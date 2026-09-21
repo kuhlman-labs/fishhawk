@@ -82,6 +82,14 @@ const (
 	// verdict says nothing about the tree: category C exactly like a refusal
 	// (verify_gate_unavailable / errGateContainerUnavailable).
 	gateUnavailable
+	// gateTimedOut: the gate DID execute but the RUNNER's own per-exec
+	// deadline (executor.verify.timeout) expired before it returned, so the
+	// process group was SIGKILLed and NO verdict was reached (#3383). A
+	// no-verdict outcome: category C at every gate, no infra absorb (a re-run
+	// costs another full timeout), no fix agent (there is no failure to
+	// hand it). neverExecutedInfra() stays FALSE — the gate ran; it simply
+	// did not finish — so every site tests this value explicitly.
+	gateTimedOut
 )
 
 // neverExecutedInfra reports whether the disposition is one the gates
@@ -102,6 +110,8 @@ func (d gateDisposition) String() string {
 		return "refused"
 	case gateUnavailable:
 		return "unavailable"
+	case gateTimedOut:
+		return "timed_out"
 	}
 	return fmt.Sprintf("gateDisposition(%d)", int(d))
 }
@@ -138,9 +148,13 @@ var gateIsolation *gateIsolationState
 
 // execBoundedHostArgvFn is the host-exec seam every selected path routes
 // through (container: the runtime CLI; clone-sandbox: the unshare wrapper;
-// clone: the gate argv itself). It is a package var SOLELY so a test can
-// capture the argv or prove it was never reached; production leaves it
-// execBoundedHostArgv.
+// clone: the gate argv itself). Its third return value, timedOut, reports
+// that the RUNNER's own per-exec deadline expired while the parent context
+// was still live (#3383) — the out-of-band signal the callers map to
+// gateTimedOut; a parent-context cancellation (a runner shutdown) keeps
+// (-1, false). It is a package var SOLELY so a test can capture the argv,
+// prove it was never reached, or script a timed-out result; production
+// leaves it execBoundedHostArgv.
 var execBoundedHostArgvFn = execBoundedHostArgv
 
 // seedModCacheFn is the host-side module-cache seed the container path runs
@@ -302,7 +316,8 @@ func materializeGateCheckout(ctx context.Context, repoDir, headSHA, parent strin
 // refusal); a seed failure wrapping ErrSeedCheckout is the checkout's OWN
 // metadata being refused, so it is gateCheckoutRefused (tree-attributable,
 // classified as an executed failure); the exec path is gateExecuted whatever
-// the exit code. Deliberate residual: a legitimate tree whose `replace`
+// the exit code, EXCEPT that a seam result reporting the runner's own
+// deadline expiry is gateTimedOut (#3383, no verdict). Deliberate residual: a legitimate tree whose `replace`
 // target sits outside the checkout draws ErrSeedCheckout too and reaches the
 // fix agent with the refusing message rather than parking category C.
 func runGateInContainer(ctx context.Context, sel gateiso.Selection, argv []string, dir, lintCacheDir string, sanitizedEnv, extraEnv []string, timeout time.Duration) (string, int, gateDisposition) {
@@ -355,11 +370,17 @@ func runGateInContainer(ctx context.Context, sel gateiso.Selection, argv []strin
 	if err != nil {
 		return "gate container: " + err.Error(), -1, gateUnavailable
 	}
-	out, code := execBoundedHostArgvFn(ctx, runArgv, dir, cliEnv, timeout)
+	out, code, timedOut := execBoundedHostArgvFn(ctx, runArgv, dir, cliEnv, timeout)
 	if code == -1 {
 		killCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), diffCoverageCleanupTimeout)
 		defer cancel()
-		_, _ = execBoundedHostArgvFn(killCtx, spec.KillArgv(), dir, cliEnv, diffCoverageCleanupTimeout)
+		_, _, _ = execBoundedHostArgvFn(killCtx, spec.KillArgv(), dir, cliEnv, diffCoverageCleanupTimeout)
+	}
+	if timedOut {
+		// The runner's own deadline killed the runtime CLI's process group
+		// (the `rm -f` above has already torn the container down): no
+		// verdict, gateTimedOut (#3383).
+		return out, code, gateTimedOut
 	}
 	return out, code, gateExecuted
 }

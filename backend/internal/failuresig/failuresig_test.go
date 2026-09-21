@@ -69,6 +69,15 @@ func matchFixtures() []matchFixture {
 			want: "infra_flake_recurred",
 		},
 		{
+			// The EXACT rendered runner lead (#3383 approval condition 4):
+			// runner/cmd/fishhawk-runner/verifytimeout.go::verifyTimedOutReason
+			// over verifyGateTimedOutLead, followed by the incomplete output
+			// tail the gate captured before the kill.
+			name: "verify gate timed out",
+			ev:   failedEvidence("C", verifyGateTimedOutReason),
+			want: "verify_gate_timed_out",
+		},
+		{
 			name: "agent no progress on a repeat attempt",
 			ev: Evidence{
 				StageType:        "implement",
@@ -80,6 +89,24 @@ func matchFixtures() []matchFixture {
 			},
 			want: "agent_no_progress_repeat",
 		},
+	}
+}
+
+// verifyGateTimedOutReason is the runner's rendered failure reason for a verify
+// gate its own timeout killed, byte-for-byte as verifyTimedOutReason renders it
+// (the lead is the cross-module string contract AnchorVerifyGateTimedOut
+// mirrors), followed by the truncated output tail run 6db228d0 ended on.
+const verifyGateTimedOutReason = "verify gate timed out: \"scripts/test verify\" (full form) was killed by the runner when executor.verify.timeout (40m0s) expired on attempt 1 before it reached a verdict; the captured output is incomplete and the change was NOT judged — retry the stage in place or raise executor.verify.timeout\n>>> ./backend\nok  \tgithub.com/kuhlman-labs/fishhawk/backend/internal/run\t412.3s\n>> > ./runner"
+
+// TestMatch_VerifyGateTimedOutRequiresCategoryC pins the category guard on
+// verify_gate_timed_out (#3383): the SAME rendered reason under category A —
+// a red tree whose test printed the phrase — matches nothing, never this id.
+func TestMatch_VerifyGateTimedOutRequiresCategoryC(t *testing.T) {
+	if got := Match(failedEvidence("A", verifyGateTimedOutReason)); got != nil {
+		t.Fatalf("Match(category A, timed-out reason) = %+v, want nil — the phrase alone must not steer a category-A failure", got)
+	}
+	if got := Match(failedEvidence("B", verifyGateTimedOutReason)); got != nil {
+		t.Fatalf("Match(category B, timed-out reason) = %+v, want nil", got)
 	}
 }
 

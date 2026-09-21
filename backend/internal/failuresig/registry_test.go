@@ -248,6 +248,7 @@ func TestAnchorsAreNonEmpty(t *testing.T) {
 		"AnchorLineageLock":                 AnchorLineageLock,
 		"AnchorRunnerExitedBeforeReporting": AnchorRunnerExitedBeforeReporting,
 		"AnchorZeroExitStrand":              AnchorZeroExitStrand,
+		"AnchorVerifyGateTimedOut":          AnchorVerifyGateTimedOut,
 	}
 	for name, v := range anchors {
 		if v == "" {

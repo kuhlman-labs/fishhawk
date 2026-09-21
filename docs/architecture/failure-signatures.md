@@ -126,6 +126,19 @@ The failure-signature registry is that memory, shipped as product behaviour. It 
 
 **Provenance.** The detached-runner reaper in `backend/internal/mcpserver/run_stage.go`.
 
+### verify_gate_timed_out — Verify gate killed by its timeout — no verdict
+
+**What it means.** The runner SIGKILLed the verify command when `executor.verify.timeout` expired, before it reached a verdict. The captured output is INCOMPLETE and ends where the process died: any `FAIL`/`panic` lines in it are real, but the absence of `FAIL` lines proves nothing — the tests that had not yet run were never judged, so the change was NOT judged either way. It is not a red tree and not an infra flake the gate could absorb: a re-run would cost another full timeout, so the runner deliberately does not re-run in place.
+
+**How it is recognized.** Failure category **C** AND the failure reason begins with the runner's lead `verify gate timed out` (`runner/cmd/fishhawk-runner/verifytimeout.go::verifyGateTimedOutLead`). The category is required alongside the anchor so a category-A/B reason that merely quotes the phrase (a test printing it) never matches. Placed before `infra_flake_recurred` because a timed-out absorb re-run cites both.
+
+**Recovery playbook.**
+1. Read the trailer at the end of the failure reason (`--- fishhawk-runner: verify TERMINATED, no verdict ---`) for the configured timeout, the wall-clock elapsed and the verify form (scoped / full / working-tree).
+2. `fishhawk_retry_stage` once — host load is the usual cause, and the stage is retryable in place.
+3. If it recurs, raise `executor.verify.timeout` in `.fishhawk/workflows.yaml` (a full `scripts/test verify` exceeds 10m on clean main; a large `-coverpkg` set runs well past 15m), or check the change for a hang in the module where the output stopped.
+
+**Provenance.** [#3383](https://github.com/kuhlman-labs/fishhawk/issues/3383) — run 6db228d0's failure reason ended mid-line at `>> > ./runner` with zero `FAIL` lines and burned four fix iterations on a verify the runner itself had killed.
+
 ### infra_flake_recurred — Absorbed infra flake recurred
 
 **What it means.** The stage's verify gate hit an infrastructure flake, absorbed one in-place re-run, and the flake recurred — so the failure is the environment, not the change.

@@ -308,10 +308,11 @@ TEXT in the refusal message and the FailureReason only. Of
 `runVerifyCommittedTree`'s SIX production call sites (the fix loop's scoped
 pass + full re-verify, the single-shot gate's run + absorb re-run, and the
 #960 strict re-verify's run + absorb re-run), the first four read the
-disposition and the #960 pair receives `_` — that site keeps its
-`isReverifyInfraFailure` classification, out of scope for #3448.
+disposition in full and the #960 pair reads it for the `timed_out` case ONLY
+(#3383) — that site otherwise keeps its `isReverifyInfraFailure`
+classification, out of scope for #3448.
 
-The four dispositions, by classification:
+The five dispositions, by classification:
 
 - **`executed`** — the argv ran (or the tolerant tmp-dir / clone `skipped`
   branch fired); output + exit code are the verdict, classified exactly as
@@ -354,6 +355,29 @@ The four dispositions, by classification:
   residual:** a legitimate tree whose `replace` target sits outside the
   checkout (`replace => ../sibling`) draws the same `ErrSeedCheckout` and
   reaches the fix agent with the refusing message rather than parking C.
+
+- **`timed_out`** — the gate RAN but the runner's OWN per-exec deadline
+  (`executor.verify.timeout`) expired before it returned, so
+  `execBoundedHostArgv` SIGKILLed the process group and NO verdict was
+  reached (#3383). The host-exec seam reports it as a third return value
+  (`timedOut`: child-context deadline exceeded while the parent context is
+  live and the command did not return success; a parent cancellation — a
+  runner shutdown — stays `-1/false`), and every path maps it to
+  `gateTimedOut` — the container path after its `rm -f` KillArgv cleanup
+  (`TestRunGateInContainer_TimedOutSeamIsTimedOutDisposition`).
+  `neverExecutedInfra()` stays FALSE: the gate executed, it simply did not
+  finish, so every site tests the value explicitly. **Category C at all
+  four gates, no absorb (a re-run would cost another full timeout), no fix
+  agent (a no-verdict fragment is nothing to fix)**: `runVerifyCommittedTree`
+  appends the `--- fishhawk-runner: verify TERMINATED, no verdict ---`
+  trailer and stamps `timed_out:true` on `verify_run`; `runVerifyFixLoop`
+  breaks with `verify_gate_timed_out`; `runVerifyGateCommitted` wraps
+  `gitops.ErrVerifyInfraFailure` + `errVerifyGateTimedOut`; the #960
+  re-verify wraps `gitops.ErrVerifyInfraFailure`; the working-tree
+  `runVerifyGate` wraps `errVerifyGateTimedOut` and `run()` maps it through
+  `workingTreeGateFailureCategory`. The LAST execution's disposition
+  governs, so an absorb re-run that itself times out is a timed-out gate.
+  Long-form: `runner/cmd/fishhawk-runner/README.md` § "Timed-out gate".
 
 Every pre-exec output (refusal text included) matches none of
 `isVerifyInfraFailure`'s classes, so a never-executed gate is never absorbed

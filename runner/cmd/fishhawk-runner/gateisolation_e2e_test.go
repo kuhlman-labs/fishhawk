@@ -139,7 +139,7 @@ func recordHostExec(t *testing.T) *[][]string {
 	t.Helper()
 	prev := execBoundedHostArgvFn
 	var calls [][]string
-	execBoundedHostArgvFn = func(ctx context.Context, argv []string, dir string, env []string, timeout time.Duration) (string, int) {
+	execBoundedHostArgvFn = func(ctx context.Context, argv []string, dir string, env []string, timeout time.Duration) (string, int, bool) {
 		calls = append(calls, append([]string(nil), argv...))
 		return prev(ctx, argv, dir, env, timeout)
 	}
@@ -477,7 +477,7 @@ func TestGateContainer_EndpointBoundAcrossContextSwitch(t *testing.T) {
 	t.Setenv("CONTAINER_CONNECTION", "fishhawk-nonexistent-connection")
 	var envs [][]string
 	prev := execBoundedHostArgvFn
-	execBoundedHostArgvFn = func(ctx context.Context, argv []string, dir string, env []string, timeout time.Duration) (string, int) {
+	execBoundedHostArgvFn = func(ctx context.Context, argv []string, dir string, env []string, timeout time.Duration) (string, int, bool) {
 		envs = append(envs, append([]string(nil), env...))
 		return prev(ctx, argv, dir, env, timeout)
 	}

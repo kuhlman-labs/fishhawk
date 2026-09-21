@@ -43,12 +43,12 @@ func captureHostExec(t *testing.T, fail bool, code int) *[][]string {
 	t.Helper()
 	prev := execBoundedHostArgvFn
 	var calls [][]string
-	execBoundedHostArgvFn = func(_ context.Context, argv []string, _ string, _ []string, _ time.Duration) (string, int) {
+	execBoundedHostArgvFn = func(_ context.Context, argv []string, _ string, _ []string, _ time.Duration) (string, int, bool) {
 		calls = append(calls, append([]string(nil), argv...))
 		if fail {
 			t.Errorf("execBoundedHostArgvFn must not be reached; called with %q", argv)
 		}
-		return "captured", code
+		return "captured", code, false
 	}
 	t.Cleanup(func() { execBoundedHostArgvFn = prev })
 	return &calls
@@ -495,15 +495,51 @@ func TestRunGateInContainer_ArgvAndTimeoutKill(t *testing.T) {
 	}
 }
 
+// TestRunGateInContainer_TimedOutSeamIsTimedOutDisposition (#3383): when the
+// host-exec seam reports the runner's own deadline expired, the container
+// path maps it to gateTimedOut (never gateExecuted) AND still issues the
+// `rm -f` KillArgv cleanup the -1 exit already triggers — the disposition
+// relabels the outcome, it does not skip the teardown. The seam stub returns
+// the partial `>> > ./runner` fragment so the mapping is proven to read the
+// third value, never the output text.
+func TestRunGateInContainer_TimedOutSeamIsTimedOutDisposition(t *testing.T) {
+	dir := t.TempDir()
+	installGateState(t, containerState("img:1", "/nonexistent/daemon.sock", io.Discard))
+	prev := execBoundedHostArgvFn
+	var calls [][]string
+	execBoundedHostArgvFn = func(_ context.Context, argv []string, _ string, _ []string, _ time.Duration) (string, int, bool) {
+		calls = append(calls, append([]string(nil), argv...))
+		if len(calls) == 1 {
+			return ">> > ./runner", -1, true
+		}
+		return "", 0, false
+	}
+	t.Cleanup(func() { execBoundedHostArgvFn = prev })
+	out, code, disp := runBoundedGateCommandDisposed(context.Background(), "sleep 60", dir, filepath.Join(t.TempDir(), "lc"), time.Second)
+	if disp != gateTimedOut {
+		t.Fatalf("disposition = %s, want timed_out", disp)
+	}
+	if code != -1 || out != ">> > ./runner" {
+		t.Errorf("(out, code) = (%q, %d), want the seam's partial fragment and -1", out, code)
+	}
+	if len(calls) != 2 {
+		t.Fatalf("seam calls = %d, want run + rm -f: %q", len(calls), calls)
+	}
+	name := calls[0][6]
+	if kill := calls[1]; strings.Join(kill, " ") != "docker --host unix:///nonexistent/daemon.sock rm -f "+name {
+		t.Errorf("kill argv = %q, want docker --host unix:///nonexistent/daemon.sock rm -f %s", kill, name)
+	}
+}
+
 // captureHostExecEnv is captureHostExec recording the ENV each seam call was
 // handed alongside its argv.
 func captureHostExecEnv(t *testing.T, code int) *[][2][]string {
 	t.Helper()
 	prev := execBoundedHostArgvFn
 	var calls [][2][]string
-	execBoundedHostArgvFn = func(_ context.Context, argv []string, _ string, env []string, _ time.Duration) (string, int) {
+	execBoundedHostArgvFn = func(_ context.Context, argv []string, _ string, env []string, _ time.Duration) (string, int, bool) {
 		calls = append(calls, [2][]string{append([]string(nil), argv...), append([]string(nil), env...)})
-		return "captured", code
+		return "captured", code, false
 	}
 	t.Cleanup(func() { execBoundedHostArgvFn = prev })
 	return &calls
@@ -665,6 +701,7 @@ func TestGateDisposition_String(t *testing.T) {
 		{gateCheckoutRefused, "checkout_refused"},
 		{gateRefused, "refused"},
 		{gateUnavailable, "unavailable"},
+		{gateTimedOut, "timed_out"},
 		{gateDisposition(99), "gateDisposition(99)"},
 	} {
 		if got := tc.d.String(); got != tc.want {

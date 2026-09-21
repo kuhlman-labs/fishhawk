@@ -3587,6 +3587,10 @@ func naSignatureFixtures() []naSignatureFixture {
 			stages: []Stage{naStage("plan", "succeeded"), naFailedImplement("D", "runner exited 0 without settling the stage (state=running)")}},
 		{id: "runner_died_before_reporting", run: naRun("failed"),
 			stages: []Stage{naStage("plan", "succeeded"), naFailedImplement("D", "runner exited 5 before reporting a terminal state")}},
+		// Category C + the EXACT rendered runner lead (#3383,
+		// runner/cmd/fishhawk-runner/verifytimeout.go::verifyGateTimedOutLead).
+		{id: "verify_gate_timed_out", run: naRun("failed"),
+			stages: []Stage{naStage("plan", "succeeded"), naFailedImplement("C", "verify gate timed out: \"scripts/test verify\" (full form) was killed by the runner when executor.verify.timeout (40m0s) expired on attempt 1 before it reached a verdict; the captured output is incomplete and the change was NOT judged — retry the stage in place or raise executor.verify.timeout\n>> > ./runner")}},
 		{id: "infra_flake_recurred", run: naRun("failed"),
 			stages: []Stage{naStage("plan", "succeeded"), naFailedImplement("A", "verify gate failed after verify_infra_flake_retry absorbed one flake")}},
 		{id: "agent_no_progress_repeat", run: noProgressRun,
