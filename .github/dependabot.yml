@@ -243,6 +243,32 @@ updates:
         patterns:
           - "@radix-ui/*"
 
+  # Public documentation site (site/, Astro + Starlight, E12.1 / #2261).
+  # Four direct dependencies, but the Astro tree is deep — the two high
+  # js-yaml / starlight alerts of 2026-09 fired here for ten days with no
+  # bump PR because this entry did not exist (the exact gap the header
+  # comment describes). One group: Astro and Starlight move in lockstep.
+  - package-ecosystem: npm
+    directory: /site
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/New_York
+    open-pull-requests-limit: 3
+    labels:
+      - type:chore
+      - area:docs
+      - autonomy:high
+    commit-message:
+      prefix: deps(site)
+      include: scope
+    groups:
+      astro:
+        patterns:
+          - "astro"
+          - "@astrojs/*"
+
   # GitHub Actions workflows. Especially load-bearing given the
   # September-2026 deprecation of Node-20-based actions warned about
   # on PR #85.
