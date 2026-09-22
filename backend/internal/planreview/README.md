@@ -217,7 +217,7 @@ additionally carries `delivery_id` and `event` for GitHub-trigger correlation. O
 `reviewer_capability_unavailable` and proceeds instead.
 
 **Audit category `reviewer_capability_unavailable`** (#1495): global-chain entry written by `handleCreateRun` when a spec-declared reviewer's provider is unavailable on the deployment but a backend IS wired — the per-reviewer capability gap that DEGRADES rather than rejects. Payload `{reason: "reviewer_unavailable", provider, optional, stage, workflow_id, repo,
-configured_agents}`. It is an internal (non-issue-comment) audit kind; the run proceeds to creation.
+configured_agents, error}`. It is an internal (non-issue-comment) audit kind; the run proceeds to creation.
 
 A startup WARN fires at `fishhawkd` boot (`backend/cmd/fishhawkd/serve.go`) whenever the resolved `PlanReviewer` is nil (neither the API key nor the local-mode flag is set), describing both degradation modes; it disappears once either adapter is wired.
 
