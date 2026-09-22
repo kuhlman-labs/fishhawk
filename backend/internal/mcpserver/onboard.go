@@ -44,7 +44,15 @@ type InitOutput struct {
 	Preset       string `json:"preset" jsonschema:"the resolved preset (echoes the default when the input was omitted)"`
 	WorkflowYAML string `json:"workflow_yaml" jsonschema:"the canonical workflow-v2 preset spec bytes to write to the repo"`
 	TargetPath   string `json:"target_path" jsonschema:"the repo-relative path the scaffold should be committed to (.fishhawk/workflows.yaml)"`
+	NextStep     string `json:"next_step" jsonschema:"what to do with the scaffold next: write it, then validate it with fishhawk_validate BEFORE committing (E45.65 / #3579)"`
 }
+
+// initNextStep is the fixed next_step sentence fishhawk_init returns (E45.65 /
+// #3579). It points the agent at fishhawk_validate for the pre-commit check
+// and says why fishhawk_doctor cannot stand in for it: the doctor's spec rung
+// reads the DEFAULT BRANCH, so re-running it against an uncommitted file is
+// the dead loop the issue reported.
+const initNextStep = "Write workflow_yaml to target_path in the checkout, then call fishhawk_validate (working_dir = the checkout, or workflow_spec = these bytes) and fix any diagnostics until valid:true BEFORE committing. Do not re-run fishhawk_doctor to confirm the file: its spec rung reads the DEFAULT BRANCH and stays unavailable until the spec is merged."
 
 // registerDoctor wires the fishhawk_doctor tool (E29.6 / #1506): the in-band
 // counterpart to the CLI `fishhawk doctor` (E29.4/E29.5). It wraps
@@ -120,7 +128,9 @@ on AUTHENTICATION only, so a token with a scope gap still gets a report naming
 its gap rather than a 403. Pair with fishhawk_init to scaffold a missing spec.
 Tool errors: authentication_required (401), validation_failed (400, malformed
 repo or forge). The fishhawk://onboarding-skill resource walks the full
-onboarding flow (doctor → init → commit).
+onboarding flow (doctor → init → validate → commit); fishhawk_validate is the
+pre-commit spec check — this tool's spec rung reads the DEFAULT BRANCH, so it
+cannot confirm an uncommitted file.
 `),
 	}, resolver.doctor)
 }
@@ -155,8 +165,11 @@ scaffold bytes for the conversational agent to write to target_path
 (budget / single-reviewer / human-gates) plus the AGENTS.md/CLAUDE.md bridge the
 CLI performs are a follow-up. Run fishhawk_doctor first to see whether a spec is
 already present. An unknown preset returns a clean tool error naming the valid
-tiers. Read fishhawk://onboarding-skill for the full walk, and run
-fishhawk_doctor first to learn whether a spec is missing.
+tiers. The output's next_step says what follows: write the bytes, then call
+fishhawk_validate on them BEFORE committing — fishhawk_doctor's spec rung reads
+the DEFAULT BRANCH, so it cannot confirm an uncommitted file. Read
+fishhawk://onboarding-skill for the full walk (doctor → init → validate →
+commit).
 `),
 	}, resolver.init)
 }
@@ -222,5 +235,6 @@ func (*runResolver) init(_ context.Context, _ *mcp.CallToolRequest, in InitInput
 		Preset:       preset,
 		WorkflowYAML: string(data),
 		TargetPath:   specFileName,
+		NextStep:     initNextStep,
 	}, nil
 }

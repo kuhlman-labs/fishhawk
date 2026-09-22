@@ -1,0 +1,14 @@
+id: scenario:issue-3579/validate-tool-listed
+statement: The MCP tools/list result includes a tool named fishhawk_validate whose description names fishhawk://onboarding-skill and states that the charter rule and reviewer model ids are not checked by it.
+verify_hint: 'MCP tools/list over the preview''s /mcp endpoint (or stdio): find fishhawk_validate; inspect its description.'
+steps: POST http://localhost:8090/mcp tools/list (Mcp-Protocol-Version 2026-07-28, Mcp-Method tools/list, Accept application/json, text/event-stream, params._meta protocolVersion+clientCapabilities, operator bearer); selected the tool named fishhawk_validate and read its description and inputSchema.
+assertions:
+    expected: tools/list includes fishhawk_validate whose description names fishhawk://onboarding-skill and states the charter rule and reviewer model ids are not checked.
+    observed_at_record: 'fishhawk_validate is listed (55 tools total). Its description says ''The fishhawk://onboarding-skill resource walks the full flow (doctor → init → validate → commit)'' and, under ''What it does NOT check'', names ''- the mandatory-charter rule — … charter_required_by[] names those workflows, and the rule is enforced by the CLI `fishhawk validate` and at run creation'' and ''- reviewer model ids (E45.64) — a deployment-oracle question; read fishhawk_doctor''s reviewers[].model_status once the spec is merged''. inputSchema: workflow_spec, working_dir, spec_file (additionalProperties false).'
+    repro_handle: /tmp/fh3579/mcpj.sh tools/list '{}' | jq -r '.result.tools[]|select(.name=="fishhawk_validate")|.description'
+origin:
+    issue: 3579
+    pr: 3588
+    run_id: a5541657-ff06-4e14-be6d-69035335faae
+    head_sha: 047e063f94538f51a92721f9068d9fae8c59a87c
+    recorded_at: 2026-09-22T03:28:03Z

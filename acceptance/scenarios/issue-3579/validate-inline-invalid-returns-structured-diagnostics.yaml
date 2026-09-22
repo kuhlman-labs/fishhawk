@@ -1,0 +1,14 @@
+id: scenario:issue-3579/validate-inline-invalid-returns-structured-diagnostics
+statement: Calling fishhawk_validate with workflow_spec set to a spec whose version is unsupported (e.g. 9.0) returns a successful tool result (not an error) with valid:false, one diagnostics[] entry carrying kind, path (/version) and message, and a hint mentioning /mcp.
+verify_hint: 'MCP tools/call fishhawk_validate {workflow_spec: ''version: "9.0"\nworkflows: {}''}; read structuredContent.valid, diagnostics[0].kind/path, hint.'
+steps: 'POST http://localhost:8090/mcp tools/call (Mcp-Method tools/call, Mcp-Name fishhawk_validate, 2026-07-28 headers and _meta, operator bearer) with params {name: fishhawk_validate, arguments: {workflow_spec: ''version: "9.0"\nworkflows: {}\n''}}; read result.isError and result.structuredContent.'
+assertions:
+    expected: Successful tool result with valid:false, one diagnostics[] entry carrying kind, path /version and message, and a hint mentioning /mcp.
+    observed_at_record: 'HTTP 200, result.isError null (not an error). structuredContent: valid false; source inline; diagnostics exactly one entry {kind schema, path /version, message ''unsupported spec version "9.0": major 9 is not recognized (supported majors: 0, 1, 2)''}; hint ''spec: schema: /version: … (this fishhawk-mcp binary may be stale — its embedded spec schema predates this version; run /mcp to reconnect and pick up the rebuilt binary)''; charter_required_by []; checked sentence; not_checked list.'
+    repro_handle: '/tmp/fh3579/mcpj.sh tools/call "$(jq -cn ''{name:"fishhawk_validate",arguments:{workflow_spec:"version: \"9.0\"\nworkflows: {}\n"}}'')" fishhawk_validate | jq ''.result|{isError,structuredContent}'''
+origin:
+    issue: 3579
+    pr: 3588
+    run_id: a5541657-ff06-4e14-be6d-69035335faae
+    head_sha: 047e063f94538f51a92721f9068d9fae8c59a87c
+    recorded_at: 2026-09-22T03:28:03Z

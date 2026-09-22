@@ -118,6 +118,7 @@ func TestOnboarding_SkillResourceListedAndReadable(t *testing.T) {
 	for _, anchor := range []string{
 		"fishhawk_doctor",
 		"fishhawk_init",
+		"fishhawk_validate",
 		".fishhawk/workflows.yaml",
 		"fishhawk_start_run",
 		"fishhawk://runbook",
@@ -127,10 +128,79 @@ func TestOnboarding_SkillResourceListedAndReadable(t *testing.T) {
 			t.Errorf("onboarding-skill missing anchor %q", anchor)
 		}
 	}
-	doctorAt := strings.Index(text, "fishhawk_doctor")
-	initAt := strings.Index(text, "fishhawk_init")
+	// Ordering is asserted on the BODY (after the frontmatter): the
+	// frontmatter description names all three verbs in one line, so an
+	// index over the whole text would be satisfied by it alone.
+	body := text[frontmatterEnd+6:]
+	doctorAt := strings.Index(body, "fishhawk_doctor")
+	initAt := strings.Index(body, "fishhawk_init")
+	validateAt := strings.Index(body, "fishhawk_validate")
 	if doctorAt < 0 || initAt < 0 || doctorAt >= initAt {
 		t.Errorf("onboarding-skill must mention fishhawk_doctor before fishhawk_init; doctor at %d, init at %d", doctorAt, initAt)
+	}
+	if validateAt < 0 || initAt >= validateAt {
+		t.Errorf("onboarding-skill must mention fishhawk_init before fishhawk_validate; init at %d, validate at %d", initAt, validateAt)
+	}
+}
+
+// skillSection returns the body of the onboarding skill's `## <heading>`
+// section whose heading starts with prefix: the text between that heading
+// line and the next `## ` heading (or EOF). Fatal when the heading is absent,
+// so an assertion scoped to a section can never be satisfied vacuously.
+func skillSection(t *testing.T, text, prefix string) string {
+	t.Helper()
+	start := strings.Index(text, "\n## "+prefix)
+	if start < 0 {
+		t.Fatalf("onboarding-skill has no section heading starting with %q", prefix)
+	}
+	rest := text[start+1:]
+	headingEnd := strings.Index(rest, "\n")
+	if headingEnd < 0 {
+		t.Fatalf("onboarding-skill section %q heading has no body", prefix)
+	}
+	body := rest[headingEnd+1:]
+	if next := strings.Index(body, "\n## "); next >= 0 {
+		body = body[:next]
+	}
+	return body
+}
+
+// TestOnboardingSkill_Step3ValidatesBeforeCommit is the #3579 done-means for
+// the skill rewrite, scoped to the Step 3 SECTION body per the approval
+// condition: the frontmatter naming fishhawk_validate must not satisfy it.
+// Step 3 must name fishhawk_validate, must NOT carry the old "re-run
+// fishhawk_doctor until spec.valid" loop (the dead loop the issue reported —
+// the doctor's spec rung reads the default branch), and Step 5 must carry the
+// post-merge doctor confirmation that replaced it.
+func TestOnboardingSkill_Step3ValidatesBeforeCommit(t *testing.T) {
+	step3 := skillSection(t, onboardingSkillMarkdown, "Step 3")
+	if !strings.Contains(step3, "fishhawk_validate") {
+		t.Errorf("Step 3 does not name fishhawk_validate:\n%s", step3)
+	}
+	lower := strings.ToLower(step3)
+	for _, banned := range []string{
+		"re-run `fishhawk_doctor` until",
+		"re-run fishhawk_doctor until",
+	} {
+		if strings.Contains(lower, banned) {
+			t.Errorf("Step 3 still carries the doctor loop %q — fishhawk_doctor's spec rung reads the default branch, so that loop never terminates on an uncommitted file:\n%s", banned, step3)
+		}
+	}
+	for _, want := range []string{"diagnostics", "charter_required_by", "not_checked", "default branch", "fishhawk validate"} {
+		if !strings.Contains(lower, strings.ToLower(want)) {
+			t.Errorf("Step 3 missing %q:\n%s", want, step3)
+		}
+	}
+	step5 := skillSection(t, onboardingSkillMarkdown, "Step 5")
+	for _, want := range []string{"fishhawk_doctor", "model_status", "fishhawk_start_run"} {
+		if !strings.Contains(step5, want) {
+			t.Errorf("Step 5 missing the post-merge %q confirmation:\n%s", want, step5)
+		}
+	}
+	// Negative control on the scoping itself: the frontmatter names the verb,
+	// so a whole-document search would pass with Step 3 reverted.
+	if !strings.Contains(onboardingSkillMarkdown[:strings.Index(onboardingSkillMarkdown, "\n## Step 1")], "fishhawk_validate") {
+		t.Fatal("test premise broken: the frontmatter/intro no longer names fishhawk_validate, so this test's section scoping is no longer load-bearing")
 	}
 }
 
@@ -179,6 +249,8 @@ func TestOnboarding_InstructionsDeliveredOnInitialize(t *testing.T) {
 		"say which criteria went undecided in your merge verdict",
 		// E34.4: the refinement intake one-liner names the tool.
 		"fishhawk_draft_epic",
+		// #3579: the onboarding line hands off to the pre-commit check.
+		"fishhawk_validate",
 		runbookURI,
 		onboardingSkillURI,
 	} {

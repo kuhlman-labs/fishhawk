@@ -115,8 +115,12 @@ var mcpToolScopes = map[string]mcpToolScopeRule{
 	// read (onboarding.go handleGetOnboardingReadiness 401s anonymous and
 	// checks no scope). fishhawk_init makes NO HTTP call at all — it renders
 	// an embedded preset in-process — so authentication is the whole gate.
-	"fishhawk_doctor": mcpScopeAuthenticatedOnly,
-	"fishhawk_init":   mcpScopeAuthenticatedOnly,
+	// fishhawk_validate (E45.65 / #3579) likewise makes NO HTTP call — it
+	// runs backend/internal/spec.ParseBytes in-process over the bytes it was
+	// given — so authentication is the whole gate.
+	"fishhawk_doctor":   mcpScopeAuthenticatedOnly,
+	"fishhawk_init":     mcpScopeAuthenticatedOnly,
+	"fishhawk_validate": mcpScopeAuthenticatedOnly,
 
 	// fishhawk_release_notes defaults to mode=preview, which dials the
 	// authenticated read GET /v0/releases/notes/preview (release_notes.go

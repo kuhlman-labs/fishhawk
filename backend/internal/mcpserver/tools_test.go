@@ -3208,7 +3208,14 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	// sibling of fishhawk_waive_concern that settles a list of one run's open
 	// concerns under ONE audited reason (the merge-gate toil the 2026-09
 	// campaign surfaced) — taking the total 53 -> 54.
-	const wantToolCount = 54
+	//
+	// E45.65 (#3579) adds exactly ONE tool — fishhawk_validate, the in-process
+	// pre-commit spec check (backend/internal/spec.ParseBytes, the validator
+	// fishhawk_start_run and POST /v0/runs already run) that closes the
+	// write → commit → push → merge → discover loop an MCP-driven onboarding
+	// was left with, because fishhawk_doctor's spec rung reads the default
+	// branch — taking the total 54 -> 55.
+	const wantToolCount = 55
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",
@@ -3237,6 +3244,19 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	}
 	if !sawWaiveConcerns {
 		t.Error("fishhawk_waive_concerns is not in the registered tool list — the bulk waive verb is unreachable")
+	}
+	// fishhawk_validate (#3579) must likewise be wire-visible, for the same
+	// reason: the count bump alone would stay green if the registration were
+	// dropped and a DIFFERENT tool added in the same change.
+	var sawValidate bool
+	for _, tool := range res.Tools {
+		if tool.Name == "fishhawk_validate" {
+			sawValidate = true
+			break
+		}
+	}
+	if !sawValidate {
+		t.Error("fishhawk_validate is not in the registered tool list — the pre-commit spec check is unreachable")
 	}
 	if !sawConsolidate {
 		t.Error("fishhawk_consolidate_slices is not registered/visible over ListTools")

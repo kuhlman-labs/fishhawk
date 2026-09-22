@@ -333,6 +333,25 @@ func TestInit_EachPreset_ReturnsValidSpec(t *testing.T) {
 	}
 }
 
+// TestInit_NextStepNamesValidate (E45.65 / #3579): fishhawk_init's output
+// must point the agent at fishhawk_validate as the pre-commit check and say
+// why fishhawk_doctor cannot stand in (it reads the default branch). RED when
+// the NextStep population is deleted.
+func TestInit_NextStepNamesValidate(t *testing.T) {
+	r := &runResolver{getenv: envFuncFromMap(nil)}
+	for _, preset := range []string{"", "low", "medium", "high"} {
+		_, out, err := r.init(context.Background(), nil, InitInput{Preset: preset})
+		if err != nil {
+			t.Fatalf("init(%q): %v", preset, err)
+		}
+		for _, want := range []string{"fishhawk_validate", "BEFORE committing", "fishhawk_doctor", "DEFAULT BRANCH"} {
+			if !strings.Contains(out.NextStep, want) {
+				t.Errorf("init(%q) NextStep missing %q: %q", preset, want, out.NextStep)
+			}
+		}
+	}
+}
+
 func TestInit_DefaultPresetIsMedium(t *testing.T) {
 	r := &runResolver{getenv: envFuncFromMap(nil)}
 	_, out, err := r.init(context.Background(), nil, InitInput{})
@@ -643,6 +662,15 @@ func TestOnboardingToolDescriptions_NameTheSkillResource(t *testing.T) {
 	initDesc := registeredToolDescription(t, "fishhawk_init")
 	if !strings.Contains(initDesc, "fishhawk://onboarding-skill") {
 		t.Errorf("fishhawk_init description missing fishhawk://onboarding-skill:\n%s", initDesc)
+	}
+	// #3579: init's description must hand off to the pre-commit check, and
+	// the check's own description must point back at the skill.
+	if !strings.Contains(initDesc, "fishhawk_validate") {
+		t.Errorf("fishhawk_init description missing the fishhawk_validate hand-off:\n%s", initDesc)
+	}
+	validateDesc := registeredToolDescription(t, "fishhawk_validate")
+	if !strings.Contains(validateDesc, "fishhawk://onboarding-skill") {
+		t.Errorf("fishhawk_validate description missing fishhawk://onboarding-skill:\n%s", validateDesc)
 	}
 }
 
