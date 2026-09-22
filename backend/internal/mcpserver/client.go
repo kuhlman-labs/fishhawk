@@ -876,12 +876,14 @@ func (c *apiClient) GetRunLatency(ctx context.Context, runID uuid.UUID) (*RunLat
 // /v0/onboarding/readiness body
 // (`backend/internal/server/onboarding.go::onboardingReadinessResponse`, E29.4 /
 // #1511): the server-side-only readiness checks a repo's first run needs —
-// five on GitHub, four on GitLab (E45.43 / #3348) — App installation (on
+// five on each family (E45.43 / #3348, E45.66 / #3580) — App installation (on
 // GitLab: project resolvability with the deployment credential), the committed
 // workflow spec's parse/validate state, per-reviewer availability on this
-// deployment, the caller token's scope adequacy, and (GitHub only) whether the
-// check Fishhawk publishes is actually required by the repo's branch
-// protection (#3161). Repeated here rather than imported because the MCP
+// deployment, the caller token's scope adequacy, and a forge-shaped merge-gate
+// read: on GitHub whether the check Fishhawk publishes is actually required by
+// the repo's branch protection (#3161, `merge_gate`); on GitLab whether the
+// default branch is protected and the project requires a successful pipeline
+// to merge (#3580, `gitlab_merge_gate`). Repeated here rather than imported because the MCP
 // server's apiClient is a thin local copy (the import direction is `cli →
 // backend`, not the reverse). Every field is a scalar/string/slice — no
 // UUID/raw-JSON field, so the #371 reflection trap does not apply. MUST stay
@@ -909,6 +911,64 @@ type OnboardingReadinessReport struct {
 	// no verdict rather than a `not_required` it never established. Still
 	// "no claim about the merge gate", not a stale backend.
 	MergeGate *OnboardingMergeGate `json:"merge_gate,omitempty" jsonschema:"whether the fishhawk_audit_complete check Fishhawk publishes is actually REQUIRED by the repo protection on its default branch; ABSENT (omitted, not zero-valued) against an older fishhawkd that does not serve the field AND on a gitlab-family report, where the protection surfaces are GitHub-only and the omission is deliberate - absence means the backend makes no claim, which is NOT the same as status unknown, and the object is never emitted with an empty status"`
+	// GitLabMergeGate is the GitLab-shaped sibling of MergeGate (E45.66 /
+	// #3580), a POINTER for the same reason: it is ABSENT on a github-family
+	// report (the rung is gitlab-only) and against a pre-#3580 fishhawkd that
+	// does not serve the key, and absence must stay absence — "no claim about
+	// the merge gate", never a zero-valued object whose status is "" (outside
+	// pipeline_gated|not_pipeline_gated|unknown). It is a SEPARATE key from
+	// merge_gate because the two answer different questions: GitLab has no
+	// per-context required status check, so this rung reports default-branch
+	// protection + pipeline-must-succeed, never whether a named check is
+	// required.
+	GitLabMergeGate *onboardingGitLabMergeGate `json:"gitlab_merge_gate,omitempty" jsonschema:"GitLab only: whether the project real default branch is protected and the project requires a successful head pipeline to merge; a SEPARATE key from merge_gate because GitLab has no per-context required status check, so this is never a claim that a named check is required; ABSENT (omitted, not zero-valued) on a github-family report and against an older fishhawkd that does not serve the field - absence means no claim, which is NOT the same as status unknown"`
+}
+
+// onboardingGitLabMergeGate mirrors the backend gitLabMergeGateReadiness
+// sub-object (E45.66 / #3580): the GitLab-shaped merge-gate rung. It answers
+// the question GitLab CAN answer — is the project's REAL default branch
+// protected (by which rules, with what push/merge access levels, force push
+// allowed or not) and does the project require a successful head pipeline to
+// merge — and says in `note` what it does NOT answer.
+//
+// Read `status` fail-closed. "not_pipeline_gated" is a POSITIVE finding — both
+// reads answered and the default branch is unprotected and/or the pipeline is
+// not required. "unknown" means the question could not be settled (no gitlab
+// forge, project not visible, an adapter without the capability, an
+// unresolved default branch, a 401/403, a transport error or a probe timeout)
+// and `reason` names which. Every signal that was never read is ABSENT
+// (pointer bools nil), never false.
+//
+// A nil *onboardingGitLabMergeGate is a FOURTH state: the backend served no
+// `gitlab_merge_gate` key — a github-family report, or a pre-#3580 fishhawkd.
+//
+// Unexported, unlike its OnboardingMergeGate sibling: the export baseline
+// (export_surface_test.go) pins the pre-#2408 surface and this type is reached
+// only through OnboardingReadinessReport — jsonschema reflection needs the
+// FIELDS exported to build the fishhawk_doctor schema, not the nested type name.
+type onboardingGitLabMergeGate struct {
+	Status                    string                        `json:"status" jsonschema:"'pipeline_gated' (the default branch is protected AND the project requires a successful pipeline to merge), 'not_pipeline_gated' (both reads answered and at least one of those is off - detail names which), or 'unknown' (the question could not be settled - reason names why; NOT evidence the branch is unprotected)"`
+	Branch                    string                        `json:"branch,omitempty" jsonschema:"the project real default branch, the branch the probe evaluated; absent when it was never resolved"`
+	Protected                 *bool                         `json:"protected,omitempty" jsonschema:"whether at least one protected-branch rule (exact or wildcard) covers the branch; absent when unread"`
+	MatchedRules              []string                      `json:"matched_rules,omitempty" jsonschema:"EVERY protected-branch rule covering the branch, the exact-name rule first then wildcards in API order - GitLab applies the most permissive of all matching rules; empty when unprotected or unread"`
+	AllowForcePush            *bool                         `json:"allow_force_push,omitempty" jsonschema:"the OR of allow_force_push across every matched rule; absent when unread"`
+	PushAccessLevels          []onboardingGitLabAccessLevel `json:"push_access_levels,omitempty" jsonschema:"the UNION of push access levels across every matched rule, deduplicated by level and ascending so the most permissive level is first; empty when unprotected or unread"`
+	MergeAccessLevels         []onboardingGitLabAccessLevel `json:"merge_access_levels,omitempty" jsonschema:"the UNION of merge access levels across every matched rule, deduplicated by level and ascending so the most permissive level is first; empty when unprotected or unread"`
+	PipelineMustSucceed       *bool                         `json:"pipeline_must_succeed,omitempty" jsonschema:"the project only_allow_merge_if_pipeline_succeeds setting; absent when unread"`
+	AllowSkippedPipeline      *bool                         `json:"allow_skipped_pipeline,omitempty" jsonschema:"the project allow_merge_on_skipped_pipeline setting (informational); absent when unread"`
+	DiscussionsMustBeResolved *bool                         `json:"discussions_must_be_resolved,omitempty" jsonschema:"the project only_allow_merge_if_all_discussions_are_resolved setting (informational); absent when unread"`
+	Authoritative             bool                          `json:"authoritative" jsonschema:"true only when both the project settings and the protected-branch list answered definitively"`
+	Reason                    string                        `json:"reason,omitempty" jsonschema:"machine code naming why the evaluation did not settle: gitlab_forge_unconfigured, project_not_visible, merge_protection_unsupported, default_branch_unresolved, forbidden, transport_error"`
+	Detail                    string                        `json:"detail,omitempty" jsonschema:"the human sentence for reason, or on not_pipeline_gated the signal(s) that are off"`
+	Remediation               string                        `json:"remediation,omitempty" jsonschema:"the operator next step when there is one"`
+	Note                      string                        `json:"note" jsonschema:"constant on every report: what the rung answers, that access levels are the effective union across matching rules, and that GitLab expresses no per-context required status check so pipeline_gated is not a claim about any named check"`
+}
+
+// onboardingGitLabAccessLevel mirrors the backend gitLabAccessLevel: one role
+// permitted to push to or merge into the protected branch.
+type onboardingGitLabAccessLevel struct {
+	Level       int    `json:"level" jsonschema:"the GitLab numeric access level (0 No one, 30 Developers + Maintainers, 40 Maintainers, ...)"`
+	Description string `json:"description" jsonschema:"the GitLab access_level_description"`
 }
 
 // OnboardingMergeGate mirrors the backend mergeGateReadiness sub-object

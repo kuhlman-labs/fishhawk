@@ -60,8 +60,9 @@ const initNextStep = "Write workflow_yaml to target_path in the checkout, then c
 // conversational "help me onboard a repo" flow — one onboarding engine, another
 // frontend. Read-only per ADR-021. Five checks since #3161, the fifth being the
 // merge-gate reconciliation of the published check against the forge — and
-// forge-family-aware since E45.43 / #3348 (four checks on GitLab, where the
-// merge gate is omitted by design).
+// forge-family-aware since E45.43 / #3348 (the GitHub-shaped merge_gate is
+// omitted on GitLab by design; since E45.66 / #3580 the fifth check on GitLab
+// is the GitLab-shaped gitlab_merge_gate rung).
 func registerDoctor(srv *mcp.Server, resolver *runResolver) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "fishhawk_doctor",
@@ -69,8 +70,9 @@ func registerDoctor(srv *mcp.Server, resolver *runResolver) {
 Use this when onboarding a repository to Fishhawk and you need its first-run
 readiness before starting a run — the in-band counterpart to the CLI
 ` + "`fishhawk doctor`" + ` (E29.4/E29.6). It wraps GET /v0/onboarding/readiness and
-returns five server-side-only checks the first feature_change run needs (four
-on GitLab — see merge_gate below):
+returns five server-side-only checks the first feature_change run needs (five
+on GitLab too, the fifth being gitlab_merge_gate — see merge_gate and
+gitlab_merge_gate below):
 
   - app     — is the GitHub App installed on the target repo (installation_id
               when it is, a reason when it is not). On GitLab there is no App:
@@ -113,7 +115,34 @@ on GitLab — see merge_gate below):
               status. The key is ALSO OMITTED on a GitLab-family report, by
               design: branch protection and rulesets are GitHub-only surfaces
               the backend never reads there, so its absence on GitLab is
-              deliberate, not a stale backend.
+              deliberate, not a stale backend — GitLab gets the SEPARATE
+              gitlab_merge_gate rung instead.
+  - gitlab_merge_gate — GitLab only (E45.66): the GitLab-shaped sibling of
+              merge_gate, under its OWN key because it answers a DIFFERENT
+              question. GitLab has no per-context required status check, so
+              nothing can say whether a named check gates the merge; this rung
+              answers what GitLab CAN answer — is the project's REAL default
+              branch protected (protected, matched_rules naming EVERY exact or
+              wildcard rule that covers it, push/merge access levels as the
+              effective union across those rules, allow_force_push) and does
+              the project require a successful head pipeline to merge
+              (pipeline_must_succeed, plus the informational
+              allow_skipped_pipeline and discussions_must_be_resolved).
+              status is pipeline_gated | not_pipeline_gated | unknown. Read it
+              FAIL-CLOSED exactly like merge_gate: "unknown" means the question
+              could NOT be settled — no gitlab forge, project not visible, an
+              adapter without protected-branch reads, an unresolved default
+              branch, a 403 (the protected_branches API needs at least the
+              Maintainer role), a transport error — and reason names which;
+              every signal that was never read is ABSENT, never false.
+              not_pipeline_gated is a positive finding whose detail names what
+              is off (unprotected default branch and/or pipeline not required)
+              and remediation names the GitLab settings to change. It is NOT a
+              statement that the fishhawk_audit_complete commit status
+              individually gates the merge — note says so on every report —
+              and approval rules are not read; confirm those by hand. The key
+              is OMITTED on a github-family report and against an older
+              fishhawkd; absence means no claim, not status unknown.
 
 The report's forge field names the family that answered (github|gitlab). repo
 is owner/name on GitHub, or a namespace/project path on GitLab — nested groups
