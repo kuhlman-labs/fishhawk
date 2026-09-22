@@ -66,7 +66,8 @@ const initNextStep = "Write workflow_yaml to target_path in the checkout, then c
 // merge-gate reconciliation of the published check against the forge — and
 // forge-family-aware since E45.43 / #3348 (the GitHub-shaped merge_gate is
 // omitted on GitLab by design; since E45.66 / #3580 the fifth check on GitLab
-// is the GitLab-shaped gitlab_merge_gate rung).
+// is the GitLab-shaped gitlab_merge_gate rung, and since E45.68 / #3582 GitLab
+// carries a sixth, gitlab_registration).
 func registerDoctor(srv *mcp.Server, resolver *runResolver) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "fishhawk_doctor",
@@ -74,20 +75,31 @@ func registerDoctor(srv *mcp.Server, resolver *runResolver) {
 Use this when onboarding a repository to Fishhawk and you need its first-run
 readiness before starting a run — the in-band counterpart to the CLI
 ` + "`fishhawk doctor`" + ` (E29.4/E29.6). It wraps GET /v0/onboarding/readiness and
-returns five server-side-only checks the first feature_change run needs (five
-on GitLab too, the fifth being gitlab_merge_gate — see merge_gate and
-gitlab_merge_gate below):
+returns five server-side-only checks the first feature_change run needs on
+GitHub and six on GitLab (the fifth on GitLab being gitlab_merge_gate and the
+sixth gitlab_registration — see merge_gate, gitlab_merge_gate and
+gitlab_registration below):
 
-  - app     — is the GitHub App installed on the target repo (installation_id
-              when it is, a reason when it is not). On GitLab there is no App:
-              installed means the project is resolvable with the deployment
-              GitLab credential, and note says so; a not-visible project
-              carries a reason naming the fishhawkd installation register
-              command.
+  - app     — is the Fishhawk-specific authorization a run needs in place? On
+              GitHub: is the GitHub App installed on the target repo
+              (installation_id when it is, a reason when it is not). On
+              GitLab there is no App: installed is true ONLY when a gitlab
+              installation is registered for EXACTLY this project path
+              (fishhawkd installation register — the authorization
+              POST /v0/runs checks) AND the project resolves with the
+              deployment GitLab credential; note says so. The weaker fact is
+              its own field: resolvable (gitlab only; absent when the gitlab
+              forge is unconfigured, i.e. never read). A resolvable but
+              unregistered project reports installed:false with a reason
+              pointing at gitlab_registration.remediation; a not-visible
+              project reports resolvable:false with a reason naming the
+              credential.
   - spec    — the committed .fishhawk/workflows.yaml fetch + parse + validate
               state (source fetched|unavailable, valid, error, note). Only
               meaningful once the app is installed (on GitLab: once the
-              project resolved).
+              project RESOLVED — the spec and gitlab_merge_gate cascades key
+              on resolvable, not on registration, so an unregistered project
+              still gets its spec read).
   - reviewers — per spec-declared reviewer availability on THIS deployment
               (available, plus a missing_hint naming the env var to set when a
               provider cannot be resolved). Each also carries the model-id
@@ -146,6 +158,32 @@ gitlab_merge_gate below):
               individually gates the merge — note says so on every report —
               and approval rules are not read; confirm those by hand. The key
               is OMITTED on a github-family report and against an older
+              fishhawkd; absence means no claim, not status unknown.
+  - gitlab_registration — GitLab only (E45.68): is an installations row
+              registered for EXACTLY this project path? This is the check
+              POST /v0/runs performs — through the same registry seam and the
+              same exact-path rule — and refuses 422
+              gitlab_project_not_registered on, so status registered means a
+              run for this path will pass that check. status is registered |
+              not_registered | unknown. not_registered is a POSITIVE finding
+              (no row, or an ambiguous double registration); read unknown
+              FAIL-CLOSED — the registry could NOT answer, either
+              registry_unwired (no installation registry / no database on
+              this deployment) or registry_lookup_failed, and reason names
+              which; unknown is NOT evidence the project is unregistered.
+              When registered, installation_ref is the registered
+              gitlab:<project_id> (the project a run would act on) and
+              resolved_ref the id the path resolved to with the deployment
+              credential; ref_matches compares them and is set ONLY when both
+              are known — false means the registration is bound to a
+              DIFFERENT project than the path resolves to (detail names both
+              refs), which a run would silently act on. remediation is a
+              copy-pasteable fishhawkd installation register command carrying
+              the REAL resolved project id when the path resolved — a human
+              action on the fishhawkd host, never performed by an agent. The
+              rung does NOT check the account_key binding the webhook
+              receiver additionally enforces (note says so). The key is
+              OMITTED on a github-family report and against an older
               fishhawkd; absence means no claim, not status unknown.
 
 The report's forge field names the family that answered (github|gitlab). repo

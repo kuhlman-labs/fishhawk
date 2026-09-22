@@ -35,17 +35,22 @@ var requiredRunScopes = []string{
 }
 
 // onboardingReadinessResponse aggregates the server-side-only checks
-// `fishhawk doctor` (E29.5) needs before a repo's first run — five on each
-// family (E45.43 / #3348, E45.66 / #3580): App installation (on GitLab:
-// project resolvability with the deployment credential), the committed
-// workflow spec's parse/validate state, per reviewer availability on this
-// deployment, the caller token's scope adequacy, and a forge-shaped merge-gate
-// read — on GitHub (#3161) whether the `fishhawk_audit_complete` check
-// Fishhawk publishes is actually REQUIRED by the repo's branch protection; on
-// GitLab (#3580) whether the project's real default branch is protected and
-// the project requires a successful head pipeline to merge. The checks
-// cascade — a not-installed repo yields an unavailable spec, empty reviewers
-// and an `unknown` merge gate — each with an explanatory note.
+// `fishhawk doctor` (E29.5) needs before a repo's first run — five on GitHub,
+// six on GitLab (E45.43 / #3348, E45.66 / #3580, E45.68 / #3582): App
+// installation (on GitLab: a gitlab installation registered for exactly this
+// project path AND the project resolvable with the deployment credential),
+// the committed workflow spec's parse/validate state, per reviewer
+// availability on this deployment, the caller token's scope adequacy, a
+// forge-shaped merge-gate read — on GitHub (#3161) whether the
+// `fishhawk_audit_complete` check Fishhawk publishes is actually REQUIRED by
+// the repo's branch protection; on GitLab (#3580) whether the project's real
+// default branch is protected and the project requires a successful head
+// pipeline to merge — and, on GitLab only, the `gitlab_registration` rung
+// (#3582): whether an installations row is registered for exactly this path,
+// the check POST /v0/runs refuses 422 gitlab_project_not_registered on. The
+// checks cascade — a not-installed GitHub repo (on GitLab: an unresolvable
+// project) yields an unavailable spec, empty reviewers and an `unknown` merge
+// gate — each with an explanatory note.
 //
 // Forge names the family that answered ("github" or "gitlab"), resolved per
 // request by onboardingForgeFamily.
@@ -67,26 +72,45 @@ var requiredRunScopes = []string{
 // and must the head pipeline succeed". It is nil on the github family and
 // set on every gitlab-family report, `unknown` with a naming reason on every
 // degrade.
+//
+// GitLabRegistration (E45.68 / #3582) is a POINTER for the same reason as
+// GitLabMergeGate: nil on the github family (no claim — no installations
+// registry applies to a GitHub repo, and the registry is never consulted
+// there), set on EVERY gitlab-family report including the forge-unconfigured
+// one, `unknown` with a naming reason whenever the registry cannot answer.
 type onboardingReadinessResponse struct {
-	Repo            string                    `json:"repo"`
-	Forge           string                    `json:"forge"`
-	App             appInstallReadiness       `json:"app"`
-	Spec            specReadiness             `json:"spec"`
-	Reviewers       []reviewerReadiness       `json:"reviewers"`
-	Scopes          scopeReadiness            `json:"scopes"`
-	MergeGate       *mergeGateReadiness       `json:"merge_gate,omitempty"`
-	GitLabMergeGate *gitLabMergeGateReadiness `json:"gitlab_merge_gate,omitempty"`
+	Repo               string                       `json:"repo"`
+	Forge              string                       `json:"forge"`
+	App                appInstallReadiness          `json:"app"`
+	Spec               specReadiness                `json:"spec"`
+	Reviewers          []reviewerReadiness          `json:"reviewers"`
+	Scopes             scopeReadiness               `json:"scopes"`
+	MergeGate          *mergeGateReadiness          `json:"merge_gate,omitempty"`
+	GitLabMergeGate    *gitLabMergeGateReadiness    `json:"gitlab_merge_gate,omitempty"`
+	GitLabRegistration *gitLabRegistrationReadiness `json:"gitlab_registration,omitempty"`
 }
 
-// appInstallReadiness reports whether the GitHub App is installed on the
-// target repo. Reason carries the human-readable explanation when it is not
-// (or when the client could not resolve the installation). On the gitlab
-// family Installed means "the project is resolvable with the deployment
-// credential" and Note says so — no App installation applies there, and
-// InstallationID is never set.
+// appInstallReadiness reports whether the Fishhawk-specific authorization a
+// run needs exists on the target repo. On the github family Installed means
+// the GitHub App is installed; Reason carries the human-readable explanation
+// when it is not (or when the client could not resolve the installation).
+//
+// On the gitlab family (E45.68 / #3582) Installed means "a gitlab installation
+// row is registered for EXACTLY this project path (`fishhawkd installation
+// register` — the authorization POST /v0/runs checks) AND the project resolves
+// with the deployment credential"; Note says so and points at the
+// gitlab_registration rung. The weaker fact — resolvable with the credential,
+// which is what Installed meant before #3582 — moves to its own explicit
+// Resolvable pointer: &true when ResolveRepoScope succeeded, &false on
+// forge.ErrNotInstalled or any resolve fault, nil when the gitlab forge is
+// unconfigured (never read). It is always nil on github, and InstallationID is
+// never set on gitlab. The spec and gitlab_merge_gate cascades key on
+// Resolvable, not on the stricter Installed: a resolvable-but-unregistered
+// project still gets its spec fetched and its protection read.
 type appInstallReadiness struct {
 	Installed      bool   `json:"installed"`
 	InstallationID int64  `json:"installation_id,omitempty"`
+	Resolvable     *bool  `json:"resolvable,omitempty"`
 	Reason         string `json:"reason,omitempty"`
 	Note           string `json:"note,omitempty"`
 }
@@ -457,14 +481,15 @@ const (
 
 // probeGitLabMergeGate runs readiness check (5) on the gitlab family (E45.66 /
 // #3580). f and scope are the forge + resolved scope probeGitLab produced;
-// installed is its rung-(1) verdict, so an unresolved project never reaches a
-// forge call here.
+// resolvable is its rung-(1) RESOLVABILITY verdict (not the stricter
+// registration-conjoined Installed, #3582 — the protection read needs only
+// the credential), so an unresolved project never reaches a forge call here.
 //
 // Every failure path returns `unknown` with a naming Reason and leaves every
 // signal pointer nil — the fail-closed contract. `not_pipeline_gated` is
 // reachable ONLY through an authoritative ReadMergeProtection.
 func (s *Server) probeGitLabMergeGate(ctx context.Context, repo string, f forge.Forge,
-	scope forge.CredentialScope, ref forge.RepoRef, installed bool) gitLabMergeGateReadiness {
+	scope forge.CredentialScope, ref forge.RepoRef, resolvable bool) gitLabMergeGateReadiness {
 	out := gitLabMergeGateReadiness{
 		Status: string(mergegate.StatusUnknown),
 		Note:   gitLabMergeGateNote,
@@ -475,10 +500,10 @@ func (s *Server) probeGitLabMergeGate(ctx context.Context, repo string, f forge.
 		out.Detail = "gitlab forge not configured on this deployment; the project's protected-branch and merge settings could not be read"
 		out.Remediation = "Set FISHHAWKD_GITLAB_TOKEN and FISHHAWKD_GITLAB_BASE_URL, then re-run the check."
 		return out
-	case !installed:
+	case !resolvable:
 		out.Reason = gitLabMergeGateReasonProjectNotVisible
 		out.Detail = "project is not visible to the deployment GitLab credential; its protected-branch and merge settings could not be read"
-		out.Remediation = "Register the project with `fishhawkd installation register --provider gitlab --project-path " + repo + "`, confirm the token can read it, then re-run the check."
+		out.Remediation = "Confirm the deployment GitLab credential (FISHHAWKD_GITLAB_TOKEN) can read " + repo + ", then re-run the check."
 		return out
 	}
 	reader, ok := f.(forge.MergeProtectionReader)
@@ -564,12 +589,98 @@ func gitLabAccessLevels(in []forge.AccessLevel) []gitLabAccessLevel {
 	return out
 }
 
-// Reason strings for the gitlab-family `app` rung (E45.43 / #3348).
+// Reason strings for the gitlab-family `app` rung (E45.43 / #3348, redefined
+// by E45.68 / #3582). The not-visible reason is a credential-visibility fact
+// and no longer names the register command — registration is the
+// gitlab_registration rung's business; the two are distinct preconditions.
 const (
 	onboardingGitLabForgeUnconfigured = "gitlab forge not configured on this deployment (set FISHHAWKD_GITLAB_TOKEN and FISHHAWKD_GITLAB_BASE_URL)"
-	onboardingGitLabProjectNotVisible = "project is not visible to the deployment GitLab credential; register it with `fishhawkd installation register --provider gitlab --project-path <path>` and confirm the token can read it"
-	onboardingGitLabInstalledNote     = "gitlab: project resolvable with the deployment credential; no App installation applies on GitLab"
+	onboardingGitLabProjectNotVisible = "project is not visible to the deployment GitLab credential (FISHHAWKD_GITLAB_TOKEN); confirm the token can read the project path"
+	onboardingGitLabInstalledNote     = "gitlab: installed means a gitlab installation is registered for exactly this project path (fishhawkd installation register — the authorization POST /v0/runs checks) AND the project resolves with the deployment credential (resolvable); no App installation applies on GitLab — see gitlab_registration"
+	// onboardingGitLabNotRegisteredReason is the app.reason when the project
+	// resolved but no installation row is registered for its exact path.
+	onboardingGitLabNotRegisteredReason = "no gitlab installation is registered for this exact project path; see gitlab_registration.remediation"
+	// onboardingGitLabRegistryUnknownReasonPrefix leads the app.reason when
+	// the registry could not answer; the rung's reason code follows in
+	// parentheses.
+	onboardingGitLabRegistryUnknownReasonPrefix = "the gitlab installation registry could not answer ("
+	onboardingGitLabRegistryUnknownReasonSuffix = "); see gitlab_registration"
 )
+
+// gitLabRegistrationReadiness is the gitlab-only registration rung (E45.68 /
+// #3582): whether an `installations` row is registered for EXACTLY this
+// project path — the pre-flight for the check POST /v0/runs performs through
+// the SAME cfg.GitLabInstallations.ResolveGitLabProject seam
+// (resolveCreateGitLabInstallation, runs.go), which refuses
+// 422 gitlab_project_not_registered when the row is absent or ambiguous. A
+// `registered` verdict here is therefore exactly "POST /v0/runs will pass the
+// registry check for this path"; TestOnboardingReadiness_GitLab_RegistrationAgreesWithRunCreate
+// pins that agreement.
+//
+// Fail-closed like the merge-gate rungs: Status is `unknown` ONLY when the
+// registry could not answer — no registry wired (registry_unwired) or the
+// lookup faulted (registry_lookup_failed) — with Reason naming which. A
+// found=false answer is the POSITIVE `not_registered` finding.
+//
+// RefMatches surfaces the registration-drift hazard: the registered
+// InstallationRef (`gitlab:<project_id>`, what a run acts on) is compared with
+// ResolvedRef (the id the path resolved to with the deployment credential,
+// same format — forge/gitlab ResolveRepoScope). It is set ONLY when both are
+// known, so a mismatch is surfaced and an unresolved project is never
+// rendered as a false match. Run-create ACCEPTS a mismatched row (it never
+// resolves the path), so Installed stays true on a mismatch; Detail and
+// Remediation say what would happen and how to re-register.
+//
+// What it does NOT check (Note says so on every report): the account_key
+// binding the webhook receiver additionally enforces. REPORTING only.
+type gitLabRegistrationReadiness struct {
+	// Status is "registered", "not_registered" or "unknown".
+	Status string `json:"status"`
+	// ProjectPath is the registered row's project path. Absent unless
+	// registered.
+	ProjectPath string `json:"project_path,omitempty"`
+	// InstallationRef is the registered row's `gitlab:<project_id>` ref, the
+	// project a run would act on. Absent unless registered.
+	InstallationRef string `json:"installation_ref,omitempty"`
+	// ResolvedRef is the `gitlab:<project_id>` ref the path resolved to with
+	// the deployment credential. Absent when the project did not resolve.
+	ResolvedRef string `json:"resolved_ref,omitempty"`
+	// RefMatches is InstallationRef == ResolvedRef, set ONLY when both are
+	// known.
+	RefMatches *bool `json:"ref_matches,omitempty"`
+	// Reason is a machine code naming why the registry could not answer.
+	// Non-empty whenever Status is "unknown".
+	Reason string `json:"reason,omitempty"`
+	// Detail is the human sentence for the status / reason.
+	Detail string `json:"detail,omitempty"`
+	// Remediation is the operator's next step — a copy-pasteable
+	// `fishhawkd installation register` command carrying the REAL project id
+	// when the path resolved.
+	Remediation string `json:"remediation,omitempty"`
+	// Note is the constant gitLabRegistrationNote, present on every report.
+	Note string `json:"note"`
+}
+
+// Status values for the gitlab_registration rung; `unknown` is shared with
+// the merge-gate rungs via mergegate.StatusUnknown.
+const (
+	gitLabRegistrationStatusRegistered    = "registered"
+	gitLabRegistrationStatusNotRegistered = "not_registered"
+)
+
+// Reason codes for the gitlab_registration rung's `unknown` degrades.
+const (
+	// gitLabRegistrationReasonRegistryUnwired — this deployment has no
+	// installation registry (no database), so it cannot answer.
+	gitLabRegistrationReasonRegistryUnwired = "registry_unwired"
+	// gitLabRegistrationReasonLookupFailed — the registry lookup faulted.
+	gitLabRegistrationReasonLookupFailed = "registry_lookup_failed"
+)
+
+// gitLabRegistrationNote is the constant sentence every gitlab_registration
+// report carries: what the rung checks, that it is the run-create check, and
+// what it does not check.
+const gitLabRegistrationNote = "gitlab: this rung reports whether an installations row is registered for EXACTLY this project_path — the check POST /v0/runs performs (an absent or ambiguous registration is refused 422 gitlab_project_not_registered). It does NOT check the account_key binding the webhook receiver additionally enforces. REPORTING only."
 
 // onboardingForgeFor resolves the forge adapter for a NON-GitHub family
 // through the same ladder issueOpsFor walks: cfg.ForgeResolver defaulting to
@@ -699,20 +810,26 @@ func (s *Server) probeGitHub(ctx context.Context, repo string, repoRef githubcli
 	return app, sp, parsed, true, installationID
 }
 
-// probeGitLab runs readiness checks (1) and (2) on the gitlab family (E45.43 /
-// #3348). There is no App to install, so (1) becomes "is the project
-// resolvable with the deployment credential" (Forge.ResolveRepoScope: a 404
-// surfaces as forge.ErrNotInstalled) with Note stating what installed means
-// here, and (2) reads the spec through forge.FileFetcher on the resolved
-// scope — which addresses the project by its FULL namespaced path, so nested
-// groups work — before handing the bytes to the shared classifier. Every
-// degrade (forge unconfigured or typed-nil, project not visible, resolve or
-// fetch fault, an adapter without file reads) lands as a naming reason on a
-// 200, never a 5xx: this is a readiness REPORT.
+// probeGitLab runs the resolvability half of readiness check (1) and check
+// (2) on the gitlab family (E45.43 / #3348). There is no App to install, so
+// the forge read here is "is the project resolvable with the deployment
+// credential" (Forge.ResolveRepoScope: a 404 surfaces as
+// forge.ErrNotInstalled), recorded on app.Resolvable — NEVER on app.Installed,
+// which the handler derives from this AND the gitlab_registration rung
+// (E45.68 / #3582) — and (2) reads the spec through forge.FileFetcher on the
+// resolved scope — which addresses the project by its FULL namespaced path,
+// so nested groups work — before handing the bytes to the shared classifier.
+// The spec cascade keys on Resolvable, so a resolvable-but-unregistered
+// project still gets its spec fetched and parsed. Every degrade (forge
+// unconfigured or typed-nil, project not visible, resolve or fetch fault, an
+// adapter without file reads) lands as a naming reason on a 200, never a 5xx:
+// this is a readiness REPORT.
 //
 // It also returns the resolved forge and scope so the handler's gitlab arm can
-// hand them to probeGitLabMergeGate (E45.66 / #3580): f is nil when the forge
-// is unconfigured, and scope is the zero value unless the project resolved.
+// hand them to probeGitLabMergeGate (E45.66 / #3580) and
+// probeGitLabRegistration: f is nil when the forge is unconfigured (and
+// app.Resolvable stays nil — never read), and scope is the zero value unless
+// the project resolved.
 func (s *Server) probeGitLab(ctx context.Context, repo string, ref forge.RepoRef,
 ) (app appInstallReadiness, sp specReadiness, parsed *spec.Spec, f forge.Forge, scope forge.CredentialScope) {
 	f = s.onboardingForgeFor(observationForgeGitLab)
@@ -725,16 +842,17 @@ func (s *Server) probeGitLab(ctx context.Context, repo string, ref forge.RepoRef
 	scope, err := f.ResolveRepoScope(ctx, ref)
 	switch {
 	case err == nil:
-		app.Installed = true
-		app.Note = onboardingGitLabInstalledNote
+		app.Resolvable = boolPtr(true)
 	case errors.Is(err, forge.ErrNotInstalled):
+		app.Resolvable = boolPtr(false)
 		app.Reason = onboardingGitLabProjectNotVisible
 	default:
+		app.Resolvable = boolPtr(false)
 		app.Reason = err.Error()
 		s.cfg.Logger.Warn("onboarding readiness: resolve gitlab project failed",
 			"repo", repo, "error", err.Error())
 	}
-	if !app.Installed {
+	if app.Resolvable == nil || !*app.Resolvable {
 		sp.Source = "unavailable"
 		sp.Note = "project is not resolvable with the deployment GitLab credential; cannot fetch the workflow spec"
 		return app, sp, nil, f, scope
@@ -759,6 +877,78 @@ func (s *Server) probeGitLab(ctx context.Context, repo string, ref forge.RepoRef
 			"repo", repo, "error", err.Error())
 	}
 	return app, sp, parsed, f, scope
+}
+
+// probeGitLabRegistration runs readiness check (6) on the gitlab family
+// (E45.68 / #3582): is an installations row registered for EXACTLY this
+// project path? It reads the SAME cfg.GitLabInstallations.ResolveGitLabProject
+// seam resolveCreateGitLabInstallation (runs.go) refuses
+// 422 gitlab_project_not_registered on, with the same trimmed path and the
+// same exact-match / ambiguous-is-not-found posture, so `registered` is
+// exactly "POST /v0/runs will pass the registry check". resolvedRef is the
+// `gitlab:<project_id>` ref the path resolved to with the deployment
+// credential (empty when it did not resolve): it fills the REAL project id
+// into the remediation and drives the ref_matches comparison.
+//
+// Every degrade returns `unknown` with a naming Reason — the fail-closed
+// contract; a registry that ANSWERED found=false is the positive
+// `not_registered`. Note is set on every return.
+func (s *Server) probeGitLabRegistration(ctx context.Context, repo, resolvedRef string) gitLabRegistrationReadiness {
+	out := gitLabRegistrationReadiness{
+		Status: string(mergegate.StatusUnknown),
+		Note:   gitLabRegistrationNote,
+	}
+	if s.cfg.GitLabInstallations == nil {
+		out.Reason = gitLabRegistrationReasonRegistryUnwired
+		out.Detail = "this deployment has no installation registry (no database), so it cannot tell whether the project is registered"
+		out.Remediation = "Run fishhawkd with FISHHAWKD_DATABASE_URL set, then re-run the check."
+		return out
+	}
+	inst, found, err := s.cfg.GitLabInstallations.ResolveGitLabProject(ctx, repo)
+	if err != nil {
+		out.Reason = gitLabRegistrationReasonLookupFailed
+		out.Detail = "the gitlab installation registry lookup failed: " + err.Error()
+		out.Remediation = "Re-run the check once the database is reachable."
+		s.cfg.Logger.Warn("onboarding readiness: gitlab registration lookup failed",
+			"repo", repo, "error", err.Error())
+		return out
+	}
+	// The resolved ref is a fact about the path, not the row: present on a
+	// not_registered finding too (it is what the remediation fills in).
+	out.ResolvedRef = resolvedRef
+	if !found {
+		out.Status = gitLabRegistrationStatusNotRegistered
+		out.Detail = "no gitlab installation is registered for project path " + repo + " (exact match; an ambiguous double registration also lands here)"
+		out.Remediation = gitLabRegisterCommand(repo, resolvedRef)
+		return out
+	}
+	out.Status = gitLabRegistrationStatusRegistered
+	out.ProjectPath = inst.ProjectPath
+	out.InstallationRef = inst.InstallationRef
+	if resolvedRef == "" || out.InstallationRef == "" {
+		// A row with no ref is unknown territory for the comparison: never
+		// render a match or a mismatch against an empty ref.
+		return out
+	}
+	out.RefMatches = boolPtr(out.InstallationRef == resolvedRef)
+	if !*out.RefMatches {
+		out.Detail = "the registered installation_ref " + out.InstallationRef + " names a different project than " + repo + " resolves to (" + resolvedRef + "); a run would act on the registered project"
+		out.Remediation = "Re-register with the resolved ref: " + gitLabRegisterCommand(repo, resolvedRef)
+	}
+	return out
+}
+
+// gitLabRegisterCommand renders the copy-pasteable `fishhawkd installation
+// register` command run-create's 422 names, substituting the REAL resolved
+// `gitlab:<project_id>` ref when the path resolved and the
+// `gitlab:<project_id>` placeholder otherwise.
+func gitLabRegisterCommand(repo, resolvedRef string) string {
+	namespace, _, _ := strings.Cut(repo, "/")
+	ref := resolvedRef
+	if ref == "" {
+		ref = "gitlab:<project_id>"
+	}
+	return "fishhawkd installation register --provider gitlab --account-key " + namespace + " --installation-ref " + ref + " --project-path " + repo
 }
 
 // probeReviewers runs readiness check (3): per-reviewer availability plus the
@@ -1065,7 +1255,33 @@ func (s *Server) handleGetOnboardingReadiness(w http.ResponseWriter, r *http.Req
 		var glForge forge.Forge
 		var glScope forge.CredentialScope
 		resp.App, resp.Spec, parsedSpec, glForge, glScope = s.probeGitLab(r.Context(), repo, repoRef)
-		mg := s.probeGitLabMergeGate(r.Context(), repo, glForge, glScope, repoRef, resp.App.Installed)
+		resolvable := resp.App.Resolvable != nil && *resp.App.Resolvable
+		// (6) gitlab_registration (E45.68 / #3582): consulted on EVERY
+		// gitlab-family report — including the forge-unconfigured one, where
+		// the registry can still answer — and NEVER on github. The resolved
+		// ref is empty unless the project resolved, so the remediation
+		// carries the real project id only when it is known.
+		var resolvedRef string
+		if resolvable {
+			resolvedRef = glScope.Ref()
+		}
+		reg := s.probeGitLabRegistration(r.Context(), repo, resolvedRef)
+		resp.GitLabRegistration = &reg
+		// (1) on gitlab: installed = registered for exactly this path AND
+		// resolvable. Forge/resolve reasons were set first and win; only a
+		// resolvable project with no (or an unknowable) registration draws
+		// the registration reason.
+		resp.App.Installed = reg.Status == gitLabRegistrationStatusRegistered && resolvable
+		if !resp.App.Installed && resp.App.Reason == "" {
+			switch reg.Status {
+			case gitLabRegistrationStatusNotRegistered:
+				resp.App.Reason = onboardingGitLabNotRegisteredReason
+			default:
+				resp.App.Reason = onboardingGitLabRegistryUnknownReasonPrefix + reg.Reason + onboardingGitLabRegistryUnknownReasonSuffix
+			}
+		}
+		resp.App.Note = onboardingGitLabInstalledNote
+		mg := s.probeGitLabMergeGate(r.Context(), repo, glForge, glScope, repoRef, resolvable)
 		resp.GitLabMergeGate = &mg
 	default:
 		var installed bool

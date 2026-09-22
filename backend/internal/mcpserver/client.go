@@ -876,14 +876,18 @@ func (c *apiClient) GetRunLatency(ctx context.Context, runID uuid.UUID) (*RunLat
 // /v0/onboarding/readiness body
 // (`backend/internal/server/onboarding.go::onboardingReadinessResponse`, E29.4 /
 // #1511): the server-side-only readiness checks a repo's first run needs —
-// five on each family (E45.43 / #3348, E45.66 / #3580) — App installation (on
-// GitLab: project resolvability with the deployment credential), the committed
-// workflow spec's parse/validate state, per-reviewer availability on this
-// deployment, the caller token's scope adequacy, and a forge-shaped merge-gate
-// read: on GitHub whether the check Fishhawk publishes is actually required by
-// the repo's branch protection (#3161, `merge_gate`); on GitLab whether the
-// default branch is protected and the project requires a successful pipeline
-// to merge (#3580, `gitlab_merge_gate`). Repeated here rather than imported because the MCP
+// five on GitHub, six on GitLab (E45.43 / #3348, E45.66 / #3580, E45.68 /
+// #3582) — App installation (on GitLab: a gitlab installation registered for
+// exactly this project path AND the project resolvable with the deployment
+// credential), the committed workflow spec's parse/validate state,
+// per-reviewer availability on this deployment, the caller token's scope
+// adequacy, a forge-shaped merge-gate read: on GitHub whether the check
+// Fishhawk publishes is actually required by the repo's branch protection
+// (#3161, `merge_gate`); on GitLab whether the default branch is protected and
+// the project requires a successful pipeline to merge (#3580,
+// `gitlab_merge_gate`) — and, on GitLab only, whether an installations row is
+// registered for exactly this path (#3582, `gitlab_registration`), the check
+// POST /v0/runs refuses 422 gitlab_project_not_registered on. Repeated here rather than imported because the MCP
 // server's apiClient is a thin local copy (the import direction is `cli →
 // backend`, not the reverse). Every field is a scalar/string/slice — no
 // UUID/raw-JSON field, so the #371 reflection trap does not apply. MUST stay
@@ -891,7 +895,7 @@ func (c *apiClient) GetRunLatency(ctx context.Context, runID uuid.UUID) (*RunLat
 type OnboardingReadinessReport struct {
 	Repo      string               `json:"repo" jsonschema:"the target repo that was probed: owner/name on GitHub, or a namespace/project path (nested groups allowed) on GitLab"`
 	Forge     string               `json:"forge,omitempty" jsonschema:"the forge family that answered: github or gitlab; absent against an older fishhawkd"`
-	App       OnboardingApp        `json:"app" jsonschema:"GitHub App installation readiness; on GitLab, whether the project is resolvable with the deployment credential (see note)"`
+	App       OnboardingApp        `json:"app" jsonschema:"GitHub App installation readiness; on GitLab, whether a gitlab installation is registered for exactly this project path AND the project is resolvable with the deployment credential (see note, resolvable and gitlab_registration)"`
 	Spec      OnboardingSpec       `json:"spec" jsonschema:"committed workflow spec fetch/parse/validate readiness"`
 	Reviewers []OnboardingReviewer `json:"reviewers" jsonschema:"per spec-declared reviewer availability on this deployment; empty when the spec is unavailable or invalid"`
 	Scopes    OnboardingScopes     `json:"scopes" jsonschema:"caller-token run-driving scope adequacy"`
@@ -922,6 +926,52 @@ type OnboardingReadinessReport struct {
 	// protection + pipeline-must-succeed, never whether a named check is
 	// required.
 	GitLabMergeGate *onboardingGitLabMergeGate `json:"gitlab_merge_gate,omitempty" jsonschema:"GitLab only: whether the project real default branch is protected and the project requires a successful head pipeline to merge; a SEPARATE key from merge_gate because GitLab has no per-context required status check, so this is never a claim that a named check is required; ABSENT (omitted, not zero-valued) on a github-family report and against an older fishhawkd that does not serve the field - absence means no claim, which is NOT the same as status unknown"`
+	// GitLabRegistration is the gitlab-only registration rung (E45.68 /
+	// #3582), a POINTER for the same reason as GitLabMergeGate: it is ABSENT
+	// on a github-family report (no installations registry applies to a
+	// GitHub repo, and the backend never consults it there) and against a
+	// pre-#3582 fishhawkd that does not serve the key. Absence means "no
+	// claim about the registration", never a zero-valued object whose status
+	// is "" (outside registered|not_registered|unknown) — and it is NOT the
+	// same as status unknown, which means the registry was asked and could
+	// not answer.
+	GitLabRegistration *onboardingGitLabRegistration `json:"gitlab_registration,omitempty" jsonschema:"GitLab only: whether an installations row is registered for EXACTLY this project path (fishhawkd installation register) - the check POST /v0/runs refuses 422 gitlab_project_not_registered on; ABSENT (omitted, not zero-valued) on a github-family report and against an older fishhawkd that does not serve the field - absence means no claim, which is NOT the same as status unknown"`
+}
+
+// onboardingGitLabRegistration mirrors the backend gitLabRegistrationReadiness
+// sub-object (E45.68 / #3582): the gitlab-only registration rung. It answers
+// whether an `installations` row is registered for EXACTLY this project path
+// — through the SAME registry seam and exact-path semantics POST /v0/runs
+// checks, so `registered` is exactly "a run for this path will pass the
+// registry check" — and compares the registered `installation_ref` with the
+// ref the path resolves to with the deployment credential.
+//
+// Read `status` fail-closed. "not_registered" is a POSITIVE finding (the
+// registry answered: no row, or an ambiguous double registration). "unknown"
+// means the registry could not answer — no registry wired on this deployment
+// (registry_unwired) or the lookup faulted (registry_lookup_failed) — and
+// `reason` names which. `ref_matches` is set ONLY when both refs are known;
+// absent is "not compared", never a false.
+//
+// A nil *onboardingGitLabRegistration is a FOURTH state: the backend served no
+// `gitlab_registration` key — a github-family report, or a pre-#3582
+// fishhawkd.
+//
+// Unexported, like onboardingGitLabMergeGate: the export baseline
+// (export_surface_test.go) pins the pre-#2408 surface and this type is reached
+// only through OnboardingReadinessReport — jsonschema reflection needs the
+// FIELDS exported, not the nested type name. MUST stay byte-identical with the
+// backend json tags.
+type onboardingGitLabRegistration struct {
+	Status          string `json:"status" jsonschema:"'registered' (an installations row exists for exactly this project path - POST /v0/runs will pass its registry check), 'not_registered' (the registry answered: no row, or an ambiguous double registration - POST /v0/runs refuses 422 gitlab_project_not_registered), or 'unknown' (the registry could not answer - reason names why; NOT evidence the project is unregistered)"`
+	ProjectPath     string `json:"project_path,omitempty" jsonschema:"the registered row project path; absent unless registered"`
+	InstallationRef string `json:"installation_ref,omitempty" jsonschema:"the registered row installation ref (gitlab:<project_id>), the project a run would act on; absent unless registered"`
+	ResolvedRef     string `json:"resolved_ref,omitempty" jsonschema:"the gitlab:<project_id> ref the path resolved to with the deployment credential; absent when the project did not resolve"`
+	RefMatches      *bool  `json:"ref_matches,omitempty" jsonschema:"whether installation_ref equals resolved_ref; set ONLY when both are known, so a registered ref bound to a different project than the path resolves to is surfaced (false) and an uncompared pair is absent, never false"`
+	Reason          string `json:"reason,omitempty" jsonschema:"machine code naming why the registry could not answer: registry_unwired (no installation registry / no database on this deployment) or registry_lookup_failed; non-empty whenever status is unknown"`
+	Detail          string `json:"detail,omitempty" jsonschema:"the human sentence for the status or reason - on a ref mismatch it names both refs and says a run would act on the registered project"`
+	Remediation     string `json:"remediation,omitempty" jsonschema:"the operator next step when there is one: on not_registered (and on a ref mismatch) a copy-pasteable fishhawkd installation register command carrying the REAL resolved project id when the path resolved - a human action, never performed by an agent"`
+	Note            string `json:"note" jsonschema:"constant on every report: the rung reports whether a row is registered for EXACTLY this project_path (the POST /v0/runs check), does NOT check the account_key binding the webhook receiver additionally enforces, and is reporting only"`
 }
 
 // onboardingGitLabMergeGate mirrors the backend gitLabMergeGateReadiness
@@ -1014,15 +1064,20 @@ type OnboardingMergeGateSrc struct {
 	Bypassable    bool   `json:"bypassable" jsonschema:"whether THIS source alone can be bypassed"`
 }
 
-// OnboardingApp mirrors the backend appInstallReadiness sub-object: whether the
-// GitHub App is installed on the target repo, with reason set when it is not.
-// On a gitlab-family report installed means the project is resolvable with
-// the deployment credential (note says so) and installation_id is never set.
+// OnboardingApp mirrors the backend appInstallReadiness sub-object: whether
+// the Fishhawk-specific authorization a run needs exists on the target repo.
+// On github installed means the GitHub App is installed, with reason set when
+// it is not. On a gitlab-family report (E45.68 / #3582) installed means a
+// gitlab installation is registered for EXACTLY this project path AND the
+// project is resolvable with the deployment credential (note says so and
+// points at gitlab_registration); the weaker resolvable fact is carried by
+// its own pointer, and installation_id is never set.
 type OnboardingApp struct {
-	Installed      bool   `json:"installed" jsonschema:"true when the GitHub App is installed on the target repo; on gitlab, true when the project is resolvable with the deployment credential"`
+	Installed      bool   `json:"installed" jsonschema:"true when the GitHub App is installed on the target repo; on gitlab, true only when a gitlab installation is registered for exactly this project path AND the project resolves with the deployment credential - see gitlab_registration"`
 	InstallationID int64  `json:"installation_id,omitempty" jsonschema:"the resolved installation id when installed (github only)"`
-	Reason         string `json:"reason,omitempty" jsonschema:"why the app is not installed / could not be resolved"`
-	Note           string `json:"note,omitempty" jsonschema:"context on what installed means for this forge, e.g. gitlab: project resolvable with the deployment credential"`
+	Resolvable     *bool  `json:"resolvable,omitempty" jsonschema:"gitlab only: whether the project resolves with the deployment GitLab credential (what installed meant before #3582); false when it does not, ABSENT when the gitlab forge is unconfigured on this deployment (never read) and always absent on github"`
+	Reason         string `json:"reason,omitempty" jsonschema:"why the app is not installed / could not be resolved; on gitlab a resolvable-but-unregistered project's reason points at gitlab_registration.remediation"`
+	Note           string `json:"note,omitempty" jsonschema:"context on what installed means for this forge, e.g. gitlab: registered for exactly this project path AND resolvable with the deployment credential"`
 }
 
 // OnboardingSpec mirrors the backend specReadiness sub-object: the committed
