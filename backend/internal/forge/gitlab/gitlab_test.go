@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1588,5 +1589,346 @@ func TestGitLabForge_ReadCIRequirement_RejectsNonGitLabScope(t *testing.T) {
 	}
 	if n := calls.Load(); n != 0 {
 		t.Errorf("a wrong-forge scope reached the wire (%d calls), want 0", n)
+	}
+}
+
+// --- forge.MergeProtectionReader (E45.66 / #3580) -----------------------
+
+// mergeProtectionStub is a v4 stub routing the two reads ReadMergeProtection
+// makes on project 77 — GET /projects/77 and GET /projects/77/protected_branches
+// — each with a programmable status + body, counting the list requests so a
+// test can pin that the project read comes FIRST.
+type mergeProtectionStub struct {
+	projectStatus int
+	projectBody   string
+	listStatus    int
+	listBody      string
+	listCalls     atomic.Int32
+	projectCalls  atomic.Int32
+}
+
+const (
+	mpProjectBody = `{"id":77,"default_branch":"main","path_with_namespace":"g/p",` +
+		`"only_allow_merge_if_pipeline_succeeds":true,"allow_merge_on_skipped_pipeline":false,` +
+		`"only_allow_merge_if_all_discussions_are_resolved":true}`
+	mpExactMainRule = `{"id":1,"name":"main",` +
+		`"push_access_levels":[{"access_level":0,"access_level_description":"No one"}],` +
+		`"merge_access_levels":[{"access_level":40,"access_level_description":"Maintainers"}],` +
+		`"allow_force_push":false}`
+)
+
+func newMergeProtectionForge(t *testing.T, st *mergeProtectionStub) *forgegitlab.Forge {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/v4/projects/77", func(w http.ResponseWriter, r *http.Request) {
+		st.projectCalls.Add(1)
+		writeJSON(w, st.projectStatus, st.projectBody)
+	})
+	mux.HandleFunc("GET /api/v4/projects/77/protected_branches", func(w http.ResponseWriter, r *http.Request) {
+		st.listCalls.Add(1)
+		writeJSON(w, st.listStatus, st.listBody)
+	})
+	f, _ := newForge(t, mux)
+	return f
+}
+
+func okMergeProtectionStub(listBody string) *mergeProtectionStub {
+	return &mergeProtectionStub{
+		projectStatus: http.StatusOK, projectBody: mpProjectBody,
+		listStatus: http.StatusOK, listBody: listBody,
+	}
+}
+
+func accessLevelsEqual(got, want []forge.AccessLevel) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// TestGitLabForge_ReadMergeProtection_ExactRule pins the full mapping of an
+// exact-name rule plus the three project settings onto forge.MergeProtection.
+func TestGitLabForge_ReadMergeProtection_ExactRule(t *testing.T) {
+	st := okMergeProtectionStub(`[` + mpExactMainRule + `]`)
+	f := newMergeProtectionForge(t, st)
+	got, err := f.ReadMergeProtection(context.Background(), gitlabScope("77"), forge.RepoRef{Owner: "other", Name: "project"}, "main")
+	if err != nil {
+		t.Fatalf("ReadMergeProtection: %v", err)
+	}
+	if got.Branch != "main" || !got.Protected {
+		t.Errorf("branch/protected = %q/%v, want main/true", got.Branch, got.Protected)
+	}
+	if len(got.MatchedRules) != 1 || got.MatchedRules[0] != "main" {
+		t.Errorf("MatchedRules = %v, want [main]", got.MatchedRules)
+	}
+	if got.AllowForcePush {
+		t.Error("AllowForcePush = true, want false")
+	}
+	if !accessLevelsEqual(got.PushAccessLevels, []forge.AccessLevel{{Level: 0, Description: "No one"}}) {
+		t.Errorf("PushAccessLevels = %+v, want [{0 No one}]", got.PushAccessLevels)
+	}
+	if !accessLevelsEqual(got.MergeAccessLevels, []forge.AccessLevel{{Level: 40, Description: "Maintainers"}}) {
+		t.Errorf("MergeAccessLevels = %+v, want [{40 Maintainers}]", got.MergeAccessLevels)
+	}
+	if !got.PipelineMustSucceed || got.AllowSkippedPipeline || !got.DiscussionsMustBeResolved {
+		t.Errorf("project settings = must_succeed %v / skipped %v / discussions %v, want true/false/true",
+			got.PipelineMustSucceed, got.AllowSkippedPipeline, got.DiscussionsMustBeResolved)
+	}
+	if n := st.listCalls.Load(); n != 1 {
+		t.Errorf("list requests = %d, want 1", n)
+	}
+}
+
+// TestGitLabForge_ReadMergeProtection_WildcardRule is the counterfactual
+// vehicle for the glob arm of protectedBranchRules: with only wildcard rules
+// present, branch main is covered by "ma*" and by nothing else. Deleting the
+// glob arm reads main as unprotected → RED.
+func TestGitLabForge_ReadMergeProtection_WildcardRule(t *testing.T) {
+	st := okMergeProtectionStub(`[
+		{"id":1,"name":"release-*","push_access_levels":[],"merge_access_levels":[{"access_level":40,"access_level_description":"Maintainers"}],"allow_force_push":false},
+		{"id":2,"name":"ma*","push_access_levels":[{"access_level":40,"access_level_description":"Maintainers"}],"merge_access_levels":[{"access_level":30,"access_level_description":"Developers + Maintainers"}],"allow_force_push":false}
+	]`)
+	f := newMergeProtectionForge(t, st)
+	got, err := f.ReadMergeProtection(context.Background(), gitlabScope("77"), forge.RepoRef{}, "main")
+	if err != nil {
+		t.Fatalf("ReadMergeProtection: %v", err)
+	}
+	if !got.Protected {
+		t.Fatal("Protected = false, want true (the ma* wildcard covers main)")
+	}
+	if len(got.MatchedRules) != 1 || got.MatchedRules[0] != "ma*" {
+		t.Errorf("MatchedRules = %v, want [ma*] (release-* must not match)", got.MatchedRules)
+	}
+	if !accessLevelsEqual(got.MergeAccessLevels, []forge.AccessLevel{{Level: 30, Description: "Developers + Maintainers"}}) {
+		t.Errorf("MergeAccessLevels = %+v, want the ma* rule's [{30 Developers + Maintainers}]", got.MergeAccessLevels)
+	}
+}
+
+// TestGitLabForge_ReadMergeProtection_OverlappingRules_MostPermissive pins
+// GitLab's most-permissive semantics (approval condition 1): when both an
+// exact rule and a wildcard cover the branch, EVERY matching rule is
+// reported (exact first), the access levels are the union sorted ascending
+// (lowest = most permissive first) and AllowForcePush is the OR. Restoring a
+// first-match-wins pick drops "m*", loses level 30 and reads force-push as
+// false → RED.
+func TestGitLabForge_ReadMergeProtection_OverlappingRules_MostPermissive(t *testing.T) {
+	st := okMergeProtectionStub(`[
+		{"id":2,"name":"m*","push_access_levels":[{"access_level":30,"access_level_description":"Developers + Maintainers"}],"merge_access_levels":[{"access_level":30,"access_level_description":"Developers + Maintainers"}],"allow_force_push":true},
+		` + mpExactMainRule + `
+	]`)
+	f := newMergeProtectionForge(t, st)
+	got, err := f.ReadMergeProtection(context.Background(), gitlabScope("77"), forge.RepoRef{}, "main")
+	if err != nil {
+		t.Fatalf("ReadMergeProtection: %v", err)
+	}
+	if !got.Protected {
+		t.Fatal("Protected = false, want true")
+	}
+	if len(got.MatchedRules) != 2 || got.MatchedRules[0] != "main" || got.MatchedRules[1] != "m*" {
+		t.Errorf("MatchedRules = %v, want [main m*] (exact first, then wildcards, regardless of API order)", got.MatchedRules)
+	}
+	if !accessLevelsEqual(got.MergeAccessLevels, []forge.AccessLevel{
+		{Level: 30, Description: "Developers + Maintainers"}, {Level: 40, Description: "Maintainers"},
+	}) {
+		t.Errorf("MergeAccessLevels = %+v, want the union [30 40] ascending", got.MergeAccessLevels)
+	}
+	if !accessLevelsEqual(got.PushAccessLevels, []forge.AccessLevel{
+		{Level: 0, Description: "No one"}, {Level: 30, Description: "Developers + Maintainers"},
+	}) {
+		t.Errorf("PushAccessLevels = %+v, want the union [0 30] ascending", got.PushAccessLevels)
+	}
+	if !got.AllowForcePush {
+		t.Error("AllowForcePush = false, want true (OR across matching rules: m* allows it)")
+	}
+
+	// The OR must hold whichever matched rule carries the true: with the
+	// EXACT rule allowing force-push and the LAST-matched wildcard denying
+	// it, a last-write-wins fold would read false. This is what makes the
+	// `||` discriminable from a plain assignment.
+	t.Run("or is not last-write-wins", func(t *testing.T) {
+		st := okMergeProtectionStub(`[
+			{"id":1,"name":"main","push_access_levels":[],"merge_access_levels":[{"access_level":40,"access_level_description":"Maintainers"}],"allow_force_push":true},
+			{"id":2,"name":"m*","push_access_levels":[],"merge_access_levels":[{"access_level":30,"access_level_description":"Developers + Maintainers"}],"allow_force_push":false}
+		]`)
+		f := newMergeProtectionForge(t, st)
+		got, err := f.ReadMergeProtection(context.Background(), gitlabScope("77"), forge.RepoRef{}, "main")
+		if err != nil {
+			t.Fatalf("ReadMergeProtection: %v", err)
+		}
+		if !got.AllowForcePush {
+			t.Error("AllowForcePush = false, want true (the exact rule allows it; the OR must not be overwritten by the later wildcard)")
+		}
+	})
+}
+
+// TestGitLabForge_ReadMergeProtection_NoRule_Unprotected pins that an
+// AUTHORITATIVE empty rule list means unprotected — with the project settings
+// still mapped and no rule/level/force-push data fabricated.
+func TestGitLabForge_ReadMergeProtection_NoRule_Unprotected(t *testing.T) {
+	st := okMergeProtectionStub(`[]`)
+	f := newMergeProtectionForge(t, st)
+	got, err := f.ReadMergeProtection(context.Background(), gitlabScope("77"), forge.RepoRef{}, "main")
+	if err != nil {
+		t.Fatalf("ReadMergeProtection: %v", err)
+	}
+	if got.Protected || len(got.MatchedRules) != 0 || got.AllowForcePush || len(got.PushAccessLevels) != 0 || len(got.MergeAccessLevels) != 0 {
+		t.Errorf("unprotected result = %+v, want Protected false with no rules/levels/force-push", got)
+	}
+	if !got.PipelineMustSucceed || !got.DiscussionsMustBeResolved {
+		t.Errorf("project settings not mapped on the unprotected path: %+v", got)
+	}
+}
+
+// TestGitLabForge_ReadMergeProtection_DefaultBranchResolved pins the empty-
+// branch contract: "" resolves to the project's REAL default branch and the
+// result carries the resolved name; an empty default branch is ErrNotFound,
+// and the rule list is never read for it.
+func TestGitLabForge_ReadMergeProtection_DefaultBranchResolved(t *testing.T) {
+	t.Run("resolved from project body", func(t *testing.T) {
+		st := okMergeProtectionStub(`[{"id":9,"name":"trunk","push_access_levels":[],"merge_access_levels":[],"allow_force_push":false}]`)
+		st.projectBody = `{"id":77,"default_branch":"trunk","only_allow_merge_if_pipeline_succeeds":true}`
+		f := newMergeProtectionForge(t, st)
+		got, err := f.ReadMergeProtection(context.Background(), gitlabScope("77"), forge.RepoRef{}, "")
+		if err != nil {
+			t.Fatalf("ReadMergeProtection: %v", err)
+		}
+		if got.Branch != "trunk" {
+			t.Errorf("Branch = %q, want trunk (resolved default branch)", got.Branch)
+		}
+		if !got.Protected || len(got.MatchedRules) != 1 || got.MatchedRules[0] != "trunk" {
+			t.Errorf("matched = %v / %v, want the trunk rule", got.Protected, got.MatchedRules)
+		}
+	})
+	t.Run("empty default branch is ErrNotFound", func(t *testing.T) {
+		st := okMergeProtectionStub(`[]`)
+		st.projectBody = `{"id":77,"default_branch":""}`
+		f := newMergeProtectionForge(t, st)
+		got, err := f.ReadMergeProtection(context.Background(), gitlabScope("77"), forge.RepoRef{}, "")
+		if !errors.Is(err, forge.ErrNotFound) {
+			t.Fatalf("err = %v, want errors.Is ErrNotFound", err)
+		}
+		if got != nil {
+			t.Errorf("result = %+v on error, want nil", got)
+		}
+		if n := st.listCalls.Load(); n != 0 {
+			t.Errorf("list requests = %d, want 0 (no branch to match)", n)
+		}
+	})
+}
+
+// TestGitLabForge_ReadMergeProtection_ProjectForbidden is the counterfactual
+// vehicle for the project-first read order: a 403 on the project read maps
+// to ErrForbidden and the list endpoint sees ZERO requests. Swapping the two
+// reads makes the stub observe a list call → RED.
+func TestGitLabForge_ReadMergeProtection_ProjectForbidden(t *testing.T) {
+	st := okMergeProtectionStub(`[` + mpExactMainRule + `]`)
+	st.projectStatus, st.projectBody = http.StatusForbidden, `{"message":"403 Forbidden"}`
+	f := newMergeProtectionForge(t, st)
+	got, err := f.ReadMergeProtection(context.Background(), gitlabScope("77"), forge.RepoRef{}, "main")
+	if !errors.Is(err, forge.ErrForbidden) {
+		t.Fatalf("err = %v, want errors.Is ErrForbidden", err)
+	}
+	if got != nil {
+		t.Errorf("result = %+v on error, want nil", got)
+	}
+	if n := st.listCalls.Load(); n != 0 {
+		t.Errorf("list requests = %d, want 0 (the project read must come first and fail closed)", n)
+	}
+}
+
+// TestGitLabForge_ReadMergeProtection_ListForbidden pins the Maintainer-role
+// residual: a credential that can read the project but not its protection
+// draws ErrForbidden, never an "unprotected" verdict.
+func TestGitLabForge_ReadMergeProtection_ListForbidden(t *testing.T) {
+	st := okMergeProtectionStub(`{"message":"403 Forbidden"}`)
+	st.listStatus = http.StatusForbidden
+	f := newMergeProtectionForge(t, st)
+	got, err := f.ReadMergeProtection(context.Background(), gitlabScope("77"), forge.RepoRef{}, "main")
+	if !errors.Is(err, forge.ErrForbidden) {
+		t.Fatalf("err = %v, want errors.Is ErrForbidden", err)
+	}
+	if got != nil {
+		t.Errorf("result = %+v on error, want nil (a failed list read is never 'unprotected')", got)
+	}
+	if n := st.projectCalls.Load(); n != 1 {
+		t.Errorf("project requests = %d, want 1", n)
+	}
+}
+
+// TestGitLabForge_ReadMergeProtection_RejectsNonGitLabScope pins the
+// fail-closed scope parse: a GitHub-shaped scope never reaches the wire.
+func TestGitLabForge_ReadMergeProtection_RejectsNonGitLabScope(t *testing.T) {
+	mux := http.NewServeMux()
+	var calls atomic.Int32
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		writeJSON(w, http.StatusOK, `{}`)
+	})
+	f, _ := newForge(t, mux)
+	_, err := f.ReadMergeProtection(context.Background(), forge.FromGitHubInstallationID(12345), forge.RepoRef{}, "main")
+	if err == nil || !strings.Contains(err.Error(), "not gitlab-shaped") {
+		t.Errorf("err = %v, want a not-gitlab-shaped rejection", err)
+	}
+	if n := calls.Load(); n != 0 {
+		t.Errorf("a wrong-forge scope reached the wire (%d calls), want 0", n)
+	}
+}
+
+// TestProtectedBranchRule is the rule-matching table (exact, `*` leading /
+// mid / trailing, `*` spanning `/`, multiple `*`, no match, empty list),
+// driven through ReadMergeProtection because the matcher is unexported and
+// this package is an external test. Each row lists rule names, a branch, and
+// the matched-rule names expected (exact first, then wildcards in API order).
+func TestProtectedBranchRule(t *testing.T) {
+	cases := []struct {
+		name   string
+		rules  []string
+		branch string
+		want   []string
+	}{
+		{"exact", []string{"main"}, "main", []string{"main"}},
+		{"exact is not a prefix match", []string{"main"}, "main2", nil},
+		{"trailing star", []string{"release-*"}, "release-1.2", []string{"release-*"}},
+		{"trailing star needs the prefix", []string{"release-*"}, "hotfix-1", nil},
+		{"leading star", []string{"*-stable"}, "v2-stable", []string{"*-stable"}},
+		{"mid star", []string{"rel*se"}, "release", []string{"rel*se"}},
+		{"mid star respects the suffix", []string{"rel*se"}, "release-x", nil},
+		{"star spans a slash", []string{"release/*"}, "release/2026/09", []string{"release/*"}},
+		{"bare star matches everything", []string{"*"}, "anything/at/all", []string{"*"}},
+		{"multiple stars in order", []string{"a*b*c"}, "aXbYc", []string{"a*b*c"}},
+		{"multiple stars out of order", []string{"a*b*c"}, "acb", nil},
+		{"exact first then wildcards in API order", []string{"m*", "*n", "main"}, "main", []string{"main", "m*", "*n"}},
+		{"no match", []string{"develop", "release-*"}, "main", nil},
+		{"empty rules", nil, "main", nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var sb strings.Builder
+			sb.WriteString("[")
+			for i, name := range tc.rules {
+				if i > 0 {
+					sb.WriteString(",")
+				}
+				raw, _ := json.Marshal(name)
+				sb.WriteString(`{"id":` + strconv.Itoa(i+1) + `,"name":` + string(raw) + `,"push_access_levels":[],"merge_access_levels":[],"allow_force_push":false}`)
+			}
+			sb.WriteString("]")
+			f := newMergeProtectionForge(t, okMergeProtectionStub(sb.String()))
+			got, err := f.ReadMergeProtection(context.Background(), gitlabScope("77"), forge.RepoRef{}, tc.branch)
+			if err != nil {
+				t.Fatalf("ReadMergeProtection: %v", err)
+			}
+			if got.Protected != (len(tc.want) > 0) {
+				t.Errorf("Protected = %v, want %v", got.Protected, len(tc.want) > 0)
+			}
+			if strings.Join(got.MatchedRules, ",") != strings.Join(tc.want, ",") {
+				t.Errorf("MatchedRules = %v, want %v", got.MatchedRules, tc.want)
+			}
+		})
 	}
 }

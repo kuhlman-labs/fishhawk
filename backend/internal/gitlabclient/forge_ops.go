@@ -93,13 +93,29 @@ type CommitStatus struct {
 	Description string `json:"description"`
 }
 
+// BranchAccessLevel is one push/merge access entry on a protected branch:
+// the numeric role level (0 "No one", 30 "Developers + Maintainers", 40
+// "Maintainers", 60 "Admins") and GitLab's description of it
+// (https://docs.gitlab.com/api/protected_branches/).
+type BranchAccessLevel struct {
+	AccessLevel            int    `json:"access_level"`
+	AccessLevelDescription string `json:"access_level_description"`
+}
+
 // ProtectedBranch is the subset of a GitLab protected-branch entry the
-// adapter needs. GitLab protection carries push/merge access levels but NO
-// required-status-check contexts, so the adapter maps a present entry to an
-// empty context list and a 404 to "no classic protection".
+// adapter reads: the id and rule name (an exact branch name or a `*`
+// wildcard), its push/merge access levels and whether force-push is
+// allowed. GitLab protection carries NO required-status-check contexts, so
+// GetBranchProtection (over GetProtectedBranch) maps a present entry to an
+// empty context list and a 404 to "no classic protection" — unchanged by the
+// widening; the extra fields feed ReadMergeProtection over
+// ListProtectedBranches (E45.66 / #3580).
 type ProtectedBranch struct {
-	ID   int    `json:"id"`
-	Name string `json:"name"`
+	ID                int                 `json:"id"`
+	Name              string              `json:"name"`
+	PushAccessLevels  []BranchAccessLevel `json:"push_access_levels"`
+	MergeAccessLevels []BranchAccessLevel `json:"merge_access_levels"`
+	AllowForcePush    bool                `json:"allow_force_push"`
 }
 
 // CompareDiff is one changed file in a Comparison — GitLab's per-file diff
@@ -149,6 +165,11 @@ type ProjectInfo struct {
 	// SKIPPED pipeline satisfy the requirement above. It is the GitLab
 	// source of forge.CIRequirement.AllowSkippedPipeline.
 	AllowMergeOnSkippedPipeline bool `json:"allow_merge_on_skipped_pipeline"`
+	// OnlyAllowMergeIfAllDiscussionsAreResolved is the project setting that
+	// refuses a merge while any MR discussion is unresolved
+	// (https://docs.gitlab.com/api/projects/#get-a-single-project). Read
+	// informationally by forge.MergeProtectionReader (E45.66 / #3580).
+	OnlyAllowMergeIfAllDiscussionsAreResolved bool `json:"only_allow_merge_if_all_discussions_are_resolved"`
 }
 
 // CreateBranch creates branch pointing at ref (a branch name, tag, or SHA).
@@ -680,6 +701,71 @@ func (c *Client) GetProtectedBranch(ctx context.Context, projectID int, branch s
 		return nil, fmt.Errorf("gitlabclient: decode get protected branch: %w", err)
 	}
 	return &out, nil
+}
+
+// ListProtectedBranches lists EVERY protected-branch rule on a project —
+// exact names and `*` wildcards alike.
+//
+//	GET /api/v4/projects/:id/protected_branches?per_page=100
+//
+// It PAGES TO EXHAUSTION via the rel="next" Link header, exactly as
+// ListIssueNotes does (issue_ops.go), and follows a next link ONLY when it
+// targets the client's own configured scheme+host (sameOrigin), with the
+// same boundary enforced across HTTP 3xx redirects by doNoOffOriginRedirect:
+// the request carries PRIVATE-TOKEN and a forge-supplied absolute URL must
+// never carry it off-instance. The adapter lists rather than reusing
+// GetProtectedBranch because GET .../protected_branches/:name is an
+// exact-name lookup that cannot tell whether a WILDCARD rule covers a branch
+// (https://docs.gitlab.com/api/protected_branches/); matching is the
+// adapter's job. GitLab documents this endpoint as needing at least the
+// Maintainer role, so a credential that can read the project may still draw
+// a 403 here — surfaced as *APIError for the adapter to map.
+func (c *Client) ListProtectedBranches(ctx context.Context, projectID int) ([]ProtectedBranch, error) {
+	if projectID <= 0 {
+		return nil, fmt.Errorf("gitlabclient: project id required")
+	}
+
+	next := c.baseURL + fmt.Sprintf("/api/v4/projects/%d/protected_branches?per_page=100", projectID)
+	var out []ProtectedBranch
+	for next != "" {
+		if err := c.sameOrigin(next, "next-page link"); err != nil {
+			return nil, err
+		}
+		page, link, err := c.getProtectedBranchesPage(ctx, next)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, page...)
+		next = nextPageURL(link)
+	}
+	return out, nil
+}
+
+// getProtectedBranchesPage fetches one page of protected-branch rules at the
+// absolute URL and returns the page plus the raw Link header for the caller
+// to walk.
+func (c *Client) getProtectedBranchesPage(ctx context.Context, absURL string) ([]ProtectedBranch, string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, absURL, nil)
+	if err != nil {
+		return nil, "", fmt.Errorf("gitlabclient: build request: %w", err)
+	}
+	req.Header.Set("PRIVATE-TOKEN", c.token)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.doNoOffOriginRedirect(req)
+	if err != nil {
+		return nil, "", fmt.Errorf("gitlabclient: GET %s: %w", req.URL.Path, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if err := errForStatus("list protected branches", resp); err != nil {
+		return nil, "", err
+	}
+
+	var page []ProtectedBranch
+	if err := json.NewDecoder(resp.Body).Decode(&page); err != nil {
+		return nil, "", fmt.Errorf("gitlabclient: decode list protected branches: %w", err)
+	}
+	return page, resp.Header.Get("Link"), nil
 }
 
 // Compare compares two refs (from..to).

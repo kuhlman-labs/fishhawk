@@ -6,7 +6,10 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -780,6 +783,163 @@ func TestGetProtectedBranch_ValidatesArgs(t *testing.T) {
 	}
 }
 
+// --- ListProtectedBranches (E45.66 / #3580) ---------------------------------
+
+// protectedRulesPage1/2 are literal documented list bodies
+// (https://docs.gitlab.com/api/protected_branches/#list-protected-branches);
+// a wrong json tag zero-values the decoded field and fails the assertion.
+const (
+	protectedRulesPage1 = `[{"id":1,"name":"main",` +
+		`"push_access_levels":[{"access_level":0,"access_level_description":"No one"}],` +
+		`"merge_access_levels":[{"access_level":40,"access_level_description":"Maintainers"}],` +
+		`"allow_force_push":false}]`
+	protectedRulesPage2 = `[{"id":2,"name":"release-*",` +
+		`"push_access_levels":[{"access_level":40,"access_level_description":"Maintainers"}],` +
+		`"merge_access_levels":[{"access_level":30,"access_level_description":"Developers + Maintainers"}],` +
+		`"allow_force_push":true}]`
+)
+
+func TestListProtectedBranches_RequestShapeAndResult(t *testing.T) {
+	c := clientWith(t, func(rec *opRequest) (*http.Response, error) {
+		if rec.method != http.MethodGet {
+			t.Errorf("method = %s, want GET", rec.method)
+		}
+		if want := "/api/v4/projects/42/protected_branches"; rec.escapedPath != want {
+			t.Errorf("escaped path = %s, want %s", rec.escapedPath, want)
+		}
+		if q := mustQuery(t, rec.rawQuery); q.Get("per_page") != "100" {
+			t.Errorf("per_page = %q, want 100", q.Get("per_page"))
+		}
+		if rec.header.Get("PRIVATE-TOKEN") != testToken {
+			t.Errorf("PRIVATE-TOKEN = %q, want %q", rec.header.Get("PRIVATE-TOKEN"), testToken)
+		}
+		return jsonResponse(http.StatusOK, protectedRulesPage1), nil
+	})
+	rules, err := c.ListProtectedBranches(context.Background(), 42)
+	if err != nil {
+		t.Fatalf("ListProtectedBranches: %v", err)
+	}
+	if len(rules) != 1 {
+		t.Fatalf("len(rules) = %d, want 1", len(rules))
+	}
+	r := rules[0]
+	if r.ID != 1 || r.Name != "main" || r.AllowForcePush {
+		t.Errorf("rule = %+v, want id 1 / main / allow_force_push false", r)
+	}
+	if len(r.PushAccessLevels) != 1 || r.PushAccessLevels[0].AccessLevel != 0 || r.PushAccessLevels[0].AccessLevelDescription != "No one" {
+		t.Errorf("push_access_levels = %+v, want [{0 No one}]", r.PushAccessLevels)
+	}
+	if len(r.MergeAccessLevels) != 1 || r.MergeAccessLevels[0].AccessLevel != 40 || r.MergeAccessLevels[0].AccessLevelDescription != "Maintainers" {
+		t.Errorf("merge_access_levels = %+v, want [{40 Maintainers}]", r.MergeAccessLevels)
+	}
+}
+
+// TestListProtectedBranches_WalksNextPageLink is the counterfactual vehicle
+// for the Link-header paging loop: page 1 carries a rel="next" Link to page
+// 2 and the result must carry BOTH pages in order. Returning after the first
+// page drops the release-* rule and reddens the length assertion.
+func TestListProtectedBranches_WalksNextPageLink(t *testing.T) {
+	s := newIssueServer(t)
+	s.mux.HandleFunc("GET /api/v4/projects/42/protected_branches", func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Query().Get("page") {
+		case "", "1":
+			w.Header().Set("Link",
+				`<`+s.srv.URL+`/api/v4/projects/42/protected_branches?page=2&per_page=100>; rel="next", `+
+					`<`+s.srv.URL+`/api/v4/projects/42/protected_branches?page=1&per_page=100>; rel="first"`)
+			writeIssueJSON(w, http.StatusOK, protectedRulesPage1)
+		case "2":
+			w.Header().Set("Link", `<`+s.srv.URL+`/api/v4/projects/42/protected_branches?page=1&per_page=100>; rel="prev"`)
+			writeIssueJSON(w, http.StatusOK, protectedRulesPage2)
+		default:
+			t.Errorf("unexpected page %q", r.URL.Query().Get("page"))
+			writeIssueJSON(w, http.StatusBadRequest, `{}`)
+		}
+	})
+
+	rules, err := s.client().ListProtectedBranches(context.Background(), 42)
+	if err != nil {
+		t.Fatalf("ListProtectedBranches: %v", err)
+	}
+	if len(rules) != 2 {
+		t.Fatalf("len(rules) = %d, want 2 (both pages walked)", len(rules))
+	}
+	if rules[0].Name != "main" || rules[1].Name != "release-*" {
+		t.Errorf("rules = [%q %q], want [main release-*] in page order", rules[0].Name, rules[1].Name)
+	}
+	if !rules[1].AllowForcePush {
+		t.Error("rules[1].AllowForcePush = false, want true (page-2 rule decoded intact)")
+	}
+	reqs := s.requests()
+	if len(reqs) != 2 {
+		t.Fatalf("requests = %d, want 2 (one per page)", len(reqs))
+	}
+	if !strings.Contains(reqs[0].Query, "per_page=100") {
+		t.Errorf("first page query = %q, want per_page=100", reqs[0].Query)
+	}
+	if !strings.Contains(reqs[1].Query, "page=2") {
+		t.Errorf("second request query = %q, want the Link's page=2", reqs[1].Query)
+	}
+	for i, r := range reqs {
+		if r.Token != "glpat-test" {
+			t.Errorf("request %d PRIVATE-TOKEN = %q, want glpat-test on every page", i, r.Token)
+		}
+	}
+}
+
+// TestListProtectedBranches_RefusesOffOriginNextLink pins the same-origin
+// guard on the Link walk (mirror of
+// TestGitLabClient_ListIssueNotes_RefusesOffOriginNextLink): a rel="next"
+// pointing at a DIFFERENT host is refused and that host is never dialed. The
+// foreign host is a reachable in-test server so that deleting the
+// sameOrigin call SUCCEEDS against it (and reddens the zero-hit assertion)
+// rather than failing on a connection error.
+func TestListProtectedBranches_RefusesOffOriginNextLink(t *testing.T) {
+	var foreignHits atomic.Int64
+	foreign := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		foreignHits.Add(1)
+		writeIssueJSON(w, http.StatusOK, `[]`)
+	}))
+	t.Cleanup(foreign.Close)
+
+	s := newIssueServer(t)
+	s.mux.HandleFunc("GET /api/v4/projects/42/protected_branches", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Link", `<`+foreign.URL+`/api/v4/projects/42/protected_branches?page=2>; rel="next"`)
+		writeIssueJSON(w, http.StatusOK, protectedRulesPage1)
+	})
+
+	rules, err := s.client().ListProtectedBranches(context.Background(), 42)
+	if err == nil {
+		t.Fatalf("ListProtectedBranches = %v, nil; want a refusal of the off-origin next link", rules)
+	}
+	if !strings.Contains(err.Error(), "refusing next-page link") {
+		t.Errorf("err = %v, want the same-origin refusal", err)
+	}
+	if got := foreignHits.Load(); got != 0 {
+		t.Errorf("foreign host received %d requests, want 0 (token must not leave the configured origin)", got)
+	}
+}
+
+func TestListProtectedBranches_APIError(t *testing.T) {
+	// GitLab documents the endpoint as Maintainer-only: a credential that
+	// can read the project may still draw a 403 here, which the adapter
+	// maps to ErrForbidden (never "unprotected").
+	c := clientWith(t, func(*opRequest) (*http.Response, error) {
+		return jsonResponse(http.StatusForbidden, `{"message":"403 Forbidden"}`), nil
+	})
+	_, err := c.ListProtectedBranches(context.Background(), 42)
+	assertAPIError(t, err, http.StatusForbidden)
+}
+
+func TestListProtectedBranches_ValidatesArgs(t *testing.T) {
+	c := clientWith(t, func(*opRequest) (*http.Response, error) {
+		t.Fatal("transport called despite invalid project id")
+		return nil, nil
+	})
+	if _, err := c.ListProtectedBranches(context.Background(), 0); err == nil {
+		t.Error("want error for missing project id")
+	}
+}
+
 // --- Compare ----------------------------------------------------------------
 
 func TestCompare_RequestShapeAndResult(t *testing.T) {
@@ -914,7 +1074,8 @@ func TestGetProjectByID_RequestShapeAndResult(t *testing.T) {
 		// are config-shaped strings no compiler checks.
 		return jsonResponse(http.StatusOK,
 			`{"id":42,"web_url":"https://gl/g/p","default_branch":"main","path_with_namespace":"g/p",`+
-				`"only_allow_merge_if_pipeline_succeeds":true,"allow_merge_on_skipped_pipeline":true}`), nil
+				`"only_allow_merge_if_pipeline_succeeds":true,"allow_merge_on_skipped_pipeline":true,`+
+				`"only_allow_merge_if_all_discussions_are_resolved":true}`), nil
 	})
 	pi, err := c.GetProjectByID(context.Background(), 42)
 	if err != nil {
@@ -928,6 +1089,9 @@ func TestGetProjectByID_RequestShapeAndResult(t *testing.T) {
 	}
 	if !pi.AllowMergeOnSkippedPipeline {
 		t.Error("AllowMergeOnSkippedPipeline = false, want true (json allow_merge_on_skipped_pipeline)")
+	}
+	if !pi.OnlyAllowMergeIfAllDiscussionsAreResolved {
+		t.Error("OnlyAllowMergeIfAllDiscussionsAreResolved = false, want true (json only_allow_merge_if_all_discussions_are_resolved)")
 	}
 }
 
