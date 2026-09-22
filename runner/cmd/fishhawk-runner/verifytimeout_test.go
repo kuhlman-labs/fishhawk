@@ -26,13 +26,52 @@ import (
 // from scaledD (lockholder_test.go) per the #1984 rule; 20ms polls stay
 // unscaled.
 
-// hangVerifyTimeout is the verify timeout the hanging scripts are run under.
+// A timed-out-gate FIXTURE runs two KINDS of invocation under one deadline,
+// and they need DIFFERENT budgets (#3587):
+//
+//   - The invocation whose expected verdict IS the timeout. A slow spawn
+//     cannot change that verdict — a late start still gets killed — so
+//     hangVerifyTimeout stays cheap and the suite pays it only once per case.
+//   - The invocation that must COMPLETE inside the deadline for the assertion
+//     to mean anything: the absorbed first failure (`exit 3`), the passing
+//     scoped pre-pass, the fast red control row. Here the deadline is racing
+//     `sh` fork/exec plus a file create and a heredoc cat, and 500ms has no
+//     margin over spawn latency on a host running the 4-module `go test -race`
+//     loop and the gate harnesses. When such an invocation is deadline-killed,
+//     runVerifyFixLoop's gateTimedOut break (main.go) fires BEFORE both
+//     absorbs, so the fixture's absorb never runs and the test reports a
+//     misleading DOWNSTREAM symptom (`formatter invocations = 0, want 1`)
+//     rather than the deadline. scaledD does not rescue it: the CI-only 5x
+//     factor is 1 on the loaded developer host where it actually fires.
+//
+// hangVerifyTimeout serves the first role, fastExitSafeVerifyTimeout the
+// second. Both stay scaledD-derived per the #1984 rule.
+
+// hangVerifyTimeout is the verify timeout the hanging scripts are run under —
+// the invocation whose expected verdict IS the timeout.
 func hangVerifyTimeout() time.Duration { return scaledD(500 * time.Millisecond) }
 
+// fastExitSafeVerifyTimeout is the verify timeout for any fixture whose
+// verdict depends on an invocation COMPLETING inside the deadline. It is 10x
+// hangVerifyTimeout — an order of magnitude over process-spawn jitter, and
+// still ~60x under the 300s sleeper, so the LAST invocation's hang remains
+// unmistakable. Expressed as a multiple rather than a literal so it
+// auto-tracks any future change to the base. A case that also runs the
+// stubbed formatter is covered by the same margin: runAutoformat is bounded
+// by this very `timeout` at its main.go call site.
+func fastExitSafeVerifyTimeout() time.Duration { return 10 * hangVerifyTimeout() }
+
 // hangElapsedBound is the wall-clock bound a timed-out gate must return
-// within — an order of magnitude over the timeout so a loaded host cannot
-// slip past it, and two orders under the sleeper so a leaked sleeper is
-// unmistakable.
+// within — an order of magnitude over hangVerifyTimeout so a loaded host
+// cannot slip past it, and two orders under the sleeper so a leaked sleeper is
+// unmistakable. Every call site asserting it has a HANGING invocation bounded
+// by hangVerifyTimeout (or, in TestRunVerifyGate_TimedOutIsCategoryC, the
+// row-local scaledD(time.Second)), so the stated ratio holds. It is
+// deliberately NOT asserted by a case whose LAST invocation hangs under the
+// 10x fastExitSafeVerifyTimeout, where 15s would be only ~3x of margin rather
+// than the order of magnitude this rationale claims; those cases rely on the
+// group-kill coverage of the seam test above instead. A fast-exit invocation
+// under fastExitSafeVerifyTimeout is unaffected — it costs milliseconds.
 func hangElapsedBound() time.Duration { return scaledD(15 * time.Second) }
 
 // hangingVerifyScript writes a verify script that prints `prelude` (a
@@ -53,11 +92,26 @@ func hangingVerifyScript(t *testing.T, prelude string) string {
 // re-run itself times out.
 func failThenHangVerifyCmd(t *testing.T, first string) string {
 	t.Helper()
+	return slowFailThenHangVerifyCmd(t, first, 0)
+}
+
+// slowFailThenHangVerifyCmd is failThenHangVerifyCmd with a deliberate
+// firstDelay before the FIRST invocation prints and exits 3 — the synthetic
+// stand-in for spawn latency on a loaded host. It must be run under
+// fastExitSafeVerifyTimeout: a delay over hangVerifyTimeout makes the first
+// invocation deadline-killed, which is exactly the #3587 shape.
+func slowFailThenHangVerifyCmd(t *testing.T, first string, firstDelay time.Duration) string {
+	t.Helper()
 	dir := t.TempDir()
 	sentinel := filepath.Join(dir, "failed-once")
 	script := filepath.Join(dir, "verify.sh")
+	delay := ""
+	if firstDelay > 0 {
+		delay = fmt.Sprintf("  sleep %g\n", firstDelay.Seconds())
+	}
 	mustWrite(t, script, "#!/bin/sh\n"+
 		"if [ ! -e "+sentinel+" ]; then\n"+
+		delay+
 		"  : > "+sentinel+"\n"+
 		"  cat <<'FISHHAWK_VERIFY_EOF'\n"+first+"\nFISHHAWK_VERIFY_EOF\n"+
 		"  exit 3\n"+
@@ -85,6 +139,48 @@ func decodeVerifyRun(t *testing.T, ev agent.Event) verifyRunPayload {
 	return p
 }
 
+// firstVerifyKilledMsg is the diagnosis every completing-invocation fixture
+// shares. Without it a first invocation killed by the deadline reports only a
+// downstream symptom (a zero absorb count, a one-short verify_run count), and
+// the reader looks for a defect in the absorb branch that is not there.
+const firstVerifyKilledMsg = "the fixture's FIRST verify invocation was killed by the deadline " +
+	"instead of exiting fast, so the absorb branch was never reached: this is the #3587 shape " +
+	"(host load vs. a too-tight fixture deadline), NOT a defect in the absorb branch. " +
+	"Raise fastExitSafeVerifyTimeout or reduce host load; see TestRunVerifyFixLoop_AbsorbFixtureToleratesSlowFirstInvocation"
+
+// assertFirstVerifyCompleted is the precondition every absorb-then-hang
+// fixture asserts BEFORE its absorb/count assertions: the FIRST verify_run
+// must have exited on its own, not been deadline-killed.
+func assertFirstVerifyCompleted(t *testing.T, events []agent.Event) {
+	t.Helper()
+	for _, ev := range events {
+		if ev.Kind != "verify_run" {
+			continue
+		}
+		if p := decodeVerifyRun(t, ev); p.TimedOut {
+			t.Fatalf("first verify_run timed_out = true (timeout_seconds=%d): %s", p.TimeoutSeconds, firstVerifyKilledMsg)
+		}
+		return
+	}
+}
+
+// assertFirstVerifyCompletedInLogs is the same precondition for the one
+// fixture that only has a log sink (openPRAndShipArtifact's strict re-verify
+// emits verify_run RECORDS, not trace events): a deadline-killed invocation
+// reports exit_code -1, a red one its real status.
+func assertFirstVerifyCompletedInLogs(t *testing.T, logs string) {
+	t.Helper()
+	for _, line := range strings.Split(logs, "\n") {
+		if !strings.Contains(line, `"event":"verify_run"`) {
+			continue
+		}
+		if strings.Contains(line, `"exit_code":-1`) {
+			t.Fatalf("first verify_run record carries exit_code -1: %s\n%s", firstVerifyKilledMsg, line)
+		}
+		return
+	}
+}
+
 // (a) The seam under a REAL hanging grandchild: returns within the bound,
 // code -1, timedOut true, and the partial line the child printed before the
 // kill is retained — which also proves the group kill closed the grandchild's
@@ -107,9 +203,11 @@ func TestExecBoundedHostArgv_TimeoutKillsGroupAndReportsTimedOut(t *testing.T) {
 		t.Errorf("partial output before the kill must be retained, got %q", out)
 	}
 
-	// Control row: a fast non-zero exit is NOT a timeout.
+	// Control row: a fast non-zero exit is NOT a timeout. It must COMPLETE
+	// inside its deadline or the row asserts nothing, so it takes the
+	// fast-exit-safe budget (which costs nothing: it exits immediately).
 	out, code, timedOut = execBoundedHostArgv(context.Background(),
-		[]string{"sh", "-c", "echo red; exit 3"}, t.TempDir(), os.Environ(), hangVerifyTimeout())
+		[]string{"sh", "-c", "echo red; exit 3"}, t.TempDir(), os.Environ(), fastExitSafeVerifyTimeout())
 	if timedOut || code != 3 || strings.TrimSpace(out) != "red" {
 		t.Errorf("fast exit 3 = (%q, %d, %v), want (red, 3, false)", out, code, timedOut)
 	}
@@ -319,7 +417,9 @@ func TestRunVerifyFixLoop_TimedOutFullFormNamesTheForm(t *testing.T) {
 	script := filepath.Join(t.TempDir(), "scoped-ok-full-hangs.sh")
 	mustWrite(t, script, "#!/bin/sh\nif [ -n \"$"+verifyPackagesEnvVar+"\" ]; then exit 0; fi\necho '>> > ./runner'\nsleep 300\n")
 	cfg.verifyCmd = "sh " + script
-	cfg.verifyTimeout = hangVerifyTimeout()
+	// The SCOPED pre-pass must exit 0 inside the deadline or the test collapses
+	// to one verify_run naming the scoped form (#3587).
+	cfg.verifyTimeout = fastExitSafeVerifyTimeout()
 	res := agent.Result{OK: true}
 	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
 	var logSink strings.Builder
@@ -327,6 +427,7 @@ func TestRunVerifyFixLoop_TimedOutFullFormNamesTheForm(t *testing.T) {
 	if err != nil {
 		t.Fatalf("runVerifyFixLoop: %v\n%s", err, logSink.String())
 	}
+	assertFirstVerifyCompleted(t, res.Events)
 	// Two verify_run events: the passing scoped pre-pass and the hanging full form.
 	assertFixLoopTimedOut(t, res, invoker, reinvoked, tree, logSink.String(), verifyFormFull, 2)
 	if strings.Contains(res.FailureReason, "(scoped form)") {
@@ -367,7 +468,8 @@ func TestRunVerifyFixLoop_InfraAbsorbRerunTimedOutIsCategoryC(t *testing.T) {
 	repo, _, _ := verifiedTreeRepo(t)
 	cfg := verifiedTreeCfg(repo, failThenHangVerifyCmd(t, lintLockOutput2645))
 	cfg.verifyMaxIterations = 1
-	cfg.verifyTimeout = hangVerifyTimeout()
+	// The absorbed FIRST failure must exit 3 inside the deadline (#3587).
+	cfg.verifyTimeout = fastExitSafeVerifyTimeout()
 	res := agent.Result{OK: true}
 	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
 	var logSink strings.Builder
@@ -375,9 +477,53 @@ func TestRunVerifyFixLoop_InfraAbsorbRerunTimedOutIsCategoryC(t *testing.T) {
 	if err != nil {
 		t.Fatalf("runVerifyFixLoop: %v\n%s", err, logSink.String())
 	}
+	assertFirstVerifyCompleted(t, res.Events)
 	assertFixLoopTimedOut(t, res, invoker, reinvoked, tree, logSink.String(), verifyFormFull, 2)
 	if n := countEvents(res.Events, "verify_infra_flake_retry"); n != 1 {
 		t.Errorf("verify_infra_flake_retry events = %d, want 1 (the first failure WAS absorbed)", n)
+	}
+}
+
+// #3587 MARGIN PIN. The fixture's FIRST invocation deliberately sleeps
+// scaledD(1s) before printing the infra literal and exiting 3 — well ABOVE
+// hangVerifyTimeout's 500ms budget and well BELOW fastExitSafeVerifyTimeout's
+// 5s — so the absorb still fires and the LAST invocation's hang still governs.
+// Reducing fastExitSafeVerifyTimeout back toward the flaky value fails this
+// test DETERMINISTICALLY instead of intermittently under load, which is what
+// the #1169 done-means rule requires of a margin.
+//
+// What it proves and what it does NOT: it pins the COMPLETION MARGIN only.
+// It does NOT probe deadline independence across invocations — at a 5s budget
+// a hypothetically shared deadline would still leave ~4s after the 1s sleep,
+// so the hang would time out and every assertion below would hold either way.
+// Deadline independence rests on execBoundedHostArgv building a FRESH
+// context.WithTimeout(ctx, timeout) per invocation (main.go).
+//
+// It uses the INFRA absorb rather than the auto-format absorb so it does not
+// also depend on the global autoformatBinary stub.
+func TestRunVerifyFixLoop_AbsorbFixtureToleratesSlowFirstInvocation(t *testing.T) {
+	slow := scaledD(1 * time.Second)
+	if slow <= hangVerifyTimeout() {
+		t.Fatalf("pin precondition: the first-invocation delay (%s) must exceed hangVerifyTimeout (%s)", slow, hangVerifyTimeout())
+	}
+	if slow >= fastExitSafeVerifyTimeout() {
+		t.Fatalf("pin precondition: the first-invocation delay (%s) must sit under fastExitSafeVerifyTimeout (%s)", slow, fastExitSafeVerifyTimeout())
+	}
+	repo, _, _ := verifiedTreeRepo(t)
+	cfg := verifiedTreeCfg(repo, slowFailThenHangVerifyCmd(t, lintLockOutput2645, slow))
+	cfg.verifyMaxIterations = 1
+	cfg.verifyTimeout = fastExitSafeVerifyTimeout()
+	res := agent.Result{OK: true}
+	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
+	var logSink strings.Builder
+	reinvoked, tree, err := runVerifyFixLoop(context.Background(), &cfg, nil, "", invoker, agent.Invocation{}, &res, &logSink)
+	if err != nil {
+		t.Fatalf("runVerifyFixLoop: %v\n%s", err, logSink.String())
+	}
+	assertFirstVerifyCompleted(t, res.Events)
+	assertFixLoopTimedOut(t, res, invoker, reinvoked, tree, logSink.String(), verifyFormFull, 2)
+	if n := countEvents(res.Events, "verify_infra_flake_retry"); n != 1 {
+		t.Errorf("verify_infra_flake_retry events = %d, want 1 — a slow-but-completing first invocation must still be absorbed", n)
 	}
 }
 
@@ -388,7 +534,10 @@ func TestRunVerifyFixLoop_InfraAbsorbRerunTimedOutIsCategoryC(t *testing.T) {
 // event followed by the timed-out verify_run.
 func TestRunVerifyFixLoop_AutoformatAbsorbRerunTimedOutIsCategoryC(t *testing.T) {
 	_, cfg := autoformatRepo(t, failThenHangVerifyCmd(t, gofmtOnlyLintOutput))
-	cfg.verifyTimeout = hangVerifyTimeout()
+	// The absorbed FIRST failure must exit 3 inside the deadline (#3587). This
+	// value ALSO bounds runAutoformat — main.go runs the formatter under the
+	// same `timeout` — so the stub formatter's own spawn shares the margin.
+	cfg.verifyTimeout = fastExitSafeVerifyTimeout()
 	count := stubFormatter(t, `printf 'package p\n' > fmtme.go; exit 0`)
 	res := agent.Result{OK: true}
 	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
@@ -397,6 +546,7 @@ func TestRunVerifyFixLoop_AutoformatAbsorbRerunTimedOutIsCategoryC(t *testing.T)
 	if err != nil {
 		t.Fatalf("runVerifyFixLoop: %v\n%s", err, logSink.String())
 	}
+	assertFirstVerifyCompleted(t, res.Events)
 	if n := count(); n != 1 {
 		t.Fatalf("formatter invocations = %d, want 1 (the format-only failure WAS absorbed)", n)
 	}
@@ -476,9 +626,11 @@ func TestRunVerifyGateCommitted_TimedOutIsCategoryCNoAbsorb(t *testing.T) {
 func TestRunVerifyGateCommitted_InfraAbsorbRerunTimedOutIsCategoryC(t *testing.T) {
 	repo, _, _ := verifiedTreeRepo(t)
 	cfg := verifiedTreeCfg(repo, failThenHangVerifyCmd(t, lintLockOutput2645))
-	cfg.verifyTimeout = hangVerifyTimeout()
+	// The absorbed FIRST failure must exit 3 inside the deadline (#3587).
+	cfg.verifyTimeout = fastExitSafeVerifyTimeout()
 	var logSink strings.Builder
 	events, _, err := runVerifyGateCommitted(context.Background(), cfg, &logSink)
+	assertFirstVerifyCompleted(t, events)
 	if !errors.Is(err, gitops.ErrVerifyInfraFailure) || !errors.Is(err, errVerifyGateTimedOut) {
 		t.Fatalf("err = %v, want ErrVerifyInfraFailure + errVerifyGateTimedOut", err)
 	}
@@ -577,8 +729,10 @@ func TestOpenPRAndShipArtifact_VerifiedTreeMismatch_InfraAbsorbRerunTimedOutIsCa
 
 	var logSink strings.Builder
 	cfg := verifiedTreeCfg(repo, failThenHangVerifyCmd(t, lintLockOutput2645))
-	cfg.verifyTimeout = hangVerifyTimeout()
+	// The absorbed FIRST re-verify must exit 3 inside the deadline (#3587).
+	cfg.verifyTimeout = fastExitSafeVerifyTimeout()
 	err = openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, nil, nil, nil)
+	assertFirstVerifyCompletedInLogs(t, logSink.String())
 	if !errors.Is(err, gitops.ErrVerifyInfraFailure) {
 		t.Fatalf("err = %v, want ErrVerifyInfraFailure", err)
 	}
@@ -616,14 +770,24 @@ func TestOpenPRAndShipArtifact_VerifiedTreeMismatch_InfraAbsorbRerunTimedOutIsCa
 // (a fast `exit 3`) stays category A. Hard-coding `A` back at the call site
 // reddens the first row.
 func TestRunVerifyGate_TimedOutIsCategoryC(t *testing.T) {
+	// Per-row timeout, not one shared value (#3587): the hanging row's verdict
+	// IS the timeout so it stays cheap, while the fast-red row must COMPLETE
+	// inside its deadline or it silently becomes a second hanging row. Both
+	// integer-truncate to a NON-ZERO second count (1/5 and 5/25 under scaledD);
+	// VerifyTimeoutSeconds == 0 would fall back to the production 10-minute
+	// default and make the row vacuous.
 	for _, tc := range []struct {
 		name, cmd, wantCategory string
 		wantTimedOut            bool
+		timeout                 time.Duration
 	}{
-		{"hanging verify → C", `echo ">> > ./runner"; sleep 300`, "C", true},
-		{"fast red verify → A", "echo red; exit 3", "A", false},
+		{"hanging verify → C", `echo ">> > ./runner"; sleep 300`, "C", true, scaledD(time.Second)},
+		{"fast red verify → A", "echo red; exit 3", "A", false, fastExitSafeVerifyTimeout()},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			if secs := int(tc.timeout / time.Second); secs == 0 {
+				t.Fatalf("row timeout %s truncates to 0 seconds — the row would silently take the production 10-minute default", tc.timeout)
+			}
 			bundlePath := filepath.Join(t.TempDir(), "trace.jsonl.gz")
 			withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
 			fu := newFakeUploader(t)
@@ -633,7 +797,7 @@ func TestRunVerifyGate_TimedOutIsCategoryC(t *testing.T) {
 				Prompt:               "Hello agent.",
 				PromptHash:           "deadbeef",
 				VerifyCommand:        tc.cmd,
-				VerifyTimeoutSeconds: int(scaledD(time.Second) / time.Second),
+				VerifyTimeoutSeconds: int(tc.timeout / time.Second),
 			}
 			withFakeUploader(t, fu)
 
