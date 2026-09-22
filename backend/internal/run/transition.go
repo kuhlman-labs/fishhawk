@@ -2,6 +2,7 @@ package run
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -555,4 +556,47 @@ type StageStateChangedError struct {
 
 func (e StageStateChangedError) Error() string {
 	return fmt.Sprintf("stage %s state changed: expected %s, got %s", e.StageID, e.Expected, e.Actual)
+}
+
+// StageAttemptToken renders a stage's per-attempt identity from its
+// dispatched_at column (#3598). It is the ONE renderer of that identity: the
+// prompt envelope that hands the token to the runner, the reap handler's
+// fast-path pre-check and the in-transaction predicate of
+// StageAttemptCASTransitioner.TransitionStageFromAttempt all call it, so the
+// three sites can never disagree on the format.
+//
+// dispatched_at is the attempt identity because the migration 0072 trigger
+// (fishhawk_stamp_stage_dispatched_at) re-stamps it with the database's now()
+// on EVERY transition INTO dispatched — a retry or fix-up re-dispatch resets
+// it, while a progress heartbeat cannot advance it (see Stage.DispatchedAt and
+// TestPostgres_StageDispatchedAtResetsOnRedispatch). A nil value — a legacy
+// pre-0072 row, or a stage that never passed through dispatched — renders as
+// the EMPTY string, which callers treat as "no attempt anchor". The value is
+// only ever compared as an opaque string against this same function's output
+// for a Postgres-stamped column, so no Go-side clock participates (#3048).
+func StageAttemptToken(dispatchedAt *time.Time) string {
+	if dispatchedAt == nil {
+		return ""
+	}
+	return dispatchedAt.UTC().Format(time.RFC3339Nano)
+}
+
+// StageAttemptChangedError is returned by the attempt-pinned compare-and-swap
+// (StageAttemptCASTransitioner.TransitionStageFromAttempt) when the row-locked
+// current state MATCHED the caller's pinned from-state but the row-locked
+// attempt token (StageAttemptToken of dispatched_at) did not: the stage was
+// re-dispatched between the caller's load and its write, so the caller's
+// premise belongs to a superseded attempt. The transition is refused
+// atomically under the row lock and nothing is mutated. It is a sibling of
+// StageStateChangedError rather than a reuse of it because a state mismatch
+// and an attempt mismatch are different facts, and callers map them to
+// different refusals (#3598).
+type StageAttemptChangedError struct {
+	StageID  uuid.UUID
+	Expected string
+	Actual   string
+}
+
+func (e StageAttemptChangedError) Error() string {
+	return fmt.Sprintf("stage %s attempt changed: expected %q, got %q", e.StageID, e.Expected, e.Actual)
 }

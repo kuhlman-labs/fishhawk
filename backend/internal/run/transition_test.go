@@ -4,6 +4,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -414,6 +415,19 @@ func TestStageStateChangedError_FormatsAndIsErrorsTarget(t *testing.T) {
 	}
 }
 
+func TestStageAttemptChangedError_FormatsAndIsErrorsTarget(t *testing.T) {
+	id := uuid.New()
+	err := error(StageAttemptChangedError{StageID: id, Expected: "tok-a", Actual: "tok-b"})
+	var target StageAttemptChangedError
+	if !errors.As(err, &target) {
+		t.Fatal("expected errors.As to extract StageAttemptChangedError")
+	}
+	want := `stage ` + id.String() + ` attempt changed: expected "tok-a", got "tok-b"`
+	if got := err.Error(); got != want {
+		t.Errorf("Error() = %q, want %q", got, want)
+	}
+}
+
 func TestInvalidTransitionError_FormatsHumanReadable(t *testing.T) {
 	err := InvalidTransitionError{Kind: "run", From: "pending", To: "succeeded"}
 	want := "invalid run transition: pending → succeeded"
@@ -586,5 +600,21 @@ func TestValidStageTransition_SupersededIsTerminalLockdown(t *testing.T) {
 	}
 	if !ValidStageTransition(StageStateSuperseded, StageStateSuperseded) {
 		t.Error("ValidStageTransition(superseded, superseded) = false, want true (same-state re-application is idempotent)")
+	}
+}
+
+// TestStageAttemptToken_NilIsEmptyAndRenderingIsUTCNano pins the renderer's
+// contract directly (#3598): a nil dispatched_at (legacy pre-0072 row, or a
+// stage never dispatched) renders as the EMPTY string — the "no attempt
+// anchor" value the prompt envelope omits, the reap handler refuses, and
+// transitionStage treats as inert — and a stamped value renders as
+// UTC RFC3339Nano regardless of the input's zone.
+func TestStageAttemptToken_NilIsEmptyAndRenderingIsUTCNano(t *testing.T) {
+	if got := StageAttemptToken(nil); got != "" {
+		t.Errorf("StageAttemptToken(nil) = %q, want empty string", got)
+	}
+	at := time.Date(2026, 9, 22, 10, 11, 12, 123456000, time.FixedZone("x", 3600))
+	if got, want := StageAttemptToken(&at), "2026-09-22T09:11:12.123456Z"; got != want {
+		t.Errorf("StageAttemptToken(%v) = %q, want %q", at, got, want)
 	}
 }
