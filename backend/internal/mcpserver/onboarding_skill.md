@@ -28,7 +28,19 @@ the environment. Read each rung of the returned report:
 - **`merge_gate`** — read FAIL-CLOSED. `unknown` is not evidence the merge
   check is unrequired; it means the question could not be settled. (Omitted
   entirely on a GitLab-family report — that is by design, not a stale
-  backend.)
+  backend; GitLab carries the separate `gitlab_merge_gate` rung instead.)
+- **`gitlab_merge_gate`** (GitLab only) — read FAIL-CLOSED the same way.
+  `unknown` means the protection could not be read and `reason` names why
+  (forge unconfigured, project not visible, a 403 because the deployment
+  credential lacks the Maintainer role, an unresolved default branch, a
+  transport error); it is not evidence the branch is unprotected.
+  `not_pipeline_gated` is a positive finding: `detail` names what is off and
+  `remediation` names the GitLab settings to enable (protect the default
+  branch; "Pipelines must succeed"). Both are operator actions on the GitLab
+  project, not something this skill does. `pipeline_gated` does NOT mean any
+  named check is individually required — GitLab has no per-context required
+  check, and approval rules are not read — so the operator confirms those by
+  hand; `note` says so on every report.
 
 ## Step 2 — `fishhawk_init`
 

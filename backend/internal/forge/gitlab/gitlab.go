@@ -40,6 +40,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -104,6 +105,11 @@ var _ forge.IssueCommentEditor = (*Forge)(nil)
 // merge-requirement read capability the GitLab run-creation path consumes
 // to capture a run's RequiredChecksSnapshot (E45.55 / #3490).
 var _ forge.CIRequirementReader = (*Forge)(nil)
+
+// Compile-time assertion that the adapter provides the standalone
+// branch-protection read capability the onboarding readiness
+// `gitlab_merge_gate` rung consumes (E45.66 / #3580).
+var _ forge.MergeProtectionReader = (*Forge)(nil)
 
 // Option customises a Forge at construction.
 type Option func(*forgeConfig)
@@ -776,6 +782,138 @@ func (f *Forge) ReadCIRequirement(ctx context.Context, scope forge.CredentialSco
 		PipelineMustSucceed:  pi.OnlyAllowMergeIfPipelineSucceeds,
 		AllowSkippedPipeline: pi.AllowMergeOnSkippedPipeline,
 	}, nil
+}
+
+// --- forge.MergeProtectionReader (E45.66 / #3580) -----------------------
+
+// ReadMergeProtection implements forge.MergeProtectionReader for the scope's
+// "gitlab:<id>" project (repo is ignored, as on every other scope-taking
+// method — the scope already names the project authoritatively).
+//
+// ORDER IS LOAD-BEARING. The project read (GET /projects/:id) comes FIRST,
+// so a project the credential cannot see is a real failure — 404 →
+// ErrNotFound, 401/403 → ErrForbidden — and never an "unprotected" verdict;
+// it also resolves an empty branch to the project's real default branch (an
+// empty default branch is ErrNotFound: an empty repository has nothing to
+// protect). Only THEN is the rule list read (GET
+// /projects/:id/protected_branches, paged to exhaustion), and only an
+// AUTHORITATIVE list with no rule matching the branch means Protected:false.
+// The list endpoint needs at least the Maintainer role, so a 403 there maps
+// to ErrForbidden — the consumer renders `unknown`, never "unprotected".
+//
+// Matching follows GitLab's semantics: every rule that covers the branch —
+// the exact-name rule and any `*` wildcard rule
+// (https://docs.gitlab.com/user/project/repository/branches/protected/#use-wildcard-rules)
+// — applies, and GitLab enforces the MOST PERMISSIVE of them. So the result
+// names every matched rule (exact first, then wildcards in API order) and
+// reports the UNION of their push/merge access levels (deduplicated by
+// level, ascending so the most permissive level is first) with
+// AllowForcePush OR'd across them. See protectedBranchRules.
+func (f *Forge) ReadMergeProtection(ctx context.Context, scope forge.CredentialScope, _ forge.RepoRef, branch string) (*forge.MergeProtection, error) {
+	c, pid, err := f.resolve(ctx, scope)
+	if err != nil {
+		return nil, err
+	}
+	pi, err := c.GetProjectByID(ctx, pid)
+	if err != nil {
+		return nil, mapError(err)
+	}
+	if branch == "" {
+		branch = pi.DefaultBranch
+	}
+	if branch == "" {
+		return nil, fmt.Errorf("gitlab: ReadMergeProtection: %w: project %d carries no default branch", forge.ErrNotFound, pid)
+	}
+	rules, err := c.ListProtectedBranches(ctx, pid)
+	if err != nil {
+		return nil, mapError(err)
+	}
+
+	matched := protectedBranchRules(rules, branch)
+	out := &forge.MergeProtection{
+		Branch:                    branch,
+		Protected:                 len(matched) > 0,
+		PipelineMustSucceed:       pi.OnlyAllowMergeIfPipelineSucceeds,
+		AllowSkippedPipeline:      pi.AllowMergeOnSkippedPipeline,
+		DiscussionsMustBeResolved: pi.OnlyAllowMergeIfAllDiscussionsAreResolved,
+	}
+	for i := range matched {
+		r := &matched[i]
+		out.MatchedRules = append(out.MatchedRules, r.Name)
+		out.AllowForcePush = out.AllowForcePush || r.AllowForcePush
+		out.PushAccessLevels = unionAccessLevels(out.PushAccessLevels, r.PushAccessLevels)
+		out.MergeAccessLevels = unionAccessLevels(out.MergeAccessLevels, r.MergeAccessLevels)
+	}
+	return out, nil
+}
+
+// protectedBranchRules returns EVERY rule covering branch: the exact-name
+// rule(s) first, then each `*`-bearing rule whose glob matches, in API
+// order. GitLab applies the most permissive of all matching rules, so a
+// single first-match pick would misreport the effective protection. An
+// empty result means no rule covers the branch.
+func protectedBranchRules(rules []gitlabclient.ProtectedBranch, branch string) []gitlabclient.ProtectedBranch {
+	var out []gitlabclient.ProtectedBranch
+	for _, r := range rules {
+		if r.Name == branch {
+			out = append(out, r)
+		}
+	}
+	for _, r := range rules {
+		if strings.Contains(r.Name, "*") && wildcardMatch(r.Name, branch) {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// wildcardMatch reports whether name matches a GitLab protected-branch
+// wildcard pattern, where `*` (the only metacharacter GitLab documents)
+// matches any run of characters — INCLUDING `/`, a deliberate choice since
+// GitLab does not document `/` as special; path.Match would stop at it.
+func wildcardMatch(pattern, name string) bool {
+	parts := strings.Split(pattern, "*")
+	if len(parts) == 1 {
+		return pattern == name
+	}
+	if !strings.HasPrefix(name, parts[0]) {
+		return false
+	}
+	name = name[len(parts[0]):]
+	last := parts[len(parts)-1]
+	if !strings.HasSuffix(name, last) {
+		return false
+	}
+	name = name[:len(name)-len(last)]
+	for _, mid := range parts[1 : len(parts)-1] {
+		idx := strings.Index(name, mid)
+		if idx < 0 {
+			return false
+		}
+		name = name[idx+len(mid):]
+	}
+	return true
+}
+
+// unionAccessLevels folds add into acc, deduplicating by numeric level
+// (the first-seen description wins) and keeping the result sorted
+// ascending so the lowest — most permissive — level is first.
+func unionAccessLevels(acc []forge.AccessLevel, add []gitlabclient.BranchAccessLevel) []forge.AccessLevel {
+	for _, a := range add {
+		dup := false
+		for _, have := range acc {
+			if have.Level == a.AccessLevel {
+				dup = true
+				break
+			}
+		}
+		if dup {
+			continue
+		}
+		acc = append(acc, forge.AccessLevel{Level: a.AccessLevel, Description: a.AccessLevelDescription})
+	}
+	sort.Slice(acc, func(i, j int) bool { return acc[i].Level < acc[j].Level })
+	return acc
 }
 
 // --- forge.IssueOperations (E50.17 / #2900) -----------------------------

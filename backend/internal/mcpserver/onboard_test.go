@@ -675,14 +675,16 @@ func TestOnboardingToolDescriptions_NameTheSkillResource(t *testing.T) {
 }
 
 // gitlabReadinessBody is a literal gitlab-family backend body (E45.43 /
-// #3348): it carries forge, app.note, NO installation_id and NO merge_gate.
+// #3348): it carries forge, app.note, NO installation_id and NO merge_gate —
+// and, since E45.66 / #3580, the GitLab-shaped gitlab_merge_gate sibling.
 const gitlabReadinessBody = `{
   "repo": "gitlab-com/customer-success/solutions-architecture/coe/gitlab-migrator",
   "forge": "gitlab",
   "app": {"installed": true, "note": "gitlab: project resolvable with the deployment credential; no App installation applies on GitLab"},
   "spec": {"source": "fetched", "valid": true},
   "reviewers": [{"provider": "anthropic", "model": "claude-opus-4-8", "available": true}],
-  "scopes": {"adequate": true, "required": ["read:runs"], "missing": []}
+  "scopes": {"adequate": true, "required": ["read:runs"], "missing": []},
+  "gitlab_merge_gate": {"status": "unknown", "reason": "forbidden", "authoritative": false, "note": "gitlab: ..."}
 }`
 
 // TestOnboardingReadinessReport_GitLabBodyMirrorsBackendTags decodes the
@@ -736,7 +738,10 @@ func TestDoctor_GitLabReport_ReemitsForgeAndNoteAndNoMergeGate(t *testing.T) {
 	if !strings.Contains(body, `"note":"gitlab: project resolvable`) {
 		t.Errorf("DoctorOutput lacks the app note:\n%s", body)
 	}
-	if strings.Contains(body, "merge_gate") {
+	// The QUOTED key: `"merge_gate":` cannot match the sibling
+	// `"gitlab_merge_gate":` key the body now carries (E45.66 / #3580), so
+	// the omission assertion stays exact rather than tripping on the sibling.
+	if strings.Contains(body, `"merge_gate":`) {
 		t.Errorf("DoctorOutput re-emits a merge_gate on a gitlab-family report:\n%s", body)
 	}
 	if strings.Contains(body, "installation_id") {
@@ -754,9 +759,194 @@ func TestDoctorToolDescription_DescribesForgeFamily(t *testing.T) {
 		"CI_PROJECT_PATH",
 		"pass forge=gitlab",
 		"nested groups",
+		"gitlab_merge_gate",
+		"pipeline_gated | not_pipeline_gated | unknown",
+		"no per-context required status check",
 	} {
 		if !strings.Contains(desc, want) {
 			t.Errorf("fishhawk_doctor description missing %q:\n%s", want, desc)
 		}
+	}
+}
+
+// --- gitlab_merge_gate mirror (E45.66 / #3580) ---
+
+// gitlabMergeGateServerBody is the LITERAL gitlab_merge_gate JSON the backend
+// serves on an authoritative read — the shape
+// backend/internal/server/onboarding_test.go's
+// TestOnboardingReadiness_GitLabMergeGate_EndToEnd asserts on the wire.
+// Decoding it through OnboardingReadinessReport is the mirror-drift control:
+// a json-tag typo on the MCP side zero-values the field and the assertions
+// below go red.
+const gitlabMergeGateServerBody = `{
+  "repo": "acme/widgets",
+  "forge": "gitlab",
+  "app": {"installed": true, "note": "gitlab: project resolvable with the deployment credential; no App installation applies on GitLab"},
+  "spec": {"source": "fetched", "valid": true},
+  "reviewers": [],
+  "scopes": {"adequate": true, "required": ["read:runs"], "missing": []},
+  "gitlab_merge_gate": {
+    "status": "pipeline_gated",
+    "branch": "main",
+    "protected": true,
+    "matched_rules": ["main", "m*"],
+    "allow_force_push": true,
+    "push_access_levels": [{"level": 0, "description": "No one"}],
+    "merge_access_levels": [{"level": 30, "description": "Developers + Maintainers"}, {"level": 40, "description": "Maintainers"}],
+    "pipeline_must_succeed": true,
+    "allow_skipped_pipeline": false,
+    "discussions_must_be_resolved": true,
+    "authoritative": true,
+    "note": "gitlab: this rung reports whether the project's real default branch is protected ..."
+  }
+}`
+
+// TestOnboardingReadinessReport_GitLabMergeGateMirrorsBackendTags decodes the
+// literal backend body and asserts every gitlab_merge_gate field lands, the
+// sibling of TestOnboardingReadinessReport_MergeGateMirrorsBackendTags.
+func TestOnboardingReadinessReport_GitLabMergeGateMirrorsBackendTags(t *testing.T) {
+	var got OnboardingReadinessReport
+	if err := json.Unmarshal([]byte(gitlabMergeGateServerBody), &got); err != nil {
+		t.Fatalf("decode backend body: %v", err)
+	}
+	if got.MergeGate != nil {
+		t.Errorf("MergeGate = %+v, want nil on a gitlab-family body", *got.MergeGate)
+	}
+	if got.GitLabMergeGate == nil {
+		t.Fatalf("GitLabMergeGate = nil, want the decoded object")
+	}
+	g := got.GitLabMergeGate
+	if g.Status != "pipeline_gated" {
+		t.Errorf("Status = %q, want pipeline_gated", g.Status)
+	}
+	if g.Branch != "main" {
+		t.Errorf("Branch = %q, want main", g.Branch)
+	}
+	if g.Protected == nil || !*g.Protected {
+		t.Errorf("Protected = %v, want &true", g.Protected)
+	}
+	if len(g.MatchedRules) != 2 || g.MatchedRules[0] != "main" || g.MatchedRules[1] != "m*" {
+		t.Errorf("MatchedRules = %v, want [main m*]", g.MatchedRules)
+	}
+	if g.AllowForcePush == nil || !*g.AllowForcePush {
+		t.Errorf("AllowForcePush = %v, want &true", g.AllowForcePush)
+	}
+	if len(g.PushAccessLevels) != 1 || g.PushAccessLevels[0].Level != 0 || g.PushAccessLevels[0].Description != "No one" {
+		t.Errorf("PushAccessLevels = %+v, want [{0 No one}]", g.PushAccessLevels)
+	}
+	if len(g.MergeAccessLevels) != 2 || g.MergeAccessLevels[0].Level != 30 || g.MergeAccessLevels[1].Level != 40 {
+		t.Errorf("MergeAccessLevels = %+v, want ascending [30 40]", g.MergeAccessLevels)
+	}
+	if g.PipelineMustSucceed == nil || !*g.PipelineMustSucceed {
+		t.Errorf("PipelineMustSucceed = %v, want &true", g.PipelineMustSucceed)
+	}
+	if g.AllowSkippedPipeline == nil || *g.AllowSkippedPipeline {
+		t.Errorf("AllowSkippedPipeline = %v, want &false (read, not absent)", g.AllowSkippedPipeline)
+	}
+	if g.DiscussionsMustBeResolved == nil || !*g.DiscussionsMustBeResolved {
+		t.Errorf("DiscussionsMustBeResolved = %v, want &true", g.DiscussionsMustBeResolved)
+	}
+	if !g.Authoritative {
+		t.Errorf("Authoritative = false, want true")
+	}
+	if !strings.HasPrefix(g.Note, "gitlab: this rung reports") {
+		t.Errorf("Note = %q, want the backend note", g.Note)
+	}
+	if g.Reason != "" || g.Detail != "" || g.Remediation != "" {
+		t.Errorf("reason/detail/remediation = %q/%q/%q, want empty on an authoritative verdict", g.Reason, g.Detail, g.Remediation)
+	}
+}
+
+// TestOnboardingReadinessReport_GitLabMergeGateUnknownKeepsPointersNil pins
+// the absence half of the mirror: an `unknown` body that omits every signal
+// decodes with every pointer bool nil — the mirror never invents a false.
+func TestOnboardingReadinessReport_GitLabMergeGateUnknownKeepsPointersNil(t *testing.T) {
+	var got OnboardingReadinessReport
+	if err := json.Unmarshal([]byte(gitlabReadinessBody), &got); err != nil {
+		t.Fatalf("decode backend body: %v", err)
+	}
+	g := got.GitLabMergeGate
+	if g == nil {
+		t.Fatalf("GitLabMergeGate = nil, want the unknown object")
+	}
+	if g.Status != "unknown" || g.Reason != "forbidden" || g.Authoritative {
+		t.Errorf("got status=%q reason=%q authoritative=%v, want unknown/forbidden/false", g.Status, g.Reason, g.Authoritative)
+	}
+	if g.Protected != nil || g.AllowForcePush != nil || g.PipelineMustSucceed != nil ||
+		g.AllowSkippedPipeline != nil || g.DiscussionsMustBeResolved != nil {
+		t.Errorf("an unread signal decoded non-nil: %+v", *g)
+	}
+	encoded, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	for _, key := range []string{`"protected"`, `"allow_force_push"`, `"pipeline_must_succeed"`, `"allow_skipped_pipeline"`, `"discussions_must_be_resolved"`, `"branch"`} {
+		if strings.Contains(string(encoded), key) {
+			t.Errorf("re-emitted unknown carries %s (an unread signal rendered as a value):\n%s", key, encoded)
+		}
+	}
+}
+
+// TestDoctor_GitLabReport_ReemitsGitLabMergeGate walks the whole tool path
+// against the authoritative gitlab body and asserts the RE-EMITTED WIRE BYTES
+// carry `"gitlab_merge_gate":{` with its status and NO `"merge_gate":` key.
+func TestDoctor_GitLabReport_ReemitsGitLabMergeGate(t *testing.T) {
+	fb, srv := newDoctorFakeBackend(t)
+	fb.rawBody = gitlabMergeGateServerBody
+	r := newResolver(srv, nil)
+
+	_, out, err := r.doctor(context.Background(), nil, DoctorInput{Repo: "acme/widgets", Forge: "gitlab"})
+	if err != nil {
+		t.Fatalf("doctor: %v", err)
+	}
+	if !out.Report.App.Installed {
+		t.Fatalf("report did not decode: %+v", out.Report)
+	}
+	encoded, err := json.Marshal(out)
+	if err != nil {
+		t.Fatalf("marshal DoctorOutput: %v", err)
+	}
+	body := string(encoded)
+	if !strings.Contains(body, `"gitlab_merge_gate":{`) {
+		t.Errorf("DoctorOutput lacks the gitlab_merge_gate object:\n%s", body)
+	}
+	if !strings.Contains(body, `"status":"pipeline_gated"`) {
+		t.Errorf("DoctorOutput lacks the pipeline_gated status:\n%s", body)
+	}
+	if !strings.Contains(body, `"matched_rules":["main","m*"]`) {
+		t.Errorf("DoctorOutput lacks matched_rules:\n%s", body)
+	}
+	if strings.Contains(body, `"merge_gate":`) {
+		t.Errorf("DoctorOutput re-emits a merge_gate on a gitlab-family report:\n%s", body)
+	}
+}
+
+// TestDoctor_GitHubReport_NoGitLabMergeGateKey pins the pointer on the mirror
+// side: a github-family body (mergeGateServerBody) walked through the tool
+// path re-emits NO `gitlab_merge_gate` substring at all. Counterfactual:
+// making OnboardingReadinessReport.GitLabMergeGate a VALUE type turns this red
+// — the re-emitted bytes then carry `"gitlab_merge_gate":{"status":"",...}`,
+// a verdict outside the documented enum that no forge read established.
+func TestDoctor_GitHubReport_NoGitLabMergeGateKey(t *testing.T) {
+	fb, srv := newDoctorFakeBackend(t)
+	fb.rawBody = mergeGateServerBody
+	r := newResolver(srv, nil)
+
+	_, out, err := r.doctor(context.Background(), nil, DoctorInput{Repo: "kuhlman-labs/fishhawk"})
+	if err != nil {
+		t.Fatalf("doctor: %v", err)
+	}
+	if out.Report.MergeGate == nil || out.Report.MergeGate.Status != "required" {
+		t.Fatalf("report did not decode the github merge_gate: %+v", out.Report)
+	}
+	if out.Report.GitLabMergeGate != nil {
+		t.Errorf("GitLabMergeGate = %+v, want nil on a github-family report", *out.Report.GitLabMergeGate)
+	}
+	encoded, err := json.Marshal(out)
+	if err != nil {
+		t.Fatalf("marshal DoctorOutput: %v", err)
+	}
+	if strings.Contains(string(encoded), "gitlab_merge_gate") {
+		t.Errorf("DoctorOutput re-emits a gitlab_merge_gate on a github-family report:\n%s", encoded)
 	}
 }

@@ -5378,21 +5378,27 @@ components:
         each with an explanatory note. Read-only; performs no writes.
 
         Forge-family-aware since E45.43 / #3348: `forge` names the family that
-        answered. On `github` all five checks run. On `gitlab` four run —
-        `app` becomes "is the project resolvable with the deployment GitLab
-        credential" (with `app.note` stating so; `installation_id` is never
-        set), `spec` is read through the forge adapter by the project's full
-        namespaced path, `reviewers` and `scopes` are unchanged — and
-        `merge_gate` is OMITTED ENTIRELY, because branch protection and
-        rulesets are GitHub-only surfaces the backend never reads there;
-        rendering one as `not_required` would claim a read that never
-        happened.
+        answered. Five checks run on each family. On `gitlab` — `app` becomes
+        "is the project resolvable with the deployment GitLab credential"
+        (with `app.note` stating so; `installation_id` is never set), `spec`
+        is read through the forge adapter by the project's full namespaced
+        path, `reviewers` and `scopes` are unchanged — `merge_gate` is
+        OMITTED ENTIRELY, because branch protection and rulesets are
+        GitHub-only surfaces the backend never reads there (rendering one as
+        `not_required` would claim a read that never happened), and the fifth
+        check is the GitLab-shaped sibling `gitlab_merge_gate` (E45.66 /
+        #3580), which is in turn OMITTED on `github`. The two rungs live under
+        SEPARATE keys because they answer different questions and are never
+        conflated: GitLab has no per-context required status check, so
+        `gitlab_merge_gate` reports default-branch protection and
+        pipeline-must-succeed, never whether a named check is required.
 
-        `merge_gate` (#3161) is deliberately OPTIONAL and absent from
-        `required`: a pre-#3161 fishhawkd serves no such key, a gitlab-family
-        response omits it by design, and both must still validate. A client
-        that sees no `merge_gate` has learned nothing about the repo's
-        protection and must not render a verdict.
+        `merge_gate` (#3161) and `gitlab_merge_gate` (#3580) are deliberately
+        OPTIONAL and absent from `required`: a pre-#3161 / pre-#3580
+        fishhawkd serves no such key, each family omits the other's rung by
+        design, and all must still validate. A client that sees neither key
+        has learned nothing about the repo's protection and must not render a
+        verdict.
       required: [repo, app, spec, reviewers, scopes]
       properties:
         repo:
@@ -5636,6 +5642,160 @@ components:
                 what IS required, when the probed check is not.
               items:
                 type: string
+        gitlab_merge_gate:
+          type: object
+          description: |
+            GitLab only (E45.66 / #3580): the GitLab-shaped sibling of
+            `merge_gate`, under its OWN key because it answers a DIFFERENT
+            question. GitLab expresses no per-context required status check,
+            so nothing can say whether a named check gates the merge; this
+            rung answers what GitLab CAN answer — is the project's REAL
+            default branch protected, by which protected-branch rules, with
+            what push/merge access and force-push posture, and does the
+            project require a successful head pipeline to merge.
+
+            OPTIONAL — a github-family response omits it (the rung is
+            gitlab-only) and a pre-#3580 fishhawkd omits it entirely; neither
+            absence is a verdict.
+
+            Read `status` FAIL-CLOSED. `pipeline_gated` and
+            `not_pipeline_gated` are reachable ONLY when BOTH the project
+            settings and the protected-branch list answered authoritatively.
+            `unknown` means the question could not be settled — no gitlab
+            forge configured, project not visible, an adapter without
+            protected-branch reads, an unresolved default branch, a 401/403
+            (the protected_branches API needs at least the Maintainer role),
+            a transport error or a probe timeout — and `reason` names which.
+            An `unknown` is NOT evidence the branch is unprotected. Every
+            signal that was never read is ABSENT from the object, never
+            rendered as `false`.
+
+            Reporting only, point-in-time. `note` is constant and states that
+            access levels are the effective union across matching rules per
+            GitLab's most-permissive semantics, and that `pipeline_gated` is
+            NOT a claim that the `fishhawk_audit_complete` commit status
+            individually gates the merge.
+          required: [status, authoritative, note]
+          properties:
+            status:
+              type: string
+              enum: [pipeline_gated, not_pipeline_gated, unknown]
+              description: |
+                `pipeline_gated` — the default branch is protected AND the
+                project requires a successful pipeline to merge.
+                `not_pipeline_gated` — both reads answered and at least one
+                of those is off (`detail` names which). `unknown` — the
+                question could not be settled; `reason` names why.
+            branch:
+              type: string
+              description: |
+                The project's REAL default branch — the branch the probe
+                evaluated. Never a guessed "main"; absent when it was never
+                resolved.
+              example: main
+            protected:
+              type: boolean
+              description: |
+                Whether at least one protected-branch rule (exact or
+                wildcard) covers `branch`. Absent when the rule list was not
+                read.
+            matched_rules:
+              type: array
+              description: |
+                EVERY protected-branch rule covering `branch` — the
+                exact-name rule first, then wildcard rules in API order.
+                GitLab applies the MOST PERMISSIVE of all matching rules, so a
+                single selected rule is never the effective protection.
+                Empty/absent when unprotected or unread.
+              items:
+                type: string
+              example: [main, 'm*']
+            allow_force_push:
+              type: boolean
+              description: |
+                The OR of `allow_force_push` across every matched rule.
+                Absent when unread.
+            push_access_levels:
+              type: array
+              description: |
+                The UNION of push access levels across every matched rule,
+                deduplicated by level and sorted ascending so the lowest —
+                most permissive — level is first. Empty/absent when
+                unprotected or unread.
+              items:
+                $ref: '#/components/schemas/GitLabAccessLevel'
+            merge_access_levels:
+              type: array
+              description: |
+                The UNION of merge access levels across every matched rule,
+                deduplicated by level and sorted ascending (most permissive
+                first). Empty/absent when unprotected or unread.
+              items:
+                $ref: '#/components/schemas/GitLabAccessLevel'
+            pipeline_must_succeed:
+              type: boolean
+              description: |
+                The project's `only_allow_merge_if_pipeline_succeeds`
+                setting. Absent when the project settings were not read.
+            allow_skipped_pipeline:
+              type: boolean
+              description: |
+                The project's `allow_merge_on_skipped_pipeline` setting
+                (informational). Absent when unread.
+            discussions_must_be_resolved:
+              type: boolean
+              description: |
+                The project's
+                `only_allow_merge_if_all_discussions_are_resolved` setting
+                (informational). Absent when unread.
+            authoritative:
+              type: boolean
+              description: |
+                True only when BOTH the project settings and the
+                protected-branch list answered definitively. Both non-unknown
+                statuses are reachable only when this is true.
+            reason:
+              type: string
+              description: |
+                Machine code naming why the evaluation did not settle.
+                Non-empty whenever status is `unknown`.
+              enum:
+                - gitlab_forge_unconfigured
+                - project_not_visible
+                - merge_protection_unsupported
+                - default_branch_unresolved
+                - forbidden
+                - transport_error
+            detail:
+              type: string
+              description: |
+                The human sentence for `reason`, or — on
+                `not_pipeline_gated` — the signal(s) that are off.
+            remediation:
+              type: string
+              description: The operator's next step, when there is one.
+            note:
+              type: string
+              description: |
+                Constant on every report: what the rung answers, that access
+                levels are the effective union across matching rules, and
+                that GitLab expresses no per-context required status check so
+                `pipeline_gated` is not a claim about any named check.
+
+    GitLabAccessLevel:
+      type: object
+      description: |
+        One role permitted to push to or merge into a protected branch on
+        GitLab: the numeric access level plus its description (0 "No one",
+        30 "Developers + Maintainers", 40 "Maintainers", ...).
+      required: [level, description]
+      properties:
+        level:
+          type: integer
+          example: 40
+        description:
+          type: string
+          example: Maintainers
 
     ApiToken:
       type: object
@@ -6919,15 +7079,20 @@ paths:
       summary: First-run readiness for a repository
       description: |
         Aggregates the server-side-only checks a repo's first run needs
-        (E29.4), consumed by `fishhawk doctor` (E29.5) — five on GitHub, four
-        on GitLab (E45.43 / #3348): App installation (on GitLab: project
-        resolvability with the deployment credential), the committed workflow
-        spec's parse/validate state, per-reviewer availability on this
-        deployment, the caller token's scope adequacy against the run-driving
-        scope subset, and — since #3161, GitHub only — `merge_gate`, whether
-        the `fishhawk_audit_complete` check Fishhawk publishes is actually
-        REQUIRED by the repository's protection on its default branch.
-        Read-only.
+        (E29.4), consumed by `fishhawk doctor` (E29.5) — five on GitHub, five
+        on GitLab (E45.43 / #3348; E45.66 / #3580): App installation (on
+        GitLab: project resolvability with the deployment credential), the
+        committed workflow spec's parse/validate state, per-reviewer
+        availability on this deployment, the caller token's scope adequacy
+        against the run-driving scope subset, and a forge-shaped merge-gate
+        read — since #3161, GitHub only, `merge_gate`, whether the
+        `fishhawk_audit_complete` check Fishhawk publishes is actually
+        REQUIRED by the repository's protection on its default branch; since
+        #3580, GitLab only, `gitlab_merge_gate`, whether the project's real
+        default branch is protected and the project requires a successful
+        pipeline to merge. The two are SEPARATE keys because they answer
+        different questions (GitLab has no per-context required check) and
+        are never conflated. Read-only.
 
         Forge-family resolution, in order: an explicit `forge` query value;
         else the account registry's provider for the repo's owner (the same
@@ -6951,7 +7116,11 @@ paths:
         gitlab-family response omits it by design (the protection surfaces
         are GitHub-only); neither absence is a verdict. Read its `status`
         fail-closed — `unknown` means the question could not be settled, NOT
-        that the check is unrequired.
+        that the check is unrequired. `gitlab_merge_gate` is OPTIONAL the
+        same way: a github-family response and a pre-#3580 fishhawkd omit
+        it; read its `status` fail-closed too — `unknown` means the
+        protection could not be read, NOT that the branch is unprotected,
+        and every unread signal is absent rather than `false`.
 
         Does NOT gate on a write scope, because scope adequacy is itself a
         reported field: a write-scope gate would lock out exactly the callers
