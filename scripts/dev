@@ -1203,7 +1203,12 @@ _diff_touches_shim() {
 _extract_workflow_version_major() {
   local spec_text="$1"
   local line
-  line="$(print -r -- "$spec_text" | grep -E '^[[:space:]]*version:' | head -n 1)"
+  # grep exits 1 on no match; under pipefail that would fail this assignment and
+  # abort cmd_up under set -e whenever a side is empty (no HEAD@{1} reflog in a
+  # fresh clone) — so a no-match is an empty line, not an error.
+  if ! line="$(print -r -- "$spec_text" | grep -E '^[[:space:]]*version:' | head -n 1)"; then
+    line=""
+  fi
   if [[ -z "$line" ]]; then
     return 0
   fi
@@ -2354,6 +2359,118 @@ _relay_down() {
   return 0
 }
 
+# --- Local trace store wiring (E45.75 / #3600) -------------------------------
+# Without FISHHAWKD_S3_BUCKET fishhawkd has no trace store, POST
+# /v0/runs/{id}/trace answers 503, and every local run fails at upload AFTER the
+# agent has run and been billed. `up --start-deps` already starts the RustFS
+# container, so it now also creates the bucket and exports the local settings.
+#
+# The five settings are one GROUP: the endpoint points at local RustFS, where a
+# real AWS credential is meaningless, so they are exported together or not at
+# all — never per-variable, which could pair a real credential with the dev
+# endpoint (or the dev credential with a real bucket).
+TRACE_STORE_VARS=(FISHHAWKD_S3_BUCKET FISHHAWKD_S3_REGION FISHHAWKD_S3_ENDPOINT AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY)
+
+# Print the FIRST of the five trace-store variables that is already SET (even
+# to the empty string) in the current environment — .env is sourced with
+# `set -a` before this runs, so .env and the ambient shell are one namespace —
+# or nothing when none is. Any one of them pins the decision to `operator`: an
+# ambient AWS_ACCESS_KEY_ID held for an unrelated purpose must never be
+# overwritten with the RustFS dev credential. Set-including-empty is the
+# conservative reading: scripts/dev cannot tell a deliberate empty from an
+# accident, so it touches neither.
+_trace_store_pinned_var() {
+  local v
+  for v in "${TRACE_STORE_VARS[@]}"; do
+    if [[ -v "$v" ]]; then
+      print -r -- "$v"
+      return 0
+    fi
+  done
+  return 0
+}
+
+# Pure two-stage decision (no env reads, no side effects), so scripts/test-dev
+# tables every branch without Docker. The ORDER is fixed and never circular:
+#   1. decide <pinned_var> <start_deps 0|1>
+#        -> operator      a trace-store variable is already set: change NOTHING
+#        -> attempt_wire  nothing pinned and --start-deps: run the bootstrap
+#        -> unconfigured  nothing pinned and no --start-deps: warn only
+#   2. ONLY on attempt_wire, the caller runs the bucket bootstrap, then
+#      classify <bootstrap_rc>
+#        -> wired             bootstrap exited 0: export the five as a group
+#        -> bootstrap_failed  non-zero: warn, export NOTHING, keep going
+# The bootstrap outcome is an input to stage 2 only, never to stage 1.
+_resolve_trace_store_wiring() {
+  local stage="$1"
+  case "$stage" in
+    decide)
+      local pinned="${2:-}" start_deps="${3:-0}"
+      if [[ -n "$pinned" ]]; then
+        print operator
+      elif [[ "$start_deps" == 1 ]]; then
+        print attempt_wire
+      else
+        print unconfigured
+      fi
+      ;;
+    classify)
+      local rc="${2:-1}"
+      if [[ "$rc" == 0 ]]; then
+        print wired
+      else
+        print bootstrap_failed
+      fi
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# The idempotent bucket bootstrap — the SAME compose invocation `make s3-init`
+# runs (composed, not reimplemented): the s3-init entrypoint does
+# `head-bucket || create-bucket`, so re-running on an existing bucket exits 0.
+_trace_bucket_bootstrap() {
+  docker compose --profile init run --rm s3-init
+}
+
+# Decide, bootstrap, classify, and on `wired` export the group into the CURRENT
+# shell, so the fishhawkd that cmd_up spawns next inherits it. Must be called
+# directly (never in a $(...) subshell, which would discard the exports). Every
+# branch is non-fatal: it returns 0 so cmd_up can never abort here under set -e.
+_wire_trace_store() {
+  local start_deps="${1:-0}"
+  local pinned decision
+  pinned="$(_trace_store_pinned_var)"
+  decision="$(_resolve_trace_store_wiring decide "$pinned" "$start_deps")"
+  if [[ "$decision" == attempt_wire ]]; then
+    local rc=0
+    if _trace_bucket_bootstrap; then rc=0; else rc=$?; fi
+    decision="$(_resolve_trace_store_wiring classify "$rc")"
+  fi
+  case "$decision" in
+    operator)
+      if [[ "$pinned" == FISHHAWKD_S3_BUCKET ]]; then
+        print "trace store: FISHHAWKD_S3_BUCKET is set in .env or the environment — leaving the trace-store settings untouched"
+      else
+        print -u2 "warning: trace store not wired — ${pinned} is already set in .env or the environment, and scripts/dev will not overwrite it with the local RustFS defaults; set FISHHAWKD_S3_BUCKET (and the rest of .env.example's trace-storage block) explicitly, or unset ${pinned}"
+      fi
+      ;;
+    wired)
+      export FISHHAWKD_S3_BUCKET=fishhawk-traces FISHHAWKD_S3_REGION=us-east-1 FISHHAWKD_S3_ENDPOINT=http://localhost:9000 AWS_ACCESS_KEY_ID=fishhawk AWS_SECRET_ACCESS_KEY=fishhawk-dev-secret
+      print "trace store: wired to local RustFS (bucket fishhawk-traces at http://localhost:9000)"
+      ;;
+    bootstrap_failed)
+      print -u2 "warning: trace store not wired — the RustFS bucket bootstrap failed; run 'make s3-init' and then 'scripts/dev reload --start-deps'. Until then POST /v0/runs/{id}/trace responds 503 and every run fails at trace upload AFTER the agent has run and been billed"
+      ;;
+    unconfigured)
+      print -u2 "warning: no trace store configured — FISHHAWKD_S3_BUCKET is unset, so POST /v0/runs/{id}/trace responds 503 and every run fails at trace upload AFTER the agent has run and been billed; pass --start-deps to wire the local RustFS store, or set .env.example's trace-storage block in .env"
+      ;;
+  esac
+  return 0
+}
+
 cmd_up() {
   print "up: starting"
   _warn_stale_worktrees || true
@@ -2443,6 +2560,11 @@ cmd_up() {
     print "postgres: running"
     print "rustfs: running"
   fi
+
+  # Trace store (E45.75 / #3600): after the .env load and the rustfs readiness
+  # gate, before the spawn — the exports must be in this shell when fishhawkd is
+  # launched below. Non-fatal on every branch; an operator-set variable wins.
+  _wire_trace_store "$start_deps"
 
   # Build
   print "building binaries..."

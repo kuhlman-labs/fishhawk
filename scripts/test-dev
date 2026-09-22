@@ -552,6 +552,14 @@ if [[ -z "$(_extract_workflow_version_major $'workflows: {}\n')" ]]; then
 else
   fail "_extract_workflow_version_major: missing version line should yield empty"
 fi
+# Under cmd_up's set -euo pipefail an empty spec side (no HEAD@{1} reflog in a
+# fresh clone) must not abort: grep's no-match exit is not an error.
+ts_wmc_out="$( setopt errexit pipefail; ts_wmc="$(_workflow_major_changed '' $'version: "2"\n')"; print "ok:${ts_wmc}" )" 2>/dev/null
+if [[ "$ts_wmc_out" == ok:1 ]]; then
+  pass "_workflow_major_changed: an empty side does not abort under errexit+pipefail"
+else
+  fail "_workflow_major_changed: an empty side aborted under errexit+pipefail (grep no-match leaked)"
+fi
 
 # 5d. _workflow_major_changed: 1 on a major bump, 0 on same major / same minor.
 if [[ "$(_workflow_major_changed $'version: "0.7"\n' $'version: "1.0"\n')" == 1 ]]; then
@@ -5481,6 +5489,223 @@ fi
 #       FAIL: _k8s_jaeger_decide should name the equal-port collision and the skip (got: )
 #       FAIL: equal jaeger ports must not print endpoints (got: jaeger UI at http://localhost:35000, OTLP HTTP at http://localhost:35000 (port-forward pid 4242)
 #       FAIL: the equal-port path should report tracing unavailable (got: jaeger UI at http://localhost:35000, OTLP HTTP at http://localhost:35000 (port-forward pid 4242)
+
+# 20. Local trace store wiring (E45.75 / #3600). `up --start-deps` bootstraps
+# the RustFS bucket and group-exports the five local S3 settings; an operator-
+# set variable (any of the five, .env or ambient) wins and is never clobbered.
+#
+# 20a. Stage 1 (decide) is pure: (pinned_var, start_deps) -> operator |
+# attempt_wire | unconfigured. The bootstrap outcome is NOT an input here.
+for ts_case in \
+  "|0|unconfigured" \
+  "|1|attempt_wire" \
+  "FISHHAWKD_S3_BUCKET|1|operator" \
+  "FISHHAWKD_S3_BUCKET|0|operator" \
+  "AWS_ACCESS_KEY_ID|1|operator" \
+  "AWS_SECRET_ACCESS_KEY|1|operator" \
+  "FISHHAWKD_S3_ENDPOINT|1|operator"; do
+  ts_pinned="${ts_case%%|*}"; ts_rest="${ts_case#*|}"
+  ts_deps="${ts_rest%%|*}"; ts_want="${ts_rest#*|}"
+  ts_got="$(_resolve_trace_store_wiring decide "$ts_pinned" "$ts_deps")"
+  if [[ "$ts_got" == "$ts_want" ]]; then
+    pass "_resolve_trace_store_wiring decide pinned='${ts_pinned}' start_deps=${ts_deps} -> ${ts_want}"
+  else
+    fail "_resolve_trace_store_wiring decide pinned='${ts_pinned}' start_deps=${ts_deps} should be ${ts_want} (got: ${ts_got})"
+  fi
+done
+
+# 20b. Stage 2 (classify) is pure: bootstrap rc -> wired | bootstrap_failed.
+for ts_case in "0|wired" "1|bootstrap_failed" "125|bootstrap_failed"; do
+  ts_rc="${ts_case%%|*}"; ts_want="${ts_case#*|}"
+  ts_got="$(_resolve_trace_store_wiring classify "$ts_rc")"
+  if [[ "$ts_got" == "$ts_want" ]]; then
+    pass "_resolve_trace_store_wiring classify rc=${ts_rc} -> ${ts_want}"
+  else
+    fail "_resolve_trace_store_wiring classify rc=${ts_rc} should be ${ts_want} (got: ${ts_got})"
+  fi
+done
+if ! _resolve_trace_store_wiring bogus >/dev/null 2>&1; then
+  pass "_resolve_trace_store_wiring rejects an unknown stage"
+else
+  fail "_resolve_trace_store_wiring should return non-zero on an unknown stage"
+fi
+
+# 20c. _trace_store_pinned_var: nothing set -> empty; ANY of the five set (even
+# to the empty string) pins — the real-AWS-credential non-clobber input.
+ts_got="$(unset "${TRACE_STORE_VARS[@]}"; _trace_store_pinned_var)"
+if [[ -z "$ts_got" ]]; then
+  pass "_trace_store_pinned_var prints nothing when none of the five is set"
+else
+  fail "_trace_store_pinned_var should print nothing when none is set (got: ${ts_got})"
+fi
+ts_got="$(unset "${TRACE_STORE_VARS[@]}"; export AWS_ACCESS_KEY_ID=AKIAREALCRED; _trace_store_pinned_var)"
+if [[ "$ts_got" == AWS_ACCESS_KEY_ID ]]; then
+  pass "_trace_store_pinned_var names an ambient AWS_ACCESS_KEY_ID"
+else
+  fail "_trace_store_pinned_var should name AWS_ACCESS_KEY_ID (got: ${ts_got})"
+fi
+ts_got="$(unset "${TRACE_STORE_VARS[@]}"; FISHHAWKD_S3_REGION=""; _trace_store_pinned_var)"
+if [[ "$ts_got" == FISHHAWKD_S3_REGION ]]; then
+  pass "_trace_store_pinned_var treats a set-but-empty variable as pinned"
+else
+  fail "_trace_store_pinned_var should treat set-but-empty FISHHAWKD_S3_REGION as pinned (got: ${ts_got})"
+fi
+
+# 20d. Body-greps. The bootstrap is the SAME compose invocation `make s3-init`
+# runs (drift-pinned against the Makefile), and the five are exported together
+# in ONE statement; cmd_up wires the store BEFORE the serve spawn, in the
+# current shell (not a $(...) subshell that would discard the exports).
+ts_boot_body="$(typeset -f _trace_bucket_bootstrap)"
+if print -r -- "$ts_boot_body" | grep -q 'docker compose --profile init run --rm s3-init' \
+   && grep -q 'docker compose --profile init run --rm s3-init' "${REPO_ROOT}/Makefile"; then
+  pass "_trace_bucket_bootstrap runs the same compose command as 'make s3-init'"
+else
+  fail "_trace_bucket_bootstrap should run 'docker compose --profile init run --rm s3-init' (the make s3-init command)"
+fi
+ts_export_line="$(typeset -f _wire_trace_store | grep 'export ')"
+if (( $(print -r -- "$ts_export_line" | grep -c 'export ') == 1 )) \
+   && [[ "$ts_export_line" == *FISHHAWKD_S3_BUCKET=fishhawk-traces* && "$ts_export_line" == *FISHHAWKD_S3_REGION=us-east-1* \
+      && "$ts_export_line" == *FISHHAWKD_S3_ENDPOINT=http://localhost:9000* && "$ts_export_line" == *AWS_ACCESS_KEY_ID=fishhawk* \
+      && "$ts_export_line" == *AWS_SECRET_ACCESS_KEY=fishhawk-dev-secret* ]]; then
+  pass "_wire_trace_store exports all five trace-store settings in one group statement"
+else
+  fail "_wire_trace_store should export the five settings in ONE export statement (got: ${ts_export_line})"
+fi
+ts_up_body="$(typeset -f cmd_up)"
+ts_wire_line="$(print -r -- "$ts_up_body" | grep -n '_wire_trace_store "$start_deps"' | head -n 1 | cut -d: -f1)"
+ts_serve_line="$(print -r -- "$ts_up_body" | grep -n ' serve --enable-child-completion-sweeper' | head -n 1 | cut -d: -f1)"
+if [[ -n "$ts_wire_line" && -n "$ts_serve_line" ]] && (( ts_wire_line < ts_serve_line )) \
+   && ! print -r -- "$ts_up_body" | grep -q '\$(_wire_trace_store'; then
+  pass "cmd_up wires the trace store in the current shell BEFORE the fishhawkd spawn"
+else
+  fail "cmd_up should call _wire_trace_store \"\$start_deps\" directly before the serve spawn (wire=${ts_wire_line} serve=${ts_serve_line})"
+fi
+
+# 20e. Behavioral: drive the REAL cmd_up end to end with Docker, the build, the
+# healthz gate and the MCP banner stubbed, and a fake fishhawkd whose `serve`
+# records its OWN environment. This proves the export's EFFECT (the spawned
+# daemon carries the settings), not just its text, and that bootstrap_failed /
+# operator / non-clobber / unconfigured each continue under set -e with the
+# daemon spawned. No Docker required.
+_ts_run_up() {   # <env-file-content|-> [cmd_up args...] ; ambient via TS_AMBIENT_* -> ts_rc ts_out ts_err ts_env ts_rec
+  local envfile="$1"; shift
+  ts_dir="$(mktemp -d "${TMPDIR:-/tmp}/fishhawk-ts-up.XXXXXX")"
+  ts_env="${ts_dir}/serve.env"; ts_rec="${ts_dir}/docker.rec"
+  : > "$ts_rec"
+  touch "${ts_dir}/README.md"
+  if [[ "$envfile" != - ]]; then print -r -- "$envfile" > "${ts_dir}/.env"; fi
+  cat > "${ts_dir}/fishhawkd" <<FAKE
+#!/bin/sh
+case "\$1" in
+  migrate) exit 0 ;;
+  serve) env > "${ts_env}.tmp" && mv "${ts_env}.tmp" "${ts_env}"; exec sleep 30 ;;
+esac
+exit 0
+FAKE
+  chmod +x "${ts_dir}/fishhawkd"
+  ts_out="$(
+    setopt errexit
+    unset "${TRACE_STORE_VARS[@]}"
+    if [[ -n "${TS_AMBIENT_KEY:-}" ]]; then export AWS_ACCESS_KEY_ID="$TS_AMBIENT_KEY"; fi
+    if [[ -n "${TS_AMBIENT_SECRET:-}" ]]; then export AWS_SECRET_ACCESS_KEY="$TS_AMBIENT_SECRET"; fi
+    REPO_ROOT="$ts_dir"; PID_FILE="${ts_dir}/.fishhawk/dev.pid"; NONCE_FILE="${ts_dir}/.fishhawk/dev.nonce"
+    LOG_DIR="${ts_dir}/logs"; LOG_FILE="${ts_dir}/logs/fishhawkd.log"; BIN="${ts_dir}/fishhawkd"
+    docker() {
+      print -r -- "docker $*" >> "$ts_rec"
+      case "$1" in
+        info) return 0 ;;
+        ps) if [[ "$*" == *postgres* ]]; then print fishhawk-postgres; else print fishhawk-rustfs; fi; return 0 ;;
+        compose) if [[ "$*" == "compose --profile init run --rm s3-init" ]]; then return "${TS_BOOTSTRAP_RC:-0}"; fi; return 0 ;;
+      esac
+      return 0
+    }
+    _warn_stale_worktrees() { return 0 }
+    _warn_stale_shim() { return 0 }
+    _preflight_port_free() { return 0 }
+    _detect_rebuild_set() { : }
+    _detect_shim_registered() { print 0 }
+    _await_healthz() { local i=0; while [[ ! -f "$ts_env" ]] && (( i < 100 )); do sleep 0.05; (( ++i )); done; [[ -f "$ts_env" ]] }
+    _verify_healthz_nonce() { return 0 }
+    _tls_enabled() { return 1 }
+    _relay_enabled() { return 1 }
+    _signal_mcp_activation() { : }
+    # A $(...) subshell has no job table, so the real `disown` finds "no current
+    # job"; the spawn (and thus the env inheritance under test) is unaffected.
+    disown() { : }
+    cmd_up "$@" 2>"${ts_dir}/err"
+  )"
+  ts_rc=$?
+  ts_err="$(cat "${ts_dir}/err" 2>/dev/null)"
+  # The fake serve stays alive (cmd_up's `disown` needs a live job); reap it.
+  if [[ -f "${ts_dir}/.fishhawk/dev.pid" ]]; then kill "$(cat "${ts_dir}/.fishhawk/dev.pid")" 2>/dev/null; fi
+}
+_ts_envval() { grep "^$1=" "$ts_env" 2>/dev/null | head -n 1 | cut -d= -f2- }
+_ts_has() { grep -q "^$1=" "$ts_env" 2>/dev/null }
+_ts_boots() { grep -c -- '--profile init run --rm s3-init' "$ts_rec" }
+
+# W1 wired: nothing pinned + --start-deps + bootstrap OK -> the spawned daemon
+# carries all five local values.
+TS_BOOTSTRAP_RC=0 _ts_run_up - --start-deps
+if (( ts_rc == 0 )) && (( $(_ts_boots) == 1 )) \
+   && [[ "$(_ts_envval FISHHAWKD_S3_BUCKET)" == fishhawk-traces && "$(_ts_envval FISHHAWKD_S3_REGION)" == us-east-1 \
+      && "$(_ts_envval FISHHAWKD_S3_ENDPOINT)" == http://localhost:9000 && "$(_ts_envval AWS_ACCESS_KEY_ID)" == fishhawk \
+      && "$(_ts_envval AWS_SECRET_ACCESS_KEY)" == fishhawk-dev-secret && "$ts_out" == *"trace store: wired"* ]]; then
+  pass "W1 wired cmd_up: bootstrap ran once and the spawned fishhawkd's env carries all five local trace-store settings"
+else
+  fail "W1 wired cmd_up (rc=${ts_rc} boots=$(_ts_boots) bucket=$(_ts_envval FISHHAWKD_S3_BUCKET) out=${ts_out} err=${ts_err})"
+fi
+rm -rf "$ts_dir"
+
+# W2 bootstrap_failed: warns naming make s3-init, exports NOTHING, and cmd_up
+# still spawns the daemon and exits 0 (no abort under errexit).
+TS_BOOTSTRAP_RC=1 _ts_run_up - --start-deps
+ts_any=0
+for ts_v in "${TRACE_STORE_VARS[@]}"; do if _ts_has "$ts_v"; then ts_any=1; fi; done
+if (( ts_rc == 0 )) && [[ -f "$ts_env" ]] && (( ts_any == 0 )) && (( $(_ts_boots) == 1 )) \
+   && [[ "$ts_err" == *warning* && "$ts_err" == *"make s3-init"* ]]; then
+  pass "W2 bootstrap_failed cmd_up: warns naming make s3-init, spawns fishhawkd with none of the five, exits 0"
+else
+  fail "W2 bootstrap_failed cmd_up (rc=${ts_rc} spawned=$([[ -f $ts_env ]] && print y) any=${ts_any} boots=$(_ts_boots) err=${ts_err})"
+fi
+rm -rf "$ts_dir"
+
+# W3 operator-wins: an .env-set bucket survives byte-unchanged, no bootstrap,
+# and none of the other four dev defaults is added.
+TS_BOOTSTRAP_RC=0 _ts_run_up "FISHHAWKD_S3_BUCKET=operator-bucket-7f3a" --start-deps
+if (( ts_rc == 0 )) && (( $(_ts_boots) == 0 )) && [[ "$(_ts_envval FISHHAWKD_S3_BUCKET)" == operator-bucket-7f3a ]] \
+   && ! _ts_has FISHHAWKD_S3_ENDPOINT && ! _ts_has AWS_ACCESS_KEY_ID && ! _ts_has AWS_SECRET_ACCESS_KEY; then
+  pass "W3 operator .env bucket: left byte-unchanged, no bootstrap, no dev defaults added"
+else
+  fail "W3 operator-wins (rc=${ts_rc} boots=$(_ts_boots) bucket=$(_ts_envval FISHHAWKD_S3_BUCKET) out=${ts_out} err=${ts_err})"
+fi
+rm -rf "$ts_dir"
+
+# W4 non-clobber: real AWS credentials in the AMBIENT env and no bucket ->
+# operator; the credentials reach the daemon unchanged, nothing else is set,
+# no bootstrap, and the warning names the pinning variable.
+TS_AMBIENT_KEY=AKIAREALOPERATORKEY TS_AMBIENT_SECRET=real-operator-secret TS_BOOTSTRAP_RC=0 _ts_run_up - --start-deps
+if (( ts_rc == 0 )) && (( $(_ts_boots) == 0 )) \
+   && [[ "$(_ts_envval AWS_ACCESS_KEY_ID)" == AKIAREALOPERATORKEY && "$(_ts_envval AWS_SECRET_ACCESS_KEY)" == real-operator-secret ]] \
+   && ! _ts_has FISHHAWKD_S3_BUCKET && ! _ts_has FISHHAWKD_S3_ENDPOINT \
+   && [[ "$ts_err" == *warning* && "$ts_err" == *AWS_ACCESS_KEY_ID* ]]; then
+  pass "W4 ambient real AWS credentials are never clobbered: passed through unchanged, no dev store wired, warning names AWS_ACCESS_KEY_ID"
+else
+  fail "W4 non-clobber (rc=${ts_rc} boots=$(_ts_boots) key=$(_ts_envval AWS_ACCESS_KEY_ID) bucket=$(_ts_envval FISHHAWKD_S3_BUCKET) err=${ts_err})"
+fi
+rm -rf "$ts_dir"
+
+# W5 unconfigured: no --start-deps and nothing pinned -> warns naming the
+# consequence and .env.example, no bootstrap, no exports, daemon still spawned.
+TS_BOOTSTRAP_RC=0 _ts_run_up -
+ts_any=0
+for ts_v in "${TRACE_STORE_VARS[@]}"; do if _ts_has "$ts_v"; then ts_any=1; fi; done
+if (( ts_rc == 0 )) && [[ -f "$ts_env" ]] && (( ts_any == 0 )) && (( $(_ts_boots) == 0 )) \
+   && [[ "$ts_err" == *"no trace store configured"* && "$ts_err" == *503* && "$ts_err" == *.env.example* ]]; then
+  pass "W5 unconfigured cmd_up: warns (503 + .env.example), no bootstrap, no exports, daemon spawned"
+else
+  fail "W5 unconfigured (rc=${ts_rc} any=${ts_any} boots=$(_ts_boots) err=${ts_err})"
+fi
+rm -rf "$ts_dir"
 
 # 6. Parse check: scripts/dev is valid zsh.
 if zsh -n "${REPO_ROOT}/scripts/dev"; then
