@@ -277,6 +277,37 @@ Job/`kubectl run` on the same image, overriding `args` exactly as
 `templates/migrate-job.yaml` does. There is still no HTTP/API route — only
 this direct-DB subcommand.
 
+### Reviewer providers — `anthropic` only ([#3583](https://github.com/kuhlman-labs/fishhawk/issues/3583))
+
+A workflow spec's `reviewers.agents[i].provider` selects one of three
+adapters, and **only one of them works on a chart install**:
+
+| provider | how fishhawkd runs it | works in this chart? |
+|---|---|---|
+| `anthropic` | Anthropic SDK/API call from the fishhawkd process | **yes** — set `anthropicApiKey` (renders `FISHHAWKD_ANTHROPIC_API_KEY`, see the Config table above) |
+| `claudecode` | spawns the `claude` CLI as a subprocess | no |
+| `codex` | spawns the `codex` CLI as a subprocess | no |
+
+The runtime image is `gcr.io/distroless/static-debian12:nonroot`. It
+ships no `claude` binary, no `codex` binary, no shell and no package
+manager, so neither CLI exists in the pod and neither can be installed
+into it.
+
+**Setting `FISHHAWKD_ENABLE_LOCAL_CLAUDE_REVIEWER` or
+`FISHHAWKD_ENABLE_CODEX_REVIEWER` in-cluster is NOT a remedy.** Those
+flags are capability gates, not installers. Since #3583 fishhawkd also
+resolves the configured binary against `PATH` at reviewer resolution and
+refuses when it is absent, naming the missing binary — so the doctor
+`reviewers` rung reports `available: false` and run-create records a
+`reviewer_capability_unavailable` audit entry, instead of reporting an
+available reviewer that then dies at spawn.
+
+The shipped workflow presets declare `provider: anthropic` accordingly,
+so a spec scaffolded by `fishhawk init` runs as-is on a chart install.
+A **host** deployment that has the agent CLIs on PATH can switch to the
+subprocess providers using the commented alternative block each preset
+ships; see `docs/spec/workflow-preset.md`.
+
 ## Secrets ([#849](https://github.com/kuhlman-labs/fishhawk/issues/849))
 
 Sensitive env arrives via `envFrom` `secretRef` whose name is resolved
@@ -656,11 +687,17 @@ compose profile; see `scripts/README.md` "Local k8s ergonomics" and the
 
 Both are set on the fishhawkd container (`resources`) and on the
 migrate Job (`migrate.resources`), and the reasoning is recorded beside
-them in `values.yaml`. fishhawkd is a plain Go HTTP service — since the
-2026-07-27 simplification that moved the `claudecode`/`codex` reviewers
-to the **runner**, the control-plane image carries no agent CLIs and
-spawns no reviewer subprocesses, so the pod is sized with no subprocess
-headroom: 100m/128Mi requests (idle-to-light steady state of a Go
+them in `values.yaml`. fishhawkd is a plain Go HTTP service. It
+DOES construct and spawn the `claudecode`/`codex` reviewer subprocesses
+(`backend/internal/server/review_grounding.go` → the adapter builds an
+`exec.Cmd`) — the 2026-07-27 simplification did not move them to the
+runner, and this paragraph previously said so wrongly (#3583). What keeps
+this pod subprocess-free is different and still holds: the enabling flags
+(`FISHHAWKD_ENABLE_LOCAL_CLAUDE_REVIEWER` / `_CODEX_REVIEWER`) default
+off, the runtime image carries no agent CLI to spawn, and the shipped
+presets declare `provider: anthropic`. So the pod is still sized with no
+subprocess headroom, and the numbers are unchanged: 100m/128Mi requests
+(idle-to-light steady state of a Go
 service with a pgx pool and a few timers) and 500m/512Mi limits (~5x CPU
 burst, a memory ceiling that caps a leak at the pod rather than the
 node). Limits are set on purpose: an unset memory limit leaves the pod

@@ -557,9 +557,14 @@ func budgetLimitOf(t *testing.T, data []byte) float64 {
 }
 
 // TestGenerateSingleReviewerDelta covers the single-vs-dual-reviewers
-// delta branch: the Codex reviewer is dropped from every stage AND the
-// output still validates. It also re-proves the delta still finds its
+// delta branch: every stage keeps exactly its FIRST agent reviewer AND
+// the output still validates. It also re-proves the delta still finds its
 // target now that reviewers stay declared PER STAGE rather than hoisted.
+//
+// Assertions are STRUCTURAL (on the decoded document), not substring
+// matches on the rendered text: since #3583 the presets carry a COMMENTED
+// claudecode/codex alternative block, so `strings.Contains(data, "codex")`
+// is true whatever the delta did.
 func TestGenerateSingleReviewerDelta(t *testing.T) {
 	data, err := Generate(PresetMedium, Deltas{SingleReviewer: true})
 	if err != nil {
@@ -568,21 +573,25 @@ func TestGenerateSingleReviewerDelta(t *testing.T) {
 	if err := ValidateBytes(data); err != nil {
 		t.Fatalf("single-reviewer output does not validate: %v", err)
 	}
-	if strings.Contains(string(data), "codex") || strings.Contains(string(data), "gpt-5.5") {
-		t.Errorf("single-reviewer output still names the codex reviewer:\n%s", data)
-	}
-	// The Claude reviewer must survive.
-	if !strings.Contains(string(data), "claudecode") {
-		t.Errorf("single-reviewer output dropped the claude reviewer too:\n%s", data)
-	}
-	// Structural check: every stage's reviewers.agents has exactly one entry.
-	counts := reviewerCountsByStage(t, data)
-	if len(counts) == 0 {
+	agents := reviewerAgentsByStage(t, data)
+	if len(agents) == 0 {
 		t.Fatal("no stage declares reviewers — the delta assertion is not load-bearing")
 	}
-	for stageID, agents := range counts {
-		if agents != 1 {
-			t.Errorf("stage %q has %d reviewer agents, want 1", stageID, agents)
+	for stageID, list := range agents {
+		// Structural check: every stage's reviewers.agents has exactly one entry.
+		if len(list) != 1 {
+			t.Errorf("stage %q has %d reviewer agents, want 1", stageID, len(list))
+			continue
+		}
+		// The FIRST agent survives, provider and model intact.
+		if list[0].Provider != "anthropic" || list[0].Model != "claude-opus-4-8" {
+			t.Errorf("stage %q surviving agent = %+v, want the first entry {anthropic claude-opus-4-8}", stageID, list[0])
+		}
+		// ...and the SECOND agent's model is gone. Keeping an absence
+		// assertion on a live model id (rather than on "codex", which now
+		// appears only in a comment) keeps this half load-bearing.
+		if list[0].Model == "claude-sonnet-4-6" {
+			t.Errorf("stage %q kept the SECOND agent instead of the first: %+v", stageID, list[0])
 		}
 	}
 }
@@ -673,11 +682,11 @@ func TestGenerateMediumRoundTrip(t *testing.T) {
 	if got := decodePresetDoc(t, data).Workflows["feature_change"].Autonomy; got != "medium" {
 		t.Errorf("medium autonomy tier drifted from feature_change: %q", got)
 	}
-	// Both stages that carry reviewers must run the Claude+Codex pair.
+	// Both stages that carry reviewers must run the full two-agent panel.
 	counts := reviewerCountsByStage(t, data)
 	for _, stageID := range []string{"plan", "implement"} {
 		if counts[stageID] != 2 {
-			t.Errorf("stage %q reviewer agents = %d, want 2 (claude+codex)", stageID, counts[stageID])
+			t.Errorf("stage %q reviewer agents = %d, want 2 (the dual-reviewer panel)", stageID, counts[stageID])
 		}
 	}
 }
@@ -1272,8 +1281,12 @@ func TestGenerateShapeSelectsBase(t *testing.T) {
 	if got := budgetLimitOf(t, data); got != 250 {
 		t.Errorf("budget delta not applied on the config-only base: limit_usd = %v", got)
 	}
-	if strings.Contains(string(data), "codex") {
-		t.Errorf("single-reviewer delta not applied on the config-only base:\n%s", data)
+	// Structural, not a substring match: the preset carries a COMMENTED
+	// claudecode/codex alternative block, so "codex" appears either way.
+	for stageID, list := range reviewerAgentsByStage(t, data) {
+		if len(list) != 1 {
+			t.Errorf("single-reviewer delta not applied on the config-only base: stage %q has %d agents, want 1", stageID, len(list))
+		}
 	}
 }
 
@@ -1319,4 +1332,41 @@ func TestPresetBytesIsAppShape(t *testing.T) {
 			}
 		})
 	}
+}
+
+// presetAgent is one decoded reviewers.agents entry.
+type presetAgent struct {
+	Provider string `yaml:"provider"`
+	Model    string `yaml:"model"`
+}
+
+// reviewerAgentsByStage decodes each stage's reviewers.agents entries.
+// It is the structural counterpart to reviewerCountsByStage: since #3583
+// the presets carry a COMMENTED claudecode/codex alternative block, so a
+// substring assertion on the rendered text cannot distinguish a live
+// entry from a comment.
+func reviewerAgentsByStage(t *testing.T, data []byte) map[string][]presetAgent {
+	t.Helper()
+	var doc struct {
+		Workflows map[string]struct {
+			Stages []struct {
+				ID        string `yaml:"id"`
+				Reviewers *struct {
+					Agents []presetAgent `yaml:"agents"`
+				} `yaml:"reviewers"`
+			} `yaml:"stages"`
+		} `yaml:"workflows"`
+	}
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		t.Fatalf("decode generated preset: %v", err)
+	}
+	out := map[string][]presetAgent{}
+	for _, wf := range doc.Workflows {
+		for _, stage := range wf.Stages {
+			if stage.Reviewers != nil {
+				out[stage.ID] = stage.Reviewers.Agents
+			}
+		}
+	}
+	return out
 }

@@ -1,0 +1,14 @@
+id: scenario:issue-3583/scaffolded-spec-validates
+statement: The workflow spec scaffolded from every preset tier and shape is accepted by the CLI's spec validator, so switching the reviewer provider did not produce a spec the product rejects.
+verify_hint: 'CLI surface: run `fishhawk validate` against each scaffolded `.fishhawk/workflows.yaml` (all three tiers x both shapes) and confirm it exits 0 with no error on stderr.'
+steps: '(1) Build the CLI from the sanctioned read-only checkout at /tmp/fishhawk-acceptance-tree-9c5ee36d-43d6-4a24-9803-71c3356f27b0-59da6531-309e-432d-b7ff-046778d46729 (HEAD f48ad97f): `cd cli && go build -o /tmp/fh3583/fishhawk ./cmd/fishhawk`. (2) Scaffold each case into its own fresh git repo under /tmp/fh3583/m: for each tier in {low, medium, high}, run `mkdir -p <dir> && cd <dir> && git init -q . && /tmp/fh3583/fishhawk init --preset <tier>` and again with `--shape config-only` appended. (3) For each: `/tmp/fh3583/fishhawk validate <case>/.fishhawk/workflows.yaml > /dev/null 2> <case>/verr.txt; echo $?; wc -c < <case>/verr.txt` and require exit 0 with 0 stderr bytes. (4) Corroborate against the running target: POST http://localhost:8090/mcp tools/call fishhawk_init {preset:<tier>, shape:''config-only''} for each tier and feed each returned workflow_yaml to POST /mcp tools/call fishhawk_validate {workflow_spec: <those bytes>} (Mcp-Name: fishhawk_validate), reading structuredContent.valid and .diagnostics.'
+assertions:
+    expected: '`fishhawk validate` exits 0 with no stderr output on every scaffolded .fishhawk/workflows.yaml (three tiers x both shapes).'
+    observed_at_record: 'All 11 scaffolds validated: exit status 0 and 0 bytes on stderr for default, medium, low, high, config-only medium/low/high, and the four --single-reviewer variants. stdout in each case was ''<file>: OK'' followed by the ''checked locally: schema, reuse resolution, stage-reference resolution ...'' sentence. Corroborated on the RUNNING target: POST /mcp tools/call fishhawk_validate with each of the three config-only workflow_yaml bodies and with the medium app workflow_yaml returned valid=true with an empty diagnostics list in every case.'
+    repro_handle: for d in medium low high co-medium co-low co-high; do /tmp/fh3583/fishhawk validate /tmp/fh3583/m/$d/.fishhawk/workflows.yaml; echo $?; done
+origin:
+    issue: 3583
+    pr: 3602
+    run_id: 9c5ee36d-43d6-4a24-9803-71c3356f27b0
+    head_sha: f48ad97fc1e157beec981cc3de0d81d37c61d2d8
+    recorded_at: 2026-09-22T14:53:18Z

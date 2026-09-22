@@ -106,6 +106,38 @@ rule exists for, so both module sides assert it:
 `TestPresetsDoNotHoistReviewers` pins that the plan and implement stages
 declare their own reviewers block and the review stage declares none.
 
+### Why both shipped reviewers are `provider: anthropic`
+
+Both agent reviewers in every preset declare `provider: anthropic`
+(#3583). `anthropic` is the SDK/API adapter; `claudecode` and `codex` are
+subprocesses **fishhawkd itself spawns**. The shipped runtime image is
+`gcr.io/distroless/static-debian12:nonroot` and carries no agent CLI and
+no package manager to install one, so a chart-installed deployment cannot
+execute either subprocess provider — a preset declaring them scaffolds a
+review gate that can never run. Since #3583, `For()` refuses such a
+reviewer at resolution with a message naming the missing binary and PATH,
+rather than constructing an adapter that fails at spawn.
+
+The cost is real and stated: the shipped panel's heterogeneity moves from
+the PROVIDER axis (Claude CLI vs Codex CLI) to the MODEL axis
+(`claude-opus-4-8` + `claude-sonnet-4-6` through one adapter). That is a
+genuine reduction in reviewer independence, taken because the alternative
+is a dead gate on the documented install path.
+
+Each preset ships the `claudecode`/`codex` pair as a COMMENTED
+alternative block directly under the live entries. A **host** deployment
+with those CLIs on PATH can swap to them, and must then also set the
+matching capability flag — `FISHHAWKD_ENABLE_LOCAL_CLAUDE_REVIEWER` /
+`FISHHAWKD_ENABLE_CODEX_REVIEWER` — **and** have the binary resolvable on
+the fishhawkd process's PATH; the flag alone no longer suffices.
+
+`model:` is optional on every entry: an empty model resolves to the
+provider's deployment default (`FISHHAWKD_PLAN_REVIEW_MODEL` for
+`anthropic`). That is the staleness escape hatch — a deployment serving
+different model ids should DELETE the `model:` lines rather than edit
+them, because a model absent from the deployment's fresh snapshot is
+rejected at reviewer resolution (#3578).
+
 ### The handle-free approval gate
 
 The presets carry NO fishhawk-repo-specific defaults (E36.1 / #1639) and
@@ -478,7 +510,7 @@ The delta surface (`spec.Deltas`):
 |---|---|
 | Shape | Selects the repository-shape BASE document (`app` default, `config-only`) via `PresetShapeBytes(preset, shape)` before the other deltas edit it. See [The shape axis](#the-shape-axis). |
 | Budget ceiling | Overrides `budgets[0].limit_usd` (the weekly advisory cost limit). The per-stage `limit_usd` ceilings are a different field and are untouched. |
-| Single vs dual reviewers | Drops the Codex (`gpt-5.5`) reviewer from every stage's `reviewers.agents`, leaving Claude only. Still finds its target because reviewers stay declared per stage. |
+| Single vs dual reviewers | Truncates every stage's `reviewers.agents` to its FIRST entry, leaving one agent reviewer per stage. The rule is POSITIONAL, not provider-keyed (#3583): both shipped agents are `provider: anthropic`, so a provider match would select nothing and the delta would silently no-op. Still finds its target because reviewers stay declared per stage. |
 | Human gates | Selects which of the plan / review approval gates remain human-approved (a gate not selected is left as authored). |
 
 The generator lives in `cli/internal/spec` so `fishhawk init` stays

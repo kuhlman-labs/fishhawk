@@ -499,6 +499,60 @@ inference-configured but ALSO enables a `claudecode`/`codex` subprocess adapter 
 a spec-declared `reviewers.agents[i].provider = claudecode/codex`; fully locking a regional cell to
 region-pinned Anthropic only is a broader change than #2107.
 
+### A subprocess reviewer whose CLI is absent from PATH is refused at resolution (#3583)
+
+`claudecode` and `codex` are **subprocess** adapters: fishhawkd itself spawns them
+(`server.reviewGrounding` → `claudecode`/`codex` `Client` builds an `exec.Cmd`). Before #3583,
+`planReviewerSet.For()` validated only that the enabling flag was on, so setting
+`FISHHAWKD_ENABLE_LOCAL_CLAUDE_REVIEWER` on a deployment with no `claude` binary — a chart install,
+whose runtime image is `gcr.io/distroless/static-debian12:nonroot` and carries no agent CLI — turned
+an honest `available: false` into a false `available: true` for a reviewer that could never spawn.
+
+`For()` now resolves the configured binary against PATH (`resolveBinary`, through an injectable
+`lookPath` seam defaulting to `exec.LookPath`) and fails closed with a message naming the binary, the
+distroless constraint and `provider: anthropic` as the in-cluster alternative. Because `For()` is the
+single chokepoint, the doctor `reviewers` rung, run-create's `unavailableSpecReviewers` (which emits
+`reviewer_capability_unavailable`) and the review dispatch loop all inherit the refusal with no
+change of their own.
+
+Four properties, each test-pinned in `TestPlanReviewerSetForRequiresBinaryOnPATH`:
+
+- **Branch order is load-bearing.** The flag refusal still wins when the flag is OFF — an operator who
+  never enabled the provider keeps the `set FISHHAWKD_ENABLE_*` message and is not told about PATH —
+  and the PATH check runs BEFORE `verifyModel`, so a deployment that cannot spawn the CLI at all is
+  not first told its model is wrong.
+- **The binary checked is the binary that will be spawned.** An empty `--local-claude-binary` /
+  `--codex-reviewer-binary` resolves the adapter's own `DefaultBinary` constant, mirroring
+  `claudecode.NewClient`/`codex.NewClient`'s zero-value defaulting; a configured absolute path is
+  resolved verbatim (`exec.LookPath` treats a name containing a separator as a direct path).
+- **`anthropic` is never probed.** It is an SDK adapter and spawns no subprocess.
+- **`Default()` is deliberately NOT gated.** It has no error channel, so it cannot refuse; the bare
+  count form still constructs the adapter and fails at spawn with the adapter's own
+  `binary not found` error, as before.
+
+The check is per reviewer RESOLUTION, not once at startup. A CLI installed after fishhawkd boots is
+therefore picked up without a restart, at the cost of a TOCTOU window between the check and the
+spawn — a window the adapter's own spawn-time error already closes, so the worst case is the
+pre-change behaviour.
+
+**Operator remedy on a chart install:** use `provider: anthropic` (set `FISHHAWKD_ANTHROPIC_API_KEY`).
+There is no in-cluster fix — the distroless image has no CLI to install and no package manager.
+
+#### Live validation (not covered by the offline tests)
+
+Both refusal surfaces below are structural in unit tests but were NOT exercised against a running
+fishhawkd in this change. To validate:
+
+1. **Doctor refuses a reviewer whose CLI is absent.** Boot fishhawkd with
+   `FISHHAWKD_ENABLE_LOCAL_CLAUDE_REVIEWER=true` on a host with no `claude` on PATH
+   (`PATH=/usr/bin:/bin fishhawkd serve …`, having confirmed `command -v claude` is empty). Call
+   `fishhawk_doctor` against a repository whose fetched spec declares `provider: claudecode`. The
+   `reviewers` rung must report `available: false` with a reason naming the binary (`claude`) and
+   `PATH` — and NOT the old `set FISHHAWKD_ENABLE_LOCAL_CLAUDE_REVIEWER` text.
+2. **Run-create degrades on an unrunnable reviewer.** On that same posture, `POST /v0/runs`. The
+   resulting `reviewer_capability_unavailable` audit entry must carry the PATH reason in its `error`
+   key (that key was added by #3586).
+
 ### The run repository refuses to boot without the reap-path CAS capability (#2672)
 
 `runRepoCASWiringError(cfg.RunRepo)` is a second **startup refusal**, called ONCE immediately before

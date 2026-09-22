@@ -39,7 +39,7 @@ func runInit(args []string, stdout, stderr io.Writer) int {
 	shapeFlag := fs.String("shape", "app", "repository shape: app | config-only")
 	workingDir := fs.String("working-dir", ".", "directory to scaffold (walks up to the .git boundary for the repo root)")
 	budgetUSD := fs.Int("budget-usd", 0, "override the feature_change weekly advisory cost ceiling (budgets[0].limit_usd)")
-	singleReviewer := fs.Bool("single-reviewer", false, "drop the Codex agent reviewer, leaving Claude alone on every stage")
+	singleReviewer := fs.Bool("single-reviewer", false, "drop the second agent reviewer, leaving one agent reviewer on every stage")
 	humanGates := fs.String("human-gates", "", "comma-separated stage ids that keep their human gate; any stage with a gate whose id is not listed has it removed")
 	force := fs.Bool("force", false, "overwrite an existing .fishhawk/workflows.yaml")
 	repo := fs.String("repo", "", "target repo owner/name for the checklist and doctor preflight; auto-detected from git origin when empty")
