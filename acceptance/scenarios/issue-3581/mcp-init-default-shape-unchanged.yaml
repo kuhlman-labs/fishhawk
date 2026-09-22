@@ -1,0 +1,14 @@
+id: scenario:issue-3581/mcp-init-default-shape-unchanged
+statement: Calling fishhawk_init with `shape` omitted returns shape="app" and a workflow_yaml that (a) equals the CURRENT shipped medium app preset bytes (spec.PresetBytes(medium) at the PR head, i.e. the medium app preset as embedded in this PR's fishhawkd) and (b) structurally still carries the app defaults on the implement stage — executor.verify present with command "make test", required_outcomes exactly [tests_added_or_updated, ci_green], and max_files_changed 45.
+verify_hint: 'MCP tool result: call fishhawk_init {} (and fishhawk_init {preset: medium}) and inspect the shape field and the returned workflow_yaml — compare the bytes against the medium app preset shipped at the PR head (the fishhawk_init {preset: medium, shape: app} result must be identical), then parse the implement stage and confirm executor.verify.command is "make test", required_outcomes is [tests_added_or_updated, ci_green] in that order, and max_files_changed is 45.'
+steps: 'POST http://localhost:8090/mcp tools/call fishhawk_init {} ; {preset: medium} ; {preset: medium, shape: app}. Compared the three workflow_yaml byte strings with cmp; compared the exact bytes (jq -j) against docs/spec/workflow-preset-medium.yaml and backend/internal/spec/presets/workflow-preset-medium.yaml in the sanctioned checkout at PR head 172d6e5f (== preview git_sha); parsed the implement stage with yq/jq.'
+assertions:
+    expected: shape=app; workflow_yaml equals the PR-head shipped medium app preset bytes; implement stage carries make test, [tests_added_or_updated, ci_green], 45.
+    observed_at_record: 'All three calls return shape "app", preset "medium", and byte-identical workflow_yaml (exact bytes sha256 7b867bb1…, 10944 B) equal to both PR-head shipped medium app preset files. Implement stage: executor.verify.command == "make test", constraints.required_outcomes == ["tests_added_or_updated","ci_green"] (that order), constraints.max_files_changed == 45. Forge-neutral comment phrases present once each in the app preset too.'
+    repro_handle: 'POST /mcp tools/call fishhawk_init {} ; cmp against docs/spec/workflow-preset-medium.yaml at 172d6e5f; yq -o=json ''.workflows.feature_change.stages[] | select(.type=="implement") | {verify: .executor.verify.command, ro: .constraints.required_outcomes, mfc: .constraints.max_files_changed}'''
+origin:
+    issue: 3581
+    pr: 3592
+    run_id: bed3f1d8-28ba-4cb8-885b-63df045c22cd
+    head_sha: 172d6e5f3803e142811069b039326d8a2f2537c0
+    recorded_at: 2026-09-22T08:21:54Z

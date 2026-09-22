@@ -1,0 +1,14 @@
+id: scenario:issue-3581/mcp-init-config-only-validates
+statement: The workflow_yaml returned by fishhawk_init with shape=config-only passes fishhawk_validate with valid:true for each of the low, medium and high tiers.
+verify_hint: 'MCP tool result: pass the bytes from fishhawk_init as workflow_spec to fishhawk_validate and observe valid:true.'
+steps: 'For each tier low/medium/high: POST http://localhost:8090/mcp tools/call fishhawk_init {preset: <tier>, shape: config-only} → structuredContent.workflow_yaml; POST /mcp tools/call fishhawk_validate {workflow_spec: <those bytes>} (Mcp-Name fishhawk_validate); read structuredContent.'
+assertions:
+    expected: valid:true for each of low, medium and high config-only outputs.
+    observed_at_record: 'low: valid true, source inline, version 2, diagnostics []; medium: valid true, diagnostics []; high: valid true, diagnostics []. All three tool results isError null.'
+    repro_handle: POST /mcp tools/call fishhawk_init {"preset":"<tier>","shape":"config-only"} → POST /mcp tools/call fishhawk_validate {"workflow_spec":"<workflow_yaml>"}
+origin:
+    issue: 3581
+    pr: 3592
+    run_id: bed3f1d8-28ba-4cb8-885b-63df045c22cd
+    head_sha: 172d6e5f3803e142811069b039326d8a2f2537c0
+    recorded_at: 2026-09-22T08:21:54Z

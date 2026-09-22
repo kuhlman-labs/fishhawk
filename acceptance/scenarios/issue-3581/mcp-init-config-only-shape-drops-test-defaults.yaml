@@ -1,0 +1,14 @@
+id: scenario:issue-3581/mcp-init-config-only-shape-drops-test-defaults
+statement: Calling the fishhawk_init MCP tool with preset=medium and shape=config-only returns workflow_yaml whose implement stage declares no executor.verify, whose required_outcomes is exactly [ci_green], whose max_files_changed is 150, and whose output echoes shape=config-only.
+verify_hint: 'MCP tool result: call fishhawk_init {preset: medium, shape: config-only} and inspect the returned workflow_yaml and shape fields.'
+steps: 'POST http://localhost:8090/mcp tools/call (Mcp-Name fishhawk_init, 2026-07-28 headers/_meta, operator bearer) {name: fishhawk_init, arguments: {preset: medium, shape: config-only}} → saved structuredContent.workflow_yaml (exact bytes sha256 22e4aa7b…) and parsed it with yq -o=json | jq, selecting the implement-type stage of workflows.feature_change.'
+assertions:
+    expected: No executor.verify on the implement stage; required_outcomes exactly [ci_green]; max_files_changed 150; shape echoes config-only.
+    observed_at_record: 'HTTP 200, isError null; structuredContent {preset: medium, shape: config-only, target_path: .fishhawk/workflows.yaml, next_step: …}. Implement stage: executor has agent claude-code and NO verify key (only a ''# fishhawk:starter-begin verify … # verify: # command: "make lint" …'' commented starter), constraints.required_outcomes == ["ci_green"], constraints.max_files_changed == 150. Bytes identical to docs/spec/workflow-preset-medium-config-only.yaml and backend/internal/spec/presets/workflow-preset-medium-config-only.yaml at PR head 172d6e5f.'
+    repro_handle: POST /mcp tools/call fishhawk_init {"preset":"medium","shape":"config-only"} | jq -r .result.structuredContent.workflow_yaml | yq -o=json '.workflows.feature_change.stages[] | select(.type=="implement")'
+origin:
+    issue: 3581
+    pr: 3592
+    run_id: bed3f1d8-28ba-4cb8-885b-63df045c22cd
+    head_sha: 172d6e5f3803e142811069b039326d8a2f2537c0
+    recorded_at: 2026-09-22T08:21:54Z

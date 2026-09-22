@@ -1,0 +1,14 @@
+id: scenario:issue-3581/mcp-init-unknown-shape-rejected
+statement: Calling fishhawk_init with shape=monorepo returns a tool error naming the valid shapes app and config-only, and no workflow_yaml.
+verify_hint: 'MCP tool result: call fishhawk_init {shape: monorepo} and observe the error text.'
+steps: 'POST http://localhost:8090/mcp tools/call fishhawk_init {shape: monorepo}; also {preset: medium, shape: monorepo}; control {preset: ultra}.'
+assertions:
+    expected: Tool error naming the valid shapes app and config-only, and no workflow_yaml.
+    observed_at_record: 'HTTP 200 JSON-RPC result with isError true, content[0].text ''unknown shape "monorepo": want one of app, config-only'', structuredContent null (no workflow_yaml); same with preset medium. Control: ''unknown preset "ultra": want one of low, medium, high''.'
+    repro_handle: POST /mcp tools/call fishhawk_init {"shape":"monorepo"}
+origin:
+    issue: 3581
+    pr: 3592
+    run_id: bed3f1d8-28ba-4cb8-885b-63df045c22cd
+    head_sha: 172d6e5f3803e142811069b039326d8a2f2537c0
+    recorded_at: 2026-09-22T08:21:54Z

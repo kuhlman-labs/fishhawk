@@ -1,0 +1,14 @@
+id: scenario:issue-3581/cli-init-shape-flag
+statement: 'Running fishhawk init --shape config-only in a fresh repository writes a .fishhawk/workflows.yaml that fishhawk validate exits 0 on, prints a stdout line carrying `shape: config-only`, and the written implement stage has no live verify block; running fishhawk init --shape monorepo exits with the usage status and names `app, config-only` on stderr.'
+verify_hint: 'CLI exit code/stdout/stderr: run the fishhawk binary''s init with --shape in a temporary git directory, then fishhawk validate on the written file.'
+steps: 'Posture B per verify_hint (CLI binary): built fishhawk from the sanctioned checkout /tmp/fishhawk-acceptance-tree-bed3f1d8-28ba-4cb8-885b-63df045c22cd-0bb56b45-8261-4f07-8902-91123a9078f7 (HEAD 172d6e5f; checkout untouched, git status clean): cd cli && go build -o /tmp/fh3581/fishhawk ./cmd/fishhawk. In a fresh repo (mkdir /tmp/fh3581/cli-repo && git init): /tmp/fh3581/fishhawk init --shape config-only (stdout/stderr captured); parsed .fishhawk/workflows.yaml with yq/jq; grep for the forge-neutral phrases; /tmp/fh3581/fishhawk validate .fishhawk/workflows.yaml and bare fishhawk validate. In a second fresh repo /tmp/fh3581/cli-repo2: fishhawk init --shape monorepo; compared exit status with fishhawk init --nope and --preset ultra.'
+assertions:
+    expected: 'Written workflows.yaml validates exit 0; stdout line carries ''shape: config-only''; implement stage has no live verify block; --shape monorepo exits with the usage status naming ''app, config-only'' on stderr.'
+    observed_at_record: 'init --shape config-only: exit 0; stdout first line ''wrote /tmp/fh3581/cli-repo/.fishhawk/workflows.yaml (preset: medium, shape: config-only)'' (then AGENTS.md/CLAUDE.md created and the doctor preflight); written implement stage has no executor.verify (commented starter only), required_outcomes [ci_green], max_files_changed 150, both forge-neutral phrases present; fishhawk validate → ''.fishhawk/workflows.yaml: OK'', exit 0 (both forms). init --shape monorepo: exit 2 (identical to the unknown-flag and unknown-preset usage status), stderr ''fishhawk init: unknown --shape "monorepo" (want one of app, config-only)'', stdout empty, no .fishhawk directory written. fishhawk init -h usage line reads ''[--shape app|config-only]''.'
+    repro_handle: cd $(mktemp -d) && git init -q && /tmp/fh3581/fishhawk init --shape config-only && /tmp/fh3581/fishhawk validate .fishhawk/workflows.yaml ; /tmp/fh3581/fishhawk init --shape monorepo ; echo $?
+origin:
+    issue: 3581
+    pr: 3592
+    run_id: bed3f1d8-28ba-4cb8-885b-63df045c22cd
+    head_sha: 172d6e5f3803e142811069b039326d8a2f2537c0
+    recorded_at: 2026-09-22T08:21:54Z
