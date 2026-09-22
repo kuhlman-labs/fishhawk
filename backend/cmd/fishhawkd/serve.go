@@ -1662,19 +1662,30 @@ func runServe(args []string, logSink io.Writer) int {
 		"secret token GitLab sends VERBATIM in X-Gitlab-Token (no HMAC); when empty, /webhooks/gitlab responds 503")
 	s3Bucket := fs.String("s3-bucket", envOr("FISHHAWKD_S3_BUCKET", ""),
 		"S3 bucket for trace bundle storage; when empty, /v0/runs/{id}/trace responds 503 "+
-			"(unless --dev-fixtures selects the in-memory dev store)")
+			"(unless --dev-fixtures or --dev-trace-store selects the in-memory dev store)")
 	devFixtures := fs.Bool("dev-fixtures", envOrBool("FISHHAWKD_DEV_FIXTURES", false),
 		"DEV ONLY (E72.2 / #3326): register the loopback-only seeded-fixture routes "+
 			"(GET/POST /v0/dev/fixtures, POST /v0/dev/sign) so an acceptance preview can materialize "+
 			"named scenarios; requires --db (without one the surface stays off). With --s3-bucket unset "+
 			"it also selects an in-memory trace store so /v0/runs/{id}/trace is drivable (#1874). "+
+			"Enabling it puts the daemon in DEV MODE, which DENIES every forge write (no branch push, "+
+			"no pull/merge request opened) and refuses host-dispatch for every caller (E72.13 / #3500); "+
+			"if an in-memory trace store was the only thing you wanted, use --dev-trace-store instead. "+
 			"Never enable in production")
 	devStubForge := fs.Bool("dev-stub-forge", envOrBool("FISHHAWKD_DEV_STUB_FORGE", false),
 		"DEV ONLY (E72.3 / #3327): serve GitHub and GitLab from an in-process stub forge and register "+
 			"the loopback-only /v0/dev/forge* control routes so an acceptance preview can seed forge state "+
 			"and dispatch signed webhook deliveries without a real forge. Refuses to coexist with a "+
 			"configured GitHub App or GitLab token; defaults both webhook secrets when unset. "+
+			"Enabling it puts the daemon in DEV MODE, which DENIES every forge write (no branch push, "+
+			"no pull/merge request opened) and refuses host-dispatch for every caller (E72.13 / #3500). "+
 			"Never enable in production")
+	devTraceStore := fs.Bool("dev-trace-store", envOrBool("FISHHAWKD_DEV_TRACE_STORE", false),
+		"DEV ONLY (E45.76 / #3601): with --s3-bucket unset, select the in-memory trace store so "+
+			"/v0/runs/{id}/trace is drivable WITHOUT mounting any dev surface — unlike --dev-fixtures "+
+			"this does NOT put the daemon in dev mode, so forge writes stay live. The store is "+
+			"EPHEMERAL: every trace bundle is lost when fishhawkd restarts, so prefer the durable "+
+			"answer, FISHHAWKD_S3_BUCKET plus 'make s3-init', for a real local loop")
 	s3Region := fs.String("s3-region", envOr("FISHHAWKD_S3_REGION", "us-east-1"),
 		"AWS region for the trace bundle bucket")
 	s3Endpoint := fs.String("s3-endpoint", envOr("FISHHAWKD_S3_ENDPOINT", ""),
@@ -2444,18 +2455,27 @@ func runServe(args []string, logSink io.Writer) int {
 			slog.String("bucket", *s3Bucket),
 			slog.String("region", *s3Region),
 			slog.String("endpoint", *s3Endpoint))
-	} else if resolved, selected := resolveDevTraceStore(*devFixtures, *s3Bucket, cfg.TraceStore); selected {
-		// Dev-fixtures trace store (E72.2 / #3326, closing #1874): under the
-		// dev flag with no bucket, an in-memory store stands in so the
-		// preview's POST /v0/runs/{id}/trace → recordCost → spend / unpriced
-		// alerts are drivable end to end. A configured bucket always wins
-		// (the branch above), and the 503 warning below is reserved for the
-		// case where NEITHER store is selected. Gated on `selected`, not on
-		// a non-nil return: the helper's passthrough arm hands back an
-		// already-wired store unchanged, and this line must only ever claim
-		// a store this branch actually minted.
+	} else if resolved, source, selected := resolveDevTraceStore(*devFixtures, *devTraceStore, *s3Bucket, cfg.TraceStore); selected {
+		// Dev trace store (E72.2 / #3326, closing #1874; --dev-trace-store
+		// added by E45.76 / #3601): under either dev knob with no bucket, an
+		// in-memory store stands in so POST /v0/runs/{id}/trace → recordCost
+		// → spend / unpriced alerts are drivable end to end. A configured
+		// bucket always wins (the branch above), and the 503 warning below is
+		// reserved for the case where NEITHER store is selected. Gated on
+		// `selected`, not on a non-nil return: the helper's passthrough arm
+		// hands back an already-wired store unchanged, and this line must
+		// only ever claim a store this branch actually minted.
 		cfg.TraceStore = resolved
-		logger.Info("trace store: in-memory (dev fixtures)")
+		logger.Info("trace store: in-memory (" + source + ")")
+		// The convenience of either knob buys an EPHEMERAL store: a daemon
+		// that writes to a REAL repository while losing every trace bundle on
+		// restart is a new posture and is worth being noisy about, so the
+		// consequence is a WARN beside the Info line rather than folded into
+		// it (the Info string is byte-preserved — README and serve_test quote
+		// the dev-fixtures form).
+		logger.Warn("trace store is EPHEMERAL: every trace bundle is lost when fishhawkd restarts "+
+			"— set FISHHAWKD_S3_BUCKET (`make s3-init`) for a durable store",
+			slog.String("selected_by", source))
 	} else {
 		logger.Warn("FISHHAWKD_S3_BUCKET not set; /v0/runs/{id}/trace will respond 503")
 	}
@@ -2642,6 +2662,18 @@ func runServe(args []string, logSink io.Writer) int {
 			slog.Bool("gitlab_webhook_secret_defaulted", stubForgeWiring.GitLabWebhookSecretDefaulted))
 	} else {
 		logger.Warn("FISHHAWKD_GITHUB_APP_ID not set; webhook dispatch and GitHub-side actions will be disabled")
+	}
+
+	// Dev-mode consequence WARN (E45.76 / #3601). Emitted ONCE, here, because
+	// this is the first point at which BOTH dev surfaces are resolved
+	// (cfg.DevFixtures is assigned in the pool block above, cfg.DevStubForge
+	// in the chain that just closed). Keyed on the mounted surfaces — the
+	// SAME predicate as server.devModeActive() — so `--dev-fixtures` without
+	// `--db` (cfg.DevFixtures stays nil, the daemon is NOT in dev mode) draws
+	// no denial warning; the "surface stays off" line above already covers
+	// that case. Additional to the per-surface WARNs, not a replacement.
+	if msg, warn := devModeBootWarning(cfg.DevFixtures != nil, cfg.DevStubForge != nil); warn {
+		logger.Warn(msg)
 	}
 
 	// campaignNotifier is the issue-comment notifier the campaign driver fires
@@ -4075,18 +4107,67 @@ func parseInstallationHostAllowlist(raw string) []string {
 	return out
 }
 
-// resolveDevTraceStore picks the trace store the dev-fixtures flag implies
-// (E72.2 / #3326): tracestore.NewMem() with selected=true iff the flag is on,
-// no S3 bucket is configured, and nothing else already wired a store;
-// otherwise current is returned unchanged with selected=false. The boolean is
-// what the boot log keys on — a non-nil return alone cannot distinguish a
-// freshly minted dev store from a passthrough of an already-wired one. Pure
-// so serve_test can table it without booting.
-func resolveDevTraceStore(devFixtures bool, s3Bucket string, current tracestore.Storage) (resolved tracestore.Storage, selected bool) {
-	if devFixtures && s3Bucket == "" && current == nil {
-		return tracestore.NewMem(), true
+// devTraceStoreSourceFixtures / devTraceStoreSourceKnob name the knob that
+// selected the in-memory trace store, for the boot line.
+const (
+	devTraceStoreSourceFixtures = "dev fixtures"
+	devTraceStoreSourceKnob     = "dev trace store"
+)
+
+// resolveDevTraceStore picks the trace store a dev knob implies (E72.2 /
+// #3326, extended E45.76 / #3601): tracestore.NewMem() with selected=true iff
+// EITHER --dev-fixtures or --dev-trace-store is on, no S3 bucket is
+// configured, and nothing else already wired a store; otherwise current is
+// returned unchanged with selected=false. The boolean is what the boot log
+// keys on — a non-nil return alone cannot distinguish a freshly minted dev
+// store from a passthrough of an already-wired one.
+//
+// source names WHICH knob selected it, so the boot line can say so: a daemon
+// that lost its trace bundles on restart must be able to tell an operator
+// which flag put it in that posture. --dev-fixtures wins when both are set,
+// because that daemon is in dev mode either way and the fixtures surface is
+// the louder fact. Empty on the passthrough arm.
+//
+// Pure so serve_test can table it without booting.
+func resolveDevTraceStore(devFixtures, devTraceStore bool, s3Bucket string, current tracestore.Storage) (resolved tracestore.Storage, source string, selected bool) {
+	if (devFixtures || devTraceStore) && s3Bucket == "" && current == nil {
+		if devFixtures {
+			return tracestore.NewMem(), devTraceStoreSourceFixtures, true
+		}
+		return tracestore.NewMem(), devTraceStoreSourceKnob, true
 	}
-	return current, false
+	return current, "", false
+}
+
+// devModeBootWarning renders the one-line dev-mode consequence WARN
+// (E45.76 / #3601), keyed on the SAME predicate as
+// server.devModeActive(): dev mode IS the presence of a mounted dev
+// surface. warn is false when neither is mounted, so a production
+// daemon's boot output is byte-identical to before this change — the
+// daemon must never warn about a denial it is not applying.
+//
+// The message names every dev-mode consequence in one place, because
+// today an operator learns the forge-write denial only by reading
+// runner/cmd/fishhawk-runner/forgewrites.go. It closes with the remedy
+// split: the durable store first, the ephemeral one second.
+//
+// Pure so serve_test can table all four modes without booting.
+func devModeBootWarning(fixturesMounted, stubForgeMounted bool) (msg string, warn bool) {
+	var surfaces []string
+	if fixturesMounted {
+		surfaces = append(surfaces, "dev_fixtures")
+	}
+	if stubForgeMounted {
+		surfaces = append(surfaces, "dev_stub_forge")
+	}
+	if len(surfaces) == 0 {
+		return "", false
+	}
+	return "DEV MODE ACTIVE (" + strings.Join(surfaces, ", ") + " mounted): forge writes are DENIED " +
+		"(no branch push, no pull/merge request opened), host-dispatch is refused for every caller with " +
+		"403 host_dispatch_refused_dev_mode, and /healthz advertises dev_mode: true. If you enabled a dev " +
+		"surface only to get a trace store, use FISHHAWKD_S3_BUCKET (`make s3-init`) for a durable store, " +
+		"or --dev-trace-store for an EPHEMERAL in-memory one WITHOUT the forge-write denial", true
 }
 
 // devStubForgeWiring is what resolveDevStubForge hands runServe: whether the

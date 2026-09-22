@@ -3702,27 +3702,33 @@ func TestTraceStoreReadinessFor(t *testing.T) {
 		ts              tracestore.Storage
 		configured      bool
 		kind            string
-		noteHas         string
+		noteHas         []string
 		remediationHas  []string
 		wantRemediation bool
 	}{
-		{"nil", nil, false, "none", "responds 503", []string{"FISHHAWKD_S3_BUCKET", "make s3-init", ".env.example"}, true},
-		{"typed-nil s3", typedNilS3, false, "none", "responds 503", []string{"FISHHAWKD_S3_BUCKET"}, true},
-		{"typed-nil mem", typedNilMem, false, "none", "responds 503", []string{"FISHHAWKD_S3_BUCKET"}, true},
-		{"memory", tracestore.NewMem(), true, "memory", "EPHEMERAL", nil, false},
-		{"s3", tracestore.NewS3Storage(nil, "bucket"), true, "s3", "", nil, false},
-		{"other", otherTraceStore{}, true, "other", "no claim is made about its durability", nil, false},
+		{"nil", nil, false, "none", []string{"responds 503"}, []string{"FISHHAWKD_S3_BUCKET", "make s3-init", ".env.example"}, true},
+		{"typed-nil s3", typedNilS3, false, "none", []string{"responds 503"}, []string{"FISHHAWKD_S3_BUCKET"}, true},
+		{"typed-nil mem", typedNilMem, false, "none", []string{"responds 503"}, []string{"FISHHAWKD_S3_BUCKET"}, true},
+		// The memory note must attribute the store to BOTH knobs: since
+		// E45.76 / #3601 --dev-trace-store also yields kind memory, so a note
+		// naming only --dev-fixtures would misattribute the posture (and
+		// misdirect an operator to the flag that ALSO denies forge writes).
+		{"memory", tracestore.NewMem(), true, "memory", []string{"EPHEMERAL", "--dev-fixtures", "--dev-trace-store"}, nil, false},
+		{"s3", tracestore.NewS3Storage(nil, "bucket"), true, "s3", nil, nil, false},
+		{"other", otherTraceStore{}, true, "other", []string{"no claim is made about its durability"}, nil, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := traceStoreReadinessFor(tc.ts)
 			if got.Configured != tc.configured || got.Kind != tc.kind {
 				t.Fatalf("got configured=%v kind=%q, want configured=%v kind=%q", got.Configured, got.Kind, tc.configured, tc.kind)
 			}
-			if tc.noteHas == "" && got.Note != "" {
+			if len(tc.noteHas) == 0 && got.Note != "" {
 				t.Errorf("Note = %q, want empty on kind %q", got.Note, tc.kind)
 			}
-			if tc.noteHas != "" && !strings.Contains(got.Note, tc.noteHas) {
-				t.Errorf("Note = %q, want it to contain %q", got.Note, tc.noteHas)
+			for _, want := range tc.noteHas {
+				if !strings.Contains(got.Note, want) {
+					t.Errorf("Note = %q, want it to contain %q", got.Note, want)
+				}
 			}
 			if !tc.wantRemediation && got.Remediation != "" {
 				t.Errorf("Remediation = %q, want empty on kind %q", got.Remediation, tc.kind)
@@ -3781,8 +3787,12 @@ func TestOnboardingReadiness_TraceStore_SpecUnavailableStillCarriesRung(t *testi
 	if ts["configured"] != true || ts["kind"] != traceStoreKindMemory {
 		t.Errorf("trace_store = %v, want configured:true kind:memory", ts)
 	}
-	if note, _ := ts["note"].(string); !strings.Contains(note, "EPHEMERAL") {
-		t.Errorf("trace_store.note = %q, want the ephemerality", note)
+	// The SERVED note is the text the CLI doctor rung renders verbatim, so
+	// both knobs must survive the wire, not only the in-process constant.
+	for _, want := range []string{"EPHEMERAL", "--dev-fixtures", "--dev-trace-store"} {
+		if note, _ := ts["note"].(string); !strings.Contains(note, want) {
+			t.Errorf("trace_store.note = %q, want it to contain %q", note, want)
+		}
 	}
 }
 
