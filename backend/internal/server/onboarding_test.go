@@ -22,10 +22,12 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	forgegitlab "github.com/kuhlman-labs/fishhawk/backend/internal/forge/gitlab"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/mcpserver"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mergegate"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/modeloracle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/tracestore"
 )
 
 // onboardingReviewersSpecYAML is a valid feature_change spec whose plan stage
@@ -3679,5 +3681,157 @@ func TestOnboardingReadiness_GitLab_RegistrationAgreesWithRunCreate(t *testing.T
 				}
 			}
 		})
+	}
+}
+
+// --- trace_store rung (E45.75 / #3600) ---
+
+// otherTraceStore is a third tracestore.Storage implementation (neither
+// *S3Storage nor *MemStorage). Embedding the interface satisfies it without
+// implementing any method — the resolver only type-switches, never calls.
+type otherTraceStore struct{ tracestore.Storage }
+
+// TestTraceStoreReadinessFor tables every resolver branch: each case asserts
+// Configured, Kind AND the branch-specific Note/Remediation text, so a no-op
+// or comment-only touch of the resolver fails here.
+func TestTraceStoreReadinessFor(t *testing.T) {
+	var typedNilS3 *tracestore.S3Storage
+	var typedNilMem *tracestore.MemStorage
+	for _, tc := range []struct {
+		name            string
+		ts              tracestore.Storage
+		configured      bool
+		kind            string
+		noteHas         string
+		remediationHas  []string
+		wantRemediation bool
+	}{
+		{"nil", nil, false, "none", "responds 503", []string{"FISHHAWKD_S3_BUCKET", "make s3-init", ".env.example"}, true},
+		{"typed-nil s3", typedNilS3, false, "none", "responds 503", []string{"FISHHAWKD_S3_BUCKET"}, true},
+		{"typed-nil mem", typedNilMem, false, "none", "responds 503", []string{"FISHHAWKD_S3_BUCKET"}, true},
+		{"memory", tracestore.NewMem(), true, "memory", "EPHEMERAL", nil, false},
+		{"s3", tracestore.NewS3Storage(nil, "bucket"), true, "s3", "", nil, false},
+		{"other", otherTraceStore{}, true, "other", "no claim is made about its durability", nil, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := traceStoreReadinessFor(tc.ts)
+			if got.Configured != tc.configured || got.Kind != tc.kind {
+				t.Fatalf("got configured=%v kind=%q, want configured=%v kind=%q", got.Configured, got.Kind, tc.configured, tc.kind)
+			}
+			if tc.noteHas == "" && got.Note != "" {
+				t.Errorf("Note = %q, want empty on kind %q", got.Note, tc.kind)
+			}
+			if tc.noteHas != "" && !strings.Contains(got.Note, tc.noteHas) {
+				t.Errorf("Note = %q, want it to contain %q", got.Note, tc.noteHas)
+			}
+			if !tc.wantRemediation && got.Remediation != "" {
+				t.Errorf("Remediation = %q, want empty on kind %q", got.Remediation, tc.kind)
+			}
+			for _, want := range tc.remediationHas {
+				if !strings.Contains(got.Remediation, want) {
+					t.Errorf("Remediation = %q, want it to contain %q", got.Remediation, want)
+				}
+			}
+		})
+	}
+}
+
+// TestOnboardingReadiness_TraceStore_NotInstalledStillCarriesRung is the
+// no-cascade seam on the app rung: a GitHub repo whose App is NOT installed
+// (the installation read 404s) still serves trace_store, because the rung
+// answers a question about the DEPLOYMENT, not the repo. The served body is
+// read RAW so key presence is asserted, not a zero value.
+func TestOnboardingReadiness_TraceStore_NotInstalledStillCarriesRung(t *testing.T) {
+	fake := newFakeGitHubForRuns(onboardingReviewersSpecYAML)
+	fake.installationStatus = http.StatusNotFound
+	fake.installationBody = `{"message":"Not Found"}`
+	s := newOnboardingServer(t, fake.server(t), nil)
+
+	id := testOperatorIdentity()
+	raw := rawReadiness(t, s, onboardingReq("x/y", &id))
+	if app := rawObject(t, raw, "app"); app["installed"] != false {
+		t.Fatalf("app = %v, want installed:false (fixture must seed the not-installed cascade)", app)
+	}
+	ts := rawObject(t, raw, "trace_store")
+	if ts["configured"] != false || ts["kind"] != traceStoreKindNone {
+		t.Errorf("trace_store = %v, want configured:false kind:none", ts)
+	}
+	if rem, _ := ts["remediation"].(string); !strings.Contains(rem, "FISHHAWKD_S3_BUCKET") {
+		t.Errorf("trace_store.remediation = %q, want it to name FISHHAWKD_S3_BUCKET", rem)
+	}
+}
+
+// TestOnboardingReadiness_TraceStore_SpecUnavailableStillCarriesRung is the
+// no-cascade seam on the spec rung: an installed repo whose spec is
+// unavailable (the contents read 404s) still serves trace_store, here with the
+// in-memory store wired so the served kind is memory.
+func TestOnboardingReadiness_TraceStore_SpecUnavailableStillCarriesRung(t *testing.T) {
+	fake := newFakeGitHubForRuns(onboardingReviewersSpecYAML)
+	fake.specStatus = http.StatusNotFound
+	fake.specBody = `{"message":"Not Found"}`
+	s := newOnboardingServer(t, fake.server(t), nil)
+	s.cfg.TraceStore = tracestore.NewMem()
+
+	id := testOperatorIdentity()
+	raw := rawReadiness(t, s, onboardingReq("x/y", &id))
+	if sp := rawObject(t, raw, "spec"); sp["source"] != "unavailable" {
+		t.Fatalf("spec = %v, want source:unavailable (fixture must seed the spec cascade)", sp)
+	}
+	ts := rawObject(t, raw, "trace_store")
+	if ts["configured"] != true || ts["kind"] != traceStoreKindMemory {
+		t.Errorf("trace_store = %v, want configured:true kind:memory", ts)
+	}
+	if note, _ := ts["note"].(string); !strings.Contains(note, "EPHEMERAL") {
+		t.Errorf("trace_store.note = %q, want the ephemerality", note)
+	}
+}
+
+// TestOnboardingReadiness_TraceStore_GitLabForgeUnconfiguredCarriesRung pins
+// the rung on the gitlab family too, on its deepest degrade (no gitlab forge
+// wired, project unresolvable).
+func TestOnboardingReadiness_TraceStore_GitLabForgeUnconfiguredCarriesRung(t *testing.T) {
+	s := newOnboardingGitLabServer(t, nil, nil, nil, nil)
+	s.cfg.TraceStore = tracestore.NewS3Storage(nil, "fishhawk-traces")
+
+	id := testOperatorIdentity()
+	raw := rawReadiness(t, s, onboardingReqForge("acme/widgets", "gitlab", &id))
+	if raw["forge"] != observationForgeGitLab {
+		t.Fatalf("forge = %v, want gitlab", raw["forge"])
+	}
+	ts := rawObject(t, raw, "trace_store")
+	if ts["configured"] != true || ts["kind"] != traceStoreKindS3 {
+		t.Errorf("trace_store = %v, want configured:true kind:s3", ts)
+	}
+}
+
+// TestOnboardingReadiness_TraceStore_SurvivesMCPMirrorDecode is the
+// cross-boundary seam (approval condition 4): the REAL handler's served JSON
+// is decoded with the fishhawk_doctor client mirror
+// (mcpserver.OnboardingReadinessReport) — not a hand-written literal — and
+// trace_store must survive with the handler's kind, configured and
+// remediation. A tag drift between the two structs fails here.
+func TestOnboardingReadiness_TraceStore_SurvivesMCPMirrorDecode(t *testing.T) {
+	fake := newFakeGitHubForRuns(onboardingReviewersSpecYAML)
+	fake.installationStatus = http.StatusNotFound
+	fake.installationBody = `{"message":"Not Found"}`
+	s := newOnboardingServer(t, fake.server(t), nil)
+
+	id := testOperatorIdentity()
+	w := httptest.NewRecorder()
+	s.handleGetOnboardingReadiness(w, onboardingReq("x/y", &id))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var report mcpserver.OnboardingReadinessReport
+	if err := json.Unmarshal(w.Body.Bytes(), &report); err != nil {
+		t.Fatalf("decode served body with the MCP mirror: %v", err)
+	}
+	if report.TraceStore == nil {
+		t.Fatalf("MCP mirror decoded TraceStore = nil from the served body:\n%s", w.Body.String())
+	}
+	want := traceStoreReadinessFor(nil)
+	if report.TraceStore.Configured != want.Configured || report.TraceStore.Kind != want.Kind ||
+		report.TraceStore.Note != want.Note || report.TraceStore.Remediation != want.Remediation {
+		t.Errorf("MCP mirror TraceStore = %+v, want %+v", *report.TraceStore, want)
 	}
 }

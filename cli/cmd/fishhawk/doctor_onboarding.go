@@ -53,6 +53,24 @@ type onboardingReadiness struct {
 	// zero value. nil means "the backend did not answer this question",
 	// which is not the same claim as "unknown".
 	MergeGate *mergeGateReadiness `json:"merge_gate"`
+	// TraceStore is the DEPLOYMENT-scoped trace-store rung (E45.75 / #3600).
+	// A POINTER for the same reason as MergeGate: a pre-#3600 fishhawkd serves
+	// no `trace_store` key, and the doctor must then emit NO rung — a zero
+	// value would read as configured:false with an out-of-enum kind "", a
+	// verdict the payload never made.
+	TraceStore *traceStoreReadiness `json:"trace_store"`
+}
+
+// traceStoreReadiness mirrors the backend traceStoreReadiness sub-object
+// (backend/internal/server/onboarding.go, #3600). Kind is one of four values:
+// "s3", "memory" (the --dev-fixtures in-memory store, EPHEMERAL), "none" (no
+// store — every run's trace upload 503s after the agent was billed) or
+// "other" (a non-S3, non-memory store, no durability claim).
+type traceStoreReadiness struct {
+	Configured  bool   `json:"configured"`
+	Kind        string `json:"kind"`
+	Note        string `json:"note"`
+	Remediation string `json:"remediation"`
 }
 
 // mergeGateReadiness mirrors the backend mergeGateReadiness sub-object
@@ -294,6 +312,13 @@ func checkOnboardingReadiness(backendURL, token, repo string) ([]checkResult, re
 		out = append(out, rung)
 	}
 
+	// (f) Trace store — will this deployment accept the run's trace bundle
+	// (#3600)? Deployment-scoped; absent against an older fishhawkd, which
+	// draws NO rung.
+	if rung, ok := traceStoreRung(body.TraceStore); ok {
+		out = append(out, rung)
+	}
+
 	return out, outcome
 }
 
@@ -367,6 +392,51 @@ func mergeGateRung(mg *mergeGateReadiness) (checkResult, bool) {
 		return checkResult{
 			label: label, detail: detail, status: "warn", remediate: remediate,
 		}, true
+	}
+}
+
+// traceStoreRung renders the trace-store readiness rung, or reports ok=false
+// when there is no rung to render (#3600).
+//
+//   - nil          — the backend served no `trace_store` key (a pre-#3600
+//     fishhawkd). NO rung: absence means the backend cannot
+//     answer, which is not the same claim as configured:false.
+//   - none         — fail. Every run's trace upload responds 503 AFTER the
+//     agent has run and been billed; remediate names
+//     FISHHAWKD_S3_BUCKET and `make s3-init`.
+//   - memory       — warn. Uploads succeed but the store is EPHEMERAL.
+//   - s3 / other   — ok. Any kind this build does not recognise is rendered
+//     from Configured: configured → ok, else fail.
+func traceStoreRung(ts *traceStoreReadiness) (checkResult, bool) {
+	if ts == nil {
+		return checkResult{}, false
+	}
+	const label = "trace store configured"
+	switch {
+	case ts.Kind == "memory":
+		remediate := ts.Note
+		if remediate == "" {
+			remediate = "the --dev-fixtures in-memory trace store is EPHEMERAL: every bundle is lost when fishhawkd restarts"
+		}
+		return checkResult{
+			label: label, detail: "memory (ephemeral)", status: "warn",
+			remediate: remediate + "; set FISHHAWKD_S3_BUCKET for a durable store",
+		}, true
+	case ts.Kind == "none" || !ts.Configured:
+		remediate := ts.Remediation
+		if remediate == "" {
+			remediate = "set FISHHAWKD_S3_BUCKET (see the trace-storage block in .env.example) and create the bucket with `make s3-init`, then restart fishhawkd"
+		}
+		return checkResult{
+			label: label, detail: "no trace store: every run's trace upload will respond 503 after the agent is billed", status: "fail",
+			remediate: remediate,
+		}, true
+	default:
+		detail := ts.Kind
+		if detail == "" {
+			detail = "configured"
+		}
+		return checkResult{label: label, detail: detail, status: "ok"}, true
 	}
 }
 

@@ -887,7 +887,9 @@ func (c *apiClient) GetRunLatency(ctx context.Context, runID uuid.UUID) (*RunLat
 // the project requires a successful pipeline to merge (#3580,
 // `gitlab_merge_gate`) — and, on GitLab only, whether an installations row is
 // registered for exactly this path (#3582, `gitlab_registration`), the check
-// POST /v0/runs refuses 422 gitlab_project_not_registered on. Repeated here rather than imported because the MCP
+// POST /v0/runs refuses 422 gitlab_project_not_registered on — plus, on both
+// families, the deployment-scoped trace_store rung (E45.75 / #3600), which
+// never cascades on the repo-scoped checks. Repeated here rather than imported because the MCP
 // server's apiClient is a thin local copy (the import direction is `cli →
 // backend`, not the reverse). Every field is a scalar/string/slice — no
 // UUID/raw-JSON field, so the #371 reflection trap does not apply. MUST stay
@@ -936,6 +938,33 @@ type OnboardingReadinessReport struct {
 	// same as status unknown, which means the registry was asked and could
 	// not answer.
 	GitLabRegistration *onboardingGitLabRegistration `json:"gitlab_registration,omitempty" jsonschema:"GitLab only: whether an installations row is registered for EXACTLY this project path (fishhawkd installation register) - the check POST /v0/runs refuses 422 gitlab_project_not_registered on; ABSENT (omitted, not zero-valued) on a github-family report and against an older fishhawkd that does not serve the field - absence means no claim, which is NOT the same as status unknown"`
+	// TraceStore is the DEPLOYMENT-scoped trace-store rung (E45.75 / #3600),
+	// a POINTER for the same reason as MergeGate: a pre-#3600 fishhawkd serves
+	// no `trace_store` key, and absence must stay absence. A value field would
+	// decode that response into a zero-valued object whose `kind` is "" —
+	// outside s3|memory|none|other, a verdict no read ever established — and
+	// whose `configured` is false, which is NOT the same claim as "the backend
+	// could not answer". The current backend sets it on EVERY report of both
+	// families, outside every repo-scoped cascade.
+	TraceStore *onboardingTraceStore `json:"trace_store,omitempty" jsonschema:"DEPLOYMENT-scoped, both families: whether this fishhawkd has a trace store wired, i.e. whether POST /v0/runs/{id}/trace will accept a run's bundle or respond 503 AFTER the agent has run and been billed; never cascades on app/spec (a not-installed repo still carries it); ABSENT (omitted, not zero-valued) against an older fishhawkd that does not serve the field - absence means the backend cannot answer, which is NOT the same claim as configured:false"`
+}
+
+// onboardingTraceStore mirrors the backend traceStoreReadiness sub-object
+// (E45.75 / #3600). Kind is one of four values: "s3" (durable S3/RustFS),
+// "memory" (the --dev-fixtures in-memory store — configured but EPHEMERAL),
+// "none" (no store: every trace upload 503s; configured is false and
+// remediation names the fix), or "other" (a non-S3, non-memory
+// implementation, no durability claim).
+//
+// Unexported, like onboardingGitLabRegistration: the export baseline pins the
+// pre-#2408 surface and this type is reached only through
+// OnboardingReadinessReport. MUST stay byte-identical with the backend json
+// tags.
+type onboardingTraceStore struct {
+	Configured  bool   `json:"configured" jsonschema:"whether a trace store is wired on this deployment; false means every run's trace upload responds 503"`
+	Kind        string `json:"kind" jsonschema:"one of s3 (durable S3/RustFS store), memory (the --dev-fixtures in-memory store: EPHEMERAL, lost on restart), none (no store configured), other (a non-S3, non-memory implementation, no durability claim)"`
+	Note        string `json:"note,omitempty" jsonschema:"the human sentence for kind none (the 503-after-billing consequence), memory (the ephemerality) or other"`
+	Remediation string `json:"remediation,omitempty" jsonschema:"on kind none: the operator next step - set FISHHAWKD_S3_BUCKET (see the .env.example trace-storage block) and create the bucket with make s3-init"`
 }
 
 // onboardingGitLabRegistration mirrors the backend gitLabRegistrationReadiness

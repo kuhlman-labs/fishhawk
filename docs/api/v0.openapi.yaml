@@ -5378,7 +5378,8 @@ components:
         each with an explanatory note. Read-only; performs no writes.
 
         Forge-family-aware since E45.43 / #3348: `forge` names the family that
-        answered. Five checks run on `github`, six on `gitlab`. On `gitlab` —
+        answered. Five repo-scoped checks run on `github`, six on `gitlab`
+        (plus the deployment-scoped `trace_store` rung on both). On `gitlab` —
         `app.installed` means "a gitlab installation is registered for
         EXACTLY this project path AND the project is resolvable with the
         deployment GitLab credential" (E45.68 / #3582; `app.note` states so,
@@ -5407,6 +5408,13 @@ components:
         learned nothing about the repo's protection and must not render a
         verdict; one that sees no `gitlab_registration` has learned nothing
         about the registration.
+
+        `trace_store` (E45.75 / #3600) is DEPLOYMENT-scoped and set on EVERY
+        report of both families, outside every cascade above: it answers
+        whether this fishhawkd will accept a run's trace upload, a fact that
+        does not depend on the repo. It is OPTIONAL for the same
+        older-fishhawkd reason; its absence is no claim, not
+        `configured: false`.
       required: [repo, app, spec, reviewers, scopes]
       properties:
         repo:
@@ -5922,6 +5930,50 @@ components:
                 `POST /v0/runs` check), does NOT check the `account_key`
                 binding the webhook receiver additionally enforces, and is
                 reporting only.
+
+        trace_store:
+          type: object
+          description: |
+            DEPLOYMENT-scoped, both families (E45.75 / #3600): whether this
+            fishhawkd has a trace store wired — i.e. whether
+            `POST /v0/runs/{id}/trace` will accept a run's bundle or respond
+            503 AFTER the agent has run and been billed. It is a fact about
+            the deployment, not the repo, so it NEVER cascades: a
+            not-installed repo, an unresolvable GitLab project and an
+            unavailable spec all still carry it. The current backend sets it
+            on every report; it is OPTIONAL only so a pre-#3600 fishhawkd's
+            body still validates. Absence means the backend cannot answer,
+            which is NOT the same claim as `configured: false`.
+          required: [configured, kind]
+          properties:
+            configured:
+              type: boolean
+              description: |
+                Whether a trace store is wired. `false` exactly when `kind`
+                is `none`: every run's trace upload responds 503.
+            kind:
+              type: string
+              description: |
+                `s3` — the durable S3 / RustFS store. `memory` — the
+                `--dev-fixtures` in-memory store: configured, but EPHEMERAL
+                (every bundle is lost on restart), so not durable for a real
+                dogfood loop. `none` — no store configured. `other` — a
+                non-S3, non-memory implementation; configured, with no claim
+                about durability (never mislabelled `s3`).
+              enum: [s3, memory, none, other]
+            note:
+              type: string
+              description: |
+                The human sentence for `none` (the 503-after-billing
+                consequence), `memory` (the ephemerality) or `other`; absent
+                on `s3`.
+            remediation:
+              type: string
+              description: |
+                On `none` only: set `FISHHAWKD_S3_BUCKET` (plus the S3
+                endpoint/region/credentials — the trace-storage block in
+                `.env.example`) and create the bucket with `make s3-init`,
+                then restart fishhawkd.
 
     GitLabAccessLevel:
       type: object
@@ -7239,7 +7291,10 @@ paths:
         `gitlab_registration`: whether an installations row is registered
         for exactly this path, the check `POST /v0/runs` refuses
         `422 gitlab_project_not_registered` on, pre-flighted through the
-        same registry seam. Read-only.
+        same registry seam. Read-only. Both families also carry the
+        DEPLOYMENT-scoped `trace_store` rung (#3600): whether this fishhawkd
+        has a trace store wired (`s3` | `memory` | `none` | `other`), set on
+        every report and never cascading on the repo-scoped checks.
 
         Forge-family resolution, in order: an explicit `forge` query value;
         else the account registry's provider for the repo's owner (the same

@@ -1278,3 +1278,77 @@ func TestInitToolDescription_DescribesShape(t *testing.T) {
 		}
 	}
 }
+
+// TestDoctor_TraceStore_ReemitsWireBytes walks the tool path and pins the
+// RE-EMITTED bytes (E45.75 / #3600): a body carrying trace_store re-emits the
+// object with its kind and configured verdict; a body WITHOUT it (an older
+// fishhawkd — mergeGateServerBody predates the rung) re-emits NO quoted
+// "trace_store" key. Counterfactual: a value-typed mirror field re-emits a
+// zero-valued `"trace_store":{"configured":false,"kind":""}` on the second
+// body — an out-of-enum verdict no read established.
+func TestDoctor_TraceStore_ReemitsWireBytes(t *testing.T) {
+	const populated = `{"repo": "x/y", "forge": "github",
+	  "app": {"installed": false, "reason": "not installed"}, "spec": {"source": "unavailable", "note": "n"},
+	  "reviewers": [], "scopes": {"adequate": true, "required": [], "missing": []},
+	  "trace_store": {"configured": false, "kind": "none", "note": "no trace store", "remediation": "set FISHHAWKD_S3_BUCKET"}}`
+	for _, tc := range []struct {
+		name    string
+		body    string
+		present bool
+	}{
+		{"populated", populated, true},
+		{"absent", mergeGateServerBody, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fb, srv := newDoctorFakeBackend(t)
+			fb.rawBody = tc.body
+			r := newResolver(srv, nil)
+			_, out, err := r.doctor(context.Background(), nil, DoctorInput{Repo: "x/y"})
+			if err != nil {
+				t.Fatalf("doctor: %v", err)
+			}
+			encoded, err := json.Marshal(out)
+			if err != nil {
+				t.Fatalf("marshal DoctorOutput: %v", err)
+			}
+			body := string(encoded)
+			if !tc.present {
+				if strings.Contains(body, `"trace_store"`) {
+					t.Errorf("DoctorOutput re-emits trace_store on a body that omitted it:\n%s", body)
+				}
+				return
+			}
+			for _, want := range []string{
+				`"trace_store":{`,
+				`"configured":false`,
+				`"kind":"none"`,
+				`"remediation":"set FISHHAWKD_S3_BUCKET"`,
+			} {
+				if !strings.Contains(body, want) {
+					t.Errorf("DoctorOutput lacks %s:\n%s", want, body)
+				}
+			}
+		})
+	}
+}
+
+// TestDoctorToolDescription_DescribesTraceStore pins the SHIPPED description's
+// #3600 claims: the rung, its four kinds, the no-cascade property and the
+// absence-is-not-configured:false distinction.
+func TestDoctorToolDescription_DescribesTraceStore(t *testing.T) {
+	desc := strings.Join(strings.Fields(registeredToolDescription(t, "fishhawk_doctor")), " ")
+	for _, want := range []string{
+		"trace_store",
+		"DEPLOYMENT-scoped",
+		"kind is s3",
+		"memory (the --dev-fixtures in-memory store",
+		"none (configured:false",
+		"other (a non-S3",
+		"NEVER cascades",
+		"NOT the same claim as configured:false",
+	} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("fishhawk_doctor description lacks %q", want)
+		}
+	}
+}
