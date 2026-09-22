@@ -5378,27 +5378,35 @@ components:
         each with an explanatory note. Read-only; performs no writes.
 
         Forge-family-aware since E45.43 / #3348: `forge` names the family that
-        answered. Five checks run on each family. On `gitlab` — `app` becomes
-        "is the project resolvable with the deployment GitLab credential"
-        (with `app.note` stating so; `installation_id` is never set), `spec`
-        is read through the forge adapter by the project's full namespaced
-        path, `reviewers` and `scopes` are unchanged — `merge_gate` is
-        OMITTED ENTIRELY, because branch protection and rulesets are
-        GitHub-only surfaces the backend never reads there (rendering one as
-        `not_required` would claim a read that never happened), and the fifth
-        check is the GitLab-shaped sibling `gitlab_merge_gate` (E45.66 /
-        #3580), which is in turn OMITTED on `github`. The two rungs live under
+        answered. Five checks run on `github`, six on `gitlab`. On `gitlab` —
+        `app.installed` means "a gitlab installation is registered for
+        EXACTLY this project path AND the project is resolvable with the
+        deployment GitLab credential" (E45.68 / #3582; `app.note` states so,
+        `app.resolvable` carries the weaker resolvability fact on its own,
+        and `installation_id` is never set), `spec` is read through the forge
+        adapter by the project's full namespaced path, `reviewers` and
+        `scopes` are unchanged — `merge_gate` is OMITTED ENTIRELY, because
+        branch protection and rulesets are GitHub-only surfaces the backend
+        never reads there (rendering one as `not_required` would claim a
+        read that never happened), the fifth check is the GitLab-shaped
+        sibling `gitlab_merge_gate` (E45.66 / #3580), which is in turn
+        OMITTED on `github`, and the sixth is `gitlab_registration` (#3582):
+        whether an installations row is registered for exactly this path —
+        the check `POST /v0/runs` refuses `422 gitlab_project_not_registered`
+        on — also OMITTED on `github`. The merge-gate rungs live under
         SEPARATE keys because they answer different questions and are never
         conflated: GitLab has no per-context required status check, so
         `gitlab_merge_gate` reports default-branch protection and
         pipeline-must-succeed, never whether a named check is required.
 
-        `merge_gate` (#3161) and `gitlab_merge_gate` (#3580) are deliberately
-        OPTIONAL and absent from `required`: a pre-#3161 / pre-#3580
-        fishhawkd serves no such key, each family omits the other's rung by
-        design, and all must still validate. A client that sees neither key
-        has learned nothing about the repo's protection and must not render a
-        verdict.
+        `merge_gate` (#3161), `gitlab_merge_gate` (#3580) and
+        `gitlab_registration` (#3582) are deliberately OPTIONAL and absent
+        from `required`: a pre-#3161 / pre-#3580 / pre-#3582 fishhawkd serves
+        no such key, each family omits the other's rungs by design, and all
+        must still validate. A client that sees neither merge-gate key has
+        learned nothing about the repo's protection and must not render a
+        verdict; one that sees no `gitlab_registration` has learned nothing
+        about the registration.
       required: [repo, app, spec, reviewers, scopes]
       properties:
         repo:
@@ -5416,26 +5424,58 @@ components:
         app:
           type: object
           description: |
-            GitHub App installation status for the target repo. On the gitlab
-            family, whether the project is resolvable with the deployment
-            credential (`note` says so; no App installation applies).
+            Whether the Fishhawk-specific authorization a run needs exists on
+            the target repo. On the github family: GitHub App installation
+            status. On the gitlab family (E45.68 / #3582): whether a gitlab
+            installation is registered for EXACTLY this project path AND the
+            project is resolvable with the deployment credential (`note`
+            says so; no App installation applies; `resolvable` carries the
+            weaker fact on its own).
           required: [installed]
           properties:
             installed:
               type: boolean
+              description: |
+                github: the GitHub App is installed on the repo. gitlab: a
+                gitlab installation is registered for exactly this project
+                path (`fishhawkd installation register` — the authorization
+                `POST /v0/runs` checks) AND the project resolves with the
+                deployment credential; `false` for a resolvable but
+                unregistered project (the pre-#3582 report said `true`
+                there). Read `gitlab_registration` for which half failed.
             installation_id:
               type: integer
               format: int64
               description: Present only when installed, github family only.
+            resolvable:
+              type: boolean
+              description: |
+                gitlab only (E45.68 / #3582): whether the project resolves
+                with the deployment GitLab credential — what `installed`
+                meant before #3582. `false` when it does not (a 404 or a
+                resolve fault); ABSENT when the gitlab forge is unconfigured
+                on this deployment (the forge was never consulted, so
+                absence is "not read", never `false`). Always absent on the
+                github family. The `spec` and `gitlab_merge_gate` cascades
+                key on this, not on the stricter `installed`.
             reason:
               type: string
-              description: Why the App is not installed (or could not be resolved).
+              description: |
+                Why the App is not installed (or could not be resolved). On
+                gitlab: the forge-unconfigured or not-visible reason when the
+                project did not resolve (naming the credential, not the
+                register command); otherwise the not-registered reason
+                pointing at `gitlab_registration.remediation`, or the
+                registry-unknown reason naming `gitlab_registration.reason`.
             note:
               type: string
               description: |
-                Context on what `installed` means for this forge — on gitlab,
-                that the project resolved with the deployment credential and
-                no App installation applies.
+                Context on what `installed` means for this forge — on
+                gitlab, that it means registered for exactly this project
+                path AND resolvable with the deployment credential, that no
+                App installation applies, and that `gitlab_registration`
+                carries the registration detail. Present on every
+                gitlab-family report.
         spec:
           type: object
           description: The committed workflow spec's fetch + parse + validate state.
@@ -5781,6 +5821,107 @@ components:
                 levels are the effective union across matching rules, and
                 that GitLab expresses no per-context required status check so
                 `pipeline_gated` is not a claim about any named check.
+
+        gitlab_registration:
+          type: object
+          description: |
+            GitLab only (E45.68 / #3582): whether an `installations` row is
+            registered for EXACTLY this project path. This is the check
+            `POST /v0/runs` performs — through the SAME registry seam and
+            the same exact-path rule (an ambiguous double registration is
+            not found) — and refuses `422 gitlab_project_not_registered`
+            on, so `registered` is exactly "a run for this path will pass
+            that check"; the two are pinned to agree.
+
+            OPTIONAL — a github-family response omits it (the rung is
+            gitlab-only; the registry is never consulted there) and a
+            pre-#3582 fishhawkd omits it entirely; neither absence is a
+            verdict.
+
+            Read `status` FAIL-CLOSED. `not_registered` is a POSITIVE
+            finding (the registry answered). `unknown` means the registry
+            could NOT answer — no installation registry on this deployment
+            (`registry_unwired`, no database) or a lookup fault
+            (`registry_lookup_failed`) — and `reason` names which; an
+            `unknown` is NOT evidence the project is unregistered.
+
+            `ref_matches` compares the registered `installation_ref`
+            (`gitlab:<project_id>`, the project a run would act on) with
+            `resolved_ref` (the id the path resolved to with the deployment
+            credential, same format) and is set ONLY when both are known —
+            a registration bound to a different project than the path
+            resolves to is surfaced as `false` with `detail` naming both
+            refs, and an uncompared pair is absent, never `false`. Run
+            creation ACCEPTS a mismatched row (it never resolves the path),
+            so `app.installed` stays `true` on a mismatch.
+
+            What it does NOT check (`note` says so on every report): the
+            `account_key` binding the webhook receiver additionally
+            enforces. Reporting only.
+          required: [status, note]
+          properties:
+            status:
+              type: string
+              enum: [registered, not_registered, unknown]
+              description: |
+                `registered` — a row exists for exactly this path.
+                `not_registered` — the registry answered: no row, or an
+                ambiguous double registration. `unknown` — the registry
+                could not answer; `reason` names why.
+            project_path:
+              type: string
+              description: The registered row's project path. Absent unless registered.
+              example: acme/platform/api
+            installation_ref:
+              type: string
+              description: |
+                The registered row's `gitlab:<project_id>` ref — the project
+                a run would act on. Absent unless registered.
+              example: gitlab:5
+            resolved_ref:
+              type: string
+              description: |
+                The `gitlab:<project_id>` ref the path resolved to with the
+                deployment credential. Absent when the project did not
+                resolve.
+              example: gitlab:5
+            ref_matches:
+              type: boolean
+              description: |
+                `installation_ref == resolved_ref`. Set ONLY when both are
+                known; absent means "not compared", never `false`.
+            reason:
+              type: string
+              description: |
+                Machine code naming why the registry could not answer.
+                Non-empty whenever status is `unknown`.
+              enum:
+                - registry_unwired
+                - registry_lookup_failed
+            detail:
+              type: string
+              description: |
+                The human sentence for the status or `reason`; on a ref
+                mismatch it names both refs and says a run would act on the
+                registered project.
+            remediation:
+              type: string
+              description: |
+                The operator's next step, when there is one: on
+                `not_registered` (and on a ref mismatch) a copy-pasteable
+                `fishhawkd installation register --provider gitlab
+                --account-key <namespace> --installation-ref <ref>
+                --project-path <path>` command, where `<ref>` is the REAL
+                resolved `gitlab:<project_id>` when the path resolved and
+                the `gitlab:<project_id>` placeholder otherwise.
+            note:
+              type: string
+              description: |
+                Constant on every report: the rung reports whether a row is
+                registered for EXACTLY this `project_path` (the
+                `POST /v0/runs` check), does NOT check the `account_key`
+                binding the webhook receiver additionally enforces, and is
+                reporting only.
 
     GitLabAccessLevel:
       type: object
@@ -7079,20 +7220,26 @@ paths:
       summary: First-run readiness for a repository
       description: |
         Aggregates the server-side-only checks a repo's first run needs
-        (E29.4), consumed by `fishhawk doctor` (E29.5) — five on GitHub, five
-        on GitLab (E45.43 / #3348; E45.66 / #3580): App installation (on
-        GitLab: project resolvability with the deployment credential), the
-        committed workflow spec's parse/validate state, per-reviewer
-        availability on this deployment, the caller token's scope adequacy
-        against the run-driving scope subset, and a forge-shaped merge-gate
-        read — since #3161, GitHub only, `merge_gate`, whether the
-        `fishhawk_audit_complete` check Fishhawk publishes is actually
+        (E29.4), consumed by `fishhawk doctor` (E29.5) — five on GitHub, six
+        on GitLab (E45.43 / #3348; E45.66 / #3580; E45.68 / #3582): App
+        installation (on GitLab: a gitlab installation registered for
+        exactly this project path AND the project resolvable with the
+        deployment credential — `app.resolvable` carries the weaker fact on
+        its own), the committed workflow spec's parse/validate state,
+        per-reviewer availability on this deployment, the caller token's
+        scope adequacy against the run-driving scope subset, a forge-shaped
+        merge-gate read — since #3161, GitHub only, `merge_gate`, whether
+        the `fishhawk_audit_complete` check Fishhawk publishes is actually
         REQUIRED by the repository's protection on its default branch; since
         #3580, GitLab only, `gitlab_merge_gate`, whether the project's real
         default branch is protected and the project requires a successful
         pipeline to merge. The two are SEPARATE keys because they answer
         different questions (GitLab has no per-context required check) and
-        are never conflated. Read-only.
+        are never conflated — and, since #3582, GitLab only,
+        `gitlab_registration`: whether an installations row is registered
+        for exactly this path, the check `POST /v0/runs` refuses
+        `422 gitlab_project_not_registered` on, pre-flighted through the
+        same registry seam. Read-only.
 
         Forge-family resolution, in order: an explicit `forge` query value;
         else the account registry's provider for the repo's owner (the same
@@ -7121,6 +7268,10 @@ paths:
         it; read its `status` fail-closed too — `unknown` means the
         protection could not be read, NOT that the branch is unprotected,
         and every unread signal is absent rather than `false`.
+        `gitlab_registration` is OPTIONAL the same way (omitted on github
+        and pre-#3582); `unknown` means the registry could not answer, NOT
+        that the project is unregistered, and `ref_matches` is absent
+        whenever the two refs were not both known.
 
         Does NOT gate on a write scope, because scope adequacy is itself a
         reported field: a write-scope gate would lock out exactly the callers

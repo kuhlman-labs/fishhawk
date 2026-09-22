@@ -2134,18 +2134,37 @@ func gitlabForgeOver(glSrv *httptest.Server) *forgegitlab.Forge {
 		forgegitlab.WithHTTPClient(glSrv.Client()))
 }
 
+// registeredGitLabInstallations is the default registry posture for the
+// gitlab-family fixtures (E45.68 / #3582): a row registered under the nested
+// path whose installation_ref names the SAME project id the v4 stub resolves
+// the path to (fakeGitLabProjectID), so the rung reports registered with
+// ref_matches true. Tests needing another posture overwrite
+// s.cfg.GitLabInstallations after construction.
+func registeredGitLabInstallations() *fakeGitLabInstallations {
+	return &fakeGitLabInstallations{
+		found: true,
+		inst: account.GitLabInstallation{
+			InstallationRef: "gitlab:" + fakeGitLabProjectID,
+			ProjectPath:     onboardingNestedGitLabPath,
+		},
+	}
+}
+
 // newOnboardingGitLabServer builds a Server whose ForgeResolver answers the
 // gitlab family with glForge (or errors when glForge is nil, the
 // unconfigured-forge posture), with an optional GitHub fake, provider resolver
-// and reviewer set. resolverErr, when non-nil, is returned by the ForgeResolver
-// regardless of glForge.
+// and reviewer set, and the registered fake installations registry
+// (registeredGitLabInstallations) wired so the gitlab family's `installed`
+// — registered AND resolvable since #3582 — reports true when the project
+// resolves.
 func newOnboardingGitLabServer(t *testing.T, ghSrv *httptest.Server, glForge forge.Forge,
 	providers ProviderResolver, reviewers ReviewerSet) *Server {
 	t.Helper()
 	cfg := Config{
-		Addr:          "127.0.0.1:0",
-		RepoProviders: providers,
-		PlanReviewers: reviewers,
+		Addr:                "127.0.0.1:0",
+		RepoProviders:       providers,
+		PlanReviewers:       reviewers,
+		GitLabInstallations: registeredGitLabInstallations(),
 		ForgeResolver: func(id string) (forge.Forge, error) {
 			if id == observationForgeGitLab && glForge != nil {
 				return glForge, nil
@@ -2218,13 +2237,40 @@ func TestOnboardingReadiness_GitLab_NestedPath_EndToEnd(t *testing.T) {
 	}
 	app := rawObject(t, raw, "app")
 	if app["installed"] != true {
-		t.Errorf("app.installed = %v, want true", app["installed"])
+		t.Errorf("app.installed = %v, want true (registered AND resolvable)", app["installed"])
+	}
+	if app["resolvable"] != true {
+		t.Errorf("app.resolvable = %v, want true", app["resolvable"])
 	}
 	if app["note"] != onboardingGitLabInstalledNote {
 		t.Errorf("app.note = %v, want %q", app["note"], onboardingGitLabInstalledNote)
 	}
 	if _, present := app["installation_id"]; present {
 		t.Errorf("app.installation_id present (%v); no App installation applies on GitLab", app["installation_id"])
+	}
+	// The registration rung (E45.68 / #3582): registered under the exact
+	// path, and the registered ref equals the ref the path resolved to.
+	reg := rawObject(t, raw, "gitlab_registration")
+	if reg["status"] != gitLabRegistrationStatusRegistered {
+		t.Errorf("gitlab_registration.status = %v, want registered", reg["status"])
+	}
+	if reg["project_path"] != onboardingNestedGitLabPath {
+		t.Errorf("gitlab_registration.project_path = %v, want the nested path", reg["project_path"])
+	}
+	wantRef := "gitlab:" + fakeGitLabProjectID
+	if reg["installation_ref"] != wantRef || reg["resolved_ref"] != wantRef {
+		t.Errorf("gitlab_registration refs = installation:%v resolved:%v, want both %q", reg["installation_ref"], reg["resolved_ref"], wantRef)
+	}
+	if reg["ref_matches"] != true {
+		t.Errorf("gitlab_registration.ref_matches = %v, want true", reg["ref_matches"])
+	}
+	if reg["note"] != gitLabRegistrationNote {
+		t.Errorf("gitlab_registration.note = %v, want the constant note", reg["note"])
+	}
+	for _, key := range []string{"reason", "detail", "remediation"} {
+		if v, present := reg[key]; present {
+			t.Errorf("gitlab_registration.%s present on a matching registration: %v", key, v)
+		}
 	}
 	sp := rawObject(t, raw, "spec")
 	if sp["source"] != "fetched" || sp["valid"] != true {
@@ -2260,22 +2306,46 @@ func TestOnboardingReadiness_GitLab_NestedPath_EndToEnd(t *testing.T) {
 }
 
 // TestOnboardingReadiness_GitLab_ProjectNotVisible: a 404 on the project
-// resolve (forge.ErrNotInstalled) yields installed:false with the reason
-// naming the register command, an unavailable spec, no merge_gate key, and
-// ZERO file reads.
+// resolve (forge.ErrNotInstalled) yields installed:false AND resolvable:false
+// with the credential-visibility reason (which since #3582 names the
+// credential, NOT the register command — registration is the
+// gitlab_registration rung's business), an unavailable spec, no merge_gate
+// key, and ZERO file reads. The registry is STILL consulted (once, with the
+// trimmed path) and reports registered — with resolved_ref and ref_matches
+// ABSENT, because the project id never resolved and an unread comparison is
+// never rendered.
 func TestOnboardingReadiness_GitLab_ProjectNotVisible(t *testing.T) {
 	gl := newFakeGitLabForOnboarding(onboardingReviewersSpecYAML)
 	gl.projectStatus = http.StatusNotFound
 	s := newOnboardingGitLabServer(t, nil, gitlabForgeOver(gl.server(t)), nil, nil)
+	registry := s.cfg.GitLabInstallations.(*fakeGitLabInstallations)
 	id := testOperatorIdentity()
 
 	raw := rawReadiness(t, s, onboardingReqForge(onboardingNestedGitLabPath, "gitlab", &id))
 	app := rawObject(t, raw, "app")
 	if app["installed"] != false || app["reason"] != onboardingGitLabProjectNotVisible {
-		t.Errorf("app = %v, want installed:false with the register-command reason", app)
+		t.Errorf("app = %v, want installed:false with the not-visible reason", app)
 	}
-	if !strings.Contains(onboardingGitLabProjectNotVisible, "fishhawkd installation register --provider gitlab") {
-		t.Errorf("reason does not name the register command: %q", onboardingGitLabProjectNotVisible)
+	if app["resolvable"] != false {
+		t.Errorf("app.resolvable = %v, want false (read, not absent)", app["resolvable"])
+	}
+	if strings.Contains(onboardingGitLabProjectNotVisible, "installation register") {
+		t.Errorf("the not-visible reason names the register command; registration is the gitlab_registration rung's business: %q", onboardingGitLabProjectNotVisible)
+	}
+	if !strings.Contains(onboardingGitLabProjectNotVisible, "FISHHAWKD_GITLAB_TOKEN") {
+		t.Errorf("the not-visible reason does not name the credential: %q", onboardingGitLabProjectNotVisible)
+	}
+	reg := rawObject(t, raw, "gitlab_registration")
+	if reg["status"] != gitLabRegistrationStatusRegistered {
+		t.Errorf("gitlab_registration.status = %v, want registered (the registry is consulted regardless of visibility)", reg["status"])
+	}
+	for _, key := range []string{"resolved_ref", "ref_matches"} {
+		if v, present := reg[key]; present {
+			t.Errorf("gitlab_registration.%s present (%v) on an unresolved project; the comparison was never made", key, v)
+		}
+	}
+	if registry.projectCalls != 1 || registry.lastPath != onboardingNestedGitLabPath {
+		t.Errorf("registry calls=%d path=%q, want 1 with the nested path", registry.projectCalls, registry.lastPath)
 	}
 	sp := rawObject(t, raw, "spec")
 	if sp["source"] != "unavailable" || sp["note"] == "" {
@@ -2368,6 +2438,14 @@ func TestOnboardingReadiness_GitLab_ForgeUnconfigured(t *testing.T) {
 	if app["installed"] != false || app["reason"] != onboardingGitLabForgeUnconfigured {
 		t.Errorf("app = %v, want installed:false with the unconfigured reason", app)
 	}
+	// The forge was never read, so resolvability is ABSENT (nil), never a
+	// false — while the registry, which needs no forge, still answered.
+	if v, present := app["resolvable"]; present {
+		t.Errorf("app.resolvable present (%v) with the forge unconfigured; it was never read", v)
+	}
+	if reg := rawObject(t, raw, "gitlab_registration"); reg["status"] != gitLabRegistrationStatusRegistered {
+		t.Errorf("gitlab_registration.status = %v, want registered (consulted on every gitlab-family report)", reg["status"])
+	}
 	sp := rawObject(t, raw, "spec")
 	if sp["source"] != "unavailable" || sp["note"] != onboardingGitLabForgeUnconfigured {
 		t.Errorf("spec = %v, want unavailable with the unconfigured note", sp)
@@ -2392,6 +2470,12 @@ func TestOnboardingReadiness_GitLab_ForgeResolverTypedNil(t *testing.T) {
 	app := rawObject(t, raw, "app")
 	if app["installed"] != false || app["reason"] != onboardingGitLabForgeUnconfigured {
 		t.Errorf("app = %v, want installed:false with the unconfigured reason (typed nil)", app)
+	}
+	if v, present := app["resolvable"]; present {
+		t.Errorf("app.resolvable present (%v) with a typed-nil forge; it was never read", v)
+	}
+	if _, present := raw["gitlab_registration"]; !present {
+		t.Errorf("gitlab_registration absent; the rung is present on every gitlab-family report")
 	}
 }
 
@@ -3102,8 +3186,8 @@ func TestOnboardingReadiness_GitLabMergeGate_ProjectNotVisible_Unknown(t *testin
 	gl.projectStatus = http.StatusNotFound
 	raw := gitLabMergeGateRaw(t, gl)
 	glmg := assertGitLabMergeGateUnknown(t, raw, gitLabMergeGateReasonProjectNotVisible)
-	if rem, _ := glmg["remediation"].(string); !strings.Contains(rem, "fishhawkd installation register --provider gitlab --project-path acme/widgets") {
-		t.Errorf("remediation = %q, want the register command naming the project", rem)
+	if rem, _ := glmg["remediation"].(string); !strings.Contains(rem, "FISHHAWKD_GITLAB_TOKEN) can read acme/widgets") {
+		t.Errorf("remediation = %q, want the credential-visibility sentence naming the project", rem)
 	}
 	if byID, list := gl.mergeGateCalls(); byID != 0 || list != 0 {
 		t.Errorf("merge-gate calls = by-id:%d list:%d, want 0/0 on an unresolved project", byID, list)
@@ -3247,4 +3331,353 @@ func TestOnboardingReadiness_GitLabMergeGate_ProbeTimeout_Unknown(t *testing.T) 
 	gl.listHang = timescale.D(3 * time.Second)
 	raw := gitLabMergeGateRaw(t, gl)
 	assertGitLabMergeGateUnknown(t, raw, gitLabMergeGateReasonTransport)
+}
+
+// --- gitlab_registration rung (E45.68 / #3582) ---
+
+// gitLabRegistrationRaw runs the nested-path gitlab request against the v4
+// stub with the given registry posture and returns the raw body plus the
+// registry fake, so each registration test asserts key PRESENCE/ABSENCE.
+func gitLabRegistrationRaw(t *testing.T, gl *fakeGitLabForOnboarding, registry GitLabInstallationResolver) map[string]any {
+	t.Helper()
+	s := newOnboardingGitLabServer(t, nil, gitlabForgeOver(gl.server(t)), nil, nil)
+	s.cfg.GitLabInstallations = registry
+	id := testOperatorIdentity()
+	return rawReadiness(t, s, onboardingReqForge(onboardingNestedGitLabPath, "gitlab", &id))
+}
+
+// TestOnboardingReadiness_GitLab_Registration_NotRegistered is the done-means
+// test for #3582: a project that RESOLVES with the deployment credential but
+// has NO installations row → app.installed false (the pre-#3582 over-claim
+// removed) with app.resolvable true and a reason pointing at
+// gitlab_registration; the rung reports not_registered with a remediation
+// carrying the REAL resolved project id (`--installation-ref gitlab:5`) and
+// the exact `--project-path`; and the cascades key on resolvability — the
+// spec is STILL fetched + valid, the merge gate STILL pipeline_gated. The
+// registry was consulted once with the trimmed nested path.
+//
+// Counterfactuals (run, not reasoned): (i) delete the
+// `reg.Status == registered &&` conjunction in the handler → RED on
+// app.installed; (iv) re-key the spec cascade in probeGitLab on Installed →
+// RED on spec.source.
+func TestOnboardingReadiness_GitLab_Registration_NotRegistered(t *testing.T) {
+	gl := newFakeGitLabForOnboarding(onboardingReviewersSpecYAML)
+	registry := &fakeGitLabInstallations{found: false}
+	raw := gitLabRegistrationRaw(t, gl, registry)
+
+	app := rawObject(t, raw, "app")
+	if app["installed"] != false {
+		t.Errorf("app.installed = %v, want false (resolvable but not registered)", app["installed"])
+	}
+	if app["resolvable"] != true {
+		t.Errorf("app.resolvable = %v, want true", app["resolvable"])
+	}
+	if app["reason"] != onboardingGitLabNotRegisteredReason || !strings.Contains(onboardingGitLabNotRegisteredReason, "gitlab_registration") {
+		t.Errorf("app.reason = %v, want the not-registered reason naming gitlab_registration", app["reason"])
+	}
+	if app["note"] != onboardingGitLabInstalledNote {
+		t.Errorf("app.note = %v, want the gitlab note", app["note"])
+	}
+	reg := rawObject(t, raw, "gitlab_registration")
+	if reg["status"] != gitLabRegistrationStatusNotRegistered {
+		t.Errorf("gitlab_registration.status = %v, want not_registered", reg["status"])
+	}
+	if _, present := reg["reason"]; present {
+		t.Errorf("gitlab_registration.reason present (%v) on a positive not_registered finding", reg["reason"])
+	}
+	if detail, _ := reg["detail"].(string); !strings.Contains(detail, onboardingNestedGitLabPath) || !strings.Contains(detail, "exact match") {
+		t.Errorf("gitlab_registration.detail = %q, want the path and the exact-match sentence", detail)
+	}
+	rem, _ := reg["remediation"].(string)
+	for _, want := range []string{
+		"fishhawkd installation register --provider gitlab",
+		"--account-key gitlab-com",
+		"--installation-ref gitlab:" + fakeGitLabProjectID,
+		"--project-path " + onboardingNestedGitLabPath,
+	} {
+		if !strings.Contains(rem, want) {
+			t.Errorf("gitlab_registration.remediation = %q, want it to carry %q", rem, want)
+		}
+	}
+	if strings.Contains(rem, "<project_id>") {
+		t.Errorf("remediation carries the placeholder although the project resolved: %q", rem)
+	}
+	if reg["resolved_ref"] != "gitlab:"+fakeGitLabProjectID {
+		t.Errorf("gitlab_registration.resolved_ref = %v, want gitlab:%s", reg["resolved_ref"], fakeGitLabProjectID)
+	}
+	for _, key := range []string{"installation_ref", "project_path", "ref_matches"} {
+		if v, present := reg[key]; present {
+			t.Errorf("gitlab_registration.%s present (%v) with no registered row", key, v)
+		}
+	}
+	// The cascades key on resolvability, not on the stricter installed.
+	sp := rawObject(t, raw, "spec")
+	if sp["source"] != "fetched" || sp["valid"] != true {
+		t.Errorf("spec = %v, want fetched + valid (the cascade keys on resolvable)", sp)
+	}
+	if rv, _ := raw["reviewers"].([]any); len(rv) == 0 {
+		t.Errorf("reviewers = %v, want the declared tuples", raw["reviewers"])
+	}
+	if glmg := rawObject(t, raw, "gitlab_merge_gate"); glmg["status"] != gitLabMergeGateStatusPipelineGated {
+		t.Errorf("gitlab_merge_gate.status = %v, want pipeline_gated (the cascade keys on resolvable)", glmg["status"])
+	}
+	if registry.projectCalls != 1 || registry.lastPath != onboardingNestedGitLabPath {
+		t.Errorf("registry calls=%d path=%q, want 1 with the trimmed nested path", registry.projectCalls, registry.lastPath)
+	}
+}
+
+// TestOnboardingReadiness_GitLab_Registration_RegistryUnwired: no registry on
+// this deployment (cfg.GitLabInstallations nil) → unknown / registry_unwired,
+// installed false with the registry-unknown app reason naming the code,
+// resolvable true, spec still fetched. Counterfactual (ii): delete the nil
+// guard in probeGitLabRegistration → RED (nil-dereference panic).
+func TestOnboardingReadiness_GitLab_Registration_RegistryUnwired(t *testing.T) {
+	gl := newFakeGitLabForOnboarding(onboardingReviewersSpecYAML)
+	raw := gitLabRegistrationRaw(t, gl, nil)
+
+	reg := rawObject(t, raw, "gitlab_registration")
+	if reg["status"] != string(mergegate.StatusUnknown) || reg["reason"] != gitLabRegistrationReasonRegistryUnwired {
+		t.Errorf("gitlab_registration = %v, want unknown / registry_unwired", reg)
+	}
+	if detail, _ := reg["detail"].(string); !strings.Contains(detail, "no installation registry") {
+		t.Errorf("detail = %q, want the no-registry sentence", detail)
+	}
+	if rem, _ := reg["remediation"].(string); !strings.Contains(rem, "FISHHAWKD_DATABASE_URL") {
+		t.Errorf("remediation = %q, want FISHHAWKD_DATABASE_URL named", rem)
+	}
+	app := rawObject(t, raw, "app")
+	if app["installed"] != false || app["resolvable"] != true {
+		t.Errorf("app = %v, want installed:false resolvable:true", app)
+	}
+	wantReason := onboardingGitLabRegistryUnknownReasonPrefix + gitLabRegistrationReasonRegistryUnwired + onboardingGitLabRegistryUnknownReasonSuffix
+	if app["reason"] != wantReason {
+		t.Errorf("app.reason = %v, want %q", app["reason"], wantReason)
+	}
+	if sp := rawObject(t, raw, "spec"); sp["source"] != "fetched" {
+		t.Errorf("spec = %v, want fetched", sp)
+	}
+}
+
+// TestOnboardingReadiness_GitLab_Registration_LookupFailed: the registry
+// faults → unknown / registry_lookup_failed with the error in detail, a WARN
+// log, installed false. Counterfactual (3): delete the err branch → RED
+// (would report not_registered).
+func TestOnboardingReadiness_GitLab_Registration_LookupFailed(t *testing.T) {
+	gl := newFakeGitLabForOnboarding(onboardingReviewersSpecYAML)
+	lookupErr := errors.New("installations store down")
+	s := newOnboardingGitLabServer(t, nil, gitlabForgeOver(gl.server(t)), nil, nil)
+	s.cfg.GitLabInstallations = &fakeGitLabInstallations{err: lookupErr}
+	logBuf := &bytes.Buffer{}
+	s.cfg.Logger = slog.New(slog.NewJSONHandler(logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	id := testOperatorIdentity()
+	raw := rawReadiness(t, s, onboardingReqForge(onboardingNestedGitLabPath, "gitlab", &id))
+
+	reg := rawObject(t, raw, "gitlab_registration")
+	if reg["status"] != string(mergegate.StatusUnknown) || reg["reason"] != gitLabRegistrationReasonLookupFailed {
+		t.Errorf("gitlab_registration = %v, want unknown / registry_lookup_failed", reg)
+	}
+	if detail, _ := reg["detail"].(string); !strings.Contains(detail, lookupErr.Error()) {
+		t.Errorf("detail = %q, want the lookup error", detail)
+	}
+	app := rawObject(t, raw, "app")
+	wantReason := onboardingGitLabRegistryUnknownReasonPrefix + gitLabRegistrationReasonLookupFailed + onboardingGitLabRegistryUnknownReasonSuffix
+	if app["installed"] != false || app["reason"] != wantReason {
+		t.Errorf("app = %v, want installed:false reason=%q", app, wantReason)
+	}
+	rec := soleLogRecord(t, logBuf, "onboarding readiness: gitlab registration lookup failed")
+	if rec["level"] != "WARN" || rec["repo"] != onboardingNestedGitLabPath || rec["error"] != lookupErr.Error() {
+		t.Errorf("log record = %v, want WARN with repo + error", rec)
+	}
+}
+
+// TestOnboardingReadiness_GitLab_Registration_RefMismatch: a row registered
+// under the exact path whose installation_ref names a DIFFERENT project
+// (gitlab:99) than the path resolves to (gitlab:5) → status registered,
+// ref_matches false, detail naming BOTH refs, a re-register remediation
+// carrying the resolved ref — and app.installed TRUE, mirroring run-create,
+// which accepts the row without resolving the path. Counterfactual (iii):
+// delete the ref comparison → RED (ref_matches absent).
+func TestOnboardingReadiness_GitLab_Registration_RefMismatch(t *testing.T) {
+	gl := newFakeGitLabForOnboarding(onboardingReviewersSpecYAML)
+	registry := &fakeGitLabInstallations{found: true, inst: account.GitLabInstallation{
+		InstallationRef: "gitlab:99", ProjectPath: onboardingNestedGitLabPath}}
+	raw := gitLabRegistrationRaw(t, gl, registry)
+
+	reg := rawObject(t, raw, "gitlab_registration")
+	if reg["status"] != gitLabRegistrationStatusRegistered {
+		t.Errorf("gitlab_registration.status = %v, want registered", reg["status"])
+	}
+	if reg["ref_matches"] != false {
+		t.Errorf("gitlab_registration.ref_matches = %v, want false", reg["ref_matches"])
+	}
+	if reg["installation_ref"] != "gitlab:99" || reg["resolved_ref"] != "gitlab:"+fakeGitLabProjectID {
+		t.Errorf("refs = installation:%v resolved:%v, want gitlab:99 / gitlab:%s", reg["installation_ref"], reg["resolved_ref"], fakeGitLabProjectID)
+	}
+	detail, _ := reg["detail"].(string)
+	if !strings.Contains(detail, "gitlab:99") || !strings.Contains(detail, "gitlab:"+fakeGitLabProjectID) {
+		t.Errorf("detail = %q, want both refs named", detail)
+	}
+	if rem, _ := reg["remediation"].(string); !strings.Contains(rem, "--installation-ref gitlab:"+fakeGitLabProjectID) {
+		t.Errorf("remediation = %q, want the re-register command with the resolved ref", rem)
+	}
+	if app := rawObject(t, raw, "app"); app["installed"] != true {
+		t.Errorf("app.installed = %v, want true (run-create accepts a mismatched row)", app["installed"])
+	}
+}
+
+// TestOnboardingReadiness_GitLab_Registration_NoteAndUnresolvedRefAbsent pins
+// the raw keys: note equals the constant on every posture, and resolved_ref
+// is ABSENT whenever the project did not resolve — on a not-visible project
+// AND on a not-registered one.
+func TestOnboardingReadiness_GitLab_Registration_NoteAndUnresolvedRefAbsent(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		registry *fakeGitLabInstallations
+		want     string
+	}{
+		{"registered", registeredGitLabInstallations(), gitLabRegistrationStatusRegistered},
+		{"not_registered", &fakeGitLabInstallations{found: false}, gitLabRegistrationStatusNotRegistered},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gl := newFakeGitLabForOnboarding(onboardingReviewersSpecYAML)
+			gl.projectStatus = http.StatusNotFound
+			raw := gitLabRegistrationRaw(t, gl, tc.registry)
+			reg := rawObject(t, raw, "gitlab_registration")
+			if reg["status"] != tc.want {
+				t.Errorf("status = %v, want %s", reg["status"], tc.want)
+			}
+			if reg["note"] != gitLabRegistrationNote {
+				t.Errorf("note = %v, want the constant", reg["note"])
+			}
+			for _, key := range []string{"resolved_ref", "ref_matches"} {
+				if v, present := reg[key]; present {
+					t.Errorf("%s present (%v) although the project did not resolve", key, v)
+				}
+			}
+			if tc.want == gitLabRegistrationStatusNotRegistered {
+				if rem, _ := reg["remediation"].(string); !strings.Contains(rem, "--installation-ref gitlab:<project_id>") {
+					t.Errorf("remediation = %q, want the placeholder ref when the project did not resolve", rem)
+				}
+			}
+		})
+	}
+}
+
+// TestOnboardingReadiness_GitHub_NoGitLabRegistrationKey: the github family
+// carries NEITHER `gitlab_registration` NOR `app.resolvable`, and a wired
+// registry fake records ZERO calls — the never-consulted seam. Counterfactual
+// (v): consult the registry on both families → RED on projectCalls.
+func TestOnboardingReadiness_GitHub_NoGitLabRegistrationKey(t *testing.T) {
+	gh := newFakeGitHubForRuns(onboardingReviewersSpecYAML)
+	s := newOnboardingGitLabServer(t, gh.server(t), nil, nil, nil)
+	registry := s.cfg.GitLabInstallations.(*fakeGitLabInstallations)
+	id := testOperatorIdentity()
+
+	raw := rawReadiness(t, s, onboardingReqForge("kuhlman-labs/fishhawk", "github", &id))
+	if raw["forge"] != "github" {
+		t.Fatalf("forge = %v, want github", raw["forge"])
+	}
+	if v, present := raw["gitlab_registration"]; present {
+		t.Errorf("gitlab_registration present on the github family: %v", v)
+	}
+	app := rawObject(t, raw, "app")
+	if v, present := app["resolvable"]; present {
+		t.Errorf("app.resolvable present on the github family: %v", v)
+	}
+	if app["installed"] != true {
+		t.Errorf("app.installed = %v, want true (App installed on the fake)", app["installed"])
+	}
+	if registry.projectCalls != 0 || registry.refCalls != 0 {
+		t.Errorf("registry consulted on the github family: project=%d ref=%d, want 0/0", registry.projectCalls, registry.refCalls)
+	}
+}
+
+// TestOnboardingReadiness_GitLab_RegistrationAgreesWithRunCreate is the
+// CROSS-BOUNDARY control (#3582): the readiness handler and POST /v0/runs on
+// ONE Server sharing ONE fakeGitLabInstallations, over every registry
+// posture. `gitlab_registration.status == registered` ⇔ the run is admitted
+// (201), and each non-registered posture's create refusal matches the rung's
+// classification: not_registered ⇔ 422 gitlab_project_not_registered,
+// registry_unwired ⇔ 503 gitlab_unconfigured, registry_lookup_failed ⇔ 500
+// internal_error. Both handlers must see the SAME path on the same seam.
+// Counterfactual (condition 4): point the rung at a different seam or
+// normalise the path before the lookup → RED.
+func TestOnboardingReadiness_GitLab_RegistrationAgreesWithRunCreate(t *testing.T) {
+	const repoPath = "acme/platform/api" // gitlabCreateBody's repo
+	cases := []struct {
+		name       string
+		registry   *fakeGitLabInstallations // nil = unwired
+		wantStatus string
+		wantReason string
+		wantCode   int
+		wantErr    string
+	}{
+		{"registered", &fakeGitLabInstallations{found: true, inst: account.GitLabInstallation{InstallationRef: "gitlab:" + fakeGitLabProjectID, ProjectPath: repoPath}},
+			gitLabRegistrationStatusRegistered, "", http.StatusCreated, ""},
+		{"not_found", &fakeGitLabInstallations{found: false},
+			gitLabRegistrationStatusNotRegistered, "", http.StatusUnprocessableEntity, "gitlab_project_not_registered"},
+		{"lookup_error", &fakeGitLabInstallations{err: errors.New("registry down")},
+			string(mergegate.StatusUnknown), gitLabRegistrationReasonLookupFailed, http.StatusInternalServerError, "internal_error"},
+		{"unwired", nil,
+			string(mergegate.StatusUnknown), gitLabRegistrationReasonRegistryUnwired, http.StatusServiceUnavailable, "gitlab_unconfigured"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gl := newFakeGitLabForOnboarding(onboardingReviewersSpecYAML)
+			s := newOnboardingGitLabServer(t, nil, gitlabForgeOver(gl.server(t)), nil, nil)
+			s.cfg.RunRepo = newFakeRepo()
+			if tc.registry == nil {
+				s.cfg.GitLabInstallations = nil
+			} else {
+				s.cfg.GitLabInstallations = tc.registry
+			}
+			id := testOperatorIdentity()
+
+			raw := rawReadiness(t, s, onboardingReqForge(repoPath, "gitlab", &id))
+			reg := rawObject(t, raw, "gitlab_registration")
+			if reg["status"] != tc.wantStatus {
+				t.Errorf("gitlab_registration.status = %v, want %s", reg["status"], tc.wantStatus)
+			}
+			if tc.wantReason != "" && reg["reason"] != tc.wantReason {
+				t.Errorf("gitlab_registration.reason = %v, want %s", reg["reason"], tc.wantReason)
+			}
+			app := rawObject(t, raw, "app")
+			// Captured BEFORE the create call overwrites it: the path the
+			// readiness rung handed the seam.
+			var readinessPath string
+			if tc.registry != nil {
+				readinessPath = tc.registry.lastPath
+			}
+
+			w := postForgeCreateRun(t, s, gitlabCreateBody())
+			if w.Code != tc.wantCode {
+				t.Fatalf("POST /v0/runs status = %d, want %d:\n%s", w.Code, tc.wantCode, w.Body.String())
+			}
+			admitted := w.Code == http.StatusCreated
+			registered := reg["status"] == gitLabRegistrationStatusRegistered
+			if admitted != registered {
+				t.Errorf("registered=%v but run admitted=%v; the rung must pre-flight exactly the run-create registry check", registered, admitted)
+			}
+			if app["installed"] != admitted {
+				t.Errorf("app.installed = %v, want %v (agrees with run-create on a resolvable project)", app["installed"], admitted)
+			}
+			if !admitted {
+				if code := decodeErrorCode(t, w); code != tc.wantErr {
+					t.Errorf("create error code = %q, want %q", code, tc.wantErr)
+				}
+			}
+			if tc.registry != nil {
+				// Both handlers hit the SAME seam with the SAME byte-exact
+				// path: one readiness lookup + one create lookup, neither
+				// normalised — a rung that canonicalised the path before the
+				// lookup would answer for a row run-create never consults.
+				if tc.registry.projectCalls != 2 {
+					t.Errorf("registry calls=%d, want 2 (readiness + create)", tc.registry.projectCalls)
+				}
+				if readinessPath != repoPath || tc.registry.lastPath != repoPath {
+					t.Errorf("seam paths: readiness=%q create=%q, want both exactly %q", readinessPath, tc.registry.lastPath, repoPath)
+				}
+			}
+		})
+	}
 }

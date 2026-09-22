@@ -676,15 +676,17 @@ func TestOnboardingToolDescriptions_NameTheSkillResource(t *testing.T) {
 
 // gitlabReadinessBody is a literal gitlab-family backend body (E45.43 /
 // #3348): it carries forge, app.note, NO installation_id and NO merge_gate —
-// and, since E45.66 / #3580, the GitLab-shaped gitlab_merge_gate sibling.
+// and, since E45.66 / #3580, the GitLab-shaped gitlab_merge_gate sibling, and
+// since E45.68 / #3582 app.resolvable plus the gitlab_registration rung.
 const gitlabReadinessBody = `{
   "repo": "gitlab-com/customer-success/solutions-architecture/coe/gitlab-migrator",
   "forge": "gitlab",
-  "app": {"installed": true, "note": "gitlab: project resolvable with the deployment credential; no App installation applies on GitLab"},
+  "app": {"installed": true, "resolvable": true, "note": "gitlab: installed means a gitlab installation is registered for exactly this project path (fishhawkd installation register — the authorization POST /v0/runs checks) AND the project resolves with the deployment credential (resolvable); no App installation applies on GitLab — see gitlab_registration"},
   "spec": {"source": "fetched", "valid": true},
   "reviewers": [{"provider": "anthropic", "model": "claude-opus-4-8", "available": true}],
   "scopes": {"adequate": true, "required": ["read:runs"], "missing": []},
-  "gitlab_merge_gate": {"status": "unknown", "reason": "forbidden", "authoritative": false, "note": "gitlab: ..."}
+  "gitlab_merge_gate": {"status": "unknown", "reason": "forbidden", "authoritative": false, "note": "gitlab: ..."},
+  "gitlab_registration": {"status": "registered", "project_path": "gitlab-com/customer-success/solutions-architecture/coe/gitlab-migrator", "installation_ref": "gitlab:5", "resolved_ref": "gitlab:5", "ref_matches": true, "note": "gitlab: this rung reports ..."}
 }`
 
 // TestOnboardingReadinessReport_GitLabBodyMirrorsBackendTags decodes the
@@ -701,8 +703,11 @@ func TestOnboardingReadinessReport_GitLabBodyMirrorsBackendTags(t *testing.T) {
 	if !got.App.Installed || got.App.InstallationID != 0 {
 		t.Errorf("App = %+v, want installed with no installation id", got.App)
 	}
-	if !strings.HasPrefix(got.App.Note, "gitlab: project resolvable") {
+	if !strings.HasPrefix(got.App.Note, "gitlab: installed means a gitlab installation is registered") {
 		t.Errorf("App.Note = %q, want the gitlab note", got.App.Note)
+	}
+	if got.App.Resolvable == nil || !*got.App.Resolvable {
+		t.Errorf("App.Resolvable = %v, want &true", got.App.Resolvable)
 	}
 	if got.MergeGate != nil {
 		t.Errorf("MergeGate = %+v, want nil on a gitlab-family body", *got.MergeGate)
@@ -735,7 +740,7 @@ func TestDoctor_GitLabReport_ReemitsForgeAndNoteAndNoMergeGate(t *testing.T) {
 	if !strings.Contains(body, `"forge":"gitlab"`) {
 		t.Errorf("DoctorOutput lacks \"forge\":\"gitlab\":\n%s", body)
 	}
-	if !strings.Contains(body, `"note":"gitlab: project resolvable`) {
+	if !strings.Contains(body, `"note":"gitlab: installed means a gitlab installation is registered`) {
 		t.Errorf("DoctorOutput lacks the app note:\n%s", body)
 	}
 	// The QUOTED key: `"merge_gate":` cannot match the sibling
@@ -781,7 +786,7 @@ func TestDoctorToolDescription_DescribesForgeFamily(t *testing.T) {
 const gitlabMergeGateServerBody = `{
   "repo": "acme/widgets",
   "forge": "gitlab",
-  "app": {"installed": true, "note": "gitlab: project resolvable with the deployment credential; no App installation applies on GitLab"},
+  "app": {"installed": true, "resolvable": true, "note": "gitlab: installed means a gitlab installation is registered for exactly this project path (fishhawkd installation register — the authorization POST /v0/runs checks) AND the project resolves with the deployment credential (resolvable); no App installation applies on GitLab — see gitlab_registration"},
   "spec": {"source": "fetched", "valid": true},
   "reviewers": [],
   "scopes": {"adequate": true, "required": ["read:runs"], "missing": []},
@@ -948,6 +953,209 @@ func TestDoctor_GitHubReport_NoGitLabMergeGateKey(t *testing.T) {
 	}
 	if strings.Contains(string(encoded), "gitlab_merge_gate") {
 		t.Errorf("DoctorOutput re-emits a gitlab_merge_gate on a github-family report:\n%s", encoded)
+	}
+}
+
+// --- gitlab_registration rung (E45.68 / #3582) ---
+
+// gitlabRegistrationServerBody is a literal gitlab-family backend body in which
+// EVERY gitlab_registration field is NON-EMPTY — a ref-mismatch report carries
+// them all — so a tag typo on either side zero-values one and the mirror test
+// below cannot pass on zero values (the #3580 review's empty-fixture gap).
+const gitlabRegistrationServerBody = `{
+  "repo": "acme/platform/api",
+  "forge": "gitlab",
+  "app": {"installed": true, "resolvable": true, "note": "gitlab: installed means a gitlab installation is registered for exactly this project path (fishhawkd installation register — the authorization POST /v0/runs checks) AND the project resolves with the deployment credential (resolvable); no App installation applies on GitLab — see gitlab_registration"},
+  "spec": {"source": "fetched", "valid": true},
+  "reviewers": [],
+  "scopes": {"adequate": true, "required": ["read:runs"], "missing": []},
+  "gitlab_merge_gate": {"status": "unknown", "reason": "forbidden", "authoritative": false, "note": "gitlab: ..."},
+  "gitlab_registration": {
+    "status": "registered",
+    "project_path": "acme/platform/api",
+    "installation_ref": "gitlab:99",
+    "resolved_ref": "gitlab:5",
+    "ref_matches": false,
+    "reason": "registry_lookup_failed",
+    "detail": "the registered installation_ref gitlab:99 names a different project than acme/platform/api resolves to (gitlab:5); a run would act on the registered project",
+    "remediation": "Re-register with the resolved ref: fishhawkd installation register --provider gitlab --account-key acme --installation-ref gitlab:5 --project-path acme/platform/api",
+    "note": "gitlab: this rung reports whether an installations row is registered for EXACTLY this project_path ..."
+  }
+}`
+
+// TestOnboardingReadinessReport_GitLabRegistrationMirrorsBackendTags decodes
+// the all-fields-populated literal body and asserts EVERY gitlab_registration
+// field lands with its non-zero value, plus app.resolvable — condition 3.
+func TestOnboardingReadinessReport_GitLabRegistrationMirrorsBackendTags(t *testing.T) {
+	var got OnboardingReadinessReport
+	if err := json.Unmarshal([]byte(gitlabRegistrationServerBody), &got); err != nil {
+		t.Fatalf("decode backend body: %v", err)
+	}
+	if got.App.Resolvable == nil || !*got.App.Resolvable {
+		t.Errorf("App.Resolvable = %v, want &true", got.App.Resolvable)
+	}
+	if got.GitLabRegistration == nil {
+		t.Fatalf("GitLabRegistration = nil, want the decoded object")
+	}
+	g := got.GitLabRegistration
+	for _, f := range []struct{ name, got, want string }{
+		{"Status", g.Status, "registered"},
+		{"ProjectPath", g.ProjectPath, "acme/platform/api"},
+		{"InstallationRef", g.InstallationRef, "gitlab:99"},
+		{"ResolvedRef", g.ResolvedRef, "gitlab:5"},
+		{"Reason", g.Reason, "registry_lookup_failed"},
+		{"Detail", g.Detail, "the registered installation_ref gitlab:99 names a different project than acme/platform/api resolves to (gitlab:5); a run would act on the registered project"},
+		{"Remediation", g.Remediation, "Re-register with the resolved ref: fishhawkd installation register --provider gitlab --account-key acme --installation-ref gitlab:5 --project-path acme/platform/api"},
+		{"Note", g.Note, "gitlab: this rung reports whether an installations row is registered for EXACTLY this project_path ..."},
+	} {
+		if f.got != f.want {
+			t.Errorf("%s = %q, want %q", f.name, f.got, f.want)
+		}
+	}
+	if g.RefMatches == nil || *g.RefMatches {
+		t.Errorf("RefMatches = %v, want &false (read, not absent)", g.RefMatches)
+	}
+	// Re-emitted, the pointer bool survives as a literal false — never
+	// dropped by omitempty as a zero value would be.
+	encoded, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(encoded), `"ref_matches":false`) {
+		t.Errorf("re-emitted body lost ref_matches:false:\n%s", encoded)
+	}
+}
+
+// TestOnboardingReadinessReport_GitLabRegistrationAbsentKeepsNil pins the
+// absence half: a github-family body (no gitlab_registration key, no
+// app.resolvable) decodes with BOTH pointers nil — the mirror never invents a
+// zero-valued rung or a false resolvable.
+func TestOnboardingReadinessReport_GitLabRegistrationAbsentKeepsNil(t *testing.T) {
+	var got OnboardingReadinessReport
+	if err := json.Unmarshal([]byte(mergeGateServerBody), &got); err != nil {
+		t.Fatalf("decode backend body: %v", err)
+	}
+	if got.GitLabRegistration != nil {
+		t.Errorf("GitLabRegistration = %+v, want nil on a github-family body", *got.GitLabRegistration)
+	}
+	if got.App.Resolvable != nil {
+		t.Errorf("App.Resolvable = %v, want nil on a github-family body", *got.App.Resolvable)
+	}
+}
+
+// TestOnboardingReadinessReport_ResolvableFalseSurvivesReemit pins WHY
+// app.resolvable is a pointer: a not-visible project's `"resolvable": false`
+// is a READ fact and must survive the mirror's re-emit as a literal false.
+// Counterfactual: a value bool under omitempty drops it — the agent would then
+// see neither a true nor a false and could not tell "not visible" from "never
+// read" (forge unconfigured).
+func TestOnboardingReadinessReport_ResolvableFalseSurvivesReemit(t *testing.T) {
+	const body = `{"repo": "acme/widgets", "forge": "gitlab",
+	  "app": {"installed": false, "resolvable": false, "reason": "project is not visible to the deployment GitLab credential (FISHHAWKD_GITLAB_TOKEN); confirm the token can read the project path"},
+	  "spec": {"source": "unavailable"}, "reviewers": [], "scopes": {"adequate": true, "required": [], "missing": []},
+	  "gitlab_registration": {"status": "registered", "project_path": "acme/widgets", "installation_ref": "gitlab:7", "note": "gitlab: ..."}}`
+	var got OnboardingReadinessReport
+	if err := json.Unmarshal([]byte(body), &got); err != nil {
+		t.Fatalf("decode backend body: %v", err)
+	}
+	if got.App.Resolvable == nil || *got.App.Resolvable {
+		t.Fatalf("App.Resolvable = %v, want &false (read, not absent)", got.App.Resolvable)
+	}
+	if g := got.GitLabRegistration; g == nil || g.RefMatches != nil || g.ResolvedRef != "" {
+		t.Errorf("GitLabRegistration = %+v, want registered with ref_matches and resolved_ref ABSENT (never compared)", g)
+	}
+	encoded, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(encoded), `"resolvable":false`) {
+		t.Errorf("re-emitted body lost resolvable:false (a read fact rendered as absence):\n%s", encoded)
+	}
+	if strings.Contains(string(encoded), `"ref_matches"`) {
+		t.Errorf("re-emitted body invented a ref_matches on an uncompared pair:\n%s", encoded)
+	}
+}
+
+// TestDoctor_GitLabReport_ReemitsGitLabRegistration walks the whole tool path
+// against the gitlab body and asserts the RE-EMITTED WIRE BYTES carry the
+// gitlab_registration object with its status and refs, and app.resolvable.
+func TestDoctor_GitLabReport_ReemitsGitLabRegistration(t *testing.T) {
+	fb, srv := newDoctorFakeBackend(t)
+	fb.rawBody = gitlabRegistrationServerBody
+	r := newResolver(srv, nil)
+
+	_, out, err := r.doctor(context.Background(), nil, DoctorInput{Repo: "acme/platform/api", Forge: "gitlab"})
+	if err != nil {
+		t.Fatalf("doctor: %v", err)
+	}
+	if out.Report.GitLabRegistration == nil || out.Report.GitLabRegistration.Status != "registered" {
+		t.Fatalf("report did not decode the registration rung: %+v", out.Report)
+	}
+	encoded, err := json.Marshal(out)
+	if err != nil {
+		t.Fatalf("marshal DoctorOutput: %v", err)
+	}
+	body := string(encoded)
+	for _, want := range []string{
+		`"gitlab_registration":{`,
+		`"status":"registered"`,
+		`"installation_ref":"gitlab:99"`,
+		`"resolved_ref":"gitlab:5"`,
+		`"ref_matches":false`,
+		`"resolvable":true`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("DoctorOutput lacks %s:\n%s", want, body)
+		}
+	}
+}
+
+// TestDoctor_GitHubReport_NoGitLabRegistrationKey pins the pointers on the
+// mirror side: a github-family body walked through the tool path re-emits
+// NEITHER `gitlab_registration` NOR `resolvable`. Counterfactual: making
+// either a VALUE type turns this red — the bytes then carry a zero-valued
+// rung (status "") or `"resolvable":false`, claims no read established.
+func TestDoctor_GitHubReport_NoGitLabRegistrationKey(t *testing.T) {
+	fb, srv := newDoctorFakeBackend(t)
+	fb.rawBody = mergeGateServerBody
+	r := newResolver(srv, nil)
+
+	_, out, err := r.doctor(context.Background(), nil, DoctorInput{Repo: "kuhlman-labs/fishhawk"})
+	if err != nil {
+		t.Fatalf("doctor: %v", err)
+	}
+	if out.Report.MergeGate == nil || out.Report.MergeGate.Status != "required" {
+		t.Fatalf("report did not decode the github merge_gate: %+v", out.Report)
+	}
+	encoded, err := json.Marshal(out)
+	if err != nil {
+		t.Fatalf("marshal DoctorOutput: %v", err)
+	}
+	for _, key := range []string{"gitlab_registration", `"resolvable"`} {
+		if strings.Contains(string(encoded), key) {
+			t.Errorf("DoctorOutput re-emits %s on a github-family report:\n%s", key, encoded)
+		}
+	}
+}
+
+// TestDoctorToolDescription_DescribesGitLabRegistration pins the SHIPPED
+// description's #3582 claims: the six-on-GitLab framing, the rung, its
+// fail-closed reason codes, and the redefined installed.
+func TestDoctorToolDescription_DescribesGitLabRegistration(t *testing.T) {
+	desc := strings.Join(strings.Fields(registeredToolDescription(t, "fishhawk_doctor")), " ")
+	for _, want := range []string{
+		"five server-side-only checks the first feature_change run needs on GitHub and six on GitLab",
+		"gitlab_registration — GitLab only",
+		"registry_unwired",
+		"registry_lookup_failed",
+		"422 gitlab_project_not_registered",
+		"ref_matches",
+		"registered for EXACTLY this project path",
+		"account_key binding",
+	} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("fishhawk_doctor description missing %q:\n%s", want, desc)
+		}
 	}
 }
 

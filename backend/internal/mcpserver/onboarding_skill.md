@@ -18,8 +18,15 @@ namespace/project path on GitLab) and `forge` when it cannot be resolved from
 the environment. Read each rung of the returned report:
 
 - **`app`** not installed — surface the reason to the operator; installing the
-  App (or registering the GitLab deployment credential) is a human action, not
-  something this skill does.
+  App is a human action, not something this skill does. On GitLab `installed`
+  means BOTH that a gitlab installation is registered for exactly this project
+  path AND that the project resolves with the deployment credential, so a
+  not-installed app there means one of two things: `resolvable` is `false`
+  (the deployment credential cannot see the project — a credential fix), or
+  the project is resolvable but unregistered — surface
+  `gitlab_registration.remediation`, the `fishhawkd installation register`
+  command, to the operator; registering is a human action on the fishhawkd
+  host.
 - **`spec`** unavailable or invalid — proceed to Step 2.
 - **`reviewers[]`** carrying a `missing_hint` — the named environment variable
   is a deployment-side action; surface it, do not attempt to set it yourself.
@@ -29,6 +36,14 @@ the environment. Read each rung of the returned report:
   check is unrequired; it means the question could not be settled. (Omitted
   entirely on a GitLab-family report — that is by design, not a stale
   backend; GitLab carries the separate `gitlab_merge_gate` rung instead.)
+- **`gitlab_registration`** (GitLab only) — the registration `POST /v0/runs`
+  actually checks. `not_registered` means a run will be refused
+  `422 gitlab_project_not_registered`; `unknown` means the registry could not
+  answer (`reason` names `registry_unwired` or `registry_lookup_failed`), NOT
+  that the project is unregistered. `ref_matches: false` means the registered
+  `installation_ref` names a different project than the path resolves to —
+  surface `detail` (both refs) and `remediation` to the operator before any
+  run.
 - **`gitlab_merge_gate`** (GitLab only) — read FAIL-CLOSED the same way.
   `unknown` means the protection could not be read and `reason` names why
   (forge unconfigured, project not visible, a 403 because the deployment
