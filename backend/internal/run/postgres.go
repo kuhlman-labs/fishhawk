@@ -637,7 +637,7 @@ func (r *postgresRepo) ListStagesAwaitingChildren(ctx context.Context) ([]*Stage
 }
 
 func (r *postgresRepo) TransitionStage(ctx context.Context, id uuid.UUID, to StageState, completion *StageCompletion) (*Stage, error) {
-	return r.transitionStage(ctx, id, to, completion, nil)
+	return r.transitionStage(ctx, id, to, completion, nil, "")
 }
 
 // Compile-time assertion that the concrete postgres repo carries the
@@ -658,16 +658,34 @@ var _ StageCASTransitioner = (*postgresRepo)(nil)
 // mutates nothing. run.FailStage consumes this to refuse a fan-in park (or
 // any other flip) landing mid-flight instead of destroying it.
 func (r *postgresRepo) TransitionStageFrom(ctx context.Context, id uuid.UUID, from, to StageState, completion *StageCompletion) (*Stage, error) {
-	return r.transitionStage(ctx, id, to, completion, &from)
+	return r.transitionStage(ctx, id, to, completion, &from, "")
+}
+
+// Compile-time assertion that the concrete postgres repo carries the
+// StageAttemptCASTransitioner capability (#3598): removing or renaming
+// TransitionStageFromAttempt fails the BUILD rather than silently steering
+// the attempt-pinned reap consumer into its capability-absent refusal.
+var _ StageAttemptCASTransitioner = (*postgresRepo)(nil)
+
+// TransitionStageFromAttempt is the attempt-pinned compare-and-swap
+// (StageAttemptCASTransitioner, #3598): TransitionStageFrom plus a comparison
+// of the row-locked dispatched_at's StageAttemptToken against
+// expectedAttempt, evaluated in the same row-locked transaction. A matching
+// state with a superseded attempt returns StageAttemptChangedError and
+// mutates nothing. An empty expectedAttempt degrades to TransitionStageFrom.
+func (r *postgresRepo) TransitionStageFromAttempt(ctx context.Context, id uuid.UUID, from, to StageState, expectedAttempt string, completion *StageCompletion) (*Stage, error) {
+	return r.transitionStage(ctx, id, to, completion, &from, expectedAttempt)
 }
 
 // transitionStage is the shared body of TransitionStage (expectedFrom
-// nil — byte-identical to the pre-refactor behavior) and
-// TransitionStageFrom (expectedFrom non-nil — a compare-and-swap under the
-// row lock). Every downstream step (same-state short-circuit, completion
-// validation, started_at/ended_at stamping, override-table union) is
-// shared, not duplicated.
-func (r *postgresRepo) transitionStage(ctx context.Context, id uuid.UUID, to StageState, completion *StageCompletion, expectedFrom *StageState) (*Stage, error) {
+// nil — byte-identical to the pre-refactor behavior), TransitionStageFrom
+// (expectedFrom non-nil — a compare-and-swap under the row lock) and
+// TransitionStageFromAttempt (expectedFrom non-nil plus a non-empty
+// expectedAttempt — the CAS additionally pinned to the stage's live attempt,
+// #3598). An empty expectedAttempt is inert. Every downstream step
+// (same-state short-circuit, completion validation, started_at/ended_at
+// stamping, override-table union) is shared, not duplicated.
+func (r *postgresRepo) transitionStage(ctx context.Context, id uuid.UUID, to StageState, completion *StageCompletion, expectedFrom *StageState, expectedAttempt string) (*Stage, error) {
 	if to == StageStateFailed && (completion == nil || completion.FailureCategory == nil) {
 		return nil, errors.New("transition to failed requires StageCompletion with FailureCategory")
 	}
@@ -696,6 +714,18 @@ func (r *postgresRepo) transitionStage(ctx context.Context, id uuid.UUID, to Sta
 		// StageStateChangedError rather than a silent idempotent success.
 		if expectedFrom != nil && from != *expectedFrom {
 			return StageStateChangedError{StageID: id, Expected: *expectedFrom, Actual: from}
+		}
+		// Attempt pin (#3598): evaluated against the SAME row-locked read as
+		// the state comparison above, so state and attempt are decided
+		// atomically — a running(A) → failed → retry → pending → dispatched →
+		// running(B) cycle satisfies a state-only `from == running` predicate,
+		// and only this comparison tells the two attempts apart. Checked
+		// BEFORE the same-state short-circuit so a superseded attempt is
+		// refused even when the stage already sits in the target state.
+		if expectedAttempt != "" {
+			if actual := StageAttemptToken(rowToStage(current).DispatchedAt); actual != expectedAttempt {
+				return StageAttemptChangedError{StageID: id, Expected: expectedAttempt, Actual: actual}
+			}
 		}
 		if from == to {
 			result = rowToStage(current)
