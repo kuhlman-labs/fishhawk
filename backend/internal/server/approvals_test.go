@@ -882,6 +882,25 @@ type orchestratorRepo struct {
 	// listRunsErr, when non-nil, makes ListRuns fail — driving the #2596 move
 	// gate's fail-closed dispatch_state_indeterminate leg.
 	listRunsErr error
+	// dispatchStamps is the fake's MONOTONIC dispatched_at counter (#3598).
+	// It mirrors migration 0072's fishhawk_stamp_stage_dispatched_at trigger —
+	// which re-stamps stages.dispatched_at on every transition INTO dispatched
+	// (TestPostgres_StageDispatchedAtResetsOnRedispatch) — from a counter
+	// rather than time.Now(), so two dispatches in one test are guaranteed
+	// distinct attempt tokens regardless of clock resolution. Guarded by mu.
+	dispatchStamps int64
+}
+
+// fakeDispatchEpoch anchors the fake's monotonic dispatched_at stamps.
+var fakeDispatchEpoch = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+// stampDispatchedLocked mirrors the migration 0072 trigger for the fake: a
+// stage entering dispatched gets a fresh, strictly-later DispatchedAt (a new
+// attempt identity). Caller holds r.mu.
+func (r *orchestratorRepo) stampDispatchedLocked(st *run.Stage) {
+	r.dispatchStamps++
+	at := fakeDispatchEpoch.Add(time.Duration(r.dispatchStamps) * time.Microsecond)
+	st.DispatchedAt = &at
 }
 
 // seedDecomposedChild inserts a fan-out child run of parentID carrying the given
@@ -958,6 +977,11 @@ func (r *orchestratorRepo) seedStage(runID uuid.UUID, seq int, state run.StageSt
 		State: state, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
 	}
 	r.mu.Lock()
+	// A stage seeded directly into dispatched/running stands for one that
+	// passed through dispatched, so it carries an attempt stamp (#3598).
+	if state == run.StageStateDispatched || state == run.StageStateRunning {
+		r.stampDispatchedLocked(st)
+	}
 	r.stagesByID[st.ID] = st
 	r.stagesByRunID[runID] = append(r.stagesByRunID[runID], st)
 	r.mu.Unlock()
@@ -1049,6 +1073,9 @@ func (r *orchestratorRepo) RetryStage(_ context.Context, id uuid.UUID, to run.St
 		return nil, run.InvalidTransitionError{Kind: "stage", From: string(st.State), To: string(to)}
 	}
 	st.State = to
+	if to == run.StageStateDispatched {
+		r.stampDispatchedLocked(st)
+	}
 	st.FailureCategory = nil
 	st.FailureReason = nil
 	st.EndedAt = nil
@@ -1120,6 +1147,9 @@ func (r *orchestratorRepo) TransitionStage(_ context.Context, id uuid.UUID, to r
 		return nil, run.InvalidTransitionError{Kind: "stage", From: string(s.State), To: string(to)}
 	}
 	s.State = to
+	if to == run.StageStateDispatched {
+		r.stampDispatchedLocked(s)
+	}
 	if c != nil {
 		s.FailureCategory = c.FailureCategory
 		s.FailureReason = c.FailureReason
@@ -1147,6 +1177,47 @@ func (r *orchestratorRepo) TransitionStageFrom(_ context.Context, id uuid.UUID, 
 		return nil, run.InvalidTransitionError{Kind: "stage", From: string(s.State), To: string(to)}
 	}
 	s.State = to
+	if to == run.StageStateDispatched {
+		r.stampDispatchedLocked(s)
+	}
+	if c != nil {
+		s.FailureCategory = c.FailureCategory
+		s.FailureReason = c.FailureReason
+	}
+	return s, nil
+}
+
+// TransitionStageFromAttempt gives the fake the run.StageAttemptCASTransitioner
+// capability (#3598), mirroring postgresRepo: the state comparison, the attempt
+// comparison and the write all happen in ONE critical section under r.mu — the
+// fake's stand-in for the row lock — so no re-dispatch can interleave between
+// the predicate and the mutation. State is compared first, then the attempt
+// (before any same-state short-circuit), exactly as the real transitionStage.
+func (r *orchestratorRepo) TransitionStageFromAttempt(_ context.Context, id uuid.UUID, from, to run.StageState, expectedAttempt string, c *run.StageCompletion) (*run.Stage, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	s, ok := r.stagesByID[id]
+	if !ok {
+		return nil, run.ErrNotFound
+	}
+	if s.State != from {
+		return nil, run.StageStateChangedError{StageID: id, Expected: from, Actual: s.State}
+	}
+	if expectedAttempt != "" {
+		if actual := run.StageAttemptToken(s.DispatchedAt); actual != expectedAttempt {
+			return nil, run.StageAttemptChangedError{StageID: id, Expected: expectedAttempt, Actual: actual}
+		}
+	}
+	if s.State == to {
+		return s, nil
+	}
+	if !run.ValidStageTransition(s.State, to) {
+		return nil, run.InvalidTransitionError{Kind: "stage", From: string(s.State), To: string(to)}
+	}
+	s.State = to
+	if to == run.StageStateDispatched {
+		r.stampDispatchedLocked(s)
+	}
 	if c != nil {
 		s.FailureCategory = c.FailureCategory
 		s.FailureReason = c.FailureReason

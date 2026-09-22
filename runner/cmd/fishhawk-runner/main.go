@@ -111,6 +111,7 @@ type uploadClient interface {
 	RequestScopeAmendment(ctx context.Context, args upload.RequestScopeAmendmentArgs) (*upload.ScopeAmendment, error)
 	ReportStageProgress(ctx context.Context, args upload.ReportStageProgressArgs) error
 	RetryStage(ctx context.Context, args upload.RetryStageArgs) error
+	ReportRunnerFailure(ctx context.Context, args upload.ReportRunnerFailureArgs) error
 	RunLineageComplete(ctx context.Context, runID string) (bool, error)
 }
 
@@ -434,6 +435,11 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// signing-key endpoint is one-shot (409 on second call), so we
 	// must issue exactly once per runner invocation.
 	var issuedKey *upload.IssuedKey
+	// stageAttempt is THIS dispatch's attempt token from the prompt envelope
+	// (stage_attempt, #3598) — the anchor the terminal-failure self-report
+	// (reportTerminalRunnerFailure) pins. Empty without --fetch-prompt or
+	// against a backend that predates the field; the report then skips.
+	stageAttempt := ""
 
 	// stageType comes from the fetch-prompt response. Drives
 	// per-stage post-processing: plan validation + upload for
@@ -627,7 +633,8 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			return exitFailure
 		}
 		issuedKey = key
-		path, sType, agentTimeoutSecs, specVerifyCmd, specVerifyTimeoutSecs, specVerifyMaxIterations, decomposedFromRunID, minRunnerVersion, agentVersionRange, agentSelfRetry, maxRetriesSnapshot, retryAttempt, scopeFiles, commitAuthorName, commitAuthorEmail, fixup, fixupBranch, expectedHeadSHA, promptBindingAssertions, applyPatches, sliceIndex, promptScopeExemptions, openPRFromHeldCommit, heldCommitSHA, heldCommitBranch, heldCommitBaseSHA, heldCommitResumeKind, heldCommitPRTitle, heldCommitPRBody, promptImplementModel, promptPlanModel, promptEgressTargetHosts, promptAcceptanceCriteriaIDs, promptAcceptanceExpectedHeadSHA, promptDiffCoverage, promptConflictResolution, promptAcceptanceReplay, promptForgeWrites, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
+		path, sType, agentTimeoutSecs, specVerifyCmd, specVerifyTimeoutSecs, specVerifyMaxIterations, decomposedFromRunID, minRunnerVersion, agentVersionRange, agentSelfRetry, maxRetriesSnapshot, retryAttempt, scopeFiles, commitAuthorName, commitAuthorEmail, fixup, fixupBranch, expectedHeadSHA, promptBindingAssertions, applyPatches, sliceIndex, promptScopeExemptions, openPRFromHeldCommit, heldCommitSHA, heldCommitBranch, heldCommitBaseSHA, heldCommitResumeKind, heldCommitPRTitle, heldCommitPRBody, promptImplementModel, promptPlanModel, promptEgressTargetHosts, promptAcceptanceCriteriaIDs, promptAcceptanceExpectedHeadSHA, promptDiffCoverage, promptConflictResolution, promptAcceptanceReplay, promptForgeWrites, promptStageAttempt, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
+		stageAttempt = promptStageAttempt
 		// Arm the retirement-drop reporter IMMEDIATELY (E72.4 / #3328, binding
 		// condition 1) — and BEFORE the fetchErr check (#3396): the guarantee
 		// starts the moment the WIRE delivered the retirements, not the moment
@@ -2746,6 +2753,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 					res.FailureReason = err.Error()
 					invokeErr = err
 				}
+				reportTerminalRunnerFailure(ctx, cfg, client, mcpBearerToken, stageAttempt, logSink, "issue_key", err.Error(), 1)
 				logCompletion(logSink, res, invokeErr)
 				return exitFailure
 			}
@@ -2788,6 +2796,11 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 				_, _ = fmt.Fprintf(logSink,
 					`{"event":"runner_failed","reason":"trace_upload","variant":%q,"detail":%q}`+"\n",
 					v.name, err.Error())
+				detail := fmt.Sprintf("variant=%s: %s", v.name, err.Error())
+				if planPath, ok := retainPlanArtifact(cfg, logSink); ok {
+					detail += "; plan artifact retained at " + planPath
+				}
+				reportTerminalRunnerFailure(ctx, cfg, client, mcpBearerToken, stageAttempt, logSink, "trace_upload", detail, 1)
 				logCompletion(logSink, res, invokeErr)
 				return exitFailure
 			}
@@ -2825,6 +2838,11 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 				invokeErr = err
 				_, _ = fmt.Fprintf(logSink,
 					`{"event":"runner_failed","reason":"plan_upload","detail":%q}`+"\n", err.Error())
+				detail := err.Error()
+				if planPath, ok := retainPlanArtifact(cfg, logSink); ok {
+					detail += "; plan artifact retained at " + planPath
+				}
+				reportTerminalRunnerFailure(ctx, cfg, client, mcpBearerToken, stageAttempt, logSink, "plan_upload", detail, 1)
 				logCompletion(logSink, res, invokeErr)
 				return exitFailure
 			}
@@ -2951,6 +2969,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 				}
 				_, _ = fmt.Fprintf(logSink,
 					`{"event":"runner_failed","reason":"acceptance_upload","detail":%q}`+"\n", err.Error())
+				reportTerminalRunnerFailure(ctx, cfg, client, mcpBearerToken, stageAttempt, logSink, "acceptance_upload", err.Error(), 1)
 				logCompletion(logSink, res, invokeErr)
 				return exitFailure
 			}
@@ -3472,13 +3491,13 @@ func reissueSigningKeyForTerminalUpload(ctx context.Context, client uploadClient
 // The temp file is 0o600 — bundle-style defense in depth, since prompts
 // may include issue bodies that the customer would prefer not to leave on
 // the runner's filesystem world-readable.
-func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, verifyCmd string, verifyTimeoutSecs int, verifyMaxIterations int, decomposedFromRunID string, minRunnerVersion string, agentVersionRange string, agentSelfRetry bool, maxRetriesSnapshot int, retryAttempt int, scopeFiles []upload.ScopeFile, commitAuthorName string, commitAuthorEmail string, fixup bool, fixupBranch string, fixupExpectedHeadSHA string, bindingAssertions []upload.BindingAssertion, fixupApplyPatches []upload.FixupApplyPatch, sliceIndex int, scopeExemptions []upload.ScopeExemption, openPRFromHeldCommit bool, heldCommitSHA string, heldCommitBranch string, heldCommitBaseSHA string, heldCommitResumeKind string, heldCommitPRTitle string, heldCommitPRBody string, implementModel string, planModel string, egressTargetHosts []string, acceptanceCriteriaIDs []string, acceptanceExpectedHeadSHA string, diffCoverage *upload.DiffCoverageConfig, conflictResolution *conflictResolutionRequest, acceptanceReplay acceptanceReplayInputs, forgeWrites string, err error) {
+func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, verifyCmd string, verifyTimeoutSecs int, verifyMaxIterations int, decomposedFromRunID string, minRunnerVersion string, agentVersionRange string, agentSelfRetry bool, maxRetriesSnapshot int, retryAttempt int, scopeFiles []upload.ScopeFile, commitAuthorName string, commitAuthorEmail string, fixup bool, fixupBranch string, fixupExpectedHeadSHA string, bindingAssertions []upload.BindingAssertion, fixupApplyPatches []upload.FixupApplyPatch, sliceIndex int, scopeExemptions []upload.ScopeExemption, openPRFromHeldCommit bool, heldCommitSHA string, heldCommitBranch string, heldCommitBaseSHA string, heldCommitResumeKind string, heldCommitPRTitle string, heldCommitPRBody string, implementModel string, planModel string, egressTargetHosts []string, acceptanceCriteriaIDs []string, acceptanceExpectedHeadSHA string, diffCoverage *upload.DiffCoverageConfig, conflictResolution *conflictResolutionRequest, acceptanceReplay acceptanceReplayInputs, forgeWrites string, stageAttempt string, err error) {
 	got, fetchErr := client.FetchPrompt(ctx, upload.FetchPromptArgs{
 		StageID:    cfg.stageID,
 		PrivateKey: key.PrivateKey,
 	})
 	if fetchErr != nil {
-		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", "", "", "", nil, nil, "", nil, nil, acceptanceReplayInputs{}, "", fetchErr
+		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", "", "", "", nil, nil, "", nil, nil, acceptanceReplayInputs{}, "", "", fetchErr
 	}
 	_, _ = fmt.Fprintf(logSink,
 		`{"event":"prompt_fetched","stage_id":%q,"stage_type":%q,"prompt_hash":%q,"prompt_bytes":%d}`+"\n",
@@ -3493,20 +3512,20 @@ func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key
 	acceptanceReplay = acceptanceReplayInputsFromPrompt(got)
 	tmp, tmpErr := os.CreateTemp("", "fishhawk-prompt-*.txt")
 	if tmpErr != nil {
-		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", fmt.Errorf("create prompt temp file: %w", tmpErr)
+		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", fmt.Errorf("create prompt temp file: %w", tmpErr)
 	}
 	if err := os.Chmod(tmp.Name(), 0o600); err != nil {
 		_ = tmp.Close()
-		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", fmt.Errorf("chmod prompt temp file: %w", err)
+		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", fmt.Errorf("chmod prompt temp file: %w", err)
 	}
 	if _, err := tmp.WriteString(got.Prompt); err != nil {
 		_ = tmp.Close()
-		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", fmt.Errorf("write prompt temp file: %w", err)
+		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", fmt.Errorf("write prompt temp file: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", fmt.Errorf("close prompt temp file: %w", err)
+		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", fmt.Errorf("close prompt temp file: %w", err)
 	}
-	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, got.VerifyCommand, got.VerifyTimeoutSeconds, got.VerifyMaxIterations, got.DecomposedFromRunID, got.MinRunnerVersion, got.AgentVersionRange, got.AgentSelfRetry, got.MaxRetriesSnapshot, got.RetryAttempt, got.ScopeFiles, got.CommitAuthorName, got.CommitAuthorEmail, got.Fixup, got.FixupBranch, got.FixupExpectedHeadSHA, got.BindingAssertions, got.FixupApplyPatches, got.SliceIndex, got.ScopeExemptions, got.OpenPRFromHeldCommit, got.HeldCommitSHA, got.HeldCommitBranch, got.HeldCommitBaseSHA, got.HeldCommitResumeKind, got.HeldCommitPRTitle, got.HeldCommitPRBody, got.ImplementModel, got.PlanModel, got.EgressTargetHosts, got.AcceptanceCriteriaIDs, got.AcceptanceExpectedHeadSHA, got.DiffCoverage, conflictResolutionFromPrompt(got), acceptanceReplayInputsFromPrompt(got), got.ForgeWrites, nil
+	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, got.VerifyCommand, got.VerifyTimeoutSeconds, got.VerifyMaxIterations, got.DecomposedFromRunID, got.MinRunnerVersion, got.AgentVersionRange, got.AgentSelfRetry, got.MaxRetriesSnapshot, got.RetryAttempt, got.ScopeFiles, got.CommitAuthorName, got.CommitAuthorEmail, got.Fixup, got.FixupBranch, got.FixupExpectedHeadSHA, got.BindingAssertions, got.FixupApplyPatches, got.SliceIndex, got.ScopeExemptions, got.OpenPRFromHeldCommit, got.HeldCommitSHA, got.HeldCommitBranch, got.HeldCommitBaseSHA, got.HeldCommitResumeKind, got.HeldCommitPRTitle, got.HeldCommitPRBody, got.ImplementModel, got.PlanModel, got.EgressTargetHosts, got.AcceptanceCriteriaIDs, got.AcceptanceExpectedHeadSHA, got.DiffCoverage, conflictResolutionFromPrompt(got), acceptanceReplayInputsFromPrompt(got), got.ForgeWrites, got.StageAttempt, nil
 }
 
 func logStartup(w io.Writer, cfg config) {
@@ -3529,6 +3548,82 @@ func logStartup(w io.Writer, cfg config) {
 // logCompletion writes a single structured line summarizing the
 // invocation outcome. Mirrors the failure categories from
 // MVP_SPEC §6 so log scrapers can switch on `category`.
+// reportTerminalRunnerFailure is the runner's terminal-failure self-report
+// (#3598): at a terminal signed-egress failure (issue_key, trace_upload,
+// plan_upload, acceptance_upload) — where the trace upload that would
+// otherwise settle the stage is the thing that failed — it POSTs the failure
+// to the reap-failure endpoint with the run-bound fhm_ token, pinned to
+// expected_state=running AND this dispatch's attempt token, so the stage
+// stops sitting `running` behind a dead process.
+//
+// It SKIPS, with one named runner_failure_report_skipped line, when there is no
+// client (no_client), no run-bound token (no_mcp_token — the acceptance stage's
+// ADR-050 zero-credential posture, or a failed token fetch), no stage id
+// (no_stage_id), or no attempt token (no_attempt_anchor — an unanchored report
+// is never sent; that case degrades to exactly the pre-#3598 behaviour, with
+// the detached reaper and dispatch watchdog as backstops). Otherwise it logs
+// ONE runner_failure_reported or runner_failure_report_failed line. BEST-EFFORT:
+// the caller's exit code, trace FailureCategory/FailureReason and runner_failed
+// line are decided before this runs and are never changed by its outcome.
+func reportTerminalRunnerFailure(ctx context.Context, cfg config, client uploadClient, mcpToken, stageAttempt string, logSink io.Writer, reason, detail string, exitCode int) {
+	skip := ""
+	switch {
+	case client == nil:
+		skip = "no_client"
+	case mcpToken == "":
+		skip = "no_mcp_token"
+	case cfg.stageID == "":
+		skip = "no_stage_id"
+	case stageAttempt == "":
+		skip = "no_attempt_anchor"
+	}
+	if skip != "" {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"runner_failure_report_skipped","run_id":%q,"stage_id":%q,"reason":%q,"failure_reason":%q}`+"\n",
+			cfg.runID, cfg.stageID, skip, reason)
+		return
+	}
+	err := client.ReportRunnerFailure(ctx, upload.ReportRunnerFailureArgs{
+		RunID:        cfg.runID,
+		StageID:      cfg.stageID,
+		MCPToken:     mcpToken,
+		Category:     "C",
+		Reason:       reason,
+		Detail:       detail,
+		ExitCode:     exitCode,
+		StageAttempt: stageAttempt,
+	})
+	if err != nil {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"runner_failure_report_failed","run_id":%q,"stage_id":%q,"failure_reason":%q,"detail":%q}`+"\n",
+			cfg.runID, cfg.stageID, reason, err.Error())
+		return
+	}
+	_, _ = fmt.Fprintf(logSink,
+		`{"event":"runner_failure_reported","run_id":%q,"stage_id":%q,"failure_reason":%q,"stage_attempt":%q}`+"\n",
+		cfg.runID, cfg.stageID, reason, stageAttempt)
+}
+
+// retainPlanArtifact reports the plan file the agent wrote (#3598 item 3) when a
+// terminal trace/plan upload failure would otherwise leave it undiscoverable:
+// when cfg.planOut names an existing file it emits ONE plan_artifact_retained
+// line naming the path and size and returns (path, true) so the caller can fold
+// it into the failure report's detail. A runner log event only — no backend
+// surface. Returns ("", false) when there is no plan file.
+func retainPlanArtifact(cfg config, logSink io.Writer) (string, bool) {
+	if cfg.planOut == "" {
+		return "", false
+	}
+	info, err := os.Stat(cfg.planOut)
+	if err != nil || !info.Mode().IsRegular() {
+		return "", false
+	}
+	_, _ = fmt.Fprintf(logSink,
+		`{"event":"plan_artifact_retained","run_id":%q,"stage_id":%q,"path":%q,"bytes":%d}`+"\n",
+		cfg.runID, cfg.stageID, cfg.planOut, info.Size())
+	return cfg.planOut, true
+}
+
 func logCompletion(w io.Writer, res agent.Result, err error) {
 	if res.OK {
 		_, _ = fmt.Fprintf(w,

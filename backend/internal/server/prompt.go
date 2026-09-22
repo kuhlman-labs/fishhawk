@@ -110,6 +110,21 @@ type promptResponse struct {
 	// RetryAttempt is the run's current retry_attempt counter. 0 for
 	// original runs; incremented by the backend on each auto-retry.
 	RetryAttempt int `json:"retry_attempt,omitempty"`
+	// StageAttempt is this stage's per-attempt identity token
+	// (run.StageAttemptToken of dispatched_at, #3598). The prompt is fetched
+	// once per dispatch, AFTER the transition into dispatched, so the runner
+	// receives exactly its own attempt's token and echoes it back as the
+	// reap-failure self-report's expected_attempt pin — the backend refuses a
+	// report whose attempt was superseded by a re-dispatch. omitempty: a nil
+	// dispatched_at (legacy pre-migration-0072 row) renders the empty token and
+	// the key is omitted, byte-identical to before; the runner then has no
+	// anchor and skips its self-report.
+	//
+	// CROSS-MODULE WIRE CONTRACT: the json tag (`stage_attempt`) MUST stay
+	// byte-identical to the runner's upload.FetchedPrompt.StageAttempt decoder
+	// (runner/internal/upload/upload.go) — covered by the existing
+	// prompt_response ModeSubset pair in backend/internal/wirecontract.
+	StageAttempt string `json:"stage_attempt,omitempty"`
 	// ScopeFiles is the approved plan's scope.files list, echoed on
 	// implement stages so the runner can bound the commit to exactly
 	// those declared paths instead of `git add -A` (#581). Empty/omitted
@@ -1520,6 +1535,7 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		AgentSelfRetry:       s.resolveAgentSelfRetryForStage(r.Context(), runRow, stage.Type),
 		MaxRetriesSnapshot:   runRow.MaxRetriesSnapshot,
 		RetryAttempt:         runRow.RetryAttempt,
+		StageAttempt:         run.StageAttemptToken(stage.DispatchedAt),
 		ScopeFiles:           scopeFiles,
 		BindingAssertions:    bindingAssertions,
 		ScopeExemptions:      scopeExemptions,
@@ -2175,6 +2191,7 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		AgentSelfRetry:       s.resolveAgentSelfRetryForStage(r.Context(), runRow, stage.Type),
 		MaxRetriesSnapshot:   runRow.MaxRetriesSnapshot,
 		RetryAttempt:         runRow.RetryAttempt,
+		StageAttempt:         run.StageAttemptToken(stage.DispatchedAt),
 		ScopeFiles:           scopeFiles,
 		BindingAssertions:    bindingAssertions,
 		ScopeExemptions:      scopeExemptions,

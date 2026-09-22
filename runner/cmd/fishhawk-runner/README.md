@@ -1159,6 +1159,33 @@ value; `TestSidecarCeilingValue` pins the number.
 | `persistAndReportAcceptanceScenarios` | `run()` glue after `acceptance_shipped`: resolves the push remote (`acceptancePersistRemoteURL`, the same `https://github.com/<owner>/<repo>` form every runner push uses; test seam) and a best-effort token (`mintBaseAuthToken`), runs persist, emits `acceptance_scenarios_persisted {…, scenario_ids, amended_ids, retired_ids}` (`amended_ids` log-only, never on the wire report), ships `acceptance_scenarios_pushed {branch, head_sha, base_sha, scenario_ids, retired}` on a push and settles the drop reporter. | `TestReportRetirementDrop_NotShippedAfterPush`, `TestReportRetirementDrop_PushReportFails` |
 | `acceptanceServedVerdictIDs` / `replaySetHasCorpus` | The verdict's join-key set is criteria ids ∪ served scenario ids; `replay` is injected (after validation, before redaction) only when the corpus held any scenario — an empty corpus ships the body unchanged (backend `replay: null`). | `TestAcceptanceStage_ServedIDsUnionAdmitsScenarioRows`, `TestRun_AcceptanceStage_ReplayCapBoundsServed`, `TestAcceptanceServedVerdictIDs_Union` |
 
+## Terminal-failure self-report (E45.73 / [#3598](https://github.com/kuhlman-labs/fishhawk/issues/3598))
+
+When a terminal signed-egress upload fails — `issue_key` (the pre-terminal key refresh), `trace_upload` (either
+variant), `plan_upload`, `acceptance_upload` — the trace upload that would settle the stage is the thing that failed,
+so the stage would sit `running` behind a dead process. `reportTerminalRunnerFailure` (called immediately before
+`logCompletion` at those four sites) POSTs the failure to `/v0/runs/{run_id}/stages/{stage_id}/reap-failure` via
+`upload.ReportRunnerFailure`, bearing the run-bound `fhm_` token and pinned to `expected_state: "running"` AND
+`expected_attempt`: the `stage_attempt` token from THIS dispatch's prompt envelope. The backend compares the attempt
+inside the write's row-locked predicate, so a superseded attempt can never reap a live re-dispatch (409
+`stage_attempt_superseded`). `pull_request_upload` is untouched — it already reports via `reportPullRequestFailure`.
+
+- **Best-effort.** The exit code, the trace bundle's `FailureCategory`/`FailureReason` and the `runner_failed` line are
+  decided before the report runs and never change with its outcome; it logs ONE `runner_failure_reported` or
+  `runner_failure_report_failed` line.
+- **Named skips** (`runner_failure_report_skipped`, `reason`): `no_client`, `no_mcp_token` (the acceptance stage's
+  ADR-050 zero-credential posture, or a failed token fetch), `no_stage_id`, `no_attempt_anchor` (no `stage_attempt` in
+  the envelope — an old backend, or no `--fetch-prompt`). An unanchored report is never sent: that case degrades to
+  exactly the pre-#3598 behaviour.
+- **Client.** Every input is validated locally (an empty attempt never dials); reason/detail are truncated under the
+  32 KiB body cap; transport errors and 5xx retry up to 3 attempts with doubling backoff; a 4xx returns after ONE
+  attempt (retrying a 409 `stage_attempt_superseded` would retry exactly what the anchor refuses).
+- **Plan artifact retained.** At the `trace_upload` / `plan_upload` sites, an existing `--plan-out` file is named in
+  one `plan_artifact_retained` line (`path`, `bytes`) and folded into the report's `detail`, so the agent's plan is
+  recoverable from disk. A log event only — no backend surface.
+- **Backstops stay.** The detached reaper (`fishhawk_dispatch_stage`) and the dispatch watchdog remain the recovery
+  for every case the self-report skips or cannot reach.
+
 ## Test harness: bare-origin fixtures and git auto-maintenance (E72.14 / #3503)
 
 Every `git push` this package's tests make into a local bare origin fixture (`persistRepo`, `acceptanceReplayStageSetup`, `initRepoWithOrigin`, and every other `t.TempDir()` bare origin) makes the receiving `git-receive-pack` run `git maintenance run --auto --quiet --detach` (`receive.autogc` / `maintenance.auto` default `true`). Since git 2.46 that child DAEMONIZES: it forks, runs its foreground tasks, then calls `daemonize()` — the parent (and `git push`, and the test) returns while the forked child keeps running. In git 2.52+ the default `--auto` strategy runs background tasks (geometric-repack, commit-graph, worktree-prune, rerere-gc) AFTER the fork, so a repack recreating `objects/pack/` under a bare origin can race a `t.TempDir()` `RemoveAll` mid-walk — the `unlinkat …/origin.git: directory not empty` cleanup failure CI hit on `TestAcceptanceStage_ServedIDsUnionAdmitsScenarioRows` (#3503).

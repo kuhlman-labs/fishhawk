@@ -4091,3 +4091,161 @@ func TestShipAcceptance_BodyTooLarge_413_Typed(t *testing.T) {
 		t.Fatalf("err = %v, want typed with LimitBytes 0", err)
 	}
 }
+
+// reapSelfReportGolden reads the SHARED cross-module golden
+// testdata/wire/reap_failure_self_report.json (#3598, operator condition 2) —
+// the SAME file the backend's prompt-envelope test asserts stage_attempt
+// against and its reap handler test drives through the real handler.
+func reapSelfReportGolden(t *testing.T) []byte {
+	t.Helper()
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	b, err := os.ReadFile(filepath.Join(filepath.Dir(thisFile), "..", "..", "..", "testdata", "wire", "reap_failure_self_report.json"))
+	if err != nil {
+		t.Fatalf("read shared reap self-report golden: %v", err)
+	}
+	return bytes.TrimSpace(b)
+}
+
+// reapFailureCountingServer counts every reap-failure POST and answers status,
+// recording the last request's auth, path and body.
+type reapFailureCountingServer struct {
+	mu               sync.Mutex
+	hits             int
+	auth, path, body string
+	status           int
+}
+
+func newReapFailureServer(t *testing.T, status int) (*reapFailureCountingServer, *Client) {
+	t.Helper()
+	rs := &reapFailureCountingServer{status: status}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		rs.mu.Lock()
+		rs.hits++
+		rs.auth, rs.path, rs.body = r.Header.Get("Authorization"), r.URL.Path, string(b)
+		rs.mu.Unlock()
+		w.WriteHeader(rs.status)
+		_, _ = io.WriteString(w, `{"transitioned":true,"stage_state":"failed"}`)
+	}))
+	t.Cleanup(srv.Close)
+	return rs, &Client{BaseURL: srv.URL, HTTP: srv.Client(), Backoff: time.Millisecond}
+}
+
+func (rs *reapFailureCountingServer) snapshot() (int, string, string, string) {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	return rs.hits, rs.auth, rs.path, rs.body
+}
+
+// TestReportRunnerFailure_HappyPath: the attempt token is DECODED from a prompt
+// envelope (FetchedPrompt.stage_attempt) carrying the golden's value, threaded
+// into ReportRunnerFailure, and the marshalled body is byte-identical to the
+// shared golden — emission → decode → send, pinned to one fixture.
+func TestReportRunnerFailure_HappyPath(t *testing.T) {
+	golden := reapSelfReportGolden(t)
+	var want struct {
+		Category        string `json:"category"`
+		Reason          string `json:"reason"`
+		Detail          string `json:"detail"`
+		ExitCode        int    `json:"exit_code"`
+		ExpectedAttempt string `json:"expected_attempt"`
+	}
+	if err := json.Unmarshal(golden, &want); err != nil {
+		t.Fatalf("decode golden: %v", err)
+	}
+	var fp FetchedPrompt
+	if err := json.Unmarshal([]byte(`{"stage_id":"s","stage_attempt":"`+want.ExpectedAttempt+`"}`), &fp); err != nil {
+		t.Fatalf("decode prompt envelope: %v", err)
+	}
+	rs, c := newReapFailureServer(t, http.StatusOK)
+	err := c.ReportRunnerFailure(context.Background(), ReportRunnerFailureArgs{
+		RunID: "run-abc", StageID: "stage-xyz", MCPToken: "fhm_runnerheld",
+		Category: want.Category, Reason: want.Reason, Detail: want.Detail, ExitCode: want.ExitCode,
+		StageAttempt: fp.StageAttempt,
+	})
+	if err != nil {
+		t.Fatalf("ReportRunnerFailure: %v", err)
+	}
+	hits, auth, path, body := rs.snapshot()
+	if hits != 1 {
+		t.Errorf("hits = %d, want 1", hits)
+	}
+	if auth != "Bearer fhm_runnerheld" {
+		t.Errorf("Authorization = %q, want the run-bound fhm_ bearer", auth)
+	}
+	if path != "/v0/runs/run-abc/stages/stage-xyz/reap-failure" {
+		t.Errorf("path = %q", path)
+	}
+	if body != string(golden) {
+		t.Errorf("body not byte-identical to the shared golden:\n got %s\nwant %s", body, golden)
+	}
+}
+
+// TestReportRunnerFailure_RejectsMissingInputs: every missing input is refused
+// LOCALLY — the hit-counting server is never dialed.
+func TestReportRunnerFailure_RejectsMissingInputs(t *testing.T) {
+	full := ReportRunnerFailureArgs{RunID: "r", StageID: "s", MCPToken: "fhm_x", Category: "C", Reason: "trace_upload", StageAttempt: "2026-09-22T17:08:46.123456Z"}
+	for name, mutate := range map[string]func(*ReportRunnerFailureArgs){
+		"run_id":        func(a *ReportRunnerFailureArgs) { a.RunID = "" },
+		"stage_id":      func(a *ReportRunnerFailureArgs) { a.StageID = "" },
+		"token":         func(a *ReportRunnerFailureArgs) { a.MCPToken = "" },
+		"category":      func(a *ReportRunnerFailureArgs) { a.Category = "" },
+		"reason":        func(a *ReportRunnerFailureArgs) { a.Reason = "" },
+		"stage_attempt": func(a *ReportRunnerFailureArgs) { a.StageAttempt = "" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			rs, c := newReapFailureServer(t, http.StatusOK)
+			args := full
+			mutate(&args)
+			if err := c.ReportRunnerFailure(context.Background(), args); err == nil {
+				t.Error("err = nil, want a local input refusal")
+			}
+			if hits, _, _, _ := rs.snapshot(); hits != 0 {
+				t.Errorf("hits = %d, want 0 (a local refusal must never dial)", hits)
+			}
+		})
+	}
+}
+
+func TestReportRunnerFailure_RetriesOn5xxThenErrors(t *testing.T) {
+	rs, c := newReapFailureServer(t, http.StatusServiceUnavailable)
+	err := c.ReportRunnerFailure(context.Background(), ReportRunnerFailureArgs{
+		RunID: "r", StageID: "s", MCPToken: "fhm_x", Category: "C", Reason: "trace_upload", StageAttempt: "a",
+	})
+	if err == nil || !strings.Contains(err.Error(), "503") {
+		t.Errorf("err = %v, want exhausted-retries error carrying 503", err)
+	}
+	if hits, _, _, _ := rs.snapshot(); hits != reportRunnerFailureMaxAttempts {
+		t.Errorf("hits = %d, want %d (5xx retried to the cap)", hits, reportRunnerFailureMaxAttempts)
+	}
+}
+
+func TestReportRunnerFailure_DoesNotRetry4xx(t *testing.T) {
+	rs, c := newReapFailureServer(t, http.StatusConflict)
+	err := c.ReportRunnerFailure(context.Background(), ReportRunnerFailureArgs{
+		RunID: "r", StageID: "s", MCPToken: "fhm_x", Category: "C", Reason: "trace_upload", StageAttempt: "a",
+	})
+	if err == nil || !strings.Contains(err.Error(), "409") {
+		t.Errorf("err = %v, want status error carrying 409", err)
+	}
+	if hits, _, _, _ := rs.snapshot(); hits != 1 {
+		t.Errorf("hits = %d, want exactly 1 (a 4xx is terminal)", hits)
+	}
+}
+
+func TestReportRunnerFailure_TruncatesOversizeReason(t *testing.T) {
+	rs, c := newReapFailureServer(t, http.StatusOK)
+	huge := strings.Repeat("x", 64*1024)
+	err := c.ReportRunnerFailure(context.Background(), ReportRunnerFailureArgs{
+		RunID: "r", StageID: "s", MCPToken: "fhm_x", Category: "C", Reason: huge, Detail: huge, StageAttempt: "a",
+	})
+	if err != nil {
+		t.Fatalf("ReportRunnerFailure: %v", err)
+	}
+	if _, _, _, body := rs.snapshot(); len(body) > 32*1024 {
+		t.Errorf("body = %d bytes, want <= 32 KiB (the backend's maxReapFailureBodyBytes)", len(body))
+	}
+}

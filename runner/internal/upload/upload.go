@@ -446,6 +446,17 @@ type FetchedPrompt struct {
 	// remaining self-retry budget without an additional API call.
 	MaxRetriesSnapshot int `json:"max_retries_snapshot,omitempty"`
 	RetryAttempt       int `json:"retry_attempt,omitempty"`
+	// StageAttempt is the stage's per-attempt identity token (#3598), the
+	// backend's run.StageAttemptToken of dispatched_at. The runner echoes it
+	// back as expected_attempt on its terminal-failure self-report
+	// (ReportRunnerFailure) so a superseded attempt can never reap a live one.
+	// Empty on a backend that predates the field: the runner then has no
+	// anchor and skips the self-report.
+	//
+	// CROSS-MODULE WIRE CONTRACT: the json tag (`stage_attempt`) MUST stay
+	// byte-identical to the backend's promptResponse.StageAttempt
+	// (backend/internal/server/prompt.go).
+	StageAttempt string `json:"stage_attempt,omitempty"`
 	// ScopeFiles is the approved plan's scope.files, echoed by the
 	// backend on implement stages so the runner can bound the commit
 	// to exactly those declared paths instead of `git add -A` (#581).
@@ -3270,6 +3281,133 @@ func (c *Client) ReportStageProgress(ctx context.Context, args ReportStageProgre
 	default:
 		return statusError("report stage progress", resp)
 	}
+}
+
+// ReportRunnerFailureArgs collects the inputs for ReportRunnerFailure (#3598).
+// MCPToken is the run-bound fhm_ bearer FetchMCPToken returned; StageAttempt is
+// the FetchedPrompt.StageAttempt token of THIS dispatch.
+type ReportRunnerFailureArgs struct {
+	RunID        string
+	StageID      string
+	MCPToken     string
+	Category     string
+	Reason       string
+	Detail       string
+	ExitCode     int
+	StageAttempt string
+}
+
+// reapFailureRequestBody is the POST wire shape of the runner's terminal-failure
+// self-report. expected_state is always "running" (the runner reports from
+// inside its own running stage) and expected_attempt carries the attempt token.
+//
+// CROSS-MODULE WIRE CONTRACT: the json tags MUST stay byte-identical — options
+// included — to the backend's reapFailureRequest
+// (backend/internal/server/reap_failure.go), registered as the
+// reap_failure_request pair in backend/internal/wirecontract. The backend types
+// expected_state/expected_attempt as json.RawMessage for its absent-vs-null
+// decode; the runner only ever emits strings. The marshalled body is pinned
+// byte-for-byte by the shared golden testdata/wire/reap_failure_self_report.json.
+type reapFailureRequestBody struct {
+	Category        string `json:"category"`
+	Reason          string `json:"reason"`
+	Detail          string `json:"detail,omitempty"`
+	ExitCode        int    `json:"exit_code,omitempty"`
+	ExpectedState   string `json:"expected_state,omitempty"`
+	ExpectedAttempt string `json:"expected_attempt,omitempty"`
+}
+
+// reportRunnerFailureMaxAttempts bounds ReportRunnerFailure's retry on
+// transport errors and 5xx.
+const reportRunnerFailureMaxAttempts = 3
+
+// ReportRunnerFailure POSTs the runner's own terminal failure to
+// /v0/runs/{run_id}/stages/{stage_id}/reap-failure bearing the run-bound MCP
+// token (#3598) — the channel for failures where the signed trace upload is
+// itself what failed, so the stage does not sit `running` behind a dead
+// process. The backend admits a run-bound token for its OWN run only, and only
+// with both expected_state and expected_attempt, evaluated inside the
+// transition's own row-locked predicate.
+//
+// Every input is validated LOCALLY before any request: an empty StageAttempt in
+// particular never dials, because the server would 400 an unanchored report.
+// Reason and detail are truncated under MaxFailureReportReasonBytes so the
+// 32 KiB body cap cannot 413 the last-word report. Transport errors and 5xx
+// are retried up to reportRunnerFailureMaxAttempts with doubling backoff —
+// there is no later heartbeat to supersede a lost report — but a 4xx is
+// returned after ONE attempt: 400/403/409 are terminal answers, and retrying a
+// 409 stage_attempt_superseded would retry exactly what the anchor refuses.
+func (c *Client) ReportRunnerFailure(ctx context.Context, args ReportRunnerFailureArgs) error {
+	if args.RunID == "" || args.StageID == "" {
+		return errors.New("upload: run_id and stage_id required")
+	}
+	if args.MCPToken == "" {
+		return errors.New("upload: mcp token required")
+	}
+	if args.Category == "" || args.Reason == "" {
+		return errors.New("upload: category and reason required")
+	}
+	if args.StageAttempt == "" {
+		return errors.New("upload: stage attempt required (no attempt anchor)")
+	}
+
+	body, err := json.Marshal(reapFailureRequestBody{
+		Category:        args.Category,
+		Reason:          TruncateReason(args.Reason, MaxFailureReportReasonBytes/2),
+		Detail:          TruncateReason(args.Detail, MaxFailureReportReasonBytes/2),
+		ExitCode:        args.ExitCode,
+		ExpectedState:   "running",
+		ExpectedAttempt: args.StageAttempt,
+	})
+	if err != nil {
+		return fmt.Errorf("upload: marshal runner failure: %w", err)
+	}
+
+	endpoint := fmt.Sprintf("%s/v0/runs/%s/stages/%s/reap-failure",
+		c.BaseURL, url.PathEscape(args.RunID), url.PathEscape(args.StageID))
+
+	backoff := c.Backoff
+	if backoff == 0 {
+		backoff = DefaultBackoff
+	}
+	var lastErr error
+	for attempt := 0; attempt < reportRunnerFailureMaxAttempts; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(backoff):
+			}
+			backoff *= 2
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+		if err != nil {
+			return fmt.Errorf("upload: build runner failure request: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+args.MCPToken)
+		req.Header.Set("Accept", "application/json")
+
+		resp, err := c.HTTP.Do(req)
+		if err != nil {
+			lastErr = fmt.Errorf("upload: report runner failure: %w", err)
+			continue
+		}
+		switch {
+		case resp.StatusCode == http.StatusOK:
+			_ = resp.Body.Close()
+			return nil
+		case resp.StatusCode >= 500:
+			lastErr = statusError("report runner failure", resp)
+			_ = resp.Body.Close()
+			continue
+		default:
+			err := statusError("report runner failure", resp)
+			_ = resp.Body.Close()
+			return err
+		}
+	}
+	return fmt.Errorf("upload: report runner failure exhausted retries: %w", lastErr)
 }
 
 // FetchInstallationTokenArgs collects the inputs for FetchInstallationToken.

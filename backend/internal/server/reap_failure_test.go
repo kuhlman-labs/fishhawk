@@ -2406,3 +2406,544 @@ func TestReapStageFailure_UnshippedMarkerPayload_SharedWithReaperFailed(t *testi
 		t.Errorf("auth_method = %v, want %q", payload["auth_method"], reapFailureAuthMethod)
 	}
 }
+
+// --- run-bound runner self-report (#3598) -----------------------------------
+
+// withRunBoundToken injects a run-bound fhm_ identity for boundRun — subject
+// mcp:run:<id>, carrying mcp:read and NEVER write:runs, exactly as mcptoken.go
+// mints it.
+func withRunBoundToken(boundRun uuid.UUID) func(*http.Request) *http.Request {
+	return func(req *http.Request) *http.Request {
+		return req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity, Identity{
+			Subject: "mcp:run:" + boundRun.String(), TokenID: "tok-run", Scopes: []string{"mcp:read"},
+		}))
+	}
+}
+
+// selfReportBody renders a runner self-report body; nil values are OMITTED so
+// absence stays distinguishable from every present value.
+func selfReportBody(t *testing.T, expectedState, expectedAttempt any) []byte {
+	t.Helper()
+	body := map[string]any{"category": "C", "reason": "trace_upload", "exit_code": 1}
+	if expectedState != nil {
+		body["expected_state"] = expectedState
+	}
+	if expectedAttempt != nil {
+		body["expected_attempt"] = expectedAttempt
+	}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("marshal self-report: %v", err)
+	}
+	return raw
+}
+
+// liveAttempt reads the stage's CURRENT attempt token off the fake under its lock.
+func liveAttempt(t *testing.T, rr *orchestratorRepo, stageID uuid.UUID) string {
+	t.Helper()
+	rr.mu.Lock()
+	defer rr.mu.Unlock()
+	return run.StageAttemptToken(rr.stagesByID[stageID].DispatchedAt)
+}
+
+// assertReapNothing asserts the COMMITTED STATE of a refused self-report, read
+// back after the call: stage state and attempt unchanged, zero
+// dispatch_reaper_failed entries, and the run not advanced.
+func assertReapNothing(t *testing.T, rr *orchestratorRepo, au *auditFake, runID, stageID uuid.UUID, wantState run.StageState, wantAttempt string) {
+	t.Helper()
+	cur, _ := rr.GetStage(context.Background(), stageID)
+	if cur.State != wantState {
+		t.Errorf("stage state = %q, want %q (nothing transitioned)", cur.State, wantState)
+	}
+	if got := liveAttempt(t, rr, stageID); got != wantAttempt {
+		t.Errorf("stage attempt = %q, want %q (attempt untouched)", got, wantAttempt)
+	}
+	if got := reapAudit(au); len(got) != 0 {
+		t.Errorf("dispatch_reaper_failed entries = %d, want 0", len(got))
+	}
+	if curRun, _ := rr.GetRun(context.Background(), runID); curRun.State != run.StateRunning {
+		t.Errorf("run state = %q, want running (not advanced)", curRun.State)
+	}
+}
+
+// redispatchCycle drives a running stage through a FULL re-dispatch using the
+// fake's REAL transition methods — running → failed → RetryStage → pending →
+// dispatched (re-stamps the attempt) → running — never by hand-patching state.
+func redispatchCycle(t *testing.T, rr *orchestratorRepo, stageID uuid.UUID) {
+	t.Helper()
+	ctx := context.Background()
+	cat, reason := run.FailureC, "attempt A died"
+	if _, err := rr.TransitionStageFrom(ctx, stageID, run.StageStateRunning, run.StageStateFailed,
+		&run.StageCompletion{FailureCategory: &cat, FailureReason: &reason}); err != nil {
+		t.Fatalf("cycle fail: %v", err)
+	}
+	if _, err := rr.RetryStage(ctx, stageID, run.StageStatePending); err != nil {
+		t.Fatalf("cycle retry: %v", err)
+	}
+	if _, err := rr.TransitionStageFrom(ctx, stageID, run.StageStatePending, run.StageStateDispatched, nil); err != nil {
+		t.Fatalf("cycle dispatch: %v", err)
+	}
+	if _, err := rr.TransitionStageFrom(ctx, stageID, run.StageStateDispatched, run.StageStateRunning, nil); err != nil {
+		t.Fatalf("cycle run: %v", err)
+	}
+}
+
+// Run-bound admission happy path: the run's OWN fhm_ token (no write:runs),
+// pinning running + the live attempt, reaps the stage — 200, stage read back
+// failed, one dispatch_reaper_failed entry, the run advanced.
+func TestReapStageFailure_RunBoundOwnRunAdmitted(t *testing.T) {
+	s, rr, au, runID, stageID := reapServer(t, run.StageStateRunning)
+	attempt := liveAttempt(t, rr, stageID)
+	if attempt == "" {
+		t.Fatal("PRECONDITION: seeded running stage carries no attempt stamp")
+	}
+	w := postReapFailureRaw(t, s, runID, stageID, selfReportBody(t, "running", attempt), withRunBoundToken(runID))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp reapFailureResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if !resp.Transitioned {
+		t.Error("transitioned = false, want true")
+	}
+	if cur, _ := rr.GetStage(context.Background(), stageID); cur.State != run.StageStateFailed {
+		t.Errorf("stage state = %q, want failed", cur.State)
+	}
+	if got := reapAudit(au); len(got) != 1 {
+		t.Fatalf("dispatch_reaper_failed entries = %d, want 1", len(got))
+	}
+	if curRun, _ := rr.GetRun(context.Background(), runID); curRun.State != run.StateFailed {
+		t.Errorf("run state = %q, want failed (Advance invoked)", curRun.State)
+	}
+}
+
+// The run-bound arm's audit payload carries reported_by=runner and
+// reported_attempt=<the accepted token>, category C.
+func TestReapStageFailure_RunBoundAuditPayloadCarriesReportedBy(t *testing.T) {
+	s, rr, au, runID, stageID := reapServer(t, run.StageStateRunning)
+	attempt := liveAttempt(t, rr, stageID)
+	w := postReapFailureRaw(t, s, runID, stageID, selfReportBody(t, "running", attempt), withRunBoundToken(runID))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	entries := reapAudit(au)
+	if len(entries) != 1 {
+		t.Fatalf("dispatch_reaper_failed entries = %d, want 1", len(entries))
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(entries[0].Payload, &payload); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	if payload["reported_by"] != "runner" {
+		t.Errorf("reported_by = %v, want runner", payload["reported_by"])
+	}
+	if payload["reported_attempt"] != attempt {
+		t.Errorf("reported_attempt = %v, want %q", payload["reported_attempt"], attempt)
+	}
+	if payload["failure_category"] != "C" {
+		t.Errorf("failure_category = %v, want C", payload["failure_category"])
+	}
+}
+
+// A run-bound token for a DIFFERENT run → 403 run_not_entitled. The token's run
+// id is a freshly generated UUID, non-matching BY CONSTRUCTION.
+func TestReapStageFailure_RunBoundCrossRunForbidden(t *testing.T) {
+	s, rr, au, runID, stageID := reapServer(t, run.StageStateRunning)
+	attempt := liveAttempt(t, rr, stageID)
+	w := postReapFailureRaw(t, s, runID, stageID, selfReportBody(t, "running", attempt), withRunBoundToken(uuid.New()))
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403:\n%s", w.Code, w.Body.String())
+	}
+	if code, _ := decodeReapError(t, w); code != "run_not_entitled" {
+		t.Errorf("error code = %q, want run_not_entitled", code)
+	}
+	assertReapNothing(t, rr, au, runID, stageID, run.StageStateRunning, attempt)
+}
+
+// The run-bound arm REQUIRES expected_state: absent or explicit-null → 400
+// expected_state_required, nothing transitioned.
+func TestReapStageFailure_RunBoundMissingExpectedStateIs400(t *testing.T) {
+	for name, st := range map[string]any{"absent": nil, "null": json.RawMessage("null")} {
+		t.Run(name, func(t *testing.T) {
+			s, rr, au, runID, stageID := reapServer(t, run.StageStateRunning)
+			attempt := liveAttempt(t, rr, stageID)
+			w := postReapFailureRaw(t, s, runID, stageID, selfReportBody(t, st, attempt), withRunBoundToken(runID))
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+			}
+			if code, _ := decodeReapError(t, w); code != "expected_state_required" {
+				t.Errorf("error code = %q, want expected_state_required", code)
+			}
+			assertReapNothing(t, rr, au, runID, stageID, run.StageStateRunning, attempt)
+		})
+	}
+}
+
+// A run-bound expected_state naming a non-anchor state → 400
+// expected_state_required naming the accepted set.
+func TestReapStageFailure_RunBoundNonAnchorExpectedStateIs400(t *testing.T) {
+	s, rr, au, runID, stageID := reapServer(t, run.StageStateRunning)
+	attempt := liveAttempt(t, rr, stageID)
+	w := postReapFailureRaw(t, s, runID, stageID, selfReportBody(t, "awaiting_children", attempt), withRunBoundToken(runID))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+	}
+	code, details := decodeReapError(t, w)
+	if code != "expected_state_required" {
+		t.Errorf("error code = %q, want expected_state_required", code)
+	}
+	if details["accepted"] == nil {
+		t.Errorf("details missing the accepted anchor list: %v", details)
+	}
+	assertReapNothing(t, rr, au, runID, stageID, run.StageStateRunning, attempt)
+}
+
+// The run-bound arm REQUIRES expected_attempt, under the three-state decode
+// discipline: absent, explicit null, empty string and a non-string are ALL
+// 400 expected_attempt_required — never the unpinned path.
+func TestReapStageFailure_RunBoundMissingExpectedAttemptIs400(t *testing.T) {
+	for name, att := range map[string]any{
+		"absent":     nil,
+		"null":       json.RawMessage("null"),
+		"empty":      "",
+		"non_string": 7,
+	} {
+		t.Run(name, func(t *testing.T) {
+			s, rr, au, runID, stageID := reapServer(t, run.StageStateRunning)
+			attempt := liveAttempt(t, rr, stageID)
+			w := postReapFailureRaw(t, s, runID, stageID, selfReportBody(t, "running", att), withRunBoundToken(runID))
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+			}
+			if code, _ := decodeReapError(t, w); code != "expected_attempt_required" {
+				t.Errorf("error code = %q, want expected_attempt_required", code)
+			}
+			assertReapNothing(t, rr, au, runID, stageID, run.StageStateRunning, attempt)
+		})
+	}
+}
+
+// The operator arm honours an OPTIONAL attempt pin but validates it the same
+// way: a present-invalid pin is 400 validation_failed, and a pin without a
+// state pin is 400 expected_state_required (the attempt predicate only exists
+// on the conditional walk).
+func TestReapStageFailure_OperatorAttemptPinValidation(t *testing.T) {
+	t.Run("invalid", func(t *testing.T) {
+		s, rr, au, runID, stageID := reapServer(t, run.StageStateRunning)
+		attempt := liveAttempt(t, rr, stageID)
+		w := postReapFailureRaw(t, s, runID, stageID, selfReportBody(t, "running", ""), withReapOperator)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+		}
+		if code, _ := decodeReapError(t, w); code != "validation_failed" {
+			t.Errorf("error code = %q, want validation_failed", code)
+		}
+		assertReapNothing(t, rr, au, runID, stageID, run.StageStateRunning, attempt)
+	})
+	t.Run("attempt_without_state", func(t *testing.T) {
+		s, rr, au, runID, stageID := reapServer(t, run.StageStateRunning)
+		attempt := liveAttempt(t, rr, stageID)
+		w := postReapFailureRaw(t, s, runID, stageID, selfReportBody(t, nil, attempt), withReapOperator)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+		}
+		if code, _ := decodeReapError(t, w); code != "expected_state_required" {
+			t.Errorf("error code = %q, want expected_state_required", code)
+		}
+		assertReapNothing(t, rr, au, runID, stageID, run.StageStateRunning, attempt)
+	})
+}
+
+// A run-bound token without write:runs is admitted only on its OWN run; an
+// OPERATOR bearer without write:runs is still refused (the operator arm's
+// requirement is unchanged by the widening).
+func TestReapStageFailure_OperatorWithoutWriteRunsForbidden(t *testing.T) {
+	s, rr, au, runID, stageID := reapServer(t, run.StageStateRunning)
+	attempt := liveAttempt(t, rr, stageID)
+	w := postReapFailureRaw(t, s, runID, stageID, selfReportBody(t, "running", attempt),
+		func(req *http.Request) *http.Request {
+			return req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity, Identity{
+				Subject: "github:ops", TokenID: "tok-op", Scopes: []string{"mcp:read"},
+			}))
+		})
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403:\n%s", w.Code, w.Body.String())
+	}
+	if code, _ := decodeReapError(t, w); code != "insufficient_scope" {
+		t.Errorf("error code = %q, want insufficient_scope", code)
+	}
+	assertReapNothing(t, rr, au, runID, stageID, run.StageStateRunning, attempt)
+}
+
+// casOnlyRunRepo carries run.StageCASTransitioner but NOT
+// run.StageAttemptCASTransitioner: the embedded run.Repository interface erases
+// every method outside it, and only TransitionStageFrom is re-added. The
+// attempt capability is therefore absent BY CONSTRUCTION.
+type casOnlyRunRepo struct {
+	run.Repository
+	cas run.StageCASTransitioner
+}
+
+func (r *casOnlyRunRepo) TransitionStageFrom(ctx context.Context, id uuid.UUID, from, to run.StageState, c *run.StageCompletion) (*run.Stage, error) {
+	return r.cas.TransitionStageFrom(ctx, id, from, to, c)
+}
+
+func newCASOnlyReapServer(t *testing.T, state run.StageState) (*Server, *orchestratorRepo, *auditFake, uuid.UUID, uuid.UUID) {
+	t.Helper()
+	rr := newOrchestratorRepo()
+	au := newAuditFake()
+	runRow := rr.seedRun()
+	stage := rr.seedStage(runRow.ID, 0, state)
+	vehicle := &casOnlyRunRepo{Repository: rr, cas: rr}
+	if _, ok := any(vehicle).(run.StageAttemptCASTransitioner); ok {
+		t.Fatal("PRECONDITION: casOnlyRunRepo unexpectedly implements StageAttemptCASTransitioner")
+	}
+	if _, ok := any(vehicle).(run.StageCASTransitioner); !ok {
+		t.Fatal("PRECONDITION: casOnlyRunRepo must still implement StageCASTransitioner")
+	}
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      vehicle,
+		AuditRepo:    au,
+		Orchestrator: &orchestrator.Orchestrator{Runs: rr},
+	})
+	return s, rr, au, runRow.ID, stage.ID
+}
+
+// Operator condition 3: an attempt-pinned self-report against a repo lacking
+// the attempt capability REFUSES loudly — 503 attempt_pinned_reap_unsupported,
+// stage unchanged, zero audit entries — never degrading to a state-only write.
+func TestReapStageFailure_RunBoundAttemptCapabilityAbsentRefused(t *testing.T) {
+	s, rr, au, runID, stageID := newCASOnlyReapServer(t, run.StageStateRunning)
+	attempt := liveAttempt(t, rr, stageID)
+	w := postReapFailureRaw(t, s, runID, stageID, selfReportBody(t, "running", attempt), withRunBoundToken(runID))
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503:\n%s", w.Code, w.Body.String())
+	}
+	if code, _ := decodeReapError(t, w); code != "attempt_pinned_reap_unsupported" {
+		t.Errorf("error code = %q, want attempt_pinned_reap_unsupported", code)
+	}
+	assertReapNothing(t, rr, au, runID, stageID, run.StageStateRunning, attempt)
+}
+
+// Operator condition 3, second half: the DETACHED reaper's UNCONDITIONAL report
+// is unaffected by the attempt capability — against the same capability-absent
+// repo it still reaps (200, stage failed, one audit entry), because an empty
+// attempt pin never probes for the capability.
+func TestReapStageFailure_UnconditionalUnaffectedByAttemptCapability(t *testing.T) {
+	s, rr, au, runID, stageID := newCASOnlyReapServer(t, run.StageStateDispatched)
+	w := postReapFailure(t, s, runID, stageID,
+		reapFailureRequest{Category: "C", Reason: "runner exited non-zero"}, withReapOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if cur, _ := rr.GetStage(context.Background(), stageID); cur.State != run.StageStateFailed {
+		t.Errorf("stage state = %q, want failed", cur.State)
+	}
+	if got := reapAudit(au); len(got) != 1 {
+		t.Errorf("dispatch_reaper_failed entries = %d, want 1", len(got))
+	}
+}
+
+// attemptCountReapRepo counts which CAS the walk used, proving an attempt-pinned
+// reap routes EVERY write (both legs of a dispatched-anchored walk) through
+// TransitionStageFromAttempt and none through the state-only CAS.
+type attemptCountReapRepo struct {
+	*orchestratorRepo
+	stateOnly, attemptPinned int
+}
+
+func (r *attemptCountReapRepo) TransitionStageFrom(ctx context.Context, id uuid.UUID, from, to run.StageState, c *run.StageCompletion) (*run.Stage, error) {
+	r.stateOnly++
+	return r.orchestratorRepo.TransitionStageFrom(ctx, id, from, to, c)
+}
+
+func (r *attemptCountReapRepo) TransitionStageFromAttempt(ctx context.Context, id uuid.UUID, from, to run.StageState, attempt string, c *run.StageCompletion) (*run.Stage, error) {
+	r.attemptPinned++
+	return r.orchestratorRepo.TransitionStageFromAttempt(ctx, id, from, to, attempt, c)
+}
+
+func TestReapStageFailure_RunBoundDispatchedWalkPinsBothLegs(t *testing.T) {
+	rr := newOrchestratorRepo()
+	au := newAuditFake()
+	runRow := rr.seedRun()
+	stage := rr.seedStage(runRow.ID, 0, run.StageStateDispatched)
+	counter := &attemptCountReapRepo{orchestratorRepo: rr}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: counter, AuditRepo: au, Orchestrator: &orchestrator.Orchestrator{Runs: rr}})
+	attempt := liveAttempt(t, rr, stage.ID)
+	w := postReapFailureRaw(t, s, runRow.ID, stage.ID, selfReportBody(t, "dispatched", attempt), withRunBoundToken(runRow.ID))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if counter.attemptPinned != 2 || counter.stateOnly != 0 {
+		t.Errorf("CAS calls: attempt-pinned=%d state-only=%d, want 2 and 0 (both legs attempt-pinned)",
+			counter.attemptPinned, counter.stateOnly)
+	}
+}
+
+// failStageForReap refuses an attempt pin on the ABSORBING (unconditional)
+// walk as a programming error, transitioning nothing.
+func TestFailStageForReap_AttemptPinRequiresConditional(t *testing.T) {
+	rr := newOrchestratorRepo()
+	runRow := rr.seedRun()
+	stage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
+	attempt := liveAttempt(t, rr, stage.ID)
+	if _, err := failStageForReap(context.Background(), rr, stage.ID, run.StageStateRunning, run.FailureC, "x", false, attempt); err == nil {
+		t.Fatal("err = nil, want a refusal for an attempt pin on the unconditional walk")
+	}
+	if cur, _ := rr.GetStage(context.Background(), stage.ID); cur.State != run.StageStateRunning {
+		t.Errorf("stage state = %q, want running (nothing transitioned)", cur.State)
+	}
+}
+
+// SEQUENTIAL state cycle (kept, and labelled honestly): attempt A's runner
+// reports AFTER the stage was already re-dispatched to attempt B, so the
+// re-dispatch PRECEDES the handler's load. This exercises the handler's
+// load-time PRE-CHECK (a fast path) — and, with the pre-check deleted, the
+// in-transaction predicate answers the identical 409 (operator condition 1).
+// It does NOT cover the load→write interleaving; that is
+// TestReapStageFailure_RunBoundReDispatchBetweenLoadAndWriteRefused. Positive
+// control: attempt B's OWN token does reap, proving the refusal discriminates
+// attempts rather than refusing blanket.
+func TestReapStageFailure_RunBoundStaleAttemptAfterRetryRefused(t *testing.T) {
+	s, rr, au, runID, stageID := reapServer(t, run.StageStateDispatched)
+	if _, err := rr.TransitionStageFrom(context.Background(), stageID, run.StageStateDispatched, run.StageStateRunning, nil); err != nil {
+		t.Fatalf("dispatched → running: %v", err)
+	}
+	tokenA := liveAttempt(t, rr, stageID)
+	redispatchCycle(t, rr, stageID)
+	tokenB := liveAttempt(t, rr, stageID)
+	if tokenA == "" || tokenB == tokenA {
+		t.Fatalf("PRECONDITION: re-dispatch did not re-stamp the attempt (A=%q B=%q)", tokenA, tokenB)
+	}
+
+	w := postReapFailureRaw(t, s, runID, stageID, selfReportBody(t, "running", tokenA), withRunBoundToken(runID))
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+	}
+	code, details := decodeReapError(t, w)
+	if code != "stage_attempt_superseded" {
+		t.Errorf("error code = %q, want stage_attempt_superseded", code)
+	}
+	if details["expected_attempt"] != tokenA || details["actual_attempt"] != tokenB {
+		t.Errorf("details = %v, want expected_attempt=%q actual_attempt=%q", details, tokenA, tokenB)
+	}
+	assertReapNothing(t, rr, au, runID, stageID, run.StageStateRunning, tokenB)
+
+	// Positive control: attempt B's own token reaps.
+	w = postReapFailureRaw(t, s, runID, stageID, selfReportBody(t, "running", tokenB), withRunBoundToken(runID))
+	if w.Code != http.StatusOK {
+		t.Fatalf("attempt B's own report: status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if cur, _ := rr.GetStage(context.Background(), stageID); cur.State != run.StageStateFailed {
+		t.Errorf("stage state = %q, want failed after attempt B's own report", cur.State)
+	}
+}
+
+// attemptRaceReapRepo performs the FULL re-dispatch cycle on the FIRST
+// TransitionStageFromAttempt call for the target stage, BEFORE delegating — so
+// at WRITE time the stage is `running` under attempt B (the STATE predicate
+// PASSES) while the handler holds attempt A's loaded row and its pre-check has
+// already succeeded. Only an attempt predicate evaluated inside the write can
+// refuse it.
+type attemptRaceReapRepo struct {
+	*orchestratorRepo
+	t       *testing.T
+	stageID uuid.UUID
+	flips   int
+}
+
+func (r *attemptRaceReapRepo) TransitionStageFromAttempt(ctx context.Context, id uuid.UUID, from, to run.StageState, attempt string, c *run.StageCompletion) (*run.Stage, error) {
+	if r.flips == 0 && id == r.stageID {
+		r.flips++
+		redispatchCycle(r.t, r.orchestratorRepo, id)
+	}
+	return r.orchestratorRepo.TransitionStageFromAttempt(ctx, id, from, to, attempt, c)
+}
+
+// THE INTERLEAVING TEST (#3598): a re-dispatch landing BETWEEN the handler's
+// load and its write must be refused by the in-transaction attempt predicate —
+// 409 stage_attempt_superseded, attempt B's stage left running with its
+// attempt intact, no audit entry, no advance.
+func TestReapStageFailure_RunBoundReDispatchBetweenLoadAndWriteRefused(t *testing.T) {
+	rr := newOrchestratorRepo()
+	au := newAuditFake()
+	runRow := rr.seedRun()
+	stage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
+	race := &attemptRaceReapRepo{orchestratorRepo: rr, t: t, stageID: stage.ID}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: race, AuditRepo: au, Orchestrator: &orchestrator.Orchestrator{Runs: rr}})
+	tokenA := liveAttempt(t, rr, stage.ID)
+
+	w := postReapFailureRaw(t, s, runRow.ID, stage.ID, selfReportBody(t, "running", tokenA), withRunBoundToken(runRow.ID))
+
+	tokenB := liveAttempt(t, rr, stage.ID)
+	if race.flips != 1 || tokenA == "" || tokenB == tokenA {
+		t.Fatalf("PRECONDITION: the wrapper did not re-dispatch between load and write (flips=%d A=%q B=%q)",
+			race.flips, tokenA, tokenB)
+	}
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (attempt A must not reap live attempt B):\n%s", w.Code, w.Body.String())
+	}
+	code, details := decodeReapError(t, w)
+	if code != "stage_attempt_superseded" {
+		t.Errorf("error code = %q, want stage_attempt_superseded", code)
+	}
+	if details["expected_attempt"] != tokenA || details["actual_attempt"] != tokenB {
+		t.Errorf("details = %v, want expected_attempt=%q actual_attempt=%q", details, tokenA, tokenB)
+	}
+	assertReapNothing(t, rr, au, runRow.ID, stage.ID, run.StageStateRunning, tokenB)
+}
+
+// A run-bound pin of `running` against a stage still `dispatched` is the
+// pre-existing state-precondition 409, unchanged.
+func TestReapStageFailure_RunBoundStalePinAgainstDispatchedIs409(t *testing.T) {
+	s, rr, au, runID, stageID := reapServer(t, run.StageStateDispatched)
+	attempt := liveAttempt(t, rr, stageID)
+	w := postReapFailureRaw(t, s, runID, stageID, selfReportBody(t, "running", attempt), withRunBoundToken(runID))
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+	}
+	if code, _ := decodeReapError(t, w); code != "stage_state_precondition_failed" {
+		t.Errorf("error code = %q, want stage_state_precondition_failed", code)
+	}
+	assertReapNothing(t, rr, au, runID, stageID, run.StageStateDispatched, attempt)
+}
+
+// CROSS-BOUNDARY (operator condition 2): the SHARED golden
+// testdata/wire/reap_failure_self_report.json — the exact bytes the runner's
+// upload_test.go pins its marshalled body against — driven through the REAL
+// handler with a run-bound identity against a stage whose attempt IS the
+// golden's expected_attempt: 200 → stage failed read back → one
+// dispatch_reaper_failed entry carrying reported_by/reported_attempt → the run
+// advanced.
+func TestReapStageFailure_RunnerSelfReportEndToEnd(t *testing.T) {
+	raw, fixtureAttempt := reapSelfReportFixture(t)
+	at, err := time.Parse(time.RFC3339Nano, fixtureAttempt)
+	if err != nil {
+		t.Fatalf("fixture attempt: %v", err)
+	}
+	s, rr, au, runID, stageID := reapServer(t, run.StageStateRunning)
+	rr.mu.Lock()
+	rr.stagesByID[stageID].DispatchedAt = &at
+	rr.mu.Unlock()
+
+	w := postReapFailureRaw(t, s, runID, stageID, raw, withRunBoundToken(runID))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if cur, _ := rr.GetStage(context.Background(), stageID); cur.State != run.StageStateFailed {
+		t.Errorf("stage state = %q, want failed", cur.State)
+	}
+	entries := reapAudit(au)
+	if len(entries) != 1 {
+		t.Fatalf("dispatch_reaper_failed entries = %d, want 1", len(entries))
+	}
+	var payload map[string]any
+	_ = json.Unmarshal(entries[0].Payload, &payload)
+	if payload["reported_by"] != "runner" || payload["reported_attempt"] != fixtureAttempt || payload["reason"] != "trace_upload" {
+		t.Errorf("payload = %v, want reported_by=runner reported_attempt=%q reason=trace_upload", payload, fixtureAttempt)
+	}
+	if curRun, _ := rr.GetRun(context.Background(), runID); curRun.State != run.StateFailed {
+		t.Errorf("run state = %q, want failed (Advance observed)", curRun.State)
+	}
+}
