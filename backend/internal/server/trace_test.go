@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -12969,4 +12970,70 @@ func TestImplementReview_ReviewRoundSequence_Recorded(t *testing.T) {
 			t.Errorf("review_round_sequence key present at roundSeq 0 — omitempty not honored\npayload: %s", raw)
 		}
 	})
+}
+
+// TestMissingTraceUploadDeps_NamesTheNilOne pins the E45.74 / #3599 contract:
+// the refusal names the dependency that is actually nil, not all three.
+//
+// The counterfactual this replaces is the old message, which was a constant —
+// it could not fail this table for any input, which is exactly why it cost a
+// hand diagnosis in run d640efb5.
+func TestMissingTraceUploadDeps_NamesTheNilOne(t *testing.T) {
+	signing := newSigningFake()
+	store := newTraceStoreFake()
+	audit := newAuditFake()
+
+	for _, tc := range []struct {
+		name     string
+		cfg      Config
+		want     []string
+		wantHint string
+	}{
+		{"only tracestore nil", Config{SigningRepo: signing, AuditRepo: audit},
+			[]string{"tracestore"}, "FISHHAWKD_S3_BUCKET"},
+		{"only signing nil", Config{TraceStore: store, AuditRepo: audit},
+			[]string{"signing"}, "repository wiring"},
+		{"only audit nil", Config{SigningRepo: signing, TraceStore: store},
+			[]string{"audit"}, "repository wiring"},
+		{"signing and audit nil", Config{TraceStore: store},
+			[]string{"signing", "audit"}, "repository wiring"},
+		{"all three nil", Config{},
+			[]string{"signing", "tracestore", "audit"}, "FISHHAWKD_S3_BUCKET"},
+		{"none nil", Config{SigningRepo: signing, TraceStore: store, AuditRepo: audit},
+			nil, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := missingTraceUploadDeps(tc.cfg)
+			if !slices.Equal(got, tc.want) {
+				t.Fatalf("missingTraceUploadDeps = %v, want %v", got, tc.want)
+			}
+			if len(got) == 0 {
+				return
+			}
+			msg := traceUploadUnconfiguredMessage(got)
+			for _, dep := range tc.want {
+				if !strings.Contains(msg, dep) {
+					t.Errorf("message %q does not name the nil dependency %q", msg, dep)
+				}
+			}
+			// Error IDENTITY: a dependency that is NOT nil must not be named,
+			// or the message is back to the three-way ambiguity it replaced.
+			for _, dep := range []string{"signing", "tracestore", "audit"} {
+				if slices.Contains(tc.want, dep) {
+					continue
+				}
+				if strings.Contains(msg, dep) {
+					t.Errorf("message %q names %q, which is configured", msg, dep)
+				}
+			}
+			if !strings.Contains(msg, tc.wantHint) {
+				t.Errorf("message %q does not carry the remedy %q", msg, tc.wantHint)
+			}
+			// The tracestore remedy must NOT send the operator to dev
+			// fixtures, which silently deny every forge write (#3601).
+			if strings.Contains(msg, "dev-fixtures") || strings.Contains(msg, "DEV_FIXTURES") {
+				t.Errorf("message %q points at dev fixtures, which disable forge writes", msg)
+			}
+		})
+	}
 }
