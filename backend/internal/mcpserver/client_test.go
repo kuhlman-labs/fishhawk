@@ -2704,3 +2704,55 @@ func TestOnboardingReviewer_ModelFieldsDecode(t *testing.T) {
 		t.Errorf("anthropic ModelHint = %q, want a did-you-mean", got[1].ModelHint)
 	}
 }
+
+// TestOnboardingReadinessReport_TraceStoreMirrorsBackendTags pins the #3600
+// trace_store mirror: EVERY field carries a distinct non-empty value, so a
+// json-tag typo on any one decodes to its zero value and fails here rather
+// than passing on a zero-valued fixture.
+func TestOnboardingReadinessReport_TraceStoreMirrorsBackendTags(t *testing.T) {
+	const body = `{"repo": "acme/widgets", "forge": "github",
+	  "app": {"installed": false}, "spec": {"source": "unavailable"},
+	  "reviewers": [], "scopes": {"adequate": true, "required": [], "missing": []},
+	  "trace_store": {"configured": true, "kind": "memory",
+	    "note": "trace-store-note-sentinel", "remediation": "trace-store-remediation-sentinel"}}`
+	var got OnboardingReadinessReport
+	if err := json.Unmarshal([]byte(body), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	ts := got.TraceStore
+	if ts == nil {
+		t.Fatalf("TraceStore = nil, want the decoded object")
+	}
+	if !ts.Configured {
+		t.Errorf("Configured = false, want true")
+	}
+	for _, f := range []struct{ name, got, want string }{
+		{"Kind", ts.Kind, "memory"},
+		{"Note", ts.Note, "trace-store-note-sentinel"},
+		{"Remediation", ts.Remediation, "trace-store-remediation-sentinel"},
+	} {
+		if f.got != f.want {
+			t.Errorf("%s = %q, want %q", f.name, f.got, f.want)
+		}
+	}
+}
+
+// TestOnboardingReadinessReport_TraceStoreAbsentOrNullKeepsNil pins the
+// pointer: an absent key (a pre-#3600 fishhawkd) and an explicit JSON null
+// both decode to nil — never a zero-valued rung whose kind is "".
+func TestOnboardingReadinessReport_TraceStoreAbsentOrNullKeepsNil(t *testing.T) {
+	for name, body := range map[string]string{
+		"absent": `{"repo": "a/b", "app": {"installed": true}, "spec": {"source": "fetched"}, "reviewers": [], "scopes": {"adequate": true, "required": [], "missing": []}}`,
+		"null":   `{"repo": "a/b", "app": {"installed": true}, "spec": {"source": "fetched"}, "reviewers": [], "scopes": {"adequate": true, "required": [], "missing": []}, "trace_store": null}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			var got OnboardingReadinessReport
+			if err := json.Unmarshal([]byte(body), &got); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if got.TraceStore != nil {
+				t.Errorf("TraceStore = %+v, want nil", *got.TraceStore)
+			}
+		})
+	}
+}

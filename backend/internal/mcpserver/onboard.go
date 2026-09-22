@@ -67,7 +67,8 @@ const initNextStep = "Write workflow_yaml to target_path in the checkout, then c
 // forge-family-aware since E45.43 / #3348 (the GitHub-shaped merge_gate is
 // omitted on GitLab by design; since E45.66 / #3580 the fifth check on GitLab
 // is the GitLab-shaped gitlab_merge_gate rung, and since E45.68 / #3582 GitLab
-// carries a sixth, gitlab_registration).
+// carries a sixth, gitlab_registration). Since E45.75 / #3600 both families
+// also carry the deployment-scoped trace_store rung.
 func registerDoctor(srv *mcp.Server, resolver *runResolver) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "fishhawk_doctor",
@@ -78,7 +79,8 @@ readiness before starting a run — the in-band counterpart to the CLI
 returns five server-side-only checks the first feature_change run needs on
 GitHub and six on GitLab (the fifth on GitLab being gitlab_merge_gate and the
 sixth gitlab_registration — see merge_gate, gitlab_merge_gate and
-gitlab_registration below):
+gitlab_registration below), plus on both families the deployment-scoped
+trace_store rung (see below):
 
   - app     — is the Fishhawk-specific authorization a run needs in place? On
               GitHub: is the GitHub App installed on the target repo
@@ -185,6 +187,18 @@ gitlab_registration below):
               receiver additionally enforces (note says so). The key is
               OMITTED on a github-family report and against an older
               fishhawkd; absence means no claim, not status unknown.
+  - trace_store — DEPLOYMENT-scoped, both families (E45.75): will this
+              fishhawkd accept a run's trace bundle, or will POST
+              /v0/runs/{id}/trace respond 503 AFTER the agent has run and been
+              billed? kind is s3 (durable S3/RustFS) | memory (the
+              --dev-fixtures in-memory store: configured but EPHEMERAL, lost on
+              restart) | none (configured:false; remediation names
+              FISHHAWKD_S3_BUCKET and make s3-init) | other (a non-S3,
+              non-memory store, no durability claim). It is a fact about the
+              deployment, not the repo, so it NEVER cascades: a not-installed
+              repo or an unavailable spec still carries it. The key is ABSENT
+              only against an older fishhawkd; absence means the backend
+              cannot answer, which is NOT the same claim as configured:false.
 
 The report's forge field names the family that answered (github|gitlab). repo
 is owner/name on GitHub, or a namespace/project path on GitLab — nested groups

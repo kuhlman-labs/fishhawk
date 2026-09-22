@@ -3267,7 +3267,7 @@ It covers evidence assembly (`releaseevidence`) → notes render (`releasenotes`
 
 ### First-run readiness introspection (`onboarding.go`, E29.4)
 
-`backend/internal/server/onboarding.go` — `handleGetOnboardingReadiness` serves `GET /v0/onboarding/readiness?repo=<path>[&forge=github|gitlab]`, aggregating the server-side-only checks a repo's first run needs, consumed by `fishhawk doctor` (E29.5) — five on GitHub, six on GitLab (E45.43 / #3348, "Forge family" below; E45.66 / #3580, "Check (5) on GitLab" below; E45.68 / #3582, "GitLab registration rung" below):
+`backend/internal/server/onboarding.go` — `handleGetOnboardingReadiness` serves `GET /v0/onboarding/readiness?repo=<path>[&forge=github|gitlab]`, aggregating the server-side-only checks a repo's first run needs, consumed by `fishhawk doctor` (E29.5) — five on GitHub, six on GitLab (E45.43 / #3348, "Forge family" below; E45.66 / #3580, "Check (5) on GitLab" below; E45.68 / #3582, "GitLab registration rung" below), plus the deployment-scoped `trace_store` rung on both families (E45.75 / #3600, "Trace-store rung" below):
 
 1. GitHub App installation via `githubclient.GetRepoInstallation`, reusing the run-create `ErrNotInstalled` classification (`runs.go`) — `probeGitHub`; on GitLab, `installed` = a gitlab installation registered for EXACTLY this project path AND the project resolvable with the deployment credential (#3582) — `probeGitLab` sets `resolvable`, the handler conjoins it with check (6);
 2. the committed workflow spec's `spec.ParseBytes` + `spec.Validate` state (`classifySpecBytes`, shared by both families; the bytes come from `GetWorkflowSpec` on GitHub and `forge.FileFetcher.FetchFile` on GitLab);
@@ -3275,6 +3275,7 @@ It covers evidence assembly (`releaseevidence`) → notes render (`releasenotes`
 4. caller-token scope adequacy against `requiredRunScopes` (the run-drive subset of `operatorDefaultScopes`, `backend/cmd/fishhawkd/token.go`) (`probeScopes`);
 5. a forge-shaped merge-gate read: `merge_gate` — whether the forge actually requires the `fishhawk_audit_complete` check Fishhawk publishes (E64.44 / #3161), below, **GitHub family only; OMITTED on GitLab** — and its GitLab-shaped sibling `gitlab_merge_gate` — whether the project's real default branch is protected and the project requires a successful pipeline to merge (E45.66 / #3580), below, **GitLab family only; OMITTED on GitHub**;
 6. **GitLab family only; OMITTED on GitHub**: `gitlab_registration` — whether an `installations` row is registered for exactly this project path, the check `POST /v0/runs` refuses `422 gitlab_project_not_registered` on (E45.68 / #3582), below — `probeGitLabRegistration`.
+7. **Both families, DEPLOYMENT-scoped, never cascading**: `trace_store` — whether this fishhawkd has a trace store wired (`s3` | `memory` | `none` | `other`), i.e. whether a run's trace upload will 503 after the agent is billed (E45.75 / #3600), below — `traceStoreReadinessFor`.
 
 Read-only; cascades gracefully (GitHub: not-installed → spec-unavailable → empty reviewers; GitLab: not-RESOLVABLE → spec-unavailable → empty reviewers — an unregistered-but-resolvable project still gets its spec read). The response's `forge` field names the family that answered.
 
@@ -3389,6 +3390,16 @@ Three identity classes are UNFILTERED, each preserving the exact pre-change surf
 - **No-mirror deployments** — `Config.RepoVisibility == nil` is `repoFilterFor`'s first early return.
 
 Pinned by, in `onboarding_test.go`: `TestOnboardingReadiness_RepoNotVisible` (the 403 + zero-forge control and counterfactual vehicle), `_RepoVisible` (admission control), `_BearerTokenUnfiltered`, `_AdminCookieBypass`, `_NoMirrorWired`, `_VisibilityStoreFault`, `_RoleResolutionFault`, `_ProviderResolutionFault`, `_CrossForgeDeny`, `_AmbiguousRowForgeDeny`, `_PrefixlessSubjectDenyAll`, `_AnonymousBeforeVisibility` (documents the observed handler-level posture — 401 `authentication_required` + zero mirror calls for anonymous — NOT a strict hoist counterfactual: `repoFilterFor` ALSO short-circuits anonymous callers with a nil filter, so a hoisted guard would still not reach the mirror fault), `_MalformedRepoBeforeVisibility`; and the cross-layer arms in `repovisibility_integration_test.go` (`TestRepoVisibility_Integration_MemberSeesOnlyGrantedRepo` / `_AdminSeesEverything`) that drive the endpoint through the real router, session middleware and Postgres-backed mirror.
+
+#### Trace-store rung (E45.75 / [#3600](https://github.com/kuhlman-labs/fishhawk/issues/3600))
+
+`trace_store` answers "will this run's trace upload 503?" BEFORE an agent is dispatched and billed, instead of after. `POST /v0/runs/{id}/trace` responds 503 when `cfg.TraceStore` is nil, and that only surfaces after the agent has run — the documented local dogfood loop hit exactly this.
+
+- **Deployment-scoped, never cascades.** `traceStoreReadinessFor(s.cfg.TraceStore)` is resolved in `handleGetOnboardingReadiness` BEFORE the forge switch, so every report of BOTH families carries it — a not-installed repo, an unresolvable GitLab project and an unavailable spec included. It is a fact about the deployment, not the repo.
+- **Four kinds, resolved by concrete type** (no `tracestore.Storage` interface change): nil (or a typed-nil concrete store) → `configured:false`, `kind:"none"`, a `note` naming the 503-after-billing consequence and a `remediation` naming `FISHHAWKD_S3_BUCKET`, the `.env.example` trace-storage block and `make s3-init`; `*tracestore.MemStorage` → `kind:"memory"` with a `note` that the `--dev-fixtures` store is EPHEMERAL (lost on restart — the E45.76 trap); `*tracestore.S3Storage` → `kind:"s3"`; any other implementation → `kind:"other"`, never mislabelled `s3`.
+- **Pointer on the wire.** `TraceStore *traceStoreReadiness` with `omitempty`; this handler never leaves it nil, but both client mirrors (`fishhawk_doctor` in `backend/internal/mcpserver`, the CLI `fishhawk doctor`) model it as a pointer so an older fishhawkd's absent key renders NO rung — absence is "cannot answer", not `configured:false`.
+
+Pinned by, in `onboarding_test.go`: `TestTraceStoreReadinessFor` (every branch including the typed-nil and third-implementation cases, asserting kind + configured + branch note/remediation), the no-cascade seams `_TraceStore_NotInstalledStillCarriesRung` / `_TraceStore_SpecUnavailableStillCarriesRung` / `_TraceStore_GitLabForgeUnconfiguredCarriesRung` (raw served JSON), and the cross-boundary `_TraceStore_SurvivesMCPMirrorDecode` (the real handler's served body decoded with `mcpserver.OnboardingReadinessReport`).
 
 ### CSRF enforcement (`csrf.go`, ADR-005)
 

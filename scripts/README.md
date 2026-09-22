@@ -1265,6 +1265,60 @@ the call-site wiring (the `if !` degrade-not-abort wrapper, the
 real client flags are unproven until a live delivery — a stub accepts any
 argv — so flag correctness is a live-validation matter.
 
+## Local trace store wiring (E45.75 / [#3600](https://github.com/kuhlman-labs/fishhawk/issues/3600))
+
+Without `FISHHAWKD_S3_BUCKET` fishhawkd has no trace store, `POST
+/v0/runs/{id}/trace` answers 503, and every local run fails at upload
+AFTER the agent has run and been billed. `cmd_up` (so also `reload` and
+`post-merge`, which forward their flags) closes that gap after the `.env`
+load and the rustfs readiness gate, BEFORE the fishhawkd spawn, via
+`_wire_trace_store "$start_deps"` — called in the current shell, never a
+`$(...)` subshell, so its exports reach the spawned daemon.
+
+The decision is two-stage and never circular
+(`_resolve_trace_store_wiring`, pure):
+
+| Stage | Inputs | Outcome |
+|---|---|---|
+| `decide` | pinned variable set | `operator` — change NOTHING |
+| `decide` | nothing pinned, `--start-deps` | `attempt_wire` — run the bootstrap |
+| `decide` | nothing pinned, no `--start-deps` | `unconfigured` — warn (503 consequence, `.env.example` block) |
+| `classify` (only after `attempt_wire`) | bootstrap rc 0 | `wired` — export the five as ONE group |
+| `classify` | bootstrap rc non-zero | `bootstrap_failed` — warn naming `make s3-init`, export NOTHING, continue |
+
+- **Pinning (`_trace_store_pinned_var`)**: ANY of the five
+  (`FISHHAWKD_S3_BUCKET`, `FISHHAWKD_S3_REGION`, `FISHHAWKD_S3_ENDPOINT`,
+  `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`) already SET — in `.env` or
+  the ambient shell, even to the empty string — selects `operator`. Keying
+  on the bucket alone would overwrite a real AWS credential held for an
+  unrelated purpose with the RustFS dev value. A bucket pin prints an info
+  line; any other pin prints a warning naming the variable.
+- **Group export**: the five are exported in one statement
+  (`fishhawk-traces`, `us-east-1`, `http://localhost:9000`, `fishhawk`,
+  `fishhawk-dev-secret` — the `docker-compose.yml` RustFS values), never
+  per-variable, since a half-default would pair a credential with the
+  wrong endpoint.
+- **Bootstrap (`_trace_bucket_bootstrap`)**: exactly `docker compose
+  --profile init run --rm s3-init`, the `make s3-init` command (composed,
+  not reimplemented); its `head-bucket || create-bucket` entrypoint makes
+  a re-run on an existing bucket exit 0.
+- **Non-fatal**: every branch returns 0; `up` never aborts on the trace
+  store. `cmd_preview` is unaffected (its `env -i` serve line keeps the
+  `--dev-fixtures` in-memory store).
+- **Deferred effect (#1018)**: a merged change here takes effect on the
+  NEXT `scripts/dev` invocation; live-validate with two consecutive
+  `scripts/dev up --start-deps` runs on a Docker host.
+
+`scripts/test-dev` §20 tables both stages, pins `_trace_store_pinned_var`
+(nothing set / ambient credential / set-but-empty), body-greps the
+bootstrap command (drift-checked against the `Makefile`), the one-statement
+five-variable export and the call's position before the spawn, and drives
+the REAL `cmd_up` under `errexit` with Docker/build/healthz stubbed and a
+fake fishhawkd that records its own environment: `wired` (all five reach
+the daemon), `bootstrap_failed` (warns, none exported, exit 0),
+operator `.env` bucket (byte-unchanged, no bootstrap), ambient real AWS
+credentials (passed through unchanged, nothing wired) and `unconfigured`.
+
 ## Seeded acceptance preview (E72.2 / [#3326](https://github.com/kuhlman-labs/fishhawk/issues/3326))
 
 `scripts/dev preview <sha-or-ref> [--seed <scenario>]` builds and serves

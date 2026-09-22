@@ -16,6 +16,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mergegate"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/modeloracle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/tracestore"
 	"github.com/kuhlman-labs/fishhawk/pricing"
 )
 
@@ -47,8 +48,10 @@ var requiredRunScopes = []string{
 // default branch is protected and the project requires a successful head
 // pipeline to merge — and, on GitLab only, the `gitlab_registration` rung
 // (#3582): whether an installations row is registered for exactly this path,
-// the check POST /v0/runs refuses 422 gitlab_project_not_registered on. The
-// checks cascade — a not-installed GitHub repo (on GitLab: an unresolvable
+// the check POST /v0/runs refuses 422 gitlab_project_not_registered on —
+// plus, on BOTH families, the deployment-scoped `trace_store` rung (E45.75 /
+// #3600), which is outside the repo-scoped count and never cascades. The
+// repo-scoped checks cascade — a not-installed GitHub repo (on GitLab: an unresolvable
 // project) yields an unavailable spec, empty reviewers and an `unknown` merge
 // gate — each with an explanatory note.
 //
@@ -78,6 +81,14 @@ var requiredRunScopes = []string{
 // registry applies to a GitHub repo, and the registry is never consulted
 // there), set on EVERY gitlab-family report including the forge-unconfigured
 // one, `unknown` with a naming reason whenever the registry cannot answer.
+//
+// TraceStore (E45.75 / #3600) is DEPLOYMENT-scoped: it answers "will this
+// run's trace upload 503?", a fact about fishhawkd's wiring, not about the
+// repo. It is set on EVERY report of both families and sits OUTSIDE every
+// repo-scoped cascade — a not-installed repo, an unresolvable gitlab project
+// and an unavailable spec all still carry it. It is a pointer only so the
+// client mirrors can model an older fishhawkd's absent key as "no claim"
+// (never a zero-valued verdict); this handler never leaves it nil.
 type onboardingReadinessResponse struct {
 	Repo               string                       `json:"repo"`
 	Forge              string                       `json:"forge"`
@@ -88,6 +99,72 @@ type onboardingReadinessResponse struct {
 	MergeGate          *mergeGateReadiness          `json:"merge_gate,omitempty"`
 	GitLabMergeGate    *gitLabMergeGateReadiness    `json:"gitlab_merge_gate,omitempty"`
 	GitLabRegistration *gitLabRegistrationReadiness `json:"gitlab_registration,omitempty"`
+	TraceStore         *traceStoreReadiness         `json:"trace_store,omitempty"`
+}
+
+// traceStoreReadiness reports whether this deployment has a trace store wired
+// and what kind (E45.75 / #3600). Kind is exactly one of the four
+// traceStoreKind* values:
+//
+//   - "none"   — no store: POST /v0/runs/{id}/trace responds 503, so every
+//     run fails at trace upload AFTER the agent has run and been billed.
+//     Configured is false and Remediation names the fix.
+//   - "memory" — the --dev-fixtures in-memory store: configured, but
+//     EPHEMERAL (bundles are lost on restart). Note says so.
+//   - "s3"     — the durable S3 / RustFS store.
+//   - "other"  — some other non-nil tracestore.Storage implementation:
+//     configured, with no claim about durability (never mislabelled "s3").
+type traceStoreReadiness struct {
+	Configured  bool   `json:"configured"`
+	Kind        string `json:"kind"`
+	Note        string `json:"note,omitempty"`
+	Remediation string `json:"remediation,omitempty"`
+}
+
+// The closed trace_store kind vocabulary (four values; docs/api/v0.openapi.yaml
+// enumerates the same set).
+const (
+	traceStoreKindS3     = "s3"
+	traceStoreKindMemory = "memory"
+	traceStoreKindNone   = "none"
+	traceStoreKindOther  = "other"
+)
+
+const (
+	traceStoreNoneNote        = "no trace store is configured on this deployment: POST /v0/runs/{id}/trace responds 503, so every run fails at trace upload AFTER the agent has run and been billed"
+	traceStoreNoneRemediation = "set FISHHAWKD_S3_BUCKET (plus the S3 endpoint/region/credentials — see the trace-storage block in .env.example) and create the bucket with `make s3-init`, then restart fishhawkd"
+	traceStoreMemoryNote      = "the --dev-fixtures in-memory trace store is wired: uploads succeed, but it is EPHEMERAL — every bundle is lost when fishhawkd restarts, so it is not durable for a real dogfood loop"
+	traceStoreOtherNote       = "a non-S3, non-memory trace store implementation is wired; no claim is made about its durability"
+)
+
+// traceStoreReadinessFor resolves the trace_store rung from the configured
+// store by concrete type, without widening the tracestore.Storage interface.
+// Pure, so onboarding_test tables every branch without booting a server. A
+// typed-nil concrete store is treated as unconfigured: its methods would
+// dereference nil, so claiming it configured would be an over-claim.
+func traceStoreReadinessFor(ts tracestore.Storage) traceStoreReadiness {
+	none := traceStoreReadiness{
+		Configured:  false,
+		Kind:        traceStoreKindNone,
+		Note:        traceStoreNoneNote,
+		Remediation: traceStoreNoneRemediation,
+	}
+	switch v := ts.(type) {
+	case nil:
+		return none
+	case *tracestore.S3Storage:
+		if v == nil {
+			return none
+		}
+		return traceStoreReadiness{Configured: true, Kind: traceStoreKindS3}
+	case *tracestore.MemStorage:
+		if v == nil {
+			return none
+		}
+		return traceStoreReadiness{Configured: true, Kind: traceStoreKindMemory, Note: traceStoreMemoryNote}
+	default:
+		return traceStoreReadiness{Configured: true, Kind: traceStoreKindOther, Note: traceStoreOtherNote}
+	}
 }
 
 // appInstallReadiness reports whether the Fishhawk-specific authorization a
@@ -1241,9 +1318,14 @@ func (s *Server) handleGetOnboardingReadiness(w http.ResponseWriter, r *http.Req
 	owner, name, _ := strings.Cut(repo, "/")
 	repoRef := forge.RepoRef{Owner: owner, Name: name}
 
+	// (7) trace_store (E45.75 / #3600) is set HERE, before the forge switch
+	// and its repo-scoped cascades, so every report of both families carries
+	// it whatever the app/spec/merge-gate probes conclude.
+	ts := traceStoreReadinessFor(s.cfg.TraceStore)
 	resp := onboardingReadinessResponse{
-		Repo:  repo,
-		Forge: family,
+		Repo:       repo,
+		Forge:      family,
+		TraceStore: &ts,
 	}
 	var parsedSpec *spec.Spec
 	switch family {
