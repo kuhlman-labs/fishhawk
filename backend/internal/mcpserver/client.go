@@ -984,9 +984,9 @@ type OnboardingReviewer struct {
 	Model           string `json:"model,omitempty" jsonschema:"the reviewer model"`
 	ReasoningEffort string `json:"reasoning_effort,omitempty" jsonschema:"the reviewer reasoning-effort tier when set"`
 	Available       bool   `json:"available" jsonschema:"true when the provider is wired on this deployment AND the resolved model was not authoritatively rejected; does NOT assert the model is served when model_status is unverifiable"`
-	ModelStatus     string `json:"model_status,omitempty" jsonschema:"model-id verdict: verified (in a fresh snapshot), rejected (authoritatively absent), or unverifiable (no live snapshot); empty when the spec omitted the model and the resolved default was not rejected"`
+	ModelStatus     string `json:"model_status,omitempty" jsonschema:"model-id verdict: verified (in a fresh snapshot), rejected (authoritatively absent), or unverifiable (no live snapshot); computed from the resolved deployment default when the spec omits the model; empty only when no reviewer backend is wired or the default id is not exposed"`
 	ModelHint       string `json:"model_hint,omitempty" jsonschema:"human sentence for a non-verified status: the did-you-mean rejection text, the passed-to-the-vendor-verbatim warning, or the unpriced $0 note"`
-	Priced          *bool  `json:"priced,omitempty" jsonschema:"whether the pricing table knows the model family; absent (nil) when the spec omitted the model, false flags usage recorded at $0"`
+	Priced          *bool  `json:"priced,omitempty" jsonschema:"whether the pricing table knows the model family; computed from the resolved default when the spec omits the model; absent (nil) only when the resolved model id is unavailable, false flags usage recorded at $0"`
 	MissingHint     string `json:"missing_hint,omitempty" jsonschema:"the adapter's missing-env-var hint when the provider is unavailable"`
 }
 

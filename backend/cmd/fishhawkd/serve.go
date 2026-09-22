@@ -494,6 +494,26 @@ func (p *planReviewerSet) For(provider, model string, reasoningEffort ...string)
 	}
 }
 
+// ResolvedReviewerModel reports the deployment default model For() resolves for
+// provider when the spec omits the reviewer model — the same per-provider
+// default the For() branches fall back to. It implements the server's optional
+// reviewerModelDefaulter seam so the doctor reviewers rung can compute the
+// model-id honesty fields for an omitted model against the id that will actually
+// run (condition 2 / #3578). An unknown provider, or a provider whose default is
+// unset, returns ("", false) so the rung keeps the "not computed" state.
+func (p *planReviewerSet) ResolvedReviewerModel(provider string) (string, bool) {
+	switch provider {
+	case "anthropic":
+		return p.opts.planReviewModel, p.opts.planReviewModel != ""
+	case "claudecode":
+		return p.opts.localClaudeModel, p.opts.localClaudeModel != ""
+	case "codex":
+		return p.opts.codexModel, p.opts.codexModel != ""
+	default:
+		return "", false
+	}
+}
+
 // verifyModel rejects a reviewer whose RESOLVED model is authoritatively absent
 // from a fresh snapshot (#3578). It runs AFTER each branch has resolved the
 // effective model — the spec value, or the provider's deployment default when

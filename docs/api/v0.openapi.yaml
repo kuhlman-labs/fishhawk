@@ -5478,8 +5478,9 @@ components:
                   Model-id verdict against the deployment's snapshot oracle:
                   verified (present in a fresh snapshot), rejected
                   (authoritatively absent), or unverifiable (no live snapshot to
-                  check against). Omitted when the spec omitted the model and the
-                  resolved default was not rejected.
+                  check against). Computed from the resolved deployment default
+                  when the spec omits the model; omitted only when no reviewer
+                  backend is wired or the default id is not exposed.
               model_hint:
                 type: string
                 description: >-
@@ -5490,8 +5491,10 @@ components:
                 type: boolean
                 description: >-
                   Whether the shared pricing table knows the model's family.
-                  Absent when the spec omitted the model (not computed); false
-                  flags that usage under this model is recorded at $0 (estimated).
+                  Computed from the resolved deployment default when the spec
+                  omits the model; absent (not computed) only when the resolved
+                  model id is unavailable; false flags that usage under this
+                  model is recorded at $0 (estimated).
               missing_hint:
                 type: string
                 description: How to enable the provider when unavailable (names the env knob).

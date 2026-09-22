@@ -100,9 +100,12 @@ type specReadiness struct {
 //
 // ModelStatus is the model-id verdict (#3578): "verified" (present in a fresh
 // snapshot), "rejected" (authoritatively absent), or "unverifiable" (no
-// authoritative snapshot — nil oracle, stale, or none for the provider). Empty
-// when the spec omitted the model AND the resolved default was not rejected (the
-// resolved id is not known to this rung on the success path).
+// authoritative snapshot — nil oracle, stale, or none for the provider). It is
+// computed from the RESOLVED model — the explicit spec value, or the deployment
+// default when the spec omits the model — so an omitted default is judged
+// exactly as an explicit one (condition 2). Empty only when no reviewer backend
+// is wired for the provider, or the wired set does not expose the resolved
+// default id.
 //
 // ModelHint is the human sentence for a non-verified status: the did-you-mean
 // rejection text for "rejected", or the "passed to the vendor verbatim" warning
@@ -110,8 +113,9 @@ type specReadiness struct {
 //
 // Priced reports whether the pricing table knows the model's family, so an
 // unpriced id is flagged rather than silently booking usage at $0. It is a
-// POINTER with three states: nil (not computed — the spec omitted the model),
-// &true (priced), &false (unpriced).
+// POINTER with three states: nil (not computed — no reviewer backend wired for
+// the provider, or the resolved default id is unavailable), &true (priced),
+// &false (unpriced).
 //
 // MissingHint carries the adapter's missing-env-var hint when the provider
 // cannot be resolved at all; it stays separate from ModelHint.
@@ -545,8 +549,15 @@ func (s *Server) probeGitLab(ctx context.Context, repo string, ref forge.RepoRef
 //     is verified directly against the oracle so ModelStatus reflects
 //     verified/unverifiable and Priced flags an unknown pricing family.
 //   - When the reviewer resolves and the spec OMITTED the model, the resolved
-//     default already passed For()'s verification but its id is not known here,
-//     so ModelStatus/Priced stay unset (the honest "not computed" state).
+//     deployment default (recovered via reviewerModelDefaulter) is verified the
+//     same way, so an unverifiable or unpriced default is flagged rather than
+//     rendering a bare "ok" (condition 2 / #3578). Only when the wired set does
+//     not expose the default do ModelStatus/Priced stay unset ("not computed").
+//
+// The success-path verification is a SECOND read of the oracle after For()'s:
+// if the snapshot flips to authoritative absence between them, annotateReviewerModel
+// forces Available=false with the did-you-mean, so a TOCTOU rejection never
+// renders "ok".
 func (s *Server) probeReviewers(ctx context.Context, parsed *spec.Spec) []reviewerReadiness {
 	out := []reviewerReadiness{}
 	if parsed == nil {
@@ -566,12 +577,20 @@ func (s *Server) probeReviewers(ctx context.Context, parsed *spec.Spec) []review
 		_, err := s.cfg.PlanReviewers.For(rv.Provider, rv.Model, rv.ReasoningEffort)
 		if err == nil {
 			rr.Available = true
-			// An EXPLICIT model resolved: verify it directly so the honesty
-			// fields reflect the real snapshot state. An OMITTED model resolved
-			// to a default whose id is not known here; leave the fields unset
-			// (Priced stays nil — the "not computed" state).
-			if rv.Model != "" {
-				s.annotateReviewerModel(ctx, &rr, rv.Provider, rv.Model)
+			// Compute the honesty fields against the id that will ACTUALLY run:
+			// the EXPLICIT spec model, or — when the spec omitted it — the
+			// resolved deployment default (condition 2). Only a set that does not
+			// expose its default leaves the id unknown, keeping the "not computed"
+			// state. annotateReviewerModel re-verifies, so a snapshot that flipped
+			// to authoritative absence since For() lands as unavailable+rejected.
+			model := rv.Model
+			if model == "" {
+				if d, ok := s.resolvedReviewerDefault(rv.Provider); ok {
+					model = d
+				}
+			}
+			if model != "" {
+				s.annotateReviewerModel(ctx, &rr, rv.Provider, model)
 			}
 			out = append(out, rr)
 			continue
@@ -598,14 +617,26 @@ func (s *Server) probeReviewers(ctx context.Context, parsed *spec.Spec) []review
 }
 
 // annotateReviewerModel sets the model-validity honesty fields for a reviewer
-// whose EXPLICIT model resolved (For() did not reject it), from the deployment's
-// snapshot oracle and the pricing table (#3578). ModelStatus is verified or
-// unverifiable (rejected is handled on the For() error path); a verified id is
-// still flagged when the pricing table does not know its family.
+// whose model resolved through For() (the explicit spec value, or the resolved
+// deployment default when the spec omitted it), from the deployment's snapshot
+// oracle and the pricing table (#3578).
+//
+// This is a SECOND oracle read after For()'s own verification. Normally it
+// reports verified/unverifiable, but the snapshot can flip to authoritative
+// absence between the two reads (a background refresh): a ModelRejected verdict
+// here is that TOCTOU case, so it forces Available=false and surfaces the
+// did-you-mean, mirroring the For()-error path so a second-read rejection never
+// renders "ok". A verified id is still flagged when the pricing table does not
+// know its family.
 func (s *Server) annotateReviewerModel(ctx context.Context, rr *reviewerReadiness, provider, model string) {
 	v := modeloracle.Verify(ctx, s.cfg.ModelOracle, provider, model)
 	rr.ModelStatus = string(v.Status)
-	if v.Status == modeloracle.ModelUnverifiable {
+	switch v.Status {
+	case modeloracle.ModelRejected:
+		// Snapshot flipped to authoritative absence since For() accepted it.
+		rr.Available = false
+		rr.ModelHint = v.RejectMessage()
+	case modeloracle.ModelUnverifiable:
 		rr.ModelHint = fmt.Sprintf("model %q could not be verified against a live model snapshot for provider %q; it is passed to the vendor verbatim and a typo fails at review time", model, provider)
 	}
 	priced := modelPriced(model)
@@ -613,6 +644,32 @@ func (s *Server) annotateReviewerModel(ctx context.Context, rr *reviewerReadines
 	if !priced {
 		rr.ModelHint = appendUnpricedNote(rr.ModelHint)
 	}
+}
+
+// reviewerModelDefaulter is OPTIONALLY implemented by a ReviewerSet to report
+// the deployment default model For() resolves for a provider when the spec omits
+// the reviewer model. The readiness rung uses it to compute the model-id honesty
+// fields against the id that will ACTUALLY run (condition 2 / #3578): without it
+// an unverifiable or unpriced deployment default would render a bare "ok". A set
+// that does not implement it — or whose default is unset — keeps the honest "not
+// computed" state.
+type reviewerModelDefaulter interface {
+	ResolvedReviewerModel(provider string) (string, bool)
+}
+
+// resolvedReviewerDefault returns the deployment default model for provider (the
+// id For() resolves for an omitted spec model) when the wired ReviewerSet
+// exposes it and the default is non-empty; absent otherwise.
+func (s *Server) resolvedReviewerDefault(provider string) (string, bool) {
+	d, ok := s.cfg.PlanReviewers.(reviewerModelDefaulter)
+	if !ok {
+		return "", false
+	}
+	model, ok := d.ResolvedReviewerModel(provider)
+	if !ok || model == "" {
+		return "", false
+	}
+	return model, true
 }
 
 // modelPriced reports whether the shared pricing table knows the model's family,
