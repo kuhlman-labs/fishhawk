@@ -6,24 +6,61 @@ import (
 	"testing"
 
 	"github.com/bmatcuk/doublestar/v4"
+	"gopkg.in/yaml.v3"
 )
 
-// allPresets is the closed set the library ships.
+// allPresets is the closed set of autonomy tiers the library ships.
 var allPresets = []Preset{PresetLow, PresetMedium, PresetHigh}
+
+// allShapes is the closed set of repository shapes the library ships.
+var allShapes = []Shape{ShapeApp, ShapeConfigOnly}
 
 // parsePreset loads and fully validates a preset (ParseBytes runs schema
 // + semantic validation), returning the typed *Spec.
 func parsePreset(t *testing.T, p Preset) *Spec {
 	t.Helper()
-	data, err := PresetBytes(p)
+	return parsePresetShape(t, p, ShapeApp)
+}
+
+// parsePresetShape loads and fully validates a (preset, shape) pair,
+// returning the typed *Spec.
+func parsePresetShape(t *testing.T, p Preset, shape Shape) *Spec {
+	t.Helper()
+	data, err := PresetShapeBytes(p, shape)
 	if err != nil {
-		t.Fatalf("PresetBytes(%q): %v", p, err)
+		t.Fatalf("PresetShapeBytes(%q, %q): %v", p, shape, err)
 	}
 	s, err := ParseBytes(data)
 	if err != nil {
-		t.Fatalf("preset %q failed ParseBytes (schema + semantic): %v", p, err)
+		t.Fatalf("preset %q/%q failed ParseBytes (schema + semantic): %v", p, shape, err)
 	}
 	return s
+}
+
+// presetShapeText returns a (preset, shape) pair's shipped bytes.
+func presetShapeText(t *testing.T, p Preset, shape Shape) []byte {
+	t.Helper()
+	data, err := PresetShapeBytes(p, shape)
+	if err != nil {
+		t.Fatalf("PresetShapeBytes(%q, %q): %v", p, shape, err)
+	}
+	return data
+}
+
+// implementStageOfSpec returns the implement stage of a parsed preset.
+func implementStageOfSpec(t *testing.T, s *Spec) Stage {
+	t.Helper()
+	wf, ok := s.Workflows["feature_change"]
+	if !ok {
+		t.Fatal("no feature_change workflow")
+	}
+	for _, st := range wf.Stages {
+		if st.ID == "implement" {
+			return st
+		}
+	}
+	t.Fatal("no implement stage")
+	return Stage{}
 }
 
 // TestPresetsParseAndValidate is the drift-proof gate mirroring the CLI
@@ -143,24 +180,26 @@ func assertPageEvents(t *testing.T, oa *OperatorAgent) {
 // pins that the v0/v1 spellings v2 renamed are gone.
 func TestShippedPresetsDeclareTheirTier(t *testing.T) {
 	for _, p := range allPresets {
-		p := p
-		t.Run(string(p), func(t *testing.T) {
-			text := string(presetText(t, p))
-			if !strings.Contains(text, "version: \"2\"\n") {
-				t.Errorf("preset %q does not declare version: \"2\":\n%s", p, text)
-			}
-			if strings.Contains(text, "operator_agent:") {
-				t.Errorf("preset %q still declares an operator_agent block (removed at workflow-v2):\n%s", p, text)
-			}
-			if want := "\n    autonomy: " + string(p) + "\n"; !strings.Contains(text, want) {
-				t.Errorf("preset %q does not declare %q:\n%s", p, strings.TrimSpace(want), text)
-			}
-			for _, legacy := range []string{"drive:", "max_runtime_minutes:", "must_page_human:"} {
-				if strings.Contains(text, legacy) {
-					t.Errorf("preset %q still uses the v0/v1 spelling %q:\n%s", p, legacy, text)
+		for _, shape := range allShapes {
+			p, shape := p, shape
+			t.Run(string(p)+"/"+string(shape), func(t *testing.T) {
+				text := string(presetShapeText(t, p, shape))
+				if !strings.Contains(text, "version: \"2\"\n") {
+					t.Errorf("preset %q/%q does not declare version: \"2\":\n%s", p, shape, text)
 				}
-			}
-		})
+				if strings.Contains(text, "operator_agent:") {
+					t.Errorf("preset %q/%q still declares an operator_agent block (removed at workflow-v2):\n%s", p, shape, text)
+				}
+				if want := "\n    autonomy: " + string(p) + "\n"; !strings.Contains(text, want) {
+					t.Errorf("preset %q/%q does not declare %q:\n%s", p, shape, strings.TrimSpace(want), text)
+				}
+				for _, legacy := range []string{"drive:", "max_runtime_minutes:", "must_page_human:"} {
+					if strings.Contains(text, legacy) {
+						t.Errorf("preset %q/%q still uses the v0/v1 spelling %q:\n%s", p, shape, legacy, text)
+					}
+				}
+			})
+		}
 	}
 }
 
@@ -281,56 +320,54 @@ func presetText(t *testing.T, p Preset) []byte {
 // touched.
 func TestPresetApprovalsGateHandleFree(t *testing.T) {
 	for _, p := range allPresets {
-		p := p
-		t.Run(string(p), func(t *testing.T) {
-			// Byte-level: the placeholder handle and the top-level roles
-			// key must be gone from the shipped document.
-			data, err := PresetBytes(p)
-			if err != nil {
-				t.Fatalf("PresetBytes(%q): %v", p, err)
-			}
-			text := string(data)
-			if strings.Contains(text, "@your-github-handle") {
-				t.Errorf("preset %q still carries the @your-github-handle placeholder:\n%s", p, text)
-			}
-			for _, line := range strings.Split(text, "\n") {
-				if strings.HasPrefix(line, "roles:") {
-					t.Errorf("preset %q still declares a top-level roles map:\n%s", p, text)
+		for _, shape := range allShapes {
+			p, shape := p, shape
+			t.Run(string(p)+"/"+string(shape), func(t *testing.T) {
+				// Byte-level: the placeholder handle and the top-level roles
+				// key must be gone from the shipped document.
+				text := string(presetShapeText(t, p, shape))
+				if strings.Contains(text, "@your-github-handle") {
+					t.Errorf("preset %q/%q still carries the @your-github-handle placeholder:\n%s", p, shape, text)
 				}
-			}
+				for _, line := range strings.Split(text, "\n") {
+					if strings.HasPrefix(line, "roles:") {
+						t.Errorf("preset %q/%q still declares a top-level roles map:\n%s", p, shape, text)
+					}
+				}
 
-			// Struct-level: each approval gate carries the forge-neutral
-			// approvals predicate and no legacy approvers form.
-			wf, ok := parsePreset(t, p).Workflows["feature_change"]
-			if !ok {
-				t.Fatalf("preset %q has no feature_change workflow", p)
-			}
-			gates := 0
-			for _, st := range wf.Stages {
-				for _, g := range st.Gates {
-					if g.Type != GateTypeApproval {
-						continue
-					}
-					gates++
-					if g.Approvers != nil {
-						t.Errorf("preset %q stage %q: approval gate still uses legacy approvers %+v", p, st.ID, g.Approvers)
-					}
-					a := g.Approvals
-					if a == nil {
-						t.Fatalf("preset %q stage %q: approval gate missing approvals block", p, st.ID)
-					}
-					if a.Count == nil || *a.Count != 1 {
-						t.Errorf("preset %q stage %q: approvals.count = %v, want 1", p, st.ID, a.Count)
-					}
-					if len(a.Not) != 2 || a.Not[0] != "author" || a.Not[1] != "agent" {
-						t.Errorf("preset %q stage %q: approvals.not = %v, want [author agent]", p, st.ID, a.Not)
+				// Struct-level: each approval gate carries the forge-neutral
+				// approvals predicate and no legacy approvers form.
+				wf, ok := parsePresetShape(t, p, shape).Workflows["feature_change"]
+				if !ok {
+					t.Fatalf("preset %q/%q has no feature_change workflow", p, shape)
+				}
+				gates := 0
+				for _, st := range wf.Stages {
+					for _, g := range st.Gates {
+						if g.Type != GateTypeApproval {
+							continue
+						}
+						gates++
+						if g.Approvers != nil {
+							t.Errorf("preset %q/%q stage %q: approval gate still uses legacy approvers %+v", p, shape, st.ID, g.Approvers)
+						}
+						a := g.Approvals
+						if a == nil {
+							t.Fatalf("preset %q/%q stage %q: approval gate missing approvals block", p, shape, st.ID)
+						}
+						if a.Count == nil || *a.Count != 1 {
+							t.Errorf("preset %q/%q stage %q: approvals.count = %v, want 1", p, shape, st.ID, a.Count)
+						}
+						if len(a.Not) != 2 || a.Not[0] != "author" || a.Not[1] != "agent" {
+							t.Errorf("preset %q/%q stage %q: approvals.not = %v, want [author agent]", p, shape, st.ID, a.Not)
+						}
 					}
 				}
-			}
-			if gates == 0 {
-				t.Errorf("preset %q has no approval gates to assert on", p)
-			}
-		})
+				if gates == 0 {
+					t.Errorf("preset %q/%q has no approval gates to assert on", p, shape)
+				}
+			})
+		}
 	}
 }
 
@@ -379,44 +416,46 @@ func uncommentStarters(text string) string {
 // A comment-only / no-op touch of a preset path fails (a) or (b).
 func TestShippedPresetsCarryControlSurfaceStarters(t *testing.T) {
 	for _, p := range allPresets {
-		p := p
-		t.Run(string(p), func(t *testing.T) {
-			text := string(presetText(t, p))
+		for _, shape := range allShapes {
+			p, shape := p, shape
+			t.Run(string(p)+"/"+string(shape), func(t *testing.T) {
+				text := string(presetShapeText(t, p, shape))
 
-			// (a) the commented applies_to starter is present.
-			if !strings.Contains(text, "# fishhawk:starter-begin applies_to") {
-				t.Errorf("preset %q is missing the commented applies_to starter block:\n%s", p, text)
-			}
-			// (b) the commented escalations starter is present.
-			if !strings.Contains(text, "# fishhawk:starter-begin escalations") {
-				t.Errorf("preset %q is missing the commented escalations starter block:\n%s", p, text)
-			}
-			// (c) the starters stay INERT: no line, trimmed of leading
-			// whitespace, begins with a LIVE applies_to:/escalations: key.
-			// A future edit that uncomments one fails here rather than
-			// silently shipping a routing/escalation policy into every
-			// scaffolded repo.
-			for i, line := range strings.Split(text, "\n") {
-				tl := strings.TrimSpace(line)
-				if strings.HasPrefix(tl, "applies_to:") || strings.HasPrefix(tl, "escalations:") {
-					t.Errorf("preset %q line %d ships a LIVE control-surface key, want it commented: %s", p, i+1, line)
+				// (a) the commented applies_to starter is present.
+				if !strings.Contains(text, "# fishhawk:starter-begin applies_to") {
+					t.Errorf("preset %q/%q is missing the commented applies_to starter block:\n%s", p, shape, text)
 				}
-			}
-			// (d) the shipped preset validates, AND the starter shapes
-			// validate once uncommented (CONDITION 2(a)): comments are
-			// discarded at parse, so this is the only machine check of the
-			// starter shape.
-			if _, err := ParseBytes([]byte(text)); err != nil {
-				t.Fatalf("shipped preset %q does not validate: %v", p, err)
-			}
-			uc := uncommentStarters(text)
-			if !strings.Contains(uc, "\n    applies_to:\n") || !strings.Contains(uc, "\n    escalations:\n") {
-				t.Fatalf("preset %q uncomment did not surface both starter keys — the sentinels did not match:\n%s", p, uc)
-			}
-			if _, err := ParseBytes([]byte(uc)); err != nil {
-				t.Fatalf("preset %q starter shapes do not validate once uncommented: %v\n%s", p, err, uc)
-			}
-		})
+				// (b) the commented escalations starter is present.
+				if !strings.Contains(text, "# fishhawk:starter-begin escalations") {
+					t.Errorf("preset %q/%q is missing the commented escalations starter block:\n%s", p, shape, text)
+				}
+				// (c) the starters stay INERT: no line, trimmed of leading
+				// whitespace, begins with a LIVE applies_to:/escalations: key.
+				// A future edit that uncomments one fails here rather than
+				// silently shipping a routing/escalation policy into every
+				// scaffolded repo.
+				for i, line := range strings.Split(text, "\n") {
+					tl := strings.TrimSpace(line)
+					if strings.HasPrefix(tl, "applies_to:") || strings.HasPrefix(tl, "escalations:") {
+						t.Errorf("preset %q/%q line %d ships a LIVE control-surface key, want it commented: %s", p, shape, i+1, line)
+					}
+				}
+				// (d) the shipped preset validates, AND the starter shapes
+				// validate once uncommented (CONDITION 2(a)): comments are
+				// discarded at parse, so this is the only machine check of the
+				// starter shape.
+				if _, err := ParseBytes([]byte(text)); err != nil {
+					t.Fatalf("shipped preset %q/%q does not validate: %v", p, shape, err)
+				}
+				uc := uncommentStarters(text)
+				if !strings.Contains(uc, "\n    applies_to:\n") || !strings.Contains(uc, "\n    escalations:\n") {
+					t.Fatalf("preset %q/%q uncomment did not surface both starter keys — the sentinels did not match:\n%s", p, shape, uc)
+				}
+				if _, err := ParseBytes([]byte(uc)); err != nil {
+					t.Fatalf("preset %q/%q starter shapes do not validate once uncommented: %v\n%s", p, shape, err, uc)
+				}
+			})
+		}
 	}
 }
 
@@ -438,28 +477,28 @@ func TestPresetBytesUnknown(t *testing.T) {
 // workflow-v2 spells constraints as one OBJECT which the parser
 // normalizes into a one-element []Constraint (see the Constraint doc in
 // spec.go), so this walks the list rather than assuming index 0.
-func forbiddenPathsOfImplement(t *testing.T, p Preset) []string {
+func forbiddenPathsOfImplement(t *testing.T, p Preset, shape Shape) []string {
 	t.Helper()
-	s := parsePreset(t, p)
+	s := parsePresetShape(t, p, shape)
 	wf, ok := s.Workflows["feature_change"]
 	if !ok {
-		t.Fatalf("preset %q has no feature_change workflow", p)
+		t.Fatalf("preset %q/%q has no feature_change workflow", p, shape)
 	}
 	for _, st := range wf.Stages {
 		if st.ID != "implement" {
 			continue
 		}
 		if len(st.Constraints) == 0 {
-			t.Fatalf("preset %q implement stage declares no constraints", p)
+			t.Fatalf("preset %q/%q implement stage declares no constraints", p, shape)
 		}
 		for _, c := range st.Constraints {
 			if len(c.ForbiddenPaths) > 0 {
 				return c.ForbiddenPaths
 			}
 		}
-		t.Fatalf("preset %q implement stage declares no forbidden_paths constraint: %+v", p, st.Constraints)
+		t.Fatalf("preset %q/%q implement stage declares no forbidden_paths constraint: %+v", p, shape, st.Constraints)
 	}
-	t.Fatalf("preset %q has no implement stage", p)
+	t.Fatalf("preset %q/%q has no implement stage", p, shape)
 	return nil
 }
 
@@ -485,16 +524,18 @@ func TestPresetsForbidBothForgeCIEntryPoints(t *testing.T) {
 	} {
 		tc := tc
 		for _, p := range allPresets {
-			p := p
-			t.Run(string(p)+"/"+tc.mode, func(t *testing.T) {
-				got := forbiddenPathsOfImplement(t, p)
-				for _, entry := range got {
-					if entry == tc.want {
-						return
+			for _, shape := range allShapes {
+				p, shape := p, shape
+				t.Run(string(p)+"/"+string(shape)+"/"+tc.mode, func(t *testing.T) {
+					got := forbiddenPathsOfImplement(t, p, shape)
+					for _, entry := range got {
+						if entry == tc.want {
+							return
+						}
 					}
-				}
-				t.Errorf("preset %q implement forbidden_paths is missing %q (%s): %v", p, tc.want, tc.mode, got)
-			})
+					t.Errorf("preset %q/%q implement forbidden_paths is missing %q (%s): %v", p, shape, tc.want, tc.mode, got)
+				})
+			}
 		}
 	}
 }
@@ -574,19 +615,233 @@ func matchesAnyForbidden(t *testing.T, pats []string, path string) (bool, string
 // completeness gate fails here.
 func TestPresetForbiddenPathsBlockBothForgeEntryPoints(t *testing.T) {
 	for _, p := range allPresets {
+		for _, shape := range allShapes {
+			p, shape := p, shape
+			t.Run(string(p)+"/"+string(shape), func(t *testing.T) {
+				pats := forbiddenPathsOfImplement(t, p, shape)
+				for _, path := range forgeGuardMustBlock {
+					if ok, _ := matchesAnyForbidden(t, pats, path); !ok {
+						t.Errorf("MUST-BLOCK %q is not matched by any forbidden_paths pattern of preset %q/%q: %v", path, p, shape, pats)
+					}
+				}
+				for _, path := range forgeGuardMustNotBlock {
+					if ok, pat := matchesAnyForbidden(t, pats, path); ok {
+						t.Errorf("MUST-NOT-BLOCK %q is blocked by pattern %q of preset %q/%q — the guard is over-broad", path, pat, p, shape)
+					}
+				}
+			})
+		}
+	}
+}
+
+// --- the config-only shape (E45.67) ------------------------------------------
+
+// TestConfigOnlyPresetsParseAndValidate is the drift-proof gate for the
+// config-only shape mirrored on the backend embed: every config-only preset
+// must pass ParseBytes (schema + semantic) plus an explicit Validate.
+func TestConfigOnlyPresetsParseAndValidate(t *testing.T) {
+	for _, p := range allPresets {
 		p := p
 		t.Run(string(p), func(t *testing.T) {
-			pats := forbiddenPathsOfImplement(t, p)
-			for _, path := range forgeGuardMustBlock {
-				if ok, _ := matchesAnyForbidden(t, pats, path); !ok {
-					t.Errorf("MUST-BLOCK %q is not matched by any forbidden_paths pattern of preset %q: %v", path, p, pats)
-				}
+			s := parsePresetShape(t, p, ShapeConfigOnly)
+			if err := Validate(s); err != nil {
+				t.Fatalf("config-only preset %q failed semantic Validate: %v", p, err)
 			}
-			for _, path := range forgeGuardMustNotBlock {
-				if ok, pat := matchesAnyForbidden(t, pats, path); ok {
-					t.Errorf("MUST-NOT-BLOCK %q is blocked by pattern %q of preset %q — the guard is over-broad", path, pat, p)
-				}
+			if _, ok := s.Workflows["feature_change"]; !ok {
+				t.Fatalf("config-only preset %q has no feature_change workflow", p)
 			}
 		})
 	}
+}
+
+// TestConfigOnlyPresetsAreLockstepBaseAndTierDelta mirrors the app lockstep
+// invariant WITHIN the config-only family on the backend embed.
+func TestConfigOnlyPresetsAreLockstepBaseAndTierDelta(t *testing.T) {
+	normalized := make(map[Preset]string, len(allPresets))
+	for _, p := range allPresets {
+		body, headerLines := stripLeadingCommentBlock(string(presetShapeText(t, p, ShapeConfigOnly)))
+		if headerLines == 0 {
+			t.Fatalf("config-only preset %q has no leading header comment block to strip", p)
+		}
+		rest, tier, n := stripAutonomyLine(body)
+		if n != 1 {
+			t.Fatalf("config-only preset %q declares %d autonomy lines, want exactly 1", p, n)
+		}
+		if tier != string(p) {
+			t.Fatalf("config-only preset %q stripped `autonomy: %s`, want its own tier — the comparison below would be vacuous", p, tier)
+		}
+		normalized[p] = rest
+	}
+	base := normalized[PresetMedium]
+	for _, p := range []Preset{PresetLow, PresetHigh} {
+		if normalized[p] != base {
+			t.Errorf("config-only preset %q is not the medium base plus its one autonomy line.\n--- %s ---\n%s\n--- medium ---\n%s", p, p, normalized[p], base)
+		}
+	}
+	if len(base) < 1000 {
+		t.Fatalf("normalized config-only base is only %d bytes — the lockstep comparison is not load-bearing", len(base))
+	}
+}
+
+// implementTreeStageOf navigates a decoded `any` tree to the implement stage.
+func implementTreeStageOf(t *testing.T, tree any) map[string]any {
+	t.Helper()
+	root, ok := tree.(map[string]any)
+	if !ok {
+		t.Fatalf("document root = %T, want a mapping", tree)
+	}
+	wfs, ok := root["workflows"].(map[string]any)
+	if !ok {
+		t.Fatalf("workflows = %T, want a mapping", root["workflows"])
+	}
+	fc, ok := wfs["feature_change"].(map[string]any)
+	if !ok {
+		t.Fatalf("feature_change = %T, want a mapping", wfs["feature_change"])
+	}
+	stages, ok := fc["stages"].([]any)
+	if !ok {
+		t.Fatalf("stages = %T, want a sequence", fc["stages"])
+	}
+	for _, s := range stages {
+		if m, ok := s.(map[string]any); ok && m["id"] == "implement" {
+			return m
+		}
+	}
+	t.Fatal("no implement stage found")
+	return nil
+}
+
+// TestConfigOnlyPresetIsAppPlusShapeDelta decodes the app and config-only docs
+// of each tier into yaml.v3 `any` trees, applies EXACTLY the shape delta to the
+// app tree, and asserts reflect.DeepEqual against the config-only tree.
+func TestConfigOnlyPresetIsAppPlusShapeDelta(t *testing.T) {
+	for _, p := range allPresets {
+		p := p
+		t.Run(string(p), func(t *testing.T) {
+			var appTree, cfgTree any
+			if err := yaml.Unmarshal(presetShapeText(t, p, ShapeApp), &appTree); err != nil {
+				t.Fatalf("unmarshal app: %v", err)
+			}
+			if err := yaml.Unmarshal(presetShapeText(t, p, ShapeConfigOnly), &cfgTree); err != nil {
+				t.Fatalf("unmarshal config-only: %v", err)
+			}
+			impl := implementTreeStageOf(t, appTree)
+
+			executor, ok := impl["executor"].(map[string]any)
+			if !ok {
+				t.Fatalf("app implement executor = %T, want a mapping", impl["executor"])
+			}
+			if _, had := executor["verify"]; !had {
+				t.Fatalf("app implement executor has no verify to delete — the app base changed")
+			}
+			delete(executor, "verify")
+
+			constraints, ok := impl["constraints"].(map[string]any)
+			if !ok {
+				t.Fatalf("app implement constraints = %T, want a mapping", impl["constraints"])
+			}
+			ro, ok := constraints["required_outcomes"].([]any)
+			if !ok {
+				t.Fatalf("app required_outcomes = %T, want a sequence", constraints["required_outcomes"])
+			}
+			kept := make([]any, 0, len(ro))
+			dropped := false
+			for _, e := range ro {
+				if e == "tests_added_or_updated" {
+					dropped = true
+					continue
+				}
+				kept = append(kept, e)
+			}
+			if !dropped {
+				t.Fatalf("app required_outcomes did not contain tests_added_or_updated: %v", ro)
+			}
+			constraints["required_outcomes"] = kept
+			constraints["max_files_changed"] = 150
+
+			if !reflect.DeepEqual(appTree, cfgTree) {
+				t.Errorf("config-only preset %q is not the app preset plus exactly the shape delta.\n--- app+delta ---\n%#v\n--- config-only ---\n%#v", p, appTree, cfgTree)
+			}
+		})
+	}
+}
+
+// TestConfigOnlyPresetsDropTestEntrypointDefaults is the done-means on the
+// PARSED config-only Spec, one assertion per changed default: the implement
+// stage's executor has no Verify, required_outcomes is EXACTLY [ci_green], and
+// max_files_changed is 150.
+func TestConfigOnlyPresetsDropTestEntrypointDefaults(t *testing.T) {
+	for _, p := range allPresets {
+		p := p
+		t.Run(string(p), func(t *testing.T) {
+			impl := implementStageOfSpec(t, parsePresetShape(t, p, ShapeConfigOnly))
+			if impl.Executor.Verify != nil {
+				t.Errorf("config-only preset %q implement executor still carries a Verify block: %+v", p, impl.Executor.Verify)
+			}
+			if len(impl.Constraints) == 0 {
+				t.Fatalf("config-only preset %q implement stage declares no constraints", p)
+			}
+			c := impl.Constraints[0]
+			if len(c.RequiredOutcomes) != 1 || c.RequiredOutcomes[0] != "ci_green" {
+				t.Errorf("config-only preset %q required_outcomes = %v, want exactly [ci_green]", p, c.RequiredOutcomes)
+			}
+			if c.MaxFilesChanged != 150 {
+				t.Errorf("config-only preset %q max_files_changed = %d, want 150", p, c.MaxFilesChanged)
+			}
+		})
+	}
+}
+
+// normalizeConfigOnlyComments strips the leading `#` marker from every line and
+// collapses whitespace runs, so a comment wrapped across lines matches as one
+// string.
+func normalizeConfigOnlyComments(s string) string {
+	var b strings.Builder
+	for _, line := range strings.Split(s, "\n") {
+		trimmed := strings.TrimSpace(line)
+		trimmed = strings.TrimPrefix(trimmed, "#")
+		b.WriteString(strings.TrimSpace(trimmed))
+		b.WriteString(" ")
+	}
+	return strings.Join(strings.Fields(b.String()), " ")
+}
+
+// TestPresetsCarryForgeNeutralInputComment pins the load-bearing github_issue
+// forge-neutral input comment on every preset across BOTH shapes (the issue's
+// explicit request).
+func TestPresetsCarryForgeNeutralInputComment(t *testing.T) {
+	want := []string{
+		"github_issue names the issue-ANCHORED input, not the forge",
+		"No gitlab_issue member exists",
+	}
+	for _, p := range allPresets {
+		for _, shape := range allShapes {
+			p, shape := p, shape
+			t.Run(string(p)+"/"+string(shape), func(t *testing.T) {
+				got := normalizeConfigOnlyComments(string(presetShapeText(t, p, shape)))
+				for _, w := range want {
+					if !strings.Contains(got, w) {
+						t.Errorf("preset %q/%q dropped the forge-neutral input comment %q", p, shape, w)
+					}
+				}
+			})
+		}
+	}
+}
+
+// TestPresetShapeBytesUnknown covers both unknown-input error branches: an
+// unknown preset and an unknown shape each name their valid set.
+func TestPresetShapeBytesUnknown(t *testing.T) {
+	t.Run("unknown preset", func(t *testing.T) {
+		_, err := PresetShapeBytes(Preset("bogus"), ShapeApp)
+		if err == nil || !strings.Contains(err.Error(), "low, medium, high") {
+			t.Fatalf("err = %v, want unknown-preset error naming the valid tiers", err)
+		}
+	})
+	t.Run("unknown shape", func(t *testing.T) {
+		_, err := PresetShapeBytes(PresetMedium, Shape("bogus"))
+		if err == nil || !strings.Contains(err.Error(), "app, config-only") {
+			t.Fatalf("err = %v, want unknown-shape error naming the valid shapes", err)
+		}
+	})
 }

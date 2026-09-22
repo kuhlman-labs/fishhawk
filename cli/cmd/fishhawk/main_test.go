@@ -1938,7 +1938,7 @@ func TestCustomUsageCommandsArePinned(t *testing.T) {
 		"validate":     {"emit-resolved"},
 		"migrate-spec": {"out", "in-place", "report-only"},
 		"token login":  commonPlus("provider", "client-id", "oauth", "oauth-client-id"),
-		"init":         commonPlus("preset", "working-dir", "budget-usd", "single-reviewer", "human-gates", "force", "repo"),
+		"init":         commonPlus("preset", "shape", "working-dir", "budget-usd", "single-reviewer", "human-gates", "force", "repo"),
 	}
 	// Each pinned command names the function that installs its override.
 	// The ATTRIBUTED set of override functions must equal this value set.

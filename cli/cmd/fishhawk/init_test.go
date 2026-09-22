@@ -207,6 +207,82 @@ func TestInit_DeltasApplied(t *testing.T) {
 	}
 }
 
+func TestInit_ShapeConfigOnly(t *testing.T) {
+	stubDoctorSeams(t)
+	dir := newInitRepo(t)
+
+	var stdout strings.Builder
+	if got := run([]string{"init", "--working-dir", dir, "--shape", "config-only"}, &stdout, io.Discard); got != exitOK {
+		t.Fatalf("status = %d, want exitOK\n%s", got, stdout.String())
+	}
+	data, err := os.ReadFile(initSpecPath(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The written spec is schema-valid.
+	if err := spec.ValidateBytes(data); err != nil {
+		t.Errorf("config-only spec fails ValidateBytes: %v", err)
+	}
+	// It is byte-identical to the equivalent Generate call.
+	want, err := spec.Generate(spec.PresetMedium, spec.Deltas{Shape: spec.ShapeConfigOnly})
+	if err != nil {
+		t.Fatalf("reference Generate: %v", err)
+	}
+	if !bytes.Equal(data, want) {
+		t.Errorf("--shape config-only bytes differ from spec.Generate(medium, {Shape: config-only})\ngot:\n%s", data)
+	}
+	// stdout announces the shape.
+	if !strings.Contains(stdout.String(), "shape: config-only") {
+		t.Errorf("stdout missing 'shape: config-only':\n%s", stdout.String())
+	}
+	// No live verify: line survives in the written config-only spec.
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "verify:") {
+			t.Errorf("config-only spec ships a live verify key: %s", line)
+		}
+	}
+}
+
+func TestInit_DefaultShapeIsApp(t *testing.T) {
+	stubDoctorSeams(t)
+	dir := newInitRepo(t)
+
+	if got := run([]string{"init", "--working-dir", dir}, io.Discard, io.Discard); got != exitOK {
+		t.Fatalf("status = %d, want exitOK", got)
+	}
+	data, err := os.ReadFile(initSpecPath(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Omitting --shape yields bytes identical to the app-shape Generate.
+	want, err := spec.Generate(spec.PresetMedium, spec.Deltas{})
+	if err != nil {
+		t.Fatalf("reference Generate: %v", err)
+	}
+	if !bytes.Equal(data, want) {
+		t.Errorf("default-shape bytes differ from spec.Generate(medium, {})\ngot:\n%s", data)
+	}
+}
+
+func TestInit_UnknownShape(t *testing.T) {
+	dir := newInitRepo(t)
+
+	var stderr strings.Builder
+	if got := run([]string{"init", "--working-dir", dir, "--shape", "bogus"}, io.Discard, &stderr); got != exitUsage {
+		t.Fatalf("status = %d, want exitUsage", got)
+	}
+	if !strings.Contains(stderr.String(), "unknown --shape") {
+		t.Errorf("stderr missing 'unknown --shape': %s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "app, config-only") {
+		t.Errorf("stderr missing the valid-shapes hint: %s", stderr.String())
+	}
+	// The bad shape must short-circuit before any spec is written.
+	if _, err := os.Stat(initSpecPath(dir)); !os.IsNotExist(err) {
+		t.Errorf("spec written despite unknown shape (stat err = %v)", err)
+	}
+}
+
 func TestInit_UnknownPreset(t *testing.T) {
 	dir := newInitRepo(t)
 

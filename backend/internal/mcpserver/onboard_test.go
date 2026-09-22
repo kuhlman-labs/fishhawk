@@ -950,3 +950,123 @@ func TestDoctor_GitHubReport_NoGitLabMergeGateKey(t *testing.T) {
 		t.Errorf("DoctorOutput re-emits a gitlab_merge_gate on a github-family report:\n%s", encoded)
 	}
 }
+
+// --- fishhawk_init shape axis (E45.67) ---
+
+// implementStageOfYAML parses workflow YAML and returns its implement stage.
+func implementStageOfYAML(t *testing.T, workflowYAML string) spec.Stage {
+	t.Helper()
+	sp, err := spec.ParseBytes([]byte(workflowYAML))
+	if err != nil {
+		t.Fatalf("scaffold does not parse: %v", err)
+	}
+	if err := spec.Validate(sp); err != nil {
+		t.Fatalf("scaffold does not validate: %v", err)
+	}
+	wf, ok := sp.Workflows["feature_change"]
+	if !ok {
+		t.Fatal("no feature_change workflow")
+	}
+	for _, st := range wf.Stages {
+		if st.ID == "implement" {
+			return st
+		}
+	}
+	t.Fatal("no implement stage")
+	return spec.Stage{}
+}
+
+// TestInit_ConfigOnlyShape_ReturnsValidSpecWithoutVerify crosses the tool
+// handler -> spec.PresetShapeBytes -> ParseBytes+Validate path for every tier
+// and asserts the config-only structural delta on the parsed implement stage.
+func TestInit_ConfigOnlyShape_ReturnsValidSpecWithoutVerify(t *testing.T) {
+	r := &runResolver{getenv: envFuncFromMap(nil)}
+	for _, preset := range []string{"low", "medium", "high"} {
+		_, out, err := r.init(context.Background(), nil, InitInput{Preset: preset, Shape: "config-only"})
+		if err != nil {
+			t.Fatalf("init(%q, config-only): %v", preset, err)
+		}
+		if out.Shape != "config-only" {
+			t.Errorf("init(%q) Shape = %q, want config-only", preset, out.Shape)
+		}
+		impl := implementStageOfYAML(t, out.WorkflowYAML)
+		if impl.Executor.Verify != nil {
+			t.Errorf("init(%q, config-only) implement executor still carries Verify: %+v", preset, impl.Executor.Verify)
+		}
+		if len(impl.Constraints) == 0 {
+			t.Fatalf("init(%q, config-only) implement stage has no constraints", preset)
+		}
+		c := impl.Constraints[0]
+		if len(c.RequiredOutcomes) != 1 || c.RequiredOutcomes[0] != "ci_green" {
+			t.Errorf("init(%q, config-only) required_outcomes = %v, want [ci_green]", preset, c.RequiredOutcomes)
+		}
+		if c.MaxFilesChanged != 150 {
+			t.Errorf("init(%q, config-only) max_files_changed = %d, want 150", preset, c.MaxFilesChanged)
+		}
+	}
+}
+
+// TestInit_DefaultShapeIsApp: an omitted shape echoes "app" and returns bytes
+// identical to the app-shape PresetBytes, whose implement stage still carries
+// the app defaults (make test / [tests_added_or_updated, ci_green] / 45).
+func TestInit_DefaultShapeIsApp(t *testing.T) {
+	r := &runResolver{getenv: envFuncFromMap(nil)}
+	_, out, err := r.init(context.Background(), nil, InitInput{Preset: "medium"})
+	if err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	if out.Shape != "app" {
+		t.Errorf("default Shape = %q, want app", out.Shape)
+	}
+	want, err := spec.PresetBytes(spec.PresetMedium)
+	if err != nil {
+		t.Fatalf("PresetBytes(medium): %v", err)
+	}
+	if out.WorkflowYAML != string(want) {
+		t.Errorf("default-shape WorkflowYAML differs from spec.PresetBytes(medium)")
+	}
+	impl := implementStageOfYAML(t, out.WorkflowYAML)
+	if impl.Executor.Verify == nil || impl.Executor.Verify.Command != "make test" {
+		t.Errorf("app implement verify = %+v, want command 'make test'", impl.Executor.Verify)
+	}
+	if len(impl.Constraints) == 0 {
+		t.Fatalf("app implement stage has no constraints")
+	}
+	c := impl.Constraints[0]
+	if len(c.RequiredOutcomes) != 2 || c.RequiredOutcomes[0] != "tests_added_or_updated" || c.RequiredOutcomes[1] != "ci_green" {
+		t.Errorf("app required_outcomes = %v, want [tests_added_or_updated ci_green]", c.RequiredOutcomes)
+	}
+	if c.MaxFilesChanged != 45 {
+		t.Errorf("app max_files_changed = %d, want 45", c.MaxFilesChanged)
+	}
+}
+
+// TestInit_UnknownShape_FailsCleanly covers the unknown-shape error branch.
+func TestInit_UnknownShape_FailsCleanly(t *testing.T) {
+	r := &runResolver{getenv: envFuncFromMap(nil)}
+	_, _, err := r.init(context.Background(), nil, InitInput{Preset: "medium", Shape: "container"})
+	if err == nil || !strings.Contains(err.Error(), "unknown shape") {
+		t.Fatalf("err = %v, want unknown-shape error", err)
+	}
+	if !strings.Contains(err.Error(), "app, config-only") {
+		t.Errorf("err = %v, want the valid-shapes hint", err)
+	}
+}
+
+// TestInitToolDescription_DescribesShape pins the SHIPPED tool description's
+// shape claims: it names the config-only shape and states shape is chosen, not
+// inferred. A prose surface no compiler enforces, so a comment-only touch must
+// not satisfy it (#1169).
+func TestInitToolDescription_DescribesShape(t *testing.T) {
+	desc := strings.Join(strings.Fields(registeredToolDescription(t, "fishhawk_init")), " ")
+	for _, want := range []string{
+		"SHAPE axis",
+		"config-only",
+		"chosen EXPLICITLY — never inferred",
+		"raises max_files_changed",
+	} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("fishhawk_init description missing %q:\n%s", want, desc)
+		}
+	}
+}

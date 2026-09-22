@@ -2,17 +2,23 @@
 
 The preset library is the seed for onboarding: `fishhawk init` (E29.3)
 and the App-PR path (E29.7) turn a chosen tier plus a few structured
-deltas into a schema-valid `.fishhawk/workflows.yaml`. Three canonical
-presets ship, one per autonomy tier in `docs/METHODOLOGY.md`.
+deltas into a schema-valid `.fishhawk/workflows.yaml`. Presets vary on
+**two axes**: an autonomy tier (low/medium/high, one per tier in
+`docs/METHODOLOGY.md`) and a repository **shape** (app/config-only). The
+cross product ships as six canonical documents. See
+[The shape axis](#the-shape-axis) for the second axis.
 
 Since E52.8 (#2220) they are **workflow-v2** documents (`version: "2"`).
 
 ## The three presets
 
-Each preset is a complete, schema-valid `workflow-v2` document with a
-single `feature_change` workflow. They are **one shared base plus a
-single `autonomy:` line**: the only difference between the three files,
-beyond the leading header comment block, is that one word.
+The autonomy axis has three tiers. Within a shape (this section describes
+the **app** shape; the config-only shape is the same table with the shape
+delta below) each preset is a complete, schema-valid `workflow-v2`
+document with a single `feature_change` workflow. They are **one shared
+base plus a single `autonomy:` line**: the only difference between the
+three files of a shape, beyond the leading header comment block, is that
+one word.
 
 | Preset | METHODOLOGY tier | Tier line | Delegation the tier expands to |
 |---|---|---|---|
@@ -307,7 +313,7 @@ before its first run:
 
 | Placeholder | Where | Replace with |
 |---|---|---|
-| `make test` | implement stage `executor.verify.command` | Your repository's test command (run via `sh -c` after the agent exits). This runs in a fresh worktree — gitignored build artifacts and downloaded dependencies will not be present, so a command that needs them must fetch or build them itself; `fishhawk doctor --run-verify-command` executes it in a throwaway worktree to prove that before any run is started (E48.58 / #2485). `verify` is optional — remove the whole block if your project has no test entrypoint — but if present, `command` must be a non-empty string. |
+| `make test` | implement stage `executor.verify.command` | Your repository's test command (run via `sh -c` after the agent exits). This runs in a fresh worktree — gitignored build artifacts and downloaded dependencies will not be present, so a command that needs them must fetch or build them itself; `fishhawk doctor --run-verify-command` executes it in a throwaway worktree to prove that before any run is started (E48.58 / #2485). `verify` is optional — remove the whole block if your project has no test entrypoint — but if present, `command` must be a non-empty string. A config- or docs-only repository should instead scaffold with the [config-only shape](#the-shape-axis) (`fishhawk init --shape config-only`), which omits `verify` entirely and drops `tests_added_or_updated`. |
 
 The placeholder is schema-valid as shipped, so a generated preset
 passes validation (and `fishhawk doctor --spec-only`) before the operator
@@ -315,6 +321,110 @@ customizes it. `fishhawk doctor --spec-only` runs only the two
 environment-free rungs (spec schema-validity + execution-path coverage),
 so a fresh repo can be validated to the plan gate with no local Fishhawk
 environment.
+
+## The shape axis
+
+The autonomy tier is not the only thing that varies between repositories.
+An application repository has a test entrypoint; a config- or docs-only
+repository does not. Seeding the latter with the app defaults leaves four
+app-repo assumptions on the implement stage that fail at run time — a
+`verify` command that has nothing to run, a `tests_added_or_updated`
+outcome that can never be satisfied, and a `max_files_changed` cap sized
+for a code change, not a docs reorganisation. So the library carries a
+second axis, **shape**, with two values: `app` (the default) and
+`config-only`.
+
+### Why standalone documents, not a cross-file overlay
+
+The shape ships as three additional standalone canonical documents
+(`docs/spec/workflow-preset-{low,medium,high}-config-only.yaml`), so the
+cross product is 3 tiers × 2 shapes = **six** documents. It is NOT a
+cross-file overlay, for the same reason the tiers are not (see [Why three
+standalone documents](#why-three-standalone-documents-rather-than-one-base-plus-two-overlays)):
+`extends:` is same-document only and cross-file `include:` is out of
+ADR-067 scope, so a preset must be a complete document `fishhawk init`
+writes whole; and the MCP `fishhawk_init` serves embedded bytes with no
+generator, so a CLI-only transform would never reach the reporter's path.
+A shipped document also carries the shape's explanatory comments, which a
+node-editing transform could not.
+
+### The exact delta
+
+A config-only document is its app sibling of the same tier with EXACTLY
+this four-key delta on the implement stage — proven byte-for-byte by
+`TestConfigOnlyPresetIsAppPlusShapeDelta` on both module sides, which
+decodes both documents, applies the delta to the app tree and
+`reflect.DeepEqual`s against the config-only tree:
+
+| Key | App shape | Config-only shape |
+|---|---|---|
+| `executor.verify` | live `make test` block | **omitted** — a commented starter only (see below) |
+| `required_outcomes` `tests_added_or_updated` | present | **dropped** |
+| `required_outcomes` `ci_green` | present | **kept** (see below) |
+| `max_files_changed` | 45 | **150** |
+
+`TestConfigOnlyPresetsDropTestEntrypointDefaults` pins the shipped bytes
+of each changed default (no live verify key, `required_outcomes` exactly
+`[ci_green]`, `max_files_changed` 150), and
+`TestConfigOnlyPresetsAreLockstepBaseAndTierDelta` holds the three
+config-only files to the base-plus-one-autonomy-line invariant within the
+family.
+
+**Why `ci_green` is kept.** Dropping the verifier does not mean dropping
+the merge-time guard. With no pipeline, `ci_green` is a **deferral**, not
+a violation: `backend/internal/policy/policy.go` treats a nil CI signal
+as a deferral to branch protection (#297), `backend/internal/server/trace.go`
+marks a snapshot-less run's deferral `deferred_unresolvable` (#3465)
+rather than failing it, and `backend/internal/webhook/gitlab_dispatch.go`
+documents that a GitLab project requiring no pipeline satisfies `ci_green`
+with no rows. So `ci_green` never fails the stage on a repository with no
+pipeline, and it preserves the guard for a config repo that DOES run a
+lint or validate pipeline.
+
+**Why `max_files_changed: 150`.** The app cap of 45 is sized for a code
+change; a config or docs reorganisation legitimately touches far more
+files. 150 (≈3.3× the app cap) is a chosen default — the issue asks for
+"something a docs reorganisation can live inside" without a number — and
+is asserted exactly by the done-means test, so changing it is a one-line
+edit plus a test constant.
+
+**The verify starter.** `verify` is omitted rather than replaced with a
+live lint placeholder: a live `make lint` would fail at run time on a repo
+with no Makefile exactly as `make test` does. Instead a COMMENTED starter
+sits between `# fishhawk:starter-begin verify` / `-end verify` sentinels,
+nested under `executor` so `uncommentStarters` produces a valid document.
+`TestConfigOnlyPresetsCarryVerifyStarter` asserts the starter is present,
+that no LIVE `verify:` key ships, and that the shape validates once
+uncommented — the only machine check of a shape a YAML parser discards.
+
+### The load-bearing forge-neutral input comment
+
+The `github_issue` input comment (it names the issue-ANCHORED input, not
+the forge; no `gitlab_issue` member exists) is part of the shared base and
+must survive on ALL six presets. `TestPresetsCarryForgeNeutralInputComment`
+on both module sides pins both of its load-bearing sentences across the
+whole library, and the MCP acceptance criterion observes the same text in
+the `fishhawk_init` tool result.
+
+### Choosing a shape
+
+Shape is chosen EXPLICITLY, never inferred from the working directory:
+`fishhawk init --shape app|config-only` (default `app`) and the MCP
+`fishhawk_init` `shape` input (echoed in the output). The CLI selects the
+base document via a new `Deltas.Shape` field before the other deltas edit
+it; `PresetBytes(preset)` keeps its signature and means the app shape, so
+every existing caller is unchanged.
+
+### Revisit trigger
+
+Only ONE shape is added — the one with a real reporter behind it. A THIRD
+shape is the trigger to switch the family from shipped standalone
+documents to generator-derived variants: at three shapes the 3×N document
+count and the byte-for-byte lockstep tests stop paying for themselves, and
+a generator that emits each variant from one base plus a shape transform
+becomes the cheaper design. Until then, standalone documents keep the
+explanatory comments and the bare-`check-jsonschema` readability the rest
+of this document argues for.
 
 ## Budgets
 
@@ -366,6 +476,7 @@ The delta surface (`spec.Deltas`):
 
 | Delta | Effect |
 |---|---|
+| Shape | Selects the repository-shape BASE document (`app` default, `config-only`) via `PresetShapeBytes(preset, shape)` before the other deltas edit it. See [The shape axis](#the-shape-axis). |
 | Budget ceiling | Overrides `budgets[0].limit_usd` (the weekly advisory cost limit). The per-stage `limit_usd` ceilings are a different field and are untouched. |
 | Single vs dual reviewers | Drops the Codex (`gpt-5.5`) reviewer from every stage's `reviewers.agents`, leaving Claude only. Still finds its target because reviewers stay declared per stage. |
 | Human gates | Selects which of the plan / review approval gates remain human-approved (a gate not selected is left as authored). |
