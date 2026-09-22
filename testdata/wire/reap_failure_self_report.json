@@ -1,0 +1,1 @@
+{"category":"C","reason":"trace_upload","detail":"trace upload failed: status 503","exit_code":1,"expected_state":"running","expected_attempt":"2026-09-22T17:08:46.123456Z"}

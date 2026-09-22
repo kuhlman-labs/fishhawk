@@ -536,6 +536,12 @@ type fakeUploader struct {
 	// guarded by a mutex because the tee POSTs from an async goroutine.
 	progressMu      sync.Mutex
 	gotProgressArgs []upload.ReportStageProgressArgs
+	// Terminal-failure self-report seam (#3598): records every
+	// ReportRunnerFailure call under the SAME progressMu (the #3226 rule for a
+	// fake reachable from concurrent product paths); runnerFailureErr forces
+	// the report to fail.
+	gotRunnerFailures []upload.ReportRunnerFailureArgs
+	runnerFailureErr  error
 
 	// Lineage-completion read seam (#1137): lineageComplete maps a run id
 	// to its reported completion; lineageCompleteErr forces an error;
@@ -939,6 +945,20 @@ func (f *fakeUploader) ReportStageProgress(_ context.Context, args upload.Report
 	f.gotProgressArgs = append(f.gotProgressArgs, args)
 	f.progressMu.Unlock()
 	return f.progressErr
+}
+
+func (f *fakeUploader) ReportRunnerFailure(_ context.Context, args upload.ReportRunnerFailureArgs) error {
+	f.progressMu.Lock()
+	f.gotRunnerFailures = append(f.gotRunnerFailures, args)
+	f.progressMu.Unlock()
+	return f.runnerFailureErr
+}
+
+// runnerFailures returns a copy of the recorded ReportRunnerFailure calls.
+func (f *fakeUploader) runnerFailures() []upload.ReportRunnerFailureArgs {
+	f.progressMu.Lock()
+	defer f.progressMu.Unlock()
+	return append([]upload.ReportRunnerFailureArgs(nil), f.gotRunnerFailures...)
 }
 
 // progressArgs returns a copy of the recorded ReportStageProgress calls under
@@ -29369,5 +29389,146 @@ func TestImplementPush_GitLabRefreshReturnsStaticToken(t *testing.T) {
 	}
 	if fpr.gotArgs != nil {
 		t.Error("gitlab forge must not invoke the GitHub PR opener")
+	}
+}
+
+// --- terminal-failure self-report (#3598) ------------------------------------
+
+// selfReportAttemptToken is the attempt token the fake prompt envelope carries;
+// the backend renders it with run.StageAttemptToken.
+const selfReportAttemptToken = "2026-09-22T17:08:46.123456Z"
+
+// runTraceUploadFailure drives run() through --fetch-prompt (a plan stage whose
+// envelope carries stageAttempt) into a trace-upload failure, returning the
+// exit code and the log.
+func runTraceUploadFailure(t *testing.T, fu *fakeUploader, stageAttempt string, extra ...string) (int, string) {
+	t.Helper()
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:      "22222222-3333-4444-5555-666666666666",
+		StageType:    "plan",
+		Prompt:       "p",
+		PromptHash:   "deadbeef",
+		StageAttempt: stageAttempt,
+	}
+	fu.shipErr = errors.New("backend 503 on trace")
+	withFakeUploader(t, fu)
+	var stderr strings.Builder
+	got := run(append([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "w", "--stage", "plan",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt", "--upload-trace",
+	}, extra...), &stderr)
+	return got, stderr.String()
+}
+
+// A trace-upload failure records exactly ONE self-report: category C, reason
+// trace_upload, the fetched attempt token and the run-bound token carried.
+func TestRun_TraceUploadFailure_ReportsTerminalFailure(t *testing.T) {
+	fu := newFakeUploader(t)
+	got, log := runTraceUploadFailure(t, fu, selfReportAttemptToken)
+	if got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure:\n%s", got, log)
+	}
+	reports := fu.runnerFailures()
+	if len(reports) != 1 {
+		t.Fatalf("self-reports = %d, want 1:\n%s", len(reports), log)
+	}
+	r := reports[0]
+	if r.Category != "C" || r.Reason != "trace_upload" || r.StageAttempt != selfReportAttemptToken ||
+		r.MCPToken != "fhm_stubmcptokenforuse" || r.StageID != "22222222-3333-4444-5555-666666666666" {
+		t.Errorf("self-report = %+v", r)
+	}
+	if !strings.Contains(log, `"event":"runner_failure_reported"`) {
+		t.Errorf("missing runner_failure_reported line:\n%s", log)
+	}
+}
+
+// No run-bound token (a failed token fetch) → ZERO reports, the named skip.
+func TestRun_TraceUploadFailure_ReportSkippedWithoutMCPToken(t *testing.T) {
+	fu := newFakeUploader(t)
+	fu.mcpTokenErr = errors.New("token endpoint down")
+	got, log := runTraceUploadFailure(t, fu, selfReportAttemptToken)
+	if got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure", got)
+	}
+	if n := len(fu.runnerFailures()); n != 0 {
+		t.Errorf("self-reports = %d, want 0", n)
+	}
+	if !strings.Contains(log, `"event":"runner_failure_report_skipped"`) || !strings.Contains(log, `"reason":"no_mcp_token"`) {
+		t.Errorf("missing no_mcp_token skip line:\n%s", log)
+	}
+}
+
+// No attempt token in the prompt envelope → ZERO reports, no_attempt_anchor.
+func TestRun_TraceUploadFailure_ReportSkippedWithoutAttemptAnchor(t *testing.T) {
+	fu := newFakeUploader(t)
+	got, log := runTraceUploadFailure(t, fu, "")
+	if got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure", got)
+	}
+	if n := len(fu.runnerFailures()); n != 0 {
+		t.Errorf("self-reports = %d, want 0 (an unanchored report is never sent)", n)
+	}
+	if !strings.Contains(log, `"reason":"no_attempt_anchor"`) {
+		t.Errorf("missing no_attempt_anchor skip line:\n%s", log)
+	}
+}
+
+// A reporter that ERRORS changes nothing the runner already decided: same exit
+// code, same category-C completion, same runner_failed line — plus one
+// runner_failure_report_failed line.
+func TestRun_TraceUploadFailure_ReportFailureDoesNotChangeExitCode(t *testing.T) {
+	fu := newFakeUploader(t)
+	fu.runnerFailureErr = errors.New("reap-failure 500")
+	got, log := runTraceUploadFailure(t, fu, selfReportAttemptToken)
+	if got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure", got)
+	}
+	for _, want := range []string{
+		`"event":"runner_failure_report_failed"`,
+		`"reason":"trace_upload"`,
+		`"category":"C"`,
+		"backend 503 on trace",
+	} {
+		if !strings.Contains(log, want) {
+			t.Errorf("log missing %s:\n%s", want, log)
+		}
+	}
+}
+
+// The plan artifact is retained: plan_artifact_retained names a path that
+// EXISTS on disk, and the same path is folded into the report's detail.
+func TestRun_TraceUploadFailure_PlanArtifactRetainedLineNamesExistingPath(t *testing.T) {
+	dir := t.TempDir()
+	planPath := filepath.Join(dir, "plan.json")
+	if err := os.WriteFile(planPath, []byte(`{"plan":"x"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fu := newFakeUploader(t)
+	got, log := runTraceUploadFailure(t, fu, selfReportAttemptToken, "--plan-out", planPath)
+	if got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure", got)
+	}
+	var retained struct {
+		Event string `json:"event"`
+		Path  string `json:"path"`
+		Bytes int64  `json:"bytes"`
+	}
+	for _, line := range strings.Split(log, "\n") {
+		if strings.Contains(line, `"event":"plan_artifact_retained"`) {
+			_ = json.Unmarshal([]byte(line), &retained)
+		}
+	}
+	if retained.Path == "" {
+		t.Fatalf("no plan_artifact_retained line:\n%s", log)
+	}
+	if info, err := os.Stat(retained.Path); err != nil || info.Size() != retained.Bytes {
+		t.Errorf("retained path %q does not exist with %d bytes: %v", retained.Path, retained.Bytes, err)
+	}
+	if reports := fu.runnerFailures(); len(reports) != 1 || !strings.Contains(reports[0].Detail, planPath) {
+		t.Errorf("self-report detail does not name the retained plan: %+v", reports)
 	}
 }
