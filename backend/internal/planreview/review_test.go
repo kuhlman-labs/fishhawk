@@ -544,6 +544,60 @@ func TestImplementReviewedPayload_ProvenanceOmittedFromWire(t *testing.T) {
 	}
 }
 
+// TestImplementReviewedPayload_RetrySupersessionFields pins the #3593 additive
+// fields: zero/false values leave the encoded payload byte-identical (neither
+// review_round_sequence nor superseded_by_retry present), and non-zero/true
+// values round-trip.
+func TestImplementReviewedPayload_RetrySupersessionFields(t *testing.T) {
+	// (a) Absent by default (omitempty): a payload with no round/flag omits both keys.
+	bare := planreview.ImplementReviewedPayload{
+		ReviewerKind: "agent",
+		Authority:    planreview.AuthorityAdvisory,
+		Verdict:      planreview.VerdictApprove,
+	}
+	b, err := json.Marshal(bare)
+	if err != nil {
+		t.Fatalf("Marshal bare: %v", err)
+	}
+	if strings.Contains(string(b), "review_round_sequence") {
+		t.Errorf("zero ReviewRoundSequence must be omitted (omitempty): %s", b)
+	}
+	if strings.Contains(string(b), "superseded_by_retry") {
+		t.Errorf("false SupersededByRetry must be omitted (omitempty): %s", b)
+	}
+	// An old stored payload decodes to zero/false.
+	var old planreview.ImplementReviewedPayload
+	if err := json.Unmarshal([]byte(`{"reviewer_kind":"agent","authority":"advisory","verdict":"approve"}`), &old); err != nil {
+		t.Fatalf("Unmarshal pre-#3593 payload: %v", err)
+	}
+	if old.ReviewRoundSequence != 0 || old.SupersededByRetry {
+		t.Errorf("pre-#3593 payload decoded ReviewRoundSequence=%d SupersededByRetry=%v, want 0/false", old.ReviewRoundSequence, old.SupersededByRetry)
+	}
+
+	// (b) Non-zero/true round-trip.
+	p := planreview.ImplementReviewedPayload{
+		ReviewerKind:        "agent",
+		Authority:           planreview.AuthorityAdvisory,
+		Verdict:             planreview.VerdictReject,
+		ReviewRoundSequence: 98345,
+		SupersededByRetry:   true,
+	}
+	b, err = json.Marshal(p)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	var got planreview.ImplementReviewedPayload
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if got.ReviewRoundSequence != 98345 {
+		t.Errorf("ReviewRoundSequence = %d, want 98345", got.ReviewRoundSequence)
+	}
+	if !got.SupersededByRetry {
+		t.Errorf("SupersededByRetry = false, want true")
+	}
+}
+
 // TestResolveAuthority_ImplementParity confirms the authority table is
 // identical for the implement stage — the same ReviewersConfig inputs
 // produce the same authority modes (ADR-027 impl 2/2 reuses the table).

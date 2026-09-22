@@ -14,7 +14,7 @@ it.
 |---|---|---|---|---|---|
 | Living anchor | `status_comment_posted` | `status_update` | `Dispatcher.Handle` (run create); `Server.notifyStatusUpdate` (every stage transition); `Server.notifyPlanReady` (plan-stage terminal) | run dispatch | Yes — one comment per run, every transition rebuilds + edits the same comment id |
 | PR status comment | `pr_status_comment_posted` | `pr_status_update` | `Server.notifyStatusUpdate` via `issuecomment.Notifier.NotifyStatusUpdateForRun` (folded in after the anchor edit) | PR first observed / `pull_request_url` stamped | Yes — one comment per PR, rebuilt on every transition + edited in place (identical body skips the edit) |
-| Agent-review PR review | `pr_review_posted` | _(source `implement_reviewed`)_ | `Notifier.maybePostAgentReviewPRReviews` via `NotifyStatusUpdateForRun` (folded in after the anchor edit) | each terminal agent `implement_reviewed` verdict on a PR-owning run | No — a NEW advisory COMMENT-type PR review per verdict round (deduped on the source `implement_reviewed` audit `Sequence`); a post-fixup re-review round posts a new review |
+| Agent-review PR review | `pr_review_posted` | _(source `implement_reviewed`)_ | `Notifier.maybePostAgentReviewPRReviews` via `NotifyStatusUpdateForRun` (folded in after the anchor edit) | each terminal agent `implement_reviewed` verdict on a PR-owning run EXCEPT one whose review round a later stage retry superseded (#3593) | No — a NEW advisory COMMENT-type PR review per verdict round (deduped on the source `implement_reviewed` audit `Sequence`); a post-fixup re-review round posts a new review; a retry-superseded verdict is skipped and writes no row |
 | Page-class ping | `anchor_ping_posted` | _(payload `event`)_ | `Notifier.firePings` from `NotifyStatusUpdateForRun` AND the pings-only immediate `NotifyPageClassForRun` invoked at each batched append site (#1786) | first crossing of a page-class event (plan gate awaiting human approval, advisory reviewer reject, must_page_human, clarification request / awaiting_input park, CI failure, acceptance triage paged, campaign gate hand-off) | No — a one-line NEW comment per source event (deduped on the source audit `Sequence`) linking back to the anchor; an already-resolved reviewer-reject page is recorded-and-skipped |
 | CI-failure retry | `issue_commented` | `ci_retry` | `Dispatcher.handleCIFailureRetry` (#279) | retry dispatch | No (per-attempt dedup; new attempts post new comments) |
 | Budget alert (advisory) | `issue_commented` | `budget_alert` | `Server.checkBudgetAlerts` → `NotifyBudgetAlert` (#688, #1371) | crossing of an advisory periodic-budget ladder rung — `warn` / `over` / `ack_required` (≥2x) / `page` (≥3x) | No (per-`(period_start, tier)` dedup; each tier posts once per calendar period) |
@@ -283,6 +283,25 @@ Notes:
     `reviewer_model`, `review_id`, `event`), so a re-render of the run never
     double-posts a review for the same verdict, while a genuinely new
     post-fixup re-review round (a later `Sequence`) posts a NEW review.
+  - **Retry-superseded verdicts are skipped, and write NO row (#3593).** A
+    verdict whose review round was discarded by a later stage retry must never
+    reach the retry's PR (the run-bed3f1d8 defect: an attempt-1 reject re-posted
+    onto the retry's PR). `supersededReviewSequences` decides supersession
+    EXACTLY from recorded state — superseded iff the payload's
+    `superseded_by_retry` is true OR (`review_round_sequence > 0` AND a
+    same-stage `stage_retried` / `stage_override_retried` row has `Sequence >
+    review_round_sequence`). The recorded `review_round_sequence` is
+    load-bearing: for a row that carries it, the comparison is against that
+    recorded round-start — NEVER the "newest `implement_review_started` below the
+    verdict" derivation, which misreads a late old-round reject that sits above a
+    new round's start. That below-the-verdict derivation survives ONLY as the
+    fallback for a legacy row lacking `review_round_sequence` (a pre-#3593 or
+    emit-failure row). A superseded verdict is skipped BEFORE `CreateReview` and
+    writes NO `pr_review_posted` row (the skip is re-derived from audit on every
+    rebuild, so the dedup map stays keyed on posted sequences only). This read
+    FAILS OPEN: a read error on any of the three lists, or an undecodable
+    payload, degrades to today's behavior (post), so a bookkeeping outage never
+    suppresses a legitimate review.
   - `pr_review_posted` is deliberately NOT added to the anchor timeline's
     `activityCategories` — it is PR-locus review bookkeeping, not an
     issue-anchor timeline activity (same posture as `pr_status_comment_posted`).

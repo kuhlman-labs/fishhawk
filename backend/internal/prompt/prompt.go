@@ -6008,6 +6008,9 @@ func buildImplementReview(t Trigger) string {
 			"observe a genuine REGRESSION of one — the prior fix was undone or broke — you MAY re-raise it in " +
 			"`concerns[]`; the server will RECORD it, not discard it. Tag such a re-raise with `settled_ref` (its id) " +
 			"and `new_evidence` (the regression you observed) for lineage.\n")
+		b.WriteString("- A `superseded` concern whose reason names a stage retry or plan revise was DISCARDED TOGETHER " +
+			"WITH THE TREE IT REVIEWED — it was NOT fixed, so do not assume the finding is resolved. If the SAME finding " +
+			"still holds on the tree under review, raise it again in `concerns[]` with `settled_ref` (its id) for lineage.\n")
 		b.WriteString("- Do NOT re-raise any listed concern that is still settled. `concerns[]` is for genuinely NEW " +
 			"findings and evidence-backed regressions only.\n\n")
 		for _, c := range t.SettledConcerns {
@@ -6015,6 +6018,13 @@ func buildImplementReview(t Trigger) string {
 				c.ID, c.State, c.Severity, c.Category, c.Note)
 			if (c.State == "waived" || c.State == "deferred") && c.StateReason != "" {
 				fmt.Fprintf(&b, "  operator %s reason: %s\n", c.State, c.StateReason)
+			}
+			// A `superseded` row's reason is a SERVER (not operator) arbitration —
+			// a plan revise or stage retry (#3593) discarded the tree it reviewed.
+			// Render it UNPREFIXED so the reviewer sees WHY the finding is settled
+			// and does not re-derive a fix that the discarded tree already lost.
+			if c.State == "superseded" && c.StateReason != "" {
+				fmt.Fprintf(&b, "  superseded reason: %s\n", c.StateReason)
 			}
 		}
 		b.WriteString("\n")

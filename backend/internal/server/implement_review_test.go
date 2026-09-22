@@ -38,7 +38,9 @@ func (s *Server) runImplementReviewLoop(ctx context.Context, runID, stageID uuid
 	for i := range invocations {
 		invocations[i] = reviewerInvocation{reviewer: s.defaultPlanReviewer()}
 	}
-	return s.runImplementReviewInvocations(ctx, runID, stageID, invocations, authority, promptText, authorModel, "", "", s.cfg.ReviewBudget, "")
+	// roundSeq 0 (#3593): the count-form test entry seeds no started row, so
+	// its verdicts carry no recorded round key — byte-identical to pre-#3593.
+	return s.runImplementReviewInvocations(ctx, runID, stageID, invocations, authority, promptText, authorModel, "", "", s.cfg.ReviewBudget, "", 0)
 }
 
 // Implement-stage workflow specs with reviewers config. The implement
@@ -1870,7 +1872,7 @@ func TestImplementReviewLoop_PersistsConcernsWithOriginSequence(t *testing.T) {
 
 	s.runImplementReviewInvocations(context.Background(), runID, stageID,
 		[]reviewerInvocation{{reviewer: rev1}, {reviewer: rev2}},
-		planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "")
+		planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "", 0)
 
 	reviewed := au.entriesByCategory("implement_reviewed")
 	if len(reviewed) != 2 {
@@ -1954,7 +1956,7 @@ func TestImplementReview_ConditionClaim_ResolvesOnConfirmingVerdict(t *testing.T
 	implStageID := uuid.New()
 	s.runImplementReviewInvocations(context.Background(), runID, implStageID,
 		[]reviewerInvocation{{reviewer: reviewer}},
-		planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "")
+		planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "", 0)
 
 	rows, _ := cr.GetByIDs(context.Background(), []uuid.UUID{claimed.ID})
 	if rows[0].State != concern.StateAddressedByCondition {
@@ -2040,7 +2042,7 @@ func TestImplementReview_ConditionClaim_QualifiedWhenConfirmingReviewRaisesFresh
 	implStageID := uuid.New()
 	s.runImplementReviewInvocations(context.Background(), runID, implStageID,
 		[]reviewerInvocation{{reviewer: reviewer}},
-		planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "")
+		planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "", 0)
 
 	// The claim still resolves — the operator's binding condition is the authority.
 	rows, _ := cr.GetByIDs(context.Background(), []uuid.UUID{claimed.ID})
@@ -2123,7 +2125,7 @@ func TestImplementReview_ConditionClaim_RejectLeavesConcernOpen(t *testing.T) {
 	implStageID := uuid.New()
 	s.runImplementReviewInvocations(context.Background(), runID, implStageID,
 		[]reviewerInvocation{{reviewer: reviewer}},
-		planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "")
+		planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "", 0)
 
 	rows, _ := cr.GetByIDs(context.Background(), []uuid.UUID{claimed.ID})
 	if rows[0].State != concern.StateRaised {
@@ -2152,7 +2154,7 @@ func TestImplementReviewLoop_StampsReviewerProvenance(t *testing.T) {
 	}
 	s.runImplementReviewInvocations(context.Background(), runID, stageID,
 		[]reviewerInvocation{{reviewer: rev, provider: "codex"}},
-		planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "")
+		planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "", 0)
 
 	reviewed := au.entriesByCategory("implement_reviewed")
 	if len(reviewed) != 1 {
@@ -2188,7 +2190,7 @@ func TestImplementReviewLoop_ProvenanceUnknownVersionDegrades(t *testing.T) {
 	}
 	s.runImplementReviewInvocations(context.Background(), runID, stageID,
 		[]reviewerInvocation{{reviewer: rev, provider: "codex"}},
-		planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "")
+		planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "", 0)
 
 	if n := len(au.entriesByCategory("implement_review_failed")); n != 0 {
 		t.Fatalf("implement_review_failed entries = %d, want 0 (an unknown version degrades, never fails)", n)
@@ -2225,7 +2227,7 @@ func TestImplementReviewLoop_NonProbingReviewerOmitsProvenance(t *testing.T) {
 	}
 	s.runImplementReviewInvocations(context.Background(), runID, stageID,
 		[]reviewerInvocation{{reviewer: rev, provider: "anthropic"}},
-		planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "")
+		planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "", 0)
 
 	reviewed := au.entriesByCategory("implement_reviewed")
 	if len(reviewed) != 1 {
@@ -2265,7 +2267,7 @@ func TestImplementReviewLoop_FailedAppendSkipsConcernPersistence(t *testing.T) {
 		model: "claude-opus-4-8",
 	}
 	s.runImplementReviewInvocations(context.Background(), runID, stageID,
-		[]reviewerInvocation{{reviewer: rev}}, planreview.AuthorityAdvisory, "prompt", "author", "", "", planreview.DefaultReviewBudget, "")
+		[]reviewerInvocation{{reviewer: rev}}, planreview.AuthorityAdvisory, "prompt", "author", "", "", planreview.DefaultReviewBudget, "", 0)
 
 	rows, _ := cr.ListByRun(context.Background(), runID)
 	if len(rows) != 0 {
@@ -2291,7 +2293,7 @@ func TestImplementReviewLoop_ConcernInsertFailureDoesNotFailLoop(t *testing.T) {
 		model: "claude-opus-4-8",
 	}
 	hasRejection := s.runImplementReviewInvocations(context.Background(), runID, stageID,
-		[]reviewerInvocation{{reviewer: rev}}, planreview.AuthorityAdvisory, "prompt", "author", "", "", planreview.DefaultReviewBudget, "")
+		[]reviewerInvocation{{reviewer: rev}}, planreview.AuthorityAdvisory, "prompt", "author", "", "", planreview.DefaultReviewBudget, "", 0)
 
 	if !hasRejection {
 		t.Error("hasRejection = false, want true (insert failure must not mask the verdict)")
@@ -2325,7 +2327,7 @@ func TestImplementReviewLoop_AdvisoryReject_LeavesConcernOpenForMergeGate(t *tes
 		model: "claude-opus-4-8",
 	}
 	hasRejection := s.runImplementReviewInvocations(context.Background(), runID, stageID,
-		[]reviewerInvocation{{reviewer: rev}}, planreview.AuthorityAdvisory, "prompt", "author", "", "", planreview.DefaultReviewBudget, "pushed-head-sha")
+		[]reviewerInvocation{{reviewer: rev}}, planreview.AuthorityAdvisory, "prompt", "author", "", "", planreview.DefaultReviewBudget, "pushed-head-sha", 0)
 
 	if !hasRejection {
 		t.Error("hasRejection = false, want true (an advisory reject is still a rejection the caller may act on)")
@@ -2372,7 +2374,7 @@ func TestImplementReviewLoop_ConfirmedResolutionTransitionsToAddressed(t *testin
 		model: "claude-opus-4-8",
 	}
 	s.runImplementReviewInvocations(context.Background(), runID, stageID,
-		[]reviewerInvocation{{reviewer: rev}}, planreview.AuthorityAdvisory, "prompt", "author", "", "", planreview.DefaultReviewBudget, "")
+		[]reviewerInvocation{{reviewer: rev}}, planreview.AuthorityAdvisory, "prompt", "author", "", "", planreview.DefaultReviewBudget, "", 0)
 
 	rows, _ := cr.GetByIDs(context.Background(), []uuid.UUID{row.ID})
 	if rows[0].State != concern.StateAddressed {
@@ -2438,7 +2440,7 @@ func TestImplementReviewLoop_ReopenWinsBothOrders(t *testing.T) {
 			}
 			s.runImplementReviewInvocations(context.Background(), runID, stageID,
 				[]reviewerInvocation{{reviewer: revA}, {reviewer: revB}},
-				planreview.AuthorityAdvisory, "prompt", "author", "", "", planreview.DefaultReviewBudget, "")
+				planreview.AuthorityAdvisory, "prompt", "author", "", "", planreview.DefaultReviewBudget, "", 0)
 
 			rows, _ := cr.GetByIDs(context.Background(), []uuid.UUID{row.ID})
 			if rows[0].State != concern.StateReopened {
@@ -2479,7 +2481,7 @@ func TestImplementReviewLoop_SloppyResolutionsWarnSkip(t *testing.T) {
 		model: "claude-opus-4-8",
 	}
 	hasRejection := s.runImplementReviewInvocations(context.Background(), runID, stageID,
-		[]reviewerInvocation{{reviewer: rev}}, planreview.AuthorityAdvisory, "prompt", "author", "", "", planreview.DefaultReviewBudget, "")
+		[]reviewerInvocation{{reviewer: rev}}, planreview.AuthorityAdvisory, "prompt", "author", "", "", planreview.DefaultReviewBudget, "", 0)
 	if hasRejection {
 		t.Error("hasRejection = true, want false (sloppy resolutions must not affect the verdict)")
 	}
@@ -4273,7 +4275,7 @@ func TestImplementReviewRound_V1_PeerConfirmVetoedWhileRaiserRejects(t *testing.
 
 	s.runImplementReviewInvocations(context.Background(), runID, stageID,
 		[]reviewerInvocation{{reviewer: raiser}, {reviewer: peer}},
-		planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "")
+		planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "", 0)
 
 	got := concernRowAfterRound(t, cr, row.ID)
 	if got.State != concern.StateAddressedPending {
@@ -4313,7 +4315,7 @@ func TestImplementReviewRound_V2_ConfirmVetoedOnOperatorEvidence(t *testing.T) {
 	peer := confirmingReviewer("fable-5", row.ID.String(), "the guard reads correct", planreview.VerdictApprove)
 	s.runImplementReviewInvocations(context.Background(), runID, stageID,
 		[]reviewerInvocation{{reviewer: peer}},
-		planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "")
+		planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "", 0)
 
 	if got := concernRowAfterRound(t, cr, row.ID); got.State != concern.StateAddressedPending {
 		t.Errorf("state = %q, want addressed_pending (operator-executed evidence outranks a reviewer confirmation)", got.State)
@@ -4337,7 +4339,7 @@ func TestImplementReviewRound_V3_ConfirmVetoedOnNoChangePass(t *testing.T) {
 	peer := confirmingReviewer("fable-5", row.ID.String(), "resolved", planreview.VerdictApprove)
 	s.runImplementReviewInvocations(context.Background(), runID, stageID,
 		[]reviewerInvocation{{reviewer: peer}},
-		planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "")
+		planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "", 0)
 
 	if got := concernRowAfterRound(t, cr, row.ID); got.State != concern.StateAddressedPending {
 		t.Errorf("state = %q, want addressed_pending (a no-change pass cannot have fixed anything)", got.State)
@@ -4368,7 +4370,7 @@ func TestImplementReviewRound_V3_NoOutcomeYet_ConfirmApplies(t *testing.T) {
 	peer := confirmingReviewer("fable-5", row.ID.String(), "the bound landed", planreview.VerdictApprove)
 	s.runImplementReviewInvocations(context.Background(), runID, stageID,
 		[]reviewerInvocation{{reviewer: peer}},
-		planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "")
+		planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "", 0)
 
 	if got := concernRowAfterRound(t, cr, row.ID); got.State != concern.StateAddressed {
 		t.Errorf("state = %q, want addressed (an absent outcome entry is not evidence of a no-change pass)", got.State)
@@ -4394,7 +4396,7 @@ func TestImplementReviewRound_V4_ConfirmVetoedWhenEvidenceLookupFails(t *testing
 	peer := confirmingReviewer("fable-5", row.ID.String(), "resolved", planreview.VerdictApprove)
 	s.runImplementReviewInvocations(context.Background(), runID, stageID,
 		[]reviewerInvocation{{reviewer: peer}},
-		planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "")
+		planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "", 0)
 
 	if got := concernRowAfterRound(t, cr, row.ID); got.State != concern.StateAddressedPending {
 		t.Errorf("state = %q, want addressed_pending (an unreadable evidence lookup must fail closed)", got.State)
@@ -4419,7 +4421,7 @@ func TestImplementReviewRound_Control_LoneConfirmResolves(t *testing.T) {
 	peer := confirmingReviewer("fable-5", row.ID.String(), "the nil check landed", planreview.VerdictApprove)
 	s.runImplementReviewInvocations(context.Background(), runID, stageID,
 		[]reviewerInvocation{{reviewer: peer}},
-		planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "")
+		planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "", 0)
 
 	if got := concernRowAfterRound(t, cr, row.ID); got.State != concern.StateAddressed {
 		t.Errorf("state = %q, want addressed (an undisputed confirm must still resolve)", got.State)
@@ -4439,7 +4441,7 @@ func TestImplementReviewRound_Control_RaiserConfirmsOwnConcernResolves(t *testin
 	raiser := confirmingReviewer("gpt-5.6-sol", row.ID.String(), "this one is fixed; I reject on a NEW finding", planreview.VerdictReject)
 	s.runImplementReviewInvocations(context.Background(), runID, stageID,
 		[]reviewerInvocation{{reviewer: raiser}},
-		planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "")
+		planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "", 0)
 
 	if got := concernRowAfterRound(t, cr, row.ID); got.State != concern.StateAddressed {
 		t.Errorf("state = %q, want addressed (a reviewer may always confirm its OWN concern)", got.State)
@@ -4480,7 +4482,7 @@ func TestImplementReviewRound_ReopenedAndSupersededNeverVetoed(t *testing.T) {
 			}
 			s.runImplementReviewInvocations(context.Background(), runID, stageID,
 				[]reviewerInvocation{{reviewer: raiser}, {reviewer: peer}},
-				planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "")
+				planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "", 0)
 
 			if got := concernRowAfterRound(t, cr, row.ID); got.State != tc.want {
 				t.Errorf("state = %q, want %q (%s is never vetoed)", got.State, tc.want, tc.resolution)
@@ -4518,7 +4520,7 @@ func TestImplementReviewRound_ReopenWinsUnderBuffering(t *testing.T) {
 			}
 			s.runImplementReviewInvocations(context.Background(), runID, stageID,
 				[]reviewerInvocation{{reviewer: mk(tc.first)}, {reviewer: mk(tc.second)}},
-				planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "")
+				planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "", 0)
 
 			if got := concernRowAfterRound(t, cr, row.ID); got.State != concern.StateReopened {
 				t.Errorf("state = %q, want reopened (REOPEN WINS in either order)", got.State)
@@ -4550,7 +4552,7 @@ func TestImplementReviewRound_OperatorEvidenceEndToEnd(t *testing.T) {
 	peer := confirmingReviewer("fable-5", row.ID.String(), "reads fixed to me", planreview.VerdictApprove)
 	s.runImplementReviewInvocations(context.Background(), stage.RunID, stage.ID,
 		[]reviewerInvocation{{reviewer: peer}},
-		planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "")
+		planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "", 0)
 
 	if got := concernRowAfterRound(t, cr, row.ID); got.State != concern.StateAddressedPending {
 		t.Errorf("state = %q, want addressed_pending (the real fix-up's operator_evidence must reach the veto)", got.State)

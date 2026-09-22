@@ -1819,11 +1819,25 @@ func (n *Notifier) maybePostAgentReviewPRReviews(ctx context.Context, runRow *ru
 		return nil
 	}
 
+	// Retry supersession (#3593): a verdict whose review round was discarded by
+	// a later stage retry must NOT be posted onto the retry's PR (the bed3f1d8
+	// defect — attempt-1 rejects re-posted to the retry's PR #3592). Decided
+	// from RECORDED state; fails OPEN (empty set → post) on any read error, so a
+	// bookkeeping outage never suppresses a legitimate review.
+	superseded := n.supersededReviewSequences(ctx, runRow.ID, entries)
+
 	for _, e := range entries {
 		if e.Category != "implement_reviewed" {
 			continue
 		}
 		if _, done := posted[e.Sequence]; done {
+			continue
+		}
+		if _, skip := superseded[e.Sequence]; skip {
+			// A retry discarded the tree this verdict reviewed. Skip BEFORE
+			// CreateReview and write NO pr_review_posted row — the skip is
+			// re-derived from audit on every rebuild, so it stays keyed on
+			// posted sequences only.
 			continue
 		}
 		body := RenderPRReviewBody(e, runRow, n.externalURL)
@@ -1870,6 +1884,123 @@ func (n *Notifier) postedReviewSequences(ctx context.Context, runID uuid.UUID) (
 		}
 	}
 	return seen, nil
+}
+
+// supersededReviewSequences returns the set of implement_reviewed audit
+// sequences whose review round was discarded by a later stage retry and must
+// NOT be posted as PR reviews (#3593). It lists stage_retried,
+// stage_override_retried and implement_review_started once, then for each
+// candidate implement_reviewed entry decides EXACTLY:
+//
+//	superseded iff payload.superseded_by_retry is true
+//	  OR (payload.review_round_sequence > 0 AND a same-stage retry row exists
+//	     with Sequence > review_round_sequence)
+//
+// The recorded review_round_sequence is LOAD-BEARING (#3593 binding condition
+// 2): for a row that carries it, the comparison is against that recorded
+// round-start — NEVER the legacy "newest implement_review_started below the
+// verdict" derivation, which is precisely what misreads the bed3f1d8 late
+// reject that sits ABOVE a new round's start. The legacy derivation applies
+// ONLY to a row lacking review_round_sequence (a pre-#3593 or emit-failure
+// row): roundStart = max same-stage implement_review_started Sequence strictly
+// below the verdict (or the verdict's own Sequence when none), with the same
+// retry comparison against it.
+//
+// Same-stage = both StageIDs non-nil and equal; a nil StageID on either side
+// compares run-wide (legacy rows / stageless fixtures). Fails OPEN to today's
+// behavior (post): a read error on ANY of the three lists returns the empty
+// set, and an undecodable candidate payload is skipped (not marked), so a
+// bookkeeping outage never suppresses a legitimate review — matching
+// postedReviewSequences' posture.
+func (n *Notifier) supersededReviewSequences(ctx context.Context, runID uuid.UUID, entries []*audit.Entry) map[int64]struct{} {
+	superseded := make(map[int64]struct{})
+
+	retried, err := n.audit.ListForRunByCategory(ctx, runID, "stage_retried")
+	if err != nil {
+		return superseded
+	}
+	overrideRetried, err := n.audit.ListForRunByCategory(ctx, runID, "stage_override_retried")
+	if err != nil {
+		return superseded
+	}
+	started, err := n.audit.ListForRunByCategory(ctx, runID, "implement_review_started")
+	if err != nil {
+		return superseded
+	}
+	retryRows := make([]*audit.Entry, 0, len(retried)+len(overrideRetried))
+	retryRows = append(retryRows, retried...)
+	retryRows = append(retryRows, overrideRetried...)
+
+	for _, e := range entries {
+		if e.Category != "implement_reviewed" {
+			continue
+		}
+		flag, roundSeq, ok := decodeReviewSupersession(e.Payload)
+		if !ok {
+			// Undecodable payload: fail open (post). Never marked superseded.
+			continue
+		}
+		if flag {
+			superseded[e.Sequence] = struct{}{}
+			continue
+		}
+		roundStart := roundSeq
+		if roundStart == 0 {
+			// Legacy row (no recorded round): derive the round start as the
+			// newest same-stage implement_review_started strictly below this
+			// verdict, or the verdict's own Sequence when none precedes it.
+			roundStart = e.Sequence
+			foundStart := false
+			for _, st := range started {
+				if !sameStageEntry(st, e) || st.Sequence >= e.Sequence {
+					continue
+				}
+				if !foundStart || st.Sequence > roundStart {
+					roundStart = st.Sequence
+					foundStart = true
+				}
+			}
+		}
+		for _, rr := range retryRows {
+			if !sameStageEntry(rr, e) {
+				continue
+			}
+			if rr.Sequence > roundStart {
+				superseded[e.Sequence] = struct{}{}
+				break
+			}
+		}
+	}
+	return superseded
+}
+
+// sameStageEntry reports whether two audit entries are same-stage for the
+// supersession comparison (#3593): both StageIDs non-nil and equal. A nil
+// StageID on EITHER side compares run-wide (true) — the legacy posture for
+// pre-#600 stageless rows and stageless test fixtures.
+func sameStageEntry(a, b *audit.Entry) bool {
+	if a.StageID == nil || b.StageID == nil {
+		return true
+	}
+	return *a.StageID == *b.StageID
+}
+
+// decodeReviewSupersession pulls the #3593 supersession fields out of an
+// implement_reviewed payload: the superseded_by_retry flag and the recorded
+// review_round_sequence. ok is false on an empty or undecodable payload, so the
+// caller can fail open (post) rather than mark it.
+func decodeReviewSupersession(payload []byte) (flag bool, roundSeq int64, ok bool) {
+	if len(payload) == 0 {
+		return false, 0, false
+	}
+	var p struct {
+		SupersededByRetry   bool  `json:"superseded_by_retry"`
+		ReviewRoundSequence int64 `json:"review_round_sequence"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return false, 0, false
+	}
+	return p.SupersededByRetry, p.ReviewRoundSequence, true
 }
 
 // appendPRReviewAudit records that the run's terminal implement verdict at

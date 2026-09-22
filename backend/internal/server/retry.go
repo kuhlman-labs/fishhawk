@@ -517,6 +517,30 @@ func (s *Server) retryStageAs(ctx context.Context, id Identity, p retryActionPar
 		s.writeRetryAudit(ctx, id, dec, runRow, p.DelegatedRule)
 	}
 
+	// Supersede the prior attempt's OPEN implement-review concerns (#3593),
+	// mirroring revise.go's supersedeReplanConcerns for the retry path. A
+	// retried implement stage re-opened to pending discards the tree the prior
+	// attempt's review round judged, so its concerns describe a tree that no
+	// longer exists — leaving them `raised` strands them at the merge gate (the
+	// retry round's `confirmed` resolutions can't legally drive raised→addressed).
+	// Superseding them here, AFTER the audit write and BEFORE the run un-terminal,
+	// drops them out of every open-concern surface. It PAIRS with the post-persist
+	// re-check in runImplementReviewInvocations: a retry landing at any instant is
+	// caught by whichever of {this sweep, that re-check} runs second. Gated on the
+	// pending re-open + implement type so a D-timeout awaiting_approval re-open (no
+	// new tree) and non-implement stages supersede nothing. Best-effort/warn-only —
+	// the retry's HTTP success is never gated on it.
+	if dec.Stage.Type == run.StageTypeImplement && dec.Stage.State == run.StageStatePending {
+		retryKind := "stage retry"
+		if dec.Overridden {
+			retryKind = "stage override retry"
+		}
+		reason := fmt.Sprintf(
+			"superseded by %s (ordinal %d): prior-attempt implement-review concern discarded on re-implement",
+			retryKind, dec.Stage.SelfRetryCount)
+		s.supersedeOpenImplementConcerns(ctx, dec.Stage.RunID, dec.Stage.ID, reason, nil)
+	}
+
 	// Un-terminal the run (failed → running) before the orchestrator
 	// handoff. This is MANDATORY, not cosmetic: orchestrator.Advance
 	// returns OutcomeNoOp without acting when run.State.IsTerminal()

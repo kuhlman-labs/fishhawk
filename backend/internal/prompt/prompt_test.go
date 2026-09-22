@@ -6214,6 +6214,9 @@ func TestBuild_ImplementReview_SettledConcernsLedger(t *testing.T) {
 			{ID: "d1", State: "deferred", Severity: "low", Category: "verification", Note: "missing bench", StateReason: "filed follow-up #4242"},
 			{ID: "a1", State: "addressed", Severity: "high", Category: "correctness", Note: "nil deref"},
 			{ID: "s1", State: "superseded", Severity: "low", Category: "style", Note: "old naming"},
+			// A superseded row carrying a server StateReason — the #3593 retry
+			// case. Its reason renders UNPREFIXED (no "operator").
+			{ID: "s2", State: "superseded", Severity: "high", Category: "correctness", Note: "discarded finding", StateReason: "superseded by stage retry (ordinal 1): prior-attempt implement-review concern discarded on re-implement"},
 		},
 	})
 	if err != nil {
@@ -6231,6 +6234,10 @@ func TestBuild_ImplementReview_SettledConcernsLedger(t *testing.T) {
 		"state: addressed",
 		"id: s1",
 		"state: superseded",
+		// The #3593 superseded reason renders UNPREFIXED for the row that carries one.
+		"superseded reason: superseded by stage retry (ordinal 1): prior-attempt implement-review concern discarded on re-implement",
+		// The discard-not-fixed guidance sentence.
+		"DISCARDED TOGETHER WITH THE TREE IT REVIEWED",
 		// conditional schema members render because SettledConcerns is non-empty
 		"\"settled_ref\":",
 		"\"new_evidence\":",
@@ -6239,7 +6246,8 @@ func TestBuild_ImplementReview_SettledConcernsLedger(t *testing.T) {
 			t.Errorf("settled ledger must render %q:\n%s", w, out)
 		}
 	}
-	// addressed/superseded rows carry NO operator-reason line (only waived/deferred do).
+	// addressed/superseded rows carry NO operator-PREFIXED reason line (only
+	// waived/deferred do); the #3593 superseded reason is deliberately unprefixed.
 	if strings.Contains(out, "operator addressed reason") || strings.Contains(out, "operator superseded reason") {
 		t.Errorf("addressed/superseded rows must not carry an operator-reason line:\n%s", out)
 	}

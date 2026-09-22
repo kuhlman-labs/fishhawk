@@ -3384,3 +3384,207 @@ func derefRef(r *string) string {
 	}
 	return *r
 }
+
+// --- #3593: retry supersedes the prior review round's PR reviews ----------
+
+// seedImplementReviewedRound seeds an implement_reviewed entry scoped to stage
+// with a recorded review_round_sequence (0 omits the key) and an optional
+// superseded_by_retry flag.
+func seedImplementReviewedRound(au *fakeAudit, runID, stageID uuid.UUID, model, verdict string, roundSeq int64, supersededFlag bool) {
+	payload := map[string]any{"reviewer_model": model, "verdict": verdict}
+	if roundSeq > 0 {
+		payload["review_round_sequence"] = roundSeq
+	}
+	if supersededFlag {
+		payload["superseded_by_retry"] = true
+	}
+	au.preSeedWithStage(runID, stageID, "implement_reviewed", payload)
+}
+
+// prReviewSourceSequences returns the source_sequence of every pr_review_posted
+// row the run appended, so a test can assert exactly which verdict was posted.
+func prReviewSourceSequences(au *fakeAudit) []int64 {
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var out []int64
+	for _, p := range au.appended {
+		if p.Category != issuecomment.CategoryPRReviewPosted {
+			continue
+		}
+		var body struct {
+			SourceSequence int64 `json:"source_sequence"`
+		}
+		_ = json.Unmarshal(p.Payload, &body)
+		out = append(out, body.SourceSequence)
+	}
+	return out
+}
+
+// TestPRReview_RetrySupersededRound_NotPosted drives the bed3f1d8 chain: two
+// attempt-1 rejects (one landing AFTER the retry) carrying the OLD round
+// sequence are suppressed; only the retry round's approve is posted (#3593).
+func TestPRReview_RetrySupersededRound_NotPosted(t *testing.T) {
+	runID, _, _, gh, au, _, n := prStatusDeps(t)
+	stageID := uuid.New()
+
+	au.preSeedWithStage(runID, stageID, "implement_review_started", map[string]any{})      // seq 1 = A
+	seedImplementReviewedRound(au, runID, stageID, "gpt-5.5", "reject", 1, false)          // seq 2 (round A)
+	au.preSeedWithStage(runID, stageID, "stage_retried", map[string]any{})                 // seq 3
+	seedImplementReviewedRound(au, runID, stageID, "gpt-5.5", "reject", 1, false)          // seq 4 (round A, late)
+	au.preSeedWithStage(runID, stageID, "implement_review_started", map[string]any{})      // seq 5 = B
+	seedImplementReviewedRound(au, runID, stageID, "claude-opus-4-8", "approve", 5, false) // seq 6 (round B)
+
+	if err := n.NotifyStatusUpdateForRun(context.Background(), runID); err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	if got := prReviewCount(gh, 7); got != 1 {
+		t.Fatalf("expected exactly 1 PR review (the retry-round approve); got %d", got)
+	}
+	seqs := prReviewSourceSequences(au)
+	if len(seqs) != 1 || seqs[0] != 6 {
+		t.Fatalf("pr_review_posted source_sequences = %v, want [6] (the approve)", seqs)
+	}
+}
+
+// TestPRReview_LateOldVerdictAfterNewRoundStart_NotPosted (constraint 2): an
+// old-round reject that lands ABOVE the new round's start is correctly
+// suppressed by its RECORDED review_round_sequence. The legacy
+// "newest-started-below-the-verdict" derivation would misread it as belonging
+// to the new round and post it.
+func TestPRReview_LateOldVerdictAfterNewRoundStart_NotPosted(t *testing.T) {
+	runID, _, _, gh, au, _, n := prStatusDeps(t)
+	stageID := uuid.New()
+
+	au.preSeedWithStage(runID, stageID, "implement_review_started", map[string]any{})      // seq 1 = A
+	au.preSeedWithStage(runID, stageID, "stage_retried", map[string]any{})                 // seq 2
+	au.preSeedWithStage(runID, stageID, "implement_review_started", map[string]any{})      // seq 3 = B
+	seedImplementReviewedRound(au, runID, stageID, "gpt-5.5", "reject", 1, false)          // seq 4 (round A, ABOVE B)
+	seedImplementReviewedRound(au, runID, stageID, "claude-opus-4-8", "approve", 3, false) // seq 5 (round B)
+
+	if err := n.NotifyStatusUpdateForRun(context.Background(), runID); err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	if got := prReviewCount(gh, 7); got != 1 {
+		t.Fatalf("expected 1 PR review (the new round's approve); got %d", got)
+	}
+	seqs := prReviewSourceSequences(au)
+	if len(seqs) != 1 || seqs[0] != 5 {
+		t.Fatalf("pr_review_posted source_sequences = %v, want [5] (the approve; the late old reject at seq 4 must NOT post)", seqs)
+	}
+}
+
+// TestPRReview_SupersededByRetryFlag_NotPosted: the flag arm alone suppresses a
+// verdict even with NO retry row seeded.
+func TestPRReview_SupersededByRetryFlag_NotPosted(t *testing.T) {
+	runID, _, _, gh, au, _, n := prStatusDeps(t)
+	stageID := uuid.New()
+	seedImplementReviewedRound(au, runID, stageID, "gpt-5.5", "reject", 1, true) // flag=true, no retry row
+
+	if err := n.NotifyStatusUpdateForRun(context.Background(), runID); err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	if got := prReviewCount(gh, 7); got != 0 {
+		t.Fatalf("a superseded_by_retry verdict must not post; got %d", got)
+	}
+	if len(prReviewSourceSequences(au)) != 0 {
+		t.Fatalf("no pr_review_posted row for a flagged verdict")
+	}
+}
+
+// TestPRReview_LegacyRowFallback: verdicts lacking review_round_sequence use the
+// below-the-verdict derivation. started→reject→retry→started→approve posts only
+// the approve.
+func TestPRReview_LegacyRowFallback(t *testing.T) {
+	runID, _, _, gh, au, _, n := prStatusDeps(t)
+	stageID := uuid.New()
+
+	au.preSeedWithStage(runID, stageID, "implement_review_started", map[string]any{})      // seq 1
+	seedImplementReviewedRound(au, runID, stageID, "gpt-5.5", "reject", 0, false)          // seq 2 (legacy, no rrs)
+	au.preSeedWithStage(runID, stageID, "stage_retried", map[string]any{})                 // seq 3
+	au.preSeedWithStage(runID, stageID, "implement_review_started", map[string]any{})      // seq 4
+	seedImplementReviewedRound(au, runID, stageID, "claude-opus-4-8", "approve", 0, false) // seq 5 (legacy, no rrs)
+
+	if err := n.NotifyStatusUpdateForRun(context.Background(), runID); err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	if got := prReviewCount(gh, 7); got != 1 {
+		t.Fatalf("legacy fallback should post only the approve; got %d", got)
+	}
+	seqs := prReviewSourceSequences(au)
+	if len(seqs) != 1 || seqs[0] != 5 {
+		t.Fatalf("pr_review_posted source_sequences = %v, want [5]", seqs)
+	}
+}
+
+// TestPRReview_RetryOnOtherStage_StillPosts: a retry on a DIFFERENT stage does
+// not suppress this stage's verdict.
+func TestPRReview_RetryOnOtherStage_StillPosts(t *testing.T) {
+	runID, _, _, gh, au, _, n := prStatusDeps(t)
+	stageID := uuid.New()
+	otherStage := uuid.New()
+
+	au.preSeedWithStage(runID, stageID, "implement_review_started", map[string]any{}) // seq 1
+	seedImplementReviewedRound(au, runID, stageID, "gpt-5.5", "reject", 1, false)     // seq 2
+	au.preSeedWithStage(runID, otherStage, "stage_retried", map[string]any{})         // seq 3 (OTHER stage)
+
+	if err := n.NotifyStatusUpdateForRun(context.Background(), runID); err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	if got := prReviewCount(gh, 7); got != 1 {
+		t.Fatalf("a retry on a DIFFERENT stage must not suppress this verdict; got %d", got)
+	}
+}
+
+// retryListErrAudit wraps *fakeAudit and errors ListForRunByCategory for the
+// stage_retried category only, so the relay's retry-list read fails and must
+// fail OPEN (post).
+type retryListErrAudit struct {
+	*fakeAudit
+}
+
+func (a *retryListErrAudit) ListForRunByCategory(ctx context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
+	if category == "stage_retried" {
+		return nil, errors.New("fake audit: injected stage_retried list error")
+	}
+	return a.fakeAudit.ListForRunByCategory(ctx, runID, category)
+}
+
+// TestPRReview_RetryListError_FailsOpen: a read error on the retry-list read
+// fails open — a verdict that WOULD be superseded is posted anyway.
+func TestPRReview_RetryListError_FailsOpen(t *testing.T) {
+	runID := uuid.New()
+	stageID := uuid.New()
+	triggerRef := "issue:42"
+	prURL := "https://github.com/x/y/pull/7"
+	runRow := &run.Run{
+		ID: runID, Repo: "x/y", WorkflowID: "feature_change",
+		TriggerSource: run.TriggerGitHubIssue, TriggerRef: &triggerRef,
+		InstallationID: int64Ptr(99), State: run.StateRunning,
+		PullRequestURL: &prURL,
+	}
+	stages := []*run.Stage{
+		{ID: stageID, RunID: runID, Sequence: 1, Type: run.StageTypeImplement, State: run.StageStateSucceeded},
+	}
+	repoRuns := &fakeRuns{
+		runs:   map[uuid.UUID]*run.Run{runID: runRow},
+		stages: map[uuid.UUID][]*run.Stage{runID: stages},
+	}
+	gh := &fakeGitHub{}
+	au := &retryListErrAudit{fakeAudit: &fakeAudit{}}
+	n := issuecomment.New(issuecomment.Deps{
+		GitHub: gh, Runs: repoRuns, Audit: au,
+		ExternalURL: "https://app.example",
+		Now:         func() time.Time { return time.Date(2026, 7, 9, 12, 0, 0, 0, time.UTC) },
+	})
+
+	au.preSeedWithStage(runID, stageID, "implement_review_started", map[string]any{})       // seq 1
+	seedImplementReviewedRound(au.fakeAudit, runID, stageID, "gpt-5.5", "reject", 1, false) // seq 2
+	au.preSeedWithStage(runID, stageID, "stage_retried", map[string]any{})                  // seq 3
+
+	if err := n.NotifyStatusUpdateForRun(context.Background(), runID); err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	if got := prReviewCount(gh, 7); got != 1 {
+		t.Fatalf("a retry-list read error must fail OPEN (post); got %d", got)
+	}
+}
