@@ -1,0 +1,14 @@
+id: scenario:issue-3583/single-reviewer-delta-drops-one-agent
+statement: Scaffolding with the single-reviewer option exits 0 and produces a spec in which every reviewer-bearing stage declares exactly one agent, and that agent is the anthropic reviewer that a container-deployed backend can run.
+verify_hint: 'CLI surface: run `fishhawk init --preset medium --single-reviewer` in an empty git repository, observe exit 0, and confirm the scaffolded `.fishhawk/workflows.yaml` has exactly one entry under each stage''s `reviewers.agents` and that entry declares the anthropic provider.'
+steps: '(1) Build the CLI from the sanctioned read-only checkout at /tmp/fishhawk-acceptance-tree-9c5ee36d-43d6-4a24-9803-71c3356f27b0-59da6531-309e-432d-b7ff-046778d46729 (HEAD f48ad97f): `cd cli && go build -o /tmp/fh3583/fishhawk ./cmd/fishhawk`. (2) `mkdir -p /tmp/fh3583/m/single && cd /tmp/fh3583/m/single && git init -q . && /tmp/fh3583/fishhawk init --preset medium --single-reviewer`; record the exit status. Repeat in fresh repos for `--preset low --single-reviewer`, `--preset high --single-reviewer` and `--preset medium --single-reviewer --shape config-only`. (3) For each: `grep -E ''^\s*-?\s*provider:'' .fishhawk/workflows.yaml | sort | uniq -c` (expect 2 x anthropic). (4) Parse with `yq -o=json .fishhawk/workflows.yaml | python3` and, for every stage carrying a `reviewers` block, assert len(reviewers.agents) == 1 and agents[0].provider == ''anthropic''. (5) `/tmp/fh3583/fishhawk validate .fishhawk/workflows.yaml` on each and require exit 0 with empty stderr.'
+assertions:
+    expected: fishhawk init --single-reviewer exits 0 and every reviewer-bearing stage declares exactly one agent, and that agent declares the anthropic provider.
+    observed_at_record: '`fishhawk init --preset medium --single-reviewer` exited 0. Its .fishhawk/workflows.yaml has exactly 2 uncommented `provider:` lines (down from 4), both `anthropic`, and both reviewer-bearing stages of workflows.feature_change declare exactly one agent: plan reviewers.agents == [{provider:''anthropic'', model:''claude-opus-4-8''}] and implement reviewers.agents == [{provider:''anthropic'', model:''claude-opus-4-8''}] (authority advisory, human 1 on both). The delta is not a no-op after the rekey. The same holds for --preset low --single-reviewer, --preset high --single-reviewer and --preset medium --single-reviewer --shape config-only: exit 0, one anthropic agent per reviewer-bearing stage. All four single-reviewer scaffolds also pass `fishhawk validate` with exit 0 and empty stderr.'
+    repro_handle: cd $(mktemp -d) && git init -q . && /tmp/fh3583/fishhawk init --preset medium --single-reviewer && yq -o=json .fishhawk/workflows.yaml
+origin:
+    issue: 3583
+    pr: 3602
+    run_id: 9c5ee36d-43d6-4a24-9803-71c3356f27b0
+    head_sha: f48ad97fc1e157beec981cc3de0d81d37c61d2d8
+    recorded_at: 2026-09-22T14:53:18Z
