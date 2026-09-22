@@ -978,7 +978,7 @@ func runSplitRound(s *Server, runID, stageID uuid.UUID, concernID string) {
 	}
 	s.runImplementReviewInvocations(context.Background(), runID, stageID,
 		[]reviewerInvocation{{reviewer: raiser}, {reviewer: peer}},
-		planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "")
+		planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "", 0)
 }
 
 // TestGateView_SplitRound_RendersDispute is THE cross-layer test (E48.103 /
@@ -1108,7 +1108,7 @@ func TestGateView_UndisputedConcern_NotDisputed(t *testing.T) {
 	}
 	s.runImplementReviewInvocations(context.Background(), runID, stageID,
 		[]reviewerInvocation{{reviewer: peer}},
-		planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "")
+		planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "", 0)
 
 	got := openConcernByID(t, decodeGateView(t, getGateView(t, s, runID, "")), row.ID)
 	if got.Disputed || len(got.Disputes) != 0 {
@@ -1297,7 +1297,7 @@ func TestGateView_ReopenVeto_NotDisputedButSurfacedAsDetail(t *testing.T) {
 	}
 	s.runImplementReviewInvocations(context.Background(), runID, stageID,
 		[]reviewerInvocation{{reviewer: reviewer}},
-		planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "")
+		planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "", 0)
 
 	got := openConcernByID(t, decodeGateView(t, getGateView(t, s, runID, "")), row.ID)
 	if got.State != string(concern.StateAddressedPending) {

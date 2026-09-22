@@ -4639,7 +4639,15 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 	// under both authorities — the MCP review_status proxy reads it to tell
 	// 'configured + running' (pending) from 'none configured'. Mirrors the
 	// plan path (runPlanReviews). Best-effort: never blocks dispatch.
-	s.emitReviewStarted(ctx, runID, stageID, "implement_review_started", authority, reviewersCfg.AgentCount(), headSHA)
+	//
+	// Capture the started row's sequence (#3593): it is the RECORDED round
+	// identity threaded into runImplementReviewInvocations as roundSeq and
+	// stamped on every implement_reviewed payload's ReviewRoundSequence, so a
+	// later stage retry supersedes exactly the verdicts of the round it
+	// discarded. roundSeq is 0 when the emit failed (ok=false); the loop then
+	// records no round key and marks nothing, and the relay falls back to its
+	// legacy below-the-verdict derivation for those rows.
+	roundSeq, _ := s.emitReviewStarted(ctx, runID, stageID, "implement_review_started", authority, reviewersCfg.AgentCount(), headSHA)
 	reviewDispatchMu.Unlock()
 
 	// invocations were resolved above (before the prompt build) so the grounding
@@ -4673,7 +4681,7 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 		go func() {
 			defer s.bgReviews.Done()
 			defer treeCleanup()
-			s.runImplementReviewInvocations(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel, "", "", stageBudget, treeDir)
+			s.runImplementReviewInvocations(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel, "", "", stageBudget, treeDir, roundSeq)
 		}()
 		return false
 	}
@@ -4682,7 +4690,7 @@ func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UU
 	// category-B before the terminal transition. Cleanup is owned by THIS scope
 	// because the loop runs to completion before runImplementReviews returns.
 	defer treeCleanup()
-	return s.runImplementReviewInvocations(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel, "", "", stageBudget, treeDir)
+	return s.runImplementReviewInvocations(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel, "", "", stageBudget, treeDir, roundSeq)
 }
 
 // amendedScopeFilesForReview computes the approval-time scope folds that the
@@ -5058,7 +5066,16 @@ func (s *Server) scopeProvenanceForReview(ctx context.Context, runID, stageID uu
 // supplemental caller passes Origin="base_rebase_reinvoke" + the re-landed
 // head SHA so the additive verdict is labelable and the dispatch idempotent
 // on (stage_id, Origin, HeadSHA).
-func (s *Server) runImplementReviewInvocations(ctx context.Context, runID, stageID uuid.UUID, invocations []reviewerInvocation, authority planreview.AuthorityMode, promptText, authorModel, origin, headSHA string, reviewBudget planreview.ReviewBudget, treeDir string) bool {
+//
+// roundSeq is the RECORDED review-round identity (#3593): the audit Sequence of
+// the implement_review_started row that opened this round, captured by the
+// caller from emitReviewStarted. It is stamped verbatim onto every
+// implement_reviewed payload's ReviewRoundSequence and anchors the retry
+// supersession predicate below. 0 means the caller emitted no started row (the
+// supplemental re-invoke pass) or the emit failed — the loop then records no
+// round key and supersedes nothing, and the PR relay uses its legacy
+// below-the-verdict derivation for those rows.
+func (s *Server) runImplementReviewInvocations(ctx context.Context, runID, stageID uuid.UUID, invocations []reviewerInvocation, authority planreview.AuthorityMode, promptText, authorModel, origin, headSHA string, reviewBudget planreview.ReviewBudget, treeDir string, roundSeq int64) bool {
 	systemKind := audit.ActorKind("system")
 	hasRejection := false
 	// pagedRejectAppended tracks whether THIS loop appended a page-class audit
@@ -5138,6 +5155,17 @@ func (s *Server) runImplementReviewInvocations(ctx context.Context, runID, stage
 			)
 		}
 
+		// Retry supersession (#3593): read the latest same-stage retry sequence
+		// AT VERDICT TIME (no loop-entry watermark). The predicate is anchored
+		// on roundSeq — the round-start sequence fixed when the round opened —
+		// so a retry landing anywhere between the started emit and this read is
+		// detected. supersededByRetry gates both the payload flag and whether
+		// this verdict's resolutions are buffered into `round`. ok is false only
+		// on a retry-list read error; a clean "no retry yet" read is (0, true),
+		// which correctly yields supersededByRetry=false.
+		latestRetry, retryReadOK := s.latestStageRetrySequence(ctx, runID, stageID)
+		supersededByRetry := retryReadOK && roundSeq > 0 && latestRetry > roundSeq
+
 		payload := planreview.ImplementReviewedPayload{
 			ReviewerKind:  "agent",
 			ReviewerModel: model,
@@ -5145,6 +5173,9 @@ func (s *Server) runImplementReviewInvocations(ctx context.Context, runID, stage
 			Verdict:       verdict.Verdict,
 			Concerns:      verdict.Concerns,
 			FreeForm:      verdict.FreeForm,
+			// Recorded review-round identity + retry supersession (#3593).
+			ReviewRoundSequence: roundSeq,
+			SupersededByRetry:   supersededByRetry,
 			// The reviewer's delta-verification verdicts on prior concerns
 			// (#984) ride on the authoritative audit payload; the concern
 			// store applies them below as a derived index.
@@ -5188,21 +5219,58 @@ func (s *Server) runImplementReviewInvocations(ctx context.Context, runID, stage
 			// chain stays the sole sequence authority, so a failed append
 			// (no sequence) skips persistence for this verdict.
 			freshRows := s.persistReviewConcerns(ctx, runID, stageID, concern.StageKindImplement, model, verdict.FreeForm, entry.Sequence, verdict.Concerns)
+
+			// Post-persist retry re-check (#3593). RE-READ the latest same-stage
+			// retry sequence AFTER persistReviewConcerns minted this verdict's
+			// rows, so a retry that landed BETWEEN the payload write and here —
+			// the accepted window where the payload is UNMARKED — still
+			// supersedes the concerns it just minted. Combined with the
+			// retry-time sweep in retryStageAs, a retry at ANY instant is caught
+			// by whichever of {sweep, this re-check} runs second. The match
+			// predicate targets ONLY the rows this verdict just minted
+			// (OriginReviewSequence == entry.Sequence), so a peer reviewer's
+			// concerns in the same round are untouched here.
+			latestRetry2, retryReadOK2 := s.latestStageRetrySequence(ctx, runID, stageID)
+			supersededPostPersist := retryReadOK2 && roundSeq > 0 && latestRetry2 > roundSeq
+			if supersededPostPersist {
+				verdictSeq := entry.Sequence
+				s.supersedeOpenImplementConcerns(ctx, runID, stageID,
+					fmt.Sprintf("superseded by stage retry (retry seq %d): this verdict's review round (opened at seq %d, before the retry) reviewed a discarded tree", latestRetry2, roundSeq),
+					func(c *concern.Concern) bool { return c.OriginReviewSequence == verdictSeq })
+			}
+			// A verdict superseded at EITHER read (verdict-build time or this
+			// post-persist re-check) reviewed a tree the retry has discarded;
+			// its delta-verification resolutions describe that discarded tree, so
+			// do NOT buffer them into `round` and do NOT let it resolve the
+			// operator's condition claims. Log at INFO that they were dropped.
+			superseded := supersededByRetry || supersededPostPersist
+			if superseded {
+				s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+					"implement review: verdict superseded by stage retry — dropping its concern resolutions",
+					slog.String("run_id", runID.String()),
+					slog.String("stage_id", stageID.String()),
+					slog.Int64("review_round_sequence", roundSeq),
+					slog.Int64("verdict_sequence", entry.Sequence),
+				)
+			}
 			// Buffer the delta-verification resolutions (#984) instead of
 			// applying them here (E48.103 / #2551): they are applied once
 			// after the loop, through the veto pass that can see what the
 			// OTHER reviewers in this same round said. The append-gated
 			// posture is unchanged — a failed append (no sequence) buffers
-			// nothing, exactly as it previously applied nothing.
-			round = append(round, roundReviewVerdict{
-				model:          model,
-				verdict:        verdict.Verdict,
-				resolutions:    verdict.ConcernResolutions,
-				reviewSequence: entry.Sequence,
-				// The authoritative input to the #3319 per-resolution
-				// substantiation predicate.
-				review: *verdict,
-			})
+			// nothing, exactly as it previously applied nothing. A
+			// retry-superseded verdict (#3593) buffers nothing either.
+			if !superseded {
+				round = append(round, roundReviewVerdict{
+					model:          model,
+					verdict:        verdict.Verdict,
+					resolutions:    verdict.ConcernResolutions,
+					reviewSequence: entry.Sequence,
+					// The authoritative input to the #3319 per-resolution
+					// substantiation predicate.
+					review: *verdict,
+				})
+			}
 			// Condition-claim resolution (E48.9 / #1956): ONE confirming
 			// (non-reject) implement review resolves the operator's claimed
 			// plan-stage concerns to addressed_by_condition — the operator's
@@ -5211,8 +5279,10 @@ func (s *Server) runImplementReviewInvocations(ctx context.Context, runID, stage
 			// a decomposition parent's consolidated review (parent runID, where
 			// the plan gate lives) resolves correctly while implement-only
 			// children no-op. Fires at most once per loop; idempotent across
-			// later re-review rounds via the already-terminal silent skip.
-			if !conditionClaimsResolved && verdict.Verdict != planreview.VerdictReject {
+			// later re-review rounds via the already-terminal silent skip. A
+			// retry-superseded verdict (#3593) reviewed a discarded tree, so it
+			// never witnesses a condition claim.
+			if !superseded && !conditionClaimsResolved && verdict.Verdict != planreview.VerdictReject {
 				// Cross-link this confirming review's OWN fresh implement
 				// concerns (#2066): persistReviewConcerns ran earlier in this
 				// same iteration for this same verdict, so freshRows are the
@@ -5272,6 +5342,92 @@ func (s *Server) runImplementReviewInvocations(ctx context.Context, runID, stage
 	}
 
 	return hasRejection
+}
+
+// latestStageRetrySequence returns the highest audit Sequence of a
+// same-stage stage_retried / stage_override_retried row for the given stage,
+// and whether the read succeeded (#3593). It reads BOTH retry categories via
+// AuditRepo.ListForRunByCategory and takes the max Sequence whose StageID is
+// non-nil and equals stageID.
+//
+// CONTRACT (constraint C): (0, true) when NO matching row exists — "no retry
+// yet" is a SUCCESSFUL read, and the caller's supersession predicate
+// (latest > roundSeq) then evaluates false, marking nothing. (0, false) is
+// returned ONLY when a list read errors (WARN-logged) or AuditRepo is nil, so
+// a bookkeeping outage never over-suppresses: the caller gates on ok before
+// concluding supersession. Best-effort: never returns an error.
+func (s *Server) latestStageRetrySequence(ctx context.Context, runID, stageID uuid.UUID) (int64, bool) {
+	if s.cfg.AuditRepo == nil {
+		return 0, false
+	}
+	var max int64
+	for _, cat := range []string{CategoryStageRetried, CategoryStageOverrideRetried} {
+		entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, cat)
+		if err != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+				"latest stage retry sequence: list audit entries failed",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+				slog.String("category", cat),
+				slog.String("error", err.Error()),
+			)
+			return 0, false
+		}
+		for _, e := range entries {
+			if e.StageID == nil || *e.StageID != stageID {
+				continue
+			}
+			if e.Sequence > max {
+				max = e.Sequence
+			}
+		}
+	}
+	return max, true
+}
+
+// supersedeOpenImplementConcerns transitions every OPEN implement-review
+// concern of the given stage that `match` selects to the terminal superseded
+// state (#3593), mirroring revise.go's supersedeReplanConcerns for the retry
+// path. It is the shared best-effort primitive both retryStageAs (at retry
+// time, matching ALL open implement concerns of the re-opened stage) and the
+// post-persist re-check in runImplementReviewInvocations (matching only the
+// just-minted rows) call.
+//
+// `match` selects rows to SUPERSEDE (a true return supersedes the row) — it is
+// deliberately NOT named `keep`, which would read as the opposite of what it
+// does. A nil ConcernRepo no-ops; a ListByRun read error WARN-logs and returns;
+// a per-concern ApplyResolution failure WARN-logs and continues to the next
+// row. The caller's outcome (the retry's HTTP success, the review loop's
+// verdict write) is NEVER gated on the supersession.
+func (s *Server) supersedeOpenImplementConcerns(ctx context.Context, runID, stageID uuid.UUID, reason string, match func(*concern.Concern) bool) {
+	if s.cfg.ConcernRepo == nil {
+		return
+	}
+	rows, err := s.cfg.ConcernRepo.ListByRun(ctx, runID)
+	if err != nil {
+		s.cfg.Logger.Warn("supersede open implement concerns: list concerns failed",
+			"run_id", runID,
+			"stage_id", stageID,
+			"error", err.Error(),
+		)
+		return
+	}
+	for _, c := range rows {
+		if c.StageID != stageID || c.StageKind != concern.StageKindImplement || !c.State.IsOpen() {
+			continue
+		}
+		if match != nil && !match(c) {
+			continue
+		}
+		if _, err := s.cfg.ConcernRepo.ApplyResolution(ctx, c.ID, concern.StateSuperseded, reason); err != nil {
+			s.cfg.Logger.Warn("supersede open implement concern failed",
+				"run_id", runID,
+				"stage_id", stageID,
+				"concern_id", c.ID,
+				"error", err.Error(),
+			)
+		}
+	}
 }
 
 // runSupplementalReinvokeReview dispatches the bounded, ADDITIVE supplemental
@@ -5426,7 +5582,10 @@ func (s *Server) runSupplementalReinvokeReview(ctx context.Context, runID, stage
 		s.bgReviews.Add(1)
 		go func() {
 			defer s.bgReviews.Done()
-			s.runImplementReviewInvocations(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel, planreview.OriginBaseRebaseReinvoke, headSHA, stageBudget, "")
+			// roundSeq 0 (#3593): the supplemental pass emits no
+			// implement_review_started row, so it records no round key and marks
+			// nothing; the relay's legacy fallback applies to its verdicts.
+			s.runImplementReviewInvocations(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel, planreview.OriginBaseRebaseReinvoke, headSHA, stageBudget, "", 0)
 		}()
 		return false
 	}
@@ -5434,7 +5593,8 @@ func (s *Server) runSupplementalReinvokeReview(ctx context.Context, runID, stage
 	// Gating: run synchronously so the caller can fail the stage category-B
 	// before responding. Same no-started-emission discipline. The supplemental
 	// reinvoke pass renders no diff and needs no tree — always ungrounded (#2486).
-	return s.runImplementReviewInvocations(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel, planreview.OriginBaseRebaseReinvoke, headSHA, stageBudget, "")
+	// roundSeq 0 (#3593): no started row, so no round key is recorded.
+	return s.runImplementReviewInvocations(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel, planreview.OriginBaseRebaseReinvoke, headSHA, stageBudget, "", 0)
 }
 
 // supplementalReinvokeReviewAlreadyRecorded reports whether a base-rebase

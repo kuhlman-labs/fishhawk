@@ -607,6 +607,35 @@ type ImplementReviewedPayload struct {
 	// byte-identical, and an old stored payload decodes false.
 	RejectWithoutConcern bool `json:"reject_without_concern,omitempty"`
 
+	// ReviewRoundSequence is the audit Sequence of the
+	// implement_review_started row that opened the review round THIS verdict
+	// belongs to (#3593). It is RECORDED by the writer at round-open time —
+	// runImplementReviews captures emitReviewStarted's returned sequence and
+	// threads it into runImplementReviewInvocations — never derived from the
+	// verdict's position in the chain. It is the fixed anchor the retry
+	// supersession predicate and the PR relay both key on: a stage retry whose
+	// sequence exceeds this value discarded the tree this round reviewed. 0
+	// (absent) means a legacy row (predating #3593) or an emit failure
+	// (emitReviewStarted returned ok=false), and ONLY then do consumers fall
+	// back to the legacy "newest implement_review_started below the verdict"
+	// derivation. omitempty keeps pre-#3593 payloads byte-identical, and an
+	// old stored payload decodes 0.
+	ReviewRoundSequence int64 `json:"review_round_sequence,omitempty"`
+
+	// SupersededByRetry marks a verdict written AFTER a same-stage
+	// stage_retried / stage_override_retried row whose Sequence exceeds
+	// ReviewRoundSequence (#3593): the verdict reviewed a tree the retry has
+	// since discarded, so it must never be posted to the retry's PR. Recorded
+	// at VERDICT-BUILD time from a fresh retry-sequence read. The
+	// retry-lands-during-persistence window MAY leave a genuinely-superseded
+	// verdict UNMARKED (the retry landed after this payload was written); that
+	// residual is safe because the concern is still superseded by the
+	// post-persist re-check (or the retry-time sweep) AND the PR relay's rule
+	// compares retry rows against ReviewRoundSequence, not this flag alone.
+	// omitempty keeps every pre-#3593 payload byte-identical, and an old stored
+	// payload decodes false.
+	SupersededByRetry bool `json:"superseded_by_retry,omitempty"`
+
 	// Origin marks a non-first-review provenance for the verdict (#1250).
 	// Empty on the first review and the parent-decomposition consolidated
 	// review (byte-identical). The base-rebase re-invoke supplemental pass

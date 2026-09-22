@@ -1864,9 +1864,16 @@ func (s *Server) planBudgetEvidence(ctx context.Context, runRow *run.Run, parsed
 // as proof that a review is pending rather than absent. Mirrors the
 // skipped-entry error handling: WARN-log and continue on append failure
 // so the dispatch path is never blocked.
-func (s *Server) emitReviewStarted(ctx context.Context, runID, stageID uuid.UUID, category string, authority planreview.AuthorityMode, configuredAgents int, headSHA string) {
+//
+// It returns the appended entry's audit Sequence and ok=true on a successful
+// append (#3593). ok=false — with seq 0 — when AuditRepo is nil or the append
+// failed (WARN already logged). The implement-review path threads the returned
+// sequence into each verdict's ReviewRoundSequence so the review round is
+// RECORDED rather than inferred; the plan_review_started caller discards the
+// result unchanged.
+func (s *Server) emitReviewStarted(ctx context.Context, runID, stageID uuid.UUID, category string, authority planreview.AuthorityMode, configuredAgents int, headSHA string) (seq int64, ok bool) {
 	if s.cfg.AuditRepo == nil {
-		return
+		return 0, false
 	}
 	payload, _ := json.Marshal(planreview.ReviewStartedPayload{
 		ConfiguredAgents: configuredAgents,
@@ -1877,19 +1884,25 @@ func (s *Server) emitReviewStarted(ctx context.Context, runID, stageID uuid.UUID
 		HeadSHA: headSHA,
 	})
 	systemKind := audit.ActorKind("system")
-	if _, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+	entry, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
 		RunID:     runID,
 		StageID:   &stageID,
 		Timestamp: time.Now().UTC(),
 		Category:  category,
 		ActorKind: &systemKind,
 		Payload:   payload,
-	}); aerr != nil {
+	})
+	if aerr != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "review: append "+category+" audit entry failed",
 			slog.String("run_id", runID.String()),
 			slog.String("error", aerr.Error()),
 		)
+		return 0, false
 	}
+	if entry == nil {
+		return 0, false
+	}
+	return entry.Sequence, true
 }
 
 // emitReviewFailed appends a best-effort terminal *_review_failed audit

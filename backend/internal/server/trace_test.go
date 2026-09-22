@@ -6897,7 +6897,7 @@ func TestImplementReviewInvocations_FiresPageClassHook(t *testing.T) {
 		model:   "gpt-5.5",
 	}
 	s.runImplementReviewInvocations(context.Background(), runID, stageID,
-		[]reviewerInvocation{{reviewer: rev}}, planreview.AuthorityAdvisory, "prompt", "author", "", "", planreview.DefaultReviewBudget, "")
+		[]reviewerInvocation{{reviewer: rev}}, planreview.AuthorityAdvisory, "prompt", "author", "", "", planreview.DefaultReviewBudget, "", 0)
 
 	if !rec.pagedRun(runID) {
 		t.Errorf("implement-review site did not invoke the page-class hook; paged=%v", rec.pageClass)
@@ -6921,7 +6921,7 @@ func TestImplementReviewInvocations_ApproveSkipsPageClassHook(t *testing.T) {
 		model:   "gpt-5.5",
 	}
 	s.runImplementReviewInvocations(context.Background(), runID, stageID,
-		[]reviewerInvocation{{reviewer: rev}}, planreview.AuthorityAdvisory, "prompt", "author", "", "", planreview.DefaultReviewBudget, "")
+		[]reviewerInvocation{{reviewer: rev}}, planreview.AuthorityAdvisory, "prompt", "author", "", "", planreview.DefaultReviewBudget, "", 0)
 
 	if rec.pagedRun(runID) {
 		t.Errorf("implement-review site fired the page-class hook on an all-approve loop; paged=%v", rec.pageClass)
@@ -11948,7 +11948,7 @@ func TestImplementReviewed_RejectWithoutConcernFlag(t *testing.T) {
 			s, au, _, runID, stageID := vetoRoundServer()
 			s.runImplementReviewInvocations(context.Background(), runID, stageID,
 				[]reviewerInvocation{{reviewer: &fakePlanReviewer{verdict: tc.verdict, model: "fable-5"}}},
-				planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "")
+				planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "", 0)
 
 			raw := rawImplementReviewedPayloads(au)
 			if len(raw) != 1 {
@@ -12605,6 +12605,368 @@ func TestShipTrace_StageBudgetBlocking_RecordsDroppedRetirements(t *testing.T) {
 		}
 		if n := countAppendedByCategory(au, CategoryAcceptanceScenarioRetirementDropped); n != 0 {
 			t.Errorf("drop rows = %d, want 0 (nothing was cancelled, nothing was dropped)", n)
+		}
+	})
+}
+
+// --- #3593: recorded review round + retry supersession --------------------
+
+// roundSeqAuditFake is a sequence-stamping audit fake whose
+// ListForRunByCategory returns entries WITH their assigned Sequence + StageID
+// (the plain auditFake drops both), so latestStageRetrySequence and the PR
+// relay can read a real round-vs-retry ordering. catErr injects a per-category
+// ListForRunByCategory error for the (0,false) contract branch.
+type roundSeqAuditFake struct {
+	*auditFake
+	rmu    sync.Mutex
+	seq    int64
+	ents   []*audit.Entry
+	catErr map[string]error
+}
+
+func newRoundSeqAuditFake() *roundSeqAuditFake {
+	return &roundSeqAuditFake{auditFake: newAuditFake(), seq: 100, catErr: map[string]error{}}
+}
+
+func (a *roundSeqAuditFake) AppendChained(_ context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
+	a.rmu.Lock()
+	defer a.rmu.Unlock()
+	a.seq++
+	rid := p.RunID
+	e := &audit.Entry{
+		ID:        uuid.New(),
+		Sequence:  a.seq,
+		RunID:     &rid,
+		StageID:   p.StageID,
+		Timestamp: p.Timestamp,
+		Category:  p.Category,
+		Payload:   p.Payload,
+	}
+	a.ents = append(a.ents, e)
+	return e, nil
+}
+
+func (a *roundSeqAuditFake) ListForRunByCategory(_ context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
+	a.rmu.Lock()
+	defer a.rmu.Unlock()
+	if err := a.catErr[category]; err != nil {
+		return nil, err
+	}
+	var out []*audit.Entry
+	for _, e := range a.ents {
+		if e.RunID != nil && *e.RunID == runID && e.Category == category {
+			out = append(out, e)
+		}
+	}
+	return out, nil
+}
+
+// implementReviewedEntry returns the single implement_reviewed entry the loop
+// wrote, decoded into its payload.
+func (a *roundSeqAuditFake) implementReviewedPayload(t *testing.T) planreview.ImplementReviewedPayload {
+	t.Helper()
+	a.rmu.Lock()
+	defer a.rmu.Unlock()
+	var found *audit.Entry
+	for _, e := range a.ents {
+		if e.Category == "implement_reviewed" {
+			if found != nil {
+				t.Fatalf("expected exactly one implement_reviewed entry, found >1")
+			}
+			found = e
+		}
+	}
+	if found == nil {
+		t.Fatalf("no implement_reviewed entry written")
+	}
+	var p planreview.ImplementReviewedPayload
+	if err := json.Unmarshal(found.Payload, &p); err != nil {
+		t.Fatalf("decode implement_reviewed payload: %v", err)
+	}
+	return p
+}
+
+// TestLatestStageRetrySequence_Contract pins the (0,true)/max/(0,false)
+// contract (#3593 constraint C), one case per branch.
+func TestLatestStageRetrySequence_Contract(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	ctx := context.Background()
+
+	appendRetry := func(a *roundSeqAuditFake, cat string, sid *uuid.UUID) int64 {
+		e, _ := a.AppendChained(ctx, audit.ChainAppendParams{RunID: runID, StageID: sid, Category: cat, Timestamp: time.Now().UTC()})
+		return e.Sequence
+	}
+
+	t.Run("no rows -> (0,true)", func(t *testing.T) {
+		au := newRoundSeqAuditFake()
+		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
+		seq, ok := s.latestStageRetrySequence(ctx, runID, stageID)
+		if seq != 0 || !ok {
+			t.Errorf("got (%d,%v), want (0,true)", seq, ok)
+		}
+	})
+
+	t.Run("both categories same-stage -> (max,true)", func(t *testing.T) {
+		au := newRoundSeqAuditFake()
+		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
+		sid := stageID
+		appendRetry(au, CategoryStageRetried, &sid)
+		hi := appendRetry(au, CategoryStageOverrideRetried, &sid)
+		seq, ok := s.latestStageRetrySequence(ctx, runID, stageID)
+		if seq != hi || !ok {
+			t.Errorf("got (%d,%v), want (%d,true)", seq, ok, hi)
+		}
+	})
+
+	t.Run("other-stage and nil-stage rows ignored -> (0,true)", func(t *testing.T) {
+		au := newRoundSeqAuditFake()
+		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
+		other := uuid.New()
+		appendRetry(au, CategoryStageRetried, &other)      // different stage
+		appendRetry(au, CategoryStageOverrideRetried, nil) // run-wide (nil stage)
+		seq, ok := s.latestStageRetrySequence(ctx, runID, stageID)
+		if seq != 0 || !ok {
+			t.Errorf("got (%d,%v), want (0,true)", seq, ok)
+		}
+	})
+
+	t.Run("list read error -> (0,false)", func(t *testing.T) {
+		au := newRoundSeqAuditFake()
+		au.catErr[CategoryStageRetried] = errors.New("audit: connection reset")
+		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
+		seq, ok := s.latestStageRetrySequence(ctx, runID, stageID)
+		if seq != 0 || ok {
+			t.Errorf("got (%d,%v), want (0,false)", seq, ok)
+		}
+	})
+}
+
+// retryDuringReviewReviewer appends a same-stage stage_retried row while its
+// Review is executing (fire=true), so the retry lands during the review round
+// — the #3593 verdict-time supersession case, seeded by construction.
+type retryDuringReviewReviewer struct {
+	au             *roundSeqAuditFake
+	runID, stageID uuid.UUID
+	verdict        *planreview.ReviewVerdict
+	model          string
+	fire           bool
+}
+
+func (r *retryDuringReviewReviewer) Review(ctx context.Context, _ string) (*planreview.ReviewVerdict, string, error) {
+	if r.fire {
+		sid := r.stageID
+		_, _ = r.au.AppendChained(ctx, audit.ChainAppendParams{
+			RunID:     r.runID,
+			StageID:   &sid,
+			Category:  CategoryStageRetried,
+			Timestamp: time.Now().UTC(),
+		})
+	}
+	return r.verdict, r.model, nil
+}
+
+// TestImplementReview_VerdictAfterRetry_IsSupersededByRetry seeds a retry
+// during the review (constraint B, verdict-build-time arm): the payload is
+// marked SupersededByRetry with the recorded round sequence, the minted concern
+// is superseded, and the verdict's resolutions are NOT applied. A no-retry
+// control decodes false + the round sequence and leaves the concern raised.
+func TestImplementReview_VerdictAfterRetry_IsSupersededByRetry(t *testing.T) {
+	run := func(t *testing.T, fire bool) (planreview.ImplementReviewedPayload, *fakeConcernRepo, uuid.UUID, uuid.UUID, *concern.Concern) {
+		runID, stageID := uuid.New(), uuid.New()
+		au := newRoundSeqAuditFake()
+		cr := newFakeConcernRepo()
+		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au, ConcernRepo: cr})
+
+		// Open the round: append implement_review_started and capture its seq.
+		sid := stageID
+		started, _ := au.AppendChained(context.Background(), audit.ChainAppendParams{
+			RunID: runID, StageID: &sid, Category: "implement_review_started", Timestamp: time.Now().UTC(),
+		})
+		roundSeq := started.Sequence
+
+		// A pre-existing routed concern whose `confirmed` resolution would flip
+		// it addressed IF the verdict were not superseded.
+		routed := seedRoutedConcern(t, cr, runID, stageID, "peer-model", "routed finding", "fix-up landed")
+
+		rev := &retryDuringReviewReviewer{
+			au: au, runID: runID, stageID: stageID, model: "fable-5", fire: fire,
+			verdict: &planreview.ReviewVerdict{
+				Verdict:  planreview.VerdictReject,
+				Concerns: []planreview.Concern{{Severity: planreview.SeverityHigh, Category: "correctness", Note: "reject-finding"}},
+				ConcernResolutions: []planreview.ConcernResolution{
+					{ID: routed.ID.String(), Resolution: "confirmed", Note: "still good"},
+				},
+			},
+		}
+		s.runImplementReviewInvocations(context.Background(), runID, stageID,
+			[]reviewerInvocation{{reviewer: rev}}, planreview.AuthorityAdvisory,
+			"prompt", "author-model", "", "", planreview.DefaultReviewBudget, "", roundSeq)
+
+		return au.implementReviewedPayload(t), cr, runID, stageID, routed
+	}
+
+	// Find the minted reject concern by its note.
+	mintedByNote := func(t *testing.T, cr *fakeConcernRepo, runID uuid.UUID, note string) *concern.Concern {
+		rows, _ := cr.ListByRun(context.Background(), runID)
+		for _, c := range rows {
+			if c.Note == note {
+				return c
+			}
+		}
+		t.Fatalf("minted concern with note %q not found", note)
+		return nil
+	}
+
+	t.Run("retry during review -> superseded", func(t *testing.T) {
+		p, cr, runID, _, routed := run(t, true)
+		if p.ReviewRoundSequence == 0 {
+			t.Errorf("ReviewRoundSequence = 0, want the recorded round seq")
+		}
+		if !p.SupersededByRetry {
+			t.Errorf("SupersededByRetry = false, want true")
+		}
+		minted := mintedByNote(t, cr, runID, "reject-finding")
+		if minted.State != concern.StateSuperseded {
+			t.Errorf("minted concern state = %q, want superseded", minted.State)
+		}
+		// The verdict's `confirmed` resolution must NOT have been applied.
+		if got := concernState(t, cr, routed.ID); got != concern.StateAddressedPending {
+			t.Errorf("routed concern state = %q, want addressed_pending (resolution NOT applied for a superseded verdict)", got)
+		}
+	})
+
+	t.Run("no retry -> not superseded, concern raised", func(t *testing.T) {
+		p, cr, runID, _, _ := run(t, false)
+		if p.SupersededByRetry {
+			t.Errorf("SupersededByRetry = true, want false (no retry landed)")
+		}
+		if p.ReviewRoundSequence == 0 {
+			t.Errorf("ReviewRoundSequence = 0, want the recorded round seq")
+		}
+		minted := mintedByNote(t, cr, runID, "reject-finding")
+		if minted.State != concern.StateRaised {
+			t.Errorf("minted concern state = %q, want raised", minted.State)
+		}
+	})
+}
+
+// hookedConcernRepo appends a same-stage stage_retried row on the FIRST
+// InsertRaised, so the retry lands DURING persistReviewConcerns — after the
+// implement_reviewed payload was already written UNMARKED (the accepted #3593
+// window). It then delegates to the embedded fake.
+type hookedConcernRepo struct {
+	*fakeConcernRepo
+	au             *roundSeqAuditFake
+	runID, stageID uuid.UUID
+	fired          bool
+}
+
+func (h *hookedConcernRepo) InsertRaised(ctx context.Context, p concern.InsertRaisedParams) ([]*concern.Concern, error) {
+	if !h.fired {
+		h.fired = true
+		sid := h.stageID
+		_, _ = h.au.AppendChained(ctx, audit.ChainAppendParams{
+			RunID: h.runID, StageID: &sid, Category: CategoryStageRetried, Timestamp: time.Now().UTC(),
+		})
+	}
+	return h.fakeConcernRepo.InsertRaised(ctx, p)
+}
+
+// TestImplementReview_RetryBetweenPersistAndSweep_ConcernsSuperseded pins the
+// accepted window (constraint B): the retry lands after the payload write but
+// during persistence, so the payload is UNMARKED — yet the post-persist
+// re-check still supersedes the just-minted concern.
+func TestImplementReview_RetryBetweenPersistAndSweep_ConcernsSuperseded(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	au := newRoundSeqAuditFake()
+	base := newFakeConcernRepo()
+	cr := &hookedConcernRepo{fakeConcernRepo: base, au: au, runID: runID, stageID: stageID}
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au, ConcernRepo: cr})
+
+	sid := stageID
+	started, _ := au.AppendChained(context.Background(), audit.ChainAppendParams{
+		RunID: runID, StageID: &sid, Category: "implement_review_started", Timestamp: time.Now().UTC(),
+	})
+	roundSeq := started.Sequence
+
+	rev := &fakePlanReviewer{
+		model: "fable-5",
+		verdict: &planreview.ReviewVerdict{
+			Verdict:  planreview.VerdictReject,
+			Concerns: []planreview.Concern{{Severity: planreview.SeverityHigh, Category: "correctness", Note: "window-finding"}},
+		},
+	}
+	s.runImplementReviewInvocations(context.Background(), runID, stageID,
+		[]reviewerInvocation{{reviewer: rev}}, planreview.AuthorityAdvisory,
+		"prompt", "author-model", "", "", planreview.DefaultReviewBudget, "", roundSeq)
+
+	// The payload is UNMARKED — the retry landed after it was written (the
+	// documented accepted window).
+	p := au.implementReviewedPayload(t)
+	if p.SupersededByRetry {
+		t.Errorf("SupersededByRetry = true, want false (retry landed during persistence — payload stays unmarked)")
+	}
+	if p.ReviewRoundSequence != roundSeq {
+		t.Errorf("ReviewRoundSequence = %d, want %d", p.ReviewRoundSequence, roundSeq)
+	}
+	// The compensating control fired: the concern ends superseded with a reason
+	// naming the retry.
+	rows, _ := base.ListByRun(context.Background(), runID)
+	var minted *concern.Concern
+	for _, c := range rows {
+		if c.Note == "window-finding" {
+			minted = c
+		}
+	}
+	if minted == nil {
+		t.Fatalf("minted concern not found")
+	}
+	if minted.State != concern.StateSuperseded {
+		t.Errorf("minted concern state = %q, want superseded (post-persist re-check)", minted.State)
+	}
+	if !strings.Contains(minted.StateReason, "stage retry") {
+		t.Errorf("minted concern state_reason = %q, want it to name the stage retry", minted.StateReason)
+	}
+}
+
+// TestImplementReview_ReviewRoundSequence_Recorded pins constraint 1(a): a
+// plain approve carries review_round_sequence when roundSeq>0, and OMITS the
+// key entirely at roundSeq 0 (the emit-failure fallback).
+func TestImplementReview_ReviewRoundSequence_Recorded(t *testing.T) {
+	t.Run("roundSeq>0 records the key", func(t *testing.T) {
+		runID, stageID := uuid.New(), uuid.New()
+		au := newRoundSeqAuditFake()
+		cr := newFakeConcernRepo()
+		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au, ConcernRepo: cr})
+		rev := &fakePlanReviewer{model: "fable-5", verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}}
+		s.runImplementReviewInvocations(context.Background(), runID, stageID,
+			[]reviewerInvocation{{reviewer: rev}}, planreview.AuthorityAdvisory,
+			"prompt", "author-model", "", "", planreview.DefaultReviewBudget, "", 4242)
+		p := au.implementReviewedPayload(t)
+		if p.ReviewRoundSequence != 4242 {
+			t.Errorf("ReviewRoundSequence = %d, want 4242", p.ReviewRoundSequence)
+		}
+	})
+
+	t.Run("roundSeq 0 omits the key", func(t *testing.T) {
+		runID, stageID := uuid.New(), uuid.New()
+		au := newRoundSeqAuditFake()
+		cr := newFakeConcernRepo()
+		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au, ConcernRepo: cr})
+		rev := &fakePlanReviewer{model: "fable-5", verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}}
+		s.runImplementReviewInvocations(context.Background(), runID, stageID,
+			[]reviewerInvocation{{reviewer: rev}}, planreview.AuthorityAdvisory,
+			"prompt", "author-model", "", "", planreview.DefaultReviewBudget, "", 0)
+		au.rmu.Lock()
+		var raw []byte
+		for _, e := range au.ents {
+			if e.Category == "implement_reviewed" {
+				raw = e.Payload
+			}
+		}
+		au.rmu.Unlock()
+		if strings.Contains(string(raw), "review_round_sequence") {
+			t.Errorf("review_round_sequence key present at roundSeq 0 — omitempty not honored\npayload: %s", raw)
 		}
 	})
 }

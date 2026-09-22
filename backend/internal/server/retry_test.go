@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -1620,5 +1621,216 @@ func TestRetryStage_SucceededNonAcceptance_Still422(t *testing.T) {
 
 	if w.Code != http.StatusUnprocessableEntity {
 		t.Errorf("status = %d, want 422 (non-acceptance succeeded stage rides the retry path):\n%s", w.Code, w.Body.String())
+	}
+}
+
+// --- #3593: retry supersedes the prior review round's open concerns --------
+
+// (concernState lives in revise_test.go — reused here.)
+
+// TestRetryStage_ImplementRetry_SupersedesOpenConcerns is the #3593 done-means
+// for the retry-time sweep: retrying a failed implement stage supersedes ONLY
+// that stage's OPEN implement-review concerns — a plan-stage concern and an
+// implement concern on a DIFFERENT stage are untouched — and the superseded
+// rows surface in the gate view's settled[] (with the retry reason) and NOT in
+// open[].
+func TestRetryStage_ImplementRetry_SupersedesOpenConcerns(t *testing.T) {
+	rr := newOrchestratorRepo()
+	r := rr.seedRun()
+	r.State = run.StateFailed
+	implement := rr.seedStage(r.ID, 0, run.StageStateFailed)
+	implement.Type = run.StageTypeImplement
+	implement.SelfRetryCount = 1 // the retry reason names ordinal 1
+	cat := run.FailureC
+	reason := "dispatch_watchdog: 70m elapsed"
+	implement.FailureCategory = &cat
+	implement.FailureReason = &reason
+
+	otherStage := rr.seedStage(r.ID, 1, run.StageStateFailed)
+	planStageID := uuid.New()
+
+	cr := newFakeConcernRepo()
+	c1 := seedConcernRow(t, cr, r.ID, implement.ID, concern.StageKindImplement, 10, "impl concern 1")
+	c2 := seedConcernRow(t, cr, r.ID, implement.ID, concern.StageKindImplement, 10, "impl concern 2")
+	c3 := seedConcernRow(t, cr, r.ID, implement.ID, concern.StageKindImplement, 10, "impl concern 3")
+	planC := seedConcernRow(t, cr, r.ID, planStageID, concern.StageKindPlan, 5, "plan concern")
+	otherC := seedConcernRow(t, cr, r.ID, otherStage.ID, concern.StageKindImplement, 7, "other-stage impl concern")
+
+	au := newApprovalAuditFake()
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au, ConcernRepo: cr})
+
+	w := postRetry(t, s, implement.ID)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	// The three same-stage implement concerns are superseded with a reason
+	// naming the retry ordinal.
+	for _, c := range []*concern.Concern{c1, c2, c3} {
+		if got := concernState(t, cr, c.ID); got != concern.StateSuperseded {
+			t.Errorf("concern %s state = %q, want superseded", c.ID, got)
+		}
+		if !strings.Contains(c.StateReason, "stage retry (ordinal 1)") {
+			t.Errorf("concern %s state_reason = %q, want it to name 'stage retry (ordinal 1)'", c.ID, c.StateReason)
+		}
+	}
+	// The plan-stage and other-stage concerns are untouched.
+	if got := concernState(t, cr, planC.ID); got != concern.StateRaised {
+		t.Errorf("plan concern state = %q, want raised (untouched)", got)
+	}
+	if got := concernState(t, cr, otherC.ID); got != concern.StateRaised {
+		t.Errorf("other-stage concern state = %q, want raised (untouched)", got)
+	}
+
+	// Gate-view surface (constraint E): the three appear in settled[] with the
+	// retry reason and are absent from open[].
+	resp := decodeGateView(t, callGateView(s, r.ID, concern.StageKindImplement, gateViewReadIdentity()))
+	settledIDs := map[uuid.UUID]gateViewSettledConcern{}
+	for _, sc := range resp.Settled {
+		settledIDs[sc.ID] = sc
+	}
+	for _, c := range []*concern.Concern{c1, c2, c3} {
+		sc, ok := settledIDs[c.ID]
+		if !ok {
+			t.Errorf("concern %s missing from gate-view settled[]", c.ID)
+			continue
+		}
+		if sc.State != string(concern.StateSuperseded) {
+			t.Errorf("gate-view settled state for %s = %q, want superseded", c.ID, sc.State)
+		}
+		if !strings.Contains(sc.StateReason, "stage retry (ordinal 1)") {
+			t.Errorf("gate-view settled state_reason for %s = %q, want the retry reason", c.ID, sc.StateReason)
+		}
+	}
+	for _, oc := range resp.Open {
+		if oc.ID == c1.ID || oc.ID == c2.ID || oc.ID == c3.ID {
+			t.Errorf("superseded concern %s still present in gate-view open[]", oc.ID)
+		}
+	}
+	// The still-open other-stage implement concern remains in open[].
+	foundOther := false
+	for _, oc := range resp.Open {
+		if oc.ID == otherC.ID {
+			foundOther = true
+		}
+	}
+	if !foundOther {
+		t.Errorf("other-stage open implement concern %s missing from gate-view open[]", otherC.ID)
+	}
+}
+
+// TestRetryStage_BOverride_SupersedesOpenConcerns is the override-path twin:
+// a {override:true} retry of a category-B implement stage supersedes its open
+// implement concerns with the "stage override retry" reason.
+func TestRetryStage_BOverride_SupersedesOpenConcerns(t *testing.T) {
+	rr := newOrchestratorRepo()
+	r := rr.seedRun()
+	r.State = run.StateFailed
+	implement := rr.seedStage(r.ID, 0, run.StageStateFailed)
+	implement.Type = run.StageTypeImplement
+	implement.SelfRetryCount = 1
+	cat := run.FailureB
+	reason := "forbidden_paths: touched .github/workflows"
+	implement.FailureCategory = &cat
+	implement.FailureReason = &reason
+
+	cr := newFakeConcernRepo()
+	c1 := seedConcernRow(t, cr, r.ID, implement.ID, concern.StageKindImplement, 10, "impl concern")
+
+	au := newApprovalAuditFake()
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au, ConcernRepo: cr})
+
+	w := postRetryBody(t, s, implement.ID, `{"override":true,"reason":"forbidden path was a generated file; regenerating"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if got := concernState(t, cr, c1.ID); got != concern.StateSuperseded {
+		t.Errorf("concern state = %q, want superseded", got)
+	}
+	if !strings.Contains(c1.StateReason, "stage override retry (ordinal 1)") {
+		t.Errorf("state_reason = %q, want it to name 'stage override retry (ordinal 1)'", c1.StateReason)
+	}
+}
+
+// TestRetryStage_DTimeoutReopen_LeavesConcernsOpen is the negative gate: a
+// D-timeout re-open lands the stage at awaiting_approval (no new tree), so the
+// pending-re-open gate is false and NO concern is superseded.
+func TestRetryStage_DTimeoutReopen_LeavesConcernsOpen(t *testing.T) {
+	rr := newOrchestratorRepo()
+	r := rr.seedRun()
+	r.State = run.StateFailed
+	implement := rr.seedStage(r.ID, 0, run.StageStateFailed)
+	implement.Type = run.StageTypeImplement
+	implement.SelfRetryCount = 1
+	cat := run.FailureD
+	reason := "sla_timeout: 5h elapsed (deadline 4h)"
+	implement.FailureCategory = &cat
+	implement.FailureReason = &reason
+
+	cr := newFakeConcernRepo()
+	c1 := seedConcernRow(t, cr, r.ID, implement.ID, concern.StageKindImplement, 10, "impl concern 1")
+	c2 := seedConcernRow(t, cr, r.ID, implement.ID, concern.StageKindImplement, 10, "impl concern 2")
+
+	au := newApprovalAuditFake()
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au, ConcernRepo: cr})
+
+	w := postRetry(t, s, implement.ID)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var body stageResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if body.State != string(run.StageStateAwaitingApproval) {
+		t.Fatalf("stage state = %q, want awaiting_approval (D-timeout re-open)", body.State)
+	}
+	for _, c := range []*concern.Concern{c1, c2} {
+		if got := concernState(t, cr, c.ID); got != concern.StateRaised {
+			t.Errorf("concern %s state = %q, want raised (D-timeout supersedes nothing)", c.ID, got)
+		}
+	}
+}
+
+// TestRetryStage_ConcernSupersedeBestEffort proves the supersession is
+// best-effort: an ApplyResolution failure leaves the concern open but the retry
+// still returns 200 and writes the stage_retried audit row.
+func TestRetryStage_ConcernSupersedeBestEffort(t *testing.T) {
+	rr := newOrchestratorRepo()
+	r := rr.seedRun()
+	r.State = run.StateFailed
+	implement := rr.seedStage(r.ID, 0, run.StageStateFailed)
+	implement.Type = run.StageTypeImplement
+	implement.SelfRetryCount = 1
+	cat := run.FailureC
+	reason := "infra flake"
+	implement.FailureCategory = &cat
+	implement.FailureReason = &reason
+
+	cr := newFakeConcernRepo()
+	c1 := seedConcernRow(t, cr, r.ID, implement.ID, concern.StageKindImplement, 10, "impl concern")
+	cr.applyResolutionErr = errors.New("concern store: connection reset")
+
+	au := newApprovalAuditFake()
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au, ConcernRepo: cr})
+
+	w := postRetry(t, s, implement.ID)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (supersession is best-effort):\n%s", w.Code, w.Body.String())
+	}
+	// The concern stays open (ApplyResolution failed) — exactly today's
+	// behavior, never worse.
+	if got := concernState(t, cr, c1.ID); got != concern.StateRaised {
+		t.Errorf("concern state = %q, want raised (ApplyResolution failed)", got)
+	}
+	// The retry still recorded its intent.
+	foundRetry := false
+	for _, e := range au.appended {
+		if e.Category == CategoryStageRetried {
+			foundRetry = true
+		}
+	}
+	if !foundRetry {
+		t.Errorf("no stage_retried audit entry written; retry intent lost")
 	}
 }
