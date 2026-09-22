@@ -17,7 +17,7 @@ import (
 // FuncDecls, TypeSpecs and ValueSpecs), not transcribed, so a drift between
 // an estimate and reality would surface as a test written from the tree.
 //
-// The bulk of these 283 names are tool I/O request/response structs. The MCP
+// The bulk of these 286 names are tool I/O request/response structs. The MCP
 // SDK's jsonschema reflection requires each tool's input/output type — and
 // its fields — to be EXPORTED to build the tool's schema, so unexporting them
 // would break tool registration. In `package main` their exportedness was
@@ -348,6 +348,11 @@ var exportBaseline = []string{
 	"SurfaceSweepFinding",
 	"TestSweep",
 	"TestSweepFinding",
+	// E45.65 / #3579: the fishhawk_validate tool's I/O structs. Exported for
+	// the same SDK-reflection reason as every other tool I/O type here.
+	"ValidateSpecDiagnostic",
+	"ValidateSpecInput",
+	"ValidateSpecOutput",
 	"VerifyRunInput",
 	"VerifyRunOutput",
 	"VouchCommitInput",

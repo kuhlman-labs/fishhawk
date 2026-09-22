@@ -1,14 +1,15 @@
 ---
 name: fishhawk-onboarding
-description: Help me onboard a repo to Fishhawk — first-run readiness and a starter workflow spec via fishhawk_doctor and fishhawk_init.
+description: Help me onboard a repo to Fishhawk — first-run readiness, a starter workflow spec and a pre-commit spec check via fishhawk_doctor, fishhawk_init and fishhawk_validate.
 ---
 
 # Fishhawk onboarding
 
 Use this skill when a connecting repository has no `.fishhawk/workflows.yaml`
 yet, or you are unsure whether it is ready for its first Fishhawk run. It
-walks `fishhawk_doctor` (readiness) then `fishhawk_init` (starter spec) to a
-committed spec and a first run.
+walks `fishhawk_doctor` (readiness), `fishhawk_init` (starter spec) and
+`fishhawk_validate` (the pre-commit spec check) to a committed spec and a
+first run.
 
 ## Step 1 — `fishhawk_doctor`
 
@@ -44,11 +45,27 @@ autonomy preset:
 itself. Write `workflow_yaml` to `target_path` (`.fishhawk/workflows.yaml`) in
 the target repository's working tree.
 
-## Step 3 — Re-verify
+## Step 3 — Validate before committing
 
-Re-run `fishhawk_doctor` until the `spec` rung reports `valid: true`. If it
-still fails, read the `error` field and correct the written spec before
-proceeding.
+Call `fishhawk_validate` with `working_dir` set to the checkout (or pass the
+bytes inline as `workflow_spec`). It runs the same validator
+`fishhawk_start_run` and run creation use, in-process, against the file you
+just wrote. Read the result:
+
+- `valid: false` — read `diagnostics[]` (`kind`, `path`, `workflow`,
+  `stage_index`, `stage`, `message`), correct the file, and call it again
+  until `valid: true`. The validator stops at the first failure, so expect one
+  diagnostic per call.
+- `charter_required_by[]` — each named workflow produces a `grooming_report`
+  and REQUIRES a repository charter at run creation; this verb cannot check
+  that rule, so note it for the operator.
+- `not_checked[]` — what `valid: true` does NOT cover (the charter rule,
+  reviewer model ids, deployment wiring) and where each is checked instead.
+
+`fishhawk_doctor`'s `spec` rung reads the DEFAULT BRANCH and stays
+`unavailable` until the spec is merged — do not loop on it to confirm an
+uncommitted file. Without MCP, `fishhawk validate <path>` is the CLI
+equivalent.
 
 ## Step 4 — Commit and open the PR
 
@@ -59,10 +76,13 @@ the agent proposes, the operator acts.
 
 ## Step 5 — First run
 
-Once the spec is merged, start the first run with `fishhawk_start_run`
-(`runner_kind:local` for a local dogfood loop). For the loop itself — plan,
-approve, dispatch, review, acceptance, merge — read the `fishhawk://runbook`
-resource.
+Once the spec is merged, run `fishhawk_doctor` once more: its `spec` rung now
+reads the merged file and should report `valid: true`, and `reviewers[]`
+carries `model_status` for each declared reviewer — model ids are checked
+only there, never by `fishhawk_validate`. Then start the first run with
+`fishhawk_start_run` (`runner_kind:local` for a local dogfood loop). For the
+loop itself — plan, approve, dispatch, review, acceptance, merge — read the
+`fishhawk://runbook` resource.
 
 ## Install as a project skill
 

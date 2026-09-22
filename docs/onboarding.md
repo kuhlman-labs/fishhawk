@@ -46,7 +46,8 @@ FAILS** (non-zero exit). Every relaxation below is scoped by a positive
 server-side signal — never a blanket softening.
 
 Over MCP, the guided walk through this same preflight is the
-`fishhawk://onboarding-skill` resource (`fishhawk_doctor` → `fishhawk_init`) —
+`fishhawk://onboarding-skill` resource (`fishhawk_doctor` → `fishhawk_init` →
+`fishhawk_validate`, the pre-commit spec check, since #3579) —
 the in-band counterpart to this CLI page, for a client whose agent holds no
 operator memory. See `backend/internal/mcpserver/README.md`.
 

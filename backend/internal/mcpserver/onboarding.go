@@ -40,7 +40,7 @@ Backlog grooming (also separate from the run loop): backlog_grooming is a NON-DI
 
 Read the fishhawk://runbook resource for the full procedure and the edge-case playbook (local-drive dispatch, fixup re-dispatch, failed-run revive, decomposed-parent fan-out (run_children/consolidate_slices), drive_run loop shape, batch-as-campaign local drive (start_campaign/start_campaign_item_run/get_campaign_status), scope amendments, heterogeneous-review waits, post-failure clean-tree, refinement intake loop, backlog grooming loop).
 
-Onboarding a NEW repository (no .fishhawk/workflows.yaml yet): read the fishhawk://onboarding-skill resource — a Claude Code SKILL.md-shaped walk through fishhawk_doctor → fishhawk_init → commit the spec.`
+Onboarding a NEW repository (no .fishhawk/workflows.yaml yet): read the fishhawk://onboarding-skill resource — a Claude Code SKILL.md-shaped walk through fishhawk_doctor → fishhawk_init → fishhawk_validate → commit the spec. Validate BEFORE committing: fishhawk_doctor's spec rung reads the default branch and cannot confirm an uncommitted file.`
 
 // runbookMarkdown is the long-form operator runbook, embedded as a
 // product file so the binary serves it without a filesystem dependency.
@@ -98,7 +98,7 @@ func registerOnboardingResources(srv *mcp.Server) {
 			URI:         onboardingSkillURI,
 			Name:        "fishhawk-onboarding-skill",
 			Title:       "Fishhawk repository onboarding skill",
-			Description: "A Claude Code SKILL.md-shaped walk through fishhawk_doctor → fishhawk_init → committing the spec, for onboarding a repository that has no .fishhawk/workflows.yaml yet.",
+			Description: "A Claude Code SKILL.md-shaped walk through fishhawk_doctor → fishhawk_init → fishhawk_validate → committing the spec, for onboarding a repository that has no .fishhawk/workflows.yaml yet.",
 			MIMEType:    "text/markdown",
 		},
 		func(_ context.Context, _ *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
