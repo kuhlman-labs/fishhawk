@@ -6,10 +6,11 @@
 # low-severity concern) and merge (gates resolved, CI green), so the
 # agent can carry a clean change through to merge.
 #
-# The three presets are ONE shared base plus a single `autonomy:` line.
-# They stay standalone documents on purpose — see
-# docs/spec/workflow-preset.md for that rationale, the per-tier delta
-# table, and the budget derivation.
+# The preset library has two axes: an autonomy axis (low/medium/high)
+# and a shape axis (app/config-only). Within a shape the three tiers are
+# ONE shared base plus a single `autonomy:` line. They stay standalone
+# documents on purpose — see docs/spec/workflow-preset.md for that
+# rationale, the per-shape delta table, and the budget derivation.
 
 version: "2"
 
@@ -164,6 +165,10 @@ workflows:
             # Replace with your repository's test command (run via
             # sh -c after the agent exits). This is optional — remove the
             # whole verify block if your project has no test entrypoint.
+            # For a config- or docs-only repository, scaffold with the
+            # config-only shape instead (fishhawk init --shape config-only,
+            # or fishhawk_init shape=config-only): it drops the verify block
+            # and tests_added_or_updated and raises max_files_changed.
             # This runs in a fresh worktree — gitignored build artifacts
             # and downloaded dependencies will not be present.
             command: "make test"

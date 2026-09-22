@@ -30,9 +30,12 @@ type DoctorOutput struct {
 
 // InitInput is the fishhawk_init tool's input schema (E29.6 / #1506). Preset
 // selects the autonomy tier; it defaults to "medium" (the recommended default)
-// when omitted.
+// when omitted. Shape selects the repository shape; it defaults to "app" when
+// omitted, and is chosen explicitly — never inferred from the working
+// directory.
 type InitInput struct {
 	Preset string `json:"preset,omitempty" jsonschema:"workflow autonomy preset: one of low, medium, high; defaults to medium when omitted"`
+	Shape  string `json:"shape,omitempty" jsonschema:"repository shape: app (a repository with a test entrypoint) or config-only (a config- or docs-only repository with none, dropping the verify block and tests_added_or_updated and raising max_files_changed); defaults to app when omitted"`
 }
 
 // InitOutput carries the starter workflow spec scaffold. The conversational
@@ -42,6 +45,7 @@ type InitInput struct {
 // delta-applying generator lives only in cli/internal/spec).
 type InitOutput struct {
 	Preset       string `json:"preset" jsonschema:"the resolved preset (echoes the default when the input was omitted)"`
+	Shape        string `json:"shape" jsonschema:"the resolved repository shape (echoes app when the input was omitted)"`
 	WorkflowYAML string `json:"workflow_yaml" jsonschema:"the canonical workflow-v2 preset spec bytes to write to the repo"`
 	TargetPath   string `json:"target_path" jsonschema:"the repo-relative path the scaffold should be committed to (.fishhawk/workflows.yaml)"`
 	NextStep     string `json:"next_step" jsonschema:"what to do with the scaffold next: write it, then validate it with fishhawk_validate BEFORE committing (E45.65 / #3579)"`
@@ -188,13 +192,25 @@ scaffolds are one shared base plus a single ` + "`autonomy:`" + ` line:
   - high   — adds waive (solo low-severity concern) and merge (gates resolved,
              CI green) on top of medium.
 
-preset defaults to medium when omitted. This tool is PRESET-ONLY: it returns the
-scaffold bytes for the conversational agent to write to target_path
-(.fishhawk/workflows.yaml) — it writes no file itself, and the delta options
-(budget / single-reviewer / human-gates) plus the AGENTS.md/CLAUDE.md bridge the
-CLI performs are a follow-up. Run fishhawk_doctor first to see whether a spec is
-already present. An unknown preset returns a clean tool error naming the valid
-tiers. The output's next_step says what follows: write the bytes, then call
+preset defaults to medium when omitted. The library also has a SHAPE axis,
+selected by the optional shape input and chosen EXPLICITLY — never inferred from
+the working directory:
+
+  - app         — the default: a repository with a test entrypoint. The
+                  implement stage runs an execution-grounded verifier and
+                  requires tests to be added.
+  - config-only — a config- or docs-only repository with no test entrypoint:
+                  the implement stage omits the verifier (a commented starter
+                  only), drops tests_added_or_updated, keeps ci_green and raises
+                  max_files_changed so a docs reorganisation fits.
+
+shape defaults to app when omitted; the output echoes the resolved shape. This
+tool is PRESET-ONLY: it returns the scaffold bytes for the conversational agent
+to write to target_path (.fishhawk/workflows.yaml) — it writes no file itself,
+and the delta options (budget / single-reviewer / human-gates) plus the
+AGENTS.md/CLAUDE.md bridge the CLI performs are a follow-up. Run fishhawk_doctor
+first to see whether a spec is already present. An unknown preset or shape
+returns a clean tool error naming the valid values. The output's next_step says what follows: write the bytes, then call
 fishhawk_validate on them BEFORE committing — fishhawk_doctor's spec rung reads
 the DEFAULT BRANCH, so it cannot confirm an uncommitted file. Read
 fishhawk://onboarding-skill for the full walk (doctor → init → validate →
@@ -256,12 +272,20 @@ func (*runResolver) init(_ context.Context, _ *mcp.CallToolRequest, in InitInput
 	if preset == "" {
 		preset = string(spec.PresetMedium)
 	}
-	data, err := spec.PresetBytes(spec.Preset(preset))
+	shape := strings.TrimSpace(in.Shape)
+	if shape == "" {
+		shape = string(spec.ShapeApp)
+	}
+	if shape != string(spec.ShapeApp) && shape != string(spec.ShapeConfigOnly) {
+		return nil, InitOutput{}, fmt.Errorf("unknown shape %q: want one of app, config-only", shape)
+	}
+	data, err := spec.PresetShapeBytes(spec.Preset(preset), spec.Shape(shape))
 	if err != nil {
 		return nil, InitOutput{}, fmt.Errorf("unknown preset %q: want one of low, medium, high", preset)
 	}
 	return nil, InitOutput{
 		Preset:       preset,
+		Shape:        shape,
 		WorkflowYAML: string(data),
 		TargetPath:   specFileName,
 		NextStep:     initNextStep,

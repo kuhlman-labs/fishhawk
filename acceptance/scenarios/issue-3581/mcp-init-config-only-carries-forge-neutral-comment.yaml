@@ -1,0 +1,14 @@
+id: scenario:issue-3581/mcp-init-config-only-carries-forge-neutral-comment
+statement: Calling fishhawk_init with shape=config-only returns a workflow_yaml whose text contains BOTH `github_issue names the issue-ANCHORED input, not the forge` and `No gitlab_issue member exists` — the load-bearing forge-neutral input comment survives the shape variant, for each of the low, medium and high tiers.
+verify_hint: 'MCP tool result: call fishhawk_init {preset: <tier>, shape: config-only} for low, medium and high and search the returned workflow_yaml text for both literal phrases.'
+steps: 'POST http://localhost:8090/mcp tools/call fishhawk_init {preset: <tier>, shape: config-only} for low, medium, high; grep -c each returned workflow_yaml for the literal phrases ''github_issue names the issue-ANCHORED input, not the forge'' and ''No gitlab_issue member exists''. Also checked the three app-shape outputs.'
+assertions:
+    expected: Both phrases present in each tier's config-only workflow_yaml.
+    observed_at_record: low/config-only 1 and 1; medium/config-only 1 and 1; high/config-only 1 and 1 (app variants also 1 and 1 each).
+    repro_handle: POST /mcp tools/call fishhawk_init {"preset":"<tier>","shape":"config-only"} | jq -r .result.structuredContent.workflow_yaml | grep -c 'github_issue names the issue-ANCHORED input, not the forge'
+origin:
+    issue: 3581
+    pr: 3592
+    run_id: bed3f1d8-28ba-4cb8-885b-63df045c22cd
+    head_sha: 172d6e5f3803e142811069b039326d8a2f2537c0
+    recorded_at: 2026-09-22T08:21:54Z

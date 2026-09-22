@@ -34,7 +34,7 @@ Without a GitHub App configured, the OAuth and webhook endpoints respond 503 —
 
 ### A sample workflow
 
-Fishhawk reads `.fishhawk/workflows.yaml` from the repository it governs. `fishhawk init` scaffolds one from an autonomy preset (`--preset low|medium|high`); the trimmed `feature_change` workflow below shows the plan → implement → review shape most work uses, and validates as-is with `fishhawk validate`:
+Fishhawk reads `.fishhawk/workflows.yaml` from the repository it governs. `fishhawk init` scaffolds one from an autonomy preset (`--preset low|medium|high`) and a repository shape (`--shape app|config-only`, where `config-only` seeds a config- or docs-only repository with no test entrypoint); the trimmed `feature_change` workflow below shows the plan → implement → review shape most work uses, and validates as-is with `fishhawk validate`:
 
 ```yaml
 version: "1.0"

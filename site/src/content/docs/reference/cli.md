@@ -180,7 +180,7 @@ Flags: `--backend-url`, `--token`, `--timeout`, `--interval`, `--output`, `--o`,
 
 #### `fishhawk init`
 
-Flags: `--backend-url`, `--token`, `--timeout`, `--preset`, `--working-dir`, `--budget-usd`, `--single-reviewer`, `--human-gates`, `--force`, `--repo`
+Flags: `--backend-url`, `--token`, `--timeout`, `--preset`, `--shape`, `--working-dir`, `--budget-usd`, `--single-reviewer`, `--human-gates`, `--force`, `--repo`
 
 #### `fishhawk validate`
 

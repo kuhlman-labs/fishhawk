@@ -36,6 +36,7 @@ func runInit(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	cf := bindCommonFlags(fs)
 	presetFlag := fs.String("preset", "medium", "autonomy preset: low | medium | high")
+	shapeFlag := fs.String("shape", "app", "repository shape: app | config-only")
 	workingDir := fs.String("working-dir", ".", "directory to scaffold (walks up to the .git boundary for the repo root)")
 	budgetUSD := fs.Int("budget-usd", 0, "override the feature_change weekly advisory cost ceiling (budgets[0].limit_usd)")
 	singleReviewer := fs.Bool("single-reviewer", false, "drop the Codex agent reviewer, leaving Claude alone on every stage")
@@ -43,7 +44,7 @@ func runInit(args []string, stdout, stderr io.Writer) int {
 	force := fs.Bool("force", false, "overwrite an existing .fishhawk/workflows.yaml")
 	repo := fs.String("repo", "", "target repo owner/name for the checklist and doctor preflight; auto-detected from git origin when empty")
 	fs.Usage = func() {
-		_, _ = fmt.Fprintln(stderr, "Usage: fishhawk init [--preset low|medium|high] [--working-dir D] [flags]")
+		_, _ = fmt.Fprintln(stderr, "Usage: fishhawk init [--preset low|medium|high] [--shape app|config-only] [--working-dir D] [flags]")
 		_, _ = fmt.Fprintln(stderr, "")
 		_, _ = fmt.Fprintln(stderr, "Scaffold a repo for Fishhawk: write .fishhawk/workflows.yaml from an")
 		_, _ = fmt.Fprintln(stderr, "autonomy preset, ensure the AGENTS.md + CLAUDE.md bridge, print the")
@@ -57,6 +58,12 @@ func runInit(args []string, stdout, stderr io.Writer) int {
 	preset, ok := parsePreset(*presetFlag)
 	if !ok {
 		_, _ = fmt.Fprintf(stderr, "fishhawk init: unknown --preset %q (want one of low, medium, high)\n", *presetFlag)
+		return exitUsage
+	}
+
+	shape, ok := parseShape(*shapeFlag)
+	if !ok {
+		_, _ = fmt.Fprintf(stderr, "fishhawk init: unknown --shape %q (want one of app, config-only)\n", *shapeFlag)
 		return exitUsage
 	}
 
@@ -81,6 +88,7 @@ func runInit(args []string, stdout, stderr io.Writer) int {
 	}
 
 	var deltas spec.Deltas
+	deltas.Shape = shape
 	if setFlags["budget-usd"] {
 		v := *budgetUSD
 		deltas.BudgetLimitUSD = &v
@@ -104,7 +112,7 @@ func runInit(args []string, stdout, stderr io.Writer) int {
 		_, _ = fmt.Fprintf(stderr, "fishhawk init: write spec: %v\n", err)
 		return exitFailure
 	}
-	_, _ = fmt.Fprintf(stdout, "wrote %s (preset: %s)\n", specPath, preset)
+	_, _ = fmt.Fprintf(stdout, "wrote %s (preset: %s, shape: %s)\n", specPath, preset, shape)
 
 	// Instruction files: AGENTS.md managed block + CLAUDE.md @AGENTS.md import.
 	res, err := bridge.EnsureAgentDocs(root)
@@ -142,6 +150,16 @@ func parsePreset(s string) (spec.Preset, bool) {
 	switch spec.Preset(s) {
 	case spec.PresetLow, spec.PresetMedium, spec.PresetHigh:
 		return spec.Preset(s), true
+	}
+	return "", false
+}
+
+// parseShape maps a shape flag value to a spec.Shape, reporting whether
+// it names one of the two known repository shapes.
+func parseShape(s string) (spec.Shape, bool) {
+	switch spec.Shape(s) {
+	case spec.ShapeApp, spec.ShapeConfigOnly:
+		return spec.Shape(s), true
 	}
 	return "", false
 }

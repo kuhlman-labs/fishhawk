@@ -290,9 +290,9 @@ CLAUDE.md), prints the out-of-band prerequisites it cannot perform, and runs the
 `doctor` preflight above as a closing step.
 
 ```
-fishhawk init [--preset low|medium|high] [--working-dir D] \
-              [--budget-usd N] [--single-reviewer] [--human-gates ids] \
-              [--force] [--repo owner/name]
+fishhawk init [--preset low|medium|high] [--shape app|config-only] \
+              [--working-dir D] [--budget-usd N] [--single-reviewer] \
+              [--human-gates ids] [--force] [--repo owner/name]
 ```
 
 ### What it does
@@ -301,9 +301,13 @@ fishhawk init [--preset low|medium|high] [--working-dir D] \
    directory containing `.git` (falling back to `--working-dir` when no `.git`
    is found), then targets `<root>/.fishhawk/workflows.yaml`.
 2. **Writes the workflow spec** from the chosen `--preset` (default `medium`)
-   plus optional structured deltas, reusing the E29.1 preset generator — which
-   validates its own output and fails closed on a delta that would break schema
-   validity:
+   and `--shape` (default `app`) plus optional structured deltas, reusing the
+   E29.1 preset generator — which validates its own output and fails closed on
+   a delta that would break schema validity:
+   - `--shape config-only` selects the config- or docs-only base document (no
+     test entrypoint): the implement stage omits `verify`, drops
+     `tests_added_or_updated`, keeps `ci_green` and raises `max_files_changed`.
+     Shape is chosen explicitly, never inferred from the working directory.
    - `--budget-usd N` overrides the `feature_change` weekly advisory cost
      ceiling (`budgets[0].limit_usd`).
    - `--single-reviewer` drops the Codex agent reviewer, leaving Claude alone

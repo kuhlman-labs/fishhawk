@@ -221,6 +221,12 @@ judgment the operator agent may exercise on your behalf:
   conditions; waiving a reviewer concern and merging stay yours.
 - `high` adds waive and merge to that set.
 
+There is a second choice alongside the tier: the repository shape, set with
+`--shape`. The default `app` assumes a test entrypoint. A config- or docs-only
+repository has none, so pass `--shape config-only`: the `implement` stage then
+omits the verify command, drops the tests-added requirement, keeps the merge
+CI check, and raises the changed-files cap so a docs reorganisation fits.
+
 This walkthrough uses `medium`, which is the shipped default and the tier the
 rest of this page's gate sequence assumes:
 

@@ -53,6 +53,17 @@ autonomy preset:
 - **high** — adds waive (solo low-severity concern) and merge (gates
   resolved, CI green) on top of medium.
 
+Also choose the `shape` — this is a deliberate choice, not something to infer
+from the working directory:
+
+- **app** (the default) — a repository with a test entrypoint. The implement
+  stage runs an execution-grounded verifier and requires tests to be added.
+- **config-only** — a config- or docs-only repository with no test entrypoint.
+  Pick this when there is no test command to run: the implement stage omits the
+  verifier, drops `tests_added_or_updated`, keeps `ci_green` and raises
+  `max_files_changed` so a docs reorganisation fits. The output echoes the
+  resolved `shape`.
+
 `fishhawk_init` returns `workflow_yaml` and `target_path` — it writes nothing
 itself. Write `workflow_yaml` to `target_path` (`.fishhawk/workflows.yaml`) in
 the target repository's working tree.
