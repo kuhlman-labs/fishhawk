@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"sort"
 	"strings"
@@ -13,7 +14,9 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mergegate"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/modeloracle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
+	"github.com/kuhlman-labs/fishhawk/pricing"
 )
 
 // requiredRunScopes is the run-driving subset of operatorDefaultScopes
@@ -88,14 +91,42 @@ type specReadiness struct {
 }
 
 // reviewerReadiness reports one spec-declared reviewer's availability on this
-// deployment. Available mirrors the ReviewerSet.For probe the run-create path
-// performs; MissingHint carries the adapter's missing-env-var hint when the
-// provider cannot be resolved.
+// deployment.
+//
+// Available means the provider is wired on this deployment AND the reviewer's
+// resolved model was not AUTHORITATIVELY rejected. It does NOT assert the model
+// is served when ModelStatus is "unverifiable" (no live snapshot to check
+// against) — read ModelStatus for that.
+//
+// ModelStatus is the model-id verdict (#3578): "verified" (present in a fresh
+// snapshot), "rejected" (authoritatively absent), or "unverifiable" (no
+// authoritative snapshot — nil oracle, stale, or none for the provider). It is
+// computed from the RESOLVED model — the explicit spec value, or the deployment
+// default when the spec omits the model — so an omitted default is judged
+// exactly as an explicit one (condition 2). Empty only when no reviewer backend
+// is wired for the provider, or the wired set does not expose the resolved
+// default id.
+//
+// ModelHint is the human sentence for a non-verified status: the did-you-mean
+// rejection text for "rejected", or the "passed to the vendor verbatim" warning
+// for "unverifiable"; it also carries the unpriced $0 note when Priced is false.
+//
+// Priced reports whether the pricing table knows the model's family, so an
+// unpriced id is flagged rather than silently booking usage at $0. It is a
+// POINTER with three states: nil (not computed — no reviewer backend wired for
+// the provider, or the resolved default id is unavailable), &true (priced),
+// &false (unpriced).
+//
+// MissingHint carries the adapter's missing-env-var hint when the provider
+// cannot be resolved at all; it stays separate from ModelHint.
 type reviewerReadiness struct {
 	Provider        string `json:"provider"`
 	Model           string `json:"model,omitempty"`
 	ReasoningEffort string `json:"reasoning_effort,omitempty"`
 	Available       bool   `json:"available"`
+	ModelStatus     string `json:"model_status,omitempty"`
+	ModelHint       string `json:"model_hint,omitempty"`
+	Priced          *bool  `json:"priced,omitempty"`
 	MissingHint     string `json:"missing_hint,omitempty"`
 }
 
@@ -501,11 +532,33 @@ func (s *Server) probeGitLab(ctx context.Context, repo string, ref forge.RepoRef
 	return app, sp, parsed
 }
 
-// probeReviewers runs readiness check (3): per-reviewer availability, only
-// when the spec parsed + validated cleanly (a nil parsed yields the empty,
-// non-null list). Reuses the ReviewerSet.For probe unavailableSpecReviewers
-// performs and surfaces the adapter's missing-env-var hint verbatim.
-func (s *Server) probeReviewers(parsed *spec.Spec) []reviewerReadiness {
+// probeReviewers runs readiness check (3): per-reviewer availability plus the
+// model-validity honesty fields (#3578), only when the spec parsed + validated
+// cleanly (a nil parsed yields the empty, non-null list). It reuses the
+// ReviewerSet.For probe unavailableSpecReviewers performs, then makes the
+// residual honest:
+//
+//   - The For() probe now REJECTS a reviewer whose resolved model — the spec
+//     value OR the deployment default when the spec omitted one — is
+//     authoritatively absent from a fresh snapshot. A rejection arrives as a
+//     modeloracle.RejectedError wrapping the verdict, so this rung recovers the
+//     RESOLVED model, marks ModelStatus=rejected, forces Available=false, and
+//     surfaces the did-you-mean plus the unpriced note — for a bad DEFAULT
+//     exactly as for a bad explicit model.
+//   - When the reviewer resolves and the spec named an EXPLICIT model, the model
+//     is verified directly against the oracle so ModelStatus reflects
+//     verified/unverifiable and Priced flags an unknown pricing family.
+//   - When the reviewer resolves and the spec OMITTED the model, the resolved
+//     deployment default (recovered via reviewerModelDefaulter) is verified the
+//     same way, so an unverifiable or unpriced default is flagged rather than
+//     rendering a bare "ok" (condition 2 / #3578). Only when the wired set does
+//     not expose the default do ModelStatus/Priced stay unset ("not computed").
+//
+// The success-path verification is a SECOND read of the oracle after For()'s:
+// if the snapshot flips to authoritative absence between them, annotateReviewerModel
+// forces Available=false with the did-you-mean, so a TOCTOU rejection never
+// renders "ok".
+func (s *Server) probeReviewers(ctx context.Context, parsed *spec.Spec) []reviewerReadiness {
 	out := []reviewerReadiness{}
 	if parsed == nil {
 		return out
@@ -518,14 +571,122 @@ func (s *Server) probeReviewers(parsed *spec.Spec) []reviewerReadiness {
 		}
 		if s.cfg.PlanReviewers == nil {
 			rr.MissingHint = "no reviewer backend is wired on this deployment; set FISHHAWKD_ANTHROPIC_API_KEY, FISHHAWKD_ENABLE_LOCAL_CLAUDE_REVIEWER, or FISHHAWKD_ENABLE_CODEX_REVIEWER"
-		} else if _, err := s.cfg.PlanReviewers.For(rv.Provider, rv.Model, rv.ReasoningEffort); err != nil {
-			rr.MissingHint = err.Error()
-		} else {
+			out = append(out, rr)
+			continue
+		}
+		_, err := s.cfg.PlanReviewers.For(rv.Provider, rv.Model, rv.ReasoningEffort)
+		if err == nil {
 			rr.Available = true
+			// Compute the honesty fields against the id that will ACTUALLY run:
+			// the EXPLICIT spec model, or — when the spec omitted it — the
+			// resolved deployment default (condition 2). Only a set that does not
+			// expose its default leaves the id unknown, keeping the "not computed"
+			// state. annotateReviewerModel re-verifies, so a snapshot that flipped
+			// to authoritative absence since For() lands as unavailable+rejected.
+			model := rv.Model
+			if model == "" {
+				if d, ok := s.resolvedReviewerDefault(rv.Provider); ok {
+					model = d
+				}
+			}
+			if model != "" {
+				s.annotateReviewerModel(ctx, &rr, rv.Provider, model)
+			}
+			out = append(out, rr)
+			continue
+		}
+		rr.MissingHint = err.Error()
+		// A model rejection (the resolved model — explicit or the deployment
+		// default — is authoritatively absent) is distinct from an unconfigured
+		// provider: surface it as rejected with the did-you-mean and force
+		// Available=false. The wrapped verdict carries the RESOLVED model, so
+		// this works for an omitted default too (condition 2).
+		var rejected modeloracle.RejectedError
+		if errors.As(err, &rejected) {
+			rr.ModelStatus = string(modeloracle.ModelRejected)
+			rr.ModelHint = rejected.Verdict.RejectMessage()
+			priced := modelPriced(rejected.Verdict.Model)
+			rr.Priced = &priced
+			if !priced {
+				rr.ModelHint = appendUnpricedNote(rr.ModelHint)
+			}
 		}
 		out = append(out, rr)
 	}
 	return out
+}
+
+// annotateReviewerModel sets the model-validity honesty fields for a reviewer
+// whose model resolved through For() (the explicit spec value, or the resolved
+// deployment default when the spec omitted it), from the deployment's snapshot
+// oracle and the pricing table (#3578).
+//
+// This is a SECOND oracle read after For()'s own verification. Normally it
+// reports verified/unverifiable, but the snapshot can flip to authoritative
+// absence between the two reads (a background refresh): a ModelRejected verdict
+// here is that TOCTOU case, so it forces Available=false and surfaces the
+// did-you-mean, mirroring the For()-error path so a second-read rejection never
+// renders "ok". A verified id is still flagged when the pricing table does not
+// know its family.
+func (s *Server) annotateReviewerModel(ctx context.Context, rr *reviewerReadiness, provider, model string) {
+	v := modeloracle.Verify(ctx, s.cfg.ModelOracle, provider, model)
+	rr.ModelStatus = string(v.Status)
+	switch v.Status {
+	case modeloracle.ModelRejected:
+		// Snapshot flipped to authoritative absence since For() accepted it.
+		rr.Available = false
+		rr.ModelHint = v.RejectMessage()
+	case modeloracle.ModelUnverifiable:
+		rr.ModelHint = fmt.Sprintf("model %q could not be verified against a live model snapshot for provider %q; it is passed to the vendor verbatim and a typo fails at review time", model, provider)
+	}
+	priced := modelPriced(model)
+	rr.Priced = &priced
+	if !priced {
+		rr.ModelHint = appendUnpricedNote(rr.ModelHint)
+	}
+}
+
+// reviewerModelDefaulter is OPTIONALLY implemented by a ReviewerSet to report
+// the deployment default model For() resolves for a provider when the spec omits
+// the reviewer model. The readiness rung uses it to compute the model-id honesty
+// fields against the id that will ACTUALLY run (condition 2 / #3578): without it
+// an unverifiable or unpriced deployment default would render a bare "ok". A set
+// that does not implement it — or whose default is unset — keeps the honest "not
+// computed" state.
+type reviewerModelDefaulter interface {
+	ResolvedReviewerModel(provider string) (string, bool)
+}
+
+// resolvedReviewerDefault returns the deployment default model for provider (the
+// id For() resolves for an omitted spec model) when the wired ReviewerSet
+// exposes it and the default is non-empty; absent otherwise.
+func (s *Server) resolvedReviewerDefault(provider string) (string, bool) {
+	d, ok := s.cfg.PlanReviewers.(reviewerModelDefaulter)
+	if !ok {
+		return "", false
+	}
+	model, ok := d.ResolvedReviewerModel(provider)
+	if !ok || model == "" {
+		return "", false
+	}
+	return model, true
+}
+
+// modelPriced reports whether the shared pricing table knows the model's family,
+// so an unpriced id can be flagged rather than silently recorded at $0.
+func modelPriced(model string) bool {
+	_, ok := pricing.Cost(model, 1, 1)
+	return ok
+}
+
+// appendUnpricedNote appends the $0-estimate warning to an existing model hint,
+// joining with "; " when the hint already carries text.
+func appendUnpricedNote(hint string) string {
+	const note = "unpriced: usage under this model is recorded at $0 (estimated)"
+	if hint == "" {
+		return note
+	}
+	return hint + "; " + note
 }
 
 // probeScopes runs readiness check (4): caller-token scope adequacy against
@@ -685,7 +846,7 @@ func (s *Server) handleGetOnboardingReadiness(w http.ResponseWriter, r *http.Req
 	}
 
 	// (3) Per-reviewer availability, (4) caller-token scope adequacy.
-	resp.Reviewers = s.probeReviewers(parsedSpec)
+	resp.Reviewers = s.probeReviewers(r.Context(), parsedSpec)
 	resp.Scopes = probeScopes(ident)
 
 	s.writeJSON(w, r, http.StatusOK, resp)

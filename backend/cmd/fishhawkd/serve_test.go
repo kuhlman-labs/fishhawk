@@ -1296,6 +1296,181 @@ func TestBuildModelProviders(t *testing.T) {
 	})
 }
 
+// stubFetcher is an in-memory modeloracle.Fetcher (no network) for the
+// newModelOracle wiring tests.
+type stubFetcher struct{ ids []string }
+
+func (f stubFetcher) Fetch(_ context.Context) ([]string, error) {
+	return append([]string(nil), f.ids...), nil
+}
+
+// TestNewModelOracle_AnthropicAliasesClaudecode pins the single-cell wiring
+// (#3578): with FISHHAWKD_MODEL_BASE_URL empty, newModelOracle aliases the
+// `anthropic` provider key to the `claudecode` snapshot, so a reviewer declared
+// provider: anthropic is validated against the claudecode served-model set.
+// Deleting the WithAlias arm turns this RED (Snapshot(anthropic) → ok=false).
+func TestNewModelOracle_AnthropicAliasesClaudecode(t *testing.T) {
+	providers := map[string]modeloracle.Fetcher{"claudecode": stubFetcher{ids: []string{"claude-opus-4-8", "claude-sonnet-4-6"}}}
+	o := newModelOracle(providers, "", "", 24*time.Hour, slog.Default())
+	o.Refresh(context.Background())
+
+	models, fresh, ok := o.Snapshot(context.Background(), "anthropic")
+	if !ok || !fresh {
+		t.Fatalf("Snapshot(anthropic) fresh=%v ok=%v, want both true (aliased to claudecode)", fresh, ok)
+	}
+	found := false
+	for _, m := range models {
+		if m == "claude-opus-4-8" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("aliased models = %v, want the claudecode set", models)
+	}
+}
+
+// TestNewModelOracle_RegionRegistersSeparateAnthropicFetcher pins binding
+// condition (1): when FISHHAWKD_MODEL_BASE_URL is SET, the anthropic reviewer
+// hits its own region endpoint, so newModelOracle registers a SEPARATE anthropic
+// fetcher against that endpoint (NOT an alias) and the reviewer is verified
+// against the REGIONAL served set — which here differs from the default
+// claudecode set. A model served only by the region endpoint verifies; a model
+// served only by the default endpoint is rejected for the anthropic reviewer.
+func TestNewModelOracle_RegionRegistersSeparateAnthropicFetcher(t *testing.T) {
+	// Region endpoint serves a DIFFERENT model set than the default claudecode
+	// fetcher below.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"data":[{"id":"regional-model","type":"model"}],"has_more":false}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	providers := map[string]modeloracle.Fetcher{"claudecode": stubFetcher{ids: []string{"default-model"}}}
+	o := newModelOracle(providers, srv.URL, "region-key", 24*time.Hour, slog.Default(), srv.Client())
+	o.Refresh(context.Background())
+
+	// The anthropic snapshot is the REGIONAL set, not the default one, and NOT
+	// aliased to claudecode.
+	anthModels, fresh, ok := o.Snapshot(context.Background(), "anthropic")
+	if !ok || !fresh || len(anthModels) != 1 || anthModels[0] != "regional-model" {
+		t.Fatalf("Snapshot(anthropic) = (%v,%v,%v), want the regional [regional-model] set", anthModels, fresh, ok)
+	}
+	if def, _, _ := o.Snapshot(context.Background(), "claudecode"); len(def) != 1 || def[0] != "default-model" {
+		t.Fatalf("Snapshot(claudecode) = %v, want the unchanged [default-model] set", def)
+	}
+
+	// The reviewer set is verified against the REGIONAL set: the region model
+	// resolves, the default-only model is rejected for the anthropic reviewer.
+	set := &planReviewerSet{opts: planReviewerOptions{
+		anthropicAPIKey: "sk-key", modelBaseURL: srv.URL, modelAPIKey: "region-key", modelOracle: o,
+	}}
+	if _, err := set.For("anthropic", "regional-model"); err != nil {
+		t.Errorf("For(anthropic, regional-model) = %v, want nil (served by the region endpoint)", err)
+	}
+	if _, err := set.For("anthropic", "default-model"); err == nil {
+		t.Error("For(anthropic, default-model) = nil, want a rejection (absent from the region set)")
+	}
+}
+
+// TestPlanReviewerSet_For_RejectsModelAbsentFromFreshSnapshot pins the core
+// control (#3578): For() rejects a reviewer whose model is authoritatively
+// absent from a fresh snapshot, on all three provider branches, with the
+// did-you-mean / available message. Deleting the verifyModel/ModelRejected arm
+// turns this RED.
+func TestPlanReviewerSet_For_RejectsModelAbsentFromFreshSnapshot(t *testing.T) {
+	oracle := modeloracle.Static{
+		Models: map[string][]string{
+			"claudecode": {"claude-opus-4-8"},
+			"codex":      {"gpt-5.5"},
+		},
+		Fresh: true,
+	}
+	// anthropic is aliased to claudecode in the single-cell posture; model the
+	// oracle keys under "claudecode" and register the anthropic entry too so the
+	// Static fixture answers the anthropic branch directly.
+	oracle.Models["anthropic"] = []string{"claude-opus-4-8"}
+
+	set := &planReviewerSet{opts: planReviewerOptions{
+		anthropicAPIKey:           "sk-key",
+		planReviewModel:           "claude-opus-4-8",
+		enableLocalClaudeReviewer: true,
+		localClaudeModel:          "claude-opus-4-8",
+		enableCodexReviewer:       true,
+		codexModel:                "gpt-5.5",
+		modelOracle:               oracle,
+	}}
+
+	for _, tc := range []struct{ provider, model string }{
+		{"anthropic", "claude-fable-5-1"},
+		{"codex", "gpt-nope"},
+		{"claudecode", "claude-opus-4-9"},
+	} {
+		t.Run(tc.provider, func(t *testing.T) {
+			_, err := set.For(tc.provider, tc.model)
+			if err == nil {
+				t.Fatalf("For(%s, %s) = nil, want a rejection", tc.provider, tc.model)
+			}
+			if !strings.Contains(err.Error(), tc.model) || !strings.Contains(err.Error(), "available:") {
+				t.Errorf("error %q does not name the model and available set", err.Error())
+			}
+		})
+	}
+}
+
+// TestPlanReviewerSet_For_VerifiesResolvedDefaultModel pins binding condition
+// (2): when the spec OMITS the model, For() verifies the RESOLVED deployment
+// default. A bad default rejects; a good default resolves.
+func TestPlanReviewerSet_For_VerifiesResolvedDefaultModel(t *testing.T) {
+	oracle := modeloracle.Static{Models: map[string][]string{"claudecode": {"claude-opus-4-8"}}, Fresh: true}
+
+	t.Run("bad default rejects", func(t *testing.T) {
+		set := &planReviewerSet{opts: planReviewerOptions{
+			enableLocalClaudeReviewer: true,
+			localClaudeModel:          "claude-typo-9", // deployment default absent from the fresh set
+			modelOracle:               oracle,
+		}}
+		if _, err := set.For("claudecode", ""); err == nil {
+			t.Fatal("For(claudecode, \"\") = nil, want the resolved default to be rejected")
+		}
+	})
+
+	t.Run("good default resolves", func(t *testing.T) {
+		set := &planReviewerSet{opts: planReviewerOptions{
+			enableLocalClaudeReviewer: true,
+			localClaudeModel:          "claude-opus-4-8",
+			modelOracle:               oracle,
+		}}
+		if _, err := set.For("claudecode", ""); err != nil {
+			t.Fatalf("For(claudecode, \"\") = %v, want nil (default is served)", err)
+		}
+	})
+}
+
+// TestPlanReviewerSet_For_FailsOpenWhenUnverifiable pins the three fail-open
+// modes: a nil oracle, a stale snapshot, and a provider with no snapshot each
+// resolve the adapter with a nil error — the model can't be authoritatively
+// rejected, so the reviewer proceeds (byte-identical to pre-#3578).
+func TestPlanReviewerSet_For_FailsOpenWhenUnverifiable(t *testing.T) {
+	base := planReviewerOptions{enableLocalClaudeReviewer: true, localClaudeModel: "claude-opus-4-8"}
+	for _, tc := range []struct {
+		name   string
+		oracle modeloracle.ModelOracle
+	}{
+		{"nil oracle", nil},
+		{"stale snapshot", modeloracle.Static{Models: map[string][]string{"claudecode": {"other"}}, Fresh: false}},
+		{"no snapshot for provider", modeloracle.Static{Models: map[string][]string{"codex": {"gpt-5.5"}}, Fresh: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := base
+			opts.modelOracle = tc.oracle
+			set := &planReviewerSet{opts: opts}
+			if rv, err := set.For("claudecode", "claude-anything"); err != nil || rv == nil {
+				t.Fatalf("For = (%v, %v), want a non-nil adapter and nil error (fail-open)", rv, err)
+			}
+		})
+	}
+}
+
 // resolveModelsFlags mirrors runServe's --models-refresh-interval /
 // --models-staleness-threshold flag wiring (#1341) so the duration defaults
 // (12h refresh / 24h staleness) are unit-testable without booting the server —

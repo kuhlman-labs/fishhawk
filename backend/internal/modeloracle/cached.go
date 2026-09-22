@@ -40,12 +40,19 @@ type Cached struct {
 	now       func() time.Time
 	logger    *slog.Logger
 
+	// aliases maps an ALIAS provider key to the CANONICAL key whose snapshot it
+	// shares. Resolved at Snapshot time BEFORE the snapshot lookup, so an alias
+	// answers exactly what its canonical does. Refresh never reads it — one fetch
+	// per registered Fetcher, never per alias — so an alias adds no network call.
+	// Nil until WithAlias is applied.
+	aliases map[string]string
+
 	mu        sync.RWMutex
 	snapshots map[string]providerSnapshot
 }
 
-// CachedOption customizes a Cached at construction. Today only WithClock; kept
-// as an option so the constructor signature in serve.go stays stable.
+// CachedOption customizes a Cached at construction: WithClock injects the time
+// source; WithAlias points one provider key at another's snapshot.
 type CachedOption func(*Cached)
 
 // WithClock injects the time source (tests advance it across the staleness
@@ -53,6 +60,22 @@ type CachedOption func(*Cached)
 // time.Now().UTC.
 func WithClock(now func() time.Time) CachedOption {
 	return func(c *Cached) { c.now = now }
+}
+
+// WithAlias makes Snapshot(alias) answer with the CANONICAL provider's snapshot.
+// It is the seam the anthropic reviewer provider uses in the single-cell posture
+// (#3578): the anthropic SDK reviewer and the oracle's claudecode fetcher hit the
+// SAME Anthropic endpoint, so aliasing anthropic→claudecode activates the #1339
+// submit-time rejection for anthropic reviewers with no extra fetch. An alias
+// whose canonical is unregistered (or not yet fetched) still reports ok=false —
+// fail-open, like any unregistered provider.
+func WithAlias(alias, canonical string) CachedOption {
+	return func(c *Cached) {
+		if c.aliases == nil {
+			c.aliases = make(map[string]string)
+		}
+		c.aliases[alias] = canonical
+	}
 }
 
 // NewCached builds a Cached over the given provider→Fetcher map with the given
@@ -86,6 +109,13 @@ func NewCached(providers map[string]Fetcher, threshold time.Duration, logger *sl
 func (c *Cached) Snapshot(_ context.Context, provider string) (models []string, fresh bool, ok bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+
+	// Resolve an alias to its canonical key before the snapshot lookup, so an
+	// aliased provider answers exactly what its canonical does (#3578). aliases
+	// is set only at construction, so reading it here is race-free.
+	if canonical, aliased := c.aliases[provider]; aliased {
+		provider = canonical
+	}
 
 	snap, present := c.snapshots[provider]
 	if !present || !snap.ok {

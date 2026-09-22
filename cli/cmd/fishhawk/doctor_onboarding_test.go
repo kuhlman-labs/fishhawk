@@ -80,6 +80,91 @@ func TestCheckOnboardingReadiness_ReviewerUnavailable(t *testing.T) {
 	}
 }
 
+// reviewerRungFor drives the doctor over a readiness body carrying one reviewer
+// object and returns its rung.
+func reviewerRungFor(t *testing.T, reviewerJSON string) checkResult {
+	t.Helper()
+	withFakeDoctorHTTP(t, func(_ *http.Request) (*http.Response, error) {
+		return fakeHTTPResponse(http.StatusOK, `{
+			"repo": "owner/name",
+			"app": {"installed": true},
+			"spec": {"source": "fetched", "valid": true},
+			"reviewers": [`+reviewerJSON+`],
+			"scopes": {"adequate": true}
+		}`), nil
+	})
+	results, _ := checkOnboardingReadiness("http://localhost:8080", "fhk_t", "owner/name")
+	return findCheck(t, results, "reviewer available: anthropic")
+}
+
+// TestCheckOnboardingReadiness_ReviewerModelVerified: an available + verified
+// model renders ok with the model as the detail (#3578).
+func TestCheckOnboardingReadiness_ReviewerModelVerified(t *testing.T) {
+	rv := reviewerRungFor(t, `{"provider":"anthropic","model":"claude-opus-4-8","available":true,"model_status":"verified","priced":true}`)
+	if rv.status != "ok" {
+		t.Errorf("status = %q, want ok", rv.status)
+	}
+	if rv.detail != "claude-opus-4-8" {
+		t.Errorf("detail = %q, want the model", rv.detail)
+	}
+}
+
+// TestCheckOnboardingReadiness_ReviewerModelUnverifiable: an available but
+// unverifiable model renders warn with the model_hint as remediation.
+func TestCheckOnboardingReadiness_ReviewerModelUnverifiable(t *testing.T) {
+	const hint = "model could not be verified against a live model snapshot; passed to the vendor verbatim"
+	rv := reviewerRungFor(t, `{"provider":"anthropic","model":"claude-opus-4-8","available":true,"model_status":"unverifiable","model_hint":"`+hint+`","priced":true}`)
+	if rv.status != "warn" {
+		t.Errorf("status = %q, want warn", rv.status)
+	}
+	if !strings.Contains(rv.detail, "unverified") {
+		t.Errorf("detail = %q, want the (unverified) marker", rv.detail)
+	}
+	if rv.remediate != hint {
+		t.Errorf("remediate = %q, want the model_hint", rv.remediate)
+	}
+}
+
+// TestCheckOnboardingReadiness_ReviewerModelUnpriced: an available + verified
+// but UNPRICED model renders warn carrying the (unpriced) marker.
+func TestCheckOnboardingReadiness_ReviewerModelUnpriced(t *testing.T) {
+	const hint = "unpriced: usage under this model is recorded at $0 (estimated)"
+	rv := reviewerRungFor(t, `{"provider":"anthropic","model":"mystery-1","available":true,"model_status":"verified","model_hint":"`+hint+`","priced":false}`)
+	if rv.status != "warn" {
+		t.Errorf("status = %q, want warn", rv.status)
+	}
+	if !strings.Contains(rv.detail, "unpriced") {
+		t.Errorf("detail = %q, want the (unpriced) marker", rv.detail)
+	}
+	if rv.remediate != hint {
+		t.Errorf("remediate = %q, want the $0 model_hint", rv.remediate)
+	}
+}
+
+// TestCheckOnboardingReadiness_ReviewerModelRejected: an unavailable reviewer
+// whose model was authoritatively rejected renders fail with the did-you-mean
+// model_hint as remediation (not the provider-level fallback).
+func TestCheckOnboardingReadiness_ReviewerModelRejected(t *testing.T) {
+	const hint = `model "claude-opus-4-8" is not a known "anthropic" model (did you mean "claude-opus-4-7"?); available: claude-opus-4-7`
+	rv := reviewerRungFor(t, `{"provider":"anthropic","model":"claude-opus-4-8","available":false,"model_status":"rejected","model_hint":"`+strings.ReplaceAll(hint, `"`, `\"`)+`"}`)
+	if rv.status != "fail" {
+		t.Errorf("status = %q, want fail", rv.status)
+	}
+	if !strings.Contains(rv.remediate, "did you mean") {
+		t.Errorf("remediate = %q, want the did-you-mean model_hint", rv.remediate)
+	}
+}
+
+// TestCheckOnboardingReadiness_ReviewerLegacyPayload: an OLDER backend serves
+// none of the #3578 fields (model_status empty, priced absent), so an available
+// reviewer still renders ok — the additive-optional wire contract.
+func TestCheckOnboardingReadiness_ReviewerLegacyPayload(t *testing.T) {
+	rv := reviewerRungFor(t, `{"provider":"anthropic","model":"claude-opus-4-8","available":true}`)
+	if rv.status != "ok" {
+		t.Errorf("status = %q, want ok (legacy payload renders unchanged)", rv.status)
+	}
+}
+
 // TestCheckOnboardingReadiness_ScopeMissing asserts the scope rung fails
 // listing the missing scopes and a reissue remediation.
 func TestCheckOnboardingReadiness_ScopeMissing(t *testing.T) {

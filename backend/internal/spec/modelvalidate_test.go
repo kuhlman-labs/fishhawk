@@ -1,6 +1,7 @@
 package spec_test
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -164,5 +165,22 @@ func TestValidateModels_DidYouMean(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), `did you mean "claude-opus-4-8"`) {
 		t.Errorf("error %q does not carry the expected did-you-mean suggestion", err.Error())
+	}
+}
+
+// (g) extraction fidelity: after the reject-message logic moved to
+// modeloracle.Verify/RejectMessage (#3578), ValidateModels's *ValidationError
+// text must equal the verdict's RejectMessage byte-for-byte — the done-means
+// test for the helper move (a wrong format here would also redden _DidYouMean).
+func TestValidateModels_MatchesOracleRejectMessage(t *testing.T) {
+	s := specWith("claude-code", "claude-opus-4-7", nil)
+	_, err := spec.ValidateModels(s, freshOracle())
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err type = %T, want *spec.ValidationError", err)
+	}
+	want := modeloracle.Verify(context.Background(), freshOracle(), "claudecode", "claude-opus-4-7").RejectMessage()
+	if ve.Message != want {
+		t.Errorf("ValidateModels message = %q\nVerify.RejectMessage  = %q\nwant byte-identical", ve.Message, want)
 	}
 }

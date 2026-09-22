@@ -977,12 +977,16 @@ type OnboardingSpec struct {
 
 // OnboardingReviewer mirrors the backend reviewerReadiness sub-object: one
 // spec-declared reviewer's availability on this deployment, with the adapter's
-// missing-env-var hint when the provider cannot be resolved.
+// missing-env-var hint when the provider cannot be resolved and the model-id
+// validity honesty fields (#3578).
 type OnboardingReviewer struct {
 	Provider        string `json:"provider" jsonschema:"the reviewer provider (e.g. claudecode, codex)"`
 	Model           string `json:"model,omitempty" jsonschema:"the reviewer model"`
 	ReasoningEffort string `json:"reasoning_effort,omitempty" jsonschema:"the reviewer reasoning-effort tier when set"`
-	Available       bool   `json:"available" jsonschema:"true when this reviewer can be resolved on this deployment"`
+	Available       bool   `json:"available" jsonschema:"true when the provider is wired on this deployment AND the resolved model was not authoritatively rejected; does NOT assert the model is served when model_status is unverifiable"`
+	ModelStatus     string `json:"model_status,omitempty" jsonschema:"model-id verdict: verified (in a fresh snapshot), rejected (authoritatively absent), or unverifiable (no live snapshot); computed from the resolved deployment default when the spec omits the model; empty only when no reviewer backend is wired or the default id is not exposed"`
+	ModelHint       string `json:"model_hint,omitempty" jsonschema:"human sentence for a non-verified status: the did-you-mean rejection text, the passed-to-the-vendor-verbatim warning, or the unpriced $0 note"`
+	Priced          *bool  `json:"priced,omitempty" jsonschema:"whether the pricing table knows the model family; computed from the resolved default when the spec omits the model; absent (nil) only when the resolved model id is unavailable, false flags usage recorded at $0"`
 	MissingHint     string `json:"missing_hint,omitempty" jsonschema:"the adapter's missing-env-var hint when the provider is unavailable"`
 }
 

@@ -36,6 +36,9 @@ type onboardingReadiness struct {
 		Provider    string `json:"provider"`
 		Model       string `json:"model"`
 		Available   bool   `json:"available"`
+		ModelStatus string `json:"model_status"`
+		ModelHint   string `json:"model_hint"`
+		Priced      *bool  `json:"priced"`
 		MissingHint string `json:"missing_hint"`
 	} `json:"reviewers"`
 	Scopes struct {
@@ -190,24 +193,54 @@ func checkOnboardingReadiness(backendURL, token, repo string) ([]checkResult, re
 		})
 	}
 
-	// (b) Per-reviewer availability — one rung per declared reviewer.
+	// (b) Per-reviewer availability — one rung per declared reviewer. The
+	// model-id honesty fields (#3578) refine an available reviewer's verdict:
+	// an unverifiable or unpriced model is a WARN (not a hard ok), and a
+	// rejected model surfaces the did-you-mean as the remediation.
 	for _, rv := range body.Reviewers {
 		rvLabel := "reviewer available: " + rv.Provider
-		if rv.Available {
-			detail := "available"
-			if rv.Model != "" {
-				detail = rv.Model
+		if !rv.Available {
+			// Prefer the model_hint (did-you-mean) when the provider IS wired
+			// but the resolved model was authoritatively rejected; otherwise the
+			// provider-level missing_hint.
+			remediate := rv.MissingHint
+			if rv.ModelStatus == "rejected" && rv.ModelHint != "" {
+				remediate = rv.ModelHint
 			}
-			out = append(out, checkResult{label: rvLabel, detail: detail, status: "ok"})
+			if remediate == "" {
+				remediate = "configure the " + rv.Provider + " reviewer backend on this deployment"
+			}
+			out = append(out, checkResult{
+				label: rvLabel, detail: "unavailable", status: "fail", remediate: remediate,
+			})
 			continue
 		}
-		remediate := rv.MissingHint
-		if remediate == "" {
-			remediate = "configure the " + rv.Provider + " reviewer backend on this deployment"
+		detail := "available"
+		if rv.Model != "" {
+			detail = rv.Model
 		}
-		out = append(out, checkResult{
-			label: rvLabel, detail: "unavailable", status: "fail", remediate: remediate,
-		})
+		// unverified: no authoritative snapshot to check against (a typo would
+		// only fail at review time). unpriced: pricing table doesn't know the
+		// family, so usage would book at $0. Either downgrades ok → warn. A nil
+		// or true priced (and a verified/empty status) leaves the rung ok — an
+		// OLDER backend that serves none of these fields renders exactly as before.
+		unverified := rv.ModelStatus == "unverifiable"
+		unpriced := rv.Priced != nil && !*rv.Priced
+		if unverified || unpriced {
+			var notes []string
+			if unverified {
+				notes = append(notes, "unverified")
+			}
+			if unpriced {
+				notes = append(notes, "unpriced")
+			}
+			out = append(out, checkResult{
+				label: rvLabel, detail: detail + " (" + strings.Join(notes, ", ") + ")",
+				status: "warn", remediate: rv.ModelHint,
+			})
+			continue
+		}
+		out = append(out, checkResult{label: rvLabel, detail: detail, status: "ok"})
 	}
 
 	// (c) Caller-token scope adequacy.
