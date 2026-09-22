@@ -90,9 +90,10 @@ type traceUploadResponse struct {
 // to the run's prior audit history, so a tampered or replayed
 // trace can't slip into an unrelated run's chain.
 func (s *Server) handleShipTrace(w http.ResponseWriter, r *http.Request) {
-	if s.cfg.SigningRepo == nil || s.cfg.TraceStore == nil || s.cfg.AuditRepo == nil {
+	if missing := missingTraceUploadDeps(s.cfg); len(missing) > 0 {
 		s.writeError(w, r, http.StatusServiceUnavailable, "trace_upload_unconfigured",
-			"trace upload requires signing, tracestore, and audit to be configured", nil)
+			traceUploadUnconfiguredMessage(missing),
+			map[string]any{"reason": strings.Join(missing, ",")})
 		return
 	}
 
@@ -8316,4 +8317,46 @@ func gateAcceptanceTranscriptFromSummary(sum *acceptanceTranscriptSummary) *prom
 		out.Criteria = append(out.Criteria, row)
 	}
 	return out
+}
+
+// missingTraceUploadDeps names the trace-upload dependencies that are nil, in
+// a fixed order so the message and its `reason` detail are deterministic.
+//
+// handleShipTrace refuses when ANY of the three is nil. The `||` chain knows
+// exactly which one it tripped on; reporting all three made the operator
+// eliminate two by hand — cross-referencing a signing_key_issued event and
+// the audit chain — at the worst possible moment, because this 503 lands
+// AFTER the agent has run to completion and been billed (E45.74 / #3599).
+func missingTraceUploadDeps(cfg Config) []string {
+	var missing []string
+	if cfg.SigningRepo == nil {
+		missing = append(missing, "signing")
+	}
+	if cfg.TraceStore == nil {
+		missing = append(missing, "tracestore")
+	}
+	if cfg.AuditRepo == nil {
+		missing = append(missing, "audit")
+	}
+	return missing
+}
+
+// traceUploadUnconfiguredMessage renders the refusal, naming the remedy for
+// the common case.
+//
+// The remedy named for `tracestore` is FISHHAWKD_S3_BUCKET, deliberately NOT
+// --dev-fixtures: dev fixtures do yield an in-memory trace store, but they
+// ALSO deny every forge write (no branch push, no PR/MR), so pointing an
+// operator there from a trace-storage error trades a loud failure for a quiet
+// wrong outcome (E45.76 / #3601). signing and audit are repository wiring, so
+// the message says so rather than naming an env var that does not exist.
+func traceUploadUnconfiguredMessage(missing []string) string {
+	msg := "trace upload is unconfigured: " + strings.Join(missing, ", ") +
+		" not configured"
+	for _, m := range missing {
+		if m == "tracestore" {
+			return msg + " (set FISHHAWKD_S3_BUCKET and its endpoint/region/credentials)"
+		}
+	}
+	return msg + " (repository wiring)"
 }
