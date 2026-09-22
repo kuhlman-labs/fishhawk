@@ -1,0 +1,14 @@
+id: scenario:issue-3582/github-report-omits-gitlab-keys
+statement: A github-family readiness report carries neither a `gitlab_registration` key nor an `app.resolvable` key, and the `app` object shape (installed, installation_id, reason) is unchanged.
+verify_hint: GET /v0/onboarding/readiness?repo=kuhlman-labs/fishhawk&forge=github returns 200 whose body has no gitlab_registration key and whose app object has no resolvable key; the fishhawk_doctor tool result for the same repo re-emits no such keys.
+steps: 'GET http://localhost:8090/v0/onboarding/readiness?repo=kuhlman-labs/fishhawk&forge=github with the operator bearer; listed top-level keys and app keys. POST /mcp tools/call fishhawk_doctor {repo: kuhlman-labs/fishhawk, forge: github} and {repo: kuhlman-labs/fishhawk} (no forge); listed report keys and grepped the tool''s text content for gitlab_registration/resolvable. Also the earlier GET ?repo=owner/name (no forge).'
+assertions:
+    expected: No gitlab_registration key and no app.resolvable key; app object shape (installed, installation_id, reason) unchanged; doctor re-emits no such keys.
+    observed_at_record: 200; keys [app, forge, merge_gate, repo, reviewers, scopes, spec] — no gitlab_registration; app keys exactly [installed, reason] (installation_id omitted when not installed) — no resolvable; both doctor reports identical in shape, text content has 0 matches for gitlab_registration/resolvable.
+    repro_handle: 'curl -H ''Authorization: Bearer <tok>'' ''http://localhost:8090/v0/onboarding/readiness?repo=kuhlman-labs/fishhawk&forge=github'' | jq ''{keys:keys, app_keys:(.app|keys)}'''
+origin:
+    issue: 3582
+    pr: 3594
+    run_id: a46177d5-6b72-4645-ac4d-619ce7383b6f
+    head_sha: a18e817d067c12bc384e9de655e7dc0799c202b3
+    recorded_at: 2026-09-22T10:12:05Z

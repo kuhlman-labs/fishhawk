@@ -1,0 +1,14 @@
+id: scenario:issue-3582/gitlab-report-carries-registration-rung
+statement: A gitlab-family readiness report (GET /v0/onboarding/readiness?repo=<namespace>/<project>&forge=gitlab, and the fishhawk_doctor MCP tool result for the same repo) carries a `gitlab_registration` object whose `status` is one of registered, not_registered or unknown and whose `note` is present, and `app.installed` is false whenever `status` is not `registered`.
+verify_hint: GET /v0/onboarding/readiness?repo=acme/widgets&forge=gitlab with an authenticated token on the localhost preview returns 200 and the body carries gitlab_registration.status and gitlab_registration.note; app.installed is false unless status is registered. The fishhawk_doctor tool result re-emits the same object.
+steps: 'DELETE /v0/dev/forge (204); POST /v0/dev/forge/issues {forge gitlab, repo acme/widgets, project_id 42, number 1, state opened, title seed} → 201 so the project resolves on the stub forge; psql confirmed 0 gitlab installations rows. GET http://localhost:8090/v0/onboarding/readiness?repo=acme/widgets&forge=gitlab with the operator bearer; POST /mcp tools/call fishhawk_doctor {repo: acme/widgets, forge: gitlab} (Mcp-Name fishhawk_doctor) and diffed structuredContent.report.{app,gitlab_registration} against the REST body. Also read the same endpoint before seeding (project not visible) and later with a registered row (live walk).'
+assertions:
+    expected: gitlab_registration object with status in {registered, not_registered, unknown} and a note; app.installed false whenever status != registered; fishhawk_doctor re-emits the same object.
+    observed_at_record: '200; gitlab_registration {status not_registered, resolved_ref gitlab:42, detail…, remediation…, note ''gitlab: this rung reports whether an installations row is registered for EXACTLY this project_path — the check POST /v0/runs performs … REPORTING only.''}; app {installed false, resolvable true, reason ''no gitlab installation is registered for this exact project path; see gitlab_registration.remediation'', note…}. Unseeded variant: status not_registered, installed false, resolvable false. Registered variant (live walk): status registered, installed true. The doctor tool''s report.app and report.gitlab_registration are byte-equal (jq -S diff) to the REST objects.'
+    repro_handle: 'curl -H ''Authorization: Bearer <tok>'' ''http://localhost:8090/v0/onboarding/readiness?repo=acme/widgets&forge=gitlab'' | jq ''{app, gitlab_registration}'''
+origin:
+    issue: 3582
+    pr: 3594
+    run_id: a46177d5-6b72-4645-ac4d-619ce7383b6f
+    head_sha: a18e817d067c12bc384e9de655e7dc0799c202b3
+    recorded_at: 2026-09-22T10:12:05Z

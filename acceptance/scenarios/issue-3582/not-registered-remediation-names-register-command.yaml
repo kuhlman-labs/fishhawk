@@ -1,0 +1,14 @@
+id: scenario:issue-3582/not-registered-remediation-names-register-command
+statement: On a deployment with a database but no gitlab installation row for the queried path, the gitlab-family report's `gitlab_registration.status` is `not_registered`, its `remediation` names `fishhawkd installation register --provider gitlab` with `--project-path <the queried path>`, and `app.installed` is false with a `reason` pointing at gitlab_registration.
+verify_hint: GET /v0/onboarding/readiness?repo=acme/unregistered-project&forge=gitlab returns 200 with gitlab_registration.status == not_registered and a remediation string containing 'fishhawkd installation register --provider gitlab' and '--project-path acme/unregistered-project'; app.installed == false.
+steps: 'Precondition met: the preview runs with FISHHAWKD_DATABASE_URL (log ''repositories configured … driver=postgres''; /v0/dev/fixtures present); psql confirmed 0 installations rows for acme/unregistered-project. GET /v0/onboarding/readiness?repo=acme/unregistered-project&forge=gitlab (project not seeded on the stub forge), then POST /v0/dev/forge/issues {forge gitlab, repo acme/unregistered-project, project_id 77, …} → 201 and GET again; grepped the remediation string.'
+assertions:
+    expected: status not_registered; remediation contains 'fishhawkd installation register --provider gitlab' and '--project-path acme/unregistered-project'; app.installed false with a reason pointing at gitlab_registration.
+    observed_at_record: Both reads 200 with gitlab_registration.status not_registered, remediation 'fishhawkd installation register --provider gitlab --account-key acme --installation-ref gitlab:<project_id> --project-path acme/unregistered-project' (placeholder while unresolved) / '… --installation-ref gitlab:77 --project-path acme/unregistered-project' (once resolvable); app.installed false. When resolvable, app.reason = 'no gitlab installation is registered for this exact project path; see gitlab_registration.remediation'. When NOT resolvable, app.reason names the credential-visibility problem instead (registration remediation still present in gitlab_registration).
+    repro_handle: 'curl -H ''Authorization: Bearer <tok>'' ''http://localhost:8090/v0/onboarding/readiness?repo=acme/unregistered-project&forge=gitlab'' | jq ''{installed:.app.installed, reason:.app.reason, reg:.gitlab_registration}'''
+origin:
+    issue: 3582
+    pr: 3594
+    run_id: a46177d5-6b72-4645-ac4d-619ce7383b6f
+    head_sha: a18e817d067c12bc384e9de655e7dc0799c202b3
+    recorded_at: 2026-09-22T10:12:05Z
