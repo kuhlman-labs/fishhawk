@@ -1,0 +1,14 @@
+id: scenario:issue-3579/init-points-at-validate
+statement: The fishhawk_init tool result carries a next_step field that names fishhawk_validate, and the fishhawk://onboarding-skill resource text mentions fishhawk_validate after fishhawk_init and no longer instructs re-running fishhawk_doctor until spec.valid before commit.
+verify_hint: MCP tools/call fishhawk_init {} → structuredContent.next_step; MCP resources/read fishhawk://onboarding-skill → text ordering of fishhawk_init vs fishhawk_validate.
+steps: 'POST http://localhost:8090/mcp tools/call fishhawk_init {} (Mcp-Name fishhawk_init) → structuredContent.next_step. POST /mcp resources/read {uri: fishhawk://onboarding-skill} (Mcp-Name fishhawk://onboarding-skill) → contents[0].text saved to /tmp/fh3579/SKILL.md; grepped line numbers of fishhawk_init / fishhawk_validate mentions and for ''re-run'' / ''until''.'
+assertions:
+    expected: fishhawk_init result carries next_step naming fishhawk_validate; the onboarding-skill text mentions fishhawk_validate after fishhawk_init and no longer instructs re-running fishhawk_doctor until spec.valid before commit.
+    observed_at_record: 'next_step = ''Write workflow_yaml to target_path in the checkout, then call fishhawk_validate (working_dir = the checkout, or workflow_spec = these bytes) and fix any diagnostics until valid:true BEFORE committing. Do not re-run fishhawk_doctor to confirm the file: its spec rung reads the DEFAULT BRANCH and stays unavailable until the spec is merged.'' Skill text: ''## Step 2 — `fishhawk_init`'' at line 33, ''## Step 3 — Validate before committing'' at line 48 with ''Call `fishhawk_validate` …'' at line 50 (after init); Step 3 body says fishhawk_doctor''s spec rung ''stays `unavailable` until the spec is merged — do not loop on it to confirm an uncommitted file''; no ''re-run'' string anywhere in the document and no instruction to re-run fishhawk_doctor until spec.valid before commit (Step 5 runs doctor once more only after merge).'
+    repro_handle: /tmp/fh3579/mcpj.sh tools/call '{"name":"fishhawk_init","arguments":{}}' fishhawk_init | jq -r .result.structuredContent.next_step; grep -n -i 're-run\|fishhawk_validate\|fishhawk_init' /tmp/fh3579/SKILL.md
+origin:
+    issue: 3579
+    pr: 3588
+    run_id: a5541657-ff06-4e14-be6d-69035335faae
+    head_sha: 047e063f94538f51a92721f9068d9fae8c59a87c
+    recorded_at: 2026-09-22T03:28:03Z

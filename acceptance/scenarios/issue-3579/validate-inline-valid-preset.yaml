@@ -1,0 +1,14 @@
+id: scenario:issue-3579/validate-inline-valid-preset
+statement: Calling fishhawk_validate with workflow_spec set to the workflow_yaml returned by fishhawk_init (medium) returns valid:true, source inline, an empty diagnostics list, a non-empty checked sentence and a not_checked list naming the charter rule and reviewer model ids.
+verify_hint: 'MCP tools/call fishhawk_init {} then fishhawk_validate {workflow_spec: <workflow_yaml>}; read structuredContent.'
+steps: 'POST http://localhost:8090/mcp tools/call fishhawk_init {preset: medium} (Mcp-Name fishhawk_init) → structuredContent.workflow_yaml (242 lines, sha256 fa3ff6fe…; byte-identical to fishhawk_init {} with no arguments). POST /mcp tools/call fishhawk_validate {workflow_spec: <that workflow_yaml>} (Mcp-Name fishhawk_validate); read structuredContent.'
+assertions:
+    expected: valid:true, source inline, empty diagnostics, non-empty checked sentence, not_checked naming the charter rule and reviewer model ids.
+    observed_at_record: 'valid true; source inline; path null; version "2"; diagnostics []; charter_required_by []; checked = ''YAML parse; the version-routed workflow JSON Schema (v0/v1/v2); workflow-v2 removed-forms sweep and defaults/extends reuse resolution; stage-reference resolution (duplicate stage ids, needs, inputs.from_stage); and the server-side stage-binding rules — via backend/internal/spec.ParseBytes, the validator fishhawk_start_run and POST /v0/runs run.''; not_checked = [''the mandatory-charter rule for grooming_report-producing workflows (see charter_required_by): enforced by the CLI `fishhawk validate` and at run creation'', ''reviewer model ids against the deployment''s model oracle (E45.64): read fishhawk_doctor''s reviewers[].model_status after the spec is merged'', ''deployment wiring (App installation, reviewer providers, token scopes, merge gate): fishhawk_doctor'']. Additional binding-condition spot checks on the running verb: a duplicate stage id yields {kind validation, path /workflows/feature_change/stages, workflow feature_change, stage ''plan''}; a needs: [nonexistent] on stage index 1 yields {kind validation, path /workflows/feature_change/stages/1/inputs/0/from_stage, stage_index 1, stage ''implement''}; the shipped docs/spec/examples/workflow-v2-backlog-grooming.yaml validates true with charter_required_by [''backlog_grooming''].'
+    repro_handle: /tmp/fh3579/mcpj.sh tools/call "$(jq -cn --rawfile s /tmp/fh3579/init-med.yaml '{name:"fishhawk_validate",arguments:{workflow_spec:$s}}')" fishhawk_validate | jq .result.structuredContent
+origin:
+    issue: 3579
+    pr: 3588
+    run_id: a5541657-ff06-4e14-be6d-69035335faae
+    head_sha: 047e063f94538f51a92721f9068d9fae8c59a87c
+    recorded_at: 2026-09-22T03:28:03Z

@@ -1,0 +1,14 @@
+id: scenario:issue-3579/validate-working-dir-discovers-file
+statement: Calling fishhawk_validate with working_dir set to a checkout containing .fishhawk/workflows.yaml validates that file and returns source file with path naming it; with working_dir set to a directory holding no spec it returns a tool error naming the directory.
+verify_hint: 'MCP tools/call fishhawk_validate {working_dir: <preview checkout path>} and again with an empty temp dir; compare structuredContent.source/path vs isError.'
+steps: 'Created a throwaway checkout /tmp/fh3579/wd-ok (git init; .fishhawk/workflows.yaml = the fishhawk_init medium bytes; empty subdir sub/) and an empty dir /tmp/fh3579/wd-empty — the sanctioned checkout was not written to. POST http://localhost:8090/mcp tools/call fishhawk_validate {working_dir: /tmp/fh3579/wd-ok}; again with {working_dir: /tmp/fh3579/wd-ok/sub}; again with {working_dir: /tmp/fh3579/wd-empty}; also {} (no input), {spec_file: /tmp/fh3579/nope.yaml}, {spec_file: <existing file>} and {workflow_spec: <version 9.0>, working_dir: /tmp/fh3579/wd-ok}.'
+assertions:
+    expected: working_dir with .fishhawk/workflows.yaml → source file with path naming it; working_dir with no spec → tool error naming the directory.
+    observed_at_record: 'wd-ok: isError null, valid true, source file, path /tmp/fh3579/wd-ok/.fishhawk/workflows.yaml, version 2. wd-ok/sub: same path via walk-up. wd-empty: isError true, text ''no .fishhawk/workflows.yaml found walking up from /tmp/fh3579/wd-empty to its .git root: pass workflow_spec (inline YAML) or spec_file (an explicit path)''. No input: isError true ''one of workflow_spec, working_dir or spec_file is required''. Missing spec_file: isError true naming the path. Existing spec_file: valid true, source file, path named. Inline + working_dir: source inline, diagnostics[0].path /version (inline wins).'
+    repro_handle: /tmp/fh3579/mcpj.sh tools/call '{"name":"fishhawk_validate","arguments":{"working_dir":"/tmp/fh3579/wd-empty"}}' fishhawk_validate | jq '.result|{isError,content}'
+origin:
+    issue: 3579
+    pr: 3588
+    run_id: a5541657-ff06-4e14-be6d-69035335faae
+    head_sha: 047e063f94538f51a92721f9068d9fae8c59a87c
+    recorded_at: 2026-09-22T03:28:03Z
