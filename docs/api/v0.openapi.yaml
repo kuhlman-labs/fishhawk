@@ -5955,9 +5955,9 @@ components:
               type: string
               description: |
                 `s3` — the durable S3 / RustFS store. `memory` — the
-                `--dev-fixtures` in-memory store: configured, but EPHEMERAL
-                (every bundle is lost on restart), so not durable for a real
-                dogfood loop. `none` — no store configured. `other` — a
+                in-memory store (`--dev-fixtures` or `--dev-trace-store`):
+                configured, but EPHEMERAL (every bundle is lost on restart),
+                so not durable for a real dogfood loop. `none` — no store configured. `other` — a
                 non-S3, non-memory implementation; configured, with no claim
                 about durability (never mislabelled `s3`).
               enum: [s3, memory, none, other]

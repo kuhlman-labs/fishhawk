@@ -32,6 +32,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/account"
 	accountdb "github.com/kuhlman-labs/fishhawk/backend/internal/account/db"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/anthropic"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	authpkg "github.com/kuhlman-labs/fishhawk/backend/internal/auth"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
@@ -4937,26 +4938,40 @@ func TestGitLabProjectRegistry_LooksUpTheGitLabProvider(t *testing.T) {
 // make the log announce a dev store that was never minted (#3326 fix-up,
 // concern f37940f4). COUNTERFACTUAL: make the helper return `current, true`
 // on its passthrough arm → the four non-mem rows go RED (observed).
+//
+// Since E45.76 / #3601 the helper also answers WHICH knob selected the
+// store, so the boot line can name it: --dev-fixtures wins when both are
+// set (that daemon is in dev mode either way), --dev-trace-store otherwise,
+// and the passthrough arm reports no source at all.
 func TestResolveDevTraceStore(t *testing.T) {
 	s3 := tracestore.NewS3Storage(nil, "bucket")
 	for _, tc := range []struct {
-		name        string
-		devFixtures bool
-		bucket      string
-		current     tracestore.Storage
-		wantMem     bool
-		wantCurrent bool
+		name          string
+		devFixtures   bool
+		devTraceStore bool
+		bucket        string
+		current       tracestore.Storage
+		wantMem       bool
+		wantCurrent   bool
+		wantSource    string
 	}{
-		{"off/no-bucket → nil", false, "", nil, false, false},
-		{"on/no-bucket → mem", true, "", nil, true, false},
-		{"on/bucket → current unchanged", true, "b", s3, false, true},
-		{"off/bucket → current", false, "b", s3, false, true},
-		{"on/no-bucket but already wired → current", true, "", s3, false, true},
+		{name: "both off/no-bucket → nil"},
+		{name: "fixtures/no-bucket → mem", devFixtures: true, wantMem: true, wantSource: "dev fixtures"},
+		{name: "trace-store knob/no-bucket → mem", devTraceStore: true, wantMem: true, wantSource: "dev trace store"},
+		{name: "both knobs → mem sourced to dev fixtures", devFixtures: true, devTraceStore: true, wantMem: true, wantSource: "dev fixtures"},
+		{name: "fixtures/bucket → current unchanged", devFixtures: true, bucket: "b", current: s3, wantCurrent: true},
+		{name: "trace-store knob/bucket → current unchanged", devTraceStore: true, bucket: "b", current: s3, wantCurrent: true},
+		{name: "off/bucket → current", bucket: "b", current: s3, wantCurrent: true},
+		{name: "fixtures/no-bucket but already wired → current", devFixtures: true, current: s3, wantCurrent: true},
+		{name: "trace-store knob/no-bucket but already wired → current", devTraceStore: true, current: s3, wantCurrent: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, selected := resolveDevTraceStore(tc.devFixtures, tc.bucket, tc.current)
+			got, source, selected := resolveDevTraceStore(tc.devFixtures, tc.devTraceStore, tc.bucket, tc.current)
 			if selected != tc.wantMem {
 				t.Fatalf("selected = %v, want %v (true only when the helper minted the mem store)", selected, tc.wantMem)
+			}
+			if source != tc.wantSource {
+				t.Fatalf("source = %q, want %q (the boot line names the knob that selected the store)", source, tc.wantSource)
 			}
 			_, isMem := got.(*tracestore.MemStorage)
 			switch {
@@ -4966,6 +4981,71 @@ func TestResolveDevTraceStore(t *testing.T) {
 				t.Fatalf("got %T, want the current store unchanged", got)
 			case !tc.wantMem && !tc.wantCurrent && got != nil:
 				t.Fatalf("got %T, want nil", got)
+			}
+		})
+	}
+}
+
+// TestDevModeBootWarning tables the dev-mode consequence WARN (E45.76 /
+// #3601) across all four mounted-surface combinations. The neither row is
+// load-bearing in the opposite direction from the other three: a production
+// daemon must log NOTHING new, so warn=false with an empty message is the
+// assertion that this change leaves a production boot byte-identical.
+//
+// Each warning row asserts the message names its own mounted surface(s) AND
+// every dev-mode consequence, because the whole point of the line is that an
+// operator today learns the forge-write denial only by reading
+// runner/cmd/fishhawk-runner/forgewrites.go.
+func TestDevModeBootWarning(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		fixtures      bool
+		stubForge     bool
+		wantWarn      bool
+		wantSurfaces  []string
+		wantNoSurface []string
+	}{
+		{name: "neither → silent", wantWarn: false},
+		{name: "fixtures only", fixtures: true, wantWarn: true,
+			wantSurfaces: []string{"dev_fixtures"}, wantNoSurface: []string{"dev_stub_forge"}},
+		{name: "stub forge only", stubForge: true, wantWarn: true,
+			wantSurfaces: []string{"dev_stub_forge"}, wantNoSurface: []string{"dev_fixtures"}},
+		{name: "both", fixtures: true, stubForge: true, wantWarn: true,
+			wantSurfaces: []string{"dev_fixtures", "dev_stub_forge"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			msg, warn := devModeBootWarning(tc.fixtures, tc.stubForge)
+			if warn != tc.wantWarn {
+				t.Fatalf("warn = %v, want %v", warn, tc.wantWarn)
+			}
+			if !tc.wantWarn {
+				if msg != "" {
+					t.Fatalf("msg = %q with no dev surface mounted, want empty (a production boot logs nothing new)", msg)
+				}
+				return
+			}
+			for _, s := range tc.wantSurfaces {
+				if !strings.Contains(msg, s) {
+					t.Errorf("msg does not name the mounted surface %q: %s", s, msg)
+				}
+			}
+			for _, s := range tc.wantNoSurface {
+				if strings.Contains(msg, s) {
+					t.Errorf("msg names %q, which is NOT mounted: %s", s, msg)
+				}
+			}
+			// Every dev-mode consequence, in one line.
+			for _, want := range []string{
+				"forge writes are DENIED",
+				"no branch push",
+				"host_dispatch_refused_dev_mode",
+				"dev_mode: true",
+				"FISHHAWKD_S3_BUCKET",
+				"--dev-trace-store",
+			} {
+				if !strings.Contains(msg, want) {
+					t.Errorf("msg does not carry %q: %s", want, msg)
+				}
 			}
 		})
 	}
@@ -5159,6 +5239,207 @@ func captureServerConfig(t *testing.T) *server.Config {
 	return captured
 }
 
+// captureServerConfigAndProbe is captureServerConfig plus a probe hook run
+// against the CONSTRUCTED *server.Server, so a test can drive the REAL serve
+// wiring's HTTP surface (s.Handler()) instead of only inspecting the Config
+// that produced it.
+//
+// The probe runs INSIDE the newServer seam, while runServe is still on the
+// stack: the database pool the server was wired with is closed on runServe's
+// unwind, so a request issued after runServe returns draws
+// `503 service_unavailable database unavailable` from every DB-backed route.
+func captureServerConfigAndProbe(t *testing.T, probe func(*server.Server)) *server.Config {
+	t.Helper()
+	captured := &server.Config{}
+	orig := newServer
+	newServer = func(cfg server.Config) *server.Server {
+		*captured = cfg
+		srv := orig(cfg)
+		probe(srv)
+		return srv
+	}
+	t.Cleanup(func() { newServer = orig })
+	return captured
+}
+
+// TestServe_DevTraceStoreFlag_WiresMemStoreWithoutDevMode is the done-means
+// test for --dev-trace-store (E45.76 / #3601), and it asserts BOTH halves of
+// the claim TOGETHER at the PROCESS BOUNDARY, on the real serve wiring:
+//
+//   - /healthz OMITS dev_mode — no dev surface was mounted, so
+//     server.devModeActive() is false and forge writes stay LIVE. This is the
+//     half that distinguishes the new knob from --dev-fixtures; asserting the
+//     store alone would be half the claim.
+//   - GET /v0/onboarding/readiness reports trace_store {configured: true,
+//     kind: "memory"} — the store an operator actually asked for.
+//
+// A mis-wiring of the knob into cfg.DevFixtures (which would silently
+// re-couple the forge-write denial to it) fails the first half; dropping the
+// resolver's new input fails the second.
+func TestServe_DevTraceStoreFlag_WiresMemStoreWithoutDevMode(t *testing.T) {
+	dbURL := pgtest.NewURL(t)
+	bearer := issueOperatorToken(t, dbURL)
+	var probed bool
+	captured := captureServerConfigAndProbe(t, func(srv *server.Server) {
+		probed = true
+
+		// Boundary half 1: /healthz OMITS dev_mode. Decoded into a map, not
+		// a struct: the claim is about the FIELD's absence on the wire,
+		// which a bool field would silently render as false either way.
+		healthRec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(healthRec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+		if healthRec.Code != http.StatusOK {
+			t.Errorf("/healthz status = %d, want 200:\n%s", healthRec.Code, healthRec.Body.String())
+			return
+		}
+		var health map[string]any
+		if err := json.Unmarshal(healthRec.Body.Bytes(), &health); err != nil {
+			t.Errorf("decode /healthz: %v\n%s", err, healthRec.Body.String())
+			return
+		}
+		if v, present := health["dev_mode"]; present {
+			t.Errorf("/healthz carries dev_mode = %v under --dev-trace-store; it must be OMITTED (no dev surface mounted)", v)
+		}
+
+		// Boundary half 2: the readiness report's trace_store rung.
+		readyReq := httptest.NewRequest(http.MethodGet,
+			"/v0/onboarding/readiness?forge=github&repo=acme%2Fwidgets", nil)
+		readyReq.Header.Set("Authorization", "Bearer "+bearer)
+		readyRec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(readyRec, readyReq)
+		if readyRec.Code != http.StatusOK {
+			t.Errorf("/v0/onboarding/readiness status = %d, want 200:\n%s", readyRec.Code, readyRec.Body.String())
+			return
+		}
+		var ready struct {
+			TraceStore *struct {
+				Configured bool   `json:"configured"`
+				Kind       string `json:"kind"`
+				Note       string `json:"note"`
+			} `json:"trace_store"`
+		}
+		if err := json.Unmarshal(readyRec.Body.Bytes(), &ready); err != nil {
+			t.Errorf("decode readiness: %v\n%s", err, readyRec.Body.String())
+			return
+		}
+		if ready.TraceStore == nil {
+			t.Errorf("readiness carries no trace_store rung:\n%s", readyRec.Body.String())
+			return
+		}
+		if !ready.TraceStore.Configured || ready.TraceStore.Kind != "memory" {
+			t.Errorf("readiness trace_store = {configured:%v kind:%q}, want {true memory}",
+				ready.TraceStore.Configured, ready.TraceStore.Kind)
+		}
+		if !strings.Contains(ready.TraceStore.Note, "EPHEMERAL") {
+			t.Errorf("readiness trace_store note does not carry the ephemerality warning: %q", ready.TraceStore.Note)
+		}
+	})
+	code, log := serveWithProfile(t, "-db", dbURL, "-dev-trace-store", "-s3-bucket=", bootstrapAbortFlag)
+	if code != exitFailure {
+		t.Fatalf("runServe exit = %d, want %d (aborts at the invalid review-resolution, AFTER newServer); log:\n%s", code, exitFailure, log)
+	}
+	if !probed {
+		t.Fatalf("newServer was never reached, so neither boundary half was asserted; log:\n%s", log)
+	}
+	// Config-level: the store is wired and NEITHER dev surface is.
+	if _, ok := captured.TraceStore.(*tracestore.MemStorage); !ok {
+		t.Fatalf("captured server.Config.TraceStore = %T, want *tracestore.MemStorage; log:\n%s", captured.TraceStore, log)
+	}
+	if captured.DevFixtures != nil || captured.DevStubForge != nil {
+		t.Fatalf("--dev-trace-store mounted a dev surface (DevFixtures=%T DevStubForge=%T); it must not — forge writes stay live",
+			captured.DevFixtures, captured.DevStubForge)
+	}
+
+	// The boot log names the knob AND the ephemerality, and does NOT claim
+	// dev mode.
+	if !strings.Contains(log, "trace store: in-memory (dev trace store)") {
+		t.Errorf("log does not name --dev-trace-store as the knob that selected the store:\n%s", log)
+	}
+	if !strings.Contains(log, "trace store is EPHEMERAL") {
+		t.Errorf("log does not announce the store's ephemerality:\n%s", log)
+	}
+	if strings.Contains(log, "DEV MODE ACTIVE") {
+		t.Errorf("--dev-trace-store boot claims dev mode; it mounts no dev surface:\n%s", log)
+	}
+	if strings.Contains(log, "/v0/runs/{id}/trace will respond 503") {
+		t.Errorf("log still warns the trace route will 503 although the store was selected:\n%s", log)
+	}
+}
+
+// issueOperatorToken mints a real bearer token in the target database so a
+// test can drive an authenticated route through the booted server's Handler.
+func issueOperatorToken(t *testing.T, dbURL string) string {
+	t.Helper()
+	pool, err := pgxpool.New(context.Background(), dbURL)
+	if err != nil {
+		t.Fatalf("pool: %v", err)
+	}
+	defer pool.Close()
+	tok, err := apitoken.NewPostgresRepository(pool).Issue(context.Background(),
+		"operator-agent/v1:serve-test", operatorDefaultScopes)
+	if err != nil {
+		t.Fatalf("issue token: %v", err)
+	}
+	return tok.PlainText
+}
+
+// TestServeRegistersDevFlagForgeWriteConsequence pins the operator-facing
+// FLAG HELP (E45.76 / #3601): the coupling between a dev surface and the
+// forge-write denial must be discoverable where an operator reads about the
+// flag, not only in runner/cmd/fishhawk-runner/forgewrites.go.
+//
+// Same shape as TestServeRegistersRepoACLTTLFlag: -h makes the REAL flag set
+// print its usage before any listener binds, and the block is sliced to each
+// flag's own entry so the assertion cannot be satisfied by text belonging to
+// a different flag.
+//
+// COUNTERFACTUAL: delete the forge-write clause from the --dev-fixtures usage
+// string in serve.go → the --dev-fixtures subtest goes RED (observed).
+func TestServeRegistersDevFlagForgeWriteConsequence(t *testing.T) {
+	var logSink bytes.Buffer
+	if code := runServe([]string{"-h"}, &logSink); code != exitFailure {
+		t.Fatalf("runServe(-h) = %d, want %d (parse aborts before serving)", code, exitFailure)
+	}
+	usage := logSink.String()
+	entry := func(t *testing.T, header string) string {
+		t.Helper()
+		i := strings.Index(usage, header)
+		if i < 0 {
+			t.Fatalf("runServe usage does not register %q; got:\n%s", strings.TrimSpace(header), usage)
+		}
+		e := usage[i+len(header):]
+		if j := strings.Index(e, "\n  -"); j >= 0 {
+			e = e[:j]
+		}
+		return e
+	}
+	for _, tc := range []struct {
+		name   string
+		header string
+	}{
+		{"dev-fixtures", "  -dev-fixtures\n"},
+		{"dev-stub-forge", "  -dev-stub-forge\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := entry(t, tc.header)
+			for _, want := range []string{"DEV MODE", "DENIES every forge write", "host-dispatch"} {
+				if !strings.Contains(e, want) {
+					t.Errorf("--%s usage does not name %q; got %q", tc.name, want, e)
+				}
+			}
+		})
+	}
+	t.Run("dev-trace-store", func(t *testing.T) {
+		e := entry(t, "  -dev-trace-store\n")
+		// It must say the OPPOSITE: no dev mode, forge writes stay live.
+		for _, want := range []string{"does NOT put the daemon in dev mode", "forge writes stay live", "EPHEMERAL", "FISHHAWKD_S3_BUCKET"} {
+			if !strings.Contains(e, want) {
+				t.Errorf("--dev-trace-store usage does not name %q; got %q", want, e)
+			}
+		}
+	})
+}
+
 // TestServe_DevFixturesFlagWiresApplierAndMemTraceStore: a DB-backed boot
 // with -dev-fixtures reaches server.New with a non-nil DevFixtures applier
 // AND a *tracestore.MemStorage trace store (no -s3-bucket). Counterfactual:
@@ -5181,6 +5462,15 @@ func TestServe_DevFixturesFlagWiresApplierAndMemTraceStore(t *testing.T) {
 	}
 	if !strings.Contains(log, "dev fixtures surface ENABLED") {
 		t.Errorf("log does not carry the dev-only / loopback-only WARN:\n%s", log)
+	}
+	// E45.76 / #3601: a dev-mode boot must NAME the forge-write denial, not
+	// leave an operator to discover it in the runner source. COUNTERFACTUAL:
+	// delete the devModeBootWarning emit in serve.go → RED here (observed).
+	if !strings.Contains(log, "DEV MODE ACTIVE") || !strings.Contains(log, "forge writes are DENIED") {
+		t.Errorf("dev-fixtures boot log does not carry the dev-mode forge-write denial warning:\n%s", log)
+	}
+	if !strings.Contains(log, "trace store is EPHEMERAL") {
+		t.Errorf("log does not name the in-memory store's ephemerality:\n%s", log)
 	}
 	// The in-memory store CLOSES the 503, so the S3-unset warning that
 	// announces it must not fire alongside — a stale claim in the boot log.
@@ -5207,6 +5497,17 @@ func TestServe_DevFixturesWithoutDB_StaysOff(t *testing.T) {
 	}
 	if !strings.Contains(log, "dev fixtures requested but no database configured; surface stays off") {
 		t.Errorf("log does not carry the no-database reason:\n%s", log)
+	}
+	// E45.76 / #3601, the load-bearing case for keying the warning on the
+	// MOUNTED surface rather than on the flag: cfg.DevFixtures stays nil here,
+	// so server.devModeActive() is false and forge writes are NOT denied. A
+	// daemon must never warn about a denial it is not applying.
+	if strings.Contains(log, "DEV MODE ACTIVE") {
+		t.Errorf("no dev surface was mounted, yet the boot log claims dev mode:\n%s", log)
+	}
+	// The in-memory trace store is still selected — it does not need a pool.
+	if _, ok := captured.TraceStore.(*tracestore.MemStorage); !ok {
+		t.Errorf("captured server.Config.TraceStore = %T, want *tracestore.MemStorage; log:\n%s", captured.TraceStore, log)
 	}
 }
 

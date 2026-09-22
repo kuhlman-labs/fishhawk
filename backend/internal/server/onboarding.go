@@ -133,7 +133,7 @@ const (
 const (
 	traceStoreNoneNote        = "no trace store is configured on this deployment: POST /v0/runs/{id}/trace responds 503, so every run fails at trace upload AFTER the agent has run and been billed"
 	traceStoreNoneRemediation = "set FISHHAWKD_S3_BUCKET (plus the S3 endpoint/region/credentials — see the trace-storage block in .env.example) and create the bucket with `make s3-init`, then restart fishhawkd"
-	traceStoreMemoryNote      = "the --dev-fixtures in-memory trace store is wired: uploads succeed, but it is EPHEMERAL — every bundle is lost when fishhawkd restarts, so it is not durable for a real dogfood loop"
+	traceStoreMemoryNote      = "the in-memory trace store is wired (--dev-fixtures or --dev-trace-store): uploads succeed, but it is EPHEMERAL — every bundle is lost when fishhawkd restarts, so it is not durable for a real dogfood loop"
 	traceStoreOtherNote       = "a non-S3, non-memory trace store implementation is wired; no claim is made about its durability"
 )
 

@@ -63,7 +63,8 @@ type onboardingReadiness struct {
 
 // traceStoreReadiness mirrors the backend traceStoreReadiness sub-object
 // (backend/internal/server/onboarding.go, #3600). Kind is one of four values:
-// "s3", "memory" (the --dev-fixtures in-memory store, EPHEMERAL), "none" (no
+// "s3", "memory" (the --dev-fixtures / --dev-trace-store in-memory store,
+// EPHEMERAL), "none" (no
 // store — every run's trace upload 503s after the agent was billed) or
 // "other" (a non-S3, non-memory store, no durability claim).
 type traceStoreReadiness struct {
@@ -416,7 +417,7 @@ func traceStoreRung(ts *traceStoreReadiness) (checkResult, bool) {
 	case ts.Kind == "memory":
 		remediate := ts.Note
 		if remediate == "" {
-			remediate = "the --dev-fixtures in-memory trace store is EPHEMERAL: every bundle is lost when fishhawkd restarts"
+			remediate = "the in-memory trace store (--dev-fixtures or --dev-trace-store) is EPHEMERAL: every bundle is lost when fishhawkd restarts"
 		}
 		return checkResult{
 			label: label, detail: "memory (ephemeral)", status: "warn",

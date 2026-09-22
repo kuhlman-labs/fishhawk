@@ -993,6 +993,27 @@ func TestDoctorOnboarding_TraceStoreMemory_WarnsEphemeral(t *testing.T) {
 	}
 }
 
+// TestDoctorOnboarding_TraceStoreMemory_EmptyNoteFallback pins the DEFENSIVE
+// branch of the memory rung: a backend that serves kind "memory" with no
+// note (an older build, or a note dropped on the wire) must still render the
+// ephemerality — and, since E45.76 / #3601, must attribute the store to BOTH
+// knobs. A fallback naming only --dev-fixtures would point an operator at the
+// flag that ALSO denies every forge write, which is the trap this epic closes.
+func TestDoctorOnboarding_TraceStoreMemory_EmptyNoteFallback(t *testing.T) {
+	r, ok := traceStoreRungFrom(t, traceStoreBody(`{"configured": true, "kind": "memory"}`))
+	if !ok {
+		t.Fatalf("no trace store rung for kind memory with an empty note")
+	}
+	if r.status != "warn" {
+		t.Errorf("status = %q, want warn", r.status)
+	}
+	for _, want := range []string{"EPHEMERAL", "--dev-fixtures", "--dev-trace-store", "FISHHAWKD_S3_BUCKET"} {
+		if !strings.Contains(r.remediate, want) {
+			t.Errorf("remediate = %q, want it to name %q", r.remediate, want)
+		}
+	}
+}
+
 func TestDoctorOnboarding_TraceStoreS3_Passes(t *testing.T) {
 	for _, kind := range []string{"s3", "other"} {
 		r, ok := traceStoreRungFrom(t, traceStoreBody(`{"configured": true, "kind": "`+kind+`"}`))
