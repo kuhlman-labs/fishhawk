@@ -16,6 +16,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -35,6 +36,7 @@ import (
 	authpkg "github.com/kuhlman-labs/fishhawk/backend/internal/auth"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/claudecode"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/codex"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	forgegitlab "github.com/kuhlman-labs/fishhawk/backend/internal/forge/gitlab"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge/stub"
@@ -372,11 +374,14 @@ func TestPlanReviewerSet_CodexReasoningEffort(t *testing.T) {
 		}
 	})
 	t.Run("For codex constructs a reviewer with the resolved effort", func(t *testing.T) {
+		// lookPath is stubbed to resolve: this subtest is about the
+		// reasoning-effort ladder, not the #3583 PATH precondition, and the
+		// host running the suite need not have the `codex` CLI installed.
 		set := &planReviewerSet{opts: planReviewerOptions{
 			enableCodexReviewer: true,
 			codexModel:          "gpt-5.5",
 			codexEffort:         "low",
-		}}
+		}, lookPath: resolvingLookPath}
 		reviewer, err := set.For("codex", "", "high")
 		if err != nil {
 			t.Fatalf("For(codex): %v", err)
@@ -1398,7 +1403,7 @@ func TestPlanReviewerSet_For_RejectsModelAbsentFromFreshSnapshot(t *testing.T) {
 		enableCodexReviewer:       true,
 		codexModel:                "gpt-5.5",
 		modelOracle:               oracle,
-	}}
+	}, lookPath: resolvingLookPath}
 
 	for _, tc := range []struct{ provider, model string }{
 		{"anthropic", "claude-fable-5-1"},
@@ -1428,7 +1433,7 @@ func TestPlanReviewerSet_For_VerifiesResolvedDefaultModel(t *testing.T) {
 			enableLocalClaudeReviewer: true,
 			localClaudeModel:          "claude-typo-9", // deployment default absent from the fresh set
 			modelOracle:               oracle,
-		}}
+		}, lookPath: resolvingLookPath}
 		if _, err := set.For("claudecode", ""); err == nil {
 			t.Fatal("For(claudecode, \"\") = nil, want the resolved default to be rejected")
 		}
@@ -1439,7 +1444,7 @@ func TestPlanReviewerSet_For_VerifiesResolvedDefaultModel(t *testing.T) {
 			enableLocalClaudeReviewer: true,
 			localClaudeModel:          "claude-opus-4-8",
 			modelOracle:               oracle,
-		}}
+		}, lookPath: resolvingLookPath}
 		if _, err := set.For("claudecode", ""); err != nil {
 			t.Fatalf("For(claudecode, \"\") = %v, want nil (default is served)", err)
 		}
@@ -1463,7 +1468,7 @@ func TestPlanReviewerSet_For_FailsOpenWhenUnverifiable(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			opts := base
 			opts.modelOracle = tc.oracle
-			set := &planReviewerSet{opts: opts}
+			set := &planReviewerSet{opts: opts, lookPath: resolvingLookPath}
 			if rv, err := set.For("claudecode", "claude-anything"); err != nil || rv == nil {
 				t.Fatalf("For = (%v, %v), want a non-nil adapter and nil error (fail-open)", rv, err)
 			}
@@ -5225,4 +5230,184 @@ func TestServe_DevFixturesOff_LeavesConfigNil(t *testing.T) {
 	if !strings.Contains(log, "/v0/runs/{id}/trace will respond 503") {
 		t.Errorf("flag-off, bucket-less boot must keep the S3-unset 503 warning:\n%s", log)
 	}
+}
+
+// resolvingLookPath is the always-resolves lookPath stub used by the reviewer
+// tests that are NOT about the #3583 PATH precondition — the suite must not
+// depend on whether the host running it happens to have `claude` or `codex`
+// installed.
+func resolvingLookPath(name string) (string, error) { return "/stub/bin/" + name, nil }
+
+// TestPlanReviewerSetForRequiresBinaryOnPATH pins the #3583 PATH precondition
+// on the two SUBPROCESS reviewer providers: claudecode and codex are spawned BY
+// fishhawkd, so a deployment whose image carries no such CLI — the shipped
+// runtime image is distroless — must get an honest refusal at reviewer
+// resolution instead of a false "available: true".
+//
+// One subtest per enumerated branch. The two refusal subtests assert error
+// IDENTITY, not merely non-nil: a refusal produced by the pre-existing
+// enabling-flag check (whose message names FISHHAWKD_ENABLE_*) must NOT green
+// them, and the flag-off subtest asserts the inverse so branch ORDER is pinned
+// in both directions (binding condition 4).
+func TestPlanReviewerSetForRequiresBinaryOnPATH(t *testing.T) {
+	// notFound is the bad state, seeded BY CONSTRUCTION: the stub simply returns
+	// exec.ErrNotFound, so nothing in any fixture routes through the control
+	// under test.
+	notFound := func(string) (string, error) { return "", exec.ErrNotFound }
+
+	t.Run("claudecode enabled but CLI absent is refused", func(t *testing.T) {
+		set := &planReviewerSet{
+			opts:     planReviewerOptions{enableLocalClaudeReviewer: true, localClaudeModel: "claude-sonnet-4-6"},
+			lookPath: notFound,
+		}
+		rv, err := set.For("claudecode", "")
+		if err == nil {
+			t.Fatalf("For(claudecode) = (%v, nil), want a refusal when `claude` is absent from PATH", rv)
+		}
+		msg := err.Error()
+		for _, want := range []string{"claude", "PATH", "anthropic"} {
+			if !strings.Contains(msg, want) {
+				t.Errorf("refusal %q does not mention %q", msg, want)
+			}
+		}
+		// Error IDENTITY: the pre-existing flag refusal must not be what greened
+		// this subtest.
+		if strings.Contains(msg, "FISHHAWKD_ENABLE_LOCAL_CLAUDE_REVIEWER") {
+			t.Errorf("refusal %q is the OLD flag-not-set error, not the PATH refusal", msg)
+		}
+	})
+
+	t.Run("codex enabled but CLI absent is refused", func(t *testing.T) {
+		set := &planReviewerSet{
+			opts:     planReviewerOptions{enableCodexReviewer: true, codexModel: "gpt-5.5"},
+			lookPath: notFound,
+		}
+		rv, err := set.For("codex", "")
+		if err == nil {
+			t.Fatalf("For(codex) = (%v, nil), want a refusal when `codex` is absent from PATH", rv)
+		}
+		msg := err.Error()
+		for _, want := range []string{"codex", "PATH", "anthropic"} {
+			if !strings.Contains(msg, want) {
+				t.Errorf("refusal %q does not mention %q", msg, want)
+			}
+		}
+		if strings.Contains(msg, "FISHHAWKD_ENABLE_CODEX_REVIEWER") {
+			t.Errorf("refusal %q is the OLD flag-not-set error, not the PATH refusal", msg)
+		}
+	})
+
+	t.Run("claudecode resolves when the CLI is on PATH", func(t *testing.T) {
+		set := &planReviewerSet{
+			opts:     planReviewerOptions{enableLocalClaudeReviewer: true, localClaudeModel: "claude-sonnet-4-6"},
+			lookPath: resolvingLookPath,
+		}
+		rv, err := set.For("claudecode", "")
+		if err != nil {
+			t.Fatalf("For(claudecode) = %v, want nil when the CLI resolves", err)
+		}
+		if _, ok := rv.(*claudecode.Reviewer); !ok {
+			t.Errorf("For(claudecode) = %T, want *claudecode.Reviewer", rv)
+		}
+	})
+
+	t.Run("codex resolves when the CLI is on PATH", func(t *testing.T) {
+		set := &planReviewerSet{
+			opts:     planReviewerOptions{enableCodexReviewer: true, codexModel: "gpt-5.5"},
+			lookPath: resolvingLookPath,
+		}
+		rv, err := set.For("codex", "")
+		if err != nil {
+			t.Fatalf("For(codex) = %v, want nil when the CLI resolves", err)
+		}
+		if _, ok := rv.(*codex.Reviewer); !ok {
+			t.Errorf("For(codex) = %T, want *codex.Reviewer", rv)
+		}
+	})
+
+	t.Run("anthropic is never PATH-probed", func(t *testing.T) {
+		calls := 0
+		set := &planReviewerSet{
+			opts: planReviewerOptions{anthropicAPIKey: "sk-ant", planReviewModel: "claude-sonnet-4-6"},
+			// Counter read only after For returns, from this single goroutine.
+			lookPath: func(name string) (string, error) { calls++; return "/stub/bin/" + name, nil },
+		}
+		if _, err := set.For("anthropic", ""); err != nil {
+			t.Fatalf("For(anthropic) = %v, want nil", err)
+		}
+		if calls != 0 {
+			t.Errorf("lookPath called %d times for the anthropic SDK adapter, want 0 (it spawns no subprocess)", calls)
+		}
+	})
+
+	t.Run("flag off still wins over the PATH check", func(t *testing.T) {
+		// Branch ORDER, asserted in the inverse direction: an operator who never
+		// enabled the provider must keep the existing knob-naming message and
+		// must NOT be told about PATH.
+		set := &planReviewerSet{opts: planReviewerOptions{}, lookPath: resolvingLookPath}
+		_, err := set.For("claudecode", "")
+		if err == nil {
+			t.Fatal("For(claudecode) with the flag off = nil, want the not-configured refusal")
+		}
+		if !strings.Contains(err.Error(), "FISHHAWKD_ENABLE_LOCAL_CLAUDE_REVIEWER") {
+			t.Errorf("refusal %q does not name the enabling flag; PATH check ran ahead of the flag check", err)
+		}
+		if strings.Contains(err.Error(), "not found on PATH") {
+			t.Errorf("refusal %q is the PATH refusal; the flag check must win when the flag is off", err)
+		}
+	})
+
+	t.Run("configured absolute path is what gets resolved", func(t *testing.T) {
+		var got []string
+		set := &planReviewerSet{
+			opts: planReviewerOptions{enableLocalClaudeReviewer: true, localClaudeBinary: "/opt/agents/claude"},
+			lookPath: func(name string) (string, error) {
+				got = append(got, name)
+				return name, nil
+			},
+		}
+		if _, err := set.For("claudecode", "claude-sonnet-4-6"); err != nil {
+			t.Fatalf("For(claudecode) = %v, want nil", err)
+		}
+		if len(got) != 1 || got[0] != "/opt/agents/claude" {
+			t.Errorf("lookPath received %v, want exactly [/opt/agents/claude] (the configured override, not the bare default)", got)
+		}
+	})
+
+	t.Run("empty configured binary falls back to the adapter default", func(t *testing.T) {
+		var got []string
+		record := func(name string) (string, error) { got = append(got, name); return name, nil }
+		set := &planReviewerSet{
+			opts:     planReviewerOptions{enableLocalClaudeReviewer: true},
+			lookPath: record,
+		}
+		if _, err := set.For("claudecode", "claude-sonnet-4-6"); err != nil {
+			t.Fatalf("For(claudecode) = %v, want nil", err)
+		}
+		// Mirrors claudecode.NewClient's own zero-value defaulting, so the check
+		// validates the binary that WILL be spawned.
+		if len(got) != 1 || got[0] != claudecode.DefaultBinary {
+			t.Errorf("lookPath received %v, want [%s]", got, claudecode.DefaultBinary)
+		}
+		got = nil
+		set = &planReviewerSet{opts: planReviewerOptions{enableCodexReviewer: true}, lookPath: record}
+		if _, err := set.For("codex", "gpt-5.5"); err != nil {
+			t.Fatalf("For(codex) = %v, want nil", err)
+		}
+		if len(got) != 1 || got[0] != codex.DefaultBinary {
+			t.Errorf("lookPath received %v, want [%s]", got, codex.DefaultBinary)
+		}
+	})
+
+	t.Run("default is not path gated", func(t *testing.T) {
+		// Documented residual: Default() has no error channel, so it cannot
+		// refuse. Pinned so a future change to it is deliberate.
+		set := &planReviewerSet{
+			opts:     planReviewerOptions{enableLocalClaudeReviewer: true, localClaudeModel: "claude-sonnet-4-6"},
+			lookPath: notFound,
+		}
+		if got := set.Default(); got == nil {
+			t.Fatal("Default() = nil, want the claudecode adapter (Default is deliberately NOT PATH-gated)")
+		}
+	})
 }

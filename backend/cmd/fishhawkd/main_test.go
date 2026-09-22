@@ -376,11 +376,20 @@ func TestResolvePlanReviewers(t *testing.T) {
 	})
 
 	t.Run("For resolves codex alongside anthropic (#955 concurrent topology)", func(t *testing.T) {
+		// codexBinary points at an executable stub rather than the bare name
+		// `codex`: since #3583 For() resolves the configured binary against PATH
+		// and refuses when it is absent, and the host running this suite need not
+		// have the Codex CLI installed. resolvePlanReviewers wires the real
+		// exec.LookPath, which accepts an absolute path to an executable file.
+		stub := filepath.Join(t.TempDir(), "codex-stub")
+		if err := os.WriteFile(stub, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+			t.Fatalf("write codex stub: %v", err)
+		}
 		set, _ := resolvePlanReviewers(planReviewerOptions{
 			anthropicAPIKey:     "sk-ant",
 			planReviewModel:     "claude-sonnet-4-6",
 			enableCodexReviewer: true,
-			codexBinary:         "codex",
+			codexBinary:         stub,
 			codexModel:          "gpt-5.2-codex",
 		}, logger)
 		got, err := set.For("codex", "")

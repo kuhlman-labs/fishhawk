@@ -95,11 +95,15 @@ ingress:
 #
 # SIZING RATIONALE (E62.2 / #2301). fishhawkd is a plain Go HTTP service: it
 # serves the REST API, runs the (optional) background-worker goroutines, and
-# talks to Postgres and S3. Since the 2026-07-27 simplification that moved the
-# claudecode/codex reviewers to the RUNNER, the control-plane image carries no
-# agent CLIs and spawns NO reviewer subprocesses — so nothing here needs
-# subprocess headroom, which is why the memory limit is a few hundred MiB rather
-# than the multi-GiB an agent-hosting pod would want.
+# talks to Postgres and S3. It DOES construct and spawn the claudecode/codex
+# reviewer subprocesses — the 2026-07-27 simplification did NOT move them to the
+# runner, and this comment previously said so wrongly (#3583). The sizing
+# conclusion is unchanged, on a different and still-correct reason: the enabling
+# flags (FISHHAWKD_ENABLE_LOCAL_CLAUDE_REVIEWER / _CODEX_REVIEWER) default off,
+# the runtime image carries no agent CLI to spawn, and the shipped presets
+# declare provider: anthropic — so nothing here needs subprocess headroom, which
+# is why the memory limit is a few hundred MiB rather than the multi-GiB an
+# agent-hosting pod would want. See README.md "Reviewer providers".
 #   requests — what the scheduler reserves. 100m/128Mi is the idle-to-light
 #              steady state of a Go service with a pgx pool and a handful of
 #              timers; it keeps the pod schedulable on a small node.

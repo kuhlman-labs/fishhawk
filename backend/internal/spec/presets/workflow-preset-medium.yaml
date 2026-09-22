@@ -102,27 +102,52 @@ workflows:
           # constraint. Uncomment and adjust to enforce.
           # agent_version: ">=2.1 <2.2"
         # Advisory plan review: agent reviewers surface verdicts before
-        # the human gate. Heterogeneous topology — Claude and Codex
-        # review concurrently. `reviewers` stays per stage for a second
-        # reason: it is taken WHOLE from exactly one rung, so a file-level
-        # block would be inherited by the review stage, which declares
-        # none on purpose.
+        # the human gate. Two agent reviewers run concurrently — see the
+        # provider note on the block below. `reviewers` stays per stage
+        # for a second reason: it is taken WHOLE from exactly one rung,
+        # so a file-level block would be inherited by the review stage,
+        # which declares none on purpose.
         reviewers:
           # Explicit review authority: makes visible what `agents` +
           # `human: 1` already resolve to — advisory, so agent verdicts
           # surface but the human gate decides. An explicit `authority`
           # wins over the reviewer counts.
           authority: advisory
+          # Reviewer providers. `anthropic` is the SDK/API provider and the
+          # ONLY one a CONTAINER-deployed fishhawkd can run: the runtime
+          # image is distroless (gcr.io/distroless/static-debian12:nonroot)
+          # and carries no agent CLI, while `claudecode` and `codex` are
+          # subprocesses fishhawkd spawns — so those two are refused at
+          # reviewer resolution, naming the missing binary. Two agents keep
+          # a dual-reviewer panel; the heterogeneity sits on the MODEL axis
+          # rather than the provider axis.
+          #
+          # `model:` is OPTIONAL: an EMPTY model means the provider's
+          # deployment default (FISHHAWKD_PLAN_REVIEW_MODEL for anthropic).
+          # If your deployment serves different model ids than the ones
+          # pinned below, DELETE the `model:` lines rather than editing
+          # them — a model id absent from the deployment's snapshot is
+          # rejected at reviewer resolution.
           agents:
-            - provider: claudecode
+            - provider: anthropic
               model: claude-opus-4-8
-            - provider: codex
-              model: gpt-5.5
-              # A codex reviewer may likewise pin the reviewer CLI
-              # versions it was validated against: an out-of-range CLI
-              # fails the review dispatch; an unprobeable version
-              # degrades to a warning.
-              # agent_version: ">=2.1 <2.2"
+            - provider: anthropic
+              model: claude-sonnet-4-6
+          # A HOST deployment that has the agent CLIs on PATH can use the
+          # subprocess providers instead — replace the two entries above
+          # with the pair below, and set the matching capability flags
+          # (FISHHAWKD_ENABLE_LOCAL_CLAUDE_REVIEWER /
+          # FISHHAWKD_ENABLE_CODEX_REVIEWER) on the deployment:
+          #
+          #   - provider: claudecode
+          #     model: claude-opus-4-8
+          #   - provider: codex
+          #     model: gpt-5.5
+          #     # A codex reviewer may likewise pin the reviewer CLI
+          #     # versions it was validated against: an out-of-range CLI
+          #     # fails the review dispatch; an unprobeable version
+          #     # degrades to a warning.
+          #     # agent_version: ">=2.1 <2.2"
           human: 1
         inputs:
           # github_issue names the issue-ANCHORED input, not the forge: it is
@@ -176,7 +201,7 @@ workflows:
             max_iterations: 1
         # Advisory implement-review: agent reviewers read the diff
         # against the approved plan and surface verdicts (incl. the
-        # scope-drift flag). Same Claude+Codex pair as the plan stage,
+        # scope-drift flag). Same two-reviewer panel as the plan stage,
         # and declared per stage for the same reason.
         reviewers:
           # Explicit review authority: makes visible what `agents` +
@@ -184,11 +209,22 @@ workflows:
           # surface but the human gate decides. An explicit `authority`
           # wins over the reviewer counts.
           authority: advisory
+          # Same provider constraint as the plan stage above: `anthropic` is
+          # the only reviewer a container-deployed fishhawkd can run, and
+          # `model:` is optional (empty = the provider's deployment default).
           agents:
-            - provider: claudecode
+            - provider: anthropic
               model: claude-opus-4-8
-            - provider: codex
-              model: gpt-5.5
+            - provider: anthropic
+              model: claude-sonnet-4-6
+          # Host deployments with the agent CLIs on PATH: replace the two
+          # entries above with the subprocess pair, and set the matching
+          # capability flags:
+          #
+          #   - provider: claudecode
+          #     model: claude-opus-4-8
+          #   - provider: codex
+          #     model: gpt-5.5
           human: 1
         inputs:
           - artifact: plan

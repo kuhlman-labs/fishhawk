@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"os/exec"
 	"os/signal"
 	"sort"
 	"syscall"
@@ -348,6 +349,45 @@ func (p *planReviewerOptions) anthropicConfigured() bool {
 // model-overridden instance per resolve is cheap and keeps the set stateless.
 type planReviewerSet struct {
 	opts planReviewerOptions
+	// lookPath resolves a reviewer CLI's executable name or path, defaulting
+	// to exec.LookPath when nil so every existing construction site
+	// (&planReviewerSet{opts: ...}) keeps working unchanged. Injectable so the
+	// PATH precondition in For() is testable without installing a binary.
+	lookPath func(string) (string, error)
+}
+
+// resolveBinary is the PATH precondition for the two SUBPROCESS reviewer
+// providers (#3583). claudecode and codex are spawned by fishhawkd itself
+// (server.reviewGrounding -> claudecode/codex Client builds an exec.Cmd), so a
+// deployment whose image carries no such CLI — the shipped runtime image is
+// gcr.io/distroless/static-debian12:nonroot — converts an honest
+// "available: false" into a false "available: true" the moment the enabling
+// flag is set. Resolving the binary here fails closed instead, with the same
+// error SHAPE as the sibling unconfigured-provider and verifyModel refusals, so
+// the doctor reviewers rung, run-create's unavailableSpecReviewers
+// (reviewer_capability_unavailable) and the review dispatch loop all inherit it
+// with no change of their own.
+//
+// configured is the operator-supplied binary name or path; fallback is the
+// adapter's own DefaultBinary constant, substituted when configured is empty
+// because claudecode.NewClient/codex.NewClient do exactly that — so the check
+// validates the binary that WILL be spawned, not a different one.
+func (p *planReviewerSet) resolveBinary(provider, configured, fallback string) error {
+	name := configured
+	if name == "" {
+		name = fallback
+	}
+	look := p.lookPath
+	if look == nil {
+		look = exec.LookPath
+	}
+	if _, err := look(name); err != nil {
+		return fmt.Errorf("reviewer provider %q is enabled but its CLI %q was not found on PATH: %w. "+
+			"This provider is a subprocess fishhawkd spawns; the shipped runtime image is distroless and ships no agent CLIs, "+
+			"so a container deployment cannot run it. Use a reviewer with provider \"anthropic\" (set FISHHAWKD_ANTHROPIC_API_KEY), "+
+			"or run fishhawkd on a host that has %q on PATH", provider, name, err, name)
+	}
+	return nil
 }
 
 func (p *planReviewerSet) newAnthropic(model string) server.PlanReviewer {
@@ -409,6 +449,14 @@ func (p *planReviewerSet) newCodex(model, reasoningEffort string) server.PlanRev
 // single-adapter era), or a literal nil interface (never a typed-nil) when
 // no backend is configured, so the server's Default()==nil guard stays
 // correct.
+//
+// Deliberately NOT gated by the resolveBinary PATH precondition For() applies
+// (#3583): Default() has no error channel, so it cannot refuse. A deployment
+// that enables claudecode/codex with no such CLI on PATH still gets a
+// constructed adapter here and fails at spawn time with the adapter's own
+// "binary not found" error, exactly as before. The residual is test-pinned
+// (TestPlanReviewerSetForRequiresBinaryOnPATH/default_is_not_path_gated) so a
+// future change to it is deliberate.
 func (p *planReviewerSet) Default() server.PlanReviewer {
 	switch {
 	case p.opts.anthropicConfigured():
@@ -471,6 +519,14 @@ func (p *planReviewerSet) For(provider, model string, reasoningEffort ...string)
 		if !p.opts.enableLocalClaudeReviewer {
 			return nil, fmt.Errorf("reviewer provider %q is not configured: set FISHHAWKD_ENABLE_LOCAL_CLAUDE_REVIEWER", provider)
 		}
+		// Ordering is load-bearing (#3583): the flag refusal above still wins
+		// when the flag is OFF (an operator who never enabled the provider must
+		// not be told about PATH), and the PATH check runs BEFORE verifyModel so
+		// a deployment that cannot spawn the CLI at all is not first told its
+		// model is wrong.
+		if err := p.resolveBinary(provider, p.opts.localClaudeBinary, claudecode.DefaultBinary); err != nil {
+			return nil, err
+		}
 		if model == "" {
 			model = p.opts.localClaudeModel
 		}
@@ -481,6 +537,10 @@ func (p *planReviewerSet) For(provider, model string, reasoningEffort ...string)
 	case "codex":
 		if !p.opts.enableCodexReviewer {
 			return nil, fmt.Errorf("reviewer provider %q is not configured: set FISHHAWKD_ENABLE_CODEX_REVIEWER", provider)
+		}
+		// Same load-bearing ordering as the claudecode branch above.
+		if err := p.resolveBinary(provider, p.opts.codexBinary, codex.DefaultBinary); err != nil {
+			return nil, err
 		}
 		if model == "" {
 			model = p.opts.codexModel
@@ -557,7 +617,7 @@ func (p *planReviewerSet) verifyModel(provider, model string) error {
 // returns (set, nil) unchanged, preserving the existing regionKeyWithoutEndpoint
 // withhold-and-warn and the subprocess fall-through byte-for-byte.
 func resolvePlanReviewers(opts planReviewerOptions, logger *slog.Logger) (server.ReviewerSet, error) {
-	set := &planReviewerSet{opts: opts}
+	set := &planReviewerSet{opts: opts, lookPath: exec.LookPath}
 	if opts.regionScoped() && !opts.regionInferenceFullyConfigured() && opts.anyReviewerConfigured() {
 		var missing []string
 		if opts.modelBaseURL == "" {

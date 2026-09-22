@@ -433,6 +433,38 @@ Kills the tracked port-forwards (fishhawkd pid in `.fishhawk/k8s-pf.pid`, Jaeger
 pid in `.fishhawk/k8s-jaeger-pf.pid`) and runs `helm uninstall fishhawk`. All
 steps are idempotent, so a double teardown is a no-op.
 
+## Reviewer providers: `anthropic` only in-cluster
+
+The runtime stage of `backend/Dockerfile` is
+`gcr.io/distroless/static-debian12:nonroot` (see the TLS section below,
+which relies on the same fact). It ships no shell, no package manager,
+and no agent CLI — so the two SUBPROCESS reviewer providers a workflow
+spec can declare, `claudecode` (spawns `claude`) and `codex` (spawns
+`codex`), have nothing to spawn in this pod and nothing can be installed
+into it.
+
+Use `provider: anthropic` for every reviewer, backed by
+`anthropicApiKey` → `FISHHAWKD_ANTHROPIC_API_KEY`. The shipped workflow
+presets already do. Setting `FISHHAWKD_ENABLE_LOCAL_CLAUDE_REVIEWER` or
+`FISHHAWKD_ENABLE_CODEX_REVIEWER` in-cluster is not a remedy: those flags
+are capability gates, not installers, and since #3583 fishhawkd refuses
+such a reviewer at resolution when the binary is absent from PATH.
+
+Full table, the enabling-flag semantics and the host-deployment swap:
+`deploy/helm/fishhawk/README.md` § "Reviewer providers".
+
+## When a reviewer reports `not found on PATH`
+
+The spec declares `provider: claudecode` or `provider: codex`, the
+matching `FISHHAWKD_ENABLE_*` flag is set, and the CLI is not on the
+fishhawkd process's PATH — on a chart install it never is. `fishhawk
+doctor` reports the `reviewers` rung `available: false` with that reason,
+and a run records a `reviewer_capability_unavailable` audit entry.
+
+Remedy: change the reviewer to `provider: anthropic` (and set
+`anthropicApiKey`), per the section above. There is no in-cluster fix:
+the distroless image has no CLI to install.
+
 ## When the migration hook fails
 
 The chart's `pre-install`/`pre-upgrade` migrate Job is what stops serve starting

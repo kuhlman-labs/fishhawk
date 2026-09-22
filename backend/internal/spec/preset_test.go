@@ -845,3 +845,45 @@ func TestPresetShapeBytesUnknown(t *testing.T) {
 		}
 	})
 }
+
+// TestShippedPresetsDeclareChartRunnableReviewers is the done-means guard for
+// #3583: every shipped preset must declare reviewers a CHART-installed
+// fishhawkd can actually run. `claudecode` and `codex` are subprocess adapters
+// fishhawkd spawns, and the runtime image is distroless
+// (gcr.io/distroless/static-debian12:nonroot) with no agent CLI, so a preset
+// naming either ships a dead review gate on the documented install path.
+//
+// This is behavioral cover the pre-PR scope-completeness gate structurally
+// cannot give: a comment-only or no-op touch of a preset file satisfies
+// presence but fails this assertion. It enumerates from presetPaths, so a
+// FUTURE tier or shape variant (#3581) is covered with no edit here — a new
+// shape inheriting a subprocess provider goes red instead of shipping.
+func TestShippedPresetsDeclareChartRunnableReviewers(t *testing.T) {
+	const want = "anthropic"
+	for key := range presetPaths {
+		t.Run(string(key.preset)+"/"+string(key.shape), func(t *testing.T) {
+			s := parsePresetShape(t, key.preset, key.shape)
+			seen := 0
+			for wfID, wf := range s.Workflows {
+				for _, stage := range wf.Stages {
+					if stage.Reviewers == nil {
+						continue
+					}
+					for i, agent := range stage.Reviewers.Agents {
+						seen++
+						if agent.Provider != want {
+							t.Errorf("preset %s/%s workflow %q stage %q reviewers.agents[%d].provider = %q, want %q "+
+								"(claudecode/codex are subprocesses fishhawkd spawns; the distroless runtime image carries no agent CLI)",
+								key.preset, key.shape, wfID, stage.ID, i, agent.Provider, want)
+						}
+					}
+				}
+			}
+			// Anti-vacuity: a preset that declared no agent reviewers at all
+			// would pass the loop above trivially.
+			if seen == 0 {
+				t.Fatalf("preset %s/%s declares no reviewers.agents entries at all", key.preset, key.shape)
+			}
+		})
+	}
+}

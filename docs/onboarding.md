@@ -310,7 +310,7 @@ fishhawk init [--preset low|medium|high] [--shape app|config-only] \
      Shape is chosen explicitly, never inferred from the working directory.
    - `--budget-usd N` overrides the `feature_change` weekly advisory cost
      ceiling (`budgets[0].limit_usd`).
-   - `--single-reviewer` drops the Codex agent reviewer, leaving Claude alone
+   - `--single-reviewer` drops the second agent reviewer, leaving one per stage
      on every stage.
    - `--human-gates id,id` keeps the human gate only on the named stages; any
      stage with a gate whose id is not listed has it removed (omit the flag to

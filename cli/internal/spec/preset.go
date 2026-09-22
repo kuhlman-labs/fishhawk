@@ -84,10 +84,6 @@ var presetPaths = map[presetKey]string{
 	{PresetHigh, ShapeConfigOnly}:   "presets/workflow-preset-high-config-only.yaml",
 }
 
-// codexReviewerProvider is the provider name of the second (Codex) agent
-// reviewer; the SingleReviewer delta drops the entry with this provider.
-const codexReviewerProvider = "codex"
-
 // Deltas are the structured overrides applied to a preset by Generate.
 // The zero value applies nothing — Generate returns the preset
 // unchanged (bar a re-encode). Every delta is validated through
@@ -96,9 +92,12 @@ type Deltas struct {
 	// BudgetLimitUSD, when non-nil, overrides the feature_change
 	// workflow's weekly advisory cost ceiling (budgets[0].limit_usd).
 	BudgetLimitUSD *int
-	// SingleReviewer, when true, drops the Codex (gpt-5.5) agent
-	// reviewer from every stage's reviewers.agents, leaving Claude
-	// alone.
+	// SingleReviewer, when true, truncates every stage's
+	// reviewers.agents sequence to its FIRST entry, leaving one agent
+	// reviewer per stage. The rule is POSITIONAL, not provider-keyed
+	// (#3583): the shipped presets now declare two `anthropic` agents
+	// differing only by model, so a provider match would select nothing
+	// and the delta would silently no-op.
 	SingleReviewer bool
 	// HumanGates, when non-nil, selects which stages keep their human
 	// approval gate: a stage whose id is listed keeps its gates; any
@@ -271,8 +270,15 @@ func applyBudgetLimit(wf *yaml.Node, limit int) error {
 	return nil
 }
 
-// applySingleReviewer drops the Codex agent reviewer from every stage's
-// reviewers.agents sequence, leaving the Claude reviewer alone.
+// applySingleReviewer truncates every stage's reviewers.agents sequence
+// to its FIRST entry, leaving one agent reviewer per stage.
+//
+// The rule is POSITIONAL rather than provider-keyed (#3583). It used to
+// drop the entry whose provider was "codex"; since the shipped presets
+// declare two `anthropic` agents differing only by model, that match
+// would select nothing and the delta would silently no-op. Truncating to
+// the first entry is provider-independent and survives a future change
+// to either agent's provider or model.
 func applySingleReviewer(wf *yaml.Node) {
 	for _, stage := range stageNodes(wf) {
 		reviewers := mappingNode(mapValue(stage, "reviewers"))
@@ -283,15 +289,9 @@ func applySingleReviewer(wf *yaml.Node) {
 		if agents == nil || agents.Kind != yaml.SequenceNode {
 			continue
 		}
-		kept := agents.Content[:0:0]
-		for _, agent := range agents.Content {
-			provider := mapValue(mappingNode(agent), "provider")
-			if provider != nil && provider.Value == codexReviewerProvider {
-				continue
-			}
-			kept = append(kept, agent)
+		if len(agents.Content) > 1 {
+			agents.Content = agents.Content[:1]
 		}
-		agents.Content = kept
 	}
 }
 
