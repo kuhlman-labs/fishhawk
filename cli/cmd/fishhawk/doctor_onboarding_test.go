@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"os"
@@ -891,6 +892,115 @@ func TestDoctorOnboarding_MergeGateNullValue_EmitsNoRung(t *testing.T) {
 	for _, r := range readinessRungs(t, "owner/name", body) {
 		if r.label == "merge gate enforced" {
 			t.Fatalf("merge gate rung emitted for an explicit null: %+v", r)
+		}
+	}
+}
+
+// --- trace_store rung (E45.75 / #3600) ---
+//
+// These CLI cases are FIXTURE-based (literal bodies), as approval condition 4
+// allows: the cli module cannot import the backend handler. The served-body
+// cross-boundary seam lives in backend/internal/server/onboarding_test.go
+// (TestOnboardingReadiness_TraceStore_SurvivesMCPMirrorDecode).
+
+// traceStoreBody is a readiness body carrying the given trace_store JSON
+// object (or no key at all when ts is empty).
+func traceStoreBody(ts string) string {
+	tail := ""
+	if ts != "" {
+		tail = `, "trace_store": ` + ts
+	}
+	return `{"repo": "owner/name", "app": {"installed": true}, "spec": {"source": "fetched", "valid": true},
+	  "reviewers": [], "scopes": {"adequate": true}` + tail + `}`
+}
+
+func traceStoreRungFrom(t *testing.T, body string) (checkResult, bool) {
+	t.Helper()
+	for _, r := range readinessRungs(t, "owner/name", body) {
+		if r.label == "trace store configured" {
+			return r, true
+		}
+	}
+	return checkResult{}, false
+}
+
+// TestDoctorOnboarding_TraceStoreMirrorsBackendTags decodes a body in which
+// EVERY trace_store field carries a distinct non-empty value, so a tag typo
+// cannot pass on zero values.
+func TestDoctorOnboarding_TraceStoreMirrorsBackendTags(t *testing.T) {
+	var got onboardingReadiness
+	body := traceStoreBody(`{"configured": true, "kind": "memory", "note": "note-sentinel", "remediation": "remediation-sentinel"}`)
+	if err := json.Unmarshal([]byte(body), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	ts := got.TraceStore
+	if ts == nil {
+		t.Fatalf("TraceStore = nil, want the decoded object")
+	}
+	if !ts.Configured || ts.Kind != "memory" || ts.Note != "note-sentinel" || ts.Remediation != "remediation-sentinel" {
+		t.Errorf("TraceStore = %+v, want every field decoded", *ts)
+	}
+}
+
+// TestDoctorOnboarding_TraceStoreAbsentOrNull_EmitsNoRung pins the pointer: an
+// absent key (older fishhawkd) and an explicit null both draw NO rung.
+func TestDoctorOnboarding_TraceStoreAbsentOrNull_EmitsNoRung(t *testing.T) {
+	for name, body := range map[string]string{
+		"absent": traceStoreBody(""),
+		"null":   traceStoreBody("null"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			var decoded onboardingReadiness
+			if err := json.Unmarshal([]byte(body), &decoded); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if decoded.TraceStore != nil {
+				t.Errorf("TraceStore = %+v, want nil", *decoded.TraceStore)
+			}
+			if r, ok := traceStoreRungFrom(t, body); ok {
+				t.Errorf("trace store rung emitted for %s: %+v", name, r)
+			}
+		})
+	}
+}
+
+func TestDoctorOnboarding_TraceStoreNone_FailsNamingBucket(t *testing.T) {
+	r, ok := traceStoreRungFrom(t, traceStoreBody(`{"configured": false, "kind": "none", "note": "n", "remediation": "set FISHHAWKD_S3_BUCKET and run make s3-init"}`))
+	if !ok {
+		t.Fatalf("no trace store rung for kind none")
+	}
+	if r.status != "fail" {
+		t.Errorf("status = %q, want fail", r.status)
+	}
+	if !strings.Contains(r.remediate, "FISHHAWKD_S3_BUCKET") {
+		t.Errorf("remediate = %q, want it to name FISHHAWKD_S3_BUCKET", r.remediate)
+	}
+	if !strings.Contains(r.detail, "503") {
+		t.Errorf("detail = %q, want the 503 consequence", r.detail)
+	}
+}
+
+func TestDoctorOnboarding_TraceStoreMemory_WarnsEphemeral(t *testing.T) {
+	r, ok := traceStoreRungFrom(t, traceStoreBody(`{"configured": true, "kind": "memory", "note": "the in-memory store is EPHEMERAL"}`))
+	if !ok {
+		t.Fatalf("no trace store rung for kind memory")
+	}
+	if r.status != "warn" {
+		t.Errorf("status = %q, want warn", r.status)
+	}
+	if !strings.Contains(r.detail, "ephemeral") || !strings.Contains(r.remediate, "EPHEMERAL") {
+		t.Errorf("rung = %+v, want the ephemerality named", r)
+	}
+}
+
+func TestDoctorOnboarding_TraceStoreS3_Passes(t *testing.T) {
+	for _, kind := range []string{"s3", "other"} {
+		r, ok := traceStoreRungFrom(t, traceStoreBody(`{"configured": true, "kind": "`+kind+`"}`))
+		if !ok {
+			t.Fatalf("no trace store rung for kind %s", kind)
+		}
+		if r.status != "ok" || r.detail != kind {
+			t.Errorf("kind %s: rung = %+v, want ok with detail %q", kind, r, kind)
 		}
 	}
 }
