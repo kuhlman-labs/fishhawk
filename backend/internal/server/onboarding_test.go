@@ -1987,28 +1987,59 @@ func TestOnboardingReadiness_MergeGate_RequiredViaClassicBypassable(t *testing.T
 const onboardingNestedGitLabPath = "gitlab-com/customer-success/solutions-architecture/coe/gitlab-migrator"
 
 // fakeGitLabForOnboarding is a minimal GitLab v4 stub for the readiness
-// endpoint's gitlab family: GET /api/v4/projects/<path> (project resolve) and
+// endpoint's gitlab family: GET /api/v4/projects/<path> (project resolve),
 // GET /api/v4/projects/<path>/repository/files/.fishhawk/workflows.yaml (the
-// Repository Files API). It is a CATCH-ALL handler switching on the DECODED
-// r.URL.Path rather than a mux pattern, because gitlabclient PathEscapes the
-// whole namespaced path into one %2F-bearing segment and ServeMux pattern
-// matching on such a path is ambiguous. It records the decoded project path
-// each call addressed, so a test can assert the FULL nested path reached the
-// forge on both calls.
+// Repository Files API), and — for the gitlab_merge_gate rung (E45.66 /
+// #3580) — GET /api/v4/projects/<id> (the project settings, by NUMERIC id)
+// and GET /api/v4/projects/<id>/protected_branches (the rule list). It is a
+// CATCH-ALL handler switching on the DECODED r.URL.Path rather than a mux
+// pattern, because gitlabclient PathEscapes the whole namespaced path into
+// one %2F-bearing segment and ServeMux pattern matching on such a path is
+// ambiguous. It records the decoded project path each path-lookup call
+// addressed, so a test can assert the FULL nested path reached the forge on
+// both calls; the by-id and protected-branch calls are counted separately
+// (idCalls / listCalls) so the existing path assertions stay byte-identical.
+//
+// projectSettingsJSON is the by-id body's settings tail (default: main is the
+// default branch, pipeline must succeed, skipped pipelines not allowed,
+// discussions must be resolved); protectedRulesJSON is the rule list (default:
+// one exact `main` rule, push "No one" (0), merge "Maintainers" (40), no force
+// push). listHang, when set, makes the list route sleep — the probe-timeout
+// vehicle.
 type fakeGitLabForOnboarding struct {
-	mu            sync.Mutex
-	projectStatus int
-	fileStatus    int
-	specYAML      string
-	projectPaths  []string
-	filePaths     []string
+	mu                  sync.Mutex
+	projectStatus       int
+	fileStatus          int
+	projectByIDStatus   int
+	protectedStatus     int
+	specYAML            string
+	projectSettingsJSON string
+	protectedRulesJSON  string
+	listHang            time.Duration
+	projectPaths        []string
+	filePaths           []string
+	idCalls             int
+	listCalls           int
 }
+
+// fakeGitLabProjectID is the numeric id the path lookup answers; the by-id
+// and protected-branch routes are keyed on it.
+const fakeGitLabProjectID = "5"
+
+const (
+	fakeGitLabDefaultSettingsJSON = `"default_branch":"main","only_allow_merge_if_pipeline_succeeds":true,"allow_merge_on_skipped_pipeline":false,"only_allow_merge_if_all_discussions_are_resolved":true`
+	fakeGitLabDefaultRulesJSON    = `[{"id":1,"name":"main","push_access_levels":[{"access_level":0,"access_level_description":"No one"}],"merge_access_levels":[{"access_level":40,"access_level_description":"Maintainers"}],"allow_force_push":false}]`
+)
 
 func newFakeGitLabForOnboarding(specYAML string) *fakeGitLabForOnboarding {
 	return &fakeGitLabForOnboarding{
-		projectStatus: http.StatusOK,
-		fileStatus:    http.StatusOK,
-		specYAML:      specYAML,
+		projectStatus:       http.StatusOK,
+		fileStatus:          http.StatusOK,
+		projectByIDStatus:   http.StatusOK,
+		protectedStatus:     http.StatusOK,
+		specYAML:            specYAML,
+		projectSettingsJSON: fakeGitLabDefaultSettingsJSON,
+		protectedRulesJSON:  fakeGitLabDefaultRulesJSON,
 	}
 }
 
@@ -2026,6 +2057,35 @@ func (f *fakeGitLabForOnboarding) server(t *testing.T) *httptest.Server {
 		rest := strings.TrimPrefix(r.URL.Path, prefix)
 		f.mu.Lock()
 		defer f.mu.Unlock()
+		switch rest {
+		case fakeGitLabProjectID:
+			f.idCalls++
+			w.WriteHeader(f.projectByIDStatus)
+			if f.projectByIDStatus != http.StatusOK {
+				_, _ = w.Write([]byte(`{"message":"` + http.StatusText(f.projectByIDStatus) + `"}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"id":` + fakeGitLabProjectID + `,"web_url":"` + srvURLPlaceholder + `",` + f.projectSettingsJSON + `}`))
+			return
+		case fakeGitLabProjectID + "/protected_branches":
+			f.listCalls++
+			if f.listHang > 0 {
+				hang := f.listHang
+				f.mu.Unlock()
+				select {
+				case <-time.After(hang):
+				case <-r.Context().Done():
+				}
+				f.mu.Lock()
+			}
+			w.WriteHeader(f.protectedStatus)
+			if f.protectedStatus != http.StatusOK {
+				_, _ = w.Write([]byte(`{"message":"` + http.StatusText(f.protectedStatus) + `"}`))
+				return
+			}
+			_, _ = w.Write([]byte(f.protectedRulesJSON))
+			return
+		}
 		if strings.HasSuffix(rest, fileSuffix) {
 			f.filePaths = append(f.filePaths, strings.TrimSuffix(rest, fileSuffix))
 			w.WriteHeader(f.fileStatus)
@@ -2057,6 +2117,14 @@ func (f *fakeGitLabForOnboarding) calls() (projects, files []string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.projectPaths...), append([]string(nil), f.filePaths...)
+}
+
+// mergeGateCalls returns how many times the by-id project read and the
+// protected-branch list were hit.
+func (f *fakeGitLabForOnboarding) mergeGateCalls() (byID, list int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.idCalls, f.listCalls
 }
 
 // gitlabForgeOver wraps the stub in the REAL forgegitlab.Forge, the adapter
@@ -2172,12 +2240,22 @@ func TestOnboardingReadiness_GitLab_NestedPath_EndToEnd(t *testing.T) {
 	if mg, present := raw["merge_gate"]; present {
 		t.Errorf("merge_gate present on the gitlab family: %v; the surface is never read there and must not render", mg)
 	}
+	// The GitLab-shaped sibling rung (E45.66 / #3580) IS present, and it
+	// addressed project 5 — the id the nested path resolved to — on both the
+	// by-id settings read and the protected-branch list.
+	glmg := rawObject(t, raw, "gitlab_merge_gate")
+	if glmg["status"] != "pipeline_gated" {
+		t.Errorf("gitlab_merge_gate.status = %v, want pipeline_gated", glmg["status"])
+	}
 	projects, files := gl.calls()
 	if len(projects) != 1 || projects[0] != onboardingNestedGitLabPath {
 		t.Errorf("project calls = %v, want exactly one with the full nested path", projects)
 	}
 	if len(files) != 1 || files[0] != onboardingNestedGitLabPath {
 		t.Errorf("file calls = %v, want exactly one with the full nested path", files)
+	}
+	if byID, list := gl.mergeGateCalls(); byID != 1 || list != 1 {
+		t.Errorf("merge-gate calls = by-id:%d list:%d, want 1/1 on project %s", byID, list, fakeGitLabProjectID)
 	}
 }
 
@@ -2521,6 +2599,12 @@ func TestOnboardingReadiness_GitHub_MergeGateKeyPresent(t *testing.T) {
 	if mg["status"] == "" || mg["status"] == nil {
 		t.Errorf("merge_gate.status = %v, want a verdict on the github family", mg["status"])
 	}
+	// The GitLab-shaped sibling is OMITTED on github (E45.66 / #3580): the
+	// counterfactual vehicle for the omission — assigning
+	// `&gitLabMergeGateReadiness{}` on the github arm turns this red.
+	if g, present := raw["gitlab_merge_gate"]; present {
+		t.Errorf("gitlab_merge_gate present on the github family: %v; the rung is gitlab-only", g)
+	}
 	app := rawObject(t, raw, "app")
 	if _, present := app["note"]; present {
 		t.Errorf("app.note present on github (%v); the note is gitlab-only", app["note"])
@@ -2782,4 +2866,385 @@ func TestOnboardingReadiness_GitLab_FetchFault(t *testing.T) {
 	if rec["error"] != fetchErr.Error() {
 		t.Errorf("log error = %v, want %q", rec["error"], fetchErr.Error())
 	}
+}
+
+// --- gitlab_merge_gate rung (E45.66 / #3580) --------------------------------
+
+// gitLabMergeGateSignalKeys are the pointer-bool / list keys the rung renders
+// ONLY on an authoritative read. Every `unknown` test asserts each is ABSENT
+// from the raw object — an unread signal must never render as false.
+var gitLabMergeGateSignalKeys = []string{
+	"protected", "matched_rules", "allow_force_push", "push_access_levels", "merge_access_levels",
+	"pipeline_must_succeed", "allow_skipped_pipeline", "discussions_must_be_resolved", "branch",
+}
+
+// assertGitLabMergeGateUnknown asserts the rung's fail-closed rendering: status
+// unknown, the named reason, authoritative false, the constant note, and
+// every signal key absent.
+func assertGitLabMergeGateUnknown(t *testing.T, raw map[string]any, wantReason string) map[string]any {
+	t.Helper()
+	glmg := rawObject(t, raw, "gitlab_merge_gate")
+	if glmg["status"] != "unknown" {
+		t.Errorf("gitlab_merge_gate.status = %v, want unknown", glmg["status"])
+	}
+	if glmg["reason"] != wantReason {
+		t.Errorf("gitlab_merge_gate.reason = %v, want %q", glmg["reason"], wantReason)
+	}
+	if glmg["authoritative"] != false {
+		t.Errorf("gitlab_merge_gate.authoritative = %v, want false", glmg["authoritative"])
+	}
+	if glmg["note"] != gitLabMergeGateNote {
+		t.Errorf("gitlab_merge_gate.note = %v, want the constant note", glmg["note"])
+	}
+	for _, k := range gitLabMergeGateSignalKeys {
+		if v, present := glmg[k]; present {
+			t.Errorf("gitlab_merge_gate.%s present (%v) on an unknown verdict; an unread signal must be ABSENT, never false", k, v)
+		}
+	}
+	if _, present := raw["merge_gate"]; present {
+		t.Errorf("merge_gate present on the gitlab family")
+	}
+	return glmg
+}
+
+// gitLabMergeGateRaw drives the gitlab family end to end over the stub and
+// returns the raw body.
+func gitLabMergeGateRaw(t *testing.T, gl *fakeGitLabForOnboarding) map[string]any {
+	t.Helper()
+	s := newOnboardingGitLabServer(t, nil, gitlabForgeOver(gl.server(t)), nil, nil)
+	id := testOperatorIdentity()
+	return rawReadiness(t, s, onboardingReqForge("acme/widgets", "gitlab", &id))
+}
+
+// TestOnboardingReadiness_GitLabMergeGate_EndToEnd is the CROSS-BOUNDARY test
+// for the rung: HTTP → handler → the REAL forgegitlab.Forge → the real
+// gitlabclient → the v4 stub → the RAW JSON body. The default fixture (one
+// exact `main` rule, pipeline must succeed) renders pipeline_gated with every
+// signal mapped, the constant note, and NO merge_gate key.
+func TestOnboardingReadiness_GitLabMergeGate_EndToEnd(t *testing.T) {
+	gl := newFakeGitLabForOnboarding(onboardingReviewersSpecYAML)
+	raw := gitLabMergeGateRaw(t, gl)
+
+	if _, present := raw["merge_gate"]; present {
+		t.Errorf("merge_gate present on the gitlab family; the GitHub-shaped rung must stay omitted")
+	}
+	glmg := rawObject(t, raw, "gitlab_merge_gate")
+	if glmg["status"] != "pipeline_gated" {
+		t.Errorf("status = %v, want pipeline_gated", glmg["status"])
+	}
+	if glmg["branch"] != "main" {
+		t.Errorf("branch = %v, want main (the project's real default branch)", glmg["branch"])
+	}
+	if glmg["protected"] != true {
+		t.Errorf("protected = %v, want true", glmg["protected"])
+	}
+	if rules, _ := glmg["matched_rules"].([]any); len(rules) != 1 || rules[0] != "main" {
+		t.Errorf("matched_rules = %v, want [main]", glmg["matched_rules"])
+	}
+	if glmg["allow_force_push"] != false {
+		t.Errorf("allow_force_push = %v, want false (read, not absent)", glmg["allow_force_push"])
+	}
+	if glmg["pipeline_must_succeed"] != true {
+		t.Errorf("pipeline_must_succeed = %v, want true", glmg["pipeline_must_succeed"])
+	}
+	if glmg["allow_skipped_pipeline"] != false {
+		t.Errorf("allow_skipped_pipeline = %v, want false (read, not absent)", glmg["allow_skipped_pipeline"])
+	}
+	if glmg["discussions_must_be_resolved"] != true {
+		t.Errorf("discussions_must_be_resolved = %v, want true", glmg["discussions_must_be_resolved"])
+	}
+	if glmg["authoritative"] != true {
+		t.Errorf("authoritative = %v, want true", glmg["authoritative"])
+	}
+	if glmg["note"] != gitLabMergeGateNote {
+		t.Errorf("note = %v, want the constant note", glmg["note"])
+	}
+	if !strings.Contains(gitLabMergeGateNote, "no per-context required status check") ||
+		!strings.Contains(gitLabMergeGateNote, "UNION across every matching protected-branch rule") {
+		t.Errorf("note does not state the per-context caveat and the union semantics: %q", gitLabMergeGateNote)
+	}
+	push, _ := glmg["push_access_levels"].([]any)
+	merge, _ := glmg["merge_access_levels"].([]any)
+	if len(push) != 1 || len(merge) != 1 {
+		t.Fatalf("access levels = push:%v merge:%v, want one entry each", glmg["push_access_levels"], glmg["merge_access_levels"])
+	}
+	if lvl, _ := push[0].(map[string]any); lvl["level"] != float64(0) || lvl["description"] != "No one" {
+		t.Errorf("push_access_levels[0] = %v, want level 0 / No one", push[0])
+	}
+	if lvl, _ := merge[0].(map[string]any); lvl["level"] != float64(40) || lvl["description"] != "Maintainers" {
+		t.Errorf("merge_access_levels[0] = %v, want level 40 / Maintainers", merge[0])
+	}
+	if _, present := glmg["reason"]; present {
+		t.Errorf("reason present on an authoritative verdict: %v", glmg["reason"])
+	}
+	if byID, list := gl.mergeGateCalls(); byID != 1 || list != 1 {
+		t.Errorf("merge-gate calls = by-id:%d list:%d, want 1/1", byID, list)
+	}
+}
+
+// TestOnboardingReadiness_GitLabMergeGate_OverlappingRules_Union pins the
+// approval-condition-1 wire shape end to end: an exact `main` rule (merge 40,
+// no force push) and a wildcard `m*` rule (merge 30, force push allowed) both
+// match, so matched_rules is [main, m*], merge levels are the ascending union
+// [30, 40] and allow_force_push is the OR (true).
+func TestOnboardingReadiness_GitLabMergeGate_OverlappingRules_Union(t *testing.T) {
+	gl := newFakeGitLabForOnboarding(onboardingReviewersSpecYAML)
+	gl.protectedRulesJSON = `[
+	  {"id":1,"name":"main","push_access_levels":[{"access_level":40,"access_level_description":"Maintainers"}],"merge_access_levels":[{"access_level":40,"access_level_description":"Maintainers"}],"allow_force_push":false},
+	  {"id":2,"name":"m*","push_access_levels":[{"access_level":30,"access_level_description":"Developers + Maintainers"}],"merge_access_levels":[{"access_level":30,"access_level_description":"Developers + Maintainers"}],"allow_force_push":true}
+	]`
+	raw := gitLabMergeGateRaw(t, gl)
+	glmg := rawObject(t, raw, "gitlab_merge_gate")
+	if glmg["status"] != "pipeline_gated" || glmg["protected"] != true {
+		t.Errorf("status/protected = %v/%v, want pipeline_gated/true", glmg["status"], glmg["protected"])
+	}
+	rules, _ := glmg["matched_rules"].([]any)
+	if len(rules) != 2 || rules[0] != "main" || rules[1] != "m*" {
+		t.Errorf("matched_rules = %v, want [main m*] (exact first, then wildcards)", glmg["matched_rules"])
+	}
+	if glmg["allow_force_push"] != true {
+		t.Errorf("allow_force_push = %v, want true (OR across matching rules)", glmg["allow_force_push"])
+	}
+	merge, _ := glmg["merge_access_levels"].([]any)
+	if len(merge) != 2 {
+		t.Fatalf("merge_access_levels = %v, want the two-level union", glmg["merge_access_levels"])
+	}
+	l0, _ := merge[0].(map[string]any)
+	l1, _ := merge[1].(map[string]any)
+	if l0["level"] != float64(30) || l1["level"] != float64(40) {
+		t.Errorf("merge_access_levels = %v, want ascending [30, 40] (most permissive first)", merge)
+	}
+}
+
+// TestOnboardingReadiness_GitLabMergeGate_NotProtected_NotPipelineGated: an
+// authoritative EMPTY rule list → not_pipeline_gated, protected false (read,
+// present), the project settings still mapped, and detail naming the
+// unprotected branch.
+func TestOnboardingReadiness_GitLabMergeGate_NotProtected_NotPipelineGated(t *testing.T) {
+	gl := newFakeGitLabForOnboarding(onboardingReviewersSpecYAML)
+	gl.protectedRulesJSON = `[]`
+	raw := gitLabMergeGateRaw(t, gl)
+	glmg := rawObject(t, raw, "gitlab_merge_gate")
+	if glmg["status"] != "not_pipeline_gated" {
+		t.Errorf("status = %v, want not_pipeline_gated", glmg["status"])
+	}
+	if glmg["protected"] != false {
+		t.Errorf("protected = %v, want false (an authoritative empty list, so PRESENT)", glmg["protected"])
+	}
+	if _, present := glmg["matched_rules"]; present {
+		t.Errorf("matched_rules present with no matching rule: %v", glmg["matched_rules"])
+	}
+	if glmg["pipeline_must_succeed"] != true {
+		t.Errorf("pipeline_must_succeed = %v, want true (still mapped)", glmg["pipeline_must_succeed"])
+	}
+	if glmg["authoritative"] != true {
+		t.Errorf("authoritative = %v, want true", glmg["authoritative"])
+	}
+	detail, _ := glmg["detail"].(string)
+	if !strings.Contains(detail, "default branch main is not covered by any protected-branch rule") {
+		t.Errorf("detail = %q, want it to name the unprotected default branch", detail)
+	}
+	if strings.Contains(detail, "only_allow_merge_if_pipeline_succeeds") {
+		t.Errorf("detail = %q names the pipeline setting, which is ON", detail)
+	}
+	if rem, _ := glmg["remediation"].(string); !strings.Contains(rem, "Protected branches") {
+		t.Errorf("remediation = %q, want the GitLab settings path", rem)
+	}
+}
+
+// TestOnboardingReadiness_GitLabMergeGate_PipelineNotRequired_NotPipelineGated:
+// the branch is protected but only_allow_merge_if_pipeline_succeeds is off →
+// not_pipeline_gated with detail naming the setting.
+func TestOnboardingReadiness_GitLabMergeGate_PipelineNotRequired_NotPipelineGated(t *testing.T) {
+	gl := newFakeGitLabForOnboarding(onboardingReviewersSpecYAML)
+	gl.projectSettingsJSON = `"default_branch":"main","only_allow_merge_if_pipeline_succeeds":false,"allow_merge_on_skipped_pipeline":true,"only_allow_merge_if_all_discussions_are_resolved":false`
+	raw := gitLabMergeGateRaw(t, gl)
+	glmg := rawObject(t, raw, "gitlab_merge_gate")
+	if glmg["status"] != "not_pipeline_gated" {
+		t.Errorf("status = %v, want not_pipeline_gated", glmg["status"])
+	}
+	if glmg["protected"] != true {
+		t.Errorf("protected = %v, want true", glmg["protected"])
+	}
+	if glmg["pipeline_must_succeed"] != false {
+		t.Errorf("pipeline_must_succeed = %v, want false (read, PRESENT)", glmg["pipeline_must_succeed"])
+	}
+	if glmg["allow_skipped_pipeline"] != true || glmg["discussions_must_be_resolved"] != false {
+		t.Errorf("informational settings = skipped:%v discussions:%v, want true/false", glmg["allow_skipped_pipeline"], glmg["discussions_must_be_resolved"])
+	}
+	detail, _ := glmg["detail"].(string)
+	if !strings.Contains(detail, "only_allow_merge_if_pipeline_succeeds is off") {
+		t.Errorf("detail = %q, want it to name the pipeline setting", detail)
+	}
+	if strings.Contains(detail, "not covered by any protected-branch rule") {
+		t.Errorf("detail = %q names the branch as unprotected, but it IS protected", detail)
+	}
+}
+
+// TestOnboardingReadiness_GitLabMergeGate_ForgeUnconfigured_Unknown: no gitlab
+// forge → unknown / gitlab_forge_unconfigured, every signal key ABSENT (pins
+// the pointer-bool absence rule).
+func TestOnboardingReadiness_GitLabMergeGate_ForgeUnconfigured_Unknown(t *testing.T) {
+	s := newOnboardingGitLabServer(t, nil, nil, nil, nil)
+	id := testOperatorIdentity()
+	raw := rawReadiness(t, s, onboardingReqForge("acme/widgets", "gitlab", &id))
+	glmg := assertGitLabMergeGateUnknown(t, raw, gitLabMergeGateReasonForgeUnconfigured)
+	if rem, _ := glmg["remediation"].(string); !strings.Contains(rem, "FISHHAWKD_GITLAB_TOKEN") {
+		t.Errorf("remediation = %q, want the env vars named", rem)
+	}
+}
+
+// TestOnboardingReadiness_GitLabMergeGate_ProjectNotVisible_Unknown: a 404 on
+// the path lookup → unknown / project_not_visible with the register command,
+// and ZERO by-id / list calls (the probe never reaches the forge).
+func TestOnboardingReadiness_GitLabMergeGate_ProjectNotVisible_Unknown(t *testing.T) {
+	gl := newFakeGitLabForOnboarding(onboardingReviewersSpecYAML)
+	gl.projectStatus = http.StatusNotFound
+	raw := gitLabMergeGateRaw(t, gl)
+	glmg := assertGitLabMergeGateUnknown(t, raw, gitLabMergeGateReasonProjectNotVisible)
+	if rem, _ := glmg["remediation"].(string); !strings.Contains(rem, "fishhawkd installation register --provider gitlab --project-path acme/widgets") {
+		t.Errorf("remediation = %q, want the register command naming the project", rem)
+	}
+	if byID, list := gl.mergeGateCalls(); byID != 0 || list != 0 {
+		t.Errorf("merge-gate calls = by-id:%d list:%d, want 0/0 on an unresolved project", byID, list)
+	}
+}
+
+// TestOnboardingReadiness_GitLabMergeGate_Unsupported_Unknown: a forge that
+// resolves the project but does not implement forge.MergeProtectionReader
+// (gitlabFetchErrForge: FileFetcher only) → unknown /
+// merge_protection_unsupported.
+func TestOnboardingReadiness_GitLabMergeGate_Unsupported_Unknown(t *testing.T) {
+	f := &gitlabFetchErrForge{fetchErr: errors.New("unused")}
+	if _, ok := forge.Forge(f).(forge.MergeProtectionReader); ok {
+		t.Fatalf("fixture implements MergeProtectionReader; the test needs one that does not")
+	}
+	s := newOnboardingGitLabServer(t, nil, f, nil, nil)
+	id := testOperatorIdentity()
+	raw := rawReadiness(t, s, onboardingReqForge("acme/widgets", "gitlab", &id))
+	assertGitLabMergeGateUnknown(t, raw, gitLabMergeGateReasonUnsupported)
+}
+
+// TestOnboardingReadiness_GitLabMergeGate_DefaultBranchEmpty_Unknown: the
+// project body carries an empty default_branch (an empty repository) →
+// unknown / default_branch_unresolved, and the list is never read.
+func TestOnboardingReadiness_GitLabMergeGate_DefaultBranchEmpty_Unknown(t *testing.T) {
+	gl := newFakeGitLabForOnboarding(onboardingReviewersSpecYAML)
+	gl.projectSettingsJSON = `"default_branch":"","only_allow_merge_if_pipeline_succeeds":true`
+	raw := gitLabMergeGateRaw(t, gl)
+	assertGitLabMergeGateUnknown(t, raw, gitLabMergeGateReasonDefaultBranch)
+	if byID, list := gl.mergeGateCalls(); byID != 1 || list != 0 {
+		t.Errorf("merge-gate calls = by-id:%d list:%d, want 1/0 (no default branch, no rule read)", byID, list)
+	}
+}
+
+// TestOnboardingReadiness_GitLabMergeGate_ProjectByIDForbidden_Unknown: a 403
+// on the by-id project read → unknown / forbidden, list never read (pins the
+// project-first order through the whole stack).
+func TestOnboardingReadiness_GitLabMergeGate_ProjectByIDForbidden_Unknown(t *testing.T) {
+	gl := newFakeGitLabForOnboarding(onboardingReviewersSpecYAML)
+	gl.projectByIDStatus = http.StatusForbidden
+	raw := gitLabMergeGateRaw(t, gl)
+	assertGitLabMergeGateUnknown(t, raw, gitLabMergeGateReasonForbidden)
+	if byID, list := gl.mergeGateCalls(); byID != 1 || list != 0 {
+		t.Errorf("merge-gate calls = by-id:%d list:%d, want 1/0", byID, list)
+	}
+}
+
+// TestOnboardingReadiness_GitLabMergeGate_ProtectedListForbidden_Unknown is the
+// COUNTERFACTUAL vehicle for the fail-closed control: a 200 project read but a
+// 403 on the protected-branch list (the endpoint needs Maintainer) → unknown /
+// forbidden with the credential-role detail, `protected` ABSENT, and a WARN
+// log. Deleting the `if err != nil` branch in probeGitLabMergeGate so the
+// verdict renders anyway turns this red (status not unknown, `protected`
+// present).
+func TestOnboardingReadiness_GitLabMergeGate_ProtectedListForbidden_Unknown(t *testing.T) {
+	gl := newFakeGitLabForOnboarding(onboardingReviewersSpecYAML)
+	gl.protectedStatus = http.StatusForbidden
+	s := newOnboardingGitLabServer(t, nil, gitlabForgeOver(gl.server(t)), nil, nil)
+	logBuf := &bytes.Buffer{}
+	s.cfg.Logger = slog.New(slog.NewJSONHandler(logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	id := testOperatorIdentity()
+	raw := rawReadiness(t, s, onboardingReqForge("acme/widgets", "gitlab", &id))
+
+	glmg := assertGitLabMergeGateUnknown(t, raw, gitLabMergeGateReasonForbidden)
+	if detail, _ := glmg["detail"].(string); !strings.Contains(detail, "Maintainer role") {
+		t.Errorf("detail = %q, want the credential-role sentence", detail)
+	}
+	if rem, _ := glmg["remediation"].(string); !strings.Contains(rem, "Maintainer") {
+		t.Errorf("remediation = %q, want the role to grant", rem)
+	}
+	rec := soleLogRecord(t, logBuf, "onboarding readiness: gitlab merge gate read failed")
+	if rec["level"] != "WARN" || rec["reason"] != gitLabMergeGateReasonForbidden || rec["repo"] != "acme/widgets" {
+		t.Errorf("log = %v, want WARN with reason=forbidden repo=acme/widgets", rec)
+	}
+	if byID, list := gl.mergeGateCalls(); byID != 1 || list != 1 {
+		t.Errorf("merge-gate calls = by-id:%d list:%d, want 1/1", byID, list)
+	}
+}
+
+// TestOnboardingReadiness_GitLabMergeGate_TransportError_Unknown: the stub is
+// closed before the merge-gate reads (the path lookup + spec fetch are served
+// by a forge over a DIFFERENT, live stub) → unknown / transport_error.
+func TestOnboardingReadiness_GitLabMergeGate_TransportError_Unknown(t *testing.T) {
+	gl := newFakeGitLabForOnboarding(onboardingReviewersSpecYAML)
+	srv := gl.server(t)
+	// A forge whose client keeps a connection-less transport to a server that
+	// is already gone: every read fails at the dial.
+	dead := httptest.NewServer(http.NotFoundHandler())
+	deadURL := dead.URL
+	dead.Close()
+	f := &gitlabSplitForge{
+		live: gitlabForgeOver(srv),
+		dead: forgegitlab.New(deadURL, forgegitlab.NewStaticCredentialProvider("glpat-test")),
+	}
+	s := newOnboardingGitLabServer(t, nil, f, nil, nil)
+	id := testOperatorIdentity()
+	raw := rawReadiness(t, s, onboardingReqForge("acme/widgets", "gitlab", &id))
+	glmg := assertGitLabMergeGateUnknown(t, raw, gitLabMergeGateReasonTransport)
+	if rem, _ := glmg["remediation"].(string); !strings.Contains(rem, "once the forge is reachable") {
+		t.Errorf("remediation = %q, want the re-run sentence", rem)
+	}
+	app := rawObject(t, raw, "app")
+	if app["installed"] != true {
+		t.Errorf("app.installed = %v, want true (the live half resolved the project)", app["installed"])
+	}
+}
+
+// gitlabSplitForge routes resolve + file reads to a live forgegitlab.Forge and
+// the merge-protection read to one pointed at a closed server, so the
+// transport-error arm is exercised with rung (1) still installed.
+type gitlabSplitForge struct {
+	forge.Forge
+	live *forgegitlab.Forge
+	dead *forgegitlab.Forge
+}
+
+func (f *gitlabSplitForge) Name() string { return "gitlab" }
+
+func (f *gitlabSplitForge) ResolveRepoScope(ctx context.Context, repo forge.RepoRef) (forge.CredentialScope, error) {
+	return f.live.ResolveRepoScope(ctx, repo)
+}
+
+func (f *gitlabSplitForge) FetchFile(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, path, ref string) (*forge.FileContent, error) {
+	return f.live.FetchFile(ctx, scope, repo, path, ref)
+}
+
+func (f *gitlabSplitForge) ReadMergeProtection(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, branch string) (*forge.MergeProtection, error) {
+	return f.dead.ReadMergeProtection(ctx, scope, repo, branch)
+}
+
+// TestOnboardingReadiness_GitLabMergeGate_ProbeTimeout_Unknown asserts the
+// bounded probe: a list route that never answers within mergeGateProbeTimeout
+// resolves to unknown / transport_error rather than hanging the report. Every
+// deadline-competing duration is derived via timescale.D (#1984).
+func TestOnboardingReadiness_GitLabMergeGate_ProbeTimeout_Unknown(t *testing.T) {
+	orig := mergeGateProbeTimeout
+	mergeGateProbeTimeout = timescale.D(100 * time.Millisecond)
+	t.Cleanup(func() { mergeGateProbeTimeout = orig })
+
+	gl := newFakeGitLabForOnboarding(onboardingReviewersSpecYAML)
+	gl.listHang = timescale.D(3 * time.Second)
+	raw := gitLabMergeGateRaw(t, gl)
+	assertGitLabMergeGateUnknown(t, raw, gitLabMergeGateReasonTransport)
 }

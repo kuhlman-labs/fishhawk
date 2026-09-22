@@ -35,15 +35,17 @@ var requiredRunScopes = []string{
 }
 
 // onboardingReadinessResponse aggregates the server-side-only checks
-// `fishhawk doctor` (E29.5) needs before a repo's first run — five on the
-// GitHub family, four on GitLab (E45.43 / #3348): App installation (on GitLab:
+// `fishhawk doctor` (E29.5) needs before a repo's first run — five on each
+// family (E45.43 / #3348, E45.66 / #3580): App installation (on GitLab:
 // project resolvability with the deployment credential), the committed
 // workflow spec's parse/validate state, per reviewer availability on this
-// deployment, the caller token's scope adequacy, and — since #3161, GitHub
-// only — whether the `fishhawk_audit_complete` check Fishhawk publishes is
-// actually REQUIRED by the repo's branch protection. The checks cascade — a
-// not-installed repo yields an unavailable spec, empty reviewers and an
-// `unknown` merge gate — each with an explanatory note.
+// deployment, the caller token's scope adequacy, and a forge-shaped merge-gate
+// read — on GitHub (#3161) whether the `fishhawk_audit_complete` check
+// Fishhawk publishes is actually REQUIRED by the repo's branch protection; on
+// GitLab (#3580) whether the project's real default branch is protected and
+// the project requires a successful head pipeline to merge. The checks
+// cascade — a not-installed repo yields an unavailable spec, empty reviewers
+// and an `unknown` merge gate — each with an explanatory note.
 //
 // Forge names the family that answered ("github" or "gitlab"), resolved per
 // request by onboardingForgeFamily.
@@ -56,14 +58,24 @@ var requiredRunScopes = []string{
 // be exactly the over-claim mergeGateReadiness's invariant forbids. Both
 // client mirrors already model absence as a pointer (#3161), so the omitted
 // key is read as "no claim about the merge gate", never as a verdict.
+//
+// GitLabMergeGate is the GitLab-shaped sibling (E45.66 / #3580), a SEPARATE
+// key rather than a reuse of `merge_gate` because the two rungs answer
+// DIFFERENT questions and must never be conflated: GitLab expresses no
+// per-context required status check, so it cannot answer "is
+// fishhawk_audit_complete required", only "is the default branch protected
+// and must the head pipeline succeed". It is nil on the github family and
+// set on every gitlab-family report, `unknown` with a naming reason on every
+// degrade.
 type onboardingReadinessResponse struct {
-	Repo      string              `json:"repo"`
-	Forge     string              `json:"forge"`
-	App       appInstallReadiness `json:"app"`
-	Spec      specReadiness       `json:"spec"`
-	Reviewers []reviewerReadiness `json:"reviewers"`
-	Scopes    scopeReadiness      `json:"scopes"`
-	MergeGate *mergeGateReadiness `json:"merge_gate,omitempty"`
+	Repo            string                    `json:"repo"`
+	Forge           string                    `json:"forge"`
+	App             appInstallReadiness       `json:"app"`
+	Spec            specReadiness             `json:"spec"`
+	Reviewers       []reviewerReadiness       `json:"reviewers"`
+	Scopes          scopeReadiness            `json:"scopes"`
+	MergeGate       *mergeGateReadiness       `json:"merge_gate,omitempty"`
+	GitLabMergeGate *gitLabMergeGateReadiness `json:"gitlab_merge_gate,omitempty"`
 }
 
 // appInstallReadiness reports whether the GitHub App is installed on the
@@ -339,6 +351,219 @@ func (s *Server) probeMergeGate(ctx context.Context, repo string, repoRef github
 	return out
 }
 
+// gitLabMergeGateReadiness is the GitLab-shaped merge-gate rung (E45.66 /
+// #3580), the sibling of mergeGateReadiness on the gitlab family. It answers
+// the question GitLab CAN answer: is the project's REAL default branch
+// protected (by which protected-branch rules, with what push/merge access and
+// force-push posture) and does the project require a successful head pipeline
+// to merge (`only_allow_merge_if_pipeline_succeeds`, plus the informational
+// `allow_merge_on_skipped_pipeline` and
+// `only_allow_merge_if_all_discussions_are_resolved`). It is read through
+// forge.MergeProtectionReader, which only the gitlab adapter implements.
+//
+// The invariant, mirroring mergeGateReadiness: Status is `not_pipeline_gated`
+// ONLY when BOTH reads (the project settings and the protected-branch list)
+// answered authoritatively. Every degrade — no gitlab forge, project not
+// visible, an adapter without the capability, an unresolved default branch, a
+// 401/403, a transport error or a probe timeout — resolves to `unknown` with a
+// naming Reason, and every signal that was never read is ABSENT (the pointer
+// bools stay nil), never rendered as false.
+//
+// What it does NOT claim: GitLab has no per-context required status check, so
+// `pipeline_gated` is not a statement that the `fishhawk_audit_complete`
+// commit status individually gates the merge — Note says so on every report.
+// REPORTING only, point-in-time. Long-form contract:
+// backend/internal/server/README.md.
+type gitLabMergeGateReadiness struct {
+	// Status is "pipeline_gated", "not_pipeline_gated" or "unknown".
+	Status string `json:"status"`
+	// Branch is the project's REAL default branch, the branch the probe
+	// evaluated. Empty when the probe never got far enough to resolve it.
+	Branch string `json:"branch,omitempty"`
+	// Protected is whether at least one protected-branch rule (exact or
+	// wildcard) covers Branch. Absent when the rule list was not read.
+	Protected *bool `json:"protected,omitempty"`
+	// MatchedRules names EVERY rule covering Branch — the exact-name rule
+	// first, then wildcard rules in API order — because GitLab applies the
+	// MOST PERMISSIVE of all matching rules, so a single rule is never the
+	// effective protection. Empty when unprotected or unread.
+	MatchedRules []string `json:"matched_rules,omitempty"`
+	// AllowForcePush is the OR across every matched rule. Absent when unread.
+	AllowForcePush *bool `json:"allow_force_push,omitempty"`
+	// PushAccessLevels / MergeAccessLevels are the UNION across every matched
+	// rule, deduplicated by level and sorted ascending — the lowest level is
+	// the most permissive and comes first. Empty when unprotected or unread.
+	PushAccessLevels  []gitLabAccessLevel `json:"push_access_levels,omitempty"`
+	MergeAccessLevels []gitLabAccessLevel `json:"merge_access_levels,omitempty"`
+	// PipelineMustSucceed mirrors the project's
+	// only_allow_merge_if_pipeline_succeeds. Absent when the project settings
+	// were not read.
+	PipelineMustSucceed *bool `json:"pipeline_must_succeed,omitempty"`
+	// AllowSkippedPipeline mirrors allow_merge_on_skipped_pipeline
+	// (informational). Absent when unread.
+	AllowSkippedPipeline *bool `json:"allow_skipped_pipeline,omitempty"`
+	// DiscussionsMustBeResolved mirrors
+	// only_allow_merge_if_all_discussions_are_resolved (informational).
+	// Absent when unread.
+	DiscussionsMustBeResolved *bool `json:"discussions_must_be_resolved,omitempty"`
+	// Authoritative is true only when both reads answered definitively.
+	Authoritative bool `json:"authoritative"`
+	// Reason is a machine code naming why the evaluation did not settle.
+	// Non-empty whenever Status is "unknown".
+	Reason string `json:"reason,omitempty"`
+	// Detail is the human sentence for Reason, or for a not_pipeline_gated
+	// verdict the signal(s) that are off.
+	Detail string `json:"detail,omitempty"`
+	// Remediation is the operator's next step, when there is one.
+	Remediation string `json:"remediation,omitempty"`
+	// Note is the constant gitLabMergeGateNote, present on every report.
+	Note string `json:"note"`
+}
+
+// gitLabAccessLevel is one role permitted to push to or merge into the
+// protected branch: GitLab's numeric access level plus its description.
+type gitLabAccessLevel struct {
+	Level       int    `json:"level"`
+	Description string `json:"description"`
+}
+
+// gitLabMergeGateNote is the constant sentence every gitlab_merge_gate
+// report carries: what the rung answers, that access levels are the effective
+// union across matching rules, and what GitLab cannot express.
+const gitLabMergeGateNote = "gitlab: this rung reports whether the project's real default branch is protected and whether the project requires a successful head pipeline to merge; push/merge access levels are the effective UNION across every matching protected-branch rule per GitLab's most-permissive semantics. GitLab expresses no per-context required status check, so pipeline_gated is NOT a claim that the fishhawk_audit_complete commit status individually gates the merge."
+
+// Reason codes for the gitlab_merge_gate rung's `unknown` degrades.
+const (
+	// gitLabMergeGateReasonForgeUnconfigured — no gitlab forge is wired on
+	// this deployment, so nothing could be read.
+	gitLabMergeGateReasonForgeUnconfigured = "gitlab_forge_unconfigured"
+	// gitLabMergeGateReasonProjectNotVisible — the project did not resolve
+	// with the deployment credential (rung (1) already says why).
+	gitLabMergeGateReasonProjectNotVisible = "project_not_visible"
+	// gitLabMergeGateReasonUnsupported — the resolved forge adapter does not
+	// implement forge.MergeProtectionReader.
+	gitLabMergeGateReasonUnsupported = "merge_protection_unsupported"
+	// gitLabMergeGateReasonDefaultBranch — the project's REAL default branch
+	// could not be resolved (an empty repository, or a project the read could
+	// not find). The probe never guesses "main".
+	gitLabMergeGateReasonDefaultBranch = "default_branch_unresolved"
+	// gitLabMergeGateReasonForbidden — a 401/403 on the project or the
+	// protected-branch read; the latter needs at least the Maintainer role.
+	gitLabMergeGateReasonForbidden = "forbidden"
+	// gitLabMergeGateReasonTransport — any other read failure, including the
+	// probe timeout.
+	gitLabMergeGateReasonTransport = "transport_error"
+)
+
+// probeGitLabMergeGate runs readiness check (5) on the gitlab family (E45.66 /
+// #3580). f and scope are the forge + resolved scope probeGitLab produced;
+// installed is its rung-(1) verdict, so an unresolved project never reaches a
+// forge call here.
+//
+// Every failure path returns `unknown` with a naming Reason and leaves every
+// signal pointer nil — the fail-closed contract. `not_pipeline_gated` is
+// reachable ONLY through an authoritative ReadMergeProtection.
+func (s *Server) probeGitLabMergeGate(ctx context.Context, repo string, f forge.Forge,
+	scope forge.CredentialScope, ref forge.RepoRef, installed bool) gitLabMergeGateReadiness {
+	out := gitLabMergeGateReadiness{
+		Status: string(mergegate.StatusUnknown),
+		Note:   gitLabMergeGateNote,
+	}
+	switch {
+	case f == nil:
+		out.Reason = gitLabMergeGateReasonForgeUnconfigured
+		out.Detail = "gitlab forge not configured on this deployment; the project's protected-branch and merge settings could not be read"
+		out.Remediation = "Set FISHHAWKD_GITLAB_TOKEN and FISHHAWKD_GITLAB_BASE_URL, then re-run the check."
+		return out
+	case !installed:
+		out.Reason = gitLabMergeGateReasonProjectNotVisible
+		out.Detail = "project is not visible to the deployment GitLab credential; its protected-branch and merge settings could not be read"
+		out.Remediation = "Register the project with `fishhawkd installation register --provider gitlab --project-path " + repo + "`, confirm the token can read it, then re-run the check."
+		return out
+	}
+	reader, ok := f.(forge.MergeProtectionReader)
+	if !ok {
+		out.Reason = gitLabMergeGateReasonUnsupported
+		out.Detail = "the resolved gitlab forge adapter does not expose protected-branch reads"
+		return out
+	}
+
+	pctx, cancel := context.WithTimeout(ctx, mergeGateProbeTimeout)
+	defer cancel()
+
+	// An empty branch asks the adapter for the project's REAL default
+	// branch (never a guessed "main"); the project read precedes the rule
+	// list inside the adapter, so a 404 there is a real failure, not an
+	// "unprotected" verdict.
+	mp, err := reader.ReadMergeProtection(pctx, scope, ref, "")
+	if err != nil {
+		switch {
+		case errors.Is(err, forge.ErrNotFound):
+			out.Reason = gitLabMergeGateReasonDefaultBranch
+			out.Detail = "could not resolve the project's default branch: " + err.Error()
+			out.Remediation = "Confirm the project has a default branch with at least one commit, then re-run the check."
+		case errors.Is(err, forge.ErrForbidden):
+			out.Reason = gitLabMergeGateReasonForbidden
+			out.Detail = "the deployment GitLab credential may not read the project's protected-branch settings (the protected_branches API needs at least the Maintainer role): " + err.Error()
+			out.Remediation = "Grant the deployment credential the Maintainer role on the project (or a token with read access to its protected-branch settings), then re-run the check."
+		default:
+			out.Reason = gitLabMergeGateReasonTransport
+			out.Detail = "reading the project's protection failed: " + err.Error()
+			out.Remediation = "Re-run the check once the forge is reachable."
+		}
+		s.cfg.Logger.Warn("onboarding readiness: gitlab merge gate read failed",
+			"repo", repo, "reason", out.Reason, "error", err.Error())
+		return out
+	}
+
+	out.Authoritative = true
+	out.Branch = mp.Branch
+	out.Protected = boolPtr(mp.Protected)
+	out.MatchedRules = mp.MatchedRules
+	out.AllowForcePush = boolPtr(mp.AllowForcePush)
+	out.PushAccessLevels = gitLabAccessLevels(mp.PushAccessLevels)
+	out.MergeAccessLevels = gitLabAccessLevels(mp.MergeAccessLevels)
+	out.PipelineMustSucceed = boolPtr(mp.PipelineMustSucceed)
+	out.AllowSkippedPipeline = boolPtr(mp.AllowSkippedPipeline)
+	out.DiscussionsMustBeResolved = boolPtr(mp.DiscussionsMustBeResolved)
+
+	if mp.Protected && mp.PipelineMustSucceed {
+		out.Status = gitLabMergeGateStatusPipelineGated
+		return out
+	}
+	out.Status = gitLabMergeGateStatusNotPipelineGated
+	var off []string
+	if !mp.Protected {
+		off = append(off, "default branch "+mp.Branch+" is not covered by any protected-branch rule")
+	}
+	if !mp.PipelineMustSucceed {
+		off = append(off, "the project does not require a successful pipeline to merge (only_allow_merge_if_pipeline_succeeds is off)")
+	}
+	out.Detail = strings.Join(off, "; ")
+	out.Remediation = "In the GitLab project: Settings → Repository → Protected branches (protect " + mp.Branch + "), and Settings → Merge requests → Merge checks → enable \"Pipelines must succeed\"; then re-run the check."
+	return out
+}
+
+// Status values for the gitlab_merge_gate rung; `unknown` is shared with the
+// GitHub rung via mergegate.StatusUnknown.
+const (
+	gitLabMergeGateStatusPipelineGated    = "pipeline_gated"
+	gitLabMergeGateStatusNotPipelineGated = "not_pipeline_gated"
+)
+
+// gitLabAccessLevels maps the forge-neutral access levels onto the wire shape,
+// keeping the adapter's ascending order.
+func gitLabAccessLevels(in []forge.AccessLevel) []gitLabAccessLevel {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]gitLabAccessLevel, 0, len(in))
+	for _, l := range in {
+		out = append(out, gitLabAccessLevel{Level: l.Level, Description: l.Description})
+	}
+	return out
+}
+
 // Reason strings for the gitlab-family `app` rung (E45.43 / #3348).
 const (
 	onboardingGitLabForgeUnconfigured = "gitlab forge not configured on this deployment (set FISHHAWKD_GITLAB_TOKEN and FISHHAWKD_GITLAB_BASE_URL)"
@@ -484,14 +709,18 @@ func (s *Server) probeGitHub(ctx context.Context, repo string, repoRef githubcli
 // degrade (forge unconfigured or typed-nil, project not visible, resolve or
 // fetch fault, an adapter without file reads) lands as a naming reason on a
 // 200, never a 5xx: this is a readiness REPORT.
+//
+// It also returns the resolved forge and scope so the handler's gitlab arm can
+// hand them to probeGitLabMergeGate (E45.66 / #3580): f is nil when the forge
+// is unconfigured, and scope is the zero value unless the project resolved.
 func (s *Server) probeGitLab(ctx context.Context, repo string, ref forge.RepoRef,
-) (app appInstallReadiness, sp specReadiness, parsed *spec.Spec) {
-	f := s.onboardingForgeFor(observationForgeGitLab)
+) (app appInstallReadiness, sp specReadiness, parsed *spec.Spec, f forge.Forge, scope forge.CredentialScope) {
+	f = s.onboardingForgeFor(observationForgeGitLab)
 	if f == nil {
 		app.Reason = onboardingGitLabForgeUnconfigured
 		sp.Source = "unavailable"
 		sp.Note = onboardingGitLabForgeUnconfigured
-		return app, sp, nil
+		return app, sp, nil, nil, scope
 	}
 	scope, err := f.ResolveRepoScope(ctx, ref)
 	switch {
@@ -508,13 +737,13 @@ func (s *Server) probeGitLab(ctx context.Context, repo string, ref forge.RepoRef
 	if !app.Installed {
 		sp.Source = "unavailable"
 		sp.Note = "project is not resolvable with the deployment GitLab credential; cannot fetch the workflow spec"
-		return app, sp, nil
+		return app, sp, nil, f, scope
 	}
 	fetcher, ok := f.(forge.FileFetcher)
 	if !ok {
 		sp.Source = "unavailable"
 		sp.Note = "gitlab forge does not expose file reads"
-		return app, sp, nil
+		return app, sp, nil, f, scope
 	}
 	fc, err := fetcher.FetchFile(ctx, scope, ref, githubclient.WorkflowSpecPath, "")
 	switch {
@@ -529,7 +758,7 @@ func (s *Server) probeGitLab(ctx context.Context, repo string, ref forge.RepoRef
 		s.cfg.Logger.Warn("onboarding readiness: fetch gitlab workflow spec failed",
 			"repo", repo, "error", err.Error())
 	}
-	return app, sp, parsed
+	return app, sp, parsed, f, scope
 }
 
 // probeReviewers runs readiness check (3): per-reviewer availability plus the
@@ -829,9 +1058,15 @@ func (s *Server) handleGetOnboardingReadiness(w http.ResponseWriter, r *http.Req
 	var parsedSpec *spec.Spec
 	switch family {
 	case observationForgeGitLab:
-		// (1)+(2) on GitLab; (5) merge gate is OMITTED — see the response
-		// type's doc comment for why nil is the only honest rendering.
-		resp.App, resp.Spec, parsedSpec = s.probeGitLab(r.Context(), repo, repoRef)
+		// (1)+(2) on GitLab; the GitHub-shaped (5) merge_gate is OMITTED —
+		// see the response type's doc comment for why nil is the only honest
+		// rendering — and the GitLab-shaped (5) gitlab_merge_gate takes its
+		// place (E45.66 / #3580) on the forge + scope probeGitLab resolved.
+		var glForge forge.Forge
+		var glScope forge.CredentialScope
+		resp.App, resp.Spec, parsedSpec, glForge, glScope = s.probeGitLab(r.Context(), repo, repoRef)
+		mg := s.probeGitLabMergeGate(r.Context(), repo, glForge, glScope, repoRef, resp.App.Installed)
+		resp.GitLabMergeGate = &mg
 	default:
 		var installed bool
 		var installationID int64
