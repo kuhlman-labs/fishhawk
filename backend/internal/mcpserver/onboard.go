@@ -76,8 +76,13 @@ on GitLab — see merge_gate below):
               project resolved).
   - reviewers — per spec-declared reviewer availability on THIS deployment
               (available, plus a missing_hint naming the env var to set when a
-              provider cannot be resolved). Empty when the spec is unavailable
-              or invalid.
+              provider cannot be resolved). Each also carries the model-id
+              honesty fields: model_status (verified | rejected | unverifiable),
+              model_hint (did-you-mean on a rejection, the verbatim-to-vendor
+              warning when unverifiable, or the unpriced $0 note), and priced
+              (whether the pricing table knows the model family; absent when the
+              spec omitted the model, false flags usage booked at $0). Empty when
+              the spec is unavailable or invalid.
   - scopes  — whether the caller token holds the run-driving scope subset
               (adequate, required[], missing[]); a cookie-session caller
               bypasses scope enforcement and is adequate by construction.

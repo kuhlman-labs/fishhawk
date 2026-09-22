@@ -5466,6 +5466,32 @@ components:
                 type: string
               available:
                 type: boolean
+                description: >-
+                  True when the provider is wired on this deployment AND the
+                  reviewer's resolved model was not authoritatively rejected. It
+                  does NOT assert the model is served when model_status is
+                  unverifiable — read model_status for that.
+              model_status:
+                type: string
+                enum: [verified, rejected, unverifiable]
+                description: >-
+                  Model-id verdict against the deployment's snapshot oracle:
+                  verified (present in a fresh snapshot), rejected
+                  (authoritatively absent), or unverifiable (no live snapshot to
+                  check against). Omitted when the spec omitted the model and the
+                  resolved default was not rejected.
+              model_hint:
+                type: string
+                description: >-
+                  Human sentence for a non-verified status: the did-you-mean
+                  rejection text, the passed-to-the-vendor-verbatim warning when
+                  unverifiable, or the unpriced $0 note.
+              priced:
+                type: boolean
+                description: >-
+                  Whether the shared pricing table knows the model's family.
+                  Absent when the spec omitted the model (not computed); false
+                  flags that usage under this model is recorded at $0 (estimated).
               missing_hint:
                 type: string
                 description: How to enable the provider when unavailable (names the env knob).

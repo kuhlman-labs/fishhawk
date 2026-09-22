@@ -252,6 +252,13 @@ type planReviewerOptions struct {
 	// resolvePlanReviewers behaves byte-for-byte as before (the subprocess
 	// fall-through is preserved).
 	homeRegion string
+	// modelOracle is the deployment's model-id snapshot seam (#3578). For()
+	// consults it to reject a reviewer whose RESOLVED model (spec value, or the
+	// provider's deployment default when the spec omits one) is absent from a
+	// FRESH snapshot, the same authoritative-absence rule the run-create path
+	// applies. Nil is fail-open — byte-identical to the pre-#3578 behaviour — so
+	// leaving it unset never turns into a false rejection or a boot blocker.
+	modelOracle modeloracle.ModelOracle
 }
 
 // regionScoped reports whether this cell is region-scoped: FISHHAWKD_HOME_REGION
@@ -456,6 +463,9 @@ func (p *planReviewerSet) For(provider, model string, reasoningEffort ...string)
 		if model == "" {
 			model = p.opts.planReviewModel
 		}
+		if err := p.verifyModel(provider, model); err != nil {
+			return nil, err
+		}
 		return p.newAnthropic(model), nil
 	case "claudecode":
 		if !p.opts.enableLocalClaudeReviewer {
@@ -463,6 +473,9 @@ func (p *planReviewerSet) For(provider, model string, reasoningEffort ...string)
 		}
 		if model == "" {
 			model = p.opts.localClaudeModel
+		}
+		if err := p.verifyModel(provider, model); err != nil {
+			return nil, err
 		}
 		return p.newClaudeCode(model), nil
 	case "codex":
@@ -472,10 +485,37 @@ func (p *planReviewerSet) For(provider, model string, reasoningEffort ...string)
 		if model == "" {
 			model = p.opts.codexModel
 		}
+		if err := p.verifyModel(provider, model); err != nil {
+			return nil, err
+		}
 		return p.newCodex(model, p.resolveCodexEffort(effort)), nil
 	default:
 		return nil, fmt.Errorf("unknown reviewer provider %q (expected anthropic, claudecode, or codex)", provider)
 	}
+}
+
+// verifyModel rejects a reviewer whose RESOLVED model is authoritatively absent
+// from a fresh snapshot (#3578). It runs AFTER each branch has resolved the
+// effective model — the spec value, or the provider's deployment default when
+// the spec omitted one — so a bad DEPLOYMENT DEFAULT is caught exactly as a bad
+// explicit model is. Only modeloracle.ModelRejected returns an error; a nil
+// oracle, a stale snapshot, or a provider with no snapshot all resolve to
+// ModelUnverifiable and proceed unchanged (fail-open). The error shape matches
+// the unconfigured-provider errors above so run-create
+// (unavailableSpecReviewers → reviewer_capability_unavailable), the review
+// dispatch loop, and the doctor rung all inherit the did-you-mean message.
+//
+// Cost is a map lookup: Cached.Snapshot never fetches (fetches happen only in
+// Refresh/Run), so this adds no network call to a reviewer resolution.
+func (p *planReviewerSet) verifyModel(provider, model string) error {
+	v := modeloracle.Verify(context.Background(), p.opts.modelOracle, provider, model)
+	if v.Status == modeloracle.ModelRejected {
+		// Wrap the verdict so a cross-package caller (the doctor reviewers rung)
+		// can recover the RESOLVED model + did-you-mean via errors.As — the run
+		// path and the log read only the rendered string (#3578).
+		return fmt.Errorf("reviewer provider %q model %q is not available: %w", provider, model, modeloracle.RejectedError{Verdict: v})
+	}
+	return nil
 }
 
 // resolvePlanReviewers builds the server.ReviewerSet from opts and logs every
@@ -1430,6 +1470,43 @@ func buildModelProviders(anthropicKey, openaiKey string, httpClient ...*http.Cli
 	return providers
 }
 
+// newModelOracle builds the live Cached model oracle over the registered
+// provider fetchers and wires the `anthropic` reviewer provider key to a
+// snapshot, so a reviewer declared `provider: anthropic` is validated against a
+// real served-model set rather than always failing open (#3578).
+//
+// Two postures, keyed on the region-scoped inference config (ADR-062 / #1831):
+//
+//   - modelBaseURL EMPTY (every deployment today): the anthropic SDK reviewer
+//     adapter (planReviewerSet.newAnthropic) and the oracle's claudecode fetcher
+//     BOTH talk to Anthropic at the SDK's production default endpoint — the same
+//     /v1/models the claudecode fetcher already polls. So the `anthropic` key is
+//     ALIASED to the `claudecode` snapshot: no extra fetch, and the #1339
+//     submit-time rejection now fires for anthropic reviewers.
+//   - modelBaseURL SET: the SDK reviewer is pinned to modelBaseURL, which may
+//     serve a DIFFERENT model set than the global endpoint the claudecode
+//     fetcher polls. Aliasing there could reject a model the region endpoint
+//     actually serves, so a SEPARATE `anthropic` fetcher is registered against
+//     the reviewer's OWN endpoint (modelAPIKey, modelBaseURL) and NO alias is
+//     set — the snapshot then represents exactly what the reviewer will call.
+//
+// The optional httpClient is injected by tests (the region fetcher points it at
+// an httptest server); production passes none so the Fetcher builds its own
+// bounded-timeout client.
+func newModelOracle(providers map[string]modeloracle.Fetcher, modelBaseURL, modelAPIKey string, threshold time.Duration, logger *slog.Logger, httpClient ...*http.Client) *modeloracle.Cached {
+	var opts []modeloracle.CachedOption
+	if modelBaseURL == "" {
+		opts = append(opts, modeloracle.WithAlias("anthropic", "claudecode"))
+	} else {
+		var client *http.Client
+		if len(httpClient) > 0 {
+			client = httpClient[0]
+		}
+		providers["anthropic"] = modeloracle.NewAnthropicFetcher(modelAPIKey, modelBaseURL, client)
+	}
+	return modeloracle.NewCached(providers, threshold, logger, opts...)
+}
+
 // modelProviderNames returns the registered provider keys in sorted order for a
 // deterministic startup log line.
 func modelProviderNames(providers map[string]modeloracle.Fetcher) []string {
@@ -2002,7 +2079,10 @@ func runServe(args []string, logSink io.Writer) int {
 	// under the existing "claudecode"/"codex" strings. The background refresh
 	// goroutine is started after the signal context is created, below.
 	modelProviders := buildModelProviders(*anthropicAPIKey, *openAIAPIKey)
-	modelOracle := modeloracle.NewCached(modelProviders, *modelsStalenessThreshold, logger)
+	// The anthropic reviewer provider key is wired to a snapshot here (#3578):
+	// aliased to claudecode in the single-cell posture, or a separate
+	// region-endpoint fetcher when FISHHAWKD_MODEL_BASE_URL is set.
+	modelOracle := newModelOracle(modelProviders, *modelBaseURL, *modelAPIKey, *modelsStalenessThreshold, logger)
 
 	cfg := server.Config{Addr: *addr, StartNonce: *startNonce, Logger: logger, ExternalURL: *externalURL, SpendAlertMultiple: *spendAlertMultiple, BudgetLocation: budgetLocation, BudgetLimitOverrideUSD: *budgetLimitOverrideUSD, BudgetAckMultiple: *budgetAckMultiple, BudgetPageMultiple: *budgetPageMultiple, ReviewBudget: reviewBudget, MaxParallelChildren: *maxParallelChildren, ImplementModelDefault: *implementModelDefault, ImplementAllowedModels: server.ParseAllowedModels(*implementAllowedModels), PlanAllowedModels: server.ParseAllowedModels(*planAllowedModels), ReviewAllowedModels: server.ParseAllowedModels(*reviewAllowedModels), ReviewResolution: *reviewResolution, ModelOracle: modelOracle, MCPRoute: mcpRouteMode, IssueSetResolutionBudget: *issueSetResolutionBudget}
 
@@ -2078,6 +2158,11 @@ func runServe(args []string, logSink io.Writer) int {
 		modelBaseURL:              *modelBaseURL,
 		modelAPIKey:               *modelAPIKey,
 		homeRegion:                *homeRegion,
+		// The oracle is constructed above (newModelOracle), so ordering holds.
+		// For() consults it to reject a reviewer naming a model absent from a
+		// fresh snapshot — including the deployment DEFAULT the spec omitted,
+		// which ValidateModels skips (#3578).
+		modelOracle: modelOracle,
 	}, logger)
 	if err != nil {
 		logger.Error("plan-review configuration refused startup", slog.String("error", err.Error()), slog.String("ref", "#2107"))

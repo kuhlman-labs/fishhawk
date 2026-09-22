@@ -2670,3 +2670,37 @@ func TestRunConcernItem_DecodesClaimedByApproval(t *testing.T) {
 		t.Error("claimed_by_approval decoded to true from a body that omits it")
 	}
 }
+
+// TestOnboardingReviewer_ModelFieldsDecode pins the #3578 client mirror: the
+// three additive model-validity fields decode from a readiness reviewer object,
+// and priced is a THREE-state pointer — a non-nil false when present, nil when
+// the payload omits it (never coerced to a bare false).
+func TestOnboardingReviewer_ModelFieldsDecode(t *testing.T) {
+	const body = `[
+	  {"provider": "codex", "model": "gpt-mystery", "available": true,
+	   "model_status": "verified",
+	   "model_hint": "unpriced: usage under this model is recorded at $0 (estimated)",
+	   "priced": false},
+	  {"provider": "anthropic", "available": false, "model_status": "rejected",
+	   "model_hint": "model \"x\" is not a known \"anthropic\" model (did you mean \"y\"?); available: y"}
+	]`
+	var got []OnboardingReviewer
+	if err := json.Unmarshal([]byte(body), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("len = %d, want 2", len(got))
+	}
+	if got[0].ModelStatus != "verified" || got[0].Priced == nil || *got[0].Priced {
+		t.Errorf("codex = %+v, want verified + non-nil false priced", got[0])
+	}
+	if !strings.Contains(got[0].ModelHint, "$0") {
+		t.Errorf("codex ModelHint = %q, want the $0 note", got[0].ModelHint)
+	}
+	if got[1].ModelStatus != "rejected" || got[1].Priced != nil {
+		t.Errorf("anthropic = %+v, want rejected + nil priced (omitted)", got[1])
+	}
+	if !strings.Contains(got[1].ModelHint, "did you mean") {
+		t.Errorf("anthropic ModelHint = %q, want a did-you-mean", got[1].ModelHint)
+	}
+}

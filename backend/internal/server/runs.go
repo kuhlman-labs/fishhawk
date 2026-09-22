@@ -3261,6 +3261,11 @@ func (s *Server) emitReviewerCapabilityUnavailable(ctx context.Context, repo, wo
 		"workflow_id":       workflowID,
 		"repo":              repo,
 		"configured_agents": configuredAgents,
+		// The resolution error verbatim (#3578): for a model rejection it carries
+		// the did-you-mean + available set, so the audit ROW — not just the log —
+		// records why the reviewer was unavailable (e.g. a bad deployment-default
+		// reviewer model absent from a fresh snapshot).
+		"error": u.err.Error(),
 	})
 	systemKind := audit.ActorKind("system")
 	if _, aerr := s.cfg.AuditRepo.AppendGlobalChained(ctx, audit.GlobalChainAppendParams{

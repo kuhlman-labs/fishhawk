@@ -65,7 +65,7 @@ func newDoctorFakeBackend(t *testing.T) (*doctorFakeBackend, *httptest.Server) {
 				App:  OnboardingApp{Installed: true, InstallationID: 4242},
 				Spec: OnboardingSpec{Source: "fetched", Valid: true},
 				Reviewers: []OnboardingReviewer{
-					{Provider: "claudecode", Model: "claude-opus-4-8", Available: true},
+					{Provider: "claudecode", Model: "claude-opus-4-8", Available: true, ModelStatus: "verified", Priced: boolPtr(true)},
 				},
 				Scopes: OnboardingScopes{
 					Adequate: true,
@@ -104,8 +104,49 @@ func TestDoctor_HappyPath_MapsReport(t *testing.T) {
 	if len(out.Report.Reviewers) != 1 || out.Report.Reviewers[0].Provider != "claudecode" {
 		t.Errorf("Reviewers = %+v, want one claudecode reviewer", out.Report.Reviewers)
 	}
+	// The #3578 model-validity fields round-trip: model_status and a non-nil
+	// priced pointer.
+	if rv := out.Report.Reviewers[0]; rv.ModelStatus != "verified" || rv.Priced == nil || !*rv.Priced {
+		t.Errorf("reviewer model fields = %+v, want model_status=verified priced=&true", rv)
+	}
 	if !out.Report.Scopes.Adequate {
 		t.Errorf("Scopes.Adequate = false, want true")
+	}
+}
+
+// TestDoctor_ReviewerModelFields_RoundTrip pins the #3578 mirror: a payload
+// carrying priced:false maps to a non-nil false pointer, and a payload OMITTING
+// priced maps to nil — the three-state distinction the CLI rendering keys on.
+func TestDoctor_ReviewerModelFields_RoundTrip(t *testing.T) {
+	fb, srv := newDoctorFakeBackend(t)
+	fb.rawBody = `{
+	  "repo": "kuhlman-labs/fishhawk",
+	  "app": {"installed": true, "installation_id": 4242},
+	  "spec": {"source": "fetched", "valid": true},
+	  "reviewers": [
+	    {"provider": "codex", "model": "gpt-mystery", "available": true, "model_status": "verified", "model_hint": "unpriced: usage under this model is recorded at $0 (estimated)", "priced": false},
+	    {"provider": "anthropic", "available": true}
+	  ],
+	  "scopes": {"adequate": true, "required": [], "missing": []}
+	}`
+	r := newResolver(srv, nil)
+
+	_, out, err := r.doctor(context.Background(), nil, DoctorInput{Repo: "kuhlman-labs/fishhawk"})
+	if err != nil {
+		t.Fatalf("doctor: %v", err)
+	}
+	if len(out.Report.Reviewers) != 2 {
+		t.Fatalf("Reviewers = %d, want 2", len(out.Report.Reviewers))
+	}
+	unpriced := out.Report.Reviewers[0]
+	if unpriced.Priced == nil || *unpriced.Priced {
+		t.Errorf("codex Priced = %v, want a non-nil false pointer", unpriced.Priced)
+	}
+	if unpriced.ModelStatus != "verified" || !strings.Contains(unpriced.ModelHint, "$0") {
+		t.Errorf("codex model fields = %+v, want verified + $0 hint", unpriced)
+	}
+	if omitted := out.Report.Reviewers[1]; omitted.Priced != nil {
+		t.Errorf("anthropic Priced = %v, want nil (priced omitted from the payload)", omitted.Priced)
 	}
 }
 

@@ -203,7 +203,8 @@ exists on GitLab:
 | Rung | Fails when | Remediation |
 |---|---|---|
 | **app installed** | the Fishhawk GitHub App is not installed on the target repo | install the App: `https://github.com/apps/fishhawk/installations/new` |
-| **reviewer available: `<provider>`** (one per spec-declared reviewer) | the reviewer's backend is not wired on this deployment | the adapter's missing-env hint, carried verbatim (e.g. set `FISHHAWKD_ANTHROPIC_API_KEY`) |
+| **reviewer available: `<provider>`** (one per spec-declared reviewer) | the reviewer's backend is not wired on this deployment, OR the resolved model was authoritatively rejected against the deployment's model snapshot (#3578) | the adapter's missing-env hint (e.g. set `FISHHAWKD_ANTHROPIC_API_KEY`), or — for a rejected model — the did-you-mean naming a served model |
+| **reviewer available: `<provider>`** (warn) | the resolved model is `unverifiable` (no live snapshot to check against) or `unpriced` (its family is unknown to the pricing table, so usage books at $0) (#3578) | the `model_hint` sentence; the detail is marked `(unverified)` / `(unpriced)`. A legacy backend serving neither field renders `ok` |
 | **token scope adequate** | the caller token lacks a run-driving scope | reissue with the named missing scope(s) via `fishhawkd token issue --subject <login> --scopes …` |
 | **workflow spec (committed) valid** | the spec on the repo's default branch fails to parse/validate (`source==fetched && !valid`); **warns** when the spec is unavailable (App not installed / no spec on the default branch) | run `fishhawk validate` for details |
 

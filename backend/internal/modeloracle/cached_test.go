@@ -61,6 +61,53 @@ func TestCached_BeforeFirstSuccessFailsOpen(t *testing.T) {
 	}
 }
 
+// TestCached_AliasSharesCanonicalSnapshot asserts WithAlias makes Snapshot on
+// the alias key answer with the canonical provider's snapshot — fresh+ok with
+// the same ids — while the canonical key is unchanged, and that resolving the
+// alias adds NO fetch (Refresh fetches once per registered Fetcher, never per
+// alias).
+func TestCached_AliasSharesCanonicalSnapshot(t *testing.T) {
+	f := &fakeFetcher{ids: []string{"claude-opus-4-8", "claude-sonnet-4-6"}}
+	o := modeloracle.NewCached(
+		map[string]modeloracle.Fetcher{"claudecode": f},
+		time.Hour, discardLogger(), modeloracle.WithAlias("anthropic", "claudecode"))
+	o.Refresh(context.Background())
+
+	alias, fresh, ok := o.Snapshot(context.Background(), "anthropic")
+	if !ok || !fresh {
+		t.Fatalf("Snapshot(anthropic) fresh=%v ok=%v, want both true (shares claudecode)", fresh, ok)
+	}
+	if !contains(alias, "claude-opus-4-8") || !contains(alias, "claude-sonnet-4-6") {
+		t.Errorf("aliased models = %v, want the claudecode set", alias)
+	}
+	if canon, cf, ck := o.Snapshot(context.Background(), "claudecode"); !ck || !cf || len(canon) != 2 {
+		t.Errorf("Snapshot(claudecode) = (%v,%v,%v), want the unchanged 2-model set", canon, cf, ck)
+	}
+
+	f.mu.Lock()
+	hits := f.hits
+	f.mu.Unlock()
+	if hits != 1 {
+		t.Errorf("fetcher hit %d times, want 1 — the alias must add no fetch", hits)
+	}
+}
+
+// TestCached_UnaliasedProviderStaysUnregistered is the counterfactual pin for
+// TestCached_AliasSharesCanonicalSnapshot: with NO WithAlias, Snapshot on the
+// anthropic key reports ok=false (the provider is genuinely unregistered), so
+// the alias is what activates the shared snapshot.
+func TestCached_UnaliasedProviderStaysUnregistered(t *testing.T) {
+	f := &fakeFetcher{ids: []string{"claude-opus-4-8"}}
+	o := modeloracle.NewCached(
+		map[string]modeloracle.Fetcher{"claudecode": f},
+		time.Hour, discardLogger())
+	o.Refresh(context.Background())
+
+	if _, _, ok := o.Snapshot(context.Background(), "anthropic"); ok {
+		t.Error("Snapshot(anthropic) ok=true without an alias, want false (unregistered → fail-open)")
+	}
+}
+
 // TestCached_SuccessfulFetchAccepted asserts a fresh successful fetch reports the
 // id set with fresh=true, ok=true.
 func TestCached_SuccessfulFetchAccepted(t *testing.T) {

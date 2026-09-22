@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -22,6 +23,7 @@ import (
 	forgegitlab "github.com/kuhlman-labs/fishhawk/backend/internal/forge/gitlab"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mergegate"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/modeloracle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 )
@@ -317,6 +319,309 @@ func TestOnboardingReadiness_NoReviewerBackend(t *testing.T) {
 		if rv.Available || rv.MissingHint == "" {
 			t.Errorf("reviewer %q = %+v, want unavailable with a hint", rv.Provider, rv)
 		}
+	}
+}
+
+// --- #3578: reviewer model-validity honesty fields on the readiness rung ---
+
+// onboardingSingleReviewerSpecYAML declares ONE anthropic reviewer with an
+// explicit model, so a model-validity test asserts against exactly one rung.
+const onboardingSingleReviewerSpecYAML = `version: "1.0"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        reviewers:
+          agents:
+            - provider: anthropic
+              model: claude-opus-4-8
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+`
+
+// onboardingUnpricedReviewerSpecYAML names a model whose family the shared
+// pricing table does not know, so the priced flag reads false.
+const onboardingUnpricedReviewerSpecYAML = `version: "1.0"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        reviewers:
+          agents:
+            - provider: anthropic
+              model: mystery-model-1
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+`
+
+// onboardingReviewerNoModelSpecYAML omits the reviewer model, so the resolved
+// deployment default (not the spec) is what gets checked.
+const onboardingReviewerNoModelSpecYAML = `version: "1.0"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        reviewers:
+          agents:
+            - provider: anthropic
+          human: 0
+        produces:
+          - artifact: plan
+            schema: standard_v1
+`
+
+// newOnboardingServerWithOracle is newOnboardingServer plus an injected
+// Config.ModelOracle, so the model-validity honesty fields (#3578) are exercised.
+func newOnboardingServerWithOracle(t *testing.T, ghSrv *httptest.Server, reviewers ReviewerSet, oracle modeloracle.ModelOracle) *Server {
+	t.Helper()
+	s := newOnboardingServer(t, ghSrv, reviewers)
+	s.cfg.ModelOracle = oracle
+	return s
+}
+
+// oracleReviewerSet is the test analog of the production planReviewerSet.For:
+// For() resolves an omitted model to the provider's deployment default, then
+// verifies the RESOLVED model against an oracle and returns a
+// modeloracle.RejectedError (wrapping the verdict) on authoritative absence —
+// exactly the shape the readiness rung and the run-create path key on (#3578).
+type oracleReviewerSet struct {
+	def       PlanReviewer
+	providers map[string]PlanReviewer
+	defaults  map[string]string // per-provider deployment default model
+	oracle    modeloracle.ModelOracle
+}
+
+func (s oracleReviewerSet) Default() PlanReviewer { return s.def }
+
+func (s oracleReviewerSet) For(provider, model string, _ ...string) (PlanReviewer, error) {
+	r, ok := s.providers[provider]
+	if !ok {
+		return nil, fmt.Errorf("reviewer provider %q is not configured", provider)
+	}
+	if model == "" {
+		model = s.defaults[provider]
+	}
+	if v := modeloracle.Verify(context.Background(), s.oracle, provider, model); v.Status == modeloracle.ModelRejected {
+		return nil, fmt.Errorf("reviewer provider %q model %q is not available: %w", provider, model, modeloracle.RejectedError{Verdict: v})
+	}
+	return r, nil
+}
+
+// reviewerByProvider indexes a readiness response's reviewers by provider.
+func reviewerByProvider(resp onboardingReadinessResponse) map[string]reviewerReadiness {
+	out := map[string]reviewerReadiness{}
+	for _, rv := range resp.Reviewers {
+		out[rv.Provider] = rv
+	}
+	return out
+}
+
+// TestOnboardingReadiness_ReviewerModelRejectedOnFreshAbsence pins the core
+// control: a reviewer whose model is authoritatively absent from a fresh
+// snapshot is available=false, model_status=rejected, with a did-you-mean hint.
+// Deleting the Available=false override (the errors.As RejectedError arm in
+// probeReviewers) turns this RED.
+func TestOnboardingReadiness_ReviewerModelRejectedOnFreshAbsence(t *testing.T) {
+	fake := newFakeGitHubForRuns(onboardingSingleReviewerSpecYAML)
+	ghSrv := fake.server(t)
+	oracle := modeloracle.Static{Models: map[string][]string{"anthropic": {"claude-opus-4-7"}}, Fresh: true}
+	set := oracleReviewerSet{
+		def:       &fakePlanReviewer{},
+		providers: map[string]PlanReviewer{"anthropic": &fakePlanReviewer{}},
+		oracle:    oracle,
+	}
+	s := newOnboardingServerWithOracle(t, ghSrv, set, oracle)
+
+	id := testOperatorIdentity()
+	code, resp := decodeReadiness(t, s, onboardingReq("x/y", &id))
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", code)
+	}
+	rv := reviewerByProvider(resp)["anthropic"]
+	if rv.Available {
+		t.Errorf("Available = true, want false for an authoritatively-absent model")
+	}
+	if rv.ModelStatus != "rejected" {
+		t.Errorf("ModelStatus = %q, want rejected", rv.ModelStatus)
+	}
+	if !strings.Contains(rv.ModelHint, `did you mean "claude-opus-4-7"`) {
+		t.Errorf("ModelHint = %q, want a did-you-mean naming claude-opus-4-7", rv.ModelHint)
+	}
+}
+
+// TestOnboardingReadiness_ReviewerModelVerified: a model present in a fresh
+// snapshot is available=true, model_status=verified, priced=true.
+func TestOnboardingReadiness_ReviewerModelVerified(t *testing.T) {
+	fake := newFakeGitHubForRuns(onboardingSingleReviewerSpecYAML)
+	ghSrv := fake.server(t)
+	oracle := modeloracle.Static{Models: map[string][]string{"anthropic": {"claude-opus-4-8"}}, Fresh: true}
+	set := fakeReviewerSet{providers: map[string]PlanReviewer{"anthropic": &fakePlanReviewer{}}}
+	s := newOnboardingServerWithOracle(t, ghSrv, set, oracle)
+
+	id := testOperatorIdentity()
+	code, resp := decodeReadiness(t, s, onboardingReq("x/y", &id))
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", code)
+	}
+	rv := reviewerByProvider(resp)["anthropic"]
+	if !rv.Available || rv.ModelStatus != "verified" {
+		t.Errorf("rv = %+v, want available + verified", rv)
+	}
+	if rv.Priced == nil || !*rv.Priced {
+		t.Errorf("Priced = %v, want &true (claude-opus is a known family)", rv.Priced)
+	}
+}
+
+// TestOnboardingReadiness_ReviewerModelUnverifiableWhenNoSnapshot: a nil oracle
+// (a key-less deployment) resolves to available=true, model_status=unverifiable,
+// with a non-empty hint — the rung's honest state everywhere without a snapshot.
+func TestOnboardingReadiness_ReviewerModelUnverifiableWhenNoSnapshot(t *testing.T) {
+	fake := newFakeGitHubForRuns(onboardingSingleReviewerSpecYAML)
+	ghSrv := fake.server(t)
+	set := fakeReviewerSet{providers: map[string]PlanReviewer{"anthropic": &fakePlanReviewer{}}}
+	s := newOnboardingServerWithOracle(t, ghSrv, set, nil) // no oracle
+
+	id := testOperatorIdentity()
+	code, resp := decodeReadiness(t, s, onboardingReq("x/y", &id))
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", code)
+	}
+	rv := reviewerByProvider(resp)["anthropic"]
+	if !rv.Available || rv.ModelStatus != "unverifiable" {
+		t.Errorf("rv = %+v, want available + unverifiable", rv)
+	}
+	if rv.ModelHint == "" {
+		t.Errorf("ModelHint empty, want the passed-to-the-vendor-verbatim warning")
+	}
+}
+
+// TestOnboardingReadiness_ReviewerModelUnpriced: a verified model whose family
+// the pricing table does not know is priced=false and the hint carries the $0
+// note. Deleting the pricing lookup (modelPriced/Priced assignment) turns this
+// RED.
+func TestOnboardingReadiness_ReviewerModelUnpriced(t *testing.T) {
+	fake := newFakeGitHubForRuns(onboardingUnpricedReviewerSpecYAML)
+	ghSrv := fake.server(t)
+	oracle := modeloracle.Static{Models: map[string][]string{"anthropic": {"mystery-model-1"}}, Fresh: true}
+	set := fakeReviewerSet{providers: map[string]PlanReviewer{"anthropic": &fakePlanReviewer{}}}
+	s := newOnboardingServerWithOracle(t, ghSrv, set, oracle)
+
+	id := testOperatorIdentity()
+	code, resp := decodeReadiness(t, s, onboardingReq("x/y", &id))
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", code)
+	}
+	rv := reviewerByProvider(resp)["anthropic"]
+	if rv.ModelStatus != "verified" {
+		t.Errorf("ModelStatus = %q, want verified (present in the fresh set)", rv.ModelStatus)
+	}
+	if rv.Priced == nil || *rv.Priced {
+		t.Errorf("Priced = %v, want &false (mystery-model-1 has no pricing family)", rv.Priced)
+	}
+	if !strings.Contains(rv.ModelHint, "$0") {
+		t.Errorf("ModelHint = %q, want the unpriced $0 note", rv.ModelHint)
+	}
+}
+
+// TestOnboardingReadiness_ReviewerModelOmittedPricedAbsent: when the spec omits
+// the model, priced is nil — ABSENT from the JSON (the "not computed" third
+// state), never a bare false.
+func TestOnboardingReadiness_ReviewerModelOmittedPricedAbsent(t *testing.T) {
+	fake := newFakeGitHubForRuns(onboardingReviewerNoModelSpecYAML)
+	ghSrv := fake.server(t)
+	oracle := modeloracle.Static{Models: map[string][]string{"anthropic": {"claude-opus-4-8"}}, Fresh: true}
+	set := fakeReviewerSet{providers: map[string]PlanReviewer{"anthropic": &fakePlanReviewer{}}}
+	s := newOnboardingServerWithOracle(t, ghSrv, set, oracle)
+
+	id := testOperatorIdentity()
+	w := httptest.NewRecorder()
+	s.handleGetOnboardingReadiness(w, onboardingReq("x/y", &id))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), `"priced"`) {
+		t.Errorf("response carries a priced key, want it absent when the spec omits the model:\n%s", w.Body.String())
+	}
+	var resp onboardingReadinessResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if rv := reviewerByProvider(resp)["anthropic"]; rv.Priced != nil {
+		t.Errorf("Priced = %v, want nil (spec omitted the model)", rv.Priced)
+	}
+}
+
+// TestCreateRun_ReviewerDefaultModelAbsent_AdmitsWithDidYouMeanAudit is binding
+// condition (3)'s end-to-end test: through the REAL admission handler + audit
+// repo, a spec omitting the reviewer model whose deployment DEFAULT is absent
+// from a fresh snapshot is ADMITTED (201, degrade not reject) AND a
+// reviewer_capability_unavailable audit entry carries the did-you-mean error.
+func TestCreateRun_ReviewerDefaultModelAbsent_AdmitsWithDidYouMeanAudit(t *testing.T) {
+	repo := newFakeRepo()
+	au := newAuditFake()
+	oracle := modeloracle.Static{Models: map[string][]string{"anthropic": {"claude-opus-4-7"}}, Fresh: true}
+	// The deployment default (claude-bad-default) is absent from the fresh set,
+	// so For() rejects it with a did-you-mean naming claude-opus-4-7.
+	set := oracleReviewerSet{
+		def:       &fakePlanReviewer{model: "claude-opus-4-7"},
+		providers: map[string]PlanReviewer{"anthropic": &fakePlanReviewer{}},
+		// The deployment default (a near-miss of the served claude-opus-4-7) is
+		// absent from the fresh set, so For() rejects it with a did-you-mean.
+		defaults: map[string]string{"anthropic": "claude-opus-4-8"},
+		oracle:   oracle,
+	}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo, AuditRepo: au, PlanReviewers: set, ModelOracle: oracle})
+
+	body, _ := json.Marshal(map[string]any{
+		"repo":           "x/y",
+		"workflow_id":    "feature_change",
+		"workflow_sha":   "abc",
+		"trigger_source": "cli",
+		"workflow_spec":  onboardingReviewerNoModelSpecYAML,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	s.handleCreateRun(w, withAuth(req))
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (a bad default DEGRADES, not rejects):\n%s", w.Code, w.Body.String())
+	}
+	if len(repo.runs) != 1 {
+		t.Fatalf("runs created = %d, want 1", len(repo.runs))
+	}
+	caps := capabilityUnavailableEntries(t, au)
+	if len(caps) != 1 {
+		t.Fatalf("reviewer_capability_unavailable entries = %d, want 1", len(caps))
+	}
+	if caps[0]["provider"] != "anthropic" {
+		t.Errorf("capability audit provider = %v, want anthropic", caps[0]["provider"])
+	}
+	errText, _ := caps[0]["error"].(string)
+	if !strings.Contains(errText, `did you mean "claude-opus-4-7"`) {
+		t.Errorf("audit error = %q, want the did-you-mean naming claude-opus-4-7", errText)
+	}
+	if !strings.Contains(errText, "claude-opus-4-8") {
+		t.Errorf("audit error = %q, want it to name the resolved default model", errText)
 	}
 }
 

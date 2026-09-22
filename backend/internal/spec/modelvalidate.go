@@ -69,32 +69,30 @@ func ValidateModels(s *Spec, oracle modeloracle.ModelOracle) (warnings []Warning
 		if strings.TrimSpace(model) == "" {
 			return
 		}
-		var (
-			models       []string
-			fresh, hasOK bool
-		)
-		oracleAbsent := oracle == nil
-		if !oracleAbsent {
-			models, fresh, hasOK = oracle.Snapshot(ctx, provider)
-		}
-		// Fail open: no oracle, no snapshot, or a stale one — accept with a
-		// warning. Absence from a non-authoritative list cannot reject.
-		if oracleAbsent || !hasOK || !fresh {
+		// The verdict routing (unverifiable → warn, verified → accept, rejected →
+		// hard error) and the reject-message rendering both live in
+		// modeloracle.Verify / Verdict.RejectMessage now (#3578), so the run
+		// path, the reviewer-set resolution, and the doctor rung all answer the
+		// same question. The Warning message and *ValidationError text below are
+		// byte-identical to the pre-refactor inline logic.
+		switch v := modeloracle.Verify(ctx, oracle, provider, model); v.Status {
+		case modeloracle.ModelUnverifiable:
+			// Fail open: no oracle, no snapshot, or a stale one — accept with a
+			// warning. Absence from a non-authoritative list cannot reject.
 			warnings = append(warnings, Warning{
 				Path:    path,
 				Code:    WarningCodeModelUnverifiable,
 				Message: fmt.Sprintf("model %q (provider %q) could not be verified against a live model snapshot; accepting (fail-open)", model, provider),
 			})
-			return
-		}
-		if modelInSet(model, models) {
-			return
-		}
-		// Authoritative absence → hard reject. Record only the first.
-		if err == nil {
-			err = &ValidationError{
-				Path:    path,
-				Message: modelRejectMessage(model, provider, models),
+		case modeloracle.ModelVerified:
+			// Present in a fresh, authoritative snapshot — accept silently.
+		case modeloracle.ModelRejected:
+			// Authoritative absence → hard reject. Record only the first.
+			if err == nil {
+				err = &ValidationError{
+					Path:    path,
+					Message: v.RejectMessage(),
+				}
 			}
 		}
 	}
@@ -135,100 +133,8 @@ func providerForExecutorAgent(agent string) string {
 	}
 }
 
-// modelInSet reports membership of model in available.
-func modelInSet(model string, available []string) bool {
-	for _, m := range available {
-		if m == model {
-			return true
-		}
-	}
-	return false
-}
-
-// modelRejectMessage renders the hard-error message: the rejected model, a
-// did-you-mean suggestion when a near-miss exists, and the available set.
-func modelRejectMessage(model, provider string, available []string) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "model %q is not a known %q model", model, provider)
-	if s := suggest(model, available); s != "" {
-		fmt.Fprintf(&b, " (did you mean %q?)", s)
-	}
-	sorted := append([]string(nil), available...)
-	sort.Strings(sorted)
-	if len(sorted) > 0 {
-		fmt.Fprintf(&b, "; available: %s", strings.Join(sorted, ", "))
-	} else {
-		b.WriteString("; available: (none)")
-	}
-	return b.String()
-}
-
-// suggest returns the closest available model to model by Levenshtein distance,
-// or "" when nothing is within a conservative edit-distance budget (so an
-// unrelated typo doesn't get a misleading suggestion). The budget scales with
-// the candidate length: up to a third of the longer string's length, capped.
-func suggest(model string, available []string) string {
-	best := ""
-	bestDist := 1 << 30
-	for _, cand := range available {
-		d := levenshtein(model, cand)
-		if d < bestDist {
-			bestDist = d
-			best = cand
-		}
-	}
-	if best == "" {
-		return ""
-	}
-	budget := len(best) / 3
-	if budget < 2 {
-		budget = 2
-	}
-	if budget > 8 {
-		budget = 8
-	}
-	if bestDist > budget {
-		return ""
-	}
-	return best
-}
-
-// levenshtein computes the edit distance between a and b (classic two-row
-// dynamic program). No such helper exists elsewhere in the repo.
-func levenshtein(a, b string) int {
-	ra, rb := []rune(a), []rune(b)
-	if len(ra) == 0 {
-		return len(rb)
-	}
-	if len(rb) == 0 {
-		return len(ra)
-	}
-	prev := make([]int, len(rb)+1)
-	curr := make([]int, len(rb)+1)
-	for j := range prev {
-		prev[j] = j
-	}
-	for i := 1; i <= len(ra); i++ {
-		curr[0] = i
-		for j := 1; j <= len(rb); j++ {
-			cost := 1
-			if ra[i-1] == rb[j-1] {
-				cost = 0
-			}
-			curr[j] = min3(prev[j]+1, curr[j-1]+1, prev[j-1]+cost)
-		}
-		prev, curr = curr, prev
-	}
-	return prev[len(rb)]
-}
-
-func min3(a, b, c int) int {
-	m := a
-	if b < m {
-		m = b
-	}
-	if c < m {
-		m = c
-	}
-	return m
-}
+// The model-membership, reject-message rendering, did-you-mean suggestion, and
+// Levenshtein helpers moved to modeloracle (verify.go) in #3578 so the
+// reviewer-set resolution and the doctor rung reuse the SAME verdict logic this
+// validation drives. ValidateModels now routes through modeloracle.Verify +
+// Verdict.RejectMessage above; the error and warning text are unchanged.
