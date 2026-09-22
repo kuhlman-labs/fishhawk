@@ -68,6 +68,7 @@ const (
 	// acceptanceTranscriptGo holds the backend twins of the runner's
 	// acceptance-transcript wire shapes (E72.5 / #3329).
 	acceptanceTranscriptGo = "backend/internal/server/acceptance_transcript.go"
+	reapFailureGo          = "backend/internal/server/reap_failure.go"
 	uploadFile             = "runner/internal/upload/upload.go"
 	scenarioFile           = "runner/internal/scenario/scenario.go"
 )
@@ -213,6 +214,19 @@ func SeedManifest() Manifest {
 				Mode:                 ModeSubset,
 				EmitterOnlyUnchecked: true,
 			},
+			{
+				// The runner's terminal-failure self-report (#3598). ModeExact:
+				// the guard compares json TAGS (names + options), not Go types,
+				// so the server's json.RawMessage expected_state/expected_attempt
+				// (needed for its absent-vs-null three-state decode) and the
+				// runner's plain strings agree field-for-field. The body bytes
+				// are ALSO pinned by the shared golden
+				// testdata/wire/reap_failure_self_report.json.
+				Name: "reap_failure_request", Anchor: "#3598",
+				Emitter:  Endpoint{File: uploadFile, Type: "reapFailureRequestBody"},
+				Consumer: Endpoint{File: reapFailureGo, Type: "reapFailureRequest"},
+				Mode:     ModeExact,
+			},
 		},
 		CoveredFiles: []string{
 			promptFile,
@@ -221,6 +235,7 @@ func SeedManifest() Manifest {
 			scopeCompFile,
 			acceptanceGo,
 			acceptanceTranscriptGo,
+			reapFailureGo,
 			uploadFile,
 			scenarioFile,
 		},

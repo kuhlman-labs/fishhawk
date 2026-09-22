@@ -43,6 +43,18 @@ const CategoryDispatchReaperFailed = "dispatch_reaper_failed"
 // it.
 var errReapRepoNotCAS = errors.New("reap path requires a run repository implementing run.StageCASTransitioner")
 
+// errReapRepoNotAttemptCAS is the sentinel failStageForReap returns when an
+// ATTEMPT-PINNED reap (a non-empty expected_attempt — the runner's self-report,
+// #3598) meets a run repository that does NOT implement
+// run.StageAttemptCASTransitioner. The handler maps it to a DISTINCT 503
+// attempt_pinned_reap_unsupported and transitions NOTHING: a self-report that
+// cannot be attempt-pinned inside the write's own predicate must reap nothing,
+// never degrade to a state-only write that a full running(A) → … → running(B)
+// re-dispatch cycle would satisfy. Unreachable in a deployed daemon (postgresRepo
+// carries the capability, pinned by its compile-time assertion); it exists so a
+// partial or in-memory repo cannot quietly weaken the anchor.
+var errReapRepoNotAttemptCAS = errors.New("attempt-pinned reap requires a run repository implementing run.StageAttemptCASTransitioner")
+
 // maxReapFailureBodyBytes caps the request body. The reap-failure report is a
 // handful of small fields (category, reason, detail, exit_code), so 32 KB is
 // well above any realistic payload and well below trace's 64 MiB cap.
@@ -141,12 +153,46 @@ func reapConditionalAnchorList() []string {
 // concurrent dispatch may have just brought to life. The raw bytes are the only
 // decode-layer representation that keeps `null` distinguishable from absence, so
 // the presence check reads them directly (validateReapExpectedState).
+//
+// ExpectedAttempt is the OPTIONAL attempt pin (#3598) — REQUIRED on the
+// run-bound arm, where the runner reports its own terminal failure. It carries
+// the run.StageAttemptToken the runner received in its prompt envelope
+// (stage_attempt) and is a json.RawMessage for the SAME absent-vs-null-vs-empty
+// reason as ExpectedState (validateReapExpectedAttempt). An attempt pin implies
+// a state pin: it is only honoured together with expected_state.
+//
+// CROSS-MODULE WIRE CONTRACT: the json tags MUST stay byte-identical to the
+// runner's upload.reapFailureRequestBody (runner/internal/upload/upload.go),
+// registered as the reap_failure_request pair in backend/internal/wirecontract;
+// the shared golden testdata/wire/reap_failure_self_report.json is read by both
+// modules' tests.
 type reapFailureRequest struct {
-	Category      string          `json:"category"`
-	Reason        string          `json:"reason"`
-	Detail        string          `json:"detail,omitempty"`
-	ExitCode      int             `json:"exit_code,omitempty"`
-	ExpectedState json.RawMessage `json:"expected_state,omitempty"`
+	Category        string          `json:"category"`
+	Reason          string          `json:"reason"`
+	Detail          string          `json:"detail,omitempty"`
+	ExitCode        int             `json:"exit_code,omitempty"`
+	ExpectedState   json.RawMessage `json:"expected_state,omitempty"`
+	ExpectedAttempt json.RawMessage `json:"expected_attempt,omitempty"`
+}
+
+// validateReapExpectedAttempt resolves the raw expected_attempt bytes (#3598)
+// with the same PRESENCE discipline as validateReapExpectedState: nil raw is
+// ABSENT (unpinned); a present value must decode to a NON-EMPTY JSON string.
+// `null`, `""`, `7` and `{}` are PRESENT-and-invalid (ok=false) — never the
+// unpinned path, or a malformed pin would silently lose its anchor.
+func validateReapExpectedAttempt(raw json.RawMessage) (pinned bool, attempt string, got string, ok bool) {
+	if raw == nil {
+		return false, "", "", true
+	}
+	trimmed := bytes.TrimSpace(raw)
+	var decoded string
+	if !bytes.Equal(trimmed, []byte("null")) && json.Unmarshal(trimmed, &decoded) == nil {
+		if decoded != "" {
+			return true, decoded, decoded, true
+		}
+		return true, "", decoded, false
+	}
+	return true, "", string(trimmed), false
 }
 
 // validateReapExpectedState resolves the raw expected_state bytes into the
@@ -222,22 +268,22 @@ func (s *Server) handleReapStageFailure(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Auth: an authenticated identity carrying write:runs. Mirrors the
-	// consolidate handler's operator-write gate — anonymous → 401; an
-	// authenticated token without write:runs → 403. A cookie session with an
-	// empty TokenID is not scope-gated (matching the sibling write handlers'
-	// bypass); the operator/MCP token that drives dispatch already carries
-	// write:runs, so the impact inventory is empty.
+	// Auth: anonymous → 401 first. Then the mutually-exclusive entitlement
+	// switch handleFileProductReport uses (#1274), widened here for the
+	// runner's terminal-failure self-report (#3598):
+	//   (a) a run-bound fhm_ token (subject mcp:run:<id>) for ANOTHER run →
+	//       403 run_not_entitled;
+	//   (b) a run-bound token for ITS OWN run → admitted WITHOUT write:runs
+	//       (run-bound tokens carry mcp:read, never write:runs), but the arm
+	//       REQUIRES both expected_state and expected_attempt below;
+	//   (c) any other bearer → unchanged write:runs requirement (403
+	//       insufficient_scope);
+	//   (d) an empty-TokenID cookie session → admitted as before.
+	// Nothing is tightened, so the auth-change impact inventory is empty.
 	id := IdentityFrom(r.Context())
 	if id.IsAnonymous() {
 		s.writeError(w, r, http.StatusUnauthorized, "authentication_required",
 			"an authenticated token is required", nil)
-		return
-	}
-	if id.TokenID != "" && !hasScope(id, "write:runs") {
-		s.writeError(w, r, http.StatusForbidden, "insufficient_scope",
-			"token is missing required scope: write:runs",
-			map[string]any{"required_scope": "write:runs"})
 		return
 	}
 
@@ -247,6 +293,26 @@ func (s *Server) handleReapStageFailure(w http.ResponseWriter, r *http.Request) 
 			"run_id must be a valid UUID",
 			map[string]any{"field": "run_id", "got": r.PathValue("run_id")})
 		return
+	}
+
+	tokenRunID, runBound := runBoundTokenRunID(id)
+	switch {
+	case runBound:
+		if tokenRunID != runID {
+			s.writeError(w, r, http.StatusForbidden, "run_not_entitled",
+				"a run-bound token may only report a failure for its own run",
+				map[string]any{"run_id": runID.String()})
+			return
+		}
+	case id.TokenID != "":
+		if !hasScope(id, "write:runs") {
+			s.writeError(w, r, http.StatusForbidden, "insufficient_scope",
+				"token is missing required scope: write:runs",
+				map[string]any{"required_scope": "write:runs"})
+			return
+		}
+	default:
+		// Empty TokenID == session-cookie operator → admit.
 	}
 	stageID, err := uuid.Parse(r.PathValue("stage_id"))
 	if err != nil {
@@ -309,6 +375,29 @@ func (s *Server) handleReapStageFailure(w http.ResponseWriter, r *http.Request) 
 	// reapFailureRequest's doc comment for why treating "" or null as
 	// unconditional would be a silent downgrade rather than a nit.
 	conditional, expected, gotExpected, ok := validateReapExpectedState(req.ExpectedState)
+	attemptPinned, expectedAttempt, gotAttempt, attemptOK := validateReapExpectedAttempt(req.ExpectedAttempt)
+	// RUN-BOUND ARM (#3598): the runner's self-report MUST pin both the state
+	// and its own attempt. A state pin alone is insufficient — a retried
+	// attempt is ALSO `running` — so an unanchored self-report is refused
+	// rather than admitted onto the absorbing unconditional walk.
+	if runBound {
+		if !conditional || !ok {
+			s.writeError(w, r, http.StatusBadRequest, "expected_state_required",
+				"a run-bound self-report must pin expected_state to one of the reapable stage states",
+				map[string]any{
+					"field":    "expected_state",
+					"got":      gotExpected,
+					"accepted": reapConditionalAnchorList(),
+				})
+			return
+		}
+		if !attemptPinned || !attemptOK {
+			s.writeError(w, r, http.StatusBadRequest, "expected_attempt_required",
+				"a run-bound self-report must pin expected_attempt to the non-empty stage_attempt token from its prompt envelope",
+				map[string]any{"field": "expected_attempt", "got": gotAttempt})
+			return
+		}
+	}
 	if !ok {
 		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
 			"expected_state must name one of the reapable stage states this endpoint can honour",
@@ -317,6 +406,21 @@ func (s *Server) handleReapStageFailure(w http.ResponseWriter, r *http.Request) 
 				"got":      gotExpected,
 				"accepted": reapConditionalAnchorList(),
 			})
+		return
+	}
+	// An attempt pin on the operator arm is honoured too, under the same rules:
+	// it must be a non-empty string and must accompany a state pin (the attempt
+	// predicate only exists on the conditional, non-absorbing walk).
+	if !attemptOK {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			"expected_attempt must be a non-empty stage attempt token",
+			map[string]any{"field": "expected_attempt", "got": gotAttempt})
+		return
+	}
+	if attemptPinned && !conditional {
+		s.writeError(w, r, http.StatusBadRequest, "expected_state_required",
+			"expected_attempt requires expected_state",
+			map[string]any{"field": "expected_state", "accepted": reapConditionalAnchorList()})
 		return
 	}
 
@@ -355,6 +459,22 @@ func (s *Server) handleReapStageFailure(w http.ResponseWriter, r *http.Request) 
 				"actual_state":   string(stage.State),
 			})
 		return
+	}
+	// Attempt-pin FAST PATH ONLY (#3598). Comparing the pin against the LOADED
+	// row saves a doomed write and answers the common non-racing case cleanly —
+	// but it is NOT the control. The handler's load and the write are two
+	// separate reads, and a full running(A) → failed → retry → pending →
+	// dispatched → running(B) cycle between them satisfies a state-only
+	// `from == running` predicate; only the attempt predicate evaluated INSIDE
+	// the transition's own row-locked transaction (failStageForReap →
+	// run.StageAttemptCASTransitioner) closes that. Deleting this pre-check must
+	// leave behaviour identical — same 409 body, same stage, no audit — because
+	// the in-transaction predicate answers it the same way.
+	if attemptPinned {
+		if actual := run.StageAttemptToken(stage.DispatchedAt); actual != expectedAttempt {
+			s.writeStageAttemptSuperseded(w, r, stageID, expectedAttempt, actual)
+			return
+		}
 	}
 
 	// Idempotent no-op: a stage that already reached a terminal state (a
@@ -427,7 +547,7 @@ func (s *Server) handleReapStageFailure(w http.ResponseWriter, r *http.Request) 
 	// dispatched → running → failed), so the spawn-phase 'dispatched' case is
 	// handled — but, UNLIKE run.FailStage, it refuses to re-anchor into any
 	// protected park that lands mid-transition (GUARD 2, #2630).
-	if _, err := failStageForReap(r.Context(), s.cfg.RunRepo, stageID, stage.State, cat, req.Reason, conditional); err != nil {
+	if _, err := failStageForReap(r.Context(), s.cfg.RunRepo, stageID, stage.State, cat, req.Reason, conditional, expectedAttempt); err != nil {
 		// (d) WIRING FAULT — the run repository does not implement
 		// run.StageCASTransitioner (#2672). This is classified FIRST, ahead of
 		// the re-load below, and is load-bearing: the re-load's terminal-or-park
@@ -448,6 +568,31 @@ func (s *Server) handleReapStageFailure(w http.ResponseWriter, r *http.Request) 
 			s.writeError(w, r, http.StatusServiceUnavailable, "reap_failure_repo_not_cas",
 				"reap-failure endpoint requires a run repository implementing run.StageCASTransitioner",
 				map[string]any{"stage_id": stageID.String()})
+			return
+		}
+		// (d2) ATTEMPT-PIN WIRING FAULT (#3598): the repo cannot evaluate the
+		// attempt inside the write's predicate, so the self-report is refused
+		// with a DISTINCT 503 and NOTHING transitioned — never a degrade to a
+		// state-only write.
+		if errors.Is(err, errReapRepoNotAttemptCAS) {
+			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelError,
+				"reap-failure: run repository does not implement run.StageAttemptCASTransitioner",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+				slog.String("repo_type", fmt.Sprintf("%T", s.cfg.RunRepo)))
+			s.writeError(w, r, http.StatusServiceUnavailable, "attempt_pinned_reap_unsupported",
+				"an attempt-pinned reap requires a run repository implementing run.StageAttemptCASTransitioner",
+				map[string]any{"stage_id": stageID.String()})
+			return
+		}
+		// (d3) ATTEMPT SUPERSEDED inside the write (#3598): the row-locked
+		// predicate saw the pinned state but a DIFFERENT attempt — the stage was
+		// re-dispatched between this handler's load and its write. This is THE
+		// control; the load-time pre-check above is only its fast path, and both
+		// answer the identical 409 body. No audit entry, no advance.
+		var ace run.StageAttemptChangedError
+		if errors.As(err, &ace) {
+			s.writeStageAttemptSuperseded(w, r, stageID, expectedAttempt, ace.Actual)
 			return
 		}
 		// This branch fires for a NARROW, well-classified set, because
@@ -545,6 +690,15 @@ func (s *Server) handleReapStageFailure(w http.ResponseWriter, r *http.Request) 
 	if conditional {
 		payload["expected_state"] = string(expected)
 	}
+	// Run-bound self-report provenance (#3598) — added on that arm ONLY, so the
+	// operator payload's key set (shared builder, pinned by
+	// _UnconditionalAuditPayloadKeySet) does not grow. Both values derive from
+	// the VERIFIED identity and the VERIFIED attempt precondition, never from a
+	// caller-supplied provenance field.
+	if runBound {
+		payload["reported_by"] = "runner"
+		payload["reported_attempt"] = expectedAttempt
+	}
 	auditPayload, _ := json.Marshal(payload)
 	if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
 		RunID:     runID,
@@ -580,6 +734,19 @@ func (s *Server) handleReapStageFailure(w http.ResponseWriter, r *http.Request) 
 		Transitioned: true,
 		StageState:   string(run.StageStateFailed),
 	})
+}
+
+// writeStageAttemptSuperseded writes the 409 stage_attempt_superseded refusal
+// (#3598). ONE writer for both the load-time fast path and the in-transaction
+// StageAttemptChangedError, so the two are indistinguishable to the caller.
+func (s *Server) writeStageAttemptSuperseded(w http.ResponseWriter, r *http.Request, stageID uuid.UUID, expected, actual string) {
+	s.writeError(w, r, http.StatusConflict, "stage_attempt_superseded",
+		"the stage attempt the report was pinned to has been superseded by a re-dispatch",
+		map[string]any{
+			"stage_id":         stageID.String(),
+			"expected_attempt": expected,
+			"actual_attempt":   actual,
+		})
 }
 
 // recordAcceptanceVerdictUnshipped is the already-terminal branch's
@@ -772,13 +939,43 @@ const reapFailMaxAttempts = 4
 // server-side compare-and-set. Unconditional callers (the detached reaper,
 // run_children's spawn-error compensation) pass false and keep the absorbing
 // loop verbatim.
-func failStageForReap(ctx context.Context, repo run.Repository, stageID uuid.UUID, from run.StageState, cat run.FailureCategory, reason string, conditional bool) (*run.Stage, error) {
+//
+// ATTEMPT-PINNED MODE (#3598). A non-empty expectedAttempt (the runner's
+// self-report) routes EVERY write of the walk — both the dispatched → running
+// leg and the → failed leg — through run.StageAttemptCASTransitioner, so the
+// attempt is compared inside each write's own row-locked predicate and no
+// re-dispatch can land between the legs either. A repo lacking that capability
+// returns errReapRepoNotAttemptCAS and transitions NOTHING. An empty
+// expectedAttempt leaves every write on TransitionStageFrom, byte-for-byte as
+// before (the detached reaper and run_children paths). An attempt pin is by
+// construction conditional; a pin with conditional=false is a programming error
+// and is refused rather than run on the absorbing walk.
+func failStageForReap(ctx context.Context, repo run.Repository, stageID uuid.UUID, from run.StageState, cat run.FailureCategory, reason string, conditional bool, expectedAttempt string) (*run.Stage, error) {
 	cas, ok := repo.(run.StageCASTransitioner)
 	if !ok {
 		return nil, fmt.Errorf("%w (repo type %T)", errReapRepoNotCAS, repo)
 	}
-	return reapFailCAS(ctx, cas, stageID, from, cat, reason, conditional)
+	transition := func(from, to run.StageState, c *run.StageCompletion) (*run.Stage, error) {
+		return cas.TransitionStageFrom(ctx, stageID, from, to, c)
+	}
+	if expectedAttempt != "" {
+		if !conditional {
+			return nil, errors.New("reap: an attempt pin requires the conditional (non-absorbing) walk")
+		}
+		acas, ok := repo.(run.StageAttemptCASTransitioner)
+		if !ok {
+			return nil, fmt.Errorf("%w (repo type %T)", errReapRepoNotAttemptCAS, repo)
+		}
+		transition = func(from, to run.StageState, c *run.StageCompletion) (*run.Stage, error) {
+			return acas.TransitionStageFromAttempt(ctx, stageID, from, to, expectedAttempt, c)
+		}
+	}
+	return reapFailCAS(transition, from, cat, reason, conditional)
 }
+
+// reapTransitionFunc is one compare-and-swap write of reapFailCAS's walk: a
+// state-only TransitionStageFrom, or its attempt-pinned sibling (#3598).
+type reapTransitionFunc func(from, to run.StageState, c *run.StageCompletion) (*run.Stage, error)
 
 // reapFailCAS is failStageForReap's bounded re-anchor loop, mirroring run's
 // failStageCAS but with a reap-scoped re-anchor guard (reapReanchor): it ABSORBS
@@ -786,11 +983,11 @@ func failStageForReap(ctx context.Context, repo run.Repository, stageID uuid.UUI
 // The dispatched → running → failed walk matches FailStage's so the spawn-phase
 // 'dispatched' case and the #1907 benign dispatched → running absorption both
 // hold; only the park-refusal diverges.
-func reapFailCAS(ctx context.Context, cas run.StageCASTransitioner, stageID uuid.UUID, from run.StageState, cat run.FailureCategory, reason string, conditional bool) (*run.Stage, error) {
+func reapFailCAS(transition reapTransitionFunc, from run.StageState, cat run.FailureCategory, reason string, conditional bool) (*run.Stage, error) {
 	var lastErr error
 	for attempt := 0; attempt < reapFailMaxAttempts; attempt++ {
 		if from == run.StageStateDispatched {
-			running, err := cas.TransitionStageFrom(ctx, stageID, run.StageStateDispatched, run.StageStateRunning, nil)
+			running, err := transition(run.StageStateDispatched, run.StageStateRunning, nil)
 			if err != nil {
 				// CONDITIONAL: no re-anchor, no second attempt — the caller pinned a
 				// state and a mid-flight change means the precondition LOST.
@@ -806,7 +1003,7 @@ func reapFailCAS(ctx context.Context, cas run.StageCASTransitioner, stageID uuid
 			}
 			from = running.State
 		}
-		out, err := cas.TransitionStageFrom(ctx, stageID, from, run.StageStateFailed, &run.StageCompletion{
+		out, err := transition(from, run.StageStateFailed, &run.StageCompletion{
 			FailureCategory: &cat,
 			FailureReason:   &reason,
 		})

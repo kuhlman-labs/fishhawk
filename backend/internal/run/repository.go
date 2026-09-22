@@ -343,6 +343,33 @@ type StageCASTransitioner interface {
 	TransitionStageFrom(ctx context.Context, id uuid.UUID, from, to StageState, completion *StageCompletion) (*Stage, error)
 }
 
+// StageAttemptCASTransitioner is an OPTIONAL capability on the concrete
+// postgres repo — the attempt-pinned sibling of StageCASTransitioner (#3598).
+// TransitionStageFromAttempt applies the move ONLY when the stage's
+// row-locked current state equals `from` AND StageAttemptToken of the
+// row-locked dispatched_at equals `expectedAttempt`. Both comparisons happen
+// inside the SAME transaction under the SAME LockStageForUpdate row lock as
+// the existing state CAS, so state and attempt are decided atomically against
+// one read and no re-dispatch can interleave between them. State is compared
+// FIRST: a state mismatch returns StageStateChangedError; a matching state
+// with a mismatched attempt returns StageAttemptChangedError; either mutates
+// NOTHING. The attempt is checked BEFORE the same-state short-circuit, so a
+// superseded attempt is refused even when the stage already sits in `to`.
+// An EMPTY expectedAttempt disables the attempt comparison, making the call
+// byte-identical to TransitionStageFrom.
+//
+// expectedAttempt is the RENDERED token rather than a time.Time on purpose:
+// both sides render from the same Postgres-stamped column through the one
+// helper, so no timestamptz-vs-RFC3339Nano precision round-trip can make an
+// equal attempt compare unequal.
+//
+// Kept OFF the Repository interface for the same reason StageCASTransitioner
+// is — widening Repository would break every manually-written full-interface
+// test fake — and probed with a type assertion by its consumer.
+type StageAttemptCASTransitioner interface {
+	TransitionStageFromAttempt(ctx context.Context, id uuid.UUID, from, to StageState, expectedAttempt string, completion *StageCompletion) (*Stage, error)
+}
+
 // AccountGetter is the cheap tenant-account lookup (ADR-057 / E44.5) that
 // returns just a run's account_id ("" for an untenanted NULL row, the account
 // UUID string otherwise) without materializing the whole run.

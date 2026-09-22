@@ -14264,3 +14264,81 @@ func TestPromptResponse_AcceptanceReplay_DegradedChainReadRecordsDrop(t *testing
 		}
 	})
 }
+
+// reapSelfReportFixture reads the SHARED cross-module golden
+// testdata/wire/reap_failure_self_report.json (#3598, operator condition 2):
+// the exact body the runner's upload.ReportRunnerFailure emits. The runner's
+// upload_test.go reads the SAME file, so the attempt token proven emitted here
+// is the one proven sent there — one fixture, both directions. Fails closed on
+// a read or decode error.
+func reapSelfReportFixture(t *testing.T) (raw []byte, expectedAttempt string) {
+	t.Helper()
+	path := filepath.Join(repoRoot(t), "testdata", "wire", "reap_failure_self_report.json")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read shared reap self-report fixture %s: %v", path, err)
+	}
+	raw = bytes.TrimSpace(b)
+	var body struct {
+		ExpectedAttempt string `json:"expected_attempt"`
+	}
+	if err := json.Unmarshal(raw, &body); err != nil || body.ExpectedAttempt == "" {
+		t.Fatalf("decode shared reap self-report fixture: err=%v expected_attempt=%q", err, body.ExpectedAttempt)
+	}
+	return raw, body.ExpectedAttempt
+}
+
+// TestGetStagePrompt_EchoesStageAttemptToken pins the EMIT half of the #3598
+// attempt anchor at BOTH prompt construction sites: a stage whose dispatched_at
+// is stamped renders `stage_attempt` byte-identical to the expected_attempt the
+// runner's shared golden sends back (operator condition 2), and a stage whose
+// dispatched_at is nil OMITS the key entirely.
+func TestGetStagePrompt_EchoesStageAttemptToken(t *testing.T) {
+	_, fixtureAttempt := reapSelfReportFixture(t)
+	dispatchedAt, err := time.Parse(time.RFC3339Nano, fixtureAttempt)
+	if err != nil {
+		t.Fatalf("fixture expected_attempt %q is not RFC3339Nano: %v", fixtureAttempt, err)
+	}
+	for _, tc := range []struct {
+		name   string
+		render bool
+	}{{"prompt", false}, {"prompt-render", true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, rr, sf, _ := newPromptServer(t)
+			runID, stageID := uuid.New(), uuid.New()
+			priv, _ := sf.issue(t, runID)
+			rr.runRow = &run.Run{ID: runID, Repo: "kuhlman-labs/example", WorkflowID: "feature_change", TriggerSource: run.TriggerCLI}
+			at := dispatchedAt
+			rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeImplement, DispatchedAt: &at}
+			var w *httptest.ResponseRecorder
+			if tc.render {
+				w = promptRenderRequest(t, s, stageID)
+			} else {
+				w = promptRequest(t, s, runID, stageID, priv, "")
+			}
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+			}
+			if want := `"stage_attempt":"` + fixtureAttempt + `"`; !strings.Contains(w.Body.String(), want) {
+				t.Errorf("prompt envelope missing %s (must equal the shared golden's expected_attempt byte-for-byte):\n%s", want, w.Body.String())
+			}
+		})
+	}
+
+	t.Run("nil_dispatched_at_omits_key", func(t *testing.T) {
+		s, rr, sf, _ := newPromptServer(t)
+		runID, stageID := uuid.New(), uuid.New()
+		priv, _ := sf.issue(t, runID)
+		rr.runRow = &run.Run{ID: runID, Repo: "kuhlman-labs/example", WorkflowID: "feature_change", TriggerSource: run.TriggerCLI}
+		// Constructed ON PURPOSE with DispatchedAt nil: it stands for a legacy
+		// pre-migration-0072 row that never carried a dispatched_at stamp.
+		rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeImplement, DispatchedAt: nil}
+		w := promptRequest(t, s, runID, stageID, priv, "")
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		if strings.Contains(w.Body.String(), `"stage_attempt"`) {
+			t.Errorf("a nil dispatched_at must omit stage_attempt entirely:\n%s", w.Body.String())
+		}
+	})
+}

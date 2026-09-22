@@ -1309,6 +1309,203 @@ func TestPostgres_TransitionStageFrom_MatchTransitions(t *testing.T) {
 	}
 }
 
+// attemptCAS returns the repo's StageAttemptCASTransitioner capability, taken
+// through the constructor's Repository-typed return value so a decorator that
+// erased the capability fails here rather than passing on the concrete type.
+func attemptCAS(t *testing.T, repo run.Repository) run.StageAttemptCASTransitioner {
+	t.Helper()
+	cas, ok := repo.(run.StageAttemptCASTransitioner)
+	if !ok {
+		t.Fatal("postgres repo does not implement StageAttemptCASTransitioner")
+	}
+	return cas
+}
+
+// dispatchToRunning walks a stage into dispatched (the migration 0072 trigger
+// stamps dispatched_at) and then running, returning the attempt token read
+// back off the DB-stamped dispatched row.
+func dispatchToRunning(t *testing.T, repo run.Repository, id uuid.UUID) string {
+	t.Helper()
+	ctx := context.Background()
+	d, err := repo.TransitionStage(ctx, id, run.StageStateDispatched, nil)
+	if err != nil {
+		t.Fatalf("→dispatched: %v", err)
+	}
+	if d.DispatchedAt == nil {
+		t.Fatal("PRECONDITION: dispatched_at not stamped on entry to dispatched")
+	}
+	if _, err := repo.TransitionStage(ctx, id, run.StageStateRunning, nil); err != nil {
+		t.Fatalf("→running: %v", err)
+	}
+	return run.StageAttemptToken(d.DispatchedAt)
+}
+
+// redispatchToRunning drives the REAL retry cycle a superseded attempt races
+// against: running → failed → RetryStage → pending → dispatched → running. The
+// trigger re-stamps dispatched_at on the second entry into dispatched, so the
+// returned token is attempt B. It asserts B != A loudly so a fixture that
+// failed to re-stamp fails rather than greening the stale-attempt tests.
+func redispatchToRunning(t *testing.T, repo run.Repository, id uuid.UUID, tokenA string) string {
+	t.Helper()
+	ctx := context.Background()
+	cat := run.FailureC
+	reason := "attempt A died"
+	if _, err := repo.TransitionStage(ctx, id, run.StageStateFailed,
+		&run.StageCompletion{FailureCategory: &cat, FailureReason: &reason}); err != nil {
+		t.Fatalf("→failed: %v", err)
+	}
+	if _, err := repo.RetryStage(ctx, id, run.StageStatePending); err != nil {
+		t.Fatalf("retry → pending: %v", err)
+	}
+	tokenB := dispatchToRunning(t, repo, id)
+	if tokenB == "" || tokenB == tokenA {
+		t.Fatalf("PRECONDITION: re-dispatch did not re-stamp the attempt: A=%q B=%q", tokenA, tokenB)
+	}
+	return tokenB
+}
+
+// assertStageUnchanged reads the stage back and asserts the refused CAS
+// mutated nothing: same state, same dispatched_at attempt, no failure stamp.
+func assertStageUnchanged(t *testing.T, repo run.Repository, id uuid.UUID, wantState run.StageState, wantAttempt string) {
+	t.Helper()
+	cur, err := repo.GetStage(context.Background(), id)
+	if err != nil {
+		t.Fatalf("get stage: %v", err)
+	}
+	if cur.State != wantState {
+		t.Errorf("state = %q, want %q (refused CAS must not mutate)", cur.State, wantState)
+	}
+	if got := run.StageAttemptToken(cur.DispatchedAt); got != wantAttempt {
+		t.Errorf("attempt = %q, want %q (live attempt preserved)", got, wantAttempt)
+	}
+	if cur.FailureCategory != nil || cur.FailureReason != nil || cur.EndedAt != nil {
+		t.Errorf("refused CAS stamped completion: cat=%v reason=%v ended=%v",
+			cur.FailureCategory, cur.FailureReason, cur.EndedAt)
+	}
+}
+
+// TestPostgres_TransitionStageFromAttempt_MatchingAttemptTransitions pins the
+// happy path against the real migration 0072 trigger (#3598): pinning the live
+// attempt token read off the stage row lets running → failed apply.
+func TestPostgres_TransitionStageFromAttempt_MatchingAttemptTransitions(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := run.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	r := makeRun(t, repo)
+	s := makeStage(t, repo, r.ID, 0)
+	token := dispatchToRunning(t, repo, s.ID)
+
+	cat := run.FailureC
+	reason := "runner self-report"
+	got, err := attemptCAS(t, repo).TransitionStageFromAttempt(ctx, s.ID, run.StageStateRunning, run.StageStateFailed, token,
+		&run.StageCompletion{FailureCategory: &cat, FailureReason: &reason})
+	if err != nil {
+		t.Fatalf("TransitionStageFromAttempt (live attempt): %v", err)
+	}
+	if got.State != run.StageStateFailed {
+		t.Errorf("returned state = %q, want failed", got.State)
+	}
+	cur, err := repo.GetStage(ctx, s.ID)
+	if err != nil {
+		t.Fatalf("get stage: %v", err)
+	}
+	if cur.State != run.StageStateFailed {
+		t.Errorf("read-back state = %q, want failed", cur.State)
+	}
+}
+
+// TestPostgres_TransitionStageFromAttempt_StaleAttemptRefused is the case the
+// whole #3598 change exists for: attempt A's token is captured from the row
+// BEFORE a real retry cycle re-dispatches the stage as attempt B. The stage is
+// `running` again, so the STATE predicate PASSES — only the in-transaction
+// attempt predicate can refuse the write. It must return
+// StageAttemptChangedError and leave attempt B's row untouched (state and
+// dispatched_at read back unchanged).
+func TestPostgres_TransitionStageFromAttempt_StaleAttemptRefused(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := run.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	r := makeRun(t, repo)
+	s := makeStage(t, repo, r.ID, 0)
+	tokenA := dispatchToRunning(t, repo, s.ID)
+	tokenB := redispatchToRunning(t, repo, s.ID, tokenA)
+
+	cat := run.FailureC
+	reason := "stale report from attempt A"
+	_, err := attemptCAS(t, repo).TransitionStageFromAttempt(ctx, s.ID, run.StageStateRunning, run.StageStateFailed, tokenA,
+		&run.StageCompletion{FailureCategory: &cat, FailureReason: &reason})
+	var ace run.StageAttemptChangedError
+	if !errors.As(err, &ace) {
+		t.Fatalf("error = %v, want StageAttemptChangedError via errors.As", err)
+	}
+	if ace.StageID != s.ID || ace.Expected != tokenA || ace.Actual != tokenB {
+		t.Errorf("StageAttemptChangedError = %+v, want {stage:%s expected:%q actual:%q}", ace, s.ID, tokenA, tokenB)
+	}
+	assertStageUnchanged(t, repo, s.ID, run.StageStateRunning, tokenB)
+}
+
+// TestPostgres_TransitionStageFromAttempt_EmptyExpectedAttemptBehavesLikeStateOnlyCAS
+// is the back-compat pin (#3598): an EMPTY expectedAttempt disables the
+// attempt comparison, so after a re-dispatch the call applies exactly as
+// TransitionStageFrom does, and a state mismatch still surfaces as
+// StageStateChangedError (state is compared first, even with a pin).
+func TestPostgres_TransitionStageFromAttempt_EmptyExpectedAttemptBehavesLikeStateOnlyCAS(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := run.NewPostgresRepository(pool)
+	ctx := context.Background()
+	cas := attemptCAS(t, repo)
+	cat := run.FailureC
+	reason := "state-only CAS"
+	completion := &run.StageCompletion{FailureCategory: &cat, FailureReason: &reason}
+
+	r := makeRun(t, repo)
+	s := makeStage(t, repo, r.ID, 0)
+	tokenA := dispatchToRunning(t, repo, s.ID)
+	tokenB := redispatchToRunning(t, repo, s.ID, tokenA)
+
+	// State mismatch wins over the attempt pin: a stale from-state pinned
+	// with the LIVE attempt is a StageStateChangedError, not an attempt error.
+	_, err := cas.TransitionStageFromAttempt(ctx, s.ID, run.StageStateDispatched, run.StageStateFailed, tokenB, completion)
+	var sce run.StageStateChangedError
+	if !errors.As(err, &sce) {
+		t.Fatalf("state mismatch error = %v, want StageStateChangedError", err)
+	}
+	assertStageUnchanged(t, repo, s.ID, run.StageStateRunning, tokenB)
+
+	// Empty attempt: attempt B's stage transitions on the state predicate alone.
+	got, err := cas.TransitionStageFromAttempt(ctx, s.ID, run.StageStateRunning, run.StageStateFailed, "", completion)
+	if err != nil {
+		t.Fatalf("TransitionStageFromAttempt (empty attempt): %v", err)
+	}
+	if got.State != run.StageStateFailed {
+		t.Errorf("state = %q, want failed (empty attempt = state-only CAS)", got.State)
+	}
+}
+
+// TestPostgres_TransitionStageFromAttempt_StaleAttemptRefusedEvenWhenAlreadyInTargetState
+// pins that the attempt comparison runs AHEAD of the same-state short-circuit
+// (#3598): attempt A reporting running → running against a stage now running
+// under attempt B must be REFUSED, not returned as a silent idempotent success.
+func TestPostgres_TransitionStageFromAttempt_StaleAttemptRefusedEvenWhenAlreadyInTargetState(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := run.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	r := makeRun(t, repo)
+	s := makeStage(t, repo, r.ID, 0)
+	tokenA := dispatchToRunning(t, repo, s.ID)
+	tokenB := redispatchToRunning(t, repo, s.ID, tokenA)
+
+	_, err := attemptCAS(t, repo).TransitionStageFromAttempt(ctx, s.ID, run.StageStateRunning, run.StageStateRunning, tokenA, nil)
+	var ace run.StageAttemptChangedError
+	if !errors.As(err, &ace) {
+		t.Fatalf("error = %v, want StageAttemptChangedError (attempt checked before the same-state short-circuit)", err)
+	}
+	assertStageUnchanged(t, repo, s.ID, run.StageStateRunning, tokenB)
+}
+
 // TestNewPostgresRepository_ImplementsStageCASTransitioner closes the
 // interface-erasure half the concrete `var _ StageCASTransitioner =
 // (*postgresRepo)(nil)` assertion cannot cover (#2672): the constructor's

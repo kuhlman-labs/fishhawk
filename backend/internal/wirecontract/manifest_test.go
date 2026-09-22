@@ -368,3 +368,56 @@ func contains(ss []string, want string) bool {
 	}
 	return false
 }
+
+// TestSeedManifest_RegistersReapFailureRequestPair pins the #3598 registration:
+// reap_failure.go is a covered file and the runner's self-report body is paired
+// EXACT with the server's reapFailureRequest, resolving to the expected_attempt
+// field on both sides — so dropping the row, the covered file or the field
+// fails here rather than leaving the contract unguarded.
+func TestSeedManifest_RegistersReapFailureRequestPair(t *testing.T) {
+	m := SeedManifest()
+	covered := false
+	for _, f := range m.CoveredFiles {
+		if f == reapFailureGo {
+			covered = true
+		}
+	}
+	if !covered {
+		t.Errorf("CoveredFiles missing %s", reapFailureGo)
+	}
+	var pair *Pair
+	for i := range m.Pairs {
+		if m.Pairs[i].Name == "reap_failure_request" {
+			pair = &m.Pairs[i]
+		}
+	}
+	if pair == nil {
+		t.Fatal("seed manifest has no reap_failure_request pair")
+	}
+	if pair.Mode != ModeExact {
+		t.Errorf("reap_failure_request mode = %v, want ModeExact", pair.Mode)
+	}
+	if pair.Emitter != (Endpoint{File: uploadFile, Type: "reapFailureRequestBody"}) ||
+		pair.Consumer != (Endpoint{File: reapFailureGo, Type: "reapFailureRequest"}) {
+		t.Errorf("reap_failure_request endpoints = %+v -> %+v", pair.Emitter, pair.Consumer)
+	}
+	root, err := RepoRoot()
+	if err != nil {
+		t.Fatalf("resolve repo root: %v", err)
+	}
+	for _, ep := range []Endpoint{pair.Emitter, pair.Consumer} {
+		fields, err := ExtractStruct(filepath.Join(root, filepath.FromSlash(ep.File)), ep.Type)
+		if err != nil {
+			t.Fatalf("extract %s.%s: %v", ep.File, ep.Type, err)
+		}
+		found := false
+		for _, f := range fields {
+			if f.JSONName == "expected_attempt" {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("%s.%s carries no expected_attempt wire field: %+v", ep.File, ep.Type, fields)
+		}
+	}
+}

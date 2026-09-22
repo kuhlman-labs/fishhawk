@@ -10409,7 +10409,7 @@ paths:
   /v0/runs/{run_id}/stages/{stage_id}/reap-failure:
     post:
       operationId: reapStageFailure
-      summary: Report a spawn-phase runner failure so a stuck 'dispatched' stage fails
+      summary: Report a runner failure so a stranded 'dispatched' or 'running' stage fails
       description: |
         Records a detached runner's spawn-phase non-zero exit (#1747). The
         `fishhawk_dispatch_stage` reaper (in the MCP host) calls this when a
@@ -10508,9 +10508,35 @@ paths:
         committed. "Nothing transitioned" is exact for the load-time refusal
         and for a `pending`- or `running`-anchored first-CAS refusal.
 
-        **Authorization.** Requires an authenticated identity carrying
-        `write:runs` (anonymous → 401; a token without the scope → 403). The
-        operator/MCP token that drives dispatch already carries it.
+        **Authorization.** Anonymous → 401. Then a mutually-exclusive
+        entitlement switch (#3598): a run-bound `fhm_` token (subject
+        `mcp:run:<id>`) is admitted WITHOUT `write:runs` for ITS OWN run only
+        (another run → 403 `run_not_entitled`); any other bearer must carry
+        `write:runs` (403 `insufficient_scope` otherwise); a cookie session
+        with no token is admitted. The operator/MCP token that drives dispatch
+        already carries `write:runs`.
+
+        **Runner terminal-failure self-report (#3598).** The run-bound arm is
+        how a runner reports its OWN terminal failure when the signed trace
+        upload that would otherwise settle the stage is what failed. That arm
+        REQUIRES both `expected_state` (400 `expected_state_required`) and
+        `expected_attempt` — the `stage_attempt` token the runner received in
+        its prompt envelope (400 `expected_attempt_required` when absent,
+        `null`, empty, or a non-string). A state pin alone is insufficient: a
+        retried attempt is ALSO `running`. The attempt pin is enforced INSIDE
+        each write's own row-locked compare-and-swap predicate, together with
+        the state pin, on BOTH legs of a `dispatched`-anchored walk — a
+        re-dispatch landing between the handler's load and its write is
+        refused 409 `stage_attempt_superseded`. The handler also compares the
+        pin against its loaded row as a fast path that answers the identical
+        409; that pre-check is NOT the guarantee. A run repository that cannot
+        evaluate the attempt in the write refuses 503
+        `attempt_pinned_reap_unsupported` and reaps nothing — never a
+        state-only write. The `dispatch_reaper_failed` entry from this arm
+        (and only this arm) additionally carries `reported_by: "runner"` and
+        `reported_attempt` (the accepted token), derived from the verified
+        identity and precondition. An operator caller may also send
+        `expected_attempt`, under the same rules, alongside `expected_state`.
       tags: [runs]
       parameters:
         - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
@@ -10564,6 +10590,17 @@ paths:
                     read as omission. When supplied, the CAS walk does not
                     re-anchor, so a concurrent advance makes the reap lose with
                     409 rather than being absorbed.
+                expected_attempt:
+                  type: string
+                  minLength: 1
+                  description: |
+                    Attempt pin (#3598): the stage's `stage_attempt` token from
+                    the prompt envelope. REQUIRED on the run-bound arm; optional
+                    for an operator, and then only together with
+                    `expected_state` (400 `expected_state_required` otherwise).
+                    Compared inside the write's row-locked predicate; a
+                    mismatch is 409 `stage_attempt_superseded`. `null`, `""` or
+                    a non-string is a PRESENT-and-invalid value, never omission.
       responses:
         '200':
           description: |
@@ -10603,14 +10640,21 @@ paths:
             (#2699). Body's `error` is `validation_failed`; for
             `expected_state` the `details` carry `field`, `got` (the value as
             supplied, echoed as raw JSON text when it is not a string) and the
-            `accepted` set.
+            `accepted` set. An operator's malformed `expected_attempt` is also
+            `validation_failed`. `expected_state_required` — the run-bound arm
+            omitted or malformed `expected_state`, or any caller sent
+            `expected_attempt` without `expected_state`.
+            `expected_attempt_required` — the run-bound arm omitted
+            `expected_attempt` or sent `null`, `""` or a non-string (#3598).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403':
           description: |
-            The identity lacks `write:runs` scope (`insufficient_scope`).
+            `insufficient_scope` — a non-run-bound bearer lacks `write:runs`.
+            `run_not_entitled` — a run-bound token for a DIFFERENT run than
+            the path `run_id` (#3598).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -10633,6 +10677,14 @@ paths:
             guarantees, precisely" above for the `dispatched`-anchored walk's
             committed intermediate hop. Unreachable for an unconditional
             report.
+
+            `stage_attempt_superseded` — an attempt-pinned report whose
+            `expected_attempt` is no longer the stage's live attempt: the stage
+            was re-dispatched (#3598). `details` carry `stage_id`,
+            `expected_attempt` and `actual_attempt`. Returned identically by
+            the load-time fast path and by the in-transaction predicate that
+            is the actual control; nothing transitioned, no audit entry, no
+            advance.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -10646,6 +10698,11 @@ paths:
             transitioned and no audit entry is written. Unreachable in a
             correctly-wired daemon (the postgres repository has the
             capability, and startup refuses a repository that lacks it).
+            `attempt_pinned_reap_unsupported` — an attempt-pinned report met a
+            run repository that cannot compare the attempt inside the write's
+            own predicate (#3598); refused rather than degraded to a
+            state-only write, so nothing is transitioned and no audit entry is
+            written. Unreachable against the postgres repository.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -13261,6 +13318,9 @@ paths:
                   min_runner_version:
                     type: string
                     description: Minimum runner version the backend requires; absent when the backend has no constraint. Runners older than this value must exit with code 3 (version_skew) rather than invoking the agent.
+                  stage_attempt:
+                    type: string
+                    description: The stage's per-attempt identity token (#3598) — its dispatched_at rendered as UTC RFC3339Nano, reset by every re-dispatch. The runner echoes it back as expected_attempt on its reap-failure self-report. Absent for a stage with no dispatched_at stamp.
                   scope_files:
                     type: array
                     description: |
@@ -13749,6 +13809,9 @@ paths:
                   min_runner_version:
                     type: string
                     description: Minimum runner version the backend requires; absent when the backend has no constraint.
+                  stage_attempt:
+                    type: string
+                    description: The stage's per-attempt identity token (#3598), as on the signed /prompt response. Absent for a stage with no dispatched_at stamp.
                   scope_files:
                     type: array
                     description: |
