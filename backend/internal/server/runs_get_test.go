@@ -3569,3 +3569,211 @@ func TestGetRun_CancelledState_WireLiteral(t *testing.T) {
 			run.StateCancelled, runnerExpectsState)
 	}
 }
+
+// --- superseded_implement (E45.83 / #3618) -----------------------------------
+
+// TestGetRun_SupersededImplementCount is the #3618 REST assertion: a retry
+// DISCARDED an implement concern, and the run-status concerns block reports that
+// count explicitly instead of letting the empty open set read as a settle.
+//
+// The fixture is deliberately MIXED: a superseded IMPLEMENT concern (counted), a
+// superseded PLAN concern (NOT counted — no implement fix-up can route it), an
+// OPEN implement concern and an ADDRESSED one (neither is a discard). Each
+// non-raised state is seeded BY CONSTRUCTION through ApplyResolution, so a
+// deletion of the counting branch reddens the count assertion, not setup.
+func TestGetRun_SupersededImplementCount(t *testing.T) {
+	ctx := context.Background()
+	repo := newFakeRepo()
+	cr := newFakeConcernRepo()
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo, ConcernRepo: cr})
+
+	got, _ := repo.CreateRun(ctx, run.CreateRunParams{
+		Repo: "x/y", WorkflowID: "feature_change", WorkflowSHA: "s",
+		TriggerSource: run.TriggerCLI,
+	})
+	implStageID := uuid.New()
+
+	// A retry-discarded IMPLEMENT concern: the one this count exists for.
+	discarded := seedConcernRow(t, cr, got.ID, implStageID, "implement", 10, "discarded by the retry")
+	if _, err := cr.ApplyResolution(ctx, discarded.ID, concern.StateSuperseded, "superseded by retry"); err != nil {
+		t.Fatalf("supersede implement concern: %v", err)
+	}
+	// A superseded PLAN concern (the #2065 revise supersession): excluded.
+	planSup := seedConcernRow(t, cr, got.ID, uuid.New(), "plan", 5, "superseded plan concern")
+	if _, err := cr.ApplyResolution(ctx, planSup.ID, concern.StateSuperseded, "superseded by revise"); err != nil {
+		t.Fatalf("supersede plan concern: %v", err)
+	}
+	// One genuinely OPEN implement concern.
+	open := seedConcernRow(t, cr, got.ID, implStageID, "implement", 11, "still open")
+	// One ADDRESSED implement concern: settled, but not a discard.
+	addressed := seedConcernRow(t, cr, got.ID, implStageID, "implement", 12, "already confirmed")
+	if err := cr.MarkAddressedPending(ctx, []uuid.UUID{addressed.ID}, "routed"); err != nil {
+		t.Fatalf("MarkAddressedPending: %v", err)
+	}
+	if _, err := cr.ApplyResolution(ctx, addressed.ID, concern.StateAddressed, "confirmed"); err != nil {
+		t.Fatalf("ApplyResolution: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/v0/runs/%s", got.ID), nil)
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp runResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp.Concerns == nil {
+		t.Fatalf("concerns block missing:\n%s", w.Body.String())
+	}
+	if resp.Concerns.SupersededImplement != 1 {
+		t.Errorf("superseded_implement = %d, want 1 (the plan-stage supersede, the open row and the addressed row are all excluded)", resp.Concerns.SupersededImplement)
+	}
+	// The open side is unchanged by the read swap.
+	if resp.Concerns.Open != 1 {
+		t.Errorf("open = %d, want 1", resp.Concerns.Open)
+	}
+	if resp.Concerns.OpenImplement != 1 {
+		t.Errorf("open_implement = %d, want 1", resp.Concerns.OpenImplement)
+	}
+	if len(resp.Concerns.Items) != 1 || resp.Concerns.Items[0].ID != open.ID {
+		t.Errorf("items = %+v, want exactly the open concern %s (no settled row may leak in)", resp.Concerns.Items, open.ID)
+	}
+	if resp.Concerns.ByState["raised"] != 1 || len(resp.Concerns.ByState) != 1 {
+		t.Errorf("by_state = %v, want {raised:1} — settled states must not appear", resp.Concerns.ByState)
+	}
+}
+
+// TestGetRun_SupersededImplementZeroKeyPresent: superseded_implement is in the
+// OpenAPI required list, so a run with NO discarded concerns must emit the key
+// with value 0 rather than omitting it. An omitted key decodes to nil on the MCP
+// client and degrades the classifier to the legacy-peer path — indistinguishable
+// from an old backend.
+func TestGetRun_SupersededImplementZeroKeyPresent(t *testing.T) {
+	repo := newFakeRepo()
+	cr := newFakeConcernRepo()
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo, ConcernRepo: cr})
+
+	got, _ := repo.CreateRun(context.Background(), run.CreateRunParams{
+		Repo: "x/y", WorkflowID: "feature_change", WorkflowSHA: "s",
+		TriggerSource: run.TriggerCLI,
+	})
+	seedConcernRow(t, cr, got.ID, uuid.New(), "implement", 10, "open, never discarded")
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/v0/runs/%s", got.ID), nil)
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	// Assert on the RAW JSON: a `0` value and an omitted key both unmarshal to
+	// the same Go zero, so only the raw body can prove PRESENCE.
+	var raw struct {
+		Concerns map[string]json.RawMessage `json:"concerns"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	v, present := raw.Concerns["superseded_implement"]
+	if !present {
+		t.Fatalf("superseded_implement key ABSENT from the concerns block; it is in the OpenAPI required list:\n%s", w.Body.String())
+	}
+	if string(v) != "0" {
+		t.Errorf("superseded_implement = %s, want 0", v)
+	}
+}
+
+// TestGetRun_DerivedOpenSetEqualsListOpenByRun pins that the #3618 read swap
+// (ListOpenByRun -> ListByRun, with the open set derived in Go via
+// concern.State.IsOpen()) is BEHAVIOUR-PRESERVING: for a mixed-state run the
+// derived open set equals the store's own ListOpenByRun result in both
+// MEMBERSHIP and ORDER. That is the assumption the swap rests on — the two
+// queries share the ORDER BY and the open predicate duplicates IsOpen — so it is
+// asserted rather than trusted.
+func TestGetRun_DerivedOpenSetEqualsListOpenByRun(t *testing.T) {
+	ctx := context.Background()
+	repo := newFakeRepo()
+	cr := newFakeConcernRepo()
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo, ConcernRepo: cr})
+
+	got, _ := repo.CreateRun(ctx, run.CreateRunParams{
+		Repo: "x/y", WorkflowID: "feature_change", WorkflowSHA: "s",
+		TriggerSource: run.TriggerCLI,
+	})
+	implStageID := uuid.New()
+
+	// One row per state, interleaved so a membership-only comparison could not
+	// hide an ordering change.
+	raised := seedConcernRow(t, cr, got.ID, implStageID, "implement", 10, "raised")
+	sup := seedConcernRow(t, cr, got.ID, implStageID, "implement", 11, "superseded")
+	if _, err := cr.ApplyResolution(ctx, sup.ID, concern.StateSuperseded, "retry"); err != nil {
+		t.Fatalf("supersede: %v", err)
+	}
+	pending := seedConcernRow(t, cr, got.ID, implStageID, "implement", 12, "addressed_pending")
+	if err := cr.MarkAddressedPending(ctx, []uuid.UUID{pending.ID}, "routed"); err != nil {
+		t.Fatalf("MarkAddressedPending: %v", err)
+	}
+	waived := seedConcernRow(t, cr, got.ID, implStageID, "implement", 13, "waived")
+	if _, err := cr.ApplyResolution(ctx, waived.ID, concern.StateWaived, "operator waived"); err != nil {
+		t.Fatalf("waive: %v", err)
+	}
+	reopened := seedConcernRow(t, cr, got.ID, implStageID, "implement", 14, "reopened")
+	if err := cr.MarkAddressedPending(ctx, []uuid.UUID{reopened.ID}, "routed"); err != nil {
+		t.Fatalf("MarkAddressedPending: %v", err)
+	}
+	if _, err := cr.ApplyResolution(ctx, reopened.ID, concern.StateReopened, "reopened"); err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	planOpen := seedConcernRow(t, cr, got.ID, uuid.New(), "plan", 15, "open plan concern")
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/v0/runs/%s", got.ID), nil)
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp runResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp.Concerns == nil {
+		t.Fatalf("concerns block missing:\n%s", w.Body.String())
+	}
+	derived := make([]uuid.UUID, 0, len(resp.Concerns.Items))
+	for _, it := range resp.Concerns.Items {
+		derived = append(derived, it.ID)
+	}
+
+	// The store's OWN open set, via the query the handler no longer calls.
+	openRows, err := cr.ListOpenByRun(ctx, got.ID)
+	if err != nil {
+		t.Fatalf("ListOpenByRun: %v", err)
+	}
+	want := make([]uuid.UUID, 0, len(openRows))
+	for _, c := range openRows {
+		want = append(want, c.ID)
+	}
+	if !reflect.DeepEqual(derived, want) {
+		t.Fatalf("derived open set = %v, want ListOpenByRun's %v (ids AND order) — the read swap changed behaviour", derived, want)
+	}
+	// Sanity on the fixture: the open set is the four open rows, and the settled
+	// ones are genuinely absent (so the equality above is not vacuous).
+	if len(want) != 4 {
+		t.Fatalf("fixture open set = %d rows, want 4 (raised, addressed_pending, reopened, plan-raised)", len(want))
+	}
+	inDerived := map[uuid.UUID]bool{}
+	for _, id := range derived {
+		inDerived[id] = true
+	}
+	for _, id := range []uuid.UUID{raised.ID, pending.ID, reopened.ID, planOpen.ID} {
+		if !inDerived[id] {
+			t.Errorf("open concern %s missing from the derived set", id)
+		}
+	}
+	for _, id := range []uuid.UUID{sup.ID, waived.ID} {
+		if inDerived[id] {
+			t.Errorf("settled concern %s leaked into the derived open set", id)
+		}
+	}
+}

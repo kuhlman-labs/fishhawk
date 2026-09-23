@@ -391,6 +391,10 @@ type RunLiveValidation struct {
 // *_reviewed audit entry remain the surfaces for the full untruncated note —
 // the run-status block carries NO note field BY DESIGN (payload size).
 //
+// The block also reports how many implement-stage concerns a retry DISCARDED
+// (SupersededImplement, E45.83 / #3618) — the open set alone reads a discard as
+// a settle.
+//
 // PRESENCE is authoritative (#3043): the backend emits this block whenever
 // the concern-store read SUCCEEDED, INCLUDING a zero-open run (open:0,
 // items omitted). It is ABSENT (nil) only when the store was UNAVAILABLE
@@ -424,6 +428,28 @@ type RunConcerns struct {
 	// silently — the #371-class hand-maintained-wire-mirror trap, exactly as the
 	// adjacent ShortSummary field warns.
 	OpenImplement *int `json:"open_implement,omitempty" jsonschema:"authoritative count of OPEN implement-stage concerns, computed over the full open set (not the bounded items); equals fishhawk_get_gate_view(stage_kind=implement).open. The review-action hint's concern count reads this. ABSENT (nil) means a backend peer that predates the field — the count degrades to the audit fallback rather than reading as an authoritative zero"`
+	// SupersededImplement is the AUTHORITATIVE count of implement-stage
+	// concerns a RETRY DISCARDED (state superseded) on this run (E45.83 /
+	// #3618). A retry supersedes the prior attempt's open implement-review
+	// concerns, which drops OpenImplement to 0 — so the open set ALONE reads a
+	// discard as a settle. A non-zero value here means those concerns were
+	// never ANSWERED by the tree the gate is about to merge; next_actions reads
+	// it and returns implement_gate_settled_after_supersede instead of
+	// implement_gate_settled.
+	//
+	// It is a POINTER for the SAME reason OpenImplement is: ABSENT and ZERO are
+	// different facts. A backend peer PREDATING the field returns a present
+	// concerns block carrying no superseded_implement key, which must decode to
+	// nil (unknown) and let the classifier fall through to today's behaviour —
+	// NOT to an authoritative zero, and NOT to a fabricated demotion. A 0 from
+	// a peer that DOES carry the key is the authoritative "no retry discarded
+	// anything". `omitempty` on a pointer omits only nil, so a re-serialized
+	// authoritative zero still emits superseded_implement:0, mirroring the
+	// backend's non-omitempty REST contract. The json tag MUST byte-match the
+	// backend's runConcernsPayload field or it decodes to nil silently — the
+	// #371-class hand-maintained-wire-mirror trap the sibling fields warn about;
+	// client_test.go's server-tag boundary test is the machine check.
+	SupersededImplement *int `json:"superseded_implement,omitempty" jsonschema:"authoritative count of implement-stage concerns a RETRY DISCARDED (state superseded). Non-zero means those concerns were never ANSWERED by the tree at this gate — only discarded; read their full rows (id, reviewer_model, severity, category, note) from fishhawk_get_gate_view's settled[] ledger and route them back with fishhawk_fixup_stage concern_ids, which accepts a superseded implement-stage id. ABSENT (nil) means a backend peer that predates the field (unknown, NOT an authoritative zero); 0 from a present peer means no retry discarded anything"`
 }
 
 // RunConcernItem is one open concern. ID is the stable server-minted

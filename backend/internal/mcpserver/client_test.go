@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
@@ -2813,4 +2815,163 @@ func TestMergeRun_AlreadyMergedWireShape(t *testing.T) {
 			t.Error("merge_queued = false; the legacy dispatch path must stay byte-compatible")
 		}
 	})
+}
+
+// TestRunConcerns_SupersededImplement_WireBoundary is the #3618 approval
+// condition 1: the SERVER-emitted superseded_implement key must decode through
+// the client's REAL unmarshal path into a non-nil SupersededImplement, and that
+// decoded Run must then classify as implement_gate_settled_after_supersede.
+//
+// The key string is not hand-asserted against a copy of itself. It is EXTRACTED
+// from the body a REAL server.Server emits over httptest against a REAL
+// pgtest-backed concern store (a superseded implement concern seeded through
+// concern.ApplyResolution exactly as retryStageAs discards one), so the literal
+// this test compares the client tag against is the tag server/runs.go actually
+// emits. That closes the #371 hand-maintained-wire-mirror trap the field's own
+// doc comment warns about: a client-side tag rename decodes to nil silently and
+// the classifier falls back to implement_gate_settled — green without this test.
+//
+// COUNTERFACTUAL (executed): renaming the client tag to
+// `superseded_implement_x` makes the decode assertion fail with
+// `SupersededImplement = nil` and the classifier assertion fail with
+// `state = implement_gate_settled`.
+func TestRunConcerns_SupersededImplement_WireBoundary(t *testing.T) {
+	ctx := context.Background()
+	pool := pgtest.NewPool(t)
+	runRepo := runpkg.NewPostgresRepository(pool)
+	concernRepo := concern.NewPostgresRepository(pool)
+
+	row, err := runRepo.CreateRun(ctx, runpkg.CreateRunParams{
+		Repo: "x/y", WorkflowID: "feature_change", WorkflowSHA: "abc",
+		TriggerSource: runpkg.TriggerCLI,
+	})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	if _, err := runRepo.TransitionRun(ctx, row.ID, runpkg.StateRunning); err != nil {
+		t.Fatalf("transition run: %v", err)
+	}
+	stage, err := runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID: row.ID, Sequence: 0, Type: runpkg.StageTypeImplement,
+		ExecutorKind: runpkg.ExecutorAgent, ExecutorRef: "claude-code",
+	})
+	if err != nil {
+		t.Fatalf("create stage: %v", err)
+	}
+	for _, to := range []runpkg.StageState{runpkg.StageStateDispatched, runpkg.StageStateRunning, runpkg.StageStateSucceeded} {
+		if _, err := runRepo.TransitionStage(ctx, stage.ID, to, nil); err != nil {
+			t.Fatalf("transition stage %s: %v", to, err)
+		}
+	}
+
+	// Two implement-review concerns, both DISCARDED by a retry. Seeded BY
+	// CONSTRUCTION through ApplyResolution, never through the control under
+	// test, so a client-tag mutation reddens the assertions below and not setup.
+	raised, err := concernRepo.InsertRaised(ctx, concern.InsertRaisedParams{
+		RunID: row.ID, StageID: stage.ID, StageKind: concern.StageKindImplement,
+		ReviewerModel: "claude-opus-4-8", OriginReviewSequence: 11,
+		Concerns: []concern.RaisedConcern{
+			{Severity: "high", Category: "correctness", Note: "the nil guard is missing"},
+			{Severity: "medium", Category: "test-coverage", Note: "no counterfactual for the refusal"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("InsertRaised: %v", err)
+	}
+	for _, c := range raised {
+		if _, aerr := concernRepo.ApplyResolution(ctx, c.ID, concern.StateSuperseded, "superseded by retry attempt 2"); aerr != nil {
+			t.Fatalf("ApplyResolution -> superseded: %v", aerr)
+		}
+	}
+
+	s := server.New(server.Config{RunRepo: runRepo, ConcernRepo: concernRepo})
+	ts := httptest.NewServer(s.Handler())
+	t.Cleanup(ts.Close)
+
+	resp, err := http.Get(ts.URL + "/v0/runs/" + row.ID.String())
+	if err != nil {
+		t.Fatalf("GET run: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET run status = %d, want 200", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+
+	// (a) The SERVER-SIDE key, read out of the server's own output — this is the
+	// literal the client tag must match.
+	var rawTop map[string]json.RawMessage
+	if err := json.Unmarshal(body, &rawTop); err != nil {
+		t.Fatalf("unmarshal top level: %v", err)
+	}
+	rawConcerns, ok := rawTop["concerns"]
+	if !ok {
+		t.Fatalf("server emitted no concerns block:\n%s", body)
+	}
+	var rawBlock map[string]json.RawMessage
+	if err := json.Unmarshal(rawConcerns, &rawBlock); err != nil {
+		t.Fatalf("unmarshal concerns block: %v", err)
+	}
+	const wireKey = "superseded_implement"
+	serverValue, present := rawBlock[wireKey]
+	if !present {
+		keys := make([]string, 0, len(rawBlock))
+		for k := range rawBlock {
+			keys = append(keys, k)
+		}
+		t.Fatalf("server-emitted concerns block carries no %q key (keys: %v) — the client tag has nothing to match", wireKey, keys)
+	}
+	if string(serverValue) != "2" {
+		t.Errorf("server %s = %s, want 2 (both discarded implement concerns)", wireKey, serverValue)
+	}
+	// The client tag is the SAME literal, read off the struct rather than
+	// retyped: a rename on either side breaks this equality.
+	field, ok := reflect.TypeOf(RunConcerns{}).FieldByName("SupersededImplement")
+	if !ok {
+		t.Fatal("RunConcerns has no SupersededImplement field")
+	}
+	clientKey := strings.Split(field.Tag.Get("json"), ",")[0]
+	if clientKey != wireKey {
+		// Errorf, not Fatalf: the decode and classifier assertions below are the
+		// ones that show what a mismatch COSTS (a nil decode, then a gate that
+		// reports the discard as a settle), so a tag rename must redden all three
+		// rather than short-circuiting at the first.
+		t.Errorf("client json tag = %q, want the server-emitted key %q — a mismatch decodes to nil SILENTLY", clientKey, wireKey)
+	}
+
+	// (b) The client's REAL unmarshal path over the SERVER's bytes.
+	var decoded Run
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		t.Fatalf("client unmarshal of the server body: %v", err)
+	}
+	if decoded.Concerns == nil {
+		t.Fatalf("client decoded a nil concerns block from:\n%s", body)
+	}
+	if decoded.Concerns.SupersededImplement == nil {
+		t.Fatalf("client decoded SupersededImplement = nil from a body carrying %s:%s — the wire mirror is broken", wireKey, serverValue)
+	}
+	if got := *decoded.Concerns.SupersededImplement; got != 2 {
+		t.Errorf("decoded SupersededImplement = %d, want 2", got)
+	}
+	// The open side must still read zero: the discard is what makes this gate
+	// look settled.
+	if decoded.Concerns.OpenImplement == nil || *decoded.Concerns.OpenImplement != 0 {
+		t.Errorf("decoded OpenImplement = %v, want 0 (the retry discarded both)", decoded.Concerns.OpenImplement)
+	}
+
+	// (c) The decoded run drives the classifier: the gate must NOT report a
+	// settle.
+	na := nextActionsFor(&decoded,
+		[]Stage{{ID: uuid.NewString(), Type: "plan", State: "succeeded"}, {ID: stage.ID.String(), Type: "implement", State: "succeeded"}},
+		nil, &ReviewStatus{Stage: "implement", Status: "complete"}, nil, nil,
+		false, false, false, "", "", releaseSignals{})
+	if na == nil {
+		t.Fatal("nextActionsFor returned nil for a settled implement gate")
+	}
+	if na.State != "implement_gate_settled_after_supersede" {
+		t.Fatalf("state = %q, want implement_gate_settled_after_supersede (not implement_gate_settled) — a discard must not be reported as a settle", na.State)
+	}
 }

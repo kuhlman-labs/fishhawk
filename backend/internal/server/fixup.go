@@ -855,6 +855,12 @@ func (s *Server) fixupStageAs(ctx context.Context, id Identity, p fixupActionPar
 	// identical to how an id-routed concern is stamped and empty when the operator
 	// supplied no reason — decided rather than left to fall out of whatever is
 	// non-nil (#2623 condition 3).
+	// A routed SUPERSEDED id re-enters the OPEN set right here (E45.83 /
+	// #3618), through concern's single superseded -> addressed_pending edge,
+	// keeping its reviewer, origin round and severity; from that point the
+	// existing delta-verification machinery tracks it to closure exactly like
+	// any other routed concern, and the run-status block's
+	// superseded_implement count drops by one as open_implement rises.
 	if len(routedIDs) > 0 && s.cfg.ConcernRepo != nil {
 		if merr := s.cfg.ConcernRepo.MarkAddressedPending(ctx, routedIDs, p.Reason); merr != nil {
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
@@ -1092,13 +1098,37 @@ type concernSelectionError struct{ msg string }
 
 func (e *concernSelectionError) Error() string { return e.msg }
 
+// concernRoutable reports whether a concern in this state may be named in a
+// fix-up's concern_ids (E45.83 / #3618). It is deliberately an EXPLICIT
+// admitted-state check rather than the blanket !State.IsOpen() refusal it
+// replaced: superseded is CLOSED (concern.State.IsOpen() is unchanged and
+// still false for it, so no open-concern surface, merge-gate count or
+// auto-resolve path moved) yet ROUTABLE, because a retry-discarded concern was
+// never answered — only discarded. Every other closed state (addressed,
+// waived, deferred, addressed_by_condition) is a settled disposition and stays
+// refused.
+func concernRoutable(st concern.State) bool {
+	return st.IsOpen() || st == concern.StateSuperseded
+}
+
 // resolveConcernsByID resolves stable concern UUIDs against the durable
 // concern store, scoped to the implement stage being fixed up (#964).
-// Every ID must name an implement-stage concern of THIS stage in an
-// open state — a plan-stage concern ID (surfaced by the same run-status
+// Every ID must name an implement-stage concern of THIS stage in a
+// ROUTABLE state — a plan-stage concern ID (surfaced by the same run-status
 // block) is rejected explicitly so it can never route into an implement
 // fix-up. Returns the selected concerns in selection order as the
 // planreview shape the audit payload and prompt renderer consume.
+//
+// Routable is the three OPEN states (raised / addressed_pending / reopened)
+// PLUS superseded (E45.83 / #3618): a retry discards the prior attempt's open
+// implement-review concerns by superseding them, and the operator must be able
+// to route a discarded concern back against the new tree with its reviewer,
+// round and severity intact — the provenance the free-text operator_concern
+// fallback destroys. addressed / waived / deferred / addressed_by_condition
+// stay refused: each is a settled disposition, not an unanswered defect. The
+// stage-kind and run/stage-ownership refusals are ORDERED AHEAD of this check,
+// so a plan-stage or cross-run superseded id is still refused for its own
+// reason.
 func (s *Server) resolveConcernsByID(ctx context.Context, runID, stageID uuid.UUID, ids []uuid.UUID) ([]planreview.Concern, error) {
 	seen := make(map[uuid.UUID]struct{}, len(ids))
 	for _, id := range ids {
@@ -1124,9 +1154,9 @@ func (s *Server) resolveConcernsByID(ctx context.Context, runID, stageID uuid.UU
 			return nil, &concernSelectionError{msg: fmt.Sprintf(
 				"concern_id %s belongs to a different run/stage than the fix-up target", c.ID)}
 		}
-		if !c.State.IsOpen() {
+		if !concernRoutable(c.State) {
 			return nil, &concernSelectionError{msg: fmt.Sprintf(
-				"concern_id %s is not open (state %s); only raised/addressed_pending/reopened concerns can be routed", c.ID, c.State)}
+				"concern_id %s is not routable (state %s); only raised/addressed_pending/reopened or superseded (a retry-discarded) concerns can be routed", c.ID, c.State)}
 		}
 		out = append(out, planreview.Concern{
 			Severity: planreview.ConcernSeverity(c.Severity),

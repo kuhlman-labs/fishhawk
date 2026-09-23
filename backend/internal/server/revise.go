@@ -387,7 +387,13 @@ func (s *Server) assessRevisionBase(ctx context.Context, stage *run.Stage) *prom
 }
 
 // supersedeReplanConcerns transitions every OPEN plan-review concern of
-// the just-re-opened plan stage to the terminal superseded state (#2065).
+// the just-re-opened plan stage to the CLOSED superseded state (#2065).
+// Closed, not terminal: E45.83 / #3618 gave superseded one outgoing edge
+// (superseded -> addressed_pending) so an operator fix-up can recover a
+// retry-discarded IMPLEMENT concern. That edge cannot reach the rows swept
+// here — resolveConcernsByID refuses a PLAN-stage id on its stage kind before
+// it ever looks at the state — and State.IsOpen() is unchanged, so these rows
+// leave every open-concern surface exactly as before.
 // A revise re-plans IN PLACE — the re-opened stage keeps its stage_id, so
 // the concern store (keyed by run_id + stage_id + stage_kind +
 // origin_review_sequence, no revision column) cannot otherwise distinguish

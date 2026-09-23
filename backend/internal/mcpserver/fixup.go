@@ -63,7 +63,10 @@ func (c *apiClient) fixupStageWithObligations(ctx context.Context, id uuid.UUID,
 // FixupStageInput is the fishhawk_fixup_stage tool's input schema
 // (E22.X / #762). Mirrors `POST /v0/stages/{stage_id}/fixup`.
 // ConcernIDs is the PRIMARY addressing scheme (#964): stable concern
-// UUIDs surfaced by fishhawk_get_run_status's run.concerns block.
+// UUIDs surfaced by fishhawk_get_run_status's run.concerns block — plus,
+// since E45.83 / #3618, the SUPERSEDED implement-stage ids a retry discarded,
+// which are read from fishhawk_get_gate_view's settled[] ledger because the
+// run-status items[] lists open concerns only.
 // Concerns (positional indices into the stage's flattened resolved
 // concern set) is DEPRECATED — ambiguous once multiple heterogeneous
 // review entries exist per stage — and only valid when ConcernIDs is
@@ -71,7 +74,7 @@ func (c *apiClient) fixupStageWithObligations(ctx context.Context, id uuid.UUID,
 // note recorded on the fix-up audit entry.
 type FixupStageInput struct {
 	StageID    string   `json:"stage_id" jsonschema:"the Fishhawk implement stage UUID to fix up (parked at the implement-review gate, or succeeded with the run's review gate still open)"`
-	ConcernIDs []string `json:"concern_ids,omitempty" jsonschema:"PRIMARY addressing: stable concern UUIDs to route back to the agent (from fishhawk_get_run_status's run.concerns.items[].id). At least one of concern_ids/concerns required; supplying both is rejected"`
+	ConcernIDs []string `json:"concern_ids,omitempty" jsonschema:"PRIMARY addressing: stable concern UUIDs to route back to the agent (from fishhawk_get_run_status's run.concerns.items[].id). A SUPERSEDED implement-stage concern id IS routable too (E45.83 / #3618) — a retry DISCARDS the prior attempt's open concerns, and routing one re-opens it against the NEW tree with its reviewer, round and severity preserved, so free-text operator_concern is no longer the only recovery after a retry. Superseded ids do NOT appear in run.concerns.items[], which lists OPEN concerns only — read them from fishhawk_get_gate_view's settled[] ledger (run.concerns.superseded_implement counts them). addressed/waived/deferred/addressed_by_condition ids are rejected. At least one of concern_ids/concerns required; supplying both is rejected"`
 	Concerns   []int    `json:"concerns,omitempty" jsonschema:"DEPRECATED positional fallback: indices into the stage's flattened implement-review concern set. Ambiguous when multiple review entries exist per stage — prefer concern_ids. Only valid when concern_ids is absent"`
 	Reason     string   `json:"reason,omitempty" jsonschema:"optional operator rationale, recorded on the stage_fixup_triggered audit entry and as the routed concerns' state_reason"`
 	// AllowCreate declares net-new files this fix-up will create (#823).
@@ -169,9 +172,25 @@ Inputs:
     succeeded with the run's review gate still open).
   - concern_ids : PRIMARY addressing (#964) — stable concern UUIDs to
     route back (at least one). Read them from fishhawk_get_run_status's
-    run.concerns.items[].id (open implement-stage concerns only; a
-    plan-stage or already-resolved ID is rejected). Routed concerns are
-    marked addressed_pending in the durable concern store.
+    run.concerns.items[].id (open implement-stage concerns; a plan-stage or
+    already-resolved ID is rejected). Routed concerns are marked
+    addressed_pending in the durable concern store.
+
+    A SUPERSEDED implement-stage id of this stage is ALSO accepted (E45.83 /
+    #3618). A retry DISCARDS the prior attempt's open implement-review
+    concerns by superseding them, so the gate reports no open concern even
+    though nothing answered them; routing a superseded id RE-OPENS it against
+    the new tree, preserving the reviewer, the origin review round and the
+    severity, and it is then tracked to closure by the same
+    delta-verification machinery as any routed concern. That means free-text
+    operator_concern is no longer the only recovery after a retry — and it is
+    the better one, because it keeps the reviewer provenance the free-text
+    path destroys. Superseded ids are NOT in run.concerns.items[] (open
+    concerns only): read them from fishhawk_get_gate_view's settled[] ledger,
+    which carries each one's id, reviewer_model, severity, category and note;
+    run.concerns.superseded_implement counts them, and the
+    implement_gate_settled_after_supersede next_actions state points here.
+    addressed / waived / deferred / addressed_by_condition ids stay rejected.
   - concerns : DEPRECATED positional fallback — indices into the stage's
     flattened implement_reviewed concern set. Ambiguous once multiple
     heterogeneous review entries exist per stage; prefer concern_ids.

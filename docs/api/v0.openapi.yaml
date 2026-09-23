@@ -1862,7 +1862,14 @@ components:
         means an authoritative store read; absent means unavailable, NEVER
         "zero". The `open` set equals the gate view's `open[]` for the same
         run by construction (both read the store's open predicate).
-      required: [open, by_state, open_implement, items]
+
+        `superseded_implement` (E45.83 / #3618) reports how many
+        implement-stage concerns a RETRY DISCARDED. It is the one fact the
+        open set cannot express: a retry supersedes the prior attempt's open
+        implement-review concerns, so `open_implement` drops to 0 and a
+        discard becomes indistinguishable from a review that genuinely
+        settled.
+      required: [open, by_state, open_implement, superseded_implement, items]
       properties:
         open:
           type: integer
@@ -1887,6 +1894,33 @@ components:
             implement-stage concerns are routable into an implement fix-up, so
             a run whose only open concerns are plan-stage ones reports
             `open_implement: 0`.
+        superseded_implement:
+          type: integer
+          minimum: 0
+          description: |
+            AUTHORITATIVE count of implement-stage concerns a RETRY DISCARDED
+            (lifecycle state `superseded`) on this run (E45.83 / #3618). A
+            retry supersedes the prior attempt's open implement-review
+            concerns — correct, since they were raised against a tree that no
+            longer exists — but that drops `open_implement` to 0, so the open
+            set ALONE reads the discard as a settle. A NON-ZERO value means
+            those concerns were never ANSWERED by the tree at this gate, only
+            discarded.
+
+            Only the count is here. Each discarded concern's full row (id,
+            `reviewer_model`, severity, category, note, `state_reason`) is
+            served by `GET /v0/runs/{run_id}/gate-view`'s `settled[]` ledger,
+            which is where an operator reads the ids to route back:
+            `POST /v0/stages/{stage_id}/fixup` ACCEPTS a superseded
+            implement-stage `concern_ids` entry of the target stage and
+            re-opens it with its reviewer, origin round and severity intact.
+
+            It counts every superseded implement-stage row on the run, not
+            just the latest attempt's — the fail-safe direction, since a
+            discard from any attempt is one the merge candidate never
+            answered. Always present on a successful read (it is in the
+            `required` list), so `0` is an authoritative "no retry discarded
+            anything" rather than an absent key.
         items:
           type: array
           items:

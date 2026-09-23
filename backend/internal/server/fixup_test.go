@@ -21,6 +21,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/fixupobligation"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/modeloracle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
@@ -2835,7 +2836,9 @@ func TestFixupStage_ConcernIDs_MalformedUUIDRejected(t *testing.T) {
 }
 
 // TestFixupStage_ConcernIDs_NonOpenRejected: a concern already resolved
-// (addressed) cannot be routed again.
+// (addressed) cannot be routed again. The message names the ADMITTED set
+// (E45.83 / #3618 widened it to include superseded), so the assertion below
+// tracks "not routable", not the old "not open".
 func TestFixupStage_ConcernIDs_NonOpenRejected(t *testing.T) {
 	s, repo, _, cr := fixupServerWithConcerns(t)
 	stage := seedImplementGateStage(repo)
@@ -2851,8 +2854,8 @@ func TestFixupStage_ConcernIDs_NonOpenRejected(t *testing.T) {
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
 	}
-	if !strings.Contains(w.Body.String(), "not open") {
-		t.Errorf("body should report the non-open state: %s", w.Body.String())
+	if !strings.Contains(w.Body.String(), "not routable") {
+		t.Errorf("body should report the non-routable state: %s", w.Body.String())
 	}
 }
 
@@ -4189,4 +4192,324 @@ func TestRecordFixupPRBodyUnsatisfiable_FailOpen(t *testing.T) {
 			t.Errorf("entries = %d, want 0 for empty routed text", n)
 		}
 	})
+}
+
+// --- routable superseded concerns (E45.83 / #3618) ---------------------------
+
+// TestFixupStage_ConcernIDs_SupersededRouted is the #3618 admission: a retry
+// DISCARDED the prior attempt's implement-review concern by superseding it, and
+// the operator routes THAT id back. It must be accepted and re-opened.
+//
+// COUNTERFACTUAL (executed): restoring the blanket !c.State.IsOpen() refusal in
+// resolveConcernsByID makes this fail with 400 validation_failed instead of 200.
+func TestFixupStage_ConcernIDs_SupersededRouted(t *testing.T) {
+	ctx := context.Background()
+	s, repo, au, cr := fixupServerWithConcerns(t)
+	stage := seedImplementGateStage(repo)
+	c := seedConcernRow(t, cr, stage.RunID, stage.ID, concern.StageKindImplement, 101, "the nil guard is missing")
+	// Seeded BY CONSTRUCTION through ApplyResolution — exactly as retryStageAs
+	// discards a prior attempt's open concerns.
+	if _, err := cr.ApplyResolution(ctx, c.ID, concern.StateSuperseded, "superseded by retry attempt 2"); err != nil {
+		t.Fatalf("supersede: %v", err)
+	}
+
+	w := postFixup(t, s, stage.ID, fixupRequest{
+		ConcernIDs: []string{c.ID.String()},
+		Reason:     "the nil guard is still missing on the retried tree",
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (a superseded implement concern is routable):\n%s", w.Code, w.Body.String())
+	}
+	// The COMMITTED state, not the response: MarkAddressedPending is warn-only,
+	// so the 200 is byte-identical whether or not the row moved.
+	if c.State != concern.StateAddressedPending {
+		t.Errorf("concern state = %q, want addressed_pending (the superseded row must re-enter the open set)", c.State)
+	}
+	if c.StateReason != "the nil guard is still missing on the retried tree" {
+		t.Errorf("StateReason = %q, want the operator's routing reason", c.StateReason)
+	}
+	// The reviewer provenance the free-text operator_concern fallback destroys
+	// survives onto the trigger payload.
+	if len(au.appended) != 1 {
+		t.Fatalf("audit entries = %d, want 1", len(au.appended))
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(au.appended[0].Payload, &payload); err != nil {
+		t.Fatalf("unmarshal audit payload: %v", err)
+	}
+	if ids := payloadStrings(t, payload, "concern_ids"); len(ids) != 1 || ids[0] != c.ID.String() {
+		t.Errorf("payload.concern_ids = %v, want [%s]", ids, c.ID)
+	}
+	concerns, ok := payload["concerns"].([]any)
+	if !ok || len(concerns) != 1 {
+		t.Fatalf("payload.concerns = %v, want one resolved concern", payload["concerns"])
+	}
+	routed := concerns[0].(map[string]any)
+	if routed["note"] != "the nil guard is missing" {
+		t.Errorf("routed note = %v, want the original reviewer note", routed["note"])
+	}
+	if routed["severity"] != "medium" {
+		t.Errorf("routed severity = %v, want the original medium", routed["severity"])
+	}
+}
+
+// TestFixupStage_ConcernIDs_NonRoutableStatesRejected is the per-failure-mode
+// matrix for the widened admitted set: superseded is IN, and each of the four
+// settled dispositions stays OUT with a 400 naming the admitted set. Every
+// fixture state is reached BY CONSTRUCTION through ApplyResolution, so deleting
+// the admitted-state check reddens the status assertion rather than setup.
+func TestFixupStage_ConcernIDs_NonRoutableStatesRejected(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name  string
+		state concern.State
+		// viaPending is true for the states reachable only from
+		// addressed_pending (addressed).
+		viaPending bool
+	}{
+		{name: "addressed", state: concern.StateAddressed, viaPending: true},
+		{name: "waived", state: concern.StateWaived},
+		{name: "deferred", state: concern.StateDeferred},
+		{name: "addressed_by_condition", state: concern.StateAddressedByCondition},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, repo, _, cr := fixupServerWithConcerns(t)
+			stage := seedImplementGateStage(repo)
+			c := seedConcernRow(t, cr, stage.RunID, stage.ID, concern.StageKindImplement, 70, "settled concern")
+			if tc.viaPending {
+				if err := cr.MarkAddressedPending(ctx, []uuid.UUID{c.ID}, "routed"); err != nil {
+					t.Fatalf("MarkAddressedPending: %v", err)
+				}
+			}
+			if _, err := cr.ApplyResolution(ctx, c.ID, tc.state, "settled"); err != nil {
+				t.Fatalf("ApplyResolution -> %s: %v", tc.state, err)
+			}
+
+			w := postFixup(t, s, stage.ID, fixupRequest{ConcernIDs: []string{c.ID.String()}})
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400 for state %s:\n%s", w.Code, tc.state, w.Body.String())
+			}
+			body := w.Body.String()
+			if !strings.Contains(body, "validation_failed") {
+				t.Errorf("body missing validation_failed: %s", body)
+			}
+			if !strings.Contains(body, "not routable") {
+				t.Errorf("body should report the non-routable state: %s", body)
+			}
+			// The message must name the ADMITTED set precisely, including the
+			// superseded carve-out, so the operator is not told to go find an
+			// open concern that does not exist.
+			if !strings.Contains(body, "raised/addressed_pending/reopened") || !strings.Contains(body, "superseded") {
+				t.Errorf("body should name the admitted set including superseded: %s", body)
+			}
+			if c.State != tc.state {
+				t.Errorf("state = %q, want %q (untouched by the refusal)", c.State, tc.state)
+			}
+		})
+	}
+}
+
+// TestFixupStage_ConcernIDs_SupersededPlanStageRejected pins refusal ORDER: a
+// PLAN-stage superseded id is refused for its STAGE KIND, not for its state.
+// The #2065 revise supersession makes such rows routine, and no implement fix-up
+// may ever route one.
+func TestFixupStage_ConcernIDs_SupersededPlanStageRejected(t *testing.T) {
+	ctx := context.Background()
+	s, repo, _, cr := fixupServerWithConcerns(t)
+	stage := seedImplementGateStage(repo)
+	planConcern := seedConcernRow(t, cr, stage.RunID, uuid.New(), concern.StageKindPlan, 50, "plan-stage concern")
+	if _, err := cr.ApplyResolution(ctx, planConcern.ID, concern.StateSuperseded, "superseded by revise"); err != nil {
+		t.Fatalf("supersede plan concern: %v", err)
+	}
+
+	w := postFixup(t, s, stage.ID, fixupRequest{ConcernIDs: []string{planConcern.ID.String()}})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "plan-stage concern") {
+		t.Errorf("body should name the STAGE-KIND mismatch (the check ordered ahead of the state check): %s", body)
+	}
+	if strings.Contains(body, "not routable") {
+		t.Errorf("body reports the STATE refusal for a plan-stage id — the refusal order regressed: %s", body)
+	}
+	if planConcern.State != concern.StateSuperseded {
+		t.Errorf("plan concern state = %q, want superseded (untouched)", planConcern.State)
+	}
+}
+
+// TestFixupStage_ConcernIDs_SupersededForeignStageRejected: a superseded
+// implement concern belonging to a DIFFERENT stage is refused for OWNERSHIP, not
+// for its state — the ordering the widened admitted set must not disturb.
+func TestFixupStage_ConcernIDs_SupersededForeignStageRejected(t *testing.T) {
+	ctx := context.Background()
+	s, repo, _, cr := fixupServerWithConcerns(t)
+	stage := seedImplementGateStage(repo)
+	foreign := seedConcernRow(t, cr, stage.RunID, uuid.New(), concern.StageKindImplement, 60, "another stage's concern")
+	if _, err := cr.ApplyResolution(ctx, foreign.ID, concern.StateSuperseded, "superseded by retry"); err != nil {
+		t.Fatalf("supersede: %v", err)
+	}
+
+	w := postFixup(t, s, stage.ID, fixupRequest{ConcernIDs: []string{foreign.ID.String()}})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "different run/stage") {
+		t.Errorf("body should name the run/stage mismatch: %s", body)
+	}
+	if strings.Contains(body, "not routable") {
+		t.Errorf("body reports the STATE refusal for a foreign-stage id — the refusal order regressed: %s", body)
+	}
+	if foreign.State != concern.StateSuperseded {
+		t.Errorf("foreign concern state = %q, want superseded (untouched)", foreign.State)
+	}
+}
+
+// TestFixupStage_SupersededConcern_CrossLayer_PG is the #618 cross-layer seam
+// for E45.83 / #3618: concern lifecycle -> REAL store -> REAL handler -> REST
+// payload, in ONE test, over a pgtest Postgres.
+//
+// A fake store cannot exercise what this change is about — the
+// superseded -> addressed_pending edge is applied by the store's from-state-
+// guarded UPDATE, and the run-status counts are derived from a real ListByRun —
+// so the run repository, audit repository and concern repository are all the
+// production Postgres ones.
+//
+// It READS THE COMMITTED STATE BACK rather than trusting the fix-up's HTTP 200:
+// the handler's MarkAddressedPending is best-effort/warn-only, so the response
+// is byte-identical whether the row moved or not. That is why deleting the
+// lifecycle edge reddens THIS test (error identity alone would be insufficient).
+func TestFixupStage_SupersededConcern_CrossLayer_PG(t *testing.T) {
+	ctx := context.Background()
+	pool := pgtest.NewPool(t)
+	runRepo := run.NewPostgresRepository(pool)
+	auditRepo := audit.NewPostgresRepository(pool)
+	concernRepo := concern.NewPostgresRepository(pool)
+	s := New(Config{
+		Addr: "127.0.0.1:0", RunRepo: runRepo, AuditRepo: auditRepo, ConcernRepo: concernRepo,
+	})
+
+	r, err := runRepo.CreateRun(ctx, run.CreateRunParams{
+		Repo: "x/y", WorkflowID: "feature_change", WorkflowSHA: "abc",
+		TriggerSource: run.TriggerCLI,
+	})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	if _, err := runRepo.TransitionRun(ctx, r.ID, run.StateRunning); err != nil {
+		t.Fatalf("run -> running: %v", err)
+	}
+	created, err := runRepo.CreateStage(ctx, run.CreateStageParams{
+		RunID: r.ID, Sequence: 0, Type: run.StageTypeImplement,
+		ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code",
+	})
+	if err != nil {
+		t.Fatalf("create implement stage: %v", err)
+	}
+	stage := driveStageTo(t, runRepo, created, run.StageStateAwaitingApproval)
+
+	// A reviewer concern from the PRIOR attempt, then the retry's discard —
+	// seeded through ApplyResolution exactly as retryStageAs supersedes it.
+	rows, err := concernRepo.InsertRaised(ctx, concern.InsertRaisedParams{
+		RunID: r.ID, StageID: stage.ID, StageKind: concern.StageKindImplement,
+		ReviewerModel: "claude-opus-4-8", OriginReviewSequence: 7,
+		Concerns: []concern.RaisedConcern{{
+			Severity: "high", Category: "correctness",
+			Note: "resolveConcernsByID refuses every non-open state, so the discarded ids are unroutable",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("InsertRaised: %v", err)
+	}
+	c := rows[0]
+	if _, err := concernRepo.ApplyResolution(ctx, c.ID, concern.StateSuperseded, "superseded by retry attempt 2"); err != nil {
+		t.Fatalf("ApplyResolution -> superseded: %v", err)
+	}
+
+	const reason = "the defect survives the retried tree; re-route the discarded concern"
+	w := postFixup(t, s, stage.ID, fixupRequest{ConcernIDs: []string{c.ID.String()}, Reason: reason})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (a superseded implement concern of this stage is routable):\n%s", w.Code, w.Body.String())
+	}
+
+	// (1) COMMITTED STATE in Postgres — not the response body.
+	got, err := concernRepo.GetByIDs(ctx, []uuid.UUID{c.ID})
+	if err != nil {
+		t.Fatalf("GetByIDs: %v", err)
+	}
+	reRouted := got[0]
+	if reRouted.State != concern.StateAddressedPending {
+		t.Fatalf("committed state = %q, want addressed_pending — the superseded row never re-entered the open set", reRouted.State)
+	}
+	if reRouted.StateReason != reason {
+		t.Errorf("state_reason = %q, want the operator's fix-up reason %q", reRouted.StateReason, reason)
+	}
+	if reRouted.ReviewerModel == nil || *reRouted.ReviewerModel != "claude-opus-4-8" {
+		t.Errorf("reviewer_model = %v, want the original reviewer preserved", reRouted.ReviewerModel)
+	}
+	if reRouted.OriginReviewSequence != 7 {
+		t.Errorf("origin_review_sequence = %d, want 7 (the original round)", reRouted.OriginReviewSequence)
+	}
+
+	// (2) The REST run-status payload: the discard has become an open concern.
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v0/runs/"+r.ID.String(), nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET run status = %d, want 200:\n%s", rec.Code, rec.Body.String())
+	}
+	var resp runResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal run response: %v", err)
+	}
+	if resp.Concerns == nil {
+		t.Fatalf("concerns block missing:\n%s", rec.Body.String())
+	}
+	if resp.Concerns.OpenImplement != 1 {
+		t.Errorf("open_implement = %d, want 1 (the re-routed concern is open again)", resp.Concerns.OpenImplement)
+	}
+	if resp.Concerns.SupersededImplement != 0 {
+		t.Errorf("superseded_implement = %d, want 0 (the discard was recovered, not still discarded)", resp.Concerns.SupersededImplement)
+	}
+	if len(resp.Concerns.Items) != 1 || resp.Concerns.Items[0].ID != c.ID {
+		t.Errorf("items = %+v, want the re-routed concern %s", resp.Concerns.Items, c.ID)
+	}
+	if len(resp.Concerns.Items) == 1 && resp.Concerns.Items[0].State != string(concern.StateAddressedPending) {
+		t.Errorf("item state = %q, want addressed_pending", resp.Concerns.Items[0].State)
+	}
+
+	// (3) The stage_fixup_triggered audit entry carries the ORIGINAL reviewer
+	// severity/category/note — the provenance the free-text operator_concern
+	// fallback destroys, and the whole reason id-routing beats it after a retry.
+	entries, err := auditRepo.ListForRunByCategory(ctx, r.ID, CategoryStageFixupTriggered)
+	if err != nil {
+		t.Fatalf("list stage_fixup_triggered: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("stage_fixup_triggered entries = %d, want 1", len(entries))
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(entries[0].Payload, &payload); err != nil {
+		t.Fatalf("unmarshal audit payload: %v", err)
+	}
+	if ids := payloadStrings(t, payload, "concern_ids"); len(ids) != 1 || ids[0] != c.ID.String() {
+		t.Errorf("payload.concern_ids = %v, want [%s]", ids, c.ID)
+	}
+	concerns, ok := payload["concerns"].([]any)
+	if !ok || len(concerns) != 1 {
+		t.Fatalf("payload.concerns = %v, want one routed concern", payload["concerns"])
+	}
+	routed, ok := concerns[0].(map[string]any)
+	if !ok {
+		t.Fatalf("payload.concerns[0] = %v, want an object", concerns[0])
+	}
+	if routed["severity"] != "high" {
+		t.Errorf("routed severity = %v, want the reviewer's high", routed["severity"])
+	}
+	if routed["category"] != "correctness" {
+		t.Errorf("routed category = %v, want the reviewer's correctness", routed["category"])
+	}
+	if routed["note"] != "resolveConcernsByID refuses every non-open state, so the discarded ids are unroutable" {
+		t.Errorf("routed note = %v, want the reviewer's own note", routed["note"])
+	}
 }

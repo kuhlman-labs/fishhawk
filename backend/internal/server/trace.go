@@ -5387,9 +5387,16 @@ func (s *Server) latestStageRetrySequence(ctx context.Context, runID, stageID uu
 }
 
 // supersedeOpenImplementConcerns transitions every OPEN implement-review
-// concern of the given stage that `match` selects to the terminal superseded
+// concern of the given stage that `match` selects to the CLOSED superseded
 // state (#3593), mirroring revise.go's supersedeReplanConcerns for the retry
-// path. It is the shared best-effort primitive both retryStageAs (at retry
+// path. Closed, not terminal: E45.83 / #3618 gave superseded one outgoing edge
+// (superseded -> addressed_pending), so a row swept here stays RECOVERABLE — an
+// operator may name its id in a fix-up's concern_ids and re-open it against the
+// new tree with its reviewer, round and severity intact. State.IsOpen() is
+// unchanged, so the sweep still drops these rows out of every open-concern
+// surface; the run-status block reports how many were discarded
+// (concerns.superseded_implement) and the gate view's settled[] ledger carries
+// their full rows. It is the shared best-effort primitive both retryStageAs (at retry
 // time, matching ALL open implement concerns of the re-opened stage) and the
 // post-persist re-check in runImplementReviewInvocations (matching only the
 // just-minted rows) call.
