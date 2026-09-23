@@ -573,13 +573,78 @@ func TestPersist_BestEffort(t *testing.T) {
 			t.Errorf("got %+v", res)
 		}
 	})
-	t.Run("verdict_undecodable", func(t *testing.T) {
-		_, tree, _, _ := persistRepo(t, nil)
-		res := persistAcceptanceScenarios(context.Background(), acceptancePersistInputs{treeDir: tree, runBranch: "b", verdict: []byte(`{`)}, &gitops.Pusher{}, &strings.Builder{})
-		if res.outcome != persistFailed || !strings.HasPrefix(res.reason, "verdict_undecodable") {
-			t.Errorf("got %+v", res)
+	// Approval condition 3 (E45.80 / #3613): the silent degrade must NAME the
+	// underlying reason, so an operator can tell "no remote configured" from
+	// "forge misconfigured". Both arms still skip — the scenario-corpus push
+	// is best-effort and never fails the acceptance stage.
+	t.Run("no_remote_names_the_underlying_reason", func(t *testing.T) {
+		for _, tc := range []struct{ name, detail, want string }{
+			{"no owner/name", "no owner/name configured", "no_remote: no owner/name configured"},
+			{"forge misconfigured", "--forge=gitlab requires --gitlab-base-url (no gitlab.com default)",
+				"no_remote: --forge=gitlab requires --gitlab-base-url (no gitlab.com default)"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				_, tree, _, head := persistRepo(t, nil)
+				res := persistAcceptanceScenarios(context.Background(), acceptancePersistInputs{treeDir: tree, runBranch: "b", issue: 101, headSHA: head, criteria: crit, verdict: passedVerdictFor("crit-b"), remoteSkipDetail: tc.detail}, &gitops.Pusher{}, &strings.Builder{})
+				if res.outcome != persistSkipped || res.reason != tc.want {
+					t.Errorf("got %+v, want persist_skipped with reason %q", res, tc.want)
+				}
+			})
 		}
 	})
+}
+
+// TestAcceptancePersistRemoteURL_PerForge pins the scenario-corpus push's
+// remote derivation (E45.80 / #3613): the github forge keeps the
+// byte-identical github.com URL, the gitlab forge targets the configured
+// host, and BOTH empty-URL modes degrade to "" (persist_skipped no_remote)
+// rather than failing the acceptance stage — while
+// acceptancePersistRemoteSkipDetail distinguishes them for the operator
+// (approval condition 3).
+func TestAcceptancePersistRemoteURL_PerForge(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		cfg        config
+		want       string
+		wantDetail string
+	}{
+		{
+			name: "github forge",
+			cfg:  config{githubRepo: "acme/widgets", forge: forgeGitHub},
+			want: "https://github.com/acme/widgets",
+		},
+		{
+			name: "gitlab forge",
+			cfg:  config{githubRepo: "group/sub/project", forge: forgeGitLab, gitlabBaseURL: "https://gitlab.example.com"},
+			want: "https://gitlab.example.com/group/sub/project",
+		},
+		{
+			name:       "gitlab forge with an EMPTY base URL degrades, naming the flag",
+			cfg:        config{githubRepo: "acme/widgets", forge: forgeGitLab},
+			want:       "",
+			wantDetail: "--gitlab-base-url",
+		},
+		{
+			name:       "no owner/name at all degrades, named distinctly",
+			cfg:        config{githubRepo: "not-a-slug"},
+			want:       "",
+			wantDetail: "no owner/name configured",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("GITHUB_REPOSITORY", "")
+			if got := acceptancePersistRemoteURL(tc.cfg); got != tc.want {
+				t.Errorf("acceptancePersistRemoteURL = %q, want %q", got, tc.want)
+			}
+			if tc.wantDetail == "" {
+				return
+			}
+			detail := acceptancePersistRemoteSkipDetail(tc.cfg)
+			if !strings.Contains(detail, tc.wantDetail) {
+				t.Errorf("skip detail = %q, want it to name %q", detail, tc.wantDetail)
+			}
+		})
+	}
 }
 
 // TestPersist_AlreadyLedgeredDisarms: every served retirement already in

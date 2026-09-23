@@ -71,6 +71,21 @@ The audit ledger ends up with three `installation_token_issued` events per imple
 
 The workflow needs `permissions: id-token: write, contents: read`. Installing the App is the only repo-side dependency.
 
+### Non-interactive git (`gitops.NonInteractiveEnv`, E45.80 / #3613)
+
+Every git child the runner spawns runs with two pinned environment entries, applied unconditionally at the `gitops` exec choke points (`Pusher.runOutEnv`, which `run`/`runEnv`/`runOut` all funnel through, and `Pusher.probeOut`) and at the one raw remote-touching exec outside them (the acceptance-tree merge-candidate object fetch, `cmd/fishhawk-runner/acceptancetree.go`). The pin sits AFTER `os.Environ()` so an inherited `GIT_TERMINAL_PROMPT=1` cannot win, and BEFORE the caller's env so `authedRemoteOp`'s own pins keep their exact-equality contract.
+
+**The two pins are not of equal weight.**
+
+- `GIT_TERMINAL_PROMPT=0` is **load-bearing**: it carries the guarantee. git refuses to read a credential from the terminal and fails with `could not read Username for '<url>': terminal prompts disabled`.
+- `GIT_ASKPASS=/bin/false` is **defence in depth**: it suppresses the askpass path before the terminal prompt is reached. A host or image WITHOUT `/bin/false` is still safe — git's exec of the missing helper fails and it falls back to the terminal prompt, which `GIT_TERMINAL_PROMPT=0` then refuses. (An EMPTY `GIT_ASKPASS` would fall through to the next askpass source rather than suppress it, which is why the pin names a program.)
+
+**The incident it closes (run f199dcf1 / stage b62aec66).** A remote-touching git op met a credential challenge it could not satisfy and opened a terminal prompt. git read the controlling terminal from a BACKGROUND process group, so the kernel delivered `SIGTTIN` to the WHOLE group — the runner included. The runner stopped in state `T` executing no instructions: it could not report, retry, or observe its own deadline, and the backend showed `running` for 57 minutes behind a stopped process. That is also why the runner-side reap-failure channel (#3598) structurally cannot cover this class — a stopped process reports nothing — and why the fix removes the PROMPT rather than adding a runner-side timeout.
+
+**Two honest residuals.** An `ssh://` passphrase prompt is NOT covered: pinning `GIT_SSH_COMMAND` would override an operator's own. A credential HELPER that opens its own GUI or tty is not covered by `GIT_TERMINAL_PROMPT` either.
+
+**Tests.** `TestRunOutEnv_PinsNonInteractive` (`internal/gitops/commit_test.go`) is the deterministic counterfactual vehicle: it captures the `*exec.Cmd` through the `p.Cmd` seam and asserts both pins reach `cmd.Env` with a nil caller env and with a non-empty one, plus the ordering. `TestRunOutEnv_NoCredential_FailsFastNotPrompt` and `TestProvisionAcceptanceTree_CredentialChallengeFailsFast` are done-means tests — each drives a REAL git op against a 401 credential-challenging `httptest` listener with no usable credential and asserts git's `terminal prompts disabled` wording — and are explicitly NOT counterfactual vehicles: with the pin deleted on a tty-bearing host git prompts, the test's process group takes `SIGTTIN` and `go test` STOPS rather than fails, which is the defect itself.
+
 ## Choosing the coding agent (Claude Code or Codex)
 
 The runner can drive either of two coding-agent providers, selected by the `agent` action input (see the [Inputs](#inputs-actionyml) table above). The provider story (#839 runner provider selection, #840 the Codex adapter, #841 the Actions wiring):
@@ -791,7 +806,7 @@ A fix-up pass must prove its work reached the PR branch before the stage reports
 
 Any reason → `ErrFixupWorkStranded` (category B), the failure path reports `{failed, B}`, and #788 recovery restores the pre-fix-up review gate. A probe error or an unavailable snapshot → `ErrVerifyInfraFailure` (category C). A clean check falls through to the byte-identical `fixup_no_changes` report. The `fixup_work_stranded` log line carries `verified_tree_sha` so the operator can see the certified tree probe 3 compared against.
 
-**Control 1b — the push branch (`verifyFixupPushLanded`).** Before reporting `fixup_pushed`, re-read the remote branch tip via `git ls-remote` (`gitops.RemoteBranchTipURL`, using the SAME `https://github.com/<owner>/<repo>` URL and run token `CommitAndPush` pushed with) and require it to reflect the pushed head. `ls-remote` exits 0 with empty stdout for an absent branch, so an absent tip is `("", nil)` (category B, "push did not land") while an ls-remote FAILURE is `("", err)` (category C) — the two are never conflated.
+**Control 1b — the push branch (`verifyFixupPushLanded`).** Before reporting `fixup_pushed`, re-read the remote branch tip via `git ls-remote` (`gitops.RemoteBranchTipURL`, using the SAME forge-derived URL VALUE and run token `CommitAndPush` pushed with — since E45.80 / #3613 the probe reuses the `remoteURLFor` result computed for the push rather than recomputing it, so no second expression can drift) and require it to reflect the pushed head. `ls-remote` exits 0 with empty stdout for an absent branch, so an absent tip is `("", nil)` (category B, "push did not land") while an ls-remote FAILURE is `("", err)` (category C) — the two are never conflated.
 
 **Semantics decision (condition 3): EXACT equality, not descendant tolerance.** A concurrent push landing on top of ours between our push and this re-read — a vouch commit, a bot formatter, another runner — therefore produces a category-B "push did not land" FALSE POSITIVE. The trade is deliberate: a descendant check needs a network fetch of the remote commit plus its own failure surface on the success path, while the race window here is milliseconds and its failure mode is SAFE (category B → the operator retries; no bad merge ships). If that false positive is ever observed in practice, revisit with a fetch-based `merge-base --is-ancestor <pushedHead> <fetchedTip>` descendant check.
 

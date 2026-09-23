@@ -745,6 +745,90 @@ func TestConflictResolutionStage_BadRepoSlugFailsClosed(t *testing.T) {
 	}
 }
 
+// TestConflictResolutionStage_RemoteURLPerForge is the conflict-resolution
+// push's OWN behavioural per-forge assertion (E45.80 / #3613, operator
+// constraint A). Before this change the site carried a hardcoded github.com
+// literal and NO RemoteURL assertion at all — the file's only github.com
+// occurrence was a redaction fixture — which is exactly why it was unguarded.
+//
+// It drives the REAL runConflictResolutionStage through the production-shaped
+// fixture and asserts the URL STRING the pusher seam received, so a
+// comment-only or no-op edit at the call site fails it. The github arm is the
+// byte-identical-default pin for this site; the fail-closed arm proves a
+// misconfigured forge reports and never pushes.
+func TestConflictResolutionStage_RemoteURLPerForge(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		mutate    func(*config)
+		wantURL   string
+		wantFail  bool
+		wantNamed string
+		gitlabTok bool
+	}{
+		{
+			name:    "default config keeps the github.com URL byte-identical",
+			mutate:  func(*config) {},
+			wantURL: "https://github.com/acme/widgets",
+		},
+		{
+			name: "gitlab forge publishes at the configured GitLab host",
+			mutate: func(c *config) {
+				c.forge = forgeGitLab
+				c.gitlabBaseURL = "https://gitlab.example.com"
+			},
+			wantURL: "https://gitlab.example.com/acme/widgets", gitlabTok: true,
+		},
+		{
+			name: "gitlab forge with no base URL fails closed and never pushes",
+			mutate: func(c *config) {
+				c.forge = forgeGitLab
+				c.gitlabBaseURL = ""
+			},
+			wantFail: true, wantNamed: "--gitlab-base-url",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.gitlabTok {
+				// The gitlab forge mints its push credential from the static
+				// PAT rather than the GitHub App broker.
+				t.Setenv("FISHHAWK_GITLAB_TOKEN", "glpat-static")
+			}
+			dispatch, _, featureTip, _ := crDispatchRepo(t)
+			fp := &fakePusher{}
+			crStageHarness(t, fp, crResolveInWorkdir)
+
+			cfg := crStageCfg(dispatch)
+			tc.mutate(&cfg)
+			client := &crFakeUpload{}
+			code := runConflictResolutionStage(context.Background(), cfg, crDispatchRequest(featureTip),
+				client, &upload.IssuedKey{PrivateKey: make([]byte, 64)}, io.Discard)
+
+			if tc.wantFail {
+				if code != exitFailure {
+					t.Fatalf("exit code = %d, want %d", code, exitFailure)
+				}
+				if fp.pushCommittedArgs != nil {
+					t.Errorf("pushed with RemoteURL %q; a misconfigured forge must never push",
+						fp.pushCommittedArgs.RemoteURL)
+				}
+				if len(client.ships) != 1 || !strings.Contains(client.ships[0].Reason, tc.wantNamed) {
+					t.Fatalf("ships = %+v, want one report naming %q", client.ships, tc.wantNamed)
+				}
+				return
+			}
+			if code != exitOK {
+				t.Fatalf("exit code = %d, want %d", code, exitOK)
+			}
+			if fp.pushCommittedArgs == nil {
+				t.Fatal("the merge commit was never pushed")
+			}
+			if fp.pushCommittedArgs.RemoteURL != tc.wantURL {
+				t.Errorf("RemoteURL = %q, want %q", fp.pushCommittedArgs.RemoteURL, tc.wantURL)
+			}
+		})
+	}
+}
+
 // --- helpers pinned in isolation ---
 
 // TestSplitNUL pins that path enumeration splits on NUL, not newline: a

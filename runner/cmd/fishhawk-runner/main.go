@@ -9037,11 +9037,24 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		return parkResult()
 	}
 
+	// Forge-derived push URL (E45.80 / #3613). remoteURLFor is the single
+	// derivation seam: --forge=gitlab pushes at <gitlab-base-url>/<slug>
+	// rather than the github.com literal this site used to hardcode. A
+	// misconfigured forge fails the stage HERE rather than pushing with an
+	// empty or wrong URL. The value is computed ONCE and reused by the fix-up
+	// push-landed probe below, so the #2884 "same URL CommitAndPush pushed
+	// to" invariant is structural rather than a second expression that can
+	// drift.
+	remoteURL, err := remoteURLFor(cfg, owner, repoName)
+	if err != nil {
+		return fmt.Errorf("upload: resolve push remote: %w", err)
+	}
+
 	cap, err := newPusher().CommitAndPush(ctx, gitops.CommitAndPushArgs{
 		RepoDir:       repoDir,
 		Branch:        branch,
 		CommitMessage: commitMessage,
-		RemoteURL:     fmt.Sprintf("https://github.com/%s/%s", owner, repoName),
+		RemoteURL:     remoteURL,
 		// App bot commit identity (#722): the backend resolves the App's
 		// `<slug>[bot]` name + `<id>+<slug>[bot]@users.noreply.github.com`
 		// email and echoes them on the prompt response. Empty values flow
@@ -9305,13 +9318,15 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 	// path reports it.
 	if isFixup {
 		// #2884 control 1b: prove the push landed on the branch before reporting
-		// fixup_pushed. Reuse the SAME remote URL expression CommitAndPush pushed
-		// to (the RemoteURL arg above) so no new forge assumption is introduced.
+		// fixup_pushed. Reuse the SAME remote URL VALUE CommitAndPush pushed to
+		// (the forge-derived remoteURL computed above, E45.80 / #3613) rather
+		// than recomputing it, so no new forge assumption is introduced and no
+		// second expression can drift from the one that pushed.
 		// A mismatch is category B (ErrFixupPushNotLanded); an unreadable tip is
 		// category C (ErrVerifyInfraFailure). Either way, no fixup_pushed report
 		// is sent, so the re-review is never certified against a head that is not
 		// on the branch.
-		fixupRemoteURL := fmt.Sprintf("https://github.com/%s/%s", owner, repoName)
+		fixupRemoteURL := remoteURL
 		if err := verifyFixupPushLanded(ctx, repoDir, fixupRemoteURL, branch, token, cap.HeadSHA); err != nil {
 			if errors.Is(err, gitops.ErrFixupPushNotLanded) {
 				tip, _ := fixupRemoteBranchTip(ctx, repoDir, fixupRemoteURL, branch, token)
