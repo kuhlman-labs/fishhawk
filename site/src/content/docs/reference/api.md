@@ -83,7 +83,7 @@ The v0 REST API exposes **128 operations** across the paths below, generated fro
 | `POST` | `/v0/runs/{run_id}/reset-branch` | Force-reset a run branch off a foreign on-top commit |
 | `POST` | `/v0/runs/{run_id}/rebase-branch` | Advance a run branch onto its declared base (operator-gated) |
 | `POST` | `/v0/runs/{run_id}/vouch-commit` | Vouch a foreign commit as run-authored lineage |
-| `POST` | `/v0/runs/{run_id}/merge` | Record an operator merge verdict and queue the squash merge |
+| `POST` | `/v0/runs/{run_id}/merge` | Record an operator merge verdict and queue the squash merge (skipped when already merged) |
 | `POST` | `/v0/runs/{run_id}/grooming-dispositions` | Record per-entry grooming dispositions (operator-only) |
 | `GET` | `/v0/runs/{run_id}/grooming-dispositions` | Read back the recorded grooming dispositions for a run |
 | `POST` | `/v0/runs/{run_id}/acceptance-arbitration` | Record the operator arbitration that discharges a paged acceptance triage |

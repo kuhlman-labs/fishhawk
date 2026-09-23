@@ -1169,3 +1169,137 @@ func TestRecordMergeObservationGitLabPartialEvidenceRefused(t *testing.T) {
 		}
 	})
 }
+
+// TestObserveForgeMerge_Discriminators pins the SHARED forge-read ladder
+// extracted in E45.87 / #3622, independently of either handler. It is what
+// makes the extraction's behaviour-preservation checkable in one place: the
+// observe verb's ten refusal rungs are the handler's mapping OF these
+// discriminators, and the merge endpoint's observe rung falls open on every
+// value but obsForgeOK.
+//
+// Bad state is seeded BY CONSTRUCTION — a PullRequest literal with Merged
+// false, or an empty MergeCommitSHA, or a nil MergedAt; a recorded URL that
+// names another repository — never by calling a guard inside the setup, so a
+// deletion's RED lands on the classification assertion.
+func TestObserveForgeMerge_Discriminators(t *testing.T) {
+	notMerged := func() *forge.PullRequest { p := mergedPR(); p.Merged = false; return p }
+	noSHA := func() *forge.PullRequest { p := mergedPR(); p.MergeCommitSHA = ""; return p }
+	noTS := func() *forge.PullRequest { p := mergedPR(); p.MergedAt = nil; return p }
+
+	cases := []struct {
+		name           string
+		repo           string
+		prURL          string
+		ref            *string
+		reader         *fakePRStateReader
+		wantReason     obsForgeReason
+		wantState      string
+		wantForgeError bool
+		wantForgeCalls int
+	}{
+		{
+			name: "merged_with_sha_and_timestamp", repo: "x/y",
+			prURL: "https://github.com/x/y/pull/7", reader: &fakePRStateReader{pr: mergedPR()},
+			wantReason: obsForgeOK, wantState: "merged", wantForgeCalls: 1,
+		},
+		{
+			name: "malformed_pr_url", repo: "x/y", prURL: "not-a-pull-request",
+			reader:     &fakePRStateReader{pr: mergedPR()},
+			wantReason: obsForgeMalformedTarget, wantState: "malformed_pr_url",
+		},
+		{
+			name: "pr_url_names_another_repository", repo: "x/y",
+			prURL: "https://github.com/other/repo/pull/7", reader: &fakePRStateReader{pr: mergedPR()},
+			wantReason: obsForgeMismatchTarget, wantState: "pr_url_repo_mismatch",
+		},
+		{
+			name: "pr_url_names_another_forge_family", repo: "x/y",
+			prURL: "https://gitlab.com/x/y/-/merge_requests/7", reader: &fakePRStateReader{pr: mergedPR()},
+			wantReason: obsForgeMismatchTarget, wantState: "pr_url_repo_mismatch",
+		},
+		{
+			name: "no_forge_reader_wired", repo: "x/y", prURL: "https://github.com/x/y/pull/7",
+			reader: nil, wantReason: obsForgeNoReader, wantState: "no_forge_reader",
+		},
+		{
+			name: "get_pull_request_errors", repo: "x/y", prURL: "https://github.com/x/y/pull/7",
+			reader: &fakePRStateReader{err: errors.New("forge boom")}, wantReason: obsForgeUnavailable,
+			wantState: "forge_unavailable", wantForgeError: true, wantForgeCalls: 1,
+		},
+		{
+			name: "forge_answers_nil_pull_request", repo: "x/y", prURL: "https://github.com/x/y/pull/7",
+			reader: &fakePRStateReader{}, wantReason: obsForgeNotMerged, wantState: "not_merged", wantForgeCalls: 1,
+		},
+		{
+			name: "forge_reports_not_merged", repo: "x/y", prURL: "https://github.com/x/y/pull/7",
+			reader: &fakePRStateReader{pr: notMerged()}, wantReason: obsForgeNotMerged,
+			wantState: "not_merged", wantForgeCalls: 1,
+		},
+		{
+			name: "merged_without_merge_commit_sha", repo: "x/y", prURL: "https://github.com/x/y/pull/7",
+			reader: &fakePRStateReader{pr: noSHA()}, wantReason: obsForgeNoMergeCommit,
+			wantState: "merged_without_commit_sha", wantForgeCalls: 1,
+		},
+		{
+			name: "merged_without_merge_timestamp", repo: "x/y", prURL: "https://github.com/x/y/pull/7",
+			reader: &fakePRStateReader{pr: noTS()}, wantReason: obsForgeNoMergeTimestamp,
+			wantState: "merged_without_timestamp", wantForgeCalls: 1,
+		},
+		{
+			// A GitLab-family run whose recorded URL matches its family
+			// resolves and reads exactly like the github one.
+			name: "gitlab_family_merged", repo: "grp/proj",
+			prURL: "https://gitlab.example.test/grp/proj/-/merge_requests/9",
+			ref:   ptrString("gitlab:5"), reader: &fakePRStateReader{pr: mergedPR()},
+			wantReason: obsForgeOK, wantState: "merged", wantForgeCalls: 1,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := New(Config{Addr: "127.0.0.1:0"})
+			if tc.reader != nil {
+				s.cfg.PRStateReader = tc.reader
+			}
+			prURL := tc.prURL
+			runRow := &run.Run{
+				ID: uuid.New(), Repo: tc.repo, PullRequestURL: &prURL, InstallationRef: tc.ref,
+			}
+
+			obs, reason, ferr := s.observeForgeMerge(context.Background(), runRow)
+			if reason != tc.wantReason {
+				t.Fatalf("reason = %d, want %d", reason, tc.wantReason)
+			}
+			if got := reason.forgeMergeState(); got != tc.wantState {
+				t.Errorf("forgeMergeState() = %q, want %q", got, tc.wantState)
+			}
+			if (ferr != nil) != tc.wantForgeError {
+				t.Errorf("forgeErr = %v, want non-nil = %v", ferr, tc.wantForgeError)
+			}
+			if tc.reader != nil && tc.reader.calls != tc.wantForgeCalls {
+				t.Errorf("GetPullRequest calls = %d, want %d", tc.reader.calls, tc.wantForgeCalls)
+			}
+			if tc.wantReason != obsForgeOK {
+				if obs != nil {
+					t.Errorf("observation = %+v, want nil on a non-OK verdict", obs)
+				}
+				return
+			}
+			if obs == nil {
+				t.Fatal("observation = nil on obsForgeOK")
+			}
+			if obs.PullRequestURL != prURL {
+				t.Errorf("observation pr url = %q, want %q", obs.PullRequestURL, prURL)
+			}
+			if obs.MergeCommitSHA != "cafebabe1234" || obs.MergedAt != "2026-08-30T12:34:56Z" {
+				t.Errorf("observation = %+v, want the forge's SHA and merge timestamp", obs)
+			}
+			if obs.ObservedAt == "" || obs.observedAtTime.IsZero() {
+				t.Errorf("observed_at = %q / %v must both be set", obs.ObservedAt, obs.observedAtTime)
+			}
+			if obs.observedAtTime.Format(time.RFC3339Nano) != obs.ObservedAt {
+				t.Errorf("observedAtTime %v and ObservedAt %q must be the SAME instant",
+					obs.observedAtTime, obs.ObservedAt)
+			}
+		})
+	}
+}

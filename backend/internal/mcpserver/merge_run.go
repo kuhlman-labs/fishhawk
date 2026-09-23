@@ -31,18 +31,27 @@ type MergeRunInput struct {
 	Verdict string `json:"verdict" jsonschema:"required operator merge verdict — recorded verbatim on the chained merge_verdict_recorded audit entry as the audited decision to ship"`
 	// TimeoutSeconds bounds the post-POST terminal await. The wait holds no
 	// server state, so a timeout is a resumable checkpoint (re-invoke to
-	// resume — the endpoint's idempotence means the re-POST records no
-	// duplicate verdict row).
-	TimeoutSeconds int `json:"timeout_seconds,omitempty" jsonschema:"how long to await the terminal merge (default 360, capped at 600). On timeout the tool returns status=timeout (resumable) — re-invoke to resume; the endpoint is idempotent so the re-POST records no duplicate verdict row"`
+	// resume). WHICH half is idempotent, stated precisely (E45.87 / #3622): the
+	// merge_verdict_recorded ROW is what a re-POST never duplicates, and the
+	// DISPATCH half is safe to repeat because the endpoint observes the pull
+	// request before dispatching — a merge that settled during the wait returns
+	// already_merged rather than the 502 a blind re-dispatch produced.
+	TimeoutSeconds int `json:"timeout_seconds,omitempty" jsonschema:"how long to await the terminal merge (default 360, capped at 600). On timeout the tool returns status=timeout (resumable) — re-invoke to resume. The re-POST never duplicates the merge_verdict_recorded ROW, and re-dispatching is safe because the endpoint OBSERVES the pull request first: a merge that settled during the wait comes back as already_merged instead of a 502"`
 }
 
 // MergeRunOutput is the fishhawk_merge_run response. Status is one of:
 //
 //   - "merged"        — a pr_merged / post_merge_observed entry landed past
-//     the verdict anchor: the PR is merged and the run resolved.
+//     the verdict anchor: the PR is merged and the run resolved. ALSO the
+//     status when the endpoint reports the PR was ALREADY merged
+//     (already_merged:true, E45.87 / #3622): no merge was queued, the await is
+//     SKIPPED entirely, and the reused status keeps every downstream consumer
+//     that switches on the string working — the distinction rides
+//     AlreadyMerged and the Message.
 //   - "timeout"       — nothing landed within the window. Resumable: re-invoke
-//     the tool to resume (the endpoint is idempotent, so the re-POST records
-//     no duplicate verdict row and re-dispatches the queued merge).
+//     the tool to resume — the re-POST never duplicates the
+//     merge_verdict_recorded ROW, and re-dispatching is safe because the
+//     endpoint observes the pull request first.
 //   - "run_terminal"  — the run reached failed/cancelled while the wait was
 //     pending (ADR-036 backstop) — the merge will most likely never settle.
 //   - "checks_pending" — the pull request's required checks have not all passed
@@ -77,11 +86,21 @@ type MergeRunOutput struct {
 	// pre-existing verdict row from one this invocation created (E67.56 / #2717
 	// binding condition 4), so provenance is not inferred — the Message carries
 	// the durability claim instead.
-	VerdictRecorded bool    `json:"verdict_recorded" jsonschema:"true when this call appended the chained merge_verdict_recorded audit entry; false on checks_pending (provenance is not inferred there)"`
-	AlreadyRecorded bool    `json:"already_recorded" jsonschema:"true when the endpoint found an existing merge_verdict_recorded row (idempotent resume) and re-dispatched the merge without a duplicate append; false on checks_pending"`
-	VerdictSequence int64   `json:"verdict_sequence,omitempty" jsonschema:"the merge_verdict_recorded row's audit sequence — the anchor the terminal await polls past; on checks_pending it is the durable verdict row's sequence when the server surfaced it"`
-	PRURL           string  `json:"pr_url,omitempty" jsonschema:"the merged pull request URL"`
-	WaitedSeconds   float64 `json:"waited_seconds" jsonschema:"elapsed wall time spent awaiting the terminal merge"`
+	VerdictRecorded bool  `json:"verdict_recorded" jsonschema:"true when this call appended the chained merge_verdict_recorded audit entry; false on checks_pending (provenance is not inferred there)"`
+	AlreadyRecorded bool  `json:"already_recorded" jsonschema:"true when the endpoint found an existing merge_verdict_recorded row (idempotent resume) and re-dispatched the merge without a duplicate append; false on checks_pending"`
+	VerdictSequence int64 `json:"verdict_sequence,omitempty" jsonschema:"the merge_verdict_recorded row's audit sequence — the anchor the terminal await polls past; on checks_pending it is the durable verdict row's sequence when the server surfaced it"`
+	// AlreadyMerged is the E45.87 / #3622 arm: the endpoint OBSERVED the pull
+	// request already merged and queued NO merge (MergeQueued is false). The
+	// tool returns status=merged WITHOUT awaiting — there is nothing left to
+	// wait for.
+	AlreadyMerged bool `json:"already_merged" jsonschema:"true when the endpoint observed the pull request was ALREADY merged and queued no merge; the tool returns status=merged immediately without awaiting"`
+	// MergeObservationRecorded is true ONLY when that call successfully
+	// appended the merge_observation_recorded audit row. It is false when the
+	// chain already carried merge evidence, and false when the append FAILED —
+	// in which case Message names record-merge-observation as the recovery.
+	MergeObservationRecorded bool    `json:"merge_observation_recorded" jsonschema:"true only when this call appended the merge_observation_recorded audit row; false when the chain already carried merge evidence and false when the append failed (the message then names the recovery)"`
+	PRURL                    string  `json:"pr_url,omitempty" jsonschema:"the merged pull request URL"`
+	WaitedSeconds            float64 `json:"waited_seconds" jsonschema:"elapsed wall time spent awaiting the terminal merge"`
 	// NextAction surfaces the operator post-merge dev-host step (the reused
 	// postMergeStep) on status=merged. Per ADR-038 the MCP surface never
 	// mutates the host, so this is SURFACED, not invoked.
@@ -121,11 +140,23 @@ dev-host step (E48.7 / #1954). It replaces the four-step hand ceremony
 (approve → merge → post-merge) with one verb.
 
 Records a chained merge_verdict_recorded audit entry (your verdict verbatim)
-and dispatches the merge. The endpoint is IDEMPOTENT: a repeated POST finds
-the existing verdict row, appends no duplicate (already_recorded:true), and
-STILL re-dispatches the merge — so a timed-out re-invoke or a 502 retry
-re-queues the merge with no duplicate verdict row. The tool always re-POSTs
-on resume with NO client-side skip.
+and dispatches the merge. The tool always re-POSTs on resume with NO
+client-side skip, and the endpoint's idempotence has TWO halves worth stating
+separately:
+
+  - the VERDICT ROW is what a re-POST never duplicates: a repeated POST finds
+    the existing merge_verdict_recorded row and appends nothing
+    (already_recorded:true).
+  - the DISPATCH is safe to repeat because the endpoint OBSERVES the pull
+    request before dispatching (E45.87 / #3622). Re-queuing a merge for an
+    already-merged PR/MR errors on both forges, so a resumable re-invoke used
+    to return 502 merge_dispatch_failed in exactly the case where the merge had
+    SUCCEEDED during the wait. Now the endpoint answers already_merged:true
+    with merge_queued:false, and this tool returns status=merged immediately
+    without awaiting. merge_observation_recorded says whether THAT call
+    persisted the merge_observation_recorded audit row; when it could not, the
+    message names POST /v0/runs/{run_id}/record-merge-observation, and a run
+    left non-terminal names POST /v0/runs/{run_id}/reconcile-merge.
 
 The PR-approval review itself STAYS a gh step under your own GitHub identity
 (App-identity approval is deferred to E39); queueing the merge before that
@@ -143,8 +174,13 @@ Statuses:
   - "merged"        — the merge settled; next_action carries the operator
                      post-merge dev-host step (surfaced, not invoked —
                      ADR-038 keeps host mutation out of the MCP surface).
+                     ALSO returned when the endpoint reports the PR was
+                     ALREADY merged (already_merged:true) — no merge was
+                     queued and the await is skipped. The status is reused
+                     deliberately so consumers switching on it keep working.
   - "timeout"       — nothing settled within the window; resumable — re-invoke
-                     to resume (idempotent, no duplicate verdict row).
+                     to resume (no duplicate verdict row, and the re-dispatch
+                     is guarded by the endpoint's observe rung).
   - "run_terminal"  — the run reached failed/cancelled while waiting; the
                      merge will most likely never settle — check
                      fishhawk_get_run_status.
@@ -182,7 +218,12 @@ Tool errors:
     run_token_forbidden / insufficient_scope (403), run_not_found (404),
     run_not_mergeable / acceptance_gate_not_passed (409),
     merge_dispatch_failed (502 — the verdict row is durable and the merge is
-    retryable; re-invoke), merge_unconfigured (503)
+    retryable; re-invoke. The endpoint re-observes the forge once before
+    returning this, so a merge that landed in the dispatch window comes back
+    as already_merged instead. A surviving 502 carries forge_merge_state and
+    names POST /v0/runs/{run_id}/record-merge-observation then
+    POST /v0/runs/{run_id}/reconcile-merge as the recovery),
+    merge_unconfigured (503)
 
 The backend's 409 merge_checks_pending is NOT surfaced as a tool error: it is
 the checks-not-all-passed precondition the tool WAITS on (re-POSTing on the poll
@@ -247,6 +288,33 @@ func conflictingOutput(ae *apiError, start time.Time) MergeRunOutput {
 		Note:            mergeRunNote,
 		Message:         msg,
 	}
+}
+
+// alreadyMergedMessage renders the operator-facing explanation for the
+// already-merged arm (E45.87 / #3622).
+//
+// It PREFERS the endpoint's own message verbatim: the backend is the only side
+// that knows whether the observation row was persisted, and on the
+// append-failure path (binding approval condition 1) that message is what names
+// POST /v0/runs/{run_id}/record-merge-observation as the recovery. A backend
+// that sends no message (an older one, or the additive-compatibility shape)
+// degrades to a locally-composed equivalent rather than an empty string, so the
+// operator is never left with a bare status.
+func alreadyMergedMessage(res *MergeRunResult) string {
+	const lead = "the pull request is already merged, so no merge was queued and the tool did not wait."
+	if strings.TrimSpace(res.Message) != "" {
+		return lead + " " + res.Message
+	}
+	msg := lead
+	if res.MergeObservationRecorded {
+		msg += " This call recorded the merge observation on the run's audit chain."
+	} else {
+		msg += " No merge observation row was appended by this call; if the run's audit chain carries no merge evidence, POST /v0/runs/{run_id}/record-merge-observation to record it."
+	}
+	if res.RunState != "" && res.RunState != "succeeded" && res.RunState != "failed" && res.RunState != "cancelled" {
+		msg += " The run is still " + res.RunState + "; POST /v0/runs/{run_id}/reconcile-merge to settle it."
+	}
+	return msg
 }
 
 // mergeVerdictSequenceFrom best-effort reads details.verdict_sequence (the audit
@@ -600,12 +668,30 @@ func (r *runResolver) mergeRun(ctx context.Context, _ *mcp.CallToolRequest, in M
 	}
 
 	out := MergeRunOutput{
-		MergeQueued:     res.MergeQueued,
-		VerdictRecorded: !res.AlreadyRecorded,
-		AlreadyRecorded: res.AlreadyRecorded,
-		VerdictSequence: res.VerdictSequence,
-		PRURL:           res.PRURL,
-		Note:            mergeRunNote,
+		MergeQueued:              res.MergeQueued,
+		VerdictRecorded:          !res.AlreadyRecorded,
+		AlreadyRecorded:          res.AlreadyRecorded,
+		VerdictSequence:          res.VerdictSequence,
+		PRURL:                    res.PRURL,
+		AlreadyMerged:            res.AlreadyMerged,
+		MergeObservationRecorded: res.MergeObservationRecorded,
+		Note:                     mergeRunNote,
+	}
+
+	// ALREADY-MERGED ARM (E45.87 / #3622). The endpoint observed the pull
+	// request already merged and queued NO merge, so there is nothing for the
+	// terminal await to wait FOR — skip it entirely and return at once. Status
+	// reuses the existing "merged" rather than introducing a sixth value: the
+	// PR is merged, which is what a consumer switching on the status string
+	// needs to know, and the distinction rides AlreadyMerged + Message.
+	if res.AlreadyMerged {
+		out.Status = "merged"
+		out.RunState = res.RunState
+		out.WaitedSeconds = time.Since(start).Seconds()
+		step := postMergeStep(run)
+		out.NextAction = &step
+		out.Message = alreadyMergedMessage(res)
+		return nil, out, nil
 	}
 
 	// Await the terminal merge with the REMAINING budget (the shared deadline),

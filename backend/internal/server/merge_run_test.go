@@ -1566,3 +1566,537 @@ func TestHandleMergeRun_ChecksPending409GenericWhenRecomputeUnavailable(t *testi
 		t.Errorf("an un-run recompute must keep the generic wording: %q", env.Error.Message)
 	}
 }
+
+// --- E45.87 / #3622: observe before dispatch -------------------------------
+//
+// These pin the rung that stops POST /v0/runs/{run_id}/merge re-dispatching a
+// merge for a pull request that has ALREADY merged — the case where the
+// documented resumable re-invoke returned 502 merge_dispatch_failed precisely
+// because the operation had SUCCEEDED during the wait.
+//
+// Every assertion reads the COMMITTED effect (the fake merger's recorded call
+// count, and the appended audit rows) AFTER the handler returns, not merely the
+// response flags: a control that fires and is then bypassed would return a
+// byte-identical body.
+
+// observeMergeRepo is the canonical repo/URL pair the observe rung resolves.
+// The URL's github family, host and owner/name must all agree with the run's
+// Repo or resolveObservationTarget refuses before the forge read.
+const observeMergeRepo = "x/y"
+
+// seedObserveMergeRun seeds a merge-ready run whose Repo agrees with mergePR,
+// so resolveObservationTarget resolves cleanly and the observe rung's outcome
+// is decided by the forge answer rather than by the target.
+func seedObserveMergeRun(t *testing.T, repo *autoDriveRepo, runID uuid.UUID, prURL string) *run.Run {
+	t.Helper()
+	r := seedMergeRun(t, repo, runID, run.StateRunning, prURL, nil, nil)
+	repo.mu.Lock()
+	r.Repo = observeMergeRepo
+	repo.mu.Unlock()
+	return r
+}
+
+// mergeObservationRows returns every appended merge_observation_recorded param.
+func mergeObservationRows(au *auditFake) []audit.ChainAppendParams {
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var out []audit.ChainAppendParams
+	for i := range au.appended {
+		if au.appended[i].Category == CategoryMergeObservationRecorded {
+			out = append(out, au.appended[i])
+		}
+	}
+	return out
+}
+
+// seedChainMergeEvidence seeds one qualifying merge-evidence row of the given
+// category, the tier-(a) chain evidence the rung reads on EVERY post.
+func seedChainMergeEvidence(au *auditFake, runID uuid.UUID, category string) {
+	rid := runID
+	au.mu.Lock()
+	au.seeded = append(au.seeded, &audit.Entry{RunID: &rid, Category: category, Sequence: 3})
+	au.mu.Unlock()
+}
+
+func decodeMergeResponse(t *testing.T, w *httptest.ResponseRecorder) mergeRunResponse {
+	t.Helper()
+	var resp mergeRunResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal merge response: %v\n%s", err, w.Body.String())
+	}
+	return resp
+}
+
+// TestMergeRun_ChainEvidence_SkipsDispatch is the DONE-MEANS control for tier
+// (a): a run whose chain ALREADY carries merge evidence answers 200
+// already_merged with merge_queued:false and the merger is NEVER called.
+// COUNTERFACTUAL VEHICLE: deleting the observe-rung skip in handleMergeRun
+// turns this RED on the committed merger call count.
+func TestMergeRun_ChainEvidence_SkipsDispatch(t *testing.T) {
+	for _, category := range []string{CategoryPRMerged, CategoryPostMergeObserved, CategoryMergeObservationRecorded} {
+		t.Run(category, func(t *testing.T) {
+			merger := &fakeMerger{}
+			s, repo, au := newAutoDriveMergeServer(t, merger)
+			reader := &fakePRStateReader{pr: mergedPR()}
+			s.cfg.PRStateReader = reader
+			runID := uuid.New()
+			seedObserveMergeRun(t, repo, runID, mergePR)
+			seedChainMergeEvidence(au, runID, category)
+
+			w := postMergeRun(t, s, runID, mergeRunRequest{Verdict: "ship"}, withMergeOperator)
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+			}
+			// COMMITTED effect: the merge was never dispatched.
+			if merger.called != 0 {
+				t.Errorf("merger called %d times, want 0 (the PR is already merged)", merger.called)
+			}
+			if rows := mergeObservationRows(au); len(rows) != 0 {
+				t.Errorf("merge_observation_recorded rows = %d, want 0 (the chain already carried evidence)", len(rows))
+			}
+			resp := decodeMergeResponse(t, w)
+			if !resp.AlreadyMerged {
+				t.Error("already_merged = false, want true")
+			}
+			if resp.MergeQueued {
+				t.Error("merge_queued = true, want false")
+			}
+			if resp.MergeObservationRecorded {
+				t.Error("merge_observation_recorded = true, want false (nothing was appended)")
+			}
+			// Tier (a) runs on EVERY post and must not pay a forge request.
+			if reader.calls != 0 {
+				t.Errorf("GetPullRequest called %d times, want 0 (chain evidence short-circuits the forge read)", reader.calls)
+			}
+		})
+	}
+}
+
+// TestMergeRun_ResumeObservesForge_SkipsDispatch is the DONE-MEANS control for
+// tier (b): on a RESUME (an existing merge_verdict_recorded row) the rung reads
+// the forge, records the observation, and skips the dispatch.
+// COUNTERFACTUAL VEHICLE: deleting the observe-rung skip turns this RED on the
+// committed merger call count.
+func TestMergeRun_ResumeObservesForge_SkipsDispatch(t *testing.T) {
+	merger := &fakeMerger{}
+	s, repo, au := newAutoDriveMergeServer(t, merger)
+	reader := &fakePRStateReader{pr: mergedPR()}
+	s.cfg.PRStateReader = reader
+	runID := uuid.New()
+	seedObserveMergeRun(t, repo, runID, mergePR)
+	seedMergeVerdict(au, runID, 11)
+
+	w := postMergeRun(t, s, runID, mergeRunRequest{Verdict: "ship"}, withMergeOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if merger.called != 0 {
+		t.Errorf("merger called %d times, want 0 (the forge reports the PR already merged)", merger.called)
+	}
+	if reader.calls != 1 {
+		t.Errorf("GetPullRequest called %d times, want 1", reader.calls)
+	}
+	rows := mergeObservationRows(au)
+	if len(rows) != 1 {
+		t.Fatalf("merge_observation_recorded rows = %d, want 1", len(rows))
+	}
+	var payload struct {
+		PRURL       string `json:"pull_request_url"`
+		PRNumber    int    `json:"pull_request_number"`
+		SHA         string `json:"merge_commit_sha"`
+		MergedAt    string `json:"merged_at"`
+		ObservedAt  string `json:"observed_at"`
+		Reconciled  bool   `json:"reconciled_after_the_fact"`
+		RunIDInBody string `json:"run_id"`
+	}
+	if err := json.Unmarshal(rows[0].Payload, &payload); err != nil {
+		t.Fatalf("decode observation payload: %v", err)
+	}
+	if payload.PRURL != mergePR || payload.PRNumber != 7 || payload.SHA != "cafebabe1234" {
+		t.Errorf("payload = %+v, want the run's own PR url/number and the forge's SHA", payload)
+	}
+	if payload.MergedAt != "2026-08-30T12:34:56Z" {
+		t.Errorf("payload merged_at = %q, want the FORGE's merge timestamp", payload.MergedAt)
+	}
+	if payload.ObservedAt == "" || !payload.Reconciled {
+		t.Errorf("payload observed_at = %q, reconciled_after_the_fact = %v", payload.ObservedAt, payload.Reconciled)
+	}
+	if rows[0].Timestamp.Format(time.RFC3339Nano) != payload.ObservedAt {
+		t.Errorf("entry timestamp %q != payload observed_at %q; they must be the same instant",
+			rows[0].Timestamp.Format(time.RFC3339Nano), payload.ObservedAt)
+	}
+	resp := decodeMergeResponse(t, w)
+	if !resp.AlreadyMerged || resp.MergeQueued || !resp.MergeObservationRecorded {
+		t.Errorf("already_merged=%v merge_queued=%v merge_observation_recorded=%v; want true/false/true",
+			resp.AlreadyMerged, resp.MergeQueued, resp.MergeObservationRecorded)
+	}
+	if !resp.AlreadyRecorded {
+		t.Error("already_recorded = false, want true (this is a resume)")
+	}
+	if !strings.Contains(resp.Message, "recorded the merge observation") {
+		t.Errorf("message must say this call recorded the observation; got %q", resp.Message)
+	}
+	// The best-effort settle ran: this run's stage set is empty, so Advance
+	// completes it and the response reports the SETTLED state — which is
+	// terminal, so reconcile-merge is correctly NOT named.
+	if resp.RunState != string(run.StateSucceeded) {
+		t.Errorf("run_state = %q, want %q after the best-effort settle", resp.RunState, run.StateSucceeded)
+	}
+	if strings.Contains(resp.Message, "reconcile-merge") {
+		t.Errorf("message must NOT name reconcile-merge on a terminal run; got %q", resp.Message)
+	}
+}
+
+// TestMergeRun_FirstPost_DoesNotReadForge pins the RESUME-ONLY gate: the happy
+// first POST pays ZERO forge requests even when the forge WOULD report merged,
+// and the merge is dispatched normally.
+// COUNTERFACTUAL VEHICLE: widening the `alreadyRecorded &&` gate to every POST
+// turns this RED on the reader's GetPullRequest call count.
+func TestMergeRun_FirstPost_DoesNotReadForge(t *testing.T) {
+	merger := &fakeMerger{}
+	s, repo, au := newAutoDriveMergeServer(t, merger)
+	reader := &fakePRStateReader{pr: mergedPR()}
+	s.cfg.PRStateReader = reader
+	runID := uuid.New()
+	seedObserveMergeRun(t, repo, runID, mergePR)
+
+	w := postMergeRun(t, s, runID, mergeRunRequest{Verdict: "ship"}, withMergeOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if reader.calls != 0 {
+		t.Errorf("GetPullRequest called %d times on a FIRST post, want 0", reader.calls)
+	}
+	if merger.called != 1 {
+		t.Errorf("merger called %d times, want 1", merger.called)
+	}
+	if rows := mergeObservationRows(au); len(rows) != 0 {
+		t.Errorf("merge_observation_recorded rows = %d, want 0", len(rows))
+	}
+	// PLACEMENT proof: the rung sits AFTER the durable verdict append, so a
+	// first post still leaves exactly one verdict row.
+	if rows := mergeVerdictRows(au); len(rows) != 1 {
+		t.Errorf("merge_verdict_recorded rows = %d, want 1", len(rows))
+	}
+	resp := decodeMergeResponse(t, w)
+	if resp.AlreadyMerged || !resp.MergeQueued {
+		t.Errorf("already_merged=%v merge_queued=%v; want false/true", resp.AlreadyMerged, resp.MergeQueued)
+	}
+}
+
+// TestMergeRun_ObserveFailOpenModes is one behavioural case per NAMED fail-open
+// mode of the observe rung. Each asserts TODAY's behaviour byte-for-byte: the
+// merge IS dispatched exactly once, NO observation row is appended, and the
+// response is the ordinary dispatch shape. Bad state is seeded BY CONSTRUCTION
+// (a PullRequest literal, a nil reader, an injected error), never by calling a
+// guard inside the test's own setup.
+func TestMergeRun_ObserveFailOpenModes(t *testing.T) {
+	notMerged := func() *forge.PullRequest { p := mergedPR(); p.Merged = false; return p }
+	noSHA := func() *forge.PullRequest { p := mergedPR(); p.MergeCommitSHA = ""; return p }
+	noTS := func() *forge.PullRequest { p := mergedPR(); p.MergedAt = nil; return p }
+
+	cases := []struct {
+		name string
+		// prURL overrides the run's recorded pull request URL.
+		prURL string
+		// reader is the injected forge seam; nil means NO reader is wired.
+		reader *fakePRStateReader
+		// chainErrCategory injects a chain-read failure for that category.
+		chainErrCategory string
+		// wantForgeCalls is the expected GetPullRequest count.
+		wantForgeCalls int
+	}{
+		{name: "no_pr_state_reader", prURL: mergePR, reader: nil},
+		{name: "get_pull_request_errors", prURL: mergePR,
+			reader: &fakePRStateReader{err: errors.New("forge boom")}, wantForgeCalls: 1},
+		{name: "forge_reports_not_merged", prURL: mergePR,
+			reader: &fakePRStateReader{pr: notMerged()}, wantForgeCalls: 1},
+		{name: "merged_with_empty_merge_commit_sha", prURL: mergePR,
+			reader: &fakePRStateReader{pr: noSHA()}, wantForgeCalls: 1},
+		{name: "merged_with_nil_merged_at", prURL: mergePR,
+			reader: &fakePRStateReader{pr: noTS()}, wantForgeCalls: 1},
+		{name: "malformed_pr_url", prURL: "not-a-pull-request",
+			reader: &fakePRStateReader{pr: mergedPR()}},
+		{name: "pr_url_names_another_repository", prURL: "https://github.com/other/repo/pull/7",
+			reader: &fakePRStateReader{pr: mergedPR()}},
+		{name: "pr_url_names_another_forge_family", prURL: "https://gitlab.com/x/y/-/merge_requests/7",
+			reader: &fakePRStateReader{pr: mergedPR()}},
+		{name: "chain_read_errors", prURL: mergePR,
+			reader: &fakePRStateReader{pr: mergedPR()}, chainErrCategory: CategoryPRMerged},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			merger := &fakeMerger{}
+			s, repo, au := newAutoDriveMergeServer(t, merger)
+			if tc.reader != nil {
+				s.cfg.PRStateReader = tc.reader
+			}
+			au.listByCategoryErrCategory = tc.chainErrCategory
+			runID := uuid.New()
+			seedObserveMergeRun(t, repo, runID, tc.prURL)
+			// RESUME shape, so tier (b) is armed for every case: the fail-open
+			// outcome is decided by the mode under test, not by the gate.
+			seedMergeVerdict(au, runID, 11)
+
+			w := postMergeRun(t, s, runID, mergeRunRequest{Verdict: "ship"}, withMergeOperator)
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200 (fail open to today's dispatch):\n%s", w.Code, w.Body.String())
+			}
+			if merger.called != 1 {
+				t.Errorf("merger called %d times, want exactly 1 (fail open)", merger.called)
+			}
+			if rows := mergeObservationRows(au); len(rows) != 0 {
+				t.Errorf("merge_observation_recorded rows = %d, want 0 on an uncertain observe", len(rows))
+			}
+			if tc.reader != nil && tc.reader.calls != tc.wantForgeCalls {
+				t.Errorf("GetPullRequest called %d times, want %d", tc.reader.calls, tc.wantForgeCalls)
+			}
+			resp := decodeMergeResponse(t, w)
+			if resp.AlreadyMerged || !resp.MergeQueued {
+				t.Errorf("already_merged=%v merge_queued=%v; want false/true", resp.AlreadyMerged, resp.MergeQueued)
+			}
+		})
+	}
+}
+
+// TestMergeRun_ChainReadError_Dispatches is the dedicated fail-OPEN control for
+// the chain read: an unreadable chain is NOT evidence, so the handler proceeds
+// to the dispatch rather than answering 500.
+// COUNTERFACTUAL VEHICLE: making the chain-read error a 500 turns this RED.
+func TestMergeRun_ChainReadError_Dispatches(t *testing.T) {
+	merger := &fakeMerger{}
+	s, repo, au := newAutoDriveMergeServer(t, merger)
+	au.listByCategoryErrCategory = CategoryPRMerged
+	runID := uuid.New()
+	seedObserveMergeRun(t, repo, runID, mergePR)
+
+	w := postMergeRun(t, s, runID, mergeRunRequest{Verdict: "ship"}, withMergeOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (a chain-read error must never 500 the merge):\n%s", w.Code, w.Body.String())
+	}
+	if merger.called != 1 {
+		t.Errorf("merger called %d times, want 1", merger.called)
+	}
+}
+
+// TestMergeRun_ForgeMergedButAppendFails is BINDING APPROVAL CONDITION 1: the
+// forge CONFIRMS the merge but the observation append fails. The merge must NOT
+// be dispatched (it already happened), the response is 200 already_merged with
+// merge_observation_recorded:FALSE, and the message names
+// record-merge-observation as the recovery.
+func TestMergeRun_ForgeMergedButAppendFails(t *testing.T) {
+	merger := &fakeMerger{}
+	s, repo, au := newAutoDriveMergeServer(t, merger)
+	au.appendErrCategory = CategoryMergeObservationRecorded
+	s.cfg.PRStateReader = &fakePRStateReader{pr: mergedPR()}
+	runID := uuid.New()
+	seedObserveMergeRun(t, repo, runID, mergePR)
+	seedMergeVerdict(au, runID, 11)
+
+	w := postMergeRun(t, s, runID, mergeRunRequest{Verdict: "ship"}, withMergeOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if merger.called != 0 {
+		t.Errorf("merger called %d times, want 0 — the merge already happened", merger.called)
+	}
+	if rows := mergeObservationRows(au); len(rows) != 0 {
+		t.Errorf("merge_observation_recorded rows = %d, want 0 (the append failed)", len(rows))
+	}
+	resp := decodeMergeResponse(t, w)
+	if !resp.AlreadyMerged || resp.MergeQueued {
+		t.Errorf("already_merged=%v merge_queued=%v; want true/false", resp.AlreadyMerged, resp.MergeQueued)
+	}
+	if resp.MergeObservationRecorded {
+		t.Error("merge_observation_recorded = true, want false — it is true ONLY when the append SUCCEEDED")
+	}
+	if !strings.Contains(resp.Message, "record-merge-observation") {
+		t.Errorf("message must name record-merge-observation as the recovery; got %q", resp.Message)
+	}
+	if !strings.Contains(resp.Message, "could NOT be persisted") {
+		t.Errorf("message must state the observation row could not be persisted; got %q", resp.Message)
+	}
+}
+
+// TestMergeRun_DispatchError_ForgeMerged_200 is the fail-FORWARD arm of step 6:
+// a merge that landed in the observe-to-dispatch window resolves as
+// already_merged instead of the 502 the issue reports.
+func TestMergeRun_DispatchError_ForgeMerged_200(t *testing.T) {
+	merger := &fakeMerger{err: errors.New("pull request is already merged")}
+	s, repo, au := newAutoDriveMergeServer(t, merger)
+	s.cfg.PRStateReader = &fakePRStateReader{pr: mergedPR()}
+	runID := uuid.New()
+	seedObserveMergeRun(t, repo, runID, mergePR)
+
+	w := postMergeRun(t, s, runID, mergeRunRequest{Verdict: "ship"}, withMergeOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (the merge already landed):\n%s", w.Code, w.Body.String())
+	}
+	if merger.called != 1 {
+		t.Errorf("merger called %d times, want 1 (the dispatch was attempted, then re-observed)", merger.called)
+	}
+	resp := decodeMergeResponse(t, w)
+	if !resp.AlreadyMerged || resp.MergeQueued || !resp.MergeObservationRecorded {
+		t.Errorf("already_merged=%v merge_queued=%v merge_observation_recorded=%v; want true/false/true",
+			resp.AlreadyMerged, resp.MergeQueued, resp.MergeObservationRecorded)
+	}
+	if rows := mergeObservationRows(au); len(rows) != 1 {
+		t.Errorf("merge_observation_recorded rows = %d, want 1", len(rows))
+	}
+}
+
+// TestMergeRun_DispatchError_ForgeMerged_AppendFails_200 applies BINDING
+// APPROVAL CONDITION 1 to the dispatch-error re-observe path: the forge
+// confirms the merge, the append fails, and the answer is still 200
+// already_merged with merge_observation_recorded:false — never a second
+// dispatch, never a 502.
+func TestMergeRun_DispatchError_ForgeMerged_AppendFails_200(t *testing.T) {
+	merger := &fakeMerger{err: errors.New("pull request is already merged")}
+	s, repo, au := newAutoDriveMergeServer(t, merger)
+	au.appendErrCategory = CategoryMergeObservationRecorded
+	s.cfg.PRStateReader = &fakePRStateReader{pr: mergedPR()}
+	runID := uuid.New()
+	seedObserveMergeRun(t, repo, runID, mergePR)
+
+	w := postMergeRun(t, s, runID, mergeRunRequest{Verdict: "ship"}, withMergeOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if merger.called != 1 {
+		t.Errorf("merger called %d times, want 1 (no second dispatch after the re-observe)", merger.called)
+	}
+	resp := decodeMergeResponse(t, w)
+	if !resp.AlreadyMerged || resp.MergeObservationRecorded {
+		t.Errorf("already_merged=%v merge_observation_recorded=%v; want true/false",
+			resp.AlreadyMerged, resp.MergeObservationRecorded)
+	}
+	if !strings.Contains(resp.Message, "record-merge-observation") {
+		t.Errorf("message must name record-merge-observation; got %q", resp.Message)
+	}
+}
+
+// TestMergeRun_DispatchError_ForgeNotMerged_502 is the surviving-502 arm: the
+// forge does NOT confirm a merge, so today's 502 stands — widened to name BOTH
+// recovery verbs and to carry details.forge_merge_state.
+func TestMergeRun_DispatchError_ForgeNotMerged_502(t *testing.T) {
+	notMerged := mergedPR()
+	notMerged.Merged = false
+	merger := &fakeMerger{err: errors.New("queue boom")}
+	s, repo, _ := newAutoDriveMergeServer(t, merger)
+	s.cfg.PRStateReader = &fakePRStateReader{pr: notMerged}
+	runID := uuid.New()
+	seedObserveMergeRun(t, repo, runID, mergePR)
+
+	w := postMergeRun(t, s, runID, mergeRunRequest{Verdict: "ship"}, withMergeOperator)
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502:\n%s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	// forge_merge_state rides the MESSAGE, not the details: a 5xx body's
+	// details are default-deny redacted by errors.go's redactableDetailKeys,
+	// which admits neither forge_merge_state nor the raw `error` cause.
+	for _, want := range []string{"merge_dispatch_failed", "record-merge-observation", "reconcile-merge",
+		"forge_merge_state=not_merged", `"verdict_sequence"`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("502 body missing %q:\n%s", want, body)
+		}
+	}
+}
+
+// TestMergeRun_AlreadyMergedEndToEnd drives the CROSS-BOUNDARY seam on a REAL
+// Postgres chain (HTTP handler → forge read → audit persistence): a resume with
+// a forge reporting merged+SHA+merged_at answers already_merged with
+// merge_queued:false, leaves a REAL merge_observation_recorded row carrying the
+// forge's merged_at / the observed_at / reconciled_after_the_fact, and records
+// ZERO MergePullRequest calls.
+func TestMergeRun_AlreadyMergedEndToEnd(t *testing.T) {
+	ctx := context.Background()
+	reader := &fakePRStateReader{pr: mergedPR()}
+	f := newObservationFixture(t, reader)
+	merger := &fakeMerger{}
+	f.s.cfg.GateMerger = merger
+
+	// RESUME shape: a durable verdict row already exists.
+	if _, err := f.audit.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     f.runID,
+		Timestamp: time.Now().UTC(),
+		Category:  CategoryMergeVerdictRecorded,
+		Payload:   []byte(`{"verdict":"ship"}`),
+	}); err != nil {
+		t.Fatalf("seed verdict row: %v", err)
+	}
+
+	w := postMergeRun(t, f.s, f.runID, mergeRunRequest{Verdict: "ship"}, withMergeOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if merger.called != 0 {
+		t.Fatalf("MergePullRequest called %d times, want 0", merger.called)
+	}
+	resp := decodeMergeResponse(t, w)
+	if !resp.AlreadyMerged || resp.MergeQueued || !resp.MergeObservationRecorded {
+		t.Errorf("already_merged=%v merge_queued=%v merge_observation_recorded=%v; want true/false/true",
+			resp.AlreadyMerged, resp.MergeQueued, resp.MergeObservationRecorded)
+	}
+
+	entries, err := f.audit.ListForRunByCategory(ctx, f.runID, CategoryMergeObservationRecorded)
+	if err != nil {
+		t.Fatalf("list merge_observation_recorded: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("merge_observation_recorded entries = %d, want 1", len(entries))
+	}
+	var payload struct {
+		MergedAt   string `json:"merged_at"`
+		ObservedAt string `json:"observed_at"`
+		Reconciled bool   `json:"reconciled_after_the_fact"`
+		SHA        string `json:"merge_commit_sha"`
+	}
+	if uerr := json.Unmarshal(entries[0].Payload, &payload); uerr != nil {
+		t.Fatalf("decode payload: %v", uerr)
+	}
+	if payload.MergedAt != "2026-08-30T12:34:56Z" {
+		t.Errorf("merged_at = %q, want the forge's merge timestamp", payload.MergedAt)
+	}
+	if payload.ObservedAt == "" || payload.ObservedAt == payload.MergedAt {
+		t.Errorf("observed_at = %q must be present and distinct from merged_at", payload.ObservedAt)
+	}
+	if !payload.Reconciled {
+		t.Error("reconciled_after_the_fact = false, want true")
+	}
+	if payload.SHA != "cafebabe1234" {
+		t.Errorf("merge_commit_sha = %q", payload.SHA)
+	}
+}
+
+// TestMergeRun_AlreadyMerged_NilOrchestrator_Still200 pins that the best-effort
+// settle cannot turn a successful observe into an error: with NO orchestrator
+// wired, advanceRunAfterReviewResolve no-ops and the already_merged body is
+// still returned.
+func TestMergeRun_AlreadyMerged_NilOrchestrator_Still200(t *testing.T) {
+	merger := &fakeMerger{}
+	s, repo, au := newAutoDriveMergeServer(t, merger)
+	s.cfg.Orchestrator = nil
+	runID := uuid.New()
+	seedObserveMergeRun(t, repo, runID, mergePR)
+	seedChainMergeEvidence(au, runID, CategoryPRMerged)
+
+	w := postMergeRun(t, s, runID, mergeRunRequest{Verdict: "ship"}, withMergeOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if merger.called != 0 {
+		t.Errorf("merger called %d times, want 0", merger.called)
+	}
+	resp := decodeMergeResponse(t, w)
+	if !resp.AlreadyMerged {
+		t.Error("already_merged = false, want true")
+	}
+	if resp.RunState != string(run.StateRunning) {
+		t.Errorf("run_state = %q, want %q", resp.RunState, run.StateRunning)
+	}
+	// A still-NON-TERMINAL run names the settling verb.
+	if !strings.Contains(resp.Message, "reconcile-merge") {
+		t.Errorf("message must name reconcile-merge on a still-running run; got %q", resp.Message)
+	}
+}

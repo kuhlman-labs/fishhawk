@@ -1492,3 +1492,137 @@ func TestMergeRun_AcceptanceAdvisory_D4_NoMatchingEntry(t *testing.T) {
 		t.Errorf("message = %q, want the generic in-flight wording", out.Message)
 	}
 }
+
+// --- E45.87 / #3622: the already-merged arm ---------------------------------
+
+// TestMergeRun_AlreadyMerged_SkipsAwait is the CROSS-BOUNDARY seam between the
+// endpoint's new already_merged field and the tool's skip-the-await decision:
+// per-layer units would each pass while the seam broke.
+//
+// The proof that the await was SKIPPED (not merely fast) is the backend's
+// audit-read counter: the terminal-merge poll's ONLY way to resolve is GET
+// /v0/runs/{id}/audit, so ZERO recorded audit requests means the poll never ran.
+func TestMergeRun_AlreadyMerged_SkipsAwait(t *testing.T) {
+	fb := &mergeRunFakeBackend{
+		prURL:            "https://github.com/x/y/pull/7",
+		stateBeforeMerge: "running",
+		mergeResp: MergeRunResult{
+			MergeQueued: false, VerdictSequence: 5, PRURL: "https://github.com/x/y/pull/7",
+			AlreadyRecorded: true, AlreadyMerged: true, MergeObservationRecorded: true,
+			RunState: "succeeded",
+			Message:  "the run's audit chain now carries the observation.",
+		},
+		// Present but unreachable: a pr_merged entry the await WOULD resolve on.
+		// Its presence makes the zero-read assertion meaningful — the await is
+		// skipped, not merely starved.
+		auditEntries: []AuditEntry{{Category: "pr_merged", Sequence: 6}},
+	}
+	srv := newMergeRunFakeBackend(t, fb)
+	r := newMergeRunResolver(srv)
+
+	_, out, err := r.mergeRun(context.Background(), nil, MergeRunInput{RunID: uuid.NewString(), Verdict: "ship it"})
+	if err != nil {
+		t.Fatalf("mergeRun: %v", err)
+	}
+	if out.Status != "merged" {
+		t.Fatalf("status = %q, want merged (the reused status, not a sixth value)", out.Status)
+	}
+	if !out.AlreadyMerged {
+		t.Error("already_merged = false, want true")
+	}
+	if !out.MergeObservationRecorded {
+		t.Error("merge_observation_recorded = false, want true")
+	}
+	if out.MergeQueued {
+		t.Error("merge_queued = true, want false — no merge was queued")
+	}
+	if out.RunState != "succeeded" {
+		t.Errorf("run_state = %q, want succeeded (from the endpoint's own response)", out.RunState)
+	}
+	if out.NextAction == nil || out.NextAction.Action != "post_merge" {
+		t.Fatalf("next_action = %+v, want the surfaced post_merge step", out.NextAction)
+	}
+	if !strings.Contains(out.Message, "already merged") {
+		t.Errorf("message = %q, want it to say the PR was already merged", out.Message)
+	}
+	// The endpoint's own message is carried verbatim: it is the only side that
+	// knows whether the observation row persisted.
+	if !strings.Contains(out.Message, "the run's audit chain now carries the observation.") {
+		t.Errorf("message = %q, want the backend's message carried verbatim", out.Message)
+	}
+	fb.mu.Lock()
+	reads, posts := fb.auditReadCalls, fb.mergeCalls
+	fb.mu.Unlock()
+	if reads != 0 {
+		t.Errorf("audit endpoint recorded %d requests, want 0 — the terminal await must be SKIPPED", reads)
+	}
+	if posts != 1 {
+		t.Errorf("merge POSTs = %d, want exactly 1", posts)
+	}
+}
+
+// TestMergeRun_AlreadyMerged_RunStateNamesReconcile pins both arms of the
+// locally-composed fallback message (a backend that sends none): a NON-TERMINAL
+// run_state names reconcile-merge, a terminal one does NOT.
+func TestMergeRun_AlreadyMerged_RunStateNamesReconcile(t *testing.T) {
+	cases := []struct {
+		name          string
+		runState      string
+		wantReconcile bool
+	}{
+		{name: "non_terminal_names_reconcile_merge", runState: "running", wantReconcile: true},
+		{name: "terminal_does_not", runState: "succeeded", wantReconcile: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fb := &mergeRunFakeBackend{
+				prURL:            "https://github.com/x/y/pull/7",
+				stateBeforeMerge: "running",
+				mergeResp: MergeRunResult{
+					MergeQueued: false, VerdictSequence: 5, AlreadyRecorded: true,
+					AlreadyMerged: true, MergeObservationRecorded: true, RunState: tc.runState,
+				},
+			}
+			srv := newMergeRunFakeBackend(t, fb)
+			r := newMergeRunResolver(srv)
+
+			_, out, err := r.mergeRun(context.Background(), nil, MergeRunInput{RunID: uuid.NewString(), Verdict: "ship it"})
+			if err != nil {
+				t.Fatalf("mergeRun: %v", err)
+			}
+			if got := strings.Contains(out.Message, "reconcile-merge"); got != tc.wantReconcile {
+				t.Errorf("message names reconcile-merge = %v, want %v; message = %q",
+					got, tc.wantReconcile, out.Message)
+			}
+		})
+	}
+}
+
+// TestMergeRun_AlreadyMerged_ObservationNotRecorded_NamesRecovery is BINDING
+// APPROVAL CONDITION 1 reaching the operator through the tool: when the
+// endpoint reports already_merged with merge_observation_recorded:FALSE and no
+// message of its own, the locally-composed fallback still names
+// record-merge-observation as the recovery.
+func TestMergeRun_AlreadyMerged_ObservationNotRecorded_NamesRecovery(t *testing.T) {
+	fb := &mergeRunFakeBackend{
+		prURL:            "https://github.com/x/y/pull/7",
+		stateBeforeMerge: "running",
+		mergeResp: MergeRunResult{
+			MergeQueued: false, VerdictSequence: 5, AlreadyRecorded: true,
+			AlreadyMerged: true, MergeObservationRecorded: false, RunState: "running",
+		},
+	}
+	srv := newMergeRunFakeBackend(t, fb)
+	r := newMergeRunResolver(srv)
+
+	_, out, err := r.mergeRun(context.Background(), nil, MergeRunInput{RunID: uuid.NewString(), Verdict: "ship it"})
+	if err != nil {
+		t.Fatalf("mergeRun: %v", err)
+	}
+	if out.MergeObservationRecorded {
+		t.Error("merge_observation_recorded = true, want false")
+	}
+	if !strings.Contains(out.Message, "record-merge-observation") {
+		t.Errorf("message must name record-merge-observation; got %q", out.Message)
+	}
+}

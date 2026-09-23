@@ -2756,3 +2756,61 @@ func TestOnboardingReadinessReport_TraceStoreAbsentOrNullKeepsNil(t *testing.T) 
 		})
 	}
 }
+
+// TestMergeRun_AlreadyMergedWireShape pins the E45.87 / #3622 additive decode:
+// the four new merge 200 fields round-trip, and a LEGACY body omitting them all
+// decodes to false / false / "" / "" (the additive-compatibility control, so an
+// older backend can never make the tool claim the PR was already merged).
+func TestMergeRun_AlreadyMergedWireShape(t *testing.T) {
+	runID := uuid.New()
+
+	t.Run("already_merged body round-trips every new field", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"merge_queued":false,"verdict_sequence":42,` +
+				`"pr_url":"https://github.com/x/y/pull/7","already_recorded":true,` +
+				`"already_merged":true,"merge_observation_recorded":true,` +
+				`"run_state":"running","message":"already merged; reconcile-merge to settle"}`))
+		}))
+		defer ts.Close()
+		c := newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})
+
+		res, err := c.MergeRun(context.Background(), runID, "ship it")
+		if err != nil {
+			t.Fatalf("MergeRun: %v", err)
+		}
+		if !res.AlreadyMerged || !res.MergeObservationRecorded {
+			t.Errorf("already_merged=%v merge_observation_recorded=%v, want true/true",
+				res.AlreadyMerged, res.MergeObservationRecorded)
+		}
+		if res.MergeQueued {
+			t.Error("merge_queued = true, want false on the already-merged arm")
+		}
+		if res.RunState != "running" {
+			t.Errorf("run_state = %q, want running", res.RunState)
+		}
+		if res.Message != "already merged; reconcile-merge to settle" {
+			t.Errorf("message = %q", res.Message)
+		}
+	})
+
+	t.Run("legacy body omitting the new fields decodes to zero values", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"merge_queued":true,"verdict_sequence":42,"already_recorded":false}`))
+		}))
+		defer ts.Close()
+		c := newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})
+
+		res, err := c.MergeRun(context.Background(), runID, "ship it")
+		if err != nil {
+			t.Fatalf("MergeRun: %v", err)
+		}
+		if res.AlreadyMerged || res.MergeObservationRecorded || res.RunState != "" || res.Message != "" {
+			t.Errorf("legacy decode = %+v, want already_merged:false observation:false run_state:\"\" message:\"\"", res)
+		}
+		if !res.MergeQueued {
+			t.Error("merge_queued = false; the legacy dispatch path must stay byte-compatible")
+		}
+	})
+}

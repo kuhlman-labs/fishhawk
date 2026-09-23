@@ -2553,16 +2553,42 @@ type mergeRunRequest struct {
 // MergeRunResult mirrors the backend's merge 200 body: the merge was
 // queued through the same GitHubMerger seam the delegated may_merge arm
 // uses, with the chained verdict row's sequence surfaced back to the
-// operator. AlreadyRecorded is the ENDPOINT-side idempotence signal
-// (#1954 binding condition 1): a repeated POST that finds an existing
-// merge_verdict_recorded row appends NO duplicate, responds
-// already_recorded:true, and STILL dispatches the merge helper — so a
-// 502-then-reinvoke re-queues the merge with no duplicate verdict row.
+// operator.
+//
+// IDEMPOTENCE HAS TWO HALVES, stated separately (E45.87 / #3622 narrows what
+// used to be a bare "the endpoint is idempotent"):
+//
+//   - the VERDICT ROW half (#1954 binding condition 1) — AlreadyRecorded:true
+//     means a repeated POST found an existing merge_verdict_recorded row and
+//     appended NO duplicate. That is what a re-POST never duplicates.
+//   - the DISPATCH half — a re-POST is safe to repeat because the endpoint now
+//     OBSERVES the pull request BEFORE dispatching. Re-queuing a merge for an
+//     already-merged PR/MR errors on both forges, so the documented resumable
+//     re-invoke used to return 502 merge_dispatch_failed precisely when the
+//     merge had SUCCEEDED during the wait. AlreadyMerged:true is that arm: no
+//     merge was queued (MergeQueued is false) because the PR was already
+//     merged.
+//
+// MergeObservationRecorded is true ONLY when THIS call successfully appended
+// the merge_observation_recorded audit row — false when the chain already
+// carried merge evidence, and false when the append itself failed (Message then
+// names POST /v0/runs/{run_id}/record-merge-observation as the recovery).
+// RunState is the run's lifecycle state after the endpoint's best-effort
+// completion re-evaluation; when it is still non-terminal, Message names
+// POST /v0/runs/{run_id}/reconcile-merge.
+//
+// All four new fields are ADDITIVE: a backend that omits them decodes to
+// false/false/""/"" and the ordinary dispatch path is byte-compatible.
 type MergeRunResult struct {
 	MergeQueued     bool   `json:"merge_queued"`
 	VerdictSequence int64  `json:"verdict_sequence"`
 	PRURL           string `json:"pr_url"`
 	AlreadyRecorded bool   `json:"already_recorded"`
+
+	AlreadyMerged            bool   `json:"already_merged"`
+	MergeObservationRecorded bool   `json:"merge_observation_recorded"`
+	RunState                 string `json:"run_state"`
+	Message                  string `json:"message"`
 }
 
 // MergeRun records the operator merge verdict and queues the squash merge
@@ -2588,7 +2614,11 @@ type MergeRunResult struct {
 //     pr_url + mergeable_state; fishhawk_merge_run returns status=conflicting
 //     IMMEDIATELY rather than waiting, since waiting cannot resolve a conflict).
 //   - 502 merge_dispatch_failed (the verdict row is durable; the queue step
-//     is retryable — re-POST re-queues with no duplicate row)
+//     is retryable — re-POST re-queues with no duplicate row. Since E45.87 /
+//     #3622 the endpoint re-observes the forge once before writing this, so a
+//     merge that landed in the dispatch window resolves as 200
+//     already_merged:true instead; details carry forge_merge_state and the
+//     message names record-merge-observation then reconcile-merge)
 //   - 503 merge_unconfigured (the merger seam is not wired)
 func (c *apiClient) MergeRun(ctx context.Context, runID uuid.UUID, verdict string) (*MergeRunResult, error) {
 	body, err := json.Marshal(mergeRunRequest{Verdict: verdict})

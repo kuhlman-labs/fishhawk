@@ -9438,7 +9438,7 @@ paths:
   /v0/runs/{run_id}/merge:
     post:
       operationId: mergeRun
-      summary: Record an operator merge verdict and queue the squash merge
+      summary: Record an operator merge verdict and queue the squash merge (skipped when already merged)
       description: |
         The one-verb operator merge path (E48.7 / #1954). Records the
         operator's merge verdict as a chained `merge_verdict_recorded` audit
@@ -9458,11 +9458,42 @@ paths:
         settle is left to the `pull_request`-closed webhook. The
         `fishhawk_merge_run` MCP tool awaits the terminal run state client-side.
 
-        **Idempotent.** A repeated POST that finds an existing
+        **Idempotent — in TWO halves, stated separately (E45.87 / #3622).**
+        The VERDICT-ROW half: a repeated POST that finds an existing
         `merge_verdict_recorded` row appends NO duplicate and responds
-        `already_recorded: true`, but ALWAYS re-dispatches the merge helper —
-        so a 502-then-reinvoke re-queues the merge without duplicating the
-        verdict.
+        `already_recorded: true`. The DISPATCH half: a re-POST no longer
+        re-dispatches BLINDLY. Re-queuing a merge for a pull/merge request that
+        has ALREADY merged errors on both forges, so the documented resumable
+        re-invoke used to return `502 merge_dispatch_failed` in exactly the case
+        where the merge had SUCCEEDED during the wait.
+
+        **Observe before dispatch (E45.87 / #3622).** Immediately after the
+        durable verdict append and BEFORE the merge dispatch the endpoint asks
+        whether the merge already landed, in two tiers:
+
+        - a CHEAP audit-chain read on EVERY POST (`pr_merged` /
+          `post_merge_observed` / `merge_observation_recorded`);
+        - a LIVE forge read on a RESUME ONLY (`already_recorded` — an existing
+          verdict row). A first POST pays ZERO forge requests. On a live
+          `merged: true` answer carrying a merge commit SHA and a merge
+          timestamp the endpoint appends the SAME
+          `merge_observation_recorded` audit entry
+          `POST /v0/runs/{run_id}/record-merge-observation` writes.
+
+        On either hit the dispatch is SKIPPED, run completion is best-effort
+        re-evaluated, and the response is `200` with `already_merged: true`,
+        `merge_queued: false`, the run's `run_state` and a `message` naming
+        `POST /v0/runs/{run_id}/reconcile-merge` when the run is still
+        non-terminal. `merge_observation_recorded` is true ONLY when THIS call
+        successfully appended the row: false when the chain already carried
+        evidence, and false when the append itself failed — in which case the
+        merge is still NOT dispatched (it already happened) and the message
+        names `POST /v0/runs/{run_id}/record-merge-observation` as the recovery.
+
+        The forge read is BEST-EFFORT and FAIL-OPEN: every uncertainty — an
+        unresolvable target, no forge reader, a forge error, a not-merged
+        answer, a missing merge commit SHA or merge timestamp, or a chain-read
+        error — falls through to the dispatch exactly as before.
 
         **Authorization.** Operator-token-only. Requires `write:approvals`,
         enforced unconditionally (a cookie-session operator without the scope
@@ -9535,6 +9566,10 @@ paths:
                   verdict_sequence: { type: integer, format: int64, description: 'Audit sequence of the merge_verdict_recorded entry.' }
                   already_recorded: { type: boolean, description: 'True when a prior verdict row existed (an idempotent re-POST); no fresh row was appended.' }
                   pr_url: { type: string, description: 'The run pull request url the merge was queued for.' }
+                  already_merged: { type: boolean, description: 'True when the endpoint OBSERVED the pull/merge request was already merged and queued NO merge (E45.87 / #3622); merge_queued is false on that path. Omitted (false) on the ordinary dispatch path.' }
+                  merge_observation_recorded: { type: boolean, description: 'True ONLY when THIS call successfully appended the merge_observation_recorded audit row. False when the audit chain already carried merge evidence, and false when the append failed — the message then names POST /v0/runs/{run_id}/record-merge-observation as the recovery.' }
+                  run_state: { type: string, description: 'On the already_merged path, the run lifecycle state after the endpoint best-effort re-evaluated run completion. Empty when the re-read failed.' }
+                  message: { type: string, description: 'On the already_merged path, the operator-facing explanation: what was (or was not) recorded, and — on a still non-terminal run — POST /v0/runs/{run_id}/reconcile-merge as the settling verb.' }
         '400':
           description: |
             Malformed body or an empty `verdict`. Body's `error` is
@@ -9597,6 +9632,16 @@ paths:
             re-queues without duplicating the verdict. A checks-not-all-passed
             refusal is reported distinctly as `409 merge_checks_pending`, not
             here, so this 502 is never a remedy-that-cannot-work.
+
+            Before writing this 502 the endpoint RE-OBSERVES the forge once
+            (E45.87 / #3622), so a merge that landed in the observe-to-dispatch
+            window resolves as `200 already_merged: true` instead. A surviving
+            502 names the observed classification inline in the message
+            (`forge_merge_state=<state>`) and names the recovery:
+            `POST /v0/runs/{run_id}/record-merge-observation` to record the
+            merge observation, then `POST /v0/runs/{run_id}/reconcile-merge` to
+            settle the run. The existing `details` keys (`run_id`,
+            `verdict_sequence`) are unchanged.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

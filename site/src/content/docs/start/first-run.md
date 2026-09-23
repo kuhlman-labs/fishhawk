@@ -435,8 +435,10 @@ curl -s -X POST -H "Authorization: Bearer $FISHHAWK_TOKEN" \
 ```
 
 That records a `merge_verdict_recorded` audit entry and queues the squash merge
-through the same seam the delegated path uses. It is idempotent — a repeated
-post appends no duplicate verdict but re-queues the merge. It requires
+through the same seam the delegated path uses. Repeating the post never duplicates the verdict
+entry, and it is safe to repeat: the endpoint reads the merge state first, so a
+pull request that has already merged comes back as `already_merged` with no
+second merge queued. It requires
 `write:approvals`, which the default operator scope set from your token
 includes.
 
