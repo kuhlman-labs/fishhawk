@@ -5034,6 +5034,63 @@ func TestPlanGateEvidence_AuditCategorySeam(t *testing.T) {
 	}
 }
 
+// TestPlanGateEvidence_ForbiddenCriterionSeam is the #3620 cross-boundary seam
+// test: a real plan body → runSurfaceSweep → planGateEvidence → the rendered
+// plan-review prompt, asserting the UNENFORCEABLE CRITERION line survives all
+// four layers. A dropped ForbiddenPath/ForbiddenPattern copy in
+// planGateEvidence fails here (the MISSING SIBLINGS line would render instead)
+// while every per-layer unit still passes — this is counterfactual (c)'s
+// vehicle.
+func TestPlanGateEvidence_ForbiddenCriterionSeam(t *testing.T) {
+	s, _, runRow := newScopePrecheckServer(t, specImplementPathConstraints)
+	body := forbiddenCriterionPlanBody(t,
+		[]plan.ScopeFile{{Path: "backend/internal/server/foo.go", Operation: plan.FileOpModify}},
+		[]string{"the workflow gate is wired in `.github/workflows/ci.yml`"}, nil)
+
+	sweep := s.runSurfaceSweep(context.Background(), runRow.ID, runRow.ID, body)
+	if sweep == nil || len(sweep.Findings) != 1 || sweep.Findings[0].ForbiddenPattern != ".github/workflows/**" {
+		t.Fatalf("runSurfaceSweep = %+v, want one forbidden-criterion finding", sweep)
+	}
+
+	ev := planGateEvidence(nil, sweep, nil, nil, nil)
+	if ev == nil || ev.SurfaceSweep == nil || len(ev.SurfaceSweep.Findings) != 1 {
+		t.Fatalf("planGateEvidence produced no SurfaceSweep evidence: %+v", ev)
+	}
+	got := ev.SurfaceSweep.Findings[0]
+	if got.ForbiddenPattern != ".github/workflows/**" {
+		t.Fatalf("SurfaceSweepFindingEvidence.ForbiddenPattern = %q (a drop in planGateEvidence)", got.ForbiddenPattern)
+	}
+	if got.ForbiddenPath != ".github/workflows/ci.yml" {
+		t.Fatalf("SurfaceSweepFindingEvidence.ForbiddenPath = %q (a drop in planGateEvidence)", got.ForbiddenPath)
+	}
+
+	parsedPlan, err := plan.Parse(body)
+	if err != nil {
+		t.Fatalf("parse plan: %v", err)
+	}
+	rendered, err := prompt.Build("plan_review", prompt.Trigger{
+		Repo:             "x/y",
+		ApprovedPlan:     parsedPlan,
+		PlanGateEvidence: ev,
+	})
+	if err != nil {
+		t.Fatalf("prompt.Build: %v", err)
+	}
+	for _, want := range []string{
+		"UNENFORCEABLE CRITERION (acceptance criterion requires a forbidden path)",
+		`path ".github/workflows/ci.yml" named at acceptance_criteria[ac-1].statement`,
+		`the glob ".github/workflows/**"`,
+		`{pattern: "acceptance criterion requires a forbidden path", sibling: ".github/workflows/ci.yml"}`,
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Errorf("plan-review prompt missing %q:\n%s", want, rendered)
+		}
+	}
+	if strings.Contains(rendered, "MISSING SIBLINGS (acceptance criterion requires a forbidden path)") {
+		t.Errorf("forbidden-criterion finding must not render as a MISSING SIBLINGS line:\n%s", rendered)
+	}
+}
+
 // stageTransitionSummary reports whether rr recorded a transition of stageID to
 // failed carrying FailureCategory B, and whether any advancement transition
 // (awaiting_approval or succeeded) was recorded for it.

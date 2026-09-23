@@ -1498,10 +1498,17 @@ func TestBuild_Plan_SurfaceCouplingSiblingMap_Rendered(t *testing.T) {
 }
 
 // TestBuild_Plan_SurfaceSweepExemptionsGuidance_OmittedWithoutPatterns pins
-// the plan-stage guard (#1544): the surface_sweep_exemptions guidance rides
+// the plan-stage guard (#1544): the MISSING-SIBLING exemption guidance rides
 // inside the SurfaceCouplingPatterns block, so a build that threads no
 // patterns (every non-plan build) never renders it — keeping those prompts
 // byte-unchanged.
+//
+// It asserts the coupling block's OWN wording, not a bare occurrence of the
+// `surface_sweep_exemptions` token: since #3620 the plan prompt's
+// Unenforceable-criteria rule names that same field UNCONDITIONALLY (it is the
+// exemption channel for a prose-triggered rule that has no sibling map), so a
+// token-level assertion would no longer pin what this test exists to pin. The
+// #1544 claim is unchanged for the block it guards.
 func TestBuild_Plan_SurfaceSweepExemptionsGuidance_OmittedWithoutPatterns(t *testing.T) {
 	got, err := Build("plan", Trigger{
 		IssueNumber: 1544,
@@ -1511,8 +1518,13 @@ func TestBuild_Plan_SurfaceSweepExemptionsGuidance_OmittedWithoutPatterns(t *tes
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
-	if strings.Contains(got, "surface_sweep_exemptions") {
-		t.Errorf("surface_sweep_exemptions guidance must be omitted when no patterns are threaded:\n%s", got)
+	for _, absent := range []string{
+		"declare that as a machine-readable top-level surface_sweep_exemptions entry",
+		`{"pattern": "<the pattern name above>", "sibling": "<the sibling path>"`,
+	} {
+		if strings.Contains(got, absent) {
+			t.Errorf("missing-sibling exemption guidance %q must be omitted when no patterns are threaded:\n%s", absent, got)
+		}
 	}
 }
 
@@ -4063,6 +4075,89 @@ func TestBuild_PlanReview_GateEvidence_AuditCategoryRenders(t *testing.T) {
 	}
 	if strings.Contains(legacy, "NEW AUDIT CATEGORY") {
 		t.Errorf("empty-Category finding must not render the audit-category line:\n%s", legacy)
+	}
+}
+
+// TestBuild_PlanReview_GateEvidence_ForbiddenCriterionRenders pins the #3620
+// render branch. Per binding approval condition 1 it asserts the FULL
+// UNENFORCEABLE CRITERION line — the criterion location, the token, the glob,
+// the two-merge-request escape sentence and the exemption key — as one exact
+// contiguous string, so a comment-only or partial touch of the renderer fails.
+// The legacy control asserts a finding with an empty ForbiddenPattern renders
+// the pre-existing MISSING SIBLINGS bytes unchanged.
+func TestBuild_PlanReview_GateEvidence_ForbiddenCriterionRenders(t *testing.T) {
+	build := func(f SurfaceSweepFindingEvidence) string {
+		t.Helper()
+		got, err := Build("plan_review", Trigger{
+			Repo:         "x/y",
+			ApprovedPlan: fixturePlan(),
+			PlanGateEvidence: &PlanGateEvidence{
+				SurfaceSweep: &SurfaceSweepEvidence{ScannedFiles: 1, Findings: []SurfaceSweepFindingEvidence{f}},
+			},
+		})
+		if err != nil {
+			t.Fatalf("Build: %v", err)
+		}
+		return got
+	}
+
+	withForbidden := build(SurfaceSweepFindingEvidence{
+		Pattern:          "acceptance criterion requires a forbidden path",
+		TriggerPath:      `path ".fishhawk/workflows.yaml" named at acceptance_criteria[ac-2].statement`,
+		ForbiddenPath:    ".fishhawk/workflows.yaml",
+		ForbiddenPattern: ".fishhawk/**",
+	})
+	const wantLine = "- UNENFORCEABLE CRITERION (acceptance criterion requires a forbidden path): " +
+		"path \".fishhawk/workflows.yaml\" named at acceptance_criteria[ac-2].statement, " +
+		"and the implement stage's forbidden_paths constraint forbids it via the glob \".fishhawk/**\". " +
+		"The implement agent structurally CANNOT satisfy this criterion — forbidden_paths is enforced against the real diff, " +
+		"so every review round will re-raise it. " +
+		"Operator escape: land the in-repository half in this merge request and edit the forbidden governance file by hand in a second one; " +
+		"an acceptance criterion should not demand both in one run. " +
+		"If this criterion does not in fact require editing \".fishhawk/workflows.yaml\", " +
+		"declare a surface_sweep_exemptions entry {pattern: \"acceptance criterion requires a forbidden path\", sibling: \".fishhawk/workflows.yaml\"}.\n"
+	if !strings.Contains(withForbidden, wantLine) {
+		t.Errorf("plan_review prompt missing the full UNENFORCEABLE CRITERION line:\nwant %q\n%s", wantLine, withForbidden)
+	}
+	if strings.Contains(withForbidden, "MISSING SIBLINGS") || strings.Contains(withForbidden, "NEW AUDIT CATEGORY") {
+		t.Errorf("a ForbiddenPattern finding must render neither sibling line:\n%s", withForbidden)
+	}
+
+	// Empty ForbiddenPattern: the legacy render, byte-identical.
+	legacy := build(SurfaceSweepFindingEvidence{
+		Pattern:         "actor @-mention render surfaces",
+		TriggerPath:     "backend/internal/issuecomment/status_template.go",
+		MissingSiblings: []string{"backend/internal/issuecomment/notifier.go"},
+	})
+	const wantLegacy = "- MISSING SIBLINGS (actor @-mention render surfaces): backend/internal/issuecomment/status_template.go is in scope but the pattern's required sibling(s) are absent from scope.files: backend/internal/issuecomment/notifier.go\n"
+	if !strings.Contains(legacy, wantLegacy) {
+		t.Errorf("empty-ForbiddenPattern finding must render the legacy line:\nwant %q\n%s", wantLegacy, legacy)
+	}
+	if strings.Contains(legacy, "UNENFORCEABLE CRITERION") {
+		t.Errorf("empty-ForbiddenPattern finding must not render the forbidden-criterion line:\n%s", legacy)
+	}
+}
+
+// TestBuild_Plan_UnenforceableCriteriaGuidance is binding approval condition 2:
+// the planner-facing authoring guidance must reach the PLAN prompt, not only
+// the plan-review render — the defect the #3620 rule detects is cheapest to
+// avoid at authoring time. It also asserts the plan_review prompt does NOT
+// carry the planner-facing paragraph, so the two surfaces stay distinct.
+func TestBuild_Plan_UnenforceableCriteriaGuidance(t *testing.T) {
+	got, err := Build("plan", Trigger{Repo: "x/y", IssueNumber: 1, IssueTitle: "t", IssueBody: "b"})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, want := range []string{
+		"Unenforceable-criteria rule:",
+		"the implement stage's `forbidden_paths` constraint is enforced against the REAL diff",
+		"lands as TWO merge requests",
+		"`acceptance criterion requires a forbidden path`",
+		"UNENFORCEABLE CRITERION finding on the plan-review gate evidence",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("plan prompt missing authoring guidance %q:\n%s", want, got)
+		}
 	}
 }
 
@@ -12011,6 +12106,17 @@ var groomingProseMarkers = []string{
 // out_of_scope paragraph, and the all-skip paragraph's pointer at the
 // declaration (a 4-deletion / 5-insertion diff in the golden) — and nothing
 // else; both anti-vacuity guards below still hold.
+//
+// REGENERATED A FOURTH TIME at E45.85 / #3620, which DELIBERATELY added the
+// planner-facing Unenforceable-criteria rule to the acceptance-criteria
+// authoring section — the paragraph warning that a criterion naming an
+// implement-stage `forbidden_paths` path is unsatisfiable, and naming the
+// two-merge-request escape and the new plan-gate check. The regeneration is a
+// verifiable SINGLE-LINE INSERTION in the golden's diff (0 deletions) and
+// touched nothing else; both anti-vacuity guards below still hold. The
+// paragraph's own presence on the plan prompt is pinned independently by
+// TestBuild_Plan_UnenforceableCriteriaGuidance, so this golden is a
+// no-other-drift pin rather than the primary evidence for it.
 //
 // Two anti-vacuity guards keep a wrongly-captured golden from passing:
 //   - the golden must contain NONE of groomingProseMarkers, so a golden

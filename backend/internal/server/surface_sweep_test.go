@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -1137,3 +1138,183 @@ func lastSurfaceSweepRaw(t *testing.T, au *auditFake) string {
 	}
 	return raws[0]
 }
+
+// forbiddenCriterionPlanBody builds a schema-valid flat plan carrying the given
+// scope.files, one acceptance criterion per statement, and optional
+// surface_sweep_exemptions (#3620).
+func forbiddenCriterionPlanBody(t *testing.T, files []plan.ScopeFile, statements []string, exemptions []plan.SurfaceSweepExemption) []byte {
+	t.Helper()
+	fileMaps := make([]any, 0, len(files))
+	for _, f := range files {
+		fileMaps = append(fileMaps, map[string]any{"path": f.Path, "operation": string(f.Operation)})
+	}
+	criteria := make([]any, 0, len(statements))
+	for i, st := range statements {
+		criteria = append(criteria, map[string]any{
+			"id":          fmt.Sprintf("ac-%d", i+1),
+			"statement":   st,
+			"source":      "explicit",
+			"verify_hint": "GET /v0/runs/{run_id}/audit carries the entry",
+		})
+	}
+	m := planfixture.Valid(func(p map[string]any) {
+		p["scope"] = map[string]any{"files": fileMaps}
+		p["verification"] = map[string]any{
+			"test_strategy":       "Run the tests.",
+			"rollback_plan":       "Revert the PR.",
+			"acceptance_criteria": criteria,
+		}
+		if len(exemptions) > 0 {
+			exMaps := make([]any, 0, len(exemptions))
+			for _, e := range exemptions {
+				exMaps = append(exMaps, map[string]any{"pattern": e.Pattern, "sibling": e.Sibling, "reason": e.Reason})
+			}
+			p["surface_sweep_exemptions"] = exMaps
+		}
+	})
+	body, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	if err := plan.Validate(body); err != nil {
+		t.Fatalf("fixture plan does not validate: %v", err)
+	}
+	return body
+}
+
+// TestRunSurfaceSweep_ForbiddenCriterionFinding is the #3620 done-means test on
+// the REAL wiring: a plan whose acceptance criterion names a path the run's
+// cached workflow spec forbids the implement stage from touching draws the
+// finding through runSurfaceSweep AND the PERSISTED plan_surface_sweep payload
+// carries it with the forbidden_pattern / forbidden_path keys; a clean plan
+// draws none and the payload carries NEITHER key (existing payloads stay
+// byte-identical); a run with no workflow spec still records its entry with no
+// forbidden-criterion finding (the fail-open contract).
+func TestRunSurfaceSweep_ForbiddenCriterionFinding(t *testing.T) {
+	foo := plan.ScopeFile{Path: "backend/internal/server/foo.go", Operation: plan.FileOpModify}
+
+	t.Run("finding", func(t *testing.T) {
+		s, au, runRow := newScopePrecheckServer(t, specImplementPathConstraints)
+		body := forbiddenCriterionPlanBody(t, []plan.ScopeFile{foo},
+			[]string{"the workflow gate is wired in `.github/workflows/ci.yml`"}, nil)
+
+		got := s.runSurfaceSweep(context.Background(), runRow.ID, runRow.ID, body)
+		if got == nil {
+			t.Fatal("want a non-nil result")
+		}
+		if len(got.Findings) != 1 {
+			t.Fatalf("want 1 finding, got %+v", got.Findings)
+		}
+		f := got.Findings[0]
+		if f.Pattern != "acceptance criterion requires a forbidden path" ||
+			f.ForbiddenPath != ".github/workflows/ci.yml" ||
+			f.ForbiddenPattern != ".github/workflows/**" ||
+			f.TriggerPath != `path ".github/workflows/ci.yml" named at acceptance_criteria[ac-1].statement` ||
+			f.SubPlanTitle != "" || f.Category != "" || len(f.MissingSiblings) != 0 {
+			t.Errorf("finding = %+v", f)
+		}
+		raw := lastSurfaceSweepRaw(t, au)
+		for _, want := range []string{
+			`"pattern":"acceptance criterion requires a forbidden path"`,
+			`"forbidden_pattern":".github/workflows/**"`,
+			`"forbidden_path":".github/workflows/ci.yml"`,
+			`acceptance_criteria[ac-1].statement`,
+		} {
+			if !strings.Contains(raw, want) {
+				t.Errorf("persisted payload missing %q:\n%s", want, raw)
+			}
+		}
+	})
+
+	t.Run("clean plan → no finding, neither key in the payload", func(t *testing.T) {
+		s, au, runRow := newScopePrecheckServer(t, specImplementPathConstraints)
+		body := forbiddenCriterionPlanBody(t, []plan.ScopeFile{foo},
+			[]string{"GET /v0/runs/{run_id} returns the field wired in backend/internal/server/reads.go"}, nil)
+
+		got := s.runSurfaceSweep(context.Background(), runRow.ID, runRow.ID, body)
+		if got == nil || len(got.Findings) != 0 {
+			t.Fatalf("want zero findings, got %+v", got)
+		}
+		raw := lastSurfaceSweepRaw(t, au)
+		for _, absent := range []string{`"forbidden_pattern"`, `"forbidden_path"`} {
+			if strings.Contains(raw, absent) {
+				t.Errorf("clean payload must carry no %s key:\n%s", absent, raw)
+			}
+		}
+		if want := `"findings":[]`; !strings.Contains(raw, want) {
+			t.Errorf("clean payload missing %s:\n%s", want, raw)
+		}
+	})
+
+	t.Run("exemption → applied, no finding", func(t *testing.T) {
+		s, _, runRow := newScopePrecheckServer(t, specImplementPathConstraints)
+		body := forbiddenCriterionPlanBody(t, []plan.ScopeFile{foo},
+			[]string{"the workflow gate is wired in `.github/workflows/ci.yml`"},
+			[]plan.SurfaceSweepExemption{{
+				Pattern: "acceptance criterion requires a forbidden path",
+				Sibling: ".github/workflows/ci.yml",
+				Reason:  "the criterion asserts the rendered doc NAMES the file",
+			}})
+
+		got := s.runSurfaceSweep(context.Background(), runRow.ID, runRow.ID, body)
+		if got == nil || len(got.Findings) != 0 {
+			t.Fatalf("want zero findings, got %+v", got)
+		}
+		if len(got.AppliedExemptions) != 1 ||
+			got.AppliedExemptions[0].Pattern != "acceptance criterion requires a forbidden path" ||
+			got.AppliedExemptions[0].Sibling != ".github/workflows/ci.yml" ||
+			got.AppliedExemptions[0].Reason != "the criterion asserts the rendered doc NAMES the file" {
+			t.Errorf("applied = %+v", got.AppliedExemptions)
+		}
+	})
+
+	t.Run("fail-open: no workflow spec → entry recorded, no forbidden-criterion finding", func(t *testing.T) {
+		s, au, runRow := newScopePrecheckServer(t, nil) // resolveImplementConstraints returns ok=false.
+		body := forbiddenCriterionPlanBody(t, []plan.ScopeFile{foo},
+			[]string{"the workflow gate is wired in `.github/workflows/ci.yml`"}, nil)
+
+		got := s.runSurfaceSweep(context.Background(), runRow.ID, runRow.ID, body)
+		if got == nil {
+			t.Fatal("the sweep must still run when the spec read fails open")
+		}
+		if len(got.Findings) != 0 {
+			t.Fatalf("want zero findings on the fail-open path, got %+v", got.Findings)
+		}
+		if raw := lastSurfaceSweepRaw(t, au); !strings.Contains(raw, `"findings":[]`) {
+			t.Errorf("fail-open path must still record the entry:\n%s", raw)
+		}
+	})
+
+	t.Run("fail-open: spec with no forbidden_paths → no finding", func(t *testing.T) {
+		s, _, runRow := newScopePrecheckServer(t, specNoForbiddenPaths)
+		body := forbiddenCriterionPlanBody(t, []plan.ScopeFile{foo},
+			[]string{"the workflow gate is wired in `.github/workflows/ci.yml`"}, nil)
+
+		got := s.runSurfaceSweep(context.Background(), runRow.ID, runRow.ID, body)
+		if got == nil || len(got.Findings) != 0 {
+			t.Fatalf("want zero findings when the implement stage configures no forbidden_paths, got %+v", got)
+		}
+	})
+}
+
+// specNoForbiddenPaths is a feature_change workflow whose implement stage
+// resolves (ok=true) but configures NO forbidden_paths, so the
+// forbidden-criterion rule is skipped on the empty-list branch.
+var specNoForbiddenPaths = []byte(`version: "0.3"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        constraints:
+          - max_files_changed: 3
+`)
