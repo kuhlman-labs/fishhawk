@@ -6963,6 +6963,319 @@ func TestRun_ImplementStage_NoPR_RefusesSharedBranchPushPaths(t *testing.T) {
 	}
 }
 
+// TestRun_GitLabPushCredentialPreflight pins the E45.82 / #3617 startup
+// refusal: an implement stage that WILL push on the gitlab forge resolves
+// FISHHAWK_GITLAB_TOKEN at prompt-fetch time and refuses with a named reason
+// BEFORE the agent runs, instead of failing at mintImplementToken after a
+// complete paid agent pass.
+//
+// It drives the REAL run() with fakeInvoker / fakeUploader / fakeGitOps, and
+// asserts the SHIPPED observable on both sides of the predicate: a refused
+// stage exits non-zero with "reason":"gitlab_push_credential_missing" and
+// fi.callIdx == 0 (zero agent passes burned, which is the whole point), and an
+// admitted stage reaches the agent with no refusal line. Every branch of
+// gitLabPushCredentialRequired gets its own case, in BOTH directions.
+func TestRun_GitLabPushCredentialPreflight(t *testing.T) {
+	const parentRunID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+	const stageID = "22222222-3333-4444-5555-666666666666"
+	cases := []struct {
+		name           string
+		stageType      string
+		gitlab         bool
+		token          string
+		noPR           bool
+		fixup          bool
+		fixupBranch    string
+		decomposedFrom string
+		// ciEnv seeds the runner-channel detection vars. The preflight is
+		// channel-BLIND by design, so a gitlab_ci job is refused identically.
+		ciEnv          map[string]string
+		wantRunnerKind string
+		wantRefused    bool
+		// admittedExit is the exit code an ADMITTED case settles on; the zero
+		// value is exitOK. The acceptance case sets exitFailure because that
+		// stage type then fails on an unrelated fixture gap (no verdict file) —
+		// what this table asserts there is that it got PAST the preflight and
+		// reached the agent, which the refusal-absence and callIdx checks pin.
+		admittedExit int
+	}{
+		{
+			// (a) The issue's case: a local gitlab implement stage with the
+			// runner credential unset. Refused, zero agent passes.
+			name: "gitlab_implement_token_unset_refused", stageType: "implement",
+			gitlab: true, wantRunnerKind: runnerKindLocal, wantRefused: true,
+		},
+		{
+			// (b) The same stage WITH the credential: admitted, agent runs.
+			name: "gitlab_implement_token_set_admitted", stageType: "implement",
+			gitlab: true, token: "glpat-present", wantRunnerKind: runnerKindLocal,
+		},
+		{
+			// (c) A standalone --no-pr implement never pushes, so it must not be
+			// refused for a credential it does not need.
+			name: "gitlab_implement_no_pr_admitted", stageType: "implement",
+			gitlab: true, noPR: true, wantRunnerKind: runnerKindLocal,
+		},
+		{
+			// (d) A plan stage never mints the push credential.
+			name: "gitlab_plan_admitted", stageType: "plan",
+			gitlab: true, wantRunnerKind: runnerKindLocal,
+		},
+		{
+			// (e) Nor does an acceptance stage.
+			name: "gitlab_acceptance_admitted", stageType: "acceptance",
+			gitlab: true, wantRunnerKind: runnerKindLocal, admittedExit: exitFailure,
+		},
+		{
+			// (f) The guard is FORGE-scoped: a github implement stage with the
+			// GitLab variable unset mints from the App broker and is admitted.
+			name: "github_implement_token_unset_admitted", stageType: "implement",
+			wantRunnerKind: runnerKindLocal,
+		},
+		{
+			// (g) A fix-up pass is an implement stage that pushes: refused.
+			name: "gitlab_fixup_token_unset_refused", stageType: "implement",
+			gitlab: true, fixup: true, fixupBranch: "fishhawk/run-11111111/stage-22222222",
+			wantRunnerKind: runnerKindLocal, wantRefused: true,
+		},
+		{
+			// (h) So is a decomposition child.
+			name: "gitlab_decomposed_child_token_unset_refused", stageType: "implement",
+			gitlab: true, decomposedFrom: parentRunID,
+			wantRunnerKind: runnerKindLocal, wantRefused: true,
+		},
+		{
+			// (i) BINDING CONDITION 1: the preflight is runner-CHANNEL-blind. A
+			// gitlab_ci job whose FISHHAWK_GITLAB_TOKEN CI/CD variable is missing
+			// would fail at the push exactly as a local runner does, and the
+			// runner reads it through the same os.Getenv there — so it is refused
+			// identically. wantRunnerKind pins that this case really IS the
+			// gitlab_ci channel, so the case cannot silently degrade to (a).
+			name: "gitlab_ci_channel_implement_token_unset_refused", stageType: "implement",
+			gitlab:         true,
+			ciEnv:          map[string]string{"GITLAB_CI": "true", "CI_PIPELINE_ID": "4242"},
+			wantRunnerKind: runnerKindGitLabCI, wantRefused: true,
+		},
+		{
+			// (j) The same gitlab_ci job WITH the variable set is admitted, so
+			// (i)'s RED is the credential and not the channel.
+			name: "gitlab_ci_channel_implement_token_set_admitted", stageType: "implement",
+			gitlab: true, token: "glpat-ci-present",
+			ciEnv:          map[string]string{"GITLAB_CI": "true", "CI_PIPELINE_ID": "4242"},
+			wantRunnerKind: runnerKindGitLabCI,
+		},
+		{
+			// (k) A whitespace-only value is NOT a credential (the deliberate
+			// tightening #3617 adds to the shared resolver).
+			name: "gitlab_implement_token_whitespace_refused", stageType: "implement",
+			gitlab: true, token: "   ", wantRunnerKind: runnerKindLocal, wantRefused: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			implementEnv(t, "group/project", "main")
+			// The channel vars are cleared unconditionally so a CI host running
+			// this suite (GitHub Actions exports GITHUB_ACTIONS=true) cannot
+			// perturb wantRunnerKind.
+			t.Setenv("GITHUB_ACTIONS", "")
+			t.Setenv("GITHUB_RUN_ID", "")
+			t.Setenv("GITLAB_CI", "")
+			t.Setenv("CI_PIPELINE_ID", "")
+			for k, v := range tc.ciEnv {
+				t.Setenv(k, v)
+			}
+			t.Setenv(gitLabPushCredentialEnv, tc.token)
+			if got := detectRunnerKind(os.Getenv); got != tc.wantRunnerKind {
+				t.Fatalf("runner channel = %q, want %q — the case's premise does not hold", got, tc.wantRunnerKind)
+			}
+
+			fi := &fakeInvoker{canned: agent.Result{OK: true}}
+			withFakeInvoker(t, fi)
+			withFakeRemoteBranchExists(t, false)
+			fu := newFakeUploader(t)
+			fu.promptResp = &upload.FetchedPrompt{
+				StageID:             stageID,
+				StageType:           tc.stageType,
+				Prompt:              "do the thing",
+				PromptHash:          "h",
+				DecomposedFromRunID: tc.decomposedFrom,
+				Fixup:               tc.fixup,
+				FixupBranch:         tc.fixupBranch,
+			}
+			withFakeUploader(t, fu)
+			withFakeGitOps(t, &fakePusher{}, &fakePROpener{})
+			fmr := &fakeMROpener{}
+			origMR := newMROpener
+			newMROpener = func(string, string) mrOpener { return fmr }
+			t.Cleanup(func() { newMROpener = origMR })
+
+			args := []string{
+				"--run-id", "11111111-2222-3333-4444-555555555555",
+				"--backend-url", "https://api.fishhawk.test",
+				"--workflow", "feature_change", "--stage", tc.stageType,
+				"--stage-id", stageID,
+				"--fetch-prompt", "--upload-trace",
+			}
+			if tc.gitlab {
+				args = append(args, "--forge", "gitlab", "--gitlab-base-url", "https://gitlab.test")
+			}
+			if tc.noPR {
+				args = append(args, "--no-pr")
+			}
+			var stderr strings.Builder
+			got := run(args, &stderr)
+
+			if tc.wantRefused {
+				if got != exitFailure {
+					t.Errorf("run = %d, want exitFailure (the preflight refusal):\n%s", got, stderr.String())
+				}
+				if !strings.Contains(stderr.String(), `"reason":"gitlab_push_credential_missing"`) {
+					t.Errorf("missing the named refusal reason:\n%s", stderr.String())
+				}
+				// The detail must stay ACTIONABLE — the operator has to learn
+				// WHICH variable and WHICH scope from this one line.
+				if !strings.Contains(stderr.String(), gitLabPushCredentialEnv) {
+					t.Errorf("refusal detail must name %s:\n%s", gitLabPushCredentialEnv, stderr.String())
+				}
+				if !strings.Contains(stderr.String(), "`api` scope") {
+					t.Errorf("refusal detail must name the required `api` scope:\n%s", stderr.String())
+				}
+				// ZERO agent passes burned: the entire value of moving the
+				// resolution to prompt-fetch time.
+				if fi.callIdx != 0 {
+					t.Errorf("agent invoked %d times, want 0 — the refusal must fire before the agent", fi.callIdx)
+				}
+				if len(fu.gotShipCalls) != 0 {
+					t.Errorf("shipped %d traces, want 0 — the refusal must fire before any work is done", len(fu.gotShipCalls))
+				}
+				return
+			}
+
+			if got != tc.admittedExit {
+				t.Fatalf("run = %d, want %d (this path must NOT be refused by the preflight):\n%s", got, tc.admittedExit, stderr.String())
+			}
+			if strings.Contains(stderr.String(), "gitlab_push_credential_missing") {
+				t.Errorf("an admitted path must not emit the refusal:\n%s", stderr.String())
+			}
+			if fi.callIdx == 0 {
+				t.Error("agent was never invoked on an admitted path")
+			}
+			// The credential is resolved SILENTLY: no token value, length or
+			// prefix may reach the log on the success path.
+			if tc.token != "" && strings.Contains(stderr.String(), strings.TrimSpace(tc.token)) {
+				t.Errorf("the token value leaked into the runner log:\n%s", stderr.String())
+			}
+		})
+	}
+}
+
+// TestResolveGitLabPushToken is the direct unit table for the shared resolver
+// both the preflight and mintImplementToken call. The whitespace-only case is
+// the deliberate tightening #3617 adds: before it, `tok == ""` admitted " " as
+// a credential and the push failed opaquely at the remote.
+func TestResolveGitLabPushToken(t *testing.T) {
+	cases := []struct {
+		name    string
+		value   string
+		wantTok string
+		wantErr bool
+	}{
+		{name: "set_returns_verbatim", value: "glpat-abc123", wantTok: "glpat-abc123"},
+		{name: "unset_fails_closed", value: "", wantErr: true},
+		{name: "whitespace_only_fails_closed", value: " \t\n ", wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := resolveGitLabPushToken(func(name string) string {
+				if name != gitLabPushCredentialEnv {
+					t.Errorf("read %q, want %q", name, gitLabPushCredentialEnv)
+				}
+				return tc.value
+			})
+			if tc.wantErr {
+				if !errors.Is(err, errGitLabPushCredentialMissing) {
+					t.Fatalf("err = %v, want errGitLabPushCredentialMissing", err)
+				}
+				if got != "" {
+					t.Errorf("token = %q, want empty on the failure path", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolveGitLabPushToken: %v", err)
+			}
+			if got != tc.wantTok {
+				t.Errorf("token = %q, want %q returned verbatim", got, tc.wantTok)
+			}
+		})
+	}
+}
+
+// TestGitLabPushCredentialRequired pins the pure predicate per branch, so the
+// scoping claim in its doc comment is machine-checked rather than argued.
+func TestGitLabPushCredentialRequired(t *testing.T) {
+	cases := []struct {
+		name      string
+		stageType string
+		cfg       config
+		want      bool
+	}{
+		{name: "gitlab_implement", stageType: "implement", cfg: config{forge: forgeGitLab}, want: true},
+		{name: "gitlab_implement_no_pr", stageType: "implement", cfg: config{forge: forgeGitLab, noPR: true}},
+		{name: "gitlab_plan", stageType: "plan", cfg: config{forge: forgeGitLab}},
+		{name: "gitlab_acceptance", stageType: "acceptance", cfg: config{forge: forgeGitLab}},
+		{name: "github_implement", stageType: "implement", cfg: config{forge: forgeGitHub}},
+		{name: "empty_forge_implement", stageType: "implement", cfg: config{}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := gitLabPushCredentialRequired(tc.stageType, tc.cfg); got != tc.want {
+				t.Errorf("gitLabPushCredentialRequired(%q, %+v) = %v, want %v", tc.stageType, tc.cfg, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestMintImplementToken_GitLab_SharesPreflightError is the STRUCTURAL half of
+// the "same actionable error" claim: the late mint and the early preflight do
+// not carry two copies of the message that could drift — they return the SAME
+// error value, because both call resolveGitLabPushToken.
+func TestMintImplementToken_GitLab_SharesPreflightError(t *testing.T) {
+	t.Setenv(gitLabPushCredentialEnv, "")
+	cfg := config{forge: forgeGitLab, runID: "run-1", stageID: "stage-1"}
+	var logSink strings.Builder
+	_, mintErr := mintImplementToken(context.Background(), cfg, nil, nil, &logSink)
+	if mintErr == nil {
+		t.Fatal("expected an error from the mint path when the credential is unset")
+	}
+	_, preflightErr := resolveGitLabPushToken(os.Getenv)
+	if preflightErr == nil {
+		t.Fatal("expected an error from the preflight resolver when the credential is unset")
+	}
+	if !errors.Is(mintErr, errGitLabPushCredentialMissing) || !errors.Is(preflightErr, errGitLabPushCredentialMissing) {
+		t.Fatalf("mint err = %v, preflight err = %v; both must be errGitLabPushCredentialMissing", mintErr, preflightErr)
+	}
+	if mintErr.Error() != preflightErr.Error() {
+		t.Errorf("the two surfaces drifted:\n mint:      %s\n preflight: %s", mintErr, preflightErr)
+	}
+}
+
+// TestMintImplementToken_GitLab_RejectsWhitespaceToken pins the tightening on
+// the MINT path specifically (the preflight is only reached on the run()
+// entry point): a whitespace-only FISHHAWK_GITLAB_TOKEN is refused, not handed
+// to the push as a credential.
+func TestMintImplementToken_GitLab_RejectsWhitespaceToken(t *testing.T) {
+	t.Setenv(gitLabPushCredentialEnv, "   ")
+	cfg := config{forge: forgeGitLab, runID: "run-1", stageID: "stage-1"}
+	var logSink strings.Builder
+	if _, err := mintImplementToken(context.Background(), cfg, nil, nil, &logSink); !errors.Is(err, errGitLabPushCredentialMissing) {
+		t.Fatalf("err = %v, want errGitLabPushCredentialMissing for a whitespace-only token", err)
+	}
+	if strings.Contains(logSink.String(), "installation_token_received") {
+		t.Errorf("a refused token must not log a received installation token:\n%s", logSink.String())
+	}
+}
+
 // TestRun_StampsRunnerKindOnManifestsAndStartup asserts the load-bearing
 // runner-side wiring (#1346 / ADR-045, binding condition #2): PackInputs
 // .RunnerKind is set from detectRunnerKind(os.Getenv) onto BOTH the raw and

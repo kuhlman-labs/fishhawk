@@ -3,6 +3,9 @@ package mcpserver
 import (
 	"context"
 	"encoding/json"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -1346,6 +1349,327 @@ func TestDoctorToolDescription_DescribesTraceStore(t *testing.T) {
 		"other (a non-S3",
 		"NEVER cascades",
 		"NOT the same claim as configured:false",
+	} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("fishhawk_doctor description lacks %q", want)
+		}
+	}
+}
+
+// --- runner_credentials rung (E45.82 / #3617) ---
+
+// runnerCredsSentinel is a distinctive value seeded as the env token so the
+// redaction assertions cannot pass by accident: it appears NOWHERE else in the
+// package, so any occurrence in the marshalled rung is a real echo.
+const runnerCredsSentinel = "glpat-SENTINEL-NEVER-ECHOED"
+
+// TestRunnerCredentials_BranchPerStatus pins one case per named branch of the
+// resolver. The seeding is BY CONSTRUCTION (a forge literal and a map with or
+// without the key), never by calling the control inside the setup, so a RED
+// under the control's deletion lands on the status assertion.
+func TestRunnerCredentials_BranchPerStatus(t *testing.T) {
+	cases := []struct {
+		name            string
+		forge           string
+		env             map[string]string
+		nilGetenv       bool
+		wantStatus      string
+		wantRemediation bool
+	}{
+		{
+			name: "gitlab_token_present", forge: "gitlab",
+			env:        map[string]string{gitLabRunnerPushCredentialEnv: runnerCredsSentinel},
+			wantStatus: runnerCredentialPresent,
+		},
+		{
+			name: "gitlab_token_absent", forge: "gitlab",
+			env:        map[string]string{},
+			wantStatus: runnerCredentialMissing, wantRemediation: true,
+		},
+		{
+			// Whitespace-only is not a credential — the same tightening the
+			// runner's resolveGitLabPushToken applies.
+			name: "gitlab_token_whitespace_only", forge: "gitlab",
+			env:        map[string]string{gitLabRunnerPushCredentialEnv: "   \t "},
+			wantStatus: runnerCredentialMissing, wantRemediation: true,
+		},
+		{
+			name: "github_not_applicable", forge: "github",
+			env:        map[string]string{gitLabRunnerPushCredentialEnv: runnerCredsSentinel},
+			wantStatus: runnerCredentialNotApplicable,
+		},
+		{
+			// An older fishhawkd serves no `forge` key: applicability could not
+			// be decided, which is NOT a finding that the credential is missing.
+			name: "empty_forge_unknown", forge: "",
+			env:        map[string]string{},
+			wantStatus: runnerCredentialUnknown,
+		},
+		{
+			name: "unrecognised_forge_unknown", forge: "bitbucket",
+			env:        map[string]string{},
+			wantStatus: runnerCredentialUnknown,
+		},
+		{
+			// A nil getenv must not panic; it reads as unset.
+			name: "gitlab_nil_getenv_missing", forge: "gitlab", nilGetenv: true,
+			wantStatus: runnerCredentialMissing, wantRemediation: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			getenv := envFuncFromMap(tc.env)
+			if tc.nilGetenv {
+				getenv = nil
+			}
+			got := runnerCredentials(tc.forge, getenv)
+			if got == nil {
+				t.Fatal("runnerCredentials returned nil — the rung is rendered on every branch")
+			}
+			if got.Status != tc.wantStatus {
+				t.Errorf("status = %q, want %q", got.Status, tc.wantStatus)
+			}
+			if (got.Remediation != "") != tc.wantRemediation {
+				t.Errorf("remediation = %q, want present=%v", got.Remediation, tc.wantRemediation)
+			}
+			if got.Note == "" {
+				t.Error("every branch must carry a human note")
+			}
+			// BINDING CONDITION 2: the scope sentence bounds the claim on EVERY
+			// branch — it is the MCP server's spawning environment (local
+			// runner) and says nothing about gitlab_ci.
+			if got.Scope != runnerCredentialsScope {
+				t.Errorf("scope = %q, want the fixed sentence", got.Scope)
+			}
+			for _, want := range []string{"local runner", "gitlab_ci", "PRESENCE only"} {
+				if !strings.Contains(got.Scope, want) {
+					t.Errorf("scope sentence lacks %q: %s", want, got.Scope)
+				}
+			}
+			// REDACTION: the rung must never echo the token value, on any
+			// branch. Marshalled, not field-by-field, so a future field is
+			// covered automatically.
+			encoded, err := json.Marshal(got)
+			if err != nil {
+				t.Fatalf("marshal rung: %v", err)
+			}
+			if strings.Contains(string(encoded), runnerCredsSentinel) {
+				t.Errorf("the rung echoed the token value:\n%s", encoded)
+			}
+		})
+	}
+}
+
+// TestRunnerCredentials_VariableIsTheRunnerLiteral pins the duplicated env-var
+// name. The runner and backend are separate modules with no import edge, so
+// this literal is the cross-module contract: a rename on the runner side must
+// redden here rather than silently decouple the rung from the runner.
+func TestRunnerCredentials_VariableIsTheRunnerLiteral(t *testing.T) {
+	for _, forge := range []string{"gitlab", "github", ""} {
+		got := runnerCredentials(forge, envFuncFromMap(nil))
+		if got.Variable != "FISHHAWK_GITLAB_TOKEN" {
+			t.Errorf("forge %q: variable = %q, want the literal FISHHAWK_GITLAB_TOKEN", forge, got.Variable)
+		}
+		// The near-identical DAEMON variable must never be named as THIS
+		// rung's variable (the #3617 near-miss).
+		if got.Variable == "FISHHAWKD_GITLAB_TOKEN" {
+			t.Errorf("forge %q: the rung names the DAEMON credential", forge)
+		}
+	}
+}
+
+// TestDoctor_RunnerCredentials_PopulatedAndReportUnchanged is the end-to-end
+// check through the real handler: a gitlab-family report yields a populated
+// runner_credentials SIBLING key, and `report` stays the byte-mirror of what
+// the backend served — the cross-boundary proof that the new key did not
+// perturb the backend-body mirror.
+func TestDoctor_RunnerCredentials_PopulatedAndReportUnchanged(t *testing.T) {
+	const served = `{"repo": "group/project", "forge": "gitlab",
+	  "app": {"installed": true, "resolvable": true}, "spec": {"source": "fetched", "valid": true},
+	  "reviewers": [], "scopes": {"adequate": true, "required": [], "missing": []}}`
+	fb, srv := newDoctorFakeBackend(t)
+	fb.rawBody = served
+	r := newResolver(srv, map[string]string{gitLabRunnerPushCredentialEnv: runnerCredsSentinel})
+
+	_, out, err := r.doctor(context.Background(), nil, DoctorInput{Repo: "group/project", Forge: "gitlab"})
+	if err != nil {
+		t.Fatalf("doctor: %v", err)
+	}
+	if out.RunnerCredentials == nil {
+		t.Fatal("runner_credentials is absent on a gitlab-family report")
+	}
+	if out.RunnerCredentials.Status != runnerCredentialPresent {
+		t.Errorf("status = %q, want present", out.RunnerCredentials.Status)
+	}
+	if out.RunnerCredentials.Forge != "gitlab" {
+		t.Errorf("forge = %q, want it echoed from the report", out.RunnerCredentials.Forge)
+	}
+
+	// The report half must decode byte-identically to what was served: the new
+	// key is a SIBLING, so it cannot appear inside `report`.
+	var wantReport OnboardingReadinessReport
+	if err := json.Unmarshal([]byte(served), &wantReport); err != nil {
+		t.Fatalf("decode the served body: %v", err)
+	}
+	wantBytes, err := json.Marshal(wantReport)
+	if err != nil {
+		t.Fatalf("marshal the expected report: %v", err)
+	}
+	gotBytes, err := json.Marshal(out.Report)
+	if err != nil {
+		t.Fatalf("marshal the returned report: %v", err)
+	}
+	if string(gotBytes) != string(wantBytes) {
+		t.Errorf("report changed:\n got: %s\nwant: %s", gotBytes, wantBytes)
+	}
+
+	encoded, err := json.Marshal(out)
+	if err != nil {
+		t.Fatalf("marshal DoctorOutput: %v", err)
+	}
+	body := string(encoded)
+	if !strings.Contains(body, `"runner_credentials":{`) {
+		t.Errorf("DoctorOutput lacks the runner_credentials sibling key:\n%s", body)
+	}
+	if strings.Contains(string(gotBytes), "runner_credentials") {
+		t.Errorf("runner_credentials leaked INSIDE report:\n%s", gotBytes)
+	}
+	if strings.Contains(body, runnerCredsSentinel) {
+		t.Errorf("the token value reached the wire:\n%s", body)
+	}
+}
+
+// TestDoctor_RunnerCredentials_GitHubStillRendered pins that a github-family
+// report still CARRIES the rung (as not_applicable) rather than omitting it —
+// the operator must see the question was asked and answered, not silently
+// dropped.
+func TestDoctor_RunnerCredentials_GitHubStillRendered(t *testing.T) {
+	const served = `{"repo": "x/y", "forge": "github",
+	  "app": {"installed": true, "installation_id": 4242}, "spec": {"source": "fetched", "valid": true},
+	  "reviewers": [], "scopes": {"adequate": true, "required": [], "missing": []}}`
+	fb, srv := newDoctorFakeBackend(t)
+	fb.rawBody = served
+	// The runner variable IS set here: a github report must still answer
+	// not_applicable, so the verdict keys on the FORGE and not on the env.
+	r := newResolver(srv, map[string]string{gitLabRunnerPushCredentialEnv: runnerCredsSentinel})
+
+	_, out, err := r.doctor(context.Background(), nil, DoctorInput{Repo: "x/y"})
+	if err != nil {
+		t.Fatalf("doctor: %v", err)
+	}
+	if out.RunnerCredentials == nil {
+		t.Fatal("runner_credentials is absent on a github-family report — it must be RENDERED as not_applicable")
+	}
+	if out.RunnerCredentials.Status != runnerCredentialNotApplicable {
+		t.Errorf("status = %q, want not_applicable", out.RunnerCredentials.Status)
+	}
+	encoded, err := json.Marshal(out)
+	if err != nil {
+		t.Fatalf("marshal DoctorOutput: %v", err)
+	}
+	if !strings.Contains(string(encoded), `"status":"not_applicable"`) {
+		t.Errorf("the not_applicable verdict is not on the wire:\n%s", encoded)
+	}
+}
+
+// TestDoctor_RunnerCredentials_UnknownForge pins the end-to-end unknown branch:
+// an older fishhawkd serves no `forge` key, so applicability cannot be decided
+// and the rung must say so rather than report missing.
+func TestDoctor_RunnerCredentials_UnknownForge(t *testing.T) {
+	const served = `{"repo": "x/y",
+	  "app": {"installed": true}, "spec": {"source": "fetched", "valid": true},
+	  "reviewers": [], "scopes": {"adequate": true, "required": [], "missing": []}}`
+	fb, srv := newDoctorFakeBackend(t)
+	fb.rawBody = served
+	r := newResolver(srv, nil)
+
+	_, out, err := r.doctor(context.Background(), nil, DoctorInput{Repo: "x/y"})
+	if err != nil {
+		t.Fatalf("doctor: %v", err)
+	}
+	if out.RunnerCredentials == nil {
+		t.Fatal("runner_credentials is absent on a forge-less report")
+	}
+	if out.RunnerCredentials.Status != runnerCredentialUnknown {
+		t.Errorf("status = %q, want unknown (NOT missing) when the report named no forge", out.RunnerCredentials.Status)
+	}
+	if out.RunnerCredentials.Remediation != "" {
+		t.Errorf("unknown must carry no remediation, got %q", out.RunnerCredentials.Remediation)
+	}
+}
+
+// TestNewServer_WiresNonNilGetenv is BINDING CONDITION 3: the production
+// constructor must wire a real getenv, so runnerCredentials' nil fallback is a
+// defensive branch that never fires in production. There is no runtime seam to
+// read the constructed resolver back through (NewServer returns *mcp.Server),
+// so the assertion is STRUCTURAL: parse server.go and require the runResolver
+// composite literal inside NewServer to carry a non-nil getenv key.
+func TestNewServer_WiresNonNilGetenv(t *testing.T) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "server.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse server.go: %v", err)
+	}
+	var fn *ast.FuncDecl
+	for _, decl := range file.Decls {
+		if d, ok := decl.(*ast.FuncDecl); ok && d.Name.Name == "NewServer" {
+			fn = d
+			break
+		}
+	}
+	if fn == nil {
+		t.Fatal("NewServer not found in server.go — the production constructor moved; repoint this assertion")
+	}
+	found := false
+	ast.Inspect(fn, func(n ast.Node) bool {
+		lit, ok := n.(*ast.CompositeLit)
+		if !ok {
+			return true
+		}
+		ident, ok := lit.Type.(*ast.Ident)
+		if !ok || ident.Name != "runResolver" {
+			return true
+		}
+		for _, elt := range lit.Elts {
+			kv, ok := elt.(*ast.KeyValueExpr)
+			if !ok {
+				continue
+			}
+			key, ok := kv.Key.(*ast.Ident)
+			if !ok || key.Name != "getenv" {
+				continue
+			}
+			if id, ok := kv.Value.(*ast.Ident); ok && id.Name == "nil" {
+				t.Error("NewServer wires getenv: nil — the production path must never take runnerCredentials' nil fallback")
+			}
+			found = true
+		}
+		return true
+	})
+	if !found {
+		t.Error("NewServer's runResolver literal sets no getenv key — the zero value is nil, so runnerCredentials would read every credential as absent in production")
+	}
+}
+
+// TestDoctorToolDescription_DescribesRunnerCredentials pins the SHIPPED
+// description's #3617 claims, mirroring the TestDoctorToolDescription_
+// DescribesTraceStore convention: the rung, that it is computed LOCALLY, the
+// four statuses, the presence-only limit and the gitlab_ci exclusion.
+func TestDoctorToolDescription_DescribesRunnerCredentials(t *testing.T) {
+	desc := strings.Join(strings.Fields(registeredToolDescription(t, "fishhawk_doctor")), " ")
+	for _, want := range []string{
+		"runner_credentials",
+		"SIBLING key, never a field inside it",
+		"computed LOCALLY by this MCP server",
+		"NOT served by fishhawkd",
+		"TWO credentials",
+		"FISHHAWKD_GITLAB_TOKEN",
+		"FISHHAWK_GITLAB_TOKEN",
+		"status is present | missing | not_applicable",
+		"unknown (the report named no forge family",
+		"PRESENCE only",
+		"says NOTHING about a gitlab_ci runner",
+		"environment that LAUNCHES fishhawk-mcp",
 	} {
 		if !strings.Contains(desc, want) {
 			t.Errorf("fishhawk_doctor description lacks %q", want)

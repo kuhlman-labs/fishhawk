@@ -821,6 +821,35 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			return exitFailure
 		}
 
+		// GitLab push-credential preflight (E45.82 / #3617). A gitlab run needs
+		// TWO credentials — the daemon's FISHHAWKD_GITLAB_TOKEN and the RUNNER
+		// process's FISHHAWK_GITLAB_TOKEN — and before this refusal the second
+		// was resolved only at mintImplementToken, i.e. AFTER a complete paid
+		// agent pass, surfacing as a category-C failure at the push.
+		//
+		// The ORDERING is load-bearing for the same reason the #2691 block above
+		// is: this fires the instant the prompt response has resolved stageType,
+		// cfg.noPR, cfg.fixup and cfg.decomposedFromRunID, and strictly BEFORE
+		// the lineage-worktree admin lock, the sweep/provision, the lineage lock,
+		// the base checkout and the agent invocation — so a refusal burns ZERO
+		// agent tokens and mutates nothing. It fires AFTER the prompt fetch
+		// rather than at flag-parse time because cfg.fixup and stageType are
+		// derived server-side and served only on the prompt response.
+		//
+		// It covers BOTH runner channels, local and gitlab_ci: the predicate
+		// never consults detectRunnerKind, because a CI job missing the
+		// FISHHAWK_GITLAB_TOKEN CI/CD variable would fail at the push just as a
+		// local runner does, and the runner reads that variable through the same
+		// os.Getenv in either channel. Presence is decided SILENTLY — the token,
+		// its length and any prefix are never logged on the success path.
+		if gitLabPushCredentialRequired(stageType, cfg) {
+			if _, err := resolveGitLabPushToken(os.Getenv); err != nil {
+				_, _ = fmt.Fprintf(logSink,
+					`{"event":"runner_failed","reason":"gitlab_push_credential_missing","detail":%q}`+"\n", err.Error())
+				return exitFailure
+			}
+		}
+
 		// Conflict-resolution pass (E64.62 / #3202, #3340). ORDERING is
 		// load-bearing: this routes BEFORE the lineage-worktree block and before
 		// every implement-path branch / worktree / verify wiring below, because
@@ -7857,6 +7886,64 @@ func resolveImplementBranchRouting(_ context.Context, cfg config, _, baseRef str
 	return r, nil
 }
 
+// gitLabPushCredentialEnv is the env var the runner reads its GitLab push /
+// MR-open credential from. It is DUPLICATED across the modules that each need
+// their own copy (gateenv.go, runner/internal/agentenv, runner/internal/acceptenv,
+// cli/cmd/fishhawk/doctor_verify.go, and the MCP server's runner_credentials
+// doctor rung in backend/internal/mcpserver/onboard.go) because the runner and
+// backend are separate Go modules with no import edge; each side's tests assert
+// the literal so a rename reddens the other rather than silently decoupling.
+const gitLabPushCredentialEnv = "FISHHAWK_GITLAB_TOKEN"
+
+// errGitLabPushCredentialMissing is the ONE actionable message both the
+// startup preflight (gitLabPushCredentialRequired, run()) and the late mint
+// (mintImplementToken) emit when the gitlab push credential is absent. Sharing
+// one error value is what makes "the preflight fails with the same actionable
+// error" structural rather than two hopeful string copies.
+var errGitLabPushCredentialMissing = errors.New("this run targets the gitlab forge (--forge=gitlab) but " + gitLabPushCredentialEnv + " is not set; " +
+	"export a GitLab access token with `api` scope so the runner can push the run branch and open the merge request")
+
+// resolveGitLabPushToken reads the gitlab push credential through the injected
+// getenv seam and fails closed on an absent OR whitespace-only value. The
+// whitespace-only rejection is a deliberate TIGHTENING over the pre-#3617
+// `tok == ""` test: a variable set to " " would previously have been handed to
+// the push as a credential and failed opaquely at the remote.
+//
+// getenv is injected rather than calling os.Getenv directly so the preflight's
+// table test can drive every branch without t.Setenv racing the shared process
+// environment; mintImplementToken and the preflight both pass os.Getenv.
+func resolveGitLabPushToken(getenv func(string) string) (string, error) {
+	tok := getenv(gitLabPushCredentialEnv)
+	if strings.TrimSpace(tok) == "" {
+		return "", errGitLabPushCredentialMissing
+	}
+	return tok, nil
+}
+
+// gitLabPushCredentialRequired reports whether this stage WILL reach
+// mintImplementToken's gitlab branch, i.e. whether it will push with the
+// FISHHAWK_GITLAB_TOKEN credential.
+//
+// WHY `implement && !noPR` is exactly that set: the three push shapes computed
+// later (willOpenPR, willPushChild, willPushFixup) are each gated on
+// stageType == "implement", and openPRAndShipArtifact short-circuits on
+// cfg.noPR BEFORE the mint — so no plan stage, no acceptance stage and no
+// --no-pr standalone implement reaches the credential. A fix-up pass and a
+// decomposition child are both implement stages WITHOUT --no-pr on every
+// supported dispatch path (the #2691 refusal above rejects the --no-pr
+// combinations outright), so both are correctly REQUIRED here.
+//
+// The predicate is deliberately RUNNER-CHANNEL-BLIND: it keys on the forge and
+// the stage, never on detectRunnerKind. A gitlab_ci job whose
+// FISHHAWK_GITLAB_TOKEN CI/CD variable is missing would fail at the push
+// exactly as a local runner does, and the runner CAN read that variable via
+// os.Getenv in that channel, so covering both channels is intended. (Only the
+// MCP server's runner_credentials doctor rung is blind to the gitlab_ci
+// channel — its process cannot see a CI/CD variable on the GitLab instance.)
+func gitLabPushCredentialRequired(stageType string, cfg config) bool {
+	return stageType == "implement" && !cfg.noPR && cfg.forge == forgeGitLab
+}
+
 // mintImplementToken resolves the push/PR-create credential for an implement
 // stage. It always mints a fresh App installation token (App tokens are
 // ~1-hour TTL and a long agent run can outlive the auth pre-step's token);
@@ -7872,10 +7959,9 @@ func mintImplementToken(ctx context.Context, cfg config, client uploadClient, is
 	// FISHHAWK_GITLAB_TOKEN (a group/project access token with api scope);
 	// fail with an actionable error naming the env var when it is absent.
 	if cfg.forge == forgeGitLab {
-		tok := os.Getenv("FISHHAWK_GITLAB_TOKEN")
-		if tok == "" {
-			return "", errors.New("this run targets the gitlab forge (--forge=gitlab) but FISHHAWK_GITLAB_TOKEN is not set; " +
-				"export a GitLab access token with `api` scope so the runner can push the run branch and open the merge request")
+		tok, err := resolveGitLabPushToken(os.Getenv)
+		if err != nil {
+			return "", err
 		}
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"installation_token_received","run_id":%q,"stage_id":%q,"source":"gitlab_env"}`+"\n",

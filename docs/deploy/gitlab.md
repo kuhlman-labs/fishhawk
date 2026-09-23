@@ -83,7 +83,11 @@ Under **Settings → CI/CD → Variables**, configure:
   its trace bundle to and fetches prompts from.
 - **`FISHHAWK_GITLAB_TOKEN`** (masked) — a project or group access token the
   runner pushes the run branch and opens the merge request with. This is the
-  `--forge=gitlab` push-path credential.
+  `--forge=gitlab` push-path credential. Since E45.82 / [#3617](https://github.com/kuhlman-labs/fishhawk/issues/3617)
+  the runner reads it at prompt-fetch time and REFUSES a gitlab-forge implement
+  stage outright when it is absent or whitespace-only
+  (`runner_failed`, reason `gitlab_push_credential_missing`), so a job missing
+  this variable fails in seconds instead of after a full agent pass.
 - **`ANTHROPIC_API_KEY`** (masked) — forwarded to Claude Code when
   `agent=claude-code`.
 - **`OPENAI_API_KEY`** (masked) — forwarded to the Codex CLI when `agent=codex`.
@@ -107,6 +111,17 @@ the merge request. `FISHHAWKD_GITLAB_TOKEN` (chart secret, note the trailing
 `D`) is the **backend's** REST credential — it gates the forge/work-item provider
 and the login-gate group lister. They read alike and serve different sides; set
 whichever the side you are configuring needs.
+
+**A GitLab run needs BOTH, on two different hosts.** Stated once, with the
+surface that reports each:
+
+| Variable | Whose process | What it does | Where it must be set | What reports it |
+|---|---|---|---|---|
+| `FISHHAWKD_GITLAB_TOKEN` (trailing `D`) | the **backend** (`fishhawkd`) | REST reads: forge/work-item provider, project resolution, login-gate group lister | the fishhawkd deployment (Helm `secrets.values.gitlabToken`) | `fishhawk_doctor`'s `app` rung (`resolvable` / `installed`) |
+| `FISHHAWK_GITLAB_TOKEN` | the **runner** | pushes the run branch, opens the merge request (`api` scope) | the host that SPAWNS the runner — the CI/CD variable on the `gitlab_ci` channel, or the environment that launches `fishhawk-mcp` / `fishhawk runner start` locally | `fishhawk_doctor`'s `runner_credentials` rung (LOCAL channel only — it cannot see a CI/CD variable), and the runner's own startup preflight on BOTH channels |
+
+Configuring only the first is the common failure: everything registers and
+plans cleanly, and the run then fails at the implement stage's push.
 
 See [`deploy/helm/fishhawk/README.md`](https://github.com/kuhlman-labs/fishhawk/blob/main/deploy/helm/fishhawk/README.md)
 (the "GitLab" section) for the full chart contract: the graduated enablement
@@ -290,7 +305,9 @@ The GitLab CI channel above is one entry point; since #3463 the operator surface
 
 1. **Register the project** so the backend can stamp the run's credential reference: `fishhawkd installation register --provider gitlab --account-key <namespace> --installation-ref gitlab:<project_id> --project-path <path_with_namespace> --forge-base-url <instance root>`. `POST /v0/runs` resolves the `installation_ref` from the installation whose `project_path` EXACTLY equals `repo`; an unregistered (or ambiguously registered) path is refused `422 gitlab_project_not_registered` naming this command. Verify with `fishhawk_doctor` (E45.68 / #3582): its `gitlab_registration` rung reports the registration through the same registry check (`registered` / `not_registered` / `unknown`, with a copy-pasteable register command carrying the real project id, and `ref_matches` comparing the registered ref with the id the path resolves to), and `app.installed` is `true` only once the project is BOTH registered and visible to the deployment credential.
 2. **Give the run an instance root.** The spawn producers read it back from `GET /v0/runs/{id}` as `forge_base_url` — the installation's `--forge-base-url`, else the deployment default `FISHHAWKD_GITLAB_BASE_URL`. A gitlab run with NEITHER is refused at spawn time (`… carries no forge_base_url; not spawning`) naming both remedies; nothing is dispatched.
-3. **Export `FISHHAWK_GITLAB_TOKEN` on the host that spawns the runner** (the `fishhawk-mcp` host, or the shell running `fishhawk runner start`). The runner mints its push / MR-open credential from its own environment; a missing token fails the IMPLEMENT stage at the runner, not at spawn.
+3. **Export `FISHHAWK_GITLAB_TOKEN` in the environment that LAUNCHES the runner-spawning process** — not merely "somewhere on the host". The four MCP verbs (`fishhawk_run_stage`, `fishhawk_dispatch_stage`, `fishhawk_drive_run`, `fishhawk_run_children`) spawn the runner with `append(os.Environ(), …)`, so the runner inherits the environment of the **`fishhawk-mcp` process**, which is the environment the MCP registration created — a `claude mcp add fishhawk <cmd>` that omits `-e FISHHAWK_GITLAB_TOKEN=<token>` produces exactly this failure even when the variable is exported in your interactive shell. On the CLI path it is the shell running `fishhawk runner start`. Use `claude mcp add fishhawk <cmd> -e FISHHAWK_GITLAB_TOKEN=<token>` (then `/mcp` to reconnect) or add it to the registration's env block.
+
+   **Two surfaces now report it** (E45.82 / [#3617](https://github.com/kuhlman-labs/fishhawk/issues/3617)). `fishhawk_doctor` carries a `runner_credentials` rung computed LOCALLY by the MCP server about its own environment — `present` / `missing` / `not_applicable` (a github run) / `unknown` (the report named no forge family) — which reports PRESENCE only, never the token's validity or scope, and which describes the MCP server's spawning environment ONLY: it says nothing about a `gitlab_ci` runner, whose credential is a CI/CD variable this process cannot read. And the runner itself now REFUSES at prompt-fetch time rather than at the push: a gitlab-forge implement stage that will push and finds no credential exits with `{"event":"runner_failed","reason":"gitlab_push_credential_missing"}` before the agent is invoked, so a missing token costs zero agent tokens instead of a complete paid pass. That refusal covers BOTH channels, local and `gitlab_ci` — a CI job missing the CI/CD variable is refused the same way.
 4. **Pass `workflow_spec` inline** (the MCP server auto-discovers it from `working_dir`; the CLI reads `--spec-file`). There is no GitLab spec-fetch fallback on `POST /v0/runs`: an empty spec on a gitlab run is `422 workflow_spec_required`.
 
 **Creating the run — the forge selector and the github-pin rule.** `fishhawk_start_run` / `fishhawk run start` take an optional `forge` (`github` | `gitlab`); `repo` is the GitLab `path_with_namespace` (nested groups allowed). The ladder differs from REST in ONE respect, the no-github-fetch guarantee:
