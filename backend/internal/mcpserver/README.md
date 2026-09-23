@@ -38,10 +38,10 @@ consumes only the first two):
   `initialize` handshake, the public alias of the package-private
   `onboardingInstructions`.
 
-## Exported surface: why 286 identifiers, not 3
+## Exported surface: why 296 identifiers, not 3
 
-The package presents **286** exported top-level identifiers, but only the three
-above are intended entry points. The other 283 are the tool I/O
+The package presents **296** exported top-level identifiers, but only the three
+above are intended entry points. The other 293 are the tool I/O
 request/response structs. The MCP SDK's jsonschema reflection requires each
 tool's input/output type — and its exported fields — to build the tool's
 schema, so **unexporting them would break tool registration**. In `package
@@ -1206,6 +1206,56 @@ Statuses: `merged` (a `pr_merged` / `post_merge_observed` entry landed past the 
 **Immediate return on `conflicting` (E64.14 / [#3109](https://github.com/kuhlman-labs/fishhawk/issues/3109)).** UNLIKE `checks_pending`, a `409 merge_conflicting` is **not** a wait-and-resolve precondition — waiting cannot clear a merge conflict — so the tool returns `status:conflicting` on the FIRST POST with no poll and no re-POST (the endpoint recorded no verdict row, so `merge_queued`/`verdict_recorded`/`already_recorded` are all false). The message names the resolution path: resolve the conflict on the run branch, `fishhawk_vouch_commit` the resulting commit (so the `fishhawk_audit_complete` check re-posts on the new head), re-approve the PR, and re-invoke.
 
 A **write** tool needing `write:approvals`; a run-bound agent token is rejected (`run_token_forbidden`, 403). `next_actions`' merge-ritual states (`succeeded_pr_open`, the acceptance-skipped/passed states, and the drive-folded `awaiting_merge`) now emit `approve_pr` then `fishhawk_merge_run`, replacing the bare `merge_pr` + `post_merge` steps. For the drive-folded `awaiting_merge` action, `driveAction` passes the backend's `next_action.detail` through verbatim as the folded merge action's `reason`, so the operator sees the backend's advisory qualification (any outstanding reviewer rejects / open concerns — [#2487](https://github.com/kuhlman-labs/fishhawk/issues/2487)); the action's precondition no longer makes an unconditional "every gate resolved and required checks green" all-clear claim and instead points the reader at that reason/detail.
+
+## Merge-recovery verb pair (`fishhawk_record_merge_observation` + `fishhawk_reconcile_merge`, [E45.88 / #3623](https://github.com/kuhlman-labs/fishhawk/issues/3623))
+
+`completion_blocked.recovery` on `GET /v0/runs/{id}` (`backend/internal/server/runs.go`) hands an operator a **closed
+three-value verb set** — `record-merge-observation`, `reconcile-merge`, `none`. Both non-`none` values have shipped REST
+routes since [#3083](https://github.com/kuhlman-labs/fishhawk/issues/3083) /
+[#3136](https://github.com/kuhlman-labs/fishhawk/issues/3136), and neither had a registered MCP tool: an MCP-driven agent
+was told the precise remedy and could not reach it, falling back to raw `curl` (run `f199dcf1`). `merge_recovery.go`
+registers both as thin wrappers. The endpoints' contracts — the full rung ladders, the refusal semantics, the audit row —
+live next to the handlers in
+[`backend/internal/server/README.md`](../server/README.md#merge-supersede-sweep--reconcile-merge-recovery-merge_supersedego-e642--3083)
+and are not restated here.
+
+**The observe/settle split is the load-bearing thing, and it is why the two verbs compose in a FIXED ORDER.**
+
+| Verb | Reads the forge? | Settles anything? |
+|---|---|---|
+| `fishhawk_record_merge_observation` | YES — the run's PR, live | NO. It appends one `merge_observation_recorded` row and stops. |
+| `fishhawk_reconcile_merge` | NEVER. Its evidence gate reads the audit CHAIN only | YES — supersedes the merge-parked stages and re-runs completion. |
+
+So a run whose PR genuinely merged but whose merge was never observed is **unreachable by `reconcile-merge` alone**: it
+refuses with `reconcile_merge_pr_not_merged`, and retrying it cannot help. Observe FIRST, then reconcile —
+`completion_blocked.recovery` flips from one to the other as the missing half is supplied, and
+`fishhawk_get_run_status`'s own description names the two TOOLS (keeping the endpoint paths as a parenthetical for a
+non-MCP reader), because a diagnosis must name something the reader can call.
+
+- **Both verbs are registered together, not one at a time.** The discriminator hands out one verb OR the other depending
+  on which half is missing, so registering only one would leave the identical unreachable-recovery gap standing for the
+  other arm. That is what the `wantToolCount` 55 -> 57 bump records.
+- **Idempotent arms are reported honestly.** A repeat `record-merge-observation` answers `already_recorded: true` and the
+  `observation` block is **EMPTY** on that arm — the backend deliberately zeroes it so the response cannot claim a row it
+  did not write, and the tool preserves that. A repeat `reconcile-merge` returns two empty lists plus the run's current
+  state, rendered as an explicit no-op rather than a false success. Nothing is back-dated: the recorded row carries the
+  forge's own `merged_at` **and** this observation's `observed_at`, so a reader sees the gap.
+- **Named refusals reach the caller verbatim.** Both descriptions enumerate them so an agent can branch:
+  `record_merge_observation_{no_pull_request, malformed_pr_url, pr_url_repo_mismatch, pr_not_merged, no_merge_commit,
+  no_merge_timestamp, forge_unavailable, unconfigured}` and `reconcile_merge_{pr_not_merged, not_applicable,
+  unconfigured}`. The shared `c.do` envelope decoding is what carries the backend's code through unflattened.
+- **Auth.** Both routes are registered `requireRunAccount(memberWrite, ...)` and **neither handler enforces a scope
+  predicate** beyond run ownership, so the `/mcp` tool→scope table mirrors them with `mcpScopeAuthenticatedOnly`. That is
+  a faithful mirror, not a claim that ownership-only is the right posture for a write verb — the table's derivation rule
+  forbids the gate being stricter than the endpoint it mirrors, so tightening belongs in an Auth-change-checklist PR
+  against the handlers (filed as a follow-up on #3623).
+- **The drift that let this gap open is now machine-caught, in both directions** (`backend/internal/server/mcproute_test.go`).
+  `TestCompletionBlockedRecoveryVerbsMatchEmission` derives the recovery vocabulary from the **emission sites** by
+  `go/ast` — every string assigned to the field backing the `recovery` json tag, anywhere in the package's production
+  code — and asserts set equality with `completionBlockedRecoveryVerbs`, failing CLOSED on an emission it cannot resolve
+  to a string constant. `TestCompletionBlockedRecoveryVerbsHaveMCPTools` then sweeps that slice against the **live**
+  `mcpserver` registry. A verb emitted but never listed fails the first; a listed verb with no registered tool fails the
+  second. One guard alone is not enough — a sweep over a hand-maintained slice cannot see a verb missing from that slice.
 
 ## Stranded-stage reap (`fishhawk_reap_stage`, [E67.47 / #2689](https://github.com/kuhlman-labs/fishhawk/issues/2689))
 

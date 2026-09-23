@@ -131,6 +131,25 @@ var mcpToolScopes = map[string]mcpToolScopeRule{
 	// endpoint. The persist arm stays enforced by its own handler.
 	"fishhawk_release_notes": mcpScopeAuthenticatedOnly,
 
+	// The #3083/#3136 merge-recovery pair (E45.88 / #3623).
+	// fishhawk_record_merge_observation POSTs
+	// /v0/runs/{run_id}/record-merge-observation (merge_observation.go
+	// handleRecordMergeObservation) and fishhawk_reconcile_merge POSTs
+	// /v0/runs/{run_id}/reconcile-merge (merge_supersede.go
+	// handleReconcileMerge). Both routes are registered
+	// requireRunAccount(memberWrite, ...) and NEITHER handler calls
+	// requireWriteScope or an inline hasScope: for a bearer/mcp identity
+	// (which carries a TokenID) enforceAccount applies OWNERSHIP only, and the
+	// cookie role-bounding branch never fires. So the FAITHFUL mirror of the
+	// posture those endpoints enforce today is the sentinel — ownership-only at
+	// the memberWrite tier, NOT an omission. This is arguably too loose at the
+	// REST layer for a write verb (a read-scoped operator token reaches both),
+	// but this table's derivation rule forbids the gate being STRICTER than the
+	// endpoint it mirrors; tightening belongs in an Auth-change-checklist PR
+	// against the handlers, tracked as a follow-up on #3623.
+	"fishhawk_record_merge_observation": mcpScopeAuthenticatedOnly,
+	"fishhawk_reconcile_merge":          mcpScopeAuthenticatedOnly,
+
 	// fishhawk_file_issue POSTs /v0/work-items, which enforces no scope:
 	// workitems.go gates on run ENTITLEMENT (runBoundTokenRunID) and
 	// repo consistency, not on a scope predicate.

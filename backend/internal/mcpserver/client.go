@@ -2568,6 +2568,119 @@ func (c *apiClient) ReconcileRunReviews(ctx context.Context, runID uuid.UUID) (*
 	return &res, nil
 }
 
+// MergeObservationFact mirrors the `observation` object of
+// POST /v0/runs/{run_id}/record-merge-observation
+// (backend/internal/server/merge_observation.go::mergeObservation).
+//
+// HAND-MAINTAINED WIRE MIRROR of an UNEXPORTED backend struct (the #371 class):
+// every json tag here MUST byte-match its counterpart or the field silently
+// decodes to its zero value. MergedAt is the FORGE's merge timestamp (when the
+// merge happened); ObservedAt is when Fishhawk read it (when Fishhawk learned
+// it) — transposing the two tags would swap two plausible-looking timestamps
+// with no decode error.
+//
+// Wholly EMPTY on the already_recorded no-op arm: that call appended nothing
+// and the backend deliberately zeroes the block so the response cannot claim a
+// row it did not write.
+type MergeObservationFact struct {
+	PullRequestURL    string `json:"pull_request_url"`
+	PullRequestNumber int    `json:"pull_request_number"`
+	MergeCommitSHA    string `json:"merge_commit_sha"`
+	MergedAt          string `json:"merged_at"`
+	ObservedAt        string `json:"observed_at"`
+}
+
+// RecordMergeObservationResult mirrors the 200 body of
+// POST /v0/runs/{run_id}/record-merge-observation
+// (backend/internal/server/merge_observation.go::recordMergeObservationResponse).
+//
+// HAND-MAINTAINED WIRE MIRROR of an UNEXPORTED backend struct (#371): the json
+// tags MUST byte-match.
+//
+// AlreadyRecorded:true means the chain already carried qualifying merge
+// evidence and this call appended NOTHING — Observation is then empty.
+type RecordMergeObservationResult struct {
+	RunID           string               `json:"run_id"`
+	AlreadyRecorded bool                 `json:"already_recorded"`
+	Observation     MergeObservationFact `json:"observation"`
+}
+
+// RecordMergeObservation invokes the OBSERVE half of the #3083 merge-recovery
+// pair (E64.32 / #3136). It takes NO request body — the handler reads only the
+// run_id path value.
+//
+// It SETTLES NOTHING: it reads the run's pull request off the forge and, only
+// on a live merged=true answer with a merge commit AND a merge timestamp,
+// appends the one merge_observation_recorded row reconcile-merge's chain-only
+// evidence gate needs. Idempotent: a repeat answers already_recorded:true
+// having appended nothing.
+//
+// 4xx/5xx surfaces, each returned as a typed *apiError carrying the backend's
+// code verbatim: 400 validation_failed (bad UUID), 401/403, 404 run_not_found,
+// 409 record_merge_observation_{no_pull_request,malformed_pr_url,
+// pr_url_repo_mismatch,pr_not_merged,no_merge_commit,no_merge_timestamp},
+// 502 record_merge_observation_forge_unavailable,
+// 503 record_merge_observation_unconfigured.
+func (c *apiClient) RecordMergeObservation(ctx context.Context, runID uuid.UUID) (*RecordMergeObservationResult, error) {
+	var res RecordMergeObservationResult
+	if err := c.do(ctx, http.MethodPost, "/v0/runs/"+runID.String()+"/record-merge-observation", nil, &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
+// SupersededStageRow mirrors one row of the reconcile endpoint's `superseded`
+// and `repaired` arrays
+// (backend/internal/server/merge_supersede.go::supersededStage).
+//
+// HAND-MAINTAINED WIRE MIRROR of an UNEXPORTED backend struct (#371): the json
+// tags MUST byte-match. StageID is a string here because the tool only ever
+// renders it.
+type SupersededStageRow struct {
+	StageID   string `json:"stage_id"`
+	StageType string `json:"stage_type"`
+	FromState string `json:"from_state"`
+	Reason    string `json:"reason"`
+}
+
+// ReconcileMergeResult mirrors the 200 body of
+// POST /v0/runs/{run_id}/reconcile-merge
+// (backend/internal/server/merge_supersede.go::reconcileMergeResponse).
+//
+// HAND-MAINTAINED WIRE MIRROR of an UNEXPORTED backend struct (#371): the json
+// tags MUST byte-match.
+//
+// Superseded lists the stages THIS invocation moved; Repaired lists stages that
+// were already `superseded` but carried no audit row and got one back. RunState
+// is the run's state after the completion re-evaluation, so a caller sees
+// whether the reconcile actually settled the run.
+type ReconcileMergeResult struct {
+	RunID      string               `json:"run_id"`
+	Superseded []SupersededStageRow `json:"superseded"`
+	Repaired   []SupersededStageRow `json:"repaired"`
+	RunState   string               `json:"run_state"`
+}
+
+// ReconcileMerge invokes the SETTLE half of the #3083 merge-recovery pair. It
+// takes NO request body — the handler reads only the run_id path value.
+//
+// It NEVER re-reads the forge: its evidence gate reads the run's audit CHAIN
+// only, which is exactly why RecordMergeObservation exists and must run first
+// when the merge was never observed. Idempotent: a repeat returns two empty
+// lists.
+//
+// 4xx/5xx surfaces, each returned as a typed *apiError carrying the backend's
+// code verbatim: 400 validation_failed (bad UUID), 401/403, 404 run_not_found,
+// 409 reconcile_merge_pr_not_merged, 409 reconcile_merge_not_applicable,
+// 503 reconcile_merge_unconfigured.
+func (c *apiClient) ReconcileMerge(ctx context.Context, runID uuid.UUID) (*ReconcileMergeResult, error) {
+	var res ReconcileMergeResult
+	if err := c.do(ctx, http.MethodPost, "/v0/runs/"+runID.String()+"/reconcile-merge", nil, &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
 // mergeRunRequest mirrors the backend's `POST /v0/runs/{run_id}/merge`
 // body (`backend/internal/server/merge_run.go::mergeRunRequest`, E48.7 /
 // #1954). Verdict is REQUIRED — the merge records an audited operator

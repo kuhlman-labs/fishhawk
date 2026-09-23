@@ -147,3 +147,43 @@ func TestMCPToolScopeTable_RunBoundAgentLoopIntact(t *testing.T) {
 		}
 	}
 }
+
+// TestMCPToolScopeTable_MergeRecoveryPairMirrorsOwnershipOnly pins the two
+// #3623 entries to the authenticated-only SENTINEL and proves a plain operator
+// bearer satisfies them.
+//
+// WHY PIN IT. `mcpScopeAuthenticatedOnly` here is a FAITHFUL MIRROR of two
+// handlers that enforce ownership only: both routes are registered
+// requireRunAccount(memberWrite, ...) (handlers.go) and neither
+// handleRecordMergeObservation nor handleReconcileMerge calls requireWriteScope
+// or an inline hasScope. Per this table's derivation rule the gate must not be
+// STRICTER than the endpoint it mirrors, so a later silent TIGHTENING here —
+// without the Auth-change-checklist PR against the handlers — would refuse an
+// operator token the REST endpoint still admits, breaking the recovery path with
+// no failing REST test. This assertion is what makes that RED.
+//
+// It is NOT a claim that ownership-only is the right posture for a write verb;
+// that question belongs on the handlers, and is filed as a follow-up on #3623.
+func TestMCPToolScopeTable_MergeRecoveryPairMirrorsOwnershipOnly(t *testing.T) {
+	// A read-only operator bearer: the weakest identity the mirrored endpoints
+	// admit today. If either entry ever demands a write scope, this fails.
+	readOnlyOperator := Identity{Subject: "svc:operator", TokenID: "tok", Scopes: []string{"read:runs"}}
+
+	for _, tool := range []string{"fishhawk_record_merge_observation", "fishhawk_reconcile_merge"} {
+		rule, ok := mcpToolScopeFor(tool)
+		if !ok {
+			t.Errorf("%s: no mcpToolScopes entry; it would be refused mcp_tool_not_authorized at runtime", tool)
+			continue
+		}
+		if len(rule.anyOf) != 0 || rule.runBoundSubjectOK {
+			t.Errorf("%s: rule = %+v, want the authenticated-only sentinel — the mirrored handler enforces "+
+				"ownership only at the memberWrite tier, and this table may not be STRICTER than the endpoint. "+
+				"Tightening belongs in an Auth-change-checklist PR against the handler", tool, rule)
+			continue
+		}
+		if !rule.satisfiedBy(readOnlyOperator) {
+			t.Errorf("%s: a read-scoped operator bearer is refused by the gate, but the REST endpoint admits it — "+
+				"the merge-recovery verb an operator is handed by completion_blocked would be unreachable", tool)
+		}
+	}
+}
