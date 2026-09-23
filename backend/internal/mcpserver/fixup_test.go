@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // --- fishhawk_fixup_stage (E22.X / #762) ---
@@ -586,5 +587,78 @@ func TestFixupStage_UntrustedExcerpt_NotInWarning(t *testing.T) {
 	// It is still named by id and channel, so the operator sees the signal.
 	if !strings.Contains(out.Warnings[0], "ob-1") || !strings.Contains(out.Warnings[0], "concern") {
 		t.Errorf("warning must still name the obligation id and channel:\n%s", out.Warnings[0])
+	}
+}
+
+// TestFixupStage_ConcernIDsSurfaceDocumentsSupersededRoutable pins BOTH
+// operator-facing surfaces that now claim a superseded implement-stage concern
+// is routable (E45.83 / #3618): the concern_ids jsonschema tag (the inline
+// schema the harness renders beside the field) and the registered tool's long
+// description. This is the behavior-change-claim guard — the backend widened
+// resolveConcernsByID's admitted set, and a surface still telling the operator
+// "open concerns only" would send them to the free-text operator_concern
+// fallback that destroys the reviewer provenance the id path preserves.
+//
+// It asserts on TOKENS, not whole sentences, so an ordinary copy-edit does not
+// redden it while a removal of the claim does.
+func TestFixupStage_ConcernIDsSurfaceDocumentsSupersededRoutable(t *testing.T) {
+	field, ok := reflect.TypeOf(FixupStageInput{}).FieldByName("ConcernIDs")
+	if !ok {
+		t.Fatal("FixupStageInput has no ConcernIDs field")
+	}
+	schema := strings.ToLower(field.Tag.Get("jsonschema"))
+	for _, want := range []string{"superseded", "gate_view", "settled[]"} {
+		if !strings.Contains(schema, want) {
+			t.Errorf("concern_ids jsonschema does not mention %q — an operator reading it would not know a retry-discarded concern is routable, nor where its id lives:\n%s", want, schema)
+		}
+	}
+
+	ctx := context.Background()
+	_, srv := newFakeBackend(t)
+	server := mcp.NewServer(&mcp.Implementation{Name: "test-server", Version: "0"}, nil)
+	registerFixupStage(server, newResolver(srv, nil))
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := server.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	defer serverSession.Close()
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	defer clientSession.Close()
+
+	res, err := clientSession.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	var desc string
+	for _, tool := range res.Tools {
+		if tool.Name == "fishhawk_fixup_stage" {
+			desc = tool.Description
+			break
+		}
+	}
+	if desc == "" {
+		t.Fatal("fishhawk_fixup_stage not registered")
+	}
+	lower := strings.ToLower(desc)
+	for _, want := range []string{
+		"superseded",
+		"settled[]",
+		"superseded_implement",
+		"implement_gate_settled_after_supersede",
+	} {
+		if !strings.Contains(lower, want) {
+			t.Errorf("fishhawk_fixup_stage description does not mention %q — the retry-recovery path is undocumented on the verb that implements it", want)
+		}
+	}
+	// The description must NOT still present operator_concern as the only
+	// post-retry recovery: that is the claim #3618 invalidated.
+	if strings.Contains(lower, "only recovery") && !strings.Contains(lower, "no longer the only recovery") {
+		t.Errorf("description still calls operator_concern the only recovery:\n%s", desc)
 	}
 }

@@ -903,9 +903,20 @@ func implementStageNextActions(run *Run, impl, review, acceptance *Stage, implem
 			// construction.
 			return &NextActions{State: "implement_concerns_open", Actions: hint.suggestedActions(run, impl.ID)}
 		}
-		// Review settled with nothing to route back. When the workflow
-		// declares an acceptance stage (E31.9 / ADR-049), it gates the merge
-		// — branch to the acceptance arm BEFORE the merge ritual.
+		// Review settled with nothing to route back — UNLESS a retry DISCARDED
+		// the prior attempt's concerns rather than anything answering them
+		// (E45.83 / #3618). That discard is a supersede, so open_implement is 0
+		// and every open-concern surface is empty, yet the defects the discarded
+		// concerns named may well survive on the tree this gate is about to
+		// merge. Lead with the recovery instead of the merge ritual.
+		if n := supersededImplementCount(run); n > 0 {
+			return &NextActions{
+				State:   "implement_gate_settled_after_supersede",
+				Actions: supersededSettledActions(run, impl, acceptance, n, acceptanceSkippedOutOfScope, acceptanceArbitrated, acceptanceVerdict, acceptanceTriageDisposition),
+			}
+		}
+		// When the workflow declares an acceptance stage (E31.9 / ADR-049), it
+		// gates the merge — branch to the acceptance arm BEFORE the merge ritual.
 		if acceptance != nil {
 			return acceptanceStageNextActions(run, acceptance, acceptanceSkippedOutOfScope, acceptanceArbitrated, acceptanceVerdict, acceptanceTriageDisposition)
 		}
@@ -914,6 +925,68 @@ func implementStageNextActions(run *Run, impl, review, acceptance *Stage, implem
 	default:
 		return nil
 	}
+}
+
+// supersededImplementCount reads the run-status concerns block's
+// retry-discarded implement-stage count (E45.83 / #3618). It returns 0 for both
+// degraded shapes, deliberately: an ABSENT concerns block (the store was
+// unavailable) and a NIL SupersededImplement (a backend peer predating the
+// field) are both "unknown", and the fail-safe answer to unknown is today's
+// classification — the merge ritual is still offered either way, so fabricating
+// a demotion from a missing number would be a claim the peer never made.
+func supersededImplementCount(run *Run) int {
+	if run == nil || run.Concerns == nil || run.Concerns.SupersededImplement == nil {
+		return 0
+	}
+	n := *run.Concerns.SupersededImplement
+	if n < 0 {
+		// Defensive: a negative count is not a fact any backend emits. Treat it
+		// as unknown rather than as a discard.
+		return 0
+	}
+	return n
+}
+
+// supersededSettledActions builds the implement_gate_settled_after_supersede
+// action list (E45.83 / #3618): the two RECOVERY actions first — read the
+// discarded concerns out of the gate view's settled[] ledger, then route them
+// back — followed by whatever the ordinary settled arm would have produced,
+// appended UNCHANGED. Nothing is removed: the acceptance gate is not skipped,
+// and where the ordinary arm offers the merge ritual it is still offered, with a
+// reason that names the discard instead of claiming the review settled.
+func supersededSettledActions(run *Run, impl, acceptance *Stage, discarded int,
+	acceptanceSkippedOutOfScope, acceptanceArbitrated bool,
+	acceptanceVerdict, acceptanceTriageDisposition string) []SuggestedAction {
+	implStageID := ""
+	if impl != nil {
+		implStageID = impl.ID
+	}
+	actions := []SuggestedAction{
+		{
+			Action:       "fishhawk_get_gate_view",
+			Params:       map[string]string{"run_id": run.ID, "stage_kind": "implement"},
+			Precondition: "none — read-only",
+			Consumes:     consumesNone,
+			Reason:       fmt.Sprintf("%d implement-review concern(s) from a PRIOR attempt were DISCARDED by a retry (state superseded), so no open concern remains — but nothing ANSWERED them. The settled[] ledger carries each one's id, reviewer_model, severity, category and note; read it before deciding whether the defects survive on this tree", discarded),
+		},
+		{
+			Action:       "fishhawk_fixup_stage",
+			Params:       map[string]string{"stage_id": implStageID, "concern_ids": "<superseded ids from gate_view settled[]>"},
+			Precondition: "the implement stage is parked at its review gate (or succeeded with the PR open); stay on a clean default branch — the runner owns the run branch in its lineage worktree",
+			Consumes:     consumesFixupBudget,
+			Reason:       fmt.Sprintf("route any of the %d discarded concern(s) back against the NEW tree: a SUPERSEDED implement-stage id is accepted by concern_ids and re-opens with its reviewer, round and severity intact, then is tracked to closure like any routed concern. Skip this only once you have read the notes and judged each defect absent from the retried tree", discarded),
+		},
+	}
+	if acceptance != nil {
+		// The acceptance gate is NOT skipped — the ordinary arm's actions ride
+		// along unchanged behind the recovery pair.
+		if acc := acceptanceStageNextActions(run, acceptance, acceptanceSkippedOutOfScope, acceptanceArbitrated, acceptanceVerdict, acceptanceTriageDisposition); acc != nil {
+			return append(actions, acc.Actions...)
+		}
+		return actions
+	}
+	return append(actions, mergeRitualActions(run,
+		fmt.Sprintf("the implement review has no open concerns, but %d were DISCARDED by a retry rather than addressed — merge only if you have read their notes in the gate view's settled[] ledger and judged each defect absent from this tree", discarded))...)
 }
 
 // deployStageNextActions covers a delegating deploy stage's non-terminal

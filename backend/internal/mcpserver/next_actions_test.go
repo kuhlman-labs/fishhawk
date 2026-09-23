@@ -5312,3 +5312,214 @@ func TestFoldGroomingApplyAdvisory_NilNoop(t *testing.T) {
 	// panic if a future caller passes nil.
 	foldGroomingApplyAdvisory(r, &GroomingApplyStatus{State: groomingApplyStateInFlight}, nil)
 }
+
+// --- implement_gate_settled_after_supersede (E45.83 / #3618) -----------------
+
+// naRunWithSuperseded is naRun plus a run-status concerns block carrying an
+// AUTHORITATIVE superseded_implement count. openImplement seeds the open side so
+// each case states both numbers explicitly.
+func naRunWithSuperseded(state string, openImplement, superseded int) *Run {
+	r := naRun(state)
+	oi, si := openImplement, superseded
+	r.Concerns = &RunConcerns{
+		Open:                openImplement,
+		OpenImplement:       &oi,
+		SupersededImplement: &si,
+	}
+	return r
+}
+
+// TestNextActions_SettledAfterSupersede_NoAcceptance is the #3618 headline: a
+// retry DISCARDED the prior attempt's implement-review concerns, so the open
+// set is empty and the pre-change classifier reported implement_gate_settled
+// with the merge ritual — reporting a discard as a settle. The new arm leads
+// with the RECOVERY (gate view, then fix-up) and keeps the merge ritual LAST,
+// with a reason that no longer claims the review settled with no open concerns.
+//
+// COUNTERFACTUAL (executed): deleting the supersededImplementCount(run) > 0
+// branch from implementStageNextActions makes this fail with
+// `state = "implement_gate_settled"`.
+func TestNextActions_SettledAfterSupersede_NoAcceptance(t *testing.T) {
+	run := naRunWithSuperseded("running", 0, 2)
+	stages := []Stage{naStage("plan", "succeeded"), naStage("implement", "succeeded")}
+	na := nextActionsFor(run, stages, nil, naReviewStatus("implement", "complete"), nil, nil, false, false, false, "", "", releaseSignals{})
+	if na == nil || na.State != "implement_gate_settled_after_supersede" {
+		t.Fatalf("state = %+v, want implement_gate_settled_after_supersede", na)
+	}
+	want := []string{"fishhawk_get_gate_view", "fishhawk_fixup_stage", "approve_pr", "fishhawk_merge_run"}
+	if got := actionNames(na); !reflect.DeepEqual(got, want) {
+		t.Fatalf("actions = %v, want %v (recovery FIRST, merge ritual LAST)", got, want)
+	}
+	// The gate view action must point at the implement stage's ledger and name
+	// the discard count.
+	gv := findAction(t, na, "fishhawk_get_gate_view")
+	if gv.Params["stage_kind"] != "implement" {
+		t.Errorf("gate_view stage_kind = %q, want implement", gv.Params["stage_kind"])
+	}
+	if gv.Params["run_id"] != run.ID {
+		t.Errorf("gate_view run_id = %q, want %q", gv.Params["run_id"], run.ID)
+	}
+	if !strings.Contains(gv.Reason, "settled[]") || !strings.Contains(gv.Reason, "2 implement-review concern") {
+		t.Errorf("gate_view reason must point at settled[] and name the count: %q", gv.Reason)
+	}
+	// The fix-up action must target the implement stage and say a superseded id
+	// is accepted.
+	fx := findAction(t, na, "fishhawk_fixup_stage")
+	if fx.Params["stage_id"] != stages[1].ID {
+		t.Errorf("fixup stage_id = %q, want the implement stage %q", fx.Params["stage_id"], stages[1].ID)
+	}
+	if !strings.Contains(strings.ToLower(fx.Reason), "superseded") {
+		t.Errorf("fixup reason must state a superseded id is routable: %q", fx.Reason)
+	}
+	if fx.Consumes != consumesFixupBudget {
+		t.Errorf("fixup Consumes = %q, want %q", fx.Consumes, consumesFixupBudget)
+	}
+	// The merge action must NOT keep the old settled claim, and must name the
+	// discard. This is the assertion a comment-only / no-op touch of
+	// next_actions.go cannot satisfy.
+	merge := findAction(t, na, "approve_pr")
+	if strings.Contains(merge.Reason, "settled with no open concerns") {
+		t.Errorf("merge reason still claims the review settled with no open concerns: %q", merge.Reason)
+	}
+	if !strings.Contains(merge.Reason, "DISCARDED") {
+		t.Errorf("merge reason must name the discard: %q", merge.Reason)
+	}
+}
+
+// TestNextActions_SettledAfterSupersede_WithAcceptance pins that the new arm
+// APPENDS to the ordinary path rather than replacing it: with an acceptance
+// stage present, the acceptance gate's own actions ride along behind the
+// recovery pair and the merge ritual does NOT appear early.
+func TestNextActions_SettledAfterSupersede_WithAcceptance(t *testing.T) {
+	run := naRunWithSuperseded("running", 0, 1)
+	stages := naAcceptanceStages("pending")
+	na := nextActionsFor(run, stages, nil, naReviewStatus("implement", "complete"), nil, nil, false, false, false, "", "", releaseSignals{})
+	if na == nil || na.State != "implement_gate_settled_after_supersede" {
+		t.Fatalf("state = %+v, want implement_gate_settled_after_supersede", na)
+	}
+	got := actionNames(na)
+	if len(got) < 3 {
+		t.Fatalf("actions = %v, want the recovery pair plus the acceptance arm's actions", got)
+	}
+	if got[0] != "fishhawk_get_gate_view" || got[1] != "fishhawk_fixup_stage" {
+		t.Fatalf("actions = %v, want the recovery pair first", got)
+	}
+	// The acceptance arm's own actions follow, UNCHANGED — compare against what
+	// the ordinary settled path produces for the same stages.
+	// Same run id, no concerns block: the ordinary acceptance arm's output for
+	// an otherwise identical run, so the comparison below is byte-exact rather
+	// than name-only.
+	plain := naRun("running")
+	plain.ID = run.ID
+	ordinary := nextActionsFor(plain, stages, nil, naReviewStatus("implement", "complete"), nil, nil, false, false, false, "", "", releaseSignals{})
+	if ordinary == nil {
+		t.Fatal("ordinary acceptance arm returned nil")
+	}
+	if !reflect.DeepEqual(got[2:], actionNames(ordinary)) {
+		t.Errorf("appended actions = %v, want the acceptance arm's %v unchanged (the acceptance gate must not be skipped)", got[2:], actionNames(ordinary))
+	}
+	if !reflect.DeepEqual(na.Actions[2:], ordinary.Actions) {
+		t.Error("the appended acceptance actions are not byte-identical to the ordinary arm's")
+	}
+	for _, name := range got {
+		if name == "fishhawk_merge_run" {
+			t.Errorf("merge ritual surfaced while the acceptance gate is unsettled: %v", got)
+		}
+	}
+}
+
+// TestNextActions_SettledAfterSupersede_ZeroKeepsSettled: superseded_implement
+// == 0 from a peer that DOES carry the key is the authoritative "no retry
+// discarded anything" — the pre-change state and action list must be returned
+// byte-identically.
+func TestNextActions_SettledAfterSupersede_ZeroKeepsSettled(t *testing.T) {
+	run := naRunWithSuperseded("running", 0, 0)
+	stages := []Stage{naStage("plan", "succeeded"), naStage("implement", "succeeded")}
+	na := nextActionsFor(run, stages, nil, naReviewStatus("implement", "complete"), nil, nil, false, false, false, "", "", releaseSignals{})
+	if na == nil || na.State != "implement_gate_settled" {
+		t.Fatalf("state = %+v, want implement_gate_settled (an authoritative zero is not a discard)", na)
+	}
+	if got := actionNames(na); !reflect.DeepEqual(got, []string{"approve_pr", "fishhawk_merge_run"}) {
+		t.Fatalf("actions = %v, want [approve_pr fishhawk_merge_run]", got)
+	}
+	if merge := findAction(t, na, "approve_pr"); !strings.Contains(merge.Reason, "settled with no open concerns") {
+		t.Errorf("merge reason = %q, want the unchanged settled claim", merge.Reason)
+	}
+}
+
+// TestNextActions_SettledAfterSupersede_NilPeerKeepsSettled: the LEGACY-PEER
+// degrade. A backend predating superseded_implement returns a present concerns
+// block with the key absent, which decodes to nil — unknown, NOT a discard. The
+// classifier must fall through to today's behaviour rather than fabricate a
+// demotion from a number the peer never sent. A block that is wholly ABSENT
+// (the store was unavailable) degrades identically.
+func TestNextActions_SettledAfterSupersede_NilPeerKeepsSettled(t *testing.T) {
+	stages := []Stage{naStage("plan", "succeeded"), naStage("implement", "succeeded")}
+	openImplement := 0
+	for _, tc := range []struct {
+		name     string
+		concerns *RunConcerns
+	}{
+		{
+			// Legacy peer: block present, superseded_implement key absent.
+			name:     "legacy_peer_nil_scalar",
+			concerns: &RunConcerns{Open: 0, OpenImplement: &openImplement},
+		},
+		{
+			// Store unavailable: no concerns block at all.
+			name:     "concerns_block_absent",
+			concerns: nil,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			run := naRun("running")
+			run.Concerns = tc.concerns
+			na := nextActionsFor(run, stages, nil, naReviewStatus("implement", "complete"), nil, nil, false, false, false, "", "", releaseSignals{})
+			if na == nil || na.State != "implement_gate_settled" {
+				t.Fatalf("state = %+v, want implement_gate_settled (unknown is not a discard)", na)
+			}
+			if got := actionNames(na); !reflect.DeepEqual(got, []string{"approve_pr", "fishhawk_merge_run"}) {
+				t.Fatalf("actions = %v, want [approve_pr fishhawk_merge_run]", got)
+			}
+		})
+	}
+}
+
+// TestNextActions_SettledAfterSupersede_DoesNotHijackOpenConcerns: the new
+// branch sits AFTER the hint == nil check, so a run with open concerns AND a
+// prior discard still classifies implement_concerns_open — the open concerns are
+// the live obligation and routing them is the next move.
+func TestNextActions_SettledAfterSupersede_DoesNotHijackOpenConcerns(t *testing.T) {
+	run := naRunWithSuperseded("running", 1, 2)
+	stages := []Stage{naStage("plan", "succeeded"), naStage("implement", "awaiting_approval")}
+	na := nextActionsFor(run, stages, nil, naReviewStatus("implement", "complete"),
+		&ReviewActionHint{Concerns: 1, RemainingFixupBudget: 1}, nil, false, false, false, "", "", releaseSignals{})
+	if na == nil || na.State != "implement_concerns_open" {
+		t.Fatalf("state = %+v, want implement_concerns_open (the open-concern hint path must win)", na)
+	}
+}
+
+// TestSupersededImplementCount_DegradedShapes pins the reader's three
+// fail-safe-to-zero branches one at a time, including the defensive negative
+// guard that no backend emits but which must not classify as a discard.
+func TestSupersededImplementCount_DegradedShapes(t *testing.T) {
+	neg, zero, two := -1, 0, 2
+	for _, tc := range []struct {
+		name string
+		run  *Run
+		want int
+	}{
+		{"nil_run", nil, 0},
+		{"nil_concerns_block", &Run{}, 0},
+		{"nil_scalar_legacy_peer", &Run{Concerns: &RunConcerns{}}, 0},
+		{"authoritative_zero", &Run{Concerns: &RunConcerns{SupersededImplement: &zero}}, 0},
+		{"negative_is_unknown", &Run{Concerns: &RunConcerns{SupersededImplement: &neg}}, 0},
+		{"authoritative_count", &Run{Concerns: &RunConcerns{SupersededImplement: &two}}, 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := supersededImplementCount(tc.run); got != tc.want {
+				t.Errorf("supersededImplementCount = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}

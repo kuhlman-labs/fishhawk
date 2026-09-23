@@ -370,3 +370,105 @@ func TestPostgres_MigrationDown(t *testing.T) {
 		t.Fatalf("insert after migration failed")
 	}
 }
+
+// TestPostgres_SupersededReRoutesToAddressedPending is the E45.83 / #3618
+// store-level round-trip: a retry supersedes an implement-review concern, and
+// an operator fix-up re-routes THAT row back into the open set through
+// MarkAddressedPending. It drives the REAL pgtest-backed store, so it covers
+// both the Go state machine and the from-state-guarded UPDATE, and it proves
+// migration 0030's `state` column admits the value (the column carries no
+// CHECK, so the write is a plain TEXT update — asserted rather than assumed).
+//
+// COUNTERFACTUAL: deleting the StateSuperseded -> StateAddressedPending edge
+// from validTransitions makes MarkAddressedPending return
+// InvalidTransitionError and the row stay superseded. The assertion READS THE
+// STATE BACK from Postgres rather than trusting the call's error, because the
+// production caller (the fix-up handler) treats a MarkAddressedPending failure
+// as warn-only.
+func TestPostgres_SupersededReRoutesToAddressedPending(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+	rows := h.insert(t, 42, concern.RaisedConcern{
+		Severity: "medium", Category: "correctness", Note: "the retry never re-checked the nil guard",
+	})
+	c := rows[0]
+
+	// Seed the superseded state BY CONSTRUCTION through ApplyResolution —
+	// exactly as retryStageAs discards a prior attempt's open concerns — so a
+	// deletion of the edge under test lands the RED on the re-route assertion
+	// below, never on this setup.
+	sup, err := h.repo.ApplyResolution(ctx, c.ID, concern.StateSuperseded, "superseded by retry attempt 2")
+	if err != nil {
+		t.Fatalf("ApplyResolution -> superseded: %v", err)
+	}
+	if sup.State != concern.StateSuperseded {
+		t.Fatalf("seeded State = %q, want superseded", sup.State)
+	}
+	if sup.State.IsOpen() {
+		t.Fatal("superseded row reports IsOpen() = true — it must stay CLOSED until an operator routes it")
+	}
+
+	const reason = "the nil guard is still missing on the retried tree"
+	if merr := h.repo.MarkAddressedPending(ctx, []uuid.UUID{c.ID}, reason); merr != nil {
+		t.Fatalf("MarkAddressedPending on a superseded row: %v (the #3618 edge is what admits this)", merr)
+	}
+
+	// Read the COMMITTED state back rather than trusting the call's nil error.
+	got, err := h.repo.GetByIDs(ctx, []uuid.UUID{c.ID})
+	if err != nil {
+		t.Fatalf("GetByIDs: %v", err)
+	}
+	reRouted := got[0]
+	if reRouted.State != concern.StateAddressedPending {
+		t.Fatalf("committed State = %q, want addressed_pending — the superseded row did not re-enter the open set", reRouted.State)
+	}
+	if !reRouted.State.IsOpen() {
+		t.Error("re-routed concern reports IsOpen() = false, want true")
+	}
+	if reRouted.StateReason != reason {
+		t.Errorf("StateReason = %q, want the operator's routing reason %q", reRouted.StateReason, reason)
+	}
+	// The reviewer, round and severity survive the round trip — the provenance
+	// the free-text operator_concern fallback destroys.
+	if reRouted.ReviewerModel == nil || *reRouted.ReviewerModel != "claude-opus-4-8" {
+		t.Errorf("ReviewerModel = %v, want the original reviewer preserved", reRouted.ReviewerModel)
+	}
+	if reRouted.OriginReviewSequence != 42 {
+		t.Errorf("OriginReviewSequence = %d, want 42 (the original round)", reRouted.OriginReviewSequence)
+	}
+	if reRouted.Severity != "medium" || reRouted.Category != "correctness" {
+		t.Errorf("severity/category = %q/%q, want medium/correctness preserved", reRouted.Severity, reRouted.Category)
+	}
+	if reRouted.Note != "the retry never re-checked the nil guard" {
+		t.Errorf("Note = %q, want the reviewer's note preserved", reRouted.Note)
+	}
+}
+
+// TestPostgres_MarkAddressedPending_RefusesWaived is the negative half of the
+// #3618 edge through the REAL store: widening superseded did NOT make the
+// genuinely terminal states re-routable. A waived row fails
+// InvalidTransitionError and stays waived in Postgres.
+func TestPostgres_MarkAddressedPending_RefusesWaived(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+	c := h.insert(t, 43)[0]
+	if _, err := h.repo.ApplyResolution(ctx, c.ID, concern.StateWaived, "operator waived"); err != nil {
+		t.Fatalf("ApplyResolution -> waived: %v", err)
+	}
+
+	err := h.repo.MarkAddressedPending(ctx, []uuid.UUID{c.ID}, "try to re-route a waived concern")
+	var inv concern.InvalidTransitionError
+	if !errors.As(err, &inv) {
+		t.Fatalf("MarkAddressedPending on a waived row = %v, want InvalidTransitionError", err)
+	}
+	if inv.From != concern.StateWaived || inv.To != concern.StateAddressedPending {
+		t.Errorf("InvalidTransitionError = %s -> %s, want waived -> addressed_pending", inv.From, inv.To)
+	}
+	got, err := h.repo.GetByIDs(ctx, []uuid.UUID{c.ID})
+	if err != nil {
+		t.Fatalf("GetByIDs: %v", err)
+	}
+	if got[0].State != concern.StateWaived {
+		t.Errorf("committed State = %q, want waived (untouched)", got[0].State)
+	}
+}

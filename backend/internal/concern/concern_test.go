@@ -15,12 +15,21 @@ func TestTransition_FullMatrix(t *testing.T) {
 		StateAddressedByCondition,
 	}
 	allowed := map[State][]State{
-		StateRaised:               {StateAddressedPending, StateWaived, StateSuperseded, StateDeferred, StateAddressedByCondition},
-		StateAddressedPending:     {StateAddressed, StateReopened, StateWaived, StateSuperseded, StateDeferred, StateAddressedByCondition},
-		StateAddressed:            {StateReopened},
-		StateReopened:             {StateAddressedPending, StateWaived, StateSuperseded, StateDeferred, StateAddressedByCondition},
-		StateWaived:               {},
-		StateSuperseded:           {},
+		StateRaised:           {StateAddressedPending, StateWaived, StateSuperseded, StateDeferred, StateAddressedByCondition},
+		StateAddressedPending: {StateAddressed, StateReopened, StateWaived, StateSuperseded, StateDeferred, StateAddressedByCondition},
+		StateAddressed:        {StateReopened},
+		StateReopened:         {StateAddressedPending, StateWaived, StateSuperseded, StateDeferred, StateAddressedByCondition},
+		StateWaived:           {},
+		// E45.83 / #3618: the ONE edge out of a closed state. superseded is
+		// closed (TestStateIsOpen still pins IsOpen()==false for it) but an
+		// operator fix-up may re-route a retry-discarded concern back into the
+		// open set. Every other exit from superseded is refused — the matrix
+		// loop below asserts that for addressed / reopened / waived / deferred /
+		// addressed_by_condition, and
+		// TestTransition_SupersededExitsAreNarrow names each explicitly.
+		StateSuperseded: {
+			StateAddressedPending,
+		},
 		StateDeferred:             {},
 		StateAddressedByCondition: {},
 	}
@@ -90,8 +99,66 @@ func TestTransition_ReopenWinsOverConfirm(t *testing.T) {
 	}
 }
 
+// TestTransition_SupersededExitsAreNarrow pins the E45.83 / #3618 edge's
+// NARROWNESS one state at a time, independently of the full matrix: the single
+// admitted exit from superseded is addressed_pending, and each of the five
+// other enum states is refused with InvalidTransitionError carrying the
+// from/to pair. Deleting the StateSuperseded -> StateAddressedPending edge
+// reddens the first assertion; WIDENING the row (adding any of the five)
+// reddens the corresponding table row.
+func TestTransition_SupersededExitsAreNarrow(t *testing.T) {
+	if err := Transition(StateSuperseded, StateAddressedPending); err != nil {
+		t.Fatalf("Transition(superseded, addressed_pending) = %v, want allowed — an operator fix-up must be able to re-route a retry-discarded concern", err)
+	}
+	for _, to := range []State{
+		StateAddressed, StateReopened, StateWaived, StateDeferred, StateAddressedByCondition,
+	} {
+		err := Transition(StateSuperseded, to)
+		if err == nil {
+			t.Errorf("Transition(superseded, %s) = nil, want InvalidTransitionError — addressed_pending is the ONLY exit", to)
+			continue
+		}
+		var inv InvalidTransitionError
+		if !errors.As(err, &inv) {
+			t.Errorf("Transition(superseded, %s) error type = %T, want InvalidTransitionError", to, err)
+			continue
+		}
+		if inv.From != StateSuperseded || inv.To != to {
+			t.Errorf("InvalidTransitionError = %s -> %s, want superseded -> %s", inv.From, inv.To, to)
+		}
+	}
+	// superseded re-entering the open set stays OPEN once routed: the edge is
+	// only useful if addressed_pending is an open state.
+	if !StateAddressedPending.IsOpen() {
+		t.Error("addressed_pending.IsOpen() = false — the re-route edge would land a concern outside the open set")
+	}
+}
+
+// TestTransition_TerminalStatesAdmitNoExit pins that the genuinely terminal
+// states stayed terminal when #3618 opened superseded: waived, deferred and
+// addressed_by_condition admit NO outgoing edge at all. Widening any of them
+// would make a settled operator disposition re-routable, which #3618
+// deliberately did not do.
+func TestTransition_TerminalStatesAdmitNoExit(t *testing.T) {
+	every := []State{
+		StateRaised, StateAddressedPending, StateAddressed, StateReopened,
+		StateWaived, StateSuperseded, StateDeferred, StateAddressedByCondition,
+	}
+	for _, from := range []State{StateWaived, StateDeferred, StateAddressedByCondition} {
+		for _, to := range every {
+			if err := Transition(from, to); err == nil {
+				t.Errorf("Transition(%s, %s) = nil, want InvalidTransitionError — %s is terminal", from, to, from)
+			}
+		}
+	}
+}
+
 func TestStateIsOpen(t *testing.T) {
 	open := []State{StateRaised, StateAddressedPending, StateReopened}
+	// superseded stays in the CLOSED list after E45.83 / #3618 gave it one
+	// outgoing edge: it is closed-and-recoverable, not open. Widening IsOpen
+	// would put every retry-discarded concern back on the open-concern
+	// surfaces and into the merge-gate count.
 	closed := []State{StateAddressed, StateWaived, StateSuperseded, StateDeferred, StateAddressedByCondition, State("bogus")}
 	for _, s := range open {
 		if !s.IsOpen() {

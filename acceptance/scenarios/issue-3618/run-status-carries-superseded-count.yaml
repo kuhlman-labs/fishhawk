@@ -1,0 +1,14 @@
+id: scenario:issue-3618/run-status-carries-superseded-count
+statement: 'A single-run read exposes the count of implement-stage concerns a retry discarded: GET /v0/runs/{run_id} returns 200 and its concerns block carries a superseded_implement integer alongside open, by_state, open_implement and items whenever the concern store read succeeded — present (as 0) even on a run that never retried, so absence of the key means an unavailable store and never ''zero''.'
+verify_hint: 'HTTP: GET /v0/runs/{run_id} on the localhost preview returns 200 and the JSON body''s concerns object contains the key superseded_implement with an integer value.'
+steps: POST http://localhost:8090/v0/dev/fixtures {"scenario":"acceptance-dispatched"} returned 201 (run 28986d68-587d-44b2-8f23-44cff76eeeb0). GET /v0/runs/28986d68-587d-44b2-8f23-44cff76eeeb0. Repeated with POST /v0/dev/fixtures {"scenario":"plan-gate-parked"} (run f018f654-1623-483f-adce-24039c9b0f74) and GET /v0/runs/f018f654-1623-483f-adce-24039c9b0f74.
+assertions:
+    expected: 200 with concerns.superseded_implement as an integer, present as 0 on a never-retried run.
+    observed_at_record: Both reads returned HTTP 200 with concerns = {"open":0,"by_state":{},"items":[],"open_implement":0,"superseded_implement":0}. superseded_implement is an integer next to open, by_state, open_implement and items, and is present as 0 on runs that never retried.
+    repro_handle: curl -s http://localhost:8090/v0/runs/<run_id> | jq .concerns
+origin:
+    issue: 3618
+    pr: 3632
+    run_id: cadc056f-b4e9-4408-a9b1-d1372f47024b
+    head_sha: 575250d9e5021464a0f3cbe8142ca28ea15a76fc
+    recorded_at: 2026-09-23T21:02:55Z

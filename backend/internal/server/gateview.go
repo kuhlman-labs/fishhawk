@@ -183,8 +183,14 @@ type gateViewResolution struct {
 }
 
 // gateViewSettledConcern is one row of the settled ledger (#1913): a concern
-// in a terminal state (addressed / waived / superseded / deferred) with its
-// state_reason.
+// in a CLOSED state (addressed / waived / superseded / deferred /
+// addressed_by_condition) with its state_reason. Closed rather than terminal:
+// E45.83 / #3618 gave superseded one outgoing edge
+// (superseded -> addressed_pending), so a retry-discarded concern listed here
+// can be routed back by an operator fix-up. The classification below is
+// deliberately unchanged — it keys on concern.State.IsOpen(), which still
+// reports false for superseded — because this ledger is exactly where an
+// operator reads the discarded rows' ids, reviewers, severities and notes.
 type gateViewSettledConcern struct {
 	ID            uuid.UUID `json:"id"`
 	StageKind     string    `json:"stage_kind"`

@@ -466,11 +466,15 @@ type runAutoAdvancePayload struct {
 // PRESENCE is authoritative (#3043): handleGetRun emits this block whenever
 // the concern-store read SUCCEEDED — including a zero-open run (open:0,
 // by_state:{}, items:[]). The field is left ABSENT only when the store is
-// UNAVAILABLE (ConcernRepo unwired, or ListOpenByRun errored — both
+// UNAVAILABLE (ConcernRepo unwired, or ListByRun errored — both
 // warn-logged). So present == an authoritative store read; absent == the
 // open set could not be read, NEVER "zero". The MCP review-action hint reads
 // this distinction: a present block is the count authority, an absent block
 // degrades it to the audit-derived fallback.
+//
+// The block ALSO reports how many implement-stage concerns a retry DISCARDED
+// (superseded_implement, E45.83 / #3618) — the open set alone reads a discard
+// as a settle.
 type runConcernsPayload struct {
 	Open    int                 `json:"open"`
 	ByState map[string]int      `json:"by_state"`
@@ -485,6 +489,24 @@ type runConcernsPayload struct {
 	// concerns are plan-stage ones reports OpenImplement:0 and the hint
 	// correctly suppresses.
 	OpenImplement int `json:"open_implement"`
+	// SupersededImplement is the AUTHORITATIVE count of implement-stage
+	// concerns a RETRY DISCARDED (state superseded) on this run (E45.83 /
+	// #3618). A retry supersedes the prior attempt's open implement-review
+	// concerns because they were raised against a tree that no longer exists;
+	// that is correct, but it drops OpenImplement to 0, and the open set alone
+	// is then indistinguishable from a review that genuinely settled. A
+	// NON-ZERO value means those concerns were never ANSWERED by the tree the
+	// gate is about to merge — only discarded.
+	//
+	// Only the COUNT is here. Each discarded concern's full row (id,
+	// reviewer_model, severity, category, note, state_reason) is served by
+	// GET /v0/runs/{run_id}/gate-view's settled[] ledger, which is where an
+	// operator recovers the ids to route into a fix-up (a superseded
+	// implement-stage concern of the target stage IS routable — see
+	// resolveConcernsByID). It counts every superseded implement-stage row on
+	// the run, NOT just the latest attempt's: the fail-safe direction, since a
+	// discard from any attempt is one the merge candidate never answered.
+	SupersededImplement int `json:"superseded_implement"`
 }
 
 // runConcernPayload is one open concern on the wire.
@@ -1934,9 +1956,19 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 	// query per row). Best-effort: a concern-store failure warn-logs
 	// and the field is omitted rather than failing the run read.
 	if s.cfg.ConcernRepo != nil {
-		open, cerr := s.cfg.ConcernRepo.ListOpenByRun(r.Context(), runID)
+		// ListByRun, not ListOpenByRun (E45.83 / #3618): the payload now reports
+		// the retry-DISCARDED implement count alongside the open set, and both
+		// come from ONE read. buildRunConcernsPayload derives the open set in Go
+		// with concern.State.IsOpen() — the same predicate
+		// ListOpenReviewConcernsByRun's WHERE clause duplicates, over the same
+		// ORDER BY — so the emitted open set and its order are unchanged
+		// (pinned by runs_get_test.go's derived-vs-ListOpenByRun equality
+		// assertion). Cost: every concern row for the run rather than the open
+		// ones, bounded by reviewer output on one run, on the single-run read
+		// only.
+		all, cerr := s.cfg.ConcernRepo.ListByRun(r.Context(), runID)
 		if cerr != nil {
-			s.cfg.Logger.Warn("list open concerns failed; omitting concerns block",
+			s.cfg.Logger.Warn("list concerns failed; omitting concerns block",
 				"run_id", runID.String(), "error", cerr.Error())
 		} else {
 			// Condition-claim markers (E64.77 / #3318). Gated on the open set
@@ -1952,8 +1984,11 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 			// (#3043).
 			var claimed map[uuid.UUID]struct{}
 			hasOpenPlanConcern := false
-			for _, c := range open {
-				if c.StageKind == concern.StageKindPlan {
+			for _, c := range all {
+				// The OPEN predicate stays part of this gate: `all` now carries
+				// settled rows too, and a run whose only plan concerns are settled
+				// must not pay the audit read (pre-#3618 behaviour).
+				if c.StageKind == concern.StageKindPlan && c.State.IsOpen() {
 					hasOpenPlanConcern = true
 					break
 				}
@@ -1968,7 +2003,7 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 			}
-			resp.Concerns = buildRunConcernsPayload(open, claimed)
+			resp.Concerns = buildRunConcernsPayload(all, claimed)
 		}
 	}
 	// Drive read surfaces (#1023): auto_advanced + next_action +
@@ -2854,22 +2889,40 @@ func concernShortSummary(note string) string {
 	return collapsed[:cut] + concernShortSummaryMarker
 }
 
-// buildRunConcernsPayload renders the open-concern summary for the
+// buildRunConcernsPayload renders the concern summary for the
 // single-run read from a SUCCESSFUL store read (#964, #3043). It is called
 // only on the success path (handleGetRun leaves the field nil on the
-// unwired / read-error paths), so it now returns a POPULATED payload even
+// unwired / read-error paths), so it returns a POPULATED payload even
 // for an empty open set (open:0, by_state:{}, items:[]) — making PRESENCE
 // authoritative: present == the store was read; absent == it was not. Items
 // stays a non-nil slice so the JSON renders `[]`, not `null`. OpenImplement
 // is computed here over the FULL open set — the authoritative implement-stage
 // count the MCP hint transports rather than re-deriving from a bounded Items.
-func buildRunConcernsPayload(open []*concern.Concern, claimed map[uuid.UUID]struct{}) *runConcernsPayload {
+//
+// It receives ALL of the run's concern rows since E45.83 / #3618, not just the
+// open ones, and derives the open set itself with concern.State.IsOpen() — the
+// predicate ListOpenReviewConcernsByRun's WHERE clause duplicates, over the
+// same ORDER BY, so Open/ByState/OpenImplement/Items are membership- and
+// order-identical to the pre-#3618 ListOpenByRun-fed payload. The same single
+// pass counts SupersededImplement, the retry-discarded implement-stage rows
+// the open set cannot express.
+func buildRunConcernsPayload(all []*concern.Concern, claimed map[uuid.UUID]struct{}) *runConcernsPayload {
 	out := &runConcernsPayload{
-		Open:    len(open),
 		ByState: make(map[string]int, 3),
-		Items:   make([]runConcernPayload, 0, len(open)),
+		Items:   make([]runConcernPayload, 0, len(all)),
 	}
-	for _, c := range open {
+	for _, c := range all {
+		if !c.State.IsOpen() {
+			// Settled. Only the retry-discarded implement-stage rows are counted;
+			// every other settled state (addressed / waived / deferred /
+			// addressed_by_condition, and a superseded PLAN concern, which no
+			// implement fix-up can route) contributes nothing to this payload.
+			if c.State == concern.StateSuperseded && c.StageKind == concern.StageKindImplement {
+				out.SupersededImplement++
+			}
+			continue
+		}
+		out.Open++
 		out.ByState[string(c.State)]++
 		if c.StageKind == concern.StageKindImplement {
 			out.OpenImplement++

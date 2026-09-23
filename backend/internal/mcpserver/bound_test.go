@@ -480,9 +480,14 @@ func TestEveryResponsePathIsClassified(t *testing.T) {
 // longer fit the 12 KiB band and its fit window shifted to [~12465, ~16383];
 // the three per-category grooming_apply_status elision entries (E54.77 /
 // #3232, T3) ride inside every skeleton measurement and grew it again to a
-// constant 13446 bytes, so the window is now [~13446, ~17511] and the 13 KiB
-// band fell below its floor — hence 15 KiB, ~1.9 KiB above the floor and
-// ~2.1 KiB below the T9 ceiling.
+// constant 13446 bytes, so the window moved to [~13446, ~17511] and the 13 KiB
+// band fell below its floor — hence 15 KiB. E45.83 / #3618 added
+// run.concerns.superseded_implement as a fourth itemised run.concerns omission,
+// growing the skeleton 13446 -> 13650 bytes; the T9 ceiling is unmoved (the T9
+// residue is a constant ~17512 bytes), so the window is now [~13650, ~17511]
+// and 15 KiB (15360) still sits INSIDE it — ~1.7 KiB above the floor (was
+// ~1.9 KiB) and ~2.1 KiB below the ceiling. The band is re-measured, not
+// relaxed: no assertion was weakened to restore green.
 // Without a band in that window no probe would engage the skeleton tier at all,
 // and the skeleton-ONLY next_actions.actions computed elision — which
 // TestElisions_ComputedCarryNoPointer requires — would vanish from the matrix.
@@ -513,8 +518,10 @@ func bandedElisions(t *testing.T, runID string) map[int]*Elisions {
 // the measured skeleton size to re-diagnose) instead of the coverage silently
 // evaporating — as it did when E54.77 / #3232's three grooming_apply_status
 // elision entries grew the skeleton from 12465 to 13446 bytes and the 13 KiB
-// band fell below the floor. The skeleton is a constant 13446 bytes; the fit
-// window is [~13446, ~17511], so 15 KiB (15360) sits ~1.9 KiB above the floor
+// band fell below the floor. E45.83 / #3618's run.concerns.superseded_implement
+// row grew it again, 13446 -> 13650 bytes, with the T9 ceiling unmoved. The
+// skeleton is a constant 13650 bytes; the fit
+// window is [~13650, ~17511], so 15 KiB (15360) sits ~1.7 KiB above the floor
 // and ~2.1 KiB below the T9 ceiling — comfortably inside, one band suffices.
 func TestElisions_SkeletonBandEngagesSkeletonTier(t *testing.T) {
 	runID := uuid.NewString()
@@ -528,7 +535,7 @@ func TestElisions_SkeletonBandEngagesSkeletonTier(t *testing.T) {
 	}
 	if bounded.Elisions.Tier != "skeleton" {
 		raw, _ := json.Marshal(bounded)
-		t.Fatalf("band %d engaged tier %q, want \"skeleton\"; the skeleton fit window shifted (measured skeleton size ~13446B, serialized here %dB) — re-pick the band inside the new window",
+		t.Fatalf("band %d engaged tier %q, want \"skeleton\"; the skeleton fit window shifted (measured skeleton size ~13650B, serialized here %dB) — re-pick the band inside the new window",
 			band, bounded.Elisions.Tier, len(raw))
 	}
 	found := false
@@ -1676,5 +1683,47 @@ func TestNextActionsSignature_SurvivesEveryTier(t *testing.T) {
 		if out.NextActions == nil || out.NextActions.Signature == nil {
 			t.Fatalf("tier %s elided the signature block", tier.name)
 		}
+	}
+}
+
+// TestElisions_SkeletonItemisesSupersededImplement pins the E45.83 / #3618
+// ledger row: run.concerns.superseded_implement must be ITEMISED as a skeleton
+// omission alongside its siblings run.concerns.open / by_state / open_implement,
+// because skeletonRunStatus never copies Run.Concerns at all. An unregistered
+// wire path already fails TestEveryResponsePathIsClassified; this asserts the
+// registration's TIER and CLASS are the sibling ones, so the row cannot be
+// smuggled in at a tier that would let it bypass the budget or silently claim
+// retention.
+func TestElisions_SkeletonItemisesSupersededImplement(t *testing.T) {
+	runID := uuid.NewString()
+	const band = 15 * 1024
+	bounded, err := boundRunStatusOutput(maximalRunStatusOutput(runID), runID, fixedBudget(band))
+	if err != nil {
+		t.Fatalf("band %d: %v", band, err)
+	}
+	if bounded.Elisions == nil || bounded.Elisions.Tier != "skeleton" {
+		t.Fatalf("band %d did not engage the skeleton tier: %+v", band, bounded.Elisions)
+	}
+	classes := map[string]string{}
+	for _, f := range bounded.Elisions.Fields {
+		classes[f.Field] = f.Class
+	}
+	got, present := classes["run.concerns.superseded_implement"]
+	if !present {
+		t.Fatalf("skeleton does not itemise run.concerns.superseded_implement; itemised run.concerns paths: %v", classes)
+	}
+	// Same class as its siblings — the ledger must not claim a different
+	// provenance for the new scalar than for open / by_state / open_implement.
+	for _, sibling := range []string{"run.concerns.open", "run.concerns.by_state", "run.concerns.open_implement"} {
+		want, ok := classes[sibling]
+		if !ok {
+			t.Fatalf("skeleton does not itemise the sibling %s — the consistency claim has no baseline", sibling)
+		}
+		if got != want {
+			t.Errorf("run.concerns.superseded_implement class = %q, want %q (same as %s)", got, want, sibling)
+		}
+	}
+	if got != string(classStored) {
+		t.Errorf("run.concerns.superseded_implement class = %q, want %q", got, classStored)
 	}
 }
