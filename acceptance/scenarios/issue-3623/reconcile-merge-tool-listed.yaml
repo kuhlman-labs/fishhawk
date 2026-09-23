@@ -1,0 +1,14 @@
+id: scenario:issue-3623/reconcile-merge-tool-listed
+statement: The MCP server advertises a tool named fishhawk_reconcile_merge whose description leads with a when/eligibility trigger and states that it settles the run by reading only the audit chain.
+verify_hint: Read the MCP tools/list result from the preview's MCP surface and check the advertised tool names and description text.
+steps: Ran fishhawk-mcp (built from the sanctioned checkout) over stdio against http://localhost:8090; tools/list; read fishhawk_reconcile_merge's description and inputSchema.
+assertions:
+    expected: fishhawk_reconcile_merge is advertised; its description leads with a when trigger and says it settles the run by reading only the audit chain.
+    observed_at_record: Listed. The description opens 'Use this when fishhawk_get_run_status reports run.completion_blocked.recovery = "reconcile-merge" ...' and says the verb 'NEVER re-reads the forge' and 'Its evidence gate is CHAIN-ONLY'. It supersedes the parked stages and re-runs completion so the run settles. inputSchema {run_id required}.
+    repro_handle: fishhawk-mcp stdio tools/list
+origin:
+    issue: 3623
+    pr: 3634
+    run_id: 764eb1fe-7fab-4ece-8020-770a34bf2206
+    head_sha: fb457d7e821c04ae99a30445151bf1b58193a4a5
+    recorded_at: 2026-09-23T23:59:25Z

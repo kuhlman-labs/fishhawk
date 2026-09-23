@@ -1,0 +1,14 @@
+id: scenario:issue-3623/run-status-names-the-tools
+statement: The fishhawk_get_run_status tool description names fishhawk_record_merge_observation and fishhawk_reconcile_merge as the verbs an operator calls for the matching completion_blocked.recovery value, rather than only raw POST paths.
+verify_hint: Read the MCP tools/list result from the preview's MCP surface and inspect the fishhawk_get_run_status entry's description.
+steps: Ran fishhawk-mcp (built from the sanctioned checkout) over stdio against http://localhost:8090; tools/list; read fishhawk_get_run_status's description.
+assertions:
+    expected: get_run_status names both MCP tools for the matching recovery values, not only raw POST paths.
+    observed_at_record: '"recovery=''record-merge-observation'' means the PR merge is unrecorded — call fishhawk_record_merge_observation FIRST (POST /v0/runs/{run_id}/record-merge-observation) ...; recovery=''reconcile-merge'' means the merge is already on the chain, so fishhawk_reconcile_merge (POST /v0/runs/{run_id}/reconcile-merge) can supersede the stage and complete the run ...; recovery=''none'' means no verb applies".'
+    repro_handle: fishhawk-mcp stdio tools/list
+origin:
+    issue: 3623
+    pr: 3634
+    run_id: 764eb1fe-7fab-4ece-8020-770a34bf2206
+    head_sha: fb457d7e821c04ae99a30445151bf1b58193a4a5
+    recorded_at: 2026-09-23T23:59:25Z

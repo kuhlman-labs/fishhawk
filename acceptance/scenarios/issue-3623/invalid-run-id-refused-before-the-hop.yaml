@@ -1,0 +1,14 @@
+id: scenario:issue-3623/invalid-run-id-refused-before-the-hop
+statement: Calling either new tool with a run_id that is not a UUID returns a tool error naming the offending value, and no request reaches the backend.
+verify_hint: Invoke the tool through the preview's MCP surface with run_id set to a non-UUID string and read the returned tool error.
+steps: 'Ran fishhawk-mcp (built from the sanctioned checkout) over stdio against http://localhost:8090. Counted lines in the preview''s request log (logs/fishhawkd-preview.log, one JSON ''request'' line per HTTP request), then called fishhawk_record_merge_observation {run_id:''not-a-uuid-3623''}, fishhawk_reconcile_merge {run_id:''not-a-uuid-3623''} and fishhawk_reconcile_merge {run_id:''../../v0/runs''}, then counted again. Positive control: a later call with a valid UUID did add request lines for /record-merge-observation and /reconcile-merge.'
+assertions:
+    expected: A tool error naming the offending value, and no backend request.
+    observed_at_record: 'Each call returned isError:true with ''run_id "not-a-uuid-3623" is not a valid UUID: invalid UUID length: 15'' (and ''"../../v0/runs" ... length: 13''). The preview request log gained 0 lines across the three calls.'
+    repro_handle: fishhawk-mcp stdio tools/call fishhawk_reconcile_merge {"run_id":"not-a-uuid-3623"}
+origin:
+    issue: 3623
+    pr: 3634
+    run_id: 764eb1fe-7fab-4ece-8020-770a34bf2206
+    head_sha: fb457d7e821c04ae99a30445151bf1b58193a4a5
+    recorded_at: 2026-09-23T23:59:25Z
