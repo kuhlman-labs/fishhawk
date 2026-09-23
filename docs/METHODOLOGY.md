@@ -254,6 +254,18 @@ What the declaration does and does not do, stated flatly: it raises the autonomy
 
 ---
 
+## Changes that span a forbidden governance file
+
+Every preset's implement stage declares `forbidden_paths`, and in this repository those paths are `.fishhawk/**`, `.github/workflows/**`, `.gitlab-ci.yml`, `LICENSE` and `NOTICE`. The constraint is correct and it stays: an implement agent must not rewrite the governance document that constrains it, or the workflow that gates it. `#2383` above is the pattern in practice — the escalation declaration was operator-authored precisely because `.fishhawk/**` is forbidden to the agent.
+
+The consequence is structural, not a matter of policy strictness. `forbidden_paths` is enforced against the REAL diff at the post-implement gate, so an agent cannot touch such a path even if asked to. **A change spanning a forbidden governance file therefore lands as TWO merge requests**: the in-repository half through the loop, and the governance edit by hand afterwards. There is no third option — no override flag clears it, because the boundary is what the tier buys.
+
+What that means for an acceptance criterion, stated flatly: **do not author one that demands both halves in one run.** A criterion requiring a change to a forbidden path is unsatisfiable from inside the loop; it cannot be fixed by the implement agent, so every review round re-raises it and the fix-up budget is spent on a gap that is not the agent's to close (run f199dcf1: flagged six times across three rounds, unfixable every time). Scope the run's criteria to the in-repository half and record the operator-side edit in `verification.out_of_scope`.
+
+The plan gate now says so at the point of failure rather than leaving it to be rediscovered. Its surface sweep runs an advisory `acceptance criterion requires a forbidden path` rule over each criterion's `statement` and `verify_hint`, matching any quoted or slash-bearing path token against the run's resolved implement-stage `forbidden_paths` with the same matcher the post-implement gate uses, and renders each hit to plan reviewers as an `UNENFORCEABLE CRITERION` line naming the criterion, the path, the glob that forbids it and this two-merge-request escape. It is advisory — it never refuses a plan — and a criterion that merely MENTIONS such a path clears it with a `surface_sweep_exemptions` entry whose reason reviewers can challenge. The rule's full contract, heuristic bounds and fail-open behaviour: `backend/internal/server/README.md` § "Forbidden-criterion rule (#3620)". The planner is warned of the same rule at authoring time in the plan prompt's Unenforceable-criteria rule.
+
+---
+
 ## Dogfood record
 
 What has actually been demonstrated live against a running backend, with dates. This section is the honest treatment of the E53 capstone's two demonstration criteria: both were met on 2026-07-31, and the one residual (the clamp half of criterion 7) is recorded as such — neither faked, neither hedged.

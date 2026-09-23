@@ -34,12 +34,20 @@ const categoryPlanSurfaceSweep = "plan_surface_sweep"
 // Category is set ONLY by the prose-triggered audit-category rule (#3410,
 // audit_category_sweep.go): the unregistered audit category the plan named.
 // omitempty keeps every path-triggered finding's payload byte-identical.
+//
+// ForbiddenPath and ForbiddenPattern are set ONLY by the prose-triggered
+// forbidden-criterion rule (#3620, forbidden_criterion_sweep.go): the
+// repository path an acceptance criterion named and the implement-stage
+// forbidden_paths glob that forbids it. Both carry omitempty for the same
+// reason Category does — every existing finding's payload stays byte-identical.
 type SurfaceSweepFinding struct {
-	Pattern         string   `json:"pattern"`
-	TriggerPath     string   `json:"trigger_path"`
-	MissingSiblings []string `json:"missing_siblings"`
-	SubPlanTitle    string   `json:"sub_plan_title,omitempty"`
-	Category        string   `json:"category,omitempty"`
+	Pattern          string   `json:"pattern"`
+	TriggerPath      string   `json:"trigger_path"`
+	MissingSiblings  []string `json:"missing_siblings"`
+	SubPlanTitle     string   `json:"sub_plan_title,omitempty"`
+	Category         string   `json:"category,omitempty"`
+	ForbiddenPath    string   `json:"forbidden_path,omitempty"`
+	ForbiddenPattern string   `json:"forbidden_pattern,omitempty"`
 }
 
 // CrossSliceClaim records which member files of a lockstep pattern one
@@ -502,10 +510,24 @@ func evaluateCrossSliceCoupling(parsedPlan *plan.Plan, patterns []surfacePattern
 // Advisory-only and fail-open, matching runScopePrecheck's degradation
 // contract verbatim: it guards on RunRepo+AuditRepo, resolves the run
 // first, and on any failure (run not resolvable, parse error, audit-append
-// failure) WARN-logs and returns without unwinding the upload. The sweep
-// itself needs only the plan's scope.files, but gating on a resolvable run
-// keeps it from recording an orphan advisory entry against a run that
-// doesn't exist (legacy/not-found), exactly as the scope pre-check does.
+// failure) WARN-logs and returns without unwinding the upload. Gating on a
+// resolvable run keeps it from recording an orphan advisory entry against a
+// run that doesn't exist (legacy/not-found), exactly as the scope pre-check
+// does — and since #3620 the run row is load-bearing in its own right, not
+// only a liveness gate: the forbidden-criterion rule reads the run's
+// implement-stage forbidden_paths off it, so the sweep no longer depends on
+// the plan's scope.files alone.
+//
+// Since #3620 it ALSO reads the run's implement-stage path constraints via
+// the existing fail-open s.resolveImplementConstraints — the same helper
+// runScopePrecheck calls on this request path — to feed the
+// forbidden-criterion rule. That read inherits the helper's contract
+// verbatim: an absent, unparseable or implement-stage-less spec (or one
+// configuring no forbidden_paths) skips the rule entirely and the payload is
+// byte-identical to before the rule existed. It is a SECOND parse of a value
+// already parsed once per plan upload — a bounded in-memory cost, taken
+// deliberately so the two advisory evaluators stay independent rather than
+// threading state between them.
 //
 // Returns the computed result payload so handleShipPlan can thread it
 // into the plan-review prompt's gate-evidence section (#963); nil on
@@ -518,8 +540,11 @@ func (s *Server) runSurfaceSweep(ctx context.Context, runID, stageID uuid.UUID, 
 	}
 
 	// Resolve the run first so the sweep only records against a real,
-	// resolvable run — matching runScopePrecheck's degradation contract.
-	if _, err := s.cfg.RunRepo.GetRun(ctx, runID); err != nil {
+	// resolvable run — matching runScopePrecheck's degradation contract. The
+	// row is kept (it was discarded before #3620) to feed the fail-open
+	// implement-constraints read the forbidden-criterion rule needs.
+	runRow, err := s.cfg.RunRepo.GetRun(ctx, runID)
+	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "surface sweep: get run failed",
 			slog.String("run_id", runID.String()),
 			slog.String("error", err.Error()),
@@ -529,11 +554,11 @@ func (s *Server) runSurfaceSweep(ctx context.Context, runID, stageID uuid.UUID, 
 
 	// Validation already passed in handleShipPlan; a parse failure here is
 	// an internal inconsistency — log and skip rather than block.
-	parsedPlan, err := plan.Parse(planBody)
-	if err != nil {
+	parsedPlan, perr := plan.Parse(planBody)
+	if perr != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "surface sweep: parse plan failed",
 			slog.String("run_id", runID.String()),
-			slog.String("error", err.Error()),
+			slog.String("error", perr.Error()),
 		)
 		return nil
 	}
@@ -587,6 +612,20 @@ func (s *Server) runSurfaceSweep(ctx context.Context, runID, stageID uuid.UUID, 
 	catFindings, catApplied := evaluateAuditCategoryRule(parsedPlan, audit.IsKnownCategory, exemptions)
 	findings = append(findings, catFindings...)
 	applied = append(applied, catApplied...)
+
+	// Forbidden-criterion rule (#3620): an acceptance criterion naming a
+	// repository path the implement stage's forbidden_paths structurally
+	// forbids the agent from touching. Carried in this same
+	// plan_surface_sweep entry (no category of its own), plan-level like the
+	// audit-category rule, and gated on the SAME fail-open spec read
+	// runScopePrecheck uses — when the spec is absent, unparseable, the
+	// workflow is missing, has no implement stage, or configures no
+	// forbidden_paths, the rule is skipped and the payload is unchanged.
+	if constraints, _, ok := s.resolveImplementConstraints(ctx, runRow); ok && len(constraints.ForbiddenPaths) > 0 {
+		fcFindings, fcApplied := evaluateForbiddenCriterionRule(parsedPlan, constraints.ForbiddenPaths, exemptions)
+		findings = append(findings, fcFindings...)
+		applied = append(applied, fcApplied...)
+	}
 
 	if findings == nil {
 		// Marshal an empty array rather than null so the audit payload's

@@ -1742,6 +1742,12 @@ func planGateEvidence(precheck *ScopePrecheckPayload, sweep *SurfaceSweepPayload
 				MissingSiblings: f.MissingSiblings,
 				SubPlanTitle:    f.SubPlanTitle,
 				Category:        f.Category,
+				// #3620: dropping either of these silently disarms the
+				// UNENFORCEABLE CRITERION render — the renderer branches on
+				// ForbiddenPattern and prints ForbiddenPath in the exemption
+				// key. Pinned by TestPlanGateEvidence_ForbiddenCriterionSeam.
+				ForbiddenPath:    f.ForbiddenPath,
+				ForbiddenPattern: f.ForbiddenPattern,
 			})
 		}
 		for _, f := range sweep.CrossSliceFindings {

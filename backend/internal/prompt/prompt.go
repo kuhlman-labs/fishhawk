@@ -1837,12 +1837,21 @@ type SurfaceSweepExemptionEvidence struct {
 // renders as a distinct NEW AUDIT CATEGORY line naming the token, the
 // registry file and the verify-gate test; when empty the MISSING SIBLINGS
 // render is byte-identical to before the field existed.
+//
+// ForbiddenPath and ForbiddenPattern are set ONLY by the prose-triggered
+// forbidden-criterion rule (#3620): the repository path an acceptance
+// criterion named and the implement-stage forbidden_paths glob that forbids
+// it. When ForbiddenPattern is non-empty the finding renders as a distinct
+// UNENFORCEABLE CRITERION line; when empty the MISSING SIBLINGS and NEW AUDIT
+// CATEGORY renders are byte-identical to before the fields existed.
 type SurfaceSweepFindingEvidence struct {
-	Pattern         string
-	TriggerPath     string
-	MissingSiblings []string
-	SubPlanTitle    string
-	Category        string
+	Pattern          string
+	TriggerPath      string
+	MissingSiblings  []string
+	SubPlanTitle     string
+	Category         string
+	ForbiddenPath    string
+	ForbiddenPattern string
 }
 
 // auditCategoryRegistryPath and auditCategoryVerifyTest name the registry
@@ -4571,6 +4580,18 @@ func buildPlan(t Trigger) string {
 		"harness stands one up, so it keeps firing regardless of the hint. So for a hermetic check the correct fix is to NAME its " +
 		"harness in `verify_hint` — never mark a sandbox-decidable check `skip_expected`, which skips verification the executor " +
 		"could actually perform.\n")
+	b.WriteString("Unenforceable-criteria rule: the implement stage's `forbidden_paths` constraint is enforced against the REAL diff, so a " +
+		"path it forbids — in this repository's presets `.fishhawk/**`, `.github/workflows/**`, `.gitlab-ci.yml`, `LICENSE` and `NOTICE` — is " +
+		"one the implement agent structurally CANNOT touch. An acceptance criterion demanding a change to such a path is therefore " +
+		"UNSATISFIABLE from inside the run, and every review round re-raises it unfixable. Do NOT author one: a change spanning a forbidden " +
+		"governance file lands as TWO merge requests — the in-repository half through the loop, the governance edit by hand afterwards — so " +
+		"scope this run's criteria to the in-repository half and record the operator-side edit in `verification.out_of_scope`. The plan gate " +
+		"runs a deterministic `acceptance criterion requires a forbidden path` check over each criterion's `statement` and `verify_hint`, " +
+		"matching every quoted or slash-bearing path token against the run's resolved implement-stage `forbidden_paths` with the SAME matcher " +
+		"the post-implement gate runs, and reports each hit as an ADVISORY UNENFORCEABLE CRITERION finding on the plan-review gate evidence. " +
+		"It never refuses the plan; a criterion that merely MENTIONS such a path without requiring an edit to it clears via a " +
+		"`surface_sweep_exemptions` entry {pattern: \"acceptance criterion requires a forbidden path\", sibling: \"<the path>\"} whose reason " +
+		"the reviewer can challenge.\n")
 	b.WriteString("\n")
 	b.WriteString("Cross-boundary test rule: when scope.files spans multiple architectural layers (request/response " +
 		"payload, domain type, persistence, render/consumer), verification.test_strategy MUST name an " +
@@ -5277,6 +5298,20 @@ func writePlanGateEvidence(b *strings.Builder, ev *PlanGateEvidence) {
 			b.WriteString("- findings: none (checked and clean)\n")
 		} else {
 			for _, f := range sw.Findings {
+				if f.ForbiddenPattern != "" {
+					// #3620 forbidden-criterion rule: prose-triggered, so the
+					// "trigger path" is where the path was named. Nothing is
+					// missing from scope — the path is structurally
+					// unreachable from inside the run, so the remedy is the
+					// two-merge-request escape or an exemption.
+					fmt.Fprintf(b, "- %sUNENFORCEABLE CRITERION (%s): %s, and the implement stage's forbidden_paths constraint forbids it via the glob %q. "+
+						"The implement agent structurally CANNOT satisfy this criterion — forbidden_paths is enforced against the real diff, so every review round will re-raise it. "+
+						"Operator escape: land the in-repository half in this merge request and edit the forbidden governance file by hand in a second one; an acceptance criterion should not demand both in one run. "+
+						"If this criterion does not in fact require editing %q, declare a surface_sweep_exemptions entry {pattern: %q, sibling: %q}.\n",
+						subPlanPrefix(f.SubPlanTitle), f.Pattern, f.TriggerPath, f.ForbiddenPattern,
+						f.ForbiddenPath, f.Pattern, f.ForbiddenPath)
+					continue
+				}
 				if f.Category != "" {
 					// #3410 audit-category rule: prose-triggered, so the
 					// "trigger path" is where the token was named, and the
