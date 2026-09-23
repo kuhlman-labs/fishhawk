@@ -866,9 +866,19 @@ func mergeVerdictRowCount(t *testing.T, ctx context.Context, pool *pgxpool.Pool,
 //     dispatches the shared merger seam, and the tool reports verdict_recorded +
 //     merge_queued;
 //   - re-invoke (the resume / 502-retry shape) → the endpoint finds the existing
-//     row, appends NO duplicate (already_recorded:true), yet STILL re-dispatches
-//     the merge — so the verdict-row count stays 1 while the merger is called
-//     twice.
+//     row, appends NO duplicate (already_recorded:true), and re-dispatches the
+//     merge — so the verdict-row count stays 1 while the merger is called twice.
+//
+// That re-dispatch is CONDITIONAL since E45.87 / #3622, and this fixture is a
+// deliberate FAIL-OPEN control for it rather than an unconditional claim. The
+// endpoint now runs an observe-before-dispatch rung: a chain read on every POST
+// and, on a resume, a live forge read. Here the chain carries no merge evidence
+// and the second server above wires NO GitHub client, PRStateReader or
+// ForgeResolver, so prStateReaderFor resolves no reader and the rung falls open
+// to the dispatch exactly as before — which is why the merger is still called
+// twice. The already-merged arm (merge_queued:false) is pinned by the per-side
+// units in backend/internal/server/merge_run_test.go and
+// backend/internal/mcpserver/merge_run_test.go.
 //
 // The run is left non-terminal (running) with no pr_merged entry, so the
 // client-side terminal await resolves to the resumable status=timeout under a 1s
@@ -953,8 +963,10 @@ func TestE2E_MergeRun_EndpointToolWireAndIdempotence(t *testing.T) {
 		t.Fatalf("merge_verdict_recorded rows after first invoke = %d, want 1", n)
 	}
 
-	// Re-invoke (the resume / 502-retry shape): the endpoint is idempotent — no
-	// duplicate verdict row, yet it STILL re-dispatches the merge.
+	// Re-invoke (the resume / 502-retry shape): the VERDICT-ROW half of the
+	// endpoint's idempotence holds unconditionally — no duplicate row — and the
+	// DISPATCH half re-queues here because the observe rung finds no chain
+	// evidence and no forge reader, so it falls open (see the doc comment).
 	second := callMerge()
 	if !second.AlreadyRecorded {
 		t.Error("second already_recorded = false, want true (endpoint idempotence)")

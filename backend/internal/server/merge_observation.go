@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -49,6 +50,12 @@ type mergeObservation struct {
 	MergedAt string `json:"merged_at"`
 	// ObservedAt is when Fishhawk read it — when Fishhawk learned it.
 	ObservedAt string `json:"observed_at"`
+	// observedAtTime is the same instant as ObservedAt, unserialized (an
+	// unexported field is invisible to encoding/json, so the wire shape is
+	// unchanged). appendMergeObservation uses it as the audit entry's
+	// Timestamp so the row's timestamp and its payload's observed_at are the
+	// SAME instant rather than two clock reads that can disagree.
+	observedAtTime time.Time
 }
 
 // recordMergeObservationResponse reports what the observe verb did. Recorded is
@@ -180,8 +187,10 @@ func (s *Server) handleRecordMergeObservation(w http.ResponseWriter, r *http.Req
 	// forge family is rung 5b's 409. Both refuse BEFORE the forge read, so a
 	// refusal costs no forge request and — like every other rung — leaves ZERO
 	// rows.
-	forgeID, repo, prNumber, reason := resolveObservationTarget(runRow)
-	switch reason {
+	// The repo ref is deliberately discarded here: observeForgeMerge below
+	// re-resolves the SAME deterministic function and owns the forge read.
+	forgeID, _, prNumber, targetReason := resolveObservationTarget(runRow)
+	switch targetReason {
 	case obsTargetMalformed:
 		s.writeError(w, r, http.StatusBadRequest, "record_merge_observation_malformed_pr_url",
 			"could not resolve the run's repository and pull request number from its recorded pull request URL",
@@ -227,47 +236,59 @@ func (s *Server) handleRecordMergeObservation(w http.ResponseWriter, r *http.Req
 		})
 		return
 	}
-	// Rung 7. Resolve the per-forge reader now that the forge family is known.
-	// A github-family run uses cfg.GitHub (unless the test seam overrides it);
-	// any other forge is resolved through ForgeResolver. A nil reader is a 503,
-	// never a nil dispatch.
-	reader, readerErr := s.prStateReaderFor(forgeID)
-	if readerErr != nil || reader == nil {
+	// Rungs 7-10 are the FORGE read and the three fact guards. They live in the
+	// shared, side-effect-free observeForgeMerge helper (E45.87 / #3622) so the
+	// merge endpoint's observe-before-dispatch rung runs the IDENTICAL ladder;
+	// the discriminator below reproduces this handler's ten refusal codes and
+	// statuses byte-for-byte.
+	obs, reason, forgeErr := s.observeForgeMerge(r.Context(), runRow)
+	switch reason {
+	case obsForgeNoReader:
+		// Rung 7 (reader half).
 		s.writeError(w, r, http.StatusServiceUnavailable, "record_merge_observation_unconfigured",
 			"recording a merge observation requires run + audit repositories and a forge pull-request reader", nil)
 		return
-	}
-	pr, perr := reader.GetPullRequest(r.Context(), mergeObservationScope(runRow), repo, prNumber)
-	if perr != nil {
+	case obsForgeUnavailable:
+		// Rung 7 (read half).
 		s.writeError(w, r, http.StatusBadGateway, "record_merge_observation_forge_unavailable",
 			"could not read the pull request from the forge; the merge state is unknown and nothing was recorded",
-			map[string]any{"run_id": runID.String(), "pull_request_number": prNumber, "error": perr.Error()})
+			map[string]any{"run_id": runID.String(), "pull_request_number": prNumber, "error": forgeErr.Error()})
 		return
-	}
-	// Rung 8. A nil PR is the same unknown as an error — never a merge.
-	if pr == nil || !pr.Merged {
+	case obsForgeNotMerged:
+		// Rung 8. A nil PR is the same unknown as an error — never a merge.
 		s.writeError(w, r, http.StatusConflict, "record_merge_observation_pr_not_merged",
 			"the forge reports this pull request is not merged; recording an observation would manufacture evidence for a change that never shipped",
 			map[string]any{"run_id": runID.String(), "pull_request_number": prNumber})
 		return
-	}
-	// Rung 9.
-	if pr.MergeCommitSHA == "" {
+	case obsForgeNoMergeCommit:
+		// Rung 9.
 		s.writeError(w, r, http.StatusConflict, "record_merge_observation_no_merge_commit",
 			"the forge reports this pull request merged but carries no merge commit SHA; refusing to record an observation with no commit",
 			map[string]any{"run_id": runID.String(), "pull_request_number": prNumber})
 		return
-	}
-	// Rung 10 (binding approval condition 2).
-	if pr.MergedAt == nil {
+	case obsForgeNoMergeTimestamp:
+		// Rung 10 (binding approval condition 2).
 		s.writeError(w, r, http.StatusConflict, "record_merge_observation_no_merge_timestamp",
 			"the forge reports this pull request merged but carries no merge timestamp; refusing to record a partial observation that would claim a merge time it does not have",
 			map[string]any{"run_id": runID.String(), "pull_request_number": prNumber})
 		return
+	case obsForgeMalformedTarget, obsForgeMismatchTarget:
+		// UNREACHABLE from here: rungs 5 / 5b above already refused every
+		// malformed or mismatched target, and observeForgeMerge re-resolves the
+		// SAME deterministic function over the SAME run row. Kept so the switch
+		// is total and a future reordering fails closed rather than falling
+		// through to the append with a zero observation.
+		s.writeError(w, r, http.StatusConflict, "record_merge_observation_pr_url_repo_mismatch",
+			"the run's recorded pull request URL does not name this run's repository on this run's forge family; refusing to confirm a pull request that is not this run's",
+			map[string]any{
+				"run_id":           runID.String(),
+				"repo":             runRow.Repo,
+				"forge":            forgeID,
+				"pull_request_url": prURL,
+			})
+		return
 	}
 
-	observedAt := time.Now().UTC()
-	mergedAt := pr.MergedAt.UTC()
 	// An operator-invoked observation, so actor_kind is user (or agent for an
 	// operator-role token) with the authenticated subject — a second signal
 	// alongside the category that this fact was learned by hand, not seen live
@@ -276,42 +297,149 @@ func (s *Server) handleRecordMergeObservation(w http.ResponseWriter, r *http.Req
 	if subject == "" {
 		subject = "anonymous"
 	}
-	actorKind := actorKindForSubject(subject)
-	payload, _ := json.Marshal(map[string]any{
-		"run_id":              runID.String(),
-		"pull_request_url":    prURL,
-		"pull_request_number": prNumber,
-		"merge_commit_sha":    pr.MergeCommitSHA,
-		// Both timestamps, deliberately. merged_at is WHEN THE MERGE HAPPENED
-		// (the forge's own value); observed_at is WHEN FISHHAWK LEARNED IT. The
-		// gap between them is the fact this category exists to make readable.
-		"merged_at":                 mergedAt.Format(time.RFC3339Nano),
-		"observed_at":               observedAt.Format(time.RFC3339Nano),
-		"reconciled_after_the_fact": true,
-	})
-	if _, aerr := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
-		RunID:        runID,
-		Timestamp:    observedAt,
-		Category:     CategoryMergeObservationRecorded,
-		ActorKind:    &actorKind,
-		ActorSubject: &subject,
-		Payload:      payload,
-	}); aerr != nil {
+	if aerr := s.appendMergeObservation(r.Context(), runID, subject, *obs); aerr != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 			"append merge observation failed", map[string]any{"error": aerr.Error()})
 		return
 	}
 
 	s.writeJSON(w, r, http.StatusOK, recordMergeObservationResponse{
-		RunID: runID.String(),
-		Observation: mergeObservation{
-			PullRequestURL:    prURL,
-			PullRequestNumber: prNumber,
-			MergeCommitSHA:    pr.MergeCommitSHA,
-			MergedAt:          mergedAt.Format(time.RFC3339Nano),
-			ObservedAt:        observedAt.Format(time.RFC3339Nano),
-		},
+		RunID:       runID.String(),
+		Observation: *obs,
 	})
+}
+
+// obsForgeReason discriminates how observeForgeMerge classified a run's live
+// forge answer. It mirrors handleRecordMergeObservation's rung set one-for-one
+// so the handler's ten refusal codes and statuses stay byte-for-byte unchanged
+// after the extraction, and so the merge endpoint's observe rung can fall open
+// on EVERY non-OK value without re-deriving the ladder (E45.87 / #3622).
+type obsForgeReason int
+
+const (
+	// obsForgeOK — the forge reports merged, with a merge commit SHA and a
+	// merge timestamp. The ONLY value on which a row may be appended.
+	obsForgeOK obsForgeReason = iota
+	obsForgeMalformedTarget
+	obsForgeMismatchTarget
+	obsForgeNoReader
+	obsForgeUnavailable
+	obsForgeNotMerged
+	obsForgeNoMergeCommit
+	obsForgeNoMergeTimestamp
+)
+
+// forgeMergeState renders the reason as the stable snake_case token the merge
+// endpoint's widened 502 surfaces in details.forge_merge_state, so an operator
+// reading a dispatch failure can tell "the forge says it is NOT merged" from
+// "we could not read the forge at all".
+func (r obsForgeReason) forgeMergeState() string {
+	switch r {
+	case obsForgeOK:
+		return "merged"
+	case obsForgeMalformedTarget:
+		return "malformed_pr_url"
+	case obsForgeMismatchTarget:
+		return "pr_url_repo_mismatch"
+	case obsForgeNoReader:
+		return "no_forge_reader"
+	case obsForgeUnavailable:
+		return "forge_unavailable"
+	case obsForgeNotMerged:
+		return "not_merged"
+	case obsForgeNoMergeCommit:
+		return "merged_without_commit_sha"
+	case obsForgeNoMergeTimestamp:
+		return "merged_without_timestamp"
+	}
+	return "unknown"
+}
+
+// observeForgeMerge performs the LIVE forge read behind the merge-observation
+// verb and classifies the answer. It is SIDE-EFFECT-FREE: it writes nothing,
+// appends nothing, and mutates no run — the caller decides what to do with the
+// verdict. Extracted in E45.87 / #3622 so POST /v0/runs/{run_id}/merge can run
+// the same ladder before dispatching a merge that may already have landed.
+//
+// It runs EXACTLY the rungs handleRecordMergeObservation runs after its chain
+// check: resolveObservationTarget (whose malformed/mismatch outcomes map onto
+// the two target reasons — the merge handler falls open on them, while the
+// observe handler has already refused them at rungs 5 / 5b), prStateReaderFor,
+// reader.GetPullRequest scoped by mergeObservationScope, and the three fact
+// guards (merged, a non-empty merge commit SHA, a non-nil merged_at).
+//
+// The returned observation is non-nil ONLY on obsForgeOK. forgeErr is non-nil
+// ONLY on obsForgeUnavailable, carrying the GetPullRequest error verbatim so
+// the observe handler's 502 detail is unchanged.
+func (s *Server) observeForgeMerge(ctx context.Context, runRow *run.Run) (obs *mergeObservation, reason obsForgeReason, forgeErr error) {
+	forgeID, repo, prNumber, targetReason := resolveObservationTarget(runRow)
+	switch targetReason {
+	case obsTargetMalformed:
+		return nil, obsForgeMalformedTarget, nil
+	case obsTargetMismatch:
+		return nil, obsForgeMismatchTarget, nil
+	}
+	reader, readerErr := s.prStateReaderFor(forgeID)
+	if readerErr != nil || reader == nil {
+		return nil, obsForgeNoReader, nil
+	}
+	pr, perr := reader.GetPullRequest(ctx, mergeObservationScope(runRow), repo, prNumber)
+	if perr != nil {
+		return nil, obsForgeUnavailable, perr
+	}
+	// A nil PR is the same unknown as an error — never a merge.
+	if pr == nil || !pr.Merged {
+		return nil, obsForgeNotMerged, nil
+	}
+	if pr.MergeCommitSHA == "" {
+		return nil, obsForgeNoMergeCommit, nil
+	}
+	if pr.MergedAt == nil {
+		return nil, obsForgeNoMergeTimestamp, nil
+	}
+	prURL := ""
+	if runRow.PullRequestURL != nil {
+		prURL = *runRow.PullRequestURL
+	}
+	observedAt := time.Now().UTC()
+	return &mergeObservation{
+		PullRequestURL:    prURL,
+		PullRequestNumber: prNumber,
+		MergeCommitSHA:    pr.MergeCommitSHA,
+		MergedAt:          pr.MergedAt.UTC().Format(time.RFC3339Nano),
+		ObservedAt:        observedAt.Format(time.RFC3339Nano),
+		observedAtTime:    observedAt,
+	}, obsForgeOK, nil
+}
+
+// appendMergeObservation appends the ONE chained merge_observation_recorded
+// entry for a confirmed forge merge. It is the SOLE writer of that category
+// (E45.87 / #3622): both the observe verb and the merge endpoint's observe rung
+// route through it, so the payload shape cannot drift between them.
+//
+// It records BOTH timestamps deliberately. merged_at is WHEN THE MERGE HAPPENED
+// (the forge's own value); observed_at is WHEN FISHHAWK LEARNED IT. The gap
+// between them is the fact this category exists to make readable.
+func (s *Server) appendMergeObservation(ctx context.Context, runID uuid.UUID, subject string, obs mergeObservation) error {
+	actorKind := actorKindForSubject(subject)
+	payload, _ := json.Marshal(map[string]any{
+		"run_id":                    runID.String(),
+		"pull_request_url":          obs.PullRequestURL,
+		"pull_request_number":       obs.PullRequestNumber,
+		"merge_commit_sha":          obs.MergeCommitSHA,
+		"merged_at":                 obs.MergedAt,
+		"observed_at":               obs.ObservedAt,
+		"reconciled_after_the_fact": true,
+	})
+	_, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:        runID,
+		Timestamp:    obs.observedAtTime,
+		Category:     CategoryMergeObservationRecorded,
+		ActorKind:    &actorKind,
+		ActorSubject: &subject,
+		Payload:      payload,
+	})
+	return err
 }
 
 // prStateReaderFor resolves the forge PR reader for a run's forge FAMILY

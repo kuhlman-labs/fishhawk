@@ -38,13 +38,32 @@ type mergeRunRequest struct {
 // mergeRunResponse reports the recorded verdict + queued merge. merge_queued is
 // true once the merge helper was dispatched; already_recorded is true when a
 // prior merge_verdict_recorded row existed (an idempotent re-POST) so no fresh
-// row was appended — the merge helper is dispatched regardless.
+// row was appended.
+//
+// E45.87 / #3622 widens it with four ADDITIVE fields, all zero-valued on the
+// ordinary dispatch path so existing consumers are byte-compatible:
+//
+//   - already_merged — the PR/MR was ALREADY merged, so NO merge was queued
+//     (merge_queued is false on that path).
+//   - merge_observation_recorded — THIS call appended the
+//     merge_observation_recorded row. TRUE ONLY when the append SUCCEEDED
+//     (binding approval condition 1): false when the chain already carried
+//     evidence, and false when the append itself failed.
+//   - run_state — the run's lifecycle state after the best-effort completion
+//     re-evaluation; empty when the re-read failed.
+//   - message — the operator-facing explanation on the already-merged path:
+//     what was (or was not) recorded, and which recovery verb to reach for.
 type mergeRunResponse struct {
 	RunID           string `json:"run_id"`
 	MergeQueued     bool   `json:"merge_queued"`
 	VerdictSequence int64  `json:"verdict_sequence"`
 	AlreadyRecorded bool   `json:"already_recorded"`
 	PRURL           string `json:"pr_url"`
+
+	AlreadyMerged            bool   `json:"already_merged,omitempty"`
+	MergeObservationRecorded bool   `json:"merge_observation_recorded,omitempty"`
+	RunState                 string `json:"run_state,omitempty"`
+	Message                  string `json:"message,omitempty"`
 }
 
 // handleMergeRun implements POST /v0/runs/{run_id}/merge (E48.7 / #1954): the
@@ -87,11 +106,22 @@ type mergeRunResponse struct {
 // in feature_change that stage settles ON merge via resolveReviewStageOnMerge,
 // so requiring it settled first would deadlock the human merge path.
 //
-// Idempotence lives on the ENDPOINT (binding approval condition 1): a repeated
-// POST that finds an existing merge_verdict_recorded row appends NO duplicate
-// row and responds already_recorded:true, but ALWAYS re-dispatches the merge
-// helper — so a 502-then-reinvoke re-queues the merge without ever duplicating
-// the verdict.
+// Idempotence lives on the ENDPOINT, and it has TWO halves that must be stated
+// separately (E45.87 / #3622 narrows what used to be a bare "the endpoint is
+// idempotent"):
+//
+//   - the VERDICT half (binding approval condition 1 of #1954): a repeated POST
+//     that finds an existing merge_verdict_recorded row appends NO duplicate row
+//     and responds already_recorded:true;
+//   - the DISPATCH half: a re-POST no longer re-dispatches BLINDLY. Re-queuing a
+//     merge for a PR/MR that has already merged errors on both forges, so the
+//     documented "re-invoke to resume" recovery returned 502
+//     merge_dispatch_failed in the exact case where the operation had WORKED
+//     (the merge settled through the webhook during the bounded wait). The
+//     observe-before-dispatch rung below reads the chain on every POST and, on a
+//     RESUME, the forge; when the PR is already merged it SKIPS the dispatch and
+//     answers 200 already_merged:true / merge_queued:false. Every uncertainty
+//     falls through to the dispatch exactly as before.
 //
 // On the merge helper erroring the handler branches on the cause. A
 // checks-not-all-passed refusal (forge.ErrPullRequestUnstableStatus — GitHub
@@ -276,6 +306,10 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 	// index's collision (not an unrelated 23505 on the hash-chain / entry-hash
 	// / (run_id, sequence) uniqueness); the loser re-reads the winner's
 	// sequence, responds already_recorded, and still dispatches the merge.
+	subject := id.Subject
+	if subject == "" {
+		subject = "anonymous"
+	}
 	existing, err := s.cfg.AuditRepo.ListForRunByCategory(r.Context(), runID, CategoryMergeVerdictRecorded)
 	if err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
@@ -288,10 +322,6 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 		// Reuse the earliest recorded verdict's sequence (chain-stable).
 		verdictSequence = earliestMergeVerdictSequence(existing)
 	} else {
-		subject := id.Subject
-		if subject == "" {
-			subject = "anonymous"
-		}
 		actorKind := audit.ActorUser
 		payload, _ := json.Marshal(map[string]any{
 			"run_id":    runID.String(),
@@ -346,6 +376,31 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 				"record merge verdict failed", map[string]any{"error": aerr.Error()})
 			return
 		}
+	}
+
+	// OBSERVE BEFORE DISPATCH (E45.87 / #3622). Re-queuing a merge for a PR/MR
+	// that has ALREADY merged errors on both forges, so the documented
+	// "re-invoke to resume" recovery returned 502 merge_dispatch_failed in the
+	// exact case where the operation had WORKED — the merge settled through the
+	// webhook during fishhawk_merge_run's bounded wait.
+	//
+	// PLACEMENT: AFTER the durable merge_verdict_recorded append, unlike the
+	// conflict guard above which refuses BEFORE it. The rationale differs by
+	// case: the conflict guard refuses a merge that structurally CANNOT queue,
+	// so its verdict would be a false record, whereas here the merge genuinely
+	// HAPPENED — the operator's verdict is a TRUE record and must be durable.
+	//
+	// Two tiers, and EVERY uncertainty falls through to today's dispatch (the
+	// prMergeConflicting fail-open posture):
+	//   (a) a CHEAP chain read on every POST (runPRObservablyMerged over
+	//       pr_merged / post_merge_observed / merge_observation_recorded). A
+	//       read error is logged and treated as NO evidence — never a 500.
+	//   (b) a LIVE forge read on a RESUME ONLY (alreadyRecorded — an existing
+	//       verdict row, i.e. the shape this issue reports). A first POST pays
+	//       ZERO forge requests.
+	if obs := s.observeMergeAlreadyLanded(r.Context(), runID, runRow, subject, alreadyRecorded); obs.Landed {
+		s.writeAlreadyMergedResponse(w, r, runID, prURL, verdictSequence, alreadyRecorded, obs)
+		return
 	}
 
 	// Dispatch the shared merge helper. The verdict row is already durable, so a
@@ -413,11 +468,35 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, r, http.StatusConflict, "merge_checks_pending", msg, details)
 			return
 		}
+		// RE-OBSERVE ONCE (E45.87 / #3622). A merge that landed in the
+		// observe-to-dispatch window — or one the dispatch itself rejected
+		// BECAUSE the PR was already merged — resolves as already_merged
+		// instead of a 502 that tells the operator to retry an operation that
+		// already succeeded. The forge read is unconditional here (not gated on
+		// alreadyRecorded): the dispatch has already failed, so the extra read
+		// is paid only on an error path.
+		obs := s.observeMergeAlreadyLanded(r.Context(), runID, runRow, subject, true)
+		if obs.Landed {
+			s.writeAlreadyMergedResponse(w, r, runID, prURL, verdictSequence, alreadyRecorded, obs)
+			return
+		}
 		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn, "merge: dispatch merge failed",
-			slog.String("run_id", runID.String()), slog.String("error", merr.Error()))
+			slog.String("run_id", runID.String()), slog.String("error", merr.Error()),
+			slog.String("forge_merge_state", obs.ForgeState))
+		// The observed state is named in the MESSAGE, not only in the details:
+		// a 5xx body's details are default-deny redacted (errors.go's
+		// redactableDetailKeys), so an un-allow-listed forge_merge_state key
+		// would never reach the caller. It is still passed as a detail because
+		// writeError logs the FULL pre-redaction map against the error_ref, so
+		// the operator's log record carries it alongside the raw cause.
 		s.writeError(w, r, http.StatusBadGateway, "merge_dispatch_failed",
-			"the merge verdict is recorded and durable, but queuing the squash merge failed; retry the merge",
-			map[string]any{"run_id": runID.String(), "error": merr.Error(), "verdict_sequence": verdictSequence})
+			"the merge verdict is recorded and durable, but queuing the squash merge failed; retry the merge. The pull request was re-read from the forge and did NOT confirm a merge (forge_merge_state="+obs.ForgeState+"). If the pull request has in fact already merged, POST /v0/runs/{run_id}/record-merge-observation to record the merge observation, then POST /v0/runs/{run_id}/reconcile-merge to settle the run.",
+			map[string]any{
+				"run_id":            runID.String(),
+				"error":             merr.Error(),
+				"verdict_sequence":  verdictSequence,
+				"forge_merge_state": obs.ForgeState,
+			})
 		return
 	}
 
@@ -499,4 +578,135 @@ func earliestMergeVerdictSequence(entries []*audit.Entry) int64 {
 		}
 	}
 	return seq
+}
+
+// mergeObserveResult is what the merge endpoint's observe-before-dispatch rung
+// concluded (E45.87 / #3622).
+//
+// Landed is the only field the dispatch decision reads: true means the PR/MR is
+// ALREADY merged and the merge MUST NOT be dispatched — re-queuing a merge for
+// an already-merged pull request errors on both forges, which is the whole
+// defect. Recorded is true ONLY when THIS call successfully appended the
+// merge_observation_recorded row (binding approval condition 1): it is false
+// when the chain already carried evidence AND false when the append failed.
+// AppendErr carries that append failure so the response can name
+// record-merge-observation as the recovery. ForgeState is the stable
+// classification token the widened 502 surfaces.
+type mergeObserveResult struct {
+	Landed     bool
+	Recorded   bool
+	AppendErr  error
+	ForgeState string
+}
+
+// observeMergeAlreadyLanded runs the observe rung for handleMergeRun. It is
+// BEST-EFFORT and FAIL-OPEN in the established prMergeConflicting posture:
+// EVERY uncertainty returns Landed:false so the caller dispatches exactly as it
+// does today. It never writes an HTTP response and never returns an error.
+//
+// Tier (a), always: the CHEAP chain read (runPRObservablyMerged over pr_merged /
+// post_merge_observed / merge_observation_recorded). A read error is logged and
+// treated as NO evidence — fail open to the dispatch, never a 500.
+//
+// Tier (b), only when allowForgeRead: the LIVE forge read through the SHARED
+// observeForgeMerge ladder, and on its OK verdict the SHARED
+// appendMergeObservation. allowForgeRead is the resume-only gate — the happy
+// FIRST post pays zero forge requests — and is forced true on the
+// dispatch-error re-observe, where the extra read is paid only on an error path.
+//
+// BINDING APPROVAL CONDITION 1: when the forge CONFIRMS the merge but the
+// append FAILS, the result is still Landed:true with Recorded:false. The merge
+// already happened, so dispatching it would reproduce the very failure this
+// rung exists to prevent; the un-persisted observation is reported to the
+// operator with record-merge-observation named as the recovery instead.
+func (s *Server) observeMergeAlreadyLanded(ctx context.Context, runID uuid.UUID, runRow *run.Run,
+	subject string, allowForgeRead bool) mergeObserveResult {
+	already, cerr := s.runPRObservablyMerged(ctx, runID)
+	if cerr != nil {
+		// Fail OPEN: an unreadable chain is not evidence of a merge, and a
+		// merge verb must not 500 because a read it did not need failed.
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"merge: observe rung: chain read failed; proceeding to dispatch (fail open)",
+			slog.String("run_id", runID.String()), slog.String("error", cerr.Error()))
+		return mergeObserveResult{ForgeState: "chain_read_error"}
+	}
+	if already {
+		return mergeObserveResult{Landed: true, ForgeState: "chain_evidence"}
+	}
+	if !allowForgeRead {
+		// Resume-only gate: a FIRST post never reads the forge.
+		return mergeObserveResult{ForgeState: "not_observed"}
+	}
+	obs, reason, forgeErr := s.observeForgeMerge(ctx, runRow)
+	if reason != obsForgeOK {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+			"merge: observe rung: forge read did not confirm a merge; proceeding to dispatch (fail open)",
+			slog.String("run_id", runID.String()),
+			slog.String("forge_merge_state", reason.forgeMergeState()),
+			slog.Bool("forge_error", forgeErr != nil))
+		return mergeObserveResult{ForgeState: reason.forgeMergeState()}
+	}
+	if aerr := s.appendMergeObservation(ctx, runID, subject, *obs); aerr != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelError,
+			"merge: observe rung: forge confirms the merge but the observation row could not be persisted",
+			slog.String("run_id", runID.String()), slog.String("error", aerr.Error()))
+		return mergeObserveResult{Landed: true, AppendErr: aerr, ForgeState: reason.forgeMergeState()}
+	}
+	return mergeObserveResult{Landed: true, Recorded: true, ForgeState: reason.forgeMergeState()}
+}
+
+// writeAlreadyMergedResponse answers the already-merged path with 200,
+// already_merged:true and merge_queued:FALSE (E45.87 / #3622).
+//
+// Before answering it best-effort SETTLES: advanceRunAfterReviewResolve is the
+// same helper reconcile-merge uses — it no-ops on a nil orchestrator and on a
+// stage set that is not all-terminal, and never unwinds — then the run is
+// re-read so run_state reports what actually happened. reconcile-merge's
+// stage-supersede sweep is deliberately NOT folded in: merge_observation.go's
+// contract splits OBSERVE from SETTLE, and this rung is the observe half.
+//
+// A still-non-terminal run names POST /v0/runs/{run_id}/reconcile-merge; a
+// failed observation append names POST /v0/runs/{run_id}/record-merge-observation
+// (binding approval condition 1).
+func (s *Server) writeAlreadyMergedResponse(w http.ResponseWriter, r *http.Request, runID uuid.UUID,
+	prURL string, verdictSequence int64, alreadyRecorded bool, obs mergeObserveResult) {
+	s.advanceRunAfterReviewResolve(r.Context(), runID)
+
+	runState := ""
+	if fresh, ferr := s.cfg.RunRepo.GetRun(r.Context(), runID); ferr == nil && fresh != nil {
+		runState = string(fresh.State)
+	}
+
+	msg := "the pull request is already merged, so no merge was queued."
+	switch {
+	case obs.AppendErr != nil:
+		msg += " The forge confirms the merge, but the merge_observation_recorded row could NOT be persisted (" +
+			obs.AppendErr.Error() + "); POST /v0/runs/{run_id}/record-merge-observation to record it."
+	case obs.Recorded:
+		msg += " This call recorded the merge observation on the run's audit chain."
+	default:
+		msg += " The run's audit chain already carried merge evidence, so no new observation row was appended."
+	}
+	if runState != "" && !run.State(runState).IsTerminal() {
+		msg += " The run is still " + runState +
+			"; POST /v0/runs/{run_id}/reconcile-merge to settle it."
+	}
+
+	s.cfg.Logger.LogAttrs(r.Context(), slog.LevelInfo, "merge: pull request already merged; skipping dispatch",
+		slog.String("run_id", runID.String()),
+		slog.String("forge_merge_state", obs.ForgeState),
+		slog.Bool("merge_observation_recorded", obs.Recorded),
+		slog.String("run_state", runState))
+
+	s.writeJSON(w, r, http.StatusOK, mergeRunResponse{
+		RunID:                    runID.String(),
+		MergeQueued:              false,
+		VerdictSequence:          verdictSequence,
+		AlreadyRecorded:          alreadyRecorded,
+		PRURL:                    prURL,
+		AlreadyMerged:            true,
+		MergeObservationRecorded: obs.Recorded,
+		RunState:                 runState,
+		Message:                  msg,
+	})
 }
