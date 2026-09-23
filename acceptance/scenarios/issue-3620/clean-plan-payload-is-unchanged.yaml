@@ -1,0 +1,14 @@
+id: scenario:issue-3620/clean-plan-payload-is-unchanged
+statement: A plan whose acceptance criteria name no forbidden path produces a plan_surface_sweep audit entry carrying no unenforceable-criterion finding and no forbidden_pattern key, so the advisory is silent on the ordinary plan.
+verify_hint: 'GET /v0/runs/{run_id}/audit for a run whose shipped plan names no forbidden path: the plan_surface_sweep entry''s findings array contains no object carrying a forbidden_pattern key.'
+steps: POST http://localhost:8090/v0/dev/fixtures {"scenario":"trace-upload-target"} -> 201 (run d5326e84-f15e-437f-9adb-8c1a0479e9cc, plan stage 4191beb4-624f-45a9-8e53-ac5fdd86ca3f). POST /v0/runs/{run}/signing-key; POST /v0/dev/sign over 'prompt:{plan}'; signed GET /v0/stages/{plan}/prompt -> 200. Built a standard_v1 plan whose scope.files is [docs/METHODOLOGY.md] and whose single acceptance criterion names only the ordinary path `docs/METHODOLOGY.md`. Signed it via /v0/dev/sign and POSTed /v0/runs/{run}/plan?stage_id={plan} with X-Fishhawk-Signature -> 201. Then GET /v0/runs/{run}/audit?category=plan_surface_sweep.
+assertions:
+    expected: plan_surface_sweep findings contain no object carrying a forbidden_pattern key.
+    observed_at_record: 'One plan_surface_sweep entry with payload {findings:[], scanned_files:1, applied_exemptions:[], cross_slice_findings:[]}. There is no unenforceable-criterion finding and no forbidden_pattern or forbidden_path key anywhere in the payload, and the key set matches the pre-existing shape. Caveat: the seeded run''s implement stage declares no forbidden_paths, so this shows the payload is unchanged and silent on an ordinary plan. It does not show silence while the rule is armed.'
+    repro_handle: GET /v0/runs/d5326e84-f15e-437f-9adb-8c1a0479e9cc/audit?category=plan_surface_sweep
+origin:
+    issue: 3620
+    pr: 3633
+    run_id: fb93b381-734e-4501-a30f-ea9d16c26572
+    head_sha: 42cf01c58625d1533903e8f0a28267d55e98f2c9
+    recorded_at: 2026-09-23T22:27:46Z
