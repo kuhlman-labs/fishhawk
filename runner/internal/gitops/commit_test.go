@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // runReal initializes a git repo on disk and exercises CommitAndPush
@@ -6462,4 +6463,151 @@ func TestIsRemoteAuthRejected(t *testing.T) {
 			t.Errorf("the classifier does not match git's real 401 stderr — update remoteAuthRejectedMarkers: %v", lsErr)
 		}
 	})
+}
+
+// --- non-interactive git env pin (E45.80 / #3613) ----------------------------
+
+// TestRunOutEnv_PinsNonInteractive is the COUNTERFACTUAL VEHICLE for the
+// non-interactive pin: it captures the *exec.Cmd through the p.Cmd seam and
+// asserts both pinned variables reach cmd.Env, with a nil caller env and with
+// a non-empty one — the nil case is the hole this closes, where cmd.Env was
+// left nil and the child inherited the parent environment unpinned.
+//
+// The two pins are NOT of equal weight, and both presences are asserted so a
+// silent drop of either is RED:
+//
+//   - GIT_TERMINAL_PROMPT=0 is LOAD-BEARING. Its absence reopens the run
+//     f199dcf1 wedge even with a working /bin/false.
+//   - GIT_ASKPASS=/bin/false is DEFENCE IN DEPTH. Its absence — or a host or
+//     image with no /bin/false at all — still leaves git refusing at the
+//     terminal-prompt step, which GIT_TERMINAL_PROMPT=0 rejects.
+//
+// It is deterministic (an env capture, no real credential challenge and no
+// dependence on whether the host has a tty), which is exactly why the
+// deletion counterfactual is run HERE and not against the two behavioural
+// tests below.
+func TestRunOutEnv_PinsNonInteractive(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	dir := t.TempDir()
+	callerEnv := []string{"GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=http.x.extraheader", "GIT_CONFIG_VALUE_0=AUTHORIZATION: basic zz"}
+
+	capture := func(run func(p *Pusher)) *exec.Cmd {
+		t.Helper()
+		var got *exec.Cmd
+		p := &Pusher{Cmd: func(ctx context.Context, name string, args ...string) *exec.Cmd {
+			got = exec.CommandContext(ctx, name, args...)
+			return got
+		}}
+		run(p)
+		if got == nil {
+			t.Fatal("the Cmd seam was never invoked")
+		}
+		return got
+	}
+
+	for _, tc := range []struct {
+		name string
+		env  []string
+	}{
+		{"nil caller env", nil},
+		{"non-empty caller env", callerEnv},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := capture(func(p *Pusher) {
+				_, _ = p.runOutEnv(context.Background(), dir, tc.env, "version")
+			})
+			for _, want := range NonInteractiveEnv() {
+				if !slices.Contains(cmd.Env, want) {
+					t.Errorf("runOutEnv cmd.Env is missing %q; git could block on a credential prompt and wedge the process group on SIGTTIN (run f199dcf1)", want)
+				}
+			}
+			if len(tc.env) == 0 {
+				return
+			}
+			// The caller's entries must come AFTER the pins so a caller (or
+			// authedRemoteOp) keeps the last word, and the pins must come
+			// after os.Environ() so an inherited GIT_TERMINAL_PROMPT=1 loses.
+			lastPin := -1
+			for _, pin := range NonInteractiveEnv() {
+				if i := slices.Index(cmd.Env, pin); i > lastPin {
+					lastPin = i
+				}
+			}
+			for _, e := range tc.env {
+				if i := slices.Index(cmd.Env, e); i < lastPin {
+					t.Errorf("caller env %q is at %d, before the last pin at %d; caller entries must win", e, i, lastPin)
+				}
+			}
+		})
+	}
+
+	t.Run("probeOut", func(t *testing.T) {
+		cmd := capture(func(p *Pusher) {
+			_, _, _ = p.probeOut(context.Background(), dir, "version")
+		})
+		for _, want := range NonInteractiveEnv() {
+			if !slices.Contains(cmd.Env, want) {
+				t.Errorf("probeOut cmd.Env is missing %q", want)
+			}
+		}
+	})
+}
+
+// TestRunOutEnv_NoCredential_FailsFastNotPrompt is the DONE-MEANS test for the
+// non-interactive half: a REAL git ls-remote meets a listener that CHALLENGES
+// for credentials (401 + WWW-Authenticate) with no usable credential, and must
+// RETURN a non-zero failure carrying git's `terminal prompts disabled` wording
+// — the error identity emitted only under GIT_TERMINAL_PROMPT=0 — rather than
+// opening a prompt.
+//
+// The credential challenge is the load-bearing half of the fixture: a
+// connection REFUSAL would fail identically with or without the pins and could
+// not establish anything (operator approval condition 1).
+//
+// SAFETY: this is NOT a counterfactual vehicle. With the pin deleted on a
+// tty-bearing host git PROMPTS, the test's process group takes SIGTTIN and
+// `go test` STOPS rather than fails — which is the defect itself. Run the
+// deletion counterfactual against TestRunOutEnv_PinsNonInteractive instead.
+//
+// The bound is RETURNING-AT-ALL, not a latency assertion (#1984): the context
+// deadline is generous, and the assertion is that the call came back before it
+// rather than that it came back quickly.
+func TestRunOutEnv_NoCredential_FailsFastNotPrompt(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	// Neutralize only the credential HELPER (osxkeychain lives in the SYSTEM
+	// config on macOS), deliberately WITHOUT calling gitNoPromptEnv — it sets
+	// GIT_TERMINAL_PROMPT itself and would mask the control under test.
+	// GIT_CONFIG_GLOBAL points at the runTestMain pin file, not /dev/null, per
+	// the #3507 coupling.
+	globalConfig := gitMaintenancePinPath
+	if globalConfig == "" {
+		globalConfig = "/dev/null"
+	}
+	t.Setenv("GIT_CONFIG_GLOBAL", globalConfig)
+	t.Setenv("GIT_CONFIG_SYSTEM", "/dev/null")
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("WWW-Authenticate", `Basic realm="git"`)
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	// An EMPTY push token means authConfigEnv returns nil: no credential is
+	// supplied at all, so the challenge cannot be satisfied.
+	got, err := RemoteBranchTipURL(ctx, t.TempDir(), srv.URL, "main", "")
+	if ctx.Err() != nil {
+		t.Fatalf("the git op did not return within the bound — it blocked rather than failing (err=%v)", err)
+	}
+	if err == nil {
+		t.Fatalf("RemoteBranchTipURL = %q, nil; want a credential failure against a 401 listener", got)
+	}
+	if !strings.Contains(err.Error(), "terminal prompts disabled") {
+		t.Errorf("error = %v\nwant git's `terminal prompts disabled` wording, which is emitted only under GIT_TERMINAL_PROMPT=0", err)
+	}
 }

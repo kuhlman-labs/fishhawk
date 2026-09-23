@@ -2182,10 +2182,13 @@ func porcelainPath(line string) string {
 //
 // It returns nil (ambient auth, byte-identical to the pre-token behavior) when
 // pushToken is empty, or when remoteURL is not http/https (file-path bare-repo
-// tests, SSH remotes). http:// is accepted alongside https:// deliberately:
-// production RemoteURLs are always https://github.com/..., and an http URL only
-// arises in tests / self-hosted setups where the header IS the intended auth —
-// it is what makes the dumb-HTTP end-to-end test possible without a network.
+// tests, SSH remotes). No host is special-cased: RemoteURL is whatever the
+// caller's forge resolves to (github.com, gitlab.com, or a self-managed GitLab
+// host — see the runner's remoteURLFor seam, E45.80 / #3613), and the
+// extraheader key is derived from that URL's OWN host via pushHost. http:// is
+// accepted alongside https:// deliberately — it arises in the dumb-HTTP
+// end-to-end tests and in self-hosted setups where the header IS the intended
+// auth, which is what makes those tests possible without a network.
 func authConfigEnv(remoteURL, pushToken string) ([]string, error) {
 	if pushToken == "" {
 		return nil, nil
@@ -2242,11 +2245,53 @@ func (p *Pusher) runOut(ctx context.Context, dir string, gitArgs ...string) (str
 	return p.runOutEnv(ctx, dir, nil, gitArgs...)
 }
 
-// runOutEnv is runOut with extra process-environment entries. When env is
-// non-empty the child runs with cmd.Env = os.Environ() + env, scoping the
-// auth GIT_CONFIG_* entries to that single invocation and writing nothing to
-// any config file; a nil/empty env leaves cmd.Env nil so the child inherits
-// the parent environment byte-identically to before this seam existed.
+// NonInteractiveEnv is the environment pin that makes every git child the
+// runner spawns fail FAST on a missing or unusable credential instead of
+// blocking on an interactive prompt.
+//
+// The failure it closes (run f199dcf1 / stage b62aec66): a remote-touching
+// git op met a credential challenge it could not satisfy and opened a
+// terminal prompt. git read the controlling terminal from a BACKGROUND
+// process group, so the kernel delivered SIGTTIN to the WHOLE group — the
+// runner itself included. The runner stopped in state T executing no
+// instructions: it could not report, could not retry, and could not observe
+// its own deadline, so the backend reported `running` for 57 minutes behind a
+// stopped process. That is also why #3598's runner-side reap-failure channel
+// structurally cannot cover this class — a stopped process reports nothing —
+// and why the fix must remove the PROMPT rather than add a runner-side
+// timeout.
+//
+// The two pins are NOT of equal weight:
+//
+//   - GIT_TERMINAL_PROMPT=0 is LOAD-BEARING. It carries the guarantee: git
+//     refuses to read a credential from the terminal and fails with
+//     `could not read Username for '<url>': terminal prompts disabled`.
+//   - GIT_ASKPASS=/bin/false is DEFENCE IN DEPTH. It suppresses the askpass
+//     path first, before the terminal prompt is ever reached. A host or image
+//     WITHOUT /bin/false is still safe: git's exec of the missing helper
+//     fails and it falls back to the terminal prompt, which
+//     GIT_TERMINAL_PROMPT=0 then refuses. (An EMPTY GIT_ASKPASS would fall
+//     through to the next askpass source rather than suppress it, which is
+//     why the pin names a program rather than "".)
+//
+// Two honest residuals: an ssh:// passphrase prompt is NOT covered (pinning
+// GIT_SSH_COMMAND would override an operator's own), and a credential HELPER
+// that opens its own GUI or tty is not covered by GIT_TERMINAL_PROMPT.
+func NonInteractiveEnv() []string {
+	return []string{"GIT_TERMINAL_PROMPT=0", "GIT_ASKPASS=/bin/false"}
+}
+
+// runOutEnv is runOut with extra process-environment entries. The child ALWAYS
+// runs with cmd.Env = os.Environ() + NonInteractiveEnv() + env: the
+// non-interactive pin must not have holes, so it is applied unconditionally
+// rather than only when a caller env is present (a nil caller env used to
+// leave cmd.Env nil and the child inherited unpinned). A non-empty env scopes
+// the auth GIT_CONFIG_* entries to that single invocation and writes nothing
+// to any config file.
+//
+// Order is load-bearing: the pins sit AFTER os.Environ() so an inherited
+// GIT_TERMINAL_PROMPT=1 cannot win, and BEFORE the caller's env so
+// authedRemoteOp's own pins keep their exact-equality contract.
 func (p *Pusher) runOutEnv(ctx context.Context, dir string, env []string, gitArgs ...string) (string, error) {
 	binary := p.Binary
 	if binary == "" {
@@ -2258,9 +2303,7 @@ func (p *Pusher) runOutEnv(ctx context.Context, dir string, env []string, gitArg
 	}
 	cmd := cmdFn(ctx, binary, gitArgs...)
 	cmd.Dir = dir
-	if len(env) > 0 {
-		cmd.Env = append(os.Environ(), env...)
-	}
+	cmd.Env = append(append(os.Environ(), NonInteractiveEnv()...), env...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -2680,6 +2723,10 @@ func safeConfigPart(part string) string {
 //
 // The code is -1 when the failure was not a non-zero exit (git absent, context
 // cancelled), which is never the pass case.
+//
+// It carries NonInteractiveEnv() for the same reason runOutEnv does: the pin
+// must have no holes, and a probe that blocked on a credential prompt would
+// wedge the runner exactly as run f199dcf1 did.
 func (p *Pusher) probeOut(ctx context.Context, dir string, gitArgs ...string) (string, int, error) {
 	binary := p.Binary
 	if binary == "" {
@@ -2691,6 +2738,7 @@ func (p *Pusher) probeOut(ctx context.Context, dir string, gitArgs ...string) (s
 	}
 	cmd := cmdFn(ctx, binary, gitArgs...)
 	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), NonInteractiveEnv()...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

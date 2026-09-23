@@ -168,10 +168,15 @@ type acceptancePersistInputs struct {
 	// detached merge-candidate checkout the scenario commit is made in.
 	treeDir string
 	// runBranch / remoteURL / pushToken address the push. An empty runBranch
-	// (older backend, ledger gap) or remoteURL (no owner/name) skips.
+	// (older backend, ledger gap) or remoteURL (no owner/name, or a
+	// misconfigured forge) skips.
 	runBranch string
 	remoteURL string
 	pushToken string
+	// remoteSkipDetail names WHY remoteURL is empty, folded into the
+	// persist_skipped reason so the silent degrade is diagnosable (approval
+	// condition 3, E45.80 / #3613). Empty when remoteURL is set.
+	remoteSkipDetail string
 	// issue is the trigger issue number (scenario id key); 0 skips recording.
 	issue int
 	// prNumber is the run's PR (0 = unknown, recorded as-is, NEVER the issue).
@@ -420,7 +425,11 @@ func persistAcceptanceScenarios(ctx context.Context, in acceptancePersistInputs,
 	}
 	headSHA := strings.TrimSpace(headOut)
 	if in.remoteURL == "" {
-		return acceptancePersistResult{outcome: persistSkipped, reason: "no_remote", baseSHA: baseSHA, headSHA: headSHA}
+		reason := "no_remote"
+		if in.remoteSkipDetail != "" {
+			reason += ": " + in.remoteSkipDetail
+		}
+		return acceptancePersistResult{outcome: persistSkipped, reason: reason, baseSHA: baseSHA, headSHA: headSHA}
 	}
 	if _, err := p.PushCommittedBranch(ctx, gitops.PushCommittedBranchArgs{
 		RepoDir: in.treeDir, Branch: in.runBranch, RemoteURL: in.remoteURL,
@@ -619,20 +628,52 @@ func scenarioIDForPath(path string) string {
 	return scenario.IDPrefix + strings.TrimSuffix(rel, ".yaml")
 }
 
-// acceptancePersistRemoteURL resolves the push URL for the scenario commit —
-// the same https://github.com/<owner>/<repo> form every other runner push
-// uses. Empty when no owner/name is configured (persist_skipped no_remote).
-// Test seam: overridden to a file-path bare remote.
-var acceptancePersistRemoteURL = func(cfg config) string {
+// acceptancePersistRemote resolves the push URL for the scenario commit
+// through the SAME forge-derived seam every other runner push uses
+// (remoteURLFor, E45.80 / #3613): github.com for the github forge,
+// <gitlab-base-url>/<slug> for gitlab. It returns ("", nil) when no
+// owner/name is configured at all, and ("", err) when one is configured but
+// the forge is misconfigured (e.g. --forge=gitlab with no --gitlab-base-url).
+//
+// Both empty-URL cases degrade to persist_skipped rather than failing the
+// acceptance stage — the scenario-corpus push is best-effort — but they are
+// DISTINGUISHED in the log detail (see acceptancePersistRemoteSkipDetail):
+// this is the one site that degrades silently, so an operator must be able to
+// tell "no remote configured" from "forge misconfigured".
+func acceptancePersistRemote(cfg config) (string, error) {
 	repoSlug := cfg.githubRepo
 	if repoSlug == "" {
 		repoSlug = os.Getenv("GITHUB_REPOSITORY")
 	}
 	owner, repoName, ok := strings.Cut(repoSlug, "/")
 	if !ok || owner == "" || repoName == "" {
+		return "", nil
+	}
+	return remoteURLFor(cfg, owner, repoName)
+}
+
+// acceptancePersistRemoteURL is the push-URL test seam (overridden to a
+// file-path bare remote). It keeps the historical func(config) string shape;
+// a helper error degrades to the empty-string persist_skipped path, with the
+// underlying reason recovered by acceptancePersistRemoteSkipDetail.
+var acceptancePersistRemoteURL = func(cfg config) string {
+	url, err := acceptancePersistRemote(cfg)
+	if err != nil {
 		return ""
 	}
-	return fmt.Sprintf("https://github.com/%s/%s", owner, repoName)
+	return url
+}
+
+// acceptancePersistRemoteSkipDetail names WHY the remote resolved empty, so
+// the persist_skipped reason distinguishes "no owner/name configured" from a
+// forge misconfiguration. Empty when the remote in fact resolved (the seam is
+// overridden in tests, so the two can disagree — the seam wins for the push
+// decision and this is pure diagnosis).
+func acceptancePersistRemoteSkipDetail(cfg config) string {
+	if _, err := acceptancePersistRemote(cfg); err != nil {
+		return err.Error()
+	}
+	return "no owner/name configured"
 }
 
 // acceptanceReplayInputs is the prompt-served replay input bundle
@@ -696,6 +737,12 @@ func persistAndReportAcceptanceScenarios(ctx context.Context, cfg config, client
 	// mint is best-effort (mintBaseAuthToken degrades to ambient auth).
 	if in.runBranch != "" {
 		pin.remoteURL = acceptancePersistRemoteURL(cfg)
+		if pin.remoteURL == "" {
+			// Approval condition 3: name the UNDERLYING reason on the one site
+			// that degrades silently, so "no remote configured" and "forge
+			// misconfigured" are distinguishable in persist_skipped.
+			pin.remoteSkipDetail = acceptancePersistRemoteSkipDetail(cfg)
+		}
 		if pin.remoteURL != "" {
 			pin.pushToken = mintBaseAuthToken(ctx, cfg, client, issued, logSink)
 		}

@@ -8,6 +8,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/kuhlman-labs/fishhawk/runner/internal/gitops"
 )
 
 /*
@@ -142,11 +144,19 @@ func provisionAcceptanceTree(ctx context.Context, repoDir, headSHA, runID, stage
 		// needed (#1951): authenticate the object fetch per-invocation and reset
 		// any stale persisted extraheader on the shared config. A nil provider or
 		// an empty env leaves the fetch on ambient auth, unchanged.
+		//
+		// The env is set UNCONDITIONALLY so gitops.NonInteractiveEnv()'s pin
+		// has no hole (E45.80 / #3613): this is the one raw remote-touching git
+		// exec outside the gitops choke points, and an unauthenticated 401 or an
+		// ambient SSH origin here would otherwise open a credential prompt and
+		// wedge the whole process group on SIGTTIN (run f199dcf1). A nil
+		// provider or empty auth env now means "ambient auth, non-interactive"
+		// rather than "inherit unpinned".
+		var authEnv []string
 		if fetchAuthEnv != nil {
-			if env := fetchAuthEnv(); len(env) > 0 {
-				fetchCmd.Env = append(os.Environ(), env...)
-			}
+			authEnv = fetchAuthEnv()
 		}
+		fetchCmd.Env = append(append(os.Environ(), gitops.NonInteractiveEnv()...), authEnv...)
 		if out, ferr := fetchCmd.CombinedOutput(); ferr != nil {
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"acceptance_tree_fetch_failed","run_id":%q,"stage_id":%q,"head_sha":%q,"detail":%q}`+"\n",

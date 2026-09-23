@@ -1506,6 +1506,15 @@ func pushConflictResolutionCommit(ctx context.Context, cfg config, client upload
 	if !ok || owner == "" || repoName == "" {
 		return "", fmt.Errorf("github repo %q is not owner/name", repoSlug)
 	}
+	// Forge-derived push URL (E45.80 / #3613): --forge=gitlab publishes the
+	// merge commit at <gitlab-base-url>/<slug>, not the github.com literal
+	// this site used to hardcode. A misconfigured forge lands on the SAME
+	// report-then-fail path the owner/name guard above takes — never a push
+	// with an empty URL.
+	remoteURL, err := remoteURLFor(cfg, owner, repoName)
+	if err != nil {
+		return "", fmt.Errorf("resolve push remote: %w", err)
+	}
 	token, err := mintImplementToken(ctx, cfg, client, issued, logSink)
 	if err != nil {
 		return "", fmt.Errorf("mint push token: %w", err)
@@ -1513,7 +1522,7 @@ func pushConflictResolutionCommit(ctx context.Context, cfg config, client upload
 	pushRes, err := newPusher().PushCommittedBranch(ctx, gitops.PushCommittedBranchArgs{
 		RepoDir:   repoDir,
 		Branch:    branch,
-		RemoteURL: fmt.Sprintf("https://github.com/%s/%s", owner, repoName),
+		RemoteURL: remoteURL,
 		PushToken: token,
 		HeadSHA:   headSHA,
 	})

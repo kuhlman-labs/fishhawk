@@ -14612,9 +14612,9 @@ func TestComputeAndEmitDiff_CategorizesScopeDrift(t *testing.T) {
 
 // verifiedTreeRepo builds the #960 integration fixture: a real repo with a
 // local bare `origin` holding main, a `url.insteadOf` rewrite so the
-// production push path's hardcoded https://github.com/<owner>/<repo> URL
-// resolves to the bare repo (no network), and a dirty in-scope edit standing
-// in for the agent's work. Returns the repo path, the bare path, and the
+// production push path's forge-derived URL (remoteURLFor — the github forge
+// default here, https://github.com/<owner>/<repo>) resolves to the bare repo
+// (no network), and a dirty in-scope edit standing in for the agent's work. Returns the repo path, the bare path, and the
 // run-branch name the production routing will derive.
 func verifiedTreeRepo(t *testing.T) (repo, bare, branch string) {
 	t.Helper()
@@ -14645,8 +14645,9 @@ func verifiedTreeRepo(t *testing.T) (repo, bare, branch string) {
 	runGit("init", "--bare", bare)
 	runGit("remote", "add", "origin", bare)
 	runGit("push", "origin", "main")
-	// Production builds the push/fetch URL as https://github.com/<slug>;
-	// rewrite it to the local bare repo so FreshFetchBase + push stay local.
+	// Production derives the push/fetch URL via remoteURLFor; on the github
+	// forge this fixture runs under that is https://github.com/<slug>. Rewrite
+	// it to the local bare repo so FreshFetchBase + push stay local.
 	runGit("config", "url."+bare+".insteadOf", "https://github.com/test-owner/test-repo")
 
 	// The agent's in-scope edit.
@@ -29389,6 +29390,52 @@ func TestImplementPush_GitLabRefreshReturnsStaticToken(t *testing.T) {
 	}
 	if fpr.gotArgs != nil {
 		t.Error("gitlab forge must not invoke the GitHub PR opener")
+	}
+}
+
+// TestRun_ImplementStage_GitLabForge_RemoteURL is the CROSS-BOUNDARY proof for
+// the implement push (E45.80 / #3613): it drives the REAL run() entry point
+// with --forge gitlab --gitlab-base-url, through flag parsing, the forge
+// branch and remoteURLFor, into the gitops.CommitAndPushArgs the fakePusher
+// captures — and asserts the constructed URL STRING, so a comment-only or
+// no-op edit at the call site fails it.
+//
+// A per-layer unit on remoteURLFor alone would stay green if main.go kept its
+// literal, which is precisely how this defect survived: the existing GitLab
+// tests (TestOpenImplementChangeRequest_ForgeSelection,
+// TestImplementPush_GitLabRefreshReturnsStaticToken) stub the REST layer and
+// structurally cannot observe the push URL.
+func TestRun_ImplementStage_GitLabForge_RemoteURL(t *testing.T) {
+	implementEnv(t, "group/sub/project", "main")
+	t.Setenv("FISHHAWK_GITLAB_TOKEN", "glpat-static")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fu := newFakeUploader(t)
+	fu.promptResp = refreshPromptResp()
+	withFakeUploader(t, fu)
+	fp := &fakePusher{}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+	fmr := &fakeMROpener{}
+	origMR := newMROpener
+	newMROpener = func(token, baseURL string) mrOpener {
+		fmr.gotToken = token
+		fmr.gotBaseURL = baseURL
+		return fmr
+	}
+	t.Cleanup(func() { newMROpener = origMR })
+
+	var stderr strings.Builder
+	if got := run(refreshRunArgs("--forge", "gitlab", "--gitlab-base-url", "https://gitlab.example.com"), &stderr); got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if fp.gotArgs == nil {
+		t.Fatal("CommitAndPush not called")
+	}
+	// The nested group proves the owner/name rejoin is lossless: the slug is
+	// split at the FIRST separator, so "sub/project" arrives whole in repoName.
+	if want := "https://gitlab.example.com/group/sub/project"; fp.gotArgs.RemoteURL != want {
+		t.Errorf("RemoteURL = %q, want %q — the implement push must target the configured GitLab host, not github.com",
+			fp.gotArgs.RemoteURL, want)
 	}
 }
 

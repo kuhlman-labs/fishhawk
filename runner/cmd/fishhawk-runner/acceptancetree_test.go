@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/kuhlman-labs/fishhawk/runner/internal/gitops"
 )
@@ -406,5 +407,89 @@ func TestProvisionAcceptanceTree_FetchAuthEnv(t *testing.T) {
 	}
 	if authed == 0 {
 		t.Fatalf("object fetch issued no authenticated /info/refs request — provider env did not reach the fetch:\n%s", log.String())
+	}
+}
+
+// TestProvisionAcceptanceTree_CredentialChallengeFailsFast is the DONE-MEANS
+// arm for the non-interactive pin at the one raw remote-touching git exec
+// outside the gitops choke points (E45.80 / #3613): the object fetch meets a
+// listener that CHALLENGES for credentials (401 + WWW-Authenticate) with NO
+// credential supplied, and must return promptly with
+// acceptance_tree_fetch_failed carrying git's `terminal prompts disabled`
+// wording — warn-and-proceed preserved, never a stage failure and never a
+// blocked prompt.
+//
+// The credential challenge is load-bearing: a connection REFUSAL would fail
+// identically with or without the pin (operator approval condition 1).
+//
+// SAFETY: this is NOT a counterfactual vehicle. With the pin deleted on a
+// tty-bearing host git PROMPTS, the test's process group takes SIGTTIN and
+// `go test` STOPS rather than fails — the defect itself. The deterministic
+// vehicle is gitops' TestRunOutEnv_PinsNonInteractive.
+func TestProvisionAcceptanceTree_CredentialChallengeFailsFast(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	// Neutralize the credential HELPER only (osxkeychain lives in the SYSTEM
+	// config on macOS). GIT_CONFIG_GLOBAL is left as runTestMain set it (the
+	// #3503 maintenance pin); GIT_TERMINAL_PROMPT is deliberately NOT set
+	// here — the production pin is the control under test.
+	t.Setenv("GIT_CONFIG_SYSTEM", "/dev/null")
+	redirectAcceptanceTreeDir(t)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("WWW-Authenticate", `Basic realm="git"`)
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	dispatch := filepath.Join(dir, "dispatch")
+	if err := os.Mkdir(dispatch, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	git := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", dispatch}, args...)...)
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@e",
+			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@e")
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+		}
+	}
+	git("init", "--initial-branch=main")
+	if err := os.WriteFile(filepath.Join(dispatch, "local.txt"), []byte("y\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	git("add", "-A")
+	git("commit", "-m", "dispatch initial")
+	git("remote", "add", "origin", srv.URL)
+
+	// A syntactically-valid but absent SHA forces the object-fetch path.
+	const missing = "0123456789abcdef0123456789abcdef01234567"
+	// The bound is RETURNING-AT-ALL, not a latency assertion (#1984).
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	var log strings.Builder
+	// A nil provider means no credential at all — the challenge is
+	// unsatisfiable, so only the env pin can stop git prompting for one.
+	teardown := provisionAcceptanceTree(ctx, dispatch, missing, "run1", "stage1", nil, &log)
+	defer teardown()
+	if ctx.Err() != nil {
+		t.Fatalf("the object fetch did not return within the bound — it blocked rather than failing:\n%s", log.String())
+	}
+
+	logged := log.String()
+	if !strings.Contains(logged, `"event":"acceptance_tree_fetch_failed"`) {
+		t.Fatalf("want acceptance_tree_fetch_failed in:\n%s", logged)
+	}
+	if !strings.Contains(logged, "terminal prompts disabled") {
+		t.Errorf("fetch detail must carry git's `terminal prompts disabled` wording (emitted only under GIT_TERMINAL_PROMPT=0):\n%s", logged)
+	}
+	// Warn-and-proceed: the fetch failure flows into the worktree-add failure,
+	// which warns and returns a no-op teardown — never a stage failure.
+	if !strings.Contains(logged, `"event":"acceptance_tree_failed"`) {
+		t.Errorf("want the warn-and-proceed acceptance_tree_failed line in:\n%s", logged)
 	}
 }
