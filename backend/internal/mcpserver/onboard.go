@@ -24,8 +24,106 @@ type DoctorInput struct {
 
 // DoctorOutput wraps the readiness report. Kept under a `report` key so the
 // client indexes on a stable shape.
+//
+// RunnerCredentials is a SIBLING of Report, never a field inside it (E45.82 /
+// #3617). `report` is the byte-mirror of what fishhawkd served — the
+// re-emission tests pin its json tags against the backend's — and this rung is
+// computed LOCALLY by this MCP process about its OWN environment. Folding it
+// into `report` would render a locally-computed fact as something the daemon
+// answered, which is a false claim about provenance.
 type DoctorOutput struct {
-	Report OnboardingReadinessReport `json:"report"`
+	Report            OnboardingReadinessReport `json:"report"`
+	RunnerCredentials *runnerCredentialsRung    `json:"runner_credentials,omitempty" jsonschema:"computed LOCALLY by this MCP server about its OWN process environment (NOT served by fishhawkd): whether the RUNNER-held GitLab push credential a local runner would inherit is present; reports PRESENCE only and says nothing about a gitlab_ci runner"`
+}
+
+// gitLabRunnerPushCredentialEnv is the env var the RUNNER reads its GitLab
+// push / MR-open credential from (E45.82 / #3617). It is DUPLICATED here on
+// purpose: the runner and backend are separate Go modules with no import edge,
+// so the literal already has independent copies in
+// runner/cmd/fishhawk-runner/main.go, runner/cmd/fishhawk-runner/gateenv.go,
+// runner/internal/agentenv, runner/internal/acceptenv and
+// cli/cmd/fishhawk/doctor_verify.go. Each side's tests assert the literal, so a
+// rename in one module reddens the other rather than silently decoupling this
+// rung from the runner it describes.
+//
+// Note the near-identical daemon-side name: FISHHAWKD_GITLAB_TOKEN (trailing
+// D) is fishhawkd's own REST credential and is what the `app` rung already
+// covers. This rung is about the OTHER one.
+const gitLabRunnerPushCredentialEnv = "FISHHAWK_GITLAB_TOKEN"
+
+// runnerCredentials rung statuses.
+const (
+	runnerCredentialPresent       = "present"
+	runnerCredentialMissing       = "missing"
+	runnerCredentialNotApplicable = "not_applicable"
+	runnerCredentialUnknown       = "unknown"
+)
+
+// runnerCredentialsScope is the FIXED sentence every report carries. It states
+// exactly what the rung observed and, just as importantly, the two things it
+// does NOT claim: the token's validity/scope, and anything at all about a
+// gitlab_ci runner (binding condition 2 — this process cannot read a CI/CD
+// variable on the GitLab instance).
+const runnerCredentialsScope = "This rung reads the fishhawk-mcp process's OWN environment, which a LOCAL runner spawned by fishhawk_run_stage / fishhawk_dispatch_stage / fishhawk_drive_run / fishhawk_run_children inherits verbatim (append(os.Environ(), ...)). It reports PRESENCE only — never the value, never the token's validity or scope. It describes the MCP server's spawning environment ONLY (local runner) and does NOT apply to a gitlab_ci runner, whose credential is a CI/CD variable on the GitLab instance that this process cannot see."
+
+// runnerCredentialsRung is the LOCALLY-computed doctor rung answering the
+// second of a GitLab run's two credentials (E45.82 / #3617): fishhawkd's own
+// FISHHAWKD_GITLAB_TOKEN is covered by the `app` rung, but the RUNNER's
+// FISHHAWK_GITLAB_TOKEN was covered by nothing — so a registration that omitted
+// it produced a run that planned and implemented correctly and then failed at
+// the push, after a complete paid agent pass.
+//
+// The daemon genuinely cannot answer this: the runner's spawning environment is
+// not its own. But the MCP SERVER is that environment on the local channel, so
+// the rung reports a fact it actually holds instead of "cannot determine".
+//
+// Unexported deliberately, like onboardingTraceStore and
+// onboardingGitLabRegistration: export_surface_test.go pins the package's
+// exported-name baseline, and jsonschema reflection reaches this type through
+// the exported DoctorOutput.
+type runnerCredentialsRung struct {
+	Status      string `json:"status" jsonschema:"present (the variable is set in this process's environment), missing (gitlab forge and the variable is absent or whitespace-only), not_applicable (a github-family report: the runner mints from the App installation broker), or unknown (the report named no forge family, so applicability could not be decided)"`
+	Variable    string `json:"variable" jsonschema:"the env var this rung reports on: FISHHAWK_GITLAB_TOKEN, the RUNNER's push/MR-open credential - note the near-identical FISHHAWKD_GITLAB_TOKEN (trailing D) is the DAEMON's REST credential, a different variable covered by the app rung"`
+	Forge       string `json:"forge,omitempty" jsonschema:"the forge family this verdict was computed for, echoed from the report; empty when the report named none"`
+	Scope       string `json:"scope" jsonschema:"the fixed sentence bounding this rung's claim: whose environment was read, that it is PRESENCE only, and that it says nothing about a gitlab_ci runner"`
+	Note        string `json:"note,omitempty" jsonschema:"the human sentence for the not_applicable and unknown verdicts, and the consequence sentence on missing"`
+	Remediation string `json:"remediation,omitempty" jsonschema:"on status missing: the operator next step, naming where the variable must live (the environment that launches fishhawk-mcp)"`
+}
+
+// runnerCredentials computes the rung from the report's own forge family and
+// the injected env seam. Four branches, one per status; a nil getenv is
+// tolerated (treated as unset) so no test or embedding path panics — but
+// NewServer wires os.Getenv, so the nil fallback never fires in production.
+func runnerCredentials(forgeFamily string, getenv func(string) string) *runnerCredentialsRung {
+	rung := &runnerCredentialsRung{
+		Variable: gitLabRunnerPushCredentialEnv,
+		Forge:    strings.TrimSpace(forgeFamily),
+		Scope:    runnerCredentialsScope,
+	}
+	switch rung.Forge {
+	case "gitlab":
+		value := ""
+		if getenv != nil {
+			value = getenv(gitLabRunnerPushCredentialEnv)
+		}
+		if strings.TrimSpace(value) == "" {
+			rung.Status = runnerCredentialMissing
+			rung.Note = "A gitlab run needs TWO credentials: fishhawkd's FISHHAWKD_GITLAB_TOKEN (the app rung above) and the RUNNER's " + gitLabRunnerPushCredentialEnv + ". This one is absent here, so a local runner spawned from this process would refuse the implement stage at prompt-fetch time (runner_failed, reason gitlab_push_credential_missing) — or, on a runner that predates that refusal, fail at the push after a complete paid agent pass."
+			rung.Remediation = "Export " + gitLabRunnerPushCredentialEnv + " (a GitLab access token with `api` scope) in the environment that LAUNCHES fishhawk-mcp — an MCP registration that omits it is the common cause: `claude mcp add fishhawk <cmd> -e " + gitLabRunnerPushCredentialEnv + "=<token>` — then reconnect the MCP server (/mcp) so the new environment takes effect."
+			return rung
+		}
+		rung.Status = runnerCredentialPresent
+		rung.Note = "The variable is set in this process's environment, so a local runner spawned from here inherits it. Presence is not validity: this rung never reads the value, so an expired, revoked or wrong-scope token still reports present."
+		return rung
+	case "github":
+		rung.Status = runnerCredentialNotApplicable
+		rung.Note = "A github-family run mints its push credential from the GitHub App installation broker (with the local `gh` CLI token as the fallback), so no runner-held env credential applies."
+		return rung
+	default:
+		rung.Status = runnerCredentialUnknown
+		rung.Note = "The readiness report named no forge family (an older fishhawkd serves no `forge` key), so whether a runner-held GitLab credential applies could not be decided. This is NOT a finding that the credential is missing."
+		return rung
+	}
 }
 
 // InitInput is the fishhawk_init tool's input schema (E29.6 / #1506). Preset
@@ -200,6 +298,31 @@ trace_store rung (see below):
               only against an older fishhawkd; absence means the backend
               cannot answer, which is NOT the same claim as configured:false.
 
+Alongside the report key — a SIBLING key, never a field inside it — the output
+carries runner_credentials, the one rung computed LOCALLY by this MCP server
+about its own process environment and NOT served by fishhawkd:
+
+  - runner_credentials — a GitLab run needs TWO credentials: fishhawkd's
+              FISHHAWKD_GITLAB_TOKEN (what the app rung covers) and the RUNNER
+              process's FISHHAWK_GITLAB_TOKEN, which pushes the run branch and
+              opens the merge request. The daemon cannot see the runner's
+              environment — but this MCP server IS that environment on the local
+              channel: fishhawk_run_stage, fishhawk_dispatch_stage,
+              fishhawk_drive_run and fishhawk_run_children each spawn the runner
+              with append(os.Environ(), ...), so a local runner inherits this
+              process's variables verbatim. status is present | missing |
+              not_applicable (a github-family run mints from the App
+              installation broker) | unknown (the report named no forge family,
+              so applicability could not be decided — NOT a finding that the
+              credential is missing). It reports PRESENCE only: never the value,
+              and never the token's validity or scope, so an expired or
+              wrong-scope token still reports present. It describes the MCP
+              server's spawning environment ONLY (local runner) and says NOTHING
+              about a gitlab_ci runner, whose credential is a CI/CD variable on
+              the GitLab instance this process cannot read. On missing,
+              remediation names where the variable must live — the environment
+              that LAUNCHES fishhawk-mcp.
+
 The report's forge field names the family that answered (github|gitlab). repo
 is owner/name on GitHub, or a namespace/project path on GitLab — nested groups
 (group/subgroup/project) are accepted; a nested path on the github family is a
@@ -312,7 +435,13 @@ func (r *runResolver) doctor(ctx context.Context, _ *mcp.CallToolRequest, in Doc
 		}
 		return nil, DoctorOutput{}, fmt.Errorf("onboarding readiness: %w", err)
 	}
-	return nil, DoctorOutput{Report: *report}, nil
+	out := DoctorOutput{Report: *report}
+	// The one LOCALLY-computed rung (E45.82 / #3617): keyed on the family the
+	// backend reported, answered from this process's own environment. It is
+	// attached AFTER the report is copied verbatim, so `report` stays the
+	// byte-mirror of what fishhawkd served.
+	out.RunnerCredentials = runnerCredentials(report.Forge, r.getenv)
+	return nil, out, nil
 }
 
 // init is the fishhawk_init tool handler. It resolves the preset (defaulting to
