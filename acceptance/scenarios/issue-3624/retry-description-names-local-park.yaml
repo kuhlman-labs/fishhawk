@@ -1,0 +1,15 @@
+id: scenario:issue-3624/retry-description-names-local-park
+statement: 'The fishhawk_retry_stage tool advertised by the running server describes the runner_kind local outcome honestly: its description names the awaiting_host_dispatch park and the follow-on dispatch verb, while still naming workflow_dispatch for the CI execution channels.'
+verify_hint: 'On the localhost preview, list the MCP tool registry over the /mcp route (a tools/list request to POST /mcp) and read the fishhawk_retry_stage entry''s description: it must contain ''awaiting_host_dispatch'', must name fishhawk_dispatch_stage (or fishhawk_run_stage) as the runner_kind local follow-on, and must still mention workflow_dispatch for github_actions / gitlab_ci.'
+steps: '1) POST http://localhost:8090/v0/dev/fixtures {"scenario":"trace-upload-target"} -> 201 (run 0fd7d652-8738-413d-8faf-d51ab2abb55a). 2) POST /v0/runs/{run}/signing-key {} -> private_key. 3) POST /v0/dev/sign with body ''{}'' and header X-Fishhawk-Dev-Private-Key: <private_key> -> signature. 4) POST /v0/runs/{run}/mcp-token with body ''{}'' and header X-Fishhawk-Signature: <signature> -> fhm_ bearer. 5) POST /mcp with Authorization: Bearer <fhm_>, Accept: application/json, text/event-stream, Mcp-Protocol-Version: 2026-07-28, Mcp-Method: tools/list, and body {jsonrpc:''2.0'',id:1,method:''tools/list'',params:{_meta:{''io.modelcontextprotocol/protocolVersion'':''2026-07-28'',''io.modelcontextprotocol/clientCapabilities'':{},''io.modelcontextprotocol/clientInfo'':{name:''acc'',version:''1''}}}} -> 200 with 57 tools. 6) Read the fishhawk_retry_stage entry''s description and outputSchema.'
+steps_carried_from: head f3ce1518eb6fc755016b64d7682c7e217f5c6bc3 recorded_at 2026-09-24T07:33:52Z
+assertions:
+    expected: The description contains awaiting_host_dispatch, names fishhawk_dispatch_stage (or fishhawk_run_stage) as the runner_kind local follow-on, and still mentions workflow_dispatch for github_actions / gitlab_ci.
+    observed_at_record: 'The description says: ''runner_kind github_actions / gitlab_ci: the orchestrator fires a fresh workflow_dispatch and the stage lands dispatched'' and ''runner_kind local: there is NO workflow to dispatch ... the re-opened stage normally parks at awaiting_host_dispatch and NOTHING is driving it until you make a separate fishhawk_dispatch_stage (or fishhawk_run_stage) call — fishhawk_run_children for a decomposition child''. It also enumerates pending, awaiting_approval and awaiting_children, says ''DISPATCH ONLY on awaiting_host_dispatch (or pending)'', and does not say ''always''. The outputSchema declares parked (required boolean) and next_step (nullable object).'
+    repro_handle: POST http://localhost:8090/mcp tools/list with a run-bound fhm_ bearer; select name==fishhawk_retry_stage
+origin:
+    issue: 3624
+    pr: 3642
+    run_id: 28195ab4-fd7f-4e5e-8756-b3bb21227da7
+    head_sha: b7eabec6c775e9092ad9105fdd9f8a80298554f2
+    recorded_at: 2026-09-24T08:49:58Z

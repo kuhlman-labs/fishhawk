@@ -3975,14 +3975,35 @@ type RetryStageInput struct {
 	StageID string `json:"stage_id" jsonschema:"the Fishhawk stage UUID to retry; must be a failed stage, OR a SUCCEEDED acceptance stage that recorded no verdict (the acceptance-reopen arm, #1567 — operator token only)"`
 }
 
-// RetryStageOutput surfaces the post-retry Stage row. Category-A/C
-// retries land in `pending` (orchestrator advances to dispatched
-// before the response returns); category-D SLA-timeout retries land
-// in `awaiting_approval`. Category-B / gate-rejected don't reach
-// this output — they surface as a tool error from the backend's
-// 422.
+// RetryStageOutput surfaces the post-retry Stage row plus what (if
+// anything) has to happen next (E45.89 / #3624).
+//
+// Category-A/C retries re-open the stage to `pending` and the backend
+// hands it to the orchestrator, which RE-FETCHES the stage before the
+// response returns — so the state you get back is the outcome, and it
+// depends on the run's execution channel. For runner_kind
+// github_actions / gitlab_ci the orchestrator fires the fresh CI
+// dispatch and the state is `dispatched`. For runner_kind local there
+// is no workflow to dispatch (ADR-024: the runner is host-spawned), so
+// the state is `awaiting_host_dispatch` and NOTHING is driving the
+// stage. Category-D SLA-timeout retries land in `awaiting_approval` (a
+// gate re-opened, no dispatch), and a decomposed-parent implement
+// restore lands in `awaiting_children`. Category-B / gate-rejected
+// don't reach this output — they surface as a tool error from the
+// backend's 422.
+//
+// Read Parked / NextStep rather than assuming any one of those: they
+// are derived from the returned Stage.State, so the caller never has to
+// poll a stage nothing is driving.
 type RetryStageOutput struct {
 	Stage Stage `json:"stage"`
+	// Parked is true when the retry re-opened the stage but nothing is
+	// driving it, so the caller MUST make a separate host-dispatch call.
+	Parked bool `json:"parked" jsonschema:"true when the retry re-opened the stage but nothing is driving it (stage.state awaiting_host_dispatch, the runner_kind local park, or pending when the orchestrator handoff was absent or errored) — the caller must dispatch it from the host; false when the orchestrator genuinely dispatched it or the stage re-opened at a gate"`
+	// NextStep is the single pre-filled follow-on call on a park.
+	NextStep *SuggestedAction `json:"next_step,omitempty" jsonschema:"the single pre-filled call to make when parked is true: fishhawk_dispatch_stage (or fishhawk_run_children keyed on the parent run id when this stage belongs to a decomposed child). Absent when the orchestrator genuinely dispatched the stage, when it re-opened at a gate (awaiting_approval / awaiting_children), or when the state is unrecognised"`
+	// Warnings carries best-effort degradations that did not fail the retry.
+	Warnings []string `json:"warnings,omitempty" jsonschema:"best-effort degradations that did NOT fail the retry — e.g. the run row could not be read, so the decomposition-child check was skipped and next_step names fishhawk_dispatch_stage"`
 }
 
 // registerRetryStage wires the fishhawk_retry_stage tool (E22.3 /
@@ -4016,18 +4037,50 @@ Mirrors the CLI's "fishhawk run retry <stage-id>" verb. The backend's
 state machine decides whether the stage is retryable per its failure
 category:
 
-  - A (agent failure)  : retried — flips failed → pending →
-                         dispatched (orchestrator fires fresh
-                         workflow_dispatch).
+  - A (agent failure)  : retried — flips failed → pending, then the
+                         outcome depends on the run's execution
+                         channel (see below).
   - B (constraint)     : NOT retryable — the workflow or spec
                          needs to change first. Surfaces as a
                          retry_not_applicable tool error.
-  - C (infrastructure) : retried — same flow as A.
+  - C (infrastructure) : retried — same flow as A, including the
+                         same runner-kind-dependent outcome.
   - D (gate-related)   : depends — SLA timeout retries (flip back
                          to awaiting_approval), gate-rejected does
                          not (file a fresh run instead).
 
-Returns the updated Stage row on retry. Returns a tool error on:
+THIS TOOL NEVER SPAWNS A RUNNER. What an A/C retry reaches depends on
+runner_kind:
+
+  - runner_kind github_actions / gitlab_ci: the orchestrator fires a
+    fresh workflow_dispatch and the stage lands dispatched. Nothing
+    more to do — poll it.
+  - runner_kind local: there is NO workflow to dispatch (ADR-024 — the
+    runner is a host-spawned subprocess the backend has no channel to
+    start), so the re-opened stage normally parks at
+    awaiting_host_dispatch and NOTHING is driving it until you make a
+    separate fishhawk_dispatch_stage (or fishhawk_run_stage) call —
+    fishhawk_run_children for a decomposition child.
+
+A local retry does not ALWAYS land at awaiting_host_dispatch: it can
+also land at pending (the orchestrator handoff was absent or errored,
+equally un-driven and needing the same host dispatch),
+awaiting_approval (a category-D SLA-timeout gate re-open — approve it,
+do not dispatch it) or awaiting_children (a decomposed-parent restore
+— the fan-in sweeper and fishhawk_consolidate_slices re-engage, so no
+host dispatch belongs there). So DISPATCH ONLY on
+awaiting_host_dispatch (or pending); for any other state read the
+returned stage.state and next_step and act on those.
+
+Read them off the response rather than deriving them: parked is true
+exactly when nothing is driving the re-opened stage, and next_step
+carries that follow-on call pre-filled (absent when the orchestrator
+genuinely dispatched, when the stage re-opened at a gate, or when the
+state is unrecognised) — so the park is never discovered by polling for
+a dispatch that will not come.
+
+Returns the updated Stage row plus parked / next_step / warnings on
+retry. Returns a tool error on:
   - invalid UUID (caught before the HTTP hop)
   - stage_not_found (404)
   - retry_not_applicable (422)
@@ -4045,7 +4098,24 @@ func (r *runResolver) retryStage(ctx context.Context, _ *mcp.CallToolRequest, in
 	if err != nil {
 		return nil, RetryStageOutput{}, fmt.Errorf("retry stage: %w", err)
 	}
-	return nil, RetryStageOutput{Stage: *retried}, nil
+	out := RetryStageOutput{Stage: *retried}
+	// The extra run read is paid ONLY on a park (E45.89 / #3624): the
+	// run row is needed solely to choose fishhawk_run_children over
+	// fishhawk_dispatch_stage for a decomposition child, so the common
+	// CI dispatched path costs no additional round-trip.
+	if retryStageStateParks(retried.State) {
+		var runRow *Run
+		var runErr error
+		if runUUID, perr := uuid.Parse(retried.RunID); perr != nil {
+			runErr = fmt.Errorf("run_id %q is not a valid UUID: %w", retried.RunID, perr)
+		} else {
+			runRow, runErr = r.api.GetRun(ctx, runUUID)
+		}
+		// Best-effort: a run-read failure must NEVER turn a successful
+		// retry into a tool error — the stage is already re-opened.
+		out.Parked, out.NextStep, out.Warnings = retryStagePark(*retried, runRow, runErr)
+	}
+	return nil, out, nil
 }
 
 // ApprovePlanInput is the fishhawk_approve_plan tool's input

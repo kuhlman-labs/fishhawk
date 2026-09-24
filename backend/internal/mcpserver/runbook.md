@@ -215,10 +215,15 @@ impossible — you no longer have to hand-sequence it. Poll
 `fishhawk_get_run_status` after reviving and follow `next_actions` for each
 re-parked stage.
 
-Distinct from `fishhawk_retry_stage`, which re-opens **one** stage and
-**auto-dispatches** it: reach for **retry** when you want a single stage re-run
+Distinct from `fishhawk_retry_stage`, which re-opens **one** stage and hands it
+to the orchestrator: reach for **retry** when you want a single stage re-run
 immediately; reach for **revive** when a run has flipped terminal and you want a
 safe **batch** re-park (especially while sibling reviews are still settling).
+Note the runner-kind asymmetry ([#3624](https://github.com/kuhlman-labs/fishhawk/issues/3624)):
+retry auto-dispatches only for `runner_kind` **github_actions / gitlab_ci**; on
+`runner_kind local` the orchestrator has no channel to a host-spawned runner
+(ADR-024), so a retried stage normally parks at `awaiting_host_dispatch` and you
+dispatch it yourself — see the retry outcome table below.
 Each re-park consumes that stage's per-stage retry budget exactly like a retry —
 revive is a batch retry-shaped re-open, not a budget bypass. Revive is
 **operator-token only** (`write:stages` or `write:retries`); a run-bound agent
@@ -289,6 +294,31 @@ child to have SUCCEEDED, and a cancelled child never can; nothing un-cancels a
 run. The verb now refuses a decomposition child (and refuses when it cannot read
 the run row to tell), with `orphan_parent_ok:true` as the deliberate,
 disclosed-in-the-output override.
+
+### What a retry actually reaches (`fishhawk_retry_stage`, [E45.89 / #3624](https://github.com/kuhlman-labs/fishhawk/issues/3624))
+
+`fishhawk_retry_stage` **never spawns a runner.** It re-opens the stage and hands
+it to the orchestrator; what that reaches depends on the run's execution channel,
+so the re-dispatch step above is **conditional, not automatic**:
+
+| `runner_kind` | post-retry `stage.state` | what you do next |
+|---|---|---|
+| `github_actions` / `gitlab_ci` | `dispatched` | nothing — the orchestrator fired a fresh `workflow_dispatch`; poll it |
+| `local` | `awaiting_host_dispatch` | **dispatch it**: `fishhawk_dispatch_stage` / `fishhawk_run_stage`, or `fishhawk_run_children` for a decomposition child |
+| any | `pending` | **dispatch it** — the orchestrator handoff was absent or errored (the backend logs and deliberately does not fail the retry), so the stage is equally un-driven |
+| any | `awaiting_approval` | **approve it, do not dispatch** — a category-D SLA-timeout gate re-open |
+| any | `awaiting_children` | **do not dispatch** — a decomposed-parent restore; the fan-in sweeper and `fishhawk_consolidate_slices` re-engage |
+
+A local retry does **not** always land at `awaiting_host_dispatch` — every row
+above is reachable — so **dispatch only on `awaiting_host_dispatch` (or
+`pending`)** and read the returned `stage.state` for anything else. You do not
+have to derive the row: the response carries **`parked`** (true exactly when
+nothing is driving the re-opened stage) and **`next_step`** (the follow-on call
+pre-filled, absent when the orchestrator genuinely dispatched, when the stage
+re-opened at a gate, or when the state is unrecognised). A `warnings` entry means
+the run row could not be read, so the decomposition-child check was skipped and
+`next_step` names `fishhawk_dispatch_stage` — prefer `fishhawk_run_children` if
+the stage belongs to a decomposed child.
 
 ### Decomposed-parent native path (`fishhawk_run_children` / `fishhawk_consolidate_slices`)
 
