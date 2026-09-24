@@ -1,0 +1,14 @@
+id: scenario:issue-3646/doctor-tool-returns-the-rung
+statement: The fishhawk_doctor MCP tool's report carries the work_item_provider rung with the same status and registered set the readiness endpoint served, and omits the key entirely when the backend served none.
+verify_hint: Invoke the fishhawk_doctor MCP tool against the localhost preview for a repository and read the work_item_provider key of the returned report object.
+steps: '1) Minted an fhm_ bearer: POST /v0/dev/fixtures {"scenario":"plan-gate-parked"} -> run_id; POST /v0/runs/{run_id}/signing-key {} -> private_key; POST /v0/dev/sign body ''{}'' with X-Fishhawk-Dev-Private-Key -> signature; POST /v0/runs/{run_id}/mcp-token body ''{}'' with X-Fishhawk-Signature -> token. 2) Inserted accounts row (provider github, account_key acme3646) in fishhawk_preview so acme3646/* conventions cannot resolve. 3) GET /v0/onboarding/readiness?repo=kuhlman-labs/fishhawk and ?repo=acme3646/widgets. 4) POST /mcp tools/call fishhawk_doctor {repo} for each repo, and {repo:glacme3646/grp/proj, forge:gitlab} (headers: Authorization Bearer, Accept application/json, text/event-stream, Mcp-Protocol-Version 2026-07-28, Mcp-Method tools/call, Mcp-Name fishhawk_doctor; params._meta with protocolVersion/clientCapabilities). Read structuredContent.report.work_item_provider and content[0].text.'
+assertions:
+    expected: The tool report carries work_item_provider with the same status and registered set as the endpoint, and omits it when the backend served none.
+    observed_at_record: 'For kuhlman-labs/fishhawk: report.work_item_provider={status:registered, provider:github_projects, registered:[github_projects]}, identical to the endpoint. For acme3646/widgets: {status:unknown, reason:conventions_unresolved, registered:[github_projects], note, missing_hint}, identical to the endpoint. The gitlab-family report also carries the rung. The text content carries the key too. The ''omit when backend served none'' branch cannot be exercised against this backend, which always serves the key.'
+    repro_handle: POST http://localhost:8090/mcp {jsonrpc:'2.0',id:1,method:'tools/call',params:{name:'fishhawk_doctor',arguments:{repo:'kuhlman-labs/fishhawk'},_meta:{...}}}
+origin:
+    issue: 3646
+    pr: 3657
+    run_id: 558ea922-f6fd-42bf-b589-3f102b3db556
+    head_sha: 387062b2a1200076a41b4efdecae91927fcb49a1
+    recorded_at: 2026-09-24T23:22:05Z
