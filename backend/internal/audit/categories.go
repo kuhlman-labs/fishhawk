@@ -147,6 +147,12 @@ import "sort"
 // apply is visible while it runs rather than only once grooming_apply_completed
 // lands. A degrade path (nothing dispatched) writes NO started row. It is
 // INTERNAL, audit-only: it renders no issue comment.
+// #3649 added campaign_admission_screened, written once per POST
+// /v0/campaigns create whose ADVISORY admission screen found at least one
+// candidate declared `runnable:no` or naming an implement-stage forbidden path
+// (the create response's admission_screen block is the operator surface; this
+// is the best-effort chain copy). It is INTERNAL, audit-only: it renders no
+// issue comment.
 // E54.6 / #2238 added campaign_grooming_source_resolved, written once per
 // campaign created from an approved grooming run's ratified order (the third
 // POST /v0/campaigns source): it carries the campaign id, the source
@@ -217,6 +223,7 @@ var KnownCategories = map[string]struct{}{
 	"branch_reset":                            {},
 	"budget_alert":                            {},
 	"budget_alert_sent":                       {},
+	"campaign_admission_screened":             {},
 	"campaign_advanced":                       {},
 	"campaign_cancelled":                      {},
 	"campaign_gate_acted":                     {},

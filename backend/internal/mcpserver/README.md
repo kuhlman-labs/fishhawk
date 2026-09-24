@@ -2133,6 +2133,17 @@ per-tool contract). Internals not covered there:
   completion-satisfied refinement), and `issue_set_resolution_unsupported` (501) maps when the provider cannot resolve
   an arbitrary issue set. A malformed ref on EITHER path maps `campaign_item_ref_invalid` (422, #2176) — on the no-epic
   path it REPLACES `issue_set_resolution_failed` (502), which now means a genuine forge fetch failure only.
+- **Advisory `admission_screen` on the create output (#3649).** The `Campaign` wire struct carries
+  `AdmissionScreen` (`*campaignAdmissionScreen`, `json:"admission_screen,omitempty"`), mirroring the backend's
+  create-response-only block: `{advisory, findings[{issue, kind, path?, location?, forbidden_pattern?}],
+  forbidden_paths_screened, truncated?}`, `kind` being `not_runnable_declared` (a `runnable:no` label) or
+  `forbidden_path` (a title/body token the repo's implement-stage `forbidden_paths` forbid). It rides
+  `StartCampaignOutput.Campaign` unchanged — no new tool, no `campaign.go` change. Typed structs (unexported, fields
+  exported) rather than `map[string]any` so the reflection-built output schema stays an object and the types stay off
+  the frozen export surface, the same convention as `campaignSatisfiedDependency`. ADVISORY: the campaign was created
+  regardless; a later `fishhawk_get_campaign_status` never carries it. Pinned by
+  `TestStartCampaign_AdmissionScreen_SurvivesDecode`, which decodes LITERAL backend-shaped wire JSON (not a round-trip
+  of the client's own struct) through the real client.
 - **`provider` selector + the two new gate-code arms (#3645).** `fishhawk_start_campaign` takes an OPTIONAL `provider`
   — the WORK-ITEM PROVIDER ID (`github_projects` | `gitlab` | `jira`) this campaign is assembled against, overriding
   the repo's conventions-resolved provider for that call. It is forwarded VERBATIM (the backend is the registry
