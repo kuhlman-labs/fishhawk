@@ -2642,3 +2642,200 @@ func TestDetailInt(t *testing.T) {
 		}
 	}
 }
+
+// --- work-item provider selector (E69.x / #3645) ---
+
+// TestStartCampaign_ProviderReachesRequestBody is the CROSS-BOUNDARY seam test
+// for the new selector. Scope spans the MCP tool input schema → the MCP HTTP
+// client request body → the REST handler's decoder → provider registry
+// dispatch, so per-layer units are insufficient (#624/#627).
+//
+// It drives the REAL startCampaign against an httptest server wrapping the REAL
+// server.Handler(), captures the RAW marshalled body and asserts the key is
+// spelled EXACTLY `provider` with the passed value. The server-side half is
+// what makes it a SEAM test rather than a serialization unit: handleCreateCampaign's
+// decoder runs with DisallowUnknownFields already enabled, so a key-name drift
+// between mcpserver.campaignCreateRequest and server.createCampaignRequest
+// surfaces as a 400 decode failure rather than a silently dropped selector.
+func TestStartCampaign_ProviderReachesRequestBody(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+
+	// Registered under the DEFAULT provider id so the explicit selector names a
+	// LIVE registered id and the create reaches the provider dispatch.
+	prov := &fakeMCPResolverProvider{
+		name: workmgmt.Default().Provider,
+		result: &workmgmt.EpicChildrenResult{
+			Children: []workmgmt.EpicChild{{Number: 101, Title: "first"}},
+		},
+	}
+	workmgmt.Register(prov)
+
+	const bearer = "fhk_provider_seam"
+	tokRepo := &stubMCPAPITokens{tok: &apitoken.Token{
+		ID: uuid.New(), Subject: "github:op", Scopes: []string{"write:campaigns"}, PlainText: bearer,
+	}}
+	s := server.New(server.Config{CampaignRepo: repo, APITokenRepo: tokRepo})
+
+	handler := s.Handler()
+	var capturedBody []byte
+	capture := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.Method == http.MethodPost && req.URL.Path == "/v0/campaigns" {
+			b, rerr := io.ReadAll(req.Body)
+			if rerr != nil {
+				t.Errorf("read captured request body: %v", rerr)
+			}
+			capturedBody = b
+			req.Body = io.NopCloser(bytes.NewReader(b))
+		}
+		handler.ServeHTTP(w, req)
+	})
+	httpSrv := httptest.NewServer(capture)
+	t.Cleanup(httpSrv.Close)
+	r := &runResolver{api: newAPIClient(config{backendURL: httpSrv.URL, apiToken: bearer})}
+
+	t.Run("passed provider is spelled exactly provider on the wire", func(t *testing.T) {
+		capturedBody = nil
+		_, _, err := r.startCampaign(context.Background(), nil, StartCampaignInput{
+			Repo:     "kuhlman-labs/fishhawk",
+			Items:    []string{"issue:101"},
+			Provider: workmgmt.Default().Provider,
+		})
+		if err != nil {
+			t.Fatalf("startCampaign: %v — a decode failure here IS the key-drift signal (DisallowUnknownFields)", err)
+		}
+		want := `"provider":"` + workmgmt.Default().Provider + `"`
+		if !bytes.Contains(capturedBody, []byte(want)) {
+			t.Errorf("request body = %s, want it to carry %s", capturedBody, want)
+		}
+	})
+
+	t.Run("omitted provider emits NO provider key (byte-identical pre-change body)", func(t *testing.T) {
+		capturedBody = nil
+		_, _, err := r.startCampaign(context.Background(), nil, StartCampaignInput{
+			Repo:  "kuhlman-labs/fishhawk",
+			Items: []string{"issue:101"},
+		})
+		if err != nil {
+			t.Fatalf("startCampaign: %v", err)
+		}
+		if bytes.Contains(capturedBody, []byte(`"provider"`)) {
+			t.Errorf("request body = %s, want NO provider key at all when the selector is omitted", capturedBody)
+		}
+	})
+}
+
+// TestStartCampaign_ProviderUnregistered_MapsActionableError pins the new
+// 400 validation_failed tool-error arm: the message names the offending value
+// and the registered set from the backend details.
+func TestStartCampaign_ProviderUnregistered_MapsActionableError(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.createCampaignStatus = http.StatusBadRequest
+	fb.createCampaignErr = `{"error":{"code":"validation_failed","message":"provider must name a work-item provider this deployment has registered","details":{"field":"provider","got":"nope","registered":["github_projects","gitlab"]}}}`
+	r := newResolver(srv, nil)
+
+	_, _, err := r.startCampaign(context.Background(), nil, StartCampaignInput{
+		Repo: "kuhlman-labs/fishhawk", EpicRef: "#25", Provider: "nope",
+	})
+	if err == nil {
+		t.Fatal("startCampaign succeeded, want the validation_failed tool error")
+	}
+	msg := err.Error()
+	for _, want := range []string{"validation_failed", "nope", "github_projects", "gitlab", "omit provider"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("tool error = %q, want it to name %q", msg, want)
+		}
+	}
+}
+
+// TestStartCampaign_OtherValidationFailed_KeepsGenericWrapper pins the OTHER
+// half of the validation_failed arm's guard: a validation_failed on a DIFFERENT
+// field falls out of the switch to the generic wrapper, byte-unchanged.
+func TestStartCampaign_OtherValidationFailed_KeepsGenericWrapper(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.createCampaignStatus = http.StatusBadRequest
+	fb.createCampaignErr = `{"error":{"code":"validation_failed","message":"working_dir must be an absolute path","details":{"field":"working_dir","got":"rel"}}}`
+	r := newResolver(srv, nil)
+
+	_, _, err := r.startCampaign(context.Background(), nil, StartCampaignInput{
+		Repo: "kuhlman-labs/fishhawk", EpicRef: "#25",
+	})
+	if err == nil {
+		t.Fatal("startCampaign succeeded, want an error")
+	}
+	if !strings.HasPrefix(err.Error(), "create campaign:") {
+		t.Errorf("tool error = %q, want the generic \"create campaign:\" wrapper for a non-provider validation_failed", err.Error())
+	}
+}
+
+// TestStartCampaign_ProviderUnimplemented_SurfacesRemedy pins the new 501 arm:
+// the backend's static-literal `remedy` is surfaced VERBATIM, along with the
+// resolved provider and the registered set. Both named modes are driven,
+// because the remedy text is what distinguishes them and a single case would
+// pass with the modes flattened.
+//
+// THE ASSERTIONS ARE DISCRIMINATING BY CONSTRUCTION, and that is load-bearing.
+// The generic `create campaign: %w` fallback renders the *apiError as
+// `fishhawk: HTTP 501 (provider_unimplemented): <message>; details: {...}` —
+// a JSON dump that ALREADY contains the code, the provider id, the registered
+// set AND the remedy text. A substring check for any of those therefore passes
+// with the arm DELETED (observed: the first draft of this test was green under
+// the deletion). So the assertions are on what ONLY the arm produces: the
+// absence of the `create campaign:` wrapper prefix, and the arm's own
+// connective phrasing.
+func TestStartCampaign_ProviderUnimplemented_SurfacesRemedy(t *testing.T) {
+	cases := []struct {
+		name     string
+		body     string
+		wantSubs []string
+	}{
+		{
+			name: "m1 deployment wired no provider",
+			body: `{"error":{"code":"provider_unimplemented","message":"this deployment has no work-item provider registered, so campaigns cannot be assembled","details":{"provider":"github_projects","registered":[],"remedy":"configure the GitHub App credentials (FISHHAWKD_GITHUB_APP_ID and FISHHAWKD_GITHUB_APP_PRIVATE_KEY_FILE) to register github_projects"}}}`,
+			wantSubs: []string{
+				"provider_unimplemented", "github_projects",
+				"FISHHAWKD_GITHUB_APP_ID",
+			},
+		},
+		{
+			name: "m2 resolved id not among the registered",
+			body: `{"error":{"code":"provider_unimplemented","message":"the resolved work-item provider is not implemented","details":{"provider":"jira","registered":["github_projects"],"remedy":"pass ` + "`provider`" + ` on this request naming one of the registered ids"}}}`,
+			wantSubs: []string{
+				"provider_unimplemented", "jira", "github_projects",
+				"pass `provider` on this request",
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fb, srv := newFakeBackend(t)
+			fb.createCampaignStatus = http.StatusNotImplemented
+			fb.createCampaignErr = tc.body
+			r := newResolver(srv, nil)
+
+			_, _, err := r.startCampaign(context.Background(), nil, StartCampaignInput{
+				Repo: "kuhlman-labs/fishhawk", EpicRef: "#25",
+			})
+			if err == nil {
+				t.Fatal("startCampaign succeeded, want the provider_unimplemented tool error")
+			}
+			msg := err.Error()
+			// DISCRIMINATOR 1: the dedicated arm returns its own message, so the
+			// generic wrapper prefix must be ABSENT. With the arm deleted the
+			// error is `create campaign: fishhawk: HTTP 501 (...)`.
+			if strings.HasPrefix(msg, "create campaign:") {
+				t.Fatalf("tool error = %q — that is the GENERIC wrapper, so the provider_unimplemented arm did not fire", msg)
+			}
+			// DISCRIMINATOR 2: the arm's own connective phrasing, which appears
+			// in no backend message and in no details dump.
+			if !strings.Contains(msg, "and this deployment has registered") {
+				t.Errorf("tool error = %q, want the arm's own phrasing naming the registered set", msg)
+			}
+			for _, want := range tc.wantSubs {
+				if !strings.Contains(msg, want) {
+					t.Errorf("tool error = %q, want it to name %q", msg, want)
+				}
+			}
+		})
+	}
+}

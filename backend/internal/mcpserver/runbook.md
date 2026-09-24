@@ -579,7 +579,13 @@ wave-orders the DAG, and persists the campaign — the batch counterpart to
   resolve an arbitrary issue set fails `issue_set_resolution_unsupported` (501).
 
 Neither `epic_ref` nor `items` fails `validation_failed`; an un-installed repo
-fails `repo_not_installed`.
+fails `repo_not_installed` **when the resolved work-item provider is
+`github_projects`** — as of #3645 the installation lookup runs only for that
+provider, so a campaign resolving to `gitlab`/`jira` reports the provider-side
+outcome instead. `provider` (optional) selects that provider per call
+(`github_projects` | `gitlab` | `jira`, defaulting to the repo's
+work-management conventions); an unregistered id fails `validation_failed`, and
+a `501 provider_unimplemented` now carries a `remedy` naming the fix.
 
 **2. The drive-tick loop — `fishhawk_get_campaign_status` is the single status
 surface.** It is reconcile-on-read: each poll settles every terminal item run and

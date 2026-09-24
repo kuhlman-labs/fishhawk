@@ -12567,6 +12567,42 @@ paths:
                     run in the batch. Omit it for no binding (the unchanged
                     default).
                   example: /Users/op/checkouts/fishhawk
+                provider:
+                  type: string
+                  description: |
+                    OPTIONAL work-item provider selector (#3645): the id of the
+                    work-item provider this campaign is assembled against —
+                    `github_projects`, `gitlab` or `jira`. The ladder is two
+                    rungs: a non-empty `provider` WINS, otherwise the repo's
+                    work-management conventions decide (the
+                    `.fishhawk/work-management.yaml` `provider:` field, falling
+                    back to `github_projects` when the repo carries no file and
+                    the deployment sets no override). Omit it for the
+                    conventions-resolved provider — the backward-compatible
+                    default, which sends a byte-identical body.
+
+                    It is a WORK-ITEM PROVIDER ID and deliberately NOT the
+                    `forge` enum `POST /v0/runs` carries: the id space includes
+                    `jira`, which no two-member `github|gitlab` enum can name,
+                    and `forge` on a run means which forge HOSTS the repo and
+                    stamps the `installation_ref`.
+
+                    Validated against the LIVE registry WITH the other body
+                    checks — before the conventions load, the provider dispatch
+                    and the GitHub App installation lookup — so an unregistered
+                    id is `400 validation_failed` (`details.field` = `provider`,
+                    `details.got` the offending value, `details.registered` the
+                    exact accepted set) at no forge round-trip. It is checked
+                    AFTER the `Idempotency-Key` lookup, so a replay returns the
+                    stored response without re-validating its body.
+
+                    NOTE the honest residual: selecting `gitlab` reaches
+                    `501 epic_children_unsupported` /
+                    `501 issue_set_resolution_unsupported`, because the GitLab
+                    work-item provider implements neither campaign capability in
+                    v0. This selector makes the refusal ACCURATE and
+                    CORRECTABLE; it does not make a GitLab campaign assemble.
+                  example: github_projects
       responses:
         '200':
           description: |
@@ -12590,9 +12626,19 @@ paths:
             `grooming_source.limit` negative, `pause_policy` not a recognized
             value, `operator_agent` not a valid operator-agent block (malformed
             or an unknown knob), `working_dir` non-empty but not absolute
-            (E48.87 / #2527), body malformed / unknown field, or a dependency
-            cycle among the assembled items (the cycle case is determinately
-            `400`, never `422`, in both the epic and no-epic branches).
+            (E48.87 / #2527), `provider` non-empty but naming an id this
+            deployment has not registered (#3645 — `details.field` =
+            `provider`, `details.got` the offending value,
+            `details.registered` the exact accepted set), body malformed /
+            unknown field, or a dependency cycle among the assembled items (the
+            cycle case is determinately `400`, never `422`, in both the epic and
+            no-epic branches).
+
+            Every body check above runs AFTER the `Idempotency-Key` lookup
+            (#3645): a replay is a read of an already-committed decision, so it
+            returns the stored `200` response without re-validating its body —
+            a deployment-state change after the original create cannot turn a
+            replay into a refusal.
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403':
           description: "`insufficient_scope` — bearer token missing `write:campaigns`."
@@ -12651,11 +12697,31 @@ paths:
             bypass.
         '501':
           description: |
-            `provider_unimplemented` — the conventions name an unregistered
-            provider; `epic_children_unsupported` — the provider cannot query
-            epic children (epic_ref path); `issue_set_resolution_unsupported` —
-            the provider cannot resolve an explicit issue set without an epic
-            (no-epic `items`-only path).
+            `provider_unimplemented` — the RESOLVED work-item provider (the
+            request's `provider` when present, else the conventions-resolved
+            one) is not in this deployment's registry. TWO NAMED MODES (#3645),
+            distinguished by `details.registered` and each carrying a
+            `details.remedy` string that is the actionable half of the refusal:
+
+            - `registered` EMPTY — the deployment wired no work-item provider at
+              all. The remedy names that WIRING (the GitHub App credentials that
+              register `github_projects`, or `FISHHAWKD_GITLAB_BASE_URL` +
+              `FISHHAWKD_GITLAB_TOKEN` that register `gitlab`).
+            - `registered` NON-EMPTY — providers ARE registered, just not the
+              resolved id. The remedy names BOTH the in-band fix (pass
+              `provider` on this request naming one of the registered ids,
+              correctable with no daemon restart) and the durable ones (the
+              repo's `.fishhawk/work-management.yaml` `provider:` field, or the
+              deployment-level `FISHHAWKD_WORKMGMT_CONVENTIONS` override). The
+              handler REFUSES rather than substituting the sole registered
+              provider: silently retargeting a batch at a different issue
+              tracker is how an operator gets a campaign they did not ask for.
+
+            `epic_children_unsupported` — the provider cannot query epic
+            children (epic_ref path); `issue_set_resolution_unsupported` — the
+            provider cannot resolve an explicit issue set without an epic
+            (no-epic `items`-only path). Both name the RESOLVED provider in
+            `details.provider`.
         '502':
           description: |
             `installation_resolution_failed` — a transient failure resolving

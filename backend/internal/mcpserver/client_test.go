@@ -108,7 +108,7 @@ func TestCreateCampaign_OperatorAgentBytes_OmittedWhenNil(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	r := newResolver(srv, nil)
 
-	_, err := r.api.CreateCampaign(context.Background(), "x/y", "#1", "", nil, nil, "", nil)
+	_, err := r.api.CreateCampaign(context.Background(), campaignCreateRequest{Repo: "x/y", EpicRef: "#1"})
 	if err != nil {
 		t.Fatalf("CreateCampaign: %v", err)
 	}
@@ -131,8 +131,8 @@ func TestCreateCampaign_OperatorAgentBytes_CarriedVerbatim(t *testing.T) {
 	}
 	r := newResolver(srv, nil)
 
-	got, err := r.api.CreateCampaign(context.Background(), "x/y", "#25", "",
-		json.RawMessage(`{"may_waive":"solo_low"}`), nil, "", nil)
+	got, err := r.api.CreateCampaign(context.Background(), campaignCreateRequest{
+		Repo: "x/y", EpicRef: "#25", OperatorAgent: json.RawMessage(`{"may_waive":"solo_low"}`)})
 	if err != nil {
 		t.Fatalf("CreateCampaign: %v", err)
 	}
@@ -164,7 +164,7 @@ func TestCreateCampaign_WorkingDir_BodyAndDecode(t *testing.T) {
 	}
 	r := newResolver(srv, nil)
 
-	got, err := r.api.CreateCampaign(context.Background(), "x/y", "#25", "", nil, nil, wd, nil)
+	got, err := r.api.CreateCampaign(context.Background(), campaignCreateRequest{Repo: "x/y", EpicRef: "#25", WorkingDir: wd})
 	if err != nil {
 		t.Fatalf("CreateCampaign: %v", err)
 	}
@@ -178,7 +178,7 @@ func TestCreateCampaign_WorkingDir_BodyAndDecode(t *testing.T) {
 	// Empty binding → no working_dir key on the wire at all.
 	fb2, srv2 := newFakeBackend(t)
 	r2 := newResolver(srv2, nil)
-	if _, err := r2.api.CreateCampaign(context.Background(), "x/y", "#25", "", nil, nil, "", nil); err != nil {
+	if _, err := r2.api.CreateCampaign(context.Background(), campaignCreateRequest{Repo: "x/y", EpicRef: "#25"}); err != nil {
 		t.Fatalf("CreateCampaign (unbound): %v", err)
 	}
 	if fb2.createCampaignBody.WorkingDir != "" {
@@ -2475,8 +2475,8 @@ func TestCreateCampaign_GroomingSourceOnTheWire(t *testing.T) {
 	}
 	r := newResolver(srv, nil)
 
-	got, err := r.api.CreateCampaign(context.Background(), "x/y", "", "", nil, nil, "",
-		&campaignGroomingSource{RunID: "r1", Limit: 3, AllowSuperseded: true})
+	got, err := r.api.CreateCampaign(context.Background(), campaignCreateRequest{
+		Repo: "x/y", GroomingSource: &campaignGroomingSource{RunID: "r1", Limit: 3, AllowSuperseded: true}})
 	if err != nil {
 		t.Fatalf("CreateCampaign: %v", err)
 	}
@@ -2541,8 +2541,8 @@ func TestCreateCampaign_RoutesThroughTheIssueSetClient(t *testing.T) {
 
 	c := newAPIClient(config{backendURL: stub.URL, apiToken: "t"})
 	c.httpIssueSet = &http.Client{Transport: sentinelRoundTripper{}}
-	_, err := c.CreateCampaign(context.Background(), "kuhlman-labs/fishhawk", "", "", nil,
-		[]string{"issue:101"}, "", nil)
+	_, err := c.CreateCampaign(context.Background(), campaignCreateRequest{
+		Repo: "kuhlman-labs/fishhawk", Items: []string{"issue:101"}})
 	if err == nil {
 		t.Fatal("CreateCampaign succeeded — it did NOT route through httpIssueSet")
 	}
@@ -2590,8 +2590,8 @@ func TestCreateCampaignDecodesServerTimeout504(t *testing.T) {
 		// ORDERING (client wait > server latency) is what is under test here; the
 		// shipped constant's own ordering is pinned by the relationship test.
 		c.httpIssueSet = &http.Client{Timeout: timescale.D(10 * time.Second)}
-		_, err := c.CreateCampaign(context.Background(), "kuhlman-labs/fishhawk", "", "", nil,
-			[]string{"issue:101"}, "", nil)
+		_, err := c.CreateCampaign(context.Background(), campaignCreateRequest{
+			Repo: "kuhlman-labs/fishhawk", Items: []string{"issue:101"}})
 		var ae *apiError
 		if !errors.As(err, &ae) {
 			t.Fatalf("error = %v (%T), want *apiError decoded from the server's 504", err, err)
@@ -2620,8 +2620,8 @@ func TestCreateCampaignDecodesServerTimeout504(t *testing.T) {
 		c := newAPIClient(config{backendURL: stub.URL, apiToken: "t"})
 		// Client wall BELOW the server's latency — the pre-#3113 ordering.
 		c.httpIssueSet = &http.Client{Timeout: serverLatency / 3}
-		_, err := c.CreateCampaign(context.Background(), "kuhlman-labs/fishhawk", "", "", nil,
-			[]string{"issue:101"}, "", nil)
+		_, err := c.CreateCampaign(context.Background(), campaignCreateRequest{
+			Repo: "kuhlman-labs/fishhawk", Items: []string{"issue:101"}})
 		if err == nil {
 			t.Fatal("CreateCampaign succeeded, want a transport error")
 		}

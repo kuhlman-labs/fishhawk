@@ -19,7 +19,7 @@ import (
 // items assembles a no-epic campaign over an explicit issue list — #2051).
 // pause_policy is optional (empty normalizes to pause_campaign server-side).
 type StartCampaignInput struct {
-	Repo        string `json:"repo" jsonschema:"GitHub repo as owner/name to assemble the campaign in"`
+	Repo        string `json:"repo" jsonschema:"repo as owner/name (GitHub owner/name or GitLab namespace/project) to assemble the campaign in"`
 	EpicRef     string `json:"epic_ref,omitempty" jsonschema:"OPTIONAL the epic reference to decompose into the campaign DAG (e.g. an issue ref like '#25' or 'owner/name#25'). Omit it and pass items to assemble a no-epic campaign over an explicit issue list instead; one of epic_ref / items is required"`
 	PausePolicy string `json:"pause_policy,omitempty" jsonschema:"OPTIONAL pause behavior on a gate hand-off: 'pause_campaign' (block the whole campaign, the default) or 'pause_item' (continue-others). Omit to take the conservative pause_campaign default"`
 	// OperatorAgent is the OPTIONAL campaign-level operator_agent override. Typed
@@ -48,6 +48,13 @@ type StartCampaignInput struct {
 	// WorkingDir is the OPTIONAL campaign-level checkout binding (E48.87 /
 	// #2527): bound ONCE here, inherited by every item run.
 	WorkingDir string `json:"working_dir,omitempty" jsonschema:"absolute path to the checkout this campaign's item runs execute in. Bound ONCE on the campaign so EVERY item run inherits it — pass it here instead of repeating an identical path on every fishhawk_start_campaign_item_run call. YOU, the calling agent, resolve your own checkout (you are running inside one) rather than asking the operator for a path. A non-absolute value is refused. Omit it only if the campaign's item runs are github_actions, or if you intend to pass working_dir per item: a LOCAL item run whose campaign carries no binding and that passes none is refused working_dir_required"`
+
+	// Provider is the OPTIONAL work-item provider selector (#3645): a
+	// forge-neutral override of the repo's conventions-resolved work-item
+	// provider for THIS campaign. Deliberately a work-item provider ID and not
+	// a github|gitlab `forge` enum — the id space includes `jira`, and `forge`
+	// on fishhawk_start_run means which forge HOSTS the repo.
+	Provider string `json:"provider,omitempty" jsonschema:"OPTIONAL the work-item provider id to assemble this campaign against: 'github_projects', 'gitlab' or 'jira'. Defaults to the repo's work-management conventions (the .fishhawk/work-management.yaml provider: field, falling back to github_projects). Reach for it when the conventions-resolved provider is not one this deployment has registered — the 501 provider_unimplemented refusal names the registered set, and passing one of those ids here corrects the call in-band with no daemon restart. An unregistered id is refused 400 validation_failed before any forge round-trip. NOTE the honest residual: 'gitlab' reaches an honest 501 epic_children_unsupported / issue_set_resolution_unsupported, because the GitLab work-item provider implements neither campaign capability in v0"`
 }
 
 // StartCampaignOutput carries the created campaign row.
@@ -143,6 +150,17 @@ fails campaign_dangling_dependency; a requested item that is not a child of the
 epic fails campaign_item_not_child; a repo without the GitHub App installed
 fails repo_not_installed; a malformed or unknown-field operator_agent fails
 validation_failed.
+
+provider is optional — the work-item provider id ('github_projects', 'gitlab' or
+'jira') this campaign is assembled against, defaulting to the repo's
+work-management conventions. Reach for it when a 501 provider_unimplemented says
+the conventions-resolved provider is not one this deployment registered: the
+refusal names the registered set and a remedy, and passing one of those ids here
+corrects the call in-band with no daemon restart. An unregistered id is refused
+400 validation_failed before any forge round-trip. Selecting 'gitlab' reaches an
+honest 501 epic_children_unsupported / issue_set_resolution_unsupported — the
+GitLab work-item provider implements neither campaign capability in v0, so this
+makes the refusal accurate, not the campaign assemblable.
 `),
 	}, resolver.startCampaign)
 }
@@ -223,7 +241,19 @@ func (r *runResolver) startCampaign(ctx context.Context, _ *mcp.CallToolRequest,
 		}
 	}
 
-	created, err := r.api.CreateCampaign(ctx, repo, in.EpicRef, in.PausePolicy, operatorAgent, in.Items, workingDir, groomingSource)
+	created, err := r.api.CreateCampaign(ctx, campaignCreateRequest{
+		Repo:           repo,
+		EpicRef:        in.EpicRef,
+		PausePolicy:    in.PausePolicy,
+		OperatorAgent:  operatorAgent,
+		Items:          in.Items,
+		WorkingDir:     workingDir,
+		GroomingSource: groomingSource,
+		// The OPTIONAL work-item provider selector (#3645). Forwarded verbatim
+		// — the backend is the registry authority, so the client does not
+		// second-guess the id. Empty omits the key entirely.
+		Provider: strings.TrimSpace(in.Provider),
+	})
 	if err != nil {
 		// Map the backend's gate codes onto operator-actionable tool errors.
 		var ae *apiError
@@ -349,6 +379,27 @@ func (r *runResolver) startCampaign(ctx context.Context, _ *mcp.CallToolRequest,
 			case "issue_set_resolution_timeout":
 				return nil, StartCampaignOutput{}, fmt.Errorf(
 					"issue_set_resolution_timeout: %s — %s", ae.Message, issueSetTimeoutRemedy(ae.Details))
+			case "validation_failed":
+				// The ONE validation_failed shape with an operator-actionable
+				// remedy the generic wrapper cannot carry: an UNREGISTERED
+				// `provider` (#3645). The backend names the accepted set in
+				// details.registered, so surface it rather than making the
+				// caller guess. Every OTHER validation_failed falls out of the
+				// switch to the generic wrapper below, byte-unchanged.
+				if field, _ := ae.Details["field"].(string); field == "provider" {
+					return nil, StartCampaignOutput{}, fmt.Errorf(
+						"validation_failed: %s — provider %v is not registered on this deployment; pass one of %v, or omit provider to take the repo's work-management conventions",
+						ae.Message, ae.Details["got"], ae.Details["registered"])
+				}
+			case "provider_unimplemented":
+				// Surface the backend's static-literal `remedy` VERBATIM (#3645).
+				// It is the half of the refusal that is actionable, and it is
+				// mode-dependent (deployment-not-wired vs resolved-id-not-
+				// registered), so re-deriving it here would either duplicate the
+				// server's branch or flatten the two modes into one wrong message.
+				return nil, StartCampaignOutput{}, fmt.Errorf(
+					"provider_unimplemented: %s — the resolved work-item provider is %v and this deployment has registered %v; %v",
+					ae.Message, ae.Details["provider"], ae.Details["registered"], ae.Details["remedy"])
 			case "campaign_repo_unconfigured":
 				return nil, StartCampaignOutput{}, fmt.Errorf(
 					"campaign_repo_unconfigured: %s — this deployment has no campaign repository wired, so campaigns cannot be created", ae.Message)
