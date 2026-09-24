@@ -1,0 +1,14 @@
+id: scenario:issue-3625/readiness-body-carries-review-grounding
+statement: On a deployment that has not set FISHHAWKD_REVIEW_GROUNDING, GET /v0/onboarding/readiness returns 200 and the body carries a review_grounding object whose enabled is false, whose adapters list names codex and claude with their respective read bounds, and whose remediation text names FISHHAWKD_REVIEW_GROUNDING.
+verify_hint: Call GET /v0/onboarding/readiness?repo=<owner/name> against the localhost preview with an operator token and read the review_grounding key in the JSON response body.
+steps: '1) POST http://localhost:8090/v0/dev/fixtures {"scenario":"plan-gate-parked"} -> 201, which returned run 8c58f780-d8d9-4019-adf6-39ce15ce1c0c. 2) POST /v0/runs/{run}/signing-key -> 201, returning private_key. 3) POST /v0/dev/sign with body ''{}'' and header X-Fishhawk-Dev-Private-Key -> signature. 4) POST /v0/runs/{run}/mcp-token with body ''{}'' and X-Fishhawk-Signature -> 201, returning an fhm_ bearer. 5) GET /v0/onboarding/readiness?repo=kuhlman-labs/fishhawk with Authorization: Bearer <fhm_> and read the review_grounding key. FISHHAWKD_REVIEW_GROUNDING is not set on the preview.'
+assertions:
+    expected: 200 with review_grounding.enabled=false, adapters naming codex and claude with their read bounds, and remediation naming FISHHAWKD_REVIEW_GROUNDING.
+    observed_at_record: 200. review_grounding = {enabled:false, adapters:[{adapter:codex, bound:confined, note:OS-level deny-by-default allowlist...}, {adapter:claude, bound:blocklist, note:--disallowed-tools blocklist... NOT the OS-enforced bound codex gets}], note:'review grounding is OFF on this deployment (the supported default)... DIFF-ONLY...', remediation:'set FISHHAWKD_REVIEW_GROUNDING=true (or --review-grounding)... OPT-IN posture for a single-tenant host... the two bounds are NOT equivalent'}.
+    repro_handle: 'curl -H ''Authorization: Bearer <token>'' ''http://localhost:8090/v0/onboarding/readiness?repo=kuhlman-labs/fishhawk'''
+origin:
+    issue: 3625
+    pr: 3638
+    run_id: 2eee44ba-26cf-4724-aae3-ea17fc2e6b88
+    head_sha: 99b9100477b000231d7431b0d7f069ca8a4ae1ff
+    recorded_at: 2026-09-24T03:05:42Z
