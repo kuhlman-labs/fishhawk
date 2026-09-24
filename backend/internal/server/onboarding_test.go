@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -3843,5 +3844,198 @@ func TestOnboardingReadiness_TraceStore_SurvivesMCPMirrorDecode(t *testing.T) {
 	if report.TraceStore.Configured != want.Configured || report.TraceStore.Kind != want.Kind ||
 		report.TraceStore.Note != want.Note || report.TraceStore.Remediation != want.Remediation {
 		t.Errorf("MCP mirror TraceStore = %+v, want %+v", *report.TraceStore, want)
+	}
+}
+
+// --- review_grounding rung (E45.90 / #3625) ---
+
+// TestReviewGroundingReadinessFor tables BOTH resolver postures. Each case
+// asserts Enabled, the EXACT two-row adapter vocabulary, the branch-specific
+// note/remediation text AND the honest-label invariant, so a no-op or
+// comment-only touch of the resolver fails here.
+func TestReviewGroundingReadinessFor(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		disabled       bool
+		wantEnabled    bool
+		noteHas        []string
+		remediationHas []string
+	}{
+		{
+			name:        "disabled is the shipping default",
+			disabled:    true,
+			wantEnabled: false,
+			noteHas:     []string{"OFF", "DIFF-ONLY", "UNTRACED", "UNESTABLISHED"},
+			// The literal an operator greps for, plus the single-tenant
+			// caveat and the per-adapter asymmetry, stated honestly.
+			remediationHas: []string{"FISHHAWKD_REVIEW_GROUNDING=true", "single-tenant", "NOT equivalent"},
+		},
+		{
+			name:           "enabled",
+			disabled:       false,
+			wantEnabled:    true,
+			noteHas:        []string{"ON", "NOT equivalent"},
+			remediationHas: []string{"FISHHAWKD_REVIEW_GROUNDING=false", "blocklist, not confinement"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := reviewGroundingReadinessFor(tc.disabled)
+			if got.Enabled != tc.wantEnabled {
+				t.Fatalf("Enabled = %v, want %v", got.Enabled, tc.wantEnabled)
+			}
+			// The adapter table renders in BOTH postures — it is what an
+			// operator deciding whether to opt IN needs — and its vocabulary
+			// is closed at exactly these two rows.
+			want := []reviewGroundingAdapterBound{
+				{Adapter: "codex", Bound: reviewGroundingBoundConfined, Note: reviewGroundingCodexNote},
+				{Adapter: "claude", Bound: reviewGroundingBoundBlocklist, Note: reviewGroundingClaudeNote},
+			}
+			if !reflect.DeepEqual(got.Adapters, want) {
+				t.Errorf("Adapters = %+v, want exactly %+v", got.Adapters, want)
+			}
+			for _, w := range tc.noteHas {
+				if !strings.Contains(got.Note, w) {
+					t.Errorf("Note = %q, want it to contain %q", got.Note, w)
+				}
+			}
+			for _, w := range tc.remediationHas {
+				if !strings.Contains(got.Remediation, w) {
+					t.Errorf("Remediation = %q, want it to contain %q", got.Remediation, w)
+				}
+			}
+		})
+	}
+}
+
+// TestReviewGroundingReadiness_HonestLabelInvariant pins the asymmetry
+// backend/internal/reviewsandbox/README.md § "Reviewer read bounds (#2522) —
+// TWO mechanisms, NOT the same strength" forbids collapsing: the CLAUDE row is
+// a blocklist and its note makes NO confinement claim, while the CODEX row is
+// the one that actually has confinement. Labelling claude's tool-layer
+// blocklist as confinement would be the exact over-claim that epic removed, so
+// it is asserted here rather than left to prose.
+func TestReviewGroundingReadiness_HonestLabelInvariant(t *testing.T) {
+	for _, disabled := range []bool{true, false} {
+		got := reviewGroundingReadinessFor(disabled)
+		var codex, claude *reviewGroundingAdapterBound
+		for i := range got.Adapters {
+			switch got.Adapters[i].Adapter {
+			case "codex":
+				codex = &got.Adapters[i]
+			case "claude":
+				claude = &got.Adapters[i]
+			}
+		}
+		if codex == nil || claude == nil {
+			t.Fatalf("disabled=%v: both adapter rows must render, got %+v", disabled, got.Adapters)
+		}
+		if claude.Bound != reviewGroundingBoundBlocklist {
+			t.Errorf("disabled=%v: claude bound = %q, want %q — claude is NEVER confined",
+				disabled, claude.Bound, reviewGroundingBoundBlocklist)
+		}
+		if strings.Contains(strings.ToLower(claude.Note), "confin") {
+			t.Errorf("disabled=%v: the claude note claims confinement, which it does not have: %q",
+				disabled, claude.Note)
+		}
+		if !strings.Contains(claude.Note, "blocklist") || !strings.Contains(claude.Note, "defence-in-depth") {
+			t.Errorf("disabled=%v: the claude note must name its blocklist/defence-in-depth posture: %q",
+				disabled, claude.Note)
+		}
+		if codex.Bound != reviewGroundingBoundConfined {
+			t.Errorf("disabled=%v: codex bound = %q, want %q", disabled, codex.Bound, reviewGroundingBoundConfined)
+		}
+		if !strings.Contains(codex.Note, "confined") || !strings.Contains(codex.Note, "EPERM") {
+			t.Errorf("disabled=%v: the codex note must name the confined profile and its OS-level effect: %q",
+				disabled, codex.Note)
+		}
+	}
+}
+
+// TestOnboardingReadiness_ReviewGrounding_NotInstalledStillCarriesRung is the
+// no-cascade seam: a GitHub repo whose App is NOT installed still serves
+// review_grounding, because the rung answers a question about the DEPLOYMENT,
+// not the repo. The body is read RAW so key PRESENCE is asserted, not a zero
+// value.
+func TestOnboardingReadiness_ReviewGrounding_NotInstalledStillCarriesRung(t *testing.T) {
+	fake := newFakeGitHubForRuns(onboardingReviewersSpecYAML)
+	fake.installationStatus = http.StatusNotFound
+	fake.installationBody = `{"message":"Not Found"}`
+	s := newOnboardingServer(t, fake.server(t), nil)
+	s.cfg.ReviewGroundingDisabled = true
+
+	id := testOperatorIdentity()
+	raw := rawReadiness(t, s, onboardingReq("x/y", &id))
+	if app := rawObject(t, raw, "app"); app["installed"] != false {
+		t.Fatalf("app = %v, want installed:false (fixture must seed the not-installed cascade)", app)
+	}
+	rg := rawObject(t, raw, "review_grounding")
+	if rg["enabled"] != false {
+		t.Errorf("review_grounding = %v, want enabled:false", rg)
+	}
+	if rem, _ := rg["remediation"].(string); !strings.Contains(rem, "FISHHAWKD_REVIEW_GROUNDING") {
+		t.Errorf("review_grounding.remediation = %q, want it to name FISHHAWKD_REVIEW_GROUNDING", rem)
+	}
+	adapters, _ := rg["adapters"].([]any)
+	if len(adapters) != 2 {
+		t.Errorf("review_grounding.adapters = %v, want the two-row table on the wire", rg["adapters"])
+	}
+}
+
+// TestOnboardingReadiness_ReviewGrounding_GitLabForgeUnconfiguredCarriesRung
+// pins the rung on the gitlab family too, on its deepest degrade (no gitlab
+// forge wired, project unresolvable), with grounding ON so the enabled branch
+// is exercised across the wire.
+func TestOnboardingReadiness_ReviewGrounding_GitLabForgeUnconfiguredCarriesRung(t *testing.T) {
+	s := newOnboardingGitLabServer(t, nil, nil, nil, nil)
+	s.cfg.ReviewGroundingDisabled = false
+
+	id := testOperatorIdentity()
+	raw := rawReadiness(t, s, onboardingReqForge("acme/widgets", "gitlab", &id))
+	if raw["forge"] != observationForgeGitLab {
+		t.Fatalf("forge = %v, want gitlab", raw["forge"])
+	}
+	rg := rawObject(t, raw, "review_grounding")
+	if rg["enabled"] != true {
+		t.Errorf("review_grounding = %v, want enabled:true", rg)
+	}
+}
+
+// TestOnboardingReadiness_ReviewGrounding_SurvivesMCPMirrorDecode is the
+// cross-boundary seam: the REAL handler's served JSON is decoded with the
+// fishhawk_doctor client mirror (mcpserver.OnboardingReadinessReport) — not a
+// hand-written literal — and every review_grounding field must survive. A tag
+// drift between the two structs fails here.
+func TestOnboardingReadiness_ReviewGrounding_SurvivesMCPMirrorDecode(t *testing.T) {
+	fake := newFakeGitHubForRuns(onboardingReviewersSpecYAML)
+	fake.installationStatus = http.StatusNotFound
+	fake.installationBody = `{"message":"Not Found"}`
+	s := newOnboardingServer(t, fake.server(t), nil)
+	s.cfg.ReviewGroundingDisabled = true
+
+	id := testOperatorIdentity()
+	w := httptest.NewRecorder()
+	s.handleGetOnboardingReadiness(w, onboardingReq("x/y", &id))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var report mcpserver.OnboardingReadinessReport
+	if err := json.Unmarshal(w.Body.Bytes(), &report); err != nil {
+		t.Fatalf("decode served body with the MCP mirror: %v", err)
+	}
+	if report.ReviewGrounding == nil {
+		t.Fatalf("MCP mirror decoded ReviewGrounding = nil from the served body:\n%s", w.Body.String())
+	}
+	want := reviewGroundingReadinessFor(true)
+	got := report.ReviewGrounding
+	if got.Enabled != want.Enabled || got.Note != want.Note || got.Remediation != want.Remediation {
+		t.Errorf("MCP mirror ReviewGrounding scalars = %+v, want %+v", *got, want)
+	}
+	if len(got.Adapters) != len(want.Adapters) {
+		t.Fatalf("MCP mirror decoded %d adapter rows, want %d", len(got.Adapters), len(want.Adapters))
+	}
+	for i, a := range got.Adapters {
+		if a.Adapter != want.Adapters[i].Adapter || a.Bound != want.Adapters[i].Bound || a.Note != want.Adapters[i].Note {
+			t.Errorf("MCP mirror adapter[%d] = %+v, want %+v", i, a, want.Adapters[i])
+		}
 	}
 }

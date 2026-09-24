@@ -58,6 +58,45 @@ matters most here:
 Waive and defer both **write a reason** that a later reader relies on. Record why
 you waived, not just that you did.
 
+## Reviewers are diff-only by default, and that is a setting
+
+By default a reviewer reads the **diff and nothing else**. It cannot open a
+sibling file to check whether the pattern it is about to flag is already the
+convention, and it cannot read the fake behind a prediction it is about to make.
+The prompt tells it what to do about that: say the baseline is `UNESTABLISHED` or
+the prediction `UNTRACED`, calibrate the severity down, and hand the check to you.
+
+So an `UNTRACED` concern is not a reviewer being vague. It is a reviewer
+correctly declining to assert something it structurally could not check — and the
+work lands on your desk.
+
+That posture is a **deployment setting, not a product limit**. Setting
+`FISHHAWKD_REVIEW_GROUNDING=true` (or `--review-grounding` on `fishhawkd`) grounds
+both review stages against a read-only export of the repository's tracked files at
+the reviewed commit, and those two findings become a search the reviewer runs
+instead of a question it hands back.
+
+**It ships off on purpose, and the reason is worth reading before you flip it.** A
+grounded reviewer is processing untrusted diff content with read access, and its
+verdict text reaches the audit log and the pull request — so what bounds its reads
+matters. Those bounds are **not the same on both adapters**:
+
+| Adapter | Bound | What it actually means |
+|---|---|---|
+| codex | `confined` | An OS-level deny-by-default allowlist. A read outside the exported tree returns `EPERM` — the operating system refuses it, not the model. |
+| claude | `blocklist` | A tool-layer deny-rule list over a fixed set of credential roots. Defence-in-depth — **not** confinement. |
+
+Do not collapse those into one word. Only codex is confined; claude is bounded by
+a list of things it is told not to read. Enabling grounding is a deliberate choice
+appropriate for a single-tenant host you control, and it should be revisited
+before multi-tenancy.
+
+`fishhawk doctor` reports the current posture as a `review grounding` rung,
+including the per-adapter bounds in both states. Off renders as an informational
+`ok` with a hint naming the flag — never a warning, because off is the supported
+default and your doctor should not go yellow for running the shipped
+configuration.
+
 ## Two operational facts that bite
 
 - **The fix-up budget is hard-capped at three passes** per implement stage. Past

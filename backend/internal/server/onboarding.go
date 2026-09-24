@@ -82,6 +82,16 @@ var requiredRunScopes = []string{
 // there), set on EVERY gitlab-family report including the forge-unconfigured
 // one, `unknown` with a naming reason whenever the registry cannot answer.
 //
+// ReviewGrounding (E45.90 / #3625) is DEPLOYMENT-scoped for the same reason
+// as TraceStore, and answers a different question: is review grounding ON for
+// this deployment, and what BOUNDS a grounded reviewer's reads per adapter? It
+// is set on EVERY report of both families and sits OUTSIDE every repo-scoped
+// cascade. Like TraceStore it is a pointer only so the client mirrors can
+// model an older fishhawkd's absent key as "no claim" (never a zero-valued
+// enabled:false verdict); this handler never leaves it nil. The rung does NOT
+// change the default: grounding ships DORMANT and `enabled:false` is the
+// supported posture, so the CLI renders it ok-with-a-hint, never a warn.
+//
 // TraceStore (E45.75 / #3600) is DEPLOYMENT-scoped: it answers "will this
 // run's trace upload 503?", a fact about fishhawkd's wiring, not about the
 // repo. It is set on EVERY report of both families and sits OUTSIDE every
@@ -100,6 +110,7 @@ type onboardingReadinessResponse struct {
 	GitLabMergeGate    *gitLabMergeGateReadiness    `json:"gitlab_merge_gate,omitempty"`
 	GitLabRegistration *gitLabRegistrationReadiness `json:"gitlab_registration,omitempty"`
 	TraceStore         *traceStoreReadiness         `json:"trace_store,omitempty"`
+	ReviewGrounding    *reviewGroundingReadiness    `json:"review_grounding,omitempty"`
 }
 
 // traceStoreReadiness reports whether this deployment has a trace store wired
@@ -164,6 +175,95 @@ func traceStoreReadinessFor(ts tracestore.Storage) traceStoreReadiness {
 		return traceStoreReadiness{Configured: true, Kind: traceStoreKindMemory, Note: traceStoreMemoryNote}
 	default:
 		return traceStoreReadiness{Configured: true, Kind: traceStoreKindOther, Note: traceStoreOtherNote}
+	}
+}
+
+// reviewGroundingReadiness reports whether this deployment grounds its plan-
+// and implement-review agents against an exported read-only source tree
+// (E45.90 / #3625), and what bounds a grounded reviewer's reads PER ADAPTER.
+//
+// Enabled false is the SUPPORTED DEFAULT, not a defect: grounding ships
+// dormant behind FISHHAWKD_REVIEW_GROUNDING (#2522). The rung exists so an
+// operator reading `fishhawk doctor` can DISCOVER the switch and the posture
+// it buys, which is why Adapters renders in BOTH postures — the per-adapter
+// asymmetry is precisely what an operator deciding whether to opt IN needs.
+type reviewGroundingReadiness struct {
+	Enabled     bool                          `json:"enabled"`
+	Adapters    []reviewGroundingAdapterBound `json:"adapters,omitempty"`
+	Note        string                        `json:"note,omitempty"`
+	Remediation string                        `json:"remediation,omitempty"`
+}
+
+// reviewGroundingAdapterBound is one reviewer adapter's read bound. Bound is a
+// CLOSED two-value vocabulary and the two are NOT equivalent — the asymmetry
+// backend/internal/reviewsandbox/README.md § "Reviewer read bounds (#2522) —
+// TWO mechanisms, NOT the same strength" forbids collapsing into one word:
+//
+//   - "confined"  — codex: the synthesized `confined` permission profile
+//     (reviewsandbox.CodexConfinedHome), an OS-level deny-by-default
+//     ALLOWLIST; an out-of-tree read returns EPERM.
+//   - "blocklist" — claude: reviewsandbox.ClaudeDenyRules, a BOUNDED
+//     `--disallowed-tools` deny-rule list over a fixed set of credential
+//     roots, enforced at the TOOL layer. Defence-in-depth, and never
+//     described here as the OS-enforced bound codex gets.
+type reviewGroundingAdapterBound struct {
+	Adapter string `json:"adapter"`
+	Bound   string `json:"bound"`
+	Note    string `json:"note,omitempty"`
+}
+
+// The closed review_grounding bound vocabulary (docs/api/v0.openapi.yaml
+// enumerates the same two values).
+const (
+	reviewGroundingBoundConfined  = "confined"
+	reviewGroundingBoundBlocklist = "blocklist"
+)
+
+const (
+	reviewGroundingAdapterCodex  = "codex"
+	reviewGroundingAdapterClaude = "claude"
+
+	// The codex note is the ONLY place either note claims confinement, and it
+	// is the adapter that actually has it.
+	reviewGroundingCodexNote = "codex reviews run under a synthesized `confined` permission profile: an OS-level deny-by-default allowlist over the exported tree, so a read outside it returns EPERM rather than a model refusal"
+	// The claude note deliberately makes NO confinement claim — the honest
+	// label reviewsandbox/README.md pins. A resolver test asserts the word is
+	// absent from this string.
+	reviewGroundingClaudeNote = "claude reviews are bounded by a `--disallowed-tools` blocklist over a fixed set of credential roots, enforced at the TOOL layer: defence-in-depth, and NOT the OS-enforced bound codex gets"
+
+	reviewGroundingOffNote        = "review grounding is OFF on this deployment (the supported default): the plan- and implement-review agents are DIFF-ONLY, so a reviewer downgrades a diff-invisible question to UNTRACED / UNESTABLISHED and calibrates the severity DOWN rather than reading the repository to settle it"
+	reviewGroundingOffRemediation = "set FISHHAWKD_REVIEW_GROUNDING=true (or --review-grounding) to ground reviews against an exported read-only tree at the reviewed commit. It is an OPT-IN posture for a single-tenant host you control: a grounded reviewer processing untrusted diff content gets read access bounded per adapter, and the two bounds are NOT equivalent — codex gets OS-enforced confinement, claude gets a tool-layer blocklist that is defence-in-depth only"
+	reviewGroundingOnNote         = "review grounding is ON: plan- and implement-review agents read an exported read-only tree at the reviewed commit. The per-adapter read bounds below are NOT equivalent — see adapters[].bound"
+	reviewGroundingOnRemediation  = "set FISHHAWKD_REVIEW_GROUNDING=false (the default) to revert both adapters to the diff-only posture. While it is on, keep this deployment single-tenant: claude's bound is a tool-layer blocklist, not confinement, so a reviewer's verdict text remains an egress path for anything it can still read"
+)
+
+// reviewGroundingReadinessFor resolves the review_grounding rung from the
+// server's grounding kill switch. Pure, for the same reason
+// traceStoreReadinessFor is: onboarding_test tables every branch without
+// booting a server.
+//
+// The adapter table is STATIC — it restates the posture #2522 shipped
+// (reviewsandbox/confine.go CodexConfinedHome / ClaudeDenyRules), it is not a
+// live probe of the adapter argv, and the backend never spawns a reviewer to
+// measure confinement at readiness time.
+func reviewGroundingReadinessFor(disabled bool) reviewGroundingReadiness {
+	adapters := []reviewGroundingAdapterBound{
+		{Adapter: reviewGroundingAdapterCodex, Bound: reviewGroundingBoundConfined, Note: reviewGroundingCodexNote},
+		{Adapter: reviewGroundingAdapterClaude, Bound: reviewGroundingBoundBlocklist, Note: reviewGroundingClaudeNote},
+	}
+	if disabled {
+		return reviewGroundingReadiness{
+			Enabled:     false,
+			Adapters:    adapters,
+			Note:        reviewGroundingOffNote,
+			Remediation: reviewGroundingOffRemediation,
+		}
+	}
+	return reviewGroundingReadiness{
+		Enabled:     true,
+		Adapters:    adapters,
+		Note:        reviewGroundingOnNote,
+		Remediation: reviewGroundingOnRemediation,
 	}
 }
 
@@ -1318,14 +1418,19 @@ func (s *Server) handleGetOnboardingReadiness(w http.ResponseWriter, r *http.Req
 	owner, name, _ := strings.Cut(repo, "/")
 	repoRef := forge.RepoRef{Owner: owner, Name: name}
 
-	// (7) trace_store (E45.75 / #3600) is set HERE, before the forge switch
-	// and its repo-scoped cascades, so every report of both families carries
-	// it whatever the app/spec/merge-gate probes conclude.
+	// (7) trace_store (E45.75 / #3600) and (8) review_grounding (E45.90 /
+	// #3625) are set HERE, before the forge switch and its repo-scoped
+	// cascades, so every report of both families carries them whatever the
+	// app/spec/merge-gate probes conclude.
 	ts := traceStoreReadinessFor(s.cfg.TraceStore)
+	// (8) review_grounding (E45.90 / #3625) is set alongside it and for the
+	// same reason: it is a fact about fishhawkd's wiring, not about the repo.
+	rg := reviewGroundingReadinessFor(s.cfg.ReviewGroundingDisabled)
 	resp := onboardingReadinessResponse{
-		Repo:       repo,
-		Forge:      family,
-		TraceStore: &ts,
+		Repo:            repo,
+		Forge:           family,
+		TraceStore:      &ts,
+		ReviewGrounding: &rg,
 	}
 	var parsedSpec *spec.Spec
 	switch family {

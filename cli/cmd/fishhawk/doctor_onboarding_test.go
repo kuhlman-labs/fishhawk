@@ -1025,3 +1025,228 @@ func TestDoctorOnboarding_TraceStoreS3_Passes(t *testing.T) {
 		}
 	}
 }
+
+// --- review_grounding rung (E45.90 / #3625) ---
+//
+// FIXTURE-based (literal bodies), like the trace_store cases above: the cli
+// module cannot import the backend handler. The served-body cross-boundary
+// seam lives in backend/internal/server/onboarding_test.go
+// (TestOnboardingReadiness_ReviewGrounding_SurvivesMCPMirrorDecode).
+
+// reviewGroundingBody is a readiness body carrying the given review_grounding
+// JSON object (or no key at all when rg is empty).
+func reviewGroundingBody(rg string) string {
+	tail := ""
+	if rg != "" {
+		tail = `, "review_grounding": ` + rg
+	}
+	return `{"repo": "owner/name", "app": {"installed": true}, "spec": {"source": "fetched", "valid": true},
+	  "reviewers": [], "scopes": {"adequate": true}` + tail + `}`
+}
+
+func reviewGroundingRungFrom(t *testing.T, body string) (checkResult, bool) {
+	t.Helper()
+	for _, r := range readinessRungs(t, "owner/name", body) {
+		if r.label == "review grounding" {
+			return r, true
+		}
+	}
+	return checkResult{}, false
+}
+
+// TestDoctorOnboarding_ReviewGroundingMirrorsBackendTags decodes a body in
+// which EVERY review_grounding field — including every field of the nested
+// adapter row — carries a distinct non-empty value, so a tag typo cannot pass
+// on zero values.
+func TestDoctorOnboarding_ReviewGroundingMirrorsBackendTags(t *testing.T) {
+	var got onboardingReadiness
+	body := reviewGroundingBody(`{"enabled": true,
+	  "adapters": [{"adapter": "adapter-sentinel", "bound": "bound-sentinel", "note": "adapter-note-sentinel"}],
+	  "note": "note-sentinel", "remediation": "remediation-sentinel"}`)
+	if err := json.Unmarshal([]byte(body), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	rg := got.ReviewGrounding
+	if rg == nil {
+		t.Fatalf("ReviewGrounding = nil, want the decoded object")
+	}
+	if !rg.Enabled || rg.Note != "note-sentinel" || rg.Remediation != "remediation-sentinel" {
+		t.Errorf("ReviewGrounding = %+v, want every scalar decoded", *rg)
+	}
+	if len(rg.Adapters) != 1 {
+		t.Fatalf("Adapters = %+v, want exactly one decoded row", rg.Adapters)
+	}
+	a := rg.Adapters[0]
+	if a.Adapter != "adapter-sentinel" || a.Bound != "bound-sentinel" || a.Note != "adapter-note-sentinel" {
+		t.Errorf("Adapters[0] = %+v, want every field decoded", a)
+	}
+}
+
+// TestDoctorOnboarding_ReviewGroundingAbsentDrawsNoRung is the COUNTERFACTUAL
+// VEHICLE for the one control this change adds: the `if rg == nil` guard in
+// reviewGroundingRung. An absent key (a pre-#3625 fishhawkd) and an explicit
+// null both decode to nil and must draw NO rung — absence means the backend
+// cannot answer, which is NOT the 'off' verdict it never made.
+//
+// The bad state is seeded BY CONSTRUCTION from a readiness body literal that
+// simply omits the key, never by calling the guard in the test's own setup, so
+// deleting the guard lands the RED on the behavioral assertion below.
+func TestDoctorOnboarding_ReviewGroundingAbsentDrawsNoRung(t *testing.T) {
+	for name, body := range map[string]string{
+		"absent": reviewGroundingBody(""),
+		"null":   reviewGroundingBody("null"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			var decoded onboardingReadiness
+			if err := json.Unmarshal([]byte(body), &decoded); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if decoded.ReviewGrounding != nil {
+				t.Errorf("ReviewGrounding = %+v, want nil", *decoded.ReviewGrounding)
+			}
+			if r, ok := reviewGroundingRungFrom(t, body); ok {
+				t.Errorf("review grounding rung emitted for %s: %+v", name, r)
+			}
+		})
+	}
+}
+
+// TestDoctorOnboarding_ReviewGroundingOff_IsOkWithTheFlagHint pins the
+// DEFAULT-posture branch: grounding off renders status OK — never warn, since
+// off is the supported default and a warn would nag every correctly configured
+// deployment — with the detail naming the diff-only consequence and the hint
+// carrying the literal an operator greps for.
+func TestDoctorOnboarding_ReviewGroundingOff_IsOkWithTheFlagHint(t *testing.T) {
+	r, ok := reviewGroundingRungFrom(t, reviewGroundingBody(`{"enabled": false,
+	  "adapters": [{"adapter": "codex", "bound": "confined"}, {"adapter": "claude", "bound": "blocklist"}],
+	  "note": "reviews are DIFF-ONLY",
+	  "remediation": "set FISHHAWKD_REVIEW_GROUNDING=true on a single-tenant host; codex gets confinement, claude gets a blocklist"}`))
+	if !ok {
+		t.Fatalf("no review grounding rung for enabled:false")
+	}
+	if r.status != "ok" {
+		t.Errorf("status = %q, want ok — off is the supported default, not a warning", r.status)
+	}
+	if r.detail != "off (reviews are diff-only)" {
+		t.Errorf("detail = %q, want the diff-only consequence named", r.detail)
+	}
+	if !strings.Contains(r.remediate, "FISHHAWKD_REVIEW_GROUNDING") {
+		t.Errorf("remediate = %q, want it to name FISHHAWKD_REVIEW_GROUNDING", r.remediate)
+	}
+}
+
+// TestDoctorOnboarding_ReviewGroundingOff_EmptyRemediationFallback pins the
+// DEFENSIVE branch of the off rung: a backend that serves enabled:false with
+// no remediation (an older build, or a field dropped on the wire) must STILL
+// name the flag and the per-adapter asymmetry — the rung exists to surface the
+// switch, so a silent hint would defeat its whole purpose.
+func TestDoctorOnboarding_ReviewGroundingOff_EmptyRemediationFallback(t *testing.T) {
+	r, ok := reviewGroundingRungFrom(t, reviewGroundingBody(`{"enabled": false}`))
+	if !ok {
+		t.Fatalf("no review grounding rung for enabled:false with an empty remediation")
+	}
+	if r.status != "ok" {
+		t.Errorf("status = %q, want ok", r.status)
+	}
+	for _, want := range []string{"FISHHAWKD_REVIEW_GROUNDING=true", "codex", "confinement", "claude", "blocklist"} {
+		if !strings.Contains(r.remediate, want) {
+			t.Errorf("remediate = %q, want it to name %q", r.remediate, want)
+		}
+	}
+}
+
+// TestDoctorOnboarding_ReviewGroundingOn_NamesBothBounds pins the enabled
+// branch: status ok, with the detail naming EACH adapter's bound in its own
+// terms. Collapsing the asymmetry into one word would fail here.
+func TestDoctorOnboarding_ReviewGroundingOn_NamesBothBounds(t *testing.T) {
+	r, ok := reviewGroundingRungFrom(t, reviewGroundingBody(`{"enabled": true,
+	  "adapters": [{"adapter": "codex", "bound": "confined"}, {"adapter": "claude", "bound": "blocklist"}],
+	  "remediation": "claude's bound is a tool-layer blocklist, not confinement"}`))
+	if !ok {
+		t.Fatalf("no review grounding rung for enabled:true")
+	}
+	if r.status != "ok" {
+		t.Errorf("status = %q, want ok", r.status)
+	}
+	for _, want := range []string{"codex: confined", "claude: blocklist"} {
+		if !strings.Contains(r.detail, want) {
+			t.Errorf("detail = %q, want it to name %q", r.detail, want)
+		}
+	}
+	if !strings.Contains(r.remediate, "not confinement") {
+		t.Errorf("remediate = %q, want the asymmetry caveat", r.remediate)
+	}
+}
+
+// TestDoctorOnboarding_ReviewGroundingOn_EmptyAdaptersFallback pins the
+// DEFENSIVE branch of the on rung: a backend serving enabled:true with NO
+// adapter rows (an older build, or the list dropped on the wire) renders the
+// bare "on" detail rather than an empty parenthesis, and still carries the
+// asymmetry caveat in the hint.
+func TestDoctorOnboarding_ReviewGroundingOn_EmptyAdaptersFallback(t *testing.T) {
+	r, ok := reviewGroundingRungFrom(t, reviewGroundingBody(`{"enabled": true}`))
+	if !ok {
+		t.Fatalf("no review grounding rung for enabled:true with no adapters")
+	}
+	if r.status != "ok" || r.detail != "on" {
+		t.Errorf("rung = %+v, want status ok with detail %q", r, "on")
+	}
+	if !strings.Contains(r.remediate, "not equivalent") {
+		t.Errorf("remediate = %q, want the asymmetry caveat", r.remediate)
+	}
+}
+
+// TestDoctorOnboarding_ReviewGroundingBoundSummary_UnknownBound pins the last
+// defensive branch: an adapter row whose bound the backend left EMPTY renders
+// "unknown bound" rather than a dangling "codex: ", so a malformed row is
+// visible instead of silently reading as a bound with no name.
+func TestDoctorOnboarding_ReviewGroundingBoundSummary_UnknownBound(t *testing.T) {
+	got := reviewGroundingBoundSummary([]reviewGroundingAdapterBound{{Adapter: "codex"}})
+	if got != "codex: unknown bound" {
+		t.Errorf("reviewGroundingBoundSummary = %q, want %q", got, "codex: unknown bound")
+	}
+	if reviewGroundingBoundSummary(nil) != "" {
+		t.Errorf("an empty adapter list must summarise to the empty string")
+	}
+}
+
+// TestDoctorOnboarding_ReviewGroundingOff_DoesNotMoveTheAggregate is the
+// NO-NAG invariant, and it is the shipped-behavior done-means assertion for
+// the operator's "keep the default OFF" condition: the doctor's aggregate
+// verdict — the fail/warn counts doctor.go derives its summary line and exit
+// code from — is IDENTICAL whether the rung is absent or present-and-off. A
+// no-op touch that rendered the rung as warn would pass the
+// scope-completeness gate and fail HERE.
+func TestDoctorOnboarding_ReviewGroundingOff_DoesNotMoveTheAggregate(t *testing.T) {
+	tally := func(rungs []checkResult) (fails, warns int) {
+		for _, r := range rungs {
+			switch r.status {
+			case "fail":
+				fails++
+			case "warn":
+				warns++
+			}
+		}
+		return fails, warns
+	}
+	absentF, absentW := tally(readinessRungs(t, "owner/name", reviewGroundingBody("")))
+	offRungs := readinessRungs(t, "owner/name", reviewGroundingBody(`{"enabled": false,
+	  "adapters": [{"adapter": "codex", "bound": "confined"}, {"adapter": "claude", "bound": "blocklist"}],
+	  "note": "reviews are DIFF-ONLY", "remediation": "set FISHHAWKD_REVIEW_GROUNDING=true"}`))
+	offF, offW := tally(offRungs)
+	if offF != absentF || offW != absentW {
+		t.Errorf("present-and-off moved the aggregate: fails %d->%d, warns %d->%d; the default posture must not nag",
+			absentF, offF, absentW, offW)
+	}
+	// Anti-vacuity: the two tallies agreeing must not be because the rung was
+	// never rendered in the "off" case.
+	var found bool
+	for _, r := range offRungs {
+		if r.label == "review grounding" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("the off body must actually render a review grounding rung; otherwise the tallies agree vacuously")
+	}
+}

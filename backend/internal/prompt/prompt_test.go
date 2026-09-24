@@ -5811,7 +5811,14 @@ func TestBuild_PlanReview_TrimmedBelowBaseline(t *testing.T) {
 	// item 13): like the blocks above, both are in the current (trimmed) prompt
 	// AND would be in the untrimmed version, so the baseline moves with them
 	// (6108 + 1333).
-	const preTrimBaselineLen = 7441
+	//
+	// #3625 raised it by the 214 bytes the REPOSITORY ACCESS block's
+	// grounding-switch sentence adds (this fixture is UNGROUNDED, the shipping
+	// default, so it renders the diff-only paragraph that now names
+	// FISHHAWKD_REVIEW_GROUNDING): like the #2486 block it extends, the
+	// sentence is in the current (trimmed) prompt AND would be in the
+	// untrimmed version, so the baseline moves with it (7441 + 214).
+	const preTrimBaselineLen = 7655
 	got := buildPlanReview(Trigger{
 		Repo:         "kuhlman-labs/example",
 		IssueNumber:  42,
@@ -14518,6 +14525,93 @@ func TestImplementReview_CalibrationCriteria_UngroundedVariant(t *testing.T) {
 	}
 }
 
+// --- review-grounding switch discoverability (E45.90 / #3625) ---
+
+// reviewGroundingFlag is the literal the ungrounded renders must name, and the
+// grounded renders must NOT. A single const so the positive and negative pins
+// cannot drift apart.
+const reviewGroundingFlag = "FISHHAWKD_REVIEW_GROUNDING"
+
+// reviewGroundingPlanReview builds a plan-review prompt at the given grounding
+// posture (empty treeCommit = the shipping UNGROUNDED default).
+func reviewGroundingPlanReview(t *testing.T, treeCommit string) string {
+	t.Helper()
+	got, err := Build("plan_review", Trigger{
+		Repo:             "kuhlman-labs/example",
+		IssueNumber:      3625,
+		IssueTitle:       "surface the grounding switch",
+		IssueBody:        "the reviewers are diff-only by default",
+		ApprovedPlan:     fixturePlan(),
+		ReviewTreeCommit: treeCommit,
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	return got
+}
+
+// TestReviewGroundingFlag_NamedInUngroundedRenders is the positive half: BOTH
+// reviewed renders on the DEFAULT (ungrounded) path name the deployment
+// switch — the plan review through writeReviewRepoAccess, the implement review
+// through that block AND the standing-rule-10 branch that mints UNTRACED. A
+// comment-only touch of prompt.go fails here.
+func TestReviewGroundingFlag_NamedInUngroundedRenders(t *testing.T) {
+	for name, got := range map[string]string{
+		"plan_review":      reviewGroundingPlanReview(t, ""),
+		"implement_review": groundedImplementReview(t, ""),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if !strings.Contains(got, reviewGroundingFlag) {
+				t.Errorf("ungrounded %s render must name %q\n---\n%s", name, reviewGroundingFlag, got)
+			}
+			// The REPOSITORY ACCESS sentence: the posture is a deployment
+			// setting, not a product limit.
+			if !strings.Contains(got, "This is a DEPLOYMENT setting, not a product limit") {
+				t.Errorf("ungrounded %s render must frame the diff-only posture as a deployment setting\n---\n%s", name, got)
+			}
+		})
+	}
+}
+
+// TestReviewGroundingFlag_UntracedNoteNamesTheFlag pins the SECOND site
+// specifically (the issue's suggested fix 2): the UNGROUNDED standing-rule-10
+// branch — the one that mints UNTRACED — instructs the reviewer to name the
+// flag in the concern note alongside the operator-runs-the-checker resolution.
+// Asserting the clause SEPARATELY from the repo-access sentence is what stops
+// the repo-access edit alone from greening this.
+func TestReviewGroundingFlag_UntracedNoteNamesTheFlag(t *testing.T) {
+	got := groundedImplementReview(t, "")
+	const clause = "In that note, name BOTH resolutions open to the operator: they can run the check themselves, or they can set " + reviewGroundingFlag + "=true to ground future reviews against the tree so the prediction is traceable."
+	if !strings.Contains(got, clause) {
+		t.Errorf("ungrounded standing-rule-10 branch must carry the flag clause verbatim\n---\n%s", got)
+	}
+	// It must sit INSIDE criterion 10, after the UNTRACED sentence it
+	// qualifies — not stranded in the repo-access block above.
+	iTrace, iClause := strings.Index(got, ungroundedTraceText), strings.Index(got, clause)
+	if iTrace < 0 || iClause < iTrace {
+		t.Errorf("the flag clause must follow the UNTRACED sentence (untraced=%d clause=%d)", iTrace, iClause)
+	}
+}
+
+// TestReviewGroundingFlag_AbsentFromGroundedRenders is the negative half: a
+// GROUNDED render must NOT name the flag. Grounding is already on there, so
+// naming the switch would be noise at best and a wrong instruction at worst —
+// and pairing presence with the other posture's ABSENCE is what stops a
+// collapsed branch (rendering the sentence unconditionally) from passing.
+func TestReviewGroundingFlag_AbsentFromGroundedRenders(t *testing.T) {
+	const treeCommit = "0123456789abcdef0123456789abcdef01234567"
+	for name, got := range map[string]string{
+		"plan_review":      reviewGroundingPlanReview(t, treeCommit),
+		"implement_review": groundedImplementReview(t, treeCommit),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if strings.Contains(got, reviewGroundingFlag) {
+				t.Errorf("grounded %s render must NOT name %q\n---\n%s", name, reviewGroundingFlag, got)
+			}
+		})
+	}
+}
+
 // TestImplementReview_CalibrationCriteria_AdversarialCarveOut: the carve-out
 // bounding criteria 9/10 to pattern-based and mechanical-prediction findings
 // renders in BOTH grounding postures. This is the guard #2119's "Explicitly NOT
@@ -14953,6 +15047,16 @@ func TestWriteGateEvidence_SliceVerifySuppressesNotAttachedBlock(t *testing.T) {
 //     tier lines (`high`/`medium`/`low`), a blank line, and the
 //     standing-rule-9-baseline-is-a-low line.
 //
+// THIRD DELIBERATE EDIT (E45.90 / #3625). The ungrounded review posture now
+// names FISHHAWKD_REVIEW_GROUNDING as the deployment switch, so two lines of
+// this golden were HAND-EDITED in place — again NOT regenerated from
+// post-change code. Exactly these lines changed, and nothing else:
+//   - EXTENDED (1 line, in place): the REPOSITORY ACCESS diff-only paragraph
+//     gains the sentence naming the flag as a DEPLOYMENT setting.
+//   - EXTENDED (1 line, in place): the UNGROUNDED criterion-10 line gains the
+//     clause instructing the reviewer to name the flag in the concern note
+//     alongside the operator-runs-the-checker resolution.
+//
 // It remains FROZEN against post-change regeneration.
 const nilSliceVerifyPromptGolden = "You are an implement-review agent for the repository `kuhlman-labs/example`.\n" +
 	"\n" +
@@ -14971,7 +15075,7 @@ const nilSliceVerifyPromptGolden = "You are an implement-review agent for the re
 	"REPOSITORY ACCESS\n" +
 	"=================\n" +
 	"\n" +
-	"No repository tree is available for this review: it is DIFF-ONLY. Scope your confidence to the diff and the context provided below, and say so rather than requesting evidence you cannot reach.\n" +
+	"No repository tree is available for this review: it is DIFF-ONLY. Scope your confidence to the diff and the context provided below, and say so rather than requesting evidence you cannot reach. This is a DEPLOYMENT setting, not a product limit: the operator can ground a review against an exported read-only tree at the reviewed commit by setting FISHHAWKD_REVIEW_GROUNDING=true, which ships off by default.\n" +
 	"\n" +
 	"### Verdict schema\n" +
 	"\n" +
@@ -15015,7 +15119,7 @@ const nilSliceVerifyPromptGolden = "You are an implement-review agent for the re
 	"8. **Evidence you cannot see is an evidence-PLACEMENT observation, never a change defect (standing rule)**: Verification evidence the agent reported in the PULL-REQUEST BODY — counterfactual RED transcripts, grep results, delete-observe-restore outputs — is NOT part of the material available to this review. Your material is scope-bounded and diff-only; you do not receive the PR body. Where the agent supplied STRUCTURED counterfactual evidence it appears in the gate-evidence 'Counterfactual self-report' block above, and that IS in your material — read it there. But where an operator condition asks you to confirm something whose evidence lives on a surface you cannot read, record it as an evidence-PLACEMENT observation naming the condition and the surface, addressed to the operator. Do NOT count it against the change, do NOT treat it as a confirmed gap, and do NOT reject on it.\n" +
 	"\n" +
 	"9. **Baseline check before severity (standing rule)**: Before assigning a severity to a PATTERN-based finding — an unbounded read or decode, a missing cap or limit, an absent guard or check — first establish whether sibling or surrounding code already exhibits the same pattern. If it does, say so explicitly and calibrate the severity DOWN: report it as pre-existing convention this diff MATCHES, not as a regression this diff INTRODUCED. No repository tree is available for this review, so state plainly in the concern note that the baseline is UNESTABLISHED and calibrate the severity DOWN accordingly — do NOT assert that this diff INTRODUCED a pattern whose surroundings you could not check.\n" +
-	"10. **Trace mechanical predictions (standing rule)**: Any claim about what a specific code path, test, or handler WILL DO — a status code returned, an error surfaced, a branch taken — must be traced to the actual definitions that govern it: the fake, the override, the wiring, the fixture. NEVER infer that behavior from a type or function name; a test fake routinely overrides the base behavior its name implies. No repository tree is available for this review, so where the governing definition is not itself in the diff, say the prediction is UNTRACED and calibrate the severity DOWN — do NOT assert what a fake or a fixture does when you cannot read it.\n" +
+	"10. **Trace mechanical predictions (standing rule)**: Any claim about what a specific code path, test, or handler WILL DO — a status code returned, an error surfaced, a branch taken — must be traced to the actual definitions that govern it: the fake, the override, the wiring, the fixture. NEVER infer that behavior from a type or function name; a test fake routinely overrides the base behavior its name implies. No repository tree is available for this review, so where the governing definition is not itself in the diff, say the prediction is UNTRACED and calibrate the severity DOWN — do NOT assert what a fake or a fixture does when you cannot read it. In that note, name BOTH resolutions open to the operator: they can run the check themselves, or they can set FISHHAWKD_REVIEW_GROUNDING=true to ground future reviews against the tree so the prediction is traceable.\n" +
 	"These two standing rules apply to PATTERN-based and MECHANICAL-PREDICTION findings ONLY. They are NOT a requirement to cite a line for every claim. Adversarial reasoning about implications — a threat model, a privilege-escalation path, a fail-open, a cross-tenant leak — is a claim about what COULD happen and is not citable to a line: do NOT withhold such a finding for want of a citation, and do NOT downgrade its severity on that ground.\n" +
 	"\n" +
 	"### Verdict decision rule\n" +
@@ -15723,6 +15827,46 @@ func noPriorConcernsGoldenTrigger() Trigger {
 	}
 }
 
+// reviewGroundingGoldenDeltas are the EXACT two in-place extensions E45.90 /
+// #3625 makes to the UNGROUNDED review render, as {before, after} pairs. The
+// no-prior-concerns golden below is genuine PRE-CHANGE evidence captured at
+// base commit 29df5ba2 and must stay byte-identical on disk — refreshing it
+// from the current tree would convert the pin into a tautology. So instead of
+// re-capturing it, the test REPLAYS these two deltas onto the pre-change bytes
+// and compares byte for byte against the result: every OTHER divergence,
+// including hoisting the reopen-substantiation bullet out of its
+// len(PriorConcerns) > 0 guard, still turns the test RED.
+//
+// This mirrors the enumerate-the-deltas convention nilSliceVerifyPromptGolden
+// uses for its hand-edited const. Each pair MUST match exactly once, and
+// applyReviewGroundingGoldenDeltas fails the test if it does not — so a future
+// prompt edit that deletes or reworks either sentence surfaces here as a loud
+// mismatch rather than as a silently inert no-op replacement.
+var reviewGroundingGoldenDeltas = [][2]string{
+	{
+		"requesting evidence you cannot reach.\n",
+		"requesting evidence you cannot reach. This is a DEPLOYMENT setting, not a product limit: the operator can ground a review against an exported read-only tree at the reviewed commit by setting FISHHAWKD_REVIEW_GROUNDING=true, which ships off by default.\n",
+	},
+	{
+		"what a fake or a fixture does when you cannot read it.\n",
+		"what a fake or a fixture does when you cannot read it. In that note, name BOTH resolutions open to the operator: they can run the check themselves, or they can set FISHHAWKD_REVIEW_GROUNDING=true to ground future reviews against the tree so the prediction is traceable.\n",
+	},
+}
+
+// applyReviewGroundingGoldenDeltas replays the #3625 deltas onto pre-change
+// golden bytes, failing the test if any pair does not match EXACTLY once.
+func applyReviewGroundingGoldenDeltas(t *testing.T, pre string) string {
+	t.Helper()
+	for i, d := range reviewGroundingGoldenDeltas {
+		if n := strings.Count(pre, d[0]); n != 1 {
+			t.Fatalf("reviewGroundingGoldenDeltas[%d] matched %d times in the pre-change golden, want exactly 1 — "+
+				"the #3625 delta no longer describes this render; re-derive it rather than relaxing the count", i, n)
+		}
+		pre = strings.Replace(pre, d[0], d[1], 1)
+	}
+	return pre
+}
+
 // TestImplementReview_PriorConcerns_ReopenSubstantiation_EmptyByteIdentical is
 // the absence half, and it establishes BYTE identity rather than merely the
 // absence of selected fragments: the no-prior-concerns prompt must equal the
@@ -15740,7 +15884,10 @@ func noPriorConcernsGoldenTrigger() Trigger {
 // render that Build in the worktree's prompt package, and diff the bytes.
 // If this test ever fails, that is a FINDING about the no-prior-concerns
 // prompt — do NOT refresh the fixture from the current tree, which would
-// silently convert the pin into a tautology.
+// silently convert the pin into a tautology. E45.90 / #3625 deliberately
+// changes the UNGROUNDED render, so rather than re-capturing, the test replays
+// the two enumerated reviewGroundingGoldenDeltas onto the pre-change bytes and
+// compares against THAT; the file on disk is still the 29df5ba2 capture.
 //
 // Anti-vacuity guard: the golden must carry NONE of the reopen-substantiation
 // fragments (a golden mistakenly re-captured from a tree where the bullet had
@@ -15760,11 +15907,16 @@ func TestImplementReview_PriorConcerns_ReopenSubstantiation_EmptyByteIdentical(t
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
-	if got != string(want) {
-		t.Errorf("the no-prior-concerns implement-review prompt diverged from the pre-change golden %s.\n"+
+	// The golden file stays PRE-CHANGE on disk; the two enumerated #3625
+	// deltas are replayed onto it here. Any divergence beyond them is a
+	// finding about the empty-PriorConcerns rendering.
+	expect := applyReviewGroundingGoldenDeltas(t, string(want))
+	if got != expect {
+		t.Errorf("the no-prior-concerns implement-review prompt diverged from the pre-change golden %s "+
+			"(with the enumerated #3625 deltas replayed).\n"+
 			"This change must not alter the empty-PriorConcerns rendering; investigate rather than re-capturing "+
 			"the golden from the current tree.\n--- got ---\n%q\n--- want ---\n%q",
-			implementReviewNoPriorConcernsGolden, got, string(want))
+			implementReviewNoPriorConcernsGolden, got, expect)
 	}
 	for _, w := range reopenSubstantiationFragments {
 		if strings.Contains(string(want), w) {

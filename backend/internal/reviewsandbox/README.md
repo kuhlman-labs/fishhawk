@@ -217,6 +217,21 @@ cannot be undone silently.
 The environment scrub is INDEPENDENT of this flag and is ALWAYS applied — it has
 no plausible reason to roll back, and it stands on its own merits.
 
+**The posture is now OPERATOR-VISIBLE (E45.90 / [#3625](https://github.com/kuhlman-labs/fishhawk/issues/3625)).**
+`GET /v0/onboarding/readiness` carries a deployment-scoped `review_grounding`
+rung, rendered by `fishhawk doctor` and by the `fishhawk_doctor` MCP tool, that
+reports whether grounding is on AND restates the per-adapter read bounds in the
+table below — `confined` on codex, `blocklist` on claude — verbatim, never
+collapsed into one word. The rung is a READOUT, not a policy change: the default
+stays FALSE, and the CLI renders `off` at status `ok` with a hint rather than a
+warning, so a correctly configured deployment is not nagged and the doctor's exit
+code does not move. Its adapter table is a STATIC restatement of what
+`confine.go` ships, not a live probe — if the posture below changes, the table
+drifts silently unless updated, which is why the backend resolver test pins the
+exact two-row vocabulary and the honest-label invariant (the claude row is never
+labelled confinement). Contract: `backend/internal/server/README.md`
+§ "Review-grounding rung".
+
 ## Reviewer read bounds (#2522) — TWO mechanisms, NOT the same strength
 
 `Env` scrubs the child ENVIRONMENT and `ExportTree` bounds what the reviewer is

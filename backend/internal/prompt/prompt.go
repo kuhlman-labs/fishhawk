@@ -4902,14 +4902,19 @@ func writeReviewToolClause(b *strings.Builder, t Trigger) {
 // when any entry was skipped in the export it discloses the tree is not
 // exhaustive and names the count and kind (C3). Ungrounded: state plainly that
 // no repository tree is available and the review is DIFF-ONLY (the honest
-// degrade path, the issue's option 3).
+// degrade path, the issue's option 3) — and, since E45.90 / #3625, name
+// FISHHAWKD_REVIEW_GROUNDING as the DEPLOYMENT switch, so the posture reads as
+// configurable rather than as a product limit. The flag is named on the
+// UNGROUNDED branch only; a grounded render must never carry it.
 func writeReviewRepoAccess(b *strings.Builder, t Trigger) {
 	b.WriteString("REPOSITORY ACCESS\n")
 	b.WriteString("=================\n\n")
 	if t.ReviewTreeCommit == "" {
 		b.WriteString("No repository tree is available for this review: it is DIFF-ONLY. " +
 			"Scope your confidence to the diff and the context provided below, and say so rather than " +
-			"requesting evidence you cannot reach.\n\n")
+			"requesting evidence you cannot reach. This is a DEPLOYMENT setting, not a product limit: " +
+			"the operator can ground a review against an exported read-only tree at the reviewed commit by " +
+			"setting FISHHAWKD_REVIEW_GROUNDING=true, which ships off by default.\n\n")
 		return
 	}
 	b.WriteString("Your working directory holds the repository's TRACKED files exported at commit ")
@@ -4949,6 +4954,13 @@ func writeReviewRepoAccess(b *strings.Builder, t Trigger) {
 // unsatisfiable on the diff-only path, which is the failure mode ADR-078
 // records against the pre-#2486 prompt.
 //
+// Since E45.90 / #3625 the UNGROUNDED criterion-10 branch — the one that mints
+// UNTRACED — also instructs the reviewer to name FISHHAWKD_REVIEW_GROUNDING in
+// the concern note alongside the operator-runs-the-checker resolution, so the
+// note the operator reads carries the switch that would have made the
+// prediction traceable. This is satisfied at the PROMPT layer: the render is
+// pinned by a golden, but nothing here proves a reviewer complies.
+//
 // The closing carve-out sentence renders in BOTH postures and is what keeps
 // these rules from suppressing adversarial reasoning — a threat model, a
 // privilege-escalation path, a fail-open, a cross-tenant leak — which is a
@@ -4981,7 +4993,9 @@ func writeGroundedCalibrationCriteria(b *strings.Builder, t Trigger) {
 	} else {
 		b.WriteString("No repository tree is available for this review, so where the governing definition is not " +
 			"itself in the diff, say the prediction is UNTRACED and calibrate the severity DOWN — do NOT assert " +
-			"what a fake or a fixture does when you cannot read it.\n")
+			"what a fake or a fixture does when you cannot read it. In that note, name BOTH resolutions open to " +
+			"the operator: they can run the check themselves, or they can set FISHHAWKD_REVIEW_GROUNDING=true to " +
+			"ground future reviews against the tree so the prediction is traceable.\n")
 	}
 	b.WriteString("These two standing rules apply to PATTERN-based and MECHANICAL-PREDICTION findings ONLY. They " +
 		"are NOT a requirement to cite a line for every claim. Adversarial reasoning about implications — a threat " +

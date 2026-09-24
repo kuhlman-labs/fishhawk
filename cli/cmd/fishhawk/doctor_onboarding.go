@@ -59,6 +59,36 @@ type onboardingReadiness struct {
 	// value would read as configured:false with an out-of-enum kind "", a
 	// verdict the payload never made.
 	TraceStore *traceStoreReadiness `json:"trace_store"`
+	// ReviewGrounding is the DEPLOYMENT-scoped review-grounding rung (E45.90
+	// / #3625). A POINTER for the same reason as TraceStore: a pre-#3625
+	// fishhawkd serves no `review_grounding` key, and the doctor must then
+	// emit NO rung — a zero value would read as enabled:false, a verdict
+	// about the deployment's posture the payload never made.
+	ReviewGrounding *reviewGroundingReadiness `json:"review_grounding"`
+}
+
+// reviewGroundingReadiness mirrors the backend reviewGroundingReadiness
+// sub-object (backend/internal/server/onboarding.go, #3625): whether this
+// deployment grounds its review agents against an exported read-only tree, or
+// leaves them DIFF-ONLY. Enabled false is the SUPPORTED DEFAULT (grounding
+// ships dormant behind FISHHAWKD_REVIEW_GROUNDING), so the rung renders it as
+// ok-with-a-hint and never degrades the doctor's aggregate outcome.
+type reviewGroundingReadiness struct {
+	Enabled     bool                          `json:"enabled"`
+	Adapters    []reviewGroundingAdapterBound `json:"adapters"`
+	Note        string                        `json:"note"`
+	Remediation string                        `json:"remediation"`
+}
+
+// reviewGroundingAdapterBound mirrors one backend adapter row. Bound is a
+// closed two-value vocabulary whose members are NOT the same strength:
+// "confined" (codex — OS-level deny-by-default allowlist) and "blocklist"
+// (claude — a tool-layer deny-rule list, defence-in-depth). The rung renders
+// both verbatim rather than collapsing them into one word.
+type reviewGroundingAdapterBound struct {
+	Adapter string `json:"adapter"`
+	Bound   string `json:"bound"`
+	Note    string `json:"note"`
 }
 
 // traceStoreReadiness mirrors the backend traceStoreReadiness sub-object
@@ -320,6 +350,15 @@ func checkOnboardingReadiness(backendURL, token, repo string) ([]checkResult, re
 		out = append(out, rung)
 	}
 
+	// (g) Review grounding — are the review agents grounded against an
+	// exported tree, or DIFF-ONLY (#3625)? Deployment-scoped; absent against
+	// an older fishhawkd, which draws NO rung. It NEVER reports worse than
+	// ok: off is the supported default, so this rung cannot move the
+	// aggregate outcome or the doctor's exit code.
+	if rung, ok := reviewGroundingRung(body.ReviewGrounding); ok {
+		out = append(out, rung)
+	}
+
 	return out, outcome
 }
 
@@ -439,6 +478,69 @@ func traceStoreRung(ts *traceStoreReadiness) (checkResult, bool) {
 		}
 		return checkResult{label: label, detail: detail, status: "ok"}, true
 	}
+}
+
+// reviewGroundingRung renders the review-grounding readiness rung, or reports
+// ok=false when there is no rung to render (#3625).
+//
+//   - nil      — the backend served no `review_grounding` key (a pre-#3625
+//     fishhawkd). NO rung: absence means the backend cannot
+//     answer, which is not the same claim as enabled:false.
+//   - disabled — ok, detail "off (reviews are diff-only)", with a hint naming
+//     FISHHAWKD_REVIEW_GROUNDING and the per-adapter asymmetry.
+//     Status ok, NOT warn: off is the supported, recommended
+//     default (grounding ships dormant, #2522), so a correctly
+//     configured deployment is not nagged and the doctor's
+//     aggregate outcome and exit code are unchanged.
+//   - enabled  — ok, detail naming each adapter's bound, with the asymmetry
+//     carried in the hint.
+//
+// `remediate` renders on ok rungs too (doctor.go prints `hint:` whenever it is
+// non-empty), which is what lets an ok rung still surface the flag.
+func reviewGroundingRung(rg *reviewGroundingReadiness) (checkResult, bool) {
+	if rg == nil {
+		return checkResult{}, false
+	}
+	const label = "review grounding"
+	if !rg.Enabled {
+		remediate := rg.Remediation
+		if remediate == "" {
+			remediate = "set FISHHAWKD_REVIEW_GROUNDING=true to ground reviews against an exported read-only tree; it is an opt-in posture for a single-tenant host you control, and the per-adapter read bounds are not equivalent (codex: OS-enforced confinement; claude: a tool-layer blocklist, defence-in-depth only)"
+		}
+		return checkResult{
+			label: label, detail: "off (reviews are diff-only)", status: "ok",
+			remediate: remediate,
+		}, true
+	}
+	detail := "on"
+	if bounds := reviewGroundingBoundSummary(rg.Adapters); bounds != "" {
+		detail = "on (" + bounds + ")"
+	}
+	remediate := rg.Remediation
+	if remediate == "" {
+		remediate = "the per-adapter read bounds are not equivalent: codex gets OS-enforced confinement, claude gets a tool-layer blocklist that is defence-in-depth only"
+	}
+	return checkResult{label: label, detail: detail, status: "ok", remediate: remediate}, true
+}
+
+// reviewGroundingBoundSummary renders each adapter's bound IN ITS OWN TERMS —
+// "codex: confined; claude: blocklist" — never one collapsed word for both.
+// The asymmetry is the load-bearing fact (#2522) and flattening it into a
+// single "bounded" would be exactly the over-claim the honest-label invariant
+// forbids.
+func reviewGroundingBoundSummary(adapters []reviewGroundingAdapterBound) string {
+	if len(adapters) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(adapters))
+	for _, a := range adapters {
+		bound := a.Bound
+		if bound == "" {
+			bound = "unknown bound"
+		}
+		parts = append(parts, a.Adapter+": "+bound)
+	}
+	return strings.Join(parts, "; ")
 }
 
 // mergeGateSourceSummary renders each requiring source's bypass posture IN ITS

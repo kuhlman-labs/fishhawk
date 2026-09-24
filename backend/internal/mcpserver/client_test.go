@@ -2907,6 +2907,66 @@ func TestOnboardingReadinessReport_TraceStoreAbsentOrNullKeepsNil(t *testing.T) 
 	}
 }
 
+// TestOnboardingReadinessReport_ReviewGroundingMirrorsBackendTags pins the
+// #3625 review_grounding mirror: EVERY field — including every field of the
+// nested adapter row — carries a DISTINCT non-empty value, so a json-tag typo
+// on any one decodes to its zero value and fails here rather than passing on a
+// zero-valued fixture.
+func TestOnboardingReadinessReport_ReviewGroundingMirrorsBackendTags(t *testing.T) {
+	const body = `{"repo": "acme/widgets", "forge": "github",
+	  "app": {"installed": false}, "spec": {"source": "unavailable"},
+	  "reviewers": [], "scopes": {"adequate": true, "required": [], "missing": []},
+	  "review_grounding": {"enabled": true,
+	    "adapters": [{"adapter": "adapter-sentinel", "bound": "bound-sentinel", "note": "adapter-note-sentinel"}],
+	    "note": "grounding-note-sentinel", "remediation": "grounding-remediation-sentinel"}}`
+	var got OnboardingReadinessReport
+	if err := json.Unmarshal([]byte(body), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	rg := got.ReviewGrounding
+	if rg == nil {
+		t.Fatalf("ReviewGrounding = nil, want the decoded object")
+	}
+	if !rg.Enabled {
+		t.Errorf("Enabled = false, want true")
+	}
+	if len(rg.Adapters) != 1 {
+		t.Fatalf("Adapters = %+v, want exactly one decoded row", rg.Adapters)
+	}
+	for _, f := range []struct{ name, got, want string }{
+		{"Note", rg.Note, "grounding-note-sentinel"},
+		{"Remediation", rg.Remediation, "grounding-remediation-sentinel"},
+		{"Adapters[0].Adapter", rg.Adapters[0].Adapter, "adapter-sentinel"},
+		{"Adapters[0].Bound", rg.Adapters[0].Bound, "bound-sentinel"},
+		{"Adapters[0].Note", rg.Adapters[0].Note, "adapter-note-sentinel"},
+	} {
+		if f.got != f.want {
+			t.Errorf("%s = %q, want %q", f.name, f.got, f.want)
+		}
+	}
+}
+
+// TestOnboardingReadinessReport_ReviewGroundingAbsentOrNullKeepsNil pins the
+// pointer: an absent key (a pre-#3625 fishhawkd) and an explicit JSON null
+// both decode to nil — never a zero-valued rung whose enabled is false, a
+// verdict about the deployment's posture no read established.
+func TestOnboardingReadinessReport_ReviewGroundingAbsentOrNullKeepsNil(t *testing.T) {
+	for name, body := range map[string]string{
+		"absent": `{"repo": "a/b", "app": {"installed": true}, "spec": {"source": "fetched"}, "reviewers": [], "scopes": {"adequate": true, "required": [], "missing": []}}`,
+		"null":   `{"repo": "a/b", "app": {"installed": true}, "spec": {"source": "fetched"}, "reviewers": [], "scopes": {"adequate": true, "required": [], "missing": []}, "review_grounding": null}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			var got OnboardingReadinessReport
+			if err := json.Unmarshal([]byte(body), &got); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if got.ReviewGrounding != nil {
+				t.Errorf("ReviewGrounding = %+v, want nil", *got.ReviewGrounding)
+			}
+		})
+	}
+}
+
 // TestMergeRun_AlreadyMergedWireShape pins the E45.87 / #3622 additive decode:
 // the four new merge 200 fields round-trip, and a LEGACY body omitting them all
 // decodes to false / false / "" / "" (the additive-compatibility control, so an
