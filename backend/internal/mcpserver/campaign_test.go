@@ -3171,3 +3171,51 @@ func TestPreviewCampaign_UnregisteredProvider_NamesRegisteredSet(t *testing.T) {
 		}
 	}
 }
+
+// TestStartCampaign_AdmissionScreen_SurvivesDecode is the MCP-boundary half of
+// the #3649 seam: a server create response carrying an admission_screen block
+// (literal wire JSON in the backend's shape, NOT a round-trip of the client's
+// own struct) decodes through the REAL client into StartCampaignOutput with
+// the typed findings intact; a response omitting it decodes to nil.
+func TestStartCampaign_AdmissionScreen_SurvivesDecode(t *testing.T) {
+	serve := func(body string) *httptest.Server {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost || r.URL.Path != "/v0/campaigns" {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, body)
+		}))
+		t.Cleanup(srv.Close)
+		return srv
+	}
+	const base = `"id":"` + "00000000-0000-0000-0000-000000000001" + `","repo":"x/y","epic_ref":"#25","state":"pending","pause_policy":"pause_campaign","created_at":"2026-09-24T00:00:00Z","updated_at":"2026-09-24T00:00:00Z"`
+
+	r := newResolver(serve(`{`+base+`,"admission_screen":{"advisory":true,"forbidden_paths_screened":true,"findings":[`+
+		`{"issue":100,"kind":"not_runnable_declared"},`+
+		`{"issue":101,"kind":"forbidden_path","path":".gitlab-ci.yml","location":"body","forbidden_pattern":".gitlab-ci.yml"}]}}`), nil)
+	_, out, err := r.startCampaign(context.Background(), nil, StartCampaignInput{Repo: "x/y", EpicRef: "#25"})
+	if err != nil {
+		t.Fatalf("startCampaign: %v", err)
+	}
+	sc := out.Campaign.AdmissionScreen
+	want := []campaignAdmissionFinding{
+		{Issue: 100, Kind: "not_runnable_declared"},
+		{Issue: 101, Kind: "forbidden_path", Path: ".gitlab-ci.yml", Location: "body", ForbiddenPattern: ".gitlab-ci.yml"},
+	}
+	if sc == nil || !sc.Advisory || !sc.ForbiddenPathsScreened || len(sc.Findings) != 2 ||
+		sc.Findings[0] != want[0] || sc.Findings[1] != want[1] {
+		t.Fatalf("decoded AdmissionScreen = %+v, want advisory+screened findings %+v", sc, want)
+	}
+
+	r2 := newResolver(serve(`{`+base+`}`), nil)
+	_, out2, err := r2.startCampaign(context.Background(), nil, StartCampaignInput{Repo: "x/y", EpicRef: "#25"})
+	if err != nil {
+		t.Fatalf("startCampaign (no screen): %v", err)
+	}
+	if out2.Campaign.AdmissionScreen != nil {
+		t.Errorf("AdmissionScreen = %+v, want nil when the response omits the block", out2.Campaign.AdmissionScreen)
+	}
+}

@@ -128,6 +128,12 @@ type campaignResponse struct {
 	// persisted (no column), so GET/list responses omit it. omitempty so a
 	// campaign that elided nothing (and every read) carries no key.
 	SatisfiedDependencies []satisfiedDependencyPayload `json:"satisfied_dependencies,omitempty"`
+	// AdmissionScreen is the ADVISORY admission screen (#3649): candidates
+	// declared `runnable:no` and candidates whose title/body names a path the
+	// repo's implement-stage forbidden_paths forbid. CREATE-response-only like
+	// SatisfiedDependencies (never persisted, so GET/list omit it), omitted
+	// when the screen found nothing. It never blocks or alters the create.
+	AdmissionScreen *campaignAdmissionScreenPayload `json:"admission_screen,omitempty"`
 }
 
 // satisfiedDependencyPayload is one elided-because-already-satisfied depends_on
@@ -553,13 +559,17 @@ func (s *Server) handleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 	//       authentication — requireWriteScope reads an Identity the auth
 	//       middleware already resolved, so the token lookup runs before
 	//       requestStart);
-	//   (c) all POST-resolution handler work — campaign row + item row
-	//       persistence, the idempotency record, and response encoding + write.
+	//   (c) all POST-resolution handler work — the advisory admission screen
+	//       (#3649), campaign row + item row persistence, the idempotency
+	//       record, and response encoding + write.
 	// The one-minute margin (issueSetClientTimeout 11m − MaxIssueSetResolution-
 	// Budget 10m) must absorb (a)+(b)+(c). It is adequate for (c) because that
-	// work is local database writes on an already-open pool plus a small JSON
-	// encode, NOT per-item forge round-trips — it does not scale with issue
-	// count, the dimension #3113 is about. THIS IS AN ARGUED MARGIN, NOT A
+	// work is local database writes on an already-open pool, a small JSON
+	// encode, and ONE workflow-spec file fetch for the admission screen — NOT
+	// per-item forge round-trips — so it does not scale with issue count, the
+	// dimension #3113 is about. That single fetch is the one non-local piece of
+	// (c); if the margin ever proves tight it is the first thing to move behind
+	// the resolution deadline. THIS IS AN ARGUED MARGIN, NOT A
 	// CONSTRUCTED GUARANTEE: no server-side deadline can bound client-side
 	// transit, and (c) is bounded by inspection rather than by a deadline.
 	//
@@ -722,6 +732,14 @@ func (s *Server) handleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Run the ADVISORY admission screen (#3649) after Assemble succeeded — so
+	// it never perturbs a refusal and costs nothing on a create that was going
+	// to fail — and before Persist. It is fail-open on every branch and never
+	// refuses, excludes or reorders: the result only rides the create response
+	// and one best-effort audit row below.
+	admissionScreen := s.screenCampaignAdmission(r.Context(), source.Scope,
+		forge.RepoRef{Owner: owner, Name: name}, result.Children)
+
 	// Thread the create request's pause_policy onto the assembly so it reaches
 	// the persisted campaign (the call-site update deferred from slice 1; a
 	// zero value is normalized to pause_campaign inside campaign.Persist).
@@ -807,6 +825,18 @@ func (s *Server) handleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 			"elided":      elided,
 		})
 	}
+	// The admission screen block (#3649): create-response-only, plus one
+	// best-effort audit copy. Nil = nothing found → no key, no audit.
+	if admissionScreen != nil {
+		resp.AdmissionScreen = admissionScreen
+		s.emitCampaignAudit(r.Context(), categoryCampaignAdmissionScreened, map[string]any{
+			"campaign_id":              created.ID.String(),
+			"repo":                     created.Repo,
+			"findings":                 admissionScreen.Findings,
+			"forbidden_paths_screened": admissionScreen.ForbiddenPathsScreened,
+			"truncated":                admissionScreen.Truncated,
+		})
+	}
 
 	s.writeJSON(w, r, http.StatusCreated, resp)
 }
@@ -839,6 +869,11 @@ type campaignSourceResolution struct {
 	Order      *campaign.GroomingOrder
 	Provenance *campaignGroomingSourcePayload
 	Guard      *campaign.GroomingCurrencyGuard
+	// Scope is the resolved GitHub App installation scope (zero for a
+	// non-github provider or an unwired client). The create handler reuses it
+	// for the advisory admission screen's spec fetch (#3649) so it costs no
+	// second installation lookup.
+	Scope forge.CredentialScope
 }
 
 // writeCampaignSourceRefusal renders a campaignSourceRefusal onto the response
@@ -1333,6 +1368,7 @@ func (s *Server) resolveCampaignSource(ctx context.Context, requestStart time.Ti
 		Order:      groomingOrder,
 		Provenance: groomingProvenance,
 		Guard:      groomingGuard,
+		Scope:      scope,
 	}, nil
 }
 

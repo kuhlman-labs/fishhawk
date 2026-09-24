@@ -8942,3 +8942,148 @@ func (f *fakeFileOnlyProvider) Name() string { return f.name }
 func (f *fakeFileOnlyProvider) File(_ context.Context, _ workmgmt.ProviderRequest) (*workmgmt.CreatedItem, error) {
 	return &workmgmt.CreatedItem{Provider: f.name}, nil
 }
+
+// --- advisory admission screen (#3649) ---
+
+// admissionScreenDAG is a two-candidate set: #100 declared runnable:no, #101
+// naming a forbidden path in its body.
+func admissionScreenDAG() *workmgmt.EpicChildrenResult {
+	return &workmgmt.EpicChildrenResult{
+		Children: []workmgmt.EpicChild{
+			{Number: 100, Title: "record a decision", NotRunnable: true},
+			{Number: 101, Title: "ci tweak", Body: "Update `.gitlab-ci.yml` to cache modules."},
+		},
+	}
+}
+
+func decodeCreatedCampaign(t *testing.T, w *httptest.ResponseRecorder) campaignResponse {
+	t.Helper()
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+	var created campaignResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode created campaign: %v", err)
+	}
+	return created
+}
+
+// TestCreateCampaign_AdmissionScreen_ReportedOnCreateResponse is the
+// cross-boundary DONE-MEANS test: the REAL POST /v0/campaigns, a work-management
+// provider returning a runnable:no child and a child naming `.gitlab-ci.yml`,
+// and a GitHub client serving a spec whose implement stage forbids it. The
+// DECODED response carries an admission_screen naming both, plus one audit row.
+func TestCreateCampaign_AdmissionScreen_ReportedOnCreateResponse(t *testing.T) {
+	registerEpicProvider(t, &fakeEpicProvider{result: admissionScreenDAG()})
+	repo := newFakeCampaignRepo()
+	aud := &campaignAuditRecorder{}
+	gh := screenGitHub(t, newFakeGitHubForRuns(screenSpecYAML))
+	s := New(Config{CampaignRepo: repo, AuditRepo: aud, GitHub: gh})
+
+	created := decodeCreatedCampaign(t, postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`))
+	sc := created.AdmissionScreen
+	if sc == nil {
+		t.Fatal("admission_screen absent from the create response")
+	}
+	want := []campaignScreenFinding{
+		{Issue: 100, Kind: campaignScreenKindNotRunnable},
+		{Issue: 101, Kind: campaignScreenKindForbiddenPath, Path: ".gitlab-ci.yml", Location: "body", ForbiddenPattern: ".gitlab-ci.yml"},
+	}
+	if !reflect.DeepEqual(sc.Findings, want) || !sc.Advisory || !sc.ForbiddenPathsScreened || sc.Truncated {
+		t.Fatalf("admission_screen = %+v, want findings %+v advisory+screened", sc, want)
+	}
+	if n := aud.count(categoryCampaignAdmissionScreened); n != 1 {
+		t.Errorf("%s audits = %d, want 1", categoryCampaignAdmissionScreened, n)
+	}
+	// Advisory: both candidates were still admitted.
+	items, err := repo.ListCampaignItemsForCampaign(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("list items: %v", err)
+	}
+	if len(items) != 2 {
+		t.Errorf("persisted items = %d, want 2 (the screen never excludes)", len(items))
+	}
+}
+
+// TestCreateCampaign_AdmissionScreen_AbsentOnCleanSet: a clean candidate set
+// yields no admission_screen key and no audit.
+func TestCreateCampaign_AdmissionScreen_AbsentOnCleanSet(t *testing.T) {
+	registerEpicProvider(t, &fakeEpicProvider{result: smallDAG()})
+	aud := &campaignAuditRecorder{}
+	gh := screenGitHub(t, newFakeGitHubForRuns(screenSpecYAML))
+	s := New(Config{CampaignRepo: newFakeCampaignRepo(), AuditRepo: aud, GitHub: gh})
+
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`)
+	decodeCreatedCampaign(t, w)
+	if strings.Contains(w.Body.String(), "admission_screen") {
+		t.Errorf("clean set carries admission_screen: %s", w.Body.String())
+	}
+	if n := aud.count(categoryCampaignAdmissionScreened); n != 0 {
+		t.Errorf("%s audits = %d, want 0", categoryCampaignAdmissionScreened, n)
+	}
+}
+
+// TestCreateCampaign_AdmissionScreen_OmittedOnGet: the block is
+// create-response-only (never persisted), mirroring satisfied_dependencies.
+func TestCreateCampaign_AdmissionScreen_OmittedOnGet(t *testing.T) {
+	registerEpicProvider(t, &fakeEpicProvider{result: admissionScreenDAG()})
+	gh := screenGitHub(t, newFakeGitHubForRuns(screenSpecYAML))
+	s := New(Config{CampaignRepo: newFakeCampaignRepo(), GitHub: gh})
+
+	created := decodeCreatedCampaign(t, postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`))
+	if created.AdmissionScreen == nil {
+		t.Fatal("precondition: create response carries no admission_screen")
+	}
+	req := httptest.NewRequest(http.MethodGet, "/v0/campaigns/"+created.ID.String(), nil)
+	req.SetPathValue("campaign_id", created.ID.String())
+	w := httptest.NewRecorder()
+	s.handleGetCampaign(w, withAuth(req))
+	if w.Code != http.StatusOK {
+		t.Fatalf("get status = %d (body=%s)", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "admission_screen") {
+		t.Errorf("GET carries admission_screen: %s", w.Body.String())
+	}
+}
+
+// TestCreateCampaign_AdmissionScreen_NoEpicSource_ScreensBody drives the
+// no-epic (#2051) items-only source end to end: the class-2 screen reads the
+// resolver's EpicChild.Body there too. (The github provider populating Body at
+// its ResolveDependencies site is pinned by the workmgmt/github package's own
+// TestResolveDependencies_PopulatesBody.)
+func TestCreateCampaign_AdmissionScreen_NoEpicSource_ScreensBody(t *testing.T) {
+	registerIssueSetProvider(t, &fakeIssueSetProvider{result: &workmgmt.EpicChildrenResult{
+		Children: []workmgmt.EpicChild{
+			{Number: 101, Title: "first", Body: "rewrite .github/workflows/ci.yml"},
+			{Number: 102, Title: "second"},
+		},
+	}})
+	gh := screenGitHub(t, newFakeGitHubForRuns(screenSpecYAML))
+	s := New(Config{CampaignRepo: newFakeCampaignRepo(), GitHub: gh})
+
+	created := decodeCreatedCampaign(t, postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","items":["issue:101","issue:102"]}`))
+	sc := created.AdmissionScreen
+	if sc == nil || len(sc.Findings) != 1 || sc.Findings[0].Issue != 101 ||
+		sc.Findings[0].Path != ".github/workflows/ci.yml" || sc.Findings[0].ForbiddenPattern != ".github/workflows/**" {
+		t.Fatalf("admission_screen = %+v, want one body-sourced .github/workflows/** finding on #101", sc)
+	}
+}
+
+// TestCreateCampaign_AdmissionScreen_OnlyAdmittedItems: an epic_ref + items
+// subset screens only the ASSEMBLED items — a runnable:no sibling the subset
+// excluded is never reported.
+func TestCreateCampaign_AdmissionScreen_OnlyAdmittedItems(t *testing.T) {
+	registerEpicProvider(t, &fakeEpicProvider{result: &workmgmt.EpicChildrenResult{
+		Children: []workmgmt.EpicChild{
+			{Number: 100, Title: "excluded", NotRunnable: true},
+			{Number: 101, Title: "admitted"},
+		},
+	}})
+	s := New(Config{CampaignRepo: newFakeCampaignRepo()})
+
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99","items":["issue:101"]}`)
+	decodeCreatedCampaign(t, w)
+	if strings.Contains(w.Body.String(), "admission_screen") {
+		t.Errorf("excluded sibling was screened: %s", w.Body.String())
+	}
+}
