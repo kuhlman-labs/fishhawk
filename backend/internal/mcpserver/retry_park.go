@@ -91,33 +91,37 @@ func retryStagePark(stage Stage, runRow *Run, runReadErr error) (bool, *Suggeste
 		stage.State)
 
 	if runReadErr != nil || runRow == nil {
-		return true, &SuggestedAction{
+		action := &SuggestedAction{
 			Action:       "fishhawk_dispatch_stage",
 			Params:       map[string]string{"run_id": stage.RunID, "stage": stage.Type},
 			Precondition: "the stage is parked pre-dispatch (awaiting_host_dispatch or pending) and no sibling stage is in flight",
 			Consumes:     "none",
 			Reason:       reason,
-		}, []string{
+		}
+		warnings := []string{
 			"could not read the run row, so the decomposition-child check was skipped: " +
 				"if this stage belongs to a decomposed CHILD run, prefer fishhawk_run_children on the parent run id over fishhawk_dispatch_stage",
 		}
+		return true, action, warnings
 	}
 
 	if runRow.DecomposedFrom != nil {
-		return true, &SuggestedAction{
+		action := &SuggestedAction{
 			Action:       "fishhawk_run_children",
 			Params:       map[string]string{"parent_run_id": *runRow.DecomposedFrom},
 			Precondition: "this stage belongs to a decomposed child run whose stage is parked pre-dispatch, which run_children admits",
 			Consumes:     "none",
 			Reason:       reason + " — this is a decomposition child, so re-spawn it through the parent's fan-out rather than dispatch_stage (which checks out main and cannot see a depends_on slice's dependency)",
-		}, nil
+		}
+		return true, action, nil
 	}
 
-	return true, &SuggestedAction{
+	action := &SuggestedAction{
 		Action:       "fishhawk_dispatch_stage",
 		Params:       map[string]string{"run_id": stage.RunID, "stage": stage.Type},
 		Precondition: "the stage is parked pre-dispatch (awaiting_host_dispatch or pending) and no sibling stage is in flight",
 		Consumes:     "none",
 		Reason:       reason,
-	}, nil
+	}
+	return true, action, nil
 }
