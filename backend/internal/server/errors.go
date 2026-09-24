@@ -130,6 +130,17 @@ var redactableDetailKeys = map[string]struct{}{
 	"budget_seconds":                 {},
 	// forge: the product-owned forge family enum (github|gitlab) derived from the run row's InstallationRef prefix, never an error/subprocess/third-party string (E45.49 / #3466).
 	"forge": {},
+	// campaign_sources_supported: the campaign sources the resolved work-item
+	// provider actually serves (#3648), a product-owned enum list ("epic_ref",
+	// "items") computed from COMPILE-TIME capability assertions in
+	// campaignSourcesSupported — never from an error, a subprocess or a
+	// third-party response — so it satisfies the membership rule above on the
+	// `registered` precedent. The two 501 capability refusals
+	// (epic_children_unsupported, issue_set_resolution_unsupported) are 5xx, so
+	// WITHOUT this entry the default-deny redactor strips exactly the list the
+	// refusal exists to carry and the operator learns nothing about which source
+	// would work.
+	"campaign_sources_supported": {},
 	// remedy: the operator-facing configuration fix a refusal names (#3628).
 	// Its value is a STATIC LITERAL written at the call site naming operator
 	// configuration (environment variable names) — never derived from an error,

@@ -555,14 +555,23 @@ above).
 `pause_item`, fixed at create time). It resolves each item's `depends_on` edges,
 wave-orders the DAG, and persists the campaign — the batch counterpart to
 `fishhawk_start_run`. Two ways to scope the batch:
-- **WITH `epic_ref`** it resolves the epic's children. Pass optional `items`
+- **WITH `epic_ref`** it resolves the epic's children. The `epic_ref` names an
+  epic ISSUE in the campaign's OWN repo (`N`, `#N`, or `issue:N`); a cross-repo
+  ref (`owner/name#N`) or an unrecognized ref fails `campaign_epic_ref_invalid`
+  (422) before any forge round-trip, and a GitLab group-epic ref (`group&5`, or a
+  `/-/epics/N` URL) fails `campaign_epic_ref_group_unsupported` (422) — group
+  epics are Premium group-level objects v0 does not model, so assemble over the
+  child issues with `items` instead (only where the provider serves items mode;
+  #3648). Pass optional `items`
   (issue refs — `N`, `#N`, or `issue:N`) to scope to a SUBSET of the epic's
   children instead of all of them (#2003): every item must parse and be a child of
   the epic (a parseable non-child fails `campaign_item_not_child`; a ref that is
   not a valid issue reference at all fails `campaign_item_ref_invalid`, #2176),
   the DAG is built over just those
   items, and an included item whose `depends_on` points at an EXCLUDED item fails
-  `campaign_dangling_dependency` (omit `items` to sweep every child).
+  `campaign_dangling_dependency` (omit `items` to sweep every child). A provider
+  that cannot decompose an epic fails `epic_children_unsupported` (501), whose
+  `campaign_sources_supported` detail names the sources that DO work.
 - **WITHOUT `epic_ref`** (`items` alone, #2051) it assembles over exactly the
   named issues — the NO-EPIC variant. An included item whose `depends_on` points
   at an OPEN, closed-but-not-completed, or unreadable issue OUTSIDE the list fails
@@ -576,7 +585,9 @@ wave-orders the DAG, and persists the campaign — the batch counterpart to
   cause: a CLOSED-but-not-completed (not_planned/duplicate) target is NOT offered
   the widen/`grooming_order_limit` remedy — no limit value can include a closed
   issue; reopen/replace the dependency or drop the edge. A provider that cannot
-  resolve an arbitrary issue set fails `issue_set_resolution_unsupported` (501).
+  resolve an arbitrary issue set fails `issue_set_resolution_unsupported` (501),
+  whose `campaign_sources_supported` detail names the sources that DO work (empty
+  on a File-only provider like `gitlab`, where neither campaign mode works, #3648).
 
 Neither `epic_ref` nor `items` fails `validation_failed`; an un-installed repo
 fails `repo_not_installed` **when the resolved work-item provider is
