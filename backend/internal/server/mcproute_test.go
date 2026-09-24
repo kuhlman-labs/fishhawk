@@ -3,11 +3,17 @@ package server
 import (
 	"context"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1715,4 +1721,377 @@ func TestHandleMCP_GateIsPOSTOnly(t *testing.T) {
 			}
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// completion_blocked recovery-verb drift guards (E45.88 / #3623)
+// ---------------------------------------------------------------------------
+//
+// TWO tests, closing the loop in both directions. `completion_blocked.recovery`
+// (runs.go) hands an operator a CLOSED verb set, and the defect #3623 reports is
+// a verb an operator is TOLD to call that no MCP tool reaches. One guard is not
+// enough:
+//
+//   - TestCompletionBlockedRecoveryVerbsMatchEmission derives the set from the
+//     EMISSION sites by go/ast and asserts two-directional equality with
+//     completionBlockedRecoveryVerbs. Without it a fourth verb emitted somewhere
+//     in the package but never added to the slice is simply not swept — the
+//     hand-maintained-slice blind spot.
+//   - TestCompletionBlockedRecoveryVerbsHaveMCPTools sweeps that slice against
+//     the LIVE mcpserver registry, so a slice member with no registered tool is
+//     RED.
+//
+// Together: an emitted verb missing from the slice fails the first; a slice verb
+// with no tool fails the second.
+
+// recoveryVerbToolByVerb maps each non-`none` completion_blocked recovery verb
+// onto the MCP tool an operator is expected to call for it. Declared HERE rather
+// than in production code because it is the TEST's claim about the operator
+// contract; a verb absent from this map fails the sweep below, which is the
+// point (#3623).
+var recoveryVerbToolByVerb = map[string]string{
+	"record-merge-observation": "fishhawk_record_merge_observation",
+	"reconcile-merge":          "fishhawk_reconcile_merge",
+}
+
+// TestCompletionBlockedRecoveryVerbsHaveMCPTools is the CROSS-PACKAGE sweep the
+// #3623 defect asks for: it reads the recovery vocabulary from this package's
+// runs.go and the tool list from a REAL mcpserver registry built through the
+// same factory the /mcp route uses (mcpToolNamesDirect, the helper
+// TestMCPRoute_ToolRegistryParity already relies on — the legal test-only import
+// edge mcpscopes.go's header documents).
+//
+// A fourth recovery verb added to the slice without a tool fails on the map
+// lookup; a tool registration dropped fails on the registry lookup.
+func TestCompletionBlockedRecoveryVerbsHaveMCPTools(t *testing.T) {
+	registered := mcpToolNamesDirect(t, context.Background())
+	if len(registered) == 0 {
+		t.Fatal("mcpserver.NewServer advertised zero tools; the comparison would be vacuous")
+	}
+	if len(completionBlockedRecoveryVerbs) == 0 {
+		t.Fatal("completionBlockedRecoveryVerbs is empty; the sweep would be vacuous")
+	}
+	swept := 0
+	for _, verb := range completionBlockedRecoveryVerbs {
+		if verb == completionBlockedRecoveryNone {
+			// `none` names no verb by construction — it is the "no verb
+			// applies" arm, whose reason says what the stage needs instead.
+			continue
+		}
+		tool, ok := recoveryVerbToolByVerb[verb]
+		if !ok {
+			t.Errorf("completion_blocked.recovery=%q names a verb with NO entry in recoveryVerbToolByVerb; "+
+				"an operator is told to apply it and an MCP-driven agent cannot reach it (the #3623 defect). "+
+				"Register an MCP tool over the verb's REST route and map it here", verb)
+			continue
+		}
+		if !registered[tool] {
+			t.Errorf("completion_blocked.recovery=%q maps to MCP tool %q, which mcpserver.NewServer does NOT register; "+
+				"the recovery the operator is handed is unreachable over MCP", verb, tool)
+		}
+		swept++
+	}
+	if swept == 0 {
+		t.Fatal("the sweep covered zero verbs; every recovery value resolved to `none`, so this test proves nothing")
+	}
+	// Both directions: a stale map row whose verb left the vocabulary is a
+	// claim about a contract that no longer exists.
+	inVocabulary := map[string]bool{}
+	for _, verb := range completionBlockedRecoveryVerbs {
+		inVocabulary[verb] = true
+	}
+	for verb := range recoveryVerbToolByVerb {
+		if !inVocabulary[verb] {
+			t.Errorf("recoveryVerbToolByVerb carries a stale row %q that completionBlockedRecoveryVerbs no longer lists", verb)
+		}
+	}
+}
+
+// TestCompletionBlockedRecoveryVerbsMatchEmission derives the recovery
+// vocabulary from the EMISSION sites — every string assigned to the struct field
+// backing the `recovery` json tag, anywhere in this package's production code —
+// and asserts SET EQUALITY with completionBlockedRecoveryVerbs in BOTH
+// directions (operator binding condition 1).
+//
+// WHY: the sweep above reads a HAND-MAINTAINED slice, so a verb emitted by a new
+// code path but never added to that slice would never be swept and the #3623
+// defect would silently reopen. This guard is what makes the slice an assertion
+// about reality rather than a list someone remembered to update.
+//
+// FAIL-CLOSED (operator binding condition 3): an emission whose value is not a
+// string literal or a resolvable package-level string constant FAILS this test
+// naming file:line, rather than being skipped. A scan that silently ignores what
+// it cannot resolve is not a guard.
+func TestCompletionBlockedRecoveryVerbsMatchEmission(t *testing.T) {
+	scan := scanRecoveryEmissions(t)
+
+	got := map[string]bool{}
+	for _, e := range scan.emissions {
+		got[e.value] = true
+	}
+	want := map[string]bool{}
+	for _, verb := range completionBlockedRecoveryVerbs {
+		want[verb] = true
+	}
+	if len(got) == 0 {
+		t.Fatalf("the AST scan found ZERO %s emissions in the package's production files; "+
+			"the comparison would be vacuous — has the field been renamed or the payload moved?", scan.fieldName)
+	}
+	for v := range got {
+		if !want[v] {
+			t.Errorf("recovery value %q is EMITTED (%s) but is not in completionBlockedRecoveryVerbs; "+
+				"an operator can be handed it and TestCompletionBlockedRecoveryVerbsHaveMCPTools never sweeps it, "+
+				"so it can have no MCP tool with nothing going red", v, scan.sitesFor(v))
+		}
+	}
+	for v := range want {
+		if !got[v] {
+			t.Errorf("completionBlockedRecoveryVerbs lists %q, which NOTHING in the package's production code emits; "+
+				"either the emission was removed (drop it from the slice) or it moved out of this package (the scan cannot see it)", v)
+		}
+	}
+}
+
+// recoveryEmission is one resolved assignment to the recovery field.
+type recoveryEmission struct {
+	value string // the resolved string
+	site  string // file:line
+}
+
+// recoveryScan is the AST scan's result.
+type recoveryScan struct {
+	fieldName string // the Go field name backing the `recovery` json tag
+	emissions []recoveryEmission
+}
+
+// sitesFor renders the file:line list of every emission carrying value, so a
+// failure names where to look.
+func (s recoveryScan) sitesFor(value string) string {
+	var out []string
+	for _, e := range s.emissions {
+		if e.value == value {
+			out = append(out, e.site)
+		}
+	}
+	sort.Strings(out)
+	return strings.Join(out, ", ")
+}
+
+// scanRecoveryEmissions parses every non-test .go file in this package and
+// collects every resolvable string assigned to the recovery field, in either of
+// the two syntaxes the package uses: a composite-literal key
+// (`&runCompletionBlockedPayload{Recovery: x}`) and a selector assignment
+// (`out.Recovery = x`).
+//
+// The field NAME is not hardcoded: it is derived from the struct field carrying
+// the `recovery` json tag, so a field rename is followed rather than silently
+// turning the scan vacuous (the Fatal in the caller catches a rename the
+// derivation cannot follow).
+//
+// Every unresolvable emission is a FATAL, not a skip (binding condition 3).
+func scanRecoveryEmissions(t *testing.T) recoveryScan {
+	t.Helper()
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read package dir: %v", err)
+	}
+	fset := token.NewFileSet()
+	var files []*ast.File
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		f, perr := parser.ParseFile(fset, name, nil, 0)
+		if perr != nil {
+			t.Fatalf("parse %s: %v", name, perr)
+		}
+		files = append(files, f)
+	}
+	if len(files) == 0 {
+		t.Fatal("no production .go files parsed; the scan would be vacuous")
+	}
+
+	// Package-level string constants, so an emission naming one resolves.
+	consts := map[string]string{}
+	for _, f := range files {
+		for _, decl := range f.Decls {
+			gd, ok := decl.(*ast.GenDecl)
+			if !ok || gd.Tok != token.CONST {
+				continue
+			}
+			for _, spec := range gd.Specs {
+				vs, ok := spec.(*ast.ValueSpec)
+				if !ok {
+					continue
+				}
+				for i, nm := range vs.Names {
+					if i >= len(vs.Values) {
+						continue
+					}
+					bl, ok := vs.Values[i].(*ast.BasicLit)
+					if !ok || bl.Kind != token.STRING {
+						continue
+					}
+					if unq, uerr := strconv.Unquote(bl.Value); uerr == nil {
+						consts[nm.Name] = unq
+					}
+				}
+			}
+		}
+	}
+
+	// Derive the field name from the `recovery` json tag, and — because the
+	// scan matches by NAME and cannot resolve types without go/types — assert
+	// that name is declared by exactly ONE struct in the package. If a second
+	// struct ever declares it, this scan would over-collect, so it fails loudly
+	// instead of quietly comparing the wrong set.
+	fieldName := ""
+	declaringStructs := 0
+	for _, f := range files {
+		ast.Inspect(f, func(n ast.Node) bool {
+			st, ok := n.(*ast.StructType)
+			if !ok || st.Fields == nil {
+				return true
+			}
+			for _, fld := range st.Fields.List {
+				if len(fld.Names) != 1 {
+					continue
+				}
+				if fld.Tag == nil {
+					continue
+				}
+				tag, uerr := strconv.Unquote(fld.Tag.Value)
+				if uerr != nil {
+					continue
+				}
+				if jsonFieldName(tag) != "recovery" {
+					continue
+				}
+				declaringStructs++
+				fieldName = fld.Names[0].Name
+			}
+			return true
+		})
+	}
+	if fieldName == "" {
+		t.Fatal("no struct field in the package carries the `recovery` json tag; " +
+			"the completion_blocked payload has been renamed or moved and this guard is blind")
+	}
+	if declaringStructs != 1 {
+		t.Fatalf("%d struct fields carry the `recovery` json tag; this name-matching scan would over-collect. "+
+			"Narrow it to the completion_blocked payload's type before relying on it", declaringStructs)
+	}
+	// Guard the other half of the name-matching assumption: no OTHER struct in
+	// the package may declare a field of the same name, or an unrelated
+	// assignment to it would be collected as a recovery emission.
+	for _, f := range files {
+		ast.Inspect(f, func(n ast.Node) bool {
+			st, ok := n.(*ast.StructType)
+			if !ok || st.Fields == nil {
+				return true
+			}
+			for _, fld := range st.Fields.List {
+				for _, nm := range fld.Names {
+					if nm.Name != fieldName {
+						continue
+					}
+					tag := ""
+					if fld.Tag != nil {
+						if unq, uerr := strconv.Unquote(fld.Tag.Value); uerr == nil {
+							tag = unq
+						}
+					}
+					if jsonFieldName(tag) != "recovery" {
+						t.Errorf("%s: a second struct declares a field named %q that does NOT carry the `recovery` "+
+							"json tag; this name-matching scan would collect its assignments as recovery emissions",
+							fset.Position(nm.Pos()), fieldName)
+					}
+				}
+			}
+			return true
+		})
+	}
+
+	scan := recoveryScan{fieldName: fieldName}
+	// resolve turns an emission's RHS into a string, or FAILS the test.
+	resolve := func(expr ast.Expr, pos token.Pos) (string, bool) {
+		switch e := expr.(type) {
+		case *ast.BasicLit:
+			if e.Kind == token.STRING {
+				if unq, uerr := strconv.Unquote(e.Value); uerr == nil {
+					return unq, true
+				}
+			}
+		case *ast.Ident:
+			if v, ok := consts[e.Name]; ok {
+				return v, true
+			}
+		}
+		t.Errorf("%s: the %s field is assigned a value this scan cannot resolve to a string constant "+
+			"(%T). The guard FAILS CLOSED rather than skipping it: make the emission a string literal or a "+
+			"package-level string constant, or teach scanRecoveryEmissions to resolve this form",
+			fset.Position(pos), fieldName, expr)
+		return "", false
+	}
+
+	for _, f := range files {
+		ast.Inspect(f, func(n ast.Node) bool {
+			switch node := n.(type) {
+			case *ast.KeyValueExpr:
+				// `runCompletionBlockedPayload{Recovery: x}`
+				key, ok := node.Key.(*ast.Ident)
+				if !ok || key.Name != fieldName {
+					return true
+				}
+				if v, ok := resolve(node.Value, node.Value.Pos()); ok {
+					scan.emissions = append(scan.emissions, recoveryEmission{
+						value: v, site: fset.Position(node.Value.Pos()).String(),
+					})
+				}
+			case *ast.AssignStmt:
+				// `out.Recovery = x`
+				for i, lhs := range node.Lhs {
+					sel, ok := lhs.(*ast.SelectorExpr)
+					if !ok || sel.Sel.Name != fieldName {
+						continue
+					}
+					if i >= len(node.Rhs) {
+						// A multi-value RHS (a call, a type assertion) cannot
+						// be resolved positionally — fail closed.
+						t.Errorf("%s: the %s field is assigned from a multi-value expression this scan cannot resolve",
+							fset.Position(lhs.Pos()), fieldName)
+						continue
+					}
+					if v, ok := resolve(node.Rhs[i], node.Rhs[i].Pos()); ok {
+						scan.emissions = append(scan.emissions, recoveryEmission{
+							value: v, site: fset.Position(node.Rhs[i].Pos()).String(),
+						})
+					}
+				}
+			}
+			return true
+		})
+	}
+	return scan
+}
+
+// jsonFieldName extracts the json NAME from a struct tag, dropping any options
+// (`,omitempty`). Returns "" when the tag carries no json key.
+func jsonFieldName(tag string) string {
+	const key = `json:"`
+	i := strings.Index(tag, key)
+	if i < 0 {
+		return ""
+	}
+	rest := tag[i+len(key):]
+	j := strings.Index(rest, `"`)
+	if j < 0 {
+		return ""
+	}
+	name := rest[:j]
+	if k := strings.Index(name, ","); k >= 0 {
+		name = name[:k]
+	}
+	return name
 }

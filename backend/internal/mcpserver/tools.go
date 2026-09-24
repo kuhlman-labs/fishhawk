@@ -284,6 +284,11 @@ func registerTools(srv *mcp.Server, resolver *runResolver) {
 	registerRetryStage(srv, resolver)
 	registerReapStage(srv, resolver)
 	registerReconcileReviews(srv, resolver)
+	// The #3083/#3136 merge-recovery PAIR, adjacent on purpose: the
+	// completion_blocked discriminator hands out one verb OR the other, and they
+	// compose in a fixed order (observe, then reconcile). See merge_recovery.go.
+	registerRecordMergeObservation(srv, resolver)
+	registerReconcileMerge(srv, resolver)
 	registerReviveRun(srv, resolver)
 	registerFileIssue(srv, resolver)
 	registerDraftEpic(srv, resolver)
@@ -1859,10 +1864,12 @@ the status goes terminal. (The interval is dropped once the run itself is
 terminal, so the wait never strands.) When a 'running' run is held open by a
 non-terminal stage, run.completion_blocked names that stage and DISCRIMINATES
 the recovery across three values, and an operator applies them IN ORDER:
-recovery='record-merge-observation' means the PR merge is unrecorded — POST
-/v0/runs/{run_id}/record-merge-observation FIRST to record it off the forge;
-recovery='reconcile-merge' means the merge is already on the chain, so POST
-/v0/runs/{run_id}/reconcile-merge can supersede the stage and complete the run
+recovery='record-merge-observation' means the PR merge is unrecorded — call
+fishhawk_record_merge_observation FIRST (POST
+/v0/runs/{run_id}/record-merge-observation) to record it off the forge;
+recovery='reconcile-merge' means the merge is already on the chain, so
+fishhawk_reconcile_merge (POST /v0/runs/{run_id}/reconcile-merge) can supersede
+the stage and complete the run
 (a merge-supersedable park on an observably merged PR); recovery='none' means no
 verb applies and reason says what the stage needs instead — branch on it rather
 than suggesting an endpoint unconditionally. A non-terminal StageWaitStatus also

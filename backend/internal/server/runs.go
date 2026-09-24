@@ -325,6 +325,21 @@ const (
 	completionBlockedRecoveryNone = "none"
 )
 
+// completionBlockedRecoveryVerbs is the closed recovery set above as a slice,
+// built FROM the same constants so a value rename cannot desync the two
+// (E45.88 / #3623). It exists so the drift the issue reports is machine-caught:
+// every non-`none` value here names a REST verb an operator is told to call, and
+// backend/internal/server/mcproute_test.go sweeps it against the LIVE MCP tool
+// registry so a recovery verb with no reachable MCP tool is RED. A second guard
+// in the same file derives the set from the EMISSION sites by go/ast and asserts
+// two-directional equality with this slice, so a verb emitted but never listed
+// here — which a sweep over a hand-maintained slice cannot see — is also RED.
+var completionBlockedRecoveryVerbs = []string{
+	completionBlockedRecoveryReconcileMerge,
+	completionBlockedRecoveryRecordMergeObservation,
+	completionBlockedRecoveryNone,
+}
+
 // runStagePermissionsPayload is one stage's declared permissions/egress on the
 // wire (E53.5 / #2228). DECLARATION-ONLY. The Enforced flag is the HONEST
 // per-entry qualifier (operator condition 3): a blanket enforced:false would LIE

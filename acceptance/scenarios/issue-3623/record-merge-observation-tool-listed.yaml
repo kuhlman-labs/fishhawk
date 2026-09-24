@@ -1,0 +1,14 @@
+id: scenario:issue-3623/record-merge-observation-tool-listed
+statement: The MCP server advertises a tool named fishhawk_record_merge_observation whose description leads with a when/eligibility trigger and names the record-merge-observation recovery verb.
+verify_hint: Read the MCP tools/list result from the preview's MCP surface (fishhawkd's /mcp route, or the fishhawk-mcp stdio handshake) and check the advertised tool names and description text.
+steps: 'Built fishhawk-mcp from the sanctioned checkout (HEAD fb457d7e == preview git_sha): `cd backend && go build -o /tmp/fh3623/fishhawk-mcp ./cmd/fishhawk-mcp`. Ran it over stdio with FISHHAWK_BACKEND_URL=http://localhost:8090; initialize + notifications/initialized; tools/list (57 tools, one page); read fishhawk_record_merge_observation''s description and inputSchema.'
+assertions:
+    expected: fishhawk_record_merge_observation is advertised; its description leads with a when trigger and names record-merge-observation.
+    observed_at_record: 'Listed. The description opens ''Use this when fishhawk_get_run_status reports run.completion_blocked.recovery = "record-merge-observation" ...'', names the verb, and lists the named refusals, including record_merge_observation_pr_not_merged. inputSchema {run_id: string, required; additionalProperties false}.'
+    repro_handle: FISHHAWK_BACKEND_URL=http://localhost:8090 FISHHAWK_API_TOKEN=x fishhawk-mcp (initialize; tools/list)
+origin:
+    issue: 3623
+    pr: 3634
+    run_id: 764eb1fe-7fab-4ece-8020-770a34bf2206
+    head_sha: fb457d7e821c04ae99a30445151bf1b58193a4a5
+    recorded_at: 2026-09-23T23:59:25Z

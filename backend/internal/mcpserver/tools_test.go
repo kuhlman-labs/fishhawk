@@ -3215,7 +3215,17 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	// write → commit → push → merge → discover loop an MCP-driven onboarding
 	// was left with, because fishhawk_doctor's spec rung reads the default
 	// branch — taking the total 54 -> 55.
-	const wantToolCount = 55
+	//
+	// E45.88 (#3623) adds TWO tools in one change — fishhawk_record_merge_observation
+	// and fishhawk_reconcile_merge, the MCP half of the #3083/#3136 merge-recovery
+	// pair — taking the total 55 -> 57. WHY TWO AT ONCE, when every bump above adds
+	// exactly one: `completion_blocked.recovery` is a DISCRIMINATOR that hands an
+	// operator one verb OR the other depending on which half of the observe/settle
+	// split is missing, and both already ship as REST routes with no MCP tool.
+	// Registering only one would leave the identical unreachable-recovery defect
+	// standing for the other arm, which is the whole defect #3623 reports. This is
+	// one gap closed, not two features.
+	const wantToolCount = 57
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",
@@ -3257,6 +3267,25 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	}
 	if !sawValidate {
 		t.Error("fishhawk_validate is not in the registered tool list — the pre-commit spec check is unreachable")
+	}
+	// The #3623 merge-recovery pair must EACH be wire-visible by NAME. The
+	// 55 -> 57 count bump alone is not enough: it stays green if one of the two
+	// registrations is dropped while a DIFFERENT tool is added in the same change,
+	// and a tool absent from tools/list is exactly the unreachable-recovery defect
+	// this change closes. Naming both is also what makes the DONE-MEANS
+	// non-vacuous — a comment-only touch of tools.go leaves both names absent.
+	for _, name := range []string{"fishhawk_record_merge_observation", "fishhawk_reconcile_merge"} {
+		var saw bool
+		for _, tool := range res.Tools {
+			if tool.Name == name {
+				saw = true
+				break
+			}
+		}
+		if !saw {
+			t.Errorf("%s is not in the registered tool list — the completion_blocked recovery verb it wraps "+
+				"is unreachable over MCP (the #3623 defect)", name)
+		}
 	}
 	if !sawConsolidate {
 		t.Error("fishhawk_consolidate_slices is not registered/visible over ListTools")

@@ -2135,6 +2135,154 @@ func TestReconcileRunReviews_ErrorEnvelope(t *testing.T) {
 	}
 }
 
+// TestRecordMergeObservation_PostsAndDecodes pins the #3136 observe call: a
+// bodiless POST to the run-scoped path, the bearer forwarded, and every mirrored
+// json tag round-tripped.
+//
+// merged_at and observed_at are seeded with two DISTINCT timestamps and asserted
+// by VALUE. That is deliberate: self-paired identical values would let a
+// transposed pair of json tags on the client mirror pass unnoticed (the #371
+// hand-maintained-wire-mirror class).
+func TestRecordMergeObservation_PostsAndDecodes(t *testing.T) {
+	runID := uuid.New()
+	var gotMethod, gotPath, gotAuth string
+	var gotBody []byte
+	c := releaseTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		gotMethod, gotPath, gotAuth = r.Method, r.URL.Path, r.Header.Get("Authorization")
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"run_id":"`+runID.String()+`","already_recorded":false,`+
+			`"observation":{"pull_request_url":"https://github.com/kuhlman-labs/fishhawk/pull/7",`+
+			`"pull_request_number":7,"merge_commit_sha":"f00dbabe",`+
+			`"merged_at":"2026-09-20T10:00:00Z","observed_at":"2026-09-23T11:30:00Z"}}`)
+	})
+
+	res, err := c.RecordMergeObservation(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("RecordMergeObservation: %v", err)
+	}
+	if gotMethod != http.MethodPost {
+		t.Errorf("method = %s, want POST", gotMethod)
+	}
+	if want := "/v0/runs/" + runID.String() + "/record-merge-observation"; gotPath != want {
+		t.Errorf("path = %q, want %q", gotPath, want)
+	}
+	if gotAuth != "Bearer tok-test" {
+		t.Errorf("Authorization = %q, want the bearer forwarded", gotAuth)
+	}
+	// The endpoint takes NO request body; the client must not invent one.
+	if len(gotBody) != 0 {
+		t.Errorf("request body = %q, want empty — the endpoint reads only the run_id path value", gotBody)
+	}
+	if res.RunID != runID.String() || res.AlreadyRecorded {
+		t.Fatalf("res = %+v, want the run id decoded and already_recorded false", res)
+	}
+	if res.Observation.PullRequestURL != "https://github.com/kuhlman-labs/fishhawk/pull/7" {
+		t.Errorf("pull_request_url = %q", res.Observation.PullRequestURL)
+	}
+	if res.Observation.PullRequestNumber != 7 {
+		t.Errorf("pull_request_number = %d, want 7", res.Observation.PullRequestNumber)
+	}
+	if res.Observation.MergeCommitSHA != "f00dbabe" {
+		t.Errorf("merge_commit_sha = %q", res.Observation.MergeCommitSHA)
+	}
+	if res.Observation.MergedAt != "2026-09-20T10:00:00Z" {
+		t.Errorf("merged_at = %q, want the FORGE timestamp; a transposed tag would land observed_at here",
+			res.Observation.MergedAt)
+	}
+	if res.Observation.ObservedAt != "2026-09-23T11:30:00Z" {
+		t.Errorf("observed_at = %q, want the observation timestamp; a transposed tag would land merged_at here",
+			res.Observation.ObservedAt)
+	}
+}
+
+// TestRecordMergeObservation_ErrorEnvelope covers the refusal path: a named 409
+// surfaces as *apiError carrying the backend's code verbatim rather than being
+// flattened into a decode failure.
+func TestRecordMergeObservation_ErrorEnvelope(t *testing.T) {
+	c := releaseTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_, _ = io.WriteString(w, `{"error":{"code":"record_merge_observation_pr_not_merged","message":"not merged"}}`)
+	})
+
+	_, err := c.RecordMergeObservation(context.Background(), uuid.New())
+	if err == nil {
+		t.Fatal("want an error on a 409")
+	}
+	var ae *apiError
+	if !errors.As(err, &ae) || ae.Code != "record_merge_observation_pr_not_merged" ||
+		ae.StatusCode != http.StatusConflict {
+		t.Fatalf("error = %v, want a typed *apiError record_merge_observation_pr_not_merged/409", err)
+	}
+}
+
+// TestReconcileMerge_PostsAndDecodes pins the #3083 settle call: a bodiless POST
+// to the run-scoped path with both row arrays and the run state decoded.
+func TestReconcileMerge_PostsAndDecodes(t *testing.T) {
+	runID := uuid.New()
+	var gotMethod, gotPath, gotAuth string
+	var gotBody []byte
+	c := releaseTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		gotMethod, gotPath, gotAuth = r.Method, r.URL.Path, r.Header.Get("Authorization")
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"run_id":"`+runID.String()+`",`+
+			`"superseded":[{"stage_id":"11111111-1111-1111-1111-111111111111","stage_type":"acceptance",`+
+			`"from_state":"awaiting_input","reason":"merge_superseded"}],`+
+			`"repaired":[{"stage_id":"22222222-2222-2222-2222-222222222222","stage_type":"implement",`+
+			`"from_state":"superseded","reason":"missing_audit_row"}],"run_state":"succeeded"}`)
+	})
+
+	res, err := c.ReconcileMerge(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("ReconcileMerge: %v", err)
+	}
+	if gotMethod != http.MethodPost {
+		t.Errorf("method = %s, want POST", gotMethod)
+	}
+	if want := "/v0/runs/" + runID.String() + "/reconcile-merge"; gotPath != want {
+		t.Errorf("path = %q, want %q", gotPath, want)
+	}
+	if gotAuth != "Bearer tok-test" {
+		t.Errorf("Authorization = %q, want the bearer forwarded", gotAuth)
+	}
+	if len(gotBody) != 0 {
+		t.Errorf("request body = %q, want empty — the endpoint reads only the run_id path value", gotBody)
+	}
+	if res.RunState != "succeeded" {
+		t.Errorf("run_state = %q, want succeeded", res.RunState)
+	}
+	if len(res.Superseded) != 1 || res.Superseded[0].StageID != "11111111-1111-1111-1111-111111111111" ||
+		res.Superseded[0].StageType != "acceptance" || res.Superseded[0].FromState != "awaiting_input" ||
+		res.Superseded[0].Reason != "merge_superseded" {
+		t.Errorf("superseded = %+v, want every mirrored tag decoded", res.Superseded)
+	}
+	if len(res.Repaired) != 1 || res.Repaired[0].StageID != "22222222-2222-2222-2222-222222222222" ||
+		res.Repaired[0].FromState != "superseded" {
+		t.Errorf("repaired = %+v, want every mirrored tag decoded", res.Repaired)
+	}
+}
+
+// TestReconcileMerge_ErrorEnvelope covers the refusal path for the settle verb.
+func TestReconcileMerge_ErrorEnvelope(t *testing.T) {
+	c := releaseTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_, _ = io.WriteString(w, `{"error":{"code":"reconcile_merge_not_applicable","message":"nothing to supersede"}}`)
+	})
+
+	_, err := c.ReconcileMerge(context.Background(), uuid.New())
+	if err == nil {
+		t.Fatal("want an error on a 409")
+	}
+	var ae *apiError
+	if !errors.As(err, &ae) || ae.Code != "reconcile_merge_not_applicable" ||
+		ae.StatusCode != http.StatusConflict {
+		t.Fatalf("error = %v, want a typed *apiError reconcile_merge_not_applicable/409", err)
+	}
+}
+
 // reapConditionalGoldenPath is the ONE shared cross-boundary artifact (the
 // operator's binding CONDITION 3 on E67.51 / #2699). Two duplicated literals,
 // one per package, could drift apart silently while LOOKING like a seam test, so

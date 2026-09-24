@@ -17,7 +17,7 @@ import (
 // FuncDecls, TypeSpecs and ValueSpecs), not transcribed, so a drift between
 // an estimate and reality would surface as a test written from the tree.
 //
-// The bulk of these 286 names are tool I/O request/response structs. The MCP
+// The bulk of these 296 names are tool I/O request/response structs. The MCP
 // SDK's jsonschema reflection requires each tool's input/output type — and
 // its fields — to be EXPORTED to build the tool's schema, so unexporting them
 // would break tool registration. In `package main` their exportedness was
@@ -202,6 +202,12 @@ var exportBaseline = []string{
 	"ListRunsOutput",
 	"ListScopeAmendmentsInput",
 	"ListScopeAmendmentsOutput",
+	// E45.88 / #3623: the client wire mirror of the `observation` object on
+	// POST /v0/runs/{run_id}/record-merge-observation. Exported for the same
+	// reason as the ReconcileReviews* / BulkWaive* sibling mirrors below — it is
+	// reached through RecordMergeObservationResult and follows the convention
+	// every recovery verb's mirrors already use.
+	"MergeObservationFact",
 	"MergeRunInput",
 	"MergeRunOutput",
 	"MergeRunResult",
@@ -241,6 +247,15 @@ var exportBaseline = []string{
 	"ReapStageInput",
 	"ReapStageOutput",
 	// #2712: fishhawk_reconcile_reviews' tool I/O plus the apiClient result
+	// E45.88 / #3623: the MCP half of the #3083/#3136 merge-recovery verb pair
+	// (merge_recovery.go). The tool I/O types MUST be exported — the MCP SDK's
+	// jsonschema reflection reads each tool's input/output type AND its nested
+	// row types to build the schema, so unexporting them breaks registration;
+	// the *Result client mirrors follow the sibling convention below.
+	"ReconcileMergeInput",
+	"ReconcileMergeOutput",
+	"ReconcileMergeResult",
+	"ReconcileMergeStage",
 	// types for POST /v0/runs/{run_id}/reviews/reconcile. Exported for the
 	// same reason as the ReapStage* sibling verb above — the MCP SDK's
 	// jsonschema reflection advertises the nested per-stage row shape.
@@ -253,6 +268,13 @@ var exportBaseline = []string{
 	"RecordAutoDriveActResult",
 	"RecordGroomingDispositionsInput",
 	"RecordGroomingDispositionsOutput",
+	// E45.88 / #3623: the observe half of the merge-recovery pair. Same reason
+	// as the ReconcileMerge* block above — tool I/O and its nested observation
+	// row must be exported for the SDK to advertise the schema.
+	"RecordMergeObservationInput",
+	"RecordMergeObservationObservation",
+	"RecordMergeObservationOutput",
+	"RecordMergeObservationResult",
 	"RecordedGroomingDisposition",
 	"RecoverExemptPath",
 	"RecoverRunParams",
@@ -344,6 +366,10 @@ var exportBaseline = []string{
 	"StartRunOutput",
 	"StartRunParams",
 	"SuggestedAction",
+	// E45.88 / #3623: the client wire mirror of one `superseded`/`repaired` row
+	// on POST /v0/runs/{run_id}/reconcile-merge, reached through
+	// ReconcileMergeResult. Same sibling-mirror convention as MergeObservationFact.
+	"SupersededStageRow",
 	"SurfaceSweep",
 	"SurfaceSweepFinding",
 	"TestSweep",
