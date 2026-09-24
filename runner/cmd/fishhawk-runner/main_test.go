@@ -15129,7 +15129,7 @@ func TestOpenHeldCommitPR_ArtifactBodyMatchesWireGolden(t *testing.T) {
 	}
 	var logSink strings.Builder
 	if code := openHeldCommitPR(context.Background(), cfg,
-		wireGoldenHeldCommitHeadSHA, wireGoldenHeldCommitBranch, wireGoldenHeldCommitBaseSHA, "", "", "",
+		wireGoldenHeldCommitHeadSHA, wireGoldenHeldCommitBranch, wireGoldenHeldCommitBaseSHA, "", "", "", "",
 		&logSink, fu, issued); code != exitOK {
 		t.Fatalf("openHeldCommitPR exit = %d, want exitOK\n%s", code, logSink.String())
 	}
@@ -17118,7 +17118,7 @@ func TestOpenHeldCommitPR_OpensFromHeldCommit_NoAgent(t *testing.T) {
 		backendURL: "https://api.fishhawk.test",
 	}
 	var logSink strings.Builder
-	if code := openHeldCommitPR(context.Background(), cfg, "deadbeefcafef00d", "fishhawk/run-abc/stage-xyz", "cafef00ddeadbeef", "", "", "", &logSink, fu, issued); code != exitOK {
+	if code := openHeldCommitPR(context.Background(), cfg, "deadbeefcafef00d", "fishhawk/run-abc/stage-xyz", "cafef00ddeadbeef", "", "", "", "", &logSink, fu, issued); code != exitOK {
 		t.Fatalf("openHeldCommitPR exit = %d, want exitOK\n%s", code, logSink.String())
 	}
 	if fpr.gotArgs == nil {
@@ -17169,7 +17169,7 @@ func TestOpenHeldCommitPR_MissingHeldFields_ReportsFailure(t *testing.T) {
 	var logSink strings.Builder
 	// held SHA / branch deliberately empty → fail-closed (base SHA present so
 	// the RED lands on the branch/SHA guard, not the #2563 base-SHA guard).
-	if code := openHeldCommitPR(context.Background(), cfg, "", "", "cafef00ddeadbeef", "", "", "", &logSink, fu, issued); code != exitFailure {
+	if code := openHeldCommitPR(context.Background(), cfg, "", "", "cafef00ddeadbeef", "", "", "", "", &logSink, fu, issued); code != exitFailure {
 		t.Fatalf("missing held fields must fail, exit = %d", code)
 	}
 	if fpr.gotArgs != nil {
@@ -17208,7 +17208,7 @@ func TestOpenHeldCommitPR_MissingBaseSHAOpensNoPR(t *testing.T) {
 	var logSink strings.Builder
 	// held branch + SHA present, base SHA empty by construction → the #2563
 	// no-orphan guard must fire.
-	code := openHeldCommitPR(context.Background(), cfg, "deadbeefcafef00d", "fishhawk/run-abc/stage-xyz", "", "", "", "", &logSink, fu, issued)
+	code := openHeldCommitPR(context.Background(), cfg, "deadbeefcafef00d", "fishhawk/run-abc/stage-xyz", "", "", "", "", "", &logSink, fu, issued)
 
 	// THE load-bearing assertion, and it is FIRST and non-fatal so nothing masks
 	// it: no PR was opened on the forge (committed external state, read AFTER the
@@ -22532,7 +22532,7 @@ func TestOpenHeldCommitPR_ResumeSkipsAgentAndOpensPR(t *testing.T) {
 	}
 	var logSink strings.Builder
 	if code := openHeldCommitPR(context.Background(), checkpointResumeCfg(repo),
-		headSHA, branch, "base-sha-2169", resumeKindPROpen, "", "", &logSink, fu, issued); code != exitOK {
+		headSHA, branch, "base-sha-2169", resumeKindPROpen, "", "", "", &logSink, fu, issued); code != exitOK {
 		t.Fatalf("resume exit = %d, want exitOK\n%s", code, logSink.String())
 	}
 	if fpr.gotArgs == nil || fpr.gotArgs.Head != branch {
@@ -22595,7 +22595,7 @@ func TestOpenHeldCommitPR_ResumeAdoptsExistingPR(t *testing.T) {
 	}
 	var logSink strings.Builder
 	if code := openHeldCommitPR(context.Background(), checkpointResumeCfg(repo),
-		headSHA, branch, "base-sha-2169", resumeKindPROpen, "", "", &logSink, fu, issued); code != exitOK {
+		headSHA, branch, "base-sha-2169", resumeKindPROpen, "", "", "", &logSink, fu, issued); code != exitOK {
 		t.Fatalf("resume exit = %d, want exitOK\n%s", code, logSink.String())
 	}
 	if creates != 0 {
@@ -22643,7 +22643,7 @@ func TestOpenHeldCommitPR_ResumeStaleRemoteTipFailsClosed(t *testing.T) {
 	}
 	var logSink strings.Builder
 	code := openHeldCommitPR(context.Background(), checkpointResumeCfg(repo),
-		movedCheckpoint, branch, "base-sha-2169", resumeKindPROpen, "", "", &logSink, fu, issued)
+		movedCheckpoint, branch, "base-sha-2169", resumeKindPROpen, "", "", "", &logSink, fu, issued)
 
 	// THE load-bearing assertion, first and non-fatal so nothing masks it: the
 	// forge was never touched. Deleting the guard reddens THIS line.
@@ -22681,7 +22681,7 @@ func TestOpenHeldCommitPR_ResumeMissingRemoteBranchFailsClosed(t *testing.T) {
 	}
 	var logSink strings.Builder
 	code := openHeldCommitPR(context.Background(), checkpointResumeCfg(repo),
-		headSHA, "fishhawk/never-pushed", "base-sha-2169", resumeKindPROpen, "", "", &logSink, fu, issued)
+		headSHA, "fishhawk/never-pushed", "base-sha-2169", resumeKindPROpen, "", "", "", &logSink, fu, issued)
 	if fpr.gotArgs != nil {
 		t.Errorf("a vanished branch must open NO PR, got: %+v", fpr.gotArgs)
 	}
@@ -22709,7 +22709,7 @@ func TestOpenHeldCommitPR_ResumeLsRemoteErrorFailsClosed(t *testing.T) {
 	}
 	var logSink strings.Builder
 	code := openHeldCommitPR(context.Background(), checkpointResumeCfg(repo),
-		headSHA, branch, "base-sha-2169", resumeKindPROpen, "", "", &logSink, fu, issued)
+		headSHA, branch, "base-sha-2169", resumeKindPROpen, "", "", "", &logSink, fu, issued)
 	if fpr.gotArgs != nil {
 		t.Errorf("an unreadable remote tip must open NO PR, got: %+v", fpr.gotArgs)
 	}
@@ -22739,7 +22739,7 @@ func TestOpenHeldCommitPR_ResumeFailureReportCarriesCheckpoint(t *testing.T) {
 	}
 	var logSink strings.Builder
 	if code := openHeldCommitPR(context.Background(), checkpointResumeCfg(repo),
-		headSHA, branch, "base-sha-2169", resumeKindPROpen, "", "", &logSink, fu, issued); code != exitFailure {
+		headSHA, branch, "base-sha-2169", resumeKindPROpen, "", "", "", &logSink, fu, issued); code != exitFailure {
 		t.Fatalf("a failed resume must exit failure, got %d\n%s", code, logSink.String())
 	}
 	rep := lastFailureReport(fu)
@@ -22772,7 +22772,7 @@ func TestOpenHeldCommitPR_LegacyExemptPathUnchanged(t *testing.T) {
 	var logSink strings.Builder
 	// Empty resume kind = the legacy #1231 exempt resolution.
 	if code := openHeldCommitPR(context.Background(), checkpointResumeCfg(repo),
-		headSHA, branch, "base-sha-2169", "", "", "", &logSink, fu, issued); code != exitOK {
+		headSHA, branch, "base-sha-2169", "", "", "", "", &logSink, fu, issued); code != exitOK {
 		t.Fatalf("the legacy exempt path must not probe the remote tip; exit = %d\n%s", code, logSink.String())
 	}
 	if fpr.gotArgs == nil {
@@ -22801,7 +22801,7 @@ func TestOpenHeldCommitPR_LegacyExemptFailureReportCarriesNoCheckpoint(t *testin
 	}
 	var logSink strings.Builder
 	if code := openHeldCommitPR(context.Background(), checkpointResumeCfg(repo),
-		headSHA, branch, "base-sha-2169", "", "", "", &logSink, fu, issued); code != exitFailure {
+		headSHA, branch, "base-sha-2169", "", "", "", "", &logSink, fu, issued); code != exitFailure {
 		t.Fatalf("exit = %d, want exitFailure\n%s", code, logSink.String())
 	}
 	rep := lastFailureReport(fu)
@@ -22840,7 +22840,7 @@ func TestOpenHeldCommitPR_ShipRejectedAsInvalid_ReportsCategoryC(t *testing.T) {
 	}
 	var logSink strings.Builder
 	if code := openHeldCommitPR(context.Background(), checkpointResumeCfg(repo),
-		headSHA, branch, "base-sha-2169", resumeKindPROpen, "", "", &logSink, fu, issued); code != exitFailure {
+		headSHA, branch, "base-sha-2169", resumeKindPROpen, "", "", "", &logSink, fu, issued); code != exitFailure {
 		t.Fatalf("a rejected ship must exit failure, got %d\n%s", code, logSink.String())
 	}
 	rep := lastFailureReport(fu)
@@ -22874,7 +22874,7 @@ func TestOpenHeldCommitPR_LegacyExemptShipRejectedReportsCategoryC(t *testing.T)
 	var logSink strings.Builder
 	// Empty resume kind = the legacy #1231 exempt resolution.
 	if code := openHeldCommitPR(context.Background(), checkpointResumeCfg(repo),
-		headSHA, branch, "base-sha-2169", "", "", "", &logSink, fu, issued); code != exitFailure {
+		headSHA, branch, "base-sha-2169", "", "", "", "", &logSink, fu, issued); code != exitFailure {
 		t.Fatalf("a rejected ship must exit failure, got %d\n%s", code, logSink.String())
 	}
 	rep := lastFailureReport(fu)
@@ -23800,7 +23800,7 @@ func TestOpenHeldCommitPR_UsesServedPRText(t *testing.T) {
 
 	var logSink strings.Builder
 	if code := openHeldCommitPR(context.Background(), checkpointResumeCfg(repo),
-		headSHA, branch, "base-sha-2169", resumeKindPROpen, servedTitle, servedBody,
+		headSHA, branch, "base-sha-2169", resumeKindPROpen, "", servedTitle, servedBody,
 		&logSink, fu, issued); code != exitOK {
 		t.Fatalf("resume exit = %d, want exitOK\n%s", code, logSink.String())
 	}
@@ -23851,7 +23851,7 @@ func TestOpenHeldCommitPR_ServedPRTextPartial(t *testing.T) {
 		issued, _ := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
 		var logSink strings.Builder
 		if code := openHeldCommitPR(context.Background(), checkpointResumeCfg(repo),
-			headSHA, branch, "base-sha-2169", resumeKindPROpen, "feat(server): served subject", "",
+			headSHA, branch, "base-sha-2169", resumeKindPROpen, "", "feat(server): served subject", "",
 			&logSink, fu, issued); code != exitOK {
 			t.Fatalf("exit = %d, want exitOK\n%s", code, logSink.String())
 		}
@@ -23867,7 +23867,7 @@ func TestOpenHeldCommitPR_ServedPRTextPartial(t *testing.T) {
 		issued, _ := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
 		var logSink strings.Builder
 		if code := openHeldCommitPR(context.Background(), checkpointResumeCfg(repo),
-			headSHA, branch, "base-sha-2169", resumeKindPROpen, "", "## Summary\n\n- served narrative",
+			headSHA, branch, "base-sha-2169", resumeKindPROpen, "", "", "## Summary\n\n- served narrative",
 			&logSink, fu, issued); code != exitOK {
 			t.Fatalf("exit = %d, want exitOK\n%s", code, logSink.String())
 		}
@@ -23904,7 +23904,7 @@ func TestOpenHeldCommitPR_FallbackStillOpensPR(t *testing.T) {
 	}
 	var logSink strings.Builder
 	if code := openHeldCommitPR(context.Background(), checkpointResumeCfg(repo),
-		headSHA, branch, "base-sha-2169", resumeKindPROpen, "", "",
+		headSHA, branch, "base-sha-2169", resumeKindPROpen, "", "", "",
 		&logSink, fu, issued); code != exitOK {
 		t.Fatalf("a resume with no served text must still succeed; exit = %d\n%s", code, logSink.String())
 	}
@@ -23937,7 +23937,7 @@ func TestOpenHeldCommitPR_FailureReReportsPRText(t *testing.T) {
 
 	var logSink strings.Builder
 	if code := openHeldCommitPR(context.Background(), checkpointResumeCfg(repo),
-		headSHA, branch, "base-sha-2169", resumeKindPROpen, servedTitle, servedBody,
+		headSHA, branch, "base-sha-2169", resumeKindPROpen, "", servedTitle, servedBody,
 		&logSink, fu, issued); code != exitFailure {
 		t.Fatalf("a failed PR open must exit failure, got %d\n%s", code, logSink.String())
 	}
@@ -23967,7 +23967,7 @@ func TestOpenHeldCommitPR_LegacyExemptFailureCarriesNoPRText(t *testing.T) {
 	var logSink strings.Builder
 	// Empty resume kind = the legacy #1231 exempt resolution.
 	if code := openHeldCommitPR(context.Background(), checkpointResumeCfg(repo),
-		headSHA, branch, "base-sha-2169", "", "feat: served", "## Summary",
+		headSHA, branch, "base-sha-2169", "", "", "feat: served", "## Summary",
 		&logSink, fu, issued); code != exitFailure {
 		t.Fatalf("exit = %d, want exitFailure\n%s", code, logSink.String())
 	}
@@ -24387,7 +24387,7 @@ func TestOpenHeldCommitPR_ResumeReauthsExpiredToken(t *testing.T) {
 	}
 	var logSink strings.Builder
 	if code := openHeldCommitPR(context.Background(), checkpointResumeCfg(repo),
-		headSHA, branch, "base-sha-2169", resumeKindPROpen, "", "", &logSink, fu, issued); code != exitOK {
+		headSHA, branch, "base-sha-2169", resumeKindPROpen, "", "", "", &logSink, fu, issued); code != exitOK {
 		t.Fatalf("resume exit = %d, want exitOK (the 401 must be re-authenticated)\n%s", code, logSink.String())
 	}
 	if want := []string{reauthStaleToken, reauthFreshToken}; !reflect.DeepEqual(log.tokens, want) {
@@ -27492,7 +27492,7 @@ func heldCommitPRBodyOutcome(t *testing.T, handoff string, servedTitle, servedBo
 	var logSink strings.Builder
 	if code := openHeldCommitPR(context.Background(), cfg,
 		wireGoldenHeldCommitHeadSHA, wireGoldenHeldCommitBranch, wireGoldenHeldCommitBaseSHA,
-		"", servedTitle, servedBody, &logSink, fu, issued); code != exitOK {
+		"", "", servedTitle, servedBody, &logSink, fu, issued); code != exitOK {
 		t.Fatalf("openHeldCommitPR exit = %d, want exitOK\n%s", code, logSink.String())
 	}
 	if fu.gotPRArgs == nil {
@@ -29890,5 +29890,454 @@ func TestRun_TraceUploadFailure_PlanArtifactRetainedLineNamesExistingPath(t *tes
 	}
 	if reports := fu.runnerFailures(); len(reports) != 1 || !strings.Contains(reports[0].Detail, planPath) {
 		t.Errorf("self-report detail does not name the retained plan: %+v", reports)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// PUSH-FAILURE RESUME (E45.86 / #3621)
+// ---------------------------------------------------------------------------
+
+// pushResumeRepo builds the fixture the push resume is defined against: a
+// gate-verified commit that exists LOCALLY on the run branch and was NEVER
+// pushed (the bare origin carries `main` only). That un-pushed state is the
+// whole point — the pr_open resume's tip-EQUALITY guard is wrong here by
+// construction, which is why the consume path uses a non-clobber ancestry
+// check instead.
+//
+// Returns the work repo, the bare origin, the run branch, the held commit and
+// its TREE object id.
+func pushResumeRepo(t *testing.T) (repo, bare, branch, headSHA, treeSHA string) {
+	t.Helper()
+	root := t.TempDir()
+	repo = filepath.Join(root, "work")
+	bare = filepath.Join(root, "origin.git")
+	if err := os.Mkdir(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGit := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+		}
+	}
+	runGit("init", "--initial-branch=main")
+	runGit("config", "user.name", "init")
+	runGit("config", "user.email", "init@example.com")
+	runGit("config", "commit.gpgsign", "false")
+	mustWrite(t, filepath.Join(repo, "a.txt"), "base\n")
+	runGit("add", "-A")
+	runGit("commit", "-m", "base")
+	runGit("init", "--bare", bare)
+	runGit("remote", "add", "origin", bare)
+	runGit("push", "origin", "main")
+
+	branch = fmt.Sprintf("fishhawk/run-%s/stage-%s", shortID(verifiedTreeRunID), shortID(verifiedTreeStageID))
+	runGit("checkout", "-b", branch)
+	mustWrite(t, filepath.Join(repo, "a.txt"), "the unpublished held commit\n")
+	runGit("add", "-A")
+	runGit("commit", "-m", "held commit (never pushed)")
+	headSHA = pushResumeRevParse(t, repo, "HEAD")
+	treeSHA = pushResumeRevParse(t, repo, "HEAD^{tree}")
+	runGit("checkout", "main")
+	return repo, bare, branch, headSHA, treeSHA
+}
+
+func pushResumeRevParse(t *testing.T, dir, rev string) string {
+	t.Helper()
+	out, err := exec.Command("git", "-C", dir, "rev-parse", rev).Output()
+	if err != nil {
+		t.Fatalf("git rev-parse %s in %s: %v", rev, dir, err)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// withFakePusher installs a fakePusher on the newPusher seam and returns it, so
+// a consume-path test can assert the push seam was NEVER DIALED (the assertion
+// that discriminates a guard from an error that happens to look the same).
+func withFakePusher(t *testing.T) *fakePusher {
+	t.Helper()
+	fp := &fakePusher{}
+	orig := newPusher
+	newPusher = func() pusher { return fp }
+	t.Cleanup(func() { newPusher = orig })
+	return fp
+}
+
+// reportedFailureBody decodes the failure report the runner shipped. Every
+// consume-path assertion reads the checkpoint (or its ABSENCE) off this, which
+// is what the backend actually receives.
+func reportedFailureBody(t *testing.T, fu *fakeUploader) upload.ShipPullRequestArgs {
+	t.Helper()
+	if fu.gotPRArgs == nil {
+		t.Fatal("no pull-request report was shipped")
+	}
+	return *fu.gotPRArgs
+}
+
+// TestResumeKindWireValues pins the resume-kind strings and the capability
+// token: no compiler binds them across the runner/backend module boundary, so
+// each is asserted byte-equal against a shared literal here and against the
+// SAME literal in backend/internal/server's TestResumeKindWireValues.
+func TestResumeKindWireValues(t *testing.T) {
+	if resumeKindPROpen != "pr_open" {
+		t.Errorf("resumeKindPROpen = %q, want %q", resumeKindPROpen, "pr_open")
+	}
+	if resumeKindPush != "push" {
+		t.Errorf("resumeKindPush = %q, want %q", resumeKindPush, "push")
+	}
+	if resumeKindPushDiscarded != "push_discarded" {
+		t.Errorf("resumeKindPushDiscarded = %q, want %q", resumeKindPushDiscarded, "push_discarded")
+	}
+	if upload.RunnerCapabilitiesHeader != "X-Fishhawk-Runner-Capabilities" {
+		t.Errorf("RunnerCapabilitiesHeader = %q", upload.RunnerCapabilitiesHeader)
+	}
+	if upload.CapabilityPushResume != "push-resume" {
+		t.Errorf("CapabilityPushResume = %q", upload.CapabilityPushResume)
+	}
+}
+
+// TestPushResume_PublishesHeldCommitAndOpensPR is the happy path: the served
+// tree matches the local held commit, the remote branch does not exist, so the
+// resume publishes the EXACT held SHA and falls through into the unchanged
+// PR-open + ship tail.
+func TestPushResume_PublishesHeldCommitAndOpensPR(t *testing.T) {
+	repo, _, branch, headSHA, treeSHA := pushResumeRepo(t)
+	fp := withFakePusher(t)
+	fpr := withFakePROpenerOnly(t)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logSink strings.Builder
+	if code := openHeldCommitPR(context.Background(), checkpointResumeCfg(repo),
+		headSHA, branch, "base-sha-3621", resumeKindPush, treeSHA, "", "", &logSink, fu, issued); code != exitOK {
+		t.Fatalf("push resume exit = %d, want exitOK\n%s", code, logSink.String())
+	}
+	if fp.pushCommittedArgs == nil {
+		t.Fatal("the push resume must publish the held commit")
+	}
+	if fp.pushCommittedArgs.HeadSHA != headSHA || fp.pushCommittedArgs.Branch != branch {
+		t.Errorf("published %+v, want head %s on %s", fp.pushCommittedArgs, headSHA, branch)
+	}
+	if fpr.gotArgs == nil || fpr.gotArgs.Head != branch {
+		t.Fatalf("the resume must open a PR from the published branch, got %+v", fpr.gotArgs)
+	}
+	if !strings.Contains(logSink.String(), `"event":"push_resume_pushed"`) {
+		t.Errorf("missing push_resume_pushed:\n%s", logSink.String())
+	}
+	if !strings.Contains(logSink.String(), `"event":"push_resume_pr_opened"`) {
+		t.Errorf("missing push_resume_pr_opened:\n%s", logSink.String())
+	}
+}
+
+// TestPushResume_ConsumeGuards drives ONE fixture through every named consume
+// guard and asserts the refusal-reason TOKEN by IDENTITY plus that the push
+// seam was NEVER dialed. Reason identity — not merely "it failed" — is what
+// makes each case a counterfactual vehicle: deleting a guard makes the NEXT one
+// fire with a DIFFERENT token, so the assertion goes red rather than being
+// masked by the later guard.
+func TestPushResume_ConsumeGuards(t *testing.T) {
+	cases := []struct {
+		name string
+		// mutate adjusts the fixture; it returns the served verified tree.
+		mutate    func(t *testing.T, repo, bare, branch, headSHA, treeSHA string) string
+		wantToken string
+		permanent bool
+	}{
+		{
+			name: "verified_tree_missing",
+			mutate: func(_ *testing.T, _, _, _, _, _ string) string {
+				return ""
+			},
+			wantToken: refusePushVerifiedTreeMissing,
+			permanent: true,
+		},
+		{
+			name: "tree_mismatch",
+			// The held commit IS present locally (so the presence guard cannot
+			// mask this) and the remote tip is absent (so the ancestry guard
+			// cannot either) — the served tree is simply a different, real tree.
+			mutate: func(t *testing.T, repo, _, _, _, _ string) string {
+				return pushResumeRevParse(t, repo, "main^{tree}")
+			},
+			wantToken: refusePushTreeMismatch,
+			permanent: true,
+		},
+		{
+			name: "remote_tip_not_ancestor",
+			// A remote tip that is NOT an ancestor of the held commit: an
+			// unrelated commit pushed onto the run branch behind our back.
+			mutate: func(t *testing.T, repo, _, branch, _, treeSHA string) string {
+				run := func(args ...string) {
+					cmd := exec.Command("git", append([]string{"-C", repo}, args...)...)
+					if out, err := cmd.CombinedOutput(); err != nil {
+						t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+					}
+				}
+				run("checkout", "-b", "foreign", "main")
+				mustWrite(t, filepath.Join(repo, "foreign.txt"), "someone else\n")
+				run("add", "-A")
+				run("commit", "-m", "foreign")
+				run("push", "origin", "foreign:"+branch)
+				run("checkout", "main")
+				return treeSHA
+			},
+			wantToken: refusePushRemoteTipNotAnc,
+			permanent: true,
+		},
+		{
+			name: "remote_tip_unreadable",
+			// The origin is gone, so ls-remote ERRORS. Not evidence either way →
+			// transient.
+			mutate: func(t *testing.T, _, bare, _, _, treeSHA string) string {
+				if err := os.RemoveAll(bare); err != nil {
+					t.Fatal(err)
+				}
+				return treeSHA
+			},
+			wantToken: refusePushRemoteTipUnreadable,
+			permanent: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			repo, bare, branch, headSHA, treeSHA := pushResumeRepo(t)
+			served := tc.mutate(t, repo, bare, branch, headSHA, treeSHA)
+			fp := withFakePusher(t)
+			fpr := withFakePROpenerOnly(t)
+			fu := newFakeUploader(t)
+			issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var logSink strings.Builder
+			code := openHeldCommitPR(context.Background(), checkpointResumeCfg(repo),
+				headSHA, branch, "base-sha-3621", resumeKindPush, served, "", "", &logSink, fu, issued)
+			if code != exitFailure {
+				t.Fatalf("exit = %d, want exitFailure\n%s", code, logSink.String())
+			}
+			if fp.pushCommittedArgs != nil {
+				t.Errorf("the push seam must never be dialed on a refusal, got %+v", fp.pushCommittedArgs)
+			}
+			if fpr.gotArgs != nil {
+				t.Errorf("no PR may be opened on a refusal, got %+v", fpr.gotArgs)
+			}
+			got := reportedFailureBody(t, fu)
+			if !strings.HasPrefix(got.Reason, tc.wantToken+":") {
+				t.Errorf("refusal reason = %q, want the %q token", got.Reason, tc.wantToken)
+			}
+			if !strings.Contains(logSink.String(), `"reason":"`+tc.wantToken+`"`) {
+				t.Errorf("missing push_resume_refused %q:\n%s", tc.wantToken, logSink.String())
+			}
+			// RE-ARM CLASSIFICATION. A PERMANENT refusal reports the DISCARD kind
+			// (no resumable checkpoint, so the next retry is an honest agent
+			// re-run); a TRANSIENT one re-arms the push checkpoint.
+			if tc.permanent {
+				if got.ResumeKind != resumeKindPushDiscarded {
+					t.Errorf("permanent refusal resume_kind = %q, want %q", got.ResumeKind, resumeKindPushDiscarded)
+				}
+			} else if got.ResumeKind != resumeKindPush {
+				t.Errorf("transient refusal resume_kind = %q, want %q (it must stay resumable)", got.ResumeKind, resumeKindPush)
+			}
+		})
+	}
+}
+
+// TestPushResume_HeldCommitAbsentLocally_RefusesWithHeldCommitAbsent is the
+// ephemeral-host case, and its own test because the fixture must DELETE the
+// object rather than adjust a served value. The remote is a REACHABLE in-test
+// bare repo, so the deletion of the presence check cannot fail for the same
+// reason the control would.
+func TestPushResume_HeldCommitAbsentLocally_RefusesWithHeldCommitAbsent(t *testing.T) {
+	repo, _, branch, headSHA, treeSHA := pushResumeRepo(t)
+	// A SHA of the right shape that no object in this repo has: the held commit
+	// is genuinely unreachable, exactly as on a fresh runner host.
+	absent := "0123456789abcdef0123456789abcdef01234567"
+	_ = headSHA
+	fp := withFakePusher(t)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logSink strings.Builder
+	code := openHeldCommitPR(context.Background(), checkpointResumeCfg(repo),
+		absent, branch, "base-sha-3621", resumeKindPush, treeSHA, "", "", &logSink, fu, issued)
+	if code != exitFailure {
+		t.Fatalf("exit = %d, want exitFailure\n%s", code, logSink.String())
+	}
+	if fp.pushCommittedArgs != nil {
+		t.Fatalf("nothing may be pushed when the held commit is absent, got %+v", fp.pushCommittedArgs)
+	}
+	got := reportedFailureBody(t, fu)
+	if !strings.HasPrefix(got.Reason, refusePushHeldCommitAbsent+":") {
+		t.Errorf("refusal reason = %q, want the %q token", got.Reason, refusePushHeldCommitAbsent)
+	}
+	if got.ResumeKind != resumeKindPushDiscarded {
+		t.Errorf("resume_kind = %q, want %q (permanent refusals must not re-arm)", got.ResumeKind, resumeKindPushDiscarded)
+	}
+}
+
+// TestOpenHeldCommitPR_UnknownResumeKind_RefusesWithoutOpeningPR pins the
+// tightened unknown-kind arm: before #3621 an unrecognized kind degraded to the
+// legacy exempt path and opened a PR on a branch that may never have been
+// pushed. It must now refuse having touched no forge.
+func TestOpenHeldCommitPR_UnknownResumeKind_RefusesWithoutOpeningPR(t *testing.T) {
+	repo, _, branch, headSHA, _ := pushResumeRepo(t)
+	fpr := withFakePROpenerOnly(t)
+	fp := withFakePusher(t)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logSink strings.Builder
+	code := openHeldCommitPR(context.Background(), checkpointResumeCfg(repo),
+		headSHA, branch, "base-sha-3621", "rebase_resume_v9", "", "", "", &logSink, fu, issued)
+	if code != exitFailure {
+		t.Fatalf("exit = %d, want exitFailure\n%s", code, logSink.String())
+	}
+	if fpr.gotArgs != nil {
+		t.Fatalf("an unknown resume kind must open NO pull request, got %+v", fpr.gotArgs)
+	}
+	if fp.pushCommittedArgs != nil {
+		t.Fatalf("an unknown resume kind must push nothing, got %+v", fp.pushCommittedArgs)
+	}
+	if got := reportedFailureBody(t, fu); !strings.HasPrefix(got.Reason, refusePushUnknownResumeKind+":") {
+		t.Errorf("refusal reason = %q, want the %q token", got.Reason, refusePushUnknownResumeKind)
+	}
+}
+
+// TestPushResume_PostPushFailure_RearmsAsPROpen pins the kind TRANSITION: once
+// the push lands the branch is published, so a later failure must re-arm as the
+// ordinary pr_open kind. The checkpoint always describes the state the run is
+// actually in.
+func TestPushResume_PostPushFailure_RearmsAsPROpen(t *testing.T) {
+	repo, _, branch, headSHA, treeSHA := pushResumeRepo(t)
+	withFakePusher(t)
+	fpr := withFakePROpenerOnly(t)
+	fpr.err = errors.New("forge still down")
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logSink strings.Builder
+	if code := openHeldCommitPR(context.Background(), checkpointResumeCfg(repo),
+		headSHA, branch, "base-sha-3621", resumeKindPush, treeSHA, "", "", &logSink, fu, issued); code != exitFailure {
+		t.Fatalf("exit = %d, want exitFailure\n%s", code, logSink.String())
+	}
+	got := reportedFailureBody(t, fu)
+	// pr_open is reported as an ABSENT resume_kind, which is the legacy wire
+	// shape — that absence IS the claim.
+	if got.ResumeKind != "" {
+		t.Errorf("post-push failure resume_kind = %q, want it ABSENT (the pr_open kind)", got.ResumeKind)
+	}
+	if got.HeadSHA != headSHA || got.Branch != branch {
+		t.Errorf("re-armed checkpoint = %s@%s, want %s@%s", got.Branch, got.HeadSHA, branch, headSHA)
+	}
+}
+
+// TestPushCheckpoint_ArmingGuards drives the REAL arming site over ONE fixture,
+// one case per named precondition. Each asserts the OBSERVABLE outcome —
+// whether a checkpoint exists at all, and of which kind — not merely that a
+// branch was taken.
+func TestPushCheckpoint_ArmingGuards(t *testing.T) {
+	repo, _, branch, headSHA, treeSHA := pushResumeRepo(t)
+	// Put the held commit back on HEAD: the arming site reads HEAD, which is
+	// where CommitAndPush leaves the commit when only the push failed.
+	if out, err := exec.Command("git", "-C", repo, "checkout", branch).CombinedOutput(); err != nil {
+		t.Fatalf("checkout: %v\n%s", err, out)
+	}
+	pushErr := fmt.Errorf("commit+push: %w", gitops.ErrPushFailed)
+	// An unrelated tree that is NOT this commit's, seeded BY CONSTRUCTION from a
+	// different real commit rather than by calling the guard in setup.
+	otherTree := pushResumeRevParse(t, repo, "main^{tree}")
+
+	cases := []struct {
+		name       string
+		supports   bool
+		verified   string
+		err        error
+		wantArmed  bool
+		wantReason string
+	}{
+		{name: "armed", supports: true, verified: treeSHA, err: pushErr, wantArmed: true},
+		{name: "backend_capability_absent", supports: false, verified: treeSHA, err: pushErr, wantReason: notArmedBackendCapabilityAbsent},
+		{name: "no_verified_tree", supports: true, verified: "", err: pushErr, wantReason: notArmedNoVerifiedTree},
+		{name: "tree_mismatch", supports: true, verified: otherTree, err: pushErr, wantReason: notArmedTreeMismatch},
+		{name: "not_a_push_transport_failure", supports: true, verified: treeSHA, err: errors.New("commit+push: gitops: commit: nothing to commit")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var cp pushCheckpoint
+			var logSink strings.Builder
+			maybeArmPushFailureCheckpoint(context.Background(), checkpointResumeCfg(repo), &logSink,
+				&cp, tc.supports, tc.err, repo, branch, tc.verified, "", "")
+			if cp.armed != tc.wantArmed {
+				t.Fatalf("armed = %t, want %t\n%s", cp.armed, tc.wantArmed, logSink.String())
+			}
+			if tc.wantArmed {
+				if cp.resumeKind != resumeKindPush {
+					t.Errorf("resumeKind = %q, want %q", cp.resumeKind, resumeKindPush)
+				}
+				if cp.headSHA != headSHA || cp.verifiedTreeSHA != treeSHA {
+					t.Errorf("checkpoint = %+v, want head %s tree %s", cp, headSHA, treeSHA)
+				}
+				if cp.baseSHA == "" {
+					t.Error("base_sha is REQUIRED by the backend's success-arm validate(); it must be resolved at arming time")
+				}
+				return
+			}
+			if tc.wantReason == "" {
+				// A non-push-transport failure is the ordinary common path: silent,
+				// so the log is not spammed on every pre-push failure.
+				if strings.Contains(logSink.String(), "push_checkpoint_not_armed") {
+					t.Errorf("a non-transport failure must not emit push_checkpoint_not_armed:\n%s", logSink.String())
+				}
+				return
+			}
+			if !strings.Contains(logSink.String(), `"reason":"`+tc.wantReason+`"`) {
+				t.Errorf("missing push_checkpoint_not_armed %q:\n%s", tc.wantReason, logSink.String())
+			}
+		})
+	}
+}
+
+// TestFailureReport_LegacyKinds_ByteIdentical is the skew guard for operator
+// condition 1's rollback half, asserted on the BYTES: neither a pre-push
+// failure nor a pr_open checkpoint may emit a resume_kind key, so an OLD
+// backend's DisallowUnknownFields decoder can never 400 a report the stage's
+// recovery depends on.
+func TestFailureReport_LegacyKinds_ByteIdentical(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cp   *pushCheckpoint
+	}{
+		{name: "pre_push_failure", cp: nil},
+		{name: "pr_open_checkpoint", cp: &pushCheckpoint{
+			branch: "fishhawk/run-x/stage-y", headSHA: "a1b2", baseSHA: "c3d4",
+			verifiedTreeSHA: "e5f6", armed: true, resumeKind: resumeKindPROpen,
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fu := newFakeUploader(t)
+			issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var logSink strings.Builder
+			if err := reportPullRequestFailure(context.Background(), checkpointResumeCfg(t.TempDir()),
+				&logSink, fu, issued, "C", "the forge is down", tc.cp); err != nil {
+				t.Fatal(err)
+			}
+			got := reportedFailureBody(t, fu)
+			if got.ResumeKind != "" {
+				t.Fatalf("a legacy path emitted resume_kind %q; it must be ABSENT", got.ResumeKind)
+			}
+		})
 	}
 }

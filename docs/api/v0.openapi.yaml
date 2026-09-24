@@ -3752,6 +3752,22 @@ components:
             strand the implement stage in `running`). A PRE-push failure omits
             all four, which is byte-identical to the pre-#2169 failure body.
 
+            `resume_kind` (E45.86 / #3621) discriminates the checkpoint those
+            coordinates encode, and is ABSENT on every legacy path (no
+            checkpoint, or the `pr_open` one above) so the pre-#3621 body is
+            byte-identical. `push` means the gate-verified commit exists on the
+            runner's disk and was NEVER published: the handler records it under
+            its own `push_resume_checkpoint` audit category and deliberately
+            NOT as the `pull_request_failed` payload's `push_checkpoint`, so a
+            reverted backend — whose resolver knows only `pull_request_failed`
+            — cannot read a never-pushed commit as a `pr_open` checkpoint.
+            `push_discarded` means a preserved push checkpoint was PERMANENTLY
+            refused at consume time: no checkpoint is recorded and a
+            `verified_tree_discarded` audit row accounts for the thrown-away
+            tree. An unrecognized value is recorded verbatim and refused by the
+            prompt-side gate; it is never a 400 (that would strand the
+            implement stage in `running`).
+
             `acceptance_scenarios_pushed` (E72.4 / #3328) reports the
             ACCEPTANCE runner's post-verdict scenario-corpus commit — new
             scenario YAML under `acceptance/scenarios/` and/or the merged
@@ -3868,6 +3884,21 @@ components:
             and the agent re-derived), `apply_failed_reset_failed` (an apply
             failed AND the post-failure reset also failed). Persisted onto the
             fixup_pushed audit entry.
+        resume_kind:
+          type: string
+          enum: [push, push_discarded]
+          description: |
+            Present only on an `outcome: failed` report, and only for the two
+            E45.86 / #3621 kinds — the legacy paths (no checkpoint, or the
+            #2169 `pr_open` one) omit the key entirely so their bodies stay
+            byte-identical. `push`: the gate-verified commit exists on the
+            runner's disk and was NEVER published, so the handler records the
+            coordinates under the `push_resume_checkpoint` audit category and
+            NOT as this entry's `push_checkpoint`. `push_discarded`: a
+            preserved push checkpoint was permanently refused at consume time;
+            no checkpoint is recorded and a `verified_tree_discarded` row
+            accounts for the tree. An unrecognized value is recorded verbatim
+            and refused by the prompt-side gate — never a 400.
         pr_body_fallback_reason:
           type: string
           enum:
@@ -13540,6 +13571,23 @@ paths:
           schema:
             type: string
             description: Hex-encoded Ed25519 signature of `sha256("prompt:" + stage_id)`.
+        - in: header
+          name: X-Fishhawk-Runner-Capabilities
+          required: false
+          schema:
+            type: string
+          description: |
+            Comma-separated list of the tokens the requesting runner BINARY
+            understands (E45.86 / #3621) — the RUNNER half of the bidirectional
+            capability handshake, sent on every prompt fetch by a runner that
+            has the capability, and absent from an older one. Tokens are
+            case-sensitive and surrounding spaces are trimmed.
+
+            Current tokens: `push-resume` — this runner implements
+            `held_commit_resume_kind: push`. A request WITHOUT it is served no
+            held-commit fields for a push-kind checkpoint (never a downgraded
+            `pr_open`), and the decline appends a `verified_tree_discarded`
+            audit row.
       responses:
         '200':
           description: Constructed prompt for the stage.
@@ -13907,7 +13955,7 @@ paths:
                       resolves (fail-closed).
                   held_commit_resume_kind:
                     type: string
-                    enum: [pr_open]
+                    enum: [pr_open, push]
                     description: |
                       DISCRIMINATES which recovery the four held-commit fields
                       above encode (#2169). ABSENT for the legacy #1231
@@ -13926,6 +13974,41 @@ paths:
                       checkpointed commit passed no operator gate the way a
                       park did. An exempt resolution always WINS over a
                       checkpoint, so the two can never both be emitted.
+
+                      `push` (E45.86 / #3621) is the PUSH-FAILURE resume: the
+                      agent ran, the committed-tree gates passed, and only the
+                      PUSH transport failed, so the commit exists on the
+                      runner's disk and NOT on the remote. The retry publishes
+                      it — after re-proving its tree against
+                      `held_commit_verified_tree_sha` and checking the remote
+                      tip is absent or an ancestor — and then opens the PR.
+                      CAPABILITY-GATED: it is served ONLY to a request carrying
+                      `X-Fishhawk-Runner-Capabilities: push-resume`. A request
+                      without that token is served NO held-commit fields at all
+                      — never a downgraded `pr_open`, which would open a PR on
+                      a branch that was never pushed — and the decline appends
+                      a `verified_tree_discarded` audit row.
+                  held_commit_verified_tree_sha:
+                    type: string
+                    description: |
+                      The gate-certified TREE object id the held commit carries
+                      (E45.86 / #3621). Served ONLY with
+                      `held_commit_resume_kind: push`, where the commit is not
+                      yet on the remote and the runner must re-prove
+                      byte-exactly that the local commit's tree IS the verified
+                      one before publishing it. Absent on every other response.
+                  supports_push_resume:
+                    type: boolean
+                    description: |
+                      The BACKEND half of the E45.86 / #3621 bidirectional
+                      capability handshake, `true` on every implement-stage
+                      response from a build that understands
+                      `held_commit_resume_kind: push`. It describes the BUILD,
+                      not a per-run decision. The runner arms a pre-push
+                      checkpoint (and emits `resume_kind` on its failure
+                      report) ONLY when it saw this, so against an older
+                      backend the failure-report body is byte-identical to the
+                      pre-#3621 shape.
                   held_commit_pr_title:
                     type: string
                     description: |
@@ -14250,8 +14333,14 @@ paths:
                     description: The base commit the held commit was built on (#2563); the runner ships it as the pull-request artifact's required `base_sha`. Resolved from the park's persisted base SHA or a legacy park's newest `scope_completeness_parked` audit `base_sha`; present only alongside a true `open_pr_from_held_commit`, and the exempt fields are all omitted when no base SHA resolves (fail-closed).
                   held_commit_resume_kind:
                     type: string
-                    enum: [pr_open]
-                    description: Discriminates which recovery the held-commit fields encode (#2169). Absent for the legacy #1231 `exempt` resolution; `pr_open` for the PR-open CHECKPOINT resume, where the stage already pushed and then failed opening the PR (or shipping the artifact) and the newest audit entry is a `pull_request_failed` carrying a complete `push_checkpoint`. On `pr_open` the runner also re-verifies the run branch's remote tip equals `held_commit_sha` before touching the forge. An exempt resolution always wins over a checkpoint.
+                    enum: [pr_open, push]
+                    description: Discriminates which recovery the held-commit fields encode (#2169). Absent for the legacy #1231 `exempt` resolution; `pr_open` for the PR-open CHECKPOINT resume, where the stage already pushed and then failed opening the PR (or shipping the artifact) and the newest audit entry is a `pull_request_failed` carrying a complete `push_checkpoint`. On `pr_open` the runner also re-verifies the run branch's remote tip equals `held_commit_sha` before touching the forge. An exempt resolution always wins over a checkpoint. `push` (E45.86 / #3621) is the PUSH-FAILURE resume — the commit exists only on the runner's disk — and is served ONLY to a request carrying `X-Fishhawk-Runner-Capabilities: push-resume`; a request without the token is served NO held-commit fields (never a downgraded `pr_open`). NOTE for this PREVIEW surface: it applies the same capability gate, so previewing without the header shows the DECLINED shape; unlike the dispatch surface it writes no `verified_tree_discarded` row.
+                  held_commit_verified_tree_sha:
+                    type: string
+                    description: The gate-certified TREE object id the held commit carries (E45.86 / #3621), served only with `held_commit_resume_kind: push` so the runner can re-prove the unpublished local commit before publishing it.
+                  supports_push_resume:
+                    type: boolean
+                    description: The BACKEND half of the E45.86 / #3621 capability handshake, `true` on every implement-stage response from a build that understands `held_commit_resume_kind: push`. It describes the build, not a per-run decision.
                   held_commit_pr_title:
                     type: string
                     description: |

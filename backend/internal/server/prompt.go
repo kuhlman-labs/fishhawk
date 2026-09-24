@@ -406,6 +406,29 @@ type promptResponse struct {
 	// tag drift degrades a pr_open resume into the legacy exempt path: still
 	// correct (same branch, same PR) but without the remote-tip guard.
 	HeldCommitResumeKind string `json:"held_commit_resume_kind,omitempty"`
+	// HeldCommitVerifiedTreeSHA is the gate-certified TREE object id the held
+	// commit carries (E45.86 / #3621). Served ONLY with HeldCommitResumeKind
+	// "push", where the commit is NOT yet on the remote and the runner must
+	// re-prove byte-exactly that the local commit's tree IS the verified one
+	// before publishing it. Empty on every other response.
+	//
+	// CROSS-MODULE WIRE CONTRACT: the json tag (held_commit_verified_tree_sha)
+	// MUST stay byte-identical to the runner's
+	// upload.FetchedPrompt.HeldCommitVerifiedTreeSHA.
+	HeldCommitVerifiedTreeSHA string `json:"held_commit_verified_tree_sha,omitempty"`
+	// SupportsPushResume advertises the BACKEND half of the E45.86 / #3621
+	// bidirectional capability handshake on every implement-stage response: this
+	// build understands resume_kind "push" and will record a push-kind
+	// checkpoint under its own audit category. It describes the BUILD, not a
+	// per-run decision.
+	//
+	// The runner arms a pre-push checkpoint and emits resume_kind only when it
+	// saw this, so against an OLD backend (which omits the key) the failure
+	// report is byte-identical to today and no unknown field can 400 it.
+	//
+	// CROSS-MODULE WIRE CONTRACT: the json tag (supports_push_resume) MUST stay
+	// byte-identical to the runner's upload.FetchedPrompt.SupportsPushResume.
+	SupportsPushResume bool `json:"supports_push_resume,omitempty"`
 	// HeldCommitPRTitle / HeldCommitPRBody are the pull-request text the resumed
 	// runner opens its PR with (#2570): the agent-authored title + body recovered
 	// from the park row or the checkpoint payload, or the documented
@@ -1568,6 +1591,10 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		rm := s.resolveImplementDispatchModel(r.Context(), runRow, stage, fixup)
 		resp.ImplementModel = rm.Value
 		s.logModelResolution(r.Context(), runRow.ID, rm)
+		// BACKEND half of the E45.86 / #3621 capability handshake. It advertises
+		// the BUILD's capability, not a per-run decision, so it is set
+		// unconditionally on every implement-stage response.
+		resp.SupportsPushResume = true
 		// Scope-completeness EXEMPT resolution (#2501): emit the held-commit
 		// fields ONLY for a park whose newest decision entry is `exempted`, so the
 		// re-dispatched runner opens the PR from the held commit with no agent
@@ -1584,16 +1611,20 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 			// agent text nor the issue-context fallback was available.
 			resp.HeldCommitPRTitle = held.prTitle
 			resp.HeldCommitPRBody = held.prBody
-		} else if held, resume := s.resolvePushCheckpointResume(r.Context(), runRow, stage, fixup); resume {
-			// PR-open CHECKPOINT resume (#2169), taken ONLY when the exempt
-			// resolution above returned false. An exempt-resolved park always wins:
-			// #1231 keeps precedence, and the two can never both set the fields (so
-			// the resume kind an exempt emission carries is always empty).
+		} else if held, resume := s.resolvePushCheckpointResume(r.Context(), runRow, stage, fixup, runnerAdvertises(r, capabilityPushResume), true); resume {
+			// Held-commit CHECKPOINT resume (#2169 pr_open, E45.86 / #3621 push),
+			// taken ONLY when the exempt resolution above returned false. An
+			// exempt-resolved park always wins: #1231 keeps precedence, and the two
+			// can never both set the fields (so the resume kind an exempt emission
+			// carries is always empty).
 			resp.OpenPRFromHeldCommit = true
 			resp.HeldCommitSHA = held.sha
 			resp.HeldCommitBranch = held.branch
 			resp.HeldCommitBaseSHA = held.baseSHA
-			resp.HeldCommitResumeKind = resumeKindPROpen
+			resp.HeldCommitResumeKind = held.resumeKind
+			// Non-empty only for the push kind; the consume side re-proves the
+			// unpublished local commit's tree against it.
+			resp.HeldCommitVerifiedTreeSHA = held.verifiedTreeSHA
 			// #2570, same as the exempt arm above.
 			resp.HeldCommitPRTitle = held.prTitle
 			resp.HeldCommitPRBody = held.prBody
@@ -2223,6 +2254,9 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 	if stage.Type == run.StageTypeImplement {
 		rm := s.resolveImplementDispatchModel(r.Context(), runRow, stage, fixup)
 		resp.ImplementModel = rm.Value
+		// BACKEND half of the E45.86 / #3621 capability handshake, same
+		// unconditional derivation as the dispatch path.
+		resp.SupportsPushResume = true
 		// Scope-completeness EXEMPT resolution (#2501), same derivation as the
 		// dispatch path so the rendered (SPA-readable) prompt response stays
 		// byte-consistent with the runner-facing one. A fix-up dispatch is refused
@@ -2237,15 +2271,19 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 			// agent text nor the issue-context fallback was available.
 			resp.HeldCommitPRTitle = held.prTitle
 			resp.HeldCommitPRBody = held.prBody
-		} else if held, resume := s.resolvePushCheckpointResume(r.Context(), runRow, stage, fixup); resume {
-			// PR-open CHECKPOINT resume (#2169), same derivation + same
-			// exempt-wins precedence as the dispatch path so the rendered
-			// (SPA-readable) prompt response stays byte-consistent with it.
+		} else if held, resume := s.resolvePushCheckpointResume(r.Context(), runRow, stage, fixup, runnerAdvertises(r, capabilityPushResume), false); resume {
+			// Held-commit CHECKPOINT resume, same derivation + same exempt-wins
+			// precedence as the dispatch path so the rendered (SPA-readable) prompt
+			// response stays byte-consistent with it. recordDrop is FALSE here: a
+			// preview must never write to the audit chain. So an operator previewing
+			// WITHOUT the capability header sees the declined shape (no held-commit
+			// fields) and no row is written — documented in runner/README.md.
 			resp.OpenPRFromHeldCommit = true
 			resp.HeldCommitSHA = held.sha
 			resp.HeldCommitBranch = held.branch
 			resp.HeldCommitBaseSHA = held.baseSHA
-			resp.HeldCommitResumeKind = resumeKindPROpen
+			resp.HeldCommitResumeKind = held.resumeKind
+			resp.HeldCommitVerifiedTreeSHA = held.verifiedTreeSHA
 			// #2570, same as the exempt arm above.
 			resp.HeldCommitPRTitle = held.prTitle
 			resp.HeldCommitPRBody = held.prBody
@@ -4517,6 +4555,14 @@ type heldCommitResume struct {
 	baseSHA string
 	prTitle string
 	prBody  string
+	// resumeKind is the wire discriminator this resolution serves (E45.86 /
+	// #3621): resumeKindPROpen for the #2169 post-push checkpoint and the #1231
+	// exempt path (where the caller leaves it empty on the response), or
+	// resumeKindPush for the pre-push one.
+	resumeKind string
+	// verifiedTreeSHA is served ONLY with resumeKindPush — the tree the consume
+	// side re-proves the unpublished local commit against.
+	verifiedTreeSHA string
 }
 
 // resumeKindPROpen is the held_commit_resume_kind wire value for a PR-open
@@ -4524,6 +4570,50 @@ type heldCommitResume struct {
 // resumeKindPROpen constant (runner/cmd/fishhawk-runner/main.go), which selects
 // the remote-tip guard and the repeatable-resume report.
 const resumeKindPROpen = "pr_open"
+
+// resumeKindPush is the held_commit_resume_kind wire value for the
+// PUSH-FAILURE resume (E45.86 / #3621): the implement agent ran, the
+// committed-tree gates passed, the commit was produced LOCALLY, and only the
+// push transport failed. WIRE VALUE: byte-identical to the runner's
+// resumeKindPush.
+const resumeKindPush = "push"
+
+// resumeKindPushDiscarded is the report-only kind a runner sends when it
+// PERMANENTLY refuses a served push resume (E45.86 / #3621). It records NO
+// checkpoint; it makes the thrown-away verified tree auditable.
+// WIRE VALUE: byte-identical to the runner's resumeKindPushDiscarded.
+const resumeKindPushDiscarded = "push_discarded"
+
+// runnerCapabilitiesHeader is the request header carrying the RUNNER half of
+// the E45.86 / #3621 capability handshake — a comma-separated token list
+// naming what the requesting runner BINARY understands. Modelled on the
+// X-Fishhawk-Plan-Reachability precedent.
+//
+// WIRE VALUE: byte-identical to the runner's upload.RunnerCapabilitiesHeader.
+// A drift means no request ever advertises, which DISABLES the push resume —
+// the fail-safe direction.
+const runnerCapabilitiesHeader = "X-Fishhawk-Runner-Capabilities"
+
+// capabilityPushResume is the runnerCapabilitiesHeader token for the
+// push-failure resume. WIRE VALUE: byte-identical to the runner's
+// upload.CapabilityPushResume.
+const capabilityPushResume = "push-resume"
+
+// runnerAdvertises reports whether the request's capability header carries
+// token. Comma-separated, space-trimmed, CASE-SENSITIVE (the tokens are wire
+// values, not user text). A nil request or an absent header is false, so an
+// old runner — and every non-runner caller — is treated as not advertising.
+func runnerAdvertises(r *http.Request, token string) bool {
+	if r == nil {
+		return false
+	}
+	for _, raw := range strings.Split(r.Header.Get(runnerCapabilitiesHeader), ",") {
+		if strings.TrimSpace(raw) == token {
+			return true
+		}
+	}
+	return false
+}
 
 // pushCheckpointCategories is the audit-category set resolvePushCheckpointResume
 // walks to find THIS stage's newest terminal implement outcome. It must contain
@@ -4533,6 +4623,7 @@ const resumeKindPROpen = "pr_open"
 // the carrier; the rest are the invalidators.
 var pushCheckpointCategories = []string{
 	"pull_request_failed",
+	CategoryPushResumeCheckpoint,
 	"pull_request_opened",
 	CategoryScopeCompletenessParked,
 	CategoryScopeCompletenessExempted,
@@ -4541,138 +4632,303 @@ var pushCheckpointCategories = []string{
 	"child_pushed",
 }
 
-// resolvePushCheckpointResume is the emission GATE for the PR-OPEN CHECKPOINT
-// resume (#2169), the sibling of resolveHeldCommitExemption above and modelled
-// directly on it. It returns ok=true — and the checkpointed head SHA + branch +
-// base SHA — only when the NEWEST audit entry for THIS stage across
-// pushCheckpointCategories is a `pull_request_failed` carrying a
-// `push_checkpoint` with a non-empty head_sha, branch, AND base_sha.
+// CategoryPushResumeCheckpoint is the audit category a PUSH-KIND checkpoint is
+// recorded under (E45.86 / #3621). It is a SEPARATE category, not a field on
+// the pull_request_failed payload, and that separation is the ROLLBACK
+// PROPERTY the operator required:
 //
-// WHAT IT RECOVERS. The implement agent ran, the committed-tree gates passed,
-// and CommitAndPush pushed the gate-verified commit — and only THEN did the PR
-// open (or the artifact ship) fail, typically a sustained forge outage. Today
-// retry_stage re-runs the whole agent for a ~$4-6, ~50-minute redo of work that
-// is already on the branch. Emitting the held-commit fields sends the runner to
-// its pre-agent short-circuit instead, where it re-attempts only the idempotent
-// adopt-then-create OpenPR (#2167) — which also covers the case where the PR
-// actually opened and only the ship failed (the adopt-by-head arm returns it).
+//	A pre-#3621 backend's resolver walks pull_request_failed and reads
+//	push_checkpoint off it. It does not know this category exists and never
+//	queries it. So a push-kind checkpoint — whose pull_request_failed sibling
+//	carries NO push_checkpoint at all — is INVISIBLE to the old resolver, which
+//	therefore returns no checkpoint and falls back to a full agent re-run.
 //
-// NEWEST-WINS IS WHAT MAKES THE GATE SELF-INVALIDATING. Once a resume succeeds,
-// a `pull_request_opened` entry becomes the newest, so a later retry takes the
-// ordinary agent path rather than re-opening a PR that already exists. Same for
-// a stage that parked, was exempted, or pushed a fix-up after the failure.
+// A resume_kind FIELD on the existing row could not give that guarantee: a
+// reverted backend would ignore the field and serve the row as a pr_open
+// checkpoint, sending the retry to open a PR on a branch that was never pushed.
+const CategoryPushResumeCheckpoint = "push_resume_checkpoint"
+
+// Verdicts newestPushCheckpoint returns. They double as the `reason` values on
+// the verified_tree_discarded audit row, so they are tokens, not prose.
+const (
+	// checkpointResumable: the stage's newest terminal entry IS a complete,
+	// serviceable checkpoint.
+	checkpointResumable = "resumable"
+	// checkpointNone: no carrier at all, or the newest entry is a
+	// pull_request_failed carrying no checkpoint (the ordinary pre-push failure).
+	checkpointNone = "no_checkpoint"
+	// checkpointSuperseded: a carrier exists but a NEWER entry invalidated it —
+	// the PR opened, the stage parked or was exempted, a fix-up or child pushed.
+	checkpointSuperseded = "checkpoint_superseded"
+	// checkpointIncomplete: the newest entry is a carrier but a required
+	// coordinate is missing.
+	checkpointIncomplete = "incomplete_checkpoint"
+)
+
+// pushCheckpointPayload is the decoded checkpoint plus the kind that carried
+// it. VerifiedTreeSHA is populated for BOTH kinds (the #2169 payload has
+// carried it since it existed) — it is what the verified_tree_discarded audit
+// row names when a retry throws the tree away.
+type pushCheckpointPayload struct {
+	Branch          string
+	HeadSHA         string
+	BaseSHA         string
+	VerifiedTreeSHA string
+	PRTitle         string
+	PRBody          string
+	ResumeKind      string
+}
+
+// checkpointEnvelope is the JSON shape BOTH carriers use. Sharing it is what
+// keeps the two categories' payloads decodable by one path.
+type checkpointEnvelope struct {
+	PushCheckpoint *struct {
+		Branch          string `json:"branch"`
+		HeadSHA         string `json:"head_sha"`
+		BaseSHA         string `json:"base_sha"`
+		VerifiedTreeSHA string `json:"verified_tree_sha"`
+		// #2570: the agent-authored PR text the checkpoint carried, so the
+		// resume opens a real pull request. Absent on every pre-#2570
+		// checkpoint, where heldCommitPRTitleBody synthesizes instead.
+		PRTitle string `json:"pr_title"`
+		PRBody  string `json:"pr_body"`
+	} `json:"push_checkpoint"`
+}
+
+// newestPushCheckpoint is the SINGLE newest-wins walk behind both the prompt
+// resume gate and the retry-side supersede/discard decision (E45.86 / #3621) —
+// one walk, not two, so the two gates can never disagree about what the stage's
+// newest terminal outcome is.
 //
-// BASE SHA IS REQUIRED, not optional. The backend's success-arm validate()
-// requires base_sha on the shipped artifact, so a resume without one would open
-// the PR and then always fail category-B, orphaning it — the #2563/#2562 defect,
-// which the runner now refuses BEFORE the forge. Failing closed here keeps the
-// two layers agreeing instead of relying on the runner's last-line guard.
+// It returns the newest CARRIER's decoded payload (so a caller can name the
+// verified tree even when the checkpoint is not serviceable) together with the
+// verdict from the newest-wins rule:
 //
-// FAIL-CLOSED on every uncertain branch (WARN-log where a real anomaly is
-// implied, silent where the state is simply ordinary): a nil stage, a
-// non-implement stage, a FIXUP dispatch (a fix-up MUST re-invoke the agent —
-// resuming would skip the very fix the operator requested), a nil AuditRepo, any
-// ListForRunByCategory error, no entry for this stage, a newest entry that is
-// not a checkpoint-bearing pull_request_failed, or an undecodable payload. The
-// cost of a wrong emission is a PR opened from an unintended head; the cost of a
-// wrong omission is today's agent re-run. Those are not symmetric.
-func (s *Server) resolvePushCheckpointResume(ctx context.Context, runRow *run.Run, stage *run.Stage, fixup bool) (heldCommitResume, bool) {
+//   - checkpointResumable — the newest entry across every category IS the
+//     carrier and every required coordinate is present.
+//   - checkpointIncomplete — the newest entry is the carrier but a coordinate
+//     is missing.
+//   - checkpointSuperseded — a carrier exists but something newer invalidated it.
+//   - checkpointNone — no carrier, or the newest entry is a checkpoint-less
+//     pull_request_failed (the ordinary pre-push failure), or the state is
+//     undecidable (nil audit repo, list error, undecodable payload). Every
+//     undecidable branch maps here so callers FAIL SAFE toward today's behavior.
+func (s *Server) newestPushCheckpoint(ctx context.Context, runID, stageID uuid.UUID) (pushCheckpointPayload, string) {
+	if s.cfg.AuditRepo == nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"prompt: audit repository unconfigured; omitting push-checkpoint resume fields",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()))
+		return pushCheckpointPayload{}, checkpointNone
+	}
+	// Two things in one pass: `newest` is the newest entry across EVERY category
+	// (the invalidators included), `newestCarrier` the newest entry of a category
+	// that can CARRY a checkpoint. Requiring the two to be the SAME entry IS the
+	// newest-wins rule, and keeping them separate is what makes the rule
+	// load-bearing rather than incidentally satisfied.
+	var newest, newestCarrier *audit.Entry
+	var newestCarrierCat string
+	for _, cat := range pushCheckpointCategories {
+		entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, cat)
+		if err != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+				"prompt: list audit entries failed; omitting push-checkpoint resume fields",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+				slog.String("category", cat),
+				slog.String("error", err.Error()))
+			return pushCheckpointPayload{}, checkpointNone
+		}
+		for _, e := range entries {
+			if e.StageID == nil || *e.StageID != stageID {
+				continue
+			}
+			if newest == nil || e.Sequence > newest.Sequence {
+				newest = e
+			}
+			if (cat == "pull_request_failed" || cat == CategoryPushResumeCheckpoint) &&
+				(newestCarrier == nil || e.Sequence > newestCarrier.Sequence) {
+				newestCarrier = e
+				newestCarrierCat = cat
+			}
+		}
+	}
+	if newestCarrier == nil {
+		return pushCheckpointPayload{}, checkpointNone
+	}
+	var env checkpointEnvelope
+	if err := json.Unmarshal(newestCarrier.Payload, &env); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"prompt: checkpoint payload undecodable; omitting push-checkpoint resume fields",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("category", newestCarrierCat),
+			slog.String("error", err.Error()))
+		return pushCheckpointPayload{}, checkpointNone
+	}
+	if env.PushCheckpoint == nil {
+		// The ordinary pre-push failure: nothing was pushed, so there is nothing
+		// to resume. Not an anomaly — no WARN.
+		return pushCheckpointPayload{}, checkpointNone
+	}
+	cp := env.PushCheckpoint
+	kind := resumeKindPROpen
+	if newestCarrierCat == CategoryPushResumeCheckpoint {
+		kind = resumeKindPush
+	}
+	out := pushCheckpointPayload{
+		Branch: cp.Branch, HeadSHA: cp.HeadSHA, BaseSHA: cp.BaseSHA,
+		VerifiedTreeSHA: cp.VerifiedTreeSHA,
+		PRTitle:         cp.PRTitle, PRBody: cp.PRBody,
+		ResumeKind: kind,
+	}
+	// NEWEST-WINS. A carrier that is no longer this stage's newest terminal
+	// outcome has been superseded — the PR opened, the stage parked or was
+	// exempted, a fix-up or child push landed — so its checkpoint is stale.
+	// Self-invalidating by construction: a successful resume writes
+	// pull_request_opened, which makes this comparison fail next time.
+	if newest != newestCarrier {
+		return out, checkpointSuperseded
+	}
+	// BASE SHA IS REQUIRED, not optional. The backend's success-arm validate()
+	// requires base_sha on the shipped artifact, so a resume without one would
+	// open the PR and then always fail category-B, orphaning it — the
+	// #2563/#2562 defect.
+	if cp.HeadSHA == "" || cp.Branch == "" || cp.BaseSHA == "" {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"prompt: push_checkpoint incomplete; omitting push-checkpoint resume fields",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()))
+		return out, checkpointIncomplete
+	}
+	return out, checkpointResumable
+}
+
+// resolvePushCheckpointResume is the emission GATE for the held-commit
+// CHECKPOINT resume, the sibling of resolveHeldCommitExemption above. It serves
+// two kinds:
+//
+//   - resumeKindPROpen (#2169) — the stage committed and PUSHED and then failed
+//     opening the PR or shipping the artifact. The retry re-attempts only the
+//     idempotent adopt-then-create OpenPR (#2167) from the pushed head.
+//   - resumeKindPush (E45.86 / #3621) — the stage committed, the gates passed,
+//     and only the PUSH failed. The retry publishes the held commit and then
+//     opens the PR. This kind is CAPABILITY-GATED.
+//
+// THE CAPABILITY GATE IS A TOTAL DECLINE, NOT A DEGRADE. A runner that did not
+// advertise capabilityPushResume is served NO held-commit fields at all for a
+// push-kind checkpoint — never a downgraded pr_open, which would send it to
+// open a PR on a branch that was never pushed (the wrong-commit bug). The retry
+// is then an ordinary agent re-run, exactly as today, and the decline is
+// AUDITED (verified_tree_discarded) on the dispatch path so no recorded
+// verified tree is thrown away silently.
+//
+// recordDrop selects the DISPATCH path (handleGetStagePrompt, true) over the
+// preview render (handleGetStagePromptRender, false): only a real dispatch may
+// write the decline audit row, so previewing a stage never mutates the chain.
+//
+// FAIL-CLOSED on every uncertain branch: a nil stage, a non-implement stage, a
+// FIXUP dispatch (a fix-up MUST re-invoke the agent), any undecidable audit
+// state, an incomplete checkpoint, a push kind with no verified tree, or an
+// unrecognized kind. The cost of a wrong emission is a PR opened from an
+// unintended head; the cost of a wrong omission is today's agent re-run. Those
+// are not symmetric.
+func (s *Server) resolvePushCheckpointResume(ctx context.Context, runRow *run.Run, stage *run.Stage, fixup bool, runnerAdvertisesPushResume, recordDrop bool) (heldCommitResume, bool) {
 	if stage == nil || stage.Type != run.StageTypeImplement {
 		return heldCommitResume{}, false
 	}
 	if fixup {
 		return heldCommitResume{}, false
 	}
-	if s.cfg.AuditRepo == nil {
+	cp, verdict := s.newestPushCheckpoint(ctx, runRow.ID, stage.ID)
+	if verdict != checkpointResumable {
+		return heldCommitResume{}, false
+	}
+	decline := func(reason string) (heldCommitResume, bool) {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
-			"prompt: audit repository unconfigured; omitting push-checkpoint resume fields",
-			slog.String("run_id", runRow.ID.String()),
-			slog.String("stage_id", stage.ID.String()))
-		return heldCommitResume{}, false
-	}
-	// Two walks in one pass: `newest` is the newest entry across EVERY category
-	// (the invalidators included), `newestFailed` the newest pull_request_failed
-	// (the only category that can CARRY a checkpoint). The gate reads the
-	// checkpoint off newestFailed and then requires the two to be the SAME entry
-	// — that identity IS the newest-wins rule, and keeping them separate is what
-	// makes the rule load-bearing rather than incidentally satisfied.
-	var newest, newestFailed *audit.Entry
-	for _, cat := range pushCheckpointCategories {
-		entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runRow.ID, cat)
-		if err != nil {
-			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
-				"prompt: list audit entries failed; omitting push-checkpoint resume fields",
-				slog.String("run_id", runRow.ID.String()),
-				slog.String("stage_id", stage.ID.String()),
-				slog.String("category", cat),
-				slog.String("error", err.Error()))
-			return heldCommitResume{}, false
-		}
-		for _, e := range entries {
-			if e.StageID == nil || *e.StageID != stage.ID {
-				continue
-			}
-			if newest == nil || e.Sequence > newest.Sequence {
-				newest = e
-			}
-			if cat == "pull_request_failed" && (newestFailed == nil || e.Sequence > newestFailed.Sequence) {
-				newestFailed = e
-			}
-		}
-	}
-	if newestFailed == nil {
-		return heldCommitResume{}, false
-	}
-	// NEWEST-WINS. A pull_request_failed that is no longer this stage's newest
-	// terminal outcome has been superseded — the PR opened, the stage parked or
-	// was exempted, a fix-up or child push landed — so its checkpoint is stale
-	// and resuming from it would re-open a PR (or open one from a head the run
-	// has moved past). Self-invalidating by construction: a successful resume
-	// writes pull_request_opened, which makes this comparison fail next time.
-	if newest != newestFailed {
-		return heldCommitResume{}, false
-	}
-	var payload struct {
-		PushCheckpoint *struct {
-			Branch  string `json:"branch"`
-			HeadSHA string `json:"head_sha"`
-			BaseSHA string `json:"base_sha"`
-			// #2570: the agent-authored PR text the checkpoint carried, so the
-			// resume opens a real pull request. Absent on every pre-#2570
-			// checkpoint, where heldCommitPRTitleBody synthesizes instead.
-			PRTitle string `json:"pr_title"`
-			PRBody  string `json:"pr_body"`
-		} `json:"push_checkpoint"`
-	}
-	if err := json.Unmarshal(newestFailed.Payload, &payload); err != nil {
-		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
-			"prompt: pull_request_failed payload undecodable; omitting push-checkpoint resume fields",
+			"prompt: declining push-kind checkpoint resume",
 			slog.String("run_id", runRow.ID.String()),
 			slog.String("stage_id", stage.ID.String()),
-			slog.String("error", err.Error()))
+			slog.String("reason", reason))
+		if recordDrop {
+			s.appendVerifiedTreeDiscarded(ctx, runRow.ID, stage.ID, cp, reason)
+		}
 		return heldCommitResume{}, false
 	}
-	if payload.PushCheckpoint == nil {
-		// The ordinary pre-push failure: nothing was pushed, so there is nothing
-		// to resume. Not an anomaly — no WARN.
-		return heldCommitResume{}, false
-	}
-	cp := payload.PushCheckpoint
-	if cp.HeadSHA == "" || cp.Branch == "" || cp.BaseSHA == "" {
-		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
-			"prompt: push_checkpoint incomplete; omitting push-checkpoint resume fields",
-			slog.String("run_id", runRow.ID.String()),
-			slog.String("stage_id", stage.ID.String()))
-		return heldCommitResume{}, false
+	switch cp.ResumeKind {
+	case resumeKindPROpen:
+		// Unchanged by #3621 and UNAFFECTED by the capability flag: every
+		// pre-existing checkpoint is a post-push one, and this is what keeps the
+		// #2169 path byte-identical.
+	case resumeKindPush:
+		if !runnerAdvertisesPushResume {
+			return decline("runner_capability_absent")
+		}
+		if cp.VerifiedTreeSHA == "" {
+			return decline("verified_tree_missing")
+		}
+	default:
+		// A kind this build does not implement is a version anomaly. Refuse
+		// outright rather than guess.
+		return decline("unknown_resume_kind")
 	}
 	// #2570: resolve the PR text off the same checkpoint payload. Empty recovered
 	// fields fall through to the issue-context synthesis; nothing here can
 	// withhold the resume.
 	title, body := heldCommitPRTitleBody(runRow, cp.PRTitle, cp.PRBody)
-	return heldCommitResume{
+	held := heldCommitResume{
 		sha: cp.HeadSHA, branch: cp.Branch, baseSHA: cp.BaseSHA,
 		prTitle: title, prBody: body,
-	}, true
+		resumeKind: cp.ResumeKind,
+	}
+	if cp.ResumeKind == resumeKindPush {
+		held.verifiedTreeSHA = cp.VerifiedTreeSHA
+	}
+	return held, true
+}
+
+// appendVerifiedTreeDiscarded records that a gate-verified tree recorded on a
+// checkpoint is being thrown away and the work will be redone by a full agent
+// re-run (E45.86 / #3621, operator condition 2). It is the accounting row for
+// the ~$3/~8-minute cost of a discard: no path may drop a recorded verified
+// tree without one.
+//
+// Best-effort / warn-only: neither a prompt dispatch nor a retry may fail
+// because the diagnostic could not be written. Inert when the checkpoint
+// carried no verified tree — there is then nothing being discarded.
+//
+// DELIBERATELY NOT in backend/internal/issuecomment's activityCategories: it is
+// a per-retry cost diagnostic for the audit chain, and rendering it would post
+// an issue comment on every non-resumable retry.
+func (s *Server) appendVerifiedTreeDiscarded(ctx context.Context, runID, stageID uuid.UUID, cp pushCheckpointPayload, reason string) {
+	if s.cfg.AuditRepo == nil || cp.VerifiedTreeSHA == "" {
+		return
+	}
+	payload, err := json.Marshal(map[string]any{
+		"run_id":            runID.String(),
+		"stage_id":          stageID.String(),
+		"verified_tree_sha": cp.VerifiedTreeSHA,
+		"head_sha":          cp.HeadSHA,
+		"branch":            cp.Branch,
+		"reason":            reason,
+	})
+	if err != nil {
+		return
+	}
+	sid := stageID
+	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   &sid,
+		Timestamp: time.Now().UTC(),
+		Category:  "verified_tree_discarded",
+		Payload:   payload,
+	}); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"append verified_tree_discarded failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()))
+	}
 }
 
 // resolveNewestReportedHeadSHA is the shared reported-head ledger walk behind

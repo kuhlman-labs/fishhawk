@@ -229,6 +229,36 @@ func (*BuildRequiredDriftError) Unwrap() error { return ErrCommittedTestsFailed 
 // ErrCommitWouldNotCompile / ErrCommittedTestsFailed.
 var ErrPushedTreeNotVerified = errors.New("gitops: pushed tree was not verified by the committed-tree gates")
 
+// ErrPushFailed is the PUSH-TRANSPORT sentinel (E45.86 / #3621): the
+// gate-verified commit exists LOCALLY and every pre-push step succeeded — the
+// stage, the commit, the VerifyCommit hook, the lease observation — and only
+// `git push` itself failed. It is wrapped at the ONE push site in
+// CommitAndPush, so a caller can distinguish "the tree is committed and the
+// transport failed" (resumable: the retry can publish the same commit without
+// re-invoking the agent) from every pre-commit and gate failure (not
+// resumable: there is no commit to publish).
+//
+// DELIBERATELY NOT wrapped around the lease-observing ls-remote error
+// ("gitops: observe remote head for lease"), which fires BEFORE the push: that
+// one CAN mean the remote branch genuinely moved, and conflating the two would
+// let a lease rejection claim a resumable checkpoint.
+//
+// Classification is unchanged: pushFailureCategory's default arm already
+// returns "C" for a push transport fault, and this sentinel adds no new arm.
+var ErrPushFailed = errors.New("gitops: push to the run branch failed")
+
+// pushFailedError carries the ORIGINAL push error text unchanged while ALSO
+// satisfying errors.Is(err, ErrPushFailed). A plain
+// fmt.Errorf("%w", errors.Join(...)) would splice the sentinel's own sentence
+// into the message and move every assertion that matches on the push error's
+// text; a multi-error Unwrap keeps the string byte-identical and adds only the
+// classification.
+type pushFailedError struct{ err error }
+
+func (e *pushFailedError) Error() string { return e.err.Error() }
+
+func (e *pushFailedError) Unwrap() []error { return []error{e.err, ErrPushFailed} }
+
 // ErrFixupWorkStranded is the category-B sentinel for a fix-up pass that
 // reported no changes while leaving its work behind rather than on the branch
 // (#2884, run 8ae65577). The stranding shapes are a net-new stash entry (a
@@ -922,7 +952,12 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 	if err := p.authedRemoteOp(ctx, args, auth, func(env []string) error {
 		return p.runEnv(ctx, args.RepoDir, env, pushArgs...)
 	}); err != nil {
-		return nil, fmt.Errorf("gitops: push %s: %w", remote, err)
+		// E45.86 / #3621: name the transport failure with ErrPushFailed so the
+		// caller can arm a push-resume checkpoint. The error STRING is unchanged
+		// ("gitops: push <remote>: <err>") — only an additional sentinel is joined
+		// in — so every assertion on the prefix and every pushFailureCategory
+		// classification behaves exactly as before.
+		return nil, &pushFailedError{err: fmt.Errorf("gitops: push %s: %w", remote, err)}
 	}
 
 	// Materialize the local remote-tracking ref to the just-pushed HEAD

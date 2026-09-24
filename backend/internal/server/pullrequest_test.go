@@ -3792,3 +3792,136 @@ func TestShipPullRequest_AcceptanceScenarioRetirementDropped_RendersOnStatusComm
 		}
 	}
 }
+
+// prFailedAllEntries drives a failure report through the REAL /pull-request
+// handler and returns EVERY audit entry it appended, so a test can assert both
+// what WAS and what was NOT recorded — which is the whole point of the E45.86 /
+// #3621 separate-category design.
+func prFailedAllEntries(t *testing.T, body []byte) []audit.ChainAppendParams {
+	t.Helper()
+	s, sf, _, au, rr := newPRServerWithOrch(t)
+	runRow := rr.seedRun()
+	implStage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
+	implStage.Type = run.StageTypeImplement
+	implStage.RequiresApproval = true
+	priv, _ := sf.issue(t, runRow.ID)
+
+	w := shipPRRequest(t, s, runRow.ID, implStage.ID, priv, body, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	return append([]audit.ChainAppendParams(nil), au.appended...)
+}
+
+func entriesByCategory(entries []audit.ChainAppendParams, category string) []audit.ChainAppendParams {
+	var out []audit.ChainAppendParams
+	for _, e := range entries {
+		if e.Category == category {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// TestPullRequestFailed_PushKindRecordedUnderSeparateCategory is operator
+// condition 1's recording half. A resume_kind:"push" report must:
+//
+//   - record its coordinates under CategoryPushResumeCheckpoint, and
+//   - record NO push_checkpoint on the pull_request_failed entry,
+//
+// so a REVERTED backend — whose resolver knows only pull_request_failed — finds
+// nothing and falls back to a full agent re-run rather than opening a PR on a
+// branch that was never pushed.
+func TestPullRequestFailed_PushKindRecordedUnderSeparateCategory(t *testing.T) {
+	body, err := json.Marshal(map[string]any{
+		"outcome": "failed", "category": "C", "reason": "commit+push: gitops: push origin: 503",
+		"branch": "fishhawk/run-3621/stage-abc", "head_sha": "headsha3621",
+		"base_sha": "basesha3621", "verified_tree_sha": "treesha3621",
+		"resume_kind": "push",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := prFailedAllEntries(t, body)
+
+	failed := entriesByCategory(entries, "pull_request_failed")
+	if len(failed) != 1 {
+		t.Fatalf("want exactly one pull_request_failed entry, got %d", len(failed))
+	}
+	var legacy map[string]json.RawMessage
+	if err := json.Unmarshal(failed[0].Payload, &legacy); err != nil {
+		t.Fatal(err)
+	}
+	if raw, ok := legacy["push_checkpoint"]; ok {
+		t.Fatalf("a push-kind report must record NO push_checkpoint on pull_request_failed "+
+			"(a reverted backend would read it as pr_open), got %s", raw)
+	}
+
+	cps := entriesByCategory(entries, CategoryPushResumeCheckpoint)
+	if len(cps) != 1 {
+		t.Fatalf("want exactly one %s entry, got %d (%+v)", CategoryPushResumeCheckpoint, len(cps), entries)
+	}
+	var carrier struct {
+		ResumeKind     string `json:"resume_kind"`
+		PushCheckpoint struct {
+			Branch          string `json:"branch"`
+			HeadSHA         string `json:"head_sha"`
+			BaseSHA         string `json:"base_sha"`
+			VerifiedTreeSHA string `json:"verified_tree_sha"`
+		} `json:"push_checkpoint"`
+	}
+	if err := json.Unmarshal(cps[0].Payload, &carrier); err != nil {
+		t.Fatal(err)
+	}
+	if carrier.ResumeKind != resumeKindPush {
+		t.Errorf("resume_kind = %q, want %q", carrier.ResumeKind, resumeKindPush)
+	}
+	if carrier.PushCheckpoint.HeadSHA != "headsha3621" ||
+		carrier.PushCheckpoint.Branch != "fishhawk/run-3621/stage-abc" ||
+		carrier.PushCheckpoint.BaseSHA != "basesha3621" ||
+		carrier.PushCheckpoint.VerifiedTreeSHA != "treesha3621" {
+		t.Errorf("checkpoint = %+v, want the reported coordinates", carrier.PushCheckpoint)
+	}
+}
+
+// TestPullRequestFailed_PushDiscardedAuditsTheTree is operator condition 2's
+// consume-side half: a PERMANENT refusal report records NO checkpoint of either
+// kind and instead appends verified_tree_discarded naming the tree, so no path
+// throws away a recorded verified tree without an accounting row.
+func TestPullRequestFailed_PushDiscardedAuditsTheTree(t *testing.T) {
+	body, err := json.Marshal(map[string]any{
+		"outcome": "failed", "category": "C",
+		"reason": "held_commit_absent: held commit is not present locally",
+		"branch": "fishhawk/run-3621/stage-abc", "head_sha": "headsha3621",
+		"base_sha": "basesha3621", "verified_tree_sha": "treesha3621",
+		"resume_kind": "push_discarded",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := prFailedAllEntries(t, body)
+
+	if cps := entriesByCategory(entries, CategoryPushResumeCheckpoint); len(cps) != 0 {
+		t.Errorf("a permanently-refused resume must arm NO checkpoint, got %+v", cps)
+	}
+	failed := entriesByCategory(entries, "pull_request_failed")
+	if len(failed) != 1 {
+		t.Fatalf("want one pull_request_failed entry, got %d", len(failed))
+	}
+	var legacy map[string]json.RawMessage
+	if err := json.Unmarshal(failed[0].Payload, &legacy); err != nil {
+		t.Fatal(err)
+	}
+	if raw, ok := legacy["push_checkpoint"]; ok {
+		t.Errorf("a discard report must record NO push_checkpoint, got %s", raw)
+	}
+	discarded := entriesByCategory(entries, "verified_tree_discarded")
+	if len(discarded) != 1 {
+		t.Fatalf("want exactly one verified_tree_discarded entry, got %d (%+v)", len(discarded), entries)
+	}
+	if !strings.Contains(string(discarded[0].Payload), "treesha3621") {
+		t.Errorf("the discard row must name the tree SHA, got %s", discarded[0].Payload)
+	}
+}
