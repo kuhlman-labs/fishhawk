@@ -175,7 +175,15 @@ import "sort"
 // landed (server/reap_failure.go); its liveness is decided by sequence against
 // the stage's newest acceptance_dispatched/acceptance_reopened anchor and any
 // later acceptance_outcome_recorded entry, and fishhawk_await_audit reads it.
-// When a new
+// E45.84 / #3619 added
+// concern_auto_closed, the implement re-review's marker for a routed concern
+// (addressed_pending) CLOSED because a COMPLETE, unanimously non-reject review
+// round re-judged the post-fix-up tree and said nothing about it — the case no
+// reviewer `confirmed` entry covers, which previously left the concern open
+// forever. It is INTERNAL and advisory (system actor, no issue comment, no
+// Notifier method): it carries the closing round's reviewer models and review
+// sequences plus the basis (clean_re_review_round), so an operator reading the
+// settled ledger can tell an auto-close from a reviewer confirm. When a new
 // canonical category is introduced, add it here so
 // operators can await it without the allow_unknown escape hatch;
 // categories_completeness_test.go's AST sweep fails the build if a
@@ -230,6 +238,7 @@ var KnownCategories = map[string]struct{}{
 	"clarification_answered":                  {},
 	"clarification_requested":                 {},
 	"concern_addressed_by_condition":          {},
+	"concern_auto_closed":                     {},
 	"concern_defer_failed":                    {},
 	"concern_deferred":                        {},
 	"concern_note_backfilled":                 {},

@@ -13037,3 +13037,650 @@ func TestMissingTraceUploadDeps_NamesTheNilOne(t *testing.T) {
 		})
 	}
 }
+
+// ---------------------------------------------------------------------------
+// E45.84 / #3619 — auto-closing a routed concern a CLEAN re-review round
+// re-judged and said nothing about.
+//
+// Every case seeds bad state BY CONSTRUCTION (a real routed concern via
+// seedRoutedConcern, then round literals) and asserts COMMITTED STATE — the row
+// re-read through the repository after the call — because the pass returns
+// nothing and its whole effect IS the state it did or did not write.
+// ---------------------------------------------------------------------------
+
+// autoCloseRound builds one buffered reviewer verdict for the auto-close pass.
+// A nil/empty resolutions slice is the SILENT reviewer this feature is about.
+func autoCloseRound(model string, seq int64, verdict planreview.Verdict, res ...planreview.ConcernResolution) roundReviewVerdict {
+	return roundReviewVerdict{
+		model:          model,
+		verdict:        verdict,
+		resolutions:    res,
+		reviewSequence: seq,
+		review:         planreview.ReviewVerdict{Verdict: verdict, ConcernResolutions: res},
+	}
+}
+
+// autoCloseRoundRaising is autoCloseRound plus the verdict's OWN fresh
+// concerns, the settled_ref re-raise source.
+func autoCloseRoundRaising(model string, seq int64, verdict planreview.Verdict, concerns ...planreview.Concern) roundReviewVerdict {
+	return roundReviewVerdict{
+		model:          model,
+		verdict:        verdict,
+		reviewSequence: seq,
+		review:         planreview.ReviewVerdict{Verdict: verdict, Concerns: concerns},
+	}
+}
+
+// autoClosedEntries decodes every concern_auto_closed entry appended in a test.
+func autoClosedEntries(t *testing.T, au *auditFake) []concernAutoClosedPayload {
+	t.Helper()
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var out []concernAutoClosedPayload
+	for _, ap := range au.appended {
+		if ap.Category != concernAutoClosedCategory {
+			continue
+		}
+		var p concernAutoClosedPayload
+		if err := json.Unmarshal(ap.Payload, &p); err != nil {
+			t.Fatalf("decode %s payload: %v", concernAutoClosedCategory, err)
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// seedPushedFixupPass seeds the audit shape of a routing pass that PUSHED: a
+// stage_fixup_triggered naming the concern with NO operator_evidence, followed
+// by a fixup_pushed. Both evidence arms therefore read clean and the lookup
+// succeeds, so vetoReason returns "" for the row — which is what lets a test
+// isolate a NON-veto guard.
+func seedPushedFixupPass(t *testing.T, au *auditFake, runID, stageID, concernID uuid.UUID) {
+	t.Helper()
+	seedStageAuditEntry(t, au, runID, stageID, 10, CategoryStageFixupTriggered, map[string]any{
+		"concern_ids": []string{concernID.String()},
+	})
+	seedStageAuditEntry(t, au, runID, stageID, 11, "fixup_pushed", map[string]any{"head_sha": "abc123"})
+}
+
+// TestAutoCloseUnjudgedRoutedConcerns_CleanRoundClosesRoutedConcern is the
+// DONE-MEANS pin: it fails on unchanged code, because before this change
+// nothing but an explicit `confirmed` resolution wrote StateAddressed.
+func TestAutoCloseUnjudgedRoutedConcerns_CleanRoundClosesRoutedConcern(t *testing.T) {
+	ctx := context.Background()
+	s, au, cr, runID, stageID := vetoRoundServer()
+	row := seedRoutedConcern(t, cr, runID, stageID, "gpt-5.6-sol", "the handler still trusts the caller subject", "routing reason: fix the authz check")
+	seedPushedFixupPass(t, au, runID, stageID, row.ID)
+
+	s.autoCloseUnjudgedRoutedConcerns(ctx, runID, stageID, []roundReviewVerdict{
+		autoCloseRound("gpt-5.6-sol", 200, planreview.VerdictApprove),
+		autoCloseRound("fable-5", 201, planreview.VerdictApproveWithConcerns),
+	}, 2, "deadbeef")
+
+	got := concernRowAfterRound(t, cr, row.ID)
+	if got.State != concern.StateAddressed {
+		t.Fatalf("state = %q, want addressed — a clean round that re-judged the tree and said nothing closes the routed concern", got.State)
+	}
+	for _, want := range []string{autoCloseBasisCleanReReview, "gpt-5.6-sol", "fable-5", "200", "201", "[verified at deadbeef]"} {
+		if !strings.Contains(got.StateReason, want) {
+			t.Errorf("state_reason = %q, want it to name %q", got.StateReason, want)
+		}
+	}
+	entries := autoClosedEntries(t, au)
+	if len(entries) != 1 {
+		t.Fatalf("%s entries = %d, want exactly 1", concernAutoClosedCategory, len(entries))
+	}
+	e := entries[0]
+	if e.ConcernID != row.ID.String() || e.Basis != autoCloseBasisCleanReReview {
+		t.Errorf("payload = %+v, want the concern id and the clean_re_review_round basis", e)
+	}
+	if !slices.Equal(e.ClosingReviewerModels, []string{"gpt-5.6-sol", "fable-5"}) {
+		t.Errorf("closing_reviewer_models = %v, want both round reviewers", e.ClosingReviewerModels)
+	}
+	if !slices.Equal(e.ClosingReviewSequences, []int64{200, 201}) {
+		t.Errorf("closing_review_sequences = %v, want [200 201]", e.ClosingReviewSequences)
+	}
+	if e.OriginReviewSequence != row.OriginReviewSequence || e.RaisingReviewerModel != "gpt-5.6-sol" {
+		t.Errorf("payload = %+v, want the row's origin sequence and raising model", e)
+	}
+	if e.ReviewedHeadSHA != "deadbeef" {
+		t.Errorf("reviewed_head_sha = %q, want deadbeef", e.ReviewedHeadSHA)
+	}
+	if v := vetoEntries(t, au); len(v) != 0 {
+		t.Errorf("%s entries = %+v, want none", concernResolutionVetoedCategory, v)
+	}
+}
+
+// Control for the #2884 head stamp: an empty reviewed head leaves the reason
+// free of the suffix rather than emitting an empty one.
+func TestAutoCloseUnjudgedRoutedConcerns_EmptyHeadSHAOmitsVerifiedSuffix(t *testing.T) {
+	ctx := context.Background()
+	s, au, cr, runID, stageID := vetoRoundServer()
+	row := seedRoutedConcern(t, cr, runID, stageID, "gpt-5.6-sol", "note", "routed")
+	seedPushedFixupPass(t, au, runID, stageID, row.ID)
+
+	s.autoCloseUnjudgedRoutedConcerns(ctx, runID, stageID, []roundReviewVerdict{
+		autoCloseRound("fable-5", 200, planreview.VerdictApprove),
+	}, 1, "")
+
+	got := concernRowAfterRound(t, cr, row.ID)
+	if got.State != concern.StateAddressed {
+		t.Fatalf("state = %q, want addressed", got.State)
+	}
+	if strings.Contains(got.StateReason, "verified at") {
+		t.Errorf("state_reason = %q, want no head stamp when the round carried no head", got.StateReason)
+	}
+}
+
+// GUARD (c): ROUND NOT CLEAN. Delete the VerdictReject check in
+// autoCloseUnjudgedRoutedConcerns and this goes RED on the state assertion.
+func TestAutoCloseUnjudgedRoutedConcerns_RejectInRound_NotClosed(t *testing.T) {
+	ctx := context.Background()
+	s, au, cr, runID, stageID := vetoRoundServer()
+	row := seedRoutedConcern(t, cr, runID, stageID, "gpt-5.6-sol", "note", "routing reason")
+	seedPushedFixupPass(t, au, runID, stageID, row.ID)
+
+	s.autoCloseUnjudgedRoutedConcerns(ctx, runID, stageID, []roundReviewVerdict{
+		autoCloseRound("fable-5", 200, planreview.VerdictApprove),
+		autoCloseRound("claude-opus-4-8", 201, planreview.VerdictReject),
+	}, 2, "")
+
+	got := concernRowAfterRound(t, cr, row.ID)
+	if got.State != concern.StateAddressedPending {
+		t.Errorf("state = %q, want addressed_pending — a round carrying a reject is not evidence the tree was fixed", got.State)
+	}
+	if got.StateReason != "routing reason" {
+		t.Errorf("state_reason = %q, want the routing reason intact", got.StateReason)
+	}
+	if n := len(autoClosedEntries(t, au)); n != 0 {
+		t.Errorf("%s entries = %d, want 0", concernAutoClosedCategory, n)
+	}
+}
+
+// GUARD (b): ROUND INCOMPLETE — a dispatched reviewer produced no buffered
+// verdict (it failed, timed out, its append failed, or it was retry-superseded).
+// Delete the len(round) != dispatchedInvocations check and this goes RED.
+func TestAutoCloseUnjudgedRoutedConcerns_IncompleteRound_NotClosed(t *testing.T) {
+	ctx := context.Background()
+	s, au, cr, runID, stageID := vetoRoundServer()
+	row := seedRoutedConcern(t, cr, runID, stageID, "gpt-5.6-sol", "note", "routing reason")
+	seedPushedFixupPass(t, au, runID, stageID, row.ID)
+
+	s.autoCloseUnjudgedRoutedConcerns(ctx, runID, stageID, []roundReviewVerdict{
+		autoCloseRound("fable-5", 200, planreview.VerdictApprove),
+	}, 2, "")
+
+	if got := concernRowAfterRound(t, cr, row.ID); got.State != concern.StateAddressedPending {
+		t.Errorf("state = %q, want addressed_pending — one of two dispatched reviewers never spoke", got.State)
+	}
+	if n := len(autoClosedEntries(t, au)); n != 0 {
+		t.Errorf("%s entries = %d, want 0", concernAutoClosedCategory, n)
+	}
+}
+
+// TestAutoCloseUnjudgedRoutedConcerns_UnknownResolutionNotClosed is the
+// judgedIDs COUNTERFACTUAL VEHICLE (operator binding condition 1). judgedIDs is
+// the ONLY guard standing: the row is addressed_pending, the routing carried NO
+// operator evidence, the pass PUSHED (so the no-change arm is silent), the
+// evidence lookup succeeds (so the fail-closed arm is silent), the round is
+// complete and unanimously non-reject, and the reviewer names the row's id with
+// an UNKNOWN resolution value — which applyConcernResolutions refuses at its
+// `default:` arm (warn "unknown resolution"), so no explicit judgment lands and
+// nothing but the judgedIDs exclusion keeps the row open. Deleting that
+// exclusion reddens THIS test on the state assertion.
+func TestAutoCloseUnjudgedRoutedConcerns_UnknownResolutionNotClosed(t *testing.T) {
+	ctx := context.Background()
+	s, au, cr, runID, stageID := vetoRoundServer()
+	row := seedRoutedConcern(t, cr, runID, stageID, "gpt-5.6-sol", "note", "routing reason")
+	seedPushedFixupPass(t, au, runID, stageID, row.ID)
+	round := []roundReviewVerdict{
+		autoCloseRound("fable-5", 200, planreview.VerdictApprove,
+			planreview.ConcernResolution{ID: row.ID.String(), Resolution: "partially_fixed", Note: "n"}),
+	}
+
+	// Run the REAL production ordering: the explicit resolutions first (which
+	// refuse this entry outright), then the auto-close.
+	s.applyRoundConcernResolutions(ctx, runID, stageID, round, "")
+	s.autoCloseUnjudgedRoutedConcerns(ctx, runID, stageID, round, 1, "")
+
+	got := concernRowAfterRound(t, cr, row.ID)
+	if got.State != concern.StateAddressedPending {
+		t.Errorf("state = %q, want addressed_pending — a round that NAMED the concern made an explicit judgment; the implicit close must not second-guess it", got.State)
+	}
+	if got.StateReason != "routing reason" {
+		t.Errorf("state_reason = %q, want the routing reason intact", got.StateReason)
+	}
+	if n := len(autoClosedEntries(t, au)); n != 0 {
+		t.Errorf("%s entries = %d, want 0", concernAutoClosedCategory, n)
+	}
+	// Proof the case is NOT masked by a veto: no veto fired at all.
+	if v := vetoEntries(t, au); len(v) != 0 {
+		t.Fatalf("%s entries = %+v, want none — this case must isolate judgedIDs, not a veto arm", concernResolutionVetoedCategory, v)
+	}
+}
+
+// TestAutoCloseUnjudgedRoutedConcerns_MalformedResolutionIDNamesNoRow pins the
+// BOUNDARY of the verbatim judgedIDs record for the OTHER non-applying
+// resolution shape: an id that is not a valid UUID. judgedIDs keys on res.ID
+// VERBATIM and BEFORE any parse, which is what makes the case above (a WELL-
+// FORMED id with an unknown resolution value) exclude its row. An id that does
+// not match ANY row's canonical string, by contrast, names no concern, so it
+// excludes none and the auto-close proceeds — asserted here so the verbatim
+// record is understood as an exclusion keyed on the id STRING, not as a blanket
+// "any resolution present suppresses the pass".
+func TestAutoCloseUnjudgedRoutedConcerns_MalformedResolutionIDNamesNoRow(t *testing.T) {
+	ctx := context.Background()
+	s, au, cr, runID, stageID := vetoRoundServer()
+	row := seedRoutedConcern(t, cr, runID, stageID, "gpt-5.6-sol", "note", "routing reason")
+	seedPushedFixupPass(t, au, runID, stageID, row.ID)
+	// The id as the reviewer emitted it: the row's UUID with trailing text, so
+	// uuid.Parse fails while the VERBATIM string still keys judgedIDs.
+	emitted := row.ID.String()
+	round := []roundReviewVerdict{
+		autoCloseRound("fable-5", 200, planreview.VerdictApprove,
+			planreview.ConcernResolution{ID: emitted + " (fixed)", Resolution: "confirmed"}),
+	}
+	// Seed the auto-close's exclusion with the SAME verbatim string the round
+	// carries, so the pairing is self-paired rather than a clean value.
+	round[0].resolutions[0].ID = emitted + " (fixed)"
+	// The row must still be reachable by the auto-close's own candidate scan,
+	// so key the exclusion on exactly what the reviewer wrote.
+	round[0].review.ConcernResolutions = round[0].resolutions
+
+	s.applyRoundConcernResolutions(ctx, runID, stageID, round, "")
+	s.autoCloseUnjudgedRoutedConcerns(ctx, runID, stageID, round, 1, "")
+
+	got := concernRowAfterRound(t, cr, row.ID)
+	// The malformed id does NOT match the row's canonical id string, so
+	// judgedIDs does not exclude this row and the auto-close legitimately
+	// closes it: a resolution naming no real concern judged no real concern.
+	if got.State != concern.StateAddressed {
+		t.Errorf("state = %q, want addressed — an unparseable id names no row, so it excludes no row", got.State)
+	}
+}
+
+// TestAutoCloseUnjudgedRoutedConcerns_VetoedConfirmNotBypassed is the #2551
+// REGRESSION PIN (not the judgedIDs counterfactual — see
+// _UnknownResolutionNotClosed above): a confirm the operator-evidence veto
+// refused must not be re-applied by the implicit close.
+func TestAutoCloseUnjudgedRoutedConcerns_VetoedConfirmNotBypassed(t *testing.T) {
+	ctx := context.Background()
+	s, au, cr, runID, stageID := vetoRoundServer()
+	row := seedRoutedConcern(t, cr, runID, stageID, "gpt-5.6-sol", "path traversal reproduces", "routed with a repro")
+	seedStageAuditEntry(t, au, runID, stageID, 10, CategoryStageFixupTriggered, map[string]any{
+		"concern_ids":       []string{row.ID.String()},
+		"operator_evidence": "curl '/v0/files?p=../../etc/passwd' returns 200 on the fix-up head",
+	})
+	round := []roundReviewVerdict{
+		autoCloseRound("fable-5", 200, planreview.VerdictApprove,
+			planreview.ConcernResolution{ID: row.ID.String(), Resolution: "confirmed", Note: "reads fixed to me"}),
+	}
+
+	s.applyRoundConcernResolutions(ctx, runID, stageID, round, "")
+	s.autoCloseUnjudgedRoutedConcerns(ctx, runID, stageID, round, 1, "")
+
+	if got := concernRowAfterRound(t, cr, row.ID); got.State != concern.StateAddressedPending {
+		t.Errorf("state = %q, want addressed_pending — a VETOED confirm must not be laundered into a close by the implicit path", got.State)
+	}
+	if n := len(autoClosedEntries(t, au)); n != 0 {
+		t.Errorf("%s entries = %d, want 0", concernAutoClosedCategory, n)
+	}
+}
+
+// VETO ARM 1 of 3 reachable here: operator_evidence_routed. The routing carried
+// executed reproduction evidence, so only the operator may retire it. Deleting
+// the vc.vetoReason refusal reddens this on the state assertion.
+func TestAutoCloseUnjudgedRoutedConcerns_OperatorEvidenceRouted_NotClosed(t *testing.T) {
+	ctx := context.Background()
+	s, au, cr, runID, stageID := vetoRoundServer()
+	row := seedRoutedConcern(t, cr, runID, stageID, "gpt-5.6-sol", "path traversal reproduces", "routed with a repro")
+	seedStageAuditEntry(t, au, runID, stageID, 10, CategoryStageFixupTriggered, map[string]any{
+		"concern_ids":       []string{row.ID.String()},
+		"operator_evidence": "reproduced on the fix-up head",
+	})
+
+	s.autoCloseUnjudgedRoutedConcerns(ctx, runID, stageID, []roundReviewVerdict{
+		autoCloseRound("fable-5", 200, planreview.VerdictApprove),
+	}, 1, "")
+
+	got := concernRowAfterRound(t, cr, row.ID)
+	if got.State != concern.StateAddressedPending {
+		t.Errorf("state = %q, want addressed_pending — operator-executed evidence outranks a silent reviewer round", got.State)
+	}
+	if got.StateReason != "routed with a repro" {
+		t.Errorf("state_reason = %q, want it intact", got.StateReason)
+	}
+	vetoes := vetoEntries(t, au)
+	if len(vetoes) != 1 || vetoes[0].VetoReason != vetoOperatorEvidenceRouted || vetoes[0].Resolution != "auto_close" {
+		t.Fatalf("vetoes = %+v, want exactly one %s with resolution auto_close", vetoes, vetoOperatorEvidenceRouted)
+	}
+	if vetoes[0].ConcernID != row.ID.String() || vetoes[0].RaisingReviewerModel != "gpt-5.6-sol" {
+		t.Errorf("veto payload = %+v, want the concern id and its raising model", vetoes[0])
+	}
+	if n := len(autoClosedEntries(t, au)); n != 0 {
+		t.Errorf("%s entries = %d, want 0", concernAutoClosedCategory, n)
+	}
+}
+
+// VETO ARM 2 of 3: fixup_pass_no_changes. The pass pushed nothing, so the tree
+// the round judged is the tree that already carried the defect.
+func TestAutoCloseUnjudgedRoutedConcerns_FixupNoChanges_NotClosed(t *testing.T) {
+	ctx := context.Background()
+	s, au, cr, runID, stageID := vetoRoundServer()
+	row := seedRoutedConcern(t, cr, runID, stageID, "gpt-5.6-sol", "unbounded read", "routed")
+	seedStageAuditEntry(t, au, runID, stageID, 10, CategoryStageFixupTriggered, map[string]any{
+		"concern_ids": []string{row.ID.String()},
+	})
+	seedStageAuditEntry(t, au, runID, stageID, 11, "fixup_no_changes", map[string]any{})
+
+	s.autoCloseUnjudgedRoutedConcerns(ctx, runID, stageID, []roundReviewVerdict{
+		autoCloseRound("fable-5", 200, planreview.VerdictApprove),
+	}, 1, "")
+
+	if got := concernRowAfterRound(t, cr, row.ID); got.State != concern.StateAddressedPending {
+		t.Errorf("state = %q, want addressed_pending — a pass that landed nothing cannot have fixed anything", got.State)
+	}
+	vetoes := vetoEntries(t, au)
+	if len(vetoes) != 1 || vetoes[0].VetoReason != vetoFixupPassNoChanges || vetoes[0].Resolution != "auto_close" {
+		t.Fatalf("vetoes = %+v, want exactly one %s with resolution auto_close", vetoes, vetoFixupPassNoChanges)
+	}
+}
+
+// VETO ARM 3 of 3: evidence_lookup_failed, FAIL CLOSED. One case per way the
+// lookup can fail — a nil AuditRepo and a ListForRunByCategory error.
+func TestAutoCloseUnjudgedRoutedConcerns_EvidenceLookupFailed_NotClosed(t *testing.T) {
+	t.Run("list_error", func(t *testing.T) {
+		ctx := context.Background()
+		s, au, cr, runID, stageID := vetoRoundServer()
+		row := seedRoutedConcern(t, cr, runID, stageID, "gpt-5.6-sol", "unbounded read", "routed")
+		s.cfg.AuditRepo = &categoryErrAuditRepo{
+			auditFake:   au,
+			errCategory: CategoryStageFixupTriggered,
+			err:         errors.New("audit store unavailable"),
+		}
+
+		s.autoCloseUnjudgedRoutedConcerns(ctx, runID, stageID, []roundReviewVerdict{
+			autoCloseRound("fable-5", 200, planreview.VerdictApprove),
+		}, 1, "")
+
+		if got := concernRowAfterRound(t, cr, row.ID); got.State != concern.StateAddressedPending {
+			t.Errorf("state = %q, want addressed_pending — an unreadable evidence lookup must fail closed", got.State)
+		}
+		vetoes := vetoEntries(t, au)
+		if len(vetoes) != 1 || vetoes[0].VetoReason != vetoEvidenceLookupFailed || vetoes[0].Resolution != "auto_close" {
+			t.Fatalf("vetoes = %+v, want exactly one %s with resolution auto_close", vetoes, vetoEvidenceLookupFailed)
+		}
+	})
+	t.Run("nil_audit_repo", func(t *testing.T) {
+		ctx := context.Background()
+		cr := newFakeConcernRepo()
+		s := New(Config{Addr: "127.0.0.1:0", ConcernRepo: cr})
+		runID, stageID := uuid.New(), uuid.New()
+		row := seedRoutedConcern(t, cr, runID, stageID, "gpt-5.6-sol", "unbounded read", "routed")
+
+		s.autoCloseUnjudgedRoutedConcerns(ctx, runID, stageID, []roundReviewVerdict{
+			autoCloseRound("fable-5", 200, planreview.VerdictApprove),
+		}, 1, "")
+
+		got := concernRowAfterRound(t, cr, row.ID)
+		if got.State != concern.StateAddressedPending {
+			t.Errorf("state = %q, want addressed_pending — with no audit store the evidence is unknown, so fail closed", got.State)
+		}
+		if got.StateReason != "routed" {
+			t.Errorf("state_reason = %q, want it intact", got.StateReason)
+		}
+	})
+}
+
+// STATE GUARD: only addressed_pending — the routed marker — is eligible. A
+// `raised` row was never routed and a `reopened` row was routed and then
+// re-raised, so a clean round is evidence neither was fixed.
+//
+// The STATE outcome alone cannot discriminate this guard, and the test is built
+// around that: concern.validTransitions has `addressed` as the target of
+// EXACTLY ONE edge (addressed_pending -> addressed), so with the guard deleted a
+// raised/reopened candidate reaches ApplyResolution and is refused by the state
+// machine, leaving the row byte-identical either way. What the guard uniquely
+// prevents is the LEDGER LIE that trip leaves behind: the reopened row here is
+// named by an operator-evidence routing, so a candidate set that wrongly
+// includes it draws a spurious `auto_close` concern_resolution_vetoed entry
+// asserting the round refused a close it was never entitled to consider.
+// Deleting the State == StateAddressedPending check reddens the veto-entry
+// assertion below.
+func TestAutoCloseUnjudgedRoutedConcerns_RaisedAndReopenedRowsUntouched(t *testing.T) {
+	ctx := context.Background()
+	s, au, cr, runID, stageID := vetoRoundServer()
+	raised := seedConcernRow(t, cr, runID, stageID, concern.StageKindImplement, 100, "never routed")
+	reopened := seedRoutedConcern(t, cr, runID, stageID, "gpt-5.6-sol", "routed then re-raised", "routed")
+	seedStageAuditEntry(t, au, runID, stageID, 10, CategoryStageFixupTriggered, map[string]any{
+		"concern_ids":       []string{reopened.ID.String()},
+		"operator_evidence": "reproduced on the fix-up head",
+	})
+	if _, err := cr.ApplyResolution(ctx, reopened.ID, concern.StateReopened, "re-raised by the last round"); err != nil {
+		t.Fatalf("seed reopened: %v", err)
+	}
+
+	s.autoCloseUnjudgedRoutedConcerns(ctx, runID, stageID, []roundReviewVerdict{
+		autoCloseRound("fable-5", 200, planreview.VerdictApprove),
+	}, 1, "")
+
+	if got := concernRowAfterRound(t, cr, raised.ID); got.State != concern.StateRaised {
+		t.Errorf("raised row state = %q, want raised — a never-routed concern is not evidence of anything", got.State)
+	}
+	if got := concernRowAfterRound(t, cr, reopened.ID); got.State != concern.StateReopened {
+		t.Errorf("reopened row state = %q, want reopened — a re-raised concern was not fixed", got.State)
+	}
+	if got := concernRowAfterRound(t, cr, reopened.ID); got.StateReason != "re-raised by the last round" {
+		t.Errorf("reopened row state_reason = %q, want it intact", got.StateReason)
+	}
+	if n := len(autoClosedEntries(t, au)); n != 0 {
+		t.Errorf("%s entries = %d, want 0", concernAutoClosedCategory, n)
+	}
+	if v := vetoEntries(t, au); len(v) != 0 {
+		t.Errorf("%s entries = %+v, want none — an ineligible row must never be CONSIDERED, so it can neither be closed nor recorded as refused", concernResolutionVetoedCategory, v)
+	}
+}
+
+// RE-RAISE GUARD: a FRESH concern in the round whose settled_ref names the
+// routed id IS the round re-raising it. Deleting the settled_ref exclusion
+// reddens this.
+func TestAutoCloseUnjudgedRoutedConcerns_ReRaisedBySettledRef_NotClosed(t *testing.T) {
+	ctx := context.Background()
+	s, au, cr, runID, stageID := vetoRoundServer()
+	row := seedRoutedConcern(t, cr, runID, stageID, "gpt-5.6-sol", "the guard is still missing", "routing reason")
+	seedPushedFixupPass(t, au, runID, stageID, row.ID)
+
+	s.autoCloseUnjudgedRoutedConcerns(ctx, runID, stageID, []roundReviewVerdict{
+		autoCloseRoundRaising("fable-5", 200, planreview.VerdictApproveWithConcerns,
+			planreview.Concern{
+				Severity:   planreview.SeverityHigh,
+				Category:   "correctness",
+				Note:       "the guard is STILL missing at handler.go:88",
+				SettledRef: row.ID.String(),
+			}),
+	}, 1, "")
+
+	got := concernRowAfterRound(t, cr, row.ID)
+	if got.State != concern.StateAddressedPending {
+		t.Errorf("state = %q, want addressed_pending — the round re-raised this very concern", got.State)
+	}
+	if got.StateReason != "routing reason" {
+		t.Errorf("state_reason = %q, want the routing reason intact", got.StateReason)
+	}
+	if n := len(autoClosedEntries(t, au)); n != 0 {
+		t.Errorf("%s entries = %d, want 0", concernAutoClosedCategory, n)
+	}
+}
+
+// SEQUENCE GUARD: a row minted BY this round cannot be closed by it. Deleting
+// the OriginReviewSequence < minReviewSequence check reddens this. The
+// comparison is on audit SEQUENCE, never a timestamp — the rows are stamped by
+// Postgres while the loop runs in the Go process (AGENTS.md cross-clock rule).
+func TestAutoCloseUnjudgedRoutedConcerns_SameRoundMintedRowUntouched(t *testing.T) {
+	ctx := context.Background()
+	s, au, cr, runID, stageID := vetoRoundServer()
+	// Minted AT the round's own review sequence and (by construction, not by
+	// any production path) already routed — so only the sequence guard can be
+	// what keeps it open.
+	row := seedConcernRow(t, cr, runID, stageID, concern.StageKindImplement, 200, "minted by this very round")
+	if err := cr.MarkAddressedPending(ctx, []uuid.UUID{row.ID}, "routed"); err != nil {
+		t.Fatalf("route concern: %v", err)
+	}
+	seedPushedFixupPass(t, au, runID, stageID, row.ID)
+
+	s.autoCloseUnjudgedRoutedConcerns(ctx, runID, stageID, []roundReviewVerdict{
+		autoCloseRound("fable-5", 200, planreview.VerdictApprove),
+		autoCloseRound("gpt-5.6-sol", 201, planreview.VerdictApprove),
+	}, 2, "")
+
+	if got := concernRowAfterRound(t, cr, row.ID); got.State != concern.StateAddressedPending {
+		t.Errorf("state = %q, want addressed_pending — a round cannot close a concern it minted", got.State)
+	}
+	if n := len(autoClosedEntries(t, au)); n != 0 {
+		t.Errorf("%s entries = %d, want 0", concernAutoClosedCategory, n)
+	}
+}
+
+// OWNERSHIP TRIPLE: a plan-stage row, a foreign-stage row and a foreign-run row
+// are all out of reach. Deleting the run/stage/stage-kind triple reddens this.
+func TestAutoCloseUnjudgedRoutedConcerns_PlanStageAndForeignStageUntouched(t *testing.T) {
+	ctx := context.Background()
+	s, au, cr, runID, stageID := vetoRoundServer()
+	otherStage := uuid.New()
+
+	planRow := seedConcernRow(t, cr, runID, stageID, concern.StageKindPlan, 100, "plan-stage concern")
+	if err := cr.MarkAddressedPending(ctx, []uuid.UUID{planRow.ID}, "routed"); err != nil {
+		t.Fatalf("route plan concern: %v", err)
+	}
+	foreignStageRow := seedRoutedConcern(t, cr, runID, otherStage, "gpt-5.6-sol", "another stage's concern", "routed")
+	foreignRunRow := seedRoutedConcern(t, cr, uuid.New(), stageID, "gpt-5.6-sol", "another run's concern", "routed")
+
+	s.autoCloseUnjudgedRoutedConcerns(ctx, runID, stageID, []roundReviewVerdict{
+		autoCloseRound("fable-5", 200, planreview.VerdictApprove),
+	}, 1, "")
+
+	for name, id := range map[string]uuid.UUID{
+		"plan_stage":  planRow.ID,
+		"other_stage": foreignStageRow.ID,
+		"other_run":   foreignRunRow.ID,
+	} {
+		if got := concernRowAfterRound(t, cr, id); got.State != concern.StateAddressedPending {
+			t.Errorf("%s row state = %q, want addressed_pending — this round owns none of these rows", name, got.State)
+		}
+	}
+	if n := len(autoClosedEntries(t, au)); n != 0 {
+		t.Errorf("%s entries = %d, want 0", concernAutoClosedCategory, n)
+	}
+}
+
+// GUARD (a): no concern store, or an EMPTY round (every dispatched reviewer
+// failed). Neither can close anything; the empty-round case must not divide by
+// a zero denominator into a false "complete round".
+func TestAutoCloseUnjudgedRoutedConcerns_NoRepoOrEmptyRound(t *testing.T) {
+	ctx := context.Background()
+	t.Run("nil_concern_repo", func(t *testing.T) {
+		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: newAuditFake()})
+		// Must not panic and must append nothing.
+		s.autoCloseUnjudgedRoutedConcerns(ctx, uuid.New(), uuid.New(), []roundReviewVerdict{
+			autoCloseRound("fable-5", 200, planreview.VerdictApprove),
+		}, 1, "")
+	})
+	t.Run("empty_round", func(t *testing.T) {
+		s, au, cr, runID, stageID := vetoRoundServer()
+		row := seedRoutedConcern(t, cr, runID, stageID, "gpt-5.6-sol", "note", "routed")
+
+		s.autoCloseUnjudgedRoutedConcerns(ctx, runID, stageID, nil, 0, "")
+
+		if got := concernRowAfterRound(t, cr, row.ID); got.State != concern.StateAddressedPending {
+			t.Errorf("state = %q, want addressed_pending — an empty round judged nothing", got.State)
+		}
+		if n := len(autoClosedEntries(t, au)); n != 0 {
+			t.Errorf("%s entries = %d, want 0", concernAutoClosedCategory, n)
+		}
+	})
+}
+
+// The ListByRun read is BEST-EFFORT, matching priorConcernsForReview: a list
+// error closes nothing rather than closing on a partial view.
+func TestAutoCloseUnjudgedRoutedConcerns_ListByRunError_ClosesNothing(t *testing.T) {
+	ctx := context.Background()
+	s, au, cr, runID, stageID := vetoRoundServer()
+	row := seedRoutedConcern(t, cr, runID, stageID, "gpt-5.6-sol", "note", "routed")
+	cr.listErr = errors.New("concern store unavailable")
+
+	s.autoCloseUnjudgedRoutedConcerns(ctx, runID, stageID, []roundReviewVerdict{
+		autoCloseRound("fable-5", 200, planreview.VerdictApprove),
+	}, 1, "")
+
+	cr.listErr = nil
+	if got := concernRowAfterRound(t, cr, row.ID); got.State != concern.StateAddressedPending {
+		t.Errorf("state = %q, want addressed_pending — a failed list must close nothing", got.State)
+	}
+	if n := len(autoClosedEntries(t, au)); n != 0 {
+		t.Errorf("%s entries = %d, want 0", concernAutoClosedCategory, n)
+	}
+}
+
+// Per-row ApplyResolution failures WARN-log and continue; no audit entry is
+// written for a closure that did not happen.
+func TestAutoCloseUnjudgedRoutedConcerns_ApplyResolutionError_NoAuditEntry(t *testing.T) {
+	ctx := context.Background()
+	s, au, cr, runID, stageID := vetoRoundServer()
+	row := seedRoutedConcern(t, cr, runID, stageID, "gpt-5.6-sol", "note", "routed")
+	seedPushedFixupPass(t, au, runID, stageID, row.ID)
+	cr.applyResolutionErr = errors.New("concern store write failed")
+
+	s.autoCloseUnjudgedRoutedConcerns(ctx, runID, stageID, []roundReviewVerdict{
+		autoCloseRound("fable-5", 200, planreview.VerdictApprove),
+	}, 1, "")
+
+	cr.applyResolutionErr = nil
+	if got := concernRowAfterRound(t, cr, row.ID); got.State != concern.StateAddressedPending {
+		t.Errorf("state = %q, want addressed_pending — the write failed", got.State)
+	}
+	if n := len(autoClosedEntries(t, au)); n != 0 {
+		t.Errorf("%s entries = %d, want 0 — the ledger must not record a closure that did not happen", concernAutoClosedCategory, n)
+	}
+}
+
+// The concern_auto_closed append is BEST-EFFORT: a failed append leaves the
+// closure standing, mirroring appendConcernResolutionVetoed's contract.
+func TestAutoCloseUnjudgedRoutedConcerns_AuditAppendFailure_ClosureStands(t *testing.T) {
+	ctx := context.Background()
+	au := newAuditFake()
+	cr := newFakeConcernRepo()
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au, ConcernRepo: cr})
+	runID, stageID := uuid.New(), uuid.New()
+	row := seedRoutedConcern(t, cr, runID, stageID, "gpt-5.6-sol", "note", "routed")
+	seedPushedFixupPass(t, au, runID, stageID, row.ID)
+	au.appendErr = errors.New("chain append failed")
+
+	s.autoCloseUnjudgedRoutedConcerns(ctx, runID, stageID, []roundReviewVerdict{
+		autoCloseRound("fable-5", 200, planreview.VerdictApprove),
+	}, 1, "")
+
+	if got := concernRowAfterRound(t, cr, row.ID); got.State != concern.StateAddressed {
+		t.Errorf("state = %q, want addressed — the closure stands whether or not the append lands", got.State)
+	}
+}
+
+// ORDERING PIN: the auto-close call site sits AFTER applyRoundConcernResolutions
+// (so a reviewer reopen/confirm has already written its state and this pass
+// reads the FINAL per-row state) and BEFORE recomputeAndPublishAuditComplete
+// (so the republished merge-gate check reflects the post-close open count).
+func TestAutoCloseCallSiteOrderedBetweenResolutionsAndAuditComplete(t *testing.T) {
+	body, err := os.ReadFile("trace.go")
+	if err != nil {
+		t.Fatalf("read trace.go: %v", err)
+	}
+	src := string(body)
+	apply := strings.Index(src, "s.applyRoundConcernResolutions(ctx, runID, stageID, round, headSHA)")
+	auto := strings.Index(src, "s.autoCloseUnjudgedRoutedConcerns(ctx, runID, stageID, round, len(invocations), headSHA)")
+	complete := strings.Index(src, "s.recomputeAndPublishAuditComplete(ctx, runID)")
+	if apply < 0 || auto < 0 || complete < 0 {
+		t.Fatalf("call sites not found: apply=%d auto=%d complete=%d", apply, auto, complete)
+	}
+	if apply >= auto || auto >= complete {
+		t.Errorf("call order = apply:%d auto:%d complete:%d, want applyRoundConcernResolutions < autoCloseUnjudgedRoutedConcerns < recomputeAndPublishAuditComplete", apply, auto, complete)
+	}
+}

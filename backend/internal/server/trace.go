@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -5320,6 +5321,14 @@ func (s *Server) runImplementReviewInvocations(ctx context.Context, runID, stage
 	// resolutions were applied inline.
 	s.applyRoundConcernResolutions(ctx, runID, stageID, round, headSHA)
 
+	// Auto-close the routed concerns this round RE-JUDGED and said nothing
+	// about (E45.84 / #3619). Placed immediately AFTER the explicit
+	// resolutions — so a reviewer reopen/confirm has already written its state
+	// and this pass reads the FINAL per-row state — and BEFORE
+	// recomputeAndPublishAuditComplete, so the republished merge-gate check
+	// reflects the post-close open count in this same pass.
+	s.autoCloseUnjudgedRoutedConcerns(ctx, runID, stageID, round, len(invocations), headSHA)
+
 	// The implement review has now written its terminal entries
 	// (implement_reviewed / implement_review_failed). Re-derive and
 	// republish fishhawk_audit_complete so the #947 review-pending presence
@@ -6262,6 +6271,266 @@ type concernResolutionVetoedPayload struct {
 	OriginReviewSequence    int64  `json:"origin_review_sequence"`
 }
 
+// concernAutoClosedCategory is the audit-log category for a routed concern
+// CLOSED by a clean re-review round that said nothing about it (E45.84 /
+// #3619). Like concernResolutionVetoedCategory it is an INTERNAL, advisory
+// audit kind — it posts no issue comment and adds no Notifier method, so it is
+// NOT an issue-comment surface. It records WHY a row reached `addressed` with
+// no reviewer resolution behind it, so an operator reading the settled ledger
+// can tell an auto-close from a reviewer `confirmed` without a hand diff.
+const concernAutoClosedCategory = "concern_auto_closed"
+
+// autoCloseBasisCleanReReview is the single Basis value concernAutoClosedPayload
+// carries today. It is a named constant rather than an inline literal so a
+// future second basis is a visibly additive change to the ledger vocabulary.
+const autoCloseBasisCleanReReview = "clean_re_review_round"
+
+// concernAutoClosedPayload is the audit payload for one auto-closed concern.
+type concernAutoClosedPayload struct {
+	ConcernID              string   `json:"concern_id"`
+	Severity               string   `json:"severity,omitempty"`
+	Category               string   `json:"category,omitempty"`
+	RaisingReviewerModel   string   `json:"raising_reviewer_model,omitempty"`
+	OriginReviewSequence   int64    `json:"origin_review_sequence"`
+	ClosingReviewSequences []int64  `json:"closing_review_sequences"`
+	ClosingReviewerModels  []string `json:"closing_reviewer_models"`
+	ReviewedHeadSHA        string   `json:"reviewed_head_sha,omitempty"`
+	Basis                  string   `json:"basis"`
+}
+
+// autoCloseUnjudgedRoutedConcerns closes the routed concerns a COMPLETE,
+// UNANIMOUSLY non-reject implement-review round re-judged and said nothing
+// about (E45.84 / #3619). Before this pass the ONLY writer of
+// concern.StateAddressed was applyConcernResolutions, which needs a reviewer to
+// emit an explicit `confirmed` entry — so a reviewer that approves the post-
+// fix-up tree without emitting one left the routed concern in
+// addressed_pending forever (the run f199dcf1 shape: five reviewer concerns
+// fixed by four fix-up passes and still raised at the gate).
+//
+// It is deliberately a SEPARATE function rather than a new parameter on
+// applyRoundConcernResolutions: that function has many keyed call sites across
+// the test files, and widening its signature would churn every one of them
+// while mixing two distinct decisions into one body.
+//
+// It derives closure EXCLUSIVELY from the round's own verdicts plus the
+// EXISTING resolutionVetoContext evidence, so the issue's item 3 (never close
+// on the fix-up's own say-so) holds: a pass that pushed nothing, an
+// operator-evidenced routing, or a failed evidence lookup each REFUSE the
+// auto-close exactly as they already refuse a reviewer `confirmed`.
+//
+// dispatchedInvocations is len(invocations) from the caller's loop — the
+// round-completeness denominator. `round` gains exactly one entry per
+// invocation that produced a buffered verdict, and the loop skips the append
+// on a reviewer error, on an append failure (no sequence) and on a
+// retry-superseded verdict — the three cases where the round is NOT a complete
+// judgment of the new tree.
+func (s *Server) autoCloseUnjudgedRoutedConcerns(ctx context.Context, runID, stageID uuid.UUID, round []roundReviewVerdict, dispatchedInvocations int, reviewedHeadSHA string) {
+	warn := func(reason string, attrs ...slog.Attr) {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "concern auto-close: "+reason,
+			append([]slog.Attr{
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+			}, attrs...)...)
+	}
+	if s.cfg.ConcernRepo == nil || len(round) == 0 {
+		return
+	}
+	// (b) ROUND INCOMPLETE — some dispatched reviewer invocation failed, timed
+	// out, had its append fail, or was dropped as retry-superseded. A partial
+	// round is not a complete judgment of the new tree.
+	if len(round) != dispatchedInvocations {
+		warn("round incomplete — not every dispatched reviewer produced a buffered verdict; closing nothing",
+			slog.Int("buffered_verdicts", len(round)),
+			slog.Int("dispatched_invocations", dispatchedInvocations),
+		)
+		return
+	}
+	// (c) ROUND NOT CLEAN — any reject in the round means the tree was not
+	// approved, so silence about a routed concern is not evidence it was fixed.
+	for _, rv := range round {
+		if rv.verdict == planreview.VerdictReject {
+			warn("round carries a reject verdict; closing nothing", slog.String("rejecting_model", rv.model))
+			return
+		}
+	}
+
+	// The round's exclusion sets, built IN MEMORY from the buffered verdicts
+	// before the store is touched.
+	//
+	// judgedIDs records every res.ID VERBATIM and BEFORE any UUID parse, so a
+	// malformed, unknown or vetoed entry still excludes its concern: an
+	// EXPLICIT reviewer judgment, applied or refused, always wins over this
+	// implicit close — which is what keeps the E48.103 / #2551 veto
+	// unbypassable by this path.
+	judgedIDs := map[string]bool{}
+	// reRaisedIDs: a fresh concern whose settled_ref names the routed id IS the
+	// round re-raising it.
+	reRaisedIDs := map[string]bool{}
+	var minReviewSequence int64
+	closingModels := make([]string, 0, len(round))
+	closingSequences := make([]int64, 0, len(round))
+	for i, rv := range round {
+		for _, res := range rv.resolutions {
+			judgedIDs[res.ID] = true
+		}
+		for _, c := range rv.review.Concerns {
+			if ref := strings.TrimSpace(c.SettledRef); ref != "" {
+				reRaisedIDs[ref] = true
+			}
+		}
+		if i == 0 || rv.reviewSequence < minReviewSequence {
+			minReviewSequence = rv.reviewSequence
+		}
+		closingModels = append(closingModels, rv.model)
+		closingSequences = append(closingSequences, rv.reviewSequence)
+	}
+
+	// Same best-effort posture as priorConcernsForReview: a list error
+	// WARN-logs and closes nothing.
+	rows, lerr := s.cfg.ConcernRepo.ListByRun(ctx, runID)
+	if lerr != nil {
+		warn("listing the run's concerns failed; closing nothing", slog.String("error", lerr.Error()))
+		return
+	}
+	var candidates []*concern.Concern
+	for _, row := range rows {
+		if row == nil {
+			continue
+		}
+		// The same ownership triple applyConcernResolutions enforces.
+		if row.RunID != runID || row.StageID != stageID || row.StageKind != concern.StageKindImplement {
+			continue
+		}
+		// EXACTLY addressed_pending — the routed marker. A `raised` row was
+		// never routed to the agent and a `reopened` row was routed and then
+		// re-raised; a clean round is evidence neither was fixed, and closing
+		// them is the over-reach the issue's item 3 warns about.
+		if row.State != concern.StateAddressedPending {
+			continue
+		}
+		// A row minted by THIS round cannot be closed by it. Sequence
+		// comparison only, never a wall-clock or UpdatedAt comparison: the rows
+		// are stamped by Postgres now() while this loop runs in the Go process,
+		// and the skew between those clock domains is unbounded (AGENTS.md).
+		if row.OriginReviewSequence >= minReviewSequence {
+			continue
+		}
+		id := row.ID.String()
+		if judgedIDs[id] || reRaisedIDs[id] {
+			continue
+		}
+		candidates = append(candidates, row)
+	}
+	if len(candidates) == 0 {
+		return
+	}
+
+	// Build the round's veto evidence ONCE, reusing the existing derivation
+	// rather than forking it. The confirming-model argument is deliberately ""
+	// — there is no confirming reviewer on this path, and the V1
+	// raiser-rejected-same-round arm is already subsumed by the reject guard
+	// above (a clean round populates no rejectedBy entries). The three arms
+	// that DO bite here are the ones the issue's item 3 demands.
+	vc := s.buildResolutionVetoContext(ctx, runID, stageID, round)
+	reason := autoCloseReason(closingSequences, closingModels, reviewedHeadSHA)
+	for _, row := range candidates {
+		if veto := vc.vetoReason(row, ""); veto != "" {
+			warn("auto-close refused: "+veto,
+				slog.String("concern_id", row.ID.String()),
+			)
+			s.appendConcernResolutionVetoed(ctx, runID, stageID, concernResolutionVetoedPayload{
+				ConcernID:            row.ID.String(),
+				Resolution:           "auto_close",
+				VetoReason:           veto,
+				RaisingReviewerModel: derefStr(row.ReviewerModel),
+				ConcernSeverity:      row.Severity,
+				ConcernCategory:      row.Category,
+				ReviewSequence:       minReviewSequence,
+				OriginReviewSequence: row.OriginReviewSequence,
+			})
+			continue
+		}
+		// addressed_pending -> addressed is an EXISTING edge in
+		// concern.validTransitions, so no new state and no migration. Per-row
+		// failures (including an InvalidTransitionError from a row that changed
+		// state under us) WARN-log and continue, mirroring
+		// applyConcernResolutions' best-effort posture.
+		if _, aerr := s.cfg.ConcernRepo.ApplyResolution(ctx, row.ID, concern.StateAddressed, reason); aerr != nil {
+			warn("apply resolution failed",
+				slog.String("concern_id", row.ID.String()),
+				slog.String("error", aerr.Error()),
+			)
+			continue
+		}
+		s.appendConcernAutoClosed(ctx, runID, stageID, concernAutoClosedPayload{
+			ConcernID:              row.ID.String(),
+			Severity:               row.Severity,
+			Category:               row.Category,
+			RaisingReviewerModel:   derefStr(row.ReviewerModel),
+			OriginReviewSequence:   row.OriginReviewSequence,
+			ClosingReviewSequences: closingSequences,
+			ClosingReviewerModels:  closingModels,
+			ReviewedHeadSHA:        reviewedHeadSHA,
+			Basis:                  autoCloseBasisCleanReReview,
+		})
+	}
+}
+
+// autoCloseReason renders the operator-visible state_reason an auto-close
+// writes: the basis, the closing round's reviewer models and review sequences,
+// and — only when the round carried one — the byte-identical
+// " [verified at <sha>]" suffix applyConcernResolutions appends for a confirm
+// (#2884), so the two closing paths speak ONE provenance vocabulary.
+func autoCloseReason(sequences []int64, models []string, reviewedHeadSHA string) string {
+	seqs := make([]string, 0, len(sequences))
+	for _, sq := range sequences {
+		seqs = append(seqs, strconv.FormatInt(sq, 10))
+	}
+	named := make([]string, 0, len(models))
+	for _, m := range models {
+		if strings.TrimSpace(m) == "" {
+			named = append(named, "(unnamed reviewer)")
+			continue
+		}
+		named = append(named, m)
+	}
+	reason := "auto-closed (" + autoCloseBasisCleanReReview + "): the re-review round at review sequence(s) " +
+		strings.Join(seqs, ", ") + " (" + strings.Join(named, ", ") +
+		") judged the post-fix-up tree without rejecting and raised nothing about this concern"
+	if reviewedHeadSHA != "" {
+		reason += " [verified at " + reviewedHeadSHA + "]"
+	}
+	return reason
+}
+
+// appendConcernAutoClosed records one auto-closed concern. BEST-EFFORT by
+// design, exactly as appendConcernResolutionVetoed is: the closure stands
+// whether or not the append lands, and the durable concern row (not this entry)
+// is the authority on the row's state — so a failed append costs the operator
+// the closure's DETAIL, never the closure itself.
+func (s *Server) appendConcernAutoClosed(ctx context.Context, runID, stageID uuid.UUID, p concernAutoClosedPayload) {
+	if s.cfg.AuditRepo == nil {
+		return
+	}
+	systemKind := audit.ActorKind("system")
+	payload, _ := json.Marshal(p)
+	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   &stageID,
+		Timestamp: time.Now().UTC(),
+		Category:  concernAutoClosedCategory,
+		ActorKind: &systemKind,
+		Payload:   payload,
+	}); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "concern auto-close: audit append failed — the closure still stands",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("concern_id", p.ConcernID),
+			slog.String("error", err.Error()),
+		)
+	}
+}
+
 // applyRoundConcernResolutions applies ONE implement-review round's buffered
 // delta-verification resolutions (E48.103 / #2551), after every reviewer in the
 // round has spoken. It builds the round's veto context once, then replays the
@@ -6564,8 +6833,11 @@ func (s *Server) applyConcernResolutions(ctx context.Context, runID, stageID uui
 			})
 			continue
 		}
-		// Ledger provenance (#2884): for a `confirmed` resolution — the one
-		// that writes StateAddressed — stamp the reviewed head sha into the
+		// Ledger provenance (#2884): for a `confirmed` resolution — THIS
+		// function's only writer of StateAddressed (since E45.84 / #3619 the
+		// clean-round auto-close is a second writer, and it stamps the head
+		// through autoCloseReason so both paths speak one vocabulary) — stamp
+		// the reviewed head sha into the
 		// state_reason so a future divergence between what the confirming review
 		// read and the PR head is visible in the ledger instead of requiring a
 		// hand diff. Passed through byte-identical when the head is empty, and

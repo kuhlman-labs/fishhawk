@@ -5168,3 +5168,107 @@ func TestMaybeBackstopFixupReReview_EvaluatesStageCumulativeDelivery(t *testing.
 		}
 	})
 }
+
+// --- Clean-round auto-close, WIRED through the production loop (E45.84 / #3619)
+//
+// The unit + guard coverage of autoCloseUnjudgedRoutedConcerns lives in
+// trace_test.go. These two are the CROSS-LAYER assertions: that the pass is
+// actually REACHED from runImplementReviewInvocations (not merely callable),
+// that the concern row committed to the store reflects it, and that the
+// run-status derivation the merge gate reads sees the closed count.
+
+// autoCloseRoundServer is vetoRoundServer with a SEQUENCE-STAMPING audit fake.
+// The round's reviewSequence comes from the implement_reviewed append, and the
+// auto-close's eligibility test is `row.OriginReviewSequence < the round's
+// minimum` — a fake stamping every entry sequence 0 would make every row
+// ineligible for reasons that have nothing to do with the behaviour under test.
+func autoCloseRoundServer() (*Server, *seqAuditFake, *fakeConcernRepo, uuid.UUID, uuid.UUID) {
+	au := newSeqAuditFake()
+	cr := newFakeConcernRepo()
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au, ConcernRepo: cr})
+	return s, au, cr, uuid.New(), uuid.New()
+}
+
+// openImplementCount runs the SAME derivation handleGetRun's concerns block
+// uses (buildRunConcernsPayload over ConcernRepo.ListByRun), so the assertion
+// reads the operator-visible count rather than a test-local recount.
+func openImplementCount(t *testing.T, cr *fakeConcernRepo, runID uuid.UUID) int {
+	t.Helper()
+	all, err := cr.ListByRun(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("ListByRun: %v", err)
+	}
+	return buildRunConcernsPayload(all, nil).OpenImplement
+}
+
+// TestImplementReviewRound_CleanRoundAutoClosesRoutedConcern drives the REAL
+// runImplementReviewInvocations loop with a reviewer that approves the
+// post-fix-up tree and emits NO concern_resolutions — the run f199dcf1 shape.
+// Before #3619 the routed concern stayed addressed_pending forever and
+// open_implement never dropped.
+func TestImplementReviewRound_CleanRoundAutoClosesRoutedConcern(t *testing.T) {
+	s, au, cr, runID, stageID := autoCloseRoundServer()
+	row := seedRoutedConcern(t, cr, runID, stageID, "gpt-5.6-sol", "the handler still trusts the caller subject", "routing reason: fix the authz check")
+	// A routing pass that PUSHED, so neither evidence veto arm can fire.
+	seedStageAuditEntry(t, au.auditFake, runID, stageID, 10, CategoryStageFixupTriggered, map[string]any{
+		"concern_ids": []string{row.ID.String()},
+	})
+	seedStageAuditEntry(t, au.auditFake, runID, stageID, 11, "fixup_pushed", map[string]any{"head_sha": "abc123"})
+
+	if got := openImplementCount(t, cr, runID); got != 1 {
+		t.Fatalf("open_implement before the round = %d, want 1", got)
+	}
+
+	silent := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove, FreeForm: "the authz check reads correct now"},
+		model:   "fable-5",
+	}
+	s.runImplementReviewInvocations(context.Background(), runID, stageID,
+		[]reviewerInvocation{{reviewer: silent}},
+		planreview.AuthorityAdvisory, "prompt", "author-model", "", "abc123", planreview.DefaultReviewBudget, "", 0)
+
+	got := concernRowAfterRound(t, cr, row.ID)
+	if got.State != concern.StateAddressed {
+		t.Fatalf("committed state = %q, want addressed — the production loop must reach the auto-close pass", got.State)
+	}
+	if !strings.Contains(got.StateReason, autoCloseBasisCleanReReview) || !strings.Contains(got.StateReason, "fable-5") {
+		t.Errorf("state_reason = %q, want it to name the basis and the closing reviewer", got.StateReason)
+	}
+	if n := openImplementCount(t, cr, runID); n != 0 {
+		t.Errorf("open_implement after the round = %d, want 0 — the merge-gate count must see the closure", n)
+	}
+	entries := autoClosedEntries(t, au.auditFake)
+	if len(entries) != 1 || entries[0].ConcernID != row.ID.String() {
+		t.Errorf("%s entries = %+v, want exactly one naming the closed concern", concernAutoClosedCategory, entries)
+	}
+}
+
+// TestImplementReviewRound_CleanFirstReviewAutoClosesNothing is the INVERSE: a
+// clean round with NO addressed_pending rows (a FIRST review, where the
+// reviewer's own fresh concerns are `raised`) must leave every concern
+// byte-identical and append no concern_auto_closed entry.
+func TestImplementReviewRound_CleanFirstReviewAutoClosesNothing(t *testing.T) {
+	s, au, cr, runID, stageID := autoCloseRoundServer()
+	raised := seedConcernRow(t, cr, runID, stageID, concern.StageKindImplement, 100, "a never-routed first-round concern")
+	before := *raised
+
+	silent := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "fable-5",
+	}
+	s.runImplementReviewInvocations(context.Background(), runID, stageID,
+		[]reviewerInvocation{{reviewer: silent}},
+		planreview.AuthorityAdvisory, "prompt", "author-model", "", "", planreview.DefaultReviewBudget, "", 0)
+
+	after := concernRowAfterRound(t, cr, raised.ID)
+	if after.State != before.State || after.StateReason != before.StateReason {
+		t.Errorf("row changed: state %q -> %q, state_reason %q -> %q; the pass must be inert on a first review",
+			before.State, after.State, before.StateReason, after.StateReason)
+	}
+	if n := len(autoClosedEntries(t, au.auditFake)); n != 0 {
+		t.Errorf("%s entries = %d, want 0", concernAutoClosedCategory, n)
+	}
+	if n := openImplementCount(t, cr, runID); n != 1 {
+		t.Errorf("open_implement = %d, want 1 — a raised concern is untouched", n)
+	}
+}
