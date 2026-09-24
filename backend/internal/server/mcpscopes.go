@@ -216,7 +216,14 @@ var mcpToolScopes = map[string]mcpToolScopeRule{
 	"fishhawk_drive_run": {anyOf: []string{"write:approvals", "write:runs"}},
 
 	// --- write:campaigns (campaigns.go, all four via requireWriteScope).
-	"fishhawk_start_campaign":          {anyOf: []string{"write:campaigns"}},
+	"fishhawk_start_campaign": {anyOf: []string{"write:campaigns"}},
+	// fishhawk_preview_campaign (#3647) MIRRORS POST /v0/campaigns/preview's own
+	// requirement exactly. handlePreviewCampaign calls
+	// requireWriteScope("write:campaigns") — the same guard handleCreateCampaign
+	// uses, because a preview costs the identical per-item forge sweep and is the
+	// pre-flight of a write — so this row must be neither stricter nor looser
+	// than the endpoint it fronts.
+	"fishhawk_preview_campaign":        {anyOf: []string{"write:campaigns"}},
 	"fishhawk_start_campaign_item_run": {anyOf: []string{"write:campaigns"}},
 	"fishhawk_resume_campaign":         {anyOf: []string{"write:campaigns"}},
 	"fishhawk_cancel_campaign":         {anyOf: []string{"write:campaigns"}},

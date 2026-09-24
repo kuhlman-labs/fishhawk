@@ -114,6 +114,11 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v0/releases/publish", s.handleReleasePublish)
 	mux.HandleFunc("GET /v0/campaigns", s.handleListCampaigns)
 	mux.HandleFunc("POST /v0/campaigns", s.handleCreateCampaign)
+	// The non-mutating dry run of the create above (#3647). net/http's
+	// ServeMux gives a literal segment precedence over a wildcard, so this
+	// does not conflict with the POST /v0/campaigns/{campaign_id}/... patterns
+	// below; it is registered here for readability, not for precedence.
+	mux.HandleFunc("POST /v0/campaigns/preview", s.handlePreviewCampaign)
 	mux.HandleFunc("GET /v0/campaigns/{campaign_id}", s.handleGetCampaign)
 	mux.HandleFunc("GET /v0/campaigns/{campaign_id}/items", s.handleListCampaignItems)
 	mux.HandleFunc("GET /v0/campaigns/{campaign_id}/status", s.handleGetCampaignStatus)

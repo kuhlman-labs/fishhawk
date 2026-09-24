@@ -17,7 +17,7 @@ import (
 // FuncDecls, TypeSpecs and ValueSpecs), not transcribed, so a drift between
 // an estimate and reality would surface as a test written from the tree.
 //
-// The bulk of these 296 names are tool I/O request/response structs. The MCP
+// The bulk of these 301 names are tool I/O request/response structs. The MCP
 // SDK's jsonschema reflection requires each tool's input/output type — and
 // its fields — to be EXPORTED to build the tool's schema, so unexporting them
 // would break tool registration. In `package main` their exportedness was
@@ -79,6 +79,13 @@ var exportBaseline = []string{
 	"CampaignItem",
 	"CampaignNextAction",
 	"CampaignPauseReason",
+	// #3647: fishhawk_preview_campaign's report wire structs — the
+	// non-mutating dry run of POST /v0/campaigns. Exported for the same
+	// reason every other tool I/O type here is: the MCP SDK builds the
+	// output schema by reflection over the exported type and its fields.
+	"CampaignPreview",
+	"CampaignPreviewDangling",
+	"CampaignPreviewItem",
 	"CampaignRollup",
 	"CampaignStatus",
 	"CancelCampaignInput",
@@ -242,6 +249,9 @@ var exportBaseline = []string{
 	"PlanSubPlan",
 	"PlanTicketRef",
 	"PlanVerification",
+	// #3647: fishhawk_preview_campaign's tool input/output.
+	"PreviewCampaignInput",
+	"PreviewCampaignOutput",
 	"ProductReport",
 	"ReapFailureResult",
 	"ReapStageInput",

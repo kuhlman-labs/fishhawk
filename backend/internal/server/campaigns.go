@@ -621,52 +621,10 @@ func (s *Server) handleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	owner, name, ok := splitRepoFullName(req.Repo)
-	if !ok {
-		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
-			"repo must be in owner/name form",
-			map[string]any{"field": "repo", "got": req.Repo})
+	epicRef, owner, name, refusal := validateCampaignSourceShape(req)
+	if refusal != nil {
+		s.writeCampaignSourceRefusal(w, r, refusal)
 		return
-	}
-	// epic_ref is OPTIONAL as of #2051, but an empty request still fails closed:
-	// at least one of epic_ref / items must be present. epic_ref PRESENT keeps
-	// the epic-sweep + optional items-subset path byte-identical; epic_ref ABSENT
-	// with items present routes to the no-epic branch below.
-	epicRef := strings.TrimSpace(req.EpicRef)
-	if epicRef == "" && len(req.Items) == 0 && req.GroomingSource == nil {
-		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
-			"one of epic_ref, items or grooming_source is required", map[string]any{"field": "epic_ref"})
-		return
-	}
-	// grooming_source is the THIRD source and is MUTUALLY EXCLUSIVE with the
-	// other two. Refusal, not precedence: three sources with a silent winner is
-	// how an operator gets a campaign they did not ask for. Validated HERE, with
-	// the other body checks and BEFORE the Idempotency-Key lookup and the
-	// installation resolution, so the conflict costs no forge round-trip.
-	if req.GroomingSource != nil {
-		if epicRef != "" {
-			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
-				"grooming_source cannot be combined with epic_ref: an approved grooming order IS the item set",
-				map[string]any{"field": "grooming_source", "conflicts_with": "epic_ref"})
-			return
-		}
-		if len(req.Items) > 0 {
-			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
-				"grooming_source cannot be combined with items: an approved grooming order IS the item set",
-				map[string]any{"field": "grooming_source", "conflicts_with": "items"})
-			return
-		}
-		if strings.TrimSpace(req.GroomingSource.RunID) == "" {
-			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
-				"grooming_source.run_id is required", map[string]any{"field": "grooming_source.run_id"})
-			return
-		}
-		if req.GroomingSource.Limit < 0 {
-			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
-				"grooming_source.limit must be >= 0 (0 means no cap)",
-				map[string]any{"field": "grooming_source.limit", "got": req.GroomingSource.Limit})
-			return
-		}
 	}
 	// pause_policy is optional; an empty value normalizes to pause_campaign in
 	// campaign.Persist. A non-empty value must be a recognized policy, caught
@@ -706,325 +664,31 @@ func (s *Server) handleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 			map[string]any{"field": "working_dir", "got": req.WorkingDir})
 		return
 	}
-	// provider is the OPTIONAL work-item provider selector (#3645). A non-empty
-	// value must name a LIVE registered provider, checked HERE — with the other
-	// body checks and BEFORE the conventions load, the provider dispatch and the
-	// installation lookup — so a typo costs no forge round-trip and the refusal
-	// is reachable without a live forge. Both field/got and registered are
-	// already allow-listed in errors.go, and a 4xx is not redacted, so the
-	// caller learns the exact accepted set from the refusal. Empty/omitted falls
-	// through to the conventions-resolved provider (the unchanged default).
-	if p := strings.TrimSpace(req.Provider); p != "" {
-		registered := registeredWorkItemProvidersFn()
-		if !containsRef(registered, p) {
-			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
-				"provider must name a work-item provider this deployment has registered",
-				map[string]any{"field": "provider", "got": req.Provider, "registered": registered})
-			return
-		}
-	}
-
-	// Resolve the work-management provider (#3645). This now runs AHEAD of the
-	// GitHub App installation lookup below: the installation is irrelevant to a
-	// non-GitHub tracker, and running it first meant a repo whose provider is
-	// gitlab/jira died on 422 repo_not_installed before the provider was even
-	// considered — which would make the request-level `provider` selector
-	// decorative on any deployment that also has GitHub credentials wired.
-	conv, err := conventionsLoader(r.Context(), req.Repo)
-	if err != nil {
-		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-			"could not load work-management conventions", map[string]any{"error": err.Error()})
-		return
-	}
-	providerID := resolveCampaignProviderID(&req, conv)
-	provider, err := workItemProviderFor(providerID)
-	if err != nil {
-		var unk *workmgmt.UnknownProviderError
-		if errors.As(err, &unk) {
-			// TWO NAMED MODES behind one error (#3645), mirroring
-			// handleFileProductReport's #3628 shape. Both messages stay STATIC
-			// literals with the product-owned facts on the allow-listed
-			// provider / registered / remedy detail keys, per the E67.15/#2587
-			// raw-cause posture — unk.Error() as the message is a raw-cause
-			// syntax the AST guard flags. The cause itself rides
-			// internalCauseKey so writeError still joins it to error_ref in the
-			// operator log rather than dropping it (E67.29 / #2631) — the AST
-			// guard can prove the message is static but not that the cause is
-			// retained, which is what
-			// TestCreateCampaign_UnknownProvider_RedactsCauseJoinsInLog asserts
-			// behaviourally.
-			//
-			// The handler REFUSES in mode m2 rather than silently substituting
-			// the sole registered provider: silently retargeting an operator's
-			// batch at a DIFFERENT issue tracker is the same class as the
-			// grooming_source guard's "three sources with a silent winner is
-			// how an operator gets a campaign they did not ask for", with a
-			// larger blast radius. The request-level `provider` selector is
-			// what makes the refusal ONE CALL away from corrected.
-			if len(unk.Known) == 0 {
-				// Mode m1: the deployment registered NO work-item provider at
-				// all. That is operator configuration, not an unimplemented
-				// provider, so the remedy names the WIRING whose absence leaves
-				// the registry empty. `remedy` is a STATIC literal and is
-				// allow-listed in errors.go, because a 501 is a 5xx and the
-				// default-deny redactor would otherwise strip exactly the
-				// actionable half of the refusal.
-				s.writeError(w, r, http.StatusNotImplemented, "provider_unimplemented",
-					"this deployment has no work-item provider registered, so campaigns cannot be assembled",
-					map[string]any{
-						"provider":       unk.ID,
-						"registered":     unk.Known,
-						"remedy":         "configure the GitHub App credentials (FISHHAWKD_GITHUB_APP_ID and FISHHAWKD_GITHUB_APP_PRIVATE_KEY_FILE) to register github_projects, or FISHHAWKD_GITLAB_BASE_URL and FISHHAWKD_GITLAB_TOKEN to register gitlab, so a work-item provider registers at startup",
-						internalCauseKey: unk.Error(),
-					})
-				return
-			}
-			// Mode m2: providers ARE registered, but not the resolved id. The
-			// remedy names BOTH the IN-BAND fix (the new request-level selector,
-			// correctable without a daemon restart) and the DURABLE ones. It
-			// deliberately does NOT name FISHHAWKD_SINGLE_TENANT_PROVIDER: that
-			// flag selects the single-tenant ACCOUNT's forge (ADR-057 Mode 1),
-			// which feeds the conventions FETCH forge — it never sets
-			// Conventions.Provider.
-			s.writeError(w, r, http.StatusNotImplemented, "provider_unimplemented",
-				"the resolved work-item provider is not implemented",
-				map[string]any{
-					"provider":       unk.ID,
-					"registered":     unk.Known,
-					"remedy":         "pass `provider` on this request naming one of the registered ids to correct it in-band, or change it durably via the repo's .fishhawk/work-management.yaml `provider:` field or the deployment-level FISHHAWKD_WORKMGMT_CONVENTIONS override",
-					internalCauseKey: unk.Error(),
-				})
-			return
-		}
-		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-			"could not resolve work-item provider", map[string]any{"error": err.Error()})
+	// provider is the OPTIONAL work-item provider selector (#3645), validated
+	// here — with the other body checks and BEFORE the conventions load, the
+	// provider dispatch and the installation lookup — so a typo costs no forge
+	// round-trip. SHARED with POST /v0/campaigns/preview (#3647) so both answer
+	// the identical refusal.
+	if provRefusal := validateCampaignProviderSelector(req); provRefusal != nil {
+		s.writeCampaignSourceRefusal(w, r, provRefusal)
 		return
 	}
 
-	// Resolve the App installation for the target repo (#713 / runs.go:498).
-	// A runless create has no run row to carry the id, so resolve it directly:
-	// the real GitHub provider needs it to query the epic's children.
-	//
-	// GATED ON THE RESOLVED PROVIDER (#3645): only the github_projects branch
-	// needs it. A non-github provider leaves scope at its zero value, which IS
-	// the existing unresolved-installation posture (forge.CredentialScope.IsZero)
-	// and the same posture the GitLab provider already runs under (its
-	// credentials are supplied at construction from FISHHAWKD_GITLAB_*). Mirrors
-	// workitems.go's `conv.Provider == workmgmtgithub.ProviderName` guard.
-	var scope forge.CredentialScope
-	if s.cfg.GitHub != nil && providerID == workmgmtgithub.ProviderName {
-		id, err := s.cfg.GitHub.GetRepoInstallation(r.Context(), forge.RepoRef{Owner: owner, Name: name})
-		switch {
-		case err == nil:
-			scope = forge.FromGitHubInstallationID(id)
-		case errors.Is(err, forge.ErrNotInstalled):
-			s.writeError(w, r, http.StatusUnprocessableEntity, "repo_not_installed",
-				"GitHub App is not installed on the target repository",
-				map[string]any{"repo": req.Repo})
-			return
-		default:
-			s.writeError(w, r, http.StatusBadGateway, "installation_resolution_failed",
-				"could not resolve the GitHub App installation for the target repo",
-				map[string]any{"error": err.Error()})
-			return
-		}
+	// Resolve the item set to assemble over through the SHARED source resolver
+	// (#3647): provider resolution, the provider-gated installation lookup, the
+	// grooming order, the epic-sweep-or-issue-set branch and the ratified-rank
+	// permutation. POST /v0/campaigns/preview calls the SAME helper, which is
+	// what makes "the preview is what create would do" structural rather than
+	// argued.
+	source, refusal := s.resolveCampaignSource(r.Context(), requestStart, req, epicRef, owner, name)
+	if refusal != nil {
+		s.writeCampaignSourceRefusal(w, r, refusal)
+		return
 	}
-
-	// The filing Target is shared by both branches (epic sweep + no-epic
-	// item-set resolution).
-	target := workmgmt.Target{
-		Repo:    workmgmt.Repo{Owner: owner, Name: name},
-		Scope:   scope,
-		Project: conv.Project,
-		Jira:    conv.Jira,
-		// GitLab is the conventions' GitLab connection block, which
-		// workmgmt.Target has carried since ADR-058 and this handler silently
-		// dropped (#3645): a gitlab-provider campaign otherwise lost its
-		// target-project override.
-		GitLab: conv.GitLab,
-	}
-
-	// THE THIRD SOURCE (E54.6 / #2238). Resolve the approved grooming order
-	// BEFORE the branch below, so its rank-ordered issue refs become the input
-	// to the EXISTING #2051 no-epic item path — no bespoke assembly, board write
-	// or dispatch path is added. The whole ladder runs against local
-	// run/artifact/approval state, so every refusal is reachable without a live
-	// forge. The order is read EXACTLY ONCE, here; nothing downstream re-reads a
-	// report or a board.
-	var groomingOrder *campaign.GroomingOrder
-	var groomingProvenance *campaignGroomingSourcePayload
-	var groomingGuard *campaign.GroomingCurrencyGuard
-	itemRefs := req.Items
-	if req.GroomingSource != nil {
-		var gerr error
-		groomingOrder, groomingProvenance, groomingGuard, gerr = s.resolveGroomingOrder(r.Context(), owner, name, req.Repo, req.GroomingSource)
-		if gerr != nil {
-			var gse *groomingSourceError
-			if errors.As(gerr, &gse) {
-				s.writeError(w, r, gse.Status, gse.Code, gse.Message, gse.Details)
-				return
-			}
-			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-				"could not resolve the grooming order", map[string]any{"error": gerr.Error()})
-			return
-		}
-		itemRefs = groomingOrder.Refs
-	}
-
-	// Resolve the epic-children (or no-epic item-set) result to assemble from.
-	// epic_ref PRESENT keeps the EpicChildrenQuerier sweep + optional
-	// FilterToSubset path byte-identical; epic_ref ABSENT + items present routes
-	// to the IssueSetDependencyResolver, which resolves each named issue's
-	// depends_on directly (there is no epic sweep to derive the edge set from,
-	// #2051). Both branches feed the same *EpicChildrenResult into
-	// campaign.Assemble below.
-	var result *workmgmt.EpicChildrenResult
-	if epicRef != "" {
-		querier, ok := provider.(workmgmt.EpicChildrenQuerier)
-		if !ok {
-			s.writeError(w, r, http.StatusNotImplemented, "epic_children_unsupported",
-				"the configured work-item provider cannot query epic children",
-				// The RESOLVED id (#3645), not conv.Provider: the 501 must name
-				// the provider actually dispatched against, which the
-				// request-level selector can override.
-				map[string]any{"provider": providerID})
-			return
-		}
-
-		result, err = querier.EpicChildren(r.Context(), workmgmt.EpicChildrenRequest{
-			Target: target,
-			Epic:   req.EpicRef,
-		})
-		if err != nil {
-			s.writeError(w, r, http.StatusBadGateway, "epic_children_query_failed",
-				"could not query the epic's children",
-				map[string]any{"error": err.Error()})
-			return
-		}
-
-		// Narrow the children to the OPTIONAL requested subset (#2003) before
-		// assembly. FilterToSubset fails closed on a ref that is not a child of the
-		// epic (campaign_item_not_child) and re-classifies an included->excluded
-		// depends_on into a dropped edge, which Assemble then surfaces as a dangling
-		// dependency. Empty/omitted items is a no-op that sweeps every child.
-		result, err = campaign.FilterToSubset(result, req.Items)
-		if err != nil {
-			// A ref that does not PARSE is caller input, and a DIFFERENT claim
-			// from "is not a child of the epic" — it names no issue at all
-			// (#2176). It is classified FIRST, on the shared
-			// workmgmt.ErrInvalidItemRef sentinel the no-epic resolver also
-			// wraps, so both assembly paths answer one code for one cause.
-			// Status is unchanged at 422; only the code gains precision.
-			if errors.Is(err, workmgmt.ErrInvalidItemRef) {
-				s.writeError(w, r, http.StatusUnprocessableEntity, "campaign_item_ref_invalid",
-					err.Error(), map[string]any{"epic_ref": req.EpicRef, "items": req.Items})
-				return
-			}
-			if errors.Is(err, campaign.ErrItemNotChild) {
-				s.writeError(w, r, http.StatusUnprocessableEntity, "campaign_item_not_child",
-					err.Error(), map[string]any{"epic_ref": req.EpicRef, "items": req.Items})
-				return
-			}
-			// Neither sentinel: the only remaining FilterToSubset failure is its
-			// nil epic-children result invariant, which is a server bug rather
-			// than caller input — correctly a 500.
-			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-				"filter campaign items to subset failed", map[string]any{"error": err.Error()})
-			return
-		}
-	} else {
-		// No-epic variant (#2051): items is the authoritative set. Resolve each
-		// named issue's depends_on directly. A provider that cannot resolve an
-		// arbitrary issue set (jira is interface-only in v0) fails 501, mirroring
-		// the epic_children_unsupported shape.
-		resolver, ok := provider.(workmgmt.IssueSetDependencyResolver)
-		if !ok {
-			s.writeError(w, r, http.StatusNotImplemented, "issue_set_resolution_unsupported",
-				"the configured work-item provider cannot resolve an explicit issue set without an epic",
-				// The RESOLVED id (#3645), not conv.Provider — see the epic
-				// branch's note above.
-				map[string]any{"provider": providerID})
-			return
-		}
-		// Bound the resolution (#3113). The deadline is anchored at
-		// requestStart (see handleCreateCampaign's opening comment), so the
-		// budget covers the whole span the caller's client timeout measures,
-		// not just the resolver call. The EPIC branch above is deliberately
-		// untouched: EpicChildren reads the sibling set in ONE ListSubIssues
-		// call, so it does not have the per-item round-trip cost this bounds.
-		budget := s.issueSetResolutionBudget()
-		resolveCtx, cancelResolve := context.WithDeadline(r.Context(), requestStart.Add(budget))
-		result, err = resolver.ResolveDependencies(resolveCtx, workmgmt.IssueSetRequest{
-			Target: target,
-			// itemRefs is req.Items for the #2051 no-epic variant and the
-			// grooming order's rank-ordered refs for the #2238 variant — one
-			// resolution path, two ways of naming the set.
-			Items: itemRefs,
-		})
-		cancelResolve()
-		if err != nil {
-			// The typed deadline outcome FIRST: the resolver returns
-			// *workmgmt.IssueSetResolutionTimeout in preference to any wrapped
-			// fetch error, and it carries honest counts. Surfacing it as a 504
-			// with those counts is what turns "the request gave up" into an
-			// actionable refusal naming a grooming_order_limit that provably
-			// fits. Anything else keeps today's 502 byte-for-byte.
-			var timeout *workmgmt.IssueSetResolutionTimeout
-			if errors.As(err, &timeout) {
-				details := map[string]any{
-					"resolved":       timeout.Resolved,
-					"items_total":    timeout.Total,
-					"budget_seconds": int(budget / time.Second),
-				}
-				// SuggestedLimit 0 means "no value could be PROVEN to fit", so
-				// the key is OMITTED rather than shipped as a 0 the operator
-				// would read as a suggestion to request nothing.
-				if timeout.SuggestedLimit > 0 {
-					details["suggested_grooming_order_limit"] = timeout.SuggestedLimit
-				}
-				s.writeError(w, r, http.StatusGatewayTimeout, "issue_set_resolution_timeout",
-					"resolving the campaign's issue set exceeded the server's budget", details)
-				return
-			}
-			// A ref that does not PARSE is caller input, not a provider fault:
-			// an operator typo in items used to triage as 502
-			// issue_set_resolution_failed, sending the reader after a transport
-			// problem that never happened (#2176). Classified AFTER the typed
-			// timeout (whose counts must not be shadowed) and BEFORE the generic
-			// 502, which stays byte-identical for every other resolver error.
-			// The message is the resolver's own error, which names the offending
-			// ref: it is OUR parse error, carrying no third-party response text,
-			// and writeError's default-deny detail redactor applies to 5xx only.
-			if errors.Is(err, workmgmt.ErrInvalidItemRef) {
-				s.writeError(w, r, http.StatusUnprocessableEntity, "campaign_item_ref_invalid",
-					err.Error(), map[string]any{"items": itemRefs})
-				return
-			}
-			s.writeError(w, r, http.StatusBadGateway, "issue_set_resolution_failed",
-				"could not resolve the campaign's issue set",
-				map[string]any{"error": err.Error()})
-			return
-		}
-	}
-
-	// PERMUTE THE RESOLVED CHILDREN INTO RATIFIED RANK ORDER. Assemble stamps
-	// each item's queue position from its index in res.Children, so this is what
-	// makes the approved order the order items are CREATED in and therefore the
-	// order ListCampaignItemsForCampaign (queue_position ASC) returns them and
-	// the engine's Eligible slice works. Edges/DroppedEdges are untouched:
-	// Assemble builds its index map from the actual Children order, so the DAG
-	// is invariant under the permutation. A set mismatch is a 500, not a 4xx —
-	// it means the provider returned a set the order did not name, which is a
-	// bug rather than operator input.
-	if groomingOrder != nil {
-		result, err = campaign.ReorderByPriority(result, groomingOrder.Numbers)
-		if err != nil {
-			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-				"the resolved issue set does not match the grooming order",
-				map[string]any{"error": err.Error()})
-			return
-		}
-	}
+	result := source.Result
+	groomingOrder := source.Order
+	groomingProvenance := source.Provenance
+	groomingGuard := source.Guard
 
 	// Assemble the wave-ordered DAG, failing closed on a dangling dependency
 	// (a depends_on target outside the assembled set) or a dependency cycle. The
@@ -1150,6 +814,528 @@ func (s *Server) handleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 // satisfiedDependencyPayloads maps the assembly's elided edges onto the wire
 // payload (#2953). Returns nil for an empty slice so the caller omits both the
 // response key and the audit.
+// campaignSourceRefusal is a typed, handler-independent refusal produced by the
+// shared campaign source helpers (validateCampaignSourceShape /
+// validateCampaignProviderSelector / resolveCampaignSource, #3647). It carries
+// exactly the four arguments s.writeError takes, so a caller maps it to a
+// response with no translation step — which is what lets POST /v0/campaigns and
+// POST /v0/campaigns/preview answer BYTE-IDENTICAL refusals for the same cause.
+// It composes groomingSourceError (same Status/Code/Message/Details shape)
+// rather than replacing it.
+type campaignSourceRefusal struct {
+	Status  int
+	Code    string
+	Message string
+	Details map[string]any
+}
+
+// campaignSourceResolution is the successful output of resolveCampaignSource:
+// the resolved item set to assemble from, plus the grooming provenance the
+// CREATE path threads onto the persisted campaign. The preview path reads
+// Result (and renders Provenance); it never uses Guard, which only matters to a
+// guarded INSERT.
+type campaignSourceResolution struct {
+	Result     *workmgmt.EpicChildrenResult
+	Order      *campaign.GroomingOrder
+	Provenance *campaignGroomingSourcePayload
+	Guard      *campaign.GroomingCurrencyGuard
+}
+
+// writeCampaignSourceRefusal renders a campaignSourceRefusal onto the response
+// with the SAME writeError call every inline refusal used before the extraction
+// (#3647), so no status, code, message or details key changes.
+func (s *Server) writeCampaignSourceRefusal(w http.ResponseWriter, r *http.Request, refusal *campaignSourceRefusal) {
+	s.writeError(w, r, refusal.Status, refusal.Code, refusal.Message, refusal.Details)
+}
+
+// validateCampaignSourceShape validates the SOURCE-SHAPE half of a campaign
+// create request: the repo owner/name split, the one-of epic_ref / items /
+// grooming_source rule, and grooming_source's mutual exclusion + run_id/limit
+// checks. It returns the trimmed epic ref and the split repo on success.
+//
+// Deliberately NOT here: pause_policy, operator_agent, working_dir and the
+// Idempotency-Key. Those are PERSISTENCE knobs of the create path, not source
+// shape — POST /v0/campaigns/preview rejects them as unknown body fields — so
+// they stay inline in handleCreateCampaign. The `provider` selector IS source
+// shape and is shared, but through its OWN helper
+// (validateCampaignProviderSelector) rather than being folded in here, so that
+// create's existing refusal PRECEDENCE — pause_policy/operator_agent/working_dir
+// ahead of provider (#3645) — is preserved byte-for-byte.
+func validateCampaignSourceShape(req createCampaignRequest) (epicRef, owner, name string, refusal *campaignSourceRefusal) {
+	var ok bool
+	owner, name, ok = splitRepoFullName(req.Repo)
+	if !ok {
+		return "", "", "", &campaignSourceRefusal{
+			Status:  http.StatusBadRequest,
+			Code:    "validation_failed",
+			Message: "repo must be in owner/name form",
+			Details: map[string]any{"field": "repo", "got": req.Repo},
+		}
+	}
+	// epic_ref is OPTIONAL as of #2051, but an empty request still fails closed:
+	// at least one of epic_ref / items must be present. epic_ref PRESENT keeps
+	// the epic-sweep + optional items-subset path byte-identical; epic_ref ABSENT
+	// with items present routes to the no-epic branch below.
+	epicRef = strings.TrimSpace(req.EpicRef)
+	if epicRef == "" && len(req.Items) == 0 && req.GroomingSource == nil {
+		return "", "", "", &campaignSourceRefusal{
+			Status:  http.StatusBadRequest,
+			Code:    "validation_failed",
+			Message: "one of epic_ref, items or grooming_source is required",
+			Details: map[string]any{"field": "epic_ref"},
+		}
+	}
+	// grooming_source is the THIRD source and is MUTUALLY EXCLUSIVE with the
+	// other two. Refusal, not precedence: three sources with a silent winner is
+	// how an operator gets a campaign they did not ask for. Validated HERE, with
+	// the other body checks and BEFORE the installation resolution, so the
+	// conflict costs no forge round-trip.
+	if req.GroomingSource != nil {
+		if epicRef != "" {
+			return "", "", "", &campaignSourceRefusal{
+				Status:  http.StatusBadRequest,
+				Code:    "validation_failed",
+				Message: "grooming_source cannot be combined with epic_ref: an approved grooming order IS the item set",
+				Details: map[string]any{"field": "grooming_source", "conflicts_with": "epic_ref"},
+			}
+		}
+		if len(req.Items) > 0 {
+			return "", "", "", &campaignSourceRefusal{
+				Status:  http.StatusBadRequest,
+				Code:    "validation_failed",
+				Message: "grooming_source cannot be combined with items: an approved grooming order IS the item set",
+				Details: map[string]any{"field": "grooming_source", "conflicts_with": "items"},
+			}
+		}
+		if strings.TrimSpace(req.GroomingSource.RunID) == "" {
+			return "", "", "", &campaignSourceRefusal{
+				Status:  http.StatusBadRequest,
+				Code:    "validation_failed",
+				Message: "grooming_source.run_id is required",
+				Details: map[string]any{"field": "grooming_source.run_id"},
+			}
+		}
+		if req.GroomingSource.Limit < 0 {
+			return "", "", "", &campaignSourceRefusal{
+				Status:  http.StatusBadRequest,
+				Code:    "validation_failed",
+				Message: "grooming_source.limit must be >= 0 (0 means no cap)",
+				Details: map[string]any{"field": "grooming_source.limit", "got": req.GroomingSource.Limit},
+			}
+		}
+	}
+	return epicRef, owner, name, nil
+}
+
+// validateCampaignProviderSelector validates the OPTIONAL request-level
+// work-item provider selector (#3645). A non-empty value must name a LIVE
+// registered provider, checked BEFORE the conventions load, the provider
+// dispatch and the installation lookup — so a typo costs no forge round-trip and
+// the refusal is reachable without a live forge. Both field/got and registered
+// are already allow-listed in errors.go, and a 4xx is not redacted, so the
+// caller learns the exact accepted set from the refusal. Empty/omitted falls
+// through to the conventions-resolved provider (the unchanged default).
+//
+// SHARED by POST /v0/campaigns and POST /v0/campaigns/preview (#3647): a preview
+// that could not be pointed at the provider the create would be pointed at would
+// report a DAG assembled against a different issue tracker than the one the
+// operator is about to campaign over — a divergence the shared resolver exists
+// to rule out.
+func validateCampaignProviderSelector(req createCampaignRequest) *campaignSourceRefusal {
+	p := strings.TrimSpace(req.Provider)
+	if p == "" {
+		return nil
+	}
+	registered := registeredWorkItemProvidersFn()
+	if containsRef(registered, p) {
+		return nil
+	}
+	return &campaignSourceRefusal{
+		Status:  http.StatusBadRequest,
+		Code:    "validation_failed",
+		Message: "provider must name a work-item provider this deployment has registered",
+		Details: map[string]any{"field": "provider", "got": req.Provider, "registered": registered},
+	}
+}
+
+// resolveCampaignSource resolves the item set a campaign would assemble over,
+// shared VERBATIM by POST /v0/campaigns and POST /v0/campaigns/preview (#3647).
+// It runs the work-management provider resolution, the (provider-gated) GitHub
+// installation lookup, the grooming-order resolution, the
+// epic-sweep-or-issue-set branch and the ratified-rank permutation, returning
+// either the resolution or a typed refusal carrying the byte-identical
+// status/code/message/details the inline form wrote.
+//
+// It is ONE helper rather than two implementations because a preview that
+// diverges from what create would do is worse than no preview: every refusal an
+// operator can hit at create is reachable at preview, by construction.
+//
+// requestStart is a PARAMETER, not re-anchored at this function's own entry, so
+// the #3113 no-epic issue-set deadline keeps measuring from the CALLER's handler
+// entry — see handleCreateCampaign's opening comment for why that anchor is
+// load-bearing. Re-basing it here would silently widen the bounded span past the
+// MCP client's 11-minute wall.
+//
+// owner/name are parameters rather than re-split from req.Repo so the split is
+// performed exactly once, by validateCampaignSourceShape, which is also what
+// refuses a malformed repo.
+func (s *Server) resolveCampaignSource(ctx context.Context, requestStart time.Time, req createCampaignRequest, epicRef, owner, name string) (*campaignSourceResolution, *campaignSourceRefusal) {
+	// Resolve the work-management provider (#3645). This runs AHEAD of the
+	// GitHub App installation lookup below: the installation is irrelevant to a
+	// non-GitHub tracker, and running it first meant a repo whose provider is
+	// gitlab/jira died on 422 repo_not_installed before the provider was even
+	// considered — which would make the request-level `provider` selector
+	// decorative on any deployment that also has GitHub credentials wired.
+	conv, err := conventionsLoader(ctx, req.Repo)
+	if err != nil {
+		return nil, &campaignSourceRefusal{
+			Status:  http.StatusInternalServerError,
+			Code:    "internal_error",
+			Message: "could not load work-management conventions",
+			Details: map[string]any{"error": err.Error()},
+		}
+	}
+	providerID := resolveCampaignProviderID(&req, conv)
+	provider, err := workItemProviderFor(providerID)
+	if err != nil {
+		var unk *workmgmt.UnknownProviderError
+		if errors.As(err, &unk) {
+			// TWO NAMED MODES behind one error (#3645), mirroring
+			// handleFileProductReport's #3628 shape. Both messages stay STATIC
+			// literals with the product-owned facts on the allow-listed
+			// provider / registered / remedy detail keys, per the E67.15/#2587
+			// raw-cause posture — unk.Error() as the message is a raw-cause
+			// syntax the AST guard flags. The cause itself rides
+			// internalCauseKey so writeError still joins it to error_ref in the
+			// operator log rather than dropping it (E67.29 / #2631) — the AST
+			// guard can prove the message is static but not that the cause is
+			// retained, which is what
+			// TestCreateCampaign_UnknownProvider_RedactsCauseJoinsInLog asserts
+			// behaviourally.
+			//
+			// The handler REFUSES in mode m2 rather than silently substituting
+			// the sole registered provider: silently retargeting an operator's
+			// batch at a DIFFERENT issue tracker is the same class as the
+			// grooming_source guard's "three sources with a silent winner is
+			// how an operator gets a campaign they did not ask for", with a
+			// larger blast radius. The request-level `provider` selector is
+			// what makes the refusal ONE CALL away from corrected.
+			if len(unk.Known) == 0 {
+				// Mode m1: the deployment registered NO work-item provider at
+				// all. That is operator configuration, not an unimplemented
+				// provider, so the remedy names the WIRING whose absence leaves
+				// the registry empty. `remedy` is a STATIC literal and is
+				// allow-listed in errors.go, because a 501 is a 5xx and the
+				// default-deny redactor would otherwise strip exactly the
+				// actionable half of the refusal.
+				return nil, &campaignSourceRefusal{
+					Status:  http.StatusNotImplemented,
+					Code:    "provider_unimplemented",
+					Message: "this deployment has no work-item provider registered, so campaigns cannot be assembled",
+					Details: map[string]any{
+						"provider":       unk.ID,
+						"registered":     unk.Known,
+						"remedy":         "configure the GitHub App credentials (FISHHAWKD_GITHUB_APP_ID and FISHHAWKD_GITHUB_APP_PRIVATE_KEY_FILE) to register github_projects, or FISHHAWKD_GITLAB_BASE_URL and FISHHAWKD_GITLAB_TOKEN to register gitlab, so a work-item provider registers at startup",
+						internalCauseKey: unk.Error(),
+					},
+				}
+			}
+			// Mode m2: providers ARE registered, but not the resolved id. The
+			// remedy names BOTH the IN-BAND fix (the request-level selector,
+			// correctable without a daemon restart) and the DURABLE ones. It
+			// deliberately does NOT name FISHHAWKD_SINGLE_TENANT_PROVIDER: that
+			// flag selects the single-tenant ACCOUNT's forge (ADR-057 Mode 1),
+			// which feeds the conventions FETCH forge — it never sets
+			// Conventions.Provider.
+			return nil, &campaignSourceRefusal{
+				Status:  http.StatusNotImplemented,
+				Code:    "provider_unimplemented",
+				Message: "the resolved work-item provider is not implemented",
+				Details: map[string]any{
+					"provider":       unk.ID,
+					"registered":     unk.Known,
+					"remedy":         "pass `provider` on this request naming one of the registered ids to correct it in-band, or change it durably via the repo's .fishhawk/work-management.yaml `provider:` field or the deployment-level FISHHAWKD_WORKMGMT_CONVENTIONS override",
+					internalCauseKey: unk.Error(),
+				},
+			}
+		}
+		return nil, &campaignSourceRefusal{
+			Status:  http.StatusInternalServerError,
+			Code:    "internal_error",
+			Message: "could not resolve work-item provider",
+			Details: map[string]any{"error": err.Error()},
+		}
+	}
+
+	// Resolve the App installation for the target repo (#713 / runs.go:498).
+	// A runless create has no run row to carry the id, so resolve it directly:
+	// the real GitHub provider needs it to query the epic's children.
+	//
+	// GATED ON THE RESOLVED PROVIDER (#3645): only the github_projects branch
+	// needs it. A non-github provider leaves scope at its zero value, which IS
+	// the existing unresolved-installation posture (forge.CredentialScope.IsZero)
+	// and the same posture the GitLab provider already runs under (its
+	// credentials are supplied at construction from FISHHAWKD_GITLAB_*). Mirrors
+	// workitems.go's `conv.Provider == workmgmtgithub.ProviderName` guard.
+	var scope forge.CredentialScope
+	if s.cfg.GitHub != nil && providerID == workmgmtgithub.ProviderName {
+		id, ierr := s.cfg.GitHub.GetRepoInstallation(ctx, forge.RepoRef{Owner: owner, Name: name})
+		switch {
+		case ierr == nil:
+			scope = forge.FromGitHubInstallationID(id)
+		case errors.Is(ierr, forge.ErrNotInstalled):
+			return nil, &campaignSourceRefusal{
+				Status:  http.StatusUnprocessableEntity,
+				Code:    "repo_not_installed",
+				Message: "GitHub App is not installed on the target repository",
+				Details: map[string]any{"repo": req.Repo},
+			}
+		default:
+			return nil, &campaignSourceRefusal{
+				Status:  http.StatusBadGateway,
+				Code:    "installation_resolution_failed",
+				Message: "could not resolve the GitHub App installation for the target repo",
+				Details: map[string]any{"error": ierr.Error()},
+			}
+		}
+	}
+
+	// The filing Target is shared by both branches (epic sweep + no-epic
+	// item-set resolution).
+	target := workmgmt.Target{
+		Repo:    workmgmt.Repo{Owner: owner, Name: name},
+		Scope:   scope,
+		Project: conv.Project,
+		Jira:    conv.Jira,
+		// GitLab is the conventions' GitLab connection block, which
+		// workmgmt.Target has carried since ADR-058 and this handler silently
+		// dropped (#3645): a gitlab-provider campaign otherwise lost its
+		// target-project override.
+		GitLab: conv.GitLab,
+	}
+
+	// THE THIRD SOURCE (E54.6 / #2238). Resolve the approved grooming order
+	// BEFORE the branch below, so its rank-ordered issue refs become the input
+	// to the EXISTING #2051 no-epic item path — no bespoke assembly, board write
+	// or dispatch path is added. The whole ladder runs against local
+	// run/artifact/approval state, so every refusal is reachable without a live
+	// forge. The order is read EXACTLY ONCE, here; nothing downstream re-reads a
+	// report or a board.
+	var groomingOrder *campaign.GroomingOrder
+	var groomingProvenance *campaignGroomingSourcePayload
+	var groomingGuard *campaign.GroomingCurrencyGuard
+	itemRefs := req.Items
+	if req.GroomingSource != nil {
+		var gerr error
+		groomingOrder, groomingProvenance, groomingGuard, gerr = s.resolveGroomingOrder(ctx, owner, name, req.Repo, req.GroomingSource)
+		if gerr != nil {
+			var gse *groomingSourceError
+			if errors.As(gerr, &gse) {
+				return nil, &campaignSourceRefusal{
+					Status:  gse.Status,
+					Code:    gse.Code,
+					Message: gse.Message,
+					Details: gse.Details,
+				}
+			}
+			return nil, &campaignSourceRefusal{
+				Status:  http.StatusInternalServerError,
+				Code:    "internal_error",
+				Message: "could not resolve the grooming order",
+				Details: map[string]any{"error": gerr.Error()},
+			}
+		}
+		itemRefs = groomingOrder.Refs
+	}
+
+	// Resolve the epic-children (or no-epic item-set) result to assemble from.
+	// epic_ref PRESENT keeps the EpicChildrenQuerier sweep + optional
+	// FilterToSubset path byte-identical; epic_ref ABSENT + items present routes
+	// to the IssueSetDependencyResolver, which resolves each named issue's
+	// depends_on directly (there is no epic sweep to derive the edge set from,
+	// #2051). Both branches feed the same *EpicChildrenResult into
+	// campaign.Assemble at the call site.
+	var result *workmgmt.EpicChildrenResult
+	if epicRef != "" {
+		querier, ok := provider.(workmgmt.EpicChildrenQuerier)
+		if !ok {
+			return nil, &campaignSourceRefusal{
+				Status:  http.StatusNotImplemented,
+				Code:    "epic_children_unsupported",
+				Message: "the configured work-item provider cannot query epic children",
+				// The RESOLVED id (#3645), not conv.Provider: the 501 must name
+				// the provider actually dispatched against, which the
+				// request-level selector can override.
+				Details: map[string]any{"provider": providerID},
+			}
+		}
+
+		result, err = querier.EpicChildren(ctx, workmgmt.EpicChildrenRequest{
+			Target: target,
+			Epic:   req.EpicRef,
+		})
+		if err != nil {
+			return nil, &campaignSourceRefusal{
+				Status:  http.StatusBadGateway,
+				Code:    "epic_children_query_failed",
+				Message: "could not query the epic's children",
+				Details: map[string]any{"error": err.Error()},
+			}
+		}
+
+		// Narrow the children to the OPTIONAL requested subset (#2003) before
+		// assembly. FilterToSubset fails closed on a ref that is not a child of the
+		// epic (campaign_item_not_child) and re-classifies an included->excluded
+		// depends_on into a dropped edge, which Assemble then surfaces as a dangling
+		// dependency. Empty/omitted items is a no-op that sweeps every child.
+		result, err = campaign.FilterToSubset(result, req.Items)
+		if err != nil {
+			// A ref that does not PARSE is caller input, and a DIFFERENT claim
+			// from "is not a child of the epic" — it names no issue at all
+			// (#2176). It is classified FIRST, on the shared
+			// workmgmt.ErrInvalidItemRef sentinel the no-epic resolver also
+			// wraps, so both assembly paths answer one code for one cause.
+			// Status is unchanged at 422; only the code gains precision.
+			if errors.Is(err, workmgmt.ErrInvalidItemRef) {
+				return nil, &campaignSourceRefusal{
+					Status:  http.StatusUnprocessableEntity,
+					Code:    "campaign_item_ref_invalid",
+					Message: err.Error(),
+					Details: map[string]any{"epic_ref": req.EpicRef, "items": req.Items},
+				}
+			}
+			if errors.Is(err, campaign.ErrItemNotChild) {
+				return nil, &campaignSourceRefusal{
+					Status:  http.StatusUnprocessableEntity,
+					Code:    "campaign_item_not_child",
+					Message: err.Error(),
+					Details: map[string]any{"epic_ref": req.EpicRef, "items": req.Items},
+				}
+			}
+			// Neither sentinel: the only remaining FilterToSubset failure is its
+			// nil epic-children result invariant, which is a server bug rather
+			// than caller input — correctly a 500.
+			return nil, &campaignSourceRefusal{
+				Status:  http.StatusInternalServerError,
+				Code:    "internal_error",
+				Message: "filter campaign items to subset failed",
+				Details: map[string]any{"error": err.Error()},
+			}
+		}
+	} else {
+		// No-epic variant (#2051): items is the authoritative set. Resolve each
+		// named issue's depends_on directly. A provider that cannot resolve an
+		// arbitrary issue set (jira is interface-only in v0) fails 501, mirroring
+		// the epic_children_unsupported shape.
+		resolver, ok := provider.(workmgmt.IssueSetDependencyResolver)
+		if !ok {
+			return nil, &campaignSourceRefusal{
+				Status:  http.StatusNotImplemented,
+				Code:    "issue_set_resolution_unsupported",
+				Message: "the configured work-item provider cannot resolve an explicit issue set without an epic",
+				// The RESOLVED id (#3645), not conv.Provider — see the epic
+				// branch's note above.
+				Details: map[string]any{"provider": providerID},
+			}
+		}
+		// Bound the resolution (#3113). The deadline is anchored at
+		// requestStart (see handleCreateCampaign's opening comment), so the
+		// budget covers the whole span the caller's client timeout measures,
+		// not just the resolver call. The EPIC branch above is deliberately
+		// untouched: EpicChildren reads the sibling set in ONE ListSubIssues
+		// call, so it does not have the per-item round-trip cost this bounds.
+		budget := s.issueSetResolutionBudget()
+		resolveCtx, cancelResolve := context.WithDeadline(ctx, requestStart.Add(budget))
+		result, err = resolver.ResolveDependencies(resolveCtx, workmgmt.IssueSetRequest{
+			Target: target,
+			// itemRefs is req.Items for the #2051 no-epic variant and the
+			// grooming order's rank-ordered refs for the #2238 variant — one
+			// resolution path, two ways of naming the set.
+			Items: itemRefs,
+		})
+		cancelResolve()
+		if err != nil {
+			// The typed deadline outcome FIRST: the resolver returns
+			// *workmgmt.IssueSetResolutionTimeout in preference to any wrapped
+			// fetch error, and it carries honest counts. Surfacing it as a 504
+			// with those counts is what turns "the request gave up" into an
+			// actionable refusal naming a grooming_order_limit that provably
+			// fits. Anything else keeps today's 502 byte-for-byte.
+			var timeout *workmgmt.IssueSetResolutionTimeout
+			if errors.As(err, &timeout) {
+				details := map[string]any{
+					"resolved":       timeout.Resolved,
+					"items_total":    timeout.Total,
+					"budget_seconds": int(budget / time.Second),
+				}
+				// SuggestedLimit 0 means "no value could be PROVEN to fit", so
+				// the key is OMITTED rather than shipped as a 0 the operator
+				// would read as a suggestion to request nothing.
+				if timeout.SuggestedLimit > 0 {
+					details["suggested_grooming_order_limit"] = timeout.SuggestedLimit
+				}
+				return nil, &campaignSourceRefusal{
+					Status:  http.StatusGatewayTimeout,
+					Code:    "issue_set_resolution_timeout",
+					Message: "resolving the campaign's issue set exceeded the server's budget",
+					Details: details,
+				}
+			}
+			// A ref that does not PARSE is caller input, not a provider fault:
+			// an operator typo in items used to triage as 502
+			// issue_set_resolution_failed, sending the reader after a transport
+			// problem that never happened (#2176). Classified AFTER the typed
+			// timeout (whose counts must not be shadowed) and BEFORE the generic
+			// 502, which stays byte-identical for every other resolver error.
+			// The message is the resolver's own error, which names the offending
+			// ref: it is OUR parse error, carrying no third-party response text,
+			// and writeError's default-deny detail redactor applies to 5xx only.
+			if errors.Is(err, workmgmt.ErrInvalidItemRef) {
+				return nil, &campaignSourceRefusal{
+					Status:  http.StatusUnprocessableEntity,
+					Code:    "campaign_item_ref_invalid",
+					Message: err.Error(),
+					Details: map[string]any{"items": itemRefs},
+				}
+			}
+			return nil, &campaignSourceRefusal{
+				Status:  http.StatusBadGateway,
+				Code:    "issue_set_resolution_failed",
+				Message: "could not resolve the campaign's issue set",
+				Details: map[string]any{"error": err.Error()},
+			}
+		}
+	}
+
+	// PERMUTE THE RESOLVED CHILDREN INTO RATIFIED RANK ORDER. Assemble stamps
+	// each item's queue position from its index in res.Children, so this is what
+	// makes the approved order the order items are CREATED in and therefore the
+	// order ListCampaignItemsForCampaign (queue_position ASC) returns them and
+	// the engine's Eligible slice works. Edges/DroppedEdges are untouched:
+	// Assemble builds its index map from the actual Children order, so the DAG
+	// is invariant under the permutation. A set mismatch is a 500, not a 4xx —
+	// it means the provider returned a set the order did not name, which is a
+	// bug rather than operator input.
+	if groomingOrder != nil {
+		result, err = campaign.ReorderByPriority(result, groomingOrder.Numbers)
+		if err != nil {
+			return nil, &campaignSourceRefusal{
+				Status:  http.StatusInternalServerError,
+				Code:    "internal_error",
+				Message: "the resolved issue set does not match the grooming order",
+				Details: map[string]any{"error": err.Error()},
+			}
+		}
+	}
+
+	return &campaignSourceResolution{
+		Result:     result,
+		Order:      groomingOrder,
+		Provenance: groomingProvenance,
+		Guard:      groomingGuard,
+	}, nil
+}
+
 func satisfiedDependencyPayloads(edges []workmgmt.SatisfiedEdge) []satisfiedDependencyPayload {
 	if len(edges) == 0 {
 		return nil
