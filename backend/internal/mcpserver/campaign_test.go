@@ -262,6 +262,117 @@ func TestStartCampaign_InvalidItemRef_MapsActionableError(t *testing.T) {
 	}
 }
 
+// --- epic_ref classifier + capability refusals (#3648) ---
+
+// TestStartCampaign_GroupEpicRef_MapsItemsAlternative maps the backend's 422
+// campaign_epic_ref_group_unsupported onto an operator remedy naming the items
+// alternative, on a provider that DOES serve items mode
+// (campaign_sources_supported=["items"]).
+func TestStartCampaign_GroupEpicRef_MapsItemsAlternative(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.createCampaignStatus = http.StatusUnprocessableEntity
+	fb.createCampaignErr = `{"error":{"code":"campaign_epic_ref_group_unsupported","message":"group epics not modeled","details":{"epic_ref_form":"gitlab_group_epic","campaign_sources_supported":["items"]}}}`
+	r := newResolver(srv, nil)
+
+	_, _, err := r.startCampaign(context.Background(), nil, StartCampaignInput{Repo: "x/y", EpicRef: "mygroup&5"})
+	if err == nil {
+		t.Fatal("err = nil, want campaign_epic_ref_group_unsupported mapping")
+	}
+	for _, want := range []string{"campaign_epic_ref_group_unsupported", "group epic", "items"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("err %q missing %q", err.Error(), want)
+		}
+	}
+}
+
+// TestStartCampaign_EpicRefInvalid_NamesThreeForms maps 422
+// campaign_epic_ref_invalid onto a remedy naming the three accepted same-repo
+// ref forms.
+func TestStartCampaign_EpicRefInvalid_NamesThreeForms(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.createCampaignStatus = http.StatusUnprocessableEntity
+	fb.createCampaignErr = `{"error":{"code":"campaign_epic_ref_invalid","message":"not a recognized issue reference","details":{"epic_ref_form":"unrecognized"}}}`
+	r := newResolver(srv, nil)
+
+	_, _, err := r.startCampaign(context.Background(), nil, StartCampaignInput{Repo: "x/y", EpicRef: "abc"})
+	if err == nil {
+		t.Fatal("err = nil, want campaign_epic_ref_invalid mapping")
+	}
+	for _, want := range []string{"campaign_epic_ref_invalid", "25", "#25", "issue:25"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("err %q missing %q", err.Error(), want)
+		}
+	}
+}
+
+// TestStartCampaign_EpicChildrenUnsupported_ItemsSources_NamesItems maps 501
+// epic_children_unsupported with campaign_sources_supported=["items"] onto a
+// remedy naming items and NOT naming epic_ref (the source that just failed).
+func TestStartCampaign_EpicChildrenUnsupported_ItemsSources_NamesItems(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.createCampaignStatus = http.StatusNotImplemented
+	fb.createCampaignErr = `{"error":{"code":"epic_children_unsupported","message":"cannot query epic children","details":{"provider":"someprov","campaign_sources_supported":["items"]}}}`
+	r := newResolver(srv, nil)
+
+	_, _, err := r.startCampaign(context.Background(), nil, StartCampaignInput{Repo: "x/y", EpicRef: "issue:99"})
+	if err == nil {
+		t.Fatal("err = nil, want epic_children_unsupported mapping")
+	}
+	if !strings.Contains(err.Error(), "items") {
+		t.Errorf("err %q must name the items source that works", err.Error())
+	}
+	if strings.Contains(err.Error(), "epic_ref") {
+		t.Errorf("err %q must NOT name epic_ref — that is the source that just 501'd", err.Error())
+	}
+}
+
+// TestStartCampaign_EpicChildrenUnsupported_EmptySources_NamesNeitherMode is the
+// GitLab dishonesty the issue reports: 501 epic_children_unsupported with an
+// EMPTY campaign_sources_supported list must NOT advertise a mode that also 501s.
+// The remedy names NEITHER items nor epic_ref and falls back to
+// fishhawk_start_run (operator condition 1).
+func TestStartCampaign_EpicChildrenUnsupported_EmptySources_NamesNeitherMode(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.createCampaignStatus = http.StatusNotImplemented
+	fb.createCampaignErr = `{"error":{"code":"epic_children_unsupported","message":"cannot query epic children","details":{"provider":"gitlab","campaign_sources_supported":[]}}}`
+	r := newResolver(srv, nil)
+
+	_, _, err := r.startCampaign(context.Background(), nil, StartCampaignInput{Repo: "x/y", EpicRef: "issue:99"})
+	if err == nil {
+		t.Fatal("err = nil, want epic_children_unsupported mapping")
+	}
+	if !strings.Contains(err.Error(), "fishhawk_start_run") {
+		t.Errorf("err %q must fall back to fishhawk_start_run when no source works", err.Error())
+	}
+	// The dishonesty guard: the remedy must advertise NEITHER mode. The error
+	// CODE ("epic_children_unsupported") legitimately contains "epic" but never
+	// the literal "epic_ref"; the empty-sources remedy contains neither word.
+	if strings.Contains(err.Error(), "items") {
+		t.Errorf("empty-sources remedy %q must not advertise items (it also 501s)", err.Error())
+	}
+	if strings.Contains(err.Error(), "epic_ref") {
+		t.Errorf("empty-sources remedy %q must not advertise epic_ref (it also 501s)", err.Error())
+	}
+}
+
+// TestStartCampaign_EpicChildrenUnsupported_AbsentDetail_FallsBack pins the
+// older-backend path: a 501 with NO campaign_sources_supported detail degrades to
+// the same source-agnostic fishhawk_start_run remedy as the empty-list case.
+func TestStartCampaign_EpicChildrenUnsupported_AbsentDetail_FallsBack(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.createCampaignStatus = http.StatusNotImplemented
+	fb.createCampaignErr = `{"error":{"code":"epic_children_unsupported","message":"cannot query epic children"}}`
+	r := newResolver(srv, nil)
+
+	_, _, err := r.startCampaign(context.Background(), nil, StartCampaignInput{Repo: "x/y", EpicRef: "issue:99"})
+	if err == nil {
+		t.Fatal("err = nil, want epic_children_unsupported mapping")
+	}
+	if !strings.Contains(err.Error(), "fishhawk_start_run") {
+		t.Errorf("err %q must fall back to fishhawk_start_run when the detail is absent (older backend)", err.Error())
+	}
+}
+
 // TestStartCampaign_OmittedPausePolicy_LeavesBodyEmpty pins the optional
 // pause_policy: omitting it sends an empty value (the backend normalizes it).
 func TestStartCampaign_OmittedPausePolicy_LeavesBodyEmpty(t *testing.T) {

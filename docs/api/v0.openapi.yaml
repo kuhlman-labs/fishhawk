@@ -12825,6 +12825,19 @@ paths:
             `502 issue_set_resolution_failed` a typo'd ref used to draw — a
             malformed ref is caller input, not a provider fault.
 
+            #3648 `epic_ref` shape refusals, classified at the request edge
+            before any forge round-trip: `campaign_epic_ref_invalid` — a
+            cross-repo `owner/name#N` reference (the epic is resolved in the
+            campaign's OWN repo) or an unrecognized `epic_ref`; it REPLACES the
+            transport-class `502 epic_children_query_failed` an unparseable
+            `epic_ref` used to draw. `campaign_epic_ref_group_unsupported` — a
+            GitLab group-epic ref (`group&5`, or a `/-/epics/N` URL); group
+            epics are a Premium group-level object v0 does not model. Both carry
+            `details.got` + `details.epic_ref_form`, and the group-epic refusal
+            additionally carries `details.campaign_sources_supported` so its
+            remedy is capability-aware (it recommends `items` mode only where the
+            resolved provider serves it).
+
             E54.6 / #2238 `grooming_source` refusals, each actionable:
             `grooming_order_repo_mismatch` — that grooming run groomed a
             different repo; `grooming_order_absent` — the run shipped no
@@ -12866,7 +12879,11 @@ paths:
             children (epic_ref path); `issue_set_resolution_unsupported` — the
             provider cannot resolve an explicit issue set without an epic
             (no-epic `items`-only path). Both name the RESOLVED provider in
-            `details.provider`.
+            `details.provider` and carry `details.campaign_sources_supported`
+            (#3648): the campaign sources the resolved provider actually serves
+            (`epic_ref` / `items`, in that order), empty on a File-only provider
+            like `gitlab` where neither mode works, so the remedy never
+            advertises a mode that also 501s.
         '502':
           description: |
             `installation_resolution_failed` — a transient failure resolving

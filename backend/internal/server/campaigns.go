@@ -75,6 +75,27 @@ func (s *Server) issueSetResolutionBudget() time.Duration {
 	return s.cfg.IssueSetResolutionBudget
 }
 
+// campaignSourcesSupported reports which campaign SOURCES the resolved provider
+// can serve, in a fixed order ("epic_ref", "items"), computed purely from
+// COMPILE-TIME capability assertions (#3648). It returns a non-nil empty slice
+// when the provider implements neither — the gitlab provider is File-only, so
+// NEITHER campaign mode works on it today (operator condition 1).
+//
+// The returned list is product-owned static enum data derived only from type
+// assertions — never from an error, a subprocess, or a third-party response —
+// so it satisfies redactableDetailKeys' membership rule and can ride a 5xx
+// refusal's details (the two 501 capability refusals enrich themselves with it).
+func campaignSourcesSupported(p workmgmt.Provider) []string {
+	sources := make([]string, 0, 2)
+	if _, ok := p.(workmgmt.EpicChildrenQuerier); ok {
+		sources = append(sources, "epic_ref")
+	}
+	if _, ok := p.(workmgmt.IssueSetDependencyResolver); ok {
+		sources = append(sources, "items")
+	}
+	return sources
+}
+
 // campaignResponse is the JSON shape POST /v0/campaigns and
 // GET /v0/campaigns/{id} return. Field names + types match
 // docs/api/v0.openapi.yaml's `Campaign` schema exactly, mirroring
@@ -885,6 +906,37 @@ func validateCampaignSourceShape(req createCampaignRequest) (epicRef, owner, nam
 			Details: map[string]any{"field": "epic_ref"},
 		}
 	}
+	// Classify a non-empty epic_ref at the server EDGE, before any forge
+	// round-trip (#3648). ClassifyEpicRef is pure and fail-soft: the issue form
+	// (the only form the epic path can resolve) flows through byte-identically,
+	// so every ref accepted today is still accepted. A cross-repo ref and an
+	// unrecognized ref are refused HERE with 422 — a same-repo epic ref is what
+	// the epic path resolves, so these two are caller-input faults regardless of
+	// which provider is configured, and refusing them early costs no round-trip.
+	// This also fixes the pre-#3648 mis-classification the issue headlines: an
+	// unparseable epic_ref used to collapse into a downstream 502
+	// epic_children_query_failed (a transport code for caller input) on GitHub.
+	// The GROUP-EPIC form is deliberately NOT refused here — its remedy must be
+	// capability-aware (operator condition 1), so it is refused after provider
+	// resolution in resolveCampaignSource.
+	if epicRef != "" {
+		switch workmgmt.ClassifyEpicRef(epicRef).Form {
+		case workmgmt.EpicRefFormCrossRepo:
+			return "", "", "", &campaignSourceRefusal{
+				Status:  http.StatusUnprocessableEntity,
+				Code:    "campaign_epic_ref_invalid",
+				Message: "the epic is resolved inside the campaign's own repo, so a cross-repo owner/name#N reference names no epic here; pass an epic in this repo as N, #N or issue:N",
+				Details: map[string]any{"field": "epic_ref", "got": epicRef, "epic_ref_form": string(workmgmt.EpicRefFormCrossRepo)},
+			}
+		case workmgmt.EpicRefFormUnrecognized:
+			return "", "", "", &campaignSourceRefusal{
+				Status:  http.StatusUnprocessableEntity,
+				Code:    "campaign_epic_ref_invalid",
+				Message: "epic_ref is not a recognized issue reference; pass N, #N or issue:N naming an epic issue in the campaign's repo",
+				Details: map[string]any{"field": "epic_ref", "got": epicRef, "epic_ref_form": string(workmgmt.EpicRefFormUnrecognized)},
+			}
+		}
+	}
 	// grooming_source is the THIRD source and is MUTUALLY EXCLUSIVE with the
 	// other two. Refusal, not precedence: three sources with a silent winner is
 	// how an operator gets a campaign they did not ask for. Validated HERE, with
@@ -1067,6 +1119,31 @@ func (s *Server) resolveCampaignSource(ctx context.Context, requestStart time.Ti
 		}
 	}
 
+	// A GitLab group-epic ref is refused HERE, after provider resolution, so the
+	// remedy names only campaign sources the RESOLVED provider actually supports
+	// (operator condition 1 / #3648). A GitLab group epic is a Premium
+	// group-level object v0 does not decompose; the alternative is to assemble
+	// over the epic's child issues via items — but that is only a real remedy on
+	// a provider implementing the items-mode capability, which the gitlab
+	// provider (File-only) does NOT. campaign_sources_supported rides the 422
+	// details (4xx, so not subject to the 5xx redactor). The message is a static
+	// literal selected by capability — never interpolated from an error — so the
+	// raw-cause AST guard is satisfied. Refused before the installation lookup so
+	// it costs no forge round-trip.
+	if epicRef != "" && workmgmt.ClassifyEpicRef(epicRef).Form == workmgmt.EpicRefFormGroupEpic {
+		sources := campaignSourcesSupported(provider)
+		msg := "a GitLab group epic is a Premium group-level object that Fishhawk's v0 epic decomposition does not model; this work-item provider supports no items campaign source yet, so its child issues cannot be assembled here — drive each issue standalone with fishhawk_start_run"
+		if containsRef(sources, "items") {
+			msg = "a GitLab group epic is a Premium group-level object that Fishhawk's v0 epic decomposition does not model; assemble the campaign over the epic's child issues by passing them as items with no epic_ref"
+		}
+		return nil, &campaignSourceRefusal{
+			Status:  http.StatusUnprocessableEntity,
+			Code:    "campaign_epic_ref_group_unsupported",
+			Message: msg,
+			Details: map[string]any{"field": "epic_ref", "got": epicRef, "epic_ref_form": string(workmgmt.EpicRefFormGroupEpic), "campaign_sources_supported": sources},
+		}
+	}
+
 	// Resolve the App installation for the target repo (#713 / runs.go:498).
 	// A runless create has no run row to carry the id, so resolve it directly:
 	// the real GitHub provider needs it to query the epic's children.
@@ -1165,8 +1242,10 @@ func (s *Server) resolveCampaignSource(ctx context.Context, requestStart time.Ti
 				Message: "the configured work-item provider cannot query epic children",
 				// The RESOLVED id (#3645), not conv.Provider: the 501 must name
 				// the provider actually dispatched against, which the
-				// request-level selector can override.
-				Details: map[string]any{"provider": providerID},
+				// request-level selector can override. campaign_sources_supported
+				// (#3648) names the sources this provider DOES serve so the MCP
+				// remedy renderer never advertises a mode that also 501s.
+				Details: map[string]any{"provider": providerID, "campaign_sources_supported": campaignSourcesSupported(provider)},
 			}
 		}
 
@@ -1234,8 +1313,9 @@ func (s *Server) resolveCampaignSource(ctx context.Context, requestStart time.Ti
 				Code:    "issue_set_resolution_unsupported",
 				Message: "the configured work-item provider cannot resolve an explicit issue set without an epic",
 				// The RESOLVED id (#3645), not conv.Provider — see the epic
-				// branch's note above.
-				Details: map[string]any{"provider": providerID},
+				// branch's note above. campaign_sources_supported (#3648) names the
+				// sources this provider DOES serve.
+				Details: map[string]any{"provider": providerID, "campaign_sources_supported": campaignSourcesSupported(provider)},
 			}
 		}
 		// Bound the resolution (#3113). The deadline is anchored at

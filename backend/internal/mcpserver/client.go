@@ -3600,8 +3600,16 @@ type campaignGroomingSource struct {
 //     not N / #N / issue:N; fires on BOTH the epic subset-filter path and the
 //     no-epic path, and REPLACES the old 502 issue_set_resolution_failed for a
 //     typo'd no-epic ref)
+//   - 422 campaign_epic_ref_invalid (a cross-repo or unrecognized epic_ref, #3648;
+//     the epic is resolved in the campaign's own repo, so pass N / #N / issue:N.
+//     REPLACES the old 502 epic_children_query_failed for an unparseable epic_ref)
+//   - 422 campaign_epic_ref_group_unsupported (a GitLab group-epic ref, #3648;
+//     group epics are a Premium group-level object v0 does not model)
 //   - 501 issue_set_resolution_unsupported (no-epic variant on a provider that
-//     cannot resolve an arbitrary issue set)
+//     cannot resolve an arbitrary issue set; details carry campaign_sources_supported,
+//     the sources the resolved provider actually serves, #3648)
+//   - 501 epic_children_unsupported (epic_ref on a provider that cannot decompose
+//     an epic; details carry campaign_sources_supported, #3648)
 //   - 501 provider_unimplemented (the RESOLVED work-item provider is not in the
 //     deployment's registry). Two named modes, both carrying a `remedy` detail:
 //     an EMPTY registered set means the deployment wired no work-item provider

@@ -338,6 +338,15 @@ A closed-AND-completed target never reaches this path — the backend elides it 
 
 This is the tool-side half of the backend's classification split. Before it, a malformed ref on the no-epic path surfaced as `502 issue_set_resolution_failed` and fell through to the generic `apiError` surface with no remedy at all; on the epic path it surfaced as `campaign_item_not_child`, whose remedy ("pass only issue refs that are children of the epic") is the wrong advice for a ref that names no issue. `campaign_item_not_child` now fires only for a PARSEABLE ref that is not a child. Pinned by `TestStartCampaign_InvalidItemRef_MapsActionableError` (driven with NO `EpicRef`, so the message cannot depend on one) alongside the retained `TestStartCampaign_ItemNotChild_MapsActionableError`.
 
+### `epic_ref` classifier + capability-aware remedies ([#3648](https://github.com/kuhlman-labs/fishhawk/issues/3648))
+
+The backend classifies a non-empty `epic_ref` at the request edge (`workmgmt.ClassifyEpicRef`) before any forge round-trip. `startCampaign` maps the two new `422` codes:
+
+- **`campaign_epic_ref_invalid`** — a cross-repo (`owner/name#N`) or unrecognized `epic_ref`. The epic is resolved in the campaign's OWN repo, so the remedy names the three accepted same-repo forms (`25` / `#25` / `issue:25`). This REPLACES the old `502 epic_children_query_failed` an unparseable `epic_ref` used to draw (a transport code for caller input).
+- **`campaign_epic_ref_group_unsupported`** — a GitLab group-epic ref (`group&5`, or a `/-/epics/N` URL). Group epics are a Premium group-level object v0 does not model. The remedy is **capability-aware**: it recommends `items` mode ONLY when the resolved provider serves it (the backend passes `campaign_sources_supported`), and otherwise points at driving each issue standalone — never at a mode that also `501`s.
+
+The two `501` capability refusals (`epic_children_unsupported`, `issue_set_resolution_unsupported`) now carry `campaign_sources_supported`, and `startCampaign` renders a remedy naming ONLY the sources that actually work on the resolved provider (`campaignSourcesRemedy`) — falling back to a source-agnostic `fishhawk_start_run` clause when the list is empty (the GitLab File-only case) or the detail is absent (an older backend). This is the tool-side half of the honesty fix: the GitLab dishonesty the issue reports (advertising `items` when it also `501`s) cannot recur, pinned by `TestStartCampaign_EpicChildrenUnsupported_EmptySources_NamesNeitherMode`.
+
 ### `issue_set_resolution_timeout` and the issue-set client ([#3113](https://github.com/kuhlman-labs/fishhawk/issues/3113))
 
 A **no-epic** campaign (an explicit `items` list, or a `grooming_run_id` order) resolves each named issue's `depends_on` through the forge one issue at a time, so a full ratified order of sixty items costs sixty-plus round-trips. The epic path is unaffected — `EpicChildren` reads the sibling set in one `ListSubIssues` call.

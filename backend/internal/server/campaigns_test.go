@@ -674,6 +674,17 @@ func decodeCampaignErrorDetails(t *testing.T, w *httptest.ResponseRecorder) (str
 	return env.Error.Code, env.Error.Details
 }
 
+// decodeCampaignErrorMessage returns the error message string so a test can
+// assert the operator-facing remedy prose (#3648).
+func decodeCampaignErrorMessage(t *testing.T, w *httptest.ResponseRecorder) string {
+	t.Helper()
+	var env errorEnvelope
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode error envelope: %v (body=%s)", err, w.Body.String())
+	}
+	return env.Error.Message
+}
+
 // --- create handler tests ---
 
 // TestCreateCampaign_CrossBoundary_E2E drives the full surface end-to-end
@@ -1747,6 +1758,176 @@ func TestCreateCampaign_NeitherEpicRefNorItems_400(t *testing.T) {
 	}
 	if code := decodeCampaignError(t, w); code != "validation_failed" {
 		t.Errorf("error code = %q, want validation_failed", code)
+	}
+}
+
+// --- epic_ref classifier refusals (#3648) ---
+
+// TestCreateCampaign_GroupEpicRef_422 pins the group-epic refusal on a provider
+// that DOES serve items mode: `mygroup&5` returns 422
+// campaign_epic_ref_group_unsupported, the message names GitLab group epics AND
+// the items alternative, the details carry epic_ref_form=gitlab_group_epic, and
+// the backend provider was NEVER called (no forge round-trip). This is the
+// items-supported arm of operator condition 1.
+func TestCreateCampaign_GroupEpicRef_422(t *testing.T) {
+	fp := &fakeIssueSetProvider{result: noEpicDAG()} // serves items mode
+	registerIssueSetProvider(t, fp)
+	s := New(Config{CampaignRepo: newFakeCampaignRepo()}) // GitHub nil: install skipped
+
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"mygroup&5"}`)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (body=%s)", w.Code, w.Body.String())
+	}
+	code, details := decodeCampaignErrorDetails(t, w)
+	if code != "campaign_epic_ref_group_unsupported" {
+		t.Fatalf("code = %q, want campaign_epic_ref_group_unsupported (body=%s)", code, w.Body.String())
+	}
+	if form, _ := details["epic_ref_form"].(string); form != "gitlab_group_epic" {
+		t.Errorf("epic_ref_form = %v, want gitlab_group_epic", details["epic_ref_form"])
+	}
+	msg := decodeCampaignErrorMessage(t, w)
+	for _, want := range []string{"group epic", "items"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("message %q missing %q (items-supported arm must name the items alternative)", msg, want)
+		}
+	}
+	if fp.resolveCalled {
+		t.Error("ResolveDependencies was called — a group-epic ref must be refused before any forge round-trip")
+	}
+}
+
+// TestCreateCampaign_GroupEpicRef_NoItemsSupport_422 pins the OTHER arm of
+// operator condition 1: on a provider that serves NEITHER campaign source (the
+// gitlab File-only shape, here fakeWorkProvider), the group-epic remedy must NOT
+// recommend items mode (which also fails there) and instead point at driving
+// issues standalone.
+func TestCreateCampaign_GroupEpicRef_NoItemsSupport_422(t *testing.T) {
+	workmgmt.Register(&fakeWorkProvider{name: workmgmt.Default().Provider}) // serves neither
+	s := New(Config{CampaignRepo: newFakeCampaignRepo()})
+
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"mygroup&5"}`)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (body=%s)", w.Code, w.Body.String())
+	}
+	code, details := decodeCampaignErrorDetails(t, w)
+	if code != "campaign_epic_ref_group_unsupported" {
+		t.Fatalf("code = %q, want campaign_epic_ref_group_unsupported", code)
+	}
+	// The supported-sources list is empty on a provider serving neither.
+	srcs, ok := details["campaign_sources_supported"].([]any)
+	if !ok || len(srcs) != 0 {
+		t.Errorf("campaign_sources_supported = %v, want an empty list on a neither-source provider", details["campaign_sources_supported"])
+	}
+	msg := decodeCampaignErrorMessage(t, w)
+	if !strings.Contains(msg, "standalone") {
+		t.Errorf("message %q must name a remedy that works (standalone) when the provider serves neither source", msg)
+	}
+}
+
+// TestCreateCampaign_CrossRepoEpicRef_422 pins the cross-repo refusal: an
+// owner/name#N ref returns 422 campaign_epic_ref_invalid with
+// epic_ref_form=cross_repo_issue, refused before any forge round-trip.
+func TestCreateCampaign_CrossRepoEpicRef_422(t *testing.T) {
+	s := New(Config{CampaignRepo: newFakeCampaignRepo()})
+
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"owner/name#25"}`)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (body=%s)", w.Code, w.Body.String())
+	}
+	code, details := decodeCampaignErrorDetails(t, w)
+	if code != "campaign_epic_ref_invalid" {
+		t.Fatalf("code = %q, want campaign_epic_ref_invalid (body=%s)", code, w.Body.String())
+	}
+	if form, _ := details["epic_ref_form"].(string); form != "cross_repo_issue" {
+		t.Errorf("epic_ref_form = %v, want cross_repo_issue", details["epic_ref_form"])
+	}
+}
+
+// TestCreateCampaign_UnrecognizedEpicRef_422 pins the RECLASSIFICATION the issue
+// headlines: `abc` returns 422 campaign_epic_ref_invalid with
+// epic_ref_form=unrecognized. Pre-#3648 this input reached the epic path and
+// surfaced 502 epic_children_query_failed (a transport code for caller input).
+func TestCreateCampaign_UnrecognizedEpicRef_422(t *testing.T) {
+	s := New(Config{CampaignRepo: newFakeCampaignRepo()})
+
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"abc"}`)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (body=%s)", w.Code, w.Body.String())
+	}
+	code, details := decodeCampaignErrorDetails(t, w)
+	if code != "campaign_epic_ref_invalid" {
+		t.Fatalf("code = %q, want campaign_epic_ref_invalid (body=%s)", code, w.Body.String())
+	}
+	if form, _ := details["epic_ref_form"].(string); form != "unrecognized" {
+		t.Errorf("epic_ref_form = %v, want unrecognized", details["epic_ref_form"])
+	}
+}
+
+// TestCreateCampaign_IssueEpicRef_NotRefusedByClassifier proves the classifier
+// is NON-REGRESSIVE: every accepted issue-form ref (#25 / issue:25 / 25) reaches
+// the existing epic path and produces the existing 201. This is the
+// backward-compatibility guard; deleting the classifier's issue-form arm makes
+// it go red.
+func TestCreateCampaign_IssueEpicRef_NotRefusedByClassifier(t *testing.T) {
+	for _, ref := range []string{"#25", "issue:25", "25"} {
+		fp := &fakeEpicProvider{result: smallDAG()}
+		registerEpicProvider(t, fp)
+		s := New(Config{CampaignRepo: newFakeCampaignRepo()}) // GitHub nil: install skipped
+
+		w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"`+ref+`"}`)
+		if w.Code != http.StatusCreated {
+			t.Fatalf("epic_ref %q: status = %d, want 201 (body=%s)", ref, w.Code, w.Body.String())
+		}
+		if !fp.called {
+			t.Errorf("epic_ref %q: EpicChildren was not called — the classifier refused an accepted issue-form ref", ref)
+		}
+	}
+}
+
+// TestCreateCampaign_EpicChildrenUnsupported_NamesSupportedSources asserts the
+// 501 epic_children_unsupported refusal carries campaign_sources_supported and
+// that the key SURVIVES 5xx redaction — the value is decoded from the SHIPPED
+// body, which is only true if errors.go admits the key. A provider serving
+// neither source yields an empty list. Deleting the redactableDetailKeys entry
+// makes this go red.
+func TestCreateCampaign_EpicChildrenUnsupported_NamesSupportedSources(t *testing.T) {
+	workmgmt.Register(&fakeWorkProvider{name: workmgmt.Default().Provider}) // serves neither
+	s := New(Config{CampaignRepo: newFakeCampaignRepo()})
+
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`)
+	if w.Code != http.StatusNotImplemented {
+		t.Fatalf("status = %d, want 501 (body=%s)", w.Code, w.Body.String())
+	}
+	code, details := decodeCampaignErrorDetails(t, w)
+	if code != "epic_children_unsupported" {
+		t.Fatalf("code = %q, want epic_children_unsupported", code)
+	}
+	srcs, ok := details["campaign_sources_supported"].([]any)
+	if !ok {
+		t.Fatalf("campaign_sources_supported missing from the SHIPPED 501 body (redacted away?): %+v", details)
+	}
+	if len(srcs) != 0 {
+		t.Errorf("campaign_sources_supported = %v, want an empty list on a neither-source provider", srcs)
+	}
+}
+
+// TestCreateCampaign_IssueSetUnsupported_NamesSupportedSources is the no-epic
+// sibling: the 501 issue_set_resolution_unsupported refusal carries the same
+// key, surviving 5xx redaction.
+func TestCreateCampaign_IssueSetUnsupported_NamesSupportedSources(t *testing.T) {
+	workmgmt.Register(&fakeWorkProvider{name: workmgmt.Default().Provider}) // serves neither
+	s := New(Config{CampaignRepo: newFakeCampaignRepo()})
+
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","items":["issue:101"]}`)
+	if w.Code != http.StatusNotImplemented {
+		t.Fatalf("status = %d, want 501 (body=%s)", w.Code, w.Body.String())
+	}
+	code, details := decodeCampaignErrorDetails(t, w)
+	if code != "issue_set_resolution_unsupported" {
+		t.Fatalf("code = %q, want issue_set_resolution_unsupported", code)
+	}
+	if _, ok := details["campaign_sources_supported"].([]any); !ok {
+		t.Fatalf("campaign_sources_supported missing from the SHIPPED 501 body (redacted away?): %+v", details)
 	}
 }
 

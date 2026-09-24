@@ -20,7 +20,7 @@ import (
 // pause_policy is optional (empty normalizes to pause_campaign server-side).
 type StartCampaignInput struct {
 	Repo        string `json:"repo" jsonschema:"repo as owner/name (GitHub owner/name or GitLab namespace/project) to assemble the campaign in"`
-	EpicRef     string `json:"epic_ref,omitempty" jsonschema:"OPTIONAL the epic reference to decompose into the campaign DAG (e.g. an issue ref like '#25' or 'owner/name#25'). Omit it and pass items to assemble a no-epic campaign over an explicit issue list instead; one of epic_ref / items is required"`
+	EpicRef     string `json:"epic_ref,omitempty" jsonschema:"OPTIONAL the epic reference to decompose into the campaign DAG. It names an epic ISSUE in the campaign's OWN repo, in one of three forms: a bare number (25), #25, or issue:25. A cross-repo ref (owner/name#25) or an unrecognized ref is refused campaign_epic_ref_invalid; a GitLab group-epic ref (group&5, or a /-/epics/N URL) is refused campaign_epic_ref_group_unsupported (group epics are Premium and are not modeled). Omit it and pass items to assemble a no-epic campaign over an explicit issue list instead; one of epic_ref / items is required"`
 	PausePolicy string `json:"pause_policy,omitempty" jsonschema:"OPTIONAL pause behavior on a gate hand-off: 'pause_campaign' (block the whole campaign, the default) or 'pause_item' (continue-others). Omit to take the conservative pause_campaign default"`
 	// OperatorAgent is the OPTIONAL campaign-level operator_agent override. Typed
 	// map[string]any so the MCP SDK's reflection-built tool input schema sees an
@@ -443,6 +443,31 @@ func (r *runResolver) startCampaign(ctx context.Context, _ *mcp.CallToolRequest,
 				// backend message names the offending ref.
 				return nil, StartCampaignOutput{}, fmt.Errorf(
 					"campaign_item_ref_invalid: %s — an items ref is not a valid issue reference; pass a bare number (101), #101, or issue:101 for every items entry", ae.Message)
+			case "campaign_epic_ref_group_unsupported":
+				// #3648: a GitLab group-epic ref. The remedy is CAPABILITY-AWARE
+				// (operator condition 1): recommend items mode ONLY when the
+				// resolved provider serves it, else point at standalone runs — the
+				// backend passes campaign_sources_supported for exactly this.
+				return nil, StartCampaignOutput{}, fmt.Errorf(
+					"campaign_epic_ref_group_unsupported: %s — %s", ae.Message, groupEpicRemedy(ae.Details))
+			case "campaign_epic_ref_invalid":
+				// #3648: an epic_ref that is cross-repo or unrecognized. The epic is
+				// resolved in the campaign's OWN repo, so name the three accepted
+				// same-repo forms.
+				return nil, StartCampaignOutput{}, fmt.Errorf(
+					"campaign_epic_ref_invalid: %s — pass an epic issue in the campaign's repo as a bare number (25), #25, or issue:25", ae.Message)
+			case "epic_children_unsupported":
+				// #3648: the resolved provider cannot decompose an epic. Name ONLY
+				// the sources it actually serves (from campaign_sources_supported),
+				// falling back to standalone runs when it serves none (the GitLab
+				// case) or the detail is absent (an older backend).
+				return nil, StartCampaignOutput{}, fmt.Errorf(
+					"epic_children_unsupported: %s — %s", ae.Message, campaignSourcesRemedy(ae.Details))
+			case "issue_set_resolution_unsupported":
+				// #3648: the resolved provider cannot resolve a no-epic issue set.
+				// Same capability-aware remedy as epic_children_unsupported.
+				return nil, StartCampaignOutput{}, fmt.Errorf(
+					"issue_set_resolution_unsupported: %s — %s", ae.Message, campaignSourcesRemedy(ae.Details))
 			case "campaign_item_not_child":
 				return nil, StartCampaignOutput{}, fmt.Errorf(
 					"campaign_item_not_child: %s — an items ref is not a child of epic %s; pass only issue refs that are children of the epic, or omit items to sweep every child", ae.Message, in.EpicRef)
@@ -1015,4 +1040,70 @@ func danglingEdgesHaveUnparsable(edges []any) bool {
 		}
 	}
 	return false
+}
+
+// campaignSupportedSources reads the backend's campaign_sources_supported detail
+// (#3648) out of an *apiError Details map. The list decodes from JSON as []any of
+// strings; an absent key or wrong-typed value yields an empty slice, which the
+// remedy renderers treat identically to "serves no source" so an older backend
+// (no such detail) and a genuinely-capability-less provider both fall back to the
+// same honest remedy.
+func campaignSupportedSources(details map[string]any) []string {
+	raw, ok := details["campaign_sources_supported"].([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(raw))
+	for _, v := range raw {
+		if s, ok := v.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// sourcesContain reports whether the decoded campaign source list names src.
+func sourcesContain(sources []string, src string) bool {
+	for _, s := range sources {
+		if s == src {
+			return true
+		}
+	}
+	return false
+}
+
+// campaignSourcesRemedy renders the operator-actionable remedy for a 501
+// capability refusal (epic_children_unsupported / issue_set_resolution_unsupported),
+// naming ONLY the sources the resolved provider actually serves (#3648). When it
+// serves NEITHER — the GitLab File-only case the issue reports, or an older
+// backend that shipped no detail — it advertises NO mode that also 501s and points
+// at standalone runs instead: the empty-sources string deliberately names neither
+// `items` nor `epic_ref`, which is what the empty-sources test asserts the ABSENCE
+// of (operator condition 1).
+func campaignSourcesRemedy(details map[string]any) string {
+	sources := campaignSupportedSources(details)
+	hasEpic := sourcesContain(sources, "epic_ref")
+	hasItems := sourcesContain(sources, "items")
+	switch {
+	case hasEpic && hasItems:
+		return "this provider serves both campaign sources: decompose an epic (pass epic_ref) or assemble over an explicit issue list (pass items)"
+	case hasItems:
+		return "this provider serves the items campaign source: pass an explicit issue list as items to assemble the campaign"
+	case hasEpic:
+		return "this provider serves the epic-decomposition campaign source: pass an epic reference to decompose"
+	default:
+		return "this work-item provider serves no campaign source yet, so a campaign cannot be assembled here; drive each issue standalone with fishhawk_start_run"
+	}
+}
+
+// groupEpicRemedy renders the operator-actionable remedy for a
+// campaign_epic_ref_group_unsupported refusal (#3648). A GitLab group epic cannot
+// be decomposed, so the ONLY alternative is items mode — recommended ONLY when the
+// resolved provider serves it (operator condition 1). When it does not, the remedy
+// points at standalone runs, never at an items mode that would also 501.
+func groupEpicRemedy(details map[string]any) string {
+	if sourcesContain(campaignSupportedSources(details), "items") {
+		return "a GitLab group epic is a Premium group-level object Fishhawk does not decompose; assemble the campaign over the epic's child issues by passing them as items with no epic_ref"
+	}
+	return "a GitLab group epic is a Premium group-level object Fishhawk does not decompose, and this work-item provider serves no items campaign source yet, so its child issues cannot be assembled here; drive each issue standalone with fishhawk_start_run"
 }
