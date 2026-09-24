@@ -189,7 +189,7 @@ whole command.
 
 ### Onboarding rungs
 
-Four rungs are read from the readiness endpoint
+The rungs below are read from the readiness endpoint
 (`GET /v0/onboarding/readiness?repo=owner/name`) — they are server-side-only
 checks the CLI cannot perform locally. The endpoint is forge-family-aware
 (E45.43 / #3348): for a GitLab project `repo` is the `namespace/project` path
@@ -208,8 +208,9 @@ exists on GitLab:
 | **reviewer available: `<provider>`** (warn) | the resolved model is `unverifiable` (no live snapshot to check against) or `unpriced` (its family is unknown to the pricing table, so usage books at $0) (#3578) | the `model_hint` sentence; the detail is marked `(unverified)` / `(unpriced)`. A legacy backend serving neither field renders `ok` |
 | **token scope adequate** | the caller token lacks a run-driving scope | reissue with the named missing scope(s) via `fishhawkd token issue --subject <login> --scopes …` |
 | **workflow spec (committed) valid** | the spec on the repo's default branch fails to parse/validate (`source==fetched && !valid`); **warns** when the spec is unavailable (App not installed / no spec on the default branch) | run `fishhawk validate` for details |
+| **work-item provider registered** (#3646) | the work-item provider this repo's `.fishhawk/work-management.yaml` conventions resolve to is **not registered** on the deployment — so campaigns, `fishhawk_file_issue` and the backlog-grooming loop all respond `501 provider_unimplemented`. **Warns** (never fails, never passes) when the conventions could not be resolved at all: that is read FAIL-CLOSED and is *not* evidence the provider is unregistered. Draws **no rung** against a fishhawkd that does not serve the key | configure the named provider's credentials on the fishhawkd deployment and **restart** it — a provider registers only when its client is configured at startup, so a credential set after boot changes nothing until the restart. The rung's `missing_hint` names the actual variables (`FISHHAWKD_GITHUB_APP_ID` + `FISHHAWKD_GITHUB_APP_PRIVATE_KEY_FILE`, `FISHHAWKD_GITLAB_BASE_URL` + `FISHHAWKD_GITLAB_TOKEN`, or the three `FISHHAWKD_JIRA_*`), or says no provider is wired at all |
 
-A fifth rung is checked **client-side** against the discovered
+One further rung is checked **client-side** against the discovered
 `.fishhawk/workflows.yaml`:
 
 | Rung | Fails when | Remediation |

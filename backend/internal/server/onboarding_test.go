@@ -29,6 +29,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/tracestore"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 )
 
 // onboardingReviewersSpecYAML is a valid feature_change spec whose plan stage
@@ -4037,5 +4038,428 @@ func TestOnboardingReadiness_ReviewGrounding_SurvivesMCPMirrorDecode(t *testing.
 		if a.Adapter != want.Adapters[i].Adapter || a.Bound != want.Adapters[i].Bound || a.Note != want.Adapters[i].Note {
 			t.Errorf("MCP mirror adapter[%d] = %+v, want %+v", i, a, want.Adapters[i])
 		}
+	}
+}
+
+// --- work_item_provider rung (E45.94 / #3646) ---
+
+// workItemProviderAbsentID is a provider id DEFINITIONALLY absent from the
+// registry: no production provider is named this, and no test registers it. It
+// seeds the `unregistered` verdict BY CONSTRUCTION rather than by calling the
+// control inside the test's own setup, so a RED under a counterfactual lands
+// on the behavioral assertion and not on fixture setup.
+const workItemProviderAbsentID = "acme_tracker_never_registered"
+
+// TestWorkItemProviderReadinessFor tables every branch of the pure resolver
+// (E45.94 / #3646), including the distinguished empty-registry sub-case and an
+// unrecognised provider id. Each case asserts the status, the provider echo,
+// the registered echo, and that missing_hint is non-empty on every
+// non-registered branch — so a no-op or comment-only touch of the resolver
+// fails here.
+func TestWorkItemProviderReadinessFor(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name         string
+		provider     string
+		registered   []string
+		resolveErr   error
+		wantStatus   string
+		wantProvider string
+		wantHintPart string
+		wantNotePart string
+	}{
+		{
+			name:         "resolved provider is registered",
+			provider:     "github_projects",
+			registered:   []string{"github_projects", "gitlab"},
+			wantStatus:   workItemProviderStatusRegistered,
+			wantProvider: "github_projects",
+		},
+		{
+			name:         "resolved provider absent from a non-empty registry",
+			provider:     "jira",
+			registered:   []string{"github_projects"},
+			wantStatus:   workItemProviderStatusUnregistered,
+			wantProvider: "jira",
+			wantHintPart: "FISHHAWKD_JIRA_API_TOKEN",
+			wantNotePart: "501 provider_unimplemented",
+		},
+		{
+			name:         "gitlab absent from a non-empty registry",
+			provider:     "gitlab",
+			registered:   []string{"github_projects"},
+			wantStatus:   workItemProviderStatusUnregistered,
+			wantProvider: "gitlab",
+			wantHintPart: "FISHHAWKD_GITLAB_TOKEN",
+			wantNotePart: "grooming",
+		},
+		{
+			name:         "EMPTY registry is its own sub-case",
+			provider:     "github_projects",
+			registered:   []string{},
+			wantStatus:   workItemProviderStatusUnregistered,
+			wantProvider: "github_projects",
+			wantHintPart: "NO work-item provider is registered on this deployment at all",
+		},
+		{
+			name:         "nil registry is the empty sub-case too",
+			provider:     "github_projects",
+			registered:   nil,
+			wantStatus:   workItemProviderStatusUnregistered,
+			wantProvider: "github_projects",
+			wantHintPart: "NO work-item provider is registered on this deployment at all",
+		},
+		{
+			name:         "unrecognised provider id gets the generic hint",
+			provider:     workItemProviderAbsentID,
+			registered:   []string{"github_projects"},
+			wantStatus:   workItemProviderStatusUnregistered,
+			wantProvider: workItemProviderAbsentID,
+			wantHintPart: "work-management.yaml",
+		},
+		{
+			name:       "conventions-resolution error is unknown",
+			provider:   "github_projects",
+			registered: []string{"github_projects"},
+			resolveErr: errors.New("fetch .fishhawk/work-management.yaml: 500 from https://forge.example/api?token=sekrit"),
+			wantStatus: workItemProviderStatusUnknown,
+			// Provider is deliberately NOT echoed on the unknown branch: the
+			// repo's conventions were never read, so there is no resolved id
+			// to report.
+			wantProvider: "",
+			wantHintPart: "work-management.yaml",
+			wantNotePart: "not evidence",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := workItemProviderReadinessFor(tc.provider, tc.registered, tc.resolveErr)
+			if got.Status != tc.wantStatus {
+				t.Errorf("status = %q, want %q", got.Status, tc.wantStatus)
+			}
+			if got.Provider != tc.wantProvider {
+				t.Errorf("provider = %q, want %q", got.Provider, tc.wantProvider)
+			}
+			// registered is ALWAYS an array, never nil: the deployment
+			// registry answers even when the repo's conventions do not.
+			if got.Registered == nil {
+				t.Errorf("registered = nil, want a (possibly empty) array")
+			}
+			if len(got.Registered) != len(tc.registered) {
+				t.Errorf("registered = %v, want %v", got.Registered, tc.registered)
+			}
+			if tc.wantStatus != workItemProviderStatusRegistered && got.MissingHint == "" {
+				t.Errorf("missing_hint = %q on status %q, want non-empty", got.MissingHint, got.Status)
+			}
+			if tc.wantStatus == workItemProviderStatusRegistered {
+				if got.MissingHint != "" || got.Note != "" || got.Reason != "" {
+					t.Errorf("registered verdict carried hint/note/reason %+v, want all empty", got)
+				}
+			}
+			if tc.wantHintPart != "" && !strings.Contains(got.MissingHint, tc.wantHintPart) {
+				t.Errorf("missing_hint = %q, want it to contain %q", got.MissingHint, tc.wantHintPart)
+			}
+			if tc.wantNotePart != "" && !strings.Contains(got.Note, tc.wantNotePart) {
+				t.Errorf("note = %q, want it to contain %q", got.Note, tc.wantNotePart)
+			}
+		})
+	}
+}
+
+// TestWorkItemProviderReadinessFor_UnknownIsNotUnregistered is the FAIL-CLOSED
+// control (counterfactual 2). The assertion is an IDENTITY assertion on the
+// status value: a conventions-resolution error MUST yield `unknown` and MUST
+// NOT yield `unregistered`. Deleting the error branch (falling through to the
+// provider/registry comparison) produces `unregistered` and turns this red.
+//
+// It also pins that the resolution error's TEXT is never echoed into the
+// served rung — a conventions load can carry forge transport detail — and that
+// the deployment registry is still reported, because the registry answered
+// even though the repo did not.
+func TestWorkItemProviderReadinessFor_UnknownIsNotUnregistered(t *testing.T) {
+	t.Parallel()
+	const secret = "glpat-do-not-echo-me"
+	resolveErr := fmt.Errorf("fetch conventions from https://gitlab.example/api/v4?private_token=%s: 500", secret)
+
+	got := workItemProviderReadinessFor("github_projects", []string{"github_projects"}, resolveErr)
+
+	if got.Status != workItemProviderStatusUnknown {
+		t.Fatalf("status = %q, want %q", got.Status, workItemProviderStatusUnknown)
+	}
+	if got.Status == workItemProviderStatusUnregistered {
+		t.Fatalf("an unresolved conventions read rendered as %q: absence of an answer is NOT evidence the provider is missing",
+			workItemProviderStatusUnregistered)
+	}
+	if got.Reason != workItemProviderUnknownReason {
+		t.Errorf("reason = %q, want the closed-set %q", got.Reason, workItemProviderUnknownReason)
+	}
+	for _, field := range []string{got.Reason, got.Note, got.MissingHint} {
+		if strings.Contains(field, secret) {
+			t.Errorf("rung field echoed the resolution error text (and its credential): %q", field)
+		}
+	}
+	// The registry answered even though the repo did not.
+	if len(got.Registered) != 1 || got.Registered[0] != "github_projects" {
+		t.Errorf("registered = %v, want the deployment set to survive the unknown branch", got.Registered)
+	}
+	// The non-claim must be STATED, not merely implied by the status word.
+	if !strings.Contains(got.Note, "not evidence") {
+		t.Errorf("note = %q, want it to state that unknown is not evidence the provider is unregistered", got.Note)
+	}
+}
+
+// TestWorkItemProviderMissingHint_NamesRealEnvVars is the DONE-MEANS test: the
+// hints are strings no compiler enforces, so each concrete provider's SHIPPED
+// hint is asserted to name its ACTUAL startup env vars (verified against
+// backend/cmd/fishhawkd/serve.go's flag table), and an unrecognised id is
+// asserted to fabricate none.
+func TestWorkItemProviderMissingHint_NamesRealEnvVars(t *testing.T) {
+	t.Parallel()
+	// A non-empty registry, so the empty-registry sub-case does not shadow the
+	// per-provider hints under test.
+	registered := []string{"some_other_provider"}
+	for _, tc := range []struct {
+		provider string
+		wantVars []string
+	}{
+		{"github_projects", []string{"FISHHAWKD_GITHUB_APP_ID", "FISHHAWKD_GITHUB_APP_PRIVATE_KEY_FILE"}},
+		{"gitlab", []string{"FISHHAWKD_GITLAB_BASE_URL", "FISHHAWKD_GITLAB_TOKEN"}},
+		{"jira", []string{"FISHHAWKD_JIRA_BASE_URL", "FISHHAWKD_JIRA_EMAIL", "FISHHAWKD_JIRA_API_TOKEN"}},
+	} {
+		t.Run(tc.provider, func(t *testing.T) {
+			t.Parallel()
+			hint := workItemProviderMissingHint(tc.provider, registered)
+			for _, v := range tc.wantVars {
+				if !strings.Contains(hint, v) {
+					t.Errorf("hint for %s = %q, want it to name %s", tc.provider, hint, v)
+				}
+			}
+			// The registration is a STARTUP fact: a credential set after boot
+			// changes nothing until fishhawkd restarts, and the hint must say so.
+			if !strings.Contains(hint, "RESTART fishhawkd") {
+				t.Errorf("hint for %s = %q, want it to name the restart requirement", tc.provider, hint)
+			}
+		})
+	}
+
+	t.Run("unrecognised id fabricates no env var", func(t *testing.T) {
+		t.Parallel()
+		hint := workItemProviderMissingHint(workItemProviderAbsentID, registered)
+		if strings.Contains(hint, "FISHHAWKD_") {
+			t.Errorf("hint for an unrecognised id named an env var that does not exist: %q", hint)
+		}
+		if !strings.Contains(hint, workItemProviderAbsentID) {
+			t.Errorf("hint = %q, want it to name the unrecognised id %q", hint, workItemProviderAbsentID)
+		}
+		for _, id := range registered {
+			if !strings.Contains(hint, id) {
+				t.Errorf("hint = %q, want it to name the registered set entry %q", hint, id)
+			}
+		}
+		if !strings.Contains(hint, "provider:") {
+			t.Errorf("hint = %q, want it to name the `provider:` conventions key", hint)
+		}
+	})
+
+	t.Run("empty registry wins over the per-provider hint", func(t *testing.T) {
+		t.Parallel()
+		hint := workItemProviderMissingHint("github_projects", nil)
+		if !strings.Contains(hint, "NO work-item provider is registered on this deployment at all") {
+			t.Errorf("hint = %q, want the empty-registry sub-case", hint)
+		}
+	})
+}
+
+// withWorkItemProviderConventions injects a conventionsLoader returning the
+// given provider id (or error) for the duration of the test, restoring the
+// prior seam afterwards. Tests using it are NOT parallel: conventionsLoader is
+// a process-global seam.
+func withWorkItemProviderConventions(t *testing.T, provider string, err error) {
+	t.Helper()
+	prev := conventionsLoader
+	conventionsLoader = func(context.Context, string) (workmgmt.Conventions, error) {
+		if err != nil {
+			return workmgmt.Conventions{}, err
+		}
+		conv := workmgmt.Default()
+		conv.Provider = provider
+		return conv, nil
+	}
+	t.Cleanup(func() { conventionsLoader = prev })
+}
+
+// TestOnboardingReadiness_WorkItemProvider_NotInstalledStillCarriesRung is one
+// of the two never-cascades controls: the rung is set BEFORE the forge-family
+// switch, so a not-installed repo still carries it.
+func TestOnboardingReadiness_WorkItemProvider_NotInstalledStillCarriesRung(t *testing.T) {
+	withWorkItemProviderConventions(t, workItemProviderAbsentID, nil)
+	fake := newFakeGitHubForRuns(onboardingReviewersSpecYAML)
+	fake.installationStatus = http.StatusNotFound
+	fake.installationBody = `{"message":"Not Found"}`
+	s := newOnboardingServer(t, fake.server(t), nil)
+
+	id := testOperatorIdentity()
+	raw := rawReadiness(t, s, onboardingReq("x/y", &id))
+	if app := rawObject(t, raw, "app"); app["installed"] != false {
+		t.Fatalf("app = %v, want installed:false (fixture must seed the not-installed cascade)", app)
+	}
+	wp := rawObject(t, raw, "work_item_provider")
+	if wp["status"] != workItemProviderStatusUnregistered {
+		t.Errorf("work_item_provider = %v, want status:unregistered", wp)
+	}
+	if wp["provider"] != workItemProviderAbsentID {
+		t.Errorf("work_item_provider.provider = %v, want the injected %q", wp["provider"], workItemProviderAbsentID)
+	}
+}
+
+// TestOnboardingReadiness_WorkItemProvider_SpecUnavailableStillCarriesRung is
+// the second never-cascades control: an installed repo whose spec read 404s
+// still carries the rung.
+func TestOnboardingReadiness_WorkItemProvider_SpecUnavailableStillCarriesRung(t *testing.T) {
+	withWorkItemProviderConventions(t, workItemProviderAbsentID, nil)
+	fake := newFakeGitHubForRuns(onboardingReviewersSpecYAML)
+	fake.specStatus = http.StatusNotFound
+	fake.specBody = `{"message":"Not Found"}`
+	s := newOnboardingServer(t, fake.server(t), nil)
+
+	id := testOperatorIdentity()
+	raw := rawReadiness(t, s, onboardingReq("x/y", &id))
+	if sp := rawObject(t, raw, "spec"); sp["source"] != "unavailable" {
+		t.Fatalf("spec = %v, want source:unavailable (fixture must seed the spec cascade)", sp)
+	}
+	wp := rawObject(t, raw, "work_item_provider")
+	if wp["status"] != workItemProviderStatusUnregistered {
+		t.Errorf("work_item_provider = %v, want status:unregistered", wp)
+	}
+}
+
+// TestOnboardingReadiness_WorkItemProvider_UnknownOnConventionsError drives the
+// FAIL-CLOSED branch through the REAL handler and the RAW served body: a
+// conventions-resolution failure must serve `unknown`, never `unregistered`.
+func TestOnboardingReadiness_WorkItemProvider_UnknownOnConventionsError(t *testing.T) {
+	withWorkItemProviderConventions(t, "", errors.New("conventions fetch failed"))
+	fake := newFakeGitHubForRuns(onboardingReviewersSpecYAML)
+	s := newOnboardingServer(t, fake.server(t), nil)
+
+	id := testOperatorIdentity()
+	raw := rawReadiness(t, s, onboardingReq("x/y", &id))
+	wp := rawObject(t, raw, "work_item_provider")
+	if wp["status"] != workItemProviderStatusUnknown {
+		t.Fatalf("work_item_provider = %v, want status:unknown", wp)
+	}
+	if wp["reason"] != workItemProviderUnknownReason {
+		t.Errorf("work_item_provider.reason = %v, want %q", wp["reason"], workItemProviderUnknownReason)
+	}
+	if _, ok := wp["registered"]; !ok {
+		t.Errorf("work_item_provider = %v, want `registered` present even on the unknown branch", wp)
+	}
+}
+
+// TestOnboardingReadiness_WorkItemProvider_UnregisteredEndToEnd is the
+// CROSS-BOUNDARY end-to-end seam and the counterfactual vehicle for the
+// resolver's unregistered branch (binding condition 2 — the counterfactual is
+// observed in a test that EXECUTES the backend resolver, not a CLI test fed a
+// constructed payload). It drives HTTP → handler → the RAW served body with a
+// conventionsLoader naming a provider DEFINITIONALLY absent from the registry,
+// and asserts the served key, its status and a non-empty missing_hint.
+//
+// It also falsifies the issue's FISHHAWKD_SINGLE_TENANT_PROVIDER attribution:
+// that variable is unset here, and the rung still echoes the conventions id.
+func TestOnboardingReadiness_WorkItemProvider_UnregisteredEndToEnd(t *testing.T) {
+	withWorkItemProviderConventions(t, workItemProviderAbsentID, nil)
+	fake := newFakeGitHubForRuns(onboardingReviewersSpecYAML)
+	s := newOnboardingServer(t, fake.server(t), nil)
+
+	id := testOperatorIdentity()
+	w := httptest.NewRecorder()
+	s.handleGetOnboardingReadiness(w, onboardingReq("x/y", &id))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"work_item_provider"`) {
+		t.Fatalf("served body carries no work_item_provider key:\n%s", w.Body.String())
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("decode served body: %v", err)
+	}
+	wp := rawObject(t, raw, "work_item_provider")
+	if wp["status"] != workItemProviderStatusUnregistered {
+		t.Fatalf("work_item_provider.status = %v, want %q — a resolved-but-unregistered provider is a FAILURE, not data",
+			wp["status"], workItemProviderStatusUnregistered)
+	}
+	if wp["provider"] != workItemProviderAbsentID {
+		t.Errorf("work_item_provider.provider = %v, want the conventions-resolved %q", wp["provider"], workItemProviderAbsentID)
+	}
+	if hint, _ := wp["missing_hint"].(string); strings.TrimSpace(hint) == "" {
+		t.Errorf("work_item_provider.missing_hint = %q, want non-empty on the unregistered branch", hint)
+	}
+	if note, _ := wp["note"].(string); !strings.Contains(note, "501") {
+		t.Errorf("work_item_provider.note = %q, want it to name the 501 consequence", note)
+	}
+}
+
+// TestOnboardingReadiness_WorkItemProvider_RegisteredWhenConventionsMatch is
+// the positive end-to-end counterpart: a fake registered under a unique id,
+// named by the injected conventions, serves `registered`. Non-parallel — it
+// mutates the process-global workmgmt registry (which exposes Register but no
+// Deregister, so the fake is registered under an id no production provider
+// uses and the assertion is on MEMBERSHIP, never on removal).
+func TestOnboardingReadiness_WorkItemProvider_RegisteredWhenConventionsMatch(t *testing.T) {
+	const id = "onboarding_rung_fake_provider"
+	workmgmt.Register(&fakeWorkProvider{name: id})
+	withWorkItemProviderConventions(t, id, nil)
+	fake := newFakeGitHubForRuns(onboardingReviewersSpecYAML)
+	s := newOnboardingServer(t, fake.server(t), nil)
+
+	ident := testOperatorIdentity()
+	raw := rawReadiness(t, s, onboardingReq("x/y", &ident))
+	wp := rawObject(t, raw, "work_item_provider")
+	if wp["status"] != workItemProviderStatusRegistered {
+		t.Fatalf("work_item_provider = %v, want status:registered", wp)
+	}
+	if wp["provider"] != id {
+		t.Errorf("work_item_provider.provider = %v, want %q", wp["provider"], id)
+	}
+	if hint, ok := wp["missing_hint"]; ok {
+		t.Errorf("work_item_provider.missing_hint = %v, want it omitted on a registered verdict", hint)
+	}
+}
+
+// TestOnboardingReadiness_WorkItemProvider_SurvivesMCPMirrorDecode is the
+// cross-boundary decode seam: the REAL handler's served JSON is decoded with
+// the fishhawk_doctor client mirror (mcpserver.OnboardingReadinessReport) — not
+// a hand-written literal — and every work_item_provider field must survive. A
+// tag drift between the two structs silently zero-values a field and fails here.
+func TestOnboardingReadiness_WorkItemProvider_SurvivesMCPMirrorDecode(t *testing.T) {
+	withWorkItemProviderConventions(t, workItemProviderAbsentID, nil)
+	fake := newFakeGitHubForRuns(onboardingReviewersSpecYAML)
+	s := newOnboardingServer(t, fake.server(t), nil)
+
+	id := testOperatorIdentity()
+	w := httptest.NewRecorder()
+	s.handleGetOnboardingReadiness(w, onboardingReq("x/y", &id))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var report mcpserver.OnboardingReadinessReport
+	if err := json.Unmarshal(w.Body.Bytes(), &report); err != nil {
+		t.Fatalf("decode served body with the MCP mirror: %v", err)
+	}
+	if report.WorkItemProvider == nil {
+		t.Fatalf("MCP mirror decoded WorkItemProvider = nil from the served body:\n%s", w.Body.String())
+	}
+	got := report.WorkItemProvider
+	if got.Status != workItemProviderStatusUnregistered {
+		t.Errorf("MCP mirror status = %q, want %q", got.Status, workItemProviderStatusUnregistered)
+	}
+	if got.Provider != workItemProviderAbsentID {
+		t.Errorf("MCP mirror provider = %q, want %q", got.Provider, workItemProviderAbsentID)
+	}
+	if got.Registered == nil {
+		t.Errorf("MCP mirror registered = nil, want the served array to survive")
+	}
+	if got.Note == "" || got.MissingHint == "" {
+		t.Errorf("MCP mirror note/missing_hint = %q / %q, want both to survive the wire", got.Note, got.MissingHint)
 	}
 }

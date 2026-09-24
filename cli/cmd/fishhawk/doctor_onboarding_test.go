@@ -1250,3 +1250,239 @@ func TestDoctorOnboarding_ReviewGroundingOff_DoesNotMoveTheAggregate(t *testing.
 		t.Fatal("the off body must actually render a review grounding rung; otherwise the tallies agree vacuously")
 	}
 }
+
+// --- work_item_provider rung (E45.94 / #3646) ---
+
+// workItemProviderBody builds an otherwise all-green readiness body carrying
+// the given work_item_provider object verbatim; an empty wp omits the key
+// entirely (the pre-#3646 fishhawkd shape).
+func workItemProviderBody(wp string) string {
+	tail := ""
+	if wp != "" {
+		tail = `, "work_item_provider": ` + wp
+	}
+	return `{"repo": "owner/name", "app": {"installed": true}, "spec": {"source": "fetched", "valid": true},
+	  "reviewers": [], "scopes": {"adequate": true}` + tail + `}`
+}
+
+func workItemProviderRungFrom(t *testing.T, body string) (checkResult, bool) {
+	t.Helper()
+	for _, r := range readinessRungs(t, "owner/name", body) {
+		if r.label == "work-item provider registered" {
+			return r, true
+		}
+	}
+	return checkResult{}, false
+}
+
+// TestDoctorOnboarding_WorkItemProviderMirrorsBackendTags decodes a body in
+// which EVERY work_item_provider field — including a MULTI-element registered
+// array — carries a distinct non-empty value, so a tag typo cannot pass on
+// zero values.
+func TestDoctorOnboarding_WorkItemProviderMirrorsBackendTags(t *testing.T) {
+	var got onboardingReadiness
+	body := workItemProviderBody(`{"status": "status-sentinel", "provider": "provider-sentinel",
+	  "registered": ["reg-one-sentinel", "reg-two-sentinel"], "reason": "reason-sentinel",
+	  "note": "note-sentinel", "missing_hint": "hint-sentinel"}`)
+	if err := json.Unmarshal([]byte(body), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	wp := got.WorkItemProvider
+	if wp == nil {
+		t.Fatalf("WorkItemProvider = nil, want the decoded object")
+	}
+	for _, f := range []struct{ name, got, want string }{
+		{"Status", wp.Status, "status-sentinel"},
+		{"Provider", wp.Provider, "provider-sentinel"},
+		{"Reason", wp.Reason, "reason-sentinel"},
+		{"Note", wp.Note, "note-sentinel"},
+		{"MissingHint", wp.MissingHint, "hint-sentinel"},
+	} {
+		if f.got != f.want {
+			t.Errorf("%s = %q, want %q", f.name, f.got, f.want)
+		}
+	}
+	want := []string{"reg-one-sentinel", "reg-two-sentinel"}
+	if len(wp.Registered) != len(want) {
+		t.Fatalf("Registered = %v, want %v", wp.Registered, want)
+	}
+	for i, id := range want {
+		if wp.Registered[i] != id {
+			t.Errorf("Registered[%d] = %q, want %q", i, wp.Registered[i], id)
+		}
+	}
+}
+
+// TestDoctorOnboarding_WorkItemProviderAbsentDrawsNoRung pins the pointer: an
+// omitted key (a pre-#3646 fishhawkd) and an explicit JSON null both draw NO
+// rung. A value-typed mirror would render an out-of-enum empty status and —
+// because this rung CAN fail — would fail the command against a backend that
+// made no claim at all.
+func TestDoctorOnboarding_WorkItemProviderAbsentDrawsNoRung(t *testing.T) {
+	for name, body := range map[string]string{
+		"absent": workItemProviderBody(""),
+		"null":   workItemProviderBody("null"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if rung, ok := workItemProviderRungFrom(t, body); ok {
+				t.Errorf("rung rendered = %+v, want none", rung)
+			}
+		})
+	}
+}
+
+// TestDoctorOnboarding_WorkItemProviderRegistered_IsOk pins the happy path:
+// the rung is ok and names the resolved provider.
+func TestDoctorOnboarding_WorkItemProviderRegistered_IsOk(t *testing.T) {
+	rung, ok := workItemProviderRungFrom(t, workItemProviderBody(
+		`{"status": "registered", "provider": "github_projects", "registered": ["github_projects"]}`))
+	if !ok {
+		t.Fatal("no work-item provider rung rendered")
+	}
+	if rung.status != "ok" {
+		t.Errorf("status = %q, want ok (detail: %s)", rung.status, rung.detail)
+	}
+	if !strings.Contains(rung.detail, "github_projects") {
+		t.Errorf("detail = %q, want it to name the resolved provider", rung.detail)
+	}
+}
+
+// TestDoctorOnboarding_WorkItemProviderUnregistered_FailsNamingTheHint pins the
+// FAILURE state: the rung is "fail" (not a warn, not data), names the provider,
+// names the registered set, states the 501 consequence, and carries the
+// server's missing_hint verbatim as the remediation.
+func TestDoctorOnboarding_WorkItemProviderUnregistered_FailsNamingTheHint(t *testing.T) {
+	rung, ok := workItemProviderRungFrom(t, workItemProviderBody(
+		`{"status": "unregistered", "provider": "jira", "registered": ["github_projects"],
+		  "note": "501 provider_unimplemented",
+		  "missing_hint": "set FISHHAWKD_JIRA_BASE_URL, FISHHAWKD_JIRA_EMAIL and FISHHAWKD_JIRA_API_TOKEN"}`))
+	if !ok {
+		t.Fatal("no work-item provider rung rendered")
+	}
+	if rung.status != "fail" {
+		t.Fatalf("status = %q, want fail — a resolved-but-unregistered provider reads as a FAILURE, not data (detail: %s)",
+			rung.status, rung.detail)
+	}
+	for _, want := range []string{"jira", "github_projects", "501 provider_unimplemented"} {
+		if !strings.Contains(rung.detail, want) {
+			t.Errorf("detail = %q, want it to contain %q", rung.detail, want)
+		}
+	}
+	if rung.remediate != "set FISHHAWKD_JIRA_BASE_URL, FISHHAWKD_JIRA_EMAIL and FISHHAWKD_JIRA_API_TOKEN" {
+		t.Errorf("remediate = %q, want the server's missing_hint verbatim", rung.remediate)
+	}
+}
+
+// TestDoctorOnboarding_WorkItemProviderUnregistered_EmptyHintFallback pins the
+// local fallback: with no server hint the rung still fails and still carries an
+// actionable remediation naming the startup-registration contract. It also pins
+// the EMPTY-registry rendering, which must not claim a registered set exists.
+func TestDoctorOnboarding_WorkItemProviderUnregistered_EmptyHintFallback(t *testing.T) {
+	rung, ok := workItemProviderRungFrom(t, workItemProviderBody(
+		`{"status": "unregistered", "provider": "github_projects", "registered": []}`))
+	if !ok {
+		t.Fatal("no work-item provider rung rendered")
+	}
+	if rung.status != "fail" {
+		t.Fatalf("status = %q, want fail", rung.status)
+	}
+	if strings.TrimSpace(rung.remediate) == "" {
+		t.Error("remediate = empty, want the local fallback when the server hint is absent")
+	}
+	if !strings.Contains(rung.remediate, "restart") {
+		t.Errorf("remediate = %q, want the fallback to name the restart requirement", rung.remediate)
+	}
+	if !strings.Contains(rung.detail, "no work-item provider is registered at all") {
+		t.Errorf("detail = %q, want the empty-registry rendering", rung.detail)
+	}
+}
+
+// TestDoctorOnboarding_WorkItemProviderUnknown_WarnsAndIsNotAClaim pins the
+// FAIL-CLOSED state: unknown warns (never passes, never fails), names the
+// reason, and the RENDERED remediation explicitly states the non-claim.
+func TestDoctorOnboarding_WorkItemProviderUnknown_WarnsAndIsNotAClaim(t *testing.T) {
+	rung, ok := workItemProviderRungFrom(t, workItemProviderBody(
+		`{"status": "unknown", "registered": ["github_projects"], "reason": "conventions_unresolved",
+		  "note": "not evidence", "missing_hint": "check .fishhawk/work-management.yaml"}`))
+	if !ok {
+		t.Fatal("no work-item provider rung rendered")
+	}
+	if rung.status != "warn" {
+		t.Fatalf("status = %q, want warn — an unsettled question is neither a pass nor a failure (detail: %s)",
+			rung.status, rung.detail)
+	}
+	if !strings.Contains(rung.detail, "conventions_unresolved") {
+		t.Errorf("detail = %q, want it to name the reason", rung.detail)
+	}
+	if !strings.Contains(rung.remediate, "NOT evidence that the provider is unregistered") {
+		t.Errorf("remediate = %q, want it to state that unknown is not evidence the provider is unregistered", rung.remediate)
+	}
+}
+
+// TestDoctorOnboarding_WorkItemProviderUnrecognisedStatus_WarnsNotFails pins
+// the forward-compatibility branch: a status this build does not recognise
+// takes the unsettled path — warn, never a PASS. Rendering an unknown future
+// verdict as ok would silently green a deployment on a verdict this build
+// cannot read.
+func TestDoctorOnboarding_WorkItemProviderUnrecognisedStatus_WarnsNotFails(t *testing.T) {
+	rung, ok := workItemProviderRungFrom(t, workItemProviderBody(
+		`{"status": "some_future_status", "provider": "github_projects", "registered": ["github_projects"]}`))
+	if !ok {
+		t.Fatal("no work-item provider rung rendered")
+	}
+	if rung.status != "warn" {
+		t.Errorf("status = %q, want warn for an unrecognised status (detail: %s)", rung.status, rung.detail)
+	}
+	if rung.status == "ok" {
+		t.Error("an unrecognised status rendered as a PASS")
+	}
+}
+
+// TestDoctorOnboarding_WorkItemProviderUnregistered_MovesTheAggregate is the
+// counterpart of TestDoctorOnboarding_ReviewGroundingOff_DoesNotMoveTheAggregate:
+// where that rung must NEVER move the doctor's aggregate, this one MUST — the
+// fail status has to reach the fail/warn tally doctor.go derives its summary
+// line and exit code from, which is the whole point of #3646's "should read as
+// a failure, not as data".
+func TestDoctorOnboarding_WorkItemProviderUnregistered_MovesTheAggregate(t *testing.T) {
+	tally := func(rungs []checkResult) (fails, warns int) {
+		for _, r := range rungs {
+			switch r.status {
+			case "fail":
+				fails++
+			case "warn":
+				warns++
+			}
+		}
+		return fails, warns
+	}
+	absentF, _ := tally(readinessRungs(t, "owner/name", workItemProviderBody("")))
+	unregRungs := readinessRungs(t, "owner/name", workItemProviderBody(
+		`{"status": "unregistered", "provider": "jira", "registered": ["github_projects"],
+		  "note": "501 provider_unimplemented", "missing_hint": "set FISHHAWKD_JIRA_BASE_URL"}`))
+	unregF, _ := tally(unregRungs)
+	if unregF != absentF+1 {
+		t.Errorf("unregistered did not move the aggregate: fails %d -> %d, want %d; an unregistered provider must read as a FAILURE",
+			absentF, unregF, absentF+1)
+	}
+	// Anti-vacuity: the extra fail must be THIS rung, not some other one.
+	var found bool
+	for _, r := range unregRungs {
+		if r.label == "work-item provider registered" {
+			found = true
+			if r.status != "fail" {
+				t.Errorf("the work-item provider rung is %q, want fail", r.status)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("the unregistered body must actually render a work-item provider rung; otherwise the tally moved for another reason")
+	}
+	// The registered verdict must NOT move it, so the failure is attributable
+	// to the unregistered classification and not to the rung's mere presence.
+	okF, _ := tally(readinessRungs(t, "owner/name", workItemProviderBody(
+		`{"status": "registered", "provider": "github_projects", "registered": ["github_projects"]}`)))
+	if okF != absentF {
+		t.Errorf("a REGISTERED verdict moved the aggregate: fails %d -> %d, want unchanged", absentF, okF)
+	}
+}

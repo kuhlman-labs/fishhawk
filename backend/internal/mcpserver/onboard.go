@@ -166,8 +166,10 @@ const initNextStep = "Write workflow_yaml to target_path in the checkout, then c
 // omitted on GitLab by design; since E45.66 / #3580 the fifth check on GitLab
 // is the GitLab-shaped gitlab_merge_gate rung, and since E45.68 / #3582 GitLab
 // carries a sixth, gitlab_registration). Since E45.75 / #3600 both families
-// also carry the deployment-scoped trace_store rung, and since E45.90 /
-// #3625 the deployment-scoped review_grounding rung.
+// also carry the deployment-scoped trace_store rung, since E45.90 / #3625 the
+// deployment-scoped review_grounding rung, and since E45.94 / #3646 the
+// HYBRID-scoped work_item_provider rung (a repo-resolved provider id compared
+// against a deployment-registered set).
 func registerDoctor(srv *mcp.Server, resolver *runResolver) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "fishhawk_doctor",
@@ -179,7 +181,8 @@ returns five server-side-only checks the first feature_change run needs on
 GitHub and six on GitLab (the fifth on GitLab being gitlab_merge_gate and the
 sixth gitlab_registration — see merge_gate, gitlab_merge_gate and
 gitlab_registration below), plus on both families the deployment-scoped
-trace_store and review_grounding rungs (see below):
+trace_store and review_grounding rungs and the hybrid-scoped
+work_item_provider rung (see below):
 
   - app     — is the Fishhawk-specific authorization a run needs in place? On
               GitHub: is the GitHub App installed on the target repo
@@ -323,6 +326,37 @@ trace_store and review_grounding rungs (see below):
               key is ABSENT only against an older fishhawkd; absence means the
               backend cannot answer, which is NOT the same claim as
               enabled:false.
+  - work_item_provider — HYBRID-scoped, both families (E45.94): can this
+              deployment file work items for this repo AT ALL? It answers the
+              two facts a 501 provider_unimplemented already prints, but
+              AHEAD of the call: provider is the work-item provider id the
+              REPO's .fishhawk/work-management.yaml conventions resolve to (a
+              REPO fact), registered[] is the provider set wired on THIS
+              deployment at startup (a DEPLOYMENT fact), and status is their
+              INTERSECTION: registered | unregistered | unknown.
+              status=unregistered is a FAILURE, not data — report it as one:
+              fishhawk_start_campaign, fishhawk_file_issue and the whole
+              backlog-grooming loop respond 501 provider_unimplemented on
+              this deployment, so do NOT start a campaign before it is fixed.
+              missing_hint names the resolved provider's REAL startup env
+              vars plus the restart requirement (registration is a STARTUP
+              fact: a credential set after boot changes nothing until
+              fishhawkd restarts), or — when registered[] is EMPTY, i.e. NO
+              provider is wired at all — a distinguished hint naming all
+              three credential sets rather than one provider's; an id this
+              build has no startup configuration for draws a generic hint
+              that fabricates no env var. Read status=unknown FAIL-CLOSED:
+              the repo's conventions could NOT be resolved (reason names the
+              closed-set class conventions_unresolved), so the question was
+              not SETTLED — it is NOT evidence the provider is unregistered,
+              and it must never be rendered as a pass. registered[] is served
+              even on unknown, because the deployment registry answers when
+              the repo's conventions do not. Because the resolved provider is
+              repo-scoped, this rung is hybrid — but it is set OUTSIDE every
+              repo-scoped cascade, so a not-installed repo or an unavailable
+              spec still carries it. The key is ABSENT only against an older
+              fishhawkd; absence means the backend cannot answer, which is
+              NOT the same claim as unregistered.
 
 Alongside the report key — a SIBLING key, never a field inside it — the output
 carries runner_credentials, the one rung computed LOCALLY by this MCP server

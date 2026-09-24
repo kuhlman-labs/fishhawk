@@ -1,0 +1,14 @@
+id: scenario:issue-3646/readiness-body-carries-work-item-provider
+statement: GET /v0/onboarding/readiness for a repository returns 200 and the response body carries a work_item_provider object whose status is one of registered, unregistered or unknown, and which carries the registered provider set for the deployment.
+verify_hint: Call GET /v0/onboarding/readiness?repo=<owner/name> against the localhost preview with an operator token and read the work_item_provider key in the JSON response body.
+steps: '1) POST http://localhost:8090/v0/dev/fixtures {"scenario":"plan-gate-parked"} -> 201; read run_id. 2) POST /v0/runs/{run_id}/signing-key {} -> private_key. 3) POST /v0/dev/sign with body ''{}'' and header X-Fishhawk-Dev-Private-Key: <private_key> -> signature. 4) POST /v0/runs/{run_id}/mcp-token with body ''{}'' and header X-Fishhawk-Signature: <signature> -> fhm_ token. 5) GET /v0/onboarding/readiness?repo=kuhlman-labs/fishhawk and GET /v0/onboarding/readiness?repo=glacme3646/grp/proj&forge=gitlab with Authorization: Bearer <fhm_>; read work_item_provider.'
+assertions:
+    expected: 200; work_item_provider object with status in {registered, unregistered, unknown} and the deployment's registered provider set.
+    observed_at_record: Both requests returned 200 with work_item_provider={"status":"registered","provider":"github_projects","registered":["github_projects"]}, on the github and the gitlab forge family alike.
+    repro_handle: 'curl -H ''Authorization: Bearer <fhm_>'' ''http://localhost:8090/v0/onboarding/readiness?repo=kuhlman-labs/fishhawk'''
+origin:
+    issue: 3646
+    pr: 3657
+    run_id: 558ea922-f6fd-42bf-b589-3f102b3db556
+    head_sha: 387062b2a1200076a41b4efdecae91927fcb49a1
+    recorded_at: 2026-09-24T23:22:05Z

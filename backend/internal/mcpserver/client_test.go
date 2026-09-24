@@ -2967,6 +2967,72 @@ func TestOnboardingReadinessReport_ReviewGroundingAbsentOrNullKeepsNil(t *testin
 	}
 }
 
+// TestOnboardingReadinessReport_WorkItemProviderMirrorsBackendTags pins the
+// #3646 work_item_provider mirror: EVERY field — including a MULTI-ELEMENT
+// registered array — carries a DISTINCT non-empty value, so a json-tag typo on
+// any one decodes to its zero value and fails here rather than passing on a
+// zero-valued fixture.
+func TestOnboardingReadinessReport_WorkItemProviderMirrorsBackendTags(t *testing.T) {
+	const body = `{"repo": "acme/widgets", "forge": "github",
+	  "app": {"installed": false}, "spec": {"source": "unavailable"},
+	  "reviewers": [], "scopes": {"adequate": true, "required": [], "missing": []},
+	  "work_item_provider": {"status": "status-sentinel", "provider": "provider-sentinel",
+	    "registered": ["registered-one-sentinel", "registered-two-sentinel"],
+	    "reason": "reason-sentinel", "note": "wip-note-sentinel",
+	    "missing_hint": "wip-hint-sentinel"}}`
+	var got OnboardingReadinessReport
+	if err := json.Unmarshal([]byte(body), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	wp := got.WorkItemProvider
+	if wp == nil {
+		t.Fatalf("WorkItemProvider = nil, want the decoded object")
+	}
+	for _, f := range []struct{ name, got, want string }{
+		{"Status", wp.Status, "status-sentinel"},
+		{"Provider", wp.Provider, "provider-sentinel"},
+		{"Reason", wp.Reason, "reason-sentinel"},
+		{"Note", wp.Note, "wip-note-sentinel"},
+		{"MissingHint", wp.MissingHint, "wip-hint-sentinel"},
+	} {
+		if f.got != f.want {
+			t.Errorf("%s = %q, want %q", f.name, f.got, f.want)
+		}
+	}
+	// A MULTI-element array, so a tag that decoded only the first entry (or
+	// coerced the array to a scalar) fails here.
+	want := []string{"registered-one-sentinel", "registered-two-sentinel"}
+	if len(wp.Registered) != len(want) {
+		t.Fatalf("Registered = %v, want %v", wp.Registered, want)
+	}
+	for i, id := range want {
+		if wp.Registered[i] != id {
+			t.Errorf("Registered[%d] = %q, want %q", i, wp.Registered[i], id)
+		}
+	}
+}
+
+// TestOnboardingReadinessReport_WorkItemProviderAbsentOrNullKeepsNil pins the
+// pointer: an absent key (a pre-#3646 fishhawkd) and an explicit JSON null both
+// decode to nil — never a zero-valued rung whose status is "", a verdict
+// outside the registered|unregistered|unknown vocabulary that no read made.
+func TestOnboardingReadinessReport_WorkItemProviderAbsentOrNullKeepsNil(t *testing.T) {
+	for name, body := range map[string]string{
+		"absent": `{"repo": "a/b", "app": {"installed": true}, "spec": {"source": "fetched"}, "reviewers": [], "scopes": {"adequate": true, "required": [], "missing": []}}`,
+		"null":   `{"repo": "a/b", "app": {"installed": true}, "spec": {"source": "fetched"}, "reviewers": [], "scopes": {"adequate": true, "required": [], "missing": []}, "work_item_provider": null}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			var got OnboardingReadinessReport
+			if err := json.Unmarshal([]byte(body), &got); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if got.WorkItemProvider != nil {
+				t.Errorf("WorkItemProvider = %+v, want nil", *got.WorkItemProvider)
+			}
+		})
+	}
+}
+
 // TestMergeRun_AlreadyMergedWireShape pins the E45.87 / #3622 additive decode:
 // the four new merge 200 fields round-trip, and a LEGACY body omitting them all
 // decodes to false / false / "" / "" (the additive-compatibility control, so an

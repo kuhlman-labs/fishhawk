@@ -65,6 +65,30 @@ type onboardingReadiness struct {
 	// emit NO rung — a zero value would read as enabled:false, a verdict
 	// about the deployment's posture the payload never made.
 	ReviewGrounding *reviewGroundingReadiness `json:"review_grounding"`
+	// WorkItemProvider is the HYBRID-scoped work-item-provider rung (E45.94 /
+	// #3646). A POINTER for the same reason as TraceStore: a pre-#3646
+	// fishhawkd serves no `work_item_provider` key, and the doctor must then
+	// emit NO rung — a zero value would read as an out-of-enum empty status,
+	// a verdict the payload never made, and would FAIL the command on a
+	// backend that simply cannot answer.
+	WorkItemProvider *workItemProviderReadiness `json:"work_item_provider"`
+}
+
+// workItemProviderReadiness mirrors the backend workItemProviderReadiness
+// sub-object (backend/internal/server/onboarding.go, #3646): is the work-item
+// provider this repo's conventions RESOLVE to actually REGISTERED on this
+// deployment? Status is a closed three-value vocabulary —
+// registered | unregistered | unknown. Unlike review_grounding, `unregistered`
+// is a hard FAILURE that moves the doctor's aggregate outcome and exit code:
+// every campaign, `fishhawk_file_issue` and the grooming loop respond 501
+// provider_unimplemented on such a deployment.
+type workItemProviderReadiness struct {
+	Status      string   `json:"status"`
+	Provider    string   `json:"provider"`
+	Registered  []string `json:"registered"`
+	Reason      string   `json:"reason"`
+	Note        string   `json:"note"`
+	MissingHint string   `json:"missing_hint"`
 }
 
 // reviewGroundingReadiness mirrors the backend reviewGroundingReadiness
@@ -359,6 +383,15 @@ func checkOnboardingReadiness(backendURL, token, repo string) ([]checkResult, re
 		out = append(out, rung)
 	}
 
+	// (h) Work-item provider — can this deployment file work items for this
+	// repo AT ALL (#3646)? Hybrid-scoped; absent against an older fishhawkd,
+	// which draws NO rung. Unlike (g) this rung CAN report "fail": a resolved
+	// but unregistered provider forecloses every campaign, work-item filing
+	// and the grooming loop with a 501, which is a failure and not data.
+	if rung, ok := workItemProviderRung(body.WorkItemProvider); ok {
+		out = append(out, rung)
+	}
+
 	return out, outcome
 }
 
@@ -541,6 +574,74 @@ func reviewGroundingBoundSummary(adapters []reviewGroundingAdapterBound) string 
 		parts = append(parts, a.Adapter+": "+bound)
 	}
 	return strings.Join(parts, "; ")
+}
+
+// workItemProviderRung renders the work-item-provider readiness rung, or
+// reports ok=false when there is no rung to render (#3646).
+//
+// Four states:
+//
+//   - nil          — the backend served no `work_item_provider` key (a
+//     pre-#3646 fishhawkd). NO rung: absence means the backend
+//     cannot answer, which is not the same claim as
+//     unregistered — and a rung here would fail the command on
+//     a backend that made no claim.
+//   - registered   — ok, detail naming the resolved provider.
+//   - unregistered — FAIL. This is the one rung state here that is a hard
+//     failure: it moves the doctor's aggregate outcome and exit
+//     code, because a deployment on which fishhawk_start_campaign,
+//     fishhawk_file_issue and the grooming loop all respond 501
+//     provider_unimplemented is not ready, and #3646 exists
+//     precisely because it previously reported all-green.
+//   - unknown      — warn (and NEVER a pass), naming the reason, with a
+//     remediation that explicitly states this is not evidence
+//     the provider is unregistered. Any status this build does
+//     not recognise takes the same branch: an unsettled verdict
+//     must never be rendered as a pass.
+func workItemProviderRung(wp *workItemProviderReadiness) (checkResult, bool) {
+	if wp == nil {
+		return checkResult{}, false
+	}
+	const label = "work-item provider registered"
+	switch wp.Status {
+	case "registered":
+		detail := wp.Provider
+		if detail == "" {
+			detail = "registered"
+		}
+		return checkResult{label: label, detail: detail, status: "ok"}, true
+	case "unregistered":
+		provider := wp.Provider
+		if provider == "" {
+			provider = "the repo's resolved provider"
+		}
+		detail := provider + " is not registered on this deployment"
+		if len(wp.Registered) > 0 {
+			detail += " (registered: " + strings.Join(wp.Registered, ", ") + ")"
+		} else {
+			detail += " (no work-item provider is registered at all)"
+		}
+		detail += "; campaigns, `fishhawk file-issue` and the grooming loop will respond 501 provider_unimplemented"
+		remediate := wp.MissingHint
+		if remediate == "" {
+			remediate = "configure a work-item provider's credentials on the fishhawkd deployment and restart it; a provider registers only when its client is configured at startup"
+		}
+		return checkResult{label: label, detail: detail, status: "fail", remediate: remediate}, true
+	default:
+		// "unknown", and any status this build does not recognise — both are
+		// unsettled, and neither licenses reporting the provider as either
+		// registered or unregistered.
+		detail := "unknown"
+		if wp.Reason != "" {
+			detail = "unknown (" + wp.Reason + ")"
+		}
+		remediate := wp.MissingHint
+		if remediate == "" {
+			remediate = "the repo's work-management conventions could not be resolved, so this rung makes no claim"
+		}
+		remediate += "; this is NOT evidence that the provider is unregistered"
+		return checkResult{label: label, detail: detail, status: "warn", remediate: remediate}, true
+	}
 }
 
 // mergeGateSourceSummary renders each requiring source's bypass posture IN ITS

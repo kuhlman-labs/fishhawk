@@ -1440,6 +1440,95 @@ func TestDoctorToolDescription_DescribesReviewGrounding(t *testing.T) {
 	}
 }
 
+// --- work_item_provider rung (E45.94 / #3646) ---
+
+// TestDoctor_WorkItemProvider_ReemitsWireBytes walks the tool path and pins the
+// RE-EMITTED bytes (E45.94 / #3646) in BOTH directions: a body carrying
+// work_item_provider re-emits the object with its status, provider, registered
+// array and hint; a body WITHOUT it (an older fishhawkd — mergeGateServerBody
+// predates the rung) re-emits NO quoted "work_item_provider" key.
+// Counterfactual: a value-typed mirror field re-emits a zero-valued
+// `"work_item_provider":{"status":"","registered":null}` on the second body —
+// an out-of-enum verdict no read established.
+func TestDoctor_WorkItemProvider_ReemitsWireBytes(t *testing.T) {
+	const populated = `{"repo": "x/y", "forge": "github",
+	  "app": {"installed": false, "reason": "not installed"}, "spec": {"source": "unavailable", "note": "n"},
+	  "reviewers": [], "scopes": {"adequate": true, "required": [], "missing": []},
+	  "work_item_provider": {"status": "unregistered", "provider": "jira",
+	    "registered": ["github_projects"],
+	    "note": "501 provider_unimplemented",
+	    "missing_hint": "set FISHHAWKD_JIRA_BASE_URL"}}`
+	for _, tc := range []struct {
+		name    string
+		body    string
+		present bool
+	}{
+		{"populated", populated, true},
+		{"absent", mergeGateServerBody, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fb, srv := newDoctorFakeBackend(t)
+			fb.rawBody = tc.body
+			r := newResolver(srv, nil)
+			_, out, err := r.doctor(context.Background(), nil, DoctorInput{Repo: "x/y"})
+			if err != nil {
+				t.Fatalf("doctor: %v", err)
+			}
+			encoded, err := json.Marshal(out)
+			if err != nil {
+				t.Fatalf("marshal DoctorOutput: %v", err)
+			}
+			body := string(encoded)
+			if !tc.present {
+				if strings.Contains(body, `"work_item_provider"`) {
+					t.Errorf("DoctorOutput re-emits work_item_provider on a body that omitted it:\n%s", body)
+				}
+				return
+			}
+			for _, want := range []string{
+				`"work_item_provider":{`,
+				`"status":"unregistered"`,
+				`"provider":"jira"`,
+				`"registered":["github_projects"]`,
+				`"note":"501 provider_unimplemented"`,
+				`"missing_hint":"set FISHHAWKD_JIRA_BASE_URL"`,
+			} {
+				if !strings.Contains(body, want) {
+					t.Errorf("DoctorOutput lacks %s:\n%s", want, body)
+				}
+			}
+		})
+	}
+}
+
+// TestDoctorToolDescription_DescribesWorkItemProvider pins the SHIPPED
+// description's #3646 claims, read off the REGISTERED tool over a real
+// in-memory MCP session (not the source constant): the key, the hybrid scope,
+// the closed status vocabulary, the 501 consequence naming the three foreclosed
+// surfaces, the fail-closed unknown, the empty-registry sub-case, the restart
+// requirement, the no-cascade property, and the absence-is-not-unregistered
+// distinction.
+func TestDoctorToolDescription_DescribesWorkItemProvider(t *testing.T) {
+	desc := strings.Join(strings.Fields(registeredToolDescription(t, "fishhawk_doctor")), " ")
+	for _, want := range []string{
+		"work_item_provider",
+		"HYBRID-scoped",
+		"registered | unregistered | unknown",
+		"status=unregistered is a FAILURE, not data",
+		"fishhawk_start_campaign, fishhawk_file_issue and the whole backlog-grooming loop respond 501 provider_unimplemented",
+		"Read status=unknown FAIL-CLOSED",
+		"it is NOT evidence the provider is unregistered",
+		"fabricates no env var",
+		"a credential set after boot changes nothing until fishhawkd restarts",
+		"set OUTSIDE every repo-scoped cascade",
+		"NOT the same claim as unregistered",
+	} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("fishhawk_doctor description lacks %q", want)
+		}
+	}
+}
+
 // --- runner_credentials rung (E45.82 / #3617) ---
 
 // runnerCredsSentinel is a distinctive value seeded as the env token so the
