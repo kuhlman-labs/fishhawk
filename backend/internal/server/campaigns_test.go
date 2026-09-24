@@ -8336,3 +8336,450 @@ func TestCreateCampaign_EpicRef_ThreadsNilGuard(t *testing.T) {
 		t.Fatalf("epic_ref campaign threaded GroomingGuard = %+v, want nil", guard)
 	}
 }
+
+// --- work-item provider selector + registry-aware refusal (E69.x / #3645) ---
+
+// stubConventionsProvider points conventionsLoader at a fixed provider id (and
+// optional GitLab connection block) for the duration of the test.
+func stubConventionsProvider(t *testing.T, conv workmgmt.Conventions) {
+	t.Helper()
+	prev := conventionsLoader
+	conventionsLoader = func(context.Context, string) (workmgmt.Conventions, error) { return conv, nil }
+	t.Cleanup(func() { conventionsLoader = prev })
+}
+
+// stubRegisteredWorkItemProviders presents a DETERMINISTIC registered set to
+// the handler's body-validation check. It goes through the campaigns.go seam
+// rather than mutating the process-global registry, which has no Unregister —
+// a registration would leak into every later test in the package and make this
+// assertion order-dependent.
+func stubRegisteredWorkItemProviders(t *testing.T, ids []string) {
+	t.Helper()
+	prev := registeredWorkItemProvidersFn
+	registeredWorkItemProvidersFn = func() []string { return ids }
+	t.Cleanup(func() { registeredWorkItemProvidersFn = prev })
+}
+
+// stubWorkItemProviderLookup presents a deterministic registry LOOKUP result.
+// The zero-registered arm (mode m1) is unreachable through the real global
+// registry inside a test binary that has already registered fakes, so the
+// lookup is a seam for the same reason product_report.go's feedbackProviderFor
+// is (#3628).
+func stubWorkItemProviderLookup(t *testing.T, fn func(string) (workmgmt.Provider, error)) {
+	t.Helper()
+	prev := workItemProviderFor
+	workItemProviderFor = fn
+	t.Cleanup(func() { workItemProviderFor = prev })
+}
+
+// TestCreateCampaign_ExplicitProviderUnregistered_Rejects is refusal mode m3:
+// an explicit `provider` naming an id absent from the LIVE registry is a 400
+// validation_failed on field `provider`, raised with the other body checks so
+// it costs no forge round-trip, and carrying the exact accepted set.
+//
+// COUNTERFACTUAL VEHICLE for the registry check: delete the check from
+// handleCreateCampaign's body-validation block and this goes red (the request
+// falls through to the provider dispatch instead of the 400).
+func TestCreateCampaign_ExplicitProviderUnregistered_Rejects(t *testing.T) {
+	stubRegisteredWorkItemProviders(t, []string{"github_projects", "gitlab"})
+	// Seeded BY CONSTRUCTION: a provider that would SUCCEED if the guard were
+	// absent, so the RED lands on the behavioural assertion and never on a
+	// missing fixture.
+	fp := &fakeEpicProvider{result: smallDAG()}
+	registerEpicProvider(t, fp)
+	s := New(Config{CampaignRepo: newFakeCampaignRepo()})
+
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99","provider":"never_registered"}`)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body=%s)", w.Code, w.Body.String())
+	}
+	code, details := decodeCampaignErrorDetails(t, w)
+	if code != "validation_failed" {
+		t.Fatalf("code = %q, want validation_failed", code)
+	}
+	if details["field"] != "provider" {
+		t.Errorf("details.field = %v, want provider", details["field"])
+	}
+	if details["got"] != "never_registered" {
+		t.Errorf("details.got = %v, want never_registered", details["got"])
+	}
+	reg, _ := details["registered"].([]any)
+	if len(reg) != 2 || reg[0] != "github_projects" || reg[1] != "gitlab" {
+		t.Errorf("details.registered = %v, want the live registered set [github_projects gitlab]", details["registered"])
+	}
+	// The refusal must cost NO provider dispatch: it is a body check.
+	if fp.called {
+		t.Error("EpicChildren was dispatched despite the 400 — the registry check must precede provider resolution")
+	}
+}
+
+// TestCreateCampaign_NoProviderRegistered_RemedyNamesWiring is refusal mode m1:
+// the deployment registered NO work-item provider at all, so the 501's remedy
+// names the deployment WIRING. Asserted on the SHIPPED RESPONSE BYTES (i.e.
+// post-redaction), which is what makes the static-literal remedy — a string no
+// compiler enforces — done-means pinned.
+//
+// COUNTERFACTUAL VEHICLE for the m1/m2 branch split.
+func TestCreateCampaign_NoProviderRegistered_RemedyNamesWiring(t *testing.T) {
+	stubConventionsProvider(t, workmgmt.Conventions{Provider: "github_projects"})
+	stubWorkItemProviderLookup(t, func(id string) (workmgmt.Provider, error) {
+		return nil, &workmgmt.UnknownProviderError{ID: id, Known: nil}
+	})
+	s := New(Config{CampaignRepo: newFakeCampaignRepo()})
+
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`)
+	if w.Code != http.StatusNotImplemented {
+		t.Fatalf("status = %d, want 501 (body=%s)", w.Code, w.Body.String())
+	}
+	code, details := decodeCampaignErrorDetails(t, w)
+	if code != "provider_unimplemented" {
+		t.Fatalf("code = %q, want provider_unimplemented", code)
+	}
+	remedy, _ := details["remedy"].(string)
+	if remedy == "" {
+		t.Fatalf("501 body carries no remedy (details=%v) — the actionable half was lost", details)
+	}
+	// m1's DISTINGUISHING substrings: the wiring env vars.
+	for _, want := range []string{"FISHHAWKD_GITHUB_APP_ID", "FISHHAWKD_GITLAB_BASE_URL"} {
+		if !strings.Contains(remedy, want) {
+			t.Errorf("m1 remedy = %q, want it to name %s", remedy, want)
+		}
+	}
+	// m1 must NOT offer the in-band selector: there is no registered id to name.
+	if strings.Contains(remedy, "work-management.yaml") {
+		t.Errorf("m1 remedy = %q, want the WIRING remedy, not m2's conventions lever", remedy)
+	}
+}
+
+// TestCreateCampaign_UnknownProvider_RemedyNamesRegisteredAlternative is refusal
+// mode m2: providers ARE registered but not the resolved id. The remedy must
+// name BOTH the in-band `provider` selector and the durable conventions lever,
+// and must NOT name FISHHAWKD_SINGLE_TENANT_PROVIDER (that flag selects the
+// single-tenant ACCOUNT's forge, never Conventions.Provider).
+//
+// COUNTERFACTUAL VEHICLE for the m1/m2 branch split.
+func TestCreateCampaign_UnknownProvider_RemedyNamesRegisteredAlternative(t *testing.T) {
+	stubConventionsProvider(t, workmgmt.Conventions{Provider: "never_registered_provider"})
+	stubWorkItemProviderLookup(t, func(id string) (workmgmt.Provider, error) {
+		return nil, &workmgmt.UnknownProviderError{ID: id, Known: []string{"github_projects"}}
+	})
+	s := New(Config{CampaignRepo: newFakeCampaignRepo()})
+
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`)
+	if w.Code != http.StatusNotImplemented {
+		t.Fatalf("status = %d, want 501 (body=%s)", w.Code, w.Body.String())
+	}
+	code, details := decodeCampaignErrorDetails(t, w)
+	if code != "provider_unimplemented" {
+		t.Fatalf("code = %q, want provider_unimplemented", code)
+	}
+	if details["provider"] != "never_registered_provider" {
+		t.Errorf("details.provider = %v, want never_registered_provider", details["provider"])
+	}
+	reg, _ := details["registered"].([]any)
+	if len(reg) != 1 || reg[0] != "github_projects" {
+		t.Errorf("details.registered = %v, want [github_projects]", details["registered"])
+	}
+	remedy, _ := details["remedy"].(string)
+	if remedy == "" {
+		t.Fatalf("501 body carries no remedy (details=%v)", details)
+	}
+	// m2's DISTINGUISHING substrings: the in-band selector AND the durable levers.
+	for _, want := range []string{"pass `provider` on this request", ".fishhawk/work-management.yaml", "FISHHAWKD_WORKMGMT_CONVENTIONS"} {
+		if !strings.Contains(remedy, want) {
+			t.Errorf("m2 remedy = %q, want it to name %q", remedy, want)
+		}
+	}
+	if strings.Contains(remedy, "FISHHAWKD_SINGLE_TENANT_PROVIDER") {
+		t.Errorf("m2 remedy = %q names FISHHAWKD_SINGLE_TENANT_PROVIDER, which selects the single-tenant ACCOUNT's forge and never Conventions.Provider", remedy)
+	}
+}
+
+// TestCreateCampaign_ExplicitProviderOverridesConventions is operator condition
+// 3(a): a REGISTERED explicit provider overrides the conventions default, and
+// the campaign is assembled against the EXPLICIT one. The resolved provider is
+// not a column on the campaign row, so it is asserted through the two surfaces
+// that DO observe it: which provider was dispatched, and the item set the
+// created campaign therefore carries.
+//
+// COUNTERFACTUAL VEHICLE for the explicit-wins rung of
+// resolveCampaignProviderID: delete it and the conventions provider's fake is
+// invoked, yielding smallDAG's {100,101} instead of noEpicDAG's {101,102}.
+func TestCreateCampaign_ExplicitProviderOverridesConventions(t *testing.T) {
+	const explicitID = "explicit_override_provider"
+	stubConventionsProvider(t, workmgmt.Conventions{Provider: workmgmt.Default().Provider})
+	stubRegisteredWorkItemProviders(t, []string{workmgmt.Default().Provider, explicitID})
+
+	conventionsFake := &fakeEpicProvider{name: workmgmt.Default().Provider, result: smallDAG()}
+	explicitFake := &fakeEpicProvider{name: explicitID, result: noEpicDAG()}
+	byID := map[string]workmgmt.Provider{
+		workmgmt.Default().Provider: conventionsFake,
+		explicitID:                  explicitFake,
+	}
+	var dispatched string
+	stubWorkItemProviderLookup(t, func(id string) (workmgmt.Provider, error) {
+		dispatched = id
+		p, ok := byID[id]
+		if !ok {
+			return nil, &workmgmt.UnknownProviderError{ID: id, Known: []string{workmgmt.Default().Provider, explicitID}}
+		}
+		return p, nil
+	})
+
+	repo := newFakeCampaignRepo()
+	s := New(Config{CampaignRepo: repo})
+
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99","provider":"`+explicitID+`"}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+	if dispatched != explicitID {
+		t.Errorf("resolved provider = %q, want the EXPLICIT %q (the conventions default must not win)", dispatched, explicitID)
+	}
+	if conventionsFake.called {
+		t.Error("the CONVENTIONS provider was dispatched despite an explicit provider on the request")
+	}
+	if !explicitFake.called {
+		t.Fatal("the EXPLICIT provider was never dispatched")
+	}
+	// The created campaign's item set is the explicit provider's DAG.
+	var created campaignResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode created campaign: %v", err)
+	}
+	items, err := repo.ListCampaignItemsForCampaign(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("list items: %v", err)
+	}
+	var refs []string
+	for _, it := range items {
+		refs = append(refs, it.IssueRef)
+	}
+	// noEpicDAG (the explicit fake) yields {101,102}; smallDAG (the conventions
+	// fake) would yield {100,101}.
+	if len(refs) != 2 || !containsRefTest(refs, "issue:101") || !containsRefTest(refs, "issue:102") {
+		t.Errorf("created campaign items = %v, want the EXPLICIT provider's set [issue:101 issue:102]", refs)
+	}
+}
+
+// TestCreateCampaign_NonGitHubProvider_SkipsInstallationLookup is operator
+// condition 3(b): an explicit non-GitHub provider NEVER calls the GitHub App
+// installation lookup. Asserted as a ZERO CALL COUNT on the recording GitHub
+// stub (condition 3(b) names the call count specifically; a t.Fatal inside the
+// httptest handler would fire on a non-test goroutine, which is invalid Go).
+//
+// COUNTERFACTUAL VEHICLE for the `providerID == workmgmtgithub.ProviderName`
+// guard on the installation lookup: delete it and hits climbs to 1.
+func TestCreateCampaign_NonGitHubProvider_SkipsInstallationLookup(t *testing.T) {
+	const nonGitHubID = "gitlab"
+	stubConventionsProvider(t, workmgmt.Conventions{Provider: nonGitHubID})
+	stubRegisteredWorkItemProviders(t, []string{nonGitHubID})
+	fp := &fakeEpicProvider{name: nonGitHubID, result: smallDAG()}
+	stubWorkItemProviderLookup(t, func(string) (workmgmt.Provider, error) { return fp, nil })
+
+	rec := &installRecorder{}
+	gh := recordingInstallGitHubClient(t, 4242, rec)
+	s := New(Config{CampaignRepo: newFakeCampaignRepo(), GitHub: gh})
+
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+	rec.mu.Lock()
+	hits := rec.hits
+	rec.mu.Unlock()
+	if hits != 0 {
+		t.Errorf("GetRepoInstallation call count = %d, want 0 — a non-GitHub provider must never dial the GitHub App installation lookup", hits)
+	}
+	// The Target's scope is left at its zero value, the existing
+	// unresolved-installation posture the GitLab provider already runs under.
+	if !fp.captured.Target.Scope.IsZero() {
+		t.Errorf("Target.Scope = %v, want the zero (unresolved-installation) value for a non-GitHub provider", fp.captured.Target.Scope)
+	}
+}
+
+// TestCreateCampaign_TargetCarriesGitLabConnection pins the conventions' GitLab
+// connection block reaching the provider, which the handler silently dropped:
+// workmgmt.Target has carried GitLab since ADR-058 but the campaign path built
+// its Target with Project + Jira only.
+//
+// COUNTERFACTUAL VEHICLE for the `GitLab: conv.GitLab` field.
+func TestCreateCampaign_TargetCarriesGitLabConnection(t *testing.T) {
+	conn := &workmgmt.GitLabConnection{Project: "group/subgroup/proj"}
+	stubConventionsProvider(t, workmgmt.Conventions{Provider: workmgmt.Default().Provider, GitLab: conn})
+	fp := &fakeEpicProvider{name: workmgmt.Default().Provider, result: smallDAG()}
+	stubWorkItemProviderLookup(t, func(string) (workmgmt.Provider, error) { return fp, nil })
+	s := New(Config{CampaignRepo: newFakeCampaignRepo()})
+
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+	got := fp.captured.Target.GitLab
+	if got == nil {
+		t.Fatal("Target.GitLab is nil — the conventions' GitLab connection block was dropped")
+	}
+	if got.Project != "group/subgroup/proj" {
+		t.Errorf("Target.GitLab.Project = %q, want group/subgroup/proj", got.Project)
+	}
+}
+
+// TestCreateCampaign_ProviderOmitted_UnchangedBehaviour is the REGRESSION pin
+// for operator condition 4: with NO `provider` key on the body, both the
+// pre-change happy path and the pre-change repo_not_installed path still hold.
+func TestCreateCampaign_ProviderOmitted_UnchangedBehaviour(t *testing.T) {
+	t.Run("happy path still 201 against the conventions provider", func(t *testing.T) {
+		fp := &fakeEpicProvider{result: smallDAG()}
+		registerEpicProvider(t, fp)
+		rec := &installRecorder{}
+		gh := recordingInstallGitHubClient(t, 7788, rec)
+		s := New(Config{CampaignRepo: newFakeCampaignRepo(), GitHub: gh})
+
+		w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`)
+		if w.Code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201 (body=%s)", w.Code, w.Body.String())
+		}
+		if !fp.called {
+			t.Error("the conventions provider was not dispatched")
+		}
+		// The conventions default IS github_projects, so the installation
+		// lookup still runs — byte-identical to pre-#3645.
+		rec.mu.Lock()
+		hits := rec.hits
+		rec.mu.Unlock()
+		if hits != 1 {
+			t.Errorf("GetRepoInstallation call count = %d, want 1 — the github_projects path must still resolve the installation", hits)
+		}
+	})
+
+	t.Run("repo_not_installed still 422", func(t *testing.T) {
+		fp := &fakeEpicProvider{result: smallDAG()}
+		registerEpicProvider(t, fp)
+		s := New(Config{CampaignRepo: newFakeCampaignRepo(), GitHub: newInstallationGitHubClient(t, 0, true)})
+
+		w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`)
+		if w.Code != http.StatusUnprocessableEntity {
+			t.Fatalf("status = %d, want 422 (body=%s)", w.Code, w.Body.String())
+		}
+		if code := decodeCampaignError(t, w); code != "repo_not_installed" {
+			t.Errorf("code = %q, want repo_not_installed", code)
+		}
+	})
+}
+
+// TestCreateCampaign_UninstalledNonGitHubProvider_PrecedenceChange is the
+// EXPLICIT before/after pin for the one acknowledged error-precedence change
+// (operator condition 4). A repo that is SIMULTANEOUSLY un-installed AND
+// resolves to a non-github provider used to report 422 repo_not_installed
+// (BEFORE: the installation lookup ran unconditionally, ahead of the provider);
+// it now reports the PROVIDER-side outcome (AFTER: the lookup is gated on the
+// resolved provider being github_projects, so it never runs).
+//
+// The pairing is the discriminator: an un-installed GitHub-provider repo still
+// reports 422 (the sibling case above), so the change is scoped to exactly the
+// pairing named here.
+func TestCreateCampaign_UninstalledNonGitHubProvider_PrecedenceChange(t *testing.T) {
+	const nonGitHubID = "gitlab"
+	stubConventionsProvider(t, workmgmt.Conventions{Provider: nonGitHubID})
+	fp := &fakeEpicProvider{name: nonGitHubID, result: smallDAG()}
+	stubWorkItemProviderLookup(t, func(string) (workmgmt.Provider, error) { return fp, nil })
+	// An un-installed repo: BEFORE this change, this alone produced a 422
+	// repo_not_installed regardless of the provider.
+	s := New(Config{CampaignRepo: newFakeCampaignRepo(), GitHub: newInstallationGitHubClient(t, 0, true)})
+
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`)
+	if w.Code == http.StatusUnprocessableEntity {
+		if code := decodeCampaignError(t, w); code == "repo_not_installed" {
+			t.Fatal("status = 422 repo_not_installed — the installation lookup still precedes provider resolution; a non-GitHub tracker's campaign must not die on a GitHub installation it does not need")
+		}
+	}
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 — the provider-side outcome (body=%s)", w.Code, w.Body.String())
+	}
+}
+
+// TestCreateCampaign_IdempotentReplay_PrecedesProviderValidation is operator
+// condition 2's named pin: a REPLAY carrying a now-unregistered explicit
+// provider returns the STORED response, not a 400. A replay is a read of an
+// already-committed decision — re-validating its body would let a deployment
+// state change AFTER the original create turn a replay into a refusal.
+//
+// COUNTERFACTUAL VEHICLE for the idempotency-before-validation ordering: move
+// the Idempotency-Key lookup back below the body checks and this goes red with
+// a 400 validation_failed.
+func TestCreateCampaign_IdempotentReplay_PrecedesProviderValidation(t *testing.T) {
+	fp := &fakeEpicProvider{result: smallDAG()}
+	registerEpicProvider(t, fp)
+	repo := newFakeCampaignRepo()
+	s := New(Config{CampaignRepo: repo})
+
+	// FIRST call: `provider` names a registered id, so it is created normally.
+	stubRegisteredWorkItemProviders(t, []string{workmgmt.Default().Provider})
+	body := `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99","provider":"` + workmgmt.Default().Provider + `"}`
+	first := postCampaignWithKey(t, s, body, "replay-key-3645")
+	if first.Code != http.StatusCreated {
+		t.Fatalf("first status = %d, want 201 (body=%s)", first.Code, first.Body.String())
+	}
+	var created campaignResponse
+	if err := json.Unmarshal(first.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode first: %v", err)
+	}
+
+	// DEPLOYMENT STATE CHANGES: that provider is no longer registered. Seeded
+	// BY CONSTRUCTION through the seam, never by calling the control.
+	stubRegisteredWorkItemProviders(t, []string{"some_other_provider"})
+
+	second := postCampaignWithKey(t, s, body, "replay-key-3645")
+	if second.Code != http.StatusOK {
+		t.Fatalf("replay status = %d, want 200 (body=%s) — a replay must return the stored response, not re-validate the body", second.Code, second.Body.String())
+	}
+	var replayed campaignResponse
+	if err := json.Unmarshal(second.Body.Bytes(), &replayed); err != nil {
+		t.Fatalf("decode replay: %v", err)
+	}
+	if replayed.ID != created.ID {
+		t.Errorf("replay id = %s, want the stored campaign %s", replayed.ID, created.ID)
+	}
+	if !replayed.Idempotent {
+		t.Error("replay response is not flagged idempotent")
+	}
+}
+
+// TestCreateCampaign_GitLabProvider_EpicChildrenUnsupported pins the HONEST
+// RESIDUAL as a test rather than only as prose: selecting `provider: gitlab`
+// reaches 501 epic_children_unsupported naming the RESOLVED id, because the
+// GitLab work-item provider implements neither EpicChildrenQuerier nor
+// IssueSetDependencyResolver in v0. This change makes the refusal accurate and
+// correctable; it does not make a GitLab campaign assemble.
+func TestCreateCampaign_GitLabProvider_EpicChildrenUnsupported(t *testing.T) {
+	stubConventionsProvider(t, workmgmt.Conventions{Provider: workmgmt.Default().Provider})
+	stubRegisteredWorkItemProviders(t, []string{workmgmt.Default().Provider, "gitlab"})
+	// A File-only provider, exactly the GitLab v0 capability surface.
+	stubWorkItemProviderLookup(t, func(id string) (workmgmt.Provider, error) {
+		return &fakeFileOnlyProvider{name: id}, nil
+	})
+	s := New(Config{CampaignRepo: newFakeCampaignRepo()})
+
+	w := postCampaign(t, s, `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99","provider":"gitlab"}`)
+	if w.Code != http.StatusNotImplemented {
+		t.Fatalf("status = %d, want 501 (body=%s)", w.Code, w.Body.String())
+	}
+	code, details := decodeCampaignErrorDetails(t, w)
+	if code != "epic_children_unsupported" {
+		t.Fatalf("code = %q, want epic_children_unsupported", code)
+	}
+	// The 501 names the RESOLVED provider, not the conventions one.
+	if details["provider"] != "gitlab" {
+		t.Errorf("details.provider = %v, want the RESOLVED gitlab (not the conventions default)", details["provider"])
+	}
+}
+
+// fakeFileOnlyProvider implements Provider and NOTHING else — the v0 GitLab
+// work-item provider's capability surface.
+type fakeFileOnlyProvider struct{ name string }
+
+func (f *fakeFileOnlyProvider) Name() string { return f.name }
+
+func (f *fakeFileOnlyProvider) File(_ context.Context, _ workmgmt.ProviderRequest) (*workmgmt.CreatedItem, error) {
+	return &workmgmt.CreatedItem{Provider: f.name}, nil
+}

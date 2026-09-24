@@ -21,6 +21,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
+	workmgmtgithub "github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt/github"
 )
 
 // Campaign list pagination bounds, mirroring runsDefaultLimit / runsMaxLimit.
@@ -247,6 +248,58 @@ type createCampaignRequest struct {
 	// sources is how an operator gets a batch they did not ask for, so the
 	// combination is a 400 rather than a precedence rule.
 	GroomingSource *groomingSourceRequest `json:"grooming_source,omitempty"`
+	// Provider is the OPTIONAL work-item provider id (E69.x / #3645) that
+	// overrides the conventions-resolved provider for THIS call:
+	// "github_projects" | "gitlab" | "jira", validated against the LIVE
+	// registry (workmgmt.Registered) with the other body checks so a bad value
+	// costs no forge round-trip. Empty/omitted is a no-op that falls through to
+	// the conventions-resolved provider — the backward-compatible default.
+	//
+	// WHY IT IS A WORK-ITEM PROVIDER ID AND NOT THE `forge` ENUM POST /v0/runs
+	// CARRIES. The thing being selected is Conventions.Provider, whose
+	// registered id space includes `jira` — an id no two-member github|gitlab
+	// enum can name. And `forge` on a run means something different: which
+	// forge HOSTS the repo and stamps the installation_ref. Reusing that name
+	// would be actively wrong on a deployment whose repo is on GitHub while its
+	// work items live in Jira.
+	Provider string `json:"provider,omitempty"`
+}
+
+// workItemProviderFor / registeredWorkItemProvidersFn are the capability seams
+// over the process-GLOBAL work-item provider registry, mirroring
+// product_report.go's feedbackProviderFor / registeredFeedbackProvidersFn
+// idiom (#3628) and conventionsLoader.
+//
+// They exist because workmgmt.Register has NO Unregister: a test that needs the
+// zero-registered arm (the m1 refusal mode below) or a deterministic registered
+// SET cannot get there by un-doing a sibling test's registration, and a
+// process-global registry makes such a test order-dependent. Routing both the
+// LOOKUP and the REGISTERED-SET read through vars lets a test present either
+// registry state deterministically without mutating the global.
+//
+// Production leaves both at the real registry functions, so no wiring changes.
+var (
+	workItemProviderFor           = workmgmt.Get
+	registeredWorkItemProvidersFn = workmgmt.Registered
+)
+
+// resolveCampaignProviderID is the campaign path's work-item provider ladder:
+// a non-empty request-level `provider` WINS, else the conventions-resolved
+// conv.Provider (which itself defaults to github_projects via
+// workmgmt.Default() when the repo carries no .fishhawk/work-management.yaml
+// and the deployment sets no override).
+//
+// It is a PURE function (no ResponseWriter) so the registry validation in the
+// handler's body-check block and the refusal shaping at the Get call site stay
+// separately testable. The ladder is deliberately TWO rungs, unlike
+// resolveCreateForge's three: there is no accounts-registry rung for a
+// work-item provider — the accounts `provider` discriminator selects the
+// conventions FETCH forge, not the tracker.
+func resolveCampaignProviderID(req *createCampaignRequest, conv workmgmt.Conventions) string {
+	if p := strings.TrimSpace(req.Provider); p != "" {
+		return p
+	}
+	return conv.Provider
 }
 
 func toCampaignResponse(c *campaign.Campaign) campaignResponse {
@@ -480,8 +533,9 @@ func (s *Server) handleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 	// WHY HANDLER ENTRY AND NOT THE RESOLVER CALL (operator condition 1(b)):
 	// the MCP client's timeout measures the ENTIRE request, so a budget that
 	// started only at the resolver call would leave everything before it —
-	// auth, body decode, provider resolution, grooming-order resolution,
-	// installation lookup — outside the measured span and unbounded. The
+	// auth, body decode, the idempotency lookup, body validation, provider
+	// resolution, the (now provider-gated) installation lookup, grooming-order
+	// resolution — outside the measured span and unbounded. The
 	// client could then still abort first, which is exactly this issue's
 	// defect. Anchoring at handler entry folds that pre-resolution work into
 	// the bounded span, which is where the unbounded per-item forge cost the
@@ -532,6 +586,39 @@ func (s *Server) handleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 			"request body is not valid JSON or contains unknown fields",
 			map[string]any{"error": err.Error()})
 		return
+	}
+
+	// Idempotency-Key (E25.13 / #1455). When set, a previously-created campaign
+	// with the same (repo, key) is returned 200 + idempotent:true instead of
+	// minting + dispatching a duplicate. Empty header is equivalent to "not
+	// idempotent" — every call mints a new campaign. The three-branch shape
+	// (hit / ErrNotFound / other error) mirrors runs.go.
+	//
+	// RESOLVED FIRST, ahead of BODY VALIDATION as well as the provider and
+	// forge work (operator condition 2, #3645). A replay is a read of an
+	// already-committed decision: re-validating the body would let a
+	// deployment-state change AFTER the original create — an unregistered
+	// explicit `provider`, a retired pause_policy — turn a replay of a campaign
+	// that already exists into a 400, which is the opposite of what an
+	// idempotency key is for. This is an ERROR-PRECEDENCE change for a replay
+	// carrying an invalid body; see backend/internal/server/README.md.
+	idempKey := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+	if idempKey != "" {
+		existing, err := s.cfg.CampaignRepo.GetCampaignByIdempotencyKey(r.Context(), req.Repo, idempKey)
+		switch {
+		case err == nil:
+			// Replay: return the prior campaign with 200 + idempotent:true.
+			resp := toCampaignResponse(existing)
+			resp.Idempotent = true
+			s.writeJSON(w, r, http.StatusOK, resp)
+			return
+		case errors.Is(err, campaign.ErrNotFound):
+			// First call with this key — fall through to create.
+		default:
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				"idempotency lookup failed", map[string]any{"error": err.Error()})
+			return
+		}
 	}
 
 	owner, name, ok := splitRepoFullName(req.Repo)
@@ -619,37 +706,113 @@ func (s *Server) handleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 			map[string]any{"field": "working_dir", "got": req.WorkingDir})
 		return
 	}
-
-	// Idempotency-Key (E25.13 / #1455). When set, a previously-created campaign
-	// with the same (repo, key) is returned 200 + idempotent:true instead of
-	// minting + dispatching a duplicate. Resolved BEFORE the installation +
-	// epic-children query so a replay does no GitHub work. Empty header is
-	// equivalent to "not idempotent" — every call mints a new campaign. The
-	// three-branch shape (hit / ErrNotFound / other error) mirrors runs.go.
-	idempKey := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
-	if idempKey != "" {
-		existing, err := s.cfg.CampaignRepo.GetCampaignByIdempotencyKey(r.Context(), req.Repo, idempKey)
-		switch {
-		case err == nil:
-			// Replay: return the prior campaign with 200 + idempotent:true.
-			resp := toCampaignResponse(existing)
-			resp.Idempotent = true
-			s.writeJSON(w, r, http.StatusOK, resp)
-			return
-		case errors.Is(err, campaign.ErrNotFound):
-			// First call with this key — fall through to create.
-		default:
-			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-				"idempotency lookup failed", map[string]any{"error": err.Error()})
+	// provider is the OPTIONAL work-item provider selector (#3645). A non-empty
+	// value must name a LIVE registered provider, checked HERE — with the other
+	// body checks and BEFORE the conventions load, the provider dispatch and the
+	// installation lookup — so a typo costs no forge round-trip and the refusal
+	// is reachable without a live forge. Both field/got and registered are
+	// already allow-listed in errors.go, and a 4xx is not redacted, so the
+	// caller learns the exact accepted set from the refusal. Empty/omitted falls
+	// through to the conventions-resolved provider (the unchanged default).
+	if p := strings.TrimSpace(req.Provider); p != "" {
+		registered := registeredWorkItemProvidersFn()
+		if !containsRef(registered, p) {
+			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+				"provider must name a work-item provider this deployment has registered",
+				map[string]any{"field": "provider", "got": req.Provider, "registered": registered})
 			return
 		}
+	}
+
+	// Resolve the work-management provider (#3645). This now runs AHEAD of the
+	// GitHub App installation lookup below: the installation is irrelevant to a
+	// non-GitHub tracker, and running it first meant a repo whose provider is
+	// gitlab/jira died on 422 repo_not_installed before the provider was even
+	// considered — which would make the request-level `provider` selector
+	// decorative on any deployment that also has GitHub credentials wired.
+	conv, err := conventionsLoader(r.Context(), req.Repo)
+	if err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"could not load work-management conventions", map[string]any{"error": err.Error()})
+		return
+	}
+	providerID := resolveCampaignProviderID(&req, conv)
+	provider, err := workItemProviderFor(providerID)
+	if err != nil {
+		var unk *workmgmt.UnknownProviderError
+		if errors.As(err, &unk) {
+			// TWO NAMED MODES behind one error (#3645), mirroring
+			// handleFileProductReport's #3628 shape. Both messages stay STATIC
+			// literals with the product-owned facts on the allow-listed
+			// provider / registered / remedy detail keys, per the E67.15/#2587
+			// raw-cause posture — unk.Error() as the message is a raw-cause
+			// syntax the AST guard flags. The cause itself rides
+			// internalCauseKey so writeError still joins it to error_ref in the
+			// operator log rather than dropping it (E67.29 / #2631) — the AST
+			// guard can prove the message is static but not that the cause is
+			// retained, which is what
+			// TestCreateCampaign_UnknownProvider_RedactsCauseJoinsInLog asserts
+			// behaviourally.
+			//
+			// The handler REFUSES in mode m2 rather than silently substituting
+			// the sole registered provider: silently retargeting an operator's
+			// batch at a DIFFERENT issue tracker is the same class as the
+			// grooming_source guard's "three sources with a silent winner is
+			// how an operator gets a campaign they did not ask for", with a
+			// larger blast radius. The request-level `provider` selector is
+			// what makes the refusal ONE CALL away from corrected.
+			if len(unk.Known) == 0 {
+				// Mode m1: the deployment registered NO work-item provider at
+				// all. That is operator configuration, not an unimplemented
+				// provider, so the remedy names the WIRING whose absence leaves
+				// the registry empty. `remedy` is a STATIC literal and is
+				// allow-listed in errors.go, because a 501 is a 5xx and the
+				// default-deny redactor would otherwise strip exactly the
+				// actionable half of the refusal.
+				s.writeError(w, r, http.StatusNotImplemented, "provider_unimplemented",
+					"this deployment has no work-item provider registered, so campaigns cannot be assembled",
+					map[string]any{
+						"provider":       unk.ID,
+						"registered":     unk.Known,
+						"remedy":         "configure the GitHub App credentials (FISHHAWKD_GITHUB_APP_ID and FISHHAWKD_GITHUB_APP_PRIVATE_KEY_FILE) to register github_projects, or FISHHAWKD_GITLAB_BASE_URL and FISHHAWKD_GITLAB_TOKEN to register gitlab, so a work-item provider registers at startup",
+						internalCauseKey: unk.Error(),
+					})
+				return
+			}
+			// Mode m2: providers ARE registered, but not the resolved id. The
+			// remedy names BOTH the IN-BAND fix (the new request-level selector,
+			// correctable without a daemon restart) and the DURABLE ones. It
+			// deliberately does NOT name FISHHAWKD_SINGLE_TENANT_PROVIDER: that
+			// flag selects the single-tenant ACCOUNT's forge (ADR-057 Mode 1),
+			// which feeds the conventions FETCH forge — it never sets
+			// Conventions.Provider.
+			s.writeError(w, r, http.StatusNotImplemented, "provider_unimplemented",
+				"the resolved work-item provider is not implemented",
+				map[string]any{
+					"provider":       unk.ID,
+					"registered":     unk.Known,
+					"remedy":         "pass `provider` on this request naming one of the registered ids to correct it in-band, or change it durably via the repo's .fishhawk/work-management.yaml `provider:` field or the deployment-level FISHHAWKD_WORKMGMT_CONVENTIONS override",
+					internalCauseKey: unk.Error(),
+				})
+			return
+		}
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"could not resolve work-item provider", map[string]any{"error": err.Error()})
+		return
 	}
 
 	// Resolve the App installation for the target repo (#713 / runs.go:498).
 	// A runless create has no run row to carry the id, so resolve it directly:
 	// the real GitHub provider needs it to query the epic's children.
+	//
+	// GATED ON THE RESOLVED PROVIDER (#3645): only the github_projects branch
+	// needs it. A non-github provider leaves scope at its zero value, which IS
+	// the existing unresolved-installation posture (forge.CredentialScope.IsZero)
+	// and the same posture the GitLab provider already runs under (its
+	// credentials are supplied at construction from FISHHAWKD_GITLAB_*). Mirrors
+	// workitems.go's `conv.Provider == workmgmtgithub.ProviderName` guard.
 	var scope forge.CredentialScope
-	if s.cfg.GitHub != nil {
+	if s.cfg.GitHub != nil && providerID == workmgmtgithub.ProviderName {
 		id, err := s.cfg.GitHub.GetRepoInstallation(r.Context(), forge.RepoRef{Owner: owner, Name: name})
 		switch {
 		case err == nil:
@@ -667,41 +830,6 @@ func (s *Server) handleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Resolve the work-management provider and its optional epic-children
-	// query capability, exactly as POST /v0/work-items does (workitems.go).
-	conv, err := conventionsLoader(r.Context(), req.Repo)
-	if err != nil {
-		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-			"could not load work-management conventions", map[string]any{"error": err.Error()})
-		return
-	}
-	provider, err := workmgmt.Get(conv.Provider)
-	if err != nil {
-		var unk *workmgmt.UnknownProviderError
-		if errors.As(err, &unk) {
-			// Static literal message (E67.15 / #2587): the same product-owned
-			// facts ride the allow-listed provider/registered detail keys, so
-			// nothing is lost from the CALLER's view, and unk.Error() as the
-			// message is a raw-cause syntax the AST guard flags. The cause
-			// itself rides internalCauseKey so writeError still joins it to
-			// error_ref in the operator log rather than dropping it (E67.29 /
-			// #2631, operator condition 3) — the AST guard can prove the
-			// message is static but not that the cause is retained, which is
-			// what TestCreateCampaign_UnknownProvider_RedactsCauseJoinsInLog
-			// asserts behaviourally.
-			s.writeError(w, r, http.StatusNotImplemented, "provider_unimplemented",
-				"the resolved work-item provider is not implemented",
-				map[string]any{
-					"provider":       unk.ID,
-					"registered":     unk.Known,
-					internalCauseKey: unk.Error(),
-				})
-			return
-		}
-		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-			"could not resolve work-item provider", map[string]any{"error": err.Error()})
-		return
-	}
 	// The filing Target is shared by both branches (epic sweep + no-epic
 	// item-set resolution).
 	target := workmgmt.Target{
@@ -709,6 +837,11 @@ func (s *Server) handleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 		Scope:   scope,
 		Project: conv.Project,
 		Jira:    conv.Jira,
+		// GitLab is the conventions' GitLab connection block, which
+		// workmgmt.Target has carried since ADR-058 and this handler silently
+		// dropped (#3645): a gitlab-provider campaign otherwise lost its
+		// target-project override.
+		GitLab: conv.GitLab,
 	}
 
 	// THE THIRD SOURCE (E54.6 / #2238). Resolve the approved grooming order
@@ -751,7 +884,10 @@ func (s *Server) handleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 		if !ok {
 			s.writeError(w, r, http.StatusNotImplemented, "epic_children_unsupported",
 				"the configured work-item provider cannot query epic children",
-				map[string]any{"provider": conv.Provider})
+				// The RESOLVED id (#3645), not conv.Provider: the 501 must name
+				// the provider actually dispatched against, which the
+				// request-level selector can override.
+				map[string]any{"provider": providerID})
 			return
 		}
 
@@ -805,7 +941,9 @@ func (s *Server) handleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 		if !ok {
 			s.writeError(w, r, http.StatusNotImplemented, "issue_set_resolution_unsupported",
 				"the configured work-item provider cannot resolve an explicit issue set without an epic",
-				map[string]any{"provider": conv.Provider})
+				// The RESOLVED id (#3645), not conv.Provider — see the epic
+				// branch's note above.
+				map[string]any{"provider": providerID})
 			return
 		}
 		// Bound the resolution (#3113). The deadline is anchored at

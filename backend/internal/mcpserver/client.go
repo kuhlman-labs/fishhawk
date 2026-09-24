@@ -3535,6 +3535,14 @@ type campaignCreateRequest struct {
 	// epic or an explicit item list sends a byte-identical body to pre-#2238.
 	// The backend refuses it in combination with epic_ref or items.
 	GroomingSource *campaignGroomingSource `json:"grooming_source,omitempty"`
+	// Provider is the OPTIONAL work-item provider selector (#3645): the
+	// work-item provider id ("github_projects" | "gitlab" | "jira") that
+	// overrides the repo's conventions-resolved provider for THIS create. The
+	// backend validates it against its LIVE registry with the other body checks
+	// (400 validation_failed on field `provider`, details carrying the
+	// registered set). omitempty drops an empty value, so a campaign created
+	// without a selector sends a BYTE-IDENTICAL body to pre-#3645.
+	Provider string `json:"provider,omitempty"`
 }
 
 // campaignGroomingSource is the grooming_source request block. It is a distinct
@@ -3553,22 +3561,37 @@ type campaignGroomingSource struct {
 }
 
 // CreateCampaign assembles a campaign via `POST /v0/campaigns` (E25.4) and
-// returns the created campaign (201 fresh). epicRef is OPTIONAL as of #2051: pass
-// it to decompose an epic's children (optionally narrowed by items), OR leave it
-// empty and pass items alone to assemble a NO-EPIC campaign over exactly that
-// issue list (the server resolves each issue's depends_on directly). epicRef is
-// serialized WITHOUT omitempty so an empty ref reaches the server, which treats
-// an empty-string epic_ref as absent and routes to the no-epic branch. An empty
-// request (neither epic_ref nor items) fails 400 validation_failed. pausePolicy
-// is optional — empty normalizes to pause_campaign server-side. operatorAgent is
-// the OPTIONAL campaign-level operator_agent override (E25.12 / #1451) carried as
-// opaque JSON; empty/nil omits the field so the campaign inherits each issue-run's
-// workflow contract. A write tool: requires an operator token with
+// returns the created campaign (201 fresh).
+//
+// It takes the request STRUCT rather than nine positional parameters (#3645):
+// five of those were strings, which is exactly the transposition hazard
+// campaignGroomingSource's own comment warns about, and the ladder only grows.
+//
+// req.EpicRef is OPTIONAL as of #2051: set it to decompose an epic's children
+// (optionally narrowed by Items), OR leave it empty and pass Items alone to
+// assemble a NO-EPIC campaign over exactly that issue list (the server resolves
+// each issue's depends_on directly). EpicRef is serialized WITHOUT omitempty so
+// an empty ref reaches the server, which treats an empty-string epic_ref as
+// absent and routes to the no-epic branch. An empty request (neither epic_ref
+// nor items) fails 400 validation_failed. PausePolicy is optional — empty
+// normalizes to pause_campaign server-side. OperatorAgent is the OPTIONAL
+// campaign-level operator_agent override (E25.12 / #1451) carried as opaque
+// JSON; empty/nil omits the field so the campaign inherits each issue-run's
+// workflow contract.
+//
+// req.Provider is the OPTIONAL work-item provider selector (#3645): a work-item
+// provider id that overrides the repo's conventions-resolved provider for this
+// create. The backend validates it against its LIVE registry WITH the other
+// body checks (so a bad value costs no forge round-trip) and answers 400
+// validation_failed on field `provider` with the registered set in details.
+// Empty omits the key, leaving the body byte-identical to pre-#3645.
+//
+// A write tool: requires an operator token with
 // write:campaigns scope. 4xx/5xx surfaces as *apiError; the tool layer reads the
 // code:
 //   - 400 validation_failed (repo not owner/name, neither epic_ref nor items,
 //     bad pause_policy, a malformed/unknown-field operator_agent, a non-absolute
-//     working_dir, or a dependency cycle)
+//     working_dir, an UNREGISTERED provider, or a dependency cycle)
 //   - 403 insufficient_scope (token lacks write:campaigns)
 //   - 422 repo_not_installed (the GitHub App is not on the target repo)
 //   - 422 campaign_dangling_dependency (a depends_on target is outside the assembled set)
@@ -3579,22 +3602,27 @@ type campaignGroomingSource struct {
 //     typo'd no-epic ref)
 //   - 501 issue_set_resolution_unsupported (no-epic variant on a provider that
 //     cannot resolve an arbitrary issue set)
+//   - 501 provider_unimplemented (the RESOLVED work-item provider is not in the
+//     deployment's registry). Two named modes, both carrying a `remedy` detail:
+//     an EMPTY registered set means the deployment wired no work-item provider
+//     at all and the remedy names that wiring; a non-empty one means the
+//     resolved id is simply not among them and the remedy names the in-band
+//     `provider` selector plus the durable conventions levers (#3645)
 //   - 504 issue_set_resolution_timeout (the no-epic resolution exceeded the
 //     server's issue-set budget; details carry resolved / items_total /
 //     budget_seconds and, when one could be proven to fit, a
 //     suggested_grooming_order_limit)
 //   - 503 campaign_repo_unconfigured (no campaign repository wired on the deploy)
 //
-// items is the OPTIONAL subset filter (#2003) WITH epicRef (issue refs naming the
-// subset of the epic's children; empty/nil sweeps every child) or the
-// AUTHORITATIVE issue set WITHOUT epicRef (the no-epic variant, #2051).
+// req.Items is the OPTIONAL subset filter (#2003) WITH EpicRef (issue refs
+// naming the subset of the epic's children; empty/nil sweeps every child) or
+// the AUTHORITATIVE issue set WITHOUT EpicRef (the no-epic variant, #2051).
 //
-// workingDir is the OPTIONAL campaign-level checkout binding (E48.87 / #2527)
-// every item run minted from the campaign inherits; empty omits the field (no
-// binding). It is the LAST parameter, appended after items []string, so it
-// cannot be transposed with another string argument at a call site.
-func (c *apiClient) CreateCampaign(ctx context.Context, repo, epicRef, pausePolicy string, operatorAgent json.RawMessage, items []string, workingDir string, groomingSource *campaignGroomingSource) (*Campaign, error) {
-	body, err := json.Marshal(campaignCreateRequest{Repo: repo, EpicRef: epicRef, PausePolicy: pausePolicy, OperatorAgent: operatorAgent, Items: items, WorkingDir: workingDir, GroomingSource: groomingSource})
+// req.WorkingDir is the OPTIONAL campaign-level checkout binding (E48.87 /
+// #2527) every item run minted from the campaign inherits; empty omits the
+// field (no binding).
+func (c *apiClient) CreateCampaign(ctx context.Context, req campaignCreateRequest) (*Campaign, error) {
+	body, err := json.Marshal(req)
 	if err != nil {
 		return nil, fmt.Errorf("marshal create campaign: %w", err)
 	}

@@ -2133,6 +2133,34 @@ per-tool contract). Internals not covered there:
   completion-satisfied refinement), and `issue_set_resolution_unsupported` (501) maps when the provider cannot resolve
   an arbitrary issue set. A malformed ref on EITHER path maps `campaign_item_ref_invalid` (422, #2176) — on the no-epic
   path it REPLACES `issue_set_resolution_failed` (502), which now means a genuine forge fetch failure only.
+- **`provider` selector + the two new gate-code arms (#3645).** `fishhawk_start_campaign` takes an OPTIONAL `provider`
+  — the WORK-ITEM PROVIDER ID (`github_projects` | `gitlab` | `jira`) this campaign is assembled against, overriding
+  the repo's conventions-resolved provider for that call. It is forwarded VERBATIM (the backend is the registry
+  authority; this layer does not second-guess the id) and `omitempty` drops an empty value, so a campaign started
+  without a selector sends a BYTE-IDENTICAL body to pre-#3645. It is deliberately NOT a `github|gitlab` `forge` enum
+  like `fishhawk_start_run`'s: the id space includes `jira`, and `forge` on a run names which forge HOSTS the repo.
+  The tool's `repo` description also lost its hardcoded "GitHub" — the field has been forge-neutral since ADR-058.
+  Two new gate-code arms:
+  - `validation_failed` on `details.field == "provider"` → an operator-actionable message naming the offending value
+    and the backend's `details.registered` set. Every OTHER `validation_failed` falls out of the switch to the
+    generic `create campaign:` wrapper, byte-unchanged.
+  - `provider_unimplemented` (501) → the backend's static-literal `details.remedy` surfaced VERBATIM, with the
+    resolved provider and the registered set. The remedy is MODE-DEPENDENT (deployment-wired-nothing vs
+    resolved-id-not-registered), so re-deriving it here would either duplicate the server's branch or flatten the two
+    modes into one wrong message. Note for anyone pinning this arm: the generic wrapper renders the `*apiError` as
+    `fishhawk: HTTP 501 (provider_unimplemented): <message>; details: {...}` — a JSON dump that ALREADY contains the
+    code, the provider id, the registered set AND the remedy text — so a substring assertion on any of those is
+    VACUOUS. `TestStartCampaign_ProviderUnimplemented_SurfacesRemedy` therefore asserts on the absence of the
+    `create campaign:` prefix and on the arm's own connective phrasing.
+
+  **Honest residual.** `provider: gitlab` reaches `501 epic_children_unsupported` / `501
+  issue_set_resolution_unsupported`, because the GitLab work-item provider implements neither `EpicChildrenQuerier`
+  nor `IssueSetDependencyResolver` in v0. The selector makes the refusal ACCURATE and CORRECTABLE; it does not make a
+  GitLab campaign assemble.
+
+  `apiClient.CreateCampaign` correspondingly takes the request STRUCT rather than nine positional parameters, five of
+  them strings — the transposition hazard `campaignGroomingSource`'s own comment warns about, and the ladder only
+  grows.
 - **`operator_agent` override (E25.12 / #1451).** `fishhawk_start_campaign`'s optional `operator_agent` — the
   campaign-level delegation override — is typed `map[string]any` on `StartCampaignInput` so the SDK's reflection-built
   input schema sees an unconstrained object; it is marshalled to opaque JSON the backend validates against
