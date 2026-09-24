@@ -906,6 +906,43 @@ func TestRetryStage_Drive_LocalImplement_ParksWithNextAction(t *testing.T) {
 	}
 }
 
+// TestRetryStage_Local_ResponseCarriesAwaitingHostDispatch pins the premise
+// the MCP surface's retry park derivation rests on (E45.89 / #3624): on a
+// runner_kind LOCAL run, POST /v0/stages/{id}/retry's RESPONSE BODY carries
+// the POST-Advance stage state awaiting_host_dispatch — not the intermediate
+// pending the retry re-opened to, and not dispatched.
+//
+// retryStageAs hands the pending re-open to Orchestrator.Advance and then
+// RE-FETCHES the stage, and the orchestrator's local branch parks it because
+// the runner is host-spawned (ADR-024: the backend has no channel to start
+// it). fishhawk_retry_stage derives its parked flag and its pre-filled
+// next_step from exactly this state, so if the re-fetch or the local park ever
+// stopped reaching the response, that derivation would silently report a
+// dispatched stage nothing is driving. The existing drive tests above assert
+// the AUDIT advance and the run resource's next_action; this one asserts the
+// retry response itself.
+func TestRetryStage_Local_ResponseCarriesAwaitingHostDispatch(t *testing.T) {
+	s, _, _, _, stageID := newDriveRetryServer(t, true, run.RunnerKindLocal,
+		run.StageTypeImplement, run.FailureA, "agent crashed: SIGSEGV")
+
+	w := postRetry(t, s, stageID)
+	if w.Code != http.StatusOK {
+		t.Fatalf("retry status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	var resp stageResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode retry response: %v\n%s", err, w.Body.String())
+	}
+	if resp.State != string(run.StageStateAwaitingHostDispatch) {
+		t.Errorf("response stage.state = %q, want %q (the runner_kind local park the MCP parked/next_step derivation reads)",
+			resp.State, run.StageStateAwaitingHostDispatch)
+	}
+	if resp.ID != stageID {
+		t.Errorf("response stage.id = %s, want %s", resp.ID, stageID)
+	}
+}
+
 // TestRetryStage_Drive_LocalPlan_ParksWithNextAction covers the plan-stage
 // branch: a category-A retry of a PLAN stage on a drive-mode local run parks
 // with next_action.action=run_plan_stage, surfaced on the run resource.

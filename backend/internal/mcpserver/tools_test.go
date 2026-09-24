@@ -8951,6 +8951,203 @@ func TestRetryStage_HappyPath_CategoryD_SLATimeout_BackToAwaitingApproval(t *tes
 	}
 }
 
+// --- fishhawk_retry_stage park derivation (E45.89 / #3624) ---
+//
+// These drive r.retryStage END TO END through the real HTTP client against the
+// fakeBackend, so they assert the DECODED RetryStageOutput — proving the new
+// parked / next_step / warnings fields actually serialize and that the handler
+// wires retryStagePark in, not merely that the pure helper returns the right
+// thing.
+
+// TestRetryStage_LocalPark_EmitsDispatchNextStep is the runner_kind local
+// outcome the tool description previously mis-stated: the retry re-opened the
+// stage and the orchestrator parked it at awaiting_host_dispatch, so the
+// response must carry parked plus the fishhawk_dispatch_stage pointer.
+func TestRetryStage_LocalPark_EmitsDispatchNextStep(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	stageID := uuid.New()
+	runID := uuid.New()
+	fb.retryResp[stageID] = Stage{
+		ID:    stageID.String(),
+		RunID: runID.String(),
+		Type:  "implement",
+		State: "awaiting_host_dispatch",
+	}
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running", RunnerKind: "local"}
+
+	_, out, err := r.retryStage(context.Background(), nil, RetryStageInput{StageID: stageID.String()})
+	if err != nil {
+		t.Fatalf("retryStage: %v", err)
+	}
+	if out.Stage.State != "awaiting_host_dispatch" {
+		t.Errorf("State = %q, want awaiting_host_dispatch", out.Stage.State)
+	}
+	if !out.Parked {
+		t.Error("parked = false, want true (runner_kind local parks at awaiting_host_dispatch)")
+	}
+	if out.NextStep == nil {
+		t.Fatal("next_step = nil, want the fishhawk_dispatch_stage pointer")
+	}
+	if out.NextStep.Action != "fishhawk_dispatch_stage" {
+		t.Errorf("next_step.action = %q, want fishhawk_dispatch_stage", out.NextStep.Action)
+	}
+	if out.NextStep.Params["run_id"] != runID.String() {
+		t.Errorf("next_step.params[run_id] = %q, want %s", out.NextStep.Params["run_id"], runID)
+	}
+	if out.NextStep.Params["stage"] != "implement" {
+		t.Errorf("next_step.params[stage] = %q, want implement", out.NextStep.Params["stage"])
+	}
+	if len(out.Warnings) != 0 {
+		t.Errorf("warnings = %v, want none", out.Warnings)
+	}
+}
+
+// TestRetryStage_LocalPark_DecompositionChild_EmitsRunChildren pins the
+// decomposition-child verb: a parked stage on a run whose decomposed_from is
+// set selects fishhawk_run_children keyed on the PARENT run id, because
+// dispatch_stage checks out main and cannot see a depends_on slice's dependency.
+func TestRetryStage_LocalPark_DecompositionChild_EmitsRunChildren(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	stageID := uuid.New()
+	childID := uuid.New()
+	parentID := uuid.New()
+	parent := parentID.String()
+	fb.retryResp[stageID] = Stage{
+		ID:    stageID.String(),
+		RunID: childID.String(),
+		Type:  "implement",
+		State: "awaiting_host_dispatch",
+	}
+	fb.getRunByID[childID] = Run{
+		ID:             childID.String(),
+		Repo:           "x/y",
+		State:          "running",
+		RunnerKind:     "local",
+		DecomposedFrom: &parent,
+	}
+
+	_, out, err := r.retryStage(context.Background(), nil, RetryStageInput{StageID: stageID.String()})
+	if err != nil {
+		t.Fatalf("retryStage: %v", err)
+	}
+	if !out.Parked {
+		t.Error("parked = false, want true")
+	}
+	if out.NextStep == nil || out.NextStep.Action != "fishhawk_run_children" {
+		t.Fatalf("next_step = %+v, want fishhawk_run_children", out.NextStep)
+	}
+	if out.NextStep.Params["parent_run_id"] != parent {
+		t.Errorf("next_step.params[parent_run_id] = %q, want %s", out.NextStep.Params["parent_run_id"], parent)
+	}
+}
+
+// TestRetryStage_GitHubActionsDispatched_NoExtraRunRead is the
+// no-extra-round-trip claim: a dispatched stage (the CI kinds' outcome) emits
+// no pointer AND costs no GetRun. Delete the retryStageStateParks
+// short-circuit in the handler so GetRun fires unconditionally and the
+// getRunCalledByID assertion goes RED.
+func TestRetryStage_GitHubActionsDispatched_NoExtraRunRead(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	stageID := uuid.New()
+	runID := uuid.New()
+	fb.retryResp[stageID] = Stage{
+		ID:    stageID.String(),
+		RunID: runID.String(),
+		Type:  "implement",
+		State: "dispatched",
+	}
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running", RunnerKind: "github_actions"}
+
+	_, out, err := r.retryStage(context.Background(), nil, RetryStageInput{StageID: stageID.String()})
+	if err != nil {
+		t.Fatalf("retryStage: %v", err)
+	}
+	if out.Parked {
+		t.Error("parked = true, want false (the orchestrator fired a fresh workflow_dispatch)")
+	}
+	if out.NextStep != nil {
+		t.Errorf("next_step = %+v, want nil", out.NextStep)
+	}
+	if fb.getRunCalledByID[runID] != 0 {
+		t.Errorf("GetRun called %d times, want 0 — the extra read is paid only on a park",
+			fb.getRunCalledByID[runID])
+	}
+}
+
+// TestRetryStage_LocalPark_RunReadFails_StillPointsAtDispatch pins the
+// fail-open posture: a GetRun failure must NOT turn a successful retry into a
+// tool error, and the pointer still ships (the park is already proven by the
+// stage state) with exactly one warning naming the skipped child check.
+func TestRetryStage_LocalPark_RunReadFails_StillPointsAtDispatch(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	stageID := uuid.New()
+	runID := uuid.New()
+	fb.retryResp[stageID] = Stage{
+		ID:    stageID.String(),
+		RunID: runID.String(),
+		Type:  "implement",
+		State: "awaiting_host_dispatch",
+	}
+	// Seeded BY CONSTRUCTION: this run id's read 500s, so the
+	// decomposition-child check cannot run.
+	fb.getStatusByID[runID] = http.StatusInternalServerError
+
+	_, out, err := r.retryStage(context.Background(), nil, RetryStageInput{StageID: stageID.String()})
+	if err != nil {
+		t.Fatalf("retryStage returned an error on a run-read failure: %v (the retry itself succeeded)", err)
+	}
+	if !out.Parked {
+		t.Error("parked = false, want true")
+	}
+	if out.NextStep == nil || out.NextStep.Action != "fishhawk_dispatch_stage" {
+		t.Fatalf("next_step = %+v, want the fishhawk_dispatch_stage pointer (fail OPEN)", out.NextStep)
+	}
+	if len(out.Warnings) != 1 {
+		t.Fatalf("warnings = %v, want exactly 1", out.Warnings)
+	}
+	if !strings.Contains(out.Warnings[0], "fishhawk_run_children") {
+		t.Errorf("warning = %q, want it to name the skipped decomposition-child check", out.Warnings[0])
+	}
+}
+
+// TestRetryStageDescription_IsRunnerKindAware is the #1169 done-means
+// behavioral test: it reads the REGISTERED tool's Description off the
+// mcp.Server tool listing (not the source literal), so a comment-only or
+// no-op touch of tools.go satisfies the scope-completeness presence gate but
+// fails here. Delete the awaiting_host_dispatch sentence from the description
+// and this goes RED.
+func TestRetryStageDescription_IsRunnerKindAware(t *testing.T) {
+	desc := registeredToolDescription(t, "fishhawk_retry_stage")
+
+	for _, want := range []string{
+		"awaiting_host_dispatch",  // the local park is NAMED
+		"runner_kind local",       // and attributed to the right channel
+		"fishhawk_dispatch_stage", // with the follow-on verb
+		"fishhawk_run_children",   // and the decomposition-child variant
+		"workflow_dispatch",       // the CI kinds' outcome still stated
+		"github_actions",          // ... attributed to those kinds
+		"next_step",               // the response carries it pre-filled
+		"NEVER SPAWNS A RUNNER",   // the honest non-claim
+		"DISPATCH ONLY on",        // condition 2: no blanket "always"
+	} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("fishhawk_retry_stage description missing %q:\n%s", want, desc)
+		}
+	}
+	// Condition 2: the description must NOT claim a local retry ALWAYS lands
+	// at awaiting_host_dispatch — pending, awaiting_approval and
+	// awaiting_children are all reachable.
+	for _, state := range []string{"pending", "awaiting_approval", "awaiting_children"} {
+		if !strings.Contains(desc, state) {
+			t.Errorf("description does not enumerate the %q outcome:\n%s", state, desc)
+		}
+	}
+}
+
 func TestRetryStage_InvalidUUID_FailsLocally(t *testing.T) {
 	fb, srv := newFakeBackend(t)
 	r := newResolver(srv, nil)
