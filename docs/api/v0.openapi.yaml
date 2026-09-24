@@ -5682,7 +5682,8 @@ components:
         Forge-family-aware since E45.43 / #3348: `forge` names the family that
         answered. Five repo-scoped checks run on `github`, six on `gitlab`
         (plus the deployment-scoped `trace_store` and `review_grounding`
-        rungs on both). On `gitlab` —
+        rungs and the hybrid-scoped `work_item_provider` rung on both). On
+        `gitlab` —
         `app.installed` means "a gitlab installation is registered for
         EXACTLY this project path AND the project is resolvable with the
         deployment GitLab credential" (E45.68 / #3582; `app.note` states so,
@@ -5728,6 +5729,18 @@ components:
         client must render it informationally rather than as a finding. It is
         OPTIONAL for the same older-fishhawkd reason; its absence is no claim,
         not `enabled: false`.
+
+        `work_item_provider` (E45.94 / #3646) is HYBRID-scoped — the resolved
+        provider id is a REPO fact (the repo's work-management conventions)
+        and the registered set a DEPLOYMENT fact — and is nevertheless set on
+        EVERY report of both families, outside every cascade above. It answers
+        whether this deployment can file work items for this repo at all.
+        `status: unregistered` is a FAILURE, not data: campaigns, work-item
+        filings and the grooming loop all respond `501
+        provider_unimplemented`. `status: unknown` is FAIL-CLOSED — the
+        conventions could not be resolved, which is not evidence the provider
+        is missing. It is OPTIONAL for the same older-fishhawkd reason; its
+        absence is no claim, not `unregistered`.
       required: [repo, app, spec, reviewers, scopes]
       properties:
         repo:
@@ -6359,6 +6372,91 @@ components:
                 `FISHHAWKD_REVIEW_GROUNDING=true` (or `--review-grounding`),
                 an OPT-IN posture for a single-tenant host you control. When
                 on: how to revert, and what stays true while it is on.
+
+        work_item_provider:
+          type: object
+          description: |
+            HYBRID-scoped, both families (E45.94 / #3646): is the work-item
+            provider this REPO's `.fishhawk/work-management.yaml` conventions
+            resolve to actually REGISTERED on this DEPLOYMENT? `provider` is a
+            repo fact, `registered` a deployment fact, and their INTERSECTION
+            is `status`. The rung exists so an operator learns BEFORE a first
+            campaign that the deployment cannot file work items — instead of
+            afterwards, from a `501 provider_unimplemented`.
+
+            `status: unregistered` is a FAILURE, not data:
+            `POST /v0/campaigns`, `POST /v0/work-items` and the backlog-
+            grooming loop all respond `501 provider_unimplemented`.
+
+            Read `status: unknown` FAIL-CLOSED: the repo's conventions could
+            not be resolved, so the question was not SETTLED. It is NOT
+            evidence that the provider is unregistered, and a client must not
+            render it as a pass.
+
+            Although the resolved provider is repo-scoped, the rung is set
+            OUTSIDE every repo-scoped cascade, so a not-installed repo, an
+            unresolvable GitLab project and an unavailable spec all still
+            carry it. The current backend sets it on every report; it is
+            OPTIONAL only so a pre-#3646 fishhawkd's body still validates.
+            Absence means the backend cannot answer, which is NOT the same
+            claim as `unregistered`.
+          required: [status, registered]
+          properties:
+            status:
+              type: string
+              description: |
+                `registered` — the resolved provider is wired on this
+                deployment; a filing call will dispatch. `unregistered` — it
+                is not: every campaign, work-item filing and grooming apply
+                responds `501 provider_unimplemented`. `unknown` — the repo's
+                work-management conventions could not be resolved; read it
+                FAIL-CLOSED, it is not evidence the provider is missing.
+              enum: [registered, unregistered, unknown]
+            provider:
+              type: string
+              description: |
+                The work-item provider id the repo's conventions resolve to.
+                Absent on `unknown`, where the conventions were never read —
+                never emitted as an empty string standing in for one.
+              example: github_projects
+            registered:
+              type: array
+              description: |
+                The work-item provider ids registered on this DEPLOYMENT at
+                startup. ALWAYS served, possibly EMPTY — an empty array means
+                no provider is wired at all — and populated even on
+                `unknown`, because the deployment registry answers when the
+                repo's conventions do not.
+              items:
+                type: string
+              example: [github_projects]
+            reason:
+              type: string
+              description: |
+                On `unknown` only: the closed-set failure class
+                (`conventions_unresolved`). A product-owned string, never the
+                resolution error's verbatim text, which can carry forge
+                transport detail.
+              enum: [conventions_unresolved]
+            note:
+              type: string
+              description: |
+                The human sentence for the verdict: on `unregistered`, the
+                501 consequence for campaigns, work-item filing and grooming;
+                on `unknown`, that the absence of an answer is not evidence
+                the provider is missing. Absent on `registered`.
+            missing_hint:
+              type: string
+              description: |
+                The operator next step. On `unregistered`: the resolved
+                provider's actual startup environment variables plus the
+                restart requirement — or, when NO provider is registered at
+                all, a distinguished hint naming all three credential sets
+                rather than one provider's. An id this build has no startup
+                configuration for gets a generic hint naming the id, the
+                registered set and the `provider:` conventions key, and
+                fabricates no environment variable. On `unknown`: where to
+                look for the conventions-resolution failure.
 
     GitLabAccessLevel:
       type: object

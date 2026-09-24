@@ -1020,6 +1020,44 @@ type OnboardingReadinessReport struct {
 	// backend could not answer". The current backend sets it on EVERY report
 	// of both families, outside every repo-scoped cascade.
 	ReviewGrounding *onboardingReviewGrounding `json:"review_grounding,omitempty" jsonschema:"DEPLOYMENT-scoped, both families: whether this fishhawkd grounds its plan- and implement-review agents against an exported read-only source tree, or leaves them DIFF-ONLY (the supported default - grounding ships dormant behind FISHHAWKD_REVIEW_GROUNDING); adapters[] states the per-adapter read bound, and the two bounds are NOT equivalent; never cascades on app/spec (a not-installed repo still carries it); ABSENT (omitted, not zero-valued) against an older fishhawkd that does not serve the field - absence means the backend cannot answer, which is NOT the same claim as enabled:false"`
+	// WorkItemProvider is the HYBRID-scoped work-item-provider rung (E45.94 /
+	// #3646), a POINTER for the same reason as TraceStore: a pre-#3646
+	// fishhawkd serves no `work_item_provider` key, and absence must stay
+	// absence. A value field would decode that response into a zero-valued
+	// object whose `status` is "" — outside registered|unregistered|unknown, a
+	// verdict no read ever established — and an empty status is NOT the same
+	// claim as "the backend could not answer". The current backend sets it on
+	// EVERY report of both families, outside every repo-scoped cascade.
+	WorkItemProvider *onboardingWorkItemProvider `json:"work_item_provider,omitempty" jsonschema:"HYBRID-scoped, both families: whether the work-item provider this REPO's work-management conventions resolve to is actually REGISTERED on this DEPLOYMENT; status unregistered is a FAILURE, not data - fishhawk_start_campaign, fishhawk_file_issue and the backlog-grooming loop all respond 501 provider_unimplemented; read status unknown FAIL-CLOSED (the conventions could not be resolved, which is NOT evidence the provider is unregistered); never cascades on app/spec (a not-installed repo still carries it); ABSENT (omitted, not zero-valued) against an older fishhawkd that does not serve the field - absence means the backend cannot answer, which is NOT the same claim as unregistered"`
+}
+
+// onboardingWorkItemProvider mirrors the backend workItemProviderReadiness
+// sub-object (E45.94 / #3646): is the work-item provider this repo's
+// conventions RESOLVE to actually REGISTERED on this deployment?
+//
+// Status is a CLOSED three-value vocabulary. "registered" means a filing call
+// will dispatch. "unregistered" is a FAILURE, not data: every campaign,
+// fishhawk_file_issue and the grooming loop respond 501
+// provider_unimplemented. "unknown" means the repo's conventions could not be
+// resolved — read it FAIL-CLOSED: the question was not SETTLED, which is not
+// evidence the provider is missing.
+//
+// The rung is HYBRID-scoped: `provider` is a REPO fact (the conventions) while
+// `registered` is a DEPLOYMENT fact (the startup registry). `registered` is
+// always served, possibly empty, because the registry answers even when the
+// repo does not.
+//
+// Unexported, like onboardingTraceStore: the export baseline pins the
+// pre-#2408 surface and this type is reached only through
+// OnboardingReadinessReport. MUST stay byte-identical with the backend json
+// tags.
+type onboardingWorkItemProvider struct {
+	Status      string   `json:"status" jsonschema:"one of registered (the resolved provider is wired on this deployment), unregistered (it is NOT - fishhawk_start_campaign, fishhawk_file_issue and the grooming loop all respond 501 provider_unimplemented; a FAILURE, not data), or unknown (the repo's work-management conventions could not be resolved, so the question was not settled - read FAIL-CLOSED, it is NOT evidence the provider is unregistered)"`
+	Provider    string   `json:"provider,omitempty" jsonschema:"the work-item provider id the REPO's .fishhawk/work-management.yaml conventions resolve to (e.g. github_projects, gitlab, jira); absent on status unknown, where the conventions were never read"`
+	Registered  []string `json:"registered" jsonschema:"the work-item provider ids REGISTERED on this DEPLOYMENT at startup (a deployment fact, not a repo one); always served, possibly EMPTY - an empty array means no provider is wired at all, and it is populated even on status unknown because the registry answers when the repo does not"`
+	Reason      string   `json:"reason,omitempty" jsonschema:"on status unknown: the closed-set failure class (conventions_unresolved); a product-owned string, never the resolution error's verbatim text, which can carry forge transport detail"`
+	Note        string   `json:"note,omitempty" jsonschema:"the human sentence for the verdict: on unregistered, the 501 consequence for campaigns / file_issue / grooming; on unknown, that the absence of an answer is not evidence the provider is missing"`
+	MissingHint string   `json:"missing_hint,omitempty" jsonschema:"the operator next step: on unregistered, the per-provider startup env vars plus the restart requirement (or, when NO provider is registered at all, the distinguished hint naming all three credential sets); on unknown, where to look for the conventions-resolution failure"`
 }
 
 // onboardingReviewGrounding mirrors the backend reviewGroundingReadiness

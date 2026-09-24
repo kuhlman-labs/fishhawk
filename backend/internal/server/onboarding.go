@@ -17,6 +17,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/modeloracle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/tracestore"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 	"github.com/kuhlman-labs/fishhawk/pricing"
 )
 
@@ -82,6 +83,20 @@ var requiredRunScopes = []string{
 // there), set on EVERY gitlab-family report including the forge-unconfigured
 // one, `unknown` with a naming reason whenever the registry cannot answer.
 //
+// WorkItemProvider (E45.94 / #3646) is HYBRID-scoped — the one rung that is
+// neither purely deployment- nor purely repo-scoped. The RESOLVED work-item
+// provider id is a REPO fact (the repo's work-management conventions, read
+// through the same conventionsLoader seam POST /v0/campaigns and
+// POST /v0/work-items resolve through), while the REGISTERED provider set is
+// a DEPLOYMENT fact (workmgmt.Registered(), populated at startup by
+// registerWorkmgmtProviders, gated per configured client). Their INTERSECTION
+// is the verdict. It is nevertheless set BEFORE the forge-family switch, so no
+// repo-scoped cascade (not-installed app, unresolvable GitLab project,
+// unavailable spec) can suppress it. Like TraceStore it is a pointer only so
+// the client mirrors can model an older fishhawkd's absent key as "no claim"
+// (never a zero-valued out-of-enum empty status); this handler never leaves it
+// nil.
+//
 // ReviewGrounding (E45.90 / #3625) is DEPLOYMENT-scoped for the same reason
 // as TraceStore, and answers a different question: is review grounding ON for
 // this deployment, and what BOUNDS a grounded reviewer's reads per adapter? It
@@ -111,6 +126,7 @@ type onboardingReadinessResponse struct {
 	GitLabRegistration *gitLabRegistrationReadiness `json:"gitlab_registration,omitempty"`
 	TraceStore         *traceStoreReadiness         `json:"trace_store,omitempty"`
 	ReviewGrounding    *reviewGroundingReadiness    `json:"review_grounding,omitempty"`
+	WorkItemProvider   *workItemProviderReadiness   `json:"work_item_provider,omitempty"`
 }
 
 // traceStoreReadiness reports whether this deployment has a trace store wired
@@ -264,6 +280,141 @@ func reviewGroundingReadinessFor(disabled bool) reviewGroundingReadiness {
 		Adapters:    adapters,
 		Note:        reviewGroundingOnNote,
 		Remediation: reviewGroundingOnRemediation,
+	}
+}
+
+// workItemProviderReadiness reports whether the work-item provider this repo's
+// conventions RESOLVE to is actually REGISTERED on this deployment (E45.94 /
+// #3646). Without it, a deployment on which every campaign, every
+// fishhawk_file_issue and the whole grooming loop is impossible reports
+// all-green, and the operator learns otherwise only from a 501
+// provider_unimplemented AFTER the first call.
+//
+// Status is a CLOSED three-value vocabulary:
+//
+//   - "registered"   — the resolved provider is in the registered set: a
+//     filing call will dispatch.
+//   - "unregistered" — the resolved provider is NOT registered. A FAILURE,
+//     not data: fishhawk_start_campaign, fishhawk_file_issue
+//     and the grooming loop all respond 501
+//     provider_unimplemented. Note states the consequence and
+//     MissingHint names the per-provider remedy.
+//   - "unknown"      — the repo's conventions could not be resolved, so the
+//     question could not be SETTLED. Read it FAIL-CLOSED: it
+//     is NOT evidence the provider is unregistered, and it is
+//     never rendered as a pass.
+//
+// Registered is ALWAYS emitted (possibly as an empty array) because the
+// deployment registry answers even when the repo's conventions do not — it is
+// the half of the verdict that is always knowable.
+type workItemProviderReadiness struct {
+	Status      string   `json:"status"`
+	Provider    string   `json:"provider,omitempty"`
+	Registered  []string `json:"registered"`
+	Reason      string   `json:"reason,omitempty"`
+	Note        string   `json:"note,omitempty"`
+	MissingHint string   `json:"missing_hint,omitempty"`
+}
+
+// The closed work_item_provider status vocabulary (three values;
+// docs/api/v0.openapi.yaml enumerates the same set).
+const (
+	workItemProviderStatusRegistered   = "registered"
+	workItemProviderStatusUnregistered = "unregistered"
+	workItemProviderStatusUnknown      = "unknown"
+)
+
+const (
+	// workItemProviderUnknownReason is a PRODUCT-OWNED closed-set string, not
+	// the resolution error's text: a conventions-load failure can carry forge
+	// transport detail (a URL, a status line, a credential-shaped token), and
+	// this rung follows the merge_gate / gitlab_registration `reason`
+	// discipline of naming the CLASS of failure rather than echoing it.
+	workItemProviderUnknownReason = "conventions_unresolved"
+	workItemProviderUnknownNote   = "the repo's work-management conventions could not be resolved, so the work-item provider this repo would file through is UNKNOWN. This is not evidence that no provider is registered: the deployment registry (registered[] below) answered, the repo did not."
+	workItemProviderUnknownHint   = "check that .fishhawk/work-management.yaml on the repo's default branch parses (or that the deployment's FISHHAWKD_WORKMGMT_CONVENTIONS fallback file does), and check the fishhawkd log for the conventions-load failure; until the conventions resolve, this rung makes NO claim about whether filing would succeed"
+
+	workItemProviderUnregisteredNote = "the work-item provider this repo's conventions resolve to is NOT registered on this deployment: fishhawk_start_campaign, fishhawk_file_issue and the backlog-grooming loop all respond 501 provider_unimplemented"
+
+	// workItemProviderNoneRegisteredHint is the distinguished EMPTY-registry
+	// sub-case: naming one provider's env vars would be misleading when the
+	// deployment has wired NONE of them.
+	workItemProviderNoneRegisteredHint = "NO work-item provider is registered on this deployment at all: configure at least one of the GitHub App (FISHHAWKD_GITHUB_APP_ID + FISHHAWKD_GITHUB_APP_PRIVATE_KEY_FILE), GitLab (FISHHAWKD_GITLAB_BASE_URL + FISHHAWKD_GITLAB_TOKEN) or Jira (FISHHAWKD_JIRA_BASE_URL + FISHHAWKD_JIRA_EMAIL + FISHHAWKD_JIRA_API_TOKEN) credentials and RESTART fishhawkd — registerWorkmgmtProviders registers a provider only when its client is configured at startup"
+
+	// workItemProviderRegisterContract is appended to every per-provider hint:
+	// the registration is a STARTUP fact, so a credential set after boot
+	// changes nothing until fishhawkd restarts.
+	workItemProviderRegisterContract = ", then RESTART fishhawkd — registerWorkmgmtProviders registers a provider only when its client is configured at startup, so the remedy is deployment configuration plus a restart"
+)
+
+// workItemProviderMissingHint names the concrete startup gate for the
+// resolved provider id, verified against backend/cmd/fishhawkd/serve.go's flag
+// table and workmgmt_wiring.go's per-client gating.
+//
+// An id OUTSIDE the three shipped providers gets a GENERIC hint naming the id,
+// the registered set and the conventions key — never a fabricated env var,
+// because inventing a plausible FISHHAWKD_<ID>_TOKEN would send an operator
+// looking for a knob that does not exist.
+func workItemProviderMissingHint(provider string, registered []string) string {
+	if len(registered) == 0 {
+		return workItemProviderNoneRegisteredHint
+	}
+	switch provider {
+	case "github_projects":
+		return "set FISHHAWKD_GITHUB_APP_ID and FISHHAWKD_GITHUB_APP_PRIVATE_KEY_FILE" + workItemProviderRegisterContract
+	case "gitlab":
+		return "set FISHHAWKD_GITLAB_BASE_URL and FISHHAWKD_GITLAB_TOKEN (both are required; a partial configuration leaves the provider disabled)" + workItemProviderRegisterContract
+	case "jira":
+		return "set FISHHAWKD_JIRA_BASE_URL, FISHHAWKD_JIRA_EMAIL and FISHHAWKD_JIRA_API_TOKEN (all three are required; a partial configuration leaves the provider disabled)" + workItemProviderRegisterContract
+	default:
+		return "the repo's conventions name work-item provider " + provider +
+			", which this build has no startup configuration for; registered providers on this deployment are: " +
+			strings.Join(registered, ", ") +
+			". Either correct the `provider:` key in .fishhawk/work-management.yaml to one of those, or deploy a build that registers " + provider
+	}
+}
+
+// workItemProviderReadinessFor resolves the work_item_provider rung from the
+// repo's resolved conventions provider, the deployment's registered set, and
+// the conventions-resolution error. Pure, for the same reason
+// traceStoreReadinessFor and reviewGroundingReadinessFor are: onboarding_test
+// tables every branch without booting a server.
+//
+// The error branch is FAIL-CLOSED and comes FIRST: with no resolved provider
+// id, falling through to the membership comparison would compare "" against
+// the registry and render `unregistered` — a positive finding about a repo
+// whose conventions were never read.
+func workItemProviderReadinessFor(provider string, registered []string, resolveErr error) workItemProviderReadiness {
+	if registered == nil {
+		// Always emit an ARRAY, never a JSON null: the field is documented as
+		// always present, and a null would decode into a client mirror
+		// indistinguishably from "the key was absent".
+		registered = []string{}
+	}
+	if resolveErr != nil {
+		return workItemProviderReadiness{
+			Status:      workItemProviderStatusUnknown,
+			Registered:  registered,
+			Reason:      workItemProviderUnknownReason,
+			Note:        workItemProviderUnknownNote,
+			MissingHint: workItemProviderUnknownHint,
+		}
+	}
+	for _, id := range registered {
+		if id == provider {
+			return workItemProviderReadiness{
+				Status:     workItemProviderStatusRegistered,
+				Provider:   provider,
+				Registered: registered,
+			}
+		}
+	}
+	return workItemProviderReadiness{
+		Status:      workItemProviderStatusUnregistered,
+		Provider:    provider,
+		Registered:  registered,
+		Note:        workItemProviderUnregisteredNote,
+		MissingHint: workItemProviderMissingHint(provider, registered),
 	}
 }
 
@@ -1418,19 +1569,31 @@ func (s *Server) handleGetOnboardingReadiness(w http.ResponseWriter, r *http.Req
 	owner, name, _ := strings.Cut(repo, "/")
 	repoRef := forge.RepoRef{Owner: owner, Name: name}
 
-	// (7) trace_store (E45.75 / #3600) and (8) review_grounding (E45.90 /
-	// #3625) are set HERE, before the forge switch and its repo-scoped
-	// cascades, so every report of both families carries them whatever the
-	// app/spec/merge-gate probes conclude.
+	// (7) trace_store (E45.75 / #3600), (8) review_grounding (E45.90 / #3625)
+	// and (9) work_item_provider (E45.94 / #3646) are set HERE, before the
+	// forge switch and its repo-scoped cascades, so every report of both
+	// families carries them whatever the app/spec/merge-gate probes conclude.
 	ts := traceStoreReadinessFor(s.cfg.TraceStore)
 	// (8) review_grounding (E45.90 / #3625) is set alongside it and for the
 	// same reason: it is a fact about fishhawkd's wiring, not about the repo.
 	rg := reviewGroundingReadinessFor(s.cfg.ReviewGroundingDisabled)
+	// (9) work_item_provider (E45.94 / #3646) is set in the SAME pre-switch
+	// block, but for a subtly different reason: it is HYBRID-scoped. The
+	// resolved provider id is a REPO fact (the repo's work-management
+	// conventions) while the registered set is a DEPLOYMENT fact, so the rung
+	// is neither a pure deployment rung nor a member of the app/spec cascade —
+	// yet it must survive every repo-scoped cascade, which is what placing it
+	// here buys. The conventionsLoader read is cheap: RepoConventionsLoader is
+	// TTL-cached per (provider, repo) and falls back to workmgmt.Default()
+	// whenever the repo commits no conventions file.
+	conv, convErr := conventionsLoader(r.Context(), repo)
+	wp := workItemProviderReadinessFor(conv.Provider, workmgmt.Registered(), convErr)
 	resp := onboardingReadinessResponse{
-		Repo:            repo,
-		Forge:           family,
-		TraceStore:      &ts,
-		ReviewGrounding: &rg,
+		Repo:             repo,
+		Forge:            family,
+		TraceStore:       &ts,
+		ReviewGrounding:  &rg,
+		WorkItemProvider: &wp,
 	}
 	var parsedSpec *spec.Spec
 	switch family {
