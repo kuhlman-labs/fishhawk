@@ -18,8 +18,61 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
+	workmgmtgithub "github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt/github"
 	"github.com/kuhlman-labs/fishhawk/redaction"
 )
+
+// registeredFeedbackProvidersFn is the capability seam over the process-global
+// feedback-provider registry, mirroring conventionsLoader and grooming_apply.go's
+// groomingMutatorFor/groomingReaderFor idiom. Both readers of the registry — this
+// handler's 501 split and handleGetRun's capabilities block — go through it, so a
+// test can present BOTH registry states without mutating the global (which has no
+// Unregister, so a registration would leak into every later test in the package).
+//
+// Server.registeredFeedbackProviders is the read point: it prefers the per-server
+// Config.FeedbackProviders seam when set (binding condition 2 — an EXTERNAL test
+// package cannot reach this unexported var, and a process-global cannot give each
+// integration case its own deterministic registry), and falls back here otherwise.
+var registeredFeedbackProvidersFn = workmgmt.RegisteredFeedback
+
+// feedbackProviderFor is the companion seam over the registry LOOKUP. It exists
+// for the same reason: the registry has no Unregister, so a test that needs the
+// NOT-registered arm cannot get there by un-doing a sibling test's registration.
+// Routing the lookup through a var lets a test present an *UnknownProviderError
+// deterministically, independent of what any other test in the package
+// registered.
+var feedbackProviderFor = workmgmt.GetFeedback
+
+// productFeedbackProviderID is the feedback provider a product report resolves
+// against. It is pinned to the DESTINATION's forge, not to the run repo's
+// work-item provider: productRepo (above) is a FIXED GitHub repo, so the
+// upstream product tracker is GitHub-hosted regardless of which forge the
+// source run operates on. Reading conv.Provider — which declares where WORK
+// ITEMS go — meant a repo whose conventions say `provider: gitlab` or `jira`
+// could not file a product report even on a deployment where the GitHub
+// feedback provider IS registered, and resolving a GitLab-shaped destination
+// would target a tracker that does not exist (#3628).
+const productFeedbackProviderID = workmgmtgithub.FeedbackProviderName
+
+// registeredFeedbackProviders reports the feedback-provider ids this
+// deployment has registered. It prefers the per-server Config.FeedbackProviders
+// seam (test-only; nil in production) and falls back to the package-level
+// registeredFeedbackProvidersFn, so a per-server override and a package-wide
+// override are both available and neither mutates the process-global registry.
+// The returned slice is never nil — an empty registry reads as an empty slice,
+// which is what makes "positively no provider" expressible on the wire.
+func (s *Server) registeredFeedbackProviders() []string {
+	var ids []string
+	if s.cfg.FeedbackProviders != nil {
+		ids = s.cfg.FeedbackProviders()
+	} else {
+		ids = registeredFeedbackProvidersFn()
+	}
+	if ids == nil {
+		return []string{}
+	}
+	return ids
+}
 
 // maxProductReportRequestBytes caps the product-report request body. The
 // slice-2 egress carries product facts only, so the body is tiny; the cap
@@ -210,14 +263,34 @@ func (s *Server) handleFileProductReport(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	provider, err := workmgmt.GetFeedback(conv.Provider)
+	provider, err := feedbackProviderFor(productFeedbackProviderID)
 	if err != nil {
 		var unk *workmgmt.UnknownProviderError
 		if errors.As(err, &unk) {
-			// Static literal message (E67.15 / #2587): the same product-owned
-			// facts ride the allow-listed provider/registered detail keys, so
-			// nothing is lost, and unk.Error() as the message is a raw-cause
-			// syntax the AST guard flags.
+			// Two NAMED failure modes behind one error (#3628). Both messages stay
+			// STATIC literals with the product-owned facts on allow-listed detail
+			// keys, per the E67.15/#2587 raw-cause posture — unk.Error() as the
+			// message is a raw-cause syntax the AST guard flags.
+			if len(s.registeredFeedbackProviders()) == 0 {
+				// Mode A: the deployment wired NO feedback provider at all. This is
+				// operator configuration, not an unimplemented provider, so name the
+				// config whose absence leaves the only implemented feedback provider
+				// unregistered (backend/cmd/fishhawkd/workmgmt_wiring.go). `remedy`
+				// is a STATIC literal and is allow-listed in errors.go, because a 501
+				// is a 5xx and the default-deny redactor would otherwise strip exactly
+				// the actionable half of this refusal.
+				s.writeError(w, r, http.StatusNotImplemented, "provider_unimplemented",
+					"this deployment has no feedback provider registered, so product reports cannot be filed",
+					map[string]any{
+						"provider":   unk.ID,
+						"registered": unk.Known,
+						"remedy":     "configure the GitHub App credentials (FISHHAWKD_GITHUB_APP_ID and FISHHAWKD_GITHUB_APP_PRIVATE_KEY_FILE) so the github_projects feedback provider registers at startup",
+					})
+				return
+			}
+			// Mode B: providers ARE registered, but not the resolved id — the
+			// pre-existing refusal, unchanged (and carrying NO remedy key: adding
+			// app credentials would not register a differently-named provider).
 			s.writeError(w, r, http.StatusNotImplemented, "provider_unimplemented",
 				"the resolved feedback provider is not implemented",
 				map[string]any{"provider": unk.ID, "registered": unk.Known})

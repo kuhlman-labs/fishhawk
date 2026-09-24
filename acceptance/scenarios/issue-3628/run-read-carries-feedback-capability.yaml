@@ -1,0 +1,14 @@
+id: scenario:issue-3628/run-read-carries-feedback-capability
+statement: GET /v0/runs/{run_id} returns 200 and the body carries a capabilities object whose product_feedback_providers key is present as a JSON array — an empty array on a deployment with no feedback provider registered, never null and never absent.
+verify_hint: 'GET /v0/runs/{run_id} on the localhost preview and read the raw response body: capabilities.product_feedback_providers must be present and an array. Confirm the list endpoint GET /v0/runs omits the capabilities object.'
+steps: 'POST http://localhost:8090/v0/dev/fixtures {"scenario":"plan-gate-parked"} -> 201 (run 2714fd2f-1af1-4636-9574-65679d228618). GET /v0/runs/2714fd2f-1af1-4636-9574-65679d228618 -> 200; extracted the raw capabilities object from the body. GET /v0/runs?limit=5 -> 200; counted occurrences of ''capabilities'' in the raw body. Supplementary: in the sanctioned checkout (HEAD 8c4a77a6) ran `cd backend && go test ./internal/server/ -run TestGetRun_CapabilitiesBlock -v` and `go test ./internal/mcpserver/ -run TestRunMirror_DecodesCapabilities -v`.'
+assertions:
+    expected: capabilities.product_feedback_providers present as a JSON array, empty and never null or absent when no provider is registered; the list endpoint omits capabilities.
+    observed_at_record: 'Single-run read: "capabilities":{"product_feedback_providers":["github_projects"]}, so the key is present and is a JSON array. List endpoint body contains 0 occurrences of ''capabilities''. TestGetRun_CapabilitiesBlock passes all 3 subtests: registered providers surface, empty registry emits a literal empty array, list endpoint omits the block. TestRunMirror_DecodesCapabilities passes absent / [] / non-empty.'
+    repro_handle: curl -s -XPOST localhost:8090/v0/dev/fixtures -d '{"scenario":"plan-gate-parked"}'; curl -s localhost:8090/v0/runs/<run_id> | grep -o '"capabilities":{[^}]*}'; curl -s 'localhost:8090/v0/runs?limit=5' | grep -c capabilities
+origin:
+    issue: 3628
+    pr: 3637
+    run_id: 9baa6f4e-fc3c-4481-9d28-980aa55dbb67
+    head_sha: 8c4a77a6b24390d1da160ba12b466a06888e26e5
+    recorded_at: 2026-09-24T02:00:17Z

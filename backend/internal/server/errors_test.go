@@ -510,3 +510,45 @@ func soleLogRecord(t *testing.T, buf *bytes.Buffer, want string) map[string]any 
 	}
 	return matches[0]
 }
+
+// TestWriteError_501RemedySurvivesRedaction pins the `remedy` allow-list entry
+// (#3628) on a REAL 501 shape. A 501 is a 5xx, so writeError's default-deny
+// redactor runs: without the entry the deployment-not-wired refusal loses
+// exactly its actionable half and the operator is handed the same un-actionable
+// body as before the split.
+//
+// The PAIRED non-allow-listed key on the SAME response is what stops this
+// passing with the redactor disabled: if the gate were off, `raw_cause` would
+// survive too and the second assertion goes red.
+func TestWriteError_501RemedySurvivesRedaction(t *testing.T) {
+	s, _ := errServerWithLog(t)
+	rec := driveWriteError(t, s, "req-remedy", http.StatusNotImplemented,
+		"provider_unimplemented",
+		"this deployment has no feedback provider registered, so product reports cannot be filed",
+		map[string]any{
+			"provider":   "github_projects",
+			"registered": []string{},
+			"remedy":     "configure the GitHub App credentials (FISHHAWKD_GITHUB_APP_ID and FISHHAWKD_GITHUB_APP_PRIVATE_KEY_FILE) so the github_projects feedback provider registers at startup",
+			// Not on the allow-list: MUST be stripped on the same response.
+			"raw_cause": "dial tcp 10.0.0.1:443: connection refused",
+		})
+
+	if rec.Code != http.StatusNotImplemented {
+		t.Fatalf("status = %d, want 501", rec.Code)
+	}
+	var env errorEnvelope
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode: %v (body=%s)", err, rec.Body.String())
+	}
+	remedy, ok := env.Error.Details["remedy"].(string)
+	if !ok {
+		t.Fatalf("details.remedy stripped by the 5xx redactor (allow-list entry missing?): %v", env.Error.Details)
+	}
+	if !strings.Contains(remedy, "FISHHAWKD_GITHUB_APP_ID") {
+		t.Errorf("details.remedy = %q, want it to name FISHHAWKD_GITHUB_APP_ID", remedy)
+	}
+	if _, present := env.Error.Details["raw_cause"]; present {
+		t.Errorf("a non-allow-listed key survived the 5xx redactor, so this test could not "+
+			"prove the remedy entry: %v", env.Error.Details)
+	}
+}

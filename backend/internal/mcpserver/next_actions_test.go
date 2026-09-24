@@ -5523,3 +5523,139 @@ func TestSupersededImplementCount_DegradedShapes(t *testing.T) {
 		})
 	}
 }
+
+// naCapabilities returns a Run in the given deployment-capability wire state:
+// nil ids means an ABSENT capabilities block (older backend / list read), a
+// non-nil slice means a PRESENT block carrying exactly those ids.
+func naCapabilities(state string, present bool, ids []string) *Run {
+	r := naRun(state)
+	if present {
+		if ids == nil {
+			ids = []string{}
+		}
+		r.Capabilities = &runCapabilities{ProductFeedbackProviders: ids}
+	}
+	return r
+}
+
+// naFilingAction returns the named action from na, or nil.
+func naFilingAction(na *NextActions, name string) *SuggestedAction {
+	if na == nil {
+		return nil
+	}
+	for i := range na.Actions {
+		if na.Actions[i].Action == name {
+			return &na.Actions[i]
+		}
+	}
+	return nil
+}
+
+// TestNextActions_ProductFeedbackCapabilityGate pins the #3628 chokepoint over
+// all three capability states, on BOTH run-level filing sites.
+//
+// m4 (EMPTY block): the deployment positively has no feedback provider, so the
+// tool call is SUBSTITUTED by the file_product_issue_manually ritual step. On
+// the terminal failed arm the filing suggestion is the ONLY action, so the
+// actions list must stay NON-EMPTY — substituting rather than omitting is what
+// keeps the surface's structural invariant intact.
+//
+// m5 (NIL block): the mixed-version / list-read degrade. FAIL OPEN — the tool
+// action is unchanged, so an older backend is never silently stripped of it.
+//
+// m6 (NON-EMPTY block): the tool action with run_id + kind=bug params unchanged.
+func TestNextActions_ProductFeedbackCapabilityGate(t *testing.T) {
+	stages := []Stage{naStage("plan", "failed")}
+
+	t.Run("m4 empty block substitutes the manual step", func(t *testing.T) {
+		run := naCapabilities("failed", true, nil)
+		na := nextActionsFor(run, stages, nil, nil, nil, nil, false, false, false, "", "", releaseSignals{})
+		if na == nil || na.State != "failed" {
+			t.Fatalf("na = %+v, want state failed", na)
+		}
+		if len(na.Actions) == 0 {
+			t.Fatal("a terminal failed run must never be handed an EMPTY actions list — " +
+				"the capability gate must SUBSTITUTE, not omit")
+		}
+		if got := naFilingAction(na, "fishhawk_report_product_issue"); got != nil {
+			t.Errorf("the tool action must NOT be offered on a deployment with no feedback "+
+				"provider (it would 501 after assembling the report): %+v", got)
+		}
+		manual := naFilingAction(na, "file_product_issue_manually")
+		if manual == nil {
+			t.Fatalf("actions = %+v, want the file_product_issue_manually substitute", na.Actions)
+		}
+		if manual.Consumes != consumesNone {
+			t.Errorf("manual step consumes = %q, want none", manual.Consumes)
+		}
+		if len(manual.Params) != 0 {
+			t.Errorf("manual step params = %v, want none (it is not an MCP call)", manual.Params)
+		}
+		if !strings.Contains(manual.Reason, "NO feedback provider registered") {
+			t.Errorf("manual step reason must name the gap: %q", manual.Reason)
+		}
+	})
+
+	t.Run("m5 nil block fails OPEN to the tool action", func(t *testing.T) {
+		run := naCapabilities("failed", false, nil)
+		na := nextActionsFor(run, stages, nil, nil, nil, nil, false, false, false, "", "", releaseSignals{})
+		if naFilingAction(na, "fishhawk_report_product_issue") == nil {
+			t.Fatalf("an ABSENT capabilities block is UNDECIDABLE and must fail OPEN to the "+
+				"tool action (the mixed-version degrade); actions = %+v", na.Actions)
+		}
+		if naFilingAction(na, "file_product_issue_manually") != nil {
+			t.Error("an absent block must never be read as 'unavailable'")
+		}
+	})
+
+	t.Run("m6 non-empty block keeps the tool action unchanged", func(t *testing.T) {
+		run := naCapabilities("failed", true, []string{"github_projects"})
+		na := nextActionsFor(run, stages, nil, nil, nil, nil, false, false, false, "", "", releaseSignals{})
+		tool := naFilingAction(na, "fishhawk_report_product_issue")
+		if tool == nil {
+			t.Fatalf("actions = %+v, want the tool action", na.Actions)
+		}
+		if tool.Params["run_id"] != run.ID || tool.Params["kind"] != "bug" {
+			t.Errorf("params = %v, want run_id=%s kind=bug unchanged", tool.Params, run.ID)
+		}
+		if naFilingAction(na, "file_product_issue_manually") != nil {
+			t.Error("a registered provider must not draw the manual substitute")
+		}
+	})
+}
+
+// TestNextActions_UnclassifiedFallbackCapabilityGate is the same three states
+// through the OTHER run-level emission site — the unclassified fallback. It
+// must keep its re-poll action in every case: the capability gate governs the
+// filing suggestion only, never the recovery move.
+func TestNextActions_UnclassifiedFallbackCapabilityGate(t *testing.T) {
+	// A run state no classifier arm matches, so the fallback is reached.
+	stages := []Stage{naStage("implement", "some_unmodelled_state")}
+
+	cases := []struct {
+		name       string
+		present    bool
+		ids        []string
+		wantFiling string
+	}{
+		{"empty block substitutes", true, nil, "file_product_issue_manually"},
+		{"nil block fails open", false, nil, "fishhawk_report_product_issue"},
+		{"non-empty keeps the tool", true, []string{"github_projects"}, "fishhawk_report_product_issue"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			run := naCapabilities("some_unmodelled_state", tc.present, tc.ids)
+			na := unclassifiedNextActions(run, stages)
+			if na == nil || na.State != "unclassified" {
+				t.Fatalf("na = %+v, want the unclassified fallback", na)
+			}
+			if naFilingAction(na, "fishhawk_get_run_status") == nil {
+				t.Errorf("the fallback must keep its re-poll action in every capability "+
+					"state; actions = %+v", na.Actions)
+			}
+			if naFilingAction(na, tc.wantFiling) == nil {
+				t.Errorf("actions = %+v, want the %s filing entry", na.Actions, tc.wantFiling)
+			}
+		})
+	}
+}

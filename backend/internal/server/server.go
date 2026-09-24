@@ -91,6 +91,18 @@ type Config struct {
 	// surviving OS pid reuse (#1018).
 	StartNonce string
 
+	// FeedbackProviders reports the deployment's registered feedback-provider
+	// ids for THIS server (#3628). It is a TEST-ONLY seam: production leaves it
+	// nil, which falls back to the package-level registeredFeedbackProvidersFn
+	// (workmgmt.RegisteredFeedback), so no production wiring changes.
+	//
+	// It exists because the feedback registry is a process-GLOBAL map with no
+	// Unregister, so an external test package (backend/internal/integration/mcp)
+	// otherwise has no way to build one server with a deterministic EMPTY
+	// registry and another with a non-empty one without depending on test order.
+	// Read it through Server.registeredFeedbackProviders, never directly.
+	FeedbackProviders func() []string
+
 	// RunRepo persists workflow runs and stages. Wired by the
 	// /v0/runs handlers; nil leaves those handlers returning 503.
 	// Tests inject in-memory fakes; production wires the Postgres
