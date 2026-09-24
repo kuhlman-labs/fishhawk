@@ -2,13 +2,14 @@ id: scenario:issue-3626/timeout-carries-stage-health
 statement: The same timeout result also carries the awaited stage's raw state and its classified stage_wait_status block, so the caller can read the stage's health from structured fields on the timeout response itself rather than issuing a second status call or parsing the message.
 verify_hint: In the same fishhawk_await_stage MCP tool result that returned status "timeout", the response object carries a non-empty state field and a stage_wait_status object.
 steps: Seeded trace-upload-target with POST /v0/dev/fixtures, then minted an fhm_ bearer via signing-key, dev/sign over '{}', and mcp-token. Called POST /mcp tools/call fishhawk_await_stage {run_id, stage:'plan', timeout_seconds:5} and read state and stage_wait_status from the timeout result.
+steps_carried_from: head bc4d3bd35d48eb8e7f4b2c10d8d216fc2c80fb82 recorded_at 2026-09-24T07:14:33Z
 assertions:
     expected: A non-empty state and a stage_wait_status object on the timeout response.
-    observed_at_record: state='dispatched'. stage_wait_status={stage:plan, status:pending, agent_timeout_seconds:900, attempt_elapsed_seconds:5, deadline_seconds_remaining:895, poll_interval_seconds:30}.
-    repro_handle: POST http://localhost:8090/mcp tools/call fishhawk_await_stage {"run_id":"<run>","stage":"plan","timeout_seconds":5}
+    observed_at_record: state 'dispatched'; stage_wait_status {stage plan, status pending, agent_timeout_seconds 900, attempt_elapsed_seconds 5, deadline_seconds_remaining 895, poll_interval_seconds 30}.
+    repro_handle: POST http://localhost:8090/mcp tools/call fishhawk_await_stage {run_id, stage:plan, timeout_seconds:5}
 origin:
     issue: 3626
     pr: 3643
     run_id: f14fb20f-db24-4aae-963d-1fee0df8122d
-    head_sha: bc4d3bd35d48eb8e7f4b2c10d8d216fc2c80fb82
-    recorded_at: 2026-09-24T07:14:33Z
+    head_sha: bbc503a9cf6751085ceb147d3d04a75b135754f9
+    recorded_at: 2026-09-24T08:16:47Z

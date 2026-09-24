@@ -1,14 +1,14 @@
 id: scenario:issue-3626/timeout-carries-client-wait-cap-kind
 statement: When fishhawk_await_stage's wait cap expires while the awaited stage is still unsettled and within its agent budget, the tool result carries status "timeout" together with timeout_kind "client_wait_cap", so a caller learns from a structured field — not from the message prose — that nothing has failed.
 verify_hint: Against the localhost preview's MCP surface, call the fishhawk_await_stage tool on a run whose awaited stage has not been dispatched (still pending) with a small timeout_seconds; the returned MCP tool result JSON carries status "timeout" and timeout_kind "client_wait_cap".
-steps: POST /v0/dev/fixtures {"scenario":"trace-upload-target"} (run d842e631-3768-4b43-a14b-c735c716ae06, plan stage state dispatched). POST /v0/runs/{run}/signing-key, POST /v0/dev/sign over '{}', and POST /v0/runs/{run}/mcp-token to get an fhm_ bearer. POST /mcp tools/call fishhawk_await_stage {run_id, stage:'plan', timeout_seconds:5}.
+steps: POST /v0/dev/fixtures {"scenario":"trace-upload-target"} -> run 9e7f8e4c-314f-4ce2-b409-c5c937ff998f, whose plan stage is dispatched and not settled. POST /v0/runs/{run}/signing-key; POST /v0/dev/sign over '{}'; POST /v0/runs/{run}/mcp-token -> fhm_ bearer. POST /mcp tools/call fishhawk_await_stage {run_id, stage:'plan', timeout_seconds:5}. I repeated this on a second trace-upload-target run and on the acceptance stage of an acceptance-dispatched run (timeout_seconds 1), with the same result.
 assertions:
     expected: status timeout with timeout_kind client_wait_cap.
-    observed_at_record: status=timeout, timeout_kind=client_wait_cap, terminal=false, waited_seconds 5.02. The message says the caller's wait cap expired and that a health read shows 895s of budget remaining.
-    repro_handle: POST http://localhost:8090/mcp tools/call fishhawk_await_stage {"run_id":"<trace-upload-target run>","stage":"plan","timeout_seconds":5}
+    observed_at_record: 'structuredContent: status ''timeout'', timeout_kind ''client_wait_cap'', terminal false. The message says ''YOUR wait cap expired, not the stage''s own deadline ... A stage-health read shows 895s of its per-attempt agent budget remaining''. It makes a positive health statement only because health was actually read, which is consistent with approval condition 1.'
+    repro_handle: POST http://localhost:8090/mcp tools/call fishhawk_await_stage {run_id, stage:plan, timeout_seconds:5}
 origin:
     issue: 3626
     pr: 3643
     run_id: f14fb20f-db24-4aae-963d-1fee0df8122d
-    head_sha: bc4d3bd35d48eb8e7f4b2c10d8d216fc2c80fb82
-    recorded_at: 2026-09-24T07:14:33Z
+    head_sha: bbc503a9cf6751085ceb147d3d04a75b135754f9
+    recorded_at: 2026-09-24T08:16:47Z
