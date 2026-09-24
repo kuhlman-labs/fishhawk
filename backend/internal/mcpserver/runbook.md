@@ -54,9 +54,14 @@ One issue → one run → one PR.
    amendment row and a pre-filled `fishhawk_decide_scope_amendment` `next_step`,
    so dispatch's in-band amendment channel is observable from the same wait —
    decide, then re-arm the wait for the settlement. A `timeout` is discriminated
-   by `timeout_kind` (#3626): `client_wait_cap` is the benign, resumable
-   checkpoint — only YOUR wait cap expired, never the stage's own deadline — so
-   re-arm; `stage_deadline_exceeded` means the stage's per-attempt agent budget
+   by `timeout_kind` (#3626): `client_wait_cap` says only that YOUR wait cap
+   expired, and it is a health claim about the stage ONLY when the message names
+   the remaining agent budget a health read actually observed — then it is the
+   benign, resumable checkpoint, so re-arm. When that read failed the message
+   says the stage's own deadline status is UNKNOWN (it can neither confirm nor
+   rule out that the stage's deadline also passed), so check
+   `fishhawk_get_run_status` rather than re-arming on the assumption it is
+   healthy. `stage_deadline_exceeded` means the stage's per-attempt agent budget
    is spent while it is still unsettled, so check `fishhawk_get_run_status`
    instead of re-arming blindly.
 5. **`fishhawk_await_review`** — block until the implement review reaches a

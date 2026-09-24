@@ -1614,7 +1614,9 @@ func TestAwaitStageTimeoutKind_Table(t *testing.T) {
 // healthy. A positive health statement is allowed ONLY where health was actually
 // read and showed remaining budget; where the read failed or the budget is
 // unresolved the message must say health is UNKNOWN and point at
-// fishhawk_get_run_status.
+// fishhawk_get_run_status. A failed read also cannot establish that the STAGE's
+// own deadline has not expired, so the UNKNOWN variant must not carry the
+// "not the stage's own deadline" denial the health-known variant earns.
 func TestAwaitStageTimeoutOutput_MessageVariants(t *testing.T) {
 	stageID := uuid.New()
 	start := time.Now()
@@ -1668,14 +1670,28 @@ func TestAwaitStageTimeoutOutput_MessageVariants(t *testing.T) {
 	if unknown.TimeoutKind != awaitStageTimeoutKindClientWaitCap {
 		t.Errorf("TimeoutKind = %q, want %q", unknown.TimeoutKind, awaitStageTimeoutKindClientWaitCap)
 	}
-	for _, want := range []string{"YOUR wait cap expired", "UNKNOWN", "does NOT claim the stage is healthy", "fishhawk_get_run_status", "re-call fishhawk_await_stage", "no-op"} {
+	for _, want := range []string{
+		"YOUR wait cap expired",
+		"stage's OWN\ndeadline also expired is UNKNOWN",
+		"does NOT claim the stage is healthy",
+		"does NOT rule out that its own deadline has passed",
+		"fishhawk_get_run_status",
+		"re-call fishhawk_await_stage",
+		"no-op",
+	} {
+		// The message is one line; the want above spans the source wrap, so
+		// compare against the unwrapped literal.
+		want = strings.ReplaceAll(want, "\n", " ")
 		if !strings.Contains(unknown.Message, want) {
 			t.Errorf("client_wait_cap (health unknown) message missing %q: %q", want, unknown.Message)
 		}
 	}
-	for _, banned := range []string{"within its deadline", "has NOT failed"} {
+	// "not the stage's own deadline" is the DENIAL the health-known variant
+	// earns by reading a positive budget. An unread health cannot establish it,
+	// so it must be absent here — this is the assertion the #3626 fix-up adds.
+	for _, banned := range []string{"within its deadline", "has NOT failed", "not the stage's own deadline"} {
 		if strings.Contains(unknown.Message, banned) {
-			t.Errorf("an unread health must make NO positive health claim (found %q): %q", banned, unknown.Message)
+			t.Errorf("an unread health must make NO positive health claim and NO denial about the stage's own deadline (found %q): %q", banned, unknown.Message)
 		}
 	}
 
@@ -1906,9 +1922,18 @@ func TestAwaitStageToolDescription_NamesDiscriminatedTimeout(t *testing.T) {
 		awaitStageTimeoutKindStageDeadlineExceeded,
 		"KILLED by the runner",
 		"not a health claim",
+		// The failed-read branch leaves the STAGE's deadline status open (#3626
+		// fix-up): the description must not tell an agent the stage's own
+		// deadline is intact when nothing read it.
+		"deadline status is UNKNOWN",
 	} {
 		if !strings.Contains(desc, want) {
 			t.Errorf("fishhawk_await_stage description missing %q", want)
 		}
+	}
+	// The unconditional denial is banned on this surface too: a health read the
+	// verb may never have made cannot rule out the stage's own deadline (#3626).
+	if strings.Contains(desc, "never the stage's") {
+		t.Errorf("fishhawk_await_stage description must not deny the stage's own deadline unconditionally: %q", desc)
 	}
 }
