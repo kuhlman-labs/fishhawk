@@ -9,6 +9,11 @@
         "ts": "2026-01-01T00:00:00Z"
       }
     ],
+    "capabilities": {
+      "product_feedback_providers": [
+        "github_projects"
+      ]
+    },
     "completion_blocked": {
       "reason": "the run cannot complete while stage review is parked at \"awaiting_approval\", and this run's pull request is not observably merged, so no reconcile applies yet",
       "recovery": "none",

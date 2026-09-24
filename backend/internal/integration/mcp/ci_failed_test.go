@@ -53,6 +53,15 @@ func TestE2E_CIFailed_ObserverToDerivedStatusToNextActions(t *testing.T) {
 		SigningRepo:    signing.NewPostgresRepository(fx.pool),
 		APITokenRepo:   fx.apitokenRepo,
 		StageCheckRepo: stageCheckRepo,
+		// The PRODUCTION shape: a deployment with the github_projects feedback
+		// provider registered, so GET /v0/runs/{id} advertises a non-empty
+		// capabilities block and next_actions offers the real tool (#3628).
+		//
+		// Injected per-SERVER rather than via workmgmt.RegisterFeedback: the
+		// feedback registry is a process-global with no Unregister, so a
+		// save/restore cannot give the mirror-image case below a deterministic
+		// EMPTY registry and the two walks would depend on test order.
+		FeedbackProviders: func() []string { return []string{"github_projects"} },
 	})
 
 	const requiredCheck = "ci/required"
@@ -119,6 +128,14 @@ func TestE2E_CIFailed_ObserverToDerivedStatusToNextActions(t *testing.T) {
 		t.Fatalf("drive_status.derived_status = %q, want ci_failed", got)
 	}
 
+	// Layer 3b (#3628): the capability block reaches the MCP mirror through the
+	// real HTTP read, PRESENT and non-empty — the production shape the filing
+	// suggestion below depends on.
+	if present, ids := runCapabilitiesView(t, ctx, session, run.ID); !present || len(ids) == 0 {
+		t.Fatalf("run.capabilities = (present=%v, ids=%v), want a PRESENT non-empty block "+
+			"(json tag drift between the backend and the MCP mirror?)", present, ids)
+	}
+
 	// Layer 4: the next_actions classifier names the legal remediation arm.
 	na := getNextActions(t, ctx, session, run.ID)
 	if na == nil {
@@ -167,6 +184,161 @@ func TestE2E_CIFailed_ObserverToDerivedStatusToNextActions(t *testing.T) {
 	if !strings.Contains(last.Precondition, "OPERATOR JUDGEMENT") {
 		t.Errorf("filing precondition = %q, want the operator-gated wording", last.Precondition)
 	}
+}
+
+// TestE2E_CIFailed_NoFeedbackProvider_SubstitutesManualFiling is the
+// mirror image of the walk above, and the CROSS-BOUNDARY test for #3628: the
+// SAME end-to-end path — server -> HTTP GET /v0/runs/{id} -> the MCP Run wire
+// mirror -> next_actions — on a deployment that registered NO feedback
+// provider.
+//
+// It is the only test that spans all three layers at once, so it is what fails
+// when the per-layer units are all green but the seam is broken: a json-tag
+// drift between runCapabilities and RunCapabilities, or a handleGetRun that
+// never populates the block, both decode to a nil block here and the walk
+// reverts to recommending the tool.
+//
+// Expectation: the capabilities block is PRESENT and EMPTY, and the last action
+// is file_product_issue_manually — never fishhawk_report_product_issue, which
+// would collect the bundle and then refuse with 501 provider_unimplemented.
+func TestE2E_CIFailed_NoFeedbackProvider_SubstitutesManualFiling(t *testing.T) {
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	const requiredCheck = "ci/required"
+	const prURL = "https://github.com/kuhlman-labs/fishhawk/pull/4546"
+
+	auditRepo := audit.NewPostgresRepository(fx.pool)
+	stageCheckRepo := stagecheck.NewPostgresRepository(fx.pool)
+	srv := server.New(server.Config{
+		Addr:           "127.0.0.1:0",
+		RunRepo:        fx.runRepo,
+		AuditRepo:      auditRepo,
+		SigningRepo:    signing.NewPostgresRepository(fx.pool),
+		APITokenRepo:   fx.apitokenRepo,
+		StageCheckRepo: stageCheckRepo,
+		// Deterministically EMPTY for THIS server only — see the sibling walk.
+		FeedbackProviders: func() []string { return nil },
+	})
+
+	run, err := fx.runRepo.CreateRun(ctx, runpkg.CreateRunParams{
+		Repo:                   "kuhlman-labs/fishhawk",
+		WorkflowID:             "feature_change",
+		WorkflowSHA:            "deadbeef",
+		TriggerSource:          runpkg.TriggerCLI,
+		Drive:                  true,
+		RequiredChecksSnapshot: &runpkg.RequiredChecksSnapshot{Contexts: []string{requiredCheck}},
+	})
+	if err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+	if _, err := fx.runRepo.SetRunPullRequestURL(ctx, run.ID, prURL); err != nil {
+		t.Fatalf("SetRunPullRequestURL: %v", err)
+	}
+	if _, err := fx.runRepo.TransitionRun(ctx, run.ID, runpkg.StateRunning); err != nil {
+		t.Fatalf("TransitionRun → running: %v", err)
+	}
+	stage, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID:            run.ID,
+		Sequence:         1,
+		Type:             runpkg.StageTypeReview,
+		ExecutorKind:     runpkg.ExecutorAgent,
+		ExecutorRef:      "fishhawk/runner@v1",
+		RequiresApproval: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateStage(review): %v", err)
+	}
+	parkAtGate(t, ctx, fx.runRepo, stage.ID)
+
+	failure := "failure"
+	if _, err := stageCheckRepo.Append(ctx, stagecheck.AppendParams{
+		StageID:    stage.ID,
+		Name:       requiredCheck,
+		Status:     "completed",
+		Conclusion: &failure,
+		HeadSHA:    "cafebabe",
+		Timestamp:  time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("Append red stage check: %v", err)
+	}
+	parked, err := fx.runRepo.GetStage(ctx, stage.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	srv.ObserveParkedReviewForDrive(ctx, parked, prURL)
+
+	session := connectMCPClient(t, ctx, fx.mcpBinary, fx.operatorTok, mountServer(t, srv))
+	// PRESENT and EMPTY: the positive "no provider registered" fact. An ABSENT
+	// block would be UNDECIDABLE and the gate below would (correctly) fail open,
+	// so this assertion is what distinguishes a working seam from a broken one.
+	present, ids := runCapabilitiesView(t, ctx, session, run.ID)
+	if !present {
+		t.Fatal("run.capabilities absent — an empty provider list must still reach the wire " +
+			"as a PRESENT block (a nil slice or an accidental omitempty collapses it)")
+	}
+	if len(ids) != 0 {
+		t.Fatalf("run.capabilities.product_feedback_providers = %v, want empty", ids)
+	}
+
+	na := getNextActions(t, ctx, session, run.ID)
+	if na == nil {
+		t.Fatal("next_actions absent on the ci_failed run")
+	}
+	if na.State != "ci_failed_unroutable" {
+		t.Fatalf("next_actions.state = %q, want ci_failed_unroutable", na.State)
+	}
+	if len(na.Actions) == 0 {
+		t.Fatal("the capability gate must SUBSTITUTE, never leave the run action-less")
+	}
+	for _, a := range na.Actions {
+		if a.Action == "fishhawk_report_product_issue" {
+			t.Fatalf("next_actions offered fishhawk_report_product_issue on a deployment with "+
+				"no feedback provider — it would 501 after assembling the report: %+v", na.Actions)
+		}
+	}
+	last := na.Actions[len(na.Actions)-1]
+	if last.Action != "file_product_issue_manually" {
+		t.Fatalf("next_actions.actions = %+v, want file_product_issue_manually LAST (#3628)", na.Actions)
+	}
+	if last.Consumes != "none" {
+		t.Errorf("manual step consumes = %q, want none", last.Consumes)
+	}
+	if !strings.Contains(last.Reason, "NO feedback provider registered") {
+		t.Errorf("manual step reason must name the gap: %q", last.Reason)
+	}
+}
+
+// runCapabilitiesView reads the run's deployment-capability block off the SAME
+// fishhawk_get_run_status call next_actions rides on (#3628). present is false
+// when the block is absent (the UNDECIDABLE state), which is what a json-tag
+// drift between the backend runCapabilities and the MCP RunCapabilities mirror
+// looks like from here.
+func runCapabilitiesView(t *testing.T, ctx context.Context, session *mcp.ClientSession, runID uuid.UUID) (present bool, ids []string) {
+	t.Helper()
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "fishhawk_get_run_status",
+		Arguments: map[string]any{"run_id": runID.String()},
+	})
+	if err != nil {
+		t.Fatalf("CallTool fishhawk_get_run_status: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("get_run_status tool returned error: %s", toolContentString(t, result))
+	}
+	var out struct {
+		Run struct {
+			Capabilities *struct {
+				ProductFeedbackProviders []string `json:"product_feedback_providers"`
+			} `json:"capabilities"`
+		} `json:"run"`
+	}
+	decodeStructured(t, result, &out)
+	if out.Run.Capabilities == nil {
+		return false, nil
+	}
+	return true, out.Run.Capabilities.ProductFeedbackProviders
 }
 
 // recoverableRun stands up a backend over the fixture pool with the

@@ -221,27 +221,100 @@ func TestProductReport_DedupHit_AppendsOccurrence(t *testing.T) {
 	assertProductReportAudit(t, af, runID, resp.Fingerprint, "occurrence", "failure")
 }
 
-// TestProductReport_UnknownFeedbackProvider_501Redacts drives the
-// provider_unimplemented branch (product_report.go): the repo's conventions
-// name a feedback provider that is not registered, so workmgmt.GetFeedback
-// returns an *UnknownProviderError. Post-#2587 the branch passes a STATIC
-// literal message (never unk.Error(), a raw-cause syntax) while the
-// product-owned facts ride the allow-listed provider/registered detail keys.
-// Asserts the 501 code, the static message, the allow-listed details, and that
-// no raw cause string leaks.
+// productReportUnregistered points the handler's registry seams at a
+// deterministic NOT-registered state: feedbackProviderFor returns the real
+// *UnknownProviderError for the resolved id, and registeredFeedbackProvidersFn
+// reports the given id set (which decides WHICH of the two 501 modes fires).
+//
+// It uses the seams rather than the process-global registry on purpose: the
+// registry has no Unregister, so a test cannot reach the not-registered arm by
+// undoing a sibling test's registration, and a global mutation would leak into
+// every later test in the package (#3628).
+func productReportUnregistered(t *testing.T, registered []string) {
+	t.Helper()
+	prevGet, prevList := feedbackProviderFor, registeredFeedbackProvidersFn
+	feedbackProviderFor = func(id string) (workmgmt.FeedbackProvider, error) {
+		return nil, &workmgmt.UnknownProviderError{ID: id, Known: registered}
+	}
+	registeredFeedbackProvidersFn = func() []string { return registered }
+	t.Cleanup(func() { feedbackProviderFor, registeredFeedbackProvidersFn = prevGet, prevList })
+}
+
+// productReportConventions swaps the conventions loader for one returning a
+// product-feedback-enabled Conventions with the given work-item provider.
+func productReportConventions(t *testing.T, provider string) {
+	t.Helper()
+	prev := conventionsLoader
+	conventionsLoader = func(context.Context, string) (workmgmt.Conventions, error) {
+		c := workmgmt.Default()
+		c.Provider = provider
+		c.ProductFeedback = &workmgmt.ProductFeedback{Enabled: true}
+		return c, nil
+	}
+	t.Cleanup(func() { conventionsLoader = prev })
+}
+
+// TestProductReport_NoFeedbackProviderRegistered_501NamesRemedy is failure mode
+// m1 (#3628): the deployment registered NO feedback provider at all. That is
+// operator CONFIGURATION, not an unimplemented provider, so the 501 carries its
+// own static message plus the allow-listed `remedy` detail naming the config
+// whose absence leaves the only implemented provider unregistered. Without the
+// split an operator is told "the resolved feedback provider is not implemented"
+// about a provider the product does implement.
+func TestProductReport_NoFeedbackProviderRegistered_501NamesRemedy(t *testing.T) {
+	fp := &fakeFeedbackProvider{}
+	af := &scAuditFake{}
+	s, runID := productReportFixture(t, fp, af)
+	productReportConventions(t, "github_projects")
+	productReportUnregistered(t, []string{})
+
+	rec := postProductReport(s, runID, "mcp:run:"+runID.String(), "")
+	if rec.Code != http.StatusNotImplemented {
+		t.Fatalf("status = %d, want 501 (body=%s)", rec.Code, rec.Body.String())
+	}
+	var env errorEnvelope
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode: %v (body=%s)", err, rec.Body.String())
+	}
+	if env.Error.Code != "provider_unimplemented" {
+		t.Errorf("code = %q, want provider_unimplemented", env.Error.Code)
+	}
+	if env.Error.Message != "this deployment has no feedback provider registered, so product reports cannot be filed" {
+		t.Errorf("message = %q, want the deployment-not-wired static literal", env.Error.Message)
+	}
+	remedy, ok := env.Error.Details["remedy"].(string)
+	if !ok {
+		t.Fatalf("details.remedy absent (allow-list entry missing?): %v", env.Error.Details)
+	}
+	if !strings.Contains(remedy, "FISHHAWKD_GITHUB_APP_ID") ||
+		!strings.Contains(remedy, "FISHHAWKD_GITHUB_APP_PRIVATE_KEY_FILE") {
+		t.Errorf("details.remedy = %q, want it to name both GitHub App env vars", remedy)
+	}
+	if fp.filed {
+		t.Error("an unregistered feedback provider must file nothing")
+	}
+}
+
+// TestProductReport_UnknownFeedbackProvider_501Redacts is failure mode m2
+// (#3628, retargeted from the pre-split test): providers ARE registered, but
+// not the resolved id. The pre-existing static literal and details are
+// unchanged, and NO remedy key rides along — adding GitHub App credentials
+// would not register a differently-named provider, so naming them here would
+// send an operator to a fix that cannot work.
+//
+// It is driven off the REGISTRY STATE rather than conv.Provider, because the
+// provider is now resolved from the fixed GitHub destination and the run repo's
+// work-item provider no longer reaches this branch at all.
+//
+// Post-#2587 the branch passes a STATIC literal message (never unk.Error(), a
+// raw-cause syntax) while the product-owned facts ride the allow-listed
+// provider/registered detail keys.
 func TestProductReport_UnknownFeedbackProvider_501Redacts(t *testing.T) {
 	fp := &fakeFeedbackProvider{}
 	af := &scAuditFake{}
 	s, runID := productReportFixture(t, fp, af)
-
-	prev := conventionsLoader
-	conventionsLoader = func(context.Context, string) (workmgmt.Conventions, error) {
-		c := workmgmt.Default()
-		c.Provider = "no-such-feedback-provider"
-		c.ProductFeedback = &workmgmt.ProductFeedback{Enabled: true}
-		return c, nil
-	}
-	defer func() { conventionsLoader = prev }()
+	productReportConventions(t, "github_projects")
+	productReportUnregistered(t, []string{"some_other_feedback_provider"})
 
 	rec := postProductReport(s, runID, "mcp:run:"+runID.String(), "")
 	if rec.Code != http.StatusNotImplemented {
@@ -255,13 +328,18 @@ func TestProductReport_UnknownFeedbackProvider_501Redacts(t *testing.T) {
 		t.Errorf("code = %q, want provider_unimplemented", env.Error.Code)
 	}
 	if env.Error.Message != "the resolved feedback provider is not implemented" {
-		t.Errorf("message = %q, want the static literal", env.Error.Message)
+		t.Errorf("message = %q, want the pre-existing static literal", env.Error.Message)
 	}
-	if env.Error.Details["provider"] != "no-such-feedback-provider" {
-		t.Errorf("details.provider = %v, want the allow-listed provider id", env.Error.Details["provider"])
+	if env.Error.Details["provider"] != productFeedbackProviderID {
+		t.Errorf("details.provider = %v, want the destination-pinned id %q",
+			env.Error.Details["provider"], productFeedbackProviderID)
 	}
 	if _, ok := env.Error.Details["registered"]; !ok {
 		t.Errorf("details missing the allow-listed registered key: %v", env.Error.Details)
+	}
+	if _, ok := env.Error.Details["remedy"]; ok {
+		t.Errorf("mode B must carry NO remedy key — app credentials would not register "+
+			"a differently-named provider: %v", env.Error.Details)
 	}
 	// No raw provider-error text (e.g. "unknown provider") may ride the message.
 	if strings.Contains(env.Error.Message, "unknown") {
@@ -269,6 +347,33 @@ func TestProductReport_UnknownFeedbackProvider_501Redacts(t *testing.T) {
 	}
 	if fp.filed {
 		t.Error("provider_unimplemented must file nothing")
+	}
+}
+
+// TestProductReport_GitLabConventions_FilesViaDestinationProvider is failure
+// mode m3 (#3628): the run repo's conventions declare a NON-GitHub work-item
+// provider, and the report files anyway.
+//
+// productRepo is a FIXED GitHub repo, so the upstream product tracker is
+// GitHub-hosted whatever forge the source run uses. Resolving the feedback
+// provider from conv.Provider (which declares where WORK ITEMS go) meant such a
+// repo got a 501 even though the GitHub feedback provider was registered — and
+// resolving a GitLab-shaped destination would target a tracker that does not
+// exist. Reverting the resolution to conv.Provider turns this into a 501.
+func TestProductReport_GitLabConventions_FilesViaDestinationProvider(t *testing.T) {
+	fp := &fakeFeedbackProvider{name: productFeedbackProviderID}
+	af := &scAuditFake{}
+	s, runID := productReportFixture(t, fp, af)
+	productReportConventions(t, "gitlab")
+
+	rec := postProductReport(s, runID, "mcp:run:"+runID.String(), "")
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 — a gitlab work-item provider must not block a "+
+			"product report filed against the FIXED GitHub product repo (body=%s)",
+			rec.Code, rec.Body.String())
+	}
+	if !fp.filed {
+		t.Error("the github_projects feedback provider should have filed the report")
 	}
 }
 

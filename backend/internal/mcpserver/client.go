@@ -216,6 +216,17 @@ type Run struct {
 	// producer that derived its target from a list read would refuse
 	// spuriously. The json tag MUST byte-match the backend's runResponse field.
 	ForgeBaseURL string `json:"forge_base_url,omitempty" jsonschema:"a gitlab run's instance root (single-run read only); absent for a github run"`
+	// Capabilities mirrors the backend runResponse.capabilities block (#3628):
+	// what THIS DEPLOYMENT can serve for the run. The backend emits it on the
+	// SINGLE-run read ONLY (handleGetRun) — the list route omits it — so a Run
+	// decoded from a list read has nil here. The json tag MUST byte-match the
+	// backend's runResponse field or the block silently decodes to nil (the
+	// #371-class hand-maintained-wire-mirror trap).
+	//
+	// nil means UNDECIDABLE, never "unavailable": an older backend and a list
+	// read both produce nil, so every consumer must fail OPEN on it.
+	// productFeedbackPositivelyUnavailable in next_actions.go is the one reader.
+	Capabilities *runCapabilities `json:"capabilities,omitempty" jsonschema:"what this deployment can serve for the run (single-run read only). Absent means undecidable, never unavailable"`
 	// RunnerKindResolved mirrors GET /v0/runs/{id}'s lock flag (#1355):
 	// true once the run's first signed runner self-report LOCKED runner_kind
 	// (#1346/#1348). The host-dispatch guard (guardHostDispatch) reads it to
@@ -343,7 +354,33 @@ func init() {
 		// /v0/runs/{id}, retained through T1..T9, itemised out only at the
 		// diagnosis skeleton.
 		pathClassification{Path: "run.completion_blocked", Tier: "skeleton", Class: classStored, Surfaces: restRun},
+		// The deployment-capability block (#3628). A tiny, fixed-shape
+		// projection the backend computes per single-run read and surfaces on
+		// GET /v0/runs/{id}, so it classifies exactly like its single-read
+		// siblings above: stored, retained through T1..T9, itemised out only at
+		// the diagnosis skeleton.
+		pathClassification{Path: "run.capabilities", Tier: "skeleton", Class: classStored, Surfaces: restRun},
 	)
+}
+
+// runCapabilities mirrors the backend's runCapabilities block (#3628 —
+// backend/internal/server/runs.go): the deployment capabilities that decide
+// which verbs a consumer may recommend. The json tags MUST stay byte-identical
+// with the backend field or the mirror decodes to nil silently (the #371-class
+// hand-maintained-wire-mirror trap).
+//
+// ProductFeedbackProviders carries NO omitempty on the backend side on purpose:
+// an EMPTY list is the positive fact "this deployment registered no feedback
+// provider", distinct from an absent Capabilities block (undecidable).
+//
+// Deliberately UNEXPORTED, on the runCompletionBlocked precedent above: the
+// package's export-surface baseline (export_surface_test.go) is not in this
+// change's scope, and nothing outside this package names the type — the FIELD
+// is exported, so encoding/json and the jsonschema reflector reach it exactly
+// as they would an exported type. If a consumer ever needs to name it,
+// exporting it is a one-line change plus a baseline row.
+type runCapabilities struct {
+	ProductFeedbackProviders []string `json:"product_feedback_providers" jsonschema:"the deployment's registered feedback-provider ids. An EMPTY list means positively none is registered, so fishhawk_report_product_issue would refuse with 501 provider_unimplemented"`
 }
 
 // RunReviewAuthority mirrors the backend's run-status review_authority entry

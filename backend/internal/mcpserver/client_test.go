@@ -3123,3 +3123,62 @@ func TestRunConcerns_SupersededImplement_WireBoundary(t *testing.T) {
 		t.Fatalf("state = %q, want implement_gate_settled_after_supersede (not implement_gate_settled) — a discard must not be reported as a settle", na.State)
 	}
 }
+
+// TestRunMirror_DecodesCapabilities pins the client Run mirror's capabilities
+// json tags against the backend runResponse/runCapabilities tags (#3628), over
+// all THREE wire states the contract defines. A tag drift decodes the block to
+// nil — the #371-class trap, here with the consequence that next_actions
+// silently reverts to recommending a tool the deployment would refuse.
+//
+//   - ABSENT: an older backend, or a Run read off the LIST endpoint (which
+//     deliberately omits the block) → nil, meaning UNDECIDABLE.
+//   - PRESENT with []: this deployment registered NO feedback provider. The
+//     block must decode NON-nil with a zero-length list, which is what makes
+//     "positively none" distinguishable from "undecidable".
+//   - PRESENT and non-empty: a provider is available.
+func TestRunMirror_DecodesCapabilities(t *testing.T) {
+	const head = `{"id":"11111111-1111-1111-1111-111111111111","repo":"x/y",` +
+		`"workflow_id":"feature_change","workflow_sha":"deadbeef","trigger_source":"cli","state":"failed",`
+	const tail = `"created_at":"2026-09-23T00:00:00Z","updated_at":"2026-09-23T00:00:00Z"}`
+
+	t.Run("absent decodes to nil (undecidable)", func(t *testing.T) {
+		var got Run
+		if err := json.Unmarshal([]byte(head+tail), &got); err != nil {
+			t.Fatalf("decode Run: %v", err)
+		}
+		if got.Capabilities != nil {
+			t.Errorf("Run.Capabilities = %+v, want nil (the mixed-version / list-read degrade)", got.Capabilities)
+		}
+	})
+
+	t.Run("empty list decodes non-nil (positively none)", func(t *testing.T) {
+		var got Run
+		body := head + `"capabilities":{"product_feedback_providers":[]},` + tail
+		if err := json.Unmarshal([]byte(body), &got); err != nil {
+			t.Fatalf("decode Run: %v", err)
+		}
+		if got.Capabilities == nil {
+			t.Fatal("Run.Capabilities = nil for a PRESENT block (json tag mismatch?) — " +
+				"an empty list must stay distinguishable from an absent block")
+		}
+		if len(got.Capabilities.ProductFeedbackProviders) != 0 {
+			t.Errorf("ProductFeedbackProviders = %v, want empty", got.Capabilities.ProductFeedbackProviders)
+		}
+	})
+
+	t.Run("non-empty list decodes the ids", func(t *testing.T) {
+		var got Run
+		body := head + `"capabilities":{"product_feedback_providers":["github_projects"]},` + tail
+		if err := json.Unmarshal([]byte(body), &got); err != nil {
+			t.Fatalf("decode Run: %v", err)
+		}
+		if got.Capabilities == nil {
+			t.Fatal("Run.Capabilities = nil (json tag mismatch?)")
+		}
+		if len(got.Capabilities.ProductFeedbackProviders) != 1 ||
+			got.Capabilities.ProductFeedbackProviders[0] != "github_projects" {
+			t.Errorf("ProductFeedbackProviders = %v, want [github_projects] (inner json tag mismatch?)",
+				got.Capabilities.ProductFeedbackProviders)
+		}
+	})
+}

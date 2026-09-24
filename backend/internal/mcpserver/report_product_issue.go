@@ -112,7 +112,12 @@ validation_failed (400), authentication_required (401), run_not_entitled
 (403 — a run-bound token may only file for its own run), insufficient_scope
 (403 — a non-run-bound operator bearer is missing write:runs),
 product_feedback_disabled (403 — the repo's kill-switch), run_not_found (404),
-provider_unimplemented (501), product_report_failed (502).
+provider_unimplemented (501 — no feedback provider is registered on this
+deployment; the error names the configuration that would register one),
+product_report_failed (502). When the deployment has no provider registered,
+fishhawk_get_run_status's next_actions substitutes a file_product_issue_manually
+step instead of pre-populating this call, so this refusal is not reached by
+accepting a suggestion.
 `),
 	}, resolver.reportProductIssue)
 }

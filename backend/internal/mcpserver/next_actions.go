@@ -211,6 +211,58 @@ func productIssueAction(runID, why string) SuggestedAction {
 	}
 }
 
+// productFeedbackPositivelyUnavailable reports whether the deployment
+// POSITIVELY has no feedback provider registered, so
+// fishhawk_report_product_issue would refuse with 501 provider_unimplemented
+// AFTER assembling the report (#3628).
+//
+// It FAILS OPEN — returns false — on a nil run and on a nil Capabilities
+// block. A nil block is UNDECIDABLE, not "unavailable": an older backend omits
+// it, and so does the list endpoint (the backend populates capabilities on the
+// single-run read only), so reading nil as unavailable would silently strip the
+// filing suggestion from every mixed-version deployment. Only a PRESENT block
+// carrying an EMPTY provider list is the positive fact.
+func productFeedbackPositivelyUnavailable(run *Run) bool {
+	if run == nil || run.Capabilities == nil {
+		return false
+	}
+	return len(run.Capabilities.ProductFeedbackProviders) == 0
+}
+
+// productIssueManualFilingPrecondition is the operator gate on the SUBSTITUTE
+// manual-filing step. It keeps productIssueFilingPrecondition's judgement call
+// and adds why the tool is not offered.
+const productIssueManualFilingPrecondition = productIssueFilingPrecondition + " — and note this deployment registered NO feedback provider, so fishhawk_report_product_issue would refuse with 501 provider_unimplemented after assembling the report"
+
+// productIssueActionFor is the ONE chokepoint every RUN-level filing
+// suggestion routes through (#3628). Normally it returns the pre-populated
+// fishhawk_report_product_issue call; when the deployment positively has no
+// feedback provider it SUBSTITUTES a file_product_issue_manually ritual step
+// naming the gap.
+//
+// SUBSTITUTE, never omit: on the classified failed / cancelled states the
+// filing suggestion is the ONLY action, so a bare omission would hand a
+// terminal failed run an empty actions list — a regression of the surface's
+// own structural invariant, which guards non-terminal runs only.
+//
+// The two CAMPAIGN emission sites (foldCampaignProductIssueSuggestion,
+// campaignUnclassifiedNextActions) deliberately do NOT route through here: the
+// campaign surface holds CampaignItem rows carrying only a run id and never
+// fetches a run row, so the capability is not reachable there without a
+// per-item round trip — and next_actions' stated contract is that it costs no
+// extra round-trip and never fails the snapshot. That half needs its own issue.
+func productIssueActionFor(run *Run, why string) SuggestedAction {
+	if !productFeedbackPositivelyUnavailable(run) {
+		return productIssueAction(run.ID, why)
+	}
+	return SuggestedAction{
+		Action:       "file_product_issue_manually",
+		Precondition: productIssueManualFilingPrecondition,
+		Consumes:     consumesNone,
+		Reason:       why + " — but this deployment has NO feedback provider registered (run.capabilities.product_feedback_providers is empty), so fishhawk_report_product_issue would collect the bundle and then refuse with 501 provider_unimplemented. File the report by hand against the upstream Fishhawk tracker, or wire a feedback provider (configure FISHHAWKD_GITHUB_APP_ID and FISHHAWKD_GITHUB_APP_PRIVATE_KEY_FILE so the github_projects feedback provider registers at startup) and re-read this run",
+	}
+}
+
 // productIssueFilingStates is the CLOSED set of classified next-actions states
 // on which the filing suggestion is offered (#1737): the category-B/C/D
 // implement-failure arms, the terminal failed/cancelled arm that today carries
@@ -282,7 +334,7 @@ func foldProductIssueSuggestion(run *Run, stages []Stage, na *NextActions) {
 	if na == nil || !productIssueFilingState(na.State) {
 		return
 	}
-	na.Actions = append(na.Actions, productIssueAction(run.ID, productIssueFilingWhy(stages, na.State)))
+	na.Actions = append(na.Actions, productIssueActionFor(run, productIssueFilingWhy(stages, na.State)))
 }
 
 // foldFailureSignature attaches the failure-signature hint to na (#1703).
@@ -2167,7 +2219,7 @@ func unclassifiedNextActions(run *Run, stages []Stage) *NextActions {
 			// file_product_issue ritual step is retired onto the real
 			// fishhawk_report_product_issue tool, the same consolidation
 			// merge_pr -> fishhawk_merge_run made (E48.7 / #1954).
-			productIssueAction(run.ID,
+			productIssueActionFor(run,
 				"the next-actions classifier has no arm for "+desc+", so the table itself is the defect — file a Fishhawk issue naming the state so it gains one"),
 		},
 	}

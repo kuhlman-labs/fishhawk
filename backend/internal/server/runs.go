@@ -55,6 +55,21 @@ func identityAccountID(ctx context.Context) *uuid.UUID {
 // return. Field names + types match docs/api/v0.openapi.yaml's
 // `Run` schema exactly so there's never a translation step between
 // the OpenAPI doc and the wire format.
+// runCapabilities is the per-deployment capability block on the single-run
+// read (#3628). ProductFeedbackProviders is the registered feedback-provider
+// id set — the same set the product-report 501 reports as `registered`.
+//
+// The inner key carries NO omitempty and the handler normalizes a nil return
+// to an empty slice, DELIBERATELY: encoding/json marshals a nil slice as null
+// and omitempty ELIDES an empty one, and the three-state contract on
+// runResponse.Capabilities depends on a literal `[]` reaching the wire to mean
+// "positively none". Adding omitempty here silently collapses "positively
+// none" into "undecidable" (runs_get_test.go's raw-body assertion is what
+// catches that; a decoded-struct assertion would not).
+type runCapabilities struct {
+	ProductFeedbackProviders []string `json:"product_feedback_providers"`
+}
+
 type runResponse struct {
 	ID             uuid.UUID  `json:"id"`
 	Repo           string     `json:"repo"`
@@ -109,6 +124,18 @@ type runResponse struct {
 	// is exactly the asymmetry the spawn-side helper relies on to insist on
 	// a single-run read. Omitted on every github run.
 	ForgeBaseURL string `json:"forge_base_url,omitempty"`
+	// Capabilities reports what THIS DEPLOYMENT can serve for the run, so a
+	// consumer never recommends a verb the backend would refuse (#3628). Like
+	// forge_base_url it is populated on the SINGLE-run read ONLY (handleGetRun);
+	// the list endpoint deliberately never sets it, keeping its no-per-row-read
+	// posture — and that asymmetry is part of the contract, not an oversight.
+	//
+	// THREE states, all load-bearing: the block ABSENT means UNDECIDABLE (an
+	// older backend, or a Run read off the list endpoint); PRESENT with an
+	// EMPTY product_feedback_providers means POSITIVELY no feedback provider is
+	// registered; PRESENT and non-empty means one is. A consumer must fail OPEN
+	// on absent, never read it as "unavailable".
+	Capabilities *runCapabilities `json:"capabilities,omitempty"`
 	// RunnerKindResolved echoes whether RunnerKind has been LOCKED by the
 	// run's first signed runner self-report (#1346/#1348). Always emitted
 	// (false for legacy / un-resolved rows), matching drive / cost_usd_total
@@ -1966,6 +1993,12 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 	if resp.Forge == webhook.ForgeGitLab {
 		resp.ForgeBaseURL = s.resolveRunForgeBaseURL(r.Context(), got)
 	}
+	// capabilities (#3628) on the single-run read ONLY, for the same reason
+	// forge_base_url is: the list endpoint pays no per-row read. The slice is
+	// guaranteed NON-NIL so an empty registry marshals as `[]` (positively no
+	// feedback provider) rather than null, which is what lets a consumer tell
+	// it apart from an absent block (undecidable).
+	resp.Capabilities = &runCapabilities{ProductFeedbackProviders: s.registeredFeedbackProviders()}
 	// Attach the open-concern summary (#964) on the single-run read
 	// ONLY — the list endpoint deliberately omits it (no N+1 concern
 	// query per row). Best-effort: a concern-store failure warn-logs

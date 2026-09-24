@@ -1095,6 +1095,34 @@ components:
             consumer then refuses rather than targeting gitlab.com by
             accident). Omitted on every `github` run.
           example: https://gitlab.example.com
+        capabilities:
+          type: object
+          description: |
+            What THIS DEPLOYMENT can serve for the run (#3628), so a consumer
+            never recommends a verb the backend would refuse. Like
+            `forge_base_url`, present ONLY on `GET /v0/runs/{run_id}` — the
+            list endpoint NEVER carries it (no per-row read), and that
+            asymmetry is part of the contract.
+
+            THREE states, all load-bearing. The block ABSENT means
+            UNDECIDABLE — an older backend, or a `Run` read off the list
+            endpoint; a consumer MUST fail OPEN on it. The block PRESENT with
+            an EMPTY `product_feedback_providers` means POSITIVELY no feedback
+            provider is registered. PRESENT and non-empty means one is.
+          required: [product_feedback_providers]
+          properties:
+            product_feedback_providers:
+              type: array
+              items: { type: string }
+              description: |
+                The deployment's registered feedback-provider ids — the same
+                set `POST /v0/runs/{run_id}/product-reports` reports as
+                `details.registered` on its 501. It is NOT omitted when empty:
+                a literal `[]` is the positive fact "no provider is
+                registered", which is what distinguishes it from an absent
+                block. An empty list means `fishhawk_report_product_issue`
+                would refuse with 501 `provider_unimplemented`.
+              example: [github_projects]
         workflow_id:
           type: string
           example: feature_change
@@ -11467,7 +11495,20 @@ paths:
             kill-switch is off.
         '404': { $ref: '#/components/responses/NotFound' }
         '501':
-          description: "`provider_unimplemented` — no feedback provider registered for the conventions' provider."
+          description: |
+            `provider_unimplemented`, in TWO named modes (#3628). The feedback
+            provider is resolved from the FIXED GitHub destination repo, not
+            from the run repo's work-item `provider`, so a repo whose
+            conventions name `gitlab` or `jira` still files here.
+
+            Registry EMPTY — this deployment wired no feedback provider at
+            all: `details.remedy` names the configuration that would register
+            one (`FISHHAWKD_GITHUB_APP_ID` +
+            `FISHHAWKD_GITHUB_APP_PRIVATE_KEY_FILE`).
+
+            Registry NON-EMPTY but missing the resolved id: the pre-existing
+            refusal, carrying `details.provider` + `details.registered` and NO
+            `remedy` key.
         '502':
           description: "`product_report_failed` — the dedup search or upstream filing failed."
         '503': { description: Run or audit repository unavailable. }

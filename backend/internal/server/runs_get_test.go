@@ -1956,6 +1956,10 @@ func canonicalizeWireValue(v any, ids map[string]string, unknown *[]string) any 
 // the mcpserver classifier test consumes.
 func TestGetRun_HumanReviewGate_MatchesWireFixture(t *testing.T) {
 	s, repo, au := newDriveE2EServer(t)
+	// Pin the capabilities block (#3628). The feedback registry is a
+	// process-GLOBAL that a sibling test in this package registers into, so
+	// reading it here would make these golden bytes depend on test order.
+	s.cfg.FeedbackProviders = func() []string { return []string{"github_projects"} }
 
 	raw, _ := json.Marshal(map[string]any{
 		"repo": "x/y", "workflow_id": "backlog_grooming", "workflow_sha": "abc",
@@ -3776,4 +3780,81 @@ func TestGetRun_DerivedOpenSetEqualsListOpenByRun(t *testing.T) {
 			t.Errorf("settled concern %s leaked into the derived open set", id)
 		}
 	}
+}
+
+// TestGetRun_CapabilitiesBlock pins the three-state capabilities contract
+// (#3628) on the SHIPPED BYTES of GET /v0/runs/{id}:
+//
+//   - a non-empty registry surfaces the ids;
+//   - an EMPTY registry surfaces the literal "product_feedback_providers":[] —
+//     asserted on the RAW body, because that is the only assertion that fails
+//     both on a nil slice marshalling as null and on an accidental omitempty
+//     eliding the key. A decoded-struct assertion passes in both cases and the
+//     consumer's "positively none" reading silently collapses into
+//     "undecidable";
+//   - the LIST endpoint omits the block entirely — the asymmetry the three-state
+//     contract rests on (absent = undecidable), and the no-per-row-read posture
+//     forge_base_url already established.
+func TestGetRun_CapabilitiesBlock(t *testing.T) {
+	seed := func(t *testing.T, ids []string) (*Server, *run.Run) {
+		t.Helper()
+		repo := newFakeRepo()
+		s := newServer(t, repo)
+		s.cfg.FeedbackProviders = func() []string { return ids }
+		got, err := repo.CreateRun(context.Background(), run.CreateRunParams{
+			Repo: "x/y", WorkflowID: "w", WorkflowSHA: "s", TriggerSource: run.TriggerCLI,
+		})
+		if err != nil {
+			t.Fatalf("CreateRun: %v", err)
+		}
+		return s, got
+	}
+
+	t.Run("registered providers surface on the single-run read", func(t *testing.T) {
+		s, got := seed(t, []string{"github_projects"})
+		w := httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/v0/runs/"+got.ID.String(), nil))
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		var resp runResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if resp.Capabilities == nil {
+			t.Fatalf("capabilities block absent on the single-run read: %s", w.Body.String())
+		}
+		if !reflect.DeepEqual(resp.Capabilities.ProductFeedbackProviders, []string{"github_projects"}) {
+			t.Errorf("product_feedback_providers = %v, want [github_projects]",
+				resp.Capabilities.ProductFeedbackProviders)
+		}
+	})
+
+	t.Run("empty registry emits a literal empty array", func(t *testing.T) {
+		s, got := seed(t, nil)
+		w := httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/v0/runs/"+got.ID.String(), nil))
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		// The done-means assertion: the RAW bytes, not the decoded struct.
+		if !strings.Contains(w.Body.String(), `"product_feedback_providers":[]`) {
+			t.Errorf("raw body must carry the literal \"product_feedback_providers\":[] so an\n"+
+				"empty registry reads as POSITIVELY none rather than undecidable; got:\n%s",
+				w.Body.String())
+		}
+	})
+
+	t.Run("list endpoint omits the block", func(t *testing.T) {
+		s, _ := seed(t, []string{"github_projects"})
+		w := httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/v0/runs", nil))
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		if strings.Contains(w.Body.String(), "capabilities") {
+			t.Errorf("the list endpoint must omit the capabilities block (no per-row read); got:\n%s",
+				w.Body.String())
+		}
+	})
 }

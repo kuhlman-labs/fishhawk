@@ -130,6 +130,15 @@ var redactableDetailKeys = map[string]struct{}{
 	"budget_seconds":                 {},
 	// forge: the product-owned forge family enum (github|gitlab) derived from the run row's InstallationRef prefix, never an error/subprocess/third-party string (E45.49 / #3466).
 	"forge": {},
+	// remedy: the operator-facing configuration fix a refusal names (#3628).
+	// Its value is a STATIC LITERAL written at the call site naming operator
+	// configuration (environment variable names) — never derived from an error,
+	// a subprocess or a third-party API response — so it satisfies the
+	// membership rule above on the same footing as the other static-literal
+	// keys. Without this entry the 501 provider_unimplemented deployment-not-
+	// wired refusal keeps its actionable half stripped by the 5xx default-deny
+	// redactor and the operator is handed the same un-actionable body as before.
+	"remedy": {},
 }
 
 // redactErrorDetails returns a NEW map holding only the allow-listed keys of
