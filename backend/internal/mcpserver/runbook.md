@@ -53,7 +53,12 @@ One issue → one run → one PR.
    pending mid-stage scope amendment returns status `amendment_pending` with the
    amendment row and a pre-filled `fishhawk_decide_scope_amendment` `next_step`,
    so dispatch's in-band amendment channel is observable from the same wait —
-   decide, then re-arm the wait for the settlement.
+   decide, then re-arm the wait for the settlement. A `timeout` is discriminated
+   by `timeout_kind` (#3626): `client_wait_cap` is the benign, resumable
+   checkpoint — only YOUR wait cap expired, never the stage's own deadline — so
+   re-arm; `stage_deadline_exceeded` means the stage's per-attempt agent budget
+   is spent while it is still unsettled, so check `fishhawk_get_run_status`
+   instead of re-arming blindly.
 5. **`fishhawk_await_review`** — block until the implement review reaches a
    terminal verdict. Re-poll `fishhawk_get_run_status` if it times out; that
    poll is the authoritative path to a terminal status. Once the review

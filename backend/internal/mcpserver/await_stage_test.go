@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -12,6 +13,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 )
 
 // seedStageWait seeds a stage of stageType for runID in the fake (so
@@ -202,6 +205,16 @@ func TestAwaitStage_TimeoutIsResumable(t *testing.T) {
 	if !strings.Contains(out.Message, "re-call fishhawk_await_stage") || !strings.Contains(out.Message, "no-op") {
 		t.Errorf("timeout message should frame the resumable no-op re-call: %q", out.Message)
 	}
+	// #3626: the timeout is discriminated. The parent ctx is cancelled here, so
+	// the best-effort health probe cannot read anything — which is exactly the
+	// unclassified fallback, and (per the binding condition) the message must
+	// therefore say health is UNKNOWN rather than imply a healthy stage.
+	if out.TimeoutKind != awaitStageTimeoutKindClientWaitCap {
+		t.Errorf("TimeoutKind = %q, want %q", out.TimeoutKind, awaitStageTimeoutKindClientWaitCap)
+	}
+	if !strings.Contains(out.Message, "UNKNOWN") || !strings.Contains(out.Message, "fishhawk_get_run_status") {
+		t.Errorf("an unread health must be reported UNKNOWN and routed to get_run_status: %q", out.Message)
+	}
 }
 
 // TestAwaitStage_TimeoutClampTable pins the timeout cap AND the effective
@@ -264,6 +277,11 @@ func TestAwaitStage_TimeoutClampTable(t *testing.T) {
 			}
 			if out.Heartbeat != tc.token {
 				t.Errorf("Heartbeat = %v, want %v (true only when a progressToken was supplied)", out.Heartbeat, tc.token)
+			}
+			// #3626: every row here times out on the CLIENT's cap, so the
+			// discriminator must say so on all four regimes.
+			if out.TimeoutKind != awaitStageTimeoutKindClientWaitCap {
+				t.Errorf("TimeoutKind = %q, want %q", out.TimeoutKind, awaitStageTimeoutKindClientWaitCap)
 			}
 		})
 	}
@@ -1533,5 +1551,364 @@ func TestDecorateSettledWithFixupRecovery_PairsBlockAndMessage(t *testing.T) {
 	}
 	if full.Message != rec.Message {
 		t.Errorf("Message = %q, want %q", full.Message, rec.Message)
+	}
+}
+
+// --- discriminated timeout (E45.91 / #3626) ---
+
+// setStageBudget stamps the per-attempt agent budget fixtures onto an
+// ALREADY-SEEDED stage in the fake's stage list — the two fields
+// stageWaitStatusFor derives deadline_seconds_remaining from
+// (agent_timeout_seconds and the #3335 per-attempt dispatch clock). The
+// timestamps are authored inside the fake backend's OWN response payload, so
+// there is no Go-vs-Postgres cross-clock comparison here (#3048 does not apply).
+func setStageBudget(fb *fakeBackend, runID, stageID uuid.UUID, agentTimeoutSeconds int, dispatchedAt time.Time) {
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	stages := fb.stagesByRun[runID]
+	for i := range stages {
+		if stages[i].ID == stageID.String() {
+			at := dispatchedAt
+			stages[i].AgentTimeoutSeconds = agentTimeoutSeconds
+			stages[i].DispatchedAt = &at
+			stages[i].StartedAt = &at
+		}
+	}
+	fb.stagesByRun[runID] = stages
+}
+
+// TestAwaitStageTimeoutKind_Table pins the PURE classifier over all four inputs
+// (#3626). The pointer is exactly the #2540 known-vs-unknown discriminator:
+// stageDeadlineRemaining returns nil when the budget could not be resolved and
+// CLAMPS an overrun to 0, so only a non-nil ZERO means "exhausted" and nil must
+// never be laundered into it.
+func TestAwaitStageTimeoutKind_Table(t *testing.T) {
+	zero := 0
+	remaining := 1800
+	cases := []struct {
+		name string
+		sw   *StageWaitStatus
+		want string
+	}{
+		{"nil block (health read failed)", nil, awaitStageTimeoutKindClientWaitCap},
+		{"unknown budget (nil remaining)", &StageWaitStatus{Stage: "implement", Status: "running"}, awaitStageTimeoutKindClientWaitCap},
+		{"budget exhausted (remaining 0)", &StageWaitStatus{Stage: "implement", Status: "running", AgentTimeoutSeconds: 3600, DeadlineSecondsRemaining: &zero}, awaitStageTimeoutKindStageDeadlineExceeded},
+		{"budget remaining", &StageWaitStatus{Stage: "implement", Status: "running", AgentTimeoutSeconds: 3600, DeadlineSecondsRemaining: &remaining}, awaitStageTimeoutKindClientWaitCap},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := awaitStageTimeoutKind(tc.sw); got != tc.want {
+				t.Errorf("awaitStageTimeoutKind = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestAwaitStageTimeoutOutput_MessageVariants pins the SHIPPED response bytes
+// for all three timeout messages (#3626). It is the done-means test: a
+// comment-only touch of await_stage.go fails it where a presence gate would
+// pass.
+//
+// The binding operator condition is what makes the two client_wait_cap variants
+// distinct rather than one message: client_wait_cap must NOT claim the stage is
+// healthy. A positive health statement is allowed ONLY where health was actually
+// read and showed remaining budget; where the read failed or the budget is
+// unresolved the message must say health is UNKNOWN and point at
+// fishhawk_get_run_status.
+func TestAwaitStageTimeoutOutput_MessageVariants(t *testing.T) {
+	stageID := uuid.New()
+	start := time.Now()
+	zero := 0
+	remaining := 1800
+
+	exceeded := awaitStageTimeoutOutput("implement", stageID, 600, start, false, 600, "running",
+		&StageWaitStatus{Stage: "implement", Status: "running", AgentTimeoutSeconds: 3600, DeadlineSecondsRemaining: &zero})
+	healthy := awaitStageTimeoutOutput("implement", stageID, 600, start, false, 600, "running",
+		&StageWaitStatus{Stage: "implement", Status: "running", AgentTimeoutSeconds: 3600, DeadlineSecondsRemaining: &remaining})
+	unknown := awaitStageTimeoutOutput("implement", stageID, 600, start, false, 600, "", nil)
+
+	for _, out := range []AwaitStageOutput{exceeded, healthy, unknown} {
+		if out.Status != "timeout" {
+			t.Fatalf("Status = %q, want timeout (the token is deliberately unchanged)", out.Status)
+		}
+		if !strings.Contains(out.Message, "within 600s") {
+			t.Errorf("every variant must report the clamped wait cap: %q", out.Message)
+		}
+	}
+
+	// stage_deadline_exceeded: names the EXHAUSTED per-attempt agent budget and
+	// routes AWAY from a blind re-arm.
+	if exceeded.TimeoutKind != awaitStageTimeoutKindStageDeadlineExceeded {
+		t.Errorf("TimeoutKind = %q, want %q", exceeded.TimeoutKind, awaitStageTimeoutKindStageDeadlineExceeded)
+	}
+	for _, want := range []string{"agent budget", "EXHAUSTED", "3600", "fishhawk_get_run_status", "fishhawk_reap_stage"} {
+		if !strings.Contains(exceeded.Message, want) {
+			t.Errorf("stage_deadline_exceeded message missing %q: %q", want, exceeded.Message)
+		}
+	}
+	for _, banned := range []string{"re-call fishhawk_await_stage", "no-op"} {
+		if strings.Contains(exceeded.Message, banned) {
+			t.Errorf("stage_deadline_exceeded message must NOT tell the operator to simply re-arm (found %q): %q", banned, exceeded.Message)
+		}
+	}
+
+	// client_wait_cap with health READ: the only variant allowed to state the
+	// stage is within its deadline, and it names the budget it observed.
+	if healthy.TimeoutKind != awaitStageTimeoutKindClientWaitCap {
+		t.Errorf("TimeoutKind = %q, want %q", healthy.TimeoutKind, awaitStageTimeoutKindClientWaitCap)
+	}
+	for _, want := range []string{"YOUR wait cap expired", "1800", "within its deadline", "re-call fishhawk_await_stage", "no-op"} {
+		if !strings.Contains(healthy.Message, want) {
+			t.Errorf("client_wait_cap (health known) message missing %q: %q", want, healthy.Message)
+		}
+	}
+
+	// client_wait_cap with health UNREAD: says UNKNOWN in those words, routes to
+	// get_run_status, and makes NO positive health claim.
+	if unknown.TimeoutKind != awaitStageTimeoutKindClientWaitCap {
+		t.Errorf("TimeoutKind = %q, want %q", unknown.TimeoutKind, awaitStageTimeoutKindClientWaitCap)
+	}
+	for _, want := range []string{"YOUR wait cap expired", "UNKNOWN", "does NOT claim the stage is healthy", "fishhawk_get_run_status", "re-call fishhawk_await_stage", "no-op"} {
+		if !strings.Contains(unknown.Message, want) {
+			t.Errorf("client_wait_cap (health unknown) message missing %q: %q", want, unknown.Message)
+		}
+	}
+	for _, banned := range []string{"within its deadline", "has NOT failed"} {
+		if strings.Contains(unknown.Message, banned) {
+			t.Errorf("an unread health must make NO positive health claim (found %q): %q", banned, unknown.Message)
+		}
+	}
+
+	if exceeded.Message == healthy.Message || healthy.Message == unknown.Message || exceeded.Message == unknown.Message {
+		t.Errorf("the three timeout messages must not be byte-equal:\n exceeded=%q\n healthy=%q\n unknown=%q",
+			exceeded.Message, healthy.Message, unknown.Message)
+	}
+}
+
+// awaitStageTimeoutFixtureSeconds is the CLIENT wait cap the end-to-end #3626
+// timeout fixtures arm. It is the smallest value clampAwaitTimeoutHeartbeat
+// accepts, and it is deliberately NOT scaled: it is the deadline whose EXPIRY is
+// the expected verdict, not a budget anything must complete inside, so a loaded
+// host cannot make it flaky. The durations that must DISCRIMINATE — the
+// per-attempt dispatch offsets below — go through timescale.D per #1984.
+const awaitStageTimeoutFixtureSeconds = 1
+
+// TestAwaitStage_TimeoutKindStageDeadlineExceededEndToEnd drives the REAL
+// handler against the fake backend with a stage whose per-attempt agent budget
+// is spent while it is still unsettled (#3626). It also catches the subtlest
+// available defect: threading the EXPIRED pollCtx into the health probe instead
+// of the parent ctx would fail the probe by construction and fall back to
+// client_wait_cap with a nil block.
+func TestAwaitStage_TimeoutKindStageDeadlineExceededEndToEnd(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	stageID := seedStageWait(fb, runID, "implement", "running", false)
+	// Exhausted BY CONSTRUCTION: a 1s agent budget dispatched an hour ago, so
+	// stageDeadlineRemaining clamps the negative remainder to 0.
+	setStageBudget(fb, runID, stageID, 1, time.Now().UTC().Add(-timescale.D(time.Hour)))
+	r := newResolver(srv, nil)
+	r.reviewPollInterval = timescale.D(25 * time.Millisecond)
+
+	_, out, err := r.awaitStage(context.Background(), nil, AwaitStageInput{
+		RunID:          runID.String(),
+		Stage:          "implement",
+		TimeoutSeconds: awaitStageTimeoutFixtureSeconds,
+	})
+	if err != nil {
+		t.Fatalf("awaitStage: %v", err)
+	}
+	if out.Status != "timeout" {
+		t.Fatalf("Status = %q, want timeout", out.Status)
+	}
+	if out.TimeoutKind != awaitStageTimeoutKindStageDeadlineExceeded {
+		t.Fatalf("TimeoutKind = %q, want %q (the probe must run on the PARENT ctx, not the expired pollCtx)",
+			out.TimeoutKind, awaitStageTimeoutKindStageDeadlineExceeded)
+	}
+	if out.StageWaitStatus == nil {
+		t.Fatalf("StageWaitStatus = nil, want the classified health block")
+	}
+	if out.StageWaitStatus.DeadlineSecondsRemaining == nil || *out.StageWaitStatus.DeadlineSecondsRemaining != 0 {
+		t.Errorf("deadline_seconds_remaining = %v, want a non-nil 0", out.StageWaitStatus.DeadlineSecondsRemaining)
+	}
+	if out.State != "running" {
+		t.Errorf("State = %q, want running (the raw, still-unsettled state)", out.State)
+	}
+}
+
+// TestAwaitStage_TimeoutKindClientWaitCapEndToEnd is the sibling: the same wait,
+// the same expired CLIENT cap, but plenty of per-attempt agent budget left. This
+// is the case that is allowed to state the stage is within its deadline, because
+// health was actually read.
+func TestAwaitStage_TimeoutKindClientWaitCapEndToEnd(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	stageID := seedStageWait(fb, runID, "implement", "running", false)
+	setStageBudget(fb, runID, stageID, 3600, time.Now().UTC())
+	r := newResolver(srv, nil)
+	r.reviewPollInterval = timescale.D(25 * time.Millisecond)
+
+	_, out, err := r.awaitStage(context.Background(), nil, AwaitStageInput{
+		RunID:          runID.String(),
+		Stage:          "implement",
+		TimeoutSeconds: awaitStageTimeoutFixtureSeconds,
+	})
+	if err != nil {
+		t.Fatalf("awaitStage: %v", err)
+	}
+	if out.Status != "timeout" || out.TimeoutKind != awaitStageTimeoutKindClientWaitCap {
+		t.Fatalf("Status/TimeoutKind = %q/%q, want timeout/%s", out.Status, out.TimeoutKind, awaitStageTimeoutKindClientWaitCap)
+	}
+	if out.State != "running" {
+		t.Errorf("State = %q, want running", out.State)
+	}
+	if out.StageWaitStatus == nil || out.StageWaitStatus.DeadlineSecondsRemaining == nil {
+		t.Fatalf("StageWaitStatus/deadline_seconds_remaining = %+v, want a known remaining budget", out.StageWaitStatus)
+	}
+	if *out.StageWaitStatus.DeadlineSecondsRemaining <= 0 {
+		t.Errorf("deadline_seconds_remaining = %d, want > 0", *out.StageWaitStatus.DeadlineSecondsRemaining)
+	}
+	if !strings.Contains(out.Message, "within its deadline") {
+		t.Errorf("a READ health showing remaining budget may state the stage is within its deadline: %q", out.Message)
+	}
+}
+
+// TestAwaitStage_TimeoutHealthProbeFailsOpen is the per-failure-mode table for
+// the four degradation branches the #3626 probe introduces. Every one must
+// return the RESUMABLE timeout with NO error: a wait held for up to two hours
+// must never die on a classification read.
+func TestAwaitStage_TimeoutHealthProbeFailsOpen(t *testing.T) {
+	cases := []struct {
+		name string
+		// seed runs after the stage is seeded; it arms the degradation.
+		seed func(fb *fakeBackend, runID, stageID uuid.UUID)
+		// wantBlock is true when the probe still resolves a classified block
+		// (the unresolved-budget row) and false when it yields nothing.
+		wantBlock bool
+	}{
+		{
+			name: "ListRunStages 500 at timeout time",
+			seed: func(fb *fakeBackend, runID, stageID uuid.UUID) {
+				// Fail the SECOND stages read (the probe); the first is
+				// resolveStage's and must succeed or the wait never arms.
+				fb.stagesFlip = func(id uuid.UUID, callNum int) {
+					if id == runID && callNum == 1 {
+						fb.stagesStatusByRun[id] = http.StatusInternalServerError
+					}
+				}
+			},
+		},
+		{
+			name: "GetRun 500 at timeout time",
+			seed: func(fb *fakeBackend, runID, stageID uuid.UUID) {
+				fb.getStatusByID[runID] = http.StatusInternalServerError
+			},
+		},
+		{
+			name: "run carries no stage of the awaited type",
+			seed: func(fb *fakeBackend, runID, stageID uuid.UUID) {
+				fb.stagesFlip = func(id uuid.UUID, callNum int) {
+					if id == runID && callNum == 1 {
+						fb.stagesByRun[id] = nil
+					}
+				}
+			},
+		},
+		{
+			name: "agent_timeout_seconds unresolved (budget unknown)",
+			seed: func(fb *fakeBackend, runID, stageID uuid.UUID) {
+				setStageBudget(fb, runID, stageID, 0, time.Now().UTC())
+			},
+			wantBlock: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fb, srv := newFakeBackend(t)
+			runID := uuid.New()
+			stageID := seedStageWait(fb, runID, "implement", "running", false)
+			tc.seed(fb, runID, stageID)
+			r := newResolver(srv, nil)
+			r.reviewPollInterval = timescale.D(25 * time.Millisecond)
+
+			_, out, err := r.awaitStage(context.Background(), nil, AwaitStageInput{
+				RunID:          runID.String(),
+				Stage:          "implement",
+				TimeoutSeconds: awaitStageTimeoutFixtureSeconds,
+			})
+			if err != nil {
+				t.Fatalf("awaitStage returned an error, want the resumable timeout: %v", err)
+			}
+			if out.Status != "timeout" {
+				t.Fatalf("Status = %q, want timeout", out.Status)
+			}
+			if out.TimeoutKind != awaitStageTimeoutKindClientWaitCap {
+				t.Errorf("TimeoutKind = %q, want %q — an UNKNOWN budget must never be reported as an exceeded deadline",
+					out.TimeoutKind, awaitStageTimeoutKindClientWaitCap)
+			}
+			if tc.wantBlock {
+				if out.StageWaitStatus == nil || out.StageWaitStatus.DeadlineSecondsRemaining != nil {
+					t.Errorf("StageWaitStatus = %+v, want a block with an UNKNOWN (nil) remaining budget", out.StageWaitStatus)
+				}
+			} else if out.StageWaitStatus != nil {
+				t.Errorf("StageWaitStatus = %+v, want nil (the health read degraded)", out.StageWaitStatus)
+			}
+			// The binding condition: an unread or unknown health is reported as
+			// UNKNOWN and routed at get_run_status, never as a healthy stage.
+			for _, want := range []string{"UNKNOWN", "does NOT claim the stage is healthy", "fishhawk_get_run_status"} {
+				if !strings.Contains(out.Message, want) {
+					t.Errorf("degraded timeout message missing %q: %q", want, out.Message)
+				}
+			}
+		})
+	}
+}
+
+// TestAwaitStageToolDescription_NamesDiscriminatedTimeout pins the correction on
+// the surface an agent reads BEFORE branching (#3626): the tool description must
+// say the timeout is the CLIENT's cap, name both kinds, and state that a stage
+// blowing its OWN agent deadline arrives settled/failed instead.
+func TestAwaitStageToolDescription_NamesDiscriminatedTimeout(t *testing.T) {
+	ctx := context.Background()
+	_, srv := newFakeBackend(t)
+	server := mcp.NewServer(&mcp.Implementation{Name: "test-server", Version: "0"}, nil)
+	registerAwaitStage(server, newResolver(srv, nil))
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := server.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	defer serverSession.Close()
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	defer clientSession.Close()
+
+	res, err := clientSession.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	var desc string
+	for _, tool := range res.Tools {
+		if tool.Name == "fishhawk_await_stage" {
+			desc = tool.Description
+			break
+		}
+	}
+	if desc == "" {
+		t.Fatal("fishhawk_await_stage not registered")
+	}
+	for _, want := range []string{
+		"timeout_kind",
+		awaitStageTimeoutKindClientWaitCap,
+		awaitStageTimeoutKindStageDeadlineExceeded,
+		"KILLED by the runner",
+		"not a health claim",
+	} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("fishhawk_await_stage description missing %q", want)
+		}
 	}
 }
