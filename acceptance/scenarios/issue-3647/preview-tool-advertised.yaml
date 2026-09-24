@@ -1,0 +1,14 @@
+id: scenario:issue-3647/preview-tool-advertised
+statement: The MCP tool listing advertises a fishhawk_preview_campaign tool whose description states that it creates nothing.
+verify_hint: The MCP tools/list result contains an entry named fishhawk_preview_campaign.
+steps: 1) POST /v0/dev/fixtures {"scenario":"trace-upload-target"} -> run. 2) POST /v0/runs/{run}/signing-key; POST /v0/dev/sign over '{}' with X-Fishhawk-Dev-Private-Key; POST /v0/runs/{run}/mcp-token with X-Fishhawk-Signature -> fhm_ bearer. 3) POST http://localhost:8090/mcp tools/list (Mcp-Protocol-Version 2026-07-28, Mcp-Method tools/list, _meta) -> 200 with 58 tools on one page. 4) Read the fishhawk_preview_campaign entry.
+assertions:
+    expected: tools/list contains fishhawk_preview_campaign, and its description states it creates nothing
+    observed_at_record: 'fishhawk_preview_campaign is advertised. Its description begins ''Preview what fishhawk_start_campaign WOULD assemble, without creating anything. It CREATES NOTHING: no campaign, no items, no audit entry''. The inputSchema takes repo (required), epic_ref, items, grooming_run_id, grooming_order_limit, grooming_allow_superseded and provider.'
+    repro_handle: POST http://localhost:8090/mcp tools/list
+origin:
+    issue: 3647
+    pr: 3652
+    run_id: 205ef2a5-936d-4930-8b8e-220dd355c8e9
+    head_sha: 6ede08903c4c69dc52350a3443c60c16541f671e
+    recorded_at: 2026-09-24T17:33:52Z
