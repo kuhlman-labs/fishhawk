@@ -3270,17 +3270,18 @@ func jitterGolden() *workmgmt.EpicChildrenResult {
 	return &workmgmt.EpicChildrenResult{
 		Children: []workmgmt.EpicChild{
 			// #101 is closed+completed, so State normalizes to "CLOSED" (#3323); the
-			// rest carry no state in the fixture, so State is "".
+			// rest carry no state in the fixture, so State is "". Each child carries
+			// its fetched Body verbatim (#3649: the REST site now populates Body).
 			{Number: 101, Title: "one-one", Complete: true, State: "CLOSED"},
 			{Number: 102, Title: "one-two"},
 			{Number: 103, Title: "one-three"},
 			{Number: 104, Title: "one-four"},
-			{Number: 105, Title: "one-five"},
-			{Number: 106, Title: "one-six"},
-			{Number: 107, Title: "one-seven"},
-			{Number: 108, Title: "one-eight"},
-			{Number: 109, Title: "one-nine"},
-			{Number: 110, Title: "one-ten"},
+			{Number: 105, Title: "one-five", Body: "Depends on: #903\n"},
+			{Number: 106, Title: "one-six", Body: "Depends on: #902\n"},
+			{Number: 107, Title: "one-seven", Body: "Depends on: other/repo#5\n"},
+			{Number: 108, Title: "one-eight", Body: "Depends on: #901\n"},
+			{Number: 109, Title: "one-nine", Body: "Depends on: #900\n"},
+			{Number: 110, Title: "one-ten", Body: "Depends on: #101\n"},
 		},
 		Edges: []workmgmt.DependsEdge{{From: 110, To: 101}},
 		DroppedEdges: []workmgmt.DependsEdge{
@@ -3883,5 +3884,103 @@ func TestPlaceIssueOnBoard_SetFailureIsTypedButRendersUnchanged(t *testing.T) {
 	}
 	if created.BoardingError != want {
 		t.Errorf("BoardingError = %q, want the UNCHANGED %q", created.BoardingError, want)
+	}
+}
+
+// TestResolveDependencies_PopulatesBody is the #3649 vacuity guard for the REST
+// GetIssue construction site: the campaign admission screen reads EpicChild.Body
+// for issue-text checks, and the no-epic (#2051) and grooming-order (#2238)
+// campaign sources resolve through ResolveDependencies rather than
+// EpicChildren. It asserts the FIELD (not the depends_on parse, which reads the
+// fetched issue directly and so stays green without the mapping).
+//
+// COUNTERFACTUAL: delete `Body: issue.Body` in ResolveDependencies → RED.
+func TestResolveDependencies_PopulatesBody(t *testing.T) {
+	const body = "Edit `.gitlab-ci.yml` to add a stage.\n"
+	api := &fakeAPI{getIssues: map[int]*githubclient.Issue{
+		100: {Number: 100, Title: "root", Body: body, State: "open"},
+		101: {Number: 101, Title: "leaf", Body: "Depends on: #100", State: "open"},
+	}}
+	res, err := New(api).ResolveDependencies(context.Background(), resolveReq("100", "101"))
+	if err != nil {
+		t.Fatalf("ResolveDependencies: %v", err)
+	}
+	if len(res.Children) != 2 {
+		t.Fatalf("children = %+v, want 2", res.Children)
+	}
+	if res.Children[0].Body != body {
+		t.Errorf("child[0].Body = %q, want the fetched body verbatim %q", res.Children[0].Body, body)
+	}
+	if res.Children[1].Body != "Depends on: #100" {
+		t.Errorf("child[1].Body = %q, want the fetched body verbatim", res.Children[1].Body)
+	}
+}
+
+// runnableLabelCases is the shared #3649 table for both EpicChild construction
+// sites: only an explicit `runnable:no` sets NotRunnable.
+var runnableLabelCases = []struct {
+	name   string
+	labels []string
+	want   bool
+}{
+	{"runnable:no declares not runnable", []string{"area:server", "runnable:no"}, true},
+	{"runnable:yes is runnable", []string{"runnable:yes"}, false},
+	{"unrecognized value is runnable", []string{"runnable:bogus"}, false},
+	{"no runnable label is runnable", []string{"autonomy:low"}, false},
+}
+
+// TestProvider_EpicChildren_PopulatesNotRunnable pins the GraphQL sub-issues
+// construction site (#3649).
+//
+// COUNTERFACTUAL: delete `NotRunnable: parseRunnableLabel(s.Labels)` → RED on
+// the runnable:no row.
+func TestProvider_EpicChildren_PopulatesNotRunnable(t *testing.T) {
+	for _, tc := range runnableLabelCases {
+		t.Run(tc.name, func(t *testing.T) {
+			api := &fakeAPI{
+				parentNode: "EPIC_NODE",
+				listSubResults: []githubclient.SubIssue{
+					{Number: 100, NodeID: "N100", Title: "child", Labels: tc.labels, State: "OPEN"},
+				},
+			}
+			res, err := New(api).EpicChildren(context.Background(), workmgmt.EpicChildrenRequest{
+				Target: workmgmt.Target{Scope: forge.FromGitHubInstallationID(99), Repo: workmgmt.Repo{Owner: "kuhlman-labs", Name: "fishhawk"}},
+				Epic:   "#99",
+			})
+			if err != nil {
+				t.Fatalf("EpicChildren: %v", err)
+			}
+			if len(res.Children) != 1 {
+				t.Fatalf("children = %+v, want 1", res.Children)
+			}
+			if got := res.Children[0].NotRunnable; got != tc.want {
+				t.Errorf("NotRunnable = %v, want %v (labels %v)", got, tc.want, tc.labels)
+			}
+		})
+	}
+}
+
+// TestProvider_ResolveDependencies_PopulatesNotRunnable pins the REST GetIssue
+// construction site (#3649).
+//
+// COUNTERFACTUAL: delete `NotRunnable: parseRunnableLabel(issue.Labels)` → RED
+// on the runnable:no row.
+func TestProvider_ResolveDependencies_PopulatesNotRunnable(t *testing.T) {
+	for _, tc := range runnableLabelCases {
+		t.Run(tc.name, func(t *testing.T) {
+			api := &fakeAPI{getIssues: map[int]*githubclient.Issue{
+				100: {Number: 100, Title: "child", Labels: tc.labels, State: "open"},
+			}}
+			res, err := New(api).ResolveDependencies(context.Background(), resolveReq("100"))
+			if err != nil {
+				t.Fatalf("ResolveDependencies: %v", err)
+			}
+			if len(res.Children) != 1 {
+				t.Fatalf("children = %+v, want 1", res.Children)
+			}
+			if got := res.Children[0].NotRunnable; got != tc.want {
+				t.Errorf("NotRunnable = %v, want %v (labels %v)", got, tc.want, tc.labels)
+			}
+		})
 	}
 }

@@ -2829,8 +2829,68 @@ components:
             "this dependency is done" from "this dependency was ignored".
           items:
             $ref: '#/components/schemas/SatisfiedDependency'
+        admission_screen:
+          $ref: '#/components/schemas/CampaignAdmissionScreen'
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
+
+    CampaignAdmissionScreen:
+      type: object
+      description: |
+        The ADVISORY campaign admission screen (#3649). Reports, per candidate,
+        an explicit `runnable:no` label declaration (`not_runnable_declared`)
+        and any path-shaped token in the issue title/body that the repo's
+        implement-stage `forbidden_paths` forbid (`forbidden_path`, matched with
+        the post-implement gate's matcher against the UNION of every workflow's
+        implement-stage `forbidden_paths` in the default-branch spec). It never
+        refuses, excludes or reorders an item. Like `satisfied_dependencies`
+        this is CREATE-response-only — NOT persisted, so GET/list/status omit
+        it — and omitted when the screen found nothing. Class 2 degrades
+        silently (fail-open, `forbidden_paths_screened: false`) when the spec
+        cannot be fetched or parsed or declares no forbidden paths; issue prose
+        is noisy, so false positives are expected.
+      required: [advisory, findings, forbidden_paths_screened]
+      properties:
+        advisory:
+          type: boolean
+          description: Always `true` — the screen reports and never blocks the create.
+        findings:
+          type: array
+          description: Sorted by issue, then kind, then path; capped at 50.
+          items:
+            $ref: '#/components/schemas/CampaignAdmissionFinding'
+        forbidden_paths_screened:
+          type: boolean
+          description: |
+            Whether the `forbidden_path` class ran. `false` when the repo's
+            implement-stage `forbidden_paths` could not be resolved, so a
+            block carrying only `not_runnable_declared` findings is not
+            mistaken for a clean forbidden-path result.
+        truncated:
+          type: boolean
+          description: Present and `true` when the findings were capped.
+
+    CampaignAdmissionFinding:
+      type: object
+      description: One admission-screen finding (#3649).
+      required: [issue, kind]
+      properties:
+        issue:
+          type: integer
+          description: The candidate issue number.
+        kind:
+          type: string
+          enum: [not_runnable_declared, forbidden_path]
+        path:
+          type: string
+          description: "`forbidden_path` only: the path-shaped token named in the issue."
+        location:
+          type: string
+          enum: [title, body]
+          description: "`forbidden_path` only: where the token was named (a token in both is attributed to the title)."
+        forbidden_pattern:
+          type: string
+          description: "`forbidden_path` only: the first declared `forbidden_paths` glob matching `path`."
 
     SatisfiedDependency:
       type: object

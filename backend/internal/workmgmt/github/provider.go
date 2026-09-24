@@ -693,6 +693,9 @@ func (p *Provider) EpicChildren(ctx context.Context, req workmgmt.EpicChildrenRe
 			// returned and still adoptable.
 			Body: s.Body,
 			URL:  s.URL,
+			// NotRunnable is the explicit `runnable:no` declaration (#3649),
+			// read by the advisory campaign admission screen.
+			NotRunnable: parseRunnableLabel(s.Labels),
 		})
 		for _, dep := range parseDependsOnMarker(s.Body) {
 			key := dependsEdgeKey{From: s.Number, To: dep.Number, Digest: dep.RawDigest}
@@ -1063,6 +1066,13 @@ func (p *Provider) ResolveDependencies(ctx context.Context, req workmgmt.IssueSe
 			// is LOWERCASE ("open"/"closed"), so ToUpper is load-bearing here — it
 			// is what makes this producer agree with the uppercase GraphQL site.
 			State: strings.ToUpper(issue.State),
+			// Body is LOAD-BEARING for the campaign admission screen (#3649):
+			// without it the screen's issue-text check is vacuous on the no-epic
+			// (#2051) and grooming-order (#2238) sources, which resolve through
+			// this site rather than EpicChildren.
+			Body: issue.Body,
+			// NotRunnable is the explicit `runnable:no` declaration (#3649).
+			NotRunnable: parseRunnableLabel(issue.Labels),
 		})
 		for _, dep := range parseDependsOnMarker(issue.Body) {
 			key := dependsEdgeKey{From: issue.Number, To: dep.Number, Digest: dep.RawDigest}
@@ -1630,6 +1640,14 @@ func parseDependsOnMarker(body string) []dependsOnRef {
 // behavior-preserving.
 func parseAutonomyLabel(labels []string) string {
 	return workmgmt.ParseAutonomyLabel(labels)
+}
+
+// parseRunnableLabel delegates to workmgmt.ParseRunnableLabel — the single
+// source of truth for the `runnable:` declaration parse (#3649) — mirroring
+// parseAutonomyLabel so both EpicChild construction sites read the namespace
+// through one helper.
+func parseRunnableLabel(labels []string) bool {
+	return workmgmt.ParseRunnableLabel(labels)
 }
 
 // parseIssueRef delegates to workmgmt.ParseIssueRef — the single source of

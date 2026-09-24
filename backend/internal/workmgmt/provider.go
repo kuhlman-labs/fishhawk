@@ -320,6 +320,12 @@ type EpicChild struct {
 	// produce a WRONG url on a GitHub Enterprise Server host. Additive and
 	// empty for a provider that does not return one.
 	URL string
+	// NotRunnable is true ONLY when the child carries an explicit `runnable:no`
+	// label (workmgmt.ParseRunnableLabel, #3649) — a DECLARATION that the item
+	// produces no diff, never an inference from issue content. False for every
+	// other input, including a provider that does not read labels. The campaign
+	// admission screen reports it; nothing refuses or excludes on it. Additive.
+	NotRunnable bool
 }
 
 // DropReason categorizes why a DependsEdge was dropped from the wave DAG, so

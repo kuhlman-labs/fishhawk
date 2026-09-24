@@ -3418,8 +3418,33 @@ type Campaign struct {
 	// schema stays an object array. CREATE-response-only — the backend does not
 	// persist it, so a later read of the campaign omits it.
 	SatisfiedDependencies []campaignSatisfiedDependency `json:"satisfied_dependencies,omitempty" jsonschema:"depends_on edges elided at assembly because the target was already closed-and-completed (its work landed, so the dependency is satisfied). Present only on the create response, only when at least one edge was elided"`
-	CreatedAt             time.Time                     `json:"created_at"`
-	UpdatedAt             time.Time                     `json:"updated_at"`
+	// AdmissionScreen is the ADVISORY campaign admission screen (#3649):
+	// candidates declared `runnable:no` and candidates whose title/body names a
+	// path the repo's implement-stage forbidden_paths forbid. Typed struct (NOT
+	// map[string]any / json.RawMessage) so the reflection-built output schema
+	// stays an object. CREATE-response-only and never blocking.
+	AdmissionScreen *campaignAdmissionScreen `json:"admission_screen,omitempty" jsonschema:"ADVISORY admission screen: candidates declared runnable:no, and candidates whose title/body names a path the repo's implement-stage forbidden_paths forbid. Present only on the create response, only when the screen found something; it never blocks or alters the campaign"`
+	CreatedAt       time.Time                `json:"created_at"`
+	UpdatedAt       time.Time                `json:"updated_at"`
+}
+
+// campaignAdmissionScreen mirrors the backend's campaignAdmissionScreenPayload
+// (#3649). Unexported (FIELDS exported for JSON) so it stays off the frozen MCP
+// export surface, like campaignSatisfiedDependency.
+type campaignAdmissionScreen struct {
+	Advisory               bool                       `json:"advisory" jsonschema:"always true: the screen reports and never blocks the create"`
+	Findings               []campaignAdmissionFinding `json:"findings" jsonschema:"the findings, sorted by issue then kind then path"`
+	ForbiddenPathsScreened bool                       `json:"forbidden_paths_screened" jsonschema:"whether the forbidden_path class ran; false when the repo's implement-stage forbidden_paths could not be resolved"`
+	Truncated              bool                       `json:"truncated,omitempty" jsonschema:"true when the findings were capped"`
+}
+
+// campaignAdmissionFinding mirrors the backend's campaignScreenFinding (#3649).
+type campaignAdmissionFinding struct {
+	Issue            int    `json:"issue" jsonschema:"the candidate issue number"`
+	Kind             string `json:"kind" jsonschema:"not_runnable_declared or forbidden_path"`
+	Path             string `json:"path,omitempty" jsonschema:"forbidden_path only: the path-shaped token named in the issue"`
+	Location         string `json:"location,omitempty" jsonschema:"forbidden_path only: title or body"`
+	ForbiddenPattern string `json:"forbidden_pattern,omitempty" jsonschema:"forbidden_path only: the forbidden_paths glob that matches the path"`
 }
 
 // campaignSatisfiedDependency mirrors the backend's satisfiedDependencyPayload
