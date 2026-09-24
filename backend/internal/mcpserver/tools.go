@@ -1580,7 +1580,12 @@ type GetRunStatusOutput struct {
 	// authority, verdict, concerns[] (a {category:"scope"} concern flags
 	// scope.files drift), and free_form. A verdict of "skipped" with a
 	// reason marks a configured agent layer that was not wired.
-	ImplementReviews []PlanReview `json:"implement_reviews,omitempty" jsonschema:"implement-review agent verdicts; populated when reviewers.agent>0 is configured on the implement stage (ADR-027). A {category:'scope'} concern flags scope.files drift (flag-only, never an auto-reject). A verdict of 'skipped' with a reason marks an agent layer that was configured but not wired on the backend"`
+	ImplementReviews []PlanReview `json:"implement_reviews,omitempty" jsonschema:"implement-review agent verdicts; populated when reviewers.agent>0 is configured on the implement stage (ADR-027). A {category:'scope'} concern flags scope.files drift (flag-only, never an auto-reject). A verdict of 'skipped' with a reason marks an agent layer that was configured but not wired on the backend. OMITTED (see implement_reviews_elided) on a deduped response when every row it carries is present verbatim in implement_review_status.reviews; still present whenever it carries a row the status field floors away (a pre-fix-up round) or the status is none/pending"`
+	// ImplementReviewsElided is the legible stand-in for a dropped
+	// implement_reviews listing (E45.92 / #3627). It is present ONLY on a deduped
+	// response and its presence is the wire signal that the surviving
+	// implement_review_status.reviews carries capped (not content-free) notes.
+	ImplementReviewsElided string `json:"implement_reviews_elided,omitempty" jsonschema:"present ONLY when the flat implement_reviews listing was OMITTED because every row it carried is present verbatim in implement_review_status.reviews (E45.92 / #3627). ABSENT whenever implement_reviews survives — when it carries a row implement_review_status.reviews floors away (a pre-fix-up round) or the status is none/pending — so its absence is never ambiguous. When present, the deduped implement_review_status.reviews concern notes carry a CAPPED prefix (long notes: a bounded prefix plus a fishhawk_get_gate_view marker; short notes: unchanged with NO marker; empty notes: stay empty) rather than the content-free elision marker, funded by and conditional on the bytes the dropped listing frees. include_review_prose=true returns the full untouched notes"`
 	// PlanReviewStatus / ImplementReviewStatus summarize each stage's review
 	// lifecycle (#600): none|pending|complete|skipped|failed derived from the
 	// audit trail. Re-polling this tool is the AUTHORITATIVE way to reach a
@@ -2208,17 +2213,54 @@ func (r *runResolver) getRunStatus(ctx context.Context, req *mcp.CallToolRequest
 	if !in.IncludeIssueContext {
 		runRow.IssueContext = nil
 	}
+
+	assembled := GetRunStatusOutput{
+		Run:                       *runRow,
+		Stages:                    stages,
+		RecentAudit:               recent,
+		ImplementReviews:          implementReviews,
+		PlanReviewStatus:          planReviewStatus,
+		ImplementReviewStatus:     implementReviewStatus,
+		PlanStageWaitStatus:       planStageWaitStatus,
+		ImplementStageWaitStatus:  implementStageWaitStatus,
+		AcceptanceStageWaitStatus: acceptanceStageWaitStatus,
+		Budget:                    budgetStatus,
+		CacheEfficiency:           cacheEfficiency,
+		Cost:                      runCost,
+		Latency:                   runLatency,
+		ReviewActionHint:          reviewActionHint,
+		ImplementReviewMergeHint:  implementReviewMergeHint(implementReviewStatus),
+		DriveStatus:               view.driveStatus(),
+		NextActions:               nextActions,
+		ChildrenStatus:            childrenStatus,
+		SecurityFindings:          securityFindings,
+		AcceptanceTranscript:      acceptanceTranscript,
+		GroomingApplyStatus:       groomingApplyStatus,
+	}
+
+	// (b) reviewer prose (E45.92 / #3627). The same per-reviewer implement
+	// verdicts are serialized TWICE — as the flat implement_reviews[] AND as
+	// implement_review_status.reviews[]. dedupImplementReviews drops the flat
+	// listing when it is provably CONTAINED in the status field (carrying nothing
+	// new), replacing it with the legible implement_reviews_elided note, and
+	// reports whether the surviving status-field notes may carry capped prefixes
+	// (funded by the freed bytes) instead of the content-free marker. It runs
+	// REGARDLESS of the include_* flags — the duplication is a wire-shape defect,
+	// not a verbosity lever, so include_review_prose=true must not resurrect the
+	// redundant copy.
+	_, capImplementNotes := dedupImplementReviews(&assembled)
 	if !in.IncludeReviewProse {
-		// The same reviewer prose is carried by the typed implement_reviews[]
-		// AND by the reviews[] embedded in plan_review_status /
-		// implement_review_status — strip all three so the free-text is gone
-		// from the wire, not merely from one surface.
-		stripReviewProse(implementReviews)
-		if planReviewStatus != nil {
-			stripReviewProse(planReviewStatus.Reviews)
+		// Strip the remaining prose from every review surface so the free-text is
+		// gone from the wire, not merely from one surface. capNotes is passed true
+		// ONLY at the implement_review_status.reviews call site (and only when the
+		// dedup funded it); implement_reviews and plan_review_status.reviews keep
+		// today's content-free marker elision unconditionally.
+		stripReviewProse(assembled.ImplementReviews, false)
+		if assembled.PlanReviewStatus != nil {
+			stripReviewProse(assembled.PlanReviewStatus.Reviews, false)
 		}
-		if implementReviewStatus != nil {
-			stripReviewProse(implementReviewStatus.Reviews)
+		if assembled.ImplementReviewStatus != nil {
+			stripReviewProse(assembled.ImplementReviewStatus.Reviews, capImplementNotes)
 		}
 	}
 	for i := range recent {
@@ -2243,30 +2285,6 @@ func (r *runResolver) getRunStatus(ctx context.Context, req *mcp.CallToolRequest
 	// in-place blank is safe; collapseCacheEfficiencyStages is nil-safe.
 	if !in.IncludeCacheStages {
 		collapseCacheEfficiencyStages(cacheEfficiency)
-	}
-
-	assembled := GetRunStatusOutput{
-		Run:                       *runRow,
-		Stages:                    stages,
-		RecentAudit:               recent,
-		ImplementReviews:          implementReviews,
-		PlanReviewStatus:          planReviewStatus,
-		ImplementReviewStatus:     implementReviewStatus,
-		PlanStageWaitStatus:       planStageWaitStatus,
-		ImplementStageWaitStatus:  implementStageWaitStatus,
-		AcceptanceStageWaitStatus: acceptanceStageWaitStatus,
-		Budget:                    budgetStatus,
-		CacheEfficiency:           cacheEfficiency,
-		Cost:                      runCost,
-		Latency:                   runLatency,
-		ReviewActionHint:          reviewActionHint,
-		ImplementReviewMergeHint:  implementReviewMergeHint(implementReviewStatus),
-		DriveStatus:               view.driveStatus(),
-		NextActions:               nextActions,
-		ChildrenStatus:            childrenStatus,
-		SecurityFindings:          securityFindings,
-		AcceptanceTranscript:      acceptanceTranscript,
-		GroomingApplyStatus:       groomingApplyStatus,
 	}
 
 	// Response byte bound (ADR-077 / #2508). Runs at ONE call site, AFTER the

@@ -466,6 +466,21 @@ func TestEveryResponsePathIsClassified(t *testing.T) {
 	_ = reflect.TypeOf(GetRunStatusOutput{})
 }
 
+// TestImplementReviewsElidedIsClassifiedTierNever pins the E45.92 / #3627 row:
+// the fixed-size elision-explanation note is tierNever ON PURPOSE (eliding the
+// explanation of an elision is the silent-drop failure the change avoids).
+// Deleting the row reddens TestEveryResponsePathIsClassified; this asserts the
+// classification is tierNever specifically, not merely present.
+func TestImplementReviewsElidedIsClassifiedTierNever(t *testing.T) {
+	row, ok := pathClassificationFor("implement_reviews_elided")
+	if !ok {
+		t.Fatal("implement_reviews_elided is not classified in runStatusPathTable")
+	}
+	if row.Tier != tierNever {
+		t.Errorf("implement_reviews_elided tier = %q, want %q", row.Tier, tierNever)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // class / pointer invariants
 // ---------------------------------------------------------------------------
