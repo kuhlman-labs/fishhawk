@@ -124,8 +124,10 @@ type pullRequestBody struct {
 	//     row accounts for the tree being thrown away.
 	//
 	// Deliberately NOT enforced in validate(): a 400 there would strand the
-	// implement stage in `running`. An unrecognized value is recorded verbatim
-	// and the prompt-side gate refuses it.
+	// implement stage in `running`. An unrecognized value instead records NO
+	// checkpoint of either kind — the retry fails safe to a full agent re-run.
+	// It cannot be laundered onto the legacy pull_request_failed payload, which
+	// carries no kind discriminator and would be served as pr_open.
 	//
 	// CROSS-MODULE WIRE CONTRACT: the json tag (resume_kind) MUST stay
 	// byte-identical to the runner's upload.pullRequestFailureBody.ResumeKind.
@@ -1671,8 +1673,19 @@ func (s *Server) failPullRequestStage(w http.ResponseWriter, r *http.Request, ru
 	// only the verified_tree_discarded accounting row. Both are handled below,
 	// AFTER this entry is appended, so this payload keeps exactly the shape it
 	// had before #3621 on every legacy path.
+	//
+	// THE GUARD IS AN ALLOW-LIST ON THE EMPTY KIND, not a deny-list of the two
+	// known ones. This payload carries NO kind discriminator, so anything
+	// recorded here is served as pr_open by newestPushCheckpoint, which derives
+	// the kind from the CATEGORY alone. A deny-list would therefore LAUNDER any
+	// FUTURE/unknown non-empty kind — emitted by a runner NEWER than this
+	// backend — into a pr_open resume, and the prompt-side unknown-kind arm
+	// could never fire to refuse it: it only ever sees pr_open or push. An
+	// unrecognized kind records NOTHING here and no checkpoint anywhere, so the
+	// retry fails SAFE to a full agent re-run rather than opening a PR on a
+	// branch whose push this backend cannot vouch for.
 	if pr.Outcome == "failed" && pr.Branch != "" && pr.HeadSHA != "" &&
-		pr.ResumeKind != resumeKindPush && pr.ResumeKind != resumeKindPushDiscarded {
+		pr.ResumeKind == "" {
 		checkpoint := map[string]any{
 			"branch":            pr.Branch,
 			"head_sha":          pr.HeadSHA,

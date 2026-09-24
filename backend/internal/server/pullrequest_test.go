@@ -3925,3 +3925,50 @@ func TestPullRequestFailed_PushDiscardedAuditsTheTree(t *testing.T) {
 		t.Errorf("the discard row must name the tree SHA, got %s", discarded[0].Payload)
 	}
 }
+
+// TestPullRequestFailed_UnknownKindRecordsNoCheckpoint pins the fail-safe on a
+// FUTURE/unknown non-empty resume_kind — a runner newer than this backend
+// emitting a kind this backend never advertised support for.
+//
+// The legacy pull_request_failed payload carries NO kind discriminator, so
+// anything recorded there is served as pr_open by newestPushCheckpoint, which
+// derives the kind from the CATEGORY alone; and the prompt-side unknown-kind
+// arm can never fire for it. So a deny-list guard (`!= push && !=
+// push_discarded`) would LAUNDER an unknown kind into a PR-open resume — the
+// wrong-commit shape this change exists to prevent. The guard is therefore an
+// allow-list on the EMPTY kind, and this test asserts an unknown kind produces
+// no serviceable checkpoint of EITHER carrier.
+func TestPullRequestFailed_UnknownKindRecordsNoCheckpoint(t *testing.T) {
+	for _, kind := range []string{"push_deferred", "PUSH", "push ", "future_kind_v9"} {
+		t.Run(kind, func(t *testing.T) {
+			body, err := json.Marshal(map[string]any{
+				"outcome": "failed", "category": "C", "reason": "commit+push: gitops: push origin: 503",
+				"branch": "fishhawk/run-3621/stage-abc", "head_sha": "headsha3621",
+				"base_sha": "basesha3621", "verified_tree_sha": "treesha3621",
+				"resume_kind": kind,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			entries := prFailedAllEntries(t, body)
+
+			failed := entriesByCategory(entries, "pull_request_failed")
+			if len(failed) != 1 {
+				t.Fatalf("want exactly one pull_request_failed entry, got %d", len(failed))
+			}
+			var legacy map[string]json.RawMessage
+			if err := json.Unmarshal(failed[0].Payload, &legacy); err != nil {
+				t.Fatal(err)
+			}
+			if raw, ok := legacy["push_checkpoint"]; ok {
+				t.Errorf("an unrecognized resume_kind %q must record NO push_checkpoint on "+
+					"pull_request_failed (that payload has no kind discriminator, so the "+
+					"resolver would serve it as pr_open), got %s", kind, raw)
+			}
+			if cps := entriesByCategory(entries, CategoryPushResumeCheckpoint); len(cps) != 0 {
+				t.Errorf("an unrecognized resume_kind %q must arm no push-kind checkpoint either, got %+v",
+					kind, cps)
+			}
+		})
+	}
+}

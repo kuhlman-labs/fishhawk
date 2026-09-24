@@ -3764,9 +3764,11 @@ components:
             `push_discarded` means a preserved push checkpoint was PERMANENTLY
             refused at consume time: no checkpoint is recorded and a
             `verified_tree_discarded` audit row accounts for the thrown-away
-            tree. An unrecognized value is recorded verbatim and refused by the
-            prompt-side gate; it is never a 400 (that would strand the
-            implement stage in `running`).
+            tree. An unrecognized value records NO checkpoint of either kind —
+            not even the legacy `pull_request_failed` one, which carries no kind
+            discriminator and would be served as `pr_open` — so the retry fails
+            safe to a full agent re-run; it is never a 400 (that would strand
+            the implement stage in `running`).
 
             `acceptance_scenarios_pushed` (E72.4 / #3328) reports the
             ACCEPTANCE runner's post-verdict scenario-corpus commit — new
@@ -3897,8 +3899,10 @@ components:
             NOT as this entry's `push_checkpoint`. `push_discarded`: a
             preserved push checkpoint was permanently refused at consume time;
             no checkpoint is recorded and a `verified_tree_discarded` row
-            accounts for the tree. An unrecognized value is recorded verbatim
-            and refused by the prompt-side gate — never a 400.
+            accounts for the tree. An unrecognized value records NO checkpoint
+            of either kind (not even the legacy `push_checkpoint`, which has no
+            kind discriminator), so the retry fails safe to a full agent re-run
+            — never a 400.
         pr_body_fallback_reason:
           type: string
           enum:
