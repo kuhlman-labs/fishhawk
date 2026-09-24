@@ -265,6 +265,26 @@ five protected PARK states (`awaiting_children`, `awaiting_approval`,
 can never destroy a live park; if you get that refusal, the stage is parked and
 needs the park's own verb, not a reap.
 
+For a `runner_kind:local` run the verb probes this host and **refuses** if a
+runner is still alive — wait for it to settle instead. For a
+`github_actions` / `gitlab_ci` run it reports `runner_liveness:"unknown"` with a
+warning: a host-local process probe says nothing about a remote runner, so
+confirm on the CI side before reaping.
+
+It also re-reads the stage state and re-probes immediately before the POST, and
+refuses if the stage moved (`"it moved from ... to ..."`) or a runner appeared in
+between — a concurrent dispatch racing the reap. On that refusal, re-read the
+stage with `fishhawk_get_run_status` and re-invoke only if it is still stranded.
+That check narrows the race but does not eliminate it: **do not run a dispatch
+of the same stage concurrently with a reap of it.**
+
+**Do NOT reach for `fishhawk_cancel_run` here — on a decomposition child it
+wedges the parent permanently.** `fishhawk_consolidate_slices` requires every
+child to have SUCCEEDED, and a cancelled child never can; nothing un-cancels a
+run. The verb now refuses a decomposition child (and refuses when it cannot read
+the run row to tell), with `orphan_parent_ok:true` as the deliberate,
+disclosed-in-the-output override.
+
 ### What a retry actually reaches (`fishhawk_retry_stage`, [E45.89 / #3624](https://github.com/kuhlman-labs/fishhawk/issues/3624))
 
 `fishhawk_retry_stage` **never spawns a runner.** It re-opens the stage and hands
@@ -289,26 +309,6 @@ re-opened at a gate, or when the state is unrecognised). A `warnings` entry mean
 the run row could not be read, so the decomposition-child check was skipped and
 `next_step` names `fishhawk_dispatch_stage` — prefer `fishhawk_run_children` if
 the stage belongs to a decomposed child.
-
-For a `runner_kind:local` run the verb probes this host and **refuses** if a
-runner is still alive — wait for it to settle instead. For a
-`github_actions` / `gitlab_ci` run it reports `runner_liveness:"unknown"` with a
-warning: a host-local process probe says nothing about a remote runner, so
-confirm on the CI side before reaping.
-
-It also re-reads the stage state and re-probes immediately before the POST, and
-refuses if the stage moved (`"it moved from ... to ..."`) or a runner appeared in
-between — a concurrent dispatch racing the reap. On that refusal, re-read the
-stage with `fishhawk_get_run_status` and re-invoke only if it is still stranded.
-That check narrows the race but does not eliminate it: **do not run a dispatch
-of the same stage concurrently with a reap of it.**
-
-**Do NOT reach for `fishhawk_cancel_run` here — on a decomposition child it
-wedges the parent permanently.** `fishhawk_consolidate_slices` requires every
-child to have SUCCEEDED, and a cancelled child never can; nothing un-cancels a
-run. The verb now refuses a decomposition child (and refuses when it cannot read
-the run row to tell), with `orphan_parent_ok:true` as the deliberate,
-disclosed-in-the-output override.
 
 ### Decomposed-parent native path (`fishhawk_run_children` / `fishhawk_consolidate_slices`)
 
