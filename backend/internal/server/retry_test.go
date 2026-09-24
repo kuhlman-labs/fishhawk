@@ -1834,3 +1834,145 @@ func TestRetryStage_ConcernSupersedeBestEffort(t *testing.T) {
 		t.Errorf("no stage_retried audit entry written; retry intent lost")
 	}
 }
+
+// --- E45.86 / #3621: the retry-side resume gate and the discard row ---------
+
+// checkpointRetryAudit serves checkpoint entries to newestPushCheckpoint while
+// keeping approvalAuditFake's append capture. The embedded fake's
+// ListForRunByCategory ERRORS (which is why every pre-#3621 retry test — the
+// #3593 supersede control included — sees checkpointNone and supersedes exactly
+// as before); this shadows it for the tests that need a checkpoint.
+type checkpointRetryAudit struct {
+	*approvalAuditFake
+	entries []*audit.Entry
+}
+
+func (a *checkpointRetryAudit) ListForRunByCategory(_ context.Context, _ uuid.UUID, category string) ([]*audit.Entry, error) {
+	var out []*audit.Entry
+	for _, e := range a.entries {
+		if e.Category == category {
+			out = append(out, e)
+		}
+	}
+	return out, nil
+}
+
+func retryCheckpointEntry(stageID uuid.UUID, category string, seq int64, payload string) *audit.Entry {
+	id := stageID
+	return &audit.Entry{Sequence: seq, StageID: &id, Category: category, Payload: []byte(payload)}
+}
+
+// retryWithCheckpointState drives the REAL retry handler for a failed implement
+// stage carrying one open implement-review concern, with the given audit
+// entries in the chain. It returns the concern's state after the handler
+// returns — READ BACK from the repository, not inferred — plus every appended
+// audit entry.
+func retryWithCheckpointState(t *testing.T, entries func(stageID uuid.UUID) []*audit.Entry) (concern.State, []audit.ChainAppendParams) {
+	t.Helper()
+	rr := newOrchestratorRepo()
+	r := rr.seedRun()
+	r.State = run.StateFailed
+	implement := rr.seedStage(r.ID, 0, run.StageStateFailed)
+	implement.Type = run.StageTypeImplement
+	implement.SelfRetryCount = 1
+	cat := run.FailureC
+	reason := "commit+push: gitops: push origin: 503"
+	implement.FailureCategory = &cat
+	implement.FailureReason = &reason
+
+	cr := newFakeConcernRepo()
+	c := seedConcernRow(t, cr, r.ID, implement.ID, concern.StageKindImplement, 10, "impl concern")
+
+	base := newApprovalAuditFake()
+	au := &checkpointRetryAudit{approvalAuditFake: base, entries: entries(implement.ID)}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au, ConcernRepo: cr})
+
+	w := postRetry(t, s, implement.ID)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	base.mu.Lock()
+	defer base.mu.Unlock()
+	return concernState(t, cr, c.ID), append([]audit.ChainAppendParams(nil), base.appended...)
+}
+
+func retryDiscardRows(appended []audit.ChainAppendParams) []audit.ChainAppendParams {
+	var out []audit.ChainAppendParams
+	for _, e := range appended {
+		if e.Category == "verified_tree_discarded" {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// TestRetryStage_ResumePending_DoesNotSupersedeConcerns: when the next dispatch
+// will RESUME from a held tree, the prior round's concerns still describe the
+// tree about to be pushed, so superseding them would delete a live review
+// round. The assertion READS THE CONCERN BACK after the handler returns — the
+// control's effect is committed state, so error identity would not discriminate.
+func TestRetryStage_ResumePending_DoesNotSupersedeConcerns(t *testing.T) {
+	for _, kind := range []string{"pr_open", "push"} {
+		t.Run(kind, func(t *testing.T) {
+			state, appended := retryWithCheckpointState(t, func(sid uuid.UUID) []*audit.Entry {
+				cp := `{"push_checkpoint":{"branch":"b","head_sha":"h","base_sha":"base","verified_tree_sha":"tree3621"}}`
+				if kind == "push" {
+					return []*audit.Entry{
+						retryCheckpointEntry(sid, "pull_request_failed", 7, `{"category":"C"}`),
+						retryCheckpointEntry(sid, CategoryPushResumeCheckpoint, 8, cp),
+					}
+				}
+				return []*audit.Entry{retryCheckpointEntry(sid, "pull_request_failed", 7, cp)}
+			})
+			if state != concern.StateRaised {
+				t.Errorf("concern state = %q, want raised (a resumable retry must not supersede)", state)
+			}
+			if rows := retryDiscardRows(appended); len(rows) != 0 {
+				t.Errorf("a resumable retry discards nothing, so it must write no verified_tree_discarded row, got %+v", rows)
+			}
+		})
+	}
+}
+
+// TestRetryStage_NoResume_SupersedesAndAuditsTheDiscard is the other half: with
+// the checkpoint SUPERSEDED, the retry is a full agent re-run, so the concerns
+// go with the tree AND exactly one verified_tree_discarded row accounts for it.
+func TestRetryStage_NoResume_SupersedesAndAuditsTheDiscard(t *testing.T) {
+	state, appended := retryWithCheckpointState(t, func(sid uuid.UUID) []*audit.Entry {
+		return []*audit.Entry{
+			retryCheckpointEntry(sid, "pull_request_failed", 7,
+				`{"push_checkpoint":{"branch":"b","head_sha":"h","base_sha":"base","verified_tree_sha":"tree3621"}}`),
+			// A NEWER invalidator: the PR opened, so the checkpoint is stale.
+			retryCheckpointEntry(sid, "pull_request_opened", 8, `{}`),
+		}
+	})
+	if state != concern.StateSuperseded {
+		t.Errorf("concern state = %q, want superseded (a discarding retry supersedes as before)", state)
+	}
+	rows := retryDiscardRows(appended)
+	if len(rows) != 1 {
+		t.Fatalf("want exactly one verified_tree_discarded row, got %d (%+v)", len(rows), appended)
+	}
+	if !strings.Contains(string(rows[0].Payload), "tree3621") {
+		t.Errorf("the discard row must name the tree SHA, got %s", rows[0].Payload)
+	}
+	if !strings.Contains(string(rows[0].Payload), checkpointSuperseded) {
+		t.Errorf("the discard row must name why the resume did not apply, got %s", rows[0].Payload)
+	}
+}
+
+// TestRetryStage_NoRecordedTree_WritesNoDiscardRow: an ordinary pre-push
+// failure recorded no verified tree, so there is nothing to account for and the
+// row must be inert — otherwise every routine retry would spam the chain.
+func TestRetryStage_NoRecordedTree_WritesNoDiscardRow(t *testing.T) {
+	state, appended := retryWithCheckpointState(t, func(sid uuid.UUID) []*audit.Entry {
+		return []*audit.Entry{retryCheckpointEntry(sid, "pull_request_failed", 7,
+			`{"category":"B","reason":"commit would not compile"}`)}
+	})
+	if state != concern.StateSuperseded {
+		t.Errorf("concern state = %q, want superseded", state)
+	}
+	if rows := retryDiscardRows(appended); len(rows) != 0 {
+		t.Errorf("no recorded verified tree means no discard row, got %+v", rows)
+	}
+}

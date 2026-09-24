@@ -10905,7 +10905,7 @@ func TestResolvePushCheckpointResume_NilAuditRepo(t *testing.T) {
 func TestResolvePushCheckpointResume_NonImplementStage(t *testing.T) {
 	s, runRow, stage := checkpointGateFixture(t, []*audit.Entry{checkpointFailedEntry(7)})
 	stage.Type = run.StageTypeReview
-	if _, ok := s.resolvePushCheckpointResume(context.Background(), runRow, stage, false); ok {
+	if _, ok := s.resolvePushCheckpointResume(context.Background(), runRow, stage, false, true, false); ok {
 		t.Error("a non-implement stage must never resume")
 	}
 }
@@ -10914,10 +10914,10 @@ func TestResolvePushCheckpointResume_FixupDispatch(t *testing.T) {
 	s, runRow, stage := checkpointGateFixture(t, []*audit.Entry{checkpointFailedEntry(7)})
 	// Control: the SAME state without the fixup flag DOES resolve, so the RED
 	// below lands on the fixup guard rather than on a broken fixture.
-	if _, ok := s.resolvePushCheckpointResume(context.Background(), runRow, stage, false); !ok {
+	if _, ok := s.resolvePushCheckpointResume(context.Background(), runRow, stage, false, true, false); !ok {
 		t.Fatal("fixture must resolve a checkpoint on a non-fixup dispatch")
 	}
-	if _, ok := s.resolvePushCheckpointResume(context.Background(), runRow, stage, true); ok {
+	if _, ok := s.resolvePushCheckpointResume(context.Background(), runRow, stage, true, true, false); ok {
 		t.Error("a fix-up dispatch must re-invoke the agent, never take the resume short-circuit")
 	}
 }
@@ -10925,7 +10925,7 @@ func TestResolvePushCheckpointResume_FixupDispatch(t *testing.T) {
 // TestResolvePushCheckpointResume_NilStage: the nil guard.
 func TestResolvePushCheckpointResume_NilStage(t *testing.T) {
 	s, runRow, _ := checkpointGateFixture(t, []*audit.Entry{checkpointFailedEntry(7)})
-	if _, ok := s.resolvePushCheckpointResume(context.Background(), runRow, nil, false); ok {
+	if _, ok := s.resolvePushCheckpointResume(context.Background(), runRow, nil, false, true, false); ok {
 		t.Error("a nil stage must never resume")
 	}
 }
@@ -14341,4 +14341,263 @@ func TestGetStagePrompt_EchoesStageAttemptToken(t *testing.T) {
 			t.Errorf("a nil dispatched_at must omit stage_attempt entirely:\n%s", w.Body.String())
 		}
 	})
+}
+
+// ---------------------------------------------------------------------------
+// PUSH-FAILURE RESUME (E45.86 / #3621): the capability handshake, the separate
+// checkpoint category, and the audited decline.
+// ---------------------------------------------------------------------------
+
+const checkpointVerifiedTree = "6666666666666666666666666666666666666666"
+
+// pushCheckpointEntry is a push_resume_checkpoint audit entry — the SEPARATE
+// category a push-kind checkpoint is recorded under. Its pull_request_failed
+// sibling deliberately carries NO push_checkpoint, which is what makes the
+// old resolver blind to it.
+func pushCheckpointEntry(seq int64) *audit.Entry {
+	return scopeDecisionEntryPayload(uuid.Nil, CategoryPushResumeCheckpoint, seq, `{
+		"resume_kind":"push",
+		"push_checkpoint":{"branch":"`+checkpointBranch+`","head_sha":"`+checkpointHeadSHA+
+		`","base_sha":"`+checkpointBaseSHA+`","verified_tree_sha":"`+checkpointVerifiedTree+`"}}`)
+}
+
+// prePushFailedEntry is the pull_request_failed entry that accompanies a
+// push-kind checkpoint: a failure record with NO push_checkpoint at all.
+func prePushFailedEntry(seq int64) *audit.Entry {
+	return scopeDecisionEntryPayload(uuid.Nil, "pull_request_failed", seq,
+		`{"category":"C","reason":"commit+push: gitops: push origin: 503"}`)
+}
+
+// TestResumeKindWireValues is the backend half of the cross-module constant
+// pin: no compiler binds these strings across the module boundary, so both
+// sides assert them against the SAME literals (the runner half is
+// runner/cmd/fishhawk-runner's TestResumeKindWireValues).
+func TestResumeKindWireValues(t *testing.T) {
+	for _, tc := range []struct{ got, want, name string }{
+		{resumeKindPROpen, "pr_open", "resumeKindPROpen"},
+		{resumeKindPush, "push", "resumeKindPush"},
+		{resumeKindPushDiscarded, "push_discarded", "resumeKindPushDiscarded"},
+		{runnerCapabilitiesHeader, "X-Fishhawk-Runner-Capabilities", "runnerCapabilitiesHeader"},
+		{capabilityPushResume, "push-resume", "capabilityPushResume"},
+		{CategoryPushResumeCheckpoint, "push_resume_checkpoint", "CategoryPushResumeCheckpoint"},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("%s = %q, want %q", tc.name, tc.got, tc.want)
+		}
+	}
+}
+
+// TestLegacyPROpenResolver_BlindToPushCheckpoint is operator condition 1's
+// ROLLBACK proof. It re-implements the PRE-CHANGE resolver's query EXACTLY —
+// walk pull_request_failed, read push_checkpoint off the newest one — and
+// asserts it finds NOTHING when only a push-kind checkpoint exists. That is
+// what guarantees a reverted backend can never serve a never-pushed commit as
+// a pr_open checkpoint and send a retry to open a PR from it.
+func TestLegacyPROpenResolver_BlindToPushCheckpoint(t *testing.T) {
+	entries := []*audit.Entry{prePushFailedEntry(7), pushCheckpointEntry(8)}
+	// The pre-change resolver's query, verbatim in shape.
+	var newestFailed *audit.Entry
+	for _, e := range entries {
+		if e.Category == "pull_request_failed" && (newestFailed == nil || e.Sequence > newestFailed.Sequence) {
+			newestFailed = e
+		}
+	}
+	if newestFailed == nil {
+		t.Fatal("fixture must carry a pull_request_failed entry, or the assertion below is vacuous")
+	}
+	var payload struct {
+		PushCheckpoint *struct {
+			HeadSHA string `json:"head_sha"`
+		} `json:"push_checkpoint"`
+	}
+	if err := json.Unmarshal(newestFailed.Payload, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.PushCheckpoint != nil {
+		t.Fatalf("the PRE-CHANGE resolver must find NO checkpoint when only a push-kind one exists, got head %q",
+			payload.PushCheckpoint.HeadSHA)
+	}
+	// Control: the NEW resolver DOES find it, so the assertion above is a
+	// statement about the old query rather than about an empty fixture.
+	s, runRow, stage := checkpointGateFixture(t, entries)
+	held, ok := s.resolvePushCheckpointResume(context.Background(), runRow, stage, false, true, false)
+	if !ok || held.resumeKind != resumeKindPush {
+		t.Fatalf("the new resolver must serve the push checkpoint, got ok=%t kind=%q", ok, held.resumeKind)
+	}
+}
+
+// TestPushResume_NotServedToUnadvertisingRunner is operator condition 1's
+// forward half AND condition 2's audited-decline half, on the REAL handler: a
+// prompt fetch with NO capability header against a complete push-kind
+// checkpoint gets NO held-commit fields at all — so a silent degrade to
+// pr_open is red too — and the decline writes a verified_tree_discarded row
+// naming the tree.
+func TestPushResume_NotServedToUnadvertisingRunner(t *testing.T) {
+	var au *exemptAuditFake
+	s, runID, stageID, priv := exemptPromptFixture(t, nil, func(sid uuid.UUID) audit.Repository {
+		au = &exemptAuditFake{}
+		for _, e := range []*audit.Entry{prePushFailedEntry(7), pushCheckpointEntry(8)} {
+			id := sid
+			e.StageID = &id
+			au.entries = append(au.entries, e)
+		}
+		return au
+	})
+	keys := exemptBodyKeys(t, promptRequest(t, s, runID, stageID, priv, ""), "/prompt")
+	assertNoResumeEmission(t, keys, "an unadvertising runner must be served NO held-commit fields")
+	if raw, ok := keys["held_commit_verified_tree_sha"]; ok {
+		t.Errorf("held_commit_verified_tree_sha must be ABSENT on a decline, got %s", raw)
+	}
+	// Condition 2: the discard is AUDITED at the decline point.
+	var found *audit.ChainAppendParams
+	for i := range au.appended {
+		if au.appended[i].Category == "verified_tree_discarded" {
+			found = &au.appended[i]
+		}
+	}
+	if found == nil {
+		t.Fatalf("declining a preserved push checkpoint must append verified_tree_discarded, got %+v", au.appended)
+	}
+	if !strings.Contains(string(found.Payload), checkpointVerifiedTree) {
+		t.Errorf("the discard row must name the tree SHA, got %s", found.Payload)
+	}
+	if !strings.Contains(string(found.Payload), "runner_capability_absent") {
+		t.Errorf("the discard row must name the reason, got %s", found.Payload)
+	}
+}
+
+// TestPushResume_ServedToAdvertisingRunner is the positive control for the gate
+// above: the SAME state WITH the capability header serves the push kind and its
+// verified tree, and writes NO discard row.
+func TestPushResume_ServedToAdvertisingRunner(t *testing.T) {
+	var au *exemptAuditFake
+	s, _, stageID, priv := exemptPromptFixture(t, nil, func(sid uuid.UUID) audit.Repository {
+		au = &exemptAuditFake{}
+		for _, e := range []*audit.Entry{prePushFailedEntry(7), pushCheckpointEntry(8)} {
+			id := sid
+			e.StageID = &id
+			au.entries = append(au.entries, e)
+		}
+		return au
+	})
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/v0/stages/%s/prompt", stageID), nil)
+	req.Header.Set("X-Fishhawk-Signature", hex.EncodeToString(ed25519.Sign(priv, PromptCanonicalMessage(stageID))))
+	req.Header.Set(runnerCapabilitiesHeader, "some-other-token, "+capabilityPushResume)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	keys := exemptBodyKeys(t, w, "/prompt")
+	for key, want := range map[string]string{
+		"held_commit_resume_kind":       `"push"`,
+		"held_commit_sha":               `"` + checkpointHeadSHA + `"`,
+		"held_commit_verified_tree_sha": `"` + checkpointVerifiedTree + `"`,
+		"supports_push_resume":          `true`,
+	} {
+		raw, ok := keys[key]
+		if !ok {
+			t.Errorf("%s must be emitted to an advertising runner", key)
+			continue
+		}
+		if string(raw) != want {
+			t.Errorf("%s = %s, want %s", key, raw, want)
+		}
+	}
+	for _, p := range au.appended {
+		if p.Category == "verified_tree_discarded" {
+			t.Errorf("a SERVED resume must write no discard row, got %s", p.Payload)
+		}
+	}
+}
+
+// TestResolvePushCheckpointResume_PROpenUnaffectedByCapability pins the #2169
+// path byte-for-byte: an absent resume_kind is the pr_open kind and is served
+// whether or not the runner advertised, because every pre-existing checkpoint
+// is a post-push one.
+func TestResolvePushCheckpointResume_PROpenUnaffectedByCapability(t *testing.T) {
+	for _, advertises := range []bool{true, false} {
+		s, runRow, stage := checkpointGateFixture(t, []*audit.Entry{checkpointFailedEntry(7)})
+		held, ok := s.resolvePushCheckpointResume(context.Background(), runRow, stage, false, advertises, false)
+		if !ok {
+			t.Fatalf("advertises=%t: the pr_open resume must be unaffected by the capability flag", advertises)
+		}
+		if held.resumeKind != resumeKindPROpen {
+			t.Errorf("advertises=%t: resumeKind = %q, want %q", advertises, held.resumeKind, resumeKindPROpen)
+		}
+		if held.verifiedTreeSHA != "" {
+			t.Errorf("advertises=%t: a pr_open resume must serve no verified tree, got %q", advertises, held.verifiedTreeSHA)
+		}
+	}
+}
+
+// TestResolvePushCheckpointResume_PushKindRefusals covers the remaining named
+// decline branches, each by its observable outcome: no resume at all.
+func TestResolvePushCheckpointResume_PushKindRefusals(t *testing.T) {
+	cases := []struct {
+		name    string
+		entries []*audit.Entry
+	}{
+		{
+			name: "push_without_verified_tree",
+			entries: []*audit.Entry{
+				prePushFailedEntry(7),
+				scopeDecisionEntryPayload(uuid.Nil, CategoryPushResumeCheckpoint, 8, `{
+					"resume_kind":"push",
+					"push_checkpoint":{"branch":"`+checkpointBranch+`","head_sha":"`+checkpointHeadSHA+
+					`","base_sha":"`+checkpointBaseSHA+`"}}`),
+			},
+		},
+		{
+			name: "push_checkpoint_superseded_by_pr_opened",
+			entries: []*audit.Entry{
+				prePushFailedEntry(7), pushCheckpointEntry(8),
+				scopeDecisionEntry(uuid.Nil, "pull_request_opened", 9),
+			},
+		},
+		{
+			name: "push_checkpoint_incomplete",
+			entries: []*audit.Entry{
+				prePushFailedEntry(7),
+				scopeDecisionEntryPayload(uuid.Nil, CategoryPushResumeCheckpoint, 8, `{
+					"resume_kind":"push",
+					"push_checkpoint":{"branch":"`+checkpointBranch+`","head_sha":"`+checkpointHeadSHA+
+					`","verified_tree_sha":"`+checkpointVerifiedTree+`"}}`),
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, runRow, stage := checkpointGateFixture(t, tc.entries)
+			if _, ok := s.resolvePushCheckpointResume(context.Background(), runRow, stage, false, true, false); ok {
+				t.Error("must refuse")
+			}
+		})
+	}
+}
+
+// TestRunnerAdvertises pins the header parse: comma-separated, space-trimmed,
+// case-sensitive, and absent/nil is false so every old runner and non-runner
+// caller is treated as not advertising.
+func TestRunnerAdvertises(t *testing.T) {
+	for _, tc := range []struct {
+		header string
+		want   bool
+	}{
+		{"", false},
+		{"push-resume", true},
+		{" push-resume ", true},
+		{"a,push-resume,b", true},
+		{"a, push-resume", true},
+		{"Push-Resume", false},
+		{"push-resume-v2", false},
+	} {
+		r := httptest.NewRequest(http.MethodGet, "/", nil)
+		if tc.header != "" {
+			r.Header.Set(runnerCapabilitiesHeader, tc.header)
+		}
+		if got := runnerAdvertises(r, capabilityPushResume); got != tc.want {
+			t.Errorf("runnerAdvertises(%q) = %t, want %t", tc.header, got, tc.want)
+		}
+	}
+	if runnerAdvertises(nil, capabilityPushResume) {
+		t.Error("a nil request must not advertise")
+	}
 }

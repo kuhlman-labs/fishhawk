@@ -340,6 +340,7 @@ var KnownCategories = map[string]struct{}{
 	"product_report_filed":                    {},
 	"pull_request_closed_after_review_reject": {},
 	"pull_request_failed":                     {},
+	"push_resume_checkpoint":                  {},
 	"pull_request_opened":                     {},
 	"refinement_draft_approved":               {},
 	"refinement_draft_edited":                 {},
@@ -389,6 +390,7 @@ var KnownCategories = map[string]struct{}{
 	"status_comment_posted":                   {},
 	"trace_uploaded":                          {},
 	"unpriced_model_alert":                    {},
+	"verified_tree_discarded":                 {},
 	"work_item_filed":                         {},
 	"work_item_transitioned":                  {},
 }

@@ -490,3 +490,17 @@ func TestKnownCategories_MergeObservationRecorded(t *testing.T) {
 		t.Fatal("merge_observation_recorded is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
 	}
 }
+
+// TestKnownCategories_PushResumeE45_86 pins the two categories E45.86 / #3621
+// adds. Registration is not cosmetic: the committed-tree verify gate's
+// TestKnownCategoriesCoversEmittedCategories fails on an emitted-but-
+// unregistered category, and push_resume_checkpoint in particular is
+// load-bearing — it is the SEPARATE carrier that keeps a never-pushed commit
+// invisible to a reverted backend's pr_open resolver.
+func TestKnownCategories_PushResumeE45_86(t *testing.T) {
+	for _, c := range []string{"push_resume_checkpoint", "verified_tree_discarded"} {
+		if !IsKnownCategory(c) {
+			t.Errorf("category %q must be registered in categories.go", c)
+		}
+	}
+}

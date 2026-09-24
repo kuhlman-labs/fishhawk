@@ -892,6 +892,10 @@ Beside the fix-up self-report above, EVERY implement pass kind (initial, decompo
 
 The acceptance stage replays previously recorded scenarios (`acceptance/scenarios/**`) FIRST against each new preview head, then records this pass's drivable passes and merges approved retirements into `acceptance/scenarios/retired.yaml`, committing ONLY that directory onto the run branch after the verdict ships. Knobs (runner-process env, never agent env): `FISHHAWK_ACCEPTANCE_REPLAY_MAX_SCENARIOS` (default 25, `0` disables) and `FISHHAWK_ACCEPTANCE_REPLAY_TIME_CAP_SECS` (default 600). A served retirement that cannot be persisted is reported as `acceptance_scenario_retirement_dropped` on every exit path after the prompt fetch. Contract: `runner/cmd/fishhawk-runner/README.md` § "Replayable scenario corpus"; operator view: `docs/acceptance-preview.md`.
 
+## Zero-re-run resumes (#1231 exempt, #2169 PR-open, E45.86 / [#3621](https://github.com/kuhlman-labs/fishhawk/issues/3621) push-failure)
+
+Three recoveries reach the pre-agent short-circuit and open the PR from a commit the stage already produced, so no agent is re-invoked. The newest, the PUSH-FAILURE resume, covers the case where `CommitAndPush` made the gate-verified commit and only the transport failed: the commit exists on the runner's disk and NOT on the remote, so the resume PUBLISHES it (non-clobber ancestry check, `gitops.PushCommittedBranch`) and then opens the PR. It rides a BIDIRECTIONAL capability handshake — `X-Fishhawk-Runner-Capabilities: push-resume` outbound, `supports_push_resume` inbound — and its checkpoint is recorded under its OWN `push_resume_checkpoint` audit category so a REVERTED backend can never read a never-pushed commit as a `pr_open` checkpoint. A refusal is a NAMED token (permanent tokens discard and audit the verified tree; transient ones re-arm). Long-form contract, the five arming preconditions, the four consume guards and both skew directions: `runner/cmd/fishhawk-runner/README.md` § "Push-failure resume".
+
 ## Releases
 
 The release workflow at `.github/workflows/runner-release.yml` triggers on tags matching `runner/v*`. To cut a release:

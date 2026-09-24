@@ -6611,3 +6611,78 @@ func TestRunOutEnv_NoCredential_FailsFastNotPrompt(t *testing.T) {
 		t.Errorf("error = %v\nwant git's `terminal prompts disabled` wording, which is emitted only under GIT_TERMINAL_PROMPT=0", err)
 	}
 }
+
+// TestCommitAndPush_PushTransportFailureNamesErrPushFailed pins the E45.86 /
+// #3621 sentinel at the seam that matters: when the gate-verified commit is
+// made and only `git push` fails, the caller must be able to tell that apart
+// from every pre-commit failure, because that is the difference between a
+// resumable tree and no tree at all.
+//
+// The message is asserted too: the sentinel is joined via a multi-error Unwrap
+// precisely so the "gitops: push <remote>:" prefix stays byte-identical and no
+// existing assertion on it moves.
+func TestCommitAndPush_PushTransportFailureNamesErrPushFailed(t *testing.T) {
+	repo := t.TempDir()
+	runGitT(t, repo, "init", "--initial-branch=main")
+	runGitT(t, repo, "config", "user.name", "t")
+	runGitT(t, repo, "config", "user.email", "t@example.com")
+	runGitT(t, repo, "config", "commit.gpgsign", "false")
+	if err := os.WriteFile(filepath.Join(repo, "a.txt"), []byte("base\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGitT(t, repo, "add", "-A")
+	runGitT(t, repo, "commit", "-m", "base")
+	if err := os.WriteFile(filepath.Join(repo, "a.txt"), []byte("agent edit\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// A remote URL that exists as a path but is NOT a repository: the commit is
+	// made, the lease observation finds no ref, and the PUSH is what fails.
+	notARepo := t.TempDir()
+	_, err := (&Pusher{}).CommitAndPush(context.Background(), CommitAndPushArgs{
+		RepoDir:       repo,
+		Branch:        "fishhawk/run-3621/stage-1",
+		CommitMessage: "held commit",
+		RemoteURL:     notARepo,
+	})
+	if err == nil {
+		t.Fatal("want a push failure")
+	}
+	if !errors.Is(err, ErrPushFailed) {
+		t.Fatalf("push transport failure must satisfy errors.Is(err, ErrPushFailed): %v", err)
+	}
+	if !strings.HasPrefix(err.Error(), "gitops: push ") {
+		t.Errorf("the push error text must be unchanged, got %q", err.Error())
+	}
+	// The commit IS local — that is what makes the failure resumable at all.
+	if out, gerr := exec.Command("git", "-C", repo, "rev-parse", "HEAD^{tree}").Output(); gerr != nil || len(out) == 0 {
+		t.Fatalf("the gate-verified commit must exist locally after a push failure: %v", gerr)
+	}
+}
+
+// TestCommitAndPush_NonPushFailureIsNotErrPushFailed is the other half: a
+// failure that is NOT the push transport must NOT claim the sentinel, or a
+// pre-commit abort would let a retry claim a resumable branch that does not
+// exist. A non-existent RepoDir cannot reach the push at all.
+func TestCommitAndPush_NonPushFailureIsNotErrPushFailed(t *testing.T) {
+	_, err := (&Pusher{}).CommitAndPush(context.Background(), CommitAndPushArgs{
+		RepoDir:       filepath.Join(t.TempDir(), "does-not-exist"),
+		Branch:        "fishhawk/run-3621/stage-1",
+		CommitMessage: "held commit",
+		RemoteURL:     t.TempDir(),
+	})
+	if err == nil {
+		t.Fatal("want a failure")
+	}
+	if errors.Is(err, ErrPushFailed) {
+		t.Fatalf("a pre-push failure must NOT satisfy errors.Is(err, ErrPushFailed): %v", err)
+	}
+}
+
+func runGitT(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+	}
+}

@@ -4249,3 +4249,88 @@ func TestReportRunnerFailure_TruncatesOversizeReason(t *testing.T) {
 		t.Errorf("body = %d bytes, want <= 32 KiB (the backend's maxReapFailureBodyBytes)", len(body))
 	}
 }
+
+// TestFetchPrompt_SendsRunnerCapabilities pins the RUNNER half of the E45.86 /
+// #3621 handshake: the capability header rides EVERY prompt fetch. It is a
+// build-time property, so there is no call shape that omits it — an old runner
+// simply does not have this code.
+func TestFetchPrompt_SendsRunnerCapabilities(t *testing.T) {
+	var gotHeader string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeader = r.Header.Get(RunnerCapabilitiesHeader)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"stage_id":"s","stage_type":"implement","prompt":"hi"}`))
+	}))
+	defer srv.Close()
+
+	_, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := &Client{BaseURL: srv.URL, HTTP: srv.Client()}
+	if _, err := c.FetchPrompt(context.Background(), FetchPromptArgs{StageID: "s", PrivateKey: priv}); err != nil {
+		t.Fatal(err)
+	}
+	if gotHeader != RunnerCapabilitiesValue() {
+		t.Fatalf("capability header = %q, want %q", gotHeader, RunnerCapabilitiesValue())
+	}
+	if !strings.Contains(gotHeader, CapabilityPushResume) {
+		t.Fatalf("capability header %q must advertise %q", gotHeader, CapabilityPushResume)
+	}
+}
+
+// TestFetchPrompt_OldBackendDecodesNoPushResume is the SKEW guard in the
+// backend→runner direction: an old backend omits supports_push_resume and
+// held_commit_verified_tree_sha, which must decode to the zero values. That
+// false is what disables the pre-push arming, so the failure report stays
+// byte-identical against the backend that cannot read it.
+func TestFetchPrompt_OldBackendDecodesNoPushResume(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"stage_id":"s","stage_type":"implement","prompt":"hi"}`))
+	}))
+	defer srv.Close()
+	_, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := &Client{BaseURL: srv.URL, HTTP: srv.Client()}
+	got, err := c.FetchPrompt(context.Background(), FetchPromptArgs{StageID: "s", PrivateKey: priv})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.SupportsPushResume {
+		t.Error("an old backend must decode SupportsPushResume=false")
+	}
+	if got.HeldCommitVerifiedTreeSHA != "" {
+		t.Errorf("HeldCommitVerifiedTreeSHA = %q, want empty", got.HeldCommitVerifiedTreeSHA)
+	}
+}
+
+// TestShipPullRequest_FailureBodyOmitsResumeKindOnLegacyPaths asserts the wire
+// BYTES: with no ResumeKind set, the marshalled failure body carries no
+// resume_kind key at all, so an old backend's DisallowUnknownFields decoder
+// never sees one.
+func TestShipPullRequest_FailureBodyOmitsResumeKindOnLegacyPaths(t *testing.T) {
+	legacy, err := json.Marshal(pullRequestFailureBody{
+		Outcome: "failed", Category: "C", Reason: "forge down",
+		Branch: "b", HeadSHA: "h", BaseSHA: "base", VerifiedTreeSHA: "tree",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(legacy), "resume_kind") {
+		t.Fatalf("a legacy failure body must carry no resume_kind key: %s", legacy)
+	}
+	withKind, err := json.Marshal(pullRequestFailureBody{
+		Outcome: "failed", Category: "C", Reason: "forge down",
+		Branch: "b", HeadSHA: "h", BaseSHA: "base", VerifiedTreeSHA: "tree",
+		ResumeKind: "push",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(withKind), `"resume_kind":"push"`) {
+		t.Fatalf("a push-kind body must carry resume_kind: %s", withKind)
+	}
+}

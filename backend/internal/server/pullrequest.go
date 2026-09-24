@@ -105,6 +105,34 @@ type pullRequestBody struct {
 	// unrecognized value to "unknown" and validate() never rejects on it.
 	PRBodyFallbackReason string `json:"pr_body_fallback_reason,omitempty"`
 
+	// ResumeKind DISCRIMINATES the checkpoint an Outcome=="failed" report carries
+	// (E45.86 / #3621). It MUST be declared here, not merely tolerated: the
+	// handler decodes with DisallowUnknownFields, so an undeclared runner key is
+	// a 400 AFTER the push already failed — the #2562/#2563 stranding shape.
+	//
+	// Three values, and only the two new ones are ever emitted:
+	//   - ABSENT (the legacy value) — no checkpoint, or the #2169 PR-OPEN one.
+	//     Recorded exactly as before, so every pre-#3621 payload is byte-identical.
+	//   - "push" — the gate-verified commit exists LOCALLY and was never
+	//     published. Recorded under its OWN audit category
+	//     (CategoryPushResumeCheckpoint) and DELIBERATELY NOT as this entry's
+	//     push_checkpoint, so a reverted backend's resolver — which knows only
+	//     pull_request_failed — cannot read it as a pr_open checkpoint and send a
+	//     retry to open a PR on a branch that was never pushed.
+	//   - "push_discarded" — a preserved push checkpoint was PERMANENTLY refused
+	//     at consume time. No checkpoint is recorded; a verified_tree_discarded
+	//     row accounts for the tree being thrown away.
+	//
+	// Deliberately NOT enforced in validate(): a 400 there would strand the
+	// implement stage in `running`. An unrecognized value instead records NO
+	// checkpoint of either kind — the retry fails safe to a full agent re-run.
+	// It cannot be laundered onto the legacy pull_request_failed payload, which
+	// carries no kind discriminator and would be served as pr_open.
+	//
+	// CROSS-MODULE WIRE CONTRACT: the json tag (resume_kind) MUST stay
+	// byte-identical to the runner's upload.pullRequestFailureBody.ResumeKind.
+	ResumeKind string `json:"resume_kind,omitempty"`
+
 	// Outcome, Category, and Reason form the optional failure-report
 	// variant (#742). When Outcome=="failed" the body is a runner-reported
 	// commit/push/PR-open failure — no PR was opened, so the PR fields above
@@ -1638,7 +1666,26 @@ func (s *Server) failPullRequestStage(w http.ResponseWriter, r *http.Request, ru
 	// NOT enforced in validate(): a 400 there would strand the implement stage in
 	// `running` until the SLA watchdog reaps it, converting a runner bug into a
 	// hung run. Recording nothing degrades to today's full agent re-run instead.
-	if pr.Outcome == "failed" && pr.Branch != "" && pr.HeadSHA != "" {
+	//
+	// E45.86 / #3621 splits this by kind. A "push" report's coordinates go to a
+	// SEPARATE audit category instead of this payload (see recordPushResume-
+	// Checkpoint), and a "push_discarded" report records no checkpoint at all —
+	// only the verified_tree_discarded accounting row. Both are handled below,
+	// AFTER this entry is appended, so this payload keeps exactly the shape it
+	// had before #3621 on every legacy path.
+	//
+	// THE GUARD IS AN ALLOW-LIST ON THE EMPTY KIND, not a deny-list of the two
+	// known ones. This payload carries NO kind discriminator, so anything
+	// recorded here is served as pr_open by newestPushCheckpoint, which derives
+	// the kind from the CATEGORY alone. A deny-list would therefore LAUNDER any
+	// FUTURE/unknown non-empty kind — emitted by a runner NEWER than this
+	// backend — into a pr_open resume, and the prompt-side unknown-kind arm
+	// could never fire to refuse it: it only ever sees pr_open or push. An
+	// unrecognized kind records NOTHING here and no checkpoint anywhere, so the
+	// retry fails SAFE to a full agent re-run rather than opening a PR on a
+	// branch whose push this backend cannot vouch for.
+	if pr.Outcome == "failed" && pr.Branch != "" && pr.HeadSHA != "" &&
+		pr.ResumeKind == "" {
 		checkpoint := map[string]any{
 			"branch":            pr.Branch,
 			"head_sha":          pr.HeadSHA,
@@ -1676,6 +1723,24 @@ func (s *Server) failPullRequestStage(w http.ResponseWriter, r *http.Request, ru
 			slog.String("error", err.Error()))
 	}
 
+	// E45.86 / #3621, AFTER the pull_request_failed entry so the checkpoint row
+	// is strictly NEWER and wins the resolver's newest-wins comparison.
+	switch pr.ResumeKind {
+	case resumeKindPush:
+		s.recordPushResumeCheckpoint(r.Context(), runID, stageID, pr, actorKind, actorSubject)
+	case resumeKindPushDiscarded:
+		// A PERMANENT consume-side refusal: the runner declined to publish the
+		// held commit and the recorded verified tree is being thrown away. Audit
+		// the discard at the decline point (operator condition 2) and record NO
+		// checkpoint, so the next retry is an honest full agent re-run.
+		s.appendVerifiedTreeDiscarded(r.Context(), runID, stageID, pushCheckpointPayload{
+			Branch:          pr.Branch,
+			HeadSHA:         pr.HeadSHA,
+			BaseSHA:         pr.BaseSHA,
+			VerifiedTreeSHA: pr.VerifiedTreeSHA,
+		}, "consume_refused_permanent")
+	}
+
 	s.notifyStatusUpdate(r.Context(), runID, "pr_failed")
 
 	s.writeJSON(w, r, http.StatusOK, pullRequestFailureResponse{
@@ -1683,6 +1748,66 @@ func (s *Server) failPullRequestStage(w http.ResponseWriter, r *http.Request, ru
 		Outcome:  "failed",
 		Category: pr.Category,
 	})
+}
+
+// recordPushResumeCheckpoint records a PUSH-KIND checkpoint (E45.86 / #3621)
+// under its own audit category rather than on the pull_request_failed payload.
+//
+// THE SEPARATE CATEGORY IS THE ROLLBACK PROPERTY. A pre-#3621 backend's
+// resolver walks pull_request_failed and reads push_checkpoint off it; it does
+// not know CategoryPushResumeCheckpoint exists and never queries it. Because
+// the sibling pull_request_failed entry carries NO push_checkpoint for this
+// kind, a reverted backend sees no checkpoint at all and falls back to a full
+// agent re-run — it can never read a never-pushed commit as a pr_open
+// checkpoint and open a PR from it.
+//
+// Best-effort / warn-only, exactly like the pull_request_failed append above:
+// the stage is already failed, and a missing checkpoint degrades to today's
+// agent re-run rather than failing the report the recovery depends on.
+func (s *Server) recordPushResumeCheckpoint(ctx context.Context, runID, stageID uuid.UUID,
+	pr *pullRequestBody, actorKind audit.ActorKind, actorSubject *string) {
+	if s.cfg.AuditRepo == nil || pr.Branch == "" || pr.HeadSHA == "" {
+		return
+	}
+	checkpoint := map[string]any{
+		"branch":            pr.Branch,
+		"head_sha":          pr.HeadSHA,
+		"base_sha":          pr.BaseSHA,
+		"verified_tree_sha": pr.VerifiedTreeSHA,
+	}
+	// Same non-empty gating as the #2570 pr_open payload, so the two carriers
+	// decode through one shared envelope.
+	if pr.Title != "" {
+		checkpoint["pr_title"] = pr.Title
+	}
+	if pr.Body != "" {
+		checkpoint["pr_body"] = pr.Body
+	}
+	payload, err := json.Marshal(map[string]any{
+		"run_id":          runID.String(),
+		"stage_id":        stageID.String(),
+		"resume_kind":     resumeKindPush,
+		"push_checkpoint": checkpoint,
+	})
+	if err != nil {
+		return
+	}
+	sid := stageID
+	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:        runID,
+		StageID:      &sid,
+		Timestamp:    time.Now().UTC(),
+		Category:     CategoryPushResumeCheckpoint,
+		ActorKind:    &actorKind,
+		ActorSubject: actorSubject,
+		Payload:      payload,
+	}); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"pull-request failure report: append push-resume checkpoint failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()))
+	}
 }
 
 // closePRAfterGatingReject closes the dangling PR the runner just opened

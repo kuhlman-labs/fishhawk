@@ -530,15 +530,47 @@ func (s *Server) retryStageAs(ctx context.Context, id Identity, p retryActionPar
 	// pending re-open + implement type so a D-timeout awaiting_approval re-open (no
 	// new tree) and non-implement stages supersede nothing. Best-effort/warn-only —
 	// the retry's HTTP success is never gated on it.
+	//
+	// E45.86 / #3621 GATES THAT SUPERSEDE. The justification above holds only
+	// when the retry DISCARDS the tree. When the next dispatch will RESUME from
+	// a held commit — a complete checkpoint of either kind that is still the
+	// stage's newest terminal outcome — the concerns still describe the tree
+	// about to be pushed, so superseding them would delete a live review round.
+	// This is a DELIBERATE BEHAVIOUR CHANGE to an existing path, not a
+	// byte-identical addition (operator condition 3).
+	//
+	// OPTIMISTIC BY NECESSITY: the retry path cannot know which runner will claim
+	// the dispatch, so a push-kind checkpoint is treated as resumable here. If an
+	// OLD runner then claims it, the backend declines at the prompt gate (and
+	// writes verified_tree_discarded there), leaving the concerns raised. The
+	// cost is a stale concern the operator waives — never a wrong PR.
+	//
+	// Every undecidable state maps to checkpointNone, so the fail-safe direction
+	// is today's behavior: supersede.
 	if dec.Stage.Type == run.StageTypeImplement && dec.Stage.State == run.StageStatePending {
-		retryKind := "stage retry"
-		if dec.Overridden {
-			retryKind = "stage override retry"
+		cp, verdict := s.newestPushCheckpoint(ctx, dec.Stage.RunID, dec.Stage.ID)
+		if verdict == checkpointResumable {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+				"retry will resume from a held commit; keeping the prior round's implement-review concerns",
+				slog.String("run_id", dec.Stage.RunID.String()),
+				slog.String("stage_id", dec.Stage.ID.String()),
+				slog.String("resume_kind", cp.ResumeKind))
+		} else {
+			retryKind := "stage retry"
+			if dec.Overridden {
+				retryKind = "stage override retry"
+			}
+			reason := fmt.Sprintf(
+				"superseded by %s (ordinal %d): prior-attempt implement-review concern discarded on re-implement",
+				retryKind, dec.Stage.SelfRetryCount)
+			s.supersedeOpenImplementConcerns(ctx, dec.Stage.RunID, dec.Stage.ID, reason, nil)
+			// AUDIT WHAT IS THROWN AWAY (E45.86 / #3621 issue item 3). The retry is
+			// a full agent re-run, so any verified tree the newest carrier recorded
+			// is discarded — ~$3 and ~8 minutes of already-completed work. Inert
+			// when no verified tree was recorded. Best-effort/warn-only and written
+			// AFTER the retry audit receipt, exactly as the supersede sweep is.
+			s.appendVerifiedTreeDiscarded(ctx, dec.Stage.RunID, dec.Stage.ID, cp, verdict)
 		}
-		reason := fmt.Sprintf(
-			"superseded by %s (ordinal %d): prior-attempt implement-review concern discarded on re-implement",
-			retryKind, dec.Stage.SelfRetryCount)
-		s.supersedeOpenImplementConcerns(ctx, dec.Stage.RunID, dec.Stage.ID, reason, nil)
 	}
 
 	// Un-terminal the run (failed → running) before the orchestrator

@@ -506,6 +506,15 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// issue-context fallback. Empty falls back to the runner placeholder.
 		exemptPRTitle string
 		exemptPRBody  string
+		// exemptHeldVerifiedTreeSHA is the gate-certified TREE the backend serves
+		// alongside a resumeKindPush resume (E45.86 / #3621). The consume path
+		// re-proves the local held commit's tree against it byte-exactly before
+		// publishing anything.
+		exemptHeldVerifiedTreeSHA string
+		// supportsPushResume is the BACKEND half of the #3621 capability
+		// handshake, read off the prompt response and handed to the pre-push
+		// arming site via the checkpoint out-parameter.
+		supportsPushResume bool
 	)
 
 	// bindingAssertions is the fetched prompt's binding_assertions (#1171):
@@ -633,7 +642,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			return exitFailure
 		}
 		issuedKey = key
-		path, sType, agentTimeoutSecs, specVerifyCmd, specVerifyTimeoutSecs, specVerifyMaxIterations, decomposedFromRunID, minRunnerVersion, agentVersionRange, agentSelfRetry, maxRetriesSnapshot, retryAttempt, scopeFiles, commitAuthorName, commitAuthorEmail, fixup, fixupBranch, expectedHeadSHA, promptBindingAssertions, applyPatches, sliceIndex, promptScopeExemptions, openPRFromHeldCommit, heldCommitSHA, heldCommitBranch, heldCommitBaseSHA, heldCommitResumeKind, heldCommitPRTitle, heldCommitPRBody, promptImplementModel, promptPlanModel, promptEgressTargetHosts, promptAcceptanceCriteriaIDs, promptAcceptanceExpectedHeadSHA, promptDiffCoverage, promptConflictResolution, promptAcceptanceReplay, promptForgeWrites, promptStageAttempt, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
+		path, sType, agentTimeoutSecs, specVerifyCmd, specVerifyTimeoutSecs, specVerifyMaxIterations, decomposedFromRunID, minRunnerVersion, agentVersionRange, agentSelfRetry, maxRetriesSnapshot, retryAttempt, scopeFiles, commitAuthorName, commitAuthorEmail, fixup, fixupBranch, expectedHeadSHA, promptBindingAssertions, applyPatches, sliceIndex, promptScopeExemptions, openPRFromHeldCommit, heldCommitSHA, heldCommitBranch, heldCommitBaseSHA, heldCommitResumeKind, heldCommitVerifiedTreeSHA, promptSupportsPushResume, heldCommitPRTitle, heldCommitPRBody, promptImplementModel, promptPlanModel, promptEgressTargetHosts, promptAcceptanceCriteriaIDs, promptAcceptanceExpectedHeadSHA, promptDiffCoverage, promptConflictResolution, promptAcceptanceReplay, promptForgeWrites, promptStageAttempt, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
 		stageAttempt = promptStageAttempt
 		// Arm the retirement-drop reporter IMMEDIATELY (E72.4 / #3328, binding
 		// condition 1) — and BEFORE the fetchErr check (#3396): the guarantee
@@ -723,6 +732,8 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		exemptHeldBranch = heldCommitBranch
 		exemptHeldBaseSHA = heldCommitBaseSHA
 		exemptResumeKind = heldCommitResumeKind
+		exemptHeldVerifiedTreeSHA = heldCommitVerifiedTreeSHA
+		supportsPushResume = promptSupportsPushResume
 		exemptPRTitle = heldCommitPRTitle
 		exemptPRBody = heldCommitPRBody
 		fixupExpectedHeadSHA = expectedHeadSHA
@@ -990,7 +1001,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		exemptOpenPR = false
 	}
 	if exemptOpenPR {
-		return openHeldCommitPR(ctx, cfg, exemptHeldSHA, exemptHeldBranch, exemptHeldBaseSHA, exemptResumeKind, exemptPRTitle, exemptPRBody, logSink, client, issuedKey)
+		return openHeldCommitPR(ctx, cfg, exemptHeldSHA, exemptHeldBranch, exemptHeldBaseSHA, exemptResumeKind, exemptHeldVerifiedTreeSHA, exemptPRTitle, exemptPRBody, logSink, client, issuedKey)
 	}
 
 	if cfg.promptFile == "" {
@@ -3030,6 +3041,10 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			// branch, and passed into the failure report below so a retry_stage can
 			// resume the PR open with no agent re-invocation.
 			var prCheckpoint pushCheckpoint
+			// E45.86 / #3621: hand the BACKEND capability in on the out-parameter so
+			// the pre-push arming site can gate on it without a new function
+			// parameter on openPRAndShipArtifact's ~40 call sites.
+			prCheckpoint.backendSupportsPushResume = supportsPushResume
 			// Arm the per-stage agent-handoff memo (#2840) immediately before
 			// the FIRST openPRAndShipArtifact call. Arming here — rather than
 			// capturing eagerly above the retry — is what keeps the first pass
@@ -3520,13 +3535,13 @@ func reissueSigningKeyForTerminalUpload(ctx context.Context, client uploadClient
 // The temp file is 0o600 — bundle-style defense in depth, since prompts
 // may include issue bodies that the customer would prefer not to leave on
 // the runner's filesystem world-readable.
-func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, verifyCmd string, verifyTimeoutSecs int, verifyMaxIterations int, decomposedFromRunID string, minRunnerVersion string, agentVersionRange string, agentSelfRetry bool, maxRetriesSnapshot int, retryAttempt int, scopeFiles []upload.ScopeFile, commitAuthorName string, commitAuthorEmail string, fixup bool, fixupBranch string, fixupExpectedHeadSHA string, bindingAssertions []upload.BindingAssertion, fixupApplyPatches []upload.FixupApplyPatch, sliceIndex int, scopeExemptions []upload.ScopeExemption, openPRFromHeldCommit bool, heldCommitSHA string, heldCommitBranch string, heldCommitBaseSHA string, heldCommitResumeKind string, heldCommitPRTitle string, heldCommitPRBody string, implementModel string, planModel string, egressTargetHosts []string, acceptanceCriteriaIDs []string, acceptanceExpectedHeadSHA string, diffCoverage *upload.DiffCoverageConfig, conflictResolution *conflictResolutionRequest, acceptanceReplay acceptanceReplayInputs, forgeWrites string, stageAttempt string, err error) {
+func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, verifyCmd string, verifyTimeoutSecs int, verifyMaxIterations int, decomposedFromRunID string, minRunnerVersion string, agentVersionRange string, agentSelfRetry bool, maxRetriesSnapshot int, retryAttempt int, scopeFiles []upload.ScopeFile, commitAuthorName string, commitAuthorEmail string, fixup bool, fixupBranch string, fixupExpectedHeadSHA string, bindingAssertions []upload.BindingAssertion, fixupApplyPatches []upload.FixupApplyPatch, sliceIndex int, scopeExemptions []upload.ScopeExemption, openPRFromHeldCommit bool, heldCommitSHA string, heldCommitBranch string, heldCommitBaseSHA string, heldCommitResumeKind string, heldCommitVerifiedTreeSHA string, supportsPushResume bool, heldCommitPRTitle string, heldCommitPRBody string, implementModel string, planModel string, egressTargetHosts []string, acceptanceCriteriaIDs []string, acceptanceExpectedHeadSHA string, diffCoverage *upload.DiffCoverageConfig, conflictResolution *conflictResolutionRequest, acceptanceReplay acceptanceReplayInputs, forgeWrites string, stageAttempt string, err error) {
 	got, fetchErr := client.FetchPrompt(ctx, upload.FetchPromptArgs{
 		StageID:    cfg.stageID,
 		PrivateKey: key.PrivateKey,
 	})
 	if fetchErr != nil {
-		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", "", "", "", nil, nil, "", nil, nil, acceptanceReplayInputs{}, "", "", fetchErr
+		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplayInputs{}, "", "", fetchErr
 	}
 	_, _ = fmt.Fprintf(logSink,
 		`{"event":"prompt_fetched","stage_id":%q,"stage_type":%q,"prompt_hash":%q,"prompt_bytes":%d}`+"\n",
@@ -3541,20 +3556,20 @@ func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key
 	acceptanceReplay = acceptanceReplayInputsFromPrompt(got)
 	tmp, tmpErr := os.CreateTemp("", "fishhawk-prompt-*.txt")
 	if tmpErr != nil {
-		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", fmt.Errorf("create prompt temp file: %w", tmpErr)
+		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", fmt.Errorf("create prompt temp file: %w", tmpErr)
 	}
 	if err := os.Chmod(tmp.Name(), 0o600); err != nil {
 		_ = tmp.Close()
-		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", fmt.Errorf("chmod prompt temp file: %w", err)
+		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", fmt.Errorf("chmod prompt temp file: %w", err)
 	}
 	if _, err := tmp.WriteString(got.Prompt); err != nil {
 		_ = tmp.Close()
-		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", fmt.Errorf("write prompt temp file: %w", err)
+		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", fmt.Errorf("write prompt temp file: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", fmt.Errorf("close prompt temp file: %w", err)
+		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", fmt.Errorf("close prompt temp file: %w", err)
 	}
-	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, got.VerifyCommand, got.VerifyTimeoutSeconds, got.VerifyMaxIterations, got.DecomposedFromRunID, got.MinRunnerVersion, got.AgentVersionRange, got.AgentSelfRetry, got.MaxRetriesSnapshot, got.RetryAttempt, got.ScopeFiles, got.CommitAuthorName, got.CommitAuthorEmail, got.Fixup, got.FixupBranch, got.FixupExpectedHeadSHA, got.BindingAssertions, got.FixupApplyPatches, got.SliceIndex, got.ScopeExemptions, got.OpenPRFromHeldCommit, got.HeldCommitSHA, got.HeldCommitBranch, got.HeldCommitBaseSHA, got.HeldCommitResumeKind, got.HeldCommitPRTitle, got.HeldCommitPRBody, got.ImplementModel, got.PlanModel, got.EgressTargetHosts, got.AcceptanceCriteriaIDs, got.AcceptanceExpectedHeadSHA, got.DiffCoverage, conflictResolutionFromPrompt(got), acceptanceReplayInputsFromPrompt(got), got.ForgeWrites, got.StageAttempt, nil
+	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, got.VerifyCommand, got.VerifyTimeoutSeconds, got.VerifyMaxIterations, got.DecomposedFromRunID, got.MinRunnerVersion, got.AgentVersionRange, got.AgentSelfRetry, got.MaxRetriesSnapshot, got.RetryAttempt, got.ScopeFiles, got.CommitAuthorName, got.CommitAuthorEmail, got.Fixup, got.FixupBranch, got.FixupExpectedHeadSHA, got.BindingAssertions, got.FixupApplyPatches, got.SliceIndex, got.ScopeExemptions, got.OpenPRFromHeldCommit, got.HeldCommitSHA, got.HeldCommitBranch, got.HeldCommitBaseSHA, got.HeldCommitResumeKind, got.HeldCommitVerifiedTreeSHA, got.SupportsPushResume, got.HeldCommitPRTitle, got.HeldCommitPRBody, got.ImplementModel, got.PlanModel, got.EgressTargetHosts, got.AcceptanceCriteriaIDs, got.AcceptanceExpectedHeadSHA, got.DiffCoverage, conflictResolutionFromPrompt(got), acceptanceReplayInputsFromPrompt(got), got.ForgeWrites, got.StageAttempt, nil
 }
 
 func logStartup(w io.Writer, cfg config) {
@@ -8098,12 +8113,40 @@ func heldCommitShipCategory(_ error) string {
 //     report re-carries the checkpoint, so a resume that itself fails (the
 //     outage is still up) leaves the NEXT retry_stage resumable rather than
 //     silently degrading back to a full agent re-run.
-func openHeldCommitPR(ctx context.Context, cfg config, heldSHA, heldBranch, heldBaseSHA, resumeKind, servedPRTitle, servedPRBody string, logSink io.Writer, client uploadClient, issued *upload.IssuedKey) int {
+func openHeldCommitPR(ctx context.Context, cfg config, heldSHA, heldBranch, heldBaseSHA, resumeKind, servedVerifiedTreeSHA, servedPRTitle, servedPRBody string, logSink io.Writer, client uploadClient, issued *upload.IssuedKey) int {
 	isPROpenResume := resumeKind == resumeKindPROpen
+	// E45.86 / #3621. isPushResume selects the PUBLISH arm: the held commit
+	// exists LOCALLY only, so this resume pushes it (after re-proving the tree
+	// and a non-clobber ancestry check) and then falls into the SAME PR-open +
+	// ship tail. pushed flips to true the instant the branch is published, which
+	// is what makes the re-armed checkpoint describe the state the run is
+	// actually in rather than the state it started the resume in.
+	isPushResume := resumeKind == resumeKindPush
+	pushed := false
 	failedReason := "scope_exempt_open_pr"
-	if isPROpenResume {
+	switch {
+	case isPROpenResume:
 		failedReason = "pr_open_resume"
+	case isPushResume:
+		failedReason = "push_resume"
 	}
+	// failWithToken is the three-argument form (E45.86 / #3621 operator
+	// condition 3): `token` is a BOUNDED refusal-reason identifier, logged on
+	// push_resume_refused and PREFIXED into the reported reason so tests and
+	// operators assert reason IDENTITY rather than prose.
+	//
+	// It also decides whether the checkpoint is RE-ARMED:
+	//   - a PERMANENT token reports with resumeKindPushDiscarded, which arms
+	//     nothing and instead tells the backend to audit the discarded verified
+	//     tree. The next retry is an ordinary agent re-run and the retry-side
+	//     supersede fires normally.
+	//   - a TRANSIENT token re-arms the push checkpoint, so a fault that clears
+	//     (an unreadable remote, a mint blip, the push itself) leaves the NEXT
+	//     retry resumable — the repeatable-resume property #2169 established for
+	//     the pr_open kind.
+	//   - ONCE PUSHED, the branch is published, so the re-arm degrades to the
+	//     ordinary pr_open kind regardless of the token.
+	var failWithToken func(category, token, reason string) int
 	fail := func(category, reason string) int {
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"runner_failed","reason":%q,"detail":%q}`+"\n", failedReason, reason)
@@ -8114,9 +8157,19 @@ func openHeldCommitPR(ctx context.Context, cfg config, heldSHA, heldBranch, held
 		// the exact loss this issue exists to eliminate. The legacy exempt path
 		// reports WITHOUT a checkpoint, keeping #1231's audit shape unchanged.
 		var cp *pushCheckpoint
-		if isPROpenResume && heldBranch != "" && heldSHA != "" {
+		if (isPROpenResume || isPushResume) && heldBranch != "" && heldSHA != "" {
+			// E45.86 / #3621: name the kind the run is ACTUALLY in. A push resume
+			// that has not published yet re-arms as "push"; once the push landed
+			// the branch is on the remote, so any later failure re-arms as the
+			// ordinary pr_open kind.
+			reArmKind := resumeKindPROpen
+			if isPushResume && !pushed {
+				reArmKind = resumeKindPush
+			}
 			cp = &pushCheckpoint{
 				branch: heldBranch, headSHA: heldSHA, baseSHA: heldBaseSHA, armed: true,
+				resumeKind:      reArmKind,
+				verifiedTreeSHA: servedVerifiedTreeSHA,
 				// #2570: re-carry the SERVED PR text as well as the coordinates. A
 				// resume that itself fails must not ERASE the recovered text from
 				// the newest audit entry — that would silently degrade the NEXT
@@ -8129,6 +8182,26 @@ func openHeldCommitPR(ctx context.Context, cfg config, heldSHA, heldBranch, held
 		// backstop engages regardless of whether the report landed.
 		_ = reportPullRequestFailure(ctx, cfg, logSink, client, issued, category, reason, cp)
 		return exitFailure
+	}
+	failWithToken = func(category, token, reason string) int {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"push_resume_refused","run_id":%q,"stage_id":%q,"reason":%q,"permanent":%t}`+"\n",
+			cfg.runID, cfg.stageID, token, permanentPushResumeRefusals[token])
+		detail := token + ": " + reason
+		if !pushed && permanentPushResumeRefusals[token] {
+			// PERMANENT refusal: report the DISCARD instead of a checkpoint, so the
+			// verified tree being thrown away is audited at the decline point
+			// (operator condition 2) and the next retry is an honest full re-run.
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"runner_failed","reason":%q,"detail":%q}`+"\n", failedReason, detail)
+			_ = reportPullRequestFailure(ctx, cfg, logSink, client, issued, category, detail, &pushCheckpoint{
+				branch: heldBranch, headSHA: heldSHA, baseSHA: heldBaseSHA, armed: true,
+				resumeKind:      resumeKindPushDiscarded,
+				verifiedTreeSHA: servedVerifiedTreeSHA,
+			})
+			return exitFailure
+		}
+		return fail(category, detail)
 	}
 	if cfg.runID == "" || cfg.stageID == "" {
 		return fail("C", "exempt open-PR requires --run-id and --stage-id")
@@ -8151,6 +8224,16 @@ func openHeldCommitPR(ctx context.Context, cfg config, heldSHA, heldBranch, held
 	if heldBaseSHA == "" {
 		return fail("C", "exempt open-PR: backend did not advertise held_commit_base_sha")
 	}
+	// UNKNOWN-KIND REFUSAL (E45.86 / #3621). Before #3621 an unrecognized
+	// non-empty kind silently degraded to the legacy #1231 exempt path, which
+	// opens a PR on a branch that may never have been pushed — the wrong-commit
+	// class this epic exists to close. A NEW-backend kind this runner does not
+	// implement is a version anomaly, so refuse category C having touched
+	// nothing. The EMPTY kind remains the legacy exempt path, byte-identical.
+	if resumeKind != "" && !isPROpenResume && !isPushResume {
+		return failWithToken("C", refusePushUnknownResumeKind,
+			fmt.Sprintf("backend served held_commit_resume_kind %q, which this runner does not implement", resumeKind))
+	}
 	if client == nil {
 		client = newUploadClient(cfg.backendURL)
 	}
@@ -8168,6 +8251,11 @@ func openHeldCommitPR(ctx context.Context, cfg config, heldSHA, heldBranch, held
 
 	token, err := mintImplementToken(ctx, cfg, client, issued, logSink)
 	if err != nil {
+		if isPushResume {
+			// TRANSIENT (E45.86 / #3621): a mint fault says nothing about the held
+			// commit, so re-arm and let the next retry resume again.
+			return failWithToken("C", refusePushTokenMintFailed, err.Error())
+		}
 		return fail("C", err.Error())
 	}
 	// When this runner obtained the credential, for the 401 re-auth path's
@@ -8199,6 +8287,86 @@ func openHeldCommitPR(ctx context.Context, cfg config, heldSHA, heldBranch, held
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"pr_open_resume_tip_verified","run_id":%q,"stage_id":%q,"branch":%q,"head_sha":%q}`+"\n",
 			cfg.runID, cfg.stageID, branch, heldSHA)
+	}
+
+	// PUSH-FAILURE RESUME (E45.86 / #3621). The held commit exists LOCALLY and
+	// was never published, so this arm re-proves it and publishes it before the
+	// forge is touched. Every guard runs IN ORDER and fails having pushed
+	// nothing; the reason TOKEN is what tests and operators read.
+	if isPushResume {
+		// (a) Without the gate-certified tree there is nothing to prove the local
+		// commit against, and the whole promise of this resume is that the commit
+		// it publishes IS the verified one. Permanent.
+		if servedVerifiedTreeSHA == "" {
+			return failWithToken("C", refusePushVerifiedTreeMissing,
+				"backend served a push resume with no held_commit_verified_tree_sha")
+		}
+		// (b) LOCAL PRESENCE. On a fresh/ephemeral host the object is simply gone
+		// — the honest outcome is a NAMED category-C refusal the operator reads,
+		// never a silent wrong push. Permanent: no retry of this resume recreates
+		// a commit that is not there.
+		if err := exec.CommandContext(ctx, "git", "-C", cfg.workingDir, "cat-file", "-e", heldSHA+"^{commit}").Run(); err != nil {
+			return failWithToken("C", refusePushHeldCommitAbsent,
+				fmt.Sprintf("held commit %s is not present in %s: %v", heldSHA, cfg.workingDir, err))
+		}
+		// (c) TREE EQUALITY, byte-exact. This is the #969 claim re-proved at the
+		// consume point: the commit about to be published must carry the tree the
+		// committed-tree gates passed. Permanent.
+		localTree, treeErr := gitRevParseIn(ctx, cfg.workingDir, heldSHA+"^{tree}")
+		if treeErr != nil || localTree != servedVerifiedTreeSHA {
+			return failWithToken("C", refusePushTreeMismatch,
+				fmt.Sprintf("held commit %s tree %q != served verified tree %q (err %v)", heldSHA, localTree, servedVerifiedTreeSHA, treeErr))
+		}
+		// (d) NON-CLOBBER GUARD. The pr_open kind's tip-EQUALITY check is wrong
+		// here BY CONSTRUCTION — the point of this resume is that the tip is NOT
+		// the held commit. Instead the remote tip must be ABSENT or an ANCESTOR of
+		// the held commit, so publishing can only fast-forward. A non-ancestor tip
+		// means someone moved the branch and only they can resolve it (permanent);
+		// an ls-remote ERROR is not evidence either way (transient).
+		tip, tipErr := gitops.RemoteBranchTip(ctx, cfg.workingDir, gitops.DefaultRemote, branch, token)
+		if tipErr != nil {
+			return failWithToken("C", refusePushRemoteTipUnreadable,
+				fmt.Sprintf("push resume: cannot read remote tip of %s: %v", branch, tipErr))
+		}
+		if tip != "" && tip != heldSHA {
+			// git merge-base --is-ancestor exits 0 when A is an ancestor of B, 1
+			// when it is not, and non-zero-other on error. ONLY exit 0 is
+			// permission to push; exit 1 is the moved-branch refusal and anything
+			// else is treated as unreadable.
+			ancErr := exec.CommandContext(ctx, "git", "-C", cfg.workingDir, "merge-base", "--is-ancestor", tip, heldSHA).Run()
+			if ancErr != nil {
+				var exitErr *exec.ExitError
+				if errors.As(ancErr, &exitErr) && exitErr.ExitCode() == 1 {
+					return failWithToken("C", refusePushRemoteTipNotAnc,
+						fmt.Sprintf("push resume: remote tip %s of %s is not an ancestor of the held commit %s; refusing to clobber it", tip, branch, heldSHA))
+				}
+				return failWithToken("C", refusePushRemoteTipUnreadable,
+					fmt.Sprintf("push resume: cannot decide ancestry of remote tip %s vs held commit %s: %v", tip, heldSHA, ancErr))
+			}
+		}
+		// PUBLISH. PushCommittedBranch pins the refspec to <sha>:refs/heads/<branch>
+		// (no symbolic source), neutralizes hooks, guards the push destination, and
+		// CONFIRMS the remote tip equals the pushed SHA afterwards — `git push`
+		// exiting 0 is not proof the ref moved (#3202).
+		pushRemoteURL, urlErr := remoteURLFor(cfg, owner, repoName)
+		if urlErr != nil {
+			return failWithToken("C", refusePushPushFailed,
+				fmt.Sprintf("push resume: resolve push remote: %v", urlErr))
+		}
+		if _, pushErr := newPusher().PushCommittedBranch(ctx, gitops.PushCommittedBranchArgs{
+			RepoDir:   cfg.workingDir,
+			Branch:    branch,
+			RemoteURL: pushRemoteURL,
+			PushToken: token,
+			HeadSHA:   heldSHA,
+		}); pushErr != nil {
+			return failWithToken("C", refusePushPushFailed,
+				fmt.Sprintf("push resume: publish %s at %s: %v", branch, heldSHA, pushErr))
+		}
+		pushed = true
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"push_resume_pushed","run_id":%q,"stage_id":%q,"branch":%q,"head_sha":%q,"verified_tree_sha":%q}`+"\n",
+			cfg.runID, cfg.stageID, branch, heldSHA, servedVerifiedTreeSHA)
 	}
 
 	// RECOVERED PR TEXT (#2570). The agent's PR description is unreachable from
@@ -8292,8 +8460,11 @@ func openHeldCommitPR(ctx context.Context, cfg config, heldSHA, heldBranch, held
 	// event that no gate consumes is unjustified surface (#2563 binding
 	// condition 2); base_sha IS plumbed because the artifact requires it.
 	openedEvent := "scope_completeness_pr_opened"
-	if isPROpenResume {
+	switch {
+	case isPROpenResume:
 		openedEvent = "pr_open_resume_pr_opened"
+	case isPushResume:
+		openedEvent = "push_resume_pr_opened"
 	}
 	_, _ = fmt.Fprintf(logSink,
 		`{"event":%q,"run_id":%q,"stage_id":%q,"pr_number":%d,"pr_url":%q,"head_sha":%q,"base_sha":%q,"branch":%q}`+"\n",
@@ -8332,10 +8503,80 @@ func openHeldCommitPR(ctx context.Context, cfg config, heldSHA, heldBranch, held
 // resumeKindPROpen is the held_commit_resume_kind discriminator the backend
 // emits for a PR-open CHECKPOINT resume (#2169). Its string value is a WIRE
 // value: it must stay byte-identical to the backend's resumeKindPROpen
-// (backend/internal/server/prompt.go). An unrecognized kind is treated as the
-// legacy #1231 exempt path — degraded but correct (same branch, same PR), which
-// is what makes an old runner against a new backend safe.
+// (backend/internal/server/prompt.go). The EMPTY kind is the legacy #1231
+// exempt path. A NON-EMPTY unrecognized kind now REFUSES category C
+// (E45.86 / #3621): it used to degrade to that exempt path, which was
+// "degraded but correct" only while every kind published a commit that was
+// already on the remote — with the push kind that assumption is gone, and the
+// degrade would open a PR on a branch that may never have been pushed. Skew
+// safety now comes from the CAPABILITY HANDSHAKE, not from the degrade: an old
+// runner that never advertises push-resume is simply never served the push
+// kind.
 const resumeKindPROpen = "pr_open"
+
+// resumeKindPush is the held_commit_resume_kind discriminator for the
+// PUSH-FAILURE resume (E45.86 / #3621): the implement agent ran, the
+// committed-tree gates passed, CommitAndPush produced the commit LOCALLY, and
+// only the push transport failed. Unlike "pr_open", the commit is NOT on the
+// remote, so the resume PUBLISHES it (after re-proving the tree locally and
+// checking the remote tip is non-clobbering) and only then opens the PR.
+//
+// WIRE VALUE: byte-identical to the backend's resumeKindPush
+// (backend/internal/server/prompt.go).
+const resumeKindPush = "push"
+
+// resumeKindPushDiscarded is the report-only kind the runner sends when it
+// PERMANENTLY refuses a served push-kind resume (E45.86 / #3621, operator
+// condition 2). It arms no checkpoint; it tells the backend "a recorded
+// verified tree is being thrown away" so the discard is audited
+// (verified_tree_discarded) rather than vanishing silently into a category-C
+// failure the operator cannot account for.
+//
+// WIRE VALUE: byte-identical to the backend's resumeKindPushDiscarded.
+const resumeKindPushDiscarded = "push_discarded"
+
+// Bounded refusal-reason tokens for the push-resume consume path (E45.86 /
+// #3621). They are asserted on by IDENTITY in tests and read by operators in
+// the push_resume_refused log line, so they are tokens rather than prose.
+//
+// PERMANENT tokens describe a state no retry of the SAME resume can change, so
+// the runner reports WITHOUT re-arming and the next retry is an ordinary agent
+// re-run. TRANSIENT tokens describe a fault that may clear, so the checkpoint
+// is re-armed and the next retry resumes again.
+const (
+	refusePushVerifiedTreeMissing = "verified_tree_missing"
+	refusePushHeldCommitAbsent    = "held_commit_absent"
+	refusePushTreeMismatch        = "tree_mismatch"
+	refusePushRemoteTipNotAnc     = "remote_tip_not_ancestor"
+	refusePushUnknownResumeKind   = "unknown_resume_kind"
+	refusePushRemoteTipUnreadable = "remote_tip_unreadable"
+	refusePushTokenMintFailed     = "token_mint_failed"
+	refusePushPushFailed          = "push_failed"
+)
+
+// permanentPushResumeRefusals is the classification table. A token ABSENT from
+// it is transient (re-arm). Keeping the PERMANENT set explicit — rather than
+// the transient one — makes the fail-safe direction the default: a refusal
+// nobody classified re-arms, costing at worst one more cheap resume attempt,
+// where a wrong PERMANENT entry would silently discard a verified tree.
+var permanentPushResumeRefusals = map[string]bool{
+	refusePushVerifiedTreeMissing: true,
+	refusePushHeldCommitAbsent:    true,
+	refusePushTreeMismatch:        true,
+	refusePushRemoteTipNotAnc:     true,
+	refusePushUnknownResumeKind:   true,
+}
+
+// Bounded reasons the PRE-PUSH checkpoint arm declines (E45.86 / #3621),
+// emitted on push_checkpoint_not_armed.
+const (
+	notArmedBackendCapabilityAbsent = "backend_capability_absent"
+	notArmedNoVerifiedTree          = "no_verified_tree"
+	notArmedHeadUnresolvable        = "head_unresolvable"
+	notArmedTreeMismatch            = "tree_mismatch"
+	notArmedBaseUnresolvable        = "base_unresolvable"
+	notArmedNotPushTransport        = "not_push_transport"
+)
 
 // pushCheckpoint is the PR-open CHECKPOINT (#2169): the coordinates of a
 // gate-verified commit CommitAndPush already pushed to the run branch, captured
@@ -8357,6 +8598,22 @@ type pushCheckpoint struct {
 	verifiedTreeSHA string
 	armed           bool
 
+	// resumeKind names WHICH checkpoint this is (E45.86 / #3621).
+	// resumeKindPROpen is the #2169 post-push checkpoint — the legacy kind,
+	// reported as an ABSENT resume_kind so the wire bytes are unchanged.
+	// resumeKindPush is the pre-push one: the commit exists locally only.
+	// resumeKindPushDiscarded is report-only and arms nothing.
+	resumeKind string
+
+	// backendSupportsPushResume is the BACKEND half of the capability handshake,
+	// set by the CALLER before openPRAndShipArtifact runs (it is not part of the
+	// checkpoint's recorded state). It gates the pre-push arm: against a backend
+	// that did not advertise the capability, recording the coordinates would have
+	// them served back as the DEFAULT pr_open kind, sending a retry to open a PR
+	// on a branch that was never pushed. So the arm is skipped entirely and the
+	// retry is an ordinary agent re-run, exactly as today.
+	backendSupportsPushResume bool
+
 	// prTitle and prBody are the agent-authored pull-request text this pass
 	// resolved (#2570), carried so the failure report persists it and the RESUME
 	// opens a real pull request instead of the
@@ -8368,6 +8625,95 @@ type pushCheckpoint struct {
 	// once at open time (see prTitleAndBodyParts).
 	prTitle string
 	prBody  string
+}
+
+// gitRevParseIn resolves a single revision inside repoDir, returning the
+// object id or an error. A thin wrapper so the arming guards below read as the
+// four checks they are rather than as four copies of exec plumbing.
+func gitRevParseIn(ctx context.Context, repoDir, rev string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", "-C", repoDir, "rev-parse", rev)
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// maybeArmPushFailureCheckpoint arms the PRE-PUSH checkpoint (E45.86 / #3621)
+// when CommitAndPush failed on the PUSH TRANSPORT and the gate-verified commit
+// is sitting in repoDir unpublished. Every precondition is fail-closed and
+// each refusal is named on a push_checkpoint_not_armed line:
+//
+//   - not a push-transport failure (errors.Is ErrPushFailed) — a mint, stage,
+//     commit or gate failure has no commit to resume from;
+//   - the backend did not advertise supports_push_resume — an old backend would
+//     serve the coordinates back as the DEFAULT pr_open kind, sending the retry
+//     to open a PR on a branch that was never pushed (the wrong-commit bug);
+//   - no verifiedTreeSHA — with nothing to compare against, the checkpoint's
+//     central promise ("this commit IS the gate-verified tree") is unprovable;
+//   - HEAD or HEAD^ unresolvable — no coordinates, and base_sha is REQUIRED by
+//     the backend's success-arm validate() (#2563);
+//   - HEAD^{tree} != verifiedTreeSHA — the #969 equality claim, re-proved HERE
+//     at the arming point, which is what makes the checkpoint's promise true
+//     rather than assumed.
+//
+// The APPLICABILITY predicate (standalone open-PR path only: not --no-pr, not a
+// fix-up, not a decomposed child, not a scope-completeness park) is structural
+// rather than re-tested: every one of those paths returns from
+// openPRAndShipArtifact BEFORE CommitAndPush, so this site is reachable only on
+// the standalone arm — the same property the post-push arm relies on.
+func maybeArmPushFailureCheckpoint(ctx context.Context, cfg config, logSink io.Writer, checkpoint *pushCheckpoint, supportsPushResume bool, pushErr error, repoDir, branch, verifiedTreeSHA, prTitle, prBody string) {
+	if checkpoint == nil {
+		return
+	}
+	notArmed := func(reason string) {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"push_checkpoint_not_armed","run_id":%q,"stage_id":%q,"reason":%q}`+"\n",
+			cfg.runID, cfg.stageID, reason)
+	}
+	if !errors.Is(pushErr, gitops.ErrPushFailed) {
+		// Silent for every ordinary pre-push failure: there is no verified tree in
+		// flight, so announcing a non-arm would be noise on the common path. The
+		// event is emitted only once the failure IS a push transport fault.
+		return
+	}
+	if !supportsPushResume {
+		notArmed(notArmedBackendCapabilityAbsent)
+		return
+	}
+	if verifiedTreeSHA == "" {
+		notArmed(notArmedNoVerifiedTree)
+		return
+	}
+	headSHA, err := gitRevParseIn(ctx, repoDir, "HEAD")
+	if err != nil || headSHA == "" {
+		notArmed(notArmedHeadUnresolvable)
+		return
+	}
+	headTree, err := gitRevParseIn(ctx, repoDir, "HEAD^{tree}")
+	if err != nil || headTree != verifiedTreeSHA {
+		notArmed(notArmedTreeMismatch)
+		return
+	}
+	baseSHA, err := gitRevParseIn(ctx, repoDir, "HEAD^")
+	if err != nil || baseSHA == "" {
+		notArmed(notArmedBaseUnresolvable)
+		return
+	}
+	*checkpoint = pushCheckpoint{
+		branch:                    branch,
+		headSHA:                   headSHA,
+		baseSHA:                   baseSHA,
+		verifiedTreeSHA:           verifiedTreeSHA,
+		armed:                     true,
+		resumeKind:                resumeKindPush,
+		backendSupportsPushResume: supportsPushResume,
+		prTitle:                   prTitle,
+		prBody:                    prBody,
+	}
+	_, _ = fmt.Fprintf(logSink,
+		`{"event":"push_checkpoint_armed","run_id":%q,"stage_id":%q,"branch":%q,"head_sha":%q,"base_sha":%q,"verified_tree_sha":%q,"resume_kind":%q}`+"\n",
+		cfg.runID, cfg.stageID, branch, headSHA, baseSHA, verifiedTreeSHA, resumeKindPush)
 }
 
 // openPRAndShipArtifact is the implement-stage post-processing
@@ -8410,6 +8756,11 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 	if issued == nil {
 		return errors.New("upload: signing key not issued (caller must hoist IssueKey before openPRAndShipArtifact)")
 	}
+	// E45.86 / #3621: the CAPABILITY half of the handshake rides in on the
+	// checkpoint out-parameter (the caller sets it before the call), so no new
+	// function parameter is threaded through the ~40 existing call sites.
+	// Captured here because the post-push arm below assigns the whole struct.
+	supportsPushResume := checkpoint != nil && checkpoint.backendSupportsPushResume
 
 	// Local-runner mode (E22.8 / #406): --no-pr skips the entire
 	// push + PR-open + artifact-ship chain. The trace has already
@@ -9222,6 +9573,13 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		RefreshPushToken: refreshPushToken,
 	})
 	if err != nil {
+		// ARM THE PRE-PUSH CHECKPOINT (E45.86 / #3621). The gate-verified commit
+		// exists LOCALLY and only the transport failed, so the retry can publish
+		// this exact commit with no agent re-invocation — the ~$3/~8-minute loss
+		// run f199dcf1 paid twice. FAIL-CLOSED on all five preconditions: a wrong
+		// arm ships a PR from an unintended tree, a wrong omission costs exactly
+		// what happens today.
+		maybeArmPushFailureCheckpoint(ctx, cfg, logSink, checkpoint, supportsPushResume, err, repoDir, branch, verifiedTreeSHA, agentPRTitle, agentPRBody)
 		return fmt.Errorf("commit+push: %w", err)
 	}
 	// #3400: the commit now exists, so this is the ONE point where the
@@ -9576,6 +9934,13 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 			baseSHA:         cap.BaseSHA,
 			verifiedTreeSHA: verifiedTreeSHA,
 			armed:           true,
+			// Name the kind where it is armed (E45.86 / #3621) rather than leaving
+			// it implicit. reportPullRequestFailure emits NO resume_kind for this
+			// one, so the wire bytes stay byte-identical to #2169.
+			resumeKind: resumeKindPROpen,
+			// Preserve the caller-set capability flag across this whole-struct
+			// assignment; the pre-push arm below reads it.
+			backendSupportsPushResume: supportsPushResume,
 			// #2570: carry the agent's PR text so a PR-open failure's resume opens
 			// a real pull request. The /tmp handoff cannot serve this: it is read
 			// (and DELETED — loadAgentAuthoredPR's delete-after-read) far above,
@@ -9748,6 +10113,13 @@ func reportPullRequestFailure(ctx context.Context, cfg config, logSink io.Writer
 		// checkpoint is the zero value there), keeping that body byte-identical.
 		args.PRTitle = checkpoint.prTitle
 		args.PRBody = checkpoint.prBody
+		// E45.86 / #3621: emit resume_kind ONLY for the two NEW kinds. The legacy
+		// pr_open checkpoint and every pre-push failure emit NO key at all, so
+		// today's report body is BYTE-IDENTICAL and an old backend's
+		// DisallowUnknownFields decoder never sees an unknown field.
+		if checkpoint.resumeKind == resumeKindPush || checkpoint.resumeKind == resumeKindPushDiscarded {
+			args.ResumeKind = checkpoint.resumeKind
+		}
 	}
 	if _, err := client.ShipPullRequest(ctx, args); err != nil {
 		_, _ = fmt.Fprintf(logSink,

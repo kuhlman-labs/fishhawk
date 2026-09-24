@@ -676,6 +676,35 @@ type FetchedPrompt struct {
 	// resume back to the placeholder — the exact defect #2570 fixes.
 	HeldCommitPRTitle string `json:"held_commit_pr_title,omitempty"`
 	HeldCommitPRBody  string `json:"held_commit_pr_body,omitempty"`
+	// HeldCommitVerifiedTreeSHA is the gate-certified TREE object id the held
+	// commit carries (E45.86 / #3621). Served ONLY alongside a
+	// HeldCommitResumeKind of "push", where the runner has not yet published the
+	// commit and must re-prove — byte-exactly, before touching the forge — that
+	// the local held commit's tree IS the tree the committed-tree gates passed.
+	// Empty on every other dispatch, including a "pr_open" resume (whose commit
+	// is already on the remote and is guarded by the tip check instead).
+	//
+	// CROSS-MODULE WIRE CONTRACT: the json tag (held_commit_verified_tree_sha)
+	// MUST stay byte-identical to the backend's
+	// promptResponse.HeldCommitVerifiedTreeSHA
+	// (backend/internal/server/prompt.go).
+	HeldCommitVerifiedTreeSHA string `json:"held_commit_verified_tree_sha,omitempty"`
+	// SupportsPushResume is the BACKEND half of the E45.86 / #3621 bidirectional
+	// capability handshake: true when the backend build understands the "push"
+	// resume kind and will record a push-kind checkpoint. The runner arms a
+	// PRE-push checkpoint and emits resume_kind ONLY when this was advertised, so
+	// against an OLD backend (which omits the key and decodes false here) the
+	// failure-report body stays BYTE-IDENTICAL to today and no unknown field can
+	// 400 the report and strand the stage in `running`.
+	//
+	// The runner half travels the other way, as the RunnerCapabilitiesHeader on
+	// every FetchPrompt.
+	//
+	// CROSS-MODULE WIRE CONTRACT: the json tag (supports_push_resume) MUST stay
+	// byte-identical to the backend's promptResponse.SupportsPushResume
+	// (backend/internal/server/prompt.go). A tag drift decodes false, which
+	// DISABLES the resume — the fail-safe direction.
+	SupportsPushResume bool `json:"supports_push_resume,omitempty"`
 	// EgressTargetHosts is the acceptance stage's full spec-declared
 	// egress.target_hosts list (E31.4 / #1532 grammar), served ONLY on
 	// acceptance-stage prompt responses (E31.7 / #1535). It is the
@@ -892,6 +921,9 @@ func (c *Client) FetchPrompt(ctx context.Context, args FetchPromptArgs) (*Fetche
 		}
 		req.Header.Set("X-Fishhawk-Signature", sigHex)
 		req.Header.Set("Accept", "application/json")
+		// Runner half of the E45.86 / #3621 capability handshake, on EVERY prompt
+		// fetch. See RunnerCapabilitiesHeader.
+		req.Header.Set(RunnerCapabilitiesHeader, RunnerCapabilitiesValue())
 
 		resp, err := c.HTTP.Do(req)
 		if err != nil {
@@ -1448,6 +1480,39 @@ func statusError(op string, resp *http.Response) error {
 // plan_reachability.go); a drift silently disables the advisory.
 const ReachabilityHeader = "X-Fishhawk-Plan-Reachability"
 
+// RunnerCapabilitiesHeader is the request header FetchPrompt carries the
+// RUNNER half of the E45.86 / #3621 capability handshake on — modelled on the
+// ReachabilityHeader precedent above. It is a comma-separated token list
+// describing what THIS runner BINARY understands, so the backend never serves
+// a resume shape an older runner would mishandle.
+//
+// It is a BUILD-TIME property, not a per-call option: FetchPrompt sets it on
+// every prompt fetch with no arg threading and no opt-in. An old runner simply
+// does not send it, and the backend then declines to serve a push-kind
+// checkpoint AT ALL (not a degraded pr_open, which would open a PR on a branch
+// that was never pushed).
+//
+// WIRE VALUE: byte-identical to the backend's runnerCapabilitiesHeader
+// (backend/internal/server/prompt.go).
+const RunnerCapabilitiesHeader = "X-Fishhawk-Runner-Capabilities"
+
+// CapabilityPushResume is the RunnerCapabilitiesHeader token for the E45.86 /
+// #3621 push-failure resume: this runner understands
+// held_commit_resume_kind:"push" and its consume-side guards.
+//
+// WIRE VALUE: byte-identical to the backend's capabilityPushResume
+// (backend/internal/server/prompt.go). A drift silently disables the resume,
+// which is the fail-safe direction.
+const CapabilityPushResume = "push-resume"
+
+// runnerCapabilities is the full static token list FetchPrompt advertises.
+var runnerCapabilities = []string{CapabilityPushResume}
+
+// RunnerCapabilitiesValue is the RunnerCapabilitiesHeader value this binary
+// sends. Exported so the backend-facing tests and the runner's own seam tests
+// assert one derivation rather than a re-spelled literal.
+func RunnerCapabilitiesValue() string { return strings.Join(runnerCapabilities, ",") }
+
 // maxReachabilityHeaderBytes caps the serialized reachability header ShipPlan
 // will attach (#2056). The advisory MUST NEVER break the plan upload: a
 // pathologically large violation list that would overflow the server's header
@@ -1926,6 +1991,17 @@ type ShipPullRequestArgs struct {
 	// it (see HeldCommitPRText). Both are clamped and budgeted against the
 	// backend's 32 KiB request cap before shipping; empty on every other outcome
 	// and on every pre-push failure, where the body stays byte-identical to today.
+	// ResumeKind is the CHECKPOINT DISCRIMINATOR on an Outcome=="failed" report
+	// (E45.86 / #3621). Empty — the legacy value — means the PR-OPEN checkpoint
+	// (#2169) or no checkpoint at all, and the marshalled body is then
+	// BYTE-IDENTICAL to every pre-#3621 failure report. "push" means the
+	// gate-verified commit exists LOCALLY but was never published, so the
+	// backend records it under its OWN audit category rather than as a pr_open
+	// checkpoint. "push_discarded" means a preserved push-kind checkpoint was
+	// permanently refused at consume time and its verified tree is being thrown
+	// away, so the backend audits the discard and records NO checkpoint.
+	ResumeKind string
+
 	PRTitle string
 	PRBody  string
 
@@ -1966,6 +2042,20 @@ type pullRequestFailureBody struct {
 	HeadSHA         string `json:"head_sha,omitempty"`
 	BaseSHA         string `json:"base_sha,omitempty"`
 	VerifiedTreeSHA string `json:"verified_tree_sha,omitempty"`
+
+	// ResumeKind DISCRIMINATES the checkpoint the coordinates above encode
+	// (E45.86 / #3621): "push" (committed locally, never published),
+	// "push_discarded" (a preserved push checkpoint permanently refused), or —
+	// on every legacy path — ABSENT. omitempty plus the runner never setting it
+	// outside the two new kinds is what keeps the pre-push and pr_open bodies
+	// BYTE-IDENTICAL, so an old backend's DisallowUnknownFields decoder never
+	// sees an unknown field and can never 400 a report the stage's recovery
+	// depends on.
+	//
+	// CROSS-MODULE WIRE CONTRACT: the json tag (resume_kind) MUST stay
+	// byte-identical to the backend's pullRequestBody.ResumeKind
+	// (backend/internal/server/pullrequest.go).
+	ResumeKind string `json:"resume_kind,omitempty"`
 
 	// HeldCommitPRText is the agent-authored PR title + body the checkpoint
 	// carries (#2570), appended LAST and fully omitempty so every pre-#2570
@@ -2722,6 +2812,8 @@ func (c *Client) ShipPullRequest(ctx context.Context, args ShipPullRequestArgs) 
 			HeadSHA:         args.HeadSHA,
 			BaseSHA:         args.BaseSHA,
 			VerifiedTreeSHA: args.TreeSHA,
+			// E45.86 / #3621: absent on every legacy path (see ResumeKind).
+			ResumeKind: args.ResumeKind,
 			// Held-commit PR text (#2570): empty everywhere the checkpoint is,
 			// so the legacy body stays byte-identical there too.
 			HeldCommitPRText: HeldCommitPRText{Title: args.PRTitle, PRBody: args.PRBody},
@@ -2926,6 +3018,10 @@ func (c *Client) ShipPullRequest(ctx context.Context, args ShipPullRequestArgs) 
 					HeadSHA:         args.HeadSHA,
 					BaseSHA:         args.BaseSHA,
 					VerifiedTreeSHA: args.TreeSHA,
+					// The kind must survive the 413 rung too: dropping it would make a
+					// push-kind checkpoint arrive as a pr_open one, which is the
+					// wrong-commit bug (E45.86 / #3621).
+					ResumeKind: args.ResumeKind,
 					// The held-commit PR text (#2570) is DELIBERATELY dropped here.
 					// This rung exists because even the budgeted body was rejected,
 					// so it ships the minimum that still makes the stage recoverable:
