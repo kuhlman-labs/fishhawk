@@ -62,6 +62,34 @@ type StartCampaignOutput struct {
 	Campaign Campaign `json:"campaign"`
 }
 
+// --- fishhawk_preview_campaign (#3647) ---
+
+// PreviewCampaignInput is the fishhawk_preview_campaign tool's input schema. It
+// mirrors StartCampaignInput's SOURCE fields exactly — repo plus one of
+// epic_ref / items / grooming_run_id — and carries NONE of the create-only
+// knobs (pause_policy, operator_agent, working_dir): a preview creates nothing,
+// so it has nothing to configure.
+type PreviewCampaignInput struct {
+	Repo    string   `json:"repo" jsonschema:"GitHub repo as owner/name the campaign would be assembled in"`
+	EpicRef string   `json:"epic_ref,omitempty" jsonschema:"OPTIONAL the epic reference to decompose into the campaign DAG (e.g. '#25' or 'owner/name#25'). Omit it and pass items to preview a no-epic campaign over an explicit issue list instead; one of epic_ref / items / grooming_run_id is required"`
+	Items   []string `json:"items,omitempty" jsonschema:"OPTIONAL issue refs (a bare number like '101', '#101', or 'issue:101'). WITH epic_ref: the subset of the epic's children to scope the preview to. WITHOUT epic_ref: the authoritative issue set to preview, resolving each issue's depends_on directly. This is the field you iterate: add the refs the previous preview listed in closure_candidates and preview again until valid is true"`
+	// GroomingRunID previews an approved grooming run's ratified order, exactly
+	// as fishhawk_start_campaign would build from it.
+	GroomingRunID           string `json:"grooming_run_id,omitempty" jsonschema:"OPTIONAL the UUID of an APPROVED grooming run whose ratified priority order would become the campaign queue. Pass it INSTEAD of epic_ref and items — combining it with either is refused"`
+	GroomingLimit           int    `json:"grooming_order_limit,omitempty" jsonschema:"OPTIONAL with grooming_run_id: cap the previewed batch to the top N issues by ratified rank. Omit (or 0) for every ordered issue. Previewing at several limits is the cheap way to find the smallest dependency-closed prefix"`
+	GroomingAllowSuperseded bool   `json:"grooming_allow_superseded,omitempty" jsonschema:"OPTIONAL with grooming_run_id: preview an order a NEWER approved grooming run has superseded. Default false refuses that case, exactly as fishhawk_start_campaign does"`
+	// Provider mirrors fishhawk_start_campaign's selector (#3645). It is SOURCE
+	// shape, not a create-only knob: it decides which issue tracker the DAG is
+	// resolved against, so a preview that could not carry it would report a
+	// graph from a different tracker than the start it is the pre-flight for.
+	Provider string `json:"provider,omitempty" jsonschema:"OPTIONAL the work-item provider id to assemble this preview against: 'github_projects', 'gitlab' or 'jira'. Pass the SAME value you will pass to fishhawk_start_campaign — a preview resolved against a different provider is not a preview of that start. Defaults to the repo's work-management conventions. An unregistered id is refused 400 validation_failed before any forge round-trip"`
+}
+
+// PreviewCampaignOutput carries the preview report.
+type PreviewCampaignOutput struct {
+	Preview CampaignPreview `json:"preview"`
+}
+
 // GetCampaignStatusInput is the fishhawk_get_campaign_status tool's input.
 type GetCampaignStatusInput struct {
 	CampaignID string `json:"campaign_id" jsonschema:"the campaign UUID (from fishhawk_start_campaign)"`
@@ -163,6 +191,153 @@ GitLab work-item provider implements neither campaign capability in v0, so this
 makes the refusal accurate, not the campaign assemblable.
 `),
 	}, resolver.startCampaign)
+}
+
+// registerPreviewCampaign wires the fishhawk_preview_campaign tool (#3647).
+//
+// Auth: the SAME write:campaigns scope fishhawk_start_campaign needs. A preview
+// costs the identical per-item forge sweep and is the pre-flight of a write, so
+// it is not widened to read-only tokens.
+func registerPreviewCampaign(srv *mcp.Server, resolver *runResolver) {
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "fishhawk_preview_campaign",
+		Description: strings.TrimSpace(`
+Preview what fishhawk_start_campaign WOULD assemble, without creating anything.
+It CREATES NOTHING: no campaign, no items, no audit entry — it resolves the same
+item set, runs the same assembly, and returns the wave-ordered DAG or the
+depends_on edges that block it.
+
+Use this as the pre-flight for fishhawk_start_campaign's dependency-closure
+constraint. A campaign must be dependency-CLOSED: every depends_on target of an
+included item must itself be in the batch, and fishhawk_start_campaign refuses a
+set that is not with campaign_dangling_dependency. Assembling a closed set by
+hand means guessing and re-reading a refusal. This verb turns that into a loop:
+preview, read closure_candidates, add those refs to items, preview again, and
+start the campaign once valid is true.
+
+repo (owner/name) is required, plus ONE of epic_ref / items / grooming_run_id —
+the same three sources fishhawk_start_campaign takes, refused in the same
+combinations. provider is optional and selects the work-item provider the DAG is
+resolved against: pass the SAME value you will pass to fishhawk_start_campaign,
+since a preview resolved against a different provider is not a preview of that
+start.
+
+Reading the report. valid:true means fishhawk_start_campaign with this same
+source would create the campaign; waves is the dispatch order and items carries
+each issue's wave, depends_on and queue position. valid:false means it would be
+refused: dangling names every blocking edge with its from/to/reason/remedy, and
+items STILL carries the resolved items and their in-set edges so you can see the
+partial graph. closure_candidates names the issues to ADD to items to close the
+set — and it is deliberately NOT every dangling target: a target_closed_incomplete
+target (closed without completing) or a target_state_unreadable one cannot be
+satisfied by widening, so it is reported in dangling but never offered as a
+candidate. closure_candidates is ONE HOP: adding those refs can surface a new
+generation of dangling edges, so iterate until valid rather than reading one
+preview as a completeness proof.
+
+A dangling set and a cycle are REPORTS at 200, not errors. Request-shaped
+problems are still refusals, identical to fishhawk_start_campaign's: a malformed
+items ref fails campaign_item_ref_invalid, a non-child subset ref fails
+campaign_item_not_child, a repo without the GitHub App fails repo_not_installed,
+and a provider that cannot resolve an arbitrary issue set fails
+issue_set_resolution_unsupported. A write tool: needs an operator token with
+write:campaigns scope.
+`),
+	}, resolver.previewCampaign)
+}
+
+// previewCampaign is the tool handler. Its client-side source validation mirrors
+// startCampaign's so a conflicting request costs no backend round-trip; the
+// backend enforces the same rules independently.
+func (r *runResolver) previewCampaign(ctx context.Context, _ *mcp.CallToolRequest, in PreviewCampaignInput) (*mcp.CallToolResult, PreviewCampaignOutput, error) {
+	repo := strings.TrimSpace(in.Repo)
+	if repo == "" {
+		return nil, PreviewCampaignOutput{}, errors.New("repo is required (owner/name)")
+	}
+	groomingRunID := strings.TrimSpace(in.GroomingRunID)
+	if strings.TrimSpace(in.EpicRef) == "" && len(in.Items) == 0 && groomingRunID == "" {
+		return nil, PreviewCampaignOutput{}, errors.New("one of epic_ref, items or grooming_run_id is required: pass epic_ref to preview an epic's children, items alone to preview an explicit issue list, or grooming_run_id to preview an approved grooming run's ratified order")
+	}
+	if groomingRunID != "" {
+		if strings.TrimSpace(in.EpicRef) != "" {
+			return nil, PreviewCampaignOutput{}, errors.New("grooming_run_id cannot be combined with epic_ref: the approved grooming order IS the item set — pass grooming_run_id alone, or drop it and preview the epic")
+		}
+		if len(in.Items) > 0 {
+			return nil, PreviewCampaignOutput{}, errors.New("grooming_run_id cannot be combined with items: the approved grooming order IS the item set — pass grooming_run_id alone, or drop it and name the items explicitly")
+		}
+		if in.GroomingLimit < 0 {
+			return nil, PreviewCampaignOutput{}, fmt.Errorf("grooming_order_limit %d must be >= 0 (0 means no cap)", in.GroomingLimit)
+		}
+	}
+
+	var groomingSource *campaignGroomingSource
+	if groomingRunID != "" {
+		groomingSource = &campaignGroomingSource{
+			RunID:           groomingRunID,
+			Limit:           in.GroomingLimit,
+			AllowSuperseded: in.GroomingAllowSuperseded,
+		}
+	}
+
+	preview, err := r.api.PreviewCampaign(ctx, campaignPreviewRequest{
+		Repo:    repo,
+		EpicRef: in.EpicRef,
+		Items:   in.Items,
+		// Forwarded verbatim — the backend is the registry authority, so the
+		// client does not second-guess the id. Empty omits the key entirely.
+		Provider:       strings.TrimSpace(in.Provider),
+		GroomingSource: groomingSource,
+	})
+	if err != nil {
+		// Map the backend's REQUEST-shaped refusals onto operator-actionable
+		// tool errors. Note what is deliberately ABSENT: there is no
+		// campaign_dangling_dependency case, because at this endpoint a dangling
+		// set is a 200 REPORT the caller reads, not an error.
+		var ae *apiError
+		if errors.As(err, &ae) {
+			switch ae.Code {
+			case "repo_not_installed":
+				return nil, PreviewCampaignOutput{}, fmt.Errorf(
+					"repo_not_installed: %s — install the Fishhawk GitHub App on %s before previewing a campaign", ae.Message, repo)
+			case "campaign_item_ref_invalid":
+				return nil, PreviewCampaignOutput{}, fmt.Errorf(
+					"campaign_item_ref_invalid: %s — an items ref is not a valid issue reference; pass a bare number (101), #101, or issue:101 for every items entry", ae.Message)
+			case "campaign_item_not_child":
+				return nil, PreviewCampaignOutput{}, fmt.Errorf(
+					"campaign_item_not_child: %s — an items ref is not a child of epic %s; pass only issue refs that are children of the epic, or omit items to preview every child", ae.Message, in.EpicRef)
+			case "issue_set_resolution_unsupported":
+				return nil, PreviewCampaignOutput{}, fmt.Errorf(
+					"issue_set_resolution_unsupported: %s — the repo's work-item provider cannot resolve an arbitrary issue set without an epic; pass epic_ref instead", ae.Message)
+			case "issue_set_resolution_timeout":
+				return nil, PreviewCampaignOutput{}, fmt.Errorf(
+					"issue_set_resolution_timeout: %s — resolving %v of %v items exceeded the server's %v-second budget. Preview a smaller set (or pass grooming_order_limit %v)",
+					ae.Message, ae.Details["resolved"], ae.Details["items_total"], ae.Details["budget_seconds"], ae.Details["suggested_grooming_order_limit"])
+			case "campaign_repo_unconfigured":
+				return nil, PreviewCampaignOutput{}, fmt.Errorf(
+					"campaign_repo_unconfigured: %s — this deployment has no campaign repository wired, so there is no campaign to preview", ae.Message)
+			case "validation_failed":
+				// The ONE validation_failed shape carrying an operator-actionable
+				// remedy the generic wrapper cannot: an UNREGISTERED `provider`
+				// (#3645). Mirrors startCampaign's arm so the two verbs answer the
+				// same refusal in the same words. Every OTHER validation_failed
+				// falls out of the switch to the generic wrapper below.
+				if field, _ := ae.Details["field"].(string); field == "provider" {
+					return nil, PreviewCampaignOutput{}, fmt.Errorf(
+						"validation_failed: %s — provider %v is not registered on this deployment; pass one of %v, or omit provider to take the repo's work-management conventions",
+						ae.Message, ae.Details["got"], ae.Details["registered"])
+				}
+			case "provider_unimplemented":
+				// The backend's static-literal `remedy` VERBATIM, for the reason
+				// startCampaign's arm gives: it is mode-dependent, so re-deriving
+				// it here would flatten two modes into one wrong message.
+				return nil, PreviewCampaignOutput{}, fmt.Errorf(
+					"provider_unimplemented: %s — the resolved work-item provider is %v and this deployment has registered %v; %v",
+					ae.Message, ae.Details["provider"], ae.Details["registered"], ae.Details["remedy"])
+			}
+		}
+		return nil, PreviewCampaignOutput{}, err
+	}
+	return nil, PreviewCampaignOutput{Preview: *preview}, nil
 }
 
 // startCampaign is the tool handler.

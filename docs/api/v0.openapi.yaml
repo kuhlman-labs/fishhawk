@@ -2854,6 +2854,151 @@ components:
           description: The target's observed `state_reason` (e.g. `completed`).
           example: completed
 
+    CampaignPreviewItem:
+      type: object
+      description: |
+        One resolved item in a `CampaignPreview` (#3647): the legible half of a
+        `CampaignItem`, minus everything that only exists once a campaign row
+        does (`id`, `run_id`, `state`, `pause_reason`).
+      required: [issue_ref, depends_on, position]
+      properties:
+        issue_ref:
+          type: string
+          example: "issue:1441"
+        depends_on:
+          type: array
+          items: { type: string }
+          description: |
+            The IN-SET `depends_on` edges for this item, as issue refs. This is
+            how the preview carries the resolved edge set. ALWAYS present on
+            both the valid and the invalid path (an item with no dependency
+            carries an empty array, never `null`).
+        wave:
+          type: integer
+          description: |
+            The 0-based topological wave this item lands in. The ONE field a
+            preview cannot always answer: on an INVALID set assembly never
+            reached the wave sort, so the key is ABSENT.
+        autonomy:
+          type: string
+          enum: [low, medium, high]
+          description: The item's autonomy tier; absent when the issue carries no `autonomy:*` label.
+        position:
+          type: integer
+          description: The item's 0-based place in the queue the campaign would be created with.
+
+    CampaignPreviewDangling:
+      type: object
+      description: |
+        One `depends_on` edge that blocks assembly, reported as DATA rather than
+        as the `422` refusal `POST /v0/campaigns` answers with (#3647).
+      required: [from, to, reason, remedy]
+      properties:
+        from:
+          type: string
+          description: The depending issue, as `issue:N`.
+          example: "issue:1441"
+        to:
+          type: string
+          description: |
+            The dependency target, rendered by the SAME authority the create
+            refusal's `dangling_*` detail lists use: `issue:N` for a resolvable
+            same-repo target, `unparsable:<digest>:"<token>"` for a cross-repo
+            or unparseable one (never the identity-less `issue:0`).
+          example: "issue:1639"
+        reason:
+          type: string
+          enum: [not_child, excluded_incomplete, target_closed_incomplete, target_state_unreadable]
+          description: |
+            Why the edge blocks assembly — the same four causes the create
+            refusal's `dangling_not_child` / `dangling_excluded_incomplete` /
+            `dangling_closed_incomplete` / `dangling_state_unreadable` detail
+            keys partition the edges into.
+        remedy:
+          type: string
+          description: One short operator-facing sentence naming what to do about this edge.
+
+    CampaignPreview:
+      type: object
+      description: |
+        The `POST /v0/campaigns/preview` report (#3647). It is a REPORT, not a
+        campaign: nothing is persisted, so it carries no `id`, `state` or
+        timestamps.
+      required: [valid, repo, item_count, items]
+      properties:
+        valid:
+          type: boolean
+          description: |
+            `true` when `POST /v0/campaigns` with this same source would have
+            created the campaign; `false` when a dangling `depends_on` edge or a
+            dependency cycle blocks assembly.
+        repo:
+          type: string
+          example: kuhlman-labs/fishhawk
+        epic_ref:
+          type: string
+          description: The previewed epic, in `issue:N` form. Absent for the no-epic and grooming sources.
+        item_count:
+          type: integer
+        wave_count:
+          type: integer
+          description: Absent when the set is invalid — assembly never reached the wave sort.
+        waves:
+          type: array
+          description: |
+            The topological dispatch order: `waves[w]` holds the issue refs
+            eligible in wave `w`. Absent when the set is invalid.
+          items:
+            type: array
+            items: { type: string }
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/CampaignPreviewItem' }
+          description: |
+            The resolved items with their in-set edges. Present on BOTH the
+            valid and the INVALID path, so an operator iterating toward a closed
+            set sees the partial graph alongside the blocking edges — `waves`
+            may be omitted on an invalid set, `items` and their edges may not.
+        satisfied_dependencies:
+          type: array
+          items: { $ref: '#/components/schemas/SatisfiedDependency' }
+          description: |
+            `depends_on` edges elided because their out-of-set target was
+            already closed-and-completed (#2953) — the same block the create
+            response carries. Absent when nothing was elided.
+        grooming_source:
+          type: object
+          additionalProperties: true
+          description: The resolved grooming provenance for a `grooming_source` preview. Absent otherwise.
+        dangling:
+          type: array
+          items: { $ref: '#/components/schemas/CampaignPreviewDangling' }
+          description: |
+            The edges blocking assembly. Absent on a valid preview, and absent
+            (with `message` set) for a defensively-wrapped dangling error the
+            assembler could not categorize.
+        closure_candidates:
+          type: array
+          items: { type: string }
+          description: |
+            The DEDUPED, sorted out-of-set issue refs to ADD to `items` to close
+            the set. Derived ONLY from the WIDENABLE causes (`not_child`,
+            `excluded_incomplete`): a `target_closed_incomplete` or
+            `target_state_unreadable` target is reported under `dangling` but
+            deliberately EXCLUDED here, because adding it cannot satisfy the
+            edge.
+
+            ONE HOP, not a transitive closure. Adding these can surface a NEW
+            generation of dangling edges, so closing a deep graph is an
+            iterate-until-valid loop — which is what this endpoint makes cheap.
+            Do not read one preview as a completeness proof.
+        cycle:
+          type: string
+          description: The assembler's message when the set is invalid because its `depends_on` edges cycle.
+        message:
+          type: string
+          description: The assembler's own message on a dangling report.
+
     CampaignItem:
       type: object
       description: |
@@ -12758,6 +12903,161 @@ paths:
             budget is `--issue-set-resolution-budget` /
             `FISHHAWKD_ISSUE_SET_RESOLUTION_BUDGET` (default 120s, permitted
             maximum 10m).
+
+  /v0/campaigns/preview:
+    post:
+      operationId: previewCampaign
+      summary: Preview a campaign without creating it
+      description: |
+        NON-MUTATING dry run of `POST /v0/campaigns` (#3647). It resolves the
+        SAME item set through the SAME source resolver, runs the SAME assembly,
+        and returns the wave-ordered DAG — or the `depends_on` edges that block
+        it — as a `200` REPORT. It creates NO campaign row, NO item rows and NO
+        audit entry on any path.
+
+        WHY IT EXISTS. A campaign must be dependency-CLOSED: every `depends_on`
+        target of an included item must itself be in the batch, and
+        `POST /v0/campaigns` refuses a set that is not with
+        `422 campaign_dangling_dependency`. Assembling a closed set by hand means
+        guessing and re-reading a refusal. This endpoint reports the blocking
+        edges as DATA plus `closure_candidates` — the issues to ADD to `items` —
+        so the set is assembled by iterating.
+
+        The request body carries ONLY the SOURCE fields (`repo` plus one of
+        `epic_ref` / `items` / `grooming_source`, and the optional `provider`
+        selector). The create-only knobs —
+        `pause_policy`, `operator_agent`, `working_dir` and the
+        `Idempotency-Key` header — configure PERSISTENCE, which a preview does
+        not do, so they are rejected as unknown body fields
+        (`400 validation_failed`) rather than silently ignored.
+
+        AUTH: the SAME `write:campaigns` scope `POST /v0/campaigns` requires. A
+        preview costs the IDENTICAL per-item forge sweep and is the pre-flight of
+        a write; widening it to read-only tokens would open a forge-read
+        amplification surface to a strictly less privileged token.
+
+        REFUSALS ARE IDENTICAL TO CREATE'S, by construction: both handlers call
+        one shared source resolver, so every status/code/details an operator can
+        hit at create is hit here for the same cause. The ONE deliberate
+        difference is the outcome this endpoint exists for — a dangling edge set
+        and a dependency cycle are `200` reports with `valid: false`, where
+        create answers `422 campaign_dangling_dependency` / `400
+        validation_failed`.
+      tags: [campaigns]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [repo]
+              description: |
+                `repo` is always required, plus EXACTLY ONE of `epic_ref` /
+                `items` / `grooming_source` — the same one-of rule
+                `POST /v0/campaigns` enforces, refused in the same combinations.
+              properties:
+                repo:
+                  type: string
+                  example: kuhlman-labs/fishhawk
+                epic_ref:
+                  type: string
+                  description: |
+                    OPTIONAL. The epic to decompose, in `issue:N` form. Omit it
+                    and pass `items` to preview a no-epic set instead.
+                  example: "issue:1439"
+                items:
+                  type: array
+                  items: { type: string }
+                  description: |
+                    OPTIONAL subset filter (WITH `epic_ref`) or the
+                    AUTHORITATIVE issue set (WITHOUT it) — issue refs (`N`, `#N`
+                    or `issue:N`). This is the field an operator ITERATES: add
+                    the refs the previous preview reported in
+                    `closure_candidates` and preview again until `valid` is true.
+                  example: ["issue:1440", "issue:1441"]
+                provider:
+                  type: string
+                  description: |
+                    OPTIONAL work-item provider id to assemble this preview
+                    against, overriding the repo's conventions-resolved
+                    provider — the SAME selector `POST /v0/campaigns` takes
+                    (#3645). It is SOURCE shape, not a persistence knob: it
+                    decides which issue tracker the DAG is resolved against, so
+                    pass the same value you will pass to create. An UNREGISTERED
+                    id is refused `400 validation_failed` on field `provider`
+                    with the registered set in `details`, before any forge
+                    round-trip.
+                  example: github_projects
+                grooming_source:
+                  type: object
+                  description: |
+                    OPTIONAL: preview an APPROVED grooming run's ratified order,
+                    exactly as `POST /v0/campaigns` would build from it.
+                    MUTUALLY EXCLUSIVE with `epic_ref` and `items`.
+                  required: [run_id]
+                  properties:
+                    run_id: { $ref: '#/components/schemas/UUID' }
+                    limit:
+                      type: integer
+                      minimum: 0
+                      description: |
+                        OPTIONAL cap on the previewed batch by ratified rank.
+                        Previewing at several limits is the cheap way to find
+                        the smallest dependency-closed prefix.
+                    allow_superseded:
+                      type: boolean
+                      description: |
+                        OPTIONAL: preview an order a NAMED newer approved
+                        grooming run has superseded. Default `false` refuses
+                        that case, exactly as create does.
+      responses:
+        '200':
+          description: |
+            The preview report. `valid: true` means `POST /v0/campaigns` with
+            this same source would create the campaign; `valid: false` means it
+            would be refused, and the report names why.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CampaignPreview' }
+        '400':
+          description: |
+            `validation_failed` — `repo` not in owner/name form, NONE of
+            `epic_ref` / `items` / `grooming_source` provided,
+            `grooming_source` combined with `epic_ref` or with `items`,
+            `grooming_source.run_id` empty, `grooming_source.limit` negative, an
+            UNREGISTERED `provider` (details carry `field`, `got` and the live
+            `registered` set), or the body malformed / carrying an unknown field
+            (which includes the create-only `pause_policy`, `operator_agent` and
+            `working_dir`).
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: "`insufficient_scope` — bearer token missing `write:campaigns`."
+        '404':
+          description: "`grooming_run_not_found` — as on `POST /v0/campaigns`."
+        '422':
+          description: |
+            `repo_not_installed`, `campaign_item_not_child`,
+            `campaign_item_ref_invalid` and every `grooming_source` refusal — the
+            same codes, statuses and details `POST /v0/campaigns` answers with.
+            NOTE what is ABSENT: `campaign_dangling_dependency` is NOT returned
+            here — a dangling edge set is the `200` report this endpoint exists
+            to produce.
+        '501':
+          description: |
+            `provider_unimplemented`, `epic_children_unsupported`,
+            `issue_set_resolution_unsupported` — as on `POST /v0/campaigns`.
+        '502':
+          description: |
+            `installation_resolution_failed`, `epic_children_query_failed`,
+            `issue_set_resolution_failed`,
+            `grooming_order_supersession_unreadable` — as on `POST /v0/campaigns`.
+        '503':
+          description: "`campaign_repo_unconfigured` — no campaign repository wired."
+        '504':
+          description: |
+            `issue_set_resolution_timeout` — as on `POST /v0/campaigns`. A
+            preview does the identical per-item forge sweep, so it is bounded by
+            the same `--issue-set-resolution-budget`.
 
   /v0/campaigns/{campaign_id}:
     get:

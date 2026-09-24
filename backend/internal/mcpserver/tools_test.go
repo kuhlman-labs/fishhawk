@@ -564,6 +564,17 @@ type fakeBackend struct {
 	createCampaignStatus int
 	createCampaignErr    string
 
+	// #3647 preview fixtures: POST /v0/campaigns/preview. previewCampaignBody
+	// captures the last decoded body, previewCampaignResp the report to serve
+	// (status defaults to 200), previewCampaignErr a verbatim 4xx/5xx envelope,
+	// and previewCampaignCalls the never-dialed seam a client-side refusal is
+	// asserted against.
+	previewCampaignBody   campaignPreviewRequest
+	previewCampaignResp   CampaignPreview
+	previewCampaignStatus int
+	previewCampaignErr    string
+	previewCampaignCalls  int
+
 	// getCampaignStatusID captures the last GET /v0/campaigns/{id}/status path
 	// id so status tests can assert the path round-trip. campaignStatusByID
 	// seeds the per-id response; an unkeyed id returns a minimal running-campaign
@@ -734,6 +745,7 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		integrateWaveStatus:           http.StatusOK,
 		integrateWaveCalledBy:         map[uuid.UUID]int{},
 		createCampaignStatus:          http.StatusCreated,
+		previewCampaignStatus:         http.StatusOK,
 		startCampaignItemRunStatus:    http.StatusCreated,
 		campaignStatusByID:            map[uuid.UUID]CampaignStatus{},
 		campaignStatusStatus:          http.StatusOK,
@@ -1444,6 +1456,27 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 			} else {
 				resp.PausePolicy = "pause_campaign"
 			}
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	})
+	mux.HandleFunc("POST /v0/campaigns/preview", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		var body campaignPreviewRequest
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		fb.mu.Lock()
+		fb.previewCampaignBody = body
+		fb.previewCampaignCalls++
+		status := fb.previewCampaignStatus
+		errBody := fb.previewCampaignErr
+		resp := fb.previewCampaignResp
+		fb.mu.Unlock()
+		w.WriteHeader(status)
+		if errBody != "" {
+			_, _ = w.Write([]byte(errBody))
+			return
+		}
+		if resp.Repo == "" {
+			resp.Repo = body.Repo
 		}
 		_ = json.NewEncoder(w).Encode(resp)
 	})
@@ -3225,7 +3258,14 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	// Registering only one would leave the identical unreachable-recovery defect
 	// standing for the other arm, which is the whole defect #3623 reports. This is
 	// one gap closed, not two features.
-	const wantToolCount = 57
+	//
+	// #3647 adds exactly ONE tool — fishhawk_preview_campaign, the NON-MUTATING
+	// dry run of fishhawk_start_campaign that reports the wave-ordered DAG (or
+	// the depends_on edges blocking it, plus the closure_candidates to add) as
+	// DATA at 200 instead of as a campaign_dangling_dependency refusal, so a
+	// dependency-closed item set is assembled by iterating rather than by hand —
+	// taking the total 57 -> 58.
+	const wantToolCount = 58
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",
@@ -3286,6 +3326,20 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 			t.Errorf("%s is not in the registered tool list — the completion_blocked recovery verb it wraps "+
 				"is unreachable over MCP (the #3623 defect)", name)
 		}
+	}
+	// fishhawk_preview_campaign (#3647) must be wire-visible by NAME. The
+	// 57 -> 58 count bump alone stays green if the registration is dropped and a
+	// DIFFERENT tool added in the same change, and an unadvertised preview verb
+	// leaves the by-hand item-set assembly this change exists to retire in place.
+	var sawPreviewCampaign bool
+	for _, tool := range res.Tools {
+		if tool.Name == "fishhawk_preview_campaign" {
+			sawPreviewCampaign = true
+			break
+		}
+	}
+	if !sawPreviewCampaign {
+		t.Error("fishhawk_preview_campaign is not in the registered tool list — the campaign dry run is unreachable over MCP")
 	}
 	if !sawConsolidate {
 		t.Error("fishhawk_consolidate_slices is not registered/visible over ListTools")

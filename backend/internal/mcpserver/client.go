@@ -3636,6 +3636,109 @@ func (c *apiClient) CreateCampaign(ctx context.Context, req campaignCreateReques
 	return &camp, nil
 }
 
+// campaignPreviewRequest is the POST /v0/campaigns/preview body (#3647). It
+// carries ONLY the source fields: the preview endpoint decodes with
+// DisallowUnknownFields and has no create-only knobs, so sending
+// pause_policy/operator_agent/working_dir/Idempotency-Key would be a 400.
+// EpicRef keeps the non-omitempty treatment campaignCreateRequest gives it, for
+// the same reason (an empty epic_ref routes to the no-epic branch).
+type campaignPreviewRequest struct {
+	Repo    string   `json:"repo"`
+	EpicRef string   `json:"epic_ref"`
+	Items   []string `json:"items,omitempty"`
+	// Provider is the OPTIONAL work-item provider selector (#3645), carried on
+	// the preview too because it is SOURCE shape: it decides which issue tracker
+	// the DAG is resolved against. A preview that could not be pointed at the
+	// provider the create will be pointed at would report a graph from a
+	// different tracker. Forwarded VERBATIM; empty omits the key.
+	Provider       string                  `json:"provider,omitempty"`
+	GroomingSource *campaignGroomingSource `json:"grooming_source,omitempty"`
+}
+
+// CampaignPreviewItem is one resolved item in a preview report: its issue ref,
+// its IN-SET depends_on edges, its wave, its autonomy tier and its queue
+// position. Wave is a *int because an INVALID set has no wave assignment — the
+// assembler never reached the topological sort — while issue_ref, depends_on and
+// position are reported on BOTH the valid and the invalid path.
+type CampaignPreviewItem struct {
+	IssueRef  string   `json:"issue_ref"`
+	DependsOn []string `json:"depends_on"`
+	Wave      *int     `json:"wave,omitempty" jsonschema:"the 0-based topological wave this item lands in. Absent when the set is invalid: assembly never reached the wave sort"`
+	Autonomy  string   `json:"autonomy,omitempty"`
+	Position  int      `json:"position"`
+}
+
+// CampaignPreviewDangling is one depends_on edge that blocks assembly, reported
+// as DATA rather than as a refusal.
+type CampaignPreviewDangling struct {
+	From   string `json:"from" jsonschema:"the depending issue, as issue:N"`
+	To     string `json:"to" jsonschema:"the dependency target. issue:N for a resolvable same-repo target; unparsable:<digest>:\"token\" for a cross-repo or unparseable one"`
+	Reason string `json:"reason" jsonschema:"why the edge blocks assembly: not_child | excluded_incomplete | target_closed_incomplete | target_state_unreadable"`
+	Remedy string `json:"remedy" jsonschema:"one short operator-facing sentence naming what to do about this edge"`
+}
+
+// CampaignPreview is the POST /v0/campaigns/preview report — the wire shape
+// docs/api/v0.openapi.yaml's CampaignPreview schema defines. It is a REPORT, not
+// a campaign: nothing is persisted, so it carries no id/state/created_at.
+type CampaignPreview struct {
+	Valid                 bool                          `json:"valid" jsonschema:"true when POST /v0/campaigns with this same source would have created a campaign; false when a dangling depends_on edge or a cycle blocks assembly"`
+	Repo                  string                        `json:"repo"`
+	EpicRef               string                        `json:"epic_ref,omitempty"`
+	ItemCount             int                           `json:"item_count"`
+	WaveCount             *int                          `json:"wave_count,omitempty"`
+	Waves                 [][]string                    `json:"waves,omitempty" jsonschema:"the topological dispatch order: waves[w] holds the issue refs eligible in wave w. Absent when the set is invalid"`
+	Items                 []CampaignPreviewItem         `json:"items" jsonschema:"the resolved items with their in-set depends_on edges. Present on BOTH the valid and the invalid path, so an invalid report still shows the partial graph"`
+	SatisfiedDependencies []campaignSatisfiedDependency `json:"satisfied_dependencies,omitempty" jsonschema:"depends_on edges elided at assembly because the target was already closed-and-completed, so the set assembles rather than failing dangling"`
+	GroomingSource        map[string]any                `json:"grooming_source,omitempty" jsonschema:"provenance of a previewed grooming order, mirroring the campaign create response's block. Absent unless grooming_run_id was passed"`
+	Dangling              []CampaignPreviewDangling     `json:"dangling,omitempty" jsonschema:"the depends_on edges blocking assembly, one entry per edge with its cause and remedy. Empty on a valid preview"`
+	ClosureCandidates     []string                      `json:"closure_candidates,omitempty" jsonschema:"the deduped, sorted out-of-set issue refs to ADD to items to close the set. Derived ONLY from the widenable causes (not_child, excluded_incomplete) — a closed-incomplete or unreadable target is deliberately excluded because adding it cannot satisfy the edge. ONE HOP, not a transitive closure: adding these can surface a new generation of dangling edges, so iterate until valid"`
+	Cycle                 string                        `json:"cycle,omitempty" jsonschema:"the assembler's message when the set is invalid because its depends_on edges cycle"`
+	Message               string                        `json:"message,omitempty" jsonschema:"the assembler's own message on a dangling report"`
+}
+
+// PreviewCampaign runs the NON-MUTATING dry run of POST /v0/campaigns via
+// `POST /v0/campaigns/preview` (#3647): it resolves the SAME item set, runs the
+// SAME assembly, and returns the wave-ordered DAG — or the depends_on edges that
+// block it — as a 200 REPORT. It creates no campaign, no items and no audit
+// entry.
+//
+// The source fields mirror CreateCampaign's exactly (repo plus one of EpicRef /
+// Items / GroomingSource, and the optional Provider selector); the create-only
+// knobs (pause_policy, operator_agent, working_dir, Idempotency-Key) have no
+// preview equivalent and are not accepted by the endpoint. It takes the request
+// STRUCT rather than positional parameters for the reason CreateCampaign does
+// (#3645): most of them are strings, which is a transposition hazard.
+//
+// A dangling set and a cycle are REPORTS (200, valid:false), NOT errors — that
+// is the point of the verb. Request-shaped failures stay the byte-identical
+// refusals CreateCampaign surfaces, since both handlers share one resolver:
+//   - 400 validation_failed (repo not owner/name, no source, three-source
+//     conflict, an UNREGISTERED provider, or a create-only field sent as an
+//     unknown body field)
+//   - 403 insufficient_scope (token lacks write:campaigns — a preview costs the
+//     identical per-item forge sweep as a create, so it is gated the same)
+//   - 422 repo_not_installed / campaign_item_not_child / campaign_item_ref_invalid
+//   - 501 issue_set_resolution_unsupported / epic_children_unsupported
+//   - 502 installation_resolution_failed / epic_children_query_failed /
+//     issue_set_resolution_failed
+//   - 504 issue_set_resolution_timeout
+//   - 503 campaign_repo_unconfigured
+func (c *apiClient) PreviewCampaign(ctx context.Context, req campaignPreviewRequest) (*CampaignPreview, error) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("marshal preview campaign: %w", err)
+	}
+	var preview CampaignPreview
+	// Routed through the ISSUE-SET client, not the 30s short one, for EXACTLY
+	// the reason CreateCampaign is: the no-epic branch does one forge
+	// round-trip per item, so a 41-issue preview legitimately takes minutes and
+	// the short client would be what gave up first. See issueSetClientTimeout.
+	if _, err := c.doWithStatusUsing(c.httpIssueSet, ctx, http.MethodPost, "/v0/campaigns/preview", body, nil, &preview); err != nil {
+		return nil, err
+	}
+	return &preview, nil
+}
+
 // GetCampaignStatus reads the campaign rollup + distilled next_action via
 // `GET /v0/campaigns/{id}/status` (E25.4) — the surface the operator-agent
 // polls to drive a campaign. Read-only. 4xx/5xx surfaces:

@@ -2490,6 +2490,165 @@ func TestCreateCampaign_ConventionsError_500(t *testing.T) {
 	}
 }
 
+// TestCreateCampaign_PostExtraction_RefusalCodes is the EXTRACTION REGRESSION
+// PIN for #3647. handleCreateCampaign's source-resolution span — installation
+// lookup, provider resolution, the epic-sweep / issue-set branch and the
+// ratified-rank permutation — moved VERBATIM into the shared
+// resolveCampaignSource so POST /v0/campaigns/preview resolves the identical
+// set. That move carries twelve distinct refusal branches, and a silent change
+// to any of them would degrade a SHIPPED surface to serve an unshipped one.
+//
+// The pre-existing per-refusal tests above remain the primary oracle (they pass
+// UNCHANGED, which is the real proof the extraction is behaviour-preserving).
+// This table is the SECOND, compact statement of the same claim: one case per
+// moved refusal code, so deleting a moved branch reddens the case naming it
+// rather than only an unrelated-looking test elsewhere in the file.
+func TestCreateCampaign_PostExtraction_RefusalCodes(t *testing.T) {
+	cases := []struct {
+		name       string
+		setup      func(t *testing.T) *Server
+		body       string
+		wantStatus int
+		wantCode   string
+	}{
+		{
+			name:       "validation_failed (repo not owner/name)",
+			setup:      func(*testing.T) *Server { return New(Config{CampaignRepo: newFakeCampaignRepo()}) },
+			body:       `{"repo":"nope","epic_ref":"issue:99"}`,
+			wantStatus: http.StatusBadRequest, wantCode: "validation_failed",
+		},
+		{
+			name:       "validation_failed (no source)",
+			setup:      func(*testing.T) *Server { return New(Config{CampaignRepo: newFakeCampaignRepo()}) },
+			body:       `{"repo":"kuhlman-labs/fishhawk"}`,
+			wantStatus: http.StatusBadRequest, wantCode: "validation_failed",
+		},
+		{
+			name: "repo_not_installed",
+			setup: func(t *testing.T) *Server {
+				registerEpicProvider(t, &fakeEpicProvider{result: smallDAG()})
+				return New(Config{CampaignRepo: newFakeCampaignRepo(), GitHub: newInstallationGitHubClient(t, 0, true)})
+			},
+			body:       `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`,
+			wantStatus: http.StatusUnprocessableEntity, wantCode: "repo_not_installed",
+		},
+		{
+			name: "internal_error (conventions load)",
+			setup: func(t *testing.T) *Server {
+				prev := conventionsLoader
+				conventionsLoader = func(context.Context, string) (workmgmt.Conventions, error) {
+					return workmgmt.Conventions{}, fmt.Errorf("conventions boom")
+				}
+				t.Cleanup(func() { conventionsLoader = prev })
+				return New(Config{CampaignRepo: newFakeCampaignRepo()})
+			},
+			body:       `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`,
+			wantStatus: http.StatusInternalServerError, wantCode: "internal_error",
+		},
+		{
+			name: "provider_unimplemented",
+			setup: func(t *testing.T) *Server {
+				prev := conventionsLoader
+				conventionsLoader = func(context.Context, string) (workmgmt.Conventions, error) {
+					return workmgmt.Conventions{Provider: "never_registered_provider"}, nil
+				}
+				t.Cleanup(func() { conventionsLoader = prev })
+				return New(Config{CampaignRepo: newFakeCampaignRepo()})
+			},
+			body:       `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`,
+			wantStatus: http.StatusNotImplemented, wantCode: "provider_unimplemented",
+		},
+		{
+			name: "epic_children_unsupported",
+			setup: func(t *testing.T) *Server {
+				registerIssueSetProvider(t, &fakeIssueSetProvider{result: noEpicDAG()})
+				return New(Config{CampaignRepo: newFakeCampaignRepo()})
+			},
+			body:       `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`,
+			wantStatus: http.StatusNotImplemented, wantCode: "epic_children_unsupported",
+		},
+		{
+			name: "epic_children_query_failed",
+			setup: func(t *testing.T) *Server {
+				registerEpicProvider(t, &fakeEpicProvider{queryErr: errors.New("boom")})
+				return New(Config{CampaignRepo: newFakeCampaignRepo()})
+			},
+			body:       `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99"}`,
+			wantStatus: http.StatusBadGateway, wantCode: "epic_children_query_failed",
+		},
+		{
+			name: "campaign_item_ref_invalid (epic subset path)",
+			setup: func(t *testing.T) *Server {
+				registerEpicProvider(t, &fakeEpicProvider{result: smallDAG()})
+				return New(Config{CampaignRepo: newFakeCampaignRepo()})
+			},
+			body:       `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99","items":["not-a-ref"]}`,
+			wantStatus: http.StatusUnprocessableEntity, wantCode: "campaign_item_ref_invalid",
+		},
+		{
+			name: "campaign_item_not_child",
+			setup: func(t *testing.T) *Server {
+				registerEpicProvider(t, &fakeEpicProvider{result: smallDAG()})
+				return New(Config{CampaignRepo: newFakeCampaignRepo()})
+			},
+			body:       `{"repo":"kuhlman-labs/fishhawk","epic_ref":"issue:99","items":["issue:999"]}`,
+			wantStatus: http.StatusUnprocessableEntity, wantCode: "campaign_item_not_child",
+		},
+		{
+			name: "issue_set_resolution_unsupported",
+			setup: func(t *testing.T) *Server {
+				registerEpicProvider(t, &fakeEpicProvider{result: smallDAG()})
+				return New(Config{CampaignRepo: newFakeCampaignRepo()})
+			},
+			body:       `{"repo":"kuhlman-labs/fishhawk","items":["issue:101"]}`,
+			wantStatus: http.StatusNotImplemented, wantCode: "issue_set_resolution_unsupported",
+		},
+		{
+			name: "issue_set_resolution_failed",
+			setup: func(t *testing.T) *Server {
+				registerIssueSetProvider(t, &fakeIssueSetProvider{resolveErr: errors.New("github rejected the request")})
+				return New(Config{CampaignRepo: newFakeCampaignRepo()})
+			},
+			body:       `{"repo":"kuhlman-labs/fishhawk","items":["issue:101"]}`,
+			wantStatus: http.StatusBadGateway, wantCode: "issue_set_resolution_failed",
+		},
+		{
+			name: "campaign_item_ref_invalid (no-epic path)",
+			setup: func(t *testing.T) *Server {
+				registerIssueSetProvider(t, &fakeIssueSetProvider{
+					resolveErr: fmt.Errorf("%w: %q", workmgmt.ErrInvalidItemRef, "not-a-ref"),
+				})
+				return New(Config{CampaignRepo: newFakeCampaignRepo()})
+			},
+			body:       `{"repo":"kuhlman-labs/fishhawk","items":["not-a-ref"]}`,
+			wantStatus: http.StatusUnprocessableEntity, wantCode: "campaign_item_ref_invalid",
+		},
+		{
+			name: "issue_set_resolution_timeout",
+			setup: func(t *testing.T) *Server {
+				registerIssueSetProvider(t, &fakeIssueSetProvider{
+					resolveErr: &workmgmt.IssueSetResolutionTimeout{Resolved: 3, Total: 41, SuggestedLimit: 3},
+				})
+				return New(Config{CampaignRepo: newFakeCampaignRepo()})
+			},
+			body:       `{"repo":"kuhlman-labs/fishhawk","items":["issue:101"]}`,
+			wantStatus: http.StatusGatewayTimeout, wantCode: "issue_set_resolution_timeout",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := tc.setup(t)
+			w := postCampaign(t, s, tc.body)
+			if w.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d (body=%s)", w.Code, tc.wantStatus, w.Body.String())
+			}
+			if code := decodeCampaignError(t, w); code != tc.wantCode {
+				t.Errorf("code = %q, want %q", code, tc.wantCode)
+			}
+		})
+	}
+}
+
 // --- next_action precedence (pure function) ---
 
 func TestComputeCampaignNextAction_Precedence(t *testing.T) {

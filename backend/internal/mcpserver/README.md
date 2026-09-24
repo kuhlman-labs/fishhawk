@@ -38,10 +38,10 @@ consumes only the first two):
   `initialize` handshake, the public alias of the package-private
   `onboardingInstructions`.
 
-## Exported surface: why 296 identifiers, not 3
+## Exported surface: why 301 identifiers, not 3
 
-The package presents **296** exported top-level identifiers, but only the three
-above are intended entry points. The other 293 are the tool I/O
+The package presents **301** exported top-level identifiers, but only the three
+above are intended entry points. The other 298 are the tool I/O
 request/response structs. The MCP SDK's jsonschema reflection requires each
 tool's input/output type — and its exported fields — to build the tool's
 schema, so **unexporting them would break tool registration**. In `package
@@ -2161,6 +2161,33 @@ per-tool contract). Internals not covered there:
   `apiClient.CreateCampaign` correspondingly takes the request STRUCT rather than nine positional parameters, five of
   them strings — the transposition hazard `campaignGroomingSource`'s own comment warns about, and the ladder only
   grows.
+- **`fishhawk_preview_campaign` (#3647) — the dry run.** The NON-MUTATING sibling of `fishhawk_start_campaign`, over
+  `POST /v0/campaigns/preview`. It takes the SAME source fields (`repo` plus one of `epic_ref` / `items` /
+  `grooming_run_id`, refused in the same combinations by the same client-side guards, which dial nothing — plus the
+  `provider` selector, which is SOURCE shape: a preview resolved against a different provider is not a preview of the
+  start it precedes, so it carries the same forward-verbatim treatment and the same `validation_failed` /
+  `provider_unimplemented` gate arms `startCampaign` has) and NONE of
+  the create-only knobs — `pause_policy`, `operator_agent` and `working_dir` configure PERSISTENCE, which a preview
+  does not do, so the endpoint rejects them as unknown body fields. It creates no campaign, no items and no audit
+  entry.
+  It exists because a campaign must be dependency-CLOSED and `fishhawk_start_campaign` refuses a set that is not with
+  `campaign_dangling_dependency`. The preview turns "guess and read the refusal" into a loop: preview → read
+  `closure_candidates` → add those refs to `items` → preview again → start once `valid` is true.
+  **An invalid set is a REPORT, not an error.** `previewCampaign`'s gate-code mapping deliberately carries NO
+  `campaign_dangling_dependency` arm: at this endpoint a dangling set arrives as a 200 body the agent reads
+  (`valid:false`, `dangling[]` with per-edge `from`/`to`/`reason`/`remedy`, `closure_candidates`, and the resolved
+  `items` with their in-set edges so the partial graph is visible). `closure_candidates` names ONLY the WIDENABLE
+  targets (`not_child`, `excluded_incomplete`) — a `target_closed_incomplete` or `target_state_unreadable` target is
+  listed under `dangling` but never offered as something to add, because adding it cannot satisfy the edge — and it is
+  ONE HOP, so iterate rather than reading one preview as a completeness proof.
+  `CampaignPreviewItem.Wave` and `CampaignPreview.WaveCount` are `*int` for the same reason: an invalid set has no
+  wave assignment, and a pointer says ABSENT where a `0` would say "wave zero". The client method routes through
+  `httpIssueSet`, not the 30s short client, for exactly the reason `CreateCampaign` does — the no-epic branch costs one
+  forge round-trip per item — and takes the request STRUCT rather than positional parameters for the reason
+  `CreateCampaign` does (#3645): most of them are strings, which is a transposition hazard.
+  `TestPreviewCampaign_E2E_ThroughRealServer` drives the tool through the REAL `server.Handler()` over a
+  write-refusing `campaign.BaseFake`, so the `CampaignPreview` wire struct is proven against the JSON the server
+  EMITS rather than a hand-built approximation, and a handler that tried to persist would 500 rather than pass.
 - **`operator_agent` override (E25.12 / #1451).** `fishhawk_start_campaign`'s optional `operator_agent` — the
   campaign-level delegation override — is typed `map[string]any` on `StartCampaignInput` so the SDK's reflection-built
   input schema sees an unconstrained object; it is marshalled to opaque JSON the backend validates against

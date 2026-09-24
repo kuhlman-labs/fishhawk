@@ -730,6 +730,297 @@ func TestStartCampaign_ForbiddenScope_SurfacesError(t *testing.T) {
 	}
 }
 
+// --- fishhawk_preview_campaign (#3647) ---
+
+// TestPreviewCampaign_ValidReport_Passthrough drives the tool → real client →
+// wire → decode chain on a VALID report: the source fields reach the POST body
+// and the wave-ordered DAG decodes back out onto the tool result.
+func TestPreviewCampaign_ValidReport_Passthrough(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	waveCount := 2
+	waveZero, waveOne := 0, 1
+	fb.previewCampaignResp = CampaignPreview{
+		Valid: true, Repo: "kuhlman-labs/fishhawk", EpicRef: "issue:99",
+		ItemCount: 2, WaveCount: &waveCount,
+		Waves: [][]string{{"issue:100"}, {"issue:101"}},
+		Items: []CampaignPreviewItem{
+			{IssueRef: "issue:100", DependsOn: []string{}, Wave: &waveZero, Position: 0},
+			{IssueRef: "issue:101", DependsOn: []string{"issue:100"}, Wave: &waveOne, Position: 1},
+		},
+	}
+	r := newResolver(srv, nil)
+
+	_, out, err := r.previewCampaign(context.Background(), nil, PreviewCampaignInput{
+		Repo: "kuhlman-labs/fishhawk", EpicRef: "issue:99",
+	})
+	if err != nil {
+		t.Fatalf("previewCampaign: %v", err)
+	}
+	if fb.previewCampaignBody.Repo != "kuhlman-labs/fishhawk" || fb.previewCampaignBody.EpicRef != "issue:99" {
+		t.Errorf("backend got body = %+v", fb.previewCampaignBody)
+	}
+	if !out.Preview.Valid {
+		t.Fatalf("Preview.Valid = false, want true: %+v", out.Preview)
+	}
+	if out.Preview.WaveCount == nil || *out.Preview.WaveCount != 2 || len(out.Preview.Waves) != 2 {
+		t.Errorf("wave_count/waves did not decode: %+v", out.Preview)
+	}
+	if len(out.Preview.Items) != 2 || out.Preview.Items[1].Wave == nil || *out.Preview.Items[1].Wave != 1 {
+		t.Errorf("items did not decode: %+v", out.Preview.Items)
+	}
+	if len(out.Preview.Items[1].DependsOn) != 1 || out.Preview.Items[1].DependsOn[0] != "issue:100" {
+		t.Errorf("in-set edges did not decode: %+v", out.Preview.Items[1])
+	}
+}
+
+// TestPreviewCampaign_InvalidReport_Passthrough is the load-bearing tool-level
+// claim: an unassemblable set arrives as a REPORT the agent can read, not as an
+// error. The dangling edges, their reasons/remedies, the closure candidates AND
+// the partial item graph must all reach the tool result.
+func TestPreviewCampaign_InvalidReport_Passthrough(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.previewCampaignResp = CampaignPreview{
+		Valid: false, Repo: "kuhlman-labs/fishhawk", ItemCount: 1,
+		Items: []CampaignPreviewItem{{IssueRef: "issue:101", DependsOn: []string{}, Position: 0}},
+		Dangling: []CampaignPreviewDangling{
+			{From: "issue:101", To: "issue:999", Reason: "not_child", Remedy: "add it to items"},
+			{From: "issue:101", To: "issue:1641", Reason: "target_closed_incomplete", Remedy: "reopen or drop the edge"},
+		},
+		ClosureCandidates: []string{"issue:999"},
+		Message:           "campaign: dangling depends_on dependency",
+	}
+	r := newResolver(srv, nil)
+
+	_, out, err := r.previewCampaign(context.Background(), nil, PreviewCampaignInput{
+		Repo: "kuhlman-labs/fishhawk", Items: []string{"issue:101"},
+	})
+	if err != nil {
+		t.Fatalf("previewCampaign returned an ERROR for an invalid set; an invalid set must be a REPORT: %v", err)
+	}
+	if out.Preview.Valid {
+		t.Fatalf("Preview.Valid = true, want false: %+v", out.Preview)
+	}
+	if len(out.Preview.Dangling) != 2 {
+		t.Fatalf("dangling = %+v, want both edges", out.Preview.Dangling)
+	}
+	if out.Preview.Dangling[0].Reason != "not_child" || out.Preview.Dangling[0].To != "issue:999" {
+		t.Errorf("dangling[0] = %+v", out.Preview.Dangling[0])
+	}
+	if out.Preview.Dangling[1].Reason != "target_closed_incomplete" {
+		t.Errorf("dangling[1] = %+v", out.Preview.Dangling[1])
+	}
+	if len(out.Preview.ClosureCandidates) != 1 || out.Preview.ClosureCandidates[0] != "issue:999" {
+		t.Errorf("closure_candidates = %v, want [issue:999] (only the WIDENABLE cause)", out.Preview.ClosureCandidates)
+	}
+	// The partial graph reaches the agent too, not only the failure.
+	if len(out.Preview.Items) != 1 || out.Preview.Items[0].IssueRef != "issue:101" {
+		t.Errorf("items = %+v, want the resolved item on the invalid path", out.Preview.Items)
+	}
+	if out.Preview.Items[0].Wave != nil {
+		t.Errorf("item wave = %v, want absent on an invalid set", out.Preview.Items[0].Wave)
+	}
+	if fb.previewCampaignBody.Items == nil || fb.previewCampaignBody.Items[0] != "issue:101" {
+		t.Errorf("backend got items = %v", fb.previewCampaignBody.Items)
+	}
+}
+
+// TestPreviewCampaign_RefusalMapping_ItemRefInvalid: a REQUEST-shaped refusal
+// stays a refusal, and the operator message names the offending ref the backend
+// reported.
+func TestPreviewCampaign_RefusalMapping_ItemRefInvalid(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.previewCampaignStatus = http.StatusUnprocessableEntity
+	fb.previewCampaignErr = `{"error":{"code":"campaign_item_ref_invalid","message":"invalid item ref \"not-a-ref\""}}`
+	r := newResolver(srv, nil)
+
+	_, _, err := r.previewCampaign(context.Background(), nil, PreviewCampaignInput{
+		Repo: "kuhlman-labs/fishhawk", Items: []string{"not-a-ref"},
+	})
+	if err == nil {
+		t.Fatal("previewCampaign returned no error for a 422 campaign_item_ref_invalid")
+	}
+	if !strings.Contains(err.Error(), "campaign_item_ref_invalid") {
+		t.Errorf("error = %q, want it to name the code", err)
+	}
+	if !strings.Contains(err.Error(), "not-a-ref") {
+		t.Errorf("error = %q, want it to name the offending ref", err)
+	}
+	if !strings.Contains(err.Error(), "issue:101") {
+		t.Errorf("error = %q, want it to name the accepted ref forms", err)
+	}
+}
+
+// TestPreviewCampaign_SourceGuards_RefuseBeforeDialing pins the CLIENT-SIDE
+// source guards. Each is asserted against the explicit never-dialed seam
+// (previewCampaignCalls == 0) against a REACHABLE in-test server, so a local
+// refusal is distinguishable from a backend rejection or a connection error.
+func TestPreviewCampaign_SourceGuards_RefuseBeforeDialing(t *testing.T) {
+	cases := []struct {
+		name string
+		in   PreviewCampaignInput
+		want string
+	}{
+		{"repo missing", PreviewCampaignInput{EpicRef: "#1"}, "repo is required"},
+		{"no source", PreviewCampaignInput{Repo: "x/y"}, "one of epic_ref, items or grooming_run_id is required"},
+		{"grooming with epic_ref", PreviewCampaignInput{Repo: "x/y", EpicRef: "#1", GroomingRunID: "11111111-1111-1111-1111-111111111111"}, "cannot be combined with epic_ref"},
+		{"grooming with items", PreviewCampaignInput{Repo: "x/y", Items: []string{"#1"}, GroomingRunID: "11111111-1111-1111-1111-111111111111"}, "cannot be combined with items"},
+		{"negative grooming limit", PreviewCampaignInput{Repo: "x/y", GroomingRunID: "11111111-1111-1111-1111-111111111111", GroomingLimit: -1}, "must be >= 0"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fb, srv := newFakeBackend(t)
+			r := newResolver(srv, nil)
+			_, _, err := r.previewCampaign(context.Background(), nil, tc.in)
+			if err == nil {
+				t.Fatalf("previewCampaign(%+v) returned no error", tc.in)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error = %q, want it to contain %q", err, tc.want)
+			}
+			fb.mu.Lock()
+			calls := fb.previewCampaignCalls
+			fb.mu.Unlock()
+			if calls != 0 {
+				t.Errorf("backend dialed %d times; a source-guard refusal must cost no round-trip", calls)
+			}
+		})
+	}
+}
+
+// TestPreviewCampaign_ThreadsGroomingSourceThroughRealClient proves the grooming
+// block is actually threaded into the client call rather than dropped: a test
+// that marshalled campaignPreviewRequest itself could not detect that.
+func TestPreviewCampaign_ThreadsGroomingSourceThroughRealClient(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	const runID = "11111111-1111-1111-1111-111111111111"
+
+	_, _, err := r.previewCampaign(context.Background(), nil, PreviewCampaignInput{
+		Repo: "kuhlman-labs/fishhawk", GroomingRunID: runID, GroomingLimit: 5, GroomingAllowSuperseded: true,
+	})
+	if err != nil {
+		t.Fatalf("previewCampaign: %v", err)
+	}
+	gs := fb.previewCampaignBody.GroomingSource
+	if gs == nil {
+		t.Fatal("POST body carried no grooming_source block")
+	}
+	if gs.RunID != runID || gs.Limit != 5 || !gs.AllowSuperseded {
+		t.Errorf("grooming_source = %+v, want the threaded run/limit/allow_superseded", gs)
+	}
+}
+
+// TestPreviewCampaign_E2E_ThroughRealServer is the CROSS-BOUNDARY test: it
+// drives fishhawk_preview_campaign through the REAL MCP client → an httptest
+// server wrapping the REAL server.Handler() (so handlePreviewCampaign runs,
+// including bearerAuth + requireWriteScope) → the no-epic branch → a fake
+// IssueSetDependencyResolver → campaign.Assemble → the report JSON the server
+// actually emits.
+//
+// This is what proves the CampaignPreview wire struct decodes the shape the
+// server EMITS rather than a hand-written approximation: a field the server
+// renames or drops turns this RED where a fakeBackend serving hand-built JSON
+// would stay green.
+//
+// The campaign repository is campaign.BaseFake — every write method returns
+// ErrNotFound — so the preview's no-write property is enforced BY CONSTRUCTION
+// here: a handler that tried to persist would 500 rather than pass.
+func TestPreviewCampaign_E2E_ThroughRealServer(t *testing.T) {
+	t.Run("valid set", func(t *testing.T) {
+		prov := &fakeMCPResolverProvider{
+			name: workmgmt.Default().Provider,
+			result: &workmgmt.EpicChildrenResult{
+				Children: []workmgmt.EpicChild{{Number: 101, Title: "first"}, {Number: 102, Title: "second", Autonomy: "medium"}},
+				Edges:    []workmgmt.DependsEdge{{From: 102, To: 101}},
+			},
+		}
+		workmgmt.Register(prov)
+
+		out := previewThroughRealServer(t, PreviewCampaignInput{
+			Repo: "kuhlman-labs/fishhawk", Items: []string{"issue:101", "issue:102"},
+		})
+		if !out.Preview.Valid {
+			t.Fatalf("valid = false through the real server: %+v", out.Preview)
+		}
+		if out.Preview.WaveCount == nil || *out.Preview.WaveCount != 2 {
+			t.Errorf("wave_count = %v, want 2", out.Preview.WaveCount)
+		}
+		if len(out.Preview.Waves) != 2 || out.Preview.Waves[0][0] != "issue:101" || out.Preview.Waves[1][0] != "issue:102" {
+			t.Errorf("waves = %v, want [[issue:101] [issue:102]]", out.Preview.Waves)
+		}
+		if len(out.Preview.Items) != 2 {
+			t.Fatalf("items = %+v, want 2", out.Preview.Items)
+		}
+		second := out.Preview.Items[1]
+		if second.IssueRef != "issue:102" || second.Wave == nil || *second.Wave != 1 ||
+			len(second.DependsOn) != 1 || second.DependsOn[0] != "issue:101" || second.Autonomy != "medium" || second.Position != 1 {
+			t.Errorf("issue:102 = %+v, want wave 1 / depends_on [issue:101] / autonomy medium / position 1", second)
+		}
+		if got := prov.captured.Items; len(got) != 2 || got[0] != "issue:101" {
+			t.Errorf("resolver got items = %v, want the named set", got)
+		}
+	})
+
+	t.Run("dangling set reports rather than refuses", func(t *testing.T) {
+		prov := &fakeMCPResolverProvider{
+			name: workmgmt.Default().Provider,
+			result: &workmgmt.EpicChildrenResult{
+				Children: []workmgmt.EpicChild{{Number: 101, Title: "first"}},
+				DroppedEdges: []workmgmt.DependsEdge{
+					{From: 101, To: 999, Reason: workmgmt.DropNotChild},
+					{From: 101, To: 1641, Reason: workmgmt.DropTargetClosedIncomplete},
+				},
+			},
+		}
+		workmgmt.Register(prov)
+
+		out := previewThroughRealServer(t, PreviewCampaignInput{
+			Repo: "kuhlman-labs/fishhawk", Items: []string{"issue:101"},
+		})
+		if out.Preview.Valid {
+			t.Fatalf("valid = true on a dangling set: %+v", out.Preview)
+		}
+		if len(out.Preview.Dangling) != 2 {
+			t.Fatalf("dangling = %+v, want both edges as DATA", out.Preview.Dangling)
+		}
+		if len(out.Preview.ClosureCandidates) != 1 || out.Preview.ClosureCandidates[0] != "issue:999" {
+			t.Errorf("closure_candidates = %v, want only the widenable [issue:999]", out.Preview.ClosureCandidates)
+		}
+		// Operator condition 2, end to end: the resolved item and its edges are
+		// still reported on the invalid path.
+		if len(out.Preview.Items) != 1 || out.Preview.Items[0].IssueRef != "issue:101" {
+			t.Errorf("items = %+v, want the resolved item", out.Preview.Items)
+		}
+		if out.Preview.Message == "" {
+			t.Error("message empty: the assembler's reason must cross the wire")
+		}
+	})
+}
+
+// previewThroughRealServer stands up the REAL server.Handler() over a
+// write-refusing campaign.BaseFake repository and drives one
+// fishhawk_preview_campaign call against it through the real MCP client.
+func previewThroughRealServer(t *testing.T, in PreviewCampaignInput) PreviewCampaignOutput {
+	t.Helper()
+	const bearer = "fhk_preview_e2e"
+	tokRepo := &stubMCPAPITokens{tok: &apitoken.Token{
+		ID: uuid.New(), Subject: "github:op", Scopes: []string{"write:campaigns"}, PlainText: bearer,
+	}}
+	// BaseFake refuses every write (ErrNotFound), so a preview that tried to
+	// persist would 500 instead of reporting — the no-write property enforced by
+	// construction rather than asserted.
+	s := server.New(server.Config{CampaignRepo: campaign.BaseFake{}, APITokenRepo: tokRepo})
+	httpSrv := httptest.NewServer(s.Handler())
+	t.Cleanup(httpSrv.Close)
+
+	r := &runResolver{api: newAPIClient(config{backendURL: httpSrv.URL, apiToken: bearer})}
+	_, out, err := r.previewCampaign(context.Background(), nil, in)
+	if err != nil {
+		t.Fatalf("previewCampaign through the real server: %v", err)
+	}
+	return out
+}
+
 // --- fishhawk_get_campaign_status (E25.8 / #1447) ---
 
 // TestGetCampaignStatus_HappyPath_ReturnsRollupAndNextActions drives the chain
@@ -2837,5 +3128,46 @@ func TestStartCampaign_ProviderUnimplemented_SurfacesRemedy(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestPreviewCampaign_ThreadsProviderThroughRealClient proves the OPTIONAL
+// work-item provider selector (#3645) reaches the POST body rather than being
+// dropped at the tool boundary. A preview resolved against a different provider
+// than the start it precedes is not a preview of that start.
+func TestPreviewCampaign_ThreadsProviderThroughRealClient(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	_, _, err := r.previewCampaign(context.Background(), nil, PreviewCampaignInput{
+		Repo: "kuhlman-labs/fishhawk", EpicRef: "issue:99", Provider: "  gitlab  ",
+	})
+	if err != nil {
+		t.Fatalf("previewCampaign: %v", err)
+	}
+	if got := fb.previewCampaignBody.Provider; got != "gitlab" {
+		t.Errorf("POST body provider = %q, want the trimmed \"gitlab\"", got)
+	}
+}
+
+// TestPreviewCampaign_UnregisteredProvider_NamesRegisteredSet pins the
+// validation_failed arm: the refusal must name the offending id AND the
+// deployment's accepted set, rather than falling out to the generic wrapper.
+func TestPreviewCampaign_UnregisteredProvider_NamesRegisteredSet(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.previewCampaignStatus = http.StatusBadRequest
+	fb.previewCampaignErr = `{"error":{"code":"validation_failed","message":"provider must name a work-item provider this deployment has registered","details":{"field":"provider","got":"nope","registered":["github_projects","gitlab"]}}}`
+	r := newResolver(srv, nil)
+
+	_, _, err := r.previewCampaign(context.Background(), nil, PreviewCampaignInput{
+		Repo: "kuhlman-labs/fishhawk", EpicRef: "issue:99", Provider: "nope",
+	})
+	if err == nil {
+		t.Fatal("previewCampaign returned no error for a 400 validation_failed on provider")
+	}
+	for _, want := range []string{"nope", "github_projects", "gitlab", "omit provider"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error = %q, want it to contain %q", err, want)
+		}
 	}
 }
