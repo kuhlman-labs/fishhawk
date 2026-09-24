@@ -1,0 +1,14 @@
+id: scenario:issue-3625/readiness-rung-survives-a-not-installed-repo
+statement: The review_grounding key is present on a readiness report for a repo whose app rung reports not installed, proving the rung is deployment-scoped and does not cascade on the repo-scoped checks.
+verify_hint: Call GET /v0/onboarding/readiness with a repo the App is not installed on and confirm the 200 response body still carries review_grounding alongside the not-installed app rung.
+steps: 'Using a run-scoped fhm_ bearer, minted by seeding plan-gate-parked via POST /v0/dev/fixtures, then POST /v0/runs/{run}/signing-key, POST /v0/dev/sign over ''{}'', and POST /v0/runs/{run}/mcp-token, I sent three requests: GET /v0/onboarding/readiness?repo=kuhlman-labs/fishhawk, GET /v0/onboarding/readiness?repo=acme/not-installed-3625, and GET /v0/onboarding/readiness?repo=acme/grp/proj&forge=gitlab.'
+assertions:
+    expected: review_grounding is present on a readiness report whose app rung reports not installed.
+    observed_at_record: 'All three returned 200. app.installed=false in each (''githubclient: AppJWT not configured for App-level requests'' for GitHub; ''project is not visible to the deployment GitLab credential'' for GitLab). The review_grounding object (enabled:false, codex+claude adapters) was present in every body, alongside the not-installed app rung and a merge_gate reporting app_not_installed.'
+    repro_handle: 'curl -H ''Authorization: Bearer <token>'' ''http://localhost:8090/v0/onboarding/readiness?repo=acme/not-installed-3625'''
+origin:
+    issue: 3625
+    pr: 3638
+    run_id: 2eee44ba-26cf-4724-aae3-ea17fc2e6b88
+    head_sha: 99b9100477b000231d7431b0d7f069ca8a4ae1ff
+    recorded_at: 2026-09-24T03:05:42Z

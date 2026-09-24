@@ -5441,7 +5441,8 @@ components:
 
         Forge-family-aware since E45.43 / #3348: `forge` names the family that
         answered. Five repo-scoped checks run on `github`, six on `gitlab`
-        (plus the deployment-scoped `trace_store` rung on both). On `gitlab` —
+        (plus the deployment-scoped `trace_store` and `review_grounding`
+        rungs on both). On `gitlab` —
         `app.installed` means "a gitlab installation is registered for
         EXACTLY this project path AND the project is resolvable with the
         deployment GitLab credential" (E45.68 / #3582; `app.note` states so,
@@ -5477,6 +5478,16 @@ components:
         does not depend on the repo. It is OPTIONAL for the same
         older-fishhawkd reason; its absence is no claim, not
         `configured: false`.
+
+        `review_grounding` (E45.90 / #3625) is DEPLOYMENT-scoped in exactly
+        the same way and set on EVERY report of both families, outside every
+        cascade above: it answers whether this fishhawkd grounds its review
+        agents against an exported read-only tree or leaves them DIFF-ONLY,
+        and states the per-adapter read bound — which is NOT the same strength
+        on both adapters. `enabled: false` is the supported default, so a
+        client must render it informationally rather than as a finding. It is
+        OPTIONAL for the same older-fishhawkd reason; its absence is no claim,
+        not `enabled: false`.
       required: [repo, app, spec, reviewers, scopes]
       properties:
         repo:
@@ -6036,6 +6047,78 @@ components:
                 endpoint/region/credentials — the trace-storage block in
                 `.env.example`) and create the bucket with `make s3-init`,
                 then restart fishhawkd.
+
+        review_grounding:
+          type: object
+          description: |
+            DEPLOYMENT-scoped, both families (E45.90 / #3625): whether this
+            fishhawkd grounds its plan- and implement-review agents against an
+            exported read-only source tree at the reviewed commit, or leaves
+            them DIFF-ONLY. `enabled: false` is the SUPPORTED DEFAULT, not a
+            misconfiguration — grounding ships DORMANT behind
+            `FISHHAWKD_REVIEW_GROUNDING` (#2522) — so a client renders it as an
+            informational rung with a hint, never as a warning or a failure.
+            When it is off, a reviewer that cannot settle a diff-invisible
+            question downgrades it to UNTRACED / UNESTABLISHED and calibrates
+            the severity DOWN rather than reading the tree. Like `trace_store`
+            it is a fact about the deployment, not the repo, so it NEVER
+            cascades: a not-installed repo, an unresolvable GitLab project and
+            an unavailable spec all still carry it. The current backend sets it
+            on every report; it is OPTIONAL only so a pre-#3625 fishhawkd's
+            body still validates. Absence means the backend cannot answer,
+            which is NOT the same claim as `enabled: false`.
+          required: [enabled]
+          properties:
+            enabled:
+              type: boolean
+              description: |
+                Whether review grounding is ON for this deployment. `false`
+                (the default) means both review agents are DIFF-ONLY.
+            adapters:
+              type: array
+              description: |
+                The read bound a GROUNDED reviewer runs under, PER ADAPTER.
+                Rendered in BOTH postures, because it is precisely what an
+                operator deciding whether to opt IN needs. It is a STATIC
+                restatement of the posture #2522 shipped, never a live probe
+                of the adapter argv.
+              items:
+                type: object
+                required: [adapter, bound]
+                properties:
+                  adapter:
+                    type: string
+                    description: The reviewer adapter this bound applies to.
+                    enum: [codex, claude]
+                  bound:
+                    type: string
+                    description: |
+                      `confined` — codex: a synthesized `confined` permission
+                      profile, an OS-level deny-by-default ALLOWLIST; an
+                      out-of-tree read returns EPERM. `blocklist` — claude: a
+                      bounded `--disallowed-tools` deny-rule list over a fixed
+                      set of credential roots, enforced at the TOOL layer.
+                      The two are NOT the same strength and must never be
+                      collapsed into one word: `blocklist` is
+                      defence-in-depth, NOT confinement.
+                    enum: [confined, blocklist]
+                  note:
+                    type: string
+                    description: |
+                      The human sentence stating this adapter's bound
+                      honestly. The claude row makes no confinement claim.
+            note:
+              type: string
+              description: |
+                The human sentence for the current posture: what DIFF-ONLY
+                costs when off, and the per-adapter caveat when on.
+            remediation:
+              type: string
+              description: |
+                The operator next step. When off: set
+                `FISHHAWKD_REVIEW_GROUNDING=true` (or `--review-grounding`),
+                an OPT-IN posture for a single-tenant host you control. When
+                on: how to revert, and what stays true while it is on.
 
     GitLabAccessLevel:
       type: object
@@ -7356,7 +7439,12 @@ paths:
         same registry seam. Read-only. Both families also carry the
         DEPLOYMENT-scoped `trace_store` rung (#3600): whether this fishhawkd
         has a trace store wired (`s3` | `memory` | `none` | `other`), set on
-        every report and never cascading on the repo-scoped checks.
+        every report and never cascading on the repo-scoped checks — and the
+        DEPLOYMENT-scoped `review_grounding` rung (#3625): whether the review
+        agents are grounded against an exported read-only tree or DIFF-ONLY
+        (`enabled: false` is the supported default), with the per-adapter read
+        bound (`confined` on codex, `blocklist` on claude — NOT the same
+        strength), likewise set on every report and never cascading.
 
         Forge-family resolution, in order: an explicit `forge` query value;
         else the account registry's provider for the repo's owner (the same

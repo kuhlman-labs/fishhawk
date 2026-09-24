@@ -1,0 +1,14 @@
+id: scenario:issue-3625/doctor-cli-prints-the-flag-without-failing
+statement: Running the doctor CLI against a deployment with grounding off prints a review-grounding rung whose hint names FISHHAWKD_REVIEW_GROUNDING, and the command's exit code is the same as it would be with the rung absent — the default posture is reported, not flagged as a defect.
+verify_hint: Run `fishhawk doctor --backend-url <preview url>` against the localhost preview, read the printed rung line and its `hint:` line on stdout, and compare the process exit code with a run against a backend serving no review_grounding key.
+steps: '1) Built the CLI from the sanctioned checkout (HEAD 99b91004): cd cli && go build -o /tmp/fh3625/fishhawk ./cmd/fishhawk. 2) In a scratch git repo with origin https://github.com/kuhlman-labs/fishhawk.git, ran /tmp/fh3625/fishhawk doctor --backend-url http://localhost:8090 --token <run-scoped fhm_ bearer, minted by seeding plan-gate-parked via POST /v0/dev/fixtures then POST /v0/runs/{run}/signing-key, /v0/dev/sign over ''{}'', POST /v0/runs/{run}/mcp-token> --repo kuhlman-labs/fishhawk, and captured stdout and the exit code. 3) A comparison backend without the review_grounding key could not be run because the sandbox egress proxy blocks any second local port. Instead I counted the tally from the live output and ran the repo-local tests in the sanctioned checkout: cd cli && go test ./cmd/fishhawk/ -run TestDoctorOnboarding_ReviewGrounding -count=1 -v.'
+assertions:
+    expected: A review-grounding rung whose hint names FISHHAWKD_REVIEW_GROUNDING, and an exit code identical to a run with the rung absent (the default is reported, not flagged).
+    observed_at_record: 'stdout carries ''review grounding          off (reviews are diff-only)              ok'' followed by ''  hint: set FISHHAWKD_REVIEW_GROUNDING=true (or --review-grounding) ... OPT-IN posture ... codex gets OS-enforced confinement, claude gets a tool-layer blocklist that is defence-in-depth only''. The summary reads ''5 check(s) failed, 10 warning(s)'' and the exit code is 1. The 5 fails are workflow spec, MCP registered, gh CLI, app installed and token scope. The 10 warns do not include review grounding. Because the rung is ok, removing it leaves the same tally and the same exit 1. All 8 ReviewGrounding CLI tests pass, including ReviewGroundingOff_DoesNotMoveTheAggregate and ReviewGroundingAbsentDrawsNoRung.'
+    repro_handle: fishhawk doctor --backend-url http://localhost:8090 --token <token> --repo kuhlman-labs/fishhawk; echo $?
+origin:
+    issue: 3625
+    pr: 3638
+    run_id: 2eee44ba-26cf-4724-aae3-ea17fc2e6b88
+    head_sha: 99b9100477b000231d7431b0d7f069ca8a4ae1ff
+    recorded_at: 2026-09-24T03:05:42Z

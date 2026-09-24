@@ -1356,6 +1356,90 @@ func TestDoctorToolDescription_DescribesTraceStore(t *testing.T) {
 	}
 }
 
+// TestDoctor_ReviewGrounding_ReemitsWireBytes walks the tool path and pins the
+// RE-EMITTED bytes (E45.90 / #3625): a body carrying review_grounding re-emits
+// the object with its enabled verdict and adapter rows; a body WITHOUT it (an
+// older fishhawkd — mergeGateServerBody predates the rung) re-emits NO quoted
+// "review_grounding" key. Counterfactual: a value-typed mirror field re-emits
+// a zero-valued `"review_grounding":{"enabled":false}` on the second body — a
+// posture verdict no read established.
+func TestDoctor_ReviewGrounding_ReemitsWireBytes(t *testing.T) {
+	const populated = `{"repo": "x/y", "forge": "github",
+	  "app": {"installed": false, "reason": "not installed"}, "spec": {"source": "unavailable", "note": "n"},
+	  "reviewers": [], "scopes": {"adequate": true, "required": [], "missing": []},
+	  "review_grounding": {"enabled": false,
+	    "adapters": [{"adapter": "codex", "bound": "confined"}, {"adapter": "claude", "bound": "blocklist"}],
+	    "note": "reviews are DIFF-ONLY", "remediation": "set FISHHAWKD_REVIEW_GROUNDING=true"}}`
+	for _, tc := range []struct {
+		name    string
+		body    string
+		present bool
+	}{
+		{"populated", populated, true},
+		{"absent", mergeGateServerBody, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fb, srv := newDoctorFakeBackend(t)
+			fb.rawBody = tc.body
+			r := newResolver(srv, nil)
+			_, out, err := r.doctor(context.Background(), nil, DoctorInput{Repo: "x/y"})
+			if err != nil {
+				t.Fatalf("doctor: %v", err)
+			}
+			encoded, err := json.Marshal(out)
+			if err != nil {
+				t.Fatalf("marshal DoctorOutput: %v", err)
+			}
+			body := string(encoded)
+			if !tc.present {
+				if strings.Contains(body, `"review_grounding"`) {
+					t.Errorf("DoctorOutput re-emits review_grounding on a body that omitted it:\n%s", body)
+				}
+				return
+			}
+			for _, want := range []string{
+				`"review_grounding":{`,
+				`"enabled":false`,
+				`"adapter":"codex"`,
+				`"bound":"confined"`,
+				`"adapter":"claude"`,
+				`"bound":"blocklist"`,
+				`"remediation":"set FISHHAWKD_REVIEW_GROUNDING=true"`,
+			} {
+				if !strings.Contains(body, want) {
+					t.Errorf("DoctorOutput lacks %s:\n%s", want, body)
+				}
+			}
+		})
+	}
+}
+
+// TestDoctorToolDescription_DescribesReviewGrounding pins the SHIPPED
+// description's #3625 claims: the rung, that enabled:false is the SUPPORTED
+// DEFAULT rather than a misconfiguration, the two-value bound vocabulary with
+// its asymmetry stated honestly, the no-cascade property, the static-table
+// caveat, and the absence-is-not-enabled:false distinction.
+func TestDoctorToolDescription_DescribesReviewGrounding(t *testing.T) {
+	desc := strings.Join(strings.Fields(registeredToolDescription(t, "fishhawk_doctor")), " ")
+	for _, want := range []string{
+		"review_grounding",
+		"DEPLOYMENT-scoped",
+		"enabled:false is the SUPPORTED DEFAULT",
+		"FISHHAWKD_REVIEW_GROUNDING",
+		"UNTRACED / UNESTABLISHED",
+		"bound=confined",
+		"bound=blocklist",
+		"defence-in-depth, NOT confinement",
+		"STATIC restatement of the shipped posture, never a live probe",
+		"NEVER cascades",
+		"NOT the same claim as enabled:false",
+	} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("fishhawk_doctor description lacks %q", want)
+		}
+	}
+}
+
 // --- runner_credentials rung (E45.82 / #3617) ---
 
 // runnerCredsSentinel is a distinctive value seeded as the env token so the

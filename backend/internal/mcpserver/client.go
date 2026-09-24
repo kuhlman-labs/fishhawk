@@ -951,8 +951,9 @@ func (c *apiClient) GetRunLatency(ctx context.Context, runID uuid.UUID) (*RunLat
 // `gitlab_merge_gate`) — and, on GitLab only, whether an installations row is
 // registered for exactly this path (#3582, `gitlab_registration`), the check
 // POST /v0/runs refuses 422 gitlab_project_not_registered on — plus, on both
-// families, the deployment-scoped trace_store rung (E45.75 / #3600), which
-// never cascades on the repo-scoped checks. Repeated here rather than imported because the MCP
+// families, the deployment-scoped trace_store rung (E45.75 / #3600) and
+// review_grounding rung (E45.90 / #3625), neither of which
+// cascades on the repo-scoped checks. Repeated here rather than imported because the MCP
 // server's apiClient is a thin local copy (the import direction is `cli →
 // backend`, not the reverse). Every field is a scalar/string/slice — no
 // UUID/raw-JSON field, so the #371 reflection trap does not apply. MUST stay
@@ -1010,6 +1011,42 @@ type OnboardingReadinessReport struct {
 	// could not answer". The current backend sets it on EVERY report of both
 	// families, outside every repo-scoped cascade.
 	TraceStore *onboardingTraceStore `json:"trace_store,omitempty" jsonschema:"DEPLOYMENT-scoped, both families: whether this fishhawkd has a trace store wired, i.e. whether POST /v0/runs/{id}/trace will accept a run's bundle or respond 503 AFTER the agent has run and been billed; never cascades on app/spec (a not-installed repo still carries it); ABSENT (omitted, not zero-valued) against an older fishhawkd that does not serve the field - absence means the backend cannot answer, which is NOT the same claim as configured:false"`
+	// ReviewGrounding is the DEPLOYMENT-scoped review-grounding rung (E45.90 /
+	// #3625), a POINTER for the same reason as TraceStore: a pre-#3625
+	// fishhawkd serves no `review_grounding` key, and absence must stay
+	// absence. A value field would decode that response into a zero-valued
+	// object whose `enabled` is false — a verdict about the deployment's
+	// posture that no read ever established, and NOT the same claim as "the
+	// backend could not answer". The current backend sets it on EVERY report
+	// of both families, outside every repo-scoped cascade.
+	ReviewGrounding *onboardingReviewGrounding `json:"review_grounding,omitempty" jsonschema:"DEPLOYMENT-scoped, both families: whether this fishhawkd grounds its plan- and implement-review agents against an exported read-only source tree, or leaves them DIFF-ONLY (the supported default - grounding ships dormant behind FISHHAWKD_REVIEW_GROUNDING); adapters[] states the per-adapter read bound, and the two bounds are NOT equivalent; never cascades on app/spec (a not-installed repo still carries it); ABSENT (omitted, not zero-valued) against an older fishhawkd that does not serve the field - absence means the backend cannot answer, which is NOT the same claim as enabled:false"`
+}
+
+// onboardingReviewGrounding mirrors the backend reviewGroundingReadiness
+// sub-object (E45.90 / #3625). enabled:false is the SUPPORTED DEFAULT, not a
+// defect — grounding ships dormant (#2522) — so a client renders it as an
+// informational rung with a hint, never a warning.
+//
+// Unexported, like onboardingTraceStore: the export baseline pins the
+// pre-#2408 surface and this type is reached only through
+// OnboardingReadinessReport. MUST stay byte-identical with the backend json
+// tags.
+type onboardingReviewGrounding struct {
+	Enabled     bool                               `json:"enabled" jsonschema:"whether review grounding is ON for this deployment; false (the default) means the review agents are DIFF-ONLY and downgrade a diff-invisible question to UNTRACED / UNESTABLISHED"`
+	Adapters    []onboardingReviewGroundingAdapter `json:"adapters,omitempty" jsonschema:"the per-adapter read bound a GROUNDED reviewer runs under, rendered in BOTH postures because it is what an operator deciding whether to opt in needs; a STATIC restatement of the shipped posture, never a live probe"`
+	Note        string                             `json:"note,omitempty" jsonschema:"the human sentence for the current posture: what DIFF-ONLY costs when off, and the per-adapter caveat when on"`
+	Remediation string                             `json:"remediation,omitempty" jsonschema:"the operator next step: when off, set FISHHAWKD_REVIEW_GROUNDING=true on a single-tenant host you control; when on, how to revert and what stays true while it is on"`
+}
+
+// onboardingReviewGroundingAdapter mirrors one backend
+// reviewGroundingAdapterBound row. Bound is a CLOSED two-value vocabulary and
+// the two are NOT the same strength: "confined" (codex, OS-level
+// deny-by-default allowlist) vs "blocklist" (claude, a tool-layer deny-rule
+// list that is defence-in-depth). Never collapse them into one word.
+type onboardingReviewGroundingAdapter struct {
+	Adapter string `json:"adapter" jsonschema:"the reviewer adapter this bound applies to: codex or claude"`
+	Bound   string `json:"bound" jsonschema:"one of confined (codex: a synthesized confined permission profile, OS-level deny-by-default allowlist - an out-of-tree read returns EPERM) or blocklist (claude: a bounded --disallowed-tools deny-rule list over credential roots, enforced at the TOOL layer - defence-in-depth, NOT the OS-enforced bound codex gets)"`
+	Note    string `json:"note,omitempty" jsonschema:"the human sentence stating this adapter's bound honestly"`
 }
 
 // onboardingTraceStore mirrors the backend traceStoreReadiness sub-object

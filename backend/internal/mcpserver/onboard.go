@@ -166,7 +166,8 @@ const initNextStep = "Write workflow_yaml to target_path in the checkout, then c
 // omitted on GitLab by design; since E45.66 / #3580 the fifth check on GitLab
 // is the GitLab-shaped gitlab_merge_gate rung, and since E45.68 / #3582 GitLab
 // carries a sixth, gitlab_registration). Since E45.75 / #3600 both families
-// also carry the deployment-scoped trace_store rung.
+// also carry the deployment-scoped trace_store rung, and since E45.90 /
+// #3625 the deployment-scoped review_grounding rung.
 func registerDoctor(srv *mcp.Server, resolver *runResolver) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "fishhawk_doctor",
@@ -178,7 +179,7 @@ returns five server-side-only checks the first feature_change run needs on
 GitHub and six on GitLab (the fifth on GitLab being gitlab_merge_gate and the
 sixth gitlab_registration — see merge_gate, gitlab_merge_gate and
 gitlab_registration below), plus on both families the deployment-scoped
-trace_store rung (see below):
+trace_store and review_grounding rungs (see below):
 
   - app     — is the Fishhawk-specific authorization a run needs in place? On
               GitHub: is the GitHub App installed on the target repo
@@ -297,6 +298,31 @@ trace_store rung (see below):
               repo or an unavailable spec still carries it. The key is ABSENT
               only against an older fishhawkd; absence means the backend
               cannot answer, which is NOT the same claim as configured:false.
+  - review_grounding — DEPLOYMENT-scoped, both families (E45.90): does this
+              fishhawkd ground its plan- and implement-review agents against an
+              exported read-only source tree at the reviewed commit, or leave
+              them DIFF-ONLY? enabled:false is the SUPPORTED DEFAULT, not a
+              defect — grounding ships DORMANT behind FISHHAWKD_REVIEW_GROUNDING
+              — so report it as an opt-in posture, never as a misconfiguration.
+              When it is off, a reviewer that cannot settle a diff-invisible
+              question downgrades it to UNTRACED / UNESTABLISHED and calibrates
+              the severity DOWN, which is why an operator seeing such findings
+              wants to know the switch exists. adapters[] states the read bound
+              a GROUNDED reviewer runs under, PER ADAPTER, and renders in BOTH
+              postures because it is what an operator deciding whether to opt in
+              needs. The two bounds are NOT equivalent and must never be
+              collapsed into one word: codex is bound=confined (a synthesized
+              confined permission profile — an OS-level deny-by-default
+              allowlist; an out-of-tree read returns EPERM), claude is
+              bound=blocklist (a bounded --disallowed-tools deny-rule list over
+              credential roots, enforced at the TOOL layer: defence-in-depth,
+              NOT confinement). The table is a STATIC restatement of the shipped
+              posture, never a live probe of the adapter argv. It is a fact
+              about the deployment, not the repo, so it NEVER cascades: a
+              not-installed repo or an unavailable spec still carries it. The
+              key is ABSENT only against an older fishhawkd; absence means the
+              backend cannot answer, which is NOT the same claim as
+              enabled:false.
 
 Alongside the report key — a SIBLING key, never a field inside it — the output
 carries runner_credentials, the one rung computed LOCALLY by this MCP server
