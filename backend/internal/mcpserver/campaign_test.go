@@ -373,6 +373,80 @@ func TestStartCampaign_EpicChildrenUnsupported_AbsentDetail_FallsBack(t *testing
 	}
 }
 
+// TestStartCampaign_IssueSetResolutionUnsupported_EmptySources_NamesNeitherMode
+// drives the no-epic `items` path's 501 issue_set_resolution_unsupported mapping
+// (campaign.go's switch case, which shares campaignSourcesRemedy with
+// epic_children_unsupported). With an EMPTY campaign_sources_supported — the
+// GitLab File-only case — the remedy must fall back to fishhawk_start_run and
+// advertise NEITHER items nor epic_ref (both would also 501). This is the
+// issue-set sibling of the group-epic fallback the concern flags as untested.
+func TestStartCampaign_IssueSetResolutionUnsupported_EmptySources_NamesNeitherMode(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.createCampaignStatus = http.StatusNotImplemented
+	fb.createCampaignErr = `{"error":{"code":"issue_set_resolution_unsupported","message":"cannot resolve an issue set","details":{"provider":"gitlab","campaign_sources_supported":[]}}}`
+	r := newResolver(srv, nil)
+
+	_, _, err := r.startCampaign(context.Background(), nil, StartCampaignInput{Repo: "x/y", Items: []string{"101"}})
+	if err == nil {
+		t.Fatal("err = nil, want issue_set_resolution_unsupported mapping")
+	}
+	if !strings.Contains(err.Error(), "issue_set_resolution_unsupported") {
+		t.Errorf("err %q must name the code", err.Error())
+	}
+	if !strings.Contains(err.Error(), "fishhawk_start_run") {
+		t.Errorf("err %q must fall back to fishhawk_start_run when no source works", err.Error())
+	}
+	if strings.Contains(err.Error(), "items") {
+		t.Errorf("empty-sources remedy %q must not advertise items (it also 501s)", err.Error())
+	}
+	if strings.Contains(err.Error(), "epic_ref") {
+		t.Errorf("empty-sources remedy %q must not advertise epic_ref (it also 501s)", err.Error())
+	}
+}
+
+// TestStartCampaign_IssueSetResolutionUnsupported_EpicSources_NamesEpic pins the
+// hasEpic-ONLY arm of campaignSourcesRemedy through the
+// issue_set_resolution_unsupported mapping: a provider that serves only
+// epic_ref must have its remedy name epic decomposition (and, since items is the
+// source that just 501'd, must NOT recommend items).
+func TestStartCampaign_IssueSetResolutionUnsupported_EpicSources_NamesEpic(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.createCampaignStatus = http.StatusNotImplemented
+	fb.createCampaignErr = `{"error":{"code":"issue_set_resolution_unsupported","message":"cannot resolve an issue set","details":{"provider":"someprov","campaign_sources_supported":["epic_ref"]}}}`
+	r := newResolver(srv, nil)
+
+	_, _, err := r.startCampaign(context.Background(), nil, StartCampaignInput{Repo: "x/y", Items: []string{"101"}})
+	if err == nil {
+		t.Fatal("err = nil, want issue_set_resolution_unsupported mapping")
+	}
+	if !strings.Contains(err.Error(), "epic") {
+		t.Errorf("err %q must name the epic-decomposition source that works", err.Error())
+	}
+	if strings.Contains(err.Error(), "pass items") {
+		t.Errorf("err %q must NOT recommend items — that is the source that just 501'd", err.Error())
+	}
+}
+
+// TestStartCampaign_EpicChildrenUnsupported_BothSources_NamesBoth pins the
+// hasEpic&&hasItems arm of campaignSourcesRemedy: a provider serving both
+// sources must have its remedy name both epic_ref and items.
+func TestStartCampaign_EpicChildrenUnsupported_BothSources_NamesBoth(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.createCampaignStatus = http.StatusNotImplemented
+	fb.createCampaignErr = `{"error":{"code":"epic_children_unsupported","message":"cannot query epic children","details":{"provider":"someprov","campaign_sources_supported":["epic_ref","items"]}}}`
+	r := newResolver(srv, nil)
+
+	_, _, err := r.startCampaign(context.Background(), nil, StartCampaignInput{Repo: "x/y", EpicRef: "issue:99"})
+	if err == nil {
+		t.Fatal("err = nil, want epic_children_unsupported mapping")
+	}
+	for _, want := range []string{"epic_ref", "items"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("both-sources remedy %q must name %q", err.Error(), want)
+		}
+	}
+}
+
 // TestStartCampaign_OmittedPausePolicy_LeavesBodyEmpty pins the optional
 // pause_policy: omitting it sends an empty value (the backend normalizes it).
 func TestStartCampaign_OmittedPausePolicy_LeavesBodyEmpty(t *testing.T) {
