@@ -4614,7 +4614,16 @@ func TestGetRunStatus_ConcernEvidenceDecoded(t *testing.T) {
 	if err != nil {
 		t.Fatalf("getRunStatus: %v", err)
 	}
-	assertConcernEvidenceDecoded(t, "get_run_status", out.ImplementReviews, evidence, settledRef)
+	// The single-round verdict is deduped off the flat implement_reviews listing
+	// (E45.92 / #3627) and survives verbatim on implement_review_status.reviews,
+	// which carries the same decode (concern new_evidence/settled_ref intact).
+	if out.ImplementReviews != nil {
+		t.Errorf("implement_reviews should be deduped away when contained; got %+v", out.ImplementReviews)
+	}
+	if out.ImplementReviewsElided == "" {
+		t.Error("implement_reviews_elided should name the surviving surface")
+	}
+	assertConcernEvidenceDecoded(t, "get_run_status", out.ImplementReviewStatus.Reviews, evidence, settledRef)
 }
 
 // seedSecurityFindingsAudit adds an implement_security_findings audit entry
@@ -4788,10 +4797,18 @@ func TestGetRunStatus_WithImplementReviews_PopulatesField(t *testing.T) {
 	if err != nil {
 		t.Fatalf("getRunStatus: %v", err)
 	}
-	if got := len(out.ImplementReviews); got != 1 {
-		t.Fatalf("len(ImplementReviews) = %d, want 1", got)
+	// The lone verdict is deduped off the flat implement_reviews listing (E45.92
+	// / #3627) and survives on implement_review_status.reviews.
+	if out.ImplementReviews != nil {
+		t.Errorf("implement_reviews should be deduped away when contained; got %+v", out.ImplementReviews)
 	}
-	rev := out.ImplementReviews[0]
+	if out.ImplementReviewsElided == "" {
+		t.Error("implement_reviews_elided should be set on a deduped response")
+	}
+	if out.ImplementReviewStatus == nil || len(out.ImplementReviewStatus.Reviews) != 1 {
+		t.Fatalf("implement_review_status.reviews = %+v, want 1 row", out.ImplementReviewStatus)
+	}
+	rev := out.ImplementReviewStatus.Reviews[0]
 	if rev.Verdict != "approve_with_concerns" {
 		t.Errorf("Verdict = %q, want approve_with_concerns", rev.Verdict)
 	}
@@ -4907,16 +4924,25 @@ func TestGetRunStatus_CompactDefault_OmitsHeavyFreeText(t *testing.T) {
 	if out.Run.IssueContext != nil {
 		t.Errorf("Run.IssueContext = %+v, want nil (stripped by default)", out.Run.IssueContext)
 	}
-	if len(out.ImplementReviews) != 1 {
-		t.Fatalf("len(ImplementReviews) = %d, want 1", len(out.ImplementReviews))
+	// The single-round verdict is deduped off the flat implement_reviews listing
+	// (E45.92 / #3627); its prose survives on implement_review_status.reviews.
+	if out.ImplementReviews != nil {
+		t.Errorf("implement_reviews should be deduped away when contained; got %+v", out.ImplementReviews)
 	}
-	// The heavy free-text is elided to the visible marker (#3043), not the
-	// reviewer's prose — distinct from a genuinely-empty note.
-	if out.ImplementReviews[0].FreeForm != elidedReviewProseMarker {
-		t.Errorf("ImplementReviews[0].FreeForm = %q, want the elision marker", out.ImplementReviews[0].FreeForm)
+	if out.ImplementReviewStatus == nil || len(out.ImplementReviewStatus.Reviews) != 1 {
+		t.Fatalf("implement_review_status.reviews = %+v, want 1 row", out.ImplementReviewStatus)
 	}
-	if n := out.ImplementReviews[0].Concerns[0].Note; n != elidedReviewProseMarker {
-		t.Errorf("concern Note = %q, want the elision marker", n)
+	rev := out.ImplementReviewStatus.Reviews[0]
+	// free_form is ALWAYS elided to the visible marker (#3043), independent of the
+	// dedup-funded note cap.
+	if rev.FreeForm != elidedReviewProseMarker {
+		t.Errorf("review free_form = %q, want the elision marker", rev.FreeForm)
+	}
+	// On this deduped response the SHORT concern note is carried verbatim (within
+	// the cap, no marker) — funded by the bytes the dropped flat listing freed
+	// (E45.92 / #3627 condition 4).
+	if n := rev.Concerns[0].Note; n != "unvalidated input note" {
+		t.Errorf("concern Note = %q, want the short note carried verbatim on the deduped response", n)
 	}
 	// Wire-bytes proof: the heavy keys must not survive serialization.
 	raw, err := json.Marshal(out)
@@ -4927,8 +4953,9 @@ func TestGetRunStatus_CompactDefault_OmitsHeavyFreeText(t *testing.T) {
 	// "issue_context_fetched" audit category name, so assert on the JSON
 	// key form ("issue_context":) plus the heavy values themselves. The
 	// review free_form KEY now legitimately carries the short elision marker
-	// (#3043) — so the reviewer's PROSE is what must be absent, not the key.
-	for _, banned := range []string{`"issue_context":`, "the big issue body", "reviewer free-text prose", "recent payload prose", "unvalidated input note", "recent payload issue body"} {
+	// (#3043); the SHORT concern note is legitimately present on the deduped
+	// response, so it is NOT a heavy value here.
+	for _, banned := range []string{`"issue_context":`, "the big issue body", "reviewer free-text prose", "recent payload prose", "recent payload issue body"} {
 		if strings.Contains(string(raw), banned) {
 			t.Errorf("wire bytes must not contain %q (compact default), got it in payload", banned)
 		}
@@ -5111,9 +5138,14 @@ func TestGetRunStatus_IncludeIssueContext_RestoresIssuePayload(t *testing.T) {
 		t.Errorf("recent_audit issue body should be restored under include_issue_context")
 	}
 	// Review prose still stripped to the elision marker (the other flag was
-	// not set) — not the reviewer's original prose.
-	if out.ImplementReviews[0].FreeForm != elidedReviewProseMarker {
-		t.Errorf("review free_form should still be elided to the marker when only include_issue_context is set; got %q", out.ImplementReviews[0].FreeForm)
+	// not set) — not the reviewer's original prose. The verdict is deduped off
+	// the flat listing (E45.92 / #3627) and its free_form survives, still
+	// marker-elided, on implement_review_status.reviews.
+	if out.ImplementReviewStatus == nil || len(out.ImplementReviewStatus.Reviews) != 1 {
+		t.Fatalf("implement_review_status.reviews = %+v, want 1 row", out.ImplementReviewStatus)
+	}
+	if out.ImplementReviewStatus.Reviews[0].FreeForm != elidedReviewProseMarker {
+		t.Errorf("review free_form should still be elided to the marker when only include_issue_context is set; got %q", out.ImplementReviewStatus.Reviews[0].FreeForm)
 	}
 }
 
@@ -5127,11 +5159,21 @@ func TestGetRunStatus_IncludeReviewProse_RestoresReviewText(t *testing.T) {
 	if err != nil {
 		t.Fatalf("getRunStatus: %v", err)
 	}
-	if out.ImplementReviews[0].FreeForm != "reviewer free-text prose" {
-		t.Errorf("FreeForm = %q, want restored", out.ImplementReviews[0].FreeForm)
+	// dedup runs regardless of include_review_prose (E45.92 / #3627): the flat
+	// implement_reviews listing is dropped, and the FULL untouched prose is
+	// returned under implement_review_status.reviews (include_review_prose skips
+	// the strip entirely, so no cap applies).
+	if out.ImplementReviews != nil {
+		t.Errorf("implement_reviews should be deduped away even under include_review_prose; got %+v", out.ImplementReviews)
 	}
-	if out.ImplementReviews[0].Concerns[0].Note != "unvalidated input note" {
-		t.Errorf("concern Note = %q, want restored", out.ImplementReviews[0].Concerns[0].Note)
+	if out.ImplementReviewStatus == nil || len(out.ImplementReviewStatus.Reviews) != 1 {
+		t.Fatalf("implement_review_status.reviews = %+v, want 1 row", out.ImplementReviewStatus)
+	}
+	if out.ImplementReviewStatus.Reviews[0].FreeForm != "reviewer free-text prose" {
+		t.Errorf("FreeForm = %q, want the full prose restored", out.ImplementReviewStatus.Reviews[0].FreeForm)
+	}
+	if out.ImplementReviewStatus.Reviews[0].Concerns[0].Note != "unvalidated input note" {
+		t.Errorf("concern Note = %q, want the full note restored (no cap under include_review_prose)", out.ImplementReviewStatus.Reviews[0].Concerns[0].Note)
 	}
 	raw, _ := json.Marshal(out)
 	if !strings.Contains(string(raw), "recent payload prose") {
@@ -5162,7 +5204,12 @@ func TestGetRunStatus_CompactDefault_RetainsPlaybookFields(t *testing.T) {
 	if out.Run.Concerns == nil || out.Run.Concerns.Open != 1 {
 		t.Errorf("run.concerns must be retained, got %+v", out.Run.Concerns)
 	}
-	rev := out.ImplementReviews[0]
+	// The verdict is deduped off the flat listing (E45.92 / #3627) and its keys
+	// are retained on implement_review_status.reviews.
+	if out.ImplementReviewStatus == nil || len(out.ImplementReviewStatus.Reviews) != 1 {
+		t.Fatalf("implement_review_status.reviews = %+v, want 1 row", out.ImplementReviewStatus)
+	}
+	rev := out.ImplementReviewStatus.Reviews[0]
 	if rev.Verdict != "approve_with_concerns" || rev.Authority != "advisory" {
 		t.Errorf("review verdict/authority must be retained, got %+v", rev)
 	}
@@ -5181,6 +5228,246 @@ func findRecentAudit(t *testing.T, entries []AuditEntry, category string) AuditE
 	}
 	t.Fatalf("no recent_audit entry of category %q in %+v", category, entries)
 	return AuditEntry{}
+}
+
+// seedTwoReviewerRound seeds a complete configured_agents=2 implement round with
+// the two supplied verdicts (E45.92 / #3627 fixtures). loadImplementReviews and
+// reviewStatusFor then return the SAME two rows (no fix-up), so the flat listing
+// is contained in the status field and the dedup fires.
+func seedTwoReviewerRound(fb *fakeBackend, runID uuid.UUID, a, b PlanReview) {
+	seedReviewStartedAudit(fb, runID, "implement_review_started", 2, "advisory")
+	seedImplementReviewAudit(fb, runID, a)
+	seedImplementReviewAudit(fb, runID, b)
+}
+
+// reconstructTodayShape rebuilds the pre-#3627 duplicated wire shape from a
+// deduped response: the flat implement_reviews listing re-added (the UNFLOORED
+// seed rows, marker-elided as today ships it), the elision note cleared, and the
+// SAME floored+union status rows re-projected with today's content-free markers
+// (stripReviewProse(false) maps every projected non-empty note back to the
+// marker and leaves empties empty, reproducing today's status notes exactly,
+// INCLUDING any synthesized failed row). It is the baseline the "no response can
+// grow" invariant is measured against.
+func reconstructTodayShape(out GetRunStatusOutput, flatSeed []PlanReview) GetRunStatusOutput {
+	today := out
+	flat := deepCopyReviews(flatSeed)
+	stripReviewProse(flat, false)
+	today.ImplementReviews = flat
+	today.ImplementReviewsElided = ""
+	rich := deepCopyReviews(out.ImplementReviewStatus.Reviews)
+	stripReviewProse(rich, false)
+	status := *out.ImplementReviewStatus
+	status.Reviews = rich
+	today.ImplementReviewStatus = &status
+	return today
+}
+
+func mustMarshalLen(t *testing.T, v any) int {
+	t.Helper()
+	raw, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	return len(raw)
+}
+
+// TestGetRunStatus_Dedup_DropsContainedFlatListing is the done-means behavioral
+// assertion (E45.92 / #3627): a complete two-reviewer round drives the REAL
+// getRunStatus and the marshalled default response omits implement_reviews,
+// carries implement_reviews_elided, and carries BOTH verdict rows under
+// implement_review_status.reviews.
+func TestGetRunStatus_Dedup_DropsContainedFlatListing(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running"}
+	a := PlanReview{ReviewerKind: "agent", ReviewerModel: "claude-opus-4-8", Authority: "advisory", Verdict: "approve",
+		Concerns: []PlanReviewConcern{{Severity: "low", Category: "scope", Note: strings.Repeat("a", 120)}}, FreeForm: strings.Repeat("f", 120)}
+	b := PlanReview{ReviewerKind: "agent", ReviewerModel: "gpt-5.5", Authority: "advisory", Verdict: "approve_with_concerns",
+		Concerns: []PlanReviewConcern{{Severity: "high", Category: "security", Note: strings.Repeat("b", 120)}}, FreeForm: strings.Repeat("g", 120)}
+	seedTwoReviewerRound(fb, runID, a, b)
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	if out.ImplementReviews != nil {
+		t.Errorf("implement_reviews should be dropped, got %+v", out.ImplementReviews)
+	}
+	if out.ImplementReviewsElided == "" {
+		t.Error("implement_reviews_elided should be set")
+	}
+	if out.ImplementReviewStatus == nil || len(out.ImplementReviewStatus.Reviews) != 2 {
+		t.Fatalf("implement_review_status.reviews = %+v, want 2 rows", out.ImplementReviewStatus)
+	}
+	// Wire-bytes proof: the flat key is gone, the elided key is present.
+	raw := mustMarshalJSON(t, out)
+	if strings.Contains(raw, `"implement_reviews":`) {
+		t.Error("wire bytes must not carry implement_reviews on a deduped response")
+	}
+	if !strings.Contains(raw, `"implement_reviews_elided":`) {
+		t.Error("wire bytes must carry implement_reviews_elided")
+	}
+}
+
+func mustMarshalJSON(t *testing.T, v any) string {
+	t.Helper()
+	raw, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	return string(raw)
+}
+
+// TestGetRunStatus_Dedup_KeepsFlatListingAfterFixup is the cross-boundary test:
+// a stage_fixup_triggered between two rounds makes the UNFLOORED flat listing
+// carry a pre-fix-up row the FLOORED status field drops, so containment fails
+// and BOTH fields survive. This is the seam the containment guard exists for —
+// deleting the guard (dedup unconditionally) drops the pre-fix-up verdict with
+// no surface carrying it (counterfactual 8(a)).
+func TestGetRunStatus_Dedup_KeepsFlatListingAfterFixup(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running"}
+
+	seedReviewStartedAudit(fb, runID, "implement_review_started", 1, "advisory")
+	rOld := PlanReview{ReviewerKind: "agent", ReviewerModel: "old", Authority: "advisory", Verdict: "reject",
+		Concerns: []PlanReviewConcern{{Severity: "high", Category: "correctness", Note: strings.Repeat("o", 120)}}}
+	seedImplementReviewAudit(fb, runID, rOld)
+	seedRunFixupTriggeredAudit(fb, runID)
+	rNew := PlanReview{ReviewerKind: "agent", ReviewerModel: "new", Authority: "advisory", Verdict: "approve",
+		Concerns: []PlanReviewConcern{{Severity: "low", Category: "scope", Note: strings.Repeat("n", 120)}}}
+	seedImplementReviewAudit(fb, runID, rNew)
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	// The flat listing carries BOTH rounds (unfloored) and must survive.
+	if len(out.ImplementReviews) != 2 {
+		t.Fatalf("implement_reviews should carry both rounds, got %+v", out.ImplementReviews)
+	}
+	if out.ImplementReviewsElided != "" {
+		t.Errorf("implement_reviews_elided must be ABSENT when the flat listing was not deduped, got %q", out.ImplementReviewsElided)
+	}
+	// The floored status field carries only the post-fix-up round.
+	if out.ImplementReviewStatus == nil || len(out.ImplementReviewStatus.Reviews) != 1 {
+		t.Fatalf("implement_review_status.reviews = %+v, want 1 floored row", out.ImplementReviewStatus)
+	}
+	if out.ImplementReviewStatus.Reviews[0].ReviewerModel != "new" {
+		t.Errorf("floored status row = %q, want the post-fix-up 'new' row", out.ImplementReviewStatus.Reviews[0].ReviewerModel)
+	}
+	// The note marker is unchanged (no dedup fired, so no cap): content-free marker.
+	if out.ImplementReviewStatus.Reviews[0].Concerns[0].Note != elidedReviewProseMarker {
+		t.Errorf("status note = %q, want the content-free marker (dedup did not fire)", out.ImplementReviewStatus.Reviews[0].Concerns[0].Note)
+	}
+}
+
+// TestGetRunStatus_TwoReviewerDefault_ByteBreakdown is the committed MEASUREMENT
+// (E45.92 / #3627 condition 2): it records the marshalled totals of the deduped
+// response and the reconstructed pre-dedup shape, asserts the duplicated flat
+// listing was a material fraction of today's response, that the deduped response
+// is STRICTLY smaller, and that at least one concern note carries a real prefix
+// of the seeded text (the cap fired, funded by the freed bytes).
+func TestGetRunStatus_TwoReviewerDefault_ByteBreakdown(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running"}
+	// Notes are within the cap (encoded < concernNoteCapBytes) so the deduped
+	// response shows them verbatim; free_form present so the freed bytes fund the
+	// cap. Recognisable prefixes so the prose assertion is real.
+	noteA := "SEEDED_NOTE_A_" + strings.Repeat("x", 150)
+	noteB := "SEEDED_NOTE_B_" + strings.Repeat("y", 150)
+	a := PlanReview{ReviewerKind: "agent", ReviewerModel: "claude-opus-4-8", Authority: "advisory", Verdict: "approve_with_concerns",
+		Concerns: []PlanReviewConcern{{Severity: "low", Category: "scope", Note: noteA}}, FreeForm: strings.Repeat("f", 160)}
+	b := PlanReview{ReviewerKind: "agent", ReviewerModel: "gpt-5.5", Authority: "advisory", Verdict: "approve_with_concerns",
+		Concerns: []PlanReviewConcern{{Severity: "high", Category: "security", Note: noteB}}, FreeForm: strings.Repeat("g", 160)}
+	seedTwoReviewerRound(fb, runID, a, b)
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	if out.ImplementReviews != nil || out.ImplementReviewsElided == "" {
+		t.Fatalf("expected a deduped response, got reviews=%v elided=%q", out.ImplementReviews, out.ImplementReviewsElided)
+	}
+
+	today := reconstructTodayShape(out, []PlanReview{a, b})
+	todayTotal := mustMarshalLen(t, today)
+	dedupTotal := mustMarshalLen(t, out)
+	duplicatedHalf := mustMarshalLen(t, today.ImplementReviews) // the redundant flat listing
+	statusHalf := mustMarshalLen(t, today.ImplementReviewStatus)
+	t.Logf("byte breakdown: today_total=%d dedup_total=%d duplicated_flat=%d status=%d", todayTotal, dedupTotal, duplicatedHalf, statusHalf)
+
+	// The duplicated flat listing is a material fraction of today's response.
+	if duplicatedHalf*8 < todayTotal {
+		t.Errorf("duplicated flat listing (%d bytes) is not a material fraction of the %d-byte response", duplicatedHalf, todayTotal)
+	}
+	// The deduped response is strictly smaller (a no-op implementation fails this).
+	if dedupTotal >= todayTotal {
+		t.Errorf("deduped response = %d bytes, want strictly smaller than today's %d", dedupTotal, todayTotal)
+	}
+	// At least one concern note carries a real prefix of the seeded text.
+	if len(out.ImplementReviewStatus.Reviews) != 2 {
+		t.Fatalf("status reviews = %+v, want 2", out.ImplementReviewStatus.Reviews)
+	}
+	sawPrefix := false
+	for _, rev := range out.ImplementReviewStatus.Reviews {
+		for _, c := range rev.Concerns {
+			if strings.HasPrefix(c.Note, "SEEDED_NOTE_") {
+				sawPrefix = true
+			}
+		}
+	}
+	if !sawPrefix {
+		t.Errorf("no deduped concern note carried a real prefix of the seeded text: %+v", out.ImplementReviewStatus.Reviews)
+	}
+}
+
+// TestGetRunStatus_Dedup_NotLargerThanToday_FailedRowsLongNotes is condition
+// 2's ENFORCED-invariant differential: the rich listing carries an EXTRA failed
+// row and LONG notes, so added > saved and the cap is NOT enabled (dedup only,
+// content-free markers). The deduped response must NOT be larger than today's
+// duplicated shape.
+func TestGetRunStatus_Dedup_NotLargerThanToday_FailedRowsLongNotes(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running"}
+	// configured_agents=3: two reviewed + one failed => complete; the failed row
+	// is synthesized into the status union but is NOT in the flat listing.
+	seedReviewStartedAudit(fb, runID, "implement_review_started", 3, "advisory")
+	a := PlanReview{ReviewerKind: "agent", ReviewerModel: "a", Authority: "advisory", Verdict: "approve_with_concerns",
+		Concerns: []PlanReviewConcern{{Severity: "high", Category: "security", Note: strings.Repeat("L", 400)}}}
+	b := PlanReview{ReviewerKind: "agent", ReviewerModel: "b", Authority: "advisory", Verdict: "approve_with_concerns",
+		Concerns: []PlanReviewConcern{{Severity: "low", Category: "scope", Note: strings.Repeat("M", 400)}}}
+	seedImplementReviewAudit(fb, runID, a)
+	seedImplementReviewAudit(fb, runID, b)
+	seedReviewFailedAudit(fb, runID, "implement_review_failed", "reviewer timed out", "c", "advisory")
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	if out.ImplementReviews != nil || out.ImplementReviewsElided == "" {
+		t.Fatalf("expected a deduped response, got reviews=%v elided=%q", out.ImplementReviews, out.ImplementReviewsElided)
+	}
+	// Cap was NOT enabled: the long notes stay content-free markers.
+	for _, rev := range out.ImplementReviewStatus.Reviews {
+		for _, c := range rev.Concerns {
+			if c.Note != "" && c.Note != elidedReviewProseMarker {
+				t.Errorf("long note should stay content-free marker (added>saved), got %q", c.Note)
+			}
+		}
+	}
+	today := reconstructTodayShape(out, []PlanReview{a, b})
+	todayTotal := mustMarshalLen(t, today)
+	dedupTotal := mustMarshalLen(t, out)
+	if dedupTotal > todayTotal {
+		t.Errorf("deduped response = %d bytes, must NOT be larger than today's %d (enforced size invariant)", dedupTotal, todayTotal)
+	}
 }
 
 // TestGetRunStatus_CompactDefault_OmitsAuditHashes is the #1749 default proof:

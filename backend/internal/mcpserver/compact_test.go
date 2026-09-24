@@ -27,7 +27,7 @@ func TestStripReviewProse(t *testing.T) {
 		},
 	}
 
-	stripReviewProse(reviews)
+	stripReviewProse(reviews, false)
 
 	rev := reviews[0]
 	// A non-empty free_form becomes the marker, which names the full-note surface.
@@ -73,7 +73,7 @@ func TestStripReviewProse_EmptyStaysEmpty(t *testing.T) {
 		},
 	}
 
-	stripReviewProse(reviews)
+	stripReviewProse(reviews, false)
 
 	rev := reviews[0]
 	if rev.FreeForm != "" {
@@ -92,8 +92,255 @@ func TestStripReviewProse_EmptyStaysEmpty(t *testing.T) {
 // TestStripReviewProse_EmptyAndNil confirms the strip is a no-op safe on
 // nil and empty slices.
 func TestStripReviewProse_EmptyAndNil(t *testing.T) {
-	stripReviewProse(nil)
-	stripReviewProse([]PlanReview{})
+	stripReviewProse(nil, false)
+	stripReviewProse([]PlanReview{}, false)
+	stripReviewProse(nil, true)
+	stripReviewProse([]PlanReview{}, true)
+}
+
+// TestStripReviewProse_CapNotes pins the four contract cases of the deduped
+// note projection (E45.92 / #3627 condition 4): a long note is capped to a
+// bounded encoded prefix plus a gate-view marker; a short note is carried
+// verbatim with NO marker; an empty note stays empty; and free_form is
+// marker-elided on BOTH paths, unaffected by capNotes. It also pins that
+// capNotes=false is byte-for-byte today's content-free marker.
+func TestStripReviewProse_CapNotes(t *testing.T) {
+	longNote := strings.Repeat("A", 300) // jsonEncodedLen 302 > concernNoteCapBytes
+	shortNote := "a short concern note"
+
+	t.Run("capNotes=false is byte-identical to today's marker", func(t *testing.T) {
+		reviews := []PlanReview{{
+			FreeForm: "prose",
+			Concerns: []PlanReviewConcern{{Severity: "high", Category: "x", Note: longNote}},
+		}}
+		stripReviewProse(reviews, false)
+		if reviews[0].Concerns[0].Note != elidedReviewProseMarker {
+			t.Errorf("capNotes=false Note = %q, want the content-free marker", reviews[0].Concerns[0].Note)
+		}
+		if reviews[0].FreeForm != elidedReviewProseMarker {
+			t.Errorf("free_form = %q, want the marker", reviews[0].FreeForm)
+		}
+	})
+
+	t.Run("capNotes=true long note capped to a bounded prefix plus marker", func(t *testing.T) {
+		reviews := []PlanReview{{
+			FreeForm: "prose",
+			Concerns: []PlanReviewConcern{{Severity: "high", Category: "x", Note: longNote}},
+		}}
+		stripReviewProse(reviews, true)
+		got := reviews[0].Concerns[0].Note
+		if !strings.HasPrefix(got, "AAAA") {
+			t.Errorf("capped note %q should start with a real prefix of the seeded text", got)
+		}
+		if !strings.HasSuffix(got, cappedNoteMarker) {
+			t.Errorf("capped note %q should end with the gate-view marker", got)
+		}
+		// The prefix (everything before the marker) must fit the ENCODED cap —
+		// this is the capJSONString counterfactual (delete the call -> the full
+		// 300-byte note leaks and this bound is exceeded).
+		prefix := strings.TrimSuffix(got, cappedNoteMarker)
+		if enc := jsonEncodedLen(prefix); enc > concernNoteCapBytes {
+			t.Errorf("capped prefix encoded length = %d, want <= %d", enc, concernNoteCapBytes)
+		}
+		if !utf8.ValidString(got) {
+			t.Errorf("capped note is not valid UTF-8: %q", got)
+		}
+		// free_form is STILL marker-elided on the cap path.
+		if reviews[0].FreeForm != elidedReviewProseMarker {
+			t.Errorf("free_form = %q, want the marker even under capNotes", reviews[0].FreeForm)
+		}
+	})
+
+	t.Run("capNotes=true short note carried verbatim with no marker", func(t *testing.T) {
+		reviews := []PlanReview{{
+			Concerns: []PlanReviewConcern{{Severity: "low", Category: "x", Note: shortNote}},
+		}}
+		stripReviewProse(reviews, true)
+		if reviews[0].Concerns[0].Note != shortNote {
+			t.Errorf("short note = %q, want it carried verbatim", reviews[0].Concerns[0].Note)
+		}
+		if strings.Contains(reviews[0].Concerns[0].Note, cappedNoteMarker) {
+			t.Errorf("short note must carry NO marker: %q", reviews[0].Concerns[0].Note)
+		}
+	})
+
+	t.Run("empty note stays empty on both paths", func(t *testing.T) {
+		for _, capNotes := range []bool{false, true} {
+			reviews := []PlanReview{{
+				Concerns: []PlanReviewConcern{{Severity: "low", Category: "x", Note: ""}},
+			}}
+			stripReviewProse(reviews, capNotes)
+			if reviews[0].Concerns[0].Note != "" {
+				t.Errorf("capNotes=%v empty note = %q, want it left empty", capNotes, reviews[0].Concerns[0].Note)
+			}
+		}
+	})
+}
+
+// TestImplementReviewsContained pins the MULTISET containment predicate: two
+// byte-identical flat rows need two distinct partners; ordering differences do
+// not defeat the match; a flat row absent from rich blocks containment; and an
+// empty rich slice is never contained (the none/pending control — condition 3's
+// discriminating guard: flip this to return true and the none/pending dedup
+// case reddens).
+func TestImplementReviewsContained(t *testing.T) {
+	rowA := PlanReview{ReviewerKind: "agent", ReviewerModel: "a", Authority: "advisory", Verdict: "approve"}
+	rowB := PlanReview{ReviewerKind: "agent", ReviewerModel: "b", Authority: "advisory", Verdict: "reject"}
+
+	t.Run("distinct partners for duplicate rows", func(t *testing.T) {
+		if !implementReviewsContained([]PlanReview{rowA, rowA}, []PlanReview{rowA, rowA}) {
+			t.Error("two identical flat rows should be contained by two identical rich rows")
+		}
+		if implementReviewsContained([]PlanReview{rowA, rowA}, []PlanReview{rowA, rowB}) {
+			t.Error("two identical flat rows must NOT be contained when rich has only one partner")
+		}
+	})
+
+	t.Run("reordered rich still contains flat", func(t *testing.T) {
+		if !implementReviewsContained([]PlanReview{rowA, rowB}, []PlanReview{rowB, rowA}) {
+			t.Error("ordering differences must not defeat containment")
+		}
+	})
+
+	t.Run("flat row absent from rich blocks containment", func(t *testing.T) {
+		if implementReviewsContained([]PlanReview{rowA, rowB}, []PlanReview{rowA}) {
+			t.Error("a flat row with no partner must block containment")
+		}
+	})
+
+	t.Run("empty rich is never contained", func(t *testing.T) {
+		if implementReviewsContained([]PlanReview{rowA}, nil) {
+			t.Error("an empty rich slice carries no rows, so nothing is contained")
+		}
+	})
+}
+
+// TestDedupImplementReviews drives the named guard branches of the dedup
+// decision over a constructed GetRunStatusOutput.
+func TestDedupImplementReviews(t *testing.T) {
+	// A row heavy enough that dropping it frees more than the elision note costs,
+	// so the size guard does not suppress the fire.
+	heavy := func(model string) PlanReview {
+		return PlanReview{
+			ReviewerKind: "agent", ReviewerModel: model, Authority: "advisory",
+			Verdict:  "approve_with_concerns",
+			Concerns: []PlanReviewConcern{{Severity: "high", Category: "security", Note: strings.Repeat("z", 120)}},
+			FreeForm: strings.Repeat("p", 120),
+		}
+	}
+
+	t.Run("nil status does not fire", func(t *testing.T) {
+		out := GetRunStatusOutput{ImplementReviews: []PlanReview{heavy("a")}}
+		fired, _ := dedupImplementReviews(&out)
+		if fired || out.ImplementReviews == nil || out.ImplementReviewsElided != "" {
+			t.Errorf("nil status must not fire: fired=%v reviews=%v elided=%q", fired, out.ImplementReviews, out.ImplementReviewsElided)
+		}
+	})
+
+	t.Run("empty Reviews (none/pending) does not fire", func(t *testing.T) {
+		out := GetRunStatusOutput{
+			ImplementReviews:      []PlanReview{heavy("a")},
+			ImplementReviewStatus: &ReviewStatus{Status: "pending", Reviews: []PlanReview{}},
+		}
+		fired, _ := dedupImplementReviews(&out)
+		if fired || out.ImplementReviews == nil || out.ImplementReviewsElided != "" {
+			t.Errorf("none/pending status must not fire: fired=%v elided=%q", fired, out.ImplementReviewsElided)
+		}
+	})
+
+	t.Run("empty flat slice does not fire even with rich rows", func(t *testing.T) {
+		// An empty flat listing matches implementReviewsContained vacuously; the
+		// SIZE GUARD is what refuses the fire (freed ~22 bytes < the ~150-byte
+		// elision note), so no spurious elision note is set. Deleting the size
+		// guard reddens this case (and the minimal-row case below).
+		out := GetRunStatusOutput{
+			ImplementReviews:      nil,
+			ImplementReviewStatus: &ReviewStatus{Status: "complete", Reviews: []PlanReview{heavy("a")}},
+		}
+		fired, _ := dedupImplementReviews(&out)
+		if fired || out.ImplementReviewsElided != "" {
+			t.Errorf("empty flat slice must not fire: fired=%v elided=%q", fired, out.ImplementReviewsElided)
+		}
+	})
+
+	t.Run("contained fires and drops the flat listing", func(t *testing.T) {
+		row := heavy("a")
+		out := GetRunStatusOutput{
+			ImplementReviews:      []PlanReview{row},
+			ImplementReviewStatus: &ReviewStatus{Status: "complete", Reviews: []PlanReview{row}},
+		}
+		fired, _ := dedupImplementReviews(&out)
+		if !fired {
+			t.Fatal("a contained flat listing should fire the dedup")
+		}
+		if out.ImplementReviews != nil {
+			t.Errorf("flat listing should be dropped, got %+v", out.ImplementReviews)
+		}
+		if out.ImplementReviewsElided != implementReviewsElidedNote {
+			t.Errorf("elided note = %q, want the fixed note", out.ImplementReviewsElided)
+		}
+	})
+
+	t.Run("not contained does not fire", func(t *testing.T) {
+		out := GetRunStatusOutput{
+			ImplementReviews:      []PlanReview{heavy("a"), heavy("b")},
+			ImplementReviewStatus: &ReviewStatus{Status: "complete", Reviews: []PlanReview{heavy("a")}},
+		}
+		fired, _ := dedupImplementReviews(&out)
+		if fired || out.ImplementReviews == nil {
+			t.Errorf("a flat row absent from rich must not fire: fired=%v", fired)
+		}
+	})
+
+	t.Run("size guard suppresses a fire that would grow the response", func(t *testing.T) {
+		// A minimal single approve row (no free_form, no concerns): dropping it
+		// frees fewer bytes than the elision note costs, so the dedup must NOT
+		// fire — the response stays byte-for-byte today's.
+		row := PlanReview{ReviewerKind: "agent", Authority: "advisory", Verdict: "approve"}
+		out := GetRunStatusOutput{
+			ImplementReviews:      []PlanReview{row},
+			ImplementReviewStatus: &ReviewStatus{Status: "complete", Reviews: []PlanReview{row}},
+		}
+		fired, _ := dedupImplementReviews(&out)
+		if fired || out.ImplementReviews == nil || out.ImplementReviewsElided != "" {
+			t.Errorf("a tiny flat listing must not fire (would grow the response): fired=%v elided=%q", fired, out.ImplementReviewsElided)
+		}
+	})
+}
+
+// TestDedupImplementReviews_PlanReviewNotesUnchanged is condition 1's guarantee:
+// when the implement dedup fires, plan-review notes are byte-identical to today
+// (content-free marker), because the caller passes capNotes=false at the plan
+// call site unconditionally. The cap can never leak to the plan surface.
+func TestDedupImplementReviews_PlanReviewNotesUnchanged(t *testing.T) {
+	row := PlanReview{
+		ReviewerKind: "agent", ReviewerModel: "a", Authority: "advisory",
+		Verdict:  "approve_with_concerns",
+		Concerns: []PlanReviewConcern{{Severity: "high", Category: "security", Note: strings.Repeat("z", 120)}},
+		FreeForm: strings.Repeat("p", 120),
+	}
+	out := GetRunStatusOutput{
+		ImplementReviews:      []PlanReview{row},
+		ImplementReviewStatus: &ReviewStatus{Status: "complete", Reviews: []PlanReview{row}},
+		PlanReviewStatus: &ReviewStatus{Status: "complete", Reviews: []PlanReview{{
+			ReviewerKind: "agent", Authority: "advisory", Verdict: "approve_with_concerns",
+			Concerns: []PlanReviewConcern{{Severity: "low", Category: "scope", Note: strings.Repeat("q", 300)}},
+			FreeForm: "plan prose",
+		}}},
+	}
+
+	fired, capNotes := dedupImplementReviews(&out)
+	if !fired {
+		t.Fatal("implement dedup should fire on the contained listing")
+	}
+	// Mirror the tools.go call sequence: plan notes are ALWAYS marker-elided.
+	stripReviewProse(out.PlanReviewStatus.Reviews, false)
+	if got := out.PlanReviewStatus.Reviews[0].Concerns[0].Note; got != elidedReviewProseMarker {
+		t.Errorf("plan-review note = %q, want the content-free marker (byte-identical to today) even though the implement dedup fired with capNotes=%v", got, capNotes)
+	}
+	if got := out.PlanReviewStatus.Reviews[0].FreeForm; got != elidedReviewProseMarker {
+		t.Errorf("plan-review free_form = %q, want the marker", got)
+	}
 }
 
 func TestCompactAuditPayload(t *testing.T) {

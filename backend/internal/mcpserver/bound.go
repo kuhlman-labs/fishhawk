@@ -607,6 +607,13 @@ var runStatusPathTable = []pathClassification{
 			pointerListAudit(runID, "implement_review_skipped", 0),
 		}
 	}},
+	// implement_reviews_elided (E45.92 / #3627) is the fixed-size legible note
+	// dedupImplementReviews sets when it drops the redundant flat listing. It is
+	// tierNever ON PURPOSE: its entire purpose is to EXPLAIN an omission, and
+	// eliding the explanation of an elision is the silent-drop failure this change
+	// exists to avoid. Being a single small scalar it neither bypasses the budget
+	// nor perturbs the diagnosis-skeleton size the floor assertions pin.
+	{Path: "implement_reviews_elided", Tier: tierNever},
 	{Path: "plan_review_status", Tier: "skeleton", Class: classStored, Surfaces: auditAll},
 	{Path: "implement_review_status", Tier: "skeleton", Class: classStored, Surfaces: auditAll},
 	{Path: "plan_stage_wait_status", Tier: tierNever},

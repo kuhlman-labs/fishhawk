@@ -1,7 +1,9 @@
 package mcpserver
 
 import (
+	"encoding/json"
 	"fmt"
+	"reflect"
 	"unicode/utf8"
 )
 
@@ -26,25 +28,210 @@ import (
 // empty: the two states an operator must be able to tell apart stay distinct.
 const elidedReviewProseMarker = "…(elided; full text via fishhawk_get_gate_view, or include_review_prose=true)"
 
-// stripReviewProse replaces the free-text fields of each typed implement
-// review IN PLACE with a visible elision marker: the review-level free_form and
-// every concern's note. A field that was ALREADY empty is left empty — the
-// marker is written only over non-empty text, so an elided note and a
-// genuinely-empty one remain distinguishable (#3043). Everything an operator
-// gates on — verdict, authority, reviewer_kind, reviewer_model, reason, and
-// each concern's severity/category (the "concern keys") — is left intact.
-// Called on the default (no include_review_prose) get_run_status path.
-func stripReviewProse(reviews []PlanReview) {
+// concernNoteCapBytes is the ENCODED-length cap a concern note is truncated to
+// on a DEDUPED get_run_status response (E45.92 / #3627). It is a floor on
+// usefulness — roughly two sentences of a concern note — not a derived optimum;
+// the byte-breakdown test records the actual totals so a later tuning pass has
+// evidence. Capping is on the escape-exact encoded length via bound.go's
+// capJSONString, never a raw-byte cut.
+const concernNoteCapBytes = 240
+
+// cappedNoteMarker is appended to a note whose full text exceeded the cap on a
+// deduped response. It names the two full-prose surfaces, mirroring
+// elidedReviewProseMarker. A note WITHIN the cap is returned byte-identical and
+// carries NO marker, so a capped note and an uncapped one are distinguishable.
+const cappedNoteMarker = "…(capped; full note via fishhawk_get_gate_view, or include_review_prose=true)"
+
+// implementReviewsElidedNote is the fixed wire note dedupImplementReviews sets on
+// GetRunStatusOutput.ImplementReviewsElided when it drops the redundant flat
+// implement_reviews listing (E45.92 / #3627). It explains the omission so it is
+// legible rather than silent (the #3043 lesson). The full contract — including
+// that a deduped response carries capped rather than content-free notes ONLY
+// when the freed bytes cover the prefixes — lives in the field's jsonschema
+// description and the package README; the wire note stays concise so it does not
+// itself eat the bytes the dedup frees.
+const implementReviewsElidedNote = "omitted; every row is present in implement_review_status.reviews (full prose via fishhawk_get_gate_view or include_review_prose=true)"
+
+// projectedConcernNote returns the projected form of a NON-EMPTY concern note on
+// the compact-default path. When capNotes is false it is today's content-free
+// marker. When capNotes is true a note within concernNoteCapBytes of encoded
+// length is returned byte-identical (no marker); a longer note is capped to a
+// rune-boundary encoded prefix plus cappedNoteMarker. capNotes true is reached
+// ONLY on a deduped implement_review_status.reviews render whose freed bytes
+// cover the added prefixes (dedupImplementReviews decides), so no response grows.
+func projectedConcernNote(note string, capNotes bool) string {
+	if !capNotes {
+		return elidedReviewProseMarker
+	}
+	if jsonEncodedLen(note) <= concernNoteCapBytes {
+		return note
+	}
+	return capJSONString(note, concernNoteCapBytes) + cappedNoteMarker
+}
+
+// stripReviewProse replaces the free-text fields of each typed review IN PLACE:
+// the review-level free_form and every concern's note. free_form is ALWAYS
+// replaced by elidedReviewProseMarker when non-empty (unaffected by capNotes).
+// For a concern note, capNotes selects the projection: false is today's
+// content-free marker (byte-for-byte the pre-#3627 behaviour); true is a capped
+// prefix (via projectedConcernNote), used ONLY at the deduped
+// implement_review_status.reviews call site. A field that was ALREADY empty is
+// left empty on both paths — the marker/prefix is written only over non-empty
+// text, so an elided note and a genuinely-empty one remain distinguishable
+// (#3043). Everything an operator gates on — verdict, authority, reviewer_kind,
+// reviewer_model, reason, and each concern's severity/category (the "concern
+// keys") — is left intact.
+func stripReviewProse(reviews []PlanReview, capNotes bool) {
 	for i := range reviews {
 		if reviews[i].FreeForm != "" {
 			reviews[i].FreeForm = elidedReviewProseMarker
 		}
 		for j := range reviews[i].Concerns {
 			if reviews[i].Concerns[j].Note != "" {
-				reviews[i].Concerns[j].Note = elidedReviewProseMarker
+				reviews[i].Concerns[j].Note = projectedConcernNote(reviews[i].Concerns[j].Note, capNotes)
 			}
 		}
 	}
+}
+
+// implementReviewsContained reports whether every element of flat has a DISTINCT
+// DeepEqual partner in rich (MULTISET containment): two byte-identical flat rows
+// each need their own partner, and ordering differences between
+// loadImplementReviews' (reviewed+skipped) order and reviewRound.LandedRows'
+// (reviewed+failed+skipped) order do not defeat the match. It returns FALSE for
+// an empty rich slice — a none/pending status carries no rows, so nothing is
+// duplicated and the flat listing is the only verdict surface there. (An empty
+// flat slice matches vacuously here; dedupImplementReviews's size guard then
+// refuses the fire, so an empty flat listing never gains a spurious elision.)
+func implementReviewsContained(flat, rich []PlanReview) bool {
+	if len(rich) == 0 {
+		return false
+	}
+	used := make([]bool, len(rich))
+	for i := range flat {
+		matched := false
+		for k := range rich {
+			if used[k] {
+				continue
+			}
+			if reflect.DeepEqual(flat[i], rich[k]) {
+				used[k] = true
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
+	}
+	return true
+}
+
+// jsonFieldBytes returns the marshalled wire cost of ONE response field —
+// `"key":value` without the surrounding object braces or a separating comma. It
+// is used by dedupImplementReviews's size accounting to compare the bytes a
+// dropped field frees against the bytes the projection adds.
+func jsonFieldBytes(key string, value any) int {
+	raw, err := json.Marshal(map[string]any{key: value})
+	if err != nil {
+		return 0
+	}
+	return len(raw) - 2 // drop the `{` and `}`
+}
+
+// dedupImplementReviews drops the flat implement_reviews listing when it is
+// provably CONTAINED in implement_review_status.reviews — the exact condition
+// under which it carries nothing new (E45.92 / #3627) — replacing it with the
+// legible ImplementReviewsElided note. It ALSO decides, by an ENFORCED size
+// accounting, whether the deduped implement_review_status.reviews notes may
+// carry capped prefixes instead of the content-free marker: the returned
+// capNotes is true ONLY when the bytes freed by dropping the flat listing cover
+// BOTH the elision note AND the added prefixes, so no response can ever grow.
+//
+// It fires (returns fired=true) only when ALL hold:
+//   - out.ImplementReviewStatus != nil          (nil-deref guard)
+//   - implementReviewsContained(flat, rich)      (rich carries every flat row;
+//     false for an empty rich, so a none/pending status never fires; an empty
+//     flat matches vacuously and is refused by the size guard below)
+//   - saved >= costElided                        (the freed bytes cover even the
+//     omission explanation; otherwise the response would grow, so leave the tiny
+//     duplication — or an empty listing — byte-for-byte in place)
+//
+// On a fire it sets out.ImplementReviews = nil (json omitempty drops it from the
+// wire) and out.ImplementReviewsElided, and returns capNotes.
+func dedupImplementReviews(out *GetRunStatusOutput) (fired bool, capNotes bool) {
+	if out.ImplementReviewStatus == nil {
+		return false, false
+	}
+	flat := out.ImplementReviews
+	rich := out.ImplementReviewStatus.Reviews
+	// An empty flat listing needs no dedicated guard: implementReviewsContained
+	// matches it vacuously, but the size guard below then measures a freed size of
+	// ~22 bytes (an empty array under its key) against the ~150-byte elision note
+	// and refuses to fire — so an empty implement_reviews never gains a spurious
+	// elision note. (Deleting the size guard reddens both the minimal-row and the
+	// empty-flat cases in TestDedupImplementReviews.)
+	if !implementReviewsContained(flat, rich) {
+		return false, false
+	}
+
+	// saved = today's wire contribution of the flat listing, which ships
+	// marker-elided. Measured on a marker-elided DEEP COPY so the saving is the
+	// real freed bytes, never the (larger) unstripped size — using the unstripped
+	// size would let the cap look affordable when it is not.
+	elidedFlat := deepCopyReviews(flat)
+	stripReviewProse(elidedFlat, false)
+	saved := jsonFieldBytes("implement_reviews", elidedFlat)
+
+	// costElided = the bytes the ImplementReviewsElided field adds (+1 for its
+	// field separator, so the added side is not under-counted).
+	costElided := jsonFieldBytes("implement_reviews_elided", implementReviewsElidedNote) + 1
+	if saved < costElided {
+		return false, false
+	}
+
+	out.ImplementReviews = nil
+	out.ImplementReviewsElided = implementReviewsElidedNote
+
+	// costCap = the extra bytes capping the rich notes adds over today's
+	// content-free markers. Enable the prefixes only when the freed bytes cover
+	// the explanation AND the prefixes, so the deduped response is never larger
+	// than today's.
+	costCap := richNoteCapDelta(rich)
+	return true, saved >= costElided+costCap
+}
+
+// deepCopyReviews copies a review slice giving each review its OWN Concerns
+// slice, so stripping the copy cannot mutate the original's shared backing array.
+func deepCopyReviews(in []PlanReview) []PlanReview {
+	out := make([]PlanReview, len(in))
+	for i := range in {
+		out[i] = in[i]
+		if in[i].Concerns != nil {
+			out[i].Concerns = make([]PlanReviewConcern, len(in[i].Concerns))
+			copy(out[i].Concerns, in[i].Concerns)
+		}
+	}
+	return out
+}
+
+// richNoteCapDelta is the total added encoded bytes if every non-empty rich
+// concern note were capped (projectedConcernNote with capNotes=true) instead of
+// marker-elided. It can be negative — a note shorter than the marker costs fewer
+// bytes capped — which correctly makes the cap even more affordable.
+func richNoteCapDelta(rich []PlanReview) int {
+	markerLen := jsonEncodedLen(elidedReviewProseMarker)
+	delta := 0
+	for i := range rich {
+		for j := range rich[i].Concerns {
+			note := rich[i].Concerns[j].Note
+			if note == "" {
+				continue
+			}
+			delta += jsonEncodedLen(projectedConcernNote(note, true)) - markerLen
+		}
+	}
+	return delta
 }
 
 // compactFreeTextKeys is the narrow, documented denylist of oversized
