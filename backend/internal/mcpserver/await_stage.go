@@ -42,8 +42,12 @@ type AwaitStageInput struct {
 //     awaiting_scope_decision / awaiting_deploy_approval /
 //     awaiting_host_dispatch). State carries the RAW backend state so a parked
 //     awaiting_approval is never coerced to succeeded.
-//   - "timeout"      — nothing settled within the window. The wait holds no
-//     server state, so re-calling is a safe idempotent no-op.
+//   - "timeout"      — the CALLER's wait cap expired before anything settled.
+//     The wait holds no server state, so re-calling is a safe idempotent no-op.
+//     TimeoutKind discriminates WHICH deadline expired (E45.91 / #3626):
+//     "client_wait_cap" (only yours) or "stage_deadline_exceeded" (a
+//     best-effort health read showed the stage's OWN per-attempt agent budget
+//     exhausted while the stage is still unsettled).
 //   - "run_terminal" — the run reached a terminal state while the stage was
 //     still unsettled (ADR-036 backstop); a final read found it still
 //     unsettled, so it most likely never will. Do not re-arm blindly.
@@ -66,9 +70,31 @@ type AwaitStageInput struct {
 // so StageWaitStatus.FixupRecovered carries the marker and Message repeats its
 // advisory at the top level where an operator cannot miss it. See
 // awaitStageSettled.
+//
+// WHY the "timeout" TOKEN WAS KEPT (E45.91 / #3626). The issue offered two
+// fixes: a NEW status value naming the client cap, or a discriminator field
+// alongside the existing token. The second was taken. `status` is the token
+// callers branch on, so minting a new value would silently break a strict
+// consumer that switch-exhausts on it — a wire-breaking change to repair a
+// low-severity REPORTING defect. `timeout_kind` is purely additive: every
+// pre-existing consumer reads byte-identical `status`, and a consumer that
+// wants the distinction gets an exhaustive switch on the new field.
 type AwaitStageOutput struct {
-	Status string `json:"status" jsonschema:"one of settled, timeout, run_terminal, amendment_pending"`
-	Stage  string `json:"stage" jsonschema:"the resolved stage type"`
+	Status string `json:"status" jsonschema:"one of settled, timeout, run_terminal, amendment_pending. The 'timeout' status is the CALLER's wait cap expiring, not a stage failure; it is discriminated by timeout_kind (#3626)"`
+	// TimeoutKind names WHICH deadline expired on the "timeout" status (E45.91 /
+	// #3626). Empty on every other status. It is DERIVED from a best-effort
+	// stage-health read at timeout time, never a constant.
+	//
+	// Per the operator's binding condition on this change, "client_wait_cap" is
+	// NOT a health claim: its whole meaning is "the caller's wait cap expired
+	// before the stage settled". The Message says the stage is within its
+	// deadline ONLY when the health read actually succeeded and showed a
+	// positive remaining budget; when the read failed or the budget is
+	// unresolved the Message says the stage's own deadline status is UNKNOWN —
+	// a failed read cannot rule out that it too expired — and points at
+	// fishhawk_get_run_status.
+	TimeoutKind string `json:"timeout_kind,omitempty" jsonschema:"present only on the 'timeout' status: WHICH deadline expired. On this verb a timeout NEVER by itself means the stage failed. 'client_wait_cap' means ONLY that your own wait cap expired before the stage settled — it is NOT a statement that the stage is healthy: read message and stage_wait_status, and when the health read failed or the agent budget is unresolved the message says the stage's OWN deadline status is UNKNOWN (a failed read can neither confirm nor rule out that it also expired) and points at fishhawk_get_run_status. 'stage_deadline_exceeded' means a best-effort health read showed the stage's OWN per-attempt agent budget exhausted (deadline_seconds_remaining is 0) while the stage is still unsettled — the concerning shape; do not just re-arm. A stage that blows its own agent deadline is KILLED by the runner and arrives as status settled/failed, never as this status"`
+	Stage       string `json:"stage" jsonschema:"the resolved stage type"`
 	// StageID is the resolved stage UUID — the durable ADR-037 handle, echoed so
 	// a resuming caller can re-issue against the same stage.
 	StageID string `json:"stage_id" jsonschema:"the resolved stage UUID the wait was armed against (the durable ADR-037 handle, with run_id)"`
@@ -76,7 +102,7 @@ type AwaitStageOutput struct {
 	// awaiting_approval settles the wait but is reported as awaiting_approval,
 	// NOT succeeded, so the operator can tell a completed stage from one parked
 	// for their attention.
-	State string `json:"state" jsonschema:"the RAW backend stage state (succeeded/failed/cancelled/superseded or a parked awaiting_* state); never coerced, so a parked settled stage is distinguishable from a succeeded one. superseded means a merge made the stage unreachable (#3083) — neither a pass nor an operator cancellation"`
+	State string `json:"state" jsonschema:"the RAW backend stage state (succeeded/failed/cancelled/superseded or a parked awaiting_* state); never coerced, so a parked settled stage is distinguishable from a succeeded one. superseded means a merge made the stage unreachable (#3083) — neither a pass nor an operator cancellation. On the 'timeout' status it carries the still-unsettled state from the best-effort health read (#3626), and is EMPTY when that read failed"`
 	// Terminal is the endpoint's settledness flag (#1252): true when the stage
 	// IsSettled — terminal OR parked. It is the authority for the settled
 	// resolve; keying on terminality alone (succeeded/failed/cancelled/superseded) would
@@ -84,7 +110,7 @@ type AwaitStageOutput struct {
 	Terminal            bool             `json:"terminal" jsonschema:"true when the stage has SETTLED — a terminal state OR a parked-for-operator state; the authoritative resolve signal"`
 	FailureCategory     string           `json:"failure_category,omitempty" jsonschema:"the failed stage's category, when the settled state is failed"`
 	FailureReason       string           `json:"failure_reason,omitempty" jsonschema:"the failed stage's reason, when the settled state is failed"`
-	StageWaitStatus     *StageWaitStatus `json:"stage_wait_status,omitempty" jsonschema:"the classified execution wait status (same shape get_run_status / dispatch_stage carry), for continuity; the raw state + terminal fields are the authority. On a settled implement stage it may carry fixup_recovered (#3081) — the marker that the latest fix-up pass FAILED and was recovered, so no fix-up commit landed"`
+	StageWaitStatus     *StageWaitStatus `json:"stage_wait_status,omitempty" jsonschema:"the classified execution wait status (same shape get_run_status / dispatch_stage carry), for continuity; the raw state + terminal fields are the authority. On a settled implement stage it may carry fixup_recovered (#3081) — the marker that the latest fix-up pass FAILED and was recovered, so no fix-up commit landed. On the 'timeout' status it carries the best-effort health read behind timeout_kind (#3626) — agent_timeout_seconds / deadline_seconds_remaining — and is ABSENT when that read failed, in which case stage health is UNKNOWN"`
 	WaitedSeconds       float64          `json:"waited_seconds" jsonschema:"elapsed wall time spent waiting"`
 	Message             string           `json:"message,omitempty" jsonschema:"actionable explanation on the timeout / run_terminal statuses, AND on a SETTLED status whose stage_wait_status carries fixup_recovered (#3081) — a fix-up pass that failed and was recovered, so the succeeded status is misleading about the fix-up"`
 	PollIntervalSeconds int              `json:"poll_interval_seconds,omitempty" jsonschema:"server-suggested cadence (seconds) for switching to fishhawk_get_run_status polling; present only on the timeout status"`
@@ -112,6 +138,23 @@ type AwaitStageOutput struct {
 // one — the stage an operator dispatches with fishhawk_dispatch_stage and then
 // wants to block on.
 const awaitStageDefaultStageType = "implement"
+
+// The two values of AwaitStageOutput.TimeoutKind (E45.91 / #3626). The word
+// "timeout" is the vocabulary of failure, but this verb's only timeout is the
+// CALLER's wait cap — a stage that blows its OWN agent deadline is killed by
+// the runner and arrives as a SETTLED failed stage. These name which deadline
+// actually expired so a caller branches on a field instead of parsing prose.
+const (
+	// awaitStageTimeoutKindClientWaitCap is the normal case: the caller's wait
+	// cap expired before the stage settled. It says NOTHING on its own about the
+	// stage's health — see awaitStageTimeoutOutput, which states a positive
+	// health fact only when the probe actually read one.
+	awaitStageTimeoutKindClientWaitCap = "client_wait_cap"
+	// awaitStageTimeoutKindStageDeadlineExceeded is the concerning case: a
+	// best-effort health read showed the stage's per-attempt agent budget
+	// exhausted (deadline_seconds_remaining == 0) while it is still unsettled.
+	awaitStageTimeoutKindStageDeadlineExceeded = "stage_deadline_exceeded"
+)
 
 // registerAwaitStage wires the fishhawk_await_stage tool (#2491): the terminal
 // wait for the durable handle fishhawk_dispatch_stage hands back. Read-only per
@@ -170,10 +213,33 @@ Statuses:
                      fishhawk_retry_stage of the same stage. Settledness wins
                      the race — a stage that has settled resolves 'settled'
                      even with an amendment still pending.
-  - "timeout"      — nothing settled within the window. The wait holds no
-                     server state, so a cut-short call is a safe no-op to
-                     re-issue; poll_interval_seconds names the fallback
-                     get_run_status cadence.
+  - "timeout"      — YOUR wait cap expired before the stage settled. What
+                     RELEASED the wait is always the CLIENT's deadline: a
+                     stage that blows its OWN agent deadline is
+                     KILLED by the runner and arrives here as status
+                     "settled" with state "failed", so a timeout by itself
+                     never means the stage failed. The wait holds no server state, so a cut-short
+                     call is a safe no-op to re-issue; poll_interval_seconds
+                     names the fallback get_run_status cadence. timeout_kind
+                     reports what a best-effort health read could establish
+                     about the STAGE's own deadline (#3626):
+                       - "client_wait_cap" — your cap expired. That is ALL it
+                         says: it is not a health claim about the stage. The
+                         message reports the stage as within its deadline only
+                         when a best-effort health read actually showed
+                         remaining budget; otherwise it says the stage's
+                         deadline status is UNKNOWN — the read failed, so it
+                         can neither confirm nor rule out that the stage's own
+                         deadline also passed — and sends you to
+                         fishhawk_get_run_status.
+                       - "stage_deadline_exceeded" — a best-effort health read
+                         shows the stage's per-attempt agent budget exhausted
+                         (deadline_seconds_remaining is 0) while it is STILL
+                         unsettled. Do not just re-arm: check
+                         fishhawk_get_run_status, and fishhawk_reap_stage if
+                         the runner is gone.
+                     state and stage_wait_status ride out alongside it, so
+                     branch on those fields rather than parsing the message.
   - "run_terminal" — the run reached succeeded/failed/cancelled while the
                      stage was still unsettled (the ADR-036 non-stranding
                      backstop); a final read found it still unsettled, so it
@@ -289,7 +355,13 @@ func (r *runResolver) awaitStage(ctx context.Context, req *mcp.CallToolRequest, 
 	for {
 		select {
 		case <-pollCtx.Done():
-			return nil, awaitStageTimeoutOutput(stageType, stageUUID, timeout, start, heartbeat, capSeconds), nil
+			// Classify the timeout ONCE, here — never per tick (#3626). The PARENT
+			// ctx, not the expired pollCtx: pollCtx's deadline is the very thing
+			// that produced this timeout, so inheriting it would fail the probe by
+			// construction every time. When the parent is ALSO done the probe's
+			// error path degrades to the unclassified client_wait_cap fallback.
+			rawState, health := r.awaitStageTimeoutHealth(ctx, runID, stageType)
+			return nil, awaitStageTimeoutOutput(stageType, stageUUID, timeout, start, heartbeat, capSeconds, rawState, health), nil
 		case <-ticker.C:
 			// Best-effort progress heartbeat once per tick (opt-in): keeps a long
 			// wait from being aborted by the client's idle timeout. Emitted only
@@ -313,7 +385,9 @@ func (r *runResolver) awaitStage(ctx context.Context, req *mcp.CallToolRequest, 
 				// A deadline hit mid-poll cancels the in-flight request; that is a
 				// timeout, not a transport failure — return the resumable timeout.
 				if pollCtx.Err() != nil {
-					return nil, awaitStageTimeoutOutput(stageType, stageUUID, timeout, start, heartbeat, capSeconds), nil
+					// Same PARENT-ctx probe as the pollCtx.Done() arm above (#3626).
+					rawState, health := r.awaitStageTimeoutHealth(ctx, runID, stageType)
+					return nil, awaitStageTimeoutOutput(stageType, stageUUID, timeout, start, heartbeat, capSeconds, rawState, health), nil
 				}
 				return nil, AwaitStageOutput{}, fmt.Errorf("poll stage wait: %w", err)
 			}
@@ -552,21 +626,124 @@ func awaitStageSettledOutput(stageType string, sw *RunStageWait, start time.Time
 	return out
 }
 
+// awaitStageTimeoutHealth is the BEST-EFFORT stage-health read paid ONCE when a
+// wait times out (E45.91 / #3626) — never per poll tick. It answers the one
+// question the bare "timeout" token could not: is the stage still inside its own
+// per-attempt agent budget, or has that budget run out too?
+//
+// It reuses the EXISTING api-client reads (ListRunStages + GetRun) and the
+// EXISTING stageWaitStatusFor classifier, so the #2540 budget derivation and the
+// #3335 per-attempt dispatch clock are inherited verbatim — no new REST surface
+// and no signature change to stage_wait.go.
+//
+// BEST-EFFORT in exactly the same direction as awaitStageRunTerminalBackstop and
+// awaitStagePendingAmendment: ANY read error, a nil run, or a run carrying no
+// stage of the awaited type yields ("", nil), and the caller falls back to the
+// unclassified client_wait_cap response. A wait that may have been held for two
+// hours must never DIE on a classification read — losing the classification is
+// strictly cheaper than failing the wait.
+//
+// The caller MUST pass the PARENT ctx, not the expired pollCtx: the deadline
+// that produced the timeout is the pollCtx's own, so inheriting it would fail
+// this probe by construction on every single timeout and silently reduce
+// TimeoutKind to a constant.
+func (r *runResolver) awaitStageTimeoutHealth(ctx context.Context, runID uuid.UUID, stageType string) (string, *StageWaitStatus) {
+	stages, err := r.api.ListRunStages(ctx, runID)
+	if err != nil {
+		return "", nil
+	}
+	runRow, err := r.api.GetRun(ctx, runID)
+	if err != nil || runRow == nil {
+		return "", nil
+	}
+	sw := stageWaitStatusFor(stages, stageType, runRow.State, runRow.PredictedRuntimeMinutes, time.Now().UTC())
+	if sw == nil {
+		return "", nil
+	}
+	rawState := ""
+	for _, s := range stages {
+		if s.Type == stageType {
+			rawState = s.State
+			break
+		}
+	}
+	return rawState, sw
+}
+
+// awaitStageTimeoutKind classifies a timeout from the (possibly nil) health
+// block awaitStageTimeoutHealth produced. PURE and separate from the probe so a
+// table test pins all four branches without a backend.
+//
+// stage_deadline_exceeded requires the pointer to be BOTH non-nil AND zero: it
+// is exactly the #2540 known-vs-unknown discriminator — stageDeadlineRemaining
+// returns nil when the budget could not be resolved and CLAMPS an overrun to 0 —
+// so nil must never be read as "exhausted". Every other case (nil block, unknown
+// budget, budget remaining) is client_wait_cap, which asserts only that the
+// caller's cap expired.
+func awaitStageTimeoutKind(sw *StageWaitStatus) string {
+	if sw != nil && sw.DeadlineSecondsRemaining != nil && *sw.DeadlineSecondsRemaining == 0 {
+		return awaitStageTimeoutKindStageDeadlineExceeded
+	}
+	return awaitStageTimeoutKindClientWaitCap
+}
+
 // awaitStageTimeoutOutput builds the resumable timeout response. The wait holds
 // no server state, so a timeout is an idempotent checkpoint, not an error.
-func awaitStageTimeoutOutput(stageType string, stageID uuid.UUID, timeout int, start time.Time, heartbeat bool, capSeconds int) AwaitStageOutput {
-	return AwaitStageOutput{
+//
+// rawState + sw come from awaitStageTimeoutHealth and may be ("", nil) when that
+// best-effort read failed. The function itself is PURE (no I/O) so both message
+// variants stay table-testable.
+//
+// THREE messages, because the operator's binding condition on #3626 forbids
+// client_wait_cap from claiming the stage is healthy:
+//
+//   - stage_deadline_exceeded — the stage's own per-attempt budget is spent and
+//     it still has not settled. Re-arming may just burn a second cap, so the
+//     message routes to fishhawk_get_run_status / fishhawk_reap_stage instead.
+//   - client_wait_cap, health KNOWN — the probe succeeded and reported a
+//     positive remaining budget, so (and only so) the response states the stage
+//     is within its deadline and names the seconds it observed.
+//   - client_wait_cap, health UNKNOWN — the probe failed, or the budget is
+//     unresolved. A failed read cannot establish that the stage's own deadline
+//     has NOT also expired, so the response asserts only the caller's cap,
+//     says the stage's deadline status is UNKNOWN IN THOSE WORDS, and points at
+//     fishhawk_get_run_status rather than implying a healthy stage it never read.
+func awaitStageTimeoutOutput(stageType string, stageID uuid.UUID, timeout int, start time.Time, heartbeat bool, capSeconds int, rawState string, sw *StageWaitStatus) AwaitStageOutput {
+	kind := awaitStageTimeoutKind(sw)
+	out := AwaitStageOutput{
 		Status:              "timeout",
+		TimeoutKind:         kind,
 		Stage:               stageType,
 		StageID:             stageID.String(),
+		State:               rawState,
+		StageWaitStatus:     sw,
 		WaitedSeconds:       time.Since(start).Seconds(),
 		PollIntervalSeconds: suggestedStageWaitPollIntervalSeconds,
 		Heartbeat:           heartbeat,
 		TimeoutCapSeconds:   capSeconds,
-		Message: fmt.Sprintf("stage %q did not settle within %ds. The wait holds nothing: re-call fishhawk_await_stage "+
-			"to resume it (a safe idempotent no-op), or poll fishhawk_get_run_status every %ds (the authoritative path).",
-			stageType, timeout, suggestedStageWaitPollIntervalSeconds),
 	}
+	switch {
+	case kind == awaitStageTimeoutKindStageDeadlineExceeded:
+		out.Message = fmt.Sprintf("stage %q did not settle within %ds, and YOUR wait cap is not the only deadline that expired: "+
+			"a stage-health read shows its per-attempt agent budget (%ds) is EXHAUSTED — deadline_seconds_remaining is 0 — "+
+			"while the stage state is still %q. Arming another wait may simply burn a second cap. "+
+			"Check fishhawk_get_run_status for the stage's actual state, and fishhawk_reap_stage if the runner is gone.",
+			stageType, timeout, sw.AgentTimeoutSeconds, rawState)
+	case sw != nil && sw.DeadlineSecondsRemaining != nil:
+		out.Message = fmt.Sprintf("stage %q did not settle within %ds — YOUR wait cap expired, not the stage's own deadline, "+
+			"and the stage has NOT failed. A stage-health read shows %ds of its per-attempt agent budget remaining "+
+			"(state %q), so it is still within its deadline. The wait holds nothing: re-call fishhawk_await_stage "+
+			"to resume it (a safe idempotent no-op), or poll fishhawk_get_run_status every %ds (the authoritative path).",
+			stageType, timeout, *sw.DeadlineSecondsRemaining, rawState, suggestedStageWaitPollIntervalSeconds)
+	default:
+		out.Message = fmt.Sprintf("stage %q did not settle within %ds — YOUR wait cap expired. Whether the stage's OWN "+
+			"deadline also expired is UNKNOWN: the health read failed or the stage's agent budget is unresolved, so this "+
+			"response does NOT claim the stage is healthy and does NOT rule out that its own deadline has passed — check "+
+			"fishhawk_get_run_status for its actual state. The wait holds nothing: re-call fishhawk_await_stage to resume "+
+			"it (a safe idempotent no-op), or poll fishhawk_get_run_status every %ds (the authoritative path).",
+			stageType, timeout, suggestedStageWaitPollIntervalSeconds)
+	}
+	return out
 }
 
 // awaitStageProgressMessage builds the per-tick heartbeat message for a pending
