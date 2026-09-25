@@ -622,3 +622,29 @@ func TestAwaitPendingScopeAmendmentSettle_PolicyEventShape(t *testing.T) {
 		t.Errorf("waited_ms missing from payload %s", raw)
 	}
 }
+
+// TestAwaitPendingScopeAmendmentSettle_RefreshesBearerPerPoll (#3255): with an
+// EXPIRED stage-start token and a wired source, the probe AND each settleLoop
+// poll carry a freshly-read bearer — never the expired one, and newer per poll.
+func TestAwaitPendingScopeAmendmentSettle_RefreshesBearerPerPoll(t *testing.T) {
+	withShrunkSettleTuning(t, scaledD(5*time.Second))
+	var tokens []string
+	fake := &fakeUploader{amendmentsSeq: [][]upload.ScopeAmendment{
+		{settlePendingRow("a1", "stage-1")},
+		{settlePendingRow("a1", "stage-1")},
+		{settleDecidedRow("a1", "stage-1", "approved")},
+	}}
+	fake.amendmentsHook = func(_ context.Context, a upload.FetchScopeAmendmentsArgs) error {
+		tokens = append(tokens, a.MCPToken)
+		return nil
+	}
+	src, _ := newExpiredTokenSource()
+	cfg := settleCfg()
+	cfg.mcpTokens = src
+	var log bytes.Buffer
+	awaitPendingScopeAmendmentSettle(context.Background(), fake, cfg, "fhm_expired", "implement", &log)
+	want := []string{"fhm_refreshed_1", "fhm_refreshed_2", "fhm_refreshed_3"}
+	if strings.Join(tokens, ",") != strings.Join(want, ",") {
+		t.Fatalf("per-poll tokens = %v, want %v", tokens, want)
+	}
+}

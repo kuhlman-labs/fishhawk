@@ -308,6 +308,21 @@ INDEPENDENT runtime probe, not `DetectRuntime` (approval condition 3) — fails
 the binary when a runtime is present but no docker-gated fixture ran. On a
 docker host, run them with `scripts/test single -run 'TestGate' ./cmd/fishhawk-runner/`.
 
+## Run-bound MCP token refresh ([E68.38 / #3255](https://github.com/kuhlman-labs/fishhawk/issues/3255))
+
+The runner mints its run-bound `fhm_` bearer once at stage start with a fixed 60-minute TTL (`backend/internal/mcptoken.DefaultTTL`), but a stage's wall clock is unbounded by any fixed margin: each `runVerifyFixLoop` re-invocation gets the full `agent_timeout_seconds` again. So every post-agent consumer reads the bearer at its point of use through `mcpTokenSource.bearer()` (`cmd/fishhawk-runner/mcptokenrefresh.go`, reached as `cfg.freshMCPToken`): the scope-amendment settle wait and each of its polls, the approved-path fold, `detectUndecidedScopeAmendments`, the amendment watch poll, the verify-fix loop's per-iteration re-fold, the migration-renumber amendment POST and decision poll, `reportTerminalRunnerFailure`, and the `stage_progress` heartbeat tee. Each fix re-invocation is also handed a refreshed `FISHHAWK_API_TOKEN` — only when the inherited env already carries one.
+
+Contract:
+
+- **Refresh window:** a credential is re-minted once less than `mcpTokenRefreshSkew` (5m) of its life remains; a fresh token costs zero network calls.
+- **Key before token:** the per-run Ed25519 signing key lives only 30 minutes (`signing.DefaultTTL`), SHORTER than the token's 60, so a mint signed with the start-of-stage key would itself 401. The source re-issues the key first when it is missing or inside its own skew window, and keeps its OWN key copy (never written back to `run()`'s `issuedKey`, which concurrent callers would race); the backend's signing Issue is multi-call-safe on migration 0012+.
+- **Detached, bounded mint:** each refresh runs under `context.WithTimeout(context.WithoutCancel(ctx), mcpTokenRefreshTimeout)` with `mcpTokenRefreshTimeout = 15s`. The source's mutex is held across the refresh, so a concurrent caller waits at most that bound; a caller cancelling its own context can never fail a refresh.
+- **Backoff:** a genuine mint failure (IssueKey or FetchMCPToken error, including the 15s bound firing) stamps a `mcpTokenRefreshRetryInterval` (30s) backoff and returns the STALE token; calls inside the backoff make no network call.
+- **Best-effort:** `bearer()` never errors and never fails a stage. Log events: `mcp_token_refreshed` on success, `mcp_token_refresh_degraded` (with `step`) on failure.
+- **Zero-credential posture:** the source is constructed only on the successful initial `FetchMCPToken` path. The acceptance stage (ADR-050 decision #2) and a failed initial fetch leave it nil, and every consumer keeps its `mcpToken == ""` guard first — so no token is ever minted for a credential-free stage.
+
+Residual: the FIRST agent invocation's `FISHHAWK_API_TOKEN` is still the stage-start token, valid 60 minutes, and cannot be rewritten inside a live process — an initial invocation that runs past 60 minutes still sees its own `fishhawk_*` tool calls 401. Fix re-invocations get a fresh one.
+
 ## Self-hosting bootstrap deadlock ([E64.5 / #3086](https://github.com/kuhlman-labs/fishhawk/issues/3086))
 
 `fishhawk-runner` is a **separate binary**, built from `main`, respawned fresh from `bin/` on every host dispatch (the same design that lets the escape below work). So a run whose job is to **fix a defect in the runner itself** executes under the *unfixed* runner: the stage runs `bin/fishhawk-runner` built from `main`, hits the very defect the run is fixing, and cannot pass its own gates. This is a bootstrap deadlock.

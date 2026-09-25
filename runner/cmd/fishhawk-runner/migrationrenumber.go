@@ -465,7 +465,7 @@ func parkForMigrationRenumberAmendment(ctx context.Context, client uploadClient,
 	}
 	amendment, err := client.RequestScopeAmendment(ctx, upload.RequestScopeAmendmentArgs{
 		RunID:    cfg.runID,
-		MCPToken: mcpToken,
+		MCPToken: cfg.freshMCPToken(ctx, mcpToken),
 		Paths:    paths,
 		Reason:   migrationRenumberReason(subs),
 	})
@@ -489,7 +489,7 @@ func parkForMigrationRenumberAmendment(ctx context.Context, client uploadClient,
 	// the JSONL line it writes to logSink is the surviving record. The
 	// substitution's own visibility rides the supplemental scope_files_exempted
 	// audit row the caller passes to openPRAndShipArtifact.
-	_ = refreshScopeAmendments(ctx, client, cfg, mcpToken, logSink)
+	_ = refreshScopeAmendments(ctx, client, cfg, cfg.freshMCPToken(ctx, mcpToken), logSink)
 	emitMigrationRenumberDecided(cfg, amendment.ID, "approved", detail, logSink)
 
 	exemptions := make([]scopeExemption, 0, len(subs)*2)
@@ -538,7 +538,7 @@ func awaitMigrationRenumberDecision(ctx context.Context, client uploadClient, cf
 		fetchCtx, cancel := context.WithDeadline(ctx, deadline)
 		items, err := client.FetchScopeAmendments(fetchCtx, upload.FetchScopeAmendmentsArgs{
 			RunID:       cfg.runID,
-			MCPToken:    mcpToken,
+			MCPToken:    cfg.freshMCPToken(ctx, mcpToken), // per poll (#3255)
 			WaitSeconds: boundedRenumberWaitSeconds(remaining),
 		})
 		cancel()
