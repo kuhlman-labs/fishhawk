@@ -9999,6 +9999,19 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 	if prBodyFallbackReason != prBodyReasonNone {
 		artifactFields["pr_body_fallback_reason"] = string(prBodyFallbackReason)
 	}
+	// #3655: ship the gate-certified tree on the SUCCESS report so the backend
+	// can compare it against the tree the implement-review round judged (the
+	// bundle's terminal verify_run tree_sha) and record review_head_mismatch
+	// when a base-rebase re-invoke shipped a tree no reviewer saw. This is the
+	// SAME producer as the review side (the committed-tree verify gate), so a
+	// normal ship compares byte-equal even though the pushed commit SHA differs
+	// from the throwaway WIP SHA. On the #969 reverify-pass path the pre-push
+	// hook rebound verifiedTreeSHA to the re-verified pushed tree, so this is
+	// always the tree the push carries. Gated on non-empty: a no-verify stage
+	// omits the key entirely, keeping its artifact bytes byte-identical.
+	if verifiedTreeSHA != "" {
+		artifactFields["verified_tree_sha"] = verifiedTreeSHA
+	}
 	// Base-rebase re-invoke exemption delta (#1218): include the supplemental set
 	// ONLY when the re-invoke produced one, so every non-re-invoke ship omits the
 	// key entirely and stays byte-identical. The backend decodes it off

@@ -13684,3 +13684,106 @@ func TestAutoCloseCallSiteOrderedBetweenResolutionsAndAuditComplete(t *testing.T
 		t.Errorf("call order = apply:%d auto:%d complete:%d, want applyRoundConcernResolutions < autoCloseUnjudgedRoutedConcerns < recomputeAndPublishAuditComplete", apply, auto, complete)
 	}
 }
+
+// implementBundleWithVerifyTrees builds a push-gated implement trace bundle
+// whose verify_run events carry the given (head_sha, tree_sha) pairs in order
+// — a runVerifyFixLoop-shaped multi-iteration bundle (#3655).
+func implementBundleWithVerifyTrees(t *testing.T, runs [][2]string) []byte {
+	t.Helper()
+	var raw bytes.Buffer
+	write := func(seq int, kind string, data any) {
+		payload, _ := json.Marshal(data)
+		line, _ := json.Marshal(map[string]any{"seq": seq, "kind": kind, "data": json.RawMessage(payload)})
+		raw.Write(line)
+		raw.WriteByte('\n')
+	}
+	write(1, "manifest", bundle.Manifest{BundleSchema: "v1", PushToSharedBranch: true})
+	write(2, "git_diff", map[string]any{
+		"kind": "name_status", "base_ref": "origin/main", "num_files": 1,
+		"files": []map[string]string{{"path": "file0.go", "status": "modified"}},
+	})
+	for i, r := range runs {
+		write(3+i, "verify_run", map[string]any{
+			"command": "scripts/test verify", "head_sha": r[0], "tree_sha": r[1], "exit_code": 0, "outcome": "passed",
+		})
+	}
+	var gz bytes.Buffer
+	w := gzip.NewWriter(&gz)
+	_, _ = w.Write(raw.Bytes())
+	_ = w.Close()
+	return gz.Bytes()
+}
+
+func startedPayloadsForStage(t *testing.T, au *auditFake, stageID uuid.UUID) []planreview.ReviewStartedPayload {
+	t.Helper()
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var out []planreview.ReviewStartedPayload
+	for _, a := range au.appended {
+		if a.Category != "implement_review_started" || a.StageID == nil || *a.StageID != stageID {
+			continue
+		}
+		var p planreview.ReviewStartedPayload
+		if err := json.Unmarshal(a.Payload, &p); err != nil {
+			t.Fatalf("decode implement_review_started: %v", err)
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// TestShipTrace_ImplementReview_RecordsReviewedTreeSHA (#3655) drives the REAL
+// trace-upload path: the implement_review_started row carries the bundle's
+// AUTHORITATIVE (last non-empty) verify_run tree_sha as the round's
+// reviewed-tree identity, while head_sha stays the first-non-empty #797 key.
+func TestShipTrace_ImplementReview_RecordsReviewedTreeSHA(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, sf, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementAdvisoryReviewers)
+	priv, _ := sf.issue(t, runRow.ID)
+	bundleBytes := implementBundleWithVerifyTrees(t, [][2]string{{"head-a", "tree-a"}, {"head-b", "tree-b"}})
+	if w := shipRequest(t, s, runRow.ID, implStage.ID, "raw", priv, bundleBytes, ""); w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+	s.waitBackgroundReviews()
+	started := startedPayloadsForStage(t, au, implStage.ID)
+	if len(started) != 1 {
+		t.Fatalf("implement_review_started rows = %d, want 1", len(started))
+	}
+	if started[0].TreeSHA != "tree-b" {
+		t.Errorf("tree_sha = %q, want tree-b (the terminal verify_run's tree)", started[0].TreeSHA)
+	}
+	if started[0].HeadSHA != "head-a" {
+		t.Errorf("head_sha = %q, want head-a (the unchanged #797 first-non-empty key)", started[0].HeadSHA)
+	}
+}
+
+// TestShipTrace_ImplementReview_NoVerifyTree_DispatchesWithEmptyTree (#3655):
+// a bundle carrying no tree_sha fails OPEN — the review still dispatches and
+// the started row records no tree (the mismatch check is disabled, never the
+// review).
+func TestShipTrace_ImplementReview_NoVerifyTree_DispatchesWithEmptyTree(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, sf, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementAdvisoryReviewers)
+	priv, _ := sf.issue(t, runRow.ID)
+	bundleBytes := implementBundleWithVerifyTrees(t, [][2]string{{"head-a", ""}})
+	if w := shipRequest(t, s, runRow.ID, implStage.ID, "raw", priv, bundleBytes, ""); w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+	s.waitBackgroundReviews()
+	started := startedPayloadsForStage(t, au, implStage.ID)
+	if len(started) != 1 {
+		t.Fatalf("implement_review_started rows = %d, want 1 (an absent tree must never suppress the review)", len(started))
+	}
+	if started[0].TreeSHA != "" {
+		t.Errorf("tree_sha = %q, want empty", started[0].TreeSHA)
+	}
+	if n := countAuditCategory(au, "implement_reviewed"); n != 1 {
+		t.Errorf("implement_reviewed rows = %d, want 1", n)
+	}
+}

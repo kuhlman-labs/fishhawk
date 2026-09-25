@@ -1739,3 +1739,94 @@ func TestExtractGateEvidence_DecodesApprovalConditionResponses(t *testing.T) {
 		t.Errorf("older bundle: err=%v ApprovalConditionResponses=%+v, want nil", err, got.ApprovalConditionResponses)
 	}
 }
+
+// makeVerifyRunTreeLine builds a verify_run event line carrying BOTH head_sha
+// and tree_sha (#3655), mirroring the runner's verify_run payload shape.
+func makeVerifyRunTreeLine(t *testing.T, seq int, headSHA, treeSHA, outcome string) Line {
+	t.Helper()
+	payload, err := json.Marshal(map[string]any{
+		"command":   "scripts/test verify",
+		"head_sha":  headSHA,
+		"tree_sha":  treeSHA,
+		"exit_code": 0,
+		"output":    "",
+		"outcome":   outcome,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return Line{Seq: seq, Kind: EventKindVerifyRun, Data: payload}
+}
+
+// multiIterationVerifyBundle is a runVerifyFixLoop-shaped bundle: an absorbed
+// FAILING first iteration (head Ha / tree Ta), a gate-skipped verify_run with
+// neither SHA, then the terminal PASSING iteration (head Hb / tree Tb).
+func multiIterationVerifyBundle(t *testing.T) []byte {
+	t.Helper()
+	return packLines(t, []Line{
+		{Seq: 1, Kind: "manifest", Data: json.RawMessage(`{"bundle_schema":"v1"}`)},
+		makeVerifyRunTreeLine(t, 2, "head-a", "tree-a", "failed"),
+		makeVerifyRunTreeLine(t, 3, "head-b", "tree-b", "passed"),
+		makeVerifyRunTreeLine(t, 4, "", "", "skipped"),
+	})
+}
+
+// B1 (#3655): the AUTHORITATIVE verify tree is the LAST non-empty tree_sha —
+// an absorbed failing iteration's tree must never be returned, and a trailing
+// empty (gate-skipped) event must not erase the terminal tree.
+func TestExtractVerifyTreeSHA_LastNonEmptyWins(t *testing.T) {
+	got, err := ExtractVerifyTreeSHA(multiIterationVerifyBundle(t))
+	if err != nil {
+		t.Fatalf("ExtractVerifyTreeSHA: %v", err)
+	}
+	if got != "tree-b" {
+		t.Errorf("tree_sha = %q, want tree-b (the terminal iteration's tree, not the superseded tree-a)", got)
+	}
+}
+
+// B2 (#3655): a bundle whose verify_run events carry no tree_sha (or no
+// verify_run at all) returns ErrNoVerifyTreeSHA so the caller fails open.
+func TestExtractVerifyTreeSHA_NoTreeReturnsSentinel(t *testing.T) {
+	cases := map[string][]Line{
+		"no verify_run": {
+			{Seq: 1, Kind: "manifest", Data: json.RawMessage(`{"bundle_schema":"v1"}`)},
+		},
+		"verify_run without tree_sha": {
+			{Seq: 1, Kind: "manifest", Data: json.RawMessage(`{"bundle_schema":"v1"}`)},
+			makeVerifyRunLine(t, 2, "realsha"),
+		},
+	}
+	for name, lines := range cases {
+		t.Run(name, func(t *testing.T) {
+			got, err := ExtractVerifyTreeSHA(packLines(t, lines))
+			if !errors.Is(err, ErrNoVerifyTreeSHA) {
+				t.Errorf("err = %v, want ErrNoVerifyTreeSHA", err)
+			}
+			if got != "" {
+				t.Errorf("tree_sha = %q, want empty", got)
+			}
+		})
+	}
+}
+
+func TestExtractVerifyTreeSHA_BadInput(t *testing.T) {
+	if _, err := ExtractVerifyTreeSHA([]byte("not gzipped")); !errors.Is(err, ErrBadGzip) {
+		t.Errorf("err = %v, want ErrBadGzip", err)
+	}
+	lines := []Line{{Seq: 1, Kind: EventKindVerifyRun, Data: json.RawMessage(`[1,2,3]`)}}
+	if _, err := ExtractVerifyTreeSHA(packLines(t, lines)); err == nil || !strings.Contains(err.Error(), "parse verify_run payload") {
+		t.Errorf("err = %v, want parse-payload error", err)
+	}
+}
+
+// B3 (#3655): ExtractHeadSHA's first-non-empty rule is UNCHANGED on the same
+// multi-iteration fixture — the two extractors deliberately differ.
+func TestExtractHeadSHA_FirstNonEmptyUnchangedOnMultiIterationBundle(t *testing.T) {
+	got, err := ExtractHeadSHA(multiIterationVerifyBundle(t))
+	if err != nil {
+		t.Fatalf("ExtractHeadSHA: %v", err)
+	}
+	if got != "head-a" {
+		t.Errorf("head_sha = %q, want head-a (first non-empty — the #797 dedup key rule)", got)
+	}
+}

@@ -355,6 +355,7 @@ var KnownCategories = map[string]struct{}{
 	"refinement_filing_completed":             {},
 	"release_cut":                             {},
 	"release_published":                       {},
+	"review_head_mismatch":                    {}, // #3655: reviewed tree != pushed tree on a success ship (server/pullrequest.go)
 	"reviewer_capability_unavailable":         {},
 	"run_admitted_applies_to_override":        {},
 	"run_admitted_budget_override":            {},
