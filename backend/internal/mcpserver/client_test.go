@@ -1650,6 +1650,74 @@ func TestGateViewReviewDiffTruncated_WireShape(t *testing.T) {
 	})
 }
 
+// TestReviewHeadMismatch_WireShape (G4, #3655) pins the hand-maintained MCP
+// wire mirror for review_head_mismatch on BOTH surfaces it rides — the gate
+// view and the run-status payload — driven from raw server-shaped bytes (not
+// the Go struct), so a mistyped json tag fails loudly instead of silently
+// decoding nil (the #371-class trap). An old-backend body that omits the key
+// decodes nil (the mixed-version degrade).
+func TestReviewHeadMismatch_WireShape(t *testing.T) {
+	runID := uuid.New()
+	const block = `{"stage_id":"s1","reviewed_tree_sha":"t1","pushed_tree_sha":"t2",` +
+		`"review_round_sequence":7,"reviewed_head_sha":"h1","pushed_head_sha":"h2"}`
+	want := gateViewReviewHeadMismatch{
+		StageID: "s1", ReviewedTreeSHA: "t1", PushedTreeSHA: "t2",
+		ReviewRoundSequence: 7, ReviewedHeadSHA: "h1", PushedHeadSHA: "h2",
+	}
+	serve := func(t *testing.T, body string) *apiClient {
+		t.Helper()
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(body))
+		}))
+		t.Cleanup(ts.Close)
+		return newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})
+	}
+	gvBody := func(extra string) string {
+		return `{"run_id":"` + runID.String() + `","open":[],"settled":[],"suppressed_relitigations":[]` + extra + `}`
+	}
+	runBody := func(extra string) string {
+		return `{"id":"` + runID.String() + `","state":"succeeded","workflow_id":"feature_change"` + extra + `}`
+	}
+
+	t.Run("gate view populated", func(t *testing.T) {
+		gv, err := serve(t, gvBody(`,"review_head_mismatch":`+block)).GetGateView(context.Background(), runID, "")
+		if err != nil {
+			t.Fatalf("GetGateView: %v", err)
+		}
+		if gv.ReviewHeadMismatch == nil || *gv.ReviewHeadMismatch != want {
+			t.Fatalf("GateView.ReviewHeadMismatch = %+v, want %+v (a tag does not byte-match the backend)", gv.ReviewHeadMismatch, want)
+		}
+	})
+	t.Run("gate view old backend -> nil", func(t *testing.T) {
+		gv, err := serve(t, gvBody("")).GetGateView(context.Background(), runID, "")
+		if err != nil {
+			t.Fatalf("GetGateView: %v", err)
+		}
+		if gv.ReviewHeadMismatch != nil {
+			t.Errorf("GateView.ReviewHeadMismatch = %+v, want nil", gv.ReviewHeadMismatch)
+		}
+	})
+	t.Run("run populated", func(t *testing.T) {
+		r, err := serve(t, runBody(`,"review_head_mismatch":`+block)).GetRun(context.Background(), runID)
+		if err != nil {
+			t.Fatalf("GetRun: %v", err)
+		}
+		if r.ReviewHeadMismatch == nil || *r.ReviewHeadMismatch != want {
+			t.Fatalf("Run.ReviewHeadMismatch = %+v, want %+v (a tag does not byte-match the backend)", r.ReviewHeadMismatch, want)
+		}
+	})
+	t.Run("run old backend -> nil", func(t *testing.T) {
+		r, err := serve(t, runBody("")).GetRun(context.Background(), runID)
+		if err != nil {
+			t.Fatalf("GetRun: %v", err)
+		}
+		if r.ReviewHeadMismatch != nil {
+			t.Errorf("Run.ReviewHeadMismatch = %+v, want nil", r.ReviewHeadMismatch)
+		}
+	})
+}
+
 // --- W1: the WHOLE MCP wire, gh subprocess → request body (#2226) ---
 //
 // The gap the operator named: issue_fetch_test.go ends at the decode and the

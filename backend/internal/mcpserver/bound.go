@@ -666,6 +666,7 @@ var runStatusPathTable = []pathClassification{
 	{Path: "run.updated_at", Tier: "skeleton", Class: classStored, Surfaces: restRun},
 	{Path: "run.issue_context", Tier: "T8", Class: classOversizedCapable, Surfaces: restRun, Unbounded: unboundedRun},
 	{Path: "run.live_validation", Tier: "T9", Class: classStored, Surfaces: restRun},
+	{Path: "run.review_head_mismatch", Tier: "T9", Class: classStored, Surfaces: restRun},
 	{Path: "run.review_authority", Tier: "T9", Class: classStored, Surfaces: restRun},
 	{Path: "run.concerns.open", Tier: "skeleton", Class: classStored, Surfaces: gateView},
 	{Path: "run.concerns.by_state", Tier: "skeleton", Class: classStored, Surfaces: gateView},
@@ -1015,6 +1016,11 @@ func tierResidualBounded(out *GetRunStatusOutput, runID string, led *elisionLedg
 		out.Run.LiveValidation = nil
 		led.add(classified("run.live_validation", runID,
 			"the pending live-validation walk is stored on the run row", 0))
+	}
+	if out.Run.ReviewHeadMismatch != nil {
+		out.Run.ReviewHeadMismatch = nil
+		led.add(classified("run.review_head_mismatch", runID,
+			"the stale-review signal is stored on the audit chain (review_head_mismatch) and returned by the gate view; next_actions already carries its advisory", 0))
 	}
 	if out.DriveStatus != nil && len(out.DriveStatus.AutoAdvanced) > 0 {
 		n := len(out.DriveStatus.AutoAdvanced)

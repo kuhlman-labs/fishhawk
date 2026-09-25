@@ -1751,3 +1751,41 @@ func TestRunConcerns_AuditReadFailure_BlockStillPresent(t *testing.T) {
 		t.Errorf("claimed_by_approval present despite an unreadable audit store, want the marker omitted:\n%s", w.Body.String())
 	}
 }
+
+// --- stale-review surface (#3655) ----------------------------------------
+
+// TestGetRun_SurfacesReviewHeadMismatch: the single-run read distills the
+// newest un-superseded review_head_mismatch onto the run response (the source
+// the MCP next_actions advisory folds from), and a run with none omits the key
+// entirely. COUNTERFACTUAL: delete the reviewHeadMismatchForRun call from
+// handleGetRun → the populated subtest goes RED.
+func TestGetRun_SurfacesReviewHeadMismatch(t *testing.T) {
+	t.Run("populated", func(t *testing.T) {
+		s, au, seeded := newSecurityGetServer(t)
+		stageID := uuid.New()
+		seedReviewHeadMismatch(au, seeded.ID, stageID, 9, rhmPayload(seeded.ID, stageID, rhmReviewedTree), nil)
+		resp, raw := getRunResponse(t, s, seeded.ID)
+		got := resp.ReviewHeadMismatch
+		if got == nil {
+			t.Fatal("review_head_mismatch = nil, want the recorded mismatch")
+		}
+		if got.ReviewedTreeSHA != rhmReviewedTree || got.PushedTreeSHA != rhmPushedTree ||
+			got.ReviewedHeadSHA != rhmReviewedHead || got.PushedHeadSHA != rhmPushedHead ||
+			got.StageID != stageID.String() || got.ReviewRoundSequence != 7 {
+			t.Errorf("review_head_mismatch = %+v, want both trees + both heads + round 7", *got)
+		}
+		if _, ok := raw["review_head_mismatch"]; !ok {
+			t.Error("review_head_mismatch key absent from the wire body")
+		}
+	})
+	t.Run("absent", func(t *testing.T) {
+		s, _, seeded := newSecurityGetServer(t)
+		resp, raw := getRunResponse(t, s, seeded.ID)
+		if resp.ReviewHeadMismatch != nil {
+			t.Errorf("review_head_mismatch = %+v, want nil", resp.ReviewHeadMismatch)
+		}
+		if _, ok := raw["review_head_mismatch"]; ok {
+			t.Error("review_head_mismatch key present with no recorded mismatch, want it omitted")
+		}
+	})
+}

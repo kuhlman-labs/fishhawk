@@ -171,6 +171,14 @@ var (
 	// ErrNoDiffEvent.
 	ErrNoHeadSHA = errors.New("bundle: no verify_run event with a head_sha found")
 
+	// ErrNoVerifyTreeSHA means the bundle parsed cleanly but carried no
+	// verify_run event with a non-empty tree_sha (no committed-tree gate
+	// ran, an older runner, or every verify_run was gate-skipped). Returned
+	// by ExtractVerifyTreeSHA so the caller can fail open (#3655): an absent
+	// tree must never suppress a review dispatch — it only disables the
+	// review_head_mismatch check for that round. Mirrors ErrNoHeadSHA.
+	ErrNoVerifyTreeSHA = errors.New("bundle: no verify_run event with a tree_sha found")
+
 	// ErrNoGateEvidence means the bundle parsed cleanly but carried no
 	// gate_evidence event — the ordinary case for older bundles (runners
 	// predating the emitter) and for stages where no gate ran (the runner
@@ -259,11 +267,14 @@ type scopeAmendmentsFoldedPayload struct {
 
 // verifyRunPayload mirrors the runner's verify_run event payload
 // (verifyRunEvent in runner/cmd/fishhawk-runner/main.go). Only head_sha
-// is read here; like the other payloads this is a lockstep runner↔backend
-// wire contract, not a JSON Schema, so the `head_sha` json tag MUST stay
-// identical to the emitter.
+// and tree_sha are read here; like the other payloads this is a lockstep
+// runner↔backend wire contract, not a JSON Schema, so the `head_sha` and
+// `tree_sha` json tags MUST stay identical to the emitter.
 type verifyRunPayload struct {
 	HeadSHA string `json:"head_sha"`
+	// TreeSHA is the tree object hash of the committed tree the gate
+	// verified (#960). Read by ExtractVerifyTreeSHA (#3655).
+	TreeSHA string `json:"tree_sha"`
 }
 
 // GateEvidence mirrors the runner's gate_evidence event payload
@@ -817,6 +828,47 @@ func ExtractHeadSHA(bundleBytes []byte) (string, error) {
 		}
 	}
 	return "", ErrNoHeadSHA
+}
+
+// ExtractVerifyTreeSHA returns the tree_sha carried by the bundle's
+// AUTHORITATIVE verify_run event — the LAST one with a non-empty tree_sha —
+// or ErrNoVerifyTreeSHA if the bundle parsed cleanly but carried none. It is
+// the implement-review round's REVIEWED-TREE identity (#3655): recorded on
+// implement_review_started and compared against the tree the runner reports
+// on its success PR ship, so a base-rebase re-invoke that shipped a tree the
+// review never judged records a review_head_mismatch row.
+//
+// LAST, deliberately the OPPOSITE of ExtractHeadSHA's first-non-empty rule.
+// ExtractHeadSHA wants a deterministic dedup KEY, and any stable choice
+// serves; this function wants the tree the gate CERTIFIED. A multi-iteration
+// runVerifyFixLoop emits one verify_run per iteration and only the terminal
+// one is authoritative (VerifyRunEvidence.Superseded marks the absorbed
+// earlier ones), so first-non-empty would return a failing iteration's tree
+// and manufacture a false mismatch. This mirrors ExtractGateEvidence's
+// authoritative-is-last rule. Only a corrupt gzip frame / malformed line
+// propagates as a different error.
+func ExtractVerifyTreeSHA(bundleBytes []byte) (string, error) {
+	lines, err := ReadEvents(bundleBytes)
+	if err != nil {
+		return "", err
+	}
+	tree := ""
+	for _, line := range lines {
+		if line.Kind != EventKindVerifyRun {
+			continue
+		}
+		var payload verifyRunPayload
+		if err := json.Unmarshal(line.Data, &payload); err != nil {
+			return "", fmt.Errorf("bundle: parse verify_run payload: %w", err)
+		}
+		if payload.TreeSHA != "" {
+			tree = payload.TreeSHA
+		}
+	}
+	if tree == "" {
+		return "", ErrNoVerifyTreeSHA
+	}
+	return tree, nil
 }
 
 // ExtractGateEvidence returns the digested gate results carried in the

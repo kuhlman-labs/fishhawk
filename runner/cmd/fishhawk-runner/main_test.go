@@ -16904,6 +16904,85 @@ func TestOpenPRAndShipArtifact_NoSupplemental_OmitsKey(t *testing.T) {
 	}
 }
 
+// TestOpenPRAndShipArtifact_ShipsVerifiedTreeEqualToPushedTree is R1 (#3655):
+// against a REAL temp repo and a local bare origin, the success artifact's
+// verified_tree_sha equals `git rev-parse <pushed head>^{tree}` read from the
+// BARE ORIGIN — turning "ship the pushed commit's tree" into a proven property
+// rather than an assumption about the #2169 precondition (d). It also proves
+// the pushed head differs from nothing the backend compares: only trees are.
+func TestOpenPRAndShipArtifact_ShipsVerifiedTreeEqualToPushedTree(t *testing.T) {
+	repo, bare, branch := verifiedTreeRepo(t)
+	withFakePROpenerOnly(t)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := verifiedTreeCfg(repo, "true")
+	_, verifiedTree, gerr := runVerifyGateCommitted(context.Background(), cfg, io.Discard)
+	if gerr != nil || verifiedTree == "" {
+		t.Fatalf("gate: tree=%q err=%v", verifiedTree, gerr)
+	}
+
+	var logSink strings.Builder
+	if err := openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, nil, nil, nil); err != nil {
+		t.Fatalf("openPRAndShipArtifact: %v\n%s", err, logSink.String())
+	}
+	if fu.gotPRArgs == nil {
+		t.Fatal("ShipPullRequest was not called")
+	}
+	var shipped struct {
+		HeadSHA         string `json:"head_sha"`
+		VerifiedTreeSHA string `json:"verified_tree_sha"`
+	}
+	if err := json.Unmarshal(fu.gotPRArgs.Body, &shipped); err != nil {
+		t.Fatalf("decode artifact: %v\n%s", err, fu.gotPRArgs.Body)
+	}
+	pushedHead, err := exec.Command("git", "--git-dir="+bare, "rev-parse", "refs/heads/"+branch).Output()
+	if err != nil {
+		t.Fatalf("resolve pushed head on origin: %v", err)
+	}
+	if got := strings.TrimSpace(string(pushedHead)); got != shipped.HeadSHA {
+		t.Fatalf("fixture: shipped head_sha %q != origin branch head %q", shipped.HeadSHA, got)
+	}
+	pushedTree, err := exec.Command("git", "--git-dir="+bare, "rev-parse", shipped.HeadSHA+"^{tree}").Output()
+	if err != nil {
+		t.Fatalf("resolve pushed tree on origin: %v", err)
+	}
+	want := strings.TrimSpace(string(pushedTree))
+	if shipped.VerifiedTreeSHA != want {
+		t.Errorf("shipped verified_tree_sha = %q, want the PUSHED commit's tree %q", shipped.VerifiedTreeSHA, want)
+	}
+}
+
+// TestOpenPRAndShipArtifact_EmptyVerifiedTree_OmitsKey is R2 (#3655): a ship
+// with no committed-tree gate (verifiedTreeSHA == "") omits verified_tree_sha
+// ENTIRELY, so the no-verify artifact stays byte-identical and the backend
+// takes its fail-closed skip.
+func TestOpenPRAndShipArtifact_EmptyVerifiedTree_OmitsKey(t *testing.T) {
+	repo, _, _ := verifiedTreeRepo(t)
+	withFakePROpenerOnly(t)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logSink strings.Builder
+	if err := openPRAndShipArtifact(context.Background(), verifiedTreeCfg(repo, "true"), &logSink, fu, issued, "", false, false, nil, false, "", "", nil, nil, nil, nil); err != nil {
+		t.Fatalf("openPRAndShipArtifact: %v\n%s", err, logSink.String())
+	}
+	if fu.gotPRArgs == nil {
+		t.Fatal("ShipPullRequest was not called")
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(fu.gotPRArgs.Body, &m); err != nil {
+		t.Fatalf("decode artifact: %v", err)
+	}
+	if raw, present := m["verified_tree_sha"]; present {
+		t.Errorf("a no-verify ship must OMIT verified_tree_sha entirely, got %s", raw)
+	}
+}
+
 // TestDiffExemptions covers the base-rebase re-invoke exemption-delta helper
 // (#1218): it returns the Path-keyed entries in `honored` absent from
 // `alreadySealed`, and nil when `honored` is a subset of `alreadySealed`.

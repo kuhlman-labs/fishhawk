@@ -1165,3 +1165,50 @@ func TestImplementReviewedPayload_RejectWithoutConcernOmitempty(t *testing.T) {
 		t.Error("a pre-#3319 payload must decode reject_without_concern=false")
 	}
 }
+
+// TestReviewStartedPayload_TreeSHAWireShape pins the #3655 reviewed-tree
+// identity field: a pre-change stored payload decodes TreeSHA=="", the plan
+// path (HeadSHA and TreeSHA both "") marshals byte-identically to the
+// pre-change shape, and tree_sha is emitted only when set.
+func TestReviewStartedPayload_TreeSHAWireShape(t *testing.T) {
+	var legacy planreview.ReviewStartedPayload
+	if err := json.Unmarshal([]byte(`{"configured_agents":1,"authority":"gating","head_sha":"abc"}`), &legacy); err != nil {
+		t.Fatalf("decode legacy payload: %v", err)
+	}
+	if legacy.TreeSHA != "" || legacy.HeadSHA != "abc" {
+		t.Errorf("legacy decode = %+v, want TreeSHA empty and HeadSHA abc", legacy)
+	}
+
+	cases := []struct {
+		name string
+		in   planreview.ReviewStartedPayload
+		want string
+	}{
+		{
+			name: "plan path byte-identical",
+			in:   planreview.ReviewStartedPayload{ConfiguredAgents: 2, Authority: planreview.AuthorityMode("advisory")},
+			want: `{"configured_agents":2,"authority":"advisory"}`,
+		},
+		{
+			name: "implement path with head only",
+			in:   planreview.ReviewStartedPayload{ConfiguredAgents: 1, Authority: planreview.AuthorityMode("gating"), HeadSHA: "h1"},
+			want: `{"configured_agents":1,"authority":"gating","head_sha":"h1"}`,
+		},
+		{
+			name: "implement path with head and tree",
+			in:   planreview.ReviewStartedPayload{ConfiguredAgents: 1, Authority: planreview.AuthorityMode("gating"), HeadSHA: "h1", TreeSHA: "t1"},
+			want: `{"configured_agents":1,"authority":"gating","head_sha":"h1","tree_sha":"t1"}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := json.Marshal(tc.in)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != tc.want {
+				t.Errorf("marshal = %s, want %s", got, tc.want)
+			}
+		})
+	}
+}

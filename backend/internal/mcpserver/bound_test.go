@@ -65,8 +65,13 @@ func maximalRunStatusOutput(runID string) GetRunStatusOutput {
 			},
 			Concerns:       &RunConcerns{Open: 3, ByState: map[string]int{"raised": 2, "reopened": 1}},
 			LiveValidation: &RunLiveValidation{PendingCriteriaCount: 2, WalkRef: "#2509"},
-			WorkingDir:     "/tmp/checkout",
-			CreatedAt:      now, UpdatedAt: now,
+			// #3655: the stale-review signal rides the T9 residual tier.
+			ReviewHeadMismatch: &gateViewReviewHeadMismatch{
+				StageID: "s1", ReviewedTreeSHA: strings.Repeat("1", 40), PushedTreeSHA: strings.Repeat("2", 40),
+				ReviewRoundSequence: 7, ReviewedHeadSHA: strings.Repeat("a", 40), PushedHeadSHA: strings.Repeat("b", 40),
+			},
+			WorkingDir: "/tmp/checkout",
+			CreatedAt:  now, UpdatedAt: now,
 		},
 		ImplementReviewMergeHint: "the implement review is still pending",
 		Budget:                   &BudgetStatus{Tier: "ok"},
@@ -929,7 +934,7 @@ func TestSkeleton_ItemisesNestedOmissions(t *testing.T) {
 	// its own class and pointer, never one opaque line.
 	for _, path := range []string{
 		"run.issue_context", "run.concerns.items", "run.review_authority",
-		"run.live_validation", "stages[].executor", "next_actions.actions",
+		"run.live_validation", "run.review_head_mismatch", "stages[].executor", "next_actions.actions",
 	} {
 		f, ok := byField[path]
 		if !ok {
@@ -1740,5 +1745,32 @@ func TestElisions_SkeletonItemisesSupersededImplement(t *testing.T) {
 	}
 	if got != string(classStored) {
 		t.Errorf("run.concerns.superseded_implement class = %q, want %q", got, classStored)
+	}
+}
+
+// TestTierResidualBounded_ElidesReviewHeadMismatch (#3655): the T9 residual
+// tier drops run.review_head_mismatch AND records its own ledger entry, so the
+// stale-review block can never vanish from a bounded response silently.
+// COUNTERFACTUAL: delete the review_head_mismatch arm of tierResidualBounded →
+// the block survives T9 and no ledger entry is recorded, RED.
+func TestTierResidualBounded_ElidesReviewHeadMismatch(t *testing.T) {
+	runID := uuid.NewString()
+	out := maximalRunStatusOutput(runID)
+	if out.Run.ReviewHeadMismatch == nil {
+		t.Fatal("fixture must carry run.review_head_mismatch")
+	}
+	led := &elisionLedger{}
+	tierResidualBounded(&out, runID, led)
+	if out.Run.ReviewHeadMismatch != nil {
+		t.Errorf("run.review_head_mismatch survived T9: %+v", out.Run.ReviewHeadMismatch)
+	}
+	found := false
+	for _, e := range led.entries {
+		if e.field == "run.review_head_mismatch" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("T9 recorded no run.review_head_mismatch ledger entry; entries = %+v", led.entries)
 	}
 }
