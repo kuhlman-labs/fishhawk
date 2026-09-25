@@ -259,7 +259,16 @@ type Run struct {
 	// entirely, so it decodes to nil — the mixed-version degrade. The json tags
 	// MUST byte-match the backend's runReviewAuthorityPayload or the field
 	// silently decodes to nil.
-	ReviewAuthority []RunReviewAuthority `json:"review_authority,omitempty" jsonschema:"per-stage resolved review authority: each entry carries the stage id, its type, the resolved mode (advisory | gating | gateless) and its provenance (declared | derived). Omitted when the run's spec declares no reviewers block"`
+	// ReviewHeadMismatch mirrors the backend run-status surface (#3655): the
+	// run's un-superseded stale-review signal — the open implement-review round
+	// judged a tree the PR does not carry. next_actions folds an advisory from
+	// it. The backend emits it on the single-run read only (handleGetRun);
+	// omitted (nil) when no un-superseded review_head_mismatch was recorded. An
+	// OLDER backend omits it entirely, so it decodes to nil and next_actions
+	// renders nothing — the mixed-version degrade. The json tag MUST byte-match
+	// the backend's runResponse field or it silently decodes to nil.
+	ReviewHeadMismatch *gateViewReviewHeadMismatch `json:"review_head_mismatch,omitempty" jsonschema:"present when the open implement-review round judged a tree the PR does not carry (reviewed_tree_sha != pushed_tree_sha): the review verdicts describe a stale tree, so force a fresh round (fishhawk_fixup_stage) before merging. Omitted when no such mismatch is recorded"`
+	ReviewAuthority    []RunReviewAuthority        `json:"review_authority,omitempty" jsonschema:"per-stage resolved review authority: each entry carries the stage id, its type, the resolved mode (advisory | gating | gateless) and its provenance (declared | derived). Omitted when the run's spec declares no reviewers block"`
 	// WorkingDir mirrors the backend runResponse.working_dir (E66.42 /
 	// #2482): the run's bound local checkout, recorded once at start_run and
 	// inherited by every later runner-spawning verb. The
@@ -601,6 +610,27 @@ type GateView struct {
 	// byte-match the backend's gateViewResponse or the field silently decodes to
 	// nil — the mixed-version degrade.
 	ReviewDiffTruncated *gateViewReviewDiffTruncated `json:"review_diff_truncated,omitempty"`
+	// ReviewHeadMismatch surfaces that the open implement-review round judged a
+	// tree the PR does not carry (#3655). Omitted (nil) when no un-superseded
+	// review_head_mismatch was recorded or against an older backend. The json tag
+	// MUST byte-match the backend's gateViewResponse or the field silently
+	// decodes to nil — the mixed-version degrade.
+	ReviewHeadMismatch *gateViewReviewHeadMismatch `json:"review_head_mismatch,omitempty"`
+}
+
+// gateViewReviewHeadMismatch mirrors the backend's gateViewReviewHeadMismatch
+// (#3655): the distilled newest un-superseded review_head_mismatch audit entry,
+// carried on BOTH the gate view and the run-status payload. The json tags MUST
+// byte-match the backend or each field silently decodes to its zero value (the
+// #371-class hand-maintained-wire-mirror trap). Deliberately UNEXPORTED — same
+// rationale as gateViewReviewDiffTruncated.
+type gateViewReviewHeadMismatch struct {
+	StageID             string `json:"stage_id" jsonschema:"the implement stage whose review round judged a stale tree"`
+	ReviewedTreeSHA     string `json:"reviewed_tree_sha" jsonschema:"the tree object the review round judged (the runner's gate-certified tree at trace upload)"`
+	PushedTreeSHA       string `json:"pushed_tree_sha" jsonschema:"the gate-certified tree the runner actually pushed to the PR"`
+	ReviewRoundSequence int64  `json:"review_round_sequence" jsonschema:"audit sequence of the implement_review_started round judged stale"`
+	ReviewedHeadSHA     string `json:"reviewed_head_sha,omitempty" jsonschema:"the reviewed round's head SHA (a throwaway WIP commit — never equal to pushed_head_sha on its own; not itself evidence of staleness)"`
+	PushedHeadSHA       string `json:"pushed_head_sha,omitempty" jsonschema:"the PR head SHA the runner pushed"`
 }
 
 // gateViewReviewDiffTruncated mirrors the backend's gateViewReviewDiffTruncated

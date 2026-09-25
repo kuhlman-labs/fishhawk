@@ -1273,6 +1273,204 @@ func TestHandleGetRunGateView_ReviewDiffTruncated_EndToEnd(t *testing.T) {
 	}
 }
 
+// --- stale-review surface (#3655) ----------------------------------------
+
+// seedReviewHeadMismatch appends a review_head_mismatch audit entry at the
+// given sequence (or a raw payload when rawPayload != nil, for the undecodable
+// case).
+func seedReviewHeadMismatch(au *auditFake, runID, stageID uuid.UUID, seq int64, p reviewHeadMismatchPayload, rawPayload []byte) {
+	payload := rawPayload
+	if payload == nil {
+		payload, _ = json.Marshal(p)
+	}
+	rid, sid := runID, stageID
+	au.seeded = append(au.seeded, &audit.Entry{
+		RunID: &rid, StageID: &sid, Sequence: seq, Category: CategoryReviewHeadMismatch,
+		Payload: payload, Timestamp: time.Now().UTC(),
+	})
+}
+
+// seedRHMReviewStarted appends an implement_review_started row at seq.
+func seedRHMReviewStarted(au *auditFake, runID, stageID uuid.UUID, seq int64) {
+	rid, sid := runID, stageID
+	au.seeded = append(au.seeded, &audit.Entry{
+		RunID: &rid, StageID: &sid, Sequence: seq, Category: "implement_review_started",
+		Payload: []byte(`{"tree_sha":"t"}`), Timestamp: time.Now().UTC(),
+	})
+}
+
+// Two distinct literal trees / heads, definitionally unequal (seeded by
+// construction).
+const (
+	rhmReviewedTree = "1111111111111111111111111111111111111111"
+	rhmPushedTree   = "2222222222222222222222222222222222222222"
+	rhmReviewedHead = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	rhmPushedHead   = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+)
+
+func rhmPayload(runID, stageID uuid.UUID, reviewedTree string) reviewHeadMismatchPayload {
+	return reviewHeadMismatchPayload{
+		RunID: runID.String(), StageID: stageID.String(),
+		ReviewedTreeSHA: reviewedTree, PushedTreeSHA: rhmPushedTree, ReviewRoundSequence: 7,
+		ReviewedHeadSHA: rhmReviewedHead, PushedHeadSHA: rhmPushedHead,
+	}
+}
+
+// TestBuildGateView_ReviewHeadMismatch_Present (G1): a recorded mismatch
+// surfaces with both trees and both heads, and the NEWEST entry wins.
+// COUNTERFACTUAL: delete the reviewHeadMismatchForRun call from buildGateView
+// → the field is nil and this goes RED.
+func TestBuildGateView_ReviewHeadMismatch_Present(t *testing.T) {
+	s, repo, au, _ := gateViewServer(t)
+	runID := seedGateRun(t, repo)
+	stageID := uuid.New()
+	seedRHMReviewStarted(au, runID, stageID, 7)
+	seedReviewHeadMismatch(au, runID, stageID, 8, rhmPayload(runID, stageID, "0000000000000000000000000000000000000000"), nil)
+	seedReviewHeadMismatch(au, runID, stageID, 9, rhmPayload(runID, stageID, rhmReviewedTree), nil)
+
+	w := getGateView(t, s, runID, "")
+	resp := decodeGateView(t, w)
+	got := resp.ReviewHeadMismatch
+	if got == nil {
+		t.Fatalf("review_head_mismatch = nil, want the newest entry; body=%s", w.Body.String())
+	}
+	want := gateViewReviewHeadMismatch{
+		StageID: stageID.String(), ReviewedTreeSHA: rhmReviewedTree, PushedTreeSHA: rhmPushedTree,
+		ReviewRoundSequence: 7, ReviewedHeadSHA: rhmReviewedHead, PushedHeadSHA: rhmPushedHead,
+	}
+	if *got != want {
+		t.Errorf("review_head_mismatch = %+v, want %+v", *got, want)
+	}
+	// Decode the raw HTTP body (not the Go struct) so a json-tag drift is caught.
+	var raw struct {
+		RHM map[string]any `json:"review_head_mismatch"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	for _, k := range []string{"stage_id", "reviewed_tree_sha", "pushed_tree_sha", "review_round_sequence", "reviewed_head_sha", "pushed_head_sha"} {
+		if _, ok := raw.RHM[k]; !ok {
+			t.Errorf("wire key review_head_mismatch.%s absent; got %v", k, raw.RHM)
+		}
+	}
+}
+
+// TestBuildGateView_ReviewHeadMismatch_AbsentKey (G2): with NO mismatch row the
+// key is ABSENT from the marshalled JSON, not null.
+func TestBuildGateView_ReviewHeadMismatch_AbsentKey(t *testing.T) {
+	s, repo, _, _ := gateViewServer(t)
+	runID := seedGateRun(t, repo)
+	w := getGateView(t, s, runID, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d; body=%s", w.Code, w.Body.String())
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(w.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if v, ok := raw["review_head_mismatch"]; ok {
+		t.Errorf("review_head_mismatch present (%s), want the key absent", v)
+	}
+}
+
+// TestBuildGateView_ReviewHeadMismatch_Degrades (G3): each degrade yields nil,
+// never a partially-populated field and never a failed gate view — and the
+// concerns stay intact.
+func TestBuildGateView_ReviewHeadMismatch_Degrades(t *testing.T) {
+	t.Run("nil AuditRepo", func(t *testing.T) {
+		s := New(Config{Addr: "127.0.0.1:0"})
+		if got := s.reviewHeadMismatchForRun(context.Background(), uuid.New()); got != nil {
+			t.Errorf("nil AuditRepo must yield nil; got %+v", got)
+		}
+	})
+	t.Run("list error", func(t *testing.T) {
+		s, repo, base, cr := gateViewServer(t)
+		runID := seedGateRun(t, repo)
+		stageID := uuid.New()
+		seedReviewHeadMismatch(base, runID, stageID, 9, rhmPayload(runID, stageID, rhmReviewedTree), nil)
+		row := seedRoutedConcern(t, cr, runID, stageID, "fable-5", "a note", "routed")
+		s.cfg.AuditRepo = &oneCategoryErrAudit{auditFake: base, failCategory: CategoryReviewHeadMismatch}
+		if got := s.reviewHeadMismatchForRun(context.Background(), runID); got != nil {
+			t.Errorf("list error must yield nil; got %+v", got)
+		}
+		resp := decodeGateView(t, getGateView(t, s, runID, ""))
+		if resp.ReviewHeadMismatch != nil {
+			t.Errorf("gate view review_head_mismatch = %+v, want nil on list error", resp.ReviewHeadMismatch)
+		}
+		found := false
+		for _, c := range resp.Open {
+			if c.ID == row.ID {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("open concerns lost on the degrade: %+v", resp.Open)
+		}
+	})
+	t.Run("no entry", func(t *testing.T) {
+		s, repo, _, _ := gateViewServer(t)
+		runID := seedGateRun(t, repo)
+		if got := s.reviewHeadMismatchForRun(context.Background(), runID); got != nil {
+			t.Errorf("no entry must yield nil; got %+v", got)
+		}
+	})
+	t.Run("undecodable payload", func(t *testing.T) {
+		s, repo, au, _ := gateViewServer(t)
+		runID := seedGateRun(t, repo)
+		seedReviewHeadMismatch(au, runID, uuid.New(), 9, reviewHeadMismatchPayload{}, []byte("{not json"))
+		if got := s.reviewHeadMismatchForRun(context.Background(), runID); got != nil {
+			t.Errorf("undecodable payload must yield nil; got %+v", got)
+		}
+	})
+}
+
+// TestReviewHeadMismatchForRun_Supersession: a same-stage
+// implement_review_started round recorded AFTER the mismatch supersedes it (a
+// fix-up forced a fresh round); an OLDER round, a DIFFERENT stage's round, or a
+// failed supersession read keeps it. COUNTERFACTUAL: delete the supersession
+// loop → "newer same-stage round" goes RED; drop the stage match → "other
+// stage" goes RED.
+func TestReviewHeadMismatchForRun_Supersession(t *testing.T) {
+	cases := []struct {
+		name      string
+		seed      func(au *auditFake, runID, stageID uuid.UUID)
+		failStart bool
+		wantNil   bool
+	}{
+		{"newer same-stage round supersedes", func(au *auditFake, runID, stageID uuid.UUID) {
+			seedRHMReviewStarted(au, runID, stageID, 10)
+		}, false, true},
+		{"older same-stage round keeps", func(au *auditFake, runID, stageID uuid.UUID) {
+			seedRHMReviewStarted(au, runID, stageID, 7)
+		}, false, false},
+		{"newer other-stage round keeps", func(au *auditFake, runID, _ uuid.UUID) {
+			seedRHMReviewStarted(au, runID, uuid.New(), 10)
+		}, false, false},
+		{"supersession read error keeps", func(au *auditFake, runID, stageID uuid.UUID) {
+			seedRHMReviewStarted(au, runID, stageID, 10)
+		}, true, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, repo, au, _ := gateViewServer(t)
+			runID := seedGateRun(t, repo)
+			stageID := uuid.New()
+			seedReviewHeadMismatch(au, runID, stageID, 9, rhmPayload(runID, stageID, rhmReviewedTree), nil)
+			tc.seed(au, runID, stageID)
+			if tc.failStart {
+				s.cfg.AuditRepo = &oneCategoryErrAudit{auditFake: au, failCategory: "implement_review_started"}
+			}
+			got := s.reviewHeadMismatchForRun(context.Background(), runID)
+			if tc.wantNil && got != nil {
+				t.Errorf("want superseded (nil); got %+v", got)
+			}
+			if !tc.wantNil && got == nil {
+				t.Error("want the mismatch kept; got nil")
+			}
+		})
+	}
+}
+
 // ---------------------------------------------------------------------------
 // #3319 — `disputed` is SCOPED to refused CONFIRMS.
 // ---------------------------------------------------------------------------

@@ -257,6 +257,13 @@ type runResponse struct {
 	// stays free of the extra read. Omitted (nil) when the run's approved plan
 	// carried no marked criterion (no marker recorded).
 	LiveValidation *runLiveValidationPayload `json:"live_validation,omitempty"`
+	// ReviewHeadMismatch is the run's un-superseded stale-review signal (#3655):
+	// the newest review_head_mismatch audit entry — the open implement-review
+	// round judged a tree the PR does not carry. Same distillation as the gate
+	// view (reviewHeadMismatchForRun) so next_actions has a source. Populated by
+	// handleGetRun ONLY (same posture as LiveValidation); omitted (nil) when no
+	// un-superseded mismatch was recorded or the read fails.
+	ReviewHeadMismatch *gateViewReviewHeadMismatch `json:"review_head_mismatch,omitempty"`
 	// ReviewAuthority is the per-stage resolved review authority (E53.2 /
 	// #2225): for each stage of the run's workflow that declares a reviewers
 	// block, the resolved mode (advisory | gating | gateless) and its
@@ -2127,6 +2134,9 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 	// nil (field omitted) when the run's approved plan carried no marked
 	// criterion or the read fails (best-effort — warn and omit).
 	resp.LiveValidation = s.liveValidationForRun(r.Context(), runID)
+	// Stale-review surface (#3655): single-run read ONLY, same best-effort
+	// posture — nil (field omitted) when no un-superseded mismatch exists.
+	resp.ReviewHeadMismatch = s.reviewHeadMismatchForRun(r.Context(), runID)
 	// Review-authority surface (E53.2 / #2225): single-run read ONLY (same
 	// posture as Concerns / Delegation — no per-row spec parse on the list
 	// endpoint). A pure projection of the run's cached workflow spec; nil

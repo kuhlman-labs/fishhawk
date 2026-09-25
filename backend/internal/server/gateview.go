@@ -58,6 +58,29 @@ type gateViewResponse struct {
 	// when the run carried none. Carries the COMPLETE omitted-file list (unlike the
 	// prompt, which is capped). Same best-effort read as LiveValidation.
 	ReviewDiffTruncated *gateViewReviewDiffTruncated `json:"review_diff_truncated,omitempty"`
+	// ReviewHeadMismatch surfaces that the open implement-review round judged a
+	// tree the PR does not carry (#3655): the newest review_head_mismatch audit
+	// entry, recorded by the success PR ship when the round's reviewed tree
+	// differs from the gate-certified tree the runner pushed. Omitted (nil) when
+	// the run carried none, when a NEWER same-stage implement_review_started
+	// round has since superseded it, or the read fails. Same best-effort read as
+	// ReviewDiffTruncated.
+	ReviewHeadMismatch *gateViewReviewHeadMismatch `json:"review_head_mismatch,omitempty"`
+}
+
+// gateViewReviewHeadMismatch is the gate-view / run-status distillation of the
+// newest review_head_mismatch audit entry (#3655). It mirrors the audit
+// payload's field set: the two trees are the machine-decidable evidence, the
+// two head SHAs are human-correlatable coordinates (reviewed_head_sha is the
+// throwaway WIP commit, so it never equals pushed_head_sha on its own), and
+// ReviewRoundSequence names the implement_review_started round judged stale.
+type gateViewReviewHeadMismatch struct {
+	StageID             string `json:"stage_id"`
+	ReviewedTreeSHA     string `json:"reviewed_tree_sha"`
+	PushedTreeSHA       string `json:"pushed_tree_sha"`
+	ReviewRoundSequence int64  `json:"review_round_sequence"`
+	ReviewedHeadSHA     string `json:"reviewed_head_sha,omitempty"`
+	PushedHeadSHA       string `json:"pushed_head_sha,omitempty"`
 }
 
 // gateViewReviewDiffTruncated is the gate-view distillation of the newest
@@ -407,7 +430,73 @@ func (s *Server) buildGateView(ctx context.Context, runID uuid.UUID, stageKind s
 	// diff" in the one call. Omitted (nil) when the run carried no truncation
 	// entry or the read fails.
 	resp.ReviewDiffTruncated = s.reviewDiffTruncatedForRun(ctx, runID)
+	// Stale-review surface (#3655): the same best-effort single-read, so the
+	// gate view answers "did the open review judge the tree the PR carries" in
+	// the one call. Omitted (nil) when no un-superseded mismatch was recorded.
+	resp.ReviewHeadMismatch = s.reviewHeadMismatchForRun(ctx, runID)
 	return resp
+}
+
+// reviewHeadMismatchForRun distills the newest review_head_mismatch audit entry
+// for the run into the gate-view / run-status surface (#3655), mirroring
+// reviewDiffTruncatedForRun's best-effort posture exactly: nil AuditRepo -> nil,
+// list error -> WARN + nil, no entry -> nil, undecodable payload -> WARN + nil.
+// It never fails the read.
+//
+// One addition over that model: a mismatch is SUPERSEDED — and omitted — when a
+// same-stage implement_review_started round was recorded AFTER it (a fix-up
+// forced a fresh round on the pushed tree), so a resolved mismatch does not
+// keep advising a re-review forever. That supersession read degrades toward
+// SHOWING the mismatch: a list error on implement_review_started WARN-logs and
+// keeps the block, because the surface is advisory and a false "stale" hint
+// costs one re-review while a false "fresh" one ships an unreviewed tree.
+func (s *Server) reviewHeadMismatchForRun(ctx context.Context, runID uuid.UUID) *gateViewReviewHeadMismatch {
+	if s.cfg.AuditRepo == nil {
+		return nil
+	}
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, CategoryReviewHeadMismatch)
+	if err != nil {
+		s.cfg.Logger.Warn("gate-view: list review_head_mismatch failed; omitting review_head_mismatch block",
+			"run_id", runID.String(), "error", err.Error())
+		return nil
+	}
+	if len(entries) == 0 {
+		return nil
+	}
+	// Newest wins: ListForRunByCategory is sequence-ascending.
+	newest := entries[len(entries)-1]
+	var p reviewHeadMismatchPayload
+	if uerr := json.Unmarshal(newest.Payload, &p); uerr != nil {
+		s.cfg.Logger.Warn("gate-view: decode review_head_mismatch payload failed; omitting review_head_mismatch block",
+			"run_id", runID.String(), "error", uerr.Error())
+		return nil
+	}
+	started, serr := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, "implement_review_started")
+	if serr != nil {
+		s.cfg.Logger.Warn("gate-view: list implement_review_started failed; keeping review_head_mismatch block unsuperseded",
+			"run_id", runID.String(), "error", serr.Error())
+	}
+	for _, e := range started {
+		if e.Sequence > newest.Sequence && strictSameStage(e.StageID, newest.StageID) {
+			return nil
+		}
+	}
+	return &gateViewReviewHeadMismatch{
+		StageID:             p.StageID,
+		ReviewedTreeSHA:     p.ReviewedTreeSHA,
+		PushedTreeSHA:       p.PushedTreeSHA,
+		ReviewRoundSequence: p.ReviewRoundSequence,
+		ReviewedHeadSHA:     p.ReviewedHeadSHA,
+		PushedHeadSHA:       p.PushedHeadSHA,
+	}
+}
+
+// strictSameStage reports whether two audit-entry stage ids name the same
+// stage. Unlike sameStage, a nil id on either side (a legacy / run-scoped row)
+// never matches, so it can never supersede a mismatch it cannot be attributed
+// to.
+func strictSameStage(a, b *uuid.UUID) bool {
+	return a != nil && b != nil && *a == *b
 }
 
 // reviewDiffTruncatedForRun distills the newest implement_review_diff_truncated
