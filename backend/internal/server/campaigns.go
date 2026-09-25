@@ -78,8 +78,11 @@ func (s *Server) issueSetResolutionBudget() time.Duration {
 // campaignSourcesSupported reports which campaign SOURCES the resolved provider
 // can serve, in a fixed order ("epic_ref", "items"), computed purely from
 // COMPILE-TIME capability assertions (#3648). It returns a non-nil empty slice
-// when the provider implements neither — the gitlab provider is File-only, so
-// NEITHER campaign mode works on it today (operator condition 1).
+// when the provider implements neither (a File-only provider such as jira), so
+// NEITHER campaign mode works on it (operator condition 1). The gitlab provider
+// implements both since #3658, so it reports ["epic_ref","items"] with no
+// change here. The doctor work_item_provider rung reports the same list as
+// campaign_sources (onboarding.go).
 //
 // The returned list is product-owned static enum data derived only from type
 // assertions — never from an error, a subprocess, or a third-party response —
@@ -1159,10 +1162,11 @@ func (s *Server) resolveCampaignSource(ctx context.Context, requestStart time.Ti
 	// (operator condition 1 / #3648). A GitLab group epic is a Premium
 	// group-level object v0 does not decompose; the alternative is to assemble
 	// over the epic's child issues via items — but that is only a real remedy on
-	// a provider implementing the items-mode capability, which the gitlab
-	// provider (File-only) does NOT. campaign_sources_supported rides the 422
-	// details (4xx, so not subject to the 5xx redactor). The message is a static
-	// literal selected by capability — never interpolated from an error — so the
+	// a provider implementing the items-mode capability (the gitlab provider
+	// does since #3658; a File-only provider does not).
+	// campaign_sources_supported rides the 422 details (4xx, so not subject to
+	// the 5xx redactor). The message is a static literal selected by
+	// capability — never interpolated from an error — so the
 	// raw-cause AST guard is satisfied. Refused before the installation lookup so
 	// it costs no forge round-trip.
 	if epicRef != "" && workmgmt.ClassifyEpicRef(epicRef).Form == workmgmt.EpicRefFormGroupEpic {

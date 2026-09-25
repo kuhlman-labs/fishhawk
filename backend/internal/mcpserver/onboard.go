@@ -351,7 +351,13 @@ work_item_provider rung (see below):
               not SETTLED — it is NOT evidence the provider is unregistered,
               and it must never be rendered as a pass. registered[] is served
               even on unknown, because the deployment registry answers when
-              the repo's conventions do not. Because the resolved provider is
+              the repo's conventions do not. campaign_sources[] (#3658) is the
+              campaign sources the resolved provider serves, in the fixed
+              order epic_ref, items — ALWAYS an array: [] on unregistered and
+              unknown (no capability claim is made), and [] on a registered
+              provider means fishhawk_start_campaign refuses 501 in either
+              mode (gitlab serves both since #3658; its Premium group epics
+              stay refused). Because the resolved provider is
               repo-scoped, this rung is hybrid — but it is set OUTSIDE every
               repo-scoped cascade, so a not-installed repo or an unavailable
               spec still carries it. The key is ABSENT only against an older

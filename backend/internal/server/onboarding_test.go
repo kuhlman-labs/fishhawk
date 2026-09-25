@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -4062,18 +4063,53 @@ func TestWorkItemProviderReadinessFor(t *testing.T) {
 		name         string
 		provider     string
 		registered   []string
+		sources      []string
 		resolveErr   error
 		wantStatus   string
 		wantProvider string
 		wantHintPart string
 		wantNotePart string
+		// wantSources is the exact campaign_sources array (#3658); every
+		// case asserts it is an ARRAY (non-nil), never a JSON null.
+		wantSources []string
 	}{
 		{
 			name:         "resolved provider is registered",
 			provider:     "github_projects",
 			registered:   []string{"github_projects", "gitlab"},
+			sources:      []string{"epic_ref", "items"},
 			wantStatus:   workItemProviderStatusRegistered,
 			wantProvider: "github_projects",
+			wantSources:  []string{"epic_ref", "items"},
+		},
+		{
+			name:         "registered File-only provider reports an EMPTY array, not null",
+			provider:     "jira",
+			registered:   []string{"jira"},
+			sources:      nil,
+			wantStatus:   workItemProviderStatusRegistered,
+			wantProvider: "jira",
+			wantSources:  []string{},
+		},
+		{
+			name:         "unregistered makes NO capability claim even if sources were passed",
+			provider:     "gitlab",
+			registered:   []string{"github_projects"},
+			sources:      []string{"epic_ref", "items"},
+			wantStatus:   workItemProviderStatusUnregistered,
+			wantProvider: "gitlab",
+			wantHintPart: "FISHHAWKD_GITLAB_TOKEN",
+			wantSources:  []string{},
+		},
+		{
+			name:         "unknown makes NO capability claim even if sources were passed",
+			provider:     "gitlab",
+			registered:   []string{"gitlab"},
+			sources:      []string{"epic_ref", "items"},
+			resolveErr:   errors.New("conventions fetch failed"),
+			wantStatus:   workItemProviderStatusUnknown,
+			wantHintPart: "work-management.yaml",
+			wantSources:  []string{},
 		},
 		{
 			name:         "resolved provider absent from a non-empty registry",
@@ -4133,7 +4169,13 @@ func TestWorkItemProviderReadinessFor(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			got := workItemProviderReadinessFor(tc.provider, tc.registered, tc.resolveErr)
+			got := workItemProviderReadinessFor(tc.provider, tc.registered, tc.sources, tc.resolveErr)
+			if got.CampaignSources == nil {
+				t.Errorf("campaign_sources = nil, want an array (never a JSON null)")
+			}
+			if tc.wantSources != nil && !slices.Equal(got.CampaignSources, tc.wantSources) {
+				t.Errorf("campaign_sources = %v, want %v", got.CampaignSources, tc.wantSources)
+			}
 			if got.Status != tc.wantStatus {
 				t.Errorf("status = %q, want %q", got.Status, tc.wantStatus)
 			}
@@ -4181,7 +4223,7 @@ func TestWorkItemProviderReadinessFor_UnknownIsNotUnregistered(t *testing.T) {
 	const secret = "glpat-do-not-echo-me"
 	resolveErr := fmt.Errorf("fetch conventions from https://gitlab.example/api/v4?private_token=%s: 500", secret)
 
-	got := workItemProviderReadinessFor("github_projects", []string{"github_projects"}, resolveErr)
+	got := workItemProviderReadinessFor("github_projects", []string{"github_projects"}, nil, resolveErr)
 
 	if got.Status != workItemProviderStatusUnknown {
 		t.Fatalf("status = %q, want %q", got.Status, workItemProviderStatusUnknown)
@@ -4426,6 +4468,64 @@ func TestOnboardingReadiness_WorkItemProvider_RegisteredWhenConventionsMatch(t *
 	}
 }
 
+// TestOnboardingReadiness_WorkItemProvider_CampaignSourcesShipped decodes the
+// SHIPPED response body (#3658) and asserts campaign_sources is present as a
+// JSON ARRAY (never null, never absent) on every branch the handler can reach:
+// the REAL gitlab provider reports both sources it now serves; a registered
+// File-only fake reports []; an unregistered provider and an unresolved
+// conventions read report [] (no capability claim). Non-parallel: it mutates
+// the process-global registry and conventionsLoader.
+func TestOnboardingReadiness_WorkItemProvider_CampaignSourcesShipped(t *testing.T) {
+	const fileOnlyID = "onboarding_rung_file_only_provider"
+	workmgmt.Register(&fakeWorkProvider{name: fileOnlyID})
+	for _, tc := range []struct {
+		name  string
+		setup func(t *testing.T)
+		want  []any
+	}{
+		{
+			name:  "real gitlab provider serves both sources",
+			setup: func(t *testing.T) { registerRealGitLabProvider(t, newFakeGitLabAPI(55)) },
+			want:  []any{"epic_ref", "items"},
+		},
+		{
+			name:  "registered File-only provider serves neither",
+			setup: func(t *testing.T) { withWorkItemProviderConventions(t, fileOnlyID, nil) },
+			want:  []any{},
+		},
+		{
+			name:  "unregistered makes no claim",
+			setup: func(t *testing.T) { withWorkItemProviderConventions(t, workItemProviderAbsentID, nil) },
+			want:  []any{},
+		},
+		{
+			name:  "unknown makes no claim",
+			setup: func(t *testing.T) { withWorkItemProviderConventions(t, "", errors.New("conventions fetch failed")) },
+			want:  []any{},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.setup(t)
+			fake := newFakeGitHubForRuns(onboardingReviewersSpecYAML)
+			s := newOnboardingServer(t, fake.server(t), nil)
+			ident := testOperatorIdentity()
+			raw := rawReadiness(t, s, onboardingReq("x/y", &ident))
+			wp := rawObject(t, raw, "work_item_provider")
+			v, ok := wp["campaign_sources"]
+			if !ok {
+				t.Fatalf("work_item_provider = %v, want campaign_sources present", wp)
+			}
+			got, isArr := v.([]any)
+			if !isArr {
+				t.Fatalf("campaign_sources = %#v, want a JSON array (never null)", v)
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("campaign_sources = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestOnboardingReadiness_WorkItemProvider_SurvivesMCPMirrorDecode is the
 // cross-boundary decode seam: the REAL handler's served JSON is decoded with
 // the fishhawk_doctor client mirror (mcpserver.OnboardingReadinessReport) — not
@@ -4461,5 +4561,8 @@ func TestOnboardingReadiness_WorkItemProvider_SurvivesMCPMirrorDecode(t *testing
 	}
 	if got.Note == "" || got.MissingHint == "" {
 		t.Errorf("MCP mirror note/missing_hint = %q / %q, want both to survive the wire", got.Note, got.MissingHint)
+	}
+	if got.CampaignSources == nil {
+		t.Errorf("MCP mirror campaign_sources = nil, want the served array to survive")
 	}
 }

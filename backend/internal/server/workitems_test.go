@@ -578,13 +578,14 @@ func TestFileWorkItem_ProviderWithoutDiscovererFailsClosed(t *testing.T) {
 
 // TestFileWorkItem_UnimplementedProvider_FailsClosed asserts an
 // unregistered/unimplemented provider id returns a typed 501 naming the
-// missing provider rather than panicking. jira is now a real provider, so
-// this uses a genuinely-never-registered placeholder ("gitlab") — the
-// registry is process-global, and the end-to-end jira test below registers
-// the jira provider, so a stale "jira" id here would resolve.
+// missing provider rather than panicking. It uses workItemProviderAbsentID, an
+// id no production provider uses and no test registers: the registry is
+// process-global, and "jira" and (since #3658's real-provider campaign and
+// onboarding tests) "gitlab" are both registered by earlier tests in this
+// package, so either would resolve depending on test order.
 func TestFileWorkItem_UnimplementedProvider_FailsClosed(t *testing.T) {
 	conv := workmgmt.Default()
-	conv.Provider = "gitlab" // never registered
+	conv.Provider = workItemProviderAbsentID // never registered
 	prev := conventionsLoader
 	conventionsLoader = func(context.Context, string) (workmgmt.Conventions, error) { return conv, nil }
 	t.Cleanup(func() { conventionsLoader = prev })
@@ -607,8 +608,8 @@ func TestFileWorkItem_UnimplementedProvider_FailsClosed(t *testing.T) {
 	if env.Error.Code != "provider_unimplemented" {
 		t.Errorf("code = %q, want provider_unimplemented", env.Error.Code)
 	}
-	if env.Error.Details["provider"] != "gitlab" {
-		t.Errorf("details.provider = %v, want gitlab", env.Error.Details["provider"])
+	if env.Error.Details["provider"] != workItemProviderAbsentID {
+		t.Errorf("details.provider = %v, want %s", env.Error.Details["provider"], workItemProviderAbsentID)
 	}
 }
 
@@ -3100,5 +3101,38 @@ func TestFileWorkItem_NoIntakeObjectWhenHookProducesNothing(t *testing.T) {
 	}
 	if strings.Contains(string(raw), "\"intake\"") {
 		t.Errorf("a nil intake serialized an intake key, breaking the pre-#2239 payload shape: %s", raw)
+	}
+}
+
+// TestFileWorkItem_GitLab_ChildNumberAllocatedViaEpicChildren pins the
+// newly-reachable consequence of #3658: the REAL gitlab provider now implements
+// workmgmt.EpicChildrenQuerier, so a gitlab filing with a parent_epic and an
+// [EX.n] title format with n omitted discovers the epic's existing children
+// (the epic issue's relates_to links) and allocates the next number. Before
+// #3658 the provider was File-only and could not allocate at all. #102 carries a
+// Parent epic marker naming THIS epic (admitted); #103 names another epic and is
+// excluded, so its [E7.9] must NOT drive the allocation to 10.
+func TestFileWorkItem_GitLab_ChildNumberAllocatedViaEpicChildren(t *testing.T) {
+	api := newFakeGitLabAPI(55)
+	api.addIssue(100, "[E7] the epic", "", nil, []int{101, 102, 103})
+	api.addIssue(101, "[E7.1] first child", "", nil, []int{100})
+	api.addIssue(102, "[E7.2] second child", "Parent epic: #100", nil, []int{100})
+	api.addIssue(103, "[E7.9] a foreign epic's child", "Parent epic: #400", nil, []int{100})
+	registerRealGitLabProvider(t, api)
+	s := New(Config{}) // no GitHub client: a gitlab filing needs none
+
+	rec := fileWorkItem(t, s, workItemRequest{
+		Repo:      "group/app",
+		Type:      "feature",
+		Summary:   "Discover my number on gitlab",
+		TitleVars: map[string]string{"epic": "7"}, // n omitted -> discovered
+		Relations: &workItemRelations{ParentEpic: "#100"},
+	}, "github:operator")
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if resp := decodeWorkItem(t, rec); resp.Title != "[E7.3] Discover my number on gitlab" {
+		t.Errorf("response title = %q, want [E7.3] Discover my number on gitlab (max(1,2)+1 over the relates_to children)", resp.Title)
 	}
 }
