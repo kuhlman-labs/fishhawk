@@ -80,6 +80,7 @@ type CampaignItem struct {
 	PauseReason   []byte             `json:"pause_reason"`
 	Autonomy      string             `json:"autonomy"`
 	QueuePosition int32              `json:"queue_position"`
+	ResolvedBy    string             `json:"resolved_by"`
 }
 
 type McpToken struct {

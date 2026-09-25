@@ -105,6 +105,8 @@ type fakeCampaignRepo struct {
 	restartCalls   int
 	reopenCalls    int
 	settleOOBCalls int
+	// settleClosedIssueCalls counts SettleCampaignItemForClosedIssue calls (#3563).
+	settleClosedIssueCalls int
 
 	// afterReopen, when set, is invoked AFTER ReopenCampaignForItemRestart
 	// releases the fake's mutex and commits both mutations — the seam the
@@ -367,7 +369,41 @@ func (f *fakeCampaignRepo) SettleCampaignItemOutOfBand(_ context.Context, id uui
 				return nil, campaign.InvalidTransitionError{Kind: "campaign_item", From: string(it.State), To: string(campaign.ItemStateSucceeded)}
 			}
 			it.State = campaign.ItemStateSucceeded
+			// Marker stamped atomically with the state (#3563), mirroring the
+			// Postgres adapter's single-statement settle.
+			it.ResolvedBy = campaign.ResolvedByIssueClosed
 			// Run link RETAINED (unlike RestartCampaignItem, which clears it).
+			it.UpdatedAt = time.Now().UTC()
+			return it, nil
+		}
+	}
+	return nil, campaign.ErrNotFound
+}
+
+// SettleCampaignItemForClosedIssue settles a not-yet-run item (pending or
+// blocked) onto the issue-closure classifier's target while stamping
+// resolved_by=issue_closed in the SAME operation, mirroring the Postgres
+// adapter's single-statement contract (#3563) so reconcile-on-read's class-A
+// settle path is exercised with its real guards. Any other from-state, or a `to`
+// outside {succeeded, cancelled}, is rejected InvalidTransitionError;
+// settleClosedIssueCalls counts invocations for the mutation asserts.
+func (f *fakeCampaignRepo) SettleCampaignItemForClosedIssue(_ context.Context, id uuid.UUID, to campaign.ItemState) (*campaign.Item, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.settleClosedIssueCalls++
+	for _, items := range f.itemsByCmp {
+		for _, it := range items {
+			if it.ID != id {
+				continue
+			}
+			if it.State != campaign.ItemStatePending && it.State != campaign.ItemStateBlocked {
+				return nil, campaign.InvalidTransitionError{Kind: "campaign_item", From: string(it.State), To: string(to)}
+			}
+			if to != campaign.ItemStateSucceeded && to != campaign.ItemStateCancelled {
+				return nil, campaign.InvalidTransitionError{Kind: "campaign_item", From: string(it.State), To: string(to)}
+			}
+			it.State = to
+			it.ResolvedBy = campaign.ResolvedByIssueClosed
 			it.UpdatedAt = time.Now().UTC()
 			return it, nil
 		}
@@ -6388,17 +6424,25 @@ func TestReconcileOnRead_RunlessClosedChain_ConvergesInSingleRead_E2E(t *testing
 	}
 }
 
-// TestReconcileOnRead_RunlessClosedDepOnOpen_StaysBlocked is the negative guard
-// preserving DAG order under the #1758 fixpoint: a run-less child C (issue:101)
-// that is itself closed-as-completed but whose dependency D (issue:100) is still
-// OPEN must NOT be settled. D never enters the done-set, so C's dep is
-// unsatisfied and the Phase-2 fixpoint never reaches C — it stays Blocked, never
-// Eligible, and emits no settle audit.
-func TestReconcileOnRead_RunlessClosedDepOnOpen_StaysBlocked(t *testing.T) {
+// TestGetCampaignStatus_ClosedItemSettlesWithUnsatisfiedDependency is the E72.24
+// (#3563) behavioral proof that the #1558 depends_on gate is GONE: a run-less
+// child C (issue:101) closed-as-completed whose dependency D (issue:100) is
+// still OPEN settles on the FIRST poll.
+//
+// This test FAILS on the pre-change code, which held C non-terminal until D
+// succeeded — the park the issue reports, unbounded when D is human-led-and-open
+// or itself abandoned. The justification for settling anyway: the campaign DAG
+// orders DISPATCH (which item may mint a RUN next) and a settle mints no run, so
+// there is nothing to order against; C's delivery is a fact the forge already
+// recorded.
+//
+// It also pins that dropping the gate does NOT make C dispatchable: C lands in
+// rollup.done, and D — still open and unsettled — is what next_action names.
+func TestGetCampaignStatus_ClosedItemSettlesWithUnsatisfiedDependency(t *testing.T) {
 	crepo := newFakeCampaignRepo()
 	aud := &campaignAuditRecorder{}
 	ghState := &runlessGitHub{installID: 4242, issues: map[int]runlessIssue{
-		100: {state: "open", stateReason: ""},            // D still open
+		100: {state: "open", stateReason: ""},            // D still OPEN — the unsatisfied dependency
 		101: {state: "closed", stateReason: "completed"}, // C closed out of dep order
 	}}
 	gh := newRunlessGitHubClient(t, ghState)
@@ -6411,22 +6455,77 @@ func TestReconcileOnRead_RunlessClosedDepOnOpen_StaysBlocked(t *testing.T) {
 
 	st := getCampaignStatusBody(t, s, c.ID)
 
-	// C is closed but its dep is open → left unsettled, no settle audit.
-	if n := aud.count("campaign_issue_settled"); n != 0 {
-		t.Errorf("campaign_issue_settled = %d, want 0 (closed item's dep still open)", n)
+	// C settled on the FIRST poll despite its open dependency.
+	if !containsRef(st.Rollup.Done, "issue:101") {
+		t.Errorf("rollup.Done = %v, want to contain issue:101 (settled despite an open dependency)", st.Rollup.Done)
 	}
+	if containsRef(st.Rollup.Blocked, "issue:101") {
+		t.Errorf("rollup.Blocked = %v, must NOT contain issue:101 (the #1558 depends_on gate is dropped)", st.Rollup.Blocked)
+	}
+	var cItemState, cResolvedBy string
 	for _, it := range st.Items {
-		if it.IssueRef == "issue:101" && it.State == string(campaign.ItemStateSucceeded) {
-			t.Errorf("item issue:101 settled to succeeded, want unsettled (dep D open)")
+		if it.IssueRef == "issue:101" {
+			cItemState, cResolvedBy = it.State, it.ResolvedBy
 		}
 	}
+	if cItemState != string(campaign.ItemStateSucceeded) {
+		t.Errorf("item issue:101 state = %q, want succeeded", cItemState)
+	}
+	if cResolvedBy != campaign.ResolvedByIssueClosed {
+		t.Errorf("item issue:101 resolved_by = %q, want %q", cResolvedBy, campaign.ResolvedByIssueClosed)
+	}
+	if n := aud.count("campaign_issue_settled"); n != 1 {
+		t.Errorf("campaign_issue_settled = %d, want 1 (C settled)", n)
+	}
+	// D is untouched — an open issue is never a candidate — and it is what the
+	// operator is pointed at, so the relaxation adds no spurious dispatch target.
+	if !containsRef(st.Rollup.Eligible, "issue:100") {
+		t.Errorf("rollup.Eligible = %v, want to contain issue:100 (D is open and dispatchable)", st.Rollup.Eligible)
+	}
+	if st.NextAction.Action != "start_run" || st.NextAction.IssueRef != "issue:100" {
+		t.Errorf("next_action = %+v, want start_run issue:100", st.NextAction)
+	}
+}
 
-	// DAG order preserved: C appears Blocked, never Eligible.
+// TestGetCampaignStatus_SettledCancelledDoesNotUnblockDependents is the
+// invariant the #3563 relaxation must NOT break: dropping the depends_on gate
+// lets an ABANDONED item settle, and a dependent of a settled-CANCELLED item
+// must still be BLOCKED. A cancelled ref never enters NextEligible's done-set,
+// so nothing was delivered and nothing unblocks.
+//
+// Without this pin, a future "simplification" that folded a not_planned closure
+// into succeeded would look correct to every other test here while silently
+// dispatching work against a dependency nobody did.
+func TestGetCampaignStatus_SettledCancelledDoesNotUnblockDependents(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	aud := &campaignAuditRecorder{}
+	ghState := &runlessGitHub{installID: 4242, issues: map[int]runlessIssue{
+		100: {state: "closed", stateReason: "not_planned"}, // D abandoned
+		101: {state: "open", stateReason: ""},              // C depends on D, still open
+	}}
+	gh := newRunlessGitHubClient(t, ghState)
+	s := New(Config{CampaignRepo: crepo, RunRepo: newFakeRepo(), AuditRepo: aud, GitHub: gh})
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		cItem("issue:100", nil, campaign.ItemStatePending),
+		cItem("issue:101", []string{"issue:100"}, campaign.ItemStatePending),
+	})
+	c.State = campaign.StateRunning
+
+	st := getCampaignStatusBody(t, s, c.ID)
+
+	// D settled CANCELLED.
+	if !containsRef(st.Rollup.Cancelled, "issue:100") {
+		t.Errorf("rollup.Cancelled = %v, want to contain issue:100 (not_planned settles cancelled)", st.Rollup.Cancelled)
+	}
+	if containsRef(st.Rollup.Done, "issue:100") {
+		t.Errorf("rollup.Done = %v, must NOT contain issue:100 (an abandonment is not a delivery)", st.Rollup.Done)
+	}
+	// C stays BLOCKED — the invariant.
 	if !containsRef(st.Rollup.Blocked, "issue:101") {
-		t.Errorf("rollup.Blocked = %v, want to contain issue:101 (closed-with-open-dep stays Blocked)", st.Rollup.Blocked)
+		t.Errorf("rollup.Blocked = %v, want to contain issue:101 (a cancelled dep unblocks nothing)", st.Rollup.Blocked)
 	}
 	if containsRef(st.Rollup.Eligible, "issue:101") {
-		t.Errorf("rollup.Eligible = %v, must NOT contain issue:101 (dep unsatisfied)", st.Rollup.Eligible)
+		t.Errorf("rollup.Eligible = %v, must NOT contain issue:101 (its dependency was abandoned)", st.Rollup.Eligible)
 	}
 }
 
@@ -6456,9 +6555,13 @@ func TestReconcileOnRead_RunlessIssueOpen_NotSettled(t *testing.T) {
 	}
 }
 
-// TestReconcileOnRead_RunlessIssueNotPlanned_NotSettled: a closed-as-not_planned
-// issue is an abandonment, not a completion — the item is left unsettled.
-func TestReconcileOnRead_RunlessIssueNotPlanned_NotSettled(t *testing.T) {
+// TestReconcileOnRead_RunlessIssueNotPlanned_SettlesCancelled is the E72.24
+// (#3563) not_planned arm, REPLACING the pre-change assertion that a
+// not_planned closure settled NOTHING (which is what parked such an item
+// non-terminal forever). An abandonment IS a resolution — just not a delivery —
+// so the item settles CANCELLED, carries resolved_by=issue_closed, lands in
+// rollup.cancelled and NOT rollup.done, and is NOT offered for restart.
+func TestReconcileOnRead_RunlessIssueNotPlanned_SettlesCancelled(t *testing.T) {
 	crepo := newFakeCampaignRepo()
 	aud := &campaignAuditRecorder{}
 	ghState := &runlessGitHub{installID: 4242, issues: map[int]runlessIssue{
@@ -6472,10 +6575,40 @@ func TestReconcileOnRead_RunlessIssueNotPlanned_NotSettled(t *testing.T) {
 
 	st := getCampaignStatusBody(t, s, c.ID)
 	if len(st.Rollup.Done) != 0 {
-		t.Errorf("rollup.Done = %v, want empty (not_planned not settled)", st.Rollup.Done)
+		t.Errorf("rollup.Done = %v, want empty (an abandonment is NOT a delivery)", st.Rollup.Done)
 	}
-	if n := aud.count("campaign_issue_settled"); n != 0 {
-		t.Errorf("campaign_issue_settled = %d, want 0 (not_planned closure)", n)
+	if !containsRef(st.Rollup.Cancelled, "issue:100") {
+		t.Errorf("rollup.Cancelled = %v, want to contain issue:100", st.Rollup.Cancelled)
+	}
+	// The abandoned issue has no forward path: never surfaced as restartable.
+	if st.NextAction.Action == "start_run" && st.NextAction.IssueRef == "issue:100" {
+		t.Errorf("next_action = %+v, must not offer start_run for an abandoned issue", st.NextAction)
+	}
+	if len(st.Items) != 1 || st.Items[0].State != string(campaign.ItemStateCancelled) {
+		t.Fatalf("items = %+v, want one cancelled item", st.Items)
+	}
+	if st.Items[0].ResolvedBy != campaign.ResolvedByIssueClosed {
+		t.Errorf("resolved_by = %q, want %q", st.Items[0].ResolvedBy, campaign.ResolvedByIssueClosed)
+	}
+	if crepo.settleClosedIssueCalls != 1 {
+		t.Errorf("settleClosedIssueCalls = %d, want 1 (the atomic class-A settle)", crepo.settleClosedIssueCalls)
+	}
+	// The audit reports the REAL state_reason and the durable marker.
+	if n := aud.count("campaign_issue_settled"); n != 1 {
+		t.Fatalf("campaign_issue_settled = %d, want 1", n)
+	}
+	p := settledAuditPayload(t, aud)
+	if p["state_reason"] != "not_planned" {
+		t.Errorf("state_reason = %v, want not_planned (no longer hard-coded completed)", p["state_reason"])
+	}
+	if p["outcome"] != string(campaign.ItemStateCancelled) {
+		t.Errorf("outcome = %v, want cancelled", p["outcome"])
+	}
+	if p["resolved_by"] != campaign.ResolvedByIssueClosed {
+		t.Errorf("resolved_by = %v, want %q", p["resolved_by"], campaign.ResolvedByIssueClosed)
+	}
+	if _, ok := p["run_id"]; ok {
+		t.Errorf("payload carries run_id = %v, want absent for a run-less settle", p["run_id"])
 	}
 }
 
@@ -9449,5 +9582,450 @@ func TestCreateCampaign_GitLabGroupEpicRef_RefusedBeforeAnyProviderCall(t *testi
 	}
 	if n := api.callCount(); n != 0 {
 		t.Errorf("gitlab API called %d times, want 0 — a group-epic ref must be refused before any forge round-trip", n)
+	}
+}
+
+// --- E72.24 / #3563: the issue-closed settle's classifier matrix + surfaces ---
+
+// TestGetCampaignStatus_IssueClosedSettle_TwoPollTransition is the E72.24
+// (#3563) headline cross-boundary done-means, exactly the transition the issue's
+// Done-means specifies: poll 1 reports the item non-terminal with next_action
+// naming it; the forge then closes the issue; poll 2 reports it settled with
+// resolved_by=issue_closed.
+//
+// It is written as a TWO-POLL test on purpose — a single-poll assertion cannot
+// distinguish "settled on observing the closure" from "was already settled at
+// seed time", and the observation-triggered transition is the whole behavior.
+// Both closure outcomes are covered as sibling subtests: completed -> succeeded
+// (rollup.done) and not_planned -> cancelled (rollup.cancelled, NO start_run).
+func TestGetCampaignStatus_IssueClosedSettle_TwoPollTransition(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		stateReason string
+		wantState   campaign.ItemState
+		// inDone reports which rollup slice the settled ref must land in.
+		inDone bool
+	}{
+		{"completed_settles_succeeded", "completed", campaign.ItemStateSucceeded, true},
+		{"not_planned_settles_cancelled", "not_planned", campaign.ItemStateCancelled, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			crepo := newFakeCampaignRepo()
+			aud := &campaignAuditRecorder{}
+			// Poll 1: the issue is still OPEN.
+			ghState := &runlessGitHub{installID: 4242, issues: map[int]runlessIssue{
+				100: {state: "open", stateReason: ""},
+			}}
+			s := New(Config{CampaignRepo: crepo, RunRepo: newFakeRepo(), AuditRepo: aud, GitHub: newRunlessGitHubClient(t, ghState)})
+			c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+				cItem("issue:100", nil, campaign.ItemStatePending),
+			})
+			c.State = campaign.StateRunning
+
+			st1 := getCampaignStatusBody(t, s, c.ID)
+			if len(st1.Items) != 1 || st1.Items[0].State != string(campaign.ItemStatePending) {
+				t.Fatalf("poll 1 items = %+v, want one pending item", st1.Items)
+			}
+			if st1.Items[0].ResolvedBy != "" {
+				t.Errorf("poll 1 resolved_by = %q, want absent (nothing settled yet)", st1.Items[0].ResolvedBy)
+			}
+			if st1.NextAction.Action != "start_run" || st1.NextAction.IssueRef != "issue:100" {
+				t.Errorf("poll 1 next_action = %+v, want start_run issue:100 (non-terminal)", st1.NextAction)
+			}
+			if n := aud.count("campaign_issue_settled"); n != 0 {
+				t.Fatalf("poll 1 campaign_issue_settled = %d, want 0", n)
+			}
+
+			// The forge closes the issue between polls.
+			ghState.issues[100] = runlessIssue{state: "closed", stateReason: tc.stateReason}
+
+			st2 := getCampaignStatusBody(t, s, c.ID)
+			if len(st2.Items) != 1 || st2.Items[0].State != string(tc.wantState) {
+				t.Fatalf("poll 2 items = %+v, want one %s item", st2.Items, tc.wantState)
+			}
+			if st2.Items[0].ResolvedBy != campaign.ResolvedByIssueClosed {
+				t.Errorf("poll 2 resolved_by = %q, want %q", st2.Items[0].ResolvedBy, campaign.ResolvedByIssueClosed)
+			}
+			if tc.inDone {
+				if !containsRef(st2.Rollup.Done, "issue:100") {
+					t.Errorf("poll 2 rollup.Done = %v, want to contain issue:100", st2.Rollup.Done)
+				}
+			} else {
+				if !containsRef(st2.Rollup.Cancelled, "issue:100") {
+					t.Errorf("poll 2 rollup.Cancelled = %v, want to contain issue:100", st2.Rollup.Cancelled)
+				}
+				if containsRef(st2.Rollup.Done, "issue:100") {
+					t.Errorf("poll 2 rollup.Done = %v, must NOT contain an abandoned issue", st2.Rollup.Done)
+				}
+			}
+			// Either way the settled item is no longer offered for a run.
+			if st2.NextAction.Action == "start_run" && st2.NextAction.IssueRef == "issue:100" {
+				t.Errorf("poll 2 next_action = %+v, must not offer start_run for a settled item", st2.NextAction)
+			}
+			if n := aud.count("campaign_issue_settled"); n != 1 {
+				t.Errorf("poll 2 campaign_issue_settled = %d, want 1", n)
+			}
+			// IDEMPOTENT: a third poll re-observes the same closure and settles
+			// nothing further (the item is no longer in a settleable from-state).
+			getCampaignStatusBody(t, s, c.ID)
+			if n := aud.count("campaign_issue_settled"); n != 1 {
+				t.Errorf("poll 3 campaign_issue_settled = %d, want still 1 (idempotent)", n)
+			}
+		})
+	}
+}
+
+// TestGetCampaignStatus_ClosedIssueClassifierMatrix drives ONE case per
+// enumerated branch of classifyClosedIssueOutcome through the REAL status route,
+// asserting the OBSERVED outcome rather than the classifier's return value.
+//
+// The three settling reasons and the four non-settling ones each have their own
+// row: an unrecognised reason, `reopened`, an EMPTY reason and an open issue must
+// all leave the item exactly as it stands — that is the fail-closed default arm,
+// and it is the control that keeps an unrecognised closure from being read as a
+// delivery.
+func TestGetCampaignStatus_ClosedIssueClassifierMatrix(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		state       string
+		stateReason string
+		// wantState is the item state after the poll. Pending means UNSETTLED.
+		wantState campaign.ItemState
+		wantMark  bool
+	}{
+		{"closed_completed", "closed", "completed", campaign.ItemStateSucceeded, true},
+		{"closed_not_planned", "closed", "not_planned", campaign.ItemStateCancelled, true},
+		{"closed_duplicate", "closed", "duplicate", campaign.ItemStateCancelled, true},
+		// --- fail-closed default arm: every row below is left UNSETTLED.
+		{"closed_empty_reason", "closed", "", campaign.ItemStatePending, false},
+		{"closed_reopened", "closed", "reopened", campaign.ItemStatePending, false},
+		{"closed_unrecognised_reason", "closed", "wontfix_someday", campaign.ItemStatePending, false},
+		{"open", "open", "", campaign.ItemStatePending, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			crepo := newFakeCampaignRepo()
+			aud := &campaignAuditRecorder{}
+			ghState := &runlessGitHub{installID: 4242, issues: map[int]runlessIssue{
+				100: {state: tc.state, stateReason: tc.stateReason},
+			}}
+			s := New(Config{CampaignRepo: crepo, RunRepo: newFakeRepo(), AuditRepo: aud, GitHub: newRunlessGitHubClient(t, ghState)})
+			c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+				cItem("issue:100", nil, campaign.ItemStatePending),
+			})
+			c.State = campaign.StateRunning
+
+			st := getCampaignStatusBody(t, s, c.ID)
+			if len(st.Items) != 1 {
+				t.Fatalf("items = %+v, want one", st.Items)
+			}
+			if got := st.Items[0].State; got != string(tc.wantState) {
+				t.Errorf("item state = %q, want %q", got, tc.wantState)
+			}
+			wantMark := ""
+			if tc.wantMark {
+				wantMark = campaign.ResolvedByIssueClosed
+			}
+			if got := st.Items[0].ResolvedBy; got != wantMark {
+				t.Errorf("resolved_by = %q, want %q", got, wantMark)
+			}
+			wantAudits := 0
+			if tc.wantMark {
+				wantAudits = 1
+			}
+			if n := aud.count("campaign_issue_settled"); n != wantAudits {
+				t.Errorf("campaign_issue_settled = %d, want %d", n, wantAudits)
+			}
+			// No settle means no write at all through the atomic settle path.
+			wantCalls := wantAudits
+			if crepo.settleClosedIssueCalls != wantCalls {
+				t.Errorf("settleClosedIssueCalls = %d, want %d", crepo.settleClosedIssueCalls, wantCalls)
+			}
+		})
+	}
+}
+
+// TestGetCampaignStatus_ClosedUnrecognisedReasonLeavesItemUnsettled is the
+// dedicated COUNTERFACTUAL VEHICLE for the classifier's fail-closed default arm.
+// Deleting that arm (so any closed issue classifies as completed) makes this test
+// go RED: the item settles succeeded and an audit fires.
+//
+// It exists separately from the matrix above so the counterfactual is run against
+// one named test rather than a table whose other rows would mask the signal.
+func TestGetCampaignStatus_ClosedUnrecognisedReasonLeavesItemUnsettled(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	aud := &campaignAuditRecorder{}
+	ghState := &runlessGitHub{installID: 4242, issues: map[int]runlessIssue{
+		100: {state: "closed", stateReason: "wontfix_someday"},
+	}}
+	s := New(Config{CampaignRepo: crepo, RunRepo: newFakeRepo(), AuditRepo: aud, GitHub: newRunlessGitHubClient(t, ghState)})
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		cItem("issue:100", nil, campaign.ItemStatePending),
+	})
+	c.State = campaign.StateRunning
+
+	st := getCampaignStatusBody(t, s, c.ID)
+	if len(st.Items) != 1 || st.Items[0].State != string(campaign.ItemStatePending) {
+		t.Errorf("items = %+v, want one PENDING item (an unrecognised state_reason must not settle)", st.Items)
+	}
+	if st.Items[0].ResolvedBy != "" {
+		t.Errorf("resolved_by = %q, want absent", st.Items[0].ResolvedBy)
+	}
+	if n := aud.count("campaign_issue_settled"); n != 0 {
+		t.Errorf("campaign_issue_settled = %d, want 0", n)
+	}
+	if crepo.settleClosedIssueCalls != 0 {
+		t.Errorf("settleClosedIssueCalls = %d, want 0 (nothing written)", crepo.settleClosedIssueCalls)
+	}
+}
+
+// TestGetCampaignStatus_ClosedIssueNonIssueRef_NotSettled: an item whose ref is
+// not an `issue:N` token (a Jira key) has no forge issue to read, so it is never
+// a candidate and no GetIssue is attempted for it.
+func TestGetCampaignStatus_ClosedIssueNonIssueRef_NotSettled(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	aud := &campaignAuditRecorder{}
+	ghState := &runlessGitHub{installID: 4242, issues: map[int]runlessIssue{}}
+	s := New(Config{CampaignRepo: crepo, RunRepo: newFakeRepo(), AuditRepo: aud, GitHub: newRunlessGitHubClient(t, ghState)})
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		cItem("PROJ-123", nil, campaign.ItemStatePending),
+	})
+	c.State = campaign.StateRunning
+
+	st := getCampaignStatusBody(t, s, c.ID)
+	if len(st.Items) != 1 || st.Items[0].State != string(campaign.ItemStatePending) {
+		t.Errorf("items = %+v, want one pending item", st.Items)
+	}
+	if ghState.issueCalls != 0 {
+		t.Errorf("issueCalls = %d, want 0 (a non issue:N ref is never fetched)", ghState.issueCalls)
+	}
+	if n := aud.count("campaign_issue_settled"); n != 0 {
+		t.Errorf("campaign_issue_settled = %d, want 0", n)
+	}
+}
+
+// TestGetCampaignStatus_AllItemsTerminalDerivesSucceeded asserts the campaign
+// DERIVATION over an issue-closed settle: a campaign whose LAST non-terminal item
+// settles this way derives campaign state succeeded through the status route.
+//
+// The seeded pair is deliberately one already-succeeded item plus one pending
+// item whose issue is closed-as-completed, so the settle is what takes the
+// campaign terminal rather than the seed.
+func TestGetCampaignStatus_AllItemsTerminalDerivesSucceeded(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	aud := &campaignAuditRecorder{}
+	ghState := &runlessGitHub{installID: 4242, issues: map[int]runlessIssue{
+		101: {state: "closed", stateReason: "completed"},
+	}}
+	s := New(Config{CampaignRepo: crepo, RunRepo: newFakeRepo(), AuditRepo: aud, GitHub: newRunlessGitHubClient(t, ghState)})
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		cItem("issue:100", nil, campaign.ItemStateSucceeded),
+		cItem("issue:101", nil, campaign.ItemStatePending),
+	})
+	c.State = campaign.StateRunning
+
+	st := getCampaignStatusBody(t, s, c.ID)
+	if st.Campaign.State != string(campaign.StateSucceeded) {
+		t.Errorf("campaign state = %q, want succeeded (the settle took the last item terminal)", st.Campaign.State)
+	}
+	if len(st.Rollup.Done) != 2 {
+		t.Errorf("rollup.Done = %v, want both items done", st.Rollup.Done)
+	}
+	if st.NextAction.Action != "complete" {
+		t.Errorf("next_action = %+v, want complete", st.NextAction)
+	}
+	if got := crepo.campaigns[c.ID].State; got != campaign.StateSucceeded {
+		t.Errorf("persisted campaign state = %q, want succeeded", got)
+	}
+}
+
+// TestStartCampaignItemRun_RefusesIssueClosedCancelledItem is the operator-verb
+// half of the #3563 single-control claim: handleStartCampaignItemRun's DAG gate
+// IS campaign.NextEligible, so the Restartable suppression makes the start verb
+// refuse an issue-closed cancellation with no second guard.
+//
+// Run over a REAL Postgres because the assertion is on COMMITTED STATE, not only
+// on error identity (per the counterfactual rules): a control that fires and is
+// then rolled back returns a byte-identical 409, so the item row is RE-READ after
+// the call to prove no run was linked and the state did not move.
+//
+// The cancelled+marked state is seeded through the repository's own settle
+// method, NOT through the engine conjunct under test, so a RED under that
+// conjunct's deletion lands on the behavioral assertion and never on setup.
+func TestStartCampaignItemRun_RefusesIssueClosedCancelledItem(t *testing.T) {
+	ctx := context.Background()
+	s, campaigns, _, _ := newCampaignStartServerPG(t)
+
+	c, err := campaigns.CreateCampaign(ctx, campaign.CreateCampaignParams{
+		Repo: "kuhlman-labs/fishhawk", EpicRef: "issue:99", WorkingDir: seededCampaignWorkingDir,
+	})
+	if err != nil {
+		t.Fatalf("create campaign: %v", err)
+	}
+	it, err := campaigns.CreateCampaignItem(ctx, campaign.CreateCampaignItemParams{CampaignID: c.ID, IssueRef: "issue:100"})
+	if err != nil {
+		t.Fatalf("create item: %v", err)
+	}
+	// Seed the abandoned shape: cancelled WITH the issue-closed marker.
+	settled, err := campaigns.SettleCampaignItemForClosedIssue(ctx, it.ID, campaign.ItemStateCancelled)
+	if err != nil {
+		t.Fatalf("seed issue-closed cancellation: %v", err)
+	}
+	if settled.ResolvedBy != campaign.ResolvedByIssueClosed {
+		t.Fatalf("seeded resolved_by = %q, want %q", settled.ResolvedBy, campaign.ResolvedByIssueClosed)
+	}
+	if _, err := campaigns.TransitionCampaign(ctx, c.ID, campaign.StateRunning); err != nil {
+		t.Fatalf("campaign→running: %v", err)
+	}
+
+	// The status surface must not advertise the item either.
+	st := getCampaignStatusBody(t, s, c.ID)
+	if st.NextAction.Action == "start_run" && st.NextAction.IssueRef == "issue:100" {
+		t.Errorf("next_action = %+v, must not offer start_run for an abandoned issue", st.NextAction)
+	}
+
+	w := postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:100","workflow_id":"feature_change","runner_kind":"local"}`)
+	if w.Code != http.StatusConflict || decodeCampaignError(t, w) != "item_not_eligible" {
+		t.Fatalf("start = %d/%s, want 409 item_not_eligible (body=%s)", w.Code, decodeCampaignError(t, w), w.Body.String())
+	}
+	// COMMITTED STATE: the refusal wrote nothing — no run link, state unmoved,
+	// marker intact. Error identity alone cannot prove this.
+	after, err := campaigns.GetCampaignItem(ctx, it.ID)
+	if err != nil {
+		t.Fatalf("re-read item: %v", err)
+	}
+	if after.RunID != nil {
+		t.Errorf("item run_id = %v, want nil (the refusal must mint and link NO run)", after.RunID)
+	}
+	if after.State != campaign.ItemStateCancelled {
+		t.Errorf("item state = %q, want cancelled (unmoved)", after.State)
+	}
+	if after.ResolvedBy != campaign.ResolvedByIssueClosed {
+		t.Errorf("item resolved_by = %q, want %q (unmoved)", after.ResolvedBy, campaign.ResolvedByIssueClosed)
+	}
+}
+
+// TestStartCampaignItemRun_OperatorCancelledStaysStartable is the ANTI-OVER-REACH
+// pin paired with TestStartCampaignItemRun_RefusesIssueClosedCancelledItem: the
+// verb refuses ONLY an issue-closed cancellation. An OPERATOR cancellation
+// (resolved_by == "", seeded by construction through the ordinary transition
+// path, never through a settle) is still restartable, exactly as #1729 shipped
+// it. It must stay GREEN under the same deletion that reddens its sibling.
+func TestStartCampaignItemRun_OperatorCancelledStaysStartable(t *testing.T) {
+	ctx := context.Background()
+	s, campaigns, _, _ := newCampaignStartServerPG(t)
+
+	c, err := campaigns.CreateCampaign(ctx, campaign.CreateCampaignParams{
+		Repo: "kuhlman-labs/fishhawk", EpicRef: "issue:99", WorkingDir: seededCampaignWorkingDir,
+	})
+	if err != nil {
+		t.Fatalf("create campaign: %v", err)
+	}
+	it, err := campaigns.CreateCampaignItem(ctx, campaign.CreateCampaignItemParams{CampaignID: c.ID, IssueRef: "issue:100"})
+	if err != nil {
+		t.Fatalf("create item: %v", err)
+	}
+	// Operator cancellation: the ordinary guarded transition, which stamps no
+	// marker. Asserted, so the fixture cannot silently drift.
+	cancelled, err := campaigns.TransitionCampaignItem(ctx, it.ID, campaign.ItemStateCancelled)
+	if err != nil {
+		t.Fatalf("→cancelled: %v", err)
+	}
+	if cancelled.ResolvedBy != campaign.ResolvedByUnset {
+		t.Fatalf("operator-cancelled resolved_by = %q, want %q", cancelled.ResolvedBy, campaign.ResolvedByUnset)
+	}
+	if _, err := campaigns.TransitionCampaign(ctx, c.ID, campaign.StateRunning); err != nil {
+		t.Fatalf("campaign→running: %v", err)
+	}
+
+	st := getCampaignStatusBody(t, s, c.ID)
+	if st.NextAction.Action != "start_run" || st.NextAction.IssueRef != "issue:100" {
+		t.Fatalf("next_action = %+v, want start_run issue:100 (an operator cancellation is restartable)", st.NextAction)
+	}
+	w := postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:100","workflow_id":"feature_change","runner_kind":"local"}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("start = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+}
+
+// TestGetCampaignStatus_OutOfBandTerminal_NotPlanned_NotSettled pins the
+// class-B COMPLETED-ONLY guard (#3563): the out-of-band-terminal arm settles only
+// on a closed-as-COMPLETED issue, because a run-linked item is ALREADY terminal
+// and a not_planned/duplicate closure would settle it to a state it effectively
+// already holds — while reaching the guard-bypassing SettleCampaignItemOutOfBand,
+// whose only target is succeeded.
+//
+// Deleting the `if isClassB && target != ItemStateSucceeded` guard makes this
+// test go RED: the cancelled item settles SUCCEEDED off an abandonment.
+func TestGetCampaignStatus_OutOfBandTerminal_NotPlanned_NotSettled(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	rrepo := newFakeRepo()
+	aud := &campaignAuditRecorder{}
+	ghState := &runlessGitHub{installID: 4242, issues: map[int]runlessIssue{
+		100: {state: "closed", stateReason: "not_planned"},
+	}}
+	s := New(Config{CampaignRepo: crepo, RunRepo: rrepo, AuditRepo: aud, GitHub: newRunlessGitHubClient(t, ghState)})
+	runID := seedTerminalRun(t, rrepo, run.StateCancelled)
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		cItemWithRun("issue:100", nil, campaign.ItemStateCancelled, runID),
+	})
+	c.State = campaign.StateRunning
+
+	st := getCampaignStatusBody(t, s, c.ID)
+	if len(st.Items) != 1 {
+		t.Fatalf("items = %+v, want one", st.Items)
+	}
+	if got := st.Items[0].State; got != string(campaign.ItemStateCancelled) {
+		t.Errorf("item state = %q, want cancelled (a non-delivery closure must not settle a run-linked terminal item)", got)
+	}
+	if containsRef(st.Rollup.Done, "issue:100") {
+		t.Errorf("rollup.Done = %v, must NOT contain issue:100", st.Rollup.Done)
+	}
+	if crepo.settleOOBCalls != 0 {
+		t.Errorf("settleOOBCalls = %d, want 0 (the guard-bypassing settle is never reached)", crepo.settleOOBCalls)
+	}
+	if n := aud.count("campaign_issue_settled"); n != 0 {
+		t.Errorf("campaign_issue_settled = %d, want 0", n)
+	}
+}
+
+// TestGetCampaignStatus_OutOfBandTerminal_Completed_StampsResolvedBy is the
+// positive control paired with the guard above: a run-linked CANCELLED item whose
+// issue IS closed-as-completed still settles succeeded through
+// SettleCampaignItemOutOfBand, now ALSO carrying resolved_by=issue_closed and its
+// retained run_id in the audit. It must stay GREEN under the class-B guard's
+// deletion, which is what makes that RED discrimination.
+func TestGetCampaignStatus_OutOfBandTerminal_Completed_StampsResolvedBy(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	rrepo := newFakeRepo()
+	aud := &campaignAuditRecorder{}
+	ghState := &runlessGitHub{installID: 4242, issues: map[int]runlessIssue{
+		100: {state: "closed", stateReason: "completed"},
+	}}
+	s := New(Config{CampaignRepo: crepo, RunRepo: rrepo, AuditRepo: aud, GitHub: newRunlessGitHubClient(t, ghState)})
+	runID := seedTerminalRun(t, rrepo, run.StateCancelled)
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		cItemWithRun("issue:100", nil, campaign.ItemStateCancelled, runID),
+	})
+	c.State = campaign.StateRunning
+
+	st := getCampaignStatusBody(t, s, c.ID)
+	if len(st.Items) != 1 || st.Items[0].State != string(campaign.ItemStateSucceeded) {
+		t.Fatalf("items = %+v, want one succeeded item", st.Items)
+	}
+	if st.Items[0].ResolvedBy != campaign.ResolvedByIssueClosed {
+		t.Errorf("resolved_by = %q, want %q", st.Items[0].ResolvedBy, campaign.ResolvedByIssueClosed)
+	}
+	if crepo.settleOOBCalls != 1 {
+		t.Errorf("settleOOBCalls = %d, want 1", crepo.settleOOBCalls)
+	}
+	p := settledAuditPayload(t, aud)
+	if p["resolved_by"] != campaign.ResolvedByIssueClosed {
+		t.Errorf("audit resolved_by = %v, want %q", p["resolved_by"], campaign.ResolvedByIssueClosed)
+	}
+	if p["run_id"] != runID.String() {
+		t.Errorf("audit run_id = %v, want %s retained (the class-B distinguishing field)", p["run_id"], runID)
+	}
+	if p["state_reason"] != "completed" {
+		t.Errorf("audit state_reason = %v, want completed", p["state_reason"])
 	}
 }

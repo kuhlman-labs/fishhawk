@@ -155,7 +155,7 @@ func (q *Queries) CreateCampaignGuardedByGroomingCurrency(ctx context.Context, a
 const createCampaignItem = `-- name: CreateCampaignItem :one
 INSERT INTO campaign_items (id, campaign_id, issue_ref, depends_on, state, autonomy, queue_position)
 VALUES ($1, $2, $3, $4, $5, $6, $7)
-RETURNING id, campaign_id, issue_ref, depends_on, run_id, state, created_at, updated_at, pause_reason, autonomy, queue_position
+RETURNING id, campaign_id, issue_ref, depends_on, run_id, state, created_at, updated_at, pause_reason, autonomy, queue_position, resolved_by
 `
 
 type CreateCampaignItemParams struct {
@@ -191,6 +191,7 @@ func (q *Queries) CreateCampaignItem(ctx context.Context, arg CreateCampaignItem
 		&i.PauseReason,
 		&i.Autonomy,
 		&i.QueuePosition,
+		&i.ResolvedBy,
 	)
 	return i, err
 }
@@ -269,7 +270,7 @@ func (q *Queries) GetCampaignByIdempotencyKey(ctx context.Context, arg GetCampai
 }
 
 const getCampaignItem = `-- name: GetCampaignItem :one
-SELECT id, campaign_id, issue_ref, depends_on, run_id, state, created_at, updated_at, pause_reason, autonomy, queue_position FROM campaign_items WHERE id = $1
+SELECT id, campaign_id, issue_ref, depends_on, run_id, state, created_at, updated_at, pause_reason, autonomy, queue_position, resolved_by FROM campaign_items WHERE id = $1
 `
 
 func (q *Queries) GetCampaignItem(ctx context.Context, id uuid.UUID) (CampaignItem, error) {
@@ -287,12 +288,13 @@ func (q *Queries) GetCampaignItem(ctx context.Context, id uuid.UUID) (CampaignIt
 		&i.PauseReason,
 		&i.Autonomy,
 		&i.QueuePosition,
+		&i.ResolvedBy,
 	)
 	return i, err
 }
 
 const listCampaignItemsForCampaign = `-- name: ListCampaignItemsForCampaign :many
-SELECT id, campaign_id, issue_ref, depends_on, run_id, state, created_at, updated_at, pause_reason, autonomy, queue_position FROM campaign_items
+SELECT id, campaign_id, issue_ref, depends_on, run_id, state, created_at, updated_at, pause_reason, autonomy, queue_position, resolved_by FROM campaign_items
  WHERE campaign_id = $1
  ORDER BY queue_position ASC, created_at ASC, id ASC
 `
@@ -320,6 +322,7 @@ func (q *Queries) ListCampaignItemsForCampaign(ctx context.Context, campaignID u
 			&i.PauseReason,
 			&i.Autonomy,
 			&i.QueuePosition,
+			&i.ResolvedBy,
 		); err != nil {
 			return nil, err
 		}
@@ -332,7 +335,7 @@ func (q *Queries) ListCampaignItemsForCampaign(ctx context.Context, campaignID u
 }
 
 const listCampaignItemsForRun = `-- name: ListCampaignItemsForRun :many
-SELECT id, campaign_id, issue_ref, depends_on, run_id, state, created_at, updated_at, pause_reason, autonomy, queue_position FROM campaign_items
+SELECT id, campaign_id, issue_ref, depends_on, run_id, state, created_at, updated_at, pause_reason, autonomy, queue_position, resolved_by FROM campaign_items
  WHERE run_id = $1
  ORDER BY created_at ASC, id ASC
 `
@@ -361,6 +364,7 @@ func (q *Queries) ListCampaignItemsForRun(ctx context.Context, runID *uuid.UUID)
 			&i.PauseReason,
 			&i.Autonomy,
 			&i.QueuePosition,
+			&i.ResolvedBy,
 		); err != nil {
 			return nil, err
 		}
@@ -457,7 +461,7 @@ func (q *Queries) LockCampaignForUpdate(ctx context.Context, id uuid.UUID) (Camp
 }
 
 const lockCampaignItemForUpdate = `-- name: LockCampaignItemForUpdate :one
-SELECT id, campaign_id, issue_ref, depends_on, run_id, state, created_at, updated_at, pause_reason, autonomy, queue_position FROM campaign_items WHERE id = $1 FOR UPDATE
+SELECT id, campaign_id, issue_ref, depends_on, run_id, state, created_at, updated_at, pause_reason, autonomy, queue_position, resolved_by FROM campaign_items WHERE id = $1 FOR UPDATE
 `
 
 func (q *Queries) LockCampaignItemForUpdate(ctx context.Context, id uuid.UUID) (CampaignItem, error) {
@@ -475,6 +479,7 @@ func (q *Queries) LockCampaignItemForUpdate(ctx context.Context, id uuid.UUID) (
 		&i.PauseReason,
 		&i.Autonomy,
 		&i.QueuePosition,
+		&i.ResolvedBy,
 	)
 	return i, err
 }
@@ -483,7 +488,7 @@ const setCampaignItemPause = `-- name: SetCampaignItemPause :one
 UPDATE campaign_items
    SET state = 'paused', pause_reason = $2
  WHERE id = $1
-RETURNING id, campaign_id, issue_ref, depends_on, run_id, state, created_at, updated_at, pause_reason, autonomy, queue_position
+RETURNING id, campaign_id, issue_ref, depends_on, run_id, state, created_at, updated_at, pause_reason, autonomy, queue_position, resolved_by
 `
 
 type SetCampaignItemPauseParams struct {
@@ -509,6 +514,7 @@ func (q *Queries) SetCampaignItemPause(ctx context.Context, arg SetCampaignItemP
 		&i.PauseReason,
 		&i.Autonomy,
 		&i.QueuePosition,
+		&i.ResolvedBy,
 	)
 	return i, err
 }
@@ -517,7 +523,7 @@ const setCampaignItemRun = `-- name: SetCampaignItemRun :one
 UPDATE campaign_items
    SET run_id = $2
  WHERE id = $1
-RETURNING id, campaign_id, issue_ref, depends_on, run_id, state, created_at, updated_at, pause_reason, autonomy, queue_position
+RETURNING id, campaign_id, issue_ref, depends_on, run_id, state, created_at, updated_at, pause_reason, autonomy, queue_position, resolved_by
 `
 
 type SetCampaignItemRunParams struct {
@@ -543,6 +549,7 @@ func (q *Queries) SetCampaignItemRun(ctx context.Context, arg SetCampaignItemRun
 		&i.PauseReason,
 		&i.Autonomy,
 		&i.QueuePosition,
+		&i.ResolvedBy,
 	)
 	return i, err
 }
@@ -551,7 +558,7 @@ const setCampaignItemAutonomy = `-- name: SetCampaignItemAutonomy :one
 UPDATE campaign_items
    SET autonomy = $2
  WHERE id = $1
-RETURNING id, campaign_id, issue_ref, depends_on, run_id, state, created_at, updated_at, pause_reason, autonomy, queue_position
+RETURNING id, campaign_id, issue_ref, depends_on, run_id, state, created_at, updated_at, pause_reason, autonomy, queue_position, resolved_by
 `
 
 type SetCampaignItemAutonomyParams struct {
@@ -578,6 +585,48 @@ func (q *Queries) SetCampaignItemAutonomy(ctx context.Context, arg SetCampaignIt
 		&i.PauseReason,
 		&i.Autonomy,
 		&i.QueuePosition,
+		&i.ResolvedBy,
+	)
+	return i, err
+}
+
+const settleCampaignItemForClosedIssue = `-- name: SettleCampaignItemForClosedIssue :one
+UPDATE campaign_items
+   SET state = $2, resolved_by = $3
+ WHERE id = $1
+RETURNING id, campaign_id, issue_ref, depends_on, run_id, state, created_at, updated_at, pause_reason, autonomy, queue_position, resolved_by
+`
+
+type SettleCampaignItemForClosedIssueParams struct {
+	ID         uuid.UUID `json:"id"`
+	State      string    `json:"state"`
+	ResolvedBy string    `json:"resolved_by"`
+}
+
+// Settles an item off a CLOSED issue (#3563): writes the terminal state AND the
+// resolved_by provenance marker in ONE statement. The single statement is
+// load-bearing, not a convenience — a two-statement settle would leave a window
+// in which the item is already cancelled but carries no marker, and in that
+// window campaign.NextEligible offers it in the Restartable slice (start_run on
+// an abandoned issue). The caller applies the state guard under the existing
+// LockCampaignItemForUpdate FOR UPDATE lock and normalizes $3 to the
+// migration-0085 CHECK set before this write.
+func (q *Queries) SettleCampaignItemForClosedIssue(ctx context.Context, arg SettleCampaignItemForClosedIssueParams) (CampaignItem, error) {
+	row := q.db.QueryRow(ctx, settleCampaignItemForClosedIssue, arg.ID, arg.State, arg.ResolvedBy)
+	var i CampaignItem
+	err := row.Scan(
+		&i.ID,
+		&i.CampaignID,
+		&i.IssueRef,
+		&i.DependsOn,
+		&i.RunID,
+		&i.State,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.PauseReason,
+		&i.Autonomy,
+		&i.QueuePosition,
+		&i.ResolvedBy,
 	)
 	return i, err
 }
@@ -586,7 +635,7 @@ const updateCampaignItemState = `-- name: UpdateCampaignItemState :one
 UPDATE campaign_items
    SET state = $2
  WHERE id = $1
-RETURNING id, campaign_id, issue_ref, depends_on, run_id, state, created_at, updated_at, pause_reason, autonomy, queue_position
+RETURNING id, campaign_id, issue_ref, depends_on, run_id, state, created_at, updated_at, pause_reason, autonomy, queue_position, resolved_by
 `
 
 type UpdateCampaignItemStateParams struct {
@@ -609,6 +658,7 @@ func (q *Queries) UpdateCampaignItemState(ctx context.Context, arg UpdateCampaig
 		&i.PauseReason,
 		&i.Autonomy,
 		&i.QueuePosition,
+		&i.ResolvedBy,
 	)
 	return i, err
 }

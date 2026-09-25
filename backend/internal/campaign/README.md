@@ -70,6 +70,33 @@ No driving yet in the E25.2 keystone (that lands E25.3+): the keystone delivers 
 - `NextEligible([]*Item) Eligibility` partitions items into eligible/blocked/running/done/failed from each item's `State`, `DependsOn`, and `RunID`. An item is eligible only when every dependency succeeded; an absent dep ref is treated as not-satisfied, defensively.
 - `DeriveState([]*Item) State` reduces item states to the campaign state, emitting only `pending`/`running`/`succeeded`/`failed` — `cancelled` (and the proposal's `paused`) are operator-set overlays owned by Track C, never derived.
 
+## Issue-closed resolution: `resolved_by` and the dropped DAG gate (E72.24 / #3563)
+
+A campaign item can be resolved OUTSIDE the run lifecycle — the issue merged and closed by a maintainer PR, or abandoned as `not_planned` — and the backend's reconcile-on-read pass (`backend/internal/server/campaigns.go::settleIssueClosedItems`) is what recognises that. Three things this package owns:
+
+**The fail-closed closure enumeration.** `classifyClosedIssueOutcome(state, state_reason)` maps the forge's issue state onto the item's terminal state, and ONLY these three pairs settle anything:
+
+| issue state | `state_reason` | item settles |
+|---|---|---|
+| `closed` | `completed` | `succeeded` — delivered out of band |
+| `closed` | `not_planned` | `cancelled` — abandoned, never delivered |
+| `closed` | `duplicate` | `cancelled` — likewise a non-delivery closure; the DELIVERING issue is the duplicate's target |
+
+Everything else returns not-a-candidate and leaves the item exactly as it stands: an OPEN issue, a closed issue carrying `reopened`, a closed issue with an EMPTY reason, and any `state_reason` GitHub may add later. The default arm is a CONTROL, not a formality — it is what keeps an unrecognised closure from being read as a delivery, and it is why the change does not depend on GitHub's documented `state_reason` set being exhaustive. `duplicate` maps to `cancelled` rather than `succeeded` deliberately: folding it into `succeeded` would seed the engine's done-set and unblock dependents on work nobody did.
+
+**`Item.ResolvedBy` (`campaign_items.resolved_by`, migration 0085).** The closed value set is `{"" , "issue_closed"}`, pinned by the column CHECK and by `normalizeResolvedBy`. `""` is the unchanged default carried by every pre-0085 row and every non-settle path — an operator cancellation, a run-linked settle, a restart. `"issue_closed"` is stamped by BOTH settle arms, ATOMICALLY with the state write: the not-yet-run arm goes through `SettleCampaignItemForClosedIssue` (one `UPDATE … SET state, resolved_by`), the out-of-band-terminal arm (#2029) through `SettleCampaignItemOutOfBand`, which stamps the same marker while retaining its run link. The single statement is load-bearing: a two-statement settle would leave a window in which the item is already `cancelled` and carries no marker, and in that window `NextEligible` offers it as Restartable.
+
+**Why the marker exists — one control, two refusals.** `NextEligible`'s cancelled arm diverts a deps-satisfied, non-human-led cancelled item into `Restartable` so `next_action` surfaces `start_run`. An issue-closed cancellation must NOT be offered: the work was abandoned at the forge, so there is nothing to restart. Without a durable marker that cancellation is byte-indistinguishable from an operator cancellation, which legitimately IS restartable. The suppression is the conjunct `it.ResolvedBy != ResolvedByIssueClosed` — and because `handleStartCampaignItemRun`'s DAG gate is that SAME `NextEligible` call, the one predicate also makes the operator start verb refuse the item (409) without a second guard.
+
+**The settle carries NO `depends_on` gate — this REPLACES #1558's wave-order rule.** #1558 refused to settle a closed item until every `depends_on` ref had succeeded, to "preserve wave order". That rationale does not hold and is retired: the campaign DAG orders DISPATCH — which item may mint a RUN next — and a settle mints no run. It only recognises an outcome the forge has ALREADY recorded. Holding the recognition back parked a closed item non-terminal for as long as its dependency stayed open, and FOREVER when that dependency was human-led-and-open, cancelled, or itself abandoned (the reported instance parked four days behind its dependency's own settle). So a closed issue settles on the poll that observes the closure, whatever its deps are doing. Two consequences, both intended:
+
+- a dependent of a settled-SUCCEEDED item becomes `Eligible` on the SAME poll, one poll earlier than before. Correct: its declared dependency IS delivered, which is precisely what closed-as-completed records.
+- a dependent of a settled-CANCELLED item stays `Blocked`, because a cancelled ref never enters `NextEligible`'s done-set. An abandoned dependency unblocks nothing.
+
+With the gate gone the #1558 in-memory FIXPOINT loop is gone too: it existed solely to converge a closed-C-depends_on-closed-D chain within one read DESPITE the gate, and with no gate to converge against a single pass settles every candidate regardless of iteration order.
+
+**Transition-table note.** `pending → cancelled` and `blocked → cancelled` were already admitted by `campaignItemTransitions` as MANUAL halts; the issue-closed settle is a second, NON-manual producer of those edges. No table change was needed — only the comments naming the new producer.
+
 ## The third campaign source: an approved grooming order (E54.6 / #2238)
 
 `POST /v0/campaigns` accepts three mutually-exclusive sources: an `epic_ref` to

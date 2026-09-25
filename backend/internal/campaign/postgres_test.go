@@ -1464,6 +1464,271 @@ func TestPostgres_SettleCampaignItemOutOfBand(t *testing.T) {
 	}
 }
 
+// TestPostgres_SettleCampaignItemOutOfBand_StampsResolvedBy pins the #3563
+// addition to the #2029 out-of-band settle: it now stamps
+// resolved_by=issue_closed WHILE retaining the run link. Both properties are
+// asserted on the PERSISTED row, not just the returned one, because the marker
+// and the link are what the engine and the operator surface read back.
+func TestPostgres_SettleCampaignItemOutOfBand_StampsResolvedBy(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+	runRepo := run.NewPostgresRepository(pool)
+	ctx := context.Background()
+	c := makeCampaign(t, repo)
+
+	r, err := runRepo.CreateRun(ctx, run.CreateRunParams{
+		Repo:          "kuhlman-labs/fishhawk",
+		WorkflowID:    "feature_change",
+		WorkflowSHA:   "deadbeef",
+		TriggerSource: run.TriggerCLI,
+	})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	it, err := repo.CreateCampaignItem(ctx, campaign.CreateCampaignItemParams{CampaignID: c.ID, IssueRef: "issue:oob"})
+	if err != nil {
+		t.Fatalf("create item: %v", err)
+	}
+	// A fresh item carries the '' default — the pre-settle baseline.
+	if it.ResolvedBy != campaign.ResolvedByUnset {
+		t.Fatalf("fresh item resolved_by = %q, want %q", it.ResolvedBy, campaign.ResolvedByUnset)
+	}
+	if _, err := repo.SetCampaignItemRun(ctx, it.ID, &r.ID); err != nil {
+		t.Fatalf("link run: %v", err)
+	}
+	for _, to := range []campaign.ItemState{campaign.ItemStateRunning, campaign.ItemStateCancelled} {
+		if _, err := repo.TransitionCampaignItem(ctx, it.ID, to); err != nil {
+			t.Fatalf("→%s: %v", to, err)
+		}
+	}
+
+	settled, err := repo.SettleCampaignItemOutOfBand(ctx, it.ID)
+	if err != nil {
+		t.Fatalf("settle: %v", err)
+	}
+	if settled.ResolvedBy != campaign.ResolvedByIssueClosed {
+		t.Errorf("settle resolved_by = %q, want %q", settled.ResolvedBy, campaign.ResolvedByIssueClosed)
+	}
+	got, err := repo.GetCampaignItem(ctx, it.ID)
+	if err != nil {
+		t.Fatalf("re-read: %v", err)
+	}
+	if got.State != campaign.ItemStateSucceeded {
+		t.Errorf("persisted state = %q, want succeeded", got.State)
+	}
+	if got.ResolvedBy != campaign.ResolvedByIssueClosed {
+		t.Errorf("persisted resolved_by = %q, want %q", got.ResolvedBy, campaign.ResolvedByIssueClosed)
+	}
+	if got.RunID == nil || *got.RunID != r.ID {
+		t.Errorf("persisted run_id = %v, want %s RETAINED", got.RunID, r.ID)
+	}
+}
+
+// TestPostgres_SettleCampaignItemForClosedIssue pins the #3563 not-yet-run
+// issue-closed settle: every admitted (from, to) pair round-trips with the
+// resolved_by marker written in the SAME statement as the state, and every
+// refusal leaves the row byte-unchanged.
+//
+// ATOMICITY is asserted on the RETURNED row (one statement, so the returned row
+// carries BOTH the new state and the marker) and re-asserted on the persisted
+// row: a two-statement settle would be observable as a row whose state moved
+// while resolved_by stayed ” — the window in which NextEligible would offer an
+// abandoned issue as Restartable.
+func TestPostgres_SettleCampaignItemForClosedIssue(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+	runRepo := run.NewPostgresRepository(pool)
+	ctx := context.Background()
+	c := makeCampaign(t, repo)
+
+	// mkItem creates a run-less item and drives it to `from` (pending is the
+	// create default; blocked is one valid transition away).
+	mkItem := func(t *testing.T, ref string, from campaign.ItemState) *campaign.Item {
+		t.Helper()
+		it, err := repo.CreateCampaignItem(ctx, campaign.CreateCampaignItemParams{CampaignID: c.ID, IssueRef: ref})
+		if err != nil {
+			t.Fatalf("create item %s: %v", ref, err)
+		}
+		if from != campaign.ItemStatePending {
+			if _, err := repo.TransitionCampaignItem(ctx, it.ID, from); err != nil {
+				t.Fatalf("%s →%s: %v", ref, from, err)
+			}
+		}
+		return it
+	}
+
+	// --- The four admitted (from, to) pairs.
+	for _, tc := range []struct {
+		name string
+		from campaign.ItemState
+		to   campaign.ItemState
+	}{
+		{"pending_to_succeeded", campaign.ItemStatePending, campaign.ItemStateSucceeded},
+		{"pending_to_cancelled", campaign.ItemStatePending, campaign.ItemStateCancelled},
+		{"blocked_to_succeeded", campaign.ItemStateBlocked, campaign.ItemStateSucceeded},
+		{"blocked_to_cancelled", campaign.ItemStateBlocked, campaign.ItemStateCancelled},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			it := mkItem(t, "issue:"+tc.name, tc.from)
+			settled, err := repo.SettleCampaignItemForClosedIssue(ctx, it.ID, tc.to)
+			if err != nil {
+				t.Fatalf("settle: %v", err)
+			}
+			// Atomicity: ONE statement, so the returned row carries both.
+			if settled.State != tc.to {
+				t.Errorf("returned state = %q, want %q", settled.State, tc.to)
+			}
+			if settled.ResolvedBy != campaign.ResolvedByIssueClosed {
+				t.Errorf("returned resolved_by = %q, want %q", settled.ResolvedBy, campaign.ResolvedByIssueClosed)
+			}
+			got, err := repo.GetCampaignItem(ctx, it.ID)
+			if err != nil {
+				t.Fatalf("re-read: %v", err)
+			}
+			if got.State != tc.to || got.ResolvedBy != campaign.ResolvedByIssueClosed {
+				t.Errorf("persisted = state %q resolved_by %q, want %q / %q", got.State, got.ResolvedBy, tc.to, campaign.ResolvedByIssueClosed)
+			}
+			// The run link is untouched by this arm (a class-A item has none).
+			if got.RunID != nil {
+				t.Errorf("persisted run_id = %v, want nil (class A is run-less)", got.RunID)
+			}
+		})
+	}
+
+	// --- Refused FROM-states. Each is asserted on COMMITTED STATE as well as on
+	// error identity: a guard that fired and then rolled back returns the same
+	// error as one that never existed, so the row is re-read.
+	var ite campaign.InvalidTransitionError
+	t.Run("refuses_running_from", func(t *testing.T) {
+		r, err := runRepo.CreateRun(ctx, run.CreateRunParams{
+			Repo: "kuhlman-labs/fishhawk", WorkflowID: "feature_change", WorkflowSHA: "deadbeef", TriggerSource: run.TriggerCLI,
+		})
+		if err != nil {
+			t.Fatalf("create run: %v", err)
+		}
+		it := mkItem(t, "issue:refuse-running", campaign.ItemStatePending)
+		if _, err := repo.SetCampaignItemRun(ctx, it.ID, &r.ID); err != nil {
+			t.Fatalf("link run: %v", err)
+		}
+		if _, err := repo.TransitionCampaignItem(ctx, it.ID, campaign.ItemStateRunning); err != nil {
+			t.Fatalf("→running: %v", err)
+		}
+		if _, err := repo.SettleCampaignItemForClosedIssue(ctx, it.ID, campaign.ItemStateSucceeded); !errors.As(err, &ite) {
+			t.Fatalf("err = %v, want InvalidTransitionError", err)
+		} else if ite.Kind != "campaign_item" || ite.From != "running" || ite.To != "succeeded" {
+			t.Errorf("err = %+v, want campaign_item running→succeeded", ite)
+		}
+		if got, _ := repo.GetCampaignItem(ctx, it.ID); got.State != campaign.ItemStateRunning || got.ResolvedBy != campaign.ResolvedByUnset {
+			t.Errorf("row after refusal = state %q resolved_by %q, want running / %q (nothing written)", got.State, got.ResolvedBy, campaign.ResolvedByUnset)
+		}
+	})
+	t.Run("refuses_succeeded_from", func(t *testing.T) {
+		it := mkItem(t, "issue:refuse-succeeded", campaign.ItemStatePending)
+		if _, err := repo.TransitionCampaignItem(ctx, it.ID, campaign.ItemStateSucceeded); err != nil {
+			t.Fatalf("→succeeded: %v", err)
+		}
+		if _, err := repo.SettleCampaignItemForClosedIssue(ctx, it.ID, campaign.ItemStateSucceeded); !errors.As(err, &ite) {
+			t.Fatalf("err = %v, want InvalidTransitionError", err)
+		}
+		if got, _ := repo.GetCampaignItem(ctx, it.ID); got.ResolvedBy != campaign.ResolvedByUnset {
+			t.Errorf("resolved_by after refusal = %q, want %q (nothing written)", got.ResolvedBy, campaign.ResolvedByUnset)
+		}
+	})
+	t.Run("refuses_paused_from", func(t *testing.T) {
+		r, err := runRepo.CreateRun(ctx, run.CreateRunParams{
+			Repo: "kuhlman-labs/fishhawk", WorkflowID: "feature_change", WorkflowSHA: "deadbeef", TriggerSource: run.TriggerCLI,
+		})
+		if err != nil {
+			t.Fatalf("create run: %v", err)
+		}
+		it := mkItem(t, "issue:refuse-paused", campaign.ItemStatePending)
+		if _, err := repo.SetCampaignItemRun(ctx, it.ID, &r.ID); err != nil {
+			t.Fatalf("link run: %v", err)
+		}
+		if _, err := repo.TransitionCampaignItem(ctx, it.ID, campaign.ItemStateRunning); err != nil {
+			t.Fatalf("→running: %v", err)
+		}
+		if _, err := repo.PauseCampaignItem(ctx, it.ID, campaign.PauseReason{PageEvent: "campaign_gate_paged"}); err != nil {
+			t.Fatalf("→paused: %v", err)
+		}
+		if _, err := repo.SettleCampaignItemForClosedIssue(ctx, it.ID, campaign.ItemStateSucceeded); !errors.As(err, &ite) {
+			t.Fatalf("err = %v, want InvalidTransitionError", err)
+		}
+		if got, _ := repo.GetCampaignItem(ctx, it.ID); got.State != campaign.ItemStatePaused || got.ResolvedBy != campaign.ResolvedByUnset {
+			t.Errorf("row after refusal = state %q resolved_by %q, want paused / %q", got.State, got.ResolvedBy, campaign.ResolvedByUnset)
+		}
+	})
+
+	// --- Refused `to`: an out-of-set target. pending→running is a VALID
+	// lifecycle edge, so this refusal is the `to` guard's alone and not the
+	// transition table's — which is why the row is re-read: an accepted `to`
+	// would have moved the item to running AND stamped a marker.
+	t.Run("refuses_out_of_set_to", func(t *testing.T) {
+		it := mkItem(t, "issue:refuse-to", campaign.ItemStatePending)
+		if _, err := repo.SettleCampaignItemForClosedIssue(ctx, it.ID, campaign.ItemStateRunning); !errors.As(err, &ite) {
+			t.Fatalf("err = %v, want InvalidTransitionError", err)
+		} else if ite.From != "pending" || ite.To != "running" {
+			t.Errorf("err = %+v, want campaign_item pending→running", ite)
+		}
+		if got, _ := repo.GetCampaignItem(ctx, it.ID); got.State != campaign.ItemStatePending || got.ResolvedBy != campaign.ResolvedByUnset {
+			t.Errorf("row after refusal = state %q resolved_by %q, want pending / %q (nothing written)", got.State, got.ResolvedBy, campaign.ResolvedByUnset)
+		}
+	})
+
+	// --- A missing item.
+	t.Run("missing_item", func(t *testing.T) {
+		if _, err := repo.SettleCampaignItemForClosedIssue(ctx, uuid.New(), campaign.ItemStateSucceeded); !errors.Is(err, campaign.ErrNotFound) {
+			t.Errorf("err = %v, want ErrNotFound", err)
+		}
+	})
+}
+
+// TestPostgres_SettleCampaignItemForClosedIssue_NormalizesMarker exercises the
+// campaign.normalizeResolvedBy guard against the REAL migration-0085 CHECK.
+//
+// The normalizer and the CHECK are two layers of the same fail-closed posture:
+// the CHECK rejects an out-of-set marker at write time (pinned by
+// backend/internal/postgres/postgres_test.go's reversal test, which inserts
+// 'bogus' directly), and the normalizer keeps an out-of-set value from ever
+// REACHING it and turning a settle into a failed write. Here the settle path is
+// driven end to end and the persisted marker asserted to be exactly the
+// in-set value — i.e. the write was ACCEPTED by the CHECK, which is only true
+// because the value handed to the column is normalized.
+func TestPostgres_SettleCampaignItemForClosedIssue_NormalizesMarker(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+	ctx := context.Background()
+	c := makeCampaign(t, repo)
+
+	it, err := repo.CreateCampaignItem(ctx, campaign.CreateCampaignItemParams{CampaignID: c.ID, IssueRef: "issue:normalize"})
+	if err != nil {
+		t.Fatalf("create item: %v", err)
+	}
+	settled, err := repo.SettleCampaignItemForClosedIssue(ctx, it.ID, campaign.ItemStateCancelled)
+	if err != nil {
+		t.Fatalf("settle: %v", err)
+	}
+	// The persisted marker is exactly one of the CHECK-permitted values — never
+	// a value the column would have rejected, and never silently empty.
+	switch settled.ResolvedBy {
+	case campaign.ResolvedByIssueClosed:
+		// expected
+	case campaign.ResolvedByUnset:
+		t.Errorf("resolved_by = %q, want %q (an issue-closed settle must be marked)", settled.ResolvedBy, campaign.ResolvedByIssueClosed)
+	default:
+		t.Errorf("resolved_by = %q, outside the migration-0085 CHECK set", settled.ResolvedBy)
+	}
+	// Raw read-back through the pool: the column really holds the in-set value,
+	// independent of the domain mapping.
+	var raw string
+	if err := pool.QueryRow(ctx, `SELECT resolved_by FROM campaign_items WHERE id = $1`, it.ID).Scan(&raw); err != nil {
+		t.Fatalf("raw select: %v", err)
+	}
+	if raw != string(campaign.ResolvedByIssueClosed) {
+		t.Errorf("column resolved_by = %q, want %q", raw, campaign.ResolvedByIssueClosed)
+	}
+}
+
 // TestPostgres_RunLinkage_EndToEnd spans domain → persistence → run linkage:
 // it inserts a REAL runs row (via the run repo, exercising the cross-package
 // boundary), attaches it to a campaign item, and asserts both forward

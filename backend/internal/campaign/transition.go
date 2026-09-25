@@ -67,7 +67,13 @@ func ValidCampaignTransition(from, to State) bool {
 //	reconcile-on-read settle pass (#1558) settles it succeeded WITHOUT it
 //	ever running.
 //
-// pending → cancelled: manually halted before running.
+// pending → cancelled: manually halted before running — OR (#3563) settled by
+//
+//	the reconcile-on-read issue-closed pass because the item's issue was closed
+//	not_planned/duplicate: a NON-manual producer of this edge. Such a settle
+//	additionally stamps resolved_by=issue_closed, which suppresses the
+//	Restartable offer NextEligible would otherwise make.
+//
 // pending → failed:    setup-time failure.
 // blocked → pending:   a dependency cleared; the item is admissible again.
 // blocked → running:   the last dependency cleared and the run dispatched.
@@ -76,7 +82,11 @@ func ValidCampaignTransition(from, to State) bool {
 //	that was blocked when its issue closed-as-completed (its deps having since
 //	cleared, the settle pass only fires on a deps-satisfied item).
 //
-// blocked → cancelled: manually halted while blocked.
+// blocked → cancelled: manually halted while blocked — OR, like the pending
+//
+//	edge above, the #3563 issue-closed settle of a not_planned/duplicate
+//	closure, which is likewise non-manual and stamps resolved_by=issue_closed.
+//
 // running → succeeded: the item's run succeeded.
 // running → failed:    the item's run failed.
 // running → cancelled: manually halted mid-flight.

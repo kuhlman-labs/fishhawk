@@ -147,6 +147,20 @@ UPDATE campaign_items
  WHERE id = $1
 RETURNING *;
 
+-- name: SettleCampaignItemForClosedIssue :one
+-- Settles an item off a CLOSED issue (#3563): writes the terminal state AND the
+-- resolved_by provenance marker in ONE statement. The single statement is
+-- load-bearing, not a convenience — a two-statement settle would leave a window
+-- in which the item is already cancelled but carries no marker, and in that
+-- window campaign.NextEligible offers it in the Restartable slice (start_run on
+-- an abandoned issue). The caller applies the state guard under the existing
+-- LockCampaignItemForUpdate FOR UPDATE lock and normalizes $3 to the
+-- migration-0085 CHECK set before this write.
+UPDATE campaign_items
+   SET state = $2, resolved_by = $3
+ WHERE id = $1
+RETURNING *;
+
 -- name: SetCampaignItemAutonomy :one
 -- Sets the item's autonomy tier — routing metadata re-read from the issue's
 -- autonomy:* label on the reconcile-on-read refresh (#2355). NOT a lifecycle

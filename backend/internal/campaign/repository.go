@@ -343,7 +343,34 @@ type Repository interface {
 	// preserved as provenance to the run that was re-shaped and delivered
 	// out-of-band). A concurrent second call re-reads the now-succeeded row under
 	// the lock and is rejected.
+	// It ALSO stamps the resolved_by provenance marker (ResolvedByIssueClosed)
+	// atomically with the state write (#3563), so an out-of-band settle is
+	// recorded as issue-closed exactly like the not-yet-run arm below.
 	SettleCampaignItemOutOfBand(ctx context.Context, id uuid.UUID) (*Item, error)
+
+	// SettleCampaignItemForClosedIssue settles a NOT-YET-RUN item (pending or
+	// blocked) off a CLOSED issue and stamps campaign_items.resolved_by =
+	// ResolvedByIssueClosed in the SAME statement (#3563 / migration 0085),
+	// under the same SELECT … FOR UPDATE lock as the other item transitions.
+	//
+	// `to` is the issue-closure classifier's target: ItemStateSucceeded for a
+	// closed-as-completed issue (delivery recognised out of band) and
+	// ItemStateCancelled for a not_planned/duplicate closure (the work was
+	// abandoned, never delivered). Both edges are already admitted by
+	// campaignItemTransitions, so unlike RestartCampaignItem and
+	// SettleCampaignItemOutOfBand this method bypasses NO guard — it exists
+	// because the marker must be written ATOMICALLY with the state. A
+	// two-statement settle would leave a window in which the item is already
+	// cancelled and carries no marker, and in that window campaign.NextEligible
+	// offers it as Restartable — start_run on an abandoned issue, the exact
+	// thing the marker exists to prevent.
+	//
+	// Guards: `from` must be in {pending, blocked} and `to` in {succeeded,
+	// cancelled}; any other pair is InvalidTransitionError{Kind:"campaign_item"}
+	// and a missing item is ErrNotFound. The marker is always
+	// ResolvedByIssueClosed, normalized so an out-of-set value can never trip
+	// the migration-0085 CHECK.
+	SettleCampaignItemForClosedIssue(ctx context.Context, id uuid.UUID, to ItemState) (*Item, error)
 }
 
 // AccountGetter is the cheap tenant-account lookup (ADR-057 / #1830) that

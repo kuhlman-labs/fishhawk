@@ -189,9 +189,16 @@ type campaignItemResponse struct {
 	// (campaign_items.queue_position, migration 0074) — for a grooming-sourced
 	// campaign, its ratified rank. Always present: it is the field that makes
 	// the queue order legible without inferring it from the array index.
-	Position  int       `json:"position"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	Position int `json:"position"`
+	// ResolvedBy is the durable provenance of HOW the item reached its terminal
+	// state (campaign_items.resolved_by, migration 0085 / #3563). The only
+	// non-empty value today is "issue_closed": the reconcile-on-read
+	// issue-closed pass settled it off the forge's issue state. omitempty, so
+	// an item with no recorded provenance — every pre-0085 row, every
+	// operator/run-driven outcome — keeps its exact pre-#3563 wire shape.
+	ResolvedBy string    `json:"resolved_by,omitempty"`
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
 }
 
 // campaignRollupPayload is the engine's readiness partition over a
@@ -368,6 +375,7 @@ func toCampaignItemResponse(it *campaign.Item) campaignItemResponse {
 		State:       string(it.State),
 		PauseReason: it.PauseReason,
 		Position:    it.Position,
+		ResolvedBy:  it.ResolvedBy,
 		CreatedAt:   it.CreatedAt,
 		UpdatedAt:   it.UpdatedAt,
 	}
@@ -2808,16 +2816,68 @@ func (s *Server) reconcileCampaignItemsOnRead(ctx context.Context, c *campaign.C
 	return true
 }
 
-// settleIssueClosedItems is reconcile-on-read pass 2 (#1558, extended #2029):
-// the issue-closed settle for a campaign item delivered OUTSIDE the run
-// lifecycle. It reads the item's GitHub issue and settles the item succeeded
-// ONLY when the issue is CLOSED as completed (state_reason=completed), for two
-// deps-satisfied candidate classes:
+// issueClosedCandidate is one item settleIssueClosedItems' Phase 1 selected for
+// settling, carrying the classifier's target state and the issue's real
+// state_reason (which the audit payload reports verbatim rather than assuming a
+// completion).
+type issueClosedCandidate struct {
+	item        *campaign.Item
+	target      campaign.ItemState
+	stateReason string
+}
+
+// classifyClosedIssueOutcome maps a forge issue's (state, state_reason) onto the
+// campaign-item terminal state its closure means, for the reconcile-on-read
+// issue-closed settle (#1558/#2029, extended #3563). It returns ok=false when
+// the issue is NOT a settle candidate at all, which leaves the item exactly as
+// it stands today.
 //
-//	A (run-less): a run-less pending/blocked item — a human-led (autonomy:low)
-//	  issue merged and closed by a maintainer PR OUTSIDE any run. Settled via the
-//	  guarded TransitionCampaignItem(->succeeded); its campaign_issue_settled
-//	  marker carries settled_via=issue_closed and NO run_id.
+// The enumeration is FAIL-CLOSED — only three (state, state_reason) pairs
+// settle anything:
+//
+//	closed + "completed"  -> succeeded: the work was DELIVERED out of band.
+//	closed + "not_planned" -> cancelled: the work was ABANDONED. It was never
+//	  delivered, so settling it succeeded would seed the engine's done-set and
+//	  unblock dependents on work nobody did.
+//	closed + "duplicate"   -> cancelled: likewise a NON-delivery closure. The
+//	  delivering issue is the duplicate's target, not this item.
+//
+// EVERYTHING ELSE returns ok=false and is left unsettled: an OPEN issue, a
+// closed issue carrying "reopened", a closed issue with an EMPTY reason, and
+// any state_reason GitHub may add in future. That default arm is the control
+// that keeps an unrecognised closure from being silently read as a delivery —
+// the fail-closed direction — and it is what makes this function safe against
+// the documented value set turning out not to be exhaustive.
+func classifyClosedIssueOutcome(state, stateReason string) (campaign.ItemState, bool) {
+	if state != "closed" {
+		return "", false
+	}
+	switch stateReason {
+	case "completed":
+		return campaign.ItemStateSucceeded, true
+	case "not_planned", "duplicate":
+		return campaign.ItemStateCancelled, true
+	default:
+		return "", false
+	}
+}
+
+// settleIssueClosedItems is reconcile-on-read pass 2 (#1558, extended #2029 and
+// #3563): the issue-closed settle for a campaign item resolved OUTSIDE the run
+// lifecycle. It reads the item's forge issue and settles it off the CLOSURE the
+// forge already recorded, per classifyClosedIssueOutcome's fail-closed
+// enumeration — closed+completed settles SUCCEEDED (delivered out of band),
+// closed+not_planned and closed+duplicate settle CANCELLED (abandoned, never
+// delivered). Any other issue state leaves the item exactly as it stands.
+//
+// Two candidate classes settle, both stamped resolved_by=issue_closed:
+//
+//	A (not-yet-run): a run-less pending/blocked item — e.g. a human-led
+//	  (autonomy:low) issue merged and closed by a maintainer PR OUTSIDE any run,
+//	  or an issue abandoned before anyone started it. Settled via
+//	  SettleCampaignItemForClosedIssue, which writes the target state and the
+//	  provenance marker in ONE statement; its campaign_issue_settled marker
+//	  carries settled_via=issue_closed and NO run_id.
 //	B (out-of-band terminal, #2029): a run-LINKED item whose linked run went
 //	  terminal-non-succeeded (cancelled/failed) — a re-shaped-then-delivered item
 //	  whose dead run left it terminal but whose issue is now closed-as-completed.
@@ -2825,9 +2885,36 @@ func (s *Server) reconcileCampaignItemsOnRead(ctx context.Context, c *campaign.C
 //	  every terminal from), so it is settled via the guard-bypassing
 //	  SettleCampaignItemOutOfBand, which RETAINS the run link; its marker carries
 //	  settled_via=issue_closed AND the retained run_id (the distinguishing field).
+//	  Class B settles only on a COMPLETED closure: a not_planned/duplicate
+//	  closure of an already-terminal item would change nothing (the item is
+//	  already cancelled/failed), so it is not a candidate.
 //
-// Returns whether it settled anything so the caller re-derives and re-reads. An
-// open issue or a not_planned closure settles NEITHER class.
+// WHY A CANCELLED SETTLE IS NOT RE-OFFERED FOR RESTART. An item cancelled here
+// was ABANDONED at the forge, unlike an operator cancellation, which is merely
+// halted and has a forward path. The resolved_by marker written atomically with
+// the state is what campaign.NextEligible reads to keep it out of the
+// Restartable slice — and because handleStartCampaignItemRun's DAG gate is that
+// SAME NextEligible call, one control also makes the operator start verb refuse
+// it.
+//
+// NO depends_on GATE ON THE SETTLE DECISION (#3563 — this REPLACES #1558's
+// wave-order rule). #1558 refused to settle a closed item until every depends_on
+// ref had succeeded, to "preserve wave order". That rationale does not hold: the
+// campaign DAG orders DISPATCH — which item may mint a RUN next — and a settle
+// mints no run. It only recognises an outcome the forge has ALREADY recorded.
+// Holding the recognition back parked a closed item non-terminal for as long as
+// its dependency stayed open, and forever when that dependency was human-led,
+// cancelled, or abandoned (the #3563 report: an item parked four days behind a
+// dependency's own settle). So a closed issue settles on the poll that observes
+// the closure, whatever its deps are doing. Two consequences, both intended:
+//
+//   - a dependent of a settled-SUCCEEDED item becomes Eligible on the SAME poll,
+//     one poll earlier than before. That is correct — its declared dependency IS
+//     delivered, which is precisely what closed-as-completed records.
+//   - a dependent of a settled-CANCELLED item stays BLOCKED, because a cancelled
+//     ref never enters the done-set. An abandoned dependency unblocks nothing.
+//
+// Returns whether it settled anything so the caller re-derives and re-reads.
 //
 // SOLE SETTLE SITE: reconcileCampaignItemsOnRead (this pass's only caller) is
 // the ONLY place a run-less issue-closed item is settled. The create path
@@ -2836,22 +2923,20 @@ func (s *Server) reconcileCampaignItemsOnRead(ctx context.Context, c *campaign.C
 // reads status immediately after assembly, so a chain of already-closed
 // children converges on that first read (#1758).
 //
-// SINGLE-READ FIXPOINT: closed-completed status is resolved via GitHub at most
-// ONCE per item in Phase 1, then Phase 2 settles to a fixpoint purely in-memory
-// — repeatedly settling any closed-completed candidate whose deps are now in
-// the done-set and adding its ref, until a full pass settles nothing new. So a
-// closed child C that depends_on a closed child D converges in the SAME read
-// regardless of iteration order, instead of one dependency-hop per read.
+// SINGLE READ, SINGLE PASS: closed status is resolved via GitHub at most ONCE
+// per item, and — with the depends_on gate gone — every candidate settles in ONE
+// in-memory pass. The #1558 fixpoint loop existed solely to converge a
+// closed-C-depends_on-closed-D chain within one read despite that gate; with no
+// gate to converge against, a single pass settles every candidate regardless of
+// iteration order.
 //
 // BEST-EFFORT and FAIL-CLOSED: every guard leaves the item unsettled and NEVER
 // fails the read — a nil GitHub client, a repo not in owner/name form, an
 // installation-resolution error, a GetIssue error, an unparseable issue_ref, an
-// open issue, or a not_planned closure each logs (where useful) and skips. The
-// repo installation is resolved at most ONCE per reconcile (lazily, only when a
-// candidate item exists) and cached across items; the pass short-circuits
-// entirely when GitHub is unwired. The depends_on DAG-order guard is preserved:
-// a CLOSED item whose dependency is still OPEN never enters the done-set and so
-// stays Blocked, never Eligible.
+// open issue, and any unrecognised state_reason each logs (where useful) and
+// skips. The repo installation is resolved at most ONCE per reconcile (lazily,
+// only when a candidate item exists) and cached across items; the pass
+// short-circuits entirely when GitHub is unwired.
 func (s *Server) settleIssueClosedItems(ctx context.Context, c *campaign.Campaign, items []*campaign.Item) bool {
 	if s.cfg.GitHub == nil {
 		return false
@@ -2861,19 +2946,6 @@ func (s *Server) settleIssueClosedItems(ctx context.Context, c *campaign.Campaig
 		s.cfg.Logger.Warn("reconcile-on-read: campaign repo not in owner/name form; run-less settle pass skipped",
 			"campaign_id", c.ID.String(), "repo", c.Repo)
 		return false
-	}
-
-	// Done-set: refs of items that have already succeeded (the
-	// firstUnmetDependency / NextEligible idiom). A dependency is satisfied iff
-	// its ref is in this set; an absent ref is therefore not-satisfied for free.
-	// Seeded from the already-succeeded items, then GROWN in Phase 2 as each
-	// candidate settles — the growth is what converges a run-less closed-closed
-	// chain within this single read.
-	done := make(map[string]bool, len(items))
-	for _, it := range items {
-		if it.State == campaign.ItemStateSucceeded {
-			done[it.IssueRef] = true
-		}
 	}
 
 	// Phase 1 (GitHub reads, at most ONCE per item): the ONE GetIssue per item
@@ -2892,7 +2964,7 @@ func (s *Server) settleIssueClosedItems(ctx context.Context, c *campaign.Campaig
 	// Every fail-closed guard applies here EXCEPT the depends_on gate — Phase 2
 	// enforces that in-memory so the closed-status read happens exactly once per item
 	// and the fixpoint never re-reads GitHub.
-	var candidates []*campaign.Item
+	var candidates []issueClosedCandidate
 	fetched := make(map[uuid.UUID]*githubclient.Issue, len(items))
 	var scope forge.CredentialScope
 	instResolved := false
@@ -2943,16 +3015,26 @@ func (s *Server) settleIssueClosedItems(ctx context.Context, c *campaign.Campaig
 		}
 		// Keep the issue for the autonomy refresh (its Labels carry the live tier).
 		fetched[it.ID] = issue
-		// Settle candidacy is class A/B AND a genuine completion: closed AND
-		// state_reason=completed. An open issue or a not_planned closure is left
-		// unsettled (but its tier is still refreshed below from the same fetch).
+		// Settle candidacy is class A/B AND a recognised closure. An open issue,
+		// or a closed one whose state_reason the fail-closed classifier does not
+		// recognise, is left unsettled (but its tier is still refreshed below
+		// from the same fetch).
 		if !isClassA && !isClassB {
 			continue
 		}
-		if issue.State != "closed" || issue.StateReason != "completed" {
+		target, ok := classifyClosedIssueOutcome(issue.State, issue.StateReason)
+		if !ok {
 			continue
 		}
-		candidates = append(candidates, it)
+		// Class B is already TERMINAL (cancelled/failed). Only a COMPLETED
+		// closure changes anything for it — the out-of-band delivery this arm
+		// exists for. A not_planned/duplicate closure of an already-terminal item
+		// would settle it to a state it is effectively already in, so it is not a
+		// candidate and the guard-bypassing settle is never reached.
+		if isClassB && target != campaign.ItemStateSucceeded {
+			continue
+		}
+		candidates = append(candidates, issueClosedCandidate{item: it, target: target, stateReason: issue.StateReason})
 	}
 
 	// Autonomy refresh (#2355): fold the fresh tier of every fetched item through
@@ -2963,73 +3045,59 @@ func (s *Server) settleIssueClosedItems(ctx context.Context, c *campaign.Campaig
 	// caller re-reads items and the rollup reflects the fresh tier.
 	refreshedAny := s.refreshItemAutonomyFromIssues(ctx, c, items, fetched)
 
-	// Phase 2 (in-memory fixpoint, no further GitHub calls): settle any candidate
-	// whose depends_on refs are all in the done-set, add its ref to the done-set,
-	// and repeat until a full pass settles nothing new. This converges a closed
-	// C-depends_on-closed-D chain in a SINGLE read regardless of iteration order,
-	// while a closed candidate whose dependency is still OPEN is never reached
-	// (its ref never enters the done-set) and stays Blocked.
+	// Phase 2 (in-memory, no further GitHub calls): settle every candidate. There
+	// is NO depends_on gate here any more (#3563) — see the doc comment: the DAG
+	// orders DISPATCH and a settle mints no run, so recognising a closure the
+	// forge already recorded has nothing to order against. With the gate gone the
+	// #1558 fixpoint loop is unnecessary too: a single pass settles every
+	// candidate regardless of iteration order.
 	settledAny := false
-	settled := make(map[uuid.UUID]bool, len(candidates))
-	for {
-		progressed := false
-		for _, it := range candidates {
-			if settled[it.ID] {
+	for _, cand := range candidates {
+		it := cand.item
+		// The audit payload for either class. `state_reason` is the issue's REAL
+		// reason (no longer hard-coded "completed"), `outcome` the settled state,
+		// and `resolved_by` the durable marker now on the row. Class B
+		// additionally carries the retained run_id — the distinguishing field of
+		// the out-of-band-terminal arm, which a run-less class-A settle has none of.
+		payload := map[string]any{
+			"campaign_id":  c.ID.String(),
+			"issue_ref":    it.IssueRef,
+			"outcome":      string(cand.target),
+			"settled_via":  "issue_closed",
+			"state_reason": cand.stateReason,
+			"resolved_by":  campaign.ResolvedByIssueClosed,
+		}
+		if it.RunID != nil {
+			// Class B (out-of-band terminal delivery, #2029): a cancelled/failed
+			// item cannot go succeeded through the transition table (it refuses
+			// every terminal from), so bypass the gate via
+			// SettleCampaignItemOutOfBand, which retains the run link for
+			// provenance and stamps the same resolved_by marker. run_id present is
+			// what distinguishes this arm's audit.
+			if _, err := s.cfg.CampaignRepo.SettleCampaignItemOutOfBand(ctx, it.ID); err != nil {
+				s.cfg.Logger.Warn("reconcile-on-read: out-of-band terminal settle failed; left for next read",
+					"campaign_id", c.ID.String(), "item_id", it.ID.String(), "error", err.Error())
 				continue
 			}
-			// DAG ordering: an out-of-dependency-order human-merge (a dependency
-			// not yet in the done-set) is deliberately NOT settled, preserving
-			// wave order — a closed item whose dep is still OPEN stays Blocked.
-			if !depsSatisfiedRefs(it.DependsOn, done) {
+			payload["run_id"] = it.RunID.String()
+		} else {
+			// Class A (not-yet-run): the item is pending/blocked, so both target
+			// edges are admitted by the transition table. A defensive re-check
+			// keeps the arm honest; the write itself goes through
+			// SettleCampaignItemForClosedIssue so the state and the resolved_by
+			// marker land in ONE statement — there is no window in which a
+			// cancelled item lacks its marker and is offered as Restartable.
+			if !campaign.ValidCampaignItemTransition(it.State, cand.target) {
 				continue
 			}
-			// Mark before transitioning so an untransitionable or failing
-			// candidate is never revisited by the fixpoint (bounds iteration and
-			// avoids a duplicate transition attempt this read).
-			settled[it.ID] = true
-			// The audit payload for either class; class B additionally carries the
-			// retained run_id (the distinguishing marker of the out-of-band-terminal
-			// arm — a run-less class-A settle has none).
-			payload := map[string]any{
-				"campaign_id":  c.ID.String(),
-				"issue_ref":    it.IssueRef,
-				"outcome":      string(campaign.ItemStateSucceeded),
-				"settled_via":  "issue_closed",
-				"state_reason": "completed",
+			if _, err := s.cfg.CampaignRepo.SettleCampaignItemForClosedIssue(ctx, it.ID, cand.target); err != nil {
+				s.cfg.Logger.Warn("reconcile-on-read: issue-closed settle failed; left for next read",
+					"campaign_id", c.ID.String(), "item_id", it.ID.String(), "target", string(cand.target), "error", err.Error())
+				continue
 			}
-			if it.RunID != nil {
-				// Class B (out-of-band terminal delivery, #2029): a cancelled/failed
-				// item cannot go succeeded through the transition table (it refuses
-				// every terminal from), so bypass the gate via
-				// SettleCampaignItemOutOfBand, which retains the run link for
-				// provenance. run_id present is what distinguishes this arm's audit.
-				if _, err := s.cfg.CampaignRepo.SettleCampaignItemOutOfBand(ctx, it.ID); err != nil {
-					s.cfg.Logger.Warn("reconcile-on-read: out-of-band terminal settle failed; left for next read",
-						"campaign_id", c.ID.String(), "item_id", it.ID.String(), "error", err.Error())
-					continue
-				}
-				payload["run_id"] = it.RunID.String()
-			} else {
-				// Class A (run-less delivery): the item is pending/blocked, so the
-				// guarded transition applies. A defensive re-check keeps the run-less
-				// arm untouched.
-				if !campaign.ValidCampaignItemTransition(it.State, campaign.ItemStateSucceeded) {
-					continue
-				}
-				if _, err := s.cfg.CampaignRepo.TransitionCampaignItem(ctx, it.ID, campaign.ItemStateSucceeded); err != nil {
-					s.cfg.Logger.Warn("reconcile-on-read: run-less settle transition failed; left for next read",
-						"campaign_id", c.ID.String(), "item_id", it.ID.String(), "error", err.Error())
-					continue
-				}
-			}
-			done[it.IssueRef] = true
-			progressed = true
-			settledAny = true
-			s.emitCampaignAudit(ctx, categoryCampaignIssueSettled, payload)
 		}
-		if !progressed {
-			break
-		}
+		settledAny = true
+		s.emitCampaignAudit(ctx, categoryCampaignIssueSettled, payload)
 	}
 	// The pass CHANGED state (so the caller re-reads) when it settled an item OR
 	// refreshed a tier (#2355).
@@ -3128,19 +3196,6 @@ func (s *Server) refreshOneItemAutonomy(ctx context.Context, c *campaign.Campaig
 		"to":          want,
 	})
 	return updated, true
-}
-
-// depsSatisfiedRefs reports whether every dep ref is in the done set. An empty
-// dep list is trivially satisfied; an absent ref is not-satisfied. Mirrors the
-// campaign engine's depsSatisfied (unexported there) for the run-less settle
-// pass's DAG-order gate.
-func depsSatisfiedRefs(deps []string, done map[string]bool) bool {
-	for _, d := range deps {
-		if !done[d] {
-			return false
-		}
-	}
-	return true
 }
 
 // deriveCampaignAfterChange re-derives the campaign state from its items and,

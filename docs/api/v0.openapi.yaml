@@ -3141,6 +3141,13 @@ components:
           description: |
             `paused` (E25.7) means the auto-driver handed this item's gate off
             to a human; it carries a `pause_reason` and re-engages on resume.
+
+            `pending`/`blocked` -> `cancelled` is no longer reached only by an
+            operator halt (E72.24 / #3563): the reconcile-on-read issue-closed
+            settle also cancels an item whose issue was closed `not_planned` or
+            `duplicate` — a non-delivery closure. Such an item carries
+            `resolved_by: issue_closed` and is deliberately NOT offered for
+            restart.
         pause_reason:
           type: object
           description: |
@@ -3159,6 +3166,22 @@ components:
             gate:
               type: string
               description: The gate/decision the human must own.
+        resolved_by:
+          type: string
+          enum: ['', issue_closed]
+          description: |
+            Durable provenance of HOW the item reached its terminal state
+            (E72.24 / #3563, migration 0085). `issue_closed` means the
+            reconcile-on-read pass settled it off the forge's issue state —
+            `succeeded` for a closed-as-completed issue, `cancelled` for a
+            `not_planned`/`duplicate` closure. Omitted when there is no
+            recorded provenance (every operator- or run-driven outcome, and
+            every pre-0085 row), which is why it is not in `required`.
+
+            An item carrying `issue_closed` in the `cancelled` state is never
+            offered for restart: the issue was abandoned at the forge, so
+            `POST /v0/campaigns/{campaign_id}/runs` refuses it.
+          example: issue_closed
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
 
