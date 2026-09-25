@@ -4,7 +4,8 @@ package gitlabclient
 // adapter's forge.IssueOperations implementation needs (E50.17 / #2900):
 // read an issue, list its notes, post a note, and edit its state — plus
 // UpdateIssueNote, the edit-in-place leg of forge.IssueCommentEditor
-// (E45.52 / #3481). Before
+// (E45.52 / #3481) — and ListIssueLinks, the Free-tier issue-links READ
+// the work-item provider's campaign sources consume (#3658). Before
 // this file the client spoke only CreateIssue and LinkIssues on the
 // issues surface. Each method reuses the c.do + errForStatus helpers and
 // the same argument-validation posture (project id > 0, iid > 0, a
@@ -194,6 +195,104 @@ func nextPageURL(link string) string {
 		}
 	}
 	return ""
+}
+
+// Link types GitLab reports on an issue link (the `link_type` field,
+// https://docs.gitlab.com/ee/api/issue_links.html). relates_to is the only
+// type a Free-tier project accepts; blocks / is_blocked_by are Premium. The
+// type is always reported FROM THE QUERIED issue's side: a link listed on
+// issue A with LinkTypeIsBlockedBy means A is blocked by the linked issue.
+const (
+	LinkTypeRelatesTo   = "relates_to"
+	LinkTypeBlocks      = "blocks"
+	LinkTypeIsBlockedBy = "is_blocked_by"
+)
+
+// IssueLink is one issue linked to a queried issue, as the issue-links list
+// endpoint returns it: the LINKED issue's own fields plus the link type
+// (https://docs.gitlab.com/ee/api/issue_links.html#list-links-from-an-issue).
+//
+// ProjectID is the LINKED issue's project. A link whose ProjectID differs
+// from the queried project is CROSS-PROJECT: its IID is scoped to that other
+// project, so a consumer must never reduce it to a local issue number and
+// read an unrelated local issue in its place. The client carries it through
+// verbatim and leaves that refusal to the consumer.
+type IssueLink struct {
+	// IID is the linked issue's project-scoped number.
+	IID int `json:"iid"`
+	// ProjectID is the linked issue's project id (see the type doc).
+	ProjectID int `json:"project_id"`
+	// Title is the linked issue's title.
+	Title string `json:"title"`
+	// Description is the linked issue's body.
+	Description string `json:"description"`
+	// State is "opened" or "closed" as GitLab reports it.
+	State string `json:"state"`
+	// Labels is the linked issue's label names.
+	Labels []string `json:"labels"`
+	// WebURL is the linked issue's browse URL.
+	WebURL string `json:"web_url"`
+	// LinkType is relates_to | blocks | is_blocked_by (see the constants).
+	LinkType string `json:"link_type"`
+}
+
+// ListIssueLinks lists every issue linked to an issue.
+//
+//	GET /api/v4/projects/:id/issues/:iid/links
+//
+// It PAGES TO EXHAUSTION via the rel="next" Link header exactly as
+// ListIssueNotes does, under the same credential boundary: every page URL
+// (the first included) must be same-origin with the client's base URL, so a
+// forge-supplied next link can never carry PRIVATE-TOKEN off-instance, and
+// each request dispatches through doNoOffOriginRedirect for the 3xx half of
+// that boundary.
+func (c *Client) ListIssueLinks(ctx context.Context, projectID, iid int) ([]IssueLink, error) {
+	if projectID <= 0 {
+		return nil, fmt.Errorf("gitlabclient: project id required")
+	}
+	if iid <= 0 {
+		return nil, fmt.Errorf("gitlabclient: issue iid required")
+	}
+
+	next := c.baseURL + fmt.Sprintf("/api/v4/projects/%d/issues/%d/links?per_page=100", projectID, iid)
+	var out []IssueLink
+	for next != "" {
+		if err := c.sameOrigin(next, "next-page link"); err != nil {
+			return nil, err
+		}
+		var page []IssueLink
+		link, err := c.getJSONPage(ctx, next, "list issue links", &page)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, page...)
+		next = nextPageURL(link)
+	}
+	return out, nil
+}
+
+// getJSONPage fetches one page of a JSON collection at the absolute URL,
+// decodes it into out, and returns the raw Link header for the caller to walk.
+func (c *Client) getJSONPage(ctx context.Context, absURL, op string, out any) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, absURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("gitlabclient: build request: %w", err)
+	}
+	req.Header.Set("PRIVATE-TOKEN", c.token)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.doNoOffOriginRedirect(req)
+	if err != nil {
+		return "", fmt.Errorf("gitlabclient: GET %s: %w", req.URL.Path, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if err := errForStatus(op, resp); err != nil {
+		return "", err
+	}
+	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+		return "", fmt.Errorf("gitlabclient: decode %s: %w", strings.TrimPrefix(op, "list "), err)
+	}
+	return resp.Header.Get("Link"), nil
 }
 
 // CreateIssueNote posts body as a new note on the issue.

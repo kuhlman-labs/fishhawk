@@ -255,6 +255,40 @@ type EpicChildrenResult struct {
 	// Edges/DroppedEdges it is deterministically sorted by (From, To). Empty
 	// when no out-of-set target was already completed.
 	SatisfiedEdges []SatisfiedEdge
+	// ExcludedCandidates are issues an epic-children query considered and
+	// deliberately did NOT admit as children, each with a named reason
+	// (#3658). It is populated only by a provider whose child set is derived
+	// from a GENERIC relation rather than a structural parent edge — the gitlab
+	// provider reads the epic issue's relates_to links as candidates — so the
+	// exclusion is auditable instead of silent. It is NOT a dependency and is
+	// deliberately kept OUT of DroppedEdges, which campaign assembly fails
+	// closed on: an unrelated link on the epic must not refuse the campaign.
+	// Sorted by Number, then Ref. Empty for every other provider.
+	ExcludedCandidates []ExcludedCandidate
+}
+
+// CandidateExclusionReason names why an epic-children candidate was not
+// admitted as a child (#3658).
+type CandidateExclusionReason string
+
+const (
+	// ExcludeCrossProject marks a candidate linked from ANOTHER project. Its
+	// number is scoped to that project, so it is never reduced to a local
+	// issue number and never read.
+	ExcludeCrossProject CandidateExclusionReason = "cross_project"
+	// ExcludeForeignParentMarker marks a candidate whose body carries a
+	// `Parent epic:` marker that names a DIFFERENT epic.
+	ExcludeForeignParentMarker CandidateExclusionReason = "foreign_parent_marker"
+)
+
+// ExcludedCandidate is one epic-children candidate that was not admitted.
+// Number is the candidate's number in its OWN project (for a cross-project
+// candidate that is NOT a local issue number); Ref is a display form that
+// is unambiguous across projects.
+type ExcludedCandidate struct {
+	Number int
+	Ref    string
+	Reason CandidateExclusionReason
 }
 
 // SatisfiedEdge is one depends_on edge whose out-of-set target is already
@@ -290,8 +324,9 @@ type EpicChild struct {
 	Autonomy string
 	Complete bool
 	// State is the child's forge issue state, NORMALIZED to the forge's
-	// uppercase spelling ("OPEN"/"CLOSED"). It is empty for a provider that does
-	// not populate it (gitlab/jira), and an empty State means UNKNOWN — do NOT
+	// uppercase spelling ("OPEN"/"CLOSED"; the gitlab provider maps GitLab's
+	// "opened"/"closed" onto it, #3658). It is empty for a provider that does
+	// not populate it (jira), and an empty State means UNKNOWN — do NOT
 	// adopt: the #3323 rolling-walk adoption requires a positively-OPEN candidate,
 	// so empty degrades to the pre-change file-a-new-walk status quo.
 	//
