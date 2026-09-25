@@ -1048,3 +1048,246 @@ func TestLineageLock_CancelledRunHolder_NextDispatchAdmitted(t *testing.T) {
 		}
 	}
 }
+
+// --- E68.67 / #3454: standalone implement advances the lineage worktree ---
+
+// standaloneMovedBaseRepo builds the #3454 cross-boundary fixture with REAL git:
+// a bare origin carrying `main` (base.txt + the in-scope scope.txt) and an
+// operator clone checked out on it. The returned advanceOrigin() merges one
+// further commit carrying advanced.txt into the origin's main and refreshes the
+// operator clone's tracking refs WITHOUT moving its HEAD or dirtying its tree —
+// exactly what "a fix merged to main between plan and implement" looks like.
+func standaloneMovedBaseRepo(t *testing.T) (operatorRepo, mainSHA string, advanceOrigin func() string) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	mustGit := func(dir string, args ...string) {
+		t.Helper()
+		if err := runGitErr(dir, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	seed := t.TempDir()
+	mustGit(seed, "init", "-q")
+	for name, body := range map[string]string{
+		"base.txt":  "base\n",
+		"scope.txt": "declared scope file, untouched at base\n",
+	} {
+		if err := os.WriteFile(filepath.Join(seed, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mustGit(seed, "add", "-A")
+	mustGit(seed, "commit", "-q", "-m", "base on main")
+	mustGit(seed, "branch", "-M", "main")
+
+	bare := filepath.Join(t.TempDir(), "origin.git")
+	mustGit(seed, "init", "--bare", "-q", bare)
+	mustGit(bare, "symbolic-ref", "HEAD", "refs/heads/main")
+	mustGit(seed, "remote", "add", "origin", bare)
+	mustGit(seed, "push", "-q", "origin", "main")
+
+	operator := filepath.Join(t.TempDir(), "operator")
+	mustGit(seed, "clone", "-q", "-b", "main", bare, operator)
+	sha, err := runGitOut(operator, "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	advanceOrigin = func() string {
+		t.Helper()
+		if werr := os.WriteFile(filepath.Join(seed, "advanced.txt"),
+			[]byte("the fix that merged to main between plan and implement\n"), 0o644); werr != nil {
+			t.Fatal(werr)
+		}
+		mustGit(seed, "add", "-A")
+		mustGit(seed, "commit", "-q", "-m", "fix merged to main between plan and implement")
+		mustGit(seed, "push", "-q", "origin", "main")
+		// Refresh the operator clone's tracking refs only — HEAD and the working
+		// tree are deliberately left where they were.
+		mustGit(operator, "fetch", "-q", "origin")
+		tip, gerr := runGitOut(seed, "rev-parse", "HEAD")
+		if gerr != nil {
+			t.Fatal(gerr)
+		}
+		return tip
+	}
+	return operator, sha, advanceOrigin
+}
+
+// TestRun_StandaloneImplement_AdvancesLineageWorktreeToMovedBase_CrossBoundary is
+// the LOAD-BEARING done-means test for #3454, with REAL git throughout: a real
+// bare origin, a real operator clone, a real provisionLineageWorktree at the
+// PLAN-TIME sha (the plan stage's exact call), a real commit merged into
+// origin/main between that provisioning and the dispatch, and production
+// remoteHasBranch / fetchDiffBaseTip / checkoutChildBase / captureHead /
+// restoreHead seams. Only the push/PR egress is faked.
+//
+// It asserts the two halves of the issue's done-means:
+//
+//   - THE AGENT SAW IT: advanced.txt is present in inv.WorkingDir at agent
+//     invoke and the worktree HEAD there equals the ADVANCED tip, not the
+//     plan-time sha;
+//   - THE GATE SAW IT: the declared verify command is a real probe for
+//     advanced.txt, and the single-shot committed-tree gate PASSES. On the stale
+//     plan-time base that probe cannot pass — this is what pins the verify-gate
+//     half, which the #1151 scope-completeness presence gate would not catch on
+//     a comment-only or no-op touch of main.go.
+//
+// Plus the safety properties: the worktree HEAD is restored by the #953 net and
+// the operator's own checkout never moves and stays clean.
+func TestRun_StandaloneImplement_AdvancesLineageWorktreeToMovedBase_CrossBoundary(t *testing.T) {
+	operator, planSHA, advanceOrigin := standaloneMovedBaseRepo(t)
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+
+	const (
+		runID   = "11111111-2222-3333-4444-555555555555"
+		stageID = "22222222-3333-4444-5555-666666666666"
+	)
+
+	// (0) The PLAN stage's exact call: seed the lineage worktree from the
+	// operator checkout's HEAD as it stands NOW. The implement dispatch below
+	// then takes provisionLineageWorktree's `lineage_worktree_reused` path —
+	// the path that never moved HEAD, which is the whole defect.
+	ctx := context.Background()
+	planWT, err := provisionLineageWorktree(ctx, operator, lineageRoot(runID, "", false), "main", io.Discard)
+	if err != nil {
+		t.Fatalf("plan-stage provision: %v", err)
+	}
+	if got, herr := runGitOut(planWT, "rev-parse", "HEAD"); herr != nil {
+		t.Fatal(herr)
+	} else if got != planSHA {
+		t.Fatalf("lineage worktree seeded at %q, want the plan-time sha %q", got, planSHA)
+	}
+
+	// (1) A fix merges to main AFTER the worktree was provisioned.
+	advancedSHA := advanceOrigin()
+
+	var (
+		sawAdvancedFile bool
+		invokeWorktree  string
+		invokeHEAD      string
+	)
+	withFakeInvoker(t, &fakeInvoker{
+		canned: agent.Result{OK: true},
+		onInvoke: func(_ int, inv agent.Invocation) {
+			invokeWorktree = inv.WorkingDir
+			if _, serr := os.Stat(filepath.Join(inv.WorkingDir, "advanced.txt")); serr == nil {
+				sawAdvancedFile = true
+			}
+			invokeHEAD, _ = runGitOut(inv.WorkingDir, "rev-parse", "HEAD")
+			// Write the declared scope file so the committed-tree gate has a
+			// scope-only commit to cut and gate.
+			if werr := os.WriteFile(filepath.Join(inv.WorkingDir, "scope.txt"),
+				[]byte("edited by the implement agent\n"), 0o644); werr != nil {
+				t.Error(werr)
+			}
+		},
+	})
+
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:    stageID,
+		StageType:  "implement",
+		Prompt:     "implement",
+		PromptHash: "h",
+		// A REAL probe for the advanced base's file: it passes on the advanced
+		// tree and cannot pass on the plan-time one.
+		VerifyCommand:       "test -f advanced.txt",
+		VerifyMaxIterations: 0, // the single-shot committed-tree gate
+		ScopeFiles:          []upload.ScopeFile{{Path: "scope.txt", Operation: "modify"}},
+	}
+	withFakeUploader(t, fu)
+
+	// Only the push/PR egress is faked; every git seam stays PRODUCTION.
+	fp := &fakePusher{result: &gitops.CommitAndPushResult{HeadSHA: "head-sha-abc", BaseSHA: "base"}}
+	origPusher, origOpener := newPusher, newPROpener
+	newPusher = func() pusher { return fp }
+	newPROpener = func(string) prOpener { return &fakePROpener{} }
+	t.Cleanup(func() { newPusher = origPusher; newPROpener = origOpener })
+
+	bundlePath := filepath.Join(t.TempDir(), "trace.jsonl.gz")
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", runID,
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", stageID,
+		"--working-dir", operator,
+		"--fetch-prompt", "--upload-trace",
+		"--bundle-out", bundlePath,
+	}, &stderr)
+
+	// (2) THE AGENT SAW IT. Asserted before the exit check so a gate failure
+	// does not mask which half regressed.
+	if !sawAdvancedFile {
+		t.Errorf("advanced.txt absent from the worktree at agent invoke — the agent reasoned against the PLAN-TIME base (#3454).\nstderr:\n%s", stderr.String())
+	}
+	if invokeHEAD == planSHA {
+		t.Errorf("worktree HEAD at invoke = %q (still the plan-time sha) — the base advance did not move it to %q", invokeHEAD, advancedSHA)
+	}
+	if invokeHEAD != advancedSHA {
+		t.Errorf("worktree HEAD at invoke = %q, want the advanced base tip %q", invokeHEAD, advancedSHA)
+	}
+
+	// (3) THE GATE SAW IT: the committed-tree verify PASSED on a probe that
+	// cannot pass against the stale base.
+	var sawGatePass, sawGateFail bool
+	for _, ev := range readBundleEvents(t, bundlePath) {
+		if ev.Kind != "verify_run" {
+			continue
+		}
+		p := string(ev.Data)
+		if !strings.Contains(p, `"head_sha"`) {
+			continue // working-tree gate events carry no head_sha
+		}
+		if strings.Contains(p, `"outcome":"passed"`) {
+			sawGatePass = true
+		}
+		if strings.Contains(p, `"outcome":"failed"`) {
+			sawGateFail = true
+		}
+	}
+	if sawGateFail {
+		t.Errorf("the committed-tree verify gate FAILED — it ran against the plan-time base (#3454).\nstderr:\n%s", stderr.String())
+	}
+	if !sawGatePass {
+		t.Errorf("no PASSING committed-tree verify_run — the gate never saw the advanced base.\nstderr:\n%s", stderr.String())
+	}
+
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+
+	// (4) The structured record names both SHAs.
+	for _, want := range []string{
+		`"event":"lineage_worktree_advanced"`,
+		`"from":"` + planSHA + `"`,
+		`"to":"` + advancedSHA + `"`,
+	} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Errorf("missing %s in run output:\n%s", want, stderr.String())
+		}
+	}
+
+	// (5) The #953 net restored the worktree HEAD, and the operator's own
+	// checkout never moved and stays clean.
+	if invokeWorktree == "" {
+		t.Fatal("agent invoke did not record a worktree path")
+	}
+	restored, rerr := runGitOut(invokeWorktree, "rev-parse", "HEAD")
+	if rerr != nil {
+		t.Fatalf("rev-parse worktree HEAD after run: %v", rerr)
+	}
+	if restored != planSHA {
+		t.Errorf("worktree HEAD after run = %q, want the restored pre-agent ref %q", restored, planSHA)
+	}
+	if head := gitPorcelainHead(t, operator); head != planSHA {
+		t.Errorf("operator HEAD moved: %q, want %q", head, planSHA)
+	}
+	if status := gitPorcelain(t, operator); status != "" {
+		t.Errorf("operator git status not clean after the run:\n%s", status)
+	}
+}

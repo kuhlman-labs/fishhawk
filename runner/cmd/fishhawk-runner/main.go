@@ -1760,6 +1760,52 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		})
 	}
 
+	// Standalone implement base advance (E68.67 / #3454). PLACEMENT is
+	// load-bearing and is the whole point of this block: it sits AFTER the
+	// pre-agent HEAD/dirty capture and the #953 run()-level restore net
+	// installed above, and strictly BEFORE the agent invoke and EVERY verify
+	// gate — so the agent's view, the committed-tree gate's throwaway
+	// scope-only commit, and the commit-time push base are all cut on ONE
+	// base. Before it existed, provisionLineageWorktree took the
+	// `lineage_worktree_reused` path for implement without moving the
+	// worktree's plan-time HEAD, so a fix merged to main between plan and
+	// implement was invisible to both the agent and the gate, and only the
+	// commit-time FreshFetchBase re-staged onto the moved base — far too late
+	// (run 1bc985d1 / #3390, run a90d98ee / #3451).
+	//
+	// standaloneBaseAdvanceEligible and the wave-base block's own guard below
+	// are MUTUALLY EXCLUSIVE BY CONSTRUCTION — this one requires
+	// cfg.decomposedFromRunID == "", that one requires it non-empty — so the
+	// two base checkouts can never both fire on one dispatch. A fix-up pass is
+	// excluded for a separate structural reason: it must stay on the PR branch
+	// checkoutFixupBase established above.
+	//
+	// The base ref is resolveImplementBaseRef(cfg) — the SAME value
+	// resolveImplementBranchRouting hands CommitAndPush as freshFetchBase.
+	// No new restore defer is needed: the #953 net installed above already
+	// restores a moved HEAD to preAgentRef on every exit path (success,
+	// failure, panic) via its double-fire-safe moved-HEAD re-read, and it is
+	// deliberately skipped under --no-pr where the dirty tree IS the
+	// deliverable (an advance there is harmless — it is still a fast-forward).
+	if standaloneBaseAdvanceEligible(stageType, cfg) {
+		repoDir := cfg.workingDir
+		if repoDir == "" {
+			repoDir = "."
+		}
+		// Mint a fresh token for the ls-remote guard and both fetches so each
+		// authenticates per-invocation and resets any stale persisted
+		// extraheader (#1951). A mint failure degrades to "" (ambient auth),
+		// never a stage failure.
+		advanceAuthToken := mintBaseAuthToken(ctx, cfg, client, issuedKey, logSink)
+		if _, advErr := advanceLineageWorktreeToBase(
+			ctx, repoDir, resolveImplementBaseRef(cfg), advanceAuthToken, logSink); advErr != nil {
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"runner_failed","reason":%q,"detail":%q}`+"\n",
+				lineageBaseAdvanceFailureReason(advErr), advErr.Error())
+			return exitFailure
+		}
+	}
+
 	// Child wave-base establishment (#1302, supersedes the dormant #1036 /
 	// ADR-041 slice-branch keying): a dependent (wave-N) decomposition slice
 	// must run against its predecessors' INTEGRATED tree, not the operator's
