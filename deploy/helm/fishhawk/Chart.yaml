@@ -9,9 +9,13 @@ description: >-
   configuration that would fail later at pod start; worked production postures
   ship as values-prod / values-cell / values-single-tenant.
 type: application
-# Chart version: bump on chart-template changes. 0.4.0 renamed the `minio.*`
-# values block to `rustfs.*` (BREAKING for out-of-tree values files; #3386).
-version: 0.4.0
+# Chart version: bump on chart-template changes. 0.5.0 adds the
+# checksum/config + checksum/secret pod-template annotations so a ConfigMap- or
+# Secret-only values change actually rolls the pods (#3577); NON-breaking —
+# spec.template is mutable, so a plain `helm upgrade` from 0.4.x succeeds and
+# simply performs one rolling restart. 0.4.0 renamed the `minio.*` values block
+# to `rustfs.*` (BREAKING for out-of-tree values files; #3386).
+version: 0.5.0
 # appVersion tracks the fishhawkd image tag shipped by backend-release.yml.
 # Defaults to the `main` rolling tag (matches infra/terraform image_tag default);
 # override per-release via image.tag in values.yaml.

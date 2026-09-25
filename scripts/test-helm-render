@@ -2143,6 +2143,242 @@ else
   fail "r18e bootstrap script unavailable — the behavioural cases (a)-(d) never ran"
 fi
 
+
+# ---------------------------------------------------------------------------
+# r19 — CONFIG/SECRET CHECKSUM ANNOTATIONS (E69.71 / #3577). Every FISHHAWKD_*
+#       value reaches the container via `envFrom`, read once at container start,
+#       so a values change touching ONLY the ConfigMap or the Secret left the
+#       Deployment manifest byte-identical: `helm upgrade` exited 0,
+#       `kubectl rollout status` reported success, and the pod kept serving the
+#       OLD configuration. The fix hashes the rendered ConfigMap/Secret into the
+#       pod template (one _helpers.tpl define, four call sites); these cases pin
+#       the property BEHAVIOURALLY, which is what a comment-only or no-op touch
+#       of the four templates cannot satisfy.
+#
+#       r19a — per-workload presence, allInOne: the `fishhawk` Deployment AND the
+#              `fishhawk-migrate` Job each carry checksum/config + checksum/secret
+#              in their POD-TEMPLATE annotations, each matching ^[0-9a-f]{64}$
+#              (the hex shape, not mere presence — a template typo rendering an
+#              empty or error string is caught).
+#       r19b — per-workload presence, split: `fishhawk-api` and `fishhawk-worker`
+#              likewise. r19a+r19b cover all four workloads — the case that goes
+#              red when three templates are wired and one is missed.
+#       r19c — THE DONE-MEANS CASE: two renders differing only in
+#              secrets.values.anthropicApiKey; checksum/secret DIFFERS while
+#              checksum/config is IDENTICAL.
+#       r19d — the mirror: two renders differing only in config.s3Region;
+#              checksum/config DIFFERS while checksum/secret is IDENTICAL.
+#              r19c+r19d together prove each annotation tracks its OWN object; a
+#              single annotation hashing both would pass r19c alone.
+#       r19e — idempotence/anti-flap: identical inputs produce identical
+#              checksums. A per-render-varying hash would restart the pod on
+#              EVERY upgrade — a different defect from the one being fixed.
+#       r19f — secrets.mode: existing — render SUCCEEDS, checksum/config present
+#              and 64-hex, checksum/secret ABSENT at YAML key position.
+#       r19g — secrets.mode: externalSecrets — same assertions. r19f+r19g are the
+#              two named modes of the `chartManaged` guard, one case each.
+#              (The approved plan named values-cell.yaml as the externalSecrets
+#              profile; it in fact ships `mode: existing`, so r19g uses a
+#              fixture in the shape r14l/r14n already use for that mode.)
+#       r19h — helm lint on the chartManaged and split renders, so the annotation
+#              additions are proven lint-clean (matching r7/r14o).
+#
+#       Parsing is STRUCTURAL, never a document-wide grep: the migrate Job carries
+#       an `annotations:` block at JOB-metadata level too (the helm.sh/hook keys),
+#       and a document-wide `grep -F checksum/config` over a multi-workload render
+#       is satisfied by ONE workload while another silently lost the annotation —
+#       green assertion, vacuous proof. Same reason r5 and r17 parse structurally.
+#
+#       THE COUNTERFACTUAL MATRIX (the mandated deletion walk: mutate the chart,
+#       re-run the harness, observe, restore byte-identically). Each mutation
+#       names only the sub-cases that can observe it; a GREEN is evidence about a
+#       sub-case's scope, not a gap:
+#         M0 control (no mutation)                    369 passed, 0 failed
+#         C1 delete the checksum/config line from the define
+#                                          a=R b=R d=R f=R g=R (8 FAILs; c/e
+#                                          green — they read only
+#                                          checksum/secret. f/g are RED on their
+#                                          checksum/config hex assertion, NOT on
+#                                          the absence assertion, which still
+#                                          passes: C1 removes a key, it does not
+#                                          add one)
+#         C2 delete the `if eq .Values.secrets.mode "chartManaged"`
+#            guard so checksum/secret is emitted unconditionally
+#            (a CONSTANT sha256 of the empty render)
+#                                          f=R g=R (2 FAILs, both the
+#                                          assert_field_absent arm:
+#                                          "unexpectedly rendered the field:
+#                                          checksum/secret"; a/b/c/d/e green —
+#                                          chartManaged is unaffected)
+#         C5 delete the checksum/secret line from the define
+#                                          a=R b=R c=R (6 FAILs, INCLUDING the
+#                                          done-means arm verbatim: "a changed
+#                                          secrets.values entry did NOT move
+#                                          checksum/secret ('' -> '')". Added
+#                                          beyond the plan's C1/C2 pair because
+#                                          neither of those reddens r19c, and a
+#                                          done-means case whose non-vacuity is
+#                                          unproven is the weakest link here)
+#       C2's bad state is seeded BY CONSTRUCTION — the non-chartManaged modes
+#       render no Secret at all — so the RED lands on the behavioural absence
+#       assertion, never on fixture setup.
+#
+#       HONEST RESIDUAL on r19e: it stays GREEN under all three mutations,
+#       because it asserts EQUALITY across two renders and two ABSENT values
+#       compare equal. That is by design — r19e exists to catch a per-render
+#       FLAP, not a missing annotation, and presence is r19a/r19b's job — but do
+#       not read r19e as a presence check.
+# ---------------------------------------------------------------------------
+
+# pod_template_annotations <workload-document> — the pod template's
+# metadata.annotations block (spec.template.metadata.annotations). yaml_block
+# "template" scopes to everything under `template:` FIRST, so the Job's
+# top-level metadata.annotations (helm.sh/hook*) is excluded by construction;
+# the first `annotations:` inside the pod template is the pod annotations.
+pod_template_annotations() {
+  local tmpl
+  tmpl=$(yaml_block "$1" "template")
+  yaml_block "$tmpl" "annotations"
+}
+
+# _r19_checksum <manifest> <workload-name> <field> — the value of <field>
+# (checksum/config | checksum/secret) in the named workload's POD-TEMPLATE
+# annotations. Empty when the workload, its pod annotations, or the field is
+# absent. Searches Deployment then Job documents.
+_r19_checksum() {
+  local doc name kind
+  for kind in Deployment Job; do
+    while IFS= read -r -d '' doc; do
+      name=$(doc_name "$doc")
+      [ "$name" = "$2" ] || continue
+      pod_template_annotations "$doc" \
+        | sed -n "s#^[[:space:]]*$3:[[:space:]]*##p" | head -1
+      return
+    done < <(docs_of_kind "$1" "$kind")
+  done
+}
+
+# _r19_assert_hex <label> <value> — the value must be a 64-char lowercase hex
+# digest. Catches a template typo rendering an empty or error string, which a
+# bare presence check would pass.
+_r19_assert_hex() {
+  case "$2" in
+    *[!0-9a-f]* | "") fail "$1 (expected a 64-char hex digest — got: '$2')" ;;
+    *) if [ "${#2}" -eq 64 ]; then pass "$1"; else
+         fail "$1 (expected a 64-char hex digest — got ${#2} chars: '$2')"
+       fi ;;
+  esac
+}
+
+# _r19_present <label> <manifest> <workload> — both annotations present and hex.
+_r19_present() {
+  _r19_assert_hex "$1 checksum/config is a 64-hex digest" "$(_r19_checksum "$2" "$3" "checksum/config")"
+  _r19_assert_hex "$1 checksum/secret is a 64-hex digest" "$(_r19_checksum "$2" "$3" "checksum/secret")"
+}
+
+# r19a — allInOne: the fishhawkd Deployment and the migrate hook Job.
+render -f "$CHART/values-local.yaml"
+assert_render_ok "r19a allInOne chartManaged render succeeds"
+r19a_manifest="$out"
+_r19_present "r19a allInOne Deployment fishhawk:" "$r19a_manifest" "fishhawk"
+_r19_present "r19a migrate Job fishhawk-migrate:" "$r19a_manifest" "fishhawk-migrate"
+
+# r19b — split: the api and worker Deployments. The case that goes red when one
+# of the four templates is missed.
+render -f "$CHART/values-local.yaml" --set deployment.mode=split
+assert_render_ok "r19b split chartManaged render succeeds"
+r19b_manifest="$out"
+_r19_present "r19b split Deployment fishhawk-api:" "$r19b_manifest" "fishhawk-api"
+_r19_present "r19b split Deployment fishhawk-worker:" "$r19b_manifest" "fishhawk-worker"
+
+# r19c — THE DONE-MEANS CASE. Change ONLY a secrets.values entry: checksum/secret
+# must move, checksum/config must not.
+render -f "$CHART/values-local.yaml" --set secrets.values.anthropicApiKey=sk-r19c-changed
+assert_render_ok "r19c render with a changed anthropicApiKey succeeds"
+r19c_manifest="$out"
+r19_base_secret=$(_r19_checksum "$r19a_manifest" "fishhawk" "checksum/secret")
+r19_base_config=$(_r19_checksum "$r19a_manifest" "fishhawk" "checksum/config")
+r19c_secret=$(_r19_checksum "$r19c_manifest" "fishhawk" "checksum/secret")
+r19c_config=$(_r19_checksum "$r19c_manifest" "fishhawk" "checksum/config")
+_r19_assert_hex "r19c the changed render still emits a 64-hex checksum/secret" "$r19c_secret"
+if [ -n "$r19_base_secret" ] && [ "$r19c_secret" != "$r19_base_secret" ]; then
+  pass "r19c a changed secrets.values entry MOVES checksum/secret (the pod template changes, so the pods roll)"
+else
+  fail "r19c a changed secrets.values entry did NOT move checksum/secret ('$r19_base_secret' -> '$r19c_secret') — a credential rotation would report success without restarting the pod (#3577)"
+fi
+assert_equals "r19c the same change leaves checksum/config IDENTICAL" "$r19c_config" "$r19_base_config"
+
+# r19d — the mirror: change ONLY a config value.
+render -f "$CHART/values-local.yaml" --set config.s3Region=eu-west-9
+assert_render_ok "r19d render with a changed config.s3Region succeeds"
+r19d_manifest="$out"
+r19d_config=$(_r19_checksum "$r19d_manifest" "fishhawk" "checksum/config")
+r19d_secret=$(_r19_checksum "$r19d_manifest" "fishhawk" "checksum/secret")
+_r19_assert_hex "r19d the changed render still emits a 64-hex checksum/config" "$r19d_config"
+if [ -n "$r19_base_config" ] && [ "$r19d_config" != "$r19_base_config" ]; then
+  pass "r19d a changed config value MOVES checksum/config"
+else
+  fail "r19d a changed config value did NOT move checksum/config ('$r19_base_config' -> '$r19d_config')"
+fi
+assert_equals "r19d the same change leaves checksum/secret IDENTICAL" "$r19d_secret" "$r19_base_secret"
+
+# r19e — idempotence: identical inputs, identical checksums. A per-render-varying
+# hash would roll the pods on EVERY `helm upgrade`.
+render -f "$CHART/values-local.yaml"
+assert_render_ok "r19e repeat render with identical inputs succeeds"
+assert_equals "r19e identical inputs produce an identical checksum/config (no per-render flap)" \
+  "$(_r19_checksum "$out" "fishhawk" "checksum/config")" "$r19_base_config"
+assert_equals "r19e identical inputs produce an identical checksum/secret (no per-render flap)" \
+  "$(_r19_checksum "$out" "fishhawk" "checksum/secret")" "$r19_base_secret"
+
+# r19f — secrets.mode: existing. secret.yaml renders nothing, so checksum/secret
+# must be ABSENT rather than a constant hash of the empty render. Asserting at
+# YAML KEY position (assert_field_absent), and asserting the render SUCCEEDS so a
+# failure for an unrelated reason cannot be mistaken for the intended absence.
+render -f "$CHART/values-prod.yaml" --set secrets.mode=existing --set existingSecret=fishhawk-secrets
+assert_render_ok "r19f secrets.mode=existing renders OK"
+r19f_manifest="$out"
+_r19_assert_hex "r19f existing mode still emits a 64-hex checksum/config" \
+  "$(_r19_checksum "$r19f_manifest" "fishhawk" "checksum/config")"
+assert_field_absent "r19f existing mode emits NO checksum/secret (the chart does not own the Secret's contents; a constant hash would falsely imply the rotation is tracked)" \
+  "$r19f_manifest" "checksum/secret"
+
+# r19g — secrets.mode: externalSecrets, the other named mode of the guard.
+cat > "$tmproot/r19g.yaml" <<'YAML'
+profile: prod
+secrets:
+  mode: externalSecrets
+  githubApp:
+    privateKeyFile:
+      enabled: false
+  externalSecrets:
+    secretStoreRef:
+      name: fishhawk-store
+    data:
+      - secretKey: FISHHAWKD_DATABASE_URL
+        remoteRef: {key: fishhawk/db}
+      - secretKey: FISHHAWKD_GITHUB_WEBHOOK_SECRET
+        remoteRef: {key: fishhawk/webhook}
+      - secretKey: FISHHAWKD_ANTHROPIC_API_KEY
+        remoteRef: {key: fishhawk/anthropic}
+YAML
+render -f "$tmproot/r19g.yaml"
+assert_render_ok "r19g secrets.mode=externalSecrets renders OK"
+r19g_manifest="$out"
+_r19_assert_hex "r19g externalSecrets mode still emits a 64-hex checksum/config" \
+  "$(_r19_checksum "$r19g_manifest" "fishhawk" "checksum/config")"
+assert_field_absent "r19g externalSecrets mode emits NO checksum/secret (ESO materializes the contents out of band; a constant hash would falsely imply the rotation is tracked)" \
+  "$r19g_manifest" "checksum/secret"
+
+# r19h — lint, so the annotation additions are proven lint-clean.
+for r19_lint in "-f;$CHART/values-local.yaml" "-f;$CHART/values-local.yaml;--set;deployment.mode=split"; do
+  IFS=';' read -r -a r19_lint_args <<< "$r19_lint"
+  if "$(command -v helm)" lint "$CHART" "${r19_lint_args[@]}" >"$tmproot/r19lint" 2>&1; then
+    pass "r19h helm lint clean (${r19_lint_args[*]})"
+  else
+    fail "r19h helm lint failed (${r19_lint_args[*]}): $(tail -3 "$tmproot/r19lint")"
+  fi
+done
 fi  # end r1–r14 (skipped under FISHHAWK_HELM_RENDER_SELFTEST)
 
 # ---------------------------------------------------------------------------

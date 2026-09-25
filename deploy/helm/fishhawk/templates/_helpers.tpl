@@ -86,6 +86,53 @@ app.kubernetes.io/component: {{ $role }}
 {{- end -}}
 
 {{/*
+Pod-template checksum annotations (E69.71 / #3577). Emits the annotation lines
+UNINDENTED; the caller places them with `nindent`.
+
+WHY: every FISHHAWKD_* value reaches the container through `envFrom`
+(configMapRef + secretRef), which is read ONCE at container start. So a values
+change that touches only the ConfigMap or only the Secret leaves the Deployment
+manifest BYTE-IDENTICAL — `helm upgrade` exits 0, `kubectl rollout status`
+reports success, and the running pod keeps serving the OLD configuration. The
+dangerous case is credential rotation: an operator rotating a leaked
+FISHHAWKD_GITLAB_TOKEN / FISHHAWKD_ANTHROPIC_API_KEY /
+FISHHAWKD_GITHUB_WEBHOOK_SECRET sees three green signals over a rotation that
+never took effect. Hashing the rendered ConfigMap/Secret into the POD TEMPLATE
+makes such a change move `spec.template`, which is what actually rolls the pods.
+
+ONE define, FOUR call sites (deployment.yaml, deployment-api.yaml,
+deployment-worker.yaml, migrate-job.yaml) — the four pod templates must stay in
+lockstep, and four hand-copied blocks are exactly the drift shape the chart's
+other shared helpers (fishhawk.fishhawkdPodSpec, fishhawk.selectorLabels) exist
+to prevent.
+
+WHY checksum/secret IS GUARDED on chartManaged: secret.yaml renders NOTHING
+under `existing` / `externalSecrets`, so an unguarded hash there would be a
+CONSTANT (sha256 of the empty string) that falsely implies an out-of-band
+rotation is tracked. Under those two modes the chart does not own the Secret's
+contents and a rotation still needs a manual `kubectl rollout restart` — stated
+plainly in deploy/helm/fishhawk/README.md rather than papered over.
+
+ACCEPTED CONSEQUENCE: the hash is taken over the rendered TEXT of
+configmap.yaml, which includes the fishhawk.labels block and therefore
+`helm.sh/chart: fishhawk-<version>`. So a Chart.yaml version bump ALONE changes
+checksum/config and costs one extra rolling restart per chart release. That is
+inherent to the standard Helm idiom and is accepted: an over-restart is
+cosmetic where an under-restart is the silent security defect above.
+
+CONTEXT CONTRACT: invoke with the chart root (`.`), never a dict and never a
+`with`/`range`-rescoped value — `$` inside a define resolves to that define's
+own invocation argument, so `$.Template.BasePath` and `.Values` both depend on
+the caller passing the root.
+*/}}
+{{- define "fishhawk.configChecksumAnnotations" -}}
+checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+{{- if eq .Values.secrets.mode "chartManaged" }}
+checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+{{- end }}
+{{- end -}}
+
+{{/*
 Secret name — the single source of truth the Deployment + migrate Job reference
 across all three secrets modes (no template duplication). `existing` reads the
 operator-supplied existingSecret; `chartManaged` and `externalSecrets` both use

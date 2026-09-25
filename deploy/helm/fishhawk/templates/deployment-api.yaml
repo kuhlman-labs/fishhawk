@@ -22,6 +22,8 @@ spec:
       {{- include "fishhawk.selectorLabels" (dict "root" . "role" "api") | nindent 6 }}
   template:
     metadata:
+      annotations:
+        {{- include "fishhawk.configChecksumAnnotations" . | nindent 8 }}
       labels:
         {{- include "fishhawk.selectorLabels" (dict "root" . "role" "api") | nindent 8 }}
     spec:

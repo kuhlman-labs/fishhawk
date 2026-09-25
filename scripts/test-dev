@@ -4710,6 +4710,19 @@ print "#!/bin/sh\nprintf '%s\\\\n' \"\$*\" >> \"$relay_wd/argv\"\nsleep 30\n" > 
   export FISHHAWK_DEV_SMEE_BIN="$relay_wd/smee"
   export FISHHAWK_DEV_WEBHOOK_CHANNEL="$relay_chan"
   _relay_up >/dev/null 2>&1
+  # #3587: the stub's `printf` races its own fork/exec, which costs 200-600ms of
+  # _relay_up's whole 1.0s window on an idle host and under `scripts/test
+  # verify`'s concurrent go-test load exceeded it — so a single read right after
+  # the call returned an EMPTY argv file. Poll for the argv EVIDENCE on an
+  # order-of-magnitude budget (20s) instead. The assertion below is UNCHANGED: a
+  # timeout leaves the file empty and still FAILS the case, so this widens the
+  # budget without weakening what is proven.
+  argv_wait=0
+  while (( argv_wait < 100 )); do
+    if [[ -s "$relay_wd/argv" ]]; then break; fi
+    sleep 0.2
+    (( ++argv_wait ))
+  done
   [[ -f "$RELAY_PID_FILE" ]] && kill "$(cat "$RELAY_PID_FILE")" 2>/dev/null
 )
 relay_argv="$(cat "$relay_wd/argv" 2>/dev/null)"
@@ -4832,6 +4845,16 @@ print "#!/bin/sh\nprintf '%s\\\\n' \"\$*\" >> \"$relay_wd/argv\"\nexit 0\n" > "$
   RELAY_PID_FILE="$relay_wd/relay.pid"; RELAY_LOG_FILE="$relay_wd/relay.log"; LOG_DIR="$relay_wd"
   export FISHHAWK_DEV_SMEE_BIN="$relay_wd/smee"
   export FISHHAWK_DEV_WEBHOOK_CHANNEL="https://smee.io/dietoken"
+  # #3587: the DEFAULT 1.0s window races the stub's whole exec -> exit -> reap
+  # lifecycle (`kill -0` answers for an unreaped zombie too), which costs
+  # 200-600ms of it even idle; under verify's load the death landed AFTER the
+  # window and _relay_up reported SUCCESS — a false green on the very branch this
+  # case exists to pin. Raise the poll count so the case tests the DETECTOR
+  # rather than that race. This does NOT weaken the assertions: the stub still dies
+  # immediately, and all four claims below (non-zero rc, the C3-distinct reason,
+  # the "died immediately" text, and the removed pid file) are unchanged — a
+  # detector that failed to notice the death would still fail them.
+  export FISHHAWK_DEV_RELAY_LIVENESS_POLLS=150
   out="$(_relay_up 2>&1)"; rc=$?
   print -r -- "$rc" > "$relay_wd/rc"; print -r -- "$out" > "$relay_wd/out"
 )
@@ -4840,7 +4863,52 @@ if [[ -n "$relay_rc" && "$relay_rc" != "0" ]]; then pass "_relay_up fails (non-z
 if [[ "$relay_out" != *"npm install -g smee-client"* ]]; then pass "_relay_up spawn-then-die reason is DISTINCT from the resolve-stage reason (no 'npm install' substring — C3 invariant)"; else fail "_relay_up spawn-then-die reason must not contain 'npm install -g smee-client' (got: $relay_out)"; fi
 if [[ "$relay_out" == *"died immediately"* ]]; then pass "_relay_up names the immediate death and points at the relay log"; else fail "_relay_up should name the immediate death (got: $relay_out)"; fi
 if [[ ! -f "$relay_wd/relay.pid" ]]; then pass "_relay_up removes the pid file on spawn-then-die"; else fail "_relay_up should remove the pid file on spawn-then-die"; fi
+# DISOWN GUARD (#3587). This case runs _relay_up inside a `$( )` capture, and a
+# zsh subshell keeps no job table, so bare `disown` fails with "no current job"
+# DETERMINISTICALLY — the line the verify failure showed leaking into operator
+# output alongside the reason. Nothing else suppresses it, so this assertion is
+# the guard's counterfactual: remove the filter in scripts/dev and it goes RED.
+if [[ "$relay_out" != *"no current job"* ]]; then pass "_relay_up leaks no zsh 'no current job' disown error into operator output"; else fail "_relay_up must suppress the disown 'no current job' error (got: $relay_out)"; fi
 rm -rf "$relay_wd"
+
+# 18g-2. DEFAULT-WINDOW PIN (scope-amendment binding constraint 3). The
+# override above is a harness-only budget knob, so the production window must be
+# provably untouched: with FISHHAWK_DEV_RELAY_LIVENESS_POLLS UNSET the accessor
+# returns 5, and 5 x the loop's 0.2s sleep is EXACTLY the 1.0s window #3169
+# shipped. Also pins that a set override is honoured (otherwise 18g's budget
+# would be silently inert and it would still be racing spawn) and that a junk or
+# non-positive override falls back to the default rather than disabling the
+# detector.
+relay_polls_default="$(unset FISHHAWK_DEV_RELAY_LIVENESS_POLLS; _relay_liveness_polls)"
+if [[ "$relay_polls_default" == "5" ]]; then
+  pass "_relay_liveness_polls defaults to 5 polls x 0.2s = the unchanged 1.0s window"
+else
+  fail "_relay_liveness_polls default must stay 5 (got: $relay_polls_default)"
+fi
+relay_polls_override="$(FISHHAWK_DEV_RELAY_LIVENESS_POLLS=150 _relay_liveness_polls)"
+if [[ "$relay_polls_override" == "150" ]]; then
+  pass "_relay_liveness_polls honours the dev-only override (18g's budget is live, not inert)"
+else
+  fail "_relay_liveness_polls should honour the override (got: $relay_polls_override)"
+fi
+for relay_polls_junk in "0" "-1" "abc" "1.5" ""; do
+  relay_polls_got="$(FISHHAWK_DEV_RELAY_LIVENESS_POLLS="$relay_polls_junk" _relay_liveness_polls)"
+  if [[ "$relay_polls_got" == "5" ]]; then
+    pass "_relay_liveness_polls falls back to the default for override '${relay_polls_junk}' (detector never disabled)"
+  else
+    fail "_relay_liveness_polls should fall back to 5 for override '${relay_polls_junk}' (got: $relay_polls_got)"
+  fi
+done
+# The default is a WINDOW only if the loop's interval is still 0.2s, so scope the
+# body-grep to _relay_up itself (a repo-wide `sleep 0.2` match would be satisfied
+# by any other helper's sleep and prove nothing): extract the function body and
+# require BOTH the polls-driven bound and the 0.2s interval inside it.
+relay_up_body="$(awk '/^_relay_up\(\) \{/{f=1} f{print} f&&/^\}$/{exit}' "$REPO_ROOT/scripts/dev")"
+if [[ "$relay_up_body" == *'while (( i < polls )); do'* && "$relay_up_body" == *'sleep 0.2'* ]]; then
+  pass "_relay_up's poll loop reads _relay_liveness_polls and keeps the 0.2s interval"
+else
+  fail "_relay_up's poll loop should bound on \$polls x a 0.2s sleep (got body: ${relay_up_body})"
+fi
 
 # 18h. RE-ENTRANCY (approval condition 1). A live pid file → zero new spawns (the
 # argv-capture file must NOT appear) and the ORIGINAL pid still in the file.
