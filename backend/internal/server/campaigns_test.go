@@ -28,11 +28,13 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaigndriver"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/gitlabclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
+	workmgmtgitlab "github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt/gitlab"
 )
 
 // --- in-memory campaign repository fake ---
@@ -1797,8 +1799,9 @@ func TestCreateCampaign_GroupEpicRef_422(t *testing.T) {
 }
 
 // TestCreateCampaign_GroupEpicRef_NoItemsSupport_422 pins the OTHER arm of
-// operator condition 1: on a provider that serves NEITHER campaign source (the
-// gitlab File-only shape, here fakeWorkProvider), the group-epic remedy must NOT
+// operator condition 1: on a provider that serves NEITHER campaign source (a
+// File-only provider, here fakeWorkProvider — the gitlab provider serves both
+// since #3658), the group-epic remedy must NOT
 // recommend items mode (which also fails there) and instead point at driving
 // issues standalone.
 func TestCreateCampaign_GroupEpicRef_NoItemsSupport_422(t *testing.T) {
@@ -9085,16 +9088,16 @@ func TestCreateCampaign_IdempotentReplay_PrecedesProviderValidation(t *testing.T
 	}
 }
 
-// TestCreateCampaign_GitLabProvider_EpicChildrenUnsupported pins the HONEST
-// RESIDUAL as a test rather than only as prose: selecting `provider: gitlab`
-// reaches 501 epic_children_unsupported naming the RESOLVED id, because the
-// GitLab work-item provider implements neither EpicChildrenQuerier nor
-// IssueSetDependencyResolver in v0. This change makes the refusal accurate and
-// correctable; it does not make a GitLab campaign assemble.
+// TestCreateCampaign_GitLabProvider_EpicChildrenUnsupported pins that selecting
+// a provider by id (`provider: gitlab`) that resolves to a File-only instance
+// reaches 501 epic_children_unsupported naming the RESOLVED id. The fake is a
+// File-only stand-in: the REAL gitlab provider serves both campaign sources
+// since #3658 (TestCreateCampaign_GitLabItems_RealProvider_E2E), so this now
+// pins the resolved-id refusal shape, not the GitLab capability surface.
 func TestCreateCampaign_GitLabProvider_EpicChildrenUnsupported(t *testing.T) {
 	stubConventionsProvider(t, workmgmt.Conventions{Provider: workmgmt.Default().Provider})
 	stubRegisteredWorkItemProviders(t, []string{workmgmt.Default().Provider, "gitlab"})
-	// A File-only provider, exactly the GitLab v0 capability surface.
+	// A File-only provider (the pre-#3658 GitLab capability surface).
 	stubWorkItemProviderLookup(t, func(id string) (workmgmt.Provider, error) {
 		return &fakeFileOnlyProvider{name: id}, nil
 	})
@@ -9114,8 +9117,8 @@ func TestCreateCampaign_GitLabProvider_EpicChildrenUnsupported(t *testing.T) {
 	}
 }
 
-// fakeFileOnlyProvider implements Provider and NOTHING else — the v0 GitLab
-// work-item provider's capability surface.
+// fakeFileOnlyProvider implements Provider and NOTHING else — a File-only
+// capability surface (the jira provider's; gitlab's before #3658).
 type fakeFileOnlyProvider struct{ name string }
 
 func (f *fakeFileOnlyProvider) Name() string { return f.name }
@@ -9266,5 +9269,185 @@ func TestCreateCampaign_AdmissionScreen_OnlyAdmittedItems(t *testing.T) {
 	decodeCreatedCampaign(t, w)
 	if strings.Contains(w.Body.String(), "admission_screen") {
 		t.Errorf("excluded sibling was screened: %s", w.Body.String())
+	}
+}
+
+// --- the REAL gitlab provider behind the campaign handler (#3658) ---
+
+// fakeGitLabAPI is an in-memory workmgmtgitlab.API: the REAL gitlab provider is
+// constructed over it, so these tests cross the handler -> provider ->
+// gitlabclient-seam boundary with only the transport faked. Every piece of
+// bookkeeping is mutex-guarded: the provider fans GetIssue / ListIssueLinks out
+// over a bounded worker pool (AGENTS.md #3226), so an unguarded map would make
+// a -race red attributable to the fake rather than to the control under test.
+type fakeGitLabAPI struct {
+	mu        sync.Mutex
+	projectID int
+	issues    map[int]*gitlabclient.Issue
+	links     map[int][]gitlabclient.IssueLink
+	calls     int // every API call, of any kind
+	created   int
+}
+
+func newFakeGitLabAPI(projectID int) *fakeGitLabAPI {
+	return &fakeGitLabAPI{
+		projectID: projectID,
+		issues:    map[int]*gitlabclient.Issue{},
+		links:     map[int][]gitlabclient.IssueLink{},
+	}
+}
+
+// addIssue seeds one open issue; blockedBy names local is_blocked_by targets
+// and relatesTo local relates_to links.
+func (f *fakeGitLabAPI) addIssue(iid int, title, body string, blockedBy, relatesTo []int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.issues[iid] = &gitlabclient.Issue{
+		IID: iid, Title: title, Description: body, State: "opened",
+		WebURL: "https://gitlab.example/group/app/-/issues/" + strconv.Itoa(iid),
+	}
+	for _, t := range blockedBy {
+		f.links[iid] = append(f.links[iid], gitlabclient.IssueLink{IID: t, ProjectID: f.projectID, LinkType: "is_blocked_by"})
+	}
+	for _, t := range relatesTo {
+		f.links[iid] = append(f.links[iid], gitlabclient.IssueLink{IID: t, ProjectID: f.projectID, LinkType: "relates_to"})
+	}
+}
+
+func (f *fakeGitLabAPI) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
+func (f *fakeGitLabAPI) GetProject(_ context.Context, _ string) (*gitlabclient.Project, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	return &gitlabclient.Project{ID: f.projectID, WebURL: "https://gitlab.example/group/app"}, nil
+}
+
+func (f *fakeGitLabAPI) CreateIssue(_ context.Context, _ int, p gitlabclient.CreateIssueParams) (*gitlabclient.CreatedIssue, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	f.created++
+	iid := 900 + f.created
+	return &gitlabclient.CreatedIssue{IID: iid, WebURL: "https://gitlab.example/group/app/-/issues/" + strconv.Itoa(iid)}, nil
+}
+
+func (f *fakeGitLabAPI) LinkIssues(_ context.Context, _, _, _ int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	return nil
+}
+
+func (f *fakeGitLabAPI) GetIssue(_ context.Context, _, iid int) (*gitlabclient.Issue, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	is, ok := f.issues[iid]
+	if !ok {
+		return nil, fmt.Errorf("fake gitlab: issue %d not found", iid)
+	}
+	cp := *is
+	return &cp, nil
+}
+
+func (f *fakeGitLabAPI) ListIssueLinks(_ context.Context, _, iid int) ([]gitlabclient.IssueLink, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	return append([]gitlabclient.IssueLink(nil), f.links[iid]...), nil
+}
+
+// registerRealGitLabProvider registers the REAL gitlab provider over api under
+// its production id and points the conventions at it with a gitlab block.
+// Non-parallel callers only: it mutates the process-global registry and
+// conventionsLoader.
+func registerRealGitLabProvider(t *testing.T, api *fakeGitLabAPI) {
+	t.Helper()
+	workmgmt.Register(workmgmtgitlab.New(api))
+	conv := workmgmt.Default()
+	conv.Provider = workmgmtgitlab.ProviderName
+	conv.GitLab = &workmgmt.GitLabConnection{Project: "group/app"}
+	prev := conventionsLoader
+	conventionsLoader = func(context.Context, string) (workmgmt.Conventions, error) { return conv, nil }
+	t.Cleanup(func() { conventionsLoader = prev })
+}
+
+// TestCreateCampaign_GitLabItems_RealProvider_E2E is the cross-boundary seam for
+// #3658: POST /v0/campaigns in items mode against the REAL gitlab provider (only
+// the gitlabclient transport is faked). Issue 12 is_blocked_by 11 — the
+// GitLab link type the provider maps to depends_on — so the persisted wave DAG
+// must carry 12 -> 11, and 13 (no links) must be independent. Before #3658 this
+// request answered 501 issue_set_resolution_unsupported.
+func TestCreateCampaign_GitLabItems_RealProvider_E2E(t *testing.T) {
+	api := newFakeGitLabAPI(55)
+	api.addIssue(11, "first", "", nil, nil)
+	api.addIssue(12, "second", "", []int{11}, nil)
+	api.addIssue(13, "third", "", nil, []int{11}) // relates_to is NOT an edge
+	registerRealGitLabProvider(t, api)
+	repo := newFakeCampaignRepo()
+	s := New(Config{CampaignRepo: repo}) // GitHub nil: a gitlab campaign needs none
+
+	w := postCampaign(t, s, `{"repo":"group/app","items":["11","#12","issue:13"]}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create status = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+	var created campaignResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode created campaign: %v", err)
+	}
+	items, err := repo.ListCampaignItemsForCampaign(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("list items: %v", err)
+	}
+	deps := map[string][]string{}
+	for _, it := range items {
+		deps[it.IssueRef] = it.DependsOn
+	}
+	if len(deps) != 3 {
+		t.Fatalf("persisted items = %v, want exactly {11,12,13}", deps)
+	}
+	if got := deps["issue:12"]; len(got) != 1 || got[0] != "issue:11" {
+		t.Errorf("issue:12 depends_on = %v, want [issue:11] (the is_blocked_by edge)", got)
+	}
+	if got := deps["issue:11"]; len(got) != 0 {
+		t.Errorf("issue:11 depends_on = %v, want none", got)
+	}
+	if got := deps["issue:13"]; len(got) != 0 {
+		t.Errorf("issue:13 depends_on = %v, want none (relates_to is not a dependency)", got)
+	}
+}
+
+// TestCreateCampaign_GitLabGroupEpicRef_RefusedBeforeAnyProviderCall is operator
+// condition 2 of #3658, pinned in-loop: now that the REAL gitlab provider serves
+// both campaign sources, a Premium group-epic ref (`group&5`) must STILL be
+// refused 422 campaign_epic_ref_group_unsupported — and refused BEFORE any
+// provider call, so the fake gitlab API records ZERO calls (no GetProject, no
+// GetIssue, no ListIssueLinks). campaign_sources_supported reports both sources
+// the provider serves.
+func TestCreateCampaign_GitLabGroupEpicRef_RefusedBeforeAnyProviderCall(t *testing.T) {
+	api := newFakeGitLabAPI(55)
+	api.addIssue(5, "an issue sharing the group epic's number", "", nil, nil)
+	registerRealGitLabProvider(t, api)
+	s := New(Config{CampaignRepo: newFakeCampaignRepo()})
+
+	w := postCampaign(t, s, `{"repo":"group/app","epic_ref":"group&5"}`)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (body=%s)", w.Code, w.Body.String())
+	}
+	code, details := decodeCampaignErrorDetails(t, w)
+	if code != "campaign_epic_ref_group_unsupported" {
+		t.Fatalf("code = %q, want campaign_epic_ref_group_unsupported (body=%s)", code, w.Body.String())
+	}
+	srcs, _ := details["campaign_sources_supported"].([]any)
+	if len(srcs) != 2 || srcs[0] != "epic_ref" || srcs[1] != "items" {
+		t.Errorf("campaign_sources_supported = %v, want [epic_ref items] for the gitlab provider", details["campaign_sources_supported"])
+	}
+	if n := api.callCount(); n != 0 {
+		t.Errorf("gitlab API called %d times, want 0 — a group-epic ref must be refused before any forge round-trip", n)
 	}
 }

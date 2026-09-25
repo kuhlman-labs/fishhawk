@@ -3,7 +3,10 @@ package gitlab
 import (
 	"context"
 	"errors"
+	"strconv"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/gitlabclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
@@ -24,7 +27,167 @@ type fakeAPI struct {
 	linkIID    int
 	linkTarget int
 	linkErr    error
+
+	// Campaign-source reads (campaign.go). These are reached from a
+	// BOUNDED-CONCURRENCY pool, so every piece of bookkeeping below is guarded
+	// by mu (the AGENTS.md #3226 trap): an unguarded map here would make a
+	// -race RED attributable to the fake rather than the control under test.
+	// The canned-response maps are populated before the call and only READ
+	// under mu afterwards.
+	mu        sync.Mutex
+	issues    map[int]*gitlabclient.Issue
+	issueErrs map[int]error
+	nilIssue  map[int]bool // GetIssue returns (nil, nil) for these iids
+	// errWithIssue makes GetIssue return the canned issue ALONGSIDE its
+	// issueErrs entry, so the classifier's error branch is observable apart
+	// from its nil-issue branch.
+	errWithIssue map[int]bool
+	links        map[int][]gitlabclient.IssueLink
+	linkErrs     map[int]error
+	getCalls     map[int]int
+	linkCalls    map[int]int
+	completed    map[int]bool // iid -> its (issue + links) read returned OK
+	inFlight     int
+	peak         int
+	// hold, when non-nil, blocks every GetIssue until closed (peak probe).
+	hold chan struct{}
+	// delay, when non-nil, returns a per-call sleep (jitter test).
+	delay func(iid int) time.Duration
+	// onGetIssue, when non-nil, runs OUTSIDE mu before the canned answer; a
+	// non-nil return replaces it (deadline tests cancel the ctx here).
+	onGetIssue func(ctx context.Context, iid int) error
 }
+
+// issue registers a canned open/closed issue and its links on the fake.
+func (f *fakeAPI) issue(iid int, state, body string, labels []string, links ...gitlabclient.IssueLink) *fakeAPI {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.issues == nil {
+		f.issues = map[int]*gitlabclient.Issue{}
+		f.links = map[int][]gitlabclient.IssueLink{}
+	}
+	f.issues[iid] = &gitlabclient.Issue{
+		IID: iid, Title: "issue " + itoa(iid), Description: body, State: state, Labels: labels,
+		WebURL: "https://gitlab.example/acme/widgets/-/issues/" + itoa(iid),
+	}
+	f.links[iid] = links
+	return f
+}
+
+func (f *fakeAPI) GetIssue(ctx context.Context, projectID, iid int) (*gitlabclient.Issue, error) {
+	f.mu.Lock()
+	if f.getCalls == nil {
+		f.getCalls = map[int]int{}
+	}
+	f.getCalls[iid]++
+	f.inFlight++
+	if f.inFlight > f.peak {
+		f.peak = f.inFlight
+	}
+	hold, delay, hook := f.hold, f.delay, f.onGetIssue
+	f.mu.Unlock()
+	defer func() {
+		f.mu.Lock()
+		f.inFlight--
+		f.mu.Unlock()
+	}()
+
+	if hold != nil {
+		<-hold
+	}
+	if delay != nil {
+		time.Sleep(delay(iid))
+	}
+	if hook != nil {
+		if err := hook(ctx, iid); err != nil {
+			return nil, err
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if projectID != 42 {
+		return nil, errors.New("fake: unexpected project id " + itoa(projectID))
+	}
+	if err := f.issueErrs[iid]; err != nil {
+		if is, ok := f.issues[iid]; ok && f.errWithIssue[iid] {
+			cp := *is
+			return &cp, err
+		}
+		return nil, err
+	}
+	if f.nilIssue[iid] {
+		return nil, nil
+	}
+	is, ok := f.issues[iid]
+	if !ok {
+		return nil, errors.New("fake: 404 issue " + itoa(iid))
+	}
+	cp := *is
+	return &cp, nil
+}
+
+func (f *fakeAPI) ListIssueLinks(ctx context.Context, projectID, iid int) ([]gitlabclient.IssueLink, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.linkCalls == nil {
+		f.linkCalls = map[int]int{}
+	}
+	f.linkCalls[iid]++
+	if projectID != 42 {
+		return nil, errors.New("fake: unexpected project id " + itoa(projectID))
+	}
+	if err := f.linkErrs[iid]; err != nil {
+		return nil, err
+	}
+	if f.completed == nil {
+		f.completed = map[int]bool{}
+	}
+	f.completed[iid] = true
+	return append([]gitlabclient.IssueLink(nil), f.links[iid]...), nil
+}
+
+// getIssueCalls reads the per-iid GetIssue count under the lock.
+func (f *fakeAPI) getIssueCalls(iid int) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.getCalls[iid]
+}
+
+// peakInFlight reads the in-flight high-water mark under the lock.
+func (f *fakeAPI) peakInFlight() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.peak
+}
+
+// waitCompleted blocks until every iid's (issue + links) read has returned.
+func (f *fakeAPI) waitCompleted(t *testing.T, iids ...int) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		f.mu.Lock()
+		all := true
+		for _, n := range iids {
+			if !f.completed[n] {
+				all = false
+			}
+		}
+		f.mu.Unlock()
+		if all {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Errorf("fake: reads of %v never completed", iids)
+}
+
+func itoa(n int) string { return strconv.Itoa(n) }
 
 func (f *fakeAPI) GetProject(_ context.Context, path string) (*gitlabclient.Project, error) {
 	f.getPath = path
@@ -402,7 +565,7 @@ func TestParseIssueRef(t *testing.T) {
 // TestProvider_DoesNotImplementWorkItemReader is the executable form of
 // acceptance criterion 4 (#2230): the SECOND provider is not forced into a
 // GitHub-shaped contract. The read/list capability is an OPTIONAL capability
-// interface, so this File-only provider does not satisfy it — and, decisively,
+// interface, so this provider (File plus the campaign sources) does not satisfy it — and, decisively,
 // this test would not COMPILE if the methods had been folded into the base
 // Provider instead.
 //
@@ -415,7 +578,7 @@ func TestParseIssueRef(t *testing.T) {
 func TestProvider_DoesNotImplementWorkItemReader(t *testing.T) {
 	var p workmgmt.Provider = New(&fakeAPI{})
 	if _, ok := p.(workmgmt.WorkItemReader); ok {
-		t.Fatal("gitlab provider satisfies workmgmt.WorkItemReader; v0 is File-only — if a reader was added deliberately, update the package doc and this test")
+		t.Fatal("gitlab provider satisfies workmgmt.WorkItemReader; the reader is deliberately unimplemented — if one was added deliberately, update the package doc and this test")
 	}
 }
 
@@ -463,7 +626,7 @@ func (*namedFileOnlyProvider) Name() string { return fileOnlyRegistryName }
 
 // TestProvider_DoesNotImplementGroomingMutator is the executable proof that
 // the grooming-APPLY capability (E54.5 / #2237) was added as a SIXTH optional
-// capability interface and NOT folded into workmgmt.Provider. This File-only
+// capability interface and NOT folded into workmgmt.Provider. This
 // provider does not satisfy it — and, decisively, this test would not COMPILE
 // had ApplyGroomingMutation been added to Provider, because New(&fakeAPI{})
 // would then fail to satisfy workmgmt.Provider on the very first line.
@@ -475,7 +638,7 @@ func (*namedFileOnlyProvider) Name() string { return fileOnlyRegistryName }
 func TestProvider_DoesNotImplementGroomingMutator(t *testing.T) {
 	var p workmgmt.Provider = New(&fakeAPI{})
 	if _, ok := p.(workmgmt.GroomingMutator); ok {
-		t.Fatal("gitlab provider satisfies workmgmt.GroomingMutator; v0 is File-only — if a mutator was added deliberately, update the package doc and this test")
+		t.Fatal("gitlab provider satisfies workmgmt.GroomingMutator; the mutator is deliberately unimplemented — if one was added deliberately, update the package doc and this test")
 	}
 }
 

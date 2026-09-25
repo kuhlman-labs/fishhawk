@@ -54,7 +54,7 @@ type StartCampaignInput struct {
 	// provider for THIS campaign. Deliberately a work-item provider ID and not
 	// a github|gitlab `forge` enum — the id space includes `jira`, and `forge`
 	// on fishhawk_start_run means which forge HOSTS the repo.
-	Provider string `json:"provider,omitempty" jsonschema:"OPTIONAL the work-item provider id to assemble this campaign against: 'github_projects', 'gitlab' or 'jira'. Defaults to the repo's work-management conventions (the .fishhawk/work-management.yaml provider: field, falling back to github_projects). Reach for it when the conventions-resolved provider is not one this deployment has registered — the 501 provider_unimplemented refusal names the registered set, and passing one of those ids here corrects the call in-band with no daemon restart. An unregistered id is refused 400 validation_failed before any forge round-trip. NOTE the honest residual: 'gitlab' reaches an honest 501 epic_children_unsupported / issue_set_resolution_unsupported, because the GitLab work-item provider implements neither campaign capability in v0"`
+	Provider string `json:"provider,omitempty" jsonschema:"OPTIONAL the work-item provider id to assemble this campaign against: 'github_projects', 'gitlab' or 'jira'. Defaults to the repo's work-management conventions (the .fishhawk/work-management.yaml provider: field, falling back to github_projects). Reach for it when the conventions-resolved provider is not one this deployment has registered — the 501 provider_unimplemented refusal names the registered set, and passing one of those ids here corrects the call in-band with no daemon restart. An unregistered id is refused 400 validation_failed before any forge round-trip. 'gitlab' serves both campaign sources (epic_ref and items) since #3658; only a GitLab Premium group-epic ref is refused campaign_epic_ref_group_unsupported"`
 }
 
 // StartCampaignOutput carries the created campaign row.
@@ -185,10 +185,9 @@ work-management conventions. Reach for it when a 501 provider_unimplemented says
 the conventions-resolved provider is not one this deployment registered: the
 refusal names the registered set and a remedy, and passing one of those ids here
 corrects the call in-band with no daemon restart. An unregistered id is refused
-400 validation_failed before any forge round-trip. Selecting 'gitlab' reaches an
-honest 501 epic_children_unsupported / issue_set_resolution_unsupported — the
-GitLab work-item provider implements neither campaign capability in v0, so this
-makes the refusal accurate, not the campaign assemblable.
+400 validation_failed before any forge round-trip. The GitLab work-item provider
+serves both campaign sources (epic_ref and items) since #3658; only a GitLab
+Premium group-epic ref is refused (campaign_epic_ref_group_unsupported).
 `),
 	}, resolver.startCampaign)
 }
@@ -1075,7 +1074,7 @@ func sourcesContain(sources []string, src string) bool {
 // campaignSourcesRemedy renders the operator-actionable remedy for a 501
 // capability refusal (epic_children_unsupported / issue_set_resolution_unsupported),
 // naming ONLY the sources the resolved provider actually serves (#3648). When it
-// serves NEITHER — the GitLab File-only case the issue reports, or an older
+// serves NEITHER — a File-only provider (GitLab was one until #3658), or an older
 // backend that shipped no detail — it advertises NO mode that also 501s and points
 // at standalone runs instead: the empty-sources string deliberately names neither
 // `items` nor `epic_ref`, which is what the empty-sources test asserts the ABSENCE

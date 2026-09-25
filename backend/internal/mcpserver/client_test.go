@@ -2978,6 +2978,7 @@ func TestOnboardingReadinessReport_WorkItemProviderMirrorsBackendTags(t *testing
 	  "reviewers": [], "scopes": {"adequate": true, "required": [], "missing": []},
 	  "work_item_provider": {"status": "status-sentinel", "provider": "provider-sentinel",
 	    "registered": ["registered-one-sentinel", "registered-two-sentinel"],
+	    "campaign_sources": ["source-one-sentinel", "source-two-sentinel"],
 	    "reason": "reason-sentinel", "note": "wip-note-sentinel",
 	    "missing_hint": "wip-hint-sentinel"}}`
 	var got OnboardingReadinessReport
@@ -3008,6 +3009,16 @@ func TestOnboardingReadinessReport_WorkItemProviderMirrorsBackendTags(t *testing
 	for i, id := range want {
 		if wp.Registered[i] != id {
 			t.Errorf("Registered[%d] = %q, want %q", i, wp.Registered[i], id)
+		}
+	}
+	// campaign_sources (#3658), also multi-element for the same reason.
+	wantSources := []string{"source-one-sentinel", "source-two-sentinel"}
+	if len(wp.CampaignSources) != len(wantSources) {
+		t.Fatalf("CampaignSources = %v, want %v", wp.CampaignSources, wantSources)
+	}
+	for i, src := range wantSources {
+		if wp.CampaignSources[i] != src {
+			t.Errorf("CampaignSources[%d] = %q, want %q", i, wp.CampaignSources[i], src)
 		}
 	}
 }

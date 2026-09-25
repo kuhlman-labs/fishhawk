@@ -1456,6 +1456,7 @@ func TestDoctor_WorkItemProvider_ReemitsWireBytes(t *testing.T) {
 	  "reviewers": [], "scopes": {"adequate": true, "required": [], "missing": []},
 	  "work_item_provider": {"status": "unregistered", "provider": "jira",
 	    "registered": ["github_projects"],
+	    "campaign_sources": [],
 	    "note": "501 provider_unimplemented",
 	    "missing_hint": "set FISHHAWKD_JIRA_BASE_URL"}}`
 	for _, tc := range []struct {
@@ -1490,6 +1491,7 @@ func TestDoctor_WorkItemProvider_ReemitsWireBytes(t *testing.T) {
 				`"status":"unregistered"`,
 				`"provider":"jira"`,
 				`"registered":["github_projects"]`,
+				`"campaign_sources":[]`,
 				`"note":"501 provider_unimplemented"`,
 				`"missing_hint":"set FISHHAWKD_JIRA_BASE_URL"`,
 			} {
@@ -1522,6 +1524,9 @@ func TestDoctorToolDescription_DescribesWorkItemProvider(t *testing.T) {
 		"a credential set after boot changes nothing until fishhawkd restarts",
 		"set OUTSIDE every repo-scoped cascade",
 		"NOT the same claim as unregistered",
+		"campaign_sources[] (#3658)",
+		"ALWAYS an array",
+		"[] on a registered provider means fishhawk_start_campaign refuses 501 in either mode",
 	} {
 		if !strings.Contains(desc, want) {
 			t.Errorf("fishhawk_doctor description lacks %q", want)

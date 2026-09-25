@@ -14,6 +14,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -553,6 +554,144 @@ func TestGitLabClient_UpdateIssue_ValidatesArgs(t *testing.T) {
 	}
 	if _, err := c.UpdateIssue(context.Background(), 42, 0, UpdateIssueParams{StateEvent: "close"}); err == nil {
 		t.Error("UpdateIssue(iid 0) = nil, want an error")
+	}
+	if n := len(s.requests()); n != 0 {
+		t.Errorf("argument validation must fire before any HTTP call; got %d requests", n)
+	}
+}
+
+// --- ListIssueLinks --------------------------------------------------------
+
+// TestGitLabClient_ListIssueLinks_ReadsAllLinkTypes is the happy read: the
+// request path, the PRIVATE-TOKEN, and every IssueLink field decoded,
+// including a link_type round-trip for all three GitLab values and a
+// CROSS-PROJECT link carried through with its own project id (never
+// reduced to a local iid by the client).
+func TestGitLabClient_ListIssueLinks_ReadsAllLinkTypes(t *testing.T) {
+	s := newIssueServer(t)
+	s.mux.HandleFunc("GET /api/v4/projects/42/issues/7/links", func(w http.ResponseWriter, r *http.Request) {
+		writeIssueJSON(w, http.StatusOK, `[
+			{"iid":8,"project_id":42,"title":"eight","description":"body 8","state":"opened","labels":["autonomy:high"],"web_url":"https://gl/8","link_type":"relates_to","issue_link_id":1},
+			{"iid":9,"project_id":42,"title":"nine","description":"","state":"closed","labels":[],"web_url":"https://gl/9","link_type":"blocks"},
+			{"iid":3,"project_id":99,"title":"foreign","description":"x","state":"opened","labels":null,"web_url":"https://gl/other/3","link_type":"is_blocked_by"}
+		]`)
+	})
+
+	links, err := s.client().ListIssueLinks(context.Background(), 42, 7)
+	if err != nil {
+		t.Fatalf("ListIssueLinks: %v", err)
+	}
+	want := []IssueLink{
+		{IID: 8, ProjectID: 42, Title: "eight", Description: "body 8", State: "opened", Labels: []string{"autonomy:high"}, WebURL: "https://gl/8", LinkType: LinkTypeRelatesTo},
+		{IID: 9, ProjectID: 42, Title: "nine", State: "closed", Labels: []string{}, WebURL: "https://gl/9", LinkType: LinkTypeBlocks},
+		{IID: 3, ProjectID: 99, Title: "foreign", Description: "x", State: "opened", WebURL: "https://gl/other/3", LinkType: LinkTypeIsBlockedBy},
+	}
+	if !reflect.DeepEqual(links, want) {
+		t.Fatalf("links = %+v\nwant  %+v", links, want)
+	}
+	reqs := s.requests()
+	if len(reqs) != 1 || reqs[0].Method != http.MethodGet || reqs[0].Path != "/api/v4/projects/42/issues/7/links" || reqs[0].Token != "glpat-test" {
+		t.Errorf("requests = %+v, want one authenticated GET on the links path", reqs)
+	}
+}
+
+// TestGitLabClient_ListIssueLinks_PagesToExhaustion pins the Link-header
+// walk: deleting the loop drops the page-2 link and reddens the length check.
+func TestGitLabClient_ListIssueLinks_PagesToExhaustion(t *testing.T) {
+	s := newIssueServer(t)
+	s.mux.HandleFunc("GET /api/v4/projects/42/issues/7/links", func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Query().Get("page") {
+		case "", "1":
+			w.Header().Set("Link", `<`+s.srv.URL+`/api/v4/projects/42/issues/7/links?page=2&per_page=100>; rel="next"`)
+			writeIssueJSON(w, http.StatusOK, `[{"iid":8,"project_id":42,"link_type":"relates_to"}]`)
+		case "2":
+			writeIssueJSON(w, http.StatusOK, `[{"iid":9,"project_id":42,"link_type":"is_blocked_by"}]`)
+		default:
+			t.Errorf("unexpected page %q", r.URL.Query().Get("page"))
+			writeIssueJSON(w, http.StatusBadRequest, `{}`)
+		}
+	})
+	links, err := s.client().ListIssueLinks(context.Background(), 42, 7)
+	if err != nil {
+		t.Fatalf("ListIssueLinks: %v", err)
+	}
+	if len(links) != 2 || links[0].IID != 8 || links[1].IID != 9 || links[1].LinkType != LinkTypeIsBlockedBy {
+		t.Fatalf("links = %+v, want both pages in order", links)
+	}
+	if n := len(s.requests()); n != 2 {
+		t.Errorf("requests = %d, want 2 (one per page)", n)
+	}
+}
+
+// TestGitLabClient_ListIssueLinks_RefusesOffOriginNextLink pins the
+// same-origin guard on the links walk. The foreign host is a REACHABLE
+// in-test server, so deleting the sameOrigin call succeeds against it and
+// reddens the zero-hit assertion rather than failing on a dial error.
+func TestGitLabClient_ListIssueLinks_RefusesOffOriginNextLink(t *testing.T) {
+	var foreignHits atomic.Int64
+	foreign := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		foreignHits.Add(1)
+		writeIssueJSON(w, http.StatusOK, `[]`)
+	}))
+	t.Cleanup(foreign.Close)
+
+	s := newIssueServer(t)
+	s.mux.HandleFunc("GET /api/v4/projects/42/issues/7/links", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Link", `<`+foreign.URL+`/api/v4/projects/42/issues/7/links?page=2>; rel="next"`)
+		writeIssueJSON(w, http.StatusOK, `[{"iid":8,"project_id":42,"link_type":"relates_to"}]`)
+	})
+
+	links, err := s.client().ListIssueLinks(context.Background(), 42, 7)
+	if err == nil {
+		t.Fatalf("ListIssueLinks = %v, nil; want a refusal of the off-origin next link", links)
+	}
+	if !strings.Contains(err.Error(), "refusing next-page link") {
+		t.Errorf("err = %v, want the same-origin refusal", err)
+	}
+	if got := foreignHits.Load(); got != 0 {
+		t.Errorf("foreign host received %d requests, want 0 (token must not leave the configured origin)", got)
+	}
+}
+
+func TestGitLabClient_ListIssueLinks_APIError(t *testing.T) {
+	s := newIssueServer(t)
+	s.mux.HandleFunc("GET /api/v4/projects/42/issues/7/links", func(w http.ResponseWriter, r *http.Request) {
+		writeIssueJSON(w, http.StatusNotFound, `{"message":"404 Not found"}`)
+	})
+	_, err := s.client().ListIssueLinks(context.Background(), 42, 7)
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusNotFound || apiErr.Op != "list issue links" {
+		t.Fatalf("err = %v, want *APIError status 404 op list issue links", err)
+	}
+}
+
+func TestGitLabClient_ListIssueLinks_UndecodableBody(t *testing.T) {
+	s := newIssueServer(t)
+	s.mux.HandleFunc("GET /api/v4/projects/42/issues/7/links", func(w http.ResponseWriter, r *http.Request) {
+		writeIssueJSON(w, http.StatusOK, `{"not":"an array"`)
+	})
+	links, err := s.client().ListIssueLinks(context.Background(), 42, 7)
+	if err == nil || !strings.Contains(err.Error(), "decode issue links") {
+		t.Fatalf("ListIssueLinks = %v, %v; want a decode error", links, err)
+	}
+}
+
+func TestGitLabClient_ListIssueLinks_ValidatesArgs(t *testing.T) {
+	s := newIssueServer(t)
+	c := s.client()
+	for _, tc := range []struct {
+		name        string
+		project, id int
+		want        string
+	}{
+		{"zero project", 0, 7, "project id required"},
+		{"negative project", -1, 7, "project id required"},
+		{"zero iid", 42, 0, "issue iid required"},
+		{"negative iid", 42, -3, "issue iid required"},
+	} {
+		if _, err := c.ListIssueLinks(context.Background(), tc.project, tc.id); err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: err = %v, want %q", tc.name, err, tc.want)
+		}
 	}
 	if n := len(s.requests()); n != 0 {
 		t.Errorf("argument validation must fire before any HTTP call; got %d requests", n)
