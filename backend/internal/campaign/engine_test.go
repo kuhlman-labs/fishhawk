@@ -383,3 +383,88 @@ func TestDeriveState_RunlessMixedHumanLedDAG(t *testing.T) {
 		t.Errorf("DeriveState(allDone) = %q, want succeeded (all run-less settled)", got)
 	}
 }
+
+// TestNextEligible_IssueClosedCancelledIsNotRestartable is the E72.24 (#3563)
+// done-means for the resolved_by suppression: an item cancelled BECAUSE its
+// issue was closed not_planned/duplicate carries ResolvedByIssueClosed and stays
+// in Cancelled — never Restartable — however satisfied its deps are and whatever
+// its autonomy tier. The abandoned issue has no forward path, so surfacing
+// start_run for it is exactly what must not happen.
+//
+// COUNTERFACTUAL VEHICLE: deleting the `it.ResolvedBy != ResolvedByIssueClosed`
+// conjunct in engine.go NextEligible makes every row below land in Restartable
+// and this test go RED.
+func TestNextEligible_IssueClosedCancelledIsNotRestartable(t *testing.T) {
+	items := []*campaign.Item{
+		item("issue:1", campaign.ItemStateSucceeded, nil), // done — satisfies deps below
+		// cancelled by the issue-closed settle, deps satisfied, autonomy unset:
+		// WITHOUT the marker this is the exact shape #1729 diverts to Restartable.
+		{IssueRef: "issue:2", State: campaign.ItemStateCancelled, DependsOn: []string{"issue:1"}, ResolvedBy: campaign.ResolvedByIssueClosed},
+		// no deps at all — the other shape that would otherwise be Restartable.
+		{IssueRef: "issue:3", State: campaign.ItemStateCancelled, ResolvedBy: campaign.ResolvedByIssueClosed},
+	}
+	got := campaign.NextEligible(items)
+	want := campaign.Eligibility{
+		Done:      []string{"issue:1"},
+		Cancelled: []string{"issue:2", "issue:3"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("NextEligible =\n  %+v\nwant\n  %+v", got, want)
+	}
+	if len(got.Restartable) != 0 {
+		t.Errorf("restartable = %v, want none (an issue-closed cancellation is abandoned, not restartable)", got.Restartable)
+	}
+	if len(got.Eligible) != 0 {
+		t.Errorf("eligible = %v, want none", got.Eligible)
+	}
+}
+
+// TestNextEligible_OperatorCancelledStaysRestartable is the ANTI-OVER-REACH pin
+// paired with TestNextEligible_IssueClosedCancelledIsNotRestartable: the #3563
+// suppression must fire ONLY on an issue-closed cancellation. An OPERATOR
+// cancellation carries ResolvedBy == "" — seeded here BY CONSTRUCTION (a fresh
+// item that never went through a settle, the zero value), never by calling the
+// control — and stays Restartable exactly as #1729 shipped it.
+//
+// It must stay GREEN under the same deletion that reddens its sibling, which is
+// what makes that RED discrimination rather than a blanket change.
+func TestNextEligible_OperatorCancelledStaysRestartable(t *testing.T) {
+	items := []*campaign.Item{
+		item("issue:1", campaign.ItemStateSucceeded, nil), // done — satisfies deps below
+		// Operator-cancelled: the zero-value ResolvedBy, by construction.
+		{IssueRef: "issue:2", State: campaign.ItemStateCancelled, DependsOn: []string{"issue:1"}},
+	}
+	if got := items[1].ResolvedBy; got != campaign.ResolvedByUnset {
+		t.Fatalf("fixture ResolvedBy = %q, want %q (the operator-cancelled default)", got, campaign.ResolvedByUnset)
+	}
+	got := campaign.NextEligible(items)
+	want := campaign.Eligibility{
+		Done:        []string{"issue:1"},
+		Restartable: []string{"issue:2"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("NextEligible =\n  %+v\nwant\n  %+v", got, want)
+	}
+}
+
+// TestNextEligible_IssueClosedMarkerDoesNotSuppressFailed pins the #3563
+// suppression's BOUNDARY on the other axis: the marker is consulted by the
+// CANCELLED arm only. The failed arm is untouched — a failed item is never
+// stamped by the settle pass (class B settles to succeeded, class A only from
+// pending/blocked) — so even a hypothetically-marked failed item keeps #1838's
+// Restartable diversion. This is the pin that keeps a future edit from widening
+// the conjunct across both arms.
+func TestNextEligible_IssueClosedMarkerDoesNotSuppressFailed(t *testing.T) {
+	items := []*campaign.Item{
+		item("issue:1", campaign.ItemStateSucceeded, nil),
+		{IssueRef: "issue:2", State: campaign.ItemStateFailed, DependsOn: []string{"issue:1"}, ResolvedBy: campaign.ResolvedByIssueClosed},
+	}
+	got := campaign.NextEligible(items)
+	want := campaign.Eligibility{
+		Done:        []string{"issue:1"},
+		Restartable: []string{"issue:2"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("NextEligible =\n  %+v\nwant\n  %+v", got, want)
+	}
+}

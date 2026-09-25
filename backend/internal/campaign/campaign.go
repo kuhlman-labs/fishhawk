@@ -94,6 +94,40 @@ func (s ItemState) IsTerminal() bool {
 	}
 }
 
+// Resolution provenance markers for campaign_items.resolved_by (migration
+// 0085 / #3563): HOW an item reached its terminal state, where that matters to
+// the engine.
+//
+// ResolvedByUnset ("") is the unchanged default carried by every pre-0085 row
+// and by every ordinary transition — an operator cancellation, a run-linked
+// settle, a restart. ResolvedByIssueClosed marks an item settled by the
+// reconcile-on-read issue-closed pass, and is what lets NextEligible suppress
+// the Restartable offer for an item cancelled BECAUSE its issue was closed
+// not_planned/duplicate: an abandoned issue has no forward path, unlike an
+// operator cancellation.
+//
+// The set is mirrored by the migration-0085 CHECK constraint, which rejects
+// any other value at write time.
+const (
+	ResolvedByUnset       = ""
+	ResolvedByIssueClosed = "issue_closed"
+)
+
+// normalizeResolvedBy maps any value outside the migration-0085 CHECK set to
+// ResolvedByUnset, so an out-of-set caller value can never trip the column
+// constraint and fail the write. It mirrors the normalization posture of
+// SetCampaignItemAutonomy's tier normalization: the database CHECK is the
+// fail-closed backstop, this is the in-process guard that keeps a caller
+// mistake from turning into a failed settle.
+func normalizeResolvedBy(v string) string {
+	switch v {
+	case ResolvedByIssueClosed:
+		return v
+	default:
+		return ResolvedByUnset
+	}
+}
+
 // PausePolicy governs what the auto-driver pauses when a run gate is handed
 // off to a human (Track C / E25.7). It is an operator-configurable choice set
 // at campaign creation; the zero value normalizes to PausePolicyPauseCampaign
@@ -232,7 +266,19 @@ type Item struct {
 	// therefore the engine's Eligible slice — reproducible. Every pre-0074 row
 	// carries the DEFAULT 0 and so keeps its exact prior order via the retained
 	// (created_at, id) tiebreak.
-	Position  int
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	Position int
+	// ResolvedBy is the DURABLE provenance of how this item reached its
+	// terminal state (campaign_items.resolved_by, migration 0085 / #3563).
+	// The closed value set is {ResolvedByUnset, ResolvedByIssueClosed}, pinned
+	// by the column CHECK.
+	//
+	// "" (ResolvedByUnset) is the unchanged default: every pre-0085 row and
+	// every item settled by any path OTHER than the reconcile-on-read
+	// issue-closed pass — including an operator cancellation, which therefore
+	// stays Restartable exactly as today. ResolvedByIssueClosed is stamped
+	// atomically with the settling state UPDATE, and NextEligible reads it to
+	// suppress the Restartable offer for an issue-closed CANCELLATION.
+	ResolvedBy string
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
 }

@@ -53,6 +53,16 @@ type Eligibility struct {
 	// computeCampaignNextAction surfaces a Restartable item as start_run; the wire
 	// rollup folds it back into the cancelled slice so the rollup contract is
 	// unchanged.
+	//
+	// ONE FURTHER SUPPRESSION on the cancelled arm (#3563): an item carrying
+	// ResolvedByIssueClosed was cancelled BECAUSE its issue was closed
+	// not_planned/duplicate — abandoned, not merely halted — so it has no
+	// forward path and stays in Cancelled however satisfied its deps are. An
+	// operator cancellation (ResolvedByUnset, the default every pre-0085 row and
+	// every non-settle path carries) is unaffected. This same predicate is the
+	// SINGLE control behind the operator start verb's refusal:
+	// handleStartCampaignItemRun gates on this very NextEligible call, so the
+	// verb refuses an issue-closed cancellation without a second guard.
 	Restartable []string
 	// Paused items were handed off to a human by the auto-driver (E25.7). A
 	// paused item carries a RunID and a non-terminal state, so it must be
@@ -80,7 +90,13 @@ type Eligibility struct {
 // even with no run and no deps (which would otherwise fall through to the
 // eligible default branch). A deps-satisfied, non-autonomy:low cancelled item
 // is diverted to Restartable instead — still never Eligible (no auto-dispatch)
-// but flagged as restartable via the operator verb (#1729).
+// but flagged as restartable via the operator verb (#1729) — UNLESS it carries
+// ResolvedBy == ResolvedByIssueClosed (#3563), which marks a cancellation the
+// reconcile-on-read issue-closed pass wrote because the issue was closed
+// not_planned/duplicate: that work was abandoned, so restarting it is exactly
+// what must not be offered, and it stays in Cancelled. Because
+// handleStartCampaignItemRun's DAG gate is this same NextEligible call, that one
+// predicate also makes the operator start verb refuse the item.
 //
 // A failed item is likewise terminal for auto-dispatch (never Eligible), but a
 // deps-satisfied, non-autonomy:low failed item is diverted to Restartable too
@@ -124,8 +140,13 @@ func NextEligible(items []*Item) Eligibility {
 			// next_action can surface it as start_run. A deps-unsatisfied item, or
 			// an autonomy:low (human-led) one, stays in Cancelled. Exactly one of
 			// Restartable / Cancelled holds each cancelled item.
+			//
+			// An item stamped ResolvedByIssueClosed (#3563) is the third exclusion:
+			// it was cancelled because its issue was closed not_planned/duplicate,
+			// so the work is abandoned and there is nothing to restart. An operator
+			// cancellation carries ResolvedByUnset and is unaffected.
 			switch {
-			case depsSatisfied(it.DependsOn, done) && it.Autonomy != "low":
+			case depsSatisfied(it.DependsOn, done) && it.Autonomy != "low" && it.ResolvedBy != ResolvedByIssueClosed:
 				e.Restartable = append(e.Restartable, ref)
 			default:
 				e.Cancelled = append(e.Cancelled, ref)

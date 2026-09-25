@@ -5114,6 +5114,132 @@ func TestMigrateDown_CampaignQueuePositionAndGroomingSourceReversal(t *testing.T
 	}
 }
 
+// TestMigrateDown_CampaignItemsResolvedByReversal pins 0085 (E72.24 / #3563) in
+// BOTH directions: campaign_items.resolved_by and its CHECK constraint EXIST
+// after MigrateUp and are GONE after exactly one MigrateDown, with the table and
+// 0074's queue_position surviving (0085 is an ALTER, not a drop).
+//
+// It also asserts the additive shape the migration promises (NOT NULL with a ”
+// DEFAULT, so every pre-0085 row reads as "no recorded resolution provenance"
+// and stays Restartable exactly as today) AND that the CHECK is genuinely
+// enforced — an out-of-set marker is REFUSED at write time rather than silently
+// persisting a value campaign.NextEligible cannot interpret. That refusal is the
+// fail-closed control; deleting the CHECK from the up-migration makes the
+// 'bogus' insert succeed and this test go RED.
+//
+// Modelled on TestMigrateDown_CampaignQueuePositionAndGroomingSourceReversal.
+func TestMigrateDown_CampaignItemsResolvedByReversal(t *testing.T) {
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+	ctx := context.Background()
+
+	columnShape := func(table, col string) (int, string, string) {
+		var n int
+		var nullable, def *string
+		if err := pool.QueryRow(ctx,
+			`SELECT count(*), max(is_nullable), max(column_default) FROM information_schema.columns
+			  WHERE table_name = $1 AND column_name = $2`, table, col).Scan(&n, &nullable, &def); err != nil {
+			t.Fatalf("query %s.%s: %v", table, col, err)
+		}
+		var nullableStr, defStr string
+		if nullable != nil {
+			nullableStr = *nullable
+		}
+		if def != nil {
+			defStr = *def
+		}
+		return n, nullableStr, defStr
+	}
+	constraintCount := func(name string) int {
+		var n int
+		if err := pool.QueryRow(ctx,
+			`SELECT count(*) FROM pg_constraint WHERE conname = $1`, name).Scan(&n); err != nil {
+			t.Fatalf("query constraint %s: %v", name, err)
+		}
+		return n
+	}
+
+	n, nullable, def := columnShape("campaign_items", "resolved_by")
+	if n != 1 {
+		t.Errorf("campaign_items.resolved_by count after MigrateUp = %d, want 1 (0085 added it)", n)
+	}
+	if nullable != "NO" {
+		t.Errorf("campaign_items.resolved_by is_nullable = %q, want NO (the marker is never absent)", nullable)
+	}
+	if !strings.Contains(def, "''") {
+		t.Errorf("campaign_items.resolved_by default = %q, want an empty-string default so every pre-0085 row behaves as today", def)
+	}
+	if got := constraintCount("campaign_items_resolved_by_check"); got != 1 {
+		t.Errorf("campaign_items_resolved_by_check count after MigrateUp = %d, want 1", got)
+	}
+
+	// Seed the rows the CHECK is asserted against. A campaign row first (the
+	// item's FK target).
+	campaignID := uuid.New()
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO campaigns (id, repo, epic_ref, state) VALUES ($1, 'kuhlman-labs/fishhawk', 'issue:1439', 'pending')`,
+		campaignID); err != nil {
+		t.Fatalf("seed campaign: %v", err)
+	}
+	// An in-set marker is ACCEPTED and reads back verbatim.
+	okID := uuid.New()
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO campaign_items (id, campaign_id, issue_ref, state, resolved_by) VALUES ($1, $2, 'issue:1', 'cancelled', 'issue_closed')`,
+		okID, campaignID); err != nil {
+		t.Fatalf("insert resolved_by='issue_closed': %v (the CHECK must admit the in-set value)", err)
+	}
+	var readBack string
+	if err := pool.QueryRow(ctx, `SELECT resolved_by FROM campaign_items WHERE id = $1`, okID).Scan(&readBack); err != nil {
+		t.Fatalf("read back resolved_by: %v", err)
+	}
+	if readBack != "issue_closed" {
+		t.Errorf("resolved_by read back = %q, want issue_closed", readBack)
+	}
+	// An OUT-OF-SET marker is REFUSED by the CHECK — the fail-closed control.
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO campaign_items (id, campaign_id, issue_ref, state, resolved_by) VALUES ($1, $2, 'issue:2', 'cancelled', 'bogus')`,
+		uuid.New(), campaignID); err == nil {
+		t.Error("insert resolved_by='bogus' succeeded, want the migration-0085 CHECK to REFUSE an out-of-set marker")
+	} else if !strings.Contains(err.Error(), "campaign_items_resolved_by_check") {
+		t.Errorf("insert resolved_by='bogus' err = %v, want a campaign_items_resolved_by_check violation", err)
+	}
+
+	// Roll back through 0085, the reversal under test. downThrough names 0085 and
+	// lands the schema on version 84, so migrations added above it need no edit.
+	downThrough(t, url, "0085")
+
+	if got, _, _ := postgres.MigrateVersion(url); got != 84 {
+		t.Errorf("MigrateVersion after reverting 0085 = %d, want 84", got)
+	}
+	if n, _, _ := columnShape("campaign_items", "resolved_by"); n != 0 {
+		t.Errorf("campaign_items.resolved_by count after MigrateDown = %d, want 0 (0085 reverted)", n)
+	}
+	// The CHECK is dropped WITH the column — no orphaned constraint survives.
+	if got := constraintCount("campaign_items_resolved_by_check"); got != 0 {
+		t.Errorf("campaign_items_resolved_by_check count after MigrateDown = %d, want 0 (dropped with the column)", got)
+	}
+	// The rollback is an ALTER, not a drop: the table and 0074's queue_position
+	// both survive.
+	var tables int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'campaign_items'`).Scan(&tables); err != nil {
+		t.Fatalf("query campaign_items table: %v", err)
+	}
+	if tables != 1 {
+		t.Errorf("campaign_items table count after MigrateDown = %d, want 1 (0085 is an ALTER)", tables)
+	}
+	if n, _, _ := columnShape("campaign_items", "queue_position"); n != 1 {
+		t.Errorf("campaign_items.queue_position count after reverting 0085 = %d, want 1 (0074 untouched)", n)
+	}
+}
+
 // --- Committed-state migration-failure tests (E62.2 / #2301) ---------------
 //
 // These drive the REAL migration path (postgres.MigrateUpFS) against a

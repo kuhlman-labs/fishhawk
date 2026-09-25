@@ -107,3 +107,8 @@ func (BaseFake) ReopenCampaignForItemRestart(_ context.Context, _, _ uuid.UUID) 
 func (BaseFake) SettleCampaignItemOutOfBand(_ context.Context, _ uuid.UUID) (*Item, error) {
 	return nil, ErrNotFound
 }
+
+// SettleCampaignItemForClosedIssue returns nil, ErrNotFound.
+func (BaseFake) SettleCampaignItemForClosedIssue(_ context.Context, _ uuid.UUID, _ ItemState) (*Item, error) {
+	return nil, ErrNotFound
+}

@@ -546,13 +546,72 @@ func (r *postgresRepo) SettleCampaignItemOutOfBand(ctx context.Context, id uuid.
 			return InvalidTransitionError{Kind: "campaign_item", From: string(from), To: string(ItemStateSucceeded)}
 		}
 		// Settle to succeeded, RETAINING the run link (unlike RestartCampaignItem,
-		// which clears it): the dead run is preserved as provenance.
-		updated, err := q.UpdateCampaignItemState(ctx, campaigndb.UpdateCampaignItemStateParams{
-			ID:    id,
-			State: string(ItemStateSucceeded),
+		// which clears it): the dead run is preserved as provenance. State and the
+		// resolved_by marker land in ONE statement (#3563) so there is no window
+		// in which the settled item lacks its provenance.
+		updated, err := q.SettleCampaignItemForClosedIssue(ctx, campaigndb.SettleCampaignItemForClosedIssueParams{
+			ID:         id,
+			State:      string(ItemStateSucceeded),
+			ResolvedBy: normalizeResolvedBy(ResolvedByIssueClosed),
 		})
 		if err != nil {
 			return fmt.Errorf("settle campaign item state: %w", err)
+		}
+		result = rowToCampaignItem(updated)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// SettleCampaignItemForClosedIssue settles a NOT-YET-RUN item (pending or
+// blocked) off a CLOSED issue, stamping the resolved_by provenance marker
+// ATOMICALLY with the state write, under SELECT … FOR UPDATE (see the
+// Repository doc for the full contract).
+//
+// `to` is the classifier's target: succeeded for a closed-as-completed issue,
+// cancelled for a not_planned/duplicate closure. Both edges are already
+// admitted by campaignItemTransitions, so this is NOT a guard bypass like
+// RestartCampaignItem / SettleCampaignItemOutOfBand — it exists for the ATOMIC
+// marker write, which UpdateCampaignItemState cannot do. Any `from` other than
+// {pending, blocked}, or any `to` other than {succeeded, cancelled}, is
+// rejected InvalidTransitionError{Kind:"campaign_item"}; a missing item is
+// ErrNotFound.
+//
+// The marker is ALWAYS ResolvedByIssueClosed (normalized, so an out-of-set
+// value can never trip the migration-0085 CHECK): a caller reaching this method
+// is by construction the issue-closed settle.
+func (r *postgresRepo) SettleCampaignItemForClosedIssue(ctx context.Context, id uuid.UUID, to ItemState) (*Item, error) {
+	var result *Item
+	err := pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
+		q := campaigndb.New(tx)
+		current, err := q.LockCampaignItemForUpdate(ctx, id)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return fmt.Errorf("lock campaign item: %w", err)
+		}
+		from := ItemState(current.State)
+		// The issue-closed settle is only defined from a not-yet-run state onto a
+		// terminal delivery/abandonment outcome. Anything else — a running item
+		// (pass 1's), an already-settled one, a paused one, or a `to` outside the
+		// two outcomes — is refused rather than silently coerced.
+		if from != ItemStatePending && from != ItemStateBlocked {
+			return InvalidTransitionError{Kind: "campaign_item", From: string(from), To: string(to)}
+		}
+		if to != ItemStateSucceeded && to != ItemStateCancelled {
+			return InvalidTransitionError{Kind: "campaign_item", From: string(from), To: string(to)}
+		}
+		updated, err := q.SettleCampaignItemForClosedIssue(ctx, campaigndb.SettleCampaignItemForClosedIssueParams{
+			ID:         id,
+			State:      string(to),
+			ResolvedBy: normalizeResolvedBy(ResolvedByIssueClosed),
+		})
+		if err != nil {
+			return fmt.Errorf("settle campaign item for closed issue: %w", err)
 		}
 		result = rowToCampaignItem(updated)
 		return nil
@@ -644,9 +703,12 @@ func rowToCampaignItem(i campaigndb.CampaignItem) *Item {
 		Autonomy: i.Autonomy,
 		// Queue position read straight back from the NOT NULL column
 		// (migration 0074). Every pre-0074 row carries the DEFAULT 0.
-		Position:  int(i.QueuePosition),
-		CreatedAt: i.CreatedAt.Time,
-		UpdatedAt: i.UpdatedAt.Time,
+		Position: int(i.QueuePosition),
+		// Resolution provenance read straight back from the NOT NULL column
+		// (migration 0085 / #3563). Every pre-0085 row carries the DEFAULT ''.
+		ResolvedBy: i.ResolvedBy,
+		CreatedAt:  i.CreatedAt.Time,
+		UpdatedAt:  i.UpdatedAt.Time,
 	}
 	// JSONB → []string. An empty/NULL payload yields a nil slice (no
 	// dependencies). Tolerate a malformed blob by dropping it rather than

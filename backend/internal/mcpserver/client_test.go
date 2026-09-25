@@ -3387,3 +3387,42 @@ func TestRunMirror_DecodesCapabilities(t *testing.T) {
 		}
 	})
 }
+
+// TestCampaignStatus_DecodesResolvedBy pins the #3563 client mirror: the
+// backend's `resolved_by` on a CampaignItem decodes onto CampaignItem.ResolvedBy
+// and so reaches the fishhawk_get_campaign_status tool output (the status
+// response's items pass through verbatim).
+//
+// Without this the field is silently dropped by a json-tag typo and the operator
+// cannot tell an issue-closed cancellation — which no verb can restart — from an
+// operator cancellation, which start_run reopens.
+//
+// SELF-PAIRED against the SAME shape with the key ABSENT, so the assertion cannot
+// be satisfied by a field that decodes to the marker unconditionally.
+func TestCampaignStatus_DecodesResolvedBy(t *testing.T) {
+	const body = `{
+	  "campaign": {"id":"11111111-1111-1111-1111-111111111111","repo":"kuhlman-labs/fishhawk","state":"running"},
+	  "items": [
+	    {"id":"22222222-2222-2222-2222-222222222222","issue_ref":"issue:100","depends_on":[],
+	     "state":"cancelled","resolved_by":"issue_closed"},
+	    {"id":"33333333-3333-3333-3333-333333333333","issue_ref":"issue:101","depends_on":[],
+	     "state":"cancelled"}
+	  ],
+	  "rollup": {"eligible":[],"human_led":[],"blocked":[],"running":[],"done":[],"failed":[],"cancelled":["issue:100","issue:101"],"paused":[]},
+	  "next_action": {"action":"wait"}
+	}`
+	var st CampaignStatus
+	if err := json.Unmarshal([]byte(body), &st); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(st.Items) != 2 {
+		t.Fatalf("items = %d, want 2", len(st.Items))
+	}
+	if st.Items[0].ResolvedBy != "issue_closed" {
+		t.Errorf("items[0].resolved_by = %q, want issue_closed — the json tag does not byte-match the backend's field", st.Items[0].ResolvedBy)
+	}
+	// Self-paired: the same item shape with the key absent must decode to "".
+	if st.Items[1].ResolvedBy != "" {
+		t.Errorf("items[1].resolved_by = %q, want empty (the body omits the key)", st.Items[1].ResolvedBy)
+	}
+}

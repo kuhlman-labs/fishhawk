@@ -3552,8 +3552,15 @@ type CampaignItem struct {
 	RunID       string               `json:"run_id,omitempty"`
 	State       string               `json:"state"`
 	PauseReason *CampaignPauseReason `json:"pause_reason,omitempty"`
-	CreatedAt   time.Time            `json:"created_at"`
-	UpdatedAt   time.Time            `json:"updated_at"`
+	// ResolvedBy is the durable provenance of HOW the item reached its terminal
+	// state (#3563). The only non-empty value today is "issue_closed": the
+	// backend's reconcile-on-read pass settled it off the forge's issue state —
+	// succeeded for a closed-as-completed issue, cancelled for a
+	// not_planned/duplicate closure. omitempty, so an item with no recorded
+	// provenance (an operator or run-driven outcome) carries no key.
+	ResolvedBy string    `json:"resolved_by,omitempty"`
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
 }
 
 // CampaignRollup mirrors the backend's `CampaignRollup` wire schema
