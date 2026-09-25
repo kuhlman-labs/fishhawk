@@ -5737,7 +5737,9 @@ components:
         whether this deployment can file work items for this repo at all.
         `status: unregistered` is a FAILURE, not data: campaigns, work-item
         filings and the grooming loop all respond `501
-        provider_unimplemented`. `status: unknown` is FAIL-CLOSED — the
+        provider_unimplemented`. `campaign_sources` (#3658) names the campaign
+        sources the resolved provider serves (`epic_ref`, `items`), an empty
+        array wherever no capability claim is made. `status: unknown` is FAIL-CLOSED — the
         conventions could not be resolved, which is not evidence the provider
         is missing. It is OPTIONAL for the same older-fishhawkd reason; its
         absence is no claim, not `unregistered`.
@@ -6430,6 +6432,24 @@ components:
               items:
                 type: string
               example: [github_projects]
+            campaign_sources:
+              type: array
+              description: |
+                The campaign sources (#3658) the resolved provider can serve,
+                in the fixed order `epic_ref`, `items` — computed from the
+                provider's compile-time capabilities, never a live probe.
+                ALWAYS served as an array by the current backend, never
+                `null`: EMPTY on `unregistered` and `unknown` (the rung makes
+                no capability claim there), and an EMPTY array on
+                `registered` means `POST /v0/campaigns` refuses `501` in
+                either mode. The `gitlab` provider serves both since #3658
+                (its Premium group epics are still refused `422
+                campaign_epic_ref_group_unsupported`). OPTIONAL only so a
+                pre-#3658 fishhawkd's body still validates.
+              items:
+                type: string
+                enum: [epic_ref, items]
+              example: [epic_ref, items]
             reason:
               type: string
               description: |
@@ -12899,12 +12919,10 @@ paths:
                     AFTER the `Idempotency-Key` lookup, so a replay returns the
                     stored response without re-validating its body.
 
-                    NOTE the honest residual: selecting `gitlab` reaches
-                    `501 epic_children_unsupported` /
-                    `501 issue_set_resolution_unsupported`, because the GitLab
-                    work-item provider implements neither campaign capability in
-                    v0. This selector makes the refusal ACCURATE and
-                    CORRECTABLE; it does not make a GitLab campaign assemble.
+                    Selecting `gitlab` assembles a campaign in either mode since
+                    #3658: the GitLab work-item provider implements both
+                    campaign capabilities (Premium group epics stay refused
+                    `422 campaign_epic_ref_group_unsupported`).
                   example: github_projects
       responses:
         '200':
@@ -13041,7 +13059,7 @@ paths:
             `details.provider` and carry `details.campaign_sources_supported`
             (#3648): the campaign sources the resolved provider actually serves
             (`epic_ref` / `items`, in that order), empty on a File-only provider
-            like `gitlab` where neither mode works, so the remedy never
+            such as `jira` where neither mode works, so the remedy never
             advertises a mode that also 501s.
         '502':
           description: |

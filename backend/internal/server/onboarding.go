@@ -307,13 +307,22 @@ func reviewGroundingReadinessFor(disabled bool) reviewGroundingReadiness {
 // Registered is ALWAYS emitted (possibly as an empty array) because the
 // deployment registry answers even when the repo's conventions do not — it is
 // the half of the verdict that is always knowable.
+//
+// CampaignSources (#3658) is ALSO always emitted as an array, never a JSON
+// null: the campaign sources ("epic_ref", "items", in that fixed order) the
+// resolved provider can serve, computed by campaignSourcesSupported from
+// compile-time capability assertions. It is populated ONLY on the registered
+// branch — an unregistered or unknown rung makes NO capability claim and
+// reports []. A registered provider reporting [] (a File-only provider) will
+// have fishhawk_start_campaign refuse 501 in either mode.
 type workItemProviderReadiness struct {
-	Status      string   `json:"status"`
-	Provider    string   `json:"provider,omitempty"`
-	Registered  []string `json:"registered"`
-	Reason      string   `json:"reason,omitempty"`
-	Note        string   `json:"note,omitempty"`
-	MissingHint string   `json:"missing_hint,omitempty"`
+	Status          string   `json:"status"`
+	Provider        string   `json:"provider,omitempty"`
+	Registered      []string `json:"registered"`
+	CampaignSources []string `json:"campaign_sources"`
+	Reason          string   `json:"reason,omitempty"`
+	Note            string   `json:"note,omitempty"`
+	MissingHint     string   `json:"missing_hint,omitempty"`
 }
 
 // The closed work_item_provider status vocabulary (three values;
@@ -376,7 +385,10 @@ func workItemProviderMissingHint(provider string, registered []string) string {
 
 // workItemProviderReadinessFor resolves the work_item_provider rung from the
 // repo's resolved conventions provider, the deployment's registered set, and
-// the conventions-resolution error. Pure, for the same reason
+// the conventions-resolution error, plus the campaign sources the caller
+// computed from the resolved provider instance (campaignSourcesSupported; nil
+// when no instance resolved). The provider is resolved by the CALLER, not here.
+// Pure, for the same reason
 // traceStoreReadinessFor and reviewGroundingReadinessFor are: onboarding_test
 // tables every branch without booting a server.
 //
@@ -384,7 +396,10 @@ func workItemProviderMissingHint(provider string, registered []string) string {
 // id, falling through to the membership comparison would compare "" against
 // the registry and render `unregistered` — a positive finding about a repo
 // whose conventions were never read.
-func workItemProviderReadinessFor(provider string, registered []string, resolveErr error) workItemProviderReadiness {
+func workItemProviderReadinessFor(provider string, registered, campaignSources []string, resolveErr error) workItemProviderReadiness {
+	// Unregistered and unknown verdicts make NO capability claim, so they
+	// always report an empty array whatever the caller passed.
+	noSources := []string{}
 	if registered == nil {
 		// Always emit an ARRAY, never a JSON null: the field is documented as
 		// always present, and a null would decode into a client mirror
@@ -393,28 +408,34 @@ func workItemProviderReadinessFor(provider string, registered []string, resolveE
 	}
 	if resolveErr != nil {
 		return workItemProviderReadiness{
-			Status:      workItemProviderStatusUnknown,
-			Registered:  registered,
-			Reason:      workItemProviderUnknownReason,
-			Note:        workItemProviderUnknownNote,
-			MissingHint: workItemProviderUnknownHint,
+			Status:          workItemProviderStatusUnknown,
+			Registered:      registered,
+			CampaignSources: noSources,
+			Reason:          workItemProviderUnknownReason,
+			Note:            workItemProviderUnknownNote,
+			MissingHint:     workItemProviderUnknownHint,
 		}
 	}
 	for _, id := range registered {
 		if id == provider {
+			if campaignSources == nil {
+				campaignSources = []string{}
+			}
 			return workItemProviderReadiness{
-				Status:     workItemProviderStatusRegistered,
-				Provider:   provider,
-				Registered: registered,
+				Status:          workItemProviderStatusRegistered,
+				Provider:        provider,
+				Registered:      registered,
+				CampaignSources: campaignSources,
 			}
 		}
 	}
 	return workItemProviderReadiness{
-		Status:      workItemProviderStatusUnregistered,
-		Provider:    provider,
-		Registered:  registered,
-		Note:        workItemProviderUnregisteredNote,
-		MissingHint: workItemProviderMissingHint(provider, registered),
+		Status:          workItemProviderStatusUnregistered,
+		Provider:        provider,
+		Registered:      registered,
+		CampaignSources: noSources,
+		Note:            workItemProviderUnregisteredNote,
+		MissingHint:     workItemProviderMissingHint(provider, registered),
 	}
 }
 
@@ -1587,7 +1608,18 @@ func (s *Server) handleGetOnboardingReadiness(w http.ResponseWriter, r *http.Req
 	// TTL-cached per (provider, repo) and falls back to workmgmt.Default()
 	// whenever the repo commits no conventions file.
 	conv, convErr := conventionsLoader(r.Context(), repo)
-	wp := workItemProviderReadinessFor(conv.Provider, workmgmt.Registered(), convErr)
+	// campaign_sources (#3658) is computed from the resolved provider INSTANCE
+	// (compile-time capability assertions), so it tracks the build: the gitlab
+	// provider reports ["epic_ref","items"] since it implements both sources.
+	// No instance (conventions unresolved, provider unregistered) → nil, which
+	// the pure resolver renders as [] — no capability claim.
+	var campaignSources []string
+	if convErr == nil {
+		if p, err := workmgmt.Get(conv.Provider); err == nil {
+			campaignSources = campaignSourcesSupported(p)
+		}
+	}
+	wp := workItemProviderReadinessFor(conv.Provider, workmgmt.Registered(), campaignSources, convErr)
 	resp := onboardingReadinessResponse{
 		Repo:             repo,
 		Forge:            family,

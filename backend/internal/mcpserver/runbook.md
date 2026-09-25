@@ -587,7 +587,8 @@ wave-orders the DAG, and persists the campaign — the batch counterpart to
   issue; reopen/replace the dependency or drop the edge. A provider that cannot
   resolve an arbitrary issue set fails `issue_set_resolution_unsupported` (501),
   whose `campaign_sources_supported` detail names the sources that DO work (empty
-  on a File-only provider like `gitlab`, where neither campaign mode works, #3648).
+  on a File-only provider such as `jira`, where neither campaign mode works, #3648;
+  `gitlab` serves both since #3658).
 
 Neither `epic_ref` nor `items` fails `validation_failed`; an un-installed repo
 fails `repo_not_installed` **when the resolved work-item provider is
