@@ -1474,6 +1474,8 @@ components:
             after a fix-up cleared them).
         live_validation:
           $ref: '#/components/schemas/LiveValidation'
+        review_head_mismatch:
+          $ref: '#/components/schemas/GateViewReviewHeadMismatch'
         review_authority:
           type: array
           description: |
@@ -2081,6 +2083,8 @@ components:
           $ref: '#/components/schemas/LiveValidation'
         review_diff_truncated:
           $ref: '#/components/schemas/GateViewReviewDiffTruncated'
+        review_head_mismatch:
+          $ref: '#/components/schemas/GateViewReviewHeadMismatch'
 
     GateViewReviewDiffTruncated:
       type: object
@@ -2131,6 +2135,47 @@ components:
             incomplete and a changed file may appear in neither the hunks nor this
             list. False for the runner path, whose name-status inventory is
             complete.
+
+    GateViewReviewHeadMismatch:
+      type: object
+      description: |
+        Present when the open implement-review round judged a tree the PR does
+        NOT carry (#3655) — e.g. a base-rebase re-invoke shipped a new tree after
+        the round was dispatched from the first attempt's trace bundle. Distilled
+        from the newest `review_head_mismatch` audit entry, which the success PR
+        ship records when the round's reviewed tree differs from the
+        gate-certified tree the runner pushed (trees, not commits: the reviewed
+        head is a throwaway WIP commit, so head SHAs differ on every ship).
+        Omitted when no mismatch was recorded, once a NEWER same-stage
+        `implement_review_started` round has superseded it, or when the read
+        fails (best-effort). Carried on both `GET /v0/runs/{run_id}/gate-view`
+        and `GET /v0/runs/{run_id}` (single-run read only). Advisory: the open
+        verdicts describe a stale tree, so force a fresh round before merging;
+        it never gates the run.
+      required: [stage_id, reviewed_tree_sha, pushed_tree_sha, review_round_sequence]
+      properties:
+        stage_id:
+          type: string
+          description: The implement stage whose review round judged a stale tree.
+        reviewed_tree_sha:
+          type: string
+          description: The tree object the review round judged (the runner's gate-certified tree at trace upload).
+        pushed_tree_sha:
+          type: string
+          description: The gate-certified tree the runner actually pushed to the PR.
+        review_round_sequence:
+          type: integer
+          format: int64
+          description: Audit sequence of the `implement_review_started` round judged stale.
+        reviewed_head_sha:
+          type: string
+          description: |
+            The reviewed round's head SHA — a throwaway WIP commit, never equal
+            to `pushed_head_sha` on its own and NOT itself evidence of staleness.
+            Human-correlatable coordinate only.
+        pushed_head_sha:
+          type: string
+          description: The PR head SHA the runner pushed.
 
     GateViewConcern:
       type: object

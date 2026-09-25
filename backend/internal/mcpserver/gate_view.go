@@ -66,6 +66,14 @@ Response (gate_view):
     file inventory is itself capped, so the omitted set may itself be
     incomplete). Omitted when no review ran on a truncated diff. A HIGH finding
     that a control is "missing" against a truncated review deserves scrutiny.
+  - review_head_mismatch — present when the open implement-review round judged
+    a tree the PR does NOT carry (e.g. a base-rebase re-invoke shipped a new
+    tree after the review round was dispatched from the first attempt's
+    bundle). Carries stage_id, reviewed_tree_sha, pushed_tree_sha,
+    review_round_sequence, reviewed_head_sha and pushed_head_sha. The open
+    verdicts describe a stale tree: force a fresh round (fishhawk_fixup_stage)
+    before merging. Omitted when no mismatch was recorded, or once a newer
+    same-stage review round superseded it.
 `),
 	}, resolver.getGateView)
 }

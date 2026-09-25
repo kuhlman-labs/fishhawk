@@ -5659,3 +5659,106 @@ func TestNextActions_UnclassifiedFallbackCapabilityGate(t *testing.T) {
 		})
 	}
 }
+
+// TestNextActions_ReviewHeadMismatchAdvisory (G5, #3655): a run carrying an
+// un-superseded review_head_mismatch gets a display-only advisory PREPENDED,
+// naming both trees and both heads, while every pre-existing action — the
+// merge ritual included — stays present and in its ORIGINAL relative order
+// (the advisory only inserts; a mismatch never wedges a run). A run without a
+// mismatch is byte-identical. COUNTERFACTUAL: delete the fold call → the
+// "prepends" subtests go RED; replace the prepend with a reorder/replace → the
+// order assertion goes RED.
+func TestNextActions_ReviewHeadMismatchAdvisory(t *testing.T) {
+	prURL := "https://github.com/x/y/pull/42"
+	mismatch := &gateViewReviewHeadMismatch{
+		StageID: "stage-impl", ReviewedTreeSHA: strings.Repeat("1", 40), PushedTreeSHA: strings.Repeat("2", 40),
+		ReviewRoundSequence: 7, ReviewedHeadSHA: strings.Repeat("a", 40), PushedHeadSHA: strings.Repeat("b", 40),
+	}
+	mkRun := func(m *gateViewReviewHeadMismatch) *Run {
+		r := naRun("succeeded")
+		r.PullRequestURL = &prURL
+		r.ReviewHeadMismatch = m
+		r.LiveValidation = &RunLiveValidation{PendingCriteriaCount: 1, WalkRef: "#9"}
+		return r
+	}
+	stages := []Stage{naStage("plan", "succeeded"), naStage("implement", "succeeded")}
+	implComplete := naReviewStatus("implement", "complete")
+
+	check := func(t *testing.T, without, with *NextActions) {
+		t.Helper()
+		base := actionNames(without)
+		got := actionNames(with)
+		if len(got) != len(base)+1 || got[0] != "review_head_mismatch" {
+			t.Fatalf("actions = %v, want review_head_mismatch prepended to %v", got, base)
+		}
+		for i := range base {
+			if got[i+1] != base[i] {
+				t.Fatalf("actions = %v, want the pre-existing actions %v unchanged and in order after the advisory", got, base)
+			}
+		}
+		act := with.Actions[0]
+		if act.Consumes != consumesNone {
+			t.Errorf("consumes = %q, want none (display-only advisory)", act.Consumes)
+		}
+		for k, v := range map[string]string{
+			"reviewed_tree_sha": mismatch.ReviewedTreeSHA, "pushed_tree_sha": mismatch.PushedTreeSHA,
+			"reviewed_head_sha": mismatch.ReviewedHeadSHA, "pushed_head_sha": mismatch.PushedHeadSHA,
+			"stage_id": "stage-impl",
+		} {
+			if act.Params[k] != v {
+				t.Errorf("params[%s] = %q, want %q", k, act.Params[k], v)
+			}
+			if k != "stage_id" && !strings.Contains(act.Reason, v) {
+				t.Errorf("reason %q does not name %s %q", act.Reason, k, v)
+			}
+		}
+		if !strings.Contains(act.Reason, "fishhawk_fixup_stage") {
+			t.Errorf("reason %q should direct a fresh review round via fishhawk_fixup_stage", act.Reason)
+		}
+	}
+
+	t.Run("prepends on the merge-ritual arm", func(t *testing.T) {
+		without := nextActionsFor(mkRun(nil), stages, nil, implComplete, nil, nil, false, false, false, "", "", releaseSignals{})
+		with := nextActionsFor(mkRun(mismatch), stages, nil, implComplete, nil, nil, false, false, false, "", "", releaseSignals{})
+		if !strings.Contains(strings.Join(actionNames(without), ","), "fishhawk_merge_run") {
+			t.Fatalf("fixture must produce the merge ritual; got %v", actionNames(without))
+		}
+		check(t, without, with)
+	})
+	t.Run("prepends on the ci_failed arm", func(t *testing.T) {
+		drive := &DriveStatus{Drive: true, DerivedStatus: "ci_failed"}
+		without := nextActionsFor(mkRun(nil), stages, nil, implComplete, nil, drive, false, false, false, "", "", releaseSignals{})
+		with := nextActionsFor(mkRun(mismatch), stages, nil, implComplete, nil, drive, false, false, false, "", "", releaseSignals{})
+		check(t, without, with)
+	})
+	t.Run("no mismatch is byte-identical", func(t *testing.T) {
+		a := nextActionsFor(mkRun(nil), stages, nil, implComplete, nil, nil, false, false, false, "", "", releaseSignals{})
+		for _, n := range actionNames(a) {
+			if n == "review_head_mismatch" {
+				t.Errorf("actions = %v, want no advisory without a mismatch", actionNames(a))
+			}
+		}
+	})
+	t.Run("empty head coordinates render unknown, never blank", func(t *testing.T) {
+		m := *mismatch
+		m.ReviewedHeadSHA, m.PushedHeadSHA, m.StageID = "", "", ""
+		na := nextActionsFor(mkRun(&m), stages, nil, implComplete, nil, nil, false, false, false, "", "", releaseSignals{})
+		act := findAction(t, na, "review_head_mismatch")
+		if !strings.Contains(act.Reason, "(head unknown)") {
+			t.Errorf("reason %q, want an empty head rendered as unknown", act.Reason)
+		}
+		for _, k := range []string{"reviewed_head_sha", "pushed_head_sha", "stage_id"} {
+			if _, ok := act.Params[k]; ok {
+				t.Errorf("params[%s] present for an empty coordinate, want the key omitted", k)
+			}
+		}
+	})
+	t.Run("nil guards", func(t *testing.T) {
+		foldReviewHeadMismatchAdvisory(mkRun(mismatch), nil)
+		na := &NextActions{State: "x"}
+		foldReviewHeadMismatchAdvisory(nil, na)
+		if len(na.Actions) != 0 {
+			t.Errorf("nil run folded %v, want nothing", na.Actions)
+		}
+	})
+}

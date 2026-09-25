@@ -104,6 +104,7 @@ func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewS
 		if drive.NextAction != nil {
 			na.Actions = append([]SuggestedAction{driveAction(run, drive.NextAction)}, na.Actions...)
 		}
+		foldReviewHeadMismatchAdvisory(run, na)
 		foldLiveValidationAdvisory(run, na)
 		foldRejectWithoutConcernAdvisory(implementReviewStatus, na)
 		foldProductIssueSuggestion(run, stages, na)
@@ -128,6 +129,7 @@ func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewS
 		fallback.State = na.State
 		na = fallback
 	}
+	foldReviewHeadMismatchAdvisory(run, na)
 	foldLiveValidationAdvisory(run, na)
 	foldRejectWithoutConcernAdvisory(implementReviewStatus, na)
 	foldProductIssueSuggestion(run, stages, na)
@@ -500,6 +502,57 @@ func foldRejectWithoutConcernAdvisory(implementReviewStatus *ReviewStatus, na *N
 		Consumes:     consumesNone,
 		Reason:       who + " rejected the pass without naming a concern, so there is nothing to route through fishhawk_fixup_stage — read the review's free_form for what it actually asserted and decide yourself whether it is a finding worth routing",
 	})
+}
+
+// foldReviewHeadMismatchAdvisory PREPENDS a DISPLAY-ONLY stale-review advisory
+// when the run carries an un-superseded review_head_mismatch (#3655): the open
+// implement-review round judged a tree the PR does not carry, so its verdicts
+// describe a stale tree and must not license a merge. PREPENDED (unlike the
+// appended live-validation / reject-without-concern advisories) because the
+// re-review is what the operator must do FIRST; it only inserts — every
+// existing action, including the merge ritual, stays present and in its
+// original relative order, so a mismatch can never wedge a run. It consumes
+// nothing itself (the fix-up it recommends is the operator's call). Folded
+// AFTER the structural guard so it never masks an otherwise-empty arm. A run
+// with no mismatch — or an older backend that omits the field — prepends
+// nothing, leaving every existing surface byte-identical. na is mutated in
+// place; a nil na is a no-op.
+func foldReviewHeadMismatchAdvisory(run *Run, na *NextActions) {
+	if na == nil || run == nil || run.ReviewHeadMismatch == nil {
+		return
+	}
+	m := run.ReviewHeadMismatch
+	params := map[string]string{
+		"run_id":            run.ID,
+		"reviewed_tree_sha": m.ReviewedTreeSHA,
+		"pushed_tree_sha":   m.PushedTreeSHA,
+	}
+	if m.StageID != "" {
+		params["stage_id"] = m.StageID
+	}
+	if m.ReviewedHeadSHA != "" {
+		params["reviewed_head_sha"] = m.ReviewedHeadSHA
+	}
+	if m.PushedHeadSHA != "" {
+		params["pushed_head_sha"] = m.PushedHeadSHA
+	}
+	advisory := SuggestedAction{
+		Action:       "review_head_mismatch",
+		Params:       params,
+		Precondition: "the open implement-review round judged a tree the PR does not carry (reviewed_tree_sha != pushed_tree_sha), e.g. a base-rebase re-invoke shipped a new tree after the round was dispatched",
+		Consumes:     consumesNone,
+		Reason: fmt.Sprintf("the open review verdicts describe tree %s (head %s) but the PR carries tree %s (head %s) — no reviewer saw the pushed tree; force a fresh review round (fishhawk_fixup_stage) before merging",
+			m.ReviewedTreeSHA, orUnknown(m.ReviewedHeadSHA), m.PushedTreeSHA, orUnknown(m.PushedHeadSHA)),
+	}
+	na.Actions = append([]SuggestedAction{advisory}, na.Actions...)
+}
+
+// orUnknown renders an empty SHA coordinate as "unknown" rather than a blank.
+func orUnknown(sha string) string {
+	if sha == "" {
+		return "unknown"
+	}
+	return sha
 }
 
 // classifyNextActions is the state table. Each arm returns a labeled
