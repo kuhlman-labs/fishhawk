@@ -7,12 +7,15 @@
 // backend/internal/gitlabclient; this package is the orchestration that
 // turns a resolved workmgmt.ProviderRequest into them.
 //
-// Only Provider.File is implemented in v0 — the Transitioner (#1012),
-// NumberDiscoverer (#1269), EpicChildrenQuerier (ADR-047) and WorkItemReader
-// (#2230) capabilities are deliberately NOT implemented, matching the jira
-// sibling. Because board placement rides the create as a label, no separate
-// transition call exists; the board-sync hook type-asserts Transitioner and
-// yields a no-op.
+// Provider.File plus the two campaign-source capabilities are implemented:
+// EpicChildrenQuerier (ADR-047, epic mode over the epic issue's Free-tier
+// relates_to links, confirmed by the child's `Parent epic:` body marker) and
+// IssueSetDependencyResolver (#2051, items / grooming-order mode), both in
+// campaign.go with is_blocked_by links as the depends_on source (#3658). The
+// Transitioner (#1012), NumberDiscoverer (#1269) and WorkItemReader (#2230)
+// capabilities are still deliberately NOT implemented. Because board placement
+// rides the create as a label, no separate transition call exists; the
+// board-sync hook type-asserts Transitioner and yields a no-op.
 //
 // WorkItemReader (#2230 / ADR-064) was REVIEWED against the GitLab shape
 // before being left unimplemented, and the finding is what pins the interface
@@ -60,6 +63,11 @@ type API interface {
 	GetProject(ctx context.Context, path string) (*gitlabclient.Project, error)
 	CreateIssue(ctx context.Context, projectID int, p gitlabclient.CreateIssueParams) (*gitlabclient.CreatedIssue, error)
 	LinkIssues(ctx context.Context, projectID, iid, targetIID int) error
+	// GetIssue and ListIssueLinks back the campaign sources (campaign.go).
+	// They are called from a bounded-concurrency pool, so an implementation
+	// must be safe for concurrent use (*gitlabclient.Client is).
+	GetIssue(ctx context.Context, projectID, iid int) (*gitlabclient.Issue, error)
+	ListIssueLinks(ctx context.Context, projectID, iid int) ([]gitlabclient.IssueLink, error)
 }
 
 // Provider is the GitLab issues work-management provider.
