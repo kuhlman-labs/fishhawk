@@ -32,6 +32,8 @@ spec:
       {{- include "fishhawk.selectorLabels" (dict "root" . "role" "worker") | nindent 6 }}
   template:
     metadata:
+      annotations:
+        {{- include "fishhawk.configChecksumAnnotations" . | nindent 8 }}
       labels:
         {{- include "fishhawk.selectorLabels" (dict "root" . "role" "worker") | nindent 8 }}
     spec:

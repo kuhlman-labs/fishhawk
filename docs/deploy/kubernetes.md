@@ -119,6 +119,30 @@ the preflight cannot answer the gate on the forward's behalf — and only THEN
 runs the image-identity gate of step 8, so a wrong listener is never mistaken
 for a wrong image.
 
+### Changing values only: the pod now restarts (chart 0.5.0, [#3577](https://github.com/kuhlman-labs/fishhawk/issues/3577))
+
+A `helm upgrade` that changes ONLY a `config.*` or (under
+`secrets.mode: chartManaged`) a `secrets.values.*` entry used to leave the
+Deployment manifest byte-identical: every `FISHHAWKD_*` value arrives via
+`envFrom`, read once at container start, so `helm upgrade` exited 0,
+`kubectl rollout status` reported success, and the pod kept serving the OLD
+value. Chart 0.5.0 hashes the rendered ConfigMap and Secret into
+`checksum/config` / `checksum/secret` pod-template annotations, so such a change
+moves `spec.template` and the pods actually roll. (`scripts/dev k8s` already
+forces a `kubectl rollout restart` in step 5, so a local bring-up was never
+exposed to this; a plain `helm upgrade` against any cluster was.)
+
+> **RESIDUAL under `secrets.mode: existing` / `externalSecrets`.** There the
+> chart does not own the Secret's contents — it sees only a name, or ESO
+> materializes the values out of band — so `checksum/secret` is deliberately NOT
+> emitted, and an out-of-band credential rotation still reports success while
+> the running pod keeps the old credential. Restart explicitly:
+> `kubectl -n <ns> rollout restart deployment/<release>-fishhawk` (split mode:
+> the `-api` and `-worker` Deployments). The same applies to the GitHub App PEM,
+> which fishhawkd reads at start even though the kubelet refreshes the mounted
+> Secret volume in place. Full contract: `deploy/helm/fishhawk/README.md`
+> § "Credential rotation and pod restart".
+
 ### Image identity: what a green bring-up now proves
 
 A healthy `/healthz` through the right forward proves a fishhawkd is serving; it

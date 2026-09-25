@@ -2217,6 +2217,31 @@ _relay_target_url() {
   print -r -- "http://127.0.0.1:$(_healthz_port)/webhooks/github"
 }
 
+# Poll COUNT for _relay_up's spawn-then-die liveness window. The window is
+# polls x 0.2s, so the DEFAULT 5 is EXACTLY the 1.0s window #3169 shipped —
+# `scripts/dev up` timing does not move. FISHHAWK_DEV_RELAY_LIVENESS_POLLS is a
+# DEV-ONLY override, and only the test harness sets it: the runner's gate env is
+# a default-deny allow-list, so no FISHHAWK_* var reaches an in-loop gate.
+# WHY it exists (#3587 class): the window races the child's whole lifecycle, not
+# just its exit. `kill -0` cannot distinguish a LIVE child from one that has
+# exited but not yet been REAPED — a zombie answers signal 0 — so the window must
+# outlast exec + exit + this shell's reap of it. Measured on an idle host that
+# costs 200-600ms of the 1.0s default, and under `scripts/test verify`'s
+# concurrent go-test load it exceeded the window outright: _relay_up printed
+# "webhook relay up" for a stub whose only statement is `exit 0`.
+# scripts/test-dev's spawn-then-die case raises this so it tests the DETECTOR
+# rather than that race; production keeps the 1.0s window unchanged.
+# A non-positive or non-numeric override falls back to the default rather than
+# disabling the check (fail-safe: the detector is never silently turned off).
+_relay_liveness_polls() {
+  local override="${FISHHAWK_DEV_RELAY_LIVENESS_POLLS:-}"
+  if [[ "$override" =~ '^[1-9][0-9]*$' ]]; then
+    print -r -- "$override"
+    return 0
+  fi
+  print -r -- 5
+}
+
 # Client detection (mirrors _tls_resolve_proxy_bin, but the CALLER emits the
 # reason, not this helper). Order: FISHHAWK_DEV_SMEE_BIN (an explicit path, also
 # the seam the tests inject a stub through) wins, then a `smee-client` on PATH,
@@ -2303,15 +2328,35 @@ _relay_up() {
   mkdir -p "$LOG_DIR"
   "$bin" -u "$channel" -t "$target" >> "$RELAY_LOG_FILE" 2>&1 &
   local relay_pid=$!
-  disown
+  # A zsh SUBSHELL keeps no job table, so when _relay_up runs inside a `$( )`
+  # capture — as the harness's failure-mode cases do — bare `disown` fails with
+  # "no current job" DETERMINISTICALLY and leaks that error into the captured
+  # output (seen verbatim in the #3587 verify failure). The same line appears at
+  # top level whenever the client exits and is reaped before this statement.
+  # Suppress ONLY that message; disowning is best-effort either way, since a
+  # subshell has nothing to disown. The redirection is a plain builtin redirect,
+  # never a `$( )` capture: command substitution would run `disown` in a SUBSHELL
+  # and leave the real job attached to this one. Any other disown failure is
+  # re-emitted verbatim, so nothing real is masked. `|| true` keeps the statement
+  # in a tested context — disown's exit status was already ignored here, and a
+  # bare failing builtin risks a ZERR/`set -e` abort for any caller that does not
+  # invoke _relay_up as an `if !` condition.
+  local disown_err="${RELAY_LOG_FILE}.disown"
+  disown 2>"$disown_err" || true
+  if [[ -s "$disown_err" ]] && ! grep -q "no current job" "$disown_err"; then
+    print -u2 -- "$(cat "$disown_err")"
+  fi
+  rm -f "$disown_err"
   print "$relay_pid" > "$RELAY_PID_FILE"
 
   # Poll for DEATH within a bounded window: if the client exits during it, it
   # died immediately → fail; if it survives the whole window, it is up.
   # (( ++i )) pre-increment per the #631 trap (post-increment returns 1 at i==0
   # → set -e abort); every command stays in a tested context so ZERR cannot fire.
+  local polls
+  polls="$(_relay_liveness_polls)"
   local i=0
-  while (( i < 5 )); do
+  while (( i < polls )); do
     if ! kill -0 "$relay_pid" 2>/dev/null; then
       print -u2 "webhook relay client died immediately (pid ${relay_pid}) — read ${RELAY_LOG_FILE} for the client error (a rejected channel or an unsupported flag)"
       rm -f "$RELAY_PID_FILE"

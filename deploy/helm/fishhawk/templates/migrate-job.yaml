@@ -46,6 +46,13 @@ spec:
   {{- end }}
   template:
     metadata:
+      # This Job is a HOOK with hook-delete-policy before-hook-creation, so it is
+      # recreated on every release regardless of its pod template — the checksum
+      # annotation here is CONSISTENT with the three Deployments (one define, four
+      # call sites), not load-bearing. Do not read it as the mechanism that reruns
+      # the migration.
+      annotations:
+        {{- include "fishhawk.configChecksumAnnotations" . | nindent 8 }}
       labels:
         {{- include "fishhawk.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: migrate

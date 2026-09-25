@@ -66,6 +66,19 @@ future split-mode guard must be wired into
 
 ## Upgrading
 
+**Chart 0.5.0 adds the `checksum/config` / `checksum/secret` pod-template
+annotations** ([#3577](https://github.com/kuhlman-labs/fishhawk/issues/3577)).
+The FIRST upgrade onto 0.5.0 performs one rolling restart, because the pod
+template changes for the first time — expected, not a fault. Unlike 0.3.0
+below, this needs **no** delete/reinstall: `spec.template.metadata.annotations`
+is a mutable field, so a plain `helm upgrade` from 0.4.x succeeds, and a
+`helm rollback` to 0.4.x simply removes the annotations at the cost of one
+more restart. Note also that a Chart.yaml VERSION bump alone moves
+`checksum/config` (the hash covers the rendered ConfigMap text, which carries
+the `helm.sh/chart` label), so every chart release costs one restart even when
+no value moved — an accepted consequence of the standard Helm idiom: an
+over-restart is cosmetic where an under-restart is the silent defect above.
+
 **Chart 0.3.0 changes the fishhawkd Deployment's `spec.selector.matchLabels`**
 (it adds `app.kubernetes.io/component: server` to the allInOne workload,
 [#2916](https://github.com/kuhlman-labs/fishhawk/issues/2916)). A
@@ -329,6 +342,61 @@ duplication. `secrets.mode` is:
   the same-named Secret. A prod hook/foundation pairing with
   [#182](https://github.com/kuhlman-labs/fishhawk/issues/182); needs
   ESO + a pre-provisioned SecretStore.
+
+### Credential rotation and pod restart ([#3577](https://github.com/kuhlman-labs/fishhawk/issues/3577))
+
+Every `FISHHAWKD_*` value reaches the container through `envFrom`, which
+the kubelet reads **once, at container start**. So before chart 0.5.0 a
+values change that touched only the ConfigMap or only the Secret left the
+Deployment manifest **byte-identical**: `helm upgrade` exited 0,
+`kubectl rollout status` reported success, and the running pod kept
+serving the OLD configuration. The dangerous case is credential
+rotation — an operator rotating a leaked `FISHHAWKD_GITLAB_TOKEN`,
+`FISHHAWKD_ANTHROPIC_API_KEY` or `FISHHAWKD_GITHUB_WEBHOOK_SECRET` saw
+three green signals over a rotation that never took effect.
+
+Chart 0.5.0 stamps two annotations onto all four pod templates (the
+allInOne Deployment, the split-mode `-api` and `-worker` Deployments, and
+the migrate hook Job) from one `fishhawk.configChecksumAnnotations`
+helper:
+
+```yaml
+    metadata:
+      annotations:
+        checksum/config: <sha256 of the rendered configmap.yaml>
+        checksum/secret: <sha256 of the rendered secret.yaml>   # chartManaged only
+```
+
+A ConfigMap- or Secret-only change now moves `spec.template`, which is
+what actually rolls the pods.
+
+> **RESIDUAL — `existing` and `externalSecrets` modes still need a manual
+> restart.** `checksum/secret` is emitted **only** under
+> `secrets.mode: chartManaged`, because that is the only mode in which the
+> chart owns the Secret's contents. Under `existing` the chart sees nothing
+> but a Secret NAME; under `externalSecrets` the contents are materialized
+> out of band by the External Secrets Operator. In both, an out-of-band
+> rotation — a new value written to the referenced Secret, or a new value
+> pulled by ESO — changes nothing the chart renders, so **`helm upgrade`
+> still reports success while the running pod keeps the old credential**.
+> The failure mode is silent and security-relevant. Restart explicitly:
+>
+> ```sh
+> kubectl -n <namespace> rollout restart deployment/<release>-fishhawk
+> # split mode:
+> kubectl -n <namespace> rollout restart deployment/<release>-fishhawk-api \
+>                                        deployment/<release>-fishhawk-worker
+> ```
+>
+> A constant hash over the empty render would have been worse than no
+> annotation: it would imply the rotation is tracked when it is not.
+
+The **GitHub App PEM needs the same restart** even though it is a mounted
+file rather than an env string. The kubelet does refresh a mounted Secret
+volume in place, but fishhawkd reads the PEM at start — so under
+`chartManaged` the new `checksum/secret` covers it (the PEM's dotted key
+lives in the very Secret being hashed), and under `existing` /
+`externalSecrets` it falls under the manual-restart residual above.
 
 ### The credential contract (`fishhawk.secretKeySpec`, E62.2 / [#2301](https://github.com/kuhlman-labs/fishhawk/issues/2301))
 
@@ -770,7 +838,19 @@ text, that no `minio/` image ref survives, and the renamed
 script from the rendered Job and RUNS it under a stubbed `aws`:
 bucket absent + create succeeds → 0; bucket exists → 0 with no create
 attempted; create FAILS → non-zero (the case a render assertion cannot
-observe); not-ready → the readiness retry loops then succeeds. A
+observe); not-ready → the readiness retry loops then succeeds. The
+**config/secret checksum** case ([r19](https://github.com/kuhlman-labs/fishhawk/issues/3577))
+pins the rotation property above behaviourally: r19a/r19b assert all four
+pod templates carry 64-hex `checksum/config` + `checksum/secret`
+annotations (parsed structurally under `spec.template`, since the migrate
+Job also carries Job-level `helm.sh/hook` annotations); r19c renders twice
+with a changed `secrets.values` entry and asserts `checksum/secret` MOVES
+while `checksum/config` is held identical (and r19d the mirror over a
+config value, so each annotation is proven to track its OWN object);
+r19e pins idempotence so the fix cannot degrade into a restart on every
+upgrade; and r19f/r19g assert `checksum/secret` is ABSENT at YAML key
+position under `existing` and `externalSecrets` — one case per named mode
+of the `chartManaged` guard. A
 render + lint of every profile rounds out the suite. It **skips with a printed reason
 and exits 0** when `helm` is absent from PATH, so a helm-less host is
 not red-lined; the cost is honest — on such a host the chart is
