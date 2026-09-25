@@ -490,6 +490,19 @@ type ReviewStartedPayload struct {
 	// plan path byte-identical — plan_review_started has no diff/head_sha
 	// and passes "", so its payload is unchanged.
 	HeadSHA string `json:"head_sha,omitempty"`
+
+	// TreeSHA is the round's REVIEWED-TREE identity (#3655): the tree object
+	// hash of the committed tree the bundle's authoritative (last) verify_run
+	// certified, i.e. the tree this implement-review round judged. It is
+	// DISTINCT from HeadSHA, which stays the #797 dedup key and is a throwaway
+	// WIP-commit SHA the runner soft-resets away — so the pushed commit SHA
+	// always differs from it, while the pushed TREE equals it on a normal ship.
+	// The success PR ship compares this against the runner-reported
+	// verified_tree_sha and records review_head_mismatch when they differ.
+	// omitempty keeps plan_review_started (which passes "") and every
+	// pre-change implement_review_started payload byte-identical; an old
+	// stored payload decodes "", which disables the comparison for that round.
+	TreeSHA string `json:"tree_sha,omitempty"`
 }
 
 // ReviewFailedPayload is the JSON payload stored in an audit entry with

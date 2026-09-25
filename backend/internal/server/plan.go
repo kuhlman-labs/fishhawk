@@ -1638,7 +1638,7 @@ func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, p
 	// has a lower audit sequence than reviewed under both gating
 	// (synchronous) and advisory (detached) authority. Best-effort:
 	// WARN-log and continue on append failure so dispatch is never blocked.
-	s.emitReviewStarted(ctx, runID, stageID, "plan_review_started", authority, reviewersCfg.AgentCount(), "")
+	s.emitReviewStarted(ctx, runID, stageID, "plan_review_started", authority, reviewersCfg.AgentCount(), "", "")
 
 	// invocations were resolved above (before the prompt build) so the grounding
 	// decision could key on the loop's capability set.
@@ -1877,7 +1877,7 @@ func (s *Server) planBudgetEvidence(ctx context.Context, runRow *run.Run, parsed
 // sequence into each verdict's ReviewRoundSequence so the review round is
 // RECORDED rather than inferred; the plan_review_started caller discards the
 // result unchanged.
-func (s *Server) emitReviewStarted(ctx context.Context, runID, stageID uuid.UUID, category string, authority planreview.AuthorityMode, configuredAgents int, headSHA string) (seq int64, ok bool) {
+func (s *Server) emitReviewStarted(ctx context.Context, runID, stageID uuid.UUID, category string, authority planreview.AuthorityMode, configuredAgents int, headSHA, treeSHA string) (seq int64, ok bool) {
 	if s.cfg.AuditRepo == nil {
 		return 0, false
 	}
@@ -1888,6 +1888,10 @@ func (s *Server) emitReviewStarted(ctx context.Context, runID, stageID uuid.UUID
 		// payload byte-identical); the implement path passes the bundle's
 		// verify_run head_sha as the #797 dedup key.
 		HeadSHA: headSHA,
+		// The round's reviewed-tree identity (#3655): empty for the plan path;
+		// the implement path passes the bundle's authoritative verify_run
+		// tree_sha so the success PR ship can detect a stale review round.
+		TreeSHA: treeSHA,
 	})
 	systemKind := audit.ActorKind("system")
 	entry, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{

@@ -825,6 +825,19 @@ Notes:
   ran on a partial diff — the false-reject class (a reviewer reports a control it
   could not see as ABSENT). Listed here only so a future reader grepping the audit
   categories doesn't mistake it for a comment surface.
+- The stale-review audit kind — `review_head_mismatch` (#3655), written by the
+  success-ship path (`pullrequest.go::recordReviewHeadMismatch`) — is an
+  **internal, gate-read audit kind, not an issue-comment surface**, and is
+  DELIBERATELY absent from `issuecomment`'s `activityCategories`: it is a signal
+  for the operator reading the gate (the open review verdicts describe a tree the
+  PR does not carry), not run activity to narrate on the issue thread. It fires
+  when the newest same-stage `implement_review_started` round's recorded
+  `tree_sha` differs from the `verified_tree_sha` the runner shipped on its
+  success PR report; either tree empty records nothing. Payload `{run_id,
+  stage_id, reviewed_tree_sha, pushed_tree_sha, review_round_sequence,
+  reviewed_head_sha, pushed_head_sha}`. Best-effort — never blocks the ship.
+  Listed here so the non-surface choice is a reviewable decision, not an
+  omission.
 - The routed-concern not-attempted audit kind — `fixup_concern_unattempted`
   (#2896), written by the implement-review assembly path
   (`trace.go::runImplementReviews`) before any reviewer verdict — is an

@@ -3972,3 +3972,285 @@ func TestPullRequestFailed_UnknownKindRecordsNoCheckpoint(t *testing.T) {
 		})
 	}
 }
+
+// ---------------------------------------------------------------------------
+// review_head_mismatch (#3655): the success ship compares the implement-review
+// round's recorded TREE against the gate-certified tree the runner pushed.
+// ---------------------------------------------------------------------------
+
+// Distinct literal SHAs, definitionally unequal, so every RED lands on the
+// behavioral assertion rather than on fixture setup.
+const (
+	rhmTreeReviewed = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	rhmTreePushed   = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	rhmHeadWIP      = "cccccccccccccccccccccccccccccccccccccccc" // throwaway committed-tree WIP commit
+	rhmHeadPushed   = "dddddddddddddddddddddddddddddddddddddddd" // the real pushed commit
+)
+
+// successPRBytesWithTree is a success-ship body carrying the given head_sha and
+// (when non-empty) verified_tree_sha, shaped as the runner's artifact.
+func successPRBytesWithTree(t *testing.T, headSHA, treeSHA string) []byte {
+	t.Helper()
+	body, err := json.Marshal(pullRequestBody{
+		PRNumber:        42,
+		PRURL:           "https://github.com/kuhlman-labs/fishhawk/pull/42",
+		Branch:          "fishhawk/run-aaa/stage-bbb",
+		HeadSHA:         headSHA,
+		BaseSHA:         "2222222222222222222222222222222222222222",
+		Title:           "Add a make target.",
+		Body:            "Opened by Fishhawk.",
+		VerifiedTreeSHA: treeSHA,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return body
+}
+
+func reviewStartedPayloadBytes(t *testing.T, headSHA, treeSHA string) []byte {
+	t.Helper()
+	b, err := json.Marshal(planreview.ReviewStartedPayload{
+		ConfiguredAgents: 1, Authority: planreview.AuthorityMode("gating"),
+		HeadSHA: headSHA, TreeSHA: treeSHA,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// reviewHeadMismatchPGFixture is a REAL Postgres seam (pgtest run + chained
+// audit repositories) so E1/E2 prove the row is actually persisted and
+// readable through the store, not merely handed to a fake.
+type reviewHeadMismatchPGFixture struct {
+	s       *Server
+	sf      *signingFake
+	audit   audit.Repository
+	runID   uuid.UUID
+	stageID uuid.UUID
+}
+
+func newReviewHeadMismatchPGFixture(t *testing.T, startedHead, startedTree string) *reviewHeadMismatchPGFixture {
+	t.Helper()
+	ctx := context.Background()
+	pool := pgtest.NewPool(t)
+	runRepo := run.NewPostgresRepository(pool)
+	auditRepo := audit.NewPostgresRepository(pool)
+	sf := newSigningFake()
+	s := New(Config{
+		Addr: "127.0.0.1:0", SigningRepo: sf, ArtifactRepo: newFakeArtifactRepo(),
+		AuditRepo: auditRepo, RunRepo: runRepo,
+	})
+	r, err := runRepo.CreateRun(ctx, run.CreateRunParams{
+		Repo: "x/y", WorkflowID: "feature_change", WorkflowSHA: "abc",
+		TriggerSource: run.TriggerCLI,
+		WorkflowSpec:  []byte(autoDriveAcceptanceSpecYAML),
+	})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	impl, err := runRepo.CreateStage(ctx, run.CreateStageParams{
+		RunID: r.ID, Sequence: 1, Type: run.StageTypeImplement,
+		ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code",
+	})
+	if err != nil {
+		t.Fatalf("create implement stage: %v", err)
+	}
+	stageID := impl.ID
+	if _, err := auditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID: r.ID, StageID: &stageID, Timestamp: time.Now().UTC(),
+		Category: "implement_review_started",
+		Payload:  reviewStartedPayloadBytes(t, startedHead, startedTree),
+	}); err != nil {
+		t.Fatalf("seed implement_review_started: %v", err)
+	}
+	return &reviewHeadMismatchPGFixture{s: s, sf: sf, audit: auditRepo, runID: r.ID, stageID: stageID}
+}
+
+func (f *reviewHeadMismatchPGFixture) ship(t *testing.T, body []byte) {
+	t.Helper()
+	priv, _ := f.sf.issue(t, f.runID)
+	w := shipPRRequest(t, f.s, f.runID, f.stageID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+}
+
+func (f *reviewHeadMismatchPGFixture) mismatchRows(t *testing.T) []*audit.Entry {
+	t.Helper()
+	rows, err := f.audit.ListForRunByCategory(context.Background(), f.runID, CategoryReviewHeadMismatch)
+	if err != nil {
+		t.Fatalf("list review_head_mismatch: %v", err)
+	}
+	return rows
+}
+
+// E1 (#3655): a round that judged tree T1 while the ship pushed T2 records
+// exactly ONE persisted review_head_mismatch row naming both trees, both heads
+// and the stale round's sequence. This is also the done-means test for the
+// audit-category registration.
+func TestShipPullRequest_ReviewHeadMismatch_TreesDiffer_RecordsRow(t *testing.T) {
+	f := newReviewHeadMismatchPGFixture(t, rhmHeadWIP, rhmTreeReviewed)
+	started, err := f.audit.ListForRunByCategory(context.Background(), f.runID, "implement_review_started")
+	if err != nil || len(started) != 1 {
+		t.Fatalf("seeded started rows = %d, err %v", len(started), err)
+	}
+	f.ship(t, successPRBytesWithTree(t, rhmHeadPushed, rhmTreePushed))
+
+	rows := f.mismatchRows(t)
+	if len(rows) != 1 {
+		t.Fatalf("review_head_mismatch rows = %d, want 1", len(rows))
+	}
+	var p reviewHeadMismatchPayload
+	if err := json.Unmarshal(rows[0].Payload, &p); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	want := reviewHeadMismatchPayload{
+		RunID: f.runID.String(), StageID: f.stageID.String(),
+		ReviewedTreeSHA: rhmTreeReviewed, PushedTreeSHA: rhmTreePushed,
+		ReviewRoundSequence: started[0].Sequence,
+		ReviewedHeadSHA:     rhmHeadWIP, PushedHeadSHA: rhmHeadPushed,
+	}
+	if p != want {
+		t.Errorf("payload = %+v\nwant      %+v", p, want)
+	}
+	if p.ReviewRoundSequence == 0 {
+		t.Error("review_round_sequence must be non-zero")
+	}
+	if rows[0].StageID == nil || *rows[0].StageID != f.stageID {
+		t.Errorf("row stage_id = %v, want %s", rows[0].StageID, f.stageID)
+	}
+}
+
+// E2 (#3655): THE NO-FALSE-POSITIVE CONTROL. A realistic normal ship: the
+// review round keyed on the throwaway WIP commit H1, the runner soft-reset it
+// away and pushed a DIFFERENT commit H2 carrying the SAME tree T. No row.
+func TestShipPullRequest_ReviewHeadMismatch_NormalShipSameTreeDifferentHead_NoRow(t *testing.T) {
+	if rhmHeadWIP == rhmHeadPushed {
+		t.Fatal("fixture invariant: the WIP head and the pushed head MUST differ, or this collapses into the degenerate equal-heads case")
+	}
+	f := newReviewHeadMismatchPGFixture(t, rhmHeadWIP, rhmTreeReviewed)
+	f.ship(t, successPRBytesWithTree(t, rhmHeadPushed, rhmTreeReviewed))
+	if rows := f.mismatchRows(t); len(rows) != 0 {
+		t.Fatalf("review_head_mismatch rows = %d on a normal ship (equal trees, different heads), want 0", len(rows))
+	}
+}
+
+// newRHMFakeServer is the fast in-memory seam for the fail-closed branches.
+func newRHMFakeServer(t *testing.T, stageType run.StageType, seeded ...*audit.Entry) (*Server, *signingFake, *auditFake, uuid.UUID, uuid.UUID) {
+	t.Helper()
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, _, au, rr := newPRServer(t, runID, stageID)
+	rr.getStages[stageID] = &run.Stage{ID: stageID, RunID: runID, Type: stageType}
+	for _, e := range seeded {
+		e.RunID = &runID
+		e.StageID = &stageID
+		au.seeded = append(au.seeded, e)
+	}
+	return s, sf, au, runID, stageID
+}
+
+func startedEntry(t *testing.T, seq int64, payload []byte) *audit.Entry {
+	t.Helper()
+	return &audit.Entry{ID: uuid.New(), Sequence: seq, Category: "implement_review_started", Timestamp: time.Now().UTC(), Payload: payload}
+}
+
+func shipAndCountMismatch(t *testing.T, s *Server, sf *signingFake, au *auditFake, runID, stageID uuid.UUID, body []byte) int {
+	t.Helper()
+	priv, _ := sf.issue(t, runID)
+	w := shipPRRequest(t, s, runID, stageID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	if findAuditByCategory(t, au, "pull_request_opened") == nil {
+		t.Fatal("pull_request_opened must still land")
+	}
+	n := 0
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	for _, a := range au.appended {
+		if a.Category == CategoryReviewHeadMismatch {
+			n++
+		}
+	}
+	return n
+}
+
+// The fake seam must itself record a row on a genuine mismatch, or every
+// zero-row assertion below would be vacuous.
+func TestShipPullRequest_ReviewHeadMismatch_FakeSeamRecordsOnMismatch(t *testing.T) {
+	s, sf, au, runID, stageID := newRHMFakeServer(t, run.StageTypeImplement,
+		startedEntry(t, 7, reviewStartedPayloadBytes(t, rhmHeadWIP, rhmTreeReviewed)))
+	if n := shipAndCountMismatch(t, s, sf, au, runID, stageID, successPRBytesWithTree(t, rhmHeadPushed, rhmTreePushed)); n != 1 {
+		t.Fatalf("review_head_mismatch rows = %d, want 1", n)
+	}
+}
+
+// F1: pushed tree empty (no-verify stage, older runner, held-commit resume).
+func TestShipPullRequest_ReviewHeadMismatch_PushedTreeEmpty_NoRow(t *testing.T) {
+	s, sf, au, runID, stageID := newRHMFakeServer(t, run.StageTypeImplement,
+		startedEntry(t, 7, reviewStartedPayloadBytes(t, rhmHeadWIP, rhmTreeReviewed)))
+	if n := shipAndCountMismatch(t, s, sf, au, runID, stageID, successPRBytesWithTree(t, rhmHeadPushed, "")); n != 0 {
+		t.Fatalf("review_head_mismatch rows = %d with an empty pushed tree, want 0", n)
+	}
+}
+
+// F2: round tree empty (a legacy implement_review_started row with no tree_sha).
+func TestShipPullRequest_ReviewHeadMismatch_RoundTreeEmpty_NoRow(t *testing.T) {
+	s, sf, au, runID, stageID := newRHMFakeServer(t, run.StageTypeImplement,
+		startedEntry(t, 7, reviewStartedPayloadBytes(t, rhmHeadWIP, "")))
+	if n := shipAndCountMismatch(t, s, sf, au, runID, stageID, successPRBytesWithTree(t, rhmHeadPushed, rhmTreePushed)); n != 0 {
+		t.Fatalf("review_head_mismatch rows = %d with an empty round tree, want 0", n)
+	}
+}
+
+// F3: no implement_review_started row at all.
+func TestShipPullRequest_ReviewHeadMismatch_NoStartedRow_NoRow(t *testing.T) {
+	s, sf, au, runID, stageID := newRHMFakeServer(t, run.StageTypeImplement)
+	if n := shipAndCountMismatch(t, s, sf, au, runID, stageID, successPRBytesWithTree(t, rhmHeadPushed, rhmTreePushed)); n != 0 {
+		t.Fatalf("review_head_mismatch rows = %d with no started row, want 0", n)
+	}
+}
+
+// F4: the NEWEST started payload is undecodable — no row, and an older
+// decodable mismatching round is NOT consulted in its place. The undecodable
+// payload still CARRIES a mismatching tree_sha: encoding/json keeps decoding
+// the remaining fields past a type error, so this fixture is what makes the
+// decode-error return discriminating (a bare `[1,2,3]` would decode to an
+// empty tree and be caught by the empty-tree guard instead).
+func TestShipPullRequest_ReviewHeadMismatch_UndecodableStartedPayload_NoRow(t *testing.T) {
+	undecodable := []byte(`{"configured_agents":"not-a-number","tree_sha":"` + rhmTreeReviewed + `"}`)
+	s, sf, au, runID, stageID := newRHMFakeServer(t, run.StageTypeImplement,
+		startedEntry(t, 7, reviewStartedPayloadBytes(t, rhmHeadWIP, rhmTreeReviewed)),
+		startedEntry(t, 9, undecodable))
+	if n := shipAndCountMismatch(t, s, sf, au, runID, stageID, successPRBytesWithTree(t, rhmHeadPushed, rhmTreePushed)); n != 0 {
+		t.Fatalf("review_head_mismatch rows = %d with an undecodable newest started payload, want 0", n)
+	}
+}
+
+// List error: the started-row read fails — no row, the ship still succeeds.
+func TestShipPullRequest_ReviewHeadMismatch_ListError_NoRow(t *testing.T) {
+	s, sf, au, runID, stageID := newRHMFakeServer(t, run.StageTypeImplement,
+		startedEntry(t, 7, reviewStartedPayloadBytes(t, rhmHeadWIP, rhmTreeReviewed)))
+	au.listByCategoryErrCategory = "implement_review_started"
+	if n := shipAndCountMismatch(t, s, sf, au, runID, stageID, successPRBytesWithTree(t, rhmHeadPushed, rhmTreePushed)); n != 0 {
+		t.Fatalf("review_head_mismatch rows = %d on a list error, want 0", n)
+	}
+}
+
+// F5: a nil AuditRepo is a silent no-op (the handler 503s before reaching the
+// check, so the helper is driven directly).
+func TestRecordReviewHeadMismatch_NilAuditRepo_NoOp(t *testing.T) {
+	s := New(Config{Addr: "127.0.0.1:0"})
+	pr := &pullRequestBody{HeadSHA: rhmHeadPushed, VerifiedTreeSHA: rhmTreePushed}
+	s.recordReviewHeadMismatch(context.Background(), uuid.New(), uuid.New(), pr)
+}
+
+// F6: a non-implement stage never runs the check, even on a genuine mismatch.
+func TestShipPullRequest_ReviewHeadMismatch_NonImplementStage_NoRow(t *testing.T) {
+	s, sf, au, runID, stageID := newRHMFakeServer(t, run.StageTypePlan,
+		startedEntry(t, 7, reviewStartedPayloadBytes(t, rhmHeadWIP, rhmTreeReviewed)))
+	if n := shipAndCountMismatch(t, s, sf, au, runID, stageID, successPRBytesWithTree(t, rhmHeadPushed, rhmTreePushed)); n != 0 {
+		t.Fatalf("review_head_mismatch rows = %d on a non-implement stage, want 0", n)
+	}
+}

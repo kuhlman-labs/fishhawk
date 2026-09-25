@@ -17,6 +17,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
@@ -194,8 +195,11 @@ type pullRequestBody struct {
 	// These mirror run.ScopeCompletenessPark's wire tags byte-for-byte and
 	// the runner's park-report upload struct (runner/internal/upload —
 	// sibling slice), the established ScopeExemption duplication pattern.
-	// The runner omits them on every other variant, so they stay absent
-	// there under the DisallowUnknownFields decoder.
+	// The runner omits MissingPaths on every other variant. VerifiedTreeSHA
+	// additionally rides the failed variant's #2169 push checkpoint and, since
+	// #3655, the SUCCESS variant (the gate-certified tree the ship pushed,
+	// omitted when no verify gate ran) — where recordReviewHeadMismatch
+	// compares it against the implement-review round's recorded tree.
 	VerifiedTreeSHA string   `json:"verified_tree_sha,omitempty"`
 	MissingPaths    []string `json:"missing_paths,omitempty"`
 
@@ -824,6 +828,17 @@ func (s *Server) handleShipPullRequest(w http.ResponseWriter, r *http.Request) {
 				slog.String("stage_id", stageID.String()),
 				slog.String("error", err.Error()))
 		}
+	}
+
+	// Stale-review detection (#3655). A base-rebase re-invoke seals and ships
+	// its trace bundle BEFORE the agent is re-invoked (#742 forward gating), so
+	// the implement-review round dispatched from that bundle may have judged a
+	// tree this PR does not carry. Compare the round's recorded tree against
+	// the gate-certified tree the runner pushed and record review_head_mismatch
+	// when they differ. Best-effort and non-gating: it only appends an audit
+	// row, never alters the response or the stage transition below.
+	if stage.Type == run.StageTypeImplement {
+		s.recordReviewHeadMismatch(r.Context(), runID, stageID, &pr)
 	}
 
 	// Backfill the run's pull_request_url so the threaded-runs view
@@ -2146,4 +2161,105 @@ func (s *Server) recordAcceptanceScenarioRetirementDropped(w http.ResponseWriter
 	}
 	s.notifyOperatorVisible(r.Context(), runID, outcomeAcceptanceScenarioRetirementDropped)
 	respond()
+}
+
+// CategoryReviewHeadMismatch is the audit category recorded when the
+// implement-review round judged a tree other than the one the success PR
+// ship pushed (#3655).
+const CategoryReviewHeadMismatch = "review_head_mismatch"
+
+// reviewHeadMismatchPayload is the review_head_mismatch audit payload
+// (#3655). The two trees are the machine-decidable evidence; the two head
+// SHAs are human-correlatable coordinates (reviewed_head_sha is the throwaway
+// WIP commit the runner soft-reset away, so it never equals pushed_head_sha
+// and is NOT itself evidence of staleness). ReviewRoundSequence is the audit
+// sequence of the implement_review_started row judged stale — the #3593
+// recorded-round-identity convention.
+type reviewHeadMismatchPayload struct {
+	RunID               string `json:"run_id"`
+	StageID             string `json:"stage_id"`
+	ReviewedTreeSHA     string `json:"reviewed_tree_sha"`
+	PushedTreeSHA       string `json:"pushed_tree_sha"`
+	ReviewRoundSequence int64  `json:"review_round_sequence"`
+	ReviewedHeadSHA     string `json:"reviewed_head_sha"`
+	PushedHeadSHA       string `json:"pushed_head_sha"`
+}
+
+// recordReviewHeadMismatch compares the newest same-stage
+// implement_review_started round's reviewed tree against the tree the runner
+// pushed (pr.VerifiedTreeSHA) and appends a review_head_mismatch row when both
+// are known and differ (#3655).
+//
+// TREES, not commits: the round's head_sha is the throwaway committed-tree
+// WIP commit (bundle.ExtractHeadSHA) the runner soft-resets away before the
+// real push, so the pushed commit SHA differs on EVERY ship. Both trees come
+// from the same producer (the runner's committed-tree verify gate), so on a
+// normal ship they are the same object and nothing is recorded.
+//
+// Fail-closed to silence: an empty tree on EITHER side (no-verify stage, older
+// runner, held-commit resume, legacy started row, extraction degrade) makes
+// the comparison undecidable and records nothing — a guessed row is worse than
+// none. Every other degrade (nil AuditRepo, list error, no started row,
+// undecodable newest payload, append error) WARN-logs or returns silently and
+// records nothing, mirroring reviewDiffTruncatedForRun. It DETECTS the stale
+// round; it does not supersede or re-dispatch it.
+func (s *Server) recordReviewHeadMismatch(ctx context.Context, runID, stageID uuid.UUID, pr *pullRequestBody) {
+	if s.cfg.AuditRepo == nil || pr.VerifiedTreeSHA == "" {
+		return
+	}
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, "implement_review_started")
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"pull-request upload: list implement_review_started failed; skipping review_head_mismatch check",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()))
+		return
+	}
+	// Newest same-stage round wins: ListForRunByCategory is sequence-ascending.
+	var newest *audit.Entry
+	for _, e := range entries {
+		if e.StageID != nil && *e.StageID == stageID {
+			newest = e
+		}
+	}
+	if newest == nil {
+		return
+	}
+	var started planreview.ReviewStartedPayload
+	if uerr := json.Unmarshal(newest.Payload, &started); uerr != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"pull-request upload: decode implement_review_started payload failed; skipping review_head_mismatch check",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", uerr.Error()))
+		return
+	}
+	if started.TreeSHA == "" || started.TreeSHA == pr.VerifiedTreeSHA {
+		return
+	}
+	payload, _ := json.Marshal(reviewHeadMismatchPayload{
+		RunID:               runID.String(),
+		StageID:             stageID.String(),
+		ReviewedTreeSHA:     started.TreeSHA,
+		PushedTreeSHA:       pr.VerifiedTreeSHA,
+		ReviewRoundSequence: newest.Sequence,
+		ReviewedHeadSHA:     started.HeadSHA,
+		PushedHeadSHA:       pr.HeadSHA,
+	})
+	systemKind := audit.ActorKind("system")
+	if _, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   &stageID,
+		Timestamp: time.Now().UTC(),
+		Category:  CategoryReviewHeadMismatch,
+		ActorKind: &systemKind,
+		Payload:   payload,
+	}); aerr != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"pull-request upload: append review_head_mismatch audit entry failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", aerr.Error()))
+	}
 }
