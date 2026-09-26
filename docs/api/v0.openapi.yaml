@@ -6113,7 +6113,12 @@ components:
             a transport error or a probe timeout — and `reason` names which.
             An `unknown` is NOT evidence the branch is unprotected. Every
             signal that was never read is ABSENT from the object, never
-            rendered as `false`.
+            rendered as `false`. The three rule-derived signals
+            (`allow_force_push`, `push_access_levels`, `merge_access_levels`)
+            are ALSO absent on an authoritative UNPROTECTED read (no rule
+            matched): an unprotected GitLab branch permits force pushes to
+            anyone with push access, so a rendered `false` would read as the
+            opposite.
 
             Reporting only, point-in-time. `note` is constant and states that
             access levels are the effective union across matching rules per
@@ -6159,14 +6164,18 @@ components:
               type: boolean
               description: |
                 The OR of `allow_force_push` across every matched rule.
-                Absent when unread.
+                ABSENT when the branch is unprotected (no rule matched —
+                nothing to OR) or when the rule list was not read; never
+                rendered `false`, because an unprotected GitLab branch permits
+                force pushes to anyone with push access.
             push_access_levels:
               type: array
               description: |
                 The UNION of push access levels across every matched rule,
                 deduplicated by level and sorted ascending so the lowest —
-                most permissive — level is first. Empty/absent when
-                unprotected or unread.
+                most permissive — level is first. ABSENT when the branch is
+                unprotected (no rule matched) or when the rule list was not
+                read.
               items:
                 $ref: '#/components/schemas/GitLabAccessLevel'
             merge_access_levels:
@@ -6174,7 +6183,8 @@ components:
               description: |
                 The UNION of merge access levels across every matched rule,
                 deduplicated by level and sorted ascending (most permissive
-                first). Empty/absent when unprotected or unread.
+                first). ABSENT when the branch is unprotected (no rule
+                matched) or when the rule list was not read.
               items:
                 $ref: '#/components/schemas/GitLabAccessLevel'
             pipeline_must_succeed:

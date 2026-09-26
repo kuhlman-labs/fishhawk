@@ -3123,6 +3123,17 @@ func TestOnboardingReadiness_GitLabMergeGate_NotProtected_NotPipelineGated(t *te
 	if _, present := glmg["matched_rules"]; present {
 		t.Errorf("matched_rules present with no matching rule: %v", glmg["matched_rules"])
 	}
+	// The three rule-derived signals must be ABSENT on an unprotected
+	// authoritative read (#3591): there is nothing to OR/union, and an
+	// unprotected GitLab branch permits force pushes to anyone with push
+	// access, so a rendered allow_force_push:false would read as "blocked".
+	// Assert map-key PRESENCE (not a value comparison — a value check cannot
+	// distinguish absent from false).
+	for _, k := range []string{"allow_force_push", "push_access_levels", "merge_access_levels"} {
+		if v, present := glmg[k]; present {
+			t.Errorf("gitlab_merge_gate.%s present (%v) on an unprotected authoritative read; the rule-derived signals must be ABSENT, never false", k, v)
+		}
+	}
 	if glmg["pipeline_must_succeed"] != true {
 		t.Errorf("pipeline_must_succeed = %v, want true (still mapped)", glmg["pipeline_must_succeed"])
 	}
@@ -3138,6 +3149,42 @@ func TestOnboardingReadiness_GitLabMergeGate_NotProtected_NotPipelineGated(t *te
 	}
 	if rem, _ := glmg["remediation"].(string); !strings.Contains(rem, "Protected branches") {
 		t.Errorf("remediation = %q, want the GitLab settings path", rem)
+	}
+}
+
+// TestOnboardingReadiness_GitLabMergeGate_ProtectedForcePushAllowed_SignalsPresent
+// is the counterfactual vehicle for the absence-on-unprotected guard (#3591):
+// on a PROTECTED authoritative read the three rule-derived signals must be
+// PRESENT and correctly valued. If the guard were written with an inverted
+// condition (`if !mp.Protected`), this test goes red — allow_force_push and
+// both access-level arrays would vanish on a protected branch.
+func TestOnboardingReadiness_GitLabMergeGate_ProtectedForcePushAllowed_SignalsPresent(t *testing.T) {
+	gl := newFakeGitLabForOnboarding(onboardingReviewersSpecYAML)
+	gl.protectedRulesJSON = `[{"id":1,"name":"main","push_access_levels":[{"access_level":30,"access_level_description":"Developers + Maintainers"}],"merge_access_levels":[{"access_level":40,"access_level_description":"Maintainers"}],"allow_force_push":true}]`
+	raw := gitLabMergeGateRaw(t, gl)
+	glmg := rawObject(t, raw, "gitlab_merge_gate")
+	if glmg["protected"] != true {
+		t.Fatalf("protected = %v, want true (a matching rule)", glmg["protected"])
+	}
+	v, present := glmg["allow_force_push"]
+	if !present {
+		t.Errorf("allow_force_push ABSENT on a protected read; the guard must render it when a rule matched")
+	} else if v != true {
+		t.Errorf("allow_force_push = %v, want true (the rule allows force push)", v)
+	}
+	push, _ := glmg["push_access_levels"].([]any)
+	if len(push) != 1 {
+		t.Fatalf("push_access_levels = %v, want one entry on a protected read", glmg["push_access_levels"])
+	}
+	if lvl, _ := push[0].(map[string]any); lvl["level"] != float64(30) {
+		t.Errorf("push_access_levels[0] = %v, want level 30", push[0])
+	}
+	merge, _ := glmg["merge_access_levels"].([]any)
+	if len(merge) != 1 {
+		t.Fatalf("merge_access_levels = %v, want one entry on a protected read", glmg["merge_access_levels"])
+	}
+	if lvl, _ := merge[0].(map[string]any); lvl["level"] != float64(40) {
+		t.Errorf("merge_access_levels[0] = %v, want level 40", merge[0])
 	}
 }
 

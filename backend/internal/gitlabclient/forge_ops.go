@@ -708,8 +708,9 @@ func (c *Client) GetProtectedBranch(ctx context.Context, projectID int, branch s
 //
 //	GET /api/v4/projects/:id/protected_branches?per_page=100
 //
-// It PAGES TO EXHAUSTION via the rel="next" Link header, exactly as
-// ListIssueNotes does (issue_ops.go), and follows a next link ONLY when it
+// It PAGES TO EXHAUSTION, bounded by maxListPages, via the rel="next" Link
+// header, exactly as ListIssueNotes does (issue_ops.go), and follows a next
+// link ONLY when it
 // targets the client's own configured scheme+host (sameOrigin), with the
 // same boundary enforced across HTTP 3xx redirects by doNoOffOriginRedirect:
 // the request carries PRIVATE-TOKEN and a forge-supplied absolute URL must
@@ -727,7 +728,7 @@ func (c *Client) ListProtectedBranches(ctx context.Context, projectID int) ([]Pr
 
 	next := c.baseURL + fmt.Sprintf("/api/v4/projects/%d/protected_branches?per_page=100", projectID)
 	var out []ProtectedBranch
-	for next != "" {
+	for pages := 0; next != ""; pages++ {
 		if err := c.sameOrigin(next, "next-page link"); err != nil {
 			return nil, err
 		}
@@ -737,6 +738,14 @@ func (c *Client) ListProtectedBranches(ctx context.Context, projectID int) ([]Pr
 		}
 		out = append(out, page...)
 		next = nextPageURL(link)
+		// Fail closed rather than truncate: a partial protected-branch rule
+		// list would let forge/gitlab's protectedBranchRules find no matching
+		// rule and report an AUTHORITATIVE Protected:false, which the
+		// onboarding readiness rung would then render as "unprotected" — the
+		// exact misreading the absence-on-unprotected guard exists to prevent.
+		if next != "" && pages+1 >= maxListPages {
+			return nil, fmt.Errorf("gitlabclient: list protected branches for project %d exceeded the %d-page cap after accumulating %d rules with more pages remaining; refusing to return a partial protected-branch rule set", projectID, maxListPages, len(out))
+		}
 	}
 	return out, nil
 }

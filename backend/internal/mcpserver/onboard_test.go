@@ -895,6 +895,63 @@ func TestOnboardingReadinessReport_GitLabMergeGateUnknownKeepsPointersNil(t *tes
 	}
 }
 
+// gitlabMergeGateUnprotectedBody is the AUTHORITATIVE-but-UNPROTECTED wire
+// shape (#3591): the rule list was read (authoritative true, protected false),
+// so the three rule-derived signals are OMITTED — there is nothing to
+// OR/union and an unprotected GitLab branch permits force pushes to anyone
+// with push access. This is a DIFFERENT state from the unknown-degrade body
+// above (which omits the signals because nothing was read).
+const gitlabMergeGateUnprotectedBody = `{
+  "repo": "acme/widgets",
+  "forge": "gitlab",
+  "app": {"installed": true, "resolvable": true, "note": "gitlab: ..."},
+  "spec": {"source": "fetched", "valid": true},
+  "reviewers": [],
+  "scopes": {"adequate": true, "required": ["read:runs"], "missing": []},
+  "gitlab_merge_gate": {
+    "status": "not_pipeline_gated",
+    "branch": "main",
+    "protected": false,
+    "pipeline_must_succeed": true,
+    "allow_skipped_pipeline": false,
+    "discussions_must_be_resolved": true,
+    "authoritative": true,
+    "detail": "default branch main is not covered by any protected-branch rule",
+    "note": "gitlab: this rung reports whether the project's real default branch is protected ..."
+  }
+}`
+
+// TestOnboardingReadinessReport_GitLabMergeGateUnprotectedOmitsRuleSignals pins
+// the new absence-on-unprotected shape (#3591): on an AUTHORITATIVE read where
+// no rule matched, AllowForcePush is nil and both access-level slices are
+// empty, while Protected is a non-nil false and the project-level settings are
+// still mapped. Sibling of the unknown-degrade absence test above.
+func TestOnboardingReadinessReport_GitLabMergeGateUnprotectedOmitsRuleSignals(t *testing.T) {
+	var got OnboardingReadinessReport
+	if err := json.Unmarshal([]byte(gitlabMergeGateUnprotectedBody), &got); err != nil {
+		t.Fatalf("decode backend body: %v", err)
+	}
+	g := got.GitLabMergeGate
+	if g == nil {
+		t.Fatalf("GitLabMergeGate = nil, want the unprotected object")
+	}
+	if g.Status != "not_pipeline_gated" || !g.Authoritative {
+		t.Errorf("status=%q authoritative=%v, want not_pipeline_gated/true", g.Status, g.Authoritative)
+	}
+	if g.Protected == nil || *g.Protected {
+		t.Errorf("Protected = %v, want a non-nil false (authoritative unprotected read)", g.Protected)
+	}
+	if g.AllowForcePush != nil {
+		t.Errorf("AllowForcePush = %v, want nil (absent on an unprotected read — never false, which would read as blocked)", *g.AllowForcePush)
+	}
+	if len(g.PushAccessLevels) != 0 || len(g.MergeAccessLevels) != 0 {
+		t.Errorf("access levels = push:%v merge:%v, want empty on an unprotected read", g.PushAccessLevels, g.MergeAccessLevels)
+	}
+	if g.PipelineMustSucceed == nil || !*g.PipelineMustSucceed {
+		t.Errorf("PipelineMustSucceed = %v, want &true (project setting still mapped)", g.PipelineMustSucceed)
+	}
+}
+
 // TestDoctor_GitLabReport_ReemitsGitLabMergeGate walks the whole tool path
 // against the authoritative gitlab body and asserts the RE-EMITTED WIRE BYTES
 // carry `"gitlab_merge_gate":{` with its status and NO `"merge_gate":` key.

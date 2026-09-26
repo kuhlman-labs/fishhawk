@@ -254,7 +254,12 @@ work_item_provider rung (see below):
               adapter without protected-branch reads, an unresolved default
               branch, a 403 (the protected_branches API needs at least the
               Maintainer role), a transport error — and reason names which;
-              every signal that was never read is ABSENT, never false.
+              every signal that was never read is ABSENT, never false. The
+              rule-derived signals (allow_force_push, push/merge access levels)
+              are ALSO absent on an authoritative UNPROTECTED read (no rule
+              matched): an unprotected GitLab branch permits force pushes to
+              anyone with push access, so allow_force_push is never rendered
+              false to mean blocked.
               not_pipeline_gated is a positive finding whose detail names what
               is off (unprotected default branch and/or pipeline not required)
               and remediation names the GitLab settings to change. It is NOT a
