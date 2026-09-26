@@ -77,6 +77,11 @@
     "milestone_scope": {
       "$ref": "#/$defs/milestone-scope",
       "description": "OPTIONAL (E54.9 / #2309). Present only when the report scopes a release milestone against a human-supplied release definition: the selected, sequenced and excluded backlog items plus the calls it declined to make. Its ABSENCE means this is an ordinary grooming report — additive within the frozen grooming_report_v1 major, so an existing report validates unchanged. A milestone_scope proposes no tracker mutation."
+    },
+    "stale_items": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/stale-item" },
+      "description": "OPTIONAL (E54.83 / #3534). Stale/closeable findings — a complete-but-open epic, an epic closed with live children, a body that predates the item's remaining scope, an aged-out item — as machine-readable entries with derived ids (`stale:<item-key>:<kind>`) instead of prose in `summary`. Additive within the frozen grooming_report_v1 major: NOT in `required`, so every report valid before this section existed validates unchanged. The class applies as action class `scoping`, is non-delegable, and settles `finding_only` at apply: approving a report records the finding and NEVER closes, reparents, rescopes or icebox-moves anything (charter S2/S5 — never close as a side effect of grooming)."
     }
   },
 
@@ -187,7 +192,7 @@
       "type": "string",
       "minLength": 1,
       "maxLength": 512,
-      "pattern": "^(ordering|duplicate|hygiene|dependency|vision_drift|decomposition|milestone_inclusion|milestone_exclusion|milestone_declined):[a-z0-9][a-z0-9._/#+-]*(:[a-z0-9][a-z0-9._-]*)?$",
+      "pattern": "^(ordering|duplicate|hygiene|dependency|vision_drift|decomposition|stale|milestone_inclusion|milestone_exclusion|milestone_declined):[a-z0-9][a-z0-9._/#+-]*(:[a-z0-9][a-z0-9._-]*)?$",
       "description": "A stable entry id, DERIVED (never minted per run) as `<class>:<item-key>` or `<class>:<item-key>:<qualifier>` or `<class>:<key-a>+<key-b>`, plus the ZERO-REF form `<class>:<qualifier>` a milestone declined call uses (an ambiguous scope question is not necessarily anchored to one item). Lowercase throughout, including the qualifier segment — see grooming-report-v1.md § Entry-id derivation for the normative rules, which the validator machine-checks by recomposing each id from the entry's own fields."
     },
 
@@ -415,6 +420,38 @@
             }
           },
           "description": "At least two children — a 'split' into one is not a split."
+        }
+      }
+    },
+
+    "stale-item": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "item_ref", "kind", "evidence", "rubric_citations", "proposed_action"],
+      "description": "One stale/closeable finding (charter S1/S5). A FINDING, never an applied mutation: the apply layer records it `finding_only` whatever the operator decides. `kind` doubles as the entry id's qualifier, so one item may carry one entry per distinct kind without an id collision.",
+      "properties": {
+        "id": { "$ref": "#/$defs/entry-id" },
+        "item_ref": { "$ref": "#/$defs/item-ref" },
+        "kind": {
+          "type": "string",
+          "enum": ["complete_but_open", "closed_with_open_children", "body_predates_scope", "aged_out"],
+          "description": "What makes the item stale: complete_but_open (every child/criterion is done yet the item is open), closed_with_open_children (the item is closed while children are still live), body_predates_scope (the body describes work that has already landed or no longer matches the remaining scope), aged_out (no longer fits the charter's phase themes). ALSO this entry's id qualifier."
+        },
+        "evidence": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The concrete observation the finding rests on (e.g. \"all 7 sub-issues closed; last merged 2026-09-01\")."
+        },
+        "rubric_citations": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/rubric-citation" },
+          "description": "At least one charter rubric line the finding rests on — the same citation control `ordering` carries, so an uncited 'this looks stale' entry is REJECTED."
+        },
+        "proposed_action": {
+          "type": "string",
+          "enum": ["close", "reparent_children", "rescope_body", "icebox"],
+          "description": "What the groomer proposes a HUMAN do. Never performed by approving the report."
         }
       }
     },

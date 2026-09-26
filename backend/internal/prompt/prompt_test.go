@@ -12527,6 +12527,29 @@ func TestBuild_GroomingPropose_ActionClassMatrix(t *testing.T) {
 	}
 }
 
+// TestGroomingPrompt_NamesStaleItemsSection pins the stale_items bullet
+// (E54.83 / #3534): the rendered groom prompt names the optional section, its
+// derived id form, and the clause that approving the gate never applies it, and
+// routes the class under `scoping`.
+func TestGroomingPrompt_NamesStaleItemsSection(t *testing.T) {
+	got, err := Build("plan", groomingTriggerWithCharter())
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, want := range []string{
+		"`stale_items` is OPTIONAL and additive",
+		"stale:<item-key>:<kind>",
+		"complete_but_open | closed_with_open_children | body_predates_scope | aged_out",
+		"close | reparent_children | rescope_body | icebox",
+		"approving this stage's gate records a stale finding and NEVER closes, reparents or rescopes anything",
+		"`" + spec.ActionGroomScoping + "` covers decomposition suggestions, vision drift AND stale_items findings",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("grooming prompt missing stale_items text %q", want)
+		}
+	}
+}
+
 // TestBuild_GroomingPropose_QuarantinesIssueComments pins that the grooming
 // branch renders untrusted issue comments through the SAME ADR-029 sanitizer as
 // the plan branch (via writeIssueContext) — a hand-rolled comment renderer in

@@ -151,6 +151,10 @@ type GroomingProposalSet struct {
 	DependencyEdges          []plan.DependencyEdge          `json:"dependency_edges"`
 	VisionDrift              []plan.VisionDriftFlag         `json:"vision_drift"`
 	DecompositionSuggestions []plan.DecompositionSuggestion `json:"decomposition_suggestions"`
+	// StaleItems (#3534) is omitempty and NOT pre-initialized by the filter,
+	// so a proposal set with no stale finding marshals byte-identically to the
+	// six-array form AC6 pins.
+	StaleItems []plan.StaleItem `json:"stale_items,omitempty"`
 }
 
 // IsEmpty reports whether nothing survived the filter — the "no changes
@@ -158,7 +162,8 @@ type GroomingProposalSet struct {
 func (p GroomingProposalSet) IsEmpty() bool {
 	return len(p.Ordering) == 0 && len(p.Duplicates) == 0 &&
 		len(p.HygieneDefects) == 0 && len(p.DependencyEdges) == 0 &&
-		len(p.VisionDrift) == 0 && len(p.DecompositionSuggestions) == 0
+		len(p.VisionDrift) == 0 && len(p.DecompositionSuggestions) == 0 &&
+		len(p.StaleItems) == 0
 }
 
 // GroomingSuppression records one WITHHELD entry. Suppressed differences are
@@ -205,8 +210,11 @@ type GroomingChurnResult struct {
 }
 
 // groomingCharterAnchoredClasses are the classes whose finding is only
-// meaningful RELATIVE to the charter: an ordering is a rubric-cited ranking and
-// a vision-drift flag is a non-goal/phase-theme judgment, so a suppression
+// meaningful RELATIVE to the charter: an ordering is a rubric-cited ranking, a
+// vision-drift flag is a non-goal/phase-theme judgment, and a stale finding
+// (#3534) is a rubric-cited S1/S5 judgment — two of its kinds (aged_out,
+// body_predates_scope) are read against the charter's phase themes — so a
+// suppression
 // computed under a charter revision that has since moved was made against a
 // rubric that no longer holds.
 //
@@ -219,6 +227,7 @@ type GroomingChurnResult struct {
 var groomingCharterAnchoredClasses = map[string]bool{
 	plan.GroomingClassOrdering:    true,
 	plan.GroomingClassVisionDrift: true,
+	plan.GroomingClassStale:       true,
 }
 
 // groomingKnownClasses is the closed set of report entry classes. A baseline
@@ -230,6 +239,7 @@ var groomingKnownClasses = map[string]bool{
 	plan.GroomingClassDependency:    true,
 	plan.GroomingClassVisionDrift:   true,
 	plan.GroomingClassDecomposition: true,
+	plan.GroomingClassStale:         true,
 }
 
 // NewGroomingBaseline derives the three-state baseline from the last
@@ -336,6 +346,9 @@ func NewGroomingBaseline(prior *plan.GroomingReport, decisions []GroomingDecisio
 	for _, e := range prior.DecompositionSuggestions {
 		add(e.ID, plan.GroomingClassDecomposition, groomingDecompositionBasis(e), 0, 0)
 	}
+	for _, e := range prior.StaleItems {
+		add(e.ID, plan.GroomingClassStale, groomingStaleBasis(e), 0, 0)
+	}
 	return out
 }
 
@@ -389,6 +402,18 @@ func groomingBasisHash(class string, fields ...string) string {
 //	               proposal, so a re-worded split does not resurface. Switching
 //	               to normalized titles is a one-line change if the operator
 //	               prefers the opposite trade.
+//	stale          the kind and proposed_action ENUMS (#3534). kind is ALSO
+//	               the id qualifier, so a changed kind is a different entry
+//	               (never_proposed) before the basis is ever compared; it is
+//	               hashed anyway so the fingerprint states the whole
+//	               structural claim. EXCLUDES evidence (prose) and
+//	               rubric_citations (regenerated judgment; a charter move is
+//	               what lifts a stale suppression — the class is charter-
+//	               anchored). RESIDUAL, accepted by the operator as a
+//	               deliberate deviation from #3534's "unless its evidence
+//	               changed": a RE-WORDED evidence line does not resurface a
+//	               decided stale finding; a changed kind or proposed_action
+//	               does, as does a moved charter.
 func groomingOrderingBasis(e plan.OrderingEntry) string {
 	ids := make([]string, 0, len(e.RubricCitations))
 	for _, c := range e.RubricCitations {
@@ -442,6 +467,10 @@ func groomingDependencyBasis(e plan.DependencyEdge) string {
 
 func groomingVisionDriftBasis(e plan.VisionDriftFlag) string {
 	return groomingBasisHash(plan.GroomingClassVisionDrift, strings.TrimSpace(e.Basis))
+}
+
+func groomingStaleBasis(e plan.StaleItem) string {
+	return groomingBasisHash(plan.GroomingClassStale, strings.TrimSpace(e.Kind), strings.TrimSpace(e.ProposedAction))
 }
 
 func groomingDecompositionBasis(e plan.DecompositionSuggestion) string {
@@ -562,6 +591,11 @@ func FilterGroomingChurn(report *plan.GroomingReport, baseline GroomingBaseline,
 			res.Proposals.DecompositionSuggestions = append(res.Proposals.DecompositionSuggestions, e)
 		}
 	}
+	for _, e := range report.StaleItems {
+		if decide(e.ID, plan.GroomingClassStale, groomingStaleBasis(e), 0, 0, "") {
+			res.Proposals.StaleItems = append(res.Proposals.StaleItems, e)
+		}
+	}
 
 	sortGroomingProposals(&res.Proposals)
 	sort.SliceStable(res.Suppressed, func(i, j int) bool { return res.Suppressed[i].EntryID < res.Suppressed[j].EntryID })
@@ -675,6 +709,10 @@ func groomingBasisFieldName(class string) string {
 		return "basis"
 	case plan.GroomingClassDecomposition:
 		return "proposed_children"
+	case plan.GroomingClassStale:
+		// kind is the id qualifier, so only proposed_action can move under
+		// an unchanged id.
+		return "proposed_action"
 	default:
 		return "basis"
 	}
@@ -694,6 +732,7 @@ func sortGroomingProposals(p *GroomingProposalSet) {
 	sort.SliceStable(p.DecompositionSuggestions, func(i, j int) bool {
 		return p.DecompositionSuggestions[i].ID < p.DecompositionSuggestions[j].ID
 	})
+	sort.SliceStable(p.StaleItems, func(i, j int) bool { return p.StaleItems[i].ID < p.StaleItems[j].ID })
 }
 
 // groomingChurnSummary builds the audit payload. Every id list is sorted, so
@@ -722,6 +761,9 @@ func groomingChurnSummary(res GroomingChurnResult, anomalies []string, baselineE
 		sum.ProposedIDs = append(sum.ProposedIDs, e.ID)
 	}
 	for _, e := range res.Proposals.DecompositionSuggestions {
+		sum.ProposedIDs = append(sum.ProposedIDs, e.ID)
+	}
+	for _, e := range res.Proposals.StaleItems {
 		sum.ProposedIDs = append(sum.ProposedIDs, e.ID)
 	}
 	for _, s := range res.Suppressed {

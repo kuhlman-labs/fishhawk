@@ -260,7 +260,8 @@ components:
                 description: |
                   The entry's class — the typed array it appeared in
                   (ordering, duplicate, hygiene, dependency, vision_drift,
-                  decomposition, or one of the three milestone_scope classes).
+                  decomposition, stale, or one of the three milestone_scope
+                  classes).
               verdict:
                 type: string
                 enum: [approved, rejected, amended]

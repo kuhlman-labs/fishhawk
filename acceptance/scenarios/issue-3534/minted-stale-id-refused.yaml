@@ -1,0 +1,14 @@
+id: scenario:issue-3534/minted-stale-id-refused
+statement: A grooming report whose stale_items entry carries an id that does not derive from its own item_ref and kind is refused rather than ingested.
+verify_hint: POST a grooming_report whose stale entry id is a hand-minted string (e.g. "stale:whatever") to the ingest route and confirm HTTP 400 with error code grooming_report_invalid naming /stale_items/0/id.
+steps: 1) POST http://localhost:8090/v0/dev/fixtures {"scenario":"trace-upload-target"} -> run, plan stage. POST /v0/runs/{run}/signing-key; sign 'prompt:<plan>' via /v0/dev/sign and GET /v0/stages/{plan}/prompt (stage running). 2) Build a grooming_report from the spec example with a single stale_items entry (item_ref kuhlman-labs/fishhawk#1638, kind complete_but_open) whose id is 'stale:whatever'. Sign it via /v0/dev/sign and POST /v0/runs/{run}/plan?stage_id={plan}. 3) GET /v0/runs/{run}/audit?category=grooming_report_recorded. 4) Repeat steps 1-2 on a fresh seed with id 'stale:github/kuhlman-labs/fishhawk#1638:aged_out' (well-formed but with the wrong kind qualifier).
+assertions:
+    expected: HTTP 400 grooming_report_invalid naming /stale_items/0/id.
+    observed_at_record: 'Both: HTTP 400 {code:grooming_report_invalid, details.error:''plan: semantic: /stale_items/0/id: entry id "stale:whatever" is not derived from its own item reference(s); expected "stale:github/kuhlman-labs/fishhawk#1638:complete_but_open" ...''}; no grooming_report_recorded row written.'
+    repro_handle: POST /v0/runs/{run}/plan?stage_id={plan} with a grooming_report whose stale_items[0].id='stale:whatever'
+origin:
+    issue: 3534
+    pr: 3685
+    run_id: 395075ff-30d5-4fbd-9bdc-088bd1d38126
+    head_sha: 644d4dc877c01984c2d271b8382ebf37b8662eca
+    recorded_at: 2026-09-26T09:28:12Z

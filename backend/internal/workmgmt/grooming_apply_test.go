@@ -136,6 +136,21 @@ func visionDriftEntry(n int) plan.VisionDriftFlag {
 	}
 }
 
+// staleEntry builds a stale/closeable finding (#3534) whose kind proposes a
+// close — the most destructive-sounding proposal the class carries, so a
+// dispatch leak would show as a close call.
+func staleEntry(n int, kind string) plan.StaleItem {
+	r := groomingRef(n)
+	return plan.StaleItem{
+		ID:              plan.GroomingEntryID(plan.GroomingClassStale, kind, r),
+		ItemRef:         r,
+		Kind:            kind,
+		Evidence:        "every child closed",
+		RubricCitations: []plan.RubricCitation{{RubricID: "S1"}},
+		ProposedAction:  "close",
+	}
+}
+
 // approveAll builds an approved decision for every entry id in the report, so
 // a test that is not ABOUT the approval gate does not have to restate it.
 func approveAll(report *plan.GroomingReport) []GroomingDecision {
@@ -2519,6 +2534,7 @@ func TestGroomingActionClassFor(t *testing.T) {
 		{plan.GroomingClassDuplicate, "dedup"},
 		{plan.GroomingClassDecomposition, "scoping"},
 		{plan.GroomingClassVisionDrift, "scoping"},
+		{plan.GroomingClassStale, "scoping"},
 		// An unrecognized class returns the EMPTY string, never a guess: an
 		// equality test against a named class is then false, so an unknown
 		// class can never test as hygiene.
@@ -3965,8 +3981,112 @@ func TestGroomingCandidateCount(t *testing.T) {
 		Duplicates:               []plan.DuplicateCandidate{duplicateEntry(13, 14)},
 		DecompositionSuggestions: []plan.DecompositionSuggestion{decompositionEntry(15)},
 		VisionDrift:              []plan.VisionDriftFlag{visionDriftEntry(16)},
+		StaleItems:               []plan.StaleItem{staleEntry(17, "complete_but_open")},
 	}
-	if got := GroomingCandidateCount(report); got != 6 {
-		t.Errorf("GroomingCandidateCount = %d, want 6 (one per report entry)", got)
+	if got := GroomingCandidateCount(report); got != 7 {
+		t.Errorf("GroomingCandidateCount = %d, want 7 (one per report entry, the stale finding included)", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// stale_items (E54.83 / #3534) — a FINDING, never a mutation
+// ---------------------------------------------------------------------------
+
+// staleApply runs ApplyGrooming over report with the given decisions and every
+// mode set to auto, so a stale entry that escaped rule 0 would have nothing
+// else standing between it and a dispatch.
+func staleApply(t *testing.T, report *plan.GroomingReport, decisions []GroomingDecision) (*GroomingApplyResult, *fakeGroomingMutator, *fakeGroomingSink) {
+	t.Helper()
+	mut := &fakeGroomingMutator{}
+	sink := &fakeGroomingSink{}
+	res, err := ApplyGrooming(context.Background(), mut, &fakeGroomingReader{}, sink, GroomingApplyRequest{
+		Target:       groomingTarget(),
+		Report:       report,
+		Decisions:    decisions,
+		Modes:        map[string]GroomingMode{"hygiene": GroomingModeAuto, "scoping": GroomingModeAuto},
+		States:       groomingStates(),
+		IceboxColumn: "Icebox",
+	})
+	if err != nil {
+		t.Fatalf("ApplyGrooming: %v", err)
+	}
+	return res, mut, sink
+}
+
+// TestGroomingApply_StaleEntryFindingOnly: with NO decision for the stale
+// entry — the production groom-gate hook's shape, which synthesizes decisions
+// for hygiene/dependency only — the entry settles skipped/finding_only (not
+// no_decision), produces exactly one record, and the mutator is never called.
+func TestGroomingApply_StaleEntryFindingOnly(t *testing.T) {
+	report := &plan.GroomingReport{StaleItems: []plan.StaleItem{staleEntry(1, "complete_but_open")}}
+	res, mut, sink := staleApply(t, report, nil)
+	rec := recordFor(t, res, report.StaleItems[0].ID)
+	if rec.Outcome != GroomingOutcomeSkipped || rec.SkipReason != GroomingSkipFindingOnly {
+		t.Errorf("stale record = %+v, want outcome skipped with skip_reason %q", rec, GroomingSkipFindingOnly)
+	}
+	if len(mut.calls) != 0 {
+		t.Errorf("mutator saw %d dispatches %v for a stale finding, want 0", len(mut.calls), mut.kinds())
+	}
+	if len(sink.records) != 1 {
+		t.Errorf("sink got %d records, want exactly 1 for the stale finding", len(sink.records))
+	}
+}
+
+// TestGroomingApply_StaleEntryFindingOnlyEvenWhenApproved is the rule-0
+// precedence control: an EXPLICIT approval cannot promote a stale finding into
+// a write (charter S2/S5 — never close as a side effect of grooming).
+func TestGroomingApply_StaleEntryFindingOnlyEvenWhenApproved(t *testing.T) {
+	report := &plan.GroomingReport{StaleItems: []plan.StaleItem{staleEntry(1, "complete_but_open")}}
+	res, mut, _ := staleApply(t, report, approveAll(report))
+	rec := recordFor(t, res, report.StaleItems[0].ID)
+	if rec.SkipReason != GroomingSkipFindingOnly {
+		t.Errorf("approved stale record = %+v, want skip_reason %q", rec, GroomingSkipFindingOnly)
+	}
+	if len(mut.calls) != 0 || len(mut.destructiveCalls()) != 0 {
+		t.Errorf("mutator saw dispatches %v for an APPROVED stale finding, want none", mut.kinds())
+	}
+}
+
+// TestGroomingApply_StaleEntryJoins proves both id walks include stale_items:
+// a decision naming the stale id joins cleanly, a duplicated stale id is the
+// REPORT-side refusal, and an unknown id is still refused while a stale entry
+// is present.
+func TestGroomingApply_StaleEntryJoins(t *testing.T) {
+	report := &plan.GroomingReport{
+		HygieneDefects: []plan.HygieneDefect{hygieneEntry(1, "missing_label_namespace", "area:api")},
+		StaleItems:     []plan.StaleItem{staleEntry(2, "aged_out")},
+	}
+	if err := validateGroomingJoin(report, approveAll(report), deriveGroomingMutations(report)); err != nil {
+		t.Fatalf("validateGroomingJoin with a stale decision = %v, want nil", err)
+	}
+
+	dup := &plan.GroomingReport{StaleItems: []plan.StaleItem{staleEntry(2, "aged_out"), staleEntry(2, "aged_out")}}
+	var je *GroomingJoinError
+	err := validateGroomingJoin(dup, nil, []groomingCandidate{{entryID: dup.StaleItems[0].ID}})
+	if !errors.As(err, &je) || !strings.Contains(je.Reason, "appears more than once in the report") {
+		t.Errorf("duplicated stale id: err = %v, want the report-side duplicate refusal", err)
+	}
+
+	unknown := append(approveAll(report), GroomingDecision{EntryID: "stale:github/x/y#9:aged_out", Verdict: GroomingApproved})
+	if err := validateGroomingJoin(report, unknown, deriveGroomingMutations(report)); !errors.As(err, &je) {
+		t.Errorf("unknown decision id: err = %v, want *GroomingJoinError", err)
+	}
+}
+
+// TestGroomingApply_StaleOrderedLast: the stale class is appended LAST in the
+// deterministic dispatch order, after vision drift, so adding it cannot
+// perturb an existing class's position.
+func TestGroomingApply_StaleOrderedLast(t *testing.T) {
+	report := &plan.GroomingReport{
+		StaleItems:     []plan.StaleItem{staleEntry(1, "aged_out")},
+		VisionDrift:    []plan.VisionDriftFlag{visionDriftEntry(2)},
+		HygieneDefects: []plan.HygieneDefect{hygieneEntry(3, "missing_label_namespace", "area:api")},
+	}
+	cands := deriveGroomingMutations(report)
+	if len(cands) != 3 {
+		t.Fatalf("derived %d candidates, want 3", len(cands))
+	}
+	if last := cands[len(cands)-1]; last.entryID != report.StaleItems[0].ID || last.class != "scoping" || last.kind != "" {
+		t.Errorf("last candidate = %+v, want the stale entry (scoping, no kind)", last)
 	}
 }

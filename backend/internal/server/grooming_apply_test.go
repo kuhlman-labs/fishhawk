@@ -448,6 +448,9 @@ type groomingApplyOpts struct {
 	// mutatorRefusal makes every dispatch return a provider REFUSAL carrying
 	// this reason — the third result state (#2860).
 	mutatorRefusal string
+	// extendReport mutates the one-of-every-class report BEFORE it is
+	// marshalled into the stage artifact (e.g. to add a stale finding).
+	extendReport func(*plan.GroomingReport)
 }
 
 type groomingApplyFixture struct {
@@ -489,6 +492,9 @@ func newGroomingApplyFixture(t *testing.T, opts groomingApplyOpts) *groomingAppl
 	}
 
 	report, ids := groomingApplyFullReport()
+	if opts.extendReport != nil {
+		opts.extendReport(report)
+	}
 	if !opts.omitReport {
 		content := groomingApplyReportJSON(t, report)
 		if opts.badReport {
@@ -3038,5 +3044,66 @@ func TestApproveGroomStage_OverBudgetRowsDecodeEqualToGoldens(t *testing.T) {
 	}
 	if sum.BudgetExhausted != exhaustedRows || sum.Applied+sum.Failed+sum.Skipped+sum.Refused != entries {
 		t.Errorf("summary = %+v, want budget_exhausted %d and counts summing to %d", sum, exhaustedRows, entries)
+	}
+}
+
+// TestApplyApprovedGrooming_StaleEntryIsFindingOnly is the CROSS-BOUNDARY
+// end-to-end test for stale_items (E54.83 / #3534): the REAL groom-gate
+// approval hook over a stage artifact carrying the one-of-every-class report
+// PLUS one stale finding (plan parse -> server entry-class map / decision merge
+// -> workmgmt apply -> audit sink). In one pass: the hygiene mutation
+// dispatched, the stale entry produced exactly ONE grooming_mutation_applied
+// row with skip_reason finding_only, and the mutator was never dialed for it —
+// even though the operator recorded an explicit APPROVED disposition on it
+// (approving a report never closes as a side effect, charter S2/S5).
+func TestApplyApprovedGrooming_StaleEntryIsFindingOnly(t *testing.T) {
+	staleRef := groomingApplyRef(19)
+	staleID := plan.GroomingEntryID(plan.GroomingClassStale, "complete_but_open", staleRef)
+	f := newGroomingApplyFixture(t, groomingApplyOpts{extendReport: func(r *plan.GroomingReport) {
+		r.StaleItems = []plan.StaleItem{{
+			ID: staleID, ItemRef: staleRef, Kind: "complete_but_open",
+			Evidence:        "every child closed",
+			RubricCitations: []plan.RubricCitation{{RubricID: "S1"}},
+			ProposedAction:  "close",
+		}}
+	}})
+	if got := groomingReportEntryClasses(f.report)[staleID]; got != plan.GroomingClassStale {
+		t.Fatalf("groomingReportEntryClasses[%q] = %q, want %q — the hook cannot classify the stale entry", staleID, got, plan.GroomingClassStale)
+	}
+	f.seedApproval(t, "kuhlman-labs", approval.DecisionApprove)
+	f.seedDisposition(t, f.reportArtifactID(t), staleID, plan.GroomingClassStale, "approved", "")
+
+	f.apply(t, approval.DecisionApprove)
+
+	dialed := f.mutator.dialedEntryIDs()
+	sawHygiene := false
+	for _, id := range dialed {
+		if id == staleID {
+			t.Errorf("mutator dialed the STALE entry %q; a stale finding must never be applied", staleID)
+		}
+		if id == f.ids.hygiene {
+			sawHygiene = true
+		}
+	}
+	if !sawHygiene {
+		t.Errorf("dialed = %v, want the hygiene entry %q — the apply must still run", dialed, f.ids.hygiene)
+	}
+
+	staleRows := 0
+	for _, p := range f.rowsOfCategory(workmgmt.GroomingMutationAppliedCategory) {
+		var rec workmgmt.GroomingMutationRecord
+		if err := json.Unmarshal(p.Payload, &rec); err != nil {
+			t.Fatalf("decode grooming_mutation_applied payload: %v (%s)", err, p.Payload)
+		}
+		if rec.EntryID != staleID {
+			continue
+		}
+		staleRows++
+		if rec.Outcome != workmgmt.GroomingOutcomeSkipped || rec.SkipReason != workmgmt.GroomingSkipFindingOnly {
+			t.Errorf("stale record = %+v, want skipped/finding_only", rec)
+		}
+	}
+	if staleRows != 1 {
+		t.Errorf("stale grooming_mutation_applied rows = %d, want exactly 1 (categories %v)", staleRows, f.groomingAuditCategories())
 	}
 }

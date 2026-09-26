@@ -318,14 +318,15 @@ An already-decided entry is re-proposed only when its **structural basis** moved
 | `dependency` | `kind` — direction is already in the id | `basis` |
 | `vision_drift` | the `basis` enum | `detail`; `charter_ref_id` is already the id qualifier |
 | `decomposition` | the proposed-children **count** | child titles and scope hints |
+| `stale` | the `kind` and `proposed_action` enums — `kind` is also the id qualifier, so only `proposed_action` can move under an unchanged id (#3534) | `evidence` (prose), `rubric_citations` (regenerated judgment; a charter move lifts the class instead) |
 
-Two residuals, stated rather than implied: a rejected proposal whose **only** change is re-worded justification does not resurface, and two proposals to split the same item into the same number of children are treated as one proposal.
+Two residuals, stated rather than implied: a rejected proposal whose **only** change is re-worded justification does not resurface, and two proposals to split the same item into the same number of children are treated as one proposal. The first applies to `stale` too, by deliberate choice (#3534): a re-worded `evidence` line does not resurface a decided stale finding; a changed `proposed_action` or a moved charter does.
 
 A third, ONE-TIME residual: the `hygiene` basis moved from `suggested_fix` onto the structured `fix` in #2847, so every hygiene fingerprint changed value once and hygiene entries decided under the old basis resurface exactly **once** on the next grooming run. That is the honest consequence of the proposal's identity genuinely changing shape — the basis now covers the value the apply path dispatches, so a re-worded sentence over an unchanged label set is no longer a "materially changed" proposal, and two different label sets behind one sentence are no longer one proposal. The board state is lower-cased on both sides — in the fingerprint and in the conventions lookup that resolves it — so `Backlog` and `backlog` are one proposal for the guard and one state for the apply.
 
 ### The charter-change lift
 
-A charter content-hash change lifts suppression for the **charter-anchored** classes (`ordering`, `vision_drift`) but not the objective ones (`hygiene`, `dependency`, `duplicate`, `decomposition`). A suppression computed under a charter revision that has since moved was made against a rubric that no longer holds; an applied label fix does not become un-applied because the charter was edited. An **absent** `charter_ref` on either side is *unknown*, not *different* — treating unknown as moved would lift every charter-anchored suppression on every report that omits it.
+A charter content-hash change lifts suppression for the **charter-anchored** classes (`ordering`, `vision_drift`, `stale`) but not the objective ones (`hygiene`, `dependency`, `duplicate`, `decomposition`). A suppression computed under a charter revision that has since moved was made against a rubric that no longer holds; an applied label fix does not become un-applied because the charter was edited. An **absent** `charter_ref` on either side is *unknown*, not *different* — treating unknown as moved would lift every charter-anchored suppression on every report that omits it.
 
 ### No semantic rule is added for `grooming`
 
