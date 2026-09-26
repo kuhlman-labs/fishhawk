@@ -522,3 +522,92 @@ func TestValidateToolDescription_StatesResiduals(t *testing.T) {
 		}
 	}
 }
+
+// TestValidateSpec_ConfinementIsTransportConditional pins fishhawk_validate's
+// half of the E66.63 / #3589 posture at the handler, complementing the
+// cross-verb table in path_confinement_test.go:
+//
+//   - STDIO reads an out-of-root spec unchanged (operator option (c)), so the
+//     local loop is untouched. This is the ACCEPT control that stops the
+//     refusal cases below passing by refusing everything.
+//   - HTTP with the spec inside a configured root reads it.
+//   - HTTP with the spec OUTSIDE every root refuses, returning a ZERO output —
+//     the file's contents never reach the caller.
+func TestValidateSpec_ConfinementIsTransportConditional(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir() // independently created — definitionally outside root
+
+	body := minimalWorkflowSpecYAML(t)
+	insideSpec := filepath.Join(root, "workflows.yaml")
+	if err := os.WriteFile(insideSpec, []byte(body), 0o600); err != nil {
+		t.Fatalf("write inside spec: %v", err)
+	}
+	outsideSpec := filepath.Join(outside, "workflows.yaml")
+	if err := os.WriteFile(outsideSpec, []byte(body), 0o600); err != nil {
+		t.Fatalf("write outside spec: %v", err)
+	}
+
+	t.Run("stdio_reads_an_out_of_root_spec", func(t *testing.T) {
+		r := &runResolver{httpTransport: false, allowedRoots: []string{root}}
+		_, out, err := r.validateSpec(context.Background(), nil, ValidateSpecInput{SpecFile: outsideSpec})
+		if err != nil {
+			t.Fatalf("stdio must be unconfined, got %v", err)
+		}
+		if !out.Valid {
+			t.Errorf("out.Valid = false, want true; diagnostics: %+v", out.Diagnostics)
+		}
+	})
+
+	t.Run("http_reads_an_in_root_spec", func(t *testing.T) {
+		r := &runResolver{httpTransport: true, allowedRoots: []string{root}}
+		_, out, err := r.validateSpec(context.Background(), nil, ValidateSpecInput{SpecFile: insideSpec})
+		if err != nil {
+			t.Fatalf("a spec inside the root must be read, got %v", err)
+		}
+		if !out.Valid {
+			t.Errorf("out.Valid = false, want true; diagnostics: %+v", out.Diagnostics)
+		}
+	})
+
+	t.Run("http_refuses_an_out_of_root_spec", func(t *testing.T) {
+		r := &runResolver{httpTransport: true, allowedRoots: []string{root}}
+		_, out, err := r.validateSpec(context.Background(), nil, ValidateSpecInput{SpecFile: outsideSpec})
+		if err == nil {
+			t.Fatalf("expected a refusal, got out = %+v", out)
+		}
+		if !strings.Contains(err.Error(), pathOutsideAllowedRootsCode) {
+			t.Errorf("error should carry %q; got %v", pathOutsideAllowedRootsCode, err)
+		}
+		if out.Valid || out.Source != "" || out.Path != "" {
+			t.Errorf("a refused call must return a ZERO output (nothing read); got %+v", out)
+		}
+	})
+
+	t.Run("http_refuses_with_no_roots_configured", func(t *testing.T) {
+		// Fail closed: the same in-root spec is refused when no root is set.
+		r := &runResolver{httpTransport: true}
+		_, _, err := r.validateSpec(context.Background(), nil, ValidateSpecInput{SpecFile: insideSpec})
+		if err == nil {
+			t.Fatal("expected a refusal with no allowed root configured")
+		}
+		if !strings.Contains(err.Error(), pathOutsideAllowedRootsCode) {
+			t.Errorf("error should carry %q; got %v", pathOutsideAllowedRootsCode, err)
+		}
+	})
+}
+
+// TestValidateToolDescription_StatesConfinement pins the SHIPPED tool
+// description's confinement sentence — a prose surface no compiler enforces,
+// and the only place an agent learns WHY it was refused before it calls.
+func TestValidateToolDescription_StatesConfinement(t *testing.T) {
+	desc := strings.Join(strings.Fields(registeredToolDescription(t, "fishhawk_validate")), " ")
+	for _, want := range []string{
+		"allowed checkout root",
+		pathOutsideAllowedRootsCode,
+		"inline workflow_spec reads no filesystem",
+	} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("fishhawk_validate description missing %q:\n%s", want, desc)
+		}
+	}
+}

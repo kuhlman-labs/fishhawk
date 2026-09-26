@@ -498,14 +498,15 @@ func TestExportedSurfaceMatchesBaseline(t *testing.T) {
 }
 
 // TestEntryPointsExist asserts the three intended entry points are present
-// and Config carries exactly the three documented exported fields — a fourth
+// and Config carries exactly the four documented exported fields — a fifth
 // exported field on Config, or a dropped one, fails it. Config/NewServer/
 // Instructions are the only surface #2390 consumes; this guards their shape
 // independently of the bulk baseline. HTTPTransport joined {APIToken,
-// BackendURL} with #2479 (the transport-conditional working_dir refusal), so
-// the baseline is updated to the new EXACT three-field set — NOT loosened to a
-// subset/contains check: a new exported field on Config must stay a conscious
-// act.
+// BackendURL} with #2479 (the transport-conditional working_dir refusal), and
+// AllowedRoots joined them with E66.63 / #3589 (the HTTP path-confinement
+// allow-list), so the baseline is updated to the new EXACT four-field set —
+// NOT loosened to a subset/contains check: a new exported field on Config must
+// stay a conscious act.
 func TestEntryPointsExist(t *testing.T) {
 	surface := map[string]struct{}{}
 	for _, n := range collectExportedIdents(t) {
@@ -517,9 +518,9 @@ func TestEntryPointsExist(t *testing.T) {
 		}
 	}
 
-	// Config's exported fields must be exactly {APIToken, BackendURL,
-	// HTTPTransport} — an EXACT-SET check (not subset/contains), so both a new
-	// leaked field and a dropped one fail.
+	// Config's exported fields must be exactly {APIToken, AllowedRoots,
+	// BackendURL, HTTPTransport} — an EXACT-SET check (not subset/contains), so
+	// both a new leaked field and a dropped one fail.
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, "server.go", nil, 0)
 	if err != nil {
@@ -550,7 +551,7 @@ func TestEntryPointsExist(t *testing.T) {
 		}
 	}
 	sort.Strings(fields)
-	want := []string{"APIToken", "BackendURL", "HTTPTransport"}
+	want := []string{"APIToken", "AllowedRoots", "BackendURL", "HTTPTransport"}
 	mismatch := len(fields) != len(want)
 	for i := range want {
 		if i >= len(fields) || fields[i] != want[i] {

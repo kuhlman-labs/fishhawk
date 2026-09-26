@@ -60,6 +60,11 @@ type config struct {
 	// the runResolver so the runner-spawning verbs refuse an omitted or
 	// relative working_dir in that posture (#2479).
 	httpTransport bool
+
+	// allowedRoots is the package-private mirror of Config.AllowedRoots: the
+	// checkout roots every path-taking input must resolve inside over the HTTP
+	// transport (E66.63 / #3589). Empty over HTTP = fail closed.
+	allowedRoots []string
 }
 
 // Config is the exported construction input for NewServer. Its two fields
@@ -84,12 +89,35 @@ type Config struct {
 	// spawned process) it stays false: the process cwd is the caller's own
 	// project directory, so an omitted working_dir resolves to it.
 	HTTPTransport bool
+
+	// AllowedRoots is the operator-configured allow-list of absolute checkout
+	// roots every path-taking MCP input (working_dir, spec_file) must resolve
+	// inside when this registry is served over an HTTP transport (E66.63 /
+	// #3589). Containment compares cleaned, symlink-resolved paths byte-wise
+	// with a separator anchor, so `/roots/repo-evil` is not inside
+	// `/roots/repo`.
+	//
+	// It is INERT on the stdio transport: a client-spawned stdio process runs
+	// as the caller in the caller's own checkout, so the caller already owns
+	// every path it can reach (the operator's option (c)).
+	//
+	// EMPTY over HTTP is the FAIL-CLOSED posture, not "unrestricted": every
+	// path-taking verb is refused path_outside_allowed_roots until at least one
+	// root is configured. Operators set it via fishhawkd's
+	// --mcp-allowed-roots / FISHHAWKD_MCP_ALLOWED_ROOTS or fishhawk-mcp's
+	// --allowed-roots / FISHHAWK_MCP_ALLOWED_ROOTS.
+	AllowedRoots []string
 }
 
 // internal bridges the exported Config into the package-private config the
 // tool constructors consume, without touching newAPIClient's signature.
 func (c Config) internal() config {
-	return config{backendURL: c.BackendURL, apiToken: c.APIToken, httpTransport: c.HTTPTransport}
+	return config{
+		backendURL:    c.BackendURL,
+		apiToken:      c.APIToken,
+		httpTransport: c.HTTPTransport,
+		allowedRoots:  c.AllowedRoots,
+	}
 }
 
 // handshakeVersion returns the version string advertised on the MCP
@@ -129,6 +157,7 @@ func NewServer(cfg Config) *mcp.Server {
 		api:           newAPIClient(c),
 		getenv:        os.Getenv,
 		httpTransport: c.httpTransport,
+		allowedRoots:  c.allowedRoots,
 	})
 	registerOnboardingResources(srv)
 	return srv
