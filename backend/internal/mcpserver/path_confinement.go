@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 )
 
 // pathConfinementSchemaNote is the one shared sentence appended to every
@@ -195,9 +196,9 @@ const (
 // is not enough, because discoverSpec walks up from it and selects a file that
 // may itself be a symlink pointing outside every root. This is consulted for
 // each candidate BEFORE the file is opened, so a discovered escape is refused
-// having read ZERO bytes. It confines a PATHNAME; readConfinedSpecFile is the
-// second half that confines the FILE ACTUALLY OPENED, closing the window
-// between this check and the open.
+// having read ZERO bytes. It confines a PATHNAME, which a concurrent swap can
+// invalidate; readConfinedSpecFile is the half that confines the FILE ACTUALLY
+// OPENED, by opening it through a root handle rather than re-checking the name.
 //
 // It is inert on stdio and when no candidate check applies, exactly like
 // confinePath, and it distinguishes the two ways a candidate can be outside a
@@ -287,6 +288,14 @@ func (r *runResolver) confineSpecCandidate(candidate string) specCandidateVerdic
 // discoverSpec. An explicit path came from the caller, so the verb's own
 // confinePath already resolved and confined that exact file; stdio is
 // deliberately unconfined.
+//
+// Residual on that delegation: discoverSpec reads an explicit path BY PATHNAME,
+// so the check-to-read window readConfinedSpecFile closes for DISCOVERED files
+// remains open for a caller-supplied one. Narrower in consequence (the caller
+// named the file; a race can substitute its bytes, not steer the walk onto a
+// file they could not name) and closing it means routing the explicit arm
+// through the same root handle inside spec_discover.go, which is outside this
+// change. Stated in the README beside the rest of the confinement contract.
 func (r *runResolver) discoverSpecConfined(startDir, explicit string) (*discoveredSpec, error) {
 	if explicit != "" || !r.httpTransport {
 		return discoverSpec(startDir, explicit)
@@ -320,9 +329,9 @@ func (r *runResolver) discoverSpecConfined(startDir, explicit string) (*discover
 				BlobSHA:  gitBlobSHA(data),
 			}, nil
 		case errors.Is(rerr, errSpecEscapedDuringOpen):
-			// The pathname was replaced between the pre-open check and the
-			// open (the TOCTOU half). Same refusal as a stationary escape:
-			// the descriptor is closed with nothing read from it.
+			// The confined open refused the candidate — an escaping component
+			// (even one introduced after the pre-open check), or a non-regular
+			// file. Same refusal as a stationary escape: nothing was read.
 			return nil, confinedSpecDiscoveryError(candidate)
 		case errors.Is(rerr, fs.ErrNotExist):
 			// fall through and check the .git boundary / walk up.
@@ -344,74 +353,82 @@ func (r *runResolver) discoverSpecConfined(startDir, explicit string) (*discover
 	}
 }
 
-// errSpecEscapedDuringOpen is the sentinel readConfinedSpecFile returns when
-// the file it actually OPENED is not the confined file the pre-open check
-// approved — the path (its leaf or an ancestor) was replaced in the window
-// between the two. The caller maps it to the same confinedSpecDiscoveryError a
-// stationary escape draws: from the caller's side the two are indistinguishable
-// by design, so the refusal is not a race oracle either.
-var errSpecEscapedDuringOpen = errors.New("discovered spec escaped the allowed roots between the confinement check and the open")
+// errSpecEscapedDuringOpen is the sentinel readConfinedSpecFile returns when the
+// confined open refused to hand back the discovered file: a component of the
+// pathname (its leaf OR an ancestor) resolved outside the allowed root, the
+// candidate lies under no configured root, or the opened file is not a regular
+// file. The caller maps it to the same confinedSpecDiscoveryError a stationary
+// escape draws: from the caller's side the two are indistinguishable by design,
+// so the refusal is not a race oracle either.
+var errSpecEscapedDuringOpen = errors.New("discovered spec escaped the allowed roots during the confined open")
 
 // specOpenRaceHook is a TEST-ONLY seam, nil in production and never assigned
 // outside _test.go. It fires in the window readConfinedSpecFile exists to
-// close — after the pre-open confinement check, before the open — so the TOCTOU
-// boundary can be exercised DETERMINISTICALLY (a test replaces the pathname
-// there) instead of only probabilistically by a racing goroutine. It is
-// deliberately not a behaviour switch: with it nil, the code path below is
-// byte-for-byte the shipped one.
+// close — after the pre-open pathname check, before the confined open — so the
+// TOCTOU boundary can be exercised DETERMINISTICALLY (a test replaces the leaf
+// or an ancestor there) instead of only probabilistically by a racing
+// goroutine. It is deliberately not a behaviour switch: with it nil, the code
+// path below is byte-for-byte the shipped one.
 var specOpenRaceHook func(candidate string)
 
-// readConfinedSpecFile opens candidate, establishes that the file it actually
-// opened is the confined file, and only THEN reads its bytes.
+// readConfinedSpecFile opens the discovered spec through a ROOT HANDLE and only
+// then reads its bytes, so containment is established by the SAME traversal that
+// produces the descriptor.
 //
-// The concern this closes (fix-up on E66.63 / #3589): confineSpecCandidate
-// validates a PATHNAME, and the subsequent open re-traverses that pathname. In
-// a writable checkout — which is the supported deployment, an agent edits the
-// tree — the leaf or an ancestor can be replaced with an out-of-root symlink
-// between the two operations, and a plain os.ReadFile would then hand the
-// outside file's bytes to validation diagnostics or to start_run's backend
-// submission. Confining the pathname is therefore necessary but not sufficient:
-// containment must hold for the OPEN FILE.
+// Why a root handle and not a re-check (the fix-up concern this closes, on
+// E66.63 / #3589): confineSpecCandidate validates a PATHNAME, and any subsequent
+// open re-traverses that pathname. The first fix-up pass held the descriptor and
+// re-derived containment (EvalSymlinks) and identity (os.SameFile against an
+// os.Lstat) afterwards — but those are TWO MORE traversals of a mutable
+// pathname, and in a writable checkout (the supported deployment: an agent edits
+// the tree) a swap-restore-RESWAP sequence defeats both. Concretely: swap an
+// ancestor to an out-of-root symlink before the open (the descriptor is now the
+// outside file), restore it before the EvalSymlinks (containment passes on an
+// in-root resolution), re-swap it before the Lstat (which follows ANCESTOR
+// symlinks, so it lands back on the outside file and SameFile agrees with the
+// descriptor). Every check passes and the outside bytes are returned. No number
+// of added re-checks fixes that, because each one is another traversal an
+// attacker can be on the other side of.
 //
-// The order is what makes it sound. Opening reads no file CONTENT, so nothing
-// has escaped yet at that point. With the descriptor held:
+// So containment is no longer judged on a pathname at all. os.Root (Go 1.24+;
+// this repo pins 1.25) opens a path COMPONENT-WISE beneath a held root
+// descriptor, refusing any component — leaf or ancestor, and any absolute or
+// upward symlink target — that would leave the root. The walk is done with
+// openat per component (openat2 RESOLVE_BENEATH where the kernel has it), so an
+// attacker swapping a component mid-walk changes which openat fails, never
+// whether the result can be outside the root. There is nothing left to
+// re-verify: the descriptor IS the containment proof, and identity is trivial
+// because the bytes are read from that same descriptor.
 //
-//   - fstat it through the descriptor and require a REGULAR file (a swap to a
-//     FIFO or a device is refused rather than read);
-//   - FULLY resolve the pathname with filepath.EvalSymlinks — NOT
-//     resolveForConfinement, whose longest-existing-ancestor fallback is
-//     deliberately lenient about a non-existent leaf. That leniency is correct
-//     for confining a not-yet-created spec_file and WRONG here: a leaf that is
-//     momentarily a DANGLING symlink would resolve to its own lexical path,
-//     read as inside the root, and the inode comparison below would then
-//     re-traverse the racing pathname and compare the escape target against
-//     itself. The file is open, so it exists; an unresolvable pathname at this
-//     point means it moved, which is a refusal;
-//   - require that fully-resolved, symlink-free path to lie inside an allowed
-//     root;
-//   - require it to name the SAME inode as the open descriptor (os.SameFile).
+// The remaining check is the file TYPE: a component swapped to a FIFO, device or
+// directory is inside the root and so passes the confined open, but is not a
+// spec. fstat through the descriptor and require a regular file. The open asks
+// for O_NONBLOCK so that a leaf swapped to a FIFO cannot WEDGE the open before
+// that check runs (a blocking FIFO open waits for a writer forever); the flag is
+// ignored for regular files.
 //
-// That last step is the one a pathname-only re-check cannot do. An attacker who
-// swaps the path to an outside file for the open and then restores it defeats a
-// second pathname check but not the inode comparison: the restored path names a
-// different file from the one held open. And an attacker who leaves the path
-// pointing at the opened file defeats the inode comparison but not the
-// re-check, which then refuses the outside resolution. Passing BOTH means the
-// bytes about to be read come from a file that is inside a root and is the file
-// the descriptor holds.
+// The pre-open confineSpecCandidate check stays. It is not load-bearing for
+// containment any more — it is the fast, stationary refusal and the walk's
+// stop-walk boundary, and it keeps the chmod-000 read-barrier assertion
+// meaningful by refusing before anything is opened.
 //
-// Residual, stated honestly: this is a verify-after-open, not an atomic
-// openat2(RESOLVE_BENEATH) (which Go does not expose portably and macOS does
-// not have). A file whose CONTENT is rewritten in place, inode unchanged, while
-// staying inside a root is read as amended — but that file was inside the trust
-// boundary the whole time, which is the same residual the README already states
-// for in-root reads.
+// Residuals, stated honestly:
+//
+//   - os.Root is traversal-resistant, NOT atomic against in-place content
+//     rewrites: a file whose BYTES are rewritten under a stable in-root path is
+//     read as amended. That file was inside the trust boundary the whole time,
+//     which is the same in-root residual the README already states.
+//   - Per the Go documentation, os.Root's guarantees are strongest on platforms
+//     with openat semantics (Linux, macOS, the BSDs). On Windows and js/wasm the
+//     implementation cannot rely on them and the confinement is correspondingly
+//     weaker — the same platform caveat the byte-wise, non-case-folding
+//     containment comparison already carries.
 func (r *runResolver) readConfinedSpecFile(candidate string) ([]byte, error) {
 	if hook := specOpenRaceHook; hook != nil {
 		hook(candidate)
 	}
 
-	f, err := os.Open(candidate) //nolint:gosec // pathname confined above; the OPEN FILE is confined below, before any read.
+	f, err := r.openSpecBeneathAllowedRoot(candidate)
 	if err != nil {
 		return nil, err
 	}
@@ -421,44 +438,92 @@ func (r *runResolver) readConfinedSpecFile(candidate string) ([]byte, error) {
 	if err != nil || !info.Mode().IsRegular() {
 		return nil, errSpecEscapedDuringOpen
 	}
-	resolved, err := filepath.EvalSymlinks(candidate)
-	if err != nil || !r.resolvedPathInsideAllowedRoots(resolved) {
-		return nil, errSpecEscapedDuringOpen
-	}
-	// Lstat, not Stat: `resolved` is symlink-free by construction, so Lstat
-	// names exactly the file EvalSymlinks landed on and cannot be made to
-	// re-traverse a link the swap re-introduced at the original pathname.
-	resolvedInfo, err := os.Lstat(resolved)
-	if err != nil || !os.SameFile(info, resolvedInfo) {
-		return nil, errSpecEscapedDuringOpen
-	}
-
 	return io.ReadAll(f)
 }
 
-// resolvedPathInsideAllowedRoots reports whether an ALREADY fully-resolved,
-// symlink-free path lies inside a configured allowed root. It is the strict
-// counterpart of the loop inside confineSpecCandidate: no roots configured is
-// FALSE (fail closed), a non-absolute configured root is FALSE (unresolvable
-// misconfiguration must not widen the allow-list), and an individually
-// unresolvable root is skipped so one bad entry cannot disable the others.
-func (r *runResolver) resolvedPathInsideAllowedRoots(resolved string) bool {
+// openSpecBeneathAllowedRoot opens candidate through an os.Root handle on the
+// allowed root that contains it, so the open itself cannot land outside that
+// root no matter what happens to the pathname concurrently.
+//
+// Root SELECTION is pathname work (which configured root does this candidate sit
+// under?) and is therefore racy — deliberately harmlessly so: whichever root it
+// picks, the open is confined BENEATH a configured root, so a raced selection
+// can at worst pick the wrong root (→ ENOENT or a refusal) and never widen the
+// boundary.
+//
+// A not-exist open is returned VERBATIM, because discoverSpecConfined keys its
+// walk-up on fs.ErrNotExist; every other failure — an escaping component, an
+// unopenable root, a candidate under no root — collapses to
+// errSpecEscapedDuringOpen so the refusal text cannot be used to classify what
+// went wrong.
+func (r *runResolver) openSpecBeneathAllowedRoot(candidate string) (*os.File, error) {
 	if len(r.allowedRoots) == 0 {
-		return false
+		return nil, errSpecEscapedDuringOpen // fail closed
 	}
+
+	var notExist error
 	for _, root := range r.allowedRoots {
 		if !filepath.IsAbs(root) {
-			return false
+			// An unresolvable configured root must never widen the allow-list.
+			return nil, errSpecEscapedDuringOpen
 		}
 		resolvedRoot, err := resolveForConfinement(root)
 		if err != nil {
+			continue // one bad entry must not disable the others
+		}
+		rel, ok := specRelBeneathRoot(resolvedRoot, candidate)
+		if !ok {
 			continue
 		}
-		if pathWithinRoot(resolved, resolvedRoot) {
-			return true
+		handle, err := os.OpenRoot(resolvedRoot)
+		if err != nil {
+			continue
+		}
+		f, oerr := handle.OpenFile(rel, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+		_ = handle.Close() // the opened file stays valid: it holds its own fd.
+		switch {
+		case oerr == nil:
+			return f, nil
+		case errors.Is(oerr, fs.ErrNotExist):
+			notExist = oerr
+			continue
+		default:
+			// "path escapes from parent" and every other refusal.
+			return nil, errSpecEscapedDuringOpen
 		}
 	}
-	return false
+	if notExist != nil {
+		return nil, notExist
+	}
+	return nil, errSpecEscapedDuringOpen
+}
+
+// specRelBeneathRoot returns candidate expressed RELATIVE to an already-resolved
+// allowed root, for handing to os.Root.OpenFile.
+//
+// The candidate is symlink-resolved first (resolveForConfinement, the lenient
+// resolver, because the leaf may legitimately not exist yet during the walk) so
+// that a leaf or ancestor symlink pointing ELSEWHERE INSIDE the root still
+// resolves to a path the root handle can walk: os.Root refuses absolute symlink
+// targets outright, and the pre-resolution is what keeps an in-root absolute
+// symlink working. It is only a NAME computation — a resolution an attacker
+// races produces a different relative name, never a wider boundary, because
+// os.Root enforces containment on the open.
+//
+// The `..`/absolute rejection is redundant with pathWithinRoot above it and kept
+// deliberately: it is the invariant os.Root's contract depends on, and it costs
+// one comparison.
+func specRelBeneathRoot(resolvedRoot, candidate string) (string, bool) {
+	resolved, err := resolveForConfinement(candidate)
+	if err != nil || !pathWithinRoot(resolved, resolvedRoot) {
+		return "", false
+	}
+	rel, err := filepath.Rel(resolvedRoot, resolved)
+	if err != nil || rel == "." || rel == ".." || filepath.IsAbs(rel) ||
+		strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", false
+	}
+	return rel, true
 }
 
 // confinedSpecDiscoveryError is the refusal confineSpecCandidate's

@@ -5,14 +5,18 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 )
 
 // TestConfinePath drives one case per NAMED branch of confinePath (E66.63 /
@@ -891,15 +895,27 @@ func swapSpecOnce(t *testing.T, candidate string, swap func()) *bool {
 
 // TestPathConfinement_DiscoveredSpecReplacedAfterCheck is the TOCTOU half of
 // binding approval condition 1, raised as a high-tier fix-up concern: confining
-// the PATHNAME is not sufficient, because the open re-traverses it. In a
+// the PATHNAME is not sufficient, because any open re-traverses it. In a
 // supported writable checkout an agent can replace the validated leaf — or an
 // ancestor directory — with an out-of-root symlink between the check and the
 // open, and a pathname-only control would then hand the outside file's bytes to
 // validation diagnostics or to start_run's backend submission.
 //
-// Both rows start from a state the pre-open check ALLOWS (a real, in-root spec),
-// so the refusal cannot come from the stationary check already covered above:
-// it can only come from the post-open containment of the file actually opened.
+// Every row starts from a state the pre-open check ALLOWS (a real, in-root spec)
+// and replaces the path in the hook's window, so a refusal cannot come from the
+// stationary check already covered above: it can only come from the CONFINED
+// OPEN, which walks the path component-wise beneath a held root descriptor.
+//
+// The swap-restore-RESWAP sequence the medium fix-up concern traced (defeating a
+// post-open containment re-check and a post-open inode comparison, which are
+// judged on two DIFFERENT traversals) has no analogue to test here: with the
+// root handle there is exactly ONE traversal, so that whole class collapses into
+// the ancestor row below — whatever the attacker restores afterwards, the
+// descriptor was produced by a walk that could not leave the root.
+//
+// Two rows cover what the root handle deliberately does NOT decide — the file
+// TYPE (a directory and a FIFO, both INSIDE the root) — and the last row is the
+// self-paired ACCEPT that keeps the refusals non-vacuous.
 func TestPathConfinement_DiscoveredSpecReplacedAfterCheck(t *testing.T) {
 	// The escape target is a VALID spec, so a control that reads it would
 	// succeed rather than fail for an unrelated reason — the read would be
@@ -991,6 +1007,105 @@ func TestPathConfinement_DiscoveredSpecReplacedAfterCheck(t *testing.T) {
 			t.Fatal("the race window never opened — the test proves nothing")
 		}
 		assertRefused(t, got, err)
+	})
+
+	t.Run("leaf_replaced_with_directory_is_refused", func(t *testing.T) {
+		// The file-TYPE half of the confined read, and the one control the root
+		// handle does NOT provide: a leaf swapped to a DIRECTORY is inside the
+		// root, so the confined open succeeds — only the regular-file check
+		// refuses it. Deterministic, and it is what pins that check.
+		root, specPath := newRoot(t)
+		fired := swapSpecOnce(t, specPath, func() {
+			if err := os.Remove(specPath); err != nil {
+				t.Errorf("race swap: remove: %v", err)
+				return
+			}
+			if err := os.MkdirAll(specPath, 0o700); err != nil {
+				t.Errorf("race swap: mkdir over the spec path: %v", err)
+			}
+		})
+
+		r := &runResolver{httpTransport: true, allowedRoots: []string{root}}
+		got, err := r.discoverSpecConfined(root, "")
+		if !*fired {
+			t.Fatal("the race window never opened — the test proves nothing")
+		}
+		assertRefused(t, got, err)
+	})
+
+	t.Run("leaf_replaced_with_fifo_is_refused_without_wedging", func(t *testing.T) {
+		// A FIFO is also inside the root, so the confined open reaches it — and
+		// a BLOCKING open of a reader-side FIFO waits for a writer forever,
+		// which would wedge the HTTP request before the regular-file check could
+		// run. This row pins BOTH the refusal and the non-blocking open: without
+		// O_NONBLOCK the call below never returns and the deadline fires.
+		mkfifo, lerr := exec.LookPath("mkfifo")
+		if lerr != nil {
+			t.Skipf("mkfifo unavailable here (%v): this platform cannot stage the FIFO case", lerr)
+		}
+		root, specPath := newRoot(t)
+		fired := swapSpecOnce(t, specPath, func() {
+			if err := os.Remove(specPath); err != nil {
+				t.Errorf("race swap: remove: %v", err)
+				return
+			}
+			if out, err := exec.Command(mkfifo, specPath).CombinedOutput(); err != nil {
+				t.Errorf("race swap: mkfifo: %v (%s)", err, out)
+			}
+		})
+
+		r := &runResolver{httpTransport: true, allowedRoots: []string{root}}
+		type result struct {
+			spec *discoveredSpec
+			err  error
+		}
+		done := make(chan result, 1)
+		go func() {
+			spec, err := r.discoverSpecConfined(root, "")
+			done <- result{spec, err}
+		}()
+		// The two durations are one scaled factor apart per the wall-clock rule
+		// (backend/internal/timescale): the ratio, not the raw number, carries
+		// the discrimination between "returned" and "wedged".
+		select {
+		case res := <-done:
+			if !*fired {
+				t.Fatal("the race window never opened — the test proves nothing")
+			}
+			assertRefused(t, res.spec, res.err)
+		case <-time.After(timescale.D(10 * time.Second)):
+			t.Fatal("the confined open WEDGED on a FIFO leaf: it must be opened non-blocking so the regular-file check can refuse it")
+		}
+	})
+
+	t.Run("in_root_symlink_leaf_is_still_read", func(t *testing.T) {
+		// The accept the redesign could plausibly have broken: os.Root refuses
+		// an ABSOLUTE symlink target outright, so a spec path that is a symlink
+		// to another file INSIDE the same root is only readable because the
+		// candidate is symlink-resolved before the confined open. Without this
+		// row the refusals above would also be satisfied by a control that
+		// refused every symlinked spec, in-root ones included.
+		root, specPath := newRoot(t)
+		inRootTarget := filepath.Join(root, "real-workflows.yaml")
+		body := "# in-root symlink target\n" + minimalWorkflowSpecYAML(t)
+		if err := os.WriteFile(inRootTarget, []byte(body), 0o600); err != nil {
+			t.Fatalf("write in-root target: %v", err)
+		}
+		if err := os.Remove(specPath); err != nil {
+			t.Fatalf("remove real spec: %v", err)
+		}
+		if err := os.Symlink(inRootTarget, specPath); err != nil {
+			t.Skipf("symlink unsupported here: %v", err)
+		}
+
+		r := &runResolver{httpTransport: true, allowedRoots: []string{root}}
+		got, err := r.discoverSpecConfined(root, "")
+		if err != nil {
+			t.Fatalf("a spec symlinked to another file INSIDE the root must still be read; got %v", err)
+		}
+		if got == nil || string(got.Contents) != body {
+			t.Fatalf("expected the in-root symlink target's contents; got %+v", got)
+		}
 	})
 
 	t.Run("unraced_call_still_reads_the_in_root_spec", func(t *testing.T) {
