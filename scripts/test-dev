@@ -1746,16 +1746,20 @@ fi
 # family, defined in 14b above — which is why this section sits after it).
 # Sub-blocks: A pure tables · B _verify_k8s_image_identity · C _k8s_load_image ·
 # D cmd_k8s_up end to end · E body-grep wiring pins.
-# Two per-call rc knobs drive B14-B18, the resolver's fail-closed branches:
+# Save/content rc knobs drive the resolver's fail-closed branches:
 # STUB_CONTENT_FAIL_AT=<n> fails the n-th 'ctr content get' (content-get-count
-# ordinal, includes the current call); STUB_INSPECT_DIGEST_RC fails ONLY
-# 'docker image inspect <repo>@sha256:…' (the shared-provisioner digest hop),
-# leaving the local-ref inspect's STUB_INSPECT_RC untouched.
+# ordinal, includes the current call, B14-B17); STUB_SAVE_RC fails EVERY
+# 'docker save' (the local-ref BUILT-side resolve, B13/B21) while
+# STUB_SAVE_DIGEST_RC fails ONLY 'docker save <repo>@sha256:…' (the shared-
+# provisioner digest hop, B18), leaving the local-ref save untouched. The save
+# arm delivers the STUB_SAVE_TAR fixture tarball to the `-o <path>` target so
+# _k8s_local_config_digest reads a real manifest.json back (#3530).
 q_hex_l="$(printf '1%.0s' {1..64})"   # local image id (docker image inspect .Id)
 q_hex_r="$(printf '2%.0s' {1..64})"   # a DIFFERENT running image id
 q_hex_m="$(printf '3%.0s' {1..64})"   # a manifest (repo) digest
 q_hex_y="$(printf '4%.0s' {1..64})"   # a layer digest (must never be returned)
-q_hex_i="$(printf '5%.0s' {1..64})"   # an index-entry manifest digest
+q_hex_i="$(printf '5%.0s' {1..64})"   # an index-entry (real platform) manifest digest
+q_hex_a="$(printf '6%.0s' {1..64})"   # a buildx ATTESTATION manifest digest (must never be returned)
 
 # --- A. pure tables -----------------------------------------------------------
 for spec in \
@@ -1837,6 +1841,53 @@ if [[ "$(_k8s_config_digest_from_manifest "$(print -- "$q_index")")" == "index:s
 else
   fail "A3 setup: the index.json fixture must resolve to index:sha256:${q_hex_i} for B15/B17 to be meaningful"
 fi
+
+# A3-bis _k8s_config_digest_from_save_manifest (#3530): the BUILT-side resolver's
+# parser over a `docker save` manifest.json ARRAY. Both store shapes parse to the
+# same config digest; every ambiguous/unrecognised form prints NOTHING (the
+# caller then fails closed). Fields are name|doc|want (the docs carry no '|').
+for spec in \
+  "blobs-form|[{\"Config\":\"blobs/sha256/${q_hex_l}\",\"RepoTags\":[\"x\"],\"Layers\":[\"y\"]}]|sha256:${q_hex_l}" \
+  "legacy-json-form|[{\"Config\":\"${q_hex_l}.json\",\"Layers\":[\"y.json\"]}]|sha256:${q_hex_l}" \
+  "two-config|[{\"Config\":\"blobs/sha256/${q_hex_l}\"},{\"Config\":\"blobs/sha256/${q_hex_i}\"}]|" \
+  "zero-config|[{\"Layers\":[\"y\"]}]|" \
+  "non-64hex|[{\"Config\":\"blobs/sha256/deadbeef\"}]|" \
+  "empty||"; do
+  q_name="${spec%%|*}"; q_rest="${spec#*|}"; q_doc="${q_rest%|*}"; q_want="${q_rest##*|}"
+  q_got="$(_k8s_config_digest_from_save_manifest "$q_doc")"
+  if [[ "$q_got" == "$q_want" ]]; then
+    pass "A3-bis _k8s_config_digest_from_save_manifest (${q_name}) -> '${q_want}'"
+  else
+    fail "A3-bis _k8s_config_digest_from_save_manifest (${q_name}) should be '${q_want}' (got: '${q_got}')"
+  fi
+done
+
+# A3-ter _k8s_config_digest_from_manifest index walk skips buildx ATTESTATION
+# manifests (#3530). A stock buildx index carries the attestation entry
+# (annotated vnd.docker.reference.type / "architecture":"unknown") AND a real
+# platform entry, in an order that is not contractual — here the attestation
+# entry is FIRST. The walk must return the linux/arm64 entry's digest, never the
+# attestation entry's. This is the counterfactual vehicle for the skip.
+q_index_attest="{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.index.v1+json\",\"manifests\":[{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"digest\":\"sha256:${q_hex_a}\",\"size\":1,\"annotations\":{\"vnd.docker.reference.type\":\"attestation-manifest\"},\"platform\":{\"architecture\":\"unknown\",\"os\":\"unknown\"}},{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"digest\":\"sha256:${q_hex_i}\",\"size\":2,\"platform\":{\"architecture\":\"arm64\",\"os\":\"linux\"}}]}"
+if [[ "$(_k8s_config_digest_from_manifest "$q_index_attest")" == "index:sha256:${q_hex_i}" ]]; then
+  pass "A3-ter index walk skips the attestation-FIRST entry, returns the linux/arm64 manifest digest"
+else
+  fail "A3-ter index walk should return index:sha256:${q_hex_i} (the real platform entry), not the attestation entry sha256:${q_hex_a} (got: $(_k8s_config_digest_from_manifest "$q_index_attest"))"
+fi
+q_index_attest_only="{\"schemaVersion\":2,\"manifests\":[{\"mediaType\":\"m\",\"digest\":\"sha256:${q_hex_a}\",\"annotations\":{\"vnd.docker.reference.type\":\"attestation-manifest\"},\"platform\":{\"architecture\":\"unknown\",\"os\":\"unknown\"}}]}"
+if [[ -z "$(_k8s_config_digest_from_manifest "$q_index_attest_only")" ]]; then
+  pass "A3-ter index carrying ONLY an attestation entry -> nothing (caller fails closed)"
+else
+  fail "A3-ter attestation-only index should print nothing (got: $(_k8s_config_digest_from_manifest "$q_index_attest_only"))"
+fi
+
+# A3-quater _k8s_resolve_running_image_id emits the `config:`-tagged token for a
+# bare kubelet imageID (a bare id already IS a config digest, #3530 provenance).
+if [[ "$(_k8s_resolve_running_image_id "containerd://sha256:${q_hex_l}" shared)" == "config:sha256:${q_hex_l}" ]]; then
+  pass "A3-quater _k8s_resolve_running_image_id tags a bare imageID as config:sha256:<hex>"
+else
+  fail "A3-quater a bare imageID should resolve to config:sha256:${q_hex_l} (got: $(_k8s_resolve_running_image_id "containerd://sha256:${q_hex_l}" shared))"
+fi
 if ( FISHHAWK_K8S_SKIP_IDENTITY=1 _k8s_identity_skipped ); then
   pass "A4 _k8s_identity_skipped is true for FISHHAWK_K8S_SKIP_IDENTITY=1"
 else
@@ -1858,13 +1909,23 @@ cat > "${q_stub}/docker" <<'STUB'
 #!/usr/bin/env zsh
 print -r -- "docker $*" >> "$REC"
 case "$*" in
-  "image inspect "*"@sha256:"*)
-    # Digest-form inspect (the shared-provisioner repo-digest resolve, B10/B18)
-    # answers via STUB_INSPECT_DIGEST_RC, distinct from STUB_INSPECT_RC below,
-    # which the local-ref inspect (B1-B13) alone consults.
-    print -r -- "${STUB_LOCAL_ID:-}"; exit "${STUB_INSPECT_DIGEST_RC:-0}" ;;
-  "image inspect "*) print -r -- "${STUB_LOCAL_ID:-}"; exit "${STUB_INSPECT_RC:-0}" ;;
-  "save "*)          exit "${STUB_SAVE_RC:-0}" ;;
+  "save "*"@sha256:"*)
+    # Running-side shared repo-digest hop: _k8s_local_config_digest of
+    # <repo>@<digest> (B10/B18/B25). Fails ONLY on STUB_SAVE_DIGEST_RC, distinct
+    # from STUB_SAVE_RC below (the LOCAL-ref save), so B18 can fail the digest
+    # hop while the local save still succeeds. It ALWAYS delivers the fixture
+    # tarball to the `docker save … -o <path>` target ($4) — even when reporting
+    # failure — so the rc guard in _k8s_local_config_digest is the ONLY thing
+    # that catches the failure (a genuine counterfactual for that guard: delete
+    # it and the code reads a valid tarball instead of failing closed).
+    [[ -n "${STUB_SAVE_DIGEST_TAR:-${STUB_SAVE_TAR:-}}" ]] && cp "${STUB_SAVE_DIGEST_TAR:-$STUB_SAVE_TAR}" "$4" 2>/dev/null
+    exit "${STUB_SAVE_DIGEST_RC:-0}" ;;
+  "save "*)
+    # Local-ref save: the BUILT-side config-digest resolve (#3530). Delivers the
+    # STUB_SAVE_TAR fixture to the -o target ALWAYS (see the digest arm above),
+    # then reports STUB_SAVE_RC.
+    [[ -n "${STUB_SAVE_TAR:-}" ]] && cp "$STUB_SAVE_TAR" "$4" 2>/dev/null
+    exit "${STUB_SAVE_RC:-0}" ;;
   *)                 exit 0 ;;
 esac
 STUB
@@ -1906,6 +1967,33 @@ print -- "$q_index" > "${q_stub}/index.json"
 print -r -- "$q_manifest_noconfig" > "${q_stub}/noconfig.json"
 q_ref="ghcr.io/kuhlman-labs/fishhawkd:dev-local"
 
+# `docker save` tarball fixtures (#3530): a real tar carrying a top-level
+# manifest.json (docker-save shape), built once with `tar -cf` over a temp dir
+# so no real docker/image is needed. The docker stub's `save … -o <path>` arm
+# copies the STUB_SAVE_TAR fixture to <path>, and _k8s_local_config_digest reads
+# it back with `tar -xOf <path> manifest.json`.
+_q_mk_save_tar() {   # <dest-tar> <manifest.json-content>
+  local dest="$1" content="$2" d
+  d="$(mktemp -d)"
+  print -r -- "$content" > "${d}/manifest.json"
+  tar -cf "$dest" -C "$d" manifest.json
+  rm -rf "$d"
+}
+# Default fixture: config digest = q_hex_l (the BUILT image), containerd shape.
+q_save_l="${q_stub}/save-lconfig.tar"
+_q_mk_save_tar "$q_save_l" "[{\"Config\":\"blobs/sha256/${q_hex_l}\",\"RepoTags\":[\"${q_ref}\"],\"Layers\":[\"blobs/sha256/${q_hex_y}\"]}]"
+# A DIFFERENT config digest = q_hex_r (a genuine content mismatch, B20).
+q_save_r="${q_stub}/save-rconfig.tar"
+_q_mk_save_tar "$q_save_r" "[{\"Config\":\"blobs/sha256/${q_hex_r}\"}]"
+# Ambiguous multi-platform save: TWO Config entries (B22).
+q_save_2cfg="${q_stub}/save-2config.tar"
+_q_mk_save_tar "$q_save_2cfg" "[{\"Config\":\"blobs/sha256/${q_hex_l}\"},{\"Config\":\"blobs/sha256/${q_hex_i}\"}]"
+# A tarball with NO manifest.json member (B23): the `tar -xOf … manifest.json`
+# extract fails closed.
+q_save_nomani="${q_stub}/save-nomanifest.tar"
+q_nomani_dir="$(mktemp -d)"; print -r -- "not a manifest" > "${q_nomani_dir}/other.txt"
+tar -cf "$q_save_nomani" -C "$q_nomani_dir" other.txt; rm -rf "$q_nomani_dir"
+
 # --- B. _verify_k8s_image_identity ---------------------------------------------
 # Each case: seed the stubs by construction, run the gate, assert rc + the
 # BRANCH-SPECIFIC reason literal (and, for the fail-closed early returns, the
@@ -1919,9 +2007,30 @@ _q_run_identity() {   # <expected> <prov> -> sets q_out (stdout) q_err (stderr) 
   q_rc=$?
   q_err="$(cat "$errf")"
 }
-export STUB_LOCAL_ID="sha256:${q_hex_l}"
+# The BUILT-side (local) config digest now comes from `docker save` of $q_ref,
+# not `docker image inspect .Id` (#3530), so the default save fixture resolves
+# the local side to config:sha256:q_hex_l for every case whose local save
+# succeeds. K8S_LOCAL_CONFIG_DIGEST is kept empty so the gate does its own save
+# (these cases do not go through _k8s_load_image's cache).
+export STUB_SAVE_TAR="$q_save_l"
 export STUB_MANIFEST_1="${q_stub}/manifest.json" STUB_MANIFEST_2="${q_stub}/manifest.json"
-unset STUB_INSPECT_RC
+K8S_LOCAL_CONFIG_DIGEST=""; K8S_LOCAL_CONFIG_DIGEST_REF=""
+unset STUB_SAVE_RC STUB_SAVE_DIGEST_RC
+
+# B0 the K8S_LOCAL_CONFIG_DIGEST cache is KEYED BY REF (approval condition 2): a
+# HIT returns the cached digest ONLY when the requested ref matches; a call with
+# a DIFFERENT ref MISSES and re-saves (never returns the cached digest). Prime
+# the cache to config q_hex_r for refA, then confirm refA hits it and refB does
+# not (refB re-saves and gets the fixture's q_hex_l).
+K8S_LOCAL_CONFIG_DIGEST="sha256:${q_hex_r}"; K8S_LOCAL_CONFIG_DIGEST_REF="refA"
+q_c_hit="$(_k8s_local_config_digest refA)"
+q_c_miss="$(_k8s_local_config_digest refB)"
+K8S_LOCAL_CONFIG_DIGEST=""; K8S_LOCAL_CONFIG_DIGEST_REF=""
+if [[ "$q_c_hit" == "config:sha256:${q_hex_r}" && "$q_c_miss" == "config:sha256:${q_hex_l}" && "$q_c_miss" != *"${q_hex_r}"* ]]; then
+  pass "B0 config-digest cache is ref-keyed: refA hits the cache, refB misses and re-saves (never the cached digest)"
+else
+  fail "B0 a different ref must not return the cached digest (hit=${q_c_hit} miss=${q_c_miss})"
+fi
 
 # B1 both match -> 0.
 q_port="$(_find_free_port)"; q_url="http://localhost:${q_port}/healthz"
@@ -1973,15 +2082,20 @@ else
   fail "B5 unreachable /healthz should return 1 on the unreachable branch (rc=${q_rc} err=${q_err})"
 fi
 
-# B6 image id MISMATCH with a MATCHING git_sha -> 1 (the same-commit discriminator).
+# B6 config-digest MISMATCH with a MATCHING git_sha -> 1 (the same-commit
+# discriminator). The kubelet reports config q_hex_r, the built image resolves
+# to config q_hex_l; the SOFTENED detail (#3530) names both digests and states
+# identity could not be verified, and must NOT assert staleness as established
+# fact.
 q_port="$(_find_free_port)"; q_url="http://localhost:${q_port}/healthz"
 export STUB_POD_IMAGE_ID="docker://sha256:${q_hex_r}"
 _serve_healthz_once "$q_port" '{"status":"ok","git_sha":"abc1234"}'
 _q_run_identity abc1234 shared; _q_reap
-if (( q_rc == 1 )) && [[ "$q_err" == *"identity: image id mismatch"* && "$q_err" == *"sha256:${q_hex_l}"* && "$q_err" == *"sha256:${q_hex_r}"* && "$q_err" == *same-commit* ]]; then
-  pass "B6 image id mismatch with a matching git_sha -> 1 naming both ids + same-commit"
+if (( q_rc == 1 )) && [[ "$q_err" == *"identity: image id mismatch"* && "$q_err" == *"sha256:${q_hex_l}"* && "$q_err" == *"sha256:${q_hex_r}"* \
+    && "$q_err" == *"COULD NOT BE VERIFIED"* && "$q_err" == *"ONE hypothesis"* && "$q_err" != *"is serving a STALE"* ]]; then
+  pass "B6 config-digest mismatch with a matching git_sha -> 1 naming both digests, could-not-verify, no staleness-as-fact"
 else
-  fail "B6 image id mismatch should fail even when git_sha matches (rc=${q_rc} err=${q_err})"
+  fail "B6 config-digest mismatch should fail even when git_sha matches, softened detail (rc=${q_rc} err=${q_err})"
 fi
 
 # B7 kubectl reports an EMPTY imageID -> 1.
@@ -1993,15 +2107,16 @@ else
   fail "B7 an empty imageID should fail closed on the no-imageID branch only (rc=${q_rc} err=${q_err})"
 fi
 
-# B13 docker image inspect of the local image fails -> 1 on its own branch.
+# B13 `docker save` of the local image fails -> 1 on its own branch (#3530: the
+# local side is now resolved through docker save, not docker image inspect).
 export STUB_POD_IMAGE_ID="docker://sha256:${q_hex_l}"
-export STUB_INSPECT_RC=1 STUB_LOCAL_ID=""
+export STUB_SAVE_RC=1
 _q_run_identity abc1234 shared
-unset STUB_INSPECT_RC; export STUB_LOCAL_ID="sha256:${q_hex_l}"
+unset STUB_SAVE_RC
 if (( q_rc == 1 )) && [[ "$q_err" == *"identity: local image id unresolved"* && "$q_err" != *"identity: image id mismatch"* ]]; then
-  pass "B13 unreadable local image id -> 1 via its OWN branch (no fall-through to the mismatch)"
+  pass "B13 unresolvable local config digest (docker save fails) -> 1 via its OWN branch (no fall-through to the mismatch)"
 else
-  fail "B13 a failed docker image inspect should fail closed on the local-id branch only (rc=${q_rc} err=${q_err})"
+  fail "B13 a failed local docker save should fail closed on the local-id branch only (rc=${q_rc} err=${q_err})"
 fi
 
 # B8 isolated + repo digest resolved through the retained debug pod -> 0.
@@ -2026,16 +2141,20 @@ else
   fail "B9 a repo digest with no debug pod must fail closed (rc=${q_rc} err=${q_err})"
 fi
 
-# B10 shared + docker-pullable repo digest resolved via the host daemon -> 0.
+# B10 shared + docker-pullable repo digest resolved via the host daemon's
+# `docker save` of <repo>@<digest> -> 0 (#3530: the shared hop is now a config-
+# digest resolve, NOT `docker image inspect <repo>@<digest>`). The digest-form
+# save delivers the default fixture (config q_hex_l), matching the local side.
 q_port="$(_find_free_port)"; q_url="http://localhost:${q_port}/healthz"
 export STUB_POD_IMAGE_ID="docker-pullable://ghcr.io/kuhlman-labs/fishhawkd@sha256:${q_hex_m}"
 : > "$REC"
 _serve_healthz_once "$q_port" '{"status":"ok","git_sha":"abc1234"}'
 _q_run_identity abc1234 shared; _q_reap
-if (( q_rc == 0 )) && grep -q "^docker image inspect ghcr.io/kuhlman-labs/fishhawkd@sha256:${q_hex_m} " "$REC"; then
-  pass "B10 shared repo digest resolves via 'docker image inspect <repo>@<digest>' -> 0"
+if (( q_rc == 0 )) && grep -q "^docker save ghcr.io/kuhlman-labs/fishhawkd@sha256:${q_hex_m} -o " "$REC" \
+  && ! grep -q "^docker image inspect ghcr.io/kuhlman-labs/fishhawkd@sha256:${q_hex_m} " "$REC"; then
+  pass "B10 shared repo digest resolves via 'docker save <repo>@<digest>' (config digest), not 'docker image inspect' -> 0"
 else
-  fail "B10 shared repo digest should resolve through the host daemon (rc=${q_rc} err=${q_err} rec=$(cat "$REC"))"
+  fail "B10 shared repo digest should resolve through docker save of the digest (rc=${q_rc} err=${q_err} rec=$(cat "$REC"))"
 fi
 
 # B11 isolated + an OCI index needs exactly ONE extra hop -> 0, two content gets.
@@ -2135,12 +2254,12 @@ else
   fail "B17 nested index should fail closed at 2 content gets (rc=${q_rc} gets=${q_gets} err=${q_err})"
 fi
 
-# B18 shared: 'docker image inspect <repo>@<digest>' fails -> 1 via its own
-# branch, distinct from B13 (the LOCAL-REF inspect failure). REC must show
-# BOTH inspect calls — the local ref succeeding, then the digest-form call
-# this case fails — proving STUB_INSPECT_DIGEST_RC targets only the latter.
+# B18 shared: the digest-form `docker save <repo>@<digest>` fails -> 1 via the
+# running-unresolved branch, distinct from B13 (the LOCAL-REF save failure). REC
+# must show BOTH saves — the local ref succeeding, then the digest-form call
+# this case fails — proving STUB_SAVE_DIGEST_RC targets only the latter (#3530).
 export STUB_POD_IMAGE_ID="docker-pullable://ghcr.io/kuhlman-labs/fishhawkd@sha256:${q_hex_m}"
-export STUB_INSPECT_DIGEST_RC=1
+export STUB_SAVE_DIGEST_RC=1
 : > "$REC"
 _q_run_identity abc1234 shared
 if (( q_rc == 1 )) \
@@ -2148,18 +2267,19 @@ if (( q_rc == 1 )) \
      && "$q_err" == *"identity: running image id unresolved"* \
      && "$q_err" != *"identity: local image id unresolved"* \
      && "$q_err" != *"identity: image id mismatch"* ]] \
-  && grep -q "^docker image inspect ghcr.io/kuhlman-labs/fishhawkd:dev-local " "$REC" \
-  && grep -q "^docker image inspect ghcr.io/kuhlman-labs/fishhawkd@sha256:${q_hex_m} " "$REC"; then
-  pass "B18 shared: 'docker image inspect <repo>@<digest>' failure -> 1 via its own branch"
+  && grep -q "^docker save ghcr.io/kuhlman-labs/fishhawkd:dev-local -o " "$REC" \
+  && grep -q "^docker save ghcr.io/kuhlman-labs/fishhawkd@sha256:${q_hex_m} -o " "$REC"; then
+  pass "B18 shared: digest-form 'docker save <repo>@<digest>' failure -> 1 via its own branch (local save still succeeds)"
 else
-  fail "B18 digest-form docker image inspect failure should fail closed (rc=${q_rc} err=${q_err} rec=$(cat "$REC"))"
+  fail "B18 digest-form docker save failure should fail closed (rc=${q_rc} err=${q_err} rec=$(cat "$REC"))"
 fi
-unset STUB_INSPECT_DIGEST_RC
+unset STUB_SAVE_DIGEST_RC
 
 # Restore every knob B14-B18 touched so B12 and block C see the pre-existing
 # fixture state (approval-plan step 5).
-unset STUB_CONTENT_FAIL_AT STUB_INSPECT_DIGEST_RC
+unset STUB_CONTENT_FAIL_AT STUB_SAVE_DIGEST_RC STUB_SAVE_RC
 export STUB_MANIFEST_1="${q_stub}/manifest.json" STUB_MANIFEST_2="${q_stub}/manifest.json"
+export STUB_SAVE_TAR="$q_save_l"
 K8S_DEBUG_PODS=()
 
 # B12 unrecognised imageID -> 1.
@@ -2171,6 +2291,110 @@ else
   fail "B12 an unrecognised imageID should fail closed (rc=${q_rc} err=${q_err})"
 fi
 unset STUB_POD_IMAGE_ID
+export STUB_SAVE_TAR="$q_save_l"; K8S_DEBUG_PODS=()
+
+# --- B19-B24: the #3530 config-vs-index fix and its new fail-closed branches ---
+# B19 THE REGRESSION CASE (DONE-MEANS). The built image is a multi-platform index
+# whose `docker image inspect .Id` would be the INDEX digest (q_hex_i), while the
+# kubelet reports the BARE CONFIG digest (q_hex_l). Because the gate now resolves
+# the built side through `docker save` -> manifest.json Config (config q_hex_l),
+# the two config digests MATCH and the gate returns 0. On today's code (which
+# compared `.Id` = index digest against the config digest) this FAILS — that is
+# the #3530 false alarm this PR removes.
+q_port="$(_find_free_port)"; q_url="http://localhost:${q_port}/healthz"
+export STUB_POD_IMAGE_ID="containerd://sha256:${q_hex_l}"
+export STUB_SAVE_TAR="$q_save_l"
+: > "$REC"
+_serve_healthz_once "$q_port" '{"status":"ok","git_sha":"abc1234"}'
+_q_run_identity abc1234 shared; _q_reap
+if (( q_rc == 0 )) && [[ "$q_out" == *"image identity verified"* && "$q_out" == *"sha256:${q_hex_l}"* ]]; then
+  pass "B19 #3530 regression: built side resolved via docker save (config), kubelet reports the config digest -> verified"
+else
+  fail "B19 the #3530 config-digest match should verify (rc=${q_rc} out=${q_out} err=${q_err})"
+fi
+
+# B20 a GENUINE content mismatch: the save manifest's config digest (q_hex_r)
+# differs from the kubelet config digest (q_hex_l) -> 1 on 'identity: image id
+# mismatch', softened detail (could-not-verify, staleness only ONE hypothesis).
+q_port="$(_find_free_port)"; q_url="http://localhost:${q_port}/healthz"
+export STUB_POD_IMAGE_ID="containerd://sha256:${q_hex_l}"
+export STUB_SAVE_TAR="$q_save_r"
+: > "$REC"
+_serve_healthz_once "$q_port" '{"status":"ok","git_sha":"abc1234"}'
+_q_run_identity abc1234 shared; _q_reap
+if (( q_rc == 1 )) && [[ "$q_err" == *"identity: image id mismatch"* && "$q_err" == *"sha256:${q_hex_r}"* && "$q_err" == *"sha256:${q_hex_l}"* \
+    && "$q_err" == *"COULD NOT BE VERIFIED"* && "$q_err" != *"is serving a STALE"* ]]; then
+  pass "B20 genuine config-digest mismatch -> 1, softened detail (could-not-verify, no staleness-as-fact)"
+else
+  fail "B20 a genuine config-digest mismatch should fail closed with softened detail (rc=${q_rc} err=${q_err})"
+fi
+export STUB_SAVE_TAR="$q_save_l"
+
+# B21 `docker save` of the local image fails -> 1 on 'identity: local image id
+# unresolved', NOT a fall-through to the mismatch. The save stub delivers a
+# VALID but DIFFERENT-config fixture (q_hex_r) even while reporting failure, so
+# the rc guard is the ONLY thing standing between this and a spurious 'image id
+# mismatch' — deleting the guard makes the code read q_hex_r and report a
+# mismatch, reddening this case (the counterfactual vehicle for the save rc
+# guard).
+export STUB_POD_IMAGE_ID="containerd://sha256:${q_hex_l}"
+export STUB_SAVE_TAR="$q_save_r" STUB_SAVE_RC=1
+: > "$REC"
+_q_run_identity abc1234 shared
+unset STUB_SAVE_RC; export STUB_SAVE_TAR="$q_save_l"
+if (( q_rc == 1 )) && [[ "$q_err" == *"identity: local image id unresolved"* && "$q_err" != *"identity: image id mismatch"* && "$q_err" != *"identity: digest kind mismatch"* ]]; then
+  pass "B21 local 'docker save' failure -> 1 via the local-id branch (no fall-through to a spurious mismatch)"
+else
+  fail "B21 a failed local docker save should fail closed on the local-id branch (rc=${q_rc} err=${q_err})"
+fi
+
+# B22 an AMBIGUOUS save manifest carrying TWO Config entries (multi-platform)
+# -> 1 on 'identity: local image id unresolved' (the parser refuses to guess).
+export STUB_POD_IMAGE_ID="containerd://sha256:${q_hex_l}"
+export STUB_SAVE_TAR="$q_save_2cfg"
+: > "$REC"
+_q_run_identity abc1234 shared
+if (( q_rc == 1 )) && [[ "$q_err" == *"identity: local image id unresolved"* && "$q_err" != *"identity: image id mismatch"* ]]; then
+  pass "B22 ambiguous two-Config save manifest -> 1 via the local-id branch"
+else
+  fail "B22 a two-Config save manifest should fail closed on the local-id branch (rc=${q_rc} err=${q_err})"
+fi
+export STUB_SAVE_TAR="$q_save_l"
+
+# B23 a save tarball with NO manifest.json member -> 1 on 'identity: local image
+# id unresolved' (the `tar -xOf … manifest.json` extract fails closed).
+export STUB_POD_IMAGE_ID="containerd://sha256:${q_hex_l}"
+export STUB_SAVE_TAR="$q_save_nomani"
+: > "$REC"
+_q_run_identity abc1234 shared
+if (( q_rc == 1 )) && [[ "$q_err" == *"identity: local image id unresolved"* && "$q_err" != *"identity: image id mismatch"* ]]; then
+  pass "B23 save tarball with no manifest.json -> 1 via the local-id branch"
+else
+  fail "B23 a manifest-less save tarball should fail closed on the local-id branch (rc=${q_rc} err=${q_err})"
+fi
+export STUB_SAVE_TAR="$q_save_l"
+
+# B24 a resolved-token KIND disagreement -> 1 on 'identity: digest kind mismatch'
+# and NOT 'identity: image id mismatch'. Forge it by construction: shadow
+# _k8s_resolve_running_image_id so the running side returns an 'index:'-tagged
+# token with the SAME hex as the built config digest — with the kind-mismatch
+# branch present this is refused BEFORE the bare-digest compare; delete that
+# branch and the bare compare passes (rc 0), so B24 reddens.
+export STUB_POD_IMAGE_ID="containerd://sha256:${q_hex_l}"
+export STUB_SAVE_TAR="$q_save_l"
+functions -c _k8s_resolve_running_image_id _q_saved_resolve
+_k8s_resolve_running_image_id() { print -r -- "index:sha256:${q_hex_l}"; return 0; }
+: > "$REC"
+_q_run_identity abc1234 shared
+functions -c _q_saved_resolve _k8s_resolve_running_image_id
+unfunction _q_saved_resolve
+if (( q_rc == 1 )) && [[ "$q_err" == *"identity: digest kind mismatch"* && "$q_err" != *"identity: image id mismatch"* ]]; then
+  pass "B24 cross-kind resolved tokens -> 1 on the digest-kind-mismatch branch (not the image-id mismatch)"
+else
+  fail "B24 a config-vs-index kind disagreement should refuse via its own branch (rc=${q_rc} err=${q_err})"
+fi
+unset STUB_POD_IMAGE_ID
+export STUB_SAVE_TAR="$q_save_l"; K8S_DEBUG_PODS=()
 
 # --- C. _k8s_load_image ---------------------------------------------------------
 # TMPDIR is pinned to a fresh dir per case so the "tarball removed" assertion is
@@ -2310,7 +2534,7 @@ else
 fi
 
 PATH="$q_orig_path"
-unset STUB_LOCAL_ID STUB_MANIFEST_1 STUB_MANIFEST_2 STUB_NODES REC
+unset STUB_SAVE_TAR STUB_SAVE_RC STUB_SAVE_DIGEST_RC STUB_MANIFEST_1 STUB_MANIFEST_2 STUB_NODES REC
 rm -rf "$q_stub"
 
 # --- E. body-grep wiring pins ---------------------------------------------------
@@ -2356,6 +2580,25 @@ if print -r -- "$q_ident" | grep -q 'return 2'; then
 else
   pass "E _verify_k8s_image_identity has no rc=2 warn-and-continue path"
 fi
+# E the gate resolves the BUILT side through _k8s_local_config_digest (#3530),
+# never a raw `docker image inspect … --format '{{.Id}}'` (which is the OCI
+# index digest on a containerd store — the false-alarm this PR fixes).
+if print -r -- "$q_ident" | grep -q '_k8s_local_config_digest "\$ref"' \
+  && ! print -r -- "$q_ident" | grep -q "docker image inspect"; then
+  pass "E _verify_k8s_image_identity resolves the built side via _k8s_local_config_digest, not 'docker image inspect .Id'"
+else
+  fail "E _verify_k8s_image_identity should call _k8s_local_config_digest and carry no 'docker image inspect' (ident=${q_ident})"
+fi
+# E the shared-provisioner hop also resolves through _k8s_local_config_digest,
+# never 'docker image inspect <repo>@<digest>' (#3530, same defect one hop over).
+q_resolve="$(typeset -f _k8s_resolve_running_image_id)"
+if print -r -- "$q_resolve" | grep -q '_k8s_local_config_digest "\${repo}@\${digest}"' \
+  && ! print -r -- "$q_resolve" | grep -q "docker image inspect"; then
+  pass "E _k8s_resolve_running_image_id's shared hop resolves via _k8s_local_config_digest, not 'docker image inspect <repo>@<digest>'"
+else
+  fail "E _k8s_resolve_running_image_id shared hop should use _k8s_local_config_digest (resolve=${q_resolve})"
+fi
+unset q_resolve
 # E identity-failure teardown leg (#3445, approval condition 1): extract ONLY
 # the lines from the 'if ! _verify_k8s_image_identity' line to ITS OWN closing
 # 'fi' (an awk range, not a fixed -A4 that could bleed past this block into
@@ -2371,7 +2614,7 @@ if [[ -n "$q_ident_leg" ]] \
 else
   fail "E the extracted identity-failure leg should kill+rm+exit and never bleed into the listener leg (leg=${q_ident_leg})"
 fi
-unset q_hex_l q_hex_r q_hex_m q_hex_y q_hex_i q_manifest_a q_manifest_b q_manifest_noconfig q_index q_ref q_url q_port q_rc q_out q_err q_ident_leg
+unset q_hex_l q_hex_r q_hex_m q_hex_y q_hex_i q_hex_a q_manifest_a q_manifest_b q_manifest_noconfig q_index q_index_attest q_index_attest_only q_save_l q_save_r q_save_2cfg q_save_nomani q_ref q_url q_port q_rc q_out q_err q_ident_leg
 
 # 15. Acceptance preview (E31.18 / #1569) — pure DB derivation. The preview
 # database name must be the base name with an `_preview` suffix and can NEVER
