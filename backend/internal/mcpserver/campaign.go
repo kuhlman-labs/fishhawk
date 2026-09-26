@@ -47,7 +47,7 @@ type StartCampaignInput struct {
 	GroomingAllowSuperseded bool `json:"grooming_allow_superseded,omitempty" jsonschema:"OPTIONAL with grooming_run_id: build from this order even though a NEWER approved grooming run — one the backend POSITIVELY IDENTIFIED and names in the refusal — has superseded it. Default false REFUSES that case; prefer grooming the newer run. Set true only when you deliberately want the older ratified order; the choice is recorded in the campaign's durable provenance. It applies to a NAMED superseding run and to NOTHING ELSE: a supersession check that could not prove the order is current (grooming_order_supersession_undetermined) or could not be run at all (grooming_order_supersession_unreadable) is refused whatever this flag says, because an incomplete check names no run to acknowledge"`
 	// WorkingDir is the OPTIONAL campaign-level checkout binding (E48.87 /
 	// #2527): bound ONCE here, inherited by every item run.
-	WorkingDir string `json:"working_dir,omitempty" jsonschema:"absolute path to the checkout this campaign's item runs execute in. Bound ONCE on the campaign so EVERY item run inherits it — pass it here instead of repeating an identical path on every fishhawk_start_campaign_item_run call. YOU, the calling agent, resolve your own checkout (you are running inside one) rather than asking the operator for a path. A non-absolute value is refused. Omit it only if the campaign's item runs are github_actions, or if you intend to pass working_dir per item: a LOCAL item run whose campaign carries no binding and that passes none is refused working_dir_required"`
+	WorkingDir string `json:"working_dir,omitempty" jsonschema:"absolute path to the checkout this campaign's item runs execute in. Bound ONCE on the campaign so EVERY item run inherits it — pass it here instead of repeating an identical path on every fishhawk_start_campaign_item_run call. YOU, the calling agent, resolve your own checkout (you are running inside one) rather than asking the operator for a path. A non-absolute value is refused. Omit it only if the campaign's item runs are github_actions, or if you intend to pass working_dir per item: a LOCAL item run whose campaign carries no binding and that passes none is refused working_dir_required. Over the HTTP MCP transport the path must resolve inside an operator-configured allowed checkout root (fishhawkd --mcp-allowed-roots / FISHHAWKD_MCP_ALLOWED_ROOTS, fishhawk-mcp --allowed-roots / FISHHAWK_MCP_ALLOWED_ROOTS); a path outside every root — or any path at all when no root is configured — is refused path_outside_allowed_roots."`
 
 	// Provider is the OPTIONAL work-item provider selector (#3645): a
 	// forge-neutral override of the repo's conventions-resolved work-item
@@ -380,6 +380,12 @@ func (r *runResolver) startCampaign(ctx context.Context, _ *mcp.CallToolRequest,
 			return nil, StartCampaignOutput{}, fmt.Errorf(
 				"working_dir %q must be an absolute path: a relative path resolves against the fishhawkd host's cwd, not your project; resolve your own checkout and pass its absolute path — it binds the campaign and every item run inherits it", workingDir)
 		}
+		// Confinement (E66.63 / #3589), still before any dial: a campaign
+		// binding is INHERITED by every item run in the batch, so an
+		// out-of-root binding accepted here would poison all of them.
+		if err := r.confinePath("working_dir", workingDir); err != nil {
+			return nil, StartCampaignOutput{}, err
+		}
 		workingDir = filepath.Clean(workingDir)
 	}
 
@@ -628,7 +634,7 @@ type StartCampaignItemRunInput struct {
 	RunnerKind  string `json:"runner_kind,omitempty" jsonschema:"OPTIONAL execution backend: 'github_actions' (default) or 'local'. Pass 'local' for the local dogfood loop so the run executes through the local runner"`
 	// WorkingDir binds the minted run's local checkout (E48.69 / #2498) and is
 	// an OVERRIDE of the campaign's own binding (E48.87 / #2527).
-	WorkingDir string `json:"working_dir,omitempty" jsonschema:"OPTIONAL absolute path to the checkout this campaign item's run executes in, OVERRIDING the campaign's own working_dir binding. Needed only when the campaign carries NO binding (bind it once at fishhawk_start_campaign instead of repeating it here): omit it and the item run inherits the campaign's. A local item run whose campaign has no binding and that passes none is refused working_dir_required. A value that differs from the campaign binding is accepted as a deliberate override — use it when this one item genuinely executes in a different checkout. A non-absolute value is refused for any runner_kind"`
+	WorkingDir string `json:"working_dir,omitempty" jsonschema:"OPTIONAL absolute path to the checkout this campaign item's run executes in, OVERRIDING the campaign's own working_dir binding. Needed only when the campaign carries NO binding (bind it once at fishhawk_start_campaign instead of repeating it here): omit it and the item run inherits the campaign's. A local item run whose campaign has no binding and that passes none is refused working_dir_required. A value that differs from the campaign binding is accepted as a deliberate override — use it when this one item genuinely executes in a different checkout. A non-absolute value is refused for any runner_kind. Over the HTTP MCP transport the path must resolve inside an operator-configured allowed checkout root (fishhawkd --mcp-allowed-roots / FISHHAWKD_MCP_ALLOWED_ROOTS, fishhawk-mcp --allowed-roots / FISHHAWK_MCP_ALLOWED_ROOTS); a path outside every root — or any path at all when no root is configured — is refused path_outside_allowed_roots."`
 }
 
 // StartCampaignItemRunOutput carries the minted run plus the linked campaign
@@ -729,6 +735,12 @@ func (r *runResolver) startCampaignItemRun(ctx context.Context, req *mcp.CallToo
 			"working_dir %q must be an absolute path: a relative path resolves against the fishhawkd host's cwd, not your project, so it is refused for any runner_kind; resolve your own checkout and pass its absolute path — it binds the minted run and every later stage inherits it", workingDir)
 	}
 	if workingDir != "" {
+		// Confinement (E66.63 / #3589), before the dial that mints the run:
+		// this value becomes the minted run's persisted binding, which every
+		// later runner-spawning verb inherits.
+		if err := r.confinePath("working_dir", workingDir); err != nil {
+			return nil, StartCampaignItemRunOutput{}, err
+		}
 		workingDir = filepath.Clean(workingDir)
 	}
 

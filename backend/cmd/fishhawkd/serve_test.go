@@ -3932,7 +3932,7 @@ func TestServe_ConstructsDefaultCIMDFetcherWhenIssuerConfigured(t *testing.T) {
 // mcpserver-level behaviour could be perfect while the route shipped the
 // permissive zero value.
 func TestMcpRouteServerConfig(t *testing.T) {
-	cfg := mcpRouteServerConfig("http://127.0.0.1:8080", "fhk_x")
+	cfg := mcpRouteServerConfig("http://127.0.0.1:8080", "fhk_x", "")
 	if !cfg.HTTPTransport {
 		t.Error("HTTPTransport = false, want true (the /mcp route serves over HTTP on the daemon)")
 	}
@@ -3941,6 +3941,64 @@ func TestMcpRouteServerConfig(t *testing.T) {
 	}
 	if cfg.APIToken != "fhk_x" {
 		t.Errorf("APIToken = %q, want fhk_x", cfg.APIToken)
+	}
+	// The FAIL-CLOSED posture (E66.63 / #3589): an empty raw list yields ZERO
+	// roots, which refuses every path-taking verb — not an unrestricted route.
+	if len(cfg.AllowedRoots) != 0 {
+		t.Errorf("AllowedRoots = %v, want empty for an empty raw list (fail closed)", cfg.AllowedRoots)
+	}
+}
+
+// TestMCPRouteServerConfig_CarriesAllowedRoots is the DONE-MEANS wiring test for
+// the E66.63 / #3589 allow-list on the /mcp route, whose correctness no compiler
+// enforces: it asserts the SHIPPED mcpserver.Config value, so a comment-only
+// touch of mcpRouteServerConfig fails it. It pins the split on the OS path-list
+// separator, blank-entry dropping (a trailing or doubled separator must not
+// become an empty root, which would admit everything), and the empty-string case
+// yielding zero roots — the fail-closed posture.
+func TestMCPRouteServerConfig_CarriesAllowedRoots(t *testing.T) {
+	sep := string(os.PathListSeparator)
+	ps := string(filepath.Separator)
+	a := filepath.Join(ps+"repos", "one")
+	b := filepath.Join(ps+"repos", "two")
+
+	cfg := mcpRouteServerConfig("u", "t", a+sep+sep+b+sep)
+	want := []string{a, b}
+	if len(cfg.AllowedRoots) != len(want) {
+		t.Fatalf("AllowedRoots = %v, want %v (split on %q, blanks dropped)", cfg.AllowedRoots, want, sep)
+	}
+	for i := range want {
+		if cfg.AllowedRoots[i] != want[i] {
+			t.Errorf("AllowedRoots[%d] = %q, want %q", i, cfg.AllowedRoots[i], want[i])
+		}
+	}
+	// Whitespace-only entries are blanks too.
+	if got := mcpRouteServerConfig("u", "t", "   "+sep+"  ").AllowedRoots; len(got) != 0 {
+		t.Errorf("AllowedRoots = %v, want empty for a whitespace-only list", got)
+	}
+	// HTTPTransport stays true regardless — the route always serves over HTTP.
+	if !cfg.HTTPTransport {
+		t.Error("HTTPTransport = false, want true")
+	}
+}
+
+// TestRunServe_MCPAllowedRootsFlagDefaultsToEnv pins the flag/env ladder on the
+// daemon: --mcp-allowed-roots defaults to FISHHAWKD_MCP_ALLOWED_ROOTS, so an
+// operator can configure it either way, and the UNSET default is the empty
+// (fail-closed) list.
+func TestRunServe_MCPAllowedRootsFlagDefaultsToEnv(t *testing.T) {
+	t.Setenv("FISHHAWKD_MCP_ALLOWED_ROOTS", "/env/root")
+	if got := envOr("FISHHAWKD_MCP_ALLOWED_ROOTS", ""); got != "/env/root" {
+		t.Fatalf("envOr read %q, want /env/root — the flag default reads this same value", got)
+	}
+	t.Setenv("FISHHAWKD_MCP_ALLOWED_ROOTS", "")
+	if got := envOr("FISHHAWKD_MCP_ALLOWED_ROOTS", ""); got != "" {
+		t.Errorf("unset env should yield the empty fail-closed default, got %q", got)
+	}
+	// The flag itself must exist on the serve flag set with that default. A
+	// missing flag makes runServe exit non-zero on the unknown-flag path.
+	if code := runServe([]string{"--mcp-allowed-roots", "/repos", "--nonexistent-flag"}, io.Discard); code == 0 {
+		t.Error("expected a non-zero exit for an unknown flag (the known flag must parse first)")
 	}
 }
 

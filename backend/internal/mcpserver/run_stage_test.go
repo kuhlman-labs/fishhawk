@@ -3178,6 +3178,10 @@ func TestRunStage_ExplicitWorkingDirEchoedAndUnchanged(t *testing.T) {
 	calls := captureAllArgv(t)
 
 	dir := t.TempDir()
+	// E66.63 / #3589: the fixture's own temp root is the allowed checkout root,
+	// so this ACCEPT case keeps pinning what it was written to pin instead of
+	// tripping on the confinement fail-closed default.
+	r.allowedRoots = []string{dir}
 	runID := uuid.New()
 	stageID := uuid.New()
 	seedStageOfType(fb, runID, stageID, "implement", "pending")
@@ -3210,6 +3214,10 @@ func TestRunStage_InheritsBoundWorkingDir(t *testing.T) {
 	calls := captureAllArgv(t)
 
 	bound := t.TempDir()
+	// E66.63 / #3589: the fixture's own temp root is the allowed checkout root,
+	// so this ACCEPT case keeps pinning what it was written to pin instead of
+	// tripping on the confinement fail-closed default.
+	r.allowedRoots = []string{bound}
 	runID := uuid.New()
 	stageID := uuid.New()
 	seedRunWorkingDir(fb, runID, bound)

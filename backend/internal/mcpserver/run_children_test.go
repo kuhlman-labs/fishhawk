@@ -740,6 +740,10 @@ func TestRunChildren_ExplicitWorkingDirEchoedAndUnchanged(t *testing.T) {
 	r.httpTransport = true
 
 	dir := t.TempDir()
+	// E66.63 / #3589: the fixture's own temp root is the allowed checkout root,
+	// so this ACCEPT case keeps pinning what it was written to pin instead of
+	// tripping on the confinement fail-closed default.
+	r.allowedRoots = []string{dir}
 	parent := uuid.New()
 	child0 := uuid.New()
 	seedChildRun(fb, child0, "pending")
@@ -777,6 +781,10 @@ func TestRunChildren_InheritsBoundWorkingDir(t *testing.T) {
 	r.httpTransport = true
 
 	bound := t.TempDir()
+	// E66.63 / #3589: the fixture's own temp root is the allowed checkout root,
+	// so this ACCEPT case keeps pinning what it was written to pin instead of
+	// tripping on the confinement fail-closed default.
+	r.allowedRoots = []string{bound}
 	parent := uuid.New()
 	child0 := uuid.New()
 	seedRunWorkingDir(fb, parent, bound)

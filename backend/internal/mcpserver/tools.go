@@ -36,6 +36,14 @@ type runResolver struct {
 	// config.httpTransport in NewServer; false for the stdio transport.
 	httpTransport bool
 
+	// allowedRoots is the operator-configured allow-list of checkout roots
+	// every path-taking input must resolve inside over the HTTP transport
+	// (E66.63 / #3589). Threaded from config.allowedRoots in NewServer. Inert
+	// on stdio (confinePath returns nil when httpTransport is false); EMPTY
+	// over HTTP is the FAIL-CLOSED posture — every path-taking verb is refused
+	// path_outside_allowed_roots until a root is configured.
+	allowedRoots []string
+
 	// getwd is the injectable cwd seam resolveWorkingDir uses on the stdio
 	// transport to resolve an omitted working_dir to an absolute path. Nil
 	// falls back to os.Getwd; tests inject a failing stub to exercise the
@@ -123,6 +131,17 @@ func (r *runResolver) resolveWorkingDir(in string) (string, error) {
 		}
 		// An accepted absolute path falls through to filepath.Abs below (idempotent
 		// on an already-absolute path), so HTTP and stdio share one exit.
+		//
+		// Confinement (E66.63 / #3589) is a SEPARATE, independently-deletable
+		// check from the two #2479 refusals above, so each keeps its own
+		// counterfactual: an absolute path that is not inside an allowed
+		// checkout root is refused here, before any caller commits state.
+		// Because resolveWorkingDirForRun feeds an INHERITED binding back
+		// through this same function, the E66.42 inheritance path is confined
+		// identically to an explicit value.
+		if err := r.confinePath("working_dir", in); err != nil {
+			return "", err
+		}
 	}
 	if in == "" {
 		getwd := r.getwd
@@ -2972,12 +2991,12 @@ type StartRunInput struct {
 	// checkout) rather than a field description. The MCP server also walks up
 	// from this directory to `.fishhawk/workflows.yaml` to auto-discover the
 	// spec; that discovery only runs when this is set.
-	WorkingDir string `json:"working_dir,omitempty" jsonschema:"absolute path to the checkout this run executes in. REQUIRED over the HTTP transport when runner_kind is local. It is bound to the run here and the later runner-spawning verbs (run_stage, dispatch_stage, run_children, drive_run) INHERIT it, so you pass it once. YOU — the calling agent — resolve your own checkout (you are running inside one); do NOT ask the operator for a path. Also the directory the server searches for .fishhawk/workflows.yaml"`
+	WorkingDir string `json:"working_dir,omitempty" jsonschema:"absolute path to the checkout this run executes in. REQUIRED over the HTTP transport when runner_kind is local. It is bound to the run here and the later runner-spawning verbs (run_stage, dispatch_stage, run_children, drive_run) INHERIT it, so you pass it once. YOU — the calling agent — resolve your own checkout (you are running inside one); do NOT ask the operator for a path. Also the directory the server searches for .fishhawk/workflows.yaml. Over the HTTP MCP transport the path must resolve inside an operator-configured allowed checkout root (fishhawkd --mcp-allowed-roots / FISHHAWKD_MCP_ALLOWED_ROOTS, fishhawk-mcp --allowed-roots / FISHHAWK_MCP_ALLOWED_ROOTS); a path outside every root — or any path at all when no root is configured — is refused path_outside_allowed_roots."`
 
 	// SpecFile overrides the walk-up auto-discovery with an
 	// explicit path. Used when the spec lives outside the
 	// canonical location (rare; mostly for test scenarios).
-	SpecFile string `json:"spec_file,omitempty" jsonschema:"explicit workflow spec path; overrides working_dir auto-discovery"`
+	SpecFile string `json:"spec_file,omitempty" jsonschema:"explicit workflow spec path; overrides working_dir auto-discovery. Over the HTTP MCP transport the path must resolve inside an operator-configured allowed checkout root (fishhawkd --mcp-allowed-roots / FISHHAWKD_MCP_ALLOWED_ROOTS, fishhawk-mcp --allowed-roots / FISHHAWK_MCP_ALLOWED_ROOTS); a path outside every root — or any path at all when no root is configured — is refused path_outside_allowed_roots."`
 
 	// IssueContext is the cached GitHub issue payload (#415).
 	// Only valid with trigger_source=github_issue (or auto-flip
@@ -3248,6 +3267,17 @@ func (r *runResolver) startRun(ctx context.Context, req *mcp.CallToolRequest, in
 			return nil, StartRunOutput{}, fmt.Errorf(
 				"working_dir %q must be an absolute path over the HTTP MCP transport: a relative path resolves against the fishhawkd host's cwd, not your project, so it is refused for any runner_kind; resolve your own checkout and pass its absolute path — it binds the run and every later stage inherits it", in.WorkingDir)
 		}
+		// Confinement (E66.63 / #3589), still inside step (1a) and therefore
+		// still BEFORE any spec discovery or backend round-trip: both
+		// path-taking inputs must resolve inside an allowed checkout root, or
+		// the call is refused having read nothing and dialed nothing. Inline
+		// workflow_spec reads no filesystem and is deliberately NOT confined.
+		if err := r.confinePath("working_dir", in.WorkingDir); err != nil {
+			return nil, StartRunOutput{}, err
+		}
+		if err := r.confinePath("spec_file", in.SpecFile); err != nil {
+			return nil, StartRunOutput{}, err
+		}
 	}
 
 	// (1b) Validate the explicit forge selector client-side (E45.46 /
@@ -3283,7 +3313,7 @@ func (r *runResolver) startRun(ctx context.Context, req *mcp.CallToolRequest, in
 		if startDir == "" {
 			startDir = "."
 		}
-		found, derr := discoverSpec(startDir, in.SpecFile)
+		found, derr := r.discoverSpecConfined(startDir, in.SpecFile)
 		if derr != nil {
 			return nil, StartRunOutput{}, fmt.Errorf("spec discovery: %w", derr)
 		}

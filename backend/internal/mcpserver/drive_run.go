@@ -247,7 +247,7 @@ const driveRunnerKindLocal = "local"
 // DriveRunInput is the fishhawk_drive_run tool's input (#1700).
 type DriveRunInput struct {
 	RunID        string `json:"run_id" jsonschema:"Fishhawk run UUID; the local runner_kind:local run to drive between human gates"`
-	WorkingDir   string `json:"working_dir,omitempty" jsonschema:"checkout the runner runs in. OPTIONAL when the run carries a start_run binding (E66.42 / #2482): omit it to INHERIT the bound checkout. An explicit value is an override and must match the binding after path cleaning — a conflicting value is refused. Over the HTTP MCP transport (fishhawkd's /mcp route, or fishhawk-mcp --transport http) an omitted-and-unbound or relative value is refused — the server's cwd is the daemon's own checkout. On the stdio transport an omitted-and-unbound value defaults to the client-spawned process's own directory (resolved to an absolute path)"`
+	WorkingDir   string `json:"working_dir,omitempty" jsonschema:"checkout the runner runs in. OPTIONAL when the run carries a start_run binding (E66.42 / #2482): omit it to INHERIT the bound checkout. An explicit value is an override and must match the binding after path cleaning — a conflicting value is refused. Over the HTTP MCP transport (fishhawkd's /mcp route, or fishhawk-mcp --transport http) an omitted-and-unbound or relative value is refused — the server's cwd is the daemon's own checkout. On the stdio transport an omitted-and-unbound value defaults to the client-spawned process's own directory (resolved to an absolute path) Over the HTTP MCP transport the path must resolve inside an operator-configured allowed checkout root (fishhawkd --mcp-allowed-roots / FISHHAWKD_MCP_ALLOWED_ROOTS, fishhawk-mcp --allowed-roots / FISHHAWK_MCP_ALLOWED_ROOTS); a path outside every root — or any path at all when no root is configured — is refused path_outside_allowed_roots. The INHERITED binding is confined identically, so a bound checkout stays usable exactly when it is itself inside a root."`
 	GitHubRepo   string `json:"github_repo,omitempty" jsonschema:"repo slug (owner/name, or the GitLab path_with_namespace); defaults to the run row's repo for a gitlab run, else auto-detected from working_dir's origin remote when empty"`
 	BaseBranch   string `json:"base_branch,omitempty" jsonschema:"base branch for the implement-stage PR; defaults to main"`
 	RunnerBinary string `json:"runner_binary,omitempty" jsonschema:"path to fishhawk-runner; resolved in order: input, FISHHAWK_RUNNER_BIN env, sibling to this binary, then PATH"`
@@ -358,6 +358,16 @@ func (r *runResolver) driveRun(ctx context.Context, req *mcp.CallToolRequest, in
 	runUUID, err := uuid.Parse(in.RunID)
 	if err != nil {
 		return nil, DriveRunOutput{}, fmt.Errorf("run_id %q is not a valid UUID: %w", in.RunID, err)
+	}
+
+	// Confinement of the SUPPLIED working_dir (E66.63 / #3589), placed here —
+	// ahead of EVERY backend read — so a refusal dials nothing at all. The
+	// resolveWorkingDir chokepoint confines it again (and is what confines the
+	// E66.42 INHERITED binding, which is only knowable after the run read), so
+	// this early guard and the chokepoint are independent controls: deleting
+	// either leaves the other's counterfactual red.
+	if cerr := r.confinePath("working_dir", in.WorkingDir); cerr != nil {
+		return nil, DriveRunOutput{}, cerr
 	}
 
 	baseBranch := in.BaseBranch
