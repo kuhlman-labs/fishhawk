@@ -2720,7 +2720,14 @@ func writeCounterfactualDiscipline(b *strings.Builder) {
 		"(a) asserting error IDENTITY when the control's effect is COMMITTED STATE — a control that fires and is then rolled back returns a byte-identical error, " +
 		"so read the state after the call returns instead; (b) pairing a malformed input with a DIFFERENT clean value, where a byte-exact comparison refuses it " +
 		"whether or not the guard exists — pair the malformed input with ITSELF; (c) pointing a hop/target URL at an unreachable address, where the connection " +
-		"error maps to the same code the control returns — point it at a reachable in-test server. Seed bad state BY CONSTRUCTION rather than by calling the " +
+		"error maps to the same code the control returns — point it at a reachable in-test server. Three more, all SETUP defects rather than assertion defects: " +
+		"(d) a deletion the FIXTURE masks — before you delete, state what the test would produce with the control absent; if that is the same as what it produces " +
+		"now, the arm is not a control, so change the FIXTURE to isolate the control rather than relaxing the assertion; (e) a mutation that stops COMPILATION is " +
+		"not a counterfactual — deleting a function, type, or declaration the test references proves only that the test names it, so mutate the BODY (return nil, " +
+		"the zero value, or the permissive branch) or delete only the CALL SITES from the production path and run the behavioural test; (f) a MASKING downstream " +
+		"guard — when a later guard makes the deletion unobservable because the deleted check is redundant on the fixture you chose, construct a case that " +
+		"ISOLATES the control (a fixture on which the deleted check is the only thing in the path) or report the control as unverifiable, having run it. " +
+		"Seed bad state BY CONSTRUCTION rather than by calling the " +
 		"control inside the test's own setup guard, so the RED lands on the behavioral assertion and not on a fixture-setup failure. If a test genuinely cannot " +
 		"serve as a counterfactual vehicle, prove that by running it under the deletion and say so — do not assert it. A control you invent in THIS pass gets the " +
 		"same treatment as one the plan named (#2444).\n")
@@ -4711,6 +4718,14 @@ func buildPlan(t Trigger) string {
 		"harness stands one up, so it keeps firing regardless of the hint. So for a hermetic check the correct fix is to NAME its " +
 		"harness in `verify_hint` — never mark a sandbox-decidable check `skip_expected`, which skips verification the executor " +
 		"could actually perform.\n")
+	b.WriteString("Deciding-test rule: every BLOCKING criterion must name, in `verify_hint`, the test or observable surface that DECIDES it — the thing that " +
+		"returns pass or fail. Name which layer decides each criterion. Anything below the HTTP surface routes to the test suite and is not an acceptance " +
+		"criterion; anything needing a real external target carries `requires_live_validation`; a criterion decidable by neither is dropped or rewritten. So a " +
+		"blocking criterion no planned test and no localhost-preview surface can decide must be EITHER downgraded to `blocking: false`, OR marked " +
+		"`requires_live_validation: true` paired with `skip_expected: true` + an `expectation_basis` and a `verify_hint`, OR dropped — never left " +
+		"blocking-and-undecidable, which ships a gate nothing can open. The plan gate runs a deterministic `blocking_criterion_undecided` advisory: it fires on a " +
+		"BLOCKING criterion that carries no sanctioned skip declaration and an EMPTY `verify_hint`. Naming the deciding surface clears it. It is ADVISORY and " +
+		"never refuses the plan.\n")
 	b.WriteString("Unenforceable-criteria rule: the implement stage's `forbidden_paths` constraint is enforced against the REAL diff, so a " +
 		"path it forbids — in this repository's presets `.fishhawk/**`, `.github/workflows/**`, `.gitlab-ci.yml`, `LICENSE` and `NOTICE` — is " +
 		"one the implement agent structurally CANNOT touch. An acceptance criterion demanding a change to such a path is therefore " +
@@ -4751,7 +4766,7 @@ func buildPlan(t Trigger) string {
 	b.WriteString("\n")
 	b.WriteString("Counterfactual attainability rule: for EVERY control this change adds or tightens — any guard, validation, check, or refusal, in ANY language and " +
 		"whether or not the change looks security-relevant — verification.test_strategy MUST name a test that goes RED when the control is deleted. " +
-		"Four rules for the tests you name: (1) name the test whose failure the control's deletion causes, and require implement to DELETE the control, " +
+		"Seven rules for the tests you name: (1) name the test whose failure the control's deletion causes, and require implement to DELETE the control, " +
 		"RUN that test, observe RED, and restore — never to reason that it would fail; seed any bad state the test needs BY CONSTRUCTION (a freshly generated " +
 		"unrelated key is definitionally non-matching) rather than by calling the control inside the test's own setup guard, so the RED lands on the behavioral " +
 		"assertion instead of 'fixture setup failed'. (2) If a named test cannot serve as a counterfactual vehicle, that must be proven EMPIRICALLY by running it " +
@@ -4759,7 +4774,19 @@ func buildPlan(t Trigger) string {
 		"(3) Error IDENTITY is insufficient when the control's effect is COMMITTED STATE — a control that fires and is then rolled back returns a byte-identical " +
 		"error, so for any such control name a test that READS that state after the call returns. (4) Pair a malformed input with ITSELF where a byte-exact " +
 		"comparison would otherwise reject it for an unrelated reason, and point hop/target URLs at reachable in-test servers — an unreachable address makes the " +
-		"deletion fail for the same reason the control would, so the test passes either way.\n")
+		"deletion fail for the same reason the control would, so the test passes either way. " +
+		"(5) STATE THE MECHANISM, as a SETUP obligation and not an outcome claim: for each control, state the fixture state that makes the deletion observable, " +
+		"i.e. what the test would produce if the control were absent. If the fixture would produce the SAME observable outcome either way, the arm is not a " +
+		"control. Naming the deletion and the test that reddens is NOT enough — a mechanism you cannot state is a counterfactual that does not exist, and in every " +
+		"reported instance of this defect the gap was in the fixture's SETUP rather than in its assertion. " +
+		"(6) A mutation that stops COMPILATION is not a counterfactual: deleting a function, type, or declaration the test references proves only that the test " +
+		"names it, never that the control behaves. Mutate the BODY (return nil, the zero value, or the permissive branch) or delete only the CALL SITES from the " +
+		"production path, and run the BEHAVIOURAL test. " +
+		"(7) Watch for a MASKING downstream guard: when a later guard makes the deletion unobservable — the deleted check is redundant on the fixture you chose — " +
+		"the test stays green and the arm proves nothing. Construct a case that ISOLATES the control (e.g. a legacy-major fixture that DOES declare a positive " +
+		"limit, so the version gate is the only thing in the path), or declare the control unverifiable and say so in test_strategy. " +
+		"The plan gate runs a deterministic `counterfactual_mechanism_missing` advisory over verification.test_strategy — a sentence naming a deletion and a RED " +
+		"outcome with no mechanism stated draws one finding; it is ADVISORY and never refuses the plan.\n")
 	b.WriteString("\n")
 	b.WriteString("Counter-examples from production bugs:\n")
 	b.WriteString("- SIGKILL and orphan file descriptors: SIGKILL kills only the direct child process; grandchildren that inherited stdout " +

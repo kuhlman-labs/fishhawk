@@ -109,6 +109,13 @@ const (
 	acceptanceRuleAllCriteriaSkipExpected     = plan.RuleAllCriteriaSkipExpected
 	acceptanceRuleCriterionRestatesTest       = plan.RuleCriterionRestatesTest
 	acceptanceRuleNoObservableCriterion       = plan.RuleNoObservableCriterion
+	// E68.28 (#3057). DELIBERATELY carries no per-rule payload field: the
+	// finding rides the existing Findings array into both the
+	// plan_acceptance_precheck audit payload and
+	// prompt.AcceptancePrecheckEvidence, and writePlanGateEvidence renders an
+	// unrecognised Rule as a generic `- FINDING <rule>: <detail>` line — so no
+	// per-rule prompt wiring is needed and none is added.
+	acceptanceRuleBlockingCriterionUndecided = plan.RuleBlockingCriterionUndecided
 )
 
 // runAcceptancePrecheck evaluates an uploaded plan's
@@ -123,7 +130,12 @@ const (
 // also surfaces the advisory undecidable_criterion rule: a criterion whose
 // statement requires a capability the sandboxed acceptance executor lacks and
 // which is not already marked skip_expected-with-basis or
-// requires_live_validation.
+// requires_live_validation. Since E68.28 / #3057 it also surfaces the advisory
+// blocking_criterion_undecided rule: a BLOCKING criterion with an EMPTY
+// verify_hint, which names no test and no observable surface that decides it.
+// That rule adds NO payload field — it rides the existing Findings array into
+// both the audit payload and the plan-review prompt's gate evidence, where an
+// unrecognised Rule renders as a generic FINDING line.
 //
 // Stage-conditional: the pre-check runs ONLY when the run's workflow
 // configures an acceptance stage (resolveAcceptanceStage returns ok). A
