@@ -699,6 +699,16 @@ func UnevaluableCriteria(v Verification) []AcceptanceFinding {
 			if !uc.liveTarget && (verifyHintDeclaresInRepo(c) || verifyHintNamesSeedScenario(c) || verifyHintNamesStubForge(c)) {
 				continue
 			}
+			// E72.32 / #3614: the SAME shared polarity post-filter #3016 gave
+			// the sibling rule, applied to a liveTarget match. A statement
+			// asserting that NO live target is involved, whose stated
+			// verification method needs no live target, must not be told to
+			// mark itself skip_expected — that skips a criterion the sandbox
+			// can verify, the harm #3016 documents. continue (not break) so a
+			// LATER live capability in the same statement still fires.
+			if uc.liveTarget && polaritySuppressesLiveTarget(c, statement) {
+				continue
+			}
 			detail := "criterion statement requires " + uc.capability +
 				", which the sandboxed acceptance executor does not have; mark it skip_expected with an expectation_basis (or requires_live_validation) so it is declared up front rather than reported undecidable at acceptance"
 			if !uc.liveTarget {
@@ -800,6 +810,75 @@ func acceptanceTokens(lowered string) []string {
 		t = strings.TrimSuffix(t, "’s")
 		if t != "" {
 			tokens = append(tokens, t)
+		}
+	}
+	return tokens
+}
+
+// listSeparatorToken and sentenceBoundaryToken are the POLARITY SENTINELS
+// (E72.32 / #3614): standalone pseudo-tokens polarityTokens emits so the
+// negation scope can tell a coordinated-list comma from a sentence boundary
+// without the tokenizer losing the punctuation entirely, which acceptanceTokens
+// does by design.
+//
+// Each carries a leading NUL byte. strings.Fields splits on whitespace, and a
+// NUL is not whitespace, so a real statement token could only collide by
+// literally containing a NUL followed by this exact word — which no prose does
+// and which, if it somehow did, would only add a sentinel where none belongs
+// (an extra budget reset, i.e. a wider negation scope on one absurd input),
+// never crash.
+const (
+	listSeparatorToken    = "\x00polarity-list-separator"
+	sentenceBoundaryToken = "\x00polarity-sentence-boundary"
+)
+
+// isPolaritySentinel reports whether tok is one of the two sentinels. Named so
+// every sentinel-aware scan reads the same one idea rather than repeating a
+// two-way comparison.
+func isPolaritySentinel(tok string) bool {
+	return tok == listSeparatorToken || tok == sentenceBoundaryToken
+}
+
+// polarityTokens is acceptanceTokens PLUS the two punctuation sentinels. It is
+// the stream the #3016 polarity post-filter runs on; acceptanceTokens is left
+// BYTE-IDENTICAL so M1's liveTargetCorpusMatch and M2's livenessProximityMatch
+// keep running on the stream they always did and neither matcher's behaviour
+// moves.
+//
+// The ordinary-word half is acceptanceTokens verbatim: surrounding punctuation
+// trimmed, a trailing possessive trimmed, interior hyphens preserved. On top of
+// that, a field is followed by a sentinel when its LAST character is:
+//
+//	','  or ';'  -> listSeparatorToken    (a coordinated-list separator)
+//	'.', '!', '?' -> sentenceBoundaryToken (a sentence terminator)
+//
+// THE SENTENCE TEST IS END-OF-FIELD, NOT ANY-DOT. "github.com" carries its dot
+// INTERIOR to the field and yields NO sentinel — the same property that makes
+// clauseBoundary exclude '.' (splitting there would cut the liveTarget corpus
+// phrase "against github.com" in half). TestPolarityTokens_SentinelBranches
+// asserts both directions rather than this comment merely claiming them.
+//
+// A field that is PURELY punctuation (a lone ",") contributes its sentinel and
+// no word, exactly as acceptanceTokens contributes nothing for it.
+func polarityTokens(lowered string) []string {
+	raw := strings.Fields(lowered)
+	tokens := make([]string, 0, len(raw))
+	for _, f := range raw {
+		sentinel := ""
+		switch f[len(f)-1] {
+		case ',', ';':
+			sentinel = listSeparatorToken
+		case '.', '!', '?':
+			sentinel = sentenceBoundaryToken
+		}
+		t := strings.Trim(f, ".,;:!?()[]{}\"'`")
+		t = strings.TrimSuffix(t, "'s")
+		t = strings.TrimSuffix(t, "\u2019s")
+		if t != "" {
+			tokens = append(tokens, t)
+		}
+		if sentinel != "" {
+			tokens = append(tokens, sentinel)
 		}
 	}
 	return tokens
@@ -924,13 +1003,28 @@ func qualifierNearAction(tokens []string) bool {
 // tokens after it. Indices come out ascending because the scan is left to
 // right, and each qualifier is reported at most once (the inner loop breaks on
 // its first partner).
+//
+// THE WINDOW SKIPS POLARITY SENTINELS (E72.32 / #3614). This function is called
+// with BOTH token streams: acceptanceTokens (from M2, which carries no
+// sentinels, so the budget decrements once per token exactly as the old
+// `j <= i+livenessProximityWindow` bound did — behaviour is unchanged there)
+// and polarityTokens (from liveTargetAnchors). A sentinel must not consume
+// budget, or a comma between a qualifier and its action noun would DROP an
+// anchor, shrinking the anchor set and making conjunct P easier to satisfy —
+// the suppression-WIDENING direction. Skipping keeps the anchor set at least as
+// large as it is on the punctuation-free stream.
 func qualifierActionIndices(tokens []string) []int {
 	var idx []int
 	for i, tok := range tokens {
 		if !tokenIn(tok, livenessQualifiers) {
 			continue
 		}
-		for j := i + 1; j <= i+livenessProximityWindow && j < len(tokens); j++ {
+		budget := livenessProximityWindow
+		for j := i + 1; j < len(tokens) && budget > 0; j++ {
+			if isPolaritySentinel(tokens[j]) {
+				continue
+			}
+			budget--
 			if tokenIn(tokens[j], liveActionNouns) {
 				idx = append(idx, i)
 				break
@@ -1106,8 +1200,25 @@ func phraseHeadIndices(tokens, phrase []string) []int {
 	return idx
 }
 
-// everyLiveTargetAnchorNegated is conjunct P: EVERY anchor carries a negation
-// token within livenessProximityWindow tokens BEFORE it.
+// everyLiveTargetAnchorNegated is conjunct P: EVERY anchor is negated, where an
+// anchor counts as negated when EITHER
+//
+//	(P1) a negator sits within livenessProximityWindow tokens BEFORE it — the
+//	     original #3016 backward window, unchanged; or
+//	(P2) it falls inside the EXTENDED NEGATION SCOPE of some negator (E72.32 /
+//	     #3614) — a forward walk from the negator whose budget RESETS at each
+//	     coordinated-list separator and TERMINATES at a sentence boundary.
+//
+// WHY P2 EXISTS. English distributes one negator over a coordinated list: in
+// "No live forge, network egress, or deployed environment is required" a single
+// "no" governs all three nouns, yet the "deployed environment" anchor sits SIX
+// tokens behind it, so P1 alone judged that anchor un-negated and the whole
+// absence assertion kept drawing both findings (#3614).
+//
+// THE CHANGE IS STRICTLY ADDITIVE. P1 is evaluated FIRST and unchanged, and its
+// window SKIPS sentinels rather than spending budget on them, so no window that
+// holds today can shrink. P2 only ever ADDS coverage. Suppression therefore
+// still requires conjunct S on top (see polaritySuppressesLiveTarget).
 //
 // An EMPTY anchor set returns FALSE. From the only caller that set is
 // unreachable (P is evaluated only after a matcher fired), but the fail
@@ -1117,19 +1228,90 @@ func everyLiveTargetAnchorNegated(anchors []int, tokens []string) bool {
 	if len(anchors) == 0 {
 		return false
 	}
+	extended := extendedNegationScope(tokens)
 	for _, a := range anchors {
-		negated := false
-		for i := max(0, a-livenessProximityWindow); i < a && i < len(tokens); i++ {
-			if tokenIn(tokens[i], acceptanceNegators) {
-				negated = true
-				break
-			}
+		if backwardWindowNegated(tokens, a) {
+			continue
 		}
-		if !negated {
-			return false
+		if extended[a] {
+			continue
 		}
+		return false
 	}
 	return true
+}
+
+// backwardWindowNegated is conjunct P1: a negator within
+// livenessProximityWindow tokens BEFORE the anchor. It is the original #3016
+// rule, rewritten only so a POLARITY SENTINEL does not consume window budget —
+// on a sentinel-free stream it is exactly the old forward scan over
+// tokens[a-4:a], and on a sentinel-bearing one a comma can only make the window
+// reach FURTHER, never less far.
+func backwardWindowNegated(tokens []string, a int) bool {
+	budget := livenessProximityWindow
+	for i := a - 1; i >= 0 && i < len(tokens) && budget > 0; i-- {
+		if isPolaritySentinel(tokens[i]) {
+			continue
+		}
+		budget--
+		if tokenIn(tokens[i], acceptanceNegators) {
+			return true
+		}
+	}
+	return false
+}
+
+// extendedNegationScope is conjunct P2 (E72.32 / #3614): the set of token
+// indices covered by some negator's FORWARD scope, so one negator distributes
+// over a coordinated list.
+//
+// THE WALK. From each negator, step forward with a budget of
+// livenessProximityWindow — the SAME constant P1 uses, so no new window is
+// introduced — and
+//
+//   - RESET the budget on a listSeparatorToken: a comma or semicolon is the
+//     signal that the next item is another member of the same coordinated list,
+//     which is precisely what "no A, B, or C" means;
+//   - TERMINATE on a sentenceBoundaryToken: a negator never reaches into the
+//     next sentence, whatever its remaining budget. This is what stops "…leaves
+//     no stopped process behind. The deployed environment serves the endpoint"
+//     from being read as a negated live target;
+//   - TERMINATE on budget exhaustion, so a comma-free run of unrelated words
+//     still ends the scope — which is what keeps
+//     TestMissingLiveValidationMarker_PartiallyNegatedStatementFires firing.
+//
+// ACCEPTED RESIDUAL, pinned by
+// TestAcceptancePolarity_AcceptedCommaSpliceExtendsScope rather than papered
+// over: a comma arriving within budget extends the scope across what is really a
+// comma-SPLICED CLAUSE rather than a list item ("no live forge, the deployed
+// environment serves the endpoint" suppresses where a parser would not).
+// Telling a coordinate list from a comma splice needs parsing this
+// deterministic word-list matcher deliberately does not do, and the failure
+// direction is an advisory MISS on an advisory rule — the same direction as
+// every other residual in this file.
+func extendedNegationScope(tokens []string) map[int]bool {
+	covered := make(map[int]bool)
+	for i, tok := range tokens {
+		if !tokenIn(tok, acceptanceNegators) {
+			continue
+		}
+		budget := livenessProximityWindow
+		for j := i + 1; j < len(tokens); j++ {
+			if tokens[j] == sentenceBoundaryToken {
+				break
+			}
+			if tokens[j] == listSeparatorToken {
+				budget = livenessProximityWindow
+				continue
+			}
+			if budget == 0 {
+				break
+			}
+			budget--
+			covered[j] = true
+		}
+	}
+	return covered
 }
 
 // hasInRepoVerification is conjunct S: the criterion's STATED VERIFICATION
@@ -1151,6 +1333,77 @@ func everyLiveTargetAnchorNegated(anchors []int, tokens []string) bool {
 func hasInRepoVerification(c AcceptanceCriterion) bool {
 	stated := strings.ToLower(c.VerifyHint + " " + c.ExpectationBasis)
 	return containsAnyPhrase(stated, inRepoVerificationMarkers)
+}
+
+// sandboxLocalVerificationMarkers name a SANDBOX-LOCAL verification procedure —
+// a loopback/localhost endpoint, the acceptance preview, the in-process stub
+// forge — in a criterion's stated verification method. They are the second
+// disjunct of conjunct S (E72.32 / #3614).
+//
+// THIS DELIBERATELY REVERSES THE #3016 REASONING ON hasInRepoVerification, FOR
+// THIS CONJUNCT ONLY. That comment declines to let "validated against the
+// localhost preview" count, because it is a claim about the acceptance
+// executor's TARGET rather than about an in-REPOSITORY harness. That reasoning
+// is right for the question "is this verified in-repository?" and wrong for the
+// question conjunct S actually asks.
+//
+// S is evaluated ONLY in conjunction with P. Once P holds, the STATEMENT itself
+// asserts that no live target is involved, so what remains to decide is not
+// "is the harness in this repository?" but "does the stated verification need a
+// LIVE target?" — and a loopback/localhost-preview procedure does not. The
+// motivating #3614 criterion is exactly that shape: its statement says "No live
+// forge, network egress, or deployed environment is required" and its
+// verify_hint prescribes a localhost/loopback sandbox check, yet the narrower
+// in-repository list scored it false and both findings stood.
+//
+// S ALONE STILL NEVER SUPPRESSES, which is what preserves #2845: an un-negated
+// live target leaves P false however the verification method reads. That
+// direction is pinned by TestMissingLiveValidationMarker_InRepoBasisAloneNeverSuppresses
+// for the original list and TestAcceptancePolarity_SandboxLocalAloneNeverSuppresses
+// for this one.
+//
+// It is a SEPARATE list so inRepoVerificationMarkers — read by
+// verifyHintDeclaresInRepo for the #3163 / #3326 / #3327 suppressions as well —
+// does not silently grow and change THOSE rules' surfaces.
+var sandboxLocalVerificationMarkers = []string{
+	"localhost", "loopback", "127.0.0.1", "preview", "in-sandbox",
+	"no forge", "no live forge", "no network egress", "no egress",
+	"/v0/dev/", "stub forge",
+}
+
+// hasNoLiveTargetVerification is conjunct S as of E72.32 / #3614: the
+// criterion's stated verification method — verify_hint and expectation_basis
+// joined, NEVER the statement — names a verification procedure that does not
+// need a live target. Either an IN-REPOSITORY harness (the #3016 list) or a
+// SANDBOX-LOCAL procedure (the list above) qualifies.
+func hasNoLiveTargetVerification(c AcceptanceCriterion) bool {
+	if hasInRepoVerification(c) {
+		return true
+	}
+	stated := strings.ToLower(c.VerifyHint + " " + c.ExpectationBasis)
+	return containsAnyPhrase(stated, sandboxLocalVerificationMarkers)
+}
+
+// polaritySuppressesLiveTarget is the ONE shared polarity post-filter behind
+// BOTH live-target rules: missing_live_validation_marker (#3016, where it
+// replaces an inline conjunction) and the liveTarget half of
+// undecidable_criterion (E72.32 / #3614, which had no polarity awareness at
+// all). Sharing it is what stops the two rules drifting apart on what counts as
+// a negated live target — the drift that produced #3614, where one rule
+// suppressed nothing and the other suppressed on a narrower reading.
+//
+// It runs on polarityTokens, NOT acceptanceTokens: the negation scope needs the
+// punctuation the matchers' tokenizer discards. Both matchers keep running on
+// acceptanceTokens, so neither moves.
+//
+// SUPPRESSION REQUIRES BOTH CONJUNCTS. P alone (every liveness anchor negated)
+// says nothing about how the criterion is checked; S alone (a no-live-target
+// verification method) would let any #2845 criterion be silenced by citing a
+// test. Neither is sufficient, and that is the whole safety argument.
+func polaritySuppressesLiveTarget(c AcceptanceCriterion, lowered string) bool {
+	tokens := polarityTokens(lowered)
+	return everyLiveTargetAnchorNegated(liveTargetAnchors(lowered, tokens), tokens) &&
+		hasNoLiveTargetVerification(c)
 }
 
 // verifyHintHarnessMarkers name an in-repository / repository-local harness in
@@ -1375,7 +1628,7 @@ func MissingLiveValidationMarker(v Verification) []AcceptanceFinding {
 		// POLARITY POST-FILTER (#3016). Both matchers keep their own behaviour
 		// untouched — the filter runs AFTER one of them fired, so M1's
 		// clause-scoped negation and M2's three conjuncts are unchanged.
-		if everyLiveTargetAnchorNegated(liveTargetAnchors(lowered, tokens), tokens) && hasInRepoVerification(c) {
+		if polaritySuppressesLiveTarget(c, lowered) {
 			continue
 		}
 		findings = append(findings, AcceptanceFinding{

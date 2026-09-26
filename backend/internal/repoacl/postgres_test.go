@@ -36,6 +36,41 @@ func newStore(t *testing.T) (repoacl.Store, *pgxpool.Pool) {
 	return repoacl.NewPostgresStore(pool), pool
 }
 
+// awaitHostClockPastDB blocks until this process's clock has passed the
+// DATABASE's current instant, and is what makes the memoization assertions
+// below deterministic. Mirror.expired treats a NEGATIVE age as expired by
+// design (checked_at is stamped by the database clock and compared against the
+// application clock, so forward skew must not extend stale-allow past the TTL).
+// A mirrored row therefore reads back as expired — costing one extra forge
+// resolve — whenever the Postgres container's clock runs ahead of the host's,
+// which on Docker Desktop it routinely does by tens of milliseconds. That is a
+// CROSS-CLOCK-DOMAIN dependency (#3048): widening a margin cannot fix it,
+// because the skew is unbounded. Anchoring the host side past the DB-stamped
+// instant removes the dependency instead, so `forge calls = 1` stays an EXACT
+// assertion rather than being relaxed or polled for.
+//
+// The wait is bounded by timescale.D so it scales with the rest of the suite,
+// and exceeding it fails loudly naming the skew rather than hanging.
+func awaitHostClockPastDB(t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+	var dbNow time.Time
+	if err := pool.QueryRow(context.Background(), "select clock_timestamp()").Scan(&dbNow); err != nil {
+		t.Fatalf("read DB clock: %v", err)
+	}
+	budget := timescale.D(2 * time.Second)
+	deadline := time.Now().Add(budget)
+	for {
+		now := time.Now()
+		if !now.Before(dbNow) {
+			return
+		}
+		if now.After(deadline) {
+			t.Fatalf("host clock is still %v behind the DB clock after %v: the Postgres container clock is skewed ahead of this host by more than the wait budget (#3048)", dbNow.Sub(now), budget)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 // ensureAndUpsert mirrors what Mirror.Permission does on a miss: it creates the
 // lockable purge-watermark row (EnsurePurgeGeneration) and captures the current
 // generation, THEN performs the guarded upsert with that generation. The guarded
@@ -159,12 +194,18 @@ func TestRepoACLPostgres_DeleteForSubjectIsScoped(t *testing.T) {
 // The Mirror driving a REAL store: a miss resolves through the forge and is
 // memoized, and the second read is served from the mirror with no forge call.
 func TestRepoACLPostgres_MirrorMemoizesAcrossReads(t *testing.T) {
-	store, _ := newStore(t)
+	store, pool := newStore(t)
 	res := &fakeResolver{perm: identity.PermissionWrite}
 	m := repoacl.NewMirror(store, res, repoacl.DefaultTTL, testLogger())
 	ctx := context.Background()
 
 	for i := range 2 {
+		// Between the memoizing resolve and the read that must be served from
+		// the mirror, anchor the host clock past the DB-stamped checked_at
+		// (#3048) — see awaitHostClockPastDB.
+		if i == 1 {
+			awaitHostClockPastDB(t, pool)
+		}
 		visible, err := m.Visible(ctx, "github", "octocat", "acme/app")
 		if err != nil {
 			t.Fatalf("Visible #%d: %v", i, err)
@@ -339,7 +380,7 @@ func TestRepoACLPostgres_PurgeOverlapRejectsInFlightGuardedInsert(t *testing.T) 
 // next read. This is the correctly-allowed direction — a resolution whose forge
 // read is post-purge must memoize.
 func TestRepoACLPostgres_ResolveAfterPurgeMemoizes(t *testing.T) {
-	store, _ := newStore(t)
+	store, pool := newStore(t)
 	res := &fakeResolver{perm: identity.PermissionWrite}
 	m := repoacl.NewMirror(store, res, repoacl.DefaultTTL, testLogger())
 	ctx := context.Background()
@@ -352,7 +393,9 @@ func TestRepoACLPostgres_ResolveAfterPurgeMemoizes(t *testing.T) {
 	if visible, err := m.Visible(ctx, "github", "octocat", "acme/app"); err != nil || !visible {
 		t.Fatalf("Visible = (%v, %v), want (true, nil)", visible, err)
 	}
-	// Served from the mirror on the next read (memoized).
+	// Served from the mirror on the next read (memoized) — anchor the host
+	// clock past the DB-stamped checked_at first (#3048).
+	awaitHostClockPastDB(t, pool)
 	if visible, err := m.Visible(ctx, "github", "octocat", "acme/app"); err != nil || !visible {
 		t.Fatalf("Visible #2 = (%v, %v), want (true, nil)", visible, err)
 	}
@@ -366,7 +409,7 @@ func TestRepoACLPostgres_ResolveAfterPurgeMemoizes(t *testing.T) {
 // generation 0, the guard passes (0 >= 0), and the write lands. Covers the
 // first-purge / never-purged / cache-miss-no-entry case (m3).
 func TestRepoACLPostgres_NeverPurgedResolveMemoizes(t *testing.T) {
-	store, _ := newStore(t)
+	store, pool := newStore(t)
 	res := &fakeResolver{perm: identity.PermissionRead}
 	m := repoacl.NewMirror(store, res, repoacl.DefaultTTL, testLogger())
 	ctx := context.Background()
@@ -374,6 +417,8 @@ func TestRepoACLPostgres_NeverPurgedResolveMemoizes(t *testing.T) {
 	if visible, err := m.Visible(ctx, "github", "octocat", "acme/app"); err != nil || !visible {
 		t.Fatalf("Visible = (%v, %v), want (true, nil)", visible, err)
 	}
+	// Anchor the host clock past the DB-stamped checked_at (#3048).
+	awaitHostClockPastDB(t, pool)
 	if visible, err := m.Visible(ctx, "github", "octocat", "acme/app"); err != nil || !visible {
 		t.Fatalf("Visible #2 = (%v, %v), want (true, nil)", visible, err)
 	}

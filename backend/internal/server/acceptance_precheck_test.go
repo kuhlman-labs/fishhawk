@@ -1443,3 +1443,93 @@ func TestRunAcceptancePrecheck_CleanPlanKeysPresentAndFalse(t *testing.T) {
 		t.Errorf("acceptance_surface_none = %v, want false (present-and-false)", sn)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// E72.32 (#3614) — the attribution an operator actually reads in the audit row
+// ---------------------------------------------------------------------------
+
+// ship3614LoopbackStatement / ship3614LoopbackHint are the run b58cc883
+// criterion VERBATIM, copied from
+// acceptance/scenarios/issue-3613/git-op-without-credential-returns-instead-of-blocking.yaml
+// — an absence assertion whose final sentence coordinates three live-target
+// nouns under ONE negator, verified by a loopback/localhost sandbox procedure.
+const ship3614LoopbackStatement = "A git operation run with the non-interactive environment this change ships, against a loopback endpoint that offers no usable credential, TERMINATES on its own with a non-zero exit status and a diagnostic naming git's refusal to prompt for a terminal credential, well inside a generous wall-clock ceiling — it does not block waiting for input and leaves no stopped process behind. No live forge, network egress, or deployed environment is required."
+
+const ship3614LoopbackHint = "CLI exit code + stderr, on the localhost sandbox, no forge needed. Read the two variables the shipped gitops.NonInteractiveEnv() returns out of runner/internal/gitops/commit.go (follow the code, do not hardcode a copy), then run a remote git read against an endpoint that cannot grant credentials — either a loopback HTTP listener answering 401, or a loopback port with no listener — with exactly those variables set and no credential helper configured (GIT_CONFIG_GLOBAL and GIT_CONFIG_SYSTEM pointed at an empty file)."
+
+// TestShipPlan_AbsenceAssertionCriterionNotFlagged is the #3614 cross-boundary
+// proof, following the #3163 precedent: it ships a REAL plan through
+// handleShipPlan and asserts on the PERSISTED plan_acceptance_precheck audit
+// payload — the artifact an operator actually reads. The evaluator unit test
+// cannot establish that, because the audit row is where the criterion_id
+// attribution and the two headline counts are rendered.
+//
+// The plan carries the two-criterion shape the issue names: the verbatim run
+// b58cc883 loopback criterion, which must draw NOTHING from either live-target
+// rule, and an unmarked genuinely-live GitLab sibling, which must draw exactly
+// one finding from EACH. Asserting the attribution BOTH ways is what makes the
+// test discriminating rather than vacuously green on a plan that tripped no rule.
+func TestShipPlan_AbsenceAssertionCriterionNotFlagged(t *testing.T) {
+	s, rr, _, sf, au := newPlanSequenceServer(t)
+	runRow := rr.seedRun()
+	runRow.WorkflowID = "feature_change"
+	runRow.WorkflowSpec = specWithAcceptanceStage
+	planStage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
+	planStage.RequiresApproval = true
+	priv, _ := sf.issue(t, runRow.ID)
+
+	body := acceptancePlanBody(t, []map[string]any{
+		{
+			"id":          "git-op-without-credential-returns-instead-of-blocking",
+			"statement":   ship3614LoopbackStatement,
+			"source":      "explicit",
+			"source_ref":  "#3613",
+			"verify_hint": ship3614LoopbackHint,
+		},
+		{
+			"id":         "pushes-over-live-gitlab-api",
+			"statement":  "the run pushes the branch to the configured GitLab host over a live gitlab api round-trip",
+			"source":     "explicit",
+			"source_ref": "#3614",
+		},
+	}, nil)
+
+	w := shipPlanRequest(t, s, runRow.ID, planStage.ID, priv, body, "")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("plan status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	// ADMISSION (committed state): both rules stay advisory across the seam.
+	if got := rr.stagesByID[planStage.ID].State; got != run.StageStateAwaitingApproval {
+		t.Errorf("stage state = %q, want awaiting_approval\ntransitions: %+v", got, rr.stageTransitions)
+	}
+	if got := rr.stagesByID[planStage.ID].FailureCategory; got != nil {
+		t.Errorf("stage carries failure category %q; both acceptance rules are advisory", *got)
+	}
+
+	if n := countAcceptancePrecheckEntries(au.auditFake); n != 1 {
+		t.Fatalf("plan_acceptance_precheck entries = %d, want 1", n)
+	}
+	entry := lastAcceptancePrecheckEntry(t, au.auditFake)
+
+	for _, rule := range []string{acceptanceRuleUndecidableCriterion, acceptanceRuleMissingLiveValidationMarker} {
+		var got []AcceptanceFinding
+		for _, f := range entry.Findings {
+			if f.Rule == rule {
+				got = append(got, f)
+			}
+		}
+		if len(got) != 1 {
+			t.Fatalf("persisted %s findings = %d, want exactly 1 (the live sibling only): %+v", rule, len(got), entry.Findings)
+		}
+		if got[0].CriterionID != "pushes-over-live-gitlab-api" {
+			t.Errorf("persisted %s criterion_id = %q, want pushes-over-live-gitlab-api — the loopback criterion asserts the ABSENCE of every live target and states a sandbox-local verification method",
+				rule, got[0].CriterionID)
+		}
+	}
+	if entry.UndecidableCount != 1 {
+		t.Errorf("persisted undecidable_count = %d, want 1\nfindings: %+v", entry.UndecidableCount, entry.Findings)
+	}
+	if entry.LiveValidationMarkerCount != 1 {
+		t.Errorf("persisted live_validation_marker_count = %d, want 1\nfindings: %+v", entry.LiveValidationMarkerCount, entry.Findings)
+	}
+}
