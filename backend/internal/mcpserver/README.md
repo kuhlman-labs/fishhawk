@@ -1278,11 +1278,17 @@ non-MCP reader), because a diagnosis must name something the reader can call.
   `record_merge_observation_{no_pull_request, malformed_pr_url, pr_url_repo_mismatch, pr_not_merged, no_merge_commit,
   no_merge_timestamp, forge_unavailable, unconfigured}` and `reconcile_merge_{pr_not_merged, not_applicable,
   unconfigured}`. The shared `c.do` envelope decoding is what carries the backend's code through unflattened.
-- **Auth.** Both routes are registered `requireRunAccount(memberWrite, ...)` and **neither handler enforces a scope
-  predicate** beyond run ownership, so the `/mcp` tool→scope table mirrors them with `mcpScopeAuthenticatedOnly`. That is
-  a faithful mirror, not a claim that ownership-only is the right posture for a write verb — the table's derivation rule
-  forbids the gate being stricter than the endpoint it mirrors, so tightening belongs in an Auth-change-checklist PR
-  against the handlers (filed as a follow-up on #3623).
+- **Auth is TWO gates** ([E45.95 / #3635](https://github.com/kuhlman-labs/fishhawk/issues/3635)). Both routes are
+  registered `requireRunAccount(memberWrite, ...)` for account ownership, **and both handlers enforce
+  `requireWriteScope("write:runs")` as their rung 0** — ahead of the `run_id` parse, so a refused caller learns nothing
+  about the run and the observe verb costs no forge request. `write:runs` is the scope every sibling run-lifecycle
+  recovery verb already enforces (`consolidate`, `reap-failure`, `reset-branch`, `recover`). The `/mcp` tool→scope table
+  mirrors that with `{anyOf: ["write:runs"]}` and **no `runBoundSubjectOK`**: neither handler authorizes a run-bound
+  `fhm_` token by subject, and such a token carries only `mcp:read`, so admitting it at the gate would make the gate
+  LOOSER than the endpoint. A **cookie session** (`TokenID == ""`) is exempt from the scope check by `requireWriteScope`'s
+  documented contract, so a signed-in operator session reaches both verbs exactly as before, bounded by ownership and
+  role-bounding. Until #3635 both entries carried `mcpScopeAuthenticatedOnly`, which faithfully mirrored handlers that
+  enforced ownership only; #3635 raised the endpoints first and the table with them, in that order.
 - **The drift that let this gap open is now machine-caught, in both directions** (`backend/internal/server/mcproute_test.go`).
   `TestCompletionBlockedRecoveryVerbsMatchEmission` derives the recovery vocabulary from the **emission sites** by
   `go/ast` — every string assigned to the field backing the `recovery` json tag, anywhere in the package's production

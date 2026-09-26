@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -140,19 +141,44 @@ func (f *observationFixture) postObserveID(t *testing.T, id string) *httptest.Re
 	return f.postObserveAs(t, id, observationSubject)
 }
 
-// postObserveAs posts with an explicit authenticated subject. An EMPTY subject
-// installs no identity at all, which is the un-authenticated shape the
-// "anonymous" fallback covers.
+// postObserveAs posts with an explicit authenticated subject, as a BEARER
+// holding write:runs — the identity the handler's rung-0 scope check admits
+// (E45.95 / #3635). An EMPTY subject installs no identity at all, which is the
+// un-authenticated shape rung 0 refuses 401.
+//
+// The TokenID is non-empty on purpose: requireWriteScope EXEMPTS a cookie
+// session (TokenID == ""), so a helper installing an identity with an empty
+// TokenID would route every test in this file down the bypass and leave the
+// scope predicate unexercised by the whole suite.
 func (f *observationFixture) postObserveAs(t *testing.T, id, subject string) *httptest.ResponseRecorder {
 	t.Helper()
-	req := httptest.NewRequest(http.MethodPost, "/v0/runs/"+id+"/record-merge-observation", nil)
-	req.SetPathValue("run_id", id)
-	if subject != "" {
-		req = req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity, Identity{Subject: subject}))
+	if subject == "" {
+		return f.postObserveWith(t, id, nil)
+	}
+	return f.postObserveWith(t, id, &Identity{
+		Subject: subject, TokenID: "tok", Scopes: []string{"write:runs"},
+	})
+}
+
+// postObserveWith posts with an ARBITRARY identity, or with NO identity at all
+// when id is nil. It is the knob the rung-0 auth cases need: an arbitrary scope
+// set, a run-bound subject, or a cookie session (TokenID == "").
+func (f *observationFixture) postObserveWith(t *testing.T, runID string, identity *Identity) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs/"+runID+"/record-merge-observation", nil)
+	req.SetPathValue("run_id", runID)
+	if identity != nil {
+		req = req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity, *identity))
 	}
 	w := httptest.NewRecorder()
 	f.s.handleRecordMergeObservation(w, req)
 	return w
+}
+
+// observeWriteRunsBearer is the admitted operator identity every non-auth test
+// in this file posts under.
+func observeWriteRunsBearer() Identity {
+	return Identity{Subject: observationSubject, TokenID: "tok", Scopes: []string{"write:runs"}}
 }
 
 // seedObservationRun creates an ADDITIONAL run in the fixture's repository,
@@ -246,6 +272,9 @@ func TestRecordMergeObservationUnconfigured(t *testing.T) {
 		s := New(Config{Addr: "127.0.0.1:0", PRStateReader: &fakePRStateReader{pr: mergedPR()}})
 		req := httptest.NewRequest(http.MethodPost, "/v0/runs/"+uuid.NewString()+"/record-merge-observation", nil)
 		req.SetPathValue("run_id", uuid.NewString())
+		// An ADMITTED identity: this subtest asserts the 503 rung, not rung 0,
+		// so it must get past the scope check to reach it.
+		req = req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity, observeWriteRunsBearer()))
 		w := httptest.NewRecorder()
 		s.handleRecordMergeObservation(w, req)
 		assertObserveRefusal(t, w, http.StatusServiceUnavailable, "record_merge_observation_unconfigured")
@@ -643,26 +672,118 @@ func TestRecordMergeObservationAppendsOneEntry(t *testing.T) {
 	}
 }
 
-// The "anonymous" substitution is a real branch and gets its own case, so the
-// attribution test above never has to accommodate it. Posting with NO identity
-// installed must still attribute — to the fallback, explicitly — rather than
-// writing a nil or empty subject.
-func TestRecordMergeObservationAnonymousFallback(t *testing.T) {
+// ---------------------------------------------------------------------------
+// Rung 0 — the write:runs auth rung (E45.95 / #3635). One test per named mode.
+//
+// This SUPERSEDES the former TestRecordMergeObservationAnonymousFallback, which
+// posted with no identity and asserted 200 with actor_subject "anonymous". That
+// shape is no longer reachable through the route: an anonymous POST is refused
+// 401 before the run_id is even parsed. The handler's "anonymous" substitution
+// survives only as a defensive default.
+//
+// Every refusal case asserts the status AND the machine error code AND reads
+// COMMITTED STATE back through the real audit repository (zero
+// merge_observation_recorded rows) AND that the forge was never called — error
+// identity alone is insufficient for a control whose effect is a persisted row.
+// ---------------------------------------------------------------------------
+
+// (a) No identity at all -> 401.
+func TestRecordMergeObservationRequiresAuthentication(t *testing.T) {
 	f := newObservationFixture(t, &fakePRStateReader{pr: mergedPR()})
 
-	w := f.postObserveAs(t, f.runID.String(), "")
+	w := f.postObserveWith(t, f.runID.String(), nil)
+	assertObserveRefusal(t, w, http.StatusUnauthorized, "authentication_required")
+	if rows := f.observationRows(t); len(rows) != 0 {
+		t.Errorf("rows = %d, want 0: an unauthenticated POST must append nothing", len(rows))
+	}
+	if f.reader.calls != 0 {
+		t.Errorf("forge calls = %d, want 0: rung 0 precedes the forge read", f.reader.calls)
+	}
+}
+
+// (b) A bearer whose scope set is DISJOINT from the requirement -> 403, with
+// details.required_scope naming write:runs. The scope set is disjoint BY
+// CONSTRUCTION, so the refusal cannot come from a fixture guard.
+func TestRecordMergeObservationRefusesInsufficientScope(t *testing.T) {
+	f := newObservationFixture(t, &fakePRStateReader{pr: mergedPR()})
+
+	w := f.postObserveWith(t, f.runID.String(), &Identity{
+		Subject: "svc:operator", TokenID: "tok", Scopes: []string{"read:runs"},
+	})
+	assertObserveRefusal(t, w, http.StatusForbidden, "insufficient_scope")
+	if body := w.Body.String(); !strings.Contains(body, `"required_scope"`) ||
+		!strings.Contains(body, "write:runs") {
+		t.Errorf("body = %s, want details.required_scope naming write:runs", body)
+	}
+	if rows := f.observationRows(t); len(rows) != 0 {
+		t.Errorf("rows = %d, want 0 on a refusal", len(rows))
+	}
+	if f.reader.calls != 0 {
+		t.Errorf("forge calls = %d, want 0", f.reader.calls)
+	}
+}
+
+// (c) A run-bound fhm_ token -> 403. It carries mcp:read (plus the two
+// conditional run-bound write scopes), never write:runs, and this handler does
+// NOT authorize a run-bound token by SUBJECT — which is what the /mcp table's
+// runBoundSubjectOK:false mirrors.
+func TestRecordMergeObservationRefusesRunBoundToken(t *testing.T) {
+	f := newObservationFixture(t, &fakePRStateReader{pr: mergedPR()})
+
+	w := f.postObserveWith(t, f.runID.String(), &Identity{
+		Subject: "mcp:run:" + f.runID.String(),
+		TokenID: "tok",
+		Scopes:  []string{scopeRunBoundRead, scopeRunBoundRetry, scopeRunBoundScopeAmendments},
+	})
+	assertObserveRefusal(t, w, http.StatusForbidden, "insufficient_scope")
+	if rows := f.observationRows(t); len(rows) != 0 {
+		t.Errorf("rows = %d, want 0 on a refusal", len(rows))
+	}
+	if f.reader.calls != 0 {
+		t.Errorf("forge calls = %d, want 0", f.reader.calls)
+	}
+}
+
+// (d) A COOKIE SESSION (TokenID == "") is ADMITTED. requireWriteScope exempts
+// it by its documented contract, so this change tightens nothing on the
+// browser/OAuth-session path. Pinned so the exemption cannot silently vanish
+// either — a cookie operator locked out of a recovery verb would be a
+// regression with no other failing test.
+func TestRecordMergeObservationAdmitsCookieSession(t *testing.T) {
+	f := newObservationFixture(t, &fakePRStateReader{pr: mergedPR()})
+
+	w := f.postObserveWith(t, f.runID.String(), &Identity{Subject: observationSubject})
 	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		t.Fatalf("status = %d, want 200 (cookie sessions bypass scope enforcement):\n%s",
+			w.Code, w.Body.String())
 	}
 	rows := f.observationRows(t)
 	if len(rows) != 1 {
 		t.Fatalf("rows = %d, want exactly 1", len(rows))
 	}
-	if rows[0].ActorSubject == nil || *rows[0].ActorSubject != "anonymous" {
-		t.Errorf("actor_subject = %v, want %q", rows[0].ActorSubject, "anonymous")
+	if rows[0].ActorSubject == nil || *rows[0].ActorSubject != observationSubject {
+		t.Errorf("actor_subject = %v, want %q", rows[0].ActorSubject, observationSubject)
 	}
 	if rows[0].ActorKind == nil || *rows[0].ActorKind != audit.ActorUser {
 		t.Errorf("actor_kind = %v, want user", rows[0].ActorKind)
+	}
+}
+
+// (e) A bearer HOLDING write:runs is ADMITTED — the positive control that makes
+// every refusal above evidence rather than an artifact of a broken fixture.
+func TestRecordMergeObservationAdmitsWriteRunsBearer(t *testing.T) {
+	f := newObservationFixture(t, &fakePRStateReader{pr: mergedPR()})
+
+	id := observeWriteRunsBearer()
+	w := f.postObserveWith(t, f.runID.String(), &id)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if rows := f.observationRows(t); len(rows) != 1 {
+		t.Fatalf("rows = %d, want exactly 1", len(rows))
+	}
+	if f.reader.calls != 1 {
+		t.Errorf("forge calls = %d, want 1: an admitted call reads the forge", f.reader.calls)
 	}
 }
 

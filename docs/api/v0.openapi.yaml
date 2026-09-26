@@ -19375,6 +19375,14 @@ paths:
         Read `completion_blocked` on GET `/v0/runs/{run_id}` first: it names the
         blocking stage and reads `recovery: "reconcile-merge"` only when this
         endpoint can actually move it.
+
+        OPERATOR-ONLY. The caller must hold the `write:runs` scope, checked
+        BEFORE any read or write — ahead of the run_id parse, the configuration
+        check and the run lookup — so a refused call touches nothing and reveals
+        nothing about whether the run exists. A cookie session is exempt from
+        the scope check and bounded by account ownership instead. Its observe
+        sibling `POST /v0/runs/{run_id}/record-merge-observation` requires the
+        identical scope.
       tags: [runs]
       parameters:
         - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
@@ -19410,12 +19418,21 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '401':
-          description: No authenticated token.
+          description: |
+            `authentication_required` — no authenticated token. Evaluated
+            first, before any repository read.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '403':
-          description: Caller is not permitted to write to this run.
+          description: |
+            `insufficient_scope` — the token is missing the required
+            `write:runs` scope; `details.required_scope` names it. Evaluated
+            first, before any repository read, so a refused call moves no stage
+            and appends no row.
+
+            The account-enforcement refusals are separate and unchanged: the
+            caller is not permitted to write to this run's workspace account.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -19508,6 +19525,14 @@ paths:
         `record_merge_observation_no_merge_commit` /
         `record_merge_observation_no_merge_timestamp` refusals remain the
         generic partial-evidence guards on BOTH forges.
+
+        OPERATOR-ONLY. The caller must hold the `write:runs` scope, checked
+        BEFORE any read or write — ahead of the run_id parse, the configuration
+        check and the run lookup — so a refused call touches nothing, reveals
+        nothing about whether the run exists, and costs no forge request. A
+        cookie session is exempt from the scope check and bounded by account
+        ownership instead. Its settle sibling
+        `POST /v0/runs/{run_id}/reconcile-merge` requires the identical scope.
       tags: [runs]
       parameters:
         - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
@@ -19570,12 +19595,21 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '401':
-          description: No authenticated token.
+          description: |
+            `authentication_required` — no authenticated token. Evaluated
+            first, before any repository or forge read.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '403':
-          description: Caller is not permitted to write to this run.
+          description: |
+            `insufficient_scope` — the token is missing the required
+            `write:runs` scope; `details.required_scope` names it. Evaluated
+            first, before any repository or forge read, so a refused call
+            appends no row and costs no forge request.
+
+            The account-enforcement refusals are separate and unchanged: the
+            caller is not permitted to write to this run's workspace account.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

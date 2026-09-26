@@ -5288,10 +5288,12 @@ Four properties carry the design:
 
 ### `POST /v0/runs/{run_id}/reconcile-merge`
 
-The operator recovery verb. `memberWrite` (an operator-decision write, not a destructive one — the merged-PR precondition and the pair table bound what it can do). Refusals, all evaluated BEFORE any write so a refused reconcile moves zero stages and writes zero rows:
+The operator recovery verb. Authorization is TWO gates: `requireRunAccount(memberWrite)` for account ownership (an operator-decision write, not a destructive one — the merged-PR precondition and the pair table bound what it can do), **plus a handler-side `requireWriteScope("write:runs")` rung 0** (E45.95 / [#3635](https://github.com/kuhlman-labs/fishhawk/issues/3635)). Refusals, all evaluated BEFORE any write so a refused reconcile moves zero stages and writes zero rows:
 
 | status | code | condition |
 | --- | --- | --- |
+| 401 | `authentication_required` | no authenticated identity (rung 0) |
+| 403 | `insufficient_scope` | an authenticated BEARER not holding `write:runs` (rung 0; `details.required_scope` names it) |
 | 400 | `validation_failed` | non-UUID `run_id` |
 | 503 | `reconcile_merge_unconfigured` | run/audit repositories unwired |
 | 404 | `run_not_found` | — |
@@ -5325,6 +5327,10 @@ A merge-evidence read failure does NOT omit the field: it FAILS CLOSED to `none`
 
 `POST /v0/runs/{run_id}/record-merge-observation` is the OBSERVE half of the #3083 recovery pair. `reconcile-merge`'s evidence gate reads the run's audit CHAIN and never the forge, so a run whose PR genuinely merged but whose merge was never recorded (a webhook that never arrived, an observation lost when fishhawkd restarted mid-write) is unreconcilable — the evidence it needs can never appear. This verb is the ONLY new way onto that chain, and it requires a live `merged=true` forge answer to use it.
 
+**Both halves require `write:runs` (E45.95 / [#3635](https://github.com/kuhlman-labs/fishhawk/issues/3635)).** The scope check is rung 0 on BOTH handlers — ahead of the `run_id` parse, the unconfigured check and the run lookup — so a refused caller learns nothing about whether the run exists and the observe verb issues no forge request. The pair is kept IDENTICAL deliberately: the observe and settle verbs must not diverge in who may call them. `write:runs` is the scope every sibling run-lifecycle recovery verb already enforces (`consolidate.go`, `reap_failure.go`, `reset_branch.go`, `recover.go`). A **cookie session** (`TokenID == ""`) is exempt by `requireWriteScope`'s documented contract, so the browser/OAuth-session path is not tightened at all — a signed-in operator session reaches both verbs exactly as before, bounded by `requireRunAccount`'s ownership and role-bounding. A run-bound `fhm_` token is REFUSED (it carries only `mcp:read` plus the two conditional run-bound write scopes, and neither handler authorizes it by SUBJECT), which is what the `/mcp` scope table mirrors with `runBoundSubjectOK: false`.
+
+**Impact inventory.** `operatorDefaultScopes` (`backend/cmd/fishhawkd/token.go`) and `oauthas.DefaultScopes` both already carry `write:runs`, so every token minted by `fishhawkd token issue` and every default OAuth grant is unaffected; only a hand-narrowed token whose scope set omits `write:runs` loses these two verbs, and the remedy is re-issuing it.
+
 **The observe/settle split is load-bearing.** This verb OBSERVES and records a fact; it settles nothing, transitions no stage and completes no run. `reconcile-merge` SETTLES and still reads only the chain. So the fail-closed posture #3083 established is preserved exactly: evidence is still REQUIRED, and the settling verb still never re-observes. The category `merge_observation_recorded` is DELIBERATELY DISTINCT from `pr_merged` — `pr_merged` carries a live-observation timestamp the latency/cost surfaces read as "when Fishhawk knew", so back-dating one would corrupt those series; recording `merged_at` (the forge's merge time) alongside `observed_at` (when Fishhawk learned it) plus `reconciled_after_the_fact:true` lets a reader see the gap without anything being back-dated.
 
 ### The rung ladder
@@ -5333,6 +5339,8 @@ Every refusal is evaluated BEFORE any write, so a refused call leaves ZERO rows:
 
 | status | code | condition |
 | --- | --- | --- |
+| 401 | `authentication_required` | no authenticated identity (rung 0) |
+| 403 | `insufficient_scope` | an authenticated BEARER not holding `write:runs` (rung 0; `details.required_scope` names it) |
 | 400 | `validation_failed` | non-UUID `run_id` |
 | 503 | `record_merge_observation_unconfigured` | run/audit repositories unwired (rung 2), OR the per-forge reader could not be resolved (rung 7) |
 | 404 | `run_not_found` | — |
@@ -5364,6 +5372,8 @@ The rung-6 guard is a READ-THEN-APPEND and is NOT atomic: two CONCURRENT posts c
 ### Live-validation operator walk (binding approval condition 3)
 
 The `requires_live_validation` criterion — a merged GitLab MR records exactly one observation carrying the MR's SHA and `merged_at` — is validated by this exact walk against a live deployment:
+
+`$FISHHAWK_API_TOKEN` must hold `write:runs` (E45.95 / #3635) — every token minted by `fishhawkd token issue` and every default OAuth grant already does; a hand-narrowed one draws `403 insufficient_scope` with `details.required_scope: write:runs`.
 
 ```sh
 # A run whose InstallationRef is "gitlab:<project_id>" and whose PR URL is a

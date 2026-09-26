@@ -163,10 +163,31 @@ func (f *supersedeFixture) supersedeRows(t *testing.T) []*audit.Entry {
 	return entries
 }
 
+// reconcileSubject is the KNOWN authenticated subject the reconcile POSTs
+// install. reconcileWriteRunsBearer is the identity the handler's rung-0 scope
+// check admits (E45.95 / #3635): a BEARER (non-empty TokenID, so the cookie
+// bypass is NOT what admits it) holding write:runs.
+const reconcileSubject = "operator@example.test"
+
+func reconcileWriteRunsBearer() Identity {
+	return Identity{Subject: reconcileSubject, TokenID: "tok", Scopes: []string{"write:runs"}}
+}
+
 func (f *supersedeFixture) postReconcile(t *testing.T) *httptest.ResponseRecorder {
 	t.Helper()
-	req := httptest.NewRequest(http.MethodPost, "/v0/runs/"+f.runID.String()+"/reconcile-merge", nil)
-	req.SetPathValue("run_id", f.runID.String())
+	id := reconcileWriteRunsBearer()
+	return f.postReconcileWith(t, f.runID.String(), &id)
+}
+
+// postReconcileWith posts with an ARBITRARY identity, or with NO identity at
+// all when identity is nil. It is the knob the rung-0 auth cases need.
+func (f *supersedeFixture) postReconcileWith(t *testing.T, runID string, identity *Identity) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs/"+runID+"/reconcile-merge", nil)
+	req.SetPathValue("run_id", runID)
+	if identity != nil {
+		req = req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity, *identity))
+	}
 	w := httptest.NewRecorder()
 	f.s.handleReconcileMerge(w, req)
 	return w
@@ -690,6 +711,9 @@ func TestReconcileMerge_RefusalsBeforeAnyWrite(t *testing.T) {
 	t.Run("bad run id", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodPost, "/v0/runs/nope/reconcile-merge", nil)
 		req.SetPathValue("run_id", "nope")
+		// An ADMITTED identity: this subtest asserts the id-shape rung, not
+		// rung 0, so it must get past the scope check to reach it.
+		req = req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity, reconcileWriteRunsBearer()))
 		w := httptest.NewRecorder()
 		f.s.handleReconcileMerge(w, req)
 		if w.Code != http.StatusBadRequest {
@@ -704,6 +728,7 @@ func TestReconcileMerge_RefusalsBeforeAnyWrite(t *testing.T) {
 		id := uuid.New()
 		req := httptest.NewRequest(http.MethodPost, "/v0/runs/"+id.String()+"/reconcile-merge", nil)
 		req.SetPathValue("run_id", id.String())
+		req = req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity, reconcileWriteRunsBearer()))
 		w := httptest.NewRecorder()
 		f.s.handleReconcileMerge(w, req)
 		if w.Code != http.StatusNotFound {
@@ -719,6 +744,7 @@ func TestReconcileMerge_RefusalsBeforeAnyWrite(t *testing.T) {
 		id := uuid.New()
 		req := httptest.NewRequest(http.MethodPost, "/v0/runs/"+id.String()+"/reconcile-merge", nil)
 		req.SetPathValue("run_id", id.String())
+		req = req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity, reconcileWriteRunsBearer()))
 		w := httptest.NewRecorder()
 		bare.handleReconcileMerge(w, req)
 		if w.Code != http.StatusServiceUnavailable {
@@ -1348,5 +1374,126 @@ func TestAppendStageSupersededAudit_DuplicateLogsInfoNotMissingRowWarn(t *testin
 	}
 	if !strings.Contains(logged, `"level":"INFO"`) {
 		t.Errorf("the duplicate collision was not logged at INFO:\n%s", logged)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Rung 0 — the write:runs auth rung (E45.95 / #3635). One test per named mode,
+// mirroring the observe verb's set exactly: the observe/settle pair must not
+// diverge in who may call it.
+//
+// Every refusal case asserts the status AND the machine error code AND reads
+// COMMITTED STATE back from the repository — the parked stages are still parked
+// and the chain carries ZERO stage_superseded_by_merge rows. Error identity
+// alone is insufficient for a control whose effect is a stage transition plus a
+// persisted row.
+// ---------------------------------------------------------------------------
+
+// assertReconcileMovedNothing reads the two parked stages and the chain back
+// and asserts the request changed neither. It is what makes a refusal
+// assertion real rather than a claim about the error envelope.
+func (f *supersedeFixture) assertReconcileMovedNothing(t *testing.T) {
+	t.Helper()
+	if got := f.stageState(t, f.stages[run.StageTypeAcceptance].ID); got != run.StageStateAwaitingHostDispatch {
+		t.Errorf("acceptance stage = %q, want it still parked at awaiting_host_dispatch", got)
+	}
+	if got := f.stageState(t, f.stages[run.StageTypeReview].ID); got != run.StageStateAwaitingApproval {
+		t.Errorf("review stage = %q, want it still parked at awaiting_approval", got)
+	}
+	if rows := f.supersedeRows(t); len(rows) != 0 {
+		t.Errorf("stage_superseded_by_merge rows = %d, want 0 on a refusal", len(rows))
+	}
+}
+
+// (a) No identity at all -> 401.
+func TestReconcileMergeRequiresAuthentication(t *testing.T) {
+	f := newSupersedeFixture(t, parkedShape())
+	f.observeMerge(t)
+
+	w := f.postReconcileWith(t, f.runID.String(), nil)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401:\n%s", w.Code, w.Body.String())
+	}
+	assertErrorCode(t, w, "authentication_required")
+	f.assertReconcileMovedNothing(t)
+}
+
+// (b) A bearer whose scope set is DISJOINT from the requirement -> 403, with
+// details.required_scope naming write:runs.
+func TestReconcileMergeRefusesInsufficientScope(t *testing.T) {
+	f := newSupersedeFixture(t, parkedShape())
+	f.observeMerge(t)
+
+	w := f.postReconcileWith(t, f.runID.String(), &Identity{
+		Subject: "svc:operator", TokenID: "tok", Scopes: []string{"read:runs"},
+	})
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403:\n%s", w.Code, w.Body.String())
+	}
+	assertErrorCode(t, w, "insufficient_scope")
+	if body := w.Body.String(); !strings.Contains(body, `"required_scope"`) ||
+		!strings.Contains(body, "write:runs") {
+		t.Errorf("body = %s, want details.required_scope naming write:runs", body)
+	}
+	f.assertReconcileMovedNothing(t)
+}
+
+// (c) A run-bound fhm_ token -> 403. It never carries write:runs and this
+// handler does not authorize it by SUBJECT — the /mcp table's
+// runBoundSubjectOK:false mirrors exactly this.
+func TestReconcileMergeRefusesRunBoundToken(t *testing.T) {
+	f := newSupersedeFixture(t, parkedShape())
+	f.observeMerge(t)
+
+	w := f.postReconcileWith(t, f.runID.String(), &Identity{
+		Subject: "mcp:run:" + f.runID.String(),
+		TokenID: "tok",
+		Scopes:  []string{scopeRunBoundRead, scopeRunBoundRetry, scopeRunBoundScopeAmendments},
+	})
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403:\n%s", w.Code, w.Body.String())
+	}
+	assertErrorCode(t, w, "insufficient_scope")
+	f.assertReconcileMovedNothing(t)
+}
+
+// (d) A COOKIE SESSION (TokenID == "") is ADMITTED — requireWriteScope's
+// documented exemption, pinned so it cannot silently disappear.
+func TestReconcileMergeAdmitsCookieSession(t *testing.T) {
+	f := newSupersedeFixture(t, parkedShape())
+	f.observeMerge(t)
+
+	w := f.postReconcileWith(t, f.runID.String(), &Identity{Subject: reconcileSubject})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (cookie sessions bypass scope enforcement):\n%s",
+			w.Code, w.Body.String())
+	}
+	if got := f.stageState(t, f.stages[run.StageTypeAcceptance].ID); got != run.StageStateSuperseded {
+		t.Errorf("acceptance stage = %q, want superseded", got)
+	}
+	if got := f.stageState(t, f.stages[run.StageTypeReview].ID); got != run.StageStateSuperseded {
+		t.Errorf("review stage = %q, want superseded", got)
+	}
+	if rows := f.supersedeRows(t); len(rows) != 2 {
+		t.Errorf("stage_superseded_by_merge rows = %d, want 2", len(rows))
+	}
+}
+
+// (e) A bearer HOLDING write:runs is ADMITTED — the positive control that makes
+// every refusal above evidence rather than a broken-fixture artifact.
+func TestReconcileMergeAdmitsWriteRunsBearer(t *testing.T) {
+	f := newSupersedeFixture(t, parkedShape())
+	f.observeMerge(t)
+
+	id := reconcileWriteRunsBearer()
+	w := f.postReconcileWith(t, f.runID.String(), &id)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if got := f.stageState(t, f.stages[run.StageTypeAcceptance].ID); got != run.StageStateSuperseded {
+		t.Errorf("acceptance stage = %q, want superseded", got)
+	}
+	if rows := f.supersedeRows(t); len(rows) != 2 {
+		t.Errorf("stage_superseded_by_merge rows = %d, want 2", len(rows))
 	}
 }
