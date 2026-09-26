@@ -3327,7 +3327,15 @@ func seedRetirementFixture(t *testing.T, ar *fakeArtifactRepo, au *auditFake, rr
 	// A retirement fixture stands in for an ordinarily-DISPATCHED acceptance
 	// stage, so it must carry a resolvable validated head — otherwise every test
 	// built on it would exercise the #3091 unbound-head clamp instead of the
-	// retirement/ladder behavior it is about.
+	// retirement/ladder behavior it is about. seedAmendedPlanFixture seeds it.
+	seedAmendedPlanFixture(t, ar, au, rr, runID, amendIngestCriteria(), amendments)
+}
+
+// seedAmendedPlanFixture is seedRetirementFixture's body with an explicit plan
+// criteria set (#3181), so the added-only downgrade tests can seed the
+// motivating all-skip-with-basis contract. Written BY CONSTRUCTION.
+func seedAmendedPlanFixture(t *testing.T, ar *fakeArtifactRepo, au *auditFake, rr *promptRunRepo, runID uuid.UUID, criteria []plan.AcceptanceCriterion, amendments []acceptanceCriteriaAmendment) {
+	t.Helper()
 	for _, st := range rr.getStages {
 		if st != nil && st.RunID == runID && st.Type == run.StageTypeAcceptance {
 			seedValidatedHead(au, runID, st.ID)
@@ -3342,7 +3350,7 @@ func seedRetirementFixture(t *testing.T, ar *fakeArtifactRepo, au *auditFake, rr
 	rr.stagesByRunID[runID] = append(rr.stagesByRunID[runID], planStage)
 	seedBudgetPlanArtifact(t, ar, planStage.ID, &plan.Plan{
 		PlanVersion:  "standard_v1",
-		Verification: plan.Verification{AcceptanceCriteria: amendIngestCriteria()},
+		Verification: plan.Verification{AcceptanceCriteria: criteria},
 	})
 	if len(amendments) == 0 {
 		return
@@ -5241,5 +5249,164 @@ func TestAcceptanceVerdictUnshipped_EndToEnd(t *testing.T) {
 	w = postMergeRun(t, s, runID, mergeRunRequest{Verdict: "go"}, withMergeOperator)
 	if w.Code != http.StatusOK || merger.called != 1 {
 		t.Fatalf("merge after recovery: status = %d merger.called = %d body = %s, want 200 / 1", w.Code, merger.called, w.Body.String())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// #3181: operator-added criteria are ADVISORY at verdict ingest.
+// ---------------------------------------------------------------------------
+
+// addCritOp is the standard single operator add the added-only tests seed.
+func addCritOp() []acceptanceCriteriaAmendment {
+	return []acceptanceCriteriaAmendment{{
+		ID: "crit-op", Action: "add", Statement: "the operator-spotted path renders",
+		Reason: "missing drivable criterion spotted at the gate",
+	}}
+}
+
+// shipAddedFixture ships body against a plan carrying criteria plus the given
+// amendments and returns the recorded acceptance_outcome_recorded payload.
+func shipAddedFixture(t *testing.T, criteria []plan.AcceptanceCriterion, amendments []acceptanceCriteriaAmendment, body []byte) map[string]any {
+	t.Helper()
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, ar, au, rr := newAcceptanceServer(t, runID, stageID)
+	seedAmendedPlanFixture(t, ar, au, rr, runID, criteria, amendments)
+	priv, _ := sf.issue(t, runID)
+	if w := shipAcceptanceRequest(t, s, runID, stageID, priv, body, ""); w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	return decodeAcceptanceOutcome(t, au)
+}
+
+// TestShipAcceptance_AddedOnlyFailure_RecordedPassed is the #3181 guard rail: a
+// failed verdict whose ONLY failure names an operator-added criterion is
+// recorded passed under basis added_criteria_only, with the added id recorded
+// and NO retired_criterion_ids key (nothing was retired).
+func TestShipAcceptance_AddedOnlyFailure_RecordedPassed(t *testing.T) {
+	payload := shipAddedFixture(t, amendIngestCriteria(), addCritOp(), acceptanceVerdictBytes(t, "failed", "assertion_fail",
+		acceptanceCriterionResult{ID: "crit-1", Result: "passed"},
+		acceptanceCriterionResult{ID: "crit-2", Result: "passed"},
+		acceptanceCriterionResult{ID: "crit-op", Result: "failed", Observed: "path 404s"},
+	))
+	if payload["verdict"] != "passed" {
+		t.Errorf("recorded verdict = %v, want passed (an added-only failure is advisory)", payload["verdict"])
+	}
+	if payload["verdict_reported"] != "failed" {
+		t.Errorf("verdict_reported = %v, want failed", payload["verdict_reported"])
+	}
+	if payload["downgrade_basis"] != acceptanceDowngradeBasisAddedOnly {
+		t.Errorf("downgrade_basis = %v, want %q", payload["downgrade_basis"], acceptanceDowngradeBasisAddedOnly)
+	}
+	if got := toStringSlice(payload["added_criterion_ids"]); !reflect.DeepEqual(got, []string{"crit-op"}) {
+		t.Errorf("added_criterion_ids = %v, want [crit-op]", got)
+	}
+	if _, present := payload["retired_criterion_ids"]; present {
+		t.Errorf("retired_criterion_ids present on an added-only downgrade with no retirement: %v", payload)
+	}
+	if payload["criteria_failed"] != float64(1) {
+		t.Errorf("criteria_failed = %v, want 1 (raw tallies are the agent's evidence)", payload["criteria_failed"])
+	}
+}
+
+// TestShipAcceptance_AddedOnly_AllBasisSkips_NotSunk is approval condition 2:
+// the motivating run 0aad7486 shape — EVERY reviewed criterion skip_expected
+// WITH an expectation_basis, plus one operator-added criterion that FAILS. A
+// basis-carrying skip counts as a surviving non-added row and does not violate
+// the "no blocking criterion skipped" conjunct, so the added failure cannot
+// sink the run: the downgrade fires and the ladder over the surviving
+// (all-skipped) rows records not_validated — honest, merge-eligible, never
+// failed and never passed.
+func TestShipAcceptance_AddedOnly_AllBasisSkips_NotSunk(t *testing.T) {
+	criteria := []plan.AcceptanceCriterion{
+		{ID: "crit-a", Statement: "webhook fires", Source: plan.CriterionSourceExplicit, SkipExpected: true, ExpectationBasis: "covered by webhook_integration_test.go"},
+		{ID: "crit-b", Statement: "issue closes", Source: plan.CriterionSourceExplicit, SkipExpected: true, ExpectationBasis: "covered by closer_e2e_test.go"},
+	}
+	payload := shipAddedFixture(t, criteria, addCritOp(), acceptanceVerdictBytes(t, "failed", "assertion_fail",
+		acceptanceCriterionResult{ID: "crit-a", Result: "skipped", ExpectationBasis: "covered by webhook_integration_test.go"},
+		acceptanceCriterionResult{ID: "crit-b", Result: "skipped", ExpectationBasis: "covered by closer_e2e_test.go"},
+		acceptanceCriterionResult{ID: "crit-op", Result: "failed", Observed: "path 404s"},
+	))
+	if payload["verdict"] != acceptanceVerdictNotValidated {
+		t.Errorf("recorded verdict = %v, want %s (an added failure must not sink an all-basis-skip contract)", payload["verdict"], acceptanceVerdictNotValidated)
+	}
+	if payload["downgrade_basis"] != acceptanceDowngradeBasisAddedOnly {
+		t.Errorf("downgrade_basis = %v, want %q", payload["downgrade_basis"], acceptanceDowngradeBasisAddedOnly)
+	}
+	if got := toStringSlice(payload["added_criterion_ids"]); !reflect.DeepEqual(got, []string{"crit-op"}) {
+		t.Errorf("added_criterion_ids = %v, want [crit-op]", got)
+	}
+	if payload[plan.AcceptanceBasisKey] != plan.AcceptanceBasisAllSkipObserved {
+		t.Errorf("basis = %v, want %s", payload[plan.AcceptanceBasisKey], plan.AcceptanceBasisAllSkipObserved)
+	}
+}
+
+// TestShipAcceptance_AddedOnly_ComposesWithRetirement pins composition with the
+// #2581 retired-only downgrade: a verdict failing on BOTH a retired and an
+// added criterion is neutralized (neither downgrade alone admits it), recording
+// both id lists under the added basis.
+func TestShipAcceptance_AddedOnly_ComposesWithRetirement(t *testing.T) {
+	amends := append(retireCrit2(), addCritOp()...)
+	payload := shipAddedFixture(t, amendIngestCriteria(), amends, acceptanceVerdictBytes(t, "failed", "assertion_fail",
+		acceptanceCriterionResult{ID: "crit-1", Result: "passed"},
+		acceptanceCriterionResult{ID: "crit-2", Result: "failed"},
+		acceptanceCriterionResult{ID: "crit-op", Result: "failed"},
+	))
+	if payload["verdict"] != "passed" {
+		t.Errorf("recorded verdict = %v, want passed", payload["verdict"])
+	}
+	if payload["downgrade_basis"] != acceptanceDowngradeBasisAddedOnly {
+		t.Errorf("downgrade_basis = %v, want %q", payload["downgrade_basis"], acceptanceDowngradeBasisAddedOnly)
+	}
+	if got := toStringSlice(payload["added_criterion_ids"]); !reflect.DeepEqual(got, []string{"crit-op"}) {
+		t.Errorf("added_criterion_ids = %v, want [crit-op]", got)
+	}
+	if got := toStringSlice(payload["retired_criterion_ids"]); !reflect.DeepEqual(got, []string{"crit-2"}) {
+		t.Errorf("retired_criterion_ids = %v, want [crit-2]", got)
+	}
+}
+
+// TestAddedOnlyDowngrade_BlockingConjuncts is one case per conjunct that BLOCKS
+// the added-only downgrade: each records the reported failure unchanged.
+func TestAddedOnlyDowngrade_BlockingConjuncts(t *testing.T) {
+	cases := []struct {
+		name    string
+		mode    string
+		results []acceptanceCriterionResult
+	}{
+		{"A1 error failure mode", "error", []acceptanceCriterionResult{
+			{ID: "crit-1", Result: "passed"}, {ID: "crit-op", Result: "failed"}}},
+		{"A2 failed non-added id", "assertion_fail", []acceptanceCriterionResult{
+			{ID: "crit-1", Result: "failed"}, {ID: "crit-op", Result: "failed"}}},
+		{"A3 no surviving non-added row", "assertion_fail", []acceptanceCriterionResult{
+			{ID: "crit-op", Result: "failed"}}},
+		{"A4 surviving blocking undecidable", "assertion_fail", []acceptanceCriterionResult{
+			{ID: "crit-1", Result: "undecidable", UndecidableReason: json.RawMessage(`"target flaked"`)},
+			{ID: "crit-2", Result: "passed"}, {ID: "crit-op", Result: "failed"}}},
+		{"A4 surviving blocking skip without plan basis", "assertion_fail", []acceptanceCriterionResult{
+			{ID: "crit-1", Result: "skipped", ExpectationBasis: "target unavailable"},
+			{ID: "crit-2", Result: "passed"}, {ID: "crit-op", Result: "failed"}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := shipAddedFixture(t, amendIngestCriteria(), addCritOp(), acceptanceVerdictBytes(t, "failed", tc.mode, tc.results...))
+			if payload["verdict"] != "failed" {
+				t.Errorf("recorded verdict = %v, want failed (no added-only downgrade)", payload["verdict"])
+			}
+			if _, present := payload["downgrade_basis"]; present {
+				t.Errorf("downgrade_basis present on a blocked downgrade: %v", payload)
+			}
+		})
+	}
+}
+
+// TestAddedOnlyDowngrade_NoAdds_NoDowngrade pins the empty-added-set guard: a
+// failure on a plan criterion with no recorded add is never neutralized.
+func TestAddedOnlyDowngrade_NoAdds_NoDowngrade(t *testing.T) {
+	eff := effectiveAcceptanceCriteria{Live: amendIngestCriteria()}
+	acc := acceptanceBody{Verdict: "failed", FailureMode: "assertion_fail", normalizedCriteria: []acceptanceCriterionResult{
+		{ID: "crit-1", Result: "passed"}, {ID: "crit-op", Result: "failed"},
+	}}
+	if down, _, _ := acceptanceAddedOnlyDowngrade(acc, eff); down {
+		t.Error("downgrade fired with an EMPTY added set")
 	}
 }

@@ -799,6 +799,114 @@ func aggregateAcceptanceResults(rows []acceptanceCriterionResult) string {
 	return acceptanceVerdictPassed
 }
 
+// acceptanceDowngradeBasisAddedOnly is the downgrade_basis recorded when the
+// #3181 added-only downgrade neutralizes a failed verdict.
+const acceptanceDowngradeBasisAddedOnly = "added_criteria_only"
+
+// acceptanceAddedOnlyDowngrade reports whether a FAILED verdict must be recorded
+// as passed because every failure names a criterion the OPERATOR ADDED at the
+// approval gate (#3181). An added criterion never passed plan review, so it is
+// ADVISORY: it is driven and reported, but it cannot sink an otherwise-passing
+// acceptance. This is the enforcement of that guard rail —
+// aggregateAcceptanceResults returns failed on ANY failed row and never reads
+// the plan's blocking flag, so the added criterion's Blocking:false is
+// provenance only. It mirrors acceptanceDowngrade (#2581), keyed on the added-id
+// set, under the same conjunctive preconditions:
+//
+//	A1 verdict==failed AND failure_mode==assertion_fail (an `error` is never
+//	   downgraded).
+//	A2 EVERY failed row names an added id — or a RETIRED id, so the two
+//	   neutralizations compose on a verdict failing both kinds — and at least
+//	   one failed row names an added id.
+//	A3 at least one reported row survives: an id that is neither added nor
+//	   retired. A verdict reporting only added/retired rows evidences nothing
+//	   about the reviewed contract.
+//	A4 no surviving BLOCKING criterion reported `undecidable`, and no surviving
+//	   blocking criterion reported `skipped` UNLESS the reviewed plan itself
+//	   declared that skip (see below). An id absent from the live set is
+//	   treated as blocking (fail closed).
+//
+// BASIS-CARRYING SKIPS (approval condition 2, the run 0aad7486 shape): a
+// surviving row reported `skipped` whose live criterion is skip_expected WITH a
+// non-empty expectation_basis DOES count as a surviving non-added row for A3,
+// and does NOT violate A4's "no blocking criterion skipped" conjunct. The skip
+// is the contract plan review approved, not an un-exercised criterion, so a
+// failed operator-added criterion cannot sink a run whose reviewed contract is
+// all basis-carrying skips. The recorded verdict is still honest: the ladder
+// then runs over the surviving (all-skipped) rows and records not_validated,
+// never passed. A skip on a criterion that is NOT skip_expected-with-basis
+// still blocks when the criterion is blocking, exactly as D4.
+//
+// Returns the added ids and the retired ids that were reported failed (effective
+// order).
+func acceptanceAddedOnlyDowngrade(acc acceptanceBody, eff effectiveAcceptanceCriteria) (bool, []string, []string) {
+	// A1.
+	if acc.Verdict != acceptanceVerdictFailed || acc.FailureMode != acceptanceFailureAssertionFail {
+		return false, nil, nil
+	}
+	// An empty added set needs no early return: no failed row can then name an
+	// added id, so the A3 len(failedAdded) check refuses it.
+	added := eff.addedIDSet()
+	retired := eff.retiredIDSet()
+	live := make(map[string]plan.AcceptanceCriterion, len(eff.Live))
+	for _, c := range eff.Live {
+		live[c.ID] = c
+	}
+
+	failedAdded := map[string]struct{}{}
+	failedRetired := map[string]struct{}{}
+	surviving := 0
+	for _, res := range acc.normalizedCriteria {
+		_, isAdded := added[res.ID]
+		_, isRetired := retired[res.ID]
+		if !isAdded && !isRetired {
+			surviving++
+		}
+		switch res.Result {
+		case acceptanceResultFailed:
+			// A2.
+			switch {
+			case isAdded:
+				failedAdded[res.ID] = struct{}{}
+			case isRetired:
+				failedRetired[res.ID] = struct{}{}
+			default:
+				return false, nil, nil
+			}
+		case acceptanceResultSkipped, acceptanceResultUndecidable:
+			// A4. Added and retired rows are advisory / superseded.
+			if isAdded || isRetired {
+				continue
+			}
+			c, ok := live[res.ID]
+			if ok && c.Blocking != nil && !*c.Blocking {
+				continue
+			}
+			if ok && res.Result == acceptanceResultSkipped && c.SkipExpected && strings.TrimSpace(c.ExpectationBasis) != "" {
+				continue
+			}
+			return false, nil, nil
+		}
+	}
+	// A3.
+	if surviving == 0 || len(failedAdded) == 0 {
+		return false, nil, nil
+	}
+	addedIDs := make([]string, 0, len(failedAdded))
+	for _, id := range eff.Added {
+		if _, ok := failedAdded[id]; ok {
+			addedIDs = append(addedIDs, id)
+		}
+	}
+	var retiredIDs []string
+	for _, r := range eff.Retired {
+		if _, ok := failedRetired[r.ID]; ok {
+			retiredIDs = append(retiredIDs, r.ID)
+		}
+	}
+	return true, addedIDs, retiredIDs
+}
+
 // acceptanceVerdictSeverity ranks the recordable dispositions on the total order
 // passed < not_validated < undecidable < failed (binding condition 3, #3397).
 // not_validated sits BELOW undecidable so an all-skip ship on an unbound head is
@@ -1033,7 +1141,13 @@ func (s *Server) handleShipAcceptance(w http.ResponseWriter, r *http.Request) {
 	// rows — the conservative direction, since a retired row can then only raise
 	// severity, never lower it.
 	downgradedVerdict, downgradeRetiredIDs, downgradeBasis := "", []string(nil), ""
+	downgradeAddedIDs := []string(nil)
 	retiredIDs := map[string]struct{}{}
+	// ladderExcluded is the set of row ids the precedence ladder skips: the
+	// retired ids always, plus the operator-added ids when the #3181 added-only
+	// downgrade fired (their failures were neutralized, so re-deriving `failed`
+	// from them would undo it).
+	ladderExcluded := map[string]struct{}{}
 	{
 		approvedPlan, perr := s.loadApprovedPlanForRun(r.Context(), runID)
 		switch {
@@ -1059,12 +1173,29 @@ func (s *Server) handleShipAcceptance(w http.ResponseWriter, r *http.Request) {
 						"acceptance: failed verdict neutralized — every failure named a retired criterion",
 						slog.String("run_id", runID.String()),
 						slog.String("retired_criterion_ids", strings.Join(ids, ",")))
+				} else if down, added, retiredFailed := acceptanceAddedOnlyDowngrade(acc, eff); down {
+					// #3181: ordered AFTER the retired-only downgrade and BEFORE the
+					// ladder at this same seam, so the two neutralizations compose.
+					downgradedVerdict = acceptanceVerdictPassed
+					downgradeAddedIDs = added
+					downgradeRetiredIDs = retiredFailed
+					downgradeBasis = acceptanceDowngradeBasisAddedOnly
+					for id := range eff.addedIDSet() {
+						ladderExcluded[id] = struct{}{}
+					}
+					s.cfg.Logger.LogAttrs(r.Context(), slog.LevelInfo,
+						"acceptance: failed verdict neutralized — every failure named an operator-added (advisory) criterion",
+						slog.String("run_id", runID.String()),
+						slog.String("added_criterion_ids", strings.Join(added, ",")))
 				}
 			}
 		}
 	}
 
-	// Step (2)+(3): derive from the non-retired rows and take the severity max.
+	// Step (2)+(3): derive from the non-retired rows (and, when the #3181
+	// added-only downgrade fired, the non-added rows) and take the severity max.
+	// So an added-only neutralization over a surviving set that is all skipped
+	// records not_validated, never passed.
 	// The len(rows) > 0 guard is aggregateAcceptanceResults' documented
 	// PRECONDITION — without it an empty row set would answer `passed` and
 	// soften a shipped failed verdict into a pass, which is the exact hazard
@@ -1079,9 +1210,12 @@ func (s *Server) handleShipAcceptance(w http.ResponseWriter, r *http.Request) {
 	if downgradedVerdict != "" {
 		recordedVerdict = downgradedVerdict
 	}
+	for id := range retiredIDs {
+		ladderExcluded[id] = struct{}{}
+	}
 	nonRetired := make([]acceptanceCriterionResult, 0, len(acc.normalizedCriteria))
 	for _, c := range acc.normalizedCriteria {
-		if _, isRetired := retiredIDs[c.ID]; !isRetired {
+		if _, excluded := ladderExcluded[c.ID]; !excluded {
 			nonRetired = append(nonRetired, c)
 		}
 	}
@@ -1205,7 +1339,15 @@ func (s *Server) handleShipAcceptance(w http.ResponseWriter, r *http.Request) {
 		}
 		if downgradeBasis != "" {
 			fields["downgrade_basis"] = downgradeBasis
-			fields["retired_criterion_ids"] = downgradeRetiredIDs
+			// An added-only downgrade records retired_criterion_ids only when a
+			// retired failure rode along (the composed case); the retired-only
+			// basis always carries it, as before.
+			if downgradeBasis == acceptanceDowngradeBasisRetiredOnly || len(downgradeRetiredIDs) > 0 {
+				fields["retired_criterion_ids"] = downgradeRetiredIDs
+			}
+			if len(downgradeAddedIDs) > 0 {
+				fields["added_criterion_ids"] = downgradeAddedIDs
+			}
 		}
 		// undecidable_basis is the #3091 clamp's own key, DISTINCT from
 		// downgrade_basis (which keeps its #2581 retirement meaning). It is
