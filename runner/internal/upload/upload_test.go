@@ -4661,6 +4661,101 @@ func TestTerminalEgress_ShipTraceAndReportRunnerFailureShareOneDeadline(t *testi
 	}
 }
 
+// TestTerminalEgressPhase_ReopensAfterASuccessfulUpload pins the phase
+// LIFECYCLE, the half a shared deadline alone does not give: the phase is
+// closed by a terminal call that SUCCEEDS, so a later terminal call opens a
+// fresh one instead of inheriting a spent instant.
+//
+// Without that, a terminal call made after the settling window had elapsed
+// since a SUCCESSFUL one — a plan stage whose ShipPlan lands instantly at T
+// followed by a ShipTrace at T+80s, packing a large bundle in between — would
+// receive an already-expired context and lose its upload with ZERO attempts
+// against a perfectly healthy backend: the stranding this change exists to
+// prevent, reintroduced on a happy path.
+//
+// Every request here succeeds, so the deadline is the ONLY thing that can fail
+// the second call. Delete endTerminalEgressPhase's Store(0) and both subtests
+// go red with context deadline exceeded.
+func TestTerminalEgressPhase_ReopensAfterASuccessfulUpload(t *testing.T) {
+	const (
+		phaseBudget = 300 * time.Millisecond
+		reserve     = 100 * time.Millisecond
+		// Past the settling window (phase - reserve = 200ms) but still inside
+		// the phase: the window the settling calls actually run against.
+		pastSettling = 250 * time.Millisecond
+		// Past the whole phase: the window the last-word report runs against.
+		pastPhase = 350 * time.Millisecond
+	)
+
+	newClient := func(t *testing.T) (*Client, ed25519.PrivateKey) {
+		t.Helper()
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.Copy(io.Discard, r.Body)
+			w.Header().Set("Content-Type", "application/json")
+			switch {
+			case strings.HasSuffix(r.URL.Path, "/plan"):
+				w.WriteHeader(http.StatusCreated)
+			case strings.HasSuffix(r.URL.Path, "/trace"):
+				w.WriteHeader(http.StatusAccepted)
+			default: // reap-failure
+				w.WriteHeader(http.StatusOK)
+			}
+			_, _ = io.WriteString(w, `{}`)
+		}))
+		t.Cleanup(srv.Close)
+		c := New(srv.URL)
+		c.HTTP = srv.Client()
+		c.TerminalEgressBudget = phaseBudget
+		c.TerminalEgressReserve = reserve
+		_, priv, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c, priv
+	}
+
+	shipPlanOK := func(t *testing.T, c *Client, priv ed25519.PrivateKey) {
+		t.Helper()
+		if _, err := c.ShipPlan(context.Background(), ShipPlanArgs{
+			RunID: "r", StageID: "s", Plan: []byte(`{"version":"standard_v1"}`), PrivateKey: priv,
+		}); err != nil {
+			t.Fatalf("ShipPlan against a healthy backend: %v", err)
+		}
+		// The success CLOSED the phase; a still-armed deadline is the defect.
+		// Errorf, not Fatalf, so the BEHAVIORAL assertion below still runs and
+		// the counterfactual RED lands on the lost upload too, not only on
+		// this white-box state read.
+		if armed := c.terminalEgressDeadline.Load(); armed != 0 {
+			t.Errorf("terminalEgressDeadline = %d after a successful ShipPlan, want 0 (phase closed)", armed)
+		}
+	}
+
+	t.Run("settling call after a successful settling call", func(t *testing.T) {
+		c, priv := newClient(t)
+		shipPlanOK(t, c, priv)
+		time.Sleep(pastSettling)
+		if _, err := c.ShipTrace(context.Background(), ShipArgs{
+			RunID: "r", StageID: "s", Variant: "raw", Bundle: []byte("b"), PrivateKey: priv,
+		}); err != nil {
+			t.Fatalf("ShipTrace %v after a successful ShipPlan: %v — it inherited the closed phase's "+
+				"expired settling deadline, so the trace is lost against a healthy backend", pastSettling, err)
+		}
+	})
+
+	t.Run("last-word call after a successful settling call", func(t *testing.T) {
+		c, priv := newClient(t)
+		shipPlanOK(t, c, priv)
+		time.Sleep(pastPhase)
+		if err := c.ReportRunnerFailure(context.Background(), ReportRunnerFailureArgs{
+			RunID: "r", StageID: "s", MCPToken: "fhm_x", Category: "C",
+			Reason: "later_failure", StageAttempt: "a",
+		}); err != nil {
+			t.Fatalf("ReportRunnerFailure %v after a successful ShipPlan: %v — it inherited the closed "+
+				"phase's expired deadline, so the stage sits `running` against a healthy backend", pastPhase, err)
+		}
+	})
+}
+
 // TestNonTerminalCalls_KeepShortBudget is the narrowness control: #2897 moved
 // exactly three methods onto the terminal budget, and a global change would
 // make every progress tick block for ~75s. FetchPrompt must still give up on

@@ -355,8 +355,9 @@ restart.
 
 The three methods do **not** each get their own 75s. They share ONE
 terminal-egress phase deadline, `DefaultTerminalEgressBudget = 90s`, armed by
-whichever terminal call runs first (`terminalEgressPhaseDeadline`) and joined by
-every terminal call after it. Without that, the budgets would STACK: a
+whichever terminal call OPENS the phase (`terminalEgressPhaseDeadline`) and
+joined by every terminal call after it until the phase is closed. Without that,
+the budgets would STACK: a
 persistent outage costs 75s in `ShipTrace` and then another 75s in the
 `ReportRunnerFailure` fallback that `ShipTrace`'s failure triggers — ~150s of
 blocking for **one** outage. Both calls ride out the SAME outage window seconds
@@ -379,6 +380,36 @@ so the one channel that stops the stage sitting `running` would get **zero real
 attempts** — the stranding this change is about, reintroduced by the fix for it.
 The reserve is clamped to half the budget, so an absurd override can never
 starve a settling upload of all its time.
+
+### The phase is scoped to the outage, not to the Client
+
+Joining a shared instant is only safe while the outage that instant bounds is
+still running. So the phase has a LIFECYCLE: `endTerminalEgressPhase` CLOSES it
+(the stored deadline back to `0`) on the first terminal call that **succeeds**,
+and the next terminal call opens a fresh one.
+
+Success is the signal because it is the one outcome that proves the backend is
+reachable — an upload that landed means there is no outage left to bound. Without
+that close, the phase would be armed once per `Client` and joined forever, so a
+terminal call made later than the settling window (phase minus reserve, ~75s)
+after a **successful** one would receive an already-expired context and lose its
+upload with **zero attempts against a healthy backend**: a plan stage whose
+`ShipPlan` lands instantly at T followed by a `ShipTrace` at T+80s (a large
+bundle to pack, or any intervening work) would deterministically lose its trace —
+the exact stranding this change exists to prevent, reintroduced on a happy path.
+
+A **failing** terminal call deliberately leaves the phase armed. That is what
+makes the `ReportRunnerFailure` fallback a `ShipTrace` failure triggers share the
+bound instead of stacking a second budget on it, so the combined ~90s worst case
+above still holds.
+
+**Residual, stated rather than papered over:** a terminal call that fails and is
+NOT followed by a fallback in the same phase leaves the phase armed, so a much
+later terminal call on the same `Client` could still be born expired. The
+runner's own sequencing makes that unreachable — a failed settling upload is
+always followed by the last-word report and then process exit — and closing it
+by re-arming on expiry instead would forfeit the combined bound the approval
+condition on #2897 asks for.
 
 **What did NOT change:** which statuses are retryable. `ReportRunnerFailure`
 still returns a 4xx after ONE attempt (400/403/409 are terminal answers, and
@@ -404,6 +435,11 @@ shipped constants so a quiet shrink goes red;
 both uploads face a persistent outage and the combined blocking stays under the
 bound while the last-word report still gets a real attempt;
 `TestSettlingEgressContext_ReserveClampedToHalfBudget`;
+`TestTerminalEgressPhase_ReopensAfterASuccessfulUpload`, the phase-LIFECYCLE
+control — every request succeeds, so the deadline is the only thing that can
+fail the DELAYED second terminal call, and both subtests (a settling call past
+the settling window, a last-word call past the whole phase) go red with
+`context deadline exceeded` if the close is deleted;
 `TestReportRunnerFailure_409_SingleAttempt`; and
 `TestNonTerminalCalls_KeepShortBudget`, the narrowness control proving
 `FetchPrompt` and `ReportStageProgress` were not swept along.

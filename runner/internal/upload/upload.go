@@ -201,11 +201,14 @@ type Client struct {
 	TerminalEgressReserve time.Duration
 
 	// terminalEgressDeadline is the shared terminal-egress deadline as Unix
-	// nanoseconds, armed ONCE by whichever terminal call runs first and
-	// reused by every terminal call after it. An atomic (rather than a
-	// mutex) keeps Client copy-safe under go vet's copylocks — the type
-	// already embeds a noCopy, so a future value copy fails vet loudly
-	// instead of silently splitting the phase in two.
+	// nanoseconds, armed by whichever terminal call OPENS the phase and
+	// reused by every terminal call that joins it, then DISARMED (back to 0)
+	// by the first terminal call that completes SUCCESSFULLY — a landed
+	// upload proves the outage the phase bounds is over, so the next terminal
+	// call opens a fresh phase instead of inheriting a spent one. An atomic
+	// (rather than a mutex) keeps Client copy-safe under go vet's copylocks —
+	// the type already embeds a noCopy, so a future value copy fails vet
+	// loudly instead of silently splitting the phase in two.
 	terminalEgressDeadline atomic.Int64
 }
 
@@ -276,13 +279,23 @@ func capBackoff(d, backoffCap time.Duration) time.Duration {
 }
 
 // terminalEgressPhaseDeadline returns the ONE instant every terminal-egress
-// call on this Client shares (E68.7 / #2897, operator approval condition 1).
+// call in the CURRENT phase shares (E68.7 / #2897, operator approval
+// condition 1).
 //
-// The first terminal call to reach here arms `now + budget`; every terminal
-// call after it JOINS that instant. So the phase's worst case is the budget
-// ONCE, not a fresh budget per call — a ShipTrace and the ReportRunnerFailure
-// fallback its failure triggers cannot stack two ~75s retry budgets into ~150s
-// of blocking for one outage.
+// The terminal call that OPENS the phase arms `now + budget`; every terminal
+// call after it JOINS that instant until the phase is disarmed. So one outage's
+// worst case is the budget ONCE, not a fresh budget per call — a ShipTrace and
+// the ReportRunnerFailure fallback its failure triggers cannot stack two ~75s
+// retry budgets into ~150s of blocking for one outage.
+//
+// The phase is disarmed by endTerminalEgressPhase on the first terminal call
+// that SUCCEEDS, so joining is scoped to the outage window rather than to the
+// Client's whole lifetime. Without that, a terminal call made later than the
+// settling window after a SUCCESSFUL one — a plan stage whose ShipPlan lands
+// instantly at T followed by a ShipTrace at T+80s, packing a large bundle in
+// between — would inherit the original instant, receive an already-expired
+// context, and lose its upload with ZERO attempts against a healthy backend:
+// the exact stranding this change exists to prevent, on a happy path.
 func (c *Client) terminalEgressPhaseDeadline() time.Time {
 	budget := c.TerminalEgressBudget
 	if budget <= 0 {
@@ -324,6 +337,28 @@ func (c *Client) settlingEgressContext(ctx context.Context) (context.Context, co
 // what this call gets to spend. The caller MUST defer the returned cancel.
 func (c *Client) lastWordEgressContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithDeadline(ctx, c.terminalEgressPhaseDeadline())
+}
+
+// endTerminalEgressPhase CLOSES the shared terminal-egress phase so the next
+// terminal call opens a fresh one. Called by ShipTrace, ShipPlan and
+// ReportRunnerFailure on their SUCCESS paths only.
+//
+// Success is the signal because it is the one outcome that PROVES the backend
+// is reachable: the phase exists to bound the blocking cost of ONE outage, and
+// an upload that landed means there is no outage left to bound. A FAILING
+// terminal call deliberately leaves the phase armed — that is what makes the
+// ReportRunnerFailure fallback a ShipTrace failure triggers share the bound
+// instead of stacking a second budget on it.
+//
+// Residual, stated rather than papered over: a terminal call that fails and is
+// NOT followed by a fallback in the same phase leaves the phase armed, so a
+// much later terminal call on the same Client could still be born expired. The
+// runner's own sequencing makes that unreachable — a failed settling upload is
+// always followed by the last-word report and then process exit — and closing
+// it by re-arming on expiry would forfeit the combined bound the approval
+// condition asks for.
+func (c *Client) endTerminalEgressPhase() {
+	c.terminalEgressDeadline.Store(0)
 }
 
 // IssuedKey is what IssueKey returns: the freshly minted keypair
@@ -508,6 +543,10 @@ func (c *Client) ShipTrace(ctx context.Context, args ShipArgs) (*ShipResult, err
 			if err != nil {
 				return nil, fmt.Errorf("upload: decode response: %w", err)
 			}
+			// The trace landed: the outage this phase bounds is over, so
+			// close it rather than leaving a later terminal call to inherit
+			// a spent deadline (see endTerminalEgressPhase).
+			c.endTerminalEgressPhase()
 			return &out, nil
 		case resp.StatusCode == http.StatusUnauthorized:
 			// Signature problems don't get better with retries.
@@ -1847,6 +1886,9 @@ func (c *Client) ShipPlan(ctx context.Context, args ShipPlanArgs) (*ShipPlanResu
 			if err != nil {
 				return nil, fmt.Errorf("upload: decode plan response: %w", err)
 			}
+			// The plan landed: close the phase so a ShipTrace later in the
+			// same stage opens a fresh one (see endTerminalEgressPhase).
+			c.endTerminalEgressPhase()
 			return &out, nil
 		case resp.StatusCode == http.StatusBadRequest:
 			brief, full := readClassifiableBody(resp)
@@ -3643,6 +3685,9 @@ func (c *Client) ReportRunnerFailure(ctx context.Context, args ReportRunnerFailu
 		switch {
 		case resp.StatusCode == http.StatusOK:
 			_ = resp.Body.Close()
+			// The last word landed: close the phase (see
+			// endTerminalEgressPhase).
+			c.endTerminalEgressPhase()
 			return nil
 		case resp.StatusCode >= 500:
 			lastErr = statusError("report runner failure", resp)
