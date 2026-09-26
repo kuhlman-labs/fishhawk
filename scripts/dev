@@ -3011,6 +3011,150 @@ cmd_down() {
   rm -f "$NONCE_FILE"
 }
 
+# ---------------------------------------------------------------------------
+# Live-run guard for reload / post-merge (E68.7 / #2897)
+#
+# `reload` and `post-merge` restart fishhawkd. A runner that is mid-stage when
+# that happens sees the backend vanish, and a lost TERMINAL upload (the
+# stage-completion trace POST, or the reap-failure channel that is its last
+# word) strands the stage in `running` — recoverable only via
+# POST /v0/runs/{id}/stages/{id}/reap-failure. The guard below refuses the
+# teardown while any fishhawk-runner process is live, with --force as the
+# deliberate escape hatch. Long-form contract: scripts/README.md.
+# ---------------------------------------------------------------------------
+
+# Shell twins of runner/cmd/fishhawk-runner/lockholder.go's runnerBinaryName
+# and runIDArgFlag. Named constants so the identity rule below reads like the
+# Go original it mirrors.
+_LIVE_RUN_BINARY="fishhawk-runner"
+_LIVE_RUN_ID_FLAG="--run-id"
+
+# PURE. Reads `ps`-shaped lines (`<pid> <argv...>`) on stdin and prints one
+# `<pid>\t<run-id>` record per live fishhawk-runner process, de-duplicated on
+# pid.
+#
+# The decision mirrors runnerIdentityMatches (lockholder.go) EXACTLY, and for
+# the same reason: split the argv on whitespace, require the FIRST argv token's
+# basename (with any extension stripped) to EQUAL fishhawk-runner, then find a
+# token exactly equal to --run-id and take its IMMEDIATELY FOLLOWING token as
+# the id. Substring containment is never sufficient and a later token naming
+# the binary is never sufficient — otherwise `/bin/sleep fishhawk-runner
+# --run-id abc` and `grep fishhawk-runner` would both count and every
+# post-merge run under a `ps | grep` would refuse itself. The single-token
+# `--run-id=<id>` form (which no argv producer in this repo emits) is refused
+# as an id.
+#
+# A matching process whose --run-id token is absent or trailing STILL counts as
+# live and is reported with an EMPTY id field: a runner mid-stage is the hazard
+# whether or not its id can be read, so the fail-safe direction is to report it.
+_parse_live_runs() {
+  local line pid base run_id i
+  local -a tokens
+  local -A seen
+  seen=()
+  while IFS= read -r line; do
+    tokens=(${=line})
+    # `<pid> <argv0> …` — anything shorter carries no argv to judge.
+    if (( ${#tokens} < 2 )); then continue; fi
+    pid="${tokens[1]}"
+    if [[ "$pid" != <-> ]]; then continue; fi
+    base="${tokens[2]:t}"
+    base="${base%%.*}"
+    if [[ "$base" != "$_LIVE_RUN_BINARY" ]]; then continue; fi
+    if [[ -n "${seen[$pid]:-}" ]]; then continue; fi
+    seen[$pid]=1
+    run_id=""
+    for (( i = 2; i <= ${#tokens}; i++ )); do
+      if [[ "${tokens[$i]}" != "$_LIVE_RUN_ID_FLAG" ]]; then continue; fi
+      if (( i + 1 <= ${#tokens} )); then run_id="${tokens[$i+1]}"; fi
+      break
+    done
+    print -r -- "${pid}"$'\t'"${run_id}"
+  done
+  return 0
+}
+
+# IMPURE. Enumerates live fishhawk-runner processes and prints _parse_live_runs'
+# records. Optional arg 1 names a file of PRE-CAPTURED ps output, so
+# scripts/test-dev drives every branch from fixtures with no live process.
+#
+# -ww is load-bearing: BSD `ps` truncates the argv column to the terminal width
+# otherwise, and although --run-id sits at argv[1..2] on today's spawns the
+# scan must stay correct for the longer run_children / drive_run argv shapes
+# too — a truncated line would hide the pair and SILENTLY under-report.
+#
+# Returns 2 — a distinguishable DEGRADE code, never a silent clean scan — when
+# ps is absent or exits non-zero. The caller renders that as a printed one-line
+# reason and proceeds (fail-open; see _refuse_on_live_runs).
+_scan_live_runs() {
+  local fixture="${1:-}"
+  local raw=""
+  if [[ -n "$fixture" ]]; then
+    if ! raw="$(cat -- "$fixture" 2>/dev/null)"; then return 2; fi
+  else
+    if ! command -v ps >/dev/null 2>&1; then return 2; fi
+    if ! raw="$(ps -axww -o pid=,args= 2>/dev/null)"; then return 2; fi
+  fi
+  print -r -- "$raw" | _parse_live_runs
+  return 0
+}
+
+# The control. Args: <force 0|1> [ps-fixture]
+#   clean scan            -> SILENT, return 0
+#   live + force=0        -> refusal naming every live run id on stderr, return 1
+#   live + force=1        -> the same inventory as a WARNING, return 0
+#   scan degrade (rc 2)   -> one-line printed reason, return 0 (fail-open)
+#
+# Fail-OPEN on the degrade is deliberate: `ps` is POSIX-ubiquitous, and wedging
+# every post-merge on a host that cannot enumerate processes is a worse failure
+# than the window this closes.
+#
+# Call sites MUST invoke this in a tested context (`if ! _refuse_on_live_runs …`)
+# so the #631 ZERR trap never fires on a deliberate refusal.
+_refuse_on_live_runs() {
+  local force="${1:-0}"
+  local fixture="${2:-}"
+  local scan="" rc=0
+  scan="$(_scan_live_runs "$fixture")" || rc=$?
+  if (( rc == 2 )); then
+    print -u2 "warning: could not enumerate processes (ps unavailable or failed) — skipping the live-run check (degraded)"
+    return 0
+  fi
+
+  local -a live
+  live=()
+  local pid run_id entry
+  while IFS=$'\t' read -r pid run_id; do
+    if [[ -z "$pid" ]]; then continue; fi
+    if [[ -n "$run_id" ]]; then
+      live+=("run ${run_id} (pid ${pid})")
+    else
+      live+=("pid ${pid} (run id unreadable)")
+    fi
+  done <<< "$scan"
+  if (( ${#live} == 0 )); then
+    return 0
+  fi
+
+  print -u2 ""
+  if (( force )); then
+    print -u2 "warning: tearing down the local stack while ${#live} fishhawk-runner process(es) are live (--force):"
+  else
+    print -u2 "error: refusing to tear down the local stack — ${#live} fishhawk-runner process(es) are live:"
+  fi
+  for entry in "${live[@]}"; do
+    print -u2 "  ${entry}"
+  done
+  print -u2 "  a teardown makes a mid-conversation runner see the backend outage; a lost terminal upload strands"
+  print -u2 "  the stage in 'running', recoverable only via POST /v0/runs/{id}/stages/{id}/reap-failure."
+  if (( force )); then
+    print -u2 "  proceeding anyway because --force was given."
+    return 0
+  fi
+  print -u2 "  wait for the run to settle, or re-run with --force to tear down anyway."
+  return 1
+}
+
 # One-step post-merge command: stop fishhawkd (if running), rebuild ALL four
 # binaries, restart fishhawkd, and emit the MCP reconnect signal. Plain `up`
 # no-ops when fishhawkd is already running, so it never rebuilds after a merge;
@@ -3022,10 +3166,32 @@ cmd_down() {
 # Extra flags (--start-deps, a redundant --all) forward to cmd_up unchanged.
 cmd_reload() {
   print "reload: starting"
+
+  # --force is THIS command's flag and is STRIPPED from what is forwarded:
+  # cmd_up scans for --all/--start-deps and has no meaning for --force, so
+  # carrying it through would hand cmd_up an argument it cannot interpret.
+  local arg force=0
+  local -a fwd
+  fwd=()
+  for arg in "$@"; do
+    if [[ "$arg" == "--force" ]]; then
+      force=1
+      continue
+    fi
+    fwd+=("$arg")
+  done
+
+  # Live-run guard (#2897) BEFORE any teardown, so the refusal is structurally
+  # ahead of the stop. Tested context: a deliberate refusal must not fire the
+  # #631 ZERR trap.
+  if ! _refuse_on_live_runs "$force"; then
+    exit 1
+  fi
+
   if [[ -f "$PID_FILE" ]]; then
     cmd_down
   fi
-  cmd_up --all "$@"
+  cmd_up --all "${fwd[@]}"
 }
 
 # One-step post-merge walk: collapse the per-PR post-merge ritual into a single
@@ -3039,6 +3205,19 @@ cmd_reload() {
 # a redundant --all) forward to cmd_reload unchanged.
 cmd_post_merge() {
   print "post-merge: starting"
+
+  # Live-run guard (#2897) at the VERY TOP — before git checkout/pull and
+  # cleanup-merged — so a refusal never leaves local git state half-advanced.
+  # --force is NOT stripped here: it is forwarded to cmd_reload (which strips
+  # it), whose own re-scan is a cheap idempotent second check that also catches
+  # a runner started during the pull.
+  local pm_arg pm_force=0
+  for pm_arg in "$@"; do
+    if [[ "$pm_arg" == "--force" ]]; then pm_force=1; fi
+  done
+  if ! _refuse_on_live_runs "$pm_force"; then
+    exit 1
+  fi
 
   local issue=''
   if [[ "${1:-}" == <-> ]]; then
@@ -4183,7 +4362,7 @@ cmd_sweep() {
 }
 
 _usage() {
-  print -u2 "usage: scripts/dev <up [--all] [--start-deps]|reload [--all] [--start-deps]|post-merge [<issue>] [--start-deps]|preview <sha-or-ref> [--seed <scenario>]|preview-down|sweep [--days N] [--yes] [--dry-run]|k8s|k8s-down|down>"
+  print -u2 "usage: scripts/dev <up [--all] [--start-deps]|reload [--all] [--start-deps] [--force]|post-merge [<issue>] [--start-deps] [--force]|preview <sha-or-ref> [--seed <scenario>]|preview-down|sweep [--days N] [--yes] [--dry-run]|k8s|k8s-down|down>"
   print -u2 ""
   print -u2 "  sweep removes merged-clean operator worktrees under .claude/worktrees"
   print -u2 "  (never a dirty one, never the current worktree) and prunes aged run/tmp"
@@ -4196,6 +4375,10 @@ _usage() {
   print -u2 ""
   print -u2 "  reload is the down-then-up stack primitive post-merge composes; plain up"
   print -u2 "  no-ops when fishhawkd is already running and so never rebuilds."
+  print -u2 ""
+  print -u2 "  reload and post-merge REFUSE while any fishhawk-runner process is live"
+  print -u2 "  (#2897): restarting fishhawkd under a mid-stage runner can strand its"
+  print -u2 "  stage in 'running'. Pass --force to tear down anyway."
   print -u2 ""
   print -u2 "  preview builds fishhawkd from <sha-or-ref> (default \$FISHHAWK_PREVIEW_SHA) in"
   print -u2 "  a detached worktree, serves it on FISHHAWK_PREVIEW_ADDR (default"

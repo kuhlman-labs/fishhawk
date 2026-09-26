@@ -33,6 +33,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -46,6 +47,48 @@ import (
 var (
 	DefaultMaxRetries = 3
 	DefaultBackoff    = 500 * time.Millisecond
+)
+
+// TERMINAL-EGRESS retry budget (E68.7 / #2897). The short budget above is a
+// BLIP budget: 3 retries at 500ms doubling is ~3.5s of sleep, which a lost
+// progress tick can afford because the next tick supersedes it. The three
+// POSTs that SETTLE a stage's outcome cannot — ShipTrace (the stage-completion
+// POST), ShipPlan (the plan stage's settling artifact) and ReportRunnerFailure
+// (the reap-failure channel that is the only backstop when the trace POST
+// itself is what failed). A lost one of those leaves the stage `running`
+// forever, recoverable only via POST /v0/runs/{id}/stages/{id}/reap-failure.
+// A `scripts/dev reload` / `post-merge` restarts fishhawkd for tens of
+// seconds, so the blip budget cannot ride one out.
+//
+// The capped doubling series is 1,2,4,8,15,15,15,15 = 75s of sleep across 9
+// attempts — bounded ON PURPOSE (#2897 rejects unbounded blocking) and
+// comfortably longer than a five-binary rebuild plus a migration restart.
+var (
+	DefaultTerminalMaxRetries = 8
+	DefaultTerminalBackoff    = 1 * time.Second
+	DefaultTerminalBackoffCap = 15 * time.Second
+
+	// DefaultTerminalEgressBudget bounds the COMBINED wall clock of the whole
+	// terminal-egress phase, not each call in it. Without it the per-call
+	// budgets STACK: a persistent outage would cost 75s in ShipTrace and then
+	// another 75s in the ReportRunnerFailure fallback that ShipTrace's failure
+	// triggers — ~150s of blocking for one outage. Since both calls ride out
+	// the SAME outage window seconds apart, one shared deadline is also the
+	// more faithful model: the phase gets ~90s total, whichever call spends it.
+	DefaultTerminalEgressBudget = 90 * time.Second
+
+	// DefaultTerminalEgressReserve is the tail of the phase WITHHELD from the
+	// settling uploads (ShipTrace / ShipPlan) and left for the last-word
+	// ReportRunnerFailure report.
+	//
+	// Without it a shared deadline has a sharp edge: a ShipTrace that spends
+	// the entire phase hands the fallback an ALREADY-EXPIRED context, so the
+	// one channel that exists to stop the stage sitting `running` gets zero
+	// real attempts — the stranding this whole change is about, reintroduced
+	// by the fix for it. Reserving the tail keeps the COMBINED bound exactly
+	// DefaultTerminalEgressBudget (nothing is added on top; the phase is
+	// SPLIT) while guaranteeing the last word a usable slice.
+	DefaultTerminalEgressReserve = 15 * time.Second
 )
 
 // Errors callers may want to switch on. ErrSignatureRejected is
@@ -135,12 +178,35 @@ type Client struct {
 	BaseURL string
 	HTTP    *http.Client
 
-	// MaxRetries caps ShipTrace retry attempts on retryable
-	// failures. Zero means DefaultMaxRetries.
+	// MaxRetries caps retry attempts on retryable failures for every
+	// non-terminal call. Zero means DefaultMaxRetries.
 	MaxRetries int
 	// Backoff is the initial delay before the first retry; each
 	// subsequent retry doubles. Zero means DefaultBackoff.
 	Backoff time.Duration
+
+	// TerminalMaxRetries / TerminalBackoff / TerminalBackoffCap override the
+	// TERMINAL-EGRESS budget (see DefaultTerminalMaxRetries) used by
+	// ShipTrace, ShipPlan and ReportRunnerFailure. Zero means the
+	// corresponding default, mirroring the MaxRetries/Backoff convention
+	// exactly so tests can shrink them.
+	TerminalMaxRetries int
+	TerminalBackoff    time.Duration
+	TerminalBackoffCap time.Duration
+	// TerminalEgressBudget overrides the SHARED terminal-egress deadline and
+	// TerminalEgressReserve the tail of it withheld for the last-word report
+	// (see DefaultTerminalEgressBudget / DefaultTerminalEgressReserve). Zero
+	// means the corresponding default.
+	TerminalEgressBudget  time.Duration
+	TerminalEgressReserve time.Duration
+
+	// terminalEgressDeadline is the shared terminal-egress deadline as Unix
+	// nanoseconds, armed ONCE by whichever terminal call runs first and
+	// reused by every terminal call after it. An atomic (rather than a
+	// mutex) keeps Client copy-safe under go vet's copylocks — the type
+	// already embeds a noCopy, so a future value copy fails vet loudly
+	// instead of silently splitting the phase in two.
+	terminalEgressDeadline atomic.Int64
 }
 
 // New returns a Client pointed at baseURL with sensible defaults.
@@ -163,6 +229,101 @@ func New(baseURL string) *Client {
 		// gating retries.
 		HTTP: &http.Client{Timeout: 120 * time.Second},
 	}
+}
+
+// retryPolicy resolves the SHORT (blip) retry budget every non-terminal call
+// uses: a doubling backoff with no cap. Resolution lives here rather than being
+// re-derived at each call site.
+func (c *Client) retryPolicy() (maxRetries int, backoff time.Duration) {
+	maxRetries = c.MaxRetries
+	if maxRetries == 0 {
+		maxRetries = DefaultMaxRetries
+	}
+	backoff = c.Backoff
+	if backoff == 0 {
+		backoff = DefaultBackoff
+	}
+	return maxRetries, backoff
+}
+
+// terminalRetryPolicy resolves the TERMINAL-EGRESS retry budget: a CAPPED
+// doubling backoff over a longer attempt count. See
+// DefaultTerminalMaxRetries for why the three settling POSTs need it.
+func (c *Client) terminalRetryPolicy() (maxRetries int, backoff, backoffCap time.Duration) {
+	maxRetries = c.TerminalMaxRetries
+	if maxRetries == 0 {
+		maxRetries = DefaultTerminalMaxRetries
+	}
+	backoff = c.TerminalBackoff
+	if backoff == 0 {
+		backoff = DefaultTerminalBackoff
+	}
+	backoffCap = c.TerminalBackoffCap
+	if backoffCap == 0 {
+		backoffCap = DefaultTerminalBackoffCap
+	}
+	return maxRetries, backoff, backoffCap
+}
+
+// capBackoff doubles d and clamps it to backoffCap. A non-positive cap means
+// uncapped doubling (the short budget's behavior).
+func capBackoff(d, backoffCap time.Duration) time.Duration {
+	d *= 2
+	if backoffCap > 0 && d > backoffCap {
+		return backoffCap
+	}
+	return d
+}
+
+// terminalEgressPhaseDeadline returns the ONE instant every terminal-egress
+// call on this Client shares (E68.7 / #2897, operator approval condition 1).
+//
+// The first terminal call to reach here arms `now + budget`; every terminal
+// call after it JOINS that instant. So the phase's worst case is the budget
+// ONCE, not a fresh budget per call — a ShipTrace and the ReportRunnerFailure
+// fallback its failure triggers cannot stack two ~75s retry budgets into ~150s
+// of blocking for one outage.
+func (c *Client) terminalEgressPhaseDeadline() time.Time {
+	budget := c.TerminalEgressBudget
+	if budget <= 0 {
+		budget = DefaultTerminalEgressBudget
+	}
+	deadline := time.Now().Add(budget)
+	if !c.terminalEgressDeadline.CompareAndSwap(0, deadline.UnixNano()) {
+		// Another terminal call armed it first; join that phase.
+		return time.Unix(0, c.terminalEgressDeadline.Load())
+	}
+	return deadline
+}
+
+// settlingEgressContext is the phase context for the SETTLING uploads
+// (ShipTrace, ShipPlan): the shared phase deadline MINUS the reserve withheld
+// for the last-word report. The caller MUST defer the returned cancel.
+//
+// The reserve is a SPLIT of the phase, not an addition to it, so the combined
+// bound stays the budget. A reserve at or above the whole budget would leave a
+// settling upload no time at all, so it is clamped to half the budget.
+func (c *Client) settlingEgressContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	deadline := c.terminalEgressPhaseDeadline()
+	budget := c.TerminalEgressBudget
+	if budget <= 0 {
+		budget = DefaultTerminalEgressBudget
+	}
+	reserve := c.TerminalEgressReserve
+	if reserve <= 0 {
+		reserve = DefaultTerminalEgressReserve
+	}
+	if reserve > budget/2 {
+		reserve = budget / 2
+	}
+	return context.WithDeadline(ctx, deadline.Add(-reserve))
+}
+
+// lastWordEgressContext is the phase context for ReportRunnerFailure: the FULL
+// shared phase deadline, so the reserve the settling uploads did not touch is
+// what this call gets to spend. The caller MUST defer the returned cancel.
+func (c *Client) lastWordEgressContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithDeadline(ctx, c.terminalEgressPhaseDeadline())
 }
 
 // IssuedKey is what IssueKey returns: the freshly minted keypair
@@ -299,14 +460,17 @@ func (c *Client) ShipTrace(ctx context.Context, args ShipArgs) (*ShipResult, err
 		url.QueryEscape(args.Variant),
 	)
 
-	maxRetries := c.MaxRetries
-	if maxRetries == 0 {
-		maxRetries = DefaultMaxRetries
-	}
-	backoff := c.Backoff
-	if backoff == 0 {
-		backoff = DefaultBackoff
-	}
+	// TERMINAL EGRESS (E68.7 / #2897): this is the POST that SETTLES the
+	// stage. A lost one leaves the stage `running` forever — recoverable only
+	// via POST /v0/runs/{id}/stages/{id}/reap-failure — so it rides the capped
+	// terminal budget rather than the blip budget a progress tick uses.
+	//
+	// The deadline is SHARED with the ReportRunnerFailure fallback this call's
+	// failure triggers (approval condition 1 on #2897): one outage gets ONE
+	// ~90s phase bound, not two stacked 75s retry budgets.
+	maxRetries, backoff, backoffCap := c.terminalRetryPolicy()
+	ctx, cancel := c.settlingEgressContext(ctx)
+	defer cancel()
 
 	var lastErr error
 	for attempt := 0; attempt <= maxRetries; attempt++ {
@@ -316,7 +480,7 @@ func (c *Client) ShipTrace(ctx context.Context, args ShipArgs) (*ShipResult, err
 				return nil, ctx.Err()
 			case <-time.After(backoff):
 			}
-			backoff *= 2
+			backoff = capBackoff(backoff, backoffCap)
 		}
 
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(args.Bundle))
@@ -895,14 +1059,7 @@ func (c *Client) FetchPrompt(ctx context.Context, args FetchPromptArgs) (*Fetche
 	endpoint := fmt.Sprintf("%s/v0/stages/%s/prompt",
 		c.BaseURL, url.PathEscape(args.StageID))
 
-	maxRetries := c.MaxRetries
-	if maxRetries == 0 {
-		maxRetries = DefaultMaxRetries
-	}
-	backoff := c.Backoff
-	if backoff == 0 {
-		backoff = DefaultBackoff
-	}
+	maxRetries, backoff := c.retryPolicy()
 
 	var lastErr error
 	for attempt := 0; attempt <= maxRetries; attempt++ {
@@ -1645,14 +1802,13 @@ func (c *Client) ShipPlan(ctx context.Context, args ShipPlanArgs) (*ShipPlanResu
 		url.PathEscape(args.StageID),
 	)
 
-	maxRetries := c.MaxRetries
-	if maxRetries == 0 {
-		maxRetries = DefaultMaxRetries
-	}
-	backoff := c.Backoff
-	if backoff == 0 {
-		backoff = DefaultBackoff
-	}
+	// TERMINAL EGRESS (E68.7 / #2897): the plan artifact is the plan stage's
+	// SETTLING upload — without it the stage has produced nothing the gate can
+	// read — so it shares the terminal budget and the same phase deadline as
+	// ShipTrace and ReportRunnerFailure.
+	maxRetries, backoff, backoffCap := c.terminalRetryPolicy()
+	ctx, cancel := c.settlingEgressContext(ctx)
+	defer cancel()
 
 	var lastErr error
 	for attempt := 0; attempt <= maxRetries; attempt++ {
@@ -1662,7 +1818,7 @@ func (c *Client) ShipPlan(ctx context.Context, args ShipPlanArgs) (*ShipPlanResu
 				return nil, ctx.Err()
 			case <-time.After(backoff):
 			}
-			backoff *= 2
+			backoff = capBackoff(backoff, backoffCap)
 		}
 
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(args.Plan))
@@ -1781,14 +1937,7 @@ func (c *Client) ShipAcceptance(ctx context.Context, args ShipAcceptanceArgs) (*
 		url.PathEscape(args.StageID),
 	)
 
-	maxRetries := c.MaxRetries
-	if maxRetries == 0 {
-		maxRetries = DefaultMaxRetries
-	}
-	backoff := c.Backoff
-	if backoff == 0 {
-		backoff = DefaultBackoff
-	}
+	maxRetries, backoff := c.retryPolicy()
 
 	var lastErr error
 	for attempt := 0; attempt <= maxRetries; attempt++ {
@@ -2565,14 +2714,7 @@ func (c *Client) ShipAcceptanceTranscript(ctx context.Context, args ShipAcceptan
 		url.PathEscape(args.StageID),
 	)
 
-	maxRetries := c.MaxRetries
-	if maxRetries == 0 {
-		maxRetries = DefaultMaxRetries
-	}
-	backoff := c.Backoff
-	if backoff == 0 {
-		backoff = DefaultBackoff
-	}
+	maxRetries, backoff := c.retryPolicy()
 
 	var lastErr error
 	for attempt := 0; attempt <= maxRetries; attempt++ {
@@ -2932,14 +3074,7 @@ func (c *Client) ShipPullRequest(ctx context.Context, args ShipPullRequestArgs) 
 	// reason large enough to overflow, so the retry is scoped to it.
 	aggressiveRetried := false
 
-	maxRetries := c.MaxRetries
-	if maxRetries == 0 {
-		maxRetries = DefaultMaxRetries
-	}
-	backoff := c.Backoff
-	if backoff == 0 {
-		backoff = DefaultBackoff
-	}
+	maxRetries, backoff := c.retryPolicy()
 
 	var lastErr error
 	for attempt := 0; attempt <= maxRetries; attempt++ {
@@ -3414,8 +3549,16 @@ type reapFailureRequestBody struct {
 }
 
 // reportRunnerFailureMaxAttempts bounds ReportRunnerFailure's retry on
-// transport errors and 5xx.
-const reportRunnerFailureMaxAttempts = 3
+// transport errors and 5xx. Derived from the TERMINAL-EGRESS budget (E68.7 /
+// #2897): this is the last-word reap-failure channel, so a restart-sized
+// outage must be ridden out, not given up on after ~3.5s. The whole phase is
+// still bounded — see terminalEgressPhaseDeadline, whose deadline this call
+// SHARES with the ShipTrace whose failure triggered it, spending the reserve
+// that ShipTrace's settlingEgressContext deliberately left behind.
+func (c *Client) reportRunnerFailureMaxAttempts() int {
+	maxRetries, _, _ := c.terminalRetryPolicy()
+	return maxRetries + 1
+}
 
 // ReportRunnerFailure POSTs the runner's own terminal failure to
 // /v0/runs/{run_id}/stages/{stage_id}/reap-failure bearing the run-bound MCP
@@ -3429,10 +3572,18 @@ const reportRunnerFailureMaxAttempts = 3
 // particular never dials, because the server would 400 an unanchored report.
 // Reason and detail are truncated under MaxFailureReportReasonBytes so the
 // 32 KiB body cap cannot 413 the last-word report. Transport errors and 5xx
-// are retried up to reportRunnerFailureMaxAttempts with doubling backoff —
-// there is no later heartbeat to supersede a lost report — but a 4xx is
-// returned after ONE attempt: 400/403/409 are terminal answers, and retrying a
-// 409 stage_attempt_superseded would retry exactly what the anchor refuses.
+// are retried up to reportRunnerFailureMaxAttempts with CAPPED doubling backoff
+// on the TERMINAL-EGRESS budget — there is no later heartbeat to supersede a
+// lost report — but a 4xx is returned after ONE attempt: 400/403/409 are
+// terminal answers, and retrying a 409 stage_attempt_superseded would retry
+// exactly what the anchor refuses. Only the attempt cap and the backoff
+// schedule changed in #2897; WHICH statuses are retryable did not.
+//
+// The retry budget is spent against the SHARED terminal-egress deadline
+// (approval condition 1 on #2897), so a ShipTrace that already burned its slice
+// of the phase leaves this fallback the RESERVE rather than a fresh budget of
+// its own — one outage, one ~90s bound, with the last word guaranteed a usable
+// tail of it (DefaultTerminalEgressReserve).
 func (c *Client) ReportRunnerFailure(ctx context.Context, args ReportRunnerFailureArgs) error {
 	if args.RunID == "" || args.StageID == "" {
 		return errors.New("upload: run_id and stage_id required")
@@ -3462,19 +3613,19 @@ func (c *Client) ReportRunnerFailure(ctx context.Context, args ReportRunnerFailu
 	endpoint := fmt.Sprintf("%s/v0/runs/%s/stages/%s/reap-failure",
 		c.BaseURL, url.PathEscape(args.RunID), url.PathEscape(args.StageID))
 
-	backoff := c.Backoff
-	if backoff == 0 {
-		backoff = DefaultBackoff
-	}
+	_, backoff, backoffCap := c.terminalRetryPolicy()
+	maxAttempts := c.reportRunnerFailureMaxAttempts()
+	ctx, cancel := c.lastWordEgressContext(ctx)
+	defer cancel()
 	var lastErr error
-	for attempt := 0; attempt < reportRunnerFailureMaxAttempts; attempt++ {
+	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
 			case <-time.After(backoff):
 			}
-			backoff *= 2
+			backoff = capBackoff(backoff, backoffCap)
 		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 		if err != nil {
