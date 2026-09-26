@@ -304,6 +304,15 @@ func groomingEntryCounts(gr *plan.GroomingReport) map[string]int {
 	if tierProposals > 0 {
 		counts["delegation_tier_proposals"] = tierProposals
 	}
+	// Stale/closeable findings (E54.83 / #3534). Every one settles finding_only
+	// at apply — approving the report closes nothing — so this is the count the
+	// operator reads at the gate to see the finding exists and that none of it
+	// will land. Emitted ONLY when non-zero (the milestone / delegation-tier
+	// precedent above), so an ordinary report's audit payload stays
+	// byte-identical to before this change.
+	if len(gr.StaleItems) > 0 {
+		counts["stale_items"] = len(gr.StaleItems)
+	}
 	return counts
 }
 

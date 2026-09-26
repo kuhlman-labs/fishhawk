@@ -4973,6 +4973,13 @@ func buildGroomingPropose(t Trigger) (string, error) {
 	b.WriteString("- The six entry arrays — ordering, duplicates, hygiene_defects, dependency_edges, vision_drift, " +
 		"decomposition_suggestions — are ALL REQUIRED even when empty: `[]` states \"none found\", which is a " +
 		"different claim from omitting the key.\n")
+	b.WriteString("- `stale_items` is OPTIONAL and additive — use it for a stale/closeable finding (a complete-but-open " +
+		"epic, an epic closed with live children, a body that predates the item's remaining scope, an aged-out item) " +
+		"instead of describing it in the free-text `summary`. Every entry needs a `kind` (complete_but_open | " +
+		"closed_with_open_children | body_predates_scope | aged_out), an `evidence` line, at least one " +
+		"`rubric_citations` id, and a `proposed_action` (close | reparent_children | rescope_body | icebox); its id " +
+		"derives as `stale:<item-key>:<kind>`. The class is PROPOSE-ONLY: approving this stage's gate records a " +
+		"stale finding and NEVER closes, reparents or rescopes anything.\n")
 	b.WriteString("- EVERY ordering entry MUST carry at least one `rubric_citations` id taken from the injected " +
 		"charter's rubric tables (the uppercase ids V*, R*, U*, S*). A ranking that cannot be justified against the " +
 		"charter is REJECTED by the schema, never shipped undecorated.\n")
@@ -5000,7 +5007,7 @@ func buildGroomingPropose(t Trigger) (string, error) {
 	b.WriteString("`hygiene` is the ONLY grooming class whose mutations are ever applied (server-side, when the " +
 		"operator approves this stage's gate — approving is a write, not a filing decision). `ordering`, `dedup` and " +
 		"`scoping` are non-delegable, PROPOSE-ONLY classes NEVER applied by this run: they are proposals a human acts " +
-		"on.\n")
+		"on. `scoping` covers decomposition suggestions, vision drift AND stale_items findings.\n")
 	b.WriteString("You yourself perform NO tracker writes and NO code changes — a grooming run produces no diff at any " +
 		"stage, so no source file is to be modified.\n\n")
 

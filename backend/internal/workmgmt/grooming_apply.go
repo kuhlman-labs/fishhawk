@@ -217,8 +217,9 @@ const (
 // The closed set of skip reasons. Every deliberate no-op names one, so an
 // audit reader can tell a containment refusal from a provider failure.
 const (
-	// GroomingSkipFindingOnly marks a vision-drift flag: a FINDING, which
-	// derives no mutation at all.
+	// GroomingSkipFindingOnly marks a vision-drift flag or a stale finding
+	// (#3534): a FINDING, which derives no mutation at all — approving the
+	// report records it and closes, reparents or rescopes nothing.
 	GroomingSkipFindingOnly = "finding_only"
 	// GroomingSkipUnmappableDefect marks a hygiene defect with no mechanical
 	// mutation — an unknown defect value, or a known one whose fix is authored
@@ -452,14 +453,18 @@ var groomingClassOrder = map[string]int{
 	plan.GroomingClassDuplicate:     3,
 	plan.GroomingClassDecomposition: 4,
 	plan.GroomingClassVisionDrift:   5,
+	// Stale (#3534) is LAST so an added class cannot perturb the existing
+	// classes' dispatch order.
+	plan.GroomingClassStale: 6,
 }
 
 // groomingActionClass maps a REPORT entry class onto the ACTION class the
 // resolved autonomy matrix keys on (spec's hygiene/ordering/dedup/scoping —
 // docs/spec/workflow-v2.md § backlog-grooming action classes). Dependency
 // edges are hygiene: adding an absent link is the objective, reversible fix
-// that class is defined by. Vision drift is scoping for record-keeping only —
-// it derives no mutation, so no mode is ever consulted for it.
+// that class is defined by. Vision drift and stale findings (#3534) are
+// scoping for record-keeping only — they derive no mutation, so no mode is ever
+// consulted for them.
 var groomingActionClass = map[string]string{
 	plan.GroomingClassHygiene:       "hygiene",
 	plan.GroomingClassDependency:    "hygiene",
@@ -467,6 +472,7 @@ var groomingActionClass = map[string]string{
 	plan.GroomingClassDuplicate:     "dedup",
 	plan.GroomingClassDecomposition: "scoping",
 	plan.GroomingClassVisionDrift:   "scoping",
+	plan.GroomingClassStale:         "scoping",
 }
 
 // GroomingActionClassFor maps a REPORT entry class onto the ACTION class the
@@ -632,6 +638,21 @@ func deriveGroomingMutations(report *plan.GroomingReport) []groomingCandidate {
 			entryID:     e.ID,
 			reportClass: plan.GroomingClassVisionDrift,
 			class:       groomingActionClass[plan.GroomingClassVisionDrift],
+			ref:         e.ItemRef,
+			skipReason:  GroomingSkipFindingOnly,
+		})
+	}
+
+	// A stale finding (#3534) is PROPOSE-ONLY: no kind, so nothing is ever
+	// dispatchable, and a derivation-time finding_only skip that rule 0 of
+	// settleGroomingCandidate short-circuits AHEAD of the decision lookup — an
+	// operator approval cannot promote it into a close (charter S2/S5: never
+	// close as a side effect of grooming).
+	for _, e := range report.StaleItems {
+		out = append(out, groomingCandidate{
+			entryID:     e.ID,
+			reportClass: plan.GroomingClassStale,
+			class:       groomingActionClass[plan.GroomingClassStale],
 			ref:         e.ItemRef,
 			skipReason:  GroomingSkipFindingOnly,
 		})
@@ -859,11 +880,14 @@ func groomingReportEntryIDs(report *plan.GroomingReport) map[string]struct{} {
 	for _, e := range report.DecompositionSuggestions {
 		ids[e.ID] = struct{}{}
 	}
+	for _, e := range report.StaleItems {
+		ids[e.ID] = struct{}{}
+	}
 	return ids
 }
 
 // duplicateGroomingReportEntryID reports the first entry id the report carries
-// TWICE, walking the same six arrays groomingReportEntryIDs walks, in the same
+// TWICE, walking the same arrays groomingReportEntryIDs walks, in the same
 // order.
 //
 // It is a SEPARATE function from groomingReportEntryIDs on purpose: that
@@ -908,6 +932,11 @@ func duplicateGroomingReportEntryID(report *plan.GroomingReport) (string, bool) 
 		}
 	}
 	for _, e := range report.DecompositionSuggestions {
+		if check(e.ID) {
+			return e.ID, true
+		}
+	}
+	for _, e := range report.StaleItems {
 		if check(e.ID) {
 			return e.ID, true
 		}
@@ -1142,7 +1171,8 @@ func candidateRecord(c groomingCandidate) GroomingMutationRecord {
 
 // GroomingCandidateCount is the number of mutation records ApplyGrooming will
 // write for report — one per derived candidate, which is one per report entry
-// (a vision-drift flag derives a finding-only candidate, still recorded). The
+// (a vision-drift flag or a stale finding derives a finding-only candidate,
+// still recorded). The
 // server stamps it on the grooming_apply_started row as the progress
 // denominator (E54.77 / #3232) without re-deriving. Nil-safe.
 func GroomingCandidateCount(report *plan.GroomingReport) int {

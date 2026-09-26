@@ -11,7 +11,7 @@
     "model": "claude-opus-5",
     "timestamp": "2026-08-21T14:02:11Z"
   },
-  "summary": "Groomed the 4 open alpha-phase items touching the grooming loop. Proposes #2235 first (it blocks the rest of E54), flags one duplicate pair, one unboarded Jira item, one directional dependency, and one non-goal drift.",
+  "summary": "Groomed the 4 open alpha-phase items touching the grooming loop. Proposes #2235 first (it blocks the rest of E54), flags one duplicate pair, one unboarded Jira item, one directional dependency, one non-goal drift, and one complete-but-open epic.",
   "charter_ref": {
     "path": ".fishhawk/charter.md",
     "content_hash": "3726dca74f7729cbe084869f755e3ffff92812011e61fe13084faf603fd13561",
@@ -173,6 +173,25 @@
           "scope_hint": "Tracker mutation path keyed by grooming-report entry id."
         }
       ]
+    }
+  ],
+  "stale_items": [
+    {
+      "id": "stale:github/kuhlman-labs/fishhawk#2051:complete_but_open",
+      "item_ref": {
+        "type": "github_issue",
+        "id": "kuhlman-labs/fishhawk#2051",
+        "url": "https://github.com/kuhlman-labs/fishhawk/issues/2051"
+      },
+      "kind": "complete_but_open",
+      "evidence": "All 6 sub-issues are closed and the last child PR merged 2026-08-14; the epic is still open with no remaining scope in its body.",
+      "rubric_citations": [
+        {
+          "rubric_id": "S1",
+          "note": "An open epic with no remaining work misstates the backlog's size."
+        }
+      ],
+      "proposed_action": "close"
     }
   ]
 }

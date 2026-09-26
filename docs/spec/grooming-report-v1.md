@@ -86,10 +86,56 @@ among the injected documents, so a report prompt is never served unanchored.
 | `dependency_edges` | yes | May be `[]`. |
 | `vision_drift` | yes | May be `[]`. |
 | `decomposition_suggestions` | yes | May be `[]`. |
+| `stale_items` | **optional** | Stale/closeable findings (#3534) — see [Stale findings](#stale-findings-stale_items). |
 
-All six entry arrays are **required** even when empty. `[]` states "none found",
-which is a different claim from omitting the key — and the two must not be
-conflated by a downstream diff (#2240).
+The six original entry arrays are **required** even when empty. `[]` states "none
+found", which is a different claim from omitting the key — and the two must not
+be conflated by a downstream diff (#2240). `stale_items` is the exception: it was
+added within the frozen `grooming_report_v1` major, so it is optional and every
+report valid before it existed validates unchanged.
+
+## Stale findings (`stale_items`)
+
+A stale/closeable item is a **finding**, not a mutation. Before #3534 the groomer
+could only describe one in the free-text `summary`, where nothing could key a
+disposition, a churn record or an audit row on it. `stale_items` makes each one a
+machine-readable entry with a derived id.
+
+| Field | Required | Notes |
+|---|---|---|
+| `id` | yes | `stale:<item-key>:<kind>` — see [Id forms](#id-forms). |
+| `item_ref` | yes | The stale item. |
+| `kind` | yes | Closed enum; also the id qualifier (one entry per kind per item). |
+| `evidence` | yes, `minLength: 1` | The concrete observation the finding rests on. Prose. |
+| `rubric_citations` | yes, `minItems: 1` | The charter rubric line(s) the finding rests on (S1/S5 typically) — the same citation control `ordering` carries, so an uncited "this looks stale" entry is rejected. |
+| `proposed_action` | yes | Closed enum — what a **human** might do. |
+
+`kind` values:
+
+| `kind` | Asserts |
+|---|---|
+| `complete_but_open` | Every child / criterion is done, yet the item is still open. |
+| `closed_with_open_children` | The item is closed while children are still live. |
+| `body_predates_scope` | The body describes work that already landed or no longer matches the remaining scope. |
+| `aged_out` | The item no longer fits the charter's phase themes. |
+
+`proposed_action` values: `close`, `reparent_children`, `rescope_body`, `icebox`.
+
+**Apply routing.** The class maps to action class `scoping` (non-delegable) and
+the apply layer derives each entry with a **derivation-time `finding_only`
+skip** — rule 0 of the containment ladder, which fires ahead of the decision
+lookup. Approving a report therefore records one `grooming_mutation_applied` row
+per stale entry with `skip_reason: finding_only` and dispatches **nothing**, even
+when the operator recorded an explicit `approved` disposition on the entry
+(charter S2/S5: never close as a side effect of grooming). Acting on a finding is
+a separate human step.
+
+**Churn.** The #2240 baseline fingerprints a stale entry on its `kind` and
+`proposed_action` enums only — `evidence` (prose) and `rubric_citations` are
+excluded — and the class is charter-anchored, so a moved charter lifts a stale
+suppression. A re-worded `evidence` line does not resurface a decided finding;
+a changed `proposed_action` or a moved charter does. See
+`docs/spec/work-management-v0.md`.
 
 ## The hygiene fix is STRUCTURED, and the prose is never dispatched
 
@@ -169,7 +215,11 @@ Two consequences worth stating plainly:
 The entry is still **reported** exactly as before — nothing filters it — and the
 ingest audit payload's `entry_counts` gains a **`delegation_tier_proposals`**
 key (emitted only when non-zero) so the operator can see at the gate how many
-hygiene entries propose a tier and that none of them will land. Applying one
+hygiene entries propose a tier and that none of them will land. A report
+carrying `stale_items` likewise gains a **`stale_items`** count (emitted only
+when non-zero, so an ordinary report's payload is unchanged): every one of those
+settles `finding_only`, so it is the number of findings visible at the gate that
+approving will not act on. Applying one
 needs an explicit **per-entry** decision, which the per-entry disposition surface
 (#2843) will carry.
 
@@ -269,6 +319,7 @@ escaper is a no-op, so derived ids are unchanged.
 | `decomposition` | `decomposition:<item-key>` | — |
 | `hygiene` | `hygiene:<item-key>:<qualifier>` | the `defect` enum value |
 | `vision_drift` | `vision_drift:<item-key>:<qualifier>` | the `charter_ref_id` |
+| `stale` | `stale:<item-key>:<qualifier>` | the `kind` enum value (one entry per kind per item) |
 | `duplicate` | `duplicate:<key-a>+<key-b>` | — (keys sorted lexicographically) |
 | `dependency` | `dependency:<from-key>+<to-key>` | — (keys **not** sorted) |
 

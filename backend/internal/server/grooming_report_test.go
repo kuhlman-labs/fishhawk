@@ -2666,3 +2666,72 @@ func TestGroomingReportSchema_LabelsDescriptionStatesTheTierCarveOut(t *testing.
 		}
 	}
 }
+
+// staleCensusReport is a minimal valid report plus n stale findings.
+func staleCensusReport(n int) *plan.GroomingReport {
+	gr := churnReport([]int{1}, []float64{0.9}, "")
+	for i := 0; i < n; i++ {
+		ref := churnItem(strconv.Itoa(200 + i))
+		gr.StaleItems = append(gr.StaleItems, plan.StaleItem{
+			ID:      plan.GroomingEntryID(plan.GroomingClassStale, "complete_but_open", ref),
+			ItemRef: ref, Kind: "complete_but_open", Evidence: "every child closed",
+			RubricCitations: []plan.RubricCitation{{RubricID: "S1"}},
+			ProposedAction:  "close",
+		})
+	}
+	return gr
+}
+
+// TestPostGroomingReport_StaleItemsCensus is the CROSS-BOUNDARY ingest test for
+// stale_items (E54.83 / #3534): the artifact is POSTed through the REAL signed
+// handler (201) and the count is read back off the persisted
+// grooming_report_recorded payload.
+func TestPostGroomingReport_StaleItemsCensus(t *testing.T) {
+	counts := ingestCensus(t, staleCensusReport(2))
+	if got := counts["stale_items"]; got != 2 {
+		t.Errorf("entry_counts[stale_items] = %d, want 2: %v", got, counts)
+	}
+}
+
+// TestGroomingEntryCounts_StaleItemsEmittedOnlyWhenNonZero is the DONE-MEANS
+// test for the census key, on the RECORDED payload: present with the right
+// value when the report carries stale findings, and ABSENT — not zero-valued —
+// when it does not, so an ordinary report's payload stays byte-identical.
+func TestGroomingEntryCounts_StaleItemsEmittedOnlyWhenNonZero(t *testing.T) {
+	t.Run("present with value", func(t *testing.T) {
+		if got := ingestCensus(t, staleCensusReport(1))["stale_items"]; got != 1 {
+			t.Errorf("entry_counts[stale_items] = %d, want 1", got)
+		}
+	})
+	t.Run("absent when zero", func(t *testing.T) {
+		counts := ingestCensus(t, staleCensusReport(0))
+		if v, present := counts["stale_items"]; present {
+			t.Errorf("entry_counts carries stale_items = %d for a report with no stale finding; the key must be absent", v)
+		}
+	})
+}
+
+// TestPostGroomingReport_StaleMintedIDRejected: a stale entry whose id does not
+// recompose is refused at ingest with 400 grooming_report_invalid and nothing
+// persisted.
+func TestPostGroomingReport_StaleMintedIDRejected(t *testing.T) {
+	gr := staleCensusReport(1)
+	gr.StaleItems[0].ID = "stale:github/acme/minted-8f14e45f:complete_but_open"
+	body, err := json.Marshal(gr)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, ar, au, _ := newGroomingServer(t, runID, stageID, run.StageTypePlan)
+	priv, _ := sf.issue(t, runID)
+	w := shipPlanRequest(t, s, runID, stageID, priv, body, "")
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+	}
+	if !bytes.Contains(w.Body.Bytes(), []byte("grooming_report_invalid")) || !bytes.Contains(w.Body.Bytes(), []byte("stale_items")) {
+		t.Errorf("body = %s, want grooming_report_invalid naming stale_items", w.Body.String())
+	}
+	if len(ar.all) != 0 || len(groomingAuditEntries(au)) != 0 {
+		t.Errorf("artifacts=%d recorded=%d, want 0/0 for an invalid report", len(ar.all), len(groomingAuditEntries(au)))
+	}
+}

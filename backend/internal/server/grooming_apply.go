@@ -350,6 +350,12 @@ func groomingReportEntryClasses(report *plan.GroomingReport) map[string]string {
 	for _, e := range report.VisionDrift {
 		out[e.ID] = plan.GroomingClassVisionDrift
 	}
+	// Stale findings (#3534) map to the scoping action class, so the base
+	// layer synthesizes no decision for them; the class settles finding_only
+	// at apply regardless of any overlaid disposition.
+	for _, e := range report.StaleItems {
+		out[e.ID] = plan.GroomingClassStale
+	}
 	return out
 }
 

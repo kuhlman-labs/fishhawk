@@ -26,7 +26,9 @@ const KindGroomingReport = "grooming_report"
 const GroomingReportVersion = "grooming_report_v1"
 
 // Entry classes. Each is the leading segment of a derived entry id and
-// names exactly one of the report's six typed arrays.
+// names exactly one of the report's typed arrays (the six required ones plus
+// the optional stale_items; the milestone classes live in
+// groomingmilestone.go).
 const (
 	GroomingClassOrdering      = "ordering"
 	GroomingClassDuplicate     = "duplicate"
@@ -34,15 +36,22 @@ const (
 	GroomingClassDependency    = "dependency"
 	GroomingClassVisionDrift   = "vision_drift"
 	GroomingClassDecomposition = "decomposition"
+	// GroomingClassStale names the OPTIONAL stale_items array (E54.83 /
+	// #3534): a stale/closeable finding. Propose-only — the apply layer
+	// settles it finding_only whatever the operator decides.
+	GroomingClassStale = "stale"
 )
 
 // GroomingReport is a parsed and schema-validated grooming_report artifact:
 // the typed set of PROPOSALS a `plan`-typed propose stage emits when it
 // grooms a backlog slice. JSON tags mirror grooming-report-v1.schema.json.
 //
-// All six entry arrays are REQUIRED by the schema even when empty: an empty
-// array states "none found", which is a different claim from omitting the
-// key, and #2240's run-over-run diff must not conflate the two.
+// The six original entry arrays are REQUIRED by the schema even when empty: an
+// empty array states "none found", which is a different claim from omitting
+// the key, and #2240's run-over-run diff must not conflate the two. The
+// seventh, StaleItems, is OPTIONAL because it was added within the frozen
+// grooming_report_v1 major (#3534) — making it required would reject every
+// report valid before it existed.
 type GroomingReport struct {
 	Kind            string          `json:"kind"`
 	ReportVersion   string          `json:"report_version"`
@@ -65,6 +74,10 @@ type GroomingReport struct {
 	// report. Its typed domain and the eight semantic rules the schema cannot
 	// express live in groomingmilestone.go.
 	MilestoneScope *MilestoneScope `json:"milestone_scope,omitempty"`
+	// StaleItems carries stale/closeable findings (E54.83 / #3534).
+	// Additive-optional: omitempty so a report without the section
+	// round-trips without a stale_items key.
+	StaleItems []StaleItem `json:"stale_items,omitempty"`
 }
 
 // GroomingCharterRef identifies the charter revision a report was scored
@@ -189,6 +202,23 @@ type DecompositionSuggestion struct {
 	ProposedChildren []DecompositionChild `json:"proposed_children"`
 }
 
+// StaleItem is one stale/closeable finding (charter S1/S5): a complete-but-open
+// epic, an epic closed with live children, a body that predates the item's
+// remaining scope, or an aged-out item. Kind doubles as the entry id's
+// qualifier (mirroring HygieneDefect.Defect), so one item may carry one entry
+// per distinct kind without an id collision.
+//
+// A FINDING, never a mutation: ProposedAction names what a HUMAN might do, and
+// approving the report performs none of it.
+type StaleItem struct {
+	ID              string           `json:"id"`
+	ItemRef         ItemRef          `json:"item_ref"`
+	Kind            string           `json:"kind"`
+	Evidence        string           `json:"evidence"`
+	RubricCitations []RubricCitation `json:"rubric_citations"`
+	ProposedAction  string           `json:"proposed_action"`
+}
+
 // DecompositionChild is one proposed child of a decomposition suggestion.
 type DecompositionChild struct {
 	Title     string `json:"title"`
@@ -255,7 +285,8 @@ func itemKey(ref ItemRef) string {
 // Forms:
 //
 //	ordering / decomposition   → "<class>:<item-key>"
-//	hygiene / vision_drift     → "<class>:<item-key>:<qualifier>"
+//	hygiene / vision_drift /
+//	stale                      → "<class>:<item-key>:<qualifier>"
 //	duplicate                  → "<class>:<key-a>+<key-b>"   (keys SORTED)
 //	dependency                 → "<class>:<from-key>+<to-key>" (keys NOT sorted)
 //	milestone_declined         → "<class>:<qualifier>"       (ZERO-REF form, #2309)
@@ -437,13 +468,14 @@ func groomingSemanticCheck(gr *GroomingReport) error {
 	return checkMilestoneScope(gr)
 }
 
-// collectGroomingEntries flattens the six typed arrays into the class-agnostic
+// collectGroomingEntries flattens the typed arrays into the class-agnostic
 // view, deriving each entry's contractual id through the single owner
 // (GroomingEntryID) so the check can never drift from the derivation.
 func collectGroomingEntries(gr *GroomingReport) []groomingEntry {
 	out := make([]groomingEntry, 0,
 		len(gr.Ordering)+len(gr.Duplicates)+len(gr.HygieneDefects)+
-			len(gr.DependencyEdges)+len(gr.VisionDrift)+len(gr.DecompositionSuggestions))
+			len(gr.DependencyEdges)+len(gr.VisionDrift)+len(gr.DecompositionSuggestions)+
+			len(gr.StaleItems))
 
 	for i, e := range gr.Ordering {
 		out = append(out, groomingEntry{
@@ -496,6 +528,16 @@ func collectGroomingEntries(gr *GroomingReport) []groomingEntry {
 			class:      GroomingClassDecomposition,
 			derivedID:  GroomingEntryID(GroomingClassDecomposition, "", e.ItemRef),
 			field:      fmt.Sprintf("/decomposition_suggestions/%d/id", i),
+		})
+	}
+	// Stale findings (#3534) inherit the report-wide id rules through this one
+	// loop: kind is the qualifier, exactly as defect is for hygiene.
+	for i, e := range gr.StaleItems {
+		out = append(out, groomingEntry{
+			declaredID: e.ID,
+			class:      GroomingClassStale,
+			derivedID:  GroomingEntryID(GroomingClassStale, e.Kind, e.ItemRef),
+			field:      fmt.Sprintf("/stale_items/%d/id", i),
 		})
 	}
 	// Milestone entries (#2309) inherit the report-wide id rules unchanged:
@@ -596,7 +638,7 @@ func formatRanks(ordering []OrderingEntry) string {
 
 // GroomingEntryIDs returns every entry id the report DECLARES, in report
 // order (ordering, duplicates, hygiene, dependency, vision drift,
-// decomposition, then the three milestone-scope classes).
+// decomposition, stale, then the three milestone-scope classes).
 //
 // It is a thin export over collectGroomingEntries — the SAME collector
 // groomingSemanticCheck walks — so the id set a capture surface validates

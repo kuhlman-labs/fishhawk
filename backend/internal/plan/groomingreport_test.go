@@ -126,10 +126,12 @@ func TestValidateGroomingReport_Example(t *testing.T) {
 		"dependency_edges":          len(gr.DependencyEdges),
 		"vision_drift":              len(gr.VisionDrift),
 		"decomposition_suggestions": len(gr.DecompositionSuggestions),
+		"stale_items":               len(gr.StaleItems),
 	}
 	want := map[string]int{
 		"ordering": 4, "duplicates": 1, "hygiene_defects": 1,
 		"dependency_edges": 1, "vision_drift": 1, "decomposition_suggestions": 1,
+		"stale_items": 1,
 	}
 	for k, w := range want {
 		if counts[k] != w {
@@ -767,7 +769,7 @@ func groomingDocWithHygiene(hygiene string) []byte {
 // export returns the ids the artifact actually carries.
 
 // allClassGroomingReport builds a report carrying at least one entry of EVERY
-// one of the nine classes: the six typed arrays plus the three milestone-scope
+// one of the ten classes: the six required arrays, stale_items, and the three milestone-scope
 // classes. It is marshalled and round-tripped through ParseGroomingReport, so
 // the fixture is schema- AND semantics-valid by the time the exports see it.
 func allClassGroomingReport(t *testing.T) *plan.GroomingReport {
@@ -817,6 +819,12 @@ func allClassGroomingReport(t *testing.T) *plan.GroomingReport {
 				{Title: "second surface", ScopeHint: "cli"},
 			},
 		}},
+		StaleItems: []plan.StaleItem{{
+			ID:      plan.GroomingEntryID(plan.GroomingClassStale, "complete_but_open", ref("acme/app#10")),
+			ItemRef: ref("acme/app#10"), Kind: "complete_but_open",
+			Evidence: "every child closed", ProposedAction: "close",
+			RubricCitations: []plan.RubricCitation{{RubricID: "S1"}},
+		}},
 		MilestoneScope: msScope(
 			[]plan.MilestoneInclusion{msInc("acme/app#1", 0, nil, nil)},
 			[]plan.MilestoneExclusion{msExc("acme/app#9")},
@@ -858,6 +866,9 @@ func declaredGroomingIDs(gr *plan.GroomingReport) []string {
 	for _, e := range gr.DecompositionSuggestions {
 		out = append(out, e.ID)
 	}
+	for _, e := range gr.StaleItems {
+		out = append(out, e.ID)
+	}
 	if gr.MilestoneScope != nil {
 		for _, e := range gr.MilestoneScope.Included {
 			out = append(out, e.ID)
@@ -875,8 +886,8 @@ func declaredGroomingIDs(gr *plan.GroomingReport) []string {
 func TestGroomingEntryIDs_EveryClassDeclaredID(t *testing.T) {
 	gr := allClassGroomingReport(t)
 	want := declaredGroomingIDs(gr)
-	if len(want) != 9 {
-		t.Fatalf("fixture declares %d ids, want 9 (one per class); the fixture is no longer all-class", len(want))
+	if len(want) != 10 {
+		t.Fatalf("fixture declares %d ids, want 10 (one per class); the fixture is no longer all-class", len(want))
 	}
 	got := plan.GroomingEntryIDs(gr)
 	if len(got) != len(want) {
@@ -901,6 +912,7 @@ func TestGroomingEntryClasses_EveryClassMapped(t *testing.T) {
 		gr.DependencyEdges[0].ID:              plan.GroomingClassDependency,
 		gr.VisionDrift[0].ID:                  plan.GroomingClassVisionDrift,
 		gr.DecompositionSuggestions[0].ID:     plan.GroomingClassDecomposition,
+		gr.StaleItems[0].ID:                   plan.GroomingClassStale,
 		gr.MilestoneScope.Included[0].ID:      plan.GroomingClassMilestoneInclusion,
 		gr.MilestoneScope.Excluded[0].ID:      plan.GroomingClassMilestoneExclusion,
 		gr.MilestoneScope.DeclinedCalls[0].ID: plan.GroomingClassMilestoneDeclined,
@@ -924,5 +936,150 @@ func TestGroomingEntryExports_NilReport(t *testing.T) {
 	}
 	if classes := plan.GroomingEntryClasses(nil); classes != nil {
 		t.Errorf("GroomingEntryClasses(nil) = %v, want nil", classes)
+	}
+}
+
+// --- stale_items (E54.83 / #3534) ---
+//
+// Fixtures are seeded BY CONSTRUCTION: a raw stale_items array literal spliced
+// into the otherwise-valid minimal envelope, so a rejection is attributable to
+// the section under test.
+
+const gr2051Ref = `{"type":"github_issue","id":"kuhlman-labs/fishhawk#2051","url":"https://github.com/kuhlman-labs/fishhawk/issues/2051"}`
+
+// staleEntryJSON renders one stale_items entry.
+func staleEntryJSON(id, ref, kind, action, citations string) string {
+	return `{"id":"` + id + `","item_ref":` + ref + `,"kind":"` + kind +
+		`","evidence":"all children closed","rubric_citations":` + citations +
+		`,"proposed_action":"` + action + `"}`
+}
+
+// groomingDocWithStale returns the minimal report plus a stale_items array.
+func groomingDocWithStale(stale string) []byte {
+	base := string(groomingMinimal())
+	i := strings.LastIndex(base, "}")
+	return []byte(base[:i] + `,
+  "stale_items": ` + stale + `
+}`)
+}
+
+// TestGroomingReport_StaleHappyPath: two stale entries on the SAME item with
+// DIFFERENT kinds are accepted — the kind qualifier keeps their ids distinct
+// exactly as defect does for hygiene (m7) — and decode into StaleItems.
+func TestGroomingReport_StaleHappyPath(t *testing.T) {
+	body := groomingDocWithStale(`[` +
+		staleEntryJSON("stale:github/kuhlman-labs/fishhawk#2051:complete_but_open", gr2051Ref, "complete_but_open", "close", `[{"rubric_id":"S1"}]`) + `,` +
+		staleEntryJSON("stale:github/kuhlman-labs/fishhawk#2051:body_predates_scope", gr2051Ref, "body_predates_scope", "rescope_body", `[{"rubric_id":"S5"}]`) +
+		`]`)
+	gr, err := plan.ParseGroomingReport(body)
+	if err != nil {
+		t.Fatalf("ParseGroomingReport(stale happy path): %v", err)
+	}
+	if len(gr.StaleItems) != 2 {
+		t.Fatalf("StaleItems = %d, want 2", len(gr.StaleItems))
+	}
+	if gr.StaleItems[1].Kind != "body_predates_scope" || gr.StaleItems[1].ProposedAction != "rescope_body" {
+		t.Errorf("StaleItems[1] = %+v, want kind body_predates_scope / action rescope_body", gr.StaleItems[1])
+	}
+	classes := plan.GroomingEntryClasses(gr)
+	if classes["stale:github/kuhlman-labs/fishhawk#2051:complete_but_open"] != plan.GroomingClassStale {
+		t.Errorf("GroomingEntryClasses does not map the stale entry to %q: %v", plan.GroomingClassStale, classes)
+	}
+}
+
+// TestGroomingReport_StaleIDMustRecompose (m1): a minted stale id that does
+// not recompose from item_ref + kind is a *SemanticError naming the field.
+func TestGroomingReport_StaleIDMustRecompose(t *testing.T) {
+	body := groomingDocWithStale(`[` +
+		staleEntryJSON("stale:github/kuhlman-labs/fishhawk#2051:run-42", gr2051Ref, "complete_but_open", "close", `[{"rubric_id":"S1"}]`) + `]`)
+	var se *plan.SemanticError
+	err := plan.ValidateGroomingReport(body)
+	if !errors.As(err, &se) {
+		t.Fatalf("ValidateGroomingReport: err = %v, want *SemanticError", err)
+	}
+	if !strings.Contains(se.Error(), "/stale_items/0/id") || !strings.Contains(se.Error(), "not derived") {
+		t.Errorf("SemanticError should name /stale_items/0/id as non-derived; got %v", se)
+	}
+}
+
+// TestGroomingReport_StaleWrongClassPrefix (m2): a vision_drift: id inside
+// stale_items is the routing error.
+func TestGroomingReport_StaleWrongClassPrefix(t *testing.T) {
+	body := groomingDocWithStale(`[` +
+		staleEntryJSON("vision_drift:github/kuhlman-labs/fishhawk#2051:complete_but_open", gr2051Ref, "complete_but_open", "close", `[{"rubric_id":"S1"}]`) + `]`)
+	var se *plan.SemanticError
+	err := plan.ValidateGroomingReport(body)
+	if !errors.As(err, &se) {
+		t.Fatalf("ValidateGroomingReport: err = %v, want *SemanticError", err)
+	}
+	if !strings.Contains(se.Error(), `class prefix "stale:"`) {
+		t.Errorf("SemanticError should be the routing error naming the stale: prefix; got %v", se)
+	}
+}
+
+// TestGroomingReport_StaleDuplicateID (m3 + m8): two stale entries on the same
+// item with the SAME kind derive one id — the uniqueness error, paired with
+// ITSELF so only the uniqueness rule can refuse it.
+func TestGroomingReport_StaleDuplicateID(t *testing.T) {
+	entry := staleEntryJSON("stale:github/kuhlman-labs/fishhawk#2051:aged_out", gr2051Ref, "aged_out", "icebox", `[{"rubric_id":"S5"}]`)
+	body := groomingDocWithStale(`[` + entry + `,` + entry + `]`)
+	var se *plan.SemanticError
+	err := plan.ValidateGroomingReport(body)
+	if !errors.As(err, &se) {
+		t.Fatalf("ValidateGroomingReport: err = %v, want *SemanticError", err)
+	}
+	if !strings.Contains(se.Error(), "duplicate entry id") || !strings.Contains(se.Error(), "/stale_items/1/id") {
+		t.Errorf("SemanticError should be the uniqueness error at /stale_items/1/id; got %v", se)
+	}
+}
+
+// TestGroomingReport_StaleSchemaRejections (m4, m5, m6): an out-of-enum kind,
+// an out-of-enum proposed_action, and an empty rubric_citations are each a
+// *SchemaError at the offending path.
+func TestGroomingReport_StaleSchemaRejections(t *testing.T) {
+	cases := []struct {
+		name, entry, path string
+	}{
+		{"kind outside enum",
+			staleEntryJSON("stale:github/kuhlman-labs/fishhawk#2051:abandoned", gr2051Ref, "abandoned", "close", `[{"rubric_id":"S1"}]`),
+			"/stale_items/0/kind"},
+		{"proposed_action outside enum",
+			staleEntryJSON("stale:github/kuhlman-labs/fishhawk#2051:aged_out", gr2051Ref, "aged_out", "delete", `[{"rubric_id":"S1"}]`),
+			"/stale_items/0/proposed_action"},
+		{"rubric_citations empty",
+			staleEntryJSON("stale:github/kuhlman-labs/fishhawk#2051:aged_out", gr2051Ref, "aged_out", "icebox", `[]`),
+			"/stale_items/0/rubric_citations"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var se *plan.SchemaError
+			err := plan.ValidateGroomingReport(groomingDocWithStale(`[` + tc.entry + `]`))
+			if !errors.As(err, &se) {
+				t.Fatalf("ValidateGroomingReport: err = %v, want *SchemaError", err)
+			}
+			if !schemaErrorMentions(se, tc.path) {
+				t.Errorf("SchemaError should name %s; got %v", tc.path, se)
+			}
+		})
+	}
+}
+
+// TestGroomingReport_StaleAbsentIsAdditive: a report WITHOUT stale_items
+// validates (the additive guarantee within the frozen major) and re-marshals
+// without a stale_items key, so an ordinary report round-trips unchanged.
+func TestGroomingReport_StaleAbsentIsAdditive(t *testing.T) {
+	gr, err := plan.ParseGroomingReport(groomingMinimal())
+	if err != nil {
+		t.Fatalf("ParseGroomingReport(minimal, no stale_items): %v", err)
+	}
+	if gr.StaleItems != nil {
+		t.Errorf("StaleItems = %v, want nil for a report that declares none", gr.StaleItems)
+	}
+	out, err := json.Marshal(gr)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(out), "stale_items") {
+		t.Errorf("re-marshalled report carries a stale_items key it never declared: %s", out)
 	}
 }

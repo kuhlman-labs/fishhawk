@@ -75,6 +75,17 @@ Before approving, check that hygiene entries carry the STRUCTURED member:
 
 The value alone. Prose in that field means the #2847 defect has returned.
 
+Stale/closeable findings — a complete-but-open epic, an epic closed with live children,
+a body that predates its remaining scope, an aged-out item — arrive in the OPTIONAL
+`stale_items` section (#3534), not buried in `summary`. Each entry carries a `kind`, an
+`evidence` line, at least one `rubric_citations` id and a `proposed_action`
+(`close` / `reparent_children` / `rescope_body` / `icebox`), under the derived id
+`stale:<item-key>:<kind>`; the `grooming_report_recorded` audit row's `entry_counts`
+carries a `stale_items` count when any are present. Approving the gate records each one
+as a `grooming_mutation_applied` row with `skip_reason: finding_only` and **closes
+nothing** — not even an entry you dispositioned `approved`. Acting on a stale finding is
+your own separate step.
+
 ## 4. Approving is a write
 
 `fishhawk_approve_plan` launches the hygiene mutations server-side. There is no separate

@@ -102,6 +102,18 @@ func gcDecomposition(n string, children int) plan.DecompositionSuggestion {
 	}
 }
 
+func gcStale(n, kind, action, evidence string) plan.StaleItem {
+	ref := gcItem(n)
+	return plan.StaleItem{
+		ID:              plan.GroomingEntryID(plan.GroomingClassStale, kind, ref),
+		ItemRef:         ref,
+		Kind:            kind,
+		Evidence:        evidence,
+		RubricCitations: []plan.RubricCitation{{RubricID: "S1"}},
+		ProposedAction:  action,
+	}
+}
+
 // gcReport assembles a report from the given entries, leaving every unnamed
 // class empty.
 func gcReport(charterHash string, mut func(*plan.GroomingReport)) *plan.GroomingReport {
@@ -1148,5 +1160,106 @@ func TestNewGroomingBaseline_FailedRecordsResurface(t *testing.T) {
 	}
 	if containsID(proposedIDs(res), landed.ID) {
 		t.Error("an APPLIED entry was proposed again")
+	}
+}
+
+// --- stale_items (E54.83 / #3534) -------------------------------------------
+
+// TestFilterGroomingChurn_StaleProposedWhenNew: a stale finding absent from the
+// baseline is never_proposed and is PROPOSED.
+func TestFilterGroomingChurn_StaleProposedWhenNew(t *testing.T) {
+	st := gcStale("1", "complete_but_open", "close", "all children closed")
+	report := gcReport("h", func(gr *plan.GroomingReport) { gr.StaleItems = []plan.StaleItem{st} })
+	res := FilterGroomingChurn(report, gcBaseline("h", nil), gcDefaultThresholds())
+	if !containsID(proposedIDs(res), st.ID) || len(res.Proposals.StaleItems) != 1 {
+		t.Fatalf("new stale finding not proposed: proposed=%v stale=%v", proposedIDs(res), res.Proposals.StaleItems)
+	}
+	if res.NoChangesProposed {
+		t.Error("NoChangesProposed = true with a stale proposal present")
+	}
+}
+
+// TestFilterGroomingChurn_StaleSuppressedWhenUnchanged is the done-means "a
+// decided stale finding does not resurface identically": an APPLIED baseline
+// record with an unchanged basis SUPPRESSES it — including under a RE-WORDED
+// evidence line, the residual the operator accepted (prose is not basis).
+func TestFilterGroomingChurn_StaleSuppressedWhenUnchanged(t *testing.T) {
+	prior := gcStale("1", "complete_but_open", "close", "all children closed")
+	base := gcBaseline("h", map[string]GroomingBaselineEntry{
+		prior.ID: {Class: plan.GroomingClassStale, Disposition: GroomingDispositionApplied, BasisHash: groomingStaleBasis(prior)},
+	})
+	for name, cur := range map[string]plan.StaleItem{
+		"identical":         prior,
+		"evidence reworded": gcStale("1", "complete_but_open", "close", "every sub-issue is done; epic still open"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			report := gcReport("h", func(gr *plan.GroomingReport) { gr.StaleItems = []plan.StaleItem{cur} })
+			res := FilterGroomingChurn(report, base, gcDefaultThresholds())
+			if containsID(proposedIDs(res), cur.ID) {
+				t.Fatalf("decided stale finding resurfaced: proposed=%v anomalies=%v", proposedIDs(res), res.Summary.Anomalies)
+			}
+			if got := suppressionReason(t, res, cur.ID); got != GroomingSuppressAlreadyApplied {
+				t.Errorf("suppression reason = %q, want %q", got, GroomingSuppressAlreadyApplied)
+			}
+		})
+	}
+}
+
+// TestFilterGroomingChurn_StaleResurfacesOnActionChange: a changed
+// proposed_action under the same id resurfaces, naming the field.
+func TestFilterGroomingChurn_StaleResurfacesOnActionChange(t *testing.T) {
+	prior := gcStale("1", "aged_out", "icebox", "no activity since 2026-03")
+	cur := gcStale("1", "aged_out", "close", "no activity since 2026-03")
+	base := gcBaseline("h", map[string]GroomingBaselineEntry{
+		prior.ID: {Class: plan.GroomingClassStale, Disposition: GroomingDispositionRejected, BasisHash: groomingStaleBasis(prior)},
+	})
+	report := gcReport("h", func(gr *plan.GroomingReport) { gr.StaleItems = []plan.StaleItem{cur} })
+	res := FilterGroomingChurn(report, base, gcDefaultThresholds())
+	rec, ok := resurfaceRecord(t, res, cur.ID)
+	if !ok || rec.Reason != GroomingResurfaceBasisChanged || rec.ChangedField != "proposed_action" {
+		t.Errorf("resurface = %+v (ok=%v), want basis_changed naming proposed_action", rec, ok)
+	}
+}
+
+// TestFilterGroomingChurn_StaleResurfacesOnCharterMove: stale is
+// CHARTER-ANCHORED, so a suppression computed under a moved charter lifts.
+func TestFilterGroomingChurn_StaleResurfacesOnCharterMove(t *testing.T) {
+	st := gcStale("1", "body_predates_scope", "rescope_body", "body lists merged work")
+	base := gcBaseline("charter-OLD", map[string]GroomingBaselineEntry{
+		st.ID: {Class: plan.GroomingClassStale, Disposition: GroomingDispositionRejected, BasisHash: groomingStaleBasis(st)},
+	})
+	report := gcReport("charter-NEW", func(gr *plan.GroomingReport) { gr.StaleItems = []plan.StaleItem{st} })
+	res := FilterGroomingChurn(report, base, gcDefaultThresholds())
+	rec, ok := resurfaceRecord(t, res, st.ID)
+	if !ok || rec.Reason != GroomingResurfaceCharterChanged {
+		t.Errorf("resurface = %+v (ok=%v), want reason %q", rec, ok, GroomingResurfaceCharterChanged)
+	}
+}
+
+// TestGroomingProposalSet_NoStaleKeyWhenAbsent: a proposal set carrying no
+// stale finding marshals WITHOUT a stale_items key, so AC6's six-array form is
+// byte-identical to before #3534.
+func TestGroomingProposalSet_NoStaleKeyWhenAbsent(t *testing.T) {
+	res := FilterGroomingChurn(gcReport("h", func(gr *plan.GroomingReport) {
+		gr.HygieneDefects = []plan.HygieneDefect{gcHygiene("1", "missing_estimate", "3")}
+	}), gcBaseline("h", nil), gcDefaultThresholds())
+	b, err := json.Marshal(res.Proposals)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(b), "stale_items") {
+		t.Errorf("proposal set without stale findings carries a stale_items key: %s", b)
+	}
+}
+
+// TestNewGroomingBaseline_RecordsStale: the baseline walk records a prior
+// stale finding under its class and structural basis.
+func TestNewGroomingBaseline_RecordsStale(t *testing.T) {
+	st := gcStale("1", "complete_but_open", "close", "x")
+	prior := gcReport("h", func(gr *plan.GroomingReport) { gr.StaleItems = []plan.StaleItem{st} })
+	b := NewGroomingBaseline(prior, []GroomingDecision{{EntryID: st.ID, Verdict: GroomingRejected}}, nil)
+	got, ok := b.Entries[st.ID]
+	if !ok || got.Class != plan.GroomingClassStale || got.BasisHash != groomingStaleBasis(st) {
+		t.Errorf("baseline entry = %+v (ok=%v), want class stale with the stale basis", got, ok)
 	}
 }
