@@ -538,10 +538,20 @@ func TestPathConfinement_EveryPathTakingVerb(t *testing.T) {
 // discoverSpec selects the file it actually READS. Here working_dir is a
 // perfectly ALLOWED root whose `.fishhawk/workflows.yaml` is a SYMLINK to a
 // spec outside every root. The call must be refused
-// path_outside_allowed_roots having read ZERO bytes — asserted by making the
-// escape target's contents a value that would be VISIBLE in the result if it
-// had been read (a spec whose version would be echoed back), and by a
-// chmod-000 read barrier proving no open() was attempted.
+// path_outside_allowed_roots having read ZERO bytes.
+//
+// Three assertions carry that, in increasing strength:
+//
+//   - the caller-visible contract: the refusal carries the named code, the
+//     output is zero (nothing echoed), and nothing was dialed or spawned;
+//   - a chmod-000 READ BARRIER on the escape target, installed AFTER the
+//     fixture has proven the symlink reads through: any open() this code
+//     attempts now fails EACCES and surfaces as a `read …: permission denied`
+//     error instead of the confinement refusal, so "refused before reading" is
+//     distinguished from "read, then refused" by the error IDENTITY rather
+//     than only inferred from the absence of output. The barrier is skipped
+//     where chmod cannot deny the running user (Windows, and root); the test
+//     then says so rather than claiming evidence it does not have.
 func TestPathConfinement_DiscoveredSpecSymlinkEscapeRefused(t *testing.T) {
 	root := t.TempDir()
 	outside := t.TempDir()
@@ -568,6 +578,25 @@ func TestPathConfinement_DiscoveredSpecSymlinkEscapeRefused(t *testing.T) {
 		t.Fatalf("fixture precondition: the symlink must be readable through, got %v", err)
 	}
 
+	// The READ BARRIER: with the escape target unreadable, any open() this code
+	// attempts fails loudly and cannot be mistaken for the confinement refusal.
+	// Installed only after the readability precondition above, and only when it
+	// is actually EFFECTIVE for the running user — root ignores mode bits, and
+	// Windows does not model them this way.
+	barrier := false
+	if runtime.GOOS != "windows" {
+		t.Cleanup(func() { _ = os.Chmod(target, 0o600) })
+		if err := os.Chmod(target, 0o000); err == nil {
+			if _, rerr := os.ReadFile(link); rerr != nil {
+				barrier = true
+			}
+		}
+	}
+	if !barrier {
+		t.Logf("read barrier not effective here (GOOS=%s, possibly running as root): "+
+			"this run pins only the indirect assertions (refusal identity, zero output, zero dials)", runtime.GOOS)
+	}
+
 	_, r, rec, calls := newConfinementFixture(t, root)
 
 	_, out, err := r.validateSpec(context.Background(), nil, ValidateSpecInput{WorkingDir: root})
@@ -576,6 +605,10 @@ func TestPathConfinement_DiscoveredSpecSymlinkEscapeRefused(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), pathOutsideAllowedRootsCode) {
 		t.Errorf("error should carry %q; got %v", pathOutsideAllowedRootsCode, err)
+	}
+	if barrier && strings.Contains(err.Error(), "permission denied") {
+		t.Errorf("the escape target was OPENED: the error is a read failure against the chmod-000 barrier, "+
+			"not the confinement refusal; got %v", err)
 	}
 	// ZERO bytes read: the refusal names the discovered path but echoes no
 	// content, and the verb returned no verdict about the escape target.
@@ -602,6 +635,9 @@ func TestPathConfinement_DiscoveredSpecSymlinkEscapeRefused(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), pathOutsideAllowedRootsCode) {
 		t.Errorf("start_run error should carry %q; got %v", pathOutsideAllowedRootsCode, err)
+	}
+	if barrier && strings.Contains(err.Error(), "permission denied") {
+		t.Errorf("start_run OPENED the escape target: the error is a read failure against the chmod-000 barrier; got %v", err)
 	}
 	for _, d := range rec2.recorded() {
 		if strings.HasPrefix(d, "POST /v0/runs") {
@@ -829,4 +865,223 @@ func TestDiscoverSpecConfined_MatchesUnconfinedWalkOnStdio(t *testing.T) {
 			t.Errorf("confined walk: got %v, %v; want nil, nil (the .git boundary)", got, gerr)
 		}
 	})
+}
+
+// swapSpecOnce installs the TEST-ONLY specOpenRaceHook so that the FIRST time
+// the discovery walk is about to open `candidate`, `swap` runs — deterministically
+// occupying the TOCTOU window between the pre-open confinement check and the
+// open. Without this seam the window could only be hit probabilistically, and a
+// probabilistic counterfactual is not evidence.
+func swapSpecOnce(t *testing.T, candidate string, swap func()) *bool {
+	t.Helper()
+	var once sync.Once
+	fired := false
+	specOpenRaceHook = func(c string) {
+		if c != candidate {
+			return
+		}
+		once.Do(func() {
+			fired = true
+			swap()
+		})
+	}
+	t.Cleanup(func() { specOpenRaceHook = nil })
+	return &fired
+}
+
+// TestPathConfinement_DiscoveredSpecReplacedAfterCheck is the TOCTOU half of
+// binding approval condition 1, raised as a high-tier fix-up concern: confining
+// the PATHNAME is not sufficient, because the open re-traverses it. In a
+// supported writable checkout an agent can replace the validated leaf — or an
+// ancestor directory — with an out-of-root symlink between the check and the
+// open, and a pathname-only control would then hand the outside file's bytes to
+// validation diagnostics or to start_run's backend submission.
+//
+// Both rows start from a state the pre-open check ALLOWS (a real, in-root spec),
+// so the refusal cannot come from the stationary check already covered above:
+// it can only come from the post-open containment of the file actually opened.
+func TestPathConfinement_DiscoveredSpecReplacedAfterCheck(t *testing.T) {
+	// The escape target is a VALID spec, so a control that reads it would
+	// succeed rather than fail for an unrelated reason — the read would be
+	// invisible in an error-identity-only assertion.
+	outside := t.TempDir()
+	target := filepath.Join(outside, "secret-workflows.yaml")
+	if err := os.WriteFile(target, []byte(minimalWorkflowSpecYAML(t)), 0o600); err != nil {
+		t.Fatalf("write escape target: %v", err)
+	}
+
+	// newRoot builds an allowed root holding a REAL, readable, in-root spec
+	// whose contents are distinguishable from the escape target's, plus a .git
+	// dir so the walk is bounded at the root.
+	inRootBody := "# in-root spec, must be what a non-raced call returns\n" + minimalWorkflowSpecYAML(t)
+	newRoot := func(t *testing.T) (root, specPath string) {
+		t.Helper()
+		root = t.TempDir()
+		if err := os.MkdirAll(filepath.Join(root, ".fishhawk"), 0o700); err != nil {
+			t.Fatalf("mkdir .fishhawk: %v", err)
+		}
+		if err := os.MkdirAll(filepath.Join(root, ".git"), 0o700); err != nil {
+			t.Fatalf("mkdir .git: %v", err)
+		}
+		specPath = filepath.Join(root, specFileName)
+		if err := os.WriteFile(specPath, []byte(inRootBody), 0o600); err != nil {
+			t.Fatalf("write in-root spec: %v", err)
+		}
+		return root, specPath
+	}
+
+	assertRefused := func(t *testing.T, got *discoveredSpec, err error) {
+		t.Helper()
+		if err == nil {
+			t.Fatalf("a spec replaced between the confinement check and the open must be refused; got %+v", got)
+		}
+		if !strings.Contains(err.Error(), pathOutsideAllowedRootsCode) {
+			t.Errorf("error should carry %q; got %v", pathOutsideAllowedRootsCode, err)
+		}
+		if got != nil {
+			t.Fatalf("the refusal must return NO spec; got Path=%q len=%d", got.Path, len(got.Contents))
+		}
+	}
+
+	t.Run("leaf_replaced_with_outside_symlink", func(t *testing.T) {
+		root, specPath := newRoot(t)
+		fired := swapSpecOnce(t, specPath, func() {
+			if err := os.Remove(specPath); err != nil {
+				t.Errorf("race swap: remove: %v", err)
+				return
+			}
+			if err := os.Symlink(target, specPath); err != nil {
+				t.Errorf("race swap: symlink: %v", err)
+			}
+		})
+
+		r := &runResolver{httpTransport: true, allowedRoots: []string{root}}
+		got, err := r.discoverSpecConfined(root, "")
+		if !*fired {
+			t.Fatal("the race window never opened — the test proves nothing")
+		}
+		assertRefused(t, got, err)
+	})
+
+	t.Run("ancestor_dir_replaced_with_outside_symlink", func(t *testing.T) {
+		root, specPath := newRoot(t)
+		// The ESCAPE seen through an ancestor: `<root>/.fishhawk` becomes a
+		// symlink to a directory outside every root that holds a spec of its own.
+		outsideDir := filepath.Join(outside, "fishhawk-dir")
+		if err := os.MkdirAll(outsideDir, 0o700); err != nil {
+			t.Fatalf("mkdir outside dir: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(outsideDir, "workflows.yaml"), []byte(minimalWorkflowSpecYAML(t)), 0o600); err != nil {
+			t.Fatalf("write outside spec: %v", err)
+		}
+		fishhawkDir := filepath.Join(root, ".fishhawk")
+		fired := swapSpecOnce(t, specPath, func() {
+			if err := os.RemoveAll(fishhawkDir); err != nil {
+				t.Errorf("race swap: remove dir: %v", err)
+				return
+			}
+			if err := os.Symlink(outsideDir, fishhawkDir); err != nil {
+				t.Errorf("race swap: symlink dir: %v", err)
+			}
+		})
+
+		r := &runResolver{httpTransport: true, allowedRoots: []string{root}}
+		got, err := r.discoverSpecConfined(root, "")
+		if !*fired {
+			t.Fatal("the race window never opened — the test proves nothing")
+		}
+		assertRefused(t, got, err)
+	})
+
+	t.Run("unraced_call_still_reads_the_in_root_spec", func(t *testing.T) {
+		// The self-paired ACCEPT: with the window occupied by a NO-OP swap, the
+		// same code path must still return the in-root spec. Without this row
+		// the two refusals above would also be satisfied by a control that
+		// refuses every discovered spec.
+		root, specPath := newRoot(t)
+		fired := swapSpecOnce(t, specPath, func() {})
+
+		r := &runResolver{httpTransport: true, allowedRoots: []string{root}}
+		got, err := r.discoverSpecConfined(root, "")
+		if err != nil {
+			t.Fatalf("an unreplaced in-root spec must still be read; got %v", err)
+		}
+		if !*fired {
+			t.Fatal("the hook never fired — the accept row is not exercising the same path")
+		}
+		if got == nil || string(got.Contents) != inRootBody {
+			t.Fatalf("expected the in-root spec contents; got %+v", got)
+		}
+	})
+}
+
+// TestPathConfinement_DiscoveredSpecRaceInvariantUnderConcurrentSwap is the
+// unseamed companion to the deterministic rows above: a real goroutine flips the
+// discovered spec between an in-root file and an out-of-root symlink while the
+// walk runs. It asserts the INVARIANT rather than a particular outcome — every
+// call returns the in-root spec, no spec, or a refusal, and NEVER the escape
+// target's bytes — so it cannot flake: the outcome distribution may vary, the
+// invariant may not.
+func TestPathConfinement_DiscoveredSpecRaceInvariantUnderConcurrentSwap(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+
+	const escapeMarker = "ESCAPE-TARGET-CONTENTS-MUST-NEVER-BE-RETURNED"
+	target := filepath.Join(outside, "secret-workflows.yaml")
+	if err := os.WriteFile(target, []byte("# "+escapeMarker+"\n"+minimalWorkflowSpecYAML(t)), 0o600); err != nil {
+		t.Fatalf("write escape target: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, ".fishhawk"), 0o700); err != nil {
+		t.Fatalf("mkdir .fishhawk: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, ".git"), 0o700); err != nil {
+		t.Fatalf("mkdir .git: %v", err)
+	}
+	specPath := filepath.Join(root, specFileName)
+	inRoot := "# in-root\n" + minimalWorkflowSpecYAML(t)
+	if err := os.WriteFile(specPath, []byte(inRoot), 0o600); err != nil {
+		t.Fatalf("write in-root spec: %v", err)
+	}
+	if err := os.Symlink(target, filepath.Join(root, ".fishhawk", "escape.yaml")); err != nil {
+		t.Skipf("symlink unsupported here: %v", err)
+	}
+	staged := filepath.Join(root, ".fishhawk", "escape.yaml")
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			// Flip the discovered pathname between the real in-root file and a
+			// symlink out of the roots, using rename so each state is durable.
+			_ = os.Remove(specPath)
+			_ = os.Symlink(staged, specPath)
+			_ = os.Remove(specPath)
+			_ = os.WriteFile(specPath, []byte(inRoot), 0o600)
+		}
+	}()
+	t.Cleanup(func() { close(stop); wg.Wait() })
+
+	r := &runResolver{httpTransport: true, allowedRoots: []string{root}}
+	for i := 0; i < 400; i++ {
+		got, err := r.discoverSpecConfined(root, "")
+		if err != nil {
+			// ANY error is acceptable here — a confinement refusal, or a
+			// transient I/O failure against a pathname the flipper is
+			// mid-replacement on. What may never happen is a SUCCESS carrying
+			// the escape target's bytes, which is the invariant below. Asserting
+			// a particular error shape would make this row flaky without
+			// strengthening it.
+			continue
+		}
+		if got != nil && strings.Contains(string(got.Contents), escapeMarker) {
+			t.Fatalf("iteration %d: the walk returned the ESCAPE TARGET's bytes under a concurrent path swap", i)
+		}
+	}
 }
