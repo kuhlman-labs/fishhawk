@@ -49,6 +49,66 @@ const defaultVerifyTimeout = 5 * time.Minute
 // unbounded.
 const verifyCleanupTimeout = 30 * time.Second
 
+// verifyProvisionHeadroom is the fixed allowance added to the per-command cap
+// to produce the throwaway worktree's PROVISIONING budget.
+//
+// The budget is derived from the operator's own cap (--verify-timeout min'd
+// against the spec's executor.verify.timeout) because that number is where the
+// operator already expressed their patience for this rung — deriving from it
+// means the one knob they reached for also raises provisioning, with no second
+// flag to discover. It is ADDITIVE headroom rather than a share of the cap
+// because provisioning is a fixed-cost checkout that is not part of the
+// command's own budget: taking a slice out of the cap would let a slow checkout
+// silently shorten the command's run and misreport a healthy command as a
+// timeout fail (#2505).
+const verifyProvisionHeadroom = 30 * time.Second
+
+// verifyProvisionTimeout returns the provisioning budget for one candidate,
+// given the effective per-command cap that candidate's child will run under.
+// effective is expected to be positive — checkVerifyCommand normalises a
+// non-positive --verify-timeout to defaultVerifyTimeout before the loop, so the
+// derivation never sees one.
+//
+// It is a package var in the doctorLookPath / doctorRunOutput seam style purely
+// so the deadline-fires test can shrink the budget to milliseconds: the headroom
+// is a fixed 30s ADDED to the cap, so no --verify-timeout value makes the real
+// budget expire inside a test's wall clock. The derivation itself is pinned
+// unstubbed by TestVerifyProvisionTimeout_DerivedFromEffectiveCap.
+var verifyProvisionTimeout = func(effective time.Duration) time.Duration {
+	return effective + verifyProvisionHeadroom
+}
+
+// effectiveVerifyTimeout resolves the per-command cap for one candidate: the
+// doctor-side cap (maxTimeout), except that the spec's own
+// executor.verify.timeout wins when it is set AND shorter. Extracted so
+// checkVerifyCommand can size the PROVISIONING budget from the SAME number the
+// verify child will be capped at (#2505).
+func effectiveVerifyTimeout(maxTimeout, specTimeout time.Duration) time.Duration {
+	if specTimeout > 0 && specTimeout < maxTimeout {
+		return specTimeout
+	}
+	return maxTimeout
+}
+
+// doctorVerifyGitRun runs one of provisionDoctorWorktree's git invocations. It
+// is a package var in the established doctorLookPath / doctorRunOutput seam
+// style so a test can observe the CONTEXT each provisioning call receives —
+// which is what pins the bounded-provisioning property of #2505 without wedging
+// real git. combineOutput selects CombinedOutput (the `worktree add` case,
+// whose stderr is part of the error message) over Output.
+//
+// The cleanup closure is deliberately NOT routed through this seam: cleanup is
+// already bounded by verifyCleanupTimeout, must survive the caller's
+// cancellation, and routing it here would make every fake observe cleanup
+// traffic it has no reason to see.
+var doctorVerifyGitRun = func(ctx context.Context, dir string, combineOutput bool, args ...string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...) //nolint:gosec
+	if combineOutput {
+		return cmd.CombinedOutput()
+	}
+	return cmd.Output()
+}
+
 // verifySpecState enumerates why collectVerifyCommands produced no
 // runnable command. Each value maps to exactly one warn branch in
 // checkVerifyCommand's outcome table.
@@ -201,8 +261,8 @@ func provisionDoctorWorktree(ctx context.Context, workingDir string) (string, fu
 		dir = "."
 	}
 
-	out, err := exec.CommandContext(ctx, "git", "-C", dir,
-		"rev-parse", "--path-format=absolute", "--git-common-dir").Output() //nolint:gosec
+	out, err := doctorVerifyGitRun(ctx, dir, false,
+		"rev-parse", "--path-format=absolute", "--git-common-dir")
 	if err != nil {
 		return "", nil, fmt.Errorf("git rev-parse --git-common-dir: %w", err)
 	}
@@ -213,7 +273,7 @@ func provisionDoctorWorktree(ctx context.Context, workingDir string) (string, fu
 
 	// Pin HEAD ONCE: the same immutable commit is handed to `worktree add`
 	// rather than re-resolving the mutable symbolic HEAD.
-	headOut, err := exec.CommandContext(ctx, "git", "-C", dir, "rev-parse", "HEAD").Output() //nolint:gosec
+	headOut, err := doctorVerifyGitRun(ctx, dir, false, "rev-parse", "HEAD")
 	if err != nil {
 		return "", nil, fmt.Errorf("git rev-parse HEAD: %w", err)
 	}
@@ -240,8 +300,8 @@ func provisionDoctorWorktree(ctx context.Context, workingDir string) (string, fu
 	gitCleanup("worktree", "remove", "--force", target)
 	gitCleanup("worktree", "prune")
 
-	if addOut, addErr := exec.CommandContext(ctx, "git", "-C", dir,
-		"worktree", "add", "--detach", target, headSHA).CombinedOutput(); addErr != nil { //nolint:gosec
+	if addOut, addErr := doctorVerifyGitRun(ctx, dir, true,
+		"worktree", "add", "--detach", target, headSHA); addErr != nil {
 		gitCleanup("worktree", "prune")
 		return "", nil, fmt.Errorf("git worktree add: %v: %s", addErr, strings.TrimSpace(string(addOut)))
 	}
@@ -714,8 +774,6 @@ func checkVerifyCommand(workingDir string, skip bool, maxTimeout time.Duration) 
 		maxTimeout = defaultVerifyTimeout
 	}
 
-	ctx := context.Background()
-
 	for _, c := range candidates {
 		// Provision a FRESH worktree PER COMMAND, not once for the whole
 		// loop (#2485 implement review, high/correctness). Sharing one
@@ -726,14 +784,38 @@ func checkVerifyCommand(workingDir string, skip bool, maxTimeout time.Duration) 
 		// failures. Per-command provisioning is also the faithful model:
 		// the runner gives each STAGE its own worktree, and these
 		// candidates are collected across stages.
-		worktree, cleanup, err := provisionDoctorWorktree(ctx, workingDir)
+		//
+		// Provisioning and the verify child get SEPARATE contexts, and the
+		// provisioning one is cancelled the instant provisioning returns
+		// (#2505). Sharing one context would let the provisioning deadline
+		// reach the child and kill a healthy command mid-run, misreporting it
+		// as a timeout fail — the thing the additive headroom exists to avoid.
+		// Each candidate gets a FRESH provisioning budget for the same reason
+		// it already gets a fresh worktree: a slow first checkout must not
+		// shrink the second candidate's budget.
+		effective := effectiveVerifyTimeout(maxTimeout, c.timeout)
+		provBudget := verifyProvisionTimeout(effective)
+		provCtx, provCancel := context.WithTimeout(context.Background(), provBudget)
+		worktree, cleanup, err := provisionDoctorWorktree(provCtx, workingDir)
+		provDeadlineFired := errors.Is(provCtx.Err(), context.DeadlineExceeded)
+		provCancel()
 		if err != nil {
+			remediate := "the verify command was not executed: " + err.Error()
+			if provDeadlineFired {
+				remediate = fmt.Sprintf("the verify command was not executed: provisioning the "+
+					"throwaway worktree (not the verify command itself) exceeded its %s budget: %v; "+
+					"that budget is the effective per-command cap (%s) plus %s of checkout headroom, "+
+					"so raise --verify-timeout to raise it",
+					provBudget, err, effective, verifyProvisionHeadroom)
+			}
 			return checkResult{label: label, detail: "clean worktree unavailable", status: "warn",
-				remediate: "the verify command was not executed: " + err.Error()}
+				remediate: remediate}
 		}
 		res, done := func() (checkResult, bool) {
 			defer cleanup()
-			return runVerifyCandidate(ctx, worktree, c, maxTimeout)
+			// A fresh background context: the child derives its OWN deadline
+			// from effective inside runVerifyCandidate.
+			return runVerifyCandidate(context.Background(), worktree, c, effective)
 		}()
 		if done {
 			return res
@@ -759,13 +841,13 @@ func checkVerifyCommand(workingDir string, skip bool, maxTimeout time.Duration) 
 // Split out of checkVerifyCommand so each candidate's worktree cleanup can run
 // via defer at the end of ITS OWN iteration rather than accumulating until the
 // enclosing function returns (#2485).
-func runVerifyCandidate(ctx context.Context, worktree string, c verifyCandidate, maxTimeout time.Duration) (checkResult, bool) {
+//
+// effective is the ALREADY-RESOLVED per-command cap (effectiveVerifyTimeout),
+// passed in rather than recomputed so checkVerifyCommand can size the
+// provisioning budget from the same number (#2505).
+func runVerifyCandidate(ctx context.Context, worktree string, c verifyCandidate, effective time.Duration) (checkResult, bool) {
 	const label = "verify command"
 
-	effective := maxTimeout
-	if c.timeout > 0 && c.timeout < effective {
-		effective = c.timeout
-	}
 	exitCode, output, timedOut := runVerifyInWorktree(ctx, worktree, c.command, effective)
 	if timedOut {
 		return checkResult{

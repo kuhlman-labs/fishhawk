@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -1131,4 +1132,311 @@ workflows:
 	if !strings.Contains(r.detail, "cat contaminant") {
 		t.Errorf("detail = %q, want it to name the SECOND command as the failing one", r.detail)
 	}
+}
+
+// --- bounded worktree provisioning (E48.73 / #2505) --------------------------
+
+// withFakeDoctorVerifyGitRun stubs doctorVerifyGitRun for the duration of the
+// test, mirroring withFakeDoctorRunOutput's save/restore shape. The original is
+// handed to fn so a fake can capture the context and still delegate to real git.
+func withFakeDoctorVerifyGitRun(t *testing.T,
+	fn func(orig func(context.Context, string, bool, ...string) ([]byte, error),
+		ctx context.Context, dir string, combineOutput bool, args ...string) ([]byte, error),
+) {
+	t.Helper()
+	orig := doctorVerifyGitRun
+	doctorVerifyGitRun = func(ctx context.Context, dir string, combineOutput bool, args ...string) ([]byte, error) {
+		return fn(orig, ctx, dir, combineOutput, args...)
+	}
+	t.Cleanup(func() { doctorVerifyGitRun = orig })
+}
+
+// capturedProvisionCall is one observed provisioning invocation.
+type capturedProvisionCall struct {
+	args        []string
+	deadline    time.Time
+	hasDeadline bool
+}
+
+// captureProvisionCalls installs a seam fake that records the context each
+// provisioning invocation receives and DELEGATES to real git, so the rung's
+// behaviour is unchanged and only the contexts are observed. The returned
+// accessor is mutex-free by construction: checkVerifyCommand provisions
+// sequentially on the calling goroutine, so no provisioning call overlaps
+// another.
+func captureProvisionCalls(t *testing.T) func() []capturedProvisionCall {
+	t.Helper()
+	var calls []capturedProvisionCall
+	withFakeDoctorVerifyGitRun(t, func(orig func(context.Context, string, bool, ...string) ([]byte, error),
+		ctx context.Context, dir string, combineOutput bool, args ...string) ([]byte, error) {
+		dl, ok := ctx.Deadline()
+		calls = append(calls, capturedProvisionCall{args: append([]string(nil), args...), deadline: dl, hasDeadline: ok})
+		return orig(ctx, dir, combineOutput, args...)
+	})
+	return func() []capturedProvisionCall { return calls }
+}
+
+// TestProvisionDoctorWorktree_ReceivesBoundedContext is the counterfactual
+// vehicle for the bounded-provisioning control (#2505): every git invocation
+// that stands up the throwaway worktree must run under a context carrying a
+// DEADLINE. Before this change checkVerifyCommand handed provisionDoctorWorktree
+// a plain context.Background(), so a `git worktree add` on a very large
+// repository, a cold cache, or a network filesystem could run for minutes while
+// the rung's own bounded-runtime criterion claimed it could not.
+//
+// The bad state is seeded BY CONSTRUCTION: the fake reads ctx.Deadline()
+// directly and a background context definitionally has none, so restoring
+// `context.Background()` at the call site lands the RED on this behavioural
+// assertion rather than on fixture setup.
+func TestProvisionDoctorWorktree_ReceivesBoundedContext(t *testing.T) {
+	repo := newVerifyRepo(t, specWithCommand("true", "15m"))
+	calls := captureProvisionCalls(t)
+
+	r := checkVerifyCommand(repo, false, verifyTestDeadline)
+	if r.status != "ok" {
+		t.Fatalf("status = %q, want ok (the seam delegates to real git); detail: %s; hint: %s",
+			r.status, r.detail, r.remediate)
+	}
+
+	got := calls()
+	if len(got) != 3 {
+		t.Fatalf("provisioning made %d git calls, want 3 (rev-parse --git-common-dir, rev-parse HEAD, "+
+			"worktree add); calls: %+v", len(got), got)
+	}
+	for i, c := range got {
+		if !c.hasDeadline {
+			t.Errorf("provisioning call %d (%v) ran with NO deadline — worktree provisioning is unbounded",
+				i, c.args)
+		}
+	}
+}
+
+// TestVerifyProvisionTimeout_DerivedFromEffectiveCap pins the derivation: the
+// provisioning budget is the EFFECTIVE per-command cap (--verify-timeout min'd
+// against the spec's executor.verify.timeout) plus the fixed
+// verifyProvisionHeadroom. It drives the REAL (unstubbed) verifyProvisionTimeout
+// and asserts on the observed deadline as a bounded WINDOW rather than an exact
+// instant, so a loaded host cannot flake it.
+func TestVerifyProvisionTimeout_DerivedFromEffectiveCap(t *testing.T) {
+	// slack bounds how long the rung may take to reach the first provisioning
+	// call after the test reads the clock. bound/slack sizing follows the file's
+	// existing discipline: the work in between is a spec read plus one
+	// context.WithTimeout, sub-millisecond even under 5x load, so 10s is three
+	// orders of magnitude of headroom and cannot be reached by slowness.
+	const slack = 10 * time.Second
+
+	cases := []struct {
+		name        string
+		maxTimeout  time.Duration
+		specTimeout string
+		wantBase    time.Duration
+	}{
+		{"cap wins over a longer spec value", verifyTestLooseCap, "15m", verifyTestLooseCap},
+		{"shorter spec value wins over the cap", verifyTestLooseCap, verifyTestDeadline.String(), verifyTestDeadline},
+		{"non-positive cap falls back to the default", 0, "15m", defaultVerifyTimeout},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := newVerifyRepo(t, specWithCommand("true", tc.specTimeout))
+			calls := captureProvisionCalls(t)
+
+			start := time.Now()
+			r := checkVerifyCommand(repo, false, tc.maxTimeout)
+			if r.status != "ok" {
+				t.Fatalf("status = %q, want ok; detail: %s; hint: %s", r.status, r.detail, r.remediate)
+			}
+			got := calls()
+			if len(got) == 0 || !got[0].hasDeadline {
+				t.Fatalf("first provisioning call carried no deadline: %+v", got)
+			}
+
+			// The deadline instant is computed AFTER the test read the clock,
+			// so the observed span is want + (however long the spec read took)
+			// — never less than want.
+			want := tc.wantBase + verifyProvisionHeadroom
+			budget := got[0].deadline.Sub(start)
+			if budget < want || budget > want+slack {
+				t.Errorf("provisioning budget = %s, want within [%s, %s] "+
+					"(effective cap %s + %s headroom)",
+					budget, want, want+slack, tc.wantBase, verifyProvisionHeadroom)
+			}
+		})
+	}
+}
+
+// TestCheckVerifyCommand_ProvisioningDeadlineWarns pins the new fail-closed
+// branch: a provisioning step that never returns is cut off by the budget and
+// reported as the documented `warn` / `clean worktree unavailable` with a
+// remediation naming the budget and the flag that raises it — and the rung
+// RETURNS rather than hanging.
+//
+// verifyProvisionTimeout is stubbed down to a millisecond budget because the
+// real headroom is a fixed 30s ADDED to the cap, so no --verify-timeout value
+// makes the real budget expire inside a test's wall clock. The production branch
+// under test (provCtx.Err() == DeadlineExceeded) is exercised for real; the
+// derivation itself is pinned by TestVerifyProvisionTimeout_DerivedFromEffectiveCap.
+func TestCheckVerifyCommand_ProvisioningDeadlineWarns(t *testing.T) {
+	repo := newVerifyRepo(t, specWithCommand("true", "15m"))
+
+	const stubBudget = 50 * time.Millisecond
+	origBudget := verifyProvisionTimeout
+	verifyProvisionTimeout = func(time.Duration) time.Duration { return stubBudget }
+	t.Cleanup(func() { verifyProvisionTimeout = origBudget })
+
+	withFakeDoctorVerifyGitRun(t, func(_ func(context.Context, string, bool, ...string) ([]byte, error),
+		ctx context.Context, _ string, _ bool, _ ...string) ([]byte, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	})
+
+	start := time.Now()
+	r := checkVerifyCommand(repo, false, verifyTestDeadline)
+	elapsed := time.Since(start)
+
+	if elapsed > verifyTestBound {
+		t.Errorf("took %s, want under %s — the provisioning budget did not cut the wedged call off",
+			elapsed, verifyTestBound)
+	}
+	if r.status != "warn" || r.detail != "clean worktree unavailable" {
+		t.Fatalf("status = %q detail = %q, want warn / \"clean worktree unavailable\"; hint: %s",
+			r.status, r.detail, r.remediate)
+	}
+	if !strings.Contains(r.remediate, stubBudget.String()) {
+		t.Errorf("remediate = %q, want it to name the exceeded budget %s", r.remediate, stubBudget)
+	}
+	if !strings.Contains(r.remediate, "--verify-timeout") {
+		t.Errorf("remediate = %q, want it to name --verify-timeout as the knob that raises the budget",
+			r.remediate)
+	}
+	if !strings.Contains(r.remediate, "throwaway worktree") {
+		t.Errorf("remediate = %q, want it to say the CHECKOUT ran long, not the verify command",
+			r.remediate)
+	}
+}
+
+// TestCheckVerifyCommand_OtherProvisioningErrorKeepsItsMessage pins the OTHER
+// side of that branch: a provisioning failure with no deadline involved keeps
+// today's verbatim message and gains none of the budget prose, so the new
+// remediation cannot swallow an unrelated git failure.
+func TestCheckVerifyCommand_OtherProvisioningErrorKeepsItsMessage(t *testing.T) {
+	repo := newVerifyRepo(t, specWithCommand("true", "15m"))
+	withFakeDoctorVerifyGitRun(t, func(_ func(context.Context, string, bool, ...string) ([]byte, error),
+		_ context.Context, _ string, _ bool, _ ...string) ([]byte, error) {
+		return nil, errors.New("synthetic git failure")
+	})
+
+	r := checkVerifyCommand(repo, false, verifyTestDeadline)
+	if r.status != "warn" || r.detail != "clean worktree unavailable" {
+		t.Fatalf("status = %q detail = %q, want warn / \"clean worktree unavailable\"", r.status, r.detail)
+	}
+	if !strings.Contains(r.remediate, "synthetic git failure") {
+		t.Errorf("remediate = %q, want the underlying git error verbatim", r.remediate)
+	}
+	if strings.Contains(r.remediate, "--verify-timeout") {
+		t.Errorf("remediate = %q, want NO provisioning-budget prose on a non-deadline failure",
+			r.remediate)
+	}
+}
+
+// TestCheckVerifyCommand_ChildDoesNotShareProvisioningContext pins the
+// separateness invariant: the provisioning context is cancelled the instant
+// provisioning returns, so it can never reach the verify child. A genuinely
+// passing command still reports ok WHILE the captured provisioning context is
+// already Done by the time the rung returns.
+//
+// Counterfactual: hand provCtx (rather than a fresh context.Background()) to
+// runVerifyCandidate and the cancelled context kills the passing command, so
+// the rung reports fail and this test goes RED.
+func TestCheckVerifyCommand_ChildDoesNotShareProvisioningContext(t *testing.T) {
+	repo := newVerifyRepo(t, specWithCommand("true", "15m"))
+
+	var provCtx context.Context
+	withFakeDoctorVerifyGitRun(t, func(orig func(context.Context, string, bool, ...string) ([]byte, error),
+		ctx context.Context, dir string, combineOutput bool, args ...string) ([]byte, error) {
+		provCtx = ctx
+		return orig(ctx, dir, combineOutput, args...)
+	})
+
+	r := checkVerifyCommand(repo, false, verifyTestDeadline)
+	if r.status != "ok" {
+		t.Fatalf("status = %q, want ok — the provisioning deadline reached the verify child; "+
+			"detail: %s; hint: %s", r.status, r.detail, r.remediate)
+	}
+	if provCtx == nil {
+		t.Fatal("no provisioning context captured")
+	}
+	select {
+	case <-provCtx.Done():
+	default:
+		t.Error("the provisioning context is still live after the rung returned — provCancel() is not " +
+			"called immediately after provisioning, so its deadline can reach the verify child")
+	}
+}
+
+// TestCheckVerifyCommand_EachCandidateGetsAFreshProvisioningBudget pins the
+// per-candidate budget: a slow first checkout must not shrink the second
+// candidate's budget, for the same reason each candidate already gets its own
+// worktree. Hoisting the context out of the loop leaves one draining budget, so
+// the two candidates' deadlines would be identical.
+func TestCheckVerifyCommand_EachCandidateGetsAFreshProvisioningBudget(t *testing.T) {
+	repo := newVerifyRepo(t, `version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+          verify:
+            command: "true"
+            timeout: "15m"
+      - id: second
+        type: implement
+        executor:
+          agent: claude-code
+          verify:
+            command: "true # second"
+            timeout: "15m"
+`)
+	calls := captureProvisionCalls(t)
+
+	r := checkVerifyCommand(repo, false, verifyTestDeadline)
+	if r.status != "ok" {
+		t.Fatalf("status = %q, want ok; detail: %s; hint: %s", r.status, r.detail, r.remediate)
+	}
+
+	got := calls()
+	if len(got) != 6 {
+		t.Fatalf("provisioning made %d git calls, want 6 (three per candidate); calls: %+v", len(got), got)
+	}
+	first, second := got[0], got[3]
+	if !first.hasDeadline || !second.hasDeadline {
+		t.Fatalf("a provisioning call carried no deadline: %+v / %+v", first, second)
+	}
+	if !second.deadline.After(first.deadline) {
+		t.Errorf("second candidate's provisioning deadline %s is not strictly after the first's %s — "+
+			"the two candidates share one draining budget", second.deadline, first.deadline)
+	}
+}
+
+// TestProvisionDoctorWorktree_ExpiredContextFails drives the REAL (un-faked)
+// seam with an already-cancelled context: the deadline must genuinely interrupt
+// the git child rather than merely mark it late, and the failure must leave no
+// registered worktree behind.
+func TestProvisionDoctorWorktree_ExpiredContextFails(t *testing.T) {
+	repo := newVerifyRepo(t, specWithCommand("true", "15m"))
+	worktree := doctorVerifyWorktreeFor(t, repo)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	target, cleanup, err := provisionDoctorWorktree(ctx, repo)
+	if cleanup != nil {
+		cleanup()
+	}
+	if err == nil {
+		t.Fatalf("provisionDoctorWorktree returned nil error under an expired context (target %q) — "+
+			"exec.CommandContext did not interrupt the git child", target)
+	}
+	assertWorktreeGone(t, repo, worktree)
 }
