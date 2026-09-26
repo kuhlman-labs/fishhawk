@@ -9,6 +9,14 @@ GitHub REST operations (read workflow spec, fire workflow_dispatch, PR surfaces)
 - It body-sniffs its own 422 for the duplicate marker and returns the typed `ErrPullRequestExists` BEFORE `classifyStatus` consumes the body (which maps all 422 → `ErrValidation`).
 - `ListOpenPullRequestsByHead(scope, repo, headBranch, base)` GETs `/pulls?head={owner}:{branch}&base&state=open` to recover the existing PR's `html_url` on that lost-race path (the 422 body carries no guaranteed PR number).
 
+## Branch delete — `DeleteRef` (E68.67 / #3562)
+
+`DeleteRef(scope, repo, branch)` sends `DELETE /repos/{o}/{r}/git/refs/heads/{branch}` and is the github half of `forge.RefDeleter` (promoted onto `forge/github.Forge`, compile-asserted there). Its consumer is the server's run-branch sweep.
+
+- **The branch is escaped with `escapePath`, NOT `url.PathEscape`.** A slice branch is `fishhawk/run-<short>/slice-<n>`; its slashes are ref-hierarchy separators GitHub must see, and `url.PathEscape` would send `fishhawk%2Frun-…` — a single literal segment that does not exist. Pinned by `TestDeleteRef_SlashedBranchPathPreserved`, which asserts the ESCAPED request path.
+- **Absent is nil.** GitHub answers a delete of a nonexistent reference with 422 `Reference does not exist` (not 404); both that 422 and a 404 return nil, so a re-sweep is an idempotent no-op (`TestDeleteRef_MissingReferenceIsBenign`). The 422 is body-sniffed BEFORE `classifyStatus` consumes the body (the `CreateRef` shape), so a 422 carrying any OTHER message stays `ErrValidation` and never masquerades as a deletion (`TestDeleteRef_OtherValidationErrorSurfaces`).
+- 401/403 → `ErrForbidden` (a protected ref or ruleset), other non-2xx → a status-bearing error. Argument guards (zero scope, missing `TokenProvider`, empty owner/name, empty branch) fire before any HTTP call (`TestDeleteRef_ArgumentGuards`). It does NOT opt into the transient-retry transport below, so a transient 5xx surfaces to the caller rather than being retried (the sweep records it on its audit row).
+
 ## Transient-retry transport (#2167 / E48.45)
 
 `New()` installs a bounded-retry `http.RoundTripper` (`retryTransport`) on the default `Client.HTTP` (30s Timeout unchanged), so an isolated GitHub 5xx / secondary-rate-limit / primary-rate-limit blip is absorbed in-process instead of failing the caller (the observed `gitops: open PR: 500` outage that re-ran the whole implement stage). The runner's `gitops.OpenPRClient` carries the same contract in its own explicit loop.
