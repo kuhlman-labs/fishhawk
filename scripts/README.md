@@ -879,26 +879,43 @@ image. `_verify_k8s_image_identity` returns 0 ONLY when BOTH checks
 match, 1 otherwise; there is no rc=2 warn-and-continue code (pinned
 by a body-grep):
 
-- PRIMARY — image ID: `docker image inspect <ref> --format '{{.Id}}'`
-  (the config digest, which survives `docker save` → `ctr images
-  import` unchanged) equals the NEWEST fishhawkd pod's
-  `containerStatuses[0].imageID` (`--sort-by=.metadata.creationTimestamp`,
-  `{.items[-1:]}`, so a still-Terminating pre-restart pod is never
-  sampled), resolved by `_k8s_resolve_running_image_id`: an `id:` form
-  compares directly; a `repo-digest:` form resolves via `docker image
-  inspect <repo>@<digest>` on `shared` or `ctr -n k8s.io content get`
-  through the retained debug pod on `isolated` (an OCI index costs
-  exactly one extra hop; no retained pod is a refusal, never a pass).
+- PRIMARY — CONFIG digest: the built image's config digest equals the
+  NEWEST fishhawkd pod's config digest
+  (`--sort-by=.metadata.creationTimestamp`, `{.items[-1:]}`, so a
+  still-Terminating pre-restart pod is never sampled). **NOT `docker
+  image inspect --format '{{.Id}}'`** — on a containerd image store that
+  prints the OCI INDEX digest, not a config digest, so comparing it
+  against the kubelet's config digest false-alarmed 'STALE image' on
+  every correctly-loaded fresh build
+  ([#3530](https://github.com/kuhlman-labs/fishhawk/issues/3530)). The
+  BUILT side is resolved by `_k8s_local_config_digest`, which reads the
+  `docker save` tarball's `manifest.json` `Config` entry (the config
+  blob named directly, on BOTH the containerd store and the classic
+  graph driver). The RUNNING side is resolved by
+  `_k8s_resolve_running_image_id`: an `id:` form (a kubelet bare imageID
+  already IS a config digest) tags directly; a `repo-digest:` form
+  resolves via `_k8s_local_config_digest <repo>@<digest>` on `shared`
+  (again NOT `docker image inspect <repo>@<digest>` — the same #3530
+  defect one hop over) or `ctr -n k8s.io content get` through the
+  retained debug pod on `isolated` (an OCI index costs exactly one extra
+  hop; no retained pod is a refusal, never a pass). Both resolvers emit
+  the SAME `config:sha256:<hex>` tagged token, so the gate compares like
+  with like and REFUSES a cross-kind comparison rather than misreporting
+  it as staleness; operator-facing text strips the tag and shows bare
+  `sha256:…` values.
 - SECONDARY — `/healthz` `git_sha` equals `build_sha`. Two dirty builds
-  at one commit share the same `-dirty` SHA and only the image ID tells
-  them apart — why the image ID is primary.
+  at one commit share the same `-dirty` SHA and only the config digest
+  tells them apart — why the config digest is primary.
 - Each fail-closed branch carries a DISTINCT reason literal (`identity:
   local image id unresolved` / `pod reports no imageID` / `running
-  image id unresolved` / `image id mismatch` / `build sha unknown` /
-  `/healthz unreachable` / `/healthz carries no git_sha` / `git_sha
-  mismatch`) plus the skip-knob pointer, so a test pins WHICH branch
-  fired and a deleted early return that falls through to a later
-  mismatch still reddens.
+  image id unresolved` / `digest kind mismatch` / `image id mismatch` /
+  `build sha unknown` / `/healthz unreachable` / `/healthz carries no
+  git_sha` / `git_sha mismatch`) plus the skip-knob pointer, so a test
+  pins WHICH branch fired and a deleted early return that falls through
+  to a later mismatch still reddens. The `image id mismatch` detail now
+  reports that identity COULD NOT BE VERIFIED — a stale image is ONE
+  hypothesis alongside a digest-kind/resolution problem — rather than
+  asserting staleness as established fact.
 
 Helper inventory (all pure helpers always exit 0 and are
 command-substitution safe, the `_k8s_pf_port` rule):
@@ -909,14 +926,16 @@ command-substitution safe, the `_k8s_pf_port` rule):
 | `_k8s_node_names <nodes>` | strips `node/`, one name per line |
 | `_k8s_identity_skipped` | `FISHHAWK_K8S_SKIP_IDENTITY == 1` (the single hatch) |
 | `_k8s_normalise_image_id <raw>` | `id:sha256:…` / `repo-digest:sha256:…` / `unrecognised:<raw>` after stripping `docker://`, `docker-pullable://`, `containerd://` |
-| `_k8s_config_digest_from_manifest <json>` | config digest from a manifest, `index:<first digest>` from an OCI index, nothing otherwise — grep/sed only; its comment names the compact-single-object assumption |
+| `_k8s_config_digest_from_manifest <json>` | config digest from a manifest, `index:<first NON-ATTESTATION manifest digest>` from an OCI index (skips buildx attestation / `architecture:unknown` entries so a stock buildx index can't return the attestation entry's digest, #3530), nothing otherwise — grep/sed only; its comment names the compact-single-object assumption |
+| `_k8s_config_digest_from_save_manifest <json>` | config digest from a `docker save` tarball's top-level `manifest.json` `Config` entry (handles both the containerd `blobs/sha256/<hex>` and classic `<hex>.json` shapes; requires EXACTLY ONE `Config` — zero/many print nothing), grep/sed only (#3530) |
+| `_k8s_local_config_digest <ref>` | BUILT-side config digest as `config:sha256:<hex>`, via a ref-keyed cache (populated by `_k8s_load_image`) else a `docker save` + `manifest.json` parse; three distinct fail-closed refusals (save non-zero, no `manifest.json`, unreadable/ambiguous Config) (#3530) |
 | `_k8s_node_ctr <pod> <args…>` | the node's `ctr` through a debug pod (`/host/usr/local/bin/ctr --address /host/run/containerd/containerd.sock -n k8s.io`) |
 | `_k8s_debug_pod_start <node>` | creates + waits for the debug pod; STDOUT IS THE POD NAME ONLY (every inner kubectl's stdout is captured or sent to stderr — `kubectl wait` prints `condition met` on stdout) |
 | `_k8s_debug_pod_delete <pod>` | `kubectl delete pod --wait=false`, always 0 |
 | `_k8s_load_image_into_node <tar> <node> [ref]` | debug → wait → cp → import; retains the pod on success |
 | `_k8s_load_image <ref> <node…>` | one `docker save`, per-node import, tarball removed by `always` |
-| `_k8s_up_cleanup` | EXIT-trap sweep of `K8S_DEBUG_PODS` + `K8S_IMAGE_TAR` |
-| `_k8s_resolve_running_image_id <raw> <prov>` | kubelet imageID → config digest, or 1 naming why |
+| `_k8s_up_cleanup` | EXIT-trap sweep of `K8S_DEBUG_PODS` + `K8S_IMAGE_TAR` + the `K8S_LOCAL_CONFIG_DIGEST` ref-keyed cache |
+| `_k8s_resolve_running_image_id <raw> <prov>` | kubelet imageID → `config:sha256:<hex>` (tagged), or 1 naming why; the `shared` repo-digest hop delegates to `_k8s_local_config_digest`, NOT `docker image inspect` (#3530) |
 | `_k8s_identity_fail <reason> <detail>` | the one-line refusal format |
 | `_verify_k8s_image_identity <url> <sha> <ref> <prov>` | the gate |
 
@@ -924,24 +943,48 @@ command-substitution safe, the `_k8s_pf_port` rule):
 (PATH stubs for `docker`/`kubectl`/`helm` recording `<tool> $*`, plus
 the one-shot `/healthz` responder): A1–A4 pure tables (provisioner,
 node names, normaliser, manifest parser including the not-a-layer-digest
-and index cases, skip predicate exactness), plus two setup-step sanity
-checks (#3445) confirming the `noconfig.json` and `index.json` fixtures
-genuinely route to the branches B14–B18 below rely on, before those
-cases assert against them; B1–B18 the gate, one named case per
-fail-closed branch with the branch literal AND the absence of the
-later mismatch literals asserted — B14–B18 (#3445) round out
-`_k8s_resolve_running_image_id`'s four fail-closed branches via two
-per-call rc knobs: `STUB_CONTENT_FAIL_AT=<n>` fails the n-th `ctr
-content get` (B14 the first fetch, B15 the index-hop fetch), and
-`STUB_INSPECT_DIGEST_RC` fails ONLY `docker image inspect
-<repo>@sha256:…` (B18, the shared-provisioner digest resolve, distinct
-from `STUB_INSPECT_RC`'s local-ref inspect that B13 already covers);
-B16 seeds a manifest with no `config` key (the no-config-digest
+and index cases, skip predicate exactness), plus A3-bis/ter/quater
+(#3530): the `_k8s_config_digest_from_save_manifest` table (both store
+shapes → the config digest; two-Config/zero-Config/non-64hex/empty →
+nothing), the `_k8s_config_digest_from_manifest` index walk skipping a
+buildx ATTESTATION-first entry to return the linux/arm64 manifest digest
+(and an attestation-only index → nothing — the counterfactual vehicle
+for the skip), and `_k8s_resolve_running_image_id` tagging a bare
+imageID `config:sha256:<hex>`; plus two setup-step sanity checks (#3445)
+confirming the `noconfig.json` and `index.json` fixtures genuinely route
+to the branches B14–B18 below rely on. B0 pins the ref-keyed
+`K8S_LOCAL_CONFIG_DIGEST` cache (approval-condition 2: a matching ref
+hits, a different ref misses and re-saves, never returning the cached
+digest). B1–B24 the gate, one named case per fail-closed branch with the
+branch literal AND the absence of the later mismatch literals asserted.
+The BUILT side is now resolved through `docker save` (#3530), so the
+docker stub's `save … -o <path>` arm delivers a `STUB_SAVE_TAR` fixture
+tarball (built once with `tar -cf` over a temp `manifest.json`) and honours
+`STUB_SAVE_RC` (every save, the local-ref BUILT-side resolve — B13/B21)
+and `STUB_SAVE_DIGEST_RC` (ONLY `docker save <repo>@sha256:…`, the
+shared-provisioner digest resolve — B18, distinct from the local-ref
+save). `STUB_CONTENT_FAIL_AT=<n>` fails the n-th `ctr content get` (B14
+the first fetch, B15 the index-hop fetch). New cases: B19 the #3530
+REGRESSION case (built image is a multi-platform index whose
+`.Id` is the INDEX digest while the kubelet reports the BARE CONFIG
+digest — the gate resolves the built side via `docker save` and returns 0,
+RED on the pre-fix `.Id` comparison); B20 a genuine config-digest
+mismatch → `image id mismatch` with the softened could-not-verify detail
+(no staleness-as-fact); B21 a local `docker save` failure (the stub still
+delivers a differing-config fixture so the rc guard alone catches it) →
+`local image id unresolved`; B22 an ambiguous two-`Config` save manifest
+→ same branch; B23 a manifest-less save tarball → same branch; B24 a
+forged config-vs-index kind disagreement → `digest kind mismatch` and NOT
+`image id mismatch`; B10 the shared repo-digest hop resolving through
+`docker save <repo>@<digest>` (asserted recorded, and NOT `docker image
+inspect`). B16 seeds a manifest with no `config` key (the no-config-digest
 branch) and B17 nests `index.json` as its own second-hop response (the
 same branch via true index self-nesting, exactly 2 content gets, no
 third hop); C1–C6 the loader (`docker save` recorded EXACTLY once
-across two nodes, debug→wait→cp→import order, pods retained with clean
-names — the stub's `wait` prints a realistic `pod/<name> condition
+across two nodes — the isolated path's config-digest cache reuses that
+tarball so the count stays at one, while the shared path performs ONE
+new save at gate time — debug→wait→cp→import order, pods retained with
+clean names — the stub's `wait` prints a realistic `pod/<name> condition
 met` on stdout so a dropped redirect reddens — tarball removed, and
 each of import/debug-parse/save/wait/cp failures with its
 delete-or-no-delete expectation); D1–D4 `cmd_k8s_up` end to end (load

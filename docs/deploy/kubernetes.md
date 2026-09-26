@@ -150,42 +150,58 @@ does not prove it is the one you just built. `scripts/dev k8s` therefore ends
 with `_verify_k8s_image_identity`, which returns 0 ONLY when BOTH checks match
 and exits the bring-up non-zero otherwise — there is no warn-and-continue code:
 
-- **Primary — image ID.** `docker image inspect
-  ghcr.io/kuhlman-labs/fishhawkd:dev-local --format '{{.Id}}'` (the image
-  CONFIG digest, which survives `docker save` → `ctr images import` unchanged)
-  must equal the newest fishhawkd pod's `status.containerStatuses[0].imageID`.
-  The kubelet reports that value as `docker://sha256:…` /
-  `containerd://sha256:…` (compared directly) or as `<repo>@sha256:<manifest
-  digest>`, which is resolved to its config digest via `ctr -n k8s.io content
-  get` in the retained node-debug pod (isolated provisioner) or `docker image
-  inspect <repo>@<digest>` against the shared host daemon. An OCI index costs
-  exactly one extra hop.
+- **Primary — CONFIG digest.** The built image's config digest must equal the
+  newest fishhawkd pod's `status.containerStatuses[0].imageID`, resolved to a
+  config digest. Both sides are resolved to a **config** digest and compared
+  like with like. The built side is read from the `docker save` tarball's
+  top-level `manifest.json` `Config` entry — **not** `docker image inspect
+  --format '{{.Id}}'`, which on a containerd image store is the OCI **index**
+  digest, not a config digest; comparing that index digest against the
+  kubelet's config digest false-alarmed 'STALE image' on every correctly-loaded
+  fresh build ([#3530]). The kubelet reports its value as `docker://sha256:…` /
+  `containerd://sha256:…` (a bare imageID already IS a config digest) or as
+  `<repo>@sha256:<manifest digest>`, which is resolved to its config digest via
+  `ctr -n k8s.io content get` in the retained node-debug pod (isolated
+  provisioner) or the same `docker save` → `manifest.json` `Config` read against
+  the shared host daemon (the shared hop had the same #3530 defect one hop
+  over). An OCI index costs exactly one extra hop, and the index walk skips
+  buildx **attestation** manifests (annotated `vnd.docker.reference.type` /
+  `architecture: unknown`) so it never returns the attestation entry's digest.
+  A cross-kind comparison is REFUSED (`identity: digest kind mismatch`) rather
+  than misreported as staleness.
 - **Secondary — `git_sha`.** `/healthz` must report the SHA stamped into the
   build. Two dirty builds at the same commit carry the SAME `-dirty` SHA, so
   this check alone cannot tell a fresh build from the previous one — which is
-  exactly why the image ID is the primary check, not a nicety.
+  exactly why the config digest is the primary check, not a nicety.
 
 Every fail-closed branch names what was missing (`identity: image id
-mismatch`, `identity: /healthz carries no git_sha`, `identity: build sha
-unknown`, `identity: pod reports no imageID`, …) and the single escape hatch:
-`FISHHAWK_K8S_SKIP_IDENTITY=1` skips the gate (and downgrades the
-unknown-provisioner refusal) with a loud stderr warning that the deployed image
-was NOT verified. Only the exact value `1` disables it; a blank
-`FISHHAWK_K8S_SKIP_IDENTITY=` in `.env` does not.
+mismatch`, `identity: digest kind mismatch`, `identity: /healthz carries no
+git_sha`, `identity: build sha unknown`, `identity: pod reports no imageID`, …)
+and the single escape hatch: `FISHHAWK_K8S_SKIP_IDENTITY=1` skips the gate (and
+downgrades the unknown-provisioner refusal) with a loud stderr warning that the
+deployed image was NOT verified. Only the exact value `1` disables it; a blank
+`FISHHAWK_K8S_SKIP_IDENTITY=` in `.env` does not. The mismatch message now
+reports that identity COULD NOT BE VERIFIED — a stale image being one
+hypothesis alongside a digest-kind or resolution problem — rather than
+asserting a stale image as established fact.
 
-By hand, the same three reads:
+By hand, the same three reads (note the built side goes through `docker save`,
+not `docker image inspect`, for the reason above):
 
 ```sh
 curl -fsS http://localhost:8080/healthz | jq -r .git_sha
-docker image inspect ghcr.io/kuhlman-labs/fishhawkd:dev-local --format '{{.Id}}'
+docker save ghcr.io/kuhlman-labs/fishhawkd:dev-local -o /tmp/fishhawkd.tar \
+  && tar -xOf /tmp/fishhawkd.tar manifest.json   # read the "Config" entry
 kubectl get pod -l app.kubernetes.io/component=server \
   --sort-by=.metadata.creationTimestamp \
   -o jsonpath='{.items[-1:].status.containerStatuses[0].imageID}'
 ```
 
 The first must equal `git rev-parse --short HEAD` (with `-dirty` on a dirty
-tree); the second must equal the third once any `<repo>@sha256:` repo digest is
-resolved to its config digest.
+tree); the `manifest.json` `Config` digest must equal the third once any
+`<repo>@sha256:` repo digest is resolved to its config digest.
+
+[#3530]: https://github.com/kuhlman-labs/fishhawk/issues/3530
 
 ### Overriding the forwarded host ports
 
@@ -692,16 +708,23 @@ UNCOMMITTED edit — the certificate is site-specific and must not be vendored.
 An optional empty-by-default named context wired into the committed
 Dockerfile is a possible follow-up if this recurs, not part of this change.
 
-## When the bring-up fails with `identity: image id mismatch` / `stale fishhawkd image`
+## When the bring-up fails with `identity: image id mismatch`
 
 The pod is running an image whose config digest differs from the one this run
-built. On the kind-based provisioner that means the load in step 3 did not
-re-point the `dev-local` tag on the node, or the pod sampled was not the
-restarted one. Remedy: `kubectl get pods -l app.kubernetes.io/component=server`
-— if an old pod is still `Terminating`, wait and re-run `scripts/dev k8s`;
-otherwise `kubectl delete deployment fishhawk` and re-run so the kubelet has no
-prior `dev-local` to reuse. Do NOT reach for `FISHHAWK_K8S_SKIP_IDENTITY=1` as
-a fix — it only silences the gate.
+built — identity could not be verified. A STALE image is the likeliest cause,
+but not the only one: since [#3530] both sides are compared as config digests
+(built side from the `docker save` `manifest.json` `Config`, not `docker image
+inspect .Id`), so a genuine mismatch here is a real content difference, not the
+old index-vs-config false alarm. On the kind-based provisioner a stale image
+means the load in step 3 did not re-point the `dev-local` tag on the node, or
+the pod sampled was not the restarted one. Remedy: `kubectl get pods -l
+app.kubernetes.io/component=server` — if an old pod is still `Terminating`,
+wait and re-run `scripts/dev k8s`; otherwise `kubectl delete deployment
+fishhawk` and re-run so the kubelet has no prior `dev-local` to reuse. A
+sibling failure, `identity: digest kind mismatch`, means the two sides resolved
+to different KINDS of digest (a resolver defect, #3530) — the gate refuses to
+compare rather than call it staleness. Do NOT reach for
+`FISHHAWK_K8S_SKIP_IDENTITY=1` as a fix — it only silences the gate.
 
 ## When the bring-up fails with `identity: /healthz carries no git_sha`
 

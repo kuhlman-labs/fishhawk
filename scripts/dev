@@ -576,6 +576,13 @@ _k8s_dump_hook_diagnostics() {
 # AND on every `exit 1` leg — verified on zsh 5.9, pinned by scripts/test-dev).
 K8S_DEBUG_PODS=()
 K8S_IMAGE_TAR=""
+# BUILT-side config digest cache, KEYED BY IMAGE REF (approval condition 2):
+# _k8s_load_image populates both from the tarball it already writes so the
+# isolated bring-up pays exactly one `docker save`, and _k8s_local_config_digest
+# returns the cached digest ONLY when the requested ref equals the cached one (a
+# different ref misses and re-saves). Cleared by _k8s_up_cleanup.
+K8S_LOCAL_CONFIG_DIGEST=""
+K8S_LOCAL_CONFIG_DIGEST_REF=""
 
 # Classify `kubectl get nodes -o name` output. Prints exactly one of:
 #   shared    — every line is node/docker-desktop (classic provisioner, the host
@@ -627,8 +634,9 @@ _k8s_identity_skipped() {
 
 # Normalise a kubelet-reported containerStatuses[].imageID into one of:
 #   id:sha256:<64hex>           — a bare image (config) ID: docker://sha256:…,
-#                                 containerd://sha256:…, or sha256:… (compare
-#                                 directly against `docker image inspect .Id`)
+#                                 containerd://sha256:…, or sha256:… (already a
+#                                 config digest; compared against the built
+#                                 image's config digest from `docker save`, #3530)
 #   repo-digest:sha256:<64hex>  — <repo>@sha256:<manifest digest> (must be
 #                                 resolved to the config digest first)
 #   unrecognised:<raw>          — anything else, including empty
@@ -664,12 +672,19 @@ _k8s_normalise_image_id() {
 # digest, which surfaces as the caller's "manifest carried no config digest"
 # refusal (never a wrong digest: only `sha256:` values INSIDE the span are
 # read, so a layer digest elsewhere in the document is never returned). An
-# INDEX document (`"manifests":[…]`, no `"config"`) yields the first manifest
-# entry's digest with the `index:` prefix; a nested index (index → index) is
+# INDEX document (`"manifests":[…]`, no `"config"`) yields the FIRST NON-
+# ATTESTATION manifest entry's digest with the `index:` prefix: buildx emits an
+# attestation manifest by default (annotated `vnd.docker.reference.type:
+# attestation-manifest`, `"platform":{"architecture":"unknown",…}`) whose own
+# config digest is NOT the image's, and array order is not contractual, so
+# taking the first entry unconditionally could return the wrong digest and
+# false-alarm the identity gate silently (#3530). The array is split into
+# per-entry spans on `},{` and any entry carrying `vnd.docker.reference.type`
+# or `"architecture":"unknown"` is skipped. A nested index (index → index) is
 # refused by the caller after its single extra hop. If a future containerd
 # changes either shape, this is the helper to revisit.
 _k8s_config_digest_from_manifest() {
-  local doc="${1:-}" compact="" span="" digest=""
+  local doc="${1:-}" compact="" span="" digest="" entries="" entry=""
   compact="$(print -r -- "$doc" | tr -d ' \n\t\r')"
   if span="$(print -r -- "$compact" | grep -Eo '"config":\{[^}]*\}' | head -n 1)" && [[ -n "$span" ]]; then
     digest="$(print -r -- "$span" | grep -Eo 'sha256:[0-9a-f]{64}' | head -n 1)"
@@ -677,11 +692,95 @@ _k8s_config_digest_from_manifest() {
     return 0
   fi
   if span="$(print -r -- "$compact" | grep -Eo '"manifests":\[.*' | head -n 1)" && [[ -n "$span" ]]; then
-    digest="$(print -r -- "$span" | grep -Eo 'sha256:[0-9a-f]{64}' | head -n 1)"
-    if [[ -n "$digest" ]]; then print -r -- "index:${digest}"; fi
+    entries="$(print -r -- "$span" | sed 's/},{/}\n{/g')"
+    while IFS= read -r entry; do
+      [[ -n "$entry" ]] || continue
+      [[ "$entry" == *'vnd.docker.reference.type'* ]] && continue
+      [[ "$entry" == *'"architecture":"unknown"'* ]] && continue
+      digest="$(print -r -- "$entry" | grep -Eo 'sha256:[0-9a-f]{64}' | head -n 1)"
+      if [[ -n "$digest" ]]; then print -r -- "index:${digest}"; return 0; fi
+    done <<< "$entries"
     return 0
   fi
   return 0
+}
+
+# Extract the image CONFIG digest from a `docker save` tarball's top-level
+# `manifest.json` document (the ARRAY docker/containerd writes). Prints
+# `sha256:<64hex>` for a single-image save, or NOTHING (fail-closed — the caller
+# refuses) in every other case. grep/sed only, matching the house style above
+# (no jq).
+#
+# IMPLEMENTATION ASSUMPTION: the document carries one or more `"Config":"<value>"`
+# occurrences. Whitespace/newlines are removed first, then EXACTLY ONE `"Config"`
+# occurrence is required — zero means an unrecognised document, more than one a
+# genuinely multi-platform save whose platform selection would be a guess, both
+# refused. Both observed shapes parse: the containerd image store writes
+# `"Config":"blobs/sha256/<hex>"`, the classic graph driver writes
+# `"Config":"<hex>.json"`; a trailing `.json` and any leading path component are
+# stripped and the remainder must be 64 hex chars. Always exit 0
+# (command-substitution safe, the _k8s_pf_port rule).
+_k8s_config_digest_from_save_manifest() {
+  local doc="${1:-}" compact="" configs="" n=0 cfg="" hex=""
+  compact="$(print -r -- "$doc" | tr -d ' \n\t\r')"
+  # `|| true`: grep exits 1 on no match, and this bare assignment is a non-tested
+  # context that would otherwise trip the ZERR diagnostic trap (#631 discipline).
+  configs="$(print -r -- "$compact" | grep -Eo '"Config":"[^"]*"' || true)"
+  [[ -n "$configs" ]] || return 0
+  n="$(print -r -- "$configs" | grep -c . || true)"
+  (( n == 1 )) || return 0
+  cfg="${configs#*\"Config\":\"}"
+  cfg="${cfg%\"}"
+  cfg="${cfg%.json}"
+  hex="${cfg##*/}"
+  if [[ "$hex" =~ '^[0-9a-f]{64}$' ]]; then print -r -- "sha256:${hex}"; fi
+  return 0
+}
+
+# BUILT-side config-digest resolver. STDOUT CONTRACT: the single token
+# `config:sha256:<64hex>` on success; returns 1 naming the failure otherwise.
+# Returns the ref-keyed cache (populated by _k8s_load_image from the tarball it
+# already writes) when the requested ref matches, so the isolated bring-up pays
+# exactly one `docker save`; otherwise `docker save`s into a throwaway tarball,
+# reads its `manifest.json` and parses the Config entry. Every return path
+# removes the tarball (the _k8s_load_image always-block idiom).
+#
+# Deliberately NOT `docker image inspect --format '{{.Id}}'`: on a containerd
+# image store that prints the OCI INDEX digest (empirically sha256:70d9b76a…,
+# `Descriptor.mediaType` application/vnd.oci.image.index.v1+json), not a config
+# digest, which is exactly the #3530 false alarm. `--platform … '{{.Id}}'` is
+# also wrong: it prints the platform MANIFEST digest (empirically
+# sha256:a0f5658b…), still not the config digest (sha256:a0ca0453…, read from
+# the save tarball's manifest.json). Only the `docker save` manifest.json Config
+# entry names the config blob directly on BOTH stores.
+_k8s_local_config_digest() {
+  local ref="$1" tar="" doc="" cfg=""
+  if [[ -n "$K8S_LOCAL_CONFIG_DIGEST" && "$K8S_LOCAL_CONFIG_DIGEST_REF" == "$ref" ]]; then
+    print -r -- "config:${K8S_LOCAL_CONFIG_DIGEST}"
+    return 0
+  fi
+  if ! tar="$(mktemp -t fishhawk-cfgtar.XXXXXX)"; then
+    print -u2 "error: mktemp failed for the config-digest save tarball of ${ref}"
+    return 1
+  fi
+  {
+    if ! docker save "$ref" -o "$tar" 2>/dev/null; then
+      print -u2 "error: cannot save ${ref} to resolve its config digest"
+      return 1
+    fi
+    if ! doc="$(tar -xOf "$tar" manifest.json 2>/dev/null)"; then
+      print -u2 "error: the docker save tarball for ${ref} carries no manifest.json"
+      return 1
+    fi
+    cfg="$(_k8s_config_digest_from_save_manifest "$doc")"
+    if [[ -z "$cfg" ]]; then
+      print -u2 "error: could not read a single config digest out of the docker save manifest for ${ref} (ambiguous multi-platform save, or an unrecognised manifest.json)"
+      return 1
+    fi
+    print -r -- "config:${cfg}"
+  } always {
+    rm -f "$tar"
+  }
 }
 
 # Run the NODE's ctr through a retained node-debug pod. `--profile=sysadmin`
@@ -765,6 +864,15 @@ _k8s_load_image() {
     K8S_IMAGE_TAR=""
     return 1
   fi
+  # Best-effort: populate the ref-keyed BUILT-side config-digest cache from the
+  # tarball we already wrote, so the identity gate reuses it (one `docker save`
+  # total on the isolated path). A parse failure leaves the cache empty and the
+  # gate falls back to its own save — never a hard failure of the LOAD path.
+  local _cfg
+  if _cfg="$(_k8s_config_digest_from_save_manifest "$(tar -xOf "$K8S_IMAGE_TAR" manifest.json 2>/dev/null)")" && [[ -n "$_cfg" ]]; then
+    K8S_LOCAL_CONFIG_DIGEST="$_cfg"
+    K8S_LOCAL_CONFIG_DIGEST_REF="$ref"
+  fi
   {
     for node in "$@"; do
       if ! _k8s_load_image_into_node "$K8S_IMAGE_TAR" "$node" "$ref"; then
@@ -790,15 +898,23 @@ _k8s_up_cleanup() {
     rm -f "$K8S_IMAGE_TAR"
     K8S_IMAGE_TAR=""
   fi
+  K8S_LOCAL_CONFIG_DIGEST=""
+  K8S_LOCAL_CONFIG_DIGEST_REF=""
 }
 
-# Resolve a kubelet-reported imageID to the running image's CONFIG digest (the
-# value `docker image inspect --format '{{.Id}}'` prints, which survives
-# `docker save` → `ctr images import` unchanged). Prints the digest, or returns
-# 1 naming why:
-#   id:            printed directly
-#   repo-digest:   shared   → the host daemon resolves <repo>@<digest> (its
-#                             store IS the node's store)
+# Resolve a kubelet-reported imageID to the running image's CONFIG digest,
+# TAGGED with its provenance kind. STDOUT CONTRACT: the single token
+# `config:sha256:<64hex>` (the same tagged form _k8s_local_config_digest emits,
+# so the gate compares like with like and refuses a cross-kind comparison);
+# returns 1 naming why otherwise:
+#   id:            a kubelet bare imageID already IS a config digest — tagged
+#                  and printed directly
+#   repo-digest:   shared   → the host daemon resolves <repo>@<digest> to its
+#                             config digest via _k8s_local_config_digest (its
+#                             store IS the node's store). NOT `docker image
+#                             inspect <repo>@<digest> --format '{{.Id}}'`: on a
+#                             containerd image store that yields the manifest/
+#                             index digest, the same #3530 defect one hop over.
 #                  isolated → `ctr content get <digest>` through the retained
 #                             node-debug pod; an OCI index costs exactly one
 #                             more hop
@@ -809,7 +925,7 @@ _k8s_resolve_running_image_id() {
   local raw="${1:-}" prov="${2:-}" norm="" digest="" stripped="" repo="" id="" pod="" doc="" cfg="" sub=""
   norm="$(_k8s_normalise_image_id "$raw")"
   case "$norm" in
-    id:*) print -r -- "${norm#id:}"; return 0 ;;
+    id:*) print -r -- "config:${norm#id:}"; return 0 ;;
     repo-digest:*) digest="${norm#repo-digest:}" ;;
     *)
       print -u2 "error: cannot recognise the pod's imageID '${raw}' (expected docker://sha256:…, containerd://sha256:… or <repo>@sha256:…)"
@@ -819,8 +935,8 @@ _k8s_resolve_running_image_id() {
     shared)
       stripped="${raw#docker-pullable://}"; stripped="${stripped#docker://}"; stripped="${stripped#containerd://}"
       repo="${stripped%@*}"
-      if ! id="$(docker image inspect "${repo}@${digest}" --format '{{.Id}}' 2>/dev/null)" || [[ -z "$id" ]]; then
-        print -u2 "error: the host daemon cannot resolve ${repo}@${digest} to an image id (docker image inspect failed)"
+      if ! id="$(_k8s_local_config_digest "${repo}@${digest}")" || [[ -z "$id" ]]; then
+        print -u2 "error: the host daemon cannot resolve ${repo}@${digest} to an image id (docker save could not read its config digest — see the line above)"
         return 1
       fi
       print -r -- "$id" ;;
@@ -847,7 +963,7 @@ _k8s_resolve_running_image_id() {
         print -u2 "error: manifest ${digest} carried no config digest (nested index, or an unrecognised manifest format — see _k8s_config_digest_from_manifest)"
         return 1
       fi
-      print -r -- "$cfg" ;;
+      print -r -- "config:${cfg}" ;;
     *)
       print -u2 "error: cannot resolve the repo digest ${digest} on an unknown provisioner"
       return 1 ;;
@@ -862,25 +978,32 @@ _k8s_identity_fail() {
   print -u2 "error: ${reason}: ${detail} — set FISHHAWK_K8S_SKIP_IDENTITY=1 to bring up an unverified image deliberately; see docs/deploy/kubernetes.md § 'Image identity'"
 }
 
-# Post-gate image-identity check (#3344). Returns 0 ONLY when BOTH checks
+# Post-gate image-identity check (#3344, #3530). Returns 0 ONLY when BOTH checks
 # match, 1 otherwise — there is no warn-and-continue code.
-#   PRIMARY   the locally built image's config ID (`docker image inspect .Id`)
-#             equals the newest fishhawkd pod's running imageID (resolved via
-#             _k8s_resolve_running_image_id). Two dirty builds at one commit
-#             carry the SAME `-dirty` git_sha; only the image ID tells them
-#             apart, which is why this is the primary check.
+#   PRIMARY   the locally built image's CONFIG digest (resolved from the
+#             `docker save` manifest.json Config entry via
+#             _k8s_local_config_digest — NOT `docker image inspect .Id`, which
+#             on a containerd image store is the OCI INDEX digest, #3530) equals
+#             the newest fishhawkd pod's running config digest (resolved via
+#             _k8s_resolve_running_image_id). Both sides are `config:`-tagged, so
+#             a cross-kind comparison is REFUSED rather than misreported as
+#             staleness. Two dirty builds at one commit carry the SAME `-dirty`
+#             git_sha; only the config digest tells them apart, which is why this
+#             is the primary check.
 #   SECONDARY /healthz `git_sha` equals the SHA stamped into this build.
 # Branch reason literals (each distinct, each fail-closed):
 #   identity: local image id unresolved · identity: pod reports no imageID ·
-#   identity: running image id unresolved · identity: image id mismatch ·
-#   identity: build sha unknown · identity: /healthz unreachable ·
-#   identity: /healthz carries no git_sha · identity: git_sha mismatch
+#   identity: running image id unresolved · identity: digest kind mismatch ·
+#   identity: image id mismatch · identity: build sha unknown ·
+#   identity: /healthz unreachable · identity: /healthz carries no git_sha ·
+#   identity: git_sha mismatch
 _verify_k8s_image_identity() {
   local url="$1" expected="$2" ref="$3" prov="$4"
   local local_id="" raw="" running_id="" body="" actual=""
+  local local_kind="" running_kind="" local_bare="" running_bare=""
 
-  if ! local_id="$(docker image inspect "$ref" --format '{{.Id}}' 2>/dev/null)" || [[ -z "$local_id" ]]; then
-    _k8s_identity_fail "identity: local image id unresolved" "cannot read the local image ID of ${ref} (docker image inspect failed — was the build successful?)"
+  if ! local_id="$(_k8s_local_config_digest "$ref")" || [[ -z "$local_id" ]]; then
+    _k8s_identity_fail "identity: local image id unresolved" "cannot read the local image config digest of ${ref} (docker save could not resolve it — was the build successful? see the line above)"
     return 1
   fi
   # Newest pod by creationTimestamp: after `rollout restart` the pre-restart
@@ -893,8 +1016,17 @@ _verify_k8s_image_identity() {
     _k8s_identity_fail "identity: running image id unresolved" "could not resolve the pod's imageID '${raw}' to an image id (see the line above)"
     return 1
   fi
-  if [[ "$running_id" != "$local_id" ]]; then
-    _k8s_identity_fail "identity: image id mismatch" "the fishhawkd pod is running image ${running_id}, not the image this bring-up built (${local_id}) — the cluster is serving a STALE fishhawkd image (#3344); a same-commit rebuild is indistinguishable by git_sha, which is why the image ID is the primary check (kubelet imageID: ${raw})"
+  # Both tokens are <kind>:sha256:<hex>. Refuse a cross-kind comparison rather
+  # than misreport it as staleness (#3530): a future asymmetry between the two
+  # resolvers is a resolution bug, not a stale image.
+  local_kind="${local_id%%:*}"; running_kind="${running_id%%:*}"
+  local_bare="${local_id#*:}"; running_bare="${running_id#*:}"
+  if [[ "$local_kind" != "$running_kind" ]]; then
+    _k8s_identity_fail "identity: digest kind mismatch" "the built image resolved to a '${local_kind}' digest but the pod's image resolved to a '${running_kind}' digest (built ${local_bare}, running ${running_bare}) — the two sides are not the same kind of digest, so identity CANNOT be compared; this is a resolver defect (#3530), not necessarily a stale image (kubelet imageID: ${raw})"
+    return 1
+  fi
+  if [[ "$running_bare" != "$local_bare" ]]; then
+    _k8s_identity_fail "identity: image id mismatch" "the fishhawkd pod's running image config digest is ${running_bare}, which does not match the image this bring-up built (${local_bare}); identity COULD NOT BE VERIFIED — a STALE fishhawkd image (#3344) is ONE hypothesis, but a digest-kind or resolution problem (#3530) is another (kubelet imageID: ${raw})"
     return 1
   fi
 
@@ -915,7 +1047,7 @@ _verify_k8s_image_identity() {
     _k8s_identity_fail "identity: git_sha mismatch" "/healthz git_sha is '${actual}', not the stamped build SHA '${expected}' — stale fishhawkd image (#3344)"
     return 1
   fi
-  print "image identity verified (image id ${local_id}, /healthz git_sha ${actual}, #3344)"
+  print "image identity verified (image config digest ${local_bare}, /healthz git_sha ${actual}, #3344)"
 }
 
 # Poll <url> until fishhawkd <pid> answers GET /healthz, for up to <deadline>
