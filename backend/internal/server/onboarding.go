@@ -1012,10 +1012,15 @@ type gitLabRegistrationReadiness struct {
 	// project a run would act on. Absent unless registered.
 	InstallationRef string `json:"installation_ref,omitempty"`
 	// ResolvedRef is the `gitlab:<project_id>` ref the path resolved to with
-	// the deployment credential. Absent when the project did not resolve.
+	// the deployment credential. It is a fact about the PATH, not the row, so
+	// it is present on EVERY posture — registered, not_registered, and BOTH
+	// `unknown` degrades (registry_unwired, registry_lookup_failed) — whenever
+	// the project resolved, and absent ONLY when it did not (E45.72 / #3595).
 	ResolvedRef string `json:"resolved_ref,omitempty"`
 	// RefMatches is InstallationRef == ResolvedRef, set ONLY when both are
-	// known.
+	// known — so a present ResolvedRef never implies a comparison was made
+	// (an `unknown` degrade never reaches it, and a registered row with an
+	// EMPTY InstallationRef leaves it absent rather than rendering false).
 	RefMatches *bool `json:"ref_matches,omitempty"`
 	// Reason is a machine code naming why the registry could not answer.
 	// Non-empty whenever Status is "unknown".
@@ -1259,13 +1264,23 @@ func (s *Server) probeGitLab(ctx context.Context, repo string, ref forge.RepoRef
 // credential (empty when it did not resolve): it fills the REAL project id
 // into the remediation and drives the ref_matches comparison.
 //
+// resolved_ref is a fact about the PATH, not the row, so it is carried on
+// EVERY posture whenever the project resolved with the deployment credential
+// — registered, not_registered, AND both `unknown` degrades — and is absent
+// only when the path did not resolve (E45.72 / #3595). It is set in the
+// initial struct literal for exactly that reason: a degrade that returns
+// before reading the registry still reports the ref the path resolved to,
+// because resolvability is an independent fact. RefMatches stays two-sided
+// (below), so a present resolved_ref never implies a comparison was made.
+//
 // Every degrade returns `unknown` with a naming Reason — the fail-closed
 // contract; a registry that ANSWERED found=false is the positive
 // `not_registered`. Note is set on every return.
 func (s *Server) probeGitLabRegistration(ctx context.Context, repo, resolvedRef string) gitLabRegistrationReadiness {
 	out := gitLabRegistrationReadiness{
-		Status: string(mergegate.StatusUnknown),
-		Note:   gitLabRegistrationNote,
+		Status:      string(mergegate.StatusUnknown),
+		Note:        gitLabRegistrationNote,
+		ResolvedRef: resolvedRef,
 	}
 	if s.cfg.GitLabInstallations == nil {
 		out.Reason = gitLabRegistrationReasonRegistryUnwired
@@ -1282,9 +1297,6 @@ func (s *Server) probeGitLabRegistration(ctx context.Context, repo, resolvedRef 
 			"repo", repo, "error", err.Error())
 		return out
 	}
-	// The resolved ref is a fact about the path, not the row: present on a
-	// not_registered finding too (it is what the remediation fills in).
-	out.ResolvedRef = resolvedRef
 	if !found {
 		out.Status = gitLabRegistrationStatusNotRegistered
 		out.Detail = "no gitlab installation is registered for project path " + repo + " (exact match; an ambiguous double registration also lands here)"

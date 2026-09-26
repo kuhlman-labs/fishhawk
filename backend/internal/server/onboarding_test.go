@@ -3481,8 +3481,14 @@ func TestOnboardingReadiness_GitLab_Registration_NotRegistered(t *testing.T) {
 // TestOnboardingReadiness_GitLab_Registration_RegistryUnwired: no registry on
 // this deployment (cfg.GitLabInstallations nil) → unknown / registry_unwired,
 // installed false with the registry-unknown app reason naming the code,
-// resolvable true, spec still fetched. Counterfactual (ii): delete the nil
-// guard in probeGitLabRegistration → RED (nil-dereference panic).
+// resolvable true, spec still fetched — AND, because the nested path DID
+// resolve on the v4 stub, resolved_ref carries the real `gitlab:5` while
+// ref_matches stays absent (E45.72 / #3595: resolved_ref is a fact about the
+// path, not the row, so a degrade that never reads the registry still
+// reports it). Counterfactual (ii): delete the nil guard in
+// probeGitLabRegistration → RED (nil-dereference panic). Counterfactual
+// (#3595): move `ResolvedRef: resolvedRef` back out of the struct literal to
+// after both degrade guards → RED on resolved_ref here.
 func TestOnboardingReadiness_GitLab_Registration_RegistryUnwired(t *testing.T) {
 	gl := newFakeGitLabForOnboarding(onboardingReviewersSpecYAML)
 	raw := gitLabRegistrationRaw(t, gl, nil)
@@ -3496,6 +3502,14 @@ func TestOnboardingReadiness_GitLab_Registration_RegistryUnwired(t *testing.T) {
 	}
 	if rem, _ := reg["remediation"].(string); !strings.Contains(rem, "FISHHAWKD_DATABASE_URL") {
 		t.Errorf("remediation = %q, want FISHHAWKD_DATABASE_URL named", rem)
+	}
+	// The path resolved, so the degrade still carries the resolved ref; the
+	// comparison is never reached, so ref_matches stays absent.
+	if reg["resolved_ref"] != "gitlab:"+fakeGitLabProjectID {
+		t.Errorf("resolved_ref = %v, want gitlab:%s (the path resolved; the degrade must still carry it)", reg["resolved_ref"], fakeGitLabProjectID)
+	}
+	if v, present := reg["ref_matches"]; present {
+		t.Errorf("ref_matches present (%v) on an unknown degrade that never reached the comparison", v)
 	}
 	app := rawObject(t, raw, "app")
 	if app["installed"] != false || app["resolvable"] != true {
@@ -3512,8 +3526,11 @@ func TestOnboardingReadiness_GitLab_Registration_RegistryUnwired(t *testing.T) {
 
 // TestOnboardingReadiness_GitLab_Registration_LookupFailed: the registry
 // faults → unknown / registry_lookup_failed with the error in detail, a WARN
-// log, installed false. Counterfactual (3): delete the err branch → RED
-// (would report not_registered).
+// log, installed false — and, the path having resolved, resolved_ref carries
+// `gitlab:5` with ref_matches absent (E45.72 / #3595). Counterfactual (3):
+// delete the err branch → RED (would report not_registered). Counterfactual
+// (#3595): move `ResolvedRef: resolvedRef` back out of the struct literal to
+// after both degrade guards → RED on resolved_ref here.
 func TestOnboardingReadiness_GitLab_Registration_LookupFailed(t *testing.T) {
 	gl := newFakeGitLabForOnboarding(onboardingReviewersSpecYAML)
 	lookupErr := errors.New("installations store down")
@@ -3530,6 +3547,14 @@ func TestOnboardingReadiness_GitLab_Registration_LookupFailed(t *testing.T) {
 	}
 	if detail, _ := reg["detail"].(string); !strings.Contains(detail, lookupErr.Error()) {
 		t.Errorf("detail = %q, want the lookup error", detail)
+	}
+	// The path resolved, so the degrade still carries the resolved ref; the
+	// comparison is never reached, so ref_matches stays absent.
+	if reg["resolved_ref"] != "gitlab:"+fakeGitLabProjectID {
+		t.Errorf("resolved_ref = %v, want gitlab:%s (the path resolved; the degrade must still carry it)", reg["resolved_ref"], fakeGitLabProjectID)
+	}
+	if v, present := reg["ref_matches"]; present {
+		t.Errorf("ref_matches present (%v) on an unknown degrade that never reached the comparison", v)
 	}
 	app := rawObject(t, raw, "app")
 	wantReason := onboardingGitLabRegistryUnknownReasonPrefix + gitLabRegistrationReasonLookupFailed + onboardingGitLabRegistryUnknownReasonSuffix
@@ -3577,18 +3602,54 @@ func TestOnboardingReadiness_GitLab_Registration_RefMismatch(t *testing.T) {
 	}
 }
 
+// TestOnboardingReadiness_GitLab_Registration_EmptyInstallationRef_RefMatchesAbsent
+// pins the RefMatches guard's SECOND disjunct (E45.72 / #3595): a row
+// registered under the exact path whose installation_ref is EMPTY, against a
+// project that DID resolve, must render ref_matches ABSENT — never false.
+// An empty ref is unknown territory for the comparison, not a mismatch.
+// Counterfactual: delete `|| out.InstallationRef == ""` from the guard → the
+// comparison runs against a definitionally non-matching pair and renders
+// ref_matches false → RED here.
+func TestOnboardingReadiness_GitLab_Registration_EmptyInstallationRef_RefMatchesAbsent(t *testing.T) {
+	gl := newFakeGitLabForOnboarding(onboardingReviewersSpecYAML)
+	registry := &fakeGitLabInstallations{found: true, inst: account.GitLabInstallation{
+		ProjectPath: onboardingNestedGitLabPath, InstallationRef: ""}}
+	raw := gitLabRegistrationRaw(t, gl, registry)
+
+	reg := rawObject(t, raw, "gitlab_registration")
+	if reg["status"] != gitLabRegistrationStatusRegistered {
+		t.Errorf("gitlab_registration.status = %v, want registered", reg["status"])
+	}
+	if reg["project_path"] != onboardingNestedGitLabPath {
+		t.Errorf("project_path = %v, want %s", reg["project_path"], onboardingNestedGitLabPath)
+	}
+	if v, present := reg["installation_ref"]; present {
+		t.Errorf("installation_ref present (%v) although the row's ref is empty (omitempty)", v)
+	}
+	if reg["resolved_ref"] != "gitlab:"+fakeGitLabProjectID {
+		t.Errorf("resolved_ref = %v, want gitlab:%s (the path resolved)", reg["resolved_ref"], fakeGitLabProjectID)
+	}
+	if v, present := reg["ref_matches"]; present {
+		t.Errorf("ref_matches = %v, want ABSENT — an empty installation_ref is never a mismatch", v)
+	}
+}
+
 // TestOnboardingReadiness_GitLab_Registration_NoteAndUnresolvedRefAbsent pins
 // the raw keys: note equals the constant on every posture, and resolved_ref
 // is ABSENT whenever the project did not resolve — on a not-visible project
-// AND on a not-registered one.
+// AND on a not-registered one, AND on both `unknown` degrades (E45.72 /
+// #3595: the omitempty half of the contract, the complement of the two
+// degrade tests above, which run against a RESOLVABLE project).
 func TestOnboardingReadiness_GitLab_Registration_NoteAndUnresolvedRefAbsent(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
-		registry *fakeGitLabInstallations
+		registry GitLabInstallationResolver
 		want     string
 	}{
 		{"registered", registeredGitLabInstallations(), gitLabRegistrationStatusRegistered},
 		{"not_registered", &fakeGitLabInstallations{found: false}, gitLabRegistrationStatusNotRegistered},
+		{"registry_unwired", nil, string(mergegate.StatusUnknown)},
+		{"registry_lookup_failed", &fakeGitLabInstallations{err: errors.New("installations store down")}, string(mergegate.StatusUnknown)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			gl := newFakeGitLabForOnboarding(onboardingReviewersSpecYAML)
