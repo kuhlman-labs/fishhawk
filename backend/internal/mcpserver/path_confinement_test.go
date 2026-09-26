@@ -184,10 +184,15 @@ func TestConfinePath(t *testing.T) {
 	})
 
 	t.Run("existence_non_leak", func(t *testing.T) {
-		// The refusal must not be an existence oracle: the message for an
-		// EXISTING outside-root file and a NON-EXISTING outside-root path are
-		// compared to EACH OTHER (not to a literal), so the case cannot pass
-		// vacuously if the wording changes.
+		// The refusal must not be an existence — or an UNRESOLVABILITY — oracle.
+		// THREE outside-root paths are compared to EACH OTHER (never to a
+		// literal, so a reworded message cannot make the case pass vacuously):
+		// an EXISTING file, a NON-EXISTING path, and an ELOOP symlink cycle.
+		// The third row is the one the low-tier fix-up concern raised: a path
+		// that exists in an unresolvable form used to draw a distinct "could not
+		// be resolved for containment checking" message, which told the caller
+		// one bit of filesystem shape (there is SOMETHING there, in a form the
+		// resolver choked on) that neither other row discloses.
 		existing := filepath.Join(outside, "present.yaml")
 		if err := os.WriteFile(existing, []byte("x"), 0o600); err != nil {
 			t.Fatalf("write fixture: %v", err)
@@ -205,10 +210,37 @@ func TestConfinePath(t *testing.T) {
 		}
 		// Byte-identical apart from the caller's own path, which the caller
 		// supplied and already knows. Normalise that out and compare.
-		normExisting := strings.ReplaceAll(errExisting.Error(), existing, "<PATH>")
-		normAbsent := strings.ReplaceAll(errAbsent.Error(), absent, "<PATH>")
+		norm := func(err error, path string) string {
+			return strings.ReplaceAll(err.Error(), path, "<PATH>")
+		}
+		normExisting := norm(errExisting, existing)
+		normAbsent := norm(errAbsent, absent)
 		if normExisting != normAbsent {
 			t.Errorf("refusal leaks existence:\n existing: %s\n absent:   %s", normExisting, normAbsent)
+		}
+
+		// The ELOOP row. Staged as a two-link cycle so EvalSymlinks fails with
+		// something that is neither "resolved" nor fs.ErrNotExist.
+		if runtime.GOOS == "windows" {
+			return
+		}
+		loopA := filepath.Join(outside, "loop-a")
+		loopB := filepath.Join(outside, "loop-b")
+		if err := os.Symlink(loopB, loopA); err != nil {
+			t.Skipf("symlink unsupported here: %v", err)
+		}
+		if err := os.Symlink(loopA, loopB); err != nil {
+			t.Skipf("symlink unsupported here: %v", err)
+		}
+		if _, rerr := resolveForConfinement(loopA); rerr == nil {
+			t.Fatal("fixture precondition: the cycle must be UNRESOLVABLE, or this row proves nothing")
+		}
+		errLoop := r.confinePath("spec_file", loopA)
+		if errLoop == nil {
+			t.Fatal("an unresolvable path must be refused (fail closed)")
+		}
+		if normLoop := norm(errLoop, loopA); normLoop != normExisting {
+			t.Errorf("refusal leaks unresolvability:\n unresolvable: %s\n outside-root: %s", normLoop, normExisting)
 		}
 	})
 
@@ -1199,4 +1231,203 @@ func TestPathConfinement_DiscoveredSpecRaceInvariantUnderConcurrentSwap(t *testi
 			t.Fatalf("iteration %d: the walk returned the ESCAPE TARGET's bytes under a concurrent path swap", i)
 		}
 	}
+}
+
+// TestPathConfinement_ExplicitSpecFileGoesThroughTheConfinedOpen closes the
+// routed medium-tier concern: the EXPLICIT spec_file arm used to delegate to
+// discoverSpec, which reads BY PATHNAME (os.ReadFile) after confinePath had
+// validated only that pathname — the identical check-to-read window the
+// discovery walk's root-handle open closes. "The caller named the file" bounds
+// nothing, because the attacker controls the symlink TARGET: any readable file on
+// the host was reachable regardless of the pathname typed.
+//
+// Every refusal row starts from a state the stationary check ALLOWS (a real,
+// in-root, readable spec) and replaces the path in the hook's window — which now
+// fires AFTER the root-relative name is computed and immediately before
+// handle.OpenFile — so the refusal can only come from the CONFINED OPEN, and the
+// escape target is a VALID spec so a control that read it would succeed rather
+// than fail for an unrelated reason. The last two rows are the self-paired ACCEPT
+// and the stdio posture, without which a control refusing every explicit
+// spec_file would satisfy the refusals.
+func TestPathConfinement_ExplicitSpecFileGoesThroughTheConfinedOpen(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the symlink-escape fixtures are unix-specific")
+	}
+
+	const escapeMarker = "ESCAPE-TARGET-CONTENTS-MUST-NEVER-BE-RETURNED"
+	outside := t.TempDir()
+	target := filepath.Join(outside, "secret-workflows.yaml")
+	if err := os.WriteFile(target, []byte("# "+escapeMarker+"\n"+minimalWorkflowSpecYAML(t)), 0o600); err != nil {
+		t.Fatalf("write escape target: %v", err)
+	}
+
+	inRootBody := "# in-root explicit spec\n" + minimalWorkflowSpecYAML(t)
+	// newRoot stages an allowed root holding the explicitly-named spec one
+	// directory DOWN, so an ANCESTOR swap has something to replace.
+	newRoot := func(t *testing.T) (root, explicit string) {
+		t.Helper()
+		root = t.TempDir()
+		cfg := filepath.Join(root, "cfg")
+		if err := os.MkdirAll(cfg, 0o700); err != nil {
+			t.Fatalf("mkdir cfg: %v", err)
+		}
+		explicit = filepath.Join(cfg, "explicit-workflows.yaml")
+		if err := os.WriteFile(explicit, []byte(inRootBody), 0o600); err != nil {
+			t.Fatalf("write in-root explicit spec: %v", err)
+		}
+		return root, explicit
+	}
+
+	assertRefused := func(t *testing.T, got *discoveredSpec, err error) {
+		t.Helper()
+		if err == nil {
+			t.Fatalf("an explicit spec replaced between the check and the open must be refused; got %+v", got)
+		}
+		if !strings.Contains(err.Error(), pathOutsideAllowedRootsCode) {
+			t.Errorf("error should carry %q; got %v", pathOutsideAllowedRootsCode, err)
+		}
+		if got != nil {
+			t.Fatalf("the refusal must return NO spec; got Path=%q len=%d", got.Path, len(got.Contents))
+		}
+	}
+
+	t.Run("leaf_replaced_with_outside_symlink", func(t *testing.T) {
+		root, explicit := newRoot(t)
+		fired := swapSpecOnce(t, explicit, func() {
+			if err := os.Remove(explicit); err != nil {
+				t.Errorf("race swap: remove: %v", err)
+				return
+			}
+			if err := os.Symlink(target, explicit); err != nil {
+				t.Errorf("race swap: symlink: %v", err)
+			}
+		})
+
+		r := &runResolver{httpTransport: true, allowedRoots: []string{root}}
+		got, err := r.discoverSpecConfined(root, explicit)
+		if !*fired {
+			t.Fatal("the race window never opened — the test proves nothing")
+		}
+		assertRefused(t, got, err)
+	})
+
+	t.Run("ancestor_dir_replaced_with_outside_symlink", func(t *testing.T) {
+		root, explicit := newRoot(t)
+		outsideDir := filepath.Join(outside, "cfg-dir")
+		if err := os.MkdirAll(outsideDir, 0o700); err != nil {
+			t.Fatalf("mkdir outside dir: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(outsideDir, "explicit-workflows.yaml"),
+			[]byte("# "+escapeMarker+"\n"+minimalWorkflowSpecYAML(t)), 0o600); err != nil {
+			t.Fatalf("write outside spec: %v", err)
+		}
+		cfg := filepath.Join(root, "cfg")
+		fired := swapSpecOnce(t, explicit, func() {
+			if err := os.RemoveAll(cfg); err != nil {
+				t.Errorf("race swap: remove dir: %v", err)
+				return
+			}
+			if err := os.Symlink(outsideDir, cfg); err != nil {
+				t.Errorf("race swap: symlink dir: %v", err)
+			}
+		})
+
+		r := &runResolver{httpTransport: true, allowedRoots: []string{root}}
+		got, err := r.discoverSpecConfined(root, explicit)
+		if !*fired {
+			t.Fatal("the race window never opened — the test proves nothing")
+		}
+		assertRefused(t, got, err)
+	})
+
+	t.Run("refused_explicit_spec_yields_a_zero_validate_output", func(t *testing.T) {
+		// End to end through the verb: the escape target's bytes must reach
+		// neither the diagnostics nor the output's Path/Source.
+		root, explicit := newRoot(t)
+		fired := swapSpecOnce(t, explicit, func() {
+			if err := os.Remove(explicit); err != nil {
+				t.Errorf("race swap: remove: %v", err)
+				return
+			}
+			if err := os.Symlink(target, explicit); err != nil {
+				t.Errorf("race swap: symlink: %v", err)
+			}
+		})
+
+		r := &runResolver{httpTransport: true, allowedRoots: []string{root}}
+		_, out, err := r.validateSpec(context.Background(), nil, ValidateSpecInput{SpecFile: explicit})
+		if !*fired {
+			t.Fatal("the race window never opened — the test proves nothing")
+		}
+		if err == nil {
+			t.Fatalf("expected a refusal, got out = %+v", out)
+		}
+		if !strings.Contains(err.Error(), pathOutsideAllowedRootsCode) {
+			t.Errorf("error should carry %q; got %v", pathOutsideAllowedRootsCode, err)
+		}
+		if out.Valid || out.Source != "" || out.Path != "" || len(out.Diagnostics) != 0 {
+			t.Errorf("a refused call must return a ZERO output (nothing read); got %+v", out)
+		}
+		if strings.Contains(err.Error(), escapeMarker) {
+			t.Errorf("the refusal must not carry the escape target's bytes; got %v", err)
+		}
+	})
+
+	t.Run("unraced_explicit_spec_is_still_read", func(t *testing.T) {
+		// The self-paired ACCEPT: with the window occupied by a NO-OP swap, the
+		// same code path must still read the in-root file through the root
+		// handle. Without this row the refusals above would also be satisfied by
+		// a control that refused every explicit spec_file.
+		root, explicit := newRoot(t)
+		fired := swapSpecOnce(t, explicit, func() {})
+
+		r := &runResolver{httpTransport: true, allowedRoots: []string{root}}
+		got, err := r.discoverSpecConfined(root, explicit)
+		if err != nil {
+			t.Fatalf("an unreplaced in-root explicit spec must still be read; got %v", err)
+		}
+		if !*fired {
+			t.Fatal("the hook never fired — the accept row is not exercising the same path")
+		}
+		if got == nil || string(got.Contents) != inRootBody {
+			t.Fatalf("expected the in-root explicit spec's contents; got %+v", got)
+		}
+		if got.Path != explicit {
+			t.Errorf("Path = %q, want the absolute explicit path %q", got.Path, explicit)
+		}
+	})
+
+	t.Run("stdio_still_reads_an_out_of_root_explicit_spec", func(t *testing.T) {
+		// Operator option (c): the stdio posture is untouched by this change, so
+		// the local loop's explicit spec_file — including one outside every
+		// configured root — still reads.
+		root, _ := newRoot(t)
+		r := &runResolver{httpTransport: false, allowedRoots: []string{root}}
+		got, err := r.discoverSpecConfined(root, target)
+		if err != nil {
+			t.Fatalf("stdio must be unconfined; got %v", err)
+		}
+		if got == nil || !strings.Contains(string(got.Contents), escapeMarker) {
+			t.Fatalf("stdio must read the named file verbatim; got %+v", got)
+		}
+	})
+
+	t.Run("missing_explicit_spec_reads_as_a_typo_not_a_refusal", func(t *testing.T) {
+		// A not-exist failure keeps discoverSpec's `spec_file: <err>` shape: the
+		// caller named this path, so a typo must not be reported as a
+		// confinement refusal (which would send them to the operator knobs).
+		root, _ := newRoot(t)
+		absent := filepath.Join(root, "cfg", "absent-workflows.yaml")
+		r := &runResolver{httpTransport: true, allowedRoots: []string{root}}
+		got, err := r.discoverSpecConfined(root, absent)
+		if err == nil {
+			t.Fatalf("a missing explicit spec must be an error; got %+v", got)
+		}
+		if !strings.Contains(err.Error(), "spec_file") {
+			t.Errorf("err should reference spec_file; got %v", err)
+		}
+		if strings.Contains(err.Error(), pathOutsideAllowedRootsCode) {
+			t.Errorf("a typo must not be reported as a confinement refusal; got %v", err)
+		}
+	})
 }

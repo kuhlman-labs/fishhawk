@@ -62,9 +62,11 @@ const allowedRootsRemedy = "configure the allow-list with fishhawkd --mcp-allowe
 // the filesystem reports.
 //
 // The refusal message names the field, the caller's OWN path and the operator
-// knobs — and NOTHING about the filesystem. It is byte-identical for an
-// existing and a non-existing outside-root path, so the refusal cannot be used
-// as an existence oracle (the #3589 information-leak half).
+// knobs — and NOTHING about the filesystem. ONE message (see
+// outsideAllowedRootsRefusal) covers every containment failure: an existing
+// outside-root path, a non-existing one, and an UNRESOLVABLE one (ELOOP,
+// EACCES). Byte-identical across all three, so the refusal cannot be used as an
+// existence — or an unresolvability — oracle (the #3589 information-leak half).
 func (r *runResolver) confinePath(field, in string) error {
 	if !r.httpTransport {
 		return nil
@@ -86,12 +88,15 @@ func (r *runResolver) confinePath(field, in string) error {
 	candidate, err := resolveForConfinement(in)
 	if err != nil {
 		// A resolution failure that is NOT "does not exist" (a permission
-		// error, a symlink loop) leaves containment UNDECIDABLE, so refuse.
-		// The message deliberately omits the underlying error, which could
-		// itself leak filesystem shape.
-		return fmt.Errorf(
-			"%s: %s %q could not be resolved for containment checking, so it is refused over the HTTP MCP transport (fail closed); %s",
-			pathOutsideAllowedRootsCode, field, in, allowedRootsRemedy)
+		// error, a symlink loop) leaves containment UNDECIDABLE, so refuse —
+		// with the SAME message an ordinary outside-root path draws. A distinct
+		// "could not be resolved" wording would have told the caller that the
+		// path exists in an unresolvable form (an ELOOP symlink cycle, a
+		// permission-blocked component) rather than not at all: one bit of
+		// filesystem shape, and the same oracle class the existing
+		// existing-vs-absent pairing closes. So every refusal below this point
+		// is byte-identical for a given field and path.
+		return outsideAllowedRootsRefusal(field, in)
 	}
 
 	for _, root := range r.allowedRoots {
@@ -112,6 +117,16 @@ func (r *runResolver) confinePath(field, in string) error {
 			return nil
 		}
 	}
+	return outsideAllowedRootsRefusal(field, in)
+}
+
+// outsideAllowedRootsRefusal is the ONE refusal confinePath returns for every
+// way a supplied path can fail containment: lying outside every root, and being
+// unresolvable (EACCES, ELOOP) so containment is undecidable. Sharing the text
+// is the control — a caller cannot tell the two apart, so the refusal reports
+// nothing about the named path beyond what the caller already supplied.
+// TestConfinePath/existence_non_leak compares all three cases byte-wise.
+func outsideAllowedRootsRefusal(field, in string) error {
 	return fmt.Errorf(
 		"%s: %s %q is not inside any allowed checkout root over the HTTP MCP transport; %s",
 		pathOutsideAllowedRootsCode, field, in, allowedRootsRemedy)
@@ -284,21 +299,25 @@ func (r *runResolver) confineSpecCandidate(candidate string) specCandidateVerdic
 // dir and the filesystem root) in step with discoverSpec if either changes;
 // TestDiscoverSpecConfined_MatchesUnconfinedWalkOnStdio pins that equivalence.
 //
-// Delegation: the EXPLICIT arm and the whole stdio posture hand straight back to
-// discoverSpec. An explicit path came from the caller, so the verb's own
-// confinePath already resolved and confined that exact file; stdio is
-// deliberately unconfined.
+// Delegation: the whole stdio posture hands straight back to discoverSpec, which
+// is deliberately unconfined (operator option (c)).
 //
-// Residual on that delegation: discoverSpec reads an explicit path BY PATHNAME,
-// so the check-to-read window readConfinedSpecFile closes for DISCOVERED files
-// remains open for a caller-supplied one. Narrower in consequence (the caller
-// named the file; a race can substitute its bytes, not steer the walk onto a
-// file they could not name) and closing it means routing the explicit arm
-// through the same root handle inside spec_discover.go, which is outside this
-// change. Stated in the README beside the rest of the confinement contract.
+// Over HTTP BOTH arms go through the confined open. The EXPLICIT arm used to
+// delegate to discoverSpec on the reasoning that the verb's own confinePath had
+// already confined that exact pathname — but confinePath validates a PATHNAME
+// and discoverSpec then reads it with os.ReadFile, re-traversing it, so the
+// explicit arm carried the identical check-to-read window readConfinedSpecFile
+// exists to close. The attacker controls the symlink TARGET, so "the caller
+// named the file" bounds nothing: any readable file on the host was reachable
+// regardless of the pathname typed. readExplicitSpecConfined closes it with the
+// same root-handle open, the same regular-file check and the same refusal text
+// the discovery walk uses.
 func (r *runResolver) discoverSpecConfined(startDir, explicit string) (*discoveredSpec, error) {
-	if explicit != "" || !r.httpTransport {
+	if !r.httpTransport {
 		return discoverSpec(startDir, explicit)
+	}
+	if explicit != "" {
+		return r.readExplicitSpecConfined(explicit)
 	}
 
 	dir, err := filepath.Abs(startDir)
@@ -353,6 +372,45 @@ func (r *runResolver) discoverSpecConfined(startDir, explicit string) (*discover
 	}
 }
 
+// readExplicitSpecConfined reads a caller-supplied spec_file over the HTTP
+// transport through the SAME confined open the discovery walk uses, closing the
+// check-to-read window that delegating to discoverSpec (os.ReadFile, by
+// pathname) left open for the explicit arm.
+//
+// The refusal text is confinedSpecDiscoveryError's, byte-identical to a
+// discovered escape's: the two must not be distinguishable, or the wording would
+// itself classify what happened in the window. A NOT-EXIST (or otherwise
+// ordinary read) failure keeps discoverSpec's `spec_file: <err>` shape, because
+// the caller named this file and a typo must read as a typo rather than as a
+// confinement refusal.
+//
+// The stationary confineSpecCandidate check runs first for the same reason it
+// does in the walk: it refuses before anything is opened. Its stop-walk verdict
+// has no meaning for an explicit path (there is no walk to stop), so anything
+// other than allow is a refusal here.
+func (r *runResolver) readExplicitSpecConfined(explicit string) (*discoveredSpec, error) {
+	abs, err := filepath.Abs(explicit)
+	if err != nil {
+		return nil, fmt.Errorf("spec_file: %w", err)
+	}
+	if r.confineSpecCandidate(abs) != specCandidateAllow {
+		return nil, confinedSpecDiscoveryError(abs)
+	}
+	data, rerr := r.readConfinedSpecFile(abs)
+	switch {
+	case rerr == nil:
+		return &discoveredSpec{
+			Path:     abs,
+			Contents: data,
+			BlobSHA:  gitBlobSHA(data),
+		}, nil
+	case errors.Is(rerr, errSpecEscapedDuringOpen):
+		return nil, confinedSpecDiscoveryError(abs)
+	default:
+		return nil, fmt.Errorf("spec_file: %w", rerr)
+	}
+}
+
 // errSpecEscapedDuringOpen is the sentinel readConfinedSpecFile returns when the
 // confined open refused to hand back the discovered file: a component of the
 // pathname (its leaf OR an ancestor) resolved outside the allowed root, the
@@ -363,12 +421,20 @@ func (r *runResolver) discoverSpecConfined(startDir, explicit string) (*discover
 var errSpecEscapedDuringOpen = errors.New("discovered spec escaped the allowed roots during the confined open")
 
 // specOpenRaceHook is a TEST-ONLY seam, nil in production and never assigned
-// outside _test.go. It fires in the window readConfinedSpecFile exists to
-// close — after the pre-open pathname check, before the confined open — so the
-// TOCTOU boundary can be exercised DETERMINISTICALLY (a test replaces the leaf
-// or an ancestor there) instead of only probabilistically by a racing
-// goroutine. It is deliberately not a behaviour switch: with it nil, the code
-// path below is byte-for-byte the shipped one.
+// outside _test.go. It fires in the window the confined open exists to close, at
+// the LATEST possible point: inside openSpecBeneathAllowedRoot, AFTER
+// specRelBeneathRoot has computed the root-relative name and IMMEDIATELY BEFORE
+// handle.OpenFile. Placement is the whole point of the seam (the low-tier
+// fix-up concern this closes). Fired earlier, a test's swap could be rejected
+// during the relative-name computation — a pathname refusal an ORDINARY
+// os.Open-after-name-computation would also produce — so the rows would not
+// discriminate the root handle. Firing here means the name is already fixed and
+// the ONLY thing left to refuse the swap is handle.OpenFile's component-wise
+// traversal: replacing it with os.Open(filepath.Join(resolvedRoot, rel)) turns
+// the ancestor row red.
+//
+// It is deliberately not a behaviour switch: with it nil, the code path is
+// byte-for-byte the shipped one.
 var specOpenRaceHook func(candidate string)
 
 // readConfinedSpecFile opens the discovered spec through a ROOT HANDLE and only
@@ -424,10 +490,6 @@ var specOpenRaceHook func(candidate string)
 //     weaker — the same platform caveat the byte-wise, non-case-folding
 //     containment comparison already carries.
 func (r *runResolver) readConfinedSpecFile(candidate string) ([]byte, error) {
-	if hook := specOpenRaceHook; hook != nil {
-		hook(candidate)
-	}
-
 	f, err := r.openSpecBeneathAllowedRoot(candidate)
 	if err != nil {
 		return nil, err
@@ -478,6 +540,11 @@ func (r *runResolver) openSpecBeneathAllowedRoot(candidate string) (*os.File, er
 		handle, err := os.OpenRoot(resolvedRoot)
 		if err != nil {
 			continue
+		}
+		// TEST-ONLY seam, nil in production: the relative name is now FIXED, so
+		// a swap staged here can only be refused by the confined open itself.
+		if hook := specOpenRaceHook; hook != nil {
+			hook(candidate)
 		}
 		f, oerr := handle.OpenFile(rel, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 		_ = handle.Close() // the opened file stays valid: it holds its own fd.

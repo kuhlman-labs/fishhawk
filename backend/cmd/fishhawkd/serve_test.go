@@ -3982,23 +3982,105 @@ func TestMCPRouteServerConfig_CarriesAllowedRoots(t *testing.T) {
 	}
 }
 
-// TestRunServe_MCPAllowedRootsFlagDefaultsToEnv pins the flag/env ladder on the
-// daemon: --mcp-allowed-roots defaults to FISHHAWKD_MCP_ALLOWED_ROOTS, so an
-// operator can configure it either way, and the UNSET default is the empty
-// (fail-closed) list.
-func TestRunServe_MCPAllowedRootsFlagDefaultsToEnv(t *testing.T) {
-	t.Setenv("FISHHAWKD_MCP_ALLOWED_ROOTS", "/env/root")
-	if got := envOr("FISHHAWKD_MCP_ALLOWED_ROOTS", ""); got != "/env/root" {
-		t.Fatalf("envOr read %q, want /env/root — the flag default reads this same value", got)
+// TestRegisterMCPAllowedRootsFlag_WiresFlagAndEnv pins the PRODUCTION
+// --mcp-allowed-roots registration runServe uses (E66.63 / #3589), replacing an
+// earlier test that asserted only a non-zero runServe exit on an argv which also
+// carried --nonexistent-flag — satisfied by the unknown flag alone, so it
+// distinguished nothing (the routed test-vacuity concern).
+//
+// Every row here registers the REAL helper on its own flag.FlagSet and asserts
+// the parsed VALUE, so a renamed flag, a renamed env var, a dropped env default
+// or an inverted precedence each fail here. It is not a test-local mirror:
+// runServe calls this same function.
+func TestRegisterMCPAllowedRootsFlag_WiresFlagAndEnv(t *testing.T) {
+	newFS := func() *flag.FlagSet {
+		fs := flag.NewFlagSet("fishhawkd serve", flag.ContinueOnError)
+		fs.SetOutput(io.Discard)
+		return fs
 	}
-	t.Setenv("FISHHAWKD_MCP_ALLOWED_ROOTS", "")
-	if got := envOr("FISHHAWKD_MCP_ALLOWED_ROOTS", ""); got != "" {
-		t.Errorf("unset env should yield the empty fail-closed default, got %q", got)
+
+	t.Run("env_supplies_the_default", func(t *testing.T) {
+		t.Setenv("FISHHAWKD_MCP_ALLOWED_ROOTS", "/env/root")
+		fs := newFS()
+		got := registerMCPAllowedRootsFlag(fs)
+		if err := fs.Parse(nil); err != nil {
+			t.Fatalf("parse with no args: %v", err)
+		}
+		if *got != "/env/root" {
+			t.Errorf("parsed value = %q, want /env/root from FISHHAWKD_MCP_ALLOWED_ROOTS", *got)
+		}
+		// The registered DEFAULT (not just the parsed value) must carry the env
+		// value, which is what makes the flag omissible in an env-configured
+		// deployment.
+		if f := fs.Lookup("mcp-allowed-roots"); f == nil {
+			t.Fatal("the flag must be registered as mcp-allowed-roots")
+		} else if f.DefValue != "/env/root" {
+			t.Errorf("DefValue = %q, want /env/root", f.DefValue)
+		}
+	})
+
+	t.Run("explicit_flag_wins_over_env", func(t *testing.T) {
+		t.Setenv("FISHHAWKD_MCP_ALLOWED_ROOTS", "/env/root")
+		fs := newFS()
+		got := registerMCPAllowedRootsFlag(fs)
+		// The flag NAME is asserted by parsing it: a rename in serve.go makes
+		// this Parse fail with "flag provided but not defined".
+		if err := fs.Parse([]string{"--mcp-allowed-roots", "/flag/root"}); err != nil {
+			t.Fatalf("the production flag name must parse: %v", err)
+		}
+		if *got != "/flag/root" {
+			t.Errorf("parsed value = %q, want /flag/root — an explicit flag must beat the env default", *got)
+		}
+	})
+
+	t.Run("unset_env_is_the_empty_fail_closed_default", func(t *testing.T) {
+		t.Setenv("FISHHAWKD_MCP_ALLOWED_ROOTS", "")
+		fs := newFS()
+		got := registerMCPAllowedRootsFlag(fs)
+		if err := fs.Parse(nil); err != nil {
+			t.Fatalf("parse with no args: %v", err)
+		}
+		if *got != "" {
+			t.Errorf("parsed value = %q, want empty (the fail-closed default)", *got)
+		}
+		// And the empty raw value is what mcpRouteServerConfig turns into ZERO
+		// roots — the fail-closed posture, not an unrestricted route.
+		if roots := mcpRouteServerConfig("u", "t", *got).AllowedRoots; len(roots) != 0 {
+			t.Errorf("AllowedRoots = %v, want empty for the unset default", roots)
+		}
+	})
+}
+
+// TestRunServe_RegistersMCPAllowedRootsFlag binds the helper above to the REAL
+// runServe flag set, which the helper test alone cannot: it asserts that
+// runServe's own parse ACCEPTS --mcp-allowed-roots by name. Discrimination comes
+// from a self-paired argv — the same invocation with a deliberately unknown flag
+// must produce the "not defined" parse error, and the known-flag invocation must
+// NOT. An argv carrying only --mcp-allowed-roots is failed deliberately AFTER
+// parsing, by an invalid --operator-min-permission, so runServe returns without
+// dialing a database or binding a port.
+func TestRunServe_RegistersMCPAllowedRootsFlag(t *testing.T) {
+	run := func(args ...string) string {
+		var sink bytes.Buffer
+		if code := runServe(args, &sink); code == 0 {
+			t.Fatalf("runServe(%v) = 0, want non-zero; output: %s", args, sink.String())
+		}
+		return sink.String()
 	}
-	// The flag itself must exist on the serve flag set with that default. A
-	// missing flag makes runServe exit non-zero on the unknown-flag path.
-	if code := runServe([]string{"--mcp-allowed-roots", "/repos", "--nonexistent-flag"}, io.Discard); code == 0 {
-		t.Error("expected a non-zero exit for an unknown flag (the known flag must parse first)")
+
+	known := run("--mcp-allowed-roots", "/repos", "--operator-min-permission", "not-a-permission")
+	if strings.Contains(known, "not defined") {
+		t.Errorf("runServe rejected --mcp-allowed-roots as an unknown flag; output: %s", known)
+	}
+	if !strings.Contains(known, "invalid --operator-min-permission") {
+		t.Errorf("expected the post-parse failure, meaning both flags parsed; output: %s", known)
+	}
+
+	// The self-pair: an actually-unknown flag in the same shape DOES produce the
+	// parse error, so the assertion above is not vacuous.
+	unknown := run("--definitely-not-a-fishhawkd-flag", "/repos")
+	if !strings.Contains(unknown, "not defined") {
+		t.Errorf("an unknown flag must draw a parse error; output: %s", unknown)
 	}
 }
 

@@ -1653,6 +1653,26 @@ func splitMCPAllowedRoots(raw string) []string {
 	return out
 }
 
+// registerMCPAllowedRootsFlag registers --mcp-allowed-roots on fs with its
+// FISHHAWKD_MCP_ALLOWED_ROOTS environment default and returns the bound value
+// runServe reads (E66.63 / #3589).
+//
+// Extracted from runServe's flag block so the wiring is DIRECTLY assertable:
+// runServe boots a daemon, so a test cannot run it to completion to observe the
+// parsed value, and asserting only that runServe exits non-zero on an argv
+// carrying the flag proves nothing (any other parse failure in the same argv
+// satisfies it — the test-vacuity defect this replaces). A test can register
+// this helper on its own flag.FlagSet and assert the PRODUCTION flag name, the
+// env default and the flag-over-env precedence on the real registration, not on
+// a test-local mirror. runServe calls it, so a rename here reddens both.
+func registerMCPAllowedRootsFlag(fs *flag.FlagSet) *string {
+	return fs.String("mcp-allowed-roots", envOr("FISHHAWKD_MCP_ALLOWED_ROOTS", ""),
+		"OS-path-list of absolute checkout roots every path-taking MCP input (working_dir, spec_file) must "+
+			"resolve inside on the /mcp route (E66.63 / #3589). Leaving it unset is FAIL CLOSED: /mcp refuses "+
+			"every path-taking verb with path_outside_allowed_roots. Containment compares cleaned, "+
+			"symlink-resolved paths")
+}
+
 // runServe boots the HTTP server with graceful SIGINT/SIGTERM
 // handling. Returns the intended process exit code.
 func runServe(args []string, logSink io.Writer) int {
@@ -1667,11 +1687,7 @@ func runServe(args []string, logSink io.Writer) int {
 			"The route is LOOPBACK-ONLY per ADR-033 — with the default --addr=:8080 the daemon binds every "+
 			"interface, so /mcp answers 403 until --addr is set to 127.0.0.1:8080. Use off as the explicit "+
 			"opt-out for a deployment that binds a non-loopback address on purpose")
-	mcpAllowedRoots := fs.String("mcp-allowed-roots", envOr("FISHHAWKD_MCP_ALLOWED_ROOTS", ""),
-		"OS-path-list of absolute checkout roots every path-taking MCP input (working_dir, spec_file) must "+
-			"resolve inside on the /mcp route (E66.63 / #3589). Leaving it unset is FAIL CLOSED: /mcp refuses "+
-			"every path-taking verb with path_outside_allowed_roots. Containment compares cleaned, "+
-			"symlink-resolved paths")
+	mcpAllowedRoots := registerMCPAllowedRootsFlag(fs)
 	oauthIssuer := fs.String("oauth-issuer", envOr("FISHHAWKD_OAUTH_ISSUER", ""),
 		"RFC 8414 issuer (https, origin-only, no path) for the OAuth 2.1 authorization server (ADR-076 / #2436); "+
 			"empty leaves the AS off. A non-empty but invalid value refuses to start rather than degrading silently")
