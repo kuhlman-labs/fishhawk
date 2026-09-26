@@ -181,6 +181,13 @@ type auditFake struct {
 	// cost_recorded, appending normally). Used to inject the
 	// unpriced_model_alert write-failure path in isolation.
 	appendErrCategory string
+	// appendErrCategoryErr, when set alongside appendErrCategory, is returned
+	// verbatim in place of the fixed "auditFake: injected append error for..."
+	// literal. Additive: nil (the zero value) falls back to the existing
+	// literal, so every current appendErrCategory user is unaffected. Lets a
+	// test plant a marker-bearing error string to prove where the append
+	// failure's cause is (and is not) surfaced (E45.94 / #3631).
+	appendErrCategoryErr error
 	// seeded is pre-existing history returned by ListAll alongside the
 	// entries appended during the test. The spend-alert check (#649)
 	// reads cost_recorded entries via ListAll to build its rolling
@@ -202,6 +209,9 @@ func (a *auditFake) AppendChained(_ context.Context, p audit.ChainAppendParams) 
 		return nil, a.appendErr
 	}
 	if a.appendErrCategory != "" && p.Category == a.appendErrCategory {
+		if a.appendErrCategoryErr != nil {
+			return nil, a.appendErrCategoryErr
+		}
 		return nil, errors.New("auditFake: injected append error for " + p.Category)
 	}
 	a.mu.Lock()

@@ -10163,7 +10163,7 @@ paths:
                   already_merged: { type: boolean, description: 'True when the endpoint OBSERVED the pull/merge request was already merged and queued NO merge (E45.87 / #3622); merge_queued is false on that path. Omitted (false) on the ordinary dispatch path.' }
                   merge_observation_recorded: { type: boolean, description: 'True ONLY when THIS call successfully appended the merge_observation_recorded audit row. False when the audit chain already carried merge evidence, and false when the append failed — the message then names POST /v0/runs/{run_id}/record-merge-observation as the recovery.' }
                   run_state: { type: string, description: 'On the already_merged path, the run lifecycle state after the endpoint best-effort re-evaluated run completion. Empty when the re-read failed.' }
-                  message: { type: string, description: 'On the already_merged path, the operator-facing explanation: what was (or was not) recorded, and — on a still non-terminal run — POST /v0/runs/{run_id}/reconcile-merge as the settling verb.' }
+                  message: { type: string, description: 'On the already_merged path, the operator-facing explanation: what was (or was not) recorded, and — on a still non-terminal run — POST /v0/runs/{run_id}/reconcile-merge as the settling verb. The message names WHAT failed and the recovery verb but never carries the underlying storage error text, which stays in the operator log correlated by request id.' }
         '400':
           description: |
             Malformed body or an empty `verdict`. Body's `error` is

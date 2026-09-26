@@ -321,8 +321,17 @@ func (s *Server) handleRecordMergeObservation(w http.ResponseWriter, r *http.Req
 		subject = "anonymous"
 	}
 	if aerr := s.appendMergeObservation(r.Context(), runID, subject, *obs); aerr != nil {
+		// E45.94/#3631: route the raw cause through the internalCauseKey
+		// channel rather than a plain "error" details key. writeError's 5xx
+		// default-deny allow-list already stripped "error" from the body — this
+		// is a CONFORMANCE change, not a body-content fix — but it makes the
+		// operator-only routing explicit at the call site and folds the cause
+		// into the log record's dedicated `cause` attribute instead of an
+		// incidental `details.error` member. run_id is allow-listed so the
+		// redacted body keeps a correlation handle.
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-			"append merge observation failed", map[string]any{"error": aerr.Error()})
+			"append merge observation failed",
+			map[string]any{"run_id": runID.String(), internalCauseKey: aerr.Error()})
 		return
 	}
 

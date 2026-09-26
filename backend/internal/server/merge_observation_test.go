@@ -1,9 +1,11 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -567,6 +569,72 @@ func TestRecordMergeObservationAppendFailureIsAnError(t *testing.T) {
 	f.s.cfg.AuditRepo = f.audit
 	if rows := f.observationRows(t); len(rows) != 0 {
 		t.Errorf("rows = %d, want 0: a failed append must not be reported as recorded", len(rows))
+	}
+}
+
+// plantedObserveAppendErrCause is a marker-bearing error text (E45.94/#3631,
+// binding approval condition 2) in the style of
+// error_redaction_integration_test.go's planted internals.
+const plantedObserveAppendErrCause = "storage: pgx: SQLSTATE 08006 dialing host=db.internal.example.com:5432 failed"
+
+// TestRecordMergeObservationAppendFailure_CauseIsOperatorOnly is E45.94/#3631's
+// SURFACE B control. The append-failure 500 body must carry run_id + error_ref
+// and NEITHER the planted marker NOR an `error` details key, while the
+// captured operator log record carries the marker under the dedicated `cause`
+// attribute. This is a CONFORMANCE change, not a body-content fix: the body
+// assertions here are expected to pass BOTH before and after the production
+// edit (the 5xx default-deny allow-list already stripped a plain "error" key);
+// only the `cause`-log-attribute assertion discriminates the internalCauseKey
+// routing.
+// COUNTERFACTUAL VEHICLE: reverting to the plain map[string]any{"error":
+// aerr.Error()} details key turns ONLY the cause-attribute assertion RED.
+func TestRecordMergeObservationAppendFailure_CauseIsOperatorOnly(t *testing.T) {
+	f := newObservationFixture(t, &fakePRStateReader{pr: mergedPR()})
+	var logBuf bytes.Buffer
+	f.s.cfg.Logger = slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	f.s.cfg.AuditRepo = &msAppendErrAudit{Repository: f.audit, err: errors.New(plantedObserveAppendErrCause)}
+	w := f.postObserve(t)
+	f.s.cfg.AuditRepo = f.audit
+
+	assertObserveRefusal(t, w, http.StatusInternalServerError, "internal_error")
+
+	body := w.Body.String()
+	if strings.Contains(body, plantedObserveAppendErrCause) {
+		t.Errorf("shipped body leaked the planted cause: %s", body)
+	}
+	var env errorEnvelope
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode error envelope: %v\n%s", err, body)
+	}
+	// This fixture posts directly to the handler (bypassing the requestID
+	// middleware, per postObserveWith's contract), so error_ref is empty by
+	// this test's own construction — not asserted here; see
+	// TestWriteError_5xxSetsErrorRefFromRequestID for that contract.
+	if _, ok := env.Error.Details["error"]; ok {
+		t.Error("details carries an `error` key, want it absent")
+	}
+	if got, ok := env.Error.Details["run_id"]; !ok || got == "" {
+		t.Errorf("details.run_id = %v, want the run's id present", got)
+	}
+
+	if !strings.Contains(logBuf.String(), plantedObserveAppendErrCause) {
+		t.Errorf("operator log must carry the planted cause; log:\n%s", logBuf.String())
+	}
+	var logLine struct {
+		Cause string `json:"cause"`
+	}
+	found := false
+	for _, line := range strings.Split(strings.TrimSpace(logBuf.String()), "\n") {
+		if line == "" {
+			continue
+		}
+		if err := json.Unmarshal([]byte(line), &logLine); err == nil && logLine.Cause == plantedObserveAppendErrCause {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("no log record carried the planted cause under the `cause` attribute; log:\n%s", logBuf.String())
 	}
 }
 
