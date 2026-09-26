@@ -5384,3 +5384,97 @@ func TestRunBranchRef_IsTheRefTriggerParamsDispatches(t *testing.T) {
 		})
 	}
 }
+
+// fakeEffectiveAcceptance is a test EffectiveAcceptanceResolver: it appends the
+// configured criteria to the plan's verification (standing in for a recorded
+// operator add) or returns err.
+type fakeEffectiveAcceptance struct {
+	add   []plan.AcceptanceCriterion
+	err   error
+	calls int
+}
+
+func (f *fakeEffectiveAcceptance) EffectiveAcceptanceVerification(_ context.Context, _ uuid.UUID, p *plan.Plan) (plan.Verification, error) {
+	f.calls++
+	if f.err != nil {
+		return plan.Verification{}, f.err
+	}
+	v := p.Verification
+	v.AcceptanceCriteria = append(append([]plan.AcceptanceCriterion(nil), v.AcceptanceCriteria...), f.add...)
+	return v, nil
+}
+
+// TestTryShortCircuitAcceptance_EffectiveVerification pins #3181's short-circuit
+// awareness: the predicates evaluate the EFFECTIVE verification, so an
+// all-skip-with-basis plan carrying a recorded drivable operator add is NOT
+// short-circuited (the added criterion must be driven), while the same plan
+// with no add, a nil hook, or a resolver error short-circuits exactly as before.
+func TestTryShortCircuitAcceptance_EffectiveVerification(t *testing.T) {
+	allSkip := []map[string]any{
+		{"id": "webhook-fires", "statement": "webhook fires on close", "source": "inferred", "rationale": "external", "skip_expected": true, "expectation_basis": "validated in webhook_integration_test.go with a fake"},
+		{"id": "issue-closes", "statement": "issue auto-closes", "source": "inferred", "rationale": "external", "skip_expected": true, "expectation_basis": "validated in closer_e2e_test.go"},
+	}
+	no := false
+	drivableAdd := []plan.AcceptanceCriterion{{
+		ID: "crit-op", Statement: "the operator-spotted path renders", Source: plan.CriterionSourceExplicit,
+		SourceRef: "operator_approval", Blocking: &no,
+	}}
+
+	t.Run("recorded drivable add -> no short-circuit", func(t *testing.T) {
+		r, stages, rs, ra, o := seedAcceptanceSkipRun(t, acceptanceSkipPlanBytes(t, nil, allSkip))
+		hook := &fakeEffectiveAcceptance{add: drivableAdd}
+		o.EffectiveAcceptance = hook
+
+		sc, liveReq, err := o.TryShortCircuitAcceptance(context.Background(), r.ID, stages[3].ID)
+		if err != nil {
+			t.Fatalf("TryShortCircuitAcceptance: %v", err)
+		}
+		if sc != nil {
+			t.Errorf("short-circuit = %+v, want nil (the added drivable criterion must be driven)", sc)
+		}
+		if !liveReq {
+			t.Error("liveValidationRequired = false, want true")
+		}
+		if hook.calls != 1 {
+			t.Errorf("resolver calls = %d, want 1", hook.calls)
+		}
+		if stages[3].State != run.StageStatePending {
+			t.Errorf("acceptance stage = %q, want pending (untouched)", stages[3].State)
+		}
+		for _, tr := range rs.stageTransitions {
+			if tr.StageID == stages[3].ID {
+				t.Errorf("stage transitioned to %q; want none", tr.To)
+			}
+		}
+		if n := countAcceptanceCategory(ra, "acceptance_outcome_recorded"); n != 0 {
+			t.Errorf("acceptance_outcome_recorded = %d, want 0", n)
+		}
+	})
+
+	for _, tc := range []struct {
+		name string
+		hook EffectiveAcceptanceResolver
+	}{
+		{"no add -> short-circuits as today", &fakeEffectiveAcceptance{}},
+		{"nil hook -> plan verbatim", nil},
+		{"resolver error -> plan verbatim", &fakeEffectiveAcceptance{add: drivableAdd, err: errors.New("audit store outage")}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, stages, _, _, o := seedAcceptanceSkipRun(t, acceptanceSkipPlanBytes(t, nil, allSkip))
+			o.EffectiveAcceptance = tc.hook
+			sc, liveReq, err := o.TryShortCircuitAcceptance(context.Background(), r.ID, stages[3].ID)
+			if err != nil {
+				t.Fatalf("TryShortCircuitAcceptance: %v", err)
+			}
+			if sc == nil || sc.Kind != AcceptanceShortCircuitAllSkipWithBasis || sc.CriteriaTotal != 2 {
+				t.Errorf("short-circuit = %+v, want all-skip-with-basis total=2", sc)
+			}
+			if liveReq {
+				t.Error("liveValidationRequired = true, want false on a short-circuit hit")
+			}
+			if stages[3].State != run.StageStateSucceeded {
+				t.Errorf("acceptance stage = %q, want succeeded", stages[3].State)
+			}
+		})
+	}
+}

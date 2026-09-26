@@ -1191,6 +1191,10 @@ func New(cfg Config) *Server {
 		// merge cancels the review stage, then the run) reaches the same
 		// dropped-retirement recorder the REST and budget cancel sinks call.
 		cfg.Orchestrator.RunCancelled = s
+		// #3181: the acceptance short-circuit predicates evaluate the
+		// EFFECTIVE verification (operator adds/retirements applied), so an
+		// operator-added drivable criterion is actually driven.
+		cfg.Orchestrator.EffectiveAcceptance = s
 	}
 	if cfg.GitHub != nil {
 		s.auditCheckPublisher = auditcheckpublisher.New(auditcheckpublisher.Deps{
