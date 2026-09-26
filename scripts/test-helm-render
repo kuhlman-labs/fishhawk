@@ -751,8 +751,11 @@ assert_contains "r9 NOTES states the existing-mode render-time limit" "$out" "CA
 # log capturing it. The value-disclosure assertion is scoped to the RUNNABLE
 # kubectl lines, not the whole NOTES text, because the surrounding prose names
 # the unsafe flags in order to warn against them.
+# The name is now shell-QUOTED (#2889); assert the quoted form, not a relaxed
+# substring on the bare name, so a regression back to bare interpolation reddens
+# this case too.
 assert_contains "r9 NOTES gives a key-name-only kubectl confirmation command" "$out" \
-  "describe secret fishhawk-secrets"
+  "describe secret 'fishhawk-secrets'"
 kubectl_cmds=$(printf '%s' "$out" | grep -E '^[[:space:]]+kubectl ' || true)
 if [ -n "$kubectl_cmds" ]; then pass "r9 NOTES carries at least one runnable kubectl command"; else
   fail "r9 NOTES carries no runnable kubectl command line to check"
@@ -771,6 +774,155 @@ envblock=$(printf '%s' "$out" | awk '/Env keys \(delivered via envFrom\)/{f=1;ne
 assert_absent "r9 NOTES omits the cell handoff secret off a cell profile" "$envblock" "FISHHAWKD_HANDOFF_SECRET"
 assert_absent "r9 NOTES omits the cell model key off a cell profile" "$envblock" "FISHHAWKD_MODEL_API_KEY"
 assert_contains "r9 NOTES still lists the baseline required keys off a cell profile" "$envblock" "- FISHHAWKD_DATABASE_URL"
+
+# ---------------------------------------------------------------------------
+# r9f/r9g/r9h — SHELL-QUOTING OF THE COPY-PASTEABLE kubectl COMMAND (#2889).
+#   NOTES.txt renders a command an operator PASTES into a terminal, with two
+#   Helm-controlled arguments: `--namespace` and fishhawk.secretName (which in
+#   `existing` mode is the operator-supplied `existingSecret`). Rendered BARE
+#   they are read as shell SYNTAX, so an `existingSecret` carrying `;`, `&&`,
+#   backticks or `$(...)` produces a line that RUNS those payloads. The fix
+#   routes both through fishhawk.shellQuote; these cases pin it.
+#
+#   r9f — the SECRET-NAME argument, one assertion per metacharacter class.
+#   r9g — the NAMESPACE argument, the same classes, so quoting only one site
+#         leaves the other case RED.
+#   r9h — the BEHAVIOURAL oracle. A string match proves the quoting was
+#         RENDERED, not that the shell agrees, so the rendered line is EXECUTED
+#         under a PATH-shadowing `kubectl` stub that logs argv one element per
+#         line: the hostile name must arrive as ONE byte-identical argv element,
+#         the argv COUNT must be exact (a word-split regression fails), and the
+#         `touch <sentinel>` payload must have left no file.
+#
+#   THE SENTINEL PATH IS BAKED ABSOLUTE INTO THE FIXTURE (approval condition 1),
+#   never `$SENTINEL` — an unexpanded shell variable inside the payload would
+#   make the absence assertion pass for the wrong reason. It lives under
+#   $tmproot, swept by the harness EXIT trap, so its absence is meaningful
+#   rather than incidental.
+#
+#   AND EACH SENTINEL-ABSENCE ASSERTION IS PAIRED WITH A POSITIVE CONTROL
+#   (approval condition 1): after the negative case, the SAME payload is run
+#   UNQUOTED (the pre-fix rendering) against the SAME sentinel path, and the
+#   sentinel MUST appear. That is what proves the absence assertion is
+#   load-bearing and not vacuous — a wrong path, an unexecutable stub or a
+#   never-run line would leave the sentinel absent too. Order matters: the
+#   negative case runs FIRST, then the sentinel is removed and the positive
+#   control runs.
+# ---------------------------------------------------------------------------
+r9_sentinel="$tmproot/r9-sentinel"
+# The fixture is written from a QUOTED heredoc (so the payload reaches disk
+# verbatim) with the absolute sentinel path substituted in, and the value is a
+# YAML single-quoted scalar so the embedded single quote is written as ''.
+cat > "$tmproot/r9-hostile.yaml.in" <<'EOF'
+secrets:
+  mode: existing
+existingSecret: 's; touch @SENTINEL@ && `id` $HOME $(whoami) it''s'
+EOF
+sed "s|@SENTINEL@|$r9_sentinel|" "$tmproot/r9-hostile.yaml.in" > "$tmproot/r9-hostile.yaml"
+# Prove the fixture really carries the ABSOLUTE path, not a shell variable.
+assert_contains "r9f the hostile fixture bakes the absolute sentinel path" \
+  "$(cat "$tmproot/r9-hostile.yaml")" "touch $r9_sentinel"
+assert_absent "r9f the hostile fixture does NOT defer the sentinel to a shell variable" \
+  "$(cat "$tmproot/r9-hostile.yaml")" 'touch $SENTINEL'
+
+# The value as the shell must ultimately see it (one argv element), and the
+# POSIX single-quoted form fishhawk.shellQuote must render for it.
+r9_hostile="s; touch $r9_sentinel && \`id\` \$HOME \$(whoami) it's"
+r9_quoted="'s; touch $r9_sentinel && \`id\` \$HOME \$(whoami) it'\\''s'"
+
+notes -f "$CHART/values-single-tenant.yaml" -f "$tmproot/r9-hostile.yaml"
+# The guard must not turn a hostile name into a RENDER FAILURE — the operator
+# still gets their NOTES, just an inert command line.
+assert_render_ok "r9f NOTES still renders exit 0 with a hostile existingSecret"
+r9_kubectl=$(printf '%s' "$out" | grep -E '^[[:space:]]+kubectl ' || true)
+if [ -n "$r9_kubectl" ]; then pass "r9f a runnable kubectl line was rendered for the hostile name"; else
+  fail "r9f no runnable kubectl line in the hostile render — the later assertions would be vacuous"
+fi
+assert_contains "r9f the secret-name argument is rendered single-quoted with the POSIX '\\'' escape" \
+  "$r9_kubectl" "describe secret $r9_quoted"
+# ONE ASSERTION PER METACHARACTER CLASS. Each asserts the class appears ONLY
+# inside the single-quoted token: strip that token from the line and the class
+# must be gone from what remains. A bare rendering leaves it in the remainder.
+r9_rest="${r9_kubectl/"$r9_quoted"/}"
+assert_absent "r9f command substitution \$(...) appears only inside the quoted token" "$r9_rest" '$(whoami)'
+assert_absent "r9f backtick substitution appears only inside the quoted token" "$r9_rest" '`id`'
+assert_absent "r9f the ; command separator appears only inside the quoted token" "$r9_rest" ';'
+assert_absent "r9f the && chain appears only inside the quoted token" "$r9_rest" '&&'
+assert_absent "r9f \$VAR parameter expansion appears only inside the quoted token" "$r9_rest" '$HOME'
+# The embedded single quote must be the close-escape-reopen escape, never a lone
+# quote that would terminate the quoting and re-expose the remainder.
+assert_contains "r9f the embedded single quote is rendered as the '\\'' escape" "$r9_kubectl" "it'\\''s"
+assert_absent "r9f the embedded single quote is NOT left bare (it would end the quoting)" "$r9_kubectl" "it's"
+
+# r9g — the NAMESPACE argument, independently exercised.
+notes -n 'ns$(id);x' -f "$CHART/values-single-tenant.yaml"
+assert_render_ok "r9g NOTES still renders exit 0 with a hostile --namespace"
+r9g_kubectl=$(printf '%s' "$out" | grep -E '^[[:space:]]+kubectl ' || true)
+assert_contains "r9g the namespace argument is rendered single-quoted" "$r9g_kubectl" "kubectl -n 'ns\$(id);x'"
+r9g_rest="${r9g_kubectl/"'ns\$(id);x'"/}"
+assert_absent "r9g namespace command substitution appears only inside the quoted token" "$r9g_rest" '$(id)'
+assert_absent "r9g namespace ; separator appears only inside the quoted token" "$r9g_rest" ';'
+
+# r9h — BEHAVIOURAL EXECUTION ORACLE.
+r9_stub="$tmproot/r9-kubectl-stub"
+mkdir -p "$r9_stub"
+cat > "$r9_stub/kubectl" <<'STUB'
+#!/bin/sh
+for a in "$@"; do printf '%s\n' "$a" >> "$KUBECTL_ARGV_LOG"; done
+exit 0
+STUB
+chmod +x "$r9_stub/kubectl"
+# _r9_exec <command-line> <argv-log> — run the line with only the stub kubectl
+# resolvable, from a $tmproot cwd. Sets r9_exec_rc.
+_r9_exec() {
+  : > "$2"
+  ( cd "$tmproot" && PATH="$r9_stub:$PATH" KUBECTL_ARGV_LOG="$2" sh -c "$1" ) >/dev/null 2>&1
+  r9_exec_rc=$?
+}
+rm -f "$r9_sentinel"
+r9_argv_log="$tmproot/r9-argv.log"
+_r9_exec "$r9_kubectl" "$r9_argv_log"
+# `sh` REJECTING the line (an unterminated quote from a wrong escape) must FAIL
+# the case, never skip it.
+assert_equals "r9h the rendered kubectl line is accepted and run by sh (exit 0)" "$r9_exec_rc" "0"
+r9_argv="$(cat "$r9_argv_log")"
+if grep -Fxq -- "$r9_hostile" "$r9_argv_log"; then
+  pass "r9h the hostile secret name arrives as ONE byte-identical argv element"
+else
+  fail "r9h the hostile secret name did NOT arrive as one verbatim argv element (got: $(printf '%s' "$r9_argv" | tr '\n' '|'))"
+fi
+assert_equals "r9h argv element count is exactly 5 (-n, ns, describe, secret, name) — a word-split regression fails" \
+  "$(wc -l < "$r9_argv_log" | tr -d ' ')" "5"
+assert_absent "r9h no \`id\` output leaked into argv (backtick substitution did not run)" "$r9_argv" "uid="
+assert_absent "r9h no \$(whoami) output leaked into argv" "$r9_argv" "$(whoami)"
+if [ -e "$r9_sentinel" ]; then
+  fail "r9h the embedded \`touch\` payload EXECUTED — the rendered line is not inert (sentinel $r9_sentinel exists)"
+else
+  pass "r9h the embedded touch payload did not execute (sentinel absent)"
+fi
+# POSITIVE CONTROL (approval condition 1): the SAME payload, the SAME absolute
+# sentinel, rendered UNQUOTED the way the pre-fix template did — the sentinel
+# MUST appear. Without this, the absence assertion above would also pass if the
+# path were wrong, the stub unexecutable or the line never run.
+rm -f "$r9_sentinel"
+# The value ENDS in an unbalanced single quote (`it's`), so the fully-unquoted
+# pre-fix line is a shell SYNTAX ERROR and would execute nothing — which would
+# make this control prove nothing. The control therefore drops that one trailing
+# token and keeps every other class (`;`, `touch`, `&&`, backticks, `$VAR`,
+# `$(...)`) intact; the `touch <sentinel>` the assertion keys on is the FIRST
+# thing on the line.
+r9_positive="${r9_hostile% it\'s}"
+assert_absent "r9h POSITIVE CONTROL line drops only the trailing unbalanced-quote token" \
+  "$r9_positive" "it'"
+assert_contains "r9h POSITIVE CONTROL line still carries the touch payload" \
+  "$r9_positive" "touch $r9_sentinel"
+_r9_exec "kubectl -n default describe secret $r9_positive" "$tmproot/r9-argv-positive.log"
+if [ -e "$r9_sentinel" ]; then
+  pass "r9h POSITIVE CONTROL: the UNQUOTED rendering DOES create the sentinel (the absence assertion is load-bearing)"
+else
+  fail "r9h POSITIVE CONTROL: the unquoted rendering did not create $r9_sentinel — the sentinel-absence assertion above is vacuous"
+fi
+rm -f "$r9_sentinel"
 
 # ---------------------------------------------------------------------------
 # r10 — THE OAUTH TRIO, POSITIVE + OFF POSTURE (E69.4 / #2915). fishhawkd
@@ -2082,8 +2234,16 @@ if [ -n "$r18_job" ]; then
   assert_contains "r18b bootstrap script probes with s3api head-bucket" "$r18_script" "s3api head-bucket"
   assert_contains "r18b bootstrap script creates with s3api create-bucket" "$r18_script" "s3api create-bucket"
   assert_contains "r18b bootstrap script forces path-style addressing via AWS_CONFIG_FILE" "$r18_script" "addressing_style = path"
-  assert_contains "r18b bootstrap script targets the rustfs Service on the api port" "$r18_script" 'endpoint="http://fishhawk-rustfs:9000"'
-  assert_contains "r18b bootstrap script targets the configured bucket" "$r18_script" 'bucket="fishhawk-traces"'
+  # EXACT-FORM, and matched against the POST-YAML-DECODING script text
+  # (approval condition 2): $r18_script is what _r18_job_script produced from
+  # the `command: [- |]` block literal and is byte-identical to what /bin/sh
+  # receives, so these needles are the single-quoted text the container runs —
+  # not the template source. Kept exact rather than relaxed to the value alone
+  # so a regression back to double quotes reddens them (#2889).
+  assert_contains "r18b bootstrap script targets the rustfs Service on the api port (shell-quoted)" "$r18_script" "endpoint='http://fishhawk-rustfs:9000'"
+  assert_contains "r18b bootstrap script targets the configured bucket (shell-quoted)" "$r18_script" "bucket='fishhawk-traces'"
+  assert_absent "r18b the endpoint assignment is NOT double-quoted (POSIX double quotes keep \$, backtick and backslash special)" "$r18_script" 'endpoint="'
+  assert_absent "r18b the bucket assignment is NOT double-quoted" "$r18_script" 'bucket="'
   r18_jobenv="$(yaml_block "$r18_job" env)"
   assert_contains "r18b bootstrap Job env sets AWS_CONFIG_FILE (the path-style config target)" "$r18_jobenv" "- name: AWS_CONFIG_FILE"
   assert_contains "r18b bootstrap Job env carries AWS_ACCESS_KEY_ID from rustfs.accessKey" "$r18_jobenv" "- name: AWS_ACCESS_KEY_ID"
@@ -2139,6 +2299,56 @@ if [ -n "$r18_script" ]; then
   assert_equals "r18e-d list-buckets was probed three times (two failures, one success)" \
     "$(printf '%s\n' "$r18_calls" | grep -c 's3api list-buckets')" "3"
   assert_contains "r18e-d the retry loop logged its wait" "$r18_out" "rustfs not ready yet; retrying"
+
+  # r18f — HOSTILE rustfs.bucket (#2889). The bucket name is values-derived and
+  # lands inside a script the CLUSTER RUNS, so a bare interpolation is a shorter
+  # path to execution than the NOTES paste vector. Same shape as r9f/r9h: the
+  # sentinel path is BAKED ABSOLUTE into the --set-string value (approval
+  # condition 1), the negative case runs first, and a POSITIVE CONTROL then runs
+  # the SAME payload through the pre-fix DOUBLE-quoted assignment against the
+  # SAME sentinel path to prove the absence assertion is load-bearing.
+  r18_sentinel="$tmproot/r18-sentinel"
+  rm -f "$r18_sentinel"
+  render -f "$CHART/values-local.yaml" --set-string "rustfs.bucket=b\$(touch $r18_sentinel)x"
+  assert_render_ok "r18f a hostile rustfs.bucket still renders exit 0"
+  r18_hostile_job=""
+  while IFS= read -r -d '' doc; do
+    case "$(doc_name "$doc")" in *-rustfs-bucket) r18_hostile_job="$doc" ;; esac
+  done < <(docs_of_kind "$out" Job)
+  if [ -n "$r18_hostile_job" ]; then
+    r18_hostile_script="$(_r18_job_script "$r18_hostile_job")"
+    # EXACT FORM, against the post-YAML-decoding script text (condition 2).
+    assert_contains "r18f the hostile bucket is assigned single-quoted in the extracted script" \
+      "$r18_hostile_script" "bucket='b\$(touch $r18_sentinel)x'"
+    r18_hostile_file="$tmproot/r18-hostile-bootstrap.sh"
+    printf '%s\n' "$r18_hostile_script" > "$r18_hostile_file"
+    _r18_run_script "$r18_hostile_file" 254 0 0
+    assert_equals "r18f the hostile-bucket script still exits 0" "$r18_rc" "0"
+    assert_contains "r18f the hostile bucket reached aws as one literal argument" \
+      "$r18_calls" "s3api head-bucket --bucket b\$(touch $r18_sentinel)x"
+    if [ -e "$r18_sentinel" ]; then
+      fail "r18f the bucket's \$(touch) payload EXECUTED in the bootstrap script (sentinel $r18_sentinel exists)"
+    else
+      pass "r18f the bucket's \$(touch) payload did not execute (sentinel absent)"
+    fi
+    # POSITIVE CONTROL: rewrite ONLY the assignment back to the pre-fix
+    # double-quoted form — exactly what `bucket="{{ .Values.rustfs.bucket }}"`
+    # rendered — and re-run. The sentinel MUST appear.
+    rm -f "$r18_sentinel"
+    r18_pos_file="$tmproot/r18-hostile-bootstrap-unquoted.sh"
+    sed "s|^bucket='b.*x'\$|bucket=\"b\$(touch $r18_sentinel)x\"|" "$r18_hostile_file" > "$r18_pos_file"
+    assert_contains "r18f POSITIVE CONTROL script carries the pre-fix double-quoted assignment" \
+      "$(cat "$r18_pos_file")" "bucket=\"b\$(touch $r18_sentinel)x\""
+    _r18_run_script "$r18_pos_file" 254 0 0
+    if [ -e "$r18_sentinel" ]; then
+      pass "r18f POSITIVE CONTROL: the pre-fix DOUBLE-quoted assignment DOES create the sentinel (the absence assertion is load-bearing)"
+    else
+      fail "r18f POSITIVE CONTROL: the double-quoted assignment did not create $r18_sentinel — the r18f absence assertion is vacuous"
+    fi
+    rm -f "$r18_sentinel"
+  else
+    fail "r18f the rustfs-bucket Job is absent from the hostile-bucket render — the hostile cases never ran"
+  fi
 else
   fail "r18e bootstrap script unavailable — the behavioural cases (a)-(d) never ran"
 fi

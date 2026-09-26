@@ -49,7 +49,7 @@ rather than listed as optional noise.
   base64-encoded VALUE of every credential in the Secret, which is a disclosure,
   not a key listing.
 
-    kubectl -n {{ .Release.Namespace }} describe secret {{ include "fishhawk.secretName" . }}
+    kubectl -n {{ include "fishhawk.shellQuote" .Release.Namespace }} describe secret {{ include "fishhawk.shellQuote" (include "fishhawk.secretName" .) }}
 {{- end }}
 {{- if .Values.secrets.githubApp.privateKeyFile.enabled }}
 

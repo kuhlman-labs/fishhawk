@@ -485,6 +485,41 @@ choice, and says so; the live drill below records the real behaviour
 under an authorized and an under-privileged identity rather than
 predicting it.
 
+### Shell-quoting rendered commands (`fishhawk.shellQuote`, [#2889](https://github.com/kuhlman-labs/fishhawk/issues/2889))
+
+Any Helm-controlled value the chart renders into a command an operator
+**pastes** or into a script the cluster **executes** goes through
+`fishhawk.shellQuote`. Those values come from `--set`, a values file or
+`--namespace` — inputs the chart does not control — so rendered bare
+they are read as shell *syntax*, not as data: an `existingSecret` of
+`s; rm -rf /` produced a copy-pasteable `kubectl` line that ran
+`rm -rf /`, and a values-derived bucket name ran inside the hook Job's
+`/bin/sh`.
+
+Four interpolation sites are routed through the helper:
+
+| Template | Site |
+|---|---|
+| `templates/NOTES.txt` | the `-n <namespace>` argument of the key-confirmation command |
+| `templates/NOTES.txt` | the `describe secret <name>` argument (`fishhawk.secretName`) |
+| `templates/rustfs-bucket-job.yaml` | the bootstrap script's `endpoint=` assignment |
+| `templates/rustfs-bucket-job.yaml` | the bootstrap script's `bucket=` assignment |
+
+Surrounding **prose** is deliberately left bare — the `Secret name:`
+line and the "add `<key>` to the existing Secret" sentence are
+descriptive text, and quoting them would misrepresent them as runnable.
+
+`| quote` (sprig `quote`, what the issue proposed) was **rejected as
+insufficient**: POSIX double-quotes keep `$`, backtick and backslash
+special (Shell Command Language §2.2.3), so `$(...)`, backticks and
+`$VAR` still expand inside them. The helper single-quotes instead
+(§2.2.2 preserves every character literally) and escapes an embedded
+single quote with the close-escape-reopen idiom `'\''` — bare sprig
+`squote` does no escaping, so a name containing `'` would close the
+quoting and re-expose the remainder.
+
+Pinned by the render gate's r9f/r9g/r9h and r18f/r18b cases below.
+
 ### GitHub App private key
 
 Never an env string. It lives in the same Secret under a dotted key
@@ -805,6 +840,15 @@ rendered output — the credential-contract failure modes (one case per
 named mode), the migrate Job's timing and `restartPolicy`, the
 `envFrom` wiring across all three workload shapes plus the migrate Job,
 the derived ingress URLs, the Mode-1 half-configured fail-closed case,
+the **shell-quoting** of the copy-pasteable `kubectl` command
+([r9f/r9g/r9h](https://github.com/kuhlman-labs/fishhawk/issues/2889) —
+one assertion per metacharacter class over the secret-name and the
+namespace argument independently, plus a behavioural oracle that RUNS
+the rendered line under a PATH-shadowing `kubectl` stub and asserts the
+hostile name arrives as one byte-identical argv element, the argv count
+is exact, and the embedded `touch <sentinel>` payload left no file —
+each sentinel-absence assertion paired with a positive control in which
+the UNQUOTED rendering does create it),
 the OAuth-trio positive + OFF posture (r10) and one case per named
 `fishhawk.validateOAuthTrio` failure mode (r11), the `config.extraEnv`
 passthrough with its collision / identifier guards and a BIDIRECTIONAL
@@ -838,7 +882,14 @@ text, that no `minio/` image ref survives, and the renamed
 script from the rendered Job and RUNS it under a stubbed `aws`:
 bucket absent + create succeeds → 0; bucket exists → 0 with no create
 attempted; create FAILS → non-zero (the case a render assertion cannot
-observe); not-ready → the readiness retry loops then succeeds. The
+observe); not-ready → the readiness retry loops then succeeds. r18b additionally
+pins the `endpoint=`/`bucket=` assignments in their **single-quoted**
+exact form against the post-YAML-decoding script text, and r18f renders
+a hostile `rustfs.bucket` (`b$(touch <absolute sentinel>)x`), asserts
+the single-quoted assignment, runs the extracted script and asserts the
+sentinel is absent — again with a positive control that re-runs the
+pre-fix double-quoted assignment and requires the sentinel to appear.
+The
 **config/secret checksum** case ([r19](https://github.com/kuhlman-labs/fishhawk/issues/3577))
 pins the rotation property above behaviourally: r19a/r19b assert all four
 pod templates carry 64-hex `checksum/config` + `checksum/secret`
@@ -982,6 +1033,11 @@ helm template fishhawk deploy/helm/fishhawk -f deploy/helm/fishhawk/values-local
 helm template fishhawk deploy/helm/fishhawk -f deploy/helm/fishhawk/values-prod.yaml   # ingress/TLS posture
 helm template fishhawk deploy/helm/fishhawk -f deploy/helm/fishhawk/values-single-tenant.yaml  # ADR-057 Mode 1
 helm template fishhawk deploy/helm/fishhawk -f deploy/helm/fishhawk/values-cell.yaml           # ADR-057 Mode 2
+# confirm a hostile existingSecret renders INERT in the pasteable kubectl line
+# (single-quoted, with the embedded quote as the POSIX '\'' escape):
+helm install --dry-run --generate-name deploy/helm/fishhawk \
+  -f deploy/helm/fishhawk/values-single-tenant.yaml \
+  --set-string 'existingSecret=s; touch /tmp/pwned && `id` $(whoami)' | grep 'describe secret'
 # confirm the credential contract fails a missing required key:
 helm template fishhawk deploy/helm/fishhawk --set secrets.mode=existing --set existingSecret=
 # confirm the OAuth trio guard fails each partial combination (all-three-or-none):

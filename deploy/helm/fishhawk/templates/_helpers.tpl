@@ -148,6 +148,39 @@ externalSecrets has ESO materialize a Secret of the same name via its target).
 {{- end -}}
 
 {{/*
+Shell-quote a Helm-controlled value that is rendered into a command an operator
+will PASTE (NOTES.txt) or into a script the cluster EXECUTES (the rustfs
+bucket-bootstrap Job). Three facts are load-bearing; do not weaken any of them:
+
+(a) PURPOSE. Those values come from `--set`, a values file or `--namespace` —
+    inputs the chart does not control. Rendered BARE they are read as shell
+    SYNTAX, so `existingSecret: "s; rm -rf /"` produces a copy-pasteable line
+    that runs `rm -rf /` in the operator's terminal, and a values-derived bucket
+    name runs in-cluster inside the hook Job's /bin/sh. Quoting makes the value
+    a single inert argument (#2889).
+
+(b) `| quote` / sprig `quote` IS INSUFFICIENT. POSIX double-quotes keep `$`,
+    backtick and backslash special (Shell Command Language §2.2.3), so
+    `$(whoami)`, `` `id` `` and `$VAR` still expand inside them. Only
+    single-quotes preserve every character literally (§2.2.2). The issue's
+    proposed `| quote` fix was rejected for exactly this reason.
+
+(c) BARE sprig `squote` IS ALSO INSUFFICIENT: it is `fmt.Sprintf("'%v'", v)`
+    with no escaping, so a value containing a single quote closes the quoting
+    and re-exposes the remainder to the shell. The `replace` below is the half
+    that closes that, using the POSIX close-escape-reopen idiom `'\''` (there
+    is no backslash escape INSIDE single quotes). Deleting the `replace` must
+    redden scripts/test-helm-render's embedded-single-quote assertion and the
+    r9h execution oracle.
+
+CONTEXT CONTRACT: pass a plain STRING, never the chart root —
+`include "fishhawk.shellQuote" .Values.rustfs.bucket`.
+*/}}
+{{- define "fishhawk.shellQuote" -}}
+{{- printf "'%s'" (replace "'" "'\\''" .) -}}
+{{- end -}}
+
+{{/*
 External URL consumed by the ConfigMap (FISHHAWKD_EXTERNAL_URL). Explicit
 config.externalUrl always wins. Otherwise, when the ingress is enabled with a
 host, derive `https://<host>` (`http://<host>` when ingress.tls is off). When
