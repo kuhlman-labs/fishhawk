@@ -15554,10 +15554,12 @@ paths:
                         type: string
                         description: |
                           A criterion id from the approved plan's
-                          `verification.acceptance_criteria`.
+                          `verification.acceptance_criteria`, or for `add` a
+                          FRESH `^[a-z0-9][a-z0-9-]*$` slug not already in the
+                          plan.
                       action:
                         type: string
-                        enum: [retire, restate, retire_scenario]
+                        enum: [retire, restate, add, retire_scenario]
                       reason:
                         type: string
                         description: |
@@ -15567,8 +15569,9 @@ paths:
                       statement:
                         type: string
                         description: |
-                          The replacement criterion statement; REQUIRED for
-                          `restate`, ignored for `retire`.
+                          The criterion statement; REQUIRED for `restate` (the
+                          replacement) and `add` (the new criterion), ignored
+                          for `retire`.
                   description: |
                     Optional list of amendments to the approved plan's acceptance
                     criteria (#2581). Plan-approval conditions reshape the design
@@ -15620,6 +15623,26 @@ paths:
                     server-side with no runner spawn — the retirement would be
                     approved and silently dropped, so it is never approved;
                     retire it on a run whose acceptance stage executes.
+
+                    `add` (#3181) APPENDS an operator-authored criterion at the
+                    gate instead of a full revise pass: `id` is a FRESH slug,
+                    `statement` and `reason` are REQUIRED. It is materialized
+                    drivable and NON-blocking (`source_ref:
+                    operator_approval`), ordered after every plan criterion,
+                    served in `acceptance_criteria` and
+                    `acceptance_criteria_ids`, and rendered under an
+                    operator-authored block telling the validator it did NOT
+                    pass plan review. It is advisory: a failed verdict naming
+                    ONLY operator-added criteria is recorded `passed` with
+                    `downgrade_basis` `added_criteria_only`. Refused `400
+                    validation_failed` with `details.rule` one of
+                    `criterion_id_exists`, `invalid_criterion_id`,
+                    `statement_required`, `reason_required`, `duplicate_id`,
+                    `amendment_not_approve_plan_stage`; `422
+                    acceptance_criteria_unavailable` on a plan with no
+                    criteria; `422 acceptance_criteria_all_operator_authored`
+                    when no reviewed criterion would stay live while any add is
+                    present, in one call or cumulatively.
                 claims_concern_ids:
                   type: array
                   items:

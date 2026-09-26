@@ -11041,6 +11041,7 @@ func TestBuild_Acceptance_NoConditionsNoAmendments_ByteIdentical(t *testing.T) {
 	withEmpty := base
 	withEmpty.AcceptanceCriteriaEffective = nil
 	withEmpty.AcceptanceCriteriaRetired = nil
+	withEmpty.AcceptanceCriteriaOperatorAdded = []OperatorAddedAcceptanceCriterion{}
 	withEmpty.AcceptanceDroppedScopePaths = []string{}
 	if span := spanOf(t, withEmpty); span != wantPreChangeAcceptanceCriteriaSpan {
 		t.Errorf("explicitly-empty amendment channels changed the criteria span:\n%q", span)
@@ -11086,6 +11087,69 @@ func TestBuild_Acceptance_RetiredCriterion_NotInLiveChecklist(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("acceptance prompt missing %q\n---\n%s", want, got)
 		}
+	}
+}
+
+// TestBuild_Acceptance_OperatorAddedCriterion_RendersAdvisoryBlock pins the
+// #3181 operator-added block: the added criterion renders in the LIVE checklist
+// (it is validated) AND in the operator-authored block with its reason and the
+// did-not-pass-review framing, the block renders BEFORE "### Output contract"
+// (so the closed-field-set count region is untouched), and it introduces no
+// verdict field. Deleting the writeAcceptanceOperatorAddedCriteria call leaves
+// this RED on the heading want.
+func TestBuild_Acceptance_OperatorAddedCriterion_RendersAdvisoryBlock(t *testing.T) {
+	p := acceptanceFixturePlan()
+	live := append([]plan.AcceptanceCriterion(nil), p.Verification.AcceptanceCriteria...)
+	f := false
+	live = append(live, plan.AcceptanceCriterion{
+		ID:        "ac-delete",
+		Statement: "DELETE /widgets/{id} returns 204",
+		Source:    plan.CriterionSourceExplicit,
+		SourceRef: "operator_approval",
+		Blocking:  &f,
+	})
+	got, err := Build("acceptance", Trigger{
+		Repo:                        "kuhlman-labs/fishhawk",
+		ApprovedPlan:                p,
+		AcceptanceCriteriaEffective: live,
+		AcceptanceCriteriaOperatorAdded: []OperatorAddedAcceptanceCriterion{
+			{ID: "ac-delete", Reason: "the plan never drives the delete route"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build(acceptance): %v", err)
+	}
+	const heading = "### Operator-authored at approval — validate, but advisory"
+	for _, want := range []string{
+		"DELETE /widgets/{id} returns 204",
+		heading,
+		"[ac-delete] added by the operator: the plan never drives the delete route",
+		"They did NOT pass plan review",
+		"MUST validate and report each one",
+		"does not condemn the change",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("acceptance prompt missing %q\n---\n%s", want, got)
+		}
+	}
+	hi, oi := strings.Index(got, heading), strings.Index(got, "### Output contract")
+	if hi < 0 || oi < 0 || hi > oi {
+		t.Errorf("operator-added block at %d must render BEFORE the output contract at %d", hi, oi)
+	}
+	if strings.Contains(got, "Retired at approval") {
+		t.Errorf("an add-only history must not render the retired block\n---\n%s", got)
+	}
+}
+
+// TestBuild_Acceptance_OperatorAddedEmpty_RendersNothing pins the inert case:
+// no added criteria renders no operator-authored block at all.
+func TestBuild_Acceptance_OperatorAddedEmpty_RendersNothing(t *testing.T) {
+	got, err := Build("acceptance", Trigger{Repo: "x/y", ApprovedPlan: acceptanceFixturePlan()})
+	if err != nil {
+		t.Fatalf("Build(acceptance): %v", err)
+	}
+	if strings.Contains(got, "Operator-authored at approval") {
+		t.Errorf("unamended acceptance prompt renders the operator-added block\n---\n%s", got)
 	}
 }
 
@@ -11792,6 +11856,7 @@ func TestBuild_Acceptance_DoesNotMutateApprovedPlan(t *testing.T) {
 		{"conditions", Trigger{Repo: "x/y", ApprovedPlan: p, ApprovalConditions: &conditions}},
 		{"effective", Trigger{Repo: "x/y", ApprovedPlan: p, AcceptanceCriteriaEffective: effective}},
 		{"dropped-paths", Trigger{Repo: "x/y", ApprovedPlan: p, AcceptanceDroppedScopePaths: []string{"a/b.go"}}},
+		{"operator-added", Trigger{Repo: "x/y", ApprovedPlan: p, AcceptanceCriteriaOperatorAdded: []OperatorAddedAcceptanceCriterion{{ID: "ac-x", Reason: "r"}}}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if _, err := Build("acceptance", tc.trig); err != nil {

@@ -15534,6 +15534,30 @@ func TestApprovePlan_RetireScenarioAdvertised(t *testing.T) {
 	}
 }
 
+// TestApprovePlan_AddCriterionAdvertised (#3181): the amend_acceptance_criteria
+// input's schema text names the add action, its fresh-id / required-statement
+// shape, the advisory semantics and every new refusal code, and the Action
+// field's own description names 'add'.
+func TestApprovePlan_AddCriterionAdvertised(t *testing.T) {
+	f, ok := reflect.TypeOf(ApprovePlanInput{}).FieldByName("AmendAcceptanceCriteria")
+	if !ok {
+		t.Fatal("ApprovePlanInput has no AmendAcceptanceCriteria field")
+	}
+	desc := f.Tag.Get("jsonschema")
+	for _, want := range []string{"'add'", "FRESH lowercase slug", "NEVER blocking", "added_criteria_only",
+		"criterion_id_exists", "invalid_criterion_id", "acceptance_criteria_all_operator_authored"} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("amend_acceptance_criteria description missing %q", want)
+		}
+	}
+	for field, want := range map[string]string{"Action": "'add'", "Statement": "'add'", "ID": "'add'"} {
+		sf, _ := reflect.TypeOf(AcceptanceCriteriaAmendment{}).FieldByName(field)
+		if !strings.Contains(sf.Tag.Get("jsonschema"), want) {
+			t.Errorf("AcceptanceCriteriaAmendment.%s description does not name %s", field, want)
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // acceptance transcript on fishhawk_get_run_status (E72.5 / #3329)
 // ---------------------------------------------------------------------------

@@ -274,7 +274,8 @@ type promptResponse struct {
 	// target instance.
 	EgressTargetHosts []string `json:"egress_target_hosts,omitempty"`
 	// AcceptanceCriteriaIDs is the approved plan's
-	// verification.acceptance_criteria id list (the E31.1 join keys), served
+	// verification.acceptance_criteria id list (the E31.1 join keys) plus every
+	// operator-added id (#3181, the effective seam's AllIDs superset), served
 	// ONLY on acceptance stages (E31.7 / #1535). The runner validates the
 	// acceptance verdict's criteria[].id join keys against this set before
 	// shipping, failing closed on an unknown id. Absent on every other stage
@@ -1404,7 +1405,7 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		// renders), so a degraded audit read can never silence a criterion.
 		trigger.ApprovalConditions = s.resolveApprovalConditions(r.Context(), runRow)
 		trigger.AcceptanceDroppedScopePaths = s.loadApprovalRemoveScopeFiles(r.Context(), runRow.ID)
-		trigger.AcceptanceCriteriaEffective, trigger.AcceptanceCriteriaRetired =
+		trigger.AcceptanceCriteriaEffective, trigger.AcceptanceCriteriaRetired, trigger.AcceptanceCriteriaOperatorAdded =
 			s.resolveAcceptancePromptCriteria(r.Context(), runRow.ID, approvedPlan)
 	}
 
@@ -2078,7 +2079,7 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		// renders), so a degraded audit read can never silence a criterion.
 		trigger.ApprovalConditions = s.resolveApprovalConditions(r.Context(), runRow)
 		trigger.AcceptanceDroppedScopePaths = s.loadApprovalRemoveScopeFiles(r.Context(), runRow.ID)
-		trigger.AcceptanceCriteriaEffective, trigger.AcceptanceCriteriaRetired =
+		trigger.AcceptanceCriteriaEffective, trigger.AcceptanceCriteriaRetired, trigger.AcceptanceCriteriaOperatorAdded =
 			s.resolveAcceptancePromptCriteria(r.Context(), runRow.ID, approvedPlan)
 	}
 
@@ -4967,6 +4968,13 @@ func (s *Server) fillAcceptanceReplayFields(ctx context.Context, runID, stageID 
 		if recordDrop && s.cfg.AuditRepo != nil {
 			s.recordAcceptanceRetirementsUnserved(ctx, runID, stageID, err)
 		}
+	}
+	// acceptance_criteria_ids must stay a SUPERSET of every id a verdict may
+	// name (#3181): the seam's AllIDs is the plan ids plus every operator-added
+	// id, so the runner's served-id join-key check admits a verdict row for an
+	// added criterion. On a read error the plan-only set stays as served.
+	if err == nil && len(eff.AllIDs) > 0 {
+		resp.AcceptanceCriteriaIDs = eff.AllIDs
 	}
 	for _, c := range live {
 		resp.AcceptanceCriteria = append(resp.AcceptanceCriteria, acceptanceCriterionEntry{

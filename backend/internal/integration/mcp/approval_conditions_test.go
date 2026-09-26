@@ -469,6 +469,163 @@ func TestE2E_AmendAcceptanceCriteria_RetiredAtApproval_ReachesAcceptancePromptAn
 	}
 }
 
+// TestE2E_AmendAcceptanceCriteria_AddedAtApproval_ReachesAcceptancePrompt is
+// the cross-boundary proof for #3181: MCP fishhawk_approve_plan carrying an
+// `add` → HTTP approvals handler → approval_submitted audit payload → the
+// single effective-criteria seam → prompt.Trigger → the rendered acceptance
+// prompt. Per-layer units pass while this seam breaks (a Trigger field
+// populated but never rendered, an MCP struct dropping `statement`), so it
+// asserts the PROMPT TEXT names the added criterion as operator-authored and
+// that acceptance_criteria_ids serves the added id.
+func TestE2E_AmendAcceptanceCriteria_AddedAtApproval_ReachesAcceptancePrompt(t *testing.T) {
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	auditRepo := audit.NewPostgresRepository(fx.pool)
+	artifactRepo := artifact.NewPostgresRepository(fx.pool)
+	approvalRepo := approval.NewPostgresRepository(fx.pool)
+	srv := server.New(server.Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      fx.runRepo,
+		AuditRepo:    auditRepo,
+		SigningRepo:  signing.NewPostgresRepository(fx.pool),
+		ArtifactRepo: artifactRepo,
+		ApprovalRepo: approvalRepo,
+		APITokenRepo: fx.apitokenRepo,
+		GitHub:       githubclient.New(nil),
+	})
+	httpSrv := httptest.NewServer(srv.Handler())
+	t.Cleanup(httpSrv.Close)
+
+	planStage, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID:            fx.runID,
+		Sequence:         1,
+		Type:             runpkg.StageTypePlan,
+		ExecutorKind:     runpkg.ExecutorAgent,
+		ExecutorRef:      "fishhawk/runner@v1",
+		RequiresApproval: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateStage plan: %v", err)
+	}
+	planContent, err := json.Marshal(map[string]any{
+		"plan_version": "standard_v1",
+		"summary":      "scoped plan",
+		"verification": map[string]any{
+			"test_strategy": "ts",
+			"rollback_plan": "rb",
+			"acceptance_criteria": []map[string]any{
+				{"id": "crit-1", "statement": "the run settles", "source": "explicit"},
+				{"id": "crit-2", "statement": "the stages list", "source": "explicit"},
+			},
+		},
+		"scope": map[string]any{
+			"files": []map[string]any{
+				{"path": "backend/internal/server/prompt.go", "operation": "modify"},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	sv := "standard_v1"
+	sum := sha256.Sum256(planContent)
+	if _, err := artifactRepo.Create(ctx, artifact.CreateParams{
+		StageID:       planStage.ID,
+		Kind:          artifact.KindPlan,
+		SchemaVersion: &sv,
+		Content:       planContent,
+		ContentHash:   hex.EncodeToString(sum[:]),
+	}); err != nil {
+		t.Fatalf("Create plan artifact: %v", err)
+	}
+	parkAtGate(t, ctx, fx.runRepo, planStage.ID)
+
+	acceptStage, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID:        fx.runID,
+		Sequence:     2,
+		Type:         runpkg.StageTypeAcceptance,
+		ExecutorKind: runpkg.ExecutorAgent,
+		ExecutorRef:  "fishhawk/runner@v1",
+	})
+	if err != nil {
+		t.Fatalf("CreateStage acceptance: %v", err)
+	}
+
+	// REAL MCP approve carrying the add.
+	session := connectMCPClient(t, ctx, fx.mcpBinary, fx.operatorTok, httpSrv.URL)
+	res, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name: "fishhawk_approve_plan",
+		Arguments: map[string]any{
+			"run_id": fx.runID.String(),
+			"amend_acceptance_criteria": []map[string]any{{
+				"id": "crit-delete", "action": "add",
+				"reason":    "the plan never drives the delete route",
+				"statement": "DELETE /v0/runs/{id} returns 204",
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool fishhawk_approve_plan: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("approve with an add returned a tool error: %s", toolContentString(t, res))
+	}
+
+	subs, err := auditRepo.ListForRunByCategory(ctx, fx.runID, "approval_submitted")
+	if err != nil {
+		t.Fatalf("ListForRunByCategory approval_submitted: %v", err)
+	}
+	if len(subs) != 1 {
+		t.Fatalf("approval_submitted entries = %d, want 1", len(subs))
+	}
+	var submitted struct {
+		Amendments []struct {
+			ID        string `json:"id"`
+			Action    string `json:"action"`
+			Reason    string `json:"reason"`
+			Statement string `json:"statement"`
+		} `json:"amend_acceptance_criteria"`
+	}
+	if err := json.Unmarshal(subs[0].Payload, &submitted); err != nil {
+		t.Fatalf("decode approval_submitted payload: %v", err)
+	}
+	if len(submitted.Amendments) != 1 || submitted.Amendments[0].ID != "crit-delete" ||
+		submitted.Amendments[0].Action != "add" || submitted.Amendments[0].Statement != "DELETE /v0/runs/{id} returns 204" {
+		t.Fatalf("recorded amendments = %+v, want one crit-delete add carrying its statement", submitted.Amendments)
+	}
+
+	promptBody := getPromptRenderRaw(t, ctx, httpSrv.URL, acceptStage.ID)
+	var rendered struct {
+		Prompt                string   `json:"prompt"`
+		AcceptanceCriteriaIDs []string `json:"acceptance_criteria_ids"`
+	}
+	if err := json.Unmarshal(promptBody, &rendered); err != nil {
+		t.Fatalf("decode prompt-render: %v", err)
+	}
+	for _, want := range []string{
+		"DELETE /v0/runs/{id} returns 204",
+		"Operator-authored at approval",
+		"[crit-delete] added by the operator: the plan never drives the delete route",
+		"They did NOT pass plan review",
+		"the run settles",
+	} {
+		if !strings.Contains(rendered.Prompt, want) {
+			t.Errorf("acceptance prompt missing %q\n---\n%s", want, rendered.Prompt)
+		}
+	}
+	var servesAdded bool
+	for _, id := range rendered.AcceptanceCriteriaIDs {
+		if id == "crit-delete" {
+			servesAdded = true
+		}
+	}
+	if !servesAdded {
+		t.Errorf("acceptance_criteria_ids = %v, want the superset carrying the added crit-delete", rendered.AcceptanceCriteriaIDs)
+	}
+}
+
 // getPromptRenderRaw fetches GET /v0/stages/{id}/prompt-render and returns the
 // raw response body, so a test can assert on wire fields beyond `prompt`.
 func getPromptRenderRaw(t *testing.T, ctx context.Context, baseURL string, stageID uuid.UUID) []byte {

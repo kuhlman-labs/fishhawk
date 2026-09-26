@@ -525,6 +525,14 @@ type Trigger struct {
 	// if it reports them at all, reports result=skipped citing the reason. Nil
 	// for every run that used no amendment.
 	AcceptanceCriteriaRetired []RetiredAcceptanceCriterion
+	// AcceptanceCriteriaOperatorAdded is the set the operator APPENDED at the
+	// plan gate through amend_acceptance_criteria action=add (#3181), each with
+	// its recorded reason. The criteria themselves ride
+	// AcceptanceCriteriaEffective (they are live and drivable); this field
+	// renders an explicit "added at approval" block telling the validator they
+	// did NOT pass plan review and are advisory. Nil for every run that added
+	// nothing, so the prompt stays byte-identical.
+	AcceptanceCriteriaOperatorAdded []OperatorAddedAcceptanceCriterion
 	// AcceptanceDroppedScopePaths carries the repo-relative paths the operator
 	// dropped from the implement scope at the approval gate via
 	// remove_scope_files (#2581, operator binding condition 1). They ride the
@@ -3747,6 +3755,7 @@ func buildAcceptance(t Trigger) string {
 	// judges the running instance against.
 	writeAcceptanceCriteriaForAcceptance(&b, t)
 	writeAcceptanceRetiredCriteria(&b, t)
+	writeAcceptanceOperatorAddedCriteria(&b, t)
 
 	// Target instance section. The value is the acceptance stage's first
 	// spec-declared egress target host (the E31.4/#1532 egress-allowance
@@ -4103,6 +4112,40 @@ func writeAcceptanceRetiredCriteria(b *strings.Builder, t Trigger) {
 		"report `result`=`skipped` citing the retirement reason in `expectation_basis`.\n\n")
 	for _, rc := range t.AcceptanceCriteriaRetired {
 		fmt.Fprintf(b, "- [%s] retired: %s\n", rc.ID, rc.Reason)
+	}
+	b.WriteString("\n")
+}
+
+// OperatorAddedAcceptanceCriterion is one acceptance criterion the operator
+// APPENDED at the plan-approval gate (#3181). The server's
+// resolveEffectiveAcceptanceCriteria seam is the only producer.
+type OperatorAddedAcceptanceCriterion struct {
+	ID     string
+	Reason string
+}
+
+// writeAcceptanceOperatorAddedCriteria renders the criteria the operator
+// APPENDED at the approval gate (#3181), each with its recorded reason. They
+// are live — they appear in the checklist above and must be validated — but
+// they never passed plan review, so the block says so and tells the validator
+// a failure on one alone does not condemn the change. Like the retired block it
+// renders BEFORE the "### Output contract" section and reuses only the
+// already-enumerated result / expectation_basis / notes fields. Renders nothing
+// when nothing was added, so an unamended prompt is byte-identical.
+func writeAcceptanceOperatorAddedCriteria(b *strings.Builder, t Trigger) {
+	if len(t.AcceptanceCriteriaOperatorAdded) == 0 {
+		return
+	}
+	b.WriteString("### Operator-authored at approval — validate, but advisory\n\n")
+	b.WriteString("The operator APPENDED these acceptance criteria at the plan-approval gate, with " +
+		"the reason recorded on the approval audit entry. They did NOT pass plan review: no " +
+		"planner wrote them and no reviewer checked them. They appear in the checklist above " +
+		"and you MUST validate and report each one like any other criterion (`result`, " +
+		"`expectation_basis`, `notes`). They are advisory, not blocking: a failure on one of " +
+		"them ALONE does not condemn the change — report it honestly as `result`=`failed` " +
+		"rather than marking it skipped to protect the change.\n\n")
+	for _, ac := range t.AcceptanceCriteriaOperatorAdded {
+		fmt.Fprintf(b, "- [%s] added by the operator: %s\n", ac.ID, ac.Reason)
 	}
 	b.WriteString("\n")
 }

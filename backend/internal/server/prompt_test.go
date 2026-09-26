@@ -12514,6 +12514,94 @@ func TestRenderStagePrompt_Acceptance_RestateOnly_RendersReplacement(t *testing.
 // TestGetStagePrompt_Acceptance_NoAmendments_NoNewBlocks is the inert-when-unused
 // control on the server path: with no approval row at all, neither #2581 block
 // renders and the full plan criteria set is served.
+// seedAcceptanceAddition records an approve-decision approval_submitted row on
+// the acceptance-prompt fixture's PLAN stage ADDING ac-delete (#3181), BY
+// CONSTRUCTION (never through the approve gate).
+func seedAcceptanceAddition(t *testing.T, s *Server, runID uuid.UUID) {
+	t.Helper()
+	rr := s.cfg.RunRepo.(*promptRunRepo)
+	var planStageID uuid.UUID
+	for _, st := range rr.stagesByRunID[runID] {
+		if st.Type == run.StageTypePlan {
+			planStageID = st.ID
+		}
+	}
+	if planStageID == uuid.Nil {
+		t.Fatal("fixture has no plan stage")
+	}
+	raw, _ := json.Marshal(map[string]any{
+		"stage_id": planStageID.String(),
+		"decision": "approve",
+		"amend_acceptance_criteria": []acceptanceCriteriaAmendment{{
+			ID: "ac-delete", Action: acceptanceAmendActionAdd,
+			Reason: "the plan never drives the delete route", Statement: "DELETE /widgets/1 returns 204",
+		}},
+	})
+	rid, sid := runID, planStageID
+	au := s.cfg.AuditRepo.(*auditFake)
+	au.seeded = append(au.seeded, &audit.Entry{
+		RunID: &rid, StageID: &sid, Sequence: 4,
+		Category: "approval_submitted", Payload: raw,
+	})
+}
+
+// TestStagePrompt_Acceptance_OperatorAddedCriterion pins the #3181 wiring on
+// BOTH acceptance prompt paths (signed dispatch and unsigned render): the added
+// criterion renders in the live checklist AND in the operator-authored block,
+// is served in acceptance_criteria as drivable, and joins
+// acceptance_criteria_ids (the superset the runner's join-key check reads — an
+// added id missing from it would fail a verdict row closed).
+func TestStagePrompt_Acceptance_OperatorAddedCriterion(t *testing.T) {
+	for _, path := range []string{"dispatch", "render"} {
+		t.Run(path, func(t *testing.T) {
+			s, runID, acceptanceStageID, priv, _ := newAcceptancePromptServer(t)
+			seedAcceptanceAddition(t, s, runID)
+			var w *httptest.ResponseRecorder
+			if path == "dispatch" {
+				w = promptRequest(t, s, runID, acceptanceStageID, priv, "")
+			} else {
+				w = promptRenderRequest(t, s, acceptanceStageID)
+			}
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+			}
+			var resp promptResponse
+			if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			for _, want := range []string{
+				"DELETE /widgets/1 returns 204",
+				"Operator-authored at approval",
+				"[ac-delete] added by the operator: the plan never drives the delete route",
+				"They did NOT pass plan review",
+				"POST /widgets returns 201",
+			} {
+				if !strings.Contains(resp.Prompt, want) {
+					t.Errorf("acceptance prompt missing %q\n---\n%s", want, resp.Prompt)
+				}
+			}
+			if strings.Contains(resp.Prompt, "Retired at approval") {
+				t.Errorf("an add-only history must not render the retired block")
+			}
+			if want := []string{"ac-create", "ac-list", "ac-delete"}; !reflect.DeepEqual(resp.AcceptanceCriteriaIDs, want) {
+				t.Errorf("AcceptanceCriteriaIDs = %v, want %v (superset incl. the added id)", resp.AcceptanceCriteriaIDs, want)
+			}
+			var found bool
+			for _, c := range resp.AcceptanceCriteria {
+				if c.ID == "ac-delete" {
+					found = true
+					if !c.Drivable || c.Statement != "DELETE /widgets/1 returns 204" {
+						t.Errorf("served added criterion = %+v, want drivable with its statement", c)
+					}
+				}
+			}
+			if !found {
+				t.Errorf("acceptance_criteria = %+v, want ac-delete served", resp.AcceptanceCriteria)
+			}
+		})
+	}
+}
+
 func TestGetStagePrompt_Acceptance_NoAmendments_NoNewBlocks(t *testing.T) {
 	s, runID, acceptanceStageID, priv, _ := newAcceptancePromptServer(t)
 	w := promptRequest(t, s, runID, acceptanceStageID, priv, "")
@@ -12524,7 +12612,7 @@ func TestGetStagePrompt_Acceptance_NoAmendments_NoNewBlocks(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	for _, unwanted := range []string{"Binding approval conditions", "Retired at approval", "Paths DROPPED from scope"} {
+	for _, unwanted := range []string{"Binding approval conditions", "Retired at approval", "Paths DROPPED from scope", "Operator-authored at approval"} {
 		if strings.Contains(resp.Prompt, unwanted) {
 			t.Errorf("acceptance prompt renders %q with the feature unused\n---\n%s", unwanted, resp.Prompt)
 		}
