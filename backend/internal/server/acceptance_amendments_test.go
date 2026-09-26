@@ -227,7 +227,7 @@ func TestResolveAcceptancePromptCriteria_RestateOnly_RendersReplacement(t *testi
 	})
 	p := &plan.Plan{Verification: plan.Verification{AcceptanceCriteria: amendCriteria()}}
 
-	live, retired := s.resolveAcceptancePromptCriteria(context.Background(), runRow.ID, p)
+	live, retired, _ := s.resolveAcceptancePromptCriteria(context.Background(), runRow.ID, p)
 	if len(live) != 3 {
 		t.Fatalf("live = %+v, want the three-criterion effective set (a restate-only history must not fall back to the plan set)", live)
 	}
@@ -246,7 +246,7 @@ func TestResolveAcceptancePromptCriteria_NoAmendments_NilNil(t *testing.T) {
 	s, _, _, _, runRow, _ := newAmendServer(t, amendCriteria())
 	p := &plan.Plan{Verification: plan.Verification{AcceptanceCriteria: amendCriteria()}}
 
-	live, retired := s.resolveAcceptancePromptCriteria(context.Background(), runRow.ID, p)
+	live, retired, _ := s.resolveAcceptancePromptCriteria(context.Background(), runRow.ID, p)
 	if live != nil || retired != nil {
 		t.Errorf("unamended resolve = (%+v, %+v), want nil/nil", live, retired)
 	}
@@ -437,7 +437,7 @@ func TestResolveAcceptancePromptCriteria_AuditError_RendersFullSet(t *testing.T)
 	au.listErr = errors.New("audit store outage")
 	p := &plan.Plan{Verification: plan.Verification{AcceptanceCriteria: amendCriteria()}}
 
-	live, retired := s.resolveAcceptancePromptCriteria(context.Background(), runRow.ID, p)
+	live, retired, _ := s.resolveAcceptancePromptCriteria(context.Background(), runRow.ID, p)
 	if live != nil || retired != nil {
 		t.Errorf("degraded resolve returned live=%v retired=%v, want nil/nil (render the full plan set)", live, retired)
 	}
@@ -998,4 +998,207 @@ func planPredicateCalls(t *testing.T, file, fn string) map[string]struct{} {
 		t.Fatalf("%s.%s: no plan.* predicate call found (function missing or renamed?)", file, fn)
 	}
 	return out
+}
+
+// ---------------------------------------------------------------------------
+// #3181: the add action — refusal table, anti-substitution gate, seam.
+// ---------------------------------------------------------------------------
+
+// TestAmendCriteria_Add_Refusals is one case per named add refusal, each
+// asserting the status AND details.rule so a refusal firing for an unrelated
+// reason cannot green it. Bad state is seeded BY CONSTRUCTION.
+func TestAmendCriteria_Add_Refusals(t *testing.T) {
+	cases := []struct {
+		name, body, rule string
+		priorAdd         bool
+	}{
+		{"plan-id collision", `[{"id":"crit-2","action":"add","reason":"r","statement":"s"}]`, "criterion_id_exists", false},
+		{"prior-approval-added collision", `[{"id":"crit-extra","action":"add","reason":"again","statement":"s2"}]`, "criterion_id_exists", true},
+		{"scenario prefix", `[{"id":"scenario:issue-1/crit-x","action":"add","reason":"r","statement":"s"}]`, "criterion_id_exists", false},
+		{"invalid slug", `[{"id":"Bad_ID","action":"add","reason":"r","statement":"s"}]`, "invalid_criterion_id", false},
+		{"empty id", `[{"id":"  ","action":"add","reason":"r","statement":"s"}]`, "invalid_criterion_id", false},
+		{"missing statement", `[{"id":"crit-new","action":"add","reason":"r"}]`, "statement_required", false},
+		{"blank reason", `[{"id":"crit-new","action":"add","reason":"  ","statement":"s"}]`, "reason_required", false},
+		{"duplicate add", `[{"id":"crit-new","action":"add","reason":"r","statement":"s"},{"id":"crit-new","action":"add","reason":"r2","statement":"s2"}]`, "duplicate_id", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _, au, app, runRow, stage := newAmendServer(t, amendCriteria())
+			if tc.priorAdd {
+				au.seedApprovalEntry(runRow.ID, stage.ID, 2, "approve", []acceptanceCriteriaAmendment{
+					{ID: "crit-extra", Action: acceptanceAmendActionAdd, Reason: "prior add", Statement: "prior statement"},
+				})
+			}
+			w := submitApproval(t, s, stage.ID, amendBody(tc.body))
+			assertAmendRefused(t, w, app, au, http.StatusBadRequest, "validation_failed", tc.rule)
+		})
+	}
+	// R5 for add, reject and non-plan stage separately.
+	t.Run("add on reject", func(t *testing.T) {
+		s, _, au, app, _, stage := newAmendServer(t, amendCriteria())
+		w := submitApproval(t, s, stage.ID,
+			`{"decision":"reject","amend_acceptance_criteria":[{"id":"crit-new","action":"add","reason":"r","statement":"s"}]}`)
+		assertAmendRefused(t, w, app, au, http.StatusBadRequest, "validation_failed", "amendment_not_approve_plan_stage")
+	})
+	t.Run("add on non-plan stage", func(t *testing.T) {
+		s, rr, au, app, runRow, _ := newAmendServer(t, amendCriteria())
+		implStage := rr.seedStage(runRow.ID, 1, run.StageStateAwaitingApproval)
+		implStage.Type = run.StageTypeImplement
+		w := submitApproval(t, s, implStage.ID,
+			amendBody(`[{"id":"crit-new","action":"add","reason":"r","statement":"s"}]`))
+		assertAmendRefused(t, w, app, au, http.StatusBadRequest, "validation_failed", "amendment_not_approve_plan_stage")
+	})
+	// R9 applies to add: an add on a criteria-less plan would be the first and
+	// only criterion — the wholly-operator-authored contract.
+	t.Run("add on criteria-less plan", func(t *testing.T) {
+		s, _, au, app, _, stage := newAmendServer(t, nil)
+		w := submitApproval(t, s, stage.ID,
+			amendBody(`[{"id":"crit-new","action":"add","reason":"r","statement":"s"}]`))
+		assertAmendRefused(t, w, app, au, http.StatusUnprocessableEntity, "acceptance_criteria_unavailable", "")
+	})
+}
+
+// TestAmendCriteria_Add_AllOperatorAuthored_SingleCall: retiring every reviewed
+// criterion while adding one in the SAME call is refused under the
+// anti-substitution code, not all_retired — deleting R12 turns it into
+// acceptance_criteria_all_retired and this goes RED on the code.
+func TestAmendCriteria_Add_AllOperatorAuthored_SingleCall(t *testing.T) {
+	s, _, au, app, _, stage := newAmendServer(t, amendCriteria())
+	w := submitApproval(t, s, stage.ID, amendBody(
+		`[{"id":"crit-1","action":"retire","reason":"a"},`+
+			`{"id":"crit-2","action":"retire","reason":"b"},`+
+			`{"id":"crit-3","action":"retire","reason":"c"},`+
+			`{"id":"crit-new","action":"add","reason":"replacement","statement":"s"}]`))
+	assertAmendRefused(t, w, app, au, http.StatusUnprocessableEntity, "acceptance_criteria_all_operator_authored", "")
+	for _, want := range []string{`"reviewed_live_count":0`, `"added_count":1`, "crit-new"} {
+		if !strings.Contains(w.Body.String(), want) {
+			t.Errorf("refusal body missing %s: %s", want, w.Body.String())
+		}
+	}
+}
+
+// TestAmendCriteria_Add_AllOperatorAuthored_Cumulative: a PRIOR approval
+// recorded an add and retired two reviewed criteria; retiring the last reviewed
+// one now would leave only the operator-authored criterion live. The gate reads
+// the recorded union, not this request alone.
+func TestAmendCriteria_Add_AllOperatorAuthored_Cumulative(t *testing.T) {
+	s, _, au, app, runRow, stage := newAmendServer(t, amendCriteria())
+	au.seedApprovalEntry(runRow.ID, stage.ID, 2, "approve", []acceptanceCriteriaAmendment{
+		{ID: "crit-extra", Action: acceptanceAmendActionAdd, Reason: "prior add", Statement: "prior statement"},
+		{ID: "crit-1", Action: acceptanceAmendActionRetire, Reason: "prior a"},
+	})
+	au.seedApprovalEntry(runRow.ID, stage.ID, 3, "approve", []acceptanceCriteriaAmendment{
+		{ID: "crit-2", Action: acceptanceAmendActionRetire, Reason: "prior b"},
+	})
+	w := submitApproval(t, s, stage.ID,
+		amendBody(`[{"id":"crit-3","action":"retire","reason":"the last reviewed one"}]`))
+	assertAmendRefused(t, w, app, au, http.StatusUnprocessableEntity, "acceptance_criteria_all_operator_authored", "")
+	if !strings.Contains(w.Body.String(), `"added_count":1`) {
+		t.Errorf("refusal body missing the prior add count: %s", w.Body.String())
+	}
+}
+
+// TestAmendCriteria_Add_Accepted_RecordedCanonical: a valid add passes the gate
+// and is recorded canonical (trimmed) with its statement on approval_submitted.
+func TestAmendCriteria_Add_Accepted_RecordedCanonical(t *testing.T) {
+	s, _, au, _, _, stage := newAmendServer(t, amendCriteria())
+	w := submitApproval(t, s, stage.ID,
+		amendBody(`[{"id":" crit-new ","action":"add","reason":" drive the delete route ","statement":" DELETE returns 204 "}]`))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	payload := findApprovalSubmittedPayload(t, au.appended)
+	entries, _ := payload["amend_acceptance_criteria"].([]any)
+	if len(entries) != 1 {
+		t.Fatalf("amend_acceptance_criteria = %v, want one entry", payload["amend_acceptance_criteria"])
+	}
+	e, _ := entries[0].(map[string]any)
+	if e["id"] != "crit-new" || e["action"] != "add" || e["reason"] != "drive the delete route" || e["statement"] != "DELETE returns 204" {
+		t.Errorf("recorded add = %v, want trimmed id/action/reason/statement", e)
+	}
+}
+
+// TestResolveEffectiveCriteria_RecordedAdd_Materializes pins the seam: a
+// recorded add lands in Live (after every plan-origin criterion, drivable,
+// non-blocking, operator_approval-sourced), in AllIDs (the served superset) and
+// in Added, and amended() is true for an add-only history.
+func TestResolveEffectiveCriteria_RecordedAdd_Materializes(t *testing.T) {
+	s, _, au, _, runRow, stage := newAmendServer(t, amendCriteria())
+	au.seedApprovalEntry(runRow.ID, stage.ID, 4, "approve", []acceptanceCriteriaAmendment{
+		{ID: "crit-new", Action: acceptanceAmendActionAdd, Reason: "the plan never drives delete", Statement: "DELETE returns 204"},
+	})
+	au.seedApprovalEntry(runRow.ID, stage.ID, 5, "approve", []acceptanceCriteriaAmendment{
+		{ID: "crit-1", Action: acceptanceAmendActionRetire, Reason: "superseded"},
+		{ID: "crit-new2", Action: acceptanceAmendActionAdd, Reason: "second add", Statement: "s2"},
+	})
+	p := &plan.Plan{Verification: plan.Verification{AcceptanceCriteria: amendCriteria()}}
+	eff, err := s.resolveEffectiveAcceptanceCriteria(context.Background(), runRow.ID, p, nil)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	gotIDs := make([]string, 0, len(eff.Live))
+	for _, c := range eff.Live {
+		gotIDs = append(gotIDs, c.ID)
+	}
+	if want := []string{"crit-2", "crit-3", "crit-new", "crit-new2"}; !reflect.DeepEqual(gotIDs, want) {
+		t.Errorf("Live ids = %v, want %v (added AFTER plan-origin)", gotIDs, want)
+	}
+	if want := []string{"crit-1", "crit-2", "crit-3", "crit-new", "crit-new2"}; !reflect.DeepEqual(eff.AllIDs, want) {
+		t.Errorf("AllIDs = %v, want %v (superset incl. added ids)", eff.AllIDs, want)
+	}
+	if want := []string{"crit-new", "crit-new2"}; !reflect.DeepEqual(eff.Added, want) {
+		t.Errorf("Added = %v, want %v", eff.Added, want)
+	}
+	added := eff.Live[2]
+	if added.Statement != "DELETE returns 204" || added.SkipExpected || added.Blocking == nil || *added.Blocking ||
+		added.Source != plan.CriterionSourceExplicit || added.SourceRef != acceptanceAdditionSourceOperator ||
+		added.Rationale != "the plan never drives delete" {
+		t.Errorf("added criterion = %+v, want drivable, non-blocking, explicit/operator_approval, rationale=reason", added)
+	}
+	if len(eff.Retired) != 1 || eff.Retired[0].ID != "crit-1" {
+		t.Errorf("Retired = %+v, want crit-1 only", eff.Retired)
+	}
+	if _, ok := eff.addedIDSet()["crit-new2"]; !ok {
+		t.Errorf("addedIDSet missing crit-new2")
+	}
+}
+
+// TestResolveAcceptancePromptCriteria_AddOnly_RendersAdded: an add-only history
+// is an amendment (amended() keys on Added) — the prompt resolver returns the
+// live set carrying the added criterion AND the operator-added projection, and
+// no retired block. Deleting the Added clause of amended() leaves this RED.
+func TestResolveAcceptancePromptCriteria_AddOnly_RendersAdded(t *testing.T) {
+	s, _, au, _, runRow, stage := newAmendServer(t, amendCriteria())
+	au.seedApprovalEntry(runRow.ID, stage.ID, 4, "approve", []acceptanceCriteriaAmendment{
+		{ID: "crit-new", Action: acceptanceAmendActionAdd, Reason: "the plan never drives delete", Statement: "DELETE returns 204"},
+	})
+	p := &plan.Plan{Verification: plan.Verification{AcceptanceCriteria: amendCriteria()}}
+	live, retired, added := s.resolveAcceptancePromptCriteria(context.Background(), runRow.ID, p)
+	if len(live) != 4 || live[3].ID != "crit-new" {
+		t.Fatalf("live = %+v, want the plan set plus crit-new last", live)
+	}
+	if retired != nil {
+		t.Errorf("retired = %+v, want nil", retired)
+	}
+	if want := []prompt.OperatorAddedAcceptanceCriterion{{ID: "crit-new", Reason: "the plan never drives delete"}}; !reflect.DeepEqual(added, want) {
+		t.Errorf("added = %+v, want %+v", added, want)
+	}
+}
+
+// TestAmendments_RetireScenario_AddMakesPersistable: on an all-skip-with-basis
+// plan a retire_scenario alone is unpersistable (pinned above), but the SAME
+// request carrying a drivable add is accepted — the check evaluates the
+// POST-amendment verification, under which the runner spawns.
+func TestAmendments_RetireScenario_AddMakesPersistable(t *testing.T) {
+	v := plan.Verification{AcceptanceCriteria: []plan.AcceptanceCriterion{
+		{ID: "c1", Statement: "s", Source: plan.CriterionSourceExplicit, SkipExpected: true, ExpectationBasis: "posture A"},
+		{ID: "c2", Statement: "s", Source: plan.CriterionSourceExplicit, SkipExpected: true, ExpectationBasis: "posture A"},
+	}}
+	s, _, _, _, stage := newAmendServerWithVerification(t, v)
+	w := submitApproval(t, s, stage.ID, amendBody(
+		`[{"id":"scenario:issue-101/crit-b","action":"retire_scenario","reason":"behaviour replaced"},`+
+			`{"id":"crit-drive","action":"add","reason":"drive it","statement":"GET /x returns 200"}]`))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (the add makes the runner spawn):\n%s", w.Code, w.Body.String())
+	}
 }

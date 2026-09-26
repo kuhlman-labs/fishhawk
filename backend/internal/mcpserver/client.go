@@ -1463,7 +1463,8 @@ type approvalRequest struct {
 	ClaimsAllOpenPlanConcerns bool `json:"claims_all_open_plan_concerns,omitempty"`
 	// AmendAcceptanceCriteria is the operator's approve-time amendment of the
 	// approved plan's acceptance criteria (#2581): retire or restate a criterion
-	// by id, each with a required reason. The backend validates it pre-Submit and
+	// by id, add an operator-authored one (#3181), or retire a replay scenario,
+	// each with a required reason. The backend validates it pre-Submit and
 	// records it on the approval audit payload. The DisallowUnknownFields decoder
 	// requires the field be declared here too; reject and amendment-less approve
 	// callers pass nil (omitempty).
@@ -1602,8 +1603,15 @@ type approvalResult struct {
 //     (#2581: the acceptance-criteria amendment refusals, each naming the
 //     offending entry under details.id and the specific refusal under
 //     details.rule — unknown_criterion_id, unknown_action, reason_required,
-//     statement_required, duplicate_id, already_retired, or
-//     amendment_not_approve_plan_stage. Pre-insert: fix the entry and re-approve)
+//     statement_required, duplicate_id, already_retired,
+//     amendment_not_approve_plan_stage, and for the #3181 add action
+//     criterion_id_exists or invalid_criterion_id. Pre-insert: fix the entry
+//     and re-approve)
+//   - 422 acceptance_criteria_all_operator_authored (#3181: the amendment would
+//     leave NO reviewed criterion live while an operator-added one is present —
+//     the anti-substitution mirror of all_retired, read off the same union, so
+//     it fires cumulatively too. No override; re-plan. details carry
+//     reviewed_live_count and added_count)
 //   - 422 acceptance_criteria_all_retired (#2581: the amendment would retire
 //     EVERY acceptance criterion in the approved plan — the anti-silencing gate,
 //     evaluated on the union of prior recorded retirements and this request's, so

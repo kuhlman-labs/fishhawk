@@ -115,6 +115,19 @@ type RunCancelledObserver interface {
 	OnRunCancelled(ctx context.Context, runID uuid.UUID, source string)
 }
 
+// EffectiveAcceptanceResolver resolves the EFFECTIVE acceptance verification
+// for a run (#3181): the approved plan's verification with its
+// acceptance_criteria replaced by the run's effective live set — operator
+// retirements removed, restatements applied, operator-added criteria appended
+// — as recorded on the run's approval chain. It is implemented server-side
+// (*server.Server), which owns the approval-chain machinery, so the
+// orchestrator cannot compute it without an import cycle. The short-circuit
+// predicates in tryShortCircuitAcceptanceCore evaluate its result; an error
+// makes the caller fall back to the plan's verification verbatim.
+type EffectiveAcceptanceResolver interface {
+	EffectiveAcceptanceVerification(ctx context.Context, runID uuid.UUID, p *plan.Plan) (plan.Verification, error)
+}
+
 // Orchestrator wires the run repository to a GitHub client to
 // advance a run's stages. Construct directly via the public fields;
 // every dependency is required (the orchestrator no-ops if any is
@@ -158,6 +171,16 @@ type Orchestrator struct {
 	// posture, no observer, no notification. Never fired on a failed or
 	// succeeded resolution.
 	RunCancelled RunCancelledObserver
+
+	// EffectiveAcceptance, when wired, resolves the EFFECTIVE acceptance
+	// verification (#3181) the three acceptance short-circuit predicates
+	// evaluate, so an operator-added drivable criterion on an otherwise
+	// all-skip-with-basis plan makes the acceptance stage dispatch instead of
+	// settling to not_validated with the added criterion never driven. Wired
+	// by server.New as a back-reference exactly like RunCancelled. Nil = the
+	// CLI/dev posture: the predicates read the approved plan verbatim, which
+	// is also the fallback on a resolver error (WARN-logged).
+	EffectiveAcceptance EffectiveAcceptanceResolver
 
 	// MaxParallelChildren is the global default cap on how many decomposed
 	// child runs may dispatch concurrently (E24.6 / #1146), wired from
@@ -1306,7 +1329,7 @@ func (o *Orchestrator) walkAcceptanceToSucceededFrom(ctx context.Context, stageI
 }
 
 // tryShortCircuitAcceptanceCore is the shared acceptance short-circuit arm
-// (#1928): it evaluates the three disjoint approved-plan predicates
+// (#1928): it evaluates the three disjoint acceptance predicates
 // (out-of-scope skip, empty-criteria, all-skip-with-basis), and on a hit walks
 // the target acceptance stage straight to succeeded and emits the matching audit
 // (the skip marker for out-of-scope, a NOT-VALIDATED verdict for the other two —
@@ -1322,6 +1345,14 @@ func (o *Orchestrator) walkAcceptanceToSucceededFrom(ctx context.Context, stageI
 // plan-stageless recovery child resolves its ancestor's plan by walking
 // ParentRunID, so BOTH the predicates AND liveValidationRequired evaluate
 // against the ancestor plan rather than falling through to nil.
+//
+// The predicates evaluate the EFFECTIVE verification (#3181), resolved once via
+// the nil-safe EffectiveAcceptance hook: the approved plan's verification with
+// acceptance_criteria replaced by the run's effective live set. Without it an
+// all-skip-with-basis plan carrying an operator-added drivable criterion would
+// still short-circuit to not_validated and the added criterion would never be
+// driven. The predicate SET is unchanged; a nil hook or a resolver error
+// evaluates the approved plan verbatim (the pre-#3181 behaviour).
 //
 // liveValidationRequired (E48.6 / #1953) is true ONLY when the target is an
 // admissible acceptance stage, the approved plan loaded, and NONE of the three
@@ -1350,25 +1381,28 @@ func (o *Orchestrator) tryShortCircuitAcceptanceCore(ctx context.Context, r *run
 	if approvedPlan == nil {
 		return nil, false, nil
 	}
+	// Evaluate the predicates against the EFFECTIVE verification (#3181), so
+	// an operator-added drivable criterion counts and a retired one does not.
+	v := o.effectiveAcceptanceVerification(ctx, r.ID, approvedPlan)
 	switch {
-	case plan.AcceptanceSkippableOutOfScope(approvedPlan.Verification):
+	case plan.AcceptanceSkippableOutOfScope(v):
 		if err := o.walkAcceptanceToSucceededFrom(ctx, target.ID, target.State, "out-of-scope skip"); err != nil {
 			return nil, false, err
 		}
-		o.emitAcceptanceSkippedOutOfScope(ctx, r.ID, target.ID, target.Sequence, len(approvedPlan.Verification.OutOfScope))
+		o.emitAcceptanceSkippedOutOfScope(ctx, r.ID, target.ID, target.Sequence, len(v.OutOfScope))
 		o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator auto-terminated acceptance stage (out_of_scope, zero acceptance_criteria)",
 			slog.String("run_id", r.ID.String()),
 			slog.String("stage_id", target.ID.String()),
 			slog.Int("sequence", target.Sequence),
-			slog.Int("out_of_scope_count", len(approvedPlan.Verification.OutOfScope)),
+			slog.Int("out_of_scope_count", len(v.OutOfScope)),
 		)
 		return &AcceptanceShortCircuit{Kind: AcceptanceShortCircuitOutOfScope, CriteriaTotal: 0}, false, nil
-	case plan.AcceptanceSkippableEmptyCriteria(approvedPlan.Verification):
+	case plan.AcceptanceSkippableEmptyCriteria(v):
 		if err := o.walkAcceptanceToSucceededFrom(ctx, target.ID, target.State, "empty-criteria short-circuit"); err != nil {
 			return nil, false, err
 		}
 		o.emitAcceptanceOutcomeShortCircuit(ctx, r.ID, target.ID, target.Sequence, plan.AcceptanceBasisEmptyCriteria, 0,
-			plan.LiveValidationCriteriaCount(approvedPlan.Verification))
+			plan.LiveValidationCriteriaCount(v))
 		o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator short-circuited acceptance stage (zero acceptance_criteria, zero out_of_scope) to a NOT-VALIDATED verdict",
 			slog.String("run_id", r.ID.String()),
 			slog.String("stage_id", target.ID.String()),
@@ -1376,13 +1410,13 @@ func (o *Orchestrator) tryShortCircuitAcceptanceCore(ctx context.Context, r *run
 			slog.String("basis", plan.AcceptanceBasisEmptyCriteria),
 		)
 		return &AcceptanceShortCircuit{Kind: AcceptanceShortCircuitEmptyCriteria, Basis: plan.AcceptanceBasisEmptyCriteria, CriteriaTotal: 0}, false, nil
-	case plan.AcceptanceSkippableAllSkipWithBasis(approvedPlan.Verification):
+	case plan.AcceptanceSkippableAllSkipWithBasis(v):
 		if err := o.walkAcceptanceToSucceededFrom(ctx, target.ID, target.State, "all-skip-with-basis short-circuit"); err != nil {
 			return nil, false, err
 		}
-		total := len(approvedPlan.Verification.AcceptanceCriteria)
+		total := len(v.AcceptanceCriteria)
 		o.emitAcceptanceOutcomeShortCircuit(ctx, r.ID, target.ID, target.Sequence, plan.AcceptanceBasisAllSkipWithBasis, total,
-			plan.LiveValidationCriteriaCount(approvedPlan.Verification))
+			plan.LiveValidationCriteriaCount(v))
 		o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator short-circuited acceptance stage (every acceptance criterion skip_expected with basis) to a NOT-VALIDATED verdict",
 			slog.String("run_id", r.ID.String()),
 			slog.String("stage_id", target.ID.String()),
@@ -1396,6 +1430,27 @@ func (o *Orchestrator) tryShortCircuitAcceptanceCore(ctx context.Context, r *run
 	// acceptance criterion needs a live target. No state change here — the
 	// admission endpoint reports needs_target and the dispatch verb probes.
 	return nil, true, nil
+}
+
+// effectiveAcceptanceVerification returns the verification the acceptance
+// short-circuit predicates evaluate (#3181): the EffectiveAcceptance hook's
+// result when wired and readable, else the approved plan's verification
+// verbatim. The fallback (nil hook, or a resolver error — WARN-logged naming the
+// run) is byte-identical to the pre-#3181 behaviour, the same fail-open
+// direction the server takes on an unreadable approval chain elsewhere.
+func (o *Orchestrator) effectiveAcceptanceVerification(ctx context.Context, runID uuid.UUID, p *plan.Plan) plan.Verification {
+	if o.EffectiveAcceptance == nil {
+		return p.Verification
+	}
+	v, err := o.EffectiveAcceptance.EffectiveAcceptanceVerification(ctx, runID, p)
+	if err != nil {
+		o.logger().LogAttrs(ctx, slog.LevelWarn,
+			"orchestrator: effective acceptance verification unresolvable; evaluating the short-circuit against the approved plan verbatim",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()))
+		return p.Verification
+	}
+	return v
 }
 
 // TryShortCircuitAcceptance is the exported entry point (#1928) the acceptance-

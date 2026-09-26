@@ -383,6 +383,31 @@ no runner spawn: the retirement would be approved and silently dropped, so
 retire it on a run whose acceptance stage executes. The tool description
 carries all of this (`TestApprovePlan_RetireScenarioAdvertised`); no new tool.
 
+### `fishhawk_approve_plan` `add` amendment ([#3181](https://github.com/kuhlman-labs/fishhawk/issues/3181))
+
+`amend_acceptance_criteria` admits a fourth action, `add`, which APPENDS an
+operator-authored acceptance criterion at the plan gate in the same call that
+carries the approval — the widening counterpart to `retire`/`restate`, so a
+missing drivable criterion no longer costs a full `fishhawk_revise_plan` pass (a
+reason condition cannot add one: criteria live in the approved plan artifact the
+implement stage cannot write). `id` is a FRESH `^[a-z0-9][a-z0-9-]*$` slug,
+`statement` and `reason` are both required. The backend materializes it in the
+single effective-criteria seam as an explicit, `operator_approval`-sourced,
+drivable, NON-blocking criterion ordered after every plan criterion, serves its
+id in `acceptance_criteria_ids`, and renders it under an "Operator-authored at
+approval" block telling the validator it did NOT pass plan review. It is
+ADVISORY: a failed acceptance naming ONLY operator-added criteria is neutralized
+at ingest (basis `added_criteria_only`), and the orchestrator's acceptance
+short-circuit evaluates the EFFECTIVE verification, so an add on an
+all-skip-with-basis plan is actually driven. Refusals: `400 validation_failed`
+with `details.rule` `criterion_id_exists` (id in the plan, added by a prior
+approval, or carrying `scenario:`), `invalid_criterion_id`, `statement_required`,
+`reason_required`, `duplicate_id`, `amendment_not_approve_plan_stage`; `422
+acceptance_criteria_unavailable` on a plan with no criteria; `422
+acceptance_criteria_all_operator_authored` when no REVIEWED criterion would stay
+live while any add is present, in one call or cumulatively. Pinned by
+`TestApprovePlan_AddCriterionAdvertised`; no new tool.
+
 ## Progress notifications (`fishhawk_run_stage`)
 
 `fishhawk_run_stage` spawns the runner and relays its stderr JSONL lines as MCP `notifications/progress` updates — but **only when a `progressToken` is present** on the call. A `progressToken` is client-supplied MCP request metadata, **not a tool input**: a tool-calling caller cannot set it, so whether live streaming is available is a property of your MCP client, not a knob you can reach (the MCP opt-in progress model). The durable signal is unaffected either way: the runner's events are still returned post-hoc in the final result's `events` list, and in the audit log and signed trace bundle.
@@ -2333,7 +2358,10 @@ acceptance_criteria_all_retired` when the amendment would retire EVERY criterion
 — evaluated on the union of prior recorded retirements and this request's, so it
 fires cumulatively too, and there is no override (re-plan instead of emptying the
 contract); `422 acceptance_criteria_unavailable` when the plan carries no
-acceptance criteria or its prior amendments cannot be read (fail-closed).
+acceptance criteria or its prior amendments cannot be read (fail-closed). The
+`add` action (#3181, section above) adds `criterion_id_exists` /
+`invalid_criterion_id` rules and the `422
+acceptance_criteria_all_operator_authored` anti-substitution refusal.
 
 **Derived retirement is deliberately NOT provided.** Retiring a criterion because
 its subject is a file dropped by `remove_scope_files` is a natural-language

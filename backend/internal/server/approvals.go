@@ -169,17 +169,18 @@ type approvalRequest struct {
 	// DisallowUnknownFields decode accepts it; callers omit it (omitempty) and
 	// stay byte-identical to today.
 	ClaimsAllOpenPlanConcerns bool `json:"claims_all_open_plan_concerns,omitempty"`
-	// AmendAcceptanceCriteria is the OPTIONAL operator channel for RETIRING or
-	// RESTATING an approved plan's acceptance criteria by id at the plan gate
-	// (#2581). Plan-approval conditions reshape the design but never rewrite the
+	// AmendAcceptanceCriteria is the OPTIONAL operator channel for RETIRING,
+	// RESTATING, or ADDING (#3181) an approved plan's acceptance criteria by id
+	// at the plan gate (#2581). Plan-approval conditions reshape the design but never rewrite the
 	// criteria, so the acceptance stage can validate the shipped behaviour
 	// against a superseded contract and fail a correct implementation; this is
 	// the explicit channel that fixes the contract at the same gate that
 	// reshaped it. Each entry requires a reason (the reconstructable why), and a
-	// restate additionally requires the replacement statement. Validated
-	// pre-Submit by checkAmendAcceptanceCriteria — nine named refusals including
-	// the anti-silencing all-retired gate — so a malformed or contract-emptying
-	// amendment inserts no approval row. Recorded on the SAME approval_submitted
+	// restate or add additionally requires the statement. Validated pre-Submit
+	// by checkAmendAcceptanceCriteria — named refusals including the
+	// anti-silencing all-retired gate and the anti-substitution
+	// all-operator-authored gate — so a malformed, contract-emptying or
+	// contract-replacing amendment inserts no approval row. Recorded on the SAME approval_submitted
 	// payload as the reason/add_scope_files/remove_scope_files that motivated it.
 	// Declared here so the DisallowUnknownFields decode accepts it; callers omit
 	// it (omitempty) and stay byte-identical to today.
@@ -2343,7 +2344,7 @@ func (s *Server) writeApprovalAudit(ctx context.Context, stage *run.Stage, app *
 	// on approve with a non-empty slice; the key is omitted otherwise so a
 	// no-claim approve is byte-identical to today.
 	// Acceptance-criteria amendment (#2581): record the operator's retirements /
-	// restatements on the SAME row as the reason and the scope channels that
+	// restatements / additions (#3181) on the SAME row as the reason and the scope channels that
 	// motivated them, so each retirement's id, reason and source are
 	// reconstructable from the chain alone. Only on approve with a non-empty
 	// slice — the key is omitted otherwise, so an approve that does not use the
