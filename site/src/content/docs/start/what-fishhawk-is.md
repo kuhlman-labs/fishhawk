@@ -28,6 +28,19 @@ the stage; it does not get a warning it can talk its way past.
 verdict, and outcome lands in an append-only audit log with a verifiable hash
 chain. You can export it and re-verify it offline, without Fishhawk running.
 
+## Who it is for
+
+Fishhawk is built for one developer to run a repository the way a team would.
+You are the captain of that repository: you decide how much the agents may
+decide on their own — per workflow, and tighter on the paths that matter — and
+you rule on anything they disagree about or may not settle. The agents are the
+crew: they plan, implement, review, and check the result, and they escalate
+rather than guess. Because the rules and the record of past decisions live in
+the repository, someone else can pick it up and run it the same way.
+
+Teams and larger organizations use the same model: each repository has a
+captain, and approval rules decide who may act as one.
+
 ## Where it runs
 
 Fishhawk is tool-agnostic and agent-agnostic. The control plane (`fishhawkd`) is
@@ -41,7 +54,8 @@ code it constrains.
 This adds friction. A gated change is slower than an ungated one, and the gates
 are the product — if you remove them you have a coding agent with extra steps.
 Fishhawk is worth adopting when you need to answer *who approved this, and on
-what basis* months after the fact. If nobody is going to ask that question, the
-overhead is not paying for anything.
+what basis* months after the fact — including when the person asking is you, or
+whoever runs the repository after you. If nobody is going to ask that question,
+the overhead is not paying for anything.
 
 Next: [what Fishhawk is not](/fishhawk/start/what-fishhawk-is-not/).
