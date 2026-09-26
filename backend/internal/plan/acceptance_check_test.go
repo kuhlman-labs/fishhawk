@@ -2527,3 +2527,470 @@ func TestSeedScenarioNamesMatchCatalog(t *testing.T) {
 		t.Errorf("seedScenarioNames = %v, want catalog.Names() = %v", got, want)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// E72.32 (#3614) — polarity awareness for undecidable_criterion, and a
+// negation that distributes over a coordinated list
+// ---------------------------------------------------------------------------
+
+// run3614LoopbackStatement / run3614LoopbackHint are the run b58cc883 criterion
+// VERBATIM, copied from
+// acceptance/scenarios/issue-3613/git-op-without-credential-returns-instead-of-blocking.yaml.
+// It is the flagship #3614 shape: an absence assertion whose final sentence
+// coordinates THREE live-target nouns under ONE negator ("No live forge,
+// network egress, or deployed environment is required") and whose stated
+// verification method is a loopback/localhost sandbox procedure.
+const run3614LoopbackStatement = "A git operation run with the non-interactive environment this change ships, against a loopback endpoint that offers no usable credential, TERMINATES on its own with a non-zero exit status and a diagnostic naming git's refusal to prompt for a terminal credential, well inside a generous wall-clock ceiling — it does not block waiting for input and leaves no stopped process behind. No live forge, network egress, or deployed environment is required."
+
+const run3614LoopbackHint = "CLI exit code + stderr, on the localhost sandbox, no forge needed. Read the two variables the shipped gitops.NonInteractiveEnv() returns out of runner/internal/gitops/commit.go (follow the code, do not hardcode a copy), then run a remote git read against an endpoint that cannot grant credentials — either a loopback HTTP listener answering 401, or a loopback port with no listener — with exactly those variables set and no credential helper configured (GIT_CONFIG_GLOBAL and GIT_CONFIG_SYSTEM pointed at an empty file). Observe: the command exits non-zero, its stderr names the terminal-prompt refusal (git's `terminal prompts disabled` wording) or an immediate connection failure, and it returns well within a generous ceiling (on the order of a minute; do not assert a tight duration). Then re-run the same command with the non-interactive variables UNSET against the 401 endpoint only if no tty is attached — if one is, skip that arm and say so, because an unpinned git will block on the prompt by design."
+
+// run3614LiveSibling is the genuinely-live UNMARKED sibling. It carries no
+// negator, so conjunct P is false and BOTH rules must keep firing on it — which
+// is what makes the attribution assertion below discriminating rather than a
+// blanket "no findings anywhere".
+const run3614LiveSibling = "the run pushes the branch to the configured GitLab host over a live gitlab api round-trip"
+
+// (REPRODUCTION / DONE-MEANS, #3614) The two-criterion shape the issue names.
+// Written FIRST and observed RED before the fix, with 2 extra findings (one per
+// rule) attributed to the loopback criterion.
+//
+// WHY BOTH RULES. undecidable_criterion had NO polarity awareness at all
+// (#3016 added the post-filter only to missing_live_validation_marker), so the
+// substring "deployed environment" inside "No live forge, network egress, or
+// deployed environment is required" matched corpus entry 3 and — because that
+// entry is liveTarget — the #3163 verify-hint suppression was structurally
+// skipped. missing_live_validation_marker fired for a different reason: its
+// polarity filter measured negation only BACKWARD 4 tokens from each anchor, so
+// the single negator "no" sitting 6 tokens before the "deployed environment"
+// anchor left conjunct P false even though one negator governs the whole
+// coordinated list.
+func TestAcceptancePolarity_Issue3614RegressionCorpus(t *testing.T) {
+	v := Verification{
+		AcceptanceCriteria: []AcceptanceCriterion{
+			{
+				ID: "git-op-without-credential-returns-instead-of-blocking", Statement: run3614LoopbackStatement,
+				Source: CriterionSourceExplicit, SourceRef: "#3613",
+				VerifyHint: run3614LoopbackHint,
+			},
+			{
+				ID: "pushes-over-live-gitlab-api", Statement: run3614LiveSibling,
+				Source: CriterionSourceExplicit, SourceRef: "#3614",
+			},
+		},
+	}
+	findings := EvaluateAcceptanceCriteria(v)
+	for _, rule := range []string{RuleUndecidableCriterion, RuleMissingLiveValidationMarker} {
+		got := findingsFor(findings, rule)
+		if len(got) != 1 {
+			t.Fatalf("%s count = %d, want exactly 1 (the live sibling only): %+v", rule, len(got), got)
+		}
+		if got[0].CriterionID != "pushes-over-live-gitlab-api" {
+			t.Errorf("%s CriterionID = %q, want pushes-over-live-gitlab-api — the loopback criterion asserts the ABSENCE of every live target and states a sandbox-local verification method",
+				rule, got[0].CriterionID)
+		}
+	}
+}
+
+// (PER-BRANCH — polarityTokens) Each sentinel branch asserted independently,
+// including the 'github.com' no-sentinel case that keeps the documented
+// interior-dot rationale intact, and the byte-identity of acceptanceTokens on
+// the same inputs — the property that keeps M1 and M2 unmoved.
+func TestPolarityTokens_SentinelBranches(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		in    string
+		want  []string
+		plain []string
+	}{
+		{
+			name:  "comma emits the list sentinel",
+			in:    "no live forge, network egress",
+			want:  []string{"no", "live", "forge", listSeparatorToken, "network", "egress"},
+			plain: []string{"no", "live", "forge", "network", "egress"},
+		},
+		{
+			name:  "semicolon emits the list sentinel",
+			in:    "no live forge; no egress",
+			want:  []string{"no", "live", "forge", listSeparatorToken, "no", "egress"},
+			plain: []string{"no", "live", "forge", "no", "egress"},
+		},
+		{
+			name:  "end-of-field period emits the sentence sentinel",
+			in:    "no egress. the loader runs",
+			want:  []string{"no", "egress", sentenceBoundaryToken, "the", "loader", "runs"},
+			plain: []string{"no", "egress", "the", "loader", "runs"},
+		},
+		{
+			name:  "exclamation and question emit the sentence sentinel",
+			in:    "stop! really?",
+			want:  []string{"stop", sentenceBoundaryToken, "really", sentenceBoundaryToken},
+			plain: []string{"stop", "really"},
+		},
+		{
+			name:  "interior dot in github.com emits NO sentinel",
+			in:    "the walk runs against github.com once",
+			want:  []string{"the", "walk", "runs", "against", "github.com", "once"},
+			plain: []string{"the", "walk", "runs", "against", "github.com", "once"},
+		},
+		{
+			name:  "a punctuation-only field contributes its sentinel and no word",
+			in:    "live , forge",
+			want:  []string{"live", listSeparatorToken, "forge"},
+			plain: []string{"live", "forge"},
+		},
+		{
+			name:  "a trailing colon is not a sentinel",
+			in:    "observe: no egress",
+			want:  []string{"observe", "no", "egress"},
+			plain: []string{"observe", "no", "egress"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := polarityTokens(tc.in); !slices.Equal(got, tc.want) {
+				t.Errorf("polarityTokens(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+			if got := acceptanceTokens(tc.in); !slices.Equal(got, tc.plain) {
+				t.Errorf("acceptanceTokens(%q) = %q, want %q — acceptanceTokens must stay BYTE-IDENTICAL so M1/M2 do not move",
+					tc.in, got, tc.plain)
+			}
+		})
+	}
+}
+
+// (OPERATOR CONDITION 1 — multi-token ADJACENCY, not just window budgets) A
+// polarity sentinel is a distinct token that no corpus word equals, so it BLOCKS
+// a multi-token phrase rather than being skipped inside one. That is the
+// behaviour this test pins, in both directions:
+//
+//   - "live forge," (trailing comma) STILL yields the anchor: the sentinel lands
+//     AFTER the bigram, so adjacency is intact.
+//   - "live, forge" (comma INSIDE the bigram) yields NO anchor.
+//
+// WHY BLOCKING IS THE RIGHT SEMANTICS HERE, not skipping. It keeps the anchor
+// set aligned with the matcher it serves: liveTargetAnchors only enters its
+// phrase loop after the same `strings.Contains(lowered, phrase)` gate M1 uses,
+// and "no live, forge" does not contain "live forge", so the gate already
+// excludes that shape. Were adjacency to SKIP sentinels, the anchor set would
+// grow past what M1 can match — and since every extra anchor can only make
+// conjunct P harder or easier by accident, punctuation would silently move the
+// suppression boundary. Pinned here so it cannot.
+//
+// Also asserts the invariant plan step 3 demands: for a punctuation-free
+// statement the anchor set over polarityTokens is IDENTICAL to the one over
+// acceptanceTokens.
+func TestAcceptancePolarity_AnchorBigramStraddlingComma(t *testing.T) {
+	anchorsOf := func(statement string) []int {
+		lowered := strings.ToLower(statement)
+		return liveTargetAnchors(lowered, polarityTokens(lowered))
+	}
+
+	// "live forge," — the(0) loader(1) hits(2) a(3) live(4) forge(5) LIST(6) today(7).
+	trailing := anchorsOf("the loader hits a live forge, today")
+	if !slices.Contains(trailing, 4) {
+		t.Errorf("a trailing comma must not change the anchor set: anchors = %v, want the index of \"live\" (4)", trailing)
+	}
+
+	// "live, forge" — the bigram straddles the comma, so it must contribute
+	// NOTHING. No other anchor exists in this statement (no action noun follows
+	// the qualifier, so conjunct 1 finds no M2 pair either), so the set is empty.
+	if straddling := anchorsOf("the loader hits a live, forge today"); len(straddling) != 0 {
+		t.Errorf("an anchor bigram straddling a comma must yield NO anchor; got %v", straddling)
+	}
+
+	// Punctuation-free: the two streams agree exactly.
+	const plain = "the loader hits a live forge today"
+	lowered := strings.ToLower(plain)
+	if got, want := liveTargetAnchors(lowered, polarityTokens(lowered)), liveTargetAnchors(lowered, acceptanceTokens(lowered)); !slices.Equal(got, want) {
+		t.Errorf("anchor set over polarityTokens = %v, over acceptanceTokens = %v; they must be identical for a punctuation-free statement", got, want)
+	}
+}
+
+// (b — the comma-reset branch) One negator distributes over a coordinated list.
+// The CONTROL row is the same list with its commas removed: the budget then
+// exhausts before the third noun, so the finding still fires — which proves the
+// comma RESET, not some other widening, is what carries the list.
+//
+// Tokens (comma row): no(0) live(1) forge(2) LIST(3) network(4) egress(5)
+// LIST(6) or(7) deployed(8) environment(9) is(10) required(11). The "deployed"
+// anchor sits 6 REAL tokens behind "no", far outside the 4-token backward
+// window; it is covered only because the budget resets at each separator.
+func TestAcceptancePolarity_CommaListDistributesNegation(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		statement string
+		want      int
+	}{
+		{
+			name:      "commas reset the budget across the list",
+			statement: "no live forge, network egress, or deployed environment is required",
+			want:      0,
+		},
+		{
+			name:      "without commas the budget exhausts and the finding fires",
+			statement: "no live forge network egress or deployed environment is required",
+			want:      1,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v := Verification{
+				AcceptanceCriteria: []AcceptanceCriterion{
+					{
+						ID: "coordinated-list", Statement: tc.statement,
+						Source: CriterionSourceExplicit, SourceRef: "#3614",
+						ExpectationBasis: "covered by backend/internal/plan/acceptance_check_test.go",
+					},
+				},
+			}
+			if got := findingsFor(EvaluateAcceptanceCriteria(v), RuleMissingLiveValidationMarker); len(got) != tc.want {
+				t.Fatalf("missing_live_validation_marker count = %d, want %d: %+v", len(got), tc.want, got)
+			}
+		})
+	}
+}
+
+// (c — the sentence-sentinel termination branch) A negator's forward scope never
+// reaches into the next sentence, EVEN WHEN it still has budget and the next
+// sentence is full of commas that would otherwise keep resetting it.
+//
+// Tokens: no(0) live(1) forge(2) LIST(3) no(4) egress(5) SENT(6) the(7)
+// resolver(8) LIST(9) the(10) loader(11) LIST(12) the(13) dispatcher(14)
+// LIST(15) and(16) the(17) deployed(18) environment(19) all(20) agree(21).
+//
+// The nearer negator "no"(4) reaches SENT(6) with budget 3 still in hand, so the
+// termination branch is load-bearing rather than shadowed by budget exhaustion.
+// The "deployed"(18) anchor's own backward window (the, and, dispatcher, the)
+// carries no negator, so conjunct P fails and the finding FIRES. Delete the
+// termination branch and the comma resets in the second sentence walk the scope
+// all the way to "deployed", P holds, and the finding is suppressed — which is
+// what makes this test the branch's counterfactual vehicle.
+func TestAcceptancePolarity_SentenceBoundaryTerminatesExtendedScope(t *testing.T) {
+	v := Verification{
+		AcceptanceCriteria: []AcceptanceCriterion{
+			{
+				ID: "cross-sentence", Statement: "no live forge, no egress. the resolver, the loader, the dispatcher, and the deployed environment all agree",
+				Source: CriterionSourceExplicit, SourceRef: "#3614",
+				ExpectationBasis: "covered by backend/internal/plan/acceptance_check_test.go",
+			},
+		},
+	}
+	if got := findingsFor(EvaluateAcceptanceCriteria(v), RuleMissingLiveValidationMarker); len(got) != 1 {
+		t.Fatalf("a negation scope must not cross a sentence boundary; want 1 finding, got %d: %+v", len(got), got)
+	}
+}
+
+// (ACCEPTED RESIDUAL — comma splice, pinned per the plan's risk entry) THIS TEST
+// DOCUMENTS CURRENT BEHAVIOUR AND AN ACCEPTED MISS, NOT A DESIRED OUTCOME.
+//
+// A comma arriving within budget resets the scope whether the next span is
+// another LIST ITEM or a spliced CLAUSE, so "no live forge, the deployed
+// environment serves the endpoint" suppresses where a parser would not.
+// Distinguishing the two needs parsing this deterministic word-list matcher
+// deliberately does not do, and the failure direction is an advisory MISS on an
+// advisory rule. Pinned so a later change to negation scoping is a visible edit
+// here rather than silent drift.
+func TestAcceptancePolarity_AcceptedCommaSpliceExtendsScope(t *testing.T) {
+	v := Verification{
+		AcceptanceCriteria: []AcceptanceCriterion{
+			{
+				ID: "comma-splice", Statement: "no live forge, the deployed environment serves the endpoint",
+				Source: CriterionSourceExplicit, SourceRef: "#3614",
+				ExpectationBasis: "covered by backend/internal/plan/acceptance_check_test.go",
+			},
+		},
+	}
+	if got := findingsFor(EvaluateAcceptanceCriteria(v), RuleMissingLiveValidationMarker); len(got) != 0 {
+		t.Fatalf("accepted comma-splice residual (see extendedNegationScope): want 0 findings; got %d: %+v", len(got), got)
+	}
+}
+
+// (d — the widened conjunct S) EVERY entry of sandboxLocalVerificationMarkers
+// suppresses a fully-negated live target, so no entry of the list is dead. The
+// final row is the CONTROL: a stated verification method naming neither an
+// in-repository harness nor a sandbox-local procedure leaves S false and the
+// finding fires.
+func TestAcceptancePolarity_SandboxLocalVerificationSuppresses(t *testing.T) {
+	const statement = "no live forge is contacted"
+	for _, tc := range []struct {
+		name string
+		hint string
+		want int
+	}{
+		{"localhost", "read the exit code on the localhost sandbox", 0},
+		{"loopback", "point the client at a loopback listener answering 401", 0},
+		{"127.0.0.1", "curl 127.0.0.1:8080/healthz and read the body", 0},
+		{"preview", "drive the acceptance preview and read the audit row", 0},
+		{"in-sandbox", "an in-sandbox check of the resolver's return value", 0},
+		{"no forge", "read the returned error; no forge is contacted", 0},
+		{"no live forge", "exercise the resolver directly, so no live forge is involved", 0},
+		{"no network egress", "assert the error text with no network egress at all", 0},
+		{"no egress", "assert the error text with no egress", 0},
+		{"/v0/dev/", "POST /v0/dev/fixtures then read the row back", 0},
+		{"stub forge", "drive the stub forge and read the delivery", 0},
+		{"CONTROL: neither in-repo nor sandbox-local", "ask the operator to confirm by hand", 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v := Verification{
+				AcceptanceCriteria: []AcceptanceCriterion{
+					{
+						ID: "sandbox-local", Statement: statement,
+						Source: CriterionSourceExplicit, SourceRef: "#3614",
+						VerifyHint: tc.hint,
+					},
+				},
+			}
+			if got := findingsFor(EvaluateAcceptanceCriteria(v), RuleMissingLiveValidationMarker); len(got) != tc.want {
+				t.Fatalf("missing_live_validation_marker count = %d, want %d for hint %q: %+v", len(got), tc.want, tc.hint, got)
+			}
+		})
+	}
+}
+
+// (d negative twin — the #2845 pin for the WIDENED conjunct S) An UN-NEGATED
+// live target plus a localhost hint STILL fires. S alone must never suppress; if
+// the widened list ever became sufficient on its own, this test and
+// TestMissingLiveValidationMarker_InRepoBasisAloneNeverSuppresses both go red.
+func TestAcceptancePolarity_SandboxLocalAloneNeverSuppresses(t *testing.T) {
+	for _, tc := range []struct{ name, hint string }{
+		{"verify_hint", "verified on the localhost preview"},
+		{"expectation_basis", "observed against a loopback listener"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := AcceptanceCriterion{
+				ID: "live-forge", Statement: "a real github api round-trip closes the issue",
+				Source: CriterionSourceExplicit, SourceRef: "#2845",
+			}
+			if tc.name == "verify_hint" {
+				c.VerifyHint = tc.hint
+			} else {
+				c.ExpectationBasis = tc.hint
+			}
+			v := Verification{AcceptanceCriteria: []AcceptanceCriterion{c}}
+			if got := findingsFor(EvaluateAcceptanceCriteria(v), RuleMissingLiveValidationMarker); len(got) != 1 {
+				t.Fatalf("#2845 regression: a sandbox-local verification method must never suppress an UN-NEGATED live target; want 1, got %d: %+v", len(got), got)
+			}
+		})
+	}
+}
+
+// (e-first — the `uc.liveTarget && polaritySuppressesLiveTarget` guard in
+// UnevaluableCriteria) The rule that had NO polarity awareness at all now has
+// it, for liveTarget matches only.
+func TestUnevaluableCriteria_LiveTargetAbsenceAssertionSuppressed(t *testing.T) {
+	v := Verification{AcceptanceCriteria: []AcceptanceCriterion{
+		{
+			ID: "no-forge-call", Statement: "no live forge is contacted and no deployed environment is required",
+			Source: CriterionSourceExplicit, SourceRef: "#3614",
+			VerifyHint: "read the resolver's returned error on the localhost sandbox",
+		},
+	}}
+	if got := findingsFor(EvaluateAcceptanceCriteria(v), RuleUndecidableCriterion); len(got) != 0 {
+		t.Fatalf("undecidable_criterion count = %d, want 0 — an absence assertion verified sandbox-locally must not be told to mark itself skip_expected: %+v", len(got), got)
+	}
+}
+
+// (e-second — `continue`, NOT `break`) A SUPPRESSED liveTarget match must not
+// stop the corpus scan: a LATER capability in the same statement still fires.
+//
+// The statement negates a live forge (corpus entry 4, liveTarget, suppressed by
+// the new guard) while naming a webhook delivery (entry 5, NON-liveTarget).
+// Corpus order reaches entry 4 first, so with `break` the scan would stop there
+// and the criterion would draw NOTHING; with `continue` entry 5 is reached and
+// fires. The hint is deliberately sandbox-local WITHOUT being in-repository,
+// seeded-scenario or stub-forge prose, so none of the #3163 / #3326 / #3327
+// disjuncts suppresses entry 5 and the finding it draws is unambiguous.
+func TestUnevaluableCriteria_PolarityDoesNotSuppressLaterLiveCapability(t *testing.T) {
+	v := Verification{AcceptanceCriteria: []AcceptanceCriterion{
+		{
+			ID: "later-capability", Statement: "no live forge is contacted when a webhook delivery arrives",
+			Source: CriterionSourceExplicit, SourceRef: "#3614",
+			VerifyHint: "read the exit code on the localhost listener",
+		},
+	}}
+	got := findingsFor(EvaluateAcceptanceCriteria(v), RuleUndecidableCriterion)
+	if len(got) != 1 {
+		t.Fatalf("undecidable_criterion count = %d, want 1 — a suppressed liveTarget match must `continue`, so the later webhook capability still fires: %+v", len(got), got)
+	}
+	if !strings.Contains(got[0].Detail, "a real webhook delivery") {
+		t.Errorf("Detail = %q, want it to name the LATER capability (a real webhook delivery), proving the scan continued past the suppressed liveTarget entry", got[0].Detail)
+	}
+}
+
+// (f — P true, S false) The flagship #3614 statement stripped of BOTH
+// verify_hint and expectation_basis. Conjunct P holds on every anchor, but a
+// criterion that states no verification method at all has given the approver
+// nothing to weigh, so BOTH rules still fire. This is the counterfactual vehicle
+// for the hasNoLiveTargetVerification conjunct.
+func TestAcceptancePolarity_NoStatedVerificationStillFires(t *testing.T) {
+	v := Verification{
+		AcceptanceCriteria: []AcceptanceCriterion{
+			{
+				ID: "git-op-without-credential-returns-instead-of-blocking", Statement: run3614LoopbackStatement,
+				Source: CriterionSourceExplicit, SourceRef: "#3614",
+			},
+		},
+	}
+	findings := EvaluateAcceptanceCriteria(v)
+	for _, rule := range []string{RuleUndecidableCriterion, RuleMissingLiveValidationMarker} {
+		if got := findingsFor(findings, rule); len(got) != 1 {
+			t.Fatalf("%s count = %d, want 1 — conjunct P alone must never suppress: %+v", rule, len(got), got)
+		}
+	}
+}
+
+// (PER-BRANCH — the sentinel skip in conjunct P1's BACKWARD window) A sentinel
+// must not consume window budget, or punctuation would SHRINK a window that
+// holds today — the one direction the #3614 change promises never to take.
+//
+// Tokens: no(0) live(1) network(2) SENT(3) a(4) deployed(5) environment(6)
+// serves(7) the(8) endpoint(9). Walking back from the "deployed"(5) anchor, the
+// four REAL tokens are a, network, live, no — the negator lands exactly on the
+// boundary, but ONLY because SENT(3) costs nothing. Charge it and the walk stops
+// one token short, conjunct P fails, and the finding fires.
+//
+// THE SENTINEL IS A SENTENCE BOUNDARY ON PURPOSE. P2's forward scope TERMINATES
+// there, so it cannot rescue this anchor — which is what isolates P1's skip as
+// the branch under test. (A comma sentinel would be covered by P2 instead, and
+// the assertion would stay green with P1's skip deleted.)
+func TestAcceptancePolarity_SentinelDoesNotConsumeBackwardWindowBudget(t *testing.T) {
+	v := Verification{
+		AcceptanceCriteria: []AcceptanceCriterion{
+			{
+				ID: "backward-window", Statement: "no live network. a deployed environment serves the endpoint",
+				Source: CriterionSourceExplicit, SourceRef: "#3614",
+				ExpectationBasis: "covered by backend/internal/plan/acceptance_check_test.go",
+			},
+		},
+	}
+	if got := findingsFor(EvaluateAcceptanceCriteria(v), RuleMissingLiveValidationMarker); len(got) != 0 {
+		t.Fatalf("a sentinel must not consume backward-window budget; want 0 findings, got %d: %+v", len(got), got)
+	}
+}
+
+// (PER-BRANCH — the sentinel skip in qualifierActionIndices' conjunct-1 window)
+// Same rule for the ANCHOR side, and here the fail direction is suppression:
+// dropping an M2 anchor because a comma ate its budget SHRINKS the anchor set,
+// and a smaller anchor set makes the EVERY-anchor conjunct P easier to satisfy.
+//
+// Tokens: no(0) live(1) forge(2) is(3) used(4) SENT(5) a(6) real(7) LIST(8)
+// very(9) careful(10) thorough(11) walk(12) against(13) the(14) tracker(15)
+// happens(16). The M1 anchor "live"(1) is negated; the M2 anchor "real"(7) is
+// NOT — its own backward window stops at "forge" and the negator's forward scope
+// terminates at the sentence boundary — so conjunct P fails and the finding
+// fires. But "real"(7) is only an anchor because the LIST(8) sentinel costs no
+// budget: its action noun "walk" sits four REAL tokens away. Charge the sentinel
+// and the anchor vanishes, every remaining anchor is negated, and the criterion
+// is wrongly suppressed.
+func TestAcceptancePolarity_SentinelDoesNotConsumeAnchorWindowBudget(t *testing.T) {
+	v := Verification{
+		AcceptanceCriteria: []AcceptanceCriterion{
+			{
+				ID: "anchor-window", Statement: "no live forge is used. a real, very careful thorough walk against the tracker happens",
+				Source: CriterionSourceExplicit, SourceRef: "#3614",
+				ExpectationBasis: "covered by backend/internal/plan/acceptance_check_test.go",
+			},
+		},
+	}
+	if got := findingsFor(EvaluateAcceptanceCriteria(v), RuleMissingLiveValidationMarker); len(got) != 1 {
+		t.Fatalf("a sentinel must not consume anchor-window budget (dropping an M2 anchor widens suppression); want 1 finding, got %d: %+v", len(got), got)
+	}
+}
