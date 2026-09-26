@@ -2304,13 +2304,42 @@ const MaxApprovalConditionBytes = 12000
 // of the value, so re-tuning this constant alone re-tunes the whole channel.
 const MaxRevisionConstraintBytes = 12000
 
-// MaxConditionBytes caps the two sibling operator-text channels that share
-// this rendering path — clarification answers (server.loadClarificationAnswers)
-// and the recovery resume reason (server.loadRecoveryResumeReason) — at their
-// historical 4000-byte behavior. These channels are advisory or bounded and are
-// deliberately NOT gate-refused, so their cap is unchanged. The revision
-// constraint is NO LONGER one of them (#2871): it is binding, gate-refused, and
-// capped by MaxRevisionConstraintBytes.
+// MaxClarificationAnswerBytes caps the operator's answers to a planner's parked
+// clarification_request — the blob server.loadClarificationAnswers reads back
+// from the clarification_answered audit entry and writeClarificationAnswers
+// renders into the resumed plan (or grooming) prompt (#1057/#3063).
+//
+// That text is BINDING in exactly the #558 sense: the planner declared it
+// CANNOT proceed without this input, so a half-answer does not merely lose
+// detail — it converts a question the operator RESOLVED back into a guess, and
+// that guess then arrives dressed as an authoritative non-derivable fact. So
+// this channel takes the same refuse-on-binding posture the two sibling binding
+// channels take: an over-cap submission is REFUSED at the answer gate
+// (server/clarification_answer.go validateClarificationAnswers → 400
+// validation_failed naming bytes / max_bytes / overflow_bytes), ahead of every
+// stateful step, so the plan stage stays parked at awaiting_input, is
+// re-answerable, and no clarification_answered entry is written.
+//
+// 12000 matches MaxApprovalConditionBytes and MaxRevisionConstraintBytes
+// because all three carry binding operator instructions and there is no reason
+// this one should be a third the size. The historical 4000 was applied TWICE in
+// series and silently at both layers (the loader's CapText and each renderer's
+// own local `const maxAnswerBytes = 4000` blind byte prefix), destroying the
+// LAST answer first while the earlier ones still looked complete: #3063's live
+// loss on run 7984a5a8 was 8256 bytes across three answers plus the trailing
+// comment. The residual truncation path — a blob persisted BEFORE this gate
+// existed — is retained but made LOUD (CapTextWithRetrieval's ADR-077 elision
+// marker plus an instruction to declare the loss) and AUDITED
+// (server.CategoryClarificationAnswersTruncated).
+const MaxClarificationAnswerBytes = 12000
+
+// MaxConditionBytes caps the recovery resume reason
+// (server.loadRecoveryResumeReason) at its historical 4000-byte behavior. That
+// channel is advisory and bounded, so it is deliberately NOT gate-refused and
+// its cap is unchanged. Two channels have LEFT this constant: the revision
+// constraint (#2871) and the clarification answers (#3063) — both are binding,
+// both are gate-refused, and both are capped by their own 12000-byte constant
+// above. This constant now owns exactly ONE channel.
 const MaxConditionBytes = 4000
 
 // MaxRejectionFeedbackBytes caps the PriorRejectionFeedback channel — the
@@ -2496,6 +2525,78 @@ func writeOperatorConstraint(b *strings.Builder, constraint, leadLine string) {
 	b.WriteString(capped)
 	b.WriteString("\n\n")
 	b.WriteString(RevisionConstraintEndMarker)
+	b.WriteString("\n\n")
+}
+
+// clarificationAnswersElidedNotice is the renderer-emitted instruction that
+// fires when and ONLY when the clarification-answers blob itself overflows
+// MaxClarificationAnswerBytes here (#3063). Same shape as the
+// revision-constraint and prior-rejection-feedback notices: the recipient of
+// truncated BINDING steering must DECLARE the incompleteness in the plan so the
+// operator sees that an answer may not have landed.
+//
+// It is written in the STABLE scaffolding ABOVE the blob, never below it, so a
+// cut that removes the blob's tail cannot also remove the instruction to notice
+// the cut — the #2871 END-marker discipline. It fires only on an actual
+// elision: a renderer that claimed truncation on an intact blob would teach the
+// planner to distrust a complete instruction (#3087).
+const clarificationAnswersElidedNotice = "IMPORTANT: the clarification answers below were TRUNCATED — the visible text is INCOMPLETE, so some of the operator's BINDING answers are not shown, and the LAST answer is the one cut first. You MUST record in the plan's risks_and_assumptions that your clarification answers were truncated and which question's answer you could not fully see (naming what you could not see if you recover the dropped tail via the pointer in the elision marker below).\n\n"
+
+// clarificationAnswerRetrievalPointer is the CapTextWithRetrieval pointer for
+// the clarification-answers channel: the run's own clarification_answered audit
+// entry carries the rendered answers under the `conditions` payload key, which
+// is exactly what server.loadClarificationAnswers read to build this prompt.
+// Like the revision-constraint pointer it does not DEPEND on retrieval
+// succeeding — whether fishhawk_list_audit is wired into a given plan agent's
+// tool set is best-effort (ADR-021) — which is why
+// clarificationAnswersElidedNotice also instructs the planner to declare the
+// gap in risks_and_assumptions.
+const clarificationAnswerRetrievalPointer = "To recover the dropped tail: read this run's newest clarification_answered audit entry (conditions payload key, via fishhawk_list_audit if it is available to you), or ask the operator to re-send the dropped portion."
+
+// writeClarificationAnswers renders the clarification-answers section shared by
+// buildPlan and buildGroomingPropose — ONE owner of this channel's cut, in the
+// spirit of writeOperatorConstraint owning the revision constraint.
+//
+// Before #3063 each call site carried its OWN `const maxAnswerBytes = 4000` and
+// its own blind `answers[:maxAnswerBytes]` byte prefix: two copies to keep in
+// sync, a cut that could split a multi-byte rune and emit invalid UTF-8 into
+// the prompt, and a bare "...[truncated]" marker that told the planner nothing
+// about how much it had lost or where to recover it.
+//
+// MaxClarificationAnswerBytes is now the ONE cap this channel has — the loader
+// (server.loadClarificationAnswers) applies the SAME constant and the handler
+// refuses above it, so the #2871 two-caps-lower-one-wins-silently shape cannot
+// recur — and this elision path is reachable only for a blob persisted BEFORE
+// that gate shipped. It is retained rather than deleted precisely because
+// silently dropping the tail is the defect: a legacy entry still renders, but
+// loudly, and the loader records a clarification_answers_truncated audit entry
+// alongside it.
+//
+// grooming selects the propose-stage body wording; the heading is shared. Both
+// bodies are byte-identical to the two inline blocks this replaced, so every
+// under-cap render is unchanged.
+func writeClarificationAnswers(b *strings.Builder, t Trigger, grooming bool) {
+	if t.ApprovalConditions == nil {
+		return
+	}
+	answers, elided := CapTextWithRetrieval(*t.ApprovalConditions,
+		MaxClarificationAnswerBytes, clarificationAnswerRetrievalPointer)
+	if elided {
+		b.WriteString(clarificationAnswersElidedNotice)
+	}
+	b.WriteString("### Clarification answers (binding — resolve your parked questions)\n\n")
+	if grooming {
+		b.WriteString("You previously parked this grooming run with a clarification_request. The operator answered your " +
+			"questions through the binding-conditions channel (#558); their answers are below. Treat them as authoritative " +
+			"non-derivable facts and produce a concrete " + plan.GroomingReportVersion + " report now.\n\n")
+	} else {
+		b.WriteString("You previously parked this issue at awaiting_input with a clarification_request " +
+			"because it was not yet plannable. The operator answered your questions through the " +
+			"binding-conditions channel (#558); their answers are below. Treat them as authoritative " +
+			"non-derivable facts and decisions: fold them into the step-zero plannability check and " +
+			"produce a concrete standard_v1 plan now. Do NOT park again on anything these answers resolve.\n\n")
+	}
+	b.WriteString(answers)
 	b.WriteString("\n\n")
 }
 
@@ -4146,23 +4247,10 @@ func buildPlan(t Trigger) string {
 	// questions flow back through the #558 binding-conditions channel
 	// (t.ApprovalConditions). The first-pass plan dispatch leaves this nil —
 	// the server only populates it when re-opening a parked plan stage — so
-	// this section is absent on a normal plan. Capped like the other resume
-	// channels.
-	if t.ApprovalConditions != nil {
-		answers := *t.ApprovalConditions
-		const maxAnswerBytes = 4000
-		if len(answers) > maxAnswerBytes {
-			answers = answers[:maxAnswerBytes] + "...[truncated]"
-		}
-		b.WriteString("### Clarification answers (binding — resolve your parked questions)\n\n")
-		b.WriteString("You previously parked this issue at awaiting_input with a clarification_request " +
-			"because it was not yet plannable. The operator answered your questions through the " +
-			"binding-conditions channel (#558); their answers are below. Treat them as authoritative " +
-			"non-derivable facts and decisions: fold them into the step-zero plannability check and " +
-			"produce a concrete standard_v1 plan now. Do NOT park again on anything these answers resolve.\n\n")
-		b.WriteString(answers)
-		b.WriteString("\n\n")
-	}
+	// this section is absent on a normal plan. The cap and the loud-elision
+	// treatment live in writeClarificationAnswers, the ONE owner of this
+	// channel's cut (#3063).
+	writeClarificationAnswers(&b, t, false)
 
 	// Revision constraint (#1099): on a plan-gate `revise` re-open, the
 	// operator's binding design constraint flows back through a DEDICATED
@@ -4805,20 +4893,12 @@ func buildGroomingPropose(t Trigger) (string, error) {
 	}
 
 	// Clarification answers on the #558 binding-conditions channel, worded for
-	// grooming. Capped like buildPlan's clarification channel.
-	if t.ApprovalConditions != nil {
-		answers := *t.ApprovalConditions
-		const maxAnswerBytes = 4000
-		if len(answers) > maxAnswerBytes {
-			answers = answers[:maxAnswerBytes] + "...[truncated]"
-		}
-		b.WriteString("### Clarification answers (binding — resolve your parked questions)\n\n")
-		b.WriteString("You previously parked this grooming run with a clarification_request. The operator answered your " +
-			"questions through the binding-conditions channel (#558); their answers are below. Treat them as authoritative " +
-			"non-derivable facts and produce a concrete " + plan.GroomingReportVersion + " report now.\n\n")
-		b.WriteString(answers)
-		b.WriteString("\n\n")
-	}
+	// grooming. The grooming resume rides the SAME loader and the same
+	// gate-refused handler as the plan resume, so it must share the same cap
+	// owner: leaving this at 4000 would re-open the silent-drop hole for every
+	// answer set the handler now accepts between 4000 and
+	// MaxClarificationAnswerBytes (#3063).
+	writeClarificationAnswers(&b, t, true)
 
 	// The triggering issue and its sanitized/quarantined comments. The grooming
 	// agent is a PROPOSE-only, quarantined agent exactly as the planner is

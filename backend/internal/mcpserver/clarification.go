@@ -60,11 +60,27 @@ Takes a run id; the tool resolves the plan stage internally. On a
 github_actions/drive run the backend re-dispatches the plan stage; on a
 local run, re-run it with fishhawk_run_stage plan after this returns.
 
+SIZE CAP (#3063): the answers are rendered into one binding blob — one
+"Q<id> (<question>): <answer>" line per question plus your optional
+comment — and that RENDERED blob is capped at 12000 bytes. An over-cap
+submission is REFUSED, never truncated: these answers are binding, and a
+silent cut destroys the LAST answer first while the earlier ones still
+look complete, so a question you resolved would reach the planner as a
+guess dressed up as an authoritative fact. A refusal changes nothing —
+the plan stage stays parked at awaiting_input and is re-answerable — so
+shorten or tighten the answers and call again, or move supporting detail
+into the issue body, where it is not byte-capped. Note the rendered blob
+is larger than your typed text: the question framing counts toward the
+cap.
+
 Common error shapes (surfaced as tool errors):
   - "this plan stage is not parked at awaiting_input" — the stage is not a
     plan stage in awaiting_input (409 invalid_state_transition)
   - "clarification_answer_invalid" — an answer id is unknown, missing, or
     duplicated relative to the parked questions (400)
+  - "validation_failed: ... N bytes ... maximum is 12000" — the rendered
+    answers blob is over the cap (400). Nothing was recorded and the stage
+    is still parked; re-answer with a shorter payload.
 `),
 	}, resolver.answerClarification)
 }
@@ -103,6 +119,19 @@ func (r *runResolver) answerClarification(ctx context.Context, _ *mcp.CallToolRe
 				return nil, AnswerClarificationOutput{}, fmt.Errorf(
 					"clarification_answer_invalid: %s — every parked question needs exactly one answer keyed by its id; read the clarification_requested audit entry's questions (fishhawk_get_run_status / fishhawk_list_audit)", ae.Message)
 			case "validation_failed":
+				// The over-cap refusal (#3063) carries the byte accounting in
+				// details; surface it in the tool error so the operator can see
+				// how far over they are without a second round trip, plus the
+				// guarantee that the refusal consumed nothing. Falls back to the
+				// bare server message for every other validation_failed shape
+				// (a malformed body, a bad stage id), which carries no details.
+				if b, ok := detailInt(ae.Details, "bytes"); ok {
+					maxB, _ := detailInt(ae.Details, "max_bytes")
+					over, _ := detailInt(ae.Details, "overflow_bytes")
+					return nil, AnswerClarificationOutput{}, fmt.Errorf(
+						"validation_failed: the rendered clarification answers are %d bytes; the maximum is %d (%d over). %s — nothing was recorded and the plan stage is still parked at awaiting_input, so shorten or tighten the answers and call again, or move the supporting detail into the issue body where it is not byte-capped",
+						b, maxB, over, ae.Message)
+				}
 				return nil, AnswerClarificationOutput{}, fmt.Errorf("validation_failed: %s", ae.Message)
 			case "stage_not_found":
 				return nil, AnswerClarificationOutput{}, fmt.Errorf(

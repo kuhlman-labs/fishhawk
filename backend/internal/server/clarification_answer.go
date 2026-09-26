@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -61,6 +62,38 @@ type clarificationAnswerItem struct {
 	Answer string `json:"answer"`
 }
 
+// validateClarificationAnswers enforces the binding clarification-answer byte
+// cap (#3063), mirroring revise.go validateReviseConstraint.
+//
+// The answers are BINDING in exactly the #558 sense: the planner declared the
+// issue NOT plannable without them, so they are injected into the resumed plan
+// prompt as authoritative non-derivable facts. A silent cut therefore does not
+// merely lose detail — it converts a question the operator RESOLVED back into a
+// guess, and the historical behavior cut it TWICE (the loader and each
+// renderer, both at 4000, both silent), destroying the LAST answer first while
+// the earlier ones still looked complete.
+//
+// The cap is measured in BYTES (len) on the RENDERED blob — the value actually
+// persisted as the clarification_answered payload's `conditions` key and
+// actually rendered into the prompt — NOT on the raw per-answer sum, which
+// excludes the `Q<id> (<question>): ` framing renderClarificationAnswers adds
+// around each answer. A refusal measured on the raw sum would admit a payload
+// the renderer then still cuts. Returns (true, "", nil) when admissible.
+func validateClarificationAnswers(rendered string) (ok bool, message string, details map[string]any) {
+	if len(rendered) <= prompt.MaxClarificationAnswerBytes {
+		return true, "", nil
+	}
+	msg := fmt.Sprintf(
+		"clarification answers render to %d bytes; the maximum is %d (they are injected verbatim into the resumed plan prompt as binding, authoritative answers and must not be silently truncated — the LAST answer is the one a cut destroys first). Shorten the answers, tighten them to the decision the planner actually needs, or move the supporting detail into the issue body, where it is not byte-capped. The plan stage stays parked at awaiting_input and is re-answerable: this call recorded nothing",
+		len(rendered), prompt.MaxClarificationAnswerBytes)
+	return false, msg, map[string]any{
+		"field":          "answers",
+		"bytes":          len(rendered),
+		"max_bytes":      prompt.MaxClarificationAnswerBytes,
+		"overflow_bytes": len(rendered) - prompt.MaxClarificationAnswerBytes,
+	}
+}
+
 // handleAnswerClarification implements POST /v0/stages/{stage_id}/
 // clarification (#1088, the #1057 slice-4/5 answer-and-resume seam).
 //
@@ -83,6 +116,14 @@ type clarificationAnswerItem struct {
 //   - non-plan or non-awaiting_input stage   → 409 invalid_state_transition
 //   - empty answers                          → 400 validation_failed
 //   - unknown / missing / duplicate answer id → 400 clarification_answer_invalid
+//   - rendered answers over prompt.MaxClarificationAnswerBytes → 400
+//     validation_failed (#3063: the answers are BINDING, so an over-cap
+//     submission is refused rather than silently truncated; details carries
+//     bytes / max_bytes / overflow_bytes). The check precedes every stateful
+//     step — the chainParams build, all three resume tiers and the audit
+//     append — so the refused call leaves the stage parked at awaiting_input,
+//     writes NO clarification_answered entry, and the operator can simply
+//     re-answer with a shorter payload.
 func (s *Server) handleAnswerClarification(w http.ResponseWriter, r *http.Request) {
 	if !s.requireWriteScope(w, r, "write:approvals") {
 		return
@@ -157,6 +198,18 @@ func (s *Server) handleAnswerClarification(w http.ResponseWriter, r *http.Reques
 	if verr != "" {
 		s.writeError(w, r, http.StatusBadRequest, "clarification_answer_invalid", verr,
 			map[string]any{"stage_id": stageID.String()})
+		return
+	}
+
+	// Refuse an over-cap submission (#3063). This sits IMMEDIATELY after the
+	// render and BEFORE every stateful step — before the chainParams build,
+	// before all three resume tiers, before the audit append — so the stage
+	// stays at awaiting_input, no clarification_answered entry is written, and
+	// the operator can re-answer. Measured on the RENDERED blob because that is
+	// the value persisted and rendered; see validateClarificationAnswers.
+	if ok, msg, details := validateClarificationAnswers(rendered); !ok {
+		details["stage_id"] = stageID.String()
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed", msg, details)
 		return
 	}
 

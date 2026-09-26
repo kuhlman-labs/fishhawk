@@ -2535,6 +2535,76 @@ func TestMigrateDown_ParentAwaitingChildScopeDecisionUniqueReversal(t *testing.T
 	}
 }
 
+// TestMigrateDown_ClarificationAnswersTruncatedOnce pins 0086 (#3063, E68.29):
+// the partial unique index audit_entries_clarification_answers_truncated_once_idx
+// must be PRESENT after MigrateUp — UNIQUE, partial on the
+// clarification_answers_truncated category, and keyed on BOTH run_id and
+// payload->>'source_entry_id' — and ABSENT after rolling back through it
+// (index-only, clean DROP INDEX). Modelled on
+// TestMigrateDown_ApprovalConditionsTruncatedUniqueReversal (the 0068 analogue).
+//
+// The MigrateUp step is itself load-bearing beyond the index assertions: it
+// proves payload->>'source_entry_id' is an IMMUTABLE, indexable expression and
+// that the CREATE cannot fail loud on legacy rows (NULL-distinct semantics). If
+// either assumption were wrong, MigrateUp would error before this test reached
+// its first Scan.
+func TestMigrateDown_ClarificationAnswersTruncatedOnce(t *testing.T) {
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+
+	const idxName = "audit_entries_clarification_answers_truncated_once_idx"
+	var idxDef string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT indexdef FROM pg_indexes
+		 WHERE tablename = 'audit_entries' AND indexname = $1`, idxName,
+	).Scan(&idxDef); err != nil {
+		t.Fatalf("query %s after MigrateUp (missing?): %v", idxName, err)
+	}
+	if !strings.Contains(idxDef, "UNIQUE") {
+		t.Errorf("index def = %q, want a UNIQUE index (0086)", idxDef)
+	}
+	if !strings.Contains(idxDef, "clarification_answers_truncated") {
+		t.Errorf("index def = %q, want partial WHERE category = 'clarification_answers_truncated' (0086)", idxDef)
+	}
+	if !strings.Contains(idxDef, "run_id") {
+		t.Errorf("index def = %q, want run_id as a key expression (0086)", idxDef)
+	}
+	if !strings.Contains(idxDef, "source_entry_id") {
+		t.Errorf("index def = %q, want payload->>'source_entry_id' as a key expression — a run_id-only key would suppress a second distinct over-cap answer set's truncation (0086)", idxDef)
+	}
+
+	// Roll back through 0086, the reversal under test: one clean index-only
+	// DROP INDEX.
+	downThrough(t, url, "0086")
+	var idxCount int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM pg_indexes
+		 WHERE tablename = 'audit_entries' AND indexname = $1`, idxName,
+	).Scan(&idxCount); err != nil {
+		t.Fatalf("query index after MigrateDown: %v", err)
+	}
+	if idxCount != 0 {
+		t.Errorf("%s count after MigrateDown = %d, want 0 (0086 reverted)", idxName, idxCount)
+	}
+	// audit_entries itself survives (0086 is index-only; the table predates it).
+	var auditTable int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'audit_entries'`,
+	).Scan(&auditTable); err != nil {
+		t.Fatalf("query audit_entries table after MigrateDown: %v", err)
+	}
+	if auditTable != 1 {
+		t.Errorf("'audit_entries' table count after MigrateDown = %d, want 1 (0086 is index-only)", auditTable)
+	}
+}
+
 // TestMigrateDown_ApprovalConditionsTruncatedUniqueReversal pins 0068 (#2622,
 // E67.25): the partial unique index
 // audit_entries_approval_conditions_truncated_once_idx must be PRESENT after

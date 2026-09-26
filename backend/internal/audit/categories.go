@@ -243,6 +243,7 @@ var KnownCategories = map[string]struct{}{
 	"ci_retry_exhausted":                      {},
 	"ci_retry_skipped":                        {},
 	"clarification_answered":                  {},
+	"clarification_answers_truncated":         {},
 	"clarification_requested":                 {},
 	"concern_addressed_by_condition":          {},
 	"concern_auto_closed":                     {},

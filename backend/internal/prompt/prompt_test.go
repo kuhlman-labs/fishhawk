@@ -2023,24 +2023,161 @@ func TestBuild_Plan_ClarificationAnswers_Nil_SectionAbsent(t *testing.T) {
 	}
 }
 
-// TestBuild_Plan_ClarificationAnswers_Truncated mirrors the other resume
-// channels' 4000-byte cap so a runaway answer payload can't blow the
-// prompt budget.
-func TestBuild_Plan_ClarificationAnswers_Truncated(t *testing.T) {
-	longAnswers := strings.Repeat("x", 5000)
-	got, err := Build("plan", Trigger{
-		IssueNumber:        7,
-		Repo:               "x/y",
-		ApprovalConditions: &longAnswers,
-	})
+// liveShapedClarificationAnswers builds a blob shaped like the #3063 live loss
+// on run 7984a5a8: three "Q<id> (<question>): <answer>" lines as
+// server.renderClarificationAnswers emits them, plus a trailing free-text
+// comment, totalling at least 8256 bytes — the size the historical 4000-byte
+// cut destroyed more than half of. The LAST answer and the trailing comment
+// carry distinct markers because they are the exact bytes that cut dropped
+// first: a blob-wide substring check would stay green with the tail missing.
+func liveShapedClarificationAnswers() (blob, lastAnswerMarker, commentMarker string) {
+	lastAnswerMarker = "LAST_ANSWER_MARKER_7984A5A8"
+	commentMarker = "TRAILING_COMMENT_MARKER_7984A5A8"
+	var b strings.Builder
+	fmt.Fprintf(&b, "Qauth-backend (Which auth backend should the token store use?): %s\n",
+		"Postgres. "+strings.Repeat("a", 2700))
+	fmt.Fprintf(&b, "Qmigration (Do we migrate existing rows in place?): %s\n",
+		"Yes, in place. "+strings.Repeat("b", 2700))
+	fmt.Fprintf(&b, "Qrollout (What is the rollout order?): %s\n",
+		"Backend first. "+strings.Repeat("c", 2700)+" "+lastAnswerMarker)
+	b.WriteString("\n" + commentMarker + " — ship it behind the existing flag.\n")
+	blob = b.String()
+	if len(blob) < 8256 {
+		panic("live-shaped clarification fixture shrank below the 8256-byte #3063 payload")
+	}
+	return blob, lastAnswerMarker, commentMarker
+}
+
+// TestBuild_Plan_ClarificationAnswers_WholeUpToNewCap is the test that would
+// have caught #3063: a live-shaped 8256-byte answers blob — three answers plus
+// a trailing comment — renders WHOLE, with its LAST answer and its trailing
+// comment both present and NO truncation or elision marker anywhere. Under the
+// historical 4000-byte cut the last answer and the comment were the first bytes
+// destroyed, and nothing said so.
+func TestBuild_Plan_ClarificationAnswers_WholeUpToNewCap(t *testing.T) {
+	blob, lastAnswer, comment := liveShapedClarificationAnswers()
+	if len(blob) > MaxClarificationAnswerBytes {
+		t.Fatalf("fixture is %d bytes, over the %d cap — it must render whole", len(blob), MaxClarificationAnswerBytes)
+	}
+	got, err := Build("plan", Trigger{IssueNumber: 7, Repo: "x/y", ApprovalConditions: &blob})
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
-	if !strings.Contains(got, "...[truncated]") {
-		t.Errorf("plan prompt missing truncation suffix:\n%s", got)
+	if !strings.Contains(got, blob) {
+		t.Errorf("the %d-byte clarification blob did not render whole:\n%s", len(blob), tailOf(got, 1200))
 	}
-	if strings.Contains(got, longAnswers) {
-		t.Errorf("untruncated long clarification answers appeared in prompt")
+	for _, want := range []string{lastAnswer, comment} {
+		if !strings.Contains(got, want) {
+			t.Errorf("the rendered prompt lost %q — the exact bytes #3063 dropped", want)
+		}
+	}
+	for _, bad := range []string{"...[truncated]", "...[ELIDED", clarificationAnswersElidedNotice} {
+		if strings.Contains(got, bad) {
+			t.Errorf("an under-cap blob drew the truncation artifact %q:\n%s", bad, tailOf(got, 800))
+		}
+	}
+}
+
+// TestBuild_Plan_ClarificationAnswers_OverCapElidesLoudly pins the residual
+// truncation path (a blob persisted before the answer gate existed): it draws
+// the ADR-077 elision marker with honest byte accounting and the retrieval
+// pointer, never the bare "...[truncated]" this channel used to take — and the
+// risks_and_assumptions instruction is written ABOVE the blob, so the very cut
+// that removes the tail cannot also remove the instruction to notice it.
+func TestBuild_Plan_ClarificationAnswers_OverCapElidesLoudly(t *testing.T) {
+	over := strings.Repeat("x", MaxClarificationAnswerBytes+250)
+	got, err := Build("plan", Trigger{IssueNumber: 7, Repo: "x/y", ApprovalConditions: &over})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, want := range []string{
+		over[:MaxClarificationAnswerBytes] + "\n\n...[ELIDED",
+		fmt.Sprintf("%d of %d bytes shown, %d bytes dropped at the %d-byte cap",
+			MaxClarificationAnswerBytes, len(over), len(over)-MaxClarificationAnswerBytes, MaxClarificationAnswerBytes),
+		"clarification_answered audit entry (conditions payload key",
+		clarificationAnswersElidedNotice,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("over-cap clarification answers missing %q:\n%s", want, tailOf(got, 1200))
+		}
+	}
+	if strings.Contains(got, over[:MaxClarificationAnswerBytes]+"...[truncated]") {
+		t.Errorf("the clarification channel took the bare truncation marker instead of the elision block")
+	}
+	if strings.Contains(got, over) {
+		t.Errorf("the untruncated over-cap answers appeared in the prompt")
+	}
+	// The instruction must sit ABOVE the blob: a tail cut must not be able to
+	// remove the instruction to declare the cut.
+	noticeAt := strings.Index(got, clarificationAnswersElidedNotice)
+	blobAt := strings.Index(got, over[:200])
+	if noticeAt < 0 || blobAt < 0 || noticeAt > blobAt {
+		t.Errorf("the elision notice must precede the blob: noticeAt=%d blobAt=%d", noticeAt, blobAt)
+	}
+}
+
+// TestBuild_Plan_ClarificationAnswers_UnderCapNoElisionInstruction is the
+// control for the elided-ONLY guard (#3087): an intact blob must not be told it
+// was truncated. A renderer that emitted the notice unconditionally would teach
+// the planner to distrust a complete binding instruction and to file a
+// risks_and_assumptions entry about a loss that never happened.
+func TestBuild_Plan_ClarificationAnswers_UnderCapNoElisionInstruction(t *testing.T) {
+	answers := "Qauth-backend (Which auth backend?): Postgres.\n"
+	got, err := Build("plan", Trigger{IssueNumber: 7, Repo: "x/y", ApprovalConditions: &answers})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(got, answers) {
+		t.Fatalf("the under-cap answers did not render:\n%s", got)
+	}
+	if strings.Contains(got, clarificationAnswersElidedNotice) {
+		t.Errorf("an intact blob wrongly carried the truncation-declaration instruction:\n%s", got)
+	}
+	if strings.Contains(got, "...[ELIDED") {
+		t.Errorf("an intact blob wrongly carried an elision marker")
+	}
+}
+
+// TestBuild_Plan_ClarificationAnswers_ExactlyAtCapWholeAndQuiet pins the
+// > not >= boundary CapTextWithRetrieval implements: a blob of EXACTLY
+// MaxClarificationAnswerBytes renders verbatim with no marker.
+func TestBuild_Plan_ClarificationAnswers_ExactlyAtCapWholeAndQuiet(t *testing.T) {
+	atCap := strings.Repeat("y", MaxClarificationAnswerBytes)
+	got, err := Build("plan", Trigger{IssueNumber: 7, Repo: "x/y", ApprovalConditions: &atCap})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(got, atCap) {
+		t.Errorf("an exactly-at-cap blob did not render whole")
+	}
+	if strings.Contains(got, "...[ELIDED") || strings.Contains(got, "...[truncated]") {
+		t.Errorf("an exactly-at-cap blob must not be marked truncated (> not >= boundary)")
+	}
+}
+
+// TestBuild_Plan_ClarificationAnswers_RuneSafeCut is the specific defect the
+// removed blind `answers[:maxAnswerBytes]` byte prefix could produce: a cut
+// landing INSIDE a multi-byte rune emitted invalid UTF-8 into the prompt. The
+// fixture is built so the cap boundary falls mid-rune.
+func TestBuild_Plan_ClarificationAnswers_RuneSafeCut(t *testing.T) {
+	// "€" is 3 bytes. Pad to one byte below the cap, then append euros so the
+	// cut at MaxClarificationAnswerBytes lands on the rune's 2nd byte.
+	blob := strings.Repeat("a", MaxClarificationAnswerBytes-1) + strings.Repeat("€", 40)
+	got, err := Build("plan", Trigger{IssueNumber: 7, Repo: "x/y", ApprovalConditions: &blob})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !utf8.ValidString(got) {
+		t.Errorf("the rendered prompt is not valid UTF-8 — the clarification cut split a multi-byte rune")
+	}
+	if !strings.Contains(got, "...[ELIDED") {
+		t.Fatalf("fixture did not overflow the cap; the rune-safety assertion is vacuous")
+	}
+	// The honest-accounting property: ToValidUTF8 dropped the partial rune, so
+	// the marker reports 1 byte FEWER than the cap and shown+dropped==original.
+	if !strings.Contains(got, fmt.Sprintf("%d of %d bytes shown, %d bytes dropped",
+		MaxClarificationAnswerBytes-1, len(blob), len(blob)-(MaxClarificationAnswerBytes-1))) {
+		t.Errorf("the elision marker misreported its own byte accounting after a rune-safe cut:\n%s", tailOf(got, 600))
 	}
 }
 
@@ -12446,7 +12583,14 @@ func TestBuild_GroomingPropose_OptionalChannels(t *testing.T) {
 		revBase := `{"kind":"grooming_report","report_version":"grooming_report_v1","notes":"` +
 			strings.Repeat("b", MaxRevisionBasePlanBytes) + `"}`
 		revConstraint := strings.Repeat("c", MaxRevisionConstraintBytes+1)
-		answers := strings.Repeat("a", 5000)
+		// The clarification answers left the 4000-byte table for the same
+		// reason the revision constraint did (#3063): they are BINDING, the
+		// answer gate now refuses above MaxClarificationAnswerBytes, and the
+		// residual path draws the LOUD elision. Leaving them at 4000 here would
+		// have kept the silent-drop hole open for every answer set the gate now
+		// accepts between 4000 and 12000, so they get an over-12000 payload and
+		// are asserted on the elision block below.
+		answers := strings.Repeat("a", MaxClarificationAnswerBytes+1)
 		tr.PriorRejectionFeedback = &big
 		tr.PriorSchemaValidationError = &schemaErr
 		tr.RevisionConstraint = &revConstraint
@@ -12467,7 +12611,6 @@ func TestBuild_GroomingPropose_OptionalChannels(t *testing.T) {
 			payload string
 		}{
 			{"prior schema-validation failure", schemaErr},
-			{"clarification answers", answers},
 		} {
 			want := ch.payload[:cap4000] + marker
 			if !strings.Contains(got, want) {
@@ -12500,6 +12643,26 @@ func TestBuild_GroomingPropose_OptionalChannels(t *testing.T) {
 		if strings.Contains(got, revConstraint) {
 			t.Errorf("the grooming revision-constraint channel rendered its full untruncated payload")
 		}
+		// The clarification answers take the #3063 treatment on the grooming
+		// path too: the LOUD elision block with its byte accounting and
+		// retrieval pointer, plus the risks-declaration notice — never the bare
+		// 4000-byte cut this channel used to take here.
+		for _, want := range []string{
+			answers[:MaxClarificationAnswerBytes] + "\n\n...[ELIDED",
+			fmt.Sprintf("1 bytes dropped at the %d-byte cap", MaxClarificationAnswerBytes),
+			"clarification_answered audit entry (conditions payload key",
+			clarificationAnswersElidedNotice,
+		} {
+			if !strings.Contains(got, want) {
+				t.Errorf("the grooming clarification-answers channel missing %q:\n%s", want, tailOf(got, 1500))
+			}
+		}
+		if strings.Contains(got, answers[:cap4000]+marker) {
+			t.Errorf("the grooming clarification answers took the retired bare 4000-byte cut")
+		}
+		if strings.Contains(got, answers) {
+			t.Errorf("the grooming clarification-answers channel rendered its full untruncated payload")
+		}
 		// The revision BASE report takes the #3087 treatment: the ADR-077 loud
 		// elision with byte accounting and the fishhawk_get_plan retrieval
 		// pointer, plus the renderer-emitted incomplete-base notice — never the
@@ -12526,6 +12689,56 @@ func TestBuild_GroomingPropose_OptionalChannels(t *testing.T) {
 			t.Errorf("the grooming revision-base channel rendered its full untruncated payload")
 		}
 	})
+}
+
+// TestBuild_GroomingPropose_ClarificationAnswers_WholeUpToNewCap is the
+// grooming half of the #3063 done-means: the SAME live-shaped 8256-byte blob
+// renders WHOLE on the propose path, last answer and trailing comment intact,
+// with grooming wording and no marker. Without it the grooming call site could
+// keep its own lower cut and the plan-path test would still pass.
+func TestBuild_GroomingPropose_ClarificationAnswers_WholeUpToNewCap(t *testing.T) {
+	blob, lastAnswer, comment := liveShapedClarificationAnswers()
+	tr := groomingTriggerWithCharter()
+	tr.ApprovalConditions = &blob
+	got, err := Build("plan", tr)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(got, "produce a concrete "+plan.GroomingReportVersion+" report now") {
+		t.Fatalf("this is not the grooming clarification wording — the fixture took the plan path")
+	}
+	if !strings.Contains(got, blob) {
+		t.Errorf("the %d-byte clarification blob did not render whole on the grooming path", len(blob))
+	}
+	for _, want := range []string{lastAnswer, comment} {
+		if !strings.Contains(got, want) {
+			t.Errorf("the grooming prompt lost %q — the exact bytes #3063 dropped", want)
+		}
+	}
+	for _, bad := range []string{"...[truncated]", clarificationAnswersElidedNotice} {
+		if strings.Contains(got, bad) {
+			t.Errorf("an under-cap grooming blob drew the truncation artifact %q", bad)
+		}
+	}
+}
+
+// TestBuild_GroomingPropose_ClarificationAnswers_UnderCapNoElisionInstruction
+// is the grooming elided-ONLY control (#3087), the sibling of the plan-path
+// case: an intact blob must not be told it was truncated.
+func TestBuild_GroomingPropose_ClarificationAnswers_UnderCapNoElisionInstruction(t *testing.T) {
+	answers := "Qicebox (Is the icebox in scope?): No, out of scope this cycle.\n"
+	tr := groomingTriggerWithCharter()
+	tr.ApprovalConditions = &answers
+	got, err := Build("plan", tr)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if !strings.Contains(got, answers) {
+		t.Fatalf("the under-cap grooming answers did not render")
+	}
+	if strings.Contains(got, clarificationAnswersElidedNotice) {
+		t.Errorf("an intact grooming blob wrongly carried the truncation-declaration instruction")
+	}
 }
 
 // ---------------------------------------------------------------------------

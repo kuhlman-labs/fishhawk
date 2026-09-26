@@ -16318,6 +16318,19 @@ paths:
         conditions loader matches only `decision=='approve'`, so the two never
         collide.
 
+        BINDING-CHANNEL POSTURE (#3063). These answers are binding in exactly
+        the #558 sense: the planner declared the issue NOT plannable without
+        them, so they arrive in the resumed prompt as authoritative
+        non-derivable facts. A silent cut would therefore convert a question the
+        operator RESOLVED back into a guess. So the RENDERED answers blob — one
+        `Q<id> (<question>): <answer>` line per parked question plus the
+        optional comment, which is strictly larger than the operator's typed
+        text — is capped at 12000 bytes and an over-cap submission is REFUSED
+        (400 `validation_failed`), never truncated. The check precedes every
+        stateful step, so a refusal leaves the stage parked at `awaiting_input`
+        and re-answerable. 12000 matches the two sibling binding channels
+        (approve-with-conditions, revise constraint).
+
         Requires `write:approvals` scope — the #558 binding-conditions /
         gate-answer family.
       tags: [approvals]
@@ -16368,6 +16381,15 @@ paths:
 
             - `validation_failed` — the body is not valid JSON, carries
               unknown fields, or `answers` is empty.
+            - `validation_failed` (over-cap, #3063) — the RENDERED answers blob
+              exceeds 12000 bytes. `details` carries `field: "answers"`,
+              `bytes` (the rendered size), `max_bytes` (12000) and
+              `overflow_bytes`. The answers are binding, so they are refused
+              rather than silently truncated — the LAST answer is the one a cut
+              destroys first. The check precedes every stateful step, so the
+              plan stage stays parked at `awaiting_input`, NO
+              `clarification_answered` entry is written, and the operator can
+              simply re-answer with a shorter payload.
             - `clarification_answer_invalid` — an answer id does not match any
               parked question, a parked question was left unanswered, or an id
               was repeated. The answers are keyed to real parked questions, so
