@@ -1226,6 +1226,7 @@ func verifyHintNamesSeedScenario(c AcceptanceCriterion) bool {
 var seedScenarioNames = map[string]bool{
 	"acceptance-dispatched": true,
 	"grooming-confirm-gate": true,
+	"plan-gate-criteria":    true,
 	"plan-gate-parked":      true,
 	"split-parent-linked":   true,
 	"trace-upload-target":   true,

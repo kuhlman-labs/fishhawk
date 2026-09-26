@@ -4568,14 +4568,36 @@ observed `healthz-reports-server-budget` failure in run 66c938d1). Two halves fi
 that, and a deliberately-rejected third is documented below.
 
 **1. The explicit channel.** `POST /v0/stages/{id}/approvals` accepts
-`amend_acceptance_criteria`: a list of `{id, action: retire|restate, reason,
-statement?}`. `retire` drops a criterion out of the live contract; `restate`
+`amend_acceptance_criteria`: a list of `{id, action: retire|restate|add|retire_scenario, reason,
+statement?}` (`add` in 1b below). `retire` drops a criterion out of the live contract; `restate`
 replaces its statement and leaves it LIVE (restatement is NOT a silencing
 channel — a restated criterion still fails if it genuinely fails). The reason is
 REQUIRED per criterion; the amendment is recorded on the SAME
 `approval_submitted` payload as the `comment` / `add_scope_files` /
 `remove_scope_files` that motivated it, so each retirement's id, reason and
 source are reconstructable from the chain alone.
+
+**1b. The widening action — `add` (#3181).** `retire` narrows and `restate`
+rewords, but nothing widened the contract: an operator who spotted a missing
+drivable criterion at the gate could only write a reason condition, which is
+structurally unsatisfiable (criteria live in the approved plan artifact the
+implement stage cannot write — run 0aad7486). `{id, action: add, reason,
+statement}` APPENDS an operator-authored criterion in the same call. `id` is a
+FRESH `^[a-z0-9][a-z0-9-]*$` slug; statement and reason are required. The seam
+materializes it as an explicit criterion with `source_ref: operator_approval`,
+its reason as `rationale`, `skip_expected: false` (always drivable) and
+`blocking: false`, appended to `Live` AFTER every plan criterion, to `AllIDs`
+(so `acceptance_criteria_ids` — now served from the seam — admits a verdict row
+for it) and to `Added`. The acceptance prompt names it under an
+"Operator-authored at approval" block: it did NOT pass plan review, it must be
+validated, and a failure on it alone does not condemn the change. It is
+ADVISORY by construction, not only by the `blocking` flag (which
+`aggregateAcceptanceResults` never reads): a failed verdict whose failures name
+ONLY operator-added criteria is neutralized at ingest under downgrade basis
+`added_criteria_only`, and the orchestrator's acceptance short-circuit evaluates
+the EFFECTIVE verification (via the nil-safe `EffectiveAcceptance` hook), so an
+add on an all-skip-with-basis plan is actually driven instead of settling
+`not_validated`.
 
 **2. Contested context in the acceptance prompt.** The acceptance prompt renders
 the binding approval conditions AND the paths the operator dropped via
@@ -4603,11 +4625,13 @@ computed. No caller may union, filter, or recompute any part of it; a consumer
 needing a different projection changes that signature. It returns `Live` (plan
 order, restatements applied), `Retired` (plan order, with reason + source +
 recording audit sequence), `Restated` (the ids a restatement replaced, plan
-order), and `AllIDs` — ALWAYS the full plan id list.
+order), `Added` (operator-added ids, add order, #3181), and `AllIDs` — ALWAYS the
+full plan id list plus every added id.
 
 `Restated` exists because `Live` alone cannot signal that an amendment applied:
 a restate-only history leaves `Live` the same LENGTH as the plan set with only a
-statement differing. `amended()` (`len(Retired) > 0 || len(Restated) > 0`) is the
+statement differing. `amended()` (`len(Retired) > 0 || len(Restated) > 0 ||
+len(Added) > 0`) is the
 single predicate a consumer uses to choose the effective set over the plan set —
 `resolveAcceptancePromptCriteria` keying that decision off `Retired` alone
 silently dropped a restate-only amendment on BOTH prompt paths, so the validator
@@ -4627,7 +4651,7 @@ It is consumed at exactly FOUR call sites:
 4. `handleShipAcceptance` (verdict ingest), where the recorded retired-id set is
    the strict key for the downgrade.
 
-### Anti-silencing gate — nine named refusals, all PRE-Submit
+### Anti-silencing gate — named refusals, all PRE-Submit
 
 Every refusal inserts NO approval row, so a corrected retry flows normally
 (the ADR-036 placement its sibling gates use). `details.rule` names each one:
@@ -4642,11 +4666,19 @@ Every refusal inserts NO approval row, so a corrected retry flows normally
 | R6 | every criterion retired in ONE call | 422 `acceptance_criteria_all_retired` |
 | R7 | every criterion retired CUMULATIVELY (prior approvals retired the rest) | 422 `acceptance_criteria_all_retired` |
 | R8 | `already_retired` — an id a PRIOR approval retired | 400 |
-| R9 | plan unloadable / zero criteria / prior amendments unreadable | 422 `acceptance_criteria_unavailable` |
+| R9 | plan unloadable / zero criteria / prior amendments unreadable — applies to `add` too | 422 `acceptance_criteria_unavailable` |
+| R10 | `criterion_id_exists` — an `add` id already in the plan, added by a PRIOR approval, or carrying `scenario:` | 400 |
+| R11 | `invalid_criterion_id` — an `add` id not matching `^[a-z0-9][a-z0-9-]*$` | 400 |
+| R12 | no REVIEWED criterion would stay live while any `add` is present (one call or cumulatively) | 422 `acceptance_criteria_all_operator_authored` |
 
 R6 and R7 are ONE control evaluated on the deduplicated union of prior and
 in-flight retirements: the channel cannot empty a plan's acceptance contract, in
-one call or across many. An action outside `{retire, restate}` is refused under
+one call or across many. R12 is its anti-SUBSTITUTION mirror, read off the SAME
+union so the two cannot disagree: when that union would leave no reviewed
+criterion live and an add is present (in this request or recorded earlier), the
+refusal is `all_operator_authored` — an advisory criterion may never become the
+whole contract. R9 applying to `add` is the same rule seen from a criteria-less
+plan. An action outside `{retire, restate, add, retire_scenario}` is refused under
 `unknown_action`; an oversized reason/statement is CAPPED (`prompt.CapText`),
 not refused. Unlike the scope channels — which IGNORE a non-plan-stage value
 (#2598) — this channel REFUSES it, because a silently dropped amendment diverges

@@ -86,6 +86,49 @@ func TestEmbeddedScenarios_DeclaredShapes(t *testing.T) {
 			t.Fatalf("want one standard_v1 plan artifact, got %+v", s.Artifacts)
 		}
 	})
+	// plan-gate-criteria (#3181): the plan gate parked over a plan carrying
+	// >= 2 DRIVABLE acceptance criteria, with an acceptance stage at pending
+	// so the amend channel is drivable and the acceptance prompt renderable.
+	t.Run("plan-gate-criteria", func(t *testing.T) {
+		s := mustLoad(t, "plan-gate-criteria")
+		if len(s.Runs) != 1 || s.Runs[0].WorkflowID != "feature_change" || s.Runs[0].State != "running" {
+			t.Fatalf("want one running feature_change run, got %+v", s.Runs)
+		}
+		got := map[string]string{}
+		for _, st := range s.Stages {
+			got[st.Type] = st.State
+			if st.Type == "plan" && !st.RequiresApproval {
+				t.Fatalf("plan stage must require approval, got %+v", st)
+			}
+		}
+		want := map[string]string{"plan": "awaiting_approval", "implement": "pending", "review": "pending", "acceptance": "pending"}
+		if len(s.Stages) != len(want) {
+			t.Fatalf("want %d stages, got %+v", len(want), s.Stages)
+		}
+		for typ, state := range want {
+			if got[typ] != state {
+				t.Fatalf("stage %s state = %q, want %q (all: %v)", typ, got[typ], state, got)
+			}
+		}
+		if len(s.Artifacts) != 1 || s.Artifacts[0].Kind != "plan" || s.Artifacts[0].SchemaVersion != "standard_v1" {
+			t.Fatalf("want one standard_v1 plan artifact, got %+v", s.Artifacts)
+		}
+		var p plan.Plan
+		if err := json.Unmarshal([]byte(s.Artifacts[0].Content), &p); err != nil {
+			t.Fatalf("plan artifact does not decode into plan.Plan: %v", err)
+		}
+		if n := len(p.Verification.AcceptanceCriteria); n != 2 {
+			t.Fatalf("plan carries %d acceptance_criteria, want 2", n)
+		}
+		for _, c := range p.Verification.AcceptanceCriteria {
+			if c.SkipExpected {
+				t.Fatalf("acceptance criterion %q is skip_expected; the fixture's criteria must be DRIVABLE", c.ID)
+			}
+		}
+		if len(s.Approvals) != 0 {
+			t.Fatalf("the plan gate must be unapproved, got %+v", s.Approvals)
+		}
+	})
 	// acceptance-dispatched (E72.5 / #3329): the first scenario past the
 	// plan stage — exactly one acceptance stage at dispatched, an
 	// acceptance_dispatched row on it, and a pull_request_opened row carrying

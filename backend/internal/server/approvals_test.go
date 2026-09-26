@@ -10257,6 +10257,62 @@ func TestApprovalAudit_AmendAcceptanceCriteria_RecordedOnSameRow(t *testing.T) {
 	}
 }
 
+// TestApprovalAudit_AmendAcceptanceCriteria_AddRecordedOnSameRow extends the
+// #2581 persistence seam to the #3181 add action: the add lands on the SAME
+// approval_submitted entry as the reason that motivated it, with its id, reason
+// AND statement, and feeding that recorded row back through the seam
+// materializes the operator-authored criterion (Live + AllIDs + Added, with
+// operator_approval provenance) — reconstructable from the chain alone.
+func TestApprovalAudit_AmendAcceptanceCriteria_AddRecordedOnSameRow(t *testing.T) {
+	s, _, au, _, runRow, stage := newAmendServer(t, amendCriteria())
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve",`+
+		`"comment":"the plan never drives the delete route",`+
+		`"amend_acceptance_criteria":[{"id":"crit-delete","action":"add","reason":"missing drivable criterion","statement":"DELETE /widgets/1 returns 204"}]}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+
+	payload := findApprovalSubmittedPayload(t, au.appended)
+	if payload["comment"] != "the plan never drives the delete route" {
+		t.Errorf("comment = %v, want the approval reason on the SAME row", payload["comment"])
+	}
+	entries, _ := payload["amend_acceptance_criteria"].([]any)
+	if len(entries) != 1 {
+		t.Fatalf("amend_acceptance_criteria = %v, want one entry", payload["amend_acceptance_criteria"])
+	}
+	first, _ := entries[0].(map[string]any)
+	if first["id"] != "crit-delete" || first["action"] != "add" ||
+		first["reason"] != "missing drivable criterion" || first["statement"] != "DELETE /widgets/1 returns 204" {
+		t.Errorf("recorded amendment = %v, want the id/action/reason/statement verbatim", first)
+	}
+
+	// Reconstructable from the chain alone: feed the RECORDED entry (decoded
+	// from the captured payload, not re-typed) back through the seam.
+	raw, _ := json.Marshal(first)
+	var recorded acceptanceCriteriaAmendment
+	if err := json.Unmarshal(raw, &recorded); err != nil {
+		t.Fatalf("decode recorded amendment: %v", err)
+	}
+	au.seedApprovalEntry(runRow.ID, stage.ID, 1, "approve", []acceptanceCriteriaAmendment{recorded})
+	p := &plan.Plan{Verification: plan.Verification{AcceptanceCriteria: amendCriteria()}}
+	eff, err := s.resolveEffectiveAcceptanceCriteria(context.Background(), runRow.ID, p, nil)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if len(eff.Added) != 1 || eff.Added[0] != "crit-delete" {
+		t.Fatalf("Added = %v, want [crit-delete]", eff.Added)
+	}
+	last := eff.Live[len(eff.Live)-1]
+	if last.ID != "crit-delete" || last.Statement != "DELETE /widgets/1 returns 204" ||
+		last.SourceRef != acceptanceAdditionSourceOperator || last.Rationale != "missing drivable criterion" {
+		t.Errorf("added criterion provenance = %+v, want operator_approval with the recorded reason", last)
+	}
+	if eff.AllIDs[len(eff.AllIDs)-1] != "crit-delete" {
+		t.Errorf("AllIDs = %v, want crit-delete in the served superset", eff.AllIDs)
+	}
+}
+
 // wantPreChangeAmendlessApprovalPayload is the FROZEN pre-#2581 approval_
 // submitted payload for the newAmendServer fixture's plain `approve` with a
 // comment, with the stage id substituted at assert time.

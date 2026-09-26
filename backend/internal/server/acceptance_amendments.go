@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -36,7 +37,21 @@ const (
 	// approval_submitted row as retired_scenarios and served to the acceptance
 	// runner, which merges it into acceptance/scenarios/retired.yaml.
 	acceptanceAmendActionRetireScenario = "retire_scenario"
+	// acceptanceAmendActionAdd APPENDS an operator-authored criterion to the
+	// live contract (#3181): the id must be a fresh slug (not in the plan, not
+	// added by a prior approval, no scenario: prefix), statement and reason are
+	// both required. The added criterion is always drivable and never blocking —
+	// it did NOT pass plan review, so it is advisory: a failure naming only
+	// added criteria is neutralized at acceptance ingest. An add may never leave
+	// the live contract wholly operator-authored (acceptance_criteria_all_operator_authored).
+	acceptanceAmendActionAdd = "add"
 )
+
+// acceptanceCriterionIDRe is the plan schema's criterion-id slug pattern
+// (docs/spec/plan-standard-v1.schema.json: ^[a-z0-9][a-z0-9-]*$). An added
+// criterion id must match it so the join key the verdict reports against stays
+// valid downstream (the runner's verdict schema and the transcript id guard).
+var acceptanceCriterionIDRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
 
 // acceptanceScenarioRetirementUnpersistableCode is the 400 code refusing a
 // retire_scenario on a plan whose shape guarantees NO acceptance runner ever
@@ -80,6 +95,12 @@ func acceptanceRunnerNeverSpawns(v plan.Verification) (bool, string) {
 // source is planned.
 const acceptanceRetirementSourceOperator = "operator_approval"
 
+// acceptanceAdditionSourceOperator is the SourceRef an operator-added criterion
+// carries (#3181): its provenance is the approve-time channel, not the issue
+// and not the planner. Exactly one addition source exists, for the same reason
+// there is exactly one retirement source.
+const acceptanceAdditionSourceOperator = "operator_approval"
+
 // maxAcceptanceAmendmentTextBytes caps each amendment's reason/statement so an
 // oversized field cannot bloat the approval_submitted audit payload. Sized off
 // the same family as the operator's approve-with-conditions text; oversized
@@ -94,13 +115,14 @@ const maxAcceptanceAmendmentTextBytes = prompt.MaxApprovalConditionBytes
 // retirement and its justification are reconstructable from the chain alone.
 type acceptanceCriteriaAmendment struct {
 	// ID is the plan criterion this amendment targets (the same slug join key
-	// the acceptance verdict reports against).
+	// the acceptance verdict reports against), or — for add — the fresh id of
+	// the criterion being appended.
 	ID string `json:"id"`
-	// Action is retire | restate.
+	// Action is retire | restate | add | retire_scenario.
 	Action string `json:"action"`
 	// Reason is REQUIRED per criterion: it is the reconstructable why.
 	Reason string `json:"reason"`
-	// Statement is REQUIRED for restate and ignored for retire.
+	// Statement is REQUIRED for restate and add, ignored for retire.
 	Statement string `json:"statement,omitempty"`
 }
 
@@ -119,10 +141,12 @@ type retiredCriterion struct {
 // effectiveAcceptanceCriteria is the COMPLETE effective criteria set for a run:
 // the live criteria (with restatements applied, in plan order), the retired set
 // with provenance (also in plan order), the ids whose statement a restatement
-// replaced (plan order), and AllIDs — ALWAYS the full plan id list, never
-// narrowed, because the acceptance_criteria_ids served to the runner must stay a
-// SUPERSET so a verdict reporting a retired id can never fail the stage closed on
-// join-key validation.
+// replaced (plan order), and AllIDs — ALWAYS the full plan id list PLUS every
+// operator-added id (#3181), never narrowed, because the acceptance_criteria_ids
+// served to the runner must stay a SUPERSET so a verdict reporting a retired id
+// (or an added one) can never fail the stage closed on join-key validation.
+// Added records the operator-added ids in add order; the criteria themselves
+// are appended to Live AFTER every plan-origin criterion.
 //
 // Restated exists because Live alone cannot tell a consumer whether an amendment
 // applied: a restate-only history leaves Live the same LENGTH as the plan set
@@ -133,6 +157,7 @@ type effectiveAcceptanceCriteria struct {
 	Live     []plan.AcceptanceCriterion
 	Retired  []retiredCriterion
 	Restated []string
+	Added    []string
 	AllIDs   []string
 	// RetiredScenarios is every approved retire_scenario entry recorded on the
 	// run's approval chain (E72.4 / #3328), in ascending approval order, FULL
@@ -151,10 +176,22 @@ func (e effectiveAcceptanceCriteria) retiredScenarioIDSet() map[string]struct{} 
 }
 
 // amended reports whether any recorded or pending amendment actually changed the
-// plan's criteria set — a retirement or a restatement. It is the single predicate
-// consumers use to decide between the effective set and the plan set verbatim.
+// plan's criteria set — a retirement, a restatement, or an addition. It is the
+// single predicate consumers use to decide between the effective set and the
+// plan set verbatim; omitting Added would drop an add-only history on the floor
+// exactly as omitting Restated once did.
 func (e effectiveAcceptanceCriteria) amended() bool {
-	return len(e.Retired) > 0 || len(e.Restated) > 0
+	return len(e.Retired) > 0 || len(e.Restated) > 0 || len(e.Added) > 0
+}
+
+// addedIDSet returns the operator-added criterion ids as a set (#3181) — the
+// strict key for the acceptance-ingest added-only downgrade.
+func (e effectiveAcceptanceCriteria) addedIDSet() map[string]struct{} {
+	out := make(map[string]struct{}, len(e.Added))
+	for _, id := range e.Added {
+		out[id] = struct{}{}
+	}
+	return out
 }
 
 // retiredIDSet returns the retired criterion ids as a set for membership tests.
@@ -197,7 +234,10 @@ func (e effectiveAcceptanceCriteria) retiredIDSet() map[string]struct{} {
 // then the caller's pending amendments. Retire is ABSORBING (a repeat retire of
 // an already-retired id no-ops here; it is REFUSED at the gate). Restate
 // replaces only the Statement of a LIVE criterion and never moves it out of
-// Live.
+// Live. Add (#3181) appends an explicit, operator_approval-sourced, drivable,
+// NON-blocking criterion to Live and its id to AllIDs and Added, ordered after
+// every plan-origin criterion; an add naming an id already present is a no-op
+// here (it is REFUSED at the gate).
 //
 // An audit read failure returns a typed error and NO partial set, so each caller
 // chooses its own fail direction explicitly (the gate fails closed; the prompt
@@ -237,6 +277,28 @@ func (s *Server) resolveEffectiveAcceptanceCriteria(ctx context.Context, runID u
 		if a.Action == acceptanceAmendActionRetireScenario {
 			// A scenario retirement names no plan criterion; it is carried on
 			// RetiredScenarios above and never touches Live/Retired.
+			return
+		}
+		if a.Action == acceptanceAmendActionAdd {
+			if _, exists := planOrder[a.ID]; exists {
+				// Collides with a plan or previously-added id; refused at the gate.
+				return
+			}
+			blocking := false
+			eff.Live = append(eff.Live, plan.AcceptanceCriterion{
+				ID:           a.ID,
+				Statement:    a.Statement,
+				Source:       plan.CriterionSourceExplicit,
+				SourceRef:    acceptanceAdditionSourceOperator,
+				Rationale:    a.Reason,
+				Blocking:     &blocking,
+				SkipExpected: false,
+			})
+			// An explicit index above every plan criterion: planOrder's zero value
+			// would otherwise sort an added id FIRST.
+			planOrder[a.ID] = len(planOrder)
+			eff.AllIDs = append(eff.AllIDs, a.ID)
+			eff.Added = append(eff.Added, a.ID)
 			return
 		}
 		if _, already := retired[a.ID]; already {
@@ -382,23 +444,32 @@ func (s *Server) recordedAcceptanceAmendments(ctx context.Context, runID uuid.UU
 // an approve that does not use the channel is untouched and records a
 // byte-identical payload to today.
 //
-// Nine named refusals, each carrying details.rule so it is separately
-// assertable:
+// Named refusals, each carrying details.rule (or a distinct 422 code) so it is
+// separately assertable:
 //
-//	R1 unknown_criterion_id            400 — id absent from the approved plan
-//	R2 reason_required                 400 — blank/whitespace reason
-//	R3 statement_required              400 — restate with no statement
+//	R1 unknown_criterion_id            400 — retire/restate id absent from the approved plan
+//	R2 reason_required                 400 — blank/whitespace reason (every action)
+//	R3 statement_required              400 — restate or add with no statement
 //	R4 duplicate_id                    400 — the same id twice in one request
 //	R5 amendment_not_approve_plan_stage 400 — reject, or a non-plan stage
 //	R6 (all-retired, single call)      422 acceptance_criteria_all_retired
 //	R7 (all-retired, cumulative)       422 acceptance_criteria_all_retired
 //	R8 already_retired                 400 — id retired by a PRIOR approval
-//	R9 (plan unavailable / no criteria) 422 acceptance_criteria_unavailable
+//	R9 (plan unavailable / no criteria) 422 acceptance_criteria_unavailable — applies to add too
+//	R10 criterion_id_exists            400 — add id already in the plan, already added by a
+//	                                         prior approval, or carrying the scenario: prefix
+//	R11 invalid_criterion_id           400 — add id not a ^[a-z0-9][a-z0-9-]*$ slug
+//	R12 (all-operator-authored)        422 acceptance_criteria_all_operator_authored
 //
 // R6 and R7 are ONE control evaluated on the deduplicated union of prior and
 // in-flight retirements — the anti-silencing gate: the channel cannot be used to
 // empty a plan's acceptance contract, whether in one call or cumulatively across
-// approvals. An unknown action value is refused under unknown_action (400).
+// approvals. R12 is its anti-SUBSTITUTION mirror (#3181), read off the SAME
+// union: when that union would leave no REVIEWED criterion live while any add is
+// present (in this request or recorded by a prior approval), the refusal is
+// all_operator_authored rather than all_retired — an operator-authored criterion
+// may never become the whole contract, in one call or cumulatively. An unknown
+// action value is refused under unknown_action (400).
 func (s *Server) checkAmendAcceptanceCriteria(w http.ResponseWriter, r *http.Request, stage *run.Stage, decision approval.Decision, amendments []acceptanceCriteriaAmendment) ([]acceptanceCriteriaAmendment, bool) {
 	if len(amendments) == 0 {
 		return nil, true
@@ -426,11 +497,20 @@ func (s *Server) checkAmendAcceptanceCriteria(w http.ResponseWriter, r *http.Req
 	// amendments: they are validated against the scenario ledger, not the plan's
 	// criteria, and are PERMITTED with zero plan criteria (R9 below applies to
 	// criterion amendments only).
-	var criterionAmendments, scenarioAmendments []acceptanceCriteriaAmendment
+	//
+	// Adds (#3181) are partitioned the same way: an add id is by construction
+	// NOT in the plan, so routing it through the retire/restate loop would
+	// refuse it under unknown_criterion_id. Adds DO count as criterion
+	// amendments for R9 (an add on a criteria-less plan would be exactly the
+	// wholly-operator-authored contract R12 refuses).
+	var criterionAmendments, scenarioAmendments, addAmendments []acceptanceCriteriaAmendment
 	for _, a := range amendments {
-		if strings.TrimSpace(a.Action) == acceptanceAmendActionRetireScenario {
+		switch strings.TrimSpace(a.Action) {
+		case acceptanceAmendActionRetireScenario:
 			scenarioAmendments = append(scenarioAmendments, a)
 			continue
+		case acceptanceAmendActionAdd:
+			addAmendments = append(addAmendments, a)
 		}
 		criterionAmendments = append(criterionAmendments, a)
 	}
@@ -446,7 +526,7 @@ func (s *Server) checkAmendAcceptanceCriteria(w http.ResponseWriter, r *http.Req
 			details["error"] = err.Error()
 		}
 		s.writeError(w, r, http.StatusUnprocessableEntity, "acceptance_criteria_unavailable",
-			"the approved plan carries no acceptance_criteria to amend; re-plan so the criteria exist, or approve without amend_acceptance_criteria",
+			"the approved plan carries no acceptance_criteria to amend; re-plan so the criteria exist, or approve without amend_acceptance_criteria (an add cannot be the first criterion — the contract would be wholly operator-authored)",
 			details)
 		return nil, false
 	}
@@ -457,7 +537,7 @@ func (s *Server) checkAmendAcceptanceCriteria(w http.ResponseWriter, r *http.Req
 	// never approved. Decided by acceptanceRunnerNeverSpawns, the SAME predicate
 	// set the orchestrator short-circuit and the surface-none omission use.
 	if len(scenarioAmendments) > 0 {
-		if never, shape := acceptanceRunnerNeverSpawns(approvedPlan.Verification); never {
+		if never, shape := acceptanceRunnerNeverSpawns(s.postAmendmentVerification(r.Context(), stage.RunID, approvedPlan, addAmendments)); never {
 			s.writeError(w, r, http.StatusBadRequest, acceptanceScenarioRetirementUnpersistableCode,
 				"retire_scenario cannot be persisted on this plan: its shape ("+shape+") settles the acceptance stage server-side with no runner spawn, so the retirement would never reach acceptance/scenarios/retired.yaml; retire the scenario on a run whose acceptance stage executes",
 				map[string]any{"field": "amend_acceptance_criteria", "rule": "scenario_retirement_unpersistable", "plan_shape": shape, "stage_id": stage.ID.String()})
@@ -471,7 +551,12 @@ func (s *Server) checkAmendAcceptanceCriteria(w http.ResponseWriter, r *http.Req
 	if len(criterionAmendments) == 0 {
 		return scenarioOut, true
 	}
-	amendments = criterionAmendments
+	amendments = criterionAmendments[:0:0]
+	for _, a := range criterionAmendments {
+		if strings.TrimSpace(a.Action) != acceptanceAmendActionAdd {
+			amendments = append(amendments, a)
+		}
+	}
 
 	// The PRIOR effective set: what the chain already records. Fail CLOSED on an
 	// unreadable chain — the anti-silencing refusals cannot be evaluated without
@@ -515,7 +600,7 @@ func (s *Server) checkAmendAcceptanceCriteria(w http.ResponseWriter, r *http.Req
 		case acceptanceAmendActionRetire, acceptanceAmendActionRestate:
 		default:
 			refuse("unknown_action",
-				"amend_acceptance_criteria action must be retire or restate",
+				"amend_acceptance_criteria action must be retire, restate, add, or retire_scenario",
 				map[string]any{"id": id, "action": action})
 			return nil, false
 		}
@@ -556,6 +641,81 @@ func (s *Server) checkAmendAcceptanceCriteria(w http.ResponseWriter, r *http.Req
 		out = append(out, canonical)
 	}
 
+	// Adds (#3181): R2/R3/R4/R10/R11. seen is shared with the retire/restate
+	// loop so an id cannot repeat across actions either.
+	priorAdded := prior.addedIDSet()
+	addedIDs := make([]string, 0, len(addAmendments))
+	for _, a := range addAmendments {
+		id := strings.TrimSpace(a.ID)
+		reason := strings.TrimSpace(a.Reason)
+		statement := strings.TrimSpace(a.Statement)
+		if isScenarioRow(id) {
+			refuse("criterion_id_exists",
+				"an amend_acceptance_criteria add id may not carry the scenario: prefix — it would masquerade as a replay scenario id",
+				map[string]any{"id": id})
+			return nil, false
+		}
+		if !acceptanceCriterionIDRe.MatchString(id) {
+			refuse("invalid_criterion_id",
+				"an amend_acceptance_criteria add id must be a lowercase slug matching ^[a-z0-9][a-z0-9-]*$ (the plan schema's criterion-id pattern)",
+				map[string]any{"id": id})
+			return nil, false
+		}
+		if _, inPlan := known[id]; inPlan {
+			refuse("criterion_id_exists",
+				"an amend_acceptance_criteria add names an id already in the approved plan's acceptance_criteria; use restate to reword it",
+				map[string]any{"id": id})
+			return nil, false
+		}
+		if _, already := priorAdded[id]; already {
+			refuse("criterion_id_exists",
+				"an amend_acceptance_criteria add names an id a prior approval already added; an addition cannot be re-added",
+				map[string]any{"id": id})
+			return nil, false
+		}
+		if reason == "" {
+			refuse("reason_required",
+				"each amend_acceptance_criteria entry requires a reason — it is the reconstructable why",
+				map[string]any{"id": id})
+			return nil, false
+		}
+		if statement == "" {
+			refuse("statement_required",
+				"an amend_acceptance_criteria add requires the criterion statement",
+				map[string]any{"id": id})
+			return nil, false
+		}
+		if _, dup := seen[id]; dup {
+			refuse("duplicate_id",
+				"amend_acceptance_criteria names the same criterion id twice in one request",
+				map[string]any{"id": id})
+			return nil, false
+		}
+		seen[id] = struct{}{}
+		addedIDs = append(addedIDs, id)
+		reason, _ = prompt.CapText(reason, maxAcceptanceAmendmentTextBytes)
+		statement, _ = prompt.CapText(statement, maxAcceptanceAmendmentTextBytes)
+		out = append(out, acceptanceCriteriaAmendment{ID: id, Action: acceptanceAmendActionAdd, Reason: reason, Statement: statement})
+	}
+
+	// R12: the anti-SUBSTITUTION gate (#3181), the mirror of R6/R7 read off the
+	// SAME deduplicated retirement union so the two cannot disagree. When no
+	// reviewed criterion would survive and ANY add is present — in this request
+	// or recorded by a prior approval — the live contract would be wholly
+	// operator-authored: refuse under its own code.
+	if len(union) >= len(known) && (len(addedIDs) > 0 || len(priorAdded) > 0) {
+		allAdded := append(append([]string(nil), prior.Added...), addedIDs...)
+		s.writeError(w, r, http.StatusUnprocessableEntity, "acceptance_criteria_all_operator_authored",
+			fmt.Sprintf("this amendment would leave %d reviewed acceptance criteria live, making the contract wholly operator-authored (added: %s); an operator-added criterion is advisory and cannot replace the reviewed contract — re-plan instead",
+				len(known)-len(union), strings.Join(allAdded, ", ")),
+			map[string]any{
+				"stage_id":            stage.ID.String(),
+				"reviewed_live_count": len(known) - len(union),
+				"added_count":         len(allAdded),
+			})
+		return nil, false
+	}
+
 	// R6/R7: the anti-silencing gate. Evaluated on the deduplicated union of the
 	// prior recorded retirements and this request's, so the channel cannot empty
 	// a plan's acceptance contract in one call OR cumulatively.
@@ -570,6 +730,27 @@ func (s *Server) checkAmendAcceptanceCriteria(w http.ResponseWriter, r *http.Req
 		return nil, false
 	}
 	return append(out, scenarioOut...), true
+}
+
+// postAmendmentVerification is the verification the retire_scenario
+// unpersistable check evaluates (#3181): the plan's verification with its
+// acceptance criteria replaced by the recorded effective live set plus a
+// drivable stand-in for every in-flight add, so an add that makes the runner
+// spawn (e.g. on an all-skip-with-basis plan) is accounted for. An unreadable
+// approval chain falls back to the plan's own criteria — the direction that
+// REFUSES more, never fewer, retirements.
+func (s *Server) postAmendmentVerification(ctx context.Context, runID uuid.UUID, p *plan.Plan, adds []acceptanceCriteriaAmendment) plan.Verification {
+	v := p.Verification
+	live := p.Verification.AcceptanceCriteria
+	if eff, err := s.resolveEffectiveAcceptanceCriteria(ctx, runID, p, nil); err == nil && len(eff.Live) > 0 {
+		live = eff.Live
+	}
+	criteria := append([]plan.AcceptanceCriterion(nil), live...)
+	for _, a := range adds {
+		criteria = append(criteria, plan.AcceptanceCriterion{ID: strings.TrimSpace(a.ID), Statement: strings.TrimSpace(a.Statement)})
+	}
+	v.AcceptanceCriteria = criteria
+	return v
 }
 
 // checkRetireScenarioAmendments validates the retire_scenario entries of a
@@ -800,15 +981,16 @@ func (s *Server) recordedAcceptanceEffectiveVerdict(ctx context.Context, runID u
 // returns (nil, nil), which makes buildAcceptance render the FULL plan criteria
 // set — a degraded read can never silence a criterion.
 //
-// The live set is returned whenever ANY amendment applied — a retirement or a
-// RESTATEMENT. Keying this off the retired set alone dropped a restate-only
+// The live set is returned whenever ANY amendment applied — a retirement, a
+// RESTATEMENT, or an ADDITION (#3181, which also populates the third,
+// operator-added return). Keying this off the retired set alone dropped a restate-only
 // history on the floor: the prompt fell back to the plan's original statements
 // and the validator judged the change against the very text the operator
 // replaced at the gate. Both prompt paths call this one function, so they cannot
 // diverge on it.
-func (s *Server) resolveAcceptancePromptCriteria(ctx context.Context, runID uuid.UUID, p *plan.Plan) ([]plan.AcceptanceCriterion, []prompt.RetiredAcceptanceCriterion) {
+func (s *Server) resolveAcceptancePromptCriteria(ctx context.Context, runID uuid.UUID, p *plan.Plan) ([]plan.AcceptanceCriterion, []prompt.RetiredAcceptanceCriterion, []prompt.OperatorAddedAcceptanceCriterion) {
 	if p == nil {
-		return nil, nil
+		return nil, nil, nil
 	}
 	eff, err := s.resolveEffectiveAcceptanceCriteria(ctx, runID, p, nil)
 	if err != nil {
@@ -817,21 +999,26 @@ func (s *Server) resolveAcceptancePromptCriteria(ctx context.Context, runID uuid
 			slog.String("run_id", runID.String()),
 			slog.String("error", err.Error()),
 		)
-		return nil, nil
+		return nil, nil, nil
 	}
 	if !eff.amended() {
-		// Nothing was amended: leave both trigger fields nil so the prompt is
+		// Nothing was amended: leave every trigger field nil so the prompt is
 		// byte-identical to today.
-		return nil, nil
+		return nil, nil, nil
 	}
-	if len(eff.Retired) == 0 {
-		// Restate-only: the live set carries the replacement statements, and the
-		// retired block must not render (there is nothing retired to name).
-		return eff.Live, nil
-	}
-	retired := make([]prompt.RetiredAcceptanceCriterion, 0, len(eff.Retired))
+	var retired []prompt.RetiredAcceptanceCriterion
 	for _, r := range eff.Retired {
 		retired = append(retired, prompt.RetiredAcceptanceCriterion{ID: r.ID, Reason: r.Reason})
 	}
-	return eff.Live, retired
+	// Operator-added criteria (#3181) ride Live (they are validated) AND the
+	// operator-authored block, whose reason is the criterion's recorded
+	// Rationale — the seam is the only producer of both.
+	var added []prompt.OperatorAddedAcceptanceCriterion
+	addedSet := eff.addedIDSet()
+	for _, c := range eff.Live {
+		if _, ok := addedSet[c.ID]; ok {
+			added = append(added, prompt.OperatorAddedAcceptanceCriterion{ID: c.ID, Reason: c.Rationale})
+		}
+	}
+	return eff.Live, retired, added
 }
