@@ -1,0 +1,14 @@
+id: scenario:issue-3559/doc-path-hint-draws-no-restates-advisory
+statement: 'For a plan whose sole acceptance criterion carries the #3510 verify_hint (a hint naming a non-test rendered file read at the PR head and explicitly disclaiming being a Go test), the plan gate''s acceptance pre-check records no criterion_restates_test finding and a restates_test_count of 0.'
+verify_hint: 'GET /v0/runs/{run_id}/audit on the localhost preview: the persisted audit row of category plan_acceptance_precheck carries restates_test_count 0 and its findings array contains no entry whose rule is criterion_restates_test.'
+steps: 'POST http://localhost:8090/v0/dev/fixtures {"scenario":"plan-gate-criteria"} -> run + plan stage (awaiting_approval) + pending acceptance stage; POST /v0/runs/{run}/signing-key {} -> private_key; build docs/spec/examples/plan-standard-v1-example.json with verification.acceptance_criteria = [{id: readme-distinguishes-marker-vs-direct-launch, source: explicit, blocking: true, verify_hint: the #3510 hint verbatim: ''Read runner/README.md § Forge-writes gate at the PR head (a rendered file in the checkout, not a Go test): the unreachable-from-the-sandbox sentence is gone and a launch-path paragraph names both classes''}]; POST /v0/dev/sign over the plan bytes with X-Fishhawk-Dev-Private-Key; POST /v0/runs/{run}/plan?stage_id={plan} with X-Fishhawk-Signature -> 201; GET /v0/runs/{run}/audit?category=plan_acceptance_precheck.'
+assertions:
+    expected: plan_acceptance_precheck restates_test_count 0 and no criterion_restates_test finding
+    observed_at_record: 'run 493c9134-7b96-4a3f-b304-7dac83437622: plan POST 201; plan_acceptance_precheck payload findings=[], restates_test_count=0, criteria_count=1, blocking_count=1. Supporting counterfactual: the classifier at HEAD~1 (df88105a, exported to /tmp) returns 1 criterion_restates_test finding for this exact hint; HEAD 40d6721b returns 0.'
+    repro_handle: GET /v0/runs/493c9134-7b96-4a3f-b304-7dac83437622/audit?category=plan_acceptance_precheck
+origin:
+    issue: 3559
+    pr: 3688
+    run_id: 64a99376-bbf6-4950-b962-90e5d1c273db
+    head_sha: 40d6721bfe87dc55595ce808216a3859f63f4aea
+    recorded_at: 2026-09-26T13:03:57Z
