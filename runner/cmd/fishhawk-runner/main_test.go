@@ -29680,7 +29680,11 @@ func TestImplementPush_RefreshPushTokenWiredToMint(t *testing.T) {
 	now := withMutableRunnerNow(t, time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC))
 	fu := newFakeUploader(t)
 	fu.promptResp = refreshPromptResp()
-	fu.instTokenSeq = []string{"ghs_old", "ghs_new"}
+	// The leading "ghs_advance" entry is consumed by the #3454 standalone
+	// base advance, which mints once pre-agent for its remote base query.
+	// The push path then takes the NEXT entries, so the refresh arithmetic
+	// below is unchanged in meaning, only shifted by that one mint.
+	fu.instTokenSeq = []string{"ghs_advance", "ghs_old", "ghs_new"}
 	withFakeUploader(t, fu)
 	fp := &fakePusher{invokeRefresh: true}
 	// Model the 30-minute verify: the clock moves 10 min between the
@@ -29705,8 +29709,8 @@ func TestImplementPush_RefreshPushTokenWiredToMint(t *testing.T) {
 	if fp.gotArgs.PushToken != "ghs_old" || fp.refreshedToken != "ghs_new" {
 		t.Errorf("PushToken/refreshed = %q/%q, want ghs_old/ghs_new (the refresh must mint a SECOND token)", fp.gotArgs.PushToken, fp.refreshedToken)
 	}
-	if fu.instTokenCalls != 2 {
-		t.Errorf("FetchInstallationToken calls = %d, want 2 (top-of-function mint + post-verify refresh)", fu.instTokenCalls)
+	if fu.instTokenCalls != 3 {
+		t.Errorf("FetchInstallationToken calls = %d, want 3 (#3454 base-advance mint + top-of-function mint + post-verify refresh)", fu.instTokenCalls)
 	}
 	wantEvent := `{"event":"push_token_refreshed","run_id":"11111111-2222-3333-4444-555555555555","stage_id":"22222222-3333-4444-5555-666666666666","token_held_seconds":600,"changed":true}`
 	if !strings.Contains(stderr.String(), wantEvent) {
@@ -29731,9 +29735,13 @@ func TestImplementPush_RefreshPushTokenFailureLogsAndDegrades(t *testing.T) {
 	now := withMutableRunnerNow(t, time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC))
 	fu := newFakeUploader(t)
 	fu.promptResp = refreshPromptResp()
-	fu.instTokenSeq = []string{"ghs_old"}
+	// The leading "ghs_advance" entry is consumed by the #3454 standalone
+	// base advance, which mints once pre-agent for its remote base query.
+	// The push path then takes the NEXT entries, so the refresh arithmetic
+	// below is unchanged in meaning, only shifted by that one mint.
+	fu.instTokenSeq = []string{"ghs_advance", "ghs_old"}
 	fu.instTokenHook = func() {
-		if fu.instTokenCalls == 2 {
+		if fu.instTokenCalls == 3 {
 			fu.instTokenErr = errors.New("backend: installation_token_issuance_failed")
 		}
 	}
@@ -29781,7 +29789,11 @@ func TestImplementPush_RefreshPushTokenEmptyIsFailure(t *testing.T) {
 	withMutableRunnerNow(t, time.Date(2026, 9, 16, 12, 0, 0, 0, time.UTC))
 	fu := newFakeUploader(t)
 	fu.promptResp = refreshPromptResp()
-	fu.instTokenSeq = []string{"ghs_old", ""}
+	// The leading "ghs_advance" entry is consumed by the #3454 standalone
+	// base advance, which mints once pre-agent for its remote base query.
+	// The push path then takes the NEXT entries, so the refresh arithmetic
+	// below is unchanged in meaning, only shifted by that one mint.
+	fu.instTokenSeq = []string{"ghs_advance", "ghs_old", ""}
 	withFakeUploader(t, fu)
 	fp := &fakePusher{invokeRefresh: true}
 	fpr := &fakePROpener{}
@@ -30654,5 +30666,259 @@ func TestRunVerifyFixLoop_NoTokenKeyNeverInjected(t *testing.T) {
 	}
 	if invoker.callIdx != 1 || sawKey || len(fc.callLog()) != 0 {
 		t.Fatalf("calls=%d sawKey=%t mints=%v; a credential-free stage must never be handed or mint a token", invoker.callIdx, sawKey, fc.callLog())
+	}
+}
+
+// --- E68.67 / #3454: standalone implement advances the lineage base ---
+
+// standaloneImplementPromptResp is the canonical STANDALONE implement prompt:
+// no DecomposedFromRunID, not a fix-up — the shape standaloneBaseAdvanceEligible
+// admits.
+func standaloneImplementPromptResp() *upload.FetchedPrompt {
+	return &upload.FetchedPrompt{
+		StageID:    "22222222-3333-4444-5555-666666666666",
+		StageType:  "implement",
+		Prompt:     "implement",
+		PromptHash: "h",
+	}
+}
+
+// runStandaloneImplementStage drives run() for a standalone implement dispatch
+// against repo (so the lineage worktree is provisioned under a THROWAWAY git
+// dir, never the runner's own source repo).
+func runStandaloneImplementStage(t *testing.T, repo string, stderr *strings.Builder) int {
+	t.Helper()
+	return run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--working-dir", repo,
+		"--fetch-prompt", "--upload-trace",
+	}, stderr)
+}
+
+// withMovedBaseSeams forces the #3454 advance's seams to report a base that
+// MOVED and records the checkout calls: remoteHasBranch says the base exists,
+// fetchDiffBaseTip reports movedTip, the ancestry probe proves the fast-forward
+// safe, and checkoutChildBase records + returns movedTip. Call it AFTER
+// withFakeGitOps so these override its defaults.
+func withMovedBaseSeams(t *testing.T, movedTip string) (checkouts *int) {
+	t.Helper()
+	withFakeRemoteHasBranch(t, true, nil)
+	origFetch, origProbe, origCheckout := fetchDiffBaseTip, ancestryProbe, checkoutChildBase
+	n := 0
+	fetchDiffBaseTip = func(_ context.Context, _, _, _, _ string) (string, error) { return movedTip, nil }
+	ancestryProbe = func(_ context.Context, _, _, _ string) error { return nil }
+	checkoutChildBase = func(_ context.Context, _, _, _, _ string) (string, error) {
+		n++
+		return movedTip, nil
+	}
+	t.Cleanup(func() {
+		fetchDiffBaseTip = origFetch
+		ancestryProbe = origProbe
+		checkoutChildBase = origCheckout
+	})
+	return &n
+}
+
+// TestRun_StandaloneImplement_AdvancesLineageBase is the run()-level positive
+// control: a STANDALONE implement dispatch whose declared base has MOVED emits
+// lineage_worktree_advanced and checks the moved tip out exactly once, BEFORE
+// the agent is invoked.
+func TestRun_StandaloneImplement_AdvancesLineageBase(t *testing.T) {
+	repo := initRepo(t)
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+
+	advancedAtInvoke := false
+	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
+	var checkouts *int
+	invoker.onInvoke = func(_ int, _ agent.Invocation) { advancedAtInvoke = *checkouts == 1 }
+	withFakeInvoker(t, invoker)
+
+	fu := newFakeUploader(t)
+	fu.promptResp = standaloneImplementPromptResp()
+	withFakeUploader(t, fu)
+	fp := &fakePusher{}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+	const movedTip = "1111111111111111111111111111111111111111"
+	checkouts = withMovedBaseSeams(t, movedTip)
+
+	var stderr strings.Builder
+	if got := runStandaloneImplementStage(t, repo, &stderr); got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	for _, want := range []string{
+		`"event":"lineage_worktree_advanced"`,
+		`"base_ref":"main"`,
+		`"to":"` + movedTip + `"`,
+	} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Errorf("missing %s in run output:\n%s", want, stderr.String())
+		}
+	}
+	if *checkouts != 1 {
+		t.Errorf("checkoutChildBase call count = %d, want exactly 1", *checkouts)
+	}
+	// ORDERING: the advance must be complete before the agent runs.
+	if !advancedAtInvoke {
+		t.Error("the base advance had not run by the time the agent was invoked")
+	}
+}
+
+// TestRun_FixupPass_DoesNotAdvanceLineageBase is the !cfg.fixup eligibility
+// counterfactual vehicle: a fix-up pass MUST stay on the PR branch
+// checkoutFixupBase established, so no standalone advance may fire even though
+// the base reports as moved.
+func TestRun_FixupPass_DoesNotAdvanceLineageBase(t *testing.T) {
+	repo := initRepo(t)
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:     "22222222-3333-4444-5555-666666666666",
+		StageType:   "implement",
+		Prompt:      "implement",
+		PromptHash:  "h",
+		Fixup:       true,
+		FixupBranch: "fishhawk/run-11111111/stage-22222222",
+	}
+	withFakeUploader(t, fu)
+	fp := &fakePusher{}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+	checkouts := withMovedBaseSeams(t, "1111111111111111111111111111111111111111")
+
+	var stderr strings.Builder
+	if got := runStandaloneImplementStage(t, repo, &stderr); got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if strings.Contains(stderr.String(), `"event":"lineage_worktree_advanced"`) {
+		t.Errorf("a fix-up pass was ADVANCED off its PR branch:\n%s", stderr.String())
+	}
+	if *checkouts != 0 {
+		t.Errorf("checkoutChildBase called %d times on a fix-up pass, want 0", *checkouts)
+	}
+}
+
+// TestRun_DecomposedChild_DoesNotTakeStandaloneBaseAdvance: a decomposed child
+// already establishes its own WAVE base in the #1302/#1363 block, and the two
+// predicates are mutually exclusive by construction — so the child takes
+// child_base_established and NOT the standalone advance.
+func TestRun_DecomposedChild_DoesNotTakeStandaloneBaseAdvance(t *testing.T) {
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fu := newFakeUploader(t)
+	fu.promptResp = decomposedChildPromptResp()
+	withFakeUploader(t, fu)
+	fp := &fakePusher{}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+	withFakeRemoteHasBranch(t, true, nil)
+
+	var stderr strings.Builder
+	if got := runDecomposedChildStageWithBase(t, &stderr, "fishhawk/run-aaaaaaaa/consolidated"); got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if strings.Contains(stderr.String(), `"event":"lineage_worktree_advanced"`) {
+		t.Errorf("a decomposed child took the STANDALONE base advance:\n%s", stderr.String())
+	}
+	// The wave-base block still fired — this test is about which block ran.
+	if !strings.Contains(stderr.String(), `"event":"child_base_established"`) {
+		t.Errorf("the wave-base block did not fire:\n%s", stderr.String())
+	}
+}
+
+// TestRun_StandaloneImplement_AdvanceRefusal_FailsLoudPreAgent: a REFUSAL
+// (here a dirty worktree) fails the stage with the self-diagnosing
+// lineage_worktree_advance_refused reason and ZERO agent invocations — the
+// refusal is strictly pre-agent, so it burns no tokens.
+func TestRun_StandaloneImplement_AdvanceRefusal_FailsLoudPreAgent(t *testing.T) {
+	repo := initRepo(t)
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
+	withFakeInvoker(t, invoker)
+
+	fu := newFakeUploader(t)
+	fu.promptResp = standaloneImplementPromptResp()
+	withFakeUploader(t, fu)
+	fp := &fakePusher{}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+	withMovedBaseSeams(t, "1111111111111111111111111111111111111111")
+	// A dirty worktree the advance cannot prove safe to fast-forward.
+	origDirty := dirtyPaths
+	dirtyPaths = func(_ context.Context, _ string) ([]string, error) { return []string{"a/b.go"}, nil }
+	t.Cleanup(func() { dirtyPaths = origDirty })
+
+	var stderr strings.Builder
+	if got := runStandaloneImplementStage(t, repo, &stderr); got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure:\n%s", got, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `"reason":"lineage_worktree_advance_refused"`) {
+		t.Errorf("missing the lineage_worktree_advance_refused reason:\n%s", stderr.String())
+	}
+	if invoker.callIdx != 0 {
+		t.Errorf("agent invoked %d times, want 0 — the refusal must be pre-agent", invoker.callIdx)
+	}
+}
+
+// TestRun_StandaloneImplement_AdvanceError_FailsLoudPreAgent: a non-refusal
+// failure (here a fetch-tip error) maps to the generic lineage_base_advance
+// reason and is likewise pre-agent.
+func TestRun_StandaloneImplement_AdvanceError_FailsLoudPreAgent(t *testing.T) {
+	repo := initRepo(t)
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
+	withFakeInvoker(t, invoker)
+
+	fu := newFakeUploader(t)
+	fu.promptResp = standaloneImplementPromptResp()
+	withFakeUploader(t, fu)
+	fp := &fakePusher{}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr)
+	// Base exists, but its tip cannot be fetched — staleness unknowable.
+	withFakeRemoteHasBranch(t, true, nil)
+
+	var stderr strings.Builder
+	if got := runStandaloneImplementStage(t, repo, &stderr); got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure:\n%s", got, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `"reason":"lineage_base_advance"`) {
+		t.Errorf("missing the lineage_base_advance reason:\n%s", stderr.String())
+	}
+	if invoker.callIdx != 0 {
+		t.Errorf("agent invoked %d times, want 0 — the failure must be pre-agent", invoker.callIdx)
+	}
+}
+
+// TestRun_StandaloneImplement_BaseAdvanceInertOnFakeGitOpsDefaults is the
+// INERTNESS pin: withFakeGitOps' default remoteHasBranch -> (false, nil) makes
+// the new block take the base_ref_absent skip, so every pre-existing run() test
+// keeps its behaviour. If this assumption ever breaks, the whole runner suite
+// changes behaviour at once and this names why.
+func TestRun_StandaloneImplement_BaseAdvanceInertOnFakeGitOpsDefaults(t *testing.T) {
+	repo := initRepo(t)
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fu := newFakeUploader(t)
+	fu.promptResp = standaloneImplementPromptResp()
+	withFakeUploader(t, fu)
+	fp := &fakePusher{}
+	fpr := &fakePROpener{}
+	withFakeGitOps(t, fp, fpr) // defaults ONLY — no override
+
+	var stderr strings.Builder
+	if got := runStandaloneImplementStage(t, repo, &stderr); got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `"reason":"base_ref_absent"`) {
+		t.Errorf("the suite default must take the base_ref_absent skip:\n%s", stderr.String())
+	}
+	if strings.Contains(stderr.String(), `"event":"lineage_worktree_advanced"`) {
+		t.Errorf("the suite default advanced a base:\n%s", stderr.String())
 	}
 }

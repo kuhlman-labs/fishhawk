@@ -1252,3 +1252,57 @@ The fix pins `maintenance.auto=false` for every git child of this package's test
 **Residual, stated not fixed:** the pin is inherited only by children whose env derives from `os.Environ()` (every git-spawning site in this package's tests and the production code under test does so today). A NEW test package that pushes into a `t.TempDir()` bare origin needs the same pin. As of #3507, `runner/internal/gitops` and `cli/cmd/fishhawk` carry it too (own `TestMain` + `TestHarnessDisablesAutoMaintenanceOnLocalPush` each, in `gitmaint_test.go`; see `runner/README.md` and `cli/README.md`) — all three git-pushing test packages in the repo are now pinned; see the `AGENTS.md` trap for the sharper per-test-override coupling #3507 found in `gitops`'s `gitNoPromptEnv`.
 
 `fetchPromptToFile` threads the five prompt fields as ONE tuple element, `acceptanceReplayInputs` (`acceptanceReplayInputsFromPrompt`). The prompt section is appended to the fetched prompt FILE and the file is re-read into `inv.Prompt` (the invocation was built before the acceptance block). Cross-run behavior — a retirement's reason surviving run 1 → `retired.yaml` → run 2, and the record-then-replay round trip whose shipped body is JSON-equivalent to the shared golden `testdata/wire/acceptance_replay_verdict.json` through a REAL `upload.Client` — is pinned by `TestAcceptanceReplay_RetirementCrossesRuns` and `TestAcceptanceReplay_RecordThenReplayEndToEnd` in `acceptance_test.go`. Operator view: `docs/acceptance-preview.md` § "Replayable scenario corpus".
+
+## Standalone implement advances the lineage worktree to the declared base (E68.67 / [#3454](https://github.com/kuhlman-labs/fishhawk/issues/3454))
+
+**The defect.** A STANDALONE implement stage ran its agent AND its committed-tree verify gates against the lineage worktree's **plan-time** base. `provisionLineageWorktree` seeds the worktree from the operator checkout's HEAD at the PLAN stage and then takes the `lineage_worktree_reused` path for implement **without moving HEAD**, and the only pre-agent base checkout in `run()` was gated on `cfg.decomposedFromRunID != ""` (the #1302/#1363 wave-base block). Only the COMMIT-time `gitops` `FreshFetchBase` re-staged the finished commit onto the moved base — far too late: the agent reasoned against the stale tree, and `runVerifyGateCommitted`'s throwaway scope-only commit was cut on top of that stale HEAD, so the gate ran the **plan-time** `scripts/test`. Observed twice: run 1bc985d1 / #3390, and run a90d98ee / #3451, where the verify-lock self-deadlock #3451 had already fixed was re-discovered by a gate running pre-fix infra — ~55 minutes and a fix-up pass burned on an already-fixed defect.
+
+**The fix** (`lineagebase.go`, wired in `main.go::run` immediately BEFORE the wave-base block): a pre-agent, standalone-only fast-forward of the worktree's detached HEAD to the freshly-fetched tip of the declared base — `resolveImplementBaseRef(cfg)`, the SAME ref `resolveImplementBranchRouting` hands `CommitAndPush` as `freshFetchBase`. So the agent's view, the gate's tree and the commit base become **one** base.
+
+Placement is load-bearing: it sits AFTER the pre-agent HEAD/dirty capture and the #953 run()-level restore net, and strictly BEFORE the agent invoke and every verify gate. No new restore defer exists or is needed — the #953 net already restores a moved HEAD to `preAgentRef` on every exit path via its double-fire-safe moved-HEAD re-read, and is deliberately skipped under `--no-pr` where the dirty tree IS the deliverable.
+
+### The ordered algorithm
+
+`advanceLineageWorktreeToBase(ctx, repoDir, baseRef, authToken, logSink) (advanced bool, err error)`. Every guard runs before anything mutates:
+
+| Step | Seam | Outcome |
+|---|---|---|
+| (a) | — | empty `baseRef` → silent no-op |
+| (b) | `remoteHasBranch` | absent → `lineage_worktree_advance_skipped` reason `base_ref_absent`; query error + `remoteConfigured` → **fail loud**; query error + NOT configured → `lineage_worktree_advance_skipped` reason `remote_unconfigured` |
+| (c) | `resolveHead` | the `from` SHA, pinned once; an error fails loud |
+| (d) | `fetchDiffBaseTip` (`gitops.FetchBaseTip`) | the `to` SHA, fetched WITHOUT touching the tree; an error fails loud |
+| (e) | — | `from == to` → `lineage_worktree_base_current`, no advance |
+| (f) | `dirtyPaths` | dirty set non-empty → refusal `dirty_worktree`; probe error → refusal `dirty_probe_failed` |
+| (g) | `ancestryProbe` | `*exec.ExitError` code 1 → refusal `head_not_ancestor`; any other probe error → refusal `ancestry_probe_failed` |
+| (h) | `checkoutChildBase` (`gitops.CheckoutRemoteBranchDetached`) | non-force `checkout --detach <tip>`; on success `lineage_worktree_advanced {base_ref,from,to}` |
+
+Every seam is an EXISTING package-level var — no parallel seam was minted. `withFakeGitOps` therefore already stubs all of them, and because its `remoteHasBranch` default is `(false, nil)` every pre-existing `run()` test takes the (b) `base_ref_absent` skip unchanged (pinned by `TestRun_StandaloneImplement_BaseAdvanceInertOnFakeGitOpsDefaults`).
+
+**One inertness exception, measured not assumed.** The token is minted by `mintBaseAuthToken` BEFORE step (b), so an eligible standalone implement dispatch now performs **one extra installation-token mint** even when the advance goes on to skip or no-op. That is inherent — learning the base tip requires a remote query, and the #1951 contract is to authenticate it with a freshly-minted token. It shifted the exact mint SEQUENCE three `#3443` post-verify-refresh tests pin (`TestImplementPush_RefreshPushTokenWiredToMint` / `_FailureLogsAndDegrades` / `_EmptyIsFailure`), whose `instTokenSeq` fixtures now carry a leading `ghs_advance` entry and whose call count is 3, not 2. Nothing else in the runner package changed behaviour — the whole package is green.
+
+**Ordering of (e) before (f)/(g) is deliberate:** the dirty and ancestry guards are reached ONLY when the base actually moved, so an already-current dispatch is byte-identical to the pre-#3454 behaviour regardless of tree state — a worktree an operator legitimately left dirty draws no refusal on a base that did not move.
+
+**Failure classification.** `lineageBaseAdvanceFailureReason` maps a `*lineageBaseAdvanceRefusal` to the `runner_failed` reason `lineage_worktree_advance_refused` and anything else to `lineage_base_advance` — the same two-line reason-mapping shape `worktreeProvisionFailureReason` and `fixupCheckoutFailReason` use. Both are strictly PRE-AGENT: the stage fails having spent zero agent tokens and mutated nothing, and the refusal message names both resolved SHAs and the `git worktree remove` remedy.
+
+### Why fix-up and decomposed children are exempt
+
+`standaloneBaseAdvanceEligible(stageType, cfg)` = `stageType == "implement" && !cfg.fixup && cfg.decomposedFromRunID == ""`. Both exclusions are STRUCTURAL:
+
+- A **fix-up pass** must stay on the PR branch `checkoutFixupBase` established. Advancing it would discard the recorded head the ADR-035 lineage comparison asserts against. A fix-up pass is never advanced.
+- A **decomposed child** already establishes its own wave base in the #1302/#1363 block immediately below. The two predicates are mutually exclusive BY CONSTRUCTION, so the two base checkouts can never both fire on one dispatch.
+
+### What is deliberately NOT claimed
+
+- **The non-force checkout at (h) is a narrow backstop, not a general second layer under (f).** `git checkout --detach` aborts only where it would OVERWRITE a local modification — i.e. where the dirty path DIFFERS between `from` and `to`. A dirty path unchanged across the range is carried forward silently, and an untracked non-conflicting file never blocks a checkout at all. Both were observed empirically: with guard (f) deleted, the advance succeeded and HEAD moved in **both** dirty shapes. Guard (f) is the only thing standing between a dirty worktree and a silent advance in the common case.
+- **The #1866 seed-ancestry semantics are preserved, not bypassed.** Guard (g) makes the advance a fast-forward-ONLY operation, so HEAD only ever moves FORWARD along the declared base; a worktree legitimately seeded from an ancestor of the base stays legitimately seeded from one. `verifySeedAncestry` is untouched. Note the ONE deliberate divergence: `verifySeedAncestry` degrades to a logged skip on a probe error (there a skip falls through to today's behaviour), whereas (g) REFUSES (here a skip would fall through to mutating the tree).
+- **The operator's manual `git worktree remove` remedy for a stale lineage worktree is retired** for the moved-base case — the advance handles it. It remains the remedy the refusal message names for a worktree that is dirty or carries its own commits, which the advance will not touch.
+
+### Behaviour change, accepted
+
+A transient `ls-remote`/fetch failure against a CONFIGURED remote now FAILS the stage where it previously ran on the stale base. Intentional, mirroring the #1363 precedent — silently running on a base of unknown staleness IS the defect — and bounded because the refusal is strictly pre-agent and re-dispatch is the recovery. A remote that is NOT configured (bare local test repos, GitHub-not-wired) still degrades to today's behaviour.
+
+### The tests that pin each mode
+
+- **Done-means / cross-boundary** (`worktree_integration_test.go`): `TestRun_StandaloneImplement_AdvancesLineageWorktreeToMovedBase_CrossBoundary` — REAL bare origin, REAL operator clone, REAL `provisionLineageWorktree` at the plan-time SHA, a REAL commit merged into `origin/main` between provisioning and dispatch, production `remoteHasBranch`/`fetchDiffBaseTip`/`checkoutChildBase`/`captureHead`/`restoreHead`; only the push/PR egress faked. It asserts the advanced file is in the agent's worktree at invoke, the worktree HEAD equals the advanced tip, `lineage_worktree_advanced` names both SHAs, and — the GATE half — that a verify command which is a real probe for the advanced file PASSES, which on the stale base it cannot.
+- **Per failure mode** (`lineagebase_test.go`, real throwaway git repos): `_EmptyBaseRef_NoOp`, `_BaseRefAbsent_Skips`, `_RemoteQueryError_RemoteConfigured_FailsLoud`, `_RemoteQueryError_RemoteUnconfigured_Skips`, `_AlreadyAtBaseTip_NoOp`, `_DirtyWorktree_Refuses` (untracked + modified-tracked arms), `_DirtyProbeError_Refuses`, `_HeadNotAncestorOfBase_Refuses`, `_AncestryProbeError_Refuses`, `_FetchTipError_FailsLoud`, `_CheckoutError_FailsLoud`, `_MovedBase_Advances`, plus `TestStandaloneBaseAdvanceEligible_Table` and `TestLineageBaseAdvanceFailureReason_Table`. Every refusal case ALSO reads the worktree HEAD after the call and asserts it is still the stale SHA — the control's effect is COMMITTED STATE, so error identity alone would not prove HEAD did not move.
+- **run()-level wiring** (`main_test.go`): `TestRun_StandaloneImplement_AdvancesLineageBase` (positive control: the event fires, `checkoutChildBase` runs exactly once, and it has already run by the time the agent is invoked), `TestRun_FixupPass_DoesNotAdvanceLineageBase`, `TestRun_DecomposedChild_DoesNotTakeStandaloneBaseAdvance`, `TestRun_StandaloneImplement_AdvanceRefusal_FailsLoudPreAgent` / `_AdvanceError_FailsLoudPreAgent` (exact reason + ZERO agent invocations), and `TestRun_StandaloneImplement_BaseAdvanceInertOnFakeGitOpsDefaults`.
