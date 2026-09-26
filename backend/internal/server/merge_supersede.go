@@ -278,6 +278,20 @@ type reconcileMergeResponse struct {
 //
 // Refusals, ALL evaluated before any write so a refused reconcile leaves ZERO
 // rows and moves ZERO stages:
+//  0. 401 authentication_required — no authenticated identity at all; and
+//     403 insufficient_scope (details.required_scope = write:runs) for a bearer
+//     that authenticates but does not hold write:runs. It is rung ZERO
+//     deliberately — ahead of the run_id parse, the unconfigured check and the
+//     run lookup — so a refused caller learns nothing about whether the run
+//     exists. Exactly two shapes are admitted: a bearer holding write:runs, and
+//     a COOKIE SESSION (TokenID == ""), which requireWriteScope exempts by its
+//     documented contract (middleware.go) — a signed-in operator session carries
+//     no explicit scope list and stays bounded by requireRunAccount's ownership
+//     and role-bounding. write:runs is the scope every sibling run-lifecycle
+//     recovery verb already enforces (consolidate.go, reap_failure.go,
+//     reset_branch.go, recover.go), and the OBSERVE half
+//     (handleRecordMergeObservation) enforces the IDENTICAL rung — the
+//     observe/settle pair must not diverge in who may call it (E45.95 / #3635);
 //  1. 400 validation_failed — a non-UUID run_id;
 //  2. 503 reconcile_merge_unconfigured — the run/audit repositories are unwired;
 //  3. 404 run_not_found;
@@ -298,6 +312,11 @@ type reconcileMergeResponse struct {
 // scan EXCLUDES the stages this same invocation moved, so exactly one row per
 // swept stage exists no matter how many times the verb is called.
 func (s *Server) handleReconcileMerge(w http.ResponseWriter, r *http.Request) {
+	// Rung 0. FIRST, before the id parse / unconfigured check / run lookup: a
+	// refused caller must learn nothing about the run.
+	if !s.requireWriteScope(w, r, "write:runs") {
+		return
+	}
 	runID, err := uuid.Parse(r.PathValue("run_id"))
 	if err != nil {
 		s.writeError(w, r, http.StatusBadRequest, "validation_failed",

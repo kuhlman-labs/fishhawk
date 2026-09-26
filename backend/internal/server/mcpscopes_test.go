@@ -148,26 +148,41 @@ func TestMCPToolScopeTable_RunBoundAgentLoopIntact(t *testing.T) {
 	}
 }
 
-// TestMCPToolScopeTable_MergeRecoveryPairMirrorsOwnershipOnly pins the two
-// #3623 entries to the authenticated-only SENTINEL and proves a plain operator
-// bearer satisfies them.
+// TestMCPToolScopeTable_MergeRecoveryPairRequiresWriteRuns pins the two
+// merge-recovery entries to {anyOf: [write:runs]} and proves the gate admits
+// and refuses exactly who the endpoints do.
 //
-// WHY PIN IT. `mcpScopeAuthenticatedOnly` here is a FAITHFUL MIRROR of two
-// handlers that enforce ownership only: both routes are registered
-// requireRunAccount(memberWrite, ...) (handlers.go) and neither
-// handleRecordMergeObservation nor handleReconcileMerge calls requireWriteScope
-// or an inline hasScope. Per this table's derivation rule the gate must not be
-// STRICTER than the endpoint it mirrors, so a later silent TIGHTENING here —
-// without the Auth-change-checklist PR against the handlers — would refuse an
-// operator token the REST endpoint still admits, breaking the recovery path with
-// no failing REST test. This assertion is what makes that RED.
+// THE DERIVATION, stated positively: since E45.95 / #3635 BOTH
+// handleRecordMergeObservation (merge_observation.go) and handleReconcileMerge
+// (merge_supersede.go) call requireWriteScope(w, r, "write:runs") as their rung
+// 0, ahead of every other refusal. write:runs is therefore the predicate those
+// endpoints enforce, and this table mirrors it.
 //
-// It is NOT a claim that ownership-only is the right posture for a write verb;
-// that question belongs on the handlers, and is filed as a follow-up on #3623.
-func TestMCPToolScopeTable_MergeRecoveryPairMirrorsOwnershipOnly(t *testing.T) {
-	// A read-only operator bearer: the weakest identity the mirrored endpoints
-	// admit today. If either entry ever demands a write scope, this fails.
+// WHY THE ASSERTION RUNS IN BOTH DIRECTIONS. The derivation rule forbids the
+// gate being STRICTER than the endpoint (a needless scope here would refuse a
+// token the REST endpoint still admits, breaking the recovery path with no
+// failing REST test) AND forbids it being LOOSER (a sentinel here would let an
+// under-scoped call construct a per-request tool registry only to be refused by
+// the inner REST hop, relocating the enforcement point back where #2459 moved
+// it from). So this pins the rule exactly: a read-only operator bearer is
+// REFUSED, a run-bound mcp:read token is REFUSED, and a write:runs bearer is
+// ADMITTED. A comment-only touch of mcpscopes.go fails it.
+func TestMCPToolScopeTable_MergeRecoveryPairRequiresWriteRuns(t *testing.T) {
+	// A read-only operator bearer: the identity the endpoints admitted before
+	// #3635 and refuse now. Its scope set is DISJOINT from the requirement, so
+	// the refusal is produced by construction, not by a fixture guard.
 	readOnlyOperator := Identity{Subject: "svc:operator", TokenID: "tok", Scopes: []string{"read:runs"}}
+	// A run-bound fhm_ token at its FULL issued vocabulary (mcptoken.go). Not
+	// one of these scopes is write:runs, and neither handler authorizes such a
+	// token by SUBJECT, so the gate must refuse it exactly as the REST layer
+	// does — admitting it would make this gate LOOSER than the endpoint.
+	runBound := Identity{
+		Subject: "mcp:run:33333333-3333-3333-3333-333333333333",
+		TokenID: "tok",
+		Scopes:  []string{scopeRunBoundRead, scopeRunBoundRetry, scopeRunBoundScopeAmendments},
+	}
+	// The operator identity the endpoints admit.
+	writeRunsOperator := Identity{Subject: "svc:operator", TokenID: "tok", Scopes: []string{"write:runs"}}
 
 	for _, tool := range []string{"fishhawk_record_merge_observation", "fishhawk_reconcile_merge"} {
 		rule, ok := mcpToolScopeFor(tool)
@@ -175,15 +190,29 @@ func TestMCPToolScopeTable_MergeRecoveryPairMirrorsOwnershipOnly(t *testing.T) {
 			t.Errorf("%s: no mcpToolScopes entry; it would be refused mcp_tool_not_authorized at runtime", tool)
 			continue
 		}
-		if len(rule.anyOf) != 0 || rule.runBoundSubjectOK {
-			t.Errorf("%s: rule = %+v, want the authenticated-only sentinel — the mirrored handler enforces "+
-				"ownership only at the memberWrite tier, and this table may not be STRICTER than the endpoint. "+
-				"Tightening belongs in an Auth-change-checklist PR against the handler", tool, rule)
+		if len(rule.anyOf) != 1 || rule.anyOf[0] != "write:runs" {
+			t.Errorf("%s: rule.anyOf = %v, want exactly [write:runs] — the mirrored handler enforces "+
+				"requireWriteScope(\"write:runs\") as its rung 0 (E45.95 / #3635), and this table must mirror "+
+				"the endpoint in BOTH directions: neither stricter nor looser", tool, rule.anyOf)
 			continue
 		}
-		if !rule.satisfiedBy(readOnlyOperator) {
-			t.Errorf("%s: a read-scoped operator bearer is refused by the gate, but the REST endpoint admits it — "+
-				"the merge-recovery verb an operator is handed by completion_blocked would be unreachable", tool)
+		if rule.runBoundSubjectOK {
+			t.Errorf("%s: runBoundSubjectOK is set, but neither handler authorizes a run-bound token by "+
+				"SUBJECT — a run-bound fhm_ token is refused at the REST layer too, so this makes the gate "+
+				"LOOSER than the endpoint it mirrors", tool)
+		}
+		if rule.satisfiedBy(readOnlyOperator) {
+			t.Errorf("%s: a read-scoped operator bearer (%s) is ADMITTED by the gate, but the REST endpoint "+
+				"now refuses it 403 insufficient_scope", tool, strings.Join(readOnlyOperator.Scopes, " "))
+		}
+		if rule.satisfiedBy(runBound) {
+			t.Errorf("%s: a run-bound fhm_ token (%s) is ADMITTED by the gate, but the REST endpoint refuses "+
+				"it 403 insufficient_scope", tool, strings.Join(runBound.Scopes, " "))
+		}
+		if !rule.satisfiedBy(writeRunsOperator) {
+			t.Errorf("%s: an operator bearer holding write:runs is REFUSED by the gate, but the REST endpoint "+
+				"admits it — the merge-recovery verb completion_blocked hands an operator would be unreachable",
+				tool)
 		}
 	}
 }

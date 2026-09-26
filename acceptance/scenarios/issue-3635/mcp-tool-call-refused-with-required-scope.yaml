@@ -1,0 +1,14 @@
+id: scenario:issue-3635/mcp-tool-call-refused-with-required-scope
+statement: Invoking the fishhawk_record_merge_observation or fishhawk_reconcile_merge tool over the /mcp surface with a bearer that lacks write:runs returns an insufficient_scope refusal naming write:runs as the required scope, rather than reaching the backend route.
+verify_hint: Call tools/call for each tool name against the preview's /mcp route with a bearer lacking write:runs and read the returned error envelope's error and details.required_scope. Advisory for the same token-minting reason as the REST criterion above.
+steps: '1) Minted an fhm_ bearer (scopes [mcp:read]) via the plan-gate-parked seed, signing-key, /v0/dev/sign over ''{}'', and mcp-token. 2) POST /mcp tools/call fishhawk_record_merge_observation {run_id} and fishhawk_reconcile_merge {run_id} (Accept application/json, text/event-stream; Mcp-Protocol-Version 2026-07-28; Mcp-Method tools/call; Mcp-Name <tool>; params._meta). 3) GET /v0/runs/{run}/audit. 4) Cross-check: stdio fishhawk-mcp built from the sanctioned checkout, tools/call fishhawk_reconcile_merge.'
+assertions:
+    expected: insufficient_scope naming write:runs, without reaching the backend route.
+    observed_at_record: '/mcp -> HTTP 403 {"error":{"code":"insufficient_scope","message":"token is missing required scope: write:runs","details":{"required_scope":"write:runs","tool":"fishhawk_reconcile_merge"}}}, and the same for fishhawk_record_merge_observation. The refusal comes from the /mcp gate (its envelope carries the tool name) and the audit is unchanged.'
+    repro_handle: POST /mcp tools/call fishhawk_reconcile_merge with an fhm_ bearer
+origin:
+    issue: 3635
+    pr: 3672
+    run_id: b7c74f52-71c0-4023-a446-6b797ed84edb
+    head_sha: b8a43981082e7856dd2b2c6aa79bbfb6f0946535
+    recorded_at: 2026-09-26T00:49:29Z

@@ -80,9 +80,12 @@ type ReconcileMergeOutput struct {
 // registerRecordMergeObservation wires the fishhawk_record_merge_observation
 // tool.
 //
-// Auth: the endpoint is registered requireRunAccount(memberWrite) and its
-// handler enforces NO scope predicate beyond run ownership, so the /mcp gate
-// mirrors it with mcpScopeAuthenticatedOnly (see
+// Auth: TWO gates. The endpoint is registered requireRunAccount(memberWrite)
+// for account ownership, and handleRecordMergeObservation itself enforces
+// requireWriteScope("write:runs") as its rung 0 (E45.95 / #3635) — the same
+// scope the sibling operator recovery verbs enforce. The /mcp gate mirrors that
+// with {anyOf: ["write:runs"]} and NO runBoundSubjectOK, because the handler
+// does not authorize a run-bound token by subject (see
 // backend/internal/server/mcpscopes.go).
 func registerRecordMergeObservation(srv *mcp.Server, resolver *runResolver) {
 	mcp.AddTool(srv, &mcp.Tool{
@@ -135,8 +138,10 @@ Named refusals, each surfacing the backend's code verbatim so you can act on it:
 
 // registerReconcileMerge wires the fishhawk_reconcile_merge tool.
 //
-// Auth: same posture as its observe sibling — requireRunAccount(memberWrite)
-// with no handler-side scope predicate, mirrored as mcpScopeAuthenticatedOnly.
+// Auth: same posture as its observe sibling, in BOTH halves —
+// requireRunAccount(memberWrite) plus a handler-side
+// requireWriteScope("write:runs") rung 0, mirrored in mcpscopes.go as
+// {anyOf: ["write:runs"]} with no runBoundSubjectOK (E45.95 / #3635).
 func registerReconcileMerge(srv *mcp.Server, resolver *runResolver) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "fishhawk_reconcile_merge",

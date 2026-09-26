@@ -86,6 +86,24 @@ type recordMergeObservationResponse struct {
 //
 // Refusals, ALL evaluated BEFORE any write, so a refused call leaves ZERO rows:
 //
+//  0. 401 authentication_required — no authenticated identity at all; and
+//     403 insufficient_scope (details.required_scope = write:runs) for a bearer
+//     that authenticates but does not hold write:runs. This is rung ZERO
+//     deliberately: it runs BEFORE the run_id parse and before the unconfigured
+//     check, so an unauthenticated or under-scoped caller learns nothing about
+//     whether the run exists and no forge read is ever issued. Exactly two
+//     shapes are admitted — a bearer holding write:runs, and a COOKIE SESSION
+//     (TokenID == ""), which requireWriteScope exempts by its documented
+//     contract (middleware.go): a signed-in operator session carries no explicit
+//     scope list and stays bounded by requireRunAccount's ownership and
+//     role-bounding, exactly as at every other requireWriteScope call site.
+//     write:runs is the scope every sibling run-lifecycle recovery verb already
+//     enforces (consolidate.go, reap_failure.go, reset_branch.go, recover.go),
+//     and the settle half (handleReconcileMerge) enforces the IDENTICAL rung —
+//     the observe/settle pair must not diverge in who may call it (E45.95 /
+//     #3635). A consequence of this rung: the "anonymous" ActorSubject
+//     substitution further down is no longer reachable through the route, and
+//     is kept only as a defensive default;
 //  1. 400 validation_failed — a non-UUID run_id;
 //  2. 503 record_merge_observation_unconfigured — the run/audit repositories are
 //     unwired (the forge reader is resolved later, at rung 7);
@@ -143,6 +161,11 @@ type recordMergeObservationResponse struct {
 // weak-mechanism/strong-claim mismatch is the shape being removed, not the
 // duplicate row.
 func (s *Server) handleRecordMergeObservation(w http.ResponseWriter, r *http.Request) {
+	// Rung 0. FIRST, before the id parse and the unconfigured check: a refused
+	// caller must learn nothing about the run and cost no forge request.
+	if !s.requireWriteScope(w, r, "write:runs") {
+		return
+	}
 	// Rung 1.
 	runID, err := uuid.Parse(r.PathValue("run_id"))
 	if err != nil {

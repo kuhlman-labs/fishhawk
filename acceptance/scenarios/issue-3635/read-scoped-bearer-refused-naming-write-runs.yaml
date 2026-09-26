@@ -1,0 +1,14 @@
+id: scenario:issue-3635/read-scoped-bearer-refused-naming-write-runs
+statement: A bearer token carrying only read scopes is refused with HTTP 403, error insufficient_scope, and details.required_scope naming write:runs on both merge-recovery routes.
+verify_hint: Issue a read-only token against the preview's database (fishhawkd token issue --subject acceptance --scope read:runs), POST to each route with it, and read the 403 body's error and details.required_scope. Advisory rather than blocking because minting a narrowed token depends on the preview harness exposing the token-issuance CLI against its own database.
+steps: '1) POST /v0/dev/fixtures {"scenario":"plan-gate-parked"} -> run d3d1e8ca-454a-4032-9a4b-c74607cd0694; POST /v0/runs/{run}/signing-key; POST /v0/dev/sign over ''{}''; POST /v0/runs/{run}/mcp-token -> fhm_ bearer whose mcp_token_issued audit row shows scopes ["mcp:read"]. The preview DB was unreachable, so fishhawkd token issue --scope read:runs was not possible; the fhm_ token omits write:runs, which satisfies the precondition. 2) POST /v0/runs/{run}/record-merge-observation and /reconcile-merge, body ''{}'', Authorization: Bearer <fhm_>.'
+assertions:
+    expected: 403 insufficient_scope with details.required_scope=write:runs on both.
+    observed_at_record: 'Both -> HTTP 403 {"error":{"code":"insufficient_scope","message":"token is missing required scope: write:runs","details":{"required_scope":"write:runs"}}}; audit unchanged.'
+    repro_handle: 'curl -X POST -H ''Authorization: Bearer <fhm_>'' http://localhost:8090/v0/runs/{run}/record-merge-observation -d ''{}'''
+origin:
+    issue: 3635
+    pr: 3672
+    run_id: b7c74f52-71c0-4023-a446-6b797ed84edb
+    head_sha: b8a43981082e7856dd2b2c6aa79bbfb6f0946535
+    recorded_at: 2026-09-26T00:49:29Z

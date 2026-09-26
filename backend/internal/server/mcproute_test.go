@@ -1557,6 +1557,54 @@ func TestHandleMCP_RefusesInsufficientScope(t *testing.T) {
 	}
 }
 
+// TestHandleMCP_MergeRecoveryPairRequiresWriteRuns is the CROSS-BOUNDARY
+// assertion for E45.95 / #3635: the table entry, the gate predicate and the
+// wire envelope on ONE path, over the real HTTP /mcp transport, for BOTH
+// merge-recovery tools.
+//
+// A unit test on mcpToolScopes alone would stay green if the gate stopped
+// consulting the table; a unit test on the handler alone would stay green if
+// the table row were reverted. This drives the whole stack: a bearer minted
+// read:runs draws 403 insufficient_scope with details.required_scope naming
+// write:runs and NEVER reaches the per-request tool registry, and a bearer
+// minted write:runs passes the gate into the SDK.
+func TestHandleMCP_MergeRecoveryPairRequiresWriteRuns(t *testing.T) {
+	for _, tool := range []string{"fishhawk_record_merge_observation", "fishhawk_reconcile_merge"} {
+		t.Run(tool+"/refused", func(t *testing.T) {
+			s, bearer, f := mcpGateServer(t, "read:runs")
+			rule, ok := mcpToolScopeFor(tool)
+			if !ok {
+				t.Fatalf("%s has no table entry; this test's premise is gone", tool)
+			}
+			// Disjointness is asserted, not assumed: a refusal produced by an
+			// overlapping fixture scope would prove nothing.
+			for _, sc := range rule.anyOf {
+				if sc == "read:runs" {
+					t.Fatalf("the seeded scope set is not disjoint from the requirement %v", rule.anyOf)
+				}
+			}
+			body := assertMCPGateRefusal(t, s, f, newMCPToolCall(tool, bearer),
+				http.StatusForbidden, "insufficient_scope")
+			if !strings.Contains(body, "required_scope") || !strings.Contains(body, "write:runs") {
+				t.Errorf("body = %s, want details.required_scope naming write:runs", body)
+			}
+		})
+		t.Run(tool+"/admitted", func(t *testing.T) {
+			s, bearer, f := mcpGateServer(t, "write:runs")
+			status, body := mcpGateResult(t, s, newMCPToolCall(tool, bearer))
+			if status == http.StatusForbidden {
+				t.Fatalf("a granted-scope tools/call was refused %d: %s", status, body)
+			}
+			if strings.Contains(body, "insufficient_scope") {
+				t.Errorf("granted-scope call drew insufficient_scope: %s", body)
+			}
+			if f.calls.Load() == 0 {
+				t.Error("the granted-scope call never reached the per-request tool registry")
+			}
+		})
+	}
+}
+
 // TestHandleMCP_RefusesBatch covers rung (0), the operator's binding condition
 // 1. The SDK validates header/body agreement only for a SINGLE non-batch
 // message (`if !isBatch && len(incoming) == 1` in mcp/streamable.go), so a

@@ -173,12 +173,19 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	// mirrors the sibling operator-decision writes — it is a RECOVERY verb, not
 	// a destructive one: it refuses unless the run's PR is observably merged,
 	// and the default-deny pair table bounds what it can terminalize.
+	// AUTHORIZATION IS TWO GATES, not one: this wrapper enforces account
+	// OWNERSHIP at the memberWrite tier, and handleReconcileMerge itself
+	// enforces the write:runs SCOPE as its rung 0 (E45.95 / #3635) — the same
+	// scope the sibling operator recovery verbs enforce (consolidate,
+	// reap-failure, reset-branch, recover). Ownership alone was never the whole
+	// gate for these two; until #3635 the scope half was simply missing.
 	mux.HandleFunc("POST /v0/runs/{run_id}/reconcile-merge", s.requireRunAccount(memberWrite, s.handleReconcileMerge))
 	// Merge-OBSERVATION recovery (E64.32 / #3136): read the run's PR off the
 	// forge and, only on a live merged=true answer, append the evidence row
-	// reconcile-merge's chain-only gate needs. Same memberWrite posture as
-	// reconcile-merge deliberately — the two are the observe/settle pair and
-	// must not diverge in who may call them.
+	// reconcile-merge's chain-only gate needs. Same posture as reconcile-merge
+	// deliberately, in BOTH halves — requireRunAccount(memberWrite) here and
+	// handleRecordMergeObservation's own write:runs rung 0 — because the two are
+	// the observe/settle pair and must not diverge in who may call them.
 	mux.HandleFunc("POST /v0/runs/{run_id}/record-merge-observation", s.requireRunAccount(memberWrite, s.handleRecordMergeObservation))
 	mux.HandleFunc("GET /v0/stages/{stage_id}", s.requireStageAccount(readAccess, s.handleGetStage))
 	mux.HandleFunc("GET /v0/stages/{stage_id}/artifacts", s.requireStageAccount(readAccess, s.handleListStageArtifacts))
