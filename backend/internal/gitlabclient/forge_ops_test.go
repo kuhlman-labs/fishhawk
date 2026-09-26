@@ -919,6 +919,41 @@ func TestListProtectedBranches_RefusesOffOriginNextLink(t *testing.T) {
 	}
 }
 
+// TestListProtectedBranches_PageCapFailsClosed pins the fail-closed page cap
+// (#3591): a server that ALWAYS emits a same-origin rel="next" link would
+// spin the walk forever, so the loop refuses at maxListPages rather than
+// returning a silently-partial rule set. Fail-closed matters most here — a
+// truncated protected-branch rule list would let the adapter find no matching
+// rule and report an AUTHORITATIVE Protected:false, read downstream as
+// "unprotected". Asserts: a naming error (cap + accumulated count), a nil
+// slice, and exactly maxListPages requests (the cap, not the client, stopped
+// it).
+func TestListProtectedBranches_PageCapFailsClosed(t *testing.T) {
+	s := newIssueServer(t)
+	s.mux.HandleFunc("GET /api/v4/projects/42/protected_branches", func(w http.ResponseWriter, r *http.Request) {
+		// Always advertise a next page, whatever the current page.
+		w.Header().Set("Link", `<`+s.srv.URL+`/api/v4/projects/42/protected_branches?page=99&per_page=100>; rel="next"`)
+		writeIssueJSON(w, http.StatusOK, protectedRulesPage1)
+	})
+
+	rules, err := s.client().ListProtectedBranches(context.Background(), 42)
+	if err == nil {
+		t.Fatalf("ListProtectedBranches = %v, nil; want a fail-closed page-cap error", rules)
+	}
+	if rules != nil {
+		t.Errorf("rules = %v, want nil (no silently-partial set on the cap)", rules)
+	}
+	if !strings.Contains(err.Error(), "page cap") {
+		t.Errorf("err = %v, want it to name the page cap", err)
+	}
+	if !strings.Contains(err.Error(), "partial protected-branch rule set") {
+		t.Errorf("err = %v, want it to name the refused partial set", err)
+	}
+	if n := len(s.requests()); n != maxListPages {
+		t.Errorf("requests = %d, want exactly maxListPages (%d) — the cap, not an early give-up, must stop the walk", n, maxListPages)
+	}
+}
+
 func TestListProtectedBranches_APIError(t *testing.T) {
 	// GitLab documents the endpoint as Maintainer-only: a credential that
 	// can read the project may still draw a 403 here, which the adapter

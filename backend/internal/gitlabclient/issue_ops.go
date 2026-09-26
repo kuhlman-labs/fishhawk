@@ -108,8 +108,9 @@ func (c *Client) GetIssue(ctx context.Context, projectID, iid int) (*Issue, erro
 //
 //	GET /api/v4/projects/:id/issues/:iid/notes?per_page=100&sort=asc&order_by=created_at
 //
-// It PAGES TO EXHAUSTION via the rel="next" Link header GitLab sends on a
-// paginated collection (https://docs.gitlab.com/ee/api/rest/#pagination-link-header)
+// It PAGES TO EXHAUSTION, bounded by maxListPages, via the rel="next" Link
+// header GitLab sends on a paginated collection
+// (https://docs.gitlab.com/ee/api/rest/#pagination-link-header)
 // — the same mechanism the GitHub client's ListIssueComments uses. A
 // single-page read would miss an idempotency marker that scrolled onto
 // page 2 and re-post the marked note on every redelivery.
@@ -132,7 +133,7 @@ func (c *Client) ListIssueNotes(ctx context.Context, projectID, iid int) ([]Note
 
 	next := c.baseURL + fmt.Sprintf("/api/v4/projects/%d/issues/%d/notes?per_page=100&sort=asc&order_by=created_at", projectID, iid)
 	var out []Note
-	for next != "" {
+	for pages := 0; next != ""; pages++ {
 		if err := c.sameOrigin(next, "next-page link"); err != nil {
 			return nil, err
 		}
@@ -142,6 +143,9 @@ func (c *Client) ListIssueNotes(ctx context.Context, projectID, iid int) ([]Note
 		}
 		out = append(out, page...)
 		next = nextPageURL(link)
+		if next != "" && pages+1 >= maxListPages {
+			return nil, fmt.Errorf("gitlabclient: list issue notes for project %d issue #%d exceeded the %d-page cap after accumulating %d notes with more pages remaining; refusing to return a partial note set", projectID, iid, maxListPages, len(out))
+		}
 	}
 	return out, nil
 }
@@ -175,6 +179,15 @@ func (c *Client) getNotesPage(ctx context.Context, absURL string) ([]Note, strin
 	}
 	return page, resp.Header.Get("Link"), nil
 }
+
+// maxListPages bounds every Link-header pagination loop in this package
+// (ListIssueNotes, ListIssueLinks, ListProtectedBranches). At per_page=100
+// this is 10 000 items — far beyond any real project — so a well-behaved
+// GitLab instance never reaches it. Reaching the cap with a rel="next" link
+// STILL present means a forge or an interposed proxy is emitting an unending
+// page chain; the loop then FAILS CLOSED with a naming error rather than
+// spinning forever or returning a silently-partial slice.
+const maxListPages = 100
 
 // nextPageURL extracts the rel="next" target from an RFC 8288 Link header,
 // or "" when the header carries none (the last page).
@@ -240,8 +253,9 @@ type IssueLink struct {
 //
 //	GET /api/v4/projects/:id/issues/:iid/links
 //
-// It PAGES TO EXHAUSTION via the rel="next" Link header exactly as
-// ListIssueNotes does, under the same credential boundary: every page URL
+// It PAGES TO EXHAUSTION, bounded by maxListPages, via the rel="next" Link
+// header exactly as ListIssueNotes does, under the same credential boundary:
+// every page URL
 // (the first included) must be same-origin with the client's base URL, so a
 // forge-supplied next link can never carry PRIVATE-TOKEN off-instance, and
 // each request dispatches through doNoOffOriginRedirect for the 3xx half of
@@ -256,7 +270,7 @@ func (c *Client) ListIssueLinks(ctx context.Context, projectID, iid int) ([]Issu
 
 	next := c.baseURL + fmt.Sprintf("/api/v4/projects/%d/issues/%d/links?per_page=100", projectID, iid)
 	var out []IssueLink
-	for next != "" {
+	for pages := 0; next != ""; pages++ {
 		if err := c.sameOrigin(next, "next-page link"); err != nil {
 			return nil, err
 		}
@@ -267,6 +281,9 @@ func (c *Client) ListIssueLinks(ctx context.Context, projectID, iid int) ([]Issu
 		}
 		out = append(out, page...)
 		next = nextPageURL(link)
+		if next != "" && pages+1 >= maxListPages {
+			return nil, fmt.Errorf("gitlabclient: list issue links for project %d issue #%d exceeded the %d-page cap after accumulating %d links with more pages remaining; refusing to return a partial link set", projectID, iid, maxListPages, len(out))
+		}
 	}
 	return out, nil
 }

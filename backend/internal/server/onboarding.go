@@ -740,7 +740,12 @@ func (s *Server) probeMergeGate(ctx context.Context, repo string, repoRef github
 // visible, an adapter without the capability, an unresolved default branch, a
 // 401/403, a transport error or a probe timeout — resolves to `unknown` with a
 // naming Reason, and every signal that was never read is ABSENT (the pointer
-// bools stay nil), never rendered as false.
+// bools stay nil), never rendered as false. The three rule-derived signals
+// (AllowForcePush, PushAccessLevels, MergeAccessLevels) are ALSO absent on an
+// AUTHORITATIVE read where no protected-branch rule matched (Protected=false):
+// there is nothing to OR/union, and an unprotected GitLab branch permits force
+// pushes to anyone with push access, so a rendered `false` would read as the
+// opposite of the truth.
 //
 // What it does NOT claim: GitLab has no per-context required status check, so
 // `pipeline_gated` is not a statement that the `fishhawk_audit_complete`
@@ -761,11 +766,17 @@ type gitLabMergeGateReadiness struct {
 	// MOST PERMISSIVE of all matching rules, so a single rule is never the
 	// effective protection. Empty when unprotected or unread.
 	MatchedRules []string `json:"matched_rules,omitempty"`
-	// AllowForcePush is the OR across every matched rule. Absent when unread.
+	// AllowForcePush is the OR across every matched rule. Absent when the
+	// branch is UNPROTECTED (no rule matched, so there is nothing to OR — an
+	// unprotected GitLab branch permits force pushes to anyone with push
+	// access, so a rendered false would read as the opposite) or when the rule
+	// list was not read.
 	AllowForcePush *bool `json:"allow_force_push,omitempty"`
 	// PushAccessLevels / MergeAccessLevels are the UNION across every matched
 	// rule, deduplicated by level and sorted ascending — the lowest level is
-	// the most permissive and comes first. Empty when unprotected or unread.
+	// the most permissive and comes first. Absent when the branch is
+	// UNPROTECTED (no rule matched, so there is nothing to union) or when the
+	// rule list was not read.
 	PushAccessLevels  []gitLabAccessLevel `json:"push_access_levels,omitempty"`
 	MergeAccessLevels []gitLabAccessLevel `json:"merge_access_levels,omitempty"`
 	// PipelineMustSucceed mirrors the project's
@@ -894,9 +905,18 @@ func (s *Server) probeGitLabMergeGate(ctx context.Context, repo string, f forge.
 	out.Branch = mp.Branch
 	out.Protected = boolPtr(mp.Protected)
 	out.MatchedRules = mp.MatchedRules
-	out.AllowForcePush = boolPtr(mp.AllowForcePush)
-	out.PushAccessLevels = gitLabAccessLevels(mp.PushAccessLevels)
-	out.MergeAccessLevels = gitLabAccessLevels(mp.MergeAccessLevels)
+	// The three rule-derived signals are rendered ONLY when a rule matched.
+	// On an authoritative zero-rule read (Protected=false) there is nothing to
+	// OR/union, and an unprotected GitLab branch permits force pushes to anyone
+	// with push access — so a rendered allow_force_push:false would read as
+	// "force push blocked", the opposite of the truth. Leave them ABSENT, the
+	// same "a signal that was not read is absent, never false" rule the rung
+	// applies to its unknown degrades.
+	if mp.Protected {
+		out.AllowForcePush = boolPtr(mp.AllowForcePush)
+		out.PushAccessLevels = gitLabAccessLevels(mp.PushAccessLevels)
+		out.MergeAccessLevels = gitLabAccessLevels(mp.MergeAccessLevels)
+	}
 	out.PipelineMustSucceed = boolPtr(mp.PipelineMustSucceed)
 	out.AllowSkippedPipeline = boolPtr(mp.AllowSkippedPipeline)
 	out.DiscussionsMustBeResolved = boolPtr(mp.DiscussionsMustBeResolved)

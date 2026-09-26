@@ -310,6 +310,37 @@ func TestGitLabClient_ListIssueNotes_ValidatesArgs(t *testing.T) {
 	}
 }
 
+// TestListIssueNotes_PageCapFailsClosed pins the fail-closed page cap
+// (#3591): a server that ALWAYS emits a same-origin rel="next" link would
+// spin the walk forever, so the loop refuses at maxListPages rather than
+// returning a silently-partial note set. Asserts: a naming error (cap +
+// accumulated count), a nil slice, and exactly maxListPages requests (the
+// cap, not an early give-up, stopped it).
+func TestListIssueNotes_PageCapFailsClosed(t *testing.T) {
+	s := newIssueServer(t)
+	s.mux.HandleFunc("GET /api/v4/projects/42/issues/7/notes", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Link", `<`+s.srv.URL+`/api/v4/projects/42/issues/7/notes?page=99&per_page=100>; rel="next"`)
+		writeIssueJSON(w, http.StatusOK, `[{"id":1,"body":"n","system":false,"created_at":"2026-09-01T00:00:00Z","author":{"username":"alice"}}]`)
+	})
+
+	notes, err := s.client().ListIssueNotes(context.Background(), 42, 7)
+	if err == nil {
+		t.Fatalf("ListIssueNotes = %v, nil; want a fail-closed page-cap error", notes)
+	}
+	if notes != nil {
+		t.Errorf("notes = %v, want nil (no silently-partial set on the cap)", notes)
+	}
+	if !strings.Contains(err.Error(), "page cap") {
+		t.Errorf("err = %v, want it to name the page cap", err)
+	}
+	if !strings.Contains(err.Error(), "partial note set") {
+		t.Errorf("err = %v, want it to name the refused partial set", err)
+	}
+	if n := len(s.requests()); n != maxListPages {
+		t.Errorf("requests = %d, want exactly maxListPages (%d)", n, maxListPages)
+	}
+}
+
 func TestNextPageURL(t *testing.T) {
 	for _, tc := range []struct {
 		name, link, want string
@@ -620,6 +651,36 @@ func TestGitLabClient_ListIssueLinks_PagesToExhaustion(t *testing.T) {
 	}
 	if n := len(s.requests()); n != 2 {
 		t.Errorf("requests = %d, want 2 (one per page)", n)
+	}
+}
+
+// TestListIssueLinks_PageCapFailsClosed pins the fail-closed page cap
+// (#3591): a server that ALWAYS emits a same-origin rel="next" link would
+// spin the walk forever, so the loop refuses at maxListPages rather than
+// returning a silently-partial link set. Asserts: a naming error (cap +
+// accumulated count), a nil slice, and exactly maxListPages requests.
+func TestListIssueLinks_PageCapFailsClosed(t *testing.T) {
+	s := newIssueServer(t)
+	s.mux.HandleFunc("GET /api/v4/projects/42/issues/7/links", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Link", `<`+s.srv.URL+`/api/v4/projects/42/issues/7/links?page=99&per_page=100>; rel="next"`)
+		writeIssueJSON(w, http.StatusOK, `[{"iid":8,"project_id":42,"link_type":"relates_to"}]`)
+	})
+
+	links, err := s.client().ListIssueLinks(context.Background(), 42, 7)
+	if err == nil {
+		t.Fatalf("ListIssueLinks = %v, nil; want a fail-closed page-cap error", links)
+	}
+	if links != nil {
+		t.Errorf("links = %v, want nil (no silently-partial set on the cap)", links)
+	}
+	if !strings.Contains(err.Error(), "page cap") {
+		t.Errorf("err = %v, want it to name the page cap", err)
+	}
+	if !strings.Contains(err.Error(), "partial link set") {
+		t.Errorf("err = %v, want it to name the refused partial set", err)
+	}
+	if n := len(s.requests()); n != maxListPages {
+		t.Errorf("requests = %d, want exactly maxListPages (%d)", n, maxListPages)
 	}
 }
 

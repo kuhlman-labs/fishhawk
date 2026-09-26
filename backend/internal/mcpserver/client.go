@@ -1186,7 +1186,10 @@ type onboardingGitLabRegistration struct {
 // forge, project not visible, an adapter without the capability, an
 // unresolved default branch, a 401/403, a transport error or a probe timeout)
 // and `reason` names which. Every signal that was never read is ABSENT
-// (pointer bools nil), never false.
+// (pointer bools nil), never false — and the three rule-derived signals
+// (allow_force_push, push/merge access levels) are ALSO absent on an
+// authoritative UNPROTECTED read, because an unprotected GitLab branch permits
+// force pushes to anyone with push access, so a rendered false would mislead.
 //
 // A nil *onboardingGitLabMergeGate is a FOURTH state: the backend served no
 // `gitlab_merge_gate` key — a github-family report, or a pre-#3580 fishhawkd.
@@ -1200,9 +1203,9 @@ type onboardingGitLabMergeGate struct {
 	Branch                    string                        `json:"branch,omitempty" jsonschema:"the project real default branch, the branch the probe evaluated; absent when it was never resolved"`
 	Protected                 *bool                         `json:"protected,omitempty" jsonschema:"whether at least one protected-branch rule (exact or wildcard) covers the branch; absent when unread"`
 	MatchedRules              []string                      `json:"matched_rules,omitempty" jsonschema:"EVERY protected-branch rule covering the branch, the exact-name rule first then wildcards in API order - GitLab applies the most permissive of all matching rules; empty when unprotected or unread"`
-	AllowForcePush            *bool                         `json:"allow_force_push,omitempty" jsonschema:"the OR of allow_force_push across every matched rule; absent when unread"`
-	PushAccessLevels          []onboardingGitLabAccessLevel `json:"push_access_levels,omitempty" jsonschema:"the UNION of push access levels across every matched rule, deduplicated by level and ascending so the most permissive level is first; empty when unprotected or unread"`
-	MergeAccessLevels         []onboardingGitLabAccessLevel `json:"merge_access_levels,omitempty" jsonschema:"the UNION of merge access levels across every matched rule, deduplicated by level and ascending so the most permissive level is first; empty when unprotected or unread"`
+	AllowForcePush            *bool                         `json:"allow_force_push,omitempty" jsonschema:"the OR of allow_force_push across every matched rule; absent when the branch is UNPROTECTED (no rule matched) or when the rule list was not read - an unprotected GitLab branch permits force pushes to anyone with push access, so this is never rendered false to mean blocked"`
+	PushAccessLevels          []onboardingGitLabAccessLevel `json:"push_access_levels,omitempty" jsonschema:"the UNION of push access levels across every matched rule, deduplicated by level and ascending so the most permissive level is first; absent when the branch is UNPROTECTED (no rule matched) or when the rule list was not read"`
+	MergeAccessLevels         []onboardingGitLabAccessLevel `json:"merge_access_levels,omitempty" jsonschema:"the UNION of merge access levels across every matched rule, deduplicated by level and ascending so the most permissive level is first; absent when the branch is UNPROTECTED (no rule matched) or when the rule list was not read"`
 	PipelineMustSucceed       *bool                         `json:"pipeline_must_succeed,omitempty" jsonschema:"the project only_allow_merge_if_pipeline_succeeds setting; absent when unread"`
 	AllowSkippedPipeline      *bool                         `json:"allow_skipped_pipeline,omitempty" jsonschema:"the project allow_merge_on_skipped_pipeline setting (informational); absent when unread"`
 	DiscussionsMustBeResolved *bool                         `json:"discussions_must_be_resolved,omitempty" jsonschema:"the project only_allow_merge_if_all_discussions_are_resolved setting (informational); absent when unread"`
