@@ -911,3 +911,35 @@ func containsString(haystack []string, needle string) bool {
 	}
 	return false
 }
+
+// TestParkForMigrationRenumber_UsesRefreshedBearer (#3255): with an EXPIRED
+// stage-start token, the amendment-file POST and the decision poll carry the
+// REFRESHED bearer, never the expired one.
+func TestParkForMigrationRenumber_UsesRefreshedBearer(t *testing.T) {
+	pinRenumberBudget(t, time.Minute)
+	fu := newFakeUploader(t)
+	fu.amendmentsAfterRequest = decidedRow("approved")
+	var pollTokens []string
+	fu.amendmentsHook = func(_ context.Context, a upload.FetchScopeAmendmentsArgs) error {
+		pollTokens = append(pollTokens, a.MCPToken)
+		return nil
+	}
+	src, _ := newExpiredTokenSource()
+	cfg := renumberDriverCfg()
+	cfg.mcpTokens = src
+	approved, _, log := runRenumberDriver(t, context.Background(), fu, cfg, "fhm_expired")
+	if !approved {
+		t.Fatalf("approved = false:\n%s", log)
+	}
+	if len(fu.gotRequestAmendmentArgs) != 1 || fu.gotRequestAmendmentArgs[0].MCPToken != "fhm_refreshed_1" {
+		t.Fatalf("request MCPToken = %+v, want fhm_refreshed_1", fu.gotRequestAmendmentArgs)
+	}
+	if len(pollTokens) < 2 {
+		t.Fatalf("poll tokens = %v, want the decision poll and the fold", pollTokens)
+	}
+	for _, tok := range pollTokens {
+		if tok == "fhm_expired" || !strings.HasPrefix(tok, "fhm_refreshed_") {
+			t.Fatalf("poll carried %q, want a refreshed bearer (all: %v)", tok, pollTokens)
+		}
+	}
+}

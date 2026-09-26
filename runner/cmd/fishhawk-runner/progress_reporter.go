@@ -65,6 +65,9 @@ type progressTee struct {
 	runID   string
 	stageID string
 	token   string
+	// tokens, when set, supplies a refreshed bearer per report (#3255); nil
+	// keeps the constructor token byte-for-byte. Assigned after construction.
+	tokens *mcpTokenSource
 
 	slot chan struct{}  // capacity 1: the single-in-flight cap
 	wg   sync.WaitGroup // lets tests await in-flight reports deterministically
@@ -111,12 +114,19 @@ func (t *progressTee) Write(p []byte) (int, error) {
 	go func() {
 		defer t.wg.Done()
 		defer func() { <-t.slot }()
+		// Resolve the bearer BEFORE the report's own bounded context starts, so
+		// a refresh (bounded separately by mcpTokenRefreshTimeout) never eats
+		// into the POST's progressReportTimeout.
+		token := t.token
+		if t.tokens != nil {
+			token = t.tokens.bearer(context.Background())
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), progressReportTimeout)
 		defer cancel()
 		rerr := t.client.ReportStageProgress(ctx, upload.ReportStageProgressArgs{
 			RunID:             t.runID,
 			StageID:           t.stageID,
-			MCPToken:          t.token,
+			MCPToken:          token,
 			LastEvent:         hb.LastEvent,
 			TurnsThisAttempt:  hb.Turns,
 			TokensThisAttempt: hb.Tokens,

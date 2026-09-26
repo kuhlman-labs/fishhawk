@@ -1142,8 +1142,10 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	//
 	// mcpBearerToken retains the run-bound fhm_ bearer for the
 	// pre-commit scope-amendment refresh (E22.X / #961) — the runner
-	// reuses the SAME token the agent's poll loop holds, keeping one
-	// agent-side auth path on the amendment surface. Empty when the
+	// starts from the SAME token the agent's poll loop holds, keeping one
+	// agent-side auth path on the amendment surface. Consumers read it
+	// through cfg.freshMCPToken, which re-mints it once it nears its
+	// 60-minute expiry (#3255). Empty when the
 	// fetch failed or never ran; the refresh then skips and the
 	// original scope stays authoritative.
 	mcpBearerToken := ""
@@ -1171,6 +1173,10 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			inv.Env["FISHHAWK_API_TOKEN"] = mcpTok.Token
 			inv.Env["FISHHAWK_BACKEND_URL"] = cfg.backendURL
 			mcpBearerToken = mcpTok.Token
+			// Every post-agent consumer and the heartbeat tee read the bearer
+			// through this source, so a stage outliving the token's 60-minute
+			// TTL re-mints instead of 401ing (#3255).
+			cfg.mcpTokens = newMCPTokenSource(client, cfg.runID, mcpTok.Token, mcpTok.ExpiresAt, issuedKey, logSink)
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"mcp_token_issued","run_id":%q,"token_id":%q,"expires_at":%q}`+"\n",
 				cfg.runID, mcpTok.TokenID, mcpTok.ExpiresAt.Format(time.RFC3339))
@@ -1188,7 +1194,11 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// decision #2) and a failed token fetch also leaves mcpBearerToken empty — in
 	// both cases the tee degrades to a pure pass-through, so acceptance keeps its
 	// zero-credential posture and nothing regresses.
-	inv.ProgressSink = newProgressTee(inv.ProgressSink, client, cfg.runID, cfg.stageID, mcpBearerToken, logSink)
+	tee := newProgressTee(inv.ProgressSink, client, cfg.runID, cfg.stageID, mcpBearerToken, logSink)
+	// No context plumbing needed: bearer() mints under its own detached,
+	// mcpTokenRefreshTimeout-bounded context (#3255).
+	tee.tokens = cfg.mcpTokens
+	inv.ProgressSink = tee
 
 	// Acceptance-agent containment (E31.7 / #1535, ADR-050 / ADR-049 #4).
 	// The acceptance agent validates the RUNNING INSTANCE from intent +
@@ -3676,7 +3686,7 @@ func reportTerminalRunnerFailure(ctx context.Context, cfg config, client uploadC
 	err := client.ReportRunnerFailure(ctx, upload.ReportRunnerFailureArgs{
 		RunID:        cfg.runID,
 		StageID:      cfg.stageID,
-		MCPToken:     mcpToken,
+		MCPToken:     cfg.freshMCPToken(ctx, mcpToken),
 		Category:     "C",
 		Reason:       reason,
 		Detail:       detail,
@@ -5494,6 +5504,19 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 		// next iteration re-commits scope-only onto the same base.
 		reinvoked = true
 		fixInv := baseInv
+		// Each re-invocation gets the full agent timeout again, so hand it a
+		// refreshed bearer rather than the (possibly expired) inherited one
+		// (#3255). Only when the inherited Env already CARRIES a token — a
+		// credential-free stage is never handed one here. The map is cloned
+		// so baseInv's Env is not mutated in place.
+		if _, ok := baseInv.Env["FISHHAWK_API_TOKEN"]; ok && cfg.mcpTokens != nil {
+			env := make(map[string]string, len(baseInv.Env))
+			for k, v := range baseInv.Env {
+				env[k] = v
+			}
+			env["FISHHAWK_API_TOKEN"] = cfg.freshMCPToken(ctx, baseInv.Env["FISHHAWK_API_TOKEN"])
+			fixInv.Env = env
+		}
 		// The embedded verify output is BOUNDED (#3408): the adapters pass the
 		// whole prompt as one argv string, so an unbounded CombinedOutput can
 		// push the spawn past the OS argument-size limit (E2BIG). The full
@@ -5592,7 +5615,13 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 		// scope path + package sets are re-resolved so the pointer write-back
 		// is what the NEXT iteration verifies — and, via *cfg, what run()
 		// later pushes (#960 verified tree == pushed tree).
-		added, refoldEvents := refoldScopeAmendmentsMidLoop(ctx, client, cfg, mcpToken, "implement", iter+1, logSink)
+		// Read the bearer per ITERATION (#3255): a long loop outlives the
+		// stage-start token's TTL. An empty token stays empty (no refresh).
+		refoldToken := mcpToken
+		if refoldToken != "" {
+			refoldToken = cfg.freshMCPToken(ctx, mcpToken)
+		}
+		added, refoldEvents := refoldScopeAmendmentsMidLoop(ctx, client, cfg, refoldToken, "implement", iter+1, logSink)
 		res.Events = append(res.Events, refoldEvents...)
 		if added {
 			resolveScope(false)
@@ -10321,7 +10350,7 @@ func watchScopeAmendments(ctx context.Context, client uploadClient, cfg config, 
 		case <-ticker.C:
 			items, err := client.FetchScopeAmendments(ctx, upload.FetchScopeAmendmentsArgs{
 				RunID:    cfg.runID,
-				MCPToken: mcpToken,
+				MCPToken: cfg.freshMCPToken(ctx, mcpToken),
 			})
 			if err != nil {
 				continue
@@ -10356,7 +10385,8 @@ func emitPendingScopeAmendments(seen map[string]struct{}, items []upload.ScopeAm
 
 // refreshScopeAmendments fetches the run's scope amendments with the
 // retained run-bound fhm_ bearer (mcpToken, from the FetchMCPToken
-// call that fed the agent's FISHHAWK_API_TOKEN env) and folds the
+// call that fed the agent's FISHHAWK_API_TOKEN env — re-minted via
+// cfg.freshMCPToken when it nears expiry, #3255) and folds the
 // paths of every APPROVED amendment into cfg.scopeFiles, deduped by
 // path (E22.X / #961). Called after the agent invocation settles and
 // BEFORE any committed-tree gate or StageScoped call reads
@@ -10399,7 +10429,7 @@ func refreshScopeAmendments(ctx context.Context, client uploadClient, cfg *confi
 	}
 	items, err := client.FetchScopeAmendments(ctx, upload.FetchScopeAmendmentsArgs{
 		RunID:    cfg.runID,
-		MCPToken: mcpToken,
+		MCPToken: cfg.freshMCPToken(ctx, mcpToken),
 	})
 	if err != nil {
 		_, _ = fmt.Fprintf(logSink,
@@ -10517,7 +10547,7 @@ func detectUndecidedScopeAmendments(ctx context.Context, client uploadClient, cf
 	}
 	items, err := client.FetchScopeAmendments(ctx, upload.FetchScopeAmendmentsArgs{
 		RunID:    cfg.runID,
-		MCPToken: mcpToken,
+		MCPToken: cfg.freshMCPToken(ctx, mcpToken),
 	})
 	if err != nil {
 		_, _ = fmt.Fprintf(logSink,

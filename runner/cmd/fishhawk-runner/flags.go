@@ -56,6 +56,16 @@ type config struct {
 	// nil-tolerant), so every un-armed path behaves exactly as before.
 	handoff *agentHandoff
 
+	// mcpTokens lazily re-mints the run-bound fhm_ bearer (and the signing
+	// key that authorizes minting it) when it nears expiry (#3255). Set at
+	// runtime ONLY on the successful FetchMCPToken path in run(); nil for the
+	// credential-free acceptance stage and a failed initial fetch. Same
+	// POINTER-field rationale as handoff above: config is copied by value but
+	// every copy shares ONE source, without a new parameter on functions with
+	// dozens of test call sites (runVerifyFixLoop alone has 36). A nil source
+	// is a pure load — freshMCPToken returns the caller's token unchanged.
+	mcpTokens *mcpTokenSource
+
 	// agent selects the coding-agent provider the runner invokes
 	// (E22.X / #839). Maps 1:1 onto an agent.Invoker via
 	// selectInvoker: "claude-code" (default) wires the existing

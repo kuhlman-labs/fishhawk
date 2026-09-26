@@ -128,7 +128,7 @@ func awaitPendingScopeAmendmentSettle(ctx context.Context, client uploadClient, 
 	probeCtx, cancelProbe := context.WithDeadline(ctx, deadline)
 	items, err := client.FetchScopeAmendments(probeCtx, upload.FetchScopeAmendmentsArgs{
 		RunID:    cfg.runID,
-		MCPToken: mcpToken,
+		MCPToken: cfg.freshMCPToken(ctx, mcpToken),
 	})
 	cancelProbe()
 	if err != nil {
@@ -198,7 +198,7 @@ func settleLoop(ctx context.Context, client uploadClient, cfg config, mcpToken s
 		fetchCtx, cancel := context.WithDeadline(ctx, deadline)
 		items, err := client.FetchScopeAmendments(fetchCtx, upload.FetchScopeAmendmentsArgs{
 			RunID:       cfg.runID,
-			MCPToken:    mcpToken,
+			MCPToken:    cfg.freshMCPToken(ctx, mcpToken), // per poll (#3255)
 			WaitSeconds: boundedWaitSeconds(remaining, scopeAmendmentSettleWaitSeconds),
 		})
 		cancel()

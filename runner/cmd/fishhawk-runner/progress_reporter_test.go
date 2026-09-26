@@ -270,3 +270,27 @@ func itoa(n int) string {
 	}
 	return string(b[i:])
 }
+
+// TestProgressTee_TokenSourceRefreshesBearer (#3255): a tee whose source holds
+// an EXPIRED token POSTs the refreshed bearer; a nil source POSTs the
+// constructor token byte-for-byte (the no-regression control).
+func TestProgressTee_TokenSourceRefreshesBearer(t *testing.T) {
+	var sink syncBuf
+	rep := &fakeReporter{}
+	tee := newProgressTee(&sink, rep, "run-1", "stage-1", "fhm_expired", &sink)
+	src, _ := newExpiredTokenSource()
+	tee.tokens = src
+	_, _ = tee.Write([]byte(testHeartbeat))
+	tee.waitForReports()
+	if rep.callCount() != 1 || rep.calls[0].MCPToken != "fhm_refreshed_1" {
+		t.Fatalf("posted = %+v, want one POST carrying fhm_refreshed_1", rep.calls)
+	}
+
+	rep2 := &fakeReporter{}
+	tee2 := newProgressTee(&sink, rep2, "run-1", "stage-1", "fhm_tok", &sink)
+	_, _ = tee2.Write([]byte(testHeartbeat))
+	tee2.waitForReports()
+	if rep2.callCount() != 1 || rep2.calls[0].MCPToken != "fhm_tok" {
+		t.Fatalf("nil-source posted = %+v, want constructor token fhm_tok", rep2.calls)
+	}
+}

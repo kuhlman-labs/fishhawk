@@ -485,9 +485,12 @@ type fakeUploader struct {
 	prErr          error
 	instTokenErr   error
 	mcpTokenErr    error
-	retryStageErr  error
-	acceptanceErr  error
-	progressErr    error
+	// mcpTokenTTL/mcpTokenCalls: FetchMCPToken short-TTL seam (#3255).
+	mcpTokenTTL   time.Duration
+	mcpTokenCalls int
+	retryStageErr error
+	acceptanceErr error
+	progressErr   error
 
 	// Recorded calls.
 	gotIssueRunID string
@@ -860,6 +863,22 @@ func (f *fakeUploader) FetchMCPToken(_ context.Context, args upload.FetchMCPToke
 	f.gotMCPTokenArgs = &a
 	if f.mcpTokenErr != nil {
 		return nil, f.mcpTokenErr
+	}
+	// mcpTokenTTL > 0 models a token already inside the refresh skew (#3255):
+	// every mint expires that soon, and each re-mint after the first hands
+	// back a DISTINCT token so a consumer's bearer proves which mint it holds.
+	f.mcpTokenCalls++
+	if f.mcpTokenTTL > 0 {
+		tok := "fhm_stubmcptokenforuse"
+		if f.mcpTokenCalls > 1 {
+			tok = fmt.Sprintf("fhm_refreshedmcptoken_%d", f.mcpTokenCalls)
+		}
+		return &upload.FetchMCPTokenResult{
+			Token:     tok,
+			TokenID:   fmt.Sprintf("t-id-%d", f.mcpTokenCalls),
+			RunID:     args.RunID,
+			ExpiresAt: time.Now().Add(f.mcpTokenTTL),
+		}, nil
 	}
 	return &upload.FetchMCPTokenResult{
 		Token:     "fhm_stubmcptokenforuse",
@@ -3243,6 +3262,57 @@ func TestRun_FetchPrompt_FetchesMCPToken_AndStampsAgentEnv(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), `"event":"mcp_token_issued"`) {
 		t.Errorf("missing mcp_token_issued log line: %s", stderr.String())
+	}
+}
+
+// TestRun_FetchPrompt_ShortLivedMCPToken_PostAgentConsumerRefreshes pins the
+// run()-level WIRING of the #3255 token source: a successful FetchMCPToken
+// must set cfg.mcpTokens, so a post-agent consumer (the implement stage's
+// undecided-amendment check) holding a token already inside the refresh skew
+// re-mints it and presents the REFRESHED bearer. Deleting the
+// `cfg.mcpTokens = newMCPTokenSource(...)` line in main.go leaves every
+// consumer on the stale start-of-stage token with no mcp_token_refreshed
+// event — the exact 401 the issue reports — and turns this test RED.
+func TestRun_FetchPrompt_ShortLivedMCPToken_PostAgentConsumerRefreshes(t *testing.T) {
+	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
+	withFakeInvoker(t, invoker)
+	fu := newFakeUploader(t)
+	// Inside mcpTokenRefreshSkew from the moment it is minted.
+	fu.mcpTokenTTL = time.Minute
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:    "22222222-3333-4444-5555-666666666666",
+		StageType:  "implement",
+		Prompt:     "Hello agent.",
+		PromptHash: "deadbeef",
+	}
+	withFakeUploader(t, fu)
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt",
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	// The agent received the start-of-stage token.
+	if got := invoker.gotInv.Env["FISHHAWK_API_TOKEN"]; got != "fhm_stubmcptokenforuse" {
+		t.Errorf("FISHHAWK_API_TOKEN = %q, want the start-of-stage token", got)
+	}
+	if !strings.Contains(stderr.String(), `"event":"mcp_token_refreshed"`) {
+		t.Errorf("no mcp_token_refreshed event — cfg.mcpTokens not wired by run():\n%s", stderr.String())
+	}
+	if fu.mcpTokenCalls < 2 {
+		t.Errorf("FetchMCPToken calls = %d, want >= 2 (start-of-stage mint + refresh)", fu.mcpTokenCalls)
+	}
+	if fu.gotAmendmentArgs == nil {
+		t.Fatal("post-agent undecided-amendment check never fetched")
+	}
+	if b := fu.gotAmendmentArgs.MCPToken; !strings.HasPrefix(b, "fhm_refreshedmcptoken_") {
+		t.Errorf("undecided-amendment check bearer = %q, want a refreshed token", b)
 	}
 }
 
@@ -20574,6 +20644,10 @@ func TestRun_AcceptanceStage_EndToEnd(t *testing.T) {
 	if !strings.Contains(stderr.String(), `"event":"acceptance_no_mcp_token"`) {
 		t.Errorf("missing acceptance_no_mcp_token event: %s", stderr.String())
 	}
+	// #3255: no token source is wired for acceptance, so nothing refreshes.
+	if strings.Contains(stderr.String(), "mcp_token_refresh") {
+		t.Errorf("acceptance stage must never refresh an MCP token: %s", stderr.String())
+	}
 
 	// The signed ship carried a valid acceptanceBody keyed by the served
 	// criterion ids, signed with the issued run key (the fake uploader
@@ -30430,6 +30504,168 @@ func TestFailureReport_LegacyKinds_ByteIdentical(t *testing.T) {
 				t.Fatalf("a legacy path emitted resume_kind %q; it must be ABSENT", got.ResumeKind)
 			}
 		})
+	}
+}
+
+// --- #3255: run-bound MCP bearer refresh at each post-agent consumer seam ---
+
+// TestDetectUndecidedScopeAmendments_UsesRefreshedBearer pins the precise call
+// that emitted #3255's scope_amendment_undecided_check_failed 401: with the
+// stage-start token EXPIRED, the check must carry the REFRESHED bearer.
+func TestDetectUndecidedScopeAmendments_UsesRefreshedBearer(t *testing.T) {
+	fake := newFakeUploader(t)
+	src, _ := newExpiredTokenSource()
+	cfg := config{runID: "run-abc", stageID: undecidedStageID, mcpTokens: src}
+	var log bytes.Buffer
+	detectUndecidedScopeAmendments(context.Background(), fake, cfg, "fhm_expired", "implement", &log)
+	if fake.gotAmendmentArgs == nil || fake.gotAmendmentArgs.MCPToken != "fhm_refreshed_1" {
+		t.Fatalf("ListScopeAmendments MCPToken = %+v, want fhm_refreshed_1", fake.gotAmendmentArgs)
+	}
+	// An empty passed-in token still short-circuits: no fetch, no mint.
+	fake2 := newFakeUploader(t)
+	src2, fc2 := newExpiredTokenSource()
+	detectUndecidedScopeAmendments(context.Background(), fake2, config{runID: "r", stageID: "s", mcpTokens: src2}, "", "implement", &log)
+	if fake2.gotAmendmentArgs != nil || len(fc2.callLog()) != 0 {
+		t.Fatalf("empty token must not fetch or mint; fetch=%+v mints=%v", fake2.gotAmendmentArgs, fc2.callLog())
+	}
+}
+
+func TestRefreshScopeAmendments_UsesRefreshedBearer(t *testing.T) {
+	fake := newFakeUploader(t)
+	src, _ := newExpiredTokenSource()
+	cfg := amendmentCfg(upload.ScopeFile{Path: "pkg/in_scope.go", Operation: "modify"})
+	cfg.mcpTokens = src
+	var log bytes.Buffer
+	refreshScopeAmendments(context.Background(), fake, cfg, "fhm_expired", &log)
+	if fake.gotAmendmentArgs == nil || fake.gotAmendmentArgs.MCPToken != "fhm_refreshed_1" {
+		t.Fatalf("FetchScopeAmendments MCPToken = %+v, want fhm_refreshed_1", fake.gotAmendmentArgs)
+	}
+	// Nil source: the passed-in token is used byte-for-byte.
+	fake2 := newFakeUploader(t)
+	cfg2 := amendmentCfg(upload.ScopeFile{Path: "pkg/in_scope.go", Operation: "modify"})
+	refreshScopeAmendments(context.Background(), fake2, cfg2, "fhm_orig", &log)
+	if fake2.gotAmendmentArgs == nil || fake2.gotAmendmentArgs.MCPToken != "fhm_orig" {
+		t.Fatalf("nil-source MCPToken = %+v, want fhm_orig", fake2.gotAmendmentArgs)
+	}
+}
+
+func TestReportTerminalRunnerFailure_UsesRefreshedBearer(t *testing.T) {
+	fake := newFakeUploader(t)
+	src, _ := newExpiredTokenSource()
+	cfg := config{runID: "run-abc", stageID: "stage-1", mcpTokens: src}
+	var log bytes.Buffer
+	reportTerminalRunnerFailure(context.Background(), cfg, fake, "fhm_expired", "attempt-1", &log, "trace_upload", "d", 1)
+	reports := fake.runnerFailures()
+	if len(reports) != 1 || reports[0].MCPToken != "fhm_refreshed_1" {
+		t.Fatalf("ReportRunnerFailure = %+v, want one report carrying fhm_refreshed_1", reports)
+	}
+	// Empty passed-in token keeps the named skip and never mints.
+	src2, fc2 := newExpiredTokenSource()
+	fake2 := newFakeUploader(t)
+	reportTerminalRunnerFailure(context.Background(), config{runID: "r", stageID: "s", mcpTokens: src2}, fake2, "", "attempt-1", &log, "x", "d", 1)
+	if len(fake2.runnerFailures()) != 0 || len(fc2.callLog()) != 0 {
+		t.Fatalf("empty token must skip without minting")
+	}
+	if !strings.Contains(log.String(), `"reason":"no_mcp_token"`) {
+		t.Fatalf("missing no_mcp_token skip:\n%s", log.String())
+	}
+}
+
+// runVerifyFixLoopTokens drives the REAL loop for two failing fix iterations
+// and returns the bearer on every FetchScopeAmendments call and the
+// FISHHAWK_API_TOKEN handed to each fix re-invocation.
+func runVerifyFixLoopTokens(t *testing.T, src *mcpTokenSource) (fetchTokens, invTokens []string, baseEnv map[string]string) {
+	t.Helper()
+	repo, _, _ := verifiedTreeRepo(t)
+	cfg := verifiedTreeCfg(repo, "false")
+	cfg.verifyMaxIterations = 2
+	cfg.mcpTokens = src
+	fake := newFakeUploader(t)
+	fake.amendmentsHook = func(_ context.Context, a upload.FetchScopeAmendmentsArgs) error {
+		fetchTokens = append(fetchTokens, a.MCPToken)
+		return nil
+	}
+	invoker := &fakeInvoker{
+		canned: agent.Result{OK: true},
+		onInvoke: func(_ int, inv agent.Invocation) {
+			invTokens = append(invTokens, inv.Env["FISHHAWK_API_TOKEN"])
+		},
+	}
+	baseEnv = map[string]string{"FISHHAWK_API_TOKEN": "fhm_orig", "FISHHAWK_BACKEND_URL": "u"}
+	res := agent.Result{OK: true}
+	var logSink strings.Builder
+	if _, _, err := runVerifyFixLoop(context.Background(), &cfg, fake, "fhm_orig", invoker, agent.Invocation{Env: baseEnv}, &res, &logSink); err != nil {
+		t.Fatalf("runVerifyFixLoop: %v\n%s", err, logSink.String())
+	}
+	return fetchTokens, invTokens, baseEnv
+}
+
+// TestRunVerifyFixLoop_RefreshesBearerPerIteration: the mid-loop re-fold reads
+// the bearer per ITERATION (iteration 2 carries a NEWER bearer than iteration
+// 1) and each fix re-invocation is handed a refreshed FISHHAWK_API_TOKEN.
+func TestRunVerifyFixLoop_RefreshesBearerPerIteration(t *testing.T) {
+	src, _ := newExpiredTokenSource()
+	fetchTokens, invTokens, baseEnv := runVerifyFixLoopTokens(t, src)
+	if len(invTokens) != 2 || len(fetchTokens) < 2 {
+		t.Fatalf("want 2 fix invocations and >=2 amendment fetches; inv=%v fetch=%v", invTokens, fetchTokens)
+	}
+	seq := func(tok string) int {
+		var n int
+		if _, err := fmt.Sscanf(tok, "fhm_refreshed_%d", &n); err != nil {
+			t.Fatalf("token %q is not a refreshed bearer", tok)
+		}
+		return n
+	}
+	last := 0
+	for _, tok := range fetchTokens {
+		n := seq(tok)
+		if n <= last {
+			t.Fatalf("amendment fetch tokens not strictly newer across iterations: %v", fetchTokens)
+		}
+		last = n
+	}
+	if seq(invTokens[1]) <= seq(invTokens[0]) {
+		t.Fatalf("fix iteration 2 token %q not newer than iteration 1 %q", invTokens[1], invTokens[0])
+	}
+	if baseEnv["FISHHAWK_API_TOKEN"] != "fhm_orig" {
+		t.Fatalf("baseInv.Env mutated in place: %v", baseEnv)
+	}
+}
+
+// Nil source: every fetch and every fix invocation carries the original
+// bearer byte-for-byte (the no-regression control).
+func TestRunVerifyFixLoop_NilTokenSourceUnchanged(t *testing.T) {
+	fetchTokens, invTokens, _ := runVerifyFixLoopTokens(t, nil)
+	for _, tok := range append(append([]string{}, fetchTokens...), invTokens...) {
+		if tok != "fhm_orig" {
+			t.Fatalf("nil-source token = %q, want fhm_orig (fetch=%v inv=%v)", tok, fetchTokens, invTokens)
+		}
+	}
+	if len(invTokens) != 2 {
+		t.Fatalf("fix invocations = %d, want 2", len(invTokens))
+	}
+}
+
+// A credential-free base invocation (acceptance / failed fetch: no
+// FISHHAWK_API_TOKEN key) is never handed a token by the fix re-invoke, even
+// with a source wired.
+func TestRunVerifyFixLoop_NoTokenKeyNeverInjected(t *testing.T) {
+	repo, _, _ := verifiedTreeRepo(t)
+	cfg := verifiedTreeCfg(repo, "false")
+	cfg.verifyMaxIterations = 1
+	src, fc := newExpiredTokenSource()
+	cfg.mcpTokens = src
+	var sawKey bool
+	invoker := &fakeInvoker{canned: agent.Result{OK: true}, onInvoke: func(_ int, inv agent.Invocation) {
+		_, sawKey = inv.Env["FISHHAWK_API_TOKEN"]
+	}}
+	res := agent.Result{OK: true}
+	var logSink strings.Builder
+	if _, _, err := runVerifyFixLoop(context.Background(), &cfg, nil, "", invoker, agent.Invocation{Env: map[string]string{"X": "y"}}, &res, &logSink); err != nil {
+		t.Fatal(err)
+	}
+	if invoker.callIdx != 1 || sawKey || len(fc.callLog()) != 0 {
+		t.Fatalf("calls=%d sawKey=%t mints=%v; a credential-free stage must never be handed or mint a token", invoker.callIdx, sawKey, fc.callLog())
 	}
 }
 
