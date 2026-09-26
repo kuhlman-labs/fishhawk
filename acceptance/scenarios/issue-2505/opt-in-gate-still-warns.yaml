@@ -1,0 +1,14 @@
+id: scenario:issue-2505/opt-in-gate-still-warns
+statement: Running `fishhawk doctor` with neither --run-verify-command nor --skip-verify-command still prints a `verify command` rung line reporting `not executed (opt-in)` with status warn, and spawns no verify subprocess.
+verify_hint: 'CLI stdout: run the built `fishhawk doctor` binary against any checkout and read the `verify command` row of the printed rung table.'
+steps: 'Built fishhawk from the sanctioned checkout at 9812f59c (cd cli && go build -o /tmp/fh2505/fishhawk ./cmd/fishhawk). Created throwaway repo /tmp/fh2505/chk: git init; .fishhawk/workflows.yaml copied from docs/spec/examples/workflow-v0-feature-change.yaml with executor.verify.command changed to ''touch /tmp/fh2505/marker-$$; true'' and timeout ''1m''; committed. Ran /tmp/fh2505/fishhawk doctor --working-dir /tmp/fh2505/chk --backend-url http://localhost:8090 --token <fhm_> --repo kuhlman-labs/fishhawk with neither --run-verify-command nor --skip-verify-command; then ls /tmp/fh2505/marker-*.'
+assertions:
+    expected: The verify command row shows 'not executed (opt-in)' with warn and no verify subprocess runs
+    observed_at_record: The row reads 'verify command            not executed (opt-in)                    warn', with a hint telling the operator to pass --run-verify-command. No marker file was created, so the verify command did not run.
+    repro_handle: fishhawk doctor --working-dir /tmp/fh2505/chk --backend-url http://localhost:8090 --token <t> --repo kuhlman-labs/fishhawk
+origin:
+    issue: 2505
+    pr: 3687
+    run_id: 7043bffd-5300-4c86-b44a-7a2da972d57d
+    head_sha: 9812f59c0fee322ac054a77c60803ed7da57b00d
+    recorded_at: 2026-09-26T11:40:55Z
