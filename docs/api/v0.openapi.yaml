@@ -6297,14 +6297,21 @@ components:
               type: string
               description: |
                 The `gitlab:<project_id>` ref the path resolved to with the
-                deployment credential. Absent when the project did not
-                resolve.
+                deployment credential. It is a fact about the PATH, not about
+                the registry row, so it is present on EVERY posture whenever
+                the project resolved — `registered`, `not_registered`, AND
+                both `unknown` degrades (`registry_unwired`,
+                `registry_lookup_failed`), which never read the registry.
+                Absent ONLY when the project did not resolve.
               example: gitlab:5
             ref_matches:
               type: boolean
               description: |
                 `installation_ref == resolved_ref`. Set ONLY when both are
-                known; absent means "not compared", never `false`.
+                known; absent means "not compared", never `false`. So a
+                present `resolved_ref` does NOT imply a comparison was made:
+                an `unknown` degrade never reaches it, and a `registered` row
+                whose `installation_ref` is empty leaves it absent too.
             reason:
               type: string
               description: |
