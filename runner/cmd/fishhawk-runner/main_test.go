@@ -485,9 +485,12 @@ type fakeUploader struct {
 	prErr          error
 	instTokenErr   error
 	mcpTokenErr    error
-	retryStageErr  error
-	acceptanceErr  error
-	progressErr    error
+	// mcpTokenTTL/mcpTokenCalls: FetchMCPToken short-TTL seam (#3255).
+	mcpTokenTTL   time.Duration
+	mcpTokenCalls int
+	retryStageErr error
+	acceptanceErr error
+	progressErr   error
 
 	// Recorded calls.
 	gotIssueRunID string
@@ -860,6 +863,22 @@ func (f *fakeUploader) FetchMCPToken(_ context.Context, args upload.FetchMCPToke
 	f.gotMCPTokenArgs = &a
 	if f.mcpTokenErr != nil {
 		return nil, f.mcpTokenErr
+	}
+	// mcpTokenTTL > 0 models a token already inside the refresh skew (#3255):
+	// every mint expires that soon, and each re-mint after the first hands
+	// back a DISTINCT token so a consumer's bearer proves which mint it holds.
+	f.mcpTokenCalls++
+	if f.mcpTokenTTL > 0 {
+		tok := "fhm_stubmcptokenforuse"
+		if f.mcpTokenCalls > 1 {
+			tok = fmt.Sprintf("fhm_refreshedmcptoken_%d", f.mcpTokenCalls)
+		}
+		return &upload.FetchMCPTokenResult{
+			Token:     tok,
+			TokenID:   fmt.Sprintf("t-id-%d", f.mcpTokenCalls),
+			RunID:     args.RunID,
+			ExpiresAt: time.Now().Add(f.mcpTokenTTL),
+		}, nil
 	}
 	return &upload.FetchMCPTokenResult{
 		Token:     "fhm_stubmcptokenforuse",
@@ -3243,6 +3262,57 @@ func TestRun_FetchPrompt_FetchesMCPToken_AndStampsAgentEnv(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), `"event":"mcp_token_issued"`) {
 		t.Errorf("missing mcp_token_issued log line: %s", stderr.String())
+	}
+}
+
+// TestRun_FetchPrompt_ShortLivedMCPToken_PostAgentConsumerRefreshes pins the
+// run()-level WIRING of the #3255 token source: a successful FetchMCPToken
+// must set cfg.mcpTokens, so a post-agent consumer (the implement stage's
+// undecided-amendment check) holding a token already inside the refresh skew
+// re-mints it and presents the REFRESHED bearer. Deleting the
+// `cfg.mcpTokens = newMCPTokenSource(...)` line in main.go leaves every
+// consumer on the stale start-of-stage token with no mcp_token_refreshed
+// event — the exact 401 the issue reports — and turns this test RED.
+func TestRun_FetchPrompt_ShortLivedMCPToken_PostAgentConsumerRefreshes(t *testing.T) {
+	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
+	withFakeInvoker(t, invoker)
+	fu := newFakeUploader(t)
+	// Inside mcpTokenRefreshSkew from the moment it is minted.
+	fu.mcpTokenTTL = time.Minute
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:    "22222222-3333-4444-5555-666666666666",
+		StageType:  "implement",
+		Prompt:     "Hello agent.",
+		PromptHash: "deadbeef",
+	}
+	withFakeUploader(t, fu)
+
+	var stderr strings.Builder
+	got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt",
+	}, &stderr)
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	// The agent received the start-of-stage token.
+	if got := invoker.gotInv.Env["FISHHAWK_API_TOKEN"]; got != "fhm_stubmcptokenforuse" {
+		t.Errorf("FISHHAWK_API_TOKEN = %q, want the start-of-stage token", got)
+	}
+	if !strings.Contains(stderr.String(), `"event":"mcp_token_refreshed"`) {
+		t.Errorf("no mcp_token_refreshed event — cfg.mcpTokens not wired by run():\n%s", stderr.String())
+	}
+	if fu.mcpTokenCalls < 2 {
+		t.Errorf("FetchMCPToken calls = %d, want >= 2 (start-of-stage mint + refresh)", fu.mcpTokenCalls)
+	}
+	if fu.gotAmendmentArgs == nil {
+		t.Fatal("post-agent undecided-amendment check never fetched")
+	}
+	if b := fu.gotAmendmentArgs.MCPToken; !strings.HasPrefix(b, "fhm_refreshedmcptoken_") {
+		t.Errorf("undecided-amendment check bearer = %q, want a refreshed token", b)
 	}
 }
 
