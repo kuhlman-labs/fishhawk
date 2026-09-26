@@ -1,0 +1,14 @@
+id: scenario:issue-3534/stale-items-ingested-and-counted
+statement: A grooming report carrying a stale_items entry is accepted by the report-ingest route and the resulting persisted audit row carries the stale count.
+verify_hint: POST the grooming_report body (with one stale_items entry) to the run's grooming-report ingest route and confirm a 2xx; then GET /v0/runs/{run_id}/audit and confirm the grooming_report_recorded entry's payload carries entry_counts.stale_items equal to the number of stale entries posted.
+steps: '1) POST http://localhost:8090/v0/dev/fixtures {"scenario":"trace-upload-target"} -> run_id and plan stage_id. This is a plan-typed stage; the only grooming fixture, grooming-confirm-gate, seeds its groom stage already succeeded, and run creation is egress-denied. 2) POST /v0/runs/{run}/signing-key -> private_key. 3) POST /v0/dev/sign over ''prompt:<plan_stage_id>'', then GET /v0/stages/{plan}/prompt with X-Fishhawk-Signature -> 200 (stage running). 4) Build a grooming_report from docs/spec/examples/grooming-report-v1-example.json, replacing stale_items with TWO entries: stale:github/kuhlman-labs/fishhawk#1638:complete_but_open (kind complete_but_open, evidence ''5/5 sub-issues closed; last sub-issue closed 2026-08-30'', rubric S1, proposed_action close) and stale:github/kuhlman-labs/fishhawk#1439:closed_with_open_children (rubric S5, reparent_children). 5) Sign the body via /v0/dev/sign and POST /v0/runs/{run}/plan?stage_id={plan} with X-Fishhawk-Signature. 6) GET /v0/runs/{run}/audit?category=grooming_report_recorded. 7) GET /v0/stages/{plan}.'
+assertions:
+    expected: 2xx on ingest and entry_counts.stale_items equal to the number of stale entries posted (2).
+    observed_at_record: POST -> 201 {schema_version:grooming_report_v1, content_hash 2469c2a0...}. The grooming_report_recorded audit row's payload.entry_counts = {ordering:4, duplicates:1, hygiene_defects:1, dependency_edges:1, vision_drift:1, decomposition_suggestions:1, stale_items:2}. The stage parked at awaiting_approval.
+    repro_handle: POST /v0/runs/{run}/plan?stage_id={plan} with a signed grooming_report carrying 2 stale_items; GET /v0/runs/{run}/audit?category=grooming_report_recorded
+origin:
+    issue: 3534
+    pr: 3685
+    run_id: 395075ff-30d5-4fbd-9bdc-088bd1d38126
+    head_sha: 644d4dc877c01984c2d271b8382ebf37b8662eca
+    recorded_at: 2026-09-26T09:28:12Z
