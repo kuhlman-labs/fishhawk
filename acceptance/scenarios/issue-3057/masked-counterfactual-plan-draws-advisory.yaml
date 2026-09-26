@@ -1,0 +1,14 @@
+id: scenario:issue-3057/masked-counterfactual-plan-draws-advisory
+statement: After a plan whose verification.test_strategy names a control deletion and a RED outcome without stating the mechanism settles at the plan gate, the run's audit log carries a plan_warnings entry whose warnings array contains an advisory naming counterfactual_mechanism_missing and quoting the offending sentence.
+verify_hint: GET /v0/runs/{run_id}/audit returns an entry of category plan_warnings whose payload warnings array contains the counterfactual_mechanism_missing advisory text; the same fact is readable as the plan_warnings field of the fishhawk_get_plan MCP tool result.
+steps: 'POST http://localhost:8090/v0/dev/fixtures {"scenario":"plan-gate-criteria"} -> run 871dfacc-bf14-4716-bc3c-974c6321807f, plan stage 5e13f0e4-e278-4f07-b1a4-0eb09ede40bd. POST /v0/runs/{run}/signing-key {}. Take docs/spec/examples/plan-standard-v1-example.json. Set verification.test_strategy to ''Integration test TestStageBudget covers stage-budget enforcement. Delete the VersionMajor gate in EvaluateStage and TestStageBudget goes RED. Manual smoke: curl the local docker-compose.'' Set one blocking criterion budget-halts-stage with a verify_hint. Sign via POST /v0/dev/sign (X-Fishhawk-Dev-Private-Key), then POST /v0/runs/{run}/plan?stage_id={plan} with X-Fishhawk-Signature -> 201. GET /v0/runs/{run}/audit?category=plan_warnings. Also mint an fhm_ bearer and POST /mcp tools/call fishhawk_get_plan {run_id}.'
+assertions:
+    expected: A plan_warnings entry naming counterfactual_mechanism_missing and quoting the offending sentence
+    observed_at_record: 'One plan_warnings entry. warnings[0] = ''test_strategy states a counterfactual with NO stated mechanism: "Delete the VersionMajor gate in EvaluateStage and TestStageBudget goes RED" — name the fixture state that makes the deletion observable ... (counterfactual_mechanism_missing; advisory)''. fishhawk_get_plan structuredContent.plan_warnings carries the same string. The plan was accepted (201) and not refused.'
+    repro_handle: GET http://localhost:8090/v0/runs/871dfacc-bf14-4716-bc3c-974c6321807f/audit?category=plan_warnings
+origin:
+    issue: 3057
+    pr: 3689
+    run_id: c9cd4085-4625-49bf-97a1-79f10d712b4d
+    head_sha: a45f977352e5e5a7838b551dacbeb701e7fa8038
+    recorded_at: 2026-09-26T14:48:15Z

@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/santhosh-tekuri/jsonschema/v6"
 )
@@ -521,7 +522,11 @@ func checkIrreducible(p *Plan) error {
 //     parent's (agent may have compressed work — soft signal for review);
 //   - test_strategy names expensive gates (-count >= 50 or full-repo
 //     -race) but predicted_runtime_minutes is below expensiveTestRuntimeThreshold
-//     (runtime budget is likely too optimistic for the stated gates).
+//     (runtime budget is likely too optimistic for the stated gates);
+//   - counterfactual_mechanism_missing (E68.28 / #3057) — test_strategy names a
+//     control deletion and a RED outcome but states no MECHANISM, i.e. no
+//     fixture state that makes the deletion observable. One warning per
+//     offending sentence, capped.
 func Warnings(p *Plan) []string {
 	var warns []string
 
@@ -572,7 +577,150 @@ func Warnings(p *Plan) []string {
 		))
 	}
 
+	// E68.28 (#3057): the stated-mechanism advisory rides LAST so every existing
+	// warning keeps its position — a reader (or a test) anchored on the prior
+	// order is unperturbed.
+	warns = append(warns, counterfactualMechanismWarnings(strategy)...)
+
 	return warns
+}
+
+// RuleCounterfactualMechanismMissing names the advisory plan.Warnings rule that
+// flags a counterfactual claim in verification.test_strategy which states no
+// failure MECHANISM (E68.28 / #3057).
+//
+// The defect it closes: a plan names a control, names the deletion, and names a
+// test that "goes RED" — but on the fixture the test actually uses, the deletion
+// changes nothing observable (a downstream guard masks it, or the fixture would
+// produce the same outcome either way), so the arm is not a control at all. In
+// every reported instance the gap was in the fixture's SETUP, not its assertion,
+// which is why the remedy this rule names is a setup obligation: state what the
+// test would produce with the control absent.
+//
+// It is ADVISORY and never refuses a plan — it rides Warnings(), which is a
+// soft-signal surface by construction, and reaches the operator as a
+// plan_warnings audit row and through fishhawk_get_plan.
+//
+// RESIDUAL, stated rather than glossed: the detector is LEXICAL and therefore
+// evadable by construction — writing the word "because" anywhere near a
+// counterfactual sentence clears it, however hollow the reason. The PROSE in the
+// plan prompt (the Counterfactual attainability rule's mechanism clause) is the
+// actual prevention; this rule is the reviewer's prompt to trace one.
+const RuleCounterfactualMechanismMissing = "counterfactual_mechanism_missing"
+
+// counterfactualDeletionMarkers are lowercase substrings that mark a sentence as
+// describing a control DELETION/MUTATION. Prefixes ("delet", "remov", "mutat")
+// deliberately cover the inflected forms.
+var counterfactualDeletionMarkers = []string{
+	"delet", "remov", "comment out", "stub out", "mutat", "control absent", "counterfactual",
+}
+
+// counterfactualMechanismMarkers are lowercase substrings that count as a STATED
+// mechanism. They are intentionally generous — the rule's job is to catch the
+// claim with NO mechanism at all, not to grade the quality of one.
+var counterfactualMechanismMarkers = []string{
+	"because", "since", "so that", "otherwise", "mechanism", "fixture", "isolat",
+	"only guard", "only thing in the path", "would produce", "observable", "setup",
+	"seeds", "seeded",
+}
+
+// counterfactualSentenceSplit reports whether r ends a sentence for the
+// mechanism scan. Bullet boundaries are covered by the newline case.
+func counterfactualSentenceSplit(r rune) bool {
+	return r == '.' || r == ';' || r == '\n' || r == '!' || r == '?'
+}
+
+// counterfactualOutcomeMarker reports whether a whole token names a RED/failing
+// outcome. Token-scoped on purpose: a substring match on "red" hits "required",
+// "predicted" and "reduce", which would make the rule fire on most plans.
+func counterfactualOutcomeMarker(tok string) bool {
+	switch {
+	case tok == "red", strings.HasPrefix(tok, "redden"):
+		return true
+	case strings.HasPrefix(tok, "fail"):
+		return true
+	}
+	return false
+}
+
+// counterfactualExcerptRunes bounds the quoted excerpt in a warning so the
+// plan_warnings payload stays small regardless of test_strategy length.
+const counterfactualExcerptRunes = 160
+
+// counterfactualWarningCap bounds how many mechanism warnings one plan can draw.
+// Past the cap a single suppression tail records the remainder.
+const counterfactualWarningCap = 5
+
+// counterfactualMechanismWarnings returns one advisory string per sentence of
+// strategy that makes a COUNTERFACTUAL CLAIM (it names a deletion AND a RED
+// outcome) while stating no MECHANISM in that sentence or the immediately
+// following one.
+//
+// Pure: it reads only its argument, so plan.Warnings' other advisories cannot
+// populate or suppress its output. An empty or whitespace-only strategy yields
+// nothing.
+func counterfactualMechanismWarnings(strategy string) []string {
+	if strings.TrimSpace(strategy) == "" {
+		return nil
+	}
+	sentences := strings.FieldsFunc(strategy, counterfactualSentenceSplit)
+	lowered := make([]string, len(sentences))
+	for i, sent := range sentences {
+		lowered[i] = strings.ToLower(sent)
+	}
+
+	var warns []string
+	suppressed := 0
+	for i, low := range lowered {
+		if !containsAnyPhrase(low, counterfactualDeletionMarkers) {
+			continue
+		}
+		hasOutcome := false
+		for _, tok := range strings.FieldsFunc(low, func(r rune) bool {
+			return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+		}) {
+			if counterfactualOutcomeMarker(tok) {
+				hasOutcome = true
+				break
+			}
+		}
+		if !hasOutcome {
+			continue
+		}
+		// The mechanism may be stated in the SAME sentence or carried into the
+		// next one ("... goes red. The fixture seeds ...").
+		if containsAnyPhrase(low, counterfactualMechanismMarkers) {
+			continue
+		}
+		if i+1 < len(lowered) && containsAnyPhrase(lowered[i+1], counterfactualMechanismMarkers) {
+			continue
+		}
+		if len(warns) >= counterfactualWarningCap {
+			suppressed++
+			continue
+		}
+		warns = append(warns, fmt.Sprintf(
+			"test_strategy states a counterfactual with NO stated mechanism: %q — name the fixture state that makes the deletion "+
+				"observable (what the test would produce if the control were absent), or construct an isolating case. If the fixture "+
+				"would produce the SAME observable outcome either way, the arm is not a control (%s; advisory)",
+			counterfactualExcerpt(sentences[i]), RuleCounterfactualMechanismMissing,
+		))
+	}
+	if suppressed > 0 {
+		warns = append(warns, fmt.Sprintf("(%d more %s warning(s) suppressed)", suppressed, RuleCounterfactualMechanismMissing))
+	}
+	return warns
+}
+
+// counterfactualExcerpt trims a sentence and truncates it rune-safely to
+// counterfactualExcerptRunes, so a multi-byte character is never split.
+func counterfactualExcerpt(sentence string) string {
+	trimmed := strings.TrimSpace(sentence)
+	runes := []rune(trimmed)
+	if len(runes) <= counterfactualExcerptRunes {
+		return trimmed
+	}
+	return string(runes[:counterfactualExcerptRunes]) + "…"
 }
 
 // schemaErrorFrom collects all leaf-level failures from a

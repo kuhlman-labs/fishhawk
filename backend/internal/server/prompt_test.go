@@ -9133,8 +9133,15 @@ func acceptancePlanArtifactContent(t *testing.T) json.RawMessage {
 			TestStrategy: "unit + integration",
 			RollbackPlan: "revert the PR",
 			AcceptanceCriteria: []plan.AcceptanceCriterion{
-				{ID: "ac-create", Statement: "POST /widgets returns 201", Source: plan.CriterionSourceExplicit, SourceRef: "#1534", Blocking: &blocking},
-				{ID: "ac-list", Statement: "GET /widgets lists widgets", Source: plan.CriterionSourceInferred, Rationale: "listing implied", Blocking: &blocking},
+				// E68.28 (#3057): each BLOCKING criterion carries a verify_hint
+				// naming the observable surface that DECIDES it. Without one the
+				// shared evaluator draws the blocking_criterion_undecided
+				// advisory, and TestAcceptanceSeam_ExampleDrivenHappyPath asserts
+				// this artifact is checked-and-clean.
+				{ID: "ac-create", Statement: "POST /widgets returns 201", Source: plan.CriterionSourceExplicit, SourceRef: "#1534", Blocking: &blocking,
+					VerifyHint: "POST /widgets returns 201 and the response body carries the created widget id"},
+				{ID: "ac-list", Statement: "GET /widgets lists widgets", Source: plan.CriterionSourceInferred, Rationale: "listing implied", Blocking: &blocking,
+					VerifyHint: "GET /widgets returns 200 and the response body lists the created widget"},
 			},
 			OutOfScope: []string{"deletion not covered"},
 		},

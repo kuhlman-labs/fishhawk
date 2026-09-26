@@ -3332,6 +3332,15 @@ func TestBuild_Plan_CounterfactualAttainabilityRule(t *testing.T) {
 		"proven EMPIRICALLY by running it under the deletion",
 		"Pair a malformed input with ITSELF",
 		"reachable in-test servers",
+		// E68.28 / #3057 clauses (5) mechanism-as-SETUP-obligation,
+		// (6) compile-failure-is-not-a-counterfactual, (7) masking guard.
+		planMechanismSetupClause,
+		"If the fixture would produce the SAME observable outcome either way, the arm is not a control",
+		"A mutation that stops COMPILATION is not a counterfactual",
+		"delete only the CALL SITES from the production path",
+		"Watch for a MASKING downstream guard",
+		"Construct a case that ISOLATES the control",
+		"counterfactual_mechanism_missing",
 	}
 	for _, w := range wants {
 		if !strings.Contains(got, w) {
@@ -3359,6 +3368,11 @@ func TestBuild_Implement_CounterfactualDiscipline_Rendered(t *testing.T) {
 		"Record the observed RED output",
 		"restore the file byte-identically",
 		"pair the malformed input with ITSELF",
+		// E68.28 / #3057 traps (d) fixture-masked deletion, (e) compile
+		// failure, (f) masking downstream guard.
+		implementMechanismSetupTrap,
+		"(e) a mutation that stops COMPILATION is not a counterfactual",
+		"(f) a MASKING downstream",
 	}
 	for _, w := range wants {
 		if !strings.Contains(got, w) {
@@ -3390,6 +3404,90 @@ func TestBuild_Implement_CounterfactualDiscipline_RenderedOnFixup(t *testing.T) 
 	}
 	if !strings.Contains(got, "A control you invent in THIS pass") {
 		t.Errorf("fix-up prompt must extend the discipline to controls invented in the fix-up pass\n---\n%s", got)
+	}
+	// E68.28 / #3057: the three new traps render on the fix-up path too — they
+	// ride writeCounterfactualDiscipline, which is deliberately NOT fix-up-exempt.
+	for _, want := range []string{
+		implementMechanismSetupTrap,
+		"(e) a mutation that stops COMPILATION is not a counterfactual",
+		"(f) a MASKING downstream",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("fix-up prompt missing counterfactual trap %q\n---\n%s", want, got)
+		}
+	}
+}
+
+// planMechanismSetupClause is the plan prompt's clause (5) — the mechanism
+// obligation phrased as a SETUP obligation (approval condition 1). Held as a
+// const so TestBuild_Plan_CounterfactualMechanismClause_AbsentFromImplementReview
+// can self-pair a PRESENCE and an ABSENCE over the SAME string.
+const planMechanismSetupClause = "state the fixture state that makes the deletion observable"
+
+// implementMechanismSetupTrap is trap (d) on the implement/fix-up path: the
+// fixture-masked deletion, stated as a pre-deletion setup obligation.
+const implementMechanismSetupTrap = "(d) a deletion the FIXTURE masks"
+
+// TestBuild_Plan_DecidingTestRule pins the E68.28 / #3057 acceptance-criteria
+// clause: a BLOCKING criterion must name the test or surface that DECIDES it, the
+// layer rule that routes sub-HTTP checks to the test suite, and the new advisory
+// rule by name. A comment-only no-op edit to prompt.go leaves this RED.
+func TestBuild_Plan_DecidingTestRule(t *testing.T) {
+	got, err := Build("plan", Trigger{
+		IssueNumber: 7,
+		IssueTitle:  "Plan a feature",
+		Repo:        "x/y",
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	wants := []string{
+		"Deciding-test rule",
+		"must name, in `verify_hint`, the test or observable surface that DECIDES it",
+		"Name which layer decides each criterion",
+		"Anything below the HTTP surface routes to the test suite and is not an acceptance criterion",
+		"decidable by neither is dropped or rewritten",
+		"never left blocking-and-undecidable",
+		"blocking_criterion_undecided",
+	}
+	for _, w := range wants {
+		if !strings.Contains(got, w) {
+			t.Errorf("plan prompt missing deciding-test rule string %q\n---\n%s", w, got)
+		}
+	}
+}
+
+// TestBuild_Plan_CounterfactualMechanismClause_AbsentFromImplementReview is the
+// SELF-PAIRED case over ONE clause constant: the mechanism obligation is PRESENT
+// on the plan prompt and the implement prompt (its two authoring surfaces) and
+// ABSENT from the implement-REVIEW prompt, which does not render
+// writeCounterfactualDiscipline. Pairing presence with absence over the same
+// string is what stops the absence half passing vacuously — a typo'd constant
+// reddens the presence half.
+func TestBuild_Plan_CounterfactualMechanismClause_AbsentFromImplementReview(t *testing.T) {
+	plan1, err := Build("plan", Trigger{IssueNumber: 7, IssueTitle: "Plan it", Repo: "x/y"})
+	if err != nil {
+		t.Fatalf("Build plan: %v", err)
+	}
+	if !strings.Contains(plan1, planMechanismSetupClause) {
+		t.Errorf("plan prompt missing %q", planMechanismSetupClause)
+	}
+
+	impl, err := Build("implement", Trigger{Repo: "o/r", IssueNumber: 42, ApprovedPlan: fixturePlan()})
+	if err != nil {
+		t.Fatalf("Build implement: %v", err)
+	}
+	if !strings.Contains(impl, implementMechanismSetupTrap) {
+		t.Errorf("implement prompt missing %q", implementMechanismSetupTrap)
+	}
+
+	review, err := Build("implement_review", Trigger{Repo: "o/r", IssueNumber: 42, ApprovedPlan: fixturePlan()})
+	if err != nil {
+		t.Fatalf("Build implement_review: %v", err)
+	}
+	if strings.Contains(review, implementMechanismSetupTrap) {
+		t.Errorf("implement_review prompt must NOT carry the implement-side counterfactual trap %q — "+
+			"writeCounterfactualDiscipline does not render on the review path\n---\n%s", implementMechanismSetupTrap, review)
 	}
 }
 
@@ -12326,6 +12424,20 @@ var groomingProseMarkers = []string{
 // paragraph's own presence on the plan prompt is pinned independently by
 // TestBuild_Plan_UnenforceableCriteriaGuidance, so this golden is a
 // no-other-drift pin rather than the primary evidence for it.
+//
+// REGENERATED A FIFTH TIME at E68.28 / #3057, which DELIBERATELY changed TWO
+// plan-prompt sections: the acceptance-criteria authoring section gained the
+// Deciding-test rule paragraph (immediately after the Undecidable-criteria rule),
+// and the Counterfactual attainability rule paragraph gained clauses (5) the
+// mechanism-as-SETUP obligation, (6) compile-failure-is-not-a-counterfactual and
+// (7) the masking-downstream-guard case, appended INSIDE the existing paragraph.
+// The regeneration is exactly TWO hunks — a single-line INSERTION for the new
+// paragraph and a single-line REPLACEMENT of the counterfactual paragraph (2
+// insertions / 1 deletion in the golden's diff) — and touched nothing else; both
+// anti-vacuity guards below still hold. Each section's own presence on the plan
+// prompt is pinned independently by TestBuild_Plan_DecidingTestRule and
+// TestBuild_Plan_CounterfactualAttainabilityRule, so this golden is a
+// no-other-drift pin rather than the primary evidence for either.
 //
 // Two anti-vacuity guards keep a wrongly-captured golden from passing:
 //   - the golden must contain NONE of groomingProseMarkers, so a golden

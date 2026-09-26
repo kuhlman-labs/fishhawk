@@ -434,10 +434,17 @@ func TestAcceptanceObservedBases(t *testing.T) {
 
 // (clean contract) A fully clean criteria set returns a NON-NIL empty slice, so
 // a payload can distinguish "checked and clean" ([]) from "never checked".
+//
+// E68.28 (#3057) tightened what "clean" MEANS: the blocking criterion a1 now
+// carries a verify_hint naming an observable surface, because a blocking
+// criterion with an EMPTY verify_hint draws the new blocking_criterion_undecided
+// advisory. The non-blocking a2 needs no hint — the rule is scoped to blocking
+// criteria.
 func TestEvaluateAcceptanceCriteria_CleanReturnsNonNilEmpty(t *testing.T) {
 	v := Verification{
 		AcceptanceCriteria: []AcceptanceCriterion{
-			{ID: "a1", Statement: "does a thing", Source: CriterionSourceExplicit, SourceRef: "#1", Blocking: ptrBool(true)},
+			{ID: "a1", Statement: "does a thing", Source: CriterionSourceExplicit, SourceRef: "#1", Blocking: ptrBool(true),
+				VerifyHint: "GET /v0/runs/{run_id} returns 200 and the body carries the field"},
 			{ID: "a2", Statement: "inferred one", Source: CriterionSourceInferred, Rationale: "derived from the issue", Blocking: ptrBool(false)},
 		},
 	}
@@ -3111,5 +3118,210 @@ func TestAcceptancePolarity_SentinelDoesNotConsumeAnchorWindowBudget(t *testing.
 	}
 	if got := findingsFor(EvaluateAcceptanceCriteria(v), RuleMissingLiveValidationMarker); len(got) != 1 {
 		t.Fatalf("a sentinel must not consume anchor-window budget (dropping an M2 anchor widens suppression); want 1 finding, got %d: %+v", len(got), got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// blocking_criterion_undecided (E68.28 / #3057)
+// ---------------------------------------------------------------------------
+
+// undecidedFixtureCriterion is the ISOLATING fixture for the new rule: ONE
+// criterion that is blocking (Blocking nil -> the schema default true),
+// source=inferred WITH a rationale, carrying a non-empty unique id and an EMPTY
+// verify_hint, whose statement deliberately avoids every capability / live-target
+// corpus phrase.
+//
+// That fixture state is what makes the control's deletion observable. Every OTHER
+// rule in the shared set is structurally unable to fire on it:
+// no_blocking_criterion needs NO blocking criterion (this one is blocking);
+// missing_source_ref needs source=explicit; missing_rationale needs an absent
+// rationale; empty_id/duplicate_id need an empty or repeated id;
+// undecidable_criterion and missing_live_validation_marker need corpus phrases
+// the statement avoids; criterion_restates_test and no_observable_criterion are
+// silent on an EMPTY verify_hint by construction; all_criteria_skip_expected
+// needs the all-skip shape. So with BlockingUndecidedCriteria's append deleted
+// from EvaluateAcceptanceCriteria the findings slice is EMPTY and the
+// exactly-one-finding assertions below fail BEHAVIOURALLY, not on fixture setup.
+func undecidedFixtureCriterion() AcceptanceCriterion {
+	return AcceptanceCriterion{
+		ID:        "payload-carries-advisory",
+		Statement: "the persisted plan gate payload carries the new advisory entry",
+		Source:    CriterionSourceInferred,
+		Rationale: "derived from the issue's done-means",
+	}
+}
+
+// (rule: blocking_criterion_undecided) FIRE: a blocking criterion with an EMPTY
+// verify_hint names no deciding test or surface at all.
+func TestEvaluateAcceptanceCriteria_BlockingCriterionUndecided(t *testing.T) {
+	v := Verification{AcceptanceCriteria: []AcceptanceCriterion{undecidedFixtureCriterion()}}
+
+	findings := EvaluateAcceptanceCriteria(v)
+	if len(findings) != 1 {
+		t.Fatalf("findings = %+v, want exactly 1 (the new rule; the fixture can draw no other)", findings)
+	}
+	f := findings[0]
+	if f.Rule != RuleBlockingCriterionUndecided {
+		t.Fatalf("findings[0].Rule = %q, want %q", f.Rule, RuleBlockingCriterionUndecided)
+	}
+	if f.CriterionID != "payload-carries-advisory" {
+		t.Errorf("CriterionID = %q, want the criterion's id", f.CriterionID)
+	}
+	for _, want := range []string{"EMPTY verify_hint", "blocking: false", "requires_live_validation: true", "advisory"} {
+		if !strings.Contains(f.Detail, want) {
+			t.Errorf("Detail %q must name %q", f.Detail, want)
+		}
+	}
+}
+
+// (rule: blocking_criterion_undecided) DISCRIMINATION CONTROL: the SAME criterion
+// marked requires_live_validation + skip_expected + expectation_basis + a
+// verify_hint draws ZERO findings of the new rule — exempt twice over. Without
+// this case a rule that fired on every blocking criterion would pass the fire
+// case above.
+func TestEvaluateAcceptanceCriteria_BlockingCriterionUndecided_ExemptWhenLiveValidationMarked(t *testing.T) {
+	c := undecidedFixtureCriterion()
+	c.RequiresLiveValidation = true
+	c.SkipExpected = true
+	c.ExpectationBasis = "covered by the integration test with a fake forge"
+	c.VerifyHint = "GET /v0/runs/{run_id}/audit carries an entry of category plan_acceptance_precheck"
+
+	findings := EvaluateAcceptanceCriteria(Verification{AcceptanceCriteria: []AcceptanceCriterion{c}})
+	if f := findingFor(findings, RuleBlockingCriterionUndecided); f != nil {
+		t.Fatalf("want no %s finding for a declared live-validation criterion; got %+v", RuleBlockingCriterionUndecided, *f)
+	}
+}
+
+// (rule: blocking_criterion_undecided) CONDITION 4: the exact shape of THIS
+// change's own acceptance criterion 6 — skip_expected: true paired with an
+// expectation_basis and NO verify_hint — must NOT be flagged. The exemption is
+// criterionDeclaresUnevaluable, the same predicate undecidable_criterion uses, so
+// the skip-with-basis declaration alone clears the rule with no hint present.
+func TestEvaluateAcceptanceCriteria_BlockingCriterionUndecided_ExemptWhenSkipExpectedWithBasis(t *testing.T) {
+	c := undecidedFixtureCriterion()
+	c.SkipExpected = true
+	c.ExpectationBasis = "covered by the offline agenteval containment gate"
+	// VerifyHint deliberately left EMPTY: the declaration, not a hint, is the exemption.
+
+	findings := EvaluateAcceptanceCriteria(Verification{AcceptanceCriteria: []AcceptanceCriterion{c}})
+	if f := findingFor(findings, RuleBlockingCriterionUndecided); f != nil {
+		t.Fatalf("a skip_expected-with-basis criterion carrying NO verify_hint must be exempt; got %+v", *f)
+	}
+}
+
+// (rule: blocking_criterion_undecided) SILENCE TABLE: one case per no-fire branch.
+func TestEvaluateAcceptanceCriteria_BlockingCriterionUndecided_SilenceTable(t *testing.T) {
+	cases := []struct {
+		name  string
+		mutir func(*AcceptanceCriterion)
+	}{
+		{
+			name:  "non_blocking_criterion",
+			mutir: func(c *AcceptanceCriterion) { c.Blocking = ptrBool(false) },
+		},
+		{
+			name:  "verify_hint_present",
+			mutir: func(c *AcceptanceCriterion) { c.VerifyHint = "GET /v0/runs/{run_id} returns 200 with the field set" },
+		},
+		{
+			name: "skip_expected_with_basis",
+			mutir: func(c *AcceptanceCriterion) {
+				c.SkipExpected = true
+				c.ExpectationBasis = "covered by the integration test"
+			},
+		},
+		{
+			name:  "requires_live_validation",
+			mutir: func(c *AcceptanceCriterion) { c.RequiresLiveValidation = true },
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := undecidedFixtureCriterion()
+			tc.mutir(&c)
+			findings := EvaluateAcceptanceCriteria(Verification{AcceptanceCriteria: []AcceptanceCriterion{c}})
+			if f := findingFor(findings, RuleBlockingCriterionUndecided); f != nil {
+				t.Fatalf("want no %s finding; got %+v", RuleBlockingCriterionUndecided, *f)
+			}
+		})
+	}
+}
+
+// (rule: blocking_criterion_undecided) A WHITESPACE-ONLY verify_hint FIRES — a
+// hint of spaces names no deciding test either.
+func TestEvaluateAcceptanceCriteria_BlockingCriterionUndecided_WhitespaceHintFires(t *testing.T) {
+	c := undecidedFixtureCriterion()
+	c.VerifyHint = "   \t\n "
+
+	findings := BlockingUndecidedCriteria(Verification{AcceptanceCriteria: []AcceptanceCriterion{c}})
+	if len(findings) != 1 {
+		t.Fatalf("findings = %+v, want 1 — a whitespace-only hint is not a deciding test", findings)
+	}
+}
+
+// (rule: blocking_criterion_undecided) Findings come out in CRITERIA ORDER, and
+// an exempt criterion between two flagged ones does not perturb it.
+func TestEvaluateAcceptanceCriteria_BlockingCriterionUndecided_CriteriaOrder(t *testing.T) {
+	first := undecidedFixtureCriterion()
+	first.ID = "first"
+	exempt := undecidedFixtureCriterion()
+	exempt.ID = "middle"
+	exempt.VerifyHint = "GET /v0/runs/{run_id} returns 200"
+	third := undecidedFixtureCriterion()
+	third.ID = "third"
+
+	findings := BlockingUndecidedCriteria(Verification{AcceptanceCriteria: []AcceptanceCriterion{first, exempt, third}})
+	var ids []string
+	for _, f := range findings {
+		ids = append(ids, f.CriterionID)
+	}
+	if !slices.Equal(ids, []string{"first", "third"}) {
+		t.Fatalf("flagged ids = %v, want [first third] in criteria order", ids)
+	}
+}
+
+// (rule: blocking_criterion_undecided) BlockingUndecidedCriteria returns a NON-NIL
+// empty slice when nothing is flagged — the "checked and clean" contract every
+// rule in this file shares.
+func TestBlockingUndecidedCriteria_NonNilWhenClean(t *testing.T) {
+	if got := BlockingUndecidedCriteria(Verification{}); got == nil {
+		t.Fatal("BlockingUndecidedCriteria returned nil; want a non-nil empty slice")
+	}
+}
+
+// TestEvaluateAcceptanceCriteria_BlockingCriterionUndecided_IntakeInert is the
+// SELF-PAIRED intake-inertness pin, held HERE rather than in
+// backend/internal/refinement per approval condition 2 (the plan package cannot
+// import refinement — refinement imports plan).
+//
+// It pins the OPERATOR DECISION taken at implement time on scope amendment
+// 731a8dab, which SUPERSEDES the approved plan's step 8: the rule must be
+// INTAKE-INERT rather than firing-but-advisory there.
+//
+// The intake arm reproduces refinement.EvaluateDraftCriteria's mapping exactly —
+// criterion text becomes BOTH the ID and the Statement, Blocking is left nil
+// (schema default true), Source is left EMPTY, and there is no verify_hint — and
+// asserts NO finding. The plan arm is the same criterion with only a Source set,
+// and asserts the rule STILL fires; pairing the two over one difference is what
+// stops the inert half passing vacuously (a rule broken outright would redden the
+// plan arm).
+func TestEvaluateAcceptanceCriteria_BlockingCriterionUndecided_IntakeInert(t *testing.T) {
+	const text = "the run reaches the review gate"
+
+	// INTAKE shape: no Source, no verify_hint, blocking by default.
+	intake := Verification{AcceptanceCriteria: []AcceptanceCriterion{{ID: text, Statement: text}}}
+	if f := findingFor(EvaluateAcceptanceCriteria(intake), RuleBlockingCriterionUndecided); f != nil {
+		t.Fatalf("the refinement intake shape (empty source, no verify_hint) must draw NO %s — intake never sets a "+
+			"verify_hint, so a rule firing there fires on 100%% of drafts by construction; got %+v",
+			RuleBlockingCriterionUndecided, *f)
+	}
+
+	// PLAN shape: the SAME criterion with only a source set.
+	planShaped := Verification{AcceptanceCriteria: []AcceptanceCriterion{{
+		ID: text, Statement: text, Source: CriterionSourceInferred, Rationale: "derived from the issue",
+	}}}
+	if f := findingFor(EvaluateAcceptanceCriteria(planShaped), RuleBlockingCriterionUndecided); f == nil {
+		t.Fatalf("a plan-shaped criterion (source set, no verify_hint) must still draw %s; got %+v",
+			RuleBlockingCriterionUndecided, EvaluateAcceptanceCriteria(planShaped))
 	}
 }

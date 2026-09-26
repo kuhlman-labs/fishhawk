@@ -297,10 +297,16 @@ func TestAcceptancePrecheck_DuplicateID_Flags(t *testing.T) {
 
 // (8) Fully clean criteria -> entry with findings: [] (checked-and-clean
 // distinguishable from never-checked), and the [] not null contract.
+//
+// E68.28 (#3057) tightened what "clean" MEANS: the blocking a1 now carries a
+// verify_hint naming an observable surface, because a blocking criterion with an
+// EMPTY verify_hint draws the new blocking_criterion_undecided advisory. The
+// non-blocking a2 needs no hint — the rule is scoped to blocking criteria.
 func TestAcceptancePrecheck_CleanCriteria_EmptyFindings(t *testing.T) {
 	s, au, runRow := newAcceptancePrecheckServer(t, specWithAcceptanceStage)
 	body := acceptancePlanBody(t, []map[string]any{
-		{"id": "a1", "statement": "does a thing", "source": "explicit", "source_ref": "#1", "blocking": true},
+		{"id": "a1", "statement": "does a thing", "source": "explicit", "source_ref": "#1", "blocking": true,
+			"verify_hint": "GET /v0/runs/{run_id} returns 200 and the body carries the field"},
 		{"id": "a2", "statement": "inferred one", "source": "inferred", "rationale": "derived from the issue", "blocking": false},
 	}, nil)
 
@@ -1577,5 +1583,107 @@ func TestShipPlan_AbsenceAssertionCriterionNotFlagged(t *testing.T) {
 	}
 	if entry.LiveValidationMarkerCount != 1 {
 		t.Errorf("persisted live_validation_marker_count = %d, want 1\nfindings: %+v", entry.LiveValidationMarkerCount, entry.Findings)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// E68.28 / #3057 — blocking_criterion_undecided, CROSS-LAYER seam
+// ---------------------------------------------------------------------------
+
+// undecidedHintCriterion is a BLOCKING criterion with NO verify_hint whose
+// statement avoids every capability / live-target corpus phrase, so the only rule
+// that can fire on it is blocking_criterion_undecided.
+func undecidedHintCriterion(id, statement string) map[string]any {
+	return map[string]any{
+		"id":          id,
+		"statement":   statement,
+		"source":      "inferred",
+		"rationale":   "derived from the issue's done-means",
+		"verify_hint": "",
+	}
+}
+
+// TestAcceptancePrecheck_BlockingCriterionUndecided_ReachesAuditAndReviewPrompt is
+// the CROSS-BOUNDARY integration test the Cross-boundary test rule requires: the
+// scope spans the plan artifact, the shared plan-package evaluator, audit
+// persistence, and prompt rendering, and per-layer units would each pass while
+// that seam broke.
+//
+// It asserts the new rule string reaches BOTH the persisted
+// plan_acceptance_precheck audit payload AND the rendered plan-review prompt's
+// gate-evidence section. The prompt half also pins the deliberate design choice
+// that NO per-rule prompt wiring was added: an unrecognised Rule renders through
+// writePlanGateEvidence's GENERIC `- FINDING <rule> (criterion: <id>): <detail>`
+// line.
+func TestAcceptancePrecheck_BlockingCriterionUndecided_ReachesAuditAndReviewPrompt(t *testing.T) {
+	s, au, runRow := newAcceptancePrecheckServer(t, specWithAcceptanceStage)
+	body := acceptancePlanBody(t, []map[string]any{
+		undecidedHintCriterion("payload-carries-advisory", "the persisted plan gate payload carries the new advisory entry"),
+	}, nil)
+
+	result := s.runAcceptancePrecheck(context.Background(), runRow.ID, runRow.ID, body)
+	if result == nil {
+		t.Fatal("want a non-nil pre-check result")
+	}
+
+	// Layer 1 — the PERSISTED audit payload the approver reads.
+	entry := lastAcceptancePrecheckEntry(t, au)
+	f := hasAcceptanceFinding(entry, acceptanceRuleBlockingCriterionUndecided)
+	if f == nil {
+		t.Fatalf("persisted plan_acceptance_precheck payload carries no %s finding; findings = %+v",
+			acceptanceRuleBlockingCriterionUndecided, entry.Findings)
+	}
+	if f.CriterionID != "payload-carries-advisory" {
+		t.Errorf("finding CriterionID = %q, want the criterion's id", f.CriterionID)
+	}
+
+	// Layer 2 — the RENDERED plan-review prompt's gate-evidence section.
+	gateEv := planGateEvidence(nil, nil, nil, nil, result)
+	if gateEv == nil {
+		t.Fatal("planGateEvidence produced no evidence")
+	}
+	got, err := prompt.Build("plan_review", prompt.Trigger{
+		Repo:             "kuhlman-labs/example",
+		PlanGateEvidence: gateEv,
+	})
+	if err != nil {
+		t.Fatalf("prompt.Build: %v", err)
+	}
+	const wantLine = "- FINDING blocking_criterion_undecided (criterion: payload-carries-advisory): blocking acceptance criterion carries an EMPTY verify_hint"
+	if !strings.Contains(got, wantLine) {
+		t.Errorf("rendered plan_review prompt missing %q — a seam between the shared evaluator, the pre-check payload and the render is broken:\n%s",
+			wantLine, got)
+	}
+}
+
+// TestAcceptancePrecheck_BlockingCriterionUndecided_NegativeTwin is the seam's
+// NEGATIVE TWIN: the byte-identical criterion carrying a verify_hint that names an
+// observable surface reaches NEITHER layer. Without it the positive case above
+// would pass for a rule that fired on every blocking criterion.
+func TestAcceptancePrecheck_BlockingCriterionUndecided_NegativeTwin(t *testing.T) {
+	s, au, runRow := newAcceptancePrecheckServer(t, specWithAcceptanceStage)
+	crit := undecidedHintCriterion("payload-carries-advisory", "the persisted plan gate payload carries the new advisory entry")
+	crit["verify_hint"] = "GET /v0/runs/{run_id}/audit carries an entry of category plan_acceptance_precheck"
+	body := acceptancePlanBody(t, []map[string]any{crit}, nil)
+
+	result := s.runAcceptancePrecheck(context.Background(), runRow.ID, runRow.ID, body)
+	if result == nil {
+		t.Fatal("want a non-nil pre-check result")
+	}
+	entry := lastAcceptancePrecheckEntry(t, au)
+	if f := hasAcceptanceFinding(entry, acceptanceRuleBlockingCriterionUndecided); f != nil {
+		t.Fatalf("a criterion naming its deciding surface must draw no %s finding; got %+v",
+			acceptanceRuleBlockingCriterionUndecided, *f)
+	}
+	gateEv := planGateEvidence(nil, nil, nil, nil, result)
+	got, err := prompt.Build("plan_review", prompt.Trigger{
+		Repo:             "kuhlman-labs/example",
+		PlanGateEvidence: gateEv,
+	})
+	if err != nil {
+		t.Fatalf("prompt.Build: %v", err)
+	}
+	if strings.Contains(got, "blocking_criterion_undecided") {
+		t.Errorf("rendered plan_review prompt must not name the rule for a criterion naming its deciding surface:\n%s", got)
 	}
 }

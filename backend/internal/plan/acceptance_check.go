@@ -147,6 +147,49 @@ const (
 	// the answer). Those are the only two cross-rule suppressions this file
 	// applies.
 	RuleNoObservableCriterion = "no_observable_criterion"
+	// RuleBlockingCriterionUndecided flags a BLOCKING criterion that names no
+	// deciding test or observable surface AT ALL — an EMPTY verify_hint — and
+	// carries no sanctioned skip declaration (E68.28 / #3057).
+	//
+	// What it is NOT a duplicate of: criterion_restates_test fires on POSITIVE
+	// test-only evidence in verify_hint and is deliberately SILENT on an empty
+	// hint (the rule is conservative by construction). So the ABSENCE case — a
+	// blocking criterion that names nothing, which no planned test and no
+	// localhost-preview surface can be shown to decide — was unguarded by every
+	// rule in this file. This rule closes exactly that gap and nothing wider: it
+	// says nothing about the QUALITY of a non-empty hint, which the sibling rule
+	// owns.
+	//
+	// EXEMPT twice over: a non-blocking criterion (the gate it would open is
+	// advisory anyway), and a criterion carrying the sanctioned declaration
+	// criterionDeclaresUnevaluable recognises — skip_expected with an
+	// expectation_basis, or requires_live_validation. The shared exemption
+	// predicate is deliberately reused rather than re-spelled, so a criterion
+	// exempt from undecidable_criterion is exempt here by the same one idea.
+	//
+	// A THIRD exemption makes the rule INTAKE-INERT: a criterion with an EMPTY
+	// source is never flagged. `source` is a REQUIRED schema enum
+	// (explicit|inferred), so every criterion on a schema-valid plan carries one
+	// and the real gate is unaffected; refinement.EvaluateDraftCriteria's intake
+	// mapping deliberately leaves Source empty, so the rule cannot fire on a
+	// draft — by construction, exactly the way the provenance rules
+	// (missing_source_ref / missing_rationale) are inert there.
+	//
+	// That is an OPERATOR DECISION taken at implement time (E68.28 / #3057),
+	// SUPERSEDING the approved plan's step 8, which had accepted the rule firing
+	// on every intake child as advisory noise: intake NEVER sets verify_hint, so a
+	// rule firing there fires on 100% of drafts by construction, which is noise
+	// that teaches operators to ignore it — and it would have made the intake
+	// preview's checked-and-clean contract (a clean draft renders findings as [])
+	// structurally unreachable.
+	//
+	// ADVISORY and never refuses a plan. RESIDUALS, stated rather than glossed:
+	// (1) it is cleared by ANY non-empty verify_hint, however uninformative — the
+	// plan prompt's Deciding-test rule is the prevention, this is the reviewer's
+	// prompt to trace one; (2) it fires on a large fraction of legacy plans, whose
+	// criteria commonly carry no verify_hint. That is the intended signal, not
+	// noise: such a criterion genuinely names nothing that decides it.
+	RuleBlockingCriterionUndecided = "blocking_criterion_undecided"
 )
 
 // EvaluateAcceptanceCriteria runs the deterministic acceptance-criteria rules
@@ -198,6 +241,11 @@ const (
 //   - no_observable_criterion — PLAN-LEVEL: at least one criterion, not
 //     all-skip, no acceptance_surface: none, and every criterion is a declared
 //     skip or restates a test (E72.1 / #3325). One finding per plan. Advisory.
+//   - blocking_criterion_undecided — a BLOCKING criterion with a non-empty
+//     source, an EMPTY verify_hint and no sanctioned skip declaration: it names
+//     no deciding test or surface at all (E68.28 / #3057). The ABSENCE case
+//     criterion_restates_test deliberately leaves unguarded. The source conjunct
+//     makes it INTAKE-INERT, like the provenance rules. Advisory only.
 //   - all_criteria_skip_expected — the plan declares at least one acceptance
 //     criterion and EVERY one is skip_expected-with-basis, so acceptance will
 //     short-circuit to not_validated having verified ZERO criteria (#3026).
@@ -268,6 +316,12 @@ func EvaluateAcceptanceCriteria(v Verification) []AcceptanceFinding {
 	findings = append(findings, restates...)
 	findings = append(findings, noObservableCriterion(v, restates)...)
 
+	// E68.28 (#3057): the empty-hint absence rule rides the SAME call, for the
+	// same single-source reason — the plan gate and refinement intake get it from
+	// one evaluator. It is the complement of the pair just above: those fire on
+	// POSITIVE test-only evidence, this on the absence of any evidence.
+	findings = append(findings, BlockingUndecidedCriteria(v)...)
+
 	// #3026 (E32.50): the all-skip short-circuit advisory rides the same call,
 	// for the same single-source reason. It is PLAN-LEVEL, so it emits at most
 	// ONE finding with an empty CriterionID — the shape no_blocking_criterion
@@ -297,6 +351,50 @@ func EvaluateAcceptanceCriteria(v Verification) []AcceptanceFinding {
 // blocking is true, matching the AcceptanceCriterion.Blocking pointer contract.
 func CriterionBlocking(c AcceptanceCriterion) bool {
 	return c.Blocking == nil || *c.Blocking
+}
+
+// blockingCriterionUndecidedDetail is the blocking_criterion_undecided finding's
+// Detail, a const so the audit-payload bytes have one source.
+const blockingCriterionUndecidedDetail = "blocking acceptance criterion carries an EMPTY verify_hint, so it names no test and no " +
+	"observable surface that DECIDES it — nothing returns pass or fail for this gate. Name the deciding test or surface in verify_hint; " +
+	"or downgrade it to blocking: false; or, when its true verification needs a live external target, mark requires_live_validation: true " +
+	"paired with skip_expected: true and an expectation_basis. This finding is advisory and never refuses the plan"
+
+// BlockingUndecidedCriteria returns one blocking_criterion_undecided finding per
+// BLOCKING criterion that carries no sanctioned skip declaration and an EMPTY
+// (or whitespace-only) verify_hint — see RuleBlockingCriterionUndecided for what
+// the rule is and is not.
+//
+// Whitespace-only is treated as empty on purpose: a hint of spaces names no
+// deciding test either.
+//
+// ADVISORY ONLY. Returns a non-nil empty slice when nothing is flagged; findings
+// come out in criteria order.
+func BlockingUndecidedCriteria(v Verification) []AcceptanceFinding {
+	findings := []AcceptanceFinding{}
+	for _, c := range v.AcceptanceCriteria {
+		if !CriterionBlocking(c) {
+			continue
+		}
+		if criterionDeclaresUnevaluable(c) {
+			continue
+		}
+		// INTAKE-INERT (operator decision, E68.28 / #3057): an EMPTY source is
+		// the refinement intake shape, where no verify_hint can exist. `source`
+		// is a required schema enum, so a real plan criterion always has one.
+		if strings.TrimSpace(string(c.Source)) == "" {
+			continue
+		}
+		if strings.TrimSpace(c.VerifyHint) != "" {
+			continue
+		}
+		findings = append(findings, AcceptanceFinding{
+			Rule:        RuleBlockingCriterionUndecided,
+			CriterionID: c.ID,
+			Detail:      blockingCriterionUndecidedDetail,
+		})
+	}
+	return findings
 }
 
 // AcceptanceSkippableOutOfScope reports whether a plan's verification declares

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -14,6 +15,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"gopkg.in/yaml.v3"
 
@@ -2514,5 +2516,157 @@ func TestParse_AcceptanceSurfaceNone_Fixture(t *testing.T) {
 		if f.Rule == plan.RuleAllCriteriaSkipExpected || f.Rule == plan.RuleNoObservableCriterion {
 			t.Errorf("fixture must not draw %s; got %+v", f.Rule, f)
 		}
+	}
+}
+
+// --- counterfactual_mechanism_missing (E68.28 / #3057) ---
+
+// mechanismPlan builds the MINIMAL Plan the mechanism advisory reads: a
+// test_strategy and a predicted_runtime_minutes ABOVE
+// expensiveTestRuntimeThreshold, with NO decomposition.
+//
+// That fixture state is what makes the counterfactual below observable: every
+// OTHER advisory in plan.Warnings is structurally unable to fire on it — the two
+// decomposition advisories need a non-nil decomposition, and the expensive-gate
+// advisory needs predicted_runtime_minutes BELOW the threshold — so the returned
+// slice is EMPTY unless the mechanism rule populates it. With the rule's call
+// deleted from Warnings the count assertions below fail on the returned value,
+// not on fixture setup.
+func mechanismPlan(strategy string) *plan.Plan {
+	return &plan.Plan{
+		Verification:            plan.Verification{TestStrategy: strategy},
+		PredictedRuntimeMinutes: 45,
+	}
+}
+
+// mechanismWarnings filters plan.Warnings down to the mechanism rule's strings.
+func mechanismWarnings(warns []string) []string {
+	var out []string
+	for _, w := range warns {
+		if strings.Contains(w, plan.RuleCounterfactualMechanismMissing) {
+			out = append(out, w)
+		}
+	}
+	return out
+}
+
+// TestWarnings_CounterfactualMechanismMissing_Fires is the FIRE case: a
+// test_strategy sentence naming a deletion AND a RED outcome with no mechanism
+// stated draws exactly one warning, which quotes the offending sentence.
+func TestWarnings_CounterfactualMechanismMissing_Fires(t *testing.T) {
+	p := mechanismPlan("Delete the VersionMajor gate and TestStageBudget_V0 goes red")
+
+	warns := plan.Warnings(p)
+	if len(warns) != 1 {
+		t.Fatalf("Warnings = %v, want exactly 1 (the mechanism advisory; the fixture can draw no other)", warns)
+	}
+	got := warns[0]
+	if !strings.Contains(got, plan.RuleCounterfactualMechanismMissing) {
+		t.Errorf("warning %q must name the rule %q", got, plan.RuleCounterfactualMechanismMissing)
+	}
+	if !strings.Contains(got, "Delete the VersionMajor gate and TestStageBudget_V0 goes red") {
+		t.Errorf("warning %q must quote the offending sentence", got)
+	}
+	if !strings.Contains(got, "fixture state that makes the deletion") {
+		t.Errorf("warning %q must name the SETUP remedy (state the fixture state)", got)
+	}
+}
+
+// TestWarnings_CounterfactualMechanismMissing_SilentWhenMechanismStated is the
+// DISCRIMINATION CONTROL the issue demands: the byte-identical claim whose
+// sentence ALSO states the isolating mechanism draws ZERO warnings. Without this
+// case a rule that fired on every plan would pass the fire case above.
+//
+// Its 'because' clause is deliberately a REAL one; the documented residual is
+// that a HOLLOW one clears the rule just as well (the rule is lexical), which the
+// vacuous-clause case below pins explicitly.
+func TestWarnings_CounterfactualMechanismMissing_SilentWhenMechanismStated(t *testing.T) {
+	p := mechanismPlan("Delete the VersionMajor gate and TestStageBudget_V0 goes red because the v0 fixture declares a " +
+		"positive limit_usd, so the version gate is the only guard in the path")
+
+	warns := plan.Warnings(p)
+	if len(warns) != 0 {
+		t.Fatalf("Warnings = %v, want none — a stated mechanism must clear the advisory", warns)
+	}
+}
+
+// TestWarnings_CounterfactualMechanismMissing_VacuousMechanismAlsoClears pins the
+// DOCUMENTED RESIDUAL rather than glossing it: the rule is LEXICAL, so a hollow
+// 'because' clause clears it. If this test ever goes red the rule has become
+// semantic and the residual recorded in RuleCounterfactualMechanismMissing's doc
+// comment, both READMEs and docs/spec/plan-standard-v1.md must be corrected.
+func TestWarnings_CounterfactualMechanismMissing_VacuousMechanismAlsoClears(t *testing.T) {
+	p := mechanismPlan("Delete the gate and the test goes red because it does")
+
+	if warns := plan.Warnings(p); len(warns) != 0 {
+		t.Fatalf("Warnings = %v, want none — the rule is lexical and a vacuous mechanism clause clears it (documented residual)", warns)
+	}
+}
+
+// TestWarnings_CounterfactualMechanismMissing_FollowingSentenceMechanism: the
+// mechanism may be carried into the IMMEDIATELY FOLLOWING sentence.
+func TestWarnings_CounterfactualMechanismMissing_FollowingSentenceMechanism(t *testing.T) {
+	p := mechanismPlan("Delete the append and TestFoo goes red. The fixture seeds one blocking criterion so no sibling rule can fire")
+
+	if warns := mechanismWarnings(plan.Warnings(p)); len(warns) != 0 {
+		t.Fatalf("mechanism warnings = %v, want none — a mechanism in the NEXT sentence clears the claim", warns)
+	}
+}
+
+// TestWarnings_CounterfactualMechanismMissing_SilenceTable covers the degrade /
+// no-fire branches one case each (the per-failure-mode rule).
+func TestWarnings_CounterfactualMechanismMissing_SilenceTable(t *testing.T) {
+	cases := []struct {
+		name     string
+		strategy string
+	}{
+		{name: "empty", strategy: ""},
+		{name: "whitespace_only", strategy: "   \n\t "},
+		{name: "deletion_without_outcome", strategy: "Delete the helper and restore it byte-identically"},
+		{name: "outcome_without_deletion", strategy: "TestFoo fails when the payload is malformed"},
+		{name: "red_substring_not_a_token", strategy: "Delete the gate; the required predicted value is reduced"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if warns := mechanismWarnings(plan.Warnings(mechanismPlan(tc.strategy))); len(warns) != 0 {
+				t.Errorf("mechanism warnings = %v, want none for strategy %q", warns, tc.strategy)
+			}
+		})
+	}
+}
+
+// TestWarnings_CounterfactualMechanismMissing_CapAndSuppressionTail: past the cap
+// the payload stays bounded and records the remainder in ONE tail string.
+func TestWarnings_CounterfactualMechanismMissing_CapAndSuppressionTail(t *testing.T) {
+	var sb strings.Builder
+	const claims = 8
+	for i := 0; i < claims; i++ {
+		fmt.Fprintf(&sb, "Delete control %d and its test goes red. ", i)
+	}
+	warns := mechanismWarnings(plan.Warnings(mechanismPlan(sb.String())))
+	// 5 capped warnings + 1 suppression tail.
+	if len(warns) != 6 {
+		t.Fatalf("mechanism warnings = %d (%v), want 5 capped + 1 suppression tail", len(warns), warns)
+	}
+	tail := warns[len(warns)-1]
+	if !strings.Contains(tail, "3 more") {
+		t.Errorf("suppression tail %q must name the 3 suppressed warnings", tail)
+	}
+}
+
+// TestWarnings_CounterfactualMechanismMissing_RuneSafeTruncation: an over-long
+// sentence is truncated WITHOUT splitting a multi-byte rune.
+func TestWarnings_CounterfactualMechanismMissing_RuneSafeTruncation(t *testing.T) {
+	// 200 multi-byte runes, then the markers, so truncation lands mid-run.
+	long := "Delete " + strings.Repeat("é", 200) + " and it goes red"
+	warns := mechanismWarnings(plan.Warnings(mechanismPlan(long)))
+	if len(warns) != 1 {
+		t.Fatalf("mechanism warnings = %v, want 1", warns)
+	}
+	if !utf8.ValidString(warns[0]) {
+		t.Errorf("warning is not valid UTF-8 — truncation split a rune: %q", warns[0])
+	}
+	if !strings.Contains(warns[0], "…") {
+		t.Errorf("warning %q must carry the truncation ellipsis", warns[0])
 	}
 }
