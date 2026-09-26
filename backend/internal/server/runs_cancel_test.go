@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -184,5 +185,41 @@ func TestCancelRun_NoRetirements_NoDropRow(t *testing.T) {
 	}
 	if n := len(c.dropRows()); n != 0 {
 		t.Errorf("drop rows = %d, want 0", n)
+	}
+}
+
+// TestCancelRun_SweepsRunBranches drives the REAL handleCancelRun on a
+// decomposed parent against an httptest GitHub behind a real githubclient
+// (E68.67 / #3562): the consolidated branch and the SLASHED slice branch are
+// DELETEd on their hierarchical ref paths after the response, and the
+// detached sweep persists one run_branches_swept row.
+func TestCancelRun_SweepsRunBranches(t *testing.T) {
+	inst := int64(42)
+	parent := &run.Run{ID: sweepRunID, Repo: "x/y", State: run.StateRunning, InstallationID: &inst}
+	rr := &prEventsRunRepo{
+		listResult:       []*run.Run{parent},
+		decomposedResult: []*run.Run{childRun(intp(0))},
+	}
+	ar := &prEventsAuditRepo{}
+	gh, client := newGitHubSweepStub(t, sweepConsol, sweepSlice0, "main")
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: ar, GitHub: client})
+
+	if w := cancelRun(t, s, parent.ID); w.Code != http.StatusOK {
+		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+	}
+	s.waitBranchSweeps()
+
+	want := []string{
+		"/repos/x/y/git/refs/heads/" + sweepConsol,
+		"/repos/x/y/git/refs/heads/fishhawk/run-11111111/slice-0",
+	}
+	if got := gh.deletePaths(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("DELETE paths = %v, want %v", got, want)
+	}
+	ar.mu.Lock()
+	row := sweptAuditRow(t, ar.appended)
+	ar.mu.Unlock()
+	if row.Trigger != sweepTriggerCancelled || !reflect.DeepEqual(row.Deleted, []string{sweepConsol, sweepSlice0}) {
+		t.Errorf("run_branches_swept = %+v", row)
 	}
 }

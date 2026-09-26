@@ -4,9 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -2209,4 +2212,64 @@ func findReviewStageID(t *testing.T, rr *orchestratorRepo, runID uuid.UUID) uuid
 	}
 	t.Fatalf("no review stage on run %s", runID)
 	return uuid.Nil
+}
+
+// TestResolveReviewStageOnMerge_SweepsRunBranches drives the REAL merge
+// resolution against an httptest GitHub behind a real githubclient wrapped by
+// forgegithub.New (E68.67 / #3562): the stage branch that exists is DELETEd on
+// its slash-preserving ref path, the absent one is classified already_absent,
+// and a redelivered merge re-sweeps idempotently (every ref already_absent,
+// no second DELETE, no error).
+func TestResolveReviewStageOnMerge_SweepsRunBranches(t *testing.T) {
+	implID, reviewID := uuid.New(), uuid.New()
+	prURL := "https://github.com/x/y/pull/42"
+	inst := int64(42)
+	target := &run.Run{ID: sweepRunID, Repo: "x/y", State: run.StateRunning, PullRequestURL: &prURL, InstallationID: &inst}
+	implBranch := fmt.Sprintf("fishhawk/run-%s/stage-%s", shortID(sweepRunID), shortID(implID))
+	reviewBranch := fmt.Sprintf("fishhawk/run-%s/stage-%s", shortID(sweepRunID), shortID(reviewID))
+	rr := &prEventsRunRepo{
+		listResult: []*run.Run{target},
+		stages: map[uuid.UUID][]*run.Stage{sweepRunID: {
+			{ID: implID, RunID: sweepRunID, Type: run.StageTypeImplement, State: run.StageStateSucceeded},
+			{ID: reviewID, RunID: sweepRunID, Type: run.StageTypeReview, State: run.StageStateAwaitingApproval},
+		}},
+	}
+	ar := &prEventsAuditRepo{}
+	gh, client := newGitHubSweepStub(t, implBranch)
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: ar, GitHub: client})
+
+	payload, _ := json.Marshal(map[string]any{
+		"pull_request": map[string]any{
+			"html_url": prURL, "number": 42, "merged": true,
+			"merged_by": map[string]any{"login": "alice"},
+			"head":      map[string]any{"sha": "headsha"},
+			"base":      map[string]any{"sha": "basesha"},
+		},
+		"sender": map[string]any{"login": "alice"},
+	})
+	s.handlePullRequestClosed(context.Background(), payload)
+
+	if got, want := gh.deletePaths(), []string{"/repos/x/y/git/refs/heads/" + implBranch}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("DELETE paths = %v, want %v", got, want)
+	}
+	row := sweptAuditRow(t, ar.appended)
+	if row.Trigger != sweepTriggerPRMerged || !reflect.DeepEqual(row.Deleted, []string{implBranch}) ||
+		!reflect.DeepEqual(row.AlreadyAbsent, []string{reviewBranch}) || len(row.Errors) != 0 {
+		t.Errorf("run_branches_swept = %+v", row)
+	}
+
+	// Redelivery: idempotent.
+	ar.mu.Lock()
+	ar.appended = nil
+	ar.mu.Unlock()
+	s.handlePullRequestClosed(context.Background(), payload)
+	if n := len(gh.deletePaths()); n != 1 {
+		t.Errorf("DELETEs after redelivery = %d, want still 1", n)
+	}
+	row = sweptAuditRow(t, ar.appended)
+	want := []string{implBranch, reviewBranch}
+	sort.Strings(want)
+	if len(row.Deleted) != 0 || len(row.Errors) != 0 || !reflect.DeepEqual(row.AlreadyAbsent, want) {
+		t.Errorf("redelivered run_branches_swept = %+v, want every ref already_absent", row)
+	}
 }

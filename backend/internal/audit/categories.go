@@ -362,6 +362,7 @@ var KnownCategories = map[string]struct{}{
 	"run_admitted_budget_override":            {},
 	"run_auto_advanced":                       {},
 	"run_auto_driven":                         {},
+	"run_branches_swept":                      {},
 	"run_budget_exceeded":                     {},
 	"run_completed":                           {},
 	"run_dispatched":                          {},

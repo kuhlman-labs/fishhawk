@@ -461,6 +461,13 @@ type Config struct {
 	// it did not read. Same nil-means-test-seam posture as the sibling seams.
 	PRStateReader PullRequestStateReader
 
+	// RunBranchDeleter is the ref-delete seam the terminal run-branch sweep
+	// (run_branch_sweep.go, E68.67 / #3562) deletes through. Set, it
+	// OVERRIDES the per-forge ladder (cfg.GitHub for a github-family run,
+	// ForgeResolver otherwise) for every run — the PRStateReader posture.
+	// nil in production.
+	RunBranchDeleter forge.RefDeleter
+
 	// ForgeResolver is the injectable forge-registry lookup a NON-GitHub
 	// forge family is resolved through. Its consumers: the
 	// merge-observation verb's pull-request read (E64.40 / #3151, see
@@ -996,6 +1003,12 @@ type Server struct {
 	// wedged forge cannot block a graceful stop past the deadline.
 	bgGroomingApply sync.WaitGroup
 
+	// bgBranchSweeps tracks the DETACHED cancel-path run-branch sweep
+	// (E68.67 / #3562): handleCancelRun writes its response first and runs
+	// the forge round-trips on a goroutine in this group under a bounded
+	// budget. Shutdown drains it alongside bgReviews / bgGroomingApply.
+	bgBranchSweeps sync.WaitGroup
+
 	// p95Cache memoizes implement-stage calibration p95 results keyed
 	// by workflow_id so resolveImplementTimeout's per-prompt-fetch call
 	// to implementCalibrationP95 doesn't run a full AuditRepo.ListAll
@@ -1325,6 +1338,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	go func() {
 		s.bgReviews.Wait()
 		s.bgGroomingApply.Wait()
+		s.bgBranchSweeps.Wait()
 		close(done)
 	}()
 	select {
@@ -1346,6 +1360,11 @@ func (s *Server) waitBackgroundReviews() { s.bgReviews.Wait() }
 // assert on the audit rows the detached apply writes. Production code never
 // calls it (Shutdown drains the same group, bounded by its context).
 func (s *Server) waitGroomingApply() { s.bgGroomingApply.Wait() }
+
+// waitBranchSweeps blocks until every detached cancel-path run-branch sweep
+// (E68.67 / #3562) has finished — the deterministic sync point tests use to
+// assert on the run_branches_swept row. Production code never calls it.
+func (s *Server) waitBranchSweeps() { s.bgBranchSweeps.Wait() }
 
 // resolveRepoScope resolves the GitHub App installation for owner/name into a
 // forge.CredentialScope (ADR-058 / #1855), the input the scope-taking
