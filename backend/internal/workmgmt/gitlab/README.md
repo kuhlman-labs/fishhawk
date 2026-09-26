@@ -18,7 +18,7 @@ GitLab issue boards are **label-driven** (<https://docs.gitlab.com/ee/user/proje
 
 ### `parent_epic` → Free-tier `relates_to` issue link (not a Premium group epic)
 
-GitLab **group epics are a Premium feature** (<https://docs.gitlab.com/ee/user/group/epics/>). To keep the v0 provider usable on Free/self-managed without a Premium tier, a `parent_epic` reference maps to a Free-tier **`relates_to` issue link** (`POST /projects/:id/issues/:iid/links`, <https://docs.gitlab.com/ee/api/issue_links.html>) rather than an epic membership. The reference (`#N` or `N`) parses with the same numeric-ref semantics as the github/jira siblings; an unparseable ref is treated as a best-effort link failure.
+GitLab **group epics are a Premium feature** (<https://docs.gitlab.com/ee/user/group/epics/>). To keep the v0 provider usable on Free/self-managed without a Premium tier, a `parent_epic` reference maps to a Free-tier **`relates_to` issue link** (`POST /projects/:id/issues/:iid/links`, <https://docs.gitlab.com/ee/api/issue_links.html>) rather than an epic membership. The reference parses as `N`, `#N` or `issue:N` via the shared `workmgmt.ParseIssueRef` (#3314) — the same set the campaign `epic_ref` classifier (`campaign.go`) and the github/jira siblings accept, which closes the #3653 divergence in which `campaign.go` accepted `issue:N` while `File` did not. A doubled prefix (`issue:issue:N`, `##N`) or a non-positive number is still an unparseable ref, recorded as a best-effort link failure (`EpicLinkError`) with the issue still returned.
 
 ## Configuration: server-side env, not repo config
 

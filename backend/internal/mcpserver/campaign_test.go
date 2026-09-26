@@ -3404,3 +3404,31 @@ func TestStartCampaign_AdmissionScreen_SurvivesDecode(t *testing.T) {
 		t.Errorf("AdmissionScreen = %+v, want nil when the response omits the block", out2.Campaign.AdmissionScreen)
 	}
 }
+
+// TestPreviewCampaignToolDescription_NamesAcceptedEpicRefForms pins the
+// WIRE-VISIBLE fishhawk_preview_campaign epic_ref description to the same
+// contract as fishhawk_start_campaign's (#3653): the three accepted same-repo
+// forms, both refusal codes, and the cross-repo owner/name#25 form named only
+// as REFUSED — never presented as an example. A jsonschema tag is not
+// compiler-enforced, so this is what makes the description non-droppable.
+func TestPreviewCampaignToolDescription_NamesAcceptedEpicRefForms(t *testing.T) {
+	desc := toolInputPropertyDescription(t, "fishhawk_preview_campaign", "epic_ref")
+	for _, want := range []string{"(25)", "#25", "issue:25", "campaign_epic_ref_invalid", "campaign_epic_ref_group_unsupported"} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("epic_ref description missing %q: %s", want, desc)
+		}
+	}
+	found := false
+	for _, sentence := range strings.Split(desc, ". ") {
+		if !strings.Contains(sentence, "owner/name#25") {
+			continue
+		}
+		found = true
+		if !strings.Contains(sentence, "refused") {
+			t.Errorf("owner/name#25 appears in a sentence that does not refuse it (presented as an example): %q", sentence)
+		}
+	}
+	if !found {
+		t.Errorf("epic_ref description does not name the refused cross-repo form owner/name#25: %s", desc)
+	}
+}

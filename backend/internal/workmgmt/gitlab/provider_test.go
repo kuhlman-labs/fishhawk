@@ -383,6 +383,43 @@ func TestFile_ParentLink(t *testing.T) {
 	}
 }
 
+// TestFile_ParentLink_IssuePrefixResolvesSameAsHash is #3653's done-means:
+// a parent_epic of issue:25 drives the IDENTICAL Free-tier LinkIssues call as
+// #25 (same project, iid and target), with EpicLinked true and no
+// EpicLinkError on both — the same ref convention gitlab/campaign.go already
+// accepts for a campaign epic_ref. Each arm gets a fresh fake and a literal
+// ref, so neither is seeded through the parser under test.
+func TestFile_ParentLink_IssuePrefixResolvesSameAsHash(t *testing.T) {
+	type linkCall struct {
+		called            bool
+		proj, iid, target int
+	}
+	file := func(ref string) linkCall {
+		t.Helper()
+		api := &fakeAPI{}
+		item := workmgmt.WorkItem{Type: "feature", Title: "t", Relations: workmgmt.Relations{ParentEpic: ref}}
+		created, err := New(api).File(context.Background(), req(item, &workmgmt.GitLabConnection{}, workmgmt.Repo{Owner: "acme", Name: "widgets"}))
+		if err != nil {
+			t.Fatalf("File(%q): %v", ref, err)
+		}
+		if !created.EpicLinked {
+			t.Errorf("File(%q): EpicLinked = false, want true", ref)
+		}
+		if created.EpicLinkError != "" {
+			t.Errorf("File(%q): EpicLinkError = %q, want empty", ref, created.EpicLinkError)
+		}
+		return linkCall{api.linkCalled, api.linkProj, api.linkIID, api.linkTarget}
+	}
+	hash := file("#25")
+	prefixed := file("issue:25")
+	if want := (linkCall{true, 42, 7, 25}); hash != want {
+		t.Fatalf("#25 link call = %+v, want %+v", hash, want)
+	}
+	if prefixed != hash {
+		t.Errorf("issue:25 link call = %+v, want the same link as #25 (%+v)", prefixed, hash)
+	}
+}
+
 // TestFile_ParentLink_BestEffort asserts a LinkIssues failure records the
 // cause in EpicLinkError, leaves EpicLinked false, and STILL returns the
 // created item with a nil error (best-effort #1107).
@@ -545,19 +582,45 @@ func TestName(t *testing.T) {
 	}
 }
 
-// TestParseIssueRef covers the numeric-ref parsing edge cases shared with
-// the github/jira siblings.
+// TestParseIssueRef covers the ref parsing edge cases shared with the
+// github/jira siblings and the campaign epic_ref classifier: the accepted set
+// is N, #N and issue:N (#3653), and every rejection the shared
+// workmgmt.ParseIssueRef makes is preserved. Rejections are asserted by error
+// IDENTITY so a parser swap that collapses the non-numeric and non-positive
+// branches goes red.
 func TestParseIssueRef(t *testing.T) {
-	ok := map[string]int{"#123": 123, "123": 123, " #7 ": 7}
+	ok := map[string]int{
+		"#123": 123, "123": 123, " #7 ": 7,
+		"issue:101": 101, " issue: 42 ": 42,
+		// Documented harmless ordering consequence: issue: is stripped
+		// before #, so the two prefixes compose once each.
+		"issue:#101": 101,
+	}
 	for ref, want := range ok {
 		got, err := parseIssueRef(ref)
 		if err != nil || got != want {
 			t.Errorf("parseIssueRef(%q) = %d, %v; want %d, nil", ref, got, err, want)
 		}
 	}
-	for _, ref := range []string{"", "abc", "#0", "-3", "#-1"} {
-		if _, err := parseIssueRef(ref); err == nil {
-			t.Errorf("parseIssueRef(%q) = nil error, want a parse error", ref)
+	const (
+		nonNumeric  = "not a numeric issue reference"
+		nonPositive = "issue number must be > 0"
+	)
+	bad := map[string]string{
+		"":                nonNumeric,
+		"abc":             nonNumeric,
+		"issue:":          nonNumeric,
+		"issue:issue:101": nonNumeric, // doubled issue: prefix
+		"##101":           nonNumeric, // doubled # prefix
+		"#0":              nonPositive,
+		"-3":              nonPositive,
+		"#-1":             nonPositive,
+		"issue:0":         nonPositive,
+	}
+	for ref, want := range bad {
+		_, err := parseIssueRef(ref)
+		if err == nil || err.Error() != want {
+			t.Errorf("parseIssueRef(%q) err = %v, want %q", ref, err, want)
 		}
 	}
 }
