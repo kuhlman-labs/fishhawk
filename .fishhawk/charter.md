@@ -14,59 +14,100 @@ charter constraining it.
 
 ## 1. North star
 
-Coding agents can write the code. The bottleneck is whether an organization can
-say what its agents did, prove it, and reproduce the process across a team.
+Coding agents can write the code. The bottleneck is whether **one person can run a
+repository the way a team would**: set its direction, trust what the agents did,
+prove it, and hand it to the next person without losing how it was run.
 
 Fishhawk is the governed, auditable workflow layer above coding agents. It is
 agent-agnostic, forge-agnostic, and opinionated about process. The workflow spec,
 the audit chain, and the approval gates are not compliance bolt-ons — they are the
 product.
 
+The unit is the **repository**. The human who commands a repository is its
+**captain**. The agents that do the work are its **crew**: planner, implementer,
+reviewers, acceptance, the operator agent as first officer, and the roles that
+keep a product running after the merge. The captain decides how much the crew may
+decide and where; the crew advises, disagrees on the record, and escalates what it
+may not settle. An organization is a fleet of such repositories, each with its own
+captain — the enterprise case is the same model repeated, not a different product.
+
 The durable model is asymmetric and is not transitional scaffolding: **humans set
 direction and approve outcomes; agents implement.** Every design decision should
 make that asymmetry cheaper to operate, not erode it.
 
-> Your agents do the work. Your team approves the work. Fishhawk holds the record.
+Doctrine belongs to the ship, not the captain. Standing orders (this charter, the
+workflow spec, the operator overlay), decisions and their reasons, and the record
+of how past gates were judged live in the repository and on the audit chain — so a
+new captain inherits how the repository is run, and changes it only in the open.
+
+> Your agents do the work. You command the crew. Fishhawk holds the record.
 
 ---
 
 ## 2. Current phase: alpha
 
-**Alpha means ADR-057 Mode 1 works end-to-end for someone who is not us.** An
-external team self-hosts Fishhawk on their own Kubernetes cluster and runs governed
-changes against their own repository, on GitHub or GitLab. No hosted service, no
-multi-tenancy, no design-partner program — those are beta (E57 #2255).
+**Alpha means one developer, on their own machine, commands the full crew against
+their own repository from the bridge — and could hand that repository to another
+developer who picks it up without the first one in the room.** No Kubernetes, no
+hosted service, no second approver, no founder assistance. The local stack
+(`fishhawkd`, Postgres, object storage, the runner, the MCP server, and the Web UI)
+comes up with the documented local path and nothing else.
 
-Alpha is tracked by E64 #2308.
+The full crew, each ready in the sense of the done-means below:
+
+| Role | Ready means | Carried by |
+|---|---|---|
+| Planner, implementer, reviewers | The plan → implement → review loop reaches a governed merge on a repo that is not this one | shipped |
+| Acceptance | A running instance is validated against the plan's criteria | shipped; E72 #3324 |
+| First officer (operator agent) | Drives runs and campaigns within delegation and pages the captain with a distilled hand-off | shipped |
+| Groomer | Keeps the backlog decision-ready against this charter | E54 #2232 |
+| Product manager | Proposes direction and release briefs for the captain to ratify | E71 #3240 |
+| Release manager | Cuts an evidence-backed release the captain approves | E33 #1583 |
+| Ops | Verifies a deploy and turns an alert into a governed incident issue | E35 #1585 |
+| Architect | Checks plans against the in-repo decision record | E78 #3699 |
+| Historian | Reads the chain back: precedent at the gate, digests, handover briefs | E75 #3696 |
+| Chief engineer | Files and runs routine upkeep (dependencies, flakes, deprecations) at high autonomy | E79 #3700 |
+| Security officer | Reviews declared sensitive paths with a threat-model lens and watches advisories | E80 #3701 |
+| Comms | Turns user feedback into charter-anchored draft issues | E81 #3702 |
+
+Alpha is tracked by E73 #3694 (ADR-080 #3693). The previous
+alpha definition — an external team self-hosting on Kubernetes (E64 #2308) — moves
+to beta.
 
 ### Phase themes
 
-- **T1 — An external repo runs the loop.** Onboarding, `init`/`doctor`, external
-  repo support, intake sanitization. Someone who did not build this can start a
-  governed run without reading the source.
-- **T2 — Two forges, not one.** GitHub and GitLab both reach a governed merge. Forge
-  agnosticism claimed in positioning has to be demonstrable, not architectural.
-- **T3 — The spec is the governance surface, and its break-window closes here.**
-  Workflow spec v2 consolidation (E52) and the declared control surface (E53). A
-  major cannot be broken in place after the first external consumer, and an alpha
-  user *is* an external consumer.
-- **T4 — The install artifact is production-posture.** A Helm chart an external
-  operator can actually deploy, with real secrets, ingress, and a migration hook
-  proven under failure.
-- **T5 — The loop survives contact with people who are not the founder.** Recovery
-  and campaign reliability are the weakest subsystems; the happy path is strong. A
-  failure mode that requires operator folklore to escape is an alpha defect.
-- **T6 — The backlog stays decision-ready without a human sweeping it.** This
-  charter's own reason for existing (E54). Fishhawk generates inflow faster than a
-  human grooms it.
+Themes T1–T6 are retired with the previous phase definition; their ids are not
+reused (see §6).
+
+- **T7 — The ship installs itself.** One documented local path brings up the whole
+  stack on a developer's machine, from published binaries, with `init`/`doctor`
+  getting a new repository to its first governed change without reading the source.
+- **T8 — The bridge.** The Web UI is where the captain decides: an attention queue
+  of what needs a human, gate decisions made there rather than in chat, and a
+  per-repository view of crew activity and the record (E40). An approver who is not
+  an engineer can act on a gate.
+- **T9 — The full crew reports for duty.** Every role in the table above reaches its
+  done-means on this repository and on one repository that is not this one.
+- **T10 — The crew talks on the record.** Agents consult and flag one another through
+  typed, addressed messages on the audit chain. A message is advice, never an
+  order; a disagreement escalates to the captain rather than looping.
+- **T11 — Change of command.** Precedent, decisions, and open work are readable by
+  a captain who did not create them; a handover is a recorded event with a brief;
+  a divergence from precedent is surfaced at the gate and resolved either as a
+  one-off or as a doctrine change.
+- **T12 — The loop survives contact with someone who is not the founder.** Recovery
+  and campaign reliability hold without operator folklore. A failure mode that needs
+  founder knowledge to escape is an alpha defect.
 
 ### What alpha does *not* require
 
-Web UI (E40 — alpha operators drive via MCP and CLI, as this repo has since day 22;
-the accepted risk is that a non-engineer approver cannot act on a gate), hosted
-multi-tenancy, BYOK (E61) and runner-hosted reviewers (E63) — both satisfied by
-construction under Mode 1, since the customer's own daemon holds their key inside
-their own perimeter.
+Kubernetes or a production-posture Helm deployment (E62, E69 — beta), hosted
+multi-tenancy (E44), BYOK (E61 — satisfied by construction when the captain's own
+daemon holds their key), runner-hosted reviewers (E63), MCP over HTTP (E66 — local
+MCP is stdio), a second eligible approver or quorum, and a second forge as a
+blocker (GitLab support stays shipped; its live walk is beta — see ADR-080 #3693).
+Earned autonomy — the crew's record recommending changes to its own delegation —
+is designed in alpha and may land after it; the captain always ratifies.
 
 ---
 
@@ -110,8 +151,8 @@ and the report should say which it is rather than blending them into one number.
 
 | id | line |
 |---|---|
-| **V1** | Directly unblocks the current phase definition (§2). For alpha: an external team cannot self-host, or cannot run on their forge, without it. |
-| **V2** | Advances a named phase theme T1–T6 without being strictly blocking. |
+| **V1** | Directly unblocks the current phase definition (§2). For alpha: a solo developer cannot bring the stack up locally, cannot command a crew role from the bridge, or cannot hand the repository to another captain without it. |
+| **V2** | Advances a named phase theme T7–T12 without being strictly blocking. |
 | **V3** | Removes recurring operator toil that Fishhawk itself generates. Toil the product creates and does not absorb is a defect in the product, not a cost of doing business. |
 | **V4** | Makes the governance story demonstrable to an evaluator — the question "how do I constrain what the agent may do?" needs a real answer, not an architecture diagram. |
 | **V5** | Improves the product for a phase that is not the current one. Real value, wrong time; rank below V1–V4 and say so. |
