@@ -2485,6 +2485,125 @@ func TestE72Rules_RuleNames(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// E72.22 (#3559) — criterion_restates_test polarity + rendered-file suppressor
+// ---------------------------------------------------------------------------
+
+// issue3510Hint is the verify_hint from run 6ee0e134 (#3510) VERBATIM — the
+// false positive this block exists to close. It names a rendered file in the
+// checkout AND explicitly disclaims being a Go test, yet the pre-polarity
+// classifier fired because `strings.ToLower(hint)` carries the substring
+// "go test" inside the NEGATED disclaimer "not a Go test".
+const issue3510Hint = "Read runner/README.md § Forge-writes gate at the PR head (a rendered file in the checkout, " +
+	"not a Go test): the unreachable-from-the-sandbox sentence is gone and a launch-path paragraph names both classes"
+
+// TestEvaluateAcceptanceCriteria_CriterionRestatesTest_PolarityAndRenderedFile
+// is the E72.22 table: one row per named mode of the two new suppressors and
+// their two exclusions, asserting SHIPPED classifier output (the finding set
+// EvaluateAcceptanceCriteria returns), never the marker lists.
+//
+// m2 and m3 are deliberately SINGLE-CONTROL rows: m2 carries a genuine
+// `_test.go` marker with NO negator, so only verifyHintNamesRenderedFile can
+// clear it, and m3 carries a negated marker with NO file path, so only the
+// polarity scan can clear it. The #3510 row m1 is cleared by EITHER control and
+// is therefore NOT a valid counterfactual vehicle for either one.
+//
+// COUNTERFACTUALS (run, observed, restored — see the PR notes): delete the
+// negation scan -> m3 AND m9 RED (m9 is the regex arm's own vehicle); delete the
+// verifyHintNamesRenderedFile disjunct in TestOnlyCriteria -> m2 RED; delete the
+// `testdata/` segment exclusion -> m6 RED; add ".go" to renderedFileExtensions
+// -> m7 RED.
+func TestEvaluateAcceptanceCriteria_CriterionRestatesTest_PolarityAndRenderedFile(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		hint string
+		want bool // want a criterion_restates_test finding
+	}{
+		// MUST NOT FIRE.
+		{"m1 #3510 hint verbatim", issue3510Hint, false},
+		{
+			"m2 doc path clears a genuine test marker",
+			"Read runner/README.md at the PR head; also covered by acceptance_check_test.go",
+			false,
+		},
+		{
+			"m3 negated marker with no file path",
+			"the behaviour is asserted by a rendered file in the checkout, not a Go test",
+			false,
+		},
+		{
+			// The bare-TestFoo REGEX arm carries its own negation scan, on the
+			// ORIGINAL-cased hint. No file path and no substring marker, so only
+			// that arm's polarity can clear it.
+			"m9 negated bare TestFoo name with no file path",
+			"the behaviour is checked by reading the rendered section at the PR head, not TestOnlyCriteria",
+			false,
+		},
+
+		// MUST FIRE.
+		{"m4 bare _test.go path", "covered by backend/internal/plan/acceptance_check_test.go", true},
+		{"m5 go test -run invocation", "run go test -run TestOnlyCriteria ./backend/internal/plan/...", true},
+		{"m6 testdata golden file is excluded", "the golden file testdata/acceptance.json is refreshed by TestFoo", true},
+		{"m7 a .go source path is not a rendered file", "covered by go test; see backend/internal/plan/acceptance_check.go", true},
+		{
+			"m8 negator outside the 4-token window before the marker head",
+			"run go test ./backend/internal/plan/...; the README is not stale",
+			true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v := Verification{AcceptanceCriteria: []AcceptanceCriterion{hintCriterion("c1", tc.hint)}}
+			findings := EvaluateAcceptanceCriteria(v)
+			got := countFindings(findings, RuleCriterionRestatesTest, "c1")
+			if tc.want && got != 1 {
+				t.Fatalf("want exactly 1 criterion_restates_test for c1; got %d in %+v", got, findings)
+			}
+			if !tc.want && got != 0 {
+				t.Fatalf("want NO criterion_restates_test for c1; got %d in %+v", got, findings)
+			}
+		})
+	}
+}
+
+// (unchanged behaviour) The E72.22 change must not move the pre-existing
+// surface: an empty/whitespace hint stays silent, and the two declared
+// exemptions stay exempt even when the hint is test-only.
+func TestEvaluateAcceptanceCriteria_CriterionRestatesTest_E7222UnchangedRows(t *testing.T) {
+	for _, hint := range []string{"", "   \t\n"} {
+		v := Verification{AcceptanceCriteria: []AcceptanceCriterion{hintCriterion("c1", hint)}}
+		findings := EvaluateAcceptanceCriteria(v)
+		if findingFor(findings, RuleCriterionRestatesTest) != nil {
+			t.Fatalf("hint %q must stay silent; got %+v", hint, findings)
+		}
+	}
+	skip := skipCriterion("c1", "the helper is renamed", "covered by the unit test")
+	skip.VerifyHint = "covered by backend/internal/plan/acceptance_check_test.go"
+	if f := findingFor(EvaluateAcceptanceCriteria(Verification{AcceptanceCriteria: []AcceptanceCriterion{skip}}), RuleCriterionRestatesTest); f != nil {
+		t.Fatalf("skip_expected-with-basis must stay exempt; got %+v", f)
+	}
+	live := hintCriterion("c1", "covered by backend/internal/plan/acceptance_check_test.go")
+	live.RequiresLiveValidation = true
+	if f := findingFor(EvaluateAcceptanceCriteria(Verification{AcceptanceCriteria: []AcceptanceCriterion{live}}), RuleCriterionRestatesTest); f != nil {
+		t.Fatalf("requires_live_validation must stay exempt; got %+v", f)
+	}
+}
+
+// (plan level) A one-criterion plan carrying the #3510 hint draws NEITHER
+// criterion_restates_test NOR no_observable_criterion. noObservableCriterion
+// keys off the criterion_restates_test finding set, so a criterion cleared by
+// either new suppressor transitively suppresses the plan-level advisory too —
+// asserted here directly rather than left as an inferred side effect.
+func TestEvaluateAcceptanceCriteria_NoObservableCriterion_SilentOnIssue3510Hint(t *testing.T) {
+	v := Verification{AcceptanceCriteria: []AcceptanceCriterion{hintCriterion("c1", issue3510Hint)}}
+	findings := EvaluateAcceptanceCriteria(v)
+	if f := findingFor(findings, RuleCriterionRestatesTest); f != nil {
+		t.Errorf("the #3510 hint must not draw criterion_restates_test; got %+v", f)
+	}
+	if f := findingFor(findings, RuleNoObservableCriterion); f != nil {
+		t.Errorf("the #3510 hint must not draw no_observable_criterion; got %+v", f)
+	}
+}
+
 // (non-nil) TestOnlyCriteria returns a non-nil empty slice on a clean plan.
 func TestTestOnlyCriteria_NonNilOnCleanPlan(t *testing.T) {
 	got := TestOnlyCriteria(Verification{})

@@ -4,6 +4,8 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 // acceptance_check.go holds the pure, deterministic acceptance-criteria rule
@@ -111,7 +113,10 @@ const (
 	// NO operator-observable surface (E72.1 / #3325). Such a criterion RESTATES
 	// the plan's test_strategy: the acceptance agent cannot observe a Go test
 	// passing on the localhost preview, so the criterion adds nothing the
-	// implement-verify gate does not already prove. The five surfaces the
+	// implement-verify gate does not already prove. Since E72.22 / #3559 a
+	// marker inside a NEGATED disclaimer is not evidence, and a hint naming a
+	// concrete non-test rendered file in the checkout suppresses the finding
+	// alongside the five surfaces. The five surfaces the
 	// acceptance agent CAN observe are an HTTP route/response/status code, an
 	// MCP tool result (`fishhawk_*`), a CLI exit code/stderr/stdout, a
 	// rendered prompt, and a persisted audit row.
@@ -186,8 +191,10 @@ const (
 //     the tracked operator-validation walk (#2845). Advisory only.
 //   - criterion_restates_test — a criterion whose verify_hint names only
 //     in-repository Go test evidence and no operator-observable surface, so it
-//     restates test_strategy (E72.1 / #3325). Exempt for skip_expected-with-
-//     basis / requires_live_validation; silent on an empty hint. Advisory only.
+//     restates test_strategy (E72.1 / #3325). Polarity-aware, and also
+//     suppressed by a named non-test rendered file (E72.22 / #3559). Exempt for
+//     skip_expected-with-basis / requires_live_validation; silent on an empty
+//     hint. Advisory only.
 //   - no_observable_criterion — PLAN-LEVEL: at least one criterion, not
 //     all-skip, no acceptance_surface: none, and every criterion is a declared
 //     skip or restates a test (E72.1 / #3325). One finding per plan. Advisory.
@@ -797,6 +804,14 @@ var sandboxMarkers = []string{
 // clauses of one sentence pair up.
 const livenessProximityWindow = 4
 
+// acceptanceTokenCutset is the surrounding punctuation every tokenizer in this
+// file trims. It is ONE const consulted by acceptanceTokens, polarityTokens and
+// hintFieldSpans (E72.22 / #3559) so a third tokenizer cannot silently disagree
+// with the two that predate it about what a token's edges are — a disagreement
+// would show up as one matcher seeing `README.md)` where another sees
+// `README.md`.
+const acceptanceTokenCutset = ".,;:!?()[]{}\"'`"
+
 // acceptanceTokens splits a lowercased statement into comparable tokens: it
 // trims surrounding punctuation and a trailing possessive, so "repo's" and
 // "round-trip," normalize to "repo" and "round-trip". Interior hyphens are
@@ -805,7 +820,7 @@ func acceptanceTokens(lowered string) []string {
 	raw := strings.Fields(lowered)
 	tokens := make([]string, 0, len(raw))
 	for _, t := range raw {
-		t = strings.Trim(t, ".,;:!?()[]{}\"'`")
+		t = strings.Trim(t, acceptanceTokenCutset)
 		t = strings.TrimSuffix(t, "'s")
 		t = strings.TrimSuffix(t, "’s")
 		if t != "" {
@@ -871,7 +886,7 @@ func polarityTokens(lowered string) []string {
 		case '.', '!', '?':
 			sentinel = sentenceBoundaryToken
 		}
-		t := strings.Trim(f, ".,;:!?()[]{}\"'`")
+		t := strings.Trim(f, acceptanceTokenCutset)
 		t = strings.TrimSuffix(t, "'s")
 		t = strings.TrimSuffix(t, "\u2019s")
 		if t != "" {
@@ -1649,6 +1664,246 @@ func MissingLiveValidationMarker(v Verification) []AcceptanceFinding {
 // criterion_restates_test / no_observable_criterion (E72.1, #3325)
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// criterion_restates_test polarity + rendered-file suppressor (E72.22, #3559)
+// ---------------------------------------------------------------------------
+//
+// THE TWO DEFECTS #3559 CLOSES, both on the #3510 hint "Read runner/README.md §
+// Forge-writes gate at the PR head (a rendered file in the checkout, not a Go
+// test): …".
+//
+// (1) POLARITY. verifyHintNamesTestOnly was a bare substring/regex test, so the
+// substring "go test" carried INSIDE the negated disclaimer "not a Go test" was
+// read as positive Go-test evidence — the hint's own denial that it is a Go test
+// made it fire. The fix is an anchor scan mirroring the shape #3016/#3614
+// already established for the live-target rules: an occurrence counts as
+// evidence only when it is NOT negated, and the predicate is true when AT LEAST
+// ONE occurrence survives. That is the mirror image of
+// everyLiveTargetAnchorNegated (there ALL anchors must be negated to suppress);
+// stated from this side, suppression requires EVERY occurrence negated.
+//
+// (2) NO RENDERED-FILE SUPPRESSOR. The only clearing predicate was
+// verifyHintNamesObservableSurface, whose marker lists cover the five
+// localhost-preview surfaces and carry no notion of a concrete non-test file the
+// acceptance agent can open in the checkout, so "runner/README.md" cleared
+// nothing. verifyHintNamesRenderedFile is a THIRD, separately-named suppressor
+// beside that list — deliberately NOT a sixth observable surface, because the
+// five-surface contract is named verbatim in criterionRestatesTestDetail, in the
+// docs and in the planner prompt, and widening the predicate would silently
+// restate it as six.
+//
+// THE WINDOW AND THE NEGATOR VOCABULARY ARE REUSED, NOT REDEFINED:
+// backwardWindowNegated (conjunct P1) and acceptanceNegators are consulted
+// verbatim, so this rule introduces no second polarity vocabulary and no second
+// proximity constant — the reuse-not-redefine rationale recorded for #3016
+// applies unchanged here.
+//
+// P2 (extendedNegationScope) is deliberately NOT consulted. P1 alone is a
+// BACKWARD window, which is what lets row m8 pin the bound behaviourally: in
+// "run go test ./…; the README is not stale" the negator sits AFTER the marker
+// head and must not suppress. Folding in the forward scope would suppress that
+// hint, widening this rule's surface on a shape #3559 never asked about.
+
+// hintFieldSpan is one whitespace-delimited field of a verify_hint: its
+// acceptanceTokens-equivalent token (punctuation and possessive trimmed, then
+// lowercased) plus the byte span of the UNTRIMMED field in the string it came
+// from. The span is what maps a marker occurrence's byte OFFSET back onto a
+// TOKEN INDEX, which is the unit backwardWindowNegated counts in.
+//
+// The span covers the untrimmed field on purpose: an occurrence overlapping
+// trimmed edge punctuation ("(a Go test):") still maps to its field.
+type hintFieldSpan struct {
+	token      string
+	start, end int
+}
+
+// hintFieldSpans tokenizes s exactly as acceptanceTokens does — same cutset,
+// same possessive trimming, same dropping of a field that trims to nothing — and
+// additionally records each surviving field's byte span. Because the token
+// sequence is identical to acceptanceTokens(s), the []string it feeds
+// backwardWindowNegated is the stream that predicate has always run on (no
+// polarity sentinels, so its sentinel-skip branch is inert here and its window
+// is exactly the original four-token backward scan).
+//
+// Tokens are LOWERCASED here rather than by the caller, so the regex arm — which
+// must match on the ORIGINAL-cased hint — can still compare negators against a
+// lowercase stream.
+func hintFieldSpans(s string) []hintFieldSpan {
+	var out []hintFieldSpan
+	i := 0
+	for i < len(s) {
+		for i < len(s) {
+			r, w := utf8.DecodeRuneInString(s[i:])
+			if !unicode.IsSpace(r) {
+				break
+			}
+			i += w
+		}
+		start := i
+		for i < len(s) {
+			r, w := utf8.DecodeRuneInString(s[i:])
+			if unicode.IsSpace(r) {
+				break
+			}
+			i += w
+		}
+		if start == i {
+			break
+		}
+		t := strings.Trim(s[start:i], acceptanceTokenCutset)
+		t = strings.TrimSuffix(t, "'s")
+		t = strings.TrimSuffix(t, "’s")
+		if t != "" {
+			out = append(out, hintFieldSpan{token: strings.ToLower(t), start: start, end: i})
+		}
+	}
+	return out
+}
+
+// hintFieldIndexAt maps a byte offset in the tokenized string onto the index of
+// the field containing it, or -1 when the offset falls in no surviving field
+// (only reachable for an offset inside a field that trimmed to nothing).
+func hintFieldIndexAt(fields []hintFieldSpan, off int) int {
+	for i, f := range fields {
+		if off >= f.start && off < f.end {
+			return i
+		}
+	}
+	return -1
+}
+
+// markerOccurrenceOffsets returns the byte offset of EVERY occurrence of every
+// phrase in markers within lowered. It preserves containsAnyPhrase's substring
+// semantics exactly — the must-FIRE surface does not move, only the polarity
+// judgement is layered on top — which is what keeps "_test.go" matching INSIDE
+// the single path token "internal/plan/acceptance_check_test.go".
+func markerOccurrenceOffsets(lowered string, markers []string) []int {
+	var offs []int
+	for _, m := range markers {
+		for from := 0; from < len(lowered); {
+			i := strings.Index(lowered[from:], m)
+			if i < 0 {
+				break
+			}
+			offs = append(offs, from+i)
+			from += i + 1
+		}
+	}
+	return offs
+}
+
+// anyUnnegatedOccurrence reports whether at least ONE of offsets (byte offsets
+// into s) is un-negated: no acceptanceNegators token within
+// livenessProximityWindow tokens BEFORE the field the offset lands in.
+//
+// TWO FAIL DIRECTIONS, both chosen toward FIRING, because this rule's harm
+// direction is the false POSITIVE #3510 demonstrated on the suppression side and
+// a silent MISS on the firing side:
+//
+//   - an EMPTY offset set returns false — no marker matched at all, so the rule
+//     stays silent, which is the pre-existing empty-hint behaviour preserved by
+//     construction rather than by an explicit guard;
+//   - an offset that maps to NO field returns true — unmappable evidence is
+//     treated as evidence rather than silently discarded.
+func anyUnnegatedOccurrence(s string, offsets []int) bool {
+	if len(offsets) == 0 {
+		return false
+	}
+	fields := hintFieldSpans(s)
+	tokens := make([]string, len(fields))
+	for i, f := range fields {
+		tokens[i] = f.token
+	}
+	for _, off := range offsets {
+		i := hintFieldIndexAt(fields, off)
+		if i < 0 {
+			return true
+		}
+		if !backwardWindowNegated(tokens, i) {
+			return true
+		}
+	}
+	return false
+}
+
+// regexOccurrenceOffsets returns the byte offset of every match of re in s.
+func regexOccurrenceOffsets(re *regexp.Regexp, s string) []int {
+	locs := re.FindAllStringIndex(s, -1)
+	offs := make([]int, 0, len(locs))
+	for _, l := range locs {
+		offs = append(offs, l[0])
+	}
+	return offs
+}
+
+// renderedFileExtensions is the doc/render extension allow-list for
+// verifyHintNamesRenderedFile. `.go` is DELIBERATELY ABSENT: a Go source path
+// (and a fortiori a `_test.go` path) must never clear this rule, which is what
+// row m7 pins behaviourally.
+var renderedFileExtensions = []string{".md", ".mdx", ".yaml", ".yml", ".json", ".txt", ".tmpl"}
+
+// verifyHintNamesRenderedFile reports whether a verify_hint names a CONCRETE
+// non-test file the acceptance agent can open in the checkout at the PR head —
+// the "read runner/README.md and check Y" shape #3510 hit, which is a legitimate
+// and common criterion for every README-contract change.
+//
+// It is the THIRD suppressor of criterion_restates_test, independently named and
+// independently justified beside verifyHintNamesObservableSurface, following the
+// verifyHintDeclaresInRepo / verifyHintNamesSeedScenario / verifyHintNamesStubForge
+// precedent in this file rather than being folded into the five-surface list.
+//
+// TWO EXCLUSIONS, each load-bearing and each with its own test row:
+//
+//   - a `testdata` PATH SEGMENT (row m6): a golden fixture is test evidence, not
+//     an operator-observable rendered file. Without it, "the golden file
+//     testdata/foo.json is updated" would clear the advisory that the "golden
+//     file" marker exists to raise. Segment equality, not a substring test, so
+//     "mytestdata/foo.json" is not excluded by accident.
+//   - a `*_test.*` BASENAME: a `_test.json` fixture beside a Go test is the same
+//     test evidence in a permitted extension.
+//
+// A BARE BASENAME is accepted ("README.md", no slash): the operator-visible
+// thing is the named rendered file, not its depth in the tree.
+//
+// NO EXTRA TRAILING TRIM IS NEEDED for the #3510 hint's parenthetical shape:
+// acceptanceTokens' cutset (acceptanceTokenCutset) already strips `)`, `:` and
+// `,` from both edges, so "runner/README.md)," normalizes to "runner/README.md"
+// with nothing added here — adding a second trim would be a branch no test could
+// redden. Row m1 pins that the verbatim hint survives tokenization.
+//
+// THE RESIDUAL IS A FALSE NEGATIVE, stated not hidden: a hint that genuinely
+// restates a test while citing a doc path ("the corpus documented in docs/foo.md
+// is exercised by TestBar") now clears the advisory. This is an ADVISORY rule
+// whose remedy is prose the author controls, so a residual miss is the cheaper
+// error than the false positive #3510 demonstrated; it is recorded in
+// docs/spec/plan-standard-v1.md rather than left to this comment.
+func verifyHintNamesRenderedFile(hint string) bool {
+	for _, tok := range acceptanceTokens(strings.ToLower(hint)) {
+		if !hasAnySuffix(tok, renderedFileExtensions) {
+			continue
+		}
+		if slices.Contains(strings.Split(tok, "/"), "testdata") {
+			continue
+		}
+		base := tok[strings.LastIndex(tok, "/")+1:]
+		if strings.Contains(base, "_test.") {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// hasAnySuffix reports whether s ends with any of suffixes.
+func hasAnySuffix(s string, suffixes []string) bool {
+	for _, suf := range suffixes {
+		if strings.HasSuffix(s, suf) {
+			return true
+		}
+	}
+	return false
+}
+
 // testOnlyHintMarkers are the SUBSTRING markers that name in-repository Go
 // test evidence in a verify_hint. Lowercase; matched against the lowered hint.
 // A bare Go test function name is matched separately by goTestNamePattern,
@@ -1687,12 +1942,25 @@ var observableSurfaceSubstringMarkers = []string{
 	"issue comment", "pr comment", "status comment",
 }
 
-// verifyHintNamesTestOnly reports whether a verify_hint names in-repository
-// Go test evidence — a test-only marker substring in the lowered hint, or a
-// bare Go test function name in the original-cased hint.
+// verifyHintNamesTestOnly reports whether a verify_hint names in-repository Go
+// test evidence — a test-only marker substring in the lowered hint, or a bare Go
+// test function name in the original-cased hint — POLARITY-AWARE since E72.22 /
+// #3559: an occurrence carrying a negator within livenessProximityWindow tokens
+// BEFORE it is the hint DENYING the evidence ("not a Go test"), not asserting
+// it, so it earns nothing. True when at least ONE occurrence is un-negated.
+//
+// The two arms tokenize DIFFERENT strings because they match different ones: the
+// substring arm runs on the lowered hint, the regex arm on the original-cased
+// hint (`TestX` is the evidence; "test" in ordinary prose is not). Each arm maps
+// its own offsets through its own tokenization, so no offset ever crosses
+// between the two strings — the alignment hazard when strings.ToLower changes a
+// rune's byte length.
 func verifyHintNamesTestOnly(hint string) bool {
-	return containsAnyPhrase(strings.ToLower(hint), testOnlyHintMarkers) ||
-		goTestNamePattern.MatchString(hint)
+	lowered := strings.ToLower(hint)
+	if anyUnnegatedOccurrence(lowered, markerOccurrenceOffsets(lowered, testOnlyHintMarkers)) {
+		return true
+	}
+	return anyUnnegatedOccurrence(hint, regexOccurrenceOffsets(goTestNamePattern, hint))
 }
 
 // verifyHintNamesObservableSurface reports whether a verify_hint names one of
@@ -1728,6 +1996,15 @@ const criterionRestatesTestDetail = "criterion verify_hint names only in-reposit
 // verifyHintDeclaresInRepo does: the hint is the field that states how the
 // criterion is verified.
 //
+// "NAMES" IS POLARITY-AWARE since E72.22 / #3559: a test marker carried inside
+// a negated disclaimer ("a rendered file in the checkout, not a Go test") is the
+// hint DENYING Go-test evidence, so it is not evidence (verifyHintNamesTestOnly).
+// And there are TWO suppressors, not one: verifyHintNamesObservableSurface (the
+// five-surface contract) and verifyHintNamesRenderedFile (a concrete non-test
+// rendered file the acceptance agent can open in the checkout) — separately
+// named on purpose, because the five-surface list is quoted verbatim in
+// criterionRestatesTestDetail and must not silently become six.
+//
 // A criterion already declared skip_expected-with-basis or
 // requires_live_validation is exempt (criterionDeclaresUnevaluable, the
 // exemption every advisory rule in this file shares), and an empty or
@@ -1744,7 +2021,9 @@ func TestOnlyCriteria(v Verification) []AcceptanceFinding {
 		// An empty / whitespace-only hint is silent BY CONSTRUCTION — no
 		// test-only marker matches it — so there is deliberately no explicit
 		// emptiness guard here (it would be a dead branch no test could redden).
-		if !verifyHintNamesTestOnly(c.VerifyHint) || verifyHintNamesObservableSurface(c.VerifyHint) {
+		if !verifyHintNamesTestOnly(c.VerifyHint) ||
+			verifyHintNamesObservableSurface(c.VerifyHint) ||
+			verifyHintNamesRenderedFile(c.VerifyHint) {
 			continue
 		}
 		findings = append(findings, AcceptanceFinding{

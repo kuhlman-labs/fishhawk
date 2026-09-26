@@ -1302,6 +1302,52 @@ func TestRunAcceptancePrecheck_RestatesTestCount(t *testing.T) {
 	}
 }
 
+// (E72.22, #3559) CROSS-BOUNDARY: the pure rule, the precheck payload and the
+// persisted audit row are three layers, and per-layer units would pass while the
+// seam (findings -> RestatesTestCount headline) broke. A plan whose SOLE
+// criterion carries the #3510 verify_hint verbatim must reach the persisted
+// plan_acceptance_precheck entry with restates_test_count == 0, no
+// criterion_restates_test finding and no no_observable_criterion finding.
+//
+// restates_test_count == 0 is ALSO what keeps the rendered plan-review
+// gate-evidence ADVISORY line absent: prompt.writePlanGateEvidence renders the
+// "criteria whose verify_hint names only a Go test" line under
+// `if ap.RestatesTestCount > 0`, so a zero here is the exact input that
+// suppresses it. Asserting the rendered STRING is not available from this
+// harness — writePlanGateEvidence is unexported and backend/internal/prompt is
+// outside this change's scope — so operator approval condition (2) takes its
+// stated fallback and leaves the rendered line to the operator walk.
+//
+// The existing test-only-hint rows above are the must-FIRE regression pin at
+// this seam: they must stay green unchanged.
+func TestRunAcceptancePrecheck_RestatesTestCount_Issue3510HintSilent(t *testing.T) {
+	const issue3510Hint = "Read runner/README.md § Forge-writes gate at the PR head (a rendered file in the checkout, " +
+		"not a Go test): the unreachable-from-the-sandbox sentence is gone and a launch-path paragraph names both classes"
+
+	s, au, runRow := newAcceptancePrecheckServer(t, specWithAcceptanceStage)
+	body := acceptancePlanBody(t, []map[string]any{
+		testOnlyCriterion("c1", "the README distinguishes the marker from a direct launch", issue3510Hint),
+	}, nil)
+
+	got := s.runAcceptancePrecheck(context.Background(), runRow.ID, runRow.ID, body)
+	if got == nil {
+		t.Fatal("want a non-nil result")
+	}
+	if got.RestatesTestCount != 0 {
+		t.Errorf("RestatesTestCount = %d, want 0 (the hint names a rendered file and disclaims being a Go test)", got.RestatesTestCount)
+	}
+	entry := lastAcceptancePrecheckEntry(t, au)
+	if entry.RestatesTestCount != 0 {
+		t.Errorf("persisted restates_test_count = %d, want 0", entry.RestatesTestCount)
+	}
+	if f := hasAcceptanceFinding(entry, acceptanceRuleCriterionRestatesTest); f != nil {
+		t.Errorf("want NO criterion_restates_test finding for the #3510 hint; got %+v", f)
+	}
+	if f := hasAcceptanceFinding(entry, acceptanceRuleNoObservableCriterion); f != nil {
+		t.Errorf("want NO no_observable_criterion finding for the #3510 hint; got %+v", f)
+	}
+}
+
 // (E72.1) The issue-title headline: an ALL-test-restating plan draws
 // no_observable_criterion in the persisted entry.
 func TestRunAcceptancePrecheck_NoObservableCriterion_Fires(t *testing.T) {
