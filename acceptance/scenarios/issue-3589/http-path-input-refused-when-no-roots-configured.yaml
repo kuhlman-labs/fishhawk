@@ -1,0 +1,14 @@
+id: scenario:issue-3589/http-path-input-refused-when-no-roots-configured
+statement: Over the HTTP MCP transport with no checkout roots configured, an MCP tool call that supplies a filesystem path input is refused, and the refusal text names path_outside_allowed_roots while reporting nothing about the named path's contents or whether it exists.
+verify_hint: 'MCP tool result: call fishhawk_validate over the preview''s POST /mcp with a working_dir argument and no configured roots; the tool result is an error whose text carries path_outside_allowed_roots. Marked non-blocking because the loopback-listener and bearer preconditions may not hold in the sandbox; the same behaviour is pinned hermetically by TestPathConfinement_EveryPathTakingVerb.'
+steps: 'Mint an fhm_ bearer: POST http://localhost:8090/v0/dev/fixtures {"scenario":"plan-gate-parked"}, POST /v0/runs/{run}/signing-key {}, POST /v0/dev/sign over ''{}'', then POST /v0/runs/{run}/mcp-token. Then POST http://localhost:8090/mcp tools/call fishhawk_validate with the bearer, Mcp-Method tools/call, Mcp-Name fishhawk_validate and params._meta. Use three argument sets: {working_dir:''/etc''} (exists), {working_dir:''/nonexistent/xyz''} (absent), and {spec_file:''/etc/hosts''}. The preview has no FISHHAWKD_MCP_ALLOWED_ROOTS.'
+assertions:
+    expected: Tool error naming path_outside_allowed_roots with no content or existence info
+    observed_at_record: 'All three return isError:true with ''path_outside_allowed_roots: no allowed checkout root is configured, so working_dir is refused over the HTTP MCP transport (fail closed); configure the allow-list with fishhawkd --mcp-allowed-roots / FISHHAWKD_MCP_ALLOWED_ROOTS, or fishhawk-mcp --allowed-roots / FISHHAWK_MCP_ALLOWED_ROOTS''. The spec_file variant names spec_file. The text is byte-identical for the existing and the absent path, and no file content appears.'
+    repro_handle: 'curl -XPOST http://localhost:8090/mcp -H ''Authorization: Bearer <fhm_>'' -H ''Mcp-Method: tools/call'' -H ''Mcp-Name: fishhawk_validate'' ... arguments {"working_dir":"/etc"}'
+origin:
+    issue: 3589
+    pr: 3708
+    run_id: 191fb53b-4243-4774-8e0b-cb4d78015927
+    head_sha: 4cd1d94eecfe0544cd158740530af76af7f2b0ba
+    recorded_at: 2026-09-26T19:06:06Z
