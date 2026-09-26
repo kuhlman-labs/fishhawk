@@ -19,6 +19,13 @@
 # --endpoint-url the CLI would otherwise address `<bucket>.<service>:9000`,
 # which cluster DNS cannot resolve.
 # A Kubernetes `command` overrides the image ENTRYPOINT (`aws`), so /bin/sh runs.
+#
+# The `endpoint=` / `bucket=` assignments are values-derived and land in a script
+# the CLUSTER RUNS, so both go through `fishhawk.shellQuote` (#2889) rather than
+# the bare-inside-double-quotes form they used to have: POSIX double quotes keep
+# `$`, backtick and backslash special, so `rustfs.bucket: 'b$(cmd)'` executed
+# `cmd` in the Job. The later `"$bucket"` / `"$endpoint"` EXPANSIONS are already
+# correct as double-quoted variable references and are deliberately unchanged.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -59,8 +66,8 @@ spec:
             - |
               set -e
               printf '[default]\ns3 =\n  addressing_style = path\n' > "$AWS_CONFIG_FILE"
-              endpoint="http://{{ include "fishhawk.fullname" . }}-rustfs:{{ .Values.rustfs.apiPort }}"
-              bucket="{{ .Values.rustfs.bucket }}"
+              endpoint={{ include "fishhawk.shellQuote" (printf "http://%s-rustfs:%v" (include "fishhawk.fullname" .) .Values.rustfs.apiPort) }}
+              bucket={{ include "fishhawk.shellQuote" .Values.rustfs.bucket }}
               echo "waiting for rustfs at $endpoint"
               until aws --endpoint-url "$endpoint" s3api list-buckets >/dev/null 2>&1; do
                 echo "rustfs not ready yet; retrying in 2s"
