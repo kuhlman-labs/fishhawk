@@ -680,8 +680,13 @@ func (s *Server) writeAlreadyMergedResponse(w http.ResponseWriter, r *http.Reque
 	msg := "the pull request is already merged, so no merge was queued."
 	switch {
 	case obs.AppendErr != nil:
-		msg += " The forge confirms the merge, but the merge_observation_recorded row could NOT be persisted (" +
-			obs.AppendErr.Error() + "); POST /v0/runs/{run_id}/record-merge-observation to record it."
+		// STATIC LITERAL, no cause interpolation: writeJSON (unlike writeError)
+		// applies no redaction at all, so a storage-layer error string
+		// interpolated here would reach the caller unfiltered. The raw cause is
+		// already emitted by observeMergeAlreadyLanded's LevelError log record at
+		// the append site, which stays the single operator-facing source.
+		msg += " The forge confirms the merge, but the merge_observation_recorded row could NOT be persisted; " +
+			"POST /v0/runs/{run_id}/record-merge-observation to record it."
 	case obs.Recorded:
 		msg += " This call recorded the merge observation on the run's audit chain."
 	default:
@@ -696,6 +701,7 @@ func (s *Server) writeAlreadyMergedResponse(w http.ResponseWriter, r *http.Reque
 		slog.String("run_id", runID.String()),
 		slog.String("forge_merge_state", obs.ForgeState),
 		slog.Bool("merge_observation_recorded", obs.Recorded),
+		slog.Bool("merge_observation_append_failed", obs.AppendErr != nil),
 		slog.String("run_state", runState))
 
 	s.writeJSON(w, r, http.StatusOK, mergeRunResponse{

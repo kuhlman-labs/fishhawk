@@ -115,6 +115,14 @@ undetected. (c) `workitems.go`'s `provider_unimplemented` 501 message carries
 product-owned `*workmgmt.UnknownProviderError` text (safe) and flows through a
 runtime-status `writeError`, so the guard reports it UNCHECKED and it is left
 unchanged; its message is safe and the file is out of this change's scope.
+(d) **`writeJSON` 2xx bodies have NO runtime redaction chokepoint and no AST
+tripwire at all** (E45.94 / [#3631](https://github.com/kuhlman-labs/fishhawk/issues/3631)):
+`writeError`'s allow-list and the raw-cause guard are both scoped to
+status-carrying refusals, so a raw cause interpolated into a `200`/`201`
+`message` field (the shape `merge_run.go`'s `writeAlreadyMergedResponse` fixed)
+is caught only by human review, never by a test or a static check. Recorded
+here rather than fixed structurally — the next such site needs a reviewer, not
+a tool.
 
 **Cross-boundary proof and the CLI golden.** `error_redaction_integration_test.go`
 stands the REAL server up on `httptest` with a provider failing on a cause
@@ -2486,7 +2494,7 @@ The operator recovery action that re-admits ANY terminal-`failed` run for anothe
 
   **On a hit the dispatch is SKIPPED**, `advanceRunAfterReviewResolve` best-effort settles the run (the same helper `reconcile-merge` uses — it no-ops on a nil orchestrator and on a stage set that is not all-terminal, and never unwinds), the run is re-read for `run_state`, and the answer is `200 already_merged:true` / `merge_queued:false`. `reconcile-merge`'s stage-supersede sweep is deliberately NOT folded in: `merge_observation.go`'s contract splits OBSERVE from SETTLE and this rung is the observe half, so a still-non-terminal run is NAMED in the message (`POST /v0/runs/{run_id}/reconcile-merge`) rather than force-settled here.
 
-  **`merge_observation_recorded` is true ONLY when THIS call's append SUCCEEDED** (binding approval condition 1). Two distinct falses: the chain already carried evidence (nothing to append), and the append FAILED. In the second case the merge is still NOT dispatched — it already happened, so dispatching would reproduce the very error this rung exists to prevent — and the message states the row could not be persisted and names `POST /v0/runs/{run_id}/record-merge-observation` as the recovery. `TestMergeRun_ForgeMergedButAppendFails` asserts zero merger calls with `merge_observation_recorded:false`.
+  **`merge_observation_recorded` is true ONLY when THIS call's append SUCCEEDED** (binding approval condition 1). Two distinct falses: the chain already carried evidence (nothing to append), and the append FAILED. In the second case the merge is still NOT dispatched — it already happened, so dispatching would reproduce the very error this rung exists to prevent — and the message states the row could not be persisted and names `POST /v0/runs/{run_id}/record-merge-observation` as the recovery. **The failed-append message is a STATIC LITERAL carrying no cause** (E45.94 / [#3631](https://github.com/kuhlman-labs/fishhawk/issues/3631)): `writeJSON` (unlike `writeError`) applies no redaction at all, so the append error's raw text — which can carry driver/DSN internals — is never interpolated into this `200` `message`; the raw cause stays available only in the `LevelError` log record `observeMergeAlreadyLanded` already emits at the append site. `TestMergeRun_ForgeMergedButAppendFails` asserts zero merger calls with `merge_observation_recorded:false`; `TestMergeRun_ForgeMergedButAppendFails_MessageOmitsRawCause` asserts the SHIPPED body carries neither of two planted markers while the captured log does.
 
   **FAIL-OPEN, in the `prMergeConflicting` posture.** Every uncertainty falls through to today's dispatch, byte-for-byte: an unresolvable or family-mismatched target, no forge reader, a `GetPullRequest` error, a not-merged answer, an empty merge commit SHA, a nil `merged_at`, and a CHAIN-READ error (logged at WARN and treated as NO evidence — never a `500`). One behavioural case per mode in `TestMergeRun_ObserveFailOpenModes`, each asserting exactly one dispatch and zero appended rows. The accepted risk is that a merged PR whose forge read fails still produces the `502`; the mitigations are the dispatch-error re-observe and the widened message below.
 
@@ -5409,6 +5417,8 @@ Every refusal is evaluated BEFORE any write, so a refused call leaves ZERO rows:
 | 409 | `record_merge_observation_no_merge_timestamp` | merged with a SHA but a nil `merged_at` — refuse the partial fact rather than claim a merge time it does not carry |
 
 A rung-6 idempotent 200 (`already_recorded:true`, appending NOTHING) fires when the chain already carries `pr_merged` / `post_merge_observed` / `merge_observation_recorded`.
+
+**The audit-append-failure `500` routes its cause through `internalCauseKey`** (E45.94 / [#3631](https://github.com/kuhlman-labs/fishhawk/issues/3631)) rather than a plain `"error"` details key. This is a CONFORMANCE change, not a body-content fix: `"error"` was never a member of `redactableDetailKeys`, so `writeError`'s 5xx default-deny allow-list already stripped it from the shipped body before this change. Routing it through `internalCauseKey` instead makes the operator-only intent explicit at the call site and folds the cause into the log record's dedicated `cause` attribute rather than an incidental `details.error` member; `details.run_id` (allow-listed) still gives the caller a correlation handle. `TestRecordMergeObservationAppendFailure_CauseIsOperatorOnly` pins the `cause`-attribute routing; `TestRecordMergeObservationAppendFailureIsAnError` is the unchanged regression pin on status/code/zero-rows.
 
 ### Forge-family URL resolution + per-forge reader dispatch (E64.40 / #3151)
 

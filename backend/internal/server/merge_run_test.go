@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -1915,6 +1916,63 @@ func TestMergeRun_ForgeMergedButAppendFails(t *testing.T) {
 	}
 	if !strings.Contains(resp.Message, "could NOT be persisted") {
 		t.Errorf("message must state the observation row could not be persisted; got %q", resp.Message)
+	}
+}
+
+// plantedAppendErrCause is a marker-bearing error text in the style of
+// error_redaction_integration_test.go's planted internals: a pgx-shaped
+// SQLSTATE fragment plus a host=...:5432 DSN fragment, neither of which may
+// ever reach the already-merged response's SHIPPED bytes.
+const plantedAppendErrCause = "storage: pgx: SQLSTATE 08006 dialing host=db.internal.example.com:5432 failed"
+
+// TestMergeRun_ForgeMergedButAppendFails_MessageOmitsRawCause is E45.94/#3631
+// binding approval condition 1's SURFACE A control: the forge confirms the
+// merge, the observation append fails with a marker-bearing cause, and the
+// SHIPPED 200 body must contain NEITHER planted marker while the message
+// keeps its established recovery substrings. The SAME test asserts the
+// planted cause DOES reach the captured operator log, so it pins the
+// REDIRECT (cause moved to the log), not merely the deletion.
+// COUNTERFACTUAL VEHICLE: restoring the obs.AppendErr.Error() interpolation
+// in writeAlreadyMergedResponse turns the body-contains-marker assertion RED.
+func TestMergeRun_ForgeMergedButAppendFails_MessageOmitsRawCause(t *testing.T) {
+	merger := &fakeMerger{}
+	s, repo, au := newAutoDriveMergeServer(t, merger)
+	var logBuf bytes.Buffer
+	s.cfg.Logger = slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	au.appendErrCategory = CategoryMergeObservationRecorded
+	au.appendErrCategoryErr = errors.New(plantedAppendErrCause)
+	s.cfg.PRStateReader = &fakePRStateReader{pr: mergedPR()}
+	runID := uuid.New()
+	seedObserveMergeRun(t, repo, runID, mergePR)
+	seedMergeVerdict(au, runID, 11)
+
+	w := postMergeRun(t, s, runID, mergeRunRequest{Verdict: "ship"}, withMergeOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if merger.called != 0 {
+		t.Errorf("merger called %d times, want 0 — the merge already happened", merger.called)
+	}
+	body := w.Body.String()
+	if strings.Contains(body, plantedAppendErrCause) {
+		t.Errorf("shipped body leaked the planted append-error cause: %s", body)
+	}
+	resp := decodeMergeResponse(t, w)
+	if !resp.AlreadyMerged || resp.MergeQueued {
+		t.Errorf("already_merged=%v merge_queued=%v; want true/false", resp.AlreadyMerged, resp.MergeQueued)
+	}
+	if resp.MergeObservationRecorded {
+		t.Error("merge_observation_recorded = true, want false — the append failed")
+	}
+	if !strings.Contains(resp.Message, "could NOT be persisted") {
+		t.Errorf("message must state the observation row could not be persisted; got %q", resp.Message)
+	}
+	if !strings.Contains(resp.Message, "record-merge-observation") {
+		t.Errorf("message must name record-merge-observation as the recovery; got %q", resp.Message)
+	}
+
+	if !strings.Contains(logBuf.String(), plantedAppendErrCause) {
+		t.Errorf("operator log must carry the planted cause (the redirect target); log:\n%s", logBuf.String())
 	}
 }
 
