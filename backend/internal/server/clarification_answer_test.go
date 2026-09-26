@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -374,32 +375,259 @@ func TestLoadClarificationAnswers_NewestWins(t *testing.T) {
 	}
 }
 
-// TestLoadClarificationAnswers_TruncatesOversizedBlob exercises the 4000-byte
-// cap: an answer payload larger than maxConditionBytes is truncated and the
-// "...[truncated]" marker is appended, so a pathological clarification answer
-// can never blow up the resumed plan prompt.
+// TestLoadClarificationAnswers_TruncatesOversizedBlob exercises the residual
+// cap, retargeted from the historical 4000 to prompt.MaxClarificationAnswerBytes
+// (#3063). Two halves:
+//
+//   - the #3063 live payload size (8256 bytes, three answers plus a trailing
+//     comment) now survives WHOLE where the old cap destroyed its tail;
+//   - a blob genuinely over the new cap is still truncated with the marker, so
+//     a pathological answer set can never blow up the resumed plan prompt.
 func TestLoadClarificationAnswers_TruncatesOversizedBlob(t *testing.T) {
-	runID := uuid.New()
-	au := newAuditFake()
-	rid := runID
-	const maxConditionBytes = 4000
-	oversized := strings.Repeat("x", maxConditionBytes+500)
-	payload, _ := json.Marshal(map[string]any{"conditions": oversized})
-	au.seeded = append(au.seeded,
-		&audit.Entry{RunID: &rid, Category: "clarification_answered", Payload: payload},
-	)
-	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
+	load := func(t *testing.T, blob string) *string {
+		t.Helper()
+		runID := uuid.New()
+		au := newAuditFake()
+		rid := runID
+		payload, _ := json.Marshal(map[string]any{"conditions": blob})
+		au.seeded = append(au.seeded,
+			&audit.Entry{RunID: &rid, Category: "clarification_answered", Payload: payload},
+		)
+		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
+		return s.loadClarificationAnswers(context.Background(), runID)
+	}
 
-	got := s.loadClarificationAnswers(context.Background(), runID)
-	if got == nil {
-		t.Fatal("loadClarificationAnswers returned nil, want the truncated blob")
+	t.Run("live-shaped 8256-byte blob survives whole", func(t *testing.T) {
+		// The exact #3063 loss: the LAST answer and the trailing comment are
+		// the bytes the 4000-byte cut destroyed first.
+		const lastAnswer = "LAST_ANSWER_MARKER_7984A5A8"
+		const comment = "TRAILING_COMMENT_MARKER_7984A5A8"
+		blob := "Qa (first?): " + strings.Repeat("a", 4000) + "\n" +
+			"Qb (second?): " + strings.Repeat("b", 4000) + "\n" +
+			"Qc (third?): " + strings.Repeat("c", 151) + " " + lastAnswer + "\n\n" + comment + "\n"
+		if len(blob) < 8256 {
+			t.Fatalf("fixture is %d bytes, want at least the 8256-byte #3063 payload", len(blob))
+		}
+		got := load(t, blob)
+		if got == nil {
+			t.Fatal("loadClarificationAnswers returned nil, want the whole blob")
+		}
+		if *got != blob {
+			t.Errorf("the %d-byte live-shaped blob was altered by the loader (got %d bytes)", len(blob), len(*got))
+		}
+		for _, want := range []string{lastAnswer, comment} {
+			if !strings.Contains(*got, want) {
+				t.Errorf("the loader dropped %q — the exact bytes #3063 lost at the old 4000-byte cap", want)
+			}
+		}
+		if strings.Contains(*got, "...[truncated]") {
+			t.Errorf("an under-cap blob was marked truncated")
+		}
+	})
+
+	t.Run("over the new cap is still truncated", func(t *testing.T) {
+		oversized := strings.Repeat("x", prompt.MaxClarificationAnswerBytes+500)
+		got := load(t, oversized)
+		if got == nil {
+			t.Fatal("loadClarificationAnswers returned nil, want the truncated blob")
+		}
+		want := strings.Repeat("x", prompt.MaxClarificationAnswerBytes) + "...[truncated]"
+		if *got != want {
+			t.Errorf("blob not truncated: len=%d, want %d + marker", len(*got), prompt.MaxClarificationAnswerBytes)
+		}
+	})
+}
+
+// overCapClarificationAnswer builds an answer string sized BY CONSTRUCTION so
+// that renderClarificationAnswers' output for the single seeded parked question
+// lands exactly `overBy` bytes past prompt.MaxClarificationAnswerBytes.
+//
+// It derives the size from the constant and the renderer's own framing rather
+// than calling the validator in the fixture: a fixture that consulted the
+// control under test would make a deleted control fail in SETUP, and the RED
+// would land on the fixture instead of on the behavioral assertion.
+func overCapClarificationAnswer(t *testing.T, overBy int) string {
+	t.Helper()
+	// renderClarificationAnswers emits "Q<id> (<question>): <answer>\n" — the
+	// framing counts toward the cap, which is why the gate measures the
+	// RENDERED blob and not the operator's raw text.
+	framing := len("Qauth-backend (Which auth backend should the token store use?): ") + len("\n")
+	n := prompt.MaxClarificationAnswerBytes + overBy - framing
+	if n <= 0 {
+		t.Fatalf("framing %d already exceeds the cap; fixture cannot be built", framing)
 	}
-	want := strings.Repeat("x", maxConditionBytes) + "...[truncated]"
-	if *got != want {
-		t.Errorf("blob not truncated: len=%d, want %d + marker", len(*got), maxConditionBytes)
+	return strings.Repeat("x", n)
+}
+
+// TestAnswerClarification_OverCapAnswersRefused is CONTROL 1's error-identity
+// half (#3063): the handler refuses a rendered blob one byte over the cap with
+// 400 validation_failed naming bytes / max_bytes / overflow_bytes. This is
+// necessary but NOT sufficient — the control's real effect is COMMITTED STATE,
+// which the sibling test below reads.
+func TestAnswerClarification_OverCapAnswersRefused(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, _, _ := newClarificationServer(t, runID, stageID, run.StageStateAwaitingInput, run.StageTypePlan)
+
+	body, _ := json.Marshal(clarificationAnswerRequest{
+		Answers: []clarificationAnswerItem{{ID: "auth-backend", Answer: overCapClarificationAnswer(t, 1)}},
+	})
+	w := answerClarification(t, s, stageID, string(body))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
 	}
-	if !strings.HasSuffix(*got, "...[truncated]") {
-		t.Errorf("truncated blob missing marker suffix: %q", (*got)[len(*got)-32:])
+	var errBody struct {
+		Error struct {
+			Code    string         `json:"code"`
+			Message string         `json:"message"`
+			Details map[string]any `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &errBody); err != nil {
+		t.Fatalf("decode error body: %v\n%s", err, w.Body.String())
+	}
+	if errBody.Error.Code != "validation_failed" {
+		t.Errorf("code = %q, want validation_failed", errBody.Error.Code)
+	}
+	wantDetails := map[string]float64{
+		"bytes":          float64(prompt.MaxClarificationAnswerBytes + 1),
+		"max_bytes":      float64(prompt.MaxClarificationAnswerBytes),
+		"overflow_bytes": 1,
+	}
+	for k, want := range wantDetails {
+		got, ok := errBody.Error.Details[k].(float64)
+		if !ok {
+			t.Errorf("details[%q] absent or not a number: %v", k, errBody.Error.Details[k])
+			continue
+		}
+		if got != want {
+			t.Errorf("details[%q] = %v, want %v", k, got, want)
+		}
+	}
+	if !strings.Contains(errBody.Error.Message, "re-answerable") {
+		t.Errorf("the refusal message must tell the operator the stage is re-answerable: %q", errBody.Error.Message)
+	}
+}
+
+// TestAnswerClarification_OverCapAnswersRefused_StageStillParkedNoAudit is
+// CONTROL 1's load-bearing half. The refusal's effect is COMMITTED STATE, and a
+// control that fired and was then rolled back would return a byte-identical
+// error — so this reads the state AFTER the call returns: no
+// clarification_answered entry, the stage still plan/awaiting_input, and a
+// subsequent UNDER-cap answer through the same handler SUCCEEDS, proving the
+// stage is genuinely re-answerable rather than merely reported as such.
+//
+// Deleting the validateClarificationAnswers call site in
+// handleAnswerClarification reddens the persisted-entry assertion here, which
+// no error-identity check could catch.
+func TestAnswerClarification_OverCapAnswersRefused_StageStillParkedNoAudit(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, rr, au := newClarificationServer(t, runID, stageID, run.StageStateAwaitingInput, run.StageTypePlan)
+
+	body, _ := json.Marshal(clarificationAnswerRequest{
+		Answers: []clarificationAnswerItem{{ID: "auth-backend", Answer: overCapClarificationAnswer(t, 1)}},
+		Comment: "and one more thing",
+	})
+	// Deliberately NON-fatal: the point of this test is the COMMITTED-STATE
+	// reads below, which an error-identity assertion cannot make. If the status
+	// assertion were fatal, deleting the control would redden this test on its
+	// precondition and the state assertions would never run — leaving the claim
+	// that they bite unproven.
+	if w := answerClarification(t, s, stageID, string(body)); w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+	}
+
+	// (a) Nothing was recorded.
+	answered, err := au.ListForRunByCategory(context.Background(), runID, "clarification_answered")
+	if err != nil {
+		t.Fatalf("ListForRunByCategory: %v", err)
+	}
+	if len(answered) != 0 {
+		t.Fatalf("clarification_answered entries after the refused call = %d, want 0 — the refusal must precede every stateful step", len(answered))
+	}
+
+	// (b) The stage never moved: no transition was even attempted.
+	for _, c := range rr.transitionStageCalls {
+		t.Errorf("the refused call attempted a stage transition to %s", c.To)
+	}
+	st, err := rr.GetStage(context.Background(), stageID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if st.Type != run.StageTypePlan || st.State != run.StageStateAwaitingInput {
+		t.Errorf("stage is %s/%s, want plan/awaiting_input (still parked)", st.Type, st.State)
+	}
+
+	// (c) The stage is genuinely re-answerable: an under-cap answer succeeds.
+	ok, _ := json.Marshal(clarificationAnswerRequest{
+		Answers: []clarificationAnswerItem{{ID: "auth-backend", Answer: "Postgres"}},
+	})
+	w := answerClarification(t, s, stageID, string(ok))
+	if w.Code != http.StatusOK {
+		t.Fatalf("the re-answer status = %d, want 200 — the refusal must consume nothing:\n%s", w.Code, w.Body.String())
+	}
+	answered, err = au.ListForRunByCategory(context.Background(), runID, "clarification_answered")
+	if err != nil {
+		t.Fatalf("ListForRunByCategory (post re-answer): %v", err)
+	}
+	if len(answered) != 1 {
+		t.Errorf("clarification_answered entries after the re-answer = %d, want exactly 1", len(answered))
+	}
+}
+
+// TestAnswerClarification_UnderCapAnswersAccepted is the control the issue
+// demands: an ordinary submission — including one at the #3063 live payload
+// size, which the OLD cap would have cut — still returns 200, transitions to
+// pending, and writes exactly one clarification_answered entry carrying the
+// answer WHOLE. A refusal that fires too eagerly is caught here.
+func TestAnswerClarification_UnderCapAnswersAccepted(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, _, au := newClarificationServer(t, runID, stageID, run.StageStateAwaitingInput, run.StageTypePlan)
+
+	const tailMarker = "ANSWER_TAIL_MARKER_7984A5A8"
+	answer := "Postgres. " + strings.Repeat("a", 8000) + " " + tailMarker
+	body, _ := json.Marshal(clarificationAnswerRequest{
+		Answers: []clarificationAnswerItem{{ID: "auth-backend", Answer: answer}},
+		Comment: "go with the default",
+	})
+	w := answerClarification(t, s, stageID, string(body))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 for an under-cap submission:\n%s", w.Code, w.Body.String())
+	}
+	var got stageResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.State != string(run.StageStatePending) {
+		t.Errorf("State = %q, want pending", got.State)
+	}
+	if len(au.appended) != 1 {
+		t.Fatalf("audit entries = %d, want exactly 1", len(au.appended))
+	}
+	if au.appended[0].Category != "clarification_answered" {
+		t.Errorf("audit category = %q, want clarification_answered", au.appended[0].Category)
+	}
+	if !bytes.Contains(au.appended[0].Payload, []byte(tailMarker)) {
+		t.Errorf("the persisted payload lost the answer's tail %q — an 8000-byte answer must be stored whole", tailMarker)
+	}
+}
+
+// TestValidateClarificationAnswers_Boundary pins the > not >= boundary the
+// validator shares with CapText: a rendered blob of EXACTLY the cap is
+// admissible; one byte more is not.
+func TestValidateClarificationAnswers_Boundary(t *testing.T) {
+	atCap := strings.Repeat("x", prompt.MaxClarificationAnswerBytes)
+	if ok, msg, details := validateClarificationAnswers(atCap); !ok {
+		t.Errorf("an exactly-at-cap blob was refused: %s %v", msg, details)
+	}
+	ok, msg, details := validateClarificationAnswers(atCap + "x")
+	if ok {
+		t.Fatalf("a one-byte-over blob was admitted")
+	}
+	if details["overflow_bytes"] != 1 {
+		t.Errorf("overflow_bytes = %v, want 1", details["overflow_bytes"])
+	}
+	if !strings.Contains(msg, "LAST answer") {
+		t.Errorf("the refusal message must name WHICH answer a cut destroys first: %q", msg)
 	}
 }
 

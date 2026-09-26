@@ -5609,11 +5609,36 @@ func (s *Server) appendApprovalConditionsTruncatedAudit(ctx context.Context, run
 	}
 }
 
+// CategoryClarificationAnswersTruncated is the audit category emitted when a
+// stored clarification-answers blob is truncated at plan-prompt-build time
+// (#3063). Since the answer gate now refuses an over-cap submission
+// (handleAnswerClarification → validateClarificationAnswers), this path is
+// reachable ONLY for a blob stored BEFORE that gate existed, or via a channel
+// that bypasses it. The entry makes that residual truncation VISIBLE in the run
+// record rather than dropping the operator's LAST answer unseen.
+//
+// The append is idempotent per (run, source clarification answer): at most one
+// entry per (run_id, source_entry_id) is enforced by migration 0086's partial
+// unique index. Prompt construction for a stage repeats (retries, prompt-render
+// fetches), so without the index one truncation would accumulate N entries and
+// the observability surface would report one dropped answer as five. Exactly
+// mirrors CategoryApprovalConditionsTruncated / migration 0068 (#2622).
+const CategoryClarificationAnswersTruncated = "clarification_answers_truncated"
+
 // loadClarificationAnswers scans the run's clarification_answered audit
 // entries (newest-first) for the first entry carrying a non-empty rendered
 // `conditions` blob — the operator's answers to a parked clarification_request
-// (#1088). Returns the blob (capped at 4000 bytes) or nil when none is found.
-// Best-effort: WARN-logs and returns nil on any error.
+// (#1088). Returns the blob (capped at prompt.MaxClarificationAnswerBytes) or
+// nil when none is found. Best-effort: WARN-logs and returns nil on any error.
+//
+// The cap is the SAME constant the renderer (prompt.writeClarificationAnswers)
+// applies, so the loader and the renderer agree on ONE value and the #2871
+// two-caps-lower-one-wins-silently shape cannot recur here (#3063: the historical
+// 4000 was applied by BOTH, and the loader's cut was the binding one in
+// production). When the stored blob exceeds the cap it is truncated AND a
+// clarification_answers_truncated audit entry is appended (best-effort) so the
+// residual drop is visible; that append is idempotent per (run, source answer
+// entry) via migration 0086's partial unique index.
 //
 // This is a DEDICATED channel, isolated from loadApprovalConditions'
 // approval_submitted entries: a plan stage parked at awaiting_input is NOT
@@ -5640,16 +5665,76 @@ func (s *Server) loadClarificationAnswers(ctx context.Context, runID uuid.UUID) 
 			continue
 		}
 		if payload.Conditions != "" {
-			c, _ := prompt.CapText(payload.Conditions, prompt.MaxConditionBytes)
+			c, truncated := prompt.CapText(payload.Conditions, prompt.MaxClarificationAnswerBytes)
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
 				"prompt: loaded clarification answers into resumed plan prompt",
 				slog.String("run_id", runID.String()),
 				slog.Int("conditions_bytes", len(payload.Conditions)),
+				slog.Bool("truncated", truncated),
 			)
+			if truncated {
+				s.appendClarificationAnswersTruncatedAudit(ctx, runID, entries[i].ID, len(payload.Conditions))
+			}
 			return &c
 		}
 	}
 	return nil
+}
+
+// appendClarificationAnswersTruncatedAudit records the residual truncation of a
+// stored over-cap clarification-answers blob (#3063). Best-effort: a WARN-logged
+// append failure never blocks prompt construction, matching the surrounding
+// loader style. Payload records the original size, the cap, the dropped-byte
+// count, tagged source="clarification_answered" (the channel the truncated blob
+// was read from), AND source_entry_id — the id of the clarification_answered
+// entry whose blob was truncated. source_entry_id is the key of migration
+// 0086's partial unique index: it makes the append idempotent per (run, source
+// answer set) so repeated prompt builds do not multiply the entry, while a
+// SECOND, genuinely different over-cap answer set in the same run (a re-park
+// and re-answer) still records its own truncation under its own key.
+//
+// On an 0086 collision (this truncation was already recorded on an earlier
+// prompt build) AppendChained returns an
+// audit.IsClarificationAnswersTruncatedDuplicate error; that is the benign
+// already-recorded outcome, logged at INFO and NOT WARN. Every other append
+// error keeps the WARN. Modelled line-for-line on
+// appendApprovalConditionsTruncatedAudit (#2583/#2622), including its reasoning
+// for adding no pre-read fast path: the append is reached only on the rare
+// legacy over-cap path, so a doomed INSERT that rolls back is cheaper than an
+// unconditional scan on every truncating build, and a read-then-append would
+// reintroduce the check-then-append race #2594 was filed to eliminate.
+func (s *Server) appendClarificationAnswersTruncatedAudit(ctx context.Context, runID, sourceEntryID uuid.UUID, originalBytes int) {
+	if s.cfg.AuditRepo == nil {
+		return
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"original_bytes":  originalBytes,
+		"cap_bytes":       prompt.MaxClarificationAnswerBytes,
+		"dropped_bytes":   originalBytes - prompt.MaxClarificationAnswerBytes,
+		"source":          "clarification_answered",
+		"source_entry_id": sourceEntryID.String(),
+	})
+	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		Timestamp: time.Now().UTC(),
+		Category:  CategoryClarificationAnswersTruncated,
+		Payload:   payload,
+	}); err != nil {
+		if audit.IsClarificationAnswersTruncatedDuplicate(err) {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+				"prompt: clarification_answers_truncated already recorded for this answer set",
+				slog.String("run_id", runID.String()),
+				slog.String("source_entry_id", sourceEntryID.String()),
+				slog.Int("original_bytes", originalBytes),
+			)
+			return
+		}
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"prompt: append clarification_answers_truncated audit failed",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()),
+		)
+	}
 }
 
 // loadRevisionConstraint scans the run's plan_revised audit entries

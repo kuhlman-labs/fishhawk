@@ -11978,6 +11978,262 @@ func TestLoadApprovalConditions_DistinctOverCapComments_AppendOneEach(t *testing
 	}
 }
 
+// --- clarification_answers_truncated audit event (#3063) ---
+
+// makeClarificationAnsweredEntry builds a clarification_answered audit entry
+// carrying the rendered answers blob under the `conditions` payload key — the
+// shape handleAnswerClarification persists and loadClarificationAnswers reads.
+func makeClarificationAnsweredEntry(runID uuid.UUID, conditions string) *audit.Entry {
+	payload, _ := json.Marshal(map[string]any{"conditions": conditions})
+	rid := runID
+	return &audit.Entry{ID: uuid.New(), Category: "clarification_answered", RunID: &rid, Payload: payload}
+}
+
+// clarificationIndexedAuditRepo enforces migration 0086's partial unique index
+// in memory: an AppendChained for category clarification_answers_truncated
+// whose (run_id, payload source_entry_id) pair is already stored returns
+// audit.ErrClarificationAnswersTruncatedDuplicate and stores nothing. Mirrors
+// indexedAuditRepo (the 0068 analogue).
+type clarificationIndexedAuditRepo struct {
+	*storingAuditRepo
+}
+
+func newClarificationIndexedAuditRepo() *clarificationIndexedAuditRepo {
+	return &clarificationIndexedAuditRepo{storingAuditRepo: newStoringAuditRepo()}
+}
+
+func (a *clarificationIndexedAuditRepo) AppendChained(ctx context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
+	if p.Category == CategoryClarificationAnswersTruncated {
+		var incoming struct {
+			SourceEntryID string `json:"source_entry_id"`
+		}
+		_ = json.Unmarshal(p.Payload, &incoming)
+		for _, e := range a.byRunID[p.RunID] {
+			if e.Category != CategoryClarificationAnswersTruncated {
+				continue
+			}
+			var stored struct {
+				SourceEntryID string `json:"source_entry_id"`
+			}
+			_ = json.Unmarshal(e.Payload, &stored)
+			if stored.SourceEntryID == incoming.SourceEntryID {
+				return nil, audit.ErrClarificationAnswersTruncatedDuplicate
+			}
+		}
+	}
+	return a.storingAuditRepo.AppendChained(ctx, p)
+}
+
+// clarificationDupAuditRepo returns the 0086 duplicate sentinel from every
+// truncation append, simulating the already-recorded outcome.
+type clarificationDupAuditRepo struct {
+	*storingAuditRepo
+}
+
+func (a *clarificationDupAuditRepo) AppendChained(_ context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
+	if p.Category == CategoryClarificationAnswersTruncated {
+		return nil, audit.ErrClarificationAnswersTruncatedDuplicate
+	}
+	return a.storingAuditRepo.AppendChained(context.Background(), p)
+}
+
+// TestLoadClarificationAnswers_OverCapAppendsTruncatedAudit is CONTROL 3's
+// headline: a stored over-cap answers blob is capped at plan-prompt-build time
+// AND appends exactly one clarification_answers_truncated entry carrying
+// original_bytes / cap_bytes / dropped_bytes / source / source_entry_id.
+// Deleting the emitter call in loadClarificationAnswers reddens this.
+func TestLoadClarificationAnswers_OverCapAppendsTruncatedAudit(t *testing.T) {
+	runID := uuid.New()
+	dropped := 500
+	original := prompt.MaxClarificationAnswerBytes + dropped
+	ar := newStoringAuditRepo()
+	sourceEntry := makeClarificationAnsweredEntry(runID, strings.Repeat("a", original))
+	ar.byRunID[runID] = []*audit.Entry{sourceEntry}
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: ar})
+
+	got := s.loadClarificationAnswers(context.Background(), runID)
+	if got == nil || !strings.HasSuffix(*got, "...[truncated]") {
+		t.Fatalf("expected a truncated answers blob; got %v", got)
+	}
+
+	entries, err := ar.ListForRunByCategory(context.Background(), runID, CategoryClarificationAnswersTruncated)
+	if err != nil {
+		t.Fatalf("list truncated audit: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("clarification_answers_truncated entries = %d, want exactly 1", len(entries))
+	}
+	var payload struct {
+		OriginalBytes int    `json:"original_bytes"`
+		CapBytes      int    `json:"cap_bytes"`
+		DroppedBytes  int    `json:"dropped_bytes"`
+		Source        string `json:"source"`
+		SourceEntryID string `json:"source_entry_id"`
+	}
+	if err := json.Unmarshal(entries[0].Payload, &payload); err != nil {
+		t.Fatalf("unmarshal truncated payload: %v", err)
+	}
+	if payload.OriginalBytes != original {
+		t.Errorf("original_bytes = %d, want %d", payload.OriginalBytes, original)
+	}
+	if payload.CapBytes != prompt.MaxClarificationAnswerBytes {
+		t.Errorf("cap_bytes = %d, want %d", payload.CapBytes, prompt.MaxClarificationAnswerBytes)
+	}
+	if payload.DroppedBytes != dropped {
+		t.Errorf("dropped_bytes = %d, want %d", payload.DroppedBytes, dropped)
+	}
+	if payload.Source != "clarification_answered" {
+		t.Errorf("source = %q, want clarification_answered", payload.Source)
+	}
+	// source_entry_id is the 0086 index key: the id of the
+	// clarification_answered entry whose blob was truncated.
+	if payload.SourceEntryID != sourceEntry.ID.String() {
+		t.Errorf("source_entry_id = %q, want the seeded answer entry's id %q", payload.SourceEntryID, sourceEntry.ID.String())
+	}
+}
+
+// TestLoadClarificationAnswers_UnderCapAppendsNothing is CONTROL 3's control:
+// an under-cap blob — including one at the #3063 live payload size, which the
+// OLD 4000-byte loader cap would have cut — appends NO entry and renders whole.
+func TestLoadClarificationAnswers_UnderCapAppendsNothing(t *testing.T) {
+	runID := uuid.New()
+	blob := "Qa (first?): " + strings.Repeat("a", 8200) + " TAIL_MARKER"
+	ar := newStoringAuditRepo()
+	ar.byRunID[runID] = []*audit.Entry{makeClarificationAnsweredEntry(runID, blob)}
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: ar})
+
+	got := s.loadClarificationAnswers(context.Background(), runID)
+	if got == nil || *got != blob {
+		t.Fatalf("under-cap answers must load verbatim; got %v", got)
+	}
+	if n := countStoredCategory(t, ar, runID, CategoryClarificationAnswersTruncated); n != 0 {
+		t.Errorf("clarification_answers_truncated entries = %d, want 0 for an under-cap blob", n)
+	}
+}
+
+// TestLoadClarificationAnswers_RepeatedBuildsAppendOnce: three loads of the
+// SAME over-cap blob against a fake enforcing the 0086 key leave exactly one
+// entry, and every load still returns the capped blob. Deleting the
+// IsClarificationAnswersTruncatedDuplicate narrowing in the emitter turns the
+// benign collision into a WARN — and narrowing the index key to run_id alone
+// would redden the distinct-sources test below.
+func TestLoadClarificationAnswers_RepeatedBuildsAppendOnce(t *testing.T) {
+	runID := uuid.New()
+	ar := newClarificationIndexedAuditRepo()
+	ar.byRunID[runID] = []*audit.Entry{
+		makeClarificationAnsweredEntry(runID, strings.Repeat("a", prompt.MaxClarificationAnswerBytes+500)),
+	}
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: ar})
+
+	for i := 0; i < 3; i++ {
+		got := s.loadClarificationAnswers(context.Background(), runID)
+		if got == nil || !strings.HasSuffix(*got, "...[truncated]") {
+			t.Fatalf("call %d: expected the capped blob; got %v", i, got)
+		}
+	}
+	if n := countStoredCategory(t, ar.storingAuditRepo, runID, CategoryClarificationAnswersTruncated); n != 1 {
+		t.Fatalf("clarification_answers_truncated entries after 3 loads = %d, want exactly 1 (repeated builds must not multiply the entry)", n)
+	}
+}
+
+// TestLoadClarificationAnswers_DuplicateAppendLogsInfoNotWarn pins the
+// duplicate-tolerant branch: an 0086 collision is the benign already-recorded
+// outcome — logged at INFO, NOT the append-failure WARN — and the prompt still
+// gets the capped blob.
+func TestLoadClarificationAnswers_DuplicateAppendLogsInfoNotWarn(t *testing.T) {
+	runID := uuid.New()
+	store := newStoringAuditRepo()
+	store.byRunID[runID] = []*audit.Entry{
+		makeClarificationAnsweredEntry(runID, strings.Repeat("a", prompt.MaxClarificationAnswerBytes+100)),
+	}
+	ar := &clarificationDupAuditRepo{storingAuditRepo: store}
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: ar, Logger: logger})
+
+	got := s.loadClarificationAnswers(context.Background(), runID)
+	if got == nil || !strings.HasSuffix(*got, "...[truncated]") {
+		t.Fatalf("a duplicate append must not block prompt build; got %v", got)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "already recorded for this answer set") {
+		t.Errorf("expected the INFO already-recorded message in the log; got:\n%s", out)
+	}
+	if strings.Contains(out, "append clarification_answers_truncated audit failed") {
+		t.Errorf("the WARN append-failure message must be ABSENT on a benign duplicate; got:\n%s", out)
+	}
+}
+
+// TestLoadClarificationAnswers_DistinctSourceEntriesEachAudited is the
+// run_id-only-key counterfactual: two clarification_answered entries with
+// DIFFERENT ids and different over-cap blobs — a re-park and re-answer cycle —
+// must each record their OWN truncation under a distinct source_entry_id. A
+// run_id-only key would suppress the second.
+func TestLoadClarificationAnswers_DistinctSourceEntriesEachAudited(t *testing.T) {
+	runID := uuid.New()
+	ar := newClarificationIndexedAuditRepo()
+	first := makeClarificationAnsweredEntry(runID, strings.Repeat("a", prompt.MaxClarificationAnswerBytes+100))
+	ar.byRunID[runID] = []*audit.Entry{first}
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: ar})
+
+	if got := s.loadClarificationAnswers(context.Background(), runID); got == nil {
+		t.Fatal("first load returned nil answers")
+	}
+	// The planner parks again with new questions and the operator answers
+	// again; the newer entry wins the newest-first scan.
+	second := makeClarificationAnsweredEntry(runID, strings.Repeat("b", prompt.MaxClarificationAnswerBytes+200))
+	ar.byRunID[runID] = append(ar.byRunID[runID], second)
+	if got := s.loadClarificationAnswers(context.Background(), runID); got == nil {
+		t.Fatal("second load returned nil answers")
+	}
+
+	entries, err := ar.ListForRunByCategory(context.Background(), runID, CategoryClarificationAnswersTruncated)
+	if err != nil {
+		t.Fatalf("list truncated: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("clarification_answers_truncated entries for two distinct over-cap blobs = %d, want 2 (a run_id-only key would suppress the second)", len(entries))
+	}
+	seen := map[string]bool{}
+	for _, e := range entries {
+		var pl struct {
+			SourceEntryID string `json:"source_entry_id"`
+		}
+		if err := json.Unmarshal(e.Payload, &pl); err != nil {
+			t.Fatalf("unmarshal payload: %v", err)
+		}
+		seen[pl.SourceEntryID] = true
+	}
+	if !seen[first.ID.String()] || !seen[second.ID.String()] {
+		t.Errorf("source_entry_id set = %v, want both %q and %q", seen, first.ID.String(), second.ID.String())
+	}
+}
+
+// TestLoadClarificationAnswers_AppendFailureDoesNotBlockPrompt: a failing
+// AuditRepo on the truncation-audit path is non-fatal — WARN-logged, and the
+// capped blob still reaches the prompt.
+func TestLoadClarificationAnswers_AppendFailureDoesNotBlockPrompt(t *testing.T) {
+	runID := uuid.New()
+	store := newStoringAuditRepo()
+	store.byRunID[runID] = []*audit.Entry{
+		makeClarificationAnsweredEntry(runID, strings.Repeat("a", prompt.MaxClarificationAnswerBytes+100)),
+	}
+	ar := &appendFailAuditRepo{storingAuditRepo: store, appendErr: errors.New("audit append boom")}
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: ar, Logger: logger})
+
+	got := s.loadClarificationAnswers(context.Background(), runID)
+	if got == nil || !strings.HasSuffix(*got, "...[truncated]") {
+		t.Fatalf("an append failure must not block prompt build; got %v", got)
+	}
+	if !strings.Contains(buf.String(), "append clarification_answers_truncated audit failed") {
+		t.Errorf("expected the WARN append-failure message; got:\n%s", buf.String())
+	}
+}
+
 // TestLoadApprovalConditions_RealPostgres_RepeatedLoads_Deduplicated is the
 // CONDITION 1 emitter→index seam proof (#2622). Unlike the in-memory-fake tests
 // above (whose payload key and dedup rule are asserted separately), this drives a

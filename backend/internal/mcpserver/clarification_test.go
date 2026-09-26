@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // --- fishhawk_answer_clarification (#1088) ---
@@ -139,6 +140,108 @@ func TestAnswerClarification_AnswerInvalid_MapsActionableError(t *testing.T) {
 	for _, want := range []string{"clarification_answer_invalid", "does not match any parked question", "exactly one answer"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("err %q missing %q", err.Error(), want)
+		}
+	}
+}
+
+// TestAnswerClarification_OverCap_MapsByteAccountingError pins the #3063
+// over-cap arm: the backend's 400 validation_failed carries bytes / max_bytes /
+// overflow_bytes in details, and the tool error must surface all three plus the
+// consumed-nothing guarantee, so the operator can resize without a second round
+// trip. Deleting the details-reading branch drops the byte accounting and the
+// "still parked" clause, reddening this.
+func TestAnswerClarification_OverCap_MapsByteAccountingError(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	planStageID := uuid.New()
+	fb.stagesByRun[runID] = []Stage{{ID: planStageID.String(), Type: "plan", State: "awaiting_input"}}
+	fb.clarificationStatus = http.StatusBadRequest
+	fb.clarificationErrBody = `{"error":{"code":"validation_failed","message":"clarification answers render to 12500 bytes; the maximum is 12000","details":{"field":"answers","bytes":12500,"max_bytes":12000,"overflow_bytes":500}}}`
+	r := newResolver(srv, nil)
+
+	_, _, err := r.answerClarification(context.Background(), nil, AnswerClarificationInput{
+		RunID:   runID.String(),
+		Answers: []ClarificationAnswer{{ID: "1", Answer: "x"}},
+	})
+	if err == nil {
+		t.Fatal("err = nil, want the over-cap validation_failed mapping")
+	}
+	for _, want := range []string{
+		"validation_failed", "12500 bytes", "maximum is 12000", "500 over",
+		"nothing was recorded", "still parked at awaiting_input",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("err %q missing %q", err.Error(), want)
+		}
+	}
+}
+
+// TestAnswerClarification_ValidationFailedWithoutDetails_FallsBack is the
+// fallback control: a validation_failed carrying NO byte details (a malformed
+// body, a bad stage id) must degrade to the bare server message rather than
+// printing zeros the handler invented.
+func TestAnswerClarification_ValidationFailedWithoutDetails_FallsBack(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	planStageID := uuid.New()
+	fb.stagesByRun[runID] = []Stage{{ID: planStageID.String(), Type: "plan", State: "awaiting_input"}}
+	fb.clarificationStatus = http.StatusBadRequest
+	fb.clarificationErrBody = `{"error":{"code":"validation_failed","message":"stage_id must be a valid UUID"}}`
+	r := newResolver(srv, nil)
+
+	_, _, err := r.answerClarification(context.Background(), nil, AnswerClarificationInput{
+		RunID:   runID.String(),
+		Answers: []ClarificationAnswer{{ID: "1", Answer: "x"}},
+	})
+	if err == nil {
+		t.Fatal("err = nil, want the bare validation_failed mapping")
+	}
+	if got := err.Error(); got != "validation_failed: stage_id must be a valid UUID" {
+		t.Errorf("err = %q, want the bare server message with no invented byte accounting", got)
+	}
+}
+
+// TestAnswerClarification_ToolDescriptionDocumentsTheCap pins the issue's core
+// complaint: the cap must be DISCOVERABLE from the tool description, not only
+// from a refusal after the fact. The assertions are on the cap VALUE and the
+// refuse-not-truncate posture, not on a full sentence a copy-edit would delete.
+func TestAnswerClarification_ToolDescriptionDocumentsTheCap(t *testing.T) {
+	ctx := context.Background()
+	srv := mcp.NewServer(&mcp.Implementation{Name: "fishhawk", Version: "test"}, nil)
+	registerAnswerClarification(srv, nil)
+
+	// Drive a real ListTools round-trip so the assertion runs against the
+	// WIRE-VISIBLE description the operator's agent actually reads, not the
+	// in-process registration struct.
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := srv.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	defer func() { _ = serverSession.Close() }()
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	defer func() { _ = clientSession.Close() }()
+
+	res, err := clientSession.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	var desc string
+	for _, tool := range res.Tools {
+		if tool.Name == "fishhawk_answer_clarification" {
+			desc = tool.Description
+		}
+	}
+	if desc == "" {
+		t.Fatal("fishhawk_answer_clarification is not wire-visible")
+	}
+	for _, want := range []string{"12000 bytes", "REFUSED", "re-answerable"} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("fishhawk_answer_clarification description missing %q:\n%s", want, desc)
 		}
 	}
 }

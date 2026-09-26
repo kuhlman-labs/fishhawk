@@ -1,0 +1,43 @@
+-- 0086: at-most-one clarification_answers_truncated audit entry per (run,
+-- source clarification answer) (E68.29 / #3063).
+--
+-- loadClarificationAnswers (server/prompt.go) appends a
+-- clarification_answers_truncated audit entry on EVERY plan-prompt build that
+-- loads a legacy over-cap clarification-answers blob (#3063). Prompt
+-- construction for a stage happens more than once (retries, prompt-render
+-- fetches), so ONE truncated answer set would accumulate N entries in the run's
+-- audit chain. The entry exists so a dropped operator ANSWER is VISIBLE in the
+-- run record; five entries for one truncation tells the operator something
+-- false. This partial unique index makes the repeated append idempotent per
+-- truncated source answer set at the DB level.
+--
+-- The key is (run_id, source_entry_id), NOT run_id alone: a run can carry two
+-- DISTINCT over-cap answer blobs across a re-park cycle (the planner parks a
+-- second time with new questions and the operator answers again), and each
+-- genuine truncation must still be reported ONCE. source_entry_id is the id of
+-- the clarification_answered audit entry whose blob was truncated — keying on
+-- the SOURCE answer entry means a genuinely second truncation from a different
+-- answer set still records. A run_id-only key would silently suppress the
+-- second drop, which is the same class of audit lie in the other direction.
+--
+-- Partial on category: run_id is nullable (run-less "global" chain rows set it
+-- NULL), but clarification_answers_truncated is a strictly per-run category so
+-- its rows always carry a non-null run_id, and the WHERE predicate excludes
+-- every other category and every run-less row — so the index is well-defined
+-- and constrains only the intended rows. Every OTHER category must stay
+-- unconstrained. IF NOT EXISTS keeps re-application idempotent.
+--
+-- payload->>'source_entry_id' is an IMMUTABLE jsonb expression, a precondition
+-- for indexing it — the same expression migration 0068 already indexes in this
+-- schema. A payload missing source_entry_id indexes as NULL, and NULLs are
+-- distinct in a PostgreSQL unique index (NULLS NOT DISTINCT is opt-in and is
+-- NOT used here), so any number of key-less rows coexist. This is why the
+-- CREATE cannot fail loud on legacy data: nothing emits this category before
+-- this migration, and any hypothetical key-less row would index as NULL and
+-- could not collide.
+--
+-- Index-only and additive: the rollback (0086 down) restores the prior
+-- unconditional-append behaviour with no schema residue and no data migration.
+CREATE UNIQUE INDEX IF NOT EXISTS audit_entries_clarification_answers_truncated_once_idx
+    ON audit_entries (run_id, (payload->>'source_entry_id'))
+    WHERE category = 'clarification_answers_truncated';

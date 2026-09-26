@@ -1580,6 +1580,125 @@ func TestPostgres_AppendChained_ApprovalConditionsTruncatedDistinctSources(t *te
 	}
 }
 
+// clarificationAnswersTruncatedParams builds a clarification_answers_truncated
+// chain append keyed on sourceEntryID — the shape
+// server.appendClarificationAnswersTruncatedAudit emits (#3063).
+func clarificationAnswersTruncatedParams(runID, sourceEntryID uuid.UUID, tag string) audit.ChainAppendParams {
+	kind := audit.ActorSystem
+	p, _ := json.Marshal(map[string]any{
+		"source_entry_id": sourceEntryID.String(),
+		"source":          "clarification_answered",
+		"original_bytes":  13000,
+		"cap_bytes":       12000,
+		"dropped_bytes":   1000,
+		"tag":             tag,
+	})
+	return audit.ChainAppendParams{
+		RunID:     runID,
+		Timestamp: time.Now().UTC(),
+		Category:  "clarification_answers_truncated",
+		ActorKind: &kind,
+		Payload:   p,
+	}
+}
+
+// TestIsClarificationAnswersTruncatedDuplicate pins each recognition branch of
+// the constraint-specific helper (#3063), mirroring
+// TestIsApprovalConditionsTruncatedDuplicate: the sentinel and its wrapped
+// form, a real pgconn 23505 on the 0086 index (bare and wrapped) → true; nil,
+// an unrelated error, a 23505 on a DIFFERENT constraint, and a non-23505 on the
+// index → false. A pure unit test (no Postgres). The different-constraint case
+// is the load-bearing one: it is what keeps an unrelated integrity failure
+// (entry-hash, (run_id, sequence)) a hard error instead of a silent swallow.
+func TestIsClarificationAnswersTruncatedDuplicate(t *testing.T) {
+	idx := audit.ClarificationAnswersTruncatedOnceIndex
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"unrelated error", errors.New("boom"), false},
+		{"sentinel", audit.ErrClarificationAnswersTruncatedDuplicate, true},
+		{"wrapped sentinel", fmt.Errorf("audit: append: %w", audit.ErrClarificationAnswersTruncatedDuplicate), true},
+		{"pg 23505 on the index", &pgconn.PgError{Code: "23505", ConstraintName: idx}, true},
+		{"wrapped pg 23505 on the index", fmt.Errorf("audit: append: %w", &pgconn.PgError{Code: "23505", ConstraintName: idx}), true},
+		{"pg 23505 on a different constraint", &pgconn.PgError{Code: "23505", ConstraintName: "audit_entries_run_id_sequence_key"}, false},
+		{"pg 23505 on the SIBLING approval index", &pgconn.PgError{Code: "23505", ConstraintName: audit.ApprovalConditionsTruncatedOnceIndex}, false},
+		{"pg non-23505 on the index", &pgconn.PgError{Code: "23503", ConstraintName: idx}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := audit.IsClarificationAnswersTruncatedDuplicate(tt.err); got != tt.want {
+				t.Errorf("IsClarificationAnswersTruncatedDuplicate(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestAppendChained_ClarificationAnswersTruncated_SecondForSameSourceIsDuplicate
+// is the done-means / real-DB behavioral assertion of the shipped 0086 partial
+// unique index (#3063): a SECOND clarification_answers_truncated AppendChained
+// for the SAME (run, source_entry_id) is rejected with an
+// audit.IsClarificationAnswersTruncatedDuplicate-recognized error, and exactly
+// one row survives. Deleting the CREATE UNIQUE INDEX body reddens this.
+func TestAppendChained_ClarificationAnswersTruncated_SecondForSameSourceIsDuplicate(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := audit.NewPostgresRepository(pool)
+	runID := makeRun(t, pool)
+	sourceEntry := uuid.New()
+
+	first, err := repo.AppendChained(context.Background(), clarificationAnswersTruncatedParams(runID, sourceEntry, "first"))
+	if err != nil {
+		t.Fatalf("first AppendChained: %v", err)
+	}
+	_, err = repo.AppendChained(context.Background(), clarificationAnswersTruncatedParams(runID, sourceEntry, "second"))
+	if err == nil {
+		t.Fatal("second AppendChained for the same (run, source_entry_id) succeeded, want a duplicate error")
+	}
+	if !audit.IsClarificationAnswersTruncatedDuplicate(err) {
+		t.Fatalf("second AppendChained error not recognized as a clarification-answers-truncated duplicate: %v", err)
+	}
+
+	rows, err := repo.ListForRunByCategory(context.Background(), runID, "clarification_answers_truncated")
+	if err != nil {
+		t.Fatalf("ListForRunByCategory: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("surviving clarification_answers_truncated rows = %d, want exactly 1", len(rows))
+	}
+	if rows[0].Sequence != first.Sequence {
+		t.Errorf("surviving row sequence = %d, want the first append's %d", rows[0].Sequence, first.Sequence)
+	}
+}
+
+// TestAppendChained_ClarificationAnswersTruncated_DistinctSourceEntriesBothStored
+// is the done-means test for the index KEY (#3063): two DIFFERENT
+// source_entry_id values under the SAME run both persist. It goes RED if the
+// index is mistakenly keyed on run_id alone — a shape the mere presence of a
+// migration file would otherwise satisfy — because a re-park-and-re-answer
+// cycle's second genuine truncation would then be suppressed.
+func TestAppendChained_ClarificationAnswersTruncated_DistinctSourceEntriesBothStored(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := audit.NewPostgresRepository(pool)
+	runID := makeRun(t, pool)
+
+	if _, err := repo.AppendChained(context.Background(), clarificationAnswersTruncatedParams(runID, uuid.New(), "answersA")); err != nil {
+		t.Fatalf("AppendChained for first source entry: %v", err)
+	}
+	if _, err := repo.AppendChained(context.Background(), clarificationAnswersTruncatedParams(runID, uuid.New(), "answersB")); err != nil {
+		t.Fatalf("AppendChained for a SECOND distinct source entry under the same run: %v — the 0086 key must be (run_id, source_entry_id), not run_id alone", err)
+	}
+
+	rows, err := repo.ListForRunByCategory(context.Background(), runID, "clarification_answers_truncated")
+	if err != nil {
+		t.Fatalf("ListForRunByCategory: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("clarification_answers_truncated rows for two distinct source entries = %d, want 2 (the index must not collapse distinct over-cap answer sets)", len(rows))
+	}
+}
+
 // TestPostgres_AppendChained_ApprovalConditionsTruncatedConcurrent is the REAL
 // concurrency proof (#2622). N goroutines each AppendChained an
 // approval_conditions_truncated entry for the SAME (run, source_entry_id); the
