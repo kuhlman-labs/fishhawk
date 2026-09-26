@@ -2329,6 +2329,67 @@ func (c *Client) CreateRef(ctx context.Context, scope forge.CredentialScope,
 	return classifyStatus("create ref", resp)
 }
 
+// DeleteRef deletes refs/heads/<branch> via
+// DELETE /repos/{owner}/{repo}/git/refs/heads/{branch} (E68.67 / #3562).
+// It implements forge.RefDeleter for the github adapter (promoted through
+// the embedded client).
+//
+// The branch is escaped with escapePath, NOT url.PathEscape: a slice
+// branch is fishhawk/run-<short>/slice-<n>, whose slashes are ref-path
+// separators GitHub must see; url.PathEscape would encode them as %2F and
+// address a single literal segment that does not exist.
+//
+// An already-absent branch is nil (the RefDeleter idempotency contract):
+// GitHub answers a delete of a nonexistent reference with 422 "Reference
+// does not exist", and a 404 is treated the same way. A 422 with any other
+// message stays ErrValidation. Every other non-2xx
+// classifies through classifyStatus, so a protected-ref refusal surfaces
+// as ErrForbidden.
+func (c *Client) DeleteRef(ctx context.Context, scope forge.CredentialScope,
+	repo RepoRef, branch string) error {
+	installationID, err := installationIDForScope(scope)
+	if err != nil {
+		return err
+	}
+	if c.Tokens == nil {
+		return errors.New("githubclient: client missing TokenProvider")
+	}
+	if repo.Owner == "" || repo.Name == "" {
+		return errors.New("githubclient: repo owner and name required")
+	}
+	if branch == "" {
+		return errors.New("githubclient: branch is required")
+	}
+
+	endpoint := c.endpoint("/repos/" + url.PathEscape(repo.Owner) +
+		"/" + url.PathEscape(repo.Name) + "/git/refs/heads/" + escapePath(branch))
+	req, err := c.buildRequest(ctx, http.MethodDelete, endpoint, nil, installationID)
+	if err != nil {
+		return err
+	}
+
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return fmt.Errorf("githubclient: delete ref: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	// Body-sniff the 422 BEFORE classifyStatus consumes the body: only the
+	// "Reference does not exist" 422 is the absent-ref case; any other 422
+	// is a real validation failure and must not masquerade as a deletion.
+	switch resp.StatusCode {
+	case http.StatusNotFound:
+		return nil
+	case http.StatusUnprocessableEntity:
+		brief := readBriefBody(resp.Body)
+		if strings.Contains(strings.ToLower(brief), "does not exist") {
+			return nil
+		}
+		return fmt.Errorf("%w: delete ref: %s", ErrValidation, brief)
+	}
+	return classifyStatus("delete ref", resp)
+}
+
 // MergeBranch performs a server-side git merge of head into base
 // (ADR-041 / #1142). It is the fan-in step's per-slice integration
 // primitive: each succeeded slice branch is merged onto the consolidated

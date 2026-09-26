@@ -513,6 +513,69 @@ func TestForceUpdateRef(t *testing.T) {
 	})
 }
 
+// TestForgeDeleteRef pins forge.RefDeleter on the GitLab adapter: the
+// DELETE reaches the Branches API with the branch URL-encoded as ONE path
+// parameter (GitLab's convention), a 404 is the tolerated already-absent
+// case, and a non-404 maps through mapError.
+func TestForgeDeleteRef(t *testing.T) {
+	t.Run("delegates to DeleteBranch", func(t *testing.T) {
+		var got []string
+		mux := http.NewServeMux()
+		mux.HandleFunc("DELETE /api/v4/projects/5/repository/branches/{branch}", func(w http.ResponseWriter, r *http.Request) {
+			got = append(got, r.PathValue("branch"))
+			w.WriteHeader(http.StatusNoContent)
+		})
+		f, _ := newForge(t, mux)
+		var deleter forge.RefDeleter = f
+		if err := deleter.DeleteRef(context.Background(), gitlabScope("5"), forge.RepoRef{}, "fishhawk/run-abc12345/slice-1"); err != nil {
+			t.Fatalf("DeleteRef: %v", err)
+		}
+		if len(got) != 1 || got[0] != "fishhawk/run-abc12345/slice-1" {
+			t.Errorf("deleted branches = %v, want [fishhawk/run-abc12345/slice-1]", got)
+		}
+	})
+	t.Run("404 absent branch tolerated", func(t *testing.T) {
+		var calls int
+		mux := http.NewServeMux()
+		mux.HandleFunc("DELETE /api/v4/projects/5/repository/branches/{branch}", func(w http.ResponseWriter, r *http.Request) {
+			calls++
+			writeJSON(w, http.StatusNotFound, `{"message":"404 Branch Not Found"}`)
+		})
+		f, _ := newForge(t, mux)
+		if err := f.DeleteRef(context.Background(), gitlabScope("5"), forge.RepoRef{}, "fishhawk/run-abc12345/slice-1"); err != nil {
+			t.Errorf("err = %v, want nil for an absent branch", err)
+		}
+		if calls != 1 {
+			t.Errorf("calls = %d, want 1", calls)
+		}
+	})
+	t.Run("403 surfaces ErrForbidden", func(t *testing.T) {
+		mux := http.NewServeMux()
+		mux.HandleFunc("DELETE /api/v4/projects/5/repository/branches/{branch}", func(w http.ResponseWriter, r *http.Request) {
+			writeJSON(w, http.StatusForbidden, `{"message":"protected"}`)
+		})
+		f, _ := newForge(t, mux)
+		if err := f.DeleteRef(context.Background(), gitlabScope("5"), forge.RepoRef{}, "fishhawk/run-abc12345/slice-1"); !errors.Is(err, forge.ErrForbidden) {
+			t.Errorf("err = %v, want forge.ErrForbidden", err)
+		}
+	})
+	t.Run("non-gitlab scope rejected before HTTP", func(t *testing.T) {
+		var calls int
+		mux := http.NewServeMux()
+		mux.HandleFunc("DELETE /api/v4/projects/5/repository/branches/{branch}", func(w http.ResponseWriter, r *http.Request) {
+			calls++
+			w.WriteHeader(http.StatusNoContent)
+		})
+		f, _ := newForge(t, mux)
+		if err := f.DeleteRef(context.Background(), forge.FromGitHubInstallationID(5), forge.RepoRef{}, "b"); err == nil {
+			t.Error("err = nil, want a non-gitlab-scope rejection")
+		}
+		if calls != 0 {
+			t.Errorf("calls = %d, want 0", calls)
+		}
+	})
+}
+
 // --- unsupported operations ---------------------------------------------
 
 // TestUnsupportedOperations pins that every Forge method GitLab's REST API

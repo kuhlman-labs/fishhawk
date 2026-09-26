@@ -27,7 +27,7 @@ import (
 const forgeName = "github"
 
 // Forge adapts *githubclient.Client onto forge.Forge. The embedded
-// client promotes CreateRef, MergeBranch, CreatePullRequest,
+// client promotes CreateRef, DeleteRef, MergeBranch, CreatePullRequest,
 // CreateCheckRun, ComparePatch, and the rest of the covered surface
 // directly — their signatures already take a forge.CredentialScope and
 // forge.RepoRef (the moved vocabulary), so no wrapping is needed. Only
@@ -49,6 +49,13 @@ var _ forge.FileFetcher = (*Forge)(nil)
 // issue-thread capability the split-parent auto-close watcher consumes
 // (E50.17 / #2900).
 var _ forge.IssueOperations = (*Forge)(nil)
+
+// Compile-time assertion that the adapter provides the standalone
+// branch-delete capability the run-branch sweep consumes (E68.67 /
+// #3562). DeleteRef is promoted from the embedded client unchanged — its
+// signature already takes the forge vocabulary, and the client maps
+// GitHub's absent-ref 422/404 to nil per the RefDeleter contract.
+var _ forge.RefDeleter = (*Forge)(nil)
 
 // New wraps c as the registered "github" forge. c is the same concrete
 // client serve.go wires for the non-forge surfaces (issues, comments,
