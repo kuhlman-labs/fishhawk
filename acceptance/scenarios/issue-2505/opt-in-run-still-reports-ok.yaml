@@ -1,0 +1,14 @@
+id: scenario:issue-2505/opt-in-run-still-reports-ok
+statement: Running `fishhawk doctor --run-verify-command --working-dir <a throwaway git checkout whose workflow spec declares a trivially-fast verify command>` prints the `verify command` rung as ok, returns promptly, and leaves no doctor-verify worktree registered in that checkout.
+verify_hint: 'CLI stdout and exit code: the `verify command` row reads ok, and `git -C <checkout> worktree list` afterwards shows no `fishhawk-worktrees/doctor-verify-*` entry.'
+steps: 'Used the same throwaway repo /tmp/fh2505/chk, created from a clean state: git init, one commit, and .fishhawk/workflows.yaml from workflow-v0-feature-change.yaml with executor.verify.command ''touch /tmp/fh2505/marker-$$; true'' and timeout ''1m''. Ran /tmp/fh2505/fishhawk doctor --run-verify-command --working-dir /tmp/fh2505/chk --backend-url http://localhost:8090 --token <fhm_> --repo kuhlman-labs/fishhawk and timed it. Then ran git -C /tmp/fh2505/chk worktree list and git worktree list --porcelain | grep -c doctor-verify.'
+assertions:
+    expected: verify command ok, prompt return, and no doctor-verify worktree left registered
+    observed_at_record: The row reads 'verify command "touch /tmp/fh2505/marker-$$; true" passed (clean worktree) ok'. The whole doctor run took about 2.8s. marker-68766 was created, so the command ran. worktree list shows only '/private/tmp/fh2505/chk 055b74e [main]', with 0 doctor-verify entries and no .git/worktrees directory. Overall exit code 1 came from unrelated preview rungs (gh CLI, MCP registration, app installed), not the verify rung.
+    repro_handle: fishhawk doctor --run-verify-command --working-dir /tmp/fh2505/chk ...; git -C /tmp/fh2505/chk worktree list
+origin:
+    issue: 2505
+    pr: 3687
+    run_id: 7043bffd-5300-4c86-b44a-7a2da972d57d
+    head_sha: 9812f59c0fee322ac054a77c60803ed7da57b00d
+    recorded_at: 2026-09-26T11:40:55Z
