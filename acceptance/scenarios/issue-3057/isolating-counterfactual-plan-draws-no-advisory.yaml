@@ -1,0 +1,14 @@
+id: scenario:issue-3057/isolating-counterfactual-plan-draws-no-advisory
+statement: 'The discrimination control: the otherwise identical plan whose same test_strategy sentence states the isolating mechanism draws NO counterfactual_mechanism_missing advisory — so the rule does not fire on every plan.'
+verify_hint: GET /v0/runs/{run_id}/audit for that run returns either no plan_warnings entry at all or one whose warnings array contains no counterfactual_mechanism_missing text; equivalently the fishhawk_get_plan MCP tool result omits that advisory.
+steps: 'POST http://localhost:8090/v0/dev/fixtures {"scenario":"plan-gate-criteria"} -> run 7cfe219b-e8ac-4771-827d-fe9f9d548e50, plan 5f63ee2f-7a00-4064-b7d4-25977e5694e3. POST /v0/runs/{run}/signing-key. Build the same plan-standard-v1-example.json with the same criterion. Its test_strategy is identical except that the counterfactual sentence reads: ''Delete the VersionMajor gate in EvaluateStage and TestStageBudget goes RED because the fixture declares a positive LimitUSD on a legacy-major spec, so the version gate is the only thing in the path.'' Sign via /v0/dev/sign, then POST /v0/runs/{run}/plan?stage_id={plan} -> 201. GET /v0/runs/{run}/audit?category=plan_warnings, and POST /mcp tools/call fishhawk_get_plan {run_id}.'
+assertions:
+    expected: No counterfactual_mechanism_missing advisory
+    observed_at_record: Zero plan_warnings entries (items []). fishhawk_get_plan has no plan_warnings field. The full audit categories are plan_generated, plan_scope_precheck, plan_surface_sweep and plan_acceptance_precheck.
+    repro_handle: GET http://localhost:8090/v0/runs/7cfe219b-e8ac-4771-827d-fe9f9d548e50/audit?category=plan_warnings
+origin:
+    issue: 3057
+    pr: 3689
+    run_id: c9cd4085-4625-49bf-97a1-79f10d712b4d
+    head_sha: a45f977352e5e5a7838b551dacbeb701e7fa8038
+    recorded_at: 2026-09-26T14:48:15Z

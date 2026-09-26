@@ -1,0 +1,14 @@
+id: scenario:issue-3057/live-validation-marked-criterion-is-exempt
+statement: 'The discrimination control: the same criterion marked requires_live_validation with a verify_hint (and the paired skip_expected plus expectation_basis the authoring contract requires) draws NO blocking_criterion_undecided finding.'
+verify_hint: GET /v0/runs/{run_id}/audit returns a plan_acceptance_precheck entry whose findings array contains no object with rule blocking_criterion_undecided.
+steps: POST http://localhost:8090/v0/dev/fixtures {"scenario":"plan-gate-criteria"} -> run 7ad77ebd-7030-45ca-aa65-2cd52c1a179c, plan 57949e2c-1eda-410a-b878-934ce255e0d7. POST /v0/runs/{run}/signing-key. Build plan-standard-v1-example.json with the same two criteria as the flagged case, except export-streams-jsonl now carries requires_live_validation true, a verify_hint, skip_expected true and an expectation_basis. Sign via /v0/dev/sign, POST /v0/runs/{run}/plan?stage_id={plan} -> 201, then GET /v0/runs/{run}/audit?category=plan_acceptance_precheck. Also, for approval condition 4, seed a second plan-gate-criteria run 65a9095a-b5b4-4419-afc2-96d59996fb8d (plan 624515fc-e5d9-435d-9b1e-f66a75d6b86d) whose export-streams-jsonl has skip_expected true plus expectation_basis and no verify_hint. Post it the same way and read the same audit category.
+assertions:
+    expected: No blocking_criterion_undecided finding
+    observed_at_record: The live-validation-marked run has findings [] and blocking_count 2. The skip_expected+expectation_basis run (criterion-6 shape) also has findings []. Neither has blocking_criterion_undecided. In the flagged twin, the same criterion without these markers does draw it.
+    repro_handle: GET http://localhost:8090/v0/runs/7ad77ebd-7030-45ca-aa65-2cd52c1a179c/audit?category=plan_acceptance_precheck
+origin:
+    issue: 3057
+    pr: 3689
+    run_id: c9cd4085-4625-49bf-97a1-79f10d712b4d
+    head_sha: a45f977352e5e5a7838b551dacbeb701e7fa8038
+    recorded_at: 2026-09-26T14:48:15Z
