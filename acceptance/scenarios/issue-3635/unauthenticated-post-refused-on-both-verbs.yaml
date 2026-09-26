@@ -1,0 +1,14 @@
+id: scenario:issue-3635/unauthenticated-post-refused-on-both-verbs
+statement: An unauthenticated POST to /v0/runs/{run_id}/record-merge-observation and to /v0/runs/{run_id}/reconcile-merge returns HTTP 401 with error authentication_required, and the run's audit log gains no new entry as a result.
+verify_hint: POST to both routes on the localhost preview with NO Authorization header and read the status code and body error field; then GET /v0/runs/{run_id}/audit and confirm no merge_observation_recorded or stage_superseded_by_merge entry was added.
+steps: 1) POST /v0/dev/fixtures {"scenario":"plan-gate-parked"} -> run d3d1e8ca-454a-4032-9a4b-c74607cd0694. 2) GET /v0/runs/{run}/audit (baseline [mcp_token_issued]). 3) POST /v0/runs/{run}/record-merge-observation body '{}' with no Authorization header. 4) POST /v0/runs/{run}/reconcile-merge body '{}' with no Authorization header. 5) GET /v0/runs/{run}/audit again.
+assertions:
+    expected: 401 authentication_required on both, no new audit entry.
+    observed_at_record: Both -> HTTP 401 {"error":{"code":"authentication_required","message":"an authenticated token is required"}}. Audit unchanged ([mcp_token_issued]); no merge_observation_recorded or stage_superseded_by_merge entry.
+    repro_handle: curl -X POST http://localhost:8090/v0/runs/d3d1e8ca-454a-4032-9a4b-c74607cd0694/reconcile-merge -d '{}'
+origin:
+    issue: 3635
+    pr: 3672
+    run_id: b7c74f52-71c0-4023-a446-6b797ed84edb
+    head_sha: b8a43981082e7856dd2b2c6aa79bbfb6f0946535
+    recorded_at: 2026-09-26T00:49:29Z
