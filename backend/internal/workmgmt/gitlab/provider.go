@@ -45,7 +45,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strconv"
 	"strings"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/gitlabclient"
@@ -153,7 +152,8 @@ func (p *Provider) File(ctx context.Context, req workmgmt.ProviderRequest) (*wor
 	// parse or link failure records the cause in EpicLinkError and leaves
 	// EpicLinked false, but the durable issue is still returned. GitLab group
 	// epics are Premium-only, so the parent maps to a Free-tier relates_to
-	// issue link rather than an epic membership.
+	// issue link rather than an epic membership. The ref parses as `N`, `#N`
+	// or `issue:N` via the shared workmgmt.ParseIssueRef (#3653).
 	if parent := strings.TrimSpace(req.Item.Relations.ParentEpic); parent != "" {
 		targetIID, perr := parseIssueRef(parent)
 		if perr != nil {
@@ -203,18 +203,15 @@ func appliedLabels(base []string, status string) []string {
 	return out
 }
 
-// parseIssueRef parses "#123" or "123" into the issue iid. GitLab
-// parent_epic references share the numeric-ref semantics of the github/jira
-// siblings — a non-numeric or non-positive ref is a link failure the caller
-// records best-effort (#1107).
+// parseIssueRef parses a parent_epic reference into the issue iid. The
+// accepted set is `N`, `#N` and `issue:N` (at most one of each prefix) —
+// the same set the campaign epic_ref classifier (gitlab/campaign.go) and the
+// github/jira siblings accept — because it delegates to the shared
+// workmgmt.ParseIssueRef (#3314, #3653). The local name is retained only so
+// the File call site and the provider_test table read unchanged; the ONLY
+// normalization is the shared parser's (a caller-side pre-strip would recreate
+// the #3314 divergence). A non-numeric, doubled-prefix or non-positive ref is
+// a link failure the caller records best-effort (#1107).
 func parseIssueRef(ref string) (int, error) {
-	s := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(ref), "#"))
-	n, err := strconv.Atoi(s)
-	if err != nil {
-		return 0, fmt.Errorf("not a numeric issue reference")
-	}
-	if n <= 0 {
-		return 0, fmt.Errorf("issue number must be > 0")
-	}
-	return n, nil
+	return workmgmt.ParseIssueRef(ref)
 }

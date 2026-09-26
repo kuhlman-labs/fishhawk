@@ -71,7 +71,7 @@ type StartCampaignOutput struct {
 // so it has nothing to configure.
 type PreviewCampaignInput struct {
 	Repo    string   `json:"repo" jsonschema:"GitHub repo as owner/name the campaign would be assembled in"`
-	EpicRef string   `json:"epic_ref,omitempty" jsonschema:"OPTIONAL the epic reference to decompose into the campaign DAG (e.g. '#25' or 'owner/name#25'). Omit it and pass items to preview a no-epic campaign over an explicit issue list instead; one of epic_ref / items / grooming_run_id is required"`
+	EpicRef string   `json:"epic_ref,omitempty" jsonschema:"OPTIONAL the epic reference to decompose into the campaign DAG. It names an epic ISSUE in the campaign's OWN repo, in one of three forms: a bare number (25), #25, or issue:25. A cross-repo ref (owner/name#25) or an unrecognized ref is refused campaign_epic_ref_invalid; a GitLab group-epic ref (group&5, or a /-/epics/N URL) is refused campaign_epic_ref_group_unsupported (group epics are Premium and are not modeled). Omit it and pass items to preview a no-epic campaign over an explicit issue list instead; one of epic_ref / items / grooming_run_id is required"`
 	Items   []string `json:"items,omitempty" jsonschema:"OPTIONAL issue refs (a bare number like '101', '#101', or 'issue:101'). WITH epic_ref: the subset of the epic's children to scope the preview to. WITHOUT epic_ref: the authoritative issue set to preview, resolving each issue's depends_on directly. This is the field you iterate: add the refs the previous preview listed in closure_candidates and preview again until valid is true"`
 	// GroomingRunID previews an approved grooming run's ratified order, exactly
 	// as fishhawk_start_campaign would build from it.
