@@ -2,7 +2,7 @@
 
 > **Status:** Draft v0.1
 > **Owner:** Brett
-> **Last revised:** 2026-04-30
+> **Last revised:** 2026-09-26 (§1, §3, §4 revised for ADR-080)
 > **Purpose:** The strategic and creative foundation for Fishhawk's brand identity. This document gives designers, copywriters, and the founder a shared reference for what Fishhawk is, how it should feel, and how to make consistent choices about voice, visual identity, and presentation.
 >
 > This is not a final brand guide. A final brand guide is produced *after* visual identity work is complete (logo, color system, typography). This is the brief that produces it.
@@ -11,7 +11,7 @@
 
 ## 1. The product, in one sentence
 
-Fishhawk is the governed, auditable workflow for agent-driven software development. It gives engineering teams an opinionated, auditable process for how AI agents plan, implement, and ship changes — without locking them into any specific agent, tracker, or stack.
+Fishhawk is the governed, auditable workflow for agent-driven software development. It lets one developer command a crew of AI agents with the discipline of a full team — an opinionated, auditable process for how agents plan, implement, and ship changes, without locking them into any specific agent, tracker, or stack.
 
 ## 2. The name
 
@@ -49,7 +49,7 @@ FISH-hawk. The two syllables get roughly equal stress. Slight elision is natural
 
 ### What Fishhawk is
 
-The opinionated, governed workflow for engineering teams using AI coding agents. The product where teams encode their process for how AI does work, enforce that process automatically, and prove afterward what was done and why.
+The opinionated, governed workflow for running a repository with AI coding agents. The developer who commands the repository encodes how the work is done, the crew of agents does it under the autonomy they delegate, and the record proves afterward what was done, why, and by whose decision — so the next person to pick the repository up inherits how it was run.
 
 ### What Fishhawk is not
 
@@ -61,17 +61,25 @@ The opinionated, governed workflow for engineering teams using AI coding agents.
 
 ### The core promise
 
-> Your agents do the work. Your team approves the work. Fishhawk holds the record.
+> Your agents do the work. You command the crew. Fishhawk holds the record.
+
+The earlier line — "Your team approves the work" — remains true for teams and fleets and is the form to use when addressing an organization.
 
 ### What we believe
 
-Three convictions that should shape every brand expression:
+Four convictions that should shape every brand expression:
 
 1. **Humans direct, agents implement.** The future of software is human judgment plus agent execution. Fishhawk is built around this asymmetry — the workflow encodes which decisions belong to humans and which to agents, permanently.
 
 2. **Governance is the product, not a feature.** Most AI tools treat audit and policy as compliance bolt-ons. Fishhawk treats them as the core abstraction. The workflow spec, the audit log, and the approval gates are not afterthoughts; they are the system.
 
 3. **Opinionated tools beat flexible ones.** The flexibility of LangGraph or generic workflow engines is the wrong answer for software governance. Fishhawk has strong opinions about how agent-driven work should be structured. Customers adopt those opinions; the opinions become their process.
+
+4. **Doctrine belongs to the repository, not the person.** Standing orders, decisions, and the precedent of past calls live in the repo and on the record. A repository run well by one person should be run the same way by the next.
+
+### Product vocabulary
+
+Inside the product and in copy: **captain** (the human who commands a repository), **crew** (the agent roles), **first officer** (the operator agent), **bridge** (where the captain decides), **log** (the audit chain), **standing orders** (charter and workflow spec). Generic nautical words only — no references to any film, TV, or game franchise, in copy, imagery, or product names.
 
 ### Positioning against incumbents
 
@@ -87,15 +95,15 @@ Three convictions that should shape every brand expression:
 
 ## 4. Audience
 
-### Primary buyer
+### Primary user and buyer (alpha)
 
-VP Engineering, Director of Platform, Head of DevX at a mid-sized engineering organization (50–300 engineers). Compliance and security are influencers; engineering owns the budget.
+The solo captain: one developer — an indie builder, a founder, or the only maintainer of a product — shipping real software with coding agents and running Fishhawk on their own machine. They are fast and they know it; what they lack is the discipline a team supplies — a reviewed plan, enforced boundaries, a release process, someone watching upkeep and security, and a memory of why things are the way they are. In alpha they are both the buyer and the user.
 
-The buyer is sophisticated, time-poor, has been pitched dozens of AI tools in the last year, and is skeptical of marketing claims. They respond to specificity, technical credibility, and honest framing of trade-offs. They are turned off by jargon, hype, and over-promising.
+They are sophisticated and skeptical of AI tooling hype. They respond to specificity, a working local install, and honest trade-offs. They are turned off by enterprise ceremony that does not pay for itself on a one-person repository.
 
-### Primary user
+### Later audiences
 
-Tech leads and senior engineers at the same organizations. They are the ones who will write `.fishhawk/workflows.yaml`, approve plans, and live with the product day to day. They are similarly sophisticated, similarly skeptical, and value tools that respect their time and intelligence.
+Small teams, where the captain role is shared, and then engineering organizations running a fleet of repositories — VP Engineering, Director of Platform, Head of DevX at 50–300 engineers, with compliance and security as influencers. That buyer is pursued from beta. Everything said to the solo captain must remain true for them: the fleet is the same model repeated.
 
 ### Audience principle
 

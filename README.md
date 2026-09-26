@@ -4,6 +4,8 @@ The governed, auditable workflow for agent-driven software development.
 
 Fishhawk is an opinionated workflow engine for agent-driven software changes: it defines the stages a change moves through (plan → implement → review), enforces policy on what an agent can and cannot do, gates the work behind human approvals, and keeps an immutable, signed audit trail of every plan, approval, and outcome. It is tool-agnostic and agent-agnostic — it is **not** a coding agent, a CI/CD platform, or a general-purpose workflow engine.
 
+It is built for one developer to run a repository the way a team would. You are the captain: you set direction, decide how much the crew of agents may decide and where, and rule on what they escalate. The crew plans, implements, reviews, and — increasingly — handles what a team does before an issue exists and after a merge. Standing orders and the record of past decisions live in the repository, so the next person to pick it up inherits how it was run. See [`.fishhawk/charter.md`](.fishhawk/charter.md) §1–§2 for the current direction.
+
 Fishhawk develops itself through Fishhawk: since Day 22 of the v0 build (2026-05-21), substantive changes flow through a workflow run defined by [`.fishhawk/workflows.yaml`](.fishhawk/workflows.yaml), and the audit log behind that development is published in [`docs/compliance/`](docs/compliance/).
 
 > **Status: alpha.** The v0 control plane, runner, CLI, MCP server, and Web UI have landed. See [Documentation](#documentation) for the full component map. Feature PRs are not yet being accepted while the v0 abstractions settle — see [`CONTRIBUTING.md`](CONTRIBUTING.md).

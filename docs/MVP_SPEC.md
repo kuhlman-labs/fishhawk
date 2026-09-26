@@ -2,16 +2,20 @@
 
 > **Status:** Draft v0.1
 > **Owner:** Brett
-> **Last revised:** 2026-04-30
+> **Last revised:** 2026-09-26
 > **Purpose:** Canonical reference for the v0 build. This document is the single source of truth for what we are building, why, and in what order. When this document and reality disagree, update this document.
+>
+> **Revision 2026-09-26 (ADR-080):** §1–§3 are revised for the solo-captain direction — the repository is the unit, and the first customer is one developer commanding a full crew of agents. §8 (the 90-day build plan) and §9 (v0 boundaries) are the historical record of the original plan and are not rewritten; `.fishhawk/charter.md` §2 is the current phase definition.
 
 ---
 
 ## 1. Product thesis
 
-Coding agents are now capable enough that the bottleneck has shifted from "can the agent write the code" to "can the business trust what the agent did, prove it, and reproduce the process across a team." No one is selling that as a first-class product.
+Coding agents are now capable enough that the bottleneck has shifted from "can the agent write the code" to "can one person trust what the agents did, prove it, and run a repository the way a team would — then hand it to someone else without losing how it was run." No one is selling that as a first-class product.
 
-Fishhawk is the **governed, auditable workflow that sits above coding agents**. It is agent-agnostic, tool-agnostic, and opinionated about *process*. It is not a coding agent. It is the layer that turns a collection of agent invocations into a governed, auditable, organizational workflow.
+Fishhawk is the **governed, auditable workflow that sits above coding agents**. It is agent-agnostic, tool-agnostic, and opinionated about *process*. It is not a coding agent. It is the layer that turns a collection of agent invocations into a governed, auditable crew that one person can command.
+
+The unit is the **repository**. The human who commands it is the **captain**; the agents are the **crew** — planner, implementer, reviewers, acceptance, the operator agent as first officer, and the roles that keep a product running after the merge (product, release, ops, architecture, upkeep, security, feedback). The captain decides how much the crew may decide and where; the crew advises, disagrees on the record, and escalates what it may not settle. Standing orders, decisions, and the precedent of past gate calls live in the repository and on the audit chain, so a new captain inherits how the repository is run.
 
 ### What Fishhawk is
 
@@ -29,28 +33,30 @@ Fishhawk is the **governed, auditable workflow that sits above coding agents**. 
 
 ### The vision (for context, not v0 scope)
 
-The future of software development is **humans setting direction and approving outcomes; agents handle implementation.** Fishhawk is the coordination layer that makes this work at organizational scale. Human accountability is not transitional scaffolding — it is the durable model. Agents radically extend human leverage; humans retain accountability for anything consequential.
+The future of software development is **humans setting direction and approving outcomes; agents handle implementation.** Fishhawk is the coordination layer that makes this work for one repository — and, repeated across a fleet of repositories each with its own captain, at organizational scale. Human accountability is not transitional scaffolding — it is the durable model. Agents radically extend human leverage; humans retain accountability for anything consequential.
 
 ---
 
 ## 2. Target customer
 
-**Primary ICP for v0 design partners:**
+**Primary customer for alpha: the solo captain.**
 
-- **Size:** 50–300 engineers
-- **Stack:** GitHub (Issues, PRs, Actions), already using at least one coding agent (Claude Code, Cursor, Copilot)
-- **Profile:** Compliance-conscious — regulated industry (fintech, healthtech, regulated B2B SaaS) or selling into one. Has a real answer to "how do you control what AI does to our code" as a procurement requirement.
-- **Pain:** Coding agents are in use but ungoverned. No standardized workflow. No auditable record of what agents did or who approved it. Different developers use agents differently. Compliance, security, and engineering leadership are uncomfortable but can't articulate the missing primitives.
+- **Who:** one developer — an indie builder, a founder, or the only maintainer of a product — shipping real software with coding agents (Claude Code, Codex, Cursor, Copilot).
+- **Stack:** a GitHub repository they own; Fishhawk runs locally on their own machine.
+- **Pain:** agents make them fast, and the result is not production-ready. Nobody reviews the plan before the code exists, nothing enforces what the agent may touch, nothing remembers why the codebase is the way it is, and the work a team does before an issue exists and after a merge — direction, releases, post-deploy checks, upkeep, security, feedback — does not happen at all. "Vibe coding" stops at the demo.
+- **What they get:** a full crew under their command, with autonomy they set per workflow and per path, disagreement that reaches them rather than being settled silently, and a record that lets someone else pick the repository up.
 
-**Buyer:** Engineering leadership (VP Eng, Director of Platform, Head of DevX). Compliance and security are influencers; the budget sits in engineering.
+**Buyer and user are the same person** in alpha.
 
-**User:** Individual developers and tech leads.
+**Later phases.** Small teams, where the captain role is shared through the existing approval predicates, and then organizations, as fleets of repositories each with a captain. The original design-partner profile — 50–300 engineers, compliance-conscious, engineering leadership as buyer — is the fleet customer and is pursued from beta (charter §2, E57).
 
 ---
 
 ## 3. Positioning
 
-> Fishhawk is the governed, auditable workflow for agent-driven software development. We give engineering teams an opinionated, auditable process for how AI agents plan, implement, and ship changes — without locking you into any specific agent, tracker, or stack.
+> Fishhawk is the governed, auditable workflow for agent-driven software development. It lets one developer command a crew of AI agents with the discipline of a full team — an opinionated, auditable process for how agents plan, implement, and ship changes, without locking you into any specific agent, tracker, or stack.
+>
+> Your agents do the work. You command the crew. Fishhawk holds the record.
 
 **Differentiation against incumbents:**
 
@@ -62,7 +68,7 @@ The future of software development is **humans setting direction and approving o
 | LangGraph / CrewAI | Generic agent orchestration | Opinionated for SDLC specifically; built-in audit/policy |
 | loopctl | Closest direct competitor | OSS, marketplace distribution, audit-first |
 
-**The moat we are building toward:** the workflow spec becomes a standard the team encodes in its repo, plus the audit history they accumulate. Once a team has six months of audit data they need to retain, switching cost is high.
+**The moat we are building toward:** the workflow spec becomes a standard encoded in the repo, plus the doctrine and precedent that accumulate on the audit chain. A repository with six months of decisions, precedent, and a crew tuned to it is expensive to move — and that record is what lets it change hands.
 
 ---
 
