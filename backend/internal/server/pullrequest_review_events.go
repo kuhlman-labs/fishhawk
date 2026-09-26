@@ -328,6 +328,10 @@ func (s *Server) resolveReviewStageOnMerge(ctx context.Context, target *run.Run,
 			// Stamp the per-change economics into the PR body (#1702).
 			// Best-effort; never unwinds the merge resolution above.
 			s.stampEconomicsIntoPRBody(ctx, target)
+			// Delete the run's Fishhawk-owned branches now the PR merged
+			// (E68.67 / #3562). LAST, after every operator-visible tail, so a
+			// sweep failure cannot skip one. Best-effort; never unwinds.
+			s.sweepRunBranches(ctx, target, sweepTriggerPRMerged)
 			return
 		}
 		if _, err := s.cfg.RunRepo.TransitionStage(ctx,
@@ -420,6 +424,11 @@ func (s *Server) resolveReviewStageOnMerge(ctx context.Context, target *run.Run,
 		// Stamp the per-change economics into the PR body (#1702).
 		// Best-effort; never unwinds the merge resolution above.
 		s.stampEconomicsIntoPRBody(ctx, target)
+		// Delete the run's Fishhawk-owned branches now the PR merged
+		// (E68.67 / #3562). LAST, after every operator-visible tail, so a
+		// sweep failure cannot skip one. Deliberately NOT on the
+		// closed-without-merge arm below: that PR's head may be reopened.
+		s.sweepRunBranches(ctx, target, sweepTriggerPRMerged)
 		return
 	}
 

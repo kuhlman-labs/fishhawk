@@ -461,3 +461,54 @@ func TestIssueOperationsErrorPassthrough(t *testing.T) {
 		}
 	}
 }
+
+// newDeleteRefAdapter builds a *forgegithub.Forge whose embedded client
+// answers DELETE .../git/refs/heads/{branch...} with status + body and
+// records each observed (escaped) request path.
+func newDeleteRefAdapter(t *testing.T, status int, body string) (*forgegithub.Forge, *[]string) {
+	t.Helper()
+	var paths []string
+	mux := http.NewServeMux()
+	mux.HandleFunc("DELETE /repos/{owner}/{repo}/git/refs/heads/{branch...}", func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.EscapedPath())
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_, _ = io.WriteString(w, body)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	c := &githubclient.Client{
+		BaseURL: srv.URL,
+		Tokens:  stubTokens{},
+		HTTP:    &http.Client{Timeout: 5 * time.Second},
+	}
+	return forgegithub.New(c), &paths
+}
+
+// TestForgeDeleteRef_DelegatesThroughCapability pins that the adapter is
+// dispatchable as a forge.RefDeleter and the DELETE reaches the stub on
+// the slash-preserving ref path.
+func TestForgeDeleteRef_DelegatesThroughCapability(t *testing.T) {
+	f, paths := newDeleteRefAdapter(t, http.StatusNoContent, "")
+	var deleter forge.RefDeleter = f
+	if err := deleter.DeleteRef(context.Background(), forge.FromGitHubInstallationID(42),
+		forge.RepoRef{Owner: "o", Name: "n"}, "fishhawk/run-abc12345/slice-0"); err != nil {
+		t.Fatalf("DeleteRef: %v", err)
+	}
+	if want := []string{"/repos/o/n/git/refs/heads/fishhawk/run-abc12345/slice-0"}; len(*paths) != 1 || (*paths)[0] != want[0] {
+		t.Errorf("observed DELETEs = %v, want %v", *paths, want)
+	}
+}
+
+// TestForgeDeleteRef_AbsentBranchTolerated pins the RefDeleter
+// idempotency contract through the adapter: GitHub's absent-ref 422 is nil.
+func TestForgeDeleteRef_AbsentBranchTolerated(t *testing.T) {
+	f, paths := newDeleteRefAdapter(t, http.StatusUnprocessableEntity, `{"message":"Reference does not exist"}`)
+	if err := f.DeleteRef(context.Background(), forge.FromGitHubInstallationID(42),
+		forge.RepoRef{Owner: "o", Name: "n"}, "fishhawk/run-abc12345/slice-0"); err != nil {
+		t.Errorf("err = %v, want nil for an absent branch", err)
+	}
+	if len(*paths) != 1 {
+		t.Errorf("observed DELETEs = %v, want exactly one", *paths)
+	}
+}

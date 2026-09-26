@@ -111,6 +111,10 @@ var _ forge.CIRequirementReader = (*Forge)(nil)
 // `gitlab_merge_gate` rung consumes (E45.66 / #3580).
 var _ forge.MergeProtectionReader = (*Forge)(nil)
 
+// Compile-time assertion that the adapter provides the standalone
+// branch-delete capability the run-branch sweep consumes (E68.67 / #3562).
+var _ forge.RefDeleter = (*Forge)(nil)
+
 // Option customises a Forge at construction.
 type Option func(*forgeConfig)
 
@@ -330,6 +334,27 @@ func (f *Forge) ForceUpdateRef(ctx context.Context, scope forge.CredentialScope,
 		}
 	}
 	if _, err := c.CreateBranch(ctx, pid, branch, newSHA); err != nil {
+		return mapError(err)
+	}
+	return nil
+}
+
+// DeleteRef implements forge.RefDeleter over the Branches API
+// (DELETE /projects/:id/repository/branches/:branch, E68.67 / #3562). A
+// 404 — the branch is already absent — is nil, the same absent-branch
+// tolerance ForceUpdateRef applies, so a re-sweep is an idempotent no-op.
+// Every other failure maps through mapError (a protected-branch 403 is
+// forge.ErrForbidden). repo is unused: the project is addressed by the
+// scope's project id, as on every other GitLab method.
+func (f *Forge) DeleteRef(ctx context.Context, scope forge.CredentialScope, _ forge.RepoRef, branch string) error {
+	c, pid, err := f.resolve(ctx, scope)
+	if err != nil {
+		return err
+	}
+	if err := c.DeleteBranch(ctx, pid, branch); err != nil {
+		if apiStatus(err) == http.StatusNotFound {
+			return nil
+		}
 		return mapError(err)
 	}
 	return nil

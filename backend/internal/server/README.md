@@ -5485,3 +5485,44 @@ The 50-id cap is an arbitrary but STATED bound on the audit-append fan-out and t
 ### The shared `applyConcernWaive` helper
 
 `waive.go` now carries the durable-record-first body as one unexported helper both verbs call, so the ordering invariant cannot drift between them: append the `concern_waived` intent entry FIRST (failure returns `concernWaiveAuditAppendError` with NO mutation and NO corrective entry — there is no intent on the chain to correct), then `ApplyResolution`, and on ITS failure append the corrective `concern_waive_failed` entry before returning the transition error unwrapped so the caller can map `InvalidTransitionError` → 422 and `ErrNotFound` → 404. The typed append error is what lets the bulk path report the same per-item `error_code` vocabulary the single path uses.
+
+## Terminal run-branch sweep (`run_branch_sweep.go`, E68.67 / #3562)
+
+A run's Fishhawk-owned branches are deleted from the forge when the run reaches a terminal state, instead of accumulating (204 stale `fishhawk/run-*` refs by 2026-09-21). `sweepRunBranches` is best-effort throughout, on the `stampEconomicsIntoPRBody` model: no failure unwinds the caller's already-committed transition.
+
+### Candidate derivation (`runSweepCandidates`, pure)
+
+Derived from the single sources of truth, never by listing refs (#1245):
+
+- every non-child run: `fishhawk/run-<short(run)>/stage-<short(stage)>` per stage (the `fixupBranchFor` form);
+- a decomposed PARENT (children enumerated via `listAllDecomposedChildren`): additionally `orchestrator.ConsolidatedBranch(run)` and `orchestrator.SliceBranch(run, SliceIndex)` per child (nil index → 0);
+- a decomposed CHILD: nothing. Its slice branch is derived from the PARENT's id and belongs to the parent's fan-in.
+
+Every candidate passes the namespace guard (`strings.HasPrefix(b, "fishhawk/run-")`), so a destructive call can never name a default, release or human branch. A children-enumeration error degrades to the consolidated branch plus the parent's stage branches and is recorded as `children_unenumerated`; a stage-enumeration error is recorded as `stages_unenumerated`.
+
+### Preservation gates (each fails CLOSED toward keeping the branch)
+
+1. **Existence probe.** When the forge carries `GetBranchSHA` (both registered adapters do), an absent branch is classified `already_absent` and gets no further calls. `RefDeleter` maps an absent ref to nil, so without the probe an absent ref would read as `deleted`.
+2. **Open-PR head.** `ListOpenPullRequestsByHead(branch, "")`. An empty base omits the base filter on both forges. A non-empty result → `skipped_open_pr` with reason `open_pr_head`.
+3. **Open-PR base** (#3562 approval condition 1). Deleting a consolidated branch would auto-close its open slice PRs. For each surviving candidate, the forge PR list is queried keyed on that candidate as BASE, once per candidate head that has an open PR (or whose PR read failed). A hit → `skipped_open_pr` with reason `open_pr_base`.
+4. **Unreadable PR state.** Any PR-list error in gate 2 or 3 → `skipped_pr_read_error`. An unreadable read never authorizes a delete.
+
+Residual: gate 3 only sees PRs whose head is one of the run's own candidates. The GitHub PR list is head-keyed in `forge.Forge`, so a PR into a `fishhawk/run-*` branch from an unrelated head is not detected.
+
+### Forge resolution (`runBranchForgeFor`)
+
+Same ladder shape as `prStateReaderFor` / `issueOpsFor`. `cfg.RunBranchDeleter` (the test seam) overrides the ladder. A github-family run resolves only `cfg.GitHub` (via `forgegithub.New`). Any other family resolves `cfg.ForgeResolver` (default `forge.Get`), guarded by `isNilForge`. The resolved forge must carry `DeleteRef` and `ListOpenPullRequestsByHead`. Otherwise it resolves to nil and there is no sweep; the sweep never deletes without the PR gates.
+
+### Trigger sites
+
+- `resolveReviewStageOnMerge`: the LAST statement of both merge-resolution success tails (no-review-stage and review-stage), after the economics stamp. Synchronous. It is not on the closed-without-merge arm, because that PR's head may be reopened.
+- `handleCancelRun`: AFTER `writeJSON`, via `sweepRunBranchesDetached`, a goroutine on `context.WithoutCancel(r.Context())` bounded by `runBranchSweepBudget` (2m) and tracked by `bgBranchSweeps` (drained by `Shutdown`, synced in tests by `waitBranchSweeps`). The cancel response never waits on forge round-trips (#3562 approval condition 3). An already-cancelled 200 re-sweeps idempotently.
+
+### The `run_branches_swept` row
+
+ONE chained system-actor entry per sweep: `trigger` (`pr_merged` | `cancelled`), `deleted`, `already_absent`, `skipped_open_pr` (`{branch, reason}`), `skipped_pr_read_error` and `errors` (`{branch, error}`, messages capped at 300 bytes), and the optional `children_unenumerated` / `stages_unenumerated`. No row is written when nothing was attempted: a nil forge, a zero credential scope, an unparseable repo, a terminal-failed or decomposed-child run, or an empty candidate set. A per-branch delete error (e.g. a ruleset 403 → `forge.ErrForbidden`) is recorded and the loop continues. A nil `AuditRepo` or a failed append skips only the row; the deletions still happen. The category is registered in `audit.KnownCategories`. It is not in `issuecomment`'s `activityCategories`, because the sweep is housekeeping and never calls `notifyOperatorVisible` / `notifyStatusUpdate`.
+
+### Stated residuals
+
+- **No terminal-FAILURE sweep.** `POST /v0/runs/{run_id}/revive` re-admits a failed run and resumes on exactly these branches, so `sweepRunBranches` returns early on `run.StateFailed`. The failed-run sweep is deferred to #3678.
+- **No retroactive sweep** of refs that predate this change.

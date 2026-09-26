@@ -3202,6 +3202,12 @@ func (s *Server) handleCancelRun(w http.ResponseWriter, r *http.Request) {
 	s.recordAcceptanceRetirementsDroppedOnCancel(r.Context(), runID, cancelSourceOperator)
 
 	s.writeJSON(w, r, http.StatusOK, toRunResponse(got))
+
+	// E68.67 / #3562: delete the cancelled run's Fishhawk-owned branches.
+	// AFTER the response, on a detached bounded goroutine, so the cancel
+	// never waits on forge round-trips (#3562 approval condition 3). The
+	// run_branches_swept row is still written by the goroutine.
+	s.sweepRunBranchesDetached(r.Context(), got, sweepTriggerCancelled)
 }
 
 // postStatusCommentRequest is the JSON body for POST /v0/runs/{run_id}/status-comment.
