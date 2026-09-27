@@ -1763,3 +1763,187 @@ func TestVerifyBranchLineage_AdmitsScenarioCommitParent(t *testing.T) {
 		t.Fatalf("scenario-corpus commit flagged as foreign: %+v", v)
 	}
 }
+
+// --- #3673: the ADR-035 ledger attributes the runner's conflict-resolution merge ---
+
+// mustConflictResolutionPushedPayload renders the payload
+// succeedConflictResolutionPushStage writes for a SUCCESSFUL pass. Only head_sha
+// drives the ledger, but the real shape is seeded so a future field rename in the
+// writer surfaces here.
+func mustConflictResolutionPushedPayload(t *testing.T, headSHA string) json.RawMessage {
+	t.Helper()
+	b, err := json.Marshal(map[string]any{
+		"run_id": uuid.New().String(), "stage_id": uuid.New().String(),
+		"branch": "fishhawk/run-abc", "head_sha": headSHA, "base_sha": "pre",
+		"files_changed_count": 2, "auth_method": "stage_key",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// TestVerifyBranchLineage_ConflictResolutionMergeAttributed is the #3673 ledger
+// regression: a LATER fix-up report on a run whose branch already carries the
+// merge commit a successful conflict-resolution pass pushed. The merge commit's
+// ONLY provenance is the conflict_resolution_pushed entry — the PR-open entry
+// names the agent head and the report seeds only the fix-up head — so this is the
+// load-bearing assertion that the new ledger member works. Counterfactual:
+// dropping auditcomplete.CategoryConflictResolutionPushed from
+// lineageLedgerCategories turns this RED with the stage failed category-B.
+func TestVerifyBranchLineage_ConflictResolutionMergeAttributed(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	const a = "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a" // PR-open (agent) head
+	const m = "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b" // conflict-resolution merge commit
+	const f = "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c" // the current fix-up head (report)
+
+	stub := &lineageGitHub{
+		baseRef:       "main",
+		commitsByBase: map[string][]string{"main": {a, m, f}},
+	}
+	gh := newLineageGitHubClient(t, stub)
+	runRow := &run.Run{ID: runID, Repo: "x/y", State: run.StateRunning, InstallationID: instID(99)}
+	stage := &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeImplement,
+		State: run.StageStateRunning, RequiresApproval: true}
+	s, _, au, rr := newLineageServer(t, gh, runRow, stage)
+	seedRunHeadEntry(au, runID, "pull_request_opened", a, 1)
+	au.seeded = append(au.seeded, &audit.Entry{
+		RunID:    &runID,
+		Category: CategoryConflictResolutionPushed,
+		Payload:  mustConflictResolutionPushedPayload(t, m),
+	})
+
+	if ok := s.verifyBranchLineage(context.Background(), runID, stage, f, 42); !ok {
+		t.Fatal("expected ok=true: the conflict-resolution merge must attribute via conflict_resolution_pushed")
+	}
+	if v := foreignViolation(au); v != nil {
+		t.Fatalf("unexpected violation after a successful conflict-resolution pass: %+v", v)
+	}
+	if transitionedTo(rr, run.StageStateFailed) {
+		t.Error("stage was failed despite an attributable conflict-resolution merge commit")
+	}
+}
+
+// TestVerifyBranchLineage_UnrecordedCommitAfterPassStillFlags is the fail-CLOSED
+// ANTI-VACUITY control (not a counterfactual vehicle): admitting the merge commit
+// must not launder the branch. A commit no category records still fires
+// foreign_commit_on_branch naming that SHA and fails the stage category-B. This
+// arm stays GREEN both before and after the change.
+func TestVerifyBranchLineage_UnrecordedCommitAfterPassStillFlags(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	const a = "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a"
+	const m = "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b"
+	const foreign = "ffffffffffffffffffffffffffffffffffffffff" // recorded by nothing
+	const f = "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c"
+
+	stub := &lineageGitHub{
+		baseRef:       "main",
+		commitsByBase: map[string][]string{"main": {a, m, foreign, f}},
+	}
+	gh := newLineageGitHubClient(t, stub)
+	runRow := &run.Run{ID: runID, Repo: "x/y", State: run.StateRunning, InstallationID: instID(99)}
+	stage := &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeImplement,
+		State: run.StageStateRunning, RequiresApproval: true}
+	s, _, au, rr := newLineageServer(t, gh, runRow, stage)
+	seedRunHeadEntry(au, runID, "pull_request_opened", a, 1)
+	au.seeded = append(au.seeded, &audit.Entry{
+		RunID:    &runID,
+		Category: CategoryConflictResolutionPushed,
+		Payload:  mustConflictResolutionPushedPayload(t, m),
+	})
+
+	if ok := s.verifyBranchLineage(context.Background(), runID, stage, f, 42); ok {
+		t.Fatal("expected ok=false: a commit recorded by no category is foreign")
+	}
+	v := foreignViolation(au)
+	if v == nil {
+		t.Fatal("expected a foreign_commit_on_branch invariant_violation, got none")
+	}
+	var payload struct {
+		OffendingSHA string `json:"offending_sha"`
+	}
+	if err := json.Unmarshal(v.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal violation payload: %v", err)
+	}
+	if payload.OffendingSHA != foreign {
+		t.Errorf("offending_sha = %q, want %q", payload.OffendingSHA, foreign)
+	}
+	if !transitionedTo(rr, run.StageStateFailed) {
+		t.Error("stage was not failed for an unattributable commit")
+	}
+}
+
+// TestReverifyBranchLineage_ChildConflictResolutionHeadAccepted is the
+// child-chain arm: a pass authorized on a decomposition CHILD's implement stage
+// pushes its merge commit to the SHARED parent branch, and the entry lands on the
+// CHILD's chain. Counterfactual: dropping
+// auditcomplete.CategoryConflictResolutionPushed from
+// lineageChildLedgerCategories turns this RED.
+func TestReverifyBranchLineage_ChildConflictResolutionHeadAccepted(t *testing.T) {
+	runID := uuid.New()
+	const c1 = "1111111111111111111111111111111111111111" // child implement commit
+	const m = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"  // child conflict-resolution merge = tip
+
+	stub := &lineageGitHub{
+		baseRef:       "main",
+		commitsByBase: map[string][]string{"main": {c1, m}},
+	}
+	gh := newReverifyGitHubClient(t, stub, m)
+	prURL := "https://github.com/x/y/pull/42"
+	runRow := &run.Run{ID: runID, Repo: "x/y", State: run.StateRunning,
+		InstallationID: instID(99), PullRequestURL: &prURL}
+	s, _, au, rr := newLineageServer(t, gh, runRow, &run.Stage{ID: uuid.New(), RunID: runID})
+	childID := seedDecompositionChild(rr, au, runID, "child_pushed", c1)
+	au.seeded = append(au.seeded, &audit.Entry{
+		RunID:    &childID,
+		Category: CategoryConflictResolutionPushed,
+		Payload:  mustConflictResolutionPushedPayload(t, m),
+	})
+
+	if clean := s.ReverifyBranchLineage(context.Background(), runID, 42); !clean {
+		t.Fatal("expected clean=true when the tip is a child conflict_resolution_pushed head")
+	}
+	if got := foreignViolationCount(au); got != 0 {
+		t.Fatalf("child conflict-resolution fan-out emitted %d violations, want 0", got)
+	}
+}
+
+// TestVerifyBranchLineage_ConflictResolutionReadErrorFailsOpen is the fail-OPEN
+// guard: a ListForRunByCategory error on the conflict_resolution_pushed category
+// marks the ledger incomplete, so the guard SKIPS (ok=true) rather than enforcing
+// against a partial ledger and false-blocking a clean run. The branch carries a
+// commit that WOULD flag against a complete ledger, proving the pass is the
+// incomplete-ledger skip and not coincidental attribution.
+func TestVerifyBranchLineage_ConflictResolutionReadErrorFailsOpen(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	const a = "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a"
+	const foreign = "ffffffffffffffffffffffffffffffffffffffff" // would flag if the ledger were complete
+	const f = "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c"
+
+	stub := &lineageGitHub{
+		baseRef:       "main",
+		commitsByBase: map[string][]string{"main": {a, foreign, f}},
+	}
+	gh := newLineageGitHubClient(t, stub)
+	runRow := &run.Run{ID: runID, Repo: "x/y", State: run.StateRunning, InstallationID: instID(99)}
+	stage := &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeImplement,
+		State: run.StageStateRunning, RequiresApproval: true}
+	s, _, au, rr := newLineageServer(t, gh, runRow, stage)
+	seedRunHeadEntry(au, runID, "pull_request_opened", a, 1)
+	// Fail ONLY the conflict_resolution_pushed read; every other category stays
+	// readable, so the ledger is incomplete solely because of the new member.
+	s.cfg.AuditRepo = &categoryErrAudit{
+		auditFake: au,
+		errFor:    map[string]error{CategoryConflictResolutionPushed: errors.New("conflict_resolution_pushed read boom")},
+	}
+
+	if ok := s.verifyBranchLineage(context.Background(), runID, stage, f, 42); !ok {
+		t.Fatal("expected ok=true: an incomplete ledger must fail open (skip), never false-block")
+	}
+	if v := foreignViolation(au); v != nil {
+		t.Fatalf("fail-open path must not emit a violation: %+v", v)
+	}
+	if transitionedTo(rr, run.StageStateFailed) {
+		t.Error("fail-open path must not fail the stage")
+	}
+}
