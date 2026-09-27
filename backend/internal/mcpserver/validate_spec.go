@@ -22,8 +22,8 @@ import (
 // from the explicit SpecFile. At least one of the three is required.
 type ValidateSpecInput struct {
 	WorkflowSpec string `json:"workflow_spec,omitempty" jsonschema:"inline workflow spec YAML to validate; wins over working_dir and spec_file when set"`
-	WorkingDir   string `json:"working_dir,omitempty" jsonschema:"absolute path of the checkout to discover .fishhawk/workflows.yaml in (walks up to the dir holding .git); defaults to the process cwd when only spec_file is omitted"`
-	SpecFile     string `json:"spec_file,omitempty" jsonschema:"explicit path to a workflow spec file; the file must exist"`
+	WorkingDir   string `json:"working_dir,omitempty" jsonschema:"absolute path of the checkout to discover .fishhawk/workflows.yaml in (walks up to the dir holding .git); defaults to the process cwd when only spec_file is omitted. Over the HTTP MCP transport the path must resolve inside an operator-configured allowed checkout root (fishhawkd --mcp-allowed-roots / FISHHAWKD_MCP_ALLOWED_ROOTS, fishhawk-mcp --allowed-roots / FISHHAWK_MCP_ALLOWED_ROOTS); a path outside every root — or any path at all when no root is configured — is refused path_outside_allowed_roots."`
+	SpecFile     string `json:"spec_file,omitempty" jsonschema:"explicit path to a workflow spec file; the file must exist. Over the HTTP MCP transport the path must resolve inside an operator-configured allowed checkout root (fishhawkd --mcp-allowed-roots / FISHHAWKD_MCP_ALLOWED_ROOTS, fishhawk-mcp --allowed-roots / FISHHAWK_MCP_ALLOWED_ROOTS); a path outside every root — or any path at all when no root is configured — is refused path_outside_allowed_roots."`
 }
 
 // ValidateSpecDiagnostic is one validation failure. Kind is yaml (the input is
@@ -110,7 +110,11 @@ DEFAULT BRANCH, so it cannot confirm an uncommitted or unmerged file.
 Input, in precedence order: workflow_spec (the inline YAML — wins when set),
 else working_dir (the checkout to discover .fishhawk/workflows.yaml in, walking
 up to the dir holding .git) and/or spec_file (an explicit path). One of the
-three is required.
+three is required. Over the HTTP MCP transport working_dir and spec_file must
+resolve inside an operator-configured allowed checkout root, and so must the
+file the discovery walk selects, or the call is refused
+path_outside_allowed_roots having read nothing; inline workflow_spec reads no
+filesystem and is unaffected.
 
 Output is structured, not prose: valid, source (inline|file), path, version,
 diagnostics[] {kind: yaml|schema|validation|other, path (JSON pointer),
@@ -146,7 +150,7 @@ validate → commit).
 // failure is a Valid:false RESULT with one classified diagnostic and a nil
 // tool error — the failure IS the answer. The spec bytes are never echoed
 // back, keeping the response small.
-func (*runResolver) validateSpec(_ context.Context, _ *mcp.CallToolRequest, in ValidateSpecInput) (*mcp.CallToolResult, ValidateSpecOutput, error) {
+func (r *runResolver) validateSpec(_ context.Context, _ *mcp.CallToolRequest, in ValidateSpecInput) (*mcp.CallToolResult, ValidateSpecOutput, error) {
 	out := ValidateSpecOutput{
 		Diagnostics:       []ValidateSpecDiagnostic{},
 		CharterRequiredBy: []string{},
@@ -161,10 +165,23 @@ func (*runResolver) validateSpec(_ context.Context, _ *mcp.CallToolRequest, in V
 		out.Source = "inline"
 	case strings.TrimSpace(in.WorkingDir) != "" || strings.TrimSpace(in.SpecFile) != "":
 		dir := strings.TrimSpace(in.WorkingDir)
+		// Confinement (E66.63 / #3589) BEFORE discoverSpec, so a refused path
+		// is never opened. Both inputs are confined as SUPPLIED; the file the
+		// walk selects is confined per-candidate by confineSpecCandidate
+		// below, which covers a discovered symlink escape (binding condition
+		// 1). The inline workflow_spec arm above is deliberately untouched: it
+		// reads no filesystem, so it stays usable over HTTP with no roots
+		// configured.
+		if err := r.confinePath("working_dir", dir); err != nil {
+			return nil, ValidateSpecOutput{}, err
+		}
+		if err := r.confinePath("spec_file", strings.TrimSpace(in.SpecFile)); err != nil {
+			return nil, ValidateSpecOutput{}, err
+		}
 		if dir == "" {
 			dir = "."
 		}
-		found, err := discoverSpec(dir, strings.TrimSpace(in.SpecFile))
+		found, err := r.discoverSpecConfined(dir, strings.TrimSpace(in.SpecFile))
 		if err != nil {
 			return nil, ValidateSpecOutput{}, fmt.Errorf("read workflow spec: %w", err)
 		}

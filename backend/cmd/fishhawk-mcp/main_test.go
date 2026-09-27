@@ -5,6 +5,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -353,7 +355,7 @@ func envFunc(env map[string]string) func(string) string {
 func TestMcpServerConfig(t *testing.T) {
 	cfg := config{backendURL: "http://127.0.0.1:9090", apiToken: "fhk_y"}
 
-	httpCfg := mcpServerConfig(cfg, true)
+	httpCfg := mcpServerConfig(cfg, true, "")
 	if !httpCfg.HTTPTransport {
 		t.Error("http branch: HTTPTransport = false, want true")
 	}
@@ -361,7 +363,7 @@ func TestMcpServerConfig(t *testing.T) {
 		t.Errorf("http branch: passthrough wrong: %+v", httpCfg)
 	}
 
-	stdioCfg := mcpServerConfig(cfg, false)
+	stdioCfg := mcpServerConfig(cfg, false, "")
 	if stdioCfg.HTTPTransport {
 		t.Error("stdio branch: HTTPTransport = true, want false")
 	}
@@ -563,5 +565,103 @@ func TestLoadConfigPersistsRotatedRefreshToken(t *testing.T) {
 	}
 	if stored.Token != "fho_rotated" {
 		t.Errorf("stored Token = %q, want fho_rotated", stored.Token)
+	}
+}
+
+// TestMCPServerConfig_CarriesAllowedRoots is the DONE-MEANS wiring test for the
+// E66.63 / #3589 allow-list, whose correctness no compiler enforces: it asserts
+// the SHIPPED mcpserver.Config value on BOTH transport branches, so a
+// comment-only touch of mcpServerConfig fails it.
+//
+// The contract it pins: the FLAG wins over the FISHHAWK_MCP_ALLOWED_ROOTS env
+// value loadConfig read; an empty flag leaves the env value in place; the list
+// is split on the OS path-list separator with blanks dropped; and the roots are
+// carried on the stdio branch too (confinement is inert there because mcpserver
+// keys it off HTTPTransport, so branching here would be a second place to get
+// wrong).
+func TestMCPServerConfig_CarriesAllowedRoots(t *testing.T) {
+	sep := string(os.PathListSeparator)
+	ps := string(filepath.Separator)
+	envRoots := filepath.Join(ps+"env", "one")
+	flagA := filepath.Join(ps+"flag", "a")
+	flagB := filepath.Join(ps+"flag", "b")
+
+	cfg := config{
+		backendURL:   "http://127.0.0.1:9090",
+		apiToken:     "fhk_y",
+		allowedRoots: splitAllowedRoots(envRoots),
+	}
+
+	for _, transport := range []bool{true, false} {
+		// (a) No flag: the env-derived roots are carried through unchanged.
+		got := mcpServerConfig(cfg, transport, "")
+		if len(got.AllowedRoots) != 1 || got.AllowedRoots[0] != envRoots {
+			t.Errorf("http=%v: AllowedRoots = %v, want the env value [%q]", transport, got.AllowedRoots, envRoots)
+		}
+
+		// (b) The flag OVERRIDES the env value, and is split on the OS
+		// path-list separator with blank entries dropped (the trailing
+		// separator below must not yield an empty root).
+		got = mcpServerConfig(cfg, transport, flagA+sep+flagB+sep)
+		want := []string{flagA, flagB}
+		if len(got.AllowedRoots) != len(want) {
+			t.Fatalf("http=%v: AllowedRoots = %v, want %v", transport, got.AllowedRoots, want)
+		}
+		for i := range want {
+			if got.AllowedRoots[i] != want[i] {
+				t.Errorf("http=%v: AllowedRoots[%d] = %q, want %q", transport, i, got.AllowedRoots[i], want[i])
+			}
+		}
+	}
+
+	// (c) The FAIL-CLOSED posture: neither flag nor env yields ZERO roots, not
+	// an unrestricted server.
+	bare := mcpServerConfig(config{backendURL: "u", apiToken: "t"}, true, "")
+	if len(bare.AllowedRoots) != 0 {
+		t.Errorf("with neither flag nor env set, AllowedRoots = %v, want empty (fail closed)", bare.AllowedRoots)
+	}
+}
+
+// TestLoadConfig_ReadsAllowedRootsFromEnv pins the env half of the ladder,
+// including that the roots survive the token ladder's rung-1 early return (an
+// explicit FISHHAWK_API_TOKEN returns before the credential store is consulted).
+func TestLoadConfig_ReadsAllowedRootsFromEnv(t *testing.T) {
+	sep := string(os.PathListSeparator)
+	ps := string(filepath.Separator)
+	cfg, err := loadConfig(envFunc(map[string]string{
+		"FISHHAWK_API_TOKEN": "fhk_tok",
+		// A trailing/doubled separator must not yield an empty root.
+		"FISHHAWK_MCP_ALLOWED_ROOTS": ps + "repos" + sep + sep + ps + "other",
+	}), nil, nil)
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	want := []string{ps + "repos", ps + "other"}
+	if len(cfg.allowedRoots) != len(want) {
+		t.Fatalf("allowedRoots = %v, want %v (blank entries dropped)", cfg.allowedRoots, want)
+	}
+	for i := range want {
+		if cfg.allowedRoots[i] != want[i] {
+			t.Errorf("allowedRoots[%d] = %q, want %q", i, cfg.allowedRoots[i], want[i])
+		}
+	}
+}
+
+// TestParseFlags_AllowedRoots pins the flag's presence and its empty default —
+// an empty default is what lets FISHHAWK_MCP_ALLOWED_ROOTS stay in effect.
+func TestParseFlags_AllowedRoots(t *testing.T) {
+	tf, err := parseFlags([]string{"fishhawk-mcp"}, io.Discard)
+	if err != nil {
+		t.Fatalf("parseFlags: %v", err)
+	}
+	if tf.allowedRoots != "" {
+		t.Errorf("default --allowed-roots = %q, want empty so the env value stays in effect", tf.allowedRoots)
+	}
+	tf, err = parseFlags([]string{"fishhawk-mcp", "--allowed-roots", "/repos"}, io.Discard)
+	if err != nil {
+		t.Fatalf("parseFlags: %v", err)
+	}
+	if tf.allowedRoots != "/repos" {
+		t.Errorf("--allowed-roots = %q, want /repos", tf.allowedRoots)
 	}
 }

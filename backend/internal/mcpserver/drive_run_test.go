@@ -4389,6 +4389,10 @@ func TestDriveRun_ExplicitWorkingDirEchoedAndUnchanged(t *testing.T) {
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
 	r.httpTransport = true
+	// E66.63 / #3589: the fixture's own temp root is the allowed checkout root,
+	// so this ACCEPT case keeps pinning what it was written to pin instead of
+	// tripping on the confinement fail-closed default.
+	r.allowedRoots = []string{dir}
 	var mu sync.Mutex
 	var gotArgv []string
 	r.driveSpawn = func(binary string, argv, env []string, runID, stageID string, report detachedFailureReporter, probe detachedStageStateProbe) (string, error) {
@@ -4442,6 +4446,10 @@ func TestDriveRun_InheritsBoundWorkingDir(t *testing.T) {
 	r, srv := newDriveResolver(t, f, rec)
 	defer srv.Close()
 	r.httpTransport = true
+	// E66.63 / #3589: the fixture's own temp root is the allowed checkout root,
+	// so this ACCEPT case keeps pinning what it was written to pin instead of
+	// tripping on the confinement fail-closed default.
+	r.allowedRoots = []string{bound}
 	var mu sync.Mutex
 	var gotArgv []string
 	r.driveSpawn = func(binary string, argv, env []string, runID, stageID string, report detachedFailureReporter, probe detachedStageStateProbe) (string, error) {

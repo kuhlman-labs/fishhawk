@@ -1749,6 +1749,10 @@ func TestStartCampaignItemRun_BindsWorkingDirInheritedByResolver(t *testing.T) {
 	r.httpTransport = true // the inheriting verbs run over HTTP; stdio would fall back to cwd
 
 	wd := t.TempDir()
+	// E66.63 / #3589: the fixture's own temp root is the allowed checkout root,
+	// so both the mint and the inheritance read stay ACCEPTS and keep pinning
+	// the #2498 inheritance leg rather than the confinement fail-closed default.
+	r.allowedRoots = []string{wd}
 	_, out, err := r.startCampaignItemRun(context.Background(), nil, StartCampaignItemRunInput{
 		CampaignID: uuid.NewString(),
 		IssueRef:   "issue:1",

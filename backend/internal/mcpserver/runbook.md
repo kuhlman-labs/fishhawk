@@ -146,6 +146,11 @@ The precedence ladder each of those verbs applies:
    tree. The refusal names both paths, both remedies (omit to inherit, or start a
    new run for a different checkout), and notes that paths are compared **without
    resolving symlinks** — so on macOS `/tmp` and `/private/tmp` read as a conflict.
+   Over the HTTP transport absolute is **necessary but not sufficient** as of
+   [E66.63 / #3589](https://github.com/kuhlman-labs/fishhawk/issues/3589): the
+   path must ALSO resolve inside an operator-configured allowed checkout root or
+   it is refused `path_outside_allowed_roots` (contract:
+   `backend/internal/mcpserver/README.md`).
 2. **Omitted with a binding** — inherits the binding, run through the same
    absolute/cleaning gate as an explicit path, so a relative or empty binding is
    refused identically.

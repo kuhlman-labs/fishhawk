@@ -42,6 +42,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -78,7 +79,11 @@ func main() {
 // backend URL + token.
 type transportFlags struct {
 	transport string
-	addr      string
+
+	// allowedRoots is the raw --allowed-roots OS-path-list (E66.63 / #3589).
+	// Empty leaves FISHHAWK_MCP_ALLOWED_ROOTS in effect.
+	allowedRoots string
+	addr         string
 }
 
 // parseFlags parses the transport-selection flags from args[1:] (args
@@ -90,6 +95,11 @@ func parseFlags(args []string, stderr io.Writer) (transportFlags, error) {
 	var tf transportFlags
 	fs.StringVar(&tf.transport, "transport", transportStdio, "transport to serve on: stdio|http (http is loopback-only, opt-in — #927)")
 	fs.StringVar(&tf.addr, "addr", defaultHTTPAddr, "host:port for --transport http; loopback-only, ignored for stdio")
+	fs.StringVar(&tf.allowedRoots, "allowed-roots", "",
+		"OS-path-list of absolute checkout roots every path-taking MCP input (working_dir, spec_file) must "+
+			"resolve inside when serving --transport http (E66.63 / #3589). Overrides FISHHAWK_MCP_ALLOWED_ROOTS. "+
+			"Inert on the stdio default. Leaving BOTH unset is FAIL CLOSED over http: every path-taking verb is "+
+			"refused path_outside_allowed_roots")
 	if err := fs.Parse(args[1:]); err != nil {
 		return transportFlags{}, err
 	}
@@ -133,7 +143,7 @@ func run(ctx context.Context, args []string, stderr io.Writer) int {
 	// working_dir too.
 	httpTransport := tf.transport == transportHTTP
 	newServer := func() *mcp.Server {
-		return mcpserver.NewServer(mcpServerConfig(cfg, httpTransport))
+		return mcpserver.NewServer(mcpServerConfig(cfg, httpTransport, tf.allowedRoots))
 	}
 
 	switch tf.transport {
@@ -159,12 +169,39 @@ func run(ctx context.Context, args []string, stderr io.Writer) int {
 // Keying on transport is what makes `fishhawk-mcp --transport http` refuse an
 // omitted or relative working_dir on the runner-spawning verbs, matching the
 // route, while stdio keeps the resolve-to-cwd default.
-func mcpServerConfig(cfg config, httpTransport bool) mcpserver.Config {
+//
+// AllowedRoots (E66.63 / #3589) is carried UNCONDITIONALLY — confinement is
+// inert on stdio because mcpserver keys it off HTTPTransport, so there is no
+// need to branch here. The --allowed-roots FLAG wins over the
+// FISHHAWK_MCP_ALLOWED_ROOTS env value loadConfig read; an empty flag leaves
+// the env value in place.
+func mcpServerConfig(cfg config, httpTransport bool, allowedRootsFlag string) mcpserver.Config {
+	roots := cfg.allowedRoots
+	if strings.TrimSpace(allowedRootsFlag) != "" {
+		roots = splitAllowedRoots(allowedRootsFlag)
+	}
 	return mcpserver.Config{
 		BackendURL:    cfg.backendURL,
 		APIToken:      cfg.apiToken,
 		HTTPTransport: httpTransport,
+		AllowedRoots:  roots,
 	}
+}
+
+// splitAllowedRoots parses an OS path-list (filepath.SplitList: ':' on unix,
+// ';' on Windows) into the allow-list, dropping blank entries so a trailing or
+// doubled separator is not read as an empty root. A checkout path CONTAINING
+// the list separator cannot be expressed — accepted rather than inventing a
+// second encoding. Mirrored in backend/cmd/fishhawkd/serve.go, which cannot
+// import this package.
+func splitAllowedRoots(raw string) []string {
+	var out []string
+	for _, p := range filepath.SplitList(raw) {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // refreshStoredCredential is the production refreshCred seam for
@@ -189,6 +226,13 @@ const refreshTimeout = 30 * time.Second
 type config struct {
 	backendURL string
 	apiToken   string
+
+	// allowedRoots is the checkout allow-list every path-taking MCP input must
+	// resolve inside when this binary serves `--transport http` (E66.63 /
+	// #3589). Read from FISHHAWK_MCP_ALLOWED_ROOTS; the --allowed-roots flag
+	// OVERRIDES it when supplied. Inert on the stdio default. EMPTY over HTTP
+	// is FAIL CLOSED — every path-taking verb is refused until a root is set.
+	allowedRoots []string
 }
 
 // loadConfig validates the env and resolves the bearer token through
@@ -241,6 +285,9 @@ func loadConfig(getenv func(string) string, loadCred func(string) (credstore.Cre
 	c := config{
 		backendURL: strings.TrimRight(getenv("FISHHAWK_BACKEND_URL"), "/"),
 		apiToken:   getenv("FISHHAWK_API_TOKEN"),
+		// Read BEFORE the token ladder's early returns so rung 1 (an explicit
+		// env token) carries the roots too.
+		allowedRoots: splitAllowedRoots(getenv("FISHHAWK_MCP_ALLOWED_ROOTS")),
 	}
 	if c.backendURL == "" {
 		c.backendURL = "http://localhost:8080"

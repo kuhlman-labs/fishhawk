@@ -166,7 +166,9 @@ func TestNewServer_HTTPTransportEchoesResolvedWorkingDir(t *testing.T) {
 	seedStageOfType(fb, runID, stageID, "implement", "pending")
 
 	dir := t.TempDir() // absolute
-	res := callDispatchViaNewServer(t, Config{BackendURL: srv.URL, APIToken: "tok", HTTPTransport: true},
+	// AllowedRoots carries the fixture's own temp root (E66.63 / #3589) so this
+	// pre-existing ACCEPT case keeps pinning the #2479 echo it was written for.
+	res := callDispatchViaNewServer(t, Config{BackendURL: srv.URL, APIToken: "tok", HTTPTransport: true, AllowedRoots: []string{dir}},
 		map[string]any{
 			"run_id":           runID.String(),
 			"workflow":         "feature_change",

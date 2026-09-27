@@ -54,7 +54,7 @@ func clampMaxParallel(effective, override int) int {
 type RunChildrenInput struct {
 	RunID        string `json:"run_id" jsonschema:"the DECOMPOSED PARENT run UUID; the tool discovers its children from the parent's plan_decomposed audit entry"`
 	Workflow     string `json:"workflow" jsonschema:"workflow ID matching the run's workflow (passed through to each child's runner)"`
-	WorkingDir   string `json:"working_dir,omitempty" jsonschema:"checkout the children run in. OPTIONAL when the parent run carries a start_run binding (E66.42 / #2482): omit it to INHERIT the bound checkout. An explicit value is an override and must match the binding after path cleaning — a conflicting value is refused. Over the HTTP MCP transport (fishhawkd's /mcp route, or fishhawk-mcp --transport http) an omitted-and-unbound or relative value is refused — the server's cwd is the daemon's own checkout. On the stdio transport an omitted-and-unbound value defaults to the client-spawned process's own directory (resolved to an absolute path). Each child provisions its OWN per-child worktree under this checkout's shared gitdir (--parallel-isolate), so the operator's tracked tree is untouched"`
+	WorkingDir   string `json:"working_dir,omitempty" jsonschema:"checkout the children run in. OPTIONAL when the parent run carries a start_run binding (E66.42 / #2482): omit it to INHERIT the bound checkout. An explicit value is an override and must match the binding after path cleaning — a conflicting value is refused. Over the HTTP MCP transport (fishhawkd's /mcp route, or fishhawk-mcp --transport http) an omitted-and-unbound or relative value is refused — the server's cwd is the daemon's own checkout. On the stdio transport an omitted-and-unbound value defaults to the client-spawned process's own directory (resolved to an absolute path). Each child provisions its OWN per-child worktree under this checkout's shared gitdir (--parallel-isolate), so the operator's tracked tree is untouched Over the HTTP MCP transport the path must resolve inside an operator-configured allowed checkout root (fishhawkd --mcp-allowed-roots / FISHHAWKD_MCP_ALLOWED_ROOTS, fishhawk-mcp --allowed-roots / FISHHAWK_MCP_ALLOWED_ROOTS); a path outside every root — or any path at all when no root is configured — is refused path_outside_allowed_roots. The INHERITED binding is confined identically, so a bound checkout stays usable exactly when it is itself inside a root."`
 	GitHubRepo   string `json:"github_repo,omitempty" jsonschema:"repo slug (owner/name, or the GitLab path_with_namespace); defaults to the parent run row's repo for a gitlab run, else auto-detected from working_dir's origin remote when empty"`
 	BaseBranch   string `json:"base_branch,omitempty" jsonschema:"fallback base branch for a child's implement stage; defaults to main. The SERVER is the authority for a dependent fan-out child — the host-dispatch marker returns the consolidated base_branch and this value is used only when it returns none"`
 	MaxParallel  int    `json:"max_parallel,omitempty" jsonschema:"optional operator concurrency override; clamp-DOWN-only against the orchestrator-resolved effective cap (it can lower an unlimited/looser cap, never raise it). Omit (0) to use the effective cap as-is"`
@@ -231,6 +231,16 @@ func (r *runResolver) runChildren(ctx context.Context, _ *mcp.CallToolRequest, i
 	parentUUID, err := uuid.Parse(in.RunID)
 	if err != nil {
 		return nil, RunChildrenOutput{}, fmt.Errorf("run_id %q is not a valid UUID: %w", in.RunID, err)
+	}
+
+	// Confinement of the SUPPLIED working_dir (E66.63 / #3589), placed here —
+	// ahead of EVERY backend read — so a refusal dials nothing at all. The
+	// resolveWorkingDir chokepoint confines it again (and is what confines the
+	// E66.42 INHERITED binding, which is only knowable after the run read), so
+	// this early guard and the chokepoint are independent controls: deleting
+	// either leaves the other's counterfactual red.
+	if cerr := r.confinePath("working_dir", in.WorkingDir); cerr != nil {
+		return nil, RunChildrenOutput{}, cerr
 	}
 
 	// (a) Discover the children + the effective cap from the parent's

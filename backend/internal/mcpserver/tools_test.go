@@ -2018,7 +2018,10 @@ func TestResolveWorkingDir(t *testing.T) {
 
 	// (iii) http + absolute -> passed through unchanged.
 	t.Run("http_absolute_passthrough", func(t *testing.T) {
-		r := &runResolver{httpTransport: true}
+		// allowedRoots carries the fixture's own temp root so this case keeps
+		// pinning the #2479 passthrough it was written for rather than tripping
+		// on the E66.63 / #3589 fail-closed default.
+		r := &runResolver{httpTransport: true, allowedRoots: []string{absDir}}
 		got, err := r.resolveWorkingDir(absDir)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -2552,6 +2555,11 @@ func TestResolveWorkingDirForRun_ConflictingOverrideRefused(t *testing.T) {
 	a := t.TempDir()
 	b := t.TempDir() // independently created — definitionally != a
 
+	// BOTH temp dirs are allowed roots (E66.63 / #3589), so each case's verdict
+	// is still decided by the #2482 conflict check under test and not by the
+	// confinement fail-closed default.
+	roots := []string{a, b}
+
 	cases := []struct {
 		name        string
 		binding     string
@@ -2568,6 +2576,7 @@ func TestResolveWorkingDirForRun_ConflictingOverrideRefused(t *testing.T) {
 			fb, srv := newFakeBackend(t)
 			r := newResolver(srv, nil)
 			r.httpTransport = true
+			r.allowedRoots = roots
 			runID := uuid.New()
 			seedRunWorkingDir(fb, runID, tc.binding)
 
@@ -2805,7 +2814,8 @@ func TestStartRun_HTTPRelativeWorkingDirRefusedAnyRunnerKind(t *testing.T) {
 		r := newResolver(srv, nil)
 		r.httpTransport = true
 
-		wd := t.TempDir() // absolute
+		wd := t.TempDir()             // absolute
+		r.allowedRoots = []string{wd} // E66.63 / #3589: keep this ACCEPT case accepting
 		_, out, err := r.startRun(context.Background(), nil, StartRunInput{
 			Repo: "kuhlman-labs/fishhawk", WorkflowID: "feature_change",
 			RunnerKind: "github_actions", WorkingDir: wd,
@@ -2846,7 +2856,8 @@ func TestStartRun_WorkingDirRoundTripsThroughToolSurface(t *testing.T) {
 	r.httpTransport = true
 	inlineSpec := minimalWorkflowSpecYAML(t)
 
-	wd := t.TempDir() // absolute
+	wd := t.TempDir()             // absolute
+	r.allowedRoots = []string{wd} // E66.63 / #3589: keep this ACCEPT case accepting
 	_, out, err := r.startRun(context.Background(), nil, StartRunInput{
 		Repo: "kuhlman-labs/fishhawk", WorkflowID: "feature_change",
 		RunnerKind: "local", WorkingDir: wd, WorkflowSpec: inlineSpec, WorkflowSHA: "deadbeef",

@@ -86,6 +86,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -1622,8 +1623,54 @@ func resolveBudgetLocation(name string, logger *slog.Logger) *time.Location {
 // runner-spawning verbs must refuse an omitted or relative working_dir and
 // require an absolute path (#2479). Extracted from the inline factory closure so
 // this posture is directly assertable — NewServer returns an opaque *mcp.Server.
-func mcpRouteServerConfig(backendURL, apiToken string) mcpserver.Config {
-	return mcpserver.Config{BackendURL: backendURL, APIToken: apiToken, HTTPTransport: true}
+//
+// allowedRootsRaw is the --mcp-allowed-roots / FISHHAWKD_MCP_ALLOWED_ROOTS
+// OS-path-list every path-taking MCP input must resolve inside (E66.63 /
+// #3589). An EMPTY list is the FAIL-CLOSED posture, not "unrestricted": the
+// route then refuses every path-taking verb with path_outside_allowed_roots.
+func mcpRouteServerConfig(backendURL, apiToken, allowedRootsRaw string) mcpserver.Config {
+	return mcpserver.Config{
+		BackendURL:    backendURL,
+		APIToken:      apiToken,
+		HTTPTransport: true,
+		AllowedRoots:  splitMCPAllowedRoots(allowedRootsRaw),
+	}
+}
+
+// splitMCPAllowedRoots parses an OS path-list (filepath.SplitList: ':' on unix,
+// ';' on Windows) into the allow-list, dropping blank entries so a trailing or
+// doubled separator is not read as an empty root. A checkout path CONTAINING
+// the list separator cannot be expressed — accepted rather than inventing a
+// second encoding. Mirrored in backend/cmd/fishhawk-mcp/main.go, which this
+// package cannot import.
+func splitMCPAllowedRoots(raw string) []string {
+	var out []string
+	for _, p := range filepath.SplitList(raw) {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// registerMCPAllowedRootsFlag registers --mcp-allowed-roots on fs with its
+// FISHHAWKD_MCP_ALLOWED_ROOTS environment default and returns the bound value
+// runServe reads (E66.63 / #3589).
+//
+// Extracted from runServe's flag block so the wiring is DIRECTLY assertable:
+// runServe boots a daemon, so a test cannot run it to completion to observe the
+// parsed value, and asserting only that runServe exits non-zero on an argv
+// carrying the flag proves nothing (any other parse failure in the same argv
+// satisfies it — the test-vacuity defect this replaces). A test can register
+// this helper on its own flag.FlagSet and assert the PRODUCTION flag name, the
+// env default and the flag-over-env precedence on the real registration, not on
+// a test-local mirror. runServe calls it, so a rename here reddens both.
+func registerMCPAllowedRootsFlag(fs *flag.FlagSet) *string {
+	return fs.String("mcp-allowed-roots", envOr("FISHHAWKD_MCP_ALLOWED_ROOTS", ""),
+		"OS-path-list of absolute checkout roots every path-taking MCP input (working_dir, spec_file) must "+
+			"resolve inside on the /mcp route (E66.63 / #3589). Leaving it unset is FAIL CLOSED: /mcp refuses "+
+			"every path-taking verb with path_outside_allowed_roots. Containment compares cleaned, "+
+			"symlink-resolved paths")
 }
 
 // runServe boots the HTTP server with graceful SIGINT/SIGTERM
@@ -1640,6 +1687,7 @@ func runServe(args []string, logSink io.Writer) int {
 			"The route is LOOPBACK-ONLY per ADR-033 — with the default --addr=:8080 the daemon binds every "+
 			"interface, so /mcp answers 403 until --addr is set to 127.0.0.1:8080. Use off as the explicit "+
 			"opt-out for a deployment that binds a non-loopback address on purpose")
+	mcpAllowedRoots := registerMCPAllowedRootsFlag(fs)
 	oauthIssuer := fs.String("oauth-issuer", envOr("FISHHAWKD_OAUTH_ISSUER", ""),
 		"RFC 8414 issuer (https, origin-only, no path) for the OAuth 2.1 authorization server (ADR-076 / #2436); "+
 			"empty leaves the AS off. A non-empty but invalid value refuses to start rather than degrading silently")
@@ -2193,7 +2241,7 @@ func runServe(args []string, logSink io.Writer) int {
 	// *mcp.Server, so pinning the route is built in HTTP posture requires
 	// asserting on the Config the factory constructs.
 	cfg.MCPServerFactory = func(backendURL, apiToken string) *mcp.Server {
-		return mcpserver.NewServer(mcpRouteServerConfig(backendURL, apiToken))
+		return mcpserver.NewServer(mcpRouteServerConfig(backendURL, apiToken, *mcpAllowedRoots))
 	}
 
 	// OAuth token-login wiring (E39.3 / #1708). The client_id the discovery

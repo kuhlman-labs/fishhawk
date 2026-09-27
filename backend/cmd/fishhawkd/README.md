@@ -63,6 +63,29 @@ Fishhawk MCP tool surface at `POST/GET/DELETE /mcp`.
 | Env var | Flag | Values | Default |
 |---|---|---|---|
 | `FISHHAWKD_MCP_ROUTE` | `--mcp-route` | `on` \| `off` (empty means `on`) | `on` |
+| `FISHHAWKD_MCP_ALLOWED_ROOTS` | `--mcp-allowed-roots` | OS path-list (`:` unix, `;` Windows) of absolute checkout roots | *(empty — fail closed)* |
+
+**LOUD NOTE — leaving `FISHHAWKD_MCP_ALLOWED_ROOTS` unset REFUSES every
+path-taking verb over `/mcp`** (E66.63 / [#3589](https://github.com/kuhlman-labs/fishhawk/issues/3589)).
+`working_dir` and `spec_file` are caller-supplied filesystem paths, so over an
+HTTP transport any authenticated MCP caller could otherwise point a verb at an
+arbitrary directory on this host. Every such input must now resolve — after
+`filepath.Clean` plus symlink evaluation of BOTH the candidate and each
+configured root — inside an allow-listed root, or the call is refused
+`path_outside_allowed_roots` BEFORE any filesystem read. An empty list is the
+FAIL-CLOSED posture, not "unrestricted": `fishhawk_validate`,
+`fishhawk_start_run`, `fishhawk_run_stage`, `fishhawk_dispatch_stage`,
+`fishhawk_run_children`, `fishhawk_drive_run`, `fishhawk_start_campaign` and
+`fishhawk_start_campaign_item_run` all refuse until a root is configured.
+(Inline `workflow_spec` reads no filesystem and is unaffected.) Containment
+compares cleaned, symlink-resolved paths BYTE-WISE with a separator anchor, so
+`/roots/repo-evil` is not inside `/roots/repo` — and because it is byte-wise
+there is no case folding: on a case-insensitive filesystem (Windows, macOS by
+default) supply roots in the canonical case the filesystem reports. A checkout
+path containing the OS path-list separator cannot be expressed in the list. This
+is a BEHAVIOUR CHANGE for an existing HTTP-driven loop: set the variable (or the
+flag) to the checkout roots your callers legitimately drive. Full contract:
+[mcpserver README — path confinement over HTTP](../../internal/mcpserver/README.md).
 
 Any other value FAILS STARTUP with `invalid --mcp-route` rather than degrading
 silently: an operator who wrote `--mcp-route=disabled` intending to close the
