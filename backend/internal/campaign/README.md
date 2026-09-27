@@ -98,7 +98,7 @@ Deliberately ABSENT: `paused → awaiting_human` (a paused campaign stays sticky
 
 **Intended behavior change beyond the headline:** an all-human-led campaign that has NOT started now derives `awaiting_human` where it previously derived `pending`. That is the honest reading (the engine will never dispatch any of its items) and is fully reversible on a relabel.
 
-**ROLLBACK, including the CODE-ONLY case.** Migration `0087` only WIDENS `campaigns_state_check`; its down migration rewrites any `awaiting_human` row to `running` BEFORE narrowing, so a full schema rollback strands nothing. **A CODE-ONLY revert — the Go reverted while migration 0087 is left applied — must FIRST normalise existing rows:**
+**ROLLBACK, including the CODE-ONLY case.** Migration `0087` only WIDENS `campaigns_state_check`; its down migration rewrites any `awaiting_human` row to `running` BEFORE narrowing, so a full schema rollback strands nothing. `running` is the exact pre-0087 state for the headline case (a started campaign); the ONE exception is a NEVER-STARTED all-human-led campaign, which derived `pending` pre-0087 and lands in `running` — benign (the old driver sweeps it, finds nothing eligible and no-ops) but sticky, since the old table has no `running → pending` edge. **A CODE-ONLY revert — the Go reverted while migration 0087 is left applied — must FIRST normalise existing rows:**
 
 ```sql
 UPDATE campaigns SET state = 'running' WHERE state = 'awaiting_human';

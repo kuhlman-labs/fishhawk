@@ -8366,9 +8366,10 @@ paths:
       parameters:
         - { name: repo, in: query, schema: { type: string } }
         - { name: workflow_id, in: query, schema: { type: string } }
-        # `paused` was missing here since 0040 widened the constraint (a
-        # pre-existing documentation defect, fixed with the #3660 addition).
-        - { name: state, in: query, schema: { type: string, enum: [pending, running, paused, awaiting_human, succeeded, failed, cancelled] } }
+        # RUN states only. `runs_state_check` (0001_runs_stages) has never been
+        # widened, so neither the campaign-only `paused` (0040) nor
+        # `awaiting_human` (0087 / #3660) belongs here.
+        - { name: state, in: query, schema: { type: string, enum: [pending, running, succeeded, failed, cancelled] } }
         - name: pull_request_url
           in: query
           description: |

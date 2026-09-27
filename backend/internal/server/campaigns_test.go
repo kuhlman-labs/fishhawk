@@ -10374,6 +10374,14 @@ func TestAttendHumanLedDetail_CapsEnumeration(t *testing.T) {
 	if !strings.Contains(got, "(+3 more)") {
 		t.Errorf("detail = %q, want a \"(+3 more)\" tail", got)
 	}
+	// The refs WITHIN the cap are all still enumerated. Without this arm a
+	// regression dropping every enumerated ref in the overflow branch still
+	// satisfies the count, the tail and the past-the-cap omission below.
+	for _, ref := range refs[:humanLedRefsInDetail] {
+		if !strings.Contains(got, ref) {
+			t.Errorf("detail = %q, want %s enumerated within the cap", got, ref)
+		}
+	}
 	// The capped-off refs are NOT enumerated.
 	for _, ref := range refs[humanLedRefsInDetail:] {
 		if strings.Contains(got, ref) {
