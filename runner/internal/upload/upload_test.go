@@ -159,6 +159,14 @@ func quickClient(srv *httptest.Server) *Client {
 	c := New(srv.URL)
 	c.MaxRetries = 3
 	c.Backoff = time.Millisecond
+	// The TERMINAL-egress budget (#2897) is a SEPARATE knob from MaxRetries /
+	// Backoff, so shrink it to the same shape here: every pre-existing test in
+	// this file keeps the attempt counts and the millisecond sleeps it was
+	// written against, and the tests that care about the terminal budget set
+	// their own values explicitly.
+	c.TerminalMaxRetries = 3
+	c.TerminalBackoff = time.Millisecond
+	c.TerminalBackoffCap = time.Millisecond
 	return c
 }
 
@@ -336,7 +344,9 @@ func TestShipTrace_ExhaustsRetries(t *testing.T) {
 	}
 	fb.mu.Lock()
 	defer fb.mu.Unlock()
-	want := c.MaxRetries + 1
+	// ShipTrace is a TERMINAL-egress call (#2897), so its attempt cap comes
+	// from the terminal budget, not from MaxRetries.
+	want := c.TerminalMaxRetries + 1
 	if fb.calls != want {
 		t.Errorf("calls = %d, want %d", fb.calls, want)
 	}
@@ -383,8 +393,9 @@ func TestShipTrace_ContextCancellation(t *testing.T) {
 	priv, _ := makeKey(t, fb)
 	fb.shipErrCount = 100
 	c := quickClient(srv)
-	c.Backoff = 50 * time.Millisecond
-	c.MaxRetries = 5
+	c.TerminalBackoff = 50 * time.Millisecond
+	c.TerminalBackoffCap = 50 * time.Millisecond
+	c.TerminalMaxRetries = 5
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // already done
@@ -4131,7 +4142,12 @@ func newReapFailureServer(t *testing.T, status int) (*reapFailureCountingServer,
 		_, _ = io.WriteString(w, `{"transitioned":true,"stage_state":"failed"}`)
 	}))
 	t.Cleanup(srv.Close)
-	return rs, &Client{BaseURL: srv.URL, HTTP: srv.Client(), Backoff: time.Millisecond}
+	return rs, &Client{
+		BaseURL: srv.URL, HTTP: srv.Client(), Backoff: time.Millisecond,
+		// ReportRunnerFailure runs on the TERMINAL budget (#2897); shrink it so
+		// these tests keep their millisecond sleeps.
+		TerminalMaxRetries: 3, TerminalBackoff: time.Millisecond, TerminalBackoffCap: time.Millisecond,
+	}
 }
 
 func (rs *reapFailureCountingServer) snapshot() (int, string, string, string) {
@@ -4218,8 +4234,8 @@ func TestReportRunnerFailure_RetriesOn5xxThenErrors(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "503") {
 		t.Errorf("err = %v, want exhausted-retries error carrying 503", err)
 	}
-	if hits, _, _, _ := rs.snapshot(); hits != reportRunnerFailureMaxAttempts {
-		t.Errorf("hits = %d, want %d (5xx retried to the cap)", hits, reportRunnerFailureMaxAttempts)
+	if hits, _, _, _ := rs.snapshot(); hits != c.reportRunnerFailureMaxAttempts() {
+		t.Errorf("hits = %d, want %d (5xx retried to the cap)", hits, c.reportRunnerFailureMaxAttempts())
 	}
 }
 
@@ -4332,5 +4348,475 @@ func TestShipPullRequest_FailureBodyOmitsResumeKindOnLegacyPaths(t *testing.T) {
 	}
 	if !strings.Contains(string(withKind), `"resume_kind":"push"`) {
 		t.Fatalf("a push-kind body must carry resume_kind: %s", withKind)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TERMINAL-EGRESS retry budget (E68.7 / #2897)
+// ---------------------------------------------------------------------------
+
+// outageServer answers 503 for the first failFor requests and okStatus after
+// that, counting every hit. The bad state is seeded BY CONSTRUCTION (an attempt
+// counter), so a RED lands on the behavioral assertion and never on setup.
+type outageServer struct {
+	mu       sync.Mutex
+	hits     int
+	failFor  int
+	okStatus int
+	okBody   string
+}
+
+func newOutageServer(t *testing.T, failFor, okStatus int, okBody string) (*outageServer, *httptest.Server) {
+	t.Helper()
+	state := &outageServer{failFor: failFor, okStatus: okStatus, okBody: okBody}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		state.mu.Lock()
+		state.hits++
+		n := state.hits
+		state.mu.Unlock()
+		if n <= state.failFor {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = io.WriteString(w, `{"error":{"code":"unavailable","message":"restarting"}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(state.okStatus)
+		_, _ = io.WriteString(w, state.okBody)
+	}))
+	t.Cleanup(srv.Close)
+	return state, srv
+}
+
+func (o *outageServer) count() int {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.hits
+}
+
+// restartSizedOutageFailures is the number of consecutive failures a
+// restart-sized outage is modelled as. It OUTLASTS the short blip budget
+// (DefaultMaxRetries+1 = 4 attempts) on purpose: a sub-budget blip would not
+// discriminate, so these tests fail against the pre-#2897 policy and pass only
+// with the terminal budget wired.
+const restartSizedOutageFailures = 6
+
+// TestShipTrace_TerminalBudget_RidesOutRestartSizedOutage is the primary
+// discrimination test for #2897: six consecutive 503s (more than the four
+// attempts the blip budget allows) followed by a 202, ridden out to success on
+// the DEFAULT terminal attempt cap.
+func TestShipTrace_TerminalBudget_RidesOutRestartSizedOutage(t *testing.T) {
+	if restartSizedOutageFailures+1 <= DefaultMaxRetries+1 {
+		t.Fatalf("fixture does not discriminate: %d attempts needed but the short budget allows %d",
+			restartSizedOutageFailures+1, DefaultMaxRetries+1)
+	}
+	o, srv := newOutageServer(t, restartSizedOutageFailures, http.StatusAccepted,
+		`{"content_hash":"abc","variant":"raw"}`)
+	c := New(srv.URL)
+	c.HTTP = srv.Client()
+	// Shrink only the SLEEPS; the attempt cap stays the shipped default, so the
+	// test measures the default budget rather than a value it chose.
+	c.TerminalBackoff = time.Millisecond
+	c.TerminalBackoffCap = time.Millisecond
+
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.ShipTrace(context.Background(), ShipArgs{
+		RunID: "r", StageID: "s", Variant: "raw", Bundle: []byte("b"), PrivateKey: priv,
+	}); err != nil {
+		t.Fatalf("ShipTrace should have ridden out a restart-sized outage: %v", err)
+	}
+	if got, want := o.count(), restartSizedOutageFailures+1; got != want {
+		t.Errorf("requests = %d, want %d", got, want)
+	}
+}
+
+// TestReportRunnerFailure_TerminalBudget_RidesOutRestartSizedOutage: the
+// reap-failure channel is the ONLY backstop when the trace POST is what failed,
+// so its 3-attempt budget was the innermost reason a restart stranded a stage.
+func TestReportRunnerFailure_TerminalBudget_RidesOutRestartSizedOutage(t *testing.T) {
+	o, srv := newOutageServer(t, restartSizedOutageFailures, http.StatusOK,
+		`{"transitioned":true,"stage_state":"failed"}`)
+	c := New(srv.URL)
+	c.HTTP = srv.Client()
+	c.TerminalBackoff = time.Millisecond
+	c.TerminalBackoffCap = time.Millisecond
+
+	if err := c.ReportRunnerFailure(context.Background(), ReportRunnerFailureArgs{
+		RunID: "r", StageID: "s", MCPToken: "fhm_x", Category: "C",
+		Reason: "trace_upload", StageAttempt: "2026-09-22T17:08:46.123456Z",
+	}); err != nil {
+		t.Fatalf("ReportRunnerFailure should have ridden out a restart-sized outage: %v", err)
+	}
+	if got, want := o.count(), restartSizedOutageFailures+1; got != want {
+		t.Errorf("requests = %d, want %d", got, want)
+	}
+}
+
+// TestTerminalRetryPolicy_DefaultBudgetExceedsRestartWindow is the done-means
+// test for the CONSTANT VALUES: a quiet shrink of any of the three goes red
+// here without the test sleeping at all.
+func TestTerminalRetryPolicy_DefaultBudgetExceedsRestartWindow(t *testing.T) {
+	c := New("http://nowhere")
+	maxRetries, backoff, backoffCap := c.terminalRetryPolicy()
+	if maxRetries != DefaultTerminalMaxRetries || backoff != DefaultTerminalBackoff || backoffCap != DefaultTerminalBackoffCap {
+		t.Fatalf("zero-valued Client must resolve the shipped defaults, got (%d, %v, %v)", maxRetries, backoff, backoffCap)
+	}
+	var total time.Duration
+	d := backoff
+	for i := 0; i < maxRetries; i++ {
+		total += d
+		d = capBackoff(d, backoffCap)
+	}
+	const minBudget = 60 * time.Second
+	if total < minBudget {
+		t.Errorf("terminal sleep budget = %v, want >= %v (a restart-sized outage must be ridden out)", total, minBudget)
+	}
+	// Bounded on purpose: #2897 explicitly rejects unbounded blocking.
+	if total > 5*time.Minute {
+		t.Errorf("terminal sleep budget = %v, want a bounded budget", total)
+	}
+	// The blip budget must stay strictly shorter, or the two tiers collapsed.
+	shortRetries, shortBackoff := c.retryPolicy()
+	var shortTotal time.Duration
+	sd := shortBackoff
+	for i := 0; i < shortRetries; i++ {
+		shortTotal += sd
+		sd *= 2
+	}
+	if shortTotal >= total {
+		t.Errorf("short budget %v must stay strictly shorter than the terminal budget %v", shortTotal, total)
+	}
+}
+
+// TestTerminalEgressBudget_BoundsCombinedWorstCase pins the SHARED-deadline
+// arithmetic of approval condition 1 without sleeping: the phase budget must be
+// well under the sum of two independent retry budgets (which is what "do not
+// stack" means numerically), and the reserve must be a SPLIT of the phase — a
+// tail withheld from the settling uploads, never time added on top of it.
+func TestTerminalEgressBudget_BoundsCombinedWorstCase(t *testing.T) {
+	c := New("http://nowhere")
+	if c.TerminalEgressBudget != 0 || c.TerminalEgressReserve != 0 {
+		t.Fatalf("New must leave the terminal-egress knobs zero-valued (meaning the defaults)")
+	}
+	maxRetries, backoff, backoffCap := c.terminalRetryPolicy()
+	var one time.Duration
+	d := backoff
+	for i := 0; i < maxRetries; i++ {
+		one += d
+		d = capBackoff(d, backoffCap)
+	}
+	if DefaultTerminalEgressBudget >= 2*one {
+		t.Errorf("DefaultTerminalEgressBudget = %v, want < 2x one call's retry budget (%v) — two budgets must not stack",
+			DefaultTerminalEgressBudget, 2*one)
+	}
+	if DefaultTerminalEgressBudget <= one {
+		t.Errorf("DefaultTerminalEgressBudget = %v, want > one call's retry budget (%v) so a settling call can still spend it",
+			DefaultTerminalEgressBudget, one)
+	}
+	// A split, not an addition: the settling slice plus the reserve IS the
+	// budget, so the COMBINED bound is the budget.
+	if DefaultTerminalEgressReserve <= 0 || DefaultTerminalEgressReserve >= DefaultTerminalEgressBudget/2 {
+		t.Errorf("DefaultTerminalEgressReserve = %v, want a positive tail strictly under half the budget (%v)",
+			DefaultTerminalEgressReserve, DefaultTerminalEgressBudget)
+	}
+	// The reserve must be big enough for the last-word report to make more than
+	// one attempt against a restart-sized outage.
+	if DefaultTerminalEgressReserve < DefaultTerminalBackoff {
+		t.Errorf("DefaultTerminalEgressReserve = %v, want at least one backoff step (%v)",
+			DefaultTerminalEgressReserve, DefaultTerminalBackoff)
+	}
+	// The derived deadlines honour the split: the last-word context ends exactly
+	// one reserve after the settling context, and both come off ONE phase.
+	settleCtx, cancel := c.settlingEgressContext(context.Background())
+	defer cancel()
+	settleDeadline, ok := settleCtx.Deadline()
+	if !ok {
+		t.Fatal("settlingEgressContext must carry a deadline")
+	}
+	lastCtx, cancel2 := c.lastWordEgressContext(context.Background())
+	defer cancel2()
+	lastDeadline, ok := lastCtx.Deadline()
+	if !ok {
+		t.Fatal("lastWordEgressContext must carry a deadline")
+	}
+	if got := lastDeadline.Sub(settleDeadline); got != DefaultTerminalEgressReserve {
+		t.Errorf("last-word deadline is %v past the settling deadline, want exactly the reserve %v",
+			got, DefaultTerminalEgressReserve)
+	}
+}
+
+// TestSettlingEgressContext_ReserveClampedToHalfBudget: a reserve at or above
+// the whole budget would leave a settling upload NO time at all — the guard
+// clamps it to half so ShipTrace always gets a usable slice.
+func TestSettlingEgressContext_ReserveClampedToHalfBudget(t *testing.T) {
+	c := New("http://nowhere")
+	c.TerminalEgressBudget = 10 * time.Second
+	c.TerminalEgressReserve = time.Hour // absurd: larger than the whole phase
+
+	before := time.Now()
+	ctx, cancel := c.settlingEgressContext(context.Background())
+	defer cancel()
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		t.Fatal("settlingEgressContext must carry a deadline")
+	}
+	remaining := deadline.Sub(before)
+	// Clamped to half the 10s budget, so ~5s remains — never a past instant.
+	if remaining <= 0 {
+		t.Fatalf("settling deadline is already expired (%v remaining); the reserve clamp did not engage", remaining)
+	}
+	if remaining > 6*time.Second || remaining < 4*time.Second {
+		t.Errorf("settling window = %v, want ~5s (half of the 10s budget)", remaining)
+	}
+}
+
+// TestTerminalEgress_ShipTraceAndReportRunnerFailureShareOneDeadline is the
+// test approval condition 1 asks for: BOTH uploads face a PERSISTENT outage and
+// the total blocking time stays under the COMBINED bound instead of costing two
+// full retry budgets.
+//
+// The fixture is tuned so each call's retry budget (40 x 100ms = 4s) far
+// OUTLASTS the phase, which is what makes the deadline — not the attempt cap —
+// the thing that stops each call. Three assertions, each a distinct failure
+// mode:
+//
+//	(1) total blocking < the combined bound. With per-call budgets instead of
+//	    one shared deadline this is ~2x the phase and goes red.
+//	(2) the last-word report still got a REAL attempt. This is what the
+//	    reserve buys; drop the reserve and ShipTrace hands the fallback an
+//	    already-expired context and this goes red at zero requests.
+//	(3) ShipTrace itself got real attempts — the phase is not born expired.
+func TestTerminalEgress_ShipTraceAndReportRunnerFailureShareOneDeadline(t *testing.T) {
+	const (
+		phaseBudget = 1500 * time.Millisecond
+		reserve     = 400 * time.Millisecond
+		perSleep    = 100 * time.Millisecond
+		attemptCap  = 40 // 4s of sleep: far more than the phase, so the DEADLINE stops each call
+	)
+	// Persistent outage on both endpoints: failFor is effectively unbounded.
+	o, srv := newOutageServer(t, 1<<30, http.StatusOK, `{}`)
+	c := New(srv.URL)
+	c.HTTP = srv.Client()
+	c.TerminalMaxRetries = attemptCap
+	c.TerminalBackoff = perSleep
+	c.TerminalBackoffCap = perSleep
+	c.TerminalEgressBudget = phaseBudget
+	c.TerminalEgressReserve = reserve
+
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	if _, err := c.ShipTrace(context.Background(), ShipArgs{
+		RunID: "r", StageID: "s", Variant: "raw", Bundle: []byte("b"), PrivateKey: priv,
+	}); err == nil {
+		t.Fatal("ShipTrace must fail against a persistent outage")
+	}
+	traceHits := o.count()
+	// The fallback the runner reaches for when the trace POST is what failed.
+	if err := c.ReportRunnerFailure(context.Background(), ReportRunnerFailureArgs{
+		RunID: "r", StageID: "s", MCPToken: "fhm_x", Category: "C",
+		Reason: "trace_upload", StageAttempt: "a",
+	}); err == nil {
+		t.Fatal("ReportRunnerFailure must fail against a persistent outage")
+	}
+	elapsed := time.Since(start)
+	reapHits := o.count() - traceHits
+
+	// (1) The combined bound. Two INDEPENDENT phase budgets would take ~2x
+	// this (3s+); the slack over the 1.5s phase absorbs request + scheduling
+	// time on a loaded host without reaching the stacked figure.
+	const combinedBound = 2500 * time.Millisecond
+	if elapsed >= combinedBound {
+		t.Errorf("combined terminal-egress blocking = %v, want < %v (one shared %v phase, not two stacked budgets)",
+			elapsed, combinedBound, phaseBudget)
+	}
+	// (2) The reserve did its job: the last-word channel got a real attempt.
+	if reapHits < 1 {
+		t.Errorf("ReportRunnerFailure made %d requests; want >= 1 — ShipTrace must not spend the reserve, "+
+			"or the only channel that stops the stage sitting `running` is silenced", reapHits)
+	}
+	// (3) The phase is not born expired.
+	if traceHits < 2 {
+		t.Errorf("ShipTrace made %d requests; want >= 2 (its slice of the phase must be usable)", traceHits)
+	}
+	// (4) The sharpest discriminator, and a RATIO rather than an absolute time
+	// so a loaded host cannot flip it: the fallback only ever had the reserve
+	// (400ms) where ShipTrace had the settling slice (1100ms), so it must have
+	// made STRICTLY FEWER requests. Give each call its own fresh phase instead
+	// and the fallback gets the larger window and overtakes ShipTrace.
+	if reapHits >= traceHits {
+		t.Errorf("ReportRunnerFailure made %d requests vs ShipTrace's %d; want strictly fewer — "+
+			"the fallback had only the %v reserve, so an equal-or-greater count means it got a fresh phase",
+			reapHits, traceHits, reserve)
+	}
+	if reapHits >= attemptCap+1 {
+		t.Errorf("ReportRunnerFailure made %d requests, reaching its own cap of %d — the budgets stacked",
+			reapHits, attemptCap+1)
+	}
+}
+
+// TestTerminalEgressPhase_ReopensAfterASuccessfulUpload pins the phase
+// LIFECYCLE, the half a shared deadline alone does not give: the phase is
+// closed by a terminal call that SUCCEEDS, so a later terminal call opens a
+// fresh one instead of inheriting a spent instant.
+//
+// Without that, a terminal call made after the settling window had elapsed
+// since a SUCCESSFUL one — a plan stage whose ShipPlan lands instantly at T
+// followed by a ShipTrace at T+80s, packing a large bundle in between — would
+// receive an already-expired context and lose its upload with ZERO attempts
+// against a perfectly healthy backend: the stranding this change exists to
+// prevent, reintroduced on a happy path.
+//
+// Every request here succeeds, so the deadline is the ONLY thing that can fail
+// the second call. Delete endTerminalEgressPhase's Store(0) and both subtests
+// go red with context deadline exceeded.
+func TestTerminalEgressPhase_ReopensAfterASuccessfulUpload(t *testing.T) {
+	const (
+		phaseBudget = 300 * time.Millisecond
+		reserve     = 100 * time.Millisecond
+		// Past the settling window (phase - reserve = 200ms) but still inside
+		// the phase: the window the settling calls actually run against.
+		pastSettling = 250 * time.Millisecond
+		// Past the whole phase: the window the last-word report runs against.
+		pastPhase = 350 * time.Millisecond
+	)
+
+	newClient := func(t *testing.T) (*Client, ed25519.PrivateKey) {
+		t.Helper()
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.Copy(io.Discard, r.Body)
+			w.Header().Set("Content-Type", "application/json")
+			switch {
+			case strings.HasSuffix(r.URL.Path, "/plan"):
+				w.WriteHeader(http.StatusCreated)
+			case strings.HasSuffix(r.URL.Path, "/trace"):
+				w.WriteHeader(http.StatusAccepted)
+			default: // reap-failure
+				w.WriteHeader(http.StatusOK)
+			}
+			_, _ = io.WriteString(w, `{}`)
+		}))
+		t.Cleanup(srv.Close)
+		c := New(srv.URL)
+		c.HTTP = srv.Client()
+		c.TerminalEgressBudget = phaseBudget
+		c.TerminalEgressReserve = reserve
+		_, priv, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c, priv
+	}
+
+	shipPlanOK := func(t *testing.T, c *Client, priv ed25519.PrivateKey) {
+		t.Helper()
+		if _, err := c.ShipPlan(context.Background(), ShipPlanArgs{
+			RunID: "r", StageID: "s", Plan: []byte(`{"version":"standard_v1"}`), PrivateKey: priv,
+		}); err != nil {
+			t.Fatalf("ShipPlan against a healthy backend: %v", err)
+		}
+		// The success CLOSED the phase; a still-armed deadline is the defect.
+		// Errorf, not Fatalf, so the BEHAVIORAL assertion below still runs and
+		// the counterfactual RED lands on the lost upload too, not only on
+		// this white-box state read.
+		if armed := c.terminalEgressDeadline.Load(); armed != 0 {
+			t.Errorf("terminalEgressDeadline = %d after a successful ShipPlan, want 0 (phase closed)", armed)
+		}
+	}
+
+	t.Run("settling call after a successful settling call", func(t *testing.T) {
+		c, priv := newClient(t)
+		shipPlanOK(t, c, priv)
+		time.Sleep(pastSettling)
+		if _, err := c.ShipTrace(context.Background(), ShipArgs{
+			RunID: "r", StageID: "s", Variant: "raw", Bundle: []byte("b"), PrivateKey: priv,
+		}); err != nil {
+			t.Fatalf("ShipTrace %v after a successful ShipPlan: %v — it inherited the closed phase's "+
+				"expired settling deadline, so the trace is lost against a healthy backend", pastSettling, err)
+		}
+	})
+
+	t.Run("last-word call after a successful settling call", func(t *testing.T) {
+		c, priv := newClient(t)
+		shipPlanOK(t, c, priv)
+		time.Sleep(pastPhase)
+		if err := c.ReportRunnerFailure(context.Background(), ReportRunnerFailureArgs{
+			RunID: "r", StageID: "s", MCPToken: "fhm_x", Category: "C",
+			Reason: "later_failure", StageAttempt: "a",
+		}); err != nil {
+			t.Fatalf("ReportRunnerFailure %v after a successful ShipPlan: %v — it inherited the closed "+
+				"phase's expired deadline, so the stage sits `running` against a healthy backend", pastPhase, err)
+		}
+	})
+}
+
+// TestNonTerminalCalls_KeepShortBudget is the narrowness control: #2897 moved
+// exactly three methods onto the terminal budget, and a global change would
+// make every progress tick block for ~75s. FetchPrompt must still give up on
+// the SHORT budget and ReportStageProgress must still be single-attempt.
+func TestNonTerminalCalls_KeepShortBudget(t *testing.T) {
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("FetchPrompt", func(t *testing.T) {
+		o, srv := newOutageServer(t, 1<<30, http.StatusOK, `{}`)
+		c := New(srv.URL)
+		c.HTTP = srv.Client()
+		c.Backoff = time.Millisecond
+		if _, err := c.FetchPrompt(context.Background(), FetchPromptArgs{StageID: "s", PrivateKey: priv}); err == nil {
+			t.Fatal("FetchPrompt must fail against a persistent outage")
+		}
+		if got, want := o.count(), DefaultMaxRetries+1; got != want {
+			t.Errorf("requests = %d, want %d (the SHORT blip budget, unchanged by #2897)", got, want)
+		}
+		if o.count() >= DefaultTerminalMaxRetries+1 {
+			t.Errorf("FetchPrompt reached the terminal attempt cap (%d requests) — the change is not narrow", o.count())
+		}
+	})
+
+	t.Run("ReportStageProgress", func(t *testing.T) {
+		o, srv := newOutageServer(t, 1<<30, http.StatusOK, `{}`)
+		c := New(srv.URL)
+		c.HTTP = srv.Client()
+		c.Backoff = time.Millisecond
+		if err := c.ReportStageProgress(context.Background(), ReportStageProgressArgs{
+			RunID: "r", StageID: "s", MCPToken: "fhm_x", LastEvent: "e",
+		}); err == nil {
+			t.Fatal("ReportStageProgress must surface a 503")
+		}
+		if got := o.count(); got != 1 {
+			t.Errorf("requests = %d, want exactly 1 (a lost progress tick is superseded by the next one)", got)
+		}
+	})
+}
+
+// TestReportRunnerFailure_409_SingleAttempt: the pre-existing
+// 4xx-terminal-after-ONE-attempt rule provably survives the longer budget.
+// Retrying a 409 stage_attempt_superseded would retry exactly what the anchor
+// refuses.
+func TestReportRunnerFailure_409_SingleAttempt(t *testing.T) {
+	rs, c := newReapFailureServer(t, http.StatusConflict)
+	// The terminal budget in full: if the 4xx rule were gone this would make
+	// DefaultTerminalMaxRetries+1 requests, not one.
+	c.TerminalMaxRetries = 0
+	c.TerminalBackoff = time.Millisecond
+	c.TerminalBackoffCap = time.Millisecond
+	err := c.ReportRunnerFailure(context.Background(), ReportRunnerFailureArgs{
+		RunID: "r", StageID: "s", MCPToken: "fhm_x", Category: "C",
+		Reason: "trace_upload", StageAttempt: "a",
+	})
+	if err == nil || !strings.Contains(err.Error(), "409") {
+		t.Fatalf("err = %v, want a status error carrying 409", err)
+	}
+	if hits, _, _, _ := rs.snapshot(); hits != 1 {
+		t.Errorf("hits = %d, want exactly 1 (a 4xx stays terminal under the terminal budget)", hits)
 	}
 }

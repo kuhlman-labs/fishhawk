@@ -323,6 +323,130 @@ Contract:
 
 Residual: the FIRST agent invocation's `FISHHAWK_API_TOKEN` is still the stage-start token, valid 60 minutes, and cannot be rewritten inside a live process — an initial invocation that runs past 60 minutes still sees its own `fishhawk_*` tool calls 401. Fix re-invocations get a fresh one.
 
+## Terminal-egress retry budget ([E68.7 / #2897](https://github.com/kuhlman-labs/fishhawk/issues/2897))
+
+`runner/internal/upload` has **two** retry budgets, not one.
+
+**The blip budget** (`DefaultMaxRetries = 3`, `DefaultBackoff = 500ms`, uncapped
+doubling) is ~3.5s of sleep across 4 attempts. It is what every non-settling
+call uses — `FetchPrompt`, `ShipAcceptance`, `ShipAcceptanceTranscript`,
+`ShipPullRequest`, `FetchMCPToken`, `FetchScopeAmendments`, and the
+single-attempt `ReportStageProgress`. A lost progress tick is cosmetic: the next
+tick supersedes it.
+
+**The terminal-egress budget** (`DefaultTerminalMaxRetries = 8`,
+`DefaultTerminalBackoff = 1s`, `DefaultTerminalBackoffCap = 15s`) is the capped
+doubling series 1,2,4,8,15,15,15,15 = **75s of sleep across 9 attempts**. It is
+used by exactly three methods, the ones that SETTLE a stage's outcome:
+
+| Method | Why it is terminal |
+|---|---|
+| `ShipTrace` | the stage-completion POST; a lost one leaves the stage `running` forever |
+| `ShipPlan` | the plan stage's settling artifact — without it the gate has nothing to read |
+| `ReportRunnerFailure` | the reap-failure channel, the ONLY backstop when the trace POST is itself what failed |
+
+The motivation is a `scripts/dev reload` / `post-merge`: fishhawkd is down for
+tens of seconds while five binaries rebuild and the migration runs, and the blip
+budget cannot ride that out. The budget is **bounded on purpose** — #2897
+explicitly rejects unbounded blocking — and 75s is comfortably longer than that
+restart.
+
+### One shared phase deadline, not stacked budgets
+
+The three methods do **not** each get their own 75s. They share ONE
+terminal-egress phase deadline, `DefaultTerminalEgressBudget = 90s`, armed by
+whichever terminal call OPENS the phase (`terminalEgressPhaseDeadline`) and
+joined by every terminal call after it until the phase is closed. Without that,
+the budgets would STACK: a
+persistent outage costs 75s in `ShipTrace` and then another 75s in the
+`ReportRunnerFailure` fallback that `ShipTrace`'s failure triggers — ~150s of
+blocking for **one** outage. Both calls ride out the SAME outage window seconds
+apart, so one deadline is also the more faithful model.
+
+**The combined worst case when the backend is genuinely gone is therefore ~90s
+of blocking, once, at egress — not 2 x 75s.**
+
+The phase is **split**, not extended: `DefaultTerminalEgressReserve = 15s` is a
+tail withheld from the settling uploads and left for the last-word report.
+
+- `settlingEgressContext` (ShipTrace, ShipPlan) → phase deadline **minus** the
+  reserve, so ~75s.
+- `lastWordEgressContext` (ReportRunnerFailure) → the **full** phase deadline,
+  so it spends whatever the settling call left plus the reserve.
+
+Why the reserve exists: a bare shared deadline has a sharp edge. A `ShipTrace`
+that spends the whole phase would hand the fallback an already-expired context,
+so the one channel that stops the stage sitting `running` would get **zero real
+attempts** — the stranding this change is about, reintroduced by the fix for it.
+The reserve is clamped to half the budget, so an absurd override can never
+starve a settling upload of all its time.
+
+### The phase is scoped to the outage, not to the Client
+
+Joining a shared instant is only safe while the outage that instant bounds is
+still running. So the phase has a LIFECYCLE: `endTerminalEgressPhase` CLOSES it
+(the stored deadline back to `0`) on the first terminal call that **succeeds**,
+and the next terminal call opens a fresh one.
+
+Success is the signal because it is the one outcome that proves the backend is
+reachable — an upload that landed means there is no outage left to bound. Without
+that close, the phase would be armed once per `Client` and joined forever, so a
+terminal call made later than the settling window (phase minus reserve, ~75s)
+after a **successful** one would receive an already-expired context and lose its
+upload with **zero attempts against a healthy backend**: a plan stage whose
+`ShipPlan` lands instantly at T followed by a `ShipTrace` at T+80s (a large
+bundle to pack, or any intervening work) would deterministically lose its trace —
+the exact stranding this change exists to prevent, reintroduced on a happy path.
+
+A **failing** terminal call deliberately leaves the phase armed. That is what
+makes the `ReportRunnerFailure` fallback a `ShipTrace` failure triggers share the
+bound instead of stacking a second budget on it, so the combined ~90s worst case
+above still holds.
+
+**Residual, stated rather than papered over:** a terminal call that fails and is
+NOT followed by a fallback in the same phase leaves the phase armed, so a much
+later terminal call on the same `Client` could still be born expired. The
+runner's own sequencing makes that unreachable — a failed settling upload is
+always followed by the last-word report and then process exit — and closing it
+by re-arming on expiry instead would forfeit the combined bound the approval
+condition on #2897 asks for.
+
+**What did NOT change:** which statuses are retryable. `ReportRunnerFailure`
+still returns a 4xx after ONE attempt (400/403/409 are terminal answers, and
+retrying a 409 `stage_attempt_superseded` would retry exactly what the anchor
+refuses); `ShipTrace` still stops immediately on 401/404; `ShipPlan` still maps
+400 `plan_invalid` to `ErrPlanInvalid` without retrying. Only the attempt cap,
+the backoff schedule, and the phase deadline changed.
+
+**Per-Client overrides** (`TerminalMaxRetries`, `TerminalBackoff`,
+`TerminalBackoffCap`, `TerminalEgressBudget`, `TerminalEgressReserve`) each mean
+"the default" when zero, mirroring the `MaxRetries` / `Backoff` convention, so
+tests shrink the sleeps without changing the attempt caps under test. Setting
+them to today's pre-#2897 values restores the old behavior with no code revert.
+
+**Tests** (`runner/internal/upload/upload_test.go`,
+`upload_plan_test.go`): a restart-sized-outage test per terminal method (six
+consecutive 503s — more than the blip budget's four attempts — then success, so
+each fails against the pre-#2897 policy);
+`TestTerminalRetryPolicy_DefaultBudgetExceedsRestartWindow` and
+`TestTerminalEgressBudget_BoundsCombinedWorstCase`, sleep-free assertions on the
+shipped constants so a quiet shrink goes red;
+`TestTerminalEgress_ShipTraceAndReportRunnerFailureShareOneDeadline`, in which
+both uploads face a persistent outage and the combined blocking stays under the
+bound while the last-word report still gets a real attempt;
+`TestSettlingEgressContext_ReserveClampedToHalfBudget`;
+`TestTerminalEgressPhase_ReopensAfterASuccessfulUpload`, the phase-LIFECYCLE
+control — every request succeeds, so the deadline is the only thing that can
+fail the DELAYED second terminal call, and both subtests (a settling call past
+the settling window, a last-word call past the whole phase) go red with
+`context deadline exceeded` if the close is deleted;
+`TestReportRunnerFailure_409_SingleAttempt`; and
+`TestNonTerminalCalls_KeepShortBudget`, the narrowness control proving
+`FetchPrompt` and `ReportStageProgress` were not swept along.
+
+The operator-side half of #2897 — `scripts/dev reload` / `post-merge` refusing
+to tear the stack down while a runner is live — is in `scripts/README.md`.
+
 ## Self-hosting bootstrap deadlock ([E64.5 / #3086](https://github.com/kuhlman-labs/fishhawk/issues/3086))
 
 `fishhawk-runner` is a **separate binary**, built from `main`, respawned fresh from `bin/` on every host dispatch (the same design that lets the escape below work). So a run whose job is to **fix a defect in the runner itself** executes under the *unfixed* runner: the stage runs `bin/fishhawk-runner` built from `main`, hits the very defect the run is fixing, and cannot pass its own gates. This is a bootstrap deadlock.

@@ -6018,6 +6018,237 @@ else
 fi
 rm -rf "$ts_dir"
 
+# ---------------------------------------------------------------------------
+# Live-run guard for reload / post-merge (E68.7 / #2897)
+# ---------------------------------------------------------------------------
+
+# LR harness: drive the REAL cmd_reload in a subshell whose teardown legs are
+# stubbed to append to ONE marker file, so "did the teardown run at all?" is a
+# file-existence question. _scan_live_runs is stubbed per mode, so no live
+# process is needed and the degrade code is reachable.
+# Args: <live|clean|degrade> [cmd_reload args...]
+# Sets: lr_rc lr_out lr_err lr_marker lr_upargs
+_lr_run_reload() {
+  local mode="$1"; shift
+  lr_dir="$(mktemp -d "${TMPDIR:-/tmp}/fishhawk-lr.XXXXXX")"
+  lr_marker="${lr_dir}/teardown"
+  lr_upargs="${lr_dir}/upargs"
+  lr_out="$(
+    setopt errexit
+    PID_FILE="${lr_dir}/dev.pid"
+    : > "$PID_FILE"
+    case "$mode" in
+      live)    _scan_live_runs() { print -r -- "4242"$'\t'"run-abc-123"; return 0 } ;;
+      clean)   _scan_live_runs() { return 0 } ;;
+      degrade) _scan_live_runs() { return 2 } ;;
+    esac
+    cmd_down() { print -r -- "down" >> "$lr_marker" }
+    cmd_up()   { print -r -- "$*" > "$lr_upargs"; print -r -- "up" >> "$lr_marker" }
+    cmd_reload "$@" 2>"${lr_dir}/err"
+  )"
+  lr_rc=$?
+  lr_err="$(cat "${lr_dir}/err" 2>/dev/null)"
+}
+
+# LR-a DONE-MEANS (negative): with a live runner and no --force, cmd_reload must
+# exit non-zero, NAME the run id, and NEVER reach the teardown. The marker file
+# is what discriminates: a comment-only or no-op touch of scripts/dev leaves the
+# marker PRESENT and this test red, where a presence-only scope gate would pass.
+_lr_run_reload live
+if (( lr_rc != 0 )) && [[ ! -f "$lr_marker" ]] && [[ "$lr_err" == *run-abc-123* ]] \
+   && [[ "$lr_err" == *"refusing to tear down"* ]] && [[ "$lr_err" == *reap-failure* ]]; then
+  pass "LR-a live run, no --force: cmd_reload exits non-zero, names the run id, and NEVER reaches the teardown"
+else
+  fail "LR-a live-run refusal (rc=${lr_rc} marker=$([[ -f $lr_marker ]] && print present || print absent) err=${lr_err})"
+fi
+rm -rf "$lr_dir"
+
+# LR-b --force: the same fixture is loud but UNBLOCKED — teardown reached, exit
+# 0, and the inventory still names the run id as a warning.
+_lr_run_reload live --force
+if (( lr_rc == 0 )) && [[ -f "$lr_marker" ]] && [[ "$lr_err" == *warning* ]] \
+   && [[ "$lr_err" == *run-abc-123* ]] && [[ "$lr_err" != *"refusing to tear down"* ]]; then
+  pass "LR-b live run + --force: teardown reached, exit 0, warning names the run id"
+else
+  fail "LR-b --force override (rc=${lr_rc} marker=$([[ -f $lr_marker ]] && print present || print absent) err=${lr_err})"
+fi
+rm -rf "$lr_dir"
+
+# LR-c clean scan: teardown reached and the guard is SILENT (no live-run text on
+# stderr at all).
+_lr_run_reload clean
+if (( lr_rc == 0 )) && [[ -f "$lr_marker" ]] && [[ "$lr_err" != *fishhawk-runner* ]] \
+   && [[ "$lr_err" != *"live-run check"* ]]; then
+  pass "LR-c clean scan: teardown reached, guard silent"
+else
+  fail "LR-c clean scan (rc=${lr_rc} marker=$([[ -f $lr_marker ]] && print present || print absent) err=${lr_err})"
+fi
+rm -rf "$lr_dir"
+
+# LR-d scan degrade (rc 2 — ps absent or non-zero): fail-OPEN. Proceeds to the
+# teardown and prints ONE line naming the reason, never a silent pass.
+_lr_run_reload degrade
+if (( lr_rc == 0 )) && [[ -f "$lr_marker" ]] && [[ "$lr_err" == *"skipping the live-run check"* ]] \
+   && [[ "$lr_err" == *degraded* ]]; then
+  pass "LR-d scan degrade: proceeds to the teardown and prints a one-line reason (fail-open)"
+else
+  fail "LR-d scan degrade (rc=${lr_rc} marker=$([[ -f $lr_marker ]] && print present || print absent) err=${lr_err})"
+fi
+rm -rf "$lr_dir"
+
+# LR-e --force is STRIPPED from the argv forwarded to cmd_up (which understands
+# only --all/--start-deps), while every other flag is forwarded unchanged.
+_lr_run_reload live --force --start-deps
+lr_fwd="$(cat "$lr_upargs" 2>/dev/null)"
+if [[ "$lr_fwd" == "--all --start-deps" ]]; then
+  pass "LR-e cmd_reload strips --force from the argv it forwards to cmd_up, keeping --all --start-deps"
+else
+  fail "LR-e --force stripping (cmd_up argv=${lr_fwd})"
+fi
+rm -rf "$lr_dir"
+
+# LR-f cmd_post_merge refuses BEFORE git checkout/pull AND before
+# cleanup-merged. Each leg gets its OWN marker; all must be absent. cleanup-merged
+# is a PATH, not a function, so it is stubbed as a real executable under a
+# re-pointed REPO_ROOT.
+_lr_run_post_merge() {
+  local mode="$1"; shift
+  lr_dir="$(mktemp -d "${TMPDIR:-/tmp}/fishhawk-lrpm.XXXXXX")"
+  mkdir -p "${lr_dir}/scripts"
+  lr_git="${lr_dir}/git.marker"
+  lr_clean="${lr_dir}/cleanup.marker"
+  lr_reload="${lr_dir}/reload.marker"
+  cat > "${lr_dir}/scripts/cleanup-merged" <<CLEAN
+#!/bin/sh
+echo ran >> "${lr_clean}"
+CLEAN
+  chmod +x "${lr_dir}/scripts/cleanup-merged"
+  lr_out="$(
+    setopt errexit
+    REPO_ROOT="$lr_dir"
+    case "$mode" in
+      live)  _scan_live_runs() { print -r -- "7777"$'\t'"run-live-xyz"; return 0 } ;;
+      clean) _scan_live_runs() { return 0 } ;;
+    esac
+    git() { print -r -- "git $*" >> "$lr_git" }
+    cmd_reload() { print -r -- "reload $*" >> "$lr_reload" }
+    cmd_post_merge "$@" 2>"${lr_dir}/err"
+  )"
+  lr_rc=$?
+  lr_err="$(cat "${lr_dir}/err" 2>/dev/null)"
+}
+
+_lr_run_post_merge live
+if (( lr_rc != 0 )) && [[ ! -f "$lr_git" && ! -f "$lr_clean" && ! -f "$lr_reload" ]] \
+   && [[ "$lr_err" == *run-live-xyz* ]]; then
+  pass "LR-f cmd_post_merge with a live run refuses BEFORE git checkout/pull, cleanup-merged and reload"
+else
+  fail "LR-f post-merge refusal (rc=${lr_rc} git=$([[ -f $lr_git ]] && print ran) cleanup=$([[ -f $lr_clean ]] && print ran) reload=$([[ -f $lr_reload ]] && print ran) err=${lr_err})"
+fi
+rm -rf "$lr_dir"
+
+# LR-g control for LR-f: a clean scan lets post-merge run its whole walk, and
+# --force is FORWARDED to cmd_reload (post_merge does not strip it; cmd_reload
+# does).
+_lr_run_post_merge clean --force
+if (( lr_rc == 0 )) && [[ -f "$lr_git" && -f "$lr_clean" && -f "$lr_reload" ]] \
+   && [[ "$(cat "$lr_reload")" == *--force* ]]; then
+  pass "LR-g cmd_post_merge clean scan: full walk runs and --force is forwarded to cmd_reload"
+else
+  fail "LR-g post-merge clean walk (rc=${lr_rc} git=$([[ -f $lr_git ]] && print ran) cleanup=$([[ -f $lr_clean ]] && print ran) reload=$(cat "$lr_reload" 2>/dev/null) err=${lr_err})"
+fi
+rm -rf "$lr_dir"
+
+# LR-h _parse_live_runs identity table. Each row is a literal `ps`-shaped line,
+# so the bad state is seeded BY CONSTRUCTION and a RED lands on the behavioral
+# assertion, never on fixture setup. The near-miss rows are the counterfactual
+# vehicles for the argv[0]-basename requirement.
+_lr_parse() { print -r -- "$1" | _parse_live_runs }
+
+typeset -a lr_rows
+lr_rows=(
+  # <label>|<ps line>|<expected record, empty means NO record>
+  "real runner argv|9001 /Users/x/bin/fishhawk-runner --run-id 11111111-2222 --stage-id s|9001	11111111-2222"
+  "binary named only in a LATER token|9002 /bin/sleep fishhawk-runner --run-id abc|"
+  "a grep for the binary name|9003 grep fishhawk-runner|"
+  "basename-boundary near-miss|9004 /tmp/fishhawk-runner-notes.txt --run-id abc|"
+  "single-token --run-id=<id> form|9005 /x/fishhawk-runner --run-id=abc|9005	"
+  "trailing --run-id with no value|9006 /x/fishhawk-runner --stage-id s --run-id|9006	"
+  "extension stripped (.exe)|9007 /x/fishhawk-runner.exe --run-id abc|9007	abc"
+  "non-numeric pid column|notapid /x/fishhawk-runner --run-id abc|"
+)
+for lr_row in "${lr_rows[@]}"; do
+  lr_label="${lr_row%%|*}"
+  lr_rest="${lr_row#*|}"
+  lr_line="${lr_rest%%|*}"
+  lr_want="${lr_rest#*|}"
+  lr_got="$(_lr_parse "$lr_line")"
+  if [[ "$lr_got" == "$lr_want" ]]; then
+    pass "LR-h _parse_live_runs: ${lr_label}"
+  else
+    fail "LR-h _parse_live_runs ${lr_label}: got '${lr_got}', want '${lr_want}'"
+  fi
+done
+
+# LR-h2 de-duplication on pid: two ps lines for the same pid yield ONE record.
+lr_got="$(print -rl -- "9008 /x/fishhawk-runner --run-id dup-1" "9008 /x/fishhawk-runner --run-id dup-1" | _parse_live_runs)"
+if [[ "$lr_got" == "9008	dup-1" ]]; then
+  pass "LR-h2 _parse_live_runs de-duplicates two records for the same pid"
+else
+  fail "LR-h2 pid de-duplication: got '${lr_got}'"
+fi
+
+# LR-h3 long argv (the -ww pin): an id positioned LATE in the line is still
+# found. Without `ps -axww` BSD ps would truncate this column and the id would
+# vanish — the silent under-report the guard must not have.
+lr_long="9009 /x/fishhawk-runner --backend-url http://localhost:8080 --stage-id 22222222-3333-4444-5555-666666666666 --working-dir /Users/someone/Documents/Projects/fishhawk --log-level debug --trace-variant raw --run-id late-in-the-line"
+lr_got="$(_lr_parse "$lr_long")"
+if [[ "$lr_got" == "9009	late-in-the-line" ]]; then
+  pass "LR-h3 _parse_live_runs finds a --run-id positioned late in a long argv"
+else
+  fail "LR-h3 long-argv id: got '${lr_got}'"
+fi
+
+# LR-i the shipped _scan_live_runs must invoke ps with -ww (a single -w only
+# DOUBLES the width; two remove the limit). Body-grep, because the assumption is
+# about the SHIPPED invocation, not about a parser the fixtures already cover.
+lr_scan_body="$(typeset -f _scan_live_runs)"
+if print -r -- "$lr_scan_body" | grep -q -- 'ps -axww -o pid=,args='; then
+  pass "LR-i _scan_live_runs invokes 'ps -axww -o pid=,args=' (untruncated argv)"
+else
+  fail "LR-i _scan_live_runs should use ps -axww (got: ${lr_scan_body})"
+fi
+
+# LR-j the guard is wired in a TESTED context at BOTH call sites, so a
+# deliberate refusal never fires the #631 ZERR trap.
+lr_reload_body="$(typeset -f cmd_reload)"
+lr_pm_body="$(typeset -f cmd_post_merge)"
+if print -r -- "$lr_reload_body" | grep -q 'if ! _refuse_on_live_runs' \
+   && print -r -- "$lr_pm_body" | grep -q 'if ! _refuse_on_live_runs'; then
+  pass "LR-j both cmd_reload and cmd_post_merge call _refuse_on_live_runs in a tested context"
+else
+  fail "LR-j guard call sites must be 'if ! _refuse_on_live_runs' in both cmd_reload and cmd_post_merge"
+fi
+
+# LR-k the refusal is structurally BEFORE the teardown in cmd_reload's body and
+# BEFORE the git walk in cmd_post_merge's — a body-order pin complementing the
+# behavioral marker tests, so a future edit that moves the guard after cmd_down
+# is caught even if the stubs were to change.
+lr_guard_at="$(print -r -- "$lr_reload_body" | grep -n '_refuse_on_live_runs' | head -n 1 | cut -d: -f1)"
+lr_down_at="$(print -r -- "$lr_reload_body" | grep -n 'cmd_down' | head -n 1 | cut -d: -f1)"
+if [[ -n "$lr_guard_at" && -n "$lr_down_at" ]] && (( lr_guard_at < lr_down_at )); then
+  pass "LR-k cmd_reload calls the guard BEFORE cmd_down"
+else
+  fail "LR-k guard/teardown ordering in cmd_reload (guard=${lr_guard_at} down=${lr_down_at})"
+fi
+lr_pm_guard_at="$(print -r -- "$lr_pm_body" | grep -n '_refuse_on_live_runs' | head -n 1 | cut -d: -f1)"
+lr_pm_git_at="$(print -r -- "$lr_pm_body" | grep -n 'git checkout main' | head -n 1 | cut -d: -f1)"
+if [[ -n "$lr_pm_guard_at" && -n "$lr_pm_git_at" ]] && (( lr_pm_guard_at < lr_pm_git_at )); then
+  pass "LR-k cmd_post_merge calls the guard BEFORE 'git checkout main'"
+else
+  fail "LR-k guard/git ordering in cmd_post_merge (guard=${lr_pm_guard_at} git=${lr_pm_git_at})"
+fi
+
 # 6. Parse check: scripts/dev is valid zsh.
 if zsh -n "${REPO_ROOT}/scripts/dev"; then
   pass "scripts/dev parses clean (zsh -n)"

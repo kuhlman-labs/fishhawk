@@ -806,6 +806,113 @@ unchanged #1792 refcount branches. That harness is now run in-loop by
 `scripts/test verify` via `_verify_gate_harnesses`, adding well under a second (it
 needs no Docker).
 
+## Live-run guard for reload / post-merge (E68.7 / [#2897](https://github.com/kuhlman-labs/fishhawk/issues/2897))
+
+`scripts/dev reload` and `scripts/dev post-merge` restart fishhawkd. Before
+#2897 they did so with **no check for live runs**: a runner mid-stage saw the
+backend vanish, and a lost terminal upload left the stage stuck in `running` —
+recoverable only via `POST /v0/runs/{id}/stages/{id}/reap-failure`. Both
+commands now **REFUSE** while any `fishhawk-runner` process is live.
+
+### Three helpers, one control
+
+| Helper | Purity | Contract |
+|---|---|---|
+| `_parse_live_runs` | PURE (stdin → stdout) | reads `ps`-shaped `<pid> <argv…>` lines, prints one `<pid>\t<run-id>` record per live runner, de-duplicated on pid |
+| `_scan_live_runs [fixture]` | IMPURE | runs `ps -axww -o pid=,args=` (or reads a pre-captured fixture file) and pipes it into the parser; returns **2** on a degrade |
+| `_refuse_on_live_runs <force 0\|1> [fixture]` | the CONTROL | silent+0 on a clean scan, refusal+1 on a live scan, warning+0 with force, reason+0 on a degrade |
+
+### The detection rule, and its lockholder.go lineage
+
+`_parse_live_runs` mirrors `runnerIdentityMatches` in
+`runner/cmd/fishhawk-runner/lockholder.go` **exactly**, and for the same reason.
+The argv is split on whitespace and a record is emitted only when:
+
+1. the **FIRST** argv token's basename — with any extension stripped — EQUALS
+   `fishhawk-runner`; and
+2. a token exactly equal to `--run-id` is found, whose **immediately following**
+   token is taken as the id.
+
+Substring containment is never sufficient and a later token naming the binary is
+never sufficient. Without rule 1, `/bin/sleep fishhawk-runner --run-id abc` would
+count, `grep fishhawk-runner` would count, and **every `post-merge` run under a
+`ps | grep` pipeline would refuse itself**. `/tmp/fishhawk-runner-notes.txt` is
+refused on the same basename boundary. The single-token `--run-id=<id>` form —
+which no argv producer in this repo emits (`composeRunnerArgv` in
+`backend/internal/mcpserver/run_stage.go`, `run_children.go`, and
+`cli/cmd/fishhawk/runner.go` all emit two adjacent tokens) — is refused **as an
+id**, not as a process.
+
+A matching process whose `--run-id` token is absent or trailing **still counts as
+live**, reported with an empty id field. A runner mid-stage is the hazard whether
+or not its id can be read, so the fail-safe direction is to report it.
+
+`-ww` is load-bearing: BSD `ps` truncates the argv column to the terminal width
+unless widened (`-w` doubles it, a second `-w` removes the limit). A long
+`run_children` / `drive_run` argv would otherwise hide the `--run-id` pair and
+the guard would silently under-report.
+
+### What the operator sees
+
+On a live scan with no `--force`, on stderr, then exit 1:
+
+```
+error: refusing to tear down the local stack — 1 fishhawk-runner process(es) are live:
+  run <run-id> (pid <pid>)
+  a teardown makes a mid-conversation runner see the backend outage; a lost terminal upload strands
+  the stage in 'running', recoverable only via POST /v0/runs/{id}/stages/{id}/reap-failure.
+  wait for the run to settle, or re-run with --force to tear down anyway.
+```
+
+`--force` prints the same inventory as a `warning:` and proceeds. A record whose
+id could not be read reads `pid <pid> (run id unreadable)`.
+
+### Wiring, and why the ordering is load-bearing
+
+- `cmd_reload` parses its own args for `--force` and **STRIPS** that token from
+  what it forwards to `cmd_up` (which scans only for `--all` / `--start-deps` and
+  has no meaning for `--force`), then calls the guard **before `cmd_down`** — so
+  the refusal is structurally ahead of the stop.
+- `cmd_post_merge` calls the guard at its **very top**, before `git checkout main`
+  / `git pull --ff-only` / `scripts/cleanup-merged`, so a refusal never leaves
+  local git state half-advanced. It does NOT strip `--force`: it forwards it to
+  `cmd_reload`, whose own re-scan is a cheap idempotent second check.
+- Every call site is written `if ! _refuse_on_live_runs …`, a TESTED context, so a
+  deliberate refusal never fires the #631 `TRAPZERR` diagnostic.
+- `up` and `down` are deliberately **NOT** guarded. `up` starts nothing and stops
+  nothing, and `down` is the operator explicitly asking for a teardown — a guard
+  there would refuse the very command you reach for to clean up.
+
+### Residuals, stated not hidden
+
+- **TOCTOU.** A runner that starts between the scan and the teardown is not
+  caught. `cmd_post_merge`'s second check via `cmd_reload` narrows the window to
+  roughly the git pull, but does not eliminate it. Eliminating it needs a lock the
+  runner participates in, out of proportion to the hazard: the guard turns a
+  silent collision into a rare one.
+- **Fail-OPEN on a scan degrade.** No `ps`, or a non-zero `ps`, prints a one-line
+  reason and PROCEEDS. Deliberate: `ps` is POSIX-ubiquitous, and wedging every
+  post-merge on a host that cannot enumerate processes is worse than the window
+  this closes. The degrade branch has its own test rather than being implicit.
+- **Other users' processes.** `ps` shows them, so a colleague's runner on a shared
+  host would also refuse this operator's post-merge. On the single-operator
+  workstation this loop targets that is not a real case, and `--force` clears it.
+
+### Tests
+
+`scripts/test-dev` (run by `scripts/test verify` via `_verify_gate_harnesses`)
+pins one behavioral test per named branch: `LR-a` the done-means negative (live
+run → `cmd_reload` exits non-zero and the stubbed teardown's marker file is
+**absent**), `LR-b` `--force`, `LR-c` clean scan, `LR-d` the degrade, `LR-e`
+`--force` stripping, `LR-f` `cmd_post_merge` refusing before git/cleanup-merged
+(each with its own marker), `LR-g` the clean-walk control, `LR-h` the
+`_parse_live_runs` identity table including every near-miss above, `LR-h2`
+de-duplication, `LR-h3` the long-argv `-ww` pin, `LR-i` the shipped `ps`
+invocation, and `LR-j`/`LR-k` the tested-context and ordering pins.
+
+The runner-side half of #2897 — the terminal-egress retry budget that makes a
+`--force`d restart survivable — is in `runner/README.md`.
+
 ## Local k8s ergonomics (ADR-034 / [#852](https://github.com/kuhlman-labs/fishhawk/issues/852))
 
 `scripts/dev k8s` / `scripts/dev k8s-down` (thin Makefile aliases

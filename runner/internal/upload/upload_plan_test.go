@@ -94,6 +94,12 @@ func quickPlanClient(srv *httptest.Server) *Client {
 	c := New(srv.URL)
 	c.MaxRetries = 3
 	c.Backoff = time.Millisecond
+	// ShipPlan is a TERMINAL-egress call (#2897) on its own budget; shrink it
+	// to the same shape so every pre-existing test here keeps its attempt
+	// counts and millisecond sleeps.
+	c.TerminalMaxRetries = 3
+	c.TerminalBackoff = time.Millisecond
+	c.TerminalBackoffCap = time.Millisecond
 	return c
 }
 
@@ -559,5 +565,36 @@ func TestShipPlan_RejectsEmptyAndBadKey(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "private key") {
 		t.Errorf("expected key-length error, got %v", err)
+	}
+}
+
+// TestShipPlan_TerminalBudget_RidesOutRestartSizedOutage: the plan artifact is
+// the plan stage's SETTLING upload, so it rides the TERMINAL-egress budget
+// (E68.7 / #2897). Six consecutive 503s outlast the four attempts the blip
+// budget allows, so this fails against the pre-#2897 policy and passes only
+// with the terminal budget wired. The outage server is shared with
+// upload_test.go's newOutageServer (same package).
+func TestShipPlan_TerminalBudget_RidesOutRestartSizedOutage(t *testing.T) {
+	o, srv := newOutageServer(t, restartSizedOutageFailures, http.StatusCreated,
+		`{"id":"p1","stage_id":"s","content_hash":"abc","schema_version":"standard_v1"}`)
+	c := New(srv.URL)
+	c.HTTP = srv.Client()
+	// Shrink only the SLEEPS; the attempt cap stays the shipped default.
+	c.TerminalBackoff = time.Millisecond
+	c.TerminalBackoffCap = time.Millisecond
+
+	priv, _ := makePlanKey(t)
+	res, err := c.ShipPlan(context.Background(), ShipPlanArgs{
+		RunID: "run-abc", StageID: "stage-xyz",
+		Plan: []byte(`{"plan_version":"standard_v1"}`), PrivateKey: priv,
+	})
+	if err != nil {
+		t.Fatalf("ShipPlan should have ridden out a restart-sized outage: %v", err)
+	}
+	if res.ID != "p1" {
+		t.Errorf("ID = %q, want p1", res.ID)
+	}
+	if got, want := o.count(), restartSizedOutageFailures+1; got != want {
+		t.Errorf("requests = %d, want %d", got, want)
 	}
 }
