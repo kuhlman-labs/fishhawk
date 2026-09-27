@@ -1759,18 +1759,21 @@ components:
     LiveValidation:
       type: object
       description: |
-        The run's pending operator live-validation walk (#2045, E48.35). When an
-        approved plan carries acceptance criteria marked `requires_live_validation`
-        — criteria whose true verification needs a live forge/deploy/external
-        target the default-deny acceptance sandbox cannot reach — plan approval
-        auto-files a `chore`-type operator-validation walk and records a durable
-        marker. This surface distils the newest such marker so the pending live
-        check is visible rather than shipped silently unvalidated. Distilled from
-        the newest `live_validation_walk_linked` marker (else a stranded
-        `live_validation_walk_intent` marker). Surfaced on `GET /v0/runs/{run_id}`
-        and `GET /v0/runs/{run_id}/gate-view` ONLY (a single audit read, same
-        posture as `security_findings`); omitted when the run's approved plan
-        carried no marked criterion.
+        The run's pending operator live-validation walk (#2045, E48.35). When a
+        run's EFFECTIVE acceptance criteria — the approved plan as amended by the
+        approval's `amend_acceptance_criteria` (#3554) — carry any criterion
+        marked `requires_live_validation`, i.e. one whose true verification needs
+        a live forge/deploy/external target the default-deny acceptance sandbox
+        cannot reach, plan approval auto-files a `chore`-type operator-validation
+        walk and records a durable marker. This surface distils the newest such
+        marker so the pending live check is visible rather than shipped silently
+        unvalidated. Distilled from the newest `live_validation_walk_linked`
+        marker (else a stranded `live_validation_walk_intent` marker). Surfaced
+        on `GET /v0/runs/{run_id}` and `GET /v0/runs/{run_id}/gate-view` ONLY (a
+        single audit read, same posture as `security_findings`); omitted when the
+        run's EFFECTIVE criteria carried no marked criterion — which covers BOTH
+        a plan that never declared one AND an approval that RETIRED every one it
+        did declare (that run files no walk at all).
 
         The walk is ROLLING per epic (#3323): runs under the same epic append a
         per-run checklist section to ONE walk issue rather than filing a new walk
@@ -1781,8 +1784,12 @@ components:
           type: integer
           minimum: 0
           description: |
-            The number of `requires_live_validation` acceptance criteria on the
-            approved plan awaiting an operator live check.
+            The number of `requires_live_validation` acceptance criteria awaiting
+            an operator live check, counted over the run's EFFECTIVE criteria
+            (#3554) — the approved plan with the approval's
+            `amend_acceptance_criteria` applied. A criterion the approval RETIRED
+            is excluded; a RESTATED one still counts and carries its restated
+            statement on the walk.
         walk_ref:
           type: string
           description: |

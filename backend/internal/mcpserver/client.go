@@ -242,13 +242,17 @@ type Run struct {
 	// LiveValidation mirrors the backend run-status surface (#2045, E48.35):
 	// the run's pending operator live-validation walk — the count of
 	// requires_live_validation acceptance criteria awaiting an operator's live
-	// check plus the walk work item that tracks it. The backend emits it on the
-	// single-run read only (handleGetRun); omitted (nil) when the run carried no
-	// requires_live_validation criterion. An OLDER backend omits it entirely, so
+	// check plus the walk work item that tracks it. The count is over the run's
+	// EFFECTIVE criteria (#3554) — the approved plan with the approval's
+	// amend_acceptance_criteria applied — so a RETIRED criterion is excluded. The
+	// backend emits it on the single-run read only (handleGetRun); omitted (nil)
+	// when the EFFECTIVE criteria carry no marked criterion, which covers BOTH a
+	// plan that never declared one AND an approval that retired every one it did
+	// (that run files no walk at all). An OLDER backend omits it entirely, so
 	// it decodes to nil and next_actions renders nothing — the mixed-version
 	// degrade. The json tag MUST byte-match the backend's runLiveValidationPayload
 	// or the field silently decodes to nil.
-	LiveValidation *RunLiveValidation `json:"live_validation,omitempty" jsonschema:"the run's pending operator live-validation walk (count of requires_live_validation criteria + the tracking walk ref). Omitted when the run carries no such criterion"`
+	LiveValidation *RunLiveValidation `json:"live_validation,omitempty" jsonschema:"the run's pending operator live-validation walk (count of EFFECTIVE requires_live_validation criteria, retirements applied, + the tracking walk ref). Omitted when the effective criteria carry no such criterion"`
 	// ReviewAuthority mirrors the backend run-status surface (E53.2 / #2225):
 	// for each stage of the run's workflow that declares a reviewers block, the
 	// resolved review authority mode (advisory | gating | gateless) and its
@@ -599,8 +603,10 @@ type GateView struct {
 	HistoryGaps             []string                    `json:"history_gaps,omitempty"`
 	// LiveValidation mirrors the run-status surface (#2045, E48.35): the run's
 	// pending operator live-validation walk, populated by buildGateView from the
-	// newest live_validation walk marker. Omitted (nil) when the run carried no
-	// requires_live_validation criterion or against an older backend. Same wire
+	// newest live_validation walk marker. Omitted (nil) when the run's EFFECTIVE
+	// criteria carry no requires_live_validation criterion — a plan that never
+	// declared one, or an approval that RETIRED every one it did (#3554) — or
+	// against an older backend. Same wire
 	// contract as Run.LiveValidation — the json tag MUST byte-match the backend.
 	LiveValidation *RunLiveValidation `json:"live_validation,omitempty"`
 	// ReviewDiffTruncated surfaces that an implement review ran on a TRUNCATED

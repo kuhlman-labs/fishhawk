@@ -179,6 +179,89 @@ func lockLiveValWalk(runID uuid.UUID) func() {
 	return m.Unlock
 }
 
+// retiredLiveValidationCriterion is one requires_live_validation criterion the
+// operator RETIRED at approval, carried for the walk's struck provenance line
+// (#3554). Statement is joined from the PLAN artifact by id because
+// retiredCriterion carries none — so a criterion retired AFTER an earlier
+// approval restated it renders its ORIGINAL plan statement here. That is
+// deliberate: the struck line is provenance and the plan text is the stable
+// reference (stated in backend/internal/server/README.md).
+type retiredLiveValidationCriterion struct {
+	ID               string
+	Statement        string
+	Reason           string
+	ApprovalSequence int64
+}
+
+// liveValidationWalkCriteria is the EFFECTIVE render input every walk body and
+// section is built from (#3554): the live requires_live_validation criteria
+// (restatements already applied), the audit Sequence of the approval that
+// restated each of them, and the marked criteria the approval retired. An
+// UNAMENDED value (nil RestatedSeq, nil Retired) renders byte-identically to the
+// pre-#3554 plan-artifact render.
+type liveValidationWalkCriteria struct {
+	Live        []plan.AcceptanceCriterion
+	RestatedSeq map[string]int64
+	Retired     []retiredLiveValidationCriterion
+}
+
+// effectiveLiveValidationWalkCriteria resolves the run's EFFECTIVE acceptance
+// criteria through the single #2581 seam (registered as call site 5) and
+// projects the requires_live_validation subset the walk renders (#3554). The
+// live subset is selected by handing the seam's Live set back through
+// plan.LiveValidationCriteria — the shared selector — rather than
+// re-implementing the requires_live_validation filter here, so the seam's
+// no-recompute rule holds.
+//
+// FAIL DIRECTION on an audit read error: WARN and render the plan's FULL
+// live-validation set with no retired/restated annotation — the status-quo
+// pre-#3554 body. That is toward MORE validation (never a dropped walk, never a
+// silently-narrowed checklist), the same direction the acceptance prompt builder
+// takes on the same error.
+func (s *Server) effectiveLiveValidationWalkCriteria(ctx context.Context, runID uuid.UUID, p *plan.Plan) liveValidationWalkCriteria {
+	eff, err := s.resolveEffectiveAcceptanceCriteria(ctx, runID, p, nil)
+	if err != nil {
+		s.logLiveValidationWarn(ctx, runID, "resolve effective acceptance criteria failed; rendering the plan's live-validation set", err.Error())
+		return liveValidationWalkCriteria{Live: plan.LiveValidationCriteria(p.Verification)}
+	}
+	wc := liveValidationWalkCriteria{Live: plan.LiveValidationCriteria(plan.Verification{AcceptanceCriteria: eff.Live})}
+	for _, c := range wc.Live {
+		seq, ok := eff.RestatedBy[c.ID]
+		if !ok {
+			continue
+		}
+		if wc.RestatedSeq == nil {
+			wc.RestatedSeq = map[string]int64{}
+		}
+		wc.RestatedSeq[c.ID] = seq
+	}
+	if len(eff.Retired) == 0 {
+		return wc
+	}
+	planByID := make(map[string]plan.AcceptanceCriterion, len(p.Verification.AcceptanceCriteria))
+	for _, c := range p.Verification.AcceptanceCriteria {
+		planByID[c.ID] = c
+	}
+	// eff.Retired is already in plan order; keep it.
+	for _, r := range eff.Retired {
+		pc, ok := planByID[r.ID]
+		if !ok || !pc.RequiresLiveValidation {
+			continue // an unmarked (or operator-added) criterion is not this walk's business
+		}
+		stmt := pc.Statement
+		if stmt == "" {
+			stmt = pc.ID
+		}
+		wc.Retired = append(wc.Retired, retiredLiveValidationCriterion{
+			ID:               r.ID,
+			Statement:        stmt,
+			Reason:           r.Reason,
+			ApprovalSequence: r.ApprovalSequence,
+		})
+	}
+	return wc
+}
+
 // fileOrLinkLiveValidationWalk is the best-effort on-approval hook (#2045,
 // E48.35): when an operator approves a plan carrying any requires_live_validation
 // acceptance criterion, it auto-files (or, on a re-approval, no-ops on) a
@@ -232,9 +315,14 @@ func (s *Server) fileOrLinkLiveValidationWalk(ctx context.Context, stage *run.St
 	if approvedPlan == nil {
 		return
 	}
-	crits := plan.LiveValidationCriteria(approvedPlan.Verification)
-	if len(crits) == 0 {
-		return // no marked criterion → no forge call, no marker
+	// The EFFECTIVE criteria, not the plan artifact's (#3554): a restated
+	// criterion renders its restatement, a retired one drops out of the checklist
+	// entirely. An approval that retires EVERY marked criterion therefore leaves
+	// wc.Live empty and files NO walk — a checklist with nothing for the operator
+	// to do is not worth an issue (operator binding condition 1).
+	wc := s.effectiveLiveValidationWalkCriteria(ctx, runID, approvedPlan)
+	if len(wc.Live) == 0 {
+		return // no marked criterion (or every one retired) → no forge call, no marker
 	}
 
 	// Serialize the intent-check → intent-append → file → linked-append section
@@ -267,10 +355,10 @@ func (s *Server) fileOrLinkLiveValidationWalk(ctx context.Context, stage *run.St
 		// The walk cannot be filed (no owner/name), but marked criteria exist —
 		// record a filing-failure marker so those pending criteria surface as
 		// file-manually rather than advancing silently unvalidated (implement-
-		// review high/correctness). crits is guaranteed non-empty here (the
+		// review high/correctness). wc.Live is guaranteed non-empty here (the
 		// no-marked-criterion case returned above), so this never marks a
 		// no-op approval as failed.
-		s.writeLiveValidationFilingFailedMarker(ctx, runRow, crits)
+		s.writeLiveValidationFilingFailedMarker(ctx, runRow, wc)
 		return
 	}
 	parentIssue := 0
@@ -285,12 +373,14 @@ func (s *Server) fileOrLinkLiveValidationWalk(ctx context.Context, stage *run.St
 		// marker rather than advancing the run with pending live-validation
 		// criteria silently accepted (implement-review high/correctness) — the
 		// same failure-marker path a post-File error takes.
-		s.writeLiveValidationFilingFailedMarker(ctx, runRow, crits)
+		s.writeLiveValidationFilingFailedMarker(ctx, runRow, wc)
 		return
 	}
 
-	ids := make([]string, 0, len(crits))
-	for _, c := range crits {
+	// The markers' pending count / criterion ids follow the EFFECTIVE live set,
+	// so run-status and gate_view stop counting a retired criterion as pending.
+	ids := make([]string, 0, len(wc.Live))
+	for _, c := range wc.Live {
 		ids = append(ids, c.ID)
 	}
 
@@ -299,7 +389,7 @@ func (s *Server) fileOrLinkLiveValidationWalk(ctx context.Context, stage *run.St
 	// cleanly (no orphan walk, no double file).
 	if err := s.appendLiveValidationMarker(ctx, runRow, liveValidationWalkIntentKind, liveValidationWalkMarker{
 		Phase:                "intent",
-		PendingCriteriaCount: len(crits),
+		PendingCriteriaCount: len(wc.Live),
 		CriterionIDs:         ids,
 	}); err != nil {
 		s.logLiveValidationWarn(ctx, runID, "append intent marker failed; filed nothing", err.Error())
@@ -311,10 +401,10 @@ func (s *Server) fileOrLinkLiveValidationWalk(ctx context.Context, stage *run.St
 	// on success with the walk ref, on ANY filing failure with filing_failed=true
 	// and an empty ref — so approval never advances leaving pending
 	// live-validation criteria with zero surfaced indication (replan directive 1).
-	walkRef, anchor, appended, filed := s.fileLiveValidationChore(ctx, runRow, owner, name, parentIssue, crits)
+	walkRef, anchor, appended, filed := s.fileLiveValidationChore(ctx, runRow, owner, name, parentIssue, wc)
 	linked := liveValidationWalkMarker{
 		Phase:                "linked",
-		PendingCriteriaCount: len(crits),
+		PendingCriteriaCount: len(wc.Live),
 		CriterionIDs:         ids,
 	}
 	if filed {
@@ -344,16 +434,16 @@ func (s *Server) fileOrLinkLiveValidationWalk(ctx context.Context, stage *run.St
 // next_actions render "N criteria pending operator live-validation (walk filing
 // failed — file manually)" and the run never advances with pending criteria
 // silently accepted (implement-review high/correctness, #2045). Callers must
-// invoke it ONLY when len(crits) > 0. Best-effort: a write failure WARNs and
+// invoke it ONLY when len(wc.Live) > 0. Best-effort: a write failure WARNs and
 // does not unwind the approval the gate already recorded.
-func (s *Server) writeLiveValidationFilingFailedMarker(ctx context.Context, runRow *run.Run, crits []plan.AcceptanceCriterion) {
-	ids := make([]string, 0, len(crits))
-	for _, c := range crits {
+func (s *Server) writeLiveValidationFilingFailedMarker(ctx context.Context, runRow *run.Run, wc liveValidationWalkCriteria) {
+	ids := make([]string, 0, len(wc.Live))
+	for _, c := range wc.Live {
 		ids = append(ids, c.ID)
 	}
 	if err := s.appendLiveValidationMarker(ctx, runRow, liveValidationWalkLinkedKind, liveValidationWalkMarker{
 		Phase:                "linked",
-		PendingCriteriaCount: len(crits),
+		PendingCriteriaCount: len(wc.Live),
 		CriterionIDs:         ids,
 		FilingFailed:         true,
 	}); err != nil {
@@ -641,7 +731,7 @@ func (s *Server) resolveWalkParentEpic(ctx context.Context, scope forge.Credenti
 //     A filed unparented walk is still a better outcome than a hook that errors,
 //     and the residual is rare and visible via the EpicLinkError WARN. See
 //     backend/internal/server/README.md.
-func (s *Server) fileLiveValidationChore(ctx context.Context, runRow *run.Run, owner, name string, parentIssue int, crits []plan.AcceptanceCriterion) (walkRef, anchor string, appended, filed bool) {
+func (s *Server) fileLiveValidationChore(ctx context.Context, runRow *run.Run, owner, name string, parentIssue int, wc liveValidationWalkCriteria) (walkRef, anchor string, appended, filed bool) {
 	conv, err := conventionsLoader(ctx, runRow.Repo)
 	if err != nil {
 		s.logLiveValidationWarn(ctx, runRow.ID, "load work-management conventions failed", err.Error())
@@ -678,7 +768,7 @@ func (s *Server) fileLiveValidationChore(ctx context.Context, runRow *run.Run, o
 		if res.AppendTo > 0 {
 			// ADOPTION: append this run's section to the existing open rolling walk
 			// (#3323). No File, no addSubIssue, no {n}.
-			a, appended, retryable := s.appendRollingWalkSection(ctx, target.Scope, runRow, owner, name, res.AppendTo, parentRef, crits)
+			a, appended, retryable := s.appendRollingWalkSection(ctx, target.Scope, runRow, owner, name, res.AppendTo, parentRef, wc)
 			if appended {
 				return fmt.Sprintf("#%d", res.AppendTo), a, true, true
 			}
@@ -695,12 +785,12 @@ func (s *Server) fileLiveValidationChore(ctx context.Context, runRow *run.Run, o
 			if res.ChildN == "" {
 				s.logLiveValidationWarn(ctx, runRow.ID, "rolling walk append degraded and no allocatable child number; filing companion", res.EpicRef)
 			} else {
-				ref, a, ok := s.fileNewRollingWalk(ctx, runRow, conv, target, owner, name, res, parentRef, rollingKey, crits)
+				ref, a, ok := s.fileNewRollingWalk(ctx, runRow, conv, target, owner, name, res, parentRef, rollingKey, wc)
 				return ref, a, false, ok
 			}
 		} else {
 			// No candidate: FIRST rolling filing under this epic.
-			ref, a, ok := s.fileNewRollingWalk(ctx, runRow, conv, target, owner, name, res, parentRef, rollingKey, crits)
+			ref, a, ok := s.fileNewRollingWalk(ctx, runRow, conv, target, owner, name, res, parentRef, rollingKey, wc)
 			return ref, a, false, ok
 		}
 	}
@@ -710,7 +800,7 @@ func (s *Server) fileLiveValidationChore(ctx context.Context, runRow *run.Run, o
 	req := workmgmt.FilingRequest{
 		Type:      "chore",
 		Summary:   summary,
-		Body:      liveValidationWalkBody(parentRef, "", crits, true),
+		Body:      liveValidationWalkBody(parentRef, "", wc, true),
 		Labels:    []string{liveValidationWalkArea},
 		TitleVars: map[string]string{"epic": strconv.Itoa(parentIssue), "n": "1"},
 		Relations: workmgmt.Relations{
@@ -733,8 +823,8 @@ func (s *Server) fileLiveValidationChore(ctx context.Context, runRow *run.Run, o
 // per-epic lock) makes deriveChildNumberTitleVar short-circuit so it does not
 // re-take the lock (no deadlock). Returns ("#N", "run-<id>", true) on success and
 // ("", "", false) on a File failure (the caller routes that to filing_failed).
-func (s *Server) fileNewRollingWalk(ctx context.Context, runRow *run.Run, conv workmgmt.Conventions, target workmgmt.Target, owner, name string, res walkEpicResolution, parentRef, rollingKey string, crits []plan.AcceptanceCriterion) (string, string, bool) {
-	body, anchor := liveValidationRollingWalkBody(runRow.ID, res.EpicRef, parentRef, crits)
+func (s *Server) fileNewRollingWalk(ctx context.Context, runRow *run.Run, conv workmgmt.Conventions, target workmgmt.Target, owner, name string, res walkEpicResolution, parentRef, rollingKey string, wc liveValidationWalkCriteria) (string, string, bool) {
+	body, anchor := liveValidationRollingWalkBody(runRow.ID, res.EpicRef, parentRef, wc)
 	req := workmgmt.FilingRequest{
 		Type:           "chore",
 		Summary:        "Operator live-validation walk (rolling)",
@@ -777,7 +867,7 @@ func (s *Server) fileNewRollingWalk(ctx context.Context, runRow *run.Run, conv w
 //	appended=false, retryable=false  → UpdateIssue FAILED on an existing walk: route
 //	                                   to filing_failed and NEVER file a second walk
 //	                                   (the #2045 double-file window).
-func (s *Server) appendRollingWalkSection(ctx context.Context, scope forge.CredentialScope, runRow *run.Run, owner, name string, walkNumber int, triggerRef string, crits []plan.AcceptanceCriterion) (anchor string, appended, retryable bool) {
+func (s *Server) appendRollingWalkSection(ctx context.Context, scope forge.CredentialScope, runRow *run.Run, owner, name string, walkNumber int, triggerRef string, wc liveValidationWalkCriteria) (anchor string, appended, retryable bool) {
 	if s.cfg.GitHub == nil {
 		return "", false, true
 	}
@@ -794,7 +884,7 @@ func (s *Server) appendRollingWalkSection(ctx context.Context, scope forge.Crede
 		s.logLiveValidationWarn(ctx, runRow.ID, "rolling walk closed at fresh read; filing new walk", fmt.Sprintf("#%d state=%q", walkNumber, issue.State))
 		return "", false, true // retryable → file a new walk
 	}
-	section, a := liveValidationRunSection(runRow.ID, triggerRef, crits)
+	section, a := liveValidationRunSection(runRow.ID, triggerRef, wc)
 	// (c) Idempotent re-entry: this run's section is already present.
 	if workmgmt.BodyHasIdempotencyKey(issue.Body, liveValidationSectionKey(runRow.ID)) {
 		return a, true, false
@@ -814,14 +904,14 @@ func (s *Server) appendRollingWalkSection(ctx context.Context, scope forge.Crede
 // the per-run idempotent re-entry; a `Filed for <triggerRef>.` line names the
 // triggering issue; and each criterion is a checkbox bullet with an indented
 // `Verify:` continuation when it carries a verify_hint.
-func liveValidationRunSection(runID uuid.UUID, triggerRef string, crits []plan.AcceptanceCriterion) (string, string) {
+func liveValidationRunSection(runID uuid.UUID, triggerRef string, wc liveValidationWalkCriteria) (string, string) {
 	anchor := "run-" + runID.String()
 	var b strings.Builder
 	fmt.Fprintf(&b, "### Run %s\n\n", runID.String())
 	b.WriteString(workmgmt.StampIdempotencyKey("", liveValidationSectionKey(runID)))
 	b.WriteString("\n\n")
 	fmt.Fprintf(&b, "Filed for %s.\n\n", triggerRef)
-	for _, c := range crits {
+	for _, c := range wc.Live {
 		stmt := c.Statement
 		if stmt == "" {
 			stmt = c.ID
@@ -830,15 +920,52 @@ func liveValidationRunSection(runID uuid.UUID, triggerRef string, crits []plan.A
 		if c.VerifyHint != "" {
 			fmt.Fprintf(&b, "  Verify: %s\n", c.VerifyHint)
 		}
+		if seq, ok := wc.RestatedSeq[c.ID]; ok {
+			b.WriteString(liveValidationRestatedNote(seq))
+		}
 	}
+	b.WriteString(liveValidationRetiredBlock(wc.Retired))
 	return b.String(), anchor
+}
+
+// liveValidationRestatedNote renders the indented continuation line naming the
+// approval that restated a criterion (#3554). The parenthetical is omitted for
+// sequence 0 — a PENDING (not yet recorded) amendment has no audit sequence to
+// name, and printing "(audit sequence 0)" would name a row that does not exist.
+func liveValidationRestatedNote(seq int64) string {
+	if seq == 0 {
+		return "  Restated by operator approval.\n"
+	}
+	return fmt.Sprintf("  Restated by operator approval (audit sequence %d).\n", seq)
+}
+
+// liveValidationRetiredBlock renders the retired criteria as NON-checkbox struck
+// provenance lines (#3554) — visible and auditable, but not tickable: the
+// operator has nothing to validate for a criterion the approval retired. Empty
+// (no label, no trailing bytes) when nothing was retired, which is what keeps an
+// unamended body byte-identical to the pre-#3554 render.
+func liveValidationRetiredBlock(retired []retiredLiveValidationCriterion) string {
+	if len(retired) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("\nRetired at approval:\n\n")
+	for _, r := range retired {
+		if r.ApprovalSequence == 0 {
+			fmt.Fprintf(&b, "- ~~`%s` — %s~~ — retired by operator approval: %s\n", r.ID, r.Statement, r.Reason)
+			continue
+		}
+		fmt.Fprintf(&b, "- ~~`%s` — %s~~ — retired by operator approval (audit sequence %d): %s\n",
+			r.ID, r.Statement, r.ApprovalSequence, r.Reason)
+	}
+	return b.String()
 }
 
 // liveValidationRollingWalkBody assembles the body of a NEW rolling walk's first
 // filing (#3323): the walk summary, a Parent-epic reference, a line stating that
 // each run appends its own section and the walk closes only when every section is
 // ticked, then this run's first section. It returns (body, anchor).
-func liveValidationRollingWalkBody(runID uuid.UUID, epicRef, triggerRef string, crits []plan.AcceptanceCriterion) (string, string) {
+func liveValidationRollingWalkBody(runID uuid.UUID, epicRef, triggerRef string, wc liveValidationWalkCriteria) (string, string) {
 	body := "## Summary\n\nThis run's approved plan carries acceptance criteria whose true verification " +
 		"needs a live forge/deploy/external target the default-deny acceptance sandbox cannot reach " +
 		"(`requires_live_validation`). The acceptance stage short-circuits them; this walk tracks the " +
@@ -846,7 +973,7 @@ func liveValidationRollingWalkBody(runID uuid.UUID, epicRef, triggerRef string, 
 	body += "Parent epic: " + epicRef + ".\n\n"
 	body += "This is a ROLLING walk (#3323): each run under this epic appends its own section below, " +
 		"and the walk closes only when EVERY section's criteria are ticked.\n\n"
-	section, anchor := liveValidationRunSection(runID, triggerRef, crits)
+	section, anchor := liveValidationRunSection(runID, triggerRef, wc)
 	body += section
 	return body, anchor
 }
@@ -857,7 +984,7 @@ func liveValidationRollingWalkBody(runID uuid.UUID, epicRef, triggerRef string, 
 // reference plus a Filed-for line. The companion=true output is byte-IDENTICAL
 // to the pre-#2179 body (pinned by TestLiveValidationWalkBody_CompanionByteIdentity),
 // so the fallback arm — the one that fires today for every walk — is unchanged.
-func liveValidationWalkBody(triggerRef, epicRef string, crits []plan.AcceptanceCriterion, companion bool) string {
+func liveValidationWalkBody(triggerRef, epicRef string, wc liveValidationWalkCriteria, companion bool) string {
 	body := "## Summary\n\nThis run's approved plan carries acceptance criteria whose true verification " +
 		"needs a live forge/deploy/external target the default-deny acceptance sandbox cannot reach " +
 		"(`requires_live_validation`). The acceptance stage short-circuits them; this walk tracks the " +
@@ -869,13 +996,17 @@ func liveValidationWalkBody(triggerRef, epicRef string, crits []plan.AcceptanceC
 		body += "Filed for " + triggerRef + ".\n\n"
 	}
 	body += "## Done-means\n\nEach criterion below has been live-validated by the operator against the real target:\n\n"
-	for _, c := range crits {
+	for _, c := range wc.Live {
 		stmt := c.Statement
 		if stmt == "" {
 			stmt = c.ID
 		}
 		body += fmt.Sprintf("- [ ] `%s` — %s\n", c.ID, stmt)
+		if seq, ok := wc.RestatedSeq[c.ID]; ok {
+			body += liveValidationRestatedNote(seq)
+		}
 	}
+	body += liveValidationRetiredBlock(wc.Retired)
 	return body
 }
 

@@ -153,12 +153,22 @@ type retiredCriterion struct {
 // with only a statement differing, so a consumer keying "was anything amended?"
 // off len(Retired) silently drops the restatement (the round-four defect — the
 // acceptance prompt fell back to the plan's original statements).
+//
+// RestatedBy carries the PROVENANCE Restated cannot: criterion id -> the audit
+// Sequence of the approval row that LAST restated it (0 for a pending, not yet
+// recorded amendment, mirroring retiredCriterion.ApprovalSequence). It exists
+// for the live-validation walk render (call site 5, #3554), which must NAME the
+// approval that amended the criteria; the no-recompute rule above forbids that
+// caller re-reading the approval chain to derive it, so the seam carries it.
+// Additive and nil when nothing was restated, so an un-amended run's result is
+// byte-unchanged for every other consumer.
 type effectiveAcceptanceCriteria struct {
-	Live     []plan.AcceptanceCriterion
-	Retired  []retiredCriterion
-	Restated []string
-	Added    []string
-	AllIDs   []string
+	Live       []plan.AcceptanceCriterion
+	Retired    []retiredCriterion
+	Restated   []string
+	RestatedBy map[string]int64
+	Added      []string
+	AllIDs     []string
 	// RetiredScenarios is every approved retire_scenario entry recorded on the
 	// run's approval chain (E72.4 / #3328), in ascending approval order, FULL
 	// entries with the reason intact. Served as acceptance_retired_scenarios.
@@ -220,6 +230,14 @@ func (e effectiveAcceptanceCriteria) retiredIDSet() map[string]struct{} {
 //  3. handleRenderPrompt's acceptance branch (the render/preview prompt path).
 //  4. handleShipAcceptance (acceptance-verdict ingest), which uses the recorded
 //     retired-id set as the strict key for the downgrade preconditions.
+//  5. fileOrLinkLiveValidationWalk (the on-approval live-validation walk filing
+//     hook, #3554) via effectiveLiveValidationWalkCriteria, so the walk a human
+//     acts on renders the EFFECTIVE criteria — a restated criterion in its
+//     restated form, a retired one as a struck provenance line rather than a
+//     live checkbox. On an audit read error it renders the FULL plan
+//     live-validation set (the status-quo pre-#3554 body), i.e. toward MORE
+//     validation and never toward silence — the same direction the prompt
+//     builder takes.
 //
 // RetiredScenarios is explicitly NOT part of the criteria set the no-recompute
 // rule above protects: it is a scenario-only projection of the same approval
@@ -328,6 +346,10 @@ func (s *Server) resolveEffectiveAcceptanceCriteria(ctx context.Context, runID u
 		case acceptanceAmendActionRestate:
 			eff.Live[idx].Statement = a.Statement
 			restated[a.ID] = struct{}{}
+			if eff.RestatedBy == nil {
+				eff.RestatedBy = map[string]int64{}
+			}
+			eff.RestatedBy[a.ID] = seq
 		}
 	}
 	for _, rec := range recorded {
