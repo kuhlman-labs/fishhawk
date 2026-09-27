@@ -1202,3 +1202,68 @@ func TestAmendments_RetireScenario_AddMakesPersistable(t *testing.T) {
 		t.Fatalf("status = %d, want 200 (the add makes the runner spawn):\n%s", w.Code, w.Body.String())
 	}
 }
+
+// TestResolveEffectiveAcceptanceCriteria_RestatedBy pins the additive
+// RestatedBy projection (#3554): a recorded restate maps the criterion id to the
+// audit Sequence of the approval row that recorded it, a retire never appears in
+// it, and an un-amended run returns a NIL map — so the field cannot perturb the
+// three existing consumers.
+func TestResolveEffectiveAcceptanceCriteria_RestatedBy(t *testing.T) {
+	p := &plan.Plan{Verification: plan.Verification{AcceptanceCriteria: amendCriteria()}}
+
+	t.Run("restate carries the approval sequence", func(t *testing.T) {
+		s, _, au, _, runRow, stage := newAmendServer(t, amendCriteria())
+		au.seedApprovalEntry(runRow.ID, stage.ID, 41, "approve", []acceptanceCriteriaAmendment{
+			{ID: "crit-2", Action: "restate", Reason: "narrowed at the gate", Statement: "healthz reports the STAGE budget"},
+			{ID: "crit-3", Action: "retire", Reason: "the advisory line moved"},
+		})
+		eff, err := s.resolveEffectiveAcceptanceCriteria(context.Background(), runRow.ID, p, nil)
+		if err != nil {
+			t.Fatalf("resolve: %v", err)
+		}
+		if want := map[string]int64{"crit-2": 41}; !reflect.DeepEqual(eff.RestatedBy, want) {
+			t.Errorf("RestatedBy = %v, want %v (a retire is not a restate)", eff.RestatedBy, want)
+		}
+	})
+
+	t.Run("a later restate wins", func(t *testing.T) {
+		s, _, au, _, runRow, stage := newAmendServer(t, amendCriteria())
+		au.seedApprovalEntry(runRow.ID, stage.ID, 11, "approve", []acceptanceCriteriaAmendment{
+			{ID: "crit-2", Action: "restate", Reason: "first pass", Statement: "first replacement"},
+		})
+		au.seedApprovalEntry(runRow.ID, stage.ID, 22, "approve", []acceptanceCriteriaAmendment{
+			{ID: "crit-2", Action: "restate", Reason: "second pass", Statement: "second replacement"},
+		})
+		eff, err := s.resolveEffectiveAcceptanceCriteria(context.Background(), runRow.ID, p, nil)
+		if err != nil {
+			t.Fatalf("resolve: %v", err)
+		}
+		if eff.RestatedBy["crit-2"] != 22 {
+			t.Errorf("RestatedBy[crit-2] = %d, want 22 (the LAST restate's sequence)", eff.RestatedBy["crit-2"])
+		}
+	})
+
+	t.Run("a pending restate carries sequence 0", func(t *testing.T) {
+		s, _, _, _, runRow, _ := newAmendServer(t, amendCriteria())
+		eff, err := s.resolveEffectiveAcceptanceCriteria(context.Background(), runRow.ID, p, []acceptanceCriteriaAmendment{
+			{ID: "crit-2", Action: "restate", Reason: "in flight", Statement: "pending replacement"},
+		})
+		if err != nil {
+			t.Fatalf("resolve: %v", err)
+		}
+		if seq, ok := eff.RestatedBy["crit-2"]; !ok || seq != 0 {
+			t.Errorf("RestatedBy[crit-2] = (%d, %v), want (0, true) for a not-yet-recorded amendment", seq, ok)
+		}
+	})
+
+	t.Run("un-amended returns a nil map", func(t *testing.T) {
+		s, _, _, _, runRow, _ := newAmendServer(t, amendCriteria())
+		eff, err := s.resolveEffectiveAcceptanceCriteria(context.Background(), runRow.ID, p, nil)
+		if err != nil {
+			t.Fatalf("resolve: %v", err)
+		}
+		if eff.RestatedBy != nil {
+			t.Errorf("RestatedBy = %v, want nil on an un-amended run", eff.RestatedBy)
+		}
+	})
+}

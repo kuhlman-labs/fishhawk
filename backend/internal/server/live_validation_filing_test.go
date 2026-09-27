@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -292,7 +293,24 @@ type liveValConfig struct {
 	// githubStore, when set, is the issue store backing cfg.github's REST GET/PATCH
 	// (#3323 rolling-walk append tests).
 	githubStore *liveValIssueStore
+	// secondMarked adds a SECOND requires_live_validation criterion (ac3) to the
+	// seeded plan, so ONE approval can carry a restate AND a retire and still
+	// leave a live criterion to render (#3554).
+	secondMarked bool
+	// amendments, when non-empty, seeds ONE approve-decision approval_submitted
+	// audit row on the run's PLAN stage carrying them, at liveValAmendSeq. Seeded
+	// BY CONSTRUCTION into the auditFake's history — never by calling the approve
+	// gate — so a counterfactual RED lands on a behavioral assertion (#3554).
+	amendments []acceptanceCriteriaAmendment
+	// amendResolveErr makes the auditFake fail ListForRunByCategory for
+	// approval_submitted ONLY, so resolveEffectiveAcceptanceCriteria errors and
+	// the hook takes its documented fail-toward-more-validation fallback.
+	amendResolveErr bool
 }
+
+// liveValAmendSeq is the fixed audit Sequence of the seeded approval row, so a
+// test can assert the walk names the amending approval by number (#3554).
+const liveValAmendSeq int64 = 96873
 
 type liveValHarness struct {
 	s         *Server
@@ -306,7 +324,7 @@ type liveValHarness struct {
 
 // liveValPlanBytes builds a plan whose acceptance criteria include one
 // requires_live_validation criterion when marked; otherwise a plain plan.
-func liveValPlanBytes(t *testing.T, marked bool) []byte {
+func liveValPlanBytes(t *testing.T, marked, secondMarked bool) []byte {
 	t.Helper()
 	crits := []plan.AcceptanceCriterion{
 		{ID: "ac1", Statement: "the webhook fires on a real push"},
@@ -321,6 +339,15 @@ func liveValPlanBytes(t *testing.T, marked bool) []byte {
 		// A verify_hint so the rendered rolling section exercises the `Verify:`
 		// continuation branch of liveValidationRunSection (low/test_coverage).
 		crits[0].VerifyHint = "trigger a real push and observe the webhook delivery"
+	}
+	if secondMarked {
+		crits = append(crits, plan.AcceptanceCriterion{
+			ID:                     "ac3",
+			Statement:              "the retry backs off against a real 429",
+			RequiresLiveValidation: true,
+			SkipExpected:           true,
+			ExpectationBasis:       "exercised against a fake forge in the unit suite",
+		})
 	}
 	p := &plan.Plan{
 		PlanVersion: "standard_v1",
@@ -375,9 +402,16 @@ func newLiveValHarness(t *testing.T, cfg liveValConfig) *liveValHarness {
 		StageID:       planStageID,
 		Kind:          artifact.KindPlan,
 		SchemaVersion: &sv,
-		Content:       liveValPlanBytes(t, cfg.marked),
+		Content:       liveValPlanBytes(t, cfg.marked, cfg.secondMarked),
 	}); err != nil {
 		t.Fatalf("seed plan artifact: %v", err)
+	}
+
+	if len(cfg.amendments) > 0 {
+		seedLiveValApprovalAmendment(au, runID, planStageID, liveValAmendSeq, cfg.amendments)
+	}
+	if cfg.amendResolveErr {
+		au.listByCategoryErrCategory = "approval_submitted"
 	}
 
 	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au, RunRepo: rr, ArtifactRepo: art})
@@ -413,6 +447,25 @@ func (h *liveValHarness) newestLinked(t *testing.T) (liveValidationWalkMarker, b
 		found = true
 	}
 	return last, found
+}
+
+// seedLiveValApprovalAmendment writes ONE synthetic approve-decision
+// approval_submitted row carrying amend_acceptance_criteria directly into the
+// auditFake's seeded history (#3554) — never by calling the approve gate that
+// would write it — so the hook's READ of the amendment is what a counterfactual
+// RED lands on, not fixture setup. The stage_id is the run's PLAN stage, which
+// is what recordedAcceptanceAmendments' approvalEntryStageIsPlan filter requires.
+func seedLiveValApprovalAmendment(au *auditFake, runID, planStageID uuid.UUID, seq int64, amendments []acceptanceCriteriaAmendment) {
+	payload, _ := json.Marshal(map[string]any{
+		"stage_id":                  planStageID.String(),
+		"decision":                  "approve",
+		"amend_acceptance_criteria": amendments,
+	})
+	rid, sid := runID, planStageID
+	au.seeded = append(au.seeded, &audit.Entry{
+		ID: uuid.New(), Sequence: seq, RunID: &rid, StageID: &sid,
+		Category: "approval_submitted", Payload: payload, Timestamp: time.Now().UTC(),
+	})
 }
 
 // seedLiveValidationMarker appends a marker directly to the auditFake's seeded
@@ -1087,7 +1140,7 @@ func TestLiveValidationWalkBody_CompanionByteIdentity(t *testing.T) {
 		"- [ ] `ac1` — the webhook fires on a real push\n" +
 		"- [ ] `ac2` — the response is 200\n"
 	// epicRef is ignored on the companion arm; pass a non-empty value to prove it.
-	got := liveValidationWalkBody("#2045", "#1940", crits, true)
+	got := liveValidationWalkBody("#2045", "#1940", liveValidationWalkCriteria{Live: crits}, true)
 	if got != want {
 		t.Errorf("companion body drifted from the frozen golden.\n got: %q\nwant: %q", got, want)
 	}
@@ -1118,14 +1171,18 @@ func liveValRollingCandidate(number int, state, rollingKey string) workmgmt.Epic
 // liveValRollingHarness builds an epic-arm harness (IssueParent -> [E48] #1940,
 // querier provider) whose epic children are `children`, wired to a github client
 // with an addressable store.
-func liveValRollingHarness(t *testing.T, children []workmgmt.EpicChild) (*liveValHarness, *liveValIssueStore) {
+func liveValRollingHarness(t *testing.T, children []workmgmt.EpicChild, mutate ...func(*liveValConfig)) (*liveValHarness, *liveValIssueStore) {
 	t.Helper()
 	inst := int64(77)
 	gh, store := newLiveValGitHubWithStore(t, "", &liveValParentFixture{number: 1940, title: "[E48] SDLC dogfooding"})
-	h := newLiveValHarness(t, liveValConfig{
+	cfg := liveValConfig{
 		marked: true, installID: &inst, github: gh, githubStore: store,
 		providerQuerier: true, epicChildren: children,
-	})
+	}
+	for _, m := range mutate {
+		m(&cfg)
+	}
+	h := newLiveValHarness(t, cfg)
 	return h, store
 }
 
@@ -1579,7 +1636,7 @@ func TestFileOrLinkLiveValidationWalk_RollingTwoRunsOneWalk(t *testing.T) {
 		rr.stagesByRunID[runID] = []*run.Stage{ps}
 		sv := "standard_v1"
 		if _, err := art.Create(context.Background(), artifact.CreateParams{
-			StageID: psID, Kind: artifact.KindPlan, SchemaVersion: &sv, Content: liveValPlanBytes(t, true),
+			StageID: psID, Kind: artifact.KindPlan, SchemaVersion: &sv, Content: liveValPlanBytes(t, true, false),
 		}); err != nil {
 			t.Fatalf("seed plan artifact: %v", err)
 		}
@@ -1624,5 +1681,244 @@ func TestFileOrLinkLiveValidationWalk_RollingTwoRunsOneWalk(t *testing.T) {
 	}
 	if got := strings.Count(si.body, "Verify: trigger a real push and observe the webhook delivery"); got != 2 {
 		t.Errorf("verify-line count = %d, want 2 (one Verify continuation per run section)", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Effective-criteria fold (#3554): the approval's amend_acceptance_criteria
+// reaches the walk a human acts on. Every assertion reads SHIPPED OUTPUT — the
+// body the provider was handed (file-new arms) or the body PATCHed onto the
+// rolling walk (append arm) — never an internal struct.
+// ---------------------------------------------------------------------------
+
+// liveValFiledBody returns the body of the single work item the provider filed.
+func liveValFiledBody(t *testing.T, h *liveValHarness) string {
+	t.Helper()
+	if len(h.provider.reqs) != 1 {
+		t.Fatalf("provider filed %d items, want exactly 1", len(h.provider.reqs))
+	}
+	return h.provider.reqs[0].Item.Body
+}
+
+// TestFileOrLinkLiveValidationWalk_RestateReachesWalkSection: an approval that
+// RESTATES a requires_live_validation criterion files a walk carrying the
+// RESTATED statement — not the plan artifact's original (the #3554 defect) —
+// annotated with the audit sequence of the approval that amended it.
+func TestFileOrLinkLiveValidationWalk_RestateReachesWalkSection(t *testing.T) {
+	inst := int64(77)
+	h := newLiveValHarness(t, liveValConfig{marked: true, installID: &inst, amendments: []acceptanceCriteriaAmendment{
+		{ID: "ac1", Action: "restate", Reason: "narrowed at the gate",
+			Statement: "a PROD org delivery is observed end to end"},
+	}})
+	h.s.fileOrLinkLiveValidationWalk(context.Background(), h.planStage)
+
+	body := liveValFiledBody(t, h)
+	if !strings.Contains(body, "- [ ] `ac1` — a PROD org delivery is observed end to end") {
+		t.Errorf("walk body missing the RESTATED statement:\n%s", body)
+	}
+	if strings.Contains(body, "the webhook fires on a real push") {
+		t.Errorf("walk body still renders the plan artifact's PRE-restatement text (#3554):\n%s", body)
+	}
+	if !strings.Contains(body, "  Restated by operator approval (audit sequence 96873).\n") {
+		t.Errorf("walk body does not name the amending approval's audit sequence:\n%s", body)
+	}
+	linked, ok := h.newestLinked(t)
+	if !ok || linked.PendingCriteriaCount != 1 {
+		t.Errorf("linked marker = %+v, want one pending criterion (a restate never retires)", linked)
+	}
+}
+
+// TestFileOrLinkLiveValidationWalk_RetireOmitsCheckbox (operator binding
+// condition 2): an approval that RETIRES a marked criterion files a walk with NO
+// tickable checkbox for it, a struck "Retired at approval:" provenance line
+// naming its id, reason and the amending audit sequence, and a linked marker
+// whose pending count / criterion ids EXCLUDE it — which is what stops run-status
+// and gate_view counting a retired criterion as pending.
+func TestFileOrLinkLiveValidationWalk_RetireOmitsCheckbox(t *testing.T) {
+	inst := int64(77)
+	h := newLiveValHarness(t, liveValConfig{marked: true, secondMarked: true, installID: &inst,
+		amendments: []acceptanceCriteriaAmendment{
+			{ID: "ac1", Action: "retire", Reason: "covered by the fake-forge integration test"},
+		}})
+	h.s.fileOrLinkLiveValidationWalk(context.Background(), h.planStage)
+
+	body := liveValFiledBody(t, h)
+	if strings.Contains(body, "- [ ] `ac1`") {
+		t.Errorf("walk body still carries a tickable checkbox for the RETIRED criterion:\n%s", body)
+	}
+	if !strings.Contains(body, "- [ ] `ac3` — the retry backs off against a real 429") {
+		t.Errorf("walk body dropped the surviving live criterion:\n%s", body)
+	}
+	if !strings.Contains(body, "\nRetired at approval:\n\n") {
+		t.Errorf("walk body missing the 'Retired at approval:' label:\n%s", body)
+	}
+	const wantStruck = "- ~~`ac1` — the webhook fires on a real push~~ — retired by operator approval " +
+		"(audit sequence 96873): covered by the fake-forge integration test\n"
+	if !strings.Contains(body, wantStruck) {
+		t.Errorf("walk body missing the struck retired line %q:\n%s", wantStruck, body)
+	}
+
+	linked, ok := h.newestLinked(t)
+	if !ok {
+		t.Fatalf("no linked marker written")
+	}
+	if linked.PendingCriteriaCount != 1 {
+		t.Errorf("linked PendingCriteriaCount = %d, want 1 (the retired criterion is not pending)", linked.PendingCriteriaCount)
+	}
+	if !reflect.DeepEqual(linked.CriterionIDs, []string{"ac3"}) {
+		t.Errorf("linked CriterionIDs = %v, want [ac3] (the retired id excluded)", linked.CriterionIDs)
+	}
+}
+
+// TestFileOrLinkLiveValidationWalk_RestateAndRetireOneApproval is the issue's
+// exact Done-means shape: ONE approval carrying one restate and one retire,
+// asserted on ONE rendered walk body.
+func TestFileOrLinkLiveValidationWalk_RestateAndRetireOneApproval(t *testing.T) {
+	inst := int64(77)
+	h := newLiveValHarness(t, liveValConfig{marked: true, secondMarked: true, installID: &inst,
+		amendments: []acceptanceCriteriaAmendment{
+			{ID: "ac1", Action: "restate", Reason: "narrowed at the gate",
+				Statement: "a PROD org delivery is observed end to end"},
+			{ID: "ac3", Action: "retire", Reason: "the 429 path has no live target yet"},
+		}})
+	h.s.fileOrLinkLiveValidationWalk(context.Background(), h.planStage)
+
+	body := liveValFiledBody(t, h)
+	if !strings.Contains(body, "- [ ] `ac1` — a PROD org delivery is observed end to end") {
+		t.Errorf("restated criterion not rendered in its restated form:\n%s", body)
+	}
+	if strings.Contains(body, "- [ ] `ac3`") {
+		t.Errorf("retired criterion still renders a tickable checkbox:\n%s", body)
+	}
+	const wantStruck = "- ~~`ac3` — the retry backs off against a real 429~~ — retired by operator approval " +
+		"(audit sequence 96873): the 429 path has no live target yet\n"
+	if !strings.Contains(body, wantStruck) {
+		t.Errorf("walk body missing the struck retired line %q:\n%s", wantStruck, body)
+	}
+	linked, _ := h.newestLinked(t)
+	if linked.PendingCriteriaCount != 1 || !reflect.DeepEqual(linked.CriterionIDs, []string{"ac1"}) {
+		t.Errorf("linked = %+v, want one pending criterion [ac1]", linked)
+	}
+}
+
+// TestFileOrLinkLiveValidationWalk_AllMarkedCriteriaRetired_NoWalk (operator
+// binding condition 1, ENDORSED): an approval that retires EVERY
+// requires_live_validation criterion files NO walk at all — a checklist whose
+// every item is struck has nothing for an operator to do. Zero File calls, zero
+// intent markers, zero linked markers.
+func TestFileOrLinkLiveValidationWalk_AllMarkedCriteriaRetired_NoWalk(t *testing.T) {
+	inst := int64(77)
+	h := newLiveValHarness(t, liveValConfig{marked: true, installID: &inst,
+		amendments: []acceptanceCriteriaAmendment{
+			{ID: "ac1", Action: "retire", Reason: "no live target exists for this run"},
+		}})
+	h.s.fileOrLinkLiveValidationWalk(context.Background(), h.planStage)
+
+	if h.provider.calls != 0 {
+		t.Errorf("provider File called %d times, want 0 (every marked criterion retired)", h.provider.calls)
+	}
+	if got := h.markerCount(liveValidationWalkIntentKind); got != 0 {
+		t.Errorf("intent markers = %d, want 0", got)
+	}
+	if got := h.markerCount(liveValidationWalkLinkedKind); got != 0 {
+		t.Errorf("linked markers = %d, want 0", got)
+	}
+	if surface := h.s.liveValidationForRun(context.Background(), h.runID); surface != nil {
+		t.Errorf("surface = %+v, want nil (no walk, nothing pending)", surface)
+	}
+}
+
+// TestFileOrLinkLiveValidationWalk_RollingAppendCarriesEffectiveCriteria: the
+// same fold on the rolling APPEND arm, asserted on the body PATCHed onto the
+// existing walk (no File call at all on this path).
+func TestFileOrLinkLiveValidationWalk_RollingAppendCarriesEffectiveCriteria(t *testing.T) {
+	cand := liveValRollingCandidate(5001, "OPEN", liveValRollingKeyOR())
+	h, store := liveValRollingHarness(t, append(numberedEpicChildren("48", 3), cand), func(c *liveValConfig) {
+		c.secondMarked = true
+		c.amendments = []acceptanceCriteriaAmendment{
+			{ID: "ac1", Action: "restate", Reason: "narrowed at the gate",
+				Statement: "a PROD org delivery is observed end to end"},
+			{ID: "ac3", Action: "retire", Reason: "the 429 path has no live target yet"},
+		}
+	})
+	store.seed(5001, cand.Body, "open")
+	h.s.fileOrLinkLiveValidationWalk(context.Background(), h.planStage)
+
+	if h.provider.calls != 0 {
+		t.Fatalf("File called %d, want 0 on the append path", h.provider.calls)
+	}
+	si, ok := store.get(5001)
+	if !ok {
+		t.Fatalf("walk #5001 missing from the store")
+	}
+	if !strings.Contains(si.body, "- [ ] `ac1` — a PROD org delivery is observed end to end") {
+		t.Errorf("appended section missing the RESTATED statement:\n%s", si.body)
+	}
+	if strings.Contains(si.body, "- [ ] `ac3`") {
+		t.Errorf("appended section still carries a checkbox for the retired criterion:\n%s", si.body)
+	}
+	if !strings.Contains(si.body, "  Restated by operator approval (audit sequence 96873).\n") {
+		t.Errorf("appended section does not name the amending approval:\n%s", si.body)
+	}
+	if !strings.Contains(si.body, "- ~~`ac3` — the retry backs off against a real 429~~ — retired by operator approval (audit sequence 96873): the 429 path has no live target yet\n") {
+		t.Errorf("appended section missing the struck retired line:\n%s", si.body)
+	}
+	linked, _ := h.newestLinked(t)
+	if linked.PendingCriteriaCount != 1 || !reflect.DeepEqual(linked.CriterionIDs, []string{"ac1"}) {
+		t.Errorf("linked = %+v, want one pending criterion [ac1]", linked)
+	}
+}
+
+// TestFileOrLinkLiveValidationWalk_AmendmentResolveErrorRendersPlanCriteria: the
+// approval_submitted read fails, so resolveEffectiveAcceptanceCriteria errors.
+// The documented fail direction is toward MORE validation — the walk STILL files,
+// rendering the plan's FULL live-validation set with no retired/restated
+// annotation. Never a dropped walk, never a silently narrowed checklist.
+func TestFileOrLinkLiveValidationWalk_AmendmentResolveErrorRendersPlanCriteria(t *testing.T) {
+	inst := int64(77)
+	h := newLiveValHarness(t, liveValConfig{marked: true, secondMarked: true, installID: &inst,
+		amendResolveErr: true,
+		amendments: []acceptanceCriteriaAmendment{
+			{ID: "ac1", Action: "retire", Reason: "covered by the fake-forge integration test"},
+		}})
+	h.s.fileOrLinkLiveValidationWalk(context.Background(), h.planStage)
+
+	if h.provider.calls != 1 {
+		t.Fatalf("provider File called %d times, want 1 (a resolve error must never drop the walk)", h.provider.calls)
+	}
+	body := liveValFiledBody(t, h)
+	if !strings.Contains(body, "- [ ] `ac1` — the webhook fires on a real push") {
+		t.Errorf("fallback body dropped a plan criterion the resolve error left unresolvable:\n%s", body)
+	}
+	if !strings.Contains(body, "- [ ] `ac3` — the retry backs off against a real 429") {
+		t.Errorf("fallback body dropped the second plan criterion:\n%s", body)
+	}
+	if strings.Contains(body, "Retired at approval:") {
+		t.Errorf("fallback body annotated retirements it could not read:\n%s", body)
+	}
+	linked, ok := h.newestLinked(t)
+	if !ok || linked.PendingCriteriaCount != 2 {
+		t.Errorf("linked = %+v, want both plan criteria pending on the fallback", linked)
+	}
+}
+
+// TestFileOrLinkLiveValidationWalk_UnamendedBodyByteIdentical pins the
+// no-amendment path: a run with no recorded amendment renders a body BYTE-
+// identical to the pre-#3554 companion render — no "Restated by" line, no
+// "Retired at approval:" label, not one extra newline.
+func TestFileOrLinkLiveValidationWalk_UnamendedBodyByteIdentical(t *testing.T) {
+	inst := int64(77)
+	h := newLiveValHarness(t, liveValConfig{marked: true, installID: &inst})
+	h.s.fileOrLinkLiveValidationWalk(context.Background(), h.planStage)
+
+	const want = "## Summary\n\nThis run's approved plan carries acceptance criteria whose true verification " +
+		"needs a live forge/deploy/external target the default-deny acceptance sandbox cannot reach " +
+		"(`requires_live_validation`). The acceptance stage short-circuits them; this walk tracks the " +
+		"operator live check so nothing ships silently unvalidated (#2045).\n\n" +
+		"Companion to #2045.\n\n" +
+		"## Done-means\n\nEach criterion below has been live-validated by the operator against the real target:\n\n" +
+		"- [ ] `ac1` — the webhook fires on a real push\n"
+	if got := liveValFiledBody(t, h); got != want {
+		t.Errorf("unamended body drifted from the pre-#3554 render.\n got: %q\nwant: %q", got, want)
 	}
 }
