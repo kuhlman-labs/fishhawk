@@ -1,14 +1,14 @@
 id: scenario:issue-3660/campaign-state-filter-accepts-awaiting-human
 statement: GET /v0/campaigns with the query parameter state=awaiting_human returns HTTP 200 with an items array (an empty array is a pass — the criterion is that the value is admitted), where before this change the same request returned 400 with code validation_failed and a message naming the closed state set.
 verify_hint: 'HTTP: GET /v0/campaigns?state=awaiting_human returns 200 and a JSON body carrying an `items` array; the same route with ?state=nonsense still returns 400 validation_failed.'
-steps: GET http://localhost:8090/v0/campaigns?state=awaiting_human; GET http://localhost:8090/v0/campaigns?state=nonsense (control).
+steps: GET http://localhost:8090/v0/campaigns?state=awaiting_human; GET http://localhost:8090/v0/campaigns?state=nonsense (control); GET ?state=running (sanity).
 assertions:
-    expected: awaiting_human -> 200 with an items array (empty is fine); nonsense -> still 400 validation_failed.
-    observed_at_record: state=awaiting_human -> 200 {"items":[],"next_cursor":""}. state=nonsense -> 400 {"error":{"code":"validation_failed","message":"state must be one of pending, running, paused, awaiting_human, succeeded, failed, cancelled","details":{"field":"state","got":"nonsense"}}}.
-    repro_handle: curl -s 'http://localhost:8090/v0/campaigns?state=awaiting_human'
+    expected: awaiting_human -> 200 with an items array (empty is fine); nonsense still -> 400 validation_failed.
+    observed_at_record: awaiting_human -> 200 {"items":[],"next_cursor":""}. nonsense -> 400 validation_failed, 'state must be one of pending, running, paused, awaiting_human, succeeded, failed, cancelled' (details.field state). running -> 200.
+    repro_handle: curl -s -w '%{http_code}' 'http://localhost:8090/v0/campaigns?state=awaiting_human'
 origin:
     issue: 3660
     pr: 3786
     run_id: 4d92911f-276d-421f-86e1-d057029921b3
-    head_sha: 5573aceab7743eee0f57889e298a43ad82c321c6
-    recorded_at: 2026-09-27T16:23:43Z
+    head_sha: 2ea9a2670fa1a93ef5bc7afbb47744443e0a75f7
+    recorded_at: 2026-09-27T17:18:49Z
