@@ -20,6 +20,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -5256,12 +5257,19 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 			break
 		}
 
+		// The iteration's CHANGE IDENTITY (#3665), computed ONCE here against
+		// the throwaway commit's own parent and stamped onto BOTH verify_run
+		// events this iteration appends: the (c) scoped run and the (c2) full
+		// re-verify gate the SAME commit, so they share one id. Best-effort —
+		// an empty id leaves each payload byte-identical.
+		changeID := gitPatchIDForCommit(ctx, repoDir, headSHA)
+
 		// (c) Verify against the committed tree. With a scope set in force this
 		// is the SCOPED form — a fast pre-pass over the touched packages, NOT
 		// the authority.
 		form = verifyFormName(scopePkgs)
 		ev, out, outcome, disp := runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, timeout, scopePkgs)
-		res.Events = append(res.Events, ev)
+		res.Events = append(res.Events, stampVerifyRunChangeID(ev, changeID))
 		attempts++
 		lastOutput = out
 		logVerifyFormOutcome(logSink, *cfg, iter+1, form, outcome)
@@ -5291,7 +5299,7 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 		if len(scopePkgs) > 0 && outcome == "passed" {
 			form = verifyFormFull
 			fev, fout, foutcome, fdisp := runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, timeout, nil)
-			res.Events = append(res.Events, fev)
+			res.Events = append(res.Events, stampVerifyRunChangeID(fev, changeID))
 			out, outcome, disp = fout, foutcome, fdisp
 			lastOutput = fout
 			logVerifyFormOutcome(logSink, *cfg, iter+1, form, outcome)
@@ -5814,11 +5822,18 @@ func runVerifyGateCommitted(ctx context.Context, cfg config, logSink io.Writer) 
 		return []agent.Event{verifyRunEvent(cfg.verifyCmd, "", "", -1, "rev_parse: "+err.Error(), "skipped")}, "", nil
 	}
 
+	// The gate's CHANGE IDENTITY (#3665), computed against the throwaway
+	// commit's own parent and stamped onto every verify_run event this gate
+	// appends (the run below plus any infra-flake absorb re-run, which gates the
+	// SAME commit). Best-effort — an empty id leaves each payload
+	// byte-identical, which the backend reads as undecidable.
+	changeID := gitPatchIDForCommit(ctx, repoDir, headSHA)
+
 	// (d) Verify against the committed scope-only tree.
 	// nil scope set = the FULL verify form (#3315). runVerifyGateCommitted is
 	// the single-shot authoritative gate; it is never narrowed.
 	ev, out, outcome, disp := runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, timeout, nil)
-	events := []agent.Event{ev}
+	events := []agent.Event{stampVerifyRunChangeID(ev, changeID)}
 
 	// Infrastructure-failure absorb (#972, widened by #2645): a failed verify
 	// whose output carries a diff-independent infra signature
@@ -5859,7 +5874,7 @@ func runVerifyGateCommitted(ctx context.Context, cfg config, logSink io.Writer) 
 			}),
 		})
 		ev, out, outcome, disp = runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, timeout, nil)
-		events = append(events, ev)
+		events = append(events, stampVerifyRunChangeID(ev, changeID))
 		// The re-run's own disposition decides (f): a host that went away
 		// between the two runs is classified as unavailable, not as a red
 		// tree, and an absorb re-run that itself timed out is a timed-out
@@ -7010,6 +7025,106 @@ func gitRevParseTreeOf(ctx context.Context, repoDir, rev string) (string, error)
 		return "", fmt.Errorf("verify-gate: rev-parse %s^{tree}: %w", rev, err)
 	}
 	return strings.TrimSpace(string(out)), nil
+}
+
+// gitPatchIDBinary is the git executable gitPatchIDForCommit invokes. It is a
+// package var SOLELY so a test can substitute a failing command and prove the
+// helper degrades to "" through the real call path (the same seam rationale as
+// gitDiffTreeBinary). Production always leaves it "git".
+var gitPatchIDBinary = "git"
+
+// gitPatchIDForCommit returns the CHANGE IDENTITY of commit: a
+// `git patch-id --stable` sum over the diff that commit introduces against its
+// OWN PARENT (#3665). It is the ship-vs-review comparison key that replaced the
+// whole-tree comparison, because a routine commit-time base advance re-stages
+// the SAME change onto a different tree: patch-id ignores line numbers, so an
+// identical change re-applied at a shifted offset yields an IDENTICAL id, while
+// a genuinely different change (one more file, different content) yields a
+// different one.
+//
+// The commit's own PARENT is the base on both producer sites, deliberately —
+// NOT the recorded base_sha. It is the only symmetric choice across a fresh
+// implement pass (parent == recorded base), a FreshFetchBase restage (parent ==
+// the re-fetched base) and a fix-up (parent == the run's own previous push);
+// base_sha means something different on the RebaseFromRemote path and would
+// make every fix-up ship report a different change.
+//
+// --stable is required: patch-id's default algorithm is sensitive to the order
+// git happens to emit per-file diffs, so two sites enumerating the same change
+// could otherwise disagree.
+//
+// BEST-EFFORT, NEVER-ERRORING: a root/parentless commit, an unknown commit, a
+// non-zero git exit, an empty diff, or an unparseable line all return "". The
+// backend reads "" as UNDECIDABLE and records nothing, so a degrade here costs
+// the detector for that ship and never manufactures a verdict.
+func gitPatchIDForCommit(ctx context.Context, repoDir, commit string) string {
+	if strings.TrimSpace(commit) == "" {
+		return ""
+	}
+	parentOut, err := exec.CommandContext(ctx, gitPatchIDBinary, "-C", repoDir, "rev-parse", "--verify", commit+"^").Output()
+	if err != nil {
+		// Root/parentless commit, or an unknown rev — no base to diff against.
+		return ""
+	}
+	parent := strings.TrimSpace(string(parentOut))
+	if parent == "" {
+		return ""
+	}
+
+	// BUFFER the diff and feed patch-id from memory rather than coupling the two
+	// children with an io.Pipe. The pipe form DEADLOCKS: neither an *io.PipeReader
+	// on Stdin nor an *io.PipeWriter on Stdout is an *os.File, so os/exec copies
+	// each through its own goroutine and Wait blocks until that copy finishes. If
+	// `git patch-id` exits before reading its whole stdin (killed, or erroring
+	// early), its stdin-copy goroutine stops draining the pipe, diff-tree's
+	// stdout-copy goroutine then blocks forever in Write, and diffTree.Run() never
+	// returns — not even on ctx cancellation, because WaitDelay is unset. That
+	// hung the runner at PR-ship time. Buffering is affordable: an implement diff
+	// is bounded by the stage's max_files_changed cap.
+	diffTree := exec.CommandContext(ctx, gitPatchIDBinary, "-C", repoDir,
+		"diff-tree", "-p", "--no-color", "--find-renames", "--full-index", parent, commit)
+	diff, err := diffTree.Output()
+	if err != nil {
+		return ""
+	}
+	patchID := exec.CommandContext(ctx, gitPatchIDBinary, "patch-id", "--stable")
+	patchID.Stdin = bytes.NewReader(diff)
+	idOut, err := patchID.Output()
+	if err != nil {
+		return ""
+	}
+	// `patch-id` prints "<patch-id> <commit-id>"; an empty diff prints nothing.
+	fields := strings.Fields(string(idOut))
+	if len(fields) == 0 {
+		return ""
+	}
+	return fields[0]
+}
+
+// stampVerifyRunChangeID returns ev with change_id set on its verify_run
+// payload (#3665). It is a POST-HOC stamper rather than a new verifyRunEvent
+// parameter so that helper's many call sites stay untouched.
+//
+// An EMPTY changeID is a no-op that returns ev unchanged, so every degrade path
+// keeps a BYTE-IDENTICAL payload (an absent key, which the backend decodes as
+// undecidable). A payload that cannot be decoded or re-marshalled is likewise
+// returned unchanged — stamping an identity is never worth corrupting the
+// event that carries the gate verdict.
+func stampVerifyRunChangeID(ev agent.Event, changeID string) agent.Event {
+	if changeID == "" || len(ev.Payload) == 0 {
+		return ev
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(ev.Payload, &fields); err != nil || fields == nil {
+		return ev
+	}
+	fields["change_id"] = changeID
+	raw, err := json.Marshal(fields)
+	if err != nil {
+		return ev
+	}
+	ev.Payload = raw
+	return ev
 }
 
 // gitDiffTreeBinary is the git executable the tree-delta forensic helper
@@ -10074,18 +10189,32 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 	if prBodyFallbackReason != prBodyReasonNone {
 		artifactFields["pr_body_fallback_reason"] = string(prBodyFallbackReason)
 	}
-	// #3655: ship the gate-certified tree on the SUCCESS report so the backend
-	// can compare it against the tree the implement-review round judged (the
-	// bundle's terminal verify_run tree_sha) and record review_head_mismatch
-	// when a base-rebase re-invoke shipped a tree no reviewer saw. This is the
-	// SAME producer as the review side (the committed-tree verify gate), so a
-	// normal ship compares byte-equal even though the pushed commit SHA differs
+	// #3655: ship the gate-certified tree on the SUCCESS report. The backend
+	// RETAINS it as a human coordinate on a review_head_mismatch row; since
+	// #3665 the row's fire condition is verified_change_id below, not this tree
+	// (a routine base advance changes the tree without superseding any reviewed
+	// change). It is the SAME producer as the review side (the committed-tree
+	// verify gate), so a normal ship compares byte-equal even though the pushed commit SHA differs
 	// from the throwaway WIP SHA. On the #969 reverify-pass path the pre-push
 	// hook rebound verifiedTreeSHA to the re-verified pushed tree, so this is
 	// always the tree the push carries. Gated on non-empty: a no-verify stage
 	// omits the key entirely, keeping its artifact bytes byte-identical.
 	if verifiedTreeSHA != "" {
 		artifactFields["verified_tree_sha"] = verifiedTreeSHA
+	}
+	// #3665: ship the PUSHED COMMIT'S CHANGE IDENTITY — a `git patch-id
+	// --stable` over the diff cap.HeadSHA introduces against its OWN parent.
+	// This, not verified_tree_sha, is what the backend now compares against the
+	// change the implement-review round judged: a routine commit-time base
+	// advance re-stages the SAME change onto a different tree, so the trees
+	// differ while the change ids match and no row is recorded. It is always the
+	// REAL pushed commit's id, including on the #969 reverify-pass path, so this
+	// side needs none of verified_tree_sha's rebind bookkeeping. Gated on
+	// non-empty, mirroring verified_tree_sha: a stage that cannot produce one
+	// (root commit, git degrade) omits the key entirely, keeping that artifact's
+	// bytes, content hash and idempotency key byte-identical.
+	if changeID := gitPatchIDForCommit(ctx, repoDir, cap.HeadSHA); changeID != "" {
+		artifactFields["verified_change_id"] = changeID
 	}
 	// Base-rebase re-invoke exemption delta (#1218): include the supplemental set
 	// ONLY when the re-invoke produced one, so every non-re-invoke ship omits the

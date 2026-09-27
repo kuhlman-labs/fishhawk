@@ -591,14 +591,17 @@ func (s *Server) advanceStageAfterTrace(r *http.Request, runID, stageID uuid.UUI
 				}
 				headSHA = ""
 			}
-			// The round's reviewed-tree identity (#3655): the authoritative
-			// (LAST) verify_run tree_sha, recorded on implement_review_started
-			// so the success PR ship can compare it against the tree it
-			// pushed. Fail-open exactly like head_sha: ErrNoVerifyTreeSHA (no
-			// gate ran, older runner) stays silent, any other error WARN-logs,
-			// and both degrade to "" — an unreadable tree never suppresses the
-			// review dispatch, it only disables the mismatch check for the round.
-			treeSHA, tserr := bundle.ExtractVerifyTreeSHA(bundleBytes)
+			// The round's reviewed identity (#3655, #3665): the authoritative
+			// (LAST) verify_run's tree_sha AND its change_id, read as ONE pair
+			// from that same event so they can never describe two different
+			// gated commits, and recorded on implement_review_started so the
+			// success PR ship can compare the CHANGE it pushed against the
+			// change this round judged. Fail-open exactly like head_sha:
+			// ErrNoVerifyTreeSHA (no gate ran, older runner) stays silent, any
+			// other error WARN-logs, and both degrade BOTH values to "" — an
+			// unreadable identity never suppresses the review dispatch, it only
+			// disables the mismatch check for the round.
+			treeSHA, changeID, tserr := bundle.ExtractVerifyIdentity(bundleBytes)
 			if tserr != nil {
 				if !errors.Is(tserr, bundle.ErrNoVerifyTreeSHA) {
 					s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
@@ -609,6 +612,7 @@ func (s *Server) advanceStageAfterTrace(r *http.Request, runID, stageID uuid.UUI
 					)
 				}
 				treeSHA = ""
+				changeID = ""
 			}
 			// Extract the runner's digested gate results (#963) so the
 			// reviewer sees machine-verified build/test/scope truth with
@@ -629,7 +633,7 @@ func (s *Server) advanceStageAfterTrace(r *http.Request, runID, stageID uuid.UUI
 					slog.String("error", geerr.Error()),
 				)
 			}
-			if s.runImplementReviewsForTree(r.Context(), runID, stageID, diff, scopeDrift, headSHA, treeSHA, gateEvidence) {
+			if s.runImplementReviewsForTree(r.Context(), runID, stageID, diff, scopeDrift, headSHA, treeSHA, changeID, gateEvidence) {
 				cat := run.FailureB
 				reason := implementReviewGatingRejectReason
 				if _, ferr := run.FailStage(r.Context(), s.cfg.RunRepo, stageID, cat, reason); ferr != nil {
@@ -3923,18 +3927,20 @@ var reviewDispatchMu sync.Mutex
 // Per-invocation errors are WARN-logged and skipped so a transient
 // reviewer failure doesn't block the stage — the diff is already stored.
 func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UUID, diff policy.Diff, scopeDrift []string, headSHA string, gateEvidence *prompt.GateEvidence) bool {
-	return s.runImplementReviewsForTree(ctx, runID, stageID, diff, scopeDrift, headSHA, "", gateEvidence)
+	return s.runImplementReviewsForTree(ctx, runID, stageID, diff, scopeDrift, headSHA, "", "", gateEvidence)
 }
 
-// runImplementReviewsForTree is runImplementReviews plus the round's
-// reviewed-tree identity (#3655): treeSHA is the bundle's authoritative
-// verify_run tree_sha (bundle.ExtractVerifyTreeSHA), stamped onto the
+// runImplementReviewsForTree is runImplementReviews plus the round's reviewed
+// identity (#3655, #3665): treeSHA and changeID are the tree_sha and change_id
+// of the bundle's authoritative verify_run, read as ONE pair from that same
+// event (bundle.ExtractVerifyIdentity) and stamped onto the
 // implement_review_started payload so the success PR ship can detect a round
-// that judged a tree the PR does not carry (review_head_mismatch). Only the
-// trace-time bundle path knows that tree; every other caller goes through
-// runImplementReviews and records none, which the ship-side check treats as
+// that judged a CHANGE the PR does not carry (review_head_mismatch). changeID
+// is the comparison key; treeSHA rides along as a human coordinate. Only the
+// trace-time bundle path knows them; every other caller goes through
+// runImplementReviews and records neither, which the ship-side check treats as
 // undecidable (fail-closed to silence).
-func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID uuid.UUID, diff policy.Diff, scopeDrift []string, headSHA, treeSHA string, gateEvidence *prompt.GateEvidence) bool {
+func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID uuid.UUID, diff policy.Diff, scopeDrift []string, headSHA, treeSHA, changeID string, gateEvidence *prompt.GateEvidence) bool {
 	// #3400: decide whether this round's gate evidence came from an uploaded
 	// bundle at ENTRY, before any of the allocate-if-nil blocks below
 	// (operator-scope-undelivered, per-slice verify, obligations) can conjure a
@@ -4680,7 +4686,7 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 	// discarded. roundSeq is 0 when the emit failed (ok=false); the loop then
 	// records no round key and marks nothing, and the relay falls back to its
 	// legacy below-the-verdict derivation for those rows.
-	roundSeq, _ := s.emitReviewStarted(ctx, runID, stageID, "implement_review_started", authority, reviewersCfg.AgentCount(), headSHA, treeSHA)
+	roundSeq, _ := s.emitReviewStarted(ctx, runID, stageID, "implement_review_started", authority, reviewersCfg.AgentCount(), headSHA, treeSHA, changeID)
 	reviewDispatchMu.Unlock()
 
 	// invocations were resolved above (before the prompt build) so the grounding

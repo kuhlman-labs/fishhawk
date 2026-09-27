@@ -203,6 +203,17 @@ type pullRequestBody struct {
 	VerifiedTreeSHA string   `json:"verified_tree_sha,omitempty"`
 	MissingPaths    []string `json:"missing_paths,omitempty"`
 
+	// VerifiedChangeID is the SUCCESS variant's PUSHED-CHANGE identity (#3665):
+	// the `git patch-id --stable` sum over the diff the pushed commit introduces
+	// against its OWN parent, computed by the runner's openPRAndShipArtifact.
+	// recordReviewHeadMismatch compares it against the change the
+	// implement-review round judged — replacing the #3655 whole-TREE comparison,
+	// which false-positived on every routine commit-time base advance (the same
+	// change re-staged onto a different tree). The runner omits the key on every
+	// other variant and whenever it cannot produce an id, so those bodies stay
+	// byte-identical and an absent value is read as undecidable (no row).
+	VerifiedChangeID string `json:"verified_change_id,omitempty"`
+
 	// UnsatisfiedAssertions is the SECOND scope_park shortfall class (#2501):
 	// the operator-declared binding assertions (#1171) the held commit did not
 	// satisfy. Exactly one of MissingPaths / UnsatisfiedAssertions is present on
@@ -830,13 +841,14 @@ func (s *Server) handleShipPullRequest(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Stale-review detection (#3655). A base-rebase re-invoke seals and ships
-	// its trace bundle BEFORE the agent is re-invoked (#742 forward gating), so
-	// the implement-review round dispatched from that bundle may have judged a
-	// tree this PR does not carry. Compare the round's recorded tree against
-	// the gate-certified tree the runner pushed and record review_head_mismatch
-	// when they differ. Best-effort and non-gating: it only appends an audit
-	// row, never alters the response or the stage transition below.
+	// Stale-review detection (#3655, comparison rewritten by #3665). A
+	// base-rebase re-invoke seals and ships its trace bundle BEFORE the agent is
+	// re-invoked (#742 forward gating), so the implement-review round dispatched
+	// from that bundle may have judged a CHANGE this PR does not carry. Compare
+	// the round's recorded change identity against the one the runner pushed and
+	// record review_head_mismatch when they differ. Best-effort and non-gating:
+	// it only appends an audit row, never alters the response or the stage
+	// transition below.
 	if stage.Type == run.StageTypeImplement {
 		s.recordReviewHeadMismatch(r.Context(), runID, stageID, &pr)
 	}
@@ -2164,16 +2176,18 @@ func (s *Server) recordAcceptanceScenarioRetirementDropped(w http.ResponseWriter
 }
 
 // CategoryReviewHeadMismatch is the audit category recorded when the
-// implement-review round judged a tree other than the one the success PR
-// ship pushed (#3655).
+// implement-review round judged a CHANGE other than the one the success PR
+// ship pushed (#3655; change-identity comparison since #3665).
 const CategoryReviewHeadMismatch = "review_head_mismatch"
 
 // reviewHeadMismatchPayload is the review_head_mismatch audit payload
-// (#3655). The two trees are the machine-decidable evidence; the two head
-// SHAs are human-correlatable coordinates (reviewed_head_sha is the throwaway
-// WIP commit the runner soft-reset away, so it never equals pushed_head_sha
-// and is NOT itself evidence of staleness). ReviewRoundSequence is the audit
-// sequence of the implement_review_started row judged stale — the #3593
+// (#3655, decision rewritten by #3665). The two CHANGE IDS are the
+// machine-decidable evidence; the two trees and the two head SHAs are
+// human-correlatable coordinates (reviewed_head_sha is the throwaway WIP commit
+// the runner soft-reset away, so it never equals pushed_head_sha, and the trees
+// legitimately differ on any base advance — neither is itself evidence of
+// staleness any more). ReviewRoundSequence is the audit sequence of the
+// implement_review_started row judged stale — the #3593
 // recorded-round-identity convention.
 type reviewHeadMismatchPayload struct {
 	RunID               string `json:"run_id"`
@@ -2183,28 +2197,49 @@ type reviewHeadMismatchPayload struct {
 	ReviewRoundSequence int64  `json:"review_round_sequence"`
 	ReviewedHeadSHA     string `json:"reviewed_head_sha"`
 	PushedHeadSHA       string `json:"pushed_head_sha"`
+
+	// ReviewedChangeID / PushedChangeID are the two CHANGE identities the
+	// decision now rests on (#3665): `git patch-id --stable` sums over the diff
+	// each side's commit introduces against its OWN parent. They are the
+	// machine-decidable evidence; the trees above are retained as human
+	// coordinates (and because the gate-view / run-status / next_actions
+	// distillations read them unchanged). omitempty so an already-persisted
+	// #3655 row and a re-decode of one stay structurally compatible.
+	ReviewedChangeID string `json:"reviewed_change_id,omitempty"`
+	PushedChangeID   string `json:"pushed_change_id,omitempty"`
 }
 
 // recordReviewHeadMismatch compares the newest same-stage
-// implement_review_started round's reviewed tree against the tree the runner
-// pushed (pr.VerifiedTreeSHA) and appends a review_head_mismatch row when both
-// are known and differ (#3655).
+// implement_review_started round's reviewed CHANGE against the change the
+// runner pushed (pr.VerifiedChangeID) and appends a review_head_mismatch row
+// when both are known and differ (#3655, decision rewritten by #3665).
 //
-// TREES, not commits: the round's head_sha is the throwaway committed-tree
-// WIP commit (bundle.ExtractHeadSHA) the runner soft-resets away before the
-// real push, so the pushed commit SHA differs on EVERY ship. Both trees come
-// from the same producer (the runner's committed-tree verify gate), so on a
-// normal ship they are the same object and nothing is recorded.
+// CHANGES, not trees, and not commits. The round's head_sha is the throwaway
+// committed-tree WIP commit (bundle.ExtractHeadSHA) the runner soft-resets away
+// before the real push, so the pushed commit SHA differs on EVERY ship — which
+// is why #3655 compared trees instead. But a routine commit-time base advance
+// re-stages the SAME change onto a different base, so the two trees differ on
+// every such ship while no reviewed change was actually superseded: comparing
+// trees false-positived exactly there (#3665). Both sides now carry a
+// `git patch-id --stable` sum over the diff their commit introduces against its
+// OWN parent. patch-id ignores line numbers and both sides use the commit's own
+// parent as the base, so a change re-staged onto an advanced base yields an
+// IDENTICAL id (no row) while a genuinely different re-landed change yields a
+// different one (row still fires).
 //
-// Fail-closed to silence: an empty tree on EITHER side (no-verify stage, older
-// runner, held-commit resume, legacy started row, extraction degrade) makes
-// the comparison undecidable and records nothing — a guessed row is worse than
-// none. Every other degrade (nil AuditRepo, list error, no started row,
-// undecodable newest payload, append error) WARN-logs or returns silently and
-// records nothing, mirroring reviewDiffTruncatedForRun. It DETECTS the stale
-// round; it does not supersede or re-dispatch it.
+// Fail-closed to silence, WIDENED: an empty change id on EITHER side (an older
+// runner shipping none, a no-verify stage, a held-commit resume, a legacy or
+// pre-#3665 started row, an extraction or git degrade) makes the comparison
+// undecidable and records nothing. The TREE comparison is deliberately NOT kept
+// as a fallback — keeping it would keep the reported false positive on exactly
+// the runs the issue says it fires on most, and the audit trail recording
+// nothing is better than recording something wrong. Every other degrade (nil
+// AuditRepo, list error, no started row, undecodable newest payload, append
+// error) WARN-logs or returns silently and records nothing, mirroring
+// reviewDiffTruncatedForRun. It DETECTS the stale round; it does not supersede
+// or re-dispatch it.
 func (s *Server) recordReviewHeadMismatch(ctx context.Context, runID, stageID uuid.UUID, pr *pullRequestBody) {
-	if s.cfg.AuditRepo == nil || pr.VerifiedTreeSHA == "" {
+	if s.cfg.AuditRepo == nil || pr.VerifiedChangeID == "" {
 		return
 	}
 	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, "implement_review_started")
@@ -2235,7 +2270,10 @@ func (s *Server) recordReviewHeadMismatch(ctx context.Context, runID, stageID uu
 			slog.String("error", uerr.Error()))
 		return
 	}
-	if started.TreeSHA == "" || started.TreeSHA == pr.VerifiedTreeSHA {
+	// Both change ids must be known for the comparison to be decidable, and
+	// only DIFFERING ids fire. The trees are NOT consulted: see the widened
+	// fail-closed-to-silence rule above.
+	if started.ChangeID == "" || started.ChangeID == pr.VerifiedChangeID {
 		return
 	}
 	payload, _ := json.Marshal(reviewHeadMismatchPayload{
@@ -2246,6 +2284,8 @@ func (s *Server) recordReviewHeadMismatch(ctx context.Context, runID, stageID uu
 		ReviewRoundSequence: newest.Sequence,
 		ReviewedHeadSHA:     started.HeadSHA,
 		PushedHeadSHA:       pr.HeadSHA,
+		ReviewedChangeID:    started.ChangeID,
+		PushedChangeID:      pr.VerifiedChangeID,
 	})
 	systemKind := audit.ActorKind("system")
 	if _, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{

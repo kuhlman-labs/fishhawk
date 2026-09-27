@@ -13742,6 +13742,113 @@ func startedPayloadsForStage(t *testing.T, au *auditFake, stageID uuid.UUID) []p
 	return out
 }
 
+// implementBundleWithVerifyIdentities is implementBundleWithVerifyTrees plus the
+// #3665 change_id: each run is (head_sha, tree_sha, change_id), and an empty
+// change_id OMITS the key so an older-runner bundle can be modelled exactly.
+//
+// pushAndOpenPR selects the manifest's forward gate: false gates on the shared
+// -branch child push (the review-dispatch tests), true gates on the success
+// /pull-request upload so the same bundle can be followed by a real PR ship (the
+// cross-boundary end-to-end test).
+func implementBundleWithVerifyIdentities(t *testing.T, runs [][3]string, pushAndOpenPR bool) []byte {
+	t.Helper()
+	var raw bytes.Buffer
+	write := func(seq int, kind string, data any) {
+		payload, _ := json.Marshal(data)
+		line, _ := json.Marshal(map[string]any{"seq": seq, "kind": kind, "data": json.RawMessage(payload)})
+		raw.Write(line)
+		raw.WriteByte('\n')
+	}
+	write(1, "manifest", bundle.Manifest{
+		BundleSchema:       "v1",
+		PushToSharedBranch: !pushAndOpenPR,
+		PushAndOpenPR:      pushAndOpenPR,
+	})
+	write(2, "git_diff", map[string]any{
+		"kind": "name_status", "base_ref": "origin/main", "num_files": 1,
+		"files": []map[string]string{{"path": "file0.go", "status": "modified"}},
+	})
+	for i, r := range runs {
+		fields := map[string]any{
+			"command": "scripts/test verify", "head_sha": r[0], "tree_sha": r[1], "exit_code": 0, "outcome": "passed",
+		}
+		if r[2] != "" {
+			fields["change_id"] = r[2]
+		}
+		write(3+i, "verify_run", fields)
+	}
+	var gz bytes.Buffer
+	w := gzip.NewWriter(&gz)
+	_, _ = w.Write(raw.Bytes())
+	_ = w.Close()
+	return gz.Bytes()
+}
+
+// TestShipTrace_ImplementReview_RecordsReviewedChangeID (#3665) drives the REAL
+// trace-upload path: the implement_review_started row carries the AUTHORITATIVE
+// verify_run's change_id as the round's reviewed-CHANGE identity, read from the
+// SAME event as tree_sha. The absorbed first iteration carries a DIFFERENT change
+// id, so a regression to an independent last-non-empty scan (or to the first
+// iteration) is visible here and not only in the bundle unit test.
+func TestShipTrace_ImplementReview_RecordsReviewedChangeID(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, sf, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementAdvisoryReviewers)
+	priv, _ := sf.issue(t, runRow.ID)
+	bundleBytes := implementBundleWithVerifyIdentities(t, [][3]string{
+		{"head-a", "tree-a", "change-a"},
+		{"head-b", "tree-b", "change-b"},
+	}, false)
+	if w := shipRequest(t, s, runRow.ID, implStage.ID, "raw", priv, bundleBytes, ""); w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+	s.waitBackgroundReviews()
+	started := startedPayloadsForStage(t, au, implStage.ID)
+	if len(started) != 1 {
+		t.Fatalf("implement_review_started rows = %d, want 1", len(started))
+	}
+	if started[0].ChangeID != "change-b" {
+		t.Errorf("change_id = %q, want change-b (the terminal verify_run's change, paired with its tree)", started[0].ChangeID)
+	}
+	if started[0].TreeSHA != "tree-b" {
+		t.Errorf("tree_sha = %q, want tree-b", started[0].TreeSHA)
+	}
+}
+
+// TestShipTrace_ImplementReview_NoChangeID_DispatchesWithEmptyChangeID (#3665):
+// an OLDER-RUNNER bundle carrying a tree_sha but no change_id fails OPEN — the
+// review still dispatches, the tree is still recorded, and the change id is
+// empty, which disables the ship-side mismatch check for that round rather than
+// the review.
+func TestShipTrace_ImplementReview_NoChangeID_DispatchesWithEmptyChangeID(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, sf, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementAdvisoryReviewers)
+	priv, _ := sf.issue(t, runRow.ID)
+	bundleBytes := implementBundleWithVerifyIdentities(t, [][3]string{{"head-a", "tree-a", ""}}, false)
+	if w := shipRequest(t, s, runRow.ID, implStage.ID, "raw", priv, bundleBytes, ""); w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+	s.waitBackgroundReviews()
+	started := startedPayloadsForStage(t, au, implStage.ID)
+	if len(started) != 1 {
+		t.Fatalf("implement_review_started rows = %d, want 1 (an absent change id must never suppress the review)", len(started))
+	}
+	if started[0].ChangeID != "" {
+		t.Errorf("change_id = %q, want empty for a pre-#3665 bundle", started[0].ChangeID)
+	}
+	if started[0].TreeSHA != "tree-a" {
+		t.Errorf("tree_sha = %q, want tree-a (the #3655 reader is unchanged)", started[0].TreeSHA)
+	}
+	if n := countAuditCategory(au, "implement_reviewed"); n != 1 {
+		t.Errorf("implement_reviewed rows = %d, want 1", n)
+	}
+}
+
 // TestShipTrace_ImplementReview_RecordsReviewedTreeSHA (#3655) drives the REAL
 // trace-upload path: the implement_review_started row carries the bundle's
 // AUTHORITATIVE (last non-empty) verify_run tree_sha as the round's

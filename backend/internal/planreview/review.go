@@ -497,12 +497,29 @@ type ReviewStartedPayload struct {
 	// DISTINCT from HeadSHA, which stays the #797 dedup key and is a throwaway
 	// WIP-commit SHA the runner soft-resets away — so the pushed commit SHA
 	// always differs from it, while the pushed TREE equals it on a normal ship.
-	// The success PR ship compares this against the runner-reported
-	// verified_tree_sha and records review_head_mismatch when they differ.
+	// The success PR ship RETAINS it as a human coordinate on a
+	// review_head_mismatch row; since #3665 the comparison that fires the row is
+	// ChangeID below, not this tree.
 	// omitempty keeps plan_review_started (which passes "") and every
 	// pre-change implement_review_started payload byte-identical; an old
 	// stored payload decodes "", which disables the comparison for that round.
 	TreeSHA string `json:"tree_sha,omitempty"`
+
+	// ChangeID is the round's REVIEWED-CHANGE identity (#3665): the
+	// `git patch-id --stable` sum the runner stamped on the bundle's
+	// authoritative verify_run for the gated commit whose tree TreeSHA names —
+	// i.e. the CHANGE this implement-review round judged, read from that SAME
+	// event (bundle.ExtractVerifyIdentity) so the pair can never describe two
+	// different commits. This, not TreeSHA, is what the success PR ship compares
+	// against the runner-reported verified_change_id: patch-id ignores line
+	// numbers and both sides base the diff on the commit's own parent, so a
+	// change re-staged onto an advanced base yields an IDENTICAL id (no row)
+	// while a genuinely different re-landed change yields a different one.
+	// omitempty keeps plan_review_started (which passes "") and every
+	// pre-change implement_review_started payload byte-identical; an old stored
+	// payload decodes "", which the ship-side check treats as undecidable and
+	// records nothing.
+	ChangeID string `json:"change_id,omitempty"`
 }
 
 // ReviewFailedPayload is the JSON payload stored in an audit entry with

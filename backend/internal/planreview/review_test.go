@@ -1178,6 +1178,16 @@ func TestReviewStartedPayload_TreeSHAWireShape(t *testing.T) {
 	if legacy.TreeSHA != "" || legacy.HeadSHA != "abc" {
 		t.Errorf("legacy decode = %+v, want TreeSHA empty and HeadSHA abc", legacy)
 	}
+	// #3665: a pre-change stored payload — including a #3655 one carrying a
+	// tree_sha — decodes ChangeID=="" , which the ship-side check reads as
+	// undecidable and records nothing.
+	var pre3665 planreview.ReviewStartedPayload
+	if err := json.Unmarshal([]byte(`{"configured_agents":1,"authority":"gating","head_sha":"abc","tree_sha":"t1"}`), &pre3665); err != nil {
+		t.Fatalf("decode pre-#3665 payload: %v", err)
+	}
+	if pre3665.ChangeID != "" || pre3665.TreeSHA != "t1" {
+		t.Errorf("pre-#3665 decode = %+v, want ChangeID empty and TreeSHA t1", pre3665)
+	}
 
 	cases := []struct {
 		name string
@@ -1198,6 +1208,20 @@ func TestReviewStartedPayload_TreeSHAWireShape(t *testing.T) {
 			name: "implement path with head and tree",
 			in:   planreview.ReviewStartedPayload{ConfiguredAgents: 1, Authority: planreview.AuthorityMode("gating"), HeadSHA: "h1", TreeSHA: "t1"},
 			want: `{"configured_agents":1,"authority":"gating","head_sha":"h1","tree_sha":"t1"}`,
+		},
+		{
+			// #3665: the reviewed-CHANGE identity rides alongside the tree and is
+			// the value the ship-side comparison uses.
+			name: "implement path with head, tree and change id",
+			in:   planreview.ReviewStartedPayload{ConfiguredAgents: 1, Authority: planreview.AuthorityMode("gating"), HeadSHA: "h1", TreeSHA: "t1", ChangeID: "c1"},
+			want: `{"configured_agents":1,"authority":"gating","head_sha":"h1","tree_sha":"t1","change_id":"c1"}`,
+		},
+		{
+			// A pre-#3665 runner ships a tree but no change_id; the key must be
+			// OMITTED so that payload stays byte-identical to the #3655 shape.
+			name: "tree without change id omits the key",
+			in:   planreview.ReviewStartedPayload{ConfiguredAgents: 1, Authority: planreview.AuthorityMode("gating"), TreeSHA: "t1"},
+			want: `{"configured_agents":1,"authority":"gating","tree_sha":"t1"}`,
 		},
 	}
 	for _, tc := range cases {

@@ -17002,8 +17002,9 @@ func TestOpenPRAndShipArtifact_ShipsVerifiedTreeEqualToPushedTree(t *testing.T) 
 		t.Fatal("ShipPullRequest was not called")
 	}
 	var shipped struct {
-		HeadSHA         string `json:"head_sha"`
-		VerifiedTreeSHA string `json:"verified_tree_sha"`
+		HeadSHA          string `json:"head_sha"`
+		VerifiedTreeSHA  string `json:"verified_tree_sha"`
+		VerifiedChangeID string `json:"verified_change_id"`
 	}
 	if err := json.Unmarshal(fu.gotPRArgs.Body, &shipped); err != nil {
 		t.Fatalf("decode artifact: %v\n%s", err, fu.gotPRArgs.Body)
@@ -17022,6 +17023,12 @@ func TestOpenPRAndShipArtifact_ShipsVerifiedTreeEqualToPushedTree(t *testing.T) 
 	want := strings.TrimSpace(string(pushedTree))
 	if shipped.VerifiedTreeSHA != want {
 		t.Errorf("shipped verified_tree_sha = %q, want the PUSHED commit's tree %q", shipped.VerifiedTreeSHA, want)
+	}
+	// #3665: the same ship also carries the pushed commit's CHANGE identity,
+	// which is what the backend now compares (the tree above is retained as a
+	// human coordinate).
+	if shipped.VerifiedChangeID == "" {
+		t.Errorf("shipped artifact carries no verified_change_id:\n%s", fu.gotPRArgs.Body)
 	}
 }
 
@@ -17050,6 +17057,462 @@ func TestOpenPRAndShipArtifact_EmptyVerifiedTree_OmitsKey(t *testing.T) {
 	}
 	if raw, present := m["verified_tree_sha"]; present {
 		t.Errorf("a no-verify ship must OMIT verified_tree_sha entirely, got %s", raw)
+	}
+}
+
+// --- #3665 change identity ----------------------------------------------
+
+// patchIDRepo builds a minimal real git repo with ONE base commit ("base") and
+// returns its path plus a runGit helper bound to it. Every #3665 patch-id test
+// drives real git rather than a fake, because the property under test (patch-id
+// ignores line numbers) is git's, not ours.
+func patchIDRepo(t *testing.T) (string, func(args ...string) string) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := t.TempDir()
+	runGit := func(args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", repo}, args...)...)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	runGit("init", "--initial-branch=main")
+	runGit("config", "user.name", "t")
+	runGit("config", "user.email", "t@example.com")
+	runGit("config", "commit.gpgsign", "false")
+	mustWrite(t, filepath.Join(repo, "base.txt"), "l1\nl2\nl3\n")
+	runGit("add", "-A")
+	runGit("commit", "-m", "base")
+	return repo, runGit
+}
+
+// TestGitPatchIDForCommit_SameChangeOnAdvancedBase_EqualIDs is the #3665
+// DONE-MEANS positive fixture, and the falsifiable form of the assumption the
+// whole fix rests on: the SAME change committed on two DIFFERENT bases yields
+// the SAME patch id even though the trees and the commit SHAs differ.
+//
+// The advance is deliberately made by touching an UNRELATED file and by
+// PREPENDING lines to the changed file's own context window is avoided — the
+// residual documented in backend/internal/server/README.md is precisely that a
+// base advance INSIDE a changed hunk's context does change the id.
+func TestGitPatchIDForCommit_SameChangeOnAdvancedBase_EqualIDs(t *testing.T) {
+	repo, runGit := patchIDRepo(t)
+	ctx := context.Background()
+
+	// Change C on base B1: edit base.txt's middle line.
+	mustWrite(t, filepath.Join(repo, "base.txt"), "l1\nCHANGED\nl3\n")
+	runGit("add", "-A")
+	runGit("commit", "-m", "change C on B1")
+	firstCommit := runGit("rev-parse", "HEAD")
+	firstTree := runGit("rev-parse", "HEAD^{tree}")
+	firstID := gitPatchIDForCommit(ctx, repo, firstCommit)
+	if firstID == "" {
+		t.Fatal("patch id for the first commit is empty; the fixture cannot discriminate")
+	}
+
+	// Independently advance the base: reset to B1, touch an UNRELATED file, then
+	// re-apply the IDENTICAL change C content and commit.
+	runGit("reset", "--hard", "HEAD~1")
+	mustWrite(t, filepath.Join(repo, "unrelated.txt"), "advanced\n")
+	runGit("add", "-A")
+	runGit("commit", "-m", "base advance B2")
+	mustWrite(t, filepath.Join(repo, "base.txt"), "l1\nCHANGED\nl3\n")
+	runGit("add", "-A")
+	runGit("commit", "-m", "change C re-staged on B2")
+	secondCommit := runGit("rev-parse", "HEAD")
+	secondTree := runGit("rev-parse", "HEAD^{tree}")
+	secondID := gitPatchIDForCommit(ctx, repo, secondCommit)
+
+	// Fixture preconditions: the two sides genuinely differ in tree AND commit,
+	// so an equal-ids result is the patch-id property and not a degenerate
+	// same-commit comparison. This is exactly the shape the #3655 tree
+	// comparison false-positived on.
+	if firstCommit == secondCommit {
+		t.Fatalf("fixture: both commits are %s", firstCommit)
+	}
+	if firstTree == secondTree {
+		t.Fatalf("fixture: both trees are %s — the base advance did not change the tree", firstTree)
+	}
+	if secondID == "" {
+		t.Fatal("patch id for the re-staged commit is empty")
+	}
+	if firstID != secondID {
+		t.Errorf("the SAME change on an advanced base must yield the SAME patch id:\n  first  = %s (tree %s)\n  second = %s (tree %s)",
+			firstID, firstTree, secondID, secondTree)
+	}
+}
+
+// TestGitPatchIDForCommit_DifferentChange_DifferentIDs is the run a1321dbb
+// counter-example, preserved as a test per the operator's approval condition 4:
+// five byte-identical files plus a SIXTH added by a mid-stage scope amendment is
+// NOT the change the review round judged, so the ids must differ and the
+// review_head_mismatch row must still fire.
+func TestGitPatchIDForCommit_DifferentChange_DifferentIDs(t *testing.T) {
+	repo, runGit := patchIDRepo(t)
+	ctx := context.Background()
+
+	five := []string{"f1.txt", "f2.txt", "f3.txt", "f4.txt", "f5.txt"}
+	writeFive := func() {
+		for i, name := range five {
+			mustWrite(t, filepath.Join(repo, name), fmt.Sprintf("content %d\n", i))
+		}
+	}
+
+	// The round the reviewer judged: the five files.
+	writeFive()
+	runGit("add", "-A")
+	runGit("commit", "-m", "five files")
+	reviewedID := gitPatchIDForCommit(ctx, repo, runGit("rev-parse", "HEAD"))
+	if reviewedID == "" {
+		t.Fatal("patch id for the five-file commit is empty")
+	}
+
+	// The amendment added a sixth file the round never saw. Same five files,
+	// byte-identical, on the same base.
+	runGit("reset", "--hard", "HEAD~1")
+	writeFive()
+	mustWrite(t, filepath.Join(repo, "f6.txt"), "the amended sixth file\n")
+	runGit("add", "-A")
+	runGit("commit", "-m", "five files plus the amended sixth")
+	pushedID := gitPatchIDForCommit(ctx, repo, runGit("rev-parse", "HEAD"))
+	if pushedID == "" {
+		t.Fatal("patch id for the six-file commit is empty")
+	}
+	if reviewedID == pushedID {
+		t.Errorf("a sixth added file is a DIFFERENT change; ids must differ, both were %s", reviewedID)
+	}
+}
+
+// TestGitPatchIDForCommit_RootCommitReturnsEmpty pins the parentless degrade: a
+// repo whose only commit has no parent has no base to diff against, so the
+// helper returns "" and the backend reads it as undecidable.
+func TestGitPatchIDForCommit_RootCommitReturnsEmpty(t *testing.T) {
+	repo, runGit := patchIDRepo(t)
+	root := runGit("rev-parse", "HEAD")
+	if n := runGit("rev-list", "--count", "HEAD"); n != "1" {
+		t.Fatalf("fixture: want exactly 1 commit, got %s", n)
+	}
+	if got := gitPatchIDForCommit(context.Background(), repo, root); got != "" {
+		t.Errorf("a parentless root commit must yield %q, got %q", "", got)
+	}
+}
+
+// TestGitPatchIDForCommit_UnknownCommitReturnsEmpty pins the unknown-rev
+// degrade: an unresolvable commit-ish returns "" rather than an error.
+func TestGitPatchIDForCommit_UnknownCommitReturnsEmpty(t *testing.T) {
+	repo, _ := patchIDRepo(t)
+	for _, rev := range []string{"", "   ", "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"} {
+		if got := gitPatchIDForCommit(context.Background(), repo, rev); got != "" {
+			t.Errorf("gitPatchIDForCommit(%q) = %q, want %q", rev, got, "")
+		}
+	}
+}
+
+// TestGitPatchIDForCommit_GitFailureReturnsEmpty pins the git-exec degrade
+// through the real call path via the gitPatchIDBinary seam: a git that always
+// fails returns "" and never an error, so a broken toolchain disables the
+// detector rather than failing the ship.
+func TestGitPatchIDForCommit_GitFailureReturnsEmpty(t *testing.T) {
+	repo, runGit := patchIDRepo(t)
+	mustWrite(t, filepath.Join(repo, "base.txt"), "l1\nCHANGED\nl3\n")
+	runGit("add", "-A")
+	runGit("commit", "-m", "c")
+	head := runGit("rev-parse", "HEAD")
+	// Sanity: with real git the fixture DOES produce an id, so an empty result
+	// below is attributable to the substituted binary.
+	if gitPatchIDForCommit(context.Background(), repo, head) == "" {
+		t.Fatal("fixture: real git produced no patch id")
+	}
+
+	failing := filepath.Join(t.TempDir(), "git")
+	mustWrite(t, failing, "#!/bin/sh\nexit 3\n")
+	if err := os.Chmod(failing, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	prev := gitPatchIDBinary
+	gitPatchIDBinary = failing
+	t.Cleanup(func() { gitPatchIDBinary = prev })
+	if got := gitPatchIDForCommit(context.Background(), repo, head); got != "" {
+		t.Errorf("a failing git must yield %q, got %q", "", got)
+	}
+}
+
+// TestGitPatchIDForCommit_EmptyDiffReturnsEmpty pins the empty-diff degrade: a
+// commit byte-identical to its parent makes `git patch-id` print NOTHING, so
+// strings.Fields finds zero fields and the helper returns "" rather than
+// indexing an empty slice. The backend reads "" as undecidable and records no
+// row — detector silence, never a manufactured verdict.
+func TestGitPatchIDForCommit_EmptyDiffReturnsEmpty(t *testing.T) {
+	repo, runGit := patchIDRepo(t)
+	// Fixture precondition: a NON-empty commit on this repo DOES produce an id,
+	// so an empty result below is attributable to the empty diff and not to a
+	// broken fixture.
+	mustWrite(t, filepath.Join(repo, "base.txt"), "l1\nCHANGED\nl3\n")
+	runGit("add", "-A")
+	runGit("commit", "-m", "a real change")
+	if gitPatchIDForCommit(context.Background(), repo, runGit("rev-parse", "HEAD")) == "" {
+		t.Fatal("fixture: a real change produced no patch id")
+	}
+
+	runGit("commit", "--allow-empty", "-m", "an empty change")
+	empty := runGit("rev-parse", "HEAD")
+	if tree, parentTree := runGit("rev-parse", "HEAD^{tree}"), runGit("rev-parse", "HEAD~1^{tree}"); tree != parentTree {
+		t.Fatalf("fixture: --allow-empty commit changed the tree (%s != %s)", tree, parentTree)
+	}
+	if got := gitPatchIDForCommit(context.Background(), repo, empty); got != "" {
+		t.Errorf("an empty diff must yield %q, got %q", "", got)
+	}
+}
+
+// TestGitPatchIDForCommit_PatchIDExitsWithoutReadingStdin_NoHang is the
+// regression pin for the CONFIRMED hang the implement review caught, and the
+// reason gitPatchIDForCommit buffers the diff instead of streaming it.
+//
+// The pre-fix helper coupled the two children with an io.Pipe: patch-id's Stdin
+// was an *io.PipeReader and diff-tree's Stdout an *io.PipeWriter, and since
+// neither is an *os.File os/exec copies each through its own goroutine whose
+// completion Wait blocks on. A patch-id that exits before draining its stdin
+// leaves diff-tree's stdout-copy goroutine blocked FOREVER in pw.Write, so
+// diffTree.Run() never returns — not even after ctx cancellation, because
+// WaitDelay is unset. That hung the runner at PR-ship time.
+//
+// The fixture forces exactly that interleaving through the gitPatchIDBinary
+// seam: rev-parse delegates to real git, diff-tree emits a 2 MiB diff (far past
+// any OS pipe buffer, so the writer MUST block if nobody drains), and patch-id
+// exits non-zero immediately without reading a byte. Completion inside the
+// bounded deadline is the assertion; "" is the required degrade.
+func TestGitPatchIDForCommit_PatchIDExitsWithoutReadingStdin_NoHang(t *testing.T) {
+	repo, runGit := patchIDRepo(t)
+	mustWrite(t, filepath.Join(repo, "base.txt"), "l1\nCHANGED\nl3\n")
+	runGit("add", "-A")
+	runGit("commit", "-m", "c")
+	head := runGit("rev-parse", "HEAD")
+
+	// A git shim that dispatches on the subcommand: real rev-parse, a 2 MiB
+	// diff-tree, and a patch-id that exits at once without reading stdin.
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Skip("git not available")
+	}
+	shim := filepath.Join(t.TempDir(), "git")
+	mustWrite(t, shim, "#!/bin/sh\n"+
+		"for a in \"$@\"; do\n"+
+		"  case \"$a\" in\n"+
+		"    rev-parse) exec "+realGit+" \"$@\" ;;\n"+
+		"    diff-tree) exec awk 'BEGIN{for(i=0;i<2048;i++){s=\"\";for(j=0;j<1023;j++)s=s \"x\";print s}}' ;;\n"+
+		"    patch-id) exit 7 ;;\n"+
+		"  esac\n"+
+		"done\n"+
+		"exec "+realGit+" \"$@\"\n")
+	if err := os.Chmod(shim, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	prev := gitPatchIDBinary
+	gitPatchIDBinary = shim
+	t.Cleanup(func() { gitPatchIDBinary = prev })
+
+	// Sanity: the shim's diff-tree really does emit more than a pipe buffer, so
+	// a non-draining reader genuinely blocks a streaming writer.
+	sanity := exec.Command(shim, "-C", repo, "diff-tree", "-p", head)
+	diff, err := sanity.Output()
+	if err != nil {
+		t.Fatalf("fixture: shim diff-tree failed: %v", err)
+	}
+	if len(diff) < 1<<20 {
+		t.Fatalf("fixture: shim diff is %d bytes, want > 1 MiB", len(diff))
+	}
+
+	type result struct{ id string }
+	done := make(chan result, 1)
+	go func() { done <- result{gitPatchIDForCommit(context.Background(), repo, head)} }()
+	// The deadline is generous relative to the work (two short-lived children)
+	// yet finite: the pre-fix io.Pipe version blocks unconditionally, so any
+	// bound at all discriminates. scaledD keeps it honest on a loaded runner.
+	select {
+	case got := <-done:
+		if got.id != "" {
+			t.Errorf("a patch-id that exits without reading stdin must yield %q, got %q", "", got.id)
+		}
+	case <-time.After(scaledD(30 * time.Second)):
+		t.Fatal("gitPatchIDForCommit did not return: a patch-id exiting without draining its stdin must not block the caller (the #3665 implement-review hang)")
+	}
+}
+
+// TestStampVerifyRunChangeID_EmptyIDLeavesPayloadByteIdentical pins the
+// byte-identity degrade: an empty change id must leave the verify_run payload
+// bytes untouched, so every path that cannot produce an id keeps the pre-#3665
+// event shape.
+func TestStampVerifyRunChangeID_EmptyIDLeavesPayloadByteIdentical(t *testing.T) {
+	ev := verifyRunEvent("scripts/test verify", "h1", "t1", 0, "ok\n", "passed")
+	before := string(ev.Payload)
+	got := stampVerifyRunChangeID(ev, "")
+	if string(got.Payload) != before {
+		t.Errorf("empty change id must leave the payload byte-identical:\n before = %s\n after  = %s", before, got.Payload)
+	}
+	if bytes.Contains(got.Payload, []byte("change_id")) {
+		t.Errorf("empty change id must not introduce the key: %s", got.Payload)
+	}
+}
+
+// TestStampVerifyRunChangeID_NonEmptySetsChangeID pins the stamp: a non-empty id
+// lands under the `change_id` key the backend's verifyRunPayload decodes, and
+// every pre-existing field survives.
+func TestStampVerifyRunChangeID_NonEmptySetsChangeID(t *testing.T) {
+	ev := stampVerifyRunChangeID(verifyRunEvent("scripts/test verify", "h1", "t1", 0, "ok\n", "passed"), "cafe1234")
+	var decoded struct {
+		Command  string `json:"command"`
+		HeadSHA  string `json:"head_sha"`
+		TreeSHA  string `json:"tree_sha"`
+		Outcome  string `json:"outcome"`
+		ChangeID string `json:"change_id"`
+	}
+	if err := json.Unmarshal(ev.Payload, &decoded); err != nil {
+		t.Fatalf("decode stamped payload: %v\n%s", err, ev.Payload)
+	}
+	if decoded.ChangeID != "cafe1234" {
+		t.Errorf("change_id = %q, want %q (payload %s)", decoded.ChangeID, "cafe1234", ev.Payload)
+	}
+	if decoded.Command != "scripts/test verify" || decoded.HeadSHA != "h1" || decoded.TreeSHA != "t1" || decoded.Outcome != "passed" {
+		t.Errorf("stamping dropped a pre-existing field: %+v", decoded)
+	}
+}
+
+// TestRunVerifyFixLoop_StampsOneChangeIDOnBothVerifyForms is the runner half of
+// the cross-boundary seam: against a REAL repo whose scope names a Go file (so
+// the #3315 scoped pre-pass plus the full re-verify both run for one iteration),
+// the loop emits TWO verify_run events for the SAME throwaway commit and both
+// carry the SAME non-empty change_id — the property the backend's
+// authoritative-is-last read depends on.
+func TestRunVerifyFixLoop_StampsOneChangeIDOnBothVerifyForms(t *testing.T) {
+	repo, cfg := autoformatRepo(t, "true")
+	// Reformat the seeded file so the auto-format absorb does not fire; the
+	// loop's first iteration must simply pass both forms.
+	mustWrite(t, filepath.Join(repo, "fmtme.go"), "package p\n")
+	res := agent.Result{OK: true}
+	var logSink strings.Builder
+	reinvoked, tree, err := runVerifyFixLoop(context.Background(), &cfg, nil, "",
+		&fakeInvoker{canned: agent.Result{OK: true}}, agent.Invocation{}, &res, &logSink)
+	if err != nil {
+		t.Fatalf("runVerifyFixLoop: %v\n%s", err, logSink.String())
+	}
+	if reinvoked || tree == "" {
+		t.Fatalf("fixture: want a first-iteration pass, got reinvoked=%v tree=%q\n%s", reinvoked, tree, logSink.String())
+	}
+
+	var ids []string
+	for _, ev := range res.Events {
+		if ev.Kind != "verify_run" {
+			continue
+		}
+		var p struct {
+			ChangeID string `json:"change_id"`
+			TreeSHA  string `json:"tree_sha"`
+		}
+		if uerr := json.Unmarshal(ev.Payload, &p); uerr != nil {
+			t.Fatalf("decode verify_run payload: %v\n%s", uerr, ev.Payload)
+		}
+		ids = append(ids, p.ChangeID)
+	}
+	if len(ids) != 2 {
+		t.Fatalf("verify_run events = %d, want 2 (the scoped pre-pass + the full re-verify)\n%s", len(ids), logSink.String())
+	}
+	if ids[0] == "" {
+		t.Errorf("the scoped verify_run carries no change_id\n%s", logSink.String())
+	}
+	if ids[0] != ids[1] {
+		t.Errorf("both forms gate the SAME commit and must share one change_id: %q vs %q", ids[0], ids[1])
+	}
+}
+
+// TestOpenPRAndShipArtifact_ShipsVerifiedChangeIDOfPushedCommit is the pushed
+// half of the seam: against a real bare origin, the success artifact's
+// verified_change_id equals the patch id of the PUSHED commit computed against
+// its own parent, so the backend compares the change the push actually carries.
+func TestOpenPRAndShipArtifact_ShipsVerifiedChangeIDOfPushedCommit(t *testing.T) {
+	repo, bare, branch := verifiedTreeRepo(t)
+	withFakePROpenerOnly(t)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := verifiedTreeCfg(repo, "true")
+	_, verifiedTree, gerr := runVerifyGateCommitted(context.Background(), cfg, io.Discard)
+	if gerr != nil || verifiedTree == "" {
+		t.Fatalf("gate: tree=%q err=%v", verifiedTree, gerr)
+	}
+	var logSink strings.Builder
+	if err := openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, nil, nil, nil); err != nil {
+		t.Fatalf("openPRAndShipArtifact: %v\n%s", err, logSink.String())
+	}
+	if fu.gotPRArgs == nil {
+		t.Fatal("ShipPullRequest was not called")
+	}
+	var shipped struct {
+		HeadSHA          string `json:"head_sha"`
+		VerifiedChangeID string `json:"verified_change_id"`
+	}
+	if err := json.Unmarshal(fu.gotPRArgs.Body, &shipped); err != nil {
+		t.Fatalf("decode artifact: %v\n%s", err, fu.gotPRArgs.Body)
+	}
+	pushedHead, err := exec.Command("git", "--git-dir="+bare, "rev-parse", "refs/heads/"+branch).Output()
+	if err != nil {
+		t.Fatalf("resolve pushed head on origin: %v", err)
+	}
+	if got := strings.TrimSpace(string(pushedHead)); got != shipped.HeadSHA {
+		t.Fatalf("fixture: shipped head_sha %q != origin branch head %q", shipped.HeadSHA, got)
+	}
+	want := gitPatchIDForCommit(context.Background(), repo, shipped.HeadSHA)
+	if want == "" {
+		t.Fatal("fixture: the pushed commit has no computable patch id")
+	}
+	if shipped.VerifiedChangeID != want {
+		t.Errorf("shipped verified_change_id = %q, want the PUSHED commit's patch id %q", shipped.VerifiedChangeID, want)
+	}
+}
+
+// TestOpenPRAndShipArtifact_NoChangeID_OmitsKey pins the ship-side omission: a
+// stage whose patch id cannot be computed omits verified_change_id ENTIRELY, so
+// that artifact's bytes, content hash and idempotency key stay byte-identical
+// and the backend takes its fail-closed-to-silence skip. Driven through the
+// gitPatchIDBinary seam, which is the only mechanism that degrades the id while
+// leaving the real push intact.
+func TestOpenPRAndShipArtifact_NoChangeID_OmitsKey(t *testing.T) {
+	repo, _, _ := verifiedTreeRepo(t)
+	withFakePROpenerOnly(t)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := verifiedTreeCfg(repo, "true")
+	_, verifiedTree, gerr := runVerifyGateCommitted(context.Background(), cfg, io.Discard)
+	if gerr != nil || verifiedTree == "" {
+		t.Fatalf("gate: tree=%q err=%v", verifiedTree, gerr)
+	}
+	failing := filepath.Join(t.TempDir(), "git")
+	mustWrite(t, failing, "#!/bin/sh\nexit 3\n")
+	if err := os.Chmod(failing, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	prev := gitPatchIDBinary
+	gitPatchIDBinary = failing
+	t.Cleanup(func() { gitPatchIDBinary = prev })
+
+	var logSink strings.Builder
+	if err := openPRAndShipArtifact(context.Background(), cfg, &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, nil, nil, nil); err != nil {
+		t.Fatalf("openPRAndShipArtifact: %v\n%s", err, logSink.String())
+	}
+	if fu.gotPRArgs == nil {
+		t.Fatal("ShipPullRequest was not called")
+	}
+	if raw := topLevelKeyRaw(t, fu.gotPRArgs.Body, "verified_change_id"); raw != "" {
+		t.Errorf("a ship with no computable change id must OMIT verified_change_id, got %s", raw)
 	}
 }
 
@@ -27504,6 +27967,14 @@ func wireGoldenOrdinaryPath(t *testing.T) string {
 const (
 	wireGoldenOrdinaryHeadSHA = "1111111111111111111111111111111111111111"
 	wireGoldenOrdinaryBaseSHA = "2222222222222222222222222222222222222222"
+	// #3665: verified_change_id is a `git patch-id --stable` sum over the diff
+	// the pushed commit introduces — derived from real git output, so it is no
+	// more pinnable in a byte-exact cross-module fixture than the two commit
+	// hashes above (a git version with different diff formatting would change
+	// it). Substituted for the same reason and with the same 40-char
+	// anti-vacuity check, so the golden pins the KEY's presence without baking a
+	// version-dependent value.
+	wireGoldenOrdinaryChangeID = "3333333333333333333333333333333333333333"
 )
 
 // wireGoldenProductionHandoffPath is the PRODUCTION run/stage-keyed handoff path
@@ -27534,9 +28005,10 @@ func substituteWireHandoffPath(t *testing.T, produced []byte, keyed string) []by
 }
 
 // normalizeOrdinaryWireArtifact makes the ordinary ship's bytes comparable
-// against a committed fixture. head_sha and base_sha are real commit hashes from
-// a freshly-created temp repo (the commit timestamp is now), so they cannot be
-// pinned; every OTHER key — including any key a future change ADDS or REMOVES —
+// against a committed fixture. head_sha, base_sha and verified_change_id are
+// real git-derived 40-char values (the first two are commit hashes from a
+// freshly-created temp repo whose commit timestamp is now; the third is a
+// patch-id over real diff bytes), so they cannot be pinned; every OTHER key — including any key a future change ADDS or REMOVES —
 // round-trips untouched through the decode/re-marshal, so the drift-detection
 // property the seam exists for is preserved: change the artifact map and these
 // bytes change.
@@ -27547,12 +28019,13 @@ func normalizeOrdinaryWireArtifact(t *testing.T, produced []byte) []byte {
 		t.Fatalf("decode produced artifact: %v", err)
 	}
 	for key, placeholder := range map[string]string{
-		"head_sha": wireGoldenOrdinaryHeadSHA,
-		"base_sha": wireGoldenOrdinaryBaseSHA,
+		"head_sha":           wireGoldenOrdinaryHeadSHA,
+		"base_sha":           wireGoldenOrdinaryBaseSHA,
+		"verified_change_id": wireGoldenOrdinaryChangeID,
 	} {
 		got, _ := m[key].(string)
 		if len(got) != 40 {
-			t.Fatalf("%s = %q, want a 40-char commit hash (the seam is meaningless without one)", key, got)
+			t.Fatalf("%s = %q, want a 40-char git hash (the seam is meaningless without one)", key, got)
 		}
 		m[key] = placeholder
 	}
