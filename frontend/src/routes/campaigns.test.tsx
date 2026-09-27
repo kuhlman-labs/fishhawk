@@ -48,6 +48,9 @@ describe('<Campaigns>', () => {
       items: [
         makeCampaign({ id: 'c1', epic_ref: 'issue:1439', state: 'running' }),
         makeCampaign({ id: 'c2', epic_ref: 'issue:1500', state: 'paused' }),
+        // awaiting_human (E72.33 / #3660): the derived non-terminal state must
+        // render with its own badge, not fall through to an undefined style.
+        makeCampaign({ id: 'c3', epic_ref: 'issue:3660', state: 'awaiting_human' }),
       ],
       next_cursor: null,
     });
@@ -55,8 +58,12 @@ describe('<Campaigns>', () => {
     await waitFor(() => {
       expect(screen.getByText('issue:1439')).toBeInTheDocument();
       expect(screen.getByText('issue:1500')).toBeInTheDocument();
+      expect(screen.getByText('issue:3660')).toBeInTheDocument();
       expect(screen.getByText('running')).toBeInTheDocument();
       expect(screen.getByText('paused')).toBeInTheDocument();
+      const badge = screen.getByText('awaiting_human');
+      expect(badge).toBeInTheDocument();
+      expect(badge.className).toContain('violet');
     });
     // The repo cell deep-links to /campaigns/<id>.
     const link = screen.getAllByRole('link', { name: /kuhlman-labs\/fishhawk/i })[0];

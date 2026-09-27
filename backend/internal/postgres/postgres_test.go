@@ -2605,6 +2605,63 @@ func TestMigrateDown_ClarificationAnswersTruncatedOnce(t *testing.T) {
 	}
 }
 
+// TestMigrateDown_CampaignsAwaitingHumanReversal pins 0087 (E72.33 / #3660): the
+// campaigns_state_check must ADMIT 'awaiting_human' after MigrateUp, and after
+// rolling back through 0087 (i) a row HOLDING that value must have been rewritten
+// to 'running' by the down migration's pre-narrowing UPDATE and (ii) the narrower
+// CHECK must REJECT 'awaiting_human' with SQLSTATE 23514.
+//
+// The fixture SEEDS a row holding the new value BEFORE the rollback, which is what
+// makes the pre-narrowing UPDATE observable (counterfactual c7): with that UPDATE
+// deleted, ADD CONSTRAINT fails validating the existing row and MigrateDown errors.
+// A fixture WITHOUT such a row would let the narrower CHECK apply cleanly and the
+// arm would prove nothing.
+func TestMigrateDown_CampaignsAwaitingHumanReversal(t *testing.T) {
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+	ctx := context.Background()
+
+	// After MigrateUp the widened CHECK admits 'awaiting_human'. Seeding the row
+	// through a plain INSERT (not a repository method) keeps the fixture
+	// independent of the Go state machine under test.
+	campaignID := uuid.New()
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO campaigns (id, repo, epic_ref, state) VALUES ($1, $2, $3, 'awaiting_human')`,
+		campaignID, "kuhlman-labs/fishhawk", "issue:3660",
+	); err != nil {
+		t.Fatalf("insert awaiting_human campaign after MigrateUp (0087 widening missing?): %v", err)
+	}
+
+	// Roll back through 0087, the reversal under test.
+	downThrough(t, url, "0087")
+
+	// (i) The pre-narrowing UPDATE rewrote the seeded row to 'running'.
+	var state string
+	if err := pool.QueryRow(ctx, `SELECT state FROM campaigns WHERE id = $1`, campaignID).Scan(&state); err != nil {
+		t.Fatalf("re-read seeded campaign after MigrateDown: %v", err)
+	}
+	if state != "running" {
+		t.Errorf("seeded campaign state after rollback = %q, want running (0087's pre-narrowing UPDATE)", state)
+	}
+
+	// (ii) The narrower CHECK now REJECTS 'awaiting_human' with 23514.
+	_, err = pool.Exec(ctx, `UPDATE campaigns SET state = 'awaiting_human' WHERE id = $1`, campaignID)
+	if err == nil {
+		t.Fatal("UPDATE to awaiting_human succeeded after rollback, want a CHECK violation")
+	}
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "23514" {
+		t.Errorf("UPDATE error = %v, want SQLSTATE 23514 (campaigns_state_check)", err)
+	}
+}
+
 // TestMigrateDown_ApprovalConditionsTruncatedUniqueReversal pins 0068 (#2622,
 // E67.25): the partial unique index
 // audit_entries_approval_conditions_truncated_once_idx must be PRESENT after

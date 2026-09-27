@@ -193,7 +193,17 @@ export interface AuditEntry {
  * campaignNextActionPayload in backend/internal/server/campaigns.go and
  * campaign.PauseReason in backend/internal/campaign/campaign.go verbatim.
  */
-export type CampaignState = 'pending' | 'running' | 'paused' | 'succeeded' | 'failed' | 'cancelled';
+/**
+ * Campaign lifecycle state.
+ *
+ * `awaiting_human` (E72.33 / #3660) is the DERIVED, NON-terminal state of a
+ * campaign whose only remaining open items are human-led (`autonomy:low`): the
+ * engine has no dispatchable work, but the campaign is neither finished nor
+ * wedged, and it returns to `pending`/`running` once such an issue is relabelled
+ * to a driveable tier.
+ */
+export type CampaignState =
+  'pending' | 'running' | 'paused' | 'awaiting_human' | 'succeeded' | 'failed' | 'cancelled';
 
 export type CampaignItemState =
   'pending' | 'blocked' | 'running' | 'paused' | 'succeeded' | 'failed' | 'cancelled';

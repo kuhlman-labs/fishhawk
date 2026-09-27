@@ -2751,11 +2751,23 @@ components:
           example: "issue:1439"
         state:
           type: string
-          enum: [pending, running, paused, succeeded, failed, cancelled]
+          enum: [pending, running, paused, awaiting_human, succeeded, failed, cancelled]
           description: |
             `paused` is the E25.7 safety-boundary overlay: the auto-driver
             paused the campaign when a run gate was handed off to a human.
             It is non-terminal — `POST /resume` returns it to `running`.
+
+            `awaiting_human` (E72.33 / #3660) is the campaign whose only
+            remaining OPEN items are human-led. It is NON-terminal and, unlike
+            `paused`, DERIVED: the server emits it whenever the readiness
+            partition has at least one `human_led` item and NO `eligible`,
+            restartable, `running` or `paused` item — an iff evaluated on every
+            derive, so the state SELF-CORRECTS. Relabelling a human-led issue
+            to a driveable tier (`autonomy:low` → `autonomy:medium`) returns the
+            campaign to `pending` or `running` on the next status poll, and
+            `POST /v0/campaigns/{campaign_id}/runs` accepts an
+            `awaiting_human` campaign so the relabelled item can be started.
+            Before #3660 such a campaign reported `running` forever.
         pause_policy:
           type: string
           enum: [pause_campaign, pause_item]
@@ -3254,6 +3266,11 @@ components:
         the campaign); an all-done campaign keeps `complete`; everything else
         becomes `closed`. A PAUSED campaign is NOT terminal and still reports
         `resume`, which is correct — resume is legal on a paused campaign.
+        An `awaiting_human` campaign (E72.33 / #3660) is likewise NOT terminal,
+        so this rule never fires for it: it keeps reporting the truthful
+        `attend_human_led` — never `closed` — and that detail now NAMES the
+        remaining human-led refs and their count (capped at ten, with a
+        `(+N more)` tail) instead of only the first one.
       required: [action]
       properties:
         action:
@@ -8349,6 +8366,9 @@ paths:
       parameters:
         - { name: repo, in: query, schema: { type: string } }
         - { name: workflow_id, in: query, schema: { type: string } }
+        # RUN states only. `runs_state_check` (0001_runs_stages) has never been
+        # widened, so neither the campaign-only `paused` (0040) nor
+        # `awaiting_human` (0087 / #3660) belongs here.
         - { name: state, in: query, schema: { type: string, enum: [pending, running, succeeded, failed, cancelled] } }
         - name: pull_request_url
           in: query
@@ -12766,7 +12786,9 @@ paths:
       tags: [campaigns]
       parameters:
         - { name: repo, in: query, schema: { type: string } }
-        - { name: state, in: query, schema: { type: string, enum: [pending, running, succeeded, failed, cancelled] } }
+        # `paused` was missing here since 0040 widened the constraint (a
+        # pre-existing documentation defect, fixed with the #3660 addition).
+        - { name: state, in: query, schema: { type: string, enum: [pending, running, paused, awaiting_human, succeeded, failed, cancelled] } }
         - { name: limit, in: query, schema: { type: integer, default: 50, maximum: 200 } }
         - name: cursor
           in: query

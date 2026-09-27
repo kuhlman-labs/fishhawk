@@ -3466,7 +3466,22 @@ type Campaign struct {
 	ID      string `json:"id"`
 	Repo    string `json:"repo"`
 	EpicRef string `json:"epic_ref"`
-	State   string `json:"state"`
+	// State is the campaign lifecycle state, drawn from the CLOSED set
+	// pending / running / paused / awaiting_human / succeeded / failed / cancelled.
+	//
+	// `awaiting_human` (E72.33 / #3660) is the DERIVED, NON-terminal state of a
+	// campaign the engine has no dispatchable work for: every remaining OPEN item
+	// is human-led (autonomy:low). It is not a wedge and not a failure — see
+	// next_action / next_actions, which report `attend_human_led` /
+	// `campaign_attend_human_led` for it exactly as before, so the action set this
+	// client switches on is unchanged.
+	//
+	// It is SELF-CORRECTING: relabelling a human-led issue to a driveable tier
+	// (autonomy:low -> autonomy:medium) returns the campaign to `pending` or
+	// `running` on the next status poll, so an operator-agent seeing
+	// `awaiting_human` alongside a `start_run` next_action is looking at a stale
+	// read, not a contradiction.
+	State string `json:"state"`
 	// PausePolicy is the operator-chosen pause behavior on a gate hand-off
 	// (E25.7): pause_campaign (block the whole campaign, the default) or
 	// pause_item (continue-others). Always normalized on a persisted campaign.

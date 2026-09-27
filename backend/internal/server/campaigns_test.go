@@ -10029,3 +10029,367 @@ func TestGetCampaignStatus_OutOfBandTerminal_Completed_StampsResolvedBy(t *testi
 		t.Errorf("audit state_reason = %v, want completed", p["state_reason"])
 	}
 }
+
+// ---------------------------------------------------------------------------
+// awaiting_human: the derived NON-terminal campaign state (E72.33 / #3660)
+// ---------------------------------------------------------------------------
+
+// TestGetCampaignStatus_AwaitingHumanWhenOnlyHumanLedRemains is the DONE-MEANS
+// test for #3660, run over a REAL Postgres because it crosses the whole change in
+// ONE test: engine -> DeriveState -> TransitionCampaign -> the migration-0087
+// campaigns_state_check -> the wire payload. A per-layer unit would pass while the
+// CHECK rejected the write.
+//
+// Fixture: item A autonomy:medium SUCCEEDED, item B autonomy:low PENDING with no
+// depends_on. B's stored tier starts EMPTY and its issue carries autonomy:low, so
+// the reconcile-on-read autonomy refresh reports a change and the read re-derives
+// — which is how the campaign row reaches awaiting_human on this poll rather than
+// waiting for another trigger.
+func TestGetCampaignStatus_AwaitingHumanWhenOnlyHumanLedRemains(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	c, err := repo.CreateCampaign(ctx, campaign.CreateCampaignParams{Repo: "kuhlman-labs/fishhawk", EpicRef: "issue:99"})
+	if err != nil {
+		t.Fatalf("create campaign: %v", err)
+	}
+	itemA, err := repo.CreateCampaignItem(ctx, campaign.CreateCampaignItemParams{
+		CampaignID: c.ID, IssueRef: "issue:100", Autonomy: "medium",
+	})
+	if err != nil {
+		t.Fatalf("create item A: %v", err)
+	}
+	if _, err := repo.TransitionCampaignItem(ctx, itemA.ID, campaign.ItemStateSucceeded); err != nil {
+		t.Fatalf("transition item A to succeeded: %v", err)
+	}
+	if _, err := repo.CreateCampaignItem(ctx, campaign.CreateCampaignItemParams{
+		CampaignID: c.ID, IssueRef: "issue:101",
+	}); err != nil {
+		t.Fatalf("create item B: %v", err)
+	}
+
+	ghState := &runlessGitHub{installID: 4242, issues: map[int]runlessIssue{
+		101: {state: "open", labels: []string{"type:feature", "autonomy:low"}},
+	}}
+	s := New(Config{CampaignRepo: repo, RunRepo: newFakeRepo(), AuditRepo: &campaignAuditRecorder{},
+		GitHub: newRunlessGitHubClient(t, ghState)})
+
+	st := getCampaignStatusBody(t, s, c.ID)
+	if st.Campaign.State != string(campaign.StateAwaitingHuman) {
+		t.Errorf("campaign.state = %q, want awaiting_human (the only open item is human-led)", st.Campaign.State)
+	}
+	if st.NextAction.Action != "attend_human_led" {
+		t.Errorf("next_action.action = %q, want attend_human_led (awaiting_human is NON-terminal, so #2681 never rewrites it to closed)", st.NextAction.Action)
+	}
+	if !strings.Contains(st.NextAction.Detail, "issue:101") {
+		t.Errorf("next_action.detail = %q, want it to NAME the remaining human-led ref", st.NextAction.Detail)
+	}
+	if !strings.Contains(st.NextAction.Detail, "1 human-led") {
+		t.Errorf("next_action.detail = %q, want it to carry the count \"1 human-led\"", st.NextAction.Detail)
+	}
+	if !containsRefTest(st.Rollup.HumanLed, "issue:101") {
+		t.Errorf("rollup.human_led = %v, want it to contain issue:101", st.Rollup.HumanLed)
+	}
+	// COMMITTED STATE: the derived state was actually WRITTEN through the widened
+	// CHECK, not merely reported by the response.
+	got, err := repo.GetCampaign(ctx, c.ID)
+	if err != nil {
+		t.Fatalf("re-read campaign: %v", err)
+	}
+	if got.State != campaign.StateAwaitingHuman {
+		t.Errorf("persisted campaign state = %q, want awaiting_human", got.State)
+	}
+}
+
+// TestGetCampaignStatus_AwaitingHumanDetailNamesEveryRef is the shape campaign
+// 6e97b69a is actually in: FOUR autonomy:low pending items, no agent-drivable work
+// at all. The detail must name all four refs and report count 4 — the enrichment
+// #3660 asks for (the pre-change detail named only the first item and no count).
+func TestGetCampaignStatus_AwaitingHumanDetailNamesEveryRef(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	c, err := repo.CreateCampaign(ctx, campaign.CreateCampaignParams{Repo: "kuhlman-labs/fishhawk", EpicRef: "issue:99"})
+	if err != nil {
+		t.Fatalf("create campaign: %v", err)
+	}
+	refs := []string{"issue:201", "issue:202", "issue:203", "issue:204"}
+	issues := map[int]runlessIssue{}
+	for i, ref := range refs {
+		if _, err := repo.CreateCampaignItem(ctx, campaign.CreateCampaignItemParams{
+			CampaignID: c.ID, IssueRef: ref,
+		}); err != nil {
+			t.Fatalf("create item %s: %v", ref, err)
+		}
+		issues[201+i] = runlessIssue{state: "open", labels: []string{"autonomy:low"}}
+	}
+	s := New(Config{CampaignRepo: repo, RunRepo: newFakeRepo(), AuditRepo: &campaignAuditRecorder{},
+		GitHub: newRunlessGitHubClient(t, &runlessGitHub{installID: 4242, issues: issues})})
+
+	st := getCampaignStatusBody(t, s, c.ID)
+	if st.Campaign.State != string(campaign.StateAwaitingHuman) {
+		t.Errorf("campaign.state = %q, want awaiting_human (every item is human-led and never started)", st.Campaign.State)
+	}
+	if st.NextAction.Action != "attend_human_led" {
+		t.Errorf("next_action.action = %q, want attend_human_led", st.NextAction.Action)
+	}
+	if !strings.Contains(st.NextAction.Detail, "4 human-led") {
+		t.Errorf("next_action.detail = %q, want the count \"4 human-led\"", st.NextAction.Detail)
+	}
+	for _, ref := range refs {
+		if !strings.Contains(st.NextAction.Detail, ref) {
+			t.Errorf("next_action.detail = %q, want it to name %s", st.NextAction.Detail, ref)
+		}
+	}
+}
+
+// TestGetCampaignStatus_RelabelWithoutStartLeavesPending is REVISION FIX 1's
+// END-TO-END half (r2) over a REAL persisted row, and counterfactual c9's vehicle.
+//
+// Sequence: an all-autonomy:low NEVER-STARTED campaign is driven to
+// `awaiting_human` by one status read; the operator then relabels one issue
+// autonomy:medium WITHOUT starting it; the next status read must re-derive
+// `pending` — a state reachable ONLY through the awaiting_human -> pending edge,
+// because with zero progress items DeriveState's progress arm cannot return
+// Running.
+//
+// The PERSISTED row is the load-bearing assertion, not the response body: the
+// body reports the derived value either way, so only the row read pins the
+// transition edge. With the StateAwaitingHuman -> StatePending map entry deleted,
+// deriveCampaignAfterChange's ValidCampaignTransition guard silently drops the
+// write, the row stays awaiting_human, and next_action still advertises start_run —
+// exactly the stuck-state contradiction the fix exists to prevent.
+//
+// Per binding condition 1, this is where the `next_action == start_run` half is
+// asserted; baseCampaignNextAction stays unexported.
+func TestGetCampaignStatus_RelabelWithoutStartLeavesPending(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	c, err := repo.CreateCampaign(ctx, campaign.CreateCampaignParams{Repo: "kuhlman-labs/fishhawk", EpicRef: "issue:99"})
+	if err != nil {
+		t.Fatalf("create campaign: %v", err)
+	}
+	for _, ref := range []string{"issue:100", "issue:101"} {
+		if _, err := repo.CreateCampaignItem(ctx, campaign.CreateCampaignItemParams{
+			CampaignID: c.ID, IssueRef: ref,
+		}); err != nil {
+			t.Fatalf("create item %s: %v", ref, err)
+		}
+	}
+	ghState := &runlessGitHub{installID: 4242, issues: map[int]runlessIssue{
+		100: {state: "open", labels: []string{"autonomy:low"}},
+		101: {state: "open", labels: []string{"autonomy:low"}},
+	}}
+	s := New(Config{CampaignRepo: repo, RunRepo: newFakeRepo(), AuditRepo: &campaignAuditRecorder{},
+		GitHub: newRunlessGitHubClient(t, ghState)})
+
+	// POLL 1 persists awaiting_human.
+	first := getCampaignStatusBody(t, s, c.ID)
+	if first.Campaign.State != string(campaign.StateAwaitingHuman) {
+		t.Fatalf("poll 1 campaign.state = %q, want awaiting_human (setup)", first.Campaign.State)
+	}
+	if persisted, err := repo.GetCampaign(ctx, c.ID); err != nil {
+		t.Fatalf("re-read campaign after poll 1: %v", err)
+	} else if persisted.State != campaign.StateAwaitingHuman {
+		t.Fatalf("persisted state after poll 1 = %q, want awaiting_human (setup)", persisted.State)
+	}
+
+	// THE RELABEL, with no start: issue:100 becomes autonomy:medium at the forge.
+	ghState.mu.Lock()
+	ghState.issues[100] = runlessIssue{state: "open", labels: []string{"autonomy:medium"}}
+	ghState.mu.Unlock()
+
+	// POLL 2 must re-derive pending and PERSIST it.
+	second := getCampaignStatusBody(t, s, c.ID)
+	if second.Campaign.State != string(campaign.StatePending) {
+		t.Errorf("poll 2 campaign.state = %q, want pending (the relabelled item is Eligible, so the awaiting_human arm must stop firing)", second.Campaign.State)
+	}
+	if second.NextAction.Action != "start_run" || second.NextAction.IssueRef != "issue:100" {
+		t.Errorf("poll 2 next_action = %+v, want start_run on issue:100", second.NextAction)
+	}
+	// THE ASSERTION THAT PINS THE EDGE: the committed row, not the body.
+	persisted, err := repo.GetCampaign(ctx, c.ID)
+	if err != nil {
+		t.Fatalf("re-read campaign after poll 2: %v", err)
+	}
+	if persisted.State != campaign.StatePending {
+		t.Errorf("PERSISTED campaign state after relabel = %q, want pending — the awaiting_human -> pending edge was refused and the row STUCK while next_action advertised start_run", persisted.State)
+	}
+}
+
+// TestListCampaigns_StateFilterAcceptsAwaitingHuman asserts the state-vocabulary
+// widening at the list handler: ?state=awaiting_human is a 200, and a bogus state
+// still 400s validation_failed (the widening did not open the filter).
+//
+// COUNTERFACTUAL c6: deleting the validCampaignStates entry makes the first
+// request take the 400 branch.
+func TestListCampaigns_StateFilterAcceptsAwaitingHuman(t *testing.T) {
+	s := New(Config{CampaignRepo: newFakeCampaignRepo()})
+
+	req := httptest.NewRequest(http.MethodGet, "/v0/campaigns?state=awaiting_human", nil)
+	w := httptest.NewRecorder()
+	s.handleListCampaigns(w, withAuth(req))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 for ?state=awaiting_human (body=%s)", w.Code, w.Body.String())
+	}
+
+	// The closed set is still closed.
+	req = httptest.NewRequest(http.MethodGet, "/v0/campaigns?state=awaiting_humans", nil)
+	w = httptest.NewRecorder()
+	s.handleListCampaigns(w, withAuth(req))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 for a bogus state", w.Code)
+	}
+	if code := decodeCampaignError(t, w); code != "validation_failed" {
+		t.Errorf("code = %q, want validation_failed", code)
+	}
+	if !strings.Contains(w.Body.String(), "awaiting_human") {
+		t.Errorf("400 detail should enumerate awaiting_human: %s", w.Body.String())
+	}
+}
+
+// TestStartCampaignItemRun_AwaitingHumanCampaignIsStartable asserts the
+// campaign-state gate widening: an awaiting_human campaign is NOT refused
+// campaign_not_startable — the request reaches the ITEM gate, which refuses
+// item_human_led for a still-low item and SUCCEEDS (201) for an item whose
+// refreshed tier is medium.
+//
+// COUNTERFACTUAL c5: restoring the pre-change three-state condition makes the 201
+// arm return 409 campaign_not_startable instead.
+func TestStartCampaignItemRun_AwaitingHumanCampaignIsStartable(t *testing.T) {
+	// Arm 1: still autonomy:low at the forge — the ITEM gate refuses, proving the
+	// request got PAST the campaign-state gate.
+	t.Run("still low reaches the item gate", func(t *testing.T) {
+		crepo := newFakeCampaignRepo()
+		s := New(Config{CampaignRepo: crepo, RunRepo: newFakeRepo(), AuditRepo: &campaignAuditRecorder{},
+			GitHub: autonomyStartGitHub(t, []string{"autonomy:low"})})
+		c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+			{IssueRef: "issue:100", State: campaign.ItemStatePending, Autonomy: "low"},
+		})
+		c.State = campaign.StateAwaitingHuman
+
+		w := postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:100","workflow_id":"feature_change","runner_kind":"local"}`)
+		code := decodeCampaignError(t, w)
+		if code == "campaign_not_startable" {
+			t.Fatalf("code = campaign_not_startable, want the ITEM gate's refusal — an awaiting_human campaign must be startable (body=%s)", w.Body.String())
+		}
+		if w.Code != http.StatusConflict || code != "item_human_led" {
+			t.Fatalf("status/code = %d/%s, want 409 item_human_led", w.Code, code)
+		}
+	})
+
+	// Arm 2: relabelled autonomy:medium — the targeted refresh runs AFTER the
+	// campaign-state gate, so refusing there would make this path unreachable.
+	t.Run("relabelled medium starts", func(t *testing.T) {
+		crepo := newFakeCampaignRepo()
+		s := New(Config{CampaignRepo: crepo, RunRepo: newFakeRepo(), AuditRepo: &campaignAuditRecorder{},
+			GitHub: autonomyStartGitHub(t, []string{"autonomy:medium"})})
+		c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+			{IssueRef: "issue:100", State: campaign.ItemStatePending, Autonomy: "low"},
+		})
+		c.State = campaign.StateAwaitingHuman
+
+		w := postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:100","workflow_id":"feature_change","runner_kind":"local"}`)
+		if w.Code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201 — an awaiting_human campaign whose item was relabelled must be startable (body=%s)", w.Code, w.Body.String())
+		}
+	})
+}
+
+// TestStartCampaignItemRun_AwaitingHumanDerivesRunning asserts the post-start
+// derivation widening (step 5c): starting a just-relabelled item on an
+// awaiting_human campaign moves the campaign row to `running` in the SAME request,
+// instead of leaving it advertising attend_human_led until the next status poll.
+//
+// COUNTERFACTUAL c8: restoring `c.State == campaign.StatePending` skips the
+// derivation and leaves the row at awaiting_human after the 201.
+func TestStartCampaignItemRun_AwaitingHumanDerivesRunning(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	s := New(Config{CampaignRepo: crepo, RunRepo: newFakeRepo(), AuditRepo: &campaignAuditRecorder{},
+		GitHub: autonomyStartGitHub(t, []string{"autonomy:medium"})})
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "issue:99", []*campaign.Item{
+		{IssueRef: "issue:100", State: campaign.ItemStatePending, Autonomy: "low"},
+	})
+	c.State = campaign.StateAwaitingHuman
+
+	w := postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:100","workflow_id":"feature_change","runner_kind":"local"}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+	if got := crepo.campaigns[c.ID].State; got != campaign.StateRunning {
+		t.Errorf("campaign state after the 201 = %q, want running (the awaiting_human -> running derivation must fire in the same request)", got)
+	}
+}
+
+// TestComputeCampaignNextAction_AwaitingHumanIsNotClosed is the test that goes RED
+// if awaiting_human is ever made TERMINAL. The #2681 post-filter rewrites every
+// non-complete base action on a terminal campaign into `closed`, whose detail tells
+// the operator the campaign will not track the issue — the first of the three
+// reasons terminal `succeeded` was rejected for this case.
+func TestComputeCampaignNextAction_AwaitingHumanIsNotClosed(t *testing.T) {
+	got := computeCampaignNextAction(campaign.StateAwaitingHuman, campaign.Eligibility{
+		Done:     []string{"issue:100"},
+		HumanLed: []string{"issue:101", "issue:102"},
+	})
+	if got.Action == "closed" {
+		t.Fatalf("action = closed — awaiting_human must be NON-terminal so the #2681 post-filter never fires (detail=%q)", got.Detail)
+	}
+	if got.Action != "attend_human_led" {
+		t.Errorf("action = %q, want attend_human_led", got.Action)
+	}
+	if got.IssueRef != "issue:101" {
+		t.Errorf("issue_ref = %q, want issue:101 (the first human-led ref, unchanged)", got.IssueRef)
+	}
+	if !strings.Contains(got.Detail, "2 human-led") {
+		t.Errorf("detail = %q, want the count \"2 human-led\"", got.Detail)
+	}
+	for _, ref := range []string{"issue:101", "issue:102"} {
+		if !strings.Contains(got.Detail, ref) {
+			t.Errorf("detail = %q, want it to name %s", got.Detail, ref)
+		}
+	}
+	// The pre-#3660 guidance sentence is preserved BYTE-IDENTICALLY as the prefix.
+	if !strings.Contains(got.Detail, "a human must lead it — do not dispatch an agent run") {
+		t.Errorf("detail = %q, want the unchanged guidance sentence", got.Detail)
+	}
+}
+
+// TestAttendHumanLedDetail_CapsEnumeration pins the enumeration bound: at most
+// humanLedRefsInDetail refs are named and the remainder is summarized as a
+// "(+N more)" tail, so a large campaign's detail stays bounded rather than
+// unbounded-or-truncated. The COUNT always reflects every human-led item.
+func TestAttendHumanLedDetail_CapsEnumeration(t *testing.T) {
+	refs := make([]string, 0, humanLedRefsInDetail+3)
+	for i := 0; i < humanLedRefsInDetail+3; i++ {
+		refs = append(refs, fmt.Sprintf("issue:%d", 900+i))
+	}
+	got := attendHumanLedDetail(refs)
+	if !strings.Contains(got, fmt.Sprintf("%d human-led items remain", len(refs))) {
+		t.Errorf("detail = %q, want the FULL count %d", got, len(refs))
+	}
+	if !strings.Contains(got, "(+3 more)") {
+		t.Errorf("detail = %q, want a \"(+3 more)\" tail", got)
+	}
+	// The refs WITHIN the cap are all still enumerated. Without this arm a
+	// regression dropping every enumerated ref in the overflow branch still
+	// satisfies the count, the tail and the past-the-cap omission below.
+	for _, ref := range refs[:humanLedRefsInDetail] {
+		if !strings.Contains(got, ref) {
+			t.Errorf("detail = %q, want %s enumerated within the cap", got, ref)
+		}
+	}
+	// The capped-off refs are NOT enumerated.
+	for _, ref := range refs[humanLedRefsInDetail:] {
+		if strings.Contains(got, ref) {
+			t.Errorf("detail = %q, should not enumerate %s past the cap", got, ref)
+		}
+	}
+	// Singular wording for exactly one.
+	if one := attendHumanLedDetail([]string{"issue:1"}); !strings.Contains(one, "1 human-led item remains: issue:1") {
+		t.Errorf("single-item detail = %q, want singular \"1 human-led item remains: issue:1\"", one)
+	}
+}

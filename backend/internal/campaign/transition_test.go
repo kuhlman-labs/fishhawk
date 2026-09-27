@@ -32,6 +32,39 @@ func TestCampaignTransitions_AllowedAndForbidden(t *testing.T) {
 		{StatePaused, StatePending, false},   // no going back to pending
 		// paused is non-terminal: pending can't reach it directly (only running can)
 		{StatePending, StatePaused, false},
+		// awaiting_human (E72.33 / #3660), the DERIVED non-terminal state.
+		// INTO it: a never-started all-human-led campaign derives it before any
+		// dispatch (pending), and a campaign whose agent work finished derives it
+		// from running.
+		{StatePending, StateAwaitingHuman, true},
+		{StateRunning, StateAwaitingHuman, true},
+		// OUT of it — the reverse half of the iff. Without these edges
+		// deriveCampaignAfterChange silently DROPS the re-derivation and the row
+		// sticks while next_action advances.
+		{StateAwaitingHuman, StateRunning, true},
+		// REVISION FIX 1: the relabel-WITHOUT-start corner. On a never-started
+		// campaign DeriveState returns StatePending after the relabel, so this edge
+		// carries the correction. (The pre-revision plan asserted this edge INVALID;
+		// that assertion is deliberately DROPPED.)
+		{StateAwaitingHuman, StatePending, true},
+		{StateAwaitingHuman, StateSucceeded, true},
+		{StateAwaitingHuman, StateFailed, true},
+		{StateAwaitingHuman, StateCancelled, true},
+		{StateAwaitingHuman, StateAwaitingHuman, true}, // idempotent no-op
+		// DELIBERATELY ABSENT edges.
+		// paused -> awaiting_human: a paused campaign stays sticky; the table
+		// refusing the edge is the backstop for every caller outside
+		// reconcileCampaignItemsOnRead's own sticky-paused guard.
+		{StatePaused, StateAwaitingHuman, false},
+		// awaiting_human -> paused: the pause/page path only sweeps `running`
+		// campaigns, and an awaiting_human campaign has no running item to page.
+		{StateAwaitingHuman, StatePaused, false},
+		// awaiting_human is NON-terminal, which is what admits the edges above.
+		// A terminal state would refuse all of them (ValidCampaignTransition's
+		// IsTerminal short-circuit), so this is the load-bearing assertion.
+		{StateSucceeded, StateAwaitingHuman, false},
+		{StateFailed, StateAwaitingHuman, false},
+		{StateCancelled, StateAwaitingHuman, false},
 		// same-state idempotent no-ops
 		{StatePending, StatePending, true},
 		{StateRunning, StateRunning, true},
