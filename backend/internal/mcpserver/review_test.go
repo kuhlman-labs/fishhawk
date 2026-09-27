@@ -1859,6 +1859,289 @@ func TestReviewStatusFor_Plan_CompleteWithRound2Verdict(t *testing.T) {
 	}
 }
 
+// --- retry-boundary flooring (#3690) ---
+
+// seedStageRetriedAudit appends a stage_retried / stage_override_retried audit
+// entry — the THIRD re-open boundary reviewStatusFor floors its terminal reads
+// to (#3690). stageID is stamped only when non-empty and prior_category only
+// when non-empty, so both a legacy payload-less entry and an unstamped stage_id
+// (the permissive liveRetryFloor arms) are expressible. Like its fix-up /
+// revise siblings the entry's Sequence lands after every previously seeded
+// entry, so a retry seeded after a round-1 verdict correctly floors it out.
+func seedStageRetriedAudit(fb *fakeBackend, runID uuid.UUID, category, stageID, priorCategory string) {
+	var payload any
+	if priorCategory != "" {
+		payload = map[string]any{"prior_category": priorCategory}
+	}
+	var sid *string
+	if stageID != "" {
+		sid = &stageID
+	}
+	fb.mu.Lock()
+	fb.perRunAuditByRun[runID] = append(fb.perRunAuditByRun[runID], AuditEntry{
+		ID:       uuid.New().String(),
+		Sequence: int64(len(fb.perRunAuditByRun[runID]) + 1),
+		RunID:    runID.String(),
+		StageID:  sid,
+		Category: category,
+		Payload:  payload,
+	})
+	fb.mu.Unlock()
+}
+
+// seedReviewStartedAuditForStage is seedReviewStartedAudit with the entry's
+// stage_id STAMPED — the anchor the #3690 retry floor is scoped to. The
+// plain seeder deliberately leaves StageID nil (the permissive arm), so every
+// pre-#3690 test keeps working untouched.
+func seedReviewStartedAuditForStage(fb *fakeBackend, runID uuid.UUID, category string, configuredAgents int, authority, stageID string) {
+	payload, _ := json.Marshal(map[string]any{
+		"configured_agents": configuredAgents,
+		"authority":         authority,
+	})
+	var decoded any
+	_ = json.Unmarshal(payload, &decoded)
+	var sid *string
+	if stageID != "" {
+		sid = &stageID
+	}
+	fb.mu.Lock()
+	fb.perRunAuditByRun[runID] = append(fb.perRunAuditByRun[runID], AuditEntry{
+		ID:       uuid.New().String(),
+		Sequence: int64(len(fb.perRunAuditByRun[runID]) + 1),
+		RunID:    runID.String(),
+		StageID:  sid,
+		Category: category,
+		Payload:  decoded,
+	})
+	fb.mu.Unlock()
+}
+
+// TestLiveRetryFloor is the pure table over the #3690 floor rule: max
+// selection, the category-D void, the stage-id scoping and its permissive
+// empty-id arms in BOTH directions.
+func TestLiveRetryFloor(t *testing.T) {
+	re := func(seq int64, stage, prior string) retryEntry {
+		return retryEntry{Sequence: seq, StageID: stage, PriorCategory: prior}
+	}
+	cases := []struct {
+		name         string
+		retries      []retryEntry
+		roundStageID string
+		want         int64
+	}{
+		{"no retries", nil, "s", 0},
+		{"one counting retry floors at its sequence", []retryEntry{re(10, "s", "A")}, "s", 10},
+		{"max wins across several", []retryEntry{re(10, "s", "A"), re(30, "s", "B"), re(20, "s", "C")}, "s", 30},
+		{"category D does not floor", []retryEntry{re(10, "s", "D")}, "s", 0},
+		{"a non-D sibling in the same slice still floors", []retryEntry{re(30, "s", "D"), re(10, "s", "A")}, "s", 10},
+		{"stage-id mismatch is skipped", []retryEntry{re(10, "other", "A")}, "s", 0},
+		{"empty stage id on the ENTRY matches", []retryEntry{re(10, "", "A")}, "s", 10},
+		{"empty stage id on the ROUND matches", []retryEntry{re(10, "s", "A")}, "", 10},
+		{"absent prior_category counts (fail-closed)", []retryEntry{re(10, "s", "")}, "s", 10},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := liveRetryFloor(tc.retries, tc.roundStageID); got != tc.want {
+				t.Errorf("liveRetryFloor = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestReviewStatusFor_Implement_PendingAfterRetryThenCompleteWithRound2 is the
+// #3690 done-means, the shape observed on run c9cd4085 / PR #3689: round 1
+// landed BOTH configured verdicts (two HIGH rejects), the operator retried the
+// implement stage — discarding the tree those verdicts describe — and a fresh
+// round opened. Before the fix the two superseded rejects still satisfied the
+// #1127 count gate and fishhawk_await_review returned 'complete' carrying them.
+func TestReviewStatusFor_Implement_PendingAfterRetryThenCompleteWithRound2(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	implStageID := uuid.New().String()
+	// Round 1: two configured reviewers both landed a reject.
+	seedReviewStartedAuditForStage(fb, runID, "implement_review_started", 2, "advisory", implStageID)
+	seedImplementReviewAudit(fb, runID, PlanReview{ReviewerKind: "agent", Authority: "advisory", Verdict: "reject"})
+	seedImplementReviewAudit(fb, runID, PlanReview{ReviewerKind: "agent", Authority: "advisory", Verdict: "reject"})
+	// The operator retries THAT stage: the tree round 1 reviewed is gone.
+	seedStageRetriedAudit(fb, runID, categoryStageRetried, implStageID, "A")
+	// Attempt 2 succeeds and opens a fresh round with no verdicts yet.
+	seedReviewStartedAuditForStage(fb, runID, "implement_review_started", 2, "advisory", implStageID)
+	r := newResolver(srv, nil)
+
+	st, err := r.reviewStatusFor(context.Background(), runID, "implement")
+	if err != nil {
+		t.Fatalf("reviewStatusFor: %v", err)
+	}
+	if st.Status != "pending" {
+		t.Errorf("Status = %q, want pending (the superseded pre-retry rejects must not read complete)", st.Status)
+	}
+	if len(st.Reviews) != 0 {
+		t.Errorf("Reviews = %+v, want empty while the post-retry review is in flight", st.Reviews)
+	}
+
+	// Round 2's own verdicts land: the status completes carrying EXACTLY those.
+	seedImplementReviewAudit(fb, runID, PlanReview{ReviewerKind: "agent", Authority: "advisory", Verdict: "approve"})
+	seedImplementReviewAudit(fb, runID, PlanReview{ReviewerKind: "agent", Authority: "advisory", Verdict: "approve_with_concerns",
+		Concerns: []PlanReviewConcern{{Severity: "low", Category: "style", Note: "nit"}}})
+
+	st, err = r.reviewStatusFor(context.Background(), runID, "implement")
+	if err != nil {
+		t.Fatalf("reviewStatusFor (round 2): %v", err)
+	}
+	if st.Status != "complete" {
+		t.Fatalf("Status = %q, want complete once the post-retry round lands", st.Status)
+	}
+	if len(st.Reviews) != 2 {
+		t.Fatalf("Reviews = %+v, want exactly the 2 round-2 verdicts", st.Reviews)
+	}
+	// Assert the VALUES, so a floored-out round-1 reject cannot pass as a
+	// round-2 row on count alone.
+	for i, rv := range st.Reviews {
+		if rv.Verdict == "reject" {
+			t.Errorf("Reviews[%d].Verdict = reject; the round-1 rejects must be floored out", i)
+		}
+	}
+	if st.Reviews[0].Verdict != "approve" || st.Reviews[1].Verdict != "approve_with_concerns" {
+		t.Errorf("Reviews verdicts = %q/%q, want approve/approve_with_concerns (the round-2 pair)",
+			st.Reviews[0].Verdict, st.Reviews[1].Verdict)
+	}
+}
+
+// TestReviewStatusFor_Implement_RetryOfDifferentStageDoesNotFloor pins the
+// STAGE SCOPING: a retry of a DIFFERENT stage must leave this round UNCHANGED
+// — the round-1 verdict still reads 'complete'. The two ids are distinct
+// uuid.New() values by construction, so the permissive empty-id arm (which
+// would MASK the guard and keep the test green either way) cannot be taken.
+// This is counterfactual (2): deleting the stage-id inequality skip from
+// liveRetryFloor floors the verdict out and the status flips to 'pending'.
+func TestReviewStatusFor_Implement_RetryOfDifferentStageDoesNotFloor(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	implStageID := uuid.New().String()
+	planStageID := uuid.New().String()
+	seedReviewStartedAuditForStage(fb, runID, "implement_review_started", 1, "advisory", implStageID)
+	seedImplementReviewAudit(fb, runID, PlanReview{ReviewerKind: "agent", Authority: "advisory", Verdict: "approve"})
+	// A retry of the PLAN stage, at a HIGHER sequence than the verdict.
+	seedStageRetriedAudit(fb, runID, categoryStageRetried, planStageID, "A")
+	r := newResolver(srv, nil)
+
+	st, err := r.reviewStatusFor(context.Background(), runID, "implement")
+	if err != nil {
+		t.Fatalf("reviewStatusFor: %v", err)
+	}
+	if st.Status != "complete" {
+		t.Errorf("Status = %q, want complete (a retry of a DIFFERENT stage must not floor this round)", st.Status)
+	}
+	if len(st.Reviews) != 1 {
+		t.Fatalf("Reviews = %+v, want the round UNCHANGED with its 1 verdict", st.Reviews)
+	}
+	if st.Reviews[0].Verdict != "approve" {
+		t.Errorf("Reviews[0].Verdict = %q, want approve (the round is unchanged)", st.Reviews[0].Verdict)
+	}
+}
+
+// TestReviewStatusFor_Implement_PendingAfterOverrideRetry pins the SECOND
+// retry category: an override retry (one admitted past the budget/category
+// gate) re-opens the round exactly as a plain retry does. Reading only
+// stage_retried would leave the override path with the #3690 false 'complete'.
+func TestReviewStatusFor_Implement_PendingAfterOverrideRetry(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	implStageID := uuid.New().String()
+	seedReviewStartedAuditForStage(fb, runID, "implement_review_started", 2, "advisory", implStageID)
+	seedImplementReviewAudit(fb, runID, PlanReview{ReviewerKind: "agent", Authority: "advisory", Verdict: "reject"})
+	seedImplementReviewAudit(fb, runID, PlanReview{ReviewerKind: "agent", Authority: "advisory", Verdict: "reject"})
+	seedStageRetriedAudit(fb, runID, categoryStageOverrideRetried, implStageID, "B")
+	r := newResolver(srv, nil)
+
+	st, err := r.reviewStatusFor(context.Background(), runID, "implement")
+	if err != nil {
+		t.Fatalf("reviewStatusFor: %v", err)
+	}
+	if st.Status != "pending" {
+		t.Errorf("Status = %q, want pending (a stage_override_retried entry floors the round too)", st.Status)
+	}
+	if len(st.Reviews) != 0 {
+		t.Errorf("Reviews = %+v, want empty after the override retry", st.Reviews)
+	}
+}
+
+// TestReviewStatusFor_Plan_CategoryDRetryDoesNotFloor pins the category-D
+// VOID and, on the byte-identical fixture, its discriminating pair: a
+// category-D (SLA-timeout) retry re-opens the approval GATE rather than
+// re-running the agent, so it opens no new round and must NOT floor — while
+// the SAME fixture with prior_category "A" must. The pair is what proves the
+// D case does not pass vacuously (the entry is present in both arms; only the
+// payload value differs). It also exercises the floor on the PLAN stage, where
+// the existing boundary is plan_revised.
+func TestReviewStatusFor_Plan_CategoryDRetryDoesNotFloor(t *testing.T) {
+	seed := func(t *testing.T, priorCategory string) *ReviewStatus {
+		t.Helper()
+		fb, srv := newFakeBackend(t)
+		runID := uuid.New()
+		planStageID := uuid.New().String()
+		seedReviewStartedAuditForStage(fb, runID, "plan_review_started", 1, "advisory", planStageID)
+		seedPlanReviewAudit(fb, runID, PlanReview{ReviewerKind: "agent", Authority: "advisory", Verdict: "approve"})
+		seedStageRetriedAudit(fb, runID, categoryStageRetried, planStageID, priorCategory)
+		st, err := newResolver(srv, nil).reviewStatusFor(context.Background(), runID, "plan")
+		if err != nil {
+			t.Fatalf("reviewStatusFor: %v", err)
+		}
+		return st
+	}
+	t.Run("prior_category D does not floor", func(t *testing.T) {
+		st := seed(t, "D")
+		if st.Status != "complete" {
+			t.Errorf("Status = %q, want complete (a D retry re-opens the GATE, opens no round, and must not strand this one)", st.Status)
+		}
+		if len(st.Reviews) != 1 {
+			t.Errorf("Reviews = %+v, want the round UNCHANGED with its 1 verdict", st.Reviews)
+		}
+	})
+	t.Run("prior_category A floors", func(t *testing.T) {
+		st := seed(t, "A")
+		if st.Status != "pending" {
+			t.Errorf("Status = %q, want pending (a non-D retry discards the plan, so its verdict is superseded)", st.Status)
+		}
+	})
+}
+
+// TestReviewStatusFor_Implement_RetryReadErrorFailsClosed pins the FAIL-CLOSED
+// read posture, one sub-test per retry category: when a retry read fails,
+// reviewStatusFor must propagate the error rather than degrade to a floor of 0
+// — which would resurrect exactly the false 'complete' #3690 fixes. The
+// fixture is the done-means shape, so a swallowed error yields status
+// 'complete' with a nil error.
+func TestReviewStatusFor_Implement_RetryReadErrorFailsClosed(t *testing.T) {
+	for _, category := range []string{categoryStageRetried, categoryStageOverrideRetried} {
+		t.Run(category, func(t *testing.T) {
+			fb, srv := newFakeBackend(t)
+			runID := uuid.New()
+			implStageID := uuid.New().String()
+			seedReviewStartedAuditForStage(fb, runID, "implement_review_started", 2, "advisory", implStageID)
+			seedImplementReviewAudit(fb, runID, PlanReview{ReviewerKind: "agent", Authority: "advisory", Verdict: "reject"})
+			seedImplementReviewAudit(fb, runID, PlanReview{ReviewerKind: "agent", Authority: "advisory", Verdict: "reject"})
+			seedStageRetriedAudit(fb, runID, categoryStageRetried, implStageID, "A")
+			// Fail ONLY this category's read. reviewFlip runs under fb.mu
+			// (the audit handler holds it), so it sets the field directly.
+			failing := category
+			fb.reviewFlip = func(cat string) {
+				if cat == failing {
+					fb.perRunAuditStatus = http.StatusInternalServerError
+					return
+				}
+				fb.perRunAuditStatus = http.StatusOK
+			}
+			r := newResolver(srv, nil)
+
+			st, err := r.reviewStatusFor(context.Background(), runID, "implement")
+			if err == nil {
+				t.Fatalf("reviewStatusFor returned nil error on a failing %s read (status=%q); the retry reads must be FAIL-CLOSED", failing, st.Status)
+			}
+		})
+	}
+}
+
 // --- count-based completeness (#1127) ---
 //
 // In the heterogeneous topology the reviewers run sequentially in one loop and

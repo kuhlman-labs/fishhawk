@@ -60,6 +60,24 @@ const categoryStageFixupTriggered = "stage_fixup_triggered"
 // (#1201).
 const categoryPlanRevised = "plan_revised"
 
+// categoryStageRetried mirrors backend server.CategoryStageRetried
+// (backend/internal/server/retry.go). KEEP IN SYNC: it is the durable audit
+// record of a fishhawk_retry_stage re-open — the THIRD stage re-open boundary
+// the MCP review-status layer floors its terminal-verdict reads to, alongside
+// stage_fixup_triggered and plan_revised. A retry discards the tree the prior
+// round's verdicts describe, so without this the superseded verdicts satisfied
+// the #1127 count gate and fishhawk_await_review reported `complete` against a
+// tree the retry threw away (#3690).
+const categoryStageRetried = "stage_retried"
+
+// categoryStageOverrideRetried mirrors backend
+// server.CategoryStageOverrideRetried (backend/internal/server/retry.go).
+// KEEP IN SYNC: it is the same re-open recorded under the OVERRIDE path (a
+// retry admitted past the budget/category gate). It floors the review round
+// exactly as categoryStageRetried does — reading only one of the two would
+// leave the override path with the #3690 false `complete`.
+const categoryStageOverrideRetried = "stage_override_retried"
+
 // categoryFixupNoChanges mirrors the backend report category written by
 // server.succeedFixupNoChangesStage (backend/internal/server/pullrequest.go)
 // when a fix-up re-dispatch produces no commit. KEEP IN SYNC: it is the

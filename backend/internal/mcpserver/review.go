@@ -319,12 +319,42 @@ func (r *runResolver) decodeLatestStartedConfiguredAgents(ctx context.Context, r
 // complete-on-first-verdict predicate via reviewStatusFallback, never
 // stranding on 'pending'.
 //
-// Re-open boundary (#894, #1201): the three TERMINAL-verdict reads (reviewed /
-// skipped / failed) are floored to entries that landed AFTER the latest stage
-// re-open audit sequence — stage_fixup_triggered for the implement stage
-// (latestImplementFixupSeq, #894), plan_revised for the plan stage
-// (latestPlanRevisedSeq, #1201, the plan-stage analog: a fishhawk_revise_plan
-// re-opens the plan gate) — so once a stage is re-opened the stale pre-re-open
+// Re-open boundary (#894, #1201, #3690): the three TERMINAL-verdict reads
+// (reviewed / skipped / failed) are floored to entries that landed AFTER the
+// latest stage re-open audit sequence. THREE boundaries feed that floor, and
+// the effective floor is their MAX:
+//
+//   - stage_fixup_triggered for the implement stage (latestImplementFixupSeq,
+//     #894), RUN-scoped.
+//   - plan_revised for the plan stage (latestPlanRevisedSeq, #1201, the
+//     plan-stage analog: a fishhawk_revise_plan re-opens the plan gate),
+//     RUN-scoped.
+//   - stage_retried / stage_override_retried for BOTH stages
+//     (latestStageRetrySeq, #3690): a retry discards the tree (or the plan)
+//     the prior round's verdicts describe, so leaving them in the round let
+//     them satisfy the #1127 count gate and made fishhawk_await_review report
+//     'complete' carrying verdicts against a tree the retry threw away
+//     (observed on run c9cd4085 / PR #3689). Unlike the other two this
+//     boundary is STAGE-SCOPED: it is anchored on the round's own
+//     *_review_started entry's stage_id, so a retry of a DIFFERENT stage never
+//     floors this round. A retry whose payload prior_category is "D" is VOID
+//     — a category-D SLA-timeout retry re-opens the approval GATE to
+//     awaiting_approval rather than re-running the agent, so it opens no new
+//     round and flooring on it would strand this one at 'pending' forever. An
+//     EMPTY stage_id on either side MATCHES (liveRetryFloor's permissive
+//     rule), degrading to run-scoped flooring rather than silently disabling
+//     the boundary. BOTH retry reads are FAIL-CLOSED: a read error propagates
+//     rather than degrading to a floor of 0, which would resurrect the false
+//     'complete'.
+//
+// RESIDUAL (#3690): a retry that FAILS AGAIN leaves the status 'pending' — no
+// post-retry round will land — where it previously read a false 'complete'.
+// fishhawk_await_review bounds that: it returns pending-after-timeout with its
+// existing actionable message and poll_interval_seconds, so the operator sees
+// an honest 'no verdict for the current tree' plus the failed stage in
+// fishhawk_get_run_status, not an indefinite block.
+//
+// So once a stage is re-opened the stale pre-re-open
 // verdict no longer reads as terminal. The *_review_started proxy check stays
 // UNFLOORED on purpose: the round-1 started entry (at a sequence below the
 // boundary) is still present, so 'started exists' remains true and the
@@ -332,9 +362,10 @@ func (r *runResolver) decodeLatestStartedConfiguredAgents(ctx context.Context, r
 // the re-review's terminal entry — which is exactly what fishhawk_await_review
 // must report while the re-review is in flight, the analogous sibling to the
 // #870 stale-input fix. sinceSeq is 0 for an implement stage with no prior
-// fix-up and for a plan stage with no prior revise; a 0 floor is a no-op
-// (sequences are >= 1), so both the no-fix-up implement path and the no-revise
-// plan path are byte-for-byte unchanged.
+// fix-up, for a plan stage with no prior revise, and for either stage with no
+// prior retry; a 0 floor is a no-op (sequences are >= 1), so the no-fix-up
+// implement path, the no-revise plan path and the no-retry path are all
+// byte-for-byte unchanged.
 func (r *runResolver) reviewStatusFor(ctx context.Context, runID uuid.UUID, stage string) (*ReviewStatus, error) {
 	round, err := r.loadReviewRound(ctx, runID, stage)
 	if err != nil {
@@ -374,9 +405,11 @@ func (rd reviewRound) LandedRows() []PlanReview {
 	return union
 }
 
-// loadReviewRound performs the round's audit reads. Query shape and count are
-// byte-for-byte what reviewStatusFor issued before the #2712 split: one
-// re-open-boundary read, three terminal reads, one started read.
+// loadReviewRound performs the round's audit reads. The pre-#3690 shape and
+// ORDER are unchanged — one re-open-boundary read, three terminal reads, one
+// started read — followed by TWO retry-boundary reads (#3690) and, ONLY when
+// the retry boundary raises the effective floor, a re-issue of the three
+// terminal reads at that raised floor.
 func (r *runResolver) loadReviewRound(ctx context.Context, runID uuid.UUID, stage string) (reviewRound, error) {
 	var out reviewRound
 	cats, err := categoriesForStage(stage)
@@ -403,6 +436,7 @@ func (r *runResolver) loadReviewRound(ctx context.Context, runID uuid.UUID, stag
 			return out, err
 		}
 	}
+
 	out.SinceSeq = sinceSeq
 
 	out.Reviewed, err = r.decodeReviewVerdicts(ctx, runID, cats.reviewed, sinceSeq)
@@ -424,6 +458,45 @@ func (r *runResolver) loadReviewRound(ctx context.Context, runID uuid.UUID, stag
 	out.Started, err = r.latestStartedRound(ctx, runID, cats.started)
 	if err != nil {
 		return out, err
+	}
+
+	// The THIRD boundary (#3690): a stage retry re-opens the round exactly as a
+	// fix-up does, and applies to BOTH stages (a retried plan stage discards its
+	// plan the same way an implement retry discards its tree). The effective
+	// floor is max(per-stage boundary, retry boundary).
+	//
+	// It is resolved AFTER the started read because it is STAGE-SCOPED to the
+	// round's own stage_id, which only that read supplies — and the three
+	// terminal reads above therefore ran at the per-stage floor. When the retry
+	// boundary RAISES the floor they are re-issued at the raised value; a run
+	// with no live retry entry yields 0 here, which never raises the floor, so
+	// no re-issue happens and every pre-#3690 path is byte-for-byte preserved.
+	// Reading the started entry first instead would be cheaper, but the round's
+	// audit reads are observed by test fixtures that key on which category is
+	// read last within one load, so the read ORDER is deliberately unchanged.
+	//
+	// COST: two extra category-filtered audit reads per review-status poll (two
+	// categories because ListRunAuditFilter.Category takes a single category),
+	// plus the three re-issued terminal reads only on a run that actually
+	// carries a live retry — which is exactly when correctness depends on them.
+	retrySeq, err := r.latestStageRetrySeq(ctx, runID, out.Started.StageID)
+	if err != nil {
+		return out, err
+	}
+	if retrySeq > sinceSeq {
+		out.SinceSeq = retrySeq
+		out.Reviewed, err = r.decodeReviewVerdicts(ctx, runID, cats.reviewed, retrySeq)
+		if err != nil {
+			return out, err
+		}
+		out.Skipped, err = r.decodeSkippedReviews(ctx, runID, cats.skipped, retrySeq)
+		if err != nil {
+			return out, err
+		}
+		out.Failed, err = r.decodeFailedReviews(ctx, runID, cats.failed, retrySeq)
+		if err != nil {
+			return out, err
+		}
 	}
 	return out, nil
 }
@@ -621,6 +694,85 @@ func derefString(p *string) string {
 	return *p
 }
 
+// retryEntry is one stage_retried or stage_override_retried audit entry
+// reduced to what liveRetryFloor needs.
+type retryEntry struct {
+	Sequence      int64
+	StageID       string
+	PriorCategory string
+}
+
+// liveRetryFloor is the pure #3690 retry boundary: the MAX Sequence among the
+// retry entries that COUNT, 0 when none do.
+//
+// An entry does NOT count when either rule fires:
+//
+//   - PriorCategory is "D". A category-D (SLA-timeout) retry re-opens the
+//     approval GATE to awaiting_approval rather than re-running the agent
+//     (backend/internal/run/retry.go), so it discards no tree and opens no new
+//     review round. Flooring on it would strand the round at 'pending' with no
+//     round ever coming. This is the same carve-out retryStageAs's concern
+//     sweep already makes.
+//   - Both roundStageID and the entry's StageID are non-empty and unequal —
+//     the STAGE SCOPING. A retry of a DIFFERENT stage must never floor this
+//     round. An EMPTY id on EITHER side MATCHES, mirroring liveFixupFloor's
+//     permissive rule: a backend that stops stamping stage_id on one side
+//     degrades to run-scoped flooring rather than silently disabling the rule.
+func liveRetryFloor(retries []retryEntry, roundStageID string) int64 {
+	var floor int64
+	for _, rec := range retries {
+		if rec.PriorCategory == "D" {
+			continue
+		}
+		if rec.StageID != "" && roundStageID != "" && rec.StageID != roundStageID {
+			continue
+		}
+		if rec.Sequence > floor {
+			floor = rec.Sequence
+		}
+	}
+	return floor
+}
+
+// latestStageRetrySeq returns the retry boundary for the round anchored on
+// roundStageID: the MAX audit Sequence among the run's COUNTING stage_retried
+// and stage_override_retried entries (0 when none), per liveRetryFloor.
+//
+// BOTH reads are FAIL-CLOSED — the error propagates, the same posture as
+// latestImplementFixupSeq's trigger read. A read failure that fell back to a
+// floor of 0 would resurrect exactly the false 'complete' #3690 fixes. The two
+// categories need two reads because ListRunAuditFilter.Category takes a single
+// category; see the cost note in loadReviewRound.
+func (r *runResolver) latestStageRetrySeq(ctx context.Context, runID uuid.UUID, roundStageID string) (int64, error) {
+	retries := make([]retryEntry, 0, reviewAuditQueryLimit)
+	for _, category := range []string{categoryStageRetried, categoryStageOverrideRetried} {
+		entries, _, err := r.api.ListRunAudit(ctx, runID, ListRunAuditFilter{
+			Category: category,
+			Limit:    reviewAuditQueryLimit,
+		})
+		if err != nil {
+			return 0, err
+		}
+		for _, e := range entries {
+			re := retryEntry{Sequence: e.Sequence, StageID: derefString(e.StageID)}
+			// Marshal-then-unmarshal, the latestImplementFixupSeq idiom: the
+			// client decodes Payload as a generic any. An undecodable or
+			// absent payload leaves PriorCategory empty, so the entry COUNTS
+			// — an unreadable payload must not silently void the floor.
+			if raw, merr := json.Marshal(e.Payload); merr == nil {
+				var p struct {
+					PriorCategory string `json:"prior_category"`
+				}
+				if json.Unmarshal(raw, &p) == nil {
+					re.PriorCategory = p.PriorCategory
+				}
+			}
+			retries = append(retries, re)
+		}
+	}
+	return liveRetryFloor(retries, roundStageID), nil
+}
+
 // latestPlanRevisedSeq returns the MAX audit Sequence among the run's
 // plan_revised entries (0 when none exist), the plan-revision boundary
 // reviewStatusFor floors the plan stage's terminal-verdict reads to (#1201).
@@ -656,7 +808,12 @@ type startedRound struct {
 	ConfiguredAgents int
 	Timestamp        time.Time
 	Sequence         int64
-	Exists           bool
+	// StageID is the review stage the round was dispatched for, the anchor
+	// the #3690 retry floor is STAGE-SCOPED to (server.emitReviewStarted
+	// stamps it on every append). Empty when the backend did not stamp
+	// stage_id, which liveRetryFloor treats permissively.
+	StageID string
+	Exists  bool
 }
 
 // latestStartedRound reads the run's *_review_started entries for the category
@@ -683,7 +840,8 @@ func (r *runResolver) latestStartedRound(ctx context.Context, runID uuid.UUID, c
 	if latest == nil {
 		return startedRound{}, nil
 	}
-	out := startedRound{Exists: true, Timestamp: latest.Timestamp, Sequence: latest.Sequence}
+	out := startedRound{Exists: true, Timestamp: latest.Timestamp, Sequence: latest.Sequence,
+		StageID: derefString(latest.StageID)}
 	if latest.Payload == nil {
 		return out, nil
 	}
