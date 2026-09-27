@@ -34,6 +34,10 @@ import (
 // generous only matters when something is genuinely broken.
 const e2eWait = 5 * time.Second
 
+// methodServerDiscover is the SEP-2575 discovery RPC the go-sdk client probes
+// with before falling back to the initialize handshake.
+const methodServerDiscover = "server/discover"
+
 // --- child side: a real mcp.Server behind the childTransport seam ---
 
 // e2eChild is a childTransport whose "process" is a real go-sdk mcp.Server
@@ -42,6 +46,15 @@ const e2eWait = 5 * time.Second
 type e2eChild struct {
 	name   string
 	server *mcp.Server
+
+	// refuseDiscover emulates a pre-SEP-2575 server: a server/discover frame is
+	// recorded like any other but answered LOCALLY with method-not-found and
+	// never forwarded to the real mcp.Server (which, built from the same go-sdk
+	// as the client, would otherwise always accept the probe). Unlike
+	// legacyClientTransport the probe still travels the full client -> shim ->
+	// child path, so the shim genuinely classifies the session stateless first —
+	// which is the #3288 bad state.
+	refuseDiscover bool
 
 	frames chan []byte
 	exited chan error
@@ -65,6 +78,14 @@ func newE2EChild(name string, tools ...string) *e2eChild {
 		frames: make(chan []byte, 256),
 		exited: make(chan error, 1),
 	}
+}
+
+// newPreSEPChild is newE2EChild with the SEP-2575 discovery RPC refused — a
+// version-skewed child, the shape #3288 is about.
+func newPreSEPChild(name string, tools ...string) *e2eChild {
+	c := newE2EChild(name, tools...)
+	c.refuseDiscover = true
+	return c
 }
 
 // e2eToolListTTL is the SEP-2549 ttlMs the e2e children stamp on every
@@ -134,7 +155,16 @@ func (c *e2eChild) Send(frame []byte) error {
 	}
 	c.sent = append(c.sent, cloneBytes(frame))
 	w := c.stdin
+	refuse := c.refuseDiscover
 	c.mu.Unlock()
+	if refuse {
+		if p := peek(frame); p.hasMethod() && p.hasID() && p.method() == methodServerDiscover {
+			// A pre-SEP-2575 server: the RPC does not exist. Answer it here and
+			// keep it off the real server's stdin entirely.
+			c.frames <- []byte(`{"jsonrpc":"2.0","id":` + p.idKey() + `,"error":{"code":-32601,"message":"method not found"}}` + "\n")
+			return nil
+		}
+	}
 	// Written outside the lock: a pipe write completes only once the server's
 	// reader consumes it, and sentFrames must never wait on that.
 	_, err := w.Write(frame)
@@ -625,6 +655,75 @@ func TestLegacyClientStillReplaysHandshake(t *testing.T) {
 	} else if id := subscriptionIDOf(req); id != "" {
 		t.Fatalf("legacy list_changed carried a subscription id %q, want untagged", id)
 	}
+	if got := toolNames(ctx, t, cs); strings.Join(got, ",") != "beta" {
+		t.Fatalf("tools after swap = %v, want [beta]", got)
+	}
+}
+
+// TestDiscoveryRejectionFallsBackAndReplaysHandshake is the #3288 proof end to
+// end: a stock go-sdk v1.7.0 client against a VERSION-SKEWED child that refuses
+// server/discover. The probe reaches the shim (so the session is genuinely
+// classified stateless first), the client falls back to the legacy initialize
+// handshake, and the swap must therefore replay that handshake — the fresh
+// child is initialized and ListTools reflects it. Before the reclassification
+// the swap took the stateless arm, left the fresh child un-initialized, and the
+// ListTools below failed with `invalid during session initialization`.
+//
+// The wire-order assertion is an anti-vacuity guard: it proves server/discover
+// really preceded initialize, so a future SDK that stops probing reddens this
+// test rather than silently degrading it into a duplicate of
+// TestLegacyClientStillReplaysHandshake.
+func TestDiscoveryRejectionFallsBackAndReplaysHandshake(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	childA := newPreSEPChild("A", "alpha")
+	childB := newPreSEPChild("B", "beta")
+	s := newE2ESession(t, childA, childB)
+	s.start()
+	cs := s.connect(ctx)
+
+	methods := s.upstreamMethods()
+	var discoverAt, initAt = -1, -1
+	for i, m := range methods {
+		if m == methodServerDiscover && discoverAt < 0 {
+			discoverAt = i
+		}
+		if m == "initialize" && initAt < 0 {
+			initAt = i
+		}
+	}
+	if discoverAt < 0 || initAt < 0 || discoverAt > initAt {
+		t.Fatalf("upstream methods %v, want server/discover BEFORE the fallback initialize (the shim must have classified on the probe)", methods)
+	}
+	if got := cs.InitializeResult().ProtocolVersion; isStatelessVersion(got) {
+		t.Fatalf("client negotiated %q after a refused discover, want a legacy version", got)
+	}
+	if got := toolNames(ctx, t, cs); strings.Join(got, ",") != "alpha" {
+		t.Fatalf("tools before swap = %v, want [alpha]", got)
+	}
+
+	pre := s.publishNow()
+	if pre.SessionProtocol != sessionProtocolLegacy || pre.ListenStreamID != "" || !pre.HandshakeDone {
+		t.Fatalf("pre-swap snapshot session_protocol=%q listen_stream_id=%q handshake_done=%v, want legacy/none/true — the fallback initialize must have reclassified the session",
+			pre.SessionProtocol, pre.ListenStreamID, pre.HandshakeDone)
+	}
+
+	post := s.triggerSwap("hash-B")
+	if post.SessionProtocol != sessionProtocolLegacy {
+		t.Fatalf("post-swap session_protocol = %q, want legacy", post.SessionProtocol)
+	}
+	got := childB.sentMethods()
+	if len(got) < 2 || got[0] != "initialize" || got[1] != "notifications/initialized" {
+		t.Fatalf("fresh child received %v, want [initialize notifications/initialized ...] — the handshake was not replayed", got)
+	}
+	if !strings.Contains(childB.sentFrames()[0], `"id":"fishhawk-shim/replay/1"`) {
+		t.Fatalf("replayed initialize did not carry the synthetic id: %s", childB.sentFrames()[0])
+	}
+	if req := s.awaitListChanged(); req == nil {
+		t.Log("no tools/list_changed reached the client after the swap; reading the tool list anyway")
+	}
+	// The call that fails with `invalid during session initialization` when the
+	// fresh child is never handshaked.
 	if got := toolNames(ctx, t, cs); strings.Join(got, ",") != "beta" {
 		t.Fatalf("tools after swap = %v, want [beta]", got)
 	}

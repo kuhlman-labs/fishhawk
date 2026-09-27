@@ -264,6 +264,27 @@ func (h *harness) triggerSwap(hash string) { h.swap <- []byte(hash) }
 // pollTick fires one watcher poll through the real tick path.
 func (h *harness) pollTick() { h.tick <- time.Time{} }
 
+// publishTick fires one watcher poll — which publishes a fresh snapshot without
+// changing any state — and returns THAT snapshot, so a caller can read a field
+// as of this instant rather than searching the whole published history.
+func (h *harness) publishTick() swapState {
+	h.t.Helper()
+	all := func(swapState) bool { return true }
+	before := h.pub.count(all)
+	h.tick <- time.Time{}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if h.pub.count(all) > before {
+			h.pub.mu.Lock()
+			defer h.pub.mu.Unlock()
+			return h.pub.states[len(h.pub.states)-1]
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	h.t.Fatal("timed out waiting for the tick-published snapshot")
+	return swapState{}
+}
+
 // logs returns everything the supervisor has written to its stderr writer.
 func (h *harness) logs() string { return h.log.String() }
 
@@ -1810,5 +1831,209 @@ func TestLegacySessionIgnoresStatelessArm(t *testing.T) {
 	st := h.pub.waitFor(t, "swapped", func(st swapState) bool { return st.LastSwapOutcome == outcomeSwapped })
 	if st.SessionProtocol != sessionProtocolLegacy || st.ListenStreamID != "" {
 		t.Fatalf("legacy session facts: %+v", st)
+	}
+}
+
+// --- #3288: an initialize after a stateless classification reclassifies legacy ---
+//
+// The go-sdk v1.7.0 client stamps the SEP-2575 protocol version into its
+// opening server/discover BEFORE it knows whether the server supports the RPC.
+// A version-skewed (pre-SEP-2575) child answers method-not-found, and the
+// client falls back to the legacy initialize handshake — but the shim has
+// already latched stateless from the probe. These tests pin the one-way
+// reclassification rule and its permanence.
+
+const (
+	// discoverRefused is the method-not-found reply a pre-SEP-2575 server gives
+	// to the probe. It is a FIXTURE: the bad state (a session latched stateless
+	// whose client is really on the legacy handshake) is seeded by construction,
+	// never by calling the control under test.
+	discoverRefused = `{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"method not found"}}`
+	// fallbackInit is the legacy handshake the client falls back to. Its id is
+	// distinct from the refused probe's so the two are never confused.
+	fallbackInit = `{"jsonrpc":"2.0","method":"initialize","id":7,"params":{"protocolVersion":"2025-11-25"}}`
+	// statelessStampedLater is a NON-initialize frame carrying the stateless
+	// _meta stamp, sent AFTER the fallback handshake. The latch must refuse it.
+	statelessStampedLater = `{"jsonrpc":"2.0","method":"tools/call","id":8,"params":{` + statelessMeta + `,"name":"alpha"}}`
+	// initWithStatelessMeta is an initialize that ALSO carries the stateless
+	// stamp — the same-frame precedence case.
+	initWithStatelessMeta = `{"jsonrpc":"2.0","method":"initialize","id":9,"params":{` + statelessMeta + `}}`
+)
+
+// refuseDiscover drives the version-skewed opening against a MANUAL child: the
+// probe reaches the shim (so the session really is classified stateless) and is
+// answered with method-not-found, exactly as a pre-SEP-2575 server would.
+func (h *harness) refuseDiscover(child *fakeChild) {
+	h.t.Helper()
+	h.send(statelessDiscover)
+	waitFor(h.t, func() bool { return len(child.sentFrames()) > 0 })
+	child.pushFrame(discoverRefused + "\n")
+	if r := h.expect(); !strings.Contains(r, `"id":1`) || !strings.Contains(r, "-32601") {
+		h.t.Fatalf("expected the method-not-found reply for id 1, got %q", r)
+	}
+	// Anti-vacuity: without the classification actually having happened, every
+	// assertion below would hold trivially on a session that was legacy all along.
+	h.pollTick()
+	h.pub.waitFor(h.t, "session_protocol stateless before the fallback initialize", func(st swapState) bool {
+		return st.SessionProtocol == sessionProtocolStateless
+	})
+}
+
+// assertHandshakeReplayed asserts the fresh child was brought up through the
+// LEGACY arm: a synthetic-id initialize followed by notifications/initialized,
+// and no bare listen re-send. This is the shipped behaviour the client depends
+// on — without it the fresh child is never initialized and the client's next
+// call fails with `invalid during session initialization`.
+func assertHandshakeReplayed(t *testing.T, child *fakeChild) {
+	t.Helper()
+	sent := child.sentFrames()
+	if len(sent) < 2 {
+		t.Fatalf("fresh child received %v, want a replayed initialize + notifications/initialized", sent)
+	}
+	if !strings.Contains(sent[0], `"initialize"`) || !strings.Contains(sent[0], "fishhawk-shim/replay/") {
+		t.Fatalf("first frame to the fresh child was %q, want the synthetic-id initialize replay", sent[0])
+	}
+	if !strings.Contains(sent[1], "notifications/initialized") {
+		t.Fatalf("second frame to the fresh child was %q, want notifications/initialized", sent[1])
+	}
+	for _, f := range sent {
+		if strings.Contains(f, methodSubscriptionsListen) {
+			t.Fatalf("a reclassified session must not re-send a listen stream, got %q", f)
+		}
+	}
+}
+
+// TestFallbackInitializeReclassifiesSessionLegacy is the #3288 done-means and
+// operator condition 2's first test: probe refused (session latched stateless),
+// legacy initialize, then a LATER non-initialize frame stamped with the
+// stateless protocol version, then a swap. The handshake MUST be replayed — the
+// later stamp may not put the session back on the stateless arm.
+func TestFallbackInitializeReclassifiesSessionLegacy(t *testing.T) {
+	child0 := newFake("A", false)
+	child1 := newFake("B", true) // auto-answers the synthetic replay initialize
+	h := newHarness(t, child0, child1)
+	h.start()
+	h.refuseDiscover(child0)
+
+	h.send(fallbackInit)
+	waitFor(t, func() bool { return len(child0.sentFrames()) > 1 })
+	child0.pushFrame(`{"jsonrpc":"2.0","id":7,"result":{"protocolVersion":"2025-11-25","serverInfo":{"name":"A"}}}` + "\n")
+	if r := h.expect(); !strings.Contains(r, `"id":7`) || !strings.Contains(r, `"result"`) {
+		t.Fatalf("expected the fallback initialize response for id 7, got %q", r)
+	}
+
+	// The later stateless-stamped frame: the latch must ignore its version.
+	h.send(statelessStampedLater)
+	waitFor(t, func() bool { return len(child0.sentFrames()) > 2 })
+	child0.pushFrame(`{"jsonrpc":"2.0","id":8,"result":{"marker":"A"}}` + "\n")
+	if r := h.expect(); !strings.Contains(r, `"marker":"A"`) {
+		t.Fatalf("tool result: %q", r)
+	}
+
+	h.triggerSwap("hash-B")
+	if lc := h.expect(); lc != string(listChangedNotification) {
+		t.Fatalf("a reclassified session must emit the untagged list_changed, got %q", lc)
+	}
+	assertHandshakeReplayed(t, child1)
+	st := h.pub.waitFor(t, "swapped", func(st swapState) bool { return st.LastSwapOutcome == outcomeSwapped })
+	if st.SessionProtocol != sessionProtocolLegacy {
+		t.Fatalf("session_protocol = %q, want %q after the fallback initialize", st.SessionProtocol, sessionProtocolLegacy)
+	}
+	if !st.HandshakeDone {
+		t.Fatalf("handshake_done must be true on a reclassified session: %+v", st)
+	}
+	waitFor(t, func() bool { return strings.Contains(h.logs(), "reclassifying legacy") })
+}
+
+// TestInitializeWithStatelessMetaClassifiesLegacy is operator condition 2's
+// second test and the same-frame precedence pin: the session's FIRST frame is
+// an initialize that also carries the stateless _meta stamp. Legacy wins —
+// classifying it stateless would skip the very handshake it establishes — and a
+// swap replays the handshake.
+func TestInitializeWithStatelessMetaClassifiesLegacy(t *testing.T) {
+	child0 := newFake("A", true)
+	child1 := newFake("B", true)
+	h := newHarness(t, child0, child1)
+	h.start()
+
+	h.send(initWithStatelessMeta)
+	if r := h.expect(); !strings.Contains(r, `"id":9`) || !strings.Contains(r, `"result"`) {
+		t.Fatalf("expected the initialize response for id 9, got %q", r)
+	}
+
+	h.triggerSwap("hash-B")
+	if lc := h.expect(); lc != string(listChangedNotification) {
+		t.Fatalf("expected the untagged list_changed, got %q", lc)
+	}
+	assertHandshakeReplayed(t, child1)
+	st := h.pub.waitFor(t, "swapped", func(st swapState) bool { return st.LastSwapOutcome == outcomeSwapped })
+	if st.SessionProtocol != sessionProtocolLegacy || st.ListenStreamID != "" {
+		t.Fatalf("an initialize carrying a stateless stamp must classify legacy with no stream: %+v", st)
+	}
+}
+
+// TestReclassificationClearsListenStreamState pins the snapshot half: a session
+// that recorded a listen stream while stateless, then reclassified, reports an
+// EMPTY listen_stream_id (the README's contract for a legacy session) and swaps
+// through the handshake replay rather than the verbatim listen re-send.
+func TestReclassificationClearsListenStreamState(t *testing.T) {
+	child0 := newFake("A", false)
+	child1 := newFake("B", true)
+	h := newHarness(t, child0, child1)
+	h.start()
+	h.discover(child0) // classified stateless, discover ANSWERED
+	h.send(statelessListen)
+	h.barrier()
+	if st := h.publishTick(); st.ListenStreamID != "2" {
+		t.Fatalf("listen_stream_id before the reclassification = %q, want 2", st.ListenStreamID)
+	}
+
+	h.send(fallbackInit)
+	waitFor(t, func() bool { return len(child0.sentFrames()) > 2 })
+	child0.pushFrame(`{"jsonrpc":"2.0","id":7,"result":{"protocolVersion":"2025-11-25","serverInfo":{"name":"A"}}}` + "\n")
+	if r := h.expect(); !strings.Contains(r, `"id":7`) {
+		t.Fatalf("expected the initialize response for id 7, got %q", r)
+	}
+	if st := h.publishTick(); st.SessionProtocol != sessionProtocolLegacy || st.ListenStreamID != "" {
+		t.Fatalf("after the reclassification: session_protocol=%q listen_stream_id=%q, want legacy/empty", st.SessionProtocol, st.ListenStreamID)
+	}
+
+	h.triggerSwap("hash-B")
+	if lc := h.expect(); lc != string(listChangedNotification) {
+		t.Fatalf("a reclassified session must emit the UNTAGGED list_changed, got %q", lc)
+	}
+	assertHandshakeReplayed(t, child1)
+}
+
+// TestStatelessSessionWithoutInitializeStaysStateless is the
+// no-spurious-reclassification control: a genuine SEP-2575 session (discover +
+// listen + tool call, no initialize anywhere) still publishes stateless and
+// still swaps via the verbatim listen re-send. The #3288 reclassification must
+// not regress #2460's stateless arm.
+func TestStatelessSessionWithoutInitializeStaysStateless(t *testing.T) {
+	child0 := newFake("A", false)
+	child1 := newFake("B", false)
+	h := newHarness(t, child0, child1)
+	h.start()
+	h.discover(child0)
+	h.send(statelessListen)
+	h.send(statelessToolCall)
+	waitFor(t, func() bool { return len(child0.sentFrames()) == 3 })
+	child0.pushFrame(`{"jsonrpc":"2.0","id":3,"result":{"marker":"A"}}` + "\n")
+	if r := h.expect(); !strings.Contains(r, `"marker":"A"`) {
+		t.Fatalf("tool result: %q", r)
+	}
+
+	h.triggerSwap("hash-B")
+	if lc := h.expect(); lc != taggedListChanged {
+		t.Fatalf("post-swap notification:\n got %q\nwant %q", lc, taggedListChanged)
+	}
+	sent := child1.sentFrames()
+	if len(sent) != 1 || sent[0] != statelessListen+"\n" {
+		t.Fatalf("the fresh child must receive exactly the verbatim listen re-send, got %v", sent)
+	}
+	st := h.pub.waitFor(t, "swapped", func(st swapState) bool { return st.LastSwapOutcome == outcomeSwapped })
+	if st.SessionProtocol != sessionProtocolStateless || st.ListenStreamID != "2" {
+		t.Fatalf("a session that never sent initialize must stay stateless: %+v", st)
 	}
 }
