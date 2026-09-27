@@ -133,10 +133,19 @@ type supervisor struct {
 
 	// stateless is set once any upstream frame carries a SEP-2575 protocol
 	// version in its params._meta (the go-sdk client stamps every request, so
-	// the opening server/discover sets it). It is a SESSION fact, sticky for the
-	// life of the shim and untouched by crash recovery: a stateless session has
-	// no handshake to replay, so the swap gate opens on it directly (#2460).
+	// the opening server/discover sets it). A stateless session has no handshake
+	// to replay, so the swap gate opens on it directly (#2460). It is a SESSION
+	// fact, untouched by crash recovery, and revisable in exactly ONE direction:
+	// stateless -> legacy the first time an `initialize` request is seen, never
+	// the reverse (#3288). See legacyLatched.
 	stateless bool
+	// legacyLatched records that an `initialize` request has been observed on
+	// this session, whether it arrived first or as the go-sdk's fallback after a
+	// refused server/discover. Once latched, NO later frame may classify the
+	// session stateless, whatever protocol version its params._meta carries: an
+	// initialize lifecycle is conclusive, and a session reclassified stateless
+	// after it would swap onto a child that is never handshaked (#3288).
+	legacyLatched bool
 	// listenReq / listenIDKey record the client's subscriptions/listen request
 	// verbatim and its raw id. The stream is re-sent to every fresh child under
 	// that ORIGINAL id, which is what the child stamps into the notifications it
@@ -230,17 +239,62 @@ func (s *supervisor) run(ctx context.Context) error {
 	}
 }
 
+// classifySession applies the one-way session-model rule to an upstream frame.
+//
+// An `initialize` request latches LEGACY for the life of the shim, and when the
+// session was already on the stateless arm it reclassifies it: the go-sdk
+// v1.7.0 client stamps the SEP-2575 protocol version into its opening
+// server/discover BEFORE it knows whether the server supports the RPC, so a
+// version-skewed child that answers method-not-found sends the client back to
+// the legacy initialize handshake while the shim is already latched stateless.
+// Left unreclassified, the next swap would take the stateless arm, leave the
+// fresh child un-initialized, and break the client's next call with
+// `method "tools/list" is invalid during session initialization` (#3288).
+//
+// Legacy wins over the version stamp on the SAME frame, and the latch makes
+// that permanent: an initialize is conclusive evidence of an initialize
+// lifecycle, so no later frame may put the session back on the stateless arm,
+// whatever its params._meta carries.
+//
+// The reclassification drops any recorded listen stream. That keeps the
+// published snapshot honest (listen_stream_id is empty for a legacy session)
+// and cannot discard a live subscription: a SEP-2575 client opens
+// subscriptions/listen only AFTER a successful server/discover, which is
+// exactly the case in which no fallback initialize is ever sent.
+func (s *supervisor) classifySession(p rpcPeek, isInit bool) {
+	if isInit {
+		s.legacyLatched = true
+		if s.stateless {
+			s.stateless = false
+			s.listenReq = nil
+			s.listenIDKey = ""
+			s.logf("initialize received on a session classified stateless: reclassifying legacy; swaps replay the handshake (#3288)")
+		}
+		return
+	}
+	if s.stateless || s.legacyLatched {
+		return
+	}
+	if v := p.metaProtocolVersion(); isStatelessVersion(v) {
+		s.stateless = true
+		s.logf("client negotiated protocol %s (SEP-2575): session classified stateless; swaps re-subscribe instead of replaying a handshake (#2460)", v)
+	}
+}
+
 // handleUpstream forwards a client frame byte-verbatim to the child and records
 // the minimum needed: the initialize request (once) and the id of any
 // client->server request (a frame with BOTH a method and an id). Notifications
 // (method, no id) and client responses to server-originated requests (id, no
 // method) are forwarded but never tracked as in-flight.
+//
+// It also classifies the session model. An `initialize` request latches LEGACY
+// permanently, reclassifying a session the version stamp had already put on the
+// stateless arm; only a non-initialize frame can classify stateless, and only
+// while legacy is unlatched (#3288).
 func (s *supervisor) handleUpstream(frame []byte) {
 	p := peek(frame)
-	if !s.stateless && isStatelessVersion(p.metaProtocolVersion()) {
-		s.stateless = true
-		s.logf("client negotiated protocol %s (SEP-2575): session classified stateless; swaps re-subscribe instead of replaying a handshake (#2460)", p.metaProtocolVersion())
-	}
+	isInit := p.hasMethod() && p.hasID() && p.method() == "initialize"
+	s.classifySession(p, isInit)
 	isReq := p.hasMethod() && p.hasID()
 	// The listen stream is recorded BEFORE the send and never tracked as
 	// in-flight: it is answered by notifications for the life of the session,
@@ -275,7 +329,7 @@ func (s *supervisor) handleUpstream(frame []byte) {
 		s.child.Terminate(s.grace)
 		return
 	}
-	if isReq && p.method() == "initialize" && s.initReq == nil {
+	if isInit && s.initReq == nil {
 		s.initReq = cloneBytes(frame)
 		s.initIDKey = key
 	}
@@ -651,7 +705,10 @@ func (s *supervisor) terminateAndDrain(c childTransport) {
 //
 //   - stateless (SEP-2575) session      → re-send the recorded
 //     subscriptions/listen (if any) under its original id, then synthesize
-//     tools/list_changed upstream tagged with that id (no handshake exists);
+//     tools/list_changed upstream tagged with that id (no handshake exists).
+//     Selected only while the session has seen NO initialize: one arriving —
+//     the go-sdk's fallback after a refused server/discover — reclassifies the
+//     session legacy, so a swap after it takes the handshake arms below (#3288);
 //   - no initialize recorded            → plain passthrough (nothing to replay);
 //   - initialize recorded, no response  → re-send the ORIGINAL initialize with
 //     its original client id so the response flows to the waiting client
