@@ -68,7 +68,43 @@ No driving yet in the E25.2 keystone (that lands E25.3+): the keystone delivers 
 **Engine** (`engine.go`):
 
 - `NextEligible([]*Item) Eligibility` partitions items into eligible/blocked/running/done/failed from each item's `State`, `DependsOn`, and `RunID`. An item is eligible only when every dependency succeeded; an absent dep ref is treated as not-satisfied, defensively.
-- `DeriveState([]*Item) State` reduces item states to the campaign state, emitting only `pending`/`running`/`succeeded`/`failed` — `cancelled` (and the proposal's `paused`) are operator-set overlays owned by Track C, never derived.
+- `DeriveState([]*Item) State` reduces item states to the campaign state, emitting `pending`/`running`/`awaiting_human`/`succeeded`/`failed` — `cancelled` and `paused` are operator/driver-set overlays owned by Track C, never derived.
+
+### `awaiting_human`: the derived non-terminal state (E72.33 / #3660)
+
+A campaign whose only remaining OPEN items are human-led (`autonomy:low`) had no state to report. `DeriveState` emitted `running` forever, because the auto-driver never dispatches an `autonomy:low` item and no item state implied a stop — so the campaign advertised the truthful `attend_human_led` under a state claiming work was in flight.
+
+**The predicate, and it is an IFF holding at every derive.** `state == awaiting_human` **iff** the `NextEligible` partition has **no** `Eligible`, `Restartable`, `Running` or `Paused` item **and** `>= 1` `HumanLed` item. It is computed from the SAME partition the server distills `next_action` from (`baseCampaignNextAction`), which is what makes the derived state and the advertised action structurally unable to contradict each other — the class of contradiction #2681 exists to prevent.
+
+Each exclusion is load-bearing: a `Running` or `Paused` item means the engine genuinely has work; an `Eligible` item is auto-dispatchable; and a `Restartable` item (deps-satisfied, non-human-led, cancelled-or-failed) has an operator forward path that `baseCampaignNextAction` outranks `HumanLed` with, so deriving `awaiting_human` there would advertise `start_run` under a state claiming only humans are owed work. `Blocked` is deliberately NOT excluded: with none of those four buckets populated, every blocked item is waiting (transitively) on the human-led work, so the campaign is genuinely parked on a human.
+
+**The iff is what makes the state self-correcting rather than sticky**, and the transition table (`transition.go`) carries the reverse edges that let the persisted row FOLLOW the derivation — `deriveCampaignAfterChange` silently DROPS a derivation whose transition the table refuses:
+
+| Edge | Why |
+|---|---|
+| `pending → awaiting_human` | an all-human-led campaign derives it before any dispatch |
+| `running → awaiting_human` | the agent-drivable work finished; the #3660 headline case |
+| `awaiting_human → running` | a human-led item was relabelled and STARTED, or a settle made a sibling eligible on a campaign that already HAS progress |
+| `awaiting_human → pending` | **the relabel-WITHOUT-start corner.** On a NEVER-STARTED campaign no item has succeeded, run or failed, so after the relabel `DeriveState` falls through to its DEFAULT branch returning `pending`. Without this edge the row STICKS at `awaiting_human` while `next_action`, computed from the same refreshed partition, advertises `start_run`. The status-read path genuinely reaches it: an autonomy refresh alone makes `settleIssueClosedItems` report `refreshedAny`, so `reconcileCampaignItemsOnRead` re-lists and calls `deriveCampaignAfterChange` |
+| `awaiting_human → succeeded` | the last human-led item closed-as-completed and settled run-less |
+| `awaiting_human → failed` | the last open item settled failed/cancelled, so `anyFailed && allTerminal` holds |
+| `awaiting_human → cancelled` | the operator cancel verb |
+
+Deliberately ABSENT: `paused → awaiting_human` (a paused campaign stays sticky; the table refusing it backstops every caller outside `reconcileCampaignItemsOnRead`'s own sticky-paused guard) and `awaiting_human → paused` (the pause/page path only sweeps `running` campaigns, and an `awaiting_human` campaign has no running item to page).
+
+**Why NOT a terminal `succeeded` with a human-led count** — the alternative the originating issue floated, whose rejection the operator ratified at the plan gate. Three reasons, each verifiable in this tree: (1) `computeCampaignNextAction`'s #2681 terminal post-filter rewrites the truthful `attend_human_led` into `closed`, whose detail tells the operator the campaign will not track the issue; (2) `handleStartCampaignItemRun`'s campaign-state gate admits only `pending`/`running`/`failed`/`awaiting_human`, so a terminal-`succeeded` campaign would refuse the start verb and an operator who relabelled the item could never drive it inside the campaign; (3) `ValidCampaignTransition` refuses every edge out of a terminal state, so a remaining human-led item that later settled failed or cancelled could never re-derive and the campaign would report `succeeded` over a failure.
+
+**Honest residual.** An `awaiting_human` campaign leaves `campaigndriver`'s `running`-only sweep. That is BY DESIGN — the engine has nothing to dispatch — and what returns it is the status-read path: the reconcile pass's autonomy refresh plus the `awaiting_human → pending`/`running` edges above. An operator who never polls the status surface and never starts an item sees no movement, which is correct: only a human can move the work.
+
+**Intended behavior change beyond the headline:** an all-human-led campaign that has NOT started now derives `awaiting_human` where it previously derived `pending`. That is the honest reading (the engine will never dispatch any of its items) and is fully reversible on a relabel.
+
+**ROLLBACK, including the CODE-ONLY case.** Migration `0087` only WIDENS `campaigns_state_check`; its down migration rewrites any `awaiting_human` row to `running` BEFORE narrowing, so a full schema rollback strands nothing. **A CODE-ONLY revert — the Go reverted while migration 0087 is left applied — must FIRST normalise existing rows:**
+
+```sql
+UPDATE campaigns SET state = 'running' WHERE state = 'awaiting_human';
+```
+
+Without it an `awaiting_human` row is STRANDED under the old code: `campaigndriver` sweeps only `running` campaigns, and `handleStartCampaignItemRun`'s pre-#3660 gate admits only `pending`/`running`/`failed` — so the campaign would be neither swept nor startable. The widened CHECK itself is harmless to leave applied (it accepts every value the narrower one did, and nothing writes the new value once the Go is reverted).
 
 ## Issue-closed resolution: `resolved_by` and the dropped DAG gate (E72.24 / #3563)
 

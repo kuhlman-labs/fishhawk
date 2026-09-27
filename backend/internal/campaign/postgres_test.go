@@ -1097,6 +1097,57 @@ func TestPostgres_TransitionCampaign_Paused(t *testing.T) {
 	}
 }
 
+// TestPostgres_TransitionCampaign_AwaitingHuman is the ONLY test that proves
+// migration 0087's widened campaigns_state_check actually shipped (E72.33 /
+// #3660). A Go-only transition test passes with the migration MISSING and the
+// write then fails SQLSTATE 23514 at runtime, so this drives the real column:
+// pending -> awaiting_human must SUCCEED and read back `awaiting_human` on an
+// independent GetCampaign, and the state must be reversible in BOTH directions
+// the transition table admits (-> pending on a relabel-without-start, -> running
+// on a start).
+func TestPostgres_TransitionCampaign_AwaitingHuman(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	c := makeCampaign(t, repo)
+	awaiting, err := repo.TransitionCampaign(ctx, c.ID, campaign.StateAwaitingHuman)
+	if err != nil {
+		t.Fatalf("pending→awaiting_human (widened campaigns_state_check missing?): %v", err)
+	}
+	if awaiting.State != campaign.StateAwaitingHuman {
+		t.Errorf("returned state = %q, want awaiting_human", awaiting.State)
+	}
+	// COMMITTED STATE: an independent read, not only the returned row.
+	got, err := repo.GetCampaign(ctx, c.ID)
+	if err != nil {
+		t.Fatalf("re-read campaign: %v", err)
+	}
+	if got.State != campaign.StateAwaitingHuman {
+		t.Errorf("persisted state = %q, want awaiting_human", got.State)
+	}
+	// REVISION FIX 1's persistence half: the row can follow the re-derivation back
+	// to pending (the relabel-without-start corner).
+	back, err := repo.TransitionCampaign(ctx, c.ID, campaign.StatePending)
+	if err != nil {
+		t.Fatalf("awaiting_human→pending: %v", err)
+	}
+	if back.State != campaign.StatePending {
+		t.Errorf("state after relabel re-derive = %q, want pending", back.State)
+	}
+	// And forward again to running (the relabel-THEN-start corner).
+	if _, err := repo.TransitionCampaign(ctx, c.ID, campaign.StateAwaitingHuman); err != nil {
+		t.Fatalf("pending→awaiting_human (second time): %v", err)
+	}
+	running, err := repo.TransitionCampaign(ctx, c.ID, campaign.StateRunning)
+	if err != nil {
+		t.Fatalf("awaiting_human→running: %v", err)
+	}
+	if running.State != campaign.StateRunning {
+		t.Errorf("state after start = %q, want running", running.State)
+	}
+}
+
 // TestPostgres_PauseCampaignItem is the round-trip done-means for the item
 // pause carrier: a running item paused via PauseCampaignItem persists state
 // 'paused' (proving the widened campaign_items_state_check) with the

@@ -22,21 +22,84 @@ import "fmt"
 // running → paused:     the auto-driver handed a gate off to a human (E25.7).
 // paused  → running:    a human resumed the campaign after handling the gate.
 // paused  → cancelled:  manually halted while paused.
+//
+// THE awaiting_human EDGES (E72.33 / #3660). awaiting_human is DERIVED and
+// NON-terminal, so the table must admit both the edges INTO it and — crucially —
+// the edges back OUT, because deriveCampaignAfterChange silently DROPS a
+// derivation whose transition this table refuses:
+//
+// pending → awaiting_human: an all-human-led campaign derives it before any
+//
+//	dispatch (DeriveState's new arm fires with zero progress items).
+//
+// running → awaiting_human: the agent-drivable work finished and only human-led
+//
+//	items remain open — the #3660 headline case.
+//
+// awaiting_human → running:  a human-led item was relabelled and STARTED, or a
+//
+//	settle made a sibling eligible on a campaign that already HAS progress
+//	(anySucceeded/anyRunning/anyFailed holds), so DeriveState's progress arm
+//	returns Running.
+//
+// awaiting_human → pending:  the relabel-WITHOUT-start corner. On a NEVER-STARTED
+//
+//	campaign no item has succeeded, run or failed, so when the operator relabels
+//	an autonomy:low item to autonomy:medium the partition gains an Eligible item,
+//	the awaiting_human arm correctly stops firing, and DeriveState falls through
+//	to its DEFAULT branch returning StatePending. Without this edge
+//	deriveCampaignAfterChange's !ValidCampaignTransition guard drops that
+//	derivation and the row STICKS at awaiting_human while next_action, computed
+//	from the same refreshed partition, advertises start_run — the state/action
+//	contradiction #2681 exists to prevent. The status-read path genuinely reaches
+//	this: an autonomy refresh alone makes settleIssueClosedItems report
+//	refreshedAny, so reconcileCampaignItemsOnRead re-lists and calls
+//	deriveCampaignAfterChange.
+//
+// awaiting_human → succeeded: the last human-led item closed-as-completed and was
+//
+//	settled run-less by the reconcile-on-read pass.
+//
+// awaiting_human → failed:    the last open item settled failed/cancelled, so
+//
+//	anyFailed && allTerminal now holds.
+//
+// awaiting_human → cancelled: the operator cancel verb, whose campaign transition
+//
+//	runs last and must not be refused.
+//
+// DELIBERATELY ABSENT:
+//
+//   - paused → awaiting_human: a paused campaign stays sticky. The server read
+//     path has its own sticky-paused guard in reconcileCampaignItemsOnRead; this
+//     table refusing the edge is the backstop for every other caller.
+//   - awaiting_human → paused: the pause/page path only runs over a campaign the
+//     driver swept as `running`, and an awaiting_human campaign has no running
+//     item whose gate could be paged.
 var campaignTransitions = map[State]map[State]struct{}{
 	StatePending: {
-		StateRunning:   {},
-		StateSucceeded: {},
-		StateCancelled: {},
-		StateFailed:    {},
+		StateRunning:       {},
+		StateAwaitingHuman: {},
+		StateSucceeded:     {},
+		StateCancelled:     {},
+		StateFailed:        {},
 	},
 	StateRunning: {
-		StateSucceeded: {},
-		StateFailed:    {},
-		StateCancelled: {},
-		StatePaused:    {},
+		StateSucceeded:     {},
+		StateFailed:        {},
+		StateCancelled:     {},
+		StatePaused:        {},
+		StateAwaitingHuman: {},
 	},
 	StatePaused: {
 		StateRunning:   {},
+		StateCancelled: {},
+	},
+	StateAwaitingHuman: {
+		StateRunning:   {},
+		StatePending:   {},
+		StateSucceeded: {},
+		StateFailed:    {},
 		StateCancelled: {},
 	},
 }

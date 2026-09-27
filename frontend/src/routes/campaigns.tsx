@@ -11,6 +11,9 @@ const stateStyles: Record<CampaignState, string> = {
   pending: 'bg-neutral-200 text-neutral-700 dark:bg-neutral-800 dark:text-neutral-300',
   running: 'bg-blue-100 text-blue-800 dark:bg-blue-900/40 dark:text-blue-300',
   paused: 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300',
+  // Violet, deliberately distinct from paused's amber: awaiting_human is DERIVED
+  // (the engine has only human-led work left), not an operator pause.
+  awaiting_human: 'bg-violet-100 text-violet-800 dark:bg-violet-900/40 dark:text-violet-300',
   succeeded: 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300',
   failed: 'bg-rose-100 text-rose-800 dark:bg-rose-900/40 dark:text-rose-300',
   cancelled: 'bg-neutral-200 text-neutral-600 dark:bg-neutral-800 dark:text-neutral-400',

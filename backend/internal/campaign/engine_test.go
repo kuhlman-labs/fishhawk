@@ -317,11 +317,62 @@ func TestDeriveState(t *testing.T) {
 		},
 		{
 			// All paused (no other progress) derives pending, never StatePaused.
+			// A paused item ALSO excludes the awaiting_human arm (E72.33 / #3660):
+			// the partition's Paused bucket is non-empty, so the arm cannot fire —
+			// and with no human-led item here it could not anyway.
 			name: "all paused is pending, never paused",
 			items: []*campaign.Item{
 				item("issue:1", campaign.ItemStatePaused, nil),
 			},
 			want: campaign.StatePending,
+		},
+		{
+			// PRECEDENCE PRESERVATION (E72.33 / #3660): the new awaiting_human arm
+			// sits strictly BELOW the allSucceeded arm, so an all-succeeded campaign
+			// that HAPPENED to contain human-led items still derives succeeded. (A
+			// succeeded item is routed to Done, never HumanLed, so the arm's
+			// predicate is false here too — this row pins both facts at once.)
+			name: "all succeeded with a human-led item is still succeeded",
+			items: []*campaign.Item{
+				humanLedItem("issue:1", campaign.ItemStateSucceeded),
+				item("issue:2", campaign.ItemStateSucceeded, nil),
+			},
+			want: campaign.StateSucceeded,
+		},
+		{
+			// PRECEDENCE PRESERVATION: a genuinely terminal-failed campaign still
+			// derives failed even with a human-led item among its items. When EVERY
+			// item state is terminal the HumanLed bucket is necessarily EMPTY —
+			// NextEligible only routes not-yet-run pending/blocked items there — so
+			// the awaiting_human arm cannot steal this case.
+			name: "all terminal with one failed and a human-led item is still failed",
+			items: []*campaign.Item{
+				humanLedItem("issue:1", campaign.ItemStateSucceeded),
+				humanLedItem("issue:2", campaign.ItemStateFailed),
+			},
+			want: campaign.StateFailed,
+		},
+		{
+			// THE DONE-MEANS at the pure-engine layer (E72.33 / #3660): a succeeded
+			// agent-drivable item plus an OPEN human-led one derives awaiting_human.
+			// COUNTERFACTUAL VEHICLE c1: with the arm deleted, anySucceeded is true
+			// and allSucceeded false, so DeriveState returns `running`.
+			name: "only human-led work remains derives awaiting_human",
+			items: []*campaign.Item{
+				item("issue:1", campaign.ItemStateSucceeded, nil),
+				humanLedItem("issue:2", campaign.ItemStatePending),
+			},
+			want: campaign.StateAwaitingHuman,
+		},
+		{
+			// The never-started all-human-led campaign: the INTENDED behavior change
+			// (it previously derived pending, DeriveState's default branch).
+			name: "never-started all-human-led campaign derives awaiting_human",
+			items: []*campaign.Item{
+				humanLedItem("issue:1", campaign.ItemStatePending),
+				humanLedItem("issue:2", campaign.ItemStatePending),
+			},
+			want: campaign.StateAwaitingHuman,
 		},
 	}
 	for _, tt := range tests {
@@ -466,5 +517,183 @@ func TestNextEligible_IssueClosedMarkerDoesNotSuppressFailed(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("NextEligible =\n  %+v\nwant\n  %+v", got, want)
+	}
+}
+
+// humanLedItem builds a deps-satisfied autonomy:low ("human-led") item — the
+// tier NextEligible diverts into the HumanLed partition.
+func humanLedItem(ref string, state campaign.ItemState, deps ...string) *campaign.Item {
+	return &campaign.Item{IssueRef: ref, State: state, Autonomy: "low", DependsOn: deps}
+}
+
+// TestDeriveState_AwaitingHumanWhenOnlyHumanLedRemains is the pure-engine
+// done-means for E72.33 (#3660) and counterfactual c1's named vehicle: a campaign
+// whose agent-drivable item succeeded and whose only remaining OPEN item is
+// human-led derives awaiting_human, not running.
+//
+// The fixture is deliberately [succeeded medium, pending autonomy:low] so that
+// with the DeriveState arm DELETED the fall-through is anySucceeded -> `running`
+// and this equality assertion fails on the BEHAVIORAL line, never on setup.
+func TestDeriveState_AwaitingHumanWhenOnlyHumanLedRemains(t *testing.T) {
+	items := []*campaign.Item{
+		item("issue:1", campaign.ItemStateSucceeded, nil),
+		humanLedItem("issue:2", campaign.ItemStatePending),
+	}
+	if got := campaign.DeriveState(items); got != campaign.StateAwaitingHuman {
+		t.Errorf("DeriveState = %q, want awaiting_human (only human-led work remains)", got)
+	}
+	// The partition the arm is computed from, pinned so a later NextEligible
+	// change that re-routed the item would fail here rather than silently.
+	e := campaign.NextEligible(items)
+	if !reflect.DeepEqual(e.HumanLed, []string{"issue:2"}) {
+		t.Errorf("HumanLed = %v, want [issue:2]", e.HumanLed)
+	}
+	if len(e.Eligible)+len(e.Restartable)+len(e.Running)+len(e.Paused) != 0 {
+		t.Errorf("partition should have no eligible/restartable/running/paused item: %+v", e)
+	}
+}
+
+// TestDeriveState_AwaitingHumanExclusions is the PER-FAILURE-MODE table for the
+// four exclusion guards in the awaiting_human arm (m1-m4) plus the deliberately
+// NOT-excluded blocked case (m5). Each fixture ISOLATES one guard: the named
+// bucket is the ONLY non-empty exclusion, so deleting that one conjunct makes the
+// arm fire and the row go RED (the masking-guard hazard). Each `want` is the
+// EXACT pre-change verdict, so an over-fire is caught rather than encoded.
+func TestDeriveState_AwaitingHumanExclusions(t *testing.T) {
+	cases := []struct {
+		name string
+		// guard names the conjunct this fixture isolates.
+		guard string
+		items []*campaign.Item
+		want  campaign.State
+	}{
+		{
+			// m1 / c2: a RUNNING item alongside an open human-led item. No eligible,
+			// restartable or paused item, so len(e.Running)==0 is the only conjunct
+			// in the path. Pre-change verdict: anyRunning -> running.
+			name:  "m1 running item keeps the campaign running",
+			guard: "len(e.Running) == 0",
+			items: []*campaign.Item{
+				item("issue:1", campaign.ItemStateRunning, nil),
+				humanLedItem("issue:2", campaign.ItemStatePending),
+			},
+			want: campaign.StateRunning,
+		},
+		{
+			// m2 / c3: a PAUSED item alongside an open human-led item. A paused item
+			// contributes to NONE of anyRunning/anySucceeded/anyFailed, so the
+			// pre-change verdict is PENDING, not running — asserting running here
+			// would encode a wrong baseline.
+			name:  "m2 paused item derives pending, not awaiting_human",
+			guard: "len(e.Paused) == 0",
+			items: []*campaign.Item{
+				item("issue:1", campaign.ItemStatePaused, nil),
+				humanLedItem("issue:2", campaign.ItemStatePending),
+			},
+			want: campaign.StatePending,
+		},
+		{
+			// m3: an ELIGIBLE sibling (pending, non-low, deps-satisfied) alongside an
+			// open human-led item, with a succeeded item supplying the progress that
+			// makes the pre-change verdict running.
+			name:  "m3 eligible sibling keeps the campaign running",
+			guard: "len(e.Eligible) == 0",
+			items: []*campaign.Item{
+				item("issue:1", campaign.ItemStateSucceeded, nil),
+				{IssueRef: "issue:2", State: campaign.ItemStatePending, Autonomy: "medium"},
+				humanLedItem("issue:3", campaign.ItemStatePending),
+			},
+			want: campaign.StateRunning,
+		},
+		{
+			// m4 / c4: the NEGATIVE CONTROL the acceptance criterion is worded to
+			// agree with. A deps-SATISFIED failed autonomy:medium item is
+			// RESTARTABLE — operator-driveable agent work — so the campaign must stay
+			// running and must NOT derive awaiting_human. (A deps-UNsatisfied failed
+			// item would land in Failed and leave the c4 deletion unobservable; this
+			// fixture gives it no deps at all.)
+			name:  "m4 restartable failed sibling keeps the campaign running",
+			guard: "len(e.Restartable) == 0",
+			items: []*campaign.Item{
+				{IssueRef: "issue:1", State: campaign.ItemStateFailed, Autonomy: "medium"},
+				humanLedItem("issue:2", campaign.ItemStatePending),
+			},
+			want: campaign.StateRunning,
+		},
+		{
+			// m5: BLOCKED is deliberately NOT excluded. With no eligible/restartable/
+			// running/paused item, a blocked item is waiting (transitively) on the
+			// human-led work, so the campaign IS parked on a human. Pinned so a later
+			// tightening is a visible decision rather than an accident.
+			name:  "m5 blocked dependent still derives awaiting_human",
+			guard: "blocked is NOT an exclusion",
+			items: []*campaign.Item{
+				humanLedItem("issue:1", campaign.ItemStatePending),
+				// depends on the human-led item, which has not succeeded -> Blocked.
+				{IssueRef: "issue:2", State: campaign.ItemStateBlocked, Autonomy: "medium", DependsOn: []string{"issue:1"}},
+			},
+			want: campaign.StateAwaitingHuman,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := campaign.DeriveState(tc.items); got != tc.want {
+				t.Errorf("DeriveState = %q, want %q (guard under test: %s)", got, tc.want, tc.guard)
+			}
+		})
+	}
+}
+
+// TestDeriveState_AwaitingHumanReDerivesPendingOnRelabel is REVISION FIX 1's
+// engine-layer half (r1): the relabel-WITHOUT-start corner on a NEVER-STARTED
+// campaign.
+//
+// Per binding condition 1 this test stays within what the campaign package can
+// reach — DeriveState, the NextEligible partition and ValidCampaignTransition.
+// baseCampaignNextAction is unexported in the SERVER package and is deliberately
+// NOT exported to satisfy a test; the next_action == start_run half is asserted in
+// the server-package integration test (r2).
+//
+// The sequence: two autonomy:low pending items, no deps, no RunID -> awaiting_human.
+// Flip ONE item's tier to medium (the relabel) -> the partition gains an Eligible
+// item, the arm stops firing, and DeriveState falls through to its DEFAULT branch
+// returning StatePending (no item has succeeded, run or failed, so the progress arm
+// cannot return Running). ValidCampaignTransition must admit that edge or the
+// persisted row sticks.
+func TestDeriveState_AwaitingHumanReDerivesPendingOnRelabel(t *testing.T) {
+	items := []*campaign.Item{
+		humanLedItem("issue:1", campaign.ItemStatePending),
+		humanLedItem("issue:2", campaign.ItemStatePending),
+	}
+	if got := campaign.DeriveState(items); got != campaign.StateAwaitingHuman {
+		t.Fatalf("DeriveState(all autonomy:low, never started) = %q, want awaiting_human", got)
+	}
+
+	// THE RELABEL, in place: autonomy:low -> autonomy:medium on issue:1.
+	items[0].Autonomy = "medium"
+
+	e := campaign.NextEligible(items)
+	if !reflect.DeepEqual(e.Eligible, []string{"issue:1"}) {
+		t.Errorf("post-relabel Eligible = %v, want [issue:1] (the arm must stop firing)", e.Eligible)
+	}
+	if !reflect.DeepEqual(e.HumanLed, []string{"issue:2"}) {
+		t.Errorf("post-relabel HumanLed = %v, want [issue:2]", e.HumanLed)
+	}
+	if got := campaign.DeriveState(items); got != campaign.StatePending {
+		t.Errorf("post-relabel DeriveState = %q, want pending (NOT awaiting_human — the partition has an Eligible item)", got)
+	}
+	// The persisted row can FOLLOW that derivation only if the edge is admitted;
+	// deriveCampaignAfterChange silently drops a derivation the table refuses.
+	if !campaign.ValidCampaignTransition(campaign.StateAwaitingHuman, campaign.StatePending) {
+		t.Error("ValidCampaignTransition(awaiting_human, pending) = false, want true (REVISION FIX 1)")
+	}
+	// ONE state change per relabel in each direction: re-deriving the same items
+	// is stable, so no flap is possible without another label edit.
+	if got := campaign.DeriveState(items); got != campaign.StatePending {
+		t.Errorf("re-derive after relabel = %q, want a stable pending", got)
+	}
+	items[0].Autonomy = "low"
+	if got := campaign.DeriveState(items); got != campaign.StateAwaitingHuman {
+		t.Errorf("derive after reverting the label = %q, want awaiting_human (one change per relabel)", got)
 	}
 }

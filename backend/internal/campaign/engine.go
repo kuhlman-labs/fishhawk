@@ -191,17 +191,53 @@ func depsSatisfied(deps []string, done map[string]bool) bool {
 }
 
 // DeriveState reduces a campaign's item states to the campaign state. It emits
-// only pending / running / succeeded / failed:
+// pending / running / awaiting_human / succeeded / failed:
 //   - no items => pending;
 //   - every item succeeded => succeeded;
 //   - any item failed AND every item terminal => failed (a QUARANTINE rule: a
 //     failed item fails the WHOLE campaign only when no forward progress
 //     remains — every item has reached a terminal state; #1838);
+//   - else the NextEligible partition has >= 1 HumanLed item and NO Eligible,
+//     Restartable, Running or Paused item => awaiting_human (E72.33 / #3660):
+//     the engine has no dispatchable work left and the only open items are
+//     human-led, so reporting `running` forever was a state/action
+//     contradiction;
 //   - any progress (some running, succeeded, or failed) => running (a failed
 //     item ALONGSIDE pending/eligible/running work keeps the campaign running so
 //     the still-actionable siblings can be driven — the failed item is
 //     quarantined, not campaign-terminal);
 //   - otherwise (all pending, or pending/blocked with no progress) => pending.
+//
+// THE awaiting_human ARM (E72.33 / #3660) is computed from NextEligible — the
+// SAME partition the server distills next_action from — rather than by
+// re-deriving the depsSatisfied/autonomy predicates here. Both functions are
+// pure and in this package, and sharing the partition is what makes the derived
+// state and next_action structurally unable to contradict each other.
+//
+// Each excluded bucket is load-bearing:
+//
+//   - Running: an item in flight means the engine genuinely has work.
+//   - Paused: the E25.7 hand-off is a live item awaiting a resume, not a
+//     campaign parked on human-led work.
+//   - Eligible: an auto-dispatchable item remains, so the campaign is driveable.
+//   - Restartable: a deps-satisfied, non-human-led cancelled/failed item has an
+//     operator forward path that baseCampaignNextAction outranks HumanLed with,
+//     so deriving awaiting_human there would advertise start_run under a state
+//     claiming only humans are owed work.
+//
+// Because the predicate is an IFF over the partition, the arm STOPS FIRING as
+// soon as any excluded bucket becomes non-empty — the mechanism the reverse
+// transition edges (awaiting_human → pending / running) exist to let the
+// persisted row follow.
+//
+// A Blocked item is deliberately NOT excluded: with no Eligible/Restartable/
+// Running/Paused item, every blocked item is waiting (transitively) on the
+// human-led work, so the campaign is genuinely parked on a human.
+//
+// INTENDED BEHAVIOR CHANGE: an all-human-led campaign that has NOT started now
+// derives awaiting_human where it previously derived pending. That is the honest
+// reading — the engine will never dispatch any of its items — and the
+// awaiting_human → pending edge makes it fully reversible on a relabel.
 //
 // The quarantine rule (anyFailed && allTerminal -> Failed, otherwise a failed
 // item is progress -> Running) is the #1838 fix: previously a single failed item
@@ -250,6 +286,14 @@ func DeriveState(items []*Item) State {
 		// Genuine terminal failure: at least one item failed and NO item remains
 		// actionable — the campaign cannot make further progress, so it is failed.
 		return StateFailed
+	case awaitingHumanOnly(items):
+		// No Eligible/Restartable/Running/Paused item and at least one HumanLed
+		// item: the engine has nothing to dispatch and the only open work is
+		// human-led (E72.33 / #3660). Strictly BELOW the two terminal arms — an
+		// all-succeeded or genuinely terminal-failed campaign keeps its terminal
+		// state — and ABOVE the progress arm, because a campaign whose agent work
+		// is finished must stop reporting `running` forever.
+		return StateAwaitingHuman
 	case anyRunning || anySucceeded || anyFailed:
 		// Some work is in flight, partially done, OR a failed item sits alongside
 		// still-actionable siblings (pending/eligible/running) — the campaign is
@@ -259,4 +303,18 @@ func DeriveState(items []*Item) State {
 		// No progress, nothing running/failed: still pending.
 		return StatePending
 	}
+}
+
+// awaitingHumanOnly reports the awaiting_human predicate over the NextEligible
+// partition: >= 1 HumanLed item AND no Eligible, Restartable, Running or Paused
+// item. It is the FORWARD half of the iff documented on DeriveState; the reverse
+// half is the transition table admitting awaiting_human → pending / running so
+// the persisted row can follow the derivation once the predicate stops holding.
+func awaitingHumanOnly(items []*Item) bool {
+	e := NextEligible(items)
+	return len(e.HumanLed) > 0 &&
+		len(e.Eligible) == 0 &&
+		len(e.Restartable) == 0 &&
+		len(e.Running) == 0 &&
+		len(e.Paused) == 0
 }

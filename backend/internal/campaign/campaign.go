@@ -39,13 +39,42 @@ type State string
 // a human/operator-agent resumes it (paused → running) once the gate is
 // handled — and is never derived from item states (DeriveState never emits
 // it); only the driver/operator set it.
+//
+// `awaiting_human` (E72.33 / #3660) is the campaign whose only remaining open
+// items are human-led. Four properties define it:
+//
+//   - NON-TERMINAL. IsTerminal's default branch already returns false for it, so
+//     no code change there: it keeps every outgoing edge a live campaign needs.
+//   - DERIVED, unlike `paused`: DeriveState emits it from the item partition, so
+//     no driver or operator has to set it.
+//   - The invariant is an IFF holding AT EVERY DERIVE: state == awaiting_human
+//     iff the NextEligible partition has NO Eligible, Restartable, Running or
+//     Paused item AND >= 1 HumanLed item. The iff is what makes the state
+//     SELF-CORRECTING rather than sticky — the arm stops firing the moment the
+//     partition gains an Eligible or Restartable item (the operator relabels an
+//     autonomy:low issue to autonomy:medium), and the reverse edges in
+//     transition.go (awaiting_human → pending and awaiting_human → running) are
+//     what let the persisted row follow that derivation.
+//   - A terminal `succeeded` with a human-led count was REJECTED, and the
+//     operator ratified the rejection, for three reasons verifiable in this
+//     tree: (1) the #2681 terminal post-filter in
+//     backend/internal/server/campaigns.go rewrites the truthful
+//     attend_human_led action into `closed`, whose detail tells the operator the
+//     campaign will not track the issue; (2) handleStartCampaignItemRun's
+//     campaign-state gate admits only pending/running/failed/awaiting_human, so
+//     a terminal-succeeded campaign would refuse the start verb and a relabelled
+//     item could never be driven inside it; (3) ValidCampaignTransition refuses
+//     every edge out of a terminal state, so a remaining human-led item that
+//     later settled failed or cancelled could never re-derive and the campaign
+//     would report `succeeded` over a failure.
 const (
-	StatePending   State = "pending"
-	StateRunning   State = "running"
-	StatePaused    State = "paused"
-	StateSucceeded State = "succeeded"
-	StateFailed    State = "failed"
-	StateCancelled State = "cancelled"
+	StatePending       State = "pending"
+	StateRunning       State = "running"
+	StatePaused        State = "paused"
+	StateAwaitingHuman State = "awaiting_human"
+	StateSucceeded     State = "succeeded"
+	StateFailed        State = "failed"
+	StateCancelled     State = "cancelled"
 )
 
 // IsTerminal reports whether the state admits no further transitions.

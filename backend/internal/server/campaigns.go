@@ -462,7 +462,11 @@ func toCampaignRollupPayload(e campaign.Eligibility) campaignRollupPayload {
 //   - everything else becomes the `closed` action, which advertises no campaign
 //     verb and points the operator at driving the leftover issue standalone.
 //
-// A NON-terminal campaign is byte-identical to the pre-#2681 behavior. In
+// A NON-terminal campaign is byte-identical to the pre-#2681 behavior. That
+// INCLUDES the derived `awaiting_human` state (E72.33 / #3660): it is
+// deliberately non-terminal, so this filter never fires for it and such a
+// campaign keeps reporting the truthful `attend_human_led` rather than `closed` —
+// one of the three reasons a terminal `succeeded` was rejected for that case. In
 // particular a PAUSED campaign is not terminal, so it still advertises `resume`
 // — and that is correct, not an omission: resume is legal on a paused campaign
 // (POST /resume accepts it), so the "never advertise a refused verb" invariant
@@ -528,7 +532,7 @@ func baseCampaignNextAction(e campaign.Eligibility) campaignNextActionPayload {
 		return campaignNextActionPayload{
 			Action:   "attend_human_led",
 			IssueRef: e.HumanLed[0],
-			Detail:   "this item's dependencies are satisfied but it is autonomy:low (human-led); a human must lead it — do not dispatch an agent run",
+			Detail:   attendHumanLedDetail(e.HumanLed),
 		}
 	case len(e.Failed) > 0:
 		return campaignNextActionPayload{
@@ -547,6 +551,33 @@ func baseCampaignNextAction(e campaign.Eligibility) campaignNextActionPayload {
 			Detail: "every campaign item reached a terminal state",
 		}
 	}
+}
+
+// humanLedRefsInDetail bounds how many human-led refs the attend_human_led
+// detail enumerates, so a large campaign's detail stays readable. Refs past the
+// cap are summarized as a "(+N more)" tail rather than dropped silently.
+const humanLedRefsInDetail = 10
+
+// attendHumanLedDetail renders the attend_human_led detail. It keeps the pre-#3660
+// guidance sentence BYTE-IDENTICAL as its prefix — every existing reader and
+// assertion sees the same wording — and appends the COUNT of remaining human-led
+// items plus their refs, so an operator learns how much human work is owed rather
+// than only the first item (E72.33 / #3660). Callers pass a non-empty slice (the
+// arm is guarded on len(e.HumanLed) > 0).
+func attendHumanLedDetail(humanLed []string) string {
+	const guidance = "this item's dependencies are satisfied but it is autonomy:low (human-led); a human must lead it — do not dispatch an agent run"
+	shown := humanLed
+	tail := ""
+	if len(shown) > humanLedRefsInDetail {
+		shown = shown[:humanLedRefsInDetail]
+		tail = fmt.Sprintf(" (+%d more)", len(humanLed)-humanLedRefsInDetail)
+	}
+	noun := "items remain"
+	if len(humanLed) == 1 {
+		noun = "item remains"
+	}
+	return fmt.Sprintf("%s. %d human-led %s: %s%s",
+		guidance, len(humanLed), noun, strings.Join(shown, ", "), tail)
 }
 
 // handleCreateCampaign implements POST /v0/campaigns. It assembles a
@@ -1576,7 +1607,7 @@ func (s *Server) handleListCampaigns(w http.ResponseWriter, r *http.Request) {
 	if stateFilter != "" {
 		if _, ok := validCampaignStates[stateFilter]; !ok {
 			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
-				"state must be one of pending, running, paused, succeeded, failed, cancelled",
+				"state must be one of pending, running, paused, awaiting_human, succeeded, failed, cancelled",
 				map[string]any{"field": "state", "got": stateFilter})
 			return
 		}
@@ -1641,12 +1672,17 @@ func (s *Server) handleListCampaigns(w http.ResponseWriter, r *http.Request) {
 // defense-in-depth at the handler so a typo'd state filter surfaces a 400
 // rather than reaching the DB layer.
 var validCampaignStates = map[string]struct{}{
-	string(campaign.StatePending):   {},
-	string(campaign.StateRunning):   {},
-	string(campaign.StatePaused):    {},
-	string(campaign.StateSucceeded): {},
-	string(campaign.StateFailed):    {},
-	string(campaign.StateCancelled): {},
+	string(campaign.StatePending): {},
+	string(campaign.StateRunning): {},
+	string(campaign.StatePaused):  {},
+	// awaiting_human (E72.33 / #3660): the derived non-terminal state of a
+	// campaign whose only open items are human-led. Listing by it is exactly how
+	// an operator finds the campaigns owed human work, so the filter must admit
+	// it rather than 400 validation_failed.
+	string(campaign.StateAwaitingHuman): {},
+	string(campaign.StateSucceeded):     {},
+	string(campaign.StateFailed):        {},
+	string(campaign.StateCancelled):     {},
 }
 
 // validPausePolicies pins the closed set of create-request pause_policy values
@@ -2281,10 +2317,18 @@ func (s *Server) handleStartCampaignItemRun(w http.ResponseWriter, r *http.Reque
 	// DAG gate below, so a failed campaign whose named item is NOT restartable is
 	// still refused with the campaign left failed and nothing written.
 	//
+	// An AWAITING_HUMAN campaign (E72.33 / #3660) is likewise startable, and it is
+	// precisely the campaign this verb exists for: the operator relabels its
+	// autonomy:low item to autonomy:medium and starts it. The targeted
+	// refreshOneItemAutonomy pass that makes the relabel visible runs AFTER this
+	// gate, so refusing here would make the relabel path unreachable — the item
+	// would be permanently unstartable inside the campaign.
+	//
 	// The remaining refusals are paused and cancelled/succeeded, and the detail
 	// distinguishes them: a paused campaign has a forward verb (resume); a
 	// cancelled or succeeded one is genuinely closed.
-	if c.State != campaign.StatePending && c.State != campaign.StateRunning && c.State != campaign.StateFailed {
+	if c.State != campaign.StatePending && c.State != campaign.StateRunning &&
+		c.State != campaign.StateFailed && c.State != campaign.StateAwaitingHuman {
 		detail := "campaign is cancelled or succeeded — it is closed and can start no further item runs; drive the issue standalone with fishhawk_start_run (the campaign will not track it)"
 		if c.State == campaign.StatePaused {
 			detail = "campaign is paused — resume it (fishhawk_resume_campaign) before starting an item run"
@@ -2621,10 +2665,16 @@ func (s *Server) handleStartCampaignItemRun(w http.ResponseWriter, r *http.Reque
 	})
 
 	// Derive the campaign forward: a pending campaign becomes running on its
-	// first dispatch. Best-effort — a derivation/transition failure does not
-	// unwind the started run (the run + link + item transition already
-	// committed); the next status-read reconcile re-derives.
-	if c.State == campaign.StatePending {
+	// first dispatch — and so does an AWAITING_HUMAN one (E72.33 / #3660), so
+	// starting a just-relabelled item moves the campaign back to `running` in the
+	// SAME request instead of leaving it advertising attend_human_led until the
+	// next status poll. This is the START half of the relabel corner; the
+	// relabel-WITHOUT-start half is corrected by the status-read re-derive over
+	// the awaiting_human -> pending transition edge, not by this trigger.
+	// Best-effort — a derivation/transition failure does not unwind the started
+	// run (the run + link + item transition already committed); the next
+	// status-read reconcile re-derives.
+	if c.State == campaign.StatePending || c.State == campaign.StateAwaitingHuman {
 		refreshed, lerr := s.cfg.CampaignRepo.ListCampaignItemsForCampaign(r.Context(), id)
 		if lerr != nil {
 			s.cfg.Logger.Warn("re-list items for campaign derivation failed; campaign left pending (status-read reconcile re-derives)",
