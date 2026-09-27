@@ -69,7 +69,7 @@ profiles=(); failed=()
 while IFS= read -r m; do
   rm -f "$m/coverage.out"
   if ! (cd "$m" && go test -race -coverprofile=coverage.out -covermode=atomic ./...) 2>&1 | tee "$log"; then
-    if grep -q -e '[build failed]' -e '[setup failed]' "$log"; then failed+=("$m (build failed)"); else failed+=("$m (tests failed)"); fi
+    if grep -q -e '\[build failed\]' -e '\[setup failed\]' "$log"; then failed+=("$m (build failed)"); else failed+=("$m (tests failed)"); fi
   fi
   if [ -f "$m/coverage.out" ]; then profiles+=("$m/coverage.out"); fi
 done <<< "$(go work edit -json | jq -r '.Use[].DiskPath')"
