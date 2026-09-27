@@ -20,6 +20,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -7070,34 +7071,30 @@ func gitPatchIDForCommit(ctx context.Context, repoDir, commit string) string {
 		return ""
 	}
 
-	// Stream diff-tree into patch-id rather than buffering the patch: an
-	// implement diff can be large, and an os/exec pipe read raced against Wait
-	// is the classic deadlock. Start patch-id first so it drains as diff-tree
-	// writes.
-	pr, pw := io.Pipe()
-	patchID := exec.CommandContext(ctx, gitPatchIDBinary, "patch-id", "--stable")
-	patchID.Stdin = pr
-	var idOut strings.Builder
-	patchID.Stdout = &idOut
-	if err := patchID.Start(); err != nil {
-		_ = pw.Close()
-		_ = pr.Close()
-		return ""
-	}
+	// BUFFER the diff and feed patch-id from memory rather than coupling the two
+	// children with an io.Pipe. The pipe form DEADLOCKS: neither an *io.PipeReader
+	// on Stdin nor an *io.PipeWriter on Stdout is an *os.File, so os/exec copies
+	// each through its own goroutine and Wait blocks until that copy finishes. If
+	// `git patch-id` exits before reading its whole stdin (killed, or erroring
+	// early), its stdin-copy goroutine stops draining the pipe, diff-tree's
+	// stdout-copy goroutine then blocks forever in Write, and diffTree.Run() never
+	// returns — not even on ctx cancellation, because WaitDelay is unset. That
+	// hung the runner at PR-ship time. Buffering is affordable: an implement diff
+	// is bounded by the stage's max_files_changed cap.
 	diffTree := exec.CommandContext(ctx, gitPatchIDBinary, "-C", repoDir,
 		"diff-tree", "-p", "--no-color", "--find-renames", "--full-index", parent, commit)
-	diffTree.Stdout = pw
-	diffErr := diffTree.Run()
-	// Closing the writer is what lets patch-id see EOF; do it whether or not
-	// diff-tree succeeded so the child can never outlive this call.
-	_ = pw.Close()
-	waitErr := patchID.Wait()
-	_ = pr.Close()
-	if diffErr != nil || waitErr != nil {
+	diff, err := diffTree.Output()
+	if err != nil {
+		return ""
+	}
+	patchID := exec.CommandContext(ctx, gitPatchIDBinary, "patch-id", "--stable")
+	patchID.Stdin = bytes.NewReader(diff)
+	idOut, err := patchID.Output()
+	if err != nil {
 		return ""
 	}
 	// `patch-id` prints "<patch-id> <commit-id>"; an empty diff prints nothing.
-	fields := strings.Fields(idOut.String())
+	fields := strings.Fields(string(idOut))
 	if len(fields) == 0 {
 		return ""
 	}

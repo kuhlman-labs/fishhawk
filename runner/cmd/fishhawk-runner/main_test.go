@@ -17242,6 +17242,107 @@ func TestGitPatchIDForCommit_GitFailureReturnsEmpty(t *testing.T) {
 	}
 }
 
+// TestGitPatchIDForCommit_EmptyDiffReturnsEmpty pins the empty-diff degrade: a
+// commit byte-identical to its parent makes `git patch-id` print NOTHING, so
+// strings.Fields finds zero fields and the helper returns "" rather than
+// indexing an empty slice. The backend reads "" as undecidable and records no
+// row — detector silence, never a manufactured verdict.
+func TestGitPatchIDForCommit_EmptyDiffReturnsEmpty(t *testing.T) {
+	repo, runGit := patchIDRepo(t)
+	// Fixture precondition: a NON-empty commit on this repo DOES produce an id,
+	// so an empty result below is attributable to the empty diff and not to a
+	// broken fixture.
+	mustWrite(t, filepath.Join(repo, "base.txt"), "l1\nCHANGED\nl3\n")
+	runGit("add", "-A")
+	runGit("commit", "-m", "a real change")
+	if gitPatchIDForCommit(context.Background(), repo, runGit("rev-parse", "HEAD")) == "" {
+		t.Fatal("fixture: a real change produced no patch id")
+	}
+
+	runGit("commit", "--allow-empty", "-m", "an empty change")
+	empty := runGit("rev-parse", "HEAD")
+	if tree, parentTree := runGit("rev-parse", "HEAD^{tree}"), runGit("rev-parse", "HEAD~1^{tree}"); tree != parentTree {
+		t.Fatalf("fixture: --allow-empty commit changed the tree (%s != %s)", tree, parentTree)
+	}
+	if got := gitPatchIDForCommit(context.Background(), repo, empty); got != "" {
+		t.Errorf("an empty diff must yield %q, got %q", "", got)
+	}
+}
+
+// TestGitPatchIDForCommit_PatchIDExitsWithoutReadingStdin_NoHang is the
+// regression pin for the CONFIRMED hang the implement review caught, and the
+// reason gitPatchIDForCommit buffers the diff instead of streaming it.
+//
+// The pre-fix helper coupled the two children with an io.Pipe: patch-id's Stdin
+// was an *io.PipeReader and diff-tree's Stdout an *io.PipeWriter, and since
+// neither is an *os.File os/exec copies each through its own goroutine whose
+// completion Wait blocks on. A patch-id that exits before draining its stdin
+// leaves diff-tree's stdout-copy goroutine blocked FOREVER in pw.Write, so
+// diffTree.Run() never returns — not even after ctx cancellation, because
+// WaitDelay is unset. That hung the runner at PR-ship time.
+//
+// The fixture forces exactly that interleaving through the gitPatchIDBinary
+// seam: rev-parse delegates to real git, diff-tree emits a 2 MiB diff (far past
+// any OS pipe buffer, so the writer MUST block if nobody drains), and patch-id
+// exits non-zero immediately without reading a byte. Completion inside the
+// bounded deadline is the assertion; "" is the required degrade.
+func TestGitPatchIDForCommit_PatchIDExitsWithoutReadingStdin_NoHang(t *testing.T) {
+	repo, runGit := patchIDRepo(t)
+	mustWrite(t, filepath.Join(repo, "base.txt"), "l1\nCHANGED\nl3\n")
+	runGit("add", "-A")
+	runGit("commit", "-m", "c")
+	head := runGit("rev-parse", "HEAD")
+
+	// A git shim that dispatches on the subcommand: real rev-parse, a 2 MiB
+	// diff-tree, and a patch-id that exits at once without reading stdin.
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Skip("git not available")
+	}
+	shim := filepath.Join(t.TempDir(), "git")
+	mustWrite(t, shim, "#!/bin/sh\n"+
+		"for a in \"$@\"; do\n"+
+		"  case \"$a\" in\n"+
+		"    rev-parse) exec "+realGit+" \"$@\" ;;\n"+
+		"    diff-tree) exec awk 'BEGIN{for(i=0;i<2048;i++){s=\"\";for(j=0;j<1023;j++)s=s \"x\";print s}}' ;;\n"+
+		"    patch-id) exit 7 ;;\n"+
+		"  esac\n"+
+		"done\n"+
+		"exec "+realGit+" \"$@\"\n")
+	if err := os.Chmod(shim, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	prev := gitPatchIDBinary
+	gitPatchIDBinary = shim
+	t.Cleanup(func() { gitPatchIDBinary = prev })
+
+	// Sanity: the shim's diff-tree really does emit more than a pipe buffer, so
+	// a non-draining reader genuinely blocks a streaming writer.
+	sanity := exec.Command(shim, "-C", repo, "diff-tree", "-p", head)
+	diff, err := sanity.Output()
+	if err != nil {
+		t.Fatalf("fixture: shim diff-tree failed: %v", err)
+	}
+	if len(diff) < 1<<20 {
+		t.Fatalf("fixture: shim diff is %d bytes, want > 1 MiB", len(diff))
+	}
+
+	type result struct{ id string }
+	done := make(chan result, 1)
+	go func() { done <- result{gitPatchIDForCommit(context.Background(), repo, head)} }()
+	// The deadline is generous relative to the work (two short-lived children)
+	// yet finite: the pre-fix io.Pipe version blocks unconditionally, so any
+	// bound at all discriminates. scaledD keeps it honest on a loaded runner.
+	select {
+	case got := <-done:
+		if got.id != "" {
+			t.Errorf("a patch-id that exits without reading stdin must yield %q, got %q", "", got.id)
+		}
+	case <-time.After(scaledD(30 * time.Second)):
+		t.Fatal("gitPatchIDForCommit did not return: a patch-id exiting without draining its stdin must not block the caller (the #3665 implement-review hang)")
+	}
+}
+
 // TestStampVerifyRunChangeID_EmptyIDLeavesPayloadByteIdentical pins the
 // byte-identity degrade: an empty change id must leave the verify_run payload
 // bytes untouched, so every path that cannot produce an id keeps the pre-#3665
