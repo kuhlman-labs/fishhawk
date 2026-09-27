@@ -3,7 +3,12 @@
 #
 # Mirrors the loop CI uses for the Go lane: reads registered modules
 # from go.work, runs each module's tests in its own directory.
-# Fail-fast on the first module whose tests fail.
+# `test` and `verify` fail fast on the first module whose tests fail.
+# `coverage` does NOT: it runs EVERY module, aggregates the surviving coverage
+# profiles, and ends with a per-module summary naming every failed module and
+# whether it failed to BUILD or failed its TESTS (#3403) — a first-failure abort
+# there hid 7 of 8 modules on every CI build for as long as one module stayed
+# red.
 #
 # Usage:
 #   scripts/test              run `go test -race ./...` in every module
@@ -341,6 +346,14 @@ _register_lease() {
 PATCHCOV_DIR=""
 LEASE_ARMED=0
 
+# Per-invocation scratch dir for the coverage loop's per-module output logs
+# (#3403). PID-keyed and created by `mktemp -d` for the same reasons PATCHCOV_DIR
+# is (atomic 0700 create, no fixed path to clobber or substitute), and swept by
+# the same EXIT trap so no log survives the invocation. It exists only so a
+# failed module's captured output can be CLASSIFIED build-vs-test; the loop runs
+# every module with or without it.
+COVLOG_DIR=""
+
 # Verify-lock state (#3315). VERIFY_LOCK_HELD is the lock path THIS invocation
 # actually acquired (empty when it refused, degraded, or was stolen from);
 # VERIFY_LOCK_TARGET is the `<pid>:<kind>` link target it wrote, re-read before
@@ -385,12 +398,36 @@ _patchcov_cleanup() {
   fi
 }
 
+_covlog_cleanup() {
+  if [ -n "${COVLOG_DIR:-}" ]; then
+    rm -rf "$COVLOG_DIR" 2>/dev/null || true
+  fi
+}
+
+# _covlog_mktemp: create the coverage loop's per-module log dir. Returns non-zero
+# (never aborts) when the dir cannot be created — the caller then degrades to
+# running each module with NO pipe at all and labels any failure `unclassified`.
+# Re-introducing an abort here to preserve a label would restore the exact defect
+# #3403 reports.
+_covlog_mktemp() {
+  if ! COVLOG_DIR="$(mktemp -d "${TMPDIR:-/tmp}/fishhawk-covlog-$$.XXXXXX" 2>/dev/null)"; then
+    COVLOG_DIR=""
+    return 1
+  fi
+  if [ -z "$COVLOG_DIR" ] || [ ! -d "$COVLOG_DIR" ]; then
+    COVLOG_DIR=""
+    return 1
+  fi
+  trap "$EXIT_TRAP" EXIT
+  return 0
+}
+
 # The single EXIT handler. It always sweeps the coverage scratch dir and reaps
 # the shared container ONLY when this invocation actually recorded a lease —
 # an invocation holding no lease must never docker-rm the container out from
 # under a peer (#1792). Kept as one string so both arming sites install the
 # identical handler.
-EXIT_TRAP='_release_verify_lock; _patchcov_cleanup; if [ "${LEASE_ARMED:-0}" = "1" ]; then _reap_shared_container; fi'
+EXIT_TRAP='_release_verify_lock; _patchcov_cleanup; _covlog_cleanup; if [ "${LEASE_ARMED:-0}" = "1" ]; then _reap_shared_container; fi'
 
 # _patchcov_mktemp: create the per-invocation profile dir and arm the EXIT trap.
 # Returns non-zero (never aborts) if the dir cannot be created — the caller then
@@ -681,15 +718,91 @@ cmd_test_scoped() {
   fi
 }
 
+# cmd_coverage: run EVERY go.work module, then gate the aggregate over whichever
+# coverage profiles were actually produced (#3403).
+#
+# The old loop ran its per-module `go test` as an UNTESTED command under this
+# script's `set -e`, so the first failing module ended the whole command — which
+# is how a red `backend` hid modules 2-8 on every CI build for as long as the
+# deleted `minio/minio` image kept `backend/internal/tracestore` red (#3386), and
+# why #3401 looked like it broke the runner module when it had merely unmasked it.
+# `cmd_test` and the verify loop deliberately KEEP their first-failure abort: they
+# are the fast inner gate, whereas `coverage` is the reporting one.
 cmd_coverage() {
+  local mlist m classify=0 idx=0 cov_rc=0
+  # Fail CLOSED on an unavailable or empty module list, exactly as cmd_test does.
+  # The old loop fed straight from `< <(modules)`, where a failing go/jq or an
+  # empty go.work iterates ZERO times and reports success having tested nothing.
+  if ! mlist="$(_module_list)"; then
+    echo "$NO_MODULES_MSG" >&2
+    exit 1
+  fi
   _arm_container_lease
-  local profiles=()
+  # A scratch-dir failure degrades the CLASSIFICATION only — never the loop.
+  if _covlog_mktemp; then
+    classify=1
+  else
+    echo "scripts/test: could not create the per-module log dir — failures will be reported unclassified" >&2
+  fi
+  local profiles=() failed=()
   while IFS= read -r m; do
     printf '>>> %s\n' "$m"
-    (cd "$m" && go test -race -p "$TEST_P" -timeout "$TEST_TIMEOUT" -coverprofile=coverage.out -covermode=atomic ./...)
-    profiles+=("$m/coverage.out")
-  done < <(modules)
-  python3 "$ROOT/scripts/check-coverage.py" --threshold 80 --exclude '/db/' "${profiles[@]}"
+    # Delete any stale profile BEFORE the run: a module whose test binary dies
+    # before writing a fresh coverage.out would otherwise contribute a previous
+    # invocation's profile to the aggregate denominator.
+    rm -f "$m/coverage.out"
+    # Pre-increment: `(( idx++ ))` returns 1 when idx is 0 and aborts under
+    # `set -e` (the #631 trap).
+    (( ++idx ))
+    if [ "$classify" = "1" ]; then
+      # `pipefail` is in force, so the pipeline's status is `go test`'s (tee
+      # exits 0). stderr is folded in deliberately: go writes compile errors
+      # there and they must be captured to be classified. The log name is keyed
+      # by the per-loop ORDINAL, not a `tr '/' '_'` slug of the module path —
+      # that slug is not injective (`a/b` and `a_b` collide) and a collision
+      # would classify the second module from the first's log.
+      if ! ( cd "$m" && go test -race -p "$TEST_P" -timeout "$TEST_TIMEOUT" -coverprofile=coverage.out -covermode=atomic ./... ) 2>&1 | tee "$COVLOG_DIR/$idx.log"; then
+        # `[build failed]` / `[setup failed]` are go test's own summary-line
+        # markers for a package that did not compile or whose setup died.
+        if grep -q -e '\[build failed\]' -e '\[setup failed\]' "$COVLOG_DIR/$idx.log" 2>/dev/null; then
+          failed+=("$m (build failed)")
+        else
+          failed+=("$m (tests failed)")
+        fi
+      fi
+    else
+      # Degrade path: no scratch dir, so NO pipe at all — never tee into a path
+      # under an empty COVLOG_DIR.
+      if ! ( cd "$m" && go test -race -p "$TEST_P" -timeout "$TEST_TIMEOUT" -coverprofile=coverage.out -covermode=atomic ./... ); then
+        failed+=("$m (failed, unclassified)")
+      fi
+    fi
+    # A module that DID run still contributes its profile even when a sibling
+    # failed, so the aggregate denominator stays honest.
+    if [ -f "$m/coverage.out" ]; then
+      profiles+=("$m/coverage.out")
+    fi
+  done <<< "$mlist"
+
+  # The count guard is load-bearing twice over: "${profiles[@]}" on an EMPTY
+  # array is an unbound-variable error under `set -u` in macOS bash 3.2, and
+  # check-coverage.py rejects zero profiles in aggregate mode with an argparse
+  # usage error whose exit 2 would bury the per-module summary below.
+  if [ "${#profiles[@]}" -gt 0 ]; then
+    python3 "$ROOT/scripts/check-coverage.py" --threshold 80 --exclude '/db/' "${profiles[@]}" || cov_rc=$?
+  else
+    echo 'scripts/test: no coverage profiles were produced — skipping the aggregate coverage gate' >&2
+  fi
+
+  if [ "${#failed[@]}" -gt 0 ]; then
+    printf 'scripts/test: %s of %s modules failed:\n' "${#failed[@]}" "$idx" >&2
+    local f
+    for f in "${failed[@]}"; do
+      printf '  - %s\n' "$f" >&2
+    done
+    exit 1
+  fi
+  return "$cov_rc"
 }
 
 # Fail CLOSED if golangci-lint is missing: the verify gate must never silently

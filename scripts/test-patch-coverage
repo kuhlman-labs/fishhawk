@@ -909,6 +909,217 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# (k) cmd_coverage AGGREGATES instead of aborting at the first failing module
+#     (#3403). Drives the REAL cmd_coverage against stub `modules`, a stub `go`
+#     whose per-module behaviour is env-driven, and a stub check-coverage.py that
+#     records its argv — so each case observes both the per-module summary and
+#     exactly which profiles the aggregate gate saw.
+#
+#     Every case runs cmd_coverage inside a `set -euo pipefail` SUBSHELL: the
+#     pre-fix abort only reproduces under errexit, and this harness shell runs
+#     `set +e`. The subshell also contains the EXIT trap cmd_coverage installs,
+#     so the parent's trap is untouched and no scratch dir leaks.
+# ---------------------------------------------------------------------------
+kroot="$tmproot/cov"
+kbin="$tmproot/kbin"
+rm -rf "$kroot" "$kbin"
+mkdir -p "$kroot/backend" "$kroot/cli" "$kroot/scripts" "$kbin"
+
+# Stub `go`: logs its argv, then behaves per module basename.
+#   KGO_BUILDFAIL — modules that emit go's own `[build failed]` marker and exit 1
+#   KGO_FAIL      — modules that emit a plain test failure and exit 1
+# Anything else writes a coverage profile and exits 0. A FAILING module writes no
+# profile, which is the "test binary died before writing a fresh coverage.out"
+# shape the stale-profile control exists for.
+cat > "$kbin/go" <<'EOF'
+#!/usr/bin/env bash
+base="$(basename "$PWD")"
+printf '%s|%s\n' "$base" "$*" >> "$KGO_LOG"
+case " ${KGO_BUILDFAIL:-} " in
+  *" $base "*) printf 'FAIL\tgithub.com/x/%s [build failed]\n' "$base"; exit 1 ;;
+esac
+case " ${KGO_FAIL:-} " in
+  *" $base "*) printf -- '--- FAIL: TestX\nFAIL\tgithub.com/x/%s\t0.1s\n' "$base"; exit 1 ;;
+esac
+printf 'mode: atomic\n' > coverage.out
+printf 'ok\tgithub.com/x/%s\t0.1s\n' "$base"
+EOF
+chmod +x "$kbin/go"
+
+# Stub check-coverage.py: records its argv and exits with $COVGATE_RC (default 0),
+# so the coverage-gate FAILURE path is testable (binding condition 2).
+cat > "$kroot/scripts/check-coverage.py" <<'EOF'
+import os, sys
+with open(os.environ["KCOV_ARGV"], "a") as fh:
+    fh.write(" ".join(sys.argv[1:]) + "\n")
+sys.exit(int(os.environ.get("COVGATE_RC", "0")))
+EOF
+
+export KGO_LOG="$tmproot/kgo.log"
+export KCOV_ARGV="$tmproot/kcov.argv"
+
+# k_run: reset the recorders, then drive the real cmd_coverage in a `set -euo
+# pipefail` subshell rooted at the throwaway repo. Sets $out and $rc.
+k_run() {
+  : > "$KGO_LOG"
+  : > "$KCOV_ARGV"
+  out="$( cd "$kroot" || exit 99
+          set -euo pipefail
+          ROOT="$kroot"
+          PATH="$kbin:$PATH"
+          TMPDIR="$tmproot"
+          export PATH TMPDIR
+          cmd_coverage 2>&1 )"
+  rc=$?
+}
+
+modules() { printf './backend\n./cli\n'; }
+_arm_container_lease() { :; }
+export KGO_FAIL="" KGO_BUILDFAIL="" COVGATE_RC=0
+
+# (k1) DONE-MEANS: module 1 fails, module 2 must STILL run, the summary names
+#      module 1, and the STALE ./backend/coverage.out pre-seeded by construction
+#      must NOT reach the gate (the rm-before-run control).
+KGO_FAIL="backend" KGO_BUILDFAIL=""
+printf 'mode: atomic\n' > "$kroot/backend/coverage.out"
+k_run
+k1_argv="$(cat "$KCOV_ARGV")"
+if [ "$rc" -ne 0 ] \
+   && printf '%s' "$out" | grep -q '>>> \./backend' \
+   && printf '%s' "$out" | grep -q '>>> \./cli' \
+   && printf '%s' "$out" | grep -q -- '- \./backend (tests failed)' \
+   && printf '%s' "$k1_argv" | grep -q -- './cli/coverage.out' \
+   && ! printf '%s' "$k1_argv" | grep -q -- './backend/coverage.out'; then
+  pass "(k1) a failing module no longer hides later modules; its stale profile is not credited"
+else
+  fail "(k1) aggregation/stale-profile (rc=$rc out='$out' argv='$k1_argv')"
+fi
+
+# (k2) BUILD-vs-TEST classification from go's own summary markers.
+KGO_FAIL="cli" KGO_BUILDFAIL="backend"
+k_run
+if [ "$rc" -ne 0 ] \
+   && printf '%s' "$out" | grep -q -- '- \./backend (build failed)' \
+   && printf '%s' "$out" | grep -q -- '- \./cli (tests failed)' \
+   && printf '%s' "$out" | grep -q 'scripts/test: 2 of 2 modules failed:'; then
+  pass "(k2) failures are classified build-vs-test from go's [build failed] marker"
+else
+  fail "(k2) build-vs-test classification (rc=$rc out='$out')"
+fi
+
+# (k2d) BINDING CONDITION 1 — the scratch-dir DEGRADE must not tee. With
+#       _covlog_mktemp failing there is no log dir, so each module runs as a bare
+#       TESTED subshell with NO pipe: module 1's failure is recorded
+#       `unclassified`, module 2 still PASSES (so it is NOT named in the summary)
+#       and its profile still reaches the gate. Teeing unconditionally would send
+#       module 2's output to a path under an empty COVLOG_DIR, and under pipefail
+#       tee's failure would mark the PASSING module failed.
+KGO_FAIL="backend" KGO_BUILDFAIL=""
+_covlog_mktemp() { return 1; }
+k_run
+k2d_argv="$(cat "$KCOV_ARGV")"
+if [ "$rc" -ne 0 ] \
+   && printf '%s' "$out" | grep -q 'failures will be reported unclassified' \
+   && printf '%s' "$out" | grep -q -- '- \./backend (failed, unclassified)' \
+   && ! printf '%s' "$out" | grep -q -- '- \./cli' \
+   && printf '%s' "$out" | grep -q 'scripts/test: 1 of 2 modules failed:' \
+   && printf '%s' "$k2d_argv" | grep -q -- './cli/coverage.out'; then
+  pass "(k2d) a failed log-dir mktemp degrades the LABEL only — no tee, every module still runs"
+else
+  fail "(k2d) mktemp degrade (rc=$rc out='$out' argv='$k2d_argv')"
+fi
+# Restore the real _covlog_mktemp for every case after this one.
+FISHHAWK_TEST_LIB_ONLY=1 source "$REPO_ROOT/scripts/test"
+set +e
+modules() { printf './backend\n./cli\n'; }
+_arm_container_lease() { :; }
+
+# (k3) ALL-GREEN passthrough control: the happy path still exits 0 and both
+#      profiles reach the gate.
+KGO_FAIL="" KGO_BUILDFAIL=""
+k_run
+k3_argv="$(cat "$KCOV_ARGV")"
+if [ "$rc" -eq 0 ] \
+   && printf '%s' "$k3_argv" | grep -q -- './backend/coverage.out' \
+   && printf '%s' "$k3_argv" | grep -q -- './cli/coverage.out' \
+   && ! printf '%s' "$out" | grep -q 'modules failed:'; then
+  pass "(k3) all-green: rc 0 and both profiles reach the aggregate gate"
+else
+  fail "(k3) all-green passthrough (rc=$rc out='$out' argv='$k3_argv')"
+fi
+
+# (k4) ZERO surviving profiles: the count guard prints a reason and check-coverage.py
+#      is NOT invoked ("${profiles[@]}" on an empty array is unbound under bash 3.2
+#      `set -u`, and the aggregate mode rejects zero profiles with an argparse
+#      usage error that would bury the summary).
+KGO_FAIL="backend cli" KGO_BUILDFAIL=""
+k_run
+k4_argv="$(cat "$KCOV_ARGV")"
+if [ "$rc" -ne 0 ] \
+   && printf '%s' "$out" | grep -q 'no coverage profiles were produced' \
+   && [ ! -s "$KCOV_ARGV" ]; then
+  pass "(k4) zero surviving profiles: printed reason, gate never invoked, still rc non-zero"
+else
+  fail "(k4) zero-profile guard (rc=$rc out='$out' argv='$k4_argv')"
+fi
+
+# (k5) FAIL-CLOSED module list, both inputs. NO_MODULES_MSG carries the phrase
+#      'refusing to report success'.
+KGO_FAIL="" KGO_BUILDFAIL=""
+k5_saved="$(declare -f modules)"
+modules() { return 1; }
+k_run
+k5a_rc=$rc; k5a_out="$out"
+modules() { printf ''; }
+k_run
+k5b_rc=$rc; k5b_out="$out"
+eval "$k5_saved"
+if [ "$k5a_rc" -ne 0 ] && printf '%s' "$k5a_out" | grep -q 'refusing to report success' \
+   && [ "$k5b_rc" -ne 0 ] && printf '%s' "$k5b_out" | grep -q 'refusing to report success'; then
+  pass "(k5) cmd_coverage fails closed on an unavailable AND on an empty module list"
+else
+  fail "(k5) module-list fail-closed (a: rc=$k5a_rc out='$k5a_out'; b: rc=$k5b_rc out='$k5b_out')"
+fi
+
+# (k6) BINDING CONDITION 2a — every module passes but the aggregate gate exits 1:
+#      cmd_coverage must return non-zero (the `return "$cov_rc"` tail).
+KGO_FAIL="" KGO_BUILDFAIL="" COVGATE_RC=1
+k_run
+if [ "$rc" -ne 0 ] && ! printf '%s' "$out" | grep -q 'modules failed:'; then
+  pass "(k6) all modules pass but the aggregate gate fails -> cmd_coverage returns non-zero"
+else
+  fail "(k6) coverage-gate failure with no module failures (rc=$rc out='$out')"
+fi
+
+# (k7) BINDING CONDITION 2b — a module fails AND the gate exits 1: the per-module
+#      summary must still be printed (the `|| cov_rc=$?` capture is what stops
+#      `set -e` aborting before it).
+KGO_FAIL="backend" KGO_BUILDFAIL="" COVGATE_RC=1
+k_run
+if [ "$rc" -ne 0 ] \
+   && printf '%s' "$out" | grep -q 'scripts/test: 1 of 2 modules failed:' \
+   && printf '%s' "$out" | grep -q -- '- \./backend (tests failed)'; then
+  pass "(k7) a failing gate does not suppress the per-module failure summary"
+else
+  fail "(k7) summary survives a failing coverage gate (rc=$rc out='$out')"
+fi
+COVGATE_RC=0
+
+# (k8) STATIC shape: the rewritten body must keep the explicit -timeout and must
+#      NOT re-introduce the process-substitution feed whose zero iterations the
+#      fail-closed block exists to catch. `declare -f` is captured ONCE and
+#      matched in the form bash actually prints (binding condition 3).
+k8_body="$(declare -f cmd_coverage)"
+if printf '%s\n' "$k8_body" | grep -q -- '-timeout "\$TEST_TIMEOUT"' \
+   && ! printf '%s\n' "$k8_body" | grep -q '< <(modules)'; then
+  pass "(k8) cmd_coverage keeps -timeout \"\$TEST_TIMEOUT\" and does not feed from < <(modules)"
+else
+  fail "(k8) cmd_coverage static shape ('$k8_body')"
+fi
+
+unset KGO_FAIL KGO_BUILDFAIL COVGATE_RC
+
+# ---------------------------------------------------------------------------
 # (i) module enumeration failing INSIDE the coverage loop. Feeding the loop
 #     straight from a failing `modules` would iterate zero times and still exit
 #     0 — verify reporting success having tested nothing. The coverage loop

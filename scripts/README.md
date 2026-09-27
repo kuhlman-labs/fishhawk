@@ -416,6 +416,90 @@ coverage loop non-zero. The (e2)/(e3) unit cases pin the same no-profiles
 integrity re-check directly on `_verify_patch_coverage`, and (e) that a
 skip-snapshot with zero profiles still skips.
 
+## Per-module coverage aggregation ([#3403](https://github.com/kuhlman-labs/fishhawk/issues/3403))
+
+`cmd_coverage` (the body of `scripts/test coverage`, which is what
+`.github/workflows/ci.yml`'s coverage step runs) runs **every** `go.work`
+module and reports on all of them. It used to run its per-module
+`(cd "$m" && go test … -coverprofile=coverage.out …)` subshell as an
+UNTESTED command under the script's `set -e`, so the first non-zero module
+ended the whole command: a red `backend` hid modules 2-8 (`cli`,
+`credstore`, `directory`, `pricing`, `redaction`, `runner`, `verifier`) on
+every CI build for as long as the deleted `minio/minio` image kept
+`backend/internal/tracestore` red (#3386), and made #3401 look like it had
+broken the runner module when it had merely unmasked it.
+
+**`cmd_test` and the verify loop deliberately KEEP their first-failure
+abort.** They are the fast inner gate an agent or developer re-runs; the
+split is intentional, not an oversight. Only `coverage` — the reporting
+gate — aggregates.
+
+The contract, in loop order:
+
+- **The module list fails CLOSED.** `cmd_coverage` now enumerates once via
+  `_module_list` and exits 1 with `NO_MODULES_MSG` when the list is
+  unavailable or empty, exactly as `cmd_test` does. The old
+  `while … done < <(modules)` feed iterated ZERO times on a failing
+  `go`/`jq` or an empty `go.work` and reported success having tested
+  nothing.
+- **Stale profiles are deleted before each run.** `rm -f "$m/coverage.out"`
+  precedes the module's `go test`. Without it, a module whose test binary
+  dies before writing a fresh profile contributes a PREVIOUS invocation's
+  `coverage.out` to the aggregate denominator — the silent-shrink hazard,
+  inverted.
+- **Each module runs in a TESTED context**, so a failure is recorded in a
+  `failed` array and the loop continues.
+- **Failures are classified BUILD vs TEST** by grepping the module's
+  captured output for `[build failed]` / `[setup failed]` — `go test`'s own
+  summary-line markers, not a heuristic. A module where one package fails
+  to build and another fails its tests is labelled `(build failed)`: the
+  marker is present, and that is the conservative direction, since the
+  build failure is the one a reader must fix first.
+- **The capture is a `tee` to an ORDINAL-keyed scratch log.** The log dir
+  is `mktemp -d "${TMPDIR:-/tmp}/fishhawk-covlog-$$.XXXXXX"` (atomic, 0700,
+  outside the repo, swept by the shared `EXIT_TRAP` via `_covlog_cleanup`),
+  and the filename is keyed by the per-loop ordinal rather than a
+  `tr '/' '_'` slug of the module path — that slug is not injective
+  (`a/b` and `a_b` both yield `a_b`) and a collision would classify the
+  second module from the first module's log. `2>&1` is folded in
+  deliberately: `go` writes compile errors to stderr and they must be
+  captured to be classified. `set -o pipefail` is already in force, so the
+  pipeline's status is `go test`'s, not `tee`'s.
+- **A failed `_covlog_mktemp` degrades the LABEL only, and does NOT tee.**
+  With no scratch dir the module runs as a bare tested subshell with no
+  pipe at all (never a `tee` into a path under an empty `COVLOG_DIR`,
+  which under `pipefail` would mark a PASSING module failed), and any
+  failure is labelled `(failed, unclassified)`. Re-introducing the abort to
+  preserve a label would restore the exact defect this issue reports.
+- **Surviving profiles are collected per module** (`[ -f "$m/coverage.out" ]`),
+  so a module that DID run still contributes its profile when a sibling
+  failed and the aggregate denominator stays honest.
+- **The aggregate gate runs behind a count guard.**
+  `[ "${#profiles[@]}" -gt 0 ]` is load-bearing twice: `"${arr[@]}"` on an
+  EMPTY array is an unbound-variable error under `set -u` in macOS bash 3.2,
+  and `check-coverage.py` rejects zero profiles in aggregate mode with an
+  argparse usage error (`at least one coverage profile is required`) whose
+  exit 2 would bury the real story. With zero profiles the gate is skipped
+  with a printed reason and the per-module summary decides the exit code.
+- **The gate's status is captured with `|| cov_rc=$?`**, not left to
+  `set -e`, so the per-module summary is still printed when the coverage
+  threshold ALSO fails.
+- **The verdict** is a stderr summary — `scripts/test: 2 of 8 modules
+  failed:` followed by one `  - ./backend (tests failed)` line per entry —
+  then `exit 1`. It comes AFTER the coverage gate's own output so it is the
+  last thing a reader sees, and it names every failed module rather than
+  only the first. With no failures `cmd_coverage` returns the gate's status.
+
+Pinned by `scripts/test-patch-coverage`'s (k) block, which drives the REAL
+`cmd_coverage` inside a `set -euo pipefail` subshell (the pre-fix abort only
+reproduces under errexit, and that harness runs `set +e`) against a stub
+`modules`, an env-driven stub `go`, and a stub `check-coverage.py` that
+records its argv and exits with `$COVGATE_RC`: k1 aggregation plus the
+stale-profile negative argv assertion, k2 build-vs-test classification, k2d
+the no-tee mktemp degrade, k3 the all-green control, k4 the zero-profile
+guard, k5 both module-list fail-closed inputs, k6/k7 a failing aggregate
+gate with and without a module failure, and k8 the static shape.
+
 ## Scoped verify + the per-repository verify lock (E68.39 / [#3315](https://github.com/kuhlman-labs/fishhawk/issues/3315))
 
 Two controls in `scripts/test`, pinned together by `scripts/test-verify-scope`.
