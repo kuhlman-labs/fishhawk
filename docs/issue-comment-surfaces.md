@@ -829,13 +829,23 @@ Notes:
   success-ship path (`pullrequest.go::recordReviewHeadMismatch`) — is an
   **internal, gate-read audit kind, not an issue-comment surface**, and is
   DELIBERATELY absent from `issuecomment`'s `activityCategories`: it is a signal
-  for the operator reading the gate (the open review verdicts describe a tree the
-  PR does not carry), not run activity to narrate on the issue thread. It fires
-  when the newest same-stage `implement_review_started` round's recorded
-  `tree_sha` differs from the `verified_tree_sha` the runner shipped on its
-  success PR report; either tree empty records nothing. Payload `{run_id,
+  for the operator reading the gate (the open review verdicts describe a change
+  the PR does not carry), not run activity to narrate on the issue thread. Since
+  #3665 it fires on a CHANGE-SET comparison, not a tree comparison: the newest
+  same-stage `implement_review_started` round's recorded `change_id` — a
+  `git patch-id --stable` sum over the diff the reviewed commit introduced
+  against its OWN parent — differs from the `verified_change_id` the runner
+  shipped on its success PR report. The earlier tree comparison false-positived
+  on every routine commit-time base advance (the same change re-staged onto a
+  different base has a different tree but an identical patch id). Fail-closed to
+  silence is correspondingly WIDENED: an empty change id on EITHER side (an older
+  runner, a no-verify stage, a held-commit resume, a legacy or pre-#3665 started
+  row, an extraction or git degrade) is UNDECIDABLE and records NOTHING, and the
+  tree comparison is deliberately not kept as a fallback. Payload `{run_id,
   stage_id, reviewed_tree_sha, pushed_tree_sha, review_round_sequence,
-  reviewed_head_sha, pushed_head_sha}`. Best-effort — never blocks the ship.
+  reviewed_head_sha, pushed_head_sha, reviewed_change_id, pushed_change_id}` —
+  the two change ids are the evidence, the trees and heads human coordinates.
+  Best-effort — never blocks the ship.
   Listed here so the non-surface choice is a reviewable decision, not an
   omission.
 - The routed-concern not-attempted audit kind — `fixup_concern_unattempted`

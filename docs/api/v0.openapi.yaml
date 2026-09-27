@@ -2147,13 +2147,18 @@ components:
     GateViewReviewHeadMismatch:
       type: object
       description: |
-        Present when the open implement-review round judged a tree the PR does
-        NOT carry (#3655) — e.g. a base-rebase re-invoke shipped a new tree after
-        the round was dispatched from the first attempt's trace bundle. Distilled
-        from the newest `review_head_mismatch` audit entry, which the success PR
-        ship records when the round's reviewed tree differs from the
-        gate-certified tree the runner pushed (trees, not commits: the reviewed
-        head is a throwaway WIP commit, so head SHAs differ on every ship).
+        Present when the open implement-review round judged a CHANGE the PR does
+        NOT carry (#3655) — e.g. a base-rebase re-invoke shipped a different
+        change after the round was dispatched from the first attempt's trace
+        bundle. Distilled from the newest `review_head_mismatch` audit entry,
+        which the success PR ship records when the round's reviewed CHANGE
+        IDENTITY (a `git patch-id --stable` sum) differs from the change identity
+        the runner pushed (#3665). Neither the trees nor the head SHAs are the
+        fire condition: the reviewed head is a throwaway WIP commit so heads
+        differ on every ship, and the trees differ on every routine base advance
+        without any reviewed change being superseded — both are carried below as
+        human coordinates only. An empty change identity on either side is
+        undecidable and records nothing.
         Omitted when no mismatch was recorded, once a NEWER same-stage
         `implement_review_started` round has superseded it, or when the read
         fails (best-effort). Carried on both `GET /v0/runs/{run_id}/gate-view`
@@ -4118,9 +4123,31 @@ components:
         verified_tree_sha:
           type: string
           description: |
-            Present only on the `scope_park` variant (#1231). The tree object
-            the committed-tree verify gate passed on; recorded so the exempt
-            resolution can assert the opened PR head reflects the identical tree.
+            The tree object the committed-tree verify gate passed on. On the
+            `scope_park` variant (#1231) it is recorded so the exempt resolution
+            can assert the opened PR head reflects the identical tree; it also
+            rides the `failed` variant's PR-open checkpoint (#2169) and, since
+            #3655, the SUCCESS variant, where it is retained as a human
+            coordinate on any `review_head_mismatch` row. Omitted when no verify
+            gate ran.
+        verified_change_id:
+          type: string
+          description: |
+            Present only on the SUCCESS variant (#3665), and omitted when the
+            runner cannot compute one (a root commit, a git degrade) so that
+            artifact stays byte-identical. The pushed commit's CHANGE IDENTITY:
+            a `git patch-id --stable` sum over the diff the pushed commit
+            introduces against its OWN parent. `recordReviewHeadMismatch`
+            compares it against the change identity the implement-review round
+            judged (`implement_review_started.change_id`) and records a
+            `review_head_mismatch` row only when the two DIFFER. It replaced the
+            #3655 whole-TREE comparison, which false-positived on every routine
+            commit-time base advance — the same change re-staged onto a different
+            base yields different trees but an IDENTICAL patch id, because
+            patch-id ignores line numbers and both sides base the diff on their
+            own commit's parent. An empty or absent value on EITHER side is
+            undecidable and records nothing; the tree comparison is deliberately
+            NOT kept as a fallback.
         missing_paths:
           type: array
           items: { type: string }

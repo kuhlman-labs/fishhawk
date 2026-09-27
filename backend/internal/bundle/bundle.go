@@ -174,9 +174,11 @@ var (
 	// ErrNoVerifyTreeSHA means the bundle parsed cleanly but carried no
 	// verify_run event with a non-empty tree_sha (no committed-tree gate
 	// ran, an older runner, or every verify_run was gate-skipped). Returned
-	// by ExtractVerifyTreeSHA so the caller can fail open (#3655): an absent
-	// tree must never suppress a review dispatch — it only disables the
-	// review_head_mismatch check for that round. Mirrors ErrNoHeadSHA.
+	// by ExtractVerifyTreeSHA / ExtractVerifyIdentity so the caller can fail
+	// open (#3655): an absent tree must never suppress a review dispatch — it
+	// only disables the review_head_mismatch check for that round (no
+	// authoritative event means no change identity to pair with it either).
+	// Mirrors ErrNoHeadSHA.
 	ErrNoVerifyTreeSHA = errors.New("bundle: no verify_run event with a tree_sha found")
 
 	// ErrNoGateEvidence means the bundle parsed cleanly but carried no
@@ -275,6 +277,16 @@ type verifyRunPayload struct {
 	// TreeSHA is the tree object hash of the committed tree the gate
 	// verified (#960). Read by ExtractVerifyTreeSHA (#3655).
 	TreeSHA string `json:"tree_sha"`
+	// ChangeID is the gated commit's CHANGE IDENTITY (#3665): a
+	// `git patch-id --stable` sum over the diff that commit introduces against
+	// its OWN parent, stamped by the runner's stampVerifyRunChangeID. Read by
+	// ExtractVerifyIdentity as the reviewed-CHANGE identity, which replaced the
+	// whole-tree comparison on the ship-side review_head_mismatch check: a
+	// routine base advance re-stages the same change onto a different tree, so
+	// the trees differ while the change ids match. Absent (decoding "") on an
+	// older runner and on every degrade path, which the backend reads as
+	// undecidable. Lockstep tag with the emitter.
+	ChangeID string `json:"change_id"`
 }
 
 // GateEvidence mirrors the runner's gate_evidence event payload
@@ -834,9 +846,11 @@ func ExtractHeadSHA(bundleBytes []byte) (string, error) {
 // AUTHORITATIVE verify_run event — the LAST one with a non-empty tree_sha —
 // or ErrNoVerifyTreeSHA if the bundle parsed cleanly but carried none. It is
 // the implement-review round's REVIEWED-TREE identity (#3655): recorded on
-// implement_review_started and compared against the tree the runner reports
-// on its success PR ship, so a base-rebase re-invoke that shipped a tree the
-// review never judged records a review_head_mismatch row.
+// implement_review_started, where it is a human coordinate on a
+// review_head_mismatch row. Since #3665 the row's fire condition is the
+// CHANGE identity ExtractVerifyIdentity returns alongside it, NOT this tree —
+// a routine base advance changes the tree without superseding any reviewed
+// change, which is what made the tree comparison false-positive.
 //
 // LAST, deliberately the OPPOSITE of ExtractHeadSHA's first-non-empty rule.
 // ExtractHeadSHA wants a deterministic dedup KEY, and any stable choice
@@ -848,27 +862,52 @@ func ExtractHeadSHA(bundleBytes []byte) (string, error) {
 // authoritative-is-last rule. Only a corrupt gzip frame / malformed line
 // propagates as a different error.
 func ExtractVerifyTreeSHA(bundleBytes []byte) (string, error) {
+	tree, _, err := ExtractVerifyIdentity(bundleBytes)
+	return tree, err
+}
+
+// ExtractVerifyIdentity returns BOTH identities carried by the bundle's
+// AUTHORITATIVE verify_run event — the LAST one with a non-empty tree_sha —
+// or ErrNoVerifyTreeSHA if the bundle parsed cleanly but carried none (#3665).
+// treeSHA is the reviewed-TREE identity (see ExtractVerifyTreeSHA); changeID is
+// the reviewed-CHANGE identity, the `git patch-id --stable` sum the runner
+// stamped for that same gated commit, and is the value the ship-side
+// review_head_mismatch check now compares.
+//
+// SAME EVENT, deliberately: changeID is read from the very event whose tree_sha
+// was selected, never by an independent last-non-empty scan over change_id. An
+// independent scan could pair iteration 3's tree with iteration 1's change id
+// and manufacture a verdict from two different trees; this way the pair either
+// describes one gated commit or the change id is EMPTY (an older runner, or a
+// degrade on the authoritative iteration), which the backend reads as
+// undecidable and records nothing.
+//
+// changeID is empty — with a nil error — whenever the authoritative event
+// carries no change_id. Only a corrupt gzip frame / malformed line propagates
+// as a different error.
+func ExtractVerifyIdentity(bundleBytes []byte) (treeSHA, changeID string, err error) {
 	lines, err := ReadEvents(bundleBytes)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
-	tree := ""
+	tree, change := "", ""
 	for _, line := range lines {
 		if line.Kind != EventKindVerifyRun {
 			continue
 		}
 		var payload verifyRunPayload
 		if err := json.Unmarshal(line.Data, &payload); err != nil {
-			return "", fmt.Errorf("bundle: parse verify_run payload: %w", err)
+			return "", "", fmt.Errorf("bundle: parse verify_run payload: %w", err)
 		}
 		if payload.TreeSHA != "" {
 			tree = payload.TreeSHA
+			change = payload.ChangeID
 		}
 	}
 	if tree == "" {
-		return "", ErrNoVerifyTreeSHA
+		return "", "", ErrNoVerifyTreeSHA
 	}
-	return tree, nil
+	return tree, change, nil
 }
 
 // ExtractGateEvidence returns the digested gate results carried in the

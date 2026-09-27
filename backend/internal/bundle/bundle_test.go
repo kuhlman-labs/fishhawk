@@ -1819,6 +1819,131 @@ func TestExtractVerifyTreeSHA_BadInput(t *testing.T) {
 	}
 }
 
+// makeVerifyRunIdentityLine builds a verify_run event line carrying head_sha,
+// tree_sha AND change_id (#3665), mirroring the shape the runner's
+// stampVerifyRunChangeID produces. An empty changeID omits the key, reproducing
+// an older runner / degraded iteration.
+func makeVerifyRunIdentityLine(t *testing.T, seq int, headSHA, treeSHA, changeID, outcome string) Line {
+	t.Helper()
+	fields := map[string]any{
+		"command":   "scripts/test verify",
+		"head_sha":  headSHA,
+		"tree_sha":  treeSHA,
+		"exit_code": 0,
+		"output":    "",
+		"outcome":   outcome,
+	}
+	if changeID != "" {
+		fields["change_id"] = changeID
+	}
+	payload, err := json.Marshal(fields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return Line{Seq: seq, Kind: EventKindVerifyRun, Data: payload}
+}
+
+// TestExtractVerifyIdentity_ChangeIDComesFromTheAuthoritativeEvent is the #3665
+// same-event pairing control, and the vehicle for its counterfactual. The
+// fixture is built so the two candidate implementations DISAGREE by
+// construction: iteration 1 carries tree-a WITH change-a, while the
+// AUTHORITATIVE (last non-empty tree) iteration 2 carries tree-b with NO
+// change_id. The paired read must return (tree-b, "") — undecidable, no row —
+// where an independent last-non-empty scan over change_id would return
+// (tree-b, change-a) and manufacture a verdict from two different commits.
+func TestExtractVerifyIdentity_ChangeIDComesFromTheAuthoritativeEvent(t *testing.T) {
+	b := packLines(t, []Line{
+		{Seq: 1, Kind: "manifest", Data: json.RawMessage(`{"bundle_schema":"v1"}`)},
+		makeVerifyRunIdentityLine(t, 2, "head-a", "tree-a", "change-a", "failed"),
+		makeVerifyRunIdentityLine(t, 3, "head-b", "tree-b", "", "passed"),
+	})
+	tree, change, err := ExtractVerifyIdentity(b)
+	if err != nil {
+		t.Fatalf("ExtractVerifyIdentity: %v", err)
+	}
+	if tree != "tree-b" {
+		t.Errorf("tree = %q, want tree-b (the authoritative iteration)", tree)
+	}
+	if change != "" {
+		t.Errorf("change_id = %q, want empty — it MUST come from the same event as tree-b, not from iteration 1's change-a", change)
+	}
+}
+
+// TestExtractVerifyIdentity_PairsBothFromTheSameEvent is the positive arm: when
+// the authoritative event carries both, both are returned, and an earlier
+// iteration's change id never wins.
+func TestExtractVerifyIdentity_PairsBothFromTheSameEvent(t *testing.T) {
+	b := packLines(t, []Line{
+		{Seq: 1, Kind: "manifest", Data: json.RawMessage(`{"bundle_schema":"v1"}`)},
+		makeVerifyRunIdentityLine(t, 2, "head-a", "tree-a", "change-a", "failed"),
+		makeVerifyRunIdentityLine(t, 3, "head-b", "tree-b", "change-b", "passed"),
+		makeVerifyRunIdentityLine(t, 4, "", "", "", "skipped"),
+	})
+	tree, change, err := ExtractVerifyIdentity(b)
+	if err != nil {
+		t.Fatalf("ExtractVerifyIdentity: %v", err)
+	}
+	if tree != "tree-b" || change != "change-b" {
+		t.Errorf("(tree, change) = (%q, %q), want (tree-b, change-b)", tree, change)
+	}
+}
+
+// TestExtractVerifyIdentity_TreeWithoutChangeIDYieldsEmptyChangeID pins the
+// older-runner degrade: a pre-#3665 bundle carries tree_sha and no change_id, so
+// the tree still resolves (the #3655 reader is unchanged) while the change id is
+// empty and the ship-side check reads it as undecidable.
+func TestExtractVerifyIdentity_TreeWithoutChangeIDYieldsEmptyChangeID(t *testing.T) {
+	tree, change, err := ExtractVerifyIdentity(multiIterationVerifyBundle(t))
+	if err != nil {
+		t.Fatalf("ExtractVerifyIdentity: %v", err)
+	}
+	if tree != "tree-b" {
+		t.Errorf("tree = %q, want tree-b", tree)
+	}
+	if change != "" {
+		t.Errorf("change_id = %q, want empty for a pre-#3665 bundle", change)
+	}
+}
+
+// TestExtractVerifyIdentity_ErrNoVerifyTreeSHAUnchanged pins that the sentinel
+// contract carries over to the pair reader, including on a bundle whose only
+// verify_run carries a change_id but no tree_sha: with no authoritative tree
+// there is no event to pair against, so both values are empty.
+func TestExtractVerifyIdentity_ErrNoVerifyTreeSHAUnchanged(t *testing.T) {
+	cases := map[string][]Line{
+		"no verify_run": {
+			{Seq: 1, Kind: "manifest", Data: json.RawMessage(`{"bundle_schema":"v1"}`)},
+		},
+		"change_id but no tree_sha": {
+			{Seq: 1, Kind: "manifest", Data: json.RawMessage(`{"bundle_schema":"v1"}`)},
+			makeVerifyRunIdentityLine(t, 2, "head-a", "", "change-a", "skipped"),
+		},
+	}
+	for name, lines := range cases {
+		t.Run(name, func(t *testing.T) {
+			tree, change, err := ExtractVerifyIdentity(packLines(t, lines))
+			if !errors.Is(err, ErrNoVerifyTreeSHA) {
+				t.Errorf("err = %v, want ErrNoVerifyTreeSHA", err)
+			}
+			if tree != "" || change != "" {
+				t.Errorf("(tree, change) = (%q, %q), want both empty", tree, change)
+			}
+		})
+	}
+}
+
+// TestExtractVerifyIdentity_BadInput pins that the pair reader propagates the
+// same two hard errors as its ExtractVerifyTreeSHA wrapper.
+func TestExtractVerifyIdentity_BadInput(t *testing.T) {
+	if _, _, err := ExtractVerifyIdentity([]byte("not gzipped")); !errors.Is(err, ErrBadGzip) {
+		t.Errorf("err = %v, want ErrBadGzip", err)
+	}
+	lines := []Line{{Seq: 1, Kind: EventKindVerifyRun, Data: json.RawMessage(`[1,2,3]`)}}
+	if _, _, err := ExtractVerifyIdentity(packLines(t, lines)); err == nil || !strings.Contains(err.Error(), "parse verify_run payload") {
+		t.Errorf("err = %v, want parse-payload error", err)
+	}
+}
+
 // B3 (#3655): ExtractHeadSHA's first-non-empty rule is UNCHANGED on the same
 // multi-iteration fixture — the two extractors deliberately differ.
 func TestExtractHeadSHA_FirstNonEmptyUnchangedOnMultiIterationBundle(t *testing.T) {
