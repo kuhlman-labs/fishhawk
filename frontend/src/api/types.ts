@@ -314,6 +314,127 @@ export interface CampaignStatus {
   next_action: CampaignNextAction;
 }
 
+/*
+ * Attention queue (E40.1 / #1713). Mirrors the AttentionList /
+ * AttentionItem / AttentionContext / AttentionDegraded schemas in
+ * docs/api/v0.openapi.yaml (GET /v0/attention) field-for-field.
+ */
+
+/** The closed six-member item-kind set, in priority order (1 = most urgent). */
+export type AttentionItemKind =
+  | 'plan_gate'
+  | 'scope_amendment'
+  | 'acceptance_disposition'
+  | 'split_verdict'
+  | 'paged_concern'
+  | 'attend_human_led_campaign';
+
+export type AttentionDegradedReason =
+  | 'concern_store_unconfigured'
+  | 'scope_amendment_store_unconfigured'
+  | 'campaign_store_unconfigured'
+  | 'stage_read_failed'
+  | 'acceptance_state_unreadable'
+  | 'scope_amendment_read_failed'
+  | 'concern_read_failed'
+  | 'gate_view_history_incomplete'
+  | 'gate_view_budget_exhausted'
+  | 'plan_summary_unavailable'
+  | 'plan_reviews_unreadable'
+  | 'campaign_read_failed'
+  | 'campaign_scan_truncated'
+  | 'campaign_items_unreadable';
+
+export interface AttentionReviewVerdict {
+  reviewer_model?: string;
+  verdict: string;
+  concern_count: number;
+}
+
+export interface AttentionRequestedPath {
+  path: string;
+  operation: 'modify' | 'create';
+}
+
+/**
+ * One failed acceptance criterion: its id and the request whose response the
+ * failing assertion evaluated. The request fields are absent when the failed
+ * criterion recorded no requests.
+ */
+export interface AttentionFailedCriterion {
+  id: string;
+  method?: string;
+  path?: string;
+  status?: number;
+}
+
+/**
+ * One-screen decision context. Which fields are present depends on the
+ * item kind — see the AttentionContext schema description.
+ */
+export interface AttentionContext {
+  // plan_gate
+  plan_summary?: string;
+  review_verdicts?: AttentionReviewVerdict[];
+  // scope_amendment
+  reason?: string;
+  requested_paths?: AttentionRequestedPath[];
+  // acceptance_disposition
+  verdict?: string;
+  criteria_failed?: number;
+  criteria_skipped?: number;
+  failed_criteria?: AttentionFailedCriterion[];
+  // split_verdict / paged_concern
+  stage_kind?: string;
+  severity?: string;
+  category?: string;
+  reviewer_model?: string;
+  note?: string;
+  new_evidence?: string;
+  dispute_reasons?: string[];
+  confirmation_note?: string;
+  // attend_human_led_campaign
+  epic_ref?: string;
+  human_led_refs?: string[];
+  detail?: string;
+}
+
+export interface AttentionItem {
+  /** Stable identity of the decision's subject (stage, amendment, concern or campaign id). */
+  id: string;
+  kind: AttentionItemKind;
+  priority: number;
+  run_id?: string;
+  campaign_id?: string;
+  stage_id?: string;
+  concern_id?: string;
+  amendment_id?: string;
+  repo: string;
+  title: string;
+  context: AttentionContext;
+  /** SPA-relative link target: /runs/{id}, /runs/{id}/stages/{id} or /campaigns/{id}. */
+  detail_path: string;
+  since: string;
+}
+
+export interface AttentionDegraded {
+  reason: AttentionDegradedReason;
+  run_id?: string;
+  campaign_id?: string;
+  detail?: string;
+}
+
+/**
+ * GET /v0/attention body. `truncated: true` or a non-empty `degraded`
+ * means the list is INCOMPLETE — even when `items` is empty.
+ */
+export interface AttentionList {
+  items: AttentionItem[];
+  degraded: AttentionDegraded[];
+  truncated: boolean;
+  scanned_runs: number;
+}
+
 export type ApprovalDecision = 'approve' | 'reject';
 
 export interface ApprovalRequest {

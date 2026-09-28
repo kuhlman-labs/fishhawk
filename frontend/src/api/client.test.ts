@@ -234,6 +234,32 @@ describe('api.getCampaign (ADR-047 / #1437)', () => {
   });
 });
 
+describe('api.listAttention (E40.1 / #1713)', () => {
+  beforeEach(() => vi.unstubAllGlobals());
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('hits /v0/attention with a GET and no query string when no params are passed', async () => {
+    const fetchMock = mockFetch();
+    await api.listAttention();
+    expect(fetchMock.mock.calls[0][0]).toBe('/v0/attention');
+    const init = lastInit(fetchMock);
+    expect(init.method ?? 'GET').toBe('GET');
+    expect(headerOf(init, CSRF_HEADER_NAME)).toBeUndefined();
+  });
+
+  it('serialises limit into the query string', async () => {
+    const fetchMock = mockFetch();
+    await api.listAttention({ limit: 25 });
+    expect(fetchMock.mock.calls[0][0]).toBe('/v0/attention?limit=25');
+  });
+
+  it('omits an unset limit from the query string', async () => {
+    const fetchMock = mockFetch();
+    await api.listAttention({});
+    expect(fetchMock.mock.calls[0][0]).toBe('/v0/attention');
+  });
+});
+
 describe('api.listStageChecks (#228)', () => {
   beforeEach(() => vi.unstubAllGlobals());
   afterEach(() => vi.unstubAllGlobals());

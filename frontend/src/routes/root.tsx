@@ -1,10 +1,14 @@
 import { NavLink, Outlet, useNavigate } from 'react-router';
-import { ListChecks, LogOut, Network, ScrollText } from 'lucide-react';
+import { Inbox, ListChecks, LogOut, Network, ScrollText } from 'lucide-react';
 import { cn } from '@/lib/cn';
 import { Button } from '@/components/ui/button';
 import { useAuth } from '@/auth/use-auth';
 
 const navItems = [
+  // The attention queue is the index route (E40.1 / #1713). It is not
+  // active on /runs etc.: NavLink matches on a segment boundary, and every
+  // entry below also sets `end`.
+  { to: '/', label: 'Needs You', icon: Inbox },
   { to: '/runs', label: 'Runs', icon: ListChecks },
   { to: '/campaigns', label: 'Campaigns', icon: Network },
   { to: '/audit', label: 'Audit', icon: ScrollText },

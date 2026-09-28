@@ -1,0 +1,135 @@
+{
+  "items": [
+    {
+      "id": "00000000-0000-4000-8000-000000000011",
+      "kind": "plan_gate",
+      "priority": 1,
+      "run_id": "00000000-0000-4000-8000-000000000010",
+      "stage_id": "00000000-0000-4000-8000-000000000011",
+      "repo": "acme/app",
+      "title": "Add the attention queue",
+      "context": {
+        "plan_summary": "Add GET /v0/attention and make it the SPA home page.",
+        "review_verdicts": [
+          {
+            "reviewer_model": "claude-opus",
+            "verdict": "approve",
+            "concern_count": 1
+          }
+        ]
+      },
+      "detail_path": "/runs/00000000-0000-4000-8000-000000000010/stages/00000000-0000-4000-8000-000000000011",
+      "since": "2026-09-01T21:00:00Z"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000022",
+      "kind": "scope_amendment",
+      "priority": 2,
+      "run_id": "00000000-0000-4000-8000-000000000020",
+      "stage_id": "00000000-0000-4000-8000-000000000021",
+      "amendment_id": "00000000-0000-4000-8000-000000000022",
+      "repo": "acme/app",
+      "title": "Amendment run",
+      "context": {
+        "reason": "the registry must list the new audit category",
+        "requested_paths": [
+          {
+            "path": "backend/internal/audit/categories.go",
+            "operation": "modify"
+          }
+        ]
+      },
+      "detail_path": "/runs/00000000-0000-4000-8000-000000000020/stages/00000000-0000-4000-8000-000000000021",
+      "since": "2026-09-01T19:00:00Z"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000031",
+      "kind": "acceptance_disposition",
+      "priority": 3,
+      "run_id": "00000000-0000-4000-8000-000000000030",
+      "stage_id": "00000000-0000-4000-8000-000000000031",
+      "repo": "acme/app",
+      "title": "Acceptance run",
+      "context": {
+        "verdict": "failed",
+        "criteria_failed": 2,
+        "criteria_skipped": 1,
+        "failed_criteria": [
+          {
+            "id": "health-probe",
+            "method": "GET",
+            "path": "/healthz",
+            "status": 503
+          },
+          {
+            "id": "widget-create",
+            "method": "POST",
+            "path": "/v0/widgets",
+            "status": 422
+          }
+        ]
+      },
+      "detail_path": "/runs/00000000-0000-4000-8000-000000000030/stages/00000000-0000-4000-8000-000000000031",
+      "since": "2026-09-01T16:01:00Z"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000042",
+      "kind": "split_verdict",
+      "priority": 4,
+      "run_id": "00000000-0000-4000-8000-000000000040",
+      "stage_id": "00000000-0000-4000-8000-000000000041",
+      "concern_id": "00000000-0000-4000-8000-000000000042",
+      "repo": "acme/app",
+      "title": "Implement gate run",
+      "context": {
+        "stage_kind": "implement",
+        "severity": "high",
+        "category": "correctness",
+        "reviewer_model": "claude-opus",
+        "note": "The retry loop never re-reads the lease, so a stale holder is never displaced.",
+        "confirmation_note": "fixed by the lease re-read"
+      },
+      "detail_path": "/runs/00000000-0000-4000-8000-000000000040/stages/00000000-0000-4000-8000-000000000041",
+      "since": "2026-09-01T14:00:00Z"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000043",
+      "kind": "paged_concern",
+      "priority": 5,
+      "run_id": "00000000-0000-4000-8000-000000000040",
+      "stage_id": "00000000-0000-4000-8000-000000000041",
+      "concern_id": "00000000-0000-4000-8000-000000000043",
+      "repo": "acme/app",
+      "title": "Implement gate run",
+      "context": {
+        "stage_kind": "implement",
+        "severity": "low",
+        "category": "test-coverage",
+        "reviewer_model": "claude-opus",
+        "note": "The degraded branch has no test asserting its reason string."
+      },
+      "detail_path": "/runs/00000000-0000-4000-8000-000000000040/stages/00000000-0000-4000-8000-000000000041",
+      "since": "2026-09-01T13:30:00Z"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000060",
+      "kind": "attend_human_led_campaign",
+      "priority": 6,
+      "campaign_id": "00000000-0000-4000-8000-000000000060",
+      "repo": "acme/app",
+      "title": "campaign issue:900",
+      "context": {
+        "epic_ref": "issue:900",
+        "human_led_refs": [
+          "issue:901"
+        ],
+        "detail": "this item's dependencies are satisfied but it is autonomy:low (human-led); a human must lead it — do not dispatch an agent run. 1 human-led item remains: issue:901"
+      },
+      "detail_path": "/campaigns/00000000-0000-4000-8000-000000000060",
+      "since": "2026-09-01T12:00:00Z"
+    }
+  ],
+  "degraded": [],
+  "truncated": false,
+  "scanned_runs": 4
+}

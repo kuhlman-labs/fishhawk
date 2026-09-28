@@ -104,6 +104,9 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v0/runs/{run_id}/status-comment", s.requireRunAccount(readAccess, s.handleGetStatusComment))
 	mux.HandleFunc("POST /v0/runs/{run_id}/status-comment", s.requireRunAccount(memberWrite, s.handlePostStatusComment))
 	mux.HandleFunc("GET /v0/audit", s.handleListGlobalAudit)
+	// Cross-run attention queue (E40.1 / #1713): account-scoped, non-run-scoped
+	// read — narrowing is inside the handler, like GET /v0/runs.
+	mux.HandleFunc("GET /v0/attention", s.handleListAttention)
 	mux.HandleFunc("GET /v0/audit/export", s.handleAuditExport)
 	mux.HandleFunc("GET /v0/audit/export.csv", s.handleAuditExportCSV)
 	mux.HandleFunc("GET /v0/reports/agent-changes", s.handleAgentChangesReport)
