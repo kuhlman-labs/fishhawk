@@ -3,7 +3,7 @@ module github.com/kuhlman-labs/fishhawk/runner
 go 1.25.0
 
 require (
-	github.com/bmatcuk/doublestar/v4 v4.10.0
+	github.com/bmatcuk/doublestar/v4 v4.10.2
 	github.com/kuhlman-labs/fishhawk/pricing v0.0.0-20260703162803-7c209fb2bab8
 	github.com/kuhlman-labs/fishhawk/redaction v0.0.0-20260703162803-7c209fb2bab8
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.3
@@ -12,6 +12,7 @@ require (
 	go.opentelemetry.io/otel/sdk v1.46.0
 	go.opentelemetry.io/otel/trace v1.46.0
 	golang.org/x/mod v0.39.0
+	golang.org/x/sys v0.47.0
 	golang.org/x/tools v0.49.0
 	gopkg.in/yaml.v3 v3.0.1
 )
@@ -30,7 +31,6 @@ require (
 	go.opentelemetry.io/proto/otlp v1.11.0 // indirect
 	golang.org/x/net v0.58.0 // indirect
 	golang.org/x/sync v0.22.0 // indirect
-	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.41.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260819154853-08b0e4226688 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260819154853-08b0e4226688 // indirect
