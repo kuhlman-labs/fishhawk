@@ -35,6 +35,32 @@ function formatTimestamp(iso: string): string {
   });
 }
 
+/*
+ * The repo cell links to the repo dashboard (/repos/:owner/:name, E40.3 /
+ * #1714); the workflow cell links to the run. A repo that is not exactly
+ * `owner/name` has no dashboard route, so it renders as plain text.
+ */
+function repoDashboardPath(repo: string): string | null {
+  const parts = repo.split('/');
+  if (parts.length !== 2 || parts[0] === '' || parts[1] === '') return null;
+  return `/repos/${encodeURIComponent(parts[0])}/${encodeURIComponent(parts[1])}`;
+}
+
+function RepoLink({ repo }: { repo: string }) {
+  const to = repoDashboardPath(repo);
+  if (to === null) {
+    return <span className="font-mono text-neutral-900 dark:text-neutral-100">{repo}</span>;
+  }
+  return (
+    <Link
+      to={to}
+      className="font-mono text-neutral-900 underline-offset-2 hover:underline dark:text-neutral-100"
+    >
+      {repo}
+    </Link>
+  );
+}
+
 export function Runs() {
   const { state, hasNext, hasPrev, next, prev, pageIndex } = usePaginated(
     (cursor) => api.listRuns({ limit: RUNS_PAGE_SIZE, cursor: cursor ?? undefined }),
@@ -89,15 +115,15 @@ export function Runs() {
                 {state.data.items.map((run) => (
                   <tr key={run.id} className="hover:bg-neutral-50 dark:hover:bg-neutral-900/50">
                     <td className="px-4 py-2">
+                      <RepoLink repo={run.repo} />
+                    </td>
+                    <td className="px-4 py-2">
                       <Link
                         to={`/runs/${run.id}`}
-                        className="font-mono text-neutral-900 underline-offset-2 hover:underline dark:text-neutral-100"
+                        className="font-mono text-neutral-700 underline-offset-2 hover:underline dark:text-neutral-300"
                       >
-                        {run.repo}
+                        {run.workflow_id}
                       </Link>
-                    </td>
-                    <td className="px-4 py-2 font-mono text-neutral-700 dark:text-neutral-300">
-                      {run.workflow_id}
                     </td>
                     <td className="px-4 py-2">
                       <StateBadge state={run.state} />

@@ -17,7 +17,10 @@ changes don't pay the install/test cost.
   `login` is rendered outside the shell; `attention` is the index
   route — the "Needs You" queue; `runs` lists workflow runs at `/runs`,
   `run-detail` drills into one, `stage-detail` renders the plan;
+  `repo-dashboard` is the per-repo dashboard at `/repos/:owner/:name`;
   `audit` is still a stub; `not-found` catches the rest).
+- `src/repo/` — the repo dashboard's five panels (in-flight,
+  throughput, economics, health, posture).
 - `src/auth/` — auth context, provider, `RequireAuth` gate, hook.
   The provider fetches `/v0/auth/me`; routes inside `<Root />` are
   gated behind it.
@@ -160,6 +163,37 @@ than guessing. The shared `<StageStateBadge>`
 (`src/components/stage-state-badge.tsx`) is reused on both the
 run-detail stage list and the stage-detail header so the visual language
 for stage state stays consistent.
+
+## Repo dashboard (E40.3 / #1714)
+
+`/repos/:owner/:name` renders `src/routes/repo-dashboard.tsx`, reached from
+the repo cell of the `/runs` list (the workflow cell links to the run). Five
+panels, in order, each with its OWN fetch and its own loading/error surface —
+one failing read renders one panel-scoped alert, never a blank page:
+
+- **In flight** (`src/repo/in-flight-panel.tsx`) — composed from EXISTING
+  surfaces, no backend of its own: `GET /v0/runs?repo=` (pending/running
+  runs, current stage from `/v0/runs/{id}/stages`) and
+  `GET /v0/campaigns?repo=` (active campaigns, wave progress derived from
+  the items' `depends_on` DAG, the readiness rollup, and each blocked item
+  with its unresolved blockers from `/v0/campaigns/{id}/status`). A failed
+  per-run or per-campaign read degrades only that row; a list read with a
+  further page renders a "Partial data" note.
+- **Throughput / Economics / Health** (`throughput-panel.tsx`,
+  `economics-panel.tsx`, `health-panel.tsx`) — `GET
+/v0/repos/{owner}/{name}/{throughput,economics,health}`; `truncated: true`
+  renders a "Partial data" note; the wait-on-human sub-panel renders only
+  when the key is present.
+- **Posture** (`posture-panel.tsx`) — `GET /v0/repos/{owner}/{name}/posture`:
+  stages, gates + approvers, reviewers, autonomy and budgets from the
+  newest run's cached spec. The drift warning fires on
+  `schema_supported: false` or `spec_valid: false` (naming the declared
+  version and `spec_error`) — NOT on a hash comparison with `/healthz`,
+  which serves the same binary's hashes and so could never disagree.
+- **One wire fixture per endpoint.** The panel and route tests read the
+  backend's goldens `testdata/wire/repodash_*.json` via `node:fs` and serve
+  them through the real client, so a field rename on either side fails a
+  test. Do not hand-author a second copy.
 
 ## Campaign detail + `operator_agent` override display (E25.12 / #1451; web UI #1467)
 
