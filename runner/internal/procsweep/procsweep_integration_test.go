@@ -12,6 +12,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // The DONE-MEANS integration test (#3663) drives REAL processes through the real
@@ -160,11 +162,11 @@ func TestSweep_ReapsOrphanedSetsidDescendant(t *testing.T) {
 	if err := syscall.Kill(grandchild, 0); err != nil {
 		t.Fatalf("grandchild %d is not alive before the sweep: %v", grandchild, err)
 	}
-	childSID, err := syscall.Getsid(grandchild)
+	childSID, err := unix.Getsid(grandchild)
 	if err != nil {
 		t.Fatalf("Getsid(grandchild): %v", err)
 	}
-	selfSID, err := syscall.Getsid(os.Getpid())
+	selfSID, err := unix.Getsid(os.Getpid())
 	if err != nil {
 		t.Fatalf("Getsid(self): %v", err)
 	}
