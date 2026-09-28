@@ -149,8 +149,9 @@ func Commands() []Command {
 			Flags: withCommon("interval", "output", "o", "max-polls")},
 
 		// standalone
-		{Key: "init", Synopsis: "Scaffold a repo for Fishhawk (workflow spec + agent docs + preflight).", Args: "",
-			Flags: withCommon("preset", "shape", "working-dir", "budget-usd", "single-reviewer", "human-gates", "force", "repo")},
+		{Key: "init", Synopsis: "Scaffold a repo for Fishhawk (spec, charter skeleton, governance config, agent docs, MCP registration, preflight).", Args: "",
+			Flags: withCommon("preset", "shape", "working-dir", "budget-usd", "single-reviewer", "human-gates", "force", "repo",
+				"project-number", "project-owner", "gitlab-project", "skip-mcp-register")},
 		{Key: "validate", Synopsis: "Validate a workflow spec file locally.", Args: "[path]",
 			Flags: []string{"emit-resolved"}},
 		{Key: "migrate-spec", Synopsis: "Migrate a workflow-v1 spec to workflow-v2 with an approval-eligibility report.", Args: "[path]",

@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/url"
 	"os"
@@ -15,6 +16,9 @@ import (
 	"strings"
 	"time"
 
+	"gopkg.in/yaml.v3"
+
+	"github.com/kuhlman-labs/fishhawk/cli/internal/scaffold"
 	"github.com/kuhlman-labs/fishhawk/cli/internal/spec"
 	"github.com/kuhlman-labs/fishhawk/credstore"
 )
@@ -181,7 +185,7 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 		return exitUsage
 	}
 
-	// --spec-only: the two rungs that read only local bytes (no docker,
+	// --spec-only: the three rungs that read only local bytes (no docker,
 	// network, backend, token, MCP, or git state). This is the fresh-repo
 	// quick-validate path — a repo whose sole workflows.yaml is
 	// schema-valid and declares an executor for every stage exits 0
@@ -195,6 +199,7 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 	if *specOnly {
 		checks = []checkResult{
 			checkSpec(*workingDir),
+			checkCharter(*workingDir),
 			checkExecutionPath(*workingDir),
 		}
 	} else {
@@ -222,6 +227,7 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 			checkBackend(*cf.backendURL),
 			checkToken(*cf.backendURL, cred, readiness),
 			checkSpec(*workingDir),
+			checkCharter(*workingDir),
 			checkExecutionPath(*workingDir),
 			checkVerifyCommandGated(*workingDir, *runVerify, *skipVerify, *verifyTimeout),
 			checkRunnerBinary(*runnerBinary, *workingDir),
@@ -478,6 +484,73 @@ func checkSpec(workingDir string) checkResult {
 	}
 	detail := fmt.Sprintf("%s (%d B)", ds.Path, len(ds.Contents))
 	return checkResult{label: label, detail: detail, status: "ok"}
+}
+
+// checkCharter reports the repository's charter document (E74.3 / #3718):
+// present, non-empty, and carrying at least one rubric row in the shape the
+// grooming reader parses (scaffold.RubricRowPattern, held equal to
+// backend/internal/intakegroom's rubricRow by a cross-module parity test).
+// Environment-free: it reads only local bytes.
+//
+// The charter path is read TOLERANTLY from .fishhawk/work-management.yaml's
+// charter.path, falling back to the conventional .fishhawk/charter.md when
+// the file is absent, does not parse, or declares no path — this rung is
+// about the DOCUMENT; `fishhawk validate` stays the authority on config
+// validity. An ABSENT charter is a WARN, not a fail: only backlog grooming
+// requires one (and fails closed there), so a repository that runs changes
+// without grooming is still ready for the loop. A charter that is present
+// but empty or rubric-less FAILS — it would refuse every grooming run.
+func checkCharter(workingDir string) checkResult {
+	label := "charter document"
+	root, err := resolveRepoRoot(workingDir)
+	if err != nil {
+		return checkResult{label: label, detail: err.Error(), status: "fail",
+			remediate: "check --working-dir"}
+	}
+	rel := charterPathFromConventions(root)
+	clean := filepath.Clean(filepath.FromSlash(rel))
+	if filepath.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return checkResult{label: label, detail: fmt.Sprintf("charter.path %q escapes the repository", rel), status: "fail",
+			remediate: "set charter.path in .fishhawk/work-management.yaml to a repo-relative path such as .fishhawk/charter.md"}
+	}
+	data, err := os.ReadFile(filepath.Join(root, clean)) //nolint:gosec // repo-relative charter path, traversal rejected above
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return checkResult{label: label, detail: rel + " not found", status: "warn",
+				remediate: "backlog grooming requires a charter: run `fishhawk init` to write the skeleton, then fill it in"}
+		}
+		return checkResult{label: label, detail: err.Error(), status: "fail",
+			remediate: "fix the read error on " + rel}
+	}
+	if strings.TrimSpace(string(data)) == "" {
+		return checkResult{label: label, detail: rel + " is empty", status: "fail",
+			remediate: "fill in the charter; `fishhawk init` writes a skeleton when the file is absent"}
+	}
+	ids := scaffold.RubricIDs(string(data))
+	if len(ids) == 0 {
+		return checkResult{label: label, detail: rel + ": no rubric rows", status: "fail",
+			remediate: "add prioritization rubric rows in the `| **V1** | <line> |` shape the grooming reader parses"}
+	}
+	return checkResult{label: label, detail: fmt.Sprintf("%s (%d rubric lines)", rel, len(ids)), status: "ok"}
+}
+
+// charterPathFromConventions returns charter.path from
+// <root>/.fishhawk/work-management.yaml, or the conventional default when the
+// file is absent, unparseable, or declares no path.
+func charterPathFromConventions(root string) string {
+	data, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(scaffold.WorkManagementPath))) //nolint:gosec // fixed repo-relative path
+	if err != nil {
+		return scaffold.CharterPath
+	}
+	var doc struct {
+		Charter struct {
+			Path string `yaml:"path"`
+		} `yaml:"charter"`
+	}
+	if yaml.Unmarshal(data, &doc) != nil || strings.TrimSpace(doc.Charter.Path) == "" {
+		return scaffold.CharterPath
+	}
+	return strings.TrimSpace(doc.Charter.Path)
 }
 
 // resolveRunnerBinary mirrors the resolution order the MCP dispatch path uses

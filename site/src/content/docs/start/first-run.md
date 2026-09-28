@@ -262,8 +262,9 @@ agent identity. There is no repository-specific name to substitute.
 fishhawk doctor --spec-only
 ```
 
-`--spec-only` runs the environment-free rungs — schema validity and
-execution-path coverage — and skips every Docker, backend, token, MCP, git and
+`--spec-only` runs the environment-free rungs — schema validity,
+execution-path coverage and the charter document (an absent charter is a
+warning, not a failure) — and skips every Docker, backend, token, MCP, git and
 `gh` check. It is the right check for a freshly scaffolded repository, because
 it passes or fails on your spec alone. A non-zero exit prints which rung failed.
 
