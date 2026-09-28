@@ -4866,6 +4866,138 @@ components:
           type: string
           format: date-time
 
+    AttentionList:
+      type: object
+      description: GET /v0/attention body (E40.1 / #1713).
+      required: [items, degraded, truncated, scanned_runs]
+      properties:
+        items:
+          type: array
+          description: Ranked by `priority` ASC, then `since` ASC, then `id` ASC.
+          items: { $ref: '#/components/schemas/AttentionItem' }
+        degraded:
+          type: array
+          description: |
+            Contributions the response could not include. Non-empty means the
+            list is INCOMPLETE — render it as such even when `items` is empty.
+          items: { $ref: '#/components/schemas/AttentionDegraded' }
+        truncated:
+          type: boolean
+          description: |
+            The candidate-run scan hit its 100-run cap, or the ranked list was
+            cut at `limit`. Campaign-scan truncation is reported in `degraded`
+            as `campaign_scan_truncated` instead.
+        scanned_runs:
+          type: integer
+          description: Candidate runs examined after account and repo narrowing.
+    AttentionDegraded:
+      type: object
+      required: [reason]
+      properties:
+        reason:
+          type: string
+          enum:
+            - concern_store_unconfigured
+            - scope_amendment_store_unconfigured
+            - campaign_store_unconfigured
+            - stage_read_failed
+            - acceptance_state_unreadable
+            - scope_amendment_read_failed
+            - concern_read_failed
+            - gate_view_history_incomplete
+            - gate_view_budget_exhausted
+            - plan_summary_unavailable
+            - plan_reviews_unreadable
+            - campaign_read_failed
+            - campaign_scan_truncated
+            - campaign_items_unreadable
+        run_id: { $ref: '#/components/schemas/UUID' }
+        campaign_id: { $ref: '#/components/schemas/UUID' }
+        detail: { type: string, description: 'Human-readable detail: an error message, a gap list, or a count.' }
+    AttentionItem:
+      type: object
+      required: [id, kind, priority, repo, title, context, detail_path, since]
+      properties:
+        id:
+          type: string
+          description: Stable identity of the decision's subject (stage, amendment, concern or campaign id).
+        kind:
+          type: string
+          enum:
+            - plan_gate
+            - scope_amendment
+            - acceptance_disposition
+            - split_verdict
+            - paged_concern
+            - attend_human_led_campaign
+        priority:
+          type: integer
+          minimum: 1
+          maximum: 6
+          description: Fixed per kind, 1 = most urgent (order as in the `kind` enum).
+        run_id: { $ref: '#/components/schemas/UUID' }
+        campaign_id: { $ref: '#/components/schemas/UUID' }
+        stage_id: { $ref: '#/components/schemas/UUID' }
+        concern_id: { $ref: '#/components/schemas/UUID' }
+        amendment_id: { $ref: '#/components/schemas/UUID' }
+        repo: { type: string }
+        title: { type: string }
+        context: { $ref: '#/components/schemas/AttentionContext' }
+        detail_path:
+          type: string
+          description: |
+            SPA-relative link target — `/runs/{run_id}`,
+            `/runs/{run_id}/stages/{stage_id}` or `/campaigns/{campaign_id}`.
+            No kind links to an audit entry.
+        since:
+          type: string
+          format: date-time
+          description: When the decision parked (stage end, amendment request, concern creation, or campaign update).
+    AttentionContext:
+      type: object
+      description: |
+        One-screen decision context. Fields present depend on `kind`:
+        `plan_gate` → `plan_summary`, `review_verdicts`; `scope_amendment` →
+        `reason`, `requested_paths`; `acceptance_disposition` → `verdict`,
+        `criteria_failed`, `criteria_skipped`; `split_verdict` /
+        `paged_concern` → `stage_kind`, `severity`, `category`,
+        `reviewer_model`, `note` (FULL prose), `new_evidence`, and for a
+        split additionally `confirmation_note`, `dispute_reasons`;
+        `attend_human_led_campaign` → `epic_ref`, `human_led_refs`, `detail`.
+      properties:
+        plan_summary: { type: string }
+        review_verdicts:
+          type: array
+          items:
+            type: object
+            required: [verdict, concern_count]
+            properties:
+              reviewer_model: { type: string }
+              verdict: { type: string }
+              concern_count: { type: integer }
+        reason: { type: string }
+        requested_paths:
+          type: array
+          items:
+            type: object
+            required: [path, operation]
+            properties:
+              path: { type: string }
+              operation: { type: string, enum: [modify, create] }
+        verdict: { type: string }
+        criteria_failed: { type: integer }
+        criteria_skipped: { type: integer }
+        stage_kind: { type: string }
+        severity: { type: string }
+        category: { type: string }
+        reviewer_model: { type: string }
+        note: { type: string }
+        new_evidence: { type: string }
+        dispute_reasons: { type: array, items: { type: string } }
+        confirmation_note: { type: string }
+        epic_ref: { type: string }
+        human_led_refs: { type: array, items: { type: string } }
+        detail: { type: string }
     AuditEntry:
       type: object
       description: |
@@ -12221,6 +12353,83 @@ paths:
             Audit repository not configured on this instance, or the repo-ACL
             mirror's store could not be reached so repo visibility could not be
             resolved (`service_unavailable`, #2071).
+
+  /v0/attention:
+    get:
+      operationId: listAttention
+      summary: Cross-run attention queue ("Needs You")
+      description: |
+        E40.1 / #1713. One prioritized list of every decision currently parked
+        on a human, across runs and campaigns. A pure read-only PROJECTION of
+        already-recorded state: it writes nothing and mints no audit entry.
+        Six item kinds, ranked by a fixed priority then oldest-first then `id`:
+        `plan_gate` (1, a plan stage in `awaiting_approval`), `scope_amendment`
+        (2, a mid-stage amendment still `pending`), `acceptance_disposition`
+        (3, the acceptance gate parked at triage), `split_verdict` (4, an open
+        concern a reviewer recorded as confirmed), `paged_concern` (5, any
+        other open concern at a parked implement/review gate) and
+        `attend_human_led_campaign` (6, a campaign in `awaiting_human`).
+
+        **Bounded scans, visible completeness.** At most 100 non-terminal runs
+        (`pending` + `running`, oldest first) are scanned — a bite sets
+        `truncated: true`, as does cutting the ranked list at `limit`. At most
+        25 runs build a gate view for concern items per request; the rest are
+        reported as a `gate_view_budget_exhausted` entry in `degraded`. At most
+        50 `awaiting_human` campaigns are scanned; a bite appends
+        `campaign_scan_truncated` to `degraded`. A client MUST treat
+        `truncated: true` or a non-empty `degraded` as "this list is
+        incomplete", including when `items` is empty.
+
+        **Visible degradation.** Only the run repository is required. Every
+        other store is optional and every per-run read is independent: a nil
+        store or a failed read appends a named reason to `degraded` and drops
+        only that contribution — the page still renders.
+
+        **Narrowing.** Mirrors `GET /v0/runs`: the caller's workspace account
+        bounds the run and campaign scans, and for a non-admin cookie-session
+        caller rows are narrowed to repositories the caller can read at the
+        forge (ADR-057 Amendment A2 / #2071). A repo-visibility fault fails the
+        WHOLE request closed (503) — never a partially-narrowed 200.
+
+        **Auth.** Items carry full reviewer concern prose, so a token must hold
+        `read:audit` (the gate-view read scope); cookie-session operators are
+        not scope-checked.
+      tags: [runs]
+      parameters:
+        - name: limit
+          in: query
+          description: Maximum items returned after ranking. A cut sets `truncated`.
+          schema: { type: integer, minimum: 1, default: 100, maximum: 500 }
+      responses:
+        '200':
+          description: The ranked queue.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AttentionList' }
+        '400':
+          description: '`validation_failed` — `limit` not an integer in 1..500.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: '`insufficient_scope` — the token lacks `read:audit`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: '`internal_error` — the candidate-run scan failed.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            `run_repo_unconfigured` — no run repository on this instance; or
+            `service_unavailable` — repo visibility could not be resolved
+            (#2071), so no partially-narrowed page is returned.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
 
   /v0/audit/export:
     get:
