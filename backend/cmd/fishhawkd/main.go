@@ -9,6 +9,7 @@
 //	fishhawkd installation register|list  register / inventory installations (GitLab authz gate)
 //	fishhawkd member invite|list    invite / inventory account membership grants (first-user bootstrap)
 //	fishhawkd oauth client register|list|remove  pre-register / inventory / remove OAuth clients (#2438)
+//	fishhawkd decision-index backfill|check  rebuild / gap-check the derived decision index (#3730)
 //
 // E3.2 (#42) wired the HTTP serve path. E3.3 (#43) added the run state
 // machine, the Postgres pool, and the migrate subcommand.
@@ -44,6 +45,8 @@ func run(args []string, logSink io.Writer) int {
 		return runMigrate(rest, logSink)
 	case "audit-rehash":
 		return runAuditRehash(rest, logSink)
+	case "decision-index":
+		return runDecisionIndex(rest, logSink)
 	case "token":
 		return runToken(rest, logSink)
 	case "account":
@@ -79,7 +82,7 @@ func splitCommand(args []string) (cmd string, rest []string) {
 
 func printUsage(w io.Writer) {
 	for _, line := range []string{
-		"Usage: fishhawkd [serve|migrate|token|account|installation|member|oauth] [flags]",
+		"Usage: fishhawkd [serve|migrate|token|account|installation|member|oauth|decision-index] [flags]",
 		"",
 		"Subcommands:",
 		"  serve                  Run the HTTP server (default).",
@@ -97,6 +100,8 @@ func printUsage(w io.Writer) {
 		"  oauth client register  Pre-register an OAuth client (the operator write path for oauth_clients; #2438).",
 		"  oauth client list      Inventory pre-registered OAuth clients.",
 		"  oauth client remove    Remove a pre-registered OAuth client by client_id.",
+		"  decision-index backfill  Reconstruct the derived decision index from the audit chain (--rebuild, --dry-run; #3730).",
+		"  decision-index check     Report decision-bearing entries with no index row; exits 1 on a gap.",
 	} {
 		_, _ = fmt.Fprintln(w, line)
 	}
