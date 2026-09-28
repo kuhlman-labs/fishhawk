@@ -3,7 +3,7 @@ module github.com/kuhlman-labs/fishhawk/cli
 go 1.25
 
 require (
-	github.com/bmatcuk/doublestar/v4 v4.10.0
+	github.com/bmatcuk/doublestar/v4 v4.10.2
 	github.com/google/uuid v1.6.0
 	github.com/kuhlman-labs/fishhawk/credstore v0.0.0
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.3
