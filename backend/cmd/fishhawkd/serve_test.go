@@ -38,6 +38,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/claudecode"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/codex"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/decisionindex"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	forgegitlab "github.com/kuhlman-labs/fishhawk/backend/internal/forge/gitlab"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge/stub"
@@ -291,6 +292,75 @@ func TestRunRepoCASWiringError(t *testing.T) {
 				t.Errorf("runRepoCASWiringError(%T) = %v, want nil", tc.repo, err)
 			}
 		})
+	}
+}
+
+// TestNewAuditRepository_WiredRepoKeepsEveryCapability pins the E75.2 / #3730
+// wrap at the single audit-repository construction point: the wired value IS
+// the decision-index decorator, and it still satisfies all four optional audit
+// capabilities server/*.go type-asserts off cfg.AuditRepo
+// (acceptance_arbitration.go, grooming_dispositions.go, grooming_apply.go, the
+// retry-budget and deduped paths). A wrap that dropped one would turn that
+// assertion into ok=false and silently disable the feature. The source-scan
+// drift guard for NEW capabilities lives in decisionindex/capabilities_test.go.
+func TestNewAuditRepository_WiredRepoKeepsEveryCapability(t *testing.T) {
+	repo, err := newAuditRepository(nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("newAuditRepository: %v", err)
+	}
+	if _, ok := repo.(*decisionindex.IndexingRepository); !ok {
+		t.Fatalf("wired audit repository is %T, want *decisionindex.IndexingRepository (decisions would not be indexed)", repo)
+	}
+	if _, ok := repo.(audit.AnchoredChainAppender); !ok {
+		t.Error("wired audit repository lost audit.AnchoredChainAppender (acceptance arbitration)")
+	}
+	if _, ok := repo.(audit.DedupedChainAppender); !ok {
+		t.Error("wired audit repository lost audit.DedupedChainAppender")
+	}
+	if _, ok := repo.(audit.GroomingWindowAppender); !ok {
+		t.Error("wired audit repository lost audit.GroomingWindowAppender (grooming dispositions)")
+	}
+	if _, ok := repo.(audit.RetryBudgetAppender); !ok {
+		t.Error("wired audit repository lost audit.RetryBudgetAppender")
+	}
+}
+
+// TestNewAuditRepository_IndexesDecisionsEndToEnd drives the wired repository
+// against a real migrated database: a decision-bearing append made through the
+// value runServe installs lands a decision_index row, and a non-decision append
+// does not — so a wiring that constructed the decorator over the wrong pool, or
+// not at all, fails here rather than only in the package's own tests.
+func TestNewAuditRepository_IndexesDecisionsEndToEnd(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	ctx := context.Background()
+	repo, err := newAuditRepository(pool, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("newAuditRepository: %v", err)
+	}
+	runID, stageID := uuid.New(), uuid.New()
+	if _, err := pool.Exec(ctx, `INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, state, runner_kind)
+		VALUES ($1, 'acme/widgets', 'feature_change', 'sha', 'cli', 'pending', 'local')`, runID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO stages (id, run_id, sequence, stage_type, executor_kind, executor_ref, state)
+		VALUES ($1, $2, 0, 'plan', 'agent', 'claude-code', 'pending')`, stageID, runID); err != nil {
+		t.Fatal(err)
+	}
+	for _, cat := range []string{"run_started", "approval_submitted"} {
+		if _, err := repo.AppendChained(ctx, audit.ChainAppendParams{
+			RunID: runID, StageID: &stageID, Timestamp: time.Now().UTC(),
+			Category: cat, Payload: json.RawMessage(`{"decision":"approve"}`),
+		}); err != nil {
+			t.Fatalf("append %s: %v", cat, err)
+		}
+	}
+	var n int
+	var class string
+	if err := pool.QueryRow(ctx, `SELECT count(*), max(decision_class) FROM decision_index WHERE run_id = $1`, runID).Scan(&n, &class); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 || class != "plan_approval" {
+		t.Fatalf("decision_index for the run: %d rows, class %q; want exactly 1 plan_approval row", n, class)
 	}
 }
 
