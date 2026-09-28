@@ -154,6 +154,25 @@ func (q *splitQueryProvider) queries() int {
 	return q.queryCalls
 }
 
+// adoptionQueries isolates the ADOPTION component of the EpicChildren call
+// count from the per-child PARENT-EPIC CAPACITY PROBE component (#3714), so the
+// "the adoption query is made ONCE per hook pass, not once per child" control
+// stays pinned on its own instead of being folded into a combined total
+// (binding scope-amendment condition).
+//
+// Since #3714 every split-filed child carries an EXPLICIT title_vars.n, so
+// server.guardParentEpicCapacity makes exactly ONE EpicChildren probe per filing
+// ATTEMPT — including an attempt whose File then fails, because the probe
+// precedes Apply and File. filingAttempts is therefore the probe count, and the
+// remainder is adoption. It is sound because every caller asserts
+// provider.calls EXACTLY on the line above, so filingAttempts is not a guess:
+// if adoption ever regressed to once-per-child this remainder rises from 1 to
+// the child count while the total rises in lockstep, which a total-only
+// assertion could not distinguish from one extra probe.
+func (q *splitQueryProvider) adoptionQueries(filingAttempts int) int {
+	return q.queries() - filingAttempts
+}
+
 func (p *splitFileProvider) requestFor(t *testing.T, title string) workmgmt.ProviderRequest {
 	t.Helper()
 	p.mu.Lock()
@@ -1560,9 +1579,20 @@ func TestSplitFiling_MarkerAppendFails_ReapprovalAdoptsInsteadOfRefiling(t *test
 	if h.provider.calls != 3 {
 		t.Errorf("total File calls = %d, want 3 (1 on pass 1 + 2 un-adoptable ordinals on pass 2)", h.provider.calls)
 	}
-	// The query ran exactly once per pass — it is a single lookup, not per-ordinal.
-	if got := h.querier.queries(); got != 2 {
-		t.Errorf("EpicChildren called %d times across two passes, want 2 (once each)", got)
+	// EpicChildren calls split into TWO components since #3714: the adoption
+	// lookup, plus one parent-epic CAPACITY PROBE per filing attempt (every
+	// split-filed child carries an explicit title_vars.n, so
+	// guardParentEpicCapacity probes rather than riding a {n} derivation). The
+	// exact total is 2 adoption lookups + 3 probes (one per File call asserted
+	// above) = 5.
+	if got := h.querier.queries(); got != 5 {
+		t.Errorf("EpicChildren called %d times across two passes, want 5 (2 adoption lookups + 3 per-child capacity probes)", got)
+	}
+	// The control this line has always carried, kept pinned ON ITS OWN rather
+	// than folded into the total: the adoption query ran exactly once per pass —
+	// a single lookup, not per-ordinal.
+	if got := h.querier.adoptionQueries(h.provider.calls); got != 2 {
+		t.Errorf("adoption queries = %d, want 2 (once per pass, not per ordinal)", got)
 	}
 
 	// (ii) the durable per-ordinal record exists after the second pass.
@@ -1705,8 +1735,14 @@ func TestSplitFiling_QueryDegradeBranches(t *testing.T) {
 			if h.provider.calls != 3 {
 				t.Fatalf("filed %d children, want 3 (nothing adoptable)", h.provider.calls)
 			}
-			if got := h.querier.queries(); got != 1 {
-				t.Errorf("EpicChildren called %d times, want exactly 1", got)
+			// Exact total since #3714: 1 adoption lookup + one parent-epic
+			// capacity probe per filing attempt (3, asserted just above) = 4.
+			if got := h.querier.queries(); got != 4 {
+				t.Errorf("EpicChildren called %d times, want exactly 4 (1 adoption lookup + 3 per-child capacity probes)", got)
+			}
+			// The adoption-query-once control, pinned independently of the total.
+			if got := h.querier.adoptionQueries(h.provider.calls); got != 1 {
+				t.Errorf("adoption queries = %d, want exactly 1 (a single lookup, not per-ordinal)", got)
 			}
 			if _, n := h.completionEntry(t); n != 1 {
 				t.Errorf("completion markers = %d, want 1", n)

@@ -265,6 +265,25 @@ type EpicChildrenResult struct {
 	// closed on: an unrelated link on the epic must not refuse the campaign.
 	// Sorted by Number, then Ref. Empty for every other provider.
 	ExcludedCandidates []ExcludedCandidate
+	// ChildCap is the provider's HARD cap on how many children ONE parent may
+	// carry — the cap whose exhaustion makes a further parent link FAIL — or 0
+	// when the provider declares no cap (#3714). It rides the result
+	// EpicChildren already returns rather than arriving through a new capability
+	// interface, so no provider gains a method and no registered fake gains a
+	// stub.
+	//
+	// It is compared against len(Children), so a non-zero value is SOUND ONLY
+	// for a provider whose Children set is the SAME structurally-capped set the
+	// link writes into. The github provider sets it (100 sub-issues per parent,
+	// and its Children set IS the fully-paginated, unfiltered sub-issue
+	// connection, so len(Children) is the authoritative count). The gitlab
+	// provider leaves it 0: its children are derived from the epic issue's
+	// relates_to link CANDIDATES and then narrowed, so len(Children) is not the
+	// size of any capped set — every consumer's capacity guard is therefore
+	// INERT on gitlab. Populated only by EpicChildren: ResolveDependencies
+	// resolves an arbitrary named issue set with no parent link, where a cap is
+	// meaningless, and leaves it 0.
+	ChildCap int
 }
 
 // CandidateExclusionReason names why an epic-children candidate was not

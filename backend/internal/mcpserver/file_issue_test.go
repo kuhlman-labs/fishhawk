@@ -474,3 +474,54 @@ func TestFiledWorkItemDecodesIntakeShape(t *testing.T) {
 		t.Errorf("window/scan/duration = %+v", out.Intake)
 	}
 }
+
+// TestFileIssueToolDescribesParentEpicCapRefusal is the DONE-MEANS pin for the
+// operator-facing half of #3714: the WIRE-VISIBLE tool description is a driving
+// agent's only instruction about the at-cap refusal, and that it cannot be
+// worked around by supplying n. Both are conventions no compiler enforces, so a
+// comment-only or no-op touch of file_issue.go would pass a scope-presence check
+// and fail here.
+func TestFileIssueToolDescribesParentEpicCapRefusal(t *testing.T) {
+	ctx := context.Background()
+	cfg := config{backendURL: "http://localhost:8080", apiToken: "tok"}
+	srv := buildServer(cfg)
+	resolver := &runResolver{api: newAPIClient(cfg), getenv: envFuncFromMap(nil)}
+	registerTools(srv, resolver)
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := srv.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	defer serverSession.Close()
+	clientSession, cerr := client.Connect(ctx, clientTransport, nil)
+	if cerr != nil {
+		t.Fatalf("client connect: %v", cerr)
+	}
+	defer clientSession.Close()
+
+	res, lerr := clientSession.ListTools(ctx, nil)
+	if lerr != nil {
+		t.Fatalf("ListTools: %v", lerr)
+	}
+	var desc string
+	for _, tool := range res.Tools {
+		if tool.Name == "fishhawk_file_issue" {
+			desc = tool.Description
+		}
+	}
+	if desc == "" {
+		t.Fatal("fishhawk_file_issue is not registered")
+	}
+	for _, want := range []string{
+		"details.parent_epic_full",
+		"child cap",
+		"does NOT bypass it",
+		"successor catch-all epic",
+	} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("fishhawk_file_issue description does not state %q; the #3714 at-cap refusal is not stated to the agent:\n%s", want, desc)
+		}
+	}
+}

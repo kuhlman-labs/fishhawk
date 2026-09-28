@@ -550,6 +550,12 @@ components:
             parseable `[E<n>]` token `{epic}` is left unresolved and the 422
             above is returned, and a failed child-number lookup returns the same
             422 with `details.n_discovery_failed` rather than a wrong title.
+            A `parent_epic` already carrying the provider's hard child cap (100
+            sub-issues per parent on GitHub) is refused `422 work_item_invalid`
+            with `details.parent_epic_full` before anything is created; the cap
+            governs the sub-issue LINK, so an explicit `{n}` does NOT bypass it
+            — file under a successor catch-all epic, or with a different
+            `parent_epic`.
         labels:
           type: array
           items: { type: string }
@@ -13702,7 +13708,16 @@ paths:
         the issue fetch errors, or the parent title carries no `[E<n>]` token,
         `{epic}` is left unresolved and the `422` below is returned rather than a
         wrong title; a failed child-number lookup returns the same `422` with
-        `details.n_discovery_failed`.
+        `details.n_discovery_failed`. A filing whose `parent_epic` is ALREADY at
+        the provider's hard child cap (100 sub-issues per parent on GitHub) is
+        refused `422 work_item_invalid` with `details.parent_epic_full` plus the
+        epic ref, the observed `parent_epic_child_count` and the
+        `parent_epic_child_cap`, BEFORE anything is created — otherwise the
+        derived `{n}` freezes and every later filing renders the same
+        `[E<epic>.<n>]` title. The cap governs the sub-issue LINK, not the
+        number, so it applies even to a type whose `title_format` has no `{n}`
+        and an explicit `title_vars.n` does NOT bypass it; the remedy is a
+        successor catch-all epic or a different `parent_epic`.
 
         **Sections fail loud.** When `body` is omitted, every `sections` key
         must match the type's `body_skeleton` exactly. An off-skeleton key
@@ -17714,6 +17729,11 @@ paths:
                     supply `n` only to override that discovery. A failed
                     lookup fails the filing closed with 422
                     `work_item_invalid` (`details.n_discovery_failed`).
+                    A parent epic already at the provider's hard child cap
+                    (100 sub-issues per parent on GitHub) is refused 422
+                    `work_item_invalid` (`details.parent_epic_full`); the cap
+                    governs the sub-issue LINK, so supplying `n` does NOT
+                    bypass it.
                 type:
                   type: string
                   description: |

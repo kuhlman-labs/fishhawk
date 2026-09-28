@@ -605,6 +605,18 @@ func (p *Provider) linkEpic(ctx context.Context, scope forge.CredentialScope, re
 	return nil
 }
 
+// subIssueChildCap is GitHub's documented HARD maximum number of sub-issues one
+// parent issue may carry ("you can add up to 100 sub-issues per parent issue",
+// GitHub Docs / "Adding sub-issues"); the 101st AddSubIssue is rejected with
+// "Parent cannot have more than 100 sub-issues" (#3714). It is reported as
+// EpicChildrenResult.ChildCap so a consumer can refuse a filing against an
+// already-full parent BEFORE anything is created. If GitHub ever raises the
+// limit this constant becomes over-strict — the failure direction is a loud,
+// actionable refusal naming the count and the cap, never a silent duplicate —
+// and TestProvider_EpicChildren_ReportsChildCap is the behavioural pin that
+// guides the one-line bump.
+const subIssueChildCap = 100
+
 // EpicChildren lists an epic's child issues and returns the depends_on edges
 // among them (ADR-047 / #1437, the campaign DAG source). It resolves the epic
 // reference to a node id, reads the sub-issues connection, parses each child
@@ -619,6 +631,14 @@ func (p *Provider) linkEpic(ctx context.Context, scope forge.CredentialScope, re
 // It validates the target repo + installation (fail closed with File's
 // actionable style). It is the optional workmgmt.EpicChildrenQuerier
 // capability E25.3 calls during campaign assembly.
+//
+// The result reports ChildCap = subIssueChildCap (#3714). len(Children) EQUALS
+// the parent's sub-issue totalCount, so the cap needs no extra
+// `subIssues(first:1){totalCount}` round-trip: githubclient.ListSubIssues
+// paginates on pageInfo.hasNextPage to exhaustion (and fails closed on a nil
+// node mid-pagination), and this method applies NO state filter, appending one
+// child per returned sub-issue — so a closed child counts toward the cap
+// exactly as GitHub counts it.
 func (p *Provider) EpicChildren(ctx context.Context, req workmgmt.EpicChildrenRequest) (*workmgmt.EpicChildrenResult, error) {
 	if p.api == nil {
 		return nil, errors.New("workmgmt/github: provider missing API client")
@@ -738,7 +758,14 @@ func (p *Provider) EpicChildren(ctx context.Context, req workmgmt.EpicChildrenRe
 	sortEdges(edges)
 	sortEdges(dropped)
 	sortSatisfiedEdges(satisfied)
-	return &workmgmt.EpicChildrenResult{Children: children, Edges: edges, DroppedEdges: dropped, SatisfiedEdges: satisfied}, nil
+	// ChildCap is declared HERE and only here: this Children set is the
+	// fully-paginated, unfiltered sub-issue connection the parent link writes
+	// into, so len(Children) is the authoritative count to compare it against
+	// (#3714). ResolveDependencies leaves it 0.
+	return &workmgmt.EpicChildrenResult{
+		Children: children, Edges: edges, DroppedEdges: dropped, SatisfiedEdges: satisfied,
+		ChildCap: subIssueChildCap,
+	}, nil
 }
 
 // dependsEdgeKey is the per-item dedup key (#2956): (From, To, ToRefDigest). The
@@ -1118,6 +1145,10 @@ func (p *Provider) ResolveDependencies(ctx context.Context, req workmgmt.IssueSe
 	sortEdges(edges)
 	sortEdges(dropped)
 	sortSatisfiedEdges(satisfied)
+	// ChildCap is deliberately LEFT 0 here (#3714): this path resolves an
+	// arbitrary named issue set with no parent link, so a per-parent child cap
+	// is meaningless and a non-zero value would make a consumer's capacity
+	// guard compare the cap against a set it does not govern.
 	return &workmgmt.EpicChildrenResult{Children: children, Edges: edges, DroppedEdges: dropped, SatisfiedEdges: satisfied}, nil
 }
 
