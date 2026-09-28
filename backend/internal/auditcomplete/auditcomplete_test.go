@@ -3079,3 +3079,256 @@ func TestHeadReportCategories_AcceptanceScenariosPushedWinsPrecedence(t *testing
 		t.Errorf("LatestReportedHeadSHA = (%q, %v), want (scenario, true)", got, ok)
 	}
 }
+
+// --- #3673: rule 5 honors the runner's conflict-resolution merge commit ---
+
+// conflictResolutionMergeSHA is the merge commit a SUCCESSFUL runner
+// conflict-resolution pass pushed. It is a freshly chosen 40-hex constant
+// distinct from every other sha in this file, so a fixture that admits it
+// admits it ONLY through the conflict_resolution_pushed union — the property
+// that makes the counterfactual observable rather than masked.
+const conflictResolutionMergeSHA = "c0ff1c700000000000000000000000000000ab12"
+
+// conflictResolutionPushedPayload renders the payload
+// server.succeedConflictResolutionPushStage writes, using the STORED-ROW
+// literals rather than the exported constants so the seam pin below
+// (TestConflictResolutionSeamConstant_MatchesStoredRowLiteral) is not circular.
+func conflictResolutionPushedPayload(sha string) json.RawMessage {
+	return json.RawMessage(`{"run_id":"r","stage_id":"s","branch":"fishhawk/run-abc","head_sha":"` + sha +
+		`","base_sha":"pre","files_changed_count":2,"auth_method":"stage_key"}`)
+}
+
+// TestCompute_Rule5_ConflictResolutionHead_NotForeign is the unit-level #3673
+// pin: the live PR HEAD is the merge commit a SUCCESSFUL conflict-resolution
+// pass pushed, recorded ONLY in a conflict_resolution_pushed entry (the PR-open
+// artifact still carries the agent's head). The product's own sanctioned
+// recovery path must not produce a commit its own gate calls foreign.
+// Counterfactual: replacing addConflictResolutionHeads' body with `return nil`
+// turns this RED with foreign_commit.
+func TestCompute_Rule5_ConflictResolutionHead_NotForeign(t *testing.T) {
+	runID, runs, arts, ar, _ := foreignCommitSetup(t)
+	implID := runs.stages[1].ID
+	ar.appendChained(t, runID, &implID, "conflict_resolution_pushed",
+		conflictResolutionPushedPayload(conflictResolutionMergeSHA))
+	d := auditcomplete.Deps{
+		Runs: runs, Artifacts: arts, Audit: ar,
+		PRHead: stubPRHead(t, conflictResolutionMergeSHA, nil),
+	}
+	state, missing, err := auditcomplete.Compute(context.Background(), runID, d)
+	if err != nil {
+		t.Fatalf("Compute: %v", err)
+	}
+	if state != stagecheck.StatePass {
+		t.Fatalf("state = %s want pass (a conflict-resolution merge commit must not be foreign); missing=%+v", state, missing)
+	}
+	if containsKind(missing, auditcomplete.MissingForeignCommit) {
+		t.Errorf("conflict_resolution_pushed head should be a known SHA, not foreign_commit; got %+v", missing)
+	}
+}
+
+// TestCompute_Rule5_ConflictResolutionOtherSha_StillForeign is the fail-closed
+// ANTI-VACUITY control (not a counterfactual vehicle): the union is keyed to the
+// RECORDED sha, not to "a conflict_resolution_pushed entry exists". A live head
+// named by no category at all still fires foreign_commit, and the detail lists
+// the recorded merge sha among the known set — proving the entry was read and
+// simply did not match. This arm must stay GREEN both before and after the
+// change.
+func TestCompute_Rule5_ConflictResolutionOtherSha_StillForeign(t *testing.T) {
+	runID, runs, arts, ar, _ := foreignCommitSetup(t)
+	const liveForeign = "deadbeef1111deadbeef1111deadbeef11111111"
+	implID := runs.stages[1].ID
+	ar.appendChained(t, runID, &implID, "conflict_resolution_pushed",
+		conflictResolutionPushedPayload(conflictResolutionMergeSHA))
+	d := auditcomplete.Deps{
+		Runs: runs, Artifacts: arts, Audit: ar,
+		PRHead: stubPRHead(t, liveForeign, nil),
+	}
+	state, missing, err := auditcomplete.Compute(context.Background(), runID, d)
+	if err != nil {
+		t.Fatalf("Compute: %v", err)
+	}
+	if state != stagecheck.StateFail {
+		t.Fatalf("state = %s want fail (an unrecorded live head is still foreign); missing=%+v", state, missing)
+	}
+	detail := foreignCommitDetail(missing)
+	if detail == "" {
+		t.Fatalf("expected foreign_commit; got %+v", missing)
+	}
+	if !strings.Contains(detail, liveForeign[:7]) {
+		t.Errorf("detail should name the live head %s: %s", liveForeign[:7], detail)
+	}
+	if !strings.Contains(detail, conflictResolutionMergeSHA[:7]) {
+		t.Errorf("detail should list the recorded merge sha %s as known: %s", conflictResolutionMergeSHA[:7], detail)
+	}
+}
+
+// TestCompute_Rule5_ConflictResolutionReadError_Pending is binding condition 2:
+// the helper's read error must surface as the SAME head_fetch_failed /
+// fail-closed outcome the per-hop head-category loop uses. The audit fake errors
+// ONLY on the conflict_resolution_pushed category and the fixture's live head is
+// reachable ONLY through that category, so a swallowed error yields a short known
+// set that would report foreign_commit — the verdict this arm forbids.
+// Counterfactual: swallowing the ListForRunByCategory error in
+// addConflictResolutionHeads (returning nil instead) turns this RED.
+func TestCompute_Rule5_ConflictResolutionReadError_Pending(t *testing.T) {
+	runID, runs, arts, ar, _ := foreignCommitSetup(t)
+	implID := runs.stages[1].ID
+	ar.appendChained(t, runID, &implID, "conflict_resolution_pushed",
+		conflictResolutionPushedPayload(conflictResolutionMergeSHA))
+	ar.catErr = map[string]error{"conflict_resolution_pushed": errors.New("db down")}
+	d := auditcomplete.Deps{
+		Runs: runs, Artifacts: arts, Audit: ar,
+		PRHead: stubPRHead(t, conflictResolutionMergeSHA, nil),
+	}
+	state, missing, err := auditcomplete.Compute(context.Background(), runID, d)
+	if err != nil {
+		t.Fatalf("Compute: %v", err)
+	}
+	if state != stagecheck.StatePending {
+		t.Fatalf("state = %s want pending (a conflict-resolution read error is transient); missing=%+v", state, missing)
+	}
+	if !containsKind(missing, auditcomplete.MissingHeadFetchFail) {
+		t.Errorf("expected head_fetch_failed; got %+v", missing)
+	}
+	if containsKind(missing, auditcomplete.MissingForeignCommit) {
+		t.Errorf("a conflict-resolution read error must never surface as foreign_commit; got %+v", missing)
+	}
+}
+
+// TestCompute_Rule5_ChildConflictResolutionHead_NotForeign pins the
+// decomposition half of the parity with buildReportedHeadLedger: a pass
+// authorized on a decomposition CHILD's implement stage pushes to the SHARED
+// parent branch, so the child-chain entry must union into the parent's rule-5
+// known set.
+func TestCompute_Rule5_ChildConflictResolutionHead_NotForeign(t *testing.T) {
+	runID, runs, arts, ar, _ := foreignCommitSetup(t)
+	childID := uuid.New()
+	parent := runID
+	runs.childPages = map[uuid.UUID][]*run.Run{
+		runID: {{ID: childID, DecomposedFrom: &parent}},
+	}
+	ar.appendChained(t, childID, nil, "conflict_resolution_pushed",
+		conflictResolutionPushedPayload(conflictResolutionMergeSHA))
+	d := auditcomplete.Deps{
+		Runs: runs, Artifacts: arts, Audit: ar,
+		PRHead: stubPRHead(t, conflictResolutionMergeSHA, nil),
+	}
+	state, missing, err := auditcomplete.Compute(context.Background(), runID, d)
+	if err != nil {
+		t.Fatalf("Compute: %v", err)
+	}
+	if state != stagecheck.StatePass {
+		t.Fatalf("state = %s want pass (a child-chain pass head must not be foreign); missing=%+v", state, missing)
+	}
+	if containsKind(missing, auditcomplete.MissingForeignCommit) {
+		t.Errorf("child-chain conflict_resolution_pushed head should be known, not foreign_commit; got %+v", missing)
+	}
+}
+
+// TestCompute_Rule5_ChildConflictResolutionReadError_Pending: a read failure on
+// a CHILD's conflict_resolution_pushed chain propagates out of the child walk
+// exactly as an own-run read error does — the child call site shares the helper's
+// error posture, so neither site can drift into a silent under-population.
+func TestCompute_Rule5_ChildConflictResolutionReadError_Pending(t *testing.T) {
+	runID, runs, arts, ar, _ := foreignCommitSetup(t)
+	childID := uuid.New()
+	parent := runID
+	runs.childPages = map[uuid.UUID][]*run.Run{
+		runID: {{ID: childID, DecomposedFrom: &parent}},
+	}
+	ar.appendChained(t, childID, nil, "conflict_resolution_pushed",
+		conflictResolutionPushedPayload(conflictResolutionMergeSHA))
+	ar.catErrByRun = map[uuid.UUID]map[string]error{
+		childID: {"conflict_resolution_pushed": errors.New("db down")},
+	}
+	d := auditcomplete.Deps{
+		Runs: runs, Artifacts: arts, Audit: ar,
+		PRHead: stubPRHead(t, conflictResolutionMergeSHA, nil),
+	}
+	state, missing, err := auditcomplete.Compute(context.Background(), runID, d)
+	if err != nil {
+		t.Fatalf("Compute: %v", err)
+	}
+	if state != stagecheck.StatePending {
+		t.Fatalf("state = %s want pending (a child pass read error is transient); missing=%+v", state, missing)
+	}
+	if !containsKind(missing, auditcomplete.MissingHeadFetchFail) {
+		t.Errorf("expected head_fetch_failed; got %+v", missing)
+	}
+	if containsKind(missing, auditcomplete.MissingForeignCommit) {
+		t.Errorf("a child pass read error must never surface as foreign_commit; got %+v", missing)
+	}
+}
+
+// TestCompute_Rule5_MalformedConflictResolutionPayload_Skipped: a row whose
+// head_sha is absent or the wrong JSON type whitelists NOTHING — it is skipped,
+// and a live head named by no other category still flags foreign_commit.
+func TestCompute_Rule5_MalformedConflictResolutionPayload_Skipped(t *testing.T) {
+	runID, runs, arts, ar, recordedSHA := foreignCommitSetup(t)
+	ar.appendChained(t, runID, nil, "conflict_resolution_pushed", json.RawMessage(`{"head_sha":42}`))
+	ar.appendChained(t, runID, nil, "conflict_resolution_pushed", json.RawMessage(`{"branch":"no head field"}`))
+	d := auditcomplete.Deps{
+		Runs: runs, Artifacts: arts, Audit: ar,
+		PRHead: stubPRHead(t, recordedSHA, nil),
+	}
+	state, missing, err := auditcomplete.Compute(context.Background(), runID, d)
+	if err != nil {
+		t.Fatalf("Compute: %v", err)
+	}
+	if state != stagecheck.StatePass {
+		t.Fatalf("state = %s want pass (malformed pass rows are skipped); missing=%+v", state, missing)
+	}
+
+	const liveForeign = "deadbeef1111deadbeef1111deadbeef11111111"
+	d.PRHead = stubPRHead(t, liveForeign, nil)
+	state, missing, err = auditcomplete.Compute(context.Background(), runID, d)
+	if err != nil {
+		t.Fatalf("Compute: %v", err)
+	}
+	if state != stagecheck.StateFail || !containsKind(missing, auditcomplete.MissingForeignCommit) {
+		t.Errorf("malformed pass rows must not whitelist anything; state=%s missing=%+v", state, missing)
+	}
+}
+
+// TestConflictResolutionSeamConstant_MatchesStoredRowLiteral is the REGRESSION
+// PIN (not a counterfactual vehicle) for the two decisions #3673 rests on:
+//
+//  1. CategoryConflictResolutionPushed equals the stored-row spelling
+//     succeedConflictResolutionPushStage writes, and that row carries the merge
+//     commit in head_sha — so the alias in server/conflictresolution.go and both
+//     ledger readers name the same rows.
+//  2. HeadReportCategoriesByPrecedence does NOT contain it. Nothing in the
+//     compiler stops a later edit from folding the category into that precedence
+//     ordering, which would silently shadow a newer fixup_pushed head for the
+//     acceptance head binding, Option C's head-aware retry and the Check Run
+//     target. The exact contents are asserted so an in-place mutation of the
+//     shared package-level slice fails here too.
+func TestConflictResolutionSeamConstant_MatchesStoredRowLiteral(t *testing.T) {
+	if auditcomplete.CategoryConflictResolutionPushed != "conflict_resolution_pushed" {
+		t.Errorf("CategoryConflictResolutionPushed = %q, want the stored-row literal",
+			auditcomplete.CategoryConflictResolutionPushed)
+	}
+	var row map[string]json.RawMessage
+	if err := json.Unmarshal(conflictResolutionPushedPayload("x"), &row); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := row["head_sha"]; !ok {
+		t.Errorf("stored conflict_resolution_pushed payload does not carry head_sha: %v", row)
+	}
+	want := []string{"acceptance_scenarios_pushed", "fixup_pushed", "child_pushed", "pull_request_opened"}
+	got := auditcomplete.HeadReportCategoriesByPrecedence
+	if len(got) != len(want) {
+		t.Fatalf("HeadReportCategoriesByPrecedence = %v, want exactly %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("HeadReportCategoriesByPrecedence = %v, want exactly %v", got, want)
+		}
+	}
+	for _, c := range got {
+		if c == auditcomplete.CategoryConflictResolutionPushed {
+			t.Errorf("conflict_resolution_pushed must stay OUT of HeadReportCategoriesByPrecedence "+
+				"(it is a ledger-only membership category; a precedence position would shadow a newer fixup head): %v", got)
+		}
+	}
+}

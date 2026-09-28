@@ -299,7 +299,42 @@ type PRHeadFetcher func(ctx context.Context, scope forge.CredentialScope, repo f
 // resolution between the acceptance/retry path and audit_complete publishing is
 // exactly the failure this centralization prevents: both import this package so
 // they cannot drift.
+//
+// conflict_resolution_pushed is deliberately NOT a member (#3673), even though
+// its entries carry a head_sha the two ledger readers now honor. This slice is a
+// static PRECEDENCE ordering, and no fixed position in it is correct for that
+// category: succeedConflictResolutionPushStage re-parks the review gate to
+// awaiting_approval, so the operator can route an ordinary fix-up AFTER a
+// successful pass. A position above fixup_pushed would shadow that newer fix-up
+// head; a position below it would shadow the merge commit whenever no fix-up
+// followed. Widening a MEMBERSHIP ledger (which commits are run-authored) does
+// not require widening a PRECEDENCE ordering (which single commit is "the"
+// head), so the category is admitted to the two membership readers only —
+// see CategoryConflictResolutionPushed.
 var HeadReportCategoriesByPrecedence = []string{"acceptance_scenarios_pushed", "fixup_pushed", "child_pushed", "pull_request_opened"}
+
+// CategoryConflictResolutionPushed is the audit category the runner's
+// SUCCESSFUL conflict-resolution pass is recorded under (E64.62 / #3202), and
+// the write→read seam for the merge commit it pushed (#3673). The WRITER is
+// server.succeedConflictResolutionPushStage (backend/internal/server/pullrequest.go),
+// which appends the entry with the merge commit in a head_sha payload field.
+// It has TWO READERS, both of which treat it as a LEDGER-ONLY membership
+// category: the ADR-035 branch-lineage ledger (server/lineage.go
+// buildReportedHeadLedger, via lineageLedgerCategories /
+// lineageChildLedgerCategories) and rule 5's known set here
+// (gatherForeignCommitInputs, via addConflictResolutionHeads).
+//
+// Before #3673 neither reader knew the category, so the product's own sanctioned
+// recovery path produced a commit its own gate called foreign and the operator
+// had to fishhawk_vouch_commit it by hand. The constant lives in this package
+// because auditcomplete cannot import server; the server aliases it so a
+// literal typo on either side is a compile-time drift, not a silent one — the
+// same shape CategoryOperatorCommitVouched (#3415) and CategorySlicesIntegrated
+// (#3429) already use.
+//
+// It is deliberately ABSENT from HeadReportCategoriesByPrecedence; the reason is
+// recorded on that slice's doc comment.
+const CategoryConflictResolutionPushed = "conflict_resolution_pushed"
 
 // CategoryOperatorCommitVouched is the audit category an operator's
 // fishhawk_vouch_commit declaration is recorded under (ADR-035 remediation,
@@ -961,7 +996,9 @@ type foreignCommitInputs struct {
 // (#216) and collects every implement-stage `pull_request`
 // artifact's head_sha + the PR's number, every walked run's own
 // head-report heads (#1682), every walked run's operator-vouched
-// commits plus those of its decomposition children (#3415), and —
+// commits plus those of its decomposition children (#3415), every
+// walked run's runner-authored conflict-resolution merge commits plus
+// those of its decomposition children (#3673), and —
 // on a walked run that HAS decomposition children — that run's own
 // fan-in integration merge commits (#3429). Returns
 // (inputs, true, nil) when there's enough to call PRHead; (_, false,
@@ -1083,6 +1120,21 @@ func gatherForeignCommitInputs(ctx context.Context, deps Deps, runID uuid.UUID) 
 		if err := addVouchedSHAs(ctx, deps, r.ID, known); err != nil {
 			return foreignCommitInputs{}, false, err
 		}
+		// #3673: a SUCCESSFUL conflict-resolution pass pushes a merge commit
+		// the runner authored, recorded ONLY under
+		// CategoryConflictResolutionPushed — deliberately absent from
+		// HeadReportCategoriesByPrecedence (see that slice's doc comment), so
+		// the per-hop head-category loop above does NOT see it and this is its
+		// SINGLE read path into the known set. Without it the product's own
+		// sanctioned recovery path produced a live PR head rule 5 called
+		// foreign_commit, forcing a manual fishhawk_vouch_commit. Union at
+		// PARITY with the vouch walk (own chain + children), same transient-I/O
+		// posture: a read failure aborts the gather into head_fetch_failed
+		// (pending) rather than under-populating known and false-flagging a
+		// legitimate merge commit.
+		if err := addConflictResolutionHeads(ctx, deps, r.ID, known); err != nil {
+			return foreignCommitInputs{}, false, err
+		}
 		children, _, err := listDecompositionChildren(ctx, deps, r.ID)
 		if err != nil {
 			return foreignCommitInputs{}, false, err
@@ -1106,6 +1158,13 @@ func gatherForeignCommitInputs(ctx context.Context, deps Deps, runID uuid.UUID) 
 				continue
 			}
 			if err := addVouchedSHAs(ctx, deps, child.ID, known); err != nil {
+				return foreignCommitInputs{}, false, err
+			}
+			// A child run has its own implement stage and pushes to the SHARED
+			// parent branch, so a conflict-resolution pass on a child is
+			// structurally possible; union its chain too, at parity with the
+			// vouch walk above.
+			if err := addConflictResolutionHeads(ctx, deps, child.ID, known); err != nil {
 				return foreignCommitInputs{}, false, err
 			}
 		}
@@ -1167,6 +1226,41 @@ func addVouchedSHAs(ctx context.Context, deps Deps, runID uuid.UUID, known map[s
 		}
 		if json.Unmarshal(e.Payload, &p) == nil && p.VouchedSHA != "" {
 			known[p.VouchedSHA] = struct{}{}
+		}
+	}
+	return nil
+}
+
+// addConflictResolutionHeads adds every non-empty head_sha payload value from
+// runID's CategoryConflictResolutionPushed audit entries to known (#3673): the
+// merge commit a SUCCESSFUL runner conflict-resolution pass authored and pushed
+// to the run branch. This is the ONLY read path by which the category reaches
+// rule 5's known set — it is deliberately absent from
+// HeadReportCategoriesByPrecedence, so the per-hop head-category loop in
+// gatherForeignCommitInputs never reads it.
+//
+// Signature and error posture mirror addVouchedSHAs exactly, so the own-chain
+// and child call sites cannot drift: a malformed payload is skipped (the push
+// report handler is the one writer and the report validator requires head_sha
+// on that outcome), and a read error is returned wrapped so the caller aborts
+// the gather as transient I/O — surfacing as the same head_fetch_failed
+// (PENDING) missing item the head-category loop's own read failure produces,
+// never a silent under-population that would false-flag the merge commit as
+// foreign.
+func addConflictResolutionHeads(ctx context.Context, deps Deps, runID uuid.UUID, known map[string]struct{}) error {
+	entries, err := deps.Audit.ListForRunByCategory(ctx, runID, CategoryConflictResolutionPushed)
+	if err != nil {
+		return fmt.Errorf("list %s for %s: %w", CategoryConflictResolutionPushed, shortID(runID), err)
+	}
+	for _, e := range entries {
+		if e == nil {
+			continue
+		}
+		var p struct {
+			HeadSHA string `json:"head_sha"`
+		}
+		if json.Unmarshal(e.Payload, &p) == nil && p.HeadSHA != "" {
+			known[p.HeadSHA] = struct{}{}
 		}
 	}
 	return nil

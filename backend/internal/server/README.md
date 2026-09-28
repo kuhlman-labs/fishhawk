@@ -1239,6 +1239,16 @@ Mechanics:
     #3415 symptom. The issue title blamed the write path ("does not union
     the sha into the reported-head ledger"); the write path was fine, the
     second reader was blind.
+- The runner's **conflict-resolution merge commit** flows to both readers the
+  same way (#3673): `buildReportedHeadLedger` admits
+  `auditcomplete.CategoryConflictResolutionPushed` to
+  `lineageLedgerCategories` AND `lineageChildLedgerCategories` (the merge commit
+  is in the ordinary `head_sha` field, so `addReportedHeads` reads it with no new
+  decoder), and `auditcomplete.gatherForeignCommitInputs` unions the same
+  `head_sha`s via `addConflictResolutionHeads` on each walked run's own chain and
+  its decomposition children. Rule 5 was again a reader that would otherwise have
+  omitted the union — see "Bounded conflict-resolution pass" above for the
+  precedence decision and the collateral readers.
 - The fan-in INTEGRATION categories now flow to both readers the same way
   (#3429). `buildReportedHeadLedger` and `gatherForeignCommitInputs` each
   union `slices_integrated` `integration_commit_shas` + `integration_commit_recorded`
@@ -1545,6 +1555,45 @@ never has to push to a branch ADR-035 declares runner-owned.
   reached through the happy path. `succeedConflictResolutionPushStage` and the
   resolver share the `CategoryConflictResolutionPushed` constant so the writer
   cannot drift out of the consumption set.
+- **A SUCCESSFUL pass's merge commit is ADMITTED to both reported-head readers
+  ([#3673](https://github.com/kuhlman-labs/fishhawk/issues/3673)).** The pass is
+  the product's own sanctioned recovery path, but neither reader of the ADR-035
+  reported-head concept knew its category, so the merge commit the RUNNER pushed
+  through the App installation read as FOREIGN and the operator had to
+  `fishhawk_vouch_commit` it by hand (observed on run `3d660c84`). The
+  `conflict_resolution_pushed` `head_sha` now enters BOTH: this package's
+  branch-lineage ledger (`lineageLedgerCategories` + `lineageChildLedgerCategories`,
+  read through the existing `addReportedHeads`/`head_sha` path) and
+  `auditcomplete`'s rule-5 known set (`addConflictResolutionHeads`, own chain +
+  decomposition children). `CategoryConflictResolutionPushed` is now an ALIAS of
+  `auditcomplete.CategoryConflictResolutionPushed`, so ONE spelling covers the
+  writer, the consumption set and both ledger readers and a rename on either
+  side is a compile-time drift. It is a LEDGER-ONLY membership category:
+  `auditcomplete.HeadReportCategoriesByPrecedence` is deliberately NOT widened,
+  because that slice is a static PRECEDENCE ordering and a successful pass
+  re-parks the review gate to `awaiting_approval` — so an ordinary fix-up can
+  follow, and a position above `fixup_pushed` would shadow the newer fix-up head
+  while a position below it would shadow the merge commit. With the union in
+  place, re-invoking `fishhawk_rebase_run_branch` (whose already-up-to-date arm
+  republishes at the LIVE head) re-posts a `fishhawk_audit_complete` check
+  carrying no `foreign_commit` item, with no manual vouch.
+- **Collateral, and deliberate: the other four readers of
+  `lineageLedgerCategories` see the category too.** The list is not exclusive to
+  `buildReportedHeadLedger`; it is also walked by
+  `resolveNewestReportedHeadSHA` (prompt.go — `expected_head_sha` for a fix-up /
+  acceptance push), `resolveAcceptanceRunBranchAndPR` (prompt.go),
+  `resolveStageCumulativeEval` (trace.go — the `stageBase` for the #3029
+  cumulative implement-review evaluation) and
+  `resolveSecondNewestReportedHeadSHA` (trace.go — the #1725 prior-reviewed-head
+  fallback). Each is either neutral or STRICTLY MORE CORRECT with the pass's push
+  admitted: the first two order by (timestamp, sequence) rather than by a static
+  precedence position, so after a pass the newest ledger head is the merge commit
+  that IS the branch tip — previously they resolved a stale pre-pass head, which
+  is a lease mismatch waiting to happen; `resolveStageCumulativeEval` takes the
+  OLDEST stage-scoped entry, which is still the PR-open one, and gains the pass as
+  evidence a push happened on that stage; and the #1725 fallback's "prior head" is
+  genuinely the pre-merge head. This is the collateral the #3091 note below warns
+  about, checked rather than assumed.
 - **The failure marker is appended BEFORE the restore, and a persistence
   failure REFUSES the recovery.** Consumption lives only in the audit chain, so
   a restore that lands while the marker append fails would acknowledge the

@@ -19,11 +19,22 @@ import (
 
 // lineageLedgerCategories are the audit categories whose entries carry
 // a reported head_sha for THIS run's own commits: the PR-open report,
-// the decomposed-child push report, the fix-up push report, and the
-// acceptance runner's scenario-corpus push report (E72.4 / #3328). Their
-// union (∪ the current report's head_sha) is the set of commits the
-// run is allowed to have placed on its branch.
-var lineageLedgerCategories = []string{"pull_request_opened", "child_pushed", "fixup_pushed", "acceptance_scenarios_pushed"}
+// the decomposed-child push report, the fix-up push report, the
+// acceptance runner's scenario-corpus push report (E72.4 / #3328), and the
+// runner's SUCCESSFUL conflict-resolution push report (#3673 — the merge
+// commit a bounded conflict-resolution pass authored on the run branch,
+// which attributes through the same head_sha payload field a fix-up push
+// does). Their union (∪ the current report's head_sha) is the set of
+// commits the run is allowed to have placed on its branch.
+//
+// The conflict-resolution member is the alias, never a literal, so a rename
+// on either side of the write→read seam is a compile-time drift exactly as
+// lineageIntegrationLedgerCategory already arranges. It is a LEDGER-ONLY
+// membership category: it is deliberately absent from
+// auditcomplete.HeadReportCategoriesByPrecedence (see that slice's doc
+// comment for why no fixed precedence position is correct).
+var lineageLedgerCategories = []string{"pull_request_opened", "child_pushed", "fixup_pushed", "acceptance_scenarios_pushed",
+	auditcomplete.CategoryConflictResolutionPushed}
 
 // lineageVouchLedgerCategory is the audit category carrying an operator's
 // vouched-commit declaration (#1044). Unlike the own-chain head categories
@@ -75,8 +86,12 @@ const lineageIntegrationCommitCategory = auditcomplete.CategoryIntegrationCommit
 // fishhawk/run-<shortID(decomposedFromRunID)> — see FixupBranch in
 // prompt.go), so both head reports belong in the parent's ledger.
 // pull_request_opened is deliberately absent: children never open PRs
-// (ADR-032/#714).
-var lineageChildLedgerCategories = []string{"child_pushed", "fixup_pushed"}
+// (ADR-032/#714). conflict_resolution_pushed IS present (#3673): a child has
+// its own implement stage, so a bounded conflict-resolution pass can be
+// authorized on it and its merge commit lands on that same shared branch.
+// The alias, never a literal — see lineageLedgerCategories.
+var lineageChildLedgerCategories = []string{"child_pushed", "fixup_pushed",
+	auditcomplete.CategoryConflictResolutionPushed}
 
 // lineageChildRunsLimit caps the decomposition-child enumeration when
 // building the reported-head ledger. run.ListRunsFilter requires
@@ -473,7 +488,9 @@ func (s *Server) resolveLineageBaseRef(ctx context.Context, runRow *run.Run,
 // buildReportedHeadLedger collects the set of head SHAs this run has
 // reported across its lineageLedgerCategories audit entries
 // (pull_request_opened / child_pushed / fixup_pushed /
-// acceptance_scenarios_pushed), plus the commits an operator has VOUCHED as run-authored
+// acceptance_scenarios_pushed / conflict_resolution_pushed — a runner-authored
+// conflict-resolution merge commit attributes through the same head_sha
+// payload path as a fix-up push, #3673), plus the commits an operator has VOUCHED as run-authored
 // lineage (operator_commit_vouched, #1044 — read from the vouched_sha
 // field, not head_sha), plus an explicit ledgerSeedSHA bootstrap (when
 // non-empty).

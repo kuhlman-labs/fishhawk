@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcomplete"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -38,7 +39,14 @@ const CategoryStageConflictResolutionFailed = "stage_conflict_resolution_failed"
 // conflict_resolution=true with anchors that name a merge already committed and
 // pushed. Success and failure are therefore both consumption, and the resolver
 // takes whichever is newest.
-const CategoryConflictResolutionPushed = "conflict_resolution_pushed"
+//
+// Aliased to auditcomplete.CategoryConflictResolutionPushed (#3673) so ONE
+// spelling covers the writer (succeedConflictResolutionPushStage), this
+// resolver's consumption set, the ADR-035 branch-lineage ledger
+// (lineageLedgerCategories / lineageChildLedgerCategories) and rule 5's known
+// set (auditcomplete.addConflictResolutionHeads); the value is unchanged, so a
+// rename on either side is a compile-time drift, not a silent one.
+const CategoryConflictResolutionPushed = auditcomplete.CategoryConflictResolutionPushed
 
 // conflictResolutionTrigger is the payload of a
 // stage_conflict_resolution_triggered entry: everything the runner needs to
