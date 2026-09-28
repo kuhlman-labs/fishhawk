@@ -22,6 +22,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/gitlabclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/jiraclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 	workmgmtgithub "github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt/github"
 	workmgmtgitlab "github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt/gitlab"
@@ -3134,5 +3135,367 @@ func TestFileWorkItem_GitLab_ChildNumberAllocatedViaEpicChildren(t *testing.T) {
 	}
 	if resp := decodeWorkItem(t, rec); resp.Title != "[E7.3] Discover my number on gitlab" {
 		t.Errorf("response title = %q, want [E7.3] Discover my number on gitlab (max(1,2)+1 over the relates_to children)", resp.Title)
+	}
+}
+
+// --- sequential-number allocation lock (#3704) ---
+
+// fakeSequentialNumberProvider is a workmgmt.Provider that ALSO implements the
+// optional workmgmt.NumberDiscoverer capability (#1269), like
+// fakeDiscoverProvider, but is concurrency-safe so the two-parallel-filings
+// test can share one instance (the AGENTS.md #3226 trap: a racy fake makes a
+// -race counterfactual attributable to the FAKE rather than to the control).
+// Every field is guarded by mu. When appendOnFile is set, File records the
+// just-allocated number so a subsequent DiscoverNumbers reflects it — the
+// mechanism that lets serialized filings allocate distinct numbers.
+//
+// fakeDiscoverProvider is deliberately NOT retrofitted: it is only ever driven
+// serially by the existing single-filing tests, which stay untouched.
+type fakeSequentialNumberProvider struct {
+	name string
+
+	mu             sync.Mutex
+	discovered     []int
+	discoverErr    error
+	discoverCalls  int
+	discoverReq    workmgmt.DiscoverNumbersRequest
+	fileCalls      int
+	filedTitles    []string
+	filedNumbers   []int
+	appendOnFile   bool
+	createdCounter int
+
+	// DiscoverNumbers arrival barrier (#1958's pattern, binding condition 1).
+	// When barrierN > 0 each DiscoverNumbers call SNAPSHOTS the number set
+	// first, THEN reports arrival and blocks until barrierN calls have arrived
+	// OR barrierWait elapses, and only then returns that pre-barrier snapshot.
+	// Snapshotting BEFORE the wait is what makes the counterfactual
+	// deterministic: with the production lock removed both goroutines are past
+	// the snapshot (each holding the same pre-filing set) before either is
+	// released, so both allocate the same number and collide. The release is a
+	// BOUNDED TIMEOUT (barrierWait, derived via timescale.D) rather than a
+	// strict rendezvous, which is what lets the correctly-LOCKED implementation
+	// — where two goroutines can never be inside DiscoverNumbers at once — pass
+	// instead of deadlocking on an arrival that can never come.
+	barrierN    int
+	barrierWait time.Duration
+	barrierArr  int
+	barrierCh   chan struct{}
+}
+
+// awaitBarrier blocks until barrierN DiscoverNumbers calls have arrived (all
+// released together) or barrierWait elapses (a lone arrival proceeds). It is a
+// no-op when barrierN <= 0. The channel wait happens WITHOUT f.mu held so a
+// blocked caller never wedges the fake's other methods.
+func (f *fakeSequentialNumberProvider) awaitBarrier() {
+	f.mu.Lock()
+	if f.barrierN <= 0 {
+		f.mu.Unlock()
+		return
+	}
+	if f.barrierCh == nil {
+		f.barrierCh = make(chan struct{})
+	}
+	ch := f.barrierCh
+	wait := f.barrierWait
+	f.barrierArr++
+	if f.barrierArr >= f.barrierN {
+		select {
+		case <-ch: // already released
+		default:
+			close(ch)
+		}
+	}
+	f.mu.Unlock()
+
+	select {
+	case <-ch:
+	case <-time.After(wait):
+	}
+}
+
+func (f *fakeSequentialNumberProvider) Name() string { return f.name }
+
+func (f *fakeSequentialNumberProvider) DiscoverNumbers(_ context.Context, req workmgmt.DiscoverNumbersRequest) ([]int, error) {
+	// Snapshot FIRST (binding condition 1), then wait on the arrival barrier,
+	// then return that pre-barrier snapshot.
+	f.mu.Lock()
+	f.discoverCalls++
+	f.discoverReq = req
+	err := f.discoverErr
+	snapshot := append([]int(nil), f.discovered...)
+	f.mu.Unlock()
+
+	f.awaitBarrier()
+
+	if err != nil {
+		return nil, err
+	}
+	return snapshot, nil
+}
+
+func (f *fakeSequentialNumberProvider) File(_ context.Context, req workmgmt.ProviderRequest) (*workmgmt.CreatedItem, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.fileCalls++
+	f.filedTitles = append(f.filedTitles, req.Item.Title)
+	f.filedNumbers = append(f.filedNumbers, req.Number)
+	if f.appendOnFile {
+		f.discovered = append(f.discovered, req.Number)
+	}
+	f.createdCounter++
+	return &workmgmt.CreatedItem{
+		Provider:      f.name,
+		Number:        7000 + f.createdCounter,
+		URL:           "https://github.com/kuhlman-labs/fishhawk/issues/7000",
+		AppliedLabels: req.Item.Classification.Labels,
+		Boarded:       true,
+	}, nil
+}
+
+// registerFakeSequentialNumberProvider registers the concurrency-safe
+// discovery-capable fake under the default provider id.
+func registerFakeSequentialNumberProvider(t *testing.T, p *fakeSequentialNumberProvider) {
+	t.Helper()
+	if p.name == "" {
+		p.name = workmgmt.Default().Provider
+	}
+	workmgmt.Register(p)
+}
+
+// sequentialTestTarget is the target the handler builds for a
+// "kuhlman-labs/fishhawk" filing, as far as sequentialNumberLockKey reads it
+// (owner + name only), so a test can compute the very key the handler will use.
+func sequentialTestTarget() workmgmt.Target {
+	return workmgmt.Target{Repo: workmgmt.Repo{Owner: "kuhlman-labs", Name: "fishhawk"}}
+}
+
+// TestFileWorkItem_SequentialNumberConcurrentFilingsDistinct is the done-means
+// behavioural test for #3704: two parallel `adr` filings with existing_numbers
+// omitted must serialize through the per-(repo, prefix) in-process lock and
+// allocate DISTINCT consecutive numbers ([ADR-080] and [ADR-081]) — never a
+// collision on [ADR-080], which is the duplicate [E78] observed on #3699/#3700.
+//
+// The barrier makes the test load-bearing rather than probabilistic. Each
+// DiscoverNumbers snapshots the number set BEFORE waiting, so WITHOUT the lock
+// both goroutines deterministically hold the same pre-filing {79} snapshot
+// before either reaches File, both allocate 80, and the seen-set assertion
+// fails. WITH the lock only one goroutine can be inside DiscoverNumbers at a
+// time: the lone arrival trips the bounded barrierWait, files 80, File appends
+// it, and the second call's snapshot is {79,80} -> 81.
+func TestFileWorkItem_SequentialNumberConcurrentFilingsDistinct(t *testing.T) {
+	fp := &fakeSequentialNumberProvider{
+		discovered:   []int{79},
+		appendOnFile: true,
+		barrierN:     2,
+		barrierWait:  timescale.D(2 * time.Second),
+	}
+	registerFakeSequentialNumberProvider(t, fp)
+	s := New(Config{})
+
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			rec := fileWorkItem(t, s, workItemRequest{
+				Repo:    "kuhlman-labs/fishhawk",
+				Type:    "adr",
+				Summary: "Concurrent decision",
+				// existing_numbers omitted on purpose — discovery fills it.
+			}, "github:operator")
+			if rec.Code != http.StatusCreated {
+				t.Errorf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
+			}
+		}()
+	}
+	wg.Wait()
+
+	fp.mu.Lock()
+	titles := append([]string(nil), fp.filedTitles...)
+	fp.mu.Unlock()
+	if len(titles) != 2 {
+		t.Fatalf("filed %d titles, want 2: %v", len(titles), titles)
+	}
+	seen := map[string]bool{}
+	for _, tl := range titles {
+		seen[tl] = true
+	}
+	if !seen["[ADR-080] Concurrent decision"] || !seen["[ADR-081] Concurrent decision"] {
+		t.Errorf("filed titles = %v, want the distinct consecutive [ADR-080] and [ADR-081]", titles)
+	}
+}
+
+// fileWorkItemWithin runs one filing on its own goroutine and fails the test if
+// it has not returned within bound — the shape every held-lock case below uses
+// to turn "the handler contended on a lock it should not have taken" into a
+// bounded failure instead of a hang.
+func fileWorkItemWithin(t *testing.T, s *Server, body workItemRequest, bound time.Duration) *httptest.ResponseRecorder {
+	t.Helper()
+	type result struct{ rec *httptest.ResponseRecorder }
+	done := make(chan result, 1)
+	go func() { done <- result{fileWorkItem(t, s, body, "github:operator")} }()
+	select {
+	case r := <-done:
+		return r.rec
+	case <-time.After(bound):
+		t.Fatalf("filing did not complete within %s — it contended on the held sequential-number lock", bound)
+		return nil
+	}
+}
+
+// TestFileWorkItem_SequentialExistingNumbersSkipsLock pins the
+// explicit-override carve-out BEHAVIOURALLY: the test itself holds the filing's
+// (repo, prefix) lock, and a caller-supplied existing_numbers filing must still
+// complete — the lock is taken ONLY when discovery actually runs.
+func TestFileWorkItem_SequentialExistingNumbersSkipsLock(t *testing.T) {
+	fp := &fakeSequentialNumberProvider{discovered: []int{500}} // would yield 501 if discovery ran
+	registerFakeSequentialNumberProvider(t, fp)
+	s := New(Config{})
+
+	unlock := lockSequentialNumberKey(sequentialNumberLockKey(sequentialTestTarget(), "ADR-"))
+	defer unlock()
+
+	rec := fileWorkItemWithin(t, s, workItemRequest{
+		Repo:            "kuhlman-labs/fishhawk",
+		Type:            "adr",
+		Summary:         "Caller knows best",
+		ExistingNumbers: []int{34, 35},
+	}, timescale.D(2*time.Second))
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
+	}
+	fp.mu.Lock()
+	calls := fp.discoverCalls
+	numbers := append([]int(nil), fp.filedNumbers...)
+	fp.mu.Unlock()
+	if calls != 0 {
+		t.Errorf("discovery ran %d times despite a caller-supplied existing_numbers override", calls)
+	}
+	if len(numbers) != 1 || numbers[0] != 36 {
+		t.Errorf("filed numbers = %v, want [36] (caller list 34,35 -> 36)", numbers)
+	}
+}
+
+// TestFileWorkItem_SequentialNoDiscovererSkipsLock is the no-capability skip
+// mode: with the (repo, prefix) lock held by the test, a File-only provider
+// must still reach the pre-existing #1265 fail-closed 422 without contending.
+func TestFileWorkItem_SequentialNoDiscovererSkipsLock(t *testing.T) {
+	fp := &fakeWorkProvider{name: workmgmt.Default().Provider}
+	workmgmt.Register(fp)
+	s := New(Config{})
+
+	unlock := lockSequentialNumberKey(sequentialNumberLockKey(sequentialTestTarget(), "ADR-"))
+	defer unlock()
+
+	rec := fileWorkItemWithin(t, s, workItemRequest{
+		Repo:    "kuhlman-labs/fishhawk",
+		Type:    "adr",
+		Summary: "No discoverer here",
+	}, timescale.D(2*time.Second))
+
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (body=%s)", rec.Code, rec.Body.String())
+	}
+	var env errorEnvelope
+	_ = json.Unmarshal(rec.Body.Bytes(), &env)
+	if env.Error.Details["existing_numbers_required"] != true {
+		t.Errorf("details.existing_numbers_required = %v, want true (the unchanged #1265 fail-closed)", env.Error.Details["existing_numbers_required"])
+	}
+}
+
+// TestFileWorkItem_SequentialDiscoveryErrorReleasesLock is the fail-closed
+// mode: a DiscoverNumbers error still returns the unchanged 422
+// work_item_invalid with details.discovery_failed, AND a second filing against
+// the same key then completes — proving the error branch released the lock
+// rather than wedging every later filing of that (repo, prefix).
+func TestFileWorkItem_SequentialDiscoveryErrorReleasesLock(t *testing.T) {
+	fp := &fakeSequentialNumberProvider{discoverErr: errors.New("search API exploded")}
+	registerFakeSequentialNumberProvider(t, fp)
+	s := New(Config{})
+
+	rec := fileWorkItemWithin(t, s, workItemRequest{
+		Repo:    "kuhlman-labs/fishhawk",
+		Type:    "adr",
+		Summary: "Discovery will fail",
+	}, timescale.D(2*time.Second))
+
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (body=%s)", rec.Code, rec.Body.String())
+	}
+	var env errorEnvelope
+	_ = json.Unmarshal(rec.Body.Bytes(), &env)
+	if env.Error.Code != "work_item_invalid" {
+		t.Errorf("code = %q, want work_item_invalid", env.Error.Code)
+	}
+	if got, _ := env.Error.Details["discovery_failed"].(string); got == "" || !strings.Contains(got, "search API exploded") {
+		t.Errorf("details.discovery_failed = %v, want it to carry the cause", env.Error.Details["discovery_failed"])
+	}
+
+	// The lock must be free again: a healthy second filing against the SAME
+	// (repo, prefix) key completes within the bound.
+	fp.mu.Lock()
+	fp.discoverErr = nil
+	fp.discovered = []int{79}
+	fp.mu.Unlock()
+
+	rec2 := fileWorkItemWithin(t, s, workItemRequest{
+		Repo:    "kuhlman-labs/fishhawk",
+		Type:    "adr",
+		Summary: "Discovery recovered",
+	}, timescale.D(2*time.Second))
+	if rec2.Code != http.StatusCreated {
+		t.Fatalf("second filing status = %d, want 201 — the discovery-error branch wedged the lock (body=%s)", rec2.Code, rec2.Body.String())
+	}
+}
+
+// TestKeyedLocks_SameKeySerializes pins the shared helper's core contract: a
+// second acquisition of the SAME key blocks until the first unlocks.
+func TestKeyedLocks_SameKeySerializes(t *testing.T) {
+	k := &keyedLocks{}
+	unlock := k.lock("repo#ADR-")
+
+	acquired := make(chan struct{})
+	go func() {
+		u := k.lock("repo#ADR-")
+		close(acquired)
+		u()
+	}()
+
+	select {
+	case <-acquired:
+		t.Fatal("a second acquisition of the same key did not block while the first was held")
+	case <-time.After(timescale.D(50 * time.Millisecond)):
+	}
+
+	unlock()
+	select {
+	case <-acquired:
+	case <-time.After(timescale.D(2 * time.Second)):
+		t.Fatal("the second acquisition never completed after the first unlocked")
+	}
+}
+
+// TestKeyedLocks_DistinctKeysDoNotContend pins that the helper keys its
+// mutexes: two DIFFERENT keys are holdable simultaneously. A helper that
+// ignored its key and serialized on one global mutex would leave the second
+// acquisition blocked until the bound elapsed.
+func TestKeyedLocks_DistinctKeysDoNotContend(t *testing.T) {
+	k := &keyedLocks{}
+	unlockA := k.lock("repo#ADR-")
+	defer unlockA()
+
+	acquired := make(chan struct{})
+	go func() {
+		u := k.lock("repo#E")
+		close(acquired)
+		u()
+	}()
+
+	select {
+	case <-acquired:
+	case <-time.After(timescale.D(2 * time.Second)):
+		t.Fatal("acquiring a DISTINCT key blocked while another key was held — the helper is serializing on one global mutex")
 	}
 }
