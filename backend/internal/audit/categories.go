@@ -348,6 +348,8 @@ var KnownCategories = map[string]struct{}{
 	"product_report_filed":                    {},
 	"pull_request_closed_after_review_reject": {},
 	"pull_request_failed":                     {},
+	"push_notification_failed":                {},
+	"push_notification_sent":                  {},
 	"push_resume_checkpoint":                  {},
 	"pull_request_opened":                     {},
 	"refinement_draft_approved":               {},

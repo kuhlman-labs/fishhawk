@@ -717,3 +717,16 @@ func TestBulkWaiveConcernsRouteRegistered(t *testing.T) {
 			missRec.Code, missRec.Body.String())
 	}
 }
+
+// TestHealth_PushSinksAlwaysPresent pins the #2292 /healthz field shape: with
+// no push dispatcher configured, push_sinks is PRESENT and the empty array
+// (never omitted, never null), so a client can tell "no sinks" from an older
+// daemon that predates the field.
+func TestHealth_PushSinksAlwaysPresent(t *testing.T) {
+	s := New(Config{})
+	rec := httptest.NewRecorder()
+	s.handleHealth(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if !strings.Contains(rec.Body.String(), `"push_sinks":[]`) {
+		t.Errorf("push_sinks must be [] when no sink is configured: %s", rec.Body.String())
+	}
+}
