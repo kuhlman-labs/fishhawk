@@ -17,7 +17,7 @@ function mockAuth(me: MeResponse) {
   /*
    * Centralized fetch stub. Anything beyond /v0/auth/* falls through
    * with a 404 so unrelated network calls in routes that haven't
-   * been wired to the API yet (runs, audit) don't quietly succeed
+   * been wired to the API yet (runs, audit, attention) don't quietly succeed
    * with stale fixtures.
    */
   const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
@@ -67,9 +67,27 @@ describe('App routing + auth', () => {
       mockAuth({ ok: true, user: sampleUser });
     });
 
-    it('renders the runs route as the index', async () => {
+    it('renders the attention queue as the index', async () => {
       renderAt('/');
+      expect(await screen.findByRole('heading', { name: 'Needs You' })).toBeInTheDocument();
+      expect(screen.queryByRole('heading', { name: 'Runs' })).not.toBeInTheDocument();
+    });
+
+    it('still renders the runs list at /runs', async () => {
+      renderAt('/runs');
       expect(await screen.findByRole('heading', { name: 'Runs' })).toBeInTheDocument();
+      expect(screen.queryByRole('heading', { name: 'Needs You' })).not.toBeInTheDocument();
+    });
+
+    it('renders the Needs You nav entry first, pointing at the index', async () => {
+      renderAt('/runs');
+      const links = await screen.findAllByRole('link');
+      const needsYou = screen.getByRole('link', { name: /^needs you$/i });
+      expect(needsYou).toHaveAttribute('href', '/');
+      expect(links[0]).toBe(needsYou);
+      // `end` keeps the index entry from staying active on a child route.
+      expect(needsYou).not.toHaveAttribute('aria-current');
+      expect(screen.getByRole('link', { name: /^runs$/i })).toHaveAttribute('aria-current', 'page');
     });
 
     it('renders the audit route', async () => {
@@ -98,8 +116,8 @@ describe('App routing + auth', () => {
 
     it('redirects /login → / when already signed in', async () => {
       renderAt('/login');
-      // Lands on the runs index (rendered inside Root) after the redirect.
-      expect(await screen.findByRole('heading', { name: 'Runs' })).toBeInTheDocument();
+      // Lands on the attention-queue index (rendered inside Root) after the redirect.
+      expect(await screen.findByRole('heading', { name: 'Needs You' })).toBeInTheDocument();
     });
 
     it('signs out via POST /v0/auth/logout and routes to /login', async () => {

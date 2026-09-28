@@ -3,6 +3,7 @@ import type {
   ApiError,
   ApprovalRequest,
   Artifact,
+  AttentionList,
   AuditEntry,
   Campaign,
   CampaignState,
@@ -298,5 +299,17 @@ export const api = {
    */
   getCampaignStatus(campaignId: string): Promise<CampaignStatus> {
     return request(`/v0/campaigns/${encodeURIComponent(campaignId)}/status`);
+  },
+
+  /**
+   * The cross-run attention queue (E40.1 / #1713): every decision parked
+   * on a human, ranked. Read-only. `limit` caps the ranked list (a cut
+   * sets `truncated`); omitted, the server default applies.
+   */
+  listAttention(params?: { limit?: number }): Promise<AttentionList> {
+    const q = new URLSearchParams();
+    if (params?.limit) q.set('limit', String(params.limit));
+    const qs = q.toString();
+    return request(`/v0/attention${qs ? `?${qs}` : ''}`);
   },
 };
