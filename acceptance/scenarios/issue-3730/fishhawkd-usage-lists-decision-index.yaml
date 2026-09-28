@@ -1,0 +1,14 @@
+id: scenario:issue-3730/fishhawkd-usage-lists-decision-index
+statement: The fishhawkd command-line help lists a `decision-index` subcommand with its backfill and check modes.
+verify_hint: 'CLI stdout/stderr: running the fishhawkd binary with `--help` exits 0 and its output names `decision-index`, `backfill` and `check`.'
+steps: 'Ran the preview''s own serving binary (.fishhawk/cache/preview-worktree/bin/fishhawkd; /healthz git_sha a6b2ccfb == checkout HEAD): `fishhawkd help`, `fishhawkd --help`, `fishhawkd -h`.'
+assertions:
+    expected: 'The fishhawkd command-line help lists decision-index with its backfill and check modes (verify_hint: `--help` exits 0 naming decision-index, backfill, check).'
+    observed_at_record: '`fishhawkd help` exits 0 and prints the ''Usage: fishhawkd [serve|...|decision-index] [flags]'' line, plus ''decision-index backfill  Reconstruct the derived decision index from the audit chain (--rebuild, --dry-run; #3730).'' and ''decision-index check     Report decision-bearing entries with no index row; exits 1 on a gap.''. `--help` and `-h` exit 1 and print only the serve flag set. That comes from existing splitCommand routing (unchanged since 2026-05-01), which sends any leading ''-'' arg to serve.'
+    repro_handle: fishhawkd help; echo $?
+origin:
+    issue: 3730
+    pr: 0
+    run_id: d773f2d2-3ad5-4ab0-883a-b6c656d8ab8a
+    head_sha: a6b2ccfb493afca4738ba2d0b6727e1b88ebb0be
+    recorded_at: 2026-09-28T22:08:21Z
