@@ -8,7 +8,12 @@ import type {
   Campaign,
   CampaignState,
   CampaignStatus,
+  HealthStatus,
   PaginatedList,
+  RepoEconomicsResponse,
+  RepoHealth,
+  RepoPostureResponse,
+  RepoThroughput,
   Run,
   Stage,
 } from './types';
@@ -42,6 +47,21 @@ export class ApiClientError extends Error {
     this.status = status;
     this.body = body;
   }
+}
+
+/*
+ * Repo dashboard path builder (E40.3 / #1714): owner and name are encoded
+ * SEPARATELY so a `/` inside either can never be read as a path separator,
+ * and `weeks` rides only when the caller set it (the server default is 12).
+ */
+function repoDashPath(
+  owner: string,
+  name: string,
+  rollup: 'throughput' | 'health' | 'economics' | 'posture',
+  weeks?: number,
+): string {
+  const base = `/v0/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/${rollup}`;
+  return weeks !== undefined ? `${base}?weeks=${encodeURIComponent(String(weeks))}` : base;
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -311,5 +331,38 @@ export const api = {
     if (params?.limit) q.set('limit', String(params.limit));
     const qs = q.toString();
     return request(`/v0/attention${qs ? `?${qs}` : ''}`);
+  },
+
+  /** Merged changes per week + median cycle time (+ optional wait-on-human). */
+  getRepoThroughput(
+    owner: string,
+    name: string,
+    params?: { weeks?: number },
+  ): Promise<RepoThroughput> {
+    return request(repoDashPath(owner, name, 'throughput', params?.weeks));
+  },
+
+  /** Plan first-shot approval, fixup and acceptance rates + failure-category mix. */
+  getRepoHealth(owner: string, name: string, params?: { weeks?: number }): Promise<RepoHealth> {
+    return request(repoDashPath(owner, name, 'health', params?.weeks));
+  },
+
+  /** Cost per merged change, weekly cache efficiency, ADR-030 budget burn. `{}` when no cost rows. */
+  getRepoEconomics(
+    owner: string,
+    name: string,
+    params?: { weeks?: number },
+  ): Promise<RepoEconomicsResponse> {
+    return request(repoDashPath(owner, name, 'economics', params?.weeks));
+  },
+
+  /** Workflow posture from the newest run's cached spec. `{}` when none is cached. */
+  getRepoPosture(owner: string, name: string): Promise<RepoPostureResponse> {
+    return request(repoDashPath(owner, name, 'posture'));
+  },
+
+  /** GET /healthz — carries the embedded schema-hash map the posture panel reads. */
+  getHealth(): Promise<HealthStatus> {
+    return request('/healthz');
   },
 };
