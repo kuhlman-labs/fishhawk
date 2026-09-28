@@ -1941,6 +1941,18 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		watchScopeAmendments(watchCtx, client, cfg, mcpBearerToken, stageType, logSink)
 	}()
 
+	// Stage orphan sweeper (#3663): sample the host process table alongside the
+	// amendment watcher, accumulating the runner's descendant + process-group
+	// closure, and SIGKILL the survivors at stage exit. Two call sites, both
+	// guarded by one sync.Once: the normal post-invoke one below (whose event
+	// rides in the signed bundle) and this defer, which backstops the cancel /
+	// timeout / early-return paths. The backstop is LOG-ONLY — run() is already
+	// returning, so there is no res.Events to append to and no bundle to fold
+	// the event into (accepted, see runner/internal/procsweep/README.md).
+	orphanSweeper := newStageOrphanSweeper(logSink, cfg, os.Getenv, time.Now())
+	orphanSweeper.start(ctx)
+	defer func() { _ = orphanSweeper.sweep(context.WithoutCancel(ctx)) }()
+
 	invokeStart := time.Now()
 	// When appliedFixup is set, the near-deterministic fix-up apply (#1165)
 	// already produced the change and passed the committed-tree verify gate
@@ -2166,6 +2178,13 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// never write concurrently (#1035).
 	stopWatch()
 	watchWG.Wait()
+
+	// Reap stage orphans (#3663) immediately after the sampler is joined, so its
+	// event is on res.Events before composeGateEvidence folds the bundle. nil on
+	// the zero-orphan common case, so a clean stage's trace is unchanged.
+	if ev := orphanSweeper.sweep(ctx); ev != nil {
+		res.Events = append(res.Events, *ev)
+	}
 
 	// Fold the #1165 deterministic-apply trace into the bundle. Appended here
 	// (not before the loop) because the agent loop reassigns res wholesale, so
@@ -5204,6 +5223,11 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 	}
 	resolveScope(true)
 
+	// Host-load preflight (#3663). Sampled immediately before EACH committed-tree
+	// verify below; only the LAST sample is retained, so the classification at
+	// the ladder tail judges the deciding verify's host conditions.
+	hostProbe := newHostLoadProbe(*cfg, logSink)
+
 	var (
 		passed          bool
 		reinvoked       bool
@@ -5268,6 +5292,7 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 		// is the SCOPED form — a fast pre-pass over the touched packages, NOT
 		// the authority.
 		form = verifyFormName(scopePkgs)
+		res.Events = append(res.Events, hostProbe.sample(ctx)...)
 		ev, out, outcome, disp := runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, timeout, scopePkgs)
 		res.Events = append(res.Events, stampVerifyRunChangeID(ev, changeID))
 		attempts++
@@ -5298,6 +5323,7 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 		// double every iteration's cost for no added coverage.
 		if len(scopePkgs) > 0 && outcome == "passed" {
 			form = verifyFormFull
+			res.Events = append(res.Events, hostProbe.sample(ctx)...)
 			fev, fout, foutcome, fdisp := runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, timeout, nil)
 			res.Events = append(res.Events, stampVerifyRunChangeID(fev, changeID))
 			out, outcome, disp = fout, foutcome, fdisp
@@ -5718,6 +5744,22 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 		return reinvoked, "", nil
 	}
 
+	// HOST OVERLOADED (#3663): the deciding verify FAILED and the host was far
+	// above its core count when it ran, so this is infrastructure, not an
+	// artifact defect — category C, retryable in place. Evaluated AFTER
+	// refused / unavailable / timedOut (each names a more specific cause) and
+	// BEFORE the category-A arm. The `!passed` conjunct IS the outcome=="failed"
+	// precondition: every non-failure exit path above has already returned, so
+	// reaching here with !passed means the deciding verify was red. A passing
+	// verify on an overloaded host is NOT demoted — it only gets the
+	// verify_host_overloaded trace event the probe already emitted.
+	if !passed && hostProbe.overloaded() {
+		res.OK = false
+		res.FailureCategory = "C"
+		res.FailureReason = hostProbe.reason() + "\n" + lastOutput
+		return reinvoked, "", nil
+	}
+
 	if !passed {
 		res.OK = false
 		res.FailureCategory = "A"
@@ -5829,11 +5871,17 @@ func runVerifyGateCommitted(ctx context.Context, cfg config, logSink io.Writer) 
 	// byte-identical, which the backend reads as undecidable.
 	changeID := gitPatchIDForCommit(ctx, repoDir, headSHA)
 
+	// Host-load preflight (#3663), sampled immediately before the gate runs and
+	// again before the infra-flake absorb re-run, so the classification at (f)
+	// judges the deciding execution's host conditions.
+	hostProbe := newHostLoadProbe(cfg, logSink)
+
 	// (d) Verify against the committed scope-only tree.
 	// nil scope set = the FULL verify form (#3315). runVerifyGateCommitted is
 	// the single-shot authoritative gate; it is never narrowed.
+	events := hostProbe.sample(ctx)
 	ev, out, outcome, disp := runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, timeout, nil)
-	events := []agent.Event{stampVerifyRunChangeID(ev, changeID)}
+	events = append(events, stampVerifyRunChangeID(ev, changeID))
 
 	// Infrastructure-failure absorb (#972, widened by #2645): a failed verify
 	// whose output carries a diff-independent infra signature
@@ -5873,6 +5921,7 @@ func runVerifyGateCommitted(ctx context.Context, cfg config, logSink io.Writer) 
 				"detail":    detail,
 			}),
 		})
+		events = append(events, hostProbe.sample(ctx)...)
 		ev, out, outcome, disp = runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, timeout, nil)
 		events = append(events, stampVerifyRunChangeID(ev, changeID))
 		// The re-run's own disposition decides (f): a host that went away
@@ -5949,6 +5998,18 @@ func runVerifyGateCommitted(ctx context.Context, cfg config, logSink io.Writer) 
 		if isVerifyInfraFailure(out) {
 			return events, "", fmt.Errorf("%w: committed tree verify command %q failed for an infrastructure reason: %s; %d file(s) outside scope are build/test-required: %s\n%s",
 				gitops.ErrVerifyInfraFailure, cfg.verifyCmd, verifyFailureExcerpt(out), len(drift), strings.Join(drift, ", "), out)
+		}
+		if hostProbe.overloaded() {
+			// HOST OVERLOADED (#3663): the gate failed while the host was far
+			// above its core count — infrastructure, not a red tree. Wrapping
+			// ErrVerifyInfraFailure is what makes committedGateFailureCategory
+			// resolve it to category C (retryable in place). The gate output is
+			// preserved verbatim after the lead so the reviewer still sees the
+			// real test failures. Placed LAST among the (f) arms: refused,
+			// unavailable, timedOut and the persistent infra signature each name
+			// a more specific cause.
+			return events, "", fmt.Errorf("%w: %s\n%s",
+				gitops.ErrVerifyInfraFailure, hostProbe.reason(), out)
 		}
 		return events, "", fmt.Errorf("%w: committed tree verify command %q failed; %d file(s) outside scope are build/test-required: %s\n%s",
 			gitops.ErrCommittedTestsFailed, cfg.verifyCmd, len(drift), strings.Join(drift, ", "), out)
