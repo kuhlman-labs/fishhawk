@@ -1,0 +1,14 @@
+id: scenario:issue-1713/attention-items-carry-one-screen-context
+statement: Every item in the GET /v0/attention response carries a context object with the decision prose for its kind (plan summary, agent amendment reason, acceptance disposition detail, human-led issue ref, or concern note), so the payload alone explains what is needed without a detail-page fetch.
+verify_hint: 'HTTP route: every element of GET /v0/attention''s items[] has a context object with at least one non-empty prose field.'
+steps: On the same seeded preview, GET http://localhost:8090/v0/attention with a read:audit fhk_ bearer. For each item check that context is an object with at least one non-empty string or non-empty list field.
+assertions:
+    expected: Every item has a context object with at least one non-empty prose field.
+    observed_at_record: 'plan_gate items carry context.plan_summary (for example ''Seeded fixture plan parked at the plan gate.'' or ''Add a bulk export endpoint for the audit log...''). acceptance_disposition items carry verdict ''failed'', criteria_failed 1, criteria_skipped 0. The transcript-backed one adds failed_criteria [{id: run-readable, method: GET, path: /v0/runs/abc, status: 404}]. All 9 pass. The other four kinds could not be seeded on this preview; the repo-local attention-item tests render their context prose (amendment reason and paths, split/paged note, campaign epic/human-led refs).'
+    repro_handle: 'curl -H ''Authorization: Bearer <fhk>'' http://localhost:8090/v0/attention | jq ''.items[].context'''
+origin:
+    issue: 1713
+    pr: 0
+    run_id: 3c14ae7f-586c-4b88-a58d-3afc7292e75b
+    head_sha: cca7f22201a516398afcb46c5a5d42b0cb595af5
+    recorded_at: 2026-09-28T16:51:12Z

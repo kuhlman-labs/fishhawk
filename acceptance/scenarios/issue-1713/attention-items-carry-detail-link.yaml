@@ -1,0 +1,14 @@
+id: scenario:issue-1713/attention-items-carry-detail-link
+statement: Every item in the GET /v0/attention response carries a non-empty detail_path pointing at the run, stage, or campaign detail route for that item.
+verify_hint: 'HTTP route: every element of GET /v0/attention''s items[] has a non-empty detail_path beginning with /runs/ or /campaigns/.'
+steps: On the same seeded preview (plan-gate-parked, plan-gate-criteria x6 with posted plans, acceptance-dispatched x2 with failed verdicts), GET http://localhost:8090/v0/attention with a read:audit fhk_ bearer. For every item check detail_path is non-empty, starts with /runs/ or /campaigns/, and equals /runs/{run_id}/stages/{stage_id} for that item.
+assertions:
+    expected: A non-empty detail_path beginning with /runs/ or /campaigns/ on every item.
+    observed_at_record: 'All 9 items: detail_path = /runs/<run_id>/stages/<stage_id>, e.g. /runs/3420811a-470f-49ce-8a82-0de21e910917/stages/fb6156bb-1d01-482f-bf63-1a4027b162ee for the acceptance disposition.'
+    repro_handle: 'curl -H ''Authorization: Bearer <fhk>'' http://localhost:8090/v0/attention | jq ''.items[].detail_path'''
+origin:
+    issue: 1713
+    pr: 0
+    run_id: 3c14ae7f-586c-4b88-a58d-3afc7292e75b
+    head_sha: cca7f22201a516398afcb46c5a5d42b0cb595af5
+    recorded_at: 2026-09-28T16:51:12Z

@@ -1,0 +1,14 @@
+id: scenario:issue-1713/attention-endpoint-returns-prioritized-items
+statement: GET /v0/attention returns 200 and the body carries an items array whose entries each have a kind drawn from the six-member set (plan_gate, scope_amendment, acceptance_disposition, attend_human_led_campaign, split_verdict, paged_concern) and a numeric priority, ordered by ascending priority.
+verify_hint: 'HTTP route: GET /v0/attention on the localhost preview returns 200 with items[] and, on a preview carrying a parked run, at least one item whose kind is in the documented enum; items[] is non-decreasing in priority.'
+steps: 'Insert an fhk_ token row with scope read:audit into the preview DB (fishhawk_preview.api_tokens, sha256 of the plaintext). POST http://localhost:8090/v0/dev/fixtures {"scenario":"plan-gate-parked"}, then GET /v0/attention with Authorization: Bearer <fhk>. Also seed six plan-gate-criteria runs with signed plans posted. Seed two acceptance-dispatched runs; on each, sign and POST a failed verdict (one via a POST /v0/runs/{run}/acceptance/transcript artifact ref). GET /v0/attention again. For each item check kind is in the six-member enum, priority is an integer, and the priority sequence is non-decreasing. Controls: POST /v0/attention with no bearer; GET without a bearer -> 401; a run-bound fhm_ token -> 403 insufficient_scope read:audit.'
+assertions:
+    expected: 200 with items[]; each kind from the six-member set, numeric priority, ascending order.
+    observed_at_record: '200. 9 items: 7 plan_gate (priority 1) then 2 acceptance_disposition (priority 3). Priorities [1,1,1,1,1,1,1,3,3], all kinds in the enum. degraded [], truncated false, scanned_runs 13. ?limit=2 -> 2 items with truncated true.'
+    repro_handle: 'curl -H ''Authorization: Bearer <read:audit fhk>'' http://localhost:8090/v0/attention'
+origin:
+    issue: 1713
+    pr: 0
+    run_id: 3c14ae7f-586c-4b88-a58d-3afc7292e75b
+    head_sha: cca7f22201a516398afcb46c5a5d42b0cb595af5
+    recorded_at: 2026-09-28T16:51:12Z

@@ -1,0 +1,14 @@
+id: scenario:issue-1713/attention-endpoint-is-read-only
+statement: 'The attention endpoint exposes no write verb: POST to /v0/attention is refused.'
+verify_hint: 'HTTP route: POST /v0/attention returns 405 Method Not Allowed.'
+steps: Send POST, PUT, PATCH and DELETE to http://localhost:8090/v0/attention, both without a bearer and with a read:audit fhk_ bearer (curl -X <method> -D -).
+assertions:
+    expected: POST /v0/attention returns 405.
+    observed_at_record: 'POST -> 405 Method Not Allowed with ''Allow: GET, HEAD''. PUT, PATCH and DELETE -> 405 each.'
+    repro_handle: curl -X POST -i http://localhost:8090/v0/attention
+origin:
+    issue: 1713
+    pr: 0
+    run_id: 3c14ae7f-586c-4b88-a58d-3afc7292e75b
+    head_sha: cca7f22201a516398afcb46c5a5d42b0cb595af5
+    recorded_at: 2026-09-28T16:51:12Z
