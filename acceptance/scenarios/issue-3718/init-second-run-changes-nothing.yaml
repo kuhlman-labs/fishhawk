@@ -1,0 +1,14 @@
+id: scenario:issue-3718/init-second-run-changes-nothing
+statement: A second `fishhawk init` over the same fresh temporary git repository reports every scaffold file as skipped-existing, exits 0, and leaves every scaffolded file in that temporary repository byte-identical to the first run's output.
+verify_hint: 'CLI stdout and exit code: run `fishhawk init` twice over the same fresh temporary git repository, read the second run''s `<path> skipped-existing` lines and exit code 0, and compare that temporary directory''s contents between the two runs.'
+steps: Build CLI from the checkout. Fresh git repo /tmp/fh3718/c1; fishhawk init --working-dir /tmp/fh3718/c1 --skip-mcp-register --backend-url http://127.0.0.1:8080; sha256 all files outside .git; run the identical init again; hash again; diff manifests.
+assertions:
+    expected: skipped-existing for each, exit 0, byte-identical files.
+    observed_at_record: Second run exit 0; the four .fishhawk files 'skipped-existing', AGENTS.md/CLAUDE.md 'unchanged'; hash manifests identical.
+    repro_handle: fishhawk init twice then diff sha256 manifests
+origin:
+    issue: 3718
+    pr: 0
+    run_id: 202ce8d9-bb2c-4606-ab53-d0ab411180e2
+    head_sha: 31eee8ce78585fca80707f8bb1eecd70f1adf912
+    recorded_at: 2026-09-28T06:11:59Z

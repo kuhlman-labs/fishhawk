@@ -1,0 +1,14 @@
+id: scenario:issue-3718/doctor-charter-rung-green-after-init
+statement: After `fishhawk init` in a fresh temporary git repository, `fishhawk doctor --spec-only` pointed at that same temporary repository reports the charter rung ok — the scaffolded charter document resolves and its rubric table yields at least one rubric line id under the same row shape the grooming charter reader uses.
+verify_hint: 'CLI stdout and exit code: run `fishhawk doctor --spec-only --working-dir <the initialised fresh temporary git repository>` and read the charter rung''s `ok` status line; exit code 0.'
+steps: 'Build CLI from the checkout; fishhawk init --skip-mcp-register in fresh git repo /tmp/fh3718/c1; run fishhawk doctor --spec-only --working-dir /tmp/fh3718/c1. Control: same against /tmp/fh3718/c3 (sentinel one-line charter). Posture B: backend go test ./internal/scaffold/ (read-only at the checkout).'
+assertions:
+    expected: charter rung ok with >=1 rubric id; exit 0.
+    observed_at_record: 'exit 0; ''charter document  .fishhawk/charter.md (19 rubric lines)  ok''; ''ready for local loop''. Control: ''no rubric rows  fail''. TestCharterTemplateParsesWithGroomingReader PASS.'
+    repro_handle: fishhawk doctor --spec-only --working-dir <initialised temp repo>
+origin:
+    issue: 3718
+    pr: 0
+    run_id: 202ce8d9-bb2c-4606-ab53-d0ab411180e2
+    head_sha: 31eee8ce78585fca80707f8bb1eecd70f1adf912
+    recorded_at: 2026-09-28T06:11:59Z
