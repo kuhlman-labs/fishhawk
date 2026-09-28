@@ -101,13 +101,20 @@ reused (see §6).
 
 ### What alpha does *not* require
 
-Kubernetes or a production-posture Helm deployment (E62, E69 — beta), hosted
-multi-tenancy (E44), BYOK (E61 — satisfied by construction when the captain's own
-daemon holds their key), runner-hosted reviewers (E63), MCP over HTTP (E66 — local
-MCP is stdio), a second eligible approver or quorum, and a second forge as a
-blocker (GitLab support stays shipped; its live walk is beta — see ADR-080 #3693).
-Earned autonomy — the crew's record recommending changes to its own delegation —
-is designed in alpha and may land after it; the captain always ratifies.
+Each line has a stable id. A grooming run that demotes an item for advancing only
+one of these cites the D id alongside **V5**, and says so. Like the rubric ids, D
+ids are retired and never recycled (§6).
+
+| id | line |
+|---|---|
+| **D1** | Kubernetes or a production-posture Helm deployment (E62, E69 — beta). |
+| **D2** | Hosted multi-tenancy (E44). |
+| **D3** | BYOK (E61) — satisfied by construction when the captain's own daemon holds their key. |
+| **D4** | Runner-hosted reviewers (E63). |
+| **D5** | MCP over HTTP (E66) — local MCP is stdio. |
+| **D6** | A second eligible approver, or quorum. |
+| **D7** | A second forge as a blocker — GitLab support stays shipped; its live walk is beta (ADR-080 #3693). |
+| **D8** | Earned autonomy landing in alpha — the crew's record recommending changes to its own delegation is designed in alpha and may land after it; the captain always ratifies. |
 
 ---
 
