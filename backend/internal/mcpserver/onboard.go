@@ -142,9 +142,9 @@ type InitInput struct {
 	Preset        string `json:"preset,omitempty" jsonschema:"workflow autonomy preset: one of low, medium, high; defaults to medium when omitted"`
 	Shape         string `json:"shape,omitempty" jsonschema:"repository shape: app (a repository with a test entrypoint) or config-only (a config- or docs-only repository with none, dropping the verify block and tests_added_or_updated and raising max_files_changed); defaults to app when omitted"`
 	Forge         string `json:"forge,omitempty" jsonschema:"work-management provider family: github (GitHub Projects) or gitlab; defaults to gitlab when gitlab_project is set, otherwise github"`
-	ProjectOwner  string `json:"project_owner,omitempty" jsonschema:"github only: the GitHub Projects owner login (the repo owner); omitted leaves the project block commented with a fill-me-in marker"`
+	ProjectOwner  string `json:"project_owner,omitempty" jsonschema:"github only: the GitHub Projects owner login (the repo owner), at most 39 letters, digits or hyphens; omitted leaves the project block commented with a fill-me-in marker"`
 	ProjectNumber int    `json:"project_number,omitempty" jsonschema:"github only: the GitHub Projects number (the integer in the Project URL); omitted leaves the project block commented with a fill-me-in marker"`
-	GitLabProject string `json:"gitlab_project,omitempty" jsonschema:"gitlab only: the namespaced project path filed issues land in; omitted means the repository's own path"`
+	GitLabProject string `json:"gitlab_project,omitempty" jsonschema:"gitlab only: the namespaced project path filed issues land in (group/project, over letters, digits, '.', '_' and '-'); omitted means the repository's own path"`
 }
 
 // InitOutput carries the scaffold file set. The conversational agent writes
@@ -502,6 +502,11 @@ project_owner or project_number leaves the project block COMMENTED under a
 fill-me-in marker and lists the missing fields in incomplete — grooming and
 issue filing fail closed until it is filled. project_owner / project_number
 with forge gitlab, or gitlab_project with forge github, is a clean tool error.
+project_owner and gitlab_project are rendered into a YAML document, so they
+are constrained to forge-identifier characters (an owner is at most 39
+letters, digits or '-'; a gitlab project is a '/'-separated path over letters,
+digits, '.', '_' and '-') and anything else is a clean tool error rather than
+text that could become configuration.
 
 This tool writes no file itself: the conversational agent writes each document
 ONLY where its path does not already exist. The spec delta options (budget /

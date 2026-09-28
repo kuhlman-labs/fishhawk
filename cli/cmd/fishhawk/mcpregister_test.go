@@ -4,6 +4,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -265,5 +268,109 @@ func TestSameDir(t *testing.T) {
 	}
 	if sameDir(func() (string, error) { return dir, nil }, dir+string(os.PathSeparator)+"missing") {
 		t.Error("sameDir with an unresolvable dir = true")
+	}
+}
+
+// TestShellQuote pins the copy-pasteable-command contract: an ordinary word
+// stays bare, and anything a shell would split or interpret is wrapped in
+// single quotes that survive the paste as the literal value.
+func TestShellQuote(t *testing.T) {
+	for _, c := range []struct{ in, want string }{
+		{"claude", "claude"},
+		{"--transport", "--transport"},
+		{"http://127.0.0.1:8080/mcp", "http://127.0.0.1:8080/mcp"},
+		{"/tmp/my repo", `'/tmp/my repo'`},
+		{"/tmp/$(touch pwned)", `'/tmp/$(touch pwned)'`},
+		{"/tmp/a;rm -rf /", `'/tmp/a;rm -rf /'`},
+		{"/tmp/it's", `'/tmp/it'\''s'`},
+		{"http://h/?a=1&b=2", `'http://h/?a=1&b=2'`},
+		{"", "''"},
+	} {
+		if got := shellQuote(c.in); got != c.want {
+			t.Errorf("shellQuote(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// TestRegisterMCP_QuotesSpacesAndMetacharacters (concern: the documented
+// --working-dir flow supports directory names with spaces, and the backend
+// URL is operator-supplied too). The printed command must parse back into
+// the INTENDED words, so the assertion runs it through a real shell parse
+// (`printf %s\n` over the argv) rather than matching a substring.
+func TestRegisterMCP_QuotesSpacesAndMetacharacters(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "my repo; touch pwned")
+	if err := os.MkdirAll(root, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	pinGetwd(t, t.TempDir())
+	installMCPStub(t, withAnswers(nil))
+	backend := "http://127.0.0.1:8080/a b"
+	var buf strings.Builder
+	registerMCP(&buf, root, backend, false)
+
+	line := ""
+	for _, l := range strings.Split(buf.String(), "\n") {
+		if strings.HasPrefix(strings.TrimSpace(l), "cd ") {
+			line = strings.TrimSpace(l)
+		}
+	}
+	if line == "" {
+		t.Fatalf("no cd line printed:\n%s", buf.String())
+	}
+	// Ask a real shell what words the printed line expands to. A root
+	// that is not one argument, or a metacharacter that executes, shows
+	// up here and nowhere in a substring match.
+	script := strings.Replace(line, "&& claude ", "&& set -- ", 1) + `; printf '%s\n' "$(pwd -P)" "$@"`
+	sh := exec.Command("/bin/sh", "-c", script)
+	// Run from a scratch dir: if the control regresses, the unquoted
+	// metacharacter EXECUTES, and its side effect must land outside the
+	// repository (this test observed it create a file in the package
+	// directory before cmd.Dir was pinned).
+	sh.Dir = t.TempDir()
+	out, err := sh.CombinedOutput()
+	if err != nil {
+		t.Fatalf("printed command does not parse (%v):\n%s\n%s", err, line, out)
+	}
+	got := strings.Split(strings.TrimRight(string(out), "\n"), "\n")
+	wantRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := append([]string{wantRoot}, claudeMCPAddArgs(backend)...)
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("printed command expands to %q, want %q\n%s", got, want, line)
+	}
+	if _, err := os.Stat(filepath.Join(root, "pwned")); err == nil {
+		t.Errorf("the printed command executed the metacharacter in the root name")
+	}
+}
+
+// TestRegisterMCP_CwdNotRootWithMatchingRegistrationDoesNotClaimRegistered
+// (concern: registerMCP used to consult `claude mcp list` BEFORE checking
+// the cwd, so a registration belonging to ANOTHER directory's scope was
+// reported as the target repository being registered). With the cwd check
+// first, the directory-scoped probe is not even consulted from the wrong
+// directory, and the output says so.
+func TestRegisterMCP_CwdNotRootWithMatchingRegistrationDoesNotClaimRegistered(t *testing.T) {
+	root := t.TempDir()
+	pinGetwd(t, t.TempDir())
+	stub := installMCPStub(t, withAnswers(map[string]mcpAnswer{
+		"claude mcp list":         {out: "fishhawk-http: http://127.0.0.1:8080/mcp (HTTP)"},
+		"claude mcp get fishhawk": {out: "ok"},
+	}))
+	var buf strings.Builder
+	registerMCP(&buf, root, testBackend, false)
+	out := buf.String()
+	if strings.Contains(out, "already registered") {
+		t.Errorf("a registration in ANOTHER directory's scope was reported as the target repository's:\n%s", out)
+	}
+	if !strings.Contains(out, "cd "+root+" && "+wantClaudeCmd) {
+		t.Errorf("output = %q", out)
+	}
+	if stub.called("claude mcp list") || stub.called("claude mcp get") {
+		t.Errorf("a directory-scoped registration probe ran from the wrong directory: %v", stub.calls)
+	}
+	if stub.called("claude mcp add") {
+		t.Errorf("an add ran from a different directory: %v", stub.calls)
 	}
 }

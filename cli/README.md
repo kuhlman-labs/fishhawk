@@ -412,10 +412,14 @@ Operator guide: `docs/onboarding.md`.
 - `bridge.EnsureAgentDocs` (E29.2, `cli/internal/bridge`) ensures the AGENTS.md managed block + the CLAUDE.md
   `@AGENTS.md` import — idempotent, with per-file status reported.
 - `registerMCP` (`mcpregister.go`) registers `fishhawk-http` at `<--backend-url>/mcp` over the `doctorRunOutput`
-  seam: skip flag → print; `claude` present + registered (`matchMCPRegistration` / `mcpGetFallback`) → no add; cwd ≠
-  repo root → print `cd <root> && …` (Claude Code's default scope is cwd-keyed); else `claude mcp add --transport http`
-  (a non-zero exit is a warning); `codex` only → print `codex mcp add fishhawk-http --url …`; neither → print the
-  Claude Code command. It never fails init.
+  seam: skip flag → print; `claude` absent and `codex` present → print `codex mcp add fishhawk-http --url …`; neither →
+  print the Claude Code command; cwd ≠ repo root → print `cd <root> && …`; `claude` present at the root + already
+  registered (`matchMCPRegistration` / `mcpGetFallback`) → no add; else `claude mcp add --transport http` (a non-zero
+  exit is a warning). It never fails init. **The cwd check precedes the already-registered probes** because Claude
+  Code's default scope is cwd-keyed, so `claude mcp list` answers for the CURRENT directory: a match seen from
+  somewhere else would report the TARGET repository as registered without anything about the target having been
+  inspected. Every interpolated word goes through `shellQuote`, so a root or backend URL holding a space or a shell
+  metacharacter is printed as ONE literal argument rather than split or executed when the line is pasted.
 - The printed checklist is local-path first (`fishhawkd`, token, App install on GitHub targets, `fishhawk run start
   --runner-kind local` + `fishhawk runner start`) with GitHub Actions as the labelled alternative; the App-install URL
   (`https://github.com/apps/fishhawk/installations/new`) is the same URL `doctor_onboarding.go` emits.

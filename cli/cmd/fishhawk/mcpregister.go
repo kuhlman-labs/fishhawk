@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
 
@@ -31,8 +32,35 @@ func mcpEndpoint(backendURL string) string {
 	return strings.TrimRight(backendURL, "/") + "/mcp"
 }
 
+// shellSafeWord is the character set a word carries through a shell with no
+// quoting at all. Everything else — a space, a quote, and every
+// metacharacter — must be quoted.
+var shellSafeWord = regexp.MustCompile(`^[A-Za-z0-9_@%+=:,./-]+$`)
+
+// shellQuote renders s as exactly ONE shell word. The commands registerMCP
+// prints are meant to be COPIED INTO A SHELL, so a value it interpolates —
+// the repository root from --working-dir, the backend URL, the registration
+// name — must survive that paste as the literal value. An ordinary directory
+// name holding a space (`/tmp/my repo`) would otherwise be split into two
+// arguments, and one holding a metacharacter (`$(...)`, `;`, a backtick)
+// would turn the printed line into unintended execution. POSIX single quotes
+// suppress every expansion; an embedded `'` is closed, escaped and reopened.
+func shellQuote(s string) string {
+	if s != "" && shellSafeWord.MatchString(s) {
+		return s
+	}
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// shellCommand renders name plus args as a copy-pasteable command line,
+// quoting every word so argument boundaries survive the paste.
 func shellCommand(name string, args []string) string {
-	return name + " " + strings.Join(args, " ")
+	out := make([]string, 0, len(args)+1)
+	out = append(out, shellQuote(name))
+	for _, a := range args {
+		out = append(out, shellQuote(a))
+	}
+	return strings.Join(out, " ")
 }
 
 // registerMCP registers the Fishhawk MCP server with a detected agent CLI
@@ -43,12 +71,17 @@ func shellCommand(name string, args []string) string {
 // a warning. The ladder:
 //
 //  1. --skip-mcp-register — print the command, run nothing.
-//  2. `claude` present, fishhawk already registered (`claude mcp list`,
-//     then the `claude mcp get` fallback) — report it, run no add.
-//  3. `claude` present, cwd is not the scaffolded repo root — print the
+//  2. `claude` present, cwd is not the scaffolded repo root — print the
 //     command to run FROM the root, run nothing: Claude Code's default
 //     `local` scope is keyed to the directory the add runs in, so an add
-//     from elsewhere would register the wrong project.
+//     from elsewhere would register the wrong project. This check comes
+//     BEFORE the already-registered probes on purpose: `claude mcp list`
+//     answers for the CURRENT directory's scope, so a match seen from
+//     somewhere else would report the TARGET repository as registered when
+//     nothing about the target was inspected.
+//  3. `claude` present, fishhawk already registered for THIS directory
+//     (`claude mcp list`, then the `claude mcp get` fallback) — report it,
+//     run no add.
 //  4. `claude` present — run `claude mcp add --transport http ...`; a
 //     non-zero exit is a warning naming the exit and the command (the flag
 //     shape is Claude-Code-version dependent).
@@ -74,6 +107,13 @@ func registerMCP(w io.Writer, root, backendURL string, skip bool) {
 		return
 	}
 
+	if !sameDir(mcpGetwd, root) {
+		_, _ = fmt.Fprintf(w, "  not registered here: Claude Code's default scope is keyed to the current directory, "+
+			"which is not %s (so a registration listed here says nothing about that repository); register from there by running:\n    cd %s && %s\n",
+			root, shellQuote(root), claudeCmd)
+		return
+	}
+
 	if out, listErr := doctorRunOutput("claude", "mcp", "list"); listErr == nil {
 		if detail, ok := matchMCPRegistration(out, backendURL); ok {
 			_, _ = fmt.Fprintf(w, "  already registered: %s (no change); the registration command is:\n    %s\n", detail, claudeCmd)
@@ -82,12 +122,6 @@ func registerMCP(w io.Writer, root, backendURL string, skip bool) {
 	}
 	if detail, ok := mcpGetFallback(); ok {
 		_, _ = fmt.Fprintf(w, "  already %s (no change); the registration command is:\n    %s\n", detail, claudeCmd)
-		return
-	}
-
-	if !sameDir(mcpGetwd, root) {
-		_, _ = fmt.Fprintf(w, "  not registered: Claude Code's default scope is keyed to the current directory, "+
-			"which is not %s; register from there by running:\n    cd %s && %s\n", root, root, claudeCmd)
 		return
 	}
 

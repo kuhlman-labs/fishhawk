@@ -17,6 +17,7 @@ import (
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"gopkg.in/yaml.v3"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/scaffold"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
@@ -2144,5 +2145,63 @@ func TestDoctorToolDescription_DescribesRunnerCredentials(t *testing.T) {
 		if !strings.Contains(desc, want) {
 			t.Errorf("fishhawk_doctor description lacks %q", want)
 		}
+	}
+}
+
+// TestMCPInit_RefusesConnectionInjection is the tool-surface half of the
+// configuration-injection control (E74.3 fix-up). project_owner and
+// gitlab_project are EXPOSED tool inputs, and initScaffoldOptions trims only
+// surrounding whitespace, so the payload reaches the renderer. On the
+// INCOMPLETE github branch the owner is rendered into a COMMENTED block,
+// where a newline ends the comment: without scaffold's identifier guard this
+// input renders an ACTIVE `project:` mapping under a header still calling the
+// configuration commented and incomplete. Each case must be a clean tool
+// error with NO documents returned — and the rendered-output assertion below
+// is what makes the test a control rather than a string check: a run that
+// returns a document at all is failed with the decoded project mapping shown.
+func TestMCPInit_RefusesConnectionInjection(t *testing.T) {
+	r := &runResolver{getenv: envFuncFromMap(nil)}
+	for name, tc := range map[string]struct {
+		in   InitInput
+		want string
+	}{
+		"owner newline activates a connection": {
+			InitInput{ProjectOwner: "acme\nproject:\n  owner: attacker\n  owner_type: user\n  number: 7"},
+			"invalid project owner",
+		},
+		"owner newline, number supplied": {
+			InitInput{ProjectOwner: "acme\nproject:\n  owner: attacker", ProjectNumber: 7},
+			"invalid project owner",
+		},
+		"owner comment escape":  {InitInput{ProjectOwner: "acme # owner: attacker"}, "invalid project owner"},
+		"gitlab newline":        {InitInput{GitLabProject: "grp/p\ngitlab:\n  project: attacker/p"}, "invalid gitlab project"},
+		"gitlab not namespaced": {InitInput{GitLabProject: "justaproject"}, "invalid gitlab project"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, out, err := r.init(context.Background(), nil, tc.in)
+			if err == nil {
+				var d struct {
+					Project map[string]any `yaml:"project"`
+					GitLab  map[string]any `yaml:"gitlab"`
+				}
+				_ = yaml.Unmarshal([]byte(out.WorkManagementYAML), &d)
+				t.Fatalf("init rendered instead of refusing; project = %v gitlab = %v\n%s", d.Project, d.GitLab, out.WorkManagementYAML)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %v, want one containing %q", err, tc.want)
+			}
+			if out.WorkManagementYAML != "" || len(out.Files) != 0 {
+				t.Errorf("a refused init still returned documents: %+v", out.Files)
+			}
+		})
+	}
+
+	// Discrimination: a legitimate owner and a legitimate namespaced
+	// project still render, so the guard is not a blanket refusal.
+	if _, _, err := r.init(context.Background(), nil, InitInput{ProjectOwner: "kuhlman-labs", ProjectNumber: 7}); err != nil {
+		t.Errorf("a legitimate owner was refused: %v", err)
+	}
+	if _, _, err := r.init(context.Background(), nil, InitInput{GitLabProject: "grp.x/sub_1/p-2"}); err != nil {
+		t.Errorf("a legitimate gitlab project was refused: %v", err)
 	}
 }

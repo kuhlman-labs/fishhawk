@@ -49,5 +49,11 @@ CLI's runtime check:
 Every value `Files` substitutes is an enumerated branch (provider, owner type,
 owner/number presence, gitlab path), so these tests cover the rendered space.
 
+The identifier guard on `ProjectOwner` / `GitLabProject` — untrusted input that
+must not become YAML structure in either the live or the COMMENTED connection
+rendering — is the same code in both copies and documented once, in
+`cli/internal/scaffold/README.md` § "Identifier guard (configuration
+injection)". `TestFiles_RejectsConnectionInjection` runs in both.
+
 A third consumer should promote the templates to a canonical `docs/spec/`
 document mirrored by `scripts/sync-schemas` instead of adding a third copy.

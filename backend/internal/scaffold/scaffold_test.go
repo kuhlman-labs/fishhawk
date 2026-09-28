@@ -321,7 +321,7 @@ func TestFiles_ProviderConnectionBranches(t *testing.T) {
 	if !strings.Contains(string(incomplete), "FILL ME IN (project.owner, project.number)") {
 		t.Errorf("incomplete: no required-fill marker:\n%s", incomplete)
 	}
-	if d := decode(mustFiles(t, Options{Provider: ProviderGitLab, Autonomy: "medium", GitLabProject: `g/"p`})[WorkManagementPath]); d.GitLab["project"] != `g/"p` {
+	if d := decode(mustFiles(t, Options{Provider: ProviderGitLab, Autonomy: "medium", GitLabProject: "grp.x/sub_1/p-2"})[WorkManagementPath]); d.GitLab["project"] != "grp.x/sub_1/p-2" {
 		t.Errorf("gitlab quoted project: %+v", d)
 	}
 }
@@ -395,5 +395,90 @@ func TestEnsureFiles_PropagatesRenderAndWriteErrors(t *testing.T) {
 	}
 	if _, err := EnsureFiles(root, githubOpts()); err == nil || !strings.Contains(err.Error(), CharterPath) {
 		t.Errorf("EnsureFiles err = %v, want a write failure naming %s", err, CharterPath)
+	}
+}
+
+// TestFiles_RejectsConnectionInjection is the configuration-injection
+// control (E74.3 fix-up). project_owner and gitlab_project are exposed
+// operator and MCP-tool inputs, and the INCOMPLETE GitHub branch renders the
+// owner into a COMMENTED block — a place no quoting pass can defend, because
+// a newline simply ends the comment. renderConnection therefore constrains
+// both scalars to forge-identifier characters and fails closed.
+//
+// Control absent, the first payload below renders
+//
+//	#   owner: acme
+//	project:
+//	  owner: attacker
+//	  owner_type: user
+//	  number: 7
+//
+// i.e. an ACTIVE project connection out of a configuration the header still
+// calls commented and incomplete. The assertions are therefore made on the
+// DECODED document as well as on the refusal: a rendered document that
+// carries a live `project` mapping while Options.Missing() is non-empty is
+// the defect, whatever the error value says.
+func TestFiles_RejectsConnectionInjection(t *testing.T) {
+	owners := map[string]string{
+		"newline activates a connection": "acme\nproject:\n  owner: attacker\n  owner_type: user\n  number: 7",
+		"inline mapping":                 `acme": {x: 1}, "y`,
+		"comment escape":                 "acme # owner: attacker",
+		"colon":                          "acme: attacker",
+		"carriage return":                "acme\rproject: x",
+		"leading dash":                   "-acme",
+		"too long":                       strings.Repeat("a", 40),
+	}
+	for name, owner := range owners {
+		t.Run("owner/"+name, func(t *testing.T) {
+			// Both arms: the incomplete (commented) render AND the
+			// complete one, so the guard is proven on the branch the
+			// payload targets and on the live branch alike.
+			for _, opts := range []Options{
+				{Provider: ProviderGitHubProjects, Autonomy: "medium", ProjectOwner: owner},
+				{Provider: ProviderGitHubProjects, Autonomy: "medium", ProjectOwner: owner, ProjectNumber: 7},
+			} {
+				files, err := Files(opts)
+				if err == nil {
+					var d struct {
+						Project map[string]any `yaml:"project"`
+					}
+					_ = yaml.Unmarshal(files[WorkManagementPath], &d)
+					t.Fatalf("Files(owner=%q, number=%d) rendered instead of refusing; project = %v\n%s",
+						owner, opts.ProjectNumber, d.Project, files[WorkManagementPath])
+				}
+				if !strings.Contains(err.Error(), "invalid project owner") {
+					t.Fatalf("Files(owner=%q, number=%d) error = %v, want an invalid-project-owner refusal", owner, opts.ProjectNumber, err)
+				}
+			}
+		})
+	}
+
+	projects := map[string]string{
+		"newline activates a connection": "grp/p\ngitlab:\n  project: attacker/p",
+		"quote":                          `g/"p`,
+		"no namespace":                   "justaproject",
+		"empty segment":                  "grp//p",
+		"comment escape":                 "grp/p # project: attacker/p",
+	}
+	for name, project := range projects {
+		t.Run("gitlab/"+name, func(t *testing.T) {
+			_, err := Files(Options{Provider: ProviderGitLab, Autonomy: "medium", GitLabProject: project})
+			if err == nil || !strings.Contains(err.Error(), "invalid gitlab project") {
+				t.Fatalf("Files(gitlab_project=%q) error = %v, want an invalid-gitlab-project refusal", project, err)
+			}
+		})
+	}
+
+	// Discrimination: the guard must not refuse the identifiers real
+	// forges issue, or it would be a blanket refusal rather than a
+	// control.
+	for _, ok := range []Options{
+		{Provider: ProviderGitHubProjects, Autonomy: "medium", ProjectOwner: "kuhlman-labs", ProjectNumber: 7},
+		{Provider: ProviderGitHubProjects, Autonomy: "medium", ProjectOwner: strings.Repeat("a", 39)},
+		{Provider: ProviderGitLab, Autonomy: "medium", GitLabProject: "grp.x/sub_1/p-2"},
+	} {
+		if _, err := Files(ok); err != nil {
+			t.Errorf("Files(%+v) refused a legitimate identifier: %v", ok, err)
+		}
 	}
 }

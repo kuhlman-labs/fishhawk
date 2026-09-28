@@ -42,6 +42,23 @@ repository at runtime. Nothing here writes into the Fishhawk repository's own
   naming the missing field — preferred over a plausible-looking number that
   would point at an unrelated board. `owner_type` defaults to `user`.
 
+### Identifier guard (configuration injection)
+
+`ProjectOwner` and `GitLabProject` are UNTRUSTED input: the CLI's
+`--project-owner` / `--gitlab-project` and the `fishhawk_init` MCP tool's
+`project_owner` / `gitlab_project`. The incomplete `github_projects` branch
+renders the owner into a COMMENTED block, where quoting is no defence at all —
+a value carrying a newline simply ends the comment, so
+`acme\nproject:\n  owner: attacker\n  number: 7` would render an ACTIVE
+project connection under a header still calling the config incomplete.
+`renderConnection` therefore constrains both scalars to the character set a
+real forge identifier can hold and FAILS CLOSED on anything else: an owner is
+at most 39 letters, digits or `-` starting alphanumeric, a GitLab project is a
+`/`-separated path of segments over letters, digits, `.`, `_` and `-`. No
+supplied text can become YAML structure in either the live or the commented
+rendering. Pinned by `TestFiles_RejectsConnectionInjection` (in BOTH copies),
+which also holds the guard discriminating against real identifiers.
+
 ## Cross-module invariants
 
 - **Rubric-row pattern.** `RubricRowPattern` is the same regexp source as

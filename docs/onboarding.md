@@ -385,8 +385,11 @@ fishhawk init [--preset low|medium|high] [--shape app|config-only] \
    `http://localhost:8080`, like every other command). With Claude Code
    detected and fishhawk not yet registered it runs `claude mcp add --transport
    http fishhawk-http <url>/mcp` (only from the repo root: Claude Code's default
-   scope is keyed to the current directory); an existing registration is left
-   alone; a failed add is a warning, never a failure. With only Codex detected
+   scope is keyed to the current directory, so from anywhere else `init` prints
+   `cd <root> && …` and neither adds nor claims a registration status — a list
+   read elsewhere describes that directory, not this repository); an existing
+   registration at the root is left alone; a failed add is a warning, never a
+   failure. With only Codex detected
    it prints `codex mcp add fishhawk-http --url <url>/mcp`; with neither, or
    under `--skip-mcp-register`, it prints the Claude Code command. Every branch
    prints the exact command.

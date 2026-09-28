@@ -192,10 +192,29 @@ func checkCharterRubric(charter []byte) error {
 	return nil
 }
 
+// Identifier shapes renderConnection accepts for the two free-text
+// connection scalars. Both are UNTRUSTED input — the CLI's --project-owner /
+// --gitlab-project and the MCP tool's project_owner / gitlab_project — and
+// the incomplete GitHub branch renders the owner into a COMMENTED block,
+// where a value carrying a newline would end the comment and turn the
+// remainder into live YAML (an "acme\nproject:\n  owner: attacker\n
+// number: 7" payload activating a connection the operator never
+// configured). Quoting cannot defend a comment, so the scalars are instead
+// constrained to the character set a real forge identifier can hold: no
+// newline, no ':', '#' or '"', hence no way for supplied text to become
+// YAML structure in EITHER the live or the commented rendering.
+var (
+	projectOwnerPattern  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9-]{0,38}$`)
+	gitLabProjectPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*(?:/[A-Za-z0-9][A-Za-z0-9._-]*)+$`)
+)
+
 // renderConnection renders the provider connection block.
 func renderConnection(opts Options) (string, error) {
 	switch opts.Provider {
 	case ProviderGitLab:
+		if opts.GitLabProject != "" && !gitLabProjectPattern.MatchString(opts.GitLabProject) {
+			return "", fmt.Errorf("scaffold: invalid gitlab project %q: want a namespaced path like group/project (letters, digits, '.', '_', '-' and '/')", opts.GitLabProject)
+		}
 		if opts.GitLabProject == "" {
 			return "# GitLab connection. No project override: filed issues land in this\n" +
 				"# repository's own owner/name project path.\n" +
@@ -204,6 +223,9 @@ func renderConnection(opts Options) (string, error) {
 		return "# GitLab connection: the namespaced project filed issues land in.\n" +
 			"gitlab:\n  project: " + yamlQuote(opts.GitLabProject), nil
 	case ProviderGitHubProjects:
+		if opts.ProjectOwner != "" && !projectOwnerPattern.MatchString(opts.ProjectOwner) {
+			return "", fmt.Errorf("scaffold: invalid project owner %q: want a forge login of at most 39 letters, digits or '-'", opts.ProjectOwner)
+		}
 		ownerType := opts.ProjectOwnerType
 		if ownerType == "" {
 			ownerType = "user"
