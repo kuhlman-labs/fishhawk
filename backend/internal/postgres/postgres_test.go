@@ -2662,6 +2662,107 @@ func TestMigrateDown_CampaignsAwaitingHumanReversal(t *testing.T) {
 	}
 }
 
+// TestMigrateDown_DecisionIndexReversal pins 0088 (E75.2 / #3730, ADR-082):
+// after MigrateUp decision_index exists under ENABLE + FORCE row-level
+// security with ONE decision_index_tenant_isolation policy whose USING and
+// WITH CHECK predicates are identical to audit_entries' 0057 policy (the
+// comparison reads pg_policies for BOTH tables, so a drifted predicate on
+// either side reddens it); after rolling back through 0088 the policy and the
+// table are gone, the schema lands on 0087, and a row in the table 0087 widened
+// (campaigns, state 'awaiting_human') survives — the down migration touches
+// only its own derived table.
+func TestMigrateDown_DecisionIndexReversal(t *testing.T) {
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+	ctx := context.Background()
+
+	var rowSec, forceSec bool
+	if err := pool.QueryRow(ctx,
+		`SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE relname = 'decision_index'`,
+	).Scan(&rowSec, &forceSec); err != nil {
+		t.Fatalf("query decision_index pg_class RLS flags (0088 table missing?): %v", err)
+	}
+	if !rowSec || !forceSec {
+		t.Errorf("decision_index relrowsecurity=%v relforcerowsecurity=%v after MigrateUp, want true/true (0088 ENABLE + FORCE)", rowSec, forceSec)
+	}
+	policyPredicates := func(table, policy string) (qual, check string) {
+		t.Helper()
+		if err := pool.QueryRow(ctx,
+			`SELECT qual, with_check FROM pg_policies WHERE tablename = $1 AND policyname = $2`,
+			table, policy,
+		).Scan(&qual, &check); err != nil {
+			t.Fatalf("read %s.%s from pg_policies: %v", table, policy, err)
+		}
+		return qual, check
+	}
+	diQual, diCheck := policyPredicates("decision_index", "decision_index_tenant_isolation")
+	aeQual, aeCheck := policyPredicates("audit_entries", "audit_entries_tenant_isolation")
+	if diQual != aeQual || diCheck != aeCheck {
+		t.Errorf("decision_index policy predicates drifted from audit_entries':\n USING      %q\n want       %q\n WITH CHECK %q\n want       %q",
+			diQual, aeQual, diCheck, aeCheck)
+	}
+
+	// Seed the table so the DROP is exercised against real data, and a row in
+	// the table one migration below so its survival is observable.
+	runID := uuid.New()
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, state, runner_kind)
+		 VALUES ($1, 'r', 'feature_change', 'sha', 'cli', 'running', 'local')`, runID,
+	); err != nil {
+		t.Fatalf("seed run: %v", err)
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO decision_index (source_sequence, source_entry_hash, run_id, repo, workflow_id,
+		     doctrine_version, decision_class, decided_at, reason_sequence)
+		 VALUES (1, 'h', $1, 'r', 'feature_change', 'sha', 'plan_approval', now(), 1)`, runID,
+	); err != nil {
+		t.Fatalf("seed decision_index row after MigrateUp: %v", err)
+	}
+	campaignID := uuid.New()
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO campaigns (id, repo, epic_ref, state) VALUES ($1, 'r', 'issue:3730', 'awaiting_human')`,
+		campaignID,
+	); err != nil {
+		t.Fatalf("seed 0087 campaign: %v", err)
+	}
+
+	// Roll back through 0088, the reversal under test. downThrough asserts the
+	// schema lands on 0087.
+	downThrough(t, url, "0088")
+
+	var tables, policies int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'decision_index'`,
+	).Scan(&tables); err != nil {
+		t.Fatalf("count decision_index tables after rollback: %v", err)
+	}
+	if tables != 0 {
+		t.Errorf("decision_index table count after rollback = %d, want 0", tables)
+	}
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM pg_policies WHERE policyname = 'decision_index_tenant_isolation'`,
+	).Scan(&policies); err != nil {
+		t.Fatalf("count decision_index policy after rollback: %v", err)
+	}
+	if policies != 0 {
+		t.Errorf("decision_index_tenant_isolation policy count after rollback = %d, want 0", policies)
+	}
+	var state string
+	if err := pool.QueryRow(ctx, `SELECT state FROM campaigns WHERE id = $1`, campaignID).Scan(&state); err != nil {
+		t.Fatalf("re-read 0087 campaign after rolling back 0088: %v", err)
+	}
+	if state != "awaiting_human" {
+		t.Errorf("0087 campaign state after rolling back 0088 = %q, want awaiting_human (untouched)", state)
+	}
+}
+
 // TestMigrateDown_ApprovalConditionsTruncatedUniqueReversal pins 0068 (#2622,
 // E67.25): the partial unique index
 // audit_entries_approval_conditions_truncated_once_idx must be PRESENT after
