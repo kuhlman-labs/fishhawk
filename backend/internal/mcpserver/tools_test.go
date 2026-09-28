@@ -16339,3 +16339,130 @@ func TestGetRunStatus_GroomingApplyStatus_UndecodableMutationRowOmits(t *testing
 		t.Errorf("GroomingApplyStatus = %+v, want nil on an undecodable ledger row", st)
 	}
 }
+
+// TestRejectPlan_RejectClass_PlumbedToSubmitApproval pins the #3729 wire hop
+// on the MCP side: the tool's reject_class input reaches the POSTed approvals
+// body. Deleting the `in.RejectClass` argument at the rejectPlan call site (it
+// would still compile as "") reddens this.
+func TestRejectPlan_RejectClass_PlumbedToSubmitApproval(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	seedPlanStage(fb, runID)
+	withFakeGh(t, "kuhlman-labs")
+
+	if _, _, err := r.rejectPlan(context.Background(), nil, RejectPlanInput{
+		RunID:       runID.String(),
+		Reason:      "the test strategy does not pin the control",
+		RejectClass: "verification",
+	}); err != nil {
+		t.Fatalf("rejectPlan: %v", err)
+	}
+	if fb.approvalsBody.RejectClass != "verification" {
+		t.Errorf("posted reject_class = %q, want verification", fb.approvalsBody.RejectClass)
+	}
+	if fb.approvalsBody.Decision != "reject" {
+		t.Errorf("decision = %q, want reject", fb.approvalsBody.Decision)
+	}
+}
+
+// TestRejectPlan_NoRejectClass_PostsEmpty pins the other direction: a reject
+// carrying no class posts none, so the body stays byte-identical to pre-#3729.
+func TestRejectPlan_NoRejectClass_PostsEmpty(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	seedPlanStage(fb, runID)
+	withFakeGh(t, "kuhlman-labs")
+
+	if _, _, err := r.rejectPlan(context.Background(), nil, RejectPlanInput{
+		RunID:  runID.String(),
+		Reason: "wrong fork",
+	}); err != nil {
+		t.Fatalf("rejectPlan: %v", err)
+	}
+	if fb.approvalsBody.RejectClass != "" {
+		t.Errorf("posted reject_class = %q, want empty on a classless reject", fb.approvalsBody.RejectClass)
+	}
+}
+
+// TestApprovePlan_NeverPostsRejectClass pins that the approve path passes ""
+// rather than leaking a class onto an approve body (which the backend refuses
+// 400 reject_class_requires_reject).
+func TestApprovePlan_NeverPostsRejectClass(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+	seedPlanStage(fb, runID)
+	withFakeGh(t, "kuhlman-labs")
+
+	if _, _, err := r.approvePlan(context.Background(), nil, ApprovePlanInput{
+		RunID:  runID.String(),
+		Reason: "looks right",
+	}); err != nil {
+		t.Fatalf("approvePlan: %v", err)
+	}
+	if fb.approvalsBody.RejectClass != "" {
+		t.Errorf("approve posted reject_class = %q, want empty", fb.approvalsBody.RejectClass)
+	}
+}
+
+// TestRejectPlanInputSchema_DeclaresRejectClass pins the operator-facing
+// surface: the property is visible over ListTools and its description names
+// the closed set AND directs decomposition at the --decompose marker
+// (operator binding condition 2).
+func TestRejectPlanInputSchema_DeclaresRejectClass(t *testing.T) {
+	ctx := context.Background()
+	cfg := config{backendURL: "http://localhost:8080", apiToken: "tok"}
+	srv := buildServer(cfg)
+	registerTools(srv, &runResolver{api: newAPIClient(cfg), getenv: envFuncFromMap(nil)})
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := srv.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	defer serverSession.Close()
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	defer clientSession.Close()
+
+	res, err := clientSession.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	var tool *mcp.Tool
+	for _, tl := range res.Tools {
+		if tl.Name == "fishhawk_reject_plan" {
+			tool = tl
+			break
+		}
+	}
+	if tool == nil {
+		t.Fatal("fishhawk_reject_plan is not registered/visible over ListTools")
+	}
+	schemaMap, ok := any(tool.InputSchema).(map[string]any)
+	if !ok {
+		t.Fatalf("fishhawk_reject_plan InputSchema is %T, want a JSON object map", tool.InputSchema)
+	}
+	props, ok := schemaMap["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("fishhawk_reject_plan schema has no properties object; got %v", schemaMap["properties"])
+	}
+	prop, ok := props["reject_class"].(map[string]any)
+	if !ok {
+		t.Fatalf("fishhawk_reject_plan input schema missing property reject_class; got %v", props)
+	}
+	desc, _ := prop["description"].(string)
+	for _, want := range []string{"scope", "approach", "verification", "other", "--decompose"} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("reject_class description must mention %q; got:\n%s", want, desc)
+		}
+	}
+	if !strings.Contains(tool.Description, "--decompose") {
+		t.Errorf("fishhawk_reject_plan description must direct decomposition at the --decompose marker; got:\n%s", tool.Description)
+	}
+}

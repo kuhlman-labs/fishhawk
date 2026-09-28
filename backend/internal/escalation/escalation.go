@@ -198,3 +198,135 @@ func Fingerprint(res Result) string {
 	sum := sha256.Sum256([]byte(RenderFired(res)))
 	return hex.EncodeToString(sum[:])
 }
+
+// RuleKeyBytes is the hex length of a RuleKey: the leading 8 bytes of the
+// sha256 over the canonical rendering, which is short enough to read in an
+// audit payload and wide enough that a collision between two declarations in
+// one workflow document is not a practical concern.
+const RuleKeyBytes = 16
+
+// RuleKey is the STABLE, content-derived key for ONE escalation declaration —
+// the join key a decision index uses to follow a rule across workflow-document
+// edits, where the positional Index cannot.
+//
+// It is derived from the DECLARATION'S OWN CONTENT ALONE and carries NO
+// positional index, which gives it exactly these properties:
+//
+//   - REORDERING unrelated declarations leaves a matched rule's key unchanged
+//     (the defect the positional index has, and the reason this is not built
+//     on RenderFired or Fingerprint — both are RESULT-level and both embed
+//     "escalation <i>", so a key derived from either would move on an
+//     unrelated reorder);
+//   - editing ANOTHER rule leaves this rule's key unchanged;
+//   - editing THIS rule's globs, labels, change kinds, triggers or `require`
+//     clamp CHANGES its key — a rule whose meaning moved is a different rule.
+//
+// Within one rule each match criterion's list is SORTED before hashing,
+// because spec.Predicate evaluates each list as an unordered OR: permuting
+// globs inside one rule is not a change to what the rule matches, so it must
+// not move the key. The sort operates on copies, so RuleKey never mutates its
+// argument (the parsed spec.Workflow is shared across gate evaluations). Each
+// element is additionally LENGTH-PREFIXED before it is joined, so a value
+// carrying the renderer's own delimiters cannot make two DIFFERENT
+// declarations key identically — see renderRuleForKey.
+//
+// RuleKey is NOT Fingerprint. Fingerprint is the RESULT-level de-duplication
+// key over a whole evaluation (what fired plus what was composed); RuleKey is
+// the RULE-level content key for one declaration.
+func RuleKey(e spec.Escalation) string {
+	sum := sha256.Sum256([]byte(renderRuleForKey(e)))
+	return hex.EncodeToString(sum[:])[:RuleKeyBytes]
+}
+
+// renderRuleForKey is RuleKey's canonical rendering of one declaration. It is
+// deliberately NOT renderPredicate: that renderer is operator-facing and
+// preserves the author's declared ORDER (a reader wants to see what they
+// wrote), while this one canonicalizes the order away, renders the `require`
+// clamp, and — unlike the operator-facing renderer — is INJECTIVE. Keeping
+// them separate is what lets RenderFired stay byte-identical while the key
+// gains its stability contract.
+//
+// INJECTIVITY is the property the key rests on, and a plain delimiter-joined
+// rendering does not have it: `paths: ["a,b"]` and `paths: ["a", "b"]` are two
+// DIFFERENT declarations (the first matches one glob containing a comma, the
+// second matches either of two globs) that both render `paths=a,b` under a
+// bare comma join, and would therefore share a RuleKey — a decision index
+// following one rule would silently follow the other. The same hazard exists
+// one level up, where a value carrying a space and a ` labels=` prefix could
+// forge a second field in a space-joined part list, and again on the scalar
+// `require.approvals.member_of`, which is free-form operator text.
+//
+// So EVERY atom — each element of every criterion list, and each rendered
+// field — is LENGTH-PREFIXED as `<byte-len>:<value>` before it is joined. A
+// length prefix is self-delimiting: the decoder (which does not exist; only
+// the hash consumes this) could recover the exact atom boundaries regardless
+// of what bytes an atom contains, which is precisely the statement that two
+// distinct declarations cannot render identically. The joining delimiters are
+// retained purely for legibility when debugging a key.
+func renderRuleForKey(e spec.Escalation) string {
+	var parts []string
+	field := func(name, value string) {
+		parts = append(parts, encodeAtom(name+"="+value))
+	}
+	if len(e.Match.Paths) > 0 {
+		field("paths", joinSorted(e.Match.Paths))
+	}
+	if len(e.Match.Labels) > 0 {
+		field("labels", joinSorted(e.Match.Labels))
+	}
+	if len(e.Match.ChangeKinds) > 0 {
+		field("change_kind", joinSorted(e.Match.ChangeKinds))
+	}
+	if len(e.Match.Triggers) > 0 {
+		forms := make([]string, len(e.Match.Triggers))
+		for i, t := range e.Match.Triggers {
+			forms[i] = string(t)
+		}
+		field("trigger", joinSorted(forms))
+	}
+	if len(parts) == 0 {
+		parts = append(parts, encodeAtom("no criterion"))
+	}
+	if a := e.Require.Approvals; a != nil {
+		if a.Count != nil {
+			field("require.approvals.count", fmt.Sprintf("%d", *a.Count))
+		}
+		if a.MemberOf != "" {
+			field("require.approvals.member_of", a.MemberOf)
+		}
+		if a.MinPermission != "" {
+			field("require.approvals.min_permission", a.MinPermission)
+		}
+	}
+	if e.Require.MaxAutonomy != "" {
+		field("require.max_autonomy", string(e.Require.MaxAutonomy))
+	}
+	return strings.Join(parts, " ")
+}
+
+// joinSorted renders one unordered-OR criterion list canonically: a SORTED
+// COPY of its LENGTH-PREFIXED elements, joined. The copy is load-bearing — an
+// in-place sort would mutate the caller's parsed spec.Workflow. The
+// length-prefixing is what makes the join injective: without it ["a,b"] and
+// ["a","b"] render identically (see renderRuleForKey's header). Sorting the
+// ENCODED elements rather than the raw ones is a different total order than
+// sorting the raw ones, which is immaterial — the contract is only that a
+// permutation of one rule's list does not move the key, and any total order
+// computed from the elements alone satisfies it.
+func joinSorted(vals []string) string {
+	cp := make([]string, len(vals))
+	for i, v := range vals {
+		cp[i] = encodeAtom(v)
+	}
+	sort.Strings(cp)
+	return strings.Join(cp, ",")
+}
+
+// encodeAtom renders one atom self-delimitingly as `<byte-len>:<value>`. It is
+// the single primitive the canonical rule rendering's injectivity rests on: a
+// reader that knows the length can recover the atom whatever bytes it holds,
+// so no atom can impersonate a delimiter, a field boundary or a neighbouring
+// atom.
+func encodeAtom(s string) string {
+	return fmt.Sprintf("%d:%s", len(s), s)
+}

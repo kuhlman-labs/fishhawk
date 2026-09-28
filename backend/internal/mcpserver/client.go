@@ -1418,6 +1418,17 @@ type StartRunParams struct {
 type approvalRequest struct {
 	Decision string `json:"decision"`
 	Comment  string `json:"comment,omitempty"`
+	// RejectClass is the structured plan-rejection class (E75.1 / #3729): the
+	// closed set scope | approach | verification | other, validated
+	// server-side and recorded verbatim on the approval_submitted audit
+	// payload. The json tag MUST byte-match the backend's approvalRequest
+	// field or the class is silently dropped and never lands — the
+	// hand-maintained-wire-mirror trap the adjacent fields warn about. The
+	// DisallowUnknownFields decoder requires the field be declared here too;
+	// approve and classless-reject callers pass "" (omitempty), so those
+	// bodies stay byte-identical. Decomposition is requested with the
+	// `--decompose` comment marker, NOT with this field.
+	RejectClass string `json:"reject_class,omitempty"`
 	// ApproverGithubLogin is the resolved GitHub login of the acting
 	// operator (#751), threaded through so the issue-thread status
 	// footer `@`-mentions the real login rather than the raw token
@@ -1526,11 +1537,17 @@ type approvalResult struct {
 // plan-stage concern ids this approval's binding condition answers (#1956) the
 // backend validates pre-Submit (approve-only, plan-stage-only, open plan-stage
 // concerns of the same run) and records on the approval audit payload; nil on
-// reject and claim-less approve. Returns the updated Stage. 4xx
+// reject and claim-less approve. `rejectClass` is the structured plan-rejection
+// class (#3729) — one of scope | approach | verification | other — recorded
+// verbatim on the approval_submitted audit payload; "" on approve and on a
+// classless reject, and decomposition is requested with the `--decompose`
+// comment marker rather than with this field. Returns the updated Stage. 4xx
 // surfaces:
 //   - 400 validation_failed (decision other than approve/reject; a malformed
 //     binding_assertions declaration — unknown type, empty literal, a
-//     test_asserts path not ending in _test.go)
+//     test_asserts path not ending in _test.go; a reject_class outside the
+//     closed set, or a non-empty reject_class on an approve —
+//     details.rule=reject_class_requires_reject)
 //   - 404 stage_not_found
 //   - 409 review_stage_managed_by_github (review-stage approvals
 //     live on GitHub per ADR-018; not relevant for the MCP plan-
@@ -1638,7 +1655,7 @@ type approvalResult struct {
 //     deployment's per-adapter allow-list; details carry model,
 //     model_source, and adapter. Pre-insert: retry with an allowed
 //     implement_model, or widen the allow-list)
-func (c *apiClient) SubmitApproval(ctx context.Context, stageID uuid.UUID, decision, comment, approverGithubLogin string, addScopeFiles, removeScopeFiles []string, addScopeFilesToSlice, moveScopeFilesToSlice map[string][]string, bindingAssertions []BindingAssertion, claimsConcernIDs []string, claimsAllOpenPlanConcerns bool, amendAcceptanceCriteria []AcceptanceCriteriaAmendment, implementModel string) (*approvalResult, error) {
+func (c *apiClient) SubmitApproval(ctx context.Context, stageID uuid.UUID, decision, comment, approverGithubLogin string, addScopeFiles, removeScopeFiles []string, addScopeFilesToSlice, moveScopeFilesToSlice map[string][]string, bindingAssertions []BindingAssertion, claimsConcernIDs []string, claimsAllOpenPlanConcerns bool, amendAcceptanceCriteria []AcceptanceCriteriaAmendment, implementModel, rejectClass string) (*approvalResult, error) {
 	body, err := json.Marshal(approvalRequest{
 		Decision:                  decision,
 		Comment:                   comment,
@@ -1652,6 +1669,7 @@ func (c *apiClient) SubmitApproval(ctx context.Context, stageID uuid.UUID, decis
 		ClaimsAllOpenPlanConcerns: claimsAllOpenPlanConcerns,
 		AmendAcceptanceCriteria:   amendAcceptanceCriteria,
 		ImplementModel:            implementModel,
+		RejectClass:               rejectClass,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("marshal approval: %w", err)

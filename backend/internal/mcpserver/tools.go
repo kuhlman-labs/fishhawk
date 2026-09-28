@@ -4283,6 +4283,12 @@ type ApprovePlanOutput struct {
 type RejectPlanInput struct {
 	RunID  string `json:"run_id" jsonschema:"the Fishhawk run UUID whose plan stage is being rejected"`
 	Reason string `json:"reason,omitempty" jsonschema:"reviewer rationale; recommended on rejects (the CLI warns when missing). Propagates to a fresh run's plan as prior-rejection feedback. Budget: 12000 bytes (measured in bytes, not characters) — a longer reason is NOT refused (unlike an over-cap approve condition), but its tail is elided from the replanning agent's prompt behind an explicit truncation marker, and this tool returns a warning naming the overflow. To keep long steering intact, split it or move it into the next approve's binding conditions"`
+	// RejectClass is the OPTIONAL structured classification of this rejection
+	// (E75.1 / #3729), recorded verbatim on the approval_submitted audit
+	// payload so a decision index can aggregate WHY plans get rejected. It is
+	// a recording dimension only: it changes no gate behaviour and injects no
+	// prompt hint. Absent indexes as unclassified.
+	RejectClass string `json:"reject_class,omitempty" jsonschema:"OPTIONAL structured classification of this rejection, recorded verbatim on the run's approval_submitted audit entry so rejections can be aggregated by kind. Closed set: scope (the plan's file scope is wrong), approach (the design or method is wrong), verification (the test strategy or done-means is inadequate), other. Any other value is refused 400 and the refusal names the allowed values. Absent indexes as unclassified — omit it rather than guessing. DECOMPOSITION IS NOT REQUESTED HERE: include the --decompose marker in the reason, which is what sets reject_reason=decompose_required and injects the decomposed-replan hint; reject_class injects no hint at all"`
 }
 
 // RejectPlanOutput mirrors ApprovePlanOutput.
@@ -4490,6 +4496,17 @@ this tool returns a warning naming the overflow — keep steering
 that must survive under the budget, or route it into the next
 approve's binding conditions.
 
+reject_class is an OPTIONAL structured classification of the
+rejection, recorded verbatim on the run's approval_submitted audit
+entry so rejections can be aggregated by kind. Closed set: scope,
+approach, verification, other — any other value is refused 400 with
+the allowed values named. Absent indexes as unclassified; omit it
+rather than guessing. It is a recording dimension only: it changes
+no gate behaviour and injects nothing into the replan prompt. To
+request a DECOMPOSED replan, include the --decompose marker in the
+reason — that marker, not reject_class, sets
+reject_reason=decompose_required and injects the decompose hint.
+
 Same resolver + error shapes as fishhawk_approve_plan.
 `),
 	}, resolver.rejectPlan)
@@ -4595,7 +4612,7 @@ func (r *runResolver) approvePlan(ctx context.Context, _ *mcp.CallToolRequest, i
 	// warning on the tool result and an empty login — never a blocked
 	// approval.
 	login, warn := resolveApproverGithubLogin()
-	updated, err := r.api.SubmitApproval(ctx, stageID, "approve", in.Reason, login, in.AddScopeFiles, in.RemoveScopeFiles, in.AddScopeFilesToSlice, in.MoveScopeFilesToSlice, in.BindingAssertions, in.ClaimsConcernIDs, in.ClaimsAllOpenPlanConcerns, in.AmendAcceptanceCriteria, in.ImplementModel)
+	updated, err := r.api.SubmitApproval(ctx, stageID, "approve", in.Reason, login, in.AddScopeFiles, in.RemoveScopeFiles, in.AddScopeFilesToSlice, in.MoveScopeFilesToSlice, in.BindingAssertions, in.ClaimsConcernIDs, in.ClaimsAllOpenPlanConcerns, in.AmendAcceptanceCriteria, in.ImplementModel, "")
 	if err != nil {
 		// ADR-036 (#875): the backend refuses the approve while a
 		// configured agent plan review is still in-flight. Surface this
@@ -4663,7 +4680,7 @@ func (r *runResolver) rejectPlan(ctx context.Context, _ *mcp.CallToolRequest, in
 	// so this NEVER refuses the submit: warn-on-reject / refuse-on-approve is a
 	// deliberate asymmetry, not an inconsistency.
 	warn = mergeRejectWarnings(warn, rejectReasonOverBudgetWarning(in.Reason))
-	updated, err := r.api.SubmitApproval(ctx, stageID, "reject", in.Reason, login, nil, nil, nil, nil, nil, nil, false, nil, "")
+	updated, err := r.api.SubmitApproval(ctx, stageID, "reject", in.Reason, login, nil, nil, nil, nil, nil, nil, false, nil, "", in.RejectClass)
 	if err != nil {
 		return nil, RejectPlanOutput{}, fmt.Errorf("submit approval: %w", err)
 	}
@@ -4772,7 +4789,7 @@ func (r *runResolver) approveDeploy(ctx context.Context, _ *mcp.CallToolRequest,
 	// Resolve the operator's real GitHub login best-effort (#751); see
 	// approvePlan. Empty on gh failure, never fatal.
 	login, warn := resolveApproverGithubLogin()
-	updated, err := r.api.SubmitApproval(ctx, stageID, "approve", comment, login, nil, nil, nil, nil, nil, nil, false, nil, "")
+	updated, err := r.api.SubmitApproval(ctx, stageID, "approve", comment, login, nil, nil, nil, nil, nil, nil, false, nil, "", "")
 	if err != nil {
 		// The deploy pre-flight 422s (deploy_environment_not_allowed,
 		// deploy_change_freeze_active, deploy_upstream_not_satisfied) and the
@@ -4803,7 +4820,7 @@ func (r *runResolver) rejectDeploy(ctx context.Context, _ *mcp.CallToolRequest, 
 		return nil, RejectDeployOutput{}, fmt.Errorf("resolved deploy stage has invalid id %q: %w", deployStage.ID, err)
 	}
 	login, warn := resolveApproverGithubLogin()
-	updated, err := r.api.SubmitApproval(ctx, stageID, "reject", in.Reason, login, nil, nil, nil, nil, nil, nil, false, nil, "")
+	updated, err := r.api.SubmitApproval(ctx, stageID, "reject", in.Reason, login, nil, nil, nil, nil, nil, nil, false, nil, "", "")
 	if err != nil {
 		return nil, RejectDeployOutput{}, fmt.Errorf("submit deploy rejection: %w", err)
 	}

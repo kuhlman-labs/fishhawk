@@ -49,6 +49,26 @@ const AuditCompleteCheckName = "fishhawk_audit_complete"
 type approvalRequest struct {
 	Decision string `json:"decision"`
 	Comment  string `json:"comment,omitempty"`
+	// RejectClass is the OPTIONAL structured classification of a plan
+	// rejection (E75.1 / #3729): the closed set scope | approach |
+	// verification | other. It is a RECORDING dimension only — it is
+	// validated as a pure input check ahead of the stage fetch and recorded
+	// verbatim on the approval_submitted audit payload under `reject_class`,
+	// and it changes no gate behaviour and triggers no replan hint.
+	//
+	// It is deliberately ORTHOGONAL to the existing `reject_reason:
+	// decompose_required` key, which the `--decompose` comment marker sets and
+	// prompt.go reads back as the decomposed-replan hint. Decomposition is
+	// requested with that marker, NOT with reject_class — a class named
+	// decompose_required that did not actually trigger a decomposed replan
+	// would be a trap, so it is NOT in the closed set and is refused 400 like
+	// any other unknown value.
+	//
+	// Absent, and the explicitly-empty string, both record NO key, so every
+	// existing row and every existing caller's body stay byte-identical and an
+	// unclassified rejection indexes as unclassified. Declared here so the
+	// DisallowUnknownFields decode accepts it; callers omit it (omitempty).
+	RejectClass string `json:"reject_class,omitempty"`
 	// ApproverGithubLogin is the resolved GitHub login of the acting
 	// operator, threaded through by the MCP approve/reject tools (#751)
 	// so the issue-thread status footer `@`-mentions the real login
@@ -288,6 +308,59 @@ func validateApprovalComment(decision approval.Decision, comment string) (ok boo
 	}
 }
 
+// rejectClasses is the CLOSED set a `reject_class` must name (E75.1 / #3729).
+//
+// `decompose_required` is deliberately ABSENT (operator binding condition 2):
+// decomposition is requested with the existing `--decompose` comment marker,
+// which writes `reject_reason: decompose_required` and is what actually
+// injects the decomposed-replan hint into the next plan prompt. A reject_class
+// of the same name would record the intent WITHOUT triggering the replan — a
+// trap for the operator — so it is refused 400 like any other unknown value.
+var rejectClasses = []string{"scope", "approach", "verification", "other"}
+
+// validateRejectClass is a PURE input check on the optional `reject_class`
+// field. It has no side effects and reads no state, which is why
+// handleSubmitApproval calls it ahead of the stage fetch: a refusal inserts no
+// approval row and advances nothing.
+//
+// Three outcomes:
+//   - empty (absent, or an explicit "") is ALWAYS admissible — it records no
+//     key, so a classless reject stays byte-identical to today;
+//   - non-empty on a decision other than reject is refused
+//     (rule=reject_class_requires_reject): an approve has no rejection to
+//     classify, so accepting one would record a meaningless dimension;
+//   - non-empty and outside rejectClasses is refused with a message NAMING
+//     every allowed value, so the operator can correct it without reading the
+//     source or the OpenAPI document.
+func validateRejectClass(decision approval.Decision, rejectClass string) (ok bool, message string, details map[string]any) {
+	if rejectClass == "" {
+		return true, "", nil
+	}
+	if decision != approval.DecisionReject {
+		return false, fmt.Sprintf(
+				"reject_class is only meaningful on a reject decision; got decision=%q. Drop reject_class, or submit the decision as a reject",
+				string(decision)),
+			map[string]any{
+				"field": "reject_class",
+				"rule":  "reject_class_requires_reject",
+				"got":   rejectClass,
+			}
+	}
+	for _, allowed := range rejectClasses {
+		if rejectClass == allowed {
+			return true, "", nil
+		}
+	}
+	return false, fmt.Sprintf(
+			"reject_class %q is not one of the allowed values: %s. Decomposition is NOT requested with reject_class — include the --decompose marker in the comment, which sets reject_reason=decompose_required and injects the decomposed-replan hint",
+			rejectClass, strings.Join(rejectClasses, ", ")),
+		map[string]any{
+			"field":   "reject_class",
+			"got":     rejectClass,
+			"allowed": rejectClasses,
+		}
+}
+
 // handleSubmitApproval implements POST /v0/stages/{stage_id}/approvals.
 //
 // Per the OpenAPI contract:
@@ -360,6 +433,15 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 	// PriorRejectionFeedback channel, not binding conditions, so an over-cap
 	// reject stays admissible.
 	if ok, msg, details := validateApprovalComment(decision, req.Comment); !ok {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed", msg, details)
+		return
+	}
+
+	// Structured plan-rejection class (E75.1 / #3729). A PURE input check with
+	// no side effects, placed here — beside validateApprovalComment and AHEAD
+	// of the stage fetch — so an unknown or misplaced value never inserts an
+	// approval row and never advances the gate.
+	if ok, msg, details := validateRejectClass(decision, req.RejectClass); !ok {
 		s.writeError(w, r, http.StatusBadRequest, "validation_failed", msg, details)
 		return
 	}
@@ -862,6 +944,7 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 		ClaimsConcernIDs:          effectiveClaimsConcernIDs,
 		ClaimsAllOpenPlanConcerns: req.ClaimsAllOpenPlanConcerns,
 		AmendAcceptanceCriteria:   amendAcceptanceCriteria,
+		RejectClass:               req.RejectClass,
 		DelegatedRule:             delegatedRule,
 		ResolvedModel:             resolvedModel,
 		PlanModel:                 req.PlanModel,
@@ -1014,10 +1097,15 @@ type approveActionParams struct {
 	// campaign auto-driver leaves it nil. Only a PLAN-stage approve can carry a
 	// non-empty value — the gate refuses the channel everywhere else.
 	AmendAcceptanceCriteria []acceptanceCriteriaAmendment
-	DelegatedRule           string
-	ResolvedModel           *ResolvedModel
-	PlanModel               string
-	ReviewModel             string
+	// RejectClass is the validated structured rejection class (E75.1 / #3729),
+	// or "" when the request carried none. Recorded verbatim on the
+	// approval_submitted payload for a REJECT only; the in-process campaign
+	// auto-driver leaves it empty, so its rows stay byte-identical.
+	RejectClass   string
+	DelegatedRule string
+	ResolvedModel *ResolvedModel
+	PlanModel     string
+	ReviewModel   string
 	// PredicateResolution, when non-nil, carries the forge-resolved
 	// min_permission / member_of values a satisfied approval-gate predicate
 	// resolution produced (E39.5 / #1710). The HTTP handler stashes it from
@@ -1160,7 +1248,7 @@ func (s *Server) approveStageAs(ctx context.Context, id Identity, p approveActio
 				// vote), and the stage stays awaiting_approval until the
 				// baseline is readable again. No predicate_snapshot — nothing
 				// about the effective requirement is known to snapshot.
-				s.writeApprovalAudit(ctx, p.Stage, res.Approval, p.Comment, p.ApproverGithubLogin, p.AddScopeFiles, p.RemoveScopeFiles, p.SliceAddScopeFiles, p.SliceMoveScopeFiles, p.SliceMovesResolved, p.BindingAssertions, p.ClaimsConcernIDs, p.ClaimsAllOpenPlanConcerns, p.AmendAcceptanceCriteria, p.DelegatedRule, id.AuthMethod, channel, onBehalfOf, nil)
+				s.writeApprovalAudit(ctx, p.Stage, res.Approval, p.Comment, p.ApproverGithubLogin, p.AddScopeFiles, p.RemoveScopeFiles, p.SliceAddScopeFiles, p.SliceMoveScopeFiles, p.SliceMovesResolved, p.BindingAssertions, p.ClaimsConcernIDs, p.ClaimsAllOpenPlanConcerns, p.AmendAcceptanceCriteria, p.DelegatedRule, id.AuthMethod, channel, onBehalfOf, p.RejectClass, nil)
 				s.notifyStatusUpdate(ctx, p.Stage.RunID, "approval_submit")
 				return &approveActionResult{Stage: p.Stage}, nil
 			}
@@ -1170,7 +1258,7 @@ func (s *Server) approveStageAs(ctx context.Context, id Identity, p approveActio
 		// enrichment (ADR-055 record leg) on the approval_submitted row. No
 		// predicate_snapshot — the gate declares no approvals block
 		// (operator binding condition 2).
-		s.writeApprovalAudit(ctx, p.Stage, res.Approval, p.Comment, p.ApproverGithubLogin, p.AddScopeFiles, p.RemoveScopeFiles, p.SliceAddScopeFiles, p.SliceMoveScopeFiles, p.SliceMovesResolved, p.BindingAssertions, p.ClaimsConcernIDs, p.ClaimsAllOpenPlanConcerns, p.AmendAcceptanceCriteria, p.DelegatedRule, id.AuthMethod, channel, onBehalfOf, nil)
+		s.writeApprovalAudit(ctx, p.Stage, res.Approval, p.Comment, p.ApproverGithubLogin, p.AddScopeFiles, p.RemoveScopeFiles, p.SliceAddScopeFiles, p.SliceMoveScopeFiles, p.SliceMovesResolved, p.BindingAssertions, p.ClaimsConcernIDs, p.ClaimsAllOpenPlanConcerns, p.AmendAcceptanceCriteria, p.DelegatedRule, id.AuthMethod, channel, onBehalfOf, p.RejectClass, nil)
 		return s.finishApprovalAdvance(ctx, p, res)
 	}
 
@@ -1300,7 +1388,7 @@ func (s *Server) approveStageAs(ctx context.Context, id Identity, p approveActio
 	}
 	// Persist the enriched approval audit BEFORE any advance (#1351) so a
 	// dispatch racing the transition observes it. Best-effort append.
-	s.writeApprovalAudit(ctx, p.Stage, res.Approval, p.Comment, p.ApproverGithubLogin, p.AddScopeFiles, p.RemoveScopeFiles, p.SliceAddScopeFiles, p.SliceMoveScopeFiles, p.SliceMovesResolved, p.BindingAssertions, p.ClaimsConcernIDs, p.ClaimsAllOpenPlanConcerns, p.AmendAcceptanceCriteria, p.DelegatedRule, id.AuthMethod, channel, onBehalfOf, snapshot)
+	s.writeApprovalAudit(ctx, p.Stage, res.Approval, p.Comment, p.ApproverGithubLogin, p.AddScopeFiles, p.RemoveScopeFiles, p.SliceAddScopeFiles, p.SliceMoveScopeFiles, p.SliceMovesResolved, p.BindingAssertions, p.ClaimsConcernIDs, p.ClaimsAllOpenPlanConcerns, p.AmendAcceptanceCriteria, p.DelegatedRule, id.AuthMethod, channel, onBehalfOf, p.RejectClass, snapshot)
 
 	if !reached {
 		// Recorded but below quorum (or a delegated/agent submission that
@@ -2210,6 +2298,11 @@ func (s *Server) rejectReviewStageApproval(w http.ResponseWriter, r *http.Reques
 // reject_reason=decompose_required is added to the payload so the
 // next plan-stage prompt can inject a decompose-required hint.
 //
+// rejectClass, when non-empty on a REJECT, is recorded verbatim under
+// reject_class (E75.1 / #3729) — the validated closed set scope | approach |
+// verification | other. It is orthogonal to reject_reason above and injects no
+// prompt hint; an empty value records no key.
+//
 // When approverGithubLogin is non-empty (the MCP loop resolved the
 // operator's real GitHub login, #751), it is recorded under
 // approver_github_login for issue-thread `@`-mention rendering. The
@@ -2236,7 +2329,7 @@ func (s *Server) rejectReviewStageApproval(w http.ResponseWriter, r *http.Reques
 // gates with no approvals block. All new keys ride INSIDE the existing
 // hashed payload JSONB — no new top-level audit.Entry / Export v1 field — so
 // the hash chain and the E9 verifier's strict decode are unaffected.
-func (s *Server) writeApprovalAudit(ctx context.Context, stage *run.Stage, app *approval.Approval, comment, approverGithubLogin string, addScopeFiles, removeScopeFiles []string, sliceAddScopeFiles map[string][]string, sliceMoveScopeFiles map[string][]string, sliceMovesResolved []movedPath, bindingAssertions []bindingAssertion, claimsConcernIDs []string, claimsAllOpenPlanConcerns bool, amendAcceptanceCriteria []acceptanceCriteriaAmendment, delegatedRule, authMethod, channel, onBehalfOf string, snapshot *predicateSnapshot) {
+func (s *Server) writeApprovalAudit(ctx context.Context, stage *run.Stage, app *approval.Approval, comment, approverGithubLogin string, addScopeFiles, removeScopeFiles []string, sliceAddScopeFiles map[string][]string, sliceMoveScopeFiles map[string][]string, sliceMovesResolved []movedPath, bindingAssertions []bindingAssertion, claimsConcernIDs []string, claimsAllOpenPlanConcerns bool, amendAcceptanceCriteria []acceptanceCriteriaAmendment, delegatedRule, authMethod, channel, onBehalfOf, rejectClass string, snapshot *predicateSnapshot) {
 	// ADR-040 D4 (#1027): the acting subject selects the kind — an
 	// operator-agent token records agent, every other subject (human
 	// tokens, GitHub logins from the PR-review-event path) stays user.
@@ -2272,6 +2365,16 @@ func (s *Server) writeApprovalAudit(ctx context.Context, stage *run.Stage, app *
 	}
 	if app.Decision == approval.DecisionReject && strings.Contains(comment, "--decompose") {
 		auditPayload["reject_reason"] = "decompose_required"
+	}
+	// Structured rejection class (E75.1 / #3729), recorded VERBATIM on a
+	// reject that declared one. Deliberately ORTHOGONAL to the reject_reason
+	// key just above: that key is the `--decompose` marker's replan TRIGGER,
+	// which prompt.go reads back to inject the decompose hint; this one is a
+	// pure recording dimension the decision index reads and no prompt
+	// consumes. The emptiness half of the guard is what keeps a classless
+	// reject — and every approve — byte-identical to today.
+	if app.Decision == approval.DecisionReject && rejectClass != "" {
+		auditPayload["reject_class"] = rejectClass
 	}
 	if app.Decision == approval.DecisionReject && comment != "" {
 		auditPayload["rejection_comment"] = comment

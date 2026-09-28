@@ -646,3 +646,93 @@ func TestApprove_ClaimsAllOpenPlanConcerns_ListErrorReturns500(t *testing.T) {
 	}
 	assertNoApprovalRecorded(t, ar, au)
 }
+
+// --- concern KIND on the condition-addressed entry (E75.1 / #3729) ---------
+
+// seedConcernRowWithKind seeds one plan-stage concern carrying an EXPLICIT
+// severity and category. The shared seedConcernRow helper hardcodes
+// medium/scope, which cannot express the empty-value case below.
+func seedConcernRowWithKind(t *testing.T, cr *fakeConcernRepo, runID, stageID uuid.UUID, severity, category, note string) *concern.Concern {
+	t.Helper()
+	rows, err := cr.InsertRaised(context.Background(), concern.InsertRaisedParams{
+		RunID:                runID,
+		StageID:              stageID,
+		StageKind:            concern.StageKindPlan,
+		ReviewerModel:        "claude-opus-4-8",
+		OriginReviewSequence: 5,
+		Concerns:             []concern.RaisedConcern{{Severity: severity, Category: category, Note: note}},
+	})
+	if err != nil {
+		t.Fatalf("seed concern: %v", err)
+	}
+	return rows[0]
+}
+
+// conditionAddressedPayload drives ONE confirming review round over a single
+// claimed concern and returns the decoded concern_addressed_by_condition
+// payload.
+func conditionAddressedPayload(t *testing.T, severity, category string) map[string]any {
+	t.Helper()
+	s, au, cr := conditionClaimsServer(t)
+	runID, stageID := uuid.New(), uuid.New()
+	row := seedConcernRowWithKind(t, cr, runID, stageID, severity, category, "the retry cap is not enforced")
+	seedApprovalEntry(au, runID, 42, "approve", "brett", []string{row.ID.String()})
+
+	s.resolveConditionClaimedPlanConcerns(context.Background(), runID, 200, "claude-opus-4-8", "approve", nil)
+
+	idx := auditEntriesByCategory(au, CategoryConcernAddressedByCondition)
+	if len(idx) != 1 {
+		t.Fatalf("concern_addressed_by_condition entries = %d, want 1", len(idx))
+	}
+	au.mu.Lock()
+	entry := au.appended[idx[0]]
+	au.mu.Unlock()
+	var payload map[string]any
+	if err := json.Unmarshal(entry.Payload, &payload); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	return payload
+}
+
+// TestResolveConditionClaimedPlanConcerns_RecordsConcernKind is the done-means
+// for the concern-kind half of #3729: the settled concern's own category and
+// severity land on the audit payload verbatim, so a chain-only decision index
+// can join a settled concern to what KIND of concern it was. A no-op touch of
+// condition_claims.go leaves both keys absent and reddens this.
+func TestResolveConditionClaimedPlanConcerns_RecordsConcernKind(t *testing.T) {
+	payload := conditionAddressedPayload(t, "high", "authz")
+
+	if payload["category"] != "authz" {
+		t.Errorf("category = %v, want authz recorded verbatim from the concern row", payload["category"])
+	}
+	if payload["severity"] != "high" {
+		t.Errorf("severity = %v, want high recorded verbatim from the concern row", payload["severity"])
+	}
+	// The pre-existing keys are untouched — the enrichment is ADDITIVE.
+	if payload["concern_id"] == nil || payload["approval_sequence"] != float64(42) ||
+		payload["confirming_review_sequence"] != float64(200) {
+		t.Errorf("existing payload keys changed: %v", payload)
+	}
+}
+
+// TestResolveConditionClaimedPlanConcerns_ConcernKindRecordedWhenEmpty pins the
+// UNCONDITIONAL recording: a concern genuinely carrying no category/severity
+// records the keys PRESENT AND EMPTY, so a consumer can tell that apart from a
+// historical entry written before this change (where the keys are ABSENT). An
+// `omitempty` would collapse the two.
+func TestResolveConditionClaimedPlanConcerns_ConcernKindRecordedWhenEmpty(t *testing.T) {
+	payload := conditionAddressedPayload(t, "", "")
+
+	got, ok := payload["category"]
+	if !ok {
+		t.Error("category key is ABSENT for an empty-category concern; it must be present-and-empty so 'recorded and empty' stays distinguishable from 'predates the change'")
+	} else if got != "" {
+		t.Errorf("category = %v, want the empty string", got)
+	}
+	got, ok = payload["severity"]
+	if !ok {
+		t.Error("severity key is ABSENT for an empty-severity concern; it must be present-and-empty")
+	} else if got != "" {
+		t.Errorf("severity = %v, want the empty string", got)
+	}
+}

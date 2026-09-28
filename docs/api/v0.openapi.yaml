@@ -15732,6 +15732,43 @@ paths:
                     criteria; `422 acceptance_criteria_all_operator_authored`
                     when no reviewed criterion would stay live while any add is
                     present, in one call or cumulatively.
+                reject_class:
+                  type: string
+                  enum: [scope, approach, verification, other]
+                  description: |
+                    Optional STRUCTURED classification of a plan rejection
+                    (E75.1 / #3729), so a decision index can aggregate WHY
+                    plans get rejected instead of parsing free-text reasons.
+                    Recorded VERBATIM on the `approval_submitted` audit payload
+                    under `reject_class`.
+
+                    Closed set: `scope` (the plan's file scope is wrong),
+                    `approach` (the design or method is wrong), `verification`
+                    (the test strategy or done-means is inadequate), `other`.
+                    A value outside the set is refused `400 validation_failed`
+                    whose message NAMES every allowed value and whose `details`
+                    carry `{field: reject_class, got, allowed}`. A non-empty
+                    value paired with `decision: approve` is refused `400
+                    validation_failed` with `details.rule`
+                    `reject_class_requires_reject` — an approve has no
+                    rejection to classify. Both refusals are PURE input checks
+                    evaluated before the stage is fetched, so no approval row
+                    is inserted and the gate does not advance.
+
+                    ABSENT — and an explicitly-empty string, which is treated
+                    as absent — records NO key, so an unclassified rejection
+                    indexes as unclassified and every existing caller's body
+                    and every existing row stay byte-identical.
+
+                    ORTHOGONAL to `reject_reason: decompose_required`. That key
+                    is set by the `--decompose` marker in `comment` and is what
+                    injects the decomposed-replan hint into the next plan
+                    prompt; `reject_class` injects nothing and changes no gate
+                    behaviour. `decompose_required` is DELIBERATELY NOT a member
+                    of this enum and is refused like any other unknown value: a
+                    class of that name would record the intent WITHOUT
+                    triggering the replan. Request decomposition with the
+                    `--decompose` marker.
                 claims_concern_ids:
                   type: array
                   items:

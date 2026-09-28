@@ -23,11 +23,17 @@
 //     `concern_recorded` category). So "join implement_reviewed concerns to
 //     the dispositions BY concern_id" is not implementable as written: the
 //     review side has no such key.
-//   - concern_addressed_by_condition carries NEITHER severity NOR category
-//     (server/condition_claims.go): its payload is {concern_id,
+//   - a concern_addressed_by_condition entry written BEFORE E75.1 / #3729
+//     carries NEITHER severity NOR category: its payload was {concern_id,
 //     prior_state, approval_sequence, approver_subject,
 //     confirming_review_sequence, reviewer_model, verdict,
-//     confirming_review_qualified}.
+//     confirming_review_qualified}. Since #3729 the emitter
+//     (server/condition_claims.go) ALSO records the settled row's own
+//     `category` and `severity`, so a post-#3729 entry carries the join key
+//     and joins exactly like a concern_waived / concern_deferred one. The
+//     absence is therefore HISTORICAL, not structural — which is why the
+//     join below tests the two fields for emptiness rather than keying off
+//     the audit CATEGORY.
 //
 // So the join actually implemented is: the DISPOSITION entries are the
 // spine and supply the concern_id, the disposition and the disposition
@@ -53,11 +59,14 @@
 //     LABELLED corpus and no key in the chain can disambiguate it. Such a
 //     run is operator-curated by hand.
 //
-// A concern_addressed_by_condition entry is therefore UNJOINABLE from the
-// audit chain (it carries no matchable key). It is not dropped and not
-// guessed: it is listed in case.md's operator-curation section by
-// concern_id so the operator can add it by hand, and it contributes no
-// labelled concern.
+// A disposition whose payload carries no (severity, category) — every
+// pre-#3729 concern_addressed_by_condition entry, and any other entry
+// missing either field — is therefore UNJOINABLE from the audit chain: it
+// has no matchable key. It is not dropped and not guessed: it is listed in
+// case.md's operator-curation section by concern_id so the operator can add
+// it by hand, and it contributes no labelled concern. A post-#3729
+// concern_addressed_by_condition entry is NOT unjoinable — it carries the
+// key and takes the ordinary catalogue join.
 //
 // FREE TEXT: concern notes and disposition reasons are FREE-TEXT OPERATOR
 // AND REVIEWER PROSE. They can carry tokens, hostnames, internal paths or
@@ -164,9 +173,11 @@ type CalibrationCaseResult struct {
 	CaseJSON []byte
 	CaseMD   string
 	Case     agenteval.SeverityCalibrationCase
-	// UnjoinableConcernIDs are concern_addressed_by_condition dispositions
-	// whose payload carries no matchable key (see the file comment). They
-	// are reported in case.md rather than guessed at.
+	// UnjoinableConcernIDs are dispositions whose payload carries no
+	// matchable (severity, category) key — in practice pre-#3729
+	// concern_addressed_by_condition entries (see the file comment; the
+	// emitter records both fields now, so the gap is historical). They are
+	// reported in case.md rather than guessed at.
 	UnjoinableConcernIDs []string
 }
 
@@ -181,7 +192,8 @@ type reviewPayload struct {
 }
 
 // dispositionPayload is the concern_* subset the join reads. severity /
-// category are ABSENT on concern_addressed_by_condition; that absence is
+// category are ABSENT on a concern_addressed_by_condition entry written
+// before E75.1 / #3729 (the emitter records both since); that absence is
 // what makes such an entry unjoinable, and it is handled, not guessed.
 type dispositionPayload struct {
 	ConcernID  string `json:"concern_id"`
@@ -299,9 +311,13 @@ func prepareSeverityCalibration(items []CalibrationAuditItem, opts CalibrationOp
 		if stageKind == "" {
 			stageKind = p.StageKind
 		}
-		// concern_addressed_by_condition carries neither severity nor
-		// category (server/condition_claims.go), so it has no key to join
-		// on. Report it; never guess it into a labelled corpus.
+		// A disposition carrying no (severity, category) has no key to join
+		// on — every pre-#3729 concern_addressed_by_condition entry. Report
+		// it; never guess it into a labelled corpus. The test is on the
+		// PAYLOAD, not the audit category, which is why a post-#3729
+		// concern_addressed_by_condition entry (server/condition_claims.go
+		// now records both fields) falls through and joins normally with no
+		// change here.
 		if strings.TrimSpace(p.Severity) == "" || strings.TrimSpace(p.Category) == "" {
 			unjoinable = append(unjoinable, p.ConcernID)
 			continue

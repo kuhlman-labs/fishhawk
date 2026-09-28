@@ -3653,6 +3653,8 @@ The last row is #2374, and its reason is that an escalation raises **relative to
 
 Surfaced on `GET /v0/runs/{run_id}` as the `escalations` block (single-run read only, omitted when the workflow declares none or nothing fired), rendered through the same `escalation.RenderFired` helper as the audit payload so the two cannot drift.
 
+**Two coordinates name a firing (E75.1 / [#3729](https://github.com/kuhlman-labs/fishhawk/issues/3729)).** The `escalation_fired` payload carries `fired` — the POSITIONAL declaration index, the coordinate spec *validation* errors report at (`/workflows/<name>/escalations/<i>`), so it is what an operator uses to find the rule in the document in front of them — and, since #3729, a parallel `fired_keys` array of `escalation.RuleKey` values: the STABLE content-derived join key a decision index follows a rule by ACROSS document edits. Reordering unrelated declarations moves the index but not the key; editing THIS rule's own globs, labels, triggers or `require` clamp changes the key. The two arrays are index-aligned by construction (built in one loop over the fired set). `fired_keys` is ADDITIVE — `fired`, `summary` and the result-level `fingerprint` are untouched, so the audit de-duplication behaviour is unchanged, and `RuleKey` is deliberately NOT `Fingerprint` (result-level de-duplication key vs rule-level content key).
+
 ### Declared per-stage permissions surface (`runs.go`, E53.5 / #2228)
 
 A workflow-v2 stage may declare a `permissions` block (`network` / `write` / `shell`) or an `egress` allowance on any agent stage. The block is **DECLARATION-ONLY** — validated, audited and surfaced but NOT enforced until E51 (#2133); no surface calls it containment, sandboxing, isolation, or a security control. The grammar and normalization (`permissions.network` folded into `Stage.Egress`) live in `backend/internal/spec`.
@@ -5521,6 +5523,15 @@ curl -sS "$FISHHAWK_BACKEND_URL/v0/runs/$RUN_ID/audit?category=merge_observation
 ## Bulk concern waive + the condition-claim shorthand (`bulk_waive.go`, `condition_claims.go`, E64.77 / #3318)
 
 Three surfaces closing the merge-gate concern-waiver toil a 2026-09 campaign surfaced, built on the existing #1956 condition-claim machinery rather than beside it.
+
+### `reject_class` — the structured plan-rejection class (E75.1 / [#3729](https://github.com/kuhlman-labs/fishhawk/issues/3729))
+
+`POST /v0/stages/{stage_id}/approvals` accepts an OPTIONAL `reject_class` naming the CLOSED set **`scope` | `approach` | `verification` | `other`**, so a decision index can aggregate *why* plans get rejected instead of parsing free-text reasons.
+
+- **Validated as a PURE input check, ahead of the stage fetch.** `validateRejectClass` reads no state and has no side effects, and `handleSubmitApproval` calls it beside `validateApprovalComment` — so a refusal inserts NO approval row, advances nothing and emits no audit entry. Two refusals, both `400 validation_failed`: a value outside the set (details `{field, got, allowed}`, and the message NAMES every allowed value), and a non-empty value paired with `decision != reject` (details `rule: reject_class_requires_reject`).
+- **Recorded verbatim, only on a reject that declared one.** `writeApprovalAudit` writes `reject_class` on the `approval_submitted` payload under `decision == reject && rejectClass != ""`. Absent AND explicitly-empty both record NO key, so every existing row and every existing caller's body stay byte-identical and an unclassified rejection indexes as unclassified.
+- **`decompose_required` is deliberately NOT in the set.** Decomposition is requested with the existing `--decompose` comment marker, which writes `reject_reason: decompose_required` — the key `prompt.go` reads back to inject the decomposed-replan hint. A `reject_class` of the same name would record the intent WITHOUT triggering the replan, so it is refused like any other unknown value and the refusal points at the marker. The two keys are orthogonal by design: `reject_reason` is the replan TRIGGER, `reject_class` is a recording dimension no prompt consumes. The existing `reject_reason` behaviour is unchanged.
+- **Mirrored on the MCP side.** `fishhawk_reject_plan` takes a matching optional `reject_class`, threaded through the hand-maintained `approvalRequest` mirror in `mcpserver/client.go` — a json-tag typo there passes both unit halves and fails only the cross-boundary integration case (`backend/internal/integration/mcp/reject_without_concern_test.go`).
 
 ### `claims_all_open_plan_concerns` — the approve-time expansion
 

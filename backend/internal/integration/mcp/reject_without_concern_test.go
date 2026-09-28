@@ -12,11 +12,14 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/bundle"
@@ -520,4 +523,230 @@ func rwcHasAdvisory(na *nextActionsView) bool {
 		}
 	}
 	return false
+}
+
+// ---------------------------------------------------------------------------
+// #3729 cross-boundary: the structured plan-rejection CLASS, end to end.
+//
+// The seam the per-layer units cannot cover. `reject_class` crosses four
+// representations that agree only by convention — the MCP tool's input schema,
+// the HAND-MIRRORED approvalRequest in mcpserver/client.go, the backend's
+// DisallowUnknownFields decode, and the approval_submitted audit payload. A
+// json-tag typo in that mirror passes the MCP-side unit tests (which assert on
+// the tool's own struct) and the server-side unit tests (which POST a
+// hand-written body) INDEPENDENTLY, and fails only here — the trap the
+// adjacent field comments name (#3318).
+//
+// Both directions are driven against ONE stage each:
+//   POSITIVE (operator binding condition 1): a reject carrying reject_class
+//     lands verbatim on the approval_submitted payload read back through the
+//     audit API.
+//   REFUSAL: `decompose_required` — deliberately NOT in the closed set
+//     (operator binding condition 2) — is refused end to end with NO approval
+//     recorded, and the refusal points at the --decompose marker.
+// ---------------------------------------------------------------------------
+
+// rcPlanJSON is a minimal valid standard_v1 plan for the rejected plan stage.
+func rcPlanJSON(t *testing.T) []byte {
+	t.Helper()
+	body, err := json.Marshal(map[string]any{
+		"plan_version": "standard_v1",
+		"summary":      "a plan whose file scope is wrong",
+		"verification": map[string]any{"test_strategy": "ts", "rollback_plan": "rb"},
+		"scope": map[string]any{
+			"files": []map[string]any{{"path": "backend/internal/server/approvals.go", "operation": "modify"}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	return body
+}
+
+// rcApprovalSubmittedPayloads reads the run's audit back through the REAL
+// HTTP audit surface and returns the decoded approval_submitted payloads.
+func rcApprovalSubmittedPayloads(t *testing.T, ctx context.Context, baseURL, token string, runID uuid.UUID) []map[string]any {
+	t.Helper()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/v0/runs/"+runID.String()+"/audit?limit=500", nil)
+	if err != nil {
+		t.Fatalf("build audit request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("audit request: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read audit body: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("audit status %d: %s", resp.StatusCode, raw)
+	}
+	var out struct {
+		Items []struct {
+			Category string          `json:"category"`
+			Payload  json.RawMessage `json:"payload"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("decode audit body: %v\n%s", err, raw)
+	}
+	var payloads []map[string]any
+	for _, it := range out.Items {
+		if it.Category != "approval_submitted" {
+			continue
+		}
+		var p map[string]any
+		if err := json.Unmarshal(it.Payload, &p); err != nil {
+			t.Fatalf("decode approval_submitted payload: %v", err)
+		}
+		payloads = append(payloads, p)
+	}
+	return payloads
+}
+
+// TestE2E_RejectClass_RecordedVerbatim_AndClosedSetEnforced is the
+// cross-boundary done-means for the reject-class half of #3729.
+func TestE2E_RejectClass_RecordedVerbatim_AndClosedSetEnforced(t *testing.T) {
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	// A second backend over the SAME pool with ApprovalRepo + ArtifactRepo
+	// wired, so the reject tool can record a row and the plan is loadable.
+	auditRepo := audit.NewPostgresRepository(fx.pool)
+	signingRepo := signing.NewPostgresRepository(fx.pool)
+	artifactRepo := artifact.NewPostgresRepository(fx.pool)
+	approvalRepo := approval.NewPostgresRepository(fx.pool)
+	srv := server.New(server.Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      fx.runRepo,
+		AuditRepo:    auditRepo,
+		SigningRepo:  signingRepo,
+		ArtifactRepo: artifactRepo,
+		ApprovalRepo: approvalRepo,
+		APITokenRepo: fx.apitokenRepo,
+		GitHub:       githubclient.New(nil),
+	})
+	httpSrv := httptest.NewServer(srv.Handler())
+	t.Cleanup(httpSrv.Close)
+
+	// seedPlanGate parks a FRESH run's plan stage at the approval gate,
+	// carrying an approved standard_v1 plan artifact.
+	seedPlanGate := func() (uuid.UUID, uuid.UUID) {
+		r, err := fx.runRepo.CreateRun(ctx, runpkg.CreateRunParams{
+			Repo:          "kuhlman-labs/fishhawk",
+			WorkflowID:    "feature_change",
+			WorkflowSHA:   "deadbeef",
+			TriggerSource: runpkg.TriggerCLI,
+			WorkflowSpec:  rwcWorkflowSpec,
+		})
+		if err != nil {
+			t.Fatalf("CreateRun: %v", err)
+		}
+		planStage, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+			RunID:            r.ID,
+			Sequence:         1,
+			Type:             runpkg.StageTypePlan,
+			ExecutorKind:     runpkg.ExecutorAgent,
+			ExecutorRef:      "fishhawk/runner@v1",
+			RequiresApproval: true,
+		})
+		if err != nil {
+			t.Fatalf("CreateStage(plan): %v", err)
+		}
+		content := rcPlanJSON(t)
+		sv := "standard_v1"
+		sum := sha256.Sum256(content)
+		if _, err := artifactRepo.Create(ctx, artifact.CreateParams{
+			StageID:       planStage.ID,
+			Kind:          artifact.KindPlan,
+			SchemaVersion: &sv,
+			Content:       content,
+			ContentHash:   hex.EncodeToString(sum[:]),
+		}); err != nil {
+			t.Fatalf("Create plan artifact: %v", err)
+		}
+		parkAtGate(t, ctx, fx.runRepo, planStage.ID)
+		return r.ID, planStage.ID
+	}
+
+	session := connectMCPClient(t, ctx, fx.mcpBinary, fx.operatorTok, httpSrv.URL)
+
+	// --- POSITIVE: a valid class lands verbatim on the persisted chain. ----
+	okRunID, okStageID := seedPlanGate()
+	res, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name: "fishhawk_reject_plan",
+		Arguments: map[string]any{
+			"run_id":       okRunID.String(),
+			"reason":       "the plan scopes the wrong package",
+			"reject_class": "scope",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool fishhawk_reject_plan: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("reject with a valid reject_class returned a tool error: %s", toolContentString(t, res))
+	}
+	rows, err := approvalRepo.ListForStage(ctx, okStageID)
+	if err != nil {
+		t.Fatalf("ListForStage: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("approval rows after a classified reject = %d, want 1", len(rows))
+	}
+	payloads := rcApprovalSubmittedPayloads(t, ctx, httpSrv.URL, fx.operatorTok, okRunID)
+	if len(payloads) != 1 {
+		t.Fatalf("approval_submitted entries = %d, want 1", len(payloads))
+	}
+	if payloads[0]["reject_class"] != "scope" {
+		t.Errorf("reject_class = %v, want %q recorded verbatim on the persisted chain; payload: %v",
+			payloads[0]["reject_class"], "scope", payloads[0])
+	}
+	if payloads[0]["decision"] != "reject" {
+		t.Errorf("decision = %v, want reject", payloads[0]["decision"])
+	}
+	// Orthogonality, observed end to end: a class does NOT set the
+	// --decompose replan trigger.
+	if _, present := payloads[0]["reject_reason"]; present {
+		t.Errorf("reject_class must not set reject_reason (the --decompose replan trigger); payload: %v", payloads[0])
+	}
+
+	// --- REFUSAL: decompose_required is outside the closed set. -----------
+	badRunID, badStageID := seedPlanGate()
+	badRes, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name: "fishhawk_reject_plan",
+		Arguments: map[string]any{
+			"run_id":       badRunID.String(),
+			"reason":       "please decompose this",
+			"reject_class": "decompose_required",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool fishhawk_reject_plan (decompose_required): %v", err)
+	}
+	if !badRes.IsError {
+		t.Fatalf("reject_class=decompose_required must surface a tool error; got success")
+	}
+	errText := toolContentString(t, badRes)
+	if !strings.Contains(errText, "validation_failed") {
+		t.Errorf("refusal must name validation_failed; got:\n%s", errText)
+	}
+	if !strings.Contains(errText, "--decompose") {
+		t.Errorf("refusal must point at the --decompose marker; got:\n%s", errText)
+	}
+	// COMMITTED STATE: no approval row, no approval_submitted entry.
+	badRows, err := approvalRepo.ListForStage(ctx, badStageID)
+	if err != nil {
+		t.Fatalf("ListForStage (refused): %v", err)
+	}
+	if len(badRows) != 0 {
+		t.Errorf("approval rows after a refused reject_class = %d, want 0", len(badRows))
+	}
+	if got := rcApprovalSubmittedPayloads(t, ctx, httpSrv.URL, fx.operatorTok, badRunID); len(got) != 0 {
+		t.Errorf("approval_submitted entries after a refused reject_class = %d, want 0", len(got))
+	}
 }

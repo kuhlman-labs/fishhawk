@@ -19,6 +19,7 @@ compilation.
 | `Result{Fired, Requirements}` | The zero value is "nothing fired, nothing raised" — what a workflow declaring none, and a change matching none, both evaluate to. |
 | `RenderFired(res)` | THE operator-facing summary. Both the `escalation_fired` audit payload and the run read's `escalations.summary` render through it, so they cannot drift. |
 | `Fingerprint(res)` | Stable hash over the rendered fired set + composed requirements; the audit de-duplication key. |
+| `RuleKey(e)` | Stable, content-derived key for ONE declaration (E75.1 / #3729) — the join key a decision index follows a rule by. Derived from that declaration's own match criteria (each list sorted on a COPY, because each is an unordered OR, and each element LENGTH-PREFIXED `<byte-len>:<value>` before the join, because the canonical rendering must be INJECTIVE over its own delimiters — a bare comma join renders `paths: ["a,b"]` and `paths: ["a", "b"]` identically and would give two different rules one key) plus its `require` clamp, and carrying NO positional index: reordering unrelated declarations, or editing another rule, leaves it unchanged; editing THIS rule's globs, labels, change kinds, triggers or clamp changes it. NOT `Fingerprint` — that is the RESULT-level de-duplication key over a whole evaluation, this is the RULE-level content key for one declaration. |
 
 ## Seams
 
