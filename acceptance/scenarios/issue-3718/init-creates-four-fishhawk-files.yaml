@@ -1,0 +1,14 @@
+id: scenario:issue-3718/init-creates-four-fishhawk-files
+statement: Running `fishhawk init` in a fresh temporary git repository (a scratch directory created for the check, never this repository's own tree) exits 0 and its stdout reports the four scaffolded files — the workflow spec, the charter skeleton, the operator overlay and the work-management config — each as created inside that temporary repository.
+verify_hint: 'CLI stdout and exit code: create a fresh temporary directory, run `git init` in it, then run `fishhawk init --working-dir <that temp dir> --skip-mcp-register` and read the four reported `<path> created` lines on stdout; exit code 0. The check never targets this repository''s own working tree.'
+steps: 'Build CLI from the merge-candidate checkout (HEAD 31eee8ce == preview git_sha): cd cli && go build -o /tmp/fh3718/fishhawk ./cmd/fishhawk. mkdir /tmp/fh3718/c1 && git -C /tmp/fh3718/c1 init. Run fishhawk init --working-dir /tmp/fh3718/c1 --skip-mcp-register --backend-url http://127.0.0.1:8080.'
+assertions:
+    expected: exit 0 and four '<path> created' lines.
+    observed_at_record: 'exit 0; stdout ''.fishhawk/workflows.yaml created (preset: medium, shape: app)'', ''.fishhawk/charter.md created'', ''.fishhawk/operator.yaml created'', ''.fishhawk/work-management.yaml created''.'
+    repro_handle: cd $(mktemp -d) && git init && fishhawk init --working-dir . --skip-mcp-register
+origin:
+    issue: 3718
+    pr: 0
+    run_id: 202ce8d9-bb2c-4606-ab53-d0ab411180e2
+    head_sha: 31eee8ce78585fca80707f8bb1eecd70f1adf912
+    recorded_at: 2026-09-28T06:11:59Z

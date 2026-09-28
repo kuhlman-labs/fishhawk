@@ -1,0 +1,11 @@
+# Per-repo operator role overlay, scaffolded by `fishhawk init`.
+# Thin by design: knob preset selection, local conventions, and the
+# work-management pointer ONLY. Procedure lives in the product's shipped
+# operator role spec; an overlay that defines procedure is rejected.
+spec_version: operator-role-v0
+knob_presets:
+  autonomy: {{autonomy}}
+conventions:
+  escalation_contact: "FILL ME IN: who the operator agent pages when it must escalate, and on which channel"
+  merge_ritual: "FILL ME IN: what happens between a green gate and a merge in this repository"
+work_management: ".fishhawk/work-management.yaml"

@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kuhlman-labs/fishhawk/cli/internal/scaffold"
 	"github.com/kuhlman-labs/fishhawk/cli/internal/spec"
 	"github.com/kuhlman-labs/fishhawk/credstore"
 )
@@ -982,8 +983,9 @@ func TestRunDoctor_SpecOnly_ExitZero(t *testing.T) {
 		t.Fatalf("run = %d, want exitOK; stdout:\n%s", got, stdout.String())
 	}
 	out := stdout.String()
-	// The two spec rungs must be present.
-	for _, want := range []string{"workflow spec present", "ready for local loop"} {
+	// The spec rungs must be present — including the charter rung, which
+	// WARNS (not fails) on this charter-less repo, so the exit stays 0.
+	for _, want := range []string{"workflow spec present", "charter document", "ready for local loop"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("stdout missing %q: %q", want, out)
 		}
@@ -1800,5 +1802,109 @@ func TestResolveDoctorCredential_ExpiredNotRefreshableFailsTokenRung(t *testing.
 	r := checkToken("http://localhost:8080", cred, readinessOutcome{})
 	if r.status != "fail" || !strings.Contains(r.detail, "expired at") {
 		t.Fatalf("status=%q detail=%q, want fail naming the expiry", r.status, r.detail)
+	}
+}
+
+// writeCharterRepo returns a temp repo root (with a .git marker) whose
+// files map is written verbatim.
+func writeCharterRepo(t *testing.T, files map[string]string) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for rel, body := range files {
+		p := filepath.Join(dir, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return dir
+}
+
+// TestCheckCharter_FailsOnRubriclessCharter (C3): the section headings are
+// present but no rubric row is, so the rubric match is the only thing
+// distinguishing pass from fail.
+func TestCheckCharter_FailsOnRubriclessCharter(t *testing.T) {
+	dir := writeCharterRepo(t, map[string]string{
+		scaffold.CharterPath: "# Charter\n\n## 1. North star\n\nx\n\n## 4. Prioritization rubric\n\n### Value\n\nV1: prose, not a table row\n",
+	})
+	r := checkCharter(dir)
+	if r.status != "fail" || !strings.Contains(r.detail, "no rubric rows") || !strings.Contains(r.remediate, "| **V1** |") {
+		t.Fatalf("checkCharter = %+v, want fail naming the rubric row shape", r)
+	}
+}
+
+// TestCheckCharter_OKOnScaffoldedCharter pins the positive arm against the
+// real shipped template, so the fixture cannot drift from what init writes.
+func TestCheckCharter_OKOnScaffoldedCharter(t *testing.T) {
+	files, err := scaffold.Files(scaffold.Options{Provider: scaffold.ProviderGitLab, Autonomy: "medium"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := writeCharterRepo(t, map[string]string{scaffold.CharterPath: string(files[scaffold.CharterPath])})
+	r := checkCharter(dir)
+	if r.status != "ok" || r.detail != ".fishhawk/charter.md (19 rubric lines)" {
+		t.Fatalf("checkCharter = %+v, want ok with 19 rubric lines", r)
+	}
+}
+
+func TestCheckCharter_WarnsWhenAbsent(t *testing.T) {
+	r := checkCharter(writeCharterRepo(t, nil))
+	if r.status != "warn" || !strings.Contains(r.detail, "not found") || !strings.Contains(r.remediate, "fishhawk init") {
+		t.Fatalf("checkCharter = %+v, want a warn pointing at fishhawk init", r)
+	}
+}
+
+func TestCheckCharter_FailsOnEmpty(t *testing.T) {
+	r := checkCharter(writeCharterRepo(t, map[string]string{scaffold.CharterPath: " \n\t\n"}))
+	if r.status != "fail" || !strings.Contains(r.detail, "is empty") {
+		t.Fatalf("checkCharter = %+v, want fail on an empty charter", r)
+	}
+}
+
+func TestCheckCharter_ReadErrorFails(t *testing.T) {
+	dir := writeCharterRepo(t, nil)
+	if err := os.MkdirAll(filepath.Join(dir, ".fishhawk", "charter.md"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r := checkCharter(dir)
+	if r.status != "fail" || !strings.Contains(r.remediate, "fix the read error") {
+		t.Fatalf("checkCharter = %+v, want fail on an unreadable charter", r)
+	}
+}
+
+// TestCheckCharter_FollowsConventionsPath: a declared charter.path is read,
+// and the conventional path is ignored.
+func TestCheckCharter_FollowsConventionsPath(t *testing.T) {
+	dir := writeCharterRepo(t, map[string]string{
+		scaffold.WorkManagementPath: "charter:\n  path: docs/CHARTER.md\n",
+		"docs/CHARTER.md":           "| **V1** | ship it |\n",
+	})
+	r := checkCharter(dir)
+	if r.status != "ok" || r.detail != "docs/CHARTER.md (1 rubric lines)" {
+		t.Fatalf("checkCharter = %+v, want ok on the declared path", r)
+	}
+}
+
+func TestCheckCharter_UnparseableConventionsFallsBack(t *testing.T) {
+	dir := writeCharterRepo(t, map[string]string{
+		scaffold.WorkManagementPath: "charter: [unterminated\n",
+		scaffold.CharterPath:        "| **R1** | risk |\n",
+	})
+	if r := checkCharter(dir); r.status != "ok" || !strings.HasPrefix(r.detail, scaffold.CharterPath) {
+		t.Fatalf("checkCharter = %+v, want ok on the conventional fallback", r)
+	}
+}
+
+func TestCheckCharter_RejectsEscapingPath(t *testing.T) {
+	for _, p := range []string{"../outside.md", "/etc/charter.md"} {
+		dir := writeCharterRepo(t, map[string]string{scaffold.WorkManagementPath: "charter:\n  path: " + p + "\n"})
+		if r := checkCharter(dir); r.status != "fail" || !strings.Contains(r.detail, "escapes the repository") {
+			t.Errorf("charter.path %q: checkCharter = %+v, want fail", p, r)
+		}
 	}
 }

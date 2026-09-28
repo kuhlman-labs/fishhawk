@@ -1,0 +1,13 @@
+id: scenario:issue-3718/init-checklist-names-local-path-first
+statement: In a fresh temporary git repository, the next-steps checklist that `fishhawk init` prints names the local execution path (runner_kind local) BEFORE the GitHub Actions path, and names no command that does not exist in the fishhawk CLI.
+steps: 'Build CLI from the checkout; fresh git repo; fishhawk init --skip-mcp-register; read Next steps. Verify commands exist: fishhawk run start --help, fishhawk runner start --help, fishhawkd token issue -h.'
+assertions:
+    expected: Local path before the GitHub Actions path; no nonexistent commands.
+    observed_at_record: 'Step 5 ''Drive a first run on the local execution path: fishhawk run start --runner-kind local --repo <owner/name> --workflow feature_change --issue <n>; fishhawk runner start --run-id <run-id> --stage-id <stage-id>'', then ''Alternative — the GitHub Actions execution path''. All named commands and flags exist.'
+    repro_handle: fishhawk init in a fresh repo; read the Next steps block
+origin:
+    issue: 3718
+    pr: 0
+    run_id: 202ce8d9-bb2c-4606-ab53-d0ab411180e2
+    head_sha: 31eee8ce78585fca80707f8bb1eecd70f1adf912
+    recorded_at: 2026-09-28T06:11:59Z

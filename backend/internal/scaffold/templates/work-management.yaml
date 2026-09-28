@@ -1,0 +1,123 @@
+# Work-management conventions, scaffolded by `fishhawk init`.
+# A repo-level config REPLACES the shipped product default rather than
+# merging with it, so this file is complete on its own: the provider
+# connection, the mandatory required_fields trio, the board states and
+# run-lifecycle transitions, the work-item types, and the charter pointer
+# the backlog-grooming gate requires.
+spec_version: work-management-v0
+provider: {{provider}}
+
+{{connection}}
+
+# The complexity prior: pick a level by what the change touches.
+complexity_levels:
+  low: >-
+    A single file or a few tightly-scoped edits; no cross-package coupling;
+    no schema, wire, or migration change.
+  medium: >-
+    Multiple files within one module/package, or one cross-package seam;
+    may touch a coupled test fixture; no migration.
+  high: >-
+    Spans wire/domain/persistence boundaries, a schema or DB migration, or
+    fans out across modules; needs an integration test for the seam.
+
+# The mandatory trio. Everything else a type declares is optional.
+required_fields:
+  - Summary
+  - Done-means
+  - complexity
+
+field_hints:
+  Summary: One or two sentences naming the motivation and the load-bearing change.
+  Done-means: >-
+    State the single testable condition that proves the item is complete —
+    an observable outcome a reviewer can check, not a description of effort.
+  complexity: >-
+    Pick low/medium/high from complexity_levels by the files and coupling the
+    change touches.
+
+# Canonical board states -> the provider's status option (GitHub Projects)
+# or label (GitLab) names. Rename the VALUES to match your board.
+states:
+  backlog: Backlog
+  up_next: Up Next
+  in_progress: In Progress
+  in_review: In Review
+  blocked: Blocked
+  done: Done
+
+# Run-lifecycle event -> canonical state.
+transitions:
+  run_started: in_progress
+  pr_opened: in_review
+  run_failed: blocked
+  run_merged: done
+  campaign_started: up_next
+  issue_closed: done
+  issue_reopened: backlog
+
+# Where this repository's human-authored charter lives. Backlog grooming
+# fails closed when no charter resolves.
+charter:
+  path: .fishhawk/charter.md
+
+types:
+  feature:
+    title_format: "[E{epic}.{n}] {summary}"
+    body_skeleton:
+      - Summary
+      - Proposal
+      - Done-means
+      - Notes
+    default_labels:
+      - type:feature
+    default_fields:
+      status: Backlog
+      complexity: medium
+    epic_link: optional
+
+  bug:
+    title_format: "[E{epic}.{n}] {summary}"
+    body_skeleton:
+      - Summary
+      - Observed
+      - Proposal
+      - Done-means
+      - Notes
+    default_labels:
+      - type:bug
+    default_fields:
+      status: Backlog
+      complexity: medium
+    epic_link: optional
+
+  chore:
+    title_format: "[E{epic}.{n}] {summary}"
+    body_skeleton:
+      - Summary
+      - Done-means
+    default_labels:
+      - type:chore
+    default_fields:
+      status: Backlog
+      complexity: low
+    epic_link: optional
+
+  adr:
+    title_format: "[ADR-{number}] {summary}"
+    body_skeleton:
+      - Context
+      - Options
+      - Recommendation
+      - Decision
+      - Consequences
+    default_labels:
+      - adr
+    default_fields:
+      status: Backlog
+      complexity: medium
+    numbering:
+      scheme: sequential
+      prefix: ADR-
+      pad: 3
+    epic_link: none

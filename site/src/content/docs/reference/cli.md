@@ -61,7 +61,7 @@ Every command below is rendered from the `cli/internal/cmdinfo` inventory, which
 | `fishhawk campaign resume` | `<campaign-id>` | Resume a paused campaign (hand back to the auto-driver). |
 | `fishhawk audit list` | `<run-id>` | List audit entries for a run. |
 | `fishhawk audit tail` | `<run-id>` | Follow the audit log of a run in real time. |
-| `fishhawk init` | — | Scaffold a repo for Fishhawk (workflow spec + agent docs + preflight). |
+| `fishhawk init` | — | Scaffold a repo for Fishhawk (spec, charter skeleton, governance config, agent docs, MCP registration, preflight). |
 | `fishhawk validate` | `[path]` | Validate a workflow spec file locally. |
 | `fishhawk migrate-spec` | `[path]` | Migrate a workflow-v1 spec to workflow-v2 with an approval-eligibility report. |
 | `fishhawk runner start` | — | Spawn the fishhawk-runner locally against an already-minted run. |
@@ -180,7 +180,7 @@ Flags: `--backend-url`, `--token`, `--timeout`, `--interval`, `--output`, `--o`,
 
 #### `fishhawk init`
 
-Flags: `--backend-url`, `--token`, `--timeout`, `--preset`, `--shape`, `--working-dir`, `--budget-usd`, `--single-reviewer`, `--human-gates`, `--force`, `--repo`
+Flags: `--backend-url`, `--token`, `--timeout`, `--preset`, `--shape`, `--working-dir`, `--budget-usd`, `--single-reviewer`, `--human-gates`, `--force`, `--repo`, `--project-number`, `--project-owner`, `--gitlab-project`, `--skip-mcp-register`
 
 #### `fishhawk validate`
 

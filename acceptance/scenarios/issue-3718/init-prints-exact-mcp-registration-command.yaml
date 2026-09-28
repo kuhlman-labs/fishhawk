@@ -1,0 +1,14 @@
+id: scenario:issue-3718/init-prints-exact-mcp-registration-command
+statement: '`fishhawk init`, run in a fresh temporary git repository, always prints the exact Fishhawk MCP registration command for the HTTP transport, naming the resolved backend URL, and exits 0 whether or not a supported agent CLI was detected or the registration succeeded.'
+verify_hint: 'CLI stdout and exit code: run `fishhawk init --backend-url http://127.0.0.1:8080 --working-dir <a fresh temporary git repository>` and read the printed `claude mcp add --transport http fishhawk-http http://127.0.0.1:8080/mcp` line; exit code 0.'
+steps: 'Build CLI from the checkout. In fresh git repos run fishhawk init --backend-url http://127.0.0.1:8080 --working-dir <repo> under: (1) --skip-mcp-register; (2) PATH with only git (no claude/codex); (3) PATH with only a stub codex; (4) PATH with a stub claude, run from outside the repo. Read the ''MCP registration:'' block and exit code.'
+assertions:
+    expected: An exact HTTP-transport registration command naming the resolved backend URL, with exit 0.
+    observed_at_record: 'All exit 0. (1) ''claude mcp add --transport http fishhawk-http http://127.0.0.1:8080/mcp''; (2) ''no supported agent CLI found on PATH (claude, codex); register by running: claude mcp add --transport http fishhawk-http http://127.0.0.1:8080/mcp''; (3) ''Codex CLI detected (Claude Code not found); register by running: codex mcp add fishhawk-http --url http://127.0.0.1:8080/mcp''; (4) ''cd /tmp/fh3718/r_fakeclaude && claude mcp add --transport http fishhawk-http http://127.0.0.1:8080/mcp''.'
+    repro_handle: fishhawk init --backend-url http://127.0.0.1:8080 --working-dir <fresh repo> --skip-mcp-register
+origin:
+    issue: 3718
+    pr: 0
+    run_id: 202ce8d9-bb2c-4606-ab53-d0ab411180e2
+    head_sha: 31eee8ce78585fca80707f8bb1eecd70f1adf912
+    recorded_at: 2026-09-28T06:11:59Z

@@ -166,14 +166,21 @@ implement pass has been paid for.
 
 ### `--spec-only`
 
-`--spec-only` restricts `doctor` to the two environment-free rungs (the
+`--spec-only` restricts `doctor` to the three environment-free rungs (the
 `verify command` rung is excluded: it provisions a worktree and spawns a
 subprocess, so it is neither environment-free nor byte-only) —
-**workflow spec present** (schema validity) and **execution path configured**
-(every stage declares an executor) — and skips every docker/backend/token/MCP/
-git/gh/onboarding rung. It is the fresh-repo quick-validate path: a repo whose
-sole Fishhawk artifact is a freshly-scaffolded `.fishhawk/workflows.yaml` exits
-0 with **no** local Fishhawk environment (no Docker, no backend, no token),
+**workflow spec present** (schema validity), **charter document** and
+**execution path configured** (every stage declares an executor) — and skips
+every docker/backend/token/MCP/git/gh/onboarding rung. The **charter document**
+rung (#3718) resolves `charter.path` from `.fishhawk/work-management.yaml`
+(tolerantly — falling back to `.fishhawk/charter.md`; `fishhawk validate` stays
+the authority on config validity) and is `ok` only when the document exists, is
+non-empty, and carries at least one rubric row in the `| **V1** | <line> |`
+shape the grooming reader parses; a present-but-empty or rubric-less charter,
+or a `charter.path` escaping the repository, FAILS; an absent charter WARNS,
+because only backlog grooming requires one. It is the fresh-repo quick-validate
+path: a repo whose sole Fishhawk artifact is a freshly-scaffolded
+`.fishhawk/workflows.yaml` exits 0 (with the charter warning) with **no** local Fishhawk environment (no Docker, no backend, no token),
 while a missing or schema-invalid spec still fails closed (exit non-zero). Run
 it right after `fishhawk init` to confirm the scaffolded spec is valid to the
 plan gate before wiring up the backend, token, and execution path.
@@ -284,16 +291,22 @@ an unexamined gap.
 
 ## `fishhawk init`
 
-`fishhawk init` (E29.3) is the primary onboarding surface. It scaffolds a repo
-for Fishhawk in one command: it writes a schema-valid `.fishhawk/workflows.yaml`
-from an autonomy preset, ensures the managed agent-docs bridge (AGENTS.md +
-CLAUDE.md), prints the out-of-band prerequisites it cannot perform, and runs the
+`fishhawk init` (E29.3, extended by E74.3 / #3718) is the primary onboarding
+surface. It scaffolds a repo for Fishhawk in one command: it writes a
+schema-valid `.fishhawk/workflows.yaml` from an autonomy preset, a charter
+skeleton, the operator overlay and the work-management config; ensures the
+managed agent-docs bridge (AGENTS.md + CLAUDE.md); registers the Fishhawk MCP
+server with a detected agent CLI (or prints the exact command); prints the
+next steps it cannot perform, local execution path first; and runs the
 `doctor` preflight above as a closing step.
 
 ```
 fishhawk init [--preset low|medium|high] [--shape app|config-only] \
               [--working-dir D] [--budget-usd N] [--single-reviewer] \
-              [--human-gates ids] [--force] [--repo owner/name]
+              [--human-gates ids] [--force] [--repo owner/name] \
+              [--project-number N] [--project-owner login] \
+              [--gitlab-project group/project] [--skip-mcp-register] \
+              [--backend-url URL]
 ```
 
 ### What it does
@@ -341,27 +354,72 @@ fishhawk init [--preset low|medium|high] [--shape app|config-only] \
    Fishhawk managed block in AGENTS.md and the `@AGENTS.md` import in CLAUDE.md.
    Both are idempotent and preserve content outside the managed markers, and
    `init` reports each file's per-file status (created / updated / unchanged).
-4. **Prints the out-of-band checklist** — the three prerequisites `init`
-   deliberately does not perform: installing the GitHub App, issuing an operator
-   token, and configuring the execution path (the `.github/workflows/fishhawk.yml`
-   workflow, `vars.FISHHAWK_BACKEND_URL`, and the reviewer API-key secrets).
-5. **Runs the `doctor` preflight** so `init` finishes by telling the operator
+4. **Writes the governance documents** via `cli/internal/scaffold`, each only
+   when absent, reported `created` or `skipped-existing` per file:
+   - `.fishhawk/charter.md` — a **skeleton**: the section structure the
+     content contract requires (north star, current phase + themes + what the
+     phase does not require, non-goals) and a prioritization rubric of stable
+     ids `V1`–`V5`, `R1`–`R5`, `U1`–`U4`, `S1`–`S5`, every body a
+     `<!-- fill me in -->` marker. The charter is **human-authored**: `init`
+     writes no direction text, and never rewrites an existing charter — not
+     even under `--force`.
+   - `.fishhawk/operator.yaml` — the thin operator overlay: `spec_version`,
+     `knob_presets.autonomy` (from `--preset`), fill-me-in `conventions`, and
+     the `work_management` pointer. No procedure field.
+   - `.fishhawk/work-management.yaml` — a complete config (a repo-level file
+     REPLACES the shipped default rather than merging with it) carrying the
+     provider connection, the mandatory `required_fields` trio, states,
+     transitions, the feature/bug/chore/adr types, and the `charter:` block
+     backlog grooming requires. The provider is derived from `git remote
+     get-url origin`: a github.com origin selects `github_projects` with its
+     owner (`--project-owner` overrides it); a GitLab-host origin, or
+     `--gitlab-project`, selects `gitlab`; an absent or unrecognised origin
+     degrades to `github_projects` with the owner as a fill-me-in marker and
+     says so. `init` cannot know a GitHub Project number, so without
+     `--project-number` the `project:` block is written **commented** with a
+     required-fill marker and `init` names the missing field — grooming and
+     filing fail closed until it is filled, rather than pointing at an
+     unrelated board.
+5. **Registers the MCP server** over the HTTP transport at `<backend-url>/mcp`
+   (`--backend-url`, default `$FISHHAWK_BACKEND_URL` then
+   `http://localhost:8080`, like every other command). With Claude Code
+   detected and fishhawk not yet registered it runs `claude mcp add --transport
+   http fishhawk-http <url>/mcp` (only from the repo root: Claude Code's default
+   scope is keyed to the current directory, so from anywhere else `init` prints
+   `cd <root> && …` and neither adds nor claims a registration status — a list
+   read elsewhere describes that directory, not this repository); an existing
+   registration at the root is left alone; a failed add is a warning, never a
+   failure. With only Codex detected
+   it prints `codex mcp add fishhawk-http --url <url>/mcp`; with neither, or
+   under `--skip-mcp-register`, it prints the Claude Code command. Every branch
+   prints the exact command.
+6. **Prints the next steps**, local execution path first: fill in the charter
+   (and any missing `project.*` field), run `fishhawkd` locally, issue an
+   operator token, install the GitHub App (GitHub targets), then drive a run
+   with `fishhawk run start --runner-kind local` + `fishhawk runner start` —
+   with the GitHub Actions path (`.github/workflows/fishhawk.yml`,
+   `vars.FISHHAWK_BACKEND_URL`, the reviewer API-key secrets) as the labelled
+   alternative.
+7. **Runs the `doctor` preflight** so `init` finishes by telling the operator
    exactly which first-run rungs still need attention.
 
-### Non-destructive
+### Non-destructive and idempotent
 
-`init` refuses to clobber an existing `.fishhawk/workflows.yaml`: if the spec is
-already present it prints the path and the `--force` escape hatch and exits
-non-zero **without touching the file**. Pass `--force` to overwrite it. Offer-to-
-merge an existing spec is out of scope for v1 — refuse is the safe default.
+Every write is idempotent. An existing `.fishhawk/workflows.yaml` is reported
+`skipped-existing (pass --force to regenerate from --preset/--shape)` and left
+untouched, and `init` continues and exits 0 (before #3718 it exited non-zero
+here). `--force` regenerates the spec and nothing else. The charter, operator
+overlay and work-management config are written only when absent — the writer
+has no force parameter at all, so no flag can overwrite a charter.
 
 The bridge files are always merged idempotently (managed block / import line
-only), so re-running `init` on an already-scaffolded tree yields a clean diff
-even under `--force`.
+only), so re-running `init` on an already-scaffolded tree reports every file
+skipped or unchanged and changes no bytes.
 
 ### Guides, does not perform
 
-`init` only writes files in the working tree. It does **not** install the App,
+`init` writes files in the working tree and, when Claude Code is detected, adds
+the local MCP registration. It does **not** start the backend, install the App,
 mint a token, or push the execution-path workflow — those cross an external
 boundary and are the operator's to complete. The closing `doctor` run and the
 printed checklist name each one. A `doctor` failure does not fail `init`: the

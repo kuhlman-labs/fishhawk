@@ -1,0 +1,14 @@
+id: scenario:issue-3718/existing-charter-never-modified
+statement: In a fresh temporary git repository that already holds a charter document, that charter is reported skipped-existing and its bytes are unchanged by `fishhawk init`, including when `--force` is passed to regenerate the workflow spec.
+verify_hint: 'CLI stdout: in a fresh temporary git repository, seed the charter document with a sentinel line, run `fishhawk init --force --working-dir <that temp dir>`, read the `skipped-existing` line naming the charter on stdout, and confirm the sentinel line is still the file''s only content while the spec was regenerated.'
+steps: Build CLI from the checkout. mkdir -p /tmp/fh3718/c3/.fishhawk; git init; echo 'SENTINEL-3718 existing charter' > .fishhawk/charter.md. Run fishhawk init --working-dir /tmp/fh3718/c3 --skip-mcp-register, then fishhawk init --force --preset high --working-dir /tmp/fh3718/c3 --skip-mcp-register; hash charter and spec after each.
+assertions:
+    expected: Charter skipped-existing and unchanged, including under --force; spec regenerated.
+    observed_at_record: 'Both runs report ''.fishhawk/charter.md skipped-existing''; the --force run reports ''workflows.yaml regenerated (--force) (preset: high)'' and the spec hash changed; the charter hash stayed 539ae2e5... and the sentinel is its only content.'
+    repro_handle: echo SENTINEL > .fishhawk/charter.md && fishhawk init --force --working-dir .
+origin:
+    issue: 3718
+    pr: 0
+    run_id: 202ce8d9-bb2c-4606-ab53-d0ab411180e2
+    head_sha: 31eee8ce78585fca80707f8bb1eecd70f1adf912
+    recorded_at: 2026-09-28T06:11:59Z
