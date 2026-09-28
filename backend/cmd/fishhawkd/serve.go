@@ -40,6 +40,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/claudecode"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/codex"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/decisionindex"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/deployreconciler"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/devfixtures"
 	dispatchwatchdog "github.com/kuhlman-labs/fishhawk/backend/internal/dispatchwatchdog"
@@ -730,6 +731,32 @@ func runRepoCASWiringError(repo runpkg.Repository) error {
 	return fmt.Errorf("run repository %T does not implement run.StageCASTransitioner; the reap-failure path "+
 		"(POST /v0/runs/{run_id}/stages/{stage_id}/reap-failure) would refuse every report at runtime rather than "+
 		"degrade to run.FailStage, which can fail a live park. Wire a CAS-capable run repository", repo)
+}
+
+// newAuditRepository builds the audit repository the server is wired with: the
+// concrete Postgres repository wrapped by the decision-index decorator (E75.2 /
+// #3730, ADR-082), which projects every decision-bearing append into
+// decision_index best-effort — an index failure is logged and swallowed, never
+// failing the decision. This is the SINGLE construction point, so every live
+// decision reaches the index; anything appended through a repository built
+// elsewhere is reconstructed by `fishhawkd decision-index backfill`.
+//
+// The decorator forwards every optional audit capability server/*.go
+// type-asserts (AnchoredChainAppender, DedupedChainAppender,
+// GroomingWindowAppender, RetryBudgetAppender). NewIndexingRepository refuses an
+// inner repository lacking one, and that refusal is RETURNED so runServe logs it
+// and exits rather than boot a server whose capability assertions silently fail.
+func newAuditRepository(pool *pgxpool.Pool, logger *slog.Logger) (audit.Repository, error) {
+	repo, err := decisionindex.NewIndexingRepository(
+		audit.NewPostgresRepository(pool),
+		decisionindex.NewStore(pool),
+		decisionindex.NewPoolResolver(pool),
+		logger,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return repo, nil
 }
 
 // dispatchWatchdogCapabilityError is the boot-time refusal for a run repository
@@ -2379,7 +2406,12 @@ func runServe(args []string, logSink io.Writer) int {
 		cfg.RunRepo = runpkg.NewPostgresRepository(pool)
 		cfg.CampaignRepo = campaign.NewPostgresRepository(pool)
 		cfg.SigningRepo = signing.NewPostgresRepository(pool)
-		cfg.AuditRepo = audit.NewPostgresRepository(pool)
+		auditRepo, err := newAuditRepository(pool, logger)
+		if err != nil {
+			logger.Error("audit repository wiring failed", slog.String("error", err.Error()))
+			return exitFailure
+		}
+		cfg.AuditRepo = auditRepo
 		cfg.ApprovalRepo = approval.NewPostgresRepository(pool)
 		cfg.ArtifactRepo = artifact.NewPostgresRepository(pool)
 		// Dev-only seeded-fixture applier (E72.2 / #3326). Bound to the
