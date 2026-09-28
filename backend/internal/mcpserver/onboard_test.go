@@ -1,6 +1,7 @@
 package mcpserver
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"go/ast"
@@ -8,13 +9,18 @@ import (
 	"go/token"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/scaffold"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 )
 
 // --- fishhawk_doctor (E29.6 / #1506) ---
@@ -382,6 +388,235 @@ func TestInit_UnknownPreset_FailsCleanly(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "low, medium, high") {
 		t.Errorf("err = %v, want the valid-tiers hint", err)
+	}
+}
+
+// TestMCPInit_ReturnsSameFileSetAsCLI (E74.3 / #3718) calls the fishhawk_init
+// handler in-process and requires its file set to be EXACTLY the four
+// documents the CLI `fishhawk init` writes, each byte-identical to an expected
+// value whose ORIGIN is stated below. A returned document with no expected
+// source fails the test, as does an expected document the tool omits.
+func TestMCPInit_ReturnsSameFileSetAsCLI(t *testing.T) {
+	r := &runResolver{getenv: envFuncFromMap(nil)}
+	in := InitInput{Preset: "high", ProjectOwner: "acme", ProjectNumber: 7}
+	_, out, err := r.init(context.Background(), nil, in)
+	if err != nil {
+		t.Fatalf("init: %v", err)
+	}
+
+	type expected struct {
+		origin string
+		data   []byte
+	}
+	want := map[string]expected{}
+
+	// (1) .fishhawk/workflows.yaml — NOT produced by scaffold.Files. Its origin
+	// is the canonical preset docs/spec/workflow-preset-high.yaml, which
+	// scripts/sync-schemas mirrors into BOTH backend/internal/spec/presets/
+	// (fishhawk_init's source, via spec.PresetShapeBytes) and
+	// cli/internal/spec/presets/ (the CLI's source, via spec.Generate). The
+	// test reads the canonical file and the CLI mirror over the repo root and
+	// requires them equal, so the expected bytes are the shared source.
+	canonical, err := os.ReadFile(filepath.Join("..", "..", "..", "docs", "spec", "workflow-preset-high.yaml"))
+	if err != nil {
+		t.Fatalf("read canonical preset: %v", err)
+	}
+	cliPreset, err := os.ReadFile(filepath.Join("..", "..", "..", "cli", "internal", "spec", "presets", "workflow-preset-high.yaml"))
+	if err != nil {
+		t.Fatalf("read CLI preset mirror: %v", err)
+	}
+	if !bytes.Equal(canonical, cliPreset) {
+		t.Fatal("cli/internal/spec/presets/workflow-preset-high.yaml drifted from docs/spec/: run scripts/sync-schemas")
+	}
+	want[specFileName] = expected{"docs/spec/workflow-preset-high.yaml (canonical preset; CLI mirror verified equal)", canonical}
+
+	// (2)-(4) .fishhawk/charter.md, .fishhawk/operator.yaml,
+	// .fishhawk/work-management.yaml — origin is scaffold.Files for the SAME
+	// options the CLI would resolve (autonomy = preset, github_projects with
+	// the supplied owner/number). backend/internal/scaffold's templates are
+	// held byte-identical to cli/internal/scaffold's by
+	// TestScaffoldTemplateParityAcrossModules, so this is the CLI's output too.
+	docs, err := scaffold.Files(scaffold.Options{
+		Provider: scaffold.ProviderGitHubProjects, Autonomy: "high", ProjectOwner: "acme", ProjectNumber: 7,
+	})
+	if err != nil {
+		t.Fatalf("scaffold.Files: %v", err)
+	}
+	for _, path := range scaffold.Paths() {
+		want[path] = expected{"scaffold.Files (backend mirror of cli/internal/scaffold)", docs[path]}
+	}
+	if len(want) != 4 {
+		t.Fatalf("expected set has %d documents, want 4: %v", len(want), want)
+	}
+
+	for path, got := range out.Files {
+		exp, ok := want[path]
+		if !ok {
+			t.Errorf("fishhawk_init returned %s, which has NO expected source: the CLI writes no such file", path)
+			continue
+		}
+		if got != string(exp.data) {
+			t.Errorf("%s differs from its expected source %s", path, exp.origin)
+		}
+	}
+	for path := range want {
+		if _, ok := out.Files[path]; !ok {
+			t.Errorf("fishhawk_init omitted %s", path)
+		}
+	}
+
+	// The named fields are the same bytes as the files map, at the same paths.
+	for path, field := range map[string]struct{ target, data string }{
+		specFileName:                {out.TargetPath, out.WorkflowYAML},
+		scaffold.CharterPath:        {out.CharterPath, out.CharterMD},
+		scaffold.OperatorPath:       {out.OperatorPath, out.OperatorYAML},
+		scaffold.WorkManagementPath: {out.WorkManagementPath, out.WorkManagementYAML},
+	} {
+		if field.target != path {
+			t.Errorf("target path field = %q, want %q", field.target, path)
+		}
+		if field.data != out.Files[path] {
+			t.Errorf("named field for %s differs from files[%s]", path, path)
+		}
+	}
+	if out.Forge != "github" || len(out.Incomplete) != 0 {
+		t.Errorf("forge = %q incomplete = %v, want github and none", out.Forge, out.Incomplete)
+	}
+	// The complete github config passes the backend's full semantic parse.
+	if _, err := workmgmt.Parse(strings.NewReader(out.WorkManagementYAML)); err != nil {
+		t.Errorf("returned work-management config fails workmgmt.Parse: %v", err)
+	}
+}
+
+// TestInit_ForgeResolution pins each forge branch's rendered connection.
+func TestInit_ForgeResolution(t *testing.T) {
+	r := &runResolver{getenv: envFuncFromMap(nil)}
+	for name, tc := range map[string]struct {
+		in         InitInput
+		wantForge  string
+		provider   string
+		wantInWM   string
+		incomplete []string
+	}{
+		"default github, nothing known": {InitInput{}, "github", "github_projects", "FILL ME IN (project.owner, project.number)", []string{"project.owner", "project.number"}},
+		"github owner only":             {InitInput{ProjectOwner: "acme"}, "github", "github_projects", "#   owner: acme", []string{"project.number"}},
+		"github complete":               {InitInput{Forge: "github", ProjectOwner: "acme", ProjectNumber: 3}, "github", "github_projects", "number: 3", nil},
+		"gitlab inferred":               {InitInput{GitLabProject: "grp/sub/proj"}, "gitlab", "gitlab", `project: "grp/sub/proj"`, nil},
+		"gitlab explicit, own path":     {InitInput{Forge: "gitlab"}, "gitlab", "gitlab", "gitlab: {}", nil},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, out, err := r.init(context.Background(), nil, tc.in)
+			if err != nil {
+				t.Fatalf("init: %v", err)
+			}
+			if out.Forge != tc.wantForge {
+				t.Errorf("forge = %q, want %q", out.Forge, tc.wantForge)
+			}
+			if !strings.Contains(out.WorkManagementYAML, "provider: "+tc.provider+"\n") {
+				t.Errorf("work-management provider is not %s:\n%s", tc.provider, out.WorkManagementYAML)
+			}
+			if !strings.Contains(out.WorkManagementYAML, tc.wantInWM) {
+				t.Errorf("work-management lacks %q:\n%s", tc.wantInWM, out.WorkManagementYAML)
+			}
+			if !reflect.DeepEqual(out.Incomplete, tc.incomplete) {
+				t.Errorf("incomplete = %v, want %v", out.Incomplete, tc.incomplete)
+			}
+		})
+	}
+}
+
+// TestInit_ContradictoryForgeInputsFailCleanly pins every fail-closed branch
+// of initScaffoldOptions: each returns a tool error naming the conflict and
+// no scaffold.
+func TestInit_ContradictoryForgeInputsFailCleanly(t *testing.T) {
+	r := &runResolver{getenv: envFuncFromMap(nil)}
+	for name, tc := range map[string]struct {
+		in   InitInput
+		want string
+	}{
+		"unknown forge":            {InitInput{Forge: "bitbucket"}, `unknown forge "bitbucket"`},
+		"gitlab_project on github": {InitInput{Forge: "github", GitLabProject: "g/p"}, "gitlab_project is set but forge is github"},
+		"owner on gitlab":          {InitInput{Forge: "gitlab", ProjectOwner: "acme"}, "forge is gitlab"},
+		"number on gitlab":         {InitInput{GitLabProject: "g/p", ProjectNumber: 2}, "forge is gitlab"},
+		"negative number":          {InitInput{ProjectNumber: -1}, "project_number -1 is invalid"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, out, err := r.init(context.Background(), nil, tc.in)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want one containing %q", err, tc.want)
+			}
+			if len(out.Files) != 0 || out.CharterMD != "" {
+				t.Errorf("a refused init still returned a scaffold: %+v", out.Files)
+			}
+		})
+	}
+}
+
+// TestInit_NextStepStatesCharterRule: the next_step carries the charter is
+// human-authored / never-overwrite rule, alongside the validate guidance.
+func TestInit_NextStepStatesCharterRule(t *testing.T) {
+	r := &runResolver{getenv: envFuncFromMap(nil)}
+	_, out, err := r.init(context.Background(), nil, InitInput{})
+	if err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	for _, want := range []string{
+		"four files",
+		"ONLY where that path does not already exist",
+		"NEVER overwrite an existing .fishhawk/charter.md",
+		"The charter is human-authored",
+		"FILL every fill-me-in marker",
+		"incomplete",
+	} {
+		if !strings.Contains(out.NextStep, want) {
+			t.Errorf("NextStep missing %q: %q", want, out.NextStep)
+		}
+	}
+}
+
+// TestOnboardingSkill_Step2NamesFourFilesAndCharterRule pins the SHIPPED skill
+// resource's Step 2 section (E74.3 / #3718): it names all four returned files
+// and the never-overwrite charter rule.
+func TestOnboardingSkill_Step2NamesFourFilesAndCharterRule(t *testing.T) {
+	_, rest, ok := strings.Cut(onboardingSkillMarkdown, "## Step 2")
+	if !ok {
+		t.Fatal("onboarding skill has no Step 2 section")
+	}
+	step2, _, _ := strings.Cut(rest, "## Step 3")
+	step2 = strings.Join(strings.Fields(step2), " ")
+	for _, want := range []string{
+		"returns FOUR files",
+		"`workflow_yaml` → `.fishhawk/workflows.yaml`",
+		"`charter_md` → `.fishhawk/charter.md`",
+		"`operator_yaml` → `.fishhawk/operator.yaml`",
+		"`work_management_yaml` → `.fishhawk/work-management.yaml`",
+		"ONLY where that path does not already exist",
+		"**Never overwrite an existing `.fishhawk/charter.md`**",
+		"`project_owner` + `project_number`",
+	} {
+		if !strings.Contains(step2, want) {
+			t.Errorf("onboarding skill Step 2 missing %q:\n%s", want, step2)
+		}
+	}
+}
+
+// TestInitToolDescription_DescribesScaffoldFiles pins the SHIPPED description's
+// E74.3 claims (#1169: a comment-only touch must not satisfy it).
+func TestInitToolDescription_DescribesScaffoldFiles(t *testing.T) {
+	desc := strings.Join(strings.Fields(registeredToolDescription(t, "fishhawk_init")), " ")
+	for _, want := range []string{
+		"charter_md (.fishhawk/charter.md)",
+		"human-authored charter SKELETON",
+		"never overwrite an existing charter",
+		"operator_yaml (.fishhawk/operator.yaml)",
+		"work_management_yaml (.fishhawk/work-management.yaml)",
+		"files map keyed by path",
+		"forge (github | gitlab), project_owner, project_number and gitlab_project",
+		"ONLY where its path does not already exist",
+	} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("fishhawk_init description missing %q:\n%s", want, desc)
+		}
 	}
 }
 
