@@ -224,27 +224,40 @@ func (p payload) reasonKey() string {
 }
 
 // TouchedPathsFromPlan returns the sorted, de-duplicated scope.files[].path
-// values of a standard_v1 plan artifact's content. A plan with no scope or no
-// files yields an empty (non-nil) slice; content that is not JSON is an error.
+// values of a standard_v1 plan artifact's content.
+//
+// Shape tolerance mirrors decodePayload's posture, because the index covers
+// HISTORICAL runs whose plan artifacts predate the current scope.files object
+// shape: `scope` that is not an object, `files` that is not an array, and any
+// element that is not an object carrying a string `path` (a legacy bare-string
+// entry such as {"scope":{"files":["a.go"]}}) each contribute NOTHING and yield
+// an empty (non-nil) slice rather than an error. Only content that is not JSON
+// at all is an error — an intolerant decode here would abort a whole backfill
+// page, and fail live indexing for every decision on such a run.
 func TouchedPathsFromPlan(content []byte) ([]string, error) {
 	if len(content) == 0 {
 		return []string{}, nil
 	}
-	var plan struct {
-		Scope *struct {
-			Files []struct {
-				Path string `json:"path"`
-			} `json:"files"`
-		} `json:"scope"`
+	var doc struct {
+		Scope json.RawMessage `json:"scope"`
 	}
-	if err := json.Unmarshal(content, &plan); err != nil {
+	if err := json.Unmarshal(content, &doc); err != nil {
 		return nil, fmt.Errorf("decisionindex: decode plan artifact content: %w", err)
 	}
-	if plan.Scope == nil {
+	var scope struct {
+		Files []json.RawMessage `json:"files"`
+	}
+	if len(doc.Scope) == 0 || json.Unmarshal(doc.Scope, &scope) != nil {
 		return []string{}, nil
 	}
-	paths := make([]string, 0, len(plan.Scope.Files))
-	for _, f := range plan.Scope.Files {
+	paths := make([]string, 0, len(scope.Files))
+	for _, raw := range scope.Files {
+		var f struct {
+			Path string `json:"path"`
+		}
+		if json.Unmarshal(raw, &f) != nil {
+			continue
+		}
 		paths = append(paths, f.Path)
 	}
 	return sortedUnique(paths), nil

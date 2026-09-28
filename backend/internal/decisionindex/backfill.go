@@ -82,9 +82,17 @@ WHERE ae.sequence = ANY($1)`
 // entry below the page's highest sequence on one of the page's stages (by
 // column, or by payload stage_id when the column is unset). LatestEscalationKeys
 // then picks, per decision, the latest one strictly below it on its own stage.
+//
+// The payload arm lowercases before comparing: $3 is built from uuid.String(),
+// which is always lowercase, while a payload records whatever text its emitter
+// wrote. Without lower() an entry whose payload stage_id is upper-case (or any
+// other non-canonical rendering) is dropped HERE while the Go-side fallback
+// (escalationStage, which parses case-insensitively) would have accepted it —
+// the two filters would disagree on the same entry and the decision would index
+// empty escalation_keys despite a same-stage escalation existing.
 const escalationSQL = `SELECT sequence, stage_id, payload FROM audit_entries
 WHERE category = '` + escalationFiredCategory + `' AND sequence < $1
-  AND (stage_id = ANY($2) OR (stage_id IS NULL AND payload->>'stage_id' = ANY($3)))
+  AND (stage_id = ANY($2) OR (stage_id IS NULL AND lower(payload->>'stage_id') = ANY($3)))
 ORDER BY sequence`
 
 // resolveContexts resolves the RowContext of every entry whose run row exists,

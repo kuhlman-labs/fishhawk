@@ -333,6 +333,75 @@ func TestBackfill_FailsLoudOnUndecodablePayload(t *testing.T) {
 	}
 }
 
+// TestBackfill_EscalationPayloadStageIDIsCaseInsensitive pins the second
+// implement-review concern: an escalation_fired entry whose stage_id COLUMN is
+// unset and whose PAYLOAD records the stage id non-canonically (upper case) must
+// reach LatestEscalationKeys. escalationSQL's payload arm compares against
+// uuid.String() output, which is always lower case, while escalationStage parses
+// case-insensitively — so without lower() in the SQL the two filters disagree on
+// the same entry and the decision silently indexes empty escalation_keys.
+// COUNTERFACTUAL: drop lower() from escalationSQL's payload arm — RED here
+// (escalation_keys = []).
+func TestBackfill_EscalationPayloadStageIDIsCaseInsensitive(t *testing.T) {
+	f := newChainFixture(t)
+	ctx := context.Background()
+	upper := strings.ToUpper(f.planStageA.String())
+	f.exec(t, `INSERT INTO audit_entries (id, run_id, category, payload, entry_hash)
+	           VALUES ($1, $2, 'escalation_fired', $3, $4)`,
+		uuid.New(), f.runA, []byte(`{"stage_id":"`+upper+`","fired_keys":["rk-upper"]}`), "h-"+uuid.NewString())
+	dec := f.appendEntry(t, f.runA, &f.planStageA, "approval_submitted", map[string]any{"decision": "approve"})
+
+	if _, err := Backfill(ctx, f.pool, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := NewStore(f.pool).List(ctx, ListFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].SourceSequence != dec.Sequence {
+		t.Fatalf("rows = %v, want the decision at sequence %d", seqsOf(rows), dec.Sequence)
+	}
+	if !reflect.DeepEqual(rows[0].EscalationKeys, []string{"rk-upper"}) {
+		t.Errorf("escalation_keys = %#v, want [rk-upper] (payload stage_id matched case-insensitively)", rows[0].EscalationKeys)
+	}
+}
+
+// TestBackfill_ToleratesHistoricalPlanShape is the cross-layer regression for
+// the implement-review concern: a run whose LATEST plan artifact carries the
+// legacy bare-string scope.files shape must index with EMPTY touched_paths, not
+// abort the page. resolveContexts propagates TouchedPathsFromPlan's error, so an
+// intolerant decode here failed the whole backfill — and live indexing for every
+// decision on that run — on a shape the index promises to tolerate.
+// COUNTERFACTUAL: decode scope.files back into []struct{Path string} in
+// extract.go — RED here with `cannot unmarshal string` and 0 rows written.
+func TestBackfill_ToleratesHistoricalPlanShape(t *testing.T) {
+	f := newChainFixture(t)
+	ctx := context.Background()
+	base := time.Now().UTC().Add(-time.Hour)
+	f.seedPlan(t, f.planStageA, base, "current.go")
+	// Newer than the object-shaped plan, so it is the one the LATERAL join takes.
+	f.seedPlanRaw(t, f.planStageA, base.Add(time.Minute), []byte(`{"scope":{"files":["legacy.go"]}}`))
+	dec := f.appendEntry(t, f.runA, &f.planStageA, "approval_submitted", map[string]any{"decision": "approve"})
+
+	sum, err := Backfill(ctx, f.pool, Options{})
+	if err != nil {
+		t.Fatalf("backfill over a legacy plan shape failed: %v", err)
+	}
+	if sum.RowsWritten != 1 {
+		t.Fatalf("rows written = %d, want 1 (summary %+v)", sum.RowsWritten, sum)
+	}
+	rows, err := NewStore(f.pool).List(ctx, ListFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].SourceSequence != dec.Sequence {
+		t.Fatalf("rows = %v, want the decision at sequence %d", seqsOf(rows), dec.Sequence)
+	}
+	if !reflect.DeepEqual(rows[0].TouchedPaths, []string{}) {
+		t.Errorf("touched_paths = %#v, want empty (legacy shape contributes no paths)", rows[0].TouchedPaths)
+	}
+}
+
 // TestDecisionBearingCategories_SortedForSQL guards the ANY($1) argument's
 // determinism the page query relies on.
 func TestDecisionBearingCategories_SortedForSQL(t *testing.T) {

@@ -345,16 +345,39 @@ func TestExtract_DecidedAtIsUTCMicroseconds(t *testing.T) {
 
 // TestTouchedPathsFromPlan covers the standard_v1 scope.files shape, a plan
 // with no scope, empty content, and content that is not JSON.
+//
+// The HISTORICAL-SHAPE cases are the regression for the implement-review
+// concern: a legacy plan whose scope.files holds bare strings (or any other
+// non-object element), a non-object `scope`, and a non-array `files` are shapes
+// the index explicitly promises to TOLERATE (README "the plan predates the
+// scope.files object shape"). An intolerant decode returned an error for each,
+// which resolveContexts propagates — aborting the whole backfill page and
+// failing live indexing for every decision on that run.
+// COUNTERFACTUAL: decode scope.files back into []struct{Path string} — RED on
+// every historical-shape case (a decode error where empty paths are required).
 func TestTouchedPathsFromPlan(t *testing.T) {
 	got, err := TouchedPathsFromPlan([]byte(`{"scope":{"files":[{"path":"b.go","operation":"modify"},{"path":"a.go","operation":"create"},{"path":"b.go","operation":"modify"}]}}`))
 	if err != nil || !reflect.DeepEqual(got, []string{"a.go", "b.go"}) {
 		t.Errorf("TouchedPathsFromPlan = %v, %v; want [a.go b.go]", got, err)
 	}
-	for _, c := range []string{`{}`, `{"scope":null}`, ``} {
+	for _, c := range []string{
+		`{}`, `{"scope":null}`, ``,
+		`{"scope":{"files":["a.go","b.go"]}}`, // legacy bare-string files
+		`{"scope":{"files":[1,2]}}`,           // legacy non-object files
+		`{"scope":{"files":null}}`,
+		`{"scope":{"files":"a.go"}}`, // files not an array
+		`{"scope":"everything"}`,     // scope not an object
+		`{"scope":[]}`,
+	} {
 		got, err := TouchedPathsFromPlan([]byte(c))
 		if err != nil || got == nil || len(got) != 0 {
-			t.Errorf("TouchedPathsFromPlan(%q) = %#v, %v; want empty non-nil", c, got, err)
+			t.Errorf("TouchedPathsFromPlan(%q) = %#v, %v; want empty non-nil, nil error", c, got, err)
 		}
+	}
+	// A mixed plan still yields the object-shaped entries it does carry.
+	got, err = TouchedPathsFromPlan([]byte(`{"scope":{"files":["legacy.go",{"path":"kept.go"}]}}`))
+	if err != nil || !reflect.DeepEqual(got, []string{"kept.go"}) {
+		t.Errorf("mixed-shape files = %v, %v; want [kept.go]", got, err)
 	}
 	if _, err := TouchedPathsFromPlan([]byte(`{bad`)); err == nil {
 		t.Error("TouchedPathsFromPlan(bad json) = nil error, want error")

@@ -80,6 +80,13 @@ func (f *chainFixture) seedPlan(t *testing.T, stageID uuid.UUID, createdAt time.
 	if err != nil {
 		t.Fatal(err)
 	}
+	f.seedPlanRaw(t, stageID, createdAt, content)
+}
+
+// seedPlanRaw writes a plan artifact with VERBATIM content, so a test can seed a
+// historical plan shape the current standard_v1 writer would never emit.
+func (f *chainFixture) seedPlanRaw(t *testing.T, stageID uuid.UUID, createdAt time.Time, content []byte) {
+	t.Helper()
 	f.exec(t, `INSERT INTO artifacts (id, stage_id, kind, content, content_hash, created_at)
 	           VALUES ($1, $2, 'plan', $3, $4, $5)`, uuid.New(), stageID, content, "h-"+uuid.NewString(), createdAt)
 }
