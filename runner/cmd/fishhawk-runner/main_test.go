@@ -38,6 +38,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/runner/internal/gateiso"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/gitdiff"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/gitops"
+	"github.com/kuhlman-labs/fishhawk/runner/internal/hostload"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/plan/planfixture"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/upload"
 )
@@ -100,6 +101,25 @@ func runTestMain(m *testing.M) int {
 	probeBackendDevMode = func(context.Context, string) devModeProbe {
 		return devModeProbe{outcome: "stubbed", detail: "runTestMain stub: no dial"}
 	}
+	// Host-load preflight stub (#3663). runVerifyFixLoop and
+	// runVerifyGateCommitted now sample the host load before each committed-tree
+	// verify, and dozens of call sites in this package drive them. Without this
+	// stub every one of them would shell out to sysctl/ps per verify AND — on a
+	// loaded developer machine, exactly the #3663 condition — reclassify a
+	// deliberately-failing fixture verify from category A to category C, turning
+	// this package red as a function of host load. The stub reports a fixed
+	// NON-overloaded sample so those tests keep their exact pre-#3663 behavior; a
+	// test exercising the preflight overrides readHostLoad itself with a
+	// t.Cleanup-restored assignment.
+	readHostLoad = func(context.Context) (hostload.Sample, error) {
+		return hostload.Sample{Load1: 0.5, Cores: runtime.NumCPU()}, nil
+	}
+	// Orphan-sweep kill switch (#3663). This package's test binary runs inside
+	// the `go test` harness's own process tree, so a sweeper that actually
+	// SIGKILLed its recorded closure could reach the harness's children. Default
+	// it OFF for the whole binary; a test that needs the real sweeper opts in via
+	// enableOrphanSweepForTest.
+	orphanSweepDefaultOn = false
 	if _, err := exec.LookPath("git"); err != nil {
 		return runSuite() // git unavailable — degrade to the original CWD.
 	}

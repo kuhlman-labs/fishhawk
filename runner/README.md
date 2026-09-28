@@ -1059,6 +1059,60 @@ sha256sum -c SHA256SUMS
 
 The verify-identity is the workflow file's path; that's the URL Fulcio embeds in the cert when keyless-signing from a GitHub Action.
 
+## Stage orphan reaper ([E51.11 / #3663](https://github.com/kuhlman-labs/fishhawk/issues/3663))
+
+An agent can background a process from a shell that then exits. The orphan is
+re-parented to pid 1 and keeps the **already-exited shell's** process-group id, so
+neither the runner's descendant walk nor a `kill(-pgid)` against the agent's group
+reaches it. In the #3663 incident that left CPU busy-loops running on the dogfood
+host, and every LATER committed-tree verify on that host red-lined on tests
+unrelated to its own diff.
+
+The runner now samples the host process table every 2 seconds during the stage,
+accumulating the transitive descendant closure of its own pid **plus the
+process-group ids those descendants belong to**, and SIGKILLs the survivors at
+stage exit. The pgid half is what reaches an orphan whose whole ancestor chain has
+already exited: only the long-lived SHELL needs to have been sampled.
+
+Because a pgid is a recyclable integer once its group empties, the pgid half is
+fenced by six controls — never the runner's own pid, never `pid <= 1`, never a
+member of the runner's own process group unless it LEADS that group, a
+**stage-start floor** (a pgid-only admission must have started at or after the
+stage began, so operator shells / the MCP server / `fishhawkd` / another runner are
+structurally unreachable), a **continuity tombstone** (a recorded pgid whose group
+empties is dropped permanently), and a **re-read of the table immediately before
+killing**. Each has its own test and its own observed-RED counterfactual.
+
+**Operator escape: `FISHHAWK_ORPHAN_SWEEP=off`** disables the sweep half alone
+(the host-load preflight below keeps running) — set it on a shared host where you
+would rather leak a process than have the runner signal one. The sweep is also
+default-OFF under the runner command's own test binary.
+
+This is a best-effort reaper, **not a containment boundary**: a descendant that
+both starts and escapes entirely between two samples, and whose whole ancestor
+chain also exits in that window, is never recorded. The structural fix is a cgroup
+(Linux) or a job object (Windows), neither of which exists on macOS — the primary
+dogfood host. Full mechanism, the measured findings behind it (including why the
+issue's suggested env-marker identification is not implementable on macOS), every
+named degrade and all four residuals: `runner/internal/procsweep/README.md`. The
+runner-side wiring and the two trace events:
+`runner/cmd/fishhawk-runner/README.md`.
+
+## Host-load verify preflight ([E51.11 / #3663](https://github.com/kuhlman-labs/fishhawk/issues/3663))
+
+The other half of #3663. Before EACH committed-tree verify the runner reads the
+1-minute load average and the top CPU consumers. When the deciding verify FAILED
+**and** the load was above `4.0 x` the core count, the failure is classified
+**category C** (infrastructure, retryable in place) instead of category A, with a
+single-line `host_overloaded: …` lead PREPENDED to the verify output — which is
+preserved verbatim, so the reviewer still reads the real test failures. A passing
+verify on an overloaded host is never demoted; it only gets a
+`verify_host_overloaded` trace event. A load-read error fails OPEN.
+
+**First check when a verify fails on tests unrelated to the diff: run `uptime`.**
+
+Contract: `runner/internal/hostload/README.md`.
+
 ## See also
 
 - `docs/MVP_SPEC.md` §5.1.2 — runner component definition.

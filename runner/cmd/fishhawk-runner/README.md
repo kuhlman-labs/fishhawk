@@ -310,7 +310,7 @@ The #2645 absorb did not fire because `scripts/test verify` ran to COMPLETION an
 
 That is a design limitation the operator has ruled INTENTIONAL (#3048), not an implementation defect: widening the allow-list to cover assertion failures would let a genuinely-broken change retry itself. The remedy taken in #3048 is therefore to remove the flake AT ITS SOURCE — DB-anchor the comparative seeds so the test carries no cross-clock dependency — rather than to reclassify the gate.
 
-**#3122 — the testcontainers deadline signature IS an allow-list entry; the limitation is the one-shot absorb.** #3122 reported the `backend/internal/postgres` pgtest-exemption leak and asserted the testcontainers Docker-socket deadline signature "is not an entry, so the absorb cannot fire." That is FALSE: `wait until ready: mapped port: ... %2Fvar%2Frun%2Fdocker.sock ... context deadline exceeded` matches `isTestcontainersStartFlake` (checked FIRST inside `isVerifyInfraFailure`), and the issue's own Observed section records `verify_infra_flake_retry` firing on iteration 1 — the absorb DID fire, exactly once. The claim is pinned by the verbatim-#3122 corpus row in `TestIsTestcontainersStartFlake` (`flakeOutput3122`, want=true), so a later narrowing of the matcher reddens a test instead of silently reopening the concern. The real limitation is that the committed-tree absorb is ONE-SHOT per stage: a saturated daemon that keeps timing out past the single re-run still lands category-A. The durable fix for #3122 is upstream of this classifier — the Go-side `t.Cleanup` leak repair plus `scripts/test`'s generation-keyed orphan sweep (see `scripts/README.md`), which stop the daemon from accumulating the containers that cause the timeout in the first place; no matcher change was made.
+**#3122 — the testcontainers deadline signature IS an allow-list entry; the limitation is the one-shot absorb.** #3122 reported the `backend/internal/postgres` pgtest-exemption leak and asserted the testcontainers Docker-socket deadline signature "is not an entry, so the absorb cannot fire." That is FALSE: `wait until ready: mapped port: ... %2Fvar%2Frun%2Fdocker.sock ... context deadline exceeded` matches `isTestcontainersStartFlake` (checked FIRST inside `isVerifyInfraFailure`), and the issue's own Observed section records `verify_infra_flake_retry` firing on iteration 1 — the absorb DID fire, exactly once. The claim is pinned by the verbatim-#3122 corpus row in `TestIsTestcontainersStartFlake` (`flakeOutput3122`, want=true), so a later narrowing of the matcher reddens a test instead of silently reopening the concern. The real limitation is that the committed-tree absorb is ONE-SHOT per stage: a saturated daemon that keeps timing out past the single re-run still lands category-A — UNLESS the saturation also shows up as a 1-minute load average above `4.0 x` the core count, in which case the #3663 host-load arm below reclassifies it C. Daemon saturation and CPU starvation are not the same condition, so neither arm subsumes the other. The durable fix for #3122 is upstream of this classifier — the Go-side `t.Cleanup` leak repair plus `scripts/test`'s generation-keyed orphan sweep (see `scripts/README.md`), which stop the daemon from accumulating the containers that cause the timeout in the first place; no matcher change was made.
 
 Both pre-push failure messages LEAD with the failing command and a bounded excerpt of its output (`verifyFailureExcerpt`), ahead of the tree-mismatch and `N file(s) excluded as scope drift` accounting that read as a scope problem they were not; the full output is still appended unabridged. `pushFailureCategory` (the extracted push-failure classifier) checks `ErrVerifyInfraFailure` FIRST so the category-C verdict survives an error that also wraps a category-B sentinel.
 
@@ -1322,3 +1322,89 @@ A transient `ls-remote`/fetch failure against a CONFIGURED remote now FAILS the 
 - **Done-means / cross-boundary** (`worktree_integration_test.go`): `TestRun_StandaloneImplement_AdvancesLineageWorktreeToMovedBase_CrossBoundary` — REAL bare origin, REAL operator clone, REAL `provisionLineageWorktree` at the plan-time SHA, a REAL commit merged into `origin/main` between provisioning and dispatch, production `remoteHasBranch`/`fetchDiffBaseTip`/`checkoutChildBase`/`captureHead`/`restoreHead`; only the push/PR egress faked. It asserts the advanced file is in the agent's worktree at invoke, the worktree HEAD equals the advanced tip, `lineage_worktree_advanced` names both SHAs, and — the GATE half — that a verify command which is a real probe for the advanced file PASSES, which on the stale base it cannot.
 - **Per failure mode** (`lineagebase_test.go`, real throwaway git repos): `_EmptyBaseRef_NoOp`, `_BaseRefAbsent_Skips`, `_RemoteQueryError_RemoteConfigured_FailsLoud`, `_RemoteQueryError_RemoteUnconfigured_Skips`, `_AlreadyAtBaseTip_NoOp`, `_DirtyWorktree_Refuses` (untracked + modified-tracked arms), `_DirtyProbeError_Refuses`, `_HeadNotAncestorOfBase_Refuses`, `_AncestryProbeError_Refuses`, `_FetchTipError_FailsLoud`, `_CheckoutError_FailsLoud`, `_MovedBase_Advances`, plus `TestStandaloneBaseAdvanceEligible_Table` and `TestLineageBaseAdvanceFailureReason_Table`. Every refusal case ALSO reads the worktree HEAD after the call and asserts it is still the stale SHA — the control's effect is COMMITTED STATE, so error identity alone would not prove HEAD did not move.
 - **run()-level wiring** (`main_test.go`): `TestRun_StandaloneImplement_AdvancesLineageBase` (positive control: the event fires, `checkoutChildBase` runs exactly once, and it has already run by the time the agent is invoked), `TestRun_FixupPass_DoesNotAdvanceLineageBase`, `TestRun_DecomposedChild_DoesNotTakeStandaloneBaseAdvance`, `TestRun_StandaloneImplement_AdvanceRefusal_FailsLoudPreAgent` / `_AdvanceError_FailsLoudPreAgent` (exact reason + ZERO agent invocations), and `TestRun_StandaloneImplement_BaseAdvanceInertOnFakeGitOpsDefaults`.
+
+## Stage orphan reaper + host-load verify preflight (E51.11 / [#3663](https://github.com/kuhlman-labs/fishhawk/issues/3663))
+
+Two runner-only halves answering one incident: an agent backgrounded processes
+that shed its process group, they outlived the stage, and the CPU they burned
+red-lined every LATER committed-tree verify on the host — on tests unrelated to
+those verifies' own diffs.
+
+### Stage orphan reaper (`orphansweep.go`)
+
+`newStageOrphanSweeper` holds a `procsweep.Recorder` anchored at `os.Getpid()`
+with `startedAt = time.Now()`. `run()` starts the sampler (2s interval) where the
+mid-stage scope-amendment watcher starts, stops it alongside `stopWatch()`, and
+then calls `sweep()` — so the `stage_orphans_reaped` event lands on `res.Events`
+**before** `composeGateEvidence` folds the bundle. The SAME once-latching
+`sweep()` is also called from a `defer` in `run()`, which backstops the cancel /
+timeout / early-return paths.
+
+**The latch closes only on a pass that read the table.** The post-invoke site is
+handed `run()`'s own ctx, so on a cancelled or timed-out stage its `ps` read
+fails, it reaps nothing, and it degrades `proc_table_read_cancelled` WITHOUT
+latching — otherwise the `defer`'s `context.WithoutCancel(ctx)` backstop would
+find the single pass already spent and every recorded survivor would outlive the
+stage, which is #3663 itself. Every other degrade (kill switch, operator off
+switch, `ErrUnsupported`, a `ps` failure under a LIVE ctx) is terminal, so a
+healthy stage still performs exactly one kill pass.
+
+**The backstop is LOG-ONLY.** On those paths `run()` is already returning: there
+is no `res.Events` to append to and no bundle to fold into, so the reap shows up
+as a `stage_orphans_reaped` log line with no bundle event. Accepted — the reap
+is the point, and the log line is enough to diagnose from.
+
+Events:
+
+| Event | When |
+|---|---|
+| `stage_orphans_reaped` (log + bundle) | the sweep reaped a process, found one already gone, or collected a kill error |
+| `stage_orphan_sweep_degraded` (log ONLY) | any named fail-open degrade — **no bundle event**, deliberately: a stage that reaped nothing leaves a trace byte-identical to before #3663, so no existing bundle grows an event and `FISHHAWK_ORPHAN_SWEEP=off` costs nothing in the bundle |
+
+The zero-orphan common case emits **neither**. The six named degrades, the six
+controls on a kill, and the four residuals are in
+`runner/internal/procsweep/README.md`.
+
+### Host-load verify preflight (`verifyhostload.go`)
+
+`hostLoadProbe.sample` is called immediately before EACH committed-tree verify —
+`runVerifyFixLoop`'s scoped run and its (c2) full re-verify, and
+`runVerifyGateCommitted`'s run and its infra-flake absorb re-run — and only the
+LAST sample is retained, so the classification judges the **deciding** verify's
+host conditions.
+
+Classification, in both gates, evaluated **after** refused / unavailable /
+timed-out (each names a more specific cause) and **before** the category-A arm:
+
+- `runVerifyFixLoop`: `!passed && hostProbe.overloaded()` → `FailureCategory="C"`
+  and `FailureReason = hostload.Reason(sample) + "\n" + lastOutput`. The
+  `!passed` conjunct IS the `outcome=="failed"` precondition — every non-failure
+  exit path has already returned by that point.
+- `runVerifyGateCommitted`: the failing-gate arm wraps `gitops.ErrVerifyInfraFailure`
+  with the same lead, which `committedGateFailureCategory` resolves to C.
+
+A `verify_host_overloaded` log line + trace event is emitted at the sample point
+whenever the host is overloaded — **including when the verify then PASSES**, so
+an overloaded host is visible regardless of the verdict. A load-read error fails
+OPEN: one `verify_host_load_unavailable` line, no classification change,
+category A exactly as before.
+
+### Test-insulation contract (`main_test.go`) — do not re-enable package-wide
+
+`runTestMain` does two things this package's tests depend on. **A future test
+author must not undo either.**
+
+1. `readHostLoad` is stubbed to a fixed NON-overloaded sample (`Load1 0.5` on
+   `runtime.NumCPU()` cores). Without it, every `runVerifyFixLoop` call site in
+   this ~31k-line test package would shell out to `sysctl`/`ps` per verify AND —
+   on a loaded developer machine, exactly the #3663 condition — reclassify a
+   deliberately-failing fixture verify from A to C, turning the package red as a
+   function of host load. A test exercising the preflight overrides the var
+   itself with a `t.Cleanup`-restored assignment (`withHostLoad`).
+2. `orphanSweepDefaultOn` is set **false**. This package's tests run inside the
+   `go test` harness's own process tree; a sweeper that actually SIGKILLed its
+   recorded closure could reach the harness's children. A test that needs the
+   real sweeper opts in per-test via `enableOrphanSweepForTest`.
+
+`TestMainStubsHostLoadForPackage` and `TestOrphanSweeperDisabledByDefaultUnderTestBinary`
+pin both.
