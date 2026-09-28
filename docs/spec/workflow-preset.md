@@ -349,8 +349,8 @@ before its first run:
 
 The placeholder is schema-valid as shipped, so a generated preset
 passes validation (and `fishhawk doctor --spec-only`) before the operator
-customizes it. `fishhawk doctor --spec-only` runs only the two
-environment-free rungs (spec schema-validity + execution-path coverage),
+customizes it. `fishhawk doctor --spec-only` runs only the three
+environment-free rungs (spec schema-validity + execution-path coverage + the charter document, where an absent charter is a warning, not a failure),
 so a fresh repo can be validated to the plan gate with no local Fishhawk
 environment.
 
