@@ -632,3 +632,22 @@ func TestResolveDependencies_DeadlineContract(t *testing.T) {
 		})
 	}
 }
+
+// TestEpicChildren_DeclaresNoChildCap pins the stated #3714 RESIDUAL: the
+// gitlab provider leaves EpicChildrenResult.ChildCap at 0, so the server's
+// parent-epic capacity guard is INERT on gitlab. That is deliberate, not an
+// omission — this provider's children are derived from the epic issue's
+// relates_to link CANDIDATES and then narrowed (cross-project and
+// foreign-parent-marker candidates are excluded), so len(Children) is not the
+// size of any structurally capped set and comparing a cap against it would be
+// unsound. A future GitLab cap is an additive one-line change guided by this
+// test.
+func TestEpicChildren_DeclaresNoChildCap(t *testing.T) {
+	res, err := epicChildren(t, epicFixture(), "issue:100")
+	if err != nil {
+		t.Fatalf("EpicChildren: %v", err)
+	}
+	if res.ChildCap != 0 {
+		t.Errorf("ChildCap = %d, want 0 (gitlab declares no structural child cap)", res.ChildCap)
+	}
+}

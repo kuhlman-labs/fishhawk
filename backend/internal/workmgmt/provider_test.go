@@ -44,6 +44,11 @@ func (f *fakeProvider) EpicChildren(_ context.Context, req EpicChildrenRequest) 
 		SatisfiedEdges: []SatisfiedEdge{
 			{From: 2032, To: 1639, State: "closed", StateReason: "completed"},
 		},
+		// The provider-declared hard child cap (#3714): the dispatch-carrying
+		// test below reads it back ONLY through the interface, so this proves
+		// ChildCap survives the Register -> Get -> EpicChildrenQuerier seam the
+		// server's capacity guard reads it across.
+		ChildCap: 100,
 	}, nil
 }
 
@@ -196,6 +201,13 @@ func TestRegistry_DispatchEpicChildren(t *testing.T) {
 	// completed, #42 is not.
 	if !res.Children[0].Complete || res.Children[1].Complete {
 		t.Errorf("children Complete = %v,%v, want true,false", res.Children[0].Complete, res.Children[1].Complete)
+	}
+	// The provider-declared child cap threads through EpicChildrenResult across
+	// the REAL registry dispatch seam (#3714) — the producer end of the server's
+	// parent-epic capacity refusal. A field the server reads but no provider can
+	// carry across this boundary is the seam defect per-layer units would miss.
+	if res.ChildCap != 100 {
+		t.Errorf("ChildCap = %d, want 100 (the declared cap did not survive registry dispatch)", res.ChildCap)
 	}
 	// A satisfied edge leaves Reason at the "" zero value, so the pre-#2120
 	// equality assertion on Edges still holds unchanged (the compatibility the

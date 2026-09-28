@@ -3358,6 +3358,12 @@ func epicJitterGolden() *workmgmt.EpicChildrenResult {
 		SatisfiedEdges: []workmgmt.SatisfiedEdge{
 			{From: 11, To: 900, State: "closed", StateReason: "completed"},
 		},
+		// The provider-declared hard child cap rides every EpicChildren result
+		// (#3714). Naming the CONSTANT rather than the literal 100 keeps this
+		// golden from becoming a second, drifting copy of the value —
+		// TestProvider_EpicChildren_ReportsChildCap is the pin on the number
+		// itself.
+		ChildCap: subIssueChildCap,
 	}
 }
 
@@ -3982,5 +3988,55 @@ func TestProvider_ResolveDependencies_PopulatesNotRunnable(t *testing.T) {
 				t.Errorf("NotRunnable = %v, want %v (labels %v)", got, tc.want, tc.labels)
 			}
 		})
+	}
+}
+
+// TestProvider_EpicChildren_ReportsChildCap is the DONE-MEANS pin for a
+// config-shaped constant no compiler enforces (#3714): GitHub's documented
+// per-parent sub-issue maximum is 100, and the server's capacity guard refuses a
+// filing against a full parent by comparing len(Children) against this reported
+// cap. A comment-only or no-op touch of provider.go would satisfy a
+// scope-presence check and leave this RED.
+//
+// It also pins that ResolveDependencies leaves ChildCap at 0: that path resolves
+// an arbitrary named issue set with no parent link, where a per-parent cap is
+// meaningless and a non-zero value would make the guard compare the cap against
+// a set it does not govern.
+func TestProvider_EpicChildren_ReportsChildCap(t *testing.T) {
+	api := &fakeAPI{
+		parentNode: "EPIC_NODE",
+		listSubResults: []githubclient.SubIssue{
+			{Number: 41, NodeID: "N41", Title: "[E68.1] a", State: "OPEN"},
+			{Number: 42, NodeID: "N42", Title: "[E68.2] b", State: "CLOSED", StateReason: "COMPLETED"},
+		},
+		getIssues: map[int]*githubclient.Issue{},
+	}
+	res, err := New(api).EpicChildren(context.Background(), workmgmt.EpicChildrenRequest{
+		Target: workmgmt.Target{Scope: forge.FromGitHubInstallationID(99), Repo: workmgmt.Repo{Owner: "kuhlman-labs", Name: "fishhawk"}},
+		Epic:   "#2885",
+	})
+	if err != nil {
+		t.Fatalf("EpicChildren: %v", err)
+	}
+	if res.ChildCap != 100 {
+		t.Errorf("ChildCap = %d, want 100 (GitHub's documented per-parent sub-issue maximum)", res.ChildCap)
+	}
+	// The cap is compared against len(Children), and EpicChildren applies no
+	// state filter, so a CLOSED child counts toward it exactly as GitHub counts
+	// it. Complete enumeration is pinned in the githubclient package
+	// (TestListSubIssues_PaginatesAcrossPages / _BoundedByPageCap /
+	// _NilNodeMidPaginationFailsClosed) and deliberately not duplicated here.
+	if len(res.Children) != 2 {
+		t.Errorf("children = %d, want 2 (the closed child counts toward the cap)", len(res.Children))
+	}
+
+	rd, err := New(&fakeAPI{getIssues: map[int]*githubclient.Issue{
+		100: {Number: 100, Title: "root", Body: "no deps", State: "open"},
+	}}).ResolveDependencies(context.Background(), resolveReq("100"))
+	if err != nil {
+		t.Fatalf("ResolveDependencies: %v", err)
+	}
+	if rd.ChildCap != 0 {
+		t.Errorf("ResolveDependencies ChildCap = %d, want 0 (no parent link, so no cap applies)", rd.ChildCap)
 	}
 }

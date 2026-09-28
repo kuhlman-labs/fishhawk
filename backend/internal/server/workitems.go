@@ -448,12 +448,26 @@ func (s *Server) applyAndFileWorkItemWithIntake(ctx context.Context, filing work
 	// serialize and allocate DISTINCT consecutive numbers. The lock is taken
 	// ONLY when {n} is discovered — an explicit-n caller returns a nil unlock
 	// and never contends. Deferred here so it releases after File below.
-	unlockChildNumber, werr := s.deriveChildNumberTitleVar(ctx, &filing, conv, target)
+	unlockChildNumber, capacityChecked, werr := s.deriveChildNumberTitleVar(ctx, &filing, conv, target)
 	if unlockChildNumber != nil {
 		defer unlockChildNumber()
 	}
 	if werr != nil {
 		return nil, nil, werr, nil
+	}
+
+	// Refuse a filing whose parent epic is already at the provider's hard child
+	// cap when derivation did NOT already evaluate it (#3714) — an explicit
+	// title_vars.n, or a type whose title_format carries no {n}. The cap governs
+	// the sub-issue LINK, not the number, so those filings would otherwise land
+	// an UNLINKED orphan. This is the ONE chokepoint all five filing entry
+	// points funnel through (HTTP work-items, defer-concern, live-validation,
+	// refinement, split filing), so no per-call-site edit is needed, and it runs
+	// BEFORE Apply and therefore before File, so nothing is created.
+	if !capacityChecked {
+		if werr := s.guardParentEpicCapacity(ctx, filing, conv, target); werr != nil {
+			return nil, nil, werr, nil
+		}
 	}
 
 	// Derive the area:* label from the parent epic when the type wants an area
@@ -785,6 +799,97 @@ func sequentialNumberLockKey(target workmgmt.Target, prefix string) string {
 	return target.Repo.Owner + "/" + target.Repo.Name + "#" + strings.TrimSpace(prefix)
 }
 
+// parentEpicAtChildCap reports whether the parent epic's observed child set has
+// reached the provider's declared hard child cap (#3714), returning the counts
+// so the refusal can name both numbers. It is pure so the boundary is
+// unit-testable and shared by BOTH refusal sites (deriveChildNumberTitleVar's
+// derived-{n} path and guardParentEpicCapacity's non-derivation path).
+//
+// A ChildCap of 0 means the provider declares NO cap, so the guard is inert.
+// The comparison is >= , not > : at exactly cap children the parent is FULL and
+// the NEXT link is the one that would be rejected.
+func parentEpicAtChildCap(res *workmgmt.EpicChildrenResult) (full bool, count, childCap int) {
+	if res == nil {
+		return false, 0, 0
+	}
+	count, childCap = len(res.Children), res.ChildCap
+	if childCap <= 0 {
+		return false, count, childCap
+	}
+	return count >= childCap, count, childCap
+}
+
+// parentEpicFullError is the SINGLE constructor for the at-cap refusal, called
+// from both refusal sites so the two 422s are byte-identical by construction
+// (#3714). The parent's sub-issue cap governs the LINK, not the number, so an
+// explicit title_vars.n does not bypass it — the message says so, because "pass
+// n explicitly" is the remedy every OTHER 422 on this path names and an
+// operator would otherwise reach for it here too.
+func parentEpicFullError(filingType, epicRef string, count, childCap int) *workItemError {
+	return &workItemError{
+		status: http.StatusUnprocessableEntity, code: "work_item_invalid",
+		msg: fmt.Sprintf(
+			"parent epic %q already carries %d of the provider's maximum %d children, so this filing's parent link would be rejected and its [E<epic>.<n>] title would duplicate an existing one; file under a successor catch-all epic, or file with a different parent_epic (an explicit title_vars.n does not bypass the link cap)",
+			epicRef, count, childCap),
+		details: map[string]any{
+			"type":                    filingType,
+			"parent_epic_full":        true,
+			"parent_epic":             epicRef,
+			"parent_epic_child_count": count,
+			"parent_epic_child_cap":   childCap,
+		},
+	}
+}
+
+// guardParentEpicCapacity refuses a filing whose parent epic is ALREADY at the
+// provider's hard child cap, for every filing that does NOT run {n} derivation
+// (#3714): an explicit title_vars.n, or a type whose title_format carries no
+// {n} at all. The cap is a property of the sub-issue LINK, not of the number,
+// so those filings would otherwise succeed-with-epic_link_error and leave an
+// unlinked orphan — the defect's worse half.
+//
+// deriveChildNumberTitleVar owns the DERIVED-{n} path and evaluates the cap on
+// the EpicChildren result it already holds; it reports that as capacityChecked,
+// and the single call site runs THIS helper only when that is false — so the cap
+// is evaluated exactly once per filing and this is never a second round-trip on
+// the derived path.
+//
+// It is a no-op (returns nil) when Relations.ParentEpic is blank, when
+// workmgmt.Get errors, or when the provider does not implement
+// EpicChildrenQuerier — the same short-circuit ladder derivation uses.
+//
+// It FAILS OPEN on an EpicChildren probe error, logging at WARN: "pass n
+// explicitly" is the documented escape hatch from exactly that error, and
+// failing closed here would make the remedy unreachable. The residual is that a
+// probe error against a genuinely-full parent still files an unlinked issue —
+// narrower than the pre-#3714 unconditional freeze, but real.
+func (*Server) guardParentEpicCapacity(ctx context.Context, filing workmgmt.FilingRequest, conv workmgmt.Conventions, target workmgmt.Target) *workItemError {
+	epicRef := strings.TrimSpace(filing.Relations.ParentEpic)
+	if epicRef == "" {
+		return nil
+	}
+	provider, err := workmgmt.Get(conv.Provider)
+	if err != nil {
+		return nil
+	}
+	querier, ok := provider.(workmgmt.EpicChildrenQuerier)
+	if !ok {
+		return nil
+	}
+	res, err := querier.EpicChildren(ctx, workmgmt.EpicChildrenRequest{Target: target, Epic: epicRef})
+	if err != nil {
+		// FAIL OPEN: see the doc comment. The filing proceeds exactly as it did
+		// before #3714.
+		slog.WarnContext(ctx, "parent epic capacity probe failed; filing proceeds unguarded",
+			"parent_epic", epicRef, "error", err)
+		return nil
+	}
+	if full, count, childCap := parentEpicAtChildCap(res); full {
+		return parentEpicFullError(filing.Type, epicRef, count, childCap)
+	}
+	return nil
+}
+
 // childNumberLockKey is the per-epic serialization key: the target repo plus
 // the parent-epic ref, so two epics (or the same epic ref in different repos)
 // never contend on one lock.
@@ -814,41 +919,60 @@ func childNumberLockKey(target workmgmt.Target, epicRef string) string {
 // caller as unlock, released after File) and calls EpicChildren. A genuine
 // query error releases the lock and returns a *workItemError 422
 // work_item_invalid naming the failure and the fallback ("pass n explicitly"),
-// with details {type, n_discovery_failed}. It ALSO fails closed the same way
+// with details {type, n_discovery_failed}.
+//
+// It ALSO refuses at the parent's CHILD CAP (#3714), on the result already in
+// hand (no second round-trip): when the provider declares a hard cap and the
+// epic already carries that many children, the {n} derivation would freeze at a
+// number whose sub-issue link GitHub rejects, so every later filing renders the
+// SAME [E<epic>.<n>] title (E68 #2885 produced seven [E68.67] issues). It
+// unlocks FIRST — mirroring the EpicChildren-error and zero-match branches'
+// unlock-before-return discipline — and returns the shared parentEpicFullError
+// 422, BEFORE NextChildNumber and therefore before Apply and File, so nothing
+// is created.
+//
+// It ALSO fails closed the same way
 // (unlock, 422 work_item_invalid, details.n_discovery_failed) when the query
 // succeeds but NextChildNumber cannot allocate — children exist yet none carry
 // the numbered [E<epic>.<n>] form, so allocating 1 would collide (#2101). On
 // success it sets filing.TitleVars["n"] = NextChildNumber(...) (with the
 // mandatory nil-map guard, the #1184 precedent) and returns the still-held
 // unlock so the caller serializes Apply + File under it.
+//
+// capacityChecked reports whether THIS call actually evaluated the parent-epic
+// child cap — true only on the branch that called EpicChildren, false on every
+// short-circuit above (unknown type, no {n} in title_format, explicit n, blank
+// parent_epic, unresolved {epic}, unresolvable provider, no EpicChildrenQuerier).
+// The caller runs guardParentEpicCapacity only when it is false, so the cap is
+// evaluated exactly once per filing.
 // The receiver is unused (discovery resolves the provider through the global
 // workmgmt registry, not server config) but the method form mirrors
 // deriveEpicTitleVar/discoverExistingNumbers and keeps the call site uniform.
-func (*Server) deriveChildNumberTitleVar(ctx context.Context, filing *workmgmt.FilingRequest, conv workmgmt.Conventions, target workmgmt.Target) (func(), *workItemError) {
+func (*Server) deriveChildNumberTitleVar(ctx context.Context, filing *workmgmt.FilingRequest, conv workmgmt.Conventions, target workmgmt.Target) (unlockFn func(), capacityChecked bool, werr *workItemError) {
 	itemType, ok := conv.Types[filing.Type]
 	if !ok || !strings.Contains(itemType.TitleFormat, "{n}") {
-		return nil, nil
+		return nil, false, nil
 	}
 	if _, set := filing.TitleVars["n"]; set {
 		// Explicit-n override: skip discovery AND the lock.
-		return nil, nil
+		return nil, false, nil
 	}
 	if strings.TrimSpace(filing.Relations.ParentEpic) == "" {
-		return nil, nil
+		return nil, false, nil
 	}
 	epic, ok := filing.TitleVars["epic"]
 	if !ok || strings.TrimSpace(epic) == "" {
 		// {epic} unresolved: leave {n} unset too so renderTitle's 422 reports
 		// both missing placeholders.
-		return nil, nil
+		return nil, false, nil
 	}
 	provider, err := workmgmt.Get(conv.Provider)
 	if err != nil {
-		return nil, nil
+		return nil, false, nil
 	}
 	querier, ok := provider.(workmgmt.EpicChildrenQuerier)
 	if !ok {
-		return nil, nil
+		return nil, false, nil
 	}
 
 	// Discovery WILL run: serialize the allocate-then-file window per epic.
@@ -859,7 +983,7 @@ func (*Server) deriveChildNumberTitleVar(ctx context.Context, filing *workmgmt.F
 	})
 	if err != nil {
 		unlock()
-		return nil, &workItemError{
+		return nil, true, &workItemError{
 			status: http.StatusUnprocessableEntity, code: "work_item_invalid",
 			msg: fmt.Sprintf(
 				"could not discover the child number for the parent epic %q: %s; pass n explicitly",
@@ -870,6 +994,13 @@ func (*Server) deriveChildNumberTitleVar(ctx context.Context, filing *workmgmt.F
 			},
 		}
 	}
+	// The parent is already FULL: refuse here, before NextChildNumber can freeze
+	// on a number whose link GitHub will reject (#3714). Unlock first, mirroring
+	// the branches either side.
+	if full, count, childCap := parentEpicAtChildCap(res); full {
+		unlock()
+		return nil, true, parentEpicFullError(filing.Type, strings.TrimSpace(filing.Relations.ParentEpic), count, childCap)
+	}
 	n, ok := workmgmt.NextChildNumber(itemType.TitleFormat, epic, res.Children)
 	if !ok {
 		// Children exist but none carry the numbered [E<epic>.<n>] form, so the
@@ -877,7 +1008,7 @@ func (*Server) deriveChildNumberTitleVar(ctx context.Context, filing *workmgmt.F
 		// child (e.g. epic #389's placeholder [E22.X] corpus). Fail closed —
 		// mirror the EpicChildren-error branch's unlock-before-return discipline.
 		unlock()
-		return nil, &workItemError{
+		return nil, true, &workItemError{
 			status: http.StatusUnprocessableEntity, code: "work_item_invalid",
 			msg: fmt.Sprintf(
 				"could not discover the child number for the parent epic %q: it has %d children but none carry the numbered [E%s.<n>] form; pass n explicitly",
@@ -896,7 +1027,7 @@ func (*Server) deriveChildNumberTitleVar(ctx context.Context, filing *workmgmt.F
 		filing.TitleVars = map[string]string{}
 	}
 	filing.TitleVars["n"] = strconv.Itoa(n)
-	return unlock, nil
+	return unlock, true, nil
 }
 
 // epicTitleRE extracts the epic number from a parent epic's leading

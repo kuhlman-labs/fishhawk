@@ -874,6 +874,14 @@ func TestFileWorkItem_GitLab_EndToEnd(t *testing.T) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusCreated)
 			_, _ = io.WriteString(w, `{"iid":42,"web_url":"https://gitlab.example/group/subgroup/app/-/issues/42"}`)
+		case r.Method == http.MethodGet && esc == "/api/v4/projects/55/issues/100/links":
+			// The parent-epic CAPACITY probe (#3714): an explicit title_vars.n
+			// skips {n} derivation, so guardParentEpicCapacity makes its own
+			// EpicChildren read — on gitlab that is the epic issue's relates_to
+			// links. An empty link set means no children, and gitlab declares no
+			// ChildCap, so the guard is doubly inert and the filing proceeds.
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `[]`)
 		case r.Method == http.MethodPost && esc == "/api/v4/projects/55/issues/42/links":
 			// Best-effort parent link.
 			linkHit = true
@@ -2678,6 +2686,10 @@ type fakeChildNumberProvider struct {
 	filedTitles  []string
 	appendOnFile bool
 	number       int
+	// childCap is the provider-declared hard child cap the fake reports on its
+	// EpicChildrenResult (#3714). 0 (the default) means "no cap declared", which
+	// keeps every pre-#3714 fixture's guard inert and its behaviour unchanged.
+	childCap int
 
 	// EpicChildren-read barrier (#1958, binding condition 1). When barrierN > 0,
 	// each EpicChildren call reports arrival and blocks until barrierN calls have
@@ -2739,7 +2751,7 @@ func (f *fakeChildNumberProvider) EpicChildren(_ context.Context, req workmgmt.E
 	}
 	out := make([]workmgmt.EpicChild, len(f.children))
 	copy(out, f.children)
-	return &workmgmt.EpicChildrenResult{Children: out}, nil
+	return &workmgmt.EpicChildrenResult{Children: out, ChildCap: f.childCap}, nil
 }
 
 func (f *fakeChildNumberProvider) File(_ context.Context, req workmgmt.ProviderRequest) (*workmgmt.CreatedItem, error) {
@@ -2815,8 +2827,10 @@ func TestFileWorkItem_ChildNumberDiscovered(t *testing.T) {
 }
 
 // TestFileWorkItem_ChildNumberExplicitOverride asserts a caller-supplied n
-// short-circuits discovery — EpicChildren is NOT called and the caller's value
-// is rendered verbatim (the override contract, mirroring existing_numbers).
+// short-circuits {n} discovery — NextChildNumber is NOT consulted and the
+// caller's value is rendered verbatim (the override contract, mirroring
+// existing_numbers). Since #3714 the single EpicChildren call on this path is
+// the parent-epic CAPACITY probe, not discovery.
 func TestFileWorkItem_ChildNumberExplicitOverride(t *testing.T) {
 	fp := &fakeChildNumberProvider{children: []workmgmt.EpicChild{{Title: "[E7.9] would yield 10"}}}
 	registerFakeChildNumberProvider(t, fp)
@@ -2833,8 +2847,13 @@ func TestFileWorkItem_ChildNumberExplicitOverride(t *testing.T) {
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
 	}
-	if fp.epicCalls != 0 {
-		t.Errorf("EpicChildren called %d times, want 0 (explicit n overrides discovery)", fp.epicCalls)
+	// ONE EpicChildren call, and it is the #3714 parent-epic CAPACITY probe, not
+	// {n} discovery: the fixture's lone child is [E7.9], so a derivation that had
+	// NOT been short-circuited would render [E7.10]. The title assertion below is
+	// what proves the override; the count only pins that the guard probes exactly
+	// once (the cap governs the sub-issue LINK, so an explicit n cannot bypass it).
+	if fp.epicCalls != 1 {
+		t.Errorf("EpicChildren called %d times, want 1 (the capacity probe only)", fp.epicCalls)
 	}
 	if fp.lastFileReq.Item.Title != "[E7.3] Caller knows the number" {
 		t.Errorf("filed title = %q, want the caller's n rendered verbatim", fp.lastFileReq.Item.Title)
@@ -2984,9 +3003,11 @@ func TestFileWorkItem_ChildNumberZeroMatchFailsClosed(t *testing.T) {
 // criterion 3 against the EXACT zero-match scenario the #2101 fix names: an
 // explicit title_vars.n supplied against an epic whose children are non-empty
 // but carry only unmatched [E22.X] titles STILL succeeds (201, issue filed),
-// because the explicit-n override short-circuits discovery entirely —
-// EpicChildren and NextChildNumber never run, so the fail-closed branch cannot
-// fire. This proves the override path is unaffected by the fix.
+// because the explicit-n override short-circuits {n} DISCOVERY entirely —
+// NextChildNumber never runs, so the #2101 fail-closed branch cannot fire. This
+// proves the override path is unaffected by the fix. (Since #3714 ONE
+// EpicChildren call still happens: the parent-epic capacity probe, which is
+// inert here because the fake declares no ChildCap.)
 func TestFileWorkItem_ChildNumberZeroMatchExplicitOverride(t *testing.T) {
 	fp := &fakeChildNumberProvider{children: []workmgmt.EpicChild{
 		{Number: 601, Title: "[E22.X] placeholder one"},
@@ -3006,8 +3027,12 @@ func TestFileWorkItem_ChildNumberZeroMatchExplicitOverride(t *testing.T) {
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
 	}
-	if fp.epicCalls != 0 {
-		t.Errorf("EpicChildren called %d times, want 0 (explicit n short-circuits discovery)", fp.epicCalls)
+	// The one EpicChildren call is the #3714 capacity probe, NOT discovery:
+	// NextChildNumber never runs (the [E22.X] corpus would make it fail closed),
+	// and the fake declares no ChildCap, so the guard is inert and the filing
+	// still succeeds — the point this test exists to pin.
+	if fp.epicCalls != 1 {
+		t.Errorf("EpicChildren called %d times, want 1 (the capacity probe only; discovery is short-circuited)", fp.epicCalls)
 	}
 	if fp.fileCalls != 1 {
 		t.Errorf("File called %d times, want 1 (the filing succeeds)", fp.fileCalls)
@@ -3497,5 +3522,294 @@ func TestKeyedLocks_DistinctKeysDoNotContend(t *testing.T) {
 	case <-acquired:
 	case <-time.After(timescale.D(2 * time.Second)):
 		t.Fatal("acquiring a DISTINCT key blocked while another key was held — the helper is serializing on one global mutex")
+	}
+}
+
+// --- parent-epic child-cap refusal (#3714) ---
+
+// numberedChildCorpus builds n well-formed numbered child titles
+// [E<epic>.1..E<epic>.n]. Fixture discipline matters here (the plan's
+// anti-MASKING note): the titles MUST be well-formed so NextChildNumber
+// SUCCEEDS, otherwise the pre-existing #2101 zero-match guard would refuse the
+// filing on its own and MASK the new cap control — the at-cap test would stay
+// green with the cap check deleted.
+func numberedChildCorpus(epic string, n int) []workmgmt.EpicChild {
+	out := make([]workmgmt.EpicChild, 0, n)
+	for i := 1; i <= n; i++ {
+		out = append(out, workmgmt.EpicChild{
+			Number: 500 + i,
+			Title:  fmt.Sprintf("[E%s.%d] child %d", epic, i, i),
+		})
+	}
+	return out
+}
+
+// capRefusal decodes the shared at-cap 422 and asserts every detail key the
+// refusal contract names, so both refusal sites are checked against ONE
+// expectation (they are built by one constructor, parentEpicFullError).
+func assertParentEpicFullRefusal(t *testing.T, rec *httptest.ResponseRecorder, wantCount, wantCap int) {
+	t.Helper()
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 (body=%s)", rec.Code, rec.Body.String())
+	}
+	var env errorEnvelope
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode error envelope: %v (body=%s)", err, rec.Body.String())
+	}
+	if env.Error.Code != "work_item_invalid" {
+		t.Errorf("code = %q, want work_item_invalid", env.Error.Code)
+	}
+	if full, _ := env.Error.Details["parent_epic_full"].(bool); !full {
+		t.Errorf("details.parent_epic_full = %v, want true: %v", env.Error.Details["parent_epic_full"], env.Error.Details)
+	}
+	if got, _ := env.Error.Details["parent_epic"].(string); got != "#389" {
+		t.Errorf("details.parent_epic = %v, want #389", env.Error.Details["parent_epic"])
+	}
+	if got, _ := env.Error.Details["parent_epic_child_count"].(float64); int(got) != wantCount {
+		t.Errorf("details.parent_epic_child_count = %v, want %d", env.Error.Details["parent_epic_child_count"], wantCount)
+	}
+	if got, _ := env.Error.Details["parent_epic_child_cap"].(float64); int(got) != wantCap {
+		t.Errorf("details.parent_epic_child_cap = %v, want %d", env.Error.Details["parent_epic_child_cap"], wantCap)
+	}
+	// The remedy must be named, and the non-bypass stated: "pass n explicitly"
+	// is the escape hatch every OTHER 422 on this path offers, and it does NOT
+	// work here.
+	if !strings.Contains(env.Error.Message, "successor catch-all epic") ||
+		!strings.Contains(env.Error.Message, "does not bypass the link cap") {
+		t.Errorf("message does not name the remedy and the non-bypass: %q", env.Error.Message)
+	}
+}
+
+// TestFileWorkItem_ParentEpicAtCapRefusedOnDerivedPath is the #3714 done-means
+// on the DERIVED-{n} path: a parent epic already carrying the provider's hard
+// cap of children refuses the filing 422 with details.parent_epic_full BEFORE
+// anything is created, instead of freezing {n} at a number whose sub-issue link
+// GitHub rejects and rendering the same [E<epic>.<n>] title on every later
+// filing (E68 #2885 produced seven [E68.67] issues).
+func TestFileWorkItem_ParentEpicAtCapRefusedOnDerivedPath(t *testing.T) {
+	fp := &fakeChildNumberProvider{children: numberedChildCorpus("68", 100), childCap: 100}
+	registerFakeChildNumberProvider(t, fp)
+	s := New(Config{})
+
+	rec := fileWorkItem(t, s, workItemRequest{
+		Repo:      "kuhlman-labs/fishhawk",
+		Type:      "feature",
+		Summary:   "Would freeze at 101",
+		TitleVars: map[string]string{"epic": "68"}, // n omitted -> derivation path
+		Relations: &workItemRelations{ParentEpic: "#389"},
+	}, "github:operator")
+
+	assertParentEpicFullRefusal(t, rec, 100, 100)
+	if fp.fileCalls != 0 {
+		t.Errorf("provider File dispatched %d times; the refusal must precede Apply and File so NOTHING is created", fp.fileCalls)
+	}
+}
+
+// TestFileWorkItem_ParentEpicBelowCapStillFiles is the BOUNDARY below the cap:
+// 99 children of a 100-cap epic is NOT full, so the filing succeeds and the
+// derived {n} is exactly 100 — the last allocatable number. This is the arm
+// that discriminates `>= cap` from `> cap`.
+func TestFileWorkItem_ParentEpicBelowCapStillFiles(t *testing.T) {
+	fp := &fakeChildNumberProvider{children: numberedChildCorpus("68", 99), childCap: 100}
+	registerFakeChildNumberProvider(t, fp)
+	s := New(Config{})
+
+	rec := fileWorkItem(t, s, workItemRequest{
+		Repo:      "kuhlman-labs/fishhawk",
+		Type:      "feature",
+		Summary:   "The last allocatable child",
+		TitleVars: map[string]string{"epic": "68"},
+		Relations: &workItemRelations{ParentEpic: "#389"},
+	}, "github:operator")
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (99 of 100 is not full) (body=%s)", rec.Code, rec.Body.String())
+	}
+	if fp.lastFileReq.Item.Title != "[E68.100] The last allocatable child" {
+		t.Errorf("filed title = %q, want [E68.100] (max(1..99)+1)", fp.lastFileReq.Item.Title)
+	}
+}
+
+// TestFileWorkItem_ParentEpicAtCapRefusedOnExplicitNPath pins the cap on the
+// NON-derivation path: an explicit title_vars.n short-circuits {n} discovery,
+// but the cap governs the sub-issue LINK, not the number, so the filing is
+// refused identically. Without this the filing would land an UNLINKED orphan
+// (succeed-with-epic_link_error) — the defect's worse half.
+func TestFileWorkItem_ParentEpicAtCapRefusedOnExplicitNPath(t *testing.T) {
+	fp := &fakeChildNumberProvider{children: numberedChildCorpus("68", 100), childCap: 100}
+	registerFakeChildNumberProvider(t, fp)
+	s := New(Config{})
+
+	rec := fileWorkItem(t, s, workItemRequest{
+		Repo:      "kuhlman-labs/fishhawk",
+		Type:      "feature",
+		Summary:   "Explicit n does not bypass the link cap",
+		TitleVars: map[string]string{"epic": "68", "n": "150"},
+		Relations: &workItemRelations{ParentEpic: "#389"},
+	}, "github:operator")
+
+	assertParentEpicFullRefusal(t, rec, 100, 100)
+	if fp.fileCalls != 0 {
+		t.Errorf("provider File dispatched %d times; an explicit n must not bypass the cap", fp.fileCalls)
+	}
+}
+
+// capConventions installs conventions carrying a type whose title_format has NO
+// {n} placeholder but whose epic_link is optional, so a filing of it can carry
+// a parent_epic and reach the non-derivation capacity guard. The shipped default
+// conventions have no such type (adr/epic both carry epic_link: none), so this
+// branch is only reachable through a deployment override (ADR-058 #1856).
+func capConventions(t *testing.T) {
+	t.Helper()
+	conv := workmgmt.Default()
+	flat := conv.Types["chore"]
+	flat.TitleFormat = "{summary}" // no {n}: derivation short-circuits
+	flat.EpicLink = "optional"
+	types := make(map[string]workmgmt.ItemType, len(conv.Types)+1)
+	for k, v := range conv.Types {
+		types[k] = v
+	}
+	types["flatchore"] = flat
+	conv.Types = types
+	prev := conventionsLoader
+	conventionsLoader = func(context.Context, string) (workmgmt.Conventions, error) { return conv, nil }
+	t.Cleanup(func() { conventionsLoader = prev })
+}
+
+// TestFileWorkItem_ParentEpicAtCapRefusedForTypeWithoutChildNumber pins the
+// widest arm: a type whose title_format carries NO {n} at all, filed against a
+// full parent epic, is refused identically. The cap is a property of the LINK,
+// so a filing that never needed a child number is still unlinkable.
+func TestFileWorkItem_ParentEpicAtCapRefusedForTypeWithoutChildNumber(t *testing.T) {
+	capConventions(t)
+	fp := &fakeChildNumberProvider{children: numberedChildCorpus("68", 100), childCap: 100}
+	registerFakeChildNumberProvider(t, fp)
+	s := New(Config{})
+
+	rec := fileWorkItem(t, s, workItemRequest{
+		Repo:      "kuhlman-labs/fishhawk",
+		Type:      "flatchore",
+		Summary:   "No child number at all",
+		Relations: &workItemRelations{ParentEpic: "#389"},
+	}, "github:operator")
+
+	assertParentEpicFullRefusal(t, rec, 100, 100)
+	if fp.fileCalls != 0 {
+		t.Errorf("provider File dispatched %d times; the cap governs the LINK, not the number", fp.fileCalls)
+	}
+}
+
+// TestFileWorkItem_ParentEpicNoDeclaredCapIsInert is the provider-declares-no-cap
+// arm: ChildCap 0 with 150 children still files. The guard must be inert for a
+// provider whose Children set is not the structurally-capped set the link writes
+// into — the stated gitlab residual.
+func TestFileWorkItem_ParentEpicNoDeclaredCapIsInert(t *testing.T) {
+	fp := &fakeChildNumberProvider{children: numberedChildCorpus("68", 150), childCap: 0}
+	registerFakeChildNumberProvider(t, fp)
+	s := New(Config{})
+
+	rec := fileWorkItem(t, s, workItemRequest{
+		Repo:      "kuhlman-labs/fishhawk",
+		Type:      "feature",
+		Summary:   "No cap declared",
+		TitleVars: map[string]string{"epic": "68"},
+		Relations: &workItemRelations{ParentEpic: "#389"},
+	}, "github:operator")
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (ChildCap 0 declares no cap) (body=%s)", rec.Code, rec.Body.String())
+	}
+	if fp.lastFileReq.Item.Title != "[E68.151] No cap declared" {
+		t.Errorf("filed title = %q, want [E68.151] (allocation unaffected)", fp.lastFileReq.Item.Title)
+	}
+}
+
+// TestFileWorkItem_ParentEpicCapProbeErrorFailsOpen pins the deliberate FAIL
+// OPEN on the non-derivation path: an EpicChildren probe error lets the filing
+// through exactly as it did before #3714, because "pass n explicitly" is the
+// documented escape hatch from that very error and failing closed here would
+// make the remedy unreachable. The residual — a probe error against a
+// genuinely-full parent still files an unlinked issue — is real and stated.
+//
+// Note the CONTRAST this arm draws with
+// TestFileWorkItem_ChildNumberDiscoveryErrorFailsClosed: the SAME probe error on
+// the DERIVED-{n} path fails CLOSED, because there the error also means no
+// number can be allocated.
+func TestFileWorkItem_ParentEpicCapProbeErrorFailsOpen(t *testing.T) {
+	fp := &fakeChildNumberProvider{epicErr: errors.New("sub-issues API exploded"), childCap: 100}
+	registerFakeChildNumberProvider(t, fp)
+	s := New(Config{})
+
+	rec := fileWorkItem(t, s, workItemRequest{
+		Repo:      "kuhlman-labs/fishhawk",
+		Type:      "feature",
+		Summary:   "Probe error must not wedge the escape hatch",
+		TitleVars: map[string]string{"epic": "68", "n": "7"},
+		Relations: &workItemRelations{ParentEpic: "#389"},
+	}, "github:operator")
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (the capacity guard FAILS OPEN on a probe error) (body=%s)", rec.Code, rec.Body.String())
+	}
+	if fp.fileCalls != 1 {
+		t.Errorf("File called %d times, want 1 (the escape hatch is preserved)", fp.fileCalls)
+	}
+	if fp.lastFileReq.Item.Title != "[E68.7] Probe error must not wedge the escape hatch" {
+		t.Errorf("filed title = %q, want the explicit n rendered verbatim", fp.lastFileReq.Item.Title)
+	}
+}
+
+// TestFileWorkItem_ParentEpicCapInertWithoutQuerierCapability pins the
+// capability short-circuit: a provider that does not implement
+// EpicChildrenQuerier cannot be probed, so a parent_epic filing of a type
+// needing no {n} is unchanged by #3714.
+func TestFileWorkItem_ParentEpicCapInertWithoutQuerierCapability(t *testing.T) {
+	capConventions(t)
+	fp := &fakeWorkProvider{} // File-only, no EpicChildrenQuerier capability
+	registerFakeProvider(t, fp)
+	s := New(Config{})
+
+	rec := fileWorkItem(t, s, workItemRequest{
+		Repo:      "kuhlman-labs/fishhawk",
+		Type:      "flatchore",
+		Summary:   "No querier capability",
+		Relations: &workItemRelations{ParentEpic: "#389"},
+	}, "github:operator")
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (no capability to probe) (body=%s)", rec.Code, rec.Body.String())
+	}
+	if !fp.called {
+		t.Error("provider File was not dispatched; the guard must be inert without the capability")
+	}
+}
+
+// TestParentEpicAtChildCap is the pure boundary unit for the predicate BOTH
+// refusal sites share. It pins the `>= cap` semantics (at the cap the parent is
+// full: the NEXT link is the rejected one), the no-cap-declared inertness, and
+// the nil-result guard.
+func TestParentEpicAtChildCap(t *testing.T) {
+	children := func(n int) []workmgmt.EpicChild { return make([]workmgmt.EpicChild, n) }
+	for _, tc := range []struct {
+		name      string
+		res       *workmgmt.EpicChildrenResult
+		wantFull  bool
+		wantCount int
+		wantCap   int
+	}{
+		{"nil result", nil, false, 0, 0},
+		{"no cap declared, many children", &workmgmt.EpicChildrenResult{Children: children(150)}, false, 150, 0},
+		{"one below the cap", &workmgmt.EpicChildrenResult{Children: children(99), ChildCap: 100}, false, 99, 100},
+		{"exactly at the cap", &workmgmt.EpicChildrenResult{Children: children(100), ChildCap: 100}, true, 100, 100},
+		{"over the cap", &workmgmt.EpicChildrenResult{Children: children(101), ChildCap: 100}, true, 101, 100},
+		{"empty epic with a cap", &workmgmt.EpicChildrenResult{ChildCap: 100}, false, 0, 100},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			full, count, childCap := parentEpicAtChildCap(tc.res)
+			if full != tc.wantFull || count != tc.wantCount || childCap != tc.wantCap {
+				t.Errorf("parentEpicAtChildCap = (%v, %d, %d), want (%v, %d, %d)",
+					full, count, childCap, tc.wantFull, tc.wantCount, tc.wantCap)
+			}
+		})
 	}
 }
