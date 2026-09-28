@@ -8,6 +8,8 @@ import type {
   Campaign,
   CampaignState,
   CampaignStatus,
+  GateView,
+  GateViewStageKind,
   PaginatedList,
   Run,
   Stage,
@@ -140,15 +142,46 @@ export const api = {
 
   listRunAudit(
     runId: string,
-    params?: { limit?: number; cursor?: string; category?: string; stageId?: string },
+    params?: {
+      limit?: number;
+      cursor?: string;
+      category?: string;
+      stageId?: string;
+      /**
+       * Return only entries with sequence strictly greater than this value
+       * (applied before pagination). With `limit: 1` and `N - 1` it
+       * resolves the single entry at sequence N independently of list
+       * pagination — the run-narrative evidence-link target (#1715).
+       * `0` is a valid anchor (sequences start at 1), so presence is
+       * tested with `!== undefined`, not truthiness.
+       */
+      sinceSequence?: number;
+    },
   ): Promise<PaginatedList<AuditEntry>> {
     const q = new URLSearchParams();
     if (params?.limit) q.set('limit', String(params.limit));
     if (params?.cursor) q.set('cursor', params.cursor);
     if (params?.category) q.set('category', params.category);
     if (params?.stageId) q.set('stage_id', params.stageId);
+    if (params?.sinceSequence !== undefined) {
+      q.set('since_sequence', String(params.sinceSequence));
+    }
     const qs = q.toString();
     return request(`/v0/runs/${encodeURIComponent(runId)}/audit${qs ? `?${qs}` : ''}`);
+  },
+
+  /**
+   * The gate-scoped decision view (#1960): open concerns with full note
+   * prose + cross-round history, the settled ledger, and suppressed
+   * relitigations. The run-narrative verdicts section (#1715) joins
+   * reviewer verdicts against it. A `503 gate_view_unconfigured` surfaces
+   * as an ApiClientError like every other non-2xx.
+   */
+  getRunGateView(runId: string, params?: { stageKind?: GateViewStageKind }): Promise<GateView> {
+    const q = new URLSearchParams();
+    if (params?.stageKind) q.set('stage_kind', params.stageKind);
+    const qs = q.toString();
+    return request(`/v0/runs/${encodeURIComponent(runId)}/gate-view${qs ? `?${qs}` : ''}`);
   },
 
   /**

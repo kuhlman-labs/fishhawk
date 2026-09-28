@@ -78,6 +78,12 @@ export type StageState =
   | 'cancelled'
   | 'superseded';
 
+// Deliberately NOT widened to 'acceptance' (#1715): the OpenAPI Stage.type
+// enum is still [plan, implement, review, deploy] even though the backend runs
+// `type: acceptance` stages (.fishhawk/workflows.yaml feature_change). The
+// mirror tracks the documented wire enum, so a consumer that needs the
+// acceptance stage (the run-narrative acceptance section) keys off the
+// acceptance_outcome_recorded audit entry's stage_id rather than stage.type.
 export type StageType = 'plan' | 'implement' | 'review' | 'deploy';
 export type ExecutorKind = 'agent' | 'human';
 export type FailureCategory = 'A' | 'B' | 'C' | 'D';
@@ -152,7 +158,17 @@ export interface Stage {
   updated_at: string;
 }
 
-export type ArtifactKind = 'plan' | 'pull_request' | 'deployment';
+// Mirrors the OpenAPI Artifact.kind enum. 'acceptance' is the acceptance
+// stage's verdict artifact (frontend/src/api/acceptance.ts), which the
+// run-narrative acceptance section selects by kind (#1715).
+export type ArtifactKind =
+  | 'plan'
+  | 'pull_request'
+  | 'deployment'
+  | 'acceptance'
+  | 'release_notes'
+  | 'grooming_report'
+  | 'acceptance_transcript';
 
 export interface Artifact<C = unknown> {
   id: string;
@@ -433,6 +449,102 @@ export interface AttentionList {
   degraded: AttentionDegraded[];
   truncated: boolean;
   scanned_runs: number;
+}
+
+/*
+ * Gate view (#1960). Mirrors the GateView / GateViewConcern /
+ * GateViewSettledConcern / GateViewFixup / GateViewResolution /
+ * GateViewDispute / GateViewSuppressedRelitigation schemas in
+ * docs/api/v0.openapi.yaml (GET /v0/runs/{run_id}/gate-view). The
+ * run-narrative verdicts section (#1715) joins reviewer verdicts to this
+ * concern lifecycle ledger. live_validation / review_diff_truncated /
+ * review_head_mismatch are not mirrored: no SPA surface reads them yet.
+ */
+export type GateViewStageKind = 'plan' | 'implement';
+
+export interface GateViewFixup {
+  sequence: number;
+  reason?: string;
+  outcome: 'pushed' | 'no_changes' | 'recovered' | 'pending';
+  apply_path?: string;
+  head_sha?: string;
+}
+
+export interface GateViewResolution {
+  sequence: number;
+  round?: number;
+  /** The reviewer verdict (`confirmed` / `reopened` / `superseded`). */
+  resolution: string;
+  note?: string;
+}
+
+export interface GateViewDispute {
+  sequence: number;
+  round?: number;
+  veto_reason: string;
+  resolution?: string;
+  confirming_reviewer_model?: string;
+  raising_reviewer_model?: string;
+  note?: string;
+}
+
+/** One OPEN concern with its full decision context. */
+export interface GateViewConcern {
+  id: string;
+  stage_kind: GateViewStageKind;
+  round?: number;
+  origin_review_sequence: number;
+  reviewer_model?: string;
+  severity: string;
+  category: string;
+  state: string;
+  state_reason?: string;
+  note: string;
+  new_evidence?: string;
+  settled_ref?: string;
+  has_suggested_patch: boolean;
+  fixups?: GateViewFixup[];
+  resolutions?: GateViewResolution[];
+  disputed?: boolean;
+  disputes?: GateViewDispute[];
+}
+
+/**
+ * One settled-ledger row. Unlike GateViewConcern it carries NO
+ * origin_review_sequence, so a join against it cannot key on the raising
+ * review's sequence.
+ */
+export interface GateViewSettledConcern {
+  id: string;
+  stage_kind: GateViewStageKind;
+  state: string;
+  severity: string;
+  category: string;
+  reviewer_model?: string;
+  note: string;
+  state_reason?: string;
+  new_evidence?: string;
+  settled_ref?: string;
+}
+
+export interface GateViewSuppressedRelitigation {
+  settled_ref: string;
+  settled_state: string;
+  severity: string;
+  category: string;
+  note: string;
+  reviewer_model?: string;
+  origin_review_sequence: number;
+}
+
+export interface GateView {
+  run_id: string;
+  stage_kind?: GateViewStageKind;
+  open: GateViewConcern[];
+  settled: GateViewSettledConcern[];
+  suppressed_relitigations: GateViewSuppressedRelitigation[];
+  history_incomplete: boolean;
+  history_gaps?: string[];
 }
 
 export type ApprovalDecision = 'approve' | 'reject';
