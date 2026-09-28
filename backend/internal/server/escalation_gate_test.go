@@ -15,6 +15,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/escalation"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
@@ -917,5 +918,117 @@ func TestResolveStageEscalations_NoRunRepo(t *testing.T) {
 	}
 	if !req.IsZero() {
 		t.Errorf("requirements = %+v, want zero", req)
+	}
+}
+
+// --- fired_keys: the stable content-derived coordinate (E75.1 / #3729) ------
+
+// escGateReorderBlock declares TWO escalations. `matchedFirst` selects which
+// order they are declared in; only the paths rule fires against a run carrying
+// no labels, so reordering moves that rule's POSITIONAL index while leaving
+// its content — and therefore its RuleKey — untouched.
+func escGateReorderBlock(matchedFirst bool) string {
+	pathsRule := `      - match:
+          paths: ["backend/internal/server/**"]
+        require:
+          approvals:
+            count: 2
+            member_of: acme/security
+`
+	labelsRule := `      - match:
+          labels: ["area:runner"]
+        require:
+          max_autonomy: low
+`
+	if matchedFirst {
+		return "    escalations:\n" + pathsRule + labelsRule
+	}
+	return "    escalations:\n" + labelsRule + pathsRule
+}
+
+// escGateFiredPayload drives ONE evaluation of the given escalations block and
+// returns the decoded escalation_fired payload.
+func escGateFiredPayload(t *testing.T, escalations string) escalationFiredPayload {
+	t.Helper()
+	rr, au, ar := newEscGateRunRepo(), &escGateAuditRepo{}, newEscGateArtifactRepo()
+	s := escGateServer(rr, au, ar)
+	runRow := escGateRun(t, escalations, nil)
+	planStage := &run.Stage{ID: uuid.New(), RunID: runRow.ID, Type: run.StageTypePlan}
+	rr.seed(runRow, planStage)
+	ar.seedPlan(t, planStage.ID, escGatePlan("backend/internal/server/runs.go"))
+	wf, _ := s.escalationsForRun(runRow)
+	res, err := s.resolveEscalations(context.Background(), runRow, wf, planStage.ID)
+	if err != nil {
+		t.Fatalf("resolveEscalations: %v", err)
+	}
+	if n := au.firedCount(); n != 1 {
+		t.Fatalf("escalation_fired entries = %d, want 1", n)
+	}
+	var payload escalationFiredPayload
+	if uerr := json.Unmarshal(au.appended[0].Payload, &payload); uerr != nil {
+		t.Fatalf("unmarshal payload: %v", uerr)
+	}
+	// The recorded keys must equal RuleKey of the declarations that actually
+	// matched — read off the evaluation, so a payload built from the wrong
+	// declarations is caught here rather than only by the reordering case.
+	if len(res.Fired) != len(payload.FiredKeys) {
+		t.Fatalf("fired_keys = %v, want one key per fired declaration (%d)", payload.FiredKeys, len(res.Fired))
+	}
+	for i, f := range res.Fired {
+		if want := escalation.RuleKey(f.Escalation); payload.FiredKeys[i] != want {
+			t.Errorf("fired_keys[%d] = %q, want escalation.RuleKey of the matched declaration (%q)", i, payload.FiredKeys[i], want)
+		}
+	}
+	return payload
+}
+
+// TestEscalationFiredAudit_FiredKeysIndexAligned is the DONE-MEANS gate for the
+// stable-escalation-key half of #3729. A comment-only or otherwise no-op touch
+// of escalation_gate.go satisfies the scope-completeness presence check but
+// leaves fired_keys absent from the decoded payload, and this test fails.
+func TestEscalationFiredAudit_FiredKeysIndexAligned(t *testing.T) {
+	payload := escGateFiredPayload(t, escGatePathsBlock)
+	if len(payload.Fired) != 1 {
+		t.Fatalf("fired = %v, want exactly one index", payload.Fired)
+	}
+	if len(payload.FiredKeys) != len(payload.Fired) {
+		t.Fatalf("fired_keys = %v (len %d), want the same length as fired (%d) — the two arrays name the same firings",
+			payload.FiredKeys, len(payload.FiredKeys), len(payload.Fired))
+	}
+	if payload.FiredKeys[0] == "" {
+		t.Error("fired_keys[0] is empty; the stable content key must be recorded")
+	}
+	// The existing coordinates are untouched: the de-duplication key is still
+	// the result-level fingerprint, and it is NOT the rule key.
+	if payload.Fingerprint == "" {
+		t.Error("fingerprint is empty; fired_keys must be ADDITIVE, not a replacement")
+	}
+	if payload.Fingerprint == payload.FiredKeys[0] {
+		t.Error("fingerprint equals fired_keys[0]; the result-level de-duplication key and the rule-level join key must be distinct coordinates")
+	}
+}
+
+// TestEscalationFiredAudit_FiredKeyStableAcrossDeclarationReordering pins the
+// property the positional index cannot provide: reordering two declarations
+// moves the recorded INDEX while the recorded KEY holds, so a decision index
+// joined on fired_keys follows the rule across the edit.
+func TestEscalationFiredAudit_FiredKeyStableAcrossDeclarationReordering(t *testing.T) {
+	first := escGateFiredPayload(t, escGateReorderBlock(true))
+	second := escGateFiredPayload(t, escGateReorderBlock(false))
+
+	if len(first.Fired) != 1 || len(second.Fired) != 1 {
+		t.Fatalf("fired = %v / %v, want exactly one matched declaration each", first.Fired, second.Fired)
+	}
+	// Fixture discrimination: if the index did NOT move, this arm proves
+	// nothing about stability.
+	if first.Fired[0] == second.Fired[0] {
+		t.Fatalf("fixture is not discriminating: the declaration index stayed at %d across the reordering", first.Fired[0])
+	}
+	if len(first.FiredKeys) != 1 || len(second.FiredKeys) != 1 {
+		t.Fatalf("fired_keys = %v / %v, want one key each", first.FiredKeys, second.FiredKeys)
+	}
+	if first.FiredKeys[0] != second.FiredKeys[0] {
+		t.Errorf("fired_keys moved under an unrelated reordering: %q → %q; the recorded key must carry no positional index",
+			first.FiredKeys[0], second.FiredKeys[0])
 	}
 }

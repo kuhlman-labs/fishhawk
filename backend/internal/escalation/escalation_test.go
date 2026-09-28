@@ -226,3 +226,182 @@ func TestRenderFired_NonPathCriteria(t *testing.T) {
 		}
 	}
 }
+
+// --- RuleKey: the stable, content-derived per-rule join key (E75.1 / #3729) --
+
+// ruleKeyRuleA is the rule under test across the RuleKey cases: one paths
+// criterion and one approvals clamp.
+func ruleKeyRuleA() spec.Escalation {
+	return esc(
+		spec.Predicate{Paths: []string{"backend/internal/server/**", "backend/internal/audit/**"}},
+		spec.EscalationRequirements{Approvals: &spec.EscalatedApprovals{Count: ptr(2)}},
+	)
+}
+
+// ruleKeyRuleB is an UNRELATED sibling declaration: it exists only to be
+// reordered around rule A.
+func ruleKeyRuleB() spec.Escalation {
+	return esc(
+		spec.Predicate{Labels: []string{"area:runner"}},
+		spec.EscalationRequirements{MaxAutonomy: spec.AutonomyTier("low")},
+	)
+}
+
+// TestRuleKey_StableAcrossReordering is the defect the issue names: the
+// positional Index moves when an unrelated declaration is inserted ahead of a
+// rule, so an index-keyed decision index loses the rule. RuleKey must not
+// move. The keys are read off the EVALUATION (matched declarations), not off
+// the raw slice, so this asserts the coordinate a consumer actually records.
+func TestRuleKey_StableAcrossReordering(t *testing.T) {
+	change := spec.Change{Paths: []string{"backend/internal/server/runs.go"}}
+
+	before := []spec.Escalation{ruleKeyRuleA(), ruleKeyRuleB()}
+	after := []spec.Escalation{ruleKeyRuleB(), ruleKeyRuleA()}
+
+	resBefore, err := Evaluate(before, change)
+	if err != nil {
+		t.Fatalf("Evaluate(before): %v", err)
+	}
+	resAfter, err := Evaluate(after, change)
+	if err != nil {
+		t.Fatalf("Evaluate(after): %v", err)
+	}
+	if len(resBefore.Fired) != 1 || len(resAfter.Fired) != 1 {
+		t.Fatalf("fired counts = %d/%d, want 1/1", len(resBefore.Fired), len(resAfter.Fired))
+	}
+	// The INDEX moves — the coordinate the issue says is unstable.
+	if resBefore.Fired[0].Index == resAfter.Fired[0].Index {
+		t.Fatalf("fixture is not discriminating: the declaration index did not move (%d both times)",
+			resBefore.Fired[0].Index)
+	}
+	keyBefore := RuleKey(resBefore.Fired[0].Escalation)
+	keyAfter := RuleKey(resAfter.Fired[0].Escalation)
+	if keyBefore != keyAfter {
+		t.Errorf("RuleKey moved under an unrelated reordering: %q → %q; the key must carry no positional index",
+			keyBefore, keyAfter)
+	}
+}
+
+// TestRuleKey_ChangesWithRuleContent pins the other half of the contract: a
+// key that never moves would be useless. Editing THIS rule's globs, or only
+// its require clamp, must change the key.
+func TestRuleKey_ChangesWithRuleContent(t *testing.T) {
+	base := RuleKey(ruleKeyRuleA())
+
+	editedGlobs := ruleKeyRuleA()
+	editedGlobs.Match.Paths = []string{"backend/internal/server/**", "backend/internal/concern/**"}
+	if got := RuleKey(editedGlobs); got == base {
+		t.Errorf("RuleKey unchanged after editing the rule's path globs (%q); a rule whose meaning moved is a different rule", got)
+	}
+
+	editedClamp := ruleKeyRuleA()
+	editedClamp.Require = spec.EscalationRequirements{Approvals: &spec.EscalatedApprovals{Count: ptr(3)}}
+	if got := RuleKey(editedClamp); got == base {
+		t.Errorf("RuleKey unchanged after editing only the require clamp (%q); two rules with identical predicates but different clamps must key differently", got)
+	}
+
+	editedMinPerm := ruleKeyRuleA()
+	editedMinPerm.Require = spec.EscalationRequirements{Approvals: &spec.EscalatedApprovals{Count: ptr(2), MinPermission: "admin"}}
+	if got := RuleKey(editedMinPerm); got == base {
+		t.Errorf("RuleKey unchanged after adding a min_permission clamp (%q)", got)
+	}
+
+	editedAutonomy := ruleKeyRuleA()
+	editedAutonomy.Require.MaxAutonomy = spec.AutonomyTier("low")
+	if got := RuleKey(editedAutonomy); got == base {
+		t.Errorf("RuleKey unchanged after adding a max_autonomy ceiling (%q)", got)
+	}
+}
+
+// TestRuleKey_InvariantToWithinRulePermutation pins the canonicalization: each
+// match criterion is an unordered OR, so permuting a rule's own globs is not a
+// semantic change and must not move the key. This is one of the two cases that
+// go RED if the sorted-copy canonicalization is removed.
+func TestRuleKey_InvariantToWithinRulePermutation(t *testing.T) {
+	a := esc(
+		spec.Predicate{
+			Paths:       []string{"a/**", "b/**", "c/**"},
+			Labels:      []string{"area:api", "area:runner"},
+			ChangeKinds: []string{"feature", "bugfix"},
+			Triggers:    []spec.TriggerForm{spec.TriggerForm("issue"), spec.TriggerForm("cli")},
+		},
+		spec.EscalationRequirements{Approvals: &spec.EscalatedApprovals{Count: ptr(2)}},
+	)
+	permuted := esc(
+		spec.Predicate{
+			Paths:       []string{"c/**", "a/**", "b/**"},
+			Labels:      []string{"area:runner", "area:api"},
+			ChangeKinds: []string{"bugfix", "feature"},
+			Triggers:    []spec.TriggerForm{spec.TriggerForm("cli"), spec.TriggerForm("issue")},
+		},
+		spec.EscalationRequirements{Approvals: &spec.EscalatedApprovals{Count: ptr(2)}},
+	)
+	if RuleKey(a) != RuleKey(permuted) {
+		t.Errorf("RuleKey moved under a within-rule criterion permutation: %q vs %q; each criterion list is an unordered OR",
+			RuleKey(a), RuleKey(permuted))
+	}
+}
+
+// TestRuleKey_IdenticalDeclarationsKeyIdentically pins the equivalence two
+// separately-constructed but structurally identical declarations must have.
+func TestRuleKey_IdenticalDeclarationsKeyIdentically(t *testing.T) {
+	// Built through two SEPARATE constructions so the comparison is between
+	// two independently-built values, not one expression against itself.
+	a, b := ruleKeyRuleA(), ruleKeyRuleA()
+	if RuleKey(a) != RuleKey(b) {
+		t.Error("two structurally identical declarations produced different RuleKeys")
+	}
+	if got := len(RuleKey(ruleKeyRuleA())); got != RuleKeyBytes {
+		t.Errorf("RuleKey length = %d, want %d hex chars", got, RuleKeyBytes)
+	}
+}
+
+// TestRuleKey_DoesNotMutateArgument is the second case pinning the sorted
+// COPY: the parsed spec.Workflow is shared across gate evaluations, so an
+// in-place sort inside RuleKey would silently reorder an operator's declared
+// globs everywhere else they are read (including RenderFired's operator-facing
+// output). The fixture's lists are deliberately UNSORTED.
+func TestRuleKey_DoesNotMutateArgument(t *testing.T) {
+	e := esc(
+		spec.Predicate{
+			Paths:       []string{"z/**", "a/**"},
+			Labels:      []string{"zeta", "alpha"},
+			ChangeKinds: []string{"z-kind", "a-kind"},
+			Triggers:    []spec.TriggerForm{spec.TriggerForm("z"), spec.TriggerForm("a")},
+		},
+		spec.EscalationRequirements{Approvals: &spec.EscalatedApprovals{Count: ptr(2)}},
+	)
+	wantPaths := append([]string(nil), e.Match.Paths...)
+	wantLabels := append([]string(nil), e.Match.Labels...)
+	wantKinds := append([]string(nil), e.Match.ChangeKinds...)
+	wantTriggers := append([]spec.TriggerForm(nil), e.Match.Triggers...)
+
+	_ = RuleKey(e)
+
+	if !reflect.DeepEqual(e.Match.Paths, wantPaths) {
+		t.Errorf("RuleKey mutated Match.Paths: %v, want %v", e.Match.Paths, wantPaths)
+	}
+	if !reflect.DeepEqual(e.Match.Labels, wantLabels) {
+		t.Errorf("RuleKey mutated Match.Labels: %v, want %v", e.Match.Labels, wantLabels)
+	}
+	if !reflect.DeepEqual(e.Match.ChangeKinds, wantKinds) {
+		t.Errorf("RuleKey mutated Match.ChangeKinds: %v, want %v", e.Match.ChangeKinds, wantKinds)
+	}
+	if !reflect.DeepEqual(e.Match.Triggers, wantTriggers) {
+		t.Errorf("RuleKey mutated Match.Triggers: %v, want %v", e.Match.Triggers, wantTriggers)
+	}
+}
+
+// TestRuleKey_CriterionlessRuleKeysStably pins the degenerate declaration (no
+// match criterion) so the renderer's "no criterion" branch is not vacuous: it
+// must still key, and still key differently from a criterion-bearing rule with
+// the same clamp.
+func TestRuleKey_CriterionlessRuleKeysStably(t *testing.T) {
+	bare := esc(spec.Predicate{}, spec.EscalationRequirements{Approvals: &spec.EscalatedApprovals{Count: ptr(2)}})
+	if RuleKey(bare) == "" {
+		t.Fatal("RuleKey of a criterionless declaration is empty")
+	}
+	if RuleKey(bare) == RuleKey(ruleKeyRuleA()) {
+		t.Error("a criterionless declaration keys identically to a paths-bearing one with the same clamp")
+	}
+}

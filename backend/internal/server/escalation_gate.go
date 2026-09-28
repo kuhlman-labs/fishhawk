@@ -177,11 +177,29 @@ func escalationsDeclarePaths(escalations []spec.Escalation) bool {
 // renders through escalation.RenderFired — the SAME helper the run-status
 // escalations block renders through — so the audit row and the API surface can
 // never describe one firing differently.
+//
+// TWO COORDINATES NAME THE SAME FIRING, and they answer different questions
+// (E75.1 / #3729):
+//
+//   - `fired` is the POSITIONAL declaration index — the coordinate spec
+//     VALIDATION errors report at (/workflows/<name>/escalations/<i>), so it
+//     is what an operator uses to find the rule in the document they are
+//     holding. It moves when an unrelated declaration is inserted ahead of it.
+//   - `fired_keys` is the STABLE content-derived key (escalation.RuleKey) —
+//     the join key a decision index follows a rule by ACROSS document edits.
+//     Reordering unrelated declarations leaves it unchanged; editing this
+//     rule's own globs or clamp changes it.
+//
+// The two arrays are index-aligned by construction (built in one loop over
+// res.Fired). `fired_keys` is ADDITIVE: `fired`, `summary` and the
+// result-level `fingerprint` are untouched, so the audit de-duplication
+// behaviour is unchanged.
 type escalationFiredPayload struct {
 	Summary     string   `json:"summary"`
 	Fingerprint string   `json:"fingerprint"`
 	StageID     string   `json:"stage_id,omitempty"`
 	Fired       []int    `json:"fired"`
+	FiredKeys   []string `json:"fired_keys"`
 	Count       *int     `json:"required_count,omitempty"`
 	MemberOf    []string `json:"required_member_of,omitempty"`
 	MinPerm     string   `json:"required_min_permission,omitempty"`
@@ -236,14 +254,19 @@ func (s *Server) writeEscalationFiredAudit(ctx context.Context, runRow *run.Run,
 		return
 	}
 
+	// One loop builds BOTH coordinates, so `fired[i]` and `fired_keys[i]`
+	// name the same firing by construction rather than by convention.
 	indices := make([]int, 0, len(res.Fired))
+	keys := make([]string, 0, len(res.Fired))
 	for _, f := range res.Fired {
 		indices = append(indices, f.Index)
+		keys = append(keys, escalation.RuleKey(f.Escalation))
 	}
 	p := escalationFiredPayload{
 		Summary:     summary,
 		Fingerprint: fingerprint,
 		Fired:       indices,
+		FiredKeys:   keys,
 		Count:       res.Requirements.Count,
 		MemberOf:    res.Requirements.MemberOf,
 		MinPerm:     res.Requirements.MinPermission,

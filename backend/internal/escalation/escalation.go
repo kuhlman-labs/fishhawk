@@ -198,3 +198,92 @@ func Fingerprint(res Result) string {
 	sum := sha256.Sum256([]byte(RenderFired(res)))
 	return hex.EncodeToString(sum[:])
 }
+
+// RuleKeyBytes is the hex length of a RuleKey: the leading 8 bytes of the
+// sha256 over the canonical rendering, which is short enough to read in an
+// audit payload and wide enough that a collision between two declarations in
+// one workflow document is not a practical concern.
+const RuleKeyBytes = 16
+
+// RuleKey is the STABLE, content-derived key for ONE escalation declaration —
+// the join key a decision index uses to follow a rule across workflow-document
+// edits, where the positional Index cannot.
+//
+// It is derived from the DECLARATION'S OWN CONTENT ALONE and carries NO
+// positional index, which gives it exactly these properties:
+//
+//   - REORDERING unrelated declarations leaves a matched rule's key unchanged
+//     (the defect the positional index has, and the reason this is not built
+//     on RenderFired or Fingerprint — both are RESULT-level and both embed
+//     "escalation <i>", so a key derived from either would move on an
+//     unrelated reorder);
+//   - editing ANOTHER rule leaves this rule's key unchanged;
+//   - editing THIS rule's globs, labels, change kinds, triggers or `require`
+//     clamp CHANGES its key — a rule whose meaning moved is a different rule.
+//
+// Within one rule each match criterion's list is SORTED before hashing,
+// because spec.Predicate evaluates each list as an unordered OR: permuting
+// globs inside one rule is not a change to what the rule matches, so it must
+// not move the key. The sort operates on copies, so RuleKey never mutates its
+// argument (the parsed spec.Workflow is shared across gate evaluations).
+//
+// RuleKey is NOT Fingerprint. Fingerprint is the RESULT-level de-duplication
+// key over a whole evaluation (what fired plus what was composed); RuleKey is
+// the RULE-level content key for one declaration.
+func RuleKey(e spec.Escalation) string {
+	sum := sha256.Sum256([]byte(renderRuleForKey(e)))
+	return hex.EncodeToString(sum[:])[:RuleKeyBytes]
+}
+
+// renderRuleForKey is RuleKey's canonical rendering of one declaration. It is
+// deliberately NOT renderPredicate: that renderer is operator-facing and
+// preserves the author's declared ORDER (a reader wants to see what they
+// wrote), while this one canonicalizes the order away and additionally renders
+// the `require` clamp. Keeping them separate is what lets RenderFired stay
+// byte-identical while the key gains its stability contract.
+func renderRuleForKey(e spec.Escalation) string {
+	var parts []string
+	if len(e.Match.Paths) > 0 {
+		parts = append(parts, "paths="+joinSorted(e.Match.Paths))
+	}
+	if len(e.Match.Labels) > 0 {
+		parts = append(parts, "labels="+joinSorted(e.Match.Labels))
+	}
+	if len(e.Match.ChangeKinds) > 0 {
+		parts = append(parts, "change_kind="+joinSorted(e.Match.ChangeKinds))
+	}
+	if len(e.Match.Triggers) > 0 {
+		forms := make([]string, len(e.Match.Triggers))
+		for i, t := range e.Match.Triggers {
+			forms[i] = string(t)
+		}
+		parts = append(parts, "trigger="+joinSorted(forms))
+	}
+	if len(parts) == 0 {
+		parts = append(parts, "no criterion")
+	}
+	if a := e.Require.Approvals; a != nil {
+		if a.Count != nil {
+			parts = append(parts, fmt.Sprintf("require.approvals.count=%d", *a.Count))
+		}
+		if a.MemberOf != "" {
+			parts = append(parts, "require.approvals.member_of="+a.MemberOf)
+		}
+		if a.MinPermission != "" {
+			parts = append(parts, "require.approvals.min_permission="+a.MinPermission)
+		}
+	}
+	if e.Require.MaxAutonomy != "" {
+		parts = append(parts, "require.max_autonomy="+string(e.Require.MaxAutonomy))
+	}
+	return strings.Join(parts, " ")
+}
+
+// joinSorted renders one unordered-OR criterion list canonically: a SORTED
+// COPY, joined. The copy is load-bearing — an in-place sort would mutate the
+// caller's parsed spec.Workflow.
+func joinSorted(vals []string) string {
+	cp := append([]string(nil), vals...)
+	sort.Strings(cp)
+	return strings.Join(cp, ",")
+}

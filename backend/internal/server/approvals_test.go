@@ -1880,7 +1880,7 @@ func TestWriteApprovalAudit_RemoveScopeFiles_RecordsBeforeAfter(t *testing.T) {
 		Decision:        approval.DecisionApprove,
 		Surface:         approval.SurfaceAPI,
 	}
-	s.writeApprovalAudit(context.Background(), planStage, app, "", "", nil, []string{"backend/b.go"}, nil, nil, nil, nil, nil, false, nil, "", "", "", "", nil)
+	s.writeApprovalAudit(context.Background(), planStage, app, "", "", nil, []string{"backend/b.go"}, nil, nil, nil, nil, nil, false, nil, "", "", "", "", "", nil)
 
 	au := s.cfg.AuditRepo.(*auditFake)
 	payload := findApprovalSubmittedPayload(t, au.appended)
@@ -10917,7 +10917,7 @@ func TestWriteApprovalAudit_RecordsMoveResolved(t *testing.T) {
 		{Path: "backend/a.go", FromSlice: 0, ToSlice: 1},
 		{Path: "backend/b.go", FromSlice: 2, ToSlice: 1},
 	}
-	s.writeApprovalAudit(context.Background(), planStage, app, "", "", nil, nil, nil, moveMap, resolved, nil, nil, false, nil, "", "", "", "", nil)
+	s.writeApprovalAudit(context.Background(), planStage, app, "", "", nil, nil, nil, moveMap, resolved, nil, nil, false, nil, "", "", "", "", "", nil)
 
 	payload := findApprovalSubmittedPayload(t, au.appended)
 	rawMap, err := json.Marshal(payload["move_scope_files_to_slice"])
@@ -10946,7 +10946,7 @@ func TestWriteApprovalAudit_RecordsMoveResolved(t *testing.T) {
 	// No-move approve: both keys ABSENT.
 	au2 := newApprovalAuditFake()
 	s2 := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au2})
-	s2.writeApprovalAudit(context.Background(), planStage, app, "", "", nil, nil, nil, nil, nil, nil, nil, false, nil, "", "", "", "", nil)
+	s2.writeApprovalAudit(context.Background(), planStage, app, "", "", nil, nil, nil, nil, nil, nil, nil, false, nil, "", "", "", "", "", nil)
 	payload2 := findApprovalSubmittedPayload(t, au2.appended)
 	if _, ok := payload2["move_scope_files_to_slice"]; ok {
 		t.Errorf("move_scope_files_to_slice present on a no-move approve payload: %#v", payload2)
@@ -11981,5 +11981,279 @@ func TestRetiredScenarioEntriesFor(t *testing.T) {
 	}
 	if got := retiredScenarioEntriesFor(runID, []acceptanceCriteriaAmendment{{ID: "crit-1", Action: acceptanceAmendActionRetire, Reason: "r"}}, now); got != nil {
 		t.Errorf("criterion-only amendments must yield nil, got %+v", got)
+	}
+}
+
+// --- reject_class: the structured plan-rejection class (E75.1 / #3729) -----
+
+// rejectClassBody builds a submit body carrying a decision and a reject_class.
+// The class is passed through BY CONSTRUCTION (never derived from
+// rejectClasses), so an unknown-value fixture cannot become self-satisfying if
+// the shipped set changes.
+func rejectClassBody(t *testing.T, decision, class string) string {
+	t.Helper()
+	body, err := json.Marshal(map[string]any{
+		"decision":     decision,
+		"reject_class": class,
+	})
+	if err != nil {
+		t.Fatalf("marshal body: %v", err)
+	}
+	return string(body)
+}
+
+// TestSubmitApproval_RejectClass_UnknownValueRefused is failure mode (1): an
+// unknown reject_class on a reject is refused 400 validation_failed, the
+// message names EVERY allowed value, the details carry field/got/allowed, and
+// — because the control's effect is COMMITTED STATE — no approval row, no
+// transition and no approval_submitted entry exist.
+//
+// The value "not-a-real-class" is chosen BY CONSTRUCTION to sit outside the
+// shipped set. The stage is seeded genuinely awaiting approval rather than
+// left absent: an absent stage would 404 either way and the arm would prove
+// nothing (the masking-guard trap). Deleting validateRejectClass's
+// unknown-value branch (returning ok=true) reddens this on the 400 assertion
+// AND on the zero-rows / zero-audit assertions.
+func TestSubmitApproval_RejectClass_UnknownValueRefused(t *testing.T) {
+	s, ar, rr, au := newApprovalServer(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+
+	w := submitApproval(t, s, stage.ID, rejectClassBody(t, "reject", "not-a-real-class"))
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `"validation_failed"`) {
+		t.Errorf("body missing validation_failed: %s", body)
+	}
+	if !strings.Contains(body, `"field":"reject_class"`) {
+		t.Errorf("details missing field=reject_class: %s", body)
+	}
+	if !strings.Contains(body, `"got":"not-a-real-class"`) {
+		t.Errorf("details missing the offending value under got: %s", body)
+	}
+	// The refusal must NAME every allowed value — both in the operator-facing
+	// message and in the structured details — so the operator can correct it
+	// without reading the source.
+	for _, allowed := range rejectClasses {
+		if !strings.Contains(body, allowed) {
+			t.Errorf("refusal must name every allowed value; %q missing from:\n%s", allowed, body)
+		}
+	}
+	if !strings.Contains(body, `"allowed":[`) {
+		t.Errorf("details missing the structured allowed list: %s", body)
+	}
+	// COMMITTED STATE: nothing was recorded.
+	if len(ar.all) != 0 {
+		t.Errorf("approval rows = %d, want 0 (a refused reject_class must insert no row)", len(ar.all))
+	}
+	if len(rr.transitions) != 0 {
+		t.Errorf("transitions = %d, want 0", len(rr.transitions))
+	}
+	if len(au.appended) != 0 {
+		t.Errorf("audit entries = %d, want 0 (a refused submit emits no approval_submitted)", len(au.appended))
+	}
+}
+
+// TestSubmitApproval_RejectClass_DecomposeRequiredRefused pins operator binding
+// condition 2 as SHIPPED BEHAVIOUR: `decompose_required` is NOT a member of the
+// closed set, so it is refused exactly like any other unknown value, and the
+// refusal points the operator at the --decompose marker instead. If a later
+// change re-adds it to the set, this test fails.
+func TestSubmitApproval_RejectClass_DecomposeRequiredRefused(t *testing.T) {
+	s, ar, rr, _ := newApprovalServer(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+
+	w := submitApproval(t, s, stage.ID, rejectClassBody(t, "reject", "decompose_required"))
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (decompose_required is not in the closed set):\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "--decompose") {
+		t.Errorf("the refusal must point at the --decompose marker; got:\n%s", w.Body.String())
+	}
+	if len(ar.all) != 0 || len(rr.transitions) != 0 {
+		t.Errorf("refused decompose_required must record nothing: rows=%d transitions=%d", len(ar.all), len(rr.transitions))
+	}
+}
+
+// TestSubmitApproval_RejectClass_OnApproveRefused is failure mode (2): a
+// non-empty reject_class paired with decision=approve is refused 400 with
+// details.rule=reject_class_requires_reject, and the stage does NOT advance.
+// Deleting that branch (returning ok=true) makes the approve SUCCEED, so both
+// the 400 assertion and the committed-state (no transition, no row) assertions
+// go red.
+func TestSubmitApproval_RejectClass_OnApproveRefused(t *testing.T) {
+	s, ar, rr, au := newApprovalServer(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+
+	w := submitApproval(t, s, stage.ID, rejectClassBody(t, "approve", "scope"))
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `"rule":"reject_class_requires_reject"`) {
+		t.Errorf("details missing rule=reject_class_requires_reject: %s", body)
+	}
+	// COMMITTED STATE, not merely error identity: the approve must not have
+	// advanced the gate.
+	if len(rr.transitions) != 0 {
+		t.Errorf("transitions = %d, want 0 — a refused approve must not advance the stage", len(rr.transitions))
+	}
+	if len(ar.all) != 0 {
+		t.Errorf("approval rows = %d, want 0", len(ar.all))
+	}
+	if len(au.appended) != 0 {
+		t.Errorf("audit entries = %d, want 0", len(au.appended))
+	}
+}
+
+// TestSubmitApproval_RejectClass_EachAllowedValueRecordedVerbatim is the
+// POSITIVE recording path (operator binding condition 1) and the SHIPPED-SET
+// done-means: every member of the closed set is accepted on a reject and lands
+// verbatim on the approval_submitted payload under `reject_class`. It fails if
+// the enum ships with a different member set, and it fails on a no-op touch
+// that never wires the key into the payload.
+func TestSubmitApproval_RejectClass_EachAllowedValueRecordedVerbatim(t *testing.T) {
+	// The expected set is stated LITERALLY here rather than read off
+	// rejectClasses, so a change to the shipped set is caught rather than
+	// silently followed.
+	want := []string{"scope", "approach", "verification", "other"}
+	if !reflect.DeepEqual(rejectClasses, want) {
+		t.Fatalf("shipped reject_class set = %v, want %v (operator binding condition 2 drops decompose_required)", rejectClasses, want)
+	}
+
+	for _, class := range want {
+		t.Run(class, func(t *testing.T) {
+			s, ar, rr, au := newApprovalServer(t)
+			stage := rr.seedStage(run.StageStateAwaitingApproval)
+
+			w := submitApproval(t, s, stage.ID, rejectClassBody(t, "reject", class))
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+			}
+			if len(ar.all) != 1 {
+				t.Fatalf("approval rows = %d, want 1", len(ar.all))
+			}
+			payload := findApprovalSubmittedPayload(t, au.appended)
+			if payload["reject_class"] != class {
+				t.Errorf("reject_class = %v, want %q recorded verbatim; payload: %v", payload["reject_class"], class, payload)
+			}
+			// Orthogonality: recording a class must NOT set the
+			// --decompose replan trigger.
+			if _, ok := payload["reject_reason"]; ok {
+				t.Errorf("reject_class must not set reject_reason (the --decompose replan trigger); payload: %v", payload)
+			}
+		})
+	}
+}
+
+// TestSubmitApproval_RejectClass_AbsentRecordsNoKey is failure mode (4): a
+// reject carrying NO reject_class records the payload byte-identically to
+// today — the key is ABSENT, not present-and-empty. Dropping the emptiness
+// half of the `decision == reject && rejectClass != ""` guard reddens this.
+func TestSubmitApproval_RejectClass_AbsentRecordsNoKey(t *testing.T) {
+	s, _, rr, au := newApprovalServer(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"reject","comment":"wrong fork"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	payload := findApprovalSubmittedPayload(t, au.appended)
+	if _, ok := payload["reject_class"]; ok {
+		t.Errorf("reject_class key must be ABSENT on a classless reject; payload: %v", payload)
+	}
+}
+
+// TestSubmitApproval_RejectClass_ExplicitEmptyTreatedAsAbsent is failure mode
+// (5): an explicitly-empty reject_class is admitted (not refused) and records
+// NO key, so `"reject_class":""` and omitting the field are the same row.
+func TestSubmitApproval_RejectClass_ExplicitEmptyTreatedAsAbsent(t *testing.T) {
+	s, ar, rr, au := newApprovalServer(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"reject","reject_class":""}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (an explicit empty class is admissible):\n%s", w.Code, w.Body.String())
+	}
+	if len(ar.all) != 1 {
+		t.Fatalf("approval rows = %d, want 1", len(ar.all))
+	}
+	payload := findApprovalSubmittedPayload(t, au.appended)
+	if _, ok := payload["reject_class"]; ok {
+		t.Errorf("reject_class key must be ABSENT for an explicitly-empty value; payload: %v", payload)
+	}
+}
+
+// TestSubmitApproval_RejectClass_ApproveWithEmptyClassUnaffected pins the
+// carve-out at the other corner: an APPROVE carrying an explicitly-empty
+// reject_class is NOT refused (the emptiness short-circuit precedes the
+// decision check), so an SPA/CLI caller that always serializes the field
+// stays unaffected.
+func TestSubmitApproval_RejectClass_ApproveWithEmptyClassUnaffected(t *testing.T) {
+	s, ar, rr, au := newApprovalServer(t)
+	stage := rr.seedStage(run.StageStateAwaitingApproval)
+
+	w := submitApproval(t, s, stage.ID, `{"decision":"approve","reject_class":""}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if len(ar.all) != 1 || len(rr.transitions) != 1 {
+		t.Fatalf("rows=%d transitions=%d, want 1/1", len(ar.all), len(rr.transitions))
+	}
+	payload := findApprovalSubmittedPayload(t, au.appended)
+	if _, ok := payload["reject_class"]; ok {
+		t.Errorf("reject_class must never appear on an approve payload; payload: %v", payload)
+	}
+}
+
+// TestValidateRejectClass_PureTable pins the validator's three branches
+// directly, including that an empty value short-circuits ahead of the decision
+// check for BOTH decisions.
+func TestValidateRejectClass_PureTable(t *testing.T) {
+	cases := []struct {
+		name     string
+		decision approval.Decision
+		class    string
+		wantOK   bool
+		wantRule string
+	}{
+		{"empty on reject", approval.DecisionReject, "", true, ""},
+		{"empty on approve", approval.DecisionApprove, "", true, ""},
+		{"allowed on reject", approval.DecisionReject, "verification", true, ""},
+		{"allowed on approve", approval.DecisionApprove, "verification", false, "reject_class_requires_reject"},
+		{"unknown on reject", approval.DecisionReject, "nope", false, ""},
+		{"decompose_required on reject", approval.DecisionReject, "decompose_required", false, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ok, msg, details := validateRejectClass(tc.decision, tc.class)
+			if ok != tc.wantOK {
+				t.Fatalf("ok = %v, want %v (msg %q)", ok, tc.wantOK, msg)
+			}
+			if ok {
+				if msg != "" || details != nil {
+					t.Errorf("an admissible value must carry no message/details; got %q / %v", msg, details)
+				}
+				return
+			}
+			if msg == "" {
+				t.Error("a refusal must carry an actionable message")
+			}
+			if details["field"] != "reject_class" {
+				t.Errorf("details field = %v, want reject_class", details["field"])
+			}
+			if tc.wantRule != "" && details["rule"] != tc.wantRule {
+				t.Errorf("details rule = %v, want %s", details["rule"], tc.wantRule)
+			}
+			if tc.wantRule == "" {
+				if _, ok := details["allowed"]; !ok {
+					t.Errorf("an unknown-value refusal must carry the allowed list; got %v", details)
+				}
+			}
+		})
 	}
 }

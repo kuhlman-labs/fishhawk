@@ -198,6 +198,12 @@ func (s *Server) loadApprovalConcernClaims(ctx context.Context, runID uuid.UUID)
 // wedges the review loop). The whole function is best-effort/warn-only,
 // matching applyConcernResolutions.
 //
+// The audit payload additionally records the settled row's own `category` and
+// `severity` (E75.1 / #3729), read at emit time off the row this function has
+// already fetched, so a chain-only decision index can join a settled concern
+// to what KIND of concern it was. Both are recorded UNCONDITIONALLY, including
+// when empty — see the field comment at the emit site.
+//
 // confirmingReviewFreshConcernIDs (#2066) are the fresh implement-stage
 // concern ids the SAME confirming review minted in this loop iteration. When
 // non-empty, the resolution is QUALIFIED: the state_reason drops the
@@ -280,6 +286,19 @@ func (s *Server) resolveConditionClaimedPlanConcerns(ctx context.Context, runID 
 			"reviewer_model":              reviewerModel,
 			"verdict":                     verdict,
 			"confirming_review_qualified": qualified,
+			// CONCERN KIND (E75.1 / #3729): the row's own category and
+			// severity, read off the row this loop already fetched via
+			// GetByIDs — no extra store read, no new failure mode. Recording
+			// them lets a decision index join a SETTLED concern to what KIND
+			// of concern it was from the chain alone, instead of having to
+			// re-read the concern store (which a chain-only consumer cannot).
+			//
+			// Recorded UNCONDITIONALLY, including when empty, deliberately:
+			// an empty string means "this concern genuinely carries no
+			// category", while an ABSENT key means "this entry predates the
+			// change" — a distinction an omitempty would destroy.
+			"category": row.Category,
+			"severity": row.Severity,
 		}
 		if qualified {
 			freshIDStrings := make([]string, 0, len(confirmingReviewFreshConcernIDs))

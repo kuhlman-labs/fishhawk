@@ -57,7 +57,7 @@ Mirroring `DistillPlanReviewMiss`, and each asserted by a test that reads the OU
 
 Ambiguity fails loud rather than guessing because the audit chain carries no concern id on a review verdict: when two unconsumed review concerns share `(severity, category)`, nothing can say which reviewer note belongs to this `concern_id`, and attributing the wrong prose would silently corrupt a LABELLED corpus. Such a run is curated by hand.
 
-A `concern_addressed_by_condition` disposition is therefore **UNJOINABLE** from the audit chain. It is neither dropped nor guessed: it is listed in `case.md` by `concern_id` for the operator to add by hand, and contributes no labelled concern. A run whose dispositions are ALL unjoinable is the zero-joined-concerns error, naming the ids.
+A disposition whose payload carries no `(severity, category)` is therefore **UNJOINABLE** from the audit chain. It is neither dropped nor guessed: it is listed in `case.md` by `concern_id` for the operator to add by hand, and contributes no labelled concern. A run whose dispositions are ALL unjoinable is the zero-joined-concerns error, naming the ids. **That gap is HISTORICAL, not structural**: a `concern_addressed_by_condition` entry written before E75.1 / [#3729](https://github.com/kuhlman-labs/fishhawk/issues/3729) carries neither field, but the emitter records the settled row's own `category` and `severity` since, so a post-#3729 entry carries the key and takes the ordinary catalogue join. The unjoinable test is on the PAYLOAD, never on the audit category — which is why no change to this package was needed when the emitter gained the fields.
 
 ### `operator_severity` is left EMPTY, on purpose
 

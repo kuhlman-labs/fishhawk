@@ -1982,7 +1982,7 @@ func TestSubmitApproval_SendsSliceAddScopeFilesBody(t *testing.T) {
 	})
 
 	if _, err := c.SubmitApproval(context.Background(), stageID, "approve", "restore the dropped file",
-		"kuhlman-labs", nil, nil, perSlice, nil, nil, nil, false, nil, ""); err != nil {
+		"kuhlman-labs", nil, nil, perSlice, nil, nil, nil, false, nil, "", ""); err != nil {
 		t.Fatalf("SubmitApproval: %v", err)
 	}
 	if gotMethod != http.MethodPost || gotPath != "/v0/stages/"+stageID.String()+"/approvals" {
@@ -1999,7 +1999,7 @@ func TestSubmitApproval_SendsSliceAddScopeFilesBody(t *testing.T) {
 	// nil → the key must be absent, not present-and-null.
 	gotRaw = nil
 	if _, err := c.SubmitApproval(context.Background(), stageID, "approve", "plain approve",
-		"kuhlman-labs", nil, nil, nil, nil, nil, nil, false, nil, ""); err != nil {
+		"kuhlman-labs", nil, nil, nil, nil, nil, nil, false, nil, "", ""); err != nil {
 		t.Fatalf("SubmitApproval (no slice map): %v", err)
 	}
 	if _, present := gotRaw["add_scope_files_to_slice"]; present {
@@ -2028,7 +2028,7 @@ func TestSubmitApproval_SendsAmendAcceptanceCriteriaBody(t *testing.T) {
 	})
 
 	if _, err := c.SubmitApproval(context.Background(), stageID, "approve", "narrowed the design",
-		"kuhlman-labs", nil, nil, nil, nil, nil, nil, false, amendments, ""); err != nil {
+		"kuhlman-labs", nil, nil, nil, nil, nil, nil, false, amendments, "", ""); err != nil {
 		t.Fatalf("SubmitApproval: %v", err)
 	}
 	raw, err := json.Marshal(gotRaw["amend_acceptance_criteria"])
@@ -2046,7 +2046,7 @@ func TestSubmitApproval_SendsAmendAcceptanceCriteriaBody(t *testing.T) {
 	// nil → the key must be absent, not present-and-null.
 	gotRaw = nil
 	if _, err := c.SubmitApproval(context.Background(), stageID, "approve", "plain approve",
-		"kuhlman-labs", nil, nil, nil, nil, nil, nil, false, nil, ""); err != nil {
+		"kuhlman-labs", nil, nil, nil, nil, nil, nil, false, nil, "", ""); err != nil {
 		t.Fatalf("SubmitApproval (no amendments): %v", err)
 	}
 	if _, present := gotRaw["amend_acceptance_criteria"]; present {
@@ -2501,7 +2501,7 @@ func TestSubmitApproval_SendsSliceMoveScopeFilesBody(t *testing.T) {
 	})
 
 	if _, err := c.SubmitApproval(context.Background(), stageID, "approve", "relocate the file",
-		"kuhlman-labs", nil, nil, nil, move, nil, nil, false, nil, ""); err != nil {
+		"kuhlman-labs", nil, nil, nil, move, nil, nil, false, nil, "", ""); err != nil {
 		t.Fatalf("SubmitApproval: %v", err)
 	}
 	if gotMethod != http.MethodPost || gotPath != "/v0/stages/"+stageID.String()+"/approvals" {
@@ -2518,7 +2518,7 @@ func TestSubmitApproval_SendsSliceMoveScopeFilesBody(t *testing.T) {
 	// nil → the key must be absent, not present-and-null.
 	gotRaw = nil
 	if _, err := c.SubmitApproval(context.Background(), stageID, "approve", "plain approve",
-		"kuhlman-labs", nil, nil, nil, nil, nil, nil, false, nil, ""); err != nil {
+		"kuhlman-labs", nil, nil, nil, nil, nil, nil, false, nil, "", ""); err != nil {
 		t.Fatalf("SubmitApproval (no move map): %v", err)
 	}
 	if _, present := gotRaw["move_scope_files_to_slice"]; present {
@@ -2799,7 +2799,7 @@ func TestSubmitApproval_SendsClaimsAllOpenPlanConcernsBody(t *testing.T) {
 	})
 
 	if _, err := c.SubmitApproval(context.Background(), stageID, "approve", "conditions answer the whole ledger",
-		"kuhlman-labs", nil, nil, nil, nil, nil, nil, true, nil, ""); err != nil {
+		"kuhlman-labs", nil, nil, nil, nil, nil, nil, true, nil, "", ""); err != nil {
 		t.Fatalf("SubmitApproval: %v", err)
 	}
 	if gotMethod != http.MethodPost || gotPath != "/v0/stages/"+stageID.String()+"/approvals" {
@@ -2812,7 +2812,7 @@ func TestSubmitApproval_SendsClaimsAllOpenPlanConcernsBody(t *testing.T) {
 	// false → the key must be absent, not present-and-false.
 	gotRaw = nil
 	if _, err := c.SubmitApproval(context.Background(), stageID, "approve", "plain approve",
-		"kuhlman-labs", nil, nil, nil, nil, nil, nil, false, nil, ""); err != nil {
+		"kuhlman-labs", nil, nil, nil, nil, nil, nil, false, nil, "", ""); err != nil {
 		t.Fatalf("SubmitApproval (no shorthand): %v", err)
 	}
 	if _, present := gotRaw["claims_all_open_plan_concerns"]; present {
@@ -3424,5 +3424,46 @@ func TestCampaignStatus_DecodesResolvedBy(t *testing.T) {
 	// Self-paired: the same item shape with the key absent must decode to "".
 	if st.Items[1].ResolvedBy != "" {
 		t.Errorf("items[1].resolved_by = %q, want empty (the body omits the key)", st.Items[1].ResolvedBy)
+	}
+}
+
+// TestSubmitApproval_SendsRejectClassBody pins the apiClient half of the
+// #3729 wire contract against a real HTTP server, in BOTH directions: the
+// class must arrive under the exact key `reject_class` (the backend's
+// DisallowUnknownFields decoder rejects any drift in the name, and a silently
+// dropped field would record nothing), and the key must be ABSENT entirely
+// when the caller passes "" — the omitempty pin that keeps a classless reject
+// body byte-identical to pre-#3729.
+func TestSubmitApproval_SendsRejectClassBody(t *testing.T) {
+	stageID := uuid.New()
+
+	var gotMethod, gotPath string
+	var gotRaw map[string]any
+	c := releaseTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		gotMethod, gotPath = r.Method, r.URL.Path
+		_ = json.NewDecoder(r.Body).Decode(&gotRaw)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"`+uuid.NewString()+`","state":"failed"}`)
+	})
+
+	if _, err := c.SubmitApproval(context.Background(), stageID, "reject", "the file scope is wrong",
+		"kuhlman-labs", nil, nil, nil, nil, nil, nil, false, nil, "", "scope"); err != nil {
+		t.Fatalf("SubmitApproval: %v", err)
+	}
+	if gotMethod != http.MethodPost || gotPath != "/v0/stages/"+stageID.String()+"/approvals" {
+		t.Errorf("request = %s %s, want POST /v0/stages/%s/approvals", gotMethod, gotPath, stageID)
+	}
+	if gotRaw["reject_class"] != "scope" {
+		t.Errorf("reject_class = %v, want %q on the POSTed body: %#v", gotRaw["reject_class"], "scope", gotRaw)
+	}
+
+	// "" → the key must be absent, not present-and-empty.
+	gotRaw = nil
+	if _, err := c.SubmitApproval(context.Background(), stageID, "reject", "plain reject",
+		"kuhlman-labs", nil, nil, nil, nil, nil, nil, false, nil, "", ""); err != nil {
+		t.Fatalf("SubmitApproval (no class): %v", err)
+	}
+	if _, present := gotRaw["reject_class"]; present {
+		t.Errorf("reject_class present on a classless reject body: %#v", gotRaw)
 	}
 }
