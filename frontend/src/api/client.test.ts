@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { api, CSRF_COOKIE_NAME, CSRF_HEADER_NAME } from './client';
+import { api, ApiClientError, CSRF_COOKIE_NAME, CSRF_HEADER_NAME } from './client';
 
 /*
  * The api.* wrappers are thin, but the CSRF auto-attach is the kind
@@ -272,5 +272,90 @@ describe('api.listStageChecks (#228)', () => {
 
     const init = lastInit(fetchMock);
     expect((init.method ?? 'GET').toUpperCase()).toBe('GET');
+  });
+});
+
+describe('api.listRunAudit since_sequence anchor (#1715)', () => {
+  beforeEach(() => vi.unstubAllGlobals());
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('serialises sinceSequence as since_sequence alongside limit', async () => {
+    const fetchMock = mockFetch();
+    await api.listRunAudit('11111111-2222-3333-4444-555555555555', {
+      sinceSequence: 41,
+      limit: 1,
+    });
+    const url = fetchMock.mock.calls.at(-1)?.[0] as string;
+    expect(url).toBe(
+      '/v0/runs/11111111-2222-3333-4444-555555555555/audit?limit=1&since_sequence=41',
+    );
+  });
+
+  it('keeps a zero anchor (entry 1 resolves via since_sequence=0)', async () => {
+    const fetchMock = mockFetch();
+    await api.listRunAudit('11111111-2222-3333-4444-555555555555', {
+      sinceSequence: 0,
+      limit: 1,
+    });
+    const url = fetchMock.mock.calls.at(-1)?.[0] as string;
+    expect(url).toContain('since_sequence=0');
+  });
+
+  it('omits since_sequence when not provided', async () => {
+    const fetchMock = mockFetch();
+    await api.listRunAudit('11111111-2222-3333-4444-555555555555', { limit: 5 });
+    const url = fetchMock.mock.calls.at(-1)?.[0] as string;
+    expect(url).not.toContain('since_sequence');
+  });
+});
+
+describe('api.getRunGateView (#1715)', () => {
+  beforeEach(() => vi.unstubAllGlobals());
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('hits /v0/runs/{id}/gate-view with a GET and no query string by default', async () => {
+    const fetchMock = mockFetch();
+    await api.getRunGateView('11111111-2222-3333-4444-555555555555');
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      '/v0/runs/11111111-2222-3333-4444-555555555555/gate-view',
+    );
+    const init = lastInit(fetchMock);
+    expect(init.method ?? 'GET').toBe('GET');
+  });
+
+  it('serialises stageKind as the snake_case stage_kind query param', async () => {
+    const fetchMock = mockFetch();
+    await api.getRunGateView('11111111-2222-3333-4444-555555555555', { stageKind: 'implement' });
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      '/v0/runs/11111111-2222-3333-4444-555555555555/gate-view?stage_kind=implement',
+    );
+  });
+
+  it('url-encodes the run id path segment', async () => {
+    const fetchMock = mockFetch();
+    await api.getRunGateView('a/b');
+    expect(fetchMock.mock.calls[0][0]).toBe('/v0/runs/a%2Fb/gate-view');
+  });
+
+  it('surfaces a 503 gate_view_unconfigured as an ApiClientError with the parsed envelope', async () => {
+    const envelope = {
+      error: 'gate_view_unconfigured',
+      message: 'concern repository is not configured',
+    };
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        async () =>
+          new Response(JSON.stringify(envelope), {
+            status: 503,
+            headers: { 'Content-Type': 'application/json' },
+          }),
+      ),
+    );
+    const err = await api.getRunGateView('11111111-2222-3333-4444-555555555555').catch((e) => e);
+    expect(err).toBeInstanceOf(ApiClientError);
+    expect((err as ApiClientError).status).toBe(503);
+    expect((err as ApiClientError).body).toEqual(envelope);
+    expect((err as ApiClientError).message).toBe('concern repository is not configured');
   });
 });
