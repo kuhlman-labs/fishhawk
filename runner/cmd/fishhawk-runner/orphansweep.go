@@ -54,8 +54,13 @@ type stageOrphanSweeper struct {
 
 	stop context.CancelFunc
 	wg   sync.WaitGroup
-	once sync.Once
 	ev   *agent.Event
+
+	// mu guards done/ev/degradedReason across the two sweep() call sites (the
+	// post-invoke site on the stage goroutine and the run() defer). done LATCHES
+	// the kill pass; a ctx-aborted pass deliberately leaves it open — see sweep().
+	mu   sync.Mutex
+	done bool
 
 	// degraded names the fail-open reason the sweep took, "" when it ran. Set by
 	// degrade(); read by the wiring tests, which assert on the printed reason
@@ -114,10 +119,20 @@ func (s *stageOrphanSweeper) stopSampling() {
 	s.stop = nil
 }
 
-// sweep performs the kill pass exactly once, whichever call site reaches it
-// first: the normal post-invoke path (whose returned event rides in the signed
-// bundle) or the run() defer that backstops the cancel / timeout / early-return
-// paths.
+// sweep performs the kill pass AT MOST ONCE across its two call sites: the
+// normal post-invoke path (whose returned event rides in the signed bundle) or
+// the run() defer that backstops the cancel / timeout / early-return paths.
+//
+// The guard LATCHES only on a pass that actually reached the process table. A
+// pass whose fresh read was aborted because THIS ctx is already done leaves it
+// OPEN, because the post-invoke site is handed run()'s own ctx: a stage
+// cancelled mid-invoke would otherwise spend the single pass on a zero-kill
+// degrade and find the defer's context.WithoutCancel(ctx) backstop already
+// consumed, leaving every recorded survivor alive — the #3663 defect itself.
+// Only that ctx-abort branch is retryable; every other named degrade (the
+// test-binary kill switch, the operator off switch, procsweep.ErrUnsupported,
+// and a `ps` failure under a LIVE ctx) is terminal and latches, so a healthy
+// stage still performs exactly one kill pass.
 //
 // It returns a stage_orphans_reaped event ONLY when the sweep actually did
 // something — reaped a process, found one already gone, or collected a kill
@@ -129,16 +144,28 @@ func (s *stageOrphanSweeper) sweep(ctx context.Context) *agent.Event {
 	if s == nil {
 		return nil
 	}
-	s.once.Do(func() {
-		s.stopSampling()
-		s.ev = s.sweepOnce(ctx)
-	})
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.done {
+		return s.ev
+	}
+	s.stopSampling()
+	s.degradedReason = ""
+	ev, retryable := s.sweepOnce(ctx)
+	if retryable {
+		// Zero kills happened and the recorded state is untouched: leave the
+		// guard open so the backstop pass still gets its read.
+		return nil
+	}
+	s.done, s.ev = true, ev
 	return s.ev
 }
 
-func (s *stageOrphanSweeper) sweepOnce(ctx context.Context) *agent.Event {
+// sweepOnce is one kill pass. retryable is true ONLY for a read aborted by a
+// done ctx, which is the one failure the caller must not latch on.
+func (s *stageOrphanSweeper) sweepOnce(ctx context.Context) (ev *agent.Event, retryable bool) {
 	if s.disabled != "" {
-		return s.degrade(s.disabled, "")
+		return s.degrade(s.disabled, ""), false
 	}
 	// A runner that does not LEAD its own process group is almost always a
 	// hand-run `bin/fishhawk-runner` sharing the operator's interactive shell's
@@ -146,19 +173,24 @@ func (s *stageOrphanSweeper) sweepOnce(ctx context.Context) *agent.Event {
 	// with nothing recorded outside it there is nothing this sweep could ever
 	// authorise — decline before reading the table at all.
 	if s.selfPGID != s.selfPID && s.rec.RecordedPGIDs() == 0 {
-		return s.degrade("not_group_leader_no_recorded_pgids", "")
+		return s.degrade("not_group_leader_no_recorded_pgids", ""), false
 	}
 
 	res, err := s.sweepFn(ctx, s.selfPID, s.selfPGID)
 	if err != nil {
-		reason := "proc_table_read_failed"
-		if errors.Is(err, procsweep.ErrUnsupported) {
-			reason = "proc_table_unsupported"
+		switch {
+		case errors.Is(err, procsweep.ErrUnsupported):
+			return s.degrade("proc_table_unsupported", err.Error()), false
+		case ctx.Err() != nil, errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+			// The `ps` read never completed because this ctx is done, so nothing
+			// was selected and nothing was killed. RETRYABLE: the run() defer's
+			// context.WithoutCancel(ctx) pass is the one that must do the work.
+			return s.degrade("proc_table_read_cancelled", err.Error()), true
 		}
-		return s.degrade(reason, err.Error())
+		return s.degrade("proc_table_read_failed", err.Error()), false
 	}
 	if len(res.Reaped) == 0 && res.AlreadyGone == 0 && len(res.Errors) == 0 {
-		return nil
+		return nil, false
 	}
 
 	sampled := make([]map[string]any, 0, orphanSweepMaxSampled)
@@ -179,7 +211,7 @@ func (s *stageOrphanSweeper) sweepOnce(ctx context.Context) *agent.Event {
 	_, _ = fmt.Fprintf(s.sink,
 		`{"event":"stage_orphans_reaped","run_id":%q,"stage_id":%q,"count":%d,"already_gone":%d,"errors":%d}`+"\n",
 		s.cfg.runID, s.cfg.stageID, len(res.Reaped), res.AlreadyGone, len(res.Errors))
-	return &agent.Event{Kind: "stage_orphans_reaped", Payload: agent.MakePayload(payload)}
+	return &agent.Event{Kind: "stage_orphans_reaped", Payload: agent.MakePayload(payload)}, false
 }
 
 // degrade records and PRINTS the named fail-open reason, and returns nil so no
@@ -193,10 +225,15 @@ func (s *stageOrphanSweeper) degrade(reason, detail string) *agent.Event {
 	return nil
 }
 
-// degradeReason is the named fail-open reason the sweep took, "" when it ran.
+// degradeReason is the named fail-open reason the LAST sweep pass took, "" when
+// it ran. A retryable ctx-abort pass records its reason here and a later
+// successful backstop pass clears it, so this always describes the pass that
+// decided the sweep.
 func (s *stageOrphanSweeper) degradeReason() string {
 	if s == nil {
 		return ""
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.degradedReason
 }

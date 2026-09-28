@@ -233,6 +233,91 @@ func TestStageOrphanSweeper_SweepIsOnceGuarded(t *testing.T) {
 	}
 }
 
+// A stage cancelled mid-invoke reaches the post-invoke sweep site with run()'s
+// OWN (now done) ctx, so the fresh `ps` read fails and that pass reaps NOTHING.
+// If it latched the guard, the run() defer's context.WithoutCancel backstop
+// would find the single pass already spent and every recorded survivor would
+// outlive the stage — the #3663 defect itself. So the cancelled pass must
+// degrade with a named reason and ZERO kills while leaving the backstop ARMED,
+// and the backstop pass must then perform the real kill pass.
+func TestStageOrphanSweeper_CancelledSweepLeavesBackstopArmed(t *testing.T) {
+	enableOrphanSweepForTest(t)
+	withSelfProcessGroup(t, func(pid int) int { return pid })
+
+	self, orphan := os.Getpid(), 424250
+	start := time.Now()
+	kr := &killRecorder{}
+	// The REAL Recorder/Sweep against a synthetic table whose reader honours ctx
+	// exactly as proctable_unix.go's exec.CommandContext read does.
+	t.Cleanup(procsweep.SetTestHooks(
+		func(ctx context.Context) (procsweep.Table, error) {
+			if err := ctx.Err(); err != nil {
+				return procsweep.Table{}, err
+			}
+			return syntheticTable(self, orphan, start), nil
+		},
+		kr.kill))
+
+	var log strings.Builder
+	s := newStageOrphanSweeper(&log, sweepCfg(), noEnv, start.Add(-time.Minute))
+	if err := s.rec.Sample(context.Background()); err != nil {
+		t.Fatalf("Sample: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	wantDegrade(t, s, s.sweep(ctx), log.String(), "proc_table_read_cancelled", kr)
+
+	// The run() defer's backstop, verbatim: same sweeper, WithoutCancel(ctx).
+	ev := s.sweep(context.WithoutCancel(ctx))
+	if ev == nil {
+		t.Fatal("the backstop sweep after a cancelled pass reaped nothing — the recorded survivor outlived the stage")
+	}
+	if got := decodeSweeperEvent(t, ev); got.Count != 1 || len(got.Sampled) != 1 || got.Sampled[0].PID != orphan {
+		t.Fatalf("backstop payload = %+v, want the one recorded survivor %d", got, orphan)
+	}
+	if got := kr.seen(); len(got) != 1 || got[0] != orphan {
+		t.Fatalf("killPID calls = %v, want exactly [%d]", got, orphan)
+	}
+	if r := s.degradeReason(); r != "" {
+		t.Errorf("degrade reason = %q after a successful backstop pass, want cleared", r)
+	}
+	// And NOW the guard latches: the completed pass is terminal.
+	if third := s.sweep(context.Background()); third != ev {
+		t.Fatal("a third sweep must return the SAME event, not perform another kill pass")
+	}
+	if got := kr.seen(); len(got) != 1 {
+		t.Fatalf("killPID calls = %v, want exactly 1 across all three sweep() calls", got)
+	}
+}
+
+// The ctx-abort retry is NARROW: a `ps` failure under a LIVE ctx is terminal, so
+// a host whose process table is unreadable does not get its degrade re-run by
+// the backstop (and cannot kill anything on a second pass either).
+func TestStageOrphanSweeper_ReadErrorUnderLiveCtxStillLatches(t *testing.T) {
+	enableOrphanSweepForTest(t)
+	withSelfProcessGroup(t, func(pid int) int { return pid })
+
+	reads := 0
+	kr := &killRecorder{}
+	t.Cleanup(procsweep.SetTestHooks(
+		func(context.Context) (procsweep.Table, error) {
+			reads++
+			return procsweep.Table{}, errors.New("ps: exit status 1")
+		},
+		kr.kill))
+
+	var log strings.Builder
+	s := newStageOrphanSweeper(&log, sweepCfg(), noEnv, time.Now().Add(-time.Minute))
+	wantDegrade(t, s, s.sweep(context.Background()), log.String(), "proc_table_read_failed", kr)
+	if ev := s.sweep(context.WithoutCancel(context.Background())); ev != nil {
+		t.Fatalf("the backstop must not re-run a latched degrade, got %s", ev.Payload)
+	}
+	if reads != 1 {
+		t.Fatalf("process-table reads = %d, want exactly 1 — a live-ctx read error latches", reads)
+	}
+}
+
 // --- the named degrades, one behavioral test each -----------------------
 
 // i2 / m12 (approval condition 4): with no opt-in, the package test binary's
@@ -400,6 +485,13 @@ func TestRunStage_SweepsOrphansAndEmitsEvent(t *testing.T) {
 	// the stage rather than once at construction.
 	var mu sync.Mutex
 	registered := false
+	// observed is signalled by the FIRST table read that saw the registered
+	// descendant. Invoke blocks on it, so the sampler has demonstrably recorded
+	// the descendant before the agent returns: the sweep can only reap what a
+	// sample recorded, and without this handoff "did a sample land inside the
+	// invoke" is a goroutine-scheduling race against the 2s sampler interval
+	// (observed RED under -race with the rest of this package's tests loaded).
+	observed := make(chan struct{}, 1)
 	kr := &killRecorder{}
 	t.Cleanup(procsweep.SetTestHooks(func(context.Context) (procsweep.Table, error) {
 		mu.Lock()
@@ -411,6 +503,10 @@ func TestRunStage_SweepsOrphansAndEmitsEvent(t *testing.T) {
 				StartRaw: procsweep.FormatStart(start), Command: "fishhawk-runner",
 			}}}, nil
 		}
+		select {
+		case observed <- struct{}{}:
+		default:
+		}
 		return syntheticTable(self, orphanPID, start), nil
 	}, kr.kill))
 
@@ -420,6 +516,11 @@ func TestRunStage_SweepsOrphansAndEmitsEvent(t *testing.T) {
 			mu.Lock()
 			registered = true
 			mu.Unlock()
+			select {
+			case <-observed:
+			case <-time.After(20 * time.Second * lockTestScale()):
+				t.Error("no process-table sample observed the registered descendant inside the invoke")
+			}
 		},
 	})
 

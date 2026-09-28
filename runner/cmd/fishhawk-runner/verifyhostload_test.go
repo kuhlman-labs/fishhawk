@@ -240,6 +240,39 @@ func TestHostLoadProbe_RetainsTheLastSample(t *testing.T) {
 	}
 }
 
+// A read ERROR after an overloaded sample must CLEAR the retained sample, so a
+// verify whose actual host conditions were unreadable is classified by nothing
+// (category A, fail open) rather than by a stale overloaded reading from an
+// earlier verify in the same ladder.
+func TestHostLoadProbe_ReadErrorClearsAnOverloadedSample(t *testing.T) {
+	restore := readHostLoad
+	t.Cleanup(func() { readHostLoad = restore })
+	calls := 0
+	readHostLoad = func(context.Context) (hostload.Sample, error) {
+		calls++
+		if calls == 1 {
+			return overloadedSample(), nil
+		}
+		return hostload.Sample{}, errors.New("sysctl vm.loadavg: no such file")
+	}
+	p := newHostLoadProbe(config{runID: "r", stageID: "s"}, &strings.Builder{})
+	p.sample(context.Background())
+	if !p.overloaded() {
+		t.Fatal("after the first (overloaded) sample the probe must report overloaded")
+	}
+	var log strings.Builder
+	p.sink = &log
+	if evs := p.sample(context.Background()); evs != nil {
+		t.Fatalf("an erroring sample must emit no trace event, got %+v", evs)
+	}
+	if p.overloaded() {
+		t.Fatal("an erroring sample must CLEAR the retained overloaded sample — the deciding verify's host conditions were unreadable, so the probe must decide nothing")
+	}
+	if !strings.Contains(log.String(), `"event":"verify_host_load_unavailable"`) {
+		t.Fatalf("the read error must print one named reason, got:\n%s", log.String())
+	}
+}
+
 // A probe that never sampled decides nothing.
 func TestHostLoadProbe_UnsampledDecidesNothing(t *testing.T) {
 	p := newHostLoadProbe(config{}, &strings.Builder{})

@@ -1336,9 +1336,18 @@ those verifies' own diffs.
 with `startedAt = time.Now()`. `run()` starts the sampler (2s interval) where the
 mid-stage scope-amendment watcher starts, stops it alongside `stopWatch()`, and
 then calls `sweep()` — so the `stage_orphans_reaped` event lands on `res.Events`
-**before** `composeGateEvidence` folds the bundle. The SAME `sync.Once`-guarded
+**before** `composeGateEvidence` folds the bundle. The SAME once-latching
 `sweep()` is also called from a `defer` in `run()`, which backstops the cancel /
 timeout / early-return paths.
+
+**The latch closes only on a pass that read the table.** The post-invoke site is
+handed `run()`'s own ctx, so on a cancelled or timed-out stage its `ps` read
+fails, it reaps nothing, and it degrades `proc_table_read_cancelled` WITHOUT
+latching — otherwise the `defer`'s `context.WithoutCancel(ctx)` backstop would
+find the single pass already spent and every recorded survivor would outlive the
+stage, which is #3663 itself. Every other degrade (kill switch, operator off
+switch, `ErrUnsupported`, a `ps` failure under a LIVE ctx) is terminal, so a
+healthy stage still performs exactly one kill pass.
 
 **The backstop is LOG-ONLY.** On those paths `run()` is already returning: there
 is no `res.Events` to append to and no bundle to fold into, so the reap shows up
@@ -1352,7 +1361,7 @@ Events:
 | `stage_orphans_reaped` (log + bundle) | the sweep reaped a process, found one already gone, or collected a kill error |
 | `stage_orphan_sweep_degraded` (log ONLY) | any named fail-open degrade — **no bundle event**, deliberately: a stage that reaped nothing leaves a trace byte-identical to before #3663, so no existing bundle grows an event and `FISHHAWK_ORPHAN_SWEEP=off` costs nothing in the bundle |
 
-The zero-orphan common case emits **neither**. The five named degrades, the six
+The zero-orphan common case emits **neither**. The six named degrades, the six
 controls on a kill, and the four residuals are in
 `runner/internal/procsweep/README.md`.
 

@@ -117,7 +117,8 @@ Owned by the runner command's `stageOrphanSweeper`:
 | `disabled_by_operator` | `FISHHAWK_ORPHAN_SWEEP=off` |
 | `not_group_leader_no_recorded_pgids` | the runner does not lead its own group AND no descendant pgids were recorded — nothing this sweep could ever authorise, so it declines before reading the table |
 | `proc_table_unsupported` | `procsweep.ErrUnsupported` (Windows: no `ps`, no portable group signal) |
-| `proc_table_read_failed` | a `ps` read error at sweep time |
+| `proc_table_read_failed` | a `ps` read error at sweep time under a LIVE ctx — terminal, so the backstop does not re-run it |
+| `proc_table_read_cancelled` | the sweep-time `ps` read was aborted because the ctx it was handed is already done (a cancelled / timed-out stage). The ONE degrade that is RETRYABLE: zero kills happened and the recorded state is untouched, so the once-guard is left OPEN for the `run()` defer's `context.WithoutCancel(ctx)` pass |
 
 ## Residuals — stated, not hidden
 
@@ -155,13 +156,25 @@ Owned by the runner command's `stageOrphanSweeper`:
    structural fix is a cgroup (Linux) or a job object (Windows), neither of which
    exists on macOS.
 5. **The backstop sweep is log-only.** `run()` calls the sweep twice under one
-   `sync.Once`: the normal post-invoke site, whose event rides in the signed
+   latching guard: the normal post-invoke site, whose event rides in the signed
    bundle, and a `defer` that backstops the **cancel / timeout / early-return**
    paths. On those paths `run()` is already returning — there is no `res.Events`
    left to append to and no bundle to fold the event into — so the reap is
    visible only as a `stage_orphans_reaped` **log line**, with no bundle event.
    Accepted: the reap itself is the point, and the log line is enough to
    diagnose from.
+
+   The guard latches only on a pass that actually reached the process table.
+   The post-invoke site is handed `run()`'s OWN ctx, so on a cancelled stage its
+   `ps` read fails and that pass reaps nothing; a `sync.Once` would have spent
+   the single pass there and left the `context.WithoutCancel(ctx)` backstop with
+   nothing to do, so the recorded survivors would outlive the stage — the very
+   defect this package exists to fix. A ctx-aborted read therefore degrades
+   `proc_table_read_cancelled` and leaves the guard OPEN; every other degrade
+   (kill switch, operator off switch, `ErrUnsupported`, a `ps` failure under a
+   live ctx) is terminal, so a healthy stage still performs exactly one kill
+   pass. Pinned by `TestStageOrphanSweeper_CancelledSweepLeavesBackstopArmed`
+   and `_ReadErrorUnderLiveCtxStillLatches`.
 
 ## Test seams
 

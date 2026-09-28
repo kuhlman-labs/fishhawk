@@ -118,6 +118,41 @@ func TestDescendants_TornReadPPIDCycleTerminates(t *testing.T) {
 	}
 }
 
+// The cycle above is DISCONNECTED from the anchor, so the traversal never
+// reaches it and the visited set is not what terminates that test. A REACHABLE
+// cycle needs a torn read to report the same pid TWICE with different ppids,
+// which is exactly what a `ps` snapshot taken across a re-parent does: pid 200
+// appears both as the anchor's child (the stale row) and as 300's child (the
+// fresh row), so children[100] -> 200 -> children[200] -> 300 -> children[300]
+// -> 200 walks into a cycle the traversal genuinely entered. Without the visited
+// set this loops 200 -> 300 -> 200 forever. The duplicate ANCHOR row (100 as a
+// child of 300) additionally proves the anchor pre-marking excludes the anchor
+// from a closure that reaches it.
+func TestDescendants_ReachableCycleTerminatesAndExcludesAnchor(t *testing.T) {
+	tb := table(
+		proc(100, 1, 100, floorT, "runner"),           // anchor
+		proc(200, 100, 100, floorT, "sh (stale row)"), // reachable from the anchor
+		proc(300, 200, 100, floorT, "sh -c loop"),     // reachable through 200
+		proc(200, 300, 100, floorT, "sh (fresh row)"), // torn read: 200 <-> 300 cycle
+		proc(100, 300, 100, floorT, "runner (torn row)"),
+	)
+	done := make(chan map[int]Proc, 1)
+	go func() { done <- Descendants(tb, 100) }()
+	select {
+	case got := <-done:
+		for _, pid := range []int{200, 300} {
+			if _, ok := got[pid]; !ok {
+				t.Errorf("pid %d must be in the closure — the traversal has to REACH the cycle for this test to pin its termination", pid)
+			}
+		}
+		if _, ok := got[100]; ok {
+			t.Error("the anchor must never appear in its own descendant closure, even when a torn row makes it a child of a descendant")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Descendants did not terminate on a ppid cycle it actually reached")
+	}
+}
+
 // --- Targets: the three exclusions --------------------------------------
 
 // c2's vehicle. The fixture RECORDS the runner's own pid (possible from a torn
