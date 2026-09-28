@@ -1,0 +1,42 @@
+{
+  "repo": "acme/app",
+  "window_start": "2026-09-07T00:00:00Z",
+  "window_end": "2026-10-05T00:00:00Z",
+  "window_weeks": 4,
+  "runs_scanned": 2,
+  "truncated": false,
+  "weeks": [
+    {
+      "week_start": "2026-09-07T00:00:00Z",
+      "merged_changes": 0
+    },
+    {
+      "week_start": "2026-09-14T00:00:00Z",
+      "merged_changes": 0
+    },
+    {
+      "week_start": "2026-09-21T00:00:00Z",
+      "merged_changes": 0
+    },
+    {
+      "week_start": "2026-09-28T00:00:00Z",
+      "merged_changes": 1
+    }
+  ],
+  "merged_changes": 1,
+  "median_cycle_time_seconds": 18000,
+  "cycle_time_samples": 1,
+  "cycle_time_excluded": 0,
+  "wait_on_human": {
+    "runs": 1,
+    "median_total_wait_seconds": 1800,
+    "total_wait_on_human_seconds": 1800,
+    "gates": [
+      {
+        "gate": "plan_approval",
+        "samples": 1,
+        "median_wait_seconds": 1800
+      }
+    ]
+  }
+}
