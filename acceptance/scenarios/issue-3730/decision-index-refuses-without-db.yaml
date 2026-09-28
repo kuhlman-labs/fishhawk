@@ -1,0 +1,14 @@
+id: scenario:issue-3730/decision-index-refuses-without-db
+statement: Invoking the decision-index backfill with no database URL supplied, and no database environment variable set, refuses with a usage exit code and an error naming both the flag and the environment variable rather than proceeding.
+verify_hint: 'CLI exit code/stderr: running the fishhawkd binary with `decision-index backfill` and no database argument exits 2 and prints an error naming the database flag and the environment variable.'
+steps: 'Ran the preview''s serving fishhawkd binary with FISHHAWKD_DATABASE_URL and DATABASE_URL unset: `fishhawkd decision-index backfill`, plus `decision-index check`, bare `decision-index` and `decision-index bogus`.'
+assertions:
+    expected: Exit 2 with an error naming the database flag and the environment variable.
+    observed_at_record: 'backfill: exit 2, stderr ''fishhawkd decision-index: --db or FISHHAWKD_DATABASE_URL is required''. check: same, exit 2. A missing or unknown mode also exits 2 with a usage line.'
+    repro_handle: env -u FISHHAWKD_DATABASE_URL fishhawkd decision-index backfill; echo $?
+origin:
+    issue: 3730
+    pr: 0
+    run_id: d773f2d2-3ad5-4ab0-883a-b6c656d8ab8a
+    head_sha: a6b2ccfb493afca4738ba2d0b6727e1b88ebb0be
+    recorded_at: 2026-09-28T22:08:21Z
