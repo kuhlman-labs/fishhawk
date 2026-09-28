@@ -357,6 +357,18 @@ export interface AttentionRequestedPath {
 }
 
 /**
+ * One failed acceptance criterion: its id and the request whose response the
+ * failing assertion evaluated. The request fields are absent when the failed
+ * criterion recorded no requests.
+ */
+export interface AttentionFailedCriterion {
+  id: string;
+  method?: string;
+  path?: string;
+  status?: number;
+}
+
+/**
  * One-screen decision context. Which fields are present depends on the
  * item kind — see the AttentionContext schema description.
  */
@@ -371,6 +383,7 @@ export interface AttentionContext {
   verdict?: string;
   criteria_failed?: number;
   criteria_skipped?: number;
+  failed_criteria?: AttentionFailedCriterion[];
   // split_verdict / paged_concern
   stage_kind?: string;
   severity?: string;

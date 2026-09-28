@@ -119,6 +119,27 @@ function AcceptanceContext({ ctx }: { ctx: AttentionContext }) {
         </Field>
       )}
       {parts.length > 0 && <Field label="Criteria">{parts.join(' · ')}</Field>}
+      {ctx.failed_criteria && ctx.failed_criteria.length > 0 && (
+        <Field label="Failed criteria">
+          <ul className="space-y-0.5">
+            {ctx.failed_criteria.map((c) => {
+              const req = [c.method, c.path].filter(Boolean).join(' ');
+              const req_with_status = c.status ? `${req} → ${c.status}` : req;
+              return (
+                <li key={c.id} className="font-mono text-xs">
+                  {c.id}
+                  {req_with_status && (
+                    <span className="text-neutral-500 dark:text-neutral-400">
+                      {' '}
+                      ({req_with_status})
+                    </span>
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+        </Field>
+      )}
     </>
   );
 }

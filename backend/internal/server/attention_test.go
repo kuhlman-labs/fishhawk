@@ -231,7 +231,23 @@ func (f *attnFixture) seedAllSixKinds(t *testing.T) {
 	ar := f.runs.seed(accRun, "acme/app", run.StateRunning, attnT0.Add(4*time.Hour), "Acceptance run")
 	ar.WorkflowSpec = []byte(attnAcceptanceSpec)
 	f.runs.addStage(accRun, accStage, run.StageTypeAcceptance, run.StageStateSucceeded, attnT0.Add(4*time.Hour+time.Minute))
-	outcome, _ := json.Marshal(map[string]any{"verdict": "failed", "criteria_failed": 2, "criteria_skipped": 1})
+	// The outcome carries a transcript so the card names WHICH criteria failed
+	// and each one's decision-relevant explanation (the failing request). A
+	// skipped criterion is present to prove only failed criteria surface.
+	outcome, _ := json.Marshal(map[string]any{
+		"verdict": "failed", "criteria_failed": 2, "criteria_skipped": 1,
+		"transcript": map[string]any{
+			"artifact_id":  attnID(33).String(),
+			"content_hash": "sha256:acc",
+			"criteria": []map[string]any{
+				{"id": "health-probe", "outcome": "failed", "request_count": 2,
+					"failing_request": map[string]any{"method": "GET", "path": "/healthz", "status": 503}},
+				{"id": "widget-create", "outcome": "failed", "request_count": 1,
+					"failing_request": map[string]any{"method": "POST", "path": "/v0/widgets", "status": 422}},
+				{"id": "flaky-metric", "outcome": "skipped", "request_count": 0, "failing_request": nil},
+			},
+		},
+	})
 	f.audit.seeded = append(f.audit.seeded, &audit.Entry{
 		ID: attnID(32), Sequence: 7, RunID: &accRun, StageID: &accStage, Timestamp: attnT0.Add(5 * time.Hour),
 		Category: CategoryAcceptanceOutcomeRecorded, Payload: outcome,
@@ -555,6 +571,82 @@ func TestAttention_AcceptanceGateStateError_DegradesOneRun(t *testing.T) {
 	}
 	if len(got.Items) != 5 {
 		t.Errorf("items = %v, want the other five kinds intact", attnKinds(got.Items))
+	}
+}
+
+// attnNthCategoryFailAudit fails the Nth ListForRunByCategory call for ONE
+// category and serves every other read from the wrapped fake. It lets a test
+// make the SECOND acceptance-outcome read (acceptanceItem's) fail while the
+// FIRST (acceptanceGateState's, which parks the item at triage) succeeds — the
+// two-consecutive-reads window concern (3) names.
+type attnNthCategoryFailAudit struct {
+	*auditFake
+	cmu      sync.Mutex
+	category string
+	failCall int // 1-based ordinal of the matching call to fail
+	seen     int
+}
+
+func (a *attnNthCategoryFailAudit) ListForRunByCategory(ctx context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
+	if category == a.category {
+		a.cmu.Lock()
+		a.seen++
+		n := a.seen
+		a.cmu.Unlock()
+		if n == a.failCall {
+			return nil, errors.New("attn: injected read failure #" + fmt.Sprint(n) + " for " + category)
+		}
+	}
+	return a.auditFake.ListForRunByCategory(ctx, runID, category)
+}
+
+// TestAttention_AcceptanceSecondReadError_ThinsAndDegrades pins concern (2/3):
+// when acceptanceGateState reads the outcome successfully (parking the item at
+// triage) but the acceptanceItem RE-READ fails, the item is still emitted with a
+// thinned context (no verdict, no criteria, no failed_criteria) AND the thinning
+// is named in degraded[] as acceptance_state_unreadable — never swallowed.
+func TestAttention_AcceptanceSecondReadError_ThinsAndDegrades(t *testing.T) {
+	f := newAttnFixture()
+	f.seedAllSixKinds(t)
+	cfg := f.config()
+	cfg.AuditRepo = &attnNthCategoryFailAudit{auditFake: f.audit, category: CategoryAcceptanceOutcomeRecorded, failCall: 2}
+	got := decodeAttention(t, getAttention(t, New(cfg), attnReader(""), ""))
+
+	var acc *attentionItem
+	for i := range got.Items {
+		if got.Items[i].Kind == attentionKindAcceptanceDisposition {
+			acc = &got.Items[i]
+		}
+	}
+	if acc == nil {
+		t.Fatalf("acceptance item dropped; want it KEPT with thin context. kinds=%v", attnKinds(got.Items))
+	}
+	if acc.Context.Verdict != "" || acc.Context.CriteriaFailed != nil || len(acc.Context.FailedCriteria) != 0 {
+		t.Errorf("context = %+v, want thinned (no verdict/criteria/failed_criteria) on the second-read failure", acc.Context)
+	}
+	if !attnHasDegraded(got, attentionDegradedAcceptanceUnreadable, attnID(30).String()) {
+		t.Errorf("degraded = %+v, want %s naming the acceptance run's thinned context", got.Degraded, attentionDegradedAcceptanceUnreadable)
+	}
+}
+
+// TestAttention_PlanGateNilAudit_DegradesReviews pins concern (3): with no audit
+// store the plan-gate item cannot carry its review verdicts, so the missing
+// contribution is named in degraded[] (plan_reviews_unreadable) rather than
+// dropped silently — and the item is still shown with its summary.
+func TestAttention_PlanGateNilAudit_DegradesReviews(t *testing.T) {
+	f := newAttnFixture()
+	f.seedPlanGateRun(attnID(1), attnID(2), "acme/app", run.StatePending, attnT0)
+	cfg := f.config()
+	cfg.AuditRepo = nil
+	got := decodeAttention(t, getAttention(t, New(cfg), attnReader(""), ""))
+	if len(got.Items) != 1 || got.Items[0].Kind != attentionKindPlanGate {
+		t.Fatalf("items = %+v, want the plan gate kept", got.Items)
+	}
+	if len(got.Items[0].Context.ReviewVerdicts) != 0 {
+		t.Errorf("review_verdicts = %+v, want none with no audit store", got.Items[0].Context.ReviewVerdicts)
+	}
+	if !attnHasDegraded(got, attentionDegradedPlanReviewsUnreadable, attnID(1).String()) {
+		t.Errorf("degraded = %+v, want %s naming the plan-gate run", got.Degraded, attentionDegradedPlanReviewsUnreadable)
 	}
 }
 

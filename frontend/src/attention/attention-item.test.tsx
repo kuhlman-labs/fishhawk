@@ -61,6 +61,20 @@ describe('<AttentionItemCard>', () => {
     expect(screen.getByText('2 failed · 1 skipped')).toBeInTheDocument();
   });
 
+  it('names which acceptance criteria failed and each one’s failing request', () => {
+    const item = itemOf('acceptance_disposition');
+    const failed = item.context.failed_criteria!;
+    expect(failed.length).toBeGreaterThan(0);
+    const { container } = renderCard(item);
+    for (const c of failed) {
+      // The card shows the criterion id and the request whose response the
+      // failing assertion evaluated — the decision-relevant explanation.
+      expect(container).toHaveTextContent(c.id);
+      if (c.path) expect(container).toHaveTextContent(c.path);
+      if (c.status) expect(container).toHaveTextContent(String(c.status));
+    }
+  });
+
   it("renders a split verdict's FULL note and the re-review that recorded it resolved", () => {
     renderCard(itemOf('split_verdict'));
     expect(

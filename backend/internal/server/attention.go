@@ -144,6 +144,13 @@ type attentionContext struct {
 	Verdict         string `json:"verdict,omitempty"`
 	CriteriaFailed  *int   `json:"criteria_failed,omitempty"`
 	CriteriaSkipped *int   `json:"criteria_skipped,omitempty"`
+	// FailedCriteria names WHICH criteria failed plus each one's
+	// decision-relevant explanation (the request whose response the failing
+	// assertion evaluated), so the acceptance card conveys the disposition
+	// without a detail-page fetch. Empty when the outcome carries no agreeing
+	// transcript (a legacy verdict, or a transcript suppressed for disagreeing
+	// with the verdict rows).
+	FailedCriteria []attentionFailedCriterion `json:"failed_criteria,omitempty"`
 	// split_verdict / paged_concern
 	StageKind      string   `json:"stage_kind,omitempty"`
 	Severity       string   `json:"severity,omitempty"`
@@ -167,6 +174,18 @@ type attentionReviewVerdict struct {
 	ReviewerModel string `json:"reviewer_model,omitempty"`
 	Verdict       string `json:"verdict"`
 	ConcernCount  int    `json:"concern_count"`
+}
+
+// attentionFailedCriterion is one failed acceptance criterion: its id and the
+// request whose response the failing assertion evaluated (method, path,
+// status) — the decision-relevant explanation carried inline on the card. The
+// request fields are empty when the failed criterion recorded no requests
+// (FailingRequest was null in the transcript summary).
+type attentionFailedCriterion struct {
+	ID     string `json:"id"`
+	Method string `json:"method,omitempty"`
+	Path   string `json:"path,omitempty"`
+	Status int    `json:"status,omitempty"`
 }
 
 // attentionCollector accumulates items and degraded reasons for one request.
@@ -340,7 +359,7 @@ func (s *Server) collectRunAttention(ctx context.Context, ru *run.Run, col *atte
 	if aerr != nil {
 		col.degrade(attentionDegradedAcceptanceUnreadable, runID, "", aerr.Error())
 	} else if gate == acceptanceGateTriage {
-		col.add(s.acceptanceItem(ctx, ru, stages, title))
+		col.add(s.acceptanceItem(ctx, ru, stages, title, col))
 	}
 
 	// (c) pending scope amendments.
@@ -453,7 +472,12 @@ func (s *Server) planGateItem(ctx context.Context, ru *run.Run, st *run.Stage, t
 		col.degrade(attentionDegradedPlanSummaryUnavailable, runID, "", err.Error())
 	}
 	it.Context.PlanSummary = summary
-	if s.cfg.AuditRepo != nil {
+	if s.cfg.AuditRepo == nil {
+		// No audit store → the plan-review verdicts cannot be read. Report the
+		// thinned contribution rather than dropping it silently; the item is
+		// still shown with its summary.
+		col.degrade(attentionDegradedPlanReviewsUnreadable, runID, "", "audit store unconfigured")
+	} else {
 		entries, aerr := s.cfg.AuditRepo.ListForRunByCategory(ctx, ru.ID, "plan_reviewed")
 		if aerr != nil {
 			col.degrade(attentionDegradedPlanReviewsUnreadable, runID, "", aerr.Error())
@@ -507,8 +531,10 @@ func (s *Server) attentionPlanSummary(ctx context.Context, stageID uuid.UUID) (s
 }
 
 // acceptanceItem builds the acceptance_disposition item from the newest
-// recorded outcome (already known to be an unarbitrated failure).
-func (s *Server) acceptanceItem(ctx context.Context, ru *run.Run, stages []*run.Stage, title string) attentionItem {
+// recorded outcome (already known to be an unarbitrated failure). The outcome
+// transcript supplies WHICH criteria failed and each one's decision-relevant
+// explanation, carried inline as FailedCriteria.
+func (s *Server) acceptanceItem(ctx context.Context, ru *run.Run, stages []*run.Stage, title string, col *attentionCollector) attentionItem {
 	runID := ru.ID.String()
 	it := attentionItem{
 		Kind:       attentionKindAcceptanceDisposition,
@@ -525,13 +551,36 @@ func (s *Server) acceptanceItem(ctx context.Context, ru *run.Run, stages []*run.
 		it.DetailPath = "/runs/" + runID + "/stages/" + acc.ID.String()
 		it.Since = attentionStageSince(acc, ru)
 	}
-	// acceptanceGateState just read this outcome successfully; a second read
-	// failing here only thins the context, so it is not separately degraded.
-	if out, err := s.latestAcceptanceOutcome(ctx, ru.ID); err == nil && out.Recorded {
+	// acceptanceGateState just read this outcome successfully. A second read
+	// failing here thins the context to nothing (no verdict, no criteria) —
+	// which would silently contradict the one-screen-context contract — so it
+	// is reported as acceptance_state_unreadable rather than swallowed. The
+	// item is still emitted (the gate parked it; the operator must see it).
+	out, err := s.latestAcceptanceOutcome(ctx, ru.ID)
+	if err != nil {
+		col.degrade(attentionDegradedAcceptanceUnreadable, runID, "",
+			"acceptance outcome unreadable on re-read; card context thinned: "+err.Error())
+		return it
+	}
+	if out.Recorded {
 		failed, skipped := out.CriteriaFailed, out.CriteriaSkipped
 		it.Context.Verdict = out.Verdict
 		it.Context.CriteriaFailed = &failed
 		it.Context.CriteriaSkipped = &skipped
+		if out.Transcript != nil {
+			for _, c := range out.Transcript.Criteria {
+				if c.Outcome != "failed" {
+					continue
+				}
+				fc := attentionFailedCriterion{ID: c.ID}
+				if c.FailingRequest != nil {
+					fc.Method = c.FailingRequest.Method
+					fc.Path = c.FailingRequest.Path
+					fc.Status = c.FailingRequest.Status
+				}
+				it.Context.FailedCriteria = append(it.Context.FailedCriteria, fc)
+			}
+		}
 	}
 	return it
 }

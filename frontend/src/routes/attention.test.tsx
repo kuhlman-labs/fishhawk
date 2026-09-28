@@ -47,6 +47,7 @@ const CONTEXT_KEYS = new Set([
   'verdict',
   'criteria_failed',
   'criteria_skipped',
+  'failed_criteria',
   'stage_kind',
   'severity',
   'category',
@@ -180,6 +181,16 @@ describe('<Attention>', () => {
     );
     expect(accept).toHaveTextContent(golden.items[2].context.verdict!);
     expect(accept).toHaveTextContent('2 failed · 1 skipped');
+    // The card names WHICH criteria failed and each one's failing request
+    // (the decision-relevant explanation) from the shared golden, so an
+    // operator sees the disposition without a detail-page fetch.
+    const failed = golden.items[2].context.failed_criteria!;
+    expect(failed.length).toBeGreaterThan(0);
+    failed.forEach((c) => {
+      expect(accept).toHaveTextContent(c.id);
+      if (c.path) expect(accept).toHaveTextContent(c.path);
+      if (c.status) expect(accept).toHaveTextContent(String(c.status));
+    });
     expect(split).toHaveTextContent(golden.items[3].context.note!);
     expect(split).toHaveTextContent(golden.items[3].context.confirmation_note!);
     expect(paged).toHaveTextContent(golden.items[4].context.note!);

@@ -53,7 +53,21 @@
       "context": {
         "verdict": "failed",
         "criteria_failed": 2,
-        "criteria_skipped": 1
+        "criteria_skipped": 1,
+        "failed_criteria": [
+          {
+            "id": "health-probe",
+            "method": "GET",
+            "path": "/healthz",
+            "status": 503
+          },
+          {
+            "id": "widget-create",
+            "method": "POST",
+            "path": "/v0/widgets",
+            "status": 422
+          }
+        ]
       },
       "detail_path": "/runs/00000000-0000-4000-8000-000000000030/stages/00000000-0000-4000-8000-000000000031",
       "since": "2026-09-01T16:01:00Z"

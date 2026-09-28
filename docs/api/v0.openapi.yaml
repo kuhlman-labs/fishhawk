@@ -4959,7 +4959,8 @@ components:
         One-screen decision context. Fields present depend on `kind`:
         `plan_gate` → `plan_summary`, `review_verdicts`; `scope_amendment` →
         `reason`, `requested_paths`; `acceptance_disposition` → `verdict`,
-        `criteria_failed`, `criteria_skipped`; `split_verdict` /
+        `criteria_failed`, `criteria_skipped`, `failed_criteria` (which
+        criteria failed + each one's failing request); `split_verdict` /
         `paged_concern` → `stage_kind`, `severity`, `category`,
         `reviewer_model`, `note` (FULL prose), `new_evidence`, and for a
         split additionally `confirmation_note`, `dispute_reasons`;
@@ -4987,6 +4988,24 @@ components:
         verdict: { type: string }
         criteria_failed: { type: integer }
         criteria_skipped: { type: integer }
+        failed_criteria:
+          type: array
+          description: |
+            The failed acceptance criteria: each carries the criterion `id`
+            and the request whose response the failing assertion evaluated
+            (`method`, `path`, `status`) — the decision-relevant explanation
+            rendered inline on the card. The request fields are omitted when
+            the failed criterion recorded no requests. Empty/absent when the
+            outcome carries no agreeing transcript (a legacy verdict, or one
+            whose transcript was suppressed for disagreeing with the verdict).
+          items:
+            type: object
+            required: [id]
+            properties:
+              id: { type: string }
+              method: { type: string }
+              path: { type: string }
+              status: { type: integer }
         stage_kind: { type: string }
         severity: { type: string }
         category: { type: string }
