@@ -4,6 +4,7 @@ import { RequireAuth } from './auth/require-auth';
 import { Root } from './routes/root';
 import { Login } from './routes/login';
 import { AccessDenied } from './routes/access-denied';
+import { Attention } from './routes/attention';
 import { Runs } from './routes/runs';
 import { RunDetail } from './routes/run-detail';
 import { StageDetail } from './routes/stage-detail';
@@ -26,7 +27,7 @@ export function App() {
             </RequireAuth>
           }
         >
-          <Route index element={<Runs />} />
+          <Route index element={<Attention />} />
           <Route path="runs" element={<Runs />} />
           <Route path="runs/:runId" element={<RunDetail />} />
           <Route path="runs/:runId/stages/:stageId" element={<StageDetail />} />
