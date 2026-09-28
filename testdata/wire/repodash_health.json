@@ -1,0 +1,26 @@
+{
+  "repo": "acme/app",
+  "window_start": "2026-09-07T00:00:00Z",
+  "window_end": "2026-10-05T00:00:00Z",
+  "window_weeks": 4,
+  "runs_scanned": 2,
+  "truncated": false,
+  "runs_considered": 2,
+  "plan_approval_samples": 1,
+  "plan_first_shot_approvals": 1,
+  "plan_first_shot_approval_rate": 1,
+  "fixup_runs": 1,
+  "fixup_rate": 0.5,
+  "acceptance_samples": 1,
+  "acceptance_passed": 1,
+  "acceptance_not_validated": 0,
+  "acceptance_failed": 0,
+  "acceptance_undecidable": 0,
+  "acceptance_pass_rate": 1,
+  "failure_categories": {
+    "A": 1,
+    "B": 0,
+    "C": 0,
+    "D": 0
+  }
+}
