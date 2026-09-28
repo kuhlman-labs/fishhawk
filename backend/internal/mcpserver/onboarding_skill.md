@@ -1,13 +1,14 @@
 ---
 name: fishhawk-onboarding
-description: Help me onboard a repo to Fishhawk — first-run readiness, a starter workflow spec and a pre-commit spec check via fishhawk_doctor, fishhawk_init and fishhawk_validate.
+description: Help me onboard a repo to Fishhawk — first-run readiness, a starter workflow spec plus charter skeleton, operator overlay and work-management config, and a pre-commit spec check via fishhawk_doctor, fishhawk_init and fishhawk_validate.
 ---
 
 # Fishhawk onboarding
 
 Use this skill when a connecting repository has no `.fishhawk/workflows.yaml`
 yet, or you are unsure whether it is ready for its first Fishhawk run. It
-walks `fishhawk_doctor` (readiness), `fishhawk_init` (starter spec) and
+walks `fishhawk_doctor` (readiness), `fishhawk_init` (starter spec and the
+three governance documents) and
 `fishhawk_validate` (the pre-commit spec check) to a committed spec and a
 first run.
 
@@ -79,9 +80,31 @@ from the working directory:
   `max_files_changed` so a docs reorganisation fits. The output echoes the
   resolved `shape`.
 
-`fishhawk_init` returns `workflow_yaml` and `target_path` — it writes nothing
-itself. Write `workflow_yaml` to `target_path` (`.fishhawk/workflows.yaml`) in
-the target repository's working tree.
+Then choose the work-management connection. `fishhawk_init` cannot read the
+repository's git origin, so pass what it would detect: `forge` (`github` or
+`gitlab`; `gitlab` is inferred when `gitlab_project` is set), and on GitHub
+`project_owner` + `project_number` (the GitHub Projects board filed issues land
+on). Omitting either leaves the config's `project:` block commented under a
+fill-me-in marker and lists the missing fields in `incomplete` — ask the
+operator for them rather than guessing a number.
+
+`fishhawk_init` returns FOUR files — it writes nothing itself. Each has its
+bytes and its repo-relative path, and `files` repeats all four keyed by path:
+
+- `workflow_yaml` → `.fishhawk/workflows.yaml` — the workflow spec.
+- `charter_md` → `.fishhawk/charter.md` — the charter SKELETON: section
+  structure and stable rubric ids, every body a fill-me-in marker.
+- `operator_yaml` → `.fishhawk/operator.yaml` — the thin operator overlay.
+- `work_management_yaml` → `.fishhawk/work-management.yaml` — the
+  work-management config, carrying the `charter:` block backlog grooming
+  requires.
+
+Write each file to its path in the target repository's working tree ONLY where
+that path does not already exist. **Never overwrite an existing
+`.fishhawk/charter.md`** — the charter is human-authored. Do not draft its
+direction text yourself: tell the operator it must be filled (north star,
+current phase, non-goals and every rubric line) before a grooming run can cite
+it.
 
 ## Step 3 — Validate before committing
 
@@ -107,8 +130,8 @@ equivalent.
 
 ## Step 4 — Commit and open the PR
 
-The agent takes no git actions. The operator commits the written
-`.fishhawk/workflows.yaml` and opens the pull request under their own
+The agent takes no git actions. The operator fills the charter, then commits
+the written `.fishhawk/` files and opens the pull request under their own
 identity — this mirrors the operator-role rule the rest of the loop follows:
 the agent proposes, the operator acts.
 

@@ -8,6 +8,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/scaffold"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
 
@@ -131,22 +132,46 @@ func runnerCredentials(forgeFamily string, getenv func(string) string) *runnerCr
 // when omitted. Shape selects the repository shape; it defaults to "app" when
 // omitted, and is chosen explicitly — never inferred from the working
 // directory.
+//
+// Forge, ProjectOwner, ProjectNumber and GitLabProject (E74.3 / #3718) select
+// the work-management provider connection, mirroring the CLI's
+// --gitlab-project / --project-owner / --project-number flags: the MCP tool
+// cannot read the caller's git origin, so the caller supplies what the CLI
+// would have detected.
 type InitInput struct {
-	Preset string `json:"preset,omitempty" jsonschema:"workflow autonomy preset: one of low, medium, high; defaults to medium when omitted"`
-	Shape  string `json:"shape,omitempty" jsonschema:"repository shape: app (a repository with a test entrypoint) or config-only (a config- or docs-only repository with none, dropping the verify block and tests_added_or_updated and raising max_files_changed); defaults to app when omitted"`
+	Preset        string `json:"preset,omitempty" jsonschema:"workflow autonomy preset: one of low, medium, high; defaults to medium when omitted"`
+	Shape         string `json:"shape,omitempty" jsonschema:"repository shape: app (a repository with a test entrypoint) or config-only (a config- or docs-only repository with none, dropping the verify block and tests_added_or_updated and raising max_files_changed); defaults to app when omitted"`
+	Forge         string `json:"forge,omitempty" jsonschema:"work-management provider family: github (GitHub Projects) or gitlab; defaults to gitlab when gitlab_project is set, otherwise github"`
+	ProjectOwner  string `json:"project_owner,omitempty" jsonschema:"github only: the GitHub Projects owner login (the repo owner); omitted leaves the project block commented with a fill-me-in marker"`
+	ProjectNumber int    `json:"project_number,omitempty" jsonschema:"github only: the GitHub Projects number (the integer in the Project URL); omitted leaves the project block commented with a fill-me-in marker"`
+	GitLabProject string `json:"gitlab_project,omitempty" jsonschema:"gitlab only: the namespaced project path filed issues land in; omitted means the repository's own path"`
 }
 
-// InitOutput carries the starter workflow spec scaffold. The conversational
-// agent writes WorkflowYAML to TargetPath in the target repo — fishhawk_init
-// itself writes no file (preset-only; the delta options + the AGENTS.md/CLAUDE.md
-// bridge the CLI `fishhawk init` performs are a follow-up, since the
-// delta-applying generator lives only in cli/internal/spec).
+// InitOutput carries the scaffold file set. The conversational agent writes
+// each document to its target path in the target repo — fishhawk_init itself
+// writes no file. Since E74.3 / #3718 the set is the same FOUR documents the
+// CLI `fishhawk init` writes: the workflow spec plus the charter skeleton,
+// operator overlay and work-management config rendered by
+// backend/internal/scaffold (the byte-mirror of cli/internal/scaffold). Files
+// repeats all four keyed by repo-relative path so a client indexes on one
+// stable shape. The spec delta options and the AGENTS.md/CLAUDE.md bridge
+// remain CLI-only (the delta-applying generator lives only in
+// cli/internal/spec).
 type InitOutput struct {
-	Preset       string `json:"preset" jsonschema:"the resolved preset (echoes the default when the input was omitted)"`
-	Shape        string `json:"shape" jsonschema:"the resolved repository shape (echoes app when the input was omitted)"`
-	WorkflowYAML string `json:"workflow_yaml" jsonschema:"the canonical workflow-v2 preset spec bytes to write to the repo"`
-	TargetPath   string `json:"target_path" jsonschema:"the repo-relative path the scaffold should be committed to (.fishhawk/workflows.yaml)"`
-	NextStep     string `json:"next_step" jsonschema:"what to do with the scaffold next: write it, then validate it with fishhawk_validate BEFORE committing (E45.65 / #3579)"`
+	Preset             string            `json:"preset" jsonschema:"the resolved preset (echoes the default when the input was omitted)"`
+	Shape              string            `json:"shape" jsonschema:"the resolved repository shape (echoes app when the input was omitted)"`
+	Forge              string            `json:"forge" jsonschema:"the resolved work-management provider family: github or gitlab"`
+	WorkflowYAML       string            `json:"workflow_yaml" jsonschema:"the canonical workflow-v2 preset spec bytes to write to the repo"`
+	TargetPath         string            `json:"target_path" jsonschema:"the repo-relative path workflow_yaml should be committed to (.fishhawk/workflows.yaml)"`
+	CharterMD          string            `json:"charter_md" jsonschema:"the human-authored charter SKELETON: section structure and stable rubric ids, every body a fill-me-in marker; write it only when charter_path does not exist"`
+	CharterPath        string            `json:"charter_path" jsonschema:"the repo-relative path charter_md targets (.fishhawk/charter.md)"`
+	OperatorYAML       string            `json:"operator_yaml" jsonschema:"the thin operator role overlay (knob preset, fill-me-in conventions, work-management pointer)"`
+	OperatorPath       string            `json:"operator_path" jsonschema:"the repo-relative path operator_yaml targets (.fishhawk/operator.yaml)"`
+	WorkManagementYAML string            `json:"work_management_yaml" jsonschema:"the complete work-management config for the resolved provider, including the charter block the grooming gate requires"`
+	WorkManagementPath string            `json:"work_management_path" jsonschema:"the repo-relative path work_management_yaml targets (.fishhawk/work-management.yaml)"`
+	Files              map[string]string `json:"files" jsonschema:"all four documents keyed by repo-relative target path"`
+	Incomplete         []string          `json:"incomplete,omitempty" jsonschema:"work-management fields left for the operator to fill (project.owner, project.number): the project block is written commented and grooming/filing fail closed until it is filled"`
+	NextStep           string            `json:"next_step" jsonschema:"what to do with the scaffold next: write each file only where absent, fill the human-authored charter, then validate the spec with fishhawk_validate BEFORE committing (E45.65 / #3579, E74.3 / #3718)"`
 }
 
 // initNextStep is the fixed next_step sentence fishhawk_init returns (E45.65 /
@@ -154,7 +179,12 @@ type InitOutput struct {
 // and says why fishhawk_doctor cannot stand in for it: the doctor's spec rung
 // reads the DEFAULT BRANCH, so re-running it against an uncommitted file is
 // the dead loop the issue reported.
-const initNextStep = "Write workflow_yaml to target_path in the checkout, then call fishhawk_validate (working_dir = the checkout, or workflow_spec = these bytes) and fix any diagnostics until valid:true BEFORE committing. Do not re-run fishhawk_doctor to confirm the file: its spec rung reads the DEFAULT BRANCH and stays unavailable until the spec is merged."
+//
+// Since E74.3 / #3718 it also carries the charter rule: the charter is
+// HUMAN-AUTHORED, so the agent writes the skeleton, the human fills it, and an
+// existing charter is never overwritten — the MCP counterpart of the CLI
+// writer having no force parameter at all.
+const initNextStep = "Write each of the four files in files to its path in the checkout ONLY where that path does not already exist — never overwrite an existing file, and NEVER overwrite an existing .fishhawk/charter.md under any circumstance. The charter is human-authored: write the skeleton, then have the human FILL every fill-me-in marker (north star, current phase, non-goals, every rubric line); do not draft its direction text yourself. If incomplete is non-empty, fill those fields in the work-management file's commented project block. Then call fishhawk_validate (working_dir = the checkout, or workflow_spec = these bytes) and fix any diagnostics until valid:true BEFORE committing. Do not re-run fishhawk_doctor to confirm the file: its spec rung reads the DEFAULT BRANCH and stays unavailable until the spec is merged."
 
 // registerDoctor wires the fishhawk_doctor tool (E29.6 / #1506): the in-band
 // counterpart to the CLI `fishhawk doctor` (E29.4/E29.5). It wraps
@@ -450,17 +480,39 @@ the working directory:
                   only), drops tests_added_or_updated, keeps ci_green and raises
                   max_files_changed so a docs reorganisation fits.
 
-shape defaults to app when omitted; the output echoes the resolved shape. This
-tool is PRESET-ONLY: it returns the scaffold bytes for the conversational agent
-to write to target_path (.fishhawk/workflows.yaml) — it writes no file itself,
-and the delta options (budget / single-reviewer / human-gates) plus the
-AGENTS.md/CLAUDE.md bridge the CLI performs are a follow-up. Run fishhawk_doctor
-first to see whether a spec is already present. An unknown preset or shape
-returns a clean tool error naming the valid values. The output's next_step says what follows: write the bytes, then call
-fishhawk_validate on them BEFORE committing — fishhawk_doctor's spec rung reads
-the DEFAULT BRANCH, so it cannot confirm an uncommitted file. Read
-fishhawk://onboarding-skill for the full walk (doctor → init → validate →
-commit).
+shape defaults to app when omitted; the output echoes the resolved shape.
+
+Alongside the spec it returns the same three governance documents the CLI
+writes (E74.3), each with its repo-relative path and all four repeated in a
+files map keyed by path:
+
+  - charter_md (.fishhawk/charter.md) — a human-authored charter SKELETON:
+    section structure and stable rubric ids (V1-V5, R1-R5, U1-U4, S1-S5),
+    every body a fill-me-in marker. The human fills it; never overwrite an
+    existing charter.
+  - operator_yaml (.fishhawk/operator.yaml) — the thin operator overlay.
+  - work_management_yaml (.fishhawk/work-management.yaml) — a complete
+    work-management config with the charter block backlog grooming requires.
+
+The optional forge (github | gitlab), project_owner, project_number and
+gitlab_project inputs select the work-management connection; the tool cannot
+read the caller's git origin, so pass what it names. forge defaults to gitlab
+when gitlab_project is set, otherwise github. On github, omitting
+project_owner or project_number leaves the project block COMMENTED under a
+fill-me-in marker and lists the missing fields in incomplete — grooming and
+issue filing fail closed until it is filled. project_owner / project_number
+with forge gitlab, or gitlab_project with forge github, is a clean tool error.
+
+This tool writes no file itself: the conversational agent writes each document
+ONLY where its path does not already exist. The spec delta options (budget /
+single-reviewer / human-gates) and the AGENTS.md/CLAUDE.md bridge stay
+CLI-only. Run fishhawk_doctor first to see whether a spec is already present.
+An unknown preset, shape or forge returns a clean tool error naming the valid
+values. The output's next_step says what follows: write the files, fill the
+charter, then call fishhawk_validate on the spec BEFORE committing —
+fishhawk_doctor's spec rung reads the DEFAULT BRANCH, so it cannot confirm an
+uncommitted file. Read fishhawk://onboarding-skill for the full walk (doctor →
+init → validate → commit).
 `),
 	}, resolver.init)
 }
@@ -535,11 +587,68 @@ func (*runResolver) init(_ context.Context, _ *mcp.CallToolRequest, in InitInput
 	if err != nil {
 		return nil, InitOutput{}, fmt.Errorf("unknown preset %q: want one of low, medium, high", preset)
 	}
+	forge, opts, err := initScaffoldOptions(in)
+	if err != nil {
+		return nil, InitOutput{}, err
+	}
+	// The preset name IS the overlay's autonomy knob, as in the CLI.
+	opts.Autonomy = preset
+	docs, err := scaffold.Files(opts)
+	if err != nil {
+		return nil, InitOutput{}, fmt.Errorf("render scaffold: %w", err)
+	}
+	files := map[string]string{specFileName: string(data)}
+	for path, b := range docs {
+		files[path] = string(b)
+	}
 	return nil, InitOutput{
-		Preset:       preset,
-		Shape:        shape,
-		WorkflowYAML: string(data),
-		TargetPath:   specFileName,
-		NextStep:     initNextStep,
+		Preset:             preset,
+		Shape:              shape,
+		Forge:              forge,
+		WorkflowYAML:       string(data),
+		TargetPath:         specFileName,
+		CharterMD:          string(docs[scaffold.CharterPath]),
+		CharterPath:        scaffold.CharterPath,
+		OperatorYAML:       string(docs[scaffold.OperatorPath]),
+		OperatorPath:       scaffold.OperatorPath,
+		WorkManagementYAML: string(docs[scaffold.WorkManagementPath]),
+		WorkManagementPath: scaffold.WorkManagementPath,
+		Files:              files,
+		Incomplete:         opts.Missing(),
+		NextStep:           initNextStep,
 	}, nil
+}
+
+// initScaffoldOptions resolves the work-management provider connection from
+// the fishhawk_init inputs (E74.3 / #3718), returning the resolved forge
+// family. It mirrors the CLI's resolution — --gitlab-project selects gitlab —
+// but fails closed on a contradictory combination instead of silently
+// ignoring an input, since a tool caller has no stdout note to read.
+func initScaffoldOptions(in InitInput) (string, scaffold.Options, error) {
+	forge := strings.TrimSpace(in.Forge)
+	owner := strings.TrimSpace(in.ProjectOwner)
+	glProject := strings.TrimSpace(in.GitLabProject)
+	if forge == "" {
+		forge = "github"
+		if glProject != "" {
+			forge = "gitlab"
+		}
+	}
+	if in.ProjectNumber < 0 {
+		return "", scaffold.Options{}, fmt.Errorf("project_number %d is invalid: want the positive integer in the GitHub Project URL, or omit it", in.ProjectNumber)
+	}
+	switch forge {
+	case "github":
+		if glProject != "" {
+			return "", scaffold.Options{}, fmt.Errorf("gitlab_project is set but forge is github: pass forge gitlab, or drop gitlab_project")
+		}
+		return forge, scaffold.Options{Provider: scaffold.ProviderGitHubProjects, ProjectOwner: owner, ProjectNumber: in.ProjectNumber}, nil
+	case "gitlab":
+		if owner != "" || in.ProjectNumber != 0 {
+			return "", scaffold.Options{}, fmt.Errorf("project_owner / project_number configure GitHub Projects, but forge is gitlab: drop them, or pass forge github")
+		}
+		return forge, scaffold.Options{Provider: scaffold.ProviderGitLab, GitLabProject: glProject}, nil
+	default:
+		return "", scaffold.Options{}, fmt.Errorf("unknown forge %q: want one of github, gitlab", forge)
+	}
 }
