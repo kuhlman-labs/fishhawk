@@ -405,3 +405,104 @@ func TestRuleKey_CriterionlessRuleKeysStably(t *testing.T) {
 		t.Error("a criterionless declaration keys identically to a paths-bearing one with the same clamp")
 	}
 }
+
+// TestRuleKey_DistinguishesDelimiterBearingDeclarations pins the INJECTIVITY
+// of the canonical rendering against the delimiters the rendering itself uses:
+// the "," that joins one criterion list's elements, the " " that joins the
+// fields, and the "=" that separates a field's name from its value.
+//
+// Each pair below is TWO GENUINELY DIFFERENT declarations — one glob
+// containing a comma matches a path literally containing that comma, two globs
+// match either path — that a bare delimiter join renders identically
+// (`paths=a,b` for both). Under such a rendering a decision index keyed on
+// RuleKey would follow one rule and silently report the other's history.
+//
+// The `field=` cases are the level-up form of the same hazard: a value that
+// carries a space plus a plausible field prefix could forge a second field in
+// the space-joined part list.
+func TestRuleKey_DistinguishesDelimiterBearingDeclarations(t *testing.T) {
+	clamp := func() spec.EscalationRequirements {
+		return spec.EscalationRequirements{Approvals: &spec.EscalatedApprovals{Count: ptr(2)}}
+	}
+	cases := []struct {
+		name string
+		a, b spec.Escalation
+	}{
+		{
+			name: "paths: one comma-bearing glob vs two globs",
+			a:    esc(spec.Predicate{Paths: []string{"a,b"}}, clamp()),
+			b:    esc(spec.Predicate{Paths: []string{"a", "b"}}, clamp()),
+		},
+		{
+			// Both sides are written in the SORTED order the canonical
+			// rendering imposes, so a bare join renders them byte-identically
+			// — without that the case would pass on the sort alone and prove
+			// nothing about the encoding.
+			name: "labels: one comma-bearing label vs two labels",
+			a:    esc(spec.Predicate{Labels: []string{"area:audit,area:server"}}, clamp()),
+			b:    esc(spec.Predicate{Labels: []string{"area:audit", "area:server"}}, clamp()),
+		},
+		{
+			name: "paths: an empty element vs a leading-comma glob",
+			a:    esc(spec.Predicate{Paths: []string{"a", ""}}, clamp()),
+			b:    esc(spec.Predicate{Paths: []string{",a"}}, clamp()),
+		},
+		{
+			name: "paths: a glob forging a second field vs the two real fields",
+			a:    esc(spec.Predicate{Paths: []string{"a labels=x"}}, clamp()),
+			b:    esc(spec.Predicate{Paths: []string{"a"}, Labels: []string{"x"}}, clamp()),
+		},
+		{
+			name: "member_of: a group name forging a max_autonomy clamp",
+			a: esc(spec.Predicate{Paths: []string{"a"}}, spec.EscalationRequirements{
+				Approvals: &spec.EscalatedApprovals{MemberOf: "sec require.max_autonomy=low"},
+			}),
+			b: esc(spec.Predicate{Paths: []string{"a"}}, spec.EscalationRequirements{
+				Approvals:   &spec.EscalatedApprovals{MemberOf: "sec"},
+				MaxAutonomy: spec.AutonomyTier("low"),
+			}),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Self-pairing guard: each declaration must key stably against
+			// ITSELF, so a RED below is the two declarations colliding and
+			// never an unstable renderer.
+			keyA := stableRuleKey(t, "a", tc.a)
+			keyB := stableRuleKey(t, "b", tc.b)
+			if keyA == keyB {
+				t.Errorf("two distinct declarations share a RuleKey (%q); the canonical rendering must be injective over its own delimiters", keyA)
+			}
+		})
+	}
+}
+
+// TestRuleKey_DelimiterBearingValuesStayPermutationInvariant pins that the
+// injectivity fix did not cost the canonicalization contract: a within-rule
+// permutation of a list whose elements CONTAIN the join delimiter must still
+// leave the key unchanged, because each list is an unordered OR whatever its
+// elements hold.
+func TestRuleKey_DelimiterBearingValuesStayPermutationInvariant(t *testing.T) {
+	clamp := spec.EscalationRequirements{Approvals: &spec.EscalatedApprovals{Count: ptr(2)}}
+	a := esc(spec.Predicate{Paths: []string{"a,b", "c d", "e=f"}}, clamp)
+	permuted := esc(spec.Predicate{Paths: []string{"e=f", "a,b", "c d"}}, clamp)
+	if RuleKey(a) != RuleKey(permuted) {
+		t.Errorf("RuleKey moved under a permutation of delimiter-bearing globs: %q vs %q", RuleKey(a), RuleKey(permuted))
+	}
+}
+
+// stableRuleKey keys one declaration TWICE and fails if the two disagree. It
+// is the self-pairing half of the injectivity cases: a collision assertion is
+// only meaningful once the renderer is known to be deterministic on each side
+// in isolation.
+func stableRuleKey(t *testing.T, side string, e spec.Escalation) string {
+	t.Helper()
+	keys := make([]string, 2)
+	for i := range keys {
+		keys[i] = RuleKey(e)
+	}
+	if keys[0] != keys[1] {
+		t.Fatalf("RuleKey of declaration %s is not stable across calls: %q vs %q", side, keys[0], keys[1])
+	}
+	return keys[0]
+}
