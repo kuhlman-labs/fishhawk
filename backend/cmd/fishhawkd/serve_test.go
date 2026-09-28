@@ -49,6 +49,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/modeloracle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/pushnotify"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/repoacl"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/repodoc"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/reviewresolver"
@@ -5851,4 +5852,96 @@ func TestPlanReviewerSetForRequiresBinaryOnPATH(t *testing.T) {
 			t.Fatal("Default() = nil, want the claudecode adapter (Default is deliberately NOT PATH-gated)")
 		}
 	})
+}
+
+// TestBuildPushDispatcher_BootPath pins the #2292 startup contract: no
+// FISHHAWKD_NOTIFY_* → no dispatcher and no error (byte-identical to a build
+// without push); a webhook URL WITH its secret → one sink; a webhook URL
+// WITHOUT its secret, or a half-configured email sink → a startup error that
+// NAMES the missing variable and echoes no configured value.
+func TestBuildPushDispatcher_BootPath(t *testing.T) {
+	const canary = "BOOTCANARY9911"
+	cases := []struct {
+		name      string
+		env       map[string]string
+		wantSinks []string
+		wantErrIn string
+	}{
+		{name: "empty_env", env: map[string]string{}},
+		{name: "webhook_with_secret", env: map[string]string{
+			pushnotify.EnvWebhookURL:    "https://hooks.example.com/" + canary,
+			pushnotify.EnvWebhookSecret: "s3cret-" + canary,
+		}, wantSinks: []string{"webhook"}},
+		{name: "webhook_without_secret", env: map[string]string{
+			pushnotify.EnvWebhookURL: "https://" + canary + ":pw@hooks.example.com/" + canary + "?q=" + canary,
+		}, wantErrIn: pushnotify.EnvWebhookSecret},
+		{name: "half_configured_email", env: map[string]string{
+			pushnotify.EnvEmailSMTPAddr: "smtp.example.com:587",
+			pushnotify.EnvEmailTo:       "ops@example.com",
+			pushnotify.EnvEmailPassword: canary,
+			pushnotify.EnvEmailUsername: "ops",
+		}, wantErrIn: pushnotify.EnvEmailFrom},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			logger := slog.New(slog.NewTextHandler(&logs, nil))
+			d, err := buildPushDispatcher(func(k string) string { return tc.env[k] }, nil, logger)
+			if d != nil {
+				t.Cleanup(func() { closePushDispatcher(d, time.Second, logger) })
+			}
+			if tc.wantErrIn != "" {
+				if err == nil || d != nil {
+					t.Fatalf("want startup error naming %s and no dispatcher; got d=%v err=%v", tc.wantErrIn, d, err)
+				}
+				if !strings.Contains(err.Error(), tc.wantErrIn) {
+					t.Errorf("error %q does not name %s", err, tc.wantErrIn)
+				}
+				if strings.Contains(err.Error(), canary) || strings.Contains(logs.String(), canary) {
+					t.Errorf("configured value echoed: err=%q logs=%q", err, logs.String())
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got := strings.Join(d.SinkNames(), ","); got != strings.Join(tc.wantSinks, ",") {
+				t.Errorf("sinks = %q, want %q", got, strings.Join(tc.wantSinks, ","))
+			}
+			if tc.wantSinks == nil && d != nil {
+				t.Errorf("empty env built a dispatcher")
+			}
+			if strings.Contains(logs.String(), canary) {
+				t.Errorf("startup log echoed a configured value: %s", logs.String())
+			}
+		})
+	}
+}
+
+// TestClosePushDispatcher_BoundedByDeadline: shutdown never waits on an
+// abandoned Deliver — a sink that ignores its context cannot hold the drain
+// past the overall deadline. A nil dispatcher is a no-op.
+func TestClosePushDispatcher_BoundedByDeadline(t *testing.T) {
+	closePushDispatcher(nil, time.Second, slog.Default())
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	d := pushnotify.NewDispatcher([]pushnotify.Sink{ignoringSink{release}}, pushnotify.Options{SinkTimeout: time.Hour})
+	d.Enqueue(pushnotify.Event{RunID: "r", SourceSequence: 1})
+	var logs bytes.Buffer
+	start := time.Now()
+	closePushDispatcher(d, 200*time.Millisecond, slog.New(slog.NewTextHandler(&logs, nil)))
+	if el := time.Since(start); el > 5*time.Second {
+		t.Fatalf("closePushDispatcher took %v; the drain deadline did not bound shutdown", el)
+	}
+	if !strings.Contains(logs.String(), "push notification drain did not finish") {
+		t.Errorf("missed drain deadline was not logged: %s", logs.String())
+	}
+}
+
+type ignoringSink struct{ release chan struct{} }
+
+func (ignoringSink) Name() string { return "webhook" }
+func (s ignoringSink) Deliver(context.Context, pushnotify.Event) error {
+	<-s.release
+	return nil
 }
