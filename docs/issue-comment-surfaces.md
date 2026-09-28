@@ -2376,6 +2376,30 @@ Notes:
   a reader grepping the audit categories doesn't mistake it for a comment
   surface.
 
+
+## Push notification sinks (#2292)
+
+Not an issue-comment surface, but it shares the page-class taxonomy, so it is
+recorded here.
+
+- The `Router` now fans out to a SECOND channel: `issuecomment.PushChannel`
+  (`push.go`), appended by `server.New` whenever a push dispatcher is
+  configured — with or without a GitHub client. With no
+  `FISHHAWKD_NOTIFY_*` sink the Router is today's single GitHub-comment
+  channel.
+- Trigger: the same `pageClassEvents` projection the page-class pings use,
+  on `NotifyStatusUpdateForRun` and `NotifyPageClassForRun`. Unlike every
+  issue-comment surface it is NOT screened by `IsIssueAnchored()`: CLI- and
+  PR-triggered runs push too. Every other Channel method is a no-op
+  (`NotifyBudgetAlert` returns `(false, nil)`, so the #758 marker is unchanged).
+- Dedup is INDEPENDENT of `anchor_ping_posted`: a `push_notification_sent`
+  CLAIM row keyed on the source audit `Sequence`, appended under a per-run
+  lock BEFORE the event is enqueued. Delivery failures and queue-full drops
+  land as `push_notification_failed`. Neither category is anchor-timeline
+  activity. This closes the per-channel-dedup deferral for the page-class
+  path; budget alerts still do not push.
+- Payload contract, sinks and operator env: `docs/notifications.md`.
+
 ## Writer-side intent contract (#3406)
 
 The `activityCategories` set in `issuecomment/status_template.go` is a closed
@@ -2537,15 +2561,19 @@ run-link degradation note above.)
 
 The **(audit category, kind) taxonomy** in the table above is the routing
 key: a channel decides what to deliver and how to dedup from that taxonomy.
-A future Slack adapter (v0.x) is a new `Channel` appended to the Router —
-no change to the core, the call sites, or this GitHub channel. Two v0
-semantics to carry forward when that adapter lands:
+The push channel (#2292, see "Push notification sinks" above) is the first
+second `Channel` appended to the Router — no change to the core, the call
+sites, or this GitHub channel; Slack is one of its sinks, not a separate
+channel. Two v0 semantics it carries forward:
 
 - `Router.NotifyBudgetAlert` returns `posted = OR` across channels, and the
   cross-run `budget_alert_sent` dedup marker (#758) keys off "any channel
-  posted". For v0's single channel this is exactly the channel's own value;
-  per-channel dedup (so a Slack post doesn't suppress a GitHub post) is a
-  deferred v0.x design.
+  posted". The push channel's `NotifyBudgetAlert` is a no-op returning
+  `(false, nil)`, so the OR is still exactly the GitHub channel's own value;
+  per-channel budget-alert dedup (so a push doesn't suppress a GitHub post)
+  stays a deferred design until budget alerts push. The page-class path's
+  per-channel dedup is resolved: push claims on its own
+  `push_notification_sent` rows.
 - The Router is nil-safe (nil receiver / nil channel entries skipped),
   matching the existing nil-safe `Notifier.NotifyXxx` posture, so call
   sites need no nil checks.

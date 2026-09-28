@@ -55,6 +55,28 @@ Deliberately asymmetric with GitHub: an absent GitLab secret logs nothing (GitLa
 would nag every GitHub-only deployment). The shared webhook delivery store (`webhook_deliveries` on Postgres,
 else in-memory) is created when EITHER secret is set, so a GitLab-only deployment gets the store too.
 
+## Push notification sinks (#2292)
+
+Optional outbound push when a run parks at a decision. No variable set → no
+sink, and behaviour is unchanged. A half- or mis-configured sink FAILS startup
+with an error naming the env var (never its value); a configured set logs one
+INFO naming the sink kinds, which `/healthz` also lists as `push_sinks`.
+Payload contract, delivery model and audit rows: `docs/notifications.md`.
+
+| Env var | Meaning | Default |
+|---|---|---|
+| `FISHHAWKD_NOTIFY_WEBHOOK_URL` | Generic webhook target (`https`, or `http` to loopback only). | *(unset — sink off)* |
+| `FISHHAWKD_NOTIFY_WEBHOOK_SECRET` | HMAC-SHA256 key for `X-Fishhawk-Signature-256`. REQUIRED with the URL; no unsigned mode. | *(unset)* |
+| `FISHHAWKD_NOTIFY_SLACK_WEBHOOK_URL` | Slack incoming-webhook URL (a credential; never logged). | *(unset — sink off)* |
+| `FISHHAWKD_NOTIFY_EMAIL_SMTP_ADDR` | SMTP `host:port`. | *(unset — sink off)* |
+| `FISHHAWKD_NOTIFY_EMAIL_FROM` | Sender address; required with any email var. | *(unset)* |
+| `FISHHAWKD_NOTIFY_EMAIL_TO` | Comma-separated recipients; required with any email var. | *(unset)* |
+| `FISHHAWKD_NOTIFY_EMAIL_USERNAME` / `FISHHAWKD_NOTIFY_EMAIL_PASSWORD` | Optional SMTP AUTH (both or neither); refused over an unencrypted connection. | *(unset)* |
+| `FISHHAWKD_NOTIFY_EMAIL_STARTTLS` | STARTTLS toggle. | `true` |
+
+Shutdown drains in-flight deliveries after the HTTP server stops, bounded by
+one 15s deadline that never waits on an abandoned delivery.
+
 ## MCP route (`--mcp-route`, ADR-076 slice 2 / E66.2 #2390)
 
 `FISHHAWKD_MCP_ROUTE` (`--mcp-route`) controls whether fishhawkd serves the

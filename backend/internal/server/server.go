@@ -44,6 +44,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/oauthstore"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/pushnotify"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/refinement"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/releaseevidence"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/repodoc"
@@ -90,6 +91,14 @@ type Config struct {
 	// can prove the listener on the port is the daemon it started,
 	// surviving OS pid reuse (#1018).
 	StartNonce string
+
+	// PushDispatcher delivers push notifications to the operator's
+	// configured sinks (#2292). serve.go builds it from
+	// pushnotify.SinksFromEnv; nil (no FISHHAWKD_NOTIFY_* configured) keeps
+	// the Router on the GitHub-comment channel alone and /healthz reports
+	// push_sinks: []. Reachable without a GitHub client: push is a run
+	// surface, not an issue-comment surface.
+	PushDispatcher *pushnotify.Dispatcher
 
 	// FeedbackProviders reports the deployment's registered feedback-provider
 	// ids for THIS server (#3628). It is a TEST-ONLY seam: production leaves it
@@ -977,11 +986,11 @@ type Server struct {
 	// issueNotifier posts pickup-ack and plan-ready comments back
 	// to the triggering GitHub issue (#234). Typed as the
 	// issuecomment.Channel seam (ADR-015 #79 option B): server.New
-	// wires an issuecomment.Router fanning out to the v0 GitHub-comment
-	// channel, so a future Slack adapter drops in with no call-site
-	// change. nil when the deps don't add up (no GitHub client, no
-	// audit repo, or no ExternalURL). Concurrent NotifyXxx calls are
-	// safe.
+	// wires an issuecomment.Router fanning out to the GitHub-comment
+	// channel and, when push sinks are configured, the push channel
+	// (#2292). nil only when NO channel is wired (no GitHub client and no
+	// push dispatcher, or no run/audit repo). Concurrent NotifyXxx calls
+	// are safe.
 	issueNotifier issuecomment.Channel
 
 	// bgReviews tracks detached advisory plan/implement review
@@ -1209,6 +1218,9 @@ func New(cfg Config) *Server {
 		// operator-added drivable criterion is actually driven.
 		cfg.Orchestrator.EffectiveAcceptance = s
 	}
+	// Channels behind the Router seam (ADR-015 #79), built as a list so a
+	// channel that needs no GitHub client (push, #2292) is still reachable.
+	var channels []issuecomment.Channel
 	if cfg.GitHub != nil {
 		s.auditCheckPublisher = auditcheckpublisher.New(auditcheckpublisher.Deps{
 			GitHub:      cfg.GitHub,
@@ -1227,10 +1239,11 @@ func New(cfg Config) *Server {
 			OnRecovered: s.auditCheckPublishRecovered,
 		})
 		// Wire the GitHub-comment channel behind the Router seam (ADR-015
-		// #79). Guard the wrap on a non-nil channel so a nil notifier leaves
-		// s.issueNotifier as a nil interface, NOT a non-nil Router over a
-		// typed-nil channel — preserving the exact nil semantics
-		// approvalCommandConfigured and the trace.go guards depend on. Since
+		// #79). Guard the append on a non-nil channel so the Router never
+		// carries a typed-nil channel, and a deployment with no channel at
+		// all leaves s.issueNotifier a nil interface — preserving the exact
+		// nil semantics approvalCommandConfigured and the trace.go guards
+		// depend on. Since
 		// #1787 the notifier is nil ONLY when GitHub is unwired (an empty
 		// ExternalURL no longer suppresses it — comments post with link-less
 		// short-ids), so this guard now hinges on the GitHub client alone.
@@ -1253,8 +1266,27 @@ func New(cfg Config) *Server {
 			// passes the same cfg.ArtifactRepo.
 			Artifacts: cfg.ArtifactRepo,
 		}); ghChannel != nil {
-			s.issueNotifier = issuecomment.NewRouter(ghChannel)
+			channels = append(channels, ghChannel)
 		}
+	}
+	// The push channel (#2292) is the second ADR-015 channel. It needs no
+	// forge client, so it is appended OUTSIDE the GitHub guard and a
+	// deployment without GitHub still pushes. NewPushChannel returns nil
+	// without a dispatcher (or sinks); only non-nil channels are appended.
+	if pushChannel := issuecomment.NewPushChannel(issuecomment.PushDeps{
+		Runs:        cfg.RunRepo,
+		Audit:       cfg.AuditRepo,
+		ExternalURL: cfg.ExternalURL,
+		Dispatcher:  cfg.PushDispatcher,
+		Logger:      cfg.Logger,
+	}); pushChannel != nil {
+		channels = append(channels, pushChannel)
+	}
+	// Assign only a NON-EMPTY list, so no channel leaves s.issueNotifier a
+	// nil interface (not a non-nil Router over nothing) — the exact nil
+	// semantics approvalCommandConfigured and the trace.go guards depend on.
+	if len(channels) > 0 {
+		s.issueNotifier = issuecomment.NewRouter(channels...)
 	}
 	// Resolve the OAuth AS verdict FIRST (ADR-076 slice 3, #2436): the /mcp
 	// route's conditional loopback lift (#2391) reads it, so it must be resolved

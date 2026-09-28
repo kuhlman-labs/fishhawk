@@ -260,6 +260,10 @@ type healthResponse struct {
 	// responses (E72.13 / #3500). omitempty keeps a production /healthz
 	// byte-identical.
 	DevMode bool `json:"dev_mode,omitempty"`
+	// PushSinks lists the configured push-notification sink KINDS (#2292),
+	// e.g. ["webhook","slack","email"]; always present, [] when none. Names
+	// ONLY — never a URL, SMTP address, recipient or secret.
+	PushSinks []string `json:"push_sinks"`
 }
 
 // handleHealth answers liveness probes with a small JSON payload that
@@ -270,7 +274,8 @@ type healthResponse struct {
 // process_start publishes the boot marker (#2712) so fishhawk_await_review
 // can decide whether an in-flight review's dispatching daemon is still the
 // one serving this request. dev_mode (omitted when false) advertises the
-// E72.13 / #3500 dev-mode posture — see devmode.go.
+// E72.13 / #3500 dev-mode posture — see devmode.go. push_sinks names the
+// configured push-notification sink kinds (#2292), [] when none.
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	resp := healthResponse{
 		Status:           "ok",
@@ -290,6 +295,8 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		},
 		StartNonce: s.cfg.StartNonce,
 		DevMode:    s.devModeActive(),
+		// SinkNames is nil-safe and returns [] (never null) when unset.
+		PushSinks: s.cfg.PushDispatcher.SinkNames(),
 	}
 	if !s.processStart.IsZero() {
 		resp.ProcessStart = s.processStart.UTC().Format(time.RFC3339Nano)

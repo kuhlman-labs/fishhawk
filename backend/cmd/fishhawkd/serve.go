@@ -67,6 +67,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/pushnotify"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/reactionpoller"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/refinement"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/repoacl"
@@ -3256,6 +3257,16 @@ func runServe(args []string, logSink io.Writer) int {
 			slog.String("ref", "#2234"))
 	}
 
+	// Push notifications (#2292): a half-configured sink FAILS startup with an
+	// error naming the env var (never its value); no FISHHAWKD_NOTIFY_* at all
+	// is a silent no-op. Built before server.New because cfg is copied by value.
+	pushDispatcher, err := buildPushDispatcher(os.Getenv, cfg.AuditRepo, logger)
+	if err != nil {
+		logger.Error("push notification configuration refused startup", slog.String("error", err.Error()), slog.String("ref", "#2292"))
+		return exitFailure
+	}
+	cfg.PushDispatcher = pushDispatcher
+
 	srv = newServer(cfg)
 
 	// Per-repo work-management conventions loader (E45.16 / #2022): fetch
@@ -3643,6 +3654,10 @@ func runServe(args []string, logSink io.Writer) int {
 		logger.Error("shutdown failed", slog.String("error", err.Error()))
 		return exitFailure
 	}
+	// Drain in-flight push deliveries AFTER the HTTP server stopped accepting
+	// requests (so no handler enqueues behind the close), under one overall
+	// deadline that never waits on an abandoned Deliver.
+	closePushDispatcher(pushDispatcher, pushDrainTimeout, logger)
 	logger.Info("shutdown complete")
 	return exitOK
 }
@@ -4395,4 +4410,44 @@ func newLogger(logSink io.Writer) *slog.Logger {
 	)
 	slog.SetDefault(logger)
 	return logger
+}
+
+// pushDrainTimeout bounds the shutdown drain of the push dispatcher (#2292).
+const pushDrainTimeout = 15 * time.Second
+
+// buildPushDispatcher constructs the push-notification dispatcher from the
+// FISHHAWKD_NOTIFY_* environment (#2292). No sink configured → (nil, nil),
+// leaving behaviour identical to a build without push. A half- or
+// mis-configured sink (including a webhook URL without its REQUIRED secret)
+// → a non-nil error naming the env var and the problem, never the value.
+// A non-empty set logs one INFO naming the sink KINDS only. Failure rows are
+// appended to auditRepo by issuecomment.PushOutcomeRecorder (nil-tolerant).
+func buildPushDispatcher(getenv func(string) string, auditRepo audit.Repository, logger *slog.Logger) (*pushnotify.Dispatcher, error) {
+	sinks, err := pushnotify.SinksFromEnv(getenv)
+	if err != nil {
+		return nil, fmt.Errorf("push notifications: %w", err)
+	}
+	if len(sinks) == 0 {
+		return nil, nil
+	}
+	d := pushnotify.NewDispatcher(sinks, pushnotify.Options{
+		OnOutcome: issuecomment.PushOutcomeRecorder(auditRepo, nil, logger),
+		Logger:    logger,
+	})
+	logger.Info("push notifications enabled", slog.Any("sinks", d.SinkNames()), slog.String("ref", "#2292"))
+	return d, nil
+}
+
+// closePushDispatcher drains and stops d under ONE overall deadline. A nil
+// dispatcher is a no-op; a missed deadline is logged, never fatal.
+func closePushDispatcher(d *pushnotify.Dispatcher, timeout time.Duration, logger *slog.Logger) {
+	if d == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	if err := d.Close(ctx); err != nil {
+		logger.Warn("push notification drain did not finish before the shutdown deadline",
+			slog.String("error", err.Error()), slog.Int64("abandoned_deliveries", d.Abandoned()))
+	}
 }

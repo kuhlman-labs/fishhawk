@@ -32,6 +32,9 @@ func TestIsKnownCategory(t *testing.T) {
 		"stage_conflict_resolution_triggered",
 		"stage_conflict_resolution_failed",
 		"conflict_resolution_pushed",
+		// #2292 push-notification claim + failure rows (travel together).
+		"push_notification_sent",
+		"push_notification_failed",
 	}
 	for _, c := range known {
 		if !IsKnownCategory(c) {
@@ -501,6 +504,19 @@ func TestKnownCategories_PushResumeE45_86(t *testing.T) {
 	for _, c := range []string{"push_resume_checkpoint", "verified_tree_discarded"} {
 		if !IsKnownCategory(c) {
 			t.Errorf("category %q must be registered in categories.go", c)
+		}
+	}
+}
+
+// TestKnownCategoriesIncludesPushNotificationCategories pins BOTH #2292
+// push-notification categories in the registry: the claim row and the
+// failure row travel together (the emitter lives in
+// internal/issuecomment/push.go). The paired "not activity" assertion lives
+// beside activityCategories in internal/issuecomment/push_test.go.
+func TestKnownCategoriesIncludesPushNotificationCategories(t *testing.T) {
+	for _, c := range []string{"push_notification_sent", "push_notification_failed"} {
+		if !IsKnownCategory(c) {
+			t.Errorf("IsKnownCategory(%q) = false; register it in categories.go", c)
 		}
 	}
 }

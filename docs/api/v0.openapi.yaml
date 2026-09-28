@@ -7611,7 +7611,7 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [status, version, git_sha, min_runner_version, schemas]
+                required: [status, version, git_sha, min_runner_version, schemas, push_sinks]
                 properties:
                   status:
                     type: string
@@ -7698,6 +7698,17 @@ paths:
                       could dispatch writes to the real forge. Omitted when
                       false, so a production `/healthz` is byte-identical.
                     example: true
+                  push_sinks:
+                    type: array
+                    items: { type: string }
+                    description: |
+                      The configured push-notification sink KINDS (#2292) —
+                      any of `webhook`, `slack`, `email`, in sorted order.
+                      Always present; `[]` when no `FISHHAWKD_NOTIFY_*` sink is
+                      configured. Names only — never a URL, SMTP address,
+                      recipient or secret. Payload contract:
+                      `docs/notifications.md`.
+                    example: [slack, webhook]
         '503':
           description: Process is shutting down or otherwise not ready.
           content:
