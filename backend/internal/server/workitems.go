@@ -480,7 +480,26 @@ func (s *Server) applyAndFileWorkItemWithIntake(ctx context.Context, filing work
 	// and seeds filing.ExistingNumbers; a genuine discovery failure fails the
 	// filing closed here, and a provider without the capability falls through to
 	// Apply's existing #1265 fail-closed 422.
-	if werr := s.discoverExistingNumbers(ctx, &filing, conv, target); werr != nil {
+	// When discovery runs it returns a non-nil unlock holding a per-(repo,
+	// numbering prefix) in-process lock across the whole discover -> Apply ->
+	// File critical section (#3704), exactly as the child-number lock above
+	// does, so two concurrent omitted-existing_numbers filings of the same
+	// sequential type serialize and allocate DISTINCT consecutive numbers. The
+	// lock is taken ONLY when discovery runs — an explicit-existing_numbers
+	// caller, a non-sequential type, an unresolvable provider and a provider
+	// without the capability all return a nil unlock and never contend.
+	// Deferred BEFORE the error check so the discovery-success path holds it
+	// across Apply + File below and releases when this function returns. Both
+	// locks are acquired in one fixed order (child then sequential) at this
+	// single call site, so no lock-ordering cycle is reachable. Every filing
+	// path (HTTP handler, defer-concern, live-validation, refinement, split)
+	// funnels through this one function, so all of them inherit the
+	// serialization.
+	unlockSequentialNumber, werr := s.discoverExistingNumbers(ctx, &filing, conv, target)
+	if unlockSequentialNumber != nil {
+		defer unlockSequentialNumber()
+	}
+	if werr != nil {
 		return nil, nil, werr, nil
 	}
 
@@ -604,7 +623,7 @@ func (s *Server) applyAndFileWorkItemWithIntake(ctx context.Context, filing work
 // numbered filings. It runs BEFORE the pure workmgmt.Apply and mirrors
 // deriveEpicTitleVar's pre-Apply provider-side I/O step.
 //
-// It is a no-op (returns nil) when: the type is unknown, the type is not
+// It is a no-op (returns a nil unlock, nil error) when: the type is unknown, the type is not
 // numbered (Numbering == nil) or its scheme is not "sequential", or the caller
 // already supplied existing_numbers (an explicit hint/override short-circuits
 // discovery). Otherwise it resolves the provider via workmgmt.Get; if the
@@ -619,29 +638,47 @@ func (s *Server) applyAndFileWorkItemWithIntake(ctx context.Context, filing work
 // discovery seeds [0] (the documented seed-zero escape → number 1) and a
 // populated discovery allocates max+1. allocateNumber is unchanged and stays
 // the final fail-closed guard.
+//
+// When discovery WILL run — and only then — it acquires the per-(repo,
+// numbering prefix) in-process lock (#3704) immediately before calling
+// DiscoverNumbers and returns its unlock to the caller, which defers it so the
+// lock spans discover -> Apply -> provider File exactly as the child-number
+// lock does. Two concurrent filings of the same sequential type against the
+// same repo would otherwise both observe the same max and both allocate max+1
+// (the duplicate [E78] on #3699/#3700). Every no-op guard above returns a nil
+// unlock and never contends, and the discovery-error branch releases before
+// returning its 422. The lock is in-process only: a hosted MULTI-INSTANCE
+// deployment sharing one tracker still needs a Postgres advisory lock, tracked
+// with the child-number lock; see backend/internal/workmgmt/README.md.
+//
 // The receiver is unused (discovery resolves the provider through the global
 // workmgmt registry, not server config) but the method form mirrors
 // deriveEpicTitleVar's pre-Apply hook and keeps the call site uniform.
-func (*Server) discoverExistingNumbers(ctx context.Context, filing *workmgmt.FilingRequest, conv workmgmt.Conventions, target workmgmt.Target) *workItemError {
+func (*Server) discoverExistingNumbers(ctx context.Context, filing *workmgmt.FilingRequest, conv workmgmt.Conventions, target workmgmt.Target) (func(), *workItemError) {
 	itemType, ok := conv.Types[filing.Type]
 	if !ok || itemType.Numbering == nil || itemType.Numbering.Scheme != "sequential" {
-		return nil
+		return nil, nil
 	}
 	if len(filing.ExistingNumbers) > 0 {
-		// Caller-supplied numbers are an explicit hint/override — skip discovery.
-		return nil
+		// Caller-supplied numbers are an explicit hint/override — skip discovery
+		// AND the lock.
+		return nil, nil
 	}
 	provider, err := workmgmt.Get(conv.Provider)
 	if err != nil {
 		// Provider resolution failure is surfaced by applyAndFileWorkItem's own
 		// workmgmt.Get below (typed 501 / 500); leave it to that single mapping.
-		return nil
+		return nil, nil
 	}
 	discoverer, ok := provider.(workmgmt.NumberDiscoverer)
 	if !ok {
 		// No discovery capability: fall through to Apply's #1265 fail-closed 422.
-		return nil
+		return nil, nil
 	}
+
+	// Discovery WILL run: serialize the allocate-then-file window per
+	// (repo, numbering prefix).
+	unlock := lockSequentialNumberKey(sequentialNumberLockKey(target, itemType.Numbering.Prefix))
 	discovered, err := discoverer.DiscoverNumbers(ctx, workmgmt.DiscoverNumbersRequest{
 		Target:      target,
 		Prefix:      itemType.Numbering.Prefix,
@@ -652,7 +689,11 @@ func (*Server) discoverExistingNumbers(ctx context.Context, filing *workmgmt.Fil
 		DefaultLabels: itemType.DefaultLabels,
 	})
 	if err != nil {
-		return &workItemError{
+		// Release before returning so a discovery failure never wedges every
+		// later filing of this key — mirrors deriveChildNumberTitleVar's
+		// unlock-before-return discipline. The 422 payload is unchanged.
+		unlock()
+		return nil, &workItemError{
 			status: http.StatusUnprocessableEntity, code: "work_item_invalid",
 			msg: fmt.Sprintf(
 				"could not discover existing numbers for the numbered type %q: %s; pass existing_numbers explicitly (or seed existing_numbers:[0] for a genuinely-first item)",
@@ -668,7 +709,7 @@ func (*Server) discoverExistingNumbers(ctx context.Context, filing *workmgmt.Fil
 	// Seed 0 so an empty discovery yields 1 via allocateNumber's seed-zero path,
 	// and a populated discovery allocates max+1.
 	filing.ExistingNumbers = append(discovered, 0)
-	return nil
+	return unlock, nil
 }
 
 // childNumberLocks serializes the discover-{n} -> File critical section per
@@ -682,24 +723,66 @@ func (*Server) discoverExistingNumbers(ctx context.Context, filing *workmgmt.Fil
 // processes; see backend/internal/workmgmt/README.md. The map is never pruned
 // (one small mutex per distinct epic ref for the process lifetime), which is
 // bounded by the number of epics filed against.
-var (
-	childNumberLocksMu sync.Mutex
-	childNumberLocks   = map[string]*sync.Mutex{}
-)
+var childNumberLocks = &keyedLocks{}
+
+// keyedLocks is the shared per-key in-process mutex map both number-allocation
+// critical sections delegate to (#3704 collapsed the two ad-hoc copies into
+// one). It is never pruned — one small mutex per distinct key for the process
+// lifetime, bounded by the number of distinct keys filed against — which is
+// the #1958 map's behaviour preserved verbatim.
+type keyedLocks struct {
+	mu sync.Mutex
+	m  map[string]*sync.Mutex
+}
+
+// lock acquires (creating on first use) the mutex for key and returns its
+// unlock func.
+func (k *keyedLocks) lock(key string) func() {
+	k.mu.Lock()
+	if k.m == nil {
+		k.m = map[string]*sync.Mutex{}
+	}
+	m := k.m[key]
+	if m == nil {
+		m = &sync.Mutex{}
+		k.m[key] = m
+	}
+	k.mu.Unlock()
+	m.Lock()
+	return m.Unlock
+}
 
 // lockChildNumberKey acquires (creating on first use) the per-epic mutex for
 // key and returns its unlock func. The caller holds it across EpicChildren ->
 // Apply -> File so the whole allocate-then-file window is serialized.
 func lockChildNumberKey(key string) func() {
-	childNumberLocksMu.Lock()
-	m := childNumberLocks[key]
-	if m == nil {
-		m = &sync.Mutex{}
-		childNumberLocks[key] = m
-	}
-	childNumberLocksMu.Unlock()
-	m.Lock()
-	return m.Unlock
+	return childNumberLocks.lock(key)
+}
+
+// sequentialNumberLocks serializes the discover -> File critical section per
+// (repo, numbering prefix) WITHIN THIS PROCESS (#3704), the sequential-number
+// sibling of childNumberLocks above. Two concurrent filings of a
+// `numbering: sequential` type (epic, adr) with existing_numbers omitted would
+// otherwise both read the same max from DiscoverNumbers and both allocate
+// max+1 — the duplicate [E78] observed on #3699/#3700. The same residual
+// applies: a hosted MULTI-INSTANCE deployment needs a Postgres advisory lock,
+// tracked with the child-number lock rather than solved here.
+var sequentialNumberLocks = &keyedLocks{}
+
+// lockSequentialNumberKey acquires (creating on first use) the per-(repo,
+// prefix) mutex for key and returns its unlock func. The caller holds it
+// across DiscoverNumbers -> Apply -> File.
+func lockSequentialNumberKey(key string) func() {
+	return sequentialNumberLocks.lock(key)
+}
+
+// sequentialNumberLockKey is the per-numbered-type serialization key: the
+// target repo plus the type's numbering prefix, so `epic` and `adr` filings in
+// one repo — and the same prefix in two repos — never contend on one lock. It
+// reuses childNumberLockKey's owner/name derivation so the two keyspaces are
+// shaped identically.
+func sequentialNumberLockKey(target workmgmt.Target, prefix string) string {
+	return target.Repo.Owner + "/" + target.Repo.Name + "#" + strings.TrimSpace(prefix)
 }
 
 // childNumberLockKey is the per-epic serialization key: the target repo plus
