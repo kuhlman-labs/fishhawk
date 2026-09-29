@@ -1,0 +1,53 @@
+{
+  "repo": "acme/app",
+  "run_id": "00000000-0000-0000-0000-000000000001",
+  "workflow_id": "feature_change",
+  "workflow_sha": "abc123",
+  "version": "0.4",
+  "schema_major": 0,
+  "schema_hash": "e55f960ddc754de42fc453130cfcc6ef0db08ee21f5bd7f61c1fd39f37bc9163",
+  "schema_supported": true,
+  "spec_valid": true,
+  "workflows": [
+    {
+      "id": "feature_change",
+      "stages": [
+        {
+          "id": "plan",
+          "type": "plan",
+          "executor": "claude-code",
+          "gates": [
+            {
+              "type": "approval",
+              "approvers_any_of": [
+                "tech_lead"
+              ]
+            }
+          ],
+          "reviewers": {
+            "agents": [
+              {
+                "provider": "anthropic",
+                "model": "claude-opus-5-5"
+              }
+            ]
+          }
+        },
+        {
+          "id": "implement",
+          "type": "implement",
+          "executor": "claude-code",
+          "budget": {
+            "max_tokens": 1000
+          }
+        }
+      ],
+      "budgets": [
+        {
+          "period": "weekly",
+          "limit_usd": 50
+        }
+      ]
+    }
+  ]
+}

@@ -135,6 +135,13 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v0/refinement/sessions/{session_id}/file", s.handleFileRefinementSession)
 	mux.HandleFunc("POST /v0/work-items", s.handleFileWorkItem)
 	mux.HandleFunc("GET /v0/calibration", s.handleGetCalibration)
+	// Repo dashboard rollups (E40.3 / #1714): read-only, same posture as
+	// GET /v0/calibration; repo visibility is enforced inside each handler
+	// (repoDashPrelude -> repoVisibleOr403), point-read DENY.
+	mux.HandleFunc("GET /v0/repos/{owner}/{name}/throughput", s.handleGetRepoThroughput)
+	mux.HandleFunc("GET /v0/repos/{owner}/{name}/health", s.handleGetRepoHealth)
+	mux.HandleFunc("GET /v0/repos/{owner}/{name}/economics", s.handleGetRepoEconomics)
+	mux.HandleFunc("GET /v0/repos/{owner}/{name}/posture", s.handleGetRepoPosture)
 	mux.HandleFunc("GET /v0/acceptance-triage/stats", s.handleGetAcceptanceTriageStats)
 	// Dev-only seeded-fixture surface (E72.2 / #3326): registered ONLY
 	// when a DevFixtures applier is configured, so a production server

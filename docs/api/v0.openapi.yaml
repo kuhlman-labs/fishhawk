@@ -5794,6 +5794,193 @@ components:
             time to its newest terminal audit marker (`pr_merged` /
             `post_merge_observed`), clamped to `0`.
 
+    RepoThroughput:
+      type: object
+      description: GET /v0/repos/{owner}/{name}/throughput body (E40.3).
+      required: [repo, window_start, window_end, window_weeks, runs_scanned, truncated, weeks, merged_changes, median_cycle_time_seconds, cycle_time_samples, cycle_time_excluded]
+      properties:
+        repo: { type: string, example: acme/app }
+        window_start: { type: string, format: date-time, description: Start of the first ISO week (Monday 00:00 UTC). }
+        window_end: { type: string, format: date-time, description: Exclusive end — the Monday after the current week. }
+        window_weeks: { type: integer }
+        runs_scanned: { type: integer, description: "Runs read by the paged scan, including ones older than the look-back that ended it." }
+        truncated: { type: boolean, description: True when the 1000-run ceiling stopped the scan before the look-back boundary. }
+        weeks:
+          type: array
+          items:
+            type: object
+            required: [week_start, merged_changes]
+            properties:
+              week_start: { type: string, format: date-time }
+              merged_changes: { type: integer }
+        merged_changes: { type: integer, description: Distinct changes whose earliest pr_merged falls in the window. }
+        median_cycle_time_seconds: { type: number, format: double }
+        cycle_time_samples: { type: integer }
+        cycle_time_excluded: { type: integer, description: Runs merged in the window per post_merge_observed but carrying no pr_merged row. }
+        wait_on_human:
+          type: object
+          description: Present only when at least one run created in the window resolves a gate-latency rollup (#1702).
+          required: [runs, median_total_wait_seconds, total_wait_on_human_seconds, gates]
+          properties:
+            runs: { type: integer }
+            median_total_wait_seconds: { type: number, format: double }
+            total_wait_on_human_seconds: { type: number, format: double }
+            gates:
+              type: array
+              items:
+                type: object
+                required: [gate, samples, median_wait_seconds]
+                properties:
+                  gate: { type: string, example: plan_approval }
+                  samples: { type: integer }
+                  median_wait_seconds: { type: number, format: double }
+    RepoHealth:
+      type: object
+      description: GET /v0/repos/{owner}/{name}/health body (E40.3).
+      required: [repo, window_start, window_end, window_weeks, runs_scanned, truncated, runs_considered, plan_approval_samples, plan_first_shot_approvals, plan_first_shot_approval_rate, fixup_runs, fixup_rate, acceptance_samples, acceptance_passed, acceptance_not_validated, acceptance_failed, acceptance_undecidable, acceptance_pass_rate, failure_categories]
+      properties:
+        repo: { type: string, example: acme/app }
+        window_start: { type: string, format: date-time, description: Start of the first ISO week (Monday 00:00 UTC). }
+        window_end: { type: string, format: date-time, description: Exclusive end — the Monday after the current week. }
+        window_weeks: { type: integer }
+        runs_scanned: { type: integer, description: "Runs read by the paged scan, including ones older than the look-back that ended it." }
+        truncated: { type: boolean, description: True when the 1000-run ceiling stopped the scan before the look-back boundary. }
+        runs_considered: { type: integer, description: Runs created in the window. }
+        plan_approval_samples: { type: integer }
+        plan_first_shot_approvals: { type: integer }
+        plan_first_shot_approval_rate: { type: number, format: double }
+        fixup_runs: { type: integer }
+        fixup_rate: { type: number, format: double }
+        acceptance_samples: { type: integer }
+        acceptance_passed: { type: integer }
+        acceptance_not_validated: { type: integer }
+        acceptance_failed: { type: integer }
+        acceptance_undecidable: { type: integer }
+        acceptance_pass_rate: { type: number, format: double }
+        failure_categories:
+          type: object
+          required: [A, B, C, D]
+          properties:
+            A: { type: integer }
+            B: { type: integer }
+            C: { type: integer }
+            D: { type: integer }
+    RepoEconomics:
+      type: object
+      description: |
+        GET /v0/repos/{owner}/{name}/economics body (E40.3). Every field is
+        absent (the body is `{}`, or carries only `truncated`) when the window
+        holds no cost_recorded entry.
+      properties:
+        repo: { type: string, example: acme/app }
+        window_start: { type: string, format: date-time, description: Start of the first ISO week (Monday 00:00 UTC). }
+        window_end: { type: string, format: date-time, description: Exclusive end — the Monday after the current week. }
+        window_weeks: { type: integer }
+        runs_scanned: { type: integer, description: "Runs read by the paged scan, including ones older than the look-back that ended it." }
+        truncated: { type: boolean, description: True when the 1000-run ceiling stopped the scan before the look-back boundary. }
+        cost_entries: { type: integer }
+        total_cost_usd: { type: number, format: double }
+        merged_changes: { type: integer }
+        cost_per_merged_change_usd: { type: number, format: double }
+        weeks:
+          type: array
+          items:
+            type: object
+            required: [week_start, cost_usd, cache_read_ratio, reuse_factor, net_savings_usd]
+            properties:
+              week_start: { type: string, format: date-time }
+              cost_usd: { type: number, format: double }
+              cache_read_ratio: { type: number, format: double }
+              reuse_factor: { type: number, format: double }
+              net_savings_usd: { type: number, format: double }
+        budgets:
+          type: array
+          description: First periodic budget of each workflow in the newest run's cached spec, evaluated like GET /v0/runs/{run_id}/budget. Omitted when none.
+          items:
+            type: object
+            required: [workflow_id, period, period_start, limit_usd, spent_usd, fraction, tier, enforcement]
+            properties:
+              workflow_id: { type: string }
+              period: { type: string, enum: [weekly, monthly] }
+              period_start: { type: string, format: date-time }
+              limit_usd: { type: number, format: double }
+              spent_usd: { type: number, format: double }
+              fraction: { type: number, format: double }
+              tier: { type: string, enum: [ok, warn, over, ack_required, page] }
+              enforcement: { type: string, enum: [advisory, hard] }
+    RepoPosture:
+      type: object
+      description: |
+        GET /v0/repos/{owner}/{name}/posture body (E40.3). Every field is
+        absent (`{}`) when the repo has no run or no cached spec.
+        `workflows` is empty unless `spec_valid` is true.
+      properties:
+        repo: { type: string }
+        run_id: { $ref: '#/components/schemas/UUID' }
+        workflow_id: { type: string }
+        workflow_sha: { type: string }
+        version: { type: string, description: The spec's declared version verbatim. }
+        schema_major: { type: integer }
+        schema_hash: { type: string, description: Embedded workflow schema hash for schema_major (the /healthz `schemas` value); absent when unsupported. }
+        schema_supported: { type: boolean, description: This binary embeds a schema for schema_major. }
+        spec_valid: { type: boolean, description: The cached bytes parse and validate through the backend's spec parser. }
+        spec_error: { type: string, description: The parse/validation error when spec_valid is false. }
+        workflows:
+          type: array
+          items:
+            type: object
+            required: [id, stages]
+            properties:
+              id: { type: string }
+              autonomy: { type: string, enum: [low, medium, high] }
+              stages:
+                type: array
+                items:
+                  type: object
+                  required: [id, type, executor]
+                  properties:
+                    id: { type: string }
+                    type: { type: string }
+                    executor: { type: string, description: "Agent name, or `human`." }
+                    model: { type: string }
+                    gates:
+                      type: array
+                      items:
+                        type: object
+                        required: [type]
+                        properties:
+                          type: { type: string }
+                          autonomy: { type: string }
+                          approvers_any_of: { type: array, items: { type: string } }
+                          approvers_all_of: { type: array, items: { type: string } }
+                    reviewers:
+                      type: object
+                      properties:
+                        agents:
+                          type: array
+                          items:
+                            type: object
+                            required: [provider]
+                            properties:
+                              provider: { type: string }
+                              model: { type: string }
+                        human: { type: integer }
+                    budget:
+                      type: object
+                      properties:
+                        max_tokens: { type: integer }
+                        max_runtime_seconds: { type: number, format: double }
+                        limit_usd: { type: number, format: double }
+              budgets:
+                type: array
+                items:
+                  type: object
+                  required: [period, limit_usd]
+                  properties:
+                    period: { type: string }
+                    limit_usd: { type: number, format: double }
+                    enforcement: { type: string }
+                    warn_at: { type: number, format: double }
     CalibrationResult:
       type: object
       description: |
@@ -14410,6 +14597,179 @@ paths:
         '503':
           description: Audit repository not configured on this instance.
 
+  /v0/repos/{owner}/{name}/throughput:
+    get:
+      operationId: getRepoThroughput
+      summary: Get a repository's throughput rollup
+      description: |
+        Read-only repo-dashboard rollup (E40.3 / #1714). Repo visibility is
+        enforced like a point read: a non-visible repo answers 403
+        `repo_forbidden`. Runs are gathered newest-first by paging the repo's
+        runs until one is older than `window_start` minus a fixed 14-day
+        look-back, under a ceiling of 1000 runs scanned; when the ceiling
+        stops the scan first, `truncated` is `true` and the numbers cover
+        only the scanned runs. Every ratio is 0 (never NaN) on a zero
+        denominator.
+
+        Merged changes per week are bucketed by MERGE time — the EARLIEST
+        `pr_merged` audit timestamp of a run (never `post_merge_observed`);
+        a change (PR URL) merged by several runs counts once. Median cycle
+        time is `run.created_at` -> that earliest `pr_merged`; a run seen
+        merged only via `post_merge_observed` is excluded and counted in
+        `cycle_time_excluded`. `wait_on_human` is present ONLY when at
+        least one run created in the window resolves a gate-latency rollup
+        (#1702); otherwise the key is absent.
+      tags: [repos]
+      parameters:
+        - { name: owner, in: path, required: true, schema: { type: string }, description: Repository owner (first `owner/name` segment). }
+        - { name: name, in: path, required: true, schema: { type: string }, description: Repository name (second `owner/name` segment). }
+        - name: weeks
+          in: query
+          description: Window length in ISO weeks (Monday 00:00 UTC starts), ending with the current week. Integer 1-52; default 12.
+          schema: { type: integer, minimum: 1, maximum: 52, default: 12 }
+      responses:
+        '200':
+          description: Throughput rollup (zero-valued for a repo with no runs).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RepoThroughput' }
+        '400':
+          description: "`validation_failed` — `weeks` is not an integer in 1-52 (`details.field: weeks`)."
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/RepoForbidden' }
+        '500':
+          description: "`internal_error` — a run, stage or audit read failed."
+        '503':
+          description: "`run_repo_unconfigured` / `audit_repo_unconfigured` — the run or audit repository is not configured; or `service_unavailable` — repository visibility could not be resolved."
+
+  /v0/repos/{owner}/{name}/health:
+    get:
+      operationId: getRepoHealth
+      summary: Get a repository's health rollup
+      description: |
+        Read-only repo-dashboard rollup (E40.3 / #1714). Repo visibility is
+        enforced like a point read: a non-visible repo answers 403
+        `repo_forbidden`. Runs are gathered newest-first by paging the repo's
+        runs until one is older than `window_start` minus a fixed 14-day
+        look-back, under a ceiling of 1000 runs scanned; when the ceiling
+        stops the scan first, `truncated` is `true` and the numbers cover
+        only the scanned runs. Every ratio is 0 (never NaN) on a zero
+        denominator.
+
+        Folds runs CREATED in the window: plan first-shot approval rate
+        (first plan-stage approve preceded by no plan-stage reject,
+        `plan_revised` or `plan_review_failed`), fixup rate (runs with at
+        least one `stage_fixup_triggered`, counted once per run), acceptance
+        pass rate (latest `acceptance_outcome_recorded` verdict per run), and
+        the failed-stage category mix A/B/C/D.
+      tags: [repos]
+      parameters:
+        - { name: owner, in: path, required: true, schema: { type: string }, description: Repository owner (first `owner/name` segment). }
+        - { name: name, in: path, required: true, schema: { type: string }, description: Repository name (second `owner/name` segment). }
+        - name: weeks
+          in: query
+          description: Window length in ISO weeks (Monday 00:00 UTC starts), ending with the current week. Integer 1-52; default 12.
+          schema: { type: integer, minimum: 1, maximum: 52, default: 12 }
+      responses:
+        '200':
+          description: Health rollup (zero-valued for a repo with no runs).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RepoHealth' }
+        '400':
+          description: "`validation_failed` — `weeks` is not an integer in 1-52 (`details.field: weeks`)."
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/RepoForbidden' }
+        '500':
+          description: "`internal_error` — a run, stage or audit read failed."
+        '503':
+          description: "`run_repo_unconfigured` / `audit_repo_unconfigured` — the run or audit repository is not configured; or `service_unavailable` — repository visibility could not be resolved."
+
+  /v0/repos/{owner}/{name}/economics:
+    get:
+      operationId: getRepoEconomics
+      summary: Get a repository's economics rollup
+      description: |
+        Read-only repo-dashboard rollup (E40.3 / #1714). Repo visibility is
+        enforced like a point read: a non-visible repo answers 403
+        `repo_forbidden`. Runs are gathered newest-first by paging the repo's
+        runs until one is older than `window_start` minus a fixed 14-day
+        look-back, under a ceiling of 1000 runs scanned; when the ceiling
+        stops the scan first, `truncated` is `true` and the numbers cover
+        only the scanned runs. Every ratio is 0 (never NaN) on a zero
+        denominator.
+
+        Folds every `cost_recorded` entry timestamped in the window: total
+        cost, cost per merged change (total over the distinct changes merged
+        in the window), the weekly cost + cache-efficiency trend, and the
+        ADR-030 periodic-budget burn of each workflow in the newest run's
+        cached spec. With no `cost_recorded` entry in the window the body is
+        `{}` (or `{"truncated": true}`), matching the `/cost` and
+        `/cache-efficiency` presence-not-status-code convention.
+      tags: [repos]
+      parameters:
+        - { name: owner, in: path, required: true, schema: { type: string }, description: Repository owner (first `owner/name` segment). }
+        - { name: name, in: path, required: true, schema: { type: string }, description: Repository name (second `owner/name` segment). }
+        - name: weeks
+          in: query
+          description: Window length in ISO weeks (Monday 00:00 UTC starts), ending with the current week. Integer 1-52; default 12.
+          schema: { type: integer, minimum: 1, maximum: 52, default: 12 }
+      responses:
+        '200':
+          description: Economics rollup, or an object with no rollup fields when the window holds no cost entries.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RepoEconomics' }
+        '400':
+          description: "`validation_failed` — `weeks` is not an integer in 1-52 (`details.field: weeks`)."
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/RepoForbidden' }
+        '500':
+          description: "`internal_error` — a run, stage or audit read failed."
+        '503':
+          description: "`run_repo_unconfigured` / `audit_repo_unconfigured` — the run or audit repository is not configured; or `service_unavailable` — repository visibility could not be resolved."
+
+  /v0/repos/{owner}/{name}/posture:
+    get:
+      operationId: getRepoPosture
+      summary: Get a repository's workflow posture
+      description: |
+        Projects the workflow spec cached on the repo's NEWEST run: each
+        workflow's stages, gates (type, autonomy, approvers), reviewers,
+        autonomy tier and budgets. Reports the declared `version`, its
+        `schema_major`, whether this binary embeds that major
+        (`schema_supported`, with the embedded `schema_hash`), and whether
+        the cached bytes validate through the backend's own spec parser
+        (`spec_valid` / `spec_error`). A client raises a drift warning when
+        either flag is false. 200 `{}` when the repo has no run or the newest
+        run carries no cached spec. Repo visibility is enforced like a point
+        read (403 `repo_forbidden`).
+      tags: [repos]
+      parameters:
+        - { name: owner, in: path, required: true, schema: { type: string }, description: Repository owner (first `owner/name` segment). }
+        - { name: name, in: path, required: true, schema: { type: string }, description: Repository name (second `owner/name` segment). }
+      responses:
+        '200':
+          description: Posture projection, or `{}` when no cached spec exists.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RepoPosture' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/RepoForbidden' }
+        '500':
+          description: "`internal_error` — a run, stage or audit read failed."
+        '503':
+          description: "`run_repo_unconfigured` — the run repository is not configured; or `service_unavailable` — repository visibility could not be resolved."
+
   /v0/acceptance-triage/stats:
     get:
       operationId: getAcceptanceTriageStats
@@ -20660,5 +21020,7 @@ tags:
     description: MCP tool surface served over streamable HTTP (ADR-076).
   - name: oauth
     description: OAuth 2.1 authorization server for MCP clients (ADR-076 slice 3, #2436).
+  - name: repos
+    description: Repo-scoped dashboard rollups — throughput, health, economics, posture (E40.3 / #1714).
   - name: dev
     description: Dev-only seeded-fixture surface for the acceptance preview (E72.2 / #3326); registered only under FISHHAWKD_DEV_FIXTURES=1, loopback-only.

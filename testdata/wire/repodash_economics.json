@@ -1,0 +1,54 @@
+{
+  "repo": "acme/app",
+  "window_start": "2026-09-07T00:00:00Z",
+  "window_end": "2026-10-05T00:00:00Z",
+  "window_weeks": 4,
+  "runs_scanned": 2,
+  "truncated": false,
+  "cost_entries": 2,
+  "total_cost_usd": 4,
+  "merged_changes": 1,
+  "cost_per_merged_change_usd": 4,
+  "weeks": [
+    {
+      "week_start": "2026-09-07T00:00:00Z",
+      "cost_usd": 0,
+      "cache_read_ratio": 0,
+      "reuse_factor": 0,
+      "net_savings_usd": 0
+    },
+    {
+      "week_start": "2026-09-14T00:00:00Z",
+      "cost_usd": 0,
+      "cache_read_ratio": 0,
+      "reuse_factor": 0,
+      "net_savings_usd": 0
+    },
+    {
+      "week_start": "2026-09-21T00:00:00Z",
+      "cost_usd": 0,
+      "cache_read_ratio": 0,
+      "reuse_factor": 0,
+      "net_savings_usd": 0
+    },
+    {
+      "week_start": "2026-09-28T00:00:00Z",
+      "cost_usd": 4,
+      "cache_read_ratio": 0.75,
+      "reuse_factor": 3,
+      "net_savings_usd": 0
+    }
+  ],
+  "budgets": [
+    {
+      "workflow_id": "feature_change",
+      "period": "weekly",
+      "period_start": "2026-09-28T00:00:00Z",
+      "limit_usd": 50,
+      "spent_usd": 12.5,
+      "fraction": 0.25,
+      "tier": "ok",
+      "enforcement": "advisory"
+    }
+  ]
+}

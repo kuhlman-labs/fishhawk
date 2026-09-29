@@ -274,3 +274,52 @@ describe('api.listStageChecks (#228)', () => {
     expect((init.method ?? 'GET').toUpperCase()).toBe('GET');
   });
 });
+
+describe('repo dashboard rollups (E40.3 / #1714)', () => {
+  beforeEach(() => vi.unstubAllGlobals());
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('builds each rollup path with owner and name encoded separately and no default weeks', async () => {
+    const fetchMock = mockFetch();
+    await api.getRepoThroughput('acme', 'app');
+    await api.getRepoHealth('acme', 'app');
+    await api.getRepoEconomics('acme', 'app');
+    await api.getRepoPosture('acme', 'app');
+    expect(fetchMock.mock.calls.map((c) => c[0])).toEqual([
+      '/v0/repos/acme/app/throughput',
+      '/v0/repos/acme/app/health',
+      '/v0/repos/acme/app/economics',
+      '/v0/repos/acme/app/posture',
+    ]);
+    for (const call of fetchMock.mock.calls) {
+      const init = (call[1] as RequestInit) ?? {};
+      expect((init.method ?? 'GET').toUpperCase()).toBe('GET');
+    }
+  });
+
+  it('passes weeks only when the caller sets it', async () => {
+    const fetchMock = mockFetch();
+    await api.getRepoThroughput('acme', 'app', { weeks: 4 });
+    await api.getRepoHealth('acme', 'app', { weeks: 52 });
+    await api.getRepoEconomics('acme', 'app', { weeks: 1 });
+    await api.getRepoThroughput('acme', 'app', {});
+    expect(fetchMock.mock.calls.map((c) => c[0])).toEqual([
+      '/v0/repos/acme/app/throughput?weeks=4',
+      '/v0/repos/acme/app/health?weeks=52',
+      '/v0/repos/acme/app/economics?weeks=1',
+      '/v0/repos/acme/app/throughput',
+    ]);
+  });
+
+  it('encodes a separator inside owner or name rather than splitting the path', async () => {
+    const fetchMock = mockFetch();
+    await api.getRepoHealth('a/b', 'c d?');
+    expect(fetchMock.mock.calls[0][0]).toBe('/v0/repos/a%2Fb/c%20d%3F/health');
+  });
+
+  it('getHealth hits /healthz', async () => {
+    const fetchMock = mockFetch();
+    await api.getHealth();
+    expect(fetchMock.mock.calls[0][0]).toBe('/healthz');
+  });
+});

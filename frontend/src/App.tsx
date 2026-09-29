@@ -11,6 +11,7 @@ import { StageDetail } from './routes/stage-detail';
 import { Campaigns } from './routes/campaigns';
 import { CampaignDetail } from './routes/campaign-detail';
 import { Audit } from './routes/audit';
+import { RepoDashboard } from './routes/repo-dashboard';
 import { NotFound } from './routes/not-found';
 
 export function App() {
@@ -33,6 +34,7 @@ export function App() {
           <Route path="runs/:runId/stages/:stageId" element={<StageDetail />} />
           <Route path="campaigns" element={<Campaigns />} />
           <Route path="campaigns/:campaignId" element={<CampaignDetail />} />
+          <Route path="repos/:owner/:name" element={<RepoDashboard />} />
           <Route path="audit" element={<Audit />} />
         </Route>
         <Route path="*" element={<NotFound />} />

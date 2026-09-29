@@ -1,0 +1,14 @@
+id: scenario:issue-1714/repo-rollup-rejects-out-of-range-window
+statement: A repo rollup request with an out-of-range week window is refused with a 400 naming the offending field rather than being silently clamped or serving an unbounded scan.
+verify_hint: GET /v0/repos/kuhlman-labs/fishhawk/throughput?weeks=0 and ?weeks=53 each return 400 with error code `validation_failed` and a details field naming `weeks`.
+steps: GET http://localhost:8090/v0/repos/kuhlman-labs/fishhawk/throughput?weeks=0 and ?weeks=53, plus controls ?weeks=1, ?weeks=52, ?weeks=abc, health?weeks=0, health?weeks=-1 and economics?weeks=53.
+assertions:
+    expected: 400 validation_failed with details naming `weeks`.
+    observed_at_record: weeks=0 and weeks=53 each return 400 {"error":{"code":"validation_failed","message":"weeks must be an integer between 1 and 52","details":{"field":"weeks","got":"…"}}}. weeks=1 and weeks=52 return 200 with window_weeks 1 and 52. abc, -1 and the health/economics variants also return 400 validation_failed with field weeks.
+    repro_handle: curl -s 'http://localhost:8090/v0/repos/kuhlman-labs/fishhawk/throughput?weeks=53'
+origin:
+    issue: 1714
+    pr: 0
+    run_id: 9e5234b3-f1fd-4704-bdd6-dc8c12fa132b
+    head_sha: 946018bb06a93cc6a534d4b452b2ae61c80b9a88
+    recorded_at: 2026-09-29T00:36:38Z
