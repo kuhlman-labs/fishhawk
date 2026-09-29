@@ -107,7 +107,13 @@ var mcpToolScopes = map[string]mcpToolScopeRule{
 	// handleGetPrecedent), an authenticated read that checks NO scope: its
 	// narrowing is the caller's own workspace account plus the point-read
 	// repo-visibility DENY, both applied inside the handler.
-	"fishhawk_precedent":             mcpScopeAuthenticatedOnly,
+	"fishhawk_precedent": mcpScopeAuthenticatedOnly,
+	// fishhawk_delegation dials GET /v0/repos/{owner}/{name}/delegation
+	// (delegation_view.go handleGetRepoDelegation), an authenticated read that
+	// checks NO scope: its narrowing is the shared repoDashPrelude — the
+	// caller's own workspace account plus the point-read repo-visibility DENY.
+	// It writes nothing and mints no audit entry.
+	"fishhawk_delegation":            mcpScopeAuthenticatedOnly,
 	"fishhawk_await_stage":           mcpScopeAuthenticatedOnly,
 	"fishhawk_await_audit":           mcpScopeAuthenticatedOnly,
 	"fishhawk_await_children":        mcpScopeAuthenticatedOnly,

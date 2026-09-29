@@ -6074,6 +6074,133 @@ components:
               fraction: { type: number, format: double }
               tier: { type: string, enum: [ok, warn, over, ack_required, page] }
               enforcement: { type: string, enum: [advisory, hard] }
+    RepoDelegationAction:
+      type: object
+      description: |
+        One resolved action class with the PROVENANCE of its mode (E76.1 /
+        #3747). `source` is what makes the matrix legible: `tier` (the autonomy
+        shorthand's expansion), `explicit` (an `actions` entry named this
+        class), `default` (nothing named it, so it fell to the fail-closed
+        `gated`), or `escalation` (an autonomy ceiling downgraded it).
+      required: [action, mode, source]
+      properties:
+        action: { type: string, description: "The action class — the five run-driving ones are `approve`, `fixup`, `waive`, `retry`, `merge`; the class set is open." }
+        mode: { type: string, enum: [gated, auto, report], description: "`gated` (the human acts), `auto` (the operator agent may act under `condition`), `report` (surface a proposal without acting)." }
+        condition: { type: string, description: The backend-evaluable condition the mode consumes; present only at `auto` / `report`. }
+        min_severity: { type: string, description: The fix-up routing severity threshold; accepted on the `fixup` class only. }
+        source: { type: string, enum: [tier, explicit, default, escalation] }
+    RepoDelegationModelPolicy:
+      type: object
+      description: The resolved block's operator-agent model-selection contract (#1421), passed through as static config.
+      properties:
+        strategy: { type: string, enum: [follow_plan_recommendation, explicit_defaults] }
+        defaults:
+          type: object
+          properties:
+            plan: { type: string }
+            implement: { type: string }
+            review: { type: string }
+        allowed:
+          type: array
+          items: { type: string }
+    RepoDelegationEscalation:
+      type: object
+      description: |
+        One declared escalation: what it matches, what it raises, and the matrix
+        its autonomy ceiling WOULD produce. DECLARATIVE — this read does not
+        evaluate whether the escalation fires, because firing depends on an
+        approved plan's `scope.files`, which does not exist before a run.
+      required: [match]
+      properties:
+        match:
+          type: object
+          description: The shared path predicate (E53.1 / #2224) — the same matcher `applies_to` consumes.
+          properties:
+            paths:
+              type: array
+              items: { type: string }
+              description: Doublestar globs, evaluated at the approval gate against the approved plan's `scope.files`.
+            labels:
+              type: array
+              items: { type: string }
+            change_kind:
+              type: array
+              items: { type: string }
+            trigger:
+              type: array
+              items: { type: string }
+        max_autonomy: { type: string, enum: [low, medium, high], description: The autonomy CEILING this escalation raises; absent when it raises none. }
+        approvals:
+          type: object
+          description: The raised approval-gate requirement. A strict subset of the gate predicate — only the three dimensions an escalation may RAISE are expressible.
+          properties:
+            count: { type: integer, minimum: 1 }
+            member_of: { type: string }
+            min_permission: { type: string, enum: [read, triage, write, maintain, admin] }
+        ceiling_matrix:
+          type: array
+          description: |
+            The workflow matrix clamped by `max_autonomy` — what the ceiling
+            WOULD produce for a change this escalation matches. Every clamped
+            class reports `mode: gated` with `source: escalation` and no
+            condition. Absent when the escalation declares no ceiling, or when
+            the workflow resolves no matrix for one to clamp.
+          items: { $ref: '#/components/schemas/RepoDelegationAction' }
+    RepoDelegationWorkflow:
+      type: object
+      description: |
+        One workflow's delegation posture. A workflow declaring NO autonomy
+        block reports an empty `autonomy` and an EMPTY `matrix` — the
+        fail-closed reading, nothing delegated.
+      required: [id, matrix, content_hash]
+      properties:
+        id: { type: string }
+        autonomy: { type: string, enum: [low, medium, high], description: "The declared tier shorthand; absent when the workflow declares only an `actions` block, or no autonomy block at all." }
+        matrix:
+          type: array
+          description: The WORKFLOW-level resolved matrix. A gate declaring its own autonomy block overrides it wholesale AT THAT GATE; this read shows the workflow-level one.
+          items: { $ref: '#/components/schemas/RepoDelegationAction' }
+        must_page_human:
+          type: array
+          description: Events that page a human regardless of any class's mode — the same list a run's delegation block surfaces.
+          items: { type: string }
+        model_policy: { $ref: '#/components/schemas/RepoDelegationModelPolicy' }
+        escalations:
+          type: array
+          items: { $ref: '#/components/schemas/RepoDelegationEscalation' }
+        content_hash:
+          type: string
+          description: |
+            `sha256` over THIS entry's delegation content with `content_hash`
+            itself zeroed. It never covers `repo`, `ref`, `workflow_sha` or
+            `source`, and it is stamped BEFORE the `workflow` filter — so a
+            filtered read reports the same value an unfiltered one does. Bind a
+            single-workflow confirmation to this hash.
+    RepoDelegation:
+      type: object
+      description: |
+        GET /v0/repos/{owner}/{name}/delegation body (E76.1 / #3747): the
+        per-workflow delegation projection of a repository's spec at one source.
+        Long-form contract: backend/internal/delegationview/README.md.
+      required: [repo, source, schema_major, content_hash, workflows]
+      properties:
+        repo: { type: string }
+        source: { type: string, enum: [ref, run_cache], description: The spec source actually read. Always present — never switched silently. }
+        ref: { type: string, description: "The ref as REQUESTED under `source=ref`; empty means the repository's default branch head." }
+        workflow_sha: { type: string, description: "The forge blob SHA under `source=ref`, or the cached run's `workflow_sha` under `source=run_cache`." }
+        spec_version: { type: string, description: The spec's declared version verbatim. }
+        schema_major: { type: integer }
+        content_hash:
+          type: string
+          description: |
+            `sha256` over the ordered workflow entries ONLY — never `repo`,
+            `source`, `ref`, `workflow_sha`, `spec_version` or `schema_major`.
+            Identical delegation read at two refs therefore hashes identically.
+            Under a `workflow` filter it is recomputed over the RETAINED set.
+        workflows:
+          type: array
+          description: One entry per declared workflow, in ascending workflow-id order.
+          items: { $ref: '#/components/schemas/RepoDelegationWorkflow' }
     RepoPosture:
       type: object
       description: |
@@ -15450,6 +15577,108 @@ paths:
           description: "`internal_error` — a run, stage or audit read failed."
         '503':
           description: "`run_repo_unconfigured` — the run repository is not configured; or `service_unavailable` — repository visibility could not be resolved."
+
+  /v0/repos/{owner}/{name}/delegation:
+    get:
+      operationId: getRepoDelegation
+      summary: Get a repository's per-workflow delegation posture
+      description: |
+        Answers "what may the crew decide on its own here?" for every workflow
+        a repository's spec declares — from the spec at a ref, WITHOUT a run
+        (E76.1 / #3747).
+
+        Per workflow it reports the declared `autonomy` tier, the resolved
+        action `matrix` with per-class PROVENANCE (`tier` / `explicit` /
+        `default` / `escalation`), the `must_page_human` event set (the same
+        list a run's delegation block surfaces), the `model_policy`, and each
+        declared escalation with its match criteria, its raised `approvals`,
+        its `max_autonomy` ceiling and the `ceiling_matrix` that ceiling
+        produces.
+
+        TWO CONTRACTS NOT TO MISREAD. `matrix` is the WORKFLOW-level matrix: a
+        gate declaring its own autonomy block overrides it wholesale AT THAT
+        GATE, and this read shows the workflow-level one. `ceiling_matrix` is
+        DECLARATIVE — whether an escalation fires depends on an approved plan's
+        `scope.files`, which does not exist before a run, so this read never
+        asks; a workflow's own `matrix` is never clamped here.
+
+        TWO EXPLICIT SPEC SOURCES, always echoed as `source` and never switched
+        silently: `ref` (the default) fetches `.fishhawk/workflows.yaml` through
+        the forge at `ref`, with an empty `ref` serving the repository's default
+        branch head; `run_cache` projects the spec cached on the repo's newest
+        run — the same source `/posture` reads. An unconfigured forge under
+        `source=ref` is a 503 `github_unconfigured` naming the `run_cache`
+        alternative, never a fallback.
+
+        `content_hash` is `sha256` over the projected delegation content ONLY —
+        never `repo`, `ref`, `workflow_sha` or `source` — so identical
+        delegation read at two refs hashes identically and a later confirmation
+        can bind to exactly what was shown. Per-workflow hashes are stamped
+        BEFORE the `workflow` filter, so a filtered read reports the same
+        per-workflow hash an unfiltered one does; only the view-level hash
+        reflects the retained set. Bind a single-workflow confirmation to that
+        workflow's own `content_hash`.
+
+        Read-only: writes nothing, mints no audit entry, grants no authority.
+        Repo visibility is enforced like a point read (403 `repo_forbidden`).
+        Also available as the `fishhawk_delegation` MCP tool, whose response is
+        bounded per ADR-077 and marks every elision with this route as the
+        un-elided retrieval surface.
+      tags: [repos]
+      parameters:
+        - { name: owner, in: path, required: true, schema: { type: string }, description: Repository owner (first `owner/name` segment). }
+        - { name: name, in: path, required: true, schema: { type: string }, description: Repository name (second `owner/name` segment). }
+        - name: source
+          in: query
+          description: Where to read the spec from. `ref` (the default) fetches it through the forge; `run_cache` projects the spec cached on the repo's newest run. Always echoed on the response.
+          schema: { type: string, enum: [ref, run_cache], default: ref }
+        - name: ref
+          in: query
+          description: The git ref to read `.fishhawk/workflows.yaml` at under `source=ref`. Omit for the repository's default branch head. Ignored under `source=run_cache`.
+          schema: { type: string }
+        - name: workflow
+          in: query
+          description: Narrow the response to one workflow id. An id the spec does not declare is 404 `workflow_not_found`.
+          schema: { type: string }
+      responses:
+        '200':
+          description: The delegation projection for every workflow (or the one named by `workflow`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RepoDelegation' }
+        '400':
+          description: "`validation_failed` — `source` is neither `ref` nor `run_cache` (`details.field: source`)."
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/RepoForbidden' }
+        '404':
+          description: "`workflow_spec_not_found` — no spec at the ref, or no run carries a cached spec; or `workflow_not_found` — the spec declares no workflow with the requested id."
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: |
+            `workflow_spec_invalid` — the spec at this source does not validate.
+            The body carries the validation error in `details.error` and NO
+            `workflows` array and NO `content_hash`: a partial matrix is never
+            emitted, and nothing was shown, so nothing may be bound to.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '502':
+          description: "`forge_unavailable` — resolving the installation or fetching the spec through the forge failed."
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: "`internal_error` — a run read failed."
+        '503':
+          description: "`github_unconfigured` — `source=ref` was requested but no GitHub App is configured (the message names the `run_cache` alternative); or `run_repo_unconfigured` — the run repository is not configured; or `service_unavailable` — repository visibility could not be resolved."
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
 
   /v0/acceptance-triage/stats:
     get:
