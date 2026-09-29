@@ -1,0 +1,15 @@
+{
+  "schema_version": "crew-message-v1",
+  "type": "work_request",
+  "sender_role": "architect",
+  "recipient_role": "captain",
+  "anchor": { "decision_record_id": "ADR-081" },
+  "payload": {
+    "title": "Ship the crew-message prompt envelope",
+    "summary": "ADR-081 rule 5 requires delivered messages to be rendered only by a prompt-package function inside a CREW MESSAGE envelope.",
+    "rationale": "The contract child ships no render path, so the envelope needs its own item before any delivery surface lands."
+  },
+  "evidence": [
+    { "kind": "decision_record", "ref": "ADR-081" }
+  ]
+}

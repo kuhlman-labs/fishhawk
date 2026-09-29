@@ -190,6 +190,15 @@ var testSweepPathTriggerRules = []testSweepPathTriggerRule{
 		Generator:     testSweepGeneratorSyncSchemas,
 	},
 	{
+		// crew-message-*.schema.json case arm (E77.1 / #3735): backend only —
+		// the contract is backend-owned and neither the runner nor the CLI
+		// reads or writes a crew message, so the arm routes exactly one mirror.
+		Rule:          testSweepRuleGeneratedSurface,
+		TriggerGlob:   "docs/spec/crew-message-v1.schema.json",
+		RequiredPaths: []string{"backend/internal/crewmessage/schemas/crew-message-v1.schema.json"},
+		Generator:     testSweepGeneratorSyncSchemas,
+	},
+	{
 		// grooming-report-*.schema.json case arm: backend only.
 		Rule:          testSweepRuleGeneratedSurface,
 		TriggerGlob:   "docs/spec/grooming-report-v1.schema.json",

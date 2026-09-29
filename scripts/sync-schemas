@@ -16,6 +16,17 @@ for schema in "$REPO_ROOT"/docs/spec/*.schema.json; do
       # clarification_request outcome semantically and does not embed it.
       cp "$schema" "$REPO_ROOT/backend/internal/plan/schemas/$base"
       ;;
+    crew-message-*.schema.json)
+      # The ADR-081 (#3727) crew-message contract is BACKEND-OWNED and gets
+      # exactly ONE mirror. This child adds no runner-written artifact and no
+      # CLI validation path -- the runner neither writes nor reads a crew
+      # message, and `fishhawk validate` has nothing to check it against -- so a
+      # second or third mirror would be dead weight that CI's schema-sync gate
+      # then has to police forever. A later E77 child that ships the schema to
+      # a non-backend process adds its mirror here and its row to the two
+      # backend/internal/server sweep registries in the same change.
+      cp "$schema" "$REPO_ROOT/backend/internal/crewmessage/schemas/$base"
+      ;;
     grooming-report-*.schema.json)
       # The plan-stage grooming_report SIBLING schema (#2235) is embedded
       # into the backend plan validator only: the runner WRITES the report

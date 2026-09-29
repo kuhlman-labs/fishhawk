@@ -1,0 +1,18 @@
+{
+  "schema_version": "crew-message-v1",
+  "type": "consult",
+  "sender_role": "planner",
+  "recipient_role": "historian",
+  "anchor": { "run_id": "6f1d2c3a-4b5e-4f70-8a91-2c3d4e5f6a7b" },
+  "payload": {
+    "question": "Has a closed type set for crew messages been settled before, and if so where?",
+    "what_i_can_infer": "ADR-081 names five types; I cannot tell whether an earlier decision narrowed or widened that set.",
+    "context": "Planning E77.1, the crew-message contract child."
+  },
+  "evidence": [
+    { "kind": "decision_record", "ref": "ADR-081" },
+    { "kind": "issue", "ref": "kuhlman-labs/fishhawk#3727" }
+  ],
+  "response_required": true,
+  "deadline": "2026-09-29T17:30:00Z"
+}

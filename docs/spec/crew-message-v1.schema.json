@@ -1,0 +1,295 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fishhawk.dev/spec/crew-message-v1.schema.json",
+  "title": "Fishhawk crew message (crew-message-v1)",
+  "description": "A typed, addressed message one crew role sends another, implementing ADR-081 (#3727) rules 1-3. NOT a plan ArtifactKind: it is a standalone contract with its own schema and its own Go package (backend/internal/crewmessage), so plan-standard-v1 stays frozen and a crew message never routes through the plan validator. A message is ADVICE, NEVER AN ORDER (rule 2): the shape below can express a question, an observation, a request or an escalation, and it deliberately cannot express a scope path, a constraint, a delegation or a gate outcome — every object closes with additionalProperties:false and no property name anywhere is drawn from the authority vocabulary. Addresses are ROLES, never model instances (rule 3): sender_role and recipient_role draw from a closed enum, so a model identifier or an agent instance name is structurally unaddressable. SCHEMA-ONLY VALIDATION IS NOT SUFFICIENT: the crew-role enum admits 'implementer' because the implementer is a real crew role and a legal SENDER, so this schema ALONE accepts recipient_role: implementer. ARCHITECTURE section 6 invariant #8 (no message is ever delivered to an implement stage) is enforced ONLY by the Go validator crewmessage.Validate, which is the single source of truth for addressability. Every consumer MUST call it; a bare check-jsonschema run does not enforce that rule.",
+
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "type",
+    "sender_role",
+    "recipient_role",
+    "anchor",
+    "payload"
+  ],
+
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "crew-message-v1",
+      "description": "Contract discriminator and version. A future major is a new schema file (crew-message-v2.schema.json) with its own const, never a break in place."
+    },
+    "type": {
+      "type": "string",
+      "enum": ["consult", "finding", "work_request", "notice", "escalation"],
+      "description": "The closed five-member type set of ADR-081 rule 1. A consult asks a question and is answered synchronously in-process; a finding records an observation and is NOT a concern (it never enters the merge gate); a work_request asks for an item to be filed and never dispatches a run; a notice informs and expects no answer; an escalation surfaces a disagreement to the captain and produces binding text only once the captain answers. The enum selects the payload shape via the allOf if/then arms below."
+    },
+    "sender_role": {
+      "$ref": "#/$defs/crew-role",
+      "description": "The role that sent the message. On the wire the server DERIVES this from the token's executing stage and never reads it from a request body (ADR-081 rule 3); the field exists so a stored or rendered message is self-describing."
+    },
+    "recipient_role": {
+      "$ref": "#/$defs/crew-role",
+      "description": "The role the message is addressed to. Invariant #8 forbids addressing a role an implement stage executes; that rule is NOT expressed here (the enum admits implementer as a legal sender) and lives in crewmessage.CanReceive."
+    },
+    "anchor": { "$ref": "#/$defs/anchor" },
+    "payload": {
+      "description": "The typed body. Deliberately declares NO constraint of its own: the type enum above admits only the five members, so exactly one allOf arm below always fires and narrows payload to that type's closed object $def. Declaring type:object here as well would be redundant and would make this the one object-typed subschema in the document that cannot close (closing it would forbid every payload field), which is why TestSchema_ClosedAtEveryLevel finds no exception to walk around."
+    },
+    "evidence": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/evidence-reference" },
+      "description": "Optional references grounding the message in recorded state. Deliberately carries NO repo-path or code-location member: a path list is the nearest thing this contract has to a scope expression, and rule 2 forbids a field that can express scope. Cite a file in a payload prose field, which carries no authority."
+    },
+    "response_required": {
+      "type": "boolean",
+      "default": false,
+      "description": "Whether the sender is waiting on an answer. Declared as a plain boolean on EVERY type here; ADR-081 D1 answers only consult and escalation synchronously, so response_required on any other type is an unanswerable request and is rejected by crewmessage.Validate (ErrResponseNotAnswerable), not by this schema."
+    },
+    "deadline": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Optional RFC 3339 instant after which the sender stops waiting. An unanswered consult times out to 'no answer' and never blocks the stage (ADR-081 rule 6)."
+    }
+  },
+
+  "allOf": [
+    {
+      "if": {
+        "required": ["type"],
+        "properties": { "type": { "const": "consult" } }
+      },
+      "then": {
+        "required": ["payload"],
+        "properties": { "payload": { "$ref": "#/$defs/consult-payload" } }
+      }
+    },
+    {
+      "if": {
+        "required": ["type"],
+        "properties": { "type": { "const": "finding" } }
+      },
+      "then": {
+        "required": ["payload"],
+        "properties": { "payload": { "$ref": "#/$defs/finding-payload" } }
+      }
+    },
+    {
+      "if": {
+        "required": ["type"],
+        "properties": { "type": { "const": "work_request" } }
+      },
+      "then": {
+        "required": ["payload"],
+        "properties": { "payload": { "$ref": "#/$defs/work-request-payload" } }
+      }
+    },
+    {
+      "if": {
+        "required": ["type"],
+        "properties": { "type": { "const": "notice" } }
+      },
+      "then": {
+        "required": ["payload"],
+        "properties": { "payload": { "$ref": "#/$defs/notice-payload" } }
+      }
+    },
+    {
+      "if": {
+        "required": ["type"],
+        "properties": { "type": { "const": "escalation" } }
+      },
+      "then": {
+        "required": ["payload"],
+        "properties": {
+          "payload": {
+            "$ref": "#/$defs/escalation-payload",
+            "required": ["summary", "recommended_default", "tradeoffs"]
+          }
+        }
+      }
+    }
+  ],
+
+  "$defs": {
+    "crew-role": {
+      "type": "string",
+      "enum": [
+        "captain",
+        "planner",
+        "architect",
+        "historian",
+        "security",
+        "reviewer",
+        "implementer"
+      ],
+      "description": "The closed crew vocabulary (ADR-081 rules 3 and 8, plus E78's plan-fit reviewer persona). An ENUM, never a free string, so a model identifier ('claude-opus-5') or an agent instance name can never be an address. 'implementer' is a member ON PURPOSE: the implementer is a real crew role and a legal sender_role. What invariant #8 forbids is ADDRESSING one, and that refusal lives in crewmessage.CanReceive so it is a live, testable control rather than dead code masked by a narrower enum. Adding an eighth role is an additive change within this major."
+    },
+
+    "anchor": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Exactly one of the three anchors. All three members are declared optional and the oneOf below admits precisely one: a document carrying none matches zero arms, and a document carrying two or three matches more than one, so both are rejected.",
+      "properties": {
+        "run_id": {
+          "type": "string",
+          "format": "uuid",
+          "description": "A Fishhawk run this message is about. Anchors the message on that run's audit chain partition."
+        },
+        "issue_ref": {
+          "type": "string",
+          "minLength": 1,
+          "description": "A work item, e.g. \"kuhlman-labs/fishhawk#3735\". Anchors a run-less message on the account's global chain."
+        },
+        "decision_record_id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "A settled decision, e.g. \"ADR-081\". The historian's precedent query and the architect's contradiction check both anchor here."
+        }
+      },
+      "oneOf": [
+        { "required": ["run_id"] },
+        { "required": ["issue_ref"] },
+        { "required": ["decision_record_id"] }
+      ]
+    },
+
+    "evidence-reference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "ref"],
+      "description": "One pointer into recorded state. The kind enum is closed and deliberately omits any file/path member (see the evidence property above).",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "audit_entry",
+            "run",
+            "stage",
+            "issue",
+            "decision_record",
+            "url"
+          ],
+          "description": "What sort of thing ref names."
+        },
+        "ref": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The identifier or URL, interpreted per kind."
+        }
+      }
+    },
+
+    "consult-payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["question"],
+      "description": "A question one role asks another, answered synchronously in-process (ADR-081 D1 option 1). The canonical first use is planner -> historian (rule 8).",
+      "properties": {
+        "question": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The question, stated directly to the recipient role."
+        },
+        "what_i_can_infer": {
+          "type": "string",
+          "description": "Optional. What the sender already established on its own, narrowing the question to the part it genuinely cannot answer."
+        },
+        "context": {
+          "type": "string",
+          "description": "Optional prose framing. Prose only — it confers no authority and binds nothing."
+        }
+      }
+    },
+
+    "finding-payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["summary"],
+      "description": "An observation one role wants another to see. A finding is NOT a concern: it never enters the merge gate and nothing is blocked by it. If the captain wants one acted on they route it explicitly (ADR-081 rule 2).",
+      "properties": {
+        "summary": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The observation in one sentence."
+        },
+        "detail": {
+          "type": "string",
+          "description": "Optional supporting prose."
+        },
+        "severity": {
+          "type": "string",
+          "enum": ["low", "medium", "high"],
+          "description": "Optional sender-assessed severity. Advisory: it feeds no gate and changes no outcome."
+        }
+      }
+    },
+
+    "work-request-payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["title", "summary"],
+      "description": "A request that a work item be filed. Filing goes through the existing applyAndFileWorkItem path, run-scoped, and NEVER dispatches a run (ADR-081 rule 2).",
+      "properties": {
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Proposed item title."
+        },
+        "summary": {
+          "type": "string",
+          "minLength": 1,
+          "description": "What the item is for."
+        },
+        "rationale": {
+          "type": "string",
+          "description": "Optional. Why it is worth filing now."
+        }
+      }
+    },
+
+    "notice-payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["summary"],
+      "description": "Information delivered with no answer expected, asynchronously (ADR-081 D1 option 3).",
+      "properties": {
+        "summary": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The notice in one sentence."
+        },
+        "detail": {
+          "type": "string",
+          "description": "Optional supporting prose."
+        }
+      }
+    },
+
+    "escalation-payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["summary"],
+      "description": "A disagreement surfaced to the captain once the bounded round count is exhausted (ADR-081 D3 option 1). recommended_default and tradeoffs are declared here as optional properties and made REQUIRED by the escalation if/then arm above, mirroring the clarification-request calibration rule: the captain must be able to accept the default at a glance. Escalation text becomes binding only once the captain answers.",
+      "properties": {
+        "summary": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The disagreement in one sentence."
+        },
+        "recommended_default": {
+          "type": "string",
+          "minLength": 1,
+          "description": "What the sender would do absent a ruling. Required on an escalation by the arm above."
+        },
+        "tradeoffs": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The consequences of the recommended default versus the alternatives. Required on an escalation by the arm above."
+        }
+      }
+    }
+  }
+}
