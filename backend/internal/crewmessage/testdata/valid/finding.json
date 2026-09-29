@@ -1,0 +1,16 @@
+{
+  "schema_version": "crew-message-v1",
+  "type": "finding",
+  "sender_role": "security",
+  "recipient_role": "captain",
+  "anchor": { "issue_ref": "kuhlman-labs/fishhawk#3735" },
+  "payload": {
+    "summary": "The evidence reference shape carries no repo-path member, so a citation cannot express a scope path.",
+    "detail": "Noted while reading the contract; this is an observation, not a concern, and blocks no gate.",
+    "severity": "low"
+  },
+  "evidence": [
+    { "kind": "audit_entry", "ref": "3f6a1b02-9c4d-4e8f-b012-7a8b9c0d1e2f" }
+  ],
+  "response_required": false
+}

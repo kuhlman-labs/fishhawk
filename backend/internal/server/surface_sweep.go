@@ -264,6 +264,26 @@ var surfacePatterns = []surfacePattern{
 		},
 	},
 	{
+		// E77.1 / #3735 (ADR-081 #3727): the crew-message-v1 schema's
+		// canonical and embedded-mirror copies must move in lockstep
+		// (scripts/sync-schemas' crew-message-* case arm routes the canonical
+		// to exactly ONE backend/internal/crewmessage/schemas mirror — the
+		// contract is backend-owned, and neither the runner nor the CLI reads
+		// or writes a crew message). Self-referential (Triggers == Siblings),
+		// matching the grooming-report / operator-role entries. A later E77
+		// child that ships the schema to a non-backend process adds its mirror
+		// to BOTH lists here.
+		Name: "crew-message schema requires every mirror",
+		Triggers: []string{
+			"docs/spec/crew-message-v1.schema.json",
+			"backend/internal/crewmessage/schemas/crew-message-v1.schema.json",
+		},
+		Siblings: []string{
+			"docs/spec/crew-message-v1.schema.json",
+			"backend/internal/crewmessage/schemas/crew-message-v1.schema.json",
+		},
+	},
+	{
 		// E54.3 / #2235: the grooming-report-v1 schema's canonical and
 		// embedded-mirror copies must move in lockstep (scripts/sync-schemas'
 		// grooming-report-* case routes the canonical to exactly the one

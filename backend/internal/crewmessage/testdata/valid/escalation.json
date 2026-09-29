@@ -1,0 +1,17 @@
+{
+  "schema_version": "crew-message-v1",
+  "type": "escalation",
+  "sender_role": "reviewer",
+  "recipient_role": "captain",
+  "anchor": { "issue_ref": "kuhlman-labs/fishhawk#3727" },
+  "payload": {
+    "summary": "The planner and I disagree on whether the crew-role enum should admit implementer.",
+    "recommended_default": "Keep implementer in the enum and enforce invariant #8 in the Go validator only.",
+    "tradeoffs": "Keeping it makes the Go rule the sole gate in its fixture's path, so the control stays counterfactual; removing it enforces the rule twice but masks the Go rule, leaving it untested dead code."
+  },
+  "evidence": [
+    { "kind": "stage", "ref": "2b9fced2-ed45-4248-9c65-6762d201d327" }
+  ],
+  "response_required": true,
+  "deadline": "2026-09-30T12:00:00Z"
+}

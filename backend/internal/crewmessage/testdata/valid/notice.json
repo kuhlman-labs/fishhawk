@@ -1,0 +1,16 @@
+{
+  "schema_version": "crew-message-v1",
+  "type": "notice",
+  "sender_role": "historian",
+  "recipient_role": "planner",
+  "anchor": { "run_id": "b2c3d4e5-f607-4819-a2b3-c4d5e6f70819" },
+  "payload": {
+    "summary": "The precedent query found one prior decision on this surface and no contradicting one.",
+    "detail": "Recorded for the plan's grounding; no answer is expected."
+  },
+  "evidence": [
+    { "kind": "run", "ref": "b2c3d4e5-f607-4819-a2b3-c4d5e6f70819" },
+    { "kind": "url", "ref": "https://github.com/kuhlman-labs/fishhawk/issues/3727" }
+  ],
+  "response_required": false
+}

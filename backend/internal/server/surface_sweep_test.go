@@ -310,6 +310,29 @@ func TestEvaluateSurfaceSweep(t *testing.T) {
 			want: nil,
 		},
 		{
+			// E77.1 / #3735: the crew-message-v1 canonical scoped without its
+			// embedded mirror is the self-referential lockstep miss the new
+			// registry entry exists to catch.
+			name:  "crew-message canonical without mirror flags",
+			scope: []string{"docs/spec/crew-message-v1.schema.json"},
+			want: []SurfaceSweepFinding{
+				{
+					Pattern:         "crew-message schema requires every mirror",
+					TriggerPath:     "docs/spec/crew-message-v1.schema.json",
+					MissingSiblings: []string{"backend/internal/crewmessage/schemas/crew-message-v1.schema.json"},
+				},
+			},
+		},
+		{
+			// Both members scoped: no finding.
+			name: "crew-message both mirrors no finding",
+			scope: []string{
+				"docs/spec/crew-message-v1.schema.json",
+				"backend/internal/crewmessage/schemas/crew-message-v1.schema.json",
+			},
+			want: nil,
+		},
+		{
 			// E54.3 / #2235: the grooming-report-v1 canonical scoped without
 			// its embedded mirror is the self-referential lockstep miss the
 			// registry entry exists to catch (scripts/sync-schemas routes the

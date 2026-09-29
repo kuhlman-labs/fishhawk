@@ -373,6 +373,22 @@ func TestEvaluateTestSweep(t *testing.T) {
 			},
 		},
 		{
+			// E77.1 / #3735: the crew-message schema's sync-schemas case arm
+			// routes exactly ONE mirror, and the finding must name both it and
+			// the generator that writes it.
+			name:     "crew-message schema without its mirror names the backend copy and the generator",
+			scope:    []plan.ScopeFile{{Path: "docs/spec/crew-message-v1.schema.json", Operation: plan.FileOpModify}},
+			listings: map[string][]string{},
+			want: []TestSweepFinding{
+				{
+					Rule:         testSweepRuleGeneratedSurface,
+					TriggerPath:  "docs/spec/crew-message-v1.schema.json",
+					MissingTests: []string{"backend/internal/crewmessage/schemas/crew-message-v1.schema.json"},
+					Generator:    testSweepGeneratorSyncSchemas,
+				},
+			},
+		},
+		{
 			// AC2: the work-management schema's sync-schemas case arm routes
 			// TWO mirrors (backend since #1005, cli since E54.11 / #2801);
 			// both must be named in one finding.
