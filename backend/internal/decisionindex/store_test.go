@@ -310,6 +310,81 @@ func TestStore_GapsReportsUnindexedDecisionEntries(t *testing.T) {
 	}
 }
 
+// TestStore_GapsInWindowNarrowsOnRepoAndSequence pins the digest's windowed
+// missing-row read (E75.6 / #3734): of four unindexed decision-bearing entries
+// — one below the window, one inside it, one above it (all on run A's repo)
+// and one inside it on run B's repo — ONLY the in-window, in-repo entry is
+// reported, while the unfiltered Gaps still sees all four (one query path).
+func TestStore_GapsInWindowNarrowsOnRepoAndSequence(t *testing.T) {
+	f := newChainFixture(t)
+	ctx := context.Background()
+	s := NewStore(f.pool)
+	below := f.appendEntry(t, f.runA, &f.planStageA, "approval_submitted", map[string]any{"decision": "approve"})
+	inside := f.appendEntry(t, f.runA, &f.planStageA, "concern_waived", map[string]any{})
+	other := f.appendEntry(t, f.runB, &f.planStgB, "concern_waived", map[string]any{})
+	above := f.appendEntry(t, f.runA, &f.planStageA, "concern_deferred", map[string]any{})
+
+	rep, err := s.GapsInWindow(ctx, GapFilter{Repo: "acme/widgets", FromSequence: inside.Sequence, ToSequence: other.Sequence})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.GapCount != 1 || len(rep.Gaps) != 1 || rep.Gaps[0].SourceSequence != inside.Sequence {
+		t.Errorf("windowed gaps = %d %+v, want only sequence %d (below %d, other-repo %d and above %d excluded)",
+			rep.GapCount, rep.Gaps, inside.Sequence, below.Sequence, other.Sequence, above.Sequence)
+	}
+	all, err := s.Gaps(ctx, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if all.GapCount != 4 {
+		t.Errorf("unfiltered gaps = %d, want 4", all.GapCount)
+	}
+}
+
+// TestStore_ListWindowBoundsAreInclusive pins ListFilter's From/ToSequence:
+// both bounds are inclusive, 0 leaves a side unbounded, and the zero-value
+// filter reads every row as before.
+func TestStore_ListWindowBoundsAreInclusive(t *testing.T) {
+	f := newChainFixture(t)
+	ctx := context.Background()
+	s := NewStore(f.pool)
+	for _, seq := range []int64{10, 20, 30, 40} {
+		if err := s.Upsert(ctx, sampleRow(f.runA, seq)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, tc := range []struct {
+		name     string
+		from, to int64
+		want     []int64
+	}{
+		{"unbounded", 0, 0, []int64{10, 20, 30, 40}},
+		{"inclusive window", 20, 30, []int64{20, 30}},
+		{"from only", 30, 0, []int64{30, 40}},
+		{"to only", 0, 20, []int64{10, 20}},
+	} {
+		got, err := s.List(ctx, ListFilter{Repo: "acme/widgets", FromSequence: tc.from, ToSequence: tc.to})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if g := seqsOf(got); !equalSeqs(g, tc.want) {
+			t.Errorf("%s: List = %v, want %v", tc.name, g, tc.want)
+		}
+	}
+}
+
+func equalSeqs(a, b []int64) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // TestStore_GapsSeparatesOrphanedEntries pins #3730 approval condition 6: a
 // decision-bearing entry whose run row does not exist is reported as ORPHANED,
 // not as a gap. MECHANISM: the orphan is seeded by construction next to a real

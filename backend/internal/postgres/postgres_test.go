@@ -2763,6 +2763,122 @@ func TestMigrateDown_DecisionIndexReversal(t *testing.T) {
 	}
 }
 
+// TestMigrateDown_CaptainReadWatermarksReversal pins 0089 (E75.6 / #3734):
+// after MigrateUp captain_read_watermarks exists under ENABLE + FORCE row-level
+// security with a captain_read_watermarks_tenant_isolation policy whose
+// predicates equal decision_index's 0088 policy, the COALESCE-sentinel unique
+// index collapses two untenanted rows for one (subject, repo), and
+// decision_index_repo_sequence_idx exists; after rolling back through 0089 the
+// table, policy and index are gone, the schema lands on 0088, and a
+// decision_index row (the table 0088 created) survives.
+func TestMigrateDown_CaptainReadWatermarksReversal(t *testing.T) {
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+	ctx := context.Background()
+
+	var rowSec, forceSec bool
+	if err := pool.QueryRow(ctx,
+		`SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE relname = 'captain_read_watermarks'`,
+	).Scan(&rowSec, &forceSec); err != nil {
+		t.Fatalf("query captain_read_watermarks pg_class RLS flags (0089 table missing?): %v", err)
+	}
+	if !rowSec || !forceSec {
+		t.Errorf("captain_read_watermarks relrowsecurity=%v relforcerowsecurity=%v, want true/true (0089 ENABLE + FORCE)", rowSec, forceSec)
+	}
+	policyPredicates := func(table, policy string) (qual, check string) {
+		t.Helper()
+		if err := pool.QueryRow(ctx,
+			`SELECT qual, with_check FROM pg_policies WHERE tablename = $1 AND policyname = $2`,
+			table, policy,
+		).Scan(&qual, &check); err != nil {
+			t.Fatalf("read %s.%s from pg_policies: %v", table, policy, err)
+		}
+		return qual, check
+	}
+	wQual, wCheck := policyPredicates("captain_read_watermarks", "captain_read_watermarks_tenant_isolation")
+	diQual, diCheck := policyPredicates("decision_index", "decision_index_tenant_isolation")
+	if wQual != diQual || wCheck != diCheck {
+		t.Errorf("captain_read_watermarks policy predicates drifted from decision_index's:\n USING      %q\n want       %q\n WITH CHECK %q\n want       %q",
+			wQual, diQual, wCheck, diCheck)
+	}
+	indexCount := func(name string) int {
+		t.Helper()
+		var n int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM pg_indexes WHERE indexname = $1`, name).Scan(&n); err != nil {
+			t.Fatalf("count index %s: %v", name, err)
+		}
+		return n
+	}
+	if n := indexCount("decision_index_repo_sequence_idx"); n != 1 {
+		t.Errorf("decision_index_repo_sequence_idx count after MigrateUp = %d, want 1", n)
+	}
+
+	// The NULL-account sentinel: a second untenanted row for the same
+	// (subject, repo) must collide rather than accumulate.
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO captain_read_watermarks (captain_subject, repo, sequence) VALUES ('cap', 'r', 1)`,
+	); err != nil {
+		t.Fatalf("seed watermark row: %v", err)
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO captain_read_watermarks (captain_subject, repo, sequence) VALUES ('cap', 'r', 2)`,
+	); err == nil {
+		t.Errorf("second untenanted watermark row for the same (subject, repo) was accepted, want a unique violation")
+	}
+
+	runID := uuid.New()
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, state, runner_kind)
+		 VALUES ($1, 'r', 'feature_change', 'sha', 'cli', 'running', 'local')`, runID,
+	); err != nil {
+		t.Fatalf("seed run: %v", err)
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO decision_index (source_sequence, source_entry_hash, run_id, repo, workflow_id,
+		     doctrine_version, decision_class, decided_at, reason_sequence)
+		 VALUES (1, 'h', $1, 'r', 'feature_change', 'sha', 'plan_approval', now(), 1)`, runID,
+	); err != nil {
+		t.Fatalf("seed 0088 decision_index row: %v", err)
+	}
+
+	downThrough(t, url, "0089")
+
+	var tables, policies int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'captain_read_watermarks'`,
+	).Scan(&tables); err != nil {
+		t.Fatalf("count captain_read_watermarks tables after rollback: %v", err)
+	}
+	if tables != 0 {
+		t.Errorf("captain_read_watermarks table count after rollback = %d, want 0", tables)
+	}
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM pg_policies WHERE policyname = 'captain_read_watermarks_tenant_isolation'`,
+	).Scan(&policies); err != nil {
+		t.Fatalf("count watermark policy after rollback: %v", err)
+	}
+	if policies != 0 {
+		t.Errorf("captain_read_watermarks_tenant_isolation policy count after rollback = %d, want 0", policies)
+	}
+	if n := indexCount("decision_index_repo_sequence_idx"); n != 0 {
+		t.Errorf("decision_index_repo_sequence_idx count after rollback = %d, want 0", n)
+	}
+	var survivors int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM decision_index WHERE run_id = $1`, runID).Scan(&survivors); err != nil {
+		t.Fatalf("re-read 0088 decision_index after rolling back 0089: %v", err)
+	}
+	if survivors != 1 {
+		t.Errorf("0088 decision_index rows after rolling back 0089 = %d, want 1 (untouched)", survivors)
+	}
+}
+
 // TestMigrateDown_ApprovalConditionsTruncatedUniqueReversal pins 0068 (#2622,
 // E67.25): the partial unique index
 // audit_entries_approval_conditions_truncated_once_idx must be PRESENT after
