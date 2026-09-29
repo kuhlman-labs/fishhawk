@@ -1,12 +1,32 @@
-import { Link, useParams } from 'react-router';
-import { ChevronRight } from 'lucide-react';
+import { Link, useParams, useSearchParams } from 'react-router';
 import { api } from '@/api/client';
 import { useAsync } from '@/api/use-async';
-import { describeFailure } from '@/api/types';
-import type { Run, Stage } from '@/api/types';
-import { StageStateBadge } from '@/components/stage-state-badge';
+import type { AuditEntry } from '@/api/types';
+import { EvidencePanel } from '@/run-narrative/evidence';
+import {
+  ENTRY_QUERY_PARAM,
+  decodePolicyDiff,
+  evidenceRefFor,
+  parseEntryParam,
+  type EvidenceRef,
+} from '@/run-narrative/narrative';
+import { RunNarrativeView } from '@/run-narrative/run-narrative';
+import {
+  loadRunNarrative,
+  type NarrativeClient,
+  type RunNarrative,
+} from '@/run-narrative/use-run-narrative';
 import { FollowUpLink, RelatedRunsSection, RetryBadge } from '@/runs/related-runs';
 import { RunAuditList } from './audit-list';
+
+/*
+ * Run detail (#1715): the existing header, then the gate-centric evidence
+ * narrative (plan → advisory verdicts → diff summary → acceptance →
+ * approvals → merge, then the gate timeline carrying the stage list),
+ * RelatedRunsSection, and the unchanged raw #audit list. A `?entry=N`
+ * query renders that audit entry in an evidence panel, resolved
+ * independently of the #audit list's pagination.
+ */
 
 export function RunDetail() {
   const { runId } = useParams<{ runId: string }>();
@@ -17,24 +37,57 @@ export function RunDetail() {
   return <RunDetailLoaded runId={runId} />;
 }
 
-function RunDetailLoaded({ runId }: { runId: string }) {
-  const run = useAsync(() => api.getRun(runId), [runId]);
-  const stages = useAsync(() => api.listRunStages(runId), [runId]);
-
-  if (run.status === 'loading' || stages.status === 'loading') {
-    return <div className="text-sm text-neutral-500">Loading run…</div>;
-  }
-  if (run.status === 'error') {
-    return <ErrorBox label="run" error={run.error} />;
-  }
-  if (stages.status === 'error') {
-    return <ErrorBox label="stages" error={stages.error} />;
-  }
-
-  return <RunDetailView run={run.data} stages={stages.data.items} />;
+interface RunDetailData {
+  narrative: RunNarrative;
+  /** The policy_evaluated entry the diff summary's staged column was derived from. */
+  stagedEvidence: EvidenceRef | null;
 }
 
-function RunDetailView({ run, stages }: { run: Run; stages: Stage[] }) {
+/**
+ * Load the narrative through a client that also observes the
+ * policy_evaluated category read, so the staged-scope column can link to
+ * the exact entry it came from without a second read. The selection
+ * mirrors the loader's: the newest entry whose diff decodes.
+ */
+async function loadRunDetail(runId: string): Promise<RunDetailData> {
+  const policyEntries: AuditEntry[] = [];
+  const client: NarrativeClient = {
+    getRun: (id) => api.getRun(id),
+    listRunStages: (id) => api.listRunStages(id),
+    getRunGateView: (id, params) => api.getRunGateView(id, params),
+    listStageArtifacts: (id) => api.listStageArtifacts(id),
+    getArtifact: (id) => api.getArtifact(id),
+    listRunAudit: async (id, params) => {
+      const res = await api.listRunAudit(id, params);
+      if (params?.category === 'policy_evaluated') policyEntries.push(...res.items);
+      return res;
+    },
+  };
+  const narrative = await loadRunNarrative(runId, client);
+  const newest = [...policyEntries]
+    .sort((a, b) => b.sequence - a.sequence)
+    .find((e) => decodePolicyDiff(e.payload) !== null);
+  return { narrative, stagedEvidence: newest ? evidenceRefFor(newest, runId) : null };
+}
+
+function RunDetailLoaded({ runId }: { runId: string }) {
+  const data = useAsync(() => loadRunDetail(runId), [runId]);
+
+  if (data.status === 'loading') {
+    return <div className="text-sm text-neutral-500">Loading run…</div>;
+  }
+  if (data.status === 'error') {
+    return <ErrorBox label="run" error={data.error} />;
+  }
+
+  return <RunDetailView data={data.data} />;
+}
+
+function RunDetailView({ data }: { data: RunDetailData }) {
+  const { narrative, stagedEvidence } = data;
+  const run = narrative.run;
+  const [searchParams] = useSearchParams();
+  const entrySequence = parseEntryParam(searchParams.get(ENTRY_QUERY_PARAM));
   return (
     <section className="space-y-6">
       <div>
@@ -87,57 +140,9 @@ function RunDetailView({ run, stages }: { run: Run; stages: Stage[] }) {
         </dl>
       </header>
 
-      <div className="space-y-2">
-        <h2 className="text-sm font-medium tracking-wide text-neutral-600 uppercase dark:text-neutral-400">
-          Stages
-        </h2>
-        <ol className="overflow-hidden rounded-md border border-neutral-200 dark:border-neutral-800">
-          {stages.length === 0 && (
-            <li className="px-4 py-3 text-sm text-neutral-500">No stages yet.</li>
-          )}
-          {stages.map((stage) => (
-            <li
-              key={stage.id}
-              className="border-b border-neutral-200 last:border-b-0 dark:border-neutral-800"
-            >
-              <Link
-                to={`/runs/${run.id}/stages/${stage.id}`}
-                aria-label={`Review ${stage.type} stage`}
-                className="flex items-center gap-4 px-4 py-3 hover:bg-neutral-50 focus-visible:bg-neutral-50 focus-visible:ring-1 focus-visible:ring-neutral-400 focus-visible:outline-none dark:hover:bg-neutral-900/50 dark:focus-visible:bg-neutral-900/50"
-              >
-                <span className="font-mono text-xs text-neutral-500">#{stage.sequence}</span>
-                <span className="font-mono text-sm font-medium">{stage.type}</span>
-                <span className="font-mono text-xs text-neutral-500">
-                  {stage.executor.kind}:{stage.executor.ref}
-                </span>
-                {stage.resolved_model && (
-                  <span
-                    className="font-mono text-xs text-neutral-500"
-                    title="Resolved model for this stage's agent spawn"
-                  >
-                    {stage.resolved_model}
-                  </span>
-                )}
-                <span className="ml-auto flex items-center gap-2 font-mono text-xs">
-                  {stage.state === 'failed' && stage.failure_category && (
-                    <span
-                      className="rounded bg-rose-100 px-1.5 py-0.5 text-rose-800 dark:bg-rose-900/40 dark:text-rose-300"
-                      title={describeFailure(stage.failure_category) ?? undefined}
-                    >
-                      {stage.failure_category}
-                    </span>
-                  )}
-                  {stage.state === 'awaiting_approval' && (
-                    <span className="text-amber-700 dark:text-amber-300">Review →</span>
-                  )}
-                  <StageStateBadge state={stage.state} />
-                </span>
-                <ChevronRight className="size-4 text-neutral-400" aria-hidden />
-              </Link>
-            </li>
-          ))}
-        </ol>
-      </div>
+      {entrySequence !== null && <EvidencePanel runId={run.id} sequence={entrySequence} />}
+
+      <RunNarrativeView narrative={narrative} stagedEvidence={stagedEvidence} />
 
       <RelatedRunsSection run={run} />
 
