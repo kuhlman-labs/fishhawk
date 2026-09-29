@@ -135,6 +135,12 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v0/refinement/sessions/{session_id}/file", s.handleFileRefinementSession)
 	mux.HandleFunc("POST /v0/work-items", s.handleFileWorkItem)
 	mux.HandleFunc("GET /v0/calibration", s.handleGetCalibration)
+	// Precedent query (E75.3 / #3731): account-scoped, non-run-scoped read,
+	// same posture as GET /v0/attention and GET /v0/calibration — the account
+	// narrowing and the repo-visibility DENY are inside the handler
+	// (precedent.go), because the repository is a query PARAMETER rather than a
+	// path segment a wrapper could resolve a run from.
+	mux.HandleFunc("GET /v0/precedent", s.handleGetPrecedent)
 	// Repo dashboard rollups (E40.3 / #1714): read-only, same posture as
 	// GET /v0/calibration; repo visibility is enforced inside each handler
 	// (repoDashPrelude -> repoVisibleOr403), point-read DENY.

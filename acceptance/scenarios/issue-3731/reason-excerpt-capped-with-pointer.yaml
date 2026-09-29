@@ -1,0 +1,13 @@
+id: scenario:issue-3731/reason-excerpt-capped-with-pointer
+statement: Each precedent result carries reason_sequence and reason_key plus a reason excerpt read from the cited entry, capped and marked when cut; an unreadable cited entry yields no excerpt and a named degradation rather than an error.
+steps: 'Posture B (sanctioned checkout 76cb6806): go test ./internal/server -run ''TestPrecedent_ReasonExcerptCapped|TestPrecedent_UnreadableReasonEntryDegrades|TestPrecedent_MissingReasonEntryOrKeyDegrades|TestPrecedent_NilAuditRepoDegrades|TestPrecedent_ChainReadOncePerDistinctRun'' -v. It could not be observed live because the index is empty.'
+assertions:
+    expected: The excerpt is capped and marked when cut, and an unreadable entry yields no excerpt plus a named degradation.
+    observed_at_record: All five tests passed.
+    repro_handle: cd backend && go test ./internal/server -run 'TestPrecedent_ReasonExcerpt|Degrades' -v
+origin:
+    issue: 3731
+    pr: 3846
+    run_id: 99552e1e-9bf6-42b0-ae70-cb32562b9f60
+    head_sha: 76cb68069de0884cb91dc1e998fe822ffaa7b1eb
+    recorded_at: 2026-09-29T05:16:17Z

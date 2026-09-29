@@ -511,6 +511,14 @@ type fakeBackend struct {
 	calibrationStatus    int
 	lastCalibrationQuery string
 
+	// Precedent fixtures: GET /v0/precedent (E75.3 / #3731).
+	// precedentResp drives the response body, precedentStatus the HTTP status
+	// (default 200), and lastPrecedentQuery records the raw query string so a
+	// test can assert the repeatable paths / escalation_keys encoding.
+	precedentResp      PrecedentResult
+	precedentStatus    int
+	lastPrecedentQuery string
+
 	// Budget fixtures: GET /v0/runs/{run_id}/budget (#693).
 	// budgetByRun seeds the status per run; an unseeded run returns the
 	// empty object {} — mirroring the backend's no-budget 200.
@@ -732,6 +740,7 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		approvalsStatus:               http.StatusOK,
 		approvalsCalledByID:           map[uuid.UUID]int{},
 		calibrationStatus:             http.StatusOK,
+		precedentStatus:               http.StatusOK,
 		budgetByRun:                   map[uuid.UUID]BudgetStatus{},
 		budgetStatus:                  http.StatusOK,
 		budgetCalledByID:              map[uuid.UUID]int{},
@@ -1955,6 +1964,16 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		fb.lastCalibrationQuery = r.URL.RawQuery
 		status := fb.calibrationStatus
 		resp := fb.calibrationResp
+		fb.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_ = json.NewEncoder(w).Encode(resp)
+	})
+	mux.HandleFunc("GET /v0/precedent", func(w http.ResponseWriter, r *http.Request) {
+		fb.mu.Lock()
+		fb.lastPrecedentQuery = r.URL.RawQuery
+		status := fb.precedentStatus
+		resp := fb.precedentResp
 		fb.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
@@ -3276,7 +3295,14 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	// DATA at 200 instead of as a campaign_dangling_dependency refusal, so a
 	// dependency-closed item set is assembled by iterating rather than by hand —
 	// taking the total 57 -> 58.
-	const wantToolCount = 58
+	// E75.3 (#3731) adds exactly ONE tool — fishhawk_precedent, the ADR-082
+	// (#3728) decision (b) precedent query: WHEN an agent or operator is about
+	// to make a gate decision, it returns prior decisions of the SAME class
+	// from the SAME repository, ranked with an explained score and each citing
+	// its audit-chain entry. ELIGIBILITY is any authenticated caller, because
+	// it is read-only, mints no audit entry and grants no authority — taking
+	// the total 58 -> 59.
+	const wantToolCount = 59
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",

@@ -1,0 +1,15 @@
+id: scenario:issue-3731/precedent-rejects-unknown-class-and-missing-repo
+statement: A request omitting the repository, or naming a decision class outside the closed nine-member set, is refused with 400 and an error naming the offending parameter and the accepted values.
+verify_hint: 'HTTP: GET /v0/precedent without repo returns 400; GET /v0/precedent?repo=<r>&decision_class=not_a_class returns 400 with a body naming the accepted class values.'
+steps: GET /v0/precedent?decision_class=plan_approval (no repo); GET /v0/precedent?repo=kuhlman-labs/fishhawk&decision_class=not_a_class; GET /v0/precedent?repo=kuhlman-labs/fishhawk (no class).
+steps_carried_from: head 72963ca60b47e4c1a07d430ff94b673eb572f029 recorded_at 2026-09-29T03:56:10Z
+assertions:
+    expected: 400 naming the offending parameter and the accepted values.
+    observed_at_record: All three returned 400 validation_failed. The missing repo named field repo ('supply it directly, or a run_id whose run resolves one'). The unknown or absent class named field decision_class with accepted = the 9 classes and got echoed.
+    repro_handle: curl 'http://localhost:8090/v0/precedent?repo=kuhlman-labs/fishhawk&decision_class=not_a_class'
+origin:
+    issue: 3731
+    pr: 3846
+    run_id: 99552e1e-9bf6-42b0-ae70-cb32562b9f60
+    head_sha: 76cb68069de0884cb91dc1e998fe822ffaa7b1eb
+    recorded_at: 2026-09-29T05:16:17Z

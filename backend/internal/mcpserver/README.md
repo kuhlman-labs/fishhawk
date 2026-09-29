@@ -1939,6 +1939,68 @@ A1 points at the **REST** walk, never back at `fishhawk_list_audit`: re-calling 
 
 **THE CURSOR RULE.** The backend's `next_cursor` is positioned after the **FULL** page it fetched. Returning it alongside a **truncated** item list would make an operator paging by cursor **silently SKIP** every dropped entry — a data-loss bug strictly worse than the hard failure this bound fixes. So the moment any item is dropped, `next_cursor` is **BLANKED** and the `since_sequence` anchor becomes the sole continuation path. **Do not "restore" the cursor** on a later refactor: it is cleared because it is WRONG, not because it is redundant. `TestBoundListAudit_BlanksCursorOnTruncation` asserts the resulting STATE (no cursor after truncation), because an error-identity assertion cannot distinguish a cursor that was cleared from one that was never set.
 
+### The `fishhawk_precedent` ladder (E75.3 / [#3731](https://github.com/kuhlman-labs/fishhawk/issues/3731))
+
+`fishhawk_precedent` wraps `GET /v0/precedent`: prior decisions of one class in
+one repository, each carrying matched keys, a score breakdown and a reason
+excerpt. A 50-item set at the excerpt cap is ~20 KiB before the matched-key
+lists, so the surface is bounded. Tool contract: `precedent.go`; scoring:
+`backend/internal/precedent/README.md`.
+
+| Tier | Target | Class | Surface |
+|---|---|---|---|
+| B1 | every `results[].reason_excerpt`, plus the per-signal `results[].score` breakdown (`score.total` retained) | stored (excerpts) + computed (the breakdown) | `GET /v0/precedent` / none |
+| B2 | items dropped from the **TAIL** — the list is score-DESCENDING, so the dropped set is the WEAKEST precedent and the retained prefix is the answer's substance | stored | `GET /v0/precedent` |
+| floor | a length-and-byte-capped `summary` + a length-and-byte-capped `resolved_context`, `results` **entirely** elided, `truncated` set. The fit is MEASURED: the list cap halves (8 → 0) until the rendered floor fits | stored (aggregate) | `GET /v0/precedent` |
+
+B1 keeps each item's **matched keys**: they are what explains why an item is
+there at all, so dropping them would leave a list of citations with no argument.
+The score BREAKDOWN is `computed` and carries no pointer — it is derived at query
+time from the ranking context and stored nowhere, so recomputation is not
+retrieval; `score.total` stays because it is the ordering the response is
+asserting.
+
+**Why the floor keeps the summary and not one item.** Unlike `fishhawk_list_audit`
+(whose floor keeps one entry because it is the hash-chain verifier surface), the
+part of a precedent response that describes the WHOLE result set is the agreement
+summary — count, human vs delegated, modal outcome and its share, doctrine
+versions spanned. One arbitrary item is strictly less useful than "there are 37
+prior decisions here and 92% of them went the same way, go read them at
+`GET /v0/precedent`". Keeping the summary is also what makes the bound hold when
+ONE result plus the summary exceeds the budget, which B2 cannot reach.
+
+**The floor caps the resolved context AND the summary, independently of the
+backend** (#3731 binding condition 2). The backend already caps its echo at 20
+entries per list, but the floor's bound must not DEPEND on that:
+`capPrecedentResolvedContext` caps each list to `precedentFloorListCap` and each
+retained element and scalar via `capJSONString(…, floorFieldCap)`, preserving the
+untruncated totals, and `capPrecedentSummary` does the same to the two
+index-derived STRINGS the retained summary carries — `modal_outcome` (an outcome
+value read out of an audit payload) and `doctrine_versions` (a set with one entry
+per distinct charter revision the scored rows span, so unbounded in cardinality).
+The summary's counts and ratio are never capped: they are what it is for, and they
+cost a bounded number of bytes.
+
+**The floor's fit is MEASURED, not inferred from those caps.** The caps alone
+cannot carry the guarantee — the floor retains three capped lists, seven capped
+scalars and the aggregate elision prose, and at the backend echo's own cap of 20
+the worst case measures ~7.2 KB, past the 4 KiB convergence floor with every
+individual cap still "correct"; worse, that sum moves whenever the prose is
+edited or one more field is retained, so a hand-tuned constant would silently
+stop holding. So `precedentFloor` BUILDS a candidate, MEASURES it, and rebuilds
+with the list cap HALVED until it fits (`precedentFloorListCap` = 8, then
+4 → 2 → 1 → 0), re-rendering the elision prose with the cap it ACTUALLY applied
+and preserving the reported totals and truncation marks at every step. It
+converges by construction: at cap 0 the floor is the capped scalars plus the
+prose. Three tests pin it —
+`TestPrecedentTool_FloorIsBoundedByA10000PathResolvedContext` (10,000 paths AND
+10,000 escalation keys from a backend that did not cap, asserting EXACTLY
+`precedentFloorListCap` entries retained),
+`TestPrecedentTool_FloorIsBoundedByAnOversizedSummary` (a 4 KB modal outcome,
+500 oversized doctrine versions and both oversized context lists at once), and
+`TestPrecedentTool_FloorFitsWithNoListsAtAll` (the cap-0 terminal step, with
+every scalar oversized).
+
 ### The shared run-row ladder (#2510)
 
 Any run row embedding `issue_context` can exceed the limit alone (run `143aea12` = **79,131 bytes**), and several of these verbs are **MUTATING**: a real `fishhawk_cancel_run` failed at **110,397 chars** *after* the server-side cancel had already succeeded, and `fishhawk_start_campaign_item_run` broke at **75,963 chars** with the run already minted. The bound is what decouples a mutating verb's success signal from whether its body fits.
