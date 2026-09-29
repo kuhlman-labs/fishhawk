@@ -30,6 +30,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auth"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/digest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge/stub"
@@ -795,6 +796,16 @@ type Config struct {
 	// structurally by *refinement.Drafter; nil in a deployment with no local
 	// claude adapter configured.
 	RefinementDrafter RefinementDrafter
+
+	// DigestStore reads the chain for the "since you last looked" digest and
+	// persists per-captain read watermarks (E75.6 / #3734, migration 0089).
+	// DigestIndex is the decision_index read surface the digest's merges and
+	// waivers_and_deferrals sections and its unindexed-decision gaps come from.
+	// Both are wired from serve.go next to decisionindex.NewStore(pool); either
+	// nil degrades GET /v0/digest and POST /v0/digest/mark-read to 501
+	// digest_unconfigured rather than panicking.
+	DigestStore *digest.Store
+	DigestIndex digest.IndexReader
 
 	// ModelOracle is the snapshot seam the model-id validity layer (#1339)
 	// queries to decide whether a model named in a workflow spec is a real,

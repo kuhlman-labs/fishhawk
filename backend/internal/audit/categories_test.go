@@ -520,3 +520,14 @@ func TestKnownCategoriesIncludesPushNotificationCategories(t *testing.T) {
 		}
 	}
 }
+
+// TestKnownCategories_DigestMarkedRead pins the E75.6 / #3734 category:
+// POST /v0/digest/mark-read (server/digest.go) appends one digest_marked_read
+// GLOBAL-chain entry BEFORE advancing a captain's read watermark. Unregistered,
+// categories_completeness_test.go's AST sweep fails the build on the emit site
+// and an operator could not arm fishhawk_await_audit on the mark.
+func TestKnownCategories_DigestMarkedRead(t *testing.T) {
+	if !IsKnownCategory("digest_marked_read") {
+		t.Fatal("digest_marked_read is not in KnownCategories; register it in categories.go")
+	}
+}

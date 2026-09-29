@@ -5647,3 +5647,31 @@ ONE chained system-actor entry per sweep: `trigger` (`pr_merged` | `cancelled`),
 
 - **No terminal-FAILURE sweep.** `POST /v0/runs/{run_id}/revive` re-admits a failed run and resumes on exactly these branches, so `sweepRunBranches` returns early on `run.StateFailed`. The failed-run sweep is deferred to #3678.
 - **No retroactive sweep** of refs that predate this change.
+
+## "Since you last looked" digest (`digest.go`, E75.6 / [#3734](https://github.com/kuhlman-labs/fishhawk/issues/3734))
+
+The REST surface over `backend/internal/digest` (ADR-082 #3728 rule 7). The computation, sections, gap kinds, the parking-entry and paired-`answered` mappings and the bound are that package's contract (`backend/internal/digest/README.md`); this section is the HANDLER contract.
+
+### `GET /v0/digest?repo=&section=&from_sequence=&to_sequence=`
+
+- **Auth.** `requireWriteScope(read:audit)` — the digest is a projection of the chain, so it takes the chain's read scope (the gate-view precedent, `scopeGateViewRead`); 401 anonymous, 403 `insufficient_scope` on a token without it; cookie sessions are not scope-checked. The watermark is keyed by `IdentityFrom(ctx).Subject` + repo + `identityAccountID(ctx)`, so two captains' digests are independent (`TestWatermark_TwoCaptainsAreIndependent` asserts B's body is byte-identical across A's mark).
+- **Request shape, before any read.** `repo` required; `section` through `digest.ParseSection` (the four content sections + `gaps`); both sequences non-negative integers. Each refusal is 400 `validation_failed` with `details.field` naming the parameter — the field is what distinguishes the handler guard from `digest.Build`'s own validation, which answers 400 without one.
+- **Repo visibility.** `enforceRepoVisibility` → 403 `repo_forbidden` / 503 `service_unavailable` (the #2071 point-read deny), after the shape checks and before any query.
+- **Never writes.** `digest.Build` then `digest.Bound(d, digest.DefaultByteBudget)` — the ONE bound the `fishhawk_digest` MCP tool also applies. No watermark move and no audit entry, however many times it is called (`TestGetDigest_DoesNotAdvanceWatermark`).
+- **Errors.** `*digest.BeyondChainHeadError` → 400 `to_sequence_beyond_chain_head` with `details.requested` + `details.chain_head`; `digest.ErrInvalidRequest` → 400 `validation_failed`; anything else (a read failure, `digest.ErrBudgetTooSmall`) → 500 `internal_error`.
+
+### `POST /v0/digest/mark-read` `{"repo","to_sequence"}`
+
+- **Auth.** `requireWriteScope(write:approvals)` — the EXISTING scope (no new one, the E34.2 / #1595 precedent), so the auth-change impact inventory is empty by construction. Pinned by `TestMarkRead_AuthenticatedWithoutScopeIs403` (a token whose scopes are exactly `[read:runs]`) and `TestMarkRead_AnonymousIs401`; neither writes a row or an entry.
+- **Body.** Strict decode (`DisallowUnknownFields`, 4 KiB `MaxBytesReader`); `repo` required and `to_sequence` positive, each a 400 naming its field.
+- **Ordering is the package's.** `digest.Store.MarkRead` resolves the watermark (at-or-below → 200 `advanced: false`, NOTHING appended), refuses a `to_sequence` above the repo's chain head (400 naming it), appends through the injected appender, and upserts ONLY after the append succeeds. This file supplies the appender: `appendDigestMarkedRead` writes one `digest_marked_read` entry via `AuditRepo.AppendGlobalChained` — the GLOBAL chain, partitioned by the caller's account, actor `user` + the captain's subject, payload `repo` / `captain_subject` / `previous_sequence` / `had_previous` / `to_sequence`. An append failure answers 500 with the watermark unmoved (`TestMarkRead_AppendFailureLeavesWatermarkUnmoved` reads the stored row after the call).
+- **Not repo-visibility filtered.** Writes are never decided by the non-authoritative forge-visibility mirror (#2071); the mark moves only the caller's own watermark.
+- **Not an issue-comment surface.** `digest_marked_read` belongs to no run, so it is deliberately absent from `issuecomment`'s `activityCategories` and from `docs/issue-comment-surfaces.md`.
+
+### Wiring and degradation
+
+`Config.DigestStore` (`*digest.Store`) and `Config.DigestIndex` (`digest.IndexReader`, satisfied by `*decisionindex.Store`) are wired in `backend/cmd/fishhawkd/serve.go` on the pool, beside the audit repository whose decorator projects into the same `decision_index`. Either nil — a DB-less boot — degrades BOTH routes to 501 `digest_unconfigured`; mark-read additionally requires `AuditRepo`. The message names each missing collaborator (`digest_store`, `decision_index`, `audit_repository`) because `writeError` redacts non-allow-listed 5xx detail keys.
+
+### Tests
+
+`digest_test.go` (no DB): route registration, both 501s, anonymous GET, every request-shape guard, and `TestOpenAPI_DigestRoutesDocumented`. `digest_pg_test.go` (pgtest, the production audit wiring — the Postgres repository wrapped by `decisionindex.NewIndexingRepository`): `TestDigestEndToEnd_WatermarkRoundTrip` (a merged run + a waived concern surface citing real chain entries; mark-read lands `digest_marked_read` on the global chain; the re-read drops the read items), plus one test per handler-visible failure mode (beyond-head on both routes, at-or-below no-op by ENTRY COUNT, append failure by stored state, 401/403, captain independence, section selector + bound).
