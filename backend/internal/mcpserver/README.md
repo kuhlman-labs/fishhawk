@@ -38,9 +38,9 @@ consumes only the first two):
   `initialize` handshake, the public alias of the package-private
   `onboardingInstructions`.
 
-## Exported surface: why 304 identifiers, not 3
+## Exported surface: why 314 identifiers, not 3
 
-The package presents **304** exported top-level identifiers, but only the three
+The package presents **314** exported top-level identifiers, but only the three
 above are intended entry points. The other 301 are the tool I/O
 request/response structs. The MCP SDK's jsonschema reflection requires each
 tool's input/output type — and its exported fields — to build the tool's
@@ -1938,6 +1938,52 @@ The differential test (`TestJSONEncodedLen_MatchesEncoder_Differential`) is the 
 A1 points at the **REST** walk, never back at `fishhawk_list_audit`: re-calling the now-bounded tool would cap the same value again — the circularity `validateWireElisions` exists to catch. `entry_hash` / `prev_hash` are **retained at every tier including the floor**: this is the hash-chain **verifier** surface (see `AuditEntry.EntryHash`'s comment), and dropping the chain to save bytes would break verification rather than shrink it.
 
 **THE CURSOR RULE.** The backend's `next_cursor` is positioned after the **FULL** page it fetched. Returning it alongside a **truncated** item list would make an operator paging by cursor **silently SKIP** every dropped entry — a data-loss bug strictly worse than the hard failure this bound fixes. So the moment any item is dropped, `next_cursor` is **BLANKED** and the `since_sequence` anchor becomes the sole continuation path. **Do not "restore" the cursor** on a later refactor: it is cleared because it is WRONG, not because it is redundant. `TestBoundListAudit_BlanksCursorOnTruncation` asserts the resulting STATE (no cursor after truncation), because an error-identity assertion cannot distinguish a cursor that was cleared from one that was never set.
+
+### The `fishhawk_delegation` ladder (E76.1 / [#3747](https://github.com/kuhlman-labs/fishhawk/issues/3747))
+
+`fishhawk_delegation` wraps `GET /v0/repos/{owner}/{name}/delegation`: per
+workflow, the resolved autonomy matrix with per-class provenance, the pageable
+event set, the model policy, and each escalation's match criteria plus the matrix
+its ceiling would produce. Read-only — it writes nothing, records no audit entry,
+and grants NO authority. A spec declaring many workflows, each with several
+escalations over long glob lists, is comfortably past the budget, so the surface
+is bounded. Tool contract: `delegation_view.go`; projection:
+`backend/internal/delegationview/README.md`.
+
+| Tier | Target | Class | Surface |
+|---|---|---|---|
+| B1 | every `escalations[].ceiling_matrix`, plus each `escalations[].match` list capped to `delegationFloorListCap` (8) | computed (the ceiling matrix) + stored (the match lists) | none / `GET /v0/repos/{owner}/{name}/delegation` |
+| B2 | workflows dropped from the **TAIL** of the id-ordered list | stored | `GET /v0/repos/{owner}/{name}/delegation` |
+| floor | per workflow only `id` + `autonomy` + `content_hash`, with `matrix`, `must_page_human`, `model_policy` and `escalations` elided under ONE aggregate entry. The fit is MEASURED: the retained workflow count halves until the rendered floor fits | stored (aggregate) | `GET /v0/repos/{owner}/{name}/delegation` |
+
+**`ceiling_matrix` is `computed` and carries NO pointer.** It is derived at read
+time by clamping the workflow matrix with the escalation's ceiling and is stored
+nowhere, so recomputation is not retrieval — the distinction
+`validateWireElisions` enforces. `max_autonomy` is deliberately RETAINED at B1:
+WHICH ceiling applies is a one-token fact, and dropping it alongside the matrix
+would leave an escalation that visibly restricts something without saying what.
+
+**B2's drop is positional, and the prose says so.** Unlike
+`fishhawk_precedent`'s score-descending list, the workflow list is id-ASCENDING
+— there is no relevance order to drop from the weak end of — so the elision
+names the `workflow` parameter and the REST surface as the way to reach a
+specific one rather than implying the retained prefix is the substance.
+
+**Why the floor keeps `content_hash`.** Per-workflow the floor is three capped
+scalars, and the hash is the one that keeps the response USEFUL after everything
+else is gone: a later re-confirmation (ADR-083) binds to it, so a floored read
+still lets a caller record exactly what was projected and fetch the detail over
+REST. The view-level `content_hash` is retained unchanged and still covers the
+unfiltered projected set. `autonomy` stays because one token says roughly how
+much is delegated; the per-class modes and their provenance do not survive.
+
+**The floor's fit is MEASURED, not inferred from the per-workflow size.** Three
+capped scalars per workflow is a constant-size ENTRY, but the number of ENTRIES
+is a function of the spec, so a spec with hundreds of workflows would put even
+the stripped list over the budget. `delegationFloor` therefore builds, measures,
+and rebuilds with the retained count HALVED until it fits, converging at zero
+retained workflows (the view's scalars plus the aggregate prose). The prose names
+the count ACTUALLY retained, not the starting one.
 
 ### The `fishhawk_precedent` ladder (E75.3 / [#3731](https://github.com/kuhlman-labs/fishhawk/issues/3731))
 

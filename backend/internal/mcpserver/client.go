@@ -15,6 +15,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/delegationview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/digest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/precedent"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
@@ -5325,6 +5326,51 @@ func (c *apiClient) GetPrecedent(ctx context.Context, p PrecedentParams) (*Prece
 		path = path + "?" + encoded
 	}
 	var res PrecedentResult
+	if err := c.do(ctx, http.MethodGet, path, nil, &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
+// RepoDelegationParams are the query inputs for GET
+// /v0/repos/{owner}/{name}/delegation (E76.1 / #3747).
+type RepoDelegationParams struct {
+	// Repo is owner/name; it forms the PATH, not a query parameter.
+	Repo string
+	// Ref is the git ref to read the spec at under Source "ref". Empty means
+	// the repository's default branch head.
+	Ref string
+	// Source is "ref" (default) or "run_cache"; empty sends no parameter and
+	// takes the backend's default.
+	Source string
+	// Workflow narrows the response to one workflow id.
+	Workflow string
+}
+
+// RepoDelegationResult mirrors the delegation read's body. It IS the pure
+// projection type — the same struct the backend marshals — so the two sides
+// cannot drift into two json-tag sets.
+type RepoDelegationResult = delegationview.View
+
+// GetRepoDelegation calls GET /v0/repos/{owner}/{name}/delegation: the resolved
+// autonomy matrix and escalation ceilings for each workflow a repository's spec
+// declares, read at a ref, without a run.
+func (c *apiClient) GetRepoDelegation(ctx context.Context, p RepoDelegationParams) (*RepoDelegationResult, error) {
+	owner, name, ok := strings.Cut(p.Repo, "/")
+	if !ok || owner == "" || name == "" {
+		return nil, fmt.Errorf("repo must be owner/name, got %q", p.Repo)
+	}
+	q := url.Values{}
+	for k, v := range map[string]string{"ref": p.Ref, "source": p.Source, "workflow": p.Workflow} {
+		if v != "" {
+			q.Set(k, v)
+		}
+	}
+	path := "/v0/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(name) + "/delegation"
+	if encoded := q.Encode(); encoded != "" {
+		path = path + "?" + encoded
+	}
+	var res RepoDelegationResult
 	if err := c.do(ctx, http.MethodGet, path, nil, &res); err != nil {
 		return nil, err
 	}

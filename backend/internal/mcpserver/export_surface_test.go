@@ -17,7 +17,7 @@ import (
 // FuncDecls, TypeSpecs and ValueSpecs), not transcribed, so a drift between
 // an estimate and reality would surface as a test written from the tree.
 //
-// The bulk of these 304 names are tool I/O request/response structs. The MCP
+// The bulk of these 314 names are tool I/O request/response structs. The MCP
 // SDK's jsonschema reflection requires each tool's input/output type — and
 // its fields — to be EXPORTED to build the tool's schema, so unexporting them
 // would break tool registration. In `package main` their exportedness was
@@ -125,6 +125,12 @@ var exportBaseline = []string{
 	"DeferFiledIssue",
 	"DeferredConcern",
 	"DeferredConcernResult",
+	// E76.1 / #3747: the fishhawk_delegation tool I/O plus the client mirrors of
+	// GET /v0/repos/{owner}/{name}/delegation. Exported for the SDK's jsonschema
+	// reflection like every other tool DTO; DelegationOutput embeds
+	// delegationview.View, whose whole type tree the SDK reflects.
+	"DelegationInput",
+	"DelegationOutput",
 	"DiagnosticBundle",
 	"DiagnosticComponent",
 	"DiagnosticFailingStage",
@@ -329,6 +335,12 @@ var exportBaseline = []string{
 	"ReleaseNotesPersistResult",
 	"ReportProductIssueInput",
 	"ReportProductIssueOutput",
+	// E76.1 / #3747: the client mirrors of GET
+	// /v0/repos/{owner}/{name}/delegation. RepoDelegationResult is an ALIAS of
+	// delegationview.View — the backend's own projection type — so the two sides
+	// cannot drift into two json-tag sets.
+	"RepoDelegationParams",
+	"RepoDelegationResult",
 	// E64.23 / #3125: the fishhawk_rebase_run_branch surface. All three MUST
 	// be exported — the MCP SDK reflects over the tool input/output structs to
 	// build the wire schemas, so unexported types are not an option.

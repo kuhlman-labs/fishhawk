@@ -519,6 +519,15 @@ type fakeBackend struct {
 	precedentStatus    int
 	lastPrecedentQuery string
 
+	// Delegation fixtures: GET /v0/repos/{owner}/{name}/delegation
+	// (E76.1 / #3747). delegationResp drives the response body,
+	// delegationStatus the HTTP status (default 200), and lastDelegationPath
+	// records the raw path+query so a test can assert the repo went into the
+	// PATH and ref/source/workflow onto the query string.
+	delegationResp     RepoDelegationResult
+	delegationStatus   int
+	lastDelegationPath string
+
 	// Budget fixtures: GET /v0/runs/{run_id}/budget (#693).
 	// budgetByRun seeds the status per run; an unseeded run returns the
 	// empty object {} — mirroring the backend's no-budget 200.
@@ -669,6 +678,7 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 	t.Helper()
 	fb := &fakeBackend{
 		listStatus:                    http.StatusOK,
+		delegationStatus:              http.StatusOK,
 		getStatus:                     http.StatusOK,
 		stagesStatus:                  http.StatusOK,
 		artifactsStatus:               http.StatusOK,
@@ -1974,6 +1984,16 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		fb.lastPrecedentQuery = r.URL.RawQuery
 		status := fb.precedentStatus
 		resp := fb.precedentResp
+		fb.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_ = json.NewEncoder(w).Encode(resp)
+	})
+	mux.HandleFunc("GET /v0/repos/{owner}/{name}/delegation", func(w http.ResponseWriter, r *http.Request) {
+		fb.mu.Lock()
+		fb.lastDelegationPath = r.URL.RequestURI()
+		status := fb.delegationStatus
+		resp := fb.delegationResp
 		fb.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
@@ -3312,8 +3332,8 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	// E76.2 (#3765) adds exactly ONE tool — fishhawk_captain, the thin wrapper
 	// over GET /v0/captain and the five POST /v0/captain/{offer,withdraw,
 	// accept,relinquish,claim} verbs (the ADR-083 captain record, agents
-	// structurally refused by the backend) — taking the total 60 -> 61.
-	const wantToolCount = 61
+	// structurally refused by the backend) — taking the total 61 -> 62 (E76.1 #3747 landed first and took it 60 -> 61).
+	const wantToolCount = 62
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",

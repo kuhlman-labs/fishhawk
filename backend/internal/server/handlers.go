@@ -160,6 +160,11 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v0/repos/{owner}/{name}/health", s.handleGetRepoHealth)
 	mux.HandleFunc("GET /v0/repos/{owner}/{name}/economics", s.handleGetRepoEconomics)
 	mux.HandleFunc("GET /v0/repos/{owner}/{name}/posture", s.handleGetRepoPosture)
+	// Per-workflow delegation read (E76.1 / #3747): the resolved autonomy
+	// matrix and escalation ceilings for each workflow, from the spec at a ref,
+	// without a run. Same posture as the rollups above — repoDashPrelude owns
+	// the visibility DENY (delegation_view.go).
+	mux.HandleFunc("GET /v0/repos/{owner}/{name}/delegation", s.handleGetRepoDelegation)
 	mux.HandleFunc("GET /v0/acceptance-triage/stats", s.handleGetAcceptanceTriageStats)
 	// Dev-only seeded-fixture surface (E72.2 / #3326): registered ONLY
 	// when a DevFixtures applier is configured, so a production server

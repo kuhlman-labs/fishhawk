@@ -3711,3 +3711,114 @@ func TestCaptainClient_SurfacesAPIError(t *testing.T) {
 		}
 	}
 }
+
+// TestGetRepoDelegation_EncodesParamsAndDecodesBody pins the apiClient half of
+// the E76.1 / #3747 wire contract against a real HTTP server: the repo goes into
+// the PATH (never a query parameter), ref / source / workflow onto the query
+// string, an empty value sends NO parameter (so the backend applies its own
+// default rather than seeing an explicit empty one), and the projection decodes
+// with its provenance, page list and escalation ceiling intact.
+func TestGetRepoDelegation_EncodesParamsAndDecodesBody(t *testing.T) {
+	var gotMethod, gotPath string
+	var gotQuery url.Values
+	c := releaseTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		gotMethod, gotPath = r.Method, r.URL.Path
+		gotQuery = r.URL.Query()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{
+			"repo":"acme/widgets","source":"ref","ref":"main","workflow_sha":"blobsha",
+			"spec_version":"2","schema_major":2,"content_hash":"viewhash",
+			"workflows":[{"id":"feature_change","autonomy":"high",
+				"matrix":[{"action":"merge","mode":"auto","condition":"gates_resolved_ci_green","source":"tier"}],
+				"must_page_human":["plan_rejection"],
+				"model_policy":{"strategy":"explicit_defaults","defaults":{"plan":"m1"},"allowed":["m1"]},
+				"escalations":[{"match":{"paths":["backend/**"],"trigger":["diff"]},
+					"max_autonomy":"medium","approvals":{"count":2,"member_of":"g","min_permission":"maintain"},
+					"ceiling_matrix":[{"action":"merge","mode":"gated","source":"escalation"}]}],
+				"content_hash":"wfhash"}]}`)
+	})
+
+	res, err := c.GetRepoDelegation(context.Background(), RepoDelegationParams{
+		Repo: "acme/widgets", Ref: "main", Source: "ref", Workflow: "",
+	})
+	if err != nil {
+		t.Fatalf("GetRepoDelegation: %v", err)
+	}
+	if gotMethod != http.MethodGet || gotPath != "/v0/repos/acme/widgets/delegation" {
+		t.Errorf("request = %s %s, want GET /v0/repos/acme/widgets/delegation", gotMethod, gotPath)
+	}
+	if gotQuery.Get("ref") != "main" || gotQuery.Get("source") != "ref" {
+		t.Errorf("query = %v, want ref=main source=ref", gotQuery)
+	}
+	if _, present := gotQuery["workflow"]; present {
+		t.Errorf("an empty workflow sent a parameter anyway: %v", gotQuery)
+	}
+	if _, present := gotQuery["repo"]; present {
+		t.Errorf("repo leaked onto the query string: %v", gotQuery)
+	}
+
+	if res.Repo != "acme/widgets" || res.Source != "ref" || res.Ref != "main" ||
+		res.WorkflowSHA != "blobsha" || res.SpecVersion != "2" || res.SchemaMajor != 2 ||
+		res.ContentHash != "viewhash" {
+		t.Errorf("envelope lost in the decode: %+v", res)
+	}
+	if len(res.Workflows) != 1 {
+		t.Fatalf("workflows = %d, want 1", len(res.Workflows))
+	}
+	wf := res.Workflows[0]
+	if wf.ID != "feature_change" || wf.Autonomy != "high" || wf.ContentHash != "wfhash" {
+		t.Errorf("workflow scalars lost: %+v", wf)
+	}
+	if len(wf.Matrix) != 1 || wf.Matrix[0].Action != "merge" || wf.Matrix[0].Mode != "auto" ||
+		wf.Matrix[0].Condition != "gates_resolved_ci_green" || wf.Matrix[0].Source != "tier" {
+		t.Errorf("matrix lost its mode/condition/provenance: %+v", wf.Matrix)
+	}
+	if len(wf.MustPageHuman) != 1 || wf.MustPageHuman[0] != "plan_rejection" {
+		t.Errorf("must_page_human = %v", wf.MustPageHuman)
+	}
+	if wf.ModelPolicy == nil || wf.ModelPolicy.Strategy != "explicit_defaults" ||
+		wf.ModelPolicy.Defaults == nil || wf.ModelPolicy.Defaults.Plan != "m1" {
+		t.Errorf("model_policy lost in the decode: %+v", wf.ModelPolicy)
+	}
+	if len(wf.Escalations) != 1 {
+		t.Fatalf("escalations = %d, want 1", len(wf.Escalations))
+	}
+	e := wf.Escalations[0]
+	if len(e.Match.Paths) != 1 || e.Match.Paths[0] != "backend/**" ||
+		len(e.Match.Trigger) != 1 || e.Match.Trigger[0] != "diff" {
+		t.Errorf("escalation match lost: %+v", e.Match)
+	}
+	if e.MaxAutonomy != "medium" {
+		t.Errorf("max_autonomy = %q", e.MaxAutonomy)
+	}
+	if e.Approvals == nil || e.Approvals.Count == nil || *e.Approvals.Count != 2 ||
+		e.Approvals.MemberOf != "g" || e.Approvals.MinPermission != "maintain" {
+		t.Errorf("escalated approvals lost: %+v", e.Approvals)
+	}
+	if len(e.CeilingMatrix) != 1 || e.CeilingMatrix[0].Mode != "gated" ||
+		e.CeilingMatrix[0].Source != "escalation" {
+		t.Errorf("ceiling_matrix lost: %+v", e.CeilingMatrix)
+	}
+}
+
+// TestGetRepoDelegation_MalformedRepoIsRefusedBeforeTheCall: the repo forms the
+// PATH, so a value that is not owner/name is refused CLIENT-SIDE rather than
+// producing a request against a nonsense path. The handler is wired to a
+// reachable in-test server that would answer 200, so a deleted check surfaces as
+// a nil error rather than as a connection failure.
+func TestGetRepoDelegation_MalformedRepoIsRefusedBeforeTheCall(t *testing.T) {
+	calls := 0
+	c := releaseTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"repo":"x/y","source":"ref","schema_major":2,"content_hash":"h","workflows":[]}`)
+	})
+	for _, bad := range []string{"", "acme", "/widgets", "acme/"} {
+		if _, err := c.GetRepoDelegation(context.Background(), RepoDelegationParams{Repo: bad}); err == nil {
+			t.Errorf("repo %q was accepted", bad)
+		}
+	}
+	if calls != 0 {
+		t.Errorf("the malformed repos produced %d backend calls, want 0", calls)
+	}
+}
