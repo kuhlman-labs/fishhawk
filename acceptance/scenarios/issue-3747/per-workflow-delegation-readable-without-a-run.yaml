@@ -1,14 +1,14 @@
 id: scenario:issue-3747/per-workflow-delegation-readable-without-a-run
 statement: GET /v0/repos/{owner}/{name}/delegation?source=run_cache returns 200 and the body carries one entry per workflow declared in the spec, each with its autonomy tier, a matrix array whose entries carry action, mode and source, a must_page_human list, and a content_hash — read without starting a run.
 verify_hint: 'HTTP route: GET /v0/repos/{owner}/{name}/delegation?source=run_cache on the localhost preview returns 200 and the decoded body carries workflows[].autonomy, workflows[].matrix[].{action,mode,source} and workflows[].content_hash.'
-steps: Seed runs with POST http://localhost:8090/v0/dev/fixtures (plan-gate-parked, trace-upload-target, plan-gate-criteria, acceptance-dispatched) so kuhlman-labs/fishhawk has a cached spec. Then GET http://localhost:8090/v0/repos/kuhlman-labs/fishhawk/delegation?source=run_cache with no bearer, and decode the body. No run is started by the read.
+steps: 'POST http://localhost:8090/v0/dev/fixtures with {"scenario":"plan-gate-parked"}, then trace-upload-target, plan-gate-criteria and acceptance-dispatched, so kuhlman-labs/fishhawk has runs with a cached spec. GET http://localhost:8090/v0/repos/kuhlman-labs/fishhawk/delegation?source=run_cache with no bearer, and decode the body. Also GET /v0/runs/{acceptance-dispatched run_id}, the newest run, to compare its workflow_id and delegation block. Negative controls: ?source=bogus, and nobody/none with source=run_cache.'
 assertions:
-    expected: 200; workflows[] each with autonomy, matrix[].{action,mode,source}, must_page_human, content_hash.
-    observed_at_record: 200 {repo, source:run_cache (echoed), workflow_sha, spec_version:'2', schema_major:2, content_hash:d7ccbf91..., workflows:[{id:feature_change, autonomy:low, matrix:[{action:approve,mode:gated,source:tier}, fixup, waive, retry, merge ... all gated/tier], content_hash:329fabc2...}]}. The workflow list has one entry per workflow the cached (fixture) spec declares. must_page_human is omitted because the set is empty for this all-gated low tier; the admitted run's own delegation block (GET /v0/runs/{id}) omits it identically.
-    repro_handle: curl -s 'http://localhost:8090/v0/repos/kuhlman-labs/fishhawk/delegation?source=run_cache'
+    expected: 200 with workflows[] each carrying autonomy, matrix[].{action,mode,source}, a must_page_human list and content_hash.
+    observed_at_record: '200: {repo, source:''run_cache'', workflow_sha:''9ab15ef1…'', spec_version:''2'', schema_major:2, content_hash:''d7ccbf91…'', workflows:[{id:''feature_change'', autonomy:''low'', matrix:[approve,fixup,waive,retry,merge each {mode:''gated'', source:''tier''}], content_hash:''329fabc2…''}]}. That is one entry, matching the single workflow in the cached spec (the run detail shows workflow_id feature_change and the same workflow_sha). must_page_human is omitted: the low tier has an empty page list (spec/v2autonomy.go, ''TierLow … implies no page_human_on list''), and the run''s delegation block omits it identically. Controls: source=bogus returned 400 validation_failed with accepted [ref, run_cache]; the unknown repo returned 404 workflow_spec_not_found. No run was started.'
+    repro_handle: curl -s 'http://localhost:8090/v0/repos/kuhlman-labs/fishhawk/delegation?source=run_cache' | jq .
 origin:
     issue: 3747
     pr: 3855
     run_id: 1f3c9925-28b7-41ef-a075-43ef84582bf2
-    head_sha: 498a796675682789e6fcb2f621af4d4239c6341d
-    recorded_at: 2026-09-29T14:28:50Z
+    head_sha: 7ff5daba1a0eb9ace80f0191bff662552566c607
+    recorded_at: 2026-09-29T16:18:29Z
