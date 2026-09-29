@@ -855,6 +855,44 @@ LEASE GENERATION:
   `CombinedOutput`, so the warning reaches the category-A `FailureReason` (#3122
   proposals 3/4) with no runner change.
 
+### Anonymous volumes ([#3710](https://github.com/kuhlman-labs/fishhawk/issues/3710))
+
+`postgres:16-alpine` declares `VOLUME /var/lib/postgresql/data`, so every
+container `scripts/test` creates gets a fresh ANONYMOUS volume. `docker rm -f`
+without `-v` leaves that volume behind, and with ryuk disabled nothing else
+reaped it — one leaked volume per invocation, which reached ~1,150 volumes
+(~98 GB) on a dogfood host.
+
+- **All three container-removal sites pass `-v`**: the last-holder lease reap of
+  `fishhawk-test-postgres`, the generation orphan sweep's per-id removal (the
+  SIGKILL-before-`t.Cleanup` path, which is exactly where a leaked Postgres data
+  volume came from), and the operator cleanup command the preflight warning
+  PRINTS — a hand cleanup must not leak either.
+- **`-v` is scoped to the removed container, and cannot reach a NAMED volume.**
+  It removes only the anonymous volumes associated with the container being
+  removed, so compose-managed state such as `fishhawk_fishhawk-postgres-data` is
+  untouchable BY CONSTRUCTION rather than by a filter we maintain.
+- **`scripts/test` NEVER executes `docker volume rm` or `docker volume prune`.**
+  A generation-keyed dangling-volume SWEEP was considered and DESCOPED: a
+  daemon-wide `dangling=true` query cannot establish ownership, so such a sweep
+  could only ever delete an unrelated workload's anonymous volumes — and it buys
+  nothing once `-v` lands, because every container we remove now takes its own
+  anonymous volumes with it and testcontainers-go's `Terminate` already removes
+  with `RemoveVolumes: true`. Volumes leave only via the `docker rm -f -v` of
+  containers `scripts/test` already removes.
+- **Report-only backlog warning.** At the same generation-open call site as the
+  container preflight, `_preflight_volume_warn` counts dangling anonymous volumes
+  (`_dangling_anonymous_volume_count`, a READ-ONLY
+  `docker volume ls -q --filter dangling=true --filter label=com.docker.volume.anonymous`)
+  and, when the count is strictly ABOVE `FISHHAWK_TEST_VOLUME_WARN_AT` (default
+  100, dev-only like the other `FISHHAWK_TEST_*` knobs), prints a stderr warning
+  naming the count and the operator command `docker volume prune -f`. It NEVER
+  runs that command. Two SILENT outcomes, neither a bogus count: docker ABSENT
+  (clean no-op) and a docker PRESENT-but-failing `volume ls` (the helper declines
+  to publish, returning non-zero with no output, exactly as
+  `_labelled_container_ids` does) — so a down daemon never produces a
+  `0 dangling volumes` line.
+
 **What this guarantees, precisely.** A container created at any point DURING the
 lease generation is reaped by the last holder — including one created by an
 overlapping invocation that exited ref-held and swept nothing, and one whose test
@@ -872,7 +910,15 @@ operator running such workloads concurrently. (3) The sweep degrades to a NO-OP
 (never remove-everything) when the snapshot is missing/unreadable, docker is
 absent, or the opt-out is set. `FISHHAWK_TEST_NO_ORPHAN_SWEEP` /
 `FISHHAWK_TEST_ORPHAN_WARN_AT` are DEV-ONLY: the runner's gate env is a
-default-deny allow-list, so neither reaches the in-loop gate.
+default-deny allow-list, so neither reaches the in-loop gate. (4) The volume
+backlog warning fires at the SAME generation-open call site, so it inherits
+residual (1) verbatim — a holder joining an already-open generation on a littered
+daemon warns nothing. (5) The warning's count requires a daemon that stamps the
+`com.docker.volume.anonymous` label; on one that does not, the filtered query
+returns an empty set and the warning is INERT — never wrong, and never a removal,
+since nothing here removes a volume. The `-v` fix on the three removal sites is
+unaffected by that degrade. `FISHHAWK_TEST_VOLUME_WARN_AT` is DEV-ONLY on the
+same default-deny grounds, so in-loop the threshold is always 100.
 
 Pinned by `scripts/test-container-lease` (sourcing `scripts/test` lib-only with a
 fake `docker` on PATH serving an injectable labelled-container set, an injectable
@@ -886,7 +932,27 @@ daemon is not swept), the sweep-runs-INSIDE-the-lock ordering (the `docker rm`
 fires with the lease lock still held — reddens if the sweep moves after
 `_lease_unlock`), snapshot lifecycle (retained after ref-held, deleted after
 last-holder), and a load-bearing branch-invariance count assertion over the
-unchanged #1792 refcount branches. That harness is now run in-loop by
+unchanged #1792 refcount branches. The #3710 volume cases ride the same harness:
+a volume-removing reap asserting the SHIPPED argv is exactly `rm -f -v
+fishhawk-test-postgres` and `rm -f -v <orphan>` (and NOT the bare `rm -f`
+spelling), the pre-generation-sparing case additionally asserting the printed
+operator hint carries `-v`, and four warning cases — fires above threshold with
+the count and `docker volume prune -f`; silent exactly AT the threshold (pinning
+`>` and not `>=`), silent strictly below it, and a non-numeric
+`FISHHAWK_TEST_VOLUME_WARN_AT` falling back to the default 100 (proved in both
+directions: 3 volumes stay silent, 101 warn); silent on a FAILING `volume ls`,
+never a bogus zero count; and a guarded docker-ABSENT case (SKIPPED, never
+counted as a pass, if a host docker still resolves on the reduced PATH). A
+separate CALL-SITE case drives the real `_register_lease` generation-open path
+rather than the helper directly, so deleting the `_preflight_volume_warn` call
+reddens it and only it — the direct-invocation cases structurally cannot observe
+the wiring. The report-only invariant is machine-enforced: the fake `docker`
+routes any `volume rm` / `volume prune` argv to a log and exits 0 (never errors),
+and `pass()` itself refuses to record a pass while that log is non-empty, so a
+future volume-removal path reddens EVERY case at once. The stub's `volume ls`
+branch also validates its filters, failing the query unless BOTH `dangling=true`
+and `label=com.docker.volume.anonymous` are present — dropping either filter from
+the helper reddens the warning cases. That harness is now run in-loop by
 `scripts/test verify` via `_verify_gate_harnesses`, adding well under a second (it
 needs no Docker).
 
