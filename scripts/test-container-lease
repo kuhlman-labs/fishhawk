@@ -12,7 +12,21 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PASS=0
 FAIL=0
 
-pass() { echo "PASS: $1"; PASS=$((PASS + 1)); }
+# pass() is GUARDED by the #3710 report-only invariant: a case can only record a
+# pass if NO `docker volume rm` / `docker volume prune` argv was recorded during
+# it. The fake docker routes any such call to $volrmlog and exits 0 (never
+# errors), so a future change that adds a volume-removal path to scripts/test
+# reddens EVERY case at once rather than slipping past the cases that happen not
+# to assert it. Volumes must leave only via `docker rm -f -v` of containers
+# scripts/test already removes.
+pass() {
+  if [ -s "${volrmlog:-/nonexistent}" ]; then
+    echo "FAIL: $1 (report-only invariant violated: docker volume removal issued: [$(tr '\n' ';' < "$volrmlog")])"
+    FAIL=$((FAIL + 1))
+    return 0
+  fi
+  echo "PASS: $1"; PASS=$((PASS + 1));
+}
 fail() { echo "FAIL: $1"; FAIL=$((FAIL + 1)); }
 
 tmproot=$(mktemp -d)
@@ -31,15 +45,35 @@ trap 'rm -rf "$tmproot"' EXIT
 #     $FAKE_DOCKER_LOCK_PATH exists AT THAT INSTANT is recorded to $locklog as
 #     "<argv> <held|free>" — so a case can assert the sweep's `docker rm` runs
 #     while the lease lock is still held (condition 4: sweep INSIDE the lock).
+#
+# Three more hooks pin the #3710 anonymous-volume half:
+#   * EVERY invocation's argv is appended to $argvlog, so a case can assert the
+#     shipped `docker rm` spelling and that no volume-removal argv ever issued.
+#   * `volume ls` serves an injectable id list ($volfile) but ONLY when the query
+#     carries BOTH `dangling=true` AND `label=com.docker.volume.anonymous`; a
+#     missing filter exits non-zero with no output, so dropping either filter in
+#     _dangling_anonymous_volume_count reddens the warning cases. The $volfail
+#     sentinel forces a non-zero exit (a present-but-failing daemon).
+#   * ANY `volume` subcommand OTHER than `ls` (i.e. `rm` / `prune`) is recorded to
+#     $volrmlog and exits 0, so a future volume-removal path is RECORDED rather
+#     than erroring — and every case asserts $volrmlog is EMPTY. That is the
+#     machine-enforced form of the report-only invariant: scripts/test must never
+#     execute `docker volume rm` or `docker volume prune` (#3710).
 bindir="$tmproot/bin"
 mkdir -p "$bindir"
 rmlog="$tmproot/docker-rm.log"
 locklog="$tmproot/docker-rm-lockstate.log"
 psfile="$tmproot/docker-ps.txt"
 psfail="$tmproot/docker-ps.fail"
+argvlog="$tmproot/docker-argv.log"
+volrmlog="$tmproot/docker-volume-rm.log"
+volfile="$tmproot/docker-volume-ls.txt"
+volfail="$tmproot/docker-volume-ls.fail"
 : > "$psfile"
+: > "$volfile"
 cat > "$bindir/docker" <<EOF
 #!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$argvlog"
 if [ "\$1" = "rm" ]; then
   printf '%s\n' "\$*" >> "$rmlog"
   lockstate=free
@@ -52,6 +86,20 @@ fi
 if [ "\$1" = "ps" ]; then
   [ -f "$psfail" ] && exit 1
   [ -f "$psfile" ] && cat "$psfile"
+  exit 0
+fi
+if [ "\$1" = "volume" ]; then
+  if [ "\$2" != "ls" ]; then
+    # rm / prune — RECORD it (never error), so the emptiness assertion is what
+    # fails if a volume-removal path is ever added.
+    printf '%s\n' "\$*" >> "$volrmlog"
+    exit 0
+  fi
+  [ -f "$volfail" ] && exit 1
+  # Validate the filters: BOTH must be present or the query fails with no output.
+  case " \$* " in *" dangling=true "*) ;; *) exit 1 ;; esac
+  case " \$* " in *" label=com.docker.volume.anonymous "*) ;; *) exit 1 ;; esac
+  [ -f "$volfile" ] && cat "$volfile"
   exit 0
 fi
 exit 0
@@ -74,9 +122,19 @@ reset_case() {
   : > "$rmlog"
   : > "$locklog"
   : > "$psfile"
+  : > "$argvlog"
+  : > "$volrmlog"
+  : > "$volfile"
   rm -f "$psfail" 2>/dev/null      # clear the docker-ps-fails sentinel
+  rm -f "$volfail" 2>/dev/null     # clear the docker-volume-ls-fails sentinel
   unset FAKE_DOCKER_LOCK_PATH      # clear the per-case lock-state probe
+  unset FISHHAWK_TEST_VOLUME_WARN_AT
 }
+
+# True when NO `docker volume rm` / `docker volume prune` argv was ever recorded.
+# The report-only invariant (#3710): scripts/test removes volumes only as a side
+# effect of `docker rm -f -v` on containers it already removes.
+no_volume_removal() { [ ! -s "$volrmlog" ]; }
 
 # Number of docker rm invocations recorded so far.
 rm_count() {
@@ -107,10 +165,11 @@ export FISHHAWK_TEST_LEASE_TOKEN=$$
 mkdir -p "$LEASE_DIR"
 : > "$LEASE_DIR/$(_lease_token)"          # our lease, the only one
 _reap_shared_container
-if [ "$(rm_count)" -eq 1 ] && grep -q fishhawk-test-postgres "$rmlog"; then
-  pass "last-holder: docker rm fishhawk-test-postgres exactly once"
+if [ "$(rm_count)" -eq 1 ] && grep -qx 'rm -f -v fishhawk-test-postgres' "$rmlog" \
+   && no_volume_removal; then
+  pass "last-holder: docker rm -f -v fishhawk-test-postgres exactly once, no volume removal"
 else
-  fail "last-holder: expected 1 docker rm of fishhawk-test-postgres, got $(rm_count)"
+  fail "last-holder: expected 1 'rm -f -v fishhawk-test-postgres', got $(rm_count) (rmlog=[$(tr '\n' ';' < "$rmlog")], volrm=[$(tr '\n' ';' < "$volrmlog")])"
 fi
 
 # (c) stale-lease: a dead-PID lease is pruned so it neither blocks the reap nor
@@ -249,7 +308,7 @@ kill "$pidA" 2>/dev/null
 FISHHAWK_TEST_LEASE_TOKEN=$pidB _reap_shared_container  # B last-holder → sweep cA
 kill "$pidB" 2>/dev/null
 unset FISHHAWK_TEST_LEASE_TOKEN
-if [ "$a_rm" -eq 0 ] && grep -qx 'rm -f cA' "$rmlog"; then
+if [ "$a_rm" -eq 0 ] && grep -qx 'rm -f -v cA' "$rmlog"; then
   pass "interleaving: cA created mid-generation is swept by the last holder"
 else
   fail "interleaving: expected A ref-held (0 rm) + B sweeps cA (a_rm=$a_rm, rmlog=[$(tr '\n' ';' < "$rmlog")])"
@@ -267,11 +326,15 @@ unset FISHHAWK_TEST_ORPHAN_WARN_AT
 printf 'cPre\ncNew\n' > "$psfile"                    # cNew appears during the generation
 _reap_shared_container                               # last-holder sweep
 unset FISHHAWK_TEST_LEASE_TOKEN
-if grep -qx 'rm -f cNew' "$rmlog" && ! grep -qx 'rm -f cPre' "$rmlog" \
-   && printf '%s' "$warnout" | grep -q 'pre-existing'; then
-  pass "pre-generation sparing: cPre spared + reported, cNew swept"
+# The warning's OPERATOR CLEANUP HINT is the third `docker rm` site (#3710): a
+# hand cleanup must not leak either, so assert the printed command carries `-v`.
+if grep -qx 'rm -f -v cNew' "$rmlog" && ! grep -qx 'rm -f -v cPre' "$rmlog" \
+   && printf '%s' "$warnout" | grep -q 'pre-existing' \
+   && printf '%s' "$warnout" | grep -qF 'docker rm -f -v $(docker ps -aq' \
+   && no_volume_removal; then
+  pass "pre-generation sparing: cPre spared + reported, cNew swept, hint carries -v"
 else
-  fail "pre-generation sparing: expected cNew swept, cPre spared+reported (rmlog=[$(tr '\n' ';' < "$rmlog")], warn=[$warnout])"
+  fail "pre-generation sparing: expected cNew swept, cPre spared+reported with a -v hint (rmlog=[$(tr '\n' ';' < "$rmlog")], warn=[$warnout])"
 fi
 
 # (iii) SNAPSHOT PLACEMENT — the snapshot is a SIBLING of $LEASE_DIR, not inside
@@ -304,7 +367,7 @@ _register_lease
 rm -f "$LEASE_DIR.snapshot"                           # snapshot gone (crash / missing)
 _reap_shared_container
 unset FISHHAWK_TEST_LEASE_TOKEN
-if grep -qx 'rm -f fishhawk-test-postgres' "$rmlog" && ! grep -qx 'rm -f cX' "$rmlog"; then
+if grep -qx 'rm -f -v fishhawk-test-postgres' "$rmlog" && ! grep -qx 'rm -f -v cX' "$rmlog"; then
   pass "no-snapshot degrade: sweep is a no-op, only the shared container removed"
 else
   fail "no-snapshot degrade: expected only fishhawk-test-postgres removed (rmlog=[$(tr '\n' ';' < "$rmlog")])"
@@ -324,7 +387,7 @@ export FISHHAWK_TEST_NO_ORPHAN_SWEEP=1
 _reap_shared_container
 unset FISHHAWK_TEST_NO_ORPHAN_SWEEP
 unset FISHHAWK_TEST_LEASE_TOKEN
-if grep -qx 'rm -f fishhawk-test-postgres' "$rmlog" && ! grep -qx 'rm -f cY' "$rmlog"; then
+if grep -qx 'rm -f -v fishhawk-test-postgres' "$rmlog" && ! grep -qx 'rm -f -v cY' "$rmlog"; then
   pass "opt-out: FISHHAWK_TEST_NO_ORPHAN_SWEEP spares a mid-generation container"
 else
   fail "opt-out: expected no sweep of cY (rmlog=[$(tr '\n' ';' < "$rmlog")])"
@@ -366,8 +429,8 @@ rm -f "$psfail"                                      # daemon recovers
 printf 'cZ\n' > "$psfile"                            # cZ now visible to the sweep
 _reap_shared_container                               # last-holder: no snapshot → no-op sweep
 unset FISHHAWK_TEST_LEASE_TOKEN
-if [ "$published_on_failure" -eq 0 ] && grep -qx 'rm -f fishhawk-test-postgres' "$rmlog" \
-   && ! grep -qx 'rm -f cZ' "$rmlog"; then
+if [ "$published_on_failure" -eq 0 ] && grep -qx 'rm -f -v fishhawk-test-postgres' "$rmlog" \
+   && ! grep -qx 'rm -f -v cZ' "$rmlog"; then
   pass "decline-to-publish: failed ps writes no snapshot, recovered daemon not swept"
 else
   fail "decline-to-publish: expected no snapshot on failure + cZ spared (published=$published_on_failure, rmlog=[$(tr '\n' ';' < "$rmlog")])"
@@ -388,10 +451,123 @@ printf 'cW\n' > "$psfile"                            # cW created mid-generation
 _reap_shared_container                               # last-holder: sweeps cW under the lock
 unset FISHHAWK_TEST_LEASE_TOKEN
 unset FAKE_DOCKER_LOCK_PATH
-if grep -qx 'rm -f cW held' "$locklog" && grep -qx 'rm -f fishhawk-test-postgres held' "$locklog"; then
+if grep -qx 'rm -f -v cW held' "$locklog" && grep -qx 'rm -f -v fishhawk-test-postgres held' "$locklog"; then
   pass "sweep-under-lock: sweep + shared-container rm run while the lease lock is held"
 else
-  fail "sweep-under-lock: expected 'rm -f cW held' + 'rm -f fishhawk-test-postgres held' (locklog=[$(tr '\n' ';' < "$locklog")])"
+  fail "sweep-under-lock: expected 'rm -f -v cW held' + 'rm -f -v fishhawk-test-postgres held' (locklog=[$(tr '\n' ';' < "$locklog")])"
+fi
+
+# ---------------------------------------------------------------------------
+# #3710 anonymous-volume cases. Two halves: the shipped `docker rm` argv carries
+# `-v` at every removal site, and the report-only backlog warning (which must
+# NEVER remove a volume).
+# ---------------------------------------------------------------------------
+
+# (x) VOLUME-REMOVING REAP — the done-means of the `-v` half, asserted on the
+# SHIPPED ARGV rather than on a comment. Drive a last-holder reap with one
+# generation orphan present and assert BOTH recorded lines are exactly the `-v`
+# spelling. Deleting the `-v` token from either _reap_shared_container or
+# _sweep_generation_orphans makes the stub record `rm -f <id>` and this reddens on
+# the behavioural assertion.
+reset_case x
+export FISHHAWK_TEST_LEASE_TOKEN=$$
+_register_lease                     # opens generation, snapshot empty
+printf 'cV\n' > "$psfile"           # cV created mid-generation → swept by the last holder
+_reap_shared_container
+unset FISHHAWK_TEST_LEASE_TOKEN
+if grep -qx 'rm -f -v fishhawk-test-postgres' "$rmlog" && grep -qx 'rm -f -v cV' "$rmlog" \
+   && ! grep -qx 'rm -f fishhawk-test-postgres' "$rmlog" && ! grep -qx 'rm -f cV' "$rmlog" \
+   && no_volume_removal; then
+  pass "volume-removing reap: both removal sites ship 'docker rm -f -v'"
+else
+  fail "volume-removing reap: expected 'rm -f -v fishhawk-test-postgres' + 'rm -f -v cV' (rmlog=[$(tr '\n' ';' < "$rmlog")], volrm=[$(tr '\n' ';' < "$volrmlog")])"
+fi
+
+# (xi) VOLUME WARNING ABOVE THRESHOLD — a count strictly ABOVE
+# FISHHAWK_TEST_VOLUME_WARN_AT prints the count and names `docker volume prune -f`
+# on stderr, and removes NOTHING. The stub's `volume ls` branch requires BOTH the
+# `dangling=true` and `label=com.docker.volume.anonymous` filters, so dropping
+# either from _dangling_anonymous_volume_count fails the query, the helper takes
+# its decline path, and this case reddens with empty stderr.
+reset_case xi
+printf 'v1\nv2\nv3\n' > "$volfile"
+export FISHHAWK_TEST_VOLUME_WARN_AT=2
+volout=$(_preflight_volume_warn 2>&1 >/dev/null)
+unset FISHHAWK_TEST_VOLUME_WARN_AT
+if printf '%s' "$volout" | grep -q '3 dangling anonymous Docker volume' \
+   && printf '%s' "$volout" | grep -qF 'docker volume prune -f' \
+   && no_volume_removal; then
+  pass "volume warning: fires above threshold with the count and the prune command"
+else
+  fail "volume warning: expected a count-bearing warning naming 'docker volume prune -f' (out=[$volout], volrm=[$(tr '\n' ';' < "$volrmlog")])"
+fi
+
+# (xii) VOLUME WARNING SILENT BRANCHES — all three arms the threshold contract
+# claims, in one case so each is load-bearing:
+#   arm 1: count EXACTLY AT the threshold → silent (pins `>` and not `>=`);
+#   arm 2: count strictly BELOW the threshold → silent;
+#   arm 3: a NON-NUMERIC FISHHAWK_TEST_VOLUME_WARN_AT falls back to the default
+#          100 — a count of 3 is below it, so silent; had the fallback not fired,
+#          `[ 3 -gt garbage ]` would error rather than stay silent, and a fallback
+#          to 0 would print. Paired with arm 4, which proves the DEFAULT is 100
+#          and not merely "something above 3": 101 volumes under the same garbage
+#          value must WARN.
+reset_case xii
+printf 'v1\nv2\nv3\n' > "$volfile"
+export FISHHAWK_TEST_VOLUME_WARN_AT=3                # arm 1: exactly at threshold
+at_out=$(_preflight_volume_warn 2>&1 >/dev/null)
+export FISHHAWK_TEST_VOLUME_WARN_AT=4                # arm 2: strictly below
+below_out=$(_preflight_volume_warn 2>&1 >/dev/null)
+export FISHHAWK_TEST_VOLUME_WARN_AT=not-a-number     # arm 3: garbage → default 100
+garbage_out=$(_preflight_volume_warn 2>&1 >/dev/null)
+seq 1 101 | sed 's/^/v/' > "$volfile"                # arm 4: 101 > default 100
+garbage_warn_out=$(_preflight_volume_warn 2>&1 >/dev/null)
+unset FISHHAWK_TEST_VOLUME_WARN_AT
+if [ -z "$at_out" ] && [ -z "$below_out" ] && [ -z "$garbage_out" ] \
+   && printf '%s' "$garbage_warn_out" | grep -q '101 dangling anonymous Docker volume' \
+   && no_volume_removal; then
+  pass "volume warning: silent at threshold, below threshold, and non-numeric knob falls back to 100"
+else
+  fail "volume warning: expected silence at/below threshold and a 100 fallback (at=[$at_out], below=[$below_out], garbage=[$garbage_out], garbage_warn=[$garbage_warn_out])"
+fi
+
+# (xiii) VOLUME QUERY FAILS — docker PRESENT but `volume ls` exits non-zero
+# (daemon down / transient error). _dangling_anonymous_volume_count declines to
+# publish (returns non-zero, prints nothing) and the warning stays SILENT: never
+# a bogus "0 dangling volumes" line, and never a removal.
+reset_case xiii
+: > "$volfail"                                       # docker present, volume ls FAILS
+printf 'v1\nv2\nv3\n' > "$volfile"
+export FISHHAWK_TEST_VOLUME_WARN_AT=0                # would warn on ANY positive count
+failout=$(_preflight_volume_warn 2>&1 >/dev/null)
+unset FISHHAWK_TEST_VOLUME_WARN_AT
+rm -f "$volfail"
+if [ -z "$failout" ] && no_volume_removal; then
+  pass "volume warning: a failing 'docker volume ls' is silent, never a bogus zero count"
+else
+  fail "volume warning: expected silence on a failed query (out=[$failout])"
+fi
+
+# (xv) WARNING CALL SITE — binding condition (1). Cases (xi)-(xiii) invoke
+# _preflight_volume_warn DIRECTLY, so none of them can observe whether it is
+# actually WIRED. This case drives the REAL generation-opening path,
+# _register_lease on a fresh lease dir, and captures its stderr. Deleting the
+# _preflight_volume_warn call from _register_lease reddens ONLY this case.
+reset_case xv
+seq 1 7 | sed 's/^/v/' > "$volfile"
+export FISHHAWK_TEST_LEASE_TOKEN=$$
+export FISHHAWK_TEST_VOLUME_WARN_AT=5
+export FISHHAWK_TEST_ORPHAN_WARN_AT=99               # keep the container preflight quiet
+callsite_out=$(_register_lease 2>&1 >/dev/null)
+unset FISHHAWK_TEST_ORPHAN_WARN_AT
+unset FISHHAWK_TEST_VOLUME_WARN_AT
+unset FISHHAWK_TEST_LEASE_TOKEN
+if printf '%s' "$callsite_out" | grep -q '7 dangling anonymous Docker volume' \
+   && printf '%s' "$callsite_out" | grep -qF 'docker volume prune -f' \
+   && no_volume_removal; then
+  pass "warning call site: _register_lease's generation-open path emits the volume warning"
+else
+  fail "warning call site: expected _register_lease to emit the volume warning (out=[$callsite_out], volrm=[$(tr '\n' ';' < "$volrmlog")])"
 fi
 
 # (vii) BRANCH INVARIANCE — a LOAD-BEARING check (was a vacuous unconditional
@@ -401,11 +577,38 @@ fi
 # evidence. Asserting the EXACT count of prior passes with zero failures turns the
 # marker into a gate: a silently-skipped or reddened prior case drops PASS below
 # the expected total here. Bump expected_prior when adding a case above.
-expected_prior=15   # (a)(b)(c)(d)(e)(g)(h)=7 + (i)(ii)(iii)(iv)(v)(vi)(viii)(ix)=8
+expected_prior=20   # (a)(b)(c)(d)(e)(g)(h)=7 + (i)(ii)(iii)(iv)(v)(vi)(viii)(ix)=8
+                    # + #3710: (x)(xi)(xii)(xiii)(xv)=5. (xiv) is GUARDED/skippable
+                    # (it runs only when docker is genuinely off PATH) and records
+                    # neither a pass nor a fail, so it is deliberately NOT counted.
 if [ "$FAIL" -eq 0 ] && [ "$PASS" -eq "$expected_prior" ]; then
   pass "branch invariance: all $expected_prior prior refcount+sweep cases ran and passed"
 else
   fail "branch invariance: expected $expected_prior prior passes and 0 failures (PASS=$PASS, FAIL=$FAIL)"
+fi
+
+# (xiv) DOCKER ABSENT — _preflight_volume_warn's first guard. Re-run it under a
+# PATH carrying only an empty bin dir plus the system dirs; with no `docker` to
+# resolve, the helper returns silently and removes nothing. Placed AFTER (vii) and
+# SKIPPED (never counted as a pass) when a host docker still resolves on that
+# reduced PATH, so it can never fabricate coverage it did not get.
+reset_case xiv
+emptybin="$tmproot/emptybin"
+mkdir -p "$emptybin"
+printf 'v1\nv2\nv3\n' > "$volfile"
+# `hash -r` inside each subshell drops bash's cached path for `docker`, which
+# would otherwise let `command -v docker` resolve the real binary even though the
+# reduced PATH no longer contains its directory — a cache hit that silently
+# skipped this case.
+if ( PATH="$emptybin:/usr/bin:/bin"; hash -r; command -v docker >/dev/null 2>&1 ); then
+  echo "SKIP: docker-absent: a host docker still resolves on the reduced PATH"
+else
+  absent_out=$( PATH="$emptybin:/usr/bin:/bin"; hash -r; FISHHAWK_TEST_VOLUME_WARN_AT=0 _preflight_volume_warn 2>&1 >/dev/null )
+  if [ -z "$absent_out" ] && no_volume_removal; then
+    pass "docker-absent: volume warning is a silent no-op with no docker on PATH"
+  else
+    fail "docker-absent: expected silence with no docker on PATH (out=[$absent_out])"
+  fi
 fi
 
 # (f) parse-clean: scripts/test itself parses with no syntax errors.

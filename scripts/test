@@ -146,6 +146,51 @@ _labelled_container_ids() {
   docker ps -aq --filter label=org.testcontainers=true 2>/dev/null
 }
 
+# _dangling_anonymous_volume_count: READ-ONLY count of dangling ANONYMOUS
+# volumes on this daemon, printed on stdout. It NEVER removes anything — nothing
+# in scripts/test executes `docker volume rm` or `docker volume prune`, because a
+# daemon-wide `dangling=true` query cannot establish ownership and could only
+# delete volumes we do not own (#3710). Volumes leave only via the `docker rm -f
+# -v` of containers scripts/test already removes.
+#
+# Same decline-on-failure discipline as _labelled_container_ids: docker ABSENT is
+# a silent success with no output; a docker PRESENT-but-failing query prints
+# NOTHING and returns non-zero, so the caller stays silent rather than publishing
+# a bogus zero count.
+_dangling_anonymous_volume_count() {
+  command -v docker >/dev/null 2>&1 || return 0
+  local ids
+  ids="$(docker volume ls -q --filter dangling=true --filter label=com.docker.volume.anonymous 2>/dev/null)" || return 1
+  printf '%s' "$ids" | grep -c . 2>/dev/null || true
+  return 0
+}
+
+# _preflight_volume_warn: non-fatal, REPORT-ONLY warning when the daemon is
+# carrying more than FISHHAWK_TEST_VOLUME_WARN_AT (default 100) dangling
+# anonymous volumes. Printed to STDERR, which the runner captures via
+# CombinedOutput, exactly as _preflight_orphan_warn's warning is. It names the
+# operator prune command but NEVER runs it. Fires ONLY for the invocation that
+# OPENS a generation — the same call site, the same lock, and the same deliberate
+# residual (a holder JOINING an already-open generation warns nothing).
+_preflight_volume_warn() {
+  command -v docker >/dev/null 2>&1 || return 0
+  local count
+  count="$(_dangling_anonymous_volume_count 2>/dev/null)" || return 0
+  case "$count" in ''|*[!0-9]*) return 0 ;; esac
+  # Read the threshold at USE time, as _preflight_orphan_warn does. Dev-only: the
+  # runner strips FISHHAWK_* from the gate env, so in-loop this is always 100.
+  local warn_at="${FISHHAWK_TEST_VOLUME_WARN_AT:-100}"
+  case "$warn_at" in ''|*[!0-9]*) warn_at=100 ;; esac
+  if [ "$count" -gt "$warn_at" ]; then
+    {
+      printf 'scripts/test: WARNING: %d dangling anonymous Docker volume(s) on this daemon.\n' "$count"
+      printf 'scripts/test: scripts/test does NOT remove volumes; they leave only with the containers it removes. Prune them with:\n'
+      printf 'scripts/test:   docker volume prune -f\n'
+    } >&2
+  fi
+  return 0
+}
+
 # _write_generation_snapshot: record the labelled-container set that exists at
 # generation-open time, written atomically (temp sibling then mv) so a concurrent
 # reader never sees a partial file. Guarded to never fail the run. Callers hold
@@ -190,7 +235,7 @@ _preflight_orphan_warn() {
     {
       printf 'scripts/test: WARNING: %d pre-existing testcontainers-labelled container(s) on this daemon before this run.\n' "$count"
       printf 'scripts/test: they predate this run and are SPARED by the generation sweep on purpose; remove them with:\n'
-      printf 'scripts/test:   docker rm -f $(docker ps -aq --filter label=org.testcontainers=true)\n'
+      printf 'scripts/test:   docker rm -f -v $(docker ps -aq --filter label=org.testcontainers=true)\n'
     } >&2
   fi
   return 0
@@ -201,7 +246,10 @@ _preflight_orphan_warn() {
 # including by an overlapping invocation that exited ref-held and swept nothing.
 # Degrades to a no-op (NEVER remove-everything) when the opt-out is set, docker is
 # absent, or the snapshot is missing/unreadable. Every command is guarded so it
-# can never fail the run. Callers hold the lock.
+# can never fail the run. Callers hold the lock. `-v` takes the removed
+# container's own ANONYMOUS volumes with it and can never reach a NAMED volume
+# (#3710) — this SIGKILL-before-t.Cleanup path is exactly where a leaked Postgres
+# data volume came from with ryuk disabled.
 _sweep_generation_orphans() {
   [ -z "${FISHHAWK_TEST_NO_ORPHAN_SWEEP:-}" ] || return 0
   command -v docker >/dev/null 2>&1 || return 0
@@ -210,7 +258,7 @@ _sweep_generation_orphans() {
   while IFS= read -r id; do
     [ -n "$id" ] || continue
     if ! grep -qxF "$id" "$LEASE_DIR.snapshot" 2>/dev/null; then
-      docker rm -f "$id" >/dev/null 2>&1 || true
+      docker rm -f -v "$id" >/dev/null 2>&1 || true
       removed=$((removed + 1))
     fi
   done <<EOF
@@ -332,6 +380,7 @@ _register_lease() {
   if [ "$opening_generation" = "1" ] || [ ! -f "$LEASE_DIR.snapshot" ]; then
     _write_generation_snapshot
     _preflight_orphan_warn
+    _preflight_volume_warn
   fi
   _lease_unlock
   return 0
@@ -480,7 +529,12 @@ _reap_shared_container() {
   rm -f "$LEASE_DIR/$(_lease_token)" 2>/dev/null || true
   _prune_dead_leases
   if rmdir "$LEASE_DIR" 2>/dev/null; then
-    docker rm -f fishhawk-test-postgres >/dev/null 2>&1 || true
+    # `-v` removes the anonymous volumes of THIS REMOVED CONTAINER only
+    # (postgres:16-alpine declares `VOLUME /var/lib/postgresql/data`, so every
+    # container we create gets one). Without it each invocation leaked one
+    # volume (#3710). `-v` CANNOT reach a NAMED volume, so compose-managed state
+    # such as `fishhawk_fishhawk-postgres-data` is untouchable by construction.
+    docker rm -f -v fishhawk-test-postgres >/dev/null 2>&1 || true
     # Last holder. Sweep the generation's orphans and drop the snapshot INSIDE
     # the lock (#3122, condition 4): if these ran after _lease_unlock a concurrent
     # invocation could arm between the rmdir and the snapshot removal, open a new
@@ -1233,7 +1287,8 @@ _verify_patch_coverage() {
 # diff-scoped: a `scripts/`-touched guard would itself be a branch needing a pin
 # and could mis-classify, and the two coverage harnesses already run every time.
 # test-container-lease (#1792, extended for the #3122 generation-keyed orphan
-# snapshot/sweep) sources this script lib-only with a fake `docker` on PATH, so it
+# snapshot/sweep and the #3710 anonymous-volume argv + report-only warning)
+# sources this script lib-only with a fake `docker` on PATH, so it
 # needs no Docker and adds well under a second; wiring it here machine-enforces the
 # lease + sweep contract in-loop rather than only when a human runs the harness.
 # A missing or non-executable harness prints a reason and is skipped; test-dev is
