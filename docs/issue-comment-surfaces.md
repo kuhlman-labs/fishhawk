@@ -1995,6 +1995,22 @@ Notes:
   with the session left open for a retry — the session close is never unaudited.
   Listed here so a future reader grepping the audit categories doesn't mistake it
   for a comment surface.
+- The captain-record kinds — `captain_assigned`, `captain_claimed`,
+  `captain_handover_offered`, `captain_handover_withdrawn` and
+  `captain_relinquished` (E76.2 / #3765, ADR-083 #3751) — are **internal,
+  global-chain audit-only categories, not issue-comment surfaces**. Nothing in
+  `issuecomment` posts them, they have no Notifier method, and none is in
+  `issuecomment`'s `activityCategories`: the captain record is REPO-scoped and
+  belongs to no run, so there is no run thread to render a handover on (the
+  `digest_marked_read` precedent). They are written by
+  `backend/internal/captain`'s `Store.Apply` via `audit.AppendGlobalChainedTx`
+  inside the same advisory-locked transaction that read and validated the
+  record, and the current captain is DERIVED from them (`captain.Derive`) —
+  never stored. A `captain_claimed` entry carries `page_pending: true`: the
+  obligation to page the previous captain is RECORDED on the entry here, and
+  DELIVERED by E77.6 #3740 / E60.3 #2292 — this surface sends nothing. Listed
+  here so a future reader grepping the audit categories doesn't mistake them for
+  comment surfaces.
 - The board-state-sync kind — `work_item_transitioned` (#1012) — is an
   **internal, audit-only category, not an issue-comment surface**. Nothing in
   `issuecomment` posts it; it has no Notifier method. It is written under its

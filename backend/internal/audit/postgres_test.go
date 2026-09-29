@@ -882,6 +882,123 @@ func TestPostgres_AppendGlobalChained_ConcurrentUntenantedNoFork(t *testing.T) {
 	assertLinearPartition(t, repo, nil, N)
 }
 
+// TestPostgres_AppendGlobalChainedTx_MatchesWrapper pins that extracting
+// AppendGlobalChainedTx out of AppendGlobalChained (#3765) is
+// behavior-preserving: the same logical appends made through each entry
+// point — the wrapper into account A's partition, the Tx variant inside a
+// caller-owned transaction into account B's — persist byte-identical
+// prev_hash linkage and entry_hash values. account_id is deliberately
+// outside the canonical hash, so two partitions fed identical inputs must
+// hash identically; any divergence in the extracted path shows here.
+func TestPostgres_AppendGlobalChainedTx_MatchesWrapper(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := audit.NewPostgresRepository(pool)
+	acctA, acctB := makeAccount(t, pool), makeAccount(t, pool)
+	ctx := context.Background()
+
+	ts := time.Now().UTC().Truncate(time.Microsecond)
+	subj := "github:42"
+	kind := audit.ActorUser
+	params := func(acct *uuid.UUID, i int) audit.GlobalChainAppendParams {
+		return audit.GlobalChainAppendParams{
+			Timestamp:    ts.Add(time.Duration(i) * time.Second),
+			Category:     "captain_claimed",
+			ActorKind:    &kind,
+			ActorSubject: &subj,
+			Payload:      json.RawMessage(fmt.Sprintf(`{"i":%d}`, i)),
+			AccountID:    acct,
+		}
+	}
+
+	var viaWrapper, viaTx []*audit.Entry
+	for i := 0; i < 2; i++ {
+		w, err := repo.AppendGlobalChained(ctx, params(&acctA, i))
+		if err != nil {
+			t.Fatalf("AppendGlobalChained #%d: %v", i, err)
+		}
+		viaWrapper = append(viaWrapper, w)
+
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		e, err := audit.AppendGlobalChainedTx(ctx, tx, params(&acctB, i))
+		if err != nil {
+			_ = tx.Rollback(ctx)
+			t.Fatalf("AppendGlobalChainedTx #%d: %v", i, err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		viaTx = append(viaTx, e)
+	}
+
+	for i := range viaWrapper {
+		w, x := viaWrapper[i], viaTx[i]
+		if w.EntryHash != x.EntryHash {
+			t.Errorf("entry %d: wrapper hash %q != tx hash %q", i, w.EntryHash, x.EntryHash)
+		}
+		if (w.PrevHash == nil) != (x.PrevHash == nil) || (w.PrevHash != nil && *w.PrevHash != *x.PrevHash) {
+			t.Errorf("entry %d: wrapper prev %v != tx prev %v", i, w.PrevHash, x.PrevHash)
+		}
+	}
+	if viaTx[1].PrevHash == nil || *viaTx[1].PrevHash != viaTx[0].EntryHash {
+		t.Errorf("tx-path second entry PrevHash = %v, want first entry hash %q", viaTx[1].PrevHash, viaTx[0].EntryHash)
+	}
+	persisted, err := repo.ListGlobalByAccount(ctx, &acctB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(persisted) != 2 || persisted[0].EntryHash != viaTx[0].EntryHash || persisted[1].EntryHash != viaTx[1].EntryHash {
+		t.Errorf("persisted tx-path partition = %+v, want the two returned entries in order", persisted)
+	}
+}
+
+// TestPostgres_AppendGlobalChainedTx_RollsBackWithCallerTx pins the
+// property the captain store's atomicity rests on (#3765): an append made
+// through AppendGlobalChainedTx inside a transaction the CALLER then rolls
+// back leaves no row and does not advance the partition head — the next
+// append is still the partition's nil-prev_hash genesis.
+func TestPostgres_AppendGlobalChainedTx_RollsBackWithCallerTx(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := audit.NewPostgresRepository(pool)
+	acct := makeAccount(t, pool)
+	ctx := context.Background()
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inTx, err := audit.AppendGlobalChainedTx(ctx, tx, audit.GlobalChainAppendParams{
+		Timestamp: time.Now().UTC(),
+		Category:  "captain_claimed",
+		Payload:   json.RawMessage(`{"rolled":"back"}`),
+		AccountID: &acct,
+	})
+	if err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatalf("AppendGlobalChainedTx: %v", err)
+	}
+	if inTx.EntryHash == "" {
+		t.Fatal("in-tx entry has no hash")
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := repo.ListGlobalByAccount(ctx, &acct)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("partition holds %d entries after caller rollback, want 0", len(got))
+	}
+	next := appendGlobal(t, repo, &acct, "captain_claimed")
+	if next.PrevHash != nil {
+		t.Errorf("post-rollback append PrevHash = %v, want nil (rolled-back entry must not be the head)", *next.PrevHash)
+	}
+}
+
 // TestPostgres_ListGlobalByAccount pins the partition-listing contract:
 // a non-nil account returns ONLY that account's run-less entries in
 // append order; nil returns ONLY the untenanted partition; per-run rows

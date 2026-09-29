@@ -29,6 +29,17 @@ links from a nil-`prev_hash` genesis entry via `prev_hash` = predecessor's
   advisory lock closes that race for tenant and untenanted partitions
   alike. Migration 0058's partial index `(account_id, sequence DESC) WHERE
   run_id IS NULL` serves the last-entry lookup and the partition walk.
+  `AppendGlobalChained` is a thin `pgx.BeginFunc` wrapper over
+  `AppendGlobalChainedTx` (#3765), the transaction-aware core — the same
+  split as `AppendChained`/`AppendChainedTx` (#1090). The Tx variant takes
+  the partition lock INSIDE the caller's transaction and holds it until the
+  caller commits or rolls back, so a caller can make read → validate →
+  append one atomic unit: `backend/internal/captain`'s `Store.Apply` takes
+  its own captain key first, then appends here, and a rolled-back caller
+  leaves no row and no advanced partition head. Pinned by
+  `TestPostgres_AppendGlobalChainedTx_MatchesWrapper` (byte-identical
+  hashes through both entry points) and
+  `TestPostgres_AppendGlobalChainedTx_RollsBackWithCallerTx`.
 
 Readers: `ListGlobal` returns the whole run-less set across partitions
 (compliance-export enumeration); `ListGlobalByAccount` returns ONE
