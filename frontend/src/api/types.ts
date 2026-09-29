@@ -866,3 +866,54 @@ export interface ApiError {
   message?: string;
   details?: Record<string, unknown>;
 }
+
+/*
+ * Compliance export (Export v1) — TS mirrors of the wire structs in
+ * backend/internal/server/audit_export.go, which themselves mirror
+ * verifier/internal/audit/export.go field-for-field (ADR-054 / #1604).
+ *
+ * The body shape is BINDING: the external verifier's ParseExport
+ * strict-decodes it with DisallowUnknownFields, so a field rename or
+ * addition on EITHER side breaks the other. Change these in lockstep
+ * with that Go file, never unilaterally. Continuation and partiality
+ * ride the X-Fishhawk-Export-Complete / X-Fishhawk-Export-Next-Cursor
+ * RESPONSE HEADERS, never the body — which is why `AuditExport` has
+ * exactly three fields and no `complete` marker.
+ */
+export interface AuditExport {
+  schema: string;
+  exported_at: string;
+  runs: Record<string, AuditExportRunData>;
+}
+
+/** Mirrors audit_export.go's exportRunData. `signing_key` carries omitempty. */
+export interface AuditExportRunData {
+  signing_key?: AuditExportSigningKey;
+  audit_entries: AuditExportEntry[];
+}
+
+/** Mirrors audit_export.go's exportSigningKey. `public_key` is base64. */
+export interface AuditExportSigningKey {
+  public_key: string;
+  issued_at: string;
+  expires_at: string;
+}
+
+/**
+ * Mirrors audit_export.go's exportEntry. The nullable fields carry NO
+ * omitempty on the Go side, so they arrive as explicit JSON nulls —
+ * exactly the values their hashes were computed over.
+ */
+export interface AuditExportEntry {
+  id: string;
+  sequence: number;
+  run_id: string | null;
+  stage_id: string | null;
+  ts: string;
+  category: string;
+  actor_kind: string | null;
+  actor_subject: string | null;
+  payload: unknown;
+  prev_hash: string | null;
+  entry_hash: string;
+}
