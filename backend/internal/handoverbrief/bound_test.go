@@ -42,6 +42,9 @@ func synthetic(n int) Brief {
 			{Kind: SectionWhatChanged, Parts: []Part{{Kind: PartMerges, Items: items(10), Complete: true}}},
 			{Kind: SectionInFlight, Parts: []Part{{Kind: PartCampaigns, InFlight: fl, Complete: true}}},
 			{Kind: SectionDelegationInForce, Parts: []Part{{Kind: PartWorkflows, Workflows: ws, Complete: true}}},
+			{Kind: SectionStandingOrders, Parts: []Part{}, StandingOrders: &StandingOrders{
+				Source: "run_cache", WorkflowSHA: strings.Repeat("c", 40), SpecVersion: "2", SchemaMajor: 2,
+				DelegationContentHash: strings.Repeat("b", 64)}},
 		},
 		Absent: DeclaredAbsences(), Gaps: gaps,
 		Degradations: []Degradation{{Kind: DegradationDelegationUnavailable, Detail: "fixed"}},
@@ -126,6 +129,51 @@ func TestBound_DescendingBudgetsAlwaysProgress(t *testing.T) {
 	}
 }
 
+// TestBound_DelegationCursorNamesComposedSource: the workflows cursor carries
+// the ?source the brief's standing orders recorded, because the delegation
+// route DEFAULTS to source=ref — a run_cache brief whose cursor named the bare
+// path would point at a different read (and can 502 forge_unavailable where
+// the composed read succeeded). No standing orders (delegation unavailable) =
+// no source to name, so the bare path stands.
+func TestBound_DelegationCursorNamesComposedSource(t *testing.T) {
+	for _, tc := range []struct{ source, want string }{
+		{"run_cache", "GET /v0/repos/" + testRepo + "/delegation?source=run_cache"},
+		{"ref", "GET /v0/repos/" + testRepo + "/delegation?source=ref"},
+		{"", "GET /v0/repos/" + testRepo + "/delegation"},
+	} {
+		t.Run("source="+tc.source, func(t *testing.T) {
+			b := synthetic(30)
+			b.Sections[0].Parts[0].Items = []digest.Item{}
+			for i := range b.Sections {
+				if b.Sections[i].Kind != SectionStandingOrders {
+					continue
+				}
+				if tc.source == "" {
+					b.Sections[i].StandingOrders, b.Sections[i].Unavailable = nil, true
+					continue
+				}
+				b.Sections[i].StandingOrders.Source = tc.source
+			}
+			b.BriefHash = Hash(b)
+			floor, err := Bound(b, 1<<20)
+			if err != nil {
+				t.Fatal(err)
+			}
+			out, err := Bound(b, size(t, floor)/3)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wf := out.Sections[2].Parts[0]
+			if !wf.Truncated {
+				t.Fatalf("workflows not cut (kept %d); the cursor assertion is vacuous", len(wf.Workflows))
+			}
+			if wf.Next == nil || wf.Next.Call != tc.want {
+				t.Errorf("workflows cursor = %+v, want call %q", wf.Next, tc.want)
+			}
+		})
+	}
+}
+
 // TestBound_CursorsNameUnderlyingQueries: campaigns, workflows and the gaps
 // stream each get a cursor naming its own underlying read.
 func TestBound_CursorsNameUnderlyingQueries(t *testing.T) {
@@ -144,7 +192,9 @@ func TestBound_CursorsNameUnderlyingQueries(t *testing.T) {
 	if !camp.Truncated || camp.Next == nil || !strings.HasPrefix(camp.Next.Call, "GET /v0/campaigns?") || camp.Next.Offset != len(camp.InFlight) {
 		t.Errorf("campaigns cursor = %+v (kept %d)", camp.Next, len(camp.InFlight))
 	}
-	if !wf.Truncated || wf.Next == nil || wf.Next.Call != "GET /v0/repos/"+testRepo+"/delegation" {
+	// The cursor must name the query the brief ACTUALLY read: the route
+	// defaults to source=ref, so a run_cache composition names ?source=run_cache.
+	if !wf.Truncated || wf.Next == nil || wf.Next.Call != "GET /v0/repos/"+testRepo+"/delegation?source=run_cache" {
 		t.Errorf("workflows cursor = %+v", wf.Next)
 	}
 	if !out.GapsTruncated || out.GapsNext == nil || !strings.HasPrefix(out.GapsNext.Call, "GET /v0/digest?") ||

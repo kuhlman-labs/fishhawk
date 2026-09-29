@@ -182,7 +182,7 @@ func (bd *bounder) cursorAt(p Part, i int) *Cursor {
 		}
 		return listCursor(repo, p.Kind, it.State, off)
 	case PartWorkflows:
-		return delegationCursor(repo, i)
+		return delegationCursor(repo, delegationSource(bd.b), i)
 	}
 	dsec := map[PartKind]digest.SectionKind{
 		PartMerges: digest.SectionMerges, PartWaiversAndDeferrals: digest.SectionWaiversAndDeferrals,

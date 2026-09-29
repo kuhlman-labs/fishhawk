@@ -54,7 +54,7 @@ Sections the issue names with no source on main are listed in `absent` with a re
 
 - digest parts / gaps → `GET /v0/digest?from_sequence=…&repo=…&section=…&to_sequence=…`
 - campaigns / runs → `GET /v0/campaigns?…` / `GET /v0/runs?…` with `state` and the offset `cursor` (base64url of `offset:N`, the server's list cursor)
-- workflows → `GET /v0/repos/{owner}/{name}/delegation`
+- workflows → `GET /v0/repos/{owner}/{name}/delegation?source=…`, carrying the `source` the brief's `standing_orders` recorded (`run_cache` for an offer's composition). The route DEFAULTS to `source=ref`, so the bare path is a DIFFERENT read — following it can 502 `forge_unavailable` where the composed run-cache read succeeded. A brief with no standing orders (delegation unavailable) has no source to name and keeps the bare path.
 
 `DefaultByteBudget` is the digest's ADR-077 number; the MCP tool re-bounds at its session budget.
 

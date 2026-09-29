@@ -649,9 +649,30 @@ func (c *composer) delegation() []Section {
 	}
 }
 
-// delegationCursor names the underlying delegation read.
-func delegationCursor(repo string, offset int) *Cursor {
-	return &Cursor{Part: PartWorkflows, Call: "GET /v0/repos/" + repo + "/delegation", Offset: offset}
+// delegationCursor names the underlying delegation read. source is the
+// standing orders' source (the delegation route's ?source): the route DEFAULTS
+// to source=ref, so a brief composed from the run cache whose cursor named the
+// bare path would point at a DIFFERENT query than the one the brief read — and
+// following it can 502 forge_unavailable where the composed read succeeded.
+// An empty source names the bare path (the route's own default).
+func delegationCursor(repo, source string, offset int) *Cursor {
+	call := "GET /v0/repos/" + repo + "/delegation"
+	if source != "" {
+		call += "?source=" + url.QueryEscape(source)
+	}
+	return &Cursor{Part: PartWorkflows, Call: call, Offset: offset}
+}
+
+// delegationSource reports the source the brief's standing orders recorded,
+// or "" when the brief carries no standing orders (the delegation view was
+// unavailable, so no source is known).
+func delegationSource(b Brief) string {
+	for _, s := range b.Sections {
+		if s.Kind == SectionStandingOrders && s.StandingOrders != nil {
+			return s.StandingOrders.Source
+		}
+	}
+	return ""
 }
 
 func markUnavailable(s *Section) {
