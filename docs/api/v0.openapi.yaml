@@ -406,6 +406,172 @@ components:
           description: Public client only.
           example: [none]
 
+    PrecedentResult:
+      type: object
+      description: |
+        A ranked set of prior decisions of one class from one repository, plus
+        the context the ranking was performed against and the agreement summary
+        of the returned set. Read-only and authority-free.
+      required: [resolved_context, summary, results, truncated]
+      properties:
+        resolved_context: { $ref: '#/components/schemas/PrecedentResolvedContext' }
+        summary: { $ref: '#/components/schemas/PrecedentSummary' }
+        results:
+          type: array
+          items: { $ref: '#/components/schemas/PrecedentItem' }
+        truncated:
+          type: boolean
+          description: >-
+            The candidate window was full, so a relevant decision older than
+            the newest 500 matching rows may exist outside it.
+        degraded:
+          type: array
+          items: { $ref: '#/components/schemas/PrecedentDegraded' }
+
+    PrecedentResolvedContext:
+      type: object
+      description: >-
+        What the ranking was actually performed against, after a gate reference
+        was resolved and any explicit overrides applied. The lists are capped at
+        20 entries; each carries its untruncated total.
+      required: [repo, decision_class, touched_paths, touched_paths_total, escalation_keys, escalation_keys_total]
+      properties:
+        repo: { type: string }
+        decision_class: { type: string }
+        stage_kind: { type: string }
+        concern_category:
+          type: string
+          description: The NORMALIZED canonical category, not the raw input spelling.
+        severity: { type: string }
+        run_id:
+          type: string
+          format: uuid
+          description: Present only in gate-reference mode.
+        stage_id: { type: string, format: uuid }
+        touched_paths: { type: array, items: { type: string } }
+        touched_paths_total: { type: integer }
+        touched_paths_truncated: { type: boolean }
+        escalation_keys: { type: array, items: { type: string } }
+        escalation_keys_total: { type: integer }
+        escalation_keys_truncated: { type: boolean }
+
+    PrecedentSummary:
+      type: object
+      description: >-
+        The agreement of the RETURNED items (not of the whole index). E75.5's
+        divergence threshold consumes this.
+      required: [count, human, delegated, agreement_ratio, doctrine_versions, hard_filter_only]
+      properties:
+        count: { type: integer }
+        human:
+          type: integer
+          description: Items NOT recorded as delegated.
+        delegated:
+          type: integer
+          description: Items a delegation rule decided.
+        modal_outcome:
+          type: string
+          description: >-
+            The most frequent outcome among the returned items — the
+            lexicographically smallest on a count tie, so the field is
+            deterministic.
+        agreement_ratio:
+          type: number
+          format: double
+          description: >-
+            The MODAL outcome's share of the returned items: 1.0 for a unanimous
+            set, 0 for an empty one. Stated rather than inferred — pairwise
+            agreement or entropy would be equally defensible definitions.
+        doctrine_versions:
+          type: array
+          items: { type: string }
+          description: >-
+            Sorted set of doctrine versions the returned items span. More than
+            one means the precedent was set under more than one charter revision.
+        hard_filter_only:
+          type: integer
+          description: Returned items that matched the repository and class and nothing else.
+
+    PrecedentItem:
+      type: object
+      description: >-
+        One ranked prior decision, citing its audit-chain entry and explaining
+        its own score.
+      required: [source_sequence, source_entry_hash, run_id, repo, decision_class, delegated, decided_at, reason_sequence, matched_keys, score]
+      properties:
+        source_sequence:
+          type: integer
+          format: int64
+          description: The audit-chain sequence of the decision entry this row projects.
+        source_entry_hash: { type: string }
+        run_id: { type: string, format: uuid }
+        stage_id: { type: string, format: uuid }
+        repo: { type: string }
+        decision_class: { type: string }
+        stage_kind: { type: string }
+        outcome: { type: string }
+        reject_class: { type: string }
+        concern_category: { type: string }
+        severity: { type: string }
+        delegated: { type: boolean }
+        actor_kind: { type: string }
+        doctrine_version: { type: string }
+        decided_at: { type: string, format: date-time }
+        reason_sequence:
+          type: integer
+          format: int64
+          description: The chain entry holding the recorded reason.
+        reason_key:
+          type: string
+          description: The payload key on that entry holding the reason prose.
+        reason_excerpt:
+          type: string
+          description: >-
+            Read from the cited entry AT QUERY TIME and capped at 280 bytes with
+            a truncation marker. Absent when the reason could not be read — see
+            `degraded`. Never fabricated.
+        hard_filter_only:
+          type: boolean
+          description: >-
+            The row matched the repository, class and stage kind and NOTHING
+            else. Its score components are zero and its matched-key set empty.
+        matched_keys:
+          type: object
+          description: Which keys this row matched on. Each list is capped at 20 entries.
+          properties:
+            touched_path_prefixes: { type: array, items: { type: string } }
+            touched_path_prefixes_total: { type: integer }
+            touched_path_prefixes_truncated: { type: boolean }
+            concern_category: { type: string }
+            severity: { type: string }
+            escalation_keys: { type: array, items: { type: string } }
+            escalation_keys_total: { type: integer }
+            escalation_keys_truncated: { type: boolean }
+        score:
+          type: object
+          description: >-
+            Each signal's WEIGHTED contribution plus their sum. The weights are
+            chosen, not fitted — see backend/internal/precedent/README.md.
+          properties:
+            touched_paths: { type: number, format: double }
+            escalation_keys: { type: number, format: double }
+            concern_category: { type: number, format: double }
+            severity: { type: number, format: double }
+            total: { type: number, format: double }
+
+    PrecedentDegraded:
+      type: object
+      description: One thing the response could not include, named rather than silent.
+      required: [reason]
+      properties:
+        reason:
+          type: string
+          enum: [window_truncated, no_indexed_decisions, audit_repo_unconfigured,
+                 reason_entry_unreadable, reason_entry_missing]
+        source_sequence: { type: integer, format: int64 }
+        run_id: { type: string, format: uuid }
+        detail: { type: string }
+
     ProtectedResourceMetadata:
       type: object
       description: |
@@ -14962,6 +15128,155 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '503':
           description: Audit repository not configured on this instance.
+
+  /v0/precedent:
+    get:
+      operationId: getPrecedent
+      summary: Query prior decisions of the same kind (precedent)
+      description: |
+        Returns prior decisions of one class from ONE repository, ranked by a
+        deterministic weighted score (ADR-082 #3728 decision (b), E75.3 #3731).
+        Read-only: it writes nothing, records no audit entry and grants NO
+        authority. A precedent item is evidence that a human or a delegation
+        rule already weighed something similar; the decision is still the
+        caller's.
+
+        Two input modes:
+
+        - EXPLICIT CONTEXT — `repo` + `decision_class`, plus any of
+          `stage_kind`, `paths`, `concern_category`, `severity`,
+          `escalation_keys`.
+        - GATE REFERENCE — `run_id` (+ optional `stage_id`) and
+          `decision_class`. The repository, stage kind, touched paths and fired
+          escalation keys are derived from that run's own latest plan artifact
+          and the named stage's latest `escalation_fired` entry, through the
+          same joins the decision indexer used — so the query ranks against the
+          same key values the prior decisions were indexed with.
+          `decision_class` stays REQUIRED: a gate does not determine which
+          CLASS of decision the caller is asking about.
+
+        An explicit field supplied alongside a gate reference OVERRIDES the
+        derived value, and `resolved_context` echoes what the ranking was
+        actually performed against.
+
+        SCORE COMPONENTS, each reported as its weighted contribution:
+        path-prefix Jaccard over touched paths (0.45 — each path contributes
+        itself plus every directory prefix, so a sibling file in the same
+        package scores below an exact hit but above zero), Jaccard over fired
+        escalation keys (0.20), an exact normalized concern-category match
+        (0.25) and an exact severity match (0.10). Ties break by recency and
+        then by source sequence, so the order is total and no two rows can
+        compare equal.
+
+        `reason_excerpt` is read from the cited chain entry AT QUERY TIME and
+        capped; the reason prose is never copied into the index. A reason that
+        cannot be read yields NO excerpt plus a named `degraded` entry, never a
+        fabricated one.
+
+        `summary.agreement_ratio` is the share of the RETURNED items carrying
+        the modal outcome (1.0 for a unanimous set, 0 for an empty one), and
+        `summary.modal_outcome` names that outcome so the number is
+        interpretable.
+
+        BOUNDED COMPLETENESS: the newest 500 matching rows are scored. A full
+        window sets `truncated` and appends a `window_truncated` degradation —
+        a relevant older decision may exist outside it. The echoed
+        `resolved_context` lists are capped at 20 entries each with their
+        untruncated totals reported.
+
+        NARROWING: the row window and the gate-reference resolve are both bound
+        to the caller's workspace account, and an identity carrying NO workspace
+        account matches ONLY untenanted rows rather than every account's —
+        repository visibility does not separate two accounts sharing one
+        repository. A run in another account, or a stage that is not on the
+        named run, answers the SAME 404 as a nonexistent run, with no resolved
+        context echoed. EVERY repository whose context reaches the response is
+        subject to the point-read repo-visibility check: the one the ranking
+        runs against AND, in gate-reference mode, the one the derived paths and
+        escalation keys came FROM, even when an explicit `repo` overrides it.
+      tags: [precedent]
+      parameters:
+        - name: decision_class
+          in: query
+          required: true
+          description: The decision class to find precedent for.
+          schema:
+            type: string
+            enum: [plan_approval, concern_waive, concern_defer, concern_addressed_by_condition,
+                   scope_amendment, acceptance_arbitration, merge_verdict, clarification,
+                   grooming_disposition]
+        - name: repo
+          in: query
+          description: >-
+            `owner/name` of the repository to search. Required unless `run_id`
+            is supplied (which resolves one).
+          schema: { type: string }
+        - name: run_id
+          in: query
+          description: Resolve the context from this run instead of naming it field by field.
+          schema: { type: string, format: uuid }
+        - name: stage_id
+          in: query
+          description: >-
+            The stage within `run_id` whose latest fired escalation keys to rank
+            against. Must belong to that run.
+          schema: { type: string, format: uuid }
+        - name: stage_kind
+          in: query
+          description: Narrow to decisions made on this stage kind.
+          schema: { type: string }
+        - name: paths
+          in: query
+          description: Repeatable. Paths this decision touches.
+          schema: { type: array, items: { type: string } }
+          explode: true
+        - name: concern_category
+          in: query
+          description: >-
+            Reviewer concern category. Normalized server-side to its canonical
+            key, so a raw spelling still matches the indexed value.
+          schema: { type: string }
+        - name: severity
+          in: query
+          description: Concern severity.
+          schema: { type: string }
+        - name: escalation_keys
+          in: query
+          description: Repeatable. Escalation rule keys currently fired.
+          schema: { type: array, items: { type: string } }
+          explode: true
+        - name: limit
+          in: query
+          description: Maximum ranked items to return.
+          schema: { type: integer, default: 20, minimum: 1, maximum: 50 }
+      responses:
+        '200':
+          description: Ranked precedent (results may be empty).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PrecedentResult' }
+        '400':
+          description: >-
+            `validation_failed` — `decision_class` is absent or not a recognized
+            class, `repo` is absent and no `run_id` resolves one, `run_id` /
+            `stage_id` is not a UUID, or `limit` is out of range.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: >-
+            `repo_forbidden` — no forge read access to a repository whose
+            context would reach the response: the `repo` the ranking runs
+            against, or the repository a `run_id` gate reference derived its
+            paths and escalation keys FROM, even when an explicit `repo`
+            overrides it.
+        '404':
+          description: >-
+            `not_found` — no such run, the run belongs to another workspace
+            account, or the stage does not belong to the run. The three are
+            deliberately indistinguishable and no resolved context is echoed.
+        '503':
+          description: >-
+            `precedent_unconfigured` — the decision index is not configured on
+            this instance.
 
   /v0/repos/{owner}/{name}/throughput:
     get:

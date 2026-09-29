@@ -331,6 +331,7 @@ func registerTools(srv *mcp.Server, resolver *runResolver) {
 	registerDriveRun(srv, resolver)
 	registerRunChildren(srv, resolver)
 	registerRuntimeCalibration(srv, resolver)
+	registerPrecedent(srv, resolver)
 	registerVerifyRun(srv, resolver)
 	registerVouchCommit(srv, resolver)
 	registerMergeRun(srv, resolver)

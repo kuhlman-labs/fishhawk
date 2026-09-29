@@ -160,6 +160,15 @@ type Config struct {
 	// POST /v0/stages/{id}/approvals; nil leaves it 503.
 	ApprovalRepo approval.Repository
 
+	// PrecedentIndex is the decision-index read surface GET /v0/precedent
+	// ranks prior decisions from (E75.3 / #3731, ADR-082 #3728 decision (b)).
+	// *decisionindex.Store satisfies it. Nil leaves the endpoint answering
+	// 503 precedent_unconfigured — the same absent-not-disabled posture as
+	// the calibration endpoint's nil AuditRepo — so dropping the wiring is a
+	// partial rollback that needs no revert. The read is account-narrowed and
+	// repo-visibility-gated inside the handler (precedent.go).
+	PrecedentIndex PrecedentIndex
+
 	// DocumentDeclarations / DocumentResolver / DocumentScope are the
 	// document-injection seam (E55.1 / #2242): the ONE attachment point for
 	// every consumer that wants a repo-authored governance document injected

@@ -464,3 +464,265 @@ func seqsOf(rows []Row) []int64 {
 	}
 	return out
 }
+
+// TestList_AccountNarrowing pins the E75.3 account predicate.
+//
+// MECHANISM / MASKING GUARD: the fixture runs as the admin test role, which
+// BYPASSES RLS, so the SQL predicate is the ONLY thing in the path. Were this
+// run under RLS the decision_index_tenant_isolation policy would mask a deleted
+// WHERE arm and the case would prove nothing — which is exactly why it is
+// deliberately run un-masked.
+// COUNTERFACTUAL: delete the account arm from listSQL's WHERE → the second
+// account's row is returned and the test is RED.
+func TestList_AccountNarrowing(t *testing.T) {
+	f := newChainFixture(t)
+	ctx := context.Background()
+	s := NewStore(f.pool)
+
+	mine := sampleRow(f.runA, 301)
+	mine.AccountID = &f.accountA
+	foreign := sampleRow(f.runB, 302)
+	foreign.Repo = "acme/widgets" // same repo, so ONLY the account arm can drop it
+	foreign.AccountID = &f.accountB
+	untenanted := sampleRow(f.runA, 303)
+	untenanted.AccountID = nil
+	if err := s.UpsertBatch(ctx, []Row{mine, foreign, untenanted}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	got, err := s.List(ctx, ListFilter{AccountID: &f.accountA})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[int64]bool{}
+	for _, r := range got {
+		seen[r.SourceSequence] = true
+	}
+	if !seen[301] {
+		t.Error("the caller's OWN row (301) was not returned")
+	}
+	// Deliberate RLS parity (#3730: NULL-account rows stay visible, the #1829
+	// window): a single-tenant deployment writes NULL-account rows and would
+	// otherwise see nothing.
+	if !seen[303] {
+		t.Error("the NULL-account row (303) was not returned; the predicate must mirror the RLS policy")
+	}
+	if seen[302] {
+		t.Error("ANOTHER ACCOUNT'S row (302) was returned")
+	}
+
+	// A nil AccountID is the un-narrowed backfill/CLI path: every row.
+	all, err := s.List(ctx, ListFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 3 {
+		t.Errorf("nil-account listing returned %d rows, want all 3", len(all))
+	}
+}
+
+// TestList_AccountScopedNarrowsAnAccountLessCaller pins the AccountScoped read
+// scope: with it set, a NIL AccountID matches ONLY untenanted rows instead of
+// every row, which is what a request-serving read needs from an identity carrying
+// no workspace account.
+//
+// MECHANISM / MASKING GUARD: like TestList_AccountNarrowing this runs as the admin
+// test role, which BYPASSES RLS, so the SQL predicate is the only thing in the
+// path; and both tenanted rows are in the SAME repository as the untenanted one,
+// so no other WHERE arm can drop them.
+// COUNTERFACTUAL: delete the `NOT $6::boolean AND` guard from listSQL's account
+// arm (leaving the bare `$5::uuid IS NULL`) → the scoped nil-account listing
+// returns all three rows and the first two assertions are RED.
+func TestList_AccountScopedNarrowsAnAccountLessCaller(t *testing.T) {
+	f := newChainFixture(t)
+	ctx := context.Background()
+	s := NewStore(f.pool)
+
+	mine := sampleRow(f.runA, 311)
+	mine.Repo = "acme/widgets"
+	mine.AccountID = &f.accountA
+	foreign := sampleRow(f.runB, 312)
+	foreign.Repo = "acme/widgets"
+	foreign.AccountID = &f.accountB
+	untenanted := sampleRow(f.runA, 313)
+	untenanted.Repo = "acme/widgets"
+	untenanted.AccountID = nil
+	if err := s.UpsertBatch(ctx, []Row{mine, foreign, untenanted}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	seqs := func(rows []Row) map[int64]bool {
+		out := map[int64]bool{}
+		for _, r := range rows {
+			out[r.SourceSequence] = true
+		}
+		return out
+	}
+
+	// An ACCOUNT-LESS scoped caller: untenanted rows ONLY.
+	got, err := s.List(ctx, ListFilter{Repo: "acme/widgets", AccountScoped: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := seqs(got)
+	if !seen[313] {
+		t.Error("the untenanted row (313) was not returned to an account-less scoped caller")
+	}
+	if seen[311] || seen[312] {
+		t.Errorf("a TENANTED row leaked to an account-less scoped caller: %v", seen)
+	}
+
+	// A TENANTED scoped caller is unchanged from the un-scoped rule: its own
+	// rows plus the untenanted ones, never another account's.
+	mineOnly, err := s.List(ctx, ListFilter{Repo: "acme/widgets", AccountID: &f.accountA, AccountScoped: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen = seqs(mineOnly)
+	if !seen[311] || !seen[313] {
+		t.Errorf("scoped listing for account A = %v, want its own 311 and the untenanted 313", seen)
+	}
+	if seen[312] {
+		t.Error("ANOTHER ACCOUNT'S row (312) was returned to a scoped caller")
+	}
+
+	// The UN-scoped nil-account path — the backfill/CLI — still sees every row.
+	all, err := s.List(ctx, ListFilter{Repo: "acme/widgets"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 3 {
+		t.Errorf("un-scoped nil-account listing returned %d rows, want all 3 — AccountScoped must not change the backfill path", len(all))
+	}
+}
+
+// TestList_NewestFirstWindow: a bounded window is the NEWEST N.
+// COUNTERFACTUAL: delete the DESC flip in listSQL → the OLDEST are returned.
+func TestList_NewestFirstWindow(t *testing.T) {
+	f := newChainFixture(t)
+	ctx := context.Background()
+	s := NewStore(f.pool)
+	var rows []Row
+	for seq := int64(401); seq <= 405; seq++ {
+		rows = append(rows, sampleRow(f.runA, seq))
+	}
+	if err := s.UpsertBatch(ctx, rows); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	got, err := s.List(ctx, ListFilter{Newest: true, Limit: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("window size = %d, want 2", len(got))
+	}
+	if got[0].SourceSequence != 405 || got[1].SourceSequence != 404 {
+		t.Errorf("window = %d,%d, want the newest 405,404", got[0].SourceSequence, got[1].SourceSequence)
+	}
+
+	oldest, err := s.List(ctx, ListFilter{Limit: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oldest[0].SourceSequence != 401 {
+		t.Errorf("ascending window starts at %d, want 401 (the pre-#3731 order must be unchanged)", oldest[0].SourceSequence)
+	}
+}
+
+// TestGateContext_DerivesFromRunStagePlanAndEscalation pins that a gate
+// reference resolves through the SAME plan-artifact and escalation joins the
+// indexer used — including that a DIFFERENT stage's escalation is not picked up.
+func TestGateContext_DerivesFromRunStagePlanAndEscalation(t *testing.T) {
+	f := newChainFixture(t)
+	ctx := context.Background()
+	s := NewStore(f.pool)
+
+	f.seedPlan(t, f.planStageA, time.Now().UTC().Add(-time.Hour), "b/z.go", "a/x.go", "a/x.go")
+	// A DIFFERENT stage's escalation must not be picked up...
+	f.appendEntry(t, f.runA, &f.planStageA, "escalation_fired",
+		map[string]any{"fired_keys": []string{"other_stage_rule"}})
+	// ...and on the SAME stage, an EARLIER escalation must be SUPERSEDED by the
+	// latest one, not unioned with it. Without a second same-stage entry, a
+	// mutation replacing LatestEscalationKeys with a union over the candidates
+	// would be unobservable (the candidate query already filters to one stage),
+	// so this entry is what isolates the "latest" semantics.
+	f.appendEntry(t, f.runA, &f.implStageA, "escalation_fired",
+		map[string]any{"fired_keys": []string{"superseded_rule"}})
+	f.appendEntry(t, f.runA, &f.implStageA, "escalation_fired",
+		map[string]any{"fired_keys": []string{"scope_cap_exceeded", "autonomy_low"}})
+
+	gc, err := s.GateContext(ctx, GateRef{RunID: f.runA, StageID: &f.implStageA, AccountID: &f.accountA})
+	if err != nil {
+		t.Fatalf("GateContext: %v", err)
+	}
+	if gc.Repo != "acme/widgets" || gc.WorkflowID != "feature_change" || gc.DoctrineVersion != "sha-a" {
+		t.Errorf("run facts = %q/%q/%q, want acme/widgets/feature_change/sha-a", gc.Repo, gc.WorkflowID, gc.DoctrineVersion)
+	}
+	if gc.StageKind != "implement" {
+		t.Errorf("stage kind = %q, want implement", gc.StageKind)
+	}
+	if len(gc.TouchedPaths) != 2 || gc.TouchedPaths[0] != "a/x.go" || gc.TouchedPaths[1] != "b/z.go" {
+		t.Errorf("touched paths = %v, want the sorted de-duplicated [a/x.go b/z.go]", gc.TouchedPaths)
+	}
+	if len(gc.EscalationKeys) != 2 || gc.EscalationKeys[0] != "autonomy_low" || gc.EscalationKeys[1] != "scope_cap_exceeded" {
+		t.Errorf("escalation keys = %v, want ONLY the LATEST same-stage entry's sorted keys", gc.EscalationKeys)
+	}
+	for _, k := range gc.EscalationKeys {
+		if k == "superseded_rule" {
+			t.Errorf("an EARLIER same-stage escalation's key leaked in: %v", gc.EscalationKeys)
+		}
+	}
+
+	// No stage id: the plan still resolves, escalation keys are empty.
+	noStage, err := s.GateContext(ctx, GateRef{RunID: f.runA, AccountID: &f.accountA})
+	if err != nil {
+		t.Fatalf("GateContext without a stage: %v", err)
+	}
+	if len(noStage.EscalationKeys) != 0 {
+		t.Errorf("escalation keys without a stage = %v, want empty", noStage.EscalationKeys)
+	}
+	if len(noStage.TouchedPaths) != 2 {
+		t.Errorf("touched paths without a stage = %v, want the run's plan paths", noStage.TouchedPaths)
+	}
+}
+
+// TestGateContext_RunMissing covers the THREE indistinguishable misses (binding
+// condition 1): a nonexistent run, a run in ANOTHER account, and a stage that is
+// not on the run. Each returns the named ErrRunMissing and NO derived context.
+//
+// COUNTERFACTUALS: delete the account arm from gateContextSQL's WHERE → the
+// foreign-account arm resolves and is RED; delete the stage EXISTS arm → the
+// wrong-stage arm resolves (with an empty stage kind) and is RED.
+func TestGateContext_RunMissing(t *testing.T) {
+	f := newChainFixture(t)
+	ctx := context.Background()
+	s := NewStore(f.pool)
+	f.seedPlan(t, f.planStageA, time.Now().UTC(), "a/x.go")
+
+	cases := []struct {
+		name string
+		ref  GateRef
+	}{
+		{"nonexistent run", GateRef{RunID: uuid.New(), AccountID: &f.accountA}},
+		{"run in another account", GateRef{RunID: f.runB, AccountID: &f.accountA}},
+		{"stage not on the run", GateRef{RunID: f.runA, StageID: &f.planStgB, AccountID: &f.accountA}},
+		{"tenanted run, account-less caller", GateRef{RunID: f.runA}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gc, err := s.GateContext(ctx, tc.ref)
+			if !errors.Is(err, ErrRunMissing) {
+				t.Fatalf("err = %v, want ErrRunMissing", err)
+			}
+			if gc.Repo != "" || len(gc.TouchedPaths) != 0 || len(gc.EscalationKeys) != 0 {
+				t.Errorf("a miss returned derived context %+v, want the zero value", gc)
+			}
+		})
+	}
+
+	// Positive control for the account arm: the run's OWN account resolves, so
+	// the misses above are the predicate biting and not a broken fixture.
+	if _, err := s.GateContext(ctx, GateRef{RunID: f.runB, AccountID: &f.accountB}); err != nil {
+		t.Fatalf("run B under account B: %v", err)
+	}
+}

@@ -145,6 +145,99 @@ while the server silently diverges. The envelope is deterministic (fixed
 declaration order with a trailing newline), so a mismatch is real drift, not a
 flake — it fails with the exact refresh command.
 
+## Precedent query (`precedent.go`, E75.3 / #3731, ADR-082 #3728 decision (b))
+
+`GET /v0/precedent` returns prior decisions of ONE class from ONE repository,
+ranked by `backend/internal/precedent`'s pure scorer. Read-only: it writes
+nothing, mints NO audit entry, and grants no authority. Wire contract:
+`docs/api/v0.md` § "Precedent query". Scoring contract:
+`backend/internal/precedent/README.md`.
+
+`Config.PrecedentIndex` is the one new field — a `List` + `GateContext`
+interface `*decisionindex.Store` satisfies. Nil answers 503
+`precedent_unconfigured` (the absent-not-disabled posture
+`handleGetCalibration` uses), which makes dropping the `serve.go` wiring a
+partial rollback that needs no revert.
+
+### Two input modes
+
+- **Explicit context** — `repo` + `decision_class` required, plus `stage_kind`,
+  repeatable `paths`, `concern_category` (run through
+  `decisionindex.NormalizeConcernCategory`, so a raw reviewer spelling matches
+  the canonical indexed value), `severity`, repeatable `escalation_keys`.
+- **Gate reference** — `run_id` (+ optional `stage_id`). `PrecedentIndex.GateContext`
+  derives the repository, stage kind, touched paths and fired escalation keys.
+  `decision_class` stays REQUIRED: a gate does not determine which CLASS of
+  decision the caller is asking about, and inferring one from the stage kind
+  would be a guess the response could not explain.
+
+An explicit field supplied alongside a gate reference OVERRIDES the derived
+value, and `resolved_context` echoes what the ranking was performed against.
+
+### Narrowing (binding condition 1 of the #3731 approval)
+
+Three layers, and none of them substitutes for another.
+
+**ACCOUNT, on the run read.** The gate-reference resolve is ACCOUNT-SCOPED at the
+resolve, not afterwards: the caller's account travels into `GateRef`, so a run in
+another account is INDISTINGUISHABLE from a nonexistent one — both, and a stage
+that is not on the named run, answer the same 404 with NO `resolved_context`
+echoed and the candidate window never queried.
+
+**ACCOUNT, on the row set.** The candidate window is read with
+`decisionindex.ListFilter.AccountScoped`, so an identity carrying NO workspace
+account (a bearer token, the untenanted posture) matches only UNTENANTED rows —
+the same stricter rule the gate resolve applies, rather than `ListFilter`'s
+default nil-matches-all, which is the backfill's row-set predicate. Repository
+visibility cannot stand in for this: two accounts can share a repository, so a
+repo-only check would hand an account-less caller another tenant's decisions AND
+their query-time reason prose. `TestPrecedent_AccountLessIdentityReadsOnlyUntenantedRows`
+and `TestPrecedentPG_AccountLessIdentityReadsOnlyUntenantedRows` pin it with the
+foreign row in the SAME repository and a distinct reason on the chain, so a leak
+surfaces the prose and not merely the row's existence.
+
+**REPOSITORY.** EVERY repository whose context reaches the response is subject to
+the point-read repo-visibility DENY (`enforceRepoVisibility`, 403
+`repo_forbidden`), because a precedent item carries a decision's reason prose.
+That is the repository the ranking runs against AND, in gate-reference mode, the
+repository the derived context came FROM — checked BEFORE a single derived key is
+adopted. Checking only the former would let a caller pair a gate reference from a
+repository they CANNOT read with an explicit `repo` they can, and receive the
+source repository's derived touched paths and escalation keys inside
+`resolved_context`; `TestPrecedent_GateReferenceSourceRepoMustBeVisible` denies
+the derived repository while ALLOWING the explicit one, so the derived-repository
+check is the only thing in that fixture's path.
+
+`callerAccountUUID` FAILS CLOSED on a non-empty `Identity.AccountID` that is not
+a UUID (500) rather than widening the read to every account: the field is written
+from a sessions row, so an unparseable value is a corrupted invariant. Its nil
+return (the untenanted posture) is safe only because every consumer pairs it with
+`AccountScoped` or with `GateRef`, which is scoped by construction.
+
+### Reason excerpts are read at query time
+
+ADR-082 rule 1: the prose is never copied into the index. `attachReasonExcerpts`
+reads each DISTINCT run's chain ONCE via `AuditRepo.ListForRun`, finds the entry
+at `reason_sequence`, takes `payload[reason_key]` and caps it to 280 bytes with a
+truncation marker. The read count is therefore bounded by `limit` (max 50, and an
+over-max limit is REFUSED rather than clamped so the bound is real). Five failure
+modes each yield NO excerpt plus a NAMED `degraded[]` reason — nil audit
+repository, failed read, missing entry, missing key, non-string value — never a
+fabricated excerpt and never a failed request. The degradation list is SORTED
+because it is assembled from a map iteration, so two identical requests produce
+byte-identical bodies.
+
+### Bounds
+
+The candidate window is the newest 500 matching rows (`Newest: true`); a FULL
+window sets `truncated` and appends `window_truncated`. The echoed
+`resolved_context` lists are capped at 20 entries each with their untruncated
+totals, so the response size is a function of the ANSWER rather than of the
+request (binding condition 2's server half). Note the PLATFORM ceiling behind
+that: `net/url`'s own query-parameter limit is 10,000 and `r.URL.Query()`
+swallows the resulting error, so a request carrying more parses to an EMPTY query
+and the handler fails CLOSED on the now-missing `decision_class` (400).
+
 ## Account-ownership authorization (ADR-057 / E44.5, #1829)
 
 Handler authorization is tenant-scoped through ONE centralized middleware layer

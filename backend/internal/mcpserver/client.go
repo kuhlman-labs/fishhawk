@@ -16,6 +16,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/digest"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/precedent"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 )
 
@@ -5170,6 +5171,109 @@ func (c *apiClient) GetCalibration(ctx context.Context, p CalibrationParams) (*C
 		path = path + "?" + encoded
 	}
 	var res CalibrationResult
+	if err := c.do(ctx, http.MethodGet, path, nil, &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
+// PrecedentParams scopes a GET /v0/precedent request (E75.3 / #3731). Empty
+// fields drop from the query string; Paths and EscalationKeys are encoded as
+// REPEATED query values, which is what the handler reads them as.
+type PrecedentParams struct {
+	DecisionClass   string
+	Repo            string
+	RunID           string
+	StageID         string
+	StageKind       string
+	Paths           []string
+	ConcernCategory string
+	Severity        string
+	EscalationKeys  []string
+	Limit           int
+}
+
+// PrecedentResolvedContext mirrors the response's resolved_context: what the
+// ranking was actually performed against, after a gate reference was resolved
+// and explicit overrides applied. The lists are CAPPED by the backend, which is
+// why each carries its untruncated total and a truncated marker.
+type PrecedentResolvedContext struct {
+	Repo            string `json:"repo"`
+	DecisionClass   string `json:"decision_class"`
+	StageKind       string `json:"stage_kind,omitempty"`
+	ConcernCategory string `json:"concern_category,omitempty"`
+	Severity        string `json:"severity,omitempty"`
+	RunID           string `json:"run_id,omitempty"`
+	StageID         string `json:"stage_id,omitempty"`
+
+	TouchedPaths          []string `json:"touched_paths"`
+	TouchedPathsTotal     int      `json:"touched_paths_total"`
+	TouchedPathsTruncated bool     `json:"touched_paths_truncated,omitempty"`
+
+	EscalationKeys          []string `json:"escalation_keys"`
+	EscalationKeysTotal     int      `json:"escalation_keys_total"`
+	EscalationKeysTruncated bool     `json:"escalation_keys_truncated,omitempty"`
+}
+
+// PrecedentDegraded names one thing the precedent response could not include.
+type PrecedentDegraded struct {
+	Reason         string `json:"reason"`
+	SourceSequence int64  `json:"source_sequence,omitempty"`
+	RunID          string `json:"run_id,omitempty"`
+	Detail         string `json:"detail,omitempty"`
+}
+
+// PrecedentResult mirrors the GET /v0/precedent response body.
+//
+// Summary and Results reuse backend/internal/precedent's OWN types rather than
+// re-declaring them: the ranked-item shape has exactly one definition in the
+// tree, so a field rename cannot make the REST body and this mirror silently
+// disagree. (The cross-module wire-parity guard exists for structs the backend
+// and the RUNNER duplicate across a module boundary; there is no boundary here
+// to duplicate across.)
+type PrecedentResult struct {
+	ResolvedContext PrecedentResolvedContext `json:"resolved_context"`
+	Summary         precedent.Summary        `json:"summary"`
+	Results         []precedent.Item         `json:"results"`
+	Truncated       bool                     `json:"truncated"`
+	Degraded        []PrecedentDegraded      `json:"degraded,omitempty"`
+}
+
+// GetPrecedent calls GET /v0/precedent: prior decisions of one class from one
+// repository, ranked with an explained score.
+func (c *apiClient) GetPrecedent(ctx context.Context, p PrecedentParams) (*PrecedentResult, error) {
+	q := url.Values{}
+	for k, v := range map[string]string{
+		"decision_class":   p.DecisionClass,
+		"repo":             p.Repo,
+		"run_id":           p.RunID,
+		"stage_id":         p.StageID,
+		"stage_kind":       p.StageKind,
+		"concern_category": p.ConcernCategory,
+		"severity":         p.Severity,
+	} {
+		if v != "" {
+			q.Set(k, v)
+		}
+	}
+	for _, v := range p.Paths {
+		if v != "" {
+			q.Add("paths", v)
+		}
+	}
+	for _, v := range p.EscalationKeys {
+		if v != "" {
+			q.Add("escalation_keys", v)
+		}
+	}
+	if p.Limit > 0 {
+		q.Set("limit", strconv.Itoa(p.Limit))
+	}
+	path := "/v0/precedent"
+	if encoded := q.Encode(); encoded != "" {
+		path = path + "?" + encoded
+	}
+	var res PrecedentResult
 	if err := c.do(ctx, http.MethodGet, path, nil, &res); err != nil {
 		return nil, err
 	}

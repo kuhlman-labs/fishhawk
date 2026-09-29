@@ -499,3 +499,125 @@ describe('repo dashboard rollups (E40.3 / #1714)', () => {
     expect(fetchMock.mock.calls[0][0]).toBe('/healthz');
   });
 });
+
+/*
+ * Compliance-export reads (E40.6 / #1718). These two bypass `request`
+ * because partiality and continuation ride RESPONSE HEADERS, so the
+ * header parsing and the error-envelope path are worth pinning directly.
+ */
+describe('api.getAuditExportPage', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  function stub(status: number, body: string, headers: Record<string, string> = {}) {
+    const fetchMock = vi.fn(
+      async () =>
+        new Response(body, { status, headers: { 'Content-Type': 'application/json', ...headers } }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    return fetchMock;
+  }
+
+  const OK_BODY = '{"schema":"v1","exported_at":"2026-09-20T12:00:00Z","runs":{}}';
+
+  it('encodes repo once and carries limit', async () => {
+    const fetchMock = stub(200, OK_BODY, { 'X-Fishhawk-Export-Complete': 'true' });
+    await api.getAuditExportPage({ repo: 'acme/app', limit: 25 });
+    expect(String(fetchMock.mock.calls[0][0])).toBe('/v0/audit/export?repo=acme%2Fapp&limit=25');
+    expect(headerOf(lastInit(fetchMock), 'Accept')).toBe('application/json');
+  });
+
+  it('omits limit when the caller does not set one', async () => {
+    const fetchMock = stub(200, OK_BODY, { 'X-Fishhawk-Export-Complete': 'true' });
+    await api.getAuditExportPage({ repo: 'acme/app' });
+    expect(String(fetchMock.mock.calls[0][0])).toBe('/v0/audit/export?repo=acme%2Fapp');
+  });
+
+  it("reads complete only from the EXACT string 'true', and the next cursor", async () => {
+    stub(200, OK_BODY, {
+      'X-Fishhawk-Export-Complete': 'true',
+      'X-Fishhawk-Export-Next-Cursor': 'cur-1',
+    });
+    const page = await api.getAuditExportPage({ repo: 'acme/app' });
+    expect(page.complete).toBe(true);
+    expect(page.nextCursor).toBe('cur-1');
+    expect(page.data.schema).toBe('v1');
+  });
+
+  it("treats the literal 'false' as not complete", async () => {
+    stub(200, OK_BODY, { 'X-Fishhawk-Export-Complete': 'false' });
+    expect((await api.getAuditExportPage({ repo: 'acme/app' })).complete).toBe(false);
+  });
+
+  it('treats a MISSING complete header as not complete, and a missing cursor as null', async () => {
+    stub(200, OK_BODY);
+    const page = await api.getAuditExportPage({ repo: 'acme/app' });
+    expect(page.complete).toBe(false);
+    expect(page.nextCursor).toBeNull();
+  });
+
+  it('throws ApiClientError carrying status 403 and the parsed details', async () => {
+    stub(
+      403,
+      '{"error":"insufficient_scope","message":"token is missing required scope: read:audit-export","details":{"required_scope":"read:audit-export"}}',
+    );
+    const err = await api.getAuditExportPage({ repo: 'acme/app' }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ApiClientError);
+    const api_err = err as ApiClientError;
+    expect(api_err.status).toBe(403);
+    expect(api_err.body?.details?.required_scope).toBe('read:audit-export');
+    expect(api_err.message).toContain('read:audit-export');
+  });
+
+  it('falls back to a status message when the error body is not JSON', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response('bad gateway', { status: 502 })),
+    );
+    const err = (await api
+      .getAuditExportPage({ repo: 'acme/app' })
+      .catch((e: unknown) => e)) as ApiClientError;
+    expect(err.status).toBe(502);
+    expect(err.message).toBe('request failed: 502');
+  });
+});
+
+describe('api.getAuditExportDownload', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('returns the raw Response so the caller can read body and headers', async () => {
+    const fetchMock = vi.fn(
+      async () =>
+        new Response('{"schema":"v1","exported_at":"2026-09-20T12:00:00Z","runs":{}}', {
+          status: 200,
+          headers: {
+            'Content-Type': 'application/json',
+            'Content-Disposition': 'attachment; filename="export.json"',
+          },
+        }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    const res = await api.getAuditExportDownload({ repo: 'acme/app' });
+    expect(String(fetchMock.mock.calls[0][0])).toBe('/v0/audit/export?repo=acme%2Fapp');
+    expect(res.headers.get('Content-Disposition')).toBe('attachment; filename="export.json"');
+    expect(await res.text()).toContain('"schema":"v1"');
+  });
+
+  it('throws ApiClientError on a non-2xx', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        async () =>
+          new Response('{"error":"audit_unavailable","message":"audit store down"}', {
+            status: 503,
+            headers: { 'Content-Type': 'application/json' },
+          }),
+      ),
+    );
+    const err = (await api
+      .getAuditExportDownload({ repo: 'acme/app' })
+      .catch((e: unknown) => e)) as ApiClientError;
+    expect(err).toBeInstanceOf(ApiClientError);
+    expect(err.status).toBe(503);
+    expect(err.message).toBe('audit store down');
+  });
+});

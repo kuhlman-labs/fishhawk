@@ -9,11 +9,12 @@ import { RepoDashboard } from './repo-dashboard';
 import { Runs } from './runs';
 
 /*
- * Mounts the REAL route with the REAL five panels. The four rollup
+ * Mounts the REAL route with the REAL panels of both tabs. The four rollup
  * endpoints serve the SHARED wire goldens the backend seam test pins
  * (testdata/wire/repodash_*.json, approval condition 3) through a stubbed
  * fetch and the real api client; the in-flight surfaces serve a minimal
- * run list.
+ * run list, and /v0/audit/export serves a clean Export v1 body for the
+ * Record tab's chain-verification badge (E40.6 / #1718).
  */
 const WIRE = resolve(__dirname, '../../../testdata/wire');
 const GOLDEN: Record<string, string> = Object.fromEntries(
@@ -37,6 +38,37 @@ const RUN: Run = {
   updated_at: '2026-09-28T12:00:00Z',
 };
 
+/* A minimal clean Export v1 body for the Record tab's badge (E40.6 / #1718). */
+const EXPORT_RUN_ID = '11111111-1111-4111-8111-111111111111';
+const EXPORT_BODY = JSON.stringify({
+  schema: 'v1',
+  exported_at: '2026-09-20T12:00:00Z',
+  runs: {
+    [EXPORT_RUN_ID]: {
+      signing_key: {
+        public_key: 'AAAA',
+        issued_at: '2026-09-01T00:00:00Z',
+        expires_at: '2026-12-01T00:00:00Z',
+      },
+      audit_entries: [
+        {
+          id: '00000000-0000-4000-8000-000000000001',
+          sequence: 1,
+          run_id: EXPORT_RUN_ID,
+          stage_id: null,
+          ts: '2026-09-19T00:00:00Z',
+          category: 'run_created',
+          actor_kind: 'operator',
+          actor_subject: 'octo',
+          payload: {},
+          prev_hash: null,
+          entry_hash: 'a'.repeat(64),
+        },
+      ],
+    },
+  },
+});
+
 function stubBackend({ failing }: { failing?: string } = {}) {
   const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
     const p = new URL(String(input), 'http://localhost').pathname;
@@ -50,6 +82,12 @@ function stubBackend({ failing }: { failing?: string } = {}) {
     }
     if (p === '/v0/auth/me') {
       return respond(JSON.stringify({ id: 'u1', github_login: 'octo', name: 'Octo', email: null }));
+    }
+    if (p === '/v0/audit/export') {
+      return new Response(EXPORT_BODY, {
+        status: 200,
+        headers: { 'Content-Type': 'application/json', 'X-Fishhawk-Export-Complete': 'true' },
+      });
     }
     if (p === '/v0/runs') return respond(JSON.stringify({ items: [RUN], next_cursor: null }));
     if (p === '/v0/runs/run-1/stages') return respond('{"items":[]}');
@@ -76,6 +114,7 @@ function panel(title: string): HTMLElement {
 }
 
 const PANELS = ['In flight', 'Throughput', 'Economics', 'Health', 'Posture'];
+const RECORD_SECTIONS = ['Chain verification', 'Export', 'Release evidence'];
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -124,6 +163,45 @@ describe('<RepoDashboard>', () => {
       expect(screen.getByRole('heading', { name: title })).toBeInTheDocument();
     }
     expect(within(panel('Throughput')).queryByRole('alert')).toBeNull();
+  });
+
+  it('renders the Record tab at ?tab=record: its sections, no rollup panels, no rollup fetches', async () => {
+    const fetchMock = stubBackend();
+    renderAt('/repos/acme/app?tab=record');
+    await screen.findByText('Pass');
+
+    expect(screen.getAllByRole('heading', { level: 2 }).map((h) => h.textContent)).toEqual(
+      RECORD_SECTIONS,
+    );
+    for (const title of PANELS) {
+      expect(screen.queryByRole('heading', { name: title })).toBeNull();
+    }
+    const urls = fetchMock.mock.calls.map((c) => String(c[0]));
+    expect(urls.some((u) => /\/v0\/repos\/acme\/app\//.test(u))).toBe(false);
+    expect(urls).toContain('/v0/audit/export?repo=acme%2Fapp&limit=25');
+  });
+
+  it('switches between the tabs by link, both ways, marking the selected one', async () => {
+    stubBackend();
+    renderAt('/repos/acme/app');
+    const nav = screen.getByRole('navigation', { name: 'Repository views' });
+    expect(within(nav).getByRole('link', { name: 'Overview' })).toHaveAttribute(
+      'aria-current',
+      'page',
+    );
+    await waitFor(() => expect(screen.getByText('Merged changes')).toBeInTheDocument());
+
+    fireEvent.click(within(nav).getByRole('link', { name: 'Record' }));
+    expect(await screen.findByRole('heading', { name: 'Chain verification' })).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'Throughput' })).toBeNull();
+    expect(within(nav).getByRole('link', { name: 'Record' })).toHaveAttribute(
+      'aria-current',
+      'page',
+    );
+
+    fireEvent.click(within(nav).getByRole('link', { name: 'Overview' }));
+    expect(await screen.findByRole('heading', { name: 'Throughput' })).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'Chain verification' })).toBeNull();
   });
 });
 

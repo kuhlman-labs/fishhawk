@@ -41,7 +41,7 @@ _Generated from the canonical sources by `scripts/gen-site-reference`; do not ed
 
 ## Operations
 
-The v0 REST API exposes **136 operations** across the paths below, generated from [`docs/api/v0.openapi.yaml`](https://github.com/kuhlman-labs/fishhawk/blob/main/docs/api/v0.openapi.yaml). That document is the source of truth; this table is its published rendering.
+The v0 REST API exposes **137 operations** across the paths below, generated from [`docs/api/v0.openapi.yaml`](https://github.com/kuhlman-labs/fishhawk/blob/main/docs/api/v0.openapi.yaml). That document is the source of truth; this table is its published rendering.
 
 | Method | Path | Summary |
 |---|---|---|
@@ -133,6 +133,7 @@ The v0 REST API exposes **136 operations** across the paths below, generated fro
 | `POST` | `/v0/refinement/sessions/{session_id}/decision` | Approve or reject the latest refinement draft revision |
 | `POST` | `/v0/refinement/sessions/{session_id}/file` | File an approved refinement draft into tracker items |
 | `GET` | `/v0/calibration` | Get runtime calibration statistics |
+| `GET` | `/v0/precedent` | Query prior decisions of the same kind (precedent) |
 | `GET` | `/v0/repos/{owner}/{name}/throughput` | Get a repository's throughput rollup |
 | `GET` | `/v0/repos/{owner}/{name}/health` | Get a repository's health rollup |
 | `GET` | `/v0/repos/{owner}/{name}/economics` | Get a repository's economics rollup |

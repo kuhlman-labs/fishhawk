@@ -7,6 +7,7 @@ import type {
   Artifact,
   AttentionList,
   AuditEntry,
+  AuditExport,
   Campaign,
   CampaignState,
   CampaignStatus,
@@ -112,6 +113,23 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     return undefined as T;
   }
   return (await res.json()) as T;
+}
+
+/*
+ * Shared non-2xx → ApiClientError conversion for the header-reading
+ * export fetches, which cannot go through `request` (it discards the
+ * Response). Mirrors `request`'s envelope parsing so a 403 still carries
+ * the parsed `details.required_scope` the Record tab's re-auth panel names.
+ */
+async function exportError(res: Response): Promise<ApiClientError> {
+  let body: ApiError | null = null;
+  try {
+    body = (await res.json()) as ApiError;
+  } catch {
+    // Non-JSON error body (e.g. plain text from a proxy). Fine.
+  }
+  const msg = body?.message ?? body?.error ?? `request failed: ${res.status}`;
+  return new ApiClientError(res.status, body, msg);
 }
 
 export const api = {
@@ -306,6 +324,52 @@ export const api = {
       const msg = body?.message ?? body?.error ?? `request failed: ${res.status}`;
       throw new ApiClientError(res.status, body, msg);
     }
+    return res;
+  },
+
+  /**
+   * One page of the compliance export (Export v1, ADR-054 / #1604), for
+   * the repo Record tab's chain-verification badge.
+   *
+   * Bypasses `request` because partiality and continuation ride RESPONSE
+   * HEADERS (X-Fishhawk-Export-Complete / X-Fishhawk-Export-Next-Cursor)
+   * and never the body — the verifier strict-decodes the three-field body,
+   * so no marker can be added to it. `complete` is the header compared to
+   * the EXACT string 'true': any other value, INCLUDING a missing header,
+   * is read as NOT complete, so we fail toward declaring partiality rather
+   * than silently claiming a whole-corpus verification.
+   */
+  async getAuditExportPage(params: {
+    repo: string;
+    limit?: number;
+  }): Promise<{ data: AuditExport; complete: boolean; nextCursor: string | null }> {
+    const q = new URLSearchParams();
+    q.set('repo', params.repo);
+    if (params.limit !== undefined) q.set('limit', String(params.limit));
+    const res = await fetch(`/v0/audit/export?${q.toString()}`, {
+      credentials: 'include',
+      headers: { Accept: 'application/json' },
+    });
+    if (!res.ok) throw await exportError(res);
+    return {
+      data: (await res.json()) as AuditExport,
+      complete: res.headers.get('X-Fishhawk-Export-Complete') === 'true',
+      nextCursor: res.headers.get('X-Fishhawk-Export-Next-Cursor'),
+    };
+  },
+
+  /**
+   * The same export page as a RAW Response, so the caller can read both
+   * the body bytes (for a Blob download) and Content-Disposition.
+   */
+  async getAuditExportDownload(params: { repo: string }): Promise<Response> {
+    const q = new URLSearchParams();
+    q.set('repo', params.repo);
+    const res = await fetch(`/v0/audit/export?${q.toString()}`, {
+      credentials: 'include',
+      headers: { Accept: 'application/json' },
+    });
+    if (!res.ok) throw await exportError(res);
     return res;
   },
 

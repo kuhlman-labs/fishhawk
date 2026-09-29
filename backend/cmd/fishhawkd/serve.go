@@ -2420,6 +2420,12 @@ func runServe(args []string, logSink io.Writer) int {
 		cfg.DigestIndex = decisionindex.NewStore(pool)
 		cfg.ApprovalRepo = approval.NewPostgresRepository(pool)
 		cfg.ArtifactRepo = artifact.NewPostgresRepository(pool)
+		// GET /v0/precedent's read surface (E75.3 / #3731). The SAME store the
+		// indexing audit decorator above writes through, so a query reads the
+		// rows the live writer just wrote. Dropping this ONE line is the
+		// partial rollback: the endpoint then answers 503
+		// precedent_unconfigured and every other surface is unchanged.
+		cfg.PrecedentIndex = decisionindex.NewStore(pool)
 		// Dev-only seeded-fixture applier (E72.2 / #3326). Bound to the
 		// Postgres repositories just wired — cfg.RunRepo is the concrete
 		// run.Repository, which satisfies devfixtures.RunStore directly.

@@ -1,0 +1,13 @@
+id: scenario:issue-3731/gate-reference-derives-context
+statement: A precedent query by gate reference (run_id + stage_id) returns a resolved_context whose repository, stage kind, touched paths and escalation keys match the referenced run's plan artifact and same-stage escalation_fired entry; a gate reference to a run in another account is refused exactly like a nonexistent run.
+steps: '1) POST /v0/dev/fixtures {"scenario":"plan-gate-parked"}, then GET /v0/precedent?run_id={run}&stage_id={plan}&decision_class=plan_approval, compared with GET /v0/stages/{plan}/artifacts and GET /v0/runs/{run}/audit. 2) POST /v0/dev/fixtures {"scenario":"trace-upload-target"}, then signing-key, a signed prompt fetch, and a signed POST /v0/runs/{run}/plan?stage_id={plan} of a plan scoping docs/METHODOLOGY.md and docs/api/v0.openapi.yaml, then the same gate-reference GET plus GET /v0/runs/{run}/audit?category=escalation_fired. 3) Refusals: a nonexistent run_id (00000000-0000-4000-8000-000000000000), and a real run paired with another run''s stage. Posture B support: TestPrecedent_GateReferenceForeignAccountIs404, TestPrecedent_GateReferenceResolvesAndEchoes and TestPrecedent_ResolvedContextListsCapped pass. The PG variants could not run (sandbox).'
+assertions:
+    expected: The derived context matches the plan artifact and escalation entry, and a foreign-account run is refused like a nonexistent one.
+    observed_at_record: 'resolved_context matched the plan artifacts: repo kuhlman-labs/fishhawk, stage_kind plan, touched_paths [README.md] and then [docs/METHODOLOGY.md, docs/api/v0.openapi.yaml], with run_id and stage_id echoed. escalation_keys was [] and the audit held no escalation_fired entries. The nonexistent run and the stage-not-on-run case both returned 404 not_found ''no such run (or the stage does not belong to it)'' with no context echoed. A foreign-account run could not be created live, so that case rests on the unit test.'
+    repro_handle: curl 'http://localhost:8090/v0/precedent?run_id=<run>&stage_id=<plan>&decision_class=plan_approval'
+origin:
+    issue: 3731
+    pr: 3846
+    run_id: 99552e1e-9bf6-42b0-ae70-cb32562b9f60
+    head_sha: 76cb68069de0884cb91dc1e998fe822ffaa7b1eb
+    recorded_at: 2026-09-29T05:16:17Z
