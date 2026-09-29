@@ -203,22 +203,10 @@ export interface AuditEntry {
  * to a driveable tier.
  */
 export type CampaignState =
-  | 'pending'
-  | 'running'
-  | 'paused'
-  | 'awaiting_human'
-  | 'succeeded'
-  | 'failed'
-  | 'cancelled';
+  'pending' | 'running' | 'paused' | 'awaiting_human' | 'succeeded' | 'failed' | 'cancelled';
 
 export type CampaignItemState =
-  | 'pending'
-  | 'blocked'
-  | 'running'
-  | 'paused'
-  | 'succeeded'
-  | 'failed'
-  | 'cancelled';
+  'pending' | 'blocked' | 'running' | 'paused' | 'succeeded' | 'failed' | 'cancelled';
 
 export type PausePolicy = 'pause_campaign' | 'pause_item';
 
