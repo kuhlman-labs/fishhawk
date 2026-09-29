@@ -14819,10 +14819,15 @@ paths:
         untruncated totals reported.
 
         NARROWING: the row window and the gate-reference resolve are both bound
-        to the caller's workspace account, and the repository is subject to the
-        point-read repo-visibility check. A run in another account, or a stage
-        that is not on the named run, answers the SAME 404 as a nonexistent
-        run, with no resolved context echoed.
+        to the caller's workspace account, and an identity carrying NO workspace
+        account matches ONLY untenanted rows rather than every account's —
+        repository visibility does not separate two accounts sharing one
+        repository. A run in another account, or a stage that is not on the
+        named run, answers the SAME 404 as a nonexistent run, with no resolved
+        context echoed. EVERY repository whose context reaches the response is
+        subject to the point-read repo-visibility check: the one the ranking
+        runs against AND, in gate-reference mode, the one the derived paths and
+        escalation keys came FROM, even when an explicit `repo` overrides it.
       tags: [precedent]
       parameters:
         - name: decision_class
@@ -14891,7 +14896,12 @@ paths:
             `stage_id` is not a UUID, or `limit` is out of range.
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403':
-          description: "`repo_forbidden` — no forge read access to the repository."
+          description: >-
+            `repo_forbidden` — no forge read access to a repository whose
+            context would reach the response: the `repo` the ranking runs
+            against, or the repository a `run_id` gate reference derived its
+            paths and escalation keys FROM, even when an explicit `repo`
+            overrides it.
         '404':
           description: >-
             `not_found` — no such run, the run belongs to another workspace

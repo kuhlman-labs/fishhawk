@@ -74,22 +74,40 @@ Two ADDITIVE reads `GET /v0/precedent` needs. Both are match-all when zero, so
 every pre-#3731 caller (the backfill, `check`, the writer parity tests) is
 byte-unchanged.
 
-### `ListFilter.AccountID` + `ListFilter.Newest`
+### `ListFilter.AccountID` + `ListFilter.AccountScoped` + `ListFilter.Newest`
 
 - `AccountID` is a `*uuid.UUID`. **NON-NIL** matches a row whose `account_id`
   EQUALS it **OR IS NULL** — the same predicate as the
   `decision_index_tenant_isolation` RLS policy, so a tenanted caller sees its own
   rows plus the untenanted ones and never another account's. Admitting the NULL
   rows is deliberate parity, not a leak: a single-tenant deployment writes
-  NULL-account rows and would otherwise see nothing (the #1829 window). **NIL**
-  matches any row — the un-narrowed backfill / CLI path.
+  NULL-account rows and would otherwise see nothing (the #1829 window).
+- `AccountScoped` decides what a **NIL** `AccountID` means, and the two readings
+  are not interchangeable:
+  - `false` (the zero value) — NIL matches **any** row. This is the ROW-SET
+    predicate the backfill and the CLI depend on; they run as the deployment,
+    not as a caller.
+  - `true` — NIL matches **only untenanted** rows. This is the READ SCOPE a
+    request-serving path must use, because an identity carrying no workspace
+    account (a bearer token, the untenanted posture) is a legitimate caller and
+    nil-matches-all would hand it every account's decisions and their query-time
+    reason prose. Repository visibility cannot stand in for it: two accounts can
+    share a repository, so a repo-only check does not separate tenants.
+    `GateRef.AccountID` already applies exactly this stricter rule to a run read
+    (below); `AccountScoped` is the same rule for the row set, which is what
+    makes a read path isolated by ACCOUNT rather than by repository alone.
+  The rendered arm is one predicate: `account_id IS NULL OR account_id = $5 OR
+  (NOT $6 AND $5 IS NULL)`.
 - `Newest` flips `ORDER BY source_sequence` to `DESC`, so a bounded `Limit`
   yields the NEWEST N rather than the oldest N: what a precedent candidate
   window needs. Consumers re-sort, so no wire order depends on the flag.
 
-`TestList_AccountNarrowing` runs as the admin role, which BYPASSES RLS, so the
-SQL predicate is the only thing in the path — were it run under RLS the policy
-would mask a deleted `WHERE` arm and the case would prove nothing.
+`TestList_AccountNarrowing` and
+`TestList_AccountScopedNarrowsAnAccountLessCaller` both run as the admin role,
+which BYPASSES RLS, so the SQL predicate is the only thing in the path — were
+they run under RLS the policy would mask a deleted `WHERE` arm and the cases
+would prove nothing. Both seed their tenanted and untenanted rows in the SAME
+repository, so no other `WHERE` arm can stand in for the account one either.
 
 ### `Store.GateContext(ctx, GateRef)`
 
@@ -106,9 +124,10 @@ condition 1). `GateRef.AccountID` narrows the resolve itself, with the predicate
 `account_id IS NULL OR account_id = $n` — `server.enforceAccount`'s ownership
 rule byte for byte, including that a NIL account (a caller carrying no workspace
 account) matches ONLY untenanted runs, exactly as `requireRunAccount` refuses
-such a caller on a tenanted run. This is deliberately STRICTER than
-`ListFilter.AccountID`'s nil-matches-all: that one is the backfill's row-set
-predicate, this one is a run READ.
+such a caller on a tenanted run. This matches
+`ListFilter` under `AccountScoped: true` and is STRICTER than `ListFilter`'s
+default nil-matches-all, which is the backfill's row-set predicate rather than a
+caller-serving read.
 
 The stage predicate is an `EXISTS` in the `WHERE`, not the `LEFT JOIN`'s
 condition, so a stage id naming a stage on a DIFFERENT run makes the whole

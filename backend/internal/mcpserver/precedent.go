@@ -50,12 +50,25 @@ type PrecedentOutput struct {
 	Elisions        *Elisions                `json:"elisions,omitempty"`
 }
 
-// precedentFloorListCap bounds each resolved-context list the FLOOR tier keeps.
+// precedentFloorListCap bounds each list the FLOOR tier keeps — the two
+// resolved-context lists and the summary's doctrine-version set.
+//
 // The backend already caps its echo, but the floor's bound must not DEPEND on
-// that: a resolved context echoing thousands of paths would put the
-// summary-only floor above the byte budget and the ladder could not converge
-// (#3731 binding condition 2). Capped here, the floor has a fixed maximum.
-const precedentFloorListCap = 20
+// that: a resolved context echoing thousands of paths would put the summary-only
+// floor above the byte budget and the ladder could not converge (#3731 binding
+// condition 2). Capped here, the floor has a fixed maximum.
+//
+// THE VALUE IS SIZE-DERIVED, not chosen for readability. The floor keeps THREE
+// such lists, each element up to floorFieldCap encoded bytes, plus the scalars
+// and the aggregate elision prose: at the backend echo's own cap of 20 the
+// worst case measures ~7.2KB, well past mcpConvergenceFloorBytes, so 20 would
+// make the floor tier unable to converge on maximal content. 8 leaves headroom
+// at the measured worst case, which
+// TestPrecedentTool_FloorIsBoundedByAnOversizedSummary pins with every list
+// oversized and every element at the cap. It is deliberately TIGHTER than the
+// backend's precedentResolvedContextListCap: the floor is the last resort, below
+// the echo, and it is the tier whose size must be a constant.
+const precedentFloorListCap = 8
 
 // precedentSurface is the unbounded retrieval surface every precedent elision
 // names: the same query over REST, which the MCP byte budget does not bound.
@@ -127,9 +140,10 @@ func (r *runResolver) precedent(ctx context.Context, req *mcp.CallToolRequest, i
 //	B2    drop items from the TAIL of the ranked list. The tail is the WEAKEST
 //	      precedent, so the retained PREFIX is the answer's substance — the one
 //	      direction in which dropping is not arbitrary.
-//	FLOOR summary + a length-and-byte-capped resolved_context, results[]
-//	      entirely elided under one aggregate entry. This is what makes the
-//	      bound hold even when ONE result plus the summary exceeds the budget.
+//	FLOOR a length-and-byte-capped summary + a length-and-byte-capped
+//	      resolved_context, results[] entirely elided under one aggregate entry.
+//	      This is what makes the bound hold even when ONE result plus the
+//	      summary exceeds the budget.
 func boundPrecedentOutput(out PrecedentOutput, budget responseBudget) (PrecedentOutput, error) {
 	set := func(o *PrecedentOutput, e *Elisions) { o.Elisions = e }
 
@@ -193,15 +207,49 @@ func boundPrecedentOutput(out PrecedentOutput, budget responseBudget) (Precedent
 	return precedentFloor(out, budget, total)
 }
 
-// precedentFloor keeps the summary and a capped resolved_context with results[]
-// entirely elided, guaranteeing convergence under
+// precedentFloor keeps a CAPPED summary and a capped resolved_context with
+// results[] entirely elided, guaranteeing convergence under
 // max(budget, mcpConvergenceFloorBytes). Every retained string is capped
-// escape-aware and every retained list is length-capped, so the floor's size is
-// a CONSTANT rather than a function of the request.
+// escape-aware and every retained list is length-capped — in the summary as well
+// as in the resolved context.
+//
+// THE FIT IS MEASURED, NOT INFERRED FROM THE CAPS. The caps alone cannot carry
+// the guarantee: the floor retains THREE capped lists, SEVEN capped scalars and
+// the aggregate elision prose, and at the backend echo's own list cap of 20 the
+// worst case measures ~7.2KB — past mcpConvergenceFloorBytes with every
+// individual cap still "correct". Worse, that sum moves whenever the prose is
+// edited or one more field is retained, so a hand-tuned constant would silently
+// stop holding. So the floor is BUILT, MEASURED, and rebuilt with the list cap
+// HALVED until it fits (8 → 4 → 2 → 1 → 0), which converges by construction:
+// at cap 0 the floor is scalars plus prose, whose fit is pinned by
+// TestPrecedentTool_FloorFitsWithNoListsAtAll. The retained totals and the
+// truncation marks survive every step, so a further-shrunk floor still reports
+// how much there was, and the elision prose names the cap ACTUALLY used rather
+// than the starting one.
 func precedentFloor(out PrecedentOutput, budget responseBudget, total int) (PrecedentOutput, error) {
+	bound := max(budget.bytes, mcpConvergenceFloorBytes)
+	for listCap := precedentFloorListCap; ; listCap /= 2 {
+		floor, err := buildPrecedentFloor(out, budget, total, listCap)
+		if err != nil {
+			return out, err
+		}
+		n, err := marshalledLen(floor)
+		if err != nil {
+			return out, err
+		}
+		if n <= bound || listCap == 0 {
+			return floor, nil
+		}
+	}
+}
+
+// buildPrecedentFloor renders one candidate floor at a given list cap. Split out
+// of precedentFloor so the measured shrink re-renders the elision prose with the
+// cap it actually applied.
+func buildPrecedentFloor(out PrecedentOutput, budget responseBudget, total, listCap int) (PrecedentOutput, error) {
 	floor := PrecedentOutput{
-		ResolvedContext: capPrecedentResolvedContext(out.ResolvedContext),
-		Summary:         out.Summary,
+		ResolvedContext: capPrecedentResolvedContext(out.ResolvedContext, listCap),
+		Summary:         capPrecedentSummary(out.Summary, listCap),
 		Results:         []precedent.Item{},
 		Truncated:       true,
 	}
@@ -212,8 +260,8 @@ func precedentFloor(out PrecedentOutput, budget responseBudget, total int) (Prec
 		note:   "reduced to the constant-size floor: the agreement summary plus the capped resolved context, with every ranked item omitted. The entry below is an AGGREGATE — the floor tier's explicit exception to per-field itemisation",
 	}
 	led.add(aggregateStoredElision("*", fmt.Sprintf(
-		"every ranked item was omitted (%d dropped) along with every reason excerpt and score breakdown, and the resolved context's lists were capped to %d entries each; truncated is set. The summary is retained because it is the one part that describes the WHOLE result set rather than any one item. The surface below returns the full ranking",
-		total, precedentFloorListCap),
+		"every ranked item was omitted (%d dropped) along with every reason excerpt and score breakdown, and the resolved context's lists plus the summary's doctrine-version set were capped to %d entries each with every retained string capped to %d bytes; truncated is set. The summary is retained because it is the one part that describes the WHOLE result set rather than any one item — its counts and ratio are exact, only its strings are capped. The surface below returns the full ranking",
+		total, listCap, floorFieldCap),
 		[]string{precedentSurface().String()}))
 	w, err := led.wire()
 	if err != nil {
@@ -223,11 +271,40 @@ func precedentFloor(out PrecedentOutput, budget responseBudget, total int) (Prec
 	return floor, nil
 }
 
-// capPrecedentResolvedContext bounds the echoed context: every scalar capped
-// escape-aware, every list capped in LENGTH and each retained element capped in
-// BYTES. The untruncated totals the backend reported are preserved, so the
-// caller still learns how much there was.
-func capPrecedentResolvedContext(rc PrecedentResolvedContext) PrecedentResolvedContext {
+// capPrecedentSummary bounds the retained agreement summary at listCap, so the
+// floor's size stops being a function of the INDEXED DATA. It is one input to the
+// bound, not the whole of it — precedentFloor MEASURES the rendered result and
+// shrinks listCap until it fits.
+//
+// Summary's numbers are fixed-width, but two of its fields are index-derived
+// STRINGS: ModalOutcome is an outcome value read out of an audit payload, and
+// DoctrineVersions is a SET whose cardinality grows with the number of charter
+// revisions the scored rows span (unbounded — one entry per distinct
+// runs.workflow_sha). Retaining either uncapped would make the floor grow with
+// the data, which is the one thing the floor tier exists to rule out. The counts,
+// the ratio and HardFilterOnly are kept exact: they are what the summary is FOR,
+// and they cost a bounded number of bytes.
+func capPrecedentSummary(s precedent.Summary, listCap int) precedent.Summary {
+	out := s
+	out.ModalOutcome = capJSONString(s.ModalOutcome, floorFieldCap)
+	kept := s.DoctrineVersions
+	if len(kept) > listCap {
+		kept = kept[:listCap]
+	}
+	versions := make([]string, 0, len(kept))
+	for _, v := range kept {
+		versions = append(versions, capJSONString(v, floorFieldCap))
+	}
+	out.DoctrineVersions = versions
+	return out
+}
+
+// capPrecedentResolvedContext bounds the echoed context at listCap: every scalar
+// capped escape-aware, every list capped in LENGTH and each retained element
+// capped in BYTES. The untruncated totals the backend reported are preserved, so
+// the caller still learns how much there was even after precedentFloor's measured
+// shrink has lowered listCap.
+func capPrecedentResolvedContext(rc PrecedentResolvedContext, listCap int) PrecedentResolvedContext {
 	out := PrecedentResolvedContext{
 		Repo:                    capJSONString(rc.Repo, floorFieldCap),
 		DecisionClass:           capJSONString(rc.DecisionClass, floorFieldCap),
@@ -241,8 +318,8 @@ func capPrecedentResolvedContext(rc PrecedentResolvedContext) PrecedentResolvedC
 		EscalationKeysTotal:     rc.EscalationKeysTotal,
 		EscalationKeysTruncated: rc.EscalationKeysTruncated,
 	}
-	out.TouchedPaths, out.TouchedPathsTruncated = capPrecedentList(rc.TouchedPaths, rc.TouchedPathsTruncated)
-	out.EscalationKeys, out.EscalationKeysTruncated = capPrecedentList(rc.EscalationKeys, rc.EscalationKeysTruncated)
+	out.TouchedPaths, out.TouchedPathsTruncated = capPrecedentList(rc.TouchedPaths, rc.TouchedPathsTruncated, listCap)
+	out.EscalationKeys, out.EscalationKeysTruncated = capPrecedentList(rc.EscalationKeys, rc.EscalationKeysTruncated, listCap)
 	if out.TouchedPathsTotal < len(rc.TouchedPaths) {
 		out.TouchedPathsTotal = len(rc.TouchedPaths)
 	}
@@ -252,11 +329,11 @@ func capPrecedentResolvedContext(rc PrecedentResolvedContext) PrecedentResolvedC
 	return out
 }
 
-func capPrecedentList(in []string, alreadyTruncated bool) ([]string, bool) {
+func capPrecedentList(in []string, alreadyTruncated bool, listCap int) ([]string, bool) {
 	truncated := alreadyTruncated
 	kept := in
-	if len(kept) > precedentFloorListCap {
-		kept = kept[:precedentFloorListCap]
+	if len(kept) > listCap {
+		kept = kept[:listCap]
 		truncated = true
 	}
 	out := make([]string, 0, len(kept))

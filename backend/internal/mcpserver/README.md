@@ -1951,7 +1951,7 @@ lists, so the surface is bounded. Tool contract: `precedent.go`; scoring:
 |---|---|---|---|
 | B1 | every `results[].reason_excerpt`, plus the per-signal `results[].score` breakdown (`score.total` retained) | stored (excerpts) + computed (the breakdown) | `GET /v0/precedent` / none |
 | B2 | items dropped from the **TAIL** — the list is score-DESCENDING, so the dropped set is the WEAKEST precedent and the retained prefix is the answer's substance | stored | `GET /v0/precedent` |
-| floor | `summary` + a length-and-byte-capped `resolved_context`, `results` **entirely** elided, `truncated` set | stored (aggregate) | `GET /v0/precedent` |
+| floor | a length-and-byte-capped `summary` + a length-and-byte-capped `resolved_context`, `results` **entirely** elided, `truncated` set. The fit is MEASURED: the list cap halves (8 → 0) until the rendered floor fits | stored (aggregate) | `GET /v0/precedent` |
 
 B1 keeps each item's **matched keys**: they are what explains why an item is
 there at all, so dropping them would leave a list of citations with no argument.
@@ -1969,16 +1969,37 @@ prior decisions here and 92% of them went the same way, go read them at
 `GET /v0/precedent`". Keeping the summary is also what makes the bound hold when
 ONE result plus the summary exceeds the budget, which B2 cannot reach.
 
-**The floor caps the resolved context independently of the backend** (#3731
-binding condition 2). The backend already caps its echo at 20 entries per list,
-but the floor's bound must not DEPEND on that: `capPrecedentResolvedContext`
-caps each list to `precedentFloorListCap` (20) and each retained element and
-scalar via `capJSONString(…, floorFieldCap)`, preserving the untruncated totals.
-So the floor is a CONSTANT size rather than a function of the request —
-`TestPrecedentTool_FloorIsBoundedByA10000PathResolvedContext` drives a
-resolved context carrying 10,000 paths AND 10,000 escalation keys (a backend that
-did not cap) and asserts the serialized floor still fits under the 4 KiB
-convergence floor.
+**The floor caps the resolved context AND the summary, independently of the
+backend** (#3731 binding condition 2). The backend already caps its echo at 20
+entries per list, but the floor's bound must not DEPEND on that:
+`capPrecedentResolvedContext` caps each list to `precedentFloorListCap` and each
+retained element and scalar via `capJSONString(…, floorFieldCap)`, preserving the
+untruncated totals, and `capPrecedentSummary` does the same to the two
+index-derived STRINGS the retained summary carries — `modal_outcome` (an outcome
+value read out of an audit payload) and `doctrine_versions` (a set with one entry
+per distinct charter revision the scored rows span, so unbounded in cardinality).
+The summary's counts and ratio are never capped: they are what it is for, and they
+cost a bounded number of bytes.
+
+**The floor's fit is MEASURED, not inferred from those caps.** The caps alone
+cannot carry the guarantee — the floor retains three capped lists, seven capped
+scalars and the aggregate elision prose, and at the backend echo's own cap of 20
+the worst case measures ~7.2 KB, past the 4 KiB convergence floor with every
+individual cap still "correct"; worse, that sum moves whenever the prose is
+edited or one more field is retained, so a hand-tuned constant would silently
+stop holding. So `precedentFloor` BUILDS a candidate, MEASURES it, and rebuilds
+with the list cap HALVED until it fits (`precedentFloorListCap` = 8, then
+4 → 2 → 1 → 0), re-rendering the elision prose with the cap it ACTUALLY applied
+and preserving the reported totals and truncation marks at every step. It
+converges by construction: at cap 0 the floor is the capped scalars plus the
+prose. Three tests pin it —
+`TestPrecedentTool_FloorIsBoundedByA10000PathResolvedContext` (10,000 paths AND
+10,000 escalation keys from a backend that did not cap, asserting EXACTLY
+`precedentFloorListCap` entries retained),
+`TestPrecedentTool_FloorIsBoundedByAnOversizedSummary` (a 4 KB modal outcome,
+500 oversized doctrine versions and both oversized context lists at once), and
+`TestPrecedentTool_FloorFitsWithNoListsAtAll` (the cap-0 terminal step, with
+every scalar oversized).
 
 ### The shared run-row ladder (#2510)
 

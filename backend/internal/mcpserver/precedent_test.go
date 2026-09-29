@@ -334,3 +334,110 @@ func TestPrecedentTool_DecodesResponse(t *testing.T) {
 		t.Errorf("resolved context lost in decode: %+v", out.ResolvedContext)
 	}
 }
+
+// TestPrecedentTool_FloorIsBoundedByAnOversizedSummary is the size evidence for
+// the one part the floor RETAINS: the agreement summary. Its counts are
+// fixed-width, but ModalOutcome is an outcome value read out of an audit payload
+// and DoctrineVersions is a set with one entry per distinct charter revision the
+// scored rows span — both index-derived and neither bounded by a fixed
+// vocabulary. The floor's size must be a constant even at their maximum, WHILE
+// the resolved context is simultaneously oversized, so the two caps are measured
+// together rather than one at a time.
+//
+// COUNTERFACTUAL: replace capPrecedentSummary's body with `return s` → the floor
+// carries the 4KB modal outcome and all 500 doctrine versions and the size
+// assertion is RED.
+func TestPrecedentTool_FloorIsBoundedByAnOversizedSummary(t *testing.T) {
+	res := bigPrecedentResult(3, 280)
+	res.Summary.ModalOutcome = strings.Repeat("o", 4096)
+	versions := make([]string, 0, 500)
+	for i := 0; i < 500; i++ {
+		versions = append(versions, strings.Repeat("v", 200)+uuid.New().String())
+	}
+	res.Summary.DoctrineVersions = versions
+	// Oversized resolved context at the same time: the floor keeps BOTH, so the
+	// bound has to hold for their sum.
+	paths := make([]string, 0, 10000)
+	keys := make([]string, 0, 10000)
+	for i := 0; i < 10000; i++ {
+		paths = append(paths, "pkg/"+uuid.New().String()+"/file.go")
+		keys = append(keys, "rule_"+uuid.New().String())
+	}
+	res.ResolvedContext.TouchedPaths = paths
+	res.ResolvedContext.EscalationKeys = keys
+
+	out, err := boundPrecedentOutput(PrecedentOutput{ResolvedContext: res.ResolvedContext,
+		Summary: res.Summary, Results: res.Results}, fixedBudget(mcpConvergenceFloorBytes))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := precedentMarshalLen(t, out); n > mcpConvergenceFloorBytes {
+		t.Fatalf("floor with a maximal summary AND a 10,000-path context = %d bytes, want <= %d", n, mcpConvergenceFloorBytes)
+	}
+	if out.Elisions == nil || out.Elisions.Tier != floorTierName {
+		t.Fatalf("tier = %v, want the floor", out.Elisions)
+	}
+	if len(out.Summary.ModalOutcome) > floorFieldCap {
+		t.Errorf("floor kept a %d-byte modal outcome, want <= %d", len(out.Summary.ModalOutcome), floorFieldCap)
+	}
+	// AT MOST the cap, not EXACTLY it: this fixture is maximal, so the measured
+	// shrink may legitimately have halved past the starting cap. The exact-count
+	// assertion belongs to the non-maximal fixture — see
+	// TestPrecedentTool_FloorIsBoundedByA10000PathResolvedContext, which asserts
+	// EXACTLY precedentFloorListCap and so pins that the cap is applied at all.
+	if n := len(out.Summary.DoctrineVersions); n == 0 || n > precedentFloorListCap {
+		t.Errorf("floor kept %d doctrine versions, want 1..%d", n, precedentFloorListCap)
+	}
+	for _, v := range out.Summary.DoctrineVersions {
+		if len(v) > floorFieldCap {
+			t.Errorf("floor kept a %d-byte doctrine version, want <= %d", len(v), floorFieldCap)
+		}
+	}
+	// The NUMBERS are exact: only the strings are capped, so the summary still
+	// describes the whole set.
+	if out.Summary.Count != res.Summary.Count || out.Summary.Human != res.Summary.Human ||
+		out.Summary.AgreementRatio != res.Summary.AgreementRatio {
+		t.Errorf("floor summary numbers = %+v, want the exact %+v", out.Summary, res.Summary)
+	}
+}
+
+// TestPrecedentTool_FloorFitsWithNoListsAtAll pins the terminal step of the
+// floor's measured shrink: at list cap 0 the floor is the scalars plus the
+// aggregate elision prose and nothing else, and THAT must fit — it is what makes
+// the shrink loop converge rather than spin. Every scalar is oversized here, so
+// the case is the worst one reachable at cap 0.
+//
+// COUNTERFACTUAL: delete capJSONString from capPrecedentResolvedContext's scalar
+// caps (assign rc's values straight through) → the seven 4KB scalars are retained
+// and the size assertion is RED.
+func TestPrecedentTool_FloorFitsWithNoListsAtAll(t *testing.T) {
+	res := bigPrecedentResult(2, 280)
+	big := strings.Repeat("s", 4096)
+	res.ResolvedContext.Repo = big
+	res.ResolvedContext.DecisionClass = big
+	res.ResolvedContext.StageKind = big
+	res.ResolvedContext.ConcernCategory = big
+	res.ResolvedContext.Severity = big
+	res.ResolvedContext.RunID = big
+	res.ResolvedContext.StageID = big
+	res.Summary.ModalOutcome = big
+
+	floor, err := buildPrecedentFloor(PrecedentOutput{ResolvedContext: res.ResolvedContext,
+		Summary: res.Summary, Results: res.Results}, fixedBudget(mcpConvergenceFloorBytes), 2, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := precedentMarshalLen(t, floor); n > mcpConvergenceFloorBytes {
+		t.Fatalf("floor at list cap 0 = %d bytes, want <= %d — the shrink loop would not converge", n, mcpConvergenceFloorBytes)
+	}
+	if len(floor.ResolvedContext.TouchedPaths) != 0 || len(floor.ResolvedContext.EscalationKeys) != 0 ||
+		len(floor.Summary.DoctrineVersions) != 0 {
+		t.Errorf("cap 0 retained list entries: %+v / %v", floor.ResolvedContext, floor.Summary.DoctrineVersions)
+	}
+	// The totals survive the shrink, so even the emptiest floor reports how much
+	// there was.
+	if floor.ResolvedContext.TouchedPathsTotal != len(res.ResolvedContext.TouchedPaths) {
+		t.Errorf("touched_paths_total = %d, want the untruncated %d",
+			floor.ResolvedContext.TouchedPathsTotal, len(res.ResolvedContext.TouchedPaths))
+	}
+}

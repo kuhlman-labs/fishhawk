@@ -128,13 +128,26 @@ type precedentDegraded struct {
 // An explicit field supplied ALONGSIDE a gate reference OVERRIDES the derived
 // value, and resolved_context echoes the result either way.
 //
-// Auth: the gate-reference resolve is ACCOUNT-SCOPED (binding condition 1) — the
-// run is loaded under the caller's account exactly as requireRunAccount's
-// ownership rule narrows a run read, so a run in another account answers the
-// same 404 as a nonexistent one and NO resolved context is echoed. The candidate
-// row window is narrowed by the same account. The repository is additionally
-// subject to the point-read repo-visibility DENY, because a precedent item
-// carries a decision's reason prose.
+// Auth, in three layers:
+//
+//	ACCOUNT, on the run read — the gate-reference resolve is account-scoped
+//	(binding condition 1): the run is loaded under the caller's account exactly
+//	as requireRunAccount's ownership rule narrows a run read, so a run in
+//	another account answers the same 404 as a nonexistent one and NO resolved
+//	context is echoed.
+//
+//	ACCOUNT, on the row set — the candidate window is read with
+//	ListFilter.AccountScoped, so an identity carrying NO workspace account
+//	matches only UNTENANTED rows, the same stricter rule the gate resolve
+//	applies. Repository visibility cannot stand in for this: two accounts can
+//	share a repository, so a repo-only check would hand an account-less caller
+//	another tenant's decisions and their reason prose.
+//
+//	REPOSITORY — EVERY repository whose context reaches the response is subject
+//	to the point-read repo-visibility DENY, because a precedent item carries a
+//	decision's reason prose. That is the repository the ranking runs against AND,
+//	in gate-reference mode, the repository the derived context came FROM even
+//	when an explicit `repo` overrides it.
 func (s *Server) handleGetPrecedent(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.PrecedentIndex == nil {
 		s.writeError(w, r, http.StatusServiceUnavailable, "precedent_unconfigured",
@@ -189,6 +202,16 @@ func (s *Server) handleGetPrecedent(w http.ResponseWriter, r *http.Request) {
 				"resolve gate context failed", map[string]any{"error": gerr.Error()})
 			return
 		}
+		// BOTH repositories are authorized, never only the one that ends up in
+		// the filter. An explicit `repo` OVERRIDES the derived one, so checking
+		// only the replacement would let a caller pair a gate reference from a
+		// repository they CANNOT read with a repo they can, and receive the
+		// source repository's derived touched paths and escalation keys inside
+		// resolved_context. The derived repository is authorized HERE, before a
+		// single derived key is adopted.
+		if gc.Repo != "" && !s.enforceRepoVisibility(w, r, gc.Repo) {
+			return
+		}
 		pctx.Repo = gc.Repo
 		pctx.StageKind = gc.StageKind
 		pctx.TouchedPaths = gc.TouchedPaths
@@ -239,6 +262,11 @@ func (s *Server) handleGetPrecedent(w http.ResponseWriter, r *http.Request) {
 		DecisionClass: pctx.DecisionClass,
 		StageKind:     pctx.StageKind,
 		AccountID:     acct,
+		// AccountScoped makes this a READ scope rather than the backfill's
+		// row-set predicate: an identity carrying NO workspace account matches
+		// only untenanted rows instead of every account's. Repo visibility
+		// cannot stand in for it — two accounts can share a repository.
+		AccountScoped: true,
 		Newest:        true,
 		Limit:         precedentCandidateWindow,
 	})
@@ -285,7 +313,10 @@ func (s *Server) handleGetPrecedent(w http.ResponseWriter, r *http.Request) {
 }
 
 // callerAccountUUID resolves the caller's workspace account to a uuid. An
-// identity carrying NO account yields nil — the untenanted posture. A non-empty
+// identity carrying NO account yields nil — the untenanted posture, which every
+// consumer must pair with ListFilter.AccountScoped (or GateRef, which is scoped
+// by construction) so nil narrows to the untenanted rows rather than widening to
+// all of them. A non-empty
 // value that is not a uuid FAILS CLOSED with a 500 rather than silently
 // widening the read to every account: the field is written from a sessions row,
 // so an unparseable value is a corrupted invariant, not a caller mistake.

@@ -155,12 +155,29 @@ type ListFilter struct {
 	// (E75.3 / #3731). NON-NIL matches a row whose account_id EQUALS it OR IS
 	// NULL — the same predicate as the decision_index_tenant_isolation RLS
 	// policy, so a tenanted caller sees its own rows plus the untenanted
-	// single-tenant rows and never another account's. NIL matches any row: the
-	// un-narrowed backfill / CLI path every pre-#3731 caller depends on.
+	// single-tenant rows and never another account's. What NIL means is decided
+	// by AccountScoped below — every row (the un-narrowed backfill / CLI path)
+	// when it is false, only the untenanted rows when it is true.
 	//
 	// It is the ROW-set predicate only. A gate-reference read is a RUN read and
-	// carries the stricter GateRef.AccountID rule instead — see GateContext.
+	// carries the GateRef.AccountID rule instead — see GateContext.
 	AccountID *uuid.UUID
+	// AccountScoped promotes AccountID from the backfill's ROW-SET predicate to
+	// a READ SCOPE, which is what a request-serving caller needs: with it set, a
+	// NIL AccountID matches ONLY untenanted rows instead of every row.
+	//
+	// WHY the distinction exists at all: an identity carrying no workspace
+	// account (a bearer token, the untenanted posture) is a legitimate caller,
+	// but nil-matches-all would hand it every account's decision rows — and
+	// their query-time reason prose — behind nothing but the repo-visibility
+	// check, which does not separate tenants sharing a repository. GateRef
+	// already applies exactly this stricter rule to a RUN read; AccountScoped
+	// is the same rule for the row set, so a read path is isolated by ACCOUNT
+	// and not by repository alone.
+	//
+	// Zero (false) is the pre-#3731 nil-matches-all behavior the backfill and
+	// the CLI depend on: those run as the deployment, not as a caller.
+	AccountScoped bool
 	// Newest flips the source-sequence ordering to DESC so a bounded Limit
 	// yields the NEWEST N rows rather than the oldest N — what a precedent
 	// candidate window needs. Consumers re-sort, so no wire order depends on
@@ -171,6 +188,11 @@ type ListFilter struct {
 // listSQL renders the List query. The ORDER BY direction is the ONLY part that
 // varies, and it is chosen from a bool rather than interpolated from caller
 // input, so there is no injection surface.
+//
+// The account arm reads: a row is visible when it is UNTENANTED, or belongs to
+// the caller's account, or the read is UN-SCOPED and no account was named (the
+// backfill's nil-matches-all). Under AccountScoped a nil account therefore
+// leaves only the untenanted rows — see ListFilter.AccountScoped.
 func listSQL(newest bool) string {
 	order := "ORDER BY source_sequence"
 	if newest {
@@ -180,7 +202,8 @@ func listSQL(newest bool) string {
 		WHERE ($1 = '' OR repo = $1)
 		  AND ($2 = '' OR decision_class = $2)
 		  AND ($3 = '' OR stage_kind = $3)
-		  AND ($5::uuid IS NULL OR account_id = $5 OR account_id IS NULL)
+		  AND (account_id IS NULL OR account_id = $5
+		       OR (NOT $6::boolean AND $5::uuid IS NULL))
 		` + order + `
 		LIMIT $4`
 }
@@ -192,7 +215,7 @@ func (s *Store) List(ctx context.Context, f ListFilter) ([]Row, error) {
 		limit = &f.Limit
 	}
 	rows, err := s.db.Query(ctx, listSQL(f.Newest),
-		f.Repo, string(f.DecisionClass), f.StageKind, limit, f.AccountID)
+		f.Repo, string(f.DecisionClass), f.StageKind, limit, f.AccountID, f.AccountScoped)
 	if err != nil {
 		return nil, fmt.Errorf("decisionindex: list: %w", err)
 	}

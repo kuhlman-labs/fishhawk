@@ -176,18 +176,43 @@ value, and `resolved_context` echoes what the ranking was performed against.
 
 ### Narrowing (binding condition 1 of the #3731 approval)
 
-The gate-reference resolve is ACCOUNT-SCOPED at the resolve, not afterwards: the
-caller's account travels into `GateRef`, so a run in another account is
-INDISTINGUISHABLE from a nonexistent one — both, and a stage that is not on the
-named run, answer the same 404 with NO `resolved_context` echoed and the
-candidate window never queried. The row window carries the same account. The
-repository is additionally subject to the point-read repo-visibility DENY
-(`enforceRepoVisibility`, 403 `repo_forbidden`), because a precedent item carries
-a decision's reason prose.
+Three layers, and none of them substitutes for another.
+
+**ACCOUNT, on the run read.** The gate-reference resolve is ACCOUNT-SCOPED at the
+resolve, not afterwards: the caller's account travels into `GateRef`, so a run in
+another account is INDISTINGUISHABLE from a nonexistent one — both, and a stage
+that is not on the named run, answer the same 404 with NO `resolved_context`
+echoed and the candidate window never queried.
+
+**ACCOUNT, on the row set.** The candidate window is read with
+`decisionindex.ListFilter.AccountScoped`, so an identity carrying NO workspace
+account (a bearer token, the untenanted posture) matches only UNTENANTED rows —
+the same stricter rule the gate resolve applies, rather than `ListFilter`'s
+default nil-matches-all, which is the backfill's row-set predicate. Repository
+visibility cannot stand in for this: two accounts can share a repository, so a
+repo-only check would hand an account-less caller another tenant's decisions AND
+their query-time reason prose. `TestPrecedent_AccountLessIdentityReadsOnlyUntenantedRows`
+and `TestPrecedentPG_AccountLessIdentityReadsOnlyUntenantedRows` pin it with the
+foreign row in the SAME repository and a distinct reason on the chain, so a leak
+surfaces the prose and not merely the row's existence.
+
+**REPOSITORY.** EVERY repository whose context reaches the response is subject to
+the point-read repo-visibility DENY (`enforceRepoVisibility`, 403
+`repo_forbidden`), because a precedent item carries a decision's reason prose.
+That is the repository the ranking runs against AND, in gate-reference mode, the
+repository the derived context came FROM — checked BEFORE a single derived key is
+adopted. Checking only the former would let a caller pair a gate reference from a
+repository they CANNOT read with an explicit `repo` they can, and receive the
+source repository's derived touched paths and escalation keys inside
+`resolved_context`; `TestPrecedent_GateReferenceSourceRepoMustBeVisible` denies
+the derived repository while ALLOWING the explicit one, so the derived-repository
+check is the only thing in that fixture's path.
 
 `callerAccountUUID` FAILS CLOSED on a non-empty `Identity.AccountID` that is not
 a UUID (500) rather than widening the read to every account: the field is written
-from a sessions row, so an unparseable value is a corrupted invariant.
+from a sessions row, so an unparseable value is a corrupted invariant. Its nil
+return (the untenanted posture) is safe only because every consumer pairs it with
+`AccountScoped` or with `GateRef`, which is scoped by construction.
 
 ### Reason excerpts are read at query time
 

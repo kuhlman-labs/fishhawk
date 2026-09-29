@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -289,5 +290,79 @@ func TestPrecedentPG_GateReferenceForeignAccountIs404(t *testing.T) {
 	// the predicates biting rather than a broken fixture.
 	if ok := precedentGET(t, f.s, "?decision_class=plan_approval&run_id="+f.runA.String()); ok.Code != http.StatusOK {
 		t.Errorf("the caller's own run = %d, want 200 (body %s)", ok.Code, ok.Body.String())
+	}
+}
+
+// TestPrecedentPG_AccountLessIdentityReadsOnlyUntenantedRows is the END-TO-END
+// half of the account-scoped row read, through the real listSQL predicate: an
+// identity whose AccountID is EMPTY (the untenanted posture a bearer token
+// carries) must see only UNTENANTED rows — never another account's decisions or
+// their chain-read reason prose.
+//
+// FIXTURE ISOLATION: every row is in acme/widgets and no RepoVisibility mirror is
+// wired, so repository visibility cannot separate the tenants (two accounts
+// sharing one repository is exactly the case repo visibility does not cover), and
+// the account arm is the only thing in the path. Each seeded decision carries a
+// distinct REASON on the real chain, so a leak surfaces the other tenant's prose.
+//
+// COUNTERFACTUAL: delete `AccountScoped: true` from the handler's ListFilter →
+// listSQL's nil-matches-all arm applies, both tenanted rows are scored and their
+// reasons are read from the chain, RED on the result count and on both leak
+// assertions.
+func TestPrecedentPG_AccountLessIdentityReadsOnlyUntenantedRows(t *testing.T) {
+	f := newPrecedentPGFixture(t)
+
+	untenantedRun := uuid.New()
+	f.seedRun(t, untenantedRun, "acme/widgets", nil)
+
+	untenantedSeq := f.seedDecision(t, untenantedRun, nil, "acme/widgets", "plan", "approve",
+		"untenanted deployment reason", []string{"backend/internal/server/foo.go"}, nil)
+	acctASeq := f.seedDecision(t, f.runA, nil, "acme/widgets", "plan", "approve",
+		"ACCOUNT A PRIVATE REASON", []string{"backend/internal/server/foo.go"}, nil)
+	acctBSeq := f.seedDecision(t, f.runC, nil, "acme/widgets", "plan", "approve",
+		"ACCOUNT B PRIVATE REASON", []string{"backend/internal/server/foo.go"}, nil)
+
+	id := memberIdentity()
+	id.AccountID = "" // the untenanted posture
+	req := withIdentity(httptest.NewRequest(http.MethodGet,
+		"/v0/precedent?repo=acme/widgets&decision_class=plan_approval"+
+			"&paths=backend/internal/server/bar.go", nil), id)
+	rec := httptest.NewRecorder()
+	f.s.handleGetPrecedent(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %s)", rec.Code, rec.Body.String())
+	}
+	resp := decodePrecedent(t, rec)
+	if len(resp.Results) != 1 {
+		t.Fatalf("results = %d, want exactly the 1 untenanted row: %+v", len(resp.Results), resp.Results)
+	}
+	if resp.Results[0].SourceSequence != untenantedSeq {
+		t.Errorf("returned sequence %d, want the untenanted %d", resp.Results[0].SourceSequence, untenantedSeq)
+	}
+	body := rec.Body.String()
+	for _, leak := range []string{"ACCOUNT A PRIVATE REASON", "ACCOUNT B PRIVATE REASON"} {
+		if strings.Contains(body, leak) {
+			t.Errorf("the response leaks a tenanted account's decision reason %q: %s", leak, body)
+		}
+	}
+
+	// Positive control: the SAME rows under the tenanted account-A identity see
+	// A's row plus the untenanted one (and still never B's), so the narrowing
+	// above is the account arm rather than an empty fixture.
+	own := precedentGET(t, f.s, "?repo=acme/widgets&decision_class=plan_approval"+
+		"&paths=backend/internal/server/bar.go")
+	if own.Code != http.StatusOK {
+		t.Fatalf("tenanted control status = %d (body %s)", own.Code, own.Body.String())
+	}
+	ownSeqs := map[int64]bool{}
+	for _, it := range decodePrecedent(t, own).Results {
+		ownSeqs[it.SourceSequence] = true
+	}
+	if !ownSeqs[acctASeq] || !ownSeqs[untenantedSeq] {
+		t.Errorf("account A saw %v, want its own %d and the untenanted %d", ownSeqs, acctASeq, untenantedSeq)
+	}
+	if ownSeqs[acctBSeq] {
+		t.Errorf("account B's row %d leaked to account A", acctBSeq)
 	}
 }

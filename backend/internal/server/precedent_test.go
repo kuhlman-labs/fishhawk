@@ -21,7 +21,9 @@ import (
 // ---------------------------------------------------------------------------
 
 // fakePrecedentIndex records the ListFilter it RECEIVES and honours its Repo,
-// DecisionClass and StageKind arms.
+// DecisionClass, StageKind and ACCOUNT arms — the account arm exactly as
+// listSQL's WHERE does, so an account-isolation assertion on the returned rows
+// is a statement about the real predicate and not about the fake's convenience.
 //
 // Recording the filter is what makes the repository-isolation case a real
 // control (#3731 binding condition 3): the assertion is on filter.Repo, so
@@ -57,12 +59,32 @@ func (f *fakePrecedentIndex) List(_ context.Context, filter decisionindex.ListFi
 		if filter.StageKind != "" && r.StageKind != filter.StageKind {
 			continue
 		}
+		if !precedentFakeAccountAllows(filter, r) {
+			continue
+		}
 		out = append(out, r)
 	}
 	if filter.Limit > 0 && len(out) > filter.Limit {
 		out = out[:filter.Limit]
 	}
 	return out, nil
+}
+
+// precedentFakeAccountAllows mirrors listSQL's account arm:
+//
+//	account_id IS NULL OR account_id = $5 OR (NOT scoped AND $5 IS NULL)
+//
+// Transcribed here rather than approximated, because the handler tests assert
+// account isolation through THIS fake. The real predicate is pinned separately by
+// the pgtest-backed decisionindex store tests.
+func precedentFakeAccountAllows(filter decisionindex.ListFilter, r decisionindex.Row) bool {
+	if r.AccountID == nil {
+		return true
+	}
+	if filter.AccountID != nil && *r.AccountID == *filter.AccountID {
+		return true
+	}
+	return !filter.AccountScoped && filter.AccountID == nil
 }
 
 func (f *fakePrecedentIndex) GateContext(_ context.Context, ref decisionindex.GateRef) (decisionindex.GateContext, error) {
@@ -740,5 +762,134 @@ func TestPrecedent_UnparseableSessionAccountIs500(t *testing.T) {
 	}
 	if idx.filterCalls != 0 {
 		t.Errorf("the index was queried %d times under an unresolvable account, want 0 — never a widened read", idx.filterCalls)
+	}
+}
+
+// TestPrecedent_GateReferenceSourceRepoMustBeVisible is the mixed-repository
+// control. A gate reference derives the SOURCE repository's touched paths and
+// escalation keys; an explicit `repo` then overwrites pctx.Repo, so a check on
+// the replacement alone authorizes the wrong repository and the source's derived
+// keys reach resolved_context anyway.
+//
+// FIXTURE ISOLATION (the masking guard): the derived repository is DENIED and the
+// explicit one is ALLOWED, so the later explicit-repo check passes and the only
+// thing that can refuse the request is the check on the DERIVED repository.
+//
+// COUNTERFACTUAL: delete the enforceRepoVisibility call on gc.Repo → 200, and the
+// body carries acme/secret's derived path and escalation key, RED on the status
+// and on every leak assertion.
+func TestPrecedent_GateReferenceSourceRepoMustBeVisible(t *testing.T) {
+	idx := &fakePrecedentIndex{
+		gate: decisionindex.GateContext{
+			Repo: "acme/secret", StageKind: "implement",
+			TouchedPaths:   []string{"secret/internal/crypto.go"},
+			EscalationKeys: []string{"secret_only_rule"},
+		},
+		rows: []decisionindex.Row{precedentRow(uuid.New(), 1, "acme/visible", nil)},
+	}
+	s := New(Config{Addr: "127.0.0.1:0", PrecedentIndex: idx,
+		RepoVisibility: newFakeRepoVisibility(map[string]bool{"acme/visible": true})})
+
+	rec := precedentGET(t, s, "?decision_class=plan_approval&repo=acme/visible&run_id="+uuid.New().String())
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 — the DERIVED repository is unreadable (body %s)", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "repo_forbidden") {
+		t.Errorf("body = %s, want the named repo_forbidden code", body)
+	}
+	for _, leak := range []string{"acme/secret", "secret/internal/crypto.go", "secret_only_rule", "resolved_context"} {
+		if strings.Contains(body, leak) {
+			t.Errorf("the 403 body leaks the protected derived context %q: %s", leak, body)
+		}
+	}
+	if idx.filterCalls != 0 {
+		t.Errorf("the candidate window was queried %d times for an unreadable source repository, want 0", idx.filterCalls)
+	}
+
+	// Positive control: when the DERIVED repository is itself readable the same
+	// request shape proceeds, so the 403 above is the new check biting rather
+	// than the gate-reference path being broken outright.
+	idx.gate.Repo = "acme/visible"
+	ok := precedentGET(t, s, "?decision_class=plan_approval&repo=acme/visible&run_id="+uuid.New().String())
+	if ok.Code != http.StatusOK {
+		t.Errorf("readable derived repository = %d, want 200 (body %s)", ok.Code, ok.Body.String())
+	}
+}
+
+// TestPrecedent_AccountLessIdentityReadsOnlyUntenantedRows covers the identity
+// whose AccountID is EMPTY — the untenanted posture a bearer token carries. Such
+// a caller must see only UNTENANTED rows, the same stricter rule GateRef already
+// applies to a run read; nil-matches-all is the backfill's row-set predicate and
+// must not be what serves a request.
+//
+// FIXTURE ISOLATION: both rows are in the SAME repository, and no RepoVisibility
+// mirror is wired, so repo visibility cannot separate them — the account arm is
+// the only thing in the path. The foreign row carries a REASON on the chain, so a
+// leak would surface the other tenant's decision prose, not merely its existence.
+//
+// COUNTERFACTUAL: delete `AccountScoped: true` from the ListFilter the handler
+// builds → the fake applies listSQL's nil-matches-all arm, both rows are scored,
+// and the assertions on the result count, on the foreign sequence and on the
+// leaked reason are RED.
+func TestPrecedent_AccountLessIdentityReadsOnlyUntenantedRows(t *testing.T) {
+	foreignAcct := uuid.MustParse("00000000-0000-0000-0000-0000000000bb")
+	untenantedRun, foreignRun := uuid.New(), uuid.New()
+	idx := &fakePrecedentIndex{rows: []decisionindex.Row{
+		precedentRow(untenantedRun, 1, "acme/widgets", nil),
+		precedentRow(foreignRun, 2, "acme/widgets", func(r *decisionindex.Row) {
+			r.AccountID = &foreignAcct
+		}),
+	}}
+	aud := &precedentAuditFake{byRun: map[uuid.UUID][]*audit.Entry{
+		untenantedRun: {precedentEntry(untenantedRun, 1, map[string]any{"reason": "untenanted deployment reason"})},
+		foreignRun:    {precedentEntry(foreignRun, 2, map[string]any{"reason": "ANOTHER TENANTS PRIVATE REASON"})},
+	}}
+	s := New(Config{Addr: "127.0.0.1:0", PrecedentIndex: idx, AuditRepo: aud})
+
+	id := memberIdentity()
+	id.AccountID = "" // the untenanted posture
+	req := withIdentity(httptest.NewRequest(http.MethodGet,
+		"/v0/precedent?repo=acme/widgets&decision_class=plan_approval", nil), id)
+	rec := httptest.NewRecorder()
+	s.handleGetPrecedent(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %s)", rec.Code, rec.Body.String())
+	}
+	if !idx.lastFilter.AccountScoped {
+		t.Errorf("the store received AccountScoped = false — an account-less caller would match EVERY account's rows")
+	}
+	if idx.lastFilter.AccountID != nil {
+		t.Errorf("filter.AccountID = %v, want nil for an identity carrying no account", idx.lastFilter.AccountID)
+	}
+	resp := decodePrecedent(t, rec)
+	if len(resp.Results) != 1 {
+		t.Fatalf("results = %d, want exactly the 1 untenanted row: %+v", len(resp.Results), resp.Results)
+	}
+	if resp.Results[0].SourceSequence != 1 {
+		t.Errorf("returned sequence %d, want the untenanted row 1 — sequence 2 belongs to another account",
+			resp.Results[0].SourceSequence)
+	}
+	if body := rec.Body.String(); strings.Contains(body, "ANOTHER TENANTS PRIVATE REASON") {
+		t.Errorf("the response leaks another account's decision reason: %s", body)
+	}
+	if calls := aud.runCalls[foreignRun]; calls != 0 {
+		t.Errorf("the chain of a foreign-account run was read %d times, want 0", calls)
+	}
+
+	// Positive control: the same rows under a TENANTED identity owning the
+	// foreign account see BOTH (its own plus the untenanted one), so the
+	// narrowing above is the account arm and not an inert fixture.
+	idx2 := &fakePrecedentIndex{rows: idx.rows}
+	s2 := New(Config{Addr: "127.0.0.1:0", PrecedentIndex: idx2, AuditRepo: aud})
+	id2 := memberIdentity()
+	id2.AccountID = foreignAcct.String()
+	req2 := withIdentity(httptest.NewRequest(http.MethodGet,
+		"/v0/precedent?repo=acme/widgets&decision_class=plan_approval", nil), id2)
+	rec2 := httptest.NewRecorder()
+	s2.handleGetPrecedent(rec2, req2)
+	if got := len(decodePrecedent(t, rec2).Results); got != 2 {
+		t.Errorf("the owning account saw %d rows, want 2 (its own + the untenanted)", got)
 	}
 }

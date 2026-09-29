@@ -446,6 +446,80 @@ func TestList_AccountNarrowing(t *testing.T) {
 	}
 }
 
+// TestList_AccountScopedNarrowsAnAccountLessCaller pins the AccountScoped read
+// scope: with it set, a NIL AccountID matches ONLY untenanted rows instead of
+// every row, which is what a request-serving read needs from an identity carrying
+// no workspace account.
+//
+// MECHANISM / MASKING GUARD: like TestList_AccountNarrowing this runs as the admin
+// test role, which BYPASSES RLS, so the SQL predicate is the only thing in the
+// path; and both tenanted rows are in the SAME repository as the untenanted one,
+// so no other WHERE arm can drop them.
+// COUNTERFACTUAL: delete the `NOT $6::boolean AND` guard from listSQL's account
+// arm (leaving the bare `$5::uuid IS NULL`) → the scoped nil-account listing
+// returns all three rows and the first two assertions are RED.
+func TestList_AccountScopedNarrowsAnAccountLessCaller(t *testing.T) {
+	f := newChainFixture(t)
+	ctx := context.Background()
+	s := NewStore(f.pool)
+
+	mine := sampleRow(f.runA, 311)
+	mine.Repo = "acme/widgets"
+	mine.AccountID = &f.accountA
+	foreign := sampleRow(f.runB, 312)
+	foreign.Repo = "acme/widgets"
+	foreign.AccountID = &f.accountB
+	untenanted := sampleRow(f.runA, 313)
+	untenanted.Repo = "acme/widgets"
+	untenanted.AccountID = nil
+	if err := s.UpsertBatch(ctx, []Row{mine, foreign, untenanted}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	seqs := func(rows []Row) map[int64]bool {
+		out := map[int64]bool{}
+		for _, r := range rows {
+			out[r.SourceSequence] = true
+		}
+		return out
+	}
+
+	// An ACCOUNT-LESS scoped caller: untenanted rows ONLY.
+	got, err := s.List(ctx, ListFilter{Repo: "acme/widgets", AccountScoped: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := seqs(got)
+	if !seen[313] {
+		t.Error("the untenanted row (313) was not returned to an account-less scoped caller")
+	}
+	if seen[311] || seen[312] {
+		t.Errorf("a TENANTED row leaked to an account-less scoped caller: %v", seen)
+	}
+
+	// A TENANTED scoped caller is unchanged from the un-scoped rule: its own
+	// rows plus the untenanted ones, never another account's.
+	mineOnly, err := s.List(ctx, ListFilter{Repo: "acme/widgets", AccountID: &f.accountA, AccountScoped: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen = seqs(mineOnly)
+	if !seen[311] || !seen[313] {
+		t.Errorf("scoped listing for account A = %v, want its own 311 and the untenanted 313", seen)
+	}
+	if seen[312] {
+		t.Error("ANOTHER ACCOUNT'S row (312) was returned to a scoped caller")
+	}
+
+	// The UN-scoped nil-account path — the backfill/CLI — still sees every row.
+	all, err := s.List(ctx, ListFilter{Repo: "acme/widgets"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 3 {
+		t.Errorf("un-scoped nil-account listing returned %d rows, want all 3 — AccountScoped must not change the backfill path", len(all))
+	}
+}
+
 // TestList_NewestFirstWindow: a bounded window is the NEWEST N.
 // COUNTERFACTUAL: delete the DESC flip in listSQL → the OLDEST are returned.
 func TestList_NewestFirstWindow(t *testing.T) {
