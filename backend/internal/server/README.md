@@ -190,11 +190,16 @@ view-level hash is recomputed over what was retained. So a filtered read returns
 the same per-workflow hash an unfiltered one does, and a consumer binding a
 confirmation to one workflow binds to that workflow's own hash.
 
-**Six refusals, one test each** (#1182): 400 `validation_failed` (unknown
+**Seven refusals, one test each** (#1182): 400 `validation_failed` (unknown
 `source`), 503 `github_unconfigured` (`source=ref`, no forge), 404
-`workflow_spec_not_found` (both sources), 422 `workflow_spec_invalid`, 404
-`workflow_not_found` (unknown `?workflow=`), 403 `repo_forbidden` (the prelude's
-DENY). `delegation_view_test.go` asserts each branch's status AND its code.
+`workflow_spec_not_found` (three branches — no cached run under `run_cache`, a
+forge 404 under `ref`, and a forge 200 whose spec content is EMPTY or
+whitespace-only), 502 `forge_unavailable` (a NON-NotFound fault from either
+`GetRepoInstallation` or `GetWorkflowSpec` — a forge fault is not "no
+installation is visible", and the two are never collapsed), 422
+`workflow_spec_invalid`, 404 `workflow_not_found` (unknown `?workflow=`), 403
+`repo_forbidden` (the prelude's DENY). `delegation_view_test.go` asserts each
+branch's status AND its code. `docs/api/v0.md` already documents the 502.
 
 **Parity with the run-side block** is asserted, not assumed.
 `TestDelegationView_MatchesRunDelegationBlockForEveryWorkflow` reads the

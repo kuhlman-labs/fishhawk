@@ -248,8 +248,17 @@ var featureChangeEscalationPaths = []string{
 // TestDelegationView_FeatureChangeEscalationIsSurfaced is the CROSS-BOUNDARY
 // end-to-end test (spec -> pure projection -> HTTP payload): it drives the REAL
 // http.Handler over a seeded run whose cached spec is the COMMITTED
-// .fishhawk/workflows.yaml, and asserts on the DECODED JSON BODY — so a
-// json-tag rename on either side fails here.
+// .fishhawk/workflows.yaml and asserts on the DECODED JSON BODY.
+//
+// IT DOES NOT PIN THE JSON TAG NAMES, and an earlier draft of this comment
+// wrongly claimed it did. The body is decoded back into delegationview.View —
+// the very type the handler serialized — so a renamed tag renames both halves of
+// the round trip and every assertion below still passes. The tag names are
+// pinned by mcpserver's
+// TestDelegationTool_SerializedOutputCarriesTheDeclaredWireFieldNames, which
+// reads a serialized delegation view against field names written out as
+// literals; that is the SAME shared type this handler serializes, so it covers
+// this surface too.
 //
 // The escalation half is config-shaped and not compiler-enforced, so the
 // assertions are on the shipped output: the seven globs, max_autonomy medium,
@@ -423,7 +432,9 @@ func TestRepoDelegation_WorkflowFilter(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// PER-FAILURE-MODE (#1182): six refusal modes, each with its own status AND code
+// PER-FAILURE-MODE (#1182): seven refusal modes, each with its own status AND
+// code. The 502 pair and the empty-spec 404 branch are the last section of this
+// file; the six below were the first pass.
 // ---------------------------------------------------------------------------
 
 // TestRepoDelegation_UnknownSourceIs400. The fixture HOLDS a projectable run,
@@ -588,4 +599,97 @@ func TestRepoDelegation_RunRepoUnconfiguredIs503(t *testing.T) {
 		t.Fatalf("status = %d, want 503; body %s", rec.Code, rec.Body.String())
 	}
 	assertErrorCode(t, rec, "run_repo_unconfigured")
+}
+
+// ---------------------------------------------------------------------------
+// The forge-fault branches (fix-up: the 502 pair + the empty-spec 404)
+// ---------------------------------------------------------------------------
+//
+// The six-refusal sweep above covers 400/403/404/422/503. delegationSpecFromRef
+// carries three more branches it did not reach: a NON-NotFound error from
+// GetRepoInstallation, a NON-NotFound error from GetWorkflowSpec (both 502
+// forge_unavailable) and a 200 whose spec content is EMPTY (404
+// workflow_spec_not_found). Each is a straight writeError with no logic behind
+// it, so these are hardening rather than a claimed defect — but an untested
+// branch is an unasserted status code.
+
+// TestRepoDelegation_InstallationFaultIs502 seeds a NON-404 fault on the
+// installation endpoint. The fixture also holds a run_cache-readable run, so a
+// 502 cannot be "nothing to read": the precondition below proves it.
+func TestRepoDelegation_InstallationFaultIs502(t *testing.T) {
+	f := newDelegationFixture(string(committedWorkflowSpec(t)))
+	fake := newFakeGitHubForRuns(string(committedWorkflowSpec(t)))
+	fake.installationStatus = http.StatusInternalServerError
+	fake.installationBody = `{"message":"boom"}`
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: f.runs, GitHub: screenGitHub(t, fake)})
+	s.nowFunc = func() time.Time { return dashNow }
+
+	if rec := delegationGET(t, s, "?source=run_cache"); rec.Code != http.StatusOK {
+		t.Fatalf("precondition: source=run_cache = %d, want 200; body %s", rec.Code, rec.Body.String())
+	}
+	rec := delegationGET(t, s, "?source=ref&ref=main")
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502; body %s", rec.Code, rec.Body.String())
+	}
+	assertErrorCode(t, rec, "forge_unavailable")
+	// The 502 is distinguished from the sibling 404: a forge FAULT is not
+	// "no installation is visible".
+	if strings.Contains(rec.Body.String(), "workflow_spec_not_found") {
+		t.Errorf("a forge fault was reported as a not-found: %s", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "installation") {
+		t.Errorf("the 502 does not say WHICH forge call failed: %s", rec.Body.String())
+	}
+}
+
+// TestRepoDelegation_SpecFetchFaultIs502 seeds a healthy installation lookup and
+// a NON-404 fault on the Contents API, so the 502 attributed to the SPEC fetch
+// is reached only past the installation branch.
+func TestRepoDelegation_SpecFetchFaultIs502(t *testing.T) {
+	f := newDelegationFixture(string(committedWorkflowSpec(t)))
+	fake := newFakeGitHubForRuns(string(committedWorkflowSpec(t)))
+	fake.specStatus = http.StatusInternalServerError
+	fake.specBody = `{"message":"boom"}`
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: f.runs, GitHub: screenGitHub(t, fake)})
+	s.nowFunc = func() time.Time { return dashNow }
+
+	rec := delegationGET(t, s, "?source=ref&ref=main")
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502; body %s", rec.Code, rec.Body.String())
+	}
+	assertErrorCode(t, rec, "forge_unavailable")
+	if !strings.Contains(rec.Body.String(), "spec") {
+		t.Errorf("the 502 does not attribute the failure to the spec fetch: %s", rec.Body.String())
+	}
+	// The installation lookup DID succeed, so this 502 is the second branch and
+	// not the first one firing under a different name.
+	if fake.installationCalls == 0 {
+		t.Error("the installation endpoint was never called; the fixture does not isolate the spec-fetch branch")
+	}
+	if fake.specCalls == 0 {
+		t.Error("the Contents endpoint was never called; the spec-fetch branch was not reached")
+	}
+}
+
+// TestRepoDelegation_EmptySpecAtRefIs404 covers the empty-content branch: the
+// forge answers 200 with a spec file that is empty or whitespace-only. Both are
+// 404 workflow_spec_not_found naming the path as EMPTY — NOT the 422 an invalid
+// spec draws, which is what the guard buys: "the file is there but has nothing
+// in it" is a different operator action from "the spec does not validate".
+func TestRepoDelegation_EmptySpecAtRefIs404(t *testing.T) {
+	for _, content := range []string{"", "\n\n   \n\t\n"} {
+		f := newDelegationFixture(string(committedWorkflowSpec(t)))
+		s := New(Config{Addr: "127.0.0.1:0", RunRepo: f.runs,
+			GitHub: screenGitHub(t, newFakeGitHubForRuns(content))})
+		s.nowFunc = func() time.Time { return dashNow }
+
+		rec := delegationGET(t, s, "?source=ref&ref=main")
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("content %q: status = %d, want 404; body %s", content, rec.Code, rec.Body.String())
+		}
+		assertErrorCode(t, rec, "workflow_spec_not_found")
+		if !strings.Contains(rec.Body.String(), "is empty at this ref") {
+			t.Errorf("content %q: the 404 does not say the file is EMPTY: %s", content, rec.Body.String())
+		}
+	}
 }

@@ -9,8 +9,11 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"sort"
 	"strings"
 	"testing"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/delegationview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
@@ -62,8 +65,20 @@ func toolMatrixByAction(m []delegationview.Action) map[string]delegationview.Act
 // committedDelegationView builds the response body from the repository's OWN
 // .fishhawk/workflows.yaml — the SAME projection of the SAME committed spec that
 // backend/internal/server/delegation_view_test.go asserts through the REST
-// handler. That is the CROSS-BOUNDARY pin (approval condition 5): both sides
-// assert on the same content, so a json-tag rename on either one fails.
+// handler. That is the CONTENT half of the cross-boundary pin (approval
+// condition 5): both surfaces are asserted to carry feature_change's tier, its
+// resolved matrix WITH provenance and its escalation globs, projected from one
+// committed spec, so neither can be satisfied by a comment-only touch.
+//
+// WHAT THIS DOES NOT PIN, stated plainly because the first draft claimed it did:
+// a json-tag rename. Both sides serialize AND decode the same shared type
+// (delegationview.View; RepoDelegationResult is an alias of it and the REST
+// body type IS it), so a renamed tag renames both halves of every round trip
+// and no assertion made on Go FIELDS can see it. The tag NAMES are pinned
+// separately, by TestDelegationTool_SerializedOutputCarriesTheDeclaredWireFieldNames
+// below, which reads the registered tool's SERIALIZED output against field
+// names written out as literals — and because the REST handler serializes that
+// same shared type, that one test pins the names for both surfaces.
 //
 // The two Go packages cannot share a helper (server imports mcpserver, not the
 // reverse), so the shared thing is the committed spec file plus the shared pure
@@ -102,10 +117,13 @@ var featureChangeEscalationPaths = []string{
 	"verifier/**",
 }
 
-// TestDelegationTool_CarriesTheCommittedSpecsDelegation is the CROSS-BOUNDARY
-// assertion (approval condition 5): the decoded TOOL output carries
-// feature_change's tier, its resolved matrix WITH provenance, and its escalation
-// globs — projected from the same committed spec the REST test drives.
+// TestDelegationTool_CarriesTheCommittedSpecsDelegation is the CONTENT half of
+// the cross-boundary assertion (approval condition 5): the decoded TOOL output
+// carries feature_change's tier, its resolved matrix WITH provenance, and its
+// escalation globs — projected from the same committed spec the REST test
+// drives. It asserts Go fields, so it does NOT discriminate a json-tag rename;
+// the wire NAMES are pinned by
+// TestDelegationTool_SerializedOutputCarriesTheDeclaredWireFieldNames.
 func TestDelegationTool_CarriesTheCommittedSpecsDelegation(t *testing.T) {
 	res := committedDelegationView(t)
 	out, fb := runDelegationTool(t, res, DelegationInput{
@@ -398,4 +416,264 @@ func TestDelegationTool_BackendErrorIsAToolErrorNotAnEmptyView(t *testing.T) {
 			t.Errorf("status %d: the error path returned workflows: %+v", status, out.Workflows)
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// WIRE-NAME EVIDENCE (approval condition 5, corrected)
+// ---------------------------------------------------------------------------
+//
+// WHY A SECOND TEST RATHER THAN A STRONGER ASSERTION ON THE ONE ABOVE. The
+// implement review was right that neither content test discriminates a json-tag
+// rename. Both sides serialize and decode the SAME shared type
+// (delegationview.View — RepoDelegationResult is an alias of it, the REST
+// handler's body type IS it), and a Go field's tag applies to both halves of
+// every round trip through it, so a rename is invisible to any assertion made
+// on Go FIELDS. Value assertions there are meaningful as CONTENT parity; they
+// are not wire-contract protection, and the comment on
+// committedDelegationView says so.
+//
+// The pin has to read the SERIALIZED output against field names written HERE as
+// independent literals. That is what the tests below do, and because the REST
+// handler serializes the same shared type, one set of literals pins the tag
+// names for BOTH surfaces.
+
+// callDelegationToolWire drives the REGISTERED fishhawk_delegation tool over a
+// real MCP client session and returns its structured output as GENERIC JSON —
+// no production type is used to decode it, so every key below is a literal.
+func callDelegationToolWire(t *testing.T, res RepoDelegationResult, args map[string]any) map[string]any {
+	t.Helper()
+	ctx := context.Background()
+	fb, srv := newFakeBackend(t)
+	fb.delegationResp = res
+
+	server := mcp.NewServer(&mcp.Implementation{Name: "test-server", Version: "0"}, nil)
+	registerDelegation(server, newResolver(srv, nil))
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := server.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	defer serverSession.Close()
+	clientSession, cerr := client.Connect(ctx, clientTransport, nil)
+	if cerr != nil {
+		t.Fatalf("client connect: %v", cerr)
+	}
+	defer clientSession.Close()
+
+	out, err := clientSession.CallTool(ctx, &mcp.CallToolParams{
+		Name: "fishhawk_delegation", Arguments: args})
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if out.IsError {
+		t.Fatalf("CallTool returned IsError; content %+v", out.Content)
+	}
+	if out.StructuredContent == nil {
+		t.Fatal("StructuredContent is nil; the typed output did not serialize")
+	}
+	raw, merr := json.Marshal(out.StructuredContent)
+	if merr != nil {
+		t.Fatalf("marshal StructuredContent: %v", merr)
+	}
+	var generic map[string]any
+	if uerr := json.Unmarshal(raw, &generic); uerr != nil {
+		t.Fatalf("decode the tool output as generic JSON: %v; raw %s", uerr, raw)
+	}
+	return generic
+}
+
+// wireObj / wireArr / wireStr read one LITERAL key out of generic JSON. An
+// ABSENT key is a distinct failure from a present-but-empty one, which is the
+// whole point: a renamed json tag makes the key absent and these name it.
+func wireObj(t *testing.T, v any, where string) map[string]any {
+	t.Helper()
+	o, ok := v.(map[string]any)
+	if !ok {
+		t.Fatalf("%s is %T, want a JSON object", where, v)
+	}
+	return o
+}
+
+func wireArr(t *testing.T, o map[string]any, key, where string) []any {
+	t.Helper()
+	v, present := o[key]
+	if !present {
+		t.Fatalf("%s carries NO %q key; the tool's serialized field names are: %v",
+			where, key, wireKeys(o))
+	}
+	a, ok := v.([]any)
+	if !ok {
+		t.Fatalf("%s.%s is %T, want a JSON array", where, key, v)
+	}
+	return a
+}
+
+func wireStr(t *testing.T, o map[string]any, key, where string) string {
+	t.Helper()
+	v, present := o[key]
+	if !present {
+		t.Fatalf("%s carries NO %q key; the tool's serialized field names are: %v",
+			where, key, wireKeys(o))
+	}
+	s, ok := v.(string)
+	if !ok {
+		t.Fatalf("%s.%s is %T, want a JSON string", where, key, v)
+	}
+	return s
+}
+
+func wireKeys(o map[string]any) []string {
+	keys := make([]string, 0, len(o))
+	for k := range o {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// wireWorkflow finds one workflow entry by its literal "id" key.
+func wireWorkflow(t *testing.T, root map[string]any, id string) map[string]any {
+	t.Helper()
+	for i, raw := range wireArr(t, root, "workflows", "the tool output") {
+		wf := wireObj(t, raw, fmt.Sprintf("workflows[%d]", i))
+		if wireStr(t, wf, "id", fmt.Sprintf("workflows[%d]", i)) == id {
+			return wf
+		}
+	}
+	t.Fatalf("no workflow with id %q in the tool's serialized output", id)
+	return nil
+}
+
+// wireMatrix indexes a serialized matrix array by its literal "action" key.
+func wireMatrix(t *testing.T, wf map[string]any, key, where string) map[string]map[string]any {
+	t.Helper()
+	out := map[string]map[string]any{}
+	for i, raw := range wireArr(t, wf, key, where) {
+		a := wireObj(t, raw, fmt.Sprintf("%s.%s[%d]", where, key, i))
+		out[wireStr(t, a, "action", fmt.Sprintf("%s.%s[%d]", where, key, i))] = a
+	}
+	return out
+}
+
+// TestDelegationTool_SerializedOutputCarriesTheDeclaredWireFieldNames is the
+// wire-contract pin condition 5 actually needs: it reads the REGISTERED tool's
+// SERIALIZED output as generic JSON and asserts each field by a name written
+// here as a literal, against the same committed spec the REST test drives.
+//
+// COUNTERFACTUAL: rename any of these json tags on delegationview.View,
+// WorkflowDelegation, Action, Escalation or EscalationMatch and this is RED,
+// naming the key that went missing — while every Go-field assertion in this
+// file and in backend/internal/server/delegation_view_test.go stays GREEN,
+// because both of those decode through the renamed type.
+func TestDelegationTool_SerializedOutputCarriesTheDeclaredWireFieldNames(t *testing.T) {
+	root := callDelegationToolWire(t, committedDelegationView(t), map[string]any{
+		"repo": "kuhlman-labs/fishhawk", "ref": "main", "source": "ref"})
+
+	// The envelope, by literal name.
+	if got := wireStr(t, root, "repo", "the tool output"); got != "kuhlman-labs/fishhawk" {
+		t.Errorf(`"repo" = %q`, got)
+	}
+	if got := wireStr(t, root, "source", "the tool output"); got != "ref" {
+		t.Errorf(`"source" = %q, want ref — the source is always echoed`, got)
+	}
+	if got := wireStr(t, root, "ref", "the tool output"); got != "main" {
+		t.Errorf(`"ref" = %q`, got)
+	}
+	if got := wireStr(t, root, "workflow_sha", "the tool output"); got == "" {
+		t.Error(`"workflow_sha" is empty`)
+	}
+	if got := wireStr(t, root, "spec_version", "the tool output"); got != "2" {
+		t.Errorf(`"spec_version" = %q, want 2`, got)
+	}
+	if _, present := root["schema_major"]; !present {
+		t.Errorf(`the tool output carries NO "schema_major" key; keys are %v`, wireKeys(root))
+	}
+	if got := wireStr(t, root, "content_hash", "the tool output"); got == "" {
+		t.Error(`"content_hash" is empty`)
+	}
+
+	// feature_change, by literal name, carrying the SAME tier / matrix
+	// provenance / escalation globs the REST test asserts on the same spec.
+	fc := wireWorkflow(t, root, "feature_change")
+	if got := wireStr(t, fc, "autonomy", "feature_change"); got != "high" {
+		t.Errorf(`"autonomy" = %q, want high`, got)
+	}
+	if got := wireStr(t, fc, "content_hash", "feature_change"); got == "" {
+		t.Error(`feature_change "content_hash" is empty`)
+	}
+	if len(wireArr(t, fc, "must_page_human", "feature_change")) == 0 {
+		t.Error(`"must_page_human" is empty on the wire`)
+	}
+	matrix := wireMatrix(t, fc, "matrix", "feature_change")
+	for class, want := range map[string]struct{ mode, source, condition string }{
+		"approve": {"auto", "tier", "clean_dual_approval"},
+		"fixup":   {"auto", "tier", "convergent_concerns"},
+		"waive":   {"auto", "tier", "solo_low"},
+		"retry":   {"auto", "tier", "infra_flake"},
+		"merge":   {"auto", "tier", "gates_resolved_ci_green"},
+	} {
+		a, ok := matrix[class]
+		if !ok {
+			t.Fatalf("class %q absent from the serialized matrix (classes %v)", class, wireKeys(matrix2any(matrix)))
+		}
+		where := "feature_change.matrix[" + class + "]"
+		if got := wireStr(t, a, "mode", where); got != want.mode {
+			t.Errorf(`%s "mode" = %q, want %q`, where, got, want.mode)
+		}
+		if got := wireStr(t, a, "source", where); got != want.source {
+			t.Errorf(`%s "source" = %q, want %q`, where, got, want.source)
+		}
+		if got := wireStr(t, a, "condition", where); got != want.condition {
+			t.Errorf(`%s "condition" = %q, want %q`, where, got, want.condition)
+		}
+	}
+
+	esc := wireArr(t, fc, "escalations", "feature_change")
+	if len(esc) != 1 {
+		t.Fatalf(`"escalations" has %d entries on the wire, want 1`, len(esc))
+	}
+	e := wireObj(t, esc[0], "feature_change.escalations[0]")
+	if got := wireStr(t, e, "max_autonomy", "feature_change.escalations[0]"); got != "medium" {
+		t.Errorf(`"max_autonomy" = %q, want medium`, got)
+	}
+	rawMatch, present := e["match"]
+	if !present {
+		t.Fatalf(`the escalation carries NO "match" key; keys are %v`, wireKeys(e))
+	}
+	match := wireObj(t, rawMatch, "feature_change.escalations[0].match")
+	var paths []string
+	for _, p := range wireArr(t, match, "paths", "feature_change.escalations[0].match") {
+		s, ok := p.(string)
+		if !ok {
+			t.Fatalf(`"paths" element is %T, want a string`, p)
+		}
+		paths = append(paths, s)
+	}
+	if !reflect.DeepEqual(paths, featureChangeEscalationPaths) {
+		t.Errorf(`"paths" =%v, want the committed spec's seven globs %v`, paths, featureChangeEscalationPaths)
+	}
+	ceiling := wireMatrix(t, e, "ceiling_matrix", "feature_change.escalations[0]")
+	for _, class := range []string{"waive", "merge"} {
+		a, ok := ceiling[class]
+		if !ok {
+			t.Fatalf("class %q absent from the serialized ceiling_matrix", class)
+		}
+		where := "feature_change.escalations[0].ceiling_matrix[" + class + "]"
+		if got := wireStr(t, a, "mode", where); got != "gated" {
+			t.Errorf(`%s "mode" = %q, want gated`, where, got)
+		}
+		if got := wireStr(t, a, "source", where); got != "escalation" {
+			t.Errorf(`%s "source" = %q, want escalation`, where, got)
+		}
+	}
+}
+
+// matrix2any adapts a matrix index for wireKeys' diagnostic.
+func matrix2any(m map[string]map[string]any) map[string]any {
+	out := make(map[string]any, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
 }

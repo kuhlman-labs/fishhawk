@@ -54,12 +54,14 @@ type delegationResponse = delegationview.View
 
 // handleGetRepoDelegation implements GET /v0/repos/{owner}/{name}/delegation.
 //
-// SIX refusal modes, each with its own status AND named code: unknown source
+// SEVEN refusal modes, each with its own status AND named code: unknown source
 // (400 validation_failed), forge unconfigured under source=ref (503
-// github_unconfigured), spec not found (404 workflow_spec_not_found), spec
-// invalid (422 workflow_spec_invalid), unknown ?workflow (404
-// workflow_not_found), repo not visible (403 repo_forbidden, from the shared
-// prelude).
+// github_unconfigured), spec not found (404 workflow_spec_not_found — three
+// branches: no cached run, a forge 404, and a 200 whose spec content is EMPTY),
+// a forge FAULT rather than a not-found on either forge call (502
+// forge_unavailable), spec invalid (422 workflow_spec_invalid), unknown
+// ?workflow (404 workflow_not_found), repo not visible (403 repo_forbidden,
+// from the shared prelude).
 func (s *Server) handleGetRepoDelegation(w http.ResponseWriter, r *http.Request) {
 	// The SAME gate the four repo-dashboard rollups use: the run-repo 503, then
 	// requestRepoFilter + repoVisibleOr403 — the point-read DENY convention.
