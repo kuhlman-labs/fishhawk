@@ -247,3 +247,68 @@ func TestCategories_AreTheFiveCaptainKinds(t *testing.T) {
 		}
 	}
 }
+
+// TestDerive_OfferSurfacesBrief: the five brief keys on a captain_handover_offered
+// payload surface on the derived pending offer (E76.4 / #3767) — a hashed
+// brief with its window, and separately an unavailable marker with its reason.
+func TestDerive_OfferSurfacesBrief(t *testing.T) {
+	var c chain
+	c.add(CategoryAssigned, map[string]any{"subject": "github:alice", "identity_verified": true})
+	c.add(CategoryHandoverOffered, map[string]any{"subject": "github:alice", "successor": "github:carol",
+		"brief_hash": "abc123", "brief_from_sequence": 2, "brief_to_sequence": 9})
+	st := Derive(testRepo, c.entries)
+	if st.PendingOffer == nil {
+		t.Fatal("no pending offer")
+	}
+	want := OfferBrief{Hash: "abc123", FromSequence: 2, ToSequence: 9}
+	if st.PendingOffer.Brief != want {
+		t.Errorf("hashed brief = %+v, want %+v", st.PendingOffer.Brief, want)
+	}
+
+	var u chain
+	u.add(CategoryAssigned, map[string]any{"subject": "github:alice", "identity_verified": true})
+	u.add(CategoryHandoverOffered, map[string]any{"subject": "github:alice", "successor": "github:carol",
+		"brief_unavailable": true, "brief_unavailable_reason": "window_read_failed"})
+	st = Derive(testRepo, u.entries)
+	want = OfferBrief{Unavailable: true, UnavailableReason: "window_read_failed"}
+	if st.PendingOffer == nil || st.PendingOffer.Brief != want {
+		t.Errorf("unavailable brief = %+v, want %+v", st.PendingOffer, want)
+	}
+}
+
+// TestDerive_PreBriefOfferHasZeroBrief: an offer written before E76.4 carries
+// no brief keys and derives the zero OfferBrief (the additive-payload claim).
+func TestDerive_PreBriefOfferHasZeroBrief(t *testing.T) {
+	var c chain
+	c.add(CategoryAssigned, map[string]any{"subject": "github:alice", "identity_verified": true})
+	c.add(CategoryHandoverOffered, map[string]any{"subject": "github:alice", "successor": "github:carol"})
+	st := Derive(testRepo, c.entries)
+	if st.PendingOffer == nil || st.PendingOffer.Brief != (OfferBrief{}) {
+		t.Errorf("pre-brief offer = %+v, want zero brief", st.PendingOffer)
+	}
+}
+
+// TestEventPayload_BriefKeysOnlyOnOffer: the brief keys are emitted on
+// captain_handover_offered and on NO other captain category, even when an
+// event of another kind carries a Brief.
+func TestEventPayload_BriefKeysOnlyOnOffer(t *testing.T) {
+	brief := OfferBrief{Hash: "abc", FromSequence: 1, ToSequence: 4, Unavailable: true, UnavailableReason: "r"}
+	keys := []string{"brief_hash", "brief_from_sequence", "brief_to_sequence", "brief_unavailable", "brief_unavailable_reason"}
+	for _, kind := range Categories() {
+		ev := Event{Kind: kind, Repo: testRepo, Subject: "github:alice", Successor: "github:carol", Brief: brief}
+		raw, err := ev.Payload()
+		if err != nil {
+			t.Fatalf("%s: %v", kind, err)
+		}
+		var m map[string]any
+		if err := json.Unmarshal(raw, &m); err != nil {
+			t.Fatal(err)
+		}
+		for _, k := range keys {
+			_, present := m[k]
+			if want := kind == CategoryHandoverOffered; present != want {
+				t.Errorf("%s: key %s present=%v, want %v (payload %s)", kind, k, present, want, raw)
+			}
+		}
+	}
+}
