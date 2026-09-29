@@ -7015,6 +7015,169 @@ components:
             can show which identity was authenticated. Omitted for legacy
             rows whose subject is empty.
 
+    Digest:
+      type: object
+      description: GET /v0/digest body (E75.6 / #3734). Bounded by `digest.Bound`.
+      required: [repo, captain_subject, watermark, has_watermark, from_sequence, to_sequence, chain_head, sections, gaps, degradations, gaps_truncated, gaps_omitted_count, truncated]
+      properties:
+        repo: { type: string }
+        captain_subject:
+          type: string
+          description: The caller's auth subject the watermark is keyed by.
+        watermark:
+          type: integer
+          format: int64
+          description: The last-read chain position (0 when `has_watermark` is false).
+        has_watermark:
+          type: boolean
+          description: False when the caller never marked this repository read.
+        from_sequence: { type: integer, format: int64, description: Inclusive window start. }
+        to_sequence: { type: integer, format: int64, description: Inclusive window end. }
+        chain_head:
+          type: integer
+          format: int64
+          description: Highest audit sequence on any run in the repository.
+        section:
+          type: string
+          description: Echo of the `section` selector; absent for a full digest.
+        sections:
+          type: array
+          items: { $ref: '#/components/schemas/DigestSection' }
+        gaps:
+          type: array
+          description: Facts the digest could not ground on the chain + index. Never silently dropped.
+          items: { $ref: '#/components/schemas/DigestGap' }
+        degradations:
+          type: array
+          items: { $ref: '#/components/schemas/DigestDegradation' }
+        gaps_truncated: { type: boolean }
+        gaps_omitted_count: { type: integer }
+        gaps_next: { $ref: '#/components/schemas/DigestCursor' }
+        truncated:
+          type: boolean
+          description: Anything in this response was elided; `next` is then the first elided collection's cursor.
+        next: { $ref: '#/components/schemas/DigestCursor' }
+    DigestSection:
+      type: object
+      required: [kind, items, complete, truncated, omitted_count]
+      properties:
+        kind:
+          type: string
+          enum: [merges, waivers_and_deferrals, pages, open_decisions]
+        items:
+          type: array
+          description: Ordered by `source_sequence` ascending.
+          items: { $ref: '#/components/schemas/DigestItem' }
+        complete:
+          type: boolean
+          description: Nothing was elided (always `!truncated`).
+        truncated: { type: boolean }
+        omitted_count:
+          type: integer
+          description: Elided items known to this response (a lower bound when a `scan_limit` degradation names the section).
+        next: { $ref: '#/components/schemas/DigestCursor' }
+    DigestItem:
+      type: object
+      required: [category, source_sequence, source_entry_hash, run_id, at]
+      properties:
+        category: { type: string, description: Audit category of the cited entry. }
+        source_sequence: { type: integer, format: int64 }
+        source_entry_hash: { type: string }
+        run_id: { type: string, format: uuid }
+        stage_id: { type: string, format: uuid }
+        stage_kind: { type: string }
+        stage_state:
+          type: string
+          description: '`open_decisions` only: the awaiting state the stage is parked in.'
+        at: { type: string, format: date-time }
+        outcome: { type: string }
+        headline:
+          type: string
+          description: Derived short label; capped at 256 encoded bytes (`fields_truncated` marks a cut).
+        concern_category: { type: string }
+        severity: { type: string }
+        reason_sequence:
+          type: integer
+          format: int64
+          description: '`waivers_and_deferrals`: the chain entry recording the reason (the prose is never copied).'
+        reason_key: { type: string, description: Payload key of the reason within that entry. }
+        amendment_id: { type: string }
+        answered:
+          type: boolean
+          description: '`pages` only: a PAIRED answer exists at or below `to_sequence` (clarification_answered on the same stage; scope_amendment_decided for the same amendment_id; approval_submitted on the same stage).'
+        answered_sequence: { type: integer, format: int64 }
+        source_missing:
+          type: boolean
+          description: The cited source entry has no audit_entries row (a `source_entry_missing` gap is reported beside it).
+        fields_truncated: { type: boolean }
+    DigestGap:
+      type: object
+      required: [kind, sequence]
+      properties:
+        kind:
+          type: string
+          enum: [unindexed_decision, source_entry_missing, source_hash_mismatch, parked_without_citation]
+        sequence:
+          type: integer
+          format: int64
+          description: The chain position concerned (0 for `parked_without_citation`, which has none).
+        category: { type: string }
+        run_id: { type: string, format: uuid }
+        stage_id: { type: string, format: uuid }
+        detail: { type: string }
+    DigestDegradation:
+      type: object
+      required: [kind]
+      properties:
+        kind:
+          type: string
+          enum: [scan_limit, reason_missing]
+        section: { type: string }
+        sequence: { type: integer, format: int64 }
+        detail: { type: string }
+    DigestCursor:
+      type: object
+      description: The exact next call that retrieves an elided remainder.
+      required: [section, from_sequence, to_sequence, call]
+      properties:
+        section:
+          type: string
+          enum: [merges, waivers_and_deferrals, pages, open_decisions, gaps]
+        from_sequence:
+          type: integer
+          format: int64
+          description: The FIRST OMITTED element's sequence (inclusive).
+        to_sequence: { type: integer, format: int64 }
+        call:
+          type: string
+          description: The next request line, e.g. `GET /v0/digest?from_sequence=…&repo=…&section=…&to_sequence=…`.
+    DigestMarkReadRequest:
+      type: object
+      additionalProperties: false
+      required: [repo, to_sequence]
+      properties:
+        repo: { type: string, description: Repository as `owner/name`. }
+        to_sequence:
+          type: integer
+          format: int64
+          minimum: 1
+          description: The chain position to mark read through (at most the repository's chain head).
+    DigestMarkReadResponse:
+      type: object
+      required: [repo, captain_subject, previous_sequence, had_previous, sequence, advanced]
+      properties:
+        repo: { type: string }
+        captain_subject: { type: string }
+        previous_sequence: { type: integer, format: int64 }
+        had_previous: { type: boolean }
+        sequence:
+          type: integer
+          format: int64
+          description: The watermark after the call.
+        advanced:
+          type: boolean
+          description: False for the at-or-below-watermark no-op (nothing appended).
+
   responses:
     BadRequest:
       description: Request body or query parameters were invalid.
@@ -12644,6 +12807,181 @@ paths:
             `run_repo_unconfigured` — no run repository on this instance; or
             `service_unavailable` — repo visibility could not be resolved
             (#2071), so no partially-narrowed page is returned.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/digest:
+    get:
+      operationId: getDigest
+      summary: '"Since you last looked" digest for one repository'
+      description: |
+        E75.6 / #3734 (ADR-082 #3728 rule 7). The caller's digest of what the
+        audit chain recorded in one repository since their READ WATERMARK,
+        computed on demand from the decision index and the chain. The
+        watermark is keyed by the caller's auth subject + repository +
+        workspace account, so two captains' digests are independent.
+
+        **Retrieval never writes.** This read does not advance the watermark
+        and appends no audit entry; only `POST /v0/digest/mark-read` does.
+
+        **Window.** `from_sequence`..`to_sequence` are INCLUSIVE chain
+        positions (`audit_entries.sequence`). Defaults: `from_sequence` = the
+        watermark + 1, `to_sequence` = the repository's chain head (the
+        highest sequence on any of its runs). A `to_sequence` above the head is
+        refused with 400 naming the head.
+
+        **Sections** (closed set): `merges`, `waivers_and_deferrals` (each item
+        POINTS at its reason via `reason_sequence` + `reason_key`), `pages`
+        (`clarification_requested`, `scope_amendment_requested`,
+        `escalation_fired`, each with a PAIRED `answered` flag) and
+        `open_decisions` (every currently parked gate, citing the entry that
+        parked it). Doctrine changes (#3733) and scheduled runs (#3725) are
+        deliberately absent. Every item cites its chain entry by
+        `source_sequence` + `source_entry_hash`.
+
+        **Nothing dropped.** A decision-bearing entry with no index row, an
+        index row citing a missing chain entry, a hash mismatch and a parked
+        stage with no identifiable parking entry are reported in `gaps`; a
+        read that hit its limit or a waiver with no reason pointer is reported
+        in `degradations`.
+
+        **One bound.** The response is bounded at 32768 serialized bytes by the
+        same `digest.Bound` the `fishhawk_digest` MCP tool applies. Every cut
+        collection carries `truncated`, `omitted_count` and a cursor whose
+        `call` names the exact next request (`section` + `from_sequence` of
+        the FIRST OMITTED element + `to_sequence`); following cursors always
+        makes progress. Long-form contract: `backend/internal/digest/README.md`.
+
+        **Auth.** A token must hold `read:audit` (the chain's read scope);
+        cookie-session operators are not scope-checked. A non-admin
+        cookie-session caller must be able to read the repository at the forge
+        (ADR-057 Amendment A2 / #2071).
+      tags: [audit]
+      parameters:
+        - name: repo
+          in: query
+          required: true
+          description: Repository as `owner/name`.
+          schema: { type: string }
+        - name: section
+          in: query
+          description: |
+            Restrict the response to one content section, or `gaps` for the
+            gaps + degradations collections. Omit for the full digest. A
+            cursor's `section` is passed verbatim.
+          schema:
+            type: string
+            enum: [merges, waivers_and_deferrals, pages, open_decisions, gaps]
+        - name: from_sequence
+          in: query
+          description: Inclusive lower chain position. 0 or absent = watermark + 1.
+          schema: { type: integer, format: int64, minimum: 0 }
+        - name: to_sequence
+          in: query
+          description: Inclusive upper chain position. 0 or absent = the repository's chain head.
+          schema: { type: integer, format: int64, minimum: 0 }
+      responses:
+        '200':
+          description: The bounded digest.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Digest' }
+        '400':
+          description: |
+            `validation_failed` — `repo` missing, an unknown `section`, or a
+            sequence that is not a non-negative integer (`details.field` names
+            it); or `to_sequence_beyond_chain_head` — `to_sequence` is above
+            the repository's chain head (`details.chain_head` names it).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            `insufficient_scope` — the token lacks `read:audit`; or
+            `repo_forbidden` — the caller cannot read the repository.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: '`internal_error` — a digest read failed.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '501':
+          description: |
+            `digest_unconfigured` — no database-backed digest store on this
+            instance; the message names each missing collaborator.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: '`service_unavailable` — repo visibility could not be resolved (#2071).'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/digest/mark-read:
+    post:
+      operationId: markDigestRead
+      summary: Advance the caller's digest read watermark
+      description: |
+        E75.6 / #3734. Advances the caller's read watermark for one repository
+        to `to_sequence`. **Never silent:** a `digest_marked_read` entry is
+        appended to the GLOBAL audit chain (partitioned by the caller's
+        workspace account; it belongs to no run) FIRST, and the watermark
+        moves only after that append succeeds — an append failure answers 500
+        with the watermark unmoved.
+
+        A `to_sequence` at or below the current watermark is a no-op
+        (`advanced: false`) that appends NOTHING. The stored watermark is
+        monotonic. Idempotence is a property of the WATERMARK, not the chain: a
+        retry after an append succeeded but the advance failed appends a
+        second entry and converges the watermark.
+
+        **Auth.** Gated on the existing `write:approvals` scope (no new scope,
+        so no token loses access); cookie-session operators are not
+        scope-checked.
+      tags: [audit]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DigestMarkReadRequest' }
+      responses:
+        '200':
+          description: The watermark after the call (advanced or a no-op).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DigestMarkReadResponse' }
+        '400':
+          description: |
+            `validation_failed` — malformed body, unknown field, `repo` missing
+            or `to_sequence` not positive; or `to_sequence_beyond_chain_head` —
+            `to_sequence` is above the repository's chain head
+            (`details.chain_head` names it). Nothing is appended.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: '`insufficient_scope` — the token lacks `write:approvals`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: |
+            `internal_error` — the `digest_marked_read` append failed (the
+            watermark is unmoved) or the advance failed after it (a retry
+            converges it).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '501':
+          description: |
+            `digest_unconfigured` — no digest store, decision index or audit
+            repository on this instance; the message names each missing one.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

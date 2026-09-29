@@ -194,6 +194,12 @@ import "sort"
 // operators can await it without the allow_unknown escape hatch;
 // categories_completeness_test.go's AST sweep fails the build if a
 // non-test backend audit-write emits a category absent from this map.
+// E75.6 / #3734 added digest_marked_read, the GLOBAL-chain record of a
+// captain advancing their per-repository digest read watermark
+// (server/digest.go, POST /v0/digest/mark-read). It is appended BEFORE the
+// watermark moves, belongs to no run, is not decision-bearing, and is
+// deliberately NOT an issue-comment activity category (there is no run thread
+// to render it on).
 var KnownCategories = map[string]struct{}{
 	"acceptance_dispatched":                   {},
 	"acceptance_outcome_recorded":             {},
@@ -264,6 +270,7 @@ var KnownCategories = map[string]struct{}{
 	"deployment_outcome_recorded":             {},
 	"deployment_rollback_completed":           {},
 	"deployment_rollback_initiated":           {},
+	"digest_marked_read":                      {},
 	"dispatch_reaper_failed":                  {},
 	"document_injected":                       {},
 	"document_truncated":                      {},
