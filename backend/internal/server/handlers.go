@@ -107,6 +107,10 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	// Cross-run attention queue (E40.1 / #1713): account-scoped, non-run-scoped
 	// read — narrowing is inside the handler, like GET /v0/runs.
 	mux.HandleFunc("GET /v0/attention", s.handleListAttention)
+	// "Since you last looked" digest (E75.6 / #3734): GET never writes;
+	// mark-read appends digest_marked_read BEFORE advancing the watermark.
+	mux.HandleFunc("GET /v0/digest", s.handleGetDigest)
+	mux.HandleFunc("POST /v0/digest/mark-read", s.handleDigestMarkRead)
 	mux.HandleFunc("GET /v0/audit/export", s.handleAuditExport)
 	mux.HandleFunc("GET /v0/audit/export.csv", s.handleAuditExportCSV)
 	mux.HandleFunc("GET /v0/reports/agent-changes", s.handleAgentChangesReport)

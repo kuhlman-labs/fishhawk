@@ -43,6 +43,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/decisionindex"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/deployreconciler"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/devfixtures"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/digest"
 	dispatchwatchdog "github.com/kuhlman-labs/fishhawk/backend/internal/dispatchwatchdog"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
@@ -2412,6 +2413,11 @@ func runServe(args []string, logSink io.Writer) int {
 			return exitFailure
 		}
 		cfg.AuditRepo = auditRepo
+		// The E75.6 / #3734 digest reads (GET /v0/digest, POST
+		// /v0/digest/mark-read): the watermark + chain store and the same
+		// decision_index store newAuditRepository projects into.
+		cfg.DigestStore = digest.NewStore(pool)
+		cfg.DigestIndex = decisionindex.NewStore(pool)
 		cfg.ApprovalRepo = approval.NewPostgresRepository(pool)
 		cfg.ArtifactRepo = artifact.NewPostgresRepository(pool)
 		// GET /v0/precedent's read surface (E75.3 / #3731). The SAME store the

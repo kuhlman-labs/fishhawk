@@ -59,6 +59,8 @@ Every class is run-scoped. An entry with no run ID, or whose run row no longer e
 - **True gaps**: the run row still exists, so a backfill can close the gap. `check` exits 1 when any true gap exists, so a cron job can alert on it.
 - **Orphaned entries**: the run row no longer exists, or the entry carries no run ID. These are reported as `orphaned_entries` (a count plus sequences) and **never fail `check`** (#3730 approval condition 6). `decision_index.run_id` references `runs`, so no backfill can ever index such an entry. Counting it as a gap would make `check` fail forever on a state the operator cannot repair.
 
+`Store.GapsInWindow(GapFilter{Repo, FromSequence, ToSequence, Limit})` is the same query narrowed to one repository and an INCLUSIVE sequence window (0 leaves a side unbounded); `Gaps(limit)` is implemented as `GapsInWindow(GapFilter{Limit: limit})`, so `check` and the digest (`backend/internal/digest`, E75.6 / #3734) share one query path. A `Repo` filter matches through the run row, so a repo-scoped report carries no orphaned entries by construction. The read has no SQL `LIMIT`: `GapCount` must be exact, and the scanned set is only UNINDEXED decision-bearing entries (normally near zero). `ListFilter` gained the same inclusive `FromSequence`/`ToSequence` bounds; migration 0089's `decision_index_repo_sequence_idx` serves the windowed read, and a zero-valued filter reads exactly what it did before.
+
 ## Operator commands
 
 ```sh

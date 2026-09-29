@@ -3295,6 +3295,7 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	// DATA at 200 instead of as a campaign_dangling_dependency refusal, so a
 	// dependency-closed item set is assembled by iterating rather than by hand —
 	// taking the total 57 -> 58.
+	//
 	// E75.3 (#3731) adds exactly ONE tool — fishhawk_precedent, the ADR-082
 	// (#3728) decision (b) precedent query: WHEN an agent or operator is about
 	// to make a gate decision, it returns prior decisions of the SAME class
@@ -3302,7 +3303,12 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	// its audit-chain entry. ELIGIBILITY is any authenticated caller, because
 	// it is read-only, mints no audit entry and grants no authority — taking
 	// the total 58 -> 59.
-	const wantToolCount = 59
+	//
+	// E75.6 (#3734) adds exactly ONE tool — fishhawk_digest, the thin wrapper
+	// over GET /v0/digest and POST /v0/digest/mark-read (the "since you last
+	// looked" digest against a per-captain read watermark) — taking the total
+	// 59 -> 60.
+	const wantToolCount = 60
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",
@@ -3377,6 +3383,19 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	}
 	if !sawPreviewCampaign {
 		t.Error("fishhawk_preview_campaign is not in the registered tool list — the campaign dry run is unreachable over MCP")
+	}
+	// fishhawk_digest (#3734) must be wire-visible by NAME: the 58 -> 59 bump
+	// alone stays green if the registration is dropped and a DIFFERENT tool
+	// added in the same change.
+	var sawDigest bool
+	for _, tool := range res.Tools {
+		if tool.Name == "fishhawk_digest" {
+			sawDigest = true
+			break
+		}
+	}
+	if !sawDigest {
+		t.Error("fishhawk_digest is not in the registered tool list — the since-you-last-looked digest is unreachable over MCP")
 	}
 	if !sawConsolidate {
 		t.Error("fishhawk_consolidate_slices is not registered/visible over ListTools")

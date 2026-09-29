@@ -145,11 +145,16 @@ func (s *Store) Truncate(ctx context.Context) error {
 }
 
 // ListFilter is ADR-082 rule 3's hard filter. An empty field matches any
-// value; Limit <= 0 means unbounded.
+// value; Limit <= 0 means unbounded. FromSequence and ToSequence bound
+// source_sequence INCLUSIVELY (the digest's windowed read, E75.6 / #3734);
+// 0 leaves that side unbounded, so the zero value reads exactly what it did
+// before the bounds existed.
 type ListFilter struct {
 	Repo          string
 	DecisionClass DecisionClass
 	StageKind     string
+	FromSequence  int64
+	ToSequence    int64
 	Limit         int
 	// AccountID narrows the listing to one tenant workspace account
 	// (E75.3 / #3731). NON-NIL matches a row whose account_id EQUALS it OR IS
@@ -204,6 +209,8 @@ func listSQL(newest bool) string {
 		  AND ($3 = '' OR stage_kind = $3)
 		  AND (account_id IS NULL OR account_id = $5
 		       OR (NOT $6::boolean AND $5::uuid IS NULL))
+		  AND ($7::bigint = 0 OR source_sequence >= $7)
+		  AND ($8::bigint = 0 OR source_sequence <= $8)
 		` + order + `
 		LIMIT $4`
 }
@@ -215,7 +222,8 @@ func (s *Store) List(ctx context.Context, f ListFilter) ([]Row, error) {
 		limit = &f.Limit
 	}
 	rows, err := s.db.Query(ctx, listSQL(f.Newest),
-		f.Repo, string(f.DecisionClass), f.StageKind, limit, f.AccountID, f.AccountScoped)
+		f.Repo, string(f.DecisionClass), f.StageKind, limit, f.AccountID, f.AccountScoped,
+		f.FromSequence, f.ToSequence)
 	if err != nil {
 		return nil, fmt.Errorf("decisionindex: list: %w", err)
 	}
@@ -284,17 +292,44 @@ type GapReport struct {
 	OrphanedSequences []int64
 }
 
-// Gaps runs the missing-row check: every decision-bearing entry on the chain
-// with no decision_index row, split into true gaps (run row present) and
+// GapFilter narrows the missing-row check. An empty Repo matches every
+// repository; FromSequence/ToSequence bound the entry's chain sequence
+// INCLUSIVELY, 0 leaving that side unbounded. Limit bounds each returned list
+// (not the counts); Limit <= 0 means unbounded.
+//
+// A Repo filter matches through the entry's run row, so it necessarily
+// excludes ORPHANED entries (no run row, hence no repository): a repo-scoped
+// report carries OrphanedCount 0 by construction.
+type GapFilter struct {
+	Repo         string
+	FromSequence int64
+	ToSequence   int64
+	Limit        int
+}
+
+// Gaps runs the missing-row check over the whole chain: every decision-bearing
+// entry with no decision_index row, split into true gaps (run row present) and
 // orphaned entries (run row absent). limit bounds each returned list, not the
-// counts; limit <= 0 means unbounded.
+// counts; limit <= 0 means unbounded. It is GapsInWindow with an empty filter,
+// so `fishhawkd decision-index check` and the digest share ONE query path.
 func (s *Store) Gaps(ctx context.Context, limit int) (*GapReport, error) {
+	return s.GapsInWindow(ctx, GapFilter{Limit: limit})
+}
+
+// GapsInWindow runs the missing-row check narrowed by f — the digest's
+// "decision-bearing entries the best-effort writer never indexed" read over its
+// (repo, sequence) window (E75.6 / #3734).
+func (s *Store) GapsInWindow(ctx context.Context, f GapFilter) (*GapReport, error) {
+	limit := f.Limit
 	rows, err := s.db.Query(ctx, `SELECT ae.sequence, ae.category, ae.run_id, ae.ts, r.id IS NULL
 		FROM audit_entries ae
 		LEFT JOIN decision_index di ON di.source_sequence = ae.sequence
 		LEFT JOIN runs r ON r.id = ae.run_id
 		WHERE ae.category = ANY($1) AND di.source_sequence IS NULL
-		ORDER BY ae.sequence`, DecisionBearingCategories())
+		  AND ($2 = '' OR r.repo = $2)
+		  AND ($3::bigint = 0 OR ae.sequence >= $3)
+		  AND ($4::bigint = 0 OR ae.sequence <= $4)
+		ORDER BY ae.sequence`, DecisionBearingCategories(), f.Repo, f.FromSequence, f.ToSequence)
 	if err != nil {
 		return nil, fmt.Errorf("decisionindex: gaps: %w", err)
 	}

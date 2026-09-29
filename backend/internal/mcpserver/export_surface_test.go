@@ -17,7 +17,7 @@ import (
 // FuncDecls, TypeSpecs and ValueSpecs), not transcribed, so a drift between
 // an estimate and reality would surface as a test written from the tree.
 //
-// The bulk of these 301 names are tool I/O request/response structs. The MCP
+// The bulk of these 304 names are tool I/O request/response structs. The MCP
 // SDK's jsonschema reflection requires each tool's input/output type — and
 // its fields — to be EXPORTED to build the tool's schema, so unexporting them
 // would break tool registration. In `package main` their exportedness was
@@ -123,6 +123,11 @@ var exportBaseline = []string{
 	"DiagnosticVersions",
 	"DiagnosticWedgeContext",
 	"DiffSummary",
+	// E75.6 / #3734: fishhawk_digest's input, output and mark-read result
+	// mirror, exported for the SDK's jsonschema reflection like every DTO.
+	"DigestInput",
+	"DigestMarkReadResult",
+	"DigestOutput",
 	"DispatchStageInput",
 	"DispatchStageOutput",
 	"DoctorInput",
