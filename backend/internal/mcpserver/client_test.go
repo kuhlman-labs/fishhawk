@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -3465,5 +3466,86 @@ func TestSubmitApproval_SendsRejectClassBody(t *testing.T) {
 	}
 	if _, present := gotRaw["reject_class"]; present {
 		t.Errorf("reject_class present on a classless reject body: %#v", gotRaw)
+	}
+}
+
+// TestGetPrecedent_EncodesRepeatableParamsAndDecodesBody pins the apiClient half
+// of the E75.3 / #3731 wire contract against a real HTTP server: the repeatable
+// `paths` / `escalation_keys` parameters must arrive as REPEATED query values
+// (a comma-joined single value would be read by the handler as one path whose
+// name contains commas), an empty element must be dropped, and the ranked-item
+// explanation fields must survive the decode.
+func TestGetPrecedent_EncodesRepeatableParamsAndDecodesBody(t *testing.T) {
+	var gotMethod, gotPath string
+	var gotQuery url.Values
+	c := releaseTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		gotMethod, gotPath = r.Method, r.URL.Path
+		gotQuery = r.URL.Query()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{
+			"resolved_context":{"repo":"acme/widgets","decision_class":"plan_approval",
+				"touched_paths":["a.go"],"touched_paths_total":3,"touched_paths_truncated":true,
+				"escalation_keys":["k1"],"escalation_keys_total":1},
+			"summary":{"count":1,"human":1,"delegated":0,"modal_outcome":"approve",
+				"agreement_ratio":1,"doctrine_versions":["sha-1"],"hard_filter_only":0},
+			"results":[{"source_sequence":42,"source_entry_hash":"deadbeef",
+				"run_id":"11111111-1111-1111-1111-111111111111","repo":"acme/widgets",
+				"decision_class":"plan_approval","outcome":"approve","reason_sequence":42,
+				"reason_key":"reason","reason_excerpt":"approved before",
+				"matched_keys":{"touched_path_prefixes":["backend"],"touched_path_prefixes_total":1,
+					"escalation_keys":[],"escalation_keys_total":0},
+				"score":{"touched_paths":0.3,"escalation_keys":0,"concern_category":0.25,
+					"severity":0,"total":0.55}}],
+			"truncated":false,
+			"degraded":[{"reason":"audit_repo_unconfigured","detail":"d"}]}`)
+	})
+
+	res, err := c.GetPrecedent(context.Background(), PrecedentParams{
+		DecisionClass:  "plan_approval",
+		Repo:           "acme/widgets",
+		Paths:          []string{"a.go", "", "b.go"},
+		EscalationKeys: []string{"k1", "k2"},
+		Limit:          5,
+	})
+	if err != nil {
+		t.Fatalf("GetPrecedent: %v", err)
+	}
+	if gotMethod != http.MethodGet || gotPath != "/v0/precedent" {
+		t.Errorf("request = %s %s, want GET /v0/precedent", gotMethod, gotPath)
+	}
+	if got := gotQuery["paths"]; len(got) != 2 || got[0] != "a.go" || got[1] != "b.go" {
+		t.Errorf("paths = %v, want two REPEATED values [a.go b.go] with the empty element dropped", got)
+	}
+	if got := gotQuery["escalation_keys"]; len(got) != 2 {
+		t.Errorf("escalation_keys = %v, want two repeated values", got)
+	}
+	if gotQuery.Get("limit") != "5" || gotQuery.Get("decision_class") != "plan_approval" {
+		t.Errorf("scalar params lost: %v", gotQuery)
+	}
+
+	if res.Summary.Count != 1 || res.Summary.ModalOutcome != "approve" || res.Summary.AgreementRatio != 1 {
+		t.Errorf("summary = %+v, want the decoded count/modal/ratio", res.Summary)
+	}
+	if !res.ResolvedContext.TouchedPathsTruncated || res.ResolvedContext.TouchedPathsTotal != 3 {
+		t.Errorf("resolved context = %+v, want the truncation markers decoded", res.ResolvedContext)
+	}
+	if len(res.Results) != 1 {
+		t.Fatalf("results = %d, want 1", len(res.Results))
+	}
+	it := res.Results[0]
+	if it.SourceSequence != 42 || it.SourceEntryHash != "deadbeef" {
+		t.Errorf("citation lost: %+v", it)
+	}
+	if it.ReasonExcerpt != "approved before" || it.ReasonKey != "reason" {
+		t.Errorf("reason fields lost: %+v", it)
+	}
+	if it.Score.Total != 0.55 || it.Score.TouchedPaths != 0.3 {
+		t.Errorf("score lost: %+v", it.Score)
+	}
+	if len(it.MatchedKeys.TouchedPathPrefixes) != 1 {
+		t.Errorf("matched keys lost: %+v", it.MatchedKeys)
+	}
+	if len(res.Degraded) != 1 || res.Degraded[0].Reason != "audit_repo_unconfigured" {
+		t.Errorf("degradations lost: %+v", res.Degraded)
 	}
 }

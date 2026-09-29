@@ -250,6 +250,16 @@ var exportBaseline = []string{
 	"PlanTicketRef",
 	"PlanVerification",
 	// #3647: fishhawk_preview_campaign's tool input/output.
+	// E75.3 / #3731: the fishhawk_precedent tool I/O plus the client mirrors of
+	// GET /v0/precedent. Exported for the SDK's jsonschema reflection like every
+	// other tool DTO; PrecedentOutput embeds PrecedentResolvedContext and
+	// PrecedentDegraded, and the SDK reflects the whole tree.
+	"PrecedentDegraded",
+	"PrecedentInput",
+	"PrecedentOutput",
+	"PrecedentParams",
+	"PrecedentResolvedContext",
+	"PrecedentResult",
 	"PreviewCampaignInput",
 	"PreviewCampaignOutput",
 	"ProductReport",

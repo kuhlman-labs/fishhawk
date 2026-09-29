@@ -2,12 +2,17 @@ package decisionindex
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 )
 
 // DBTX is the query surface the store and the resolver run against. Both
@@ -146,6 +151,38 @@ type ListFilter struct {
 	DecisionClass DecisionClass
 	StageKind     string
 	Limit         int
+	// AccountID narrows the listing to one tenant workspace account
+	// (E75.3 / #3731). NON-NIL matches a row whose account_id EQUALS it OR IS
+	// NULL — the same predicate as the decision_index_tenant_isolation RLS
+	// policy, so a tenanted caller sees its own rows plus the untenanted
+	// single-tenant rows and never another account's. NIL matches any row: the
+	// un-narrowed backfill / CLI path every pre-#3731 caller depends on.
+	//
+	// It is the ROW-set predicate only. A gate-reference read is a RUN read and
+	// carries the stricter GateRef.AccountID rule instead — see GateContext.
+	AccountID *uuid.UUID
+	// Newest flips the source-sequence ordering to DESC so a bounded Limit
+	// yields the NEWEST N rows rather than the oldest N — what a precedent
+	// candidate window needs. Consumers re-sort, so no wire order depends on
+	// this flag. Zero (false) is the pre-#3731 ascending order.
+	Newest bool
+}
+
+// listSQL renders the List query. The ORDER BY direction is the ONLY part that
+// varies, and it is chosen from a bool rather than interpolated from caller
+// input, so there is no injection surface.
+func listSQL(newest bool) string {
+	order := "ORDER BY source_sequence"
+	if newest {
+		order = "ORDER BY source_sequence DESC"
+	}
+	return `SELECT ` + rowColumns + ` FROM decision_index
+		WHERE ($1 = '' OR repo = $1)
+		  AND ($2 = '' OR decision_class = $2)
+		  AND ($3 = '' OR stage_kind = $3)
+		  AND ($5::uuid IS NULL OR account_id = $5 OR account_id IS NULL)
+		` + order + `
+		LIMIT $4`
 }
 
 // List returns the rows matching f, ordered by source sequence.
@@ -154,12 +191,8 @@ func (s *Store) List(ctx context.Context, f ListFilter) ([]Row, error) {
 	if f.Limit > 0 {
 		limit = &f.Limit
 	}
-	rows, err := s.db.Query(ctx, `SELECT `+rowColumns+` FROM decision_index
-		WHERE ($1 = '' OR repo = $1)
-		  AND ($2 = '' OR decision_class = $2)
-		  AND ($3 = '' OR stage_kind = $3)
-		ORDER BY source_sequence
-		LIMIT $4`, f.Repo, string(f.DecisionClass), f.StageKind, limit)
+	rows, err := s.db.Query(ctx, listSQL(f.Newest),
+		f.Repo, string(f.DecisionClass), f.StageKind, limit, f.AccountID)
 	if err != nil {
 		return nil, fmt.Errorf("decisionindex: list: %w", err)
 	}
@@ -271,4 +304,128 @@ func (s *Store) Gaps(ctx context.Context, limit int) (*GapReport, error) {
 		return nil, fmt.Errorf("decisionindex: gaps: %w", err)
 	}
 	return rep, nil
+}
+
+// GateContext is the (repo, stage kind, touched paths, escalation keys) tuple a
+// GATE-REFERENCE precedent query ranks against (E75.3 / #3731). Every field is
+// derived through the SAME joins and the SAME two helpers the indexer used
+// (contextSQL's LATERAL plan join with TouchedPathsFromPlan, and
+// LatestEscalationKeys over escalationSQL's candidates), which is what makes a
+// gate query rank against the same key VALUES the rows were indexed with. A
+// divergent second derivation would make a gate query score differently from
+// the very rows it is compared against.
+type GateContext struct {
+	Repo            string
+	WorkflowID      string
+	DoctrineVersion string
+	StageKind       string
+	TouchedPaths    []string
+	EscalationKeys  []string
+}
+
+// GateRef names the run (and optionally the stage) a gate-reference query
+// resolves, TOGETHER WITH the account the read is performed under.
+//
+// ACCOUNT SCOPE IS PART OF THE REFERENCE, not a separate later check (#3731
+// binding condition 1): the resolve itself is narrowed, so a run in another
+// account is INDISTINGUISHABLE from a nonexistent one — GateContext returns
+// ErrRunMissing either way and no derived context is ever produced to leak.
+//
+// The predicate mirrors server.enforceAccount's ownership rule byte for byte:
+// a row matches when its account_id IS NULL (the untenanted single-tenant
+// window #1830 closes) or EQUALS AccountID. A NIL AccountID — a caller whose
+// identity carries no workspace account, e.g. a bearer token — therefore
+// matches ONLY untenanted runs, exactly as requireRunAccount already refuses
+// such a caller on a tenanted run. This is deliberately STRICTER than
+// ListFilter.AccountID's nil-matches-all: that one is the backfill's row-set
+// predicate, this one is a run READ.
+type GateRef struct {
+	RunID     uuid.UUID
+	StageID   *uuid.UUID
+	AccountID *uuid.UUID
+}
+
+// gateContextSQL resolves the run, the named stage's kind, and the run's LATEST
+// plan artifact. The plan LATERAL is contextSQL's, unchanged.
+//
+// The stage predicate is an EXISTS in the WHERE, not the LEFT JOIN's condition:
+// a stage id that names a stage on a DIFFERENT run must make the whole resolve
+// miss (the same 404 as a nonexistent run), where a LEFT JOIN would merely
+// yield an empty stage_type and answer with a partially-derived context.
+const gateContextSQL = `SELECT r.repo, r.workflow_id, r.workflow_sha,
+	COALESCE(s.stage_type, ''), pa.content
+FROM runs r
+LEFT JOIN stages s ON s.id = $2 AND s.run_id = r.id
+LEFT JOIN LATERAL (
+	SELECT a.content FROM artifacts a
+	JOIN stages ps ON ps.id = a.stage_id
+	WHERE ps.run_id = r.id AND a.kind = 'plan'
+	ORDER BY a.created_at DESC, a.id DESC
+	LIMIT 1
+) pa ON true
+WHERE r.id = $1
+  AND (r.account_id IS NULL OR r.account_id = $3)
+  AND ($2::uuid IS NULL OR EXISTS (
+	SELECT 1 FROM stages s2 WHERE s2.id = $2 AND s2.run_id = r.id))`
+
+// GateContext derives the ranking keys for one run+stage pair, under ref's
+// account scope. It returns ErrRunMissing when the run does not exist, belongs
+// to another account, or the named stage is not on it — one indistinguishable
+// outcome, on purpose.
+func (s *Store) GateContext(ctx context.Context, ref GateRef) (GateContext, error) {
+	var (
+		gc      GateContext
+		content []byte
+	)
+	err := s.db.QueryRow(ctx, gateContextSQL, ref.RunID, ref.StageID, ref.AccountID).
+		Scan(&gc.Repo, &gc.WorkflowID, &gc.DoctrineVersion, &gc.StageKind, &content)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return GateContext{}, fmt.Errorf("%w: run %s", ErrRunMissing, ref.RunID)
+	}
+	if err != nil {
+		return GateContext{}, fmt.Errorf("decisionindex: gate context for run %s: %w", ref.RunID, err)
+	}
+	paths, err := TouchedPathsFromPlan(content)
+	if err != nil {
+		return GateContext{}, fmt.Errorf("decisionindex: gate context for run %s: %w", ref.RunID, err)
+	}
+	gc.TouchedPaths = paths
+	gc.EscalationKeys = []string{}
+	if ref.StageID == nil {
+		return gc, nil
+	}
+	keys, err := s.latestStageEscalationKeys(ctx, *ref.StageID)
+	if err != nil {
+		return GateContext{}, err
+	}
+	gc.EscalationKeys = keys
+	return gc, nil
+}
+
+// latestStageEscalationKeys returns the fired_keys of the LATEST
+// escalation_fired entry on stageID, reusing escalationSQL and
+// LatestEscalationKeys unchanged. math.MaxInt64 as the sequence ceiling is what
+// "latest on this stage, with no decision to sit below" means: the indexer
+// passes the decision's own sequence, a gate query has none.
+func (s *Store) latestStageEscalationKeys(ctx context.Context, stageID uuid.UUID) ([]string, error) {
+	rows, err := s.db.Query(ctx, escalationSQL, int64(math.MaxInt64),
+		[]uuid.UUID{stageID}, []string{stageID.String()})
+	if err != nil {
+		return nil, fmt.Errorf("decisionindex: gate context escalations for stage %s: %w", stageID, err)
+	}
+	defer rows.Close()
+	var cands []*audit.Entry
+	for rows.Next() {
+		c := &audit.Entry{Category: escalationFiredCategory}
+		var payload []byte
+		if err := rows.Scan(&c.Sequence, &c.StageID, &payload); err != nil {
+			return nil, fmt.Errorf("decisionindex: gate context escalations: scan: %w", err)
+		}
+		c.Payload = json.RawMessage(payload)
+		cands = append(cands, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("decisionindex: gate context escalations: %w", err)
+	}
+	return LatestEscalationKeys(cands, &stageID, math.MaxInt64), nil
 }

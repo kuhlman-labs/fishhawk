@@ -68,6 +68,55 @@ fishhawkd decision-index check    [--db <url>] [--limit N]
 
 `--db` falls back to `FISHHAWKD_DATABASE_URL`. `backfill` without `--rebuild` is a converging top-up: the upsert is keyed on `source_sequence`, so re-running it converges instead of erroring. `--rebuild` truncates first. `--dry-run` extracts and counts but writes nothing. The backfill pages `audit_entries` by keyset with a bounded LIMIT and never uses `audit.Repository.ListAll`, which has no LIMIT. It resolves each page's context with one batched join. A decision-bearing entry whose payload is not a JSON object fails the run loudly and names its sequence.
 
+## Read affordances for the precedent query (E75.3 / #3731)
+
+Two ADDITIVE reads `GET /v0/precedent` needs. Both are match-all when zero, so
+every pre-#3731 caller (the backfill, `check`, the writer parity tests) is
+byte-unchanged.
+
+### `ListFilter.AccountID` + `ListFilter.Newest`
+
+- `AccountID` is a `*uuid.UUID`. **NON-NIL** matches a row whose `account_id`
+  EQUALS it **OR IS NULL** — the same predicate as the
+  `decision_index_tenant_isolation` RLS policy, so a tenanted caller sees its own
+  rows plus the untenanted ones and never another account's. Admitting the NULL
+  rows is deliberate parity, not a leak: a single-tenant deployment writes
+  NULL-account rows and would otherwise see nothing (the #1829 window). **NIL**
+  matches any row — the un-narrowed backfill / CLI path.
+- `Newest` flips `ORDER BY source_sequence` to `DESC`, so a bounded `Limit`
+  yields the NEWEST N rather than the oldest N: what a precedent candidate
+  window needs. Consumers re-sort, so no wire order depends on the flag.
+
+`TestList_AccountNarrowing` runs as the admin role, which BYPASSES RLS, so the
+SQL predicate is the only thing in the path — were it run under RLS the policy
+would mask a deleted `WHERE` arm and the case would prove nothing.
+
+### `Store.GateContext(ctx, GateRef)`
+
+Derives `(repo, workflow id, doctrine version, stage kind, touched paths,
+escalation keys)` for a run+stage pair, through the SAME joins and the SAME two
+helpers the indexer used — `contextSQL`'s LATERAL plan join with
+`TouchedPathsFromPlan`, and `LatestEscalationKeys` over `escalationSQL`'s
+candidates. That reuse is the point: a divergent second derivation would make a
+gate-reference query score differently from the very rows it is compared
+against.
+
+**Account scope is part of the reference, not a later check** (#3731 binding
+condition 1). `GateRef.AccountID` narrows the resolve itself, with the predicate
+`account_id IS NULL OR account_id = $n` — `server.enforceAccount`'s ownership
+rule byte for byte, including that a NIL account (a caller carrying no workspace
+account) matches ONLY untenanted runs, exactly as `requireRunAccount` refuses
+such a caller on a tenanted run. This is deliberately STRICTER than
+`ListFilter.AccountID`'s nil-matches-all: that one is the backfill's row-set
+predicate, this one is a run READ.
+
+The stage predicate is an `EXISTS` in the `WHERE`, not the `LEFT JOIN`'s
+condition, so a stage id naming a stage on a DIFFERENT run makes the whole
+resolve MISS rather than yielding a partially-derived context with an empty stage
+kind. A nonexistent run, a run in another account and a stage not on the run all
+return the named `ErrRunMissing`, which the handler renders as one
+indistinguishable 404.
+
 ## Rollback
 
 The change is purely additive. Dropping the wrap in `newAuditRepository` disables live indexing and leaves backfill available. `fishhawkd migrate down` reverts 0088, pinned by `TestMigrateDown_DecisionIndexReversal`. Because the index holds no fact the chain lacks, dropping the table loses nothing.

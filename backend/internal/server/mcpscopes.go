@@ -97,12 +97,17 @@ var mcpToolScopes = map[string]mcpToolScopeRule{
 	// gates a run-bound token on mcp:read (which such a token always holds)
 	// while letting an operator bearer through unscoped
 	// (run_stage_wait.go, scope_amendment.go handleListScopeAmendments).
-	"fishhawk_get_active_run":        mcpScopeAuthenticatedOnly,
-	"fishhawk_get_plan":              mcpScopeAuthenticatedOnly,
-	"fishhawk_get_run_status":        mcpScopeAuthenticatedOnly,
-	"fishhawk_list_audit":            mcpScopeAuthenticatedOnly,
-	"fishhawk_list_runs":             mcpScopeAuthenticatedOnly,
-	"fishhawk_runtime_calibration":   mcpScopeAuthenticatedOnly,
+	"fishhawk_get_active_run":      mcpScopeAuthenticatedOnly,
+	"fishhawk_get_plan":            mcpScopeAuthenticatedOnly,
+	"fishhawk_get_run_status":      mcpScopeAuthenticatedOnly,
+	"fishhawk_list_audit":          mcpScopeAuthenticatedOnly,
+	"fishhawk_list_runs":           mcpScopeAuthenticatedOnly,
+	"fishhawk_runtime_calibration": mcpScopeAuthenticatedOnly,
+	// fishhawk_precedent dials GET /v0/precedent (precedent.go
+	// handleGetPrecedent), an authenticated read that checks NO scope: its
+	// narrowing is the caller's own workspace account plus the point-read
+	// repo-visibility DENY, both applied inside the handler.
+	"fishhawk_precedent":             mcpScopeAuthenticatedOnly,
 	"fishhawk_await_stage":           mcpScopeAuthenticatedOnly,
 	"fishhawk_await_audit":           mcpScopeAuthenticatedOnly,
 	"fishhawk_await_children":        mcpScopeAuthenticatedOnly,
