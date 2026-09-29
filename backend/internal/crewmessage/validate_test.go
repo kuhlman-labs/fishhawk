@@ -417,6 +417,31 @@ func TestValidate_SchemaLayerRejections(t *testing.T) {
 			wantIn: []string{"crew-message-v1"},
 		},
 		{
+			// CONTROL 8: format assertion on anchor.run_id. Draft 2020-12
+			// makes `format` an ANNOTATION by default, so without
+			// Compiler.AssertFormat the Go layer accepts this document while
+			// check-jsonschema — which asserts formats — rejects it against
+			// the canonical copy. Every other field is valid, so the format
+			// keyword is the sole failure cause; drop AssertFormat and this
+			// case reddens.
+			name: "malformed run_id uuid",
+			base: "consult.json",
+			mutate: func(m map[string]any) {
+				m["anchor"].(map[string]any)["run_id"] = "not-a-uuid"
+			},
+			wantIn: []string{"/anchor/run_id", "uuid"},
+		},
+		{
+			// CONTROL 8b: the same assertion on deadline's date-time. The
+			// reference doc advertises 'RFC 3339 date-time', so a document
+			// carrying prose in the field must be refused by the layer that
+			// advertises it.
+			name:   "malformed deadline date-time",
+			base:   "consult.json",
+			mutate: func(m map[string]any) { m["deadline"] = "not-a-date" },
+			wantIn: []string{"/deadline", "date-time"},
+		},
+		{
 			// A per-type payload arm rejects a payload belonging to another
 			// type, so consult prose cannot ride on a notice.
 			name: "notice carrying a consult payload",
@@ -465,30 +490,159 @@ func TestParse_RejectsMalformedAndEmpty(t *testing.T) {
 	}
 }
 
-// TestParse_DisallowsUnknownFields pins the typed decoder's own refusal. It is
-// a SECOND gate behind the schema's additionalProperties:false, and it exists
-// for drift the schema cannot see: a Message json tag that stops matching a
-// schema property name would leave the field schema-valid but silently dropped
-// on decode. The assertion is on the observable refusal, using a
-// schema-invisible shape (a payload field spelled the way a renamed tag would
-// leave it) so the branch is reachable.
-func TestParse_DisallowsUnknownFields(t *testing.T) {
-	// The schema layer is what refuses this document, so assert the layered
-	// outcome: it never reaches the typed decode.
-	data := mutateFixture(t, "notice.json", func(m map[string]any) {
-		m["payload"].(map[string]any)["summary_text"] = "renamed tag"
-	})
-	if err := Validate(data); err == nil {
-		t.Fatal("Validate = nil, want a rejection of the unknown payload field")
+// TestDecodeStrict_RejectsUnknownField pins the PRODUCTION unknown-field
+// guard: decodeStrict is the function Parse calls, and the sole site of
+// dec.DisallowUnknownFields(). Delete that call and this test reddens.
+//
+// The earlier shape of this test could not do that. No document can both pass
+// the schema (every object is additionalProperties:false) and carry a field
+// Message does not know, so a test driving Parse cannot reach the branch at
+// all; the old test's first arm was therefore a SCHEMA rejection and its
+// second arm built its own decoder, exercising encoding/json rather than the
+// production wiring. Both stayed green with the guard removed. Testing the
+// extracted production function is what makes the guard counterfactual.
+func TestDecodeStrict_RejectsUnknownField(t *testing.T) {
+	// A field spelled the way a renamed json tag would leave it: the drift
+	// this guard exists for.
+	in := []byte(`{"schema_version":"crew-message-v1","type":"notice","sender_role":"historian","recipient_role":"planner","anchor":{"run_id":"b2c3d4e5-f607-4819-a2b3-c4d5e6f70819"},"payload":{"summary_text":"renamed tag"}}`)
+
+	// Precondition, asserted rather than assumed: the document is WELL-FORMED
+	// JSON and decodes fine WITHOUT the guard, so the rejection below is the
+	// guard firing and not a malformed-input artifact.
+	var permissive Message
+	if err := json.Unmarshal(in, &permissive); err != nil {
+		t.Fatalf("precondition failed: the fixture must decode without the guard, got %v", err)
 	}
 
-	// And the decoder itself refuses an unknown field when handed one
-	// directly, which is the guard that catches a tag/property drift the
-	// schema would accept.
-	var msg Message
-	dec := json.NewDecoder(strings.NewReader(`{"schema_version":"crew-message-v1","not_a_field":1}`))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&msg); err == nil {
-		t.Fatal("typed decode accepted an unknown field; Parse must decode with DisallowUnknownFields")
+	_, err := decodeStrict(in)
+	var perr *ParseError
+	if !errors.As(err, &perr) {
+		t.Fatalf("decodeStrict = %T (%v), want *ParseError from DisallowUnknownFields", err, err)
+	}
+	if !strings.Contains(perr.Error(), "summary_text") {
+		t.Errorf("error must name the unknown field, got %q", perr)
+	}
+
+	// The guard must not fire on a legal document: a rule that rejected
+	// everything would pass the arm above.
+	if _, err := decodeStrict(readFixture(t, "notice.json")); err != nil {
+		t.Fatalf("decodeStrict(notice.json) = %v, want nil", err)
+	}
+}
+
+// TestParse_RoutesThroughDecodeStrict pins the WIRING: Parse must return the
+// decodeStrict value, not an independently decoded one. Asserted through a
+// legal document, since no schema-valid document reaches the guard branch.
+func TestParse_RoutesThroughDecodeStrict(t *testing.T) {
+	data := readFixture(t, "consult.json")
+	viaParse, err := Parse(data)
+	if err != nil {
+		t.Fatalf("Parse = %v, want nil", err)
+	}
+	viaHelper, err := decodeStrict(data)
+	if err != nil {
+		t.Fatalf("decodeStrict = %v, want nil", err)
+	}
+	if !reflect.DeepEqual(viaParse, viaHelper) {
+		t.Errorf("Parse must return the decodeStrict value\n got: %#v\nwant: %#v", viaParse, viaHelper)
+	}
+}
+
+// TestParse_RejectsDuplicateMembers is the duplicate-member control.
+//
+// The two decoders inside Parse DISAGREE on a repeated member: the generic
+// decode REPLACES (map assignment), the typed decode MERGES (a struct field
+// that is itself a struct is decoded into twice). The anchor case below is
+// the consequence that matters — before this control, the schema layer saw
+// ONE anchor and passed the oneOf while the decoded Message carried TWO,
+// letting exactly-one-anchor escape into the typed value.
+//
+// These fixtures are RAW BYTES, not mutateFixture output: a map[string]any
+// cannot hold a duplicate member, so the map-based helper structurally cannot
+// reach this boundary.
+func TestParse_RejectsDuplicateMembers(t *testing.T) {
+	const anchorRun = `"anchor":{"run_id":"b2c3d4e5-f607-4819-a2b3-c4d5e6f70819"}`
+	const noticeTail = `"payload":{"summary":"s","detail":"d"}`
+	const noticeHead = `"schema_version":"crew-message-v1","type":"notice","sender_role":"historian","recipient_role":"planner"`
+
+	cases := []struct {
+		name    string
+		in      string
+		wantDup string
+	}{
+		{
+			// The consequential case: two anchors of DIFFERENT kinds. Each is
+			// individually valid and the generic decode keeps only the last,
+			// so the schema oneOf passes — the Go layer is the only gate.
+			name:    "repeated anchor with different kinds",
+			in:      `{` + noticeHead + `,` + anchorRun + `,"anchor":{"issue_ref":"kuhlman-labs/fishhawk#1"},` + noticeTail + `}`,
+			wantDup: "anchor",
+		},
+		{
+			// A repeated scalar at the root. Both values are legal members of
+			// the crew-role enum, so the COLLAPSED document is schema-valid
+			// either way and the rejection cannot come from the enum.
+			name:    "repeated scalar member",
+			in:      `{` + noticeHead + `,` + anchorRun + `,` + noticeTail + `,"sender_role":"security"}`,
+			wantDup: "sender_role",
+		},
+		{
+			// A repeated member NESTED inside the anchor object, proving the
+			// walk descends rather than checking the root only.
+			name:    "repeated member inside the anchor",
+			in:      `{` + noticeHead + `,"anchor":{"run_id":"b2c3d4e5-f607-4819-a2b3-c4d5e6f70819","run_id":"0f0e0d0c-0b0a-4908-8706-050403020100"},` + noticeTail + `}`,
+			wantDup: "run_id",
+		},
+		{
+			// A repeated member inside an ARRAY element, proving the walk
+			// descends through arrays too.
+			name:    "repeated member inside an evidence element",
+			in:      `{` + noticeHead + `,` + anchorRun + `,` + noticeTail + `,"evidence":[{"kind":"run","ref":"a","ref":"b"}]}`,
+			wantDup: "ref",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Precondition, asserted rather than assumed: with the duplicate
+			// COLLAPSED the way the generic decoder collapses it, the document
+			// is schema-valid. So the rejection below is this control firing,
+			// not the schema rejecting something else about the fixture.
+			var raw any
+			if err := json.Unmarshal([]byte(tc.in), &raw); err != nil {
+				t.Fatalf("precondition failed: fixture must be well-formed JSON, got %v", err)
+			}
+			if err := compiledSchema.Validate(raw); err != nil {
+				t.Fatalf("precondition failed: the schema must ACCEPT the collapsed document so the Go rule is the sole gate, got %v", err)
+			}
+
+			_, err := Parse([]byte(tc.in))
+			if !errors.Is(err, ErrDuplicateMember) {
+				t.Fatalf("Parse = %v, want ErrDuplicateMember", err)
+			}
+			if !strings.Contains(err.Error(), tc.wantDup) {
+				t.Errorf("error must name the repeated member %q, got %q", tc.wantDup, err)
+			}
+			if verr := Validate([]byte(tc.in)); !errors.Is(verr, ErrDuplicateMember) {
+				t.Errorf("Validate = %v, want ErrDuplicateMember", verr)
+			}
+		})
+	}
+}
+
+// TestParse_AcceptsRepeatedNameInSiblingObjects is the paired accept arm: a
+// rule that rejected any name seen twice ANYWHERE in the document would pass
+// the reject table above. The same member name in two SIBLING objects is
+// legal and must stay accepted — every evidence element carries "kind" and
+// "ref".
+func TestParse_AcceptsRepeatedNameInSiblingObjects(t *testing.T) {
+	for _, f := range []string{"consult.json", "notice.json"} {
+		msg, err := Parse(readFixture(t, f))
+		if err != nil {
+			t.Fatalf("Parse(%s) = %v, want nil", f, err)
+		}
+		if len(msg.Evidence) < 2 {
+			t.Fatalf("%s must carry two evidence elements so the sibling-name arm is exercised, got %d", f, len(msg.Evidence))
+		}
 	}
 }

@@ -61,10 +61,14 @@ Two layers carry the invariants, and **which layer** matters.
 | Exactly one anchor | **schema** | the `anchor` `oneOf` over three single-member arms: zero anchors match no arm, two match two |
 | ARCHITECTURE §6 invariant #8 — no message is delivered to an implement stage | **Go only** | `crewmessage.CanReceive`, returning `ErrRecipientNotAddressable` |
 | ADR-081 D1 — `response_required` only on the synchronously-answered types | **Go only** | `ErrResponseNotAnswerable` |
+| No object repeats a member name | **Go only** | `ErrDuplicateMember`. JSON permits a repeated member and every decoder accepts one, but they disagree on its meaning — a generic decode REPLACES, a typed decode into a struct field MERGES — so `{"anchor":{"run_id":…},"anchor":{"issue_ref":…}}` presents ONE anchor to the schema `oneOf` and TWO to the decoded `Message`. Refusing duplicates up front is what keeps exactly-one-anchor true of the typed value |
+| `anchor.run_id` is a uuid, `deadline` an RFC 3339 date-time | **both** | `format` is an annotation by default under Draft 2020-12, so the Go compiler is built with `AssertFormat` — without it the Go layer would ACCEPT values `check-jsonschema` rejects |
 
 ### Schema-only validation is NOT sufficient
 
 The `crew-role` enum **includes `implementer`**, so this schema *on its own* accepts `recipient_role: implementer`. A bare `check-jsonschema --schemafile` run — or any consumer that validates against the schema without calling Go — does **not** enforce the no-implement-recipient rule. Invariant #8 lives in `crewmessage.Validate` and only there. **Every consumer must call the Go `Validate` (or `Parse`, which is `Validate` plus a typed decode).**
+
+Invariant #8 is not the only Go-only rule. The `response_required` answerability rule and the duplicate-member refusal are also enforced nowhere but in Go, and they cut the other way from a normal schema/validator split: a document `check-jsonschema` **accepts** can be refused by `Validate`. On duplicate members the Go layer is deliberately the stricter of the two — Python's `json` is last-wins, so `check-jsonschema` silently collapses a repeated member and never sees the divergence the Go decoders would. Formats are the one place the two were out of step in the *other* direction, which is why the compiler is built with `AssertFormat`: a garbage `run_id` or `deadline` must not pass the layer documented as the stricter one.
 
 That split is deliberate, not an oversight:
 
@@ -111,10 +115,10 @@ check-jsonschema --schemafile docs/spec/crew-message-v1.schema.json \
     backend/internal/crewmessage/testdata/valid/escalation.json
 ```
 
-Both commands check the **schema layer only**. Neither enforces invariant #8 or the `response_required` rule — for those, run the Go validator:
+Both commands check the **schema layer only**. Neither enforces invariant #8, the `response_required` rule or the duplicate-member refusal — for those, run the Go validator. Run the whole package, not a `-run TestValidate` subset: the duplicate-member and unknown-field controls are named `TestParse_*` and `TestDecodeStrict_*` and a `TestValidate` filter skips them.
 
 ```sh
-scripts/test single -run TestValidate ./backend/internal/crewmessage/
+scripts/test single ./backend/internal/crewmessage/   # the WHOLE package
 ```
 
 ## Deliberately not in this contract

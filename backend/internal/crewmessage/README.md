@@ -20,8 +20,23 @@ The split is the load-bearing design decision, so read it before changing either
 |---|---|---|
 | No message is addressed to a role an implement stage executes (`docs/ARCHITECTURE.md` §6 invariant #8) | `ErrRecipientNotAddressable` | `CanReceive` |
 | `response_required` is legal only on `consult` and `escalation` (ADR-081 D1) | `ErrResponseNotAnswerable` | `answerableTypes` |
+| No object repeats a member name, at any depth | `ErrDuplicateMember` | `rejectDuplicateMembers` |
 
-Both rules read the value decoded inside `Parse`, never a second independent decode of the raw bytes, so the schema layer and the Go layer agree on one interpretation of the document.
+Both directional rules read the value decoded inside `Parse`, never a second independent decode of the raw bytes, so the schema layer and the Go layer agree on one interpretation of the document.
+
+**The duplicate-member rule is what makes that last sentence true.** `Parse` validates a generic decode and then decodes the original bytes into `Message`, and the two decoders disagree on exactly one construct: a repeated member name. `map[string]any` **replaces** the earlier value; a struct field that is itself a struct is **merged** into twice. So
+
+```json
+{"anchor":{"run_id":"…"},"anchor":{"issue_ref":"…"}}
+```
+
+presented ONE anchor to the schema layer — the `oneOf` passed — and TWO to the decoded `Message`, letting exactly-one-anchor escape into the typed value. Observed, not reasoned: before the guard, `Parse` on that document returned `Anchor{RunID:"…", IssueRef:"…"}` with a nil error. `rejectDuplicateMembers` runs ahead of *both* decodes, as a token walk, because every decode target this package has already collapses the duplicate before it can be seen.
+
+`check-jsonschema` **accepts** duplicates (Python's `json` is last-wins), so this is a place the Go layer is deliberately the stricter of the two. The paired accept arm matters: the same member name in two *sibling* objects is legal and stays accepted — every `evidence` element carries `kind` and `ref`.
+
+### Format assertion
+
+The compiler is built with `Compiler.AssertFormat()`. Under Draft 2020-12 `format` is an **annotation** by default, so without it the Go layer accepted an `anchor.run_id` of `"not-a-uuid"` and a `deadline` of `"not-a-date"` that `check-jsonschema` — which asserts formats — rejects against the canonical copy. Both were observed. That divergence ran the wrong way: this package is documented as the *stricter* of the two layers, so it must not be the weaker one on the two format-bearing properties. No sibling validator in the repo asserts formats, so this is a deliberate departure from the local idiom rather than a copy of it.
 
 `CanReceive` is the **single source of truth for addressability**. It is defined as the complement of `implementStageRoles`, kept as its own declaration so a future implement-executed role is added in exactly one place, and it is fail-closed for a role outside `AllRoles`.
 
@@ -42,7 +57,7 @@ A later E77 child that ships this schema to a **non-backend process** must re-ev
 | Symbol | Contract |
 |---|---|
 | `Validate(data []byte) error` | schema-validate, then apply both semantic rules. Returns `*ParseError`, `*SchemaError`, `ErrRecipientNotAddressable` or `ErrResponseNotAnswerable` |
-| `Parse(data []byte) (*Message, error)` | `Validate` plus a typed decode with `DisallowUnknownFields`, so the typed path can never silently accept a field the schema rejects |
+| `Parse(data []byte) (*Message, error)` | `Validate` plus a typed decode (`decodeStrict`) with `DisallowUnknownFields`, so the typed path can never silently accept a field the schema rejects |
 | `CanReceive(Role) bool` | addressability; see above |
 | `AllRoles` | the full vocabulary, in schema order |
 | `EmbeddedSchema() []byte` | the shipped mirror's raw bytes, for the drift and shipped-document tests |
@@ -64,8 +79,11 @@ Seven controls, one behavioural test each. For the two Go controls, mutate the r
 | 5 | escalation calibration | schema, the escalation `if`/`then` arm | `.../escalation_missing_recommended_default`, `.../escalation_missing_tradeoffs` | each case leaves the OTHER field present, proving the payload is otherwise well-formed, so only the `then`-clause `required` entry rejects it. Making either field optional turns one case red |
 | 6 | closed type set | schema, `type` enum | `.../unknown_type` | with the enum deleted no `if`/`then` arm matches, payload goes unconstrained, and the document validates |
 | 7 | `response_required` answerability | Go, `ErrResponseNotAnswerable` | `TestValidate_RejectsResponseRequiredOnNotice` | the schema declares `response_required` as a plain boolean on every type, so the document is schema-valid and the Go rule is the only gate. `TestValidate_ResponseRequiredLegalOnAnswerableTypes` is the paired accept arm, so a rule that rejected it on EVERY type would not pass |
+| 8 | format assertion | schema, `Compiler.AssertFormat` | `.../malformed_run_id_uuid`, `.../malformed_deadline_date-time` | every other field is valid, so the `format` keyword is the sole failure cause; drop `AssertFormat` and both cases redden (observed) |
+| 9 | no duplicate members | Go, `ErrDuplicateMember` | `TestParse_RejectsDuplicateMembers` | the fixtures are RAW BYTES — a `map[string]any` cannot hold a duplicate member, so `mutateFixture` structurally cannot reach this boundary. Each case asserts as a precondition that the schema ACCEPTS the collapsed document, so the Go rule is the sole gate. `TestParse_AcceptsRepeatedNameInSiblingObjects` is the paired accept arm |
+| 10 | unknown-field guard | Go, `DisallowUnknownFields` | `TestDecodeStrict_RejectsUnknownField` | the guard lives in the extracted `decodeStrict`, which is the only site of the call. It is tested *there* because no document can both pass the schema (`additionalProperties: false` everywhere) and carry a field `Message` does not know — a test driving `Parse` can never reach the branch, which is what made the earlier version of this test vacuous |
 
-Controls 1 and 7 assert the schema **accepts** the mutated document as an explicit precondition, so a future schema tightening that masks the Go rule fails loudly instead of leaving the test quietly non-counterfactual.
+Controls 1, 7 and 9 assert the schema **accepts** the mutated document as an explicit precondition, so a future schema tightening that masks the Go rule fails loudly instead of leaving the test quietly non-counterfactual.
 
 Beyond the seven: `TestSchema_ClosedAtEveryLevel` and `TestSchema_DeclaresNoAuthorityVocabulary` walk the **shipped** document, so a comment-only or no-op touch of the schema cannot satisfy them; `TestEmbeddedSchemaMatchesCanonical` fails mirror drift in-loop, ahead of CI's schema-sync gate; and `TestSchemaRoleEnumMatchesAllRoles` pins the Go vocabulary against the schema enum in both directions.
 
@@ -76,7 +94,7 @@ Beyond the seven: `TestSchema_ClosedAtEveryLevel` and `TestSchema_DeclaresNoAuth
 Per-package during iteration, one full gate at the end:
 
 ```sh
-scripts/test single -run TestValidate ./backend/internal/crewmessage/
+scripts/test single ./backend/internal/crewmessage/   # the WHOLE package
 (cd backend && go test -race ./internal/crewmessage/ ./internal/server/)
 scripts/test verify        # once, on the committed tree
 ```

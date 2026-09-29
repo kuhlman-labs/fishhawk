@@ -26,8 +26,20 @@
 //   - response_required is legal only on the two synchronously-answered types,
 //     consult and escalation (ADR-081 D1). Validate returns
 //     ErrResponseNotAnswerable otherwise.
+//   - No object repeats a member name. Validate returns ErrDuplicateMember.
+//     This is what keeps the generic and typed decodes inside Parse reading
+//     ONE interpretation of the document; see ErrDuplicateMember.
 //
-// SCHEMA-ONLY VALIDATION IS NOT SUFFICIENT. The crew-role enum admits
+// The compiler is built with AssertFormat, so anchor.run_id must be a uuid and
+// deadline an RFC 3339 date-time. Draft 2020-12 makes format an annotation by
+// default, which would leave this layer WEAKER than check-jsonschema on the
+// canonical copy — the wrong direction for the layer documented as the
+// authority.
+//
+// SCHEMA-ONLY VALIDATION IS NOT SUFFICIENT, and the gap is wider than one
+// rule: the response_required rule and the duplicate-member refusal are also
+// Go-only, and check-jsonschema ACCEPTS a duplicate member (Python's json is
+// last-wins). The crew-role enum admits
 // RoleImplementer on purpose: the implementer is a real crew role and a legal
 // SENDER, so a bare `check-jsonschema --schemafile` run (or any non-Go
 // consumer of the schema) ACCEPTS recipient_role: implementer. Invariant #8 is
@@ -71,6 +83,15 @@ func mustCompileSchema() *jsonschema.Schema {
 		panic(fmt.Sprintf("crewmessage: parse embedded schema %s: %v", embeddedSchemaPath, err))
 	}
 	c := jsonschema.NewCompiler()
+	// Under Draft 2020-12 `format` is an ANNOTATION by default, so without
+	// this the Go layer would ACCEPT a run_id of "not-a-uuid" and a deadline
+	// of "not-a-date" that check-jsonschema — which asserts formats — rejects
+	// against the canonical copy. That is a cross-layer divergence in the
+	// wrong direction: the Go validator is documented as the STRICTER
+	// authority, so it must not be the weaker one on the two format-bearing
+	// properties (anchor.run_id, deadline). Asserting here makes the two
+	// layers agree, and the reject table pins both.
+	c.AssertFormat()
 	// Registered under the document's own absolute $id rather than a bare
 	// filename: a relative resource name is resolved against the process cwd,
 	// which would leak an absolute host path into every validation error
