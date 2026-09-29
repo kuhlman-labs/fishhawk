@@ -29,6 +29,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcheckpublisher"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auth"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/captain"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/digest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
@@ -815,6 +816,13 @@ type Config struct {
 	// digest_unconfigured rather than panicking.
 	DigestStore *digest.Store
 	DigestIndex digest.IndexReader
+
+	// CaptainStore is the captain record's serialization domain and lock-free
+	// read (E76.2 / #3765, ADR-083 #3751): GET /v0/captain and the five POST
+	// /v0/captain/{offer,withdraw,accept,relinquish,claim} verbs. Wired from
+	// serve.go next to digest.NewStore(pool); nil degrades all six routes to
+	// 501 captain_unconfigured rather than panicking.
+	CaptainStore *captain.Store
 
 	// ModelOracle is the snapshot seam the model-id validity layer (#1339)
 	// queries to decide whether a model named in a workflow spec is a real,

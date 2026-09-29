@@ -92,6 +92,16 @@ var exportBaseline = []string{
 	"CancelCampaignOutput",
 	"CancelRunInput",
 	"CancelRunOutput",
+	// E76.2 / #3765: fishhawk_captain's input, output and the REST-mirror
+	// DTOs it nests, exported for the SDK's jsonschema reflection like every
+	// DTO.
+	"CaptainHistoryEntry",
+	"CaptainInput",
+	"CaptainOffer",
+	"CaptainOutput",
+	"CaptainRecord",
+	"CaptainState",
+	"CaptainVerbResult",
 	"CategoryRunAutoDriven",
 	"ChildCriteriaCheck",
 	"ChildResult",

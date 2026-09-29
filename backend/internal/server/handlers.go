@@ -111,6 +111,14 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	// mark-read appends digest_marked_read BEFORE advancing the watermark.
 	mux.HandleFunc("GET /v0/digest", s.handleGetDigest)
 	mux.HandleFunc("POST /v0/digest/mark-read", s.handleDigestMarkRead)
+	// Captain record (E76.2 / #3765, ADR-083 #3751): GET never writes; each
+	// verb appends one global-chain entry atomically via captain.Store.Apply.
+	mux.HandleFunc("GET /v0/captain", s.handleGetCaptain)
+	mux.HandleFunc("POST /v0/captain/offer", s.handleCaptainOffer)
+	mux.HandleFunc("POST /v0/captain/withdraw", s.handleCaptainWithdraw)
+	mux.HandleFunc("POST /v0/captain/accept", s.handleCaptainAccept)
+	mux.HandleFunc("POST /v0/captain/relinquish", s.handleCaptainRelinquish)
+	mux.HandleFunc("POST /v0/captain/claim", s.handleCaptainClaim)
 	mux.HandleFunc("GET /v0/audit/export", s.handleAuditExport)
 	mux.HandleFunc("GET /v0/audit/export.csv", s.handleAuditExportCSV)
 	mux.HandleFunc("GET /v0/reports/agent-changes", s.handleAgentChangesReport)
