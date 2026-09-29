@@ -547,11 +547,318 @@ export interface GateView {
   history_gaps?: string[];
 }
 
+/*
+ * Repo dashboard rollups (E40.3 / #1714). Mirrors the RepoThroughput /
+ * RepoHealth / RepoEconomics / RepoPosture schemas in
+ * docs/api/v0.openapi.yaml, served by GET /v0/repos/{owner}/{name}/{...}
+ * (backend/internal/server/repodash.go). The shared wire goldens
+ * testdata/wire/repodash_*.json pin these shapes on both sides.
+ */
+
+/**
+ * The window envelope every rollup carries. `truncated: true` means the
+ * server's scan ceiling stopped the run scan before the look-back boundary
+ * — the rollup is PARTIAL, and each panel says so.
+ */
+export interface RepoDashWindow {
+  repo: string;
+  window_start: string;
+  window_end: string;
+  window_weeks: number;
+  runs_scanned: number;
+  truncated: boolean;
+}
+
+/** One ISO week (UTC, Monday start) of merged changes, bucketed by merge time. */
+export interface RepoWeekCount {
+  week_start: string;
+  merged_changes: number;
+}
+
+export interface RepoGateWaitRollup {
+  gate: string;
+  samples: number;
+  median_wait_seconds: number;
+}
+
+/** Wait-on-human latency (#1702), folded over the runs that resolved a rollup. */
+export interface RepoWaitOnHuman {
+  runs: number;
+  median_total_wait_seconds: number;
+  total_wait_on_human_seconds: number;
+  gates: RepoGateWaitRollup[];
+}
+
+/** GET /v0/repos/{owner}/{name}/throughput body. */
+export interface RepoThroughput extends RepoDashWindow {
+  weeks: RepoWeekCount[];
+  merged_changes: number;
+  /** created_at → earliest pr_merged, median over `cycle_time_samples` runs. */
+  median_cycle_time_seconds: number;
+  cycle_time_samples: number;
+  /** Merged runs with no pr_merged row, left out of the median. */
+  cycle_time_excluded: number;
+  /** ABSENT (not a zero block) when no run in the window resolved a gate-latency rollup. */
+  wait_on_human?: RepoWaitOnHuman;
+}
+
+export interface RepoFailureMix {
+  A: number;
+  B: number;
+  C: number;
+  D: number;
+}
+
+/** GET /v0/repos/{owner}/{name}/health body. Every rate is 0 on a zero denominator. */
+export interface RepoHealth extends RepoDashWindow {
+  runs_considered: number;
+  plan_approval_samples: number;
+  plan_first_shot_approvals: number;
+  plan_first_shot_approval_rate: number;
+  fixup_runs: number;
+  fixup_rate: number;
+  acceptance_samples: number;
+  acceptance_passed: number;
+  acceptance_not_validated: number;
+  acceptance_failed: number;
+  acceptance_undecidable: number;
+  acceptance_pass_rate: number;
+  failure_categories: RepoFailureMix;
+}
+
+export interface RepoWeekEconomics {
+  week_start: string;
+  cost_usd: number;
+  cache_read_ratio: number;
+  reuse_factor: number;
+  net_savings_usd: number;
+}
+
+/** budget.Tier* in backend/internal/budget/budget.go. */
+export type BudgetTier = 'ok' | 'warn' | 'over' | 'ack_required' | 'page';
+
+/** One workflow's ADR-030 periodic-budget burn. */
+export interface RepoBudgetBurn {
+  workflow_id: string;
+  period: 'weekly' | 'monthly';
+  period_start: string;
+  limit_usd: number;
+  spent_usd: number;
+  fraction: number;
+  tier: BudgetTier;
+  enforcement: 'advisory' | 'blocking';
+}
+
+export interface RepoEconomics extends RepoDashWindow {
+  cost_entries: number;
+  total_cost_usd: number;
+  merged_changes: number;
+  cost_per_merged_change_usd: number;
+  weeks: RepoWeekEconomics[];
+  /** Omitted when no workflow in the window declares a periodic budget. */
+  budgets?: RepoBudgetBurn[];
+}
+
+/**
+ * The no-cost_recorded economics body: `{}`, or `{"truncated":true}` when the
+ * scan was cut short (presence-not-status-code, like /cost).
+ */
+export interface RepoEconomicsEmpty {
+  truncated?: boolean;
+}
+
+/** GET /v0/repos/{owner}/{name}/economics body. */
+export type RepoEconomicsResponse = RepoEconomics | RepoEconomicsEmpty;
+
+export interface PostureGate {
+  type: string;
+  autonomy?: string;
+  approvers_any_of?: string[];
+  approvers_all_of?: string[];
+}
+
+export interface PostureReviewers {
+  agents?: Array<{ provider: string; model?: string }>;
+  human?: number;
+}
+
+export interface PostureStageBudget {
+  max_tokens?: number;
+  max_runtime_seconds?: number;
+  limit_usd?: number;
+}
+
+export interface PostureStage {
+  id: string;
+  type: string;
+  executor: string;
+  model?: string;
+  gates?: PostureGate[];
+  reviewers?: PostureReviewers;
+  budget?: PostureStageBudget;
+}
+
+export interface PosturePeriodicBudget {
+  period: 'weekly' | 'monthly';
+  limit_usd: number;
+  enforcement?: 'advisory' | 'blocking';
+  warn_at?: number;
+}
+
+export interface PostureWorkflow {
+  id: string;
+  autonomy?: string;
+  stages: PostureStage[];
+  budgets?: PosturePeriodicBudget[];
+}
+
+/**
+ * Workflow posture projected from the repo's newest run's cached spec.
+ * `schema_supported` / `spec_valid` + `spec_error` drive the drift warning.
+ */
+export interface RepoPosture {
+  repo: string;
+  run_id: string;
+  workflow_id: string;
+  workflow_sha: string;
+  version: string;
+  schema_major: number;
+  schema_hash?: string;
+  schema_supported: boolean;
+  spec_valid: boolean;
+  spec_error?: string;
+  workflows: PostureWorkflow[];
+}
+
+/** GET /v0/repos/{owner}/{name}/posture body: `{}` when no run carries a cached spec. */
+export type RepoPostureResponse = RepoPosture | Record<string, never>;
+
+/** GET /healthz body (backend/internal/server/handlers.go healthResponse). */
+export interface HealthStatus {
+  status: string;
+  version: string;
+  git_sha: string;
+  min_runner_version: string;
+  /** Embedded schema hashes keyed by id, e.g. `workflow-v2`. */
+  schemas: Record<string, string>;
+  start_nonce?: string;
+  process_start?: string;
+  dev_mode?: boolean;
+  push_sinks: string[];
+}
+
 export type ApprovalDecision = 'approve' | 'reject';
 
 export interface ApprovalRequest {
   decision: ApprovalDecision;
   comment?: string;
+}
+
+/*
+ * Human-decision write surfaces wired into the attention queue (E40.2 /
+ * #1717). Each mirrors an existing OpenAPI request/response shape in
+ * docs/api/v0.openapi.yaml — no new endpoint, no schema change. Field
+ * names are copied field-for-field from the OpenAPI document.
+ */
+
+export type ScopeAmendmentDecision = 'approve' | 'deny';
+export type ScopeAmendmentStatus = 'pending' | 'approved' | 'denied';
+
+/** One requested path in a mid-stage scope amendment (#961). */
+export interface ScopeAmendmentPath {
+  path: string;
+  operation: 'modify' | 'create';
+}
+
+/** Mirrors the ScopeAmendment schema — the decided-amendment response body. */
+export interface ScopeAmendment {
+  id: string;
+  run_id: string;
+  stage_id: string;
+  paths: ScopeAmendmentPath[];
+  reason: string;
+  status: ScopeAmendmentStatus;
+  decision_reason?: string;
+  decided_by?: string;
+  requested_at: string;
+  decided_at?: string;
+}
+
+/** Body of POST /v0/runs/{run}/scope-amendments/{id}/decision. */
+export interface ScopeAmendmentDecisionRequest {
+  decision: ScopeAmendmentDecision;
+  reason?: string;
+}
+
+/**
+ * The updated concern row returned by the waive endpoint (#984). Deferred
+ * concerns carry the identical row shape nested under
+ * DeferredConcernResult.concern, so the alias below names the shared shape.
+ */
+export interface ConcernRow {
+  id: string;
+  run_id: string;
+  stage_id: string;
+  stage_kind: 'plan' | 'implement';
+  severity: string;
+  category: string;
+  note: string;
+  state: string;
+  state_reason: string;
+}
+export type WaivedConcern = ConcernRow;
+
+/** Body of POST /v0/concerns/{id}/waive — the REQUIRED audited reason. */
+export interface ConcernWaiveRequest {
+  reason: string;
+}
+
+/**
+ * Body of POST /v0/concerns/{id}/defer. `parent_epic` is the only
+ * operator-supplied field the server cannot derive; the rest override
+ * server defaults.
+ */
+export interface ConcernDeferRequest {
+  parent_epic?: string;
+  n?: string;
+  type?: string;
+  labels?: string[];
+  note?: string;
+}
+
+/** Mirrors DeferredConcernResult — the filed follow-up issue + deferred concern. */
+export interface DeferredConcernResult {
+  concern: ConcernRow;
+  issue: {
+    type: string;
+    title: string;
+    number: number;
+    url: string;
+    provider: string;
+    applied_labels?: string[];
+    defaulted_labels?: string[];
+    missing_label_namespaces?: string[];
+  };
+}
+
+/**
+ * Body of POST /v0/runs/{run}/acceptance-arbitration. `reason` is required;
+ * `acknowledge_failed_criteria` is required by the server (409
+ * `acceptance_arbitration_requires_acknowledgement`) whenever the discharged
+ * outcome carries `criteria_failed > 0`.
+ */
+export interface AcceptanceArbitrationRequest {
+  reason: string;
+  acknowledge_failed_criteria?: boolean;
+}
+
+/** The 200 body of the acceptance-arbitration endpoint. */
+export interface AcceptanceArbitrationResult {
+  run_id: string;
+  acceptance_gate_state: string;
+  outcome_sequence: number;
+  arbitration_sequence: number;
+  already_recorded: boolean;
 }
 
 export interface ApiError {

@@ -1,0 +1,14 @@
+id: scenario:issue-1714/throughput-endpoint-returns-weekly-merges
+statement: The repo throughput rollup endpoint returns 200 for a repo that has at least one run, and its body carries a per-week merged-change series and a median cycle time derived from run completion timestamps.
+verify_hint: GET /v0/repos/kuhlman-labs/fishhawk/throughput returns 200 and the JSON body carries a `weeks` array and a numeric `median_cycle_time_seconds`.
+steps: Seeded runs for kuhlman-labs/fishhawk via POST http://localhost:8090/v0/dev/fixtures (plan-gate-parked, plan-gate-criteria, trace-upload-target, acceptance-dispatched), then GET http://localhost:8090/v0/repos/kuhlman-labs/fishhawk/throughput.
+assertions:
+    expected: 200 with a `weeks` array and a numeric `median_cycle_time_seconds`.
+    observed_at_record: '200 with window_weeks 12, runs_scanned 8, truncated false, and a weeks array of 12 {week_start, merged_changes} entries. median_cycle_time_seconds is 0 (numeric), with cycle_time_samples 0 and cycle_time_excluded 0. No seeded run carries a pr_merged row: a stub-forge pull_request.closed merged delivery returned 202 but matched no run.'
+    repro_handle: curl -s http://localhost:8090/v0/repos/kuhlman-labs/fishhawk/throughput
+origin:
+    issue: 1714
+    pr: 0
+    run_id: 9e5234b3-f1fd-4704-bdd6-dc8c12fa132b
+    head_sha: 946018bb06a93cc6a534d4b452b2ae61c80b9a88
+    recorded_at: 2026-09-29T00:36:38Z

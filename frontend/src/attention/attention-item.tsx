@@ -1,16 +1,25 @@
-import type { ReactNode } from 'react';
+import { useState, type ReactNode } from 'react';
 import { Link } from 'react-router';
+import { Button } from '@/components/ui/button';
 import type { AttentionContext, AttentionItem, AttentionItemKind } from '@/api/types';
 import { cn } from '@/lib/cn';
+import { DECISION_VERBS } from './decision-verbs';
+import { DecisionPanel } from './decision-panel';
 
 /*
- * One attention-queue card (E40.1 / #1713): kind badge, repo + title, the
- * one-screen decision context, relative age, and a link to the item's
- * detail page. READ-ONLY by construction — it renders no button, form or
- * dispatch affordance; the decision itself is taken on the detail page.
+ * One attention-queue card (E40.1 / #1713; decision write-surface E40.2 /
+ * #1717): kind badge, repo + title, the one-screen decision context, relative
+ * age, and a link to the item's detail page.
  *
- * The link target is the server-emitted `detail_path`, never re-derived
- * here, so the six link rules live in one place (the backend).
+ * The card is no longer read-only: a "Decide" disclosure expands an inline
+ * per-kind decision panel (DecisionPanel) beside the retained detail link, for
+ * every kind whose DECISION_VERBS entry is non-empty. A human-led campaign
+ * item has no decision endpoint (its verb list is empty), so it keeps its
+ * E40.1 shape with no Decide toggle. Re-execution ("drive-plane") affordances
+ * are still excluded — see decision-verbs.ts.
+ *
+ * The link target is the server-emitted `detail_path`, never re-derived here,
+ * so the six link rules live in one place (the backend).
  */
 
 const ATTENTION_KIND_LABELS: Record<AttentionItemKind, string> = {
@@ -237,7 +246,21 @@ function KindContext({ item }: { item: AttentionItem }) {
   }
 }
 
-export function AttentionItemCard({ item }: { item: AttentionItem }) {
+export function AttentionItemCard({
+  item,
+  onResolved,
+}: {
+  item: AttentionItem;
+  /** Called when this item's decision was successfully submitted (E40.2 / #1717). */
+  onResolved?: (item: AttentionItem) => void;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  // Only kinds with a decision endpoint get the Decide disclosure; a
+  // human-led campaign item (empty verb list) keeps its E40.1 read-only shape.
+  // `?? []` guards a runtime-unknown kind (the labelled-fallback path), which
+  // has no DECISION_VERBS entry — it stays read-only.
+  const decidable = (DECISION_VERBS[item.kind] ?? []).length > 0;
+
   return (
     <article
       aria-label={`${ATTENTION_KIND_LABELS[item.kind] ?? item.kind}: ${item.title}`}
@@ -267,12 +290,28 @@ export function AttentionItemCard({ item }: { item: AttentionItem }) {
       <dl className="space-y-2">
         <KindContext item={item} />
       </dl>
-      <Link
-        to={item.detail_path}
-        className="inline-block text-sm text-neutral-900 underline underline-offset-2 dark:text-neutral-100"
-      >
-        Open to decide →
-      </Link>
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+        {decidable && (
+          <Button variant="outline" size="sm" onClick={() => setExpanded((v) => !v)}>
+            {expanded ? 'Hide' : 'Decide'}
+          </Button>
+        )}
+        <Link
+          to={item.detail_path}
+          className="inline-block text-sm text-neutral-900 underline underline-offset-2 dark:text-neutral-100"
+        >
+          Open to decide →
+        </Link>
+      </div>
+      {decidable && expanded && (
+        <div className="rounded-md border border-neutral-200 bg-neutral-50 p-3 dark:border-neutral-800 dark:bg-neutral-900">
+          <DecisionPanel
+            item={item}
+            onResolved={() => onResolved?.(item)}
+            onCancel={() => setExpanded(false)}
+          />
+        </div>
+      )}
     </article>
   );
 }

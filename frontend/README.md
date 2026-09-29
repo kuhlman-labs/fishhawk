@@ -17,7 +17,10 @@ changes don't pay the install/test cost.
   `login` is rendered outside the shell; `attention` is the index
   route — the "Needs You" queue; `runs` lists workflow runs at `/runs`,
   `run-detail` drills into one, `stage-detail` renders the plan;
+  `repo-dashboard` is the per-repo dashboard at `/repos/:owner/:name`;
   `audit` is still a stub; `not-found` catches the rest).
+- `src/repo/` — the repo dashboard's five panels (in-flight,
+  throughput, economics, health, posture).
 - `src/auth/` — auth context, provider, `RequireAuth` gate, hook.
   The provider fetches `/v0/auth/me`; routes inside `<Root />` are
   gated behind it.
@@ -29,7 +32,9 @@ changes don't pay the install/test cost.
   (#1715): pure derivations (`narrative.ts`) and the composed loader
   (`use-run-narrative.ts`). See "Run-detail evidence narrative" below.
 - `src/attention/` — the attention-queue item card
-  (`attention-item.tsx`), one per-kind context renderer.
+  (`attention-item.tsx`), one per-kind context renderer, plus the
+  decision write surface (`decision-verbs.ts`, `decision-form.tsx`,
+  `decision-panel.tsx`, `plan-gate-decision.tsx`) wired in E40.2.
 - `src/plan/` — the plan-document renderer (`plan-document.tsx`)
   and its section primitives (`sections.tsx`). Each `standard_v1`
   field is its own section so the side nav anchors line up
@@ -110,10 +115,11 @@ to come:
 
 ## Attention queue — the home page (E40.1 / #1713)
 
-`/` renders `src/routes/attention.tsx` ("Needs You"), a READ-ONLY ranked
-list from `GET /v0/attention` (`api.listAttention`) of every decision
-parked on a human across runs and campaigns. The runs list is unchanged
-at `/runs`; the shell's first nav entry points at `/`.
+`/` renders `src/routes/attention.tsx` ("Needs You"), a ranked list from
+`GET /v0/attention` (`api.listAttention`) of every decision parked on a
+human across runs and campaigns. It was read-only in E40.1; E40.2 wired the
+inline decision write surface (below), so cards are now actionable. The runs
+list is unchanged at `/runs`; the shell's first nav entry points at `/`.
 
 - **Six item kinds**, rendered by `src/attention/attention-item.tsx`:
   `plan_gate`, `scope_amendment`, `acceptance_disposition`,
@@ -124,8 +130,9 @@ at `/runs`; the shell's first nav entry points at `/`.
   labelled "Unknown item" fallback).
 - **Links are server-emitted.** Each card links to the item's
   `detail_path` (`/runs/…` or `/campaigns/…`), never a client-derived
-  path. No card renders a button, form or dispatch affordance — the
-  decision is taken on the detail page.
+  path. The card also carries an inline decision affordance (see the E40.2
+  section below); DISPATCH / re-execution affordances stay excluded, and
+  the link target is still never re-derived here.
 - **Completeness is never silent.** `truncated: true` or a non-empty
   `degraded[]` renders a "This list is incomplete." banner listing each
   reason, INCLUDING when `items` is empty — in that case the "Nothing
@@ -136,6 +143,40 @@ at `/runs`; the shell's first nav entry points at `/`.
   test file) and render it through `api.listAttention` and the page, so a
   field rename on either side of the wire fails a test. Do not
   hand-author a second copy of that payload.
+
+## Decision write surface (E40.2 / #1717)
+
+Each queue card with a decision endpoint gains a `Decide` disclosure
+(`src/attention/attention-item.tsx`) that expands an inline per-kind panel
+(`src/attention/decision-panel.tsx`). No new backend endpoint and no OpenAPI
+change — every write rides an EXISTING route through the shared `api` client
+(CSRF auto-attach covers all four POSTs):
+
+| Kind                             | Verbs              | Endpoint                                                       |
+| -------------------------------- | ------------------ | -------------------------------------------------------------- |
+| `plan_gate`                      | Approve / Reject   | `POST /v0/stages/{id}/approvals` (reuses `ApprovalPanel`)      |
+| `scope_amendment`                | Approve / Deny     | `POST /v0/runs/{run}/scope-amendments/{id}/decision`           |
+| `split_verdict`, `paged_concern` | Waive / Defer      | `POST /v0/concerns/{id}/waive`, `POST /v0/concerns/{id}/defer` |
+| `acceptance_disposition`         | Record arbitration | `POST /v0/runs/{run}/acceptance-arbitration`                   |
+| `attend_human_led_campaign`      | —                  | no decision endpoint; no submit control                        |
+
+- **`DECISION_VERBS` (`decision-verbs.ts`) is the single source** of which
+  verbs each kind offers; the panels render their buttons from it, and
+  `isDrivePlaneVerb` proves no verb — and no rendered button/link — is a
+  re-execution ("drive-plane") affordance. Adding a drive-plane verb goes red.
+- **Remove only on a confirmed write.** A 2xx removes the resolved item from
+  the live list via route-local state (keyed on `item.id`) — no refetch, no
+  reload. Any non-2xx leaves the item and renders the error envelope inline.
+  For `plan_gate` the item is resolved from `ApprovalPanel`'s `onSubmitted`
+  (fired only after the POST resolves), NOT its optimistic `onUpdate`.
+- **Fail closed on a missing id.** `run_id` / `stage_id` / `concern_id` /
+  `amendment_id` are optional on the wire, so a panel whose required ids are
+  absent renders a named refusal and no submit button rather than building a
+  `/runs/undefined/...` URL.
+- **`ApprovalPanel` gained two optional props** — `onSubmitted` and
+  `showRegenerate` (default `true`) — both preserving every existing call
+  site. The queue passes `showRegenerate={false}` because Regenerate is a
+  drive-plane verb.
 
 ## Plan review surface
 
@@ -163,6 +204,37 @@ than guessing. The shared `<StageStateBadge>`
 (`src/components/stage-state-badge.tsx`) is reused on both the
 run-detail stage list and the stage-detail header so the visual language
 for stage state stays consistent.
+
+## Repo dashboard (E40.3 / #1714)
+
+`/repos/:owner/:name` renders `src/routes/repo-dashboard.tsx`, reached from
+the repo cell of the `/runs` list (the workflow cell links to the run). Five
+panels, in order, each with its OWN fetch and its own loading/error surface —
+one failing read renders one panel-scoped alert, never a blank page:
+
+- **In flight** (`src/repo/in-flight-panel.tsx`) — composed from EXISTING
+  surfaces, no backend of its own: `GET /v0/runs?repo=` (pending/running
+  runs, current stage from `/v0/runs/{id}/stages`) and
+  `GET /v0/campaigns?repo=` (active campaigns, wave progress derived from
+  the items' `depends_on` DAG, the readiness rollup, and each blocked item
+  with its unresolved blockers from `/v0/campaigns/{id}/status`). A failed
+  per-run or per-campaign read degrades only that row; a list read with a
+  further page renders a "Partial data" note.
+- **Throughput / Economics / Health** (`throughput-panel.tsx`,
+  `economics-panel.tsx`, `health-panel.tsx`) — `GET
+/v0/repos/{owner}/{name}/{throughput,economics,health}`; `truncated: true`
+  renders a "Partial data" note; the wait-on-human sub-panel renders only
+  when the key is present.
+- **Posture** (`posture-panel.tsx`) — `GET /v0/repos/{owner}/{name}/posture`:
+  stages, gates + approvers, reviewers, autonomy and budgets from the
+  newest run's cached spec. The drift warning fires on
+  `schema_supported: false` or `spec_valid: false` (naming the declared
+  version and `spec_error`) — NOT on a hash comparison with `/healthz`,
+  which serves the same binary's hashes and so could never disagree.
+- **One wire fixture per endpoint.** The panel and route tests read the
+  backend's goldens `testdata/wire/repodash_*.json` via `node:fs` and serve
+  them through the real client, so a field rename on either side fails a
+  test. Do not hand-author a second copy.
 
 ## Campaign detail + `operator_agent` override display (E25.12 / #1451; web UI #1467)
 

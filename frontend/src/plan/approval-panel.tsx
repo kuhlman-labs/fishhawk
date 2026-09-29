@@ -26,6 +26,22 @@ interface Props {
   runId: string;
   onUpdate: (next: Stage) => void;
   onRollback: (prev: Stage) => void;
+  /**
+   * Called with the server-returned Stage ONLY after a successful approval
+   * POST (E40.2 / #1717) — never on the optimistic pre-flight and never on
+   * the error path. The attention queue's PlanGateDecision resolves the item
+   * from this, not from `onUpdate`, because `onUpdate` fires with the
+   * optimistic stage BEFORE the POST is awaited (a stage reaching `onUpdate`
+   * does not prove the write landed). Optional; existing call sites omit it.
+   */
+  onSubmitted?: (updated: Stage) => void;
+  /**
+   * Whether to render the (still-disabled, #146) Regenerate button. Defaults
+   * to TRUE so every existing call site renders exactly as before. The
+   * attention queue passes `false`: re-execution is a drive-plane verb and
+   * must not appear as a queue affordance (E40.2 / #1717).
+   */
+  showRegenerate?: boolean;
 }
 
 type Phase =
@@ -52,7 +68,14 @@ function optimisticUpdate(stage: Stage, decision: ApprovalDecision): Stage {
   };
 }
 
-export function ApprovalPanel({ stage, runId, onUpdate, onRollback }: Props) {
+export function ApprovalPanel({
+  stage,
+  runId,
+  onUpdate,
+  onRollback,
+  onSubmitted,
+  showRegenerate = true,
+}: Props) {
   const [phase, setPhase] = useState<Phase>({ kind: 'idle' });
   const [comment, setComment] = useState('');
 
@@ -80,6 +103,9 @@ export function ApprovalPanel({ stage, runId, onUpdate, onRollback }: Props) {
         comment: comment.trim() || undefined,
       });
       onUpdate(updated);
+      // Called ONLY here, after the POST resolved — never on the optimistic
+      // onUpdate above and never in the catch below (E40.2 / #1717).
+      onSubmitted?.(updated);
       setPhase({ kind: 'idle' });
       setComment('');
     } catch (err) {
@@ -132,15 +158,17 @@ export function ApprovalPanel({ stage, runId, onUpdate, onRollback }: Props) {
   return (
     <div className="flex flex-col items-end gap-2">
       <div className="flex gap-2">
-        <Button variant="outline" size="sm" disabled title="Wires up in E8.3 (#146)">
-          <RefreshCw className="size-4" aria-hidden />
-          <span>Regenerate</span>
-        </Button>
-        <Button variant="outline" size="sm" onClick={() => start('reject')}>
+        {showRegenerate && (
+          <Button variant="outline" size="sm" disabled title="Wires up in E8.3 (#146)">
+            <RefreshCw className="size-4" aria-hidden />
+            <span>Regenerate</span>
+          </Button>
+        )}
+        <Button variant="outline" size="sm" data-decision-verb="" onClick={() => start('reject')}>
           <X className="size-4" aria-hidden />
           <span>Reject</span>
         </Button>
-        <Button size="sm" onClick={() => start('approve')}>
+        <Button size="sm" data-decision-verb="" onClick={() => start('approve')}>
           <Check className="size-4" aria-hidden />
           <span>Approve</span>
         </Button>

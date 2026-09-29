@@ -1,13 +1,16 @@
+import { useCallback, useState } from 'react';
 import { api } from '@/api/client';
-import type { AttentionList } from '@/api/types';
+import type { AttentionItem, AttentionList } from '@/api/types';
 import { useAsync } from '@/api/use-async';
 import { AttentionItemCard } from '@/attention/attention-item';
 
 /*
- * The "Needs You" attention queue (E40.1 / #1713) — the SPA index route.
- * One ranked list of every decision parked on a human across runs and
- * campaigns, from GET /v0/attention. Read-only: each card links to the
- * detail page where the decision is taken.
+ * The "Needs You" attention queue (E40.1 / #1713; write surface E40.2 /
+ * #1717) — the SPA index route. One ranked list of every decision parked on a
+ * human across runs and campaigns, from GET /v0/attention. Each card links to
+ * its detail page AND (for a kind with a decision endpoint) expands an inline
+ * decision panel; a successful decision removes the item from the live list
+ * here, client-side, with no refetch or reload.
  *
  * Completeness is never silent: `truncated: true` or a non-empty
  * `degraded` renders an "incomplete" banner, INCLUDING when `items` is
@@ -50,6 +53,24 @@ function IncompleteBanner({ list }: { list: AttentionList }) {
 export function Attention() {
   const state = useAsync(() => api.listAttention(), []);
 
+  /*
+   * Items resolved in-session leave the live list without a refetch or reload
+   * (E40.2 / #1717). Keyed on item.id ALONE — the stable subject identity, so
+   * two same-kind items resolve independently — and applied as a client-side
+   * filter over the loaded list; the loaded AttentionList is never mutated.
+   */
+  const [resolved, setResolved] = useState<Set<string>>(new Set());
+  const onResolved = useCallback((item: AttentionItem) => {
+    setResolved((prev) => {
+      const next = new Set(prev);
+      next.add(item.id);
+      return next;
+    });
+  }, []);
+
+  const visibleItems =
+    state.status === 'ok' ? state.data.items.filter((i) => !resolved.has(i.id)) : [];
+
   return (
     <section className="space-y-4">
       <header>
@@ -79,7 +100,7 @@ export function Attention() {
         <IncompleteBanner list={state.data} />
       )}
 
-      {state.status === 'ok' && state.data.items.length === 0 && (
+      {state.status === 'ok' && visibleItems.length === 0 && (
         <div className="rounded-md border border-dashed border-neutral-300 p-8 text-sm text-neutral-500 dark:border-neutral-700">
           {isAttentionIncomplete(state.data)
             ? 'No parked decisions were found in the part of the queue that could be read.'
@@ -87,11 +108,11 @@ export function Attention() {
         </div>
       )}
 
-      {state.status === 'ok' && state.data.items.length > 0 && (
+      {state.status === 'ok' && visibleItems.length > 0 && (
         <ol className="space-y-3">
-          {state.data.items.map((item) => (
-            <li key={`${item.kind}:${item.id}`}>
-              <AttentionItemCard item={item} />
+          {visibleItems.map((item) => (
+            <li key={item.id}>
+              <AttentionItemCard item={item} onResolved={onResolved} />
             </li>
           ))}
         </ol>
