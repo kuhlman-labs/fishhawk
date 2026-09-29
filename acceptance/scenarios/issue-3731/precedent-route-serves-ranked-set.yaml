@@ -1,0 +1,14 @@
+id: scenario:issue-3731/precedent-route-serves-ranked-set
+statement: A GET request to /v0/precedent naming a repository and a valid decision class returns 200 with a body carrying resolved_context, a summary block (count, human, delegated, agreement_ratio, doctrine_versions) and a results array, each result citing its source_sequence and entry_hash.
+verify_hint: 'HTTP: GET /v0/precedent?repo=<owner/name>&decision_class=plan_approval on the localhost preview returns 200 and the body carries resolved_context, summary and results.'
+steps: GET http://localhost:8090/v0/precedent?repo=kuhlman-labs/fishhawk&decision_class=plan_approval (no bearer; the dev preview served it).
+assertions:
+    expected: 200 with resolved_context, a summary with count/human/delegated/agreement_ratio/doctrine_versions, and a results array.
+    observed_at_record: 200 {"resolved_context":{"repo":"kuhlman-labs/fishhawk","decision_class":"plan_approval",…},"summary":{"count":0,"human":0,"delegated":0,"agreement_ratio":0,"doctrine_versions":[],"hard_filter_only":0},"results":[],"truncated":false,"degraded":[…]}. The preview index is empty and no row can be seeded, so per-result source_sequence/entry_hash could not be observed live. The in-repo fixtures (precedent_test.go) carry SourceSequence/SourceEntryHash and those tests pass.
+    repro_handle: curl -s 'http://localhost:8090/v0/precedent?repo=kuhlman-labs/fishhawk&decision_class=plan_approval'
+origin:
+    issue: 3731
+    pr: 3846
+    run_id: 99552e1e-9bf6-42b0-ae70-cb32562b9f60
+    head_sha: 72963ca60b47e4c1a07d430ff94b673eb572f029
+    recorded_at: 2026-09-29T03:56:10Z

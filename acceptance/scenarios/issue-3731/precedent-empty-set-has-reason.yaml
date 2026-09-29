@@ -1,0 +1,14 @@
+id: scenario:issue-3731/precedent-empty-set-has-reason
+statement: A context whose class has no indexed decisions returns a successful empty result set carrying a named reason, not an error.
+verify_hint: 'HTTP: GET /v0/precedent with a repo and class that have no indexed decisions returns 200 with results: [] and a named reason in the response body (never 4xx/5xx).'
+steps: GET http://localhost:8090/v0/precedent?repo=kuhlman-labs/fishhawk&decision_class=plan_approval and GET …?repo=other/repo&decision_class=merge_verdict.
+assertions:
+    expected: 200 with results [] and a named reason; never 4xx/5xx.
+    observed_at_record: Both returned 200 with results:[] and degraded:[{"reason":"no_indexed_decisions","detail":"no indexed decision of this class exists for this repository yet"}].
+    repro_handle: curl -s 'http://localhost:8090/v0/precedent?repo=other/repo&decision_class=merge_verdict'
+origin:
+    issue: 3731
+    pr: 3846
+    run_id: 99552e1e-9bf6-42b0-ae70-cb32562b9f60
+    head_sha: 72963ca60b47e4c1a07d430ff94b673eb572f029
+    recorded_at: 2026-09-29T03:56:10Z

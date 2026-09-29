@@ -1,0 +1,13 @@
+id: scenario:issue-3731/gate-reference-derives-context
+statement: A precedent query by gate reference (run_id + stage_id) returns a resolved_context whose repository, stage kind, touched paths and escalation keys match the referenced run's plan artifact and same-stage escalation_fired entry; a gate reference to a run in another account is refused exactly like a nonexistent run.
+steps: 'POST /v0/dev/fixtures {"scenario":"plan-gate-parked"} → run c1fd347f-abfe-42af-87a5-a251b3463286, plan edaf85aa-8c53-40ee-bc12-aad5a63ce741. GET /v0/precedent?run_id={run}&stage_id={plan}&decision_class=plan_approval. Also queried the trace-upload-target run d5092623-… / stage 26ef8653-… after posting a plan scoping docs/api/v0.openapi.yaml, and the plan-gate-criteria run 37d083a2-… (whose plan scopes the three backend/internal/api files). Refusals: GET with run_id=00000000-0000-4000-8000-000000000000 (nonexistent), and run c1fd347f with a stage from another run (26ef8653).'
+assertions:
+    expected: The derived context matches the plan artifact and escalation entry, and a foreign-account run is refused like a nonexistent one.
+    observed_at_record: 'resolved_context.repo=kuhlman-labs/fishhawk, stage_kind=plan. touched_paths follow each run''s plan artifact exactly: [README.md] for the seeded plan, [docs/api/v0.openapi.yaml] for the posted plan, and [backend/internal/api/audit_export.go, …_test.go, router.go] for the criteria plan. escalation_keys=[] (no escalation_fired on these stages). The nonexistent run and the stage-not-on-run both returned 404 not_found ''no such run (or the stage does not belong to it)'' with no resolved_context. Limit: a second account cannot be created on this target, so the foreign-account refusal was not observed live; the in-repo TestPrecedent_GateReferenceForeignAccountIs404 passes, but the real-PG counterpart could not run in the sandbox.'
+    repro_handle: curl -s 'http://localhost:8090/v0/precedent?run_id=<seeded run>&stage_id=<plan stage>&decision_class=plan_approval'
+origin:
+    issue: 3731
+    pr: 3846
+    run_id: 99552e1e-9bf6-42b0-ae70-cb32562b9f60
+    head_sha: 72963ca60b47e4c1a07d430ff94b673eb572f029
+    recorded_at: 2026-09-29T03:56:10Z
