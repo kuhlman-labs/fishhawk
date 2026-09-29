@@ -216,3 +216,40 @@ func TestMCPToolScopeTable_MergeRecoveryPairRequiresWriteRuns(t *testing.T) {
 		}
 	}
 }
+
+// TestMCPToolScopeTable_HandoverBriefMirrorsReadAudit pins the
+// fishhawk_handover_brief row (E76.4 / #3767) to the endpoint it fronts:
+// handleGetHandoverBrief enforces requireWriteScope(scopeHandoverBriefRead),
+// which IS scopeDigestRead (read:audit), and admits no run-bound subject. A
+// read:audit bearer is ADMITTED; a write:approvals-only bearer and a run-bound
+// fhm_ token at its full vocabulary are REFUSED — the row is neither stricter
+// nor looser than the handler.
+func TestMCPToolScopeTable_HandoverBriefMirrorsReadAudit(t *testing.T) {
+	rule, ok := mcpToolScopeFor("fishhawk_handover_brief")
+	if !ok {
+		t.Fatal("fishhawk_handover_brief has no mcpToolScopes entry; it would be refused mcp_tool_not_authorized at runtime")
+	}
+	if len(rule.anyOf) != 1 || rule.anyOf[0] != scopeHandoverBriefRead || scopeHandoverBriefRead != "read:audit" {
+		t.Errorf("rule.anyOf = %v, want exactly [%s] (read:audit) — the scope handleGetHandoverBrief enforces", rule.anyOf, scopeHandoverBriefRead)
+	}
+	if rule.runBoundSubjectOK {
+		t.Error("runBoundSubjectOK is set, but handleGetHandoverBrief authorizes no run-bound token by subject")
+	}
+	cases := []struct {
+		name string
+		id   Identity
+		want bool
+	}{
+		{"read:audit operator admitted", Identity{Subject: "svc:operator", TokenID: "tok", Scopes: []string{"read:audit"}}, true},
+		{"write:approvals-only operator refused", Identity{Subject: "svc:operator", TokenID: "tok", Scopes: []string{"write:approvals"}}, false},
+		{"run-bound token refused", Identity{
+			Subject: "mcp:run:33333333-3333-3333-3333-333333333333", TokenID: "tok",
+			Scopes: []string{scopeRunBoundRead, scopeRunBoundRetry, scopeRunBoundScopeAmendments},
+		}, false},
+	}
+	for _, c := range cases {
+		if got := rule.satisfiedBy(c.id); got != c.want {
+			t.Errorf("%s: satisfiedBy = %v, want %v", c.name, got, c.want)
+		}
+	}
+}

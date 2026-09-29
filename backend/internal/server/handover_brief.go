@@ -29,6 +29,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/captain"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/delegationview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/digest"
@@ -77,7 +78,7 @@ func (s *Server) handoverBriefDeps(ctx context.Context, repo string) handoverbri
 	}
 	var campaigns handoverbrief.CampaignLister
 	if s.cfg.CampaignRepo != nil {
-		campaigns = s.cfg.CampaignRepo
+		campaigns = campaignInFlightLister{repo: s.cfg.CampaignRepo}
 	}
 	var runs handoverbrief.RunLister
 	if s.cfg.RunRepo != nil {
@@ -86,6 +87,33 @@ func (s *Server) handoverBriefDeps(ctx context.Context, repo string) handoverbri
 	deps.InFlight = handoverbrief.NewStore(campaigns, runs)
 	deps.Delegation, deps.DelegationUnavailableReason = s.handoverBriefDelegation(ctx, repo)
 	return deps
+}
+
+// campaignInFlightLister adapts campaign.Repository to
+// handoverbrief.CampaignLister. The adapter lives HERE, not in handoverbrief,
+// because backend/internal/campaign's closure reaches workmgmt and mcpserver
+// imports handoverbrief — the ADR-064 guard forbids workmgmt on the MCP tool
+// surface (mcpserver TestNoBoardReadOnMCPToolSurface).
+type campaignInFlightLister struct{ repo campaign.Repository }
+
+// ListInFlightCampaigns returns at most limit campaigns of repo in state,
+// newest first, account-scoped (accountID "" = unscoped), projected to the
+// brief's in-flight item.
+func (l campaignInFlightLister) ListInFlightCampaigns(ctx context.Context, repo, accountID, state string, limit int) ([]handoverbrief.InFlightItem, error) {
+	rows, err := l.repo.ListCampaigns(ctx, campaign.ListCampaignsFilter{
+		Repo: repo, State: state, AccountID: accountID, Limit: limit,
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]handoverbrief.InFlightItem, 0, len(rows))
+	for _, c := range rows {
+		if c == nil {
+			continue
+		}
+		out = append(out, handoverbrief.InFlightItem{Kind: "campaign", ID: c.ID, State: string(c.State), Ref: c.EpicRef, CreatedAt: c.CreatedAt.UTC()})
+	}
+	return out, nil
 }
 
 // handoverBriefDelegation projects the delegation view from the spec cached

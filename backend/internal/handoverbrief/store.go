@@ -7,14 +7,19 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
-// CampaignLister is the campaign read the brief needs
-// (campaign.Repository satisfies it).
+// CampaignLister is the campaign read the brief needs, already projected to
+// InFlightItem (Kind "campaign"). It is declared over this package's own
+// types, NOT campaign.Repository's, because backend/internal/campaign's
+// closure reaches backend/internal/workmgmt and mcpserver imports this
+// package for the wire model and Bound — the ADR-064 guard
+// (mcpserver TestNoBoardReadOnMCPToolSurface) forbids workmgmt on the MCP tool
+// surface. The campaign.Repository adapter lives with the caller
+// (server.campaignInFlightLister). accountID is "" for an unscoped read.
 type CampaignLister interface {
-	ListCampaigns(ctx context.Context, f campaign.ListCampaignsFilter) ([]*campaign.Campaign, error)
+	ListInFlightCampaigns(ctx context.Context, repo, accountID, state string, limit int) ([]InFlightItem, error)
 }
 
 // RunLister is the run read the brief needs (run.Repository satisfies it).
@@ -49,20 +54,7 @@ func (s *Store) Campaigns(ctx context.Context, repo string, accountID *uuid.UUID
 	if s == nil || s.campaigns == nil {
 		return nil, fmt.Errorf("handoverbrief: campaign repository unconfigured")
 	}
-	rows, err := s.campaigns.ListCampaigns(ctx, campaign.ListCampaignsFilter{
-		Repo: repo, State: state, AccountID: accountArg(accountID), Limit: limit,
-	})
-	if err != nil {
-		return nil, err
-	}
-	out := make([]InFlightItem, 0, len(rows))
-	for _, c := range rows {
-		if c == nil {
-			continue
-		}
-		out = append(out, InFlightItem{Kind: "campaign", ID: c.ID, State: string(c.State), Ref: c.EpicRef, CreatedAt: c.CreatedAt.UTC()})
-	}
-	return out, nil
+	return s.campaigns.ListInFlightCampaigns(ctx, repo, accountArg(accountID), state, limit)
 }
 
 // Runs returns at most limit runs of repo in state, in the repository's list
