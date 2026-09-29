@@ -29,7 +29,9 @@ changes don't pay the install/test cost.
   `plan.ts`), and a small `useAsync` hook for component-level
   data loading.
 - `src/attention/` — the attention-queue item card
-  (`attention-item.tsx`), one per-kind context renderer.
+  (`attention-item.tsx`), one per-kind context renderer, plus the
+  decision write surface (`decision-verbs.ts`, `decision-form.tsx`,
+  `decision-panel.tsx`, `plan-gate-decision.tsx`) wired in E40.2.
 - `src/plan/` — the plan-document renderer (`plan-document.tsx`)
   and its section primitives (`sections.tsx`). Each `standard_v1`
   field is its own section so the side nav anchors line up
@@ -110,10 +112,11 @@ to come:
 
 ## Attention queue — the home page (E40.1 / #1713)
 
-`/` renders `src/routes/attention.tsx` ("Needs You"), a READ-ONLY ranked
-list from `GET /v0/attention` (`api.listAttention`) of every decision
-parked on a human across runs and campaigns. The runs list is unchanged
-at `/runs`; the shell's first nav entry points at `/`.
+`/` renders `src/routes/attention.tsx` ("Needs You"), a ranked list from
+`GET /v0/attention` (`api.listAttention`) of every decision parked on a
+human across runs and campaigns. It was read-only in E40.1; E40.2 wired the
+inline decision write surface (below), so cards are now actionable. The runs
+list is unchanged at `/runs`; the shell's first nav entry points at `/`.
 
 - **Six item kinds**, rendered by `src/attention/attention-item.tsx`:
   `plan_gate`, `scope_amendment`, `acceptance_disposition`,
@@ -124,8 +127,9 @@ at `/runs`; the shell's first nav entry points at `/`.
   labelled "Unknown item" fallback).
 - **Links are server-emitted.** Each card links to the item's
   `detail_path` (`/runs/…` or `/campaigns/…`), never a client-derived
-  path. No card renders a button, form or dispatch affordance — the
-  decision is taken on the detail page.
+  path. The card also carries an inline decision affordance (see the E40.2
+  section below); DISPATCH / re-execution affordances stay excluded, and
+  the link target is still never re-derived here.
 - **Completeness is never silent.** `truncated: true` or a non-empty
   `degraded[]` renders a "This list is incomplete." banner listing each
   reason, INCLUDING when `items` is empty — in that case the "Nothing
@@ -136,6 +140,40 @@ at `/runs`; the shell's first nav entry points at `/`.
   test file) and render it through `api.listAttention` and the page, so a
   field rename on either side of the wire fails a test. Do not
   hand-author a second copy of that payload.
+
+## Decision write surface (E40.2 / #1717)
+
+Each queue card with a decision endpoint gains a `Decide` disclosure
+(`src/attention/attention-item.tsx`) that expands an inline per-kind panel
+(`src/attention/decision-panel.tsx`). No new backend endpoint and no OpenAPI
+change — every write rides an EXISTING route through the shared `api` client
+(CSRF auto-attach covers all four POSTs):
+
+| Kind                             | Verbs              | Endpoint                                                       |
+| -------------------------------- | ------------------ | -------------------------------------------------------------- |
+| `plan_gate`                      | Approve / Reject   | `POST /v0/stages/{id}/approvals` (reuses `ApprovalPanel`)      |
+| `scope_amendment`                | Approve / Deny     | `POST /v0/runs/{run}/scope-amendments/{id}/decision`           |
+| `split_verdict`, `paged_concern` | Waive / Defer      | `POST /v0/concerns/{id}/waive`, `POST /v0/concerns/{id}/defer` |
+| `acceptance_disposition`         | Record arbitration | `POST /v0/runs/{run}/acceptance-arbitration`                   |
+| `attend_human_led_campaign`      | —                  | no decision endpoint; no submit control                        |
+
+- **`DECISION_VERBS` (`decision-verbs.ts`) is the single source** of which
+  verbs each kind offers; the panels render their buttons from it, and
+  `isDrivePlaneVerb` proves no verb — and no rendered button/link — is a
+  re-execution ("drive-plane") affordance. Adding a drive-plane verb goes red.
+- **Remove only on a confirmed write.** A 2xx removes the resolved item from
+  the live list via route-local state (keyed on `item.id`) — no refetch, no
+  reload. Any non-2xx leaves the item and renders the error envelope inline.
+  For `plan_gate` the item is resolved from `ApprovalPanel`'s `onSubmitted`
+  (fired only after the POST resolves), NOT its optimistic `onUpdate`.
+- **Fail closed on a missing id.** `run_id` / `stage_id` / `concern_id` /
+  `amendment_id` are optional on the wire, so a panel whose required ids are
+  absent renders a named refusal and no submit button rather than building a
+  `/runs/undefined/...` URL.
+- **`ApprovalPanel` gained two optional props** — `onSubmitted` and
+  `showRegenerate` (default `true`) — both preserving every existing call
+  site. The queue passes `showRegenerate={false}` because Regenerate is a
+  drive-plane verb.
 
 ## Plan review surface
 

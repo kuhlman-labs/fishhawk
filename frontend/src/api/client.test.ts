@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { api, CSRF_COOKIE_NAME, CSRF_HEADER_NAME } from './client';
+import { api, ApiClientError, CSRF_COOKIE_NAME, CSRF_HEADER_NAME } from './client';
 
 /*
  * The api.* wrappers are thin, but the CSRF auto-attach is the kind
@@ -257,6 +257,97 @@ describe('api.listAttention (E40.1 / #1713)', () => {
     const fetchMock = mockFetch();
     await api.listAttention({});
     expect(fetchMock.mock.calls[0][0]).toBe('/v0/attention');
+  });
+});
+
+describe('api decision write surfaces (E40.2 / #1717)', () => {
+  beforeEach(() => {
+    clearCookie(CSRF_COOKIE_NAME);
+    vi.unstubAllGlobals();
+  });
+  afterEach(() => {
+    clearCookie(CSRF_COOKIE_NAME);
+    vi.unstubAllGlobals();
+  });
+
+  function okFetch(body: unknown = {}): ReturnType<typeof vi.fn> {
+    const fetchMock = vi.fn(
+      async () =>
+        new Response(JSON.stringify(body), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    return fetchMock;
+  }
+
+  it('decideScopeAmendment POSTs the decision to the run+amendment URL with CSRF', async () => {
+    setCookie(CSRF_COOKIE_NAME, 'tok-amend');
+    const fetchMock = okFetch();
+    await api.decideScopeAmendment('run-1', 'amend-9', { decision: 'approve', reason: 'ok' });
+    expect(fetchMock.mock.calls[0][0]).toBe('/v0/runs/run-1/scope-amendments/amend-9/decision');
+    const init = lastInit(fetchMock);
+    expect(init.method).toBe('POST');
+    expect(headerOf(init, CSRF_HEADER_NAME)).toBe('tok-amend');
+    expect(JSON.parse(String(init.body))).toEqual({ decision: 'approve', reason: 'ok' });
+  });
+
+  it('decideScopeAmendment url-encodes both path segments', async () => {
+    const fetchMock = okFetch();
+    await api.decideScopeAmendment('run/1', 'amend 9', { decision: 'deny' });
+    expect(fetchMock.mock.calls[0][0]).toBe('/v0/runs/run%2F1/scope-amendments/amend%209/decision');
+  });
+
+  it('waiveConcern POSTs the reason to the concern waive URL', async () => {
+    const fetchMock = okFetch();
+    await api.waiveConcern('concern-3', { reason: 'accepted trade-off' });
+    expect(fetchMock.mock.calls[0][0]).toBe('/v0/concerns/concern-3/waive');
+    const init = lastInit(fetchMock);
+    expect(init.method).toBe('POST');
+    expect(JSON.parse(String(init.body))).toEqual({ reason: 'accepted trade-off' });
+  });
+
+  it('deferConcern POSTs parent_epic to the concern defer URL', async () => {
+    const fetchMock = okFetch();
+    await api.deferConcern('concern-4', { parent_epic: '#1196', note: 'later' });
+    expect(fetchMock.mock.calls[0][0]).toBe('/v0/concerns/concern-4/defer');
+    const init = lastInit(fetchMock);
+    expect(init.method).toBe('POST');
+    expect(JSON.parse(String(init.body))).toEqual({ parent_epic: '#1196', note: 'later' });
+  });
+
+  it('arbitrateAcceptance POSTs reason + acknowledge to the run URL', async () => {
+    const fetchMock = okFetch();
+    await api.arbitrateAcceptance('run-2', {
+      reason: 'shipping anyway',
+      acknowledge_failed_criteria: true,
+    });
+    expect(fetchMock.mock.calls[0][0]).toBe('/v0/runs/run-2/acceptance-arbitration');
+    const init = lastInit(fetchMock);
+    expect(init.method).toBe('POST');
+    expect(JSON.parse(String(init.body))).toEqual({
+      reason: 'shipping anyway',
+      acknowledge_failed_criteria: true,
+    });
+  });
+
+  it('throws ApiClientError carrying the parsed error code on a non-2xx', async () => {
+    const fetchMock = vi.fn(
+      async () =>
+        new Response(JSON.stringify({ error: 'amendment_already_decided' }), {
+          status: 409,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    const err = await api
+      .decideScopeAmendment('run-1', 'amend-9', { decision: 'approve' })
+      .then(() => null)
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ApiClientError);
+    expect((err as ApiClientError).status).toBe(409);
+    expect((err as ApiClientError).body?.error).toBe('amendment_already_decided');
   });
 });
 
