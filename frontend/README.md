@@ -19,8 +19,9 @@ changes don't pay the install/test cost.
   `run-detail` drills into one, `stage-detail` renders the plan;
   `repo-dashboard` is the per-repo dashboard at `/repos/:owner/:name`;
   `audit` is still a stub; `not-found` catches the rest).
-- `src/repo/` — the repo dashboard's five panels (in-flight,
-  throughput, economics, health, posture).
+- `src/repo/` — the repo dashboard's Overview panels (in-flight,
+  throughput, economics, health, posture) plus the Record tab
+  (`record-tab.tsx`) and its pure export fold (`chain-verification.ts`).
 - `src/auth/` — auth context, provider, `RequireAuth` gate, hook.
   The provider fetches `/v0/auth/me`; routes inside `<Root />` are
   gated behind it.
@@ -208,9 +209,11 @@ for stage state stays consistent.
 ## Repo dashboard (E40.3 / #1714)
 
 `/repos/:owner/:name` renders `src/routes/repo-dashboard.tsx`, reached from
-the repo cell of the `/runs` list (the workflow cell links to the run). Five
-panels, in order, each with its OWN fetch and its own loading/error surface —
-one failing read renders one panel-scoped alert, never a blank page:
+the repo cell of the `/runs` list (the workflow cell links to the run). Two
+tabs, selected by the `?tab=` search param: **Overview** (the default) and
+**Record** (`?tab=record`, below). Overview renders five panels, in order,
+each with its OWN fetch and its own loading/error surface — one failing read
+renders one panel-scoped alert, never a blank page:
 
 - **In flight** (`src/repo/in-flight-panel.tsx`) — composed from EXISTING
   surfaces, no backend of its own: `GET /v0/runs?repo=` (pending/running
@@ -235,6 +238,65 @@ one failing read renders one panel-scoped alert, never a blank page:
   backend's goldens `testdata/wire/repodash_*.json` via `node:fs` and serve
   them through the real client, so a field rename on either side fails a
   test. Do not hand-author a second copy.
+
+### Record tab (E40.6 / #1718)
+
+`?tab=record` selects it; anything else — including the absent param —
+selects Overview, so every existing deep link is unchanged. Each branch
+renders only its own panels, so the Record tab never fires the four
+rollup fetches and Overview never fetches the export. Three sections:
+
+- **Chain verification** — one page of `GET /v0/audit/export?repo=…&limit=25`
+  folded through `src/repo/chain-verification.ts`, a PURE, fetch-free,
+  React-free module. What it checks: per-run chain STRUCTURE (genesis,
+  `prev_hash` linkage, strict sequence monotonicity) and SIGNING-KEY
+  COVERAGE (a run with entries carries a key whose window covers
+  `exported_at`; `issued_at <= exported_at <= expires_at`), mirroring the
+  external verifier's `chain_broken` / `first_entry_has_prev_hash` /
+  `sequence_not_monotonic` / `missing_signing_key` kinds plus its own
+  `signing_key_expired` / `signing_key_not_yet_valid`.
+
+  What it does NOT check, and why the badge says so in its own wording:
+  it does **not** recompute entry hashes (the verifier's `hash_mismatch`)
+  — that needs byte-exact reproduction of Go's `encoding/json` over the
+  canonical `HashInputs`, and a third implementation with no shared
+  `(input, expected-hash)` fixture would drift silently; it is also
+  outside ADR-008's trust model, whose point is that verification does
+  not run code the backend served. It does **not** verify Ed25519 bundle
+  signatures — structurally impossible here, because the export is
+  POINTER-ONLY (ADR-054: trace bundle bytes are never inlined), so there
+  is nothing to verify a signature over. The badge therefore says
+  "signing-key coverage", never "signatures verified", and points at the
+  offline `fishhawk-verify` CLI for cryptographic proof.
+
+  **Fail-closed shape guard.** A body that is not Export v1 — wrong
+  `schema`, non-object `runs`, a run without an `audit_entries` array, an
+  entry with a non-string `entry_hash` / non-numeric `sequence` /
+  non-string-non-null `prev_hash`, an unparseable `exported_at`, or a
+  present `signing_key` missing a string `public_key` or a parseable
+  `issued_at`/`expires_at` — yields `unverifiable`, never `pass`. That
+  guard is what stands in for a shared backend/SPA wire golden, which the
+  export's live `exported_at` and random run UUIDs make awkward to pin.
+  Partiality rides the `X-Fishhawk-Export-Complete` RESPONSE header (the
+  verifier strict-decodes the three-field body, so no marker can live in
+  it); the client treats only the exact string `true` as complete, so a
+  missing header renders the "Partial data" note.
+
+  No anchored-checkpoint field is rendered: ADR-056 / #1699 has not
+  landed and nothing in the tree exposes one. An absence test on the
+  badge's rendered text pins that, and must be updated deliberately when
+  ADR-056 ships.
+
+- **Export** — a one-click Export v1 download of the same endpoint via a
+  Blob + object URL. A **403** gets a dedicated re-auth panel naming the
+  required scope from `details.required_scope` (falling back to the
+  literal `read:audit-export`) and telling the operator to re-authenticate
+  with a token that carries it; every other status renders the generic
+  inline error. A cookie-session operator normally never sees the 403 —
+  `requireWriteScope` enforces the scope only for token identities — so
+  the branch matters for bearer-token contexts.
+- **Release evidence** — a visibly disabled placeholder, always rendered,
+  wired when E33 (#1583) ships.
 
 ## Campaign detail + `operator_agent` override display (E25.12 / #1451; web UI #1467)
 
