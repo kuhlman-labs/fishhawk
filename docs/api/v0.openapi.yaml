@@ -7053,6 +7053,13 @@ components:
         gaps_truncated: { type: boolean }
         gaps_omitted_count: { type: integer }
         gaps_next: { $ref: '#/components/schemas/DigestCursor' }
+        uncited_next:
+          allOf: [{ $ref: '#/components/schemas/DigestCursor' }]
+          description: >-
+            Continues the `parked_without_citation` gaps, which have no chain
+            sequence: the constant-size floor carries only the first 16 and the
+            rest are offset-paged via `section=open_decisions_uncited`. Present
+            when more remain.
         truncated:
           type: boolean
           description: Anything in this response was elided; `next` is then the first elided collection's cursor.
@@ -7142,11 +7149,14 @@ components:
       properties:
         section:
           type: string
-          enum: [merges, waivers_and_deferrals, pages, open_decisions, gaps]
+          enum: [merges, waivers_and_deferrals, pages, open_decisions, gaps, open_decisions_uncited]
         from_sequence:
           type: integer
           format: int64
-          description: The FIRST OMITTED element's sequence (inclusive).
+          description: >-
+            The FIRST OMITTED element's sequence (inclusive). For
+            `section=open_decisions_uncited` it is instead an opaque page offset
+            (those gaps have no chain sequence) — copy it verbatim.
         to_sequence: { type: integer, format: int64 }
         call:
           type: string
@@ -7173,10 +7183,18 @@ components:
         sequence:
           type: integer
           format: int64
-          description: The watermark after the call.
+          description: >-
+            The watermark COMMITTED after the call — not necessarily the
+            requested `to_sequence`: a concurrent higher mark-read can win the
+            row, and this then reports that higher committed value.
         advanced:
           type: boolean
-          description: False for the at-or-below-watermark no-op (nothing appended).
+          description: >-
+            True only when THIS call raised the watermark. False for the
+            at-or-below-watermark no-op (nothing appended), and also when a
+            concurrent mark-read had already advanced it to or past
+            `to_sequence` (an entry was appended, but the watermark did not move
+            for this call).
 
   responses:
     BadRequest:
@@ -12844,7 +12862,11 @@ paths:
         index row citing a missing chain entry, a hash mismatch and a parked
         stage with no identifiable parking entry are reported in `gaps`; a
         read that hit its limit or a waiver with no reason pointer is reported
-        in `degradations`.
+        in `degradations`. A single-section call keeps its OWN item-derived
+        gaps beside the item; a content section that hit its scan limit exposes
+        its item-derived gaps past the limit through `gaps_next`; the
+        `parked_without_citation` remainder (no chain sequence) is offset-paged
+        through `uncited_next` (`section=open_decisions_uncited`).
 
         **One bound.** The response is bounded at 32768 serialized bytes by the
         same `digest.Bound` the `fishhawk_digest` MCP tool applies. Every cut
@@ -12867,12 +12889,14 @@ paths:
         - name: section
           in: query
           description: |
-            Restrict the response to one content section, or `gaps` for the
-            gaps + degradations collections. Omit for the full digest. A
-            cursor's `section` is passed verbatim.
+            Restrict the response to one content section, `gaps` for the gaps +
+            degradations collections, or `open_decisions_uncited` to offset-page
+            the `parked_without_citation` gaps (`from_sequence` carries the
+            offset). Omit for the full digest. A cursor's `section` is passed
+            verbatim.
           schema:
             type: string
-            enum: [merges, waivers_and_deferrals, pages, open_decisions, gaps]
+            enum: [merges, waivers_and_deferrals, pages, open_decisions, gaps, open_decisions_uncited]
         - name: from_sequence
           in: query
           description: Inclusive lower chain position. 0 or absent = watermark + 1.
@@ -12936,9 +12960,13 @@ paths:
 
         A `to_sequence` at or below the current watermark is a no-op
         (`advanced: false`) that appends NOTHING. The stored watermark is
-        monotonic. Idempotence is a property of the WATERMARK, not the chain: a
-        retry after an append succeeded but the advance failed appends a
-        second entry and converges the watermark.
+        monotonic. The response reports the COMMITTED watermark: `sequence` is
+        the value the row holds and `advanced` is true only when THIS call
+        raised it — a call a concurrent higher mark-read already overtook
+        returns that higher `sequence` with `advanced: false` (its entry was
+        still appended). Idempotence is a property of the WATERMARK, not the
+        chain: a retry after an append succeeded but the advance failed appends
+        a second entry and converges the watermark.
 
         **Auth.** Gated on the existing `write:approvals` scope (no new scope,
         so no token loses access); cookie-session operators are not

@@ -207,6 +207,15 @@ func (b *bounder) render(keep []int) (Digest, int, error) {
 			out.Next = out.GapsNext
 		}
 	}
+	// UncitedNext (parked_without_citation remainder) rides the floor's cursor,
+	// not the trimmed stream, so Bound preserves it and reflects it in the
+	// top-level truncation markers (#3734 fix-up condition 3).
+	if out.UncitedNext != nil {
+		out.Truncated = true
+		if out.Next == nil {
+			out.Next = out.UncitedNext
+		}
+	}
 	raw, err := json.Marshal(out)
 	if err != nil {
 		return Digest{}, 0, fmt.Errorf("digest: bound: marshal: %w", err)

@@ -241,13 +241,17 @@ func (s *Store) ParkedStages(ctx context.Context, repo string, from, to int64, l
 }
 
 // UncitedParkedStages returns parked stages with NO identifiable parking
-// entry, at most limit, in a deterministic order.
-func (s *Store) UncitedParkedStages(ctx context.Context, repo string, limit int) ([]ParkedRow, error) {
+// entry, ordered by (created_at, id) — a stable total order with no chain
+// sequence to page by — skipping the first offset rows and returning at most
+// limit. The (created_at, id) key + OFFSET is what makes every uncited parked
+// stage beyond the constant-size floor retrievable through the
+// SectionOpenDecisionsUncited cursor (#3734 fix-up condition 3).
+func (s *Store) UncitedParkedStages(ctx context.Context, repo string, offset, limit int) ([]ParkedRow, error) {
 	states, cats, parked := parkingPairs()
 	return s.parked(ctx, parkedBaseSQL+`
 		AND pe.sequence IS NULL
-		ORDER BY s.run_id, s.sequence
-		LIMIT $5`, repo, states, cats, parked, limit)
+		ORDER BY s.created_at, s.id
+		LIMIT $5 OFFSET $6`, repo, states, cats, parked, limit, offset)
 }
 
 func (s *Store) parked(ctx context.Context, sql string, args ...any) ([]ParkedRow, error) {
@@ -312,4 +316,36 @@ func (s *Store) UpsertWatermark(ctx context.Context, accountID *uuid.UUID, subje
 		return fmt.Errorf("digest: upsert watermark: %w", err)
 	}
 	return nil
+}
+
+// advanceWatermarkSQL upserts monotonically and reports the COMMITTED sequence
+// plus whether THIS statement raised it. The `up` CTE returns a row only when
+// the INSERT (first mark) or the conflicting UPDATE (a strictly higher mark)
+// fired; when the monotonic WHERE refuses the update — a concurrent request
+// already committed a value at or above this one — `up` is empty and the second
+// arm re-reads the row the winner committed. So MarkRead can report the
+// watermark the database actually holds, with advanced=false, rather than the
+// value it merely requested (#3734 fix-up condition 4).
+const advanceWatermarkSQL = `WITH up AS (
+	INSERT INTO captain_read_watermarks (account_id, captain_subject, repo, sequence)
+	VALUES ($1, $2, $3, $4)
+	ON CONFLICT (captain_subject, repo, COALESCE(account_id, '00000000-0000-0000-0000-000000000000'::uuid))
+	DO UPDATE SET sequence = EXCLUDED.sequence, updated_at = now()
+	WHERE captain_read_watermarks.sequence < EXCLUDED.sequence
+	RETURNING sequence
+)
+SELECT sequence, true FROM up
+UNION ALL
+SELECT sequence, false FROM captain_read_watermarks
+	WHERE captain_subject = $2 AND repo = $3 AND account_id IS NOT DISTINCT FROM $1
+	  AND NOT EXISTS (SELECT 1 FROM up)
+LIMIT 1`
+
+// advanceWatermark upserts the watermark monotonically and returns the
+// COMMITTED sequence and whether this call raised it. See advanceWatermarkSQL.
+func (s *Store) advanceWatermark(ctx context.Context, accountID *uuid.UUID, subject, repo string, sequence int64) (committed int64, changed bool, err error) {
+	if err := s.db.QueryRow(ctx, advanceWatermarkSQL, accountID, subject, repo, sequence).Scan(&committed, &changed); err != nil {
+		return 0, false, fmt.Errorf("digest: advance watermark: %w", err)
+	}
+	return committed, changed, nil
 }

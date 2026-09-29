@@ -18,6 +18,14 @@ import (
 //  4. ONLY after that append succeeds, advance the watermark (a monotonic
 //     upsert). An append error returns with the row untouched.
 //
+// The result describes what was COMMITTED, not what was requested: Sequence is
+// the watermark the upsert statement left in the row and Advanced is true only
+// when THIS call raised it. Two captains' requests can race here — a lower one
+// reads the old watermark before a higher one commits, then its own monotonic
+// upsert makes no change — so the lower call reports the higher committed
+// Sequence with Advanced=false rather than falsely claiming it advanced to its
+// own lower ToSequence (#3734 fix-up condition 4).
+//
 // Idempotence is a property of the WATERMARK, not of the chain. A retry after
 // an append succeeded but the advance failed appends a SECOND entry — an
 // honest record of the second attempt, since the chain is append-only — and
@@ -78,10 +86,13 @@ type MarkReadParams struct {
 type MarkReadResult struct {
 	PreviousSequence int64 `json:"previous_sequence"`
 	HadPrevious      bool  `json:"had_previous"`
-	// Sequence is the watermark after the call.
+	// Sequence is the watermark COMMITTED after the call (not necessarily the
+	// requested ToSequence: a concurrent higher advance can win the row).
 	Sequence int64 `json:"sequence"`
-	// Advanced is false for the at-or-below-watermark no-op (nothing was
-	// appended).
+	// Advanced is true only when THIS call raised the watermark. It is false
+	// for the at-or-below-watermark no-op (nothing appended) AND for a call
+	// whose entry was appended but whose monotonic upsert a concurrent higher
+	// advance had already made a no-op.
 	Advanced bool `json:"advanced"`
 }
 
@@ -114,10 +125,11 @@ func (s *Store) MarkRead(ctx context.Context, appender Appender, p MarkReadParam
 	}); err != nil {
 		return MarkReadResult{}, fmt.Errorf("digest: mark read: append digest_marked_read (watermark unmoved): %w", err)
 	}
-	if err := s.UpsertWatermark(ctx, p.AccountID, p.CaptainSubject, p.Repo, p.ToSequence); err != nil {
+	committed, changed, err := s.advanceWatermark(ctx, p.AccountID, p.CaptainSubject, p.Repo, p.ToSequence)
+	if err != nil {
 		return MarkReadResult{}, fmt.Errorf("digest: mark read: entry appended but watermark not advanced (a retry converges it): %w", err)
 	}
-	return MarkReadResult{PreviousSequence: cur, HadPrevious: has, Sequence: p.ToSequence, Advanced: true}, nil
+	return MarkReadResult{PreviousSequence: cur, HadPrevious: has, Sequence: committed, Advanced: changed}, nil
 }
 
 // jsonObject renders m as a JSON object string for a ::jsonb bind.

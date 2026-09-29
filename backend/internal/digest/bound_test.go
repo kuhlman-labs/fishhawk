@@ -283,7 +283,7 @@ func TestCapString(t *testing.T) {
 // TestParseSection covers the selector set, including gaps and a refused
 // not-yet-shipped kind.
 func TestParseSection(t *testing.T) {
-	for _, ok := range []string{"", "merges", "waivers_and_deferrals", "pages", "open_decisions", "gaps"} {
+	for _, ok := range []string{"", "merges", "waivers_and_deferrals", "pages", "open_decisions", "gaps", "open_decisions_uncited"} {
 		if _, err := ParseSection(ok); err != nil {
 			t.Errorf("%q: %v", ok, err)
 		}

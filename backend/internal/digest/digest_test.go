@@ -392,6 +392,119 @@ func TestBuild_FollowingCursorTerminates(t *testing.T) {
 	}
 }
 
+// TestBuild_SectionCallRetainsCitationGap (#3734 fix-up condition 1): a single
+// content-section request KEEPS the source_entry_missing gap discovered on that
+// section's own items, beside the item — Build must not clear d.Gaps for a
+// section call. With the old d.Gaps=[]Gap{} clear this asserts an empty gap
+// list, so it reddens.
+func TestBuild_SectionCallRetainsCitationGap(t *testing.T) {
+	f := newFixture(t)
+	burned := f.burnSequence(t)
+	anchor := f.appendEntry(t, f.run, nil, "run_started", map[string]any{})
+	ghost := *anchor
+	ghost.Sequence = burned
+	f.index(t, &ghost, decisionindex.ClassMergeVerdict, nil)
+
+	d := f.build(t, Request{Section: SectionMerges})
+	m := sectionOf(t, d, SectionMerges)
+	if len(m.Items) != 1 || m.Items[0].SourceSequence != burned || !m.Items[0].SourceMissing {
+		t.Fatalf("merges = %+v, want the item at %d emitted with source_missing", m.Items, burned)
+	}
+	if len(d.Gaps) != 1 || d.Gaps[0].Kind != GapSourceEntryMissing || d.Gaps[0].Sequence != burned {
+		t.Errorf("section=merges gaps = %+v, want the %s gap at %d reported beside the item", d.Gaps, GapSourceEntryMissing, burned)
+	}
+}
+
+// TestBuild_GapsCursorReachesItemGapPastScanLimit (#3734 fix-up condition 2/3):
+// indexed merges exceeding the scan limit, then an indexed merge whose source
+// entry is missing. A section=gaps request scan-limits the merges read and its
+// item-derived gap lies past the limit; following the gaps cursor must reach it
+// and terminate. Without folding the section's scan-limit continuation into the
+// gaps cursor, GapsNext is nil and the gap is never reached.
+func TestBuild_GapsCursorReachesItemGapPastScanLimit(t *testing.T) {
+	f := newFixture(t)
+	const limit = 2
+	for i := 0; i < limit; i++ { // valid indexed merges filling the scan limit
+		e := f.mergeEntry(t)
+		f.index(t, e, decisionindex.ClassMergeVerdict, nil)
+	}
+	burned := f.burnSequence(t)
+	anchor := f.appendEntry(t, f.run, nil, "run_started", map[string]any{})
+	ghost := *anchor
+	ghost.Sequence = burned
+	f.index(t, &ghost, decisionindex.ClassMergeVerdict, nil)
+
+	found := false
+	seen := map[int64]bool{}
+	collect := func(d Digest) *Cursor {
+		for _, g := range d.Gaps {
+			if g.Kind == GapSourceEntryMissing && g.Sequence == burned {
+				found = true
+			}
+		}
+		return d.GapsNext
+	}
+	next := collect(f.build(t, Request{Section: SectionGaps, ScanLimit: limit}))
+	for i := 0; next != nil && !found; i++ {
+		if i > 10 {
+			t.Fatal("gaps cursor chain did not terminate")
+		}
+		if next.Section != SectionGaps {
+			t.Fatalf("gaps cursor section = %q", next.Section)
+		}
+		if seen[next.FromSequence] {
+			t.Fatalf("gaps cursor did not advance past %d", next.FromSequence)
+		}
+		seen[next.FromSequence] = true
+		next = collect(f.build(t, Request{Section: SectionGaps, FromSequence: next.FromSequence, ToSequence: next.ToSequence, ScanLimit: limit}))
+	}
+	if !found {
+		t.Fatalf("following section=gaps cursors never reached the %s gap at %d", GapSourceEntryMissing, burned)
+	}
+}
+
+// TestBuild_UncitedParkedFullyRetrievable (#3734 fix-up condition 3): with more
+// uncited parked stages than the constant-size floor holds, the full digest
+// carries uncited_next and following the SectionOpenDecisionsUncited cursor
+// returns EVERY uncited stage and terminates. The old code dropped all but
+// uncitedLimit with no cursor, so this reddens (only 16 of 20 retrieved).
+func TestBuild_UncitedParkedFullyRetrievable(t *testing.T) {
+	f := newFixture(t)
+	const total = uncitedLimit + 4 // 20: more than one floor page
+	want := map[uuid.UUID]bool{}
+	for i := 0; i < total; i++ {
+		// awaiting_deploy_approval with no escalation_fired entry → uncited.
+		want[f.seedStage(t, f.run, i, "deploy", "awaiting_deploy_approval")] = true
+	}
+	got := map[uuid.UUID]bool{}
+	collect := func(d Digest) *Cursor {
+		for _, g := range d.Gaps {
+			if g.Kind == GapParkedWithoutCitation && g.StageID != nil {
+				got[*g.StageID] = true
+			}
+		}
+		return d.UncitedNext
+	}
+	next := collect(f.build(t, Request{}))
+	for i := 0; next != nil; i++ {
+		if i > total {
+			t.Fatal("uncited cursor chain did not terminate")
+		}
+		if next.Section != SectionOpenDecisionsUncited {
+			t.Fatalf("uncited cursor section = %q, want %s", next.Section, SectionOpenDecisionsUncited)
+		}
+		next = collect(f.build(t, Request{Section: next.Section, FromSequence: next.FromSequence}))
+	}
+	if len(got) != total {
+		t.Fatalf("retrieved %d uncited parked stages, want %d", len(got), total)
+	}
+	for id := range want {
+		if !got[id] {
+			t.Fatalf("uncited parked stage %s was never returned by following uncited_next", id)
+		}
+	}
+}
+
 // TestBuild_FollowingGapsCursorReturnsRest (condition 2): the gaps collection
 // is addressable with section=gaps and following its pointer returns the rest.
 func TestBuild_FollowingGapsCursorReturnsRest(t *testing.T) {

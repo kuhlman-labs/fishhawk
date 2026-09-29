@@ -51,6 +51,13 @@ const (
 	// Gaps + Degradations collections so their truncated remainder is
 	// retrievable with the same cursor mechanism (#3734 approval condition 2).
 	SectionGaps SectionKind = "gaps"
+	// SectionOpenDecisionsUncited is a SELECTOR that pages the
+	// parked_without_citation gaps — parked stages with no identifiable parking
+	// entry, which have NO chain sequence to page by. It is OFFSET-paged
+	// (from_sequence carries the offset) over the store's (created_at, id)
+	// order, so every such stage beyond the constant-size floor is retrievable
+	// (#3734 fix-up condition 3).
+	SectionOpenDecisionsUncited SectionKind = "open_decisions_uncited"
 )
 
 // ContentSections is the closed, ordered set of content sections a full
@@ -61,10 +68,10 @@ var ContentSections = []SectionKind{SectionMerges, SectionWaiversAndDeferrals, S
 // full digest.
 func ParseSection(s string) (SectionKind, error) {
 	switch k := SectionKind(s); k {
-	case "", SectionMerges, SectionWaiversAndDeferrals, SectionPages, SectionOpenDecisions, SectionGaps:
+	case "", SectionMerges, SectionWaiversAndDeferrals, SectionPages, SectionOpenDecisions, SectionGaps, SectionOpenDecisionsUncited:
 		return k, nil
 	}
-	return "", fmt.Errorf("%w: unknown section %q (want one of merges, waivers_and_deferrals, pages, open_decisions, gaps)", ErrInvalidRequest, s)
+	return "", fmt.Errorf("%w: unknown section %q (want one of merges, waivers_and_deferrals, pages, open_decisions, gaps, open_decisions_uncited)", ErrInvalidRequest, s)
 }
 
 // Item is one digest entry. SourceSequence and SourceEntryHash cite the chain
@@ -145,8 +152,9 @@ const (
 	// the chain entry's.
 	GapSourceHashMismatch = "source_hash_mismatch"
 	// GapParkedWithoutCitation: a parked stage with no identifiable parking
-	// entry. It has no chain position, so Sequence is 0 and it is carried in
-	// the constant-size floor (bounded by uncitedLimit), never trimmed.
+	// entry. It has no chain position, so Sequence is 0 and it rides the
+	// constant-size floor. The floor carries only the first uncitedLimit; the
+	// rest are offset-paged via SectionOpenDecisionsUncited (UncitedNext).
 	GapParkedWithoutCitation = "parked_without_citation"
 )
 
@@ -201,6 +209,11 @@ type Digest struct {
 	GapsTruncated    bool          `json:"gaps_truncated"`
 	GapsOmittedCount int           `json:"gaps_omitted_count"`
 	GapsNext         *Cursor       `json:"gaps_next,omitempty"`
+	// UncitedNext continues the parked_without_citation gaps. The constant-size
+	// floor carries only the first uncitedLimit of them (they have no chain
+	// sequence, so they ride the floor, not the paged gaps stream); the rest are
+	// offset-paged via SectionOpenDecisionsUncited (#3734 fix-up condition 3).
+	UncitedNext *Cursor `json:"uncited_next,omitempty"`
 	// Truncated is true when anything in this response was elided; Next is
 	// then the first elided collection's cursor.
 	Truncated bool    `json:"truncated"`
@@ -308,10 +321,27 @@ func Build(ctx context.Context, deps Deps, req Request) (Digest, error) {
 	}
 	b := &builder{deps: deps, req: req, d: &d, limit: limit, to: to, from: from}
 
+	// The dedicated uncited selector pages the sequence-less
+	// parked_without_citation gaps by OFFSET (from_sequence carries it),
+	// independently of every windowed collection.
+	if req.Section == SectionOpenDecisionsUncited {
+		if err := b.uncitedParked(ctx, int(req.FromSequence)); err != nil {
+			return Digest{}, err
+		}
+		sortGaps(d.Gaps)
+		sortDegradations(d.Degradations)
+		return d, nil
+	}
+
 	want := func(k SectionKind) bool { return req.Section == "" || req.Section == k }
 	emitGaps := req.Section == "" || req.Section == SectionGaps
 	// The gaps selector recomputes the item-derived gaps (source_entry_missing,
-	// reason_missing) from the same reads, without emitting the items.
+	// source_hash_mismatch, reason_missing) from the same reads, without
+	// emitting the items. gapsContFrom captures the earliest first-omitted
+	// sequence of any content section that hit its scan limit during a gaps
+	// request: its item-derived gaps PAST the limit were not checked, so the
+	// gaps cursor must advance through them (#3734 fix-up condition 2/3).
+	var gapsContFrom int64
 	for _, k := range ContentSections {
 		if !want(k) && !emitGaps {
 			continue
@@ -323,24 +353,33 @@ func Build(ctx context.Context, deps Deps, req Request) (Digest, error) {
 		if want(k) && req.Section != SectionGaps {
 			d.Sections = append(d.Sections, sec)
 		}
+		if req.Section == SectionGaps && sec.Next != nil && (gapsContFrom == 0 || sec.Next.FromSequence < gapsContFrom) {
+			gapsContFrom = sec.Next.FromSequence
+		}
 	}
 	if emitGaps {
 		if err := b.unindexedGaps(ctx); err != nil {
 			return Digest{}, err
 		}
 		if req.FromSequence == 0 {
-			// Parked-without-citation gaps have no chain position; they ride
-			// only the non-continuation call (a cursor-following call carries
-			// an explicit FromSequence).
-			if err := b.uncitedParked(ctx); err != nil {
+			// Parked-without-citation gaps have no chain position; the floor
+			// carries only the first uncitedLimit on this non-continuation
+			// call, and UncitedNext pages the rest (SectionOpenDecisionsUncited).
+			if err := b.uncitedParked(ctx, 0); err != nil {
 				return Digest{}, err
 			}
 		}
-	} else {
-		// A single content section carries only its own findings.
-		d.Gaps = []Gap{}
-		d.Degradations = keepSection(d.Degradations, req.Section)
+		// Fold a content section's scan-limit continuation into the gaps
+		// cursor so its item-derived gaps past the limit stay retrievable.
+		if gapsContFrom != 0 && (b.d.GapsNext == nil || gapsContFrom < b.d.GapsNext.FromSequence) {
+			b.d.GapsNext = NewCursor(b.req.Repo, SectionGaps, gapsContFrom, b.to)
+			b.d.GapsTruncated = true
+		}
 	}
+	// A single content section keeps its OWN item-derived gaps (they were
+	// appended only for that section's items), so a caller paging one section
+	// sees the source_entry_missing / source_hash_mismatch gap beside the item
+	// as the package doc promises (#3734 fix-up condition 1).
 	sortGaps(d.Gaps)
 	sortDegradations(d.Degradations)
 	return d, nil
@@ -529,15 +568,23 @@ func (b *builder) unindexedGaps(ctx context.Context) error {
 	return nil
 }
 
-func (b *builder) uncitedParked(ctx context.Context) error {
-	rows, err := b.deps.Store.UncitedParkedStages(ctx, b.req.Repo, uncitedLimit+1)
+// uncitedParked lists the parked_without_citation gaps starting at offset,
+// carrying at most uncitedLimit on this page (the floor is constant-size) and
+// setting UncitedNext to page the rest via SectionOpenDecisionsUncited when
+// more remain (#3734 fix-up condition 3).
+func (b *builder) uncitedParked(ctx context.Context, offset int) error {
+	if offset < 0 {
+		offset = 0
+	}
+	rows, err := b.deps.Store.UncitedParkedStages(ctx, b.req.Repo, offset, uncitedLimit+1)
 	if err != nil {
 		return err
 	}
 	if len(rows) > uncitedLimit {
 		rows = rows[:uncitedLimit]
+		b.d.UncitedNext = NewCursor(b.req.Repo, SectionOpenDecisionsUncited, int64(offset+uncitedLimit), b.to)
 		b.d.Degradations = append(b.d.Degradations, Degradation{Kind: DegradationScanLimit, Section: SectionOpenDecisions,
-			Detail: fmt.Sprintf("more than %d parked stages have no identifiable parking entry; only the first %d are listed", uncitedLimit, uncitedLimit)})
+			Detail: fmt.Sprintf("more than %d parked stages have no identifiable parking entry; follow uncited_next (section=%s) for the rest", uncitedLimit, SectionOpenDecisionsUncited)})
 	}
 	for _, p := range rows {
 		runID, stageID := p.RunID, p.StageID
@@ -555,16 +602,6 @@ func categoryFor(c decisionindex.DecisionClass) string {
 		}
 	}
 	return string(c)
-}
-
-func keepSection(ds []Degradation, k SectionKind) []Degradation {
-	out := []Degradation{}
-	for _, d := range ds {
-		if d.Section == k {
-			out = append(out, d)
-		}
-	}
-	return out
 }
 
 func sortGaps(gs []Gap) {

@@ -24,8 +24,8 @@ import (
 //     something.
 type DigestInput struct {
 	Repo         string `json:"repo,omitempty" jsonschema:"target repo as owner/name; falls back to GITHUB_REPOSITORY env when omitted"`
-	Section      string `json:"section,omitempty" jsonschema:"read mode only: one of merges, waivers_and_deferrals, pages, open_decisions, gaps — copy a continuation cursor's section verbatim; omit for the full digest"`
-	FromSequence int64  `json:"from_sequence,omitempty" jsonschema:"read mode only: INCLUSIVE window start; copy a continuation cursor's from_sequence verbatim; omitted = your watermark + 1"`
+	Section      string `json:"section,omitempty" jsonschema:"read mode only: one of merges, waivers_and_deferrals, pages, open_decisions, gaps, open_decisions_uncited — copy a continuation cursor's section verbatim; omit for the full digest"`
+	FromSequence int64  `json:"from_sequence,omitempty" jsonschema:"read mode only: INCLUSIVE window start; copy a continuation cursor's from_sequence verbatim (for section=open_decisions_uncited it is an opaque page offset, not a chain sequence); omitted = your watermark + 1"`
 	ToSequence   int64  `json:"to_sequence,omitempty" jsonschema:"read mode: INCLUSIVE window end (omitted = the repository chain head; above the head is refused). mark-read mode: REQUIRED — the to_sequence of the digest you actually read"`
 	MarkRead     bool   `json:"mark_read,omitempty" jsonschema:"true advances your read watermark to to_sequence via POST /v0/digest/mark-read (needs write:approvals; appends a digest_marked_read audit entry first). false (default) only reads"`
 }
@@ -38,8 +38,8 @@ type DigestMarkReadResult struct {
 	CaptainSubject   string `json:"captain_subject"`
 	PreviousSequence int64  `json:"previous_sequence"`
 	HadPrevious      bool   `json:"had_previous"`
-	Sequence         int64  `json:"sequence" jsonschema:"the watermark after the call"`
-	Advanced         bool   `json:"advanced" jsonschema:"false when to_sequence was at or below the watermark: a no-op that appended nothing"`
+	Sequence         int64  `json:"sequence" jsonschema:"the watermark COMMITTED after the call (a concurrent higher mark-read can make this exceed the to_sequence you passed)"`
+	Advanced         bool   `json:"advanced" jsonschema:"true only when THIS call raised the watermark. false when to_sequence was at or below the watermark (a no-op that appended nothing), and also when a concurrent mark-read had already advanced it to or past to_sequence (an entry was appended, but the watermark did not move for this call)"`
 }
 
 // DigestOutput is the tool's result: exactly one of Digest (read mode) or
@@ -99,8 +99,17 @@ Bounded: the digest is trimmed to this session's response byte budget by the
 same digest.Bound the REST route applies. When truncated is true, next names
 the continuation — call this tool again with its section, from_sequence and
 to_sequence (the cursor's call field shows the equivalent REST request).
-section=gaps pages through gaps and degradations. Decision-bearing entries the
+section=gaps pages through gaps and degradations; item-derived citation gaps
+past a section's scan limit are reached by following gaps_next. Parked stages
+with no identifiable parking entry ride a constant-size floor and page via
+uncited_next (section=open_decisions_uncited). Decision-bearing entries the
 index never recorded are reported as gaps, never dropped.
+
+Over-budget floor escape: if a read errors because the constant-size floor
+(many parked_without_citation gaps) exceeds this session's byte budget, pass an
+explicit from_sequence (e.g. your watermark + 1) — a continuation call skips the
+uncited-parked floor, shrinking it — and retrieve those stages separately via
+section=open_decisions_uncited.
 
 Tool errors: repo missing; section/from_sequence passed with mark_read;
 to_sequence missing with mark_read; validation_failed (400);

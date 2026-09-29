@@ -8,7 +8,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5"
 )
 
 // recordingAppender records every digest_marked_read event and optionally
@@ -35,21 +35,27 @@ func (a *recordingAppender) count() int {
 	return len(a.events)
 }
 
-// failingUpsertDB fails the watermark upsert exactly `failures` times and
+// failingUpsertDB fails the watermark advance exactly `failures` times and
 // passes every other statement through — the injected DB error for the
-// append-then-failed-advance path.
+// append-then-failed-advance path. MarkRead advances via QueryRow
+// (advanceWatermarkSQL), so the failure is injected there.
 type failingUpsertDB struct {
 	DBTX
 	failures int
 }
 
-func (d *failingUpsertDB) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
-	if sql == upsertWatermarkSQL && d.failures > 0 {
+func (d *failingUpsertDB) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	if sql == advanceWatermarkSQL && d.failures > 0 {
 		d.failures--
-		return pgconn.CommandTag{}, errors.New("injected upsert failure")
+		return errRow{err: errors.New("injected upsert failure")}
 	}
-	return d.DBTX.Exec(ctx, sql, args...)
+	return d.DBTX.QueryRow(ctx, sql, args...)
 }
+
+// errRow is a pgx.Row whose Scan always returns err.
+type errRow struct{ err error }
+
+func (r errRow) Scan(_ ...any) error { return r.err }
 
 func (f *fixture) watermark(t *testing.T, account *uuid.UUID, subject string) (int64, bool) {
 	t.Helper()
@@ -233,6 +239,43 @@ func TestWatermark_ConcurrentLowerUpsertDoesNotRegress(t *testing.T) {
 	}
 	if got, _ := f.watermark(t, nil, "cap"); got != 40 {
 		t.Errorf("watermark after lower upsert = %d, want 40 (monotonic)", got)
+	}
+}
+
+// TestMarkRead_ConcurrentAdvanceReportsCommitted (#3734 fix-up condition 4): a
+// lower mark-read that read the OLD watermark before a higher one committed
+// must report the higher COMMITTED sequence with advanced=false, not the value
+// it requested. The interleave is deterministic — the lower call's appender
+// fires AFTER it reads the watermark and BEFORE its own advance, and inside it
+// the higher MarkRead runs to completion — so there is no goroutine or sleep to
+// flake. Old code returned p.ToSequence/advanced=true unconditionally, so it
+// reddens this assertion.
+func TestMarkRead_ConcurrentAdvanceReportsCommitted(t *testing.T) {
+	f := newFixture(t)
+	head := f.seedHead(t, 3)
+	ctx := context.Background()
+	lower, higher := head-1, head
+
+	var once sync.Once
+	interleave := AppenderFunc(func(ctx context.Context, _ MarkedReadEvent) error {
+		once.Do(func() {
+			if _, err := f.st.MarkRead(ctx, &recordingAppender{}, MarkReadParams{
+				CaptainSubject: "cap", Repo: testRepo, ToSequence: higher,
+			}); err != nil {
+				t.Errorf("interleaved higher mark-read: %v", err)
+			}
+		})
+		return nil
+	})
+	res, err := f.st.MarkRead(ctx, interleave, MarkReadParams{CaptainSubject: "cap", Repo: testRepo, ToSequence: lower})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Advanced || res.Sequence != higher {
+		t.Errorf("lower mark-read = %+v, want committed %d with advanced=false", res, higher)
+	}
+	if got, _ := f.watermark(t, nil, "cap"); got != higher {
+		t.Errorf("watermark = %d, want %d (the higher commit stands)", got, higher)
 	}
 }
 
