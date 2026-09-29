@@ -1,0 +1,14 @@
+id: scenario:issue-1714/wait-on-human-key-absent-when-unavailable
+statement: When no run in the requested window resolves a gate-latency rollup, the throughput response omits the wait-on-human key entirely rather than returning a zero-valued block or an error.
+verify_hint: GET /v0/repos/{owner}/{name}/throughput for a repo whose runs carry no human-gate audit markers returns 200 and the response body has no `wait_on_human` key at all.
+steps: Seeded runs via POST http://localhost:8090/v0/dev/fixtures (including trace-upload-target, whose plan stage is only dispatched and has not reached a human gate). Sent GET http://localhost:8090/v0/repos/kuhlman-labs/fishhawk/throughput and grepped the raw body for 'wait_on_human'.
+assertions:
+    expected: 200 and no `wait_on_human` key.
+    observed_at_record: 200; 0 occurrences of 'wait_on_human' in the body. It is neither a zero block nor an error.
+    repro_handle: curl -s http://localhost:8090/v0/repos/kuhlman-labs/fishhawk/throughput | grep -c wait_on_human
+origin:
+    issue: 1714
+    pr: 0
+    run_id: 9e5234b3-f1fd-4704-bdd6-dc8c12fa132b
+    head_sha: 946018bb06a93cc6a534d4b452b2ae61c80b9a88
+    recorded_at: 2026-09-29T00:36:38Z

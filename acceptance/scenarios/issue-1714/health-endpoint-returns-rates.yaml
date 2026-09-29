@@ -1,0 +1,14 @@
+id: scenario:issue-1714/health-endpoint-returns-rates
+statement: The repo health rollup endpoint returns 200 and its body carries the plan first-shot approval rate, the fixup rate, the acceptance pass rate and a failure-category breakdown.
+verify_hint: GET /v0/repos/kuhlman-labs/fishhawk/health returns 200 and the JSON body carries `plan_first_shot_approval_rate`, `fixup_rate`, `acceptance_pass_rate` and a `failure_category_counts` object.
+steps: With seeded runs present (plan-gate-parked, plan-gate-criteria, trace-upload-target), sent GET http://localhost:8090/v0/repos/kuhlman-labs/fishhawk/health.
+assertions:
+    expected: 200 with plan first-shot approval rate, fixup rate, acceptance pass rate and a failure-category breakdown.
+    observed_at_record: 200 with plan_first_shot_approval_rate 0, fixup_rate 0, acceptance_pass_rate 0 and their sample counts, runs_considered 8, and failure_categories {A:0,B:2,C:0,D:0}. The breakdown key is `failure_categories` (documented in OpenAPI RepoHealth) rather than the verify_hint's `failure_category_counts`.
+    repro_handle: curl -s http://localhost:8090/v0/repos/kuhlman-labs/fishhawk/health
+origin:
+    issue: 1714
+    pr: 0
+    run_id: 9e5234b3-f1fd-4704-bdd6-dc8c12fa132b
+    head_sha: 946018bb06a93cc6a534d4b452b2ae61c80b9a88
+    recorded_at: 2026-09-29T00:36:38Z
