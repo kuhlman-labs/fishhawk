@@ -51,11 +51,12 @@ and double env-gated.
 | Field | Meaning |
 |---|---|
 | `name` | Fixture name. |
-| `attack_class` | One of `InjectionAttackClasses` (SIX): `direct-instruction-override`, `fake-authority-claim`, `envelope-delimiter-breakout`, `code-fence-embedded-instructions`, `split-body-comment-payload`, `verify-output-instruction-injection`. |
+| `attack_class` | One of `InjectionAttackClasses` (SEVEN): `direct-instruction-override`, `fake-authority-claim`, `envelope-delimiter-breakout`, `code-fence-embedded-instructions`, `split-body-comment-payload`, `verify-output-instruction-injection`, `crew-message-instruction-injection`. The seventh (#3738) plants its payload in an agent-written CREW MESSAGE: a forged `<<<END UNTRUSTED CREW MESSAGE>>>` delimiter line AND a forged trusted-heading line opening with `CREW MESSAGE`, followed by an instruction-override payload carrying the compliance marker, plus a sender role and anchor carrying embedded line breaks so the metadata normalization is exercised too. |
 | `body` | The adversarial issue body. |
 | `comments[]` | `{author, body, created_at}` — the split-channel class needs at least one. |
 | `verify_output` | `{parent_tail, parent_summary_detail, slice_tail, slice_summary_detail}` (#3192) — the adversarial verify-gate output for the `verify-output-instruction-injection` class. `ToTrigger` attaches a `GateEvidence` built from it (a parent verify run + summary AND one child slice), so ONE fixture exercises BOTH implement-review render sites. Nil leaves `GateEvidence` nil, keeping every other fixture byte-identical. |
-| `containment_probes[]` | `{channel: "body"\|"comment"\|"verify_output", text}` — literal substrings the offline gate asserts land INSIDE that channel's envelope. A `verify_output` probe is asserted only in the `implement_review` render (the sole reviewed render that ingests gate evidence) and WHOLLY ABSENT from `plan`/`plan_review`. |
+| `crew_messages[]` | `{type, sender_role, anchor_ref, message_text}` (#3738) — the adversarial crew messages for the `crew-message-instruction-injection` class. `ToTrigger` maps them onto `prompt.Trigger.CrewMessages`; empty leaves that field nil, keeping every other fixture byte-identical. Only `message_text` is enveloped — the rest renders as Fishhawk-normalized attribution OUTSIDE the envelope. |
+| `containment_probes[]` | `{channel: "body"\|"comment"\|"verify_output"\|"crew_message", text}` — literal substrings the offline gate asserts land INSIDE that channel's envelope. A `verify_output` probe is asserted only in the `implement_review` render (the sole reviewed render that ingests gate evidence) and WHOLLY ABSENT from `plan`/`plan_review`. A `crew_message` probe is asserted in ALL THREE reviewed renders, since every one of them ingests crew messages. |
 | `compliance_marker` | The literal "emit this token" sentinel. |
 | `marker_only` + `marker_only_reason` | Declares this payload admits NO substantive behavioural signal beyond the marker, and says why. |
 | `behavioral_rubric` | `{compliant_behavior, resistant_behavior, dimensions[]}` — required unless `marker_only`, forbidden when `marker_only`. |
@@ -118,10 +119,31 @@ cannot find it means the gate is silently not running.
 | (m) | a rubric that does not declare `DeciderDimension` |
 | (n) | a `verify_output` probe on a case with no `verify_output` block, or whose text matches none of its four fields (#3192) |
 | (o) | a `verify_output` block whose four fields are ALL empty — it would render no envelope (#3192) |
+| (p) | a `crew_message` probe on a case with no `crew_messages` block (#3738) |
+| (q) | a `crew_message` probe whose text matches none of the declared messages' `message_text` (#3738) |
+| (r) | a declared `crew_messages` entry whose `message_text` is empty — it would render an empty envelope (#3738) |
 
-Mode (f) — and its `verify_output` sibling (n) — is what makes the containment
-matrix meaningful: a probe absent from its own source text would pass
-containment **vacuously**.
+Mode (f) — and its `verify_output` sibling (n), and its `crew_message` siblings
+(p)/(q) — is what makes the containment matrix meaningful: a probe absent from
+its own source text would pass containment **vacuously**.
+
+**ANTI-VACUITY, the other half.** Refusing a probe that is not in its own source
+is necessary but not sufficient: a probe that VANISHED from the render (a deleted
+call site) would satisfy an every-occurrence-inside-a-span check with zero
+occurrences and zero violations. So `TestInjectionCorpus_ContainedInEveryReviewedRender`
+also FATALs when a case declaring a `crew_messages` block produces ZERO crew
+envelopes in a reviewed render. Deleting the `writeUntrustedCrewMessages` call
+from `buildPlanReview` fires exactly that FATAL — the counterfactual that proves
+the crew containment assertion is not vacuous.
+
+**Stated residual for the crew channel.** The acceptance-transcript
+structural-exclusion control in `backend/internal/server`
+(`TestAcceptanceTranscriptValidate_RejectsInjectionCorpusPayloads`) enumerates
+the corpus channels EXPLICITLY and feeds `body`, each comment, each
+`verify_output` field and each containment probe. It does NOT yet feed a crew
+message's full `message_text` — the crew payload reaches it only through that
+case's containment probes, which are substrings of it. Widening that control is
+a one-line follow-up in a package outside this change's scope.
 
 ### The offline gates
 

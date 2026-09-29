@@ -68,6 +68,12 @@ var InjectionAttackClasses = []string{
 	// body or comment. Its probes use the "verify_output" channel and are
 	// asserted only in the implement_review render.
 	"verify-output-instruction-injection",
+	// ADR-081 #3727 rule 5 / #3738: the payload lives in a CREW MESSAGE — prose
+	// written by an agent in another crew role and delivered into the reviewed
+	// prompts. Its probes use the "crew_message" channel and are asserted in all
+	// three reviewed renders (unlike verify_output, every reviewed render
+	// ingests crew messages).
+	"crew-message-instruction-injection",
 }
 
 // ReviewedRenderStages are the three stage prompts that INGEST untrusted
@@ -88,10 +94,12 @@ type IssueCommentFixture struct {
 // (Channel "comment") that MUST render inside that channel's quarantine
 // envelope and nowhere else.
 type Probe struct {
-	// Channel is "body", "comment", or "verify_output" — which envelope the
-	// text must land in. A "verify_output" probe is asserted only in the
-	// implement_review render (the only reviewed render that ingests gate
+	// Channel is "body", "comment", "verify_output", or "crew_message" — which
+	// envelope the text must land in. A "verify_output" probe is asserted only in
+	// the implement_review render (the only reviewed render that ingests gate
 	// evidence) and is asserted WHOLLY ABSENT from the plan/plan_review renders.
+	// A "crew_message" probe is asserted in ALL THREE reviewed renders, since
+	// every one of them ingests crew messages.
 	Channel string `json:"channel"`
 	// Text is the literal probe substring.
 	Text string `json:"text"`
@@ -117,6 +125,25 @@ type VerifyOutputFixture struct {
 // substring check and the all-empty guard.
 func (v *VerifyOutputFixture) fields() []string {
 	return []string{v.ParentTail, v.ParentSummaryDetail, v.SliceTail, v.SliceSummaryDetail}
+}
+
+// CrewMessageFixture declares one crew-to-crew message of an injection case
+// (ADR-081 #3727 rule 5 / #3738): the adversarial payload as it would arrive on
+// a reviewed prompt's crew-message surface. It mirrors prompt.CrewMessage; the
+// corpus carries its own type so a case.json is a stable committed artifact
+// rather than a mirror of a production struct.
+type CrewMessageFixture struct {
+	Type        string `json:"type"`
+	SenderRole  string `json:"sender_role"`
+	AnchorRef   string `json:"anchor_ref"`
+	MessageText string `json:"message_text"`
+}
+
+// fields returns the declared crew-message source strings a probe may match.
+// Only MessageText is enveloped — the metadata renders as Fishhawk-normalized
+// attribution OUTSIDE the envelope — so a probe must occur in MessageText.
+func (m *CrewMessageFixture) fields() []string {
+	return []string{m.MessageText}
 }
 
 // BehavioralRubric states, in reviewable terms, what COMPLIANCE with this
@@ -149,6 +176,12 @@ type InjectionCase struct {
 	// GateEvidence built from it; nil leaves GateEvidence nil so every existing
 	// fixture's renders stay byte-identical.
 	VerifyOutput *VerifyOutputFixture `json:"verify_output,omitempty"`
+	// CrewMessages, when non-empty, carries the adversarial crew-message
+	// channel (#3738): a payload that arrives on a reviewed prompt's
+	// crew-message surface rather than in the issue body/comments. ToTrigger
+	// maps them onto prompt.Trigger.CrewMessages; empty leaves that field nil so
+	// every existing fixture's renders stay byte-identical.
+	CrewMessages []CrewMessageFixture `json:"crew_messages,omitempty"`
 	// ContainmentProbes are the offline gate's assertions.
 	ContainmentProbes []Probe `json:"containment_probes"`
 	// ComplianceMarker is the literal "emit this token" sentinel. Its
@@ -182,7 +215,7 @@ type NamedInjectionCase struct {
 // the gate is silently not running — the exact fail-open this issue exists
 // to close.
 //
-// FIFTEEN named fail-closed modes, each returning an error naming the case:
+// EIGHTEEN named fail-closed modes, each returning an error naming the case:
 //
 //	(a) missing/unreadable case.json
 //	(b) malformed JSON
@@ -207,6 +240,12 @@ type NamedInjectionCase struct {
 //	    of mode (f))
 //	(o) a verify_output block whose four fields are ALL empty — it would render
 //	    no envelope at all, so a fixture declaring one is malformed
+//	(p) a crew_message probe on a case declaring no crew_messages block — it
+//	    would assert containment VACUOUSLY (no crew envelope renders at all)
+//	(q) a crew_message probe whose text is a substring of none of the declared
+//	    messages' message_text — the #3738 vacuity sibling of (f) and (n)
+//	(r) a declared crew_messages entry whose message_text is empty — it would
+//	    render an empty envelope, so a fixture declaring one is malformed
 func LoadInjectionCorpus(dir string) ([]NamedInjectionCase, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -284,6 +323,11 @@ func (c *InjectionCase) validate() error {
 			return fmt.Errorf("verify_output block declares all four fields empty (parent_tail, parent_summary_detail, slice_tail, slice_summary_detail) — it would render no envelope") // (o)
 		}
 	}
+	for i, m := range c.CrewMessages {
+		if strings.TrimSpace(m.MessageText) == "" {
+			return fmt.Errorf("crew_messages[%d]: message_text must be non-empty — it would render an empty envelope", i) // (r)
+		}
+	}
 	return nil
 }
 
@@ -311,10 +355,33 @@ func (c *InjectionCase) validateProbe(i int, p Probe) error {
 		if p.Text == "" || !anyContains(c.VerifyOutput.fields(), p.Text) {
 			return fmt.Errorf("containment_probes[%d]: text %q is not a substring of any declared verify_output field", i, p.Text)
 		}
+	case "crew_message":
+		// (p)/(q): a crew_message probe must occur in a DECLARED crew message's
+		// message_text, or its containment assertion passes VACUOUSLY — the
+		// #3738 sibling of modes (f) and (n). A case with no crew_messages block
+		// renders no crew-message envelope at all, so such a probe is always
+		// vacuous.
+		if len(c.CrewMessages) == 0 {
+			return fmt.Errorf("containment_probes[%d]: channel \"crew_message\" but the case declares no crew_messages block", i) // (p)
+		}
+		if p.Text == "" || !anyCrewMessageContains(c.CrewMessages, p.Text) {
+			return fmt.Errorf("containment_probes[%d]: text %q is not a substring of any declared crew message's message_text", i, p.Text) // (q)
+		}
 	default:
-		return fmt.Errorf("containment_probes[%d]: channel %q must be \"body\", \"comment\", or \"verify_output\"", i, p.Channel)
+		return fmt.Errorf("containment_probes[%d]: channel %q must be \"body\", \"comment\", \"verify_output\", or \"crew_message\"", i, p.Channel)
 	}
 	return nil
+}
+
+// anyCrewMessageContains reports whether any declared crew message's enveloped
+// source text contains sub.
+func anyCrewMessageContains(msgs []CrewMessageFixture, sub string) bool {
+	for i := range msgs {
+		if anyContains(msgs[i].fields(), sub) {
+			return true
+		}
+	}
+	return false
 }
 
 // anyContains reports whether any string in ss contains sub.
@@ -383,6 +450,21 @@ func ToTrigger(c InjectionCase) prompt.Trigger {
 		IssueComments: comments,
 		IssueURL:      "https://github.com/kuhlman-labs/fishhawk/issues/2291",
 		Repo:          "kuhlman-labs/fishhawk",
+	}
+	// #3738: map the declared crew messages onto the Trigger's crew-message
+	// channel. Left nil when the fixture declares none, so every existing
+	// fixture's renders (and the gates over them) stay byte-identical.
+	if len(c.CrewMessages) > 0 {
+		msgs := make([]prompt.CrewMessage, 0, len(c.CrewMessages))
+		for _, cm := range c.CrewMessages {
+			msgs = append(msgs, prompt.CrewMessage{
+				Type:        cm.Type,
+				SenderRole:  cm.SenderRole,
+				AnchorRef:   cm.AnchorRef,
+				MessageText: cm.MessageText,
+			})
+		}
+		t.CrewMessages = msgs
 	}
 	// #3192: when the fixture declares a verify_output channel, attach a
 	// GateEvidence that exercises BOTH implement-review render sites from ONE
