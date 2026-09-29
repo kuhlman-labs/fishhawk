@@ -1,5 +1,7 @@
 import { getCookie } from '@/lib/cookie';
 import type {
+  AcceptanceArbitrationRequest,
+  AcceptanceArbitrationResult,
   ApiError,
   ApprovalRequest,
   Artifact,
@@ -8,6 +10,9 @@ import type {
   Campaign,
   CampaignState,
   CampaignStatus,
+  ConcernDeferRequest,
+  ConcernWaiveRequest,
+  DeferredConcernResult,
   HealthStatus,
   PaginatedList,
   RepoEconomicsResponse,
@@ -15,7 +20,10 @@ import type {
   RepoPostureResponse,
   RepoThroughput,
   Run,
+  ScopeAmendment,
+  ScopeAmendmentDecisionRequest,
   Stage,
+  WaivedConcern,
 } from './types';
 
 /*
@@ -364,5 +372,54 @@ export const api = {
   /** GET /healthz — carries the embedded schema-hash map the posture panel reads. */
   getHealth(): Promise<HealthStatus> {
     return request('/healthz');
+  },
+
+  /*
+   * Human-decision write surfaces for the attention queue (E40.2 / #1717).
+   * Each is a thin POST in the same style as submitApproval: CSRF
+   * auto-attach and ApiClientError envelope parsing come from `request`.
+   * No endpoint is added server-side; docs/api/v0.openapi.yaml is untouched.
+   */
+
+  decideScopeAmendment(
+    runId: string,
+    amendmentId: string,
+    body: ScopeAmendmentDecisionRequest,
+  ): Promise<ScopeAmendment> {
+    return request(
+      `/v0/runs/${encodeURIComponent(runId)}/scope-amendments/${encodeURIComponent(amendmentId)}/decision`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      },
+    );
+  },
+
+  waiveConcern(concernId: string, body: ConcernWaiveRequest): Promise<WaivedConcern> {
+    return request(`/v0/concerns/${encodeURIComponent(concernId)}/waive`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+  },
+
+  deferConcern(concernId: string, body: ConcernDeferRequest): Promise<DeferredConcernResult> {
+    return request(`/v0/concerns/${encodeURIComponent(concernId)}/defer`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+  },
+
+  arbitrateAcceptance(
+    runId: string,
+    body: AcceptanceArbitrationRequest,
+  ): Promise<AcceptanceArbitrationResult> {
+    return request(`/v0/runs/${encodeURIComponent(runId)}/acceptance-arbitration`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
   },
 };

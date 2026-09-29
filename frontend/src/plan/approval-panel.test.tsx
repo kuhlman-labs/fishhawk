@@ -44,7 +44,10 @@ function setupFetch({ approval }: FetchSetup) {
   return fetchMock;
 }
 
-function renderPanel(stage: Stage = stageAwaiting) {
+function renderPanel(
+  stage: Stage = stageAwaiting,
+  extra: Partial<Parameters<typeof ApprovalPanel>[0]> = {},
+) {
   const onUpdate = vi.fn();
   const onRollback = vi.fn();
   render(
@@ -54,6 +57,7 @@ function renderPanel(stage: Stage = stageAwaiting) {
         runId={stage.run_id}
         onUpdate={onUpdate}
         onRollback={onRollback}
+        {...extra}
       />
     </MemoryRouter>,
   );
@@ -152,6 +156,45 @@ describe('ApprovalPanel', () => {
     renderPanel({ ...stageAwaiting, state: 'succeeded' });
     expect(screen.queryByRole('button', { name: /^approve$/i })).not.toBeInTheDocument();
     expect(screen.getByText(/approved/i)).toBeInTheDocument();
+  });
+
+  it('calls onSubmitted ONLY after the successful POST, never on the optimistic onUpdate (E40.2 / #1717)', async () => {
+    const succeeded: Stage = { ...stageAwaiting, state: 'succeeded' };
+    setupFetch({ approval: { ok: true, stage: succeeded } });
+    const onSubmitted = vi.fn();
+    renderPanel(stageAwaiting, { onSubmitted });
+
+    fireEvent.click(screen.getByRole('button', { name: /^approve$/i }));
+    fireEvent.click(screen.getByRole('button', { name: /confirm approve/i }));
+
+    await waitFor(() => expect(onSubmitted).toHaveBeenCalledTimes(1));
+    // Called with the SERVER stage, not the optimistic one.
+    expect(onSubmitted).toHaveBeenCalledWith(succeeded);
+  });
+
+  it('does NOT call onSubmitted when the approval POST fails (rolled back)', async () => {
+    setupFetch({ approval: { ok: false, status: 500, error: 'boom' } });
+    const onSubmitted = vi.fn();
+    const { onRollback } = renderPanel(stageAwaiting, { onSubmitted });
+
+    fireEvent.click(screen.getByRole('button', { name: /^approve$/i }));
+    fireEvent.click(screen.getByRole('button', { name: /confirm approve/i }));
+
+    await waitFor(() => expect(onRollback).toHaveBeenCalled());
+    expect(onSubmitted).not.toHaveBeenCalled();
+  });
+
+  it('renders Regenerate by default (existing call sites unchanged)', () => {
+    renderPanel();
+    expect(screen.getByRole('button', { name: /regenerate/i })).toBeInTheDocument();
+  });
+
+  it('suppresses Regenerate when showRegenerate={false} (the queue call site)', () => {
+    renderPanel(stageAwaiting, { showRegenerate: false });
+    expect(screen.queryByRole('button', { name: /regenerate/i })).not.toBeInTheDocument();
+    // The verbs remain.
+    expect(screen.getByRole('button', { name: /^approve$/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /^reject$/i })).toBeInTheDocument();
   });
 
   it('cancels the confirmation panel without firing a request', async () => {

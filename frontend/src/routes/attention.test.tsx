@@ -1,11 +1,12 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { render, screen, waitFor, within } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router';
 import { Attention, ATTENTION_EMPTY_TEXT, ATTENTION_INCOMPLETE_TEXT } from './attention';
 import { api } from '@/api/client';
-import type { AttentionList } from '@/api/types';
+import { isDrivePlaneVerb } from '@/attention/decision-verbs';
+import type { AttentionItem, AttentionList } from '@/api/types';
 
 /*
  * The shared wire golden (testdata/wire/attention_list.json) is the
@@ -198,9 +199,12 @@ describe('<Attention>', () => {
     expect(campaign).toHaveTextContent(golden.items[5].context.human_led_refs![0]);
     expect(campaign).toHaveTextContent(golden.items[5].context.detail!);
 
-    // A complete golden renders no incomplete banner and no action affordance.
+    // A complete golden renders no incomplete banner. The queue is now
+    // actionable (E40.2), but NO rendered button or link is a drive-plane verb.
     expect(screen.queryByText(ATTENTION_INCOMPLETE_TEXT)).not.toBeInTheDocument();
-    expect(screen.queryAllByRole('button')).toHaveLength(0);
+    for (const el of [...screen.queryAllByRole('button'), ...screen.queryAllByRole('link')]) {
+      expect(isDrivePlaneVerb(el.textContent ?? ''), `"${el.textContent}"`).toBe(false);
+    }
   });
 
   it('the wire golden carries only field names the SPA mirrors', () => {
@@ -215,6 +219,72 @@ describe('<Attention>', () => {
         expect(CONTEXT_KEYS.has(key), `unknown AttentionContext field "${key}"`).toBe(true);
       }
     }
+  });
+
+  describe('decision write surface (E40.2 / #1717)', () => {
+    function scopeItem(over: Partial<AttentionItem>): AttentionItem {
+      const base = golden.items.find((i) => i.kind === 'scope_amendment')!;
+      return structuredClone({ ...base, ...over });
+    }
+
+    function stubDecision(handler: (url: string) => { status: number; body: unknown }) {
+      const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+        const r = handler(String(input));
+        return new Response(JSON.stringify(r.body), {
+          status: r.status,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      });
+      vi.stubGlobal('fetch', fetchMock);
+      return fetchMock;
+    }
+
+    function cardOf(title: string): HTMLElement {
+      const el = screen.getByText(title).closest('article');
+      if (!el) throw new Error(`no card for "${title}"`);
+      return el as HTMLElement;
+    }
+
+    it('submitting one of two same-kind items removes ONLY it, with no refetch', async () => {
+      const a = scopeItem({ id: 'id-a', amendment_id: 'am-a', title: 'Amendment A' });
+      const b = scopeItem({ id: 'id-b', amendment_id: 'am-b', title: 'Amendment B' });
+      const listSpy = vi.spyOn(api, 'listAttention').mockResolvedValue(list({ items: [a, b] }));
+      const fetchMock = stubDecision(() => ({ status: 200, body: {} }));
+      renderPage();
+
+      await screen.findByText('Amendment A');
+      const cardA = cardOf('Amendment A');
+      fireEvent.click(within(cardA).getByRole('button', { name: /^decide$/i }));
+      fireEvent.click(within(cardA).getByRole('button', { name: 'Approve' }));
+
+      await waitFor(() => expect(screen.queryByText('Amendment A')).not.toBeInTheDocument());
+      // The sibling with the same kind but a different id is untouched.
+      expect(screen.getByText('Amendment B')).toBeInTheDocument();
+      // Exactly one POST landed, and the queue was NOT refetched or reloaded.
+      const posts = fetchMock.mock.calls.filter(([, i]) => (i as RequestInit)?.method === 'POST');
+      expect(posts).toHaveLength(1);
+      expect(String(posts[0][0])).toBe('/v0/runs/' + a.run_id + '/scope-amendments/am-a/decision');
+      expect(listSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it('a failed concern waive (422) leaves the item in the list (C3)', async () => {
+      const split = golden.items.find((i) => i.kind === 'split_verdict')!;
+      vi.spyOn(api, 'listAttention').mockResolvedValue(list({ items: [structuredClone(split)] }));
+      stubDecision(() => ({ status: 422, body: { error: 'concern_waive_conflict' } }));
+      renderPage();
+
+      await screen.findByText(split.title);
+      const card = cardOf(split.title);
+      fireEvent.click(within(card).getByRole('button', { name: /^decide$/i }));
+      fireEvent.change(within(card).getByLabelText('Waive reason'), {
+        target: { value: 'still open' },
+      });
+      fireEvent.click(within(card).getByRole('button', { name: 'Waive' }));
+
+      await within(card).findByRole('alert');
+      // The waive was rejected, so the item MUST remain in the queue.
+      expect(screen.getByText(split.title)).toBeInTheDocument();
+    });
   });
 
   it('does not render the empty state while still loading', async () => {

@@ -642,6 +642,113 @@ export interface ApprovalRequest {
   comment?: string;
 }
 
+/*
+ * Human-decision write surfaces wired into the attention queue (E40.2 /
+ * #1717). Each mirrors an existing OpenAPI request/response shape in
+ * docs/api/v0.openapi.yaml — no new endpoint, no schema change. Field
+ * names are copied field-for-field from the OpenAPI document.
+ */
+
+export type ScopeAmendmentDecision = 'approve' | 'deny';
+export type ScopeAmendmentStatus = 'pending' | 'approved' | 'denied';
+
+/** One requested path in a mid-stage scope amendment (#961). */
+export interface ScopeAmendmentPath {
+  path: string;
+  operation: 'modify' | 'create';
+}
+
+/** Mirrors the ScopeAmendment schema — the decided-amendment response body. */
+export interface ScopeAmendment {
+  id: string;
+  run_id: string;
+  stage_id: string;
+  paths: ScopeAmendmentPath[];
+  reason: string;
+  status: ScopeAmendmentStatus;
+  decision_reason?: string;
+  decided_by?: string;
+  requested_at: string;
+  decided_at?: string;
+}
+
+/** Body of POST /v0/runs/{run}/scope-amendments/{id}/decision. */
+export interface ScopeAmendmentDecisionRequest {
+  decision: ScopeAmendmentDecision;
+  reason?: string;
+}
+
+/**
+ * The updated concern row returned by the waive endpoint (#984). Deferred
+ * concerns carry the identical row shape nested under
+ * DeferredConcernResult.concern, so the alias below names the shared shape.
+ */
+export interface ConcernRow {
+  id: string;
+  run_id: string;
+  stage_id: string;
+  stage_kind: 'plan' | 'implement';
+  severity: string;
+  category: string;
+  note: string;
+  state: string;
+  state_reason: string;
+}
+export type WaivedConcern = ConcernRow;
+
+/** Body of POST /v0/concerns/{id}/waive — the REQUIRED audited reason. */
+export interface ConcernWaiveRequest {
+  reason: string;
+}
+
+/**
+ * Body of POST /v0/concerns/{id}/defer. `parent_epic` is the only
+ * operator-supplied field the server cannot derive; the rest override
+ * server defaults.
+ */
+export interface ConcernDeferRequest {
+  parent_epic?: string;
+  n?: string;
+  type?: string;
+  labels?: string[];
+  note?: string;
+}
+
+/** Mirrors DeferredConcernResult — the filed follow-up issue + deferred concern. */
+export interface DeferredConcernResult {
+  concern: ConcernRow;
+  issue: {
+    type: string;
+    title: string;
+    number: number;
+    url: string;
+    provider: string;
+    applied_labels?: string[];
+    defaulted_labels?: string[];
+    missing_label_namespaces?: string[];
+  };
+}
+
+/**
+ * Body of POST /v0/runs/{run}/acceptance-arbitration. `reason` is required;
+ * `acknowledge_failed_criteria` is required by the server (409
+ * `acceptance_arbitration_requires_acknowledgement`) whenever the discharged
+ * outcome carries `criteria_failed > 0`.
+ */
+export interface AcceptanceArbitrationRequest {
+  reason: string;
+  acknowledge_failed_criteria?: boolean;
+}
+
+/** The 200 body of the acceptance-arbitration endpoint. */
+export interface AcceptanceArbitrationResult {
+  run_id: string;
+  acceptance_gate_state: string;
+  outcome_sequence: number;
+  arbitration_sequence: number;
+  already_recorded: boolean;
+}
+
 export interface ApiError {
   error: string;
   message?: string;

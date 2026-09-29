@@ -1,9 +1,10 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { render, screen, within } from '@testing-library/react';
+import { fireEvent, render, screen, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router';
 import { AttentionItemCard } from './attention-item';
+import { DECISION_VERBS, isDrivePlaneVerb } from './decision-verbs';
 import type { AttentionItem, AttentionItemKind, AttentionList } from '@/api/types';
 
 /*
@@ -115,17 +116,39 @@ describe('<AttentionItemCard>', () => {
     expect(screen.getByText('reviewer B still reproduces the stale holder')).toBeInTheDocument();
   });
 
-  it.each(ALL_KINDS)('%s links to the server-emitted detail_path and renders no action', (kind) => {
+  it.each(ALL_KINDS)('%s keeps its single server-emitted detail_path link', (kind) => {
     const item = itemOf(kind);
-    const { container } = renderCard(item);
+    renderCard(item);
     const card = screen.getByRole('article');
     const links = within(card).getAllByRole('link');
     expect(links).toHaveLength(1);
     expect(links[0]).toHaveAttribute('href', item.detail_path);
-    // Read-only control: no button, form or input affordance on any kind.
-    expect(screen.queryAllByRole('button')).toHaveLength(0);
-    expect(screen.queryAllByRole('form')).toHaveLength(0);
-    expect(container.querySelector('button, form, input, select, textarea')).toBeNull();
+  });
+
+  it.each(ALL_KINDS)('%s renders NO drive-plane verb on any button or link (collapsed)', (kind) => {
+    renderCard(itemOf(kind));
+    for (const el of [...screen.queryAllByRole('button'), ...screen.queryAllByRole('link')]) {
+      expect(isDrivePlaneVerb(el.textContent ?? ''), `"${el.textContent}"`).toBe(false);
+    }
+  });
+
+  it.each(ALL_KINDS)('%s shows a Decide toggle iff it has a decision endpoint', (kind) => {
+    renderCard(itemOf(kind));
+    const decidable = DECISION_VERBS[kind].length > 0;
+    expect(!!screen.queryByRole('button', { name: /^decide$/i })).toBe(decidable);
+  });
+
+  it('expanding a decidable card reveals exactly DECISION_VERBS[kind] as submit verbs', () => {
+    const { container } = renderCard(itemOf('scope_amendment'));
+    fireEvent.click(screen.getByRole('button', { name: /^decide$/i }));
+    const verbLabels = Array.from(container.querySelectorAll('[data-decision-verb]'))
+      .map((el) => (el.textContent ?? '').trim())
+      .sort();
+    expect(verbLabels).toEqual([...DECISION_VERBS.scope_amendment].sort());
+    // Still no drive-plane verb once expanded.
+    for (const el of [...screen.queryAllByRole('button'), ...screen.queryAllByRole('link')]) {
+      expect(isDrivePlaneVerb(el.textContent ?? '')).toBe(false);
+    }
   });
 
   it('renders a labelled fallback, not a blank card, for a kind the client does not know', () => {
