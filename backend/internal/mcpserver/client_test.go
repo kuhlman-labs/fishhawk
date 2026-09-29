@@ -658,6 +658,85 @@ func TestPersistReleaseNotes_PostsBodyAndDecodes(t *testing.T) {
 	}
 }
 
+// TestGetDigest_SendsSelectorAndDecodes proves GetDigest GETs /v0/digest with
+// the selector as query params — zero sequences and an empty section OMITTED
+// so the backend applies its watermark / chain-head defaults — and decodes the
+// shared digest.Digest wire model (E75.6 / #3734).
+func TestGetDigest_SendsSelectorAndDecodes(t *testing.T) {
+	runID := uuid.New()
+	var gotMethod, gotPath string
+	var gotQuery []string
+	c := releaseTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		gotMethod, gotPath = r.Method, r.URL.Path
+		gotQuery = append(gotQuery, r.URL.RawQuery)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"repo":"x/y","to_sequence":9,"sections":[{"kind":"merges","items":[{"category":"merge_verdict_recorded","source_sequence":9,"source_entry_hash":"h9","run_id":"`+runID.String()+`","at":"2026-09-01T00:00:00Z"}],"complete":true,"truncated":false,"omitted_count":0}],"gaps":[],"degradations":[]}`)
+	})
+
+	d, err := c.GetDigest(context.Background(), "x/y", "", 0, 0)
+	if err != nil {
+		t.Fatalf("GetDigest: %v", err)
+	}
+	if _, err := c.GetDigest(context.Background(), "x/y", "pages", 4, 9); err != nil {
+		t.Fatalf("GetDigest (selector): %v", err)
+	}
+	if gotMethod != http.MethodGet || gotPath != "/v0/digest" {
+		t.Errorf("request = %s %s, want GET /v0/digest", gotMethod, gotPath)
+	}
+	if gotQuery[0] != "repo=x%2Fy" {
+		t.Errorf("default query = %q, want repo only", gotQuery[0])
+	}
+	if gotQuery[1] != "from_sequence=4&repo=x%2Fy&section=pages&to_sequence=9" {
+		t.Errorf("selector query = %q", gotQuery[1])
+	}
+	if d.ToSequence != 9 || len(d.Sections) != 1 || len(d.Sections[0].Items) != 1 ||
+		d.Sections[0].Items[0].RunID != runID || d.Sections[0].Items[0].SourceEntryHash != "h9" {
+		t.Errorf("decoded digest = %+v", d)
+	}
+}
+
+// TestMarkDigestRead_PostsBodyAndDecodes proves MarkDigestRead POSTs
+// {repo, to_sequence} to /v0/digest/mark-read and decodes the flattened
+// watermark result.
+func TestMarkDigestRead_PostsBodyAndDecodes(t *testing.T) {
+	var gotMethod, gotPath string
+	var gotBody digestMarkReadRequest
+	c := releaseTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		gotMethod, gotPath = r.Method, r.URL.Path
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"repo":"x/y","captain_subject":"captain:a","previous_sequence":0,"had_previous":false,"sequence":42,"advanced":true}`)
+	})
+	res, err := c.MarkDigestRead(context.Background(), "x/y", 42)
+	if err != nil {
+		t.Fatalf("MarkDigestRead: %v", err)
+	}
+	if gotMethod != http.MethodPost || gotPath != "/v0/digest/mark-read" || gotBody.Repo != "x/y" || gotBody.ToSequence != 42 {
+		t.Errorf("request = %s %s %+v, want POST /v0/digest/mark-read {x/y, 42}", gotMethod, gotPath, gotBody)
+	}
+	if !res.Advanced || res.Sequence != 42 || res.HadPrevious || res.CaptainSubject != "captain:a" {
+		t.Errorf("decoded result = %+v", res)
+	}
+}
+
+// TestDigestClient_SurfacesAPIError proves both digest methods surface a
+// non-2xx as the typed *apiError (403 insufficient_scope here).
+func TestDigestClient_SurfacesAPIError(t *testing.T) {
+	c := releaseTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = io.WriteString(w, `{"error":{"code":"insufficient_scope","message":"write:approvals required"}}`)
+	})
+	_, getErr := c.GetDigest(context.Background(), "x/y", "", 0, 0)
+	_, markErr := c.MarkDigestRead(context.Background(), "x/y", 1)
+	for name, err := range map[string]error{"GetDigest": getErr, "MarkDigestRead": markErr} {
+		var ae *apiError
+		if !errors.As(err, &ae) || ae.StatusCode != http.StatusForbidden || ae.Code != "insufficient_scope" {
+			t.Errorf("%s err = %v, want *apiError 403 insufficient_scope", name, err)
+		}
+	}
+}
+
 // TestPersistReleaseNotes_SurfacesAPIError proves a 404 stage_not_found from the
 // persist endpoint surfaces as *apiError (the do error passthrough).
 func TestPersistReleaseNotes_SurfacesAPIError(t *testing.T) {

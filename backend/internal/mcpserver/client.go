@@ -15,6 +15,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/digest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 )
 
@@ -4847,6 +4848,61 @@ func (c *apiClient) PersistReleaseNotes(ctx context.Context, repo, from, to, sta
 	}
 	var res ReleaseNotesPersistResult
 	if err := c.do(ctx, http.MethodPost, "/v0/releases/notes", body, &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
+// GetDigest reads the caller's "since you last looked" digest via
+// GET /v0/digest?repo=&section=&from_sequence=&to_sequence= (E75.6 / #3734).
+// section and the two sequences are optional and sent only when set (the
+// backend defaults the window to the caller's watermark + 1 .. chain head).
+// The body is the shared digest.Digest wire model, already bounded
+// server-side at digest.DefaultByteBudget. 4xx/5xx surfaces as *apiError:
+//   - 400 validation_failed / to_sequence_beyond_chain_head (names the head)
+//   - 401 authentication_required / 403 insufficient_scope (needs read:audit)
+//   - 501 digest_unconfigured
+func (c *apiClient) GetDigest(ctx context.Context, repo, section string, fromSequence, toSequence int64) (*digest.Digest, error) {
+	q := url.Values{}
+	q.Set("repo", repo)
+	if section != "" {
+		q.Set("section", section)
+	}
+	if fromSequence > 0 {
+		q.Set("from_sequence", strconv.FormatInt(fromSequence, 10))
+	}
+	if toSequence > 0 {
+		q.Set("to_sequence", strconv.FormatInt(toSequence, 10))
+	}
+	var d digest.Digest
+	if err := c.do(ctx, http.MethodGet, "/v0/digest?"+q.Encode(), nil, &d); err != nil {
+		return nil, err
+	}
+	return &d, nil
+}
+
+// digestMarkReadRequest is the POST /v0/digest/mark-read body.
+type digestMarkReadRequest struct {
+	Repo       string `json:"repo"`
+	ToSequence int64  `json:"to_sequence"`
+}
+
+// MarkDigestRead advances the caller's read watermark for repo to toSequence
+// via POST /v0/digest/mark-read (E75.6 / #3734). The backend appends the
+// digest_marked_read audit entry BEFORE moving the watermark; a toSequence at
+// or below the watermark is a 200 no-op with advanced=false. 4xx/5xx
+// surfaces as *apiError:
+//   - 400 validation_failed / to_sequence_beyond_chain_head (names the head)
+//   - 401 authentication_required / 403 insufficient_scope (needs
+//     write:approvals)
+//   - 501 digest_unconfigured
+func (c *apiClient) MarkDigestRead(ctx context.Context, repo string, toSequence int64) (*DigestMarkReadResult, error) {
+	body, err := json.Marshal(digestMarkReadRequest{Repo: repo, ToSequence: toSequence})
+	if err != nil {
+		return nil, fmt.Errorf("marshal digest mark-read: %w", err)
+	}
+	var res DigestMarkReadResult
+	if err := c.do(ctx, http.MethodPost, "/v0/digest/mark-read", body, &res); err != nil {
 		return nil, err
 	}
 	return &res, nil
