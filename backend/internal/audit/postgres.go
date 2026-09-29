@@ -289,73 +289,98 @@ func globalChainLockKey(accountID *uuid.UUID) int64 {
 // commits, exactly mirroring the per-run SELECT FOR UPDATE
 // serialization. Appends to different partitions run in parallel. The
 // xact-scoped lock releases automatically on commit or rollback.
+//
+// It is a thin pgx.BeginFunc wrapper delegating to
+// AppendGlobalChainedTx, exactly as AppendChained wraps AppendChainedTx;
+// the lock/hash/insert logic lives there so a caller can fold the
+// append into its OWN transaction (the captain store's
+// read-derive-validate-append, #3765) without duplicating it. Behavior
+// is unchanged for all existing callers.
 func (r *postgresRepo) AppendGlobalChained(ctx context.Context, p GlobalChainAppendParams) (*Entry, error) {
 	var result *Entry
 	err := pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", globalChainLockKey(p.AccountID)); err != nil {
-			return fmt.Errorf("audit: acquire global-chain partition lock: %w", err)
-		}
-
-		aq := auditdb.New(tx)
-		var prev *string
-		var last auditdb.AuditEntry
-		var err error
-		if p.AccountID != nil {
-			last, err = aq.GetLastGlobalAuditEntryForAccount(ctx, p.AccountID)
-		} else {
-			last, err = aq.GetLastGlobalAuditEntryUntenanted(ctx)
-		}
-		switch {
-		case err == nil:
-			prev = &last.EntryHash
-		case errors.Is(err, pgx.ErrNoRows):
-			// Genesis entry of this partition's chain.
-		default:
-			return fmt.Errorf("audit: read last global entry: %w", err)
-		}
-
-		hash, err := ComputeEntryHash(HashInputs{
-			RunID:        nil,
-			StageID:      nil,
-			Timestamp:    p.Timestamp,
-			Category:     p.Category,
-			ActorKind:    p.ActorKind,
-			ActorSubject: p.ActorSubject,
-			Payload:      p.Payload,
-			PrevHash:     prev,
-		})
+		entry, err := AppendGlobalChainedTx(ctx, tx, p)
 		if err != nil {
 			return err
 		}
-
-		var actorKind *string
-		if p.ActorKind != nil {
-			s := string(*p.ActorKind)
-			actorKind = &s
-		}
-		row, err := aq.AppendAuditEntry(ctx, auditdb.AppendAuditEntryParams{
-			ID:           uuid.New(),
-			RunID:        nil,
-			StageID:      nil,
-			Ts:           pgtype.Timestamptz{Time: p.Timestamp, Valid: true},
-			Category:     p.Category,
-			ActorKind:    actorKind,
-			ActorSubject: p.ActorSubject,
-			Payload:      []byte(p.Payload),
-			PrevHash:     prev,
-			EntryHash:    hash,
-			AccountID:    p.AccountID,
-		})
-		if err != nil {
-			return fmt.Errorf("audit: append global: %w", err)
-		}
-		result = rowToEntry(row)
+		result = entry
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
 	return result, nil
+}
+
+// AppendGlobalChainedTx is the transaction-aware core of
+// AppendGlobalChained: it performs the run-less chained append against
+// the caller-supplied tx (pg_advisory_xact_lock on the partition's
+// globalChainLockKey, read the partition's last entry,
+// ComputeEntryHash, insert). The caller owns the transaction
+// lifecycle, so the append commits or rolls back with whatever else
+// the caller did in that tx, and the xact-scoped partition lock is
+// held until the caller's commit/rollback — never released early. The
+// hashing path is identical to AppendGlobalChained, so persisted
+// entries are byte-identical (#3765).
+func AppendGlobalChainedTx(ctx context.Context, tx pgx.Tx, p GlobalChainAppendParams) (*Entry, error) {
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", globalChainLockKey(p.AccountID)); err != nil {
+		return nil, fmt.Errorf("audit: acquire global-chain partition lock: %w", err)
+	}
+
+	aq := auditdb.New(tx)
+	var prev *string
+	var last auditdb.AuditEntry
+	var err error
+	if p.AccountID != nil {
+		last, err = aq.GetLastGlobalAuditEntryForAccount(ctx, p.AccountID)
+	} else {
+		last, err = aq.GetLastGlobalAuditEntryUntenanted(ctx)
+	}
+	switch {
+	case err == nil:
+		prev = &last.EntryHash
+	case errors.Is(err, pgx.ErrNoRows):
+		// Genesis entry of this partition's chain.
+	default:
+		return nil, fmt.Errorf("audit: read last global entry: %w", err)
+	}
+
+	hash, err := ComputeEntryHash(HashInputs{
+		RunID:        nil,
+		StageID:      nil,
+		Timestamp:    p.Timestamp,
+		Category:     p.Category,
+		ActorKind:    p.ActorKind,
+		ActorSubject: p.ActorSubject,
+		Payload:      p.Payload,
+		PrevHash:     prev,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	var actorKind *string
+	if p.ActorKind != nil {
+		s := string(*p.ActorKind)
+		actorKind = &s
+	}
+	row, err := aq.AppendAuditEntry(ctx, auditdb.AppendAuditEntryParams{
+		ID:           uuid.New(),
+		RunID:        nil,
+		StageID:      nil,
+		Ts:           pgtype.Timestamptz{Time: p.Timestamp, Valid: true},
+		Category:     p.Category,
+		ActorKind:    actorKind,
+		ActorSubject: p.ActorSubject,
+		Payload:      []byte(p.Payload),
+		PrevHash:     prev,
+		EntryHash:    hash,
+		AccountID:    p.AccountID,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("audit: append global: %w", err)
+	}
+	return rowToEntry(row), nil
 }
 
 // AppendChained writes an entry inside a transaction that holds a
