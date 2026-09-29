@@ -73,6 +73,10 @@ type Params struct {
 	ActorIsDelegated bool
 	// Successor is the offer's named successor (Offer only).
 	Successor string
+	// Brief is the handover brief the offer records (Offer only); it is
+	// copied onto the event verbatim — composing it is the caller's job,
+	// because composition does I/O and a transition is pure.
+	Brief OfferBrief
 	// Predicate and PredicateBasis are the claim's resolved predicate (Claim
 	// only). PredicateBasis names WHY, e.g. "min_permission:admin",
 	// "trivial:any-non-agent-token-holder", "undeterminable:spec_unparseable".
@@ -115,6 +119,7 @@ func Offer(s State, p Params) (Event, error) {
 		IdentityVerified:          IdentityVerified(p.Actor),
 		Successor:                 p.Successor,
 		SuccessorIdentityVerified: IdentityVerified(p.Successor),
+		Brief:                     p.Brief,
 	}, nil
 }
 

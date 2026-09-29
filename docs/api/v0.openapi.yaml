@@ -7489,6 +7489,178 @@ components:
             `to_sequence` (an entry was appended, but the watermark did not move
             for this call).
 
+    HandoverBrief:
+      type: object
+      description: >-
+        GET /v0/handover-brief body (E76.4 / #3767, ADR-083 #3751). Composed by
+        `handoverbrief.Compose` from existing readers, bounded by
+        `handoverbrief.Bound`. A POINT-IN-TIME composition: `brief_hash`
+        commits to what was composed at that moment; live sections (parked
+        gates, campaigns, runs) may differ on a later read.
+      required: [repo, window, sections, absent, gaps, degradations, gaps_truncated, gaps_omitted_count, brief_hash, truncated]
+      properties:
+        repo: { type: string }
+        captain_subject: { type: string, description: The current captain (omitted when the seat is vacant). }
+        successor: { type: string, description: "The pending offer's successor, when one is pending." }
+        window: { $ref: '#/components/schemas/HandoverBriefWindow' }
+        section:
+          type: string
+          description: Echoes a `?section=` selector.
+        sections:
+          type: array
+          items: { $ref: '#/components/schemas/HandoverBriefSection' }
+        absent:
+          type: array
+          description: >-
+            Sections with no source on main, declared rather than emitted empty:
+            `charter_revision` (#3242), `adr_index` (E78), `doctrine_changes` (#3733).
+          items:
+            type: object
+            required: [section, reason, anchor]
+            properties:
+              section: { type: string }
+              reason: { type: string }
+              anchor: { type: string }
+        gaps:
+          type: array
+          items: { $ref: '#/components/schemas/DigestGap' }
+        degradations:
+          type: array
+          description: >-
+            Independently degraded contributions. A degradation never fails the
+            brief: `digest_section_failed`, `campaign_store_unconfigured`,
+            `run_store_unconfigured`, `campaign_read_failed`, `run_read_failed`,
+            `delegation_unavailable`, `scan_limit` (plus the digest's own kinds).
+          items:
+            type: object
+            required: [kind]
+            properties:
+              kind: { type: string }
+              section: { type: string }
+              part: { type: string }
+              sequence: { type: integer, format: int64 }
+              detail: { type: string }
+        gaps_truncated: { type: boolean }
+        gaps_omitted_count: { type: integer }
+        gaps_next: { $ref: '#/components/schemas/HandoverBriefCursor' }
+        uncited_next: { $ref: '#/components/schemas/HandoverBriefCursor' }
+        brief_hash:
+          type: string
+          description: >-
+            hex(sha256) of the CANONICAL form — the full, unbounded composition
+            with `brief_hash`, `section` and every truncation/bounding field
+            zeroed. Every render, bounded or section-selected, carries the SAME
+            hash; a bounded render is never re-hashed. The value an offer
+            records as `brief_hash`.
+        truncated: { type: boolean }
+        next: { $ref: '#/components/schemas/HandoverBriefCursor' }
+    HandoverBriefWindow:
+      type: object
+      required: [from_sequence, to_sequence, chain_head, basis]
+      properties:
+        from_sequence:
+          type: integer
+          format: int64
+          description: Inclusive start — the last `captain_assigned` sequence + 1, or 1 for a first captain.
+        to_sequence: { type: integer, format: int64, description: Inclusive end (default the chain head). }
+        chain_head: { type: integer, format: int64 }
+        basis: { type: string, enum: [since_last_handover, first_captain, requested] }
+        assigned_sequence: { type: integer, format: int64 }
+        assigned_entry_hash: { type: string }
+    HandoverBriefSection:
+      type: object
+      required: [kind, parts]
+      properties:
+        kind:
+          type: string
+          enum: [what_changed, needs_decision, in_flight, delegation_in_force, standing_orders]
+        parts:
+          type: array
+          items: { $ref: '#/components/schemas/HandoverBriefPart' }
+        standing_orders:
+          type: object
+          description: The spec in force (standing_orders only).
+          required: [source, schema_major, delegation_content_hash]
+          properties:
+            source: { type: string }
+            ref: { type: string }
+            workflow_sha: { type: string }
+            spec_version: { type: string }
+            schema_major: { type: integer }
+            delegation_content_hash: { type: string }
+        unavailable: { type: boolean, description: True when every part is unavailable. }
+    HandoverBriefPart:
+      type: object
+      description: >-
+        One underlying read inside a section. `merges` / `waivers_and_deferrals`
+        / `unanswered_pages` / `open_decisions` carry digest `items` (each citing
+        its chain entry); `campaigns` / `runs` carry `in_flight`; `workflows`
+        carries delegation entries whose `confirmation` is `unavailable` until
+        E76.5 (#3768).
+      required: [kind, complete, truncated, omitted_count]
+      properties:
+        kind:
+          type: string
+          enum: [merges, waivers_and_deferrals, unanswered_pages, open_decisions, campaigns, runs, workflows]
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/DigestItem' }
+        in_flight:
+          type: array
+          items:
+            type: object
+            required: [kind, id, state, created_at]
+            properties:
+              kind: { type: string, enum: [campaign, run] }
+              id: { type: string, format: uuid }
+              state: { type: string }
+              ref: { type: string }
+              workflow_id: { type: string }
+              created_at: { type: string, format: date-time }
+              fields_truncated: { type: boolean }
+        workflows:
+          type: array
+          items:
+            type: object
+            required: [workflow_id, content_hash, confirmation]
+            properties:
+              workflow_id: { type: string }
+              autonomy: { type: string }
+              must_page_human:
+                type: array
+                items: { type: string }
+              escalations:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    match: { type: object, additionalProperties: true }
+                    max_autonomy: { type: string }
+              content_hash: { type: string }
+              confirmation: { type: string, enum: [unavailable] }
+              fields_truncated: { type: boolean }
+        unavailable: { type: boolean }
+        unavailable_reason: { type: string }
+        complete: { type: boolean }
+        truncated: { type: boolean }
+        omitted_count: { type: integer }
+        next: { $ref: '#/components/schemas/HandoverBriefCursor' }
+    HandoverBriefCursor:
+      type: object
+      description: The exact UNDERLYING query that retrieves an elided remainder.
+      required: [part, call]
+      properties:
+        part: { type: string }
+        call:
+          type: string
+          description: >-
+            e.g. `GET /v0/digest?from_sequence=…&repo=…&section=…&to_sequence=…`,
+            `GET /v0/campaigns?cursor=…&repo=…&state=…`, `GET /v0/runs?…`, or
+            `GET /v0/repos/{owner}/{name}/delegation`.
+        from_sequence: { type: integer, format: int64 }
+        to_sequence: { type: integer, format: int64 }
+        offset: { type: integer }
+
     CaptainRecord:
       type: object
       description: >-
@@ -7525,6 +7697,23 @@ components:
           description: The `captain_handover_offered` entry's `entry_hash` — the offer's identity.
         offered_sequence: { type: integer, format: int64 }
         offered_at: { type: string, format: date-time }
+        brief_hash:
+          type: string
+          description: >-
+            The `brief_hash` of the canonical handover brief composed for this
+            offer (E76.4 / #3767) — what the successor was shown. Omitted when
+            `brief_unavailable` is true, and for an offer written before E76.4.
+        brief_from_sequence: { type: integer, format: int64, description: The recorded brief's inclusive window start. }
+        brief_to_sequence: { type: integer, format: int64, description: The recorded brief's inclusive window end. }
+        brief_unavailable:
+          type: boolean
+          description: >-
+            True when the brief could not be established at all (captain record
+            or window read failed, or a required collaborator is unwired). The
+            offer still commits. A section degradation is NOT unavailability.
+        brief_unavailable_reason:
+          type: string
+          enum: [dependency_unconfigured, captain_record_read_failed, window_read_failed, compose_failed]
 
     CaptainHistoryItem:
       type: object
@@ -7544,7 +7733,10 @@ components:
             The entry payload: `repo`, `subject`, `identity_verified`, and per
             category `successor`, `successor_identity_verified`,
             `offer_entry_hash`, `previous_captain`, `claim_verified`,
-            `predicate_basis`, `page_pending`.
+            `predicate_basis`, `page_pending`; `captain_handover_offered`
+            also carries `brief_hash` + `brief_from_sequence` +
+            `brief_to_sequence`, or `brief_unavailable` +
+            `brief_unavailable_reason` (E76.4 / #3767).
 
     CaptainResponse:
       type: object
@@ -13424,6 +13616,113 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
+  /v0/handover-brief:
+    get:
+      operationId: getHandoverBrief
+      summary: Handover brief for one repository
+      description: |
+        E76.4 / #3767 (ADR-083 #3751, ADR-082 #3728 rule 7). Everything an
+        incoming captain needs since the last handover, every item cited.
+        Composed on demand from EXISTING readers — nothing is re-derived:
+        `what_changed` (digest merges + waivers/deferrals over the window),
+        `needs_decision` (unanswered digest pages over the window + every
+        currently parked gate), `in_flight` (non-terminal campaigns and runs),
+        `delegation_in_force` and `standing_orders` (the delegation view
+        projected from the spec cached on the repository's newest run, with
+        `confirmation: unavailable` until E76.5 #3768). `charter_revision`,
+        `adr_index` and `doctrine_changes` have no source on main and are
+        listed in `absent`.
+
+        **Window.** Starts after the last `captain_assigned` entry of the
+        captain record (basis `since_last_handover`), or at chain sequence 1
+        (basis `first_captain`); ends at the repository's chain head.
+        `from_sequence` / `to_sequence` override it (basis `requested`).
+
+        **Failure vs degradation.** A section read error is a DEGRADATION: the
+        part is marked `unavailable`, a named entry is appended to
+        `degradations`, and the brief still composes with a `brief_hash`. Only
+        a failure to establish the brief (captain record or window read) is
+        503 `handover_brief_unavailable`.
+
+        **One hash, one bound.** `brief_hash` is the hash of the canonical,
+        unbounded composition; this bounded render (32768 serialized bytes,
+        `handoverbrief.Bound`) and the `fishhawk_handover_brief` MCP tool carry
+        the same hash plus their own truncation markers. `POST
+        /v0/captain/offer` records it on the offer. The brief is a
+        point-in-time composition; a later read may differ.
+
+        **Never writes.** No audit entry, no watermark movement.
+
+        **Auth.** A token must hold `read:audit`; cookie-session operators are
+        not scope-checked. A non-admin cookie-session caller must be able to
+        read the repository at the forge (ADR-057 Amendment A2 / #2071).
+        Long-form contract: `backend/internal/handoverbrief/README.md`.
+      tags: [audit]
+      parameters:
+        - name: repo
+          in: query
+          required: true
+          description: Repository as `owner/name`.
+          schema: { type: string }
+        - name: section
+          in: query
+          description: Restrict to one section; `brief_hash` stays the whole brief's.
+          schema:
+            type: string
+            enum: [what_changed, needs_decision, in_flight, delegation_in_force, standing_orders]
+        - name: from_sequence
+          in: query
+          description: Inclusive lower chain position. 0 or absent = derived from the captain record.
+          schema: { type: integer, format: int64, minimum: 0 }
+        - name: to_sequence
+          in: query
+          description: Inclusive upper chain position. 0 or absent = the repository's chain head.
+          schema: { type: integer, format: int64, minimum: 0 }
+      responses:
+        '200':
+          description: The bounded brief.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HandoverBrief' }
+        '400':
+          description: |
+            `validation_failed` — `repo` missing, an unknown `section`, a
+            sequence that is not a non-negative integer (`details.field` names
+            it), or a `to_sequence` above the chain head.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            `insufficient_scope` — the token lacks `read:audit`; or
+            `repo_forbidden` — the caller cannot read the repository.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: '`internal_error` — composing or bounding the brief failed.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '501':
+          description: |
+            `handover_brief_unconfigured` — a required collaborator is not
+            wired; the message names each of `digest_store`, `decision_index`,
+            `captain_store` that is missing.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            `handover_brief_unavailable` — the brief could not be established
+            (`captain_record_read_failed` or `window_read_failed`, named in the
+            message); or `service_unavailable` — repo visibility could not be
+            resolved (#2071).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
   /v0/captain:
     get:
       operationId: getCaptain
@@ -13483,6 +13782,16 @@ paths:
       description: |
         The sitting captain offers the seat to `successor` (a later offer
         replaces a pending one).
+
+        **Handover brief (E76.4 / #3767).** Before the append the handover
+        brief (`GET /v0/handover-brief`) is composed for this successor and
+        its `brief_hash` + window are recorded on the entry. A section read
+        error only degrades the brief (it still hashes). When the brief cannot
+        be established at all the offer STILL commits, recording
+        `brief_unavailable` + `brief_unavailable_reason` and no hash — refusing
+        a handover over a read-only projection would strand the seat. The
+        brief is composed outside the captain lock, so the hash describes what
+        was composed at (or just before) the offer's own sequence.
 
         Appends exactly one global-chain entry inside ONE advisory-locked
         transaction (read -> derive -> validate -> append); a refusal appends

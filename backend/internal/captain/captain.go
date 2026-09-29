@@ -65,7 +65,8 @@ const (
 // the claimant) and IdentityVerified is Subject's provider qualification.
 // ClaimVerified is set only on a claim: true when a non-trivial repo predicate
 // was checked and satisfied, false when the predicate was positively trivial —
-// it is deliberately SEPARATE from IdentityVerified.
+// it is deliberately SEPARATE from IdentityVerified. Brief is set only on an
+// offer: the handover brief the successor was shown (E76.4 / #3767).
 type Event struct {
 	Kind                      string
 	Repo                      string
@@ -78,6 +79,23 @@ type Event struct {
 	ClaimVerified             *bool
 	PredicateBasis            string
 	PagePending               bool
+	Brief                     OfferBrief
+}
+
+// OfferBrief is the handover brief an offer records (E76.4 / #3767): the
+// brief_hash of the canonical, unbounded brief composed for the offer and
+// the window (from/to chain sequence) it covered — or, when the brief could
+// not be established at all (captain record or window read failure),
+// Unavailable with a machine-readable UnavailableReason and an EMPTY Hash.
+// A section degradation is NOT unavailability: that brief still has a hash.
+// The brief is a point-in-time composition: the hash commits to what was
+// composed at offer time, and a later read may differ.
+type OfferBrief struct {
+	Hash              string
+	FromSequence      int64
+	ToSequence        int64
+	Unavailable       bool
+	UnavailableReason string
 }
 
 // payload is the snake_case wire shape of an Event, and the decode target
@@ -93,6 +111,12 @@ type payload struct {
 	ClaimVerified             *bool  `json:"claim_verified,omitempty"`
 	PredicateBasis            string `json:"predicate_basis,omitempty"`
 	PagePending               bool   `json:"page_pending,omitempty"`
+	// The five brief keys are emitted only on captain_handover_offered.
+	BriefHash              string `json:"brief_hash,omitempty"`
+	BriefFromSequence      int64  `json:"brief_from_sequence,omitempty"`
+	BriefToSequence        int64  `json:"brief_to_sequence,omitempty"`
+	BriefUnavailable       bool   `json:"brief_unavailable,omitempty"`
+	BriefUnavailableReason string `json:"brief_unavailable_reason,omitempty"`
 }
 
 // Payload renders the event as the JSON stored on its chain entry. It refuses
@@ -119,6 +143,11 @@ func (e Event) Payload() (json.RawMessage, error) {
 	if e.Kind == CategoryHandoverOffered {
 		v := e.SuccessorIdentityVerified
 		p.SuccessorIdentityVerified = &v
+		p.BriefHash = e.Brief.Hash
+		p.BriefFromSequence = e.Brief.FromSequence
+		p.BriefToSequence = e.Brief.ToSequence
+		p.BriefUnavailable = e.Brief.Unavailable
+		p.BriefUnavailableReason = e.Brief.UnavailableReason
 	}
 	b, err := json.Marshal(p)
 	if err != nil {
@@ -151,7 +180,8 @@ type Record struct {
 
 // HandoverOffer is the derived pending handover offer. EntryHash is the
 // captain_handover_offered entry's entry_hash — the offer's identity, which a
-// withdraw or accept names as offer_entry_hash.
+// withdraw or accept names as offer_entry_hash. Brief is the handover brief
+// the offer recorded (zero for an offer written before E76.4).
 type HandoverOffer struct {
 	Successor                 string
 	SuccessorIdentityVerified bool
@@ -159,6 +189,7 @@ type HandoverOffer struct {
 	EntryHash                 string
 	Sequence                  int64
 	OfferedAt                 time.Time
+	Brief                     OfferBrief
 }
 
 // State is the fold of a repository's captain chain. LastCaptain is the most
@@ -201,6 +232,13 @@ func Derive(repo string, entries []ChainEntry) State {
 				EntryHash:                 e.EntryHash,
 				Sequence:                  e.Sequence,
 				OfferedAt:                 e.Timestamp,
+				Brief: OfferBrief{
+					Hash:              p.BriefHash,
+					FromSequence:      p.BriefFromSequence,
+					ToSequence:        p.BriefToSequence,
+					Unavailable:       p.BriefUnavailable,
+					UnavailableReason: p.BriefUnavailableReason,
+				},
 			}
 		case CategoryHandoverWithdrawn:
 			if st.PendingOffer == nil || st.PendingOffer.EntryHash != p.OfferEntryHash {

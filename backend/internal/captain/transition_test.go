@@ -327,3 +327,44 @@ func TestTransition_FirstClaimHasNoPreviousCaptain(t *testing.T) {
 		t.Errorf("page_pending = %v, want true", m["page_pending"])
 	}
 }
+
+// TestTransition_OfferCarriesBrief: Offer copies the caller-composed brief
+// onto the event verbatim, and the payload records hash + window.
+func TestTransition_OfferCarriesBrief(t *testing.T) {
+	p := params("github:alice")
+	p.Successor = "github:carol"
+	p.Brief = OfferBrief{Hash: "deadbeef", FromSequence: 3, ToSequence: 11}
+	ev, err := Offer(held("github:alice"), p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ev.Brief != p.Brief {
+		t.Errorf("event brief = %+v, want %+v", ev.Brief, p.Brief)
+	}
+	m := payloadMap(t, ev)
+	if m["brief_hash"] != "deadbeef" || m["brief_from_sequence"] != float64(3) || m["brief_to_sequence"] != float64(11) {
+		t.Errorf("offer payload = %v", m)
+	}
+	if _, ok := m["brief_unavailable"]; ok {
+		t.Errorf("a hashed brief must not record brief_unavailable: %v", m)
+	}
+}
+
+// TestTransition_OfferRecordsBriefUnavailable: an unavailable brief is
+// recorded as a marker with its reason and NO hash.
+func TestTransition_OfferRecordsBriefUnavailable(t *testing.T) {
+	p := params("github:alice")
+	p.Successor = "github:carol"
+	p.Brief = OfferBrief{Unavailable: true, UnavailableReason: "captain_record_read_failed"}
+	ev, err := Offer(held("github:alice"), p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := payloadMap(t, ev)
+	if m["brief_unavailable"] != true || m["brief_unavailable_reason"] != "captain_record_read_failed" {
+		t.Errorf("offer payload = %v", m)
+	}
+	if _, ok := m["brief_hash"]; ok {
+		t.Errorf("an unavailable brief must carry no brief_hash: %v", m)
+	}
+}

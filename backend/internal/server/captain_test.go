@@ -11,6 +11,8 @@ import (
 	"testing"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/captain"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/digest"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/handoverbrief"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/identity"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
@@ -324,5 +326,173 @@ func TestCaptainRoutes_Registered(t *testing.T) {
 		if w.Code != http.StatusUnauthorized {
 			t.Errorf("%s %s = %d, want 401 (route registered, auth gate reached)", c.method, c.path, w.Code)
 		}
+	}
+}
+
+// TestCaptainOffer_StampsCanonicalBriefHash (approval condition 1, end to
+// end): the committed captain_handover_offered payload carries the brief_hash
+// of the canonical, unbounded brief composed for that offer plus its window,
+// and a render bounded far below the brief's size — the Bound the MCP tool
+// re-applies at its session budget — reports the SAME hash; the REST route's
+// bounded render reports the canonical hash of its own composition, never a
+// re-hash of its bounded body.
+func TestCaptainOffer_StampsCanonicalBriefHash(t *testing.T) {
+	f := newBriefPG(t)
+	f.seedCaptain(t, "github:alice")
+	for i := 0; i < 4; i++ {
+		f.seedMerge(t)
+	}
+	ctx := context.Background()
+
+	// REST render at this chain state vs the canonical hash of the same
+	// composition (successor unset: no offer is pending yet).
+	restBefore := f.get(t, "")
+	canonBefore, err := handoverbrief.Compose(ctx, f.srv.handoverBriefDeps(ctx, briefPGRepo), handoverbrief.Request{Repo: briefPGRepo})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restBefore.BriefHash != canonBefore.BriefHash || restBefore.BriefHash != handoverbrief.Hash(canonBefore) {
+		t.Errorf("REST brief_hash = %q, want the canonical hash %q", restBefore.BriefHash, canonBefore.BriefHash)
+	}
+
+	// The canonical brief the offer composes: same chain state, same
+	// successor. Nothing writes between this compose and the POST.
+	canon, err := handoverbrief.Compose(ctx, f.srv.handoverBriefDeps(ctx, briefPGRepo),
+		handoverbrief.Request{Repo: briefPGRepo, Subject: "github:alice", Successor: "github:carol"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.offer(t, "github:alice", "github:carol")
+
+	p := f.offerPayload(t)
+	if p["brief_hash"] != canon.BriefHash || canon.BriefHash == "" {
+		t.Errorf("committed brief_hash = %v, want the canonical %q", p["brief_hash"], canon.BriefHash)
+	}
+	if p["brief_from_sequence"] != float64(canon.Window.FromSequence) || p["brief_to_sequence"] != float64(canon.Window.ToSequence) {
+		t.Errorf("committed window = %v..%v, want %d..%d", p["brief_from_sequence"], p["brief_to_sequence"], canon.Window.FromSequence, canon.Window.ToSequence)
+	}
+	if _, ok := p["brief_unavailable"]; ok {
+		t.Errorf("a composed brief must not record brief_unavailable: %v", p)
+	}
+
+	// Tighten the budget until Bound actually truncates (above its floor),
+	// so the hash check runs against a genuinely cut render.
+	full, _ := json.Marshal(canon)
+	var bounded handoverbrief.Brief
+	for budget := len(full) - 1; budget > 0; budget -= 16 {
+		b, err := handoverbrief.Bound(canon, budget)
+		if err != nil {
+			break
+		}
+		if b.Truncated {
+			bounded = b
+			break
+		}
+	}
+	if !bounded.Truncated {
+		t.Fatalf("no budget above the floor truncated the brief; the check would be vacuous")
+	}
+	if bounded.BriefHash != p["brief_hash"] {
+		t.Errorf("bounded render brief_hash = %q, want the committed %v", bounded.BriefHash, p["brief_hash"])
+	}
+
+	// The derived pending offer surfaces the recorded brief.
+	w := serveCaptain(t, f.srv, http.MethodGet, "/v0/captain?repo="+briefPGRepo, "", &Identity{Subject: "github:reader"})
+	var rec captainResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &rec); err != nil || rec.PendingOffer == nil {
+		t.Fatalf("GET /v0/captain = %d %s", w.Code, w.Body.String())
+	}
+	if rec.PendingOffer.BriefHash != canon.BriefHash || rec.PendingOffer.BriefToSequence != canon.Window.ToSequence {
+		t.Errorf("pending_offer brief = %q..%d, want %q..%d", rec.PendingOffer.BriefHash, rec.PendingOffer.BriefToSequence, canon.BriefHash, canon.Window.ToSequence)
+	}
+}
+
+// TestCaptainOffer_FailOpenMarksBriefUnavailable (approval condition 2): a
+// reachable TOTAL failure — the brief's window (chain-head) read fails while
+// the captain store keeps working — still commits the offer, and the COMMITTED
+// payload records brief_unavailable with the reason and NO brief_hash. The
+// assertion reads the chain entry back rather than the response.
+func TestCaptainOffer_FailOpenMarksBriefUnavailable(t *testing.T) {
+	f := newBriefPG(t)
+	f.seedCaptain(t, "github:alice")
+	f.srv.cfg.DigestStore = digest.NewStore(failingDB{})
+	f.offer(t, "github:alice", "github:carol")
+	p := f.offerPayload(t)
+	if p["brief_unavailable"] != true || p["brief_unavailable_reason"] != handoverbrief.ReasonWindowReadFailed {
+		t.Errorf("committed payload = %v, want brief_unavailable with reason %s", p, handoverbrief.ReasonWindowReadFailed)
+	}
+	if _, ok := p["brief_hash"]; ok {
+		t.Errorf("an unavailable brief must carry no brief_hash: %v", p)
+	}
+	if p["successor"] != "github:carol" {
+		t.Errorf("the offer itself must still commit: %v", p)
+	}
+}
+
+// TestCaptainOffer_UnwiredDigestMarksDependencyUnconfigured: with no digest
+// store wired at all the offer still commits, recording
+// brief_unavailable/dependency_unconfigured — the captain verbs never depend
+// on the brief surface being configured.
+func TestCaptainOffer_UnwiredDigestMarksDependencyUnconfigured(t *testing.T) {
+	f := newBriefPG(t)
+	f.seedCaptain(t, "github:alice")
+	f.srv.cfg.DigestStore = nil
+	f.offer(t, "github:alice", "github:carol")
+	p := f.offerPayload(t)
+	if p["brief_unavailable"] != true || p["brief_unavailable_reason"] != handoverbrief.ReasonDependencyUnconfigured {
+		t.Errorf("committed payload = %v, want brief_unavailable/%s", p, handoverbrief.ReasonDependencyUnconfigured)
+	}
+}
+
+// TestCaptainOffer_DigestSectionErrorStillHashes (approval condition 2): a
+// SECTION read error (the decision index backing merges / waivers fails) is a
+// degradation — the brief composes with those parts marked unavailable, and
+// the offer still records a brief_hash, never brief_unavailable.
+func TestCaptainOffer_DigestSectionErrorStillHashes(t *testing.T) {
+	f := newBriefPG(t)
+	f.seedCaptain(t, "github:alice")
+	f.seedMerge(t)
+	f.srv.cfg.DigestIndex = failingIndex{}
+	ctx := context.Background()
+
+	b, err := handoverbrief.Compose(ctx, f.srv.handoverBriefDeps(ctx, briefPGRepo),
+		handoverbrief.Request{Repo: briefPGRepo, Subject: "github:alice", Successor: "github:carol"})
+	if err != nil {
+		t.Fatalf("a section error must not fail the brief: %v", err)
+	}
+	if m := briefPart(t, b, handoverbrief.SectionWhatChanged, handoverbrief.PartMerges); !m.Unavailable {
+		t.Errorf("merges part = %+v, want unavailable", m)
+	}
+	if !briefHasDegradation(b, handoverbrief.DegradationDigestSectionFailed) {
+		t.Errorf("degradations = %+v, want digest_section_failed", b.Degradations)
+	}
+
+	f.offer(t, "github:alice", "github:carol")
+	p := f.offerPayload(t)
+	if p["brief_hash"] != b.BriefHash || b.BriefHash == "" {
+		t.Errorf("committed brief_hash = %v, want the degraded brief's %q", p["brief_hash"], b.BriefHash)
+	}
+	if _, ok := p["brief_unavailable"]; ok {
+		t.Errorf("a degraded brief is not unavailable: %v", p)
+	}
+}
+
+// TestCaptainVerbs_OnlyOfferRecordsABrief: withdraw, accept, relinquish and
+// claim never carry brief keys — the brief is composed on the offer path only.
+func TestCaptainVerbs_OnlyOfferRecordsABrief(t *testing.T) {
+	f := newBriefPG(t)
+	f.seedCaptain(t, "github:alice")
+	f.offer(t, "github:alice", "github:carol")
+	w := serveCaptain(t, f.srv, http.MethodPost, "/v0/captain/accept", `{"repo":"`+briefPGRepo+`"}`, &Identity{Subject: "github:carol"})
+	if w.Code != http.StatusOK {
+		t.Fatalf("accept = %d:\n%s", w.Code, w.Body.String())
+	}
+	var raw []byte
+	if err := f.pool.QueryRow(context.Background(), `SELECT payload FROM audit_entries
+		WHERE run_id IS NULL AND category = 'captain_assigned' ORDER BY sequence DESC LIMIT 1`).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "brief_") {
+		t.Errorf("captain_assigned payload carries brief keys: %s", raw)
 	}
 }
