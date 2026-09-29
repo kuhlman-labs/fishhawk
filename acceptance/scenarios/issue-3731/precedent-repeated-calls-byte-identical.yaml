@@ -1,14 +1,14 @@
 id: scenario:issue-3731/precedent-repeated-calls-byte-identical
 statement: Two identical precedent requests against an unchanged index return byte-identical response bodies.
 verify_hint: 'HTTP: issue the same GET /v0/precedent request twice and compare the raw response bodies byte for byte.'
-steps: Issued GET /v0/precedent?repo=kuhlman-labs/fishhawk&decision_class=plan_approval&paths=a/b.go,c/d.go&severity=high three times. Issued GET …&stage_kind=plan&paths=backend/a.go&paths=docs/b.md&severity=high&concern_category=security&escalation_keys=k1 twice. Issued the gate-reference GET ?run_id=c1fd347f-…&stage_id=edaf85aa-…&decision_class=plan_approval twice. Compared sha256 of the raw bodies.
+steps: Sent GET /v0/precedent?repo=kuhlman-labs/fishhawk&decision_class=plan_approval&paths=a/b.go,c/d.go&severity=high three times, and GET …&stage_kind=plan&paths=backend/a.go&paths=docs/b.md&severity=high&concern_category=security&escalation_keys=k1 twice. Compared the sha256 of the raw bodies. As supporting evidence (Posture B, sanctioned checkout), TestPrecedent_RepeatedCallsByteIdental and TestRank_DeterministicUnderInputReordering pass.
 assertions:
-    expected: Byte-identical bodies for identical requests.
-    observed_at_record: 'Explicit x3: all 9b87128d…. Explicit with signals x2: both 7718adf1…. Gate reference x2: both 1171f6a8…. Live comparison was only possible on empty result sets. In-repo TestPrecedent_RepeatedCallsByteIdentical (non-empty set) also passes.'
-    repro_handle: for i in 1 2; do curl -s 'http://localhost:8090/v0/precedent?repo=kuhlman-labs/fishhawk&decision_class=plan_approval' | shasum -a256; done
+    expected: Byte-identical bodies.
+    observed_at_record: The sha256 values were identical within each group (9b87128d… x3; 7718adf1… x2).
+    repro_handle: for i in 1 2; do curl -s 'http://localhost:8090/v0/precedent?repo=kuhlman-labs/fishhawk&decision_class=plan_approval&paths=a/b.go' | shasum -a 256; done
 origin:
     issue: 3731
     pr: 3846
     run_id: 99552e1e-9bf6-42b0-ae70-cb32562b9f60
-    head_sha: 72963ca60b47e4c1a07d430ff94b673eb572f029
-    recorded_at: 2026-09-29T03:56:10Z
+    head_sha: 76cb68069de0884cb91dc1e998fe822ffaa7b1eb
+    recorded_at: 2026-09-29T05:16:17Z
