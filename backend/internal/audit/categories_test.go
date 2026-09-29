@@ -531,3 +531,23 @@ func TestKnownCategories_DigestMarkedRead(t *testing.T) {
 		t.Fatal("digest_marked_read is not in KnownCategories; register it in categories.go")
 	}
 }
+
+// TestKnownCategories_CaptainRecord pins the E76.2 / #3765 captain-record
+// categories: backend/internal/captain's Store.Apply appends exactly one of
+// these GLOBAL-chain entries per accepted verb, and the current captain is
+// derived from them. Unregistered, categories_completeness_test.go's AST sweep
+// fails the build on the emit site and an operator could not arm
+// fishhawk_await_audit on a handover.
+func TestKnownCategories_CaptainRecord(t *testing.T) {
+	for _, c := range []string{
+		"captain_assigned",
+		"captain_claimed",
+		"captain_handover_offered",
+		"captain_handover_withdrawn",
+		"captain_relinquished",
+	} {
+		if !IsKnownCategory(c) {
+			t.Errorf("%s is not in KnownCategories; register it in categories.go", c)
+		}
+	}
+}

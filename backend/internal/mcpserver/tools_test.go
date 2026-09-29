@@ -3328,7 +3328,12 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	// over GET /v0/digest and POST /v0/digest/mark-read (the "since you last
 	// looked" digest against a per-captain read watermark) — taking the total
 	// 59 -> 60.
-	const wantToolCount = 61
+	//
+	// E76.2 (#3765) adds exactly ONE tool — fishhawk_captain, the thin wrapper
+	// over GET /v0/captain and the five POST /v0/captain/{offer,withdraw,
+	// accept,relinquish,claim} verbs (the ADR-083 captain record, agents
+	// structurally refused by the backend) — taking the total 61 -> 62 (E76.1 #3747 landed first and took it 60 -> 61).
+	const wantToolCount = 62
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",
@@ -3416,6 +3421,18 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	}
 	if !sawDigest {
 		t.Error("fishhawk_digest is not in the registered tool list — the since-you-last-looked digest is unreachable over MCP")
+	}
+	// fishhawk_captain (#3765) must be wire-visible by NAME, for the same
+	// reason as fishhawk_digest above.
+	var sawCaptain bool
+	for _, tool := range res.Tools {
+		if tool.Name == "fishhawk_captain" {
+			sawCaptain = true
+			break
+		}
+	}
+	if !sawCaptain {
+		t.Error("fishhawk_captain is not in the registered tool list — the captain record is unreachable over MCP")
 	}
 	if !sawConsolidate {
 		t.Error("fishhawk_consolidate_slices is not registered/visible over ListTools")

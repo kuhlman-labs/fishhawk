@@ -7489,6 +7489,123 @@ components:
             `to_sequence` (an entry was appended, but the watermark did not move
             for this call).
 
+    CaptainRecord:
+      type: object
+      description: >-
+        The current captain of a repository, derived from the global audit
+        chain (E76.2 / #3765, ADR-083 #3751). `claim_verified` is SEPARATE
+        from `identity_verified`.
+      required: [subject, identity_verified, claim_verified, basis, assigned_sequence, assigned_entry_hash, assigned_at]
+      properties:
+        subject: { type: string }
+        identity_verified:
+          type: boolean
+          description: True only for a provider-qualified subject (`github:` / `gitlab:`); a static token subject carries false.
+        claim_verified:
+          type: [boolean, "null"]
+          description: >-
+            Null for an assigned (handed-over) seat. On a claimed seat: true
+            when a non-trivial repository approval predicate was checked and
+            satisfied, false when the predicate was positively trivial.
+        basis: { type: string, enum: [assigned, claimed] }
+        assigned_sequence: { type: integer, format: int64 }
+        assigned_entry_hash: { type: string }
+        assigned_at: { type: string, format: date-time }
+
+    CaptainOffer:
+      type: object
+      description: A pending handover offer. `identity_verified` is the SUCCESSOR's provider qualification.
+      required: [successor, identity_verified, offered_by, offer_entry_hash, offered_sequence, offered_at]
+      properties:
+        successor: { type: string }
+        identity_verified: { type: boolean }
+        offered_by: { type: string }
+        offer_entry_hash:
+          type: string
+          description: The `captain_handover_offered` entry's `entry_hash` — the offer's identity.
+        offered_sequence: { type: integer, format: int64 }
+        offered_at: { type: string, format: date-time }
+
+    CaptainHistoryItem:
+      type: object
+      description: One captain-record chain entry.
+      required: [sequence, entry_hash, category, at, payload]
+      properties:
+        sequence: { type: integer, format: int64 }
+        entry_hash: { type: string }
+        category:
+          type: string
+          enum: [captain_handover_offered, captain_handover_withdrawn, captain_assigned, captain_relinquished, captain_claimed]
+        at: { type: string, format: date-time }
+        payload:
+          type: object
+          additionalProperties: true
+          description: >-
+            The entry payload: `repo`, `subject`, `identity_verified`, and per
+            category `successor`, `successor_identity_verified`,
+            `offer_entry_hash`, `previous_captain`, `claim_verified`,
+            `predicate_basis`, `page_pending`.
+
+    CaptainResponse:
+      type: object
+      description: GET /v0/captain body (E76.2 / #3765).
+      required: [repo, captain, pending_offer, last_captain, history, history_total, skipped_entries]
+      properties:
+        repo: { type: string }
+        captain:
+          oneOf:
+            - $ref: '#/components/schemas/CaptainRecord'
+            - type: "null"
+          description: Null when the seat is vacant.
+        pending_offer:
+          oneOf:
+            - $ref: '#/components/schemas/CaptainOffer'
+            - type: "null"
+        last_captain:
+          type: [string, "null"]
+          description: The most recent captain to leave the seat — what a later claim records as `previous_captain`.
+        history:
+          type: array
+          description: The newest 50 captain entries, ascending.
+          items: { $ref: '#/components/schemas/CaptainHistoryItem' }
+        history_total:
+          type: integer
+          description: How many captain entries the chain holds for this repository.
+        skipped_entries:
+          type: integer
+          description: Entries the fold could not use (undecodable, another repo) — skipped, never guessed at.
+
+    CaptainVerbRequest:
+      type: object
+      additionalProperties: false
+      required: [repo]
+      properties:
+        repo: { type: string, description: Repository as `owner/name`. }
+        successor:
+          type: string
+          description: '`offer` only: the subject offered the seat. Refused (400) on every other verb.'
+        delegated:
+          type: boolean
+          description: >-
+            Opts into the ADR-040 delegated-action path — which every captain
+            verb REFUSES (403 `captain_agent_identity_refused`).
+
+    CaptainVerbResponse:
+      type: object
+      description: Every captain verb's 200 body — the appended event and the record re-derived with it.
+      required: [repo, event, captain, pending_offer]
+      properties:
+        repo: { type: string }
+        event: { $ref: '#/components/schemas/CaptainHistoryItem' }
+        captain:
+          oneOf:
+            - $ref: '#/components/schemas/CaptainRecord'
+            - type: "null"
+        pending_offer:
+          oneOf:
+            - $ref: '#/components/schemas/CaptainOffer'
+            - type: "null"
+
   responses:
     BadRequest:
       description: Request body or query parameters were invalid.
@@ -13303,6 +13420,357 @@ paths:
           description: |
             `digest_unconfigured` — no digest store, decision index or audit
             repository on this instance; the message names each missing one.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/captain:
+    get:
+      operationId: getCaptain
+      summary: The captain record for one repository
+      description: |
+        E76.2 / #3765 (ADR-083 #3751 rules 2-5). The current captain, any
+        pending handover offer, the last captain to leave the seat, and the
+        newest 50 captain chain entries — all DERIVED on every read from the
+        repository's run-less (global-chain) captain entries in the caller's
+        account partition. The chain is the sole authority: there is no derived
+        table. Retrieval never writes. `claim_verified` is rendered separately
+        from `identity_verified`. Nothing here is read by approval quorum or
+        eligibility. Long-form contract: `backend/internal/captain/README.md`.
+
+        **Auth.** A token must hold `read:audit`; cookie-session operators are
+        not scope-checked; a non-admin cookie-session caller must be able to
+        read the repository at the forge.
+      tags: [audit]
+      parameters:
+        - name: repo
+          in: query
+          required: true
+          description: Repository as `owner/name`.
+          schema: { type: string }
+      responses:
+        '200':
+          description: The derived captain record.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CaptainResponse' }
+        '400':
+          description: '`validation_failed` — `repo` missing.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: '`insufficient_scope` (lacks `read:audit`) or `repo_forbidden`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: '`internal_error` — the chain read failed.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '501':
+          description: '`captain_unconfigured` — no captain store on this instance.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/captain/offer:
+    post:
+      operationId: captainOffer
+      summary: Offer the captain seat to a named successor
+      description: |
+        The sitting captain offers the seat to `successor` (a later offer
+        replaces a pending one).
+
+        Appends exactly one global-chain entry inside ONE advisory-locked
+        transaction (read -> derive -> validate -> append); a refusal appends
+        nothing. **Auth.** The existing `write:approvals` scope; agent and
+        delegated identities are refused by the single domain guard.
+      tags: [audit]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CaptainVerbRequest' }
+      responses:
+        '200':
+          description: The appended event and the record after it.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CaptainVerbResponse' }
+        '400':
+          description: |
+            `validation_failed` — malformed body, unknown field, `repo` missing
+            or `successor` on a verb that does not take one.
+            `captain_successor_required` — no `successor`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            `insufficient_scope` (lacks `write:approvals`),
+            `captain_agent_identity_refused` (an agent or delegated identity), or `captain_not_captain` (the caller is not the sitting captain).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: |
+            `captain_no_captain` (the seat is vacant) or `captain_self_handover` (the successor is the caller).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: '`internal_error` — the chain read or append failed.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '501':
+          description: '`captain_unconfigured` — no captain store on this instance.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/captain/withdraw:
+    post:
+      operationId: captainWithdraw
+      summary: Withdraw a pending handover offer
+      description: |
+        The captain who made the pending offer withdraws it. `captain_not_offerer`
+        is the ONE withdraw-authorization check.
+
+        Appends exactly one global-chain entry inside ONE advisory-locked
+        transaction (read -> derive -> validate -> append); a refusal appends
+        nothing. **Auth.** The existing `write:approvals` scope; agent and
+        delegated identities are refused by the single domain guard.
+      tags: [audit]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CaptainVerbRequest' }
+      responses:
+        '200':
+          description: The appended event and the record after it.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CaptainVerbResponse' }
+        '400':
+          description: |
+            `validation_failed` — malformed body, unknown field, `repo` missing
+            or `successor` on a verb that does not take one.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            `insufficient_scope` (lacks `write:approvals`),
+            `captain_agent_identity_refused` (an agent or delegated identity), or `captain_not_offerer` (the caller did not make the offer).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: |
+            `captain_no_offer` — no handover offer is pending.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: '`internal_error` — the chain read or append failed.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '501':
+          description: '`captain_unconfigured` — no captain store on this instance.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/captain/accept:
+    post:
+      operationId: captainAccept
+      summary: Accept a pending handover offer
+      description: |
+        The named successor accepts and becomes captain; the entry records
+        `offer_entry_hash` and `previous_captain`.
+
+        Appends exactly one global-chain entry inside ONE advisory-locked
+        transaction (read -> derive -> validate -> append); a refusal appends
+        nothing. **Auth.** The existing `write:approvals` scope; agent and
+        delegated identities are refused by the single domain guard.
+      tags: [audit]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CaptainVerbRequest' }
+      responses:
+        '200':
+          description: The appended event and the record after it.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CaptainVerbResponse' }
+        '400':
+          description: |
+            `validation_failed` — malformed body, unknown field, `repo` missing
+            or `successor` on a verb that does not take one.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            `insufficient_scope` (lacks `write:approvals`),
+            `captain_agent_identity_refused` (an agent or delegated identity), or `captain_offer_successor_mismatch` (the offer names someone else).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: |
+            `captain_no_offer` — no handover offer is pending (e.g. it was withdrawn).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: '`internal_error` — the chain read or append failed.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '501':
+          description: '`captain_unconfigured` — no captain store on this instance.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/captain/relinquish:
+    post:
+      operationId: captainRelinquish
+      summary: Relinquish the captain seat
+      description: |
+        The sitting captain vacates the seat; the record then reports
+        `last_captain`.
+
+        Appends exactly one global-chain entry inside ONE advisory-locked
+        transaction (read -> derive -> validate -> append); a refusal appends
+        nothing. **Auth.** The existing `write:approvals` scope; agent and
+        delegated identities are refused by the single domain guard.
+      tags: [audit]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CaptainVerbRequest' }
+      responses:
+        '200':
+          description: The appended event and the record after it.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CaptainVerbResponse' }
+        '400':
+          description: |
+            `validation_failed` — malformed body, unknown field, `repo` missing
+            or `successor` on a verb that does not take one.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            `insufficient_scope` (lacks `write:approvals`),
+            `captain_agent_identity_refused` (an agent or delegated identity), or `captain_not_captain` (the caller is not the sitting captain).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: |
+            `captain_no_captain` — the seat is already vacant.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: '`internal_error` — the chain read or append failed.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '501':
+          description: '`captain_unconfigured` — no captain store on this instance.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/captain/claim:
+    post:
+      operationId: captainClaim
+      summary: Claim a vacant captain seat
+      description: |
+        A fallback claim of a VACANT seat, gated on the repository's approval
+        predicate: the spec cached on the repository's NEWEST run, folded
+        strictest-per-dimension across every approval gate (strictest
+        `min_permission`, union of `member_of`). A positively trivial predicate
+        (neither declared) admits the claim with `claim_verified: false`; a
+        non-trivial predicate the claimant satisfies admits it with
+        `claim_verified: true`. Every claim records `predicate_basis`,
+        `previous_captain` (when one exists — including after a relinquish) and
+        `page_pending: true` (the recorded obligation to page, delivered by
+        E77.6 #3740 / E60.3 #2292).
+
+        Appends exactly one global-chain entry inside ONE advisory-locked
+        transaction (read -> derive -> validate -> append); a refusal appends
+        nothing. **Auth.** The existing `write:approvals` scope; agent and
+        delegated identities are refused by the single domain guard.
+      tags: [audit]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CaptainVerbRequest' }
+      responses:
+        '200':
+          description: The appended event and the record after it.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CaptainVerbResponse' }
+        '400':
+          description: |
+            `validation_failed` — malformed body, unknown field, `repo` missing
+            or `successor` on a verb that does not take one.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            `insufficient_scope` (lacks `write:approvals`),
+            `captain_agent_identity_refused` (an agent or delegated identity), or `captain_predicate_rejected` (the claimant fails the non-trivial predicate).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: |
+            `captain_exists` — the seat is held.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: |
+            `captain_predicate_undeterminable` — the repository's approval
+            predicate could not be resolved (no run, no cached spec, an
+            unparseable spec, a legacy `approvers` gate, or an identity provider
+            that is unavailable/unconfigured); `details.predicate_basis` names
+            which. Fails CLOSED: an unreadable predicate is never trivial.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: '`internal_error` — the chain read or append failed.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '501':
+          description: '`captain_unconfigured` — no captain store on this instance.'
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

@@ -4910,6 +4910,57 @@ func (c *apiClient) MarkDigestRead(ctx context.Context, repo string, toSequence 
 	return &res, nil
 }
 
+// GetCaptain reads the captain record for repo via GET /v0/captain?repo=
+// (E76.2 / #3765). It never writes. 4xx/5xx surfaces as *apiError:
+//   - 400 validation_failed (repo missing)
+//   - 401 authentication_required / 403 insufficient_scope (needs
+//     read:audit) / 403 repo_forbidden
+//   - 500 internal_error
+//   - 501 captain_unconfigured
+func (c *apiClient) GetCaptain(ctx context.Context, repo string) (*CaptainState, error) {
+	q := url.Values{}
+	q.Set("repo", repo)
+	var st CaptainState
+	if err := c.do(ctx, http.MethodGet, "/v0/captain?"+q.Encode(), nil, &st); err != nil {
+		return nil, err
+	}
+	return &st, nil
+}
+
+// captainVerbRequest is every POST /v0/captain/{verb} body.
+type captainVerbRequest struct {
+	Repo      string `json:"repo"`
+	Successor string `json:"successor,omitempty"`
+}
+
+// PostCaptainVerb records one captain verb — offer, withdraw, accept,
+// relinquish or claim — via POST /v0/captain/{verb} (E76.2 / #3765).
+// successor is sent only for offer. Each verb appends exactly one chain
+// entry atomically; a refusal appends nothing. 4xx/5xx surfaces as
+// *apiError, one code per refusal mode:
+//   - 400 validation_failed / captain_successor_required
+//   - 401 authentication_required
+//   - 403 insufficient_scope (needs write:approvals) /
+//     captain_agent_identity_refused / captain_not_captain /
+//     captain_not_offerer / captain_offer_successor_mismatch /
+//     captain_predicate_rejected
+//   - 409 captain_no_captain / captain_no_offer / captain_exists /
+//     captain_self_handover
+//   - 422 captain_predicate_undeterminable
+//   - 500 internal_error
+//   - 501 captain_unconfigured
+func (c *apiClient) PostCaptainVerb(ctx context.Context, verb, repo, successor string) (*CaptainVerbResult, error) {
+	body, err := json.Marshal(captainVerbRequest{Repo: repo, Successor: successor})
+	if err != nil {
+		return nil, fmt.Errorf("marshal captain %s: %w", verb, err)
+	}
+	var res CaptainVerbResult
+	if err := c.do(ctx, http.MethodPost, "/v0/captain/"+url.PathEscape(verb), body, &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
 // getText performs a GET and returns the raw response body as a string. Unlike
 // do, it does NOT json-decode the body — used for the text/markdown
 // release-notes preview (E33.2), whose body is rendered markdown, not a JSON

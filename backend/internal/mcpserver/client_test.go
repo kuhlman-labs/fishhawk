@@ -3629,6 +3629,89 @@ func TestGetPrecedent_EncodesRepeatableParamsAndDecodesBody(t *testing.T) {
 	}
 }
 
+// TestGetCaptain_SendsRepoAndDecodes proves GetCaptain GETs /v0/captain?repo=
+// and decodes claim_verified separately from identity_verified (E76.2 /
+// #3765).
+func TestGetCaptain_SendsRepoAndDecodes(t *testing.T) {
+	var gotMethod, gotPath, gotQuery string
+	c := releaseTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		gotMethod, gotPath, gotQuery = r.Method, r.URL.Path, r.URL.RawQuery
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"repo":"x/y","captain":{"subject":"github:a","identity_verified":true,"claim_verified":false,"basis":"claimed","assigned_sequence":3,"assigned_entry_hash":"h3","assigned_at":"2026-09-01T00:00:00Z"},"pending_offer":null,"last_captain":"github:z","history":[],"history_total":3,"skipped_entries":0}`)
+	})
+	st, err := c.GetCaptain(context.Background(), "x/y")
+	if err != nil {
+		t.Fatalf("GetCaptain: %v", err)
+	}
+	if gotMethod != http.MethodGet || gotPath != "/v0/captain" || gotQuery != "repo=x%2Fy" {
+		t.Errorf("request = %s %s?%s, want GET /v0/captain?repo=x%%2Fy", gotMethod, gotPath, gotQuery)
+	}
+	if st.Captain == nil || !st.Captain.IdentityVerified || st.Captain.ClaimVerified == nil || *st.Captain.ClaimVerified ||
+		st.LastCaptain == nil || *st.LastCaptain != "github:z" || st.HistoryTotal != 3 {
+		t.Errorf("decoded state = %+v", st)
+	}
+}
+
+// TestPostCaptainVerb_PostsBodyAndDecodes proves PostCaptainVerb POSTs
+// {repo, successor} to /v0/captain/{verb}, omitting an empty successor.
+func TestPostCaptainVerb_PostsBodyAndDecodes(t *testing.T) {
+	var paths []string
+	var bodies []map[string]any
+	c := releaseTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.Method+" "+r.URL.Path)
+		var m map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&m)
+		bodies = append(bodies, m)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"repo":"x/y","event":{"sequence":4,"entry_hash":"h4","category":"captain_handover_offered","at":"2026-09-01T00:00:00Z","payload":{"repo":"x/y"}},"captain":null,"pending_offer":null}`)
+	})
+	res, err := c.PostCaptainVerb(context.Background(), "offer", "x/y", "github:b")
+	if err != nil {
+		t.Fatalf("PostCaptainVerb offer: %v", err)
+	}
+	if _, err := c.PostCaptainVerb(context.Background(), "claim", "x/y", ""); err != nil {
+		t.Fatalf("PostCaptainVerb claim: %v", err)
+	}
+	if paths[0] != "POST /v0/captain/offer" || bodies[0]["successor"] != "github:b" || bodies[0]["repo"] != "x/y" {
+		t.Errorf("offer request = %s %v", paths[0], bodies[0])
+	}
+	if _, has := bodies[1]["successor"]; paths[1] != "POST /v0/captain/claim" || has {
+		t.Errorf("claim request = %s %v, want no successor key", paths[1], bodies[1])
+	}
+	if res.Event.Sequence != 4 || res.Event.Category != "captain_handover_offered" {
+		t.Errorf("decoded result = %+v", res)
+	}
+}
+
+// TestCaptainClient_SurfacesAPIError proves both captain methods surface a
+// non-2xx as the typed *apiError carrying the backend's refusal code.
+func TestCaptainClient_SurfacesAPIError(t *testing.T) {
+	for _, tc := range []struct {
+		status int
+		code   string
+	}{
+		{http.StatusForbidden, "captain_agent_identity_refused"},
+		{http.StatusConflict, "captain_exists"},
+		{http.StatusUnprocessableEntity, "captain_predicate_undeterminable"},
+		{http.StatusNotImplemented, "captain_unconfigured"},
+	} {
+		c := releaseTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(tc.status)
+			_, _ = io.WriteString(w, `{"error":{"code":"`+tc.code+`","message":"refused"}}`)
+		})
+		_, err := c.PostCaptainVerb(context.Background(), "claim", "x/y", "")
+		var ae *apiError
+		if !errors.As(err, &ae) || ae.StatusCode != tc.status || ae.Code != tc.code {
+			t.Errorf("PostCaptainVerb err = %v, want *apiError %d %s", err, tc.status, tc.code)
+		}
+		_, err = c.GetCaptain(context.Background(), "x/y")
+		if !errors.As(err, &ae) || ae.Code != tc.code {
+			t.Errorf("GetCaptain err = %v, want *apiError %s", err, tc.code)
+		}
+	}
+}
+
 // TestGetRepoDelegation_EncodesParamsAndDecodesBody pins the apiClient half of
 // the E76.1 / #3747 wire contract against a real HTTP server: the repo goes into
 // the PATH (never a query parameter), ref / source / workflow onto the query

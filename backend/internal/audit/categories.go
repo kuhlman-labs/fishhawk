@@ -200,6 +200,15 @@ import "sort"
 // watermark moves, belongs to no run, is not decision-bearing, and is
 // deliberately NOT an issue-comment activity category (there is no run thread
 // to render it on).
+// E76.2 / #3765 (ADR-083 #3751) added the five captain-record categories —
+// captain_assigned, captain_claimed, captain_handover_offered,
+// captain_handover_withdrawn and captain_relinquished — written by
+// backend/internal/captain's Store.Apply via AppendGlobalChainedTx. They are
+// repo-keyed GLOBAL-chain entries (payload.repo) belonging to no run; the
+// current captain is DERIVED from them (captain.Derive), never stored. They
+// are not decision-bearing (decisionindex is untouched) and, like
+// digest_marked_read, are deliberately NOT issue-comment activity categories:
+// a handover is repo-scoped and has no run thread to render on.
 var KnownCategories = map[string]struct{}{
 	"acceptance_dispatched":                   {},
 	"acceptance_outcome_recorded":             {},
@@ -240,6 +249,11 @@ var KnownCategories = map[string]struct{}{
 	"campaign_issue_started":                  {},
 	"campaign_item_autonomy_refreshed":        {},
 	"campaign_paused":                         {},
+	"captain_assigned":                        {},
+	"captain_claimed":                         {},
+	"captain_handover_offered":                {},
+	"captain_handover_withdrawn":              {},
+	"captain_relinquished":                    {},
 	"child_pushed":                            {},
 	"conflict_resolution_pushed":              {},
 	"child_redriven":                          {},

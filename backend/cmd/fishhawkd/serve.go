@@ -36,6 +36,7 @@ import (
 	authpkg "github.com/kuhlman-labs/fishhawk/backend/internal/auth"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaigndriver"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/captain"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/childcompletion"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/claudecode"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/codex"
@@ -2418,6 +2419,10 @@ func runServe(args []string, logSink io.Writer) int {
 		// decision_index store newAuditRepository projects into.
 		cfg.DigestStore = digest.NewStore(pool)
 		cfg.DigestIndex = decisionindex.NewStore(pool)
+		// The E76.2 / #3765 captain record (GET /v0/captain + the five POST
+		// verbs): the chain is the sole authority, so the store needs only
+		// the pool — no derived table.
+		cfg.CaptainStore = captain.NewStore(pool)
 		cfg.ApprovalRepo = approval.NewPostgresRepository(pool)
 		cfg.ArtifactRepo = artifact.NewPostgresRepository(pool)
 		// GET /v0/precedent's read surface (E75.3 / #3731). The SAME store the

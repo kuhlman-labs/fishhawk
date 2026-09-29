@@ -254,6 +254,16 @@ var mcpToolScopes = map[string]mcpToolScopeRule{
 	// run-bound subject, so runBoundSubjectOK stays false.
 	"fishhawk_digest": {anyOf: []string{scopeDigestRead, scopeDigestMarkRead}},
 
+	// fishhawk_captain (E76.2 / #3765) dials SIX endpoints: action=read GETs
+	// /v0/captain (captain.go handleGetCaptain: requireWriteScope(
+	// scopeCaptainRead) = read:audit) and the five verbs POST
+	// /v0/captain/{offer,withdraw,accept,relinquish,claim}
+	// (handleCaptainVerb: requireWriteScope(scopeCaptainWrite) =
+	// write:approvals). Any-of across them; the inner REST call stays
+	// authoritative for the action invoked. A run-bound subject is an agent
+	// identity the captain record refuses, so runBoundSubjectOK stays false.
+	"fishhawk_captain": {anyOf: []string{scopeCaptainRead, scopeCaptainWrite}},
+
 	// --- refinement gate. draft_epic dials /v0/refinement/sessions and its
 	// siblings, every one behind requireWriteScope(scopeRefinementGate)
 	// (refinement.go, refinement_file.go).
