@@ -519,6 +519,15 @@ type fakeBackend struct {
 	precedentStatus    int
 	lastPrecedentQuery string
 
+	// Delegation fixtures: GET /v0/repos/{owner}/{name}/delegation
+	// (E76.1 / #3747). delegationResp drives the response body,
+	// delegationStatus the HTTP status (default 200), and lastDelegationPath
+	// records the raw path+query so a test can assert the repo went into the
+	// PATH and ref/source/workflow onto the query string.
+	delegationResp     RepoDelegationResult
+	delegationStatus   int
+	lastDelegationPath string
+
 	// Budget fixtures: GET /v0/runs/{run_id}/budget (#693).
 	// budgetByRun seeds the status per run; an unseeded run returns the
 	// empty object {} — mirroring the backend's no-budget 200.
@@ -669,6 +678,7 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 	t.Helper()
 	fb := &fakeBackend{
 		listStatus:                    http.StatusOK,
+		delegationStatus:              http.StatusOK,
 		getStatus:                     http.StatusOK,
 		stagesStatus:                  http.StatusOK,
 		artifactsStatus:               http.StatusOK,
@@ -1974,6 +1984,16 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		fb.lastPrecedentQuery = r.URL.RawQuery
 		status := fb.precedentStatus
 		resp := fb.precedentResp
+		fb.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_ = json.NewEncoder(w).Encode(resp)
+	})
+	mux.HandleFunc("GET /v0/repos/{owner}/{name}/delegation", func(w http.ResponseWriter, r *http.Request) {
+		fb.mu.Lock()
+		fb.lastDelegationPath = r.URL.RequestURI()
+		status := fb.delegationStatus
+		resp := fb.delegationResp
 		fb.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
@@ -3308,7 +3328,7 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	// over GET /v0/digest and POST /v0/digest/mark-read (the "since you last
 	// looked" digest against a per-captain read watermark) — taking the total
 	// 59 -> 60.
-	const wantToolCount = 60
+	const wantToolCount = 61
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",

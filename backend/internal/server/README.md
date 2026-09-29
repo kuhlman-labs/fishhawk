@@ -145,6 +145,70 @@ while the server silently diverges. The envelope is deterministic (fixed
 declaration order with a trailing newline), so a mismatch is real drift, not a
 flake — it fails with the exact refresh command.
 
+## Delegation read (`delegation_view.go`, E76.1 / #3747)
+
+`GET /v0/repos/{owner}/{name}/delegation` answers "what may the crew decide on
+its own in this repository?" for every workflow the spec declares — from the
+spec at a ref, WITHOUT a run. Read-only: it writes nothing, mints NO audit
+entry, and grants no authority. The projection is pure
+(`backend/internal/delegationview`, whose README holds the long-form contract);
+this file only resolves the source, parses, and maps.
+
+**The gate is the shared one.** `repoDashPrelude(w, r, false, false)` — so the
+run-repo 503 and the `requestRepoFilter` + `repoVisibleOr403` point-read DENY are
+byte-for-byte the ones the four repo-dashboard rollups use. There is no second
+visibility path to keep in sync.
+
+**Two explicit spec sources, always echoed, never switched silently.**
+
+| `source` | Resolution |
+|---|---|
+| `ref` (the default) | `GetRepoInstallation` → `GetWorkflowSpec(…, ref)`. An empty `ref` serves the repository's DEFAULT BRANCH head — `githubclient.GetFile`'s documented `ref=""` behaviour, the same one `handleGetOnboardingReadiness` and `campaign_admission_screen.go` rely on, and the endpoint's "base branch head" default |
+| `run_cache` | the newest run's `WorkflowSpec` + `WorkflowSHA` — the `projectPosture` ladder, same account narrowing |
+
+Two sources rather than forge-only because a forge-only surface is unreadable on
+any deployment without a wired installation, which would leave the endpoint with
+no drivable acceptance criterion. What keeps that from becoming a lie is the
+refusal: an unconfigured forge under `source=ref` is 503 `github_unconfigured`
+whose message names `run_cache`, never a fallback, and the resolved `source` is a
+required field on every response.
+
+**Invalid spec is fail-closed with a `return`, not a degradation.** A
+`spec.ParseBytes` failure writes 422 `workflow_spec_invalid` and returns
+IMMEDIATELY: the body carries the validation error and NO `workflows` array and
+NO `content_hash`. That guard is the only thing standing between an invalid spec
+and a partial matrix — a spec can DECODE into a workflow map and still fail
+validation (`mode: auto` on the non-delegable `ordering` grooming class is the
+fixture `TestRepoDelegation_InvalidSpecReturnsNamedErrorNotPartialMatrix` uses),
+and `delegationview.Project` would happily emit a matrix for it. The declared
+`version` is still read from the raw YAML independently of validation, exactly as
+`projectPosture` reads it, so an invalid spec can still report what it claimed.
+
+**Hash-before-filter.** `delegationview.Project` stamps each entry's
+`content_hash`, THEN the optional `?workflow=` filter narrows the set, THEN the
+view-level hash is recomputed over what was retained. So a filtered read returns
+the same per-workflow hash an unfiltered one does, and a consumer binding a
+confirmation to one workflow binds to that workflow's own hash.
+
+**Seven refusals, one test each** (#1182): 400 `validation_failed` (unknown
+`source`), 503 `github_unconfigured` (`source=ref`, no forge), 404
+`workflow_spec_not_found` (three branches — no cached run under `run_cache`, a
+forge 404 under `ref`, and a forge 200 whose spec content is EMPTY or
+whitespace-only), 502 `forge_unavailable` (a NON-NotFound fault from either
+`GetRepoInstallation` or `GetWorkflowSpec` — a forge fault is not "no
+installation is visible", and the two are never collapsed), 422
+`workflow_spec_invalid`, 404 `workflow_not_found` (unknown `?workflow=`), 403
+`repo_forbidden` (the prelude's DENY). `delegation_view_test.go` asserts each
+branch's status AND its code. `docs/api/v0.md` already documents the 502.
+
+**Parity with the run-side block** is asserted, not assumed.
+`TestDelegationView_MatchesRunDelegationBlockForEveryWorkflow` reads the
+committed `.fishhawk/workflows.yaml` and, for EVERY workflow it declares,
+compares the projection's `autonomy` / `matrix` / `must_page_human` against
+`delegationPayloadFrom(delegation.NewEvaluator(…).Evaluate(…), major)` — the
+exact pair `handleGetRun` uses. It iterates the parsed workflow map rather than a
+hand-written list, so a workflow added to the spec is covered automatically.
+
 ## Precedent query (`precedent.go`, E75.3 / #3731, ADR-082 #3728 decision (b))
 
 `GET /v0/precedent` returns prior decisions of ONE class from ONE repository,
@@ -2045,7 +2109,7 @@ Until this change the ONLY writer of `concern.StateAddressed` was `applyConcernR
 
 `GET /v0/repos/{owner}/{name}/{throughput,health,economics,posture}` feed the SPA's `/repos/:owner/:name` page. Read-only projections: nothing is written, no audit entry is minted. The folds are the pure `backend/internal/repodash` package; this file gathers rows, decodes audit payloads into `repodash.Event`/`CostEntry`, and maps results onto json-tagged response structs.
 
-- **Prelude (`repoDashPrelude`).** Order: 503 `run_repo_unconfigured` (and, for the three rollups, `audit_repo_unconfigured`) → `requestRepoFilter` + `repoVisibleOr403` (the #2071 point-read DENY: 403 `repo_forbidden`, 503 `service_unavailable` on a store fault) → the bounded `weeks` parameter (1–52, default 12; anything else 400 `validation_failed` with `details.field: weeks`). `posture` takes no `weeks`. No new auth scope — same read posture as `GET /v0/calibration`.
+- **Prelude (`repoDashPrelude`).** Order: 503 `run_repo_unconfigured` (and, for the three rollups, `audit_repo_unconfigured`) → `requestRepoFilter` + `repoVisibleOr403` (the #2071 point-read DENY: 403 `repo_forbidden`, 503 `service_unavailable` on a store fault) → the bounded `weeks` parameter (1–52, default 12; anything else 400 `validation_failed` with `details.field: weeks`). `posture` takes no `weeks`. No new auth scope — same read posture as `GET /v0/calibration`. `repoDashPrelude` has a FIFTH caller outside this section: the delegation read (`delegation_view.go`, E76.1 / #3747) reuses it with `needAudit=false, needWeeks=false` so its visibility DENY is byte-for-byte the one here.
 - **Window scan (`scanRepoRuns`).** Pages `RunRepo.ListRuns` (Repo + the caller's `AccountID`, newest first, `repoDashPageSize` 200) until a row is older than `window_start − repodash.LookBack` (14 days — keeps a run created before the window but merged inside it) or a short page ends the listing, under the `repodash.MaxRunsScanned` (1000) ceiling. When the ceiling stops the scan first, a one-row probe decides `truncated` (so exactly-ceiling runs is complete); `truncated` is carried on every rollup, including the economics empty body (`{"truncated":true}`).
 - **Per-run reads.** One `AuditRepo.ListForRun` per gathered run (plus `ListStagesForRun` for `health`, which resolves `approval_submitted` stage types and failure categories) — the N+1-acceptable-for-v0 posture `filterRuntimeObservedSamples` documents, bounded by the ceiling. `wait_on_human` is folded from the already-loaded chain through the same `gateEventCategory` / `latestTerminalTimestamp` / `latency.AggregateGateLatency` path as `runLatencySummary`, without a second read; the key is ABSENT when no run resolved.
 - **Economics.** Cost from `cost_recorded` payloads (`usd`, `model`, token split, `source`); `{}` when the window holds none (the `/cost` presence convention). Budget burn evaluates the FIRST periodic budget of each workflow in the newest run's cached spec through `effectiveBudgetLimit` + `evaluateWorkflowBudget` + `budget.Tier` — the `/budget` chain — and is omitted when the run repo is not a `runCostSummer`.
