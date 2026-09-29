@@ -1,7 +1,7 @@
 import { ArrowUpRight } from 'lucide-react';
 import { Section, SummarySection } from '@/plan/sections';
 import { DegradeNotes, EvidenceLink } from './evidence';
-import type { PlanModel } from './narrative';
+import { safeExternalHref, type PlanModel } from './narrative';
 import type { SectionState } from './use-run-narrative';
 
 /*
@@ -11,6 +11,9 @@ import type { SectionState } from './use-run-narrative';
  */
 export function PlanBlock({ section }: { section: SectionState<PlanModel> }) {
   const plan = section.model;
+  // The ticket url comes out of the agent-authored plan artifact, so it is
+  // untrusted: link it only when it is an http(s) url, else render the id.
+  const ticketHref = safeExternalHref(plan?.ticketUrl);
   return (
     <Section id="narrative-plan" title="Plan">
       <div className="space-y-3">
@@ -23,9 +26,9 @@ export function PlanBlock({ section }: { section: SectionState<PlanModel> }) {
                 <>
                   <dt className="text-neutral-500">Ticket</dt>
                   <dd className="font-mono">
-                    {plan.ticketUrl ? (
+                    {ticketHref ? (
                       <a
-                        href={plan.ticketUrl}
+                        href={ticketHref}
                         rel="noreferrer"
                         target="_blank"
                         className="inline-flex items-center gap-1 hover:underline"

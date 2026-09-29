@@ -28,7 +28,9 @@ export function EvidenceLink({ refTo }: { refTo: EvidenceRef }) {
   const hash = refTo.kind === 'audit' ? refTo.entryHash : refTo.contentHash;
   const label =
     refTo.kind === 'audit'
-      ? `audit entry #${refTo.sequence} (${refTo.category})`
+      ? // A ref built from a record that names only the sequence (a gate-view
+        // fix-up/resolution row) carries no category; the panel reads it back.
+        `audit entry #${refTo.sequence}${refTo.category ? ` (${refTo.category})` : ''}`
       : `${refTo.artifactKind} artifact`;
   return (
     <Link

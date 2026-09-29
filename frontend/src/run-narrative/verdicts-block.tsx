@@ -1,6 +1,11 @@
 import { Section } from '@/plan/sections';
 import { DegradeNotes, EvidenceLink } from './evidence';
-import type { ConcernLifecycle, JoinedConcern, JoinedVerdict } from './narrative';
+import {
+  sequenceEvidenceRef,
+  type ConcernLifecycle,
+  type JoinedConcern,
+  type JoinedVerdict,
+} from './narrative';
 import type { SectionState, VerdictsModel } from './use-run-narrative';
 
 /*
@@ -55,7 +60,14 @@ function LifecycleBadge({ concern }: { concern: JoinedConcern }) {
   );
 }
 
-function ConcernItem({ concern }: { concern: JoinedConcern }) {
+/*
+ * Each history claim resolves ITS OWN backing entry (approval condition 1):
+ * a fix-up at sequence 12 and a resolution at sequence 13 are later events
+ * than the review the column links, so the review's entry cannot
+ * substantiate them. The gate-view rows name only the sequence, so the link
+ * is built from that and the evidence panel reads back the hash/category.
+ */
+function ConcernItem({ concern, runId }: { concern: JoinedConcern; runId: string }) {
   return (
     <li data-testid="verdict-concern" className="space-y-1 py-2">
       <div className="flex items-start gap-2">
@@ -71,14 +83,28 @@ function ConcernItem({ concern }: { concern: JoinedConcern }) {
       {(concern.fixups.length > 0 || concern.resolutions.length > 0) && (
         <ul data-testid="concern-history" className="space-y-0.5 pl-2 font-mono text-xs">
           {concern.fixups.map((f) => (
-            <li key={`f-${f.sequence}`} className="text-neutral-600 dark:text-neutral-400">
-              fix-up #{f.sequence}: {f.outcome}
-              {f.head_sha ? ` @ ${f.head_sha.slice(0, 12)}` : ''}
+            <li
+              key={`f-${f.sequence}`}
+              data-testid="concern-fixup"
+              className="flex flex-wrap items-baseline gap-1 text-neutral-600 dark:text-neutral-400"
+            >
+              <span>
+                fix-up #{f.sequence}: {f.outcome}
+                {f.head_sha ? ` @ ${f.head_sha.slice(0, 12)}` : ''}
+              </span>
+              <EvidenceLink refTo={sequenceEvidenceRef(runId, f.sequence)} />
             </li>
           ))}
           {concern.resolutions.map((r) => (
-            <li key={`r-${r.sequence}`} className="text-neutral-600 dark:text-neutral-400">
-              resolution #{r.sequence}: {r.resolution}
+            <li
+              key={`r-${r.sequence}`}
+              data-testid="concern-resolution"
+              className="flex flex-wrap items-baseline gap-1 text-neutral-600 dark:text-neutral-400"
+            >
+              <span>
+                resolution #{r.sequence}: {r.resolution}
+              </span>
+              <EvidenceLink refTo={sequenceEvidenceRef(runId, r.sequence)} />
             </li>
           ))}
         </ul>
@@ -114,7 +140,7 @@ function VerdictColumn({ verdict }: { verdict: JoinedVerdict }) {
       ) : (
         <ul className="divide-y divide-neutral-200 dark:divide-neutral-800">
           {verdict.concerns.map((c, i) => (
-            <ConcernItem key={i} concern={c} />
+            <ConcernItem key={i} concern={c} runId={verdict.evidence.runId} />
           ))}
         </ul>
       )}

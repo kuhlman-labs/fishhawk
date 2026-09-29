@@ -261,7 +261,7 @@ describe('loadRunNarrative — happy path', () => {
       provider: 'github',
       subject: 'github:octo',
     });
-    expect(n.sections.merge.model).toEqual({ merge: null });
+    expect(n.sections.merge.model).toEqual({ merge: null, unavailable: [] });
   });
 
   it('reads every classifyTransition category, including run_auto_driven and approval_predicate_rejected', async () => {
@@ -500,7 +500,7 @@ describe('loadRunNarrative — per-section degrade', () => {
 
   it('merge: no entry of any category → an explicit not-merged model (merge: null), not a degrade', async () => {
     const n = await loadRunNarrative(RUN);
-    expect(n.sections.merge).toEqual({ model: { merge: null }, notes: [] });
+    expect(n.sections.merge).toEqual({ model: { merge: null, unavailable: [] }, notes: [] });
   });
 
   it('merge: one category rejecting is partial; all four rejecting is unavailable', async () => {
@@ -529,6 +529,21 @@ describe('loadRunNarrative — per-section degrade', () => {
     });
     n = await loadRunNarrative(RUN);
     expect(n.sections.merge.model).toBeNull();
+  });
+
+  it('merge: a rejected read with no terminal outcome names the unreadable category', async () => {
+    // pr_merged rejects while the other three return []. `readable > 0`, so
+    // the section still has a model — but the merge event could be in the
+    // read that failed, so the model must NOT let the render claim
+    // 'Not merged': it names the unavailable category.
+    const base = m.listRunAudit.getMockImplementation()!;
+    m.listRunAudit.mockImplementation(async (id, p) => {
+      if (p?.category === 'pr_merged') throw new Error('403');
+      return base(id, p);
+    });
+    const n = await loadRunNarrative(RUN);
+    expect(n.sections.merge.model).toEqual({ merge: null, unavailable: ['pr_merged'] });
+    expect(n.sections.merge.notes.map((x) => x.read)).toEqual(['audit:pr_merged']);
   });
 
   it('a rejected transition category degrades the timeline with a note but keeps the stages', async () => {

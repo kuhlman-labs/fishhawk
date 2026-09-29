@@ -94,8 +94,19 @@ export interface AcceptanceModel {
 }
 
 export interface MergeSectionModel {
-  /** null = no merge-related entry at all: render the explicit not-merged state. */
+  /**
+   * null = no merge-related entry was DECODED. On its own that is the
+   * explicit not-merged state — but only when `unavailable` is empty; see
+   * below.
+   */
   merge: MergeModel | null;
+  /**
+   * The merge categories whose read FAILED. A failed read could itself hold
+   * the merge event, so when no terminal outcome was established and this is
+   * non-empty the merge state is INDETERMINATE — the render must not claim
+   * 'Not merged' on evidence it could not read.
+   */
+  unavailable: string[];
 }
 
 export interface RunNarrativeSections {
@@ -438,16 +449,18 @@ export async function loadRunNarrative(
   {
     const mergeEntries: AuditEntry[] = [];
     let readable = 0;
+    const unavailable: string[] = [];
     for (const c of MERGE_CATEGORIES) {
       const es = entriesFor(c, ['merge']);
       if (es === null) {
+        unavailable.push(c);
         note('merge', 'read_failed', `audit:${c}`, `${c} unavailable: ${failedRead(c)}`);
       } else {
         readable++;
         mergeEntries.push(...es);
       }
     }
-    if (readable > 0) merge = { merge: deriveMerge(mergeEntries) };
+    if (readable > 0) merge = { merge: deriveMerge(mergeEntries), unavailable };
   }
 
   // --- gate timeline ----------------------------------------------------

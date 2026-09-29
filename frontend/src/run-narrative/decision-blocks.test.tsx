@@ -115,7 +115,7 @@ function renderMerge(entries: AuditEntry[] | null) {
                   },
                 ],
               }
-            : { model: { merge: deriveMerge(entries) }, notes: [] }
+            : { model: { merge: deriveMerge(entries), unavailable: [] }, notes: [] }
         }
       />
     </MemoryRouter>,
@@ -147,6 +147,79 @@ describe('<MergeBlock>', () => {
     unmount();
     renderMerge([entry('merge_verdict_recorded', { verdict: 'merge' })]);
     expect(screen.getByTestId('merge-state')).toHaveAttribute('data-state', 'verdict_only');
+  });
+
+  it('an unreadable merge category with no terminal outcome → indeterminate, never "Not merged"', () => {
+    render(
+      <MemoryRouter>
+        <MergeBlock
+          section={{
+            model: { merge: null, unavailable: ['pr_merged'] },
+            notes: [
+              {
+                section: 'merge',
+                kind: 'read_failed',
+                read: 'audit:pr_merged',
+                message: 'pr_merged unavailable: 403',
+              },
+            ],
+          }}
+        />
+      </MemoryRouter>,
+    );
+    const state = screen.getByTestId('merge-state');
+    expect(state).toHaveAttribute('data-state', 'indeterminate');
+    expect(state).not.toHaveTextContent('Not merged');
+    expect(state).toHaveTextContent('Indeterminate');
+    expect(screen.getByText('Unreadable').nextElementSibling).toHaveTextContent('pr_merged');
+  });
+
+  it('indeterminacy outranks verdict_only but a terminal outcome still stands', () => {
+    const { unmount } = render(
+      <MemoryRouter>
+        <MergeBlock
+          section={{
+            model: {
+              merge: deriveMerge([entry('merge_verdict_recorded', { verdict: 'merge' })]),
+              unavailable: ['pr_merged'],
+            },
+            notes: [],
+          }}
+        />
+      </MemoryRouter>,
+    );
+    expect(screen.getByTestId('merge-state')).toHaveAttribute('data-state', 'indeterminate');
+    // The verdict itself is still reported alongside the indeterminate state.
+    expect(screen.getByText('Merge verdict').nextElementSibling).toHaveTextContent('merge');
+    unmount();
+    // A positive terminal outcome is established evidence: it is not weakened
+    // by an unrelated failed read.
+    render(
+      <MemoryRouter>
+        <MergeBlock
+          section={{
+            model: {
+              merge: deriveMerge([
+                entry('pr_merged', { pr_url: 'https://e.test/1', head_sha: 'a' }),
+              ]),
+              unavailable: ['pr_closed_without_merge'],
+            },
+            notes: [],
+          }}
+        />
+      </MemoryRouter>,
+    );
+    expect(screen.getByTestId('merge-state')).toHaveAttribute('data-state', 'merged');
+  });
+
+  it('a non-http(s) pr url renders as text, never as a clickable link', () => {
+    const hostile = 'javascript:alert(1)';
+    renderMerge([entry('pr_merged', { pr_url: hostile, head_sha: 'cafef00d' })]);
+    expect(screen.getByTestId('merge-pr-unlinked')).toHaveTextContent(hostile);
+    expect(screen.queryByRole('link', { name: hostile })).not.toBeInTheDocument();
+    for (const a of document.querySelectorAll('a')) {
+      expect(a.getAttribute('href') ?? '').not.toMatch(/^javascript:/i);
+    }
   });
 
   it('read failure → the note, no state claim', () => {

@@ -92,8 +92,33 @@ describe('<VerdictsBlock>', () => {
     );
     expect(within(columns[1]).getByText('No concerns raised.')).toBeInTheDocument();
     for (const col of columns) {
-      expect(within(col).getByTestId('evidence-link').getAttribute('href')).toMatch(
+      // The column header's own link (the review entry) is the first one.
+      expect(within(col).getAllByTestId('evidence-link')[0].getAttribute('href')).toMatch(
         /\?entry=1[01]#/,
+      );
+    }
+  });
+
+  it('each history claim links its OWN sequence, not the review entry that raised the concern', () => {
+    renderBlock(gateView);
+    const concern = screen.getAllByTestId('verdict-concern')[0];
+    // The review is #10; the fix-up is #12 and the resolution #13. The
+    // review entry cannot substantiate either later event, so each row
+    // resolves its own sequence (approval condition 1).
+    const fixup = within(concern).getByTestId('concern-fixup');
+    expect(within(fixup).getByTestId('evidence-link')).toHaveAttribute(
+      'href',
+      '/runs/run-1?entry=12#entry-12',
+    );
+    const resolution = within(concern).getByTestId('concern-resolution');
+    expect(within(resolution).getByTestId('evidence-link')).toHaveAttribute(
+      'href',
+      '/runs/run-1?entry=13#entry-13',
+    );
+    // No history link falls back to the raising review's sequence.
+    for (const el of [fixup, resolution]) {
+      expect(within(el).getByTestId('evidence-link').getAttribute('href')).not.toContain(
+        'entry=10',
       );
     }
   });

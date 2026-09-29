@@ -46,6 +46,21 @@ describe('<PlanBlock>', () => {
     expect(screen.queryByRole('note')).not.toBeInTheDocument();
   });
 
+  it('a non-http(s) ticket url renders the id as text, never as a clickable link', () => {
+    // The ticket url comes from the agent-authored plan artifact (untrusted).
+    const hostile = 'javascript:alert(document.cookie)';
+    render(
+      <MemoryRouter>
+        <PlanBlock section={{ model: { ...plan, ticketUrl: hostile }, notes: [] }} />
+      </MemoryRouter>,
+    );
+    expect(screen.queryByRole('link', { name: '#1715' })).not.toBeInTheDocument();
+    expect(screen.getByText('#1715')).toBeInTheDocument();
+    for (const a of document.querySelectorAll('a')) {
+      expect(a.getAttribute('href') ?? '').not.toMatch(/^javascript:/i);
+    }
+  });
+
   it('renders the degrade note in place of the body when there is no plan artifact', () => {
     render(
       <MemoryRouter>

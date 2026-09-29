@@ -200,6 +200,13 @@ function resetFixture() {
       ),
     ],
     approval_predicate_rejected: [entry(4, 'approval_predicate_rejected', {}, 'st-plan')],
+    // The entries the gate view's fix-up/resolution rows name. The narrative
+    // never reads these categories; they exist so following a history link
+    // resolves a real entry.
+    stage_fixup_triggered: [entry(12, 'stage_fixup_triggered', { reason: 'r' }, 'st-impl')],
+    concern_resolution_recorded: [
+      entry(13, 'concern_resolution_recorded', { resolution: 'claimed_addressed' }, 'st-impl'),
+    ],
     run_auto_advanced: [entry(61, 'run_auto_advanced', {}, 'st-impl')],
     run_auto_driven: [entry(62, 'run_auto_driven', {})],
     pr_merged: [
@@ -222,6 +229,9 @@ function resetFixture() {
         state: 'waived',
         note: 'check the join',
         has_suggested_patch: false,
+        // Later events than the raising review (#3): each resolves its own entry.
+        fixups: [{ sequence: 12, outcome: 'pushed', head_sha: 'abcdef0123456789' }],
+        resolutions: [{ sequence: 13, resolution: 'claimed_addressed' }],
       },
     ],
     settled: [],
@@ -416,11 +426,79 @@ describe('<RunDetail> evidence narrative', () => {
     expect(m.listRunAudit).toHaveBeenCalledWith(RUN, { sinceSequence: 119, limit: 1 });
   });
 
+  it('following a concern fix-up history link resolves THAT entry, not the review that raised it', async () => {
+    await renderLoaded();
+    const concern = within(sectionEl('verdicts')).getByTestId('verdict-concern');
+    const fixupLink = within(within(concern).getByTestId('concern-fixup')).getByTestId(
+      'evidence-link',
+    );
+    expect(fixupLink).toHaveAttribute('href', `/runs/${RUN}?entry=12#entry-12`);
+    fireEvent.click(fixupLink);
+    let panel = await screen.findByTestId('evidence-panel');
+    await waitFor(() =>
+      expect(within(panel).getByTestId('evidence-entry-hash')).toHaveTextContent(
+        'hash12-0123456789abcdef0123456789abcdef',
+      ),
+    );
+    expect(within(panel).getByText('stage_fixup_triggered')).toBeInTheDocument();
+    expect(m.listRunAudit).toHaveBeenCalledWith(RUN, { sinceSequence: 11, limit: 1 });
+
+    const resolutionLink = within(within(concern).getByTestId('concern-resolution')).getByTestId(
+      'evidence-link',
+    );
+    expect(resolutionLink).toHaveAttribute('href', `/runs/${RUN}?entry=13#entry-13`);
+    fireEvent.click(resolutionLink);
+    panel = await screen.findByTestId('evidence-panel');
+    await waitFor(() =>
+      expect(within(panel).getByTestId('evidence-entry-hash')).toHaveTextContent(
+        'hash13-0123456789abcdef0123456789abcdef',
+      ),
+    );
+    expect(within(panel).getByText('concern_resolution_recorded')).toBeInTheDocument();
+  });
+
   it('renders a named "entry not found" state for a sequence with no entry', async () => {
     await renderLoaded(`/runs/${RUN}?entry=999`);
     expect(await screen.findByTestId('evidence-entry-not-found')).toHaveTextContent(
       'Audit entry #999 not found',
     );
+  });
+});
+
+describe('<RunDetail> untrusted-value and unavailable-evidence handling', () => {
+  it('a failed merge read with no terminal outcome renders indeterminate, never "Not merged"', async () => {
+    audit.pr_merged = [];
+    const base = m.listRunAudit.getMockImplementation()!;
+    m.listRunAudit.mockImplementation(async (id, p) => {
+      if (p?.category === 'pr_merged') throw new ApiClientError(403, {}, 'forbidden');
+      return base(id, p);
+    });
+    await renderLoaded();
+    const merge = sectionEl('merge');
+    const state = within(merge).getByTestId('merge-state');
+    expect(state).toHaveAttribute('data-state', 'indeterminate');
+    expect(state).not.toHaveTextContent('Not merged');
+    expect(within(merge).getByRole('note')).toHaveTextContent('pr_merged unavailable');
+    expectAllSixSections();
+  });
+
+  it('never renders a javascript: href from an agent-authored plan or an audit payload', async () => {
+    const hostile = 'javascript:alert(1)';
+    artifacts['art-plan'] = {
+      ...planArtifact,
+      content: {
+        ...planContent,
+        ticket_reference: { type: 'github_issue', url: hostile, id: '#1715' },
+      },
+    };
+    audit.pr_merged = [entry(130, 'pr_merged', { pr_url: hostile, head_sha: 'deadbeefcafe' })];
+    await renderLoaded();
+    for (const a of document.querySelectorAll('a')) {
+      expect(a.getAttribute('href') ?? '').not.toMatch(/^\s*javascript:/i);
+    }
+    // The values are still visible to the operator, as inert text.
+    expect(within(sectionEl('plan')).getByText('#1715')).toBeInTheDocument();
+    expect(within(sectionEl('merge')).getByTestId('merge-pr-unlinked')).toHaveTextContent(hostile);
   });
 });
 

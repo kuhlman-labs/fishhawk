@@ -34,8 +34,16 @@ export type EvidenceRef =
       kind: 'audit';
       runId: string;
       sequence: number;
-      entryHash: string;
-      category: string;
+      /**
+       * The entry's hash and category, when the claim was derived from the
+       * entry itself. A claim derived from a SECONDARY record that carries
+       * only the sequence — a gate-view fix-up or resolution row, which
+       * names its audit sequence but neither hash nor category — leaves both
+       * undefined; the link still resolves the entry, and the evidence panel
+       * shows the hash and category it reads back.
+       */
+      entryHash?: string;
+      category?: string;
     }
   | {
       kind: 'artifact';
@@ -71,6 +79,36 @@ export function parseEntryParam(raw: string | null): number | null {
   if (raw === null || !/^[1-9][0-9]*$/.test(raw)) return null;
   const n = Number(raw);
   return Number.isSafeInteger(n) ? n : null;
+}
+
+/**
+ * The evidence reference for a claim whose backing record names only an
+ * audit SEQUENCE (a gate-view fix-up or resolution row). The link resolves
+ * the entry through the same `?entry=<sequence>` path as every other
+ * audit-backed claim (approval condition 1).
+ */
+export function sequenceEvidenceRef(runId: string, sequence: number): EvidenceRef {
+  return { kind: 'audit', runId, sequence };
+}
+
+/**
+ * The href to render for an EXTERNAL url decoded from untrusted agent output
+ * (an agent-authored plan artifact's ticket url, a pr url off an audit
+ * payload), or null when it is not one. React escapes link TEXT but not a
+ * link's scheme, so a `javascript:` value would otherwise become a clickable
+ * script link for the operator. Only absolute http(s) urls are rendered as
+ * links; anything else — another scheme, a relative or unparseable value —
+ * returns null and the caller renders the raw value as plain text.
+ */
+export function safeExternalHref(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    return null;
+  }
+  return parsed.protocol === 'http:' || parsed.protocol === 'https:' ? raw : null;
 }
 
 /** Build the evidence reference backing a claim read from `source`. */

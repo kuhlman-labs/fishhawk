@@ -21,6 +21,8 @@ import {
   latestAcceptanceOutcome,
   parseEntryParam,
   readPlanAcceptanceCriteria,
+  safeExternalHref,
+  sequenceEvidenceRef,
 } from './narrative';
 
 const RUN = 'rrrrrrrr-0000-0000-0000-000000000000';
@@ -609,5 +611,36 @@ describe('classifyTransition / classifyStage / deriveGateTimeline (approval cond
       ['run_auto_driven', 'auto_advance'],
     ]);
     expect(t.runTransitions[0].evidence).toMatchObject({ kind: 'audit', sequence: 6 });
+  });
+});
+
+describe('safeExternalHref', () => {
+  it('passes http(s) urls through and refuses every other value', () => {
+    expect(safeExternalHref('https://example.test/a?b=1#c')).toBe('https://example.test/a?b=1#c');
+    expect(safeExternalHref('http://example.test/a')).toBe('http://example.test/a');
+    for (const hostile of [
+      'javascript:alert(1)',
+      '  JavaScript:alert(1)',
+      'jAvAsCrIpT:alert(1)',
+      'data:text/html;base64,PHNjcmlwdD4=',
+      'vbscript:msgbox(1)',
+      'file:///etc/passwd',
+      // Not absolute: no scheme to trust, so it is not rendered as a link.
+      '/relative/path',
+      'example.test/a',
+      '',
+    ]) {
+      expect(safeExternalHref(hostile), hostile).toBeNull();
+    }
+    expect(safeExternalHref(undefined)).toBeNull();
+    expect(safeExternalHref(null)).toBeNull();
+  });
+});
+
+describe('sequenceEvidenceRef', () => {
+  it('resolves a sequence-only claim through the same ?entry= path', () => {
+    const ref = sequenceEvidenceRef('run-1', 12);
+    expect(ref).toEqual({ kind: 'audit', runId: 'run-1', sequence: 12 });
+    expect(evidenceHref(ref)).toBe('/runs/run-1?entry=12#entry-12');
   });
 });

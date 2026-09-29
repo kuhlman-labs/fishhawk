@@ -1,6 +1,6 @@
 import { Section } from '@/plan/sections';
 import { DegradeNotes, EvidenceLink } from './evidence';
-import type { ApprovalRow } from './narrative';
+import { safeExternalHref, type ApprovalRow } from './narrative';
 import type { MergeSectionModel, SectionState } from './use-run-narrative';
 
 /*
@@ -76,8 +76,14 @@ export function MergeBlock({ section }: { section: SectionState<MergeSectionMode
   const merge = model?.merge ?? null;
   const outcome = merge?.outcome ?? null;
   const verdict = merge?.verdict ?? null;
-  let state: 'merged' | 'closed_without_merge' | 'verdict_only' | 'not_merged';
+  const unavailable = model?.unavailable ?? [];
+  let state: 'merged' | 'closed_without_merge' | 'verdict_only' | 'not_merged' | 'indeterminate';
+  // A terminal outcome is positive evidence and stands on its own. With NO
+  // terminal outcome and a failed merge read, the missing evidence could
+  // itself be the merge event — so the state is indeterminate, never the
+  // claim 'Not merged'.
   if (outcome) state = outcome.kind;
+  else if (unavailable.length > 0) state = 'indeterminate';
   else if (verdict) state = 'verdict_only';
   else state = 'not_merged';
   const stateLabel = {
@@ -85,8 +91,10 @@ export function MergeBlock({ section }: { section: SectionState<MergeSectionMode
     closed_without_merge: 'Closed without merge',
     verdict_only: 'Merge verdict recorded; merge not yet observed',
     not_merged: 'Not merged',
+    indeterminate: 'Indeterminate: merge evidence could not be read',
   }[state];
   const prUrl = outcome?.prUrl ?? verdict?.prUrl;
+  const prHref = safeExternalHref(prUrl);
   return (
     <Section id="narrative-merge" title="Merge">
       <div className="space-y-3">
@@ -102,16 +110,22 @@ export function MergeBlock({ section }: { section: SectionState<MergeSectionMode
             {outcome?.actor && <Row label="By">{outcome.actor}</Row>}
             {prUrl && (
               <Row label="Pull request">
-                <a
-                  href={prUrl}
-                  rel="noopener noreferrer"
-                  target="_blank"
-                  className="text-blue-700 hover:underline dark:text-blue-300"
-                >
-                  {prUrl}
-                </a>
+                {prHref ? (
+                  <a
+                    href={prHref}
+                    rel="noopener noreferrer"
+                    target="_blank"
+                    className="text-blue-700 hover:underline dark:text-blue-300"
+                  >
+                    {prUrl}
+                  </a>
+                ) : (
+                  // Not an http(s) url: render the recorded value as text.
+                  <span data-testid="merge-pr-unlinked">{prUrl}</span>
+                )}
               </Row>
             )}
+            {state === 'indeterminate' && <Row label="Unreadable">{unavailable.join(', ')}</Row>}
             {(outcome || verdict) && (
               <Row label="Evidence">
                 <span className="flex flex-wrap gap-2">

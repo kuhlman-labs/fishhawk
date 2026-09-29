@@ -279,7 +279,7 @@ throwing. `use-run-narrative.ts` is the composed loader.
 | diff summary      | plan `scope.files`; newest decodable audit `policy_evaluated`                                                                                     | `deriveScopeDivergence`                                                       |
 | acceptance        | newest audit `acceptance_outcome_recorded` → `getArtifact(artifact_id)`; plan `verification.acceptance_criteria`                                  | `latestAcceptanceOutcome`, `decodeAcceptanceArtifact`, `deriveAcceptanceRows` |
 | approvals         | audit `approval_submitted`                                                                                                                        | `deriveApprovals`                                                             |
-| merge             | audit `pr_merged`, `merge_verdict_recorded`, `merge_observation_recorded`, `pr_closed_without_merge`                                              | `deriveMerge`                                                                 |
+| merge             | audit `pr_merged`, `merge_verdict_recorded`, `merge_observation_recorded`, `pr_closed_without_merge`                                              | `deriveMerge` (+ `unavailable[]`)                                             |
 | gate timeline     | `listRunStages`; audit `approval_submitted`, `acceptance_outcome_recorded`, `approval_predicate_rejected`, `run_auto_advanced`, `run_auto_driven` | `classifyStage`, `classifyTransition`, `deriveGateTimeline`                   |
 
 - **Degrade one section, never the page.** Every read runs under
@@ -291,6 +291,16 @@ throwing. `use-run-narrative.ts` is the composed loader.
   (e.g. acceptance keeps the recorded verdict + tallies when the artifact
   read fails; verdicts keep every concern labelled `unavailable` when the
   gate view fails). The only page-level failure is `getRun`.
+- **Unavailable merge evidence is INDETERMINATE, not "Not merged".** The
+  merge section survives a partial read failure (`readable > 0`), but the
+  failed read could itself hold the merge event — so
+  `MergeSectionModel.unavailable[]` names every merge category whose read
+  rejected, and `<MergeBlock>` renders state `indeterminate` whenever no
+  terminal outcome was decoded and that list is non-empty. A terminal
+  outcome (`pr_merged` / `merge_observation_recorded` /
+  `pr_closed_without_merge`) is positive evidence and still stands on its
+  own; indeterminacy outranks the `verdict_only` state, which is not an
+  observed merge.
 - **Bounded reads.** One `listRunAudit` per category with the `category`
   filter and `limit=500`, paginating until `next_cursor` is null or
   `AUDIT_MAX_PAGES` (10), which records an `incomplete` note.
@@ -329,7 +339,20 @@ throwing. `use-run-narrative.ts` is the composed loader.
   an artifact-backed one as the stage page. `loadAuditEntry` /
   `useAuditEntry` resolve `?entry=N` independently of list pagination via
   `listRunAudit({sinceSequence: N-1, limit: 1})`, accepting the result only
-  when its sequence IS N (null → the "entry not found" state).
+  when its sequence IS N (null → the "entry not found" state). A claim whose
+  backing record names only a SEQUENCE — a gate-view fix-up or resolution
+  row, which carries neither entry hash nor category — uses
+  `sequenceEvidenceRef`, so each history claim resolves ITS OWN later entry
+  rather than the review entry that raised the concern; `EvidenceLink`
+  labels such a ref `audit entry #N` and the panel reads the hash and
+  category back.
+- **External hrefs are scheme-allowlisted.** A url decoded from untrusted
+  agent output — the plan artifact's `ticket_reference.url`, a `pr_url` off
+  an audit payload — passes through `safeExternalHref`, which renders only
+  absolute `http:`/`https:` urls as links (React escapes link TEXT but not a
+  link's SCHEME, so a `javascript:` value would otherwise be a clickable
+  script link). Anything else renders as inert text, so the operator still
+  sees the recorded value.
 
 ## Threaded runs (#216)
 
