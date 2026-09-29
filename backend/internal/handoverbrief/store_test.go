@@ -52,7 +52,7 @@ func (f *fixture) deps() Deps {
 	return Deps{
 		Digest:   digest.Deps{Store: f.digest, Index: f.idx},
 		Captain:  f.captain,
-		InFlight: NewStore(f.campaigns, f.runs),
+		InFlight: NewStore(campaignLister{f.campaigns}, f.runs),
 	}
 }
 
@@ -159,7 +159,7 @@ func TestStore_CampaignsAndRunsAreRepoAndStateScoped(t *testing.T) {
 	f := newFixture(t)
 	running := f.campaign(t, campaign.StateRunning)
 	f.campaign(t, campaign.StatePending)
-	st := NewStore(f.campaigns, f.runs)
+	st := NewStore(campaignLister{f.campaigns}, f.runs)
 	ctx := context.Background()
 
 	got, err := st.Campaigns(ctx, testRepo, nil, "running", 10)
@@ -190,7 +190,7 @@ func TestStore_LimitPlusOneBite(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		f.campaign(t, campaign.StateRunning)
 	}
-	all, err := NewStore(f.campaigns, f.runs).Campaigns(context.Background(), testRepo, nil, "running", 10)
+	all, err := NewStore(campaignLister{f.campaigns}, f.runs).Campaigns(context.Background(), testRepo, nil, "running", 10)
 	if err != nil || len(all) != 3 {
 		t.Fatalf("all running = %d (%v), want 3", len(all), err)
 	}
@@ -217,9 +217,28 @@ func TestStore_LimitPlusOneBite(t *testing.T) {
 	}
 }
 
+// campaignLister is the test-side campaign.Repository adapter (production's
+// lives in server, keeping campaign out of this package's non-test closure).
+type campaignLister struct{ repo campaign.Repository }
+
+func (l campaignLister) ListInFlightCampaigns(ctx context.Context, repo, accountID, state string, limit int) ([]InFlightItem, error) {
+	rows, err := l.repo.ListCampaigns(ctx, campaign.ListCampaignsFilter{Repo: repo, State: state, AccountID: accountID, Limit: limit})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]InFlightItem, 0, len(rows))
+	for _, c := range rows {
+		if c == nil {
+			continue
+		}
+		out = append(out, InFlightItem{Kind: "campaign", ID: c.ID, State: string(c.State), Ref: c.EpicRef, CreatedAt: c.CreatedAt.UTC()})
+	}
+	return out, nil
+}
+
 type errCampaigns struct{}
 
-func (errCampaigns) ListCampaigns(context.Context, campaign.ListCampaignsFilter) ([]*campaign.Campaign, error) {
+func (errCampaigns) ListInFlightCampaigns(context.Context, string, string, string, int) ([]InFlightItem, error) {
 	return nil, errors.New("boom")
 }
 

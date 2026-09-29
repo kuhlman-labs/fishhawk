@@ -264,6 +264,13 @@ var mcpToolScopes = map[string]mcpToolScopeRule{
 	// identity the captain record refuses, so runBoundSubjectOK stays false.
 	"fishhawk_captain": {anyOf: []string{scopeCaptainRead, scopeCaptainWrite}},
 
+	// fishhawk_handover_brief (E76.4 / #3767) dials ONE endpoint: GET
+	// /v0/handover-brief (handover_brief.go handleGetHandoverBrief:
+	// requireWriteScope(scopeHandoverBriefRead) = scopeDigestRead =
+	// read:audit). It never writes. The handler admits no run-bound subject,
+	// so runBoundSubjectOK stays false.
+	"fishhawk_handover_brief": {anyOf: []string{scopeDigestRead}},
+
 	// --- refinement gate. draft_epic dials /v0/refinement/sessions and its
 	// siblings, every one behind requireWriteScope(scopeRefinementGate)
 	// (refinement.go, refinement_file.go).

@@ -328,7 +328,7 @@ func TestDegradation_StoresUnconfigured(t *testing.T) {
 		t.Error("in_flight should be unavailable and the brief still hashed")
 	}
 	// A campaign-only store degrades runs alone.
-	deps.InFlight = NewStore(f.campaigns, nil)
+	deps.InFlight = NewStore(campaignLister{f.campaigns}, nil)
 	b = compose(t, deps, Request{})
 	if partOf(t, b, SectionInFlight, PartCampaigns).Unavailable || !partOf(t, b, SectionInFlight, PartRuns).Unavailable {
 		t.Error("nil run lister should degrade only runs")
