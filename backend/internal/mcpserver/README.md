@@ -38,10 +38,10 @@ consumes only the first two):
   `initialize` handshake, the public alias of the package-private
   `onboardingInstructions`.
 
-## Exported surface: why 301 identifiers, not 3
+## Exported surface: why 304 identifiers, not 3
 
-The package presents **301** exported top-level identifiers, but only the three
-above are intended entry points. The other 298 are the tool I/O
+The package presents **304** exported top-level identifiers, but only the three
+above are intended entry points. The other 301 are the tool I/O
 request/response structs. The MCP SDK's jsonschema reflection requires each
 tool's input/output type — and its exported fields — to build the tool's
 schema, so **unexporting them would break tool registration**. In `package
@@ -2443,3 +2443,13 @@ names the `backlog_grooming` workflow. A `campaign_dangling_dependency` carrying
 drop `grooming_order_limit`) or drop the edge — because "fix the epic's edges" is
 meaningless for a batch that has no epic. The epic wording is unchanged when that
 detail is absent.
+
+## "Since you last looked" digest (`fishhawk_digest`, [E75.6 / #3734](https://github.com/kuhlman-labs/fishhawk/issues/3734))
+
+`digest.go` registers `fishhawk_digest`, a thin wrapper over the two digest REST routes (`backend/internal/server/digest.go`; the domain contract — sections, gaps, the paired `answered` predicate, the parking-entry mapping, the watermark ordering — lives in `backend/internal/digest/README.md`, not here). Two `apiClient` methods in `client.go` carry the wire: `GetDigest` (`GET /v0/digest`, zero sequences and an empty section OMITTED so the backend applies its watermark / chain-head defaults) and `MarkDigestRead` (`POST /v0/digest/mark-read`).
+
+- **Two modes, never mixed.** `mark_read: false` (default) reads and NEVER writes. `mark_read: true` requires `to_sequence` (the `to_sequence` of the digest actually read — defaulting it to the chain head could silently skip items the captain never saw) and REFUSES `section` / `from_sequence` rather than ignoring them. Every input refusal fires before any HTTP request (`TestDigest_RefusesBeforeHTTP` counts backend hits).
+- **One bound, two surfaces.** The REST handler applies `digest.Bound` at `digest.DefaultByteBudget`; the tool RE-applies the SAME `digest.Bound` at `mcpResponseByteBudget(r.getenv)` (the `FISHHAWKD_MCP_RESPONSE_BUDGET_BYTES` ladder, clamped to the 4 KiB convergence floor). `Bound` composes: a section it trims further keeps the REST-side `omitted_count` and moves its cursor to the new first omitted item; a section it leaves alone keeps the REST-side markers verbatim. `TestDigest_BoundsAtSessionBudget` pins the fit + markers; `TestDigest_FollowingCursorThroughToolTerminates` follows the tool's own cursors (section / from_sequence / to_sequence passed back as arguments) over a set that exceeds BOTH budgets and asserts every item is retrieved exactly once, strictly advancing, each response within budget. A floor that cannot fit the session budget is a tool error (`digest.ErrBudgetTooSmall`), never an over-budget result. The cursor's `call` field renders the equivalent REST request line; the MCP caller passes its `section` / `from_sequence` / `to_sequence` as arguments.
+- **Explicit output schema.** `digest.Item` / `digest.Gap` carry `uuid.UUID`, which the SDK's reflection would advertise as a 16-integer array while the value marshals as a string — every non-empty digest would then fail the SDK's own output validation. `digestOutputSchema` reflects `DigestOutput` with a `uuid.UUID → string` type mapping, so the tool serves the SHARED `digest.Digest` wire model instead of forking a hand-maintained mirror (the #371 drift class). `TestDigest_OutputPassesSDKSchemaValidation` drives a real `tools/call` and reddens without it.
+- **Authorization.** The `/mcp` HTTP-layer gate row (`backend/internal/server/mcpscopes.go`) is `anyOf: [read:audit, write:approvals]` — any-of across the two endpoints the tool dials; the inner REST call stays authoritative for the mode invoked (`read:audit` for the read, `write:approvals` for mark-read). Neither handler admits a run-bound subject.
+- **End to end.** `TestDigestTool_EndToEndThroughRealServer` drives the tool against an httptest server running the real `server.Handler()` over a migrated pgtest schema with the production indexing audit wiring: read → mark-read → re-read, asserting the cited entry, the stored watermark and that the read item is gone.

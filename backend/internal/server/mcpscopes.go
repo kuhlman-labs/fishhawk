@@ -233,6 +233,16 @@ var mcpToolScopes = map[string]mcpToolScopeRule{
 	"fishhawk_resume_campaign":         {anyOf: []string{"write:campaigns"}},
 	"fishhawk_cancel_campaign":         {anyOf: []string{"write:campaigns"}},
 
+	// fishhawk_digest (E75.6 / #3734) dials TWO endpoints: its default read
+	// mode GETs /v0/digest (digest.go handleGetDigest:
+	// requireWriteScope(scopeDigestRead) = read:audit) and mark_read=true
+	// POSTs /v0/digest/mark-read (handleDigestMarkRead:
+	// requireWriteScope("write:approvals")). A tool performing several
+	// actions takes any-of across them; the inner REST call stays
+	// authoritative for the mode actually invoked. Neither handler admits a
+	// run-bound subject, so runBoundSubjectOK stays false.
+	"fishhawk_digest": {anyOf: []string{scopeDigestRead, scopeDigestMarkRead}},
+
 	// --- refinement gate. draft_epic dials /v0/refinement/sessions and its
 	// siblings, every one behind requireWriteScope(scopeRefinementGate)
 	// (refinement.go, refinement_file.go).
