@@ -91,9 +91,17 @@ type CrewConsultAnswer struct {
 	Evidence []crewmessage.EvidenceReference
 }
 
-// CrewResponder answers one consult. Respond must honour ctx: the dispatcher
-// stops waiting at the consult's deadline and disposes it expired whether or
-// not Respond has returned.
+// CrewResponder answers one consult.
+//
+// Respond MUST honour ctx. That is a REQUIREMENT of this interface, not a
+// courtesy: the dispatcher stops waiting at the consult's deadline and
+// disposes it expired whether or not Respond has returned, and the bound the
+// dispatcher enforces is the CONSULT's deadline, not the responder's. A
+// Respond that blocks past ctx.Done() keeps one goroutine alive until it
+// returns — tracked by s.bgReviews so Shutdown's bounded drain accounts for
+// it (E77.14 / #3876), but nothing in this package can make a wedged
+// responder return. E77.8's (#3742) model-backed responder is the first
+// implementation obliged to bound its upstream call by the passed ctx.
 type CrewResponder interface {
 	Respond(ctx context.Context, req CrewConsultRequest) (CrewConsultAnswer, error)
 }
@@ -231,11 +239,24 @@ type crewConsultResult struct {
 // validation, or the deadline disposes it `expired` with a reason naming the
 // cause. The STAGE is never touched: an expired consult is "no answer" and
 // nothing else. Every non-answer path WARN-logs run id, sequence and role.
+//
+// The INNER responder goroutine is tracked by s.bgReviews (E77.14 / #3876),
+// not only the outer dispatch goroutine. What that buys: when the deadline
+// branch fires and this function returns without the responder, Shutdown's
+// drain (server.go Shutdown, bounded by shutdownCtx — the same bound that
+// already protects it from a hung reviewer) WAITS for that abandoned
+// goroutine to unwind instead of leaving it unaccounted. What it does NOT
+// buy, stated plainly: a responder that never returns is still a goroutine
+// the process reclaims only at exit. Tracking converts a silent leak into
+// one the bounded drain accounts for; it cannot unwedge the responder.
 func (s *Server) runCrewConsult(ctx context.Context, responder CrewResponder, req CrewConsultRequest) {
 	// The responder runs on its own goroutine so one that ignores ctx cannot
-	// hold the consult open past its deadline.
+	// hold the consult open past its deadline. done stays BUFFERED (capacity
+	// 1) so an abandoned responder's send never blocks.
 	done := make(chan crewConsultResult, 1)
+	s.bgReviews.Add(1)
 	go func() {
+		defer s.bgReviews.Done()
 		a, err := responder.Respond(ctx, req)
 		done <- crewConsultResult{answer: a, err: err}
 	}()
@@ -272,7 +293,7 @@ func (s *Server) runCrewConsult(ctx context.Context, responder CrewResponder, re
 		return
 	}
 	actor := crewConsultActor(req.RecipientRole)
-	reply, _, err := s.RespondToCrewMessage(wctx, RespondParams{
+	reply, _, err := s.crewConsultSink().Respond(wctx, RespondParams{
 		SentSequence: req.SentSequence, Reply: doc, ResponderRole: req.RecipientRole, Actor: actor,
 	})
 	if err == nil {
@@ -301,7 +322,7 @@ func (s *Server) expireCrewConsult(ctx context.Context, req CrewConsultRequest, 
 		slog.String("recipient_role", string(req.RecipientRole)), slog.String("reason", reason),
 	}
 	s.cfg.Logger.LogAttrs(wctx, slog.LevelWarn, "crew consult expired without an answer", attrs...)
-	_, err := s.cfg.CrewMailbox.Dispose(wctx, crewmessage.DisposeParams{
+	_, err := s.crewConsultSink().Dispose(wctx, crewmessage.DisposeParams{
 		SentSequence: req.SentSequence, Disposition: crewmessage.DispositionExpired,
 		Reason: reason, Actor: crewConsultActor(req.RecipientRole),
 	})
@@ -310,4 +331,45 @@ func (s *Server) expireCrewConsult(ctx context.Context, req CrewConsultRequest, 
 		s.cfg.Logger.LogAttrs(wctx, slog.LevelWarn, "crew consult expiry could not be recorded",
 			append(attrs, slog.String("error", err.Error()))...)
 	}
+}
+
+// crewConsultSink is the narrow surface the consult dispatcher performs its
+// two mailbox interactions through: recording an answer, and disposing an
+// unanswered consult. Production is serverCrewConsultSink, a pass-through to
+// (*Server).RespondToCrewMessage and cfg.CrewMailbox.Dispose, so the seam
+// costs exactly one indirection and changes no behaviour on any path a
+// supported configuration reaches.
+//
+// WHY it exists (E77.14 / #3876): two branches here are unreachable through a
+// real mailbox. runCrewConsult's answered-but-not-disposed branch needs a
+// RECORDED reply paired with a FAILING disposition — a state no real mailbox
+// produces on demand — and expireCrewConsult's tolerance ladder needs Dispose
+// to return a chosen error class (a wrapped crewmessage.ErrAlreadyDisposed, a
+// *crewmessage.ProjectionError, an unrelated error) on demand. Mirrors this
+// package's releasePublisher / releasePublisherOverride idiom.
+type crewConsultSink interface {
+	Respond(ctx context.Context, p RespondParams) (reply, answered *crewmessage.Row, err error)
+	Dispose(ctx context.Context, p crewmessage.DisposeParams) (*crewmessage.Row, error)
+}
+
+// serverCrewConsultSink is the production sink: a pass-through to the Server's
+// own two operations.
+type serverCrewConsultSink struct{ s *Server }
+
+func (k serverCrewConsultSink) Respond(ctx context.Context, p RespondParams) (*crewmessage.Row, *crewmessage.Row, error) {
+	return k.s.RespondToCrewMessage(ctx, p)
+}
+
+func (k serverCrewConsultSink) Dispose(ctx context.Context, p crewmessage.DisposeParams) (*crewmessage.Row, error) {
+	return k.s.cfg.CrewMailbox.Dispose(ctx, p)
+}
+
+// crewConsultSink returns the test override when set, else the production
+// pass-through — the lazy-default shape releasePublisher uses, so New needs no
+// change and production is never anything but serverCrewConsultSink.
+func (s *Server) crewConsultSink() crewConsultSink {
+	if s.crewConsultSinkOverride != nil {
+		return s.crewConsultSinkOverride
+	}
+	return serverCrewConsultSink{s}
 }

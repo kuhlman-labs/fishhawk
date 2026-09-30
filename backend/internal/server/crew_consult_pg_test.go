@@ -4,13 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/crewmessage"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
@@ -443,5 +446,89 @@ func TestCrewConsult_SurvivesSenderDisconnect(t *testing.T) {
 	}
 	if n := f.count(t, crewmessage.CategorySent); n != 2 {
 		t.Fatalf("crew_message_sent entries = %d, want consult + answer", n)
+	}
+}
+
+// The REAL-mailbox arm of expireCrewConsult's ErrAlreadyDisposed tolerance
+// (E77.14 / #3876). The hermetic TestCrewConsult_ExpiryTolerance row asserts
+// errors.Is against an error a FAKE constructs; this arm proves the production
+// *crewmessage.Mailbox returns an error the clause actually matches — and that
+// the ErrAlreadyDisposed clause is the one that fires, not masked by the
+// *ProjectionError clause ahead of it.
+//
+// Mechanism: the derived row is disposed BY CONSTRUCTION (directly through
+// f.mailbox.Dispose, with a distinguishable MANUAL reason) while the gated
+// responder is provably still running, so when the shortened deadline fires
+// the dispatcher's Dispose meets an already-closed row.
+func TestCrewConsult_ExpiryToleratesRealAlreadyDisposed(t *testing.T) {
+	const manualReason = "IBIS-3876-manually-disposed-before-the-deadline"
+	const notRecorded = "crew consult expiry could not be recorded"
+	const expiryWarn = "crew consult expired without an answer"
+
+	f := newCrewPG(t)
+	gate := make(chan struct{})
+	seen := make(chan CrewConsultRequest, 1)
+	f.withResponders(t, map[crewmessage.Role]CrewResponder{crewmessage.RoleHistorian: &fakeResponder{gate: gate, seen: seen}})
+	closeGate := sync.OnceFunc(func() { close(gate) })
+	t.Cleanup(closeGate) // LIFO: runs before withResponders' drain.
+
+	// Swap the logger BEFORE the send so every line the consult emits lands in
+	// the buffer.
+	buf := &syncBuffer{}
+	f.srv.cfg.Logger = slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	window := timescale.D(2 * time.Second)
+	shortenConsultWindow(t, window)
+	runA := f.seedRun(t, run.StageTypePlan)
+	sent := f.send(t, consultDoc("historian", runAnchor(runA), crewConsultPayload), runBound(runA, "mcp:read", scopeWriteMessages))
+
+	select {
+	case <-seen:
+	case <-time.After(timescale.D(5 * time.Second)):
+		t.Fatal("responder never entered Respond")
+	}
+
+	// Close the row out from under the dispatcher.
+	if _, err := f.mailbox.Dispose(context.Background(), crewmessage.DisposeParams{
+		SentSequence: sent.SentSequence, Disposition: crewmessage.DispositionExpired,
+		Reason: manualReason, Actor: crewmessage.Actor{Kind: audit.ActorUser, Subject: "operator:test"},
+	}); err != nil {
+		t.Fatalf("manual dispose: %v", err)
+	}
+
+	// PRESENCE CONTROL (approval condition 2): a line KNOWN to be emitted on
+	// this path must appear in the SWAPPED buffer, so the absence assertion
+	// below cannot pass because the logger swap never took effect. This also
+	// proves the deadline branch fired.
+	deadline := time.Now().Add(window + timescale.D(10*time.Second))
+	for !strings.Contains(buf.String(), expiryWarn) {
+		if time.Now().After(deadline) {
+			t.Fatalf("the swapped log buffer never carried %q — the deadline branch did not fire, or the logger swap did not take effect; log: %s", expiryWarn, buf.String())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	// Drain so expireCrewConsult has RETURNED (its Dispose call and the error
+	// classification that follows are both complete) before asserting absence.
+	closeGate()
+	f.srv.waitBackgroundReviews()
+
+	if logged := buf.String(); strings.Contains(logged, notRecorded) {
+		t.Fatalf("a real ErrAlreadyDisposed was logged as unrecorded: %s", logged)
+	}
+	row, err := f.mailbox.Store().Get(context.Background(), sent.SentSequence)
+	if err != nil {
+		t.Fatalf("get row: %v", err)
+	}
+	if row.State != crewmessage.StateExpired {
+		t.Fatalf("state = %q, want expired", row.State)
+	}
+	// The dispatcher's expiry appended NOTHING: the manual reason survives and
+	// there is exactly one disposition entry.
+	disp, reason := f.disposedReason(t, sent.SentSequence)
+	if disp != string(crewmessage.DispositionExpired) || reason != manualReason {
+		t.Fatalf("disposition = %q reason = %q, want expired + the manual reason", disp, reason)
+	}
+	if n := f.count(t, crewmessage.CategoryDisposed); n != 1 {
+		t.Fatalf("crew_message_disposed entries = %d, want 1 (the dispatcher's expiry must append nothing)", n)
 	}
 }
