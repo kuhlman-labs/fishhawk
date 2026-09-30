@@ -579,3 +579,40 @@ func TestKnownCategories_PrecedentSurfaced(t *testing.T) {
 		t.Fatal("precedent_surfaced is not in KnownCategories; register it in categories.go")
 	}
 }
+
+// TestKnownCategories_CrewMessageDelivered pins the E77.7 / #3741 deferred
+// delivery record: backend/internal/server's recordCrewMessagesDelivered
+// appends one per signed plan prompt or review round that handed open
+// findings/notices to the reading stage's role. Its prior-delivery filter
+// reads it back, so an unregistered category would fail the emit site AND
+// silently re-deliver to every later stage.
+func TestKnownCategories_CrewMessageDelivered(t *testing.T) {
+	if !IsKnownCategory("crew_message_delivered") {
+		t.Error("crew_message_delivered is not in KnownCategories; register it in categories.go")
+	}
+}
+
+// TestKnownCategories_CrewWorkRequestFiled pins the E77.7 / #3741 record of
+// a crew work_request filing exactly one work item (and no run).
+func TestKnownCategories_CrewWorkRequestFiled(t *testing.T) {
+	if !IsKnownCategory("crew_work_request_filed") {
+		t.Error("crew_work_request_filed is not in KnownCategories; register it in categories.go")
+	}
+}
+
+// TestKnownCategories_CrewFindingConverted pins the E77.7 / #3741 record of
+// the captain converting a crew finding into a concern.
+func TestKnownCategories_CrewFindingConverted(t *testing.T) {
+	if !IsKnownCategory("crew_finding_converted") {
+		t.Error("crew_finding_converted is not in KnownCategories; register it in categories.go")
+	}
+}
+
+// TestKnownCategories_CrewFindingConvertFailed pins the E77.7 / #3741
+// corrective entry: the finding was disposed accepted but the concern insert
+// then failed (the concern_defer_failed shape).
+func TestKnownCategories_CrewFindingConvertFailed(t *testing.T) {
+	if !IsKnownCategory("crew_finding_convert_failed") {
+		t.Error("crew_finding_convert_failed is not in KnownCategories; register it in categories.go")
+	}
+}

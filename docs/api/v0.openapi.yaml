@@ -2374,7 +2374,8 @@ components:
             The audit categories that failed to read, when `history_incomplete`
             is true. The captain block adds `captain_record` (the captain read
             failed) or `approval_submitted` (the run's approvals could not be
-            read) when it is omitted for that reason.
+            read) when it is omitted for that reason; the crew block adds
+            `crew_messages` when the crew-message read failed.
         live_validation:
           $ref: '#/components/schemas/LiveValidation'
         review_diff_truncated:
@@ -2385,6 +2386,46 @@ components:
           $ref: '#/components/schemas/GateViewCaptain'
         precedent:
           $ref: '#/components/schemas/GatePrecedent'
+        crew_messages:
+          type: array
+          items: { $ref: '#/components/schemas/GateViewCrewMessage' }
+          description: |
+            E77.7 / #3741. Every OPEN crew `finding` / `notice` thread root
+            anchored on the run, WHATEVER its recipient role (a finding
+            addressed to architect, security or historian has no stage, so the
+            gate is its only surface), in sequence order. ADVISORY: a finding
+            is never a concern and never enters `open` or the merge gate until
+            the captain converts it (`POST
+            /v0/crew-messages/{sequence}/convert-to-concern`). OMITTED for
+            every run-bound (`mcp:run:`) identity — an implement-stage token
+            can read the gate view, so the block would otherwise be an
+            un-gated read path into crew text (ARCHITECTURE.md §6 invariant
+            #8). Absent when no crew mailbox is wired; absent with a
+            `crew_messages` `history_gaps` entry when the read fails.
+
+    GateViewCrewMessage:
+      type: object
+      description: |
+        One open crew finding/notice on the gate view: contract-closed
+        metadata plus its text ONLY in the prompt quarantine envelope.
+      required: [sent_sequence, message_type, sender_role, recipient_role, state, sent_at, rendered]
+      properties:
+        sent_sequence: { type: integer, format: int64 }
+        message_type: { type: string, enum: [finding, notice] }
+        sender_role: { type: string }
+        recipient_role: { type: string }
+        severity:
+          type: string
+          enum: [low, medium, high]
+          description: A finding's sender-assessed severity; absent when none was set. Advisory.
+        state: { type: string, enum: [open] }
+        sent_at: { type: string, format: date-time }
+        rendered:
+          type: string
+          description: |
+            `prompt.RenderCrewMessages` over this one message — the same bytes
+            `GET /v0/crew-messages/{sequence}` returns, inside the
+            `<<<BEGIN UNTRUSTED CREW MESSAGE>>>` envelope.
 
     GateViewCaptain:
       type: object
@@ -8239,6 +8280,72 @@ components:
             E77.5 / #3739. Present ONLY on the send response of a run-bound
             `response_required` consult: how many more such consults the
             sending stage may send (per-stage cap 2).
+        work_item:
+          $ref: '#/components/schemas/CrewWorkItem'
+        work_item_filing_error:
+          $ref: '#/components/schemas/CrewWorkItemFilingError'
+    CrewWorkItem:
+      type: object
+      description: |
+        E77.7 / #3741. Present ONLY on the send response of a `work_request`:
+        the ONE work item the request filed through the shared work-item
+        filing core (title format, `type:*` default, derived labels,
+        `Status=Backlog`, boarding and epic link). No run is created.
+      required: [type, title, number, url, provider]
+      properties:
+        type: { type: string }
+        title: { type: string }
+        number: { type: integer }
+        url: { type: string, format: uri }
+        provider: { type: string }
+        applied_labels: { type: array, items: { type: string } }
+        defaulted_labels: { type: array, items: { type: string } }
+        missing_label_namespaces: { type: array, items: { type: string } }
+    CrewWorkItemFilingError:
+      type: object
+      description: |
+        E77.7 / #3741. Present ONLY on the send response of a `work_request`
+        whose filing failed. The message was STILL sent — its
+        `crew_message_sent` chain entry is the record — so the response stays
+        201. `code` is one of `run_scoped_filing_required` (a run-bound token
+        on the run-absent path; nothing filed), `crew_work_request_no_repository`
+        (the anchor names no repository), `work_item_filing_failed` (the
+        forge refused), or `internal_error`.
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          enum: [run_scoped_filing_required, crew_work_request_no_repository, work_item_filing_failed, internal_error]
+        message: { type: string }
+        details: { type: object, additionalProperties: true }
+    CrewConvertRequest:
+      type: object
+      description: Optional body; the reason is recorded on the finding's disposition entry only.
+      additionalProperties: false
+      properties:
+        reason: { type: string }
+    CrewConvertResponse:
+      type: object
+      required: [crew_message, concern]
+      properties:
+        crew_message:
+          $ref: '#/components/schemas/CrewMessage'
+        concern:
+          type: object
+          description: The concern the finding became, in state `raised`.
+          required: [id, run_id, stage_id, stage_kind, origin_review_sequence, severity, category, state]
+          properties:
+            id: { $ref: '#/components/schemas/UUID' }
+            run_id: { $ref: '#/components/schemas/UUID' }
+            stage_id: { $ref: '#/components/schemas/UUID' }
+            stage_kind: { type: string, enum: [plan, implement] }
+            origin_review_sequence:
+              type: integer
+              format: int64
+              description: The FINDING's sent sequence, so an implement concern's round derives from when the finding was sent.
+            severity: { type: string, enum: [low, medium, high] }
+            category: { type: string, enum: [crew_finding] }
+            state: { type: string }
     CrewMessageAnswer:
       type: object
       required: [sent_sequence, sender_role, rendered]
@@ -14624,6 +14731,15 @@ paths:
         deadline the consult is disposed `expired` (`answered: false`) — an
         expiry, not a refusal. The stage is never failed or blocked by a
         consult.
+
+        **Work request (E77.7 / #3741, ADR-081 rule 2).** A `work_request`
+        files exactly ONE work item after the send commits, citing the
+        message, its evidence, the anchor run and the sent sequence, and
+        creates NO run. A run-bound token's filing is run-scoped (the anchor
+        run supplies the filing scope). The 201 carries `work_item`, or
+        `work_item_filing_error` when the filing failed — the message stays
+        sent either way. One `crew_work_request_filed` chain entry records a
+        landed filing.
       tags: [runs]
       requestBody:
         required: true
@@ -14913,6 +15029,99 @@ paths:
         '503':
           description: |
             `crew_message_unconfigured` — no crew mailbox on this instance (the documented partial rollback).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/crew-messages/{sequence}/convert-to-concern:
+    post:
+      operationId: convertCrewFindingToConcern
+      summary: The captain converts a crew finding into a review concern
+      description: |
+        E77.7 / #3741 (ADR-081 #3727 D1 option 3). A crew `finding` is
+        ADVISORY — it lives in `crew_messages`, never in the concern store,
+        so it never blocks the merge gate. This is the captain's explicit
+        promotion. The finding must be an OPEN, run-anchored thread root.
+        Order is load-bearing: the finding is disposed `accepted` FIRST (so
+        a second or racing conversion is refused
+        `crew_message_already_disposed` and conversion is exactly-once),
+        THEN one concern is inserted on the run's newest plan or implement
+        stage — severity from the finding (default `medium`), category
+        `crew_finding`, `origin_review_sequence` = the finding's sent
+        sequence, a note quoting the finding's summary and citing
+        `crew_message:<sequence>`. One `crew_finding_converted` chain entry
+        records it. If the insert fails after the dispose, the corrective
+        `crew_finding_convert_failed` entry is appended and the response is
+        500 — never a success entry for a conversion that did not land. The
+        concern is then routed like any other (`concern_ids` on a fix-up).
+
+        **Auth.** A run-bound token is refused `self_decision` before any
+        read — a crew role never promotes its own advice into a blocker; any
+        other identity needs `write:stages`.
+      tags: [runs]
+      parameters:
+        - name: sequence
+          in: path
+          required: true
+          description: The finding's crew_message_sent chain sequence.
+          schema: { type: integer, format: int64, minimum: 1 }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CrewConvertRequest' }
+      responses:
+        '201':
+          description: The disposed finding's metadata and the concern it became.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CrewConvertResponse' }
+        '400':
+          description: |
+            `validation_failed` — a bad sequence, a malformed body, or an unknown body field.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            `self_decision` (a run-bound token) or `insufficient_scope` (lacks `write:stages`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: |
+            `crew_message_not_found` — no crew message at that sequence, or another account's.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: |
+            `crew_message_already_disposed` — the finding is no longer open (including a racing conversion that disposed it first); nothing is inserted.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '413':
+          description: |
+            `body_too_large` — body over 64 KiB.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: |
+            `crew_message_not_finding` — not a `finding`, a run-less anchor, or a thread reply (`details.reason`: `not_a_finding` / `run_less_anchor` / `not_a_thread_root`). `crew_finding_no_concern_stage` — the run has no plan or implement stage for a concern to attach to.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: |
+            `crew_finding_convert_failed` — the finding was disposed but the concern insert failed; a corrective `crew_finding_convert_failed` chain entry records it. `internal_error` — the stage list or the finding's recorded document could not be read (nothing was disposed).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            `crew_message_unconfigured` — no crew mailbox or concern repository on this instance.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

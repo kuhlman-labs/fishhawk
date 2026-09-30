@@ -3363,7 +3363,15 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	// sitting captain, agents refused by the backend. Its action set is CLOSED at
 	// {read, confirm, lower} — there is no raise action. With E77.3's three
 	// crew-message tools the total goes 63 -> 67.
-	const wantToolCount = 67
+	//
+	// E77.7 (#3741) adds exactly ONE tool — fishhawk_convert_crew_finding, the
+	// thin wrapper over POST /v0/crew-messages/{sequence}/convert-to-concern.
+	// WHEN: the captain decides an advisory crew finding should bind, making it
+	// a concern the existing concern_ids fix-up routing addresses.
+	// ELIGIBILITY: write:stages; a run-bound agent token is refused
+	// self_decision. Its own tool, not a decide-escalation mode: it closes a
+	// finding AND mints a concern, a different write. 67 -> 68.
+	const wantToolCount = 68
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",
@@ -3478,7 +3486,8 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	}
 	// The three E77.3 (#3737) crew-message tools must be wire-visible by
 	// NAME, for the same reason as fishhawk_digest above.
-	for _, name := range []string{"fishhawk_send_crew_message", "fishhawk_read_crew_messages", "fishhawk_decide_crew_escalation"} {
+	// E77.7 (#3741) adds fishhawk_convert_crew_finding to the same set.
+	for _, name := range []string{"fishhawk_send_crew_message", "fishhawk_read_crew_messages", "fishhawk_decide_crew_escalation", "fishhawk_convert_crew_finding"} {
 		var saw bool
 		for _, tool := range res.Tools {
 			if tool.Name == name {

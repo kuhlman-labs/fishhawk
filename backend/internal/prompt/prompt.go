@@ -556,11 +556,13 @@ type Trigger struct {
 	// invariant (ADR-029 / ARCHITECTURE.md §6 invariant #8). Do NOT reintroduce
 	// a direct t.CrewMessages render —
 	// TestPrompt_UntrustedIssueFieldsReadOnlyByEnvelopingWriters is the AST
-	// allow-list that fails a raw read. The ONE delivery path today is the
-	// server's resolveAnsweredCrewConsults (E77.5 / #3739), which folds a plan
-	// stage's own ANSWERED consults (question + answer) back into a resumed or
-	// retried plan attempt; every other run leaves it nil (E77.7 owns general
-	// delivery), and a nil slice keeps every render byte-identical.
+	// allow-list that fails a raw read. Two server delivery paths populate it:
+	// resolveAnsweredCrewConsults (E77.5 / #3739) folds a plan stage's own
+	// ANSWERED consults (question + answer) back into a resumed or retried plan
+	// attempt, and resolveDeliverableCrewMessages (E77.7 / #3741) prepends the
+	// run's OPEN findings/notices addressed to the planner (plan) or reviewer
+	// (plan_review, implement_review). A nil slice keeps every render
+	// byte-identical.
 	CrewMessages []CrewMessage
 	// CrewEscalationRulings are the captain's rulings on this run's escalated
 	// crew disagreements (E77.6 / #3740) — the TRUSTED binding channel, rendered

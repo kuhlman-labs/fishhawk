@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -20,6 +21,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/crewmessage"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan/planfixture"
@@ -5453,5 +5455,46 @@ func TestPlanReviewLoop_BlankNoteBackfilled(t *testing.T) {
 	}
 	if rows[0].StageKind != concern.StageKindPlan {
 		t.Errorf("stage kind = %q, want %q", rows[0].StageKind, concern.StageKindPlan)
+	}
+}
+
+// TestRunPlanReviews_DeliversCrewFindingOncePerRound (E77.7 / #3741): an OPEN
+// finding addressed to the reviewer reaches EVERY plan reviewer of the round
+// inside the crew quarantine envelope, a finding addressed to the planner
+// reaches none, and the round records exactly ONE crew_message_delivered entry
+// (resolved per round, not per reviewer) under the plan stage's id.
+func TestRunPlanReviews_DeliversCrewFindingOncePerRound(t *testing.T) {
+	f := newCrewPG(t)
+	runID, stageID := uuid.New(), uuid.New()
+	anthropicFake := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-opus-4-8"}
+	codexFake := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "gpt-5.5"}
+	set := fakeReviewerSet{providers: map[string]PlanReviewer{"anthropic": anthropicFake, "codex": codexFake}, def: anthropicFake}
+	s, _, _, au, _ := newPlanServerWithReviewerSet(t, runID, stageID, set, specHeterogeneousPlanReviewers(0), nil)
+	wireCrewIntoReviewServer(t, s, f, au, runID, stageID)
+	seq := seedCrewMail(t, f, runID, crewmessage.TypeFinding, crewmessage.RoleReviewer, "PLANREV-SENTINEL-reviewer")
+	seedCrewMail(t, f, runID, crewmessage.TypeFinding, crewmessage.RolePlanner, "PLANREV-SENTINEL-planner")
+
+	s.runPlanReviews(context.Background(), runID, stageID, validPlanBytes(t), nil, nil, nil, nil, nil)
+	s.waitBackgroundReviews()
+
+	for name, r := range map[string]*fakePlanReviewer{"anthropic": anthropicFake, "codex": codexFake} {
+		r.mu.Lock()
+		calls := append([]string(nil), r.calls...)
+		r.mu.Unlock()
+		if len(calls) != 1 {
+			t.Fatalf("%s reviewer invoked %d times, want 1", name, len(calls))
+		}
+		requireInsideCrewEnvelopes(t, calls[0], "PLANREV-SENTINEL-reviewer")
+		if strings.Contains(calls[0], "PLANREV-SENTINEL-planner") {
+			t.Errorf("%s plan_review prompt carries the planner's finding", name)
+		}
+	}
+	got := deliveredEntries(t, f, runID)
+	if len(got) != 1 {
+		t.Fatalf("crew_message_delivered entries = %d, want 1 per round", len(got))
+	}
+	if !slices.Equal(got[0].SentSequences, []int64{seq}) || got[0].Render != "plan_review" ||
+		got[0].StageType != string(run.StageTypeReview) || got[0].RecipientRole != string(crewmessage.RoleReviewer) {
+		t.Errorf("delivery = %+v, want [%d] plan_review/review/reviewer", got[0], seq)
 	}
 }

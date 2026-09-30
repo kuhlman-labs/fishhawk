@@ -41,7 +41,7 @@ _Generated from the canonical sources by `scripts/gen-site-reference`; do not ed
 
 ## Operations
 
-The v0 REST API exposes **153 operations** across the paths below, generated from [`docs/api/v0.openapi.yaml`](https://github.com/kuhlman-labs/fishhawk/blob/main/docs/api/v0.openapi.yaml). That document is the source of truth; this table is its published rendering.
+The v0 REST API exposes **154 operations** across the paths below, generated from [`docs/api/v0.openapi.yaml`](https://github.com/kuhlman-labs/fishhawk/blob/main/docs/api/v0.openapi.yaml). That document is the source of truth; this table is its published rendering.
 
 | Method | Path | Summary |
 |---|---|---|
@@ -121,6 +121,7 @@ The v0 REST API exposes **153 operations** across the paths below, generated fro
 | `GET` | `/v0/crew-messages/{sequence}` | Read one crew message in prompt-rendered form |
 | `POST` | `/v0/crew-messages/{sequence}/respond` | Answer a crew message (refused over HTTP) |
 | `POST` | `/v0/crew-messages/{sequence}/escalation-decision` | The captain's decision on a crew escalation |
+| `POST` | `/v0/crew-messages/{sequence}/convert-to-concern` | The captain converts a crew finding into a review concern |
 | `GET` | `/v0/audit/export` | Compliance export in the verifier's Export v1 wire shape |
 | `GET` | `/v0/audit/export.csv` | Flat CSV rendering of the compliance export for spreadsheet workflows |
 | `GET` | `/v0/reports/agent-changes` | Canned compliance report of all agent changes in a date range (JSON) |
