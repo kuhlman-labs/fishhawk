@@ -302,6 +302,12 @@ var mcpToolScopes = map[string]mcpToolScopeRule{
 	// self_decision outright, every other identity needs write:stages — so
 	// write:messages is deliberately ABSENT here.
 	"fishhawk_decide_crew_escalation": {anyOf: []string{"write:stages"}},
+	// fishhawk_convert_crew_finding (E77.7 / #3741) POSTs
+	// /v0/crew-messages/{sequence}/convert-to-concern
+	// (handleConvertCrewFindingToConcern): the decide row's shape — a
+	// run-bound token is refused self_decision, every other identity needs
+	// write:stages, so write:messages is deliberately ABSENT.
+	"fishhawk_convert_crew_finding": {anyOf: []string{"write:stages"}},
 	// fishhawk_delegation_confirm (E76.5 / #3768) dials THREE endpoints:
 	// action=read GETs /v0/repos/{owner}/{name}/delegation/confirmation
 	// (delegation_confirm.go handleGetDelegationConfirmation), which checks NO
