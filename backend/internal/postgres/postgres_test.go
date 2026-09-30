@@ -2879,6 +2879,129 @@ func TestMigrateDown_CaptainReadWatermarksReversal(t *testing.T) {
 	}
 }
 
+// TestMigrateDown_CrewMessagesReversal pins 0090 (E77.2 / #3736, ADR-081):
+// after MigrateUp crew_messages exists under ENABLE + FORCE row-level security
+// with ONE crew_messages_tenant_isolation policy whose USING and WITH CHECK
+// predicates are identical to audit_entries' 0057 policy (read from
+// pg_policies for BOTH tables, so a drifted predicate on either side reddens
+// it); the table carries NO trigger (it is DERIVED — truncatable and
+// rebuildable, unlike the append-only chain); after rolling back through 0090
+// the policy and the table are gone, the schema lands on 0089, and a row in
+// the table 0089 created (captain_read_watermarks) survives — the down
+// migration touches only its own derived table.
+func TestMigrateDown_CrewMessagesReversal(t *testing.T) {
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+	ctx := context.Background()
+
+	var rowSec, forceSec bool
+	if err := pool.QueryRow(ctx,
+		`SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE relname = 'crew_messages'`,
+	).Scan(&rowSec, &forceSec); err != nil {
+		t.Fatalf("query crew_messages pg_class RLS flags (0090 table missing?): %v", err)
+	}
+	if !rowSec || !forceSec {
+		t.Errorf("crew_messages relrowsecurity=%v relforcerowsecurity=%v after MigrateUp, want true/true (0090 ENABLE + FORCE)", rowSec, forceSec)
+	}
+	policyPredicates := func(table, policy string) (qual, check string) {
+		t.Helper()
+		if err := pool.QueryRow(ctx,
+			`SELECT qual, with_check FROM pg_policies WHERE tablename = $1 AND policyname = $2`,
+			table, policy,
+		).Scan(&qual, &check); err != nil {
+			t.Fatalf("read %s.%s from pg_policies: %v", table, policy, err)
+		}
+		return qual, check
+	}
+	cmQual, cmCheck := policyPredicates("crew_messages", "crew_messages_tenant_isolation")
+	aeQual, aeCheck := policyPredicates("audit_entries", "audit_entries_tenant_isolation")
+	if cmQual != aeQual || cmCheck != aeCheck {
+		t.Errorf("crew_messages policy predicates drifted from audit_entries':\n USING      %q\n want       %q\n WITH CHECK %q\n want       %q",
+			cmQual, aeQual, cmCheck, aeCheck)
+	}
+	var policyCount, triggers int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM pg_policies WHERE tablename = 'crew_messages'`,
+	).Scan(&policyCount); err != nil {
+		t.Fatalf("count crew_messages policies: %v", err)
+	}
+	if policyCount != 1 {
+		t.Errorf("crew_messages policy count = %d, want 1 (a second permissive policy would OR-widen the tenant predicate)", policyCount)
+	}
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM pg_trigger WHERE tgrelid = 'crew_messages'::regclass AND NOT tgisinternal`,
+	).Scan(&triggers); err != nil {
+		t.Fatalf("count crew_messages triggers: %v", err)
+	}
+	if triggers != 0 {
+		t.Errorf("crew_messages trigger count = %d, want 0 (the table is DERIVED and must stay truncatable)", triggers)
+	}
+
+	// Seed the table so the DROP is exercised against real data (and TRUNCATE
+	// is proven to work), and a row in the table one migration below so its
+	// survival is observable.
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO crew_messages (sent_sequence, sent_entry_hash, issue_ref, message_type, sender_role,
+		     recipient_role, thread_root_sequence, state, sent_at, last_applied_sequence)
+		 VALUES (1, 'h', 'issue:3736', 'notice', 'reviewer', 'captain', 1, 'open', now(), 1)`,
+	); err != nil {
+		t.Fatalf("seed crew_messages row after MigrateUp: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `TRUNCATE crew_messages`); err != nil {
+		t.Errorf("TRUNCATE crew_messages = %v, want nil (the derived table must be rebuildable)", err)
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO crew_messages (sent_sequence, sent_entry_hash, issue_ref, message_type, sender_role,
+		     recipient_role, thread_root_sequence, state, sent_at, last_applied_sequence)
+		 VALUES (2, 'h', 'issue:3736', 'notice', 'reviewer', 'captain', 2, 'open', now(), 2)`,
+	); err != nil {
+		t.Fatalf("re-seed crew_messages row after TRUNCATE: %v", err)
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO captain_read_watermarks (captain_subject, repo, sequence) VALUES ('cap', 'r', 7)`,
+	); err != nil {
+		t.Fatalf("seed 0089 watermark row: %v", err)
+	}
+
+	// Roll back through 0090, the reversal under test. downThrough asserts the
+	// schema lands on 0089.
+	downThrough(t, url, "0090")
+
+	var tables, policies int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'crew_messages'`,
+	).Scan(&tables); err != nil {
+		t.Fatalf("count crew_messages tables after rollback: %v", err)
+	}
+	if tables != 0 {
+		t.Errorf("crew_messages table count after rollback = %d, want 0", tables)
+	}
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM pg_policies WHERE policyname = 'crew_messages_tenant_isolation'`,
+	).Scan(&policies); err != nil {
+		t.Fatalf("count crew_messages policy after rollback: %v", err)
+	}
+	if policies != 0 {
+		t.Errorf("crew_messages_tenant_isolation policy count after rollback = %d, want 0", policies)
+	}
+	var seq int64
+	if err := pool.QueryRow(ctx,
+		`SELECT sequence FROM captain_read_watermarks WHERE captain_subject = 'cap' AND repo = 'r'`,
+	).Scan(&seq); err != nil {
+		t.Fatalf("re-read 0089 watermark after rolling back 0090: %v", err)
+	}
+	if seq != 7 {
+		t.Errorf("0089 watermark sequence after rolling back 0090 = %d, want 7 (untouched)", seq)
+	}
+}
+
 // TestMigrateDown_ApprovalConditionsTruncatedUniqueReversal pins 0068 (#2622,
 // E67.25): the partial unique index
 // audit_entries_approval_conditions_truncated_once_idx must be PRESENT after

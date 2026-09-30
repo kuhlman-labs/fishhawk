@@ -2011,6 +2011,22 @@ Notes:
   DELIVERED by E77.6 #3740 / E60.3 #2292 — this surface sends nothing. Listed
   here so a future reader grepping the audit categories doesn't mistake them for
   comment surfaces.
+- The crew-message kinds — `crew_message_sent`, `crew_message_disposed` and
+  `crew_message_escalated` (E77.2 / #3736, ADR-081 #3727 D2/D3) — are
+  **internal, audit-only categories, not issue-comment surfaces**. They are
+  written by `backend/internal/crewmessage`'s `Mailbox` (`Send`, `Dispose`, and
+  `Dispose`'s refused (bound+1)th rejection respectively) via
+  `audit.AppendChainedTx` for a run anchor or `audit.AppendGlobalChainedTx` for
+  an issue / decision-record anchor, and the derived `crew_messages` table is
+  rebuilt from them. Nothing in `issuecomment` posts them, they have no Notifier
+  method, and none is in `issuecomment`'s `activityCategories`. The reason is
+  structural, not a preference: this child ships NO delivery surface (no REST
+  route, MCP tool or CLI), so no `backend/internal/server` writer exists to call
+  `(*Server).notifyOperatorVisible`, and a `renderActivityLine` case would be
+  unreachable. E77.5 / E77.7, which ship the delivery surface, must revisit this
+  decision in the same change that adds a server writer. Listed here so a future
+  reader grepping the audit categories doesn't mistake them for comment
+  surfaces.
 - The board-state-sync kind — `work_item_transitioned` (#1012) — is an
   **internal, audit-only category, not an issue-comment surface**. Nothing in
   `issuecomment` posts it; it has no Notifier method. It is written under its
