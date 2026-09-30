@@ -1024,6 +1024,7 @@ func (n *Notifier) NotifyStatusUpdateForRun(ctx context.Context, runID uuid.UUID
 		SupersededPlans:    superseded,
 		PlanEchoSuppressed: suppressed,
 		Economics:          BuildRunEconomics(runRow, entries, children),
+		Precedent:          distilAnchorPrecedent(entries, stages),
 		ExternalURL:        n.externalURL,
 		Now:                n.now(),
 	})
@@ -2859,4 +2860,91 @@ func extractKind(payload []byte) Kind {
 		return ""
 	}
 	return Kind(p.Kind)
+}
+
+// auditCategoryPrecedentSurfaced is the chain category the gate precedent
+// block is recorded under (backend/internal/server's CategoryPrecedentSurfaced,
+// E75.4 / #3732). Redeclared as a literal because this package cannot import
+// server. It is INTERNAL: deliberately NOT in activityCategories (one activity
+// line per gate open would be thread noise); it surfaces only inside the
+// anchor's droppable precedent section (docs/issue-comment-surfaces.md).
+const auditCategoryPrecedentSurfaced = "precedent_surfaced"
+
+// anchorPrecedentMaxCited bounds the cited lines the anchor renders, matching
+// the gate block's own bound so a malformed oversized payload cannot grow the
+// section.
+const anchorPrecedentMaxCited = 3
+
+// anchorPrecedentPayload is the subset of the precedent_surfaced payload the
+// anchor renders. Tags match backend/internal/server's precedentSurfacedPayload.
+type anchorPrecedentPayload struct {
+	DecisionClass string `json:"decision_class"`
+	StageID       string `json:"stage_id"`
+	IndexVersion  string `json:"index_version"`
+	Cited         []struct {
+		SourceSequence int64  `json:"source_sequence"`
+		Outcome        string `json:"outcome"`
+		Score          struct {
+			Total float64 `json:"total"`
+		} `json:"score"`
+	} `json:"cited"`
+	Summary struct {
+		Count          int     `json:"count"`
+		ModalOutcome   string  `json:"modal_outcome"`
+		AgreementRatio float64 `json:"agreement_ratio"`
+	} `json:"summary"`
+}
+
+// distilAnchorPrecedent returns the NEWEST decodable precedent_surfaced entry
+// on the chain as an AnchorPrecedent, or nil. BEST-EFFORT: an undecodable
+// payload is skipped (the next-newest is tried), never fatal to the rebuild.
+//
+// It renders only while the recorded gate is STILL OPEN — the entry's stage is
+// awaiting_approval or awaiting_scope_decision. Once the captain decides, the
+// block describes a gate that no longer exists, so the section disappears
+// rather than lingering as stale context. An entry citing nothing distils to a
+// block RenderPrecedentSection renders as "" (its own empty-cited guard).
+func distilAnchorPrecedent(entries []*audit.Entry, stages []*run.Stage) *AnchorPrecedent {
+	for i := len(entries) - 1; i >= 0; i-- {
+		e := entries[i]
+		if e == nil || e.Category != auditCategoryPrecedentSurfaced {
+			continue
+		}
+		var p anchorPrecedentPayload
+		if json.Unmarshal(e.Payload, &p) != nil {
+			continue
+		}
+		if !precedentGateStillOpen(p.StageID, stages) {
+			return nil
+		}
+		out := &AnchorPrecedent{
+			DecisionClass:  p.DecisionClass,
+			IndexVersion:   p.IndexVersion,
+			Count:          p.Summary.Count,
+			ModalOutcome:   p.Summary.ModalOutcome,
+			AgreementRatio: p.Summary.AgreementRatio,
+		}
+		for j, c := range p.Cited {
+			if j >= anchorPrecedentMaxCited {
+				break
+			}
+			out.Cited = append(out.Cited, AnchorPrecedentCitation{
+				SourceSequence: c.SourceSequence, Outcome: c.Outcome, ScoreTotal: c.Score.Total,
+			})
+		}
+		return out
+	}
+	return nil
+}
+
+// precedentGateStillOpen reports whether the stage a precedent_surfaced entry
+// was recorded for is still parked at a human gate.
+func precedentGateStillOpen(stageID string, stages []*run.Stage) bool {
+	for _, st := range stages {
+		if st == nil || st.ID.String() != stageID {
+			continue
+		}
+		return st.State == run.StageStateAwaitingApproval || st.State == run.StageStateAwaitingScopeDecision
+	}
+	return false
 }

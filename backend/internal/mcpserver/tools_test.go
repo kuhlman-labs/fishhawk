@@ -37,6 +37,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/policy"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/precedent"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/securityscan"
@@ -16629,5 +16630,148 @@ func TestRejectPlanInputSchema_DeclaresRejectClass(t *testing.T) {
 	}
 	if !strings.Contains(tool.Description, "--decompose") {
 		t.Errorf("fishhawk_reject_plan description must direct decomposition at the --decompose marker; got:\n%s", tool.Description)
+	}
+}
+
+// --- E75.4 / #3732: precedent at the gate on run status ---------------------
+
+const runStatusPrecedentSentinel = "SENTINEL-precedent-reason-excerpt"
+
+// seededRunStatusPrecedent is a gate precedent block as the backend's
+// single-run read carries it on run.precedent.
+func seededRunStatusPrecedent() *gatePrecedent {
+	return &gatePrecedent{
+		DecisionClass: "plan_approval", StageID: uuid.NewString(), IndexVersion: "precedent-rank-v1",
+		Fingerprint: "fp-run-status",
+		Items: []precedent.Item{{
+			SourceSequence: 41, SourceEntryHash: "h41", Repo: "x/y", DecisionClass: "plan_approval",
+			Outcome: "approved", ReasonExcerpt: runStatusPrecedentSentinel,
+			MatchedKeys: precedent.MatchedKeys{TouchedPathPrefixes: []string{"backend/"}, TouchedPathPrefixesTotal: 1, EscalationKeys: []string{}},
+			Score:       precedent.ScoreComponents{TouchedPaths: 0.4, Total: 0.4},
+		}},
+		Summary:   precedent.Summary{Count: 1, Human: 1, ModalOutcome: "approved", AgreementRatio: 1, DoctrineVersions: []string{}},
+		Degraded:  []PrecedentDegraded{},
+		FullQuery: gatePrecedentQuery{Tool: "fishhawk_precedent", DecisionClass: "plan_approval", Repo: "x/y"},
+	}
+}
+
+// TestGetRunStatus_PrecedentHoistedAndCompacted: the single-run read's
+// run.precedent is HOISTED to the top-level precedent field (so it appears
+// once, beside next_actions), and under the compact default each cited item's
+// reason excerpt is replaced by the elision marker while the scores, matched
+// keys, outcome, citation and summary survive. include_review_prose=true
+// returns the excerpt untouched.
+func TestGetRunStatus_PrecedentHoistedAndCompacted(t *testing.T) {
+	fb, srv, runID := seedCompactFixture(t)
+	row := fb.getRunByID[runID]
+	row.Precedent = seededRunStatusPrecedent()
+	fb.getRunByID[runID] = row
+	r := newResolver(srv, nil)
+
+	_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	if out.Run.Precedent != nil {
+		t.Errorf("run.precedent = %+v, want nil (hoisted to the top level)", out.Run.Precedent)
+	}
+	p := out.Precedent
+	if p == nil || len(p.Items) != 1 {
+		t.Fatalf("precedent = %+v, want the hoisted block with one cited item", p)
+	}
+	if p.Items[0].ReasonExcerpt != elidedPrecedentExcerptMarker {
+		t.Errorf("compact default: reason_excerpt = %q, want the elision marker", p.Items[0].ReasonExcerpt)
+	}
+	if p.Items[0].Score.Total != 0.4 || p.Items[0].Outcome != "approved" || p.Items[0].SourceEntryHash != "h41" ||
+		len(p.Items[0].MatchedKeys.TouchedPathPrefixes) != 1 || p.Summary.ModalOutcome != "approved" ||
+		p.FullQuery.Tool != "fishhawk_precedent" {
+		t.Errorf("compact default dropped a decidable field: %+v", p)
+	}
+	raw, _ := json.Marshal(out)
+	if strings.Contains(string(raw), runStatusPrecedentSentinel) {
+		t.Errorf("compact default leaked the reason excerpt onto the wire")
+	}
+	if n := strings.Count(string(raw), `"fingerprint":"fp-run-status"`); n != 1 {
+		t.Errorf("precedent block serialized %d times, want exactly 1", n)
+	}
+
+	_, full, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String(), IncludeReviewProse: true})
+	if err != nil {
+		t.Fatalf("getRunStatus include_review_prose: %v", err)
+	}
+	if full.Precedent == nil || full.Precedent.Items[0].ReasonExcerpt != runStatusPrecedentSentinel {
+		t.Errorf("include_review_prose: precedent = %+v, want the excerpt restored", full.Precedent)
+	}
+}
+
+// TestGetRunStatus_PrecedentChangesNoNextActions is the MCP half of the
+// never-a-gate-input criterion (ADR-082 rule 2): the SAME run fixture with and
+// without a precedent block yields byte-identical next_actions and stage
+// states. Only the precedent field differs.
+func TestGetRunStatus_PrecedentChangesNoNextActions(t *testing.T) {
+	fb, srv, runID := seedCompactFixture(t)
+	r := newResolver(srv, nil)
+	statusFor := func(withPrecedent bool) GetRunStatusOutput {
+		row := fb.getRunByID[runID]
+		row.Precedent = nil
+		if withPrecedent {
+			row.Precedent = seededRunStatusPrecedent()
+		}
+		fb.getRunByID[runID] = row
+		_, out, err := r.getRunStatus(context.Background(), nil, GetRunStatusInput{RunID: runID.String()})
+		if err != nil {
+			t.Fatalf("getRunStatus(withPrecedent=%v): %v", withPrecedent, err)
+		}
+		return out
+	}
+	with, without := statusFor(true), statusFor(false)
+	if with.Precedent == nil || without.Precedent != nil {
+		t.Fatalf("fixture: precedent with=%v without=%v, want present/absent", with.Precedent != nil, without.Precedent != nil)
+	}
+	gotNA, _ := json.Marshal(with.NextActions)
+	wantNA, _ := json.Marshal(without.NextActions)
+	if with.NextActions == nil || string(gotNA) != string(wantNA) {
+		t.Errorf("next_actions changed by the precedent block:\n with    %s\n without %s", gotNA, wantNA)
+	}
+	for i := range with.Stages {
+		if with.Stages[i].State != without.Stages[i].State {
+			t.Errorf("stage %d state %q vs %q", i, with.Stages[i].State, without.Stages[i].State)
+		}
+	}
+}
+
+// TestRunStatusBound_T1ShedsPrecedent: the response-budget ladder's FIRST tier
+// sheds the display-only precedent block (E75.4 / #3732) and itemises it as a
+// STORED elision pointing at the gate view, so the block cannot bypass the
+// budget and its omission is legible, never silent. A response with no block
+// records no entry for it.
+func TestRunStatusBound_T1ShedsPrecedent(t *testing.T) {
+	runID := uuid.NewString()
+	out := GetRunStatusOutput{Precedent: seededRunStatusPrecedent()}
+	led := &elisionLedger{}
+	tierDerivedEconomics(&out, runID, led)
+	if out.Precedent != nil {
+		t.Errorf("T1 left the precedent block in place: %+v", out.Precedent)
+	}
+	var got *elidedField
+	for i := range led.entries {
+		if led.entries[i].field == "precedent" {
+			got = &led.entries[i]
+		}
+	}
+	if got == nil {
+		t.Fatalf("T1 shed the precedent block without itemising it: %+v", led.entries)
+	}
+	if got.class != classStored || !strings.Contains(got.pointer, "fishhawk_get_gate_view") {
+		t.Errorf("precedent elision = %+v, want a stored elision pointing at the gate view", *got)
+	}
+
+	empty := GetRunStatusOutput{}
+	led = &elisionLedger{}
+	tierDerivedEconomics(&empty, runID, led)
+	for _, e := range led.entries {
+		if e.field == "precedent" {
+			t.Errorf("an absent block must record no elision: %+v", e)
+		}
 	}
 }

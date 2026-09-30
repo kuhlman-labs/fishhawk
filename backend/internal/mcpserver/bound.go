@@ -642,6 +642,10 @@ var runStatusPathTable = []pathClassification{
 		}
 	}},
 	{Path: "elisions", Tier: tierNever},
+	// precedent (E75.4 / #3732) is the display-only gate precedent block,
+	// hoisted off run.precedent. It sheds at T1 — first, matching the issue
+	// anchor's ladder — and the gate view returns it whole.
+	{Path: "precedent", Tier: "T1", Class: classStored, Surfaces: gateView},
 
 	// --- run.* -----------------------------------------------------------
 	{Path: "run.id", Tier: tierNever},
@@ -668,6 +672,9 @@ var runStatusPathTable = []pathClassification{
 	{Path: "run.live_validation", Tier: "T9", Class: classStored, Surfaces: restRun},
 	{Path: "run.review_head_mismatch", Tier: "T9", Class: classStored, Surfaces: restRun},
 	{Path: "run.review_authority", Tier: "T9", Class: classStored, Surfaces: restRun},
+	// run.precedent is always nil here: getRunStatus hoists it to the top-level
+	// precedent path above, so no tier ever has anything to reduce.
+	{Path: "run.precedent", Tier: tierNever},
 	{Path: "run.concerns.open", Tier: "skeleton", Class: classStored, Surfaces: gateView},
 	{Path: "run.concerns.by_state", Tier: "skeleton", Class: classStored, Surfaces: gateView},
 	{Path: "run.concerns.open_implement", Tier: "skeleton", Class: classStored, Surfaces: gateView},
@@ -855,6 +862,11 @@ var runStatusTiers = []runStatusTier{
 }
 
 func tierDerivedEconomics(out *GetRunStatusOutput, runID string, led *elisionLedger) {
+	if out.Precedent != nil {
+		out.Precedent = nil
+		led.add(classified("precedent", runID,
+			"the display-only gate precedent block is recorded on the audit chain (precedent_surfaced) and returned whole by the gate view", 0))
+	}
 	const why = "recomputed at read time from the cost ledger or the audit-chain timestamps; never stored, so no pointer can retrieve it"
 	if out.Cost != nil {
 		out.Cost = nil

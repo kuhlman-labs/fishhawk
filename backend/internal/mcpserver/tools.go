@@ -1699,6 +1699,16 @@ type GetRunStatusOutput struct {
 	// gates the run. For drive-enabled runs the drive next_action is
 	// folded in as the first entry so the two surfaces agree.
 	NextActions *NextActions `json:"next_actions,omitempty" jsonschema:"server-suggested next actions (#1024): the classified run lifecycle state plus the legal next moves — each entry names the tool to call (with key params), its precondition, what it consumes (none, fixup_budget, retry_budget, approval_slot, new_run), and a one-line reason. Every non-terminal run carries at least one action; terminal runs carry the state with no actions. Display-only — never gates the run"`
+	// Precedent is the bounded precedent block for the run's open human gate
+	// (E75.4 / #3732, ADR-082 decision (c)), hoisted off the single-run read's
+	// run.precedent so it sits beside next_actions and appears once. It is
+	// DISPLAY-ONLY: next_actions is computed BEFORE it is attached and never
+	// reads it (never a gate input), and no agent prompt renders it (never an
+	// agent input — pinned by prompt_test.go's
+	// TestPrecedentNeverRendersIntoAnAgentPrompt). Under the compact default
+	// each cited item's reason excerpt is elided (include_review_prose=true
+	// restores it); scores, matched keys, outcomes and the summary survive.
+	Precedent *gatePrecedent `json:"precedent,omitempty" jsonschema:"how this kind of gate was decided before (E75.4): the open gate's decision class, up to 3 cited prior decisions with explained scores + matched keys, the aggregate summary (modal outcome, agreement ratio) and a full_query pointer (fishhawk_precedent) to the unbounded set. DISPLAY-ONLY — never authority, never a gate input, never an agent input; the decision is still the captain's. Reason excerpts are elided unless include_review_prose=true. Omitted when no human gate is open or no precedent is indexed"`
 	// ChildrenStatus is the decomposed-parent per-child + integration-phase
 	// view (#1147): each child's live lifecycle state in slice-index order
 	// plus the fan-in phase classified from the slices_integrated /
@@ -2240,6 +2250,10 @@ func (r *runResolver) getRunStatus(ctx context.Context, req *mcp.CallToolRequest
 	if !in.IncludeIssueContext {
 		runRow.IssueContext = nil
 	}
+	// Hoist the gate precedent block (E75.4) off the run mirror so it appears
+	// ONCE, beside next_actions. nextActions was computed above without it.
+	gatePrecedentBlock := runRow.Precedent
+	runRow.Precedent = nil
 
 	assembled := GetRunStatusOutput{
 		Run:                       *runRow,
@@ -2263,6 +2277,7 @@ func (r *runResolver) getRunStatus(ctx context.Context, req *mcp.CallToolRequest
 		SecurityFindings:          securityFindings,
 		AcceptanceTranscript:      acceptanceTranscript,
 		GroomingApplyStatus:       groomingApplyStatus,
+		Precedent:                 gatePrecedentBlock,
 	}
 
 	// (b) reviewer prose (E45.92 / #3627). The same per-reviewer implement
@@ -2289,6 +2304,7 @@ func (r *runResolver) getRunStatus(ctx context.Context, req *mcp.CallToolRequest
 		if assembled.ImplementReviewStatus != nil {
 			stripReviewProse(assembled.ImplementReviewStatus.Reviews, capImplementNotes)
 		}
+		assembled.Precedent = elidePrecedentExcerpts(assembled.Precedent)
 	}
 	for i := range recent {
 		recent[i].Payload = compactAuditPayload(recent[i].Payload, !in.IncludeIssueContext, !in.IncludeReviewProse)

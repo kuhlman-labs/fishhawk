@@ -74,6 +74,19 @@ Response (gate_view):
     verdicts describe a stale tree: force a fresh round (fishhawk_fixup_stage)
     before merging. Omitted when no mismatch was recorded, or once a newer
     same-stage review round superseded it.
+  - precedent — present when a HUMAN gate is open on the run and the
+    repository has indexed prior decisions of that gate's class (E75.4): how
+    this kind of gate was decided before. Carries decision_class
+    (plan_approval | concern_waive | merge_verdict | scope_amendment),
+    stage_id, index_version, fingerprint, up to 3 cited items (each with its
+    source_sequence + source_entry_hash citation, outcome, explained score,
+    matched keys and a capped reason_excerpt), the aggregate summary (modal
+    outcome, agreement ratio), truncated, degraded[], and a full_query pointer
+    (fishhawk_precedent, plus alternate_decision_class — concern_defer beside
+    concern_waive). DISPLAY-ONLY: never authority, never a gate input, never an
+    agent input — the decision is still yours. What was surfaced is recorded
+    once on the chain as precedent_surfaced. Omitted when no human gate is
+    open, no precedent is indexed, or the backend's index is unwired.
 `),
 	}, resolver.getGateView)
 }

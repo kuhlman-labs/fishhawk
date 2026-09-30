@@ -1073,11 +1073,12 @@ func TestRenderAnchorBody_EconomicsNilOmitted(t *testing.T) {
 	}
 }
 
-// TestAssembleAnchor_EconomicsDroppedFirst pins the #1702 degradation ordering
-// directly on the ladder: the economics block is the FIRST droppable section
-// shed under the comment cap, before the timeline and superseded plans. The
-// header, what-now line, current plan, and footer are never dropped.
-func TestAssembleAnchor_EconomicsDroppedFirst(t *testing.T) {
+// TestAssembleAnchor_LadderOrder pins the degradation ordering directly on the
+// ladder: the gate precedent section (E75.4 / #3732) is the FIRST droppable
+// section shed under the comment cap, and the pre-E75.4 relative order below it
+// is preserved — economics (#1702), then the timeline, then superseded plans.
+// The header, what-now line, current plan, and footer are never dropped.
+func TestAssembleAnchor_LadderOrder(t *testing.T) {
 	s := anchorSections{
 		header:          "HEADER",
 		whatNow:         "WHATNOW",
@@ -1088,43 +1089,28 @@ func TestAssembleAnchor_EconomicsDroppedFirst(t *testing.T) {
 		modelResolved:   "MODEL",
 		supersededPlans: "SUPERSEDED",
 		economics:       "ECONOMICS",
+		precedent:       "PRECEDENT",
 		footer:          "FOOTER",
 	}
-
-	l0 := assembleAnchor(s, 0)
-	for _, want := range []string{"ECONOMICS", "TIMELINE", "SUPERSEDED", "HEADER", "CURRENTPLAN", "FOOTER"} {
-		if !strings.Contains(l0, want) {
-			t.Errorf("level 0 must contain %q:\n%s", want, l0)
+	// gone[level] is the set of sections absent at that level; every other
+	// droppable section must still be present.
+	droppable := []string{"PRECEDENT", "ECONOMICS", "TIMELINE", "SUPERSEDED"}
+	for level := 0; level <= anchorLadderFloor; level++ {
+		body := assembleAnchor(s, level)
+		for i, sec := range droppable {
+			wantGone := i < level
+			if gone := !strings.Contains(body, sec); gone != wantGone {
+				t.Errorf("level %d: %s gone=%v, want %v:\n%s", level, sec, gone, wantGone, body)
+			}
+		}
+		for _, want := range []string{"HEADER", "WHATNOW", "CURRENTPLAN", "FOOTER"} {
+			if !strings.Contains(body, want) {
+				t.Errorf("level %d must still contain the never-dropped section %q", level, want)
+			}
 		}
 	}
-
-	// Level 1 sheds economics FIRST — timeline and superseded still present.
-	l1 := assembleAnchor(s, 1)
-	if strings.Contains(l1, "ECONOMICS") {
-		t.Errorf("economics must be dropped at level 1 (first):\n%s", l1)
-	}
-	if !strings.Contains(l1, "TIMELINE") || !strings.Contains(l1, "SUPERSEDED") {
-		t.Errorf("timeline and superseded must survive level 1 (dropped after economics):\n%s", l1)
-	}
-
-	// Level 2 sheds the timeline; superseded still present.
-	l2 := assembleAnchor(s, 2)
-	if strings.Contains(l2, "TIMELINE") {
-		t.Errorf("timeline must be dropped at level 2:\n%s", l2)
-	}
-	if !strings.Contains(l2, "SUPERSEDED") {
-		t.Errorf("superseded must survive level 2:\n%s", l2)
-	}
-
-	// Level 3 sheds superseded plans; the never-dropped sections remain.
-	l3 := assembleAnchor(s, 3)
-	if strings.Contains(l3, "SUPERSEDED") {
-		t.Errorf("superseded must be dropped at level 3:\n%s", l3)
-	}
-	for _, want := range []string{"HEADER", "WHATNOW", "CURRENTPLAN", "FOOTER"} {
-		if !strings.Contains(l3, want) {
-			t.Errorf("level 3 must still contain the never-dropped section %q:\n%s", want, l3)
-		}
+	if anchorLadderDropPrecedent != 1 {
+		t.Errorf("precedent drops at level %d, want 1 (FIRST)", anchorLadderDropPrecedent)
 	}
 }
 
@@ -1309,5 +1295,154 @@ func TestRenderAnchorBody_NonCaptainNoteSanitizesCaptain(t *testing.T) {
 	})
 	if !strings.Contains(body, "; captain is `evil'@x`") {
 		t.Errorf("captain must render sanitized inside one code span:\n%s", body)
+	}
+}
+
+// --- E75.4 / #3732: the gate precedent section ------------------------------
+
+func anchorPrecedentFixture() *AnchorPrecedent {
+	return &AnchorPrecedent{
+		DecisionClass: "plan_approval", IndexVersion: "precedent-rank-v1",
+		Count: 3, ModalOutcome: "approved", AgreementRatio: 2.0 / 3.0,
+		Cited: []AnchorPrecedentCitation{
+			{SourceSequence: 41, Outcome: "approved", ScoreTotal: 0.75},
+			{SourceSequence: 17, Outcome: "", ScoreTotal: 0.5},
+		},
+	}
+}
+
+// TestRenderPrecedentSection renders the heading, the display-only framing,
+// the aggregate, one citation line per cited decision, and the full-query
+// pointer; nil and a block citing nothing render nothing.
+func TestRenderPrecedentSection(t *testing.T) {
+	got := RenderPrecedentSection(anchorPrecedentFixture())
+	for _, want := range []string{
+		AnchorPrecedentHeading,
+		"display-only — never authority; the decision is still the captain's",
+		"Most common outcome: `approved` (67% of 3).",
+		AnchorPrecedentCitationMarker + "41` — `approved`, score 0.75",
+		AnchorPrecedentCitationMarker + "17` — `unrecorded`, score 0.50",
+		"`fishhawk_precedent`",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("precedent section missing %q:\n%s", want, got)
+		}
+	}
+	if RenderPrecedentSection(nil) != "" || RenderPrecedentSection(&AnchorPrecedent{DecisionClass: "x"}) != "" {
+		t.Errorf("nil / empty-cited precedent must render nothing")
+	}
+}
+
+// TestRenderAnchorBody_PrecedentPlacement: a wired precedent renders inside the
+// anchor above the footer; nil renders the anchor exactly as before.
+func TestRenderAnchorBody_PrecedentPlacement(t *testing.T) {
+	base := AnchorInput{
+		Run:         anchorRun(),
+		Stages:      []*run.Stage{{Type: run.StageTypePlan, State: run.StageStateAwaitingApproval}},
+		ExternalURL: "https://app.example",
+		Now:         time.Unix(1000, 0).UTC(),
+	}
+	without := RenderAnchorBody(base)
+	base.Precedent = anchorPrecedentFixture()
+	with := RenderAnchorBody(base)
+	pIdx, fIdx := strings.Index(with, AnchorPrecedentHeading), strings.Index(with, "[View run →]")
+	if pIdx < 0 || fIdx < 0 || pIdx > fIdx {
+		t.Errorf("precedent section must render above the footer (precedent=%d footer=%d):\n%s", pIdx, fIdx, with)
+	}
+	if strings.Contains(without, AnchorPrecedentHeading) {
+		t.Errorf("nil precedent must render no section:\n%s", without)
+	}
+	if strings.Replace(with, RenderPrecedentSection(base.Precedent)+"\n", "", 1) != without {
+		t.Errorf("a wired precedent changed more than its own section:\n with    %q\n without %q", with, without)
+	}
+}
+
+// ladderOverflowInput returns an anchor input carrying BOTH the economics block
+// and the precedent section whose FULL body exceeds the comment cap by exactly
+// overflow bytes, tuned through the current plan's scope path length.
+func ladderOverflowInput(t *testing.T, overflow int) AnchorInput {
+	t.Helper()
+	econ := fullEconomics()
+	in := AnchorInput{
+		Run:         anchorRun(),
+		Stages:      []*run.Stage{{Type: run.StageTypePlan, State: run.StageStateAwaitingApproval}},
+		Audit:       []*audit.Entry{startedEntry(10, "plan")},
+		Economics:   &econ,
+		Precedent:   anchorPrecedentFixture(),
+		ExternalURL: "https://app.example",
+		Now:         time.Unix(1000, 0).UTC(),
+	}
+	build := func(n int) AnchorInput {
+		c := in
+		c.CurrentPlan = &AnchorPlanView{
+			Summary: "Current plan summary stays.",
+			Files:   []plan.ScopeFile{{Path: strings.Repeat("p", n), Operation: "modify"}},
+		}
+		c.SupersededPlans = []AnchorPlanView{{Summary: "Old plan", Files: []plan.ScopeFile{{Path: "old.go", Operation: "modify"}}}}
+		return c
+	}
+	sectionsFor := func(c AnchorInput) anchorSections {
+		return anchorSections{
+			marker: stickyMarker(stickyLocusAnchor, c.Run.ID), header: renderAnchorHeader(c.Run, c.ExternalURL),
+			captain: renderAnchorCaptain(c.Captain), whatNow: renderWhatNow(c.Run, c.Stages),
+			stages: renderAnchorStages(c.Stages), timeline: renderAnchorTimeline(c.Audit, c.Captain),
+			reviews: renderAnchorReviews(c.Stages, c.Audit), currentPlan: renderCurrentPlan(c.CurrentPlan, false),
+			modelResolved: renderResolvedModel(c.Audit), supersededPlans: renderSupersededPlans(c.SupersededPlans),
+			economics: renderEconomicsSection(c.Economics), precedent: RenderPrecedentSection(c.Precedent),
+			footer: renderAnchorFooter(c.Run, c.ExternalURL),
+		}
+	}
+	probe := len(assembleAnchor(sectionsFor(build(0)), 0))
+	c := build(MaxIssueCommentBodyBytes + overflow - probe)
+	if got := len(assembleAnchor(sectionsFor(c), 0)); got != MaxIssueCommentBodyBytes+overflow {
+		t.Fatalf("fixture: full body = %d bytes, want cap+%d = %d", got, overflow, MaxIssueCommentBodyBytes+overflow)
+	}
+	return c
+}
+
+// TestAnchorLadder_DropsPrecedentFirst: a body over the cap by FEWER bytes than
+// EITHER the precedent section or the economics block can be fixed by shedding
+// exactly one of them, so the outcome discriminates the ladder's first position:
+// precedent is gone while economics, the timeline and superseded plans all
+// SURVIVE. The pre-E75.4 ladder (economics first) would keep precedent and drop
+// economics here.
+func TestAnchorLadder_DropsPrecedentFirst(t *testing.T) {
+	const overflow = 16
+	in := ladderOverflowInput(t, overflow)
+	if n := len(RenderPrecedentSection(in.Precedent)); n <= overflow {
+		t.Fatalf("fixture: precedent section %d bytes must exceed the overflow %d", n, overflow)
+	}
+	if n := len(renderEconomicsSection(in.Economics)); n <= overflow {
+		t.Fatalf("fixture: economics block %d bytes must exceed the overflow %d", n, overflow)
+	}
+	body := RenderAnchorBody(in)
+	if len(body) > MaxIssueCommentBodyBytes {
+		t.Fatalf("body %d exceeds the cap", len(body))
+	}
+	if strings.Contains(body, AnchorPrecedentHeading) {
+		t.Errorf("precedent section must be shed FIRST, but it survived")
+	}
+	for _, want := range []string{"**Economics**", "Old plan", "Current plan summary stays."} {
+		if !strings.Contains(body, want) {
+			t.Errorf("%q must survive when shedding precedent alone fits the cap", want)
+		}
+	}
+}
+
+// TestAnchorLadder_HarderCapKeepsOrderBelowPrecedent: a body over the cap by
+// MORE than precedent + economics but less than precedent + economics + the
+// timeline sheds precedent and economics and keeps the timeline and superseded
+// plans — the preserved economics -> timeline -> superseded order.
+func TestAnchorLadder_HarderCapKeepsOrderBelowPrecedent(t *testing.T) {
+	probe := ladderOverflowInput(t, 0)
+	pre := len(RenderPrecedentSection(probe.Precedent)) + 1
+	econ := len(renderEconomicsSection(probe.Economics)) + 1
+	in := ladderOverflowInput(t, pre+econ-2)
+	body := RenderAnchorBody(in)
+	if strings.Contains(body, AnchorPrecedentHeading) || strings.Contains(body, "**Economics**") {
+		t.Errorf("precedent and economics must both be shed at this cap")
+	}
+	if !strings.Contains(body, "Old plan") {
+		t.Errorf("superseded plans must survive (dropped after the timeline)")
 	}
 }
