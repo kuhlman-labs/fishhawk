@@ -274,7 +274,14 @@ type DriveRunOutput struct {
 	StepsTaken         []DriveStep  `json:"steps_taken,omitempty" jsonschema:"the ordered acts the driver performed; each dispatch and gate act also landed a run_auto_driven audit row"`
 	PageEvent          string       `json:"page_event,omitempty" jsonschema:"the must_page_human event, set only on a paged stop"`
 	NextActions        *NextActions `json:"next_actions,omitempty" jsonschema:"the legal next operator moves, set on a decision_required / paged / stalled stop. fishhawk_get_run_status carries the full lifecycle block"`
-	Warnings           []string     `json:"warnings,omitempty"`
+	// Captain is the hand-off's addressee (E76.3 / #3766, ADR-083 rule 4):
+	// on a decision_required / paged stop the driver makes ONE best-effort
+	// gate-view read and copies its captain block here verbatim — the note
+	// ("approved by X; captain is Y") is the backend's, never recomputed.
+	// Omitted on every other stop, when the backend returns no block, or when
+	// the read fails (a warning then names the failure; the stop is unchanged).
+	Captain  *gateViewCaptain `json:"captain,omitempty" jsonschema:"on a decision_required / paged stop: the repository's current captain and the non-captain approval note, copied from the gate view. Omitted when unavailable"`
+	Warnings []string         `json:"warnings,omitempty"`
 }
 
 // registerDriveRun wires the fishhawk_drive_run tool (#1700).
@@ -352,6 +359,43 @@ Reach for fishhawk_dispatch_stage instead to drive a single stage by hand.
 
 // driveRun is the tool handler: the bounded, resumable drive loop.
 func (r *runResolver) driveRun(ctx context.Context, req *mcp.CallToolRequest, in DriveRunInput) (*mcp.CallToolResult, DriveRunOutput, error) {
+	res, out, err := r.driveRunLoop(ctx, req, in)
+	if err == nil {
+		r.driveAttachCaptain(ctx, &out)
+	}
+	return res, out, err
+}
+
+// driveHandoffStop reports whether a stop hands the run to a human: a
+// decision_required:<state> or paged:<event> stop.
+func driveHandoffStop(reason string) bool {
+	return strings.HasPrefix(reason, "decision_required:") || strings.HasPrefix(reason, "paged:")
+}
+
+// driveAttachCaptain enriches a hand-off stop with the gate view's captain
+// block (E76.3 / #3766, ADR-083 rule 4) so the hand-off names who is being
+// handed to. ONE best-effort read: a hand-off stop is terminal and must never
+// fail on an enrichment, so a read error appends a warning and leaves the
+// stop otherwise unchanged. Every other stop makes no read.
+func (r *runResolver) driveAttachCaptain(ctx context.Context, out *DriveRunOutput) {
+	if !driveHandoffStop(out.StoppedReason) {
+		return
+	}
+	runUUID, err := uuid.Parse(out.RunID)
+	if err != nil {
+		return
+	}
+	gv, err := r.api.GetGateView(ctx, runUUID, "")
+	if err != nil {
+		out.Warnings = append(out.Warnings, "gate-view read for the captain hand-off failed; captain omitted: "+err.Error())
+		return
+	}
+	out.Captain = gv.Captain
+}
+
+// driveRunLoop is the drive loop proper; driveRun wraps it with the hand-off
+// captain enrichment.
+func (r *runResolver) driveRunLoop(ctx context.Context, req *mcp.CallToolRequest, in DriveRunInput) (*mcp.CallToolResult, DriveRunOutput, error) {
 	if in.RunID == "" {
 		return nil, DriveRunOutput{}, errors.New("run_id is required")
 	}

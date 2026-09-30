@@ -626,6 +626,27 @@ type GateView struct {
 	// MUST byte-match the backend's gateViewResponse or the field silently
 	// decodes to nil — the mixed-version degrade.
 	ReviewHeadMismatch *gateViewReviewHeadMismatch `json:"review_head_mismatch,omitempty"`
+	// Captain mirrors the backend's gate-view captain block (E76.3 / #3766,
+	// ADR-083 rule 4): the repository's current captain and the non-captain
+	// approval note. INFORMATIONAL — never an input to quorum or eligibility.
+	// Omitted (nil) when the backend's captain record is unwired or unreadable,
+	// or against an older backend. The json tag MUST byte-match the backend's
+	// gateViewResponse or the block silently decodes to nil.
+	Captain *gateViewCaptain `json:"captain,omitempty"`
+}
+
+// gateViewCaptain mirrors the backend's gateViewCaptain (E76.3 / #3766). The
+// json tags MUST byte-match the backend or each field silently decodes to its
+// zero value (the #371-class hand-maintained-wire-mirror trap). Deliberately
+// UNEXPORTED — same rationale as gateViewDispute: the jsonschema reflection
+// walks it through the exported Captain fields, and exportBaseline is not
+// widened for a nested payload shape.
+type gateViewCaptain struct {
+	Subject             string   `json:"subject,omitempty" jsonschema:"the seated captain's subject; empty when vacant"`
+	IdentityVerified    bool     `json:"identity_verified" jsonschema:"true when the captain's subject is a verified forge identity"`
+	Vacant              bool     `json:"vacant" jsonschema:"true when the repository has no captain (stated, never implied by an absent block)"`
+	NonCaptainApprovers []string `json:"non_captain_approvers" jsonschema:"each human subject that approved on this run and is not the captain, in chain order"`
+	Note                string   `json:"note,omitempty" jsonschema:"'approved by X; captain is Y', composed only when a captain is seated and a non-captain approved"`
 }
 
 // gateViewReviewHeadMismatch mirrors the backend's gateViewReviewHeadMismatch
