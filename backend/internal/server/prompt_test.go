@@ -27,6 +27,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/bundle"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/crewmessage"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/fixupobligation"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	forgegitlab "github.com/kuhlman-labs/fishhawk/backend/internal/forge/gitlab"
@@ -14950,5 +14951,364 @@ func TestRunnerAdvertises(t *testing.T) {
 	}
 	if runnerAdvertises(nil, capabilityPushResume) {
 		t.Error("a nil request must not advertise")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Crew consult fold-in (E77.5 / #3739): resolveAnsweredCrewConsults folds a
+// plan stage's OWN answered consults back into a resumed or retried attempt's
+// prompt, inside the crew quarantine envelope.
+// ---------------------------------------------------------------------------
+
+// consultFoldAuditRepo wraps a real audit repository for the fold-in's
+// degrade branches: listErr fails the crew_message_sent listing, extra is
+// PREPENDED to it (a hostile/undecodable stage-stamped entry), and tamper
+// rewrites the entry_hash of the listed sequences so crewSentDocument's
+// citation check refuses them.
+type consultFoldAuditRepo struct {
+	audit.Repository
+	listErr error
+	extra   []*audit.Entry
+	tamper  map[int64]bool
+}
+
+func (a *consultFoldAuditRepo) ListForRunByCategory(ctx context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
+	if a.listErr != nil && category == crewmessage.CategorySent {
+		return nil, a.listErr
+	}
+	entries, err := a.Repository.ListForRunByCategory(ctx, runID, category)
+	if err != nil || category != crewmessage.CategorySent {
+		return entries, err
+	}
+	out := append([]*audit.Entry{}, a.extra...)
+	for _, e := range entries {
+		if a.tamper[e.Sequence] {
+			c := *e
+			c.EntryHash = "tampered-" + c.EntryHash
+			e = &c
+		}
+		out = append(out, e)
+	}
+	return out, nil
+}
+
+// newConsultFoldServer builds a prompt-capable server over f's pool, mailbox
+// and (optionally wrapped) audit repository.
+func newConsultFoldServer(t *testing.T, f *crewPG, ar audit.Repository) (*Server, *signingFake) {
+	t.Helper()
+	sf := newSigningFake()
+	s := New(Config{
+		Addr:        "127.0.0.1:0",
+		RunRepo:     run.NewPostgresRepository(f.pool),
+		AuditRepo:   ar,
+		CrewMailbox: f.mailbox,
+		SigningRepo: sf,
+	})
+	s.promptIssueGetterOverride = &stubIssueGetter{}
+	return s, sf
+}
+
+// seedStage adds a second stage of stageType to runID and returns its id.
+func (f *crewPG) seedStage(t *testing.T, runID uuid.UUID, sequence int, stageType run.StageType) uuid.UUID {
+	t.Helper()
+	id := uuid.New()
+	if _, err := f.pool.Exec(context.Background(), `INSERT INTO stages (id, run_id, sequence, stage_type, executor_kind, executor_ref, state)
+		VALUES ($1, $2, $3, $4, 'agent', 'claude-code', 'running')`, id, runID, sequence, string(stageType)); err != nil {
+		t.Fatalf("seed stage: %v", err)
+	}
+	return id
+}
+
+// seedStageConsult records a planner consult stamped with stageID BY
+// CONSTRUCTION (straight through the mailbox, never via the HTTP send's
+// budget/registry path) and, when answer is non-empty, answers it through
+// RespondToCrewMessage (threaded notice + accepted). It returns the consult's
+// sent sequence.
+func seedStageConsult(t *testing.T, s *Server, f *crewPG, runID, stageID uuid.UUID, question, answer string) int64 {
+	t.Helper()
+	ctx := context.Background()
+	row, err := f.mailbox.Send(ctx, crewmessage.SendParams{
+		RawMessage: []byte(`{"schema_version":"crew-message-v1","type":"consult","sender_role":"planner","recipient_role":"historian","anchor":` +
+			runAnchor(runID) + `,"payload":{"question":"` + question + `"},"response_required":true}`),
+		Actor:   crewmessage.Actor{Kind: audit.ActorSystem, Subject: "test:planner"},
+		StageID: &stageID,
+	})
+	if err != nil {
+		t.Fatalf("seed consult: %v", err)
+	}
+	if answer != "" {
+		if _, _, err := s.RespondToCrewMessage(ctx, RespondParams{
+			SentSequence: row.SentSequence,
+			Reply: []byte(`{"schema_version":"crew-message-v1","type":"notice","recipient_role":"planner","anchor":` +
+				runAnchor(runID) + `,"payload":{"summary":"` + answer + `"}}`),
+			ResponderRole: crewmessage.RoleHistorian,
+			Actor:         crewmessage.Actor{Kind: audit.ActorSystem, Subject: "test:historian"},
+		}); err != nil {
+			t.Fatalf("answer consult: %v", err)
+		}
+	}
+	return row.SentSequence
+}
+
+// crewMessagesText joins every MessageText, for substring assertions.
+func crewMessagesText(msgs []prompt.CrewMessage) string {
+	var b strings.Builder
+	for _, m := range msgs {
+		b.WriteString(m.MessageText)
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+// requireInsideCrewEnvelopes asserts literal occurs in rendered and that every
+// occurrence lies strictly inside a column-0 crew BEGIN/END pair.
+func requireInsideCrewEnvelopes(t *testing.T, rendered, literal string) {
+	t.Helper()
+	if !strings.Contains(rendered, literal) {
+		t.Fatalf("%q absent from the prompt", literal)
+	}
+	for off := 0; ; {
+		i := strings.Index(rendered[off:], literal)
+		if i < 0 {
+			return
+		}
+		at := off + i
+		begin := strings.LastIndex(rendered[:at], "\n"+crewBegin+"\n")
+		end := strings.LastIndex(rendered[:at], "\n"+crewEnd+"\n")
+		if begin < 0 || end > begin || !strings.Contains(rendered[at:], "\n"+crewEnd+"\n") {
+			t.Fatalf("%q at offset %d is OUTSIDE every crew envelope (last begin %d, last end %d)", literal, at, begin, end)
+		}
+		off = at + len(literal)
+	}
+}
+
+// TestBuildPlanPrompt_FoldsOnlyAnsweredConsults (counterfactual C6): of four
+// consults, only the one that is ANSWERED (accepted + threaded reply) AND
+// stamped with THIS stage folds in, each consult rendered ahead of its answer.
+// The still-open consult on the SAME stage is separated from the answered one
+// ONLY by the state filter, the answered consult on ANOTHER plan stage only by
+// the stage filter, and the accepted-but-unreplied consult only by the
+// reply-presence check.
+func TestBuildPlanPrompt_FoldsOnlyAnsweredConsults(t *testing.T) {
+	f := newCrewPG(t)
+	s, _ := newConsultFoldServer(t, f, f.audit)
+	runID := f.seedRun(t, run.StageTypePlan)
+	stageID := f.stageOf(t, runID)
+	otherStage := f.seedStage(t, runID, 2, run.StageTypePlan)
+
+	seedStageConsult(t, s, f, runID, stageID, "FOLD-Q-answered", "FOLD-A-answered")
+	// The open consult carries a threaded reply that was recorded but never
+	// disposed (the "answered but not disposed" residue runCrewConsult logs),
+	// so the reply-presence check cannot mask the state filter: the state
+	// filter is the ONLY thing keeping it out.
+	openSeq := seedStageConsult(t, s, f, runID, stageID, "FOLD-Q-open", "")
+	if _, err := f.mailbox.Send(context.Background(), crewmessage.SendParams{
+		RawMessage: []byte(`{"schema_version":"crew-message-v1","type":"notice","sender_role":"historian","recipient_role":"planner","anchor":` +
+			runAnchor(runID) + `,"payload":{"summary":"FOLD-A-open-undisposed"}}`),
+		Actor:              crewmessage.Actor{Kind: audit.ActorSystem, Subject: "test:historian"},
+		ThreadRootSequence: &openSeq,
+	}); err != nil {
+		t.Fatalf("reply to the open consult: %v", err)
+	}
+	if row, err := f.mailbox.Store().Get(context.Background(), openSeq); err != nil || row.State != crewmessage.StateOpen {
+		t.Fatalf("fixture: the replied consult must still be open (state %q, err %v)", row.State, err)
+	}
+	seedStageConsult(t, s, f, runID, otherStage, "FOLD-Q-otherstage", "FOLD-A-otherstage")
+	// An ACCEPTED consult with NO threaded reply (disposed directly): the
+	// reply-presence check is the only thing keeping it out.
+	noReply := seedStageConsult(t, s, f, runID, stageID, "FOLD-Q-accepted-noreply", "")
+	if _, err := f.mailbox.Dispose(context.Background(), crewmessage.DisposeParams{
+		SentSequence: noReply, Disposition: crewmessage.DispositionAccepted,
+		Actor: crewmessage.Actor{Kind: audit.ActorSystem, Subject: "test:historian"},
+	}); err != nil {
+		t.Fatalf("dispose the unreplied consult: %v", err)
+	}
+
+	got := s.resolveAnsweredCrewConsults(context.Background(), runID, stageID)
+	if len(got) != 2 {
+		t.Fatalf("folded %d crew messages, want 2 (one consult + its answer):\n%s", len(got), crewMessagesText(got))
+	}
+	if got[0].Type != string(crewmessage.TypeConsult) || !strings.Contains(got[0].MessageText, "FOLD-Q-answered") {
+		t.Errorf("first folded message = %+v, want the answered consult", got[0])
+	}
+	if got[1].Type != string(crewmessage.TypeNotice) || got[1].SenderRole != string(crewmessage.RoleHistorian) ||
+		!strings.Contains(got[1].MessageText, "FOLD-A-answered") {
+		t.Errorf("second folded message = %+v, want the historian's answer", got[1])
+	}
+	text := crewMessagesText(got)
+	for _, leaked := range []string{"FOLD-Q-open", "FOLD-A-open-undisposed", "FOLD-Q-otherstage", "FOLD-A-otherstage", "FOLD-Q-accepted-noreply"} {
+		if strings.Contains(text, leaked) {
+			t.Errorf("fold-in carried %q, which is not this stage's answered consult", leaked)
+		}
+	}
+
+	rendered, err := prompt.Build("plan", prompt.Trigger{Repo: "kuhlman-labs/fishhawk", CrewMessages: got})
+	if err != nil {
+		t.Fatalf("Build(plan): %v", err)
+	}
+	requireInsideCrewEnvelopes(t, rendered, "FOLD-Q-answered")
+	requireInsideCrewEnvelopes(t, rendered, "FOLD-A-answered")
+}
+
+// TestGetStagePrompt_RetriedPlanCarriesAnsweredConsult is the end-to-end fold
+// (issue acceptance criterion 4): a plan stage answers a consult, FAILS, and is
+// RETRIED through the real repository (which re-opens the SAME row); BOTH
+// prompt handlers — the signed /prompt dispatch and the /prompt-render preview
+// — then carry the prior question and its answer inside the crew quarantine
+// envelope, alongside the consult section's do-not-re-ask instruction.
+func TestGetStagePrompt_RetriedPlanCarriesAnsweredConsult(t *testing.T) {
+	f := newCrewPG(t)
+	s, sf := newConsultFoldServer(t, f, f.audit)
+	runID := f.seedRun(t, run.StageTypePlan)
+	stageID := f.stageOf(t, runID)
+	priv, _ := sf.issue(t, runID)
+	// An ordinary (non-grooming) run records its charter determination at
+	// creation; the raw seedRun fixture predates that column.
+	if _, err := f.pool.Exec(context.Background(), `UPDATE runs SET requires_charter = false WHERE id = $1`, runID); err != nil {
+		t.Fatalf("record charter determination: %v", err)
+	}
+
+	seedStageConsult(t, s, f, runID, stageID, "RETRY-Q-prior-question", "RETRY-A-prior-answer")
+
+	ctx := context.Background()
+	catA := run.FailureA
+	reason := "agent exited mid-plan"
+	if _, err := s.cfg.RunRepo.TransitionStage(ctx, stageID, run.StageStateFailed, &run.StageCompletion{
+		FailureCategory: &catA, FailureReason: &reason,
+	}); err != nil {
+		t.Fatalf("fail plan stage: %v", err)
+	}
+	retried, err := s.cfg.RunRepo.RetryStage(ctx, stageID, run.StageStatePending)
+	if err != nil {
+		t.Fatalf("retry plan stage: %v", err)
+	}
+	if retried.ID != stageID {
+		t.Fatalf("retry minted a new stage row %s (want %s) — the stage-id fold would drop every prior answer", retried.ID, stageID)
+	}
+
+	for name, w := range map[string]*httptest.ResponseRecorder{
+		"prompt":        promptRequest(t, s, runID, retried.ID, priv, ""),
+		"prompt-render": promptRenderRequest(t, s, retried.ID),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+			}
+			var resp promptResponse
+			if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			requireInsideCrewEnvelopes(t, resp.Prompt, "RETRY-Q-prior-question")
+			requireInsideCrewEnvelopes(t, resp.Prompt, "RETRY-A-prior-answer")
+			if !strings.Contains(resp.Prompt, "### Crew consults") || !strings.Contains(resp.Prompt, "do NOT re-ask them") {
+				t.Errorf("the retried plan prompt must carry the consult section's do-not-re-ask instruction:\n%s", resp.Prompt)
+			}
+		})
+	}
+}
+
+// TestResolveAnsweredCrewConsults_Unconfigured pins the first best-effort
+// degrade: with no crew mailbox (or no audit repository) the fold returns nil
+// and the prompt build is unaffected.
+func TestResolveAnsweredCrewConsults_Unconfigured(t *testing.T) {
+	s := New(Config{Addr: "127.0.0.1:0"})
+	if got := s.resolveAnsweredCrewConsults(context.Background(), uuid.New(), uuid.New()); got != nil {
+		t.Fatalf("unconfigured fold = %+v, want nil", got)
+	}
+}
+
+// TestResolveAnsweredCrewConsults_ChainListErrorDegrades: a failing chain
+// listing logs and folds nothing (it never fails the prompt build). The fixture
+// holds a genuinely answered consult, so the nil is the degrade and not an
+// empty chain.
+func TestResolveAnsweredCrewConsults_ChainListErrorDegrades(t *testing.T) {
+	f := newCrewPG(t)
+	ok, _ := newConsultFoldServer(t, f, f.audit)
+	runID := f.seedRun(t, run.StageTypePlan)
+	stageID := f.stageOf(t, runID)
+	seedStageConsult(t, ok, f, runID, stageID, "LISTERR-Q", "LISTERR-A")
+	if got := ok.resolveAnsweredCrewConsults(context.Background(), runID, stageID); len(got) != 2 {
+		t.Fatalf("control: folded %d, want 2", len(got))
+	}
+
+	failing, _ := newConsultFoldServer(t, f, &consultFoldAuditRepo{Repository: f.audit, listErr: errors.New("chain unavailable")})
+	if got := failing.resolveAnsweredCrewConsults(context.Background(), runID, stageID); got != nil {
+		t.Fatalf("list-error fold = %+v, want nil", got)
+	}
+}
+
+// TestResolveAnsweredCrewConsults_RowListErrorDegrades: a failing derived-row
+// listing (the crew_messages table is renamed away in this test's OWN cloned
+// database) logs and folds nothing.
+func TestResolveAnsweredCrewConsults_RowListErrorDegrades(t *testing.T) {
+	f := newCrewPG(t)
+	s, _ := newConsultFoldServer(t, f, f.audit)
+	runID := f.seedRun(t, run.StageTypePlan)
+	stageID := f.stageOf(t, runID)
+	seedStageConsult(t, s, f, runID, stageID, "ROWERR-Q", "ROWERR-A")
+	if _, err := f.pool.Exec(context.Background(), `ALTER TABLE crew_messages RENAME TO crew_messages_gone`); err != nil {
+		t.Fatalf("rename crew_messages: %v", err)
+	}
+	if got := s.resolveAnsweredCrewConsults(context.Background(), runID, stageID); got != nil {
+		t.Fatalf("row-list-error fold = %+v, want nil", got)
+	}
+}
+
+// TestResolveAnsweredCrewConsults_SkipsUnresolvableConsults: a stage-stamped
+// chain entry whose payload does not decode, a consult whose OWN document fails
+// the citation check, and a consult whose ANSWER fails it are each skipped —
+// and skipping one never drops a healthy sibling consult.
+func TestResolveAnsweredCrewConsults_SkipsUnresolvableConsults(t *testing.T) {
+	f := newCrewPG(t)
+	plain, _ := newConsultFoldServer(t, f, f.audit)
+	runID := f.seedRun(t, run.StageTypePlan)
+	stageID := f.stageOf(t, runID)
+
+	badQuestion := seedStageConsult(t, plain, f, runID, stageID, "SKIP-Q-badquestion", "SKIP-A-badquestion")
+	badAnswer := seedStageConsult(t, plain, f, runID, stageID, "SKIP-Q-badanswer", "SKIP-A-badanswer")
+	seedStageConsult(t, plain, f, runID, stageID, "SKIP-Q-healthy", "SKIP-A-healthy")
+
+	// The answer to badAnswer is the first reply after it in its thread.
+	var badAnswerReply int64
+	if err := f.pool.QueryRow(context.Background(),
+		`SELECT sent_sequence FROM crew_messages WHERE thread_root_sequence = $1 AND sent_sequence > $1 ORDER BY sent_sequence LIMIT 1`,
+		badAnswer).Scan(&badAnswerReply); err != nil {
+		t.Fatalf("find answer of %d: %v", badAnswer, err)
+	}
+
+	stage := stageID
+	wrapped := &consultFoldAuditRepo{
+		Repository: f.audit,
+		extra:      []*audit.Entry{{Sequence: 1 << 40, StageID: &stage, Category: crewmessage.CategorySent, Payload: []byte(`{not json`)}},
+		tamper:     map[int64]bool{badQuestion: true, badAnswerReply: true},
+	}
+	s, _ := newConsultFoldServer(t, f, wrapped)
+	got := s.resolveAnsweredCrewConsults(context.Background(), runID, stageID)
+	text := crewMessagesText(got)
+	if len(got) != 2 || !strings.Contains(text, "SKIP-Q-healthy") || !strings.Contains(text, "SKIP-A-healthy") {
+		t.Fatalf("folded %d messages, want only the healthy consult + answer:\n%s", len(got), text)
+	}
+	for _, leaked := range []string{"SKIP-Q-badquestion", "SKIP-Q-badanswer", "SKIP-A-badanswer"} {
+		if strings.Contains(text, leaked) {
+			t.Errorf("fold-in carried %q from a consult whose documents failed the citation check", leaked)
+		}
+	}
+}
+
+// TestConsultChannelFiguresMatchServerBounds pins the two figures the plan
+// prompt's consult section TELLS the agent (prompt.ConsultChannelMaxPerStage,
+// prompt.ConsultChannelWindowMinutes) to the bounds this package ENFORCES. The
+// prompt package cannot import server, so the copies are held equal here.
+func TestConsultChannelFiguresMatchServerBounds(t *testing.T) {
+	const sites = "update together: backend/internal/server/crew_consult.go (maxCrewConsultsPerStage / crewConsultWindowSeconds), " +
+		"backend/internal/prompt/prompt.go (ConsultChannelMaxPerStage / ConsultChannelWindowMinutes), " +
+		"backend/internal/prompt/README.md and backend/internal/server/README.md (the consult cap and window prose)"
+	if prompt.ConsultChannelMaxPerStage != maxCrewConsultsPerStage {
+		t.Errorf("plan prompt tells the agent %d consults per stage, the server enforces %d — %s",
+			prompt.ConsultChannelMaxPerStage, maxCrewConsultsPerStage, sites)
+	}
+	if prompt.ConsultChannelWindowMinutes*60 != crewConsultWindowSeconds {
+		t.Errorf("plan prompt tells the agent a ~%d-minute consult window, the server enforces %ds — %s",
+			prompt.ConsultChannelWindowMinutes, crewConsultWindowSeconds, sites)
 	}
 }

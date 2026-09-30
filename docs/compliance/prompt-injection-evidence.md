@@ -158,9 +158,10 @@ report is only meaningful alongside the model and date that produced it.
   three reviewed renders and nowhere in `implement` — but that proves STRUCTURAL
   containment only. Whether a model actually declines to FOLLOW an instruction
   planted in a crew message is UNMEASURED, and is owned by #3187 alongside the
-  other six. A second residual bounds even the structural claim: the render ships
-  BEFORE any delivery path, so nothing populates `prompt.Trigger.CrewMessages`
-  outside this corpus today.
+  other six. A second residual bounds even the structural claim: the render
+  shipped BEFORE its delivery path, and the first delivery path (E77.5 / #3739,
+  `resolveAnsweredCrewConsults`) populates `prompt.Trigger.CrewMessages` on the
+  PLAN prompt only, with the stage's own answered consults.
 - The envelope/no-envelope plan-quality delta against the −0.25 threshold
   (#2291 criteria 1 and 2 — the delta is reported, and a material regression
   changes the treatment).

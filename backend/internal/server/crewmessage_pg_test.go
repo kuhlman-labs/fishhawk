@@ -492,3 +492,34 @@ func TestRespondToCrewMessage_RepliesAndDisposes(t *testing.T) {
 		t.Fatalf("second respond err = %v, want already disposed", err)
 	}
 }
+
+// E77.5 / #3739: only a run-bound response_required consult takes the consult
+// branch. A notice and a consult WITHOUT response_required keep E77.3's
+// response byte-shape (no consult_* members) and their chain entries carry no
+// stage stamp, so neither can consume a stage's consult budget.
+func TestCrewMessageAPI_NonConsultSendUnchangedByConsultBranch(t *testing.T) {
+	f := newCrewPG(t)
+	runA := f.seedRun(t, run.StageTypePlan)
+	tok := runBound(runA, "mcp:read", scopeWriteMessages)
+	for name, body := range map[string]string{
+		"notice":                  crewDoc("notice", "", "historian", runAnchor(runA), `{"summary":"s"}`),
+		"consult_no_response_req": crewDoc("consult", "", "historian", runAnchor(runA), crewConsultPayload),
+	} {
+		t.Run(name, func(t *testing.T) {
+			w := crewCall(t, f.srv.handleSendCrewMessage, http.MethodPost, "/v0/crew-messages", "", body, tok)
+			if w.Code != http.StatusCreated {
+				t.Fatalf("send = %d %s", w.Code, w.Body.String())
+			}
+			if strings.Contains(w.Body.String(), "consult_") {
+				t.Fatalf("non-consult response carries consult members: %s", w.Body.String())
+			}
+			var resp crewMessageResponse
+			_ = json.Unmarshal(w.Body.Bytes(), &resp)
+			var stamped bool
+			if err := f.pool.QueryRow(context.Background(), `SELECT stage_id IS NOT NULL FROM audit_entries WHERE sequence = $1`,
+				resp.SentSequence).Scan(&stamped); err != nil || stamped {
+				t.Fatalf("stage stamped = %v (%v), want unstamped", stamped, err)
+			}
+		})
+	}
+}

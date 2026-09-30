@@ -8109,6 +8109,22 @@ components:
           description: |
             Present and true when the chain entry COMMITTED but the derived row
             did not project. The operation HAPPENED; do not retry it.
+        consult_deadline:
+          type: string
+          format: date-time
+          description: |
+            E77.5 / #3739. Present ONLY on the send response of a run-bound
+            `consult` with `response_required: true`: the effective deadline the
+            in-process responder is held to — min(the document's `deadline`,
+            now + 900 seconds). After it the consult is disposed `expired`
+            ("no answer", never a stage failure).
+        consult_budget_remaining:
+          type: integer
+          minimum: 0
+          description: |
+            E77.5 / #3739. Present ONLY on the send response of a run-bound
+            `response_required` consult: how many more such consults the
+            sending stage may send (per-stage cap 2).
     CrewMessageAnswer:
       type: object
       required: [sent_sequence, sender_role, rendered]
@@ -14479,6 +14495,21 @@ paths:
         document's `anchor.run_id` must be its own run (a run-less anchor is
         refused). Any other identity needs `write:stages` and sends as
         `captain`; a run anchor is checked against the caller's account.
+
+        **Synchronous consult (E77.5 / #3739).** A run-bound token's `consult`
+        with `response_required: true` is bounded and routed BEFORE the chain
+        append: the sending stage may send at most 2 such consults
+        (`crew_consult_budget_exhausted`), and the recipient role must have a
+        registered in-process responder (`crew_responder_unavailable` — no
+        responder is registered on this release, so every consult is refused
+        this way until one is). An accepted consult is stamped with the
+        sending stage, the 201 carries `consult_deadline` and
+        `consult_budget_remaining`, and fishhawkd runs the responder
+        in-process: its answer is a threaded reply the sender reads with
+        `GET /v0/crew-messages/{sequence}?wait=` (`answered: true`); at the
+        deadline the consult is disposed `expired` (`answered: false`) — an
+        expiry, not a refusal. The stage is never failed or blocked by a
+        consult.
       tags: [runs]
       requestBody:
         required: true
@@ -14520,13 +14551,13 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '422':
           description: |
-            `recipient_not_addressable` — the recipient is a role an implement stage executes (invariant #8).
+            `recipient_not_addressable` — the recipient is a role an implement stage executes (invariant #8). `crew_consult_budget_exhausted` — a run-bound `response_required` consult when the sending stage has already sent its cap (`details.max`, `details.used`); nothing is appended. `crew_responder_unavailable` — a run-bound `response_required` consult naming a role with no registered in-process responder (`details.recipient_role`); nothing is appended.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '500':
           description: |
-            `internal_error` — the chain append failed.
+            `internal_error` — the chain append (or the consult-budget count) failed.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -14673,8 +14704,8 @@ paths:
       summary: Answer a crew message (refused over HTTP)
       description: |
         A REFUSAL LADDER (ADR-081 rule 4): only a fishhawkd-invoked responder
-        answers a consult, in-process (`Server.RespondToCrewMessage`), and no
-        HTTP caller is one. A run-bound token is refused
+        answers a consult, in-process (`Server.RespondToCrewMessage`, called by
+        the E77.5 consult dispatcher), and no HTTP caller is one. A run-bound token is refused
         `agent_token_required`; every other identity `responder_required`.
       tags: [runs]
       parameters:

@@ -513,3 +513,16 @@ func TestCrewMessageForPrompt_DecisionRecordAnchorAndEvidence(t *testing.T) {
 		t.Errorf("EvidenceRefs = %v", cm.EvidenceRefs)
 	}
 }
+
+// E77.5 / #3739: a response_required consult under the empty (production)
+// responder registry is refused crew_responder_unavailable BEFORE the mailbox
+// is reached — this server's mailbox has no pool, so reaching Send would fail
+// with a different error.
+func TestCrewMessageAPI_ConsultRefusedBeforeMailboxWithoutResponder(t *testing.T) {
+	s, planRun, _ := crewNoDBServer(t)
+	body := `{"schema_version":"crew-message-v1","type":"consult","recipient_role":"historian","anchor":` +
+		runAnchor(planRun.ID) + `,"payload":` + crewConsultPayload + `,"response_required":true}`
+	w := crewCall(t, s.handleSendCrewMessage, http.MethodPost, "/v0/crew-messages", "", body,
+		runBound(planRun.ID, "mcp:read", scopeWriteMessages))
+	requireCrewRefusal(t, w, http.StatusUnprocessableEntity, "crew_responder_unavailable")
+}
