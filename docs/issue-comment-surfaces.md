@@ -2132,7 +2132,11 @@ Notes:
   route, MCP tool or CLI), so no `backend/internal/server` writer exists to call
   `(*Server).notifyOperatorVisible`, and a `renderActivityLine` case would be
   unreachable. E77.5 / E77.7, which ship the delivery surface, must revisit this
-  decision in the same change that adds a server writer. Listed here so a future
+  decision in the same change that adds a server writer. E77.7 / #3741 revisited
+  it and keeps its four new categories (`crew_message_delivered`,
+  `crew_work_request_filed`, `crew_finding_converted`,
+  `crew_finding_convert_failed`) internal too: crew text reaches a reader only
+  through the quarantine envelope. Listed here so a future
   reader grepping the audit categories doesn't mistake them for comment
   surfaces.
 - The board-state-sync kind — `work_item_transitioned` (#1012) — is an

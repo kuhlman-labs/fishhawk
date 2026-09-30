@@ -1365,6 +1365,9 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		Source: string(runRow.TriggerSource),
 		Repo:   runRow.Repo,
 	}
+	// crewDeliveries is resolved inside the plan-type guard below and recorded
+	// only after the build succeeds; for every other stage type it stays empty.
+	var crewDeliveries crewDelivery
 	if runRow.TriggerRef != nil {
 		if number, ok := parseIssueRef(*runRow.TriggerRef); ok {
 			trigger.IssueNumber = number
@@ -1645,12 +1648,17 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		// handlers so the signed prompt and the render preview stay byte-identical.
 		trigger.GeneratedSurfaceRelations = generatedSurfaceRelationsForPrompt()
 		trigger.GeneratedSurfaceRestoration = s.loadGeneratedSurfaceRestoration(r.Context(), runRow.ID, stage.ID)
-		// Crew consult fold-in (E77.5 / #3739): the stage's OWN answered
-		// consults, so a resumed or retried attempt sees its prior answers
-		// (inside the crew quarantine envelope) instead of re-asking. Set on
-		// BOTH prompt handlers so the signed prompt and the render preview
-		// stay byte-identical.
-		trigger.CrewMessages = s.resolveAnsweredCrewConsults(r.Context(), runRow.ID, stage.ID)
+		// Deferred crew delivery (E77.7 / #3741) + consult fold-in (E77.5 /
+		// #3739). The OPEN findings/notices addressed to the planner go FIRST
+		// on purpose: writeUntrustedCrewMessages' block cap drops from the
+		// FRONT, so under byte pressure the advisory deliveries (still open,
+		// re-offered next stage, visible on the gate view) are elided before the
+		// stage's OWN answered consults, which it cannot re-obtain once its
+		// consult budget is spent. Resolved identically on BOTH prompt handlers
+		// so the signed prompt and the render preview stay byte-identical;
+		// ONLY this signed handler records the delivery (after the build).
+		crewDeliveries = s.resolveDeliverableCrewMessages(r.Context(), runRow.ID, stage.ID, stage.Type)
+		trigger.CrewMessages = append(crewDeliveries.Messages, s.resolveAnsweredCrewConsults(r.Context(), runRow.ID, stage.ID)...)
 		// Captain's rulings on escalated disagreements (E77.6 / #3740): a DECIDED
 		// escalation becomes binding plan text; an open one folds in nothing. Set
 		// on BOTH prompt handlers so the signed prompt and the render preview stay
@@ -1760,6 +1768,9 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		s.writePromptBuildError(w, r, string(stage.Type), err)
 		return
 	}
+	// Record the deferred crew delivery (E77.7 / #3741) only once the prompt
+	// carrying it has actually built — the signed serve IS the delivery.
+	s.recordCrewMessagesDelivered(r.Context(), runRow.ID, stage.ID, stage.Type, string(stage.Type), crewDeliveries.Sequences)
 
 	hash := signing.ComputeMessage([]byte(text))
 	verifyCmd, verifyTimeoutSecs, verifyMaxIterations := s.resolveVerifyConfig(r.Context(), runRow, stage.Type)
@@ -2330,12 +2341,12 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		// handlers so the signed prompt and the render preview stay byte-identical.
 		trigger.GeneratedSurfaceRelations = generatedSurfaceRelationsForPrompt()
 		trigger.GeneratedSurfaceRestoration = s.loadGeneratedSurfaceRestoration(r.Context(), runRow.ID, stage.ID)
-		// Crew consult fold-in (E77.5 / #3739): the stage's OWN answered
-		// consults, so a resumed or retried attempt sees its prior answers
-		// (inside the crew quarantine envelope) instead of re-asking. Set on
-		// BOTH prompt handlers so the signed prompt and the render preview
-		// stay byte-identical.
-		trigger.CrewMessages = s.resolveAnsweredCrewConsults(r.Context(), runRow.ID, stage.ID)
+		// Deferred crew delivery (E77.7 / #3741) + consult fold-in (E77.5 /
+		// #3739), resolved exactly as the signed handler does (deliveries
+		// FIRST — see there) so the two stay byte-identical. This preview is a
+		// READ: it never records crew_message_delivered.
+		previewDeliveries := s.resolveDeliverableCrewMessages(r.Context(), runRow.ID, stage.ID, stage.Type)
+		trigger.CrewMessages = append(previewDeliveries.Messages, s.resolveAnsweredCrewConsults(r.Context(), runRow.ID, stage.ID)...)
 		// Captain's rulings on escalated disagreements (E77.6 / #3740): a DECIDED
 		// escalation becomes binding plan text; an open one folds in nothing. Set
 		// on BOTH prompt handlers so the signed prompt and the render preview stay

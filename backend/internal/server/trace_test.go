@@ -34,6 +34,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcomplete"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/bundle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/crewmessage"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/fixupobligation"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
@@ -13902,5 +13903,73 @@ func TestShipTrace_ImplementReview_NoVerifyTree_DispatchesWithEmptyTree(t *testi
 	}
 	if n := countAuditCategory(au, "implement_reviewed"); n != 1 {
 		t.Errorf("implement_reviewed rows = %d, want 1", n)
+	}
+}
+
+// TestRunImplementReviews_DeliversCrewFindingToReviewer (E77.7 / #3741): the
+// implement_review render carries an OPEN finding addressed to the reviewer
+// inside the crew envelope and records one delivery under the implement
+// stage's id; a re-review round of the SAME stage re-renders it.
+func TestRunImplementReviews_DeliversCrewFindingToReviewer(t *testing.T) {
+	f := newCrewPG(t)
+	reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-opus-4-7"}
+	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+	wireCrewIntoReviewServer(t, s, f, au, runRow.ID, implStage.ID)
+	seq := seedCrewMail(t, f, runRow.ID, crewmessage.TypeFinding, crewmessage.RoleReviewer, "IMPLREV-SENTINEL-reviewer")
+	seedCrewMail(t, f, runRow.ID, crewmessage.TypeNotice, crewmessage.RolePlanner, "IMPLREV-SENTINEL-planner")
+
+	diff := policy.Diff{ChangedFiles: []policy.ChangedFile{{Path: "backend/internal/foo/foo.go", Status: policy.StatusModified}}}
+	for round := range 2 {
+		s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, diff, nil, "", nil)
+		reviewer.mu.Lock()
+		calls := append([]string(nil), reviewer.calls...)
+		reviewer.mu.Unlock()
+		if len(calls) != round+1 {
+			t.Fatalf("round %d: reviewer invoked %d times", round, len(calls))
+		}
+		requireInsideCrewEnvelopes(t, calls[round], "IMPLREV-SENTINEL-reviewer")
+		if strings.Contains(calls[round], "IMPLREV-SENTINEL-planner") {
+			t.Errorf("round %d: implement_review prompt carries the planner's notice", round)
+		}
+	}
+	got := deliveredEntries(t, f, runRow.ID)
+	if len(got) != 2 {
+		t.Fatalf("crew_message_delivered entries = %d, want one per round", len(got))
+	}
+	for _, d := range got {
+		if !slices.Equal(d.SentSequences, []int64{seq}) || d.Render != "implement_review" || d.RecipientRole != string(crewmessage.RoleReviewer) {
+			t.Errorf("delivery = %+v, want [%d] implement_review/reviewer", d, seq)
+		}
+	}
+}
+
+// TestRunSupplementalReinvokeReview_CarriesAndRecordsNoCrewDelivery: the
+// bounded exemption-soundness re-invoke renders no crew surface
+// (buildImplementReview returns before writeUntrustedCrewMessages), so it must
+// neither carry nor RECORD a delivery — a record there would name text the
+// reviewer never saw and suppress it for every later stage.
+func TestRunSupplementalReinvokeReview_CarriesAndRecordsNoCrewDelivery(t *testing.T) {
+	f := newCrewPG(t)
+	reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-opus-4-7"}
+	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+	wireCrewIntoReviewServer(t, s, f, au, runRow.ID, implStage.ID)
+	seedCrewMail(t, f, runRow.ID, crewmessage.TypeFinding, crewmessage.RoleReviewer, "SUPP-SENTINEL-reviewer")
+
+	s.runSupplementalReinvokeReview(t.Context(), runRow.ID, implStage.ID, "abc123",
+		[]prompt.GateScopeExemption{{Path: "backend/internal/foo/foo_test.go", Reason: "coupled test"}})
+	s.waitBackgroundReviews()
+	reviewer.mu.Lock()
+	calls := append([]string(nil), reviewer.calls...)
+	reviewer.mu.Unlock()
+	if len(calls) == 0 {
+		t.Fatal("control: the supplemental review never invoked the reviewer")
+	}
+	for _, c := range calls {
+		if strings.Contains(c, "SUPP-SENTINEL-reviewer") {
+			t.Error("the supplemental re-invoke carried crew text")
+		}
+	}
+	if got := deliveredEntries(t, f, runRow.ID); len(got) != 0 {
+		t.Errorf("the supplemental re-invoke recorded %d deliveries, want 0", len(got))
 	}
 }
