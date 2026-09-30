@@ -17363,7 +17363,12 @@ func TestBuild_CrewMessage_PerMessageCapElided(t *testing.T) {
 // capping: TEN messages each 4000 raw bytes, capping to ~2000 sanitized bytes
 // each, so the rendered block is ~21 KiB against a 12 KiB cap. The OLDEST must
 // be dropped, with the block-level elision notice counting them, and the NEWEST
-// must always survive.
+// must always survive — a guarantee crewBlockStart now makes STRUCTURAL by
+// seeding its start index at the newest chunk (#3859), rather than one that
+// followed from the per-message cap sitting below the block budget. This test is
+// also the REGRESSION PIN for the extraction: the accumulation order, the `>`
+// (not `>=`) boundary and the drop-everything-older semantics are unchanged, so
+// it must stay green unmodified.
 func TestBuild_CrewMessage_TotalCapDropsOldestFirst(t *testing.T) {
 	const n = 10
 	msgs := make([]CrewMessage, n)
@@ -17380,7 +17385,7 @@ func TestBuild_CrewMessage_TotalCapDropsOldestFirst(t *testing.T) {
 		t.Fatalf("Build: %v", err)
 	}
 	if !strings.Contains(got, sentinels[n-1]) {
-		t.Fatalf("the NEWEST message was dropped — the per-message cap must stay below the block cap\n---\n%s", got)
+		t.Fatalf("the NEWEST message was dropped — crewBlockStart must seed its start index at the newest chunk (#3859)\n---\n%s", got)
 	}
 	if strings.Contains(got, sentinels[0]) {
 		t.Errorf("the OLDEST message's sentinel %q survived — the block cap did not drop it", sentinels[0])
@@ -17605,6 +17610,282 @@ func TestBuild_CrewMessage_MetadataNormalized(t *testing.T) {
 				t.Errorf("%s: column-0 crew BEGIN/END counts = %d/%d, want 1/1 — metadata forged a delimiter line\n---\n%s", stage, b, e, got)
 			}
 		})
+	}
+}
+
+// crewAttributionLine returns the ONE attribution line in rendered, failing if
+// there is not exactly one.
+func crewAttributionLine(t *testing.T, rendered string) string {
+	t.Helper()
+	var found []string
+	for _, l := range strings.Split(rendered, "\n") {
+		if strings.HasPrefix(l, crewMessageAttributionPrefix) {
+			found = append(found, l)
+		}
+	}
+	if len(found) != 1 {
+		t.Fatalf("want exactly 1 attribution line, got %d\n---\n%s", len(found), rendered)
+	}
+	return found[0]
+}
+
+// crewAttributionField returns the value of one " · <label>: "-delimited field on
+// the attribution line (or the leading "type: " field), up to the next " · " or
+// end of line.
+func crewAttributionField(t *testing.T, line, label string) string {
+	t.Helper()
+	var head string
+	if label == "type" {
+		head = crewMessageAttributionPrefix + "type: "
+	} else {
+		head = " · " + label + ": "
+	}
+	i := strings.Index(line, head)
+	if i < 0 {
+		t.Fatalf("attribution line carries no %q field: %q", label, line)
+	}
+	rest := line[i+len(head):]
+	if j := strings.Index(rest, " · "); j >= 0 {
+		rest = rest[:j]
+	}
+	return rest
+}
+
+// TestCrewBlockStart_NewestAlwaysSurvives drives the extracted block-budget walk
+// directly (#3859). The property under test is STRUCTURAL: the newest chunk is
+// included whatever its rendered size, so the walk can never return
+// len(rendered) and leave the block with zero envelopes.
+//
+// COUNTERFACTUAL (run, observed RED): delete the `start := len(rendered) - 1` /
+// `total := len(rendered[start])` seeding and restore the unconditional
+// accumulate-then-break loop. MECHANISM — for the single-oversized-newest case
+// the old loop adds len(rendered[1]) > budget on its FIRST iteration and sets
+// start = 2 == len(rendered), so the assertion fails on the returned VALUE, not
+// on compilation (the clause lives inside the function body).
+func TestCrewBlockStart_NewestAlwaysSurvives(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		rendered []string
+		budget   int
+		want     int
+	}{
+		{"empty", nil, 100, 0},
+		{"single fits", []string{"aaaa"}, 100, 0},
+		// The case #3859 names: the NEWEST chunk alone blows the budget.
+		{"single oversized", []string{strings.Repeat("b", 101)}, 100, 0},
+		{"newest oversized with an older sibling", []string{"a", strings.Repeat("b", 101)}, 100, 1},
+		// Boundary: total exactly == budget KEEPS the chunk (the `>` not `>=`
+		// semantics the pre-#3859 walk had, preserved byte-for-byte).
+		{"at boundary keeps", []string{strings.Repeat("a", 50), strings.Repeat("b", 50)}, 100, 0},
+		{"one byte over drops oldest", []string{strings.Repeat("a", 51), strings.Repeat("b", 50)}, 100, 1},
+		// Drop-everything-older-on-first-overflow, matching the old semantics.
+		{"drops all older on first overflow", []string{"a", strings.Repeat("c", 60), strings.Repeat("b", 60)}, 100, 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := crewBlockStart(tc.rendered, tc.budget); got != tc.want {
+				t.Errorf("crewBlockStart(%d chunks, budget %d) = %d, want %d", len(tc.rendered), tc.budget, got, tc.want)
+			}
+			if len(tc.rendered) > 0 {
+				if got := crewBlockStart(tc.rendered, tc.budget); got >= len(tc.rendered) {
+					t.Errorf("crewBlockStart returned %d == len — the newest chunk was DROPPED, which renders zero envelopes", got)
+				}
+			}
+		})
+	}
+}
+
+// TestBuild_CrewMessage_PathologicalMetadataStillRendersEnvelope is the
+// done-means test for #3859 and the BINDING evidence for this change's single
+// acceptance criterion (operator approval condition). One message carries 100 KiB
+// of Type, SenderRole and AnchorRef plus 100 evidence refs of 10 KiB each and an
+// at-cap MessageText — a chunk that, unbounded, renders at ~1.3 MB against a
+// 12000-byte block budget.
+//
+// It fails under BOTH deletions the approval condition names:
+//
+//   - DELETE THE METADATA CAPS (drop capCrewMetadata from the attribution writes,
+//     or the MaxCrewMessageEvidenceRefs slice): the rendered block grows past
+//     MaxTotalCrewMessageBytes, so the block-size assertion goes RED — and with
+//     the newest-survives seed ALSO absent the walk drops every message and the
+//     envelope-pair count goes to 0 (the exact zero-envelope symptom #3859
+//     describes: heading, framing paragraph and drop notice, no envelopes).
+//   - DELETE THE NEWEST-SURVIVES GUARANTEE (crewBlockStart's start/total seeding):
+//     the folded-in crewBlockStart assertion below goes RED on its returned
+//     VALUE. That arm is folded in HERE deliberately: with the metadata caps in
+//     place no Build-level fixture can make one chunk exceed the whole budget, so
+//     a Build-only assertion would be MASKED by the caps and would stay green
+//     with the guarantee deleted.
+func TestBuild_CrewMessage_PathologicalMetadataStillRendersEnvelope(t *testing.T) {
+	const textSentinel = "CREW_PATHOLOGICAL_TEXT_5E2A"
+	refs := make([]string, 100)
+	for i := range refs {
+		refs[i] = fmt.Sprintf("ref/%03d/", i) + strings.Repeat("r", 10*1024)
+	}
+	msg := CrewMessage{
+		Type:         strings.Repeat("t", 100*1024),
+		SenderRole:   strings.Repeat("s", 100*1024),
+		AnchorRef:    strings.Repeat("a", 100*1024),
+		EvidenceRefs: refs,
+		MessageText:  textSentinel + " " + strings.Repeat("m", MaxCrewMessageBytes),
+	}
+
+	// The newest-survives guarantee, asserted where it is OBSERVABLE: a
+	// synthetic chunk larger than the whole budget must still be kept.
+	if got := crewBlockStart([]string{"older", strings.Repeat("z", MaxTotalCrewMessageBytes+1)}, MaxTotalCrewMessageBytes); got != 1 {
+		t.Errorf("crewBlockStart dropped an oversized NEWEST chunk (got start=%d, want 1) — the block would render zero envelopes", got)
+	}
+
+	for _, stage := range crewMessageStages {
+		t.Run(stage, func(t *testing.T) {
+			got, err := Build(stage, crewTrigger(msg))
+			if err != nil {
+				t.Fatalf("Build(%s): %v", stage, err)
+			}
+			if b, e := countColumn0Lines(got, untrustedCrewMessageBegin), countColumn0Lines(got, untrustedCrewMessageEnd); b < 1 || e < 1 {
+				t.Fatalf("%s: crew BEGIN/END counts = %d/%d, want at least 1/1 — pathological metadata emptied the block", stage, b, e)
+			}
+			if !strings.Contains(got, textSentinel) {
+				t.Errorf("%s: the message text sentinel %q was dropped", stage, textSentinel)
+			}
+			line := crewAttributionLine(t, got)
+			if strings.Contains(line, "<<<") || strings.Contains(line, ">>>") {
+				t.Errorf("%s: the attribution line carries a live delimiter token", stage)
+			}
+		})
+	}
+
+	// The BOUND is ASSERTED, not reasoned about: the whole rendered crew block
+	// (heading + framing + attribution + envelope + capped text) stays under the
+	// block budget, so ONE chunk can no longer exceed it through metadata.
+	block := RenderCrewMessages([]CrewMessage{msg})
+	if len(block) >= MaxTotalCrewMessageBytes {
+		t.Errorf("rendered crew block is %d bytes, want < the %d-byte block budget — the metadata caps are not bounding one chunk",
+			len(block), MaxTotalCrewMessageBytes)
+	}
+}
+
+// TestBuild_CrewMessage_MetadataCapped gives each capped attribution field its
+// OWN control (the per-failure-mode rule): the fixture supplies 100 KiB for ONE
+// field at a time, so removing capCrewMetadata from that one write site reddens
+// only that sub-case.
+func TestBuild_CrewMessage_MetadataCapped(t *testing.T) {
+	const oversized = 100 * 1024
+	// The rendered value is at most the cap plus CapText's fixed marker.
+	bound := MaxCrewMessageMetadataBytes + len("...[truncated]")
+	for _, tc := range []struct {
+		name  string
+		label string
+		set   func(*CrewMessage, string)
+	}{
+		{"type", "type", func(m *CrewMessage, v string) { m.Type = v }},
+		{"sender_role", "from", func(m *CrewMessage, v string) { m.SenderRole = v }},
+		{"anchor_ref", "anchored at", func(m *CrewMessage, v string) { m.AnchorRef = v }},
+		{"evidence_ref", "evidence", func(m *CrewMessage, v string) { m.EvidenceRefs = []string{v} }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := CrewMessage{
+				Type: "question", SenderRole: "engineer", AnchorRef: "run/3859",
+				MessageText: "body text\n",
+			}
+			tc.set(&m, strings.Repeat("v", oversized))
+			got, err := Build("plan", crewTrigger(m))
+			if err != nil {
+				t.Fatalf("Build: %v", err)
+			}
+			value := crewAttributionField(t, crewAttributionLine(t, got), tc.label)
+			if len(value) > bound {
+				t.Errorf("%s field rendered %d bytes, want at most %d — capCrewMetadata is not applied to this write site", tc.label, len(value), bound)
+			}
+			if !strings.HasSuffix(value, "...[truncated]") {
+				t.Errorf("%s field carries no truncation marker: %q", tc.label, value)
+			}
+		})
+	}
+}
+
+// TestBuild_CrewMessage_EvidenceRefCountCapped pins the ref COUNT cap, which is
+// a separate control from the per-ref LENGTH cap: 25 short refs are each well
+// under MaxCrewMessageMetadataBytes, so only the count cap bounds them.
+func TestBuild_CrewMessage_EvidenceRefCountCapped(t *testing.T) {
+	const n = 25
+	refs := make([]string, n)
+	for i := range refs {
+		refs[i] = fmt.Sprintf("ref/EVIDENCE_SENTINEL_%02d", i)
+	}
+	got, err := Build("plan", crewTrigger(CrewMessage{
+		Type: "question", SenderRole: "engineer", AnchorRef: "run/3859",
+		MessageText: "body text\n", EvidenceRefs: refs,
+	}))
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	line := crewAttributionLine(t, got)
+	rendered := 0
+	for i, r := range refs {
+		if present := strings.Contains(line, r); present {
+			rendered++
+			if i >= MaxCrewMessageEvidenceRefs {
+				t.Errorf("evidence ref %d rendered past the %d-ref cap", i, MaxCrewMessageEvidenceRefs)
+			}
+		}
+	}
+	if rendered != MaxCrewMessageEvidenceRefs {
+		t.Errorf("rendered %d evidence refs, want exactly %d", rendered, MaxCrewMessageEvidenceRefs)
+	}
+	wantMarker := fmt.Sprintf(crewMessageEvidenceOverflowFormat, n-MaxCrewMessageEvidenceRefs)
+	if !strings.Contains(line, wantMarker) {
+		t.Errorf("attribution line carries no overflow marker %q\n%s", wantMarker, line)
+	}
+}
+
+// TestBuild_CrewMessage_MetadataCapAppliedAfterSanitize pins the ORDERING as its
+// own control. The fixture's AnchorRef is MaxCrewMessageMetadataBytes bytes of
+// '<': neutralizeEnvelopeDelimiters re-emits a run of N into roughly 1.5N, so
+// capping the RAW value would keep 200 bytes that RENDER as ~300 and blow the
+// bound. Capping the SANITIZED value is what holds it.
+func TestBuild_CrewMessage_MetadataCapAppliedAfterSanitize(t *testing.T) {
+	bound := MaxCrewMessageMetadataBytes + len("...[truncated]")
+	got, err := Build("plan", crewTrigger(CrewMessage{
+		Type: "question", SenderRole: "engineer",
+		AnchorRef:   strings.Repeat("<", MaxCrewMessageMetadataBytes),
+		MessageText: "body text\n",
+	}))
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	line := crewAttributionLine(t, got)
+	value := crewAttributionField(t, line, "anchored at")
+	if len(value) > bound {
+		t.Errorf("anchor rendered %d bytes, want at most %d — the cap is applied BEFORE sanitization, which expands a delimiter run ~1.5x", len(value), bound)
+	}
+	// Truncating a SANITIZED value cannot reopen the injection the sanitizer
+	// closed: the cut only removes trailing bytes and the marker carries no
+	// '<', '>', CR or LF.
+	if strings.Contains(line, "<<<") || strings.Contains(line, ">>>") {
+		t.Errorf("the cut reopened a live delimiter token on the attribution line: %q", line)
+	}
+}
+
+// TestBuild_CrewMessage_UnderCapMetadataUnchanged is the byte-identity control
+// for the ordinary case: an under-cap fixture must render with neither the
+// truncation marker nor the evidence overflow marker anywhere in the crew block.
+func TestBuild_CrewMessage_UnderCapMetadataUnchanged(t *testing.T) {
+	block := RenderCrewMessages([]CrewMessage{{
+		Type: "question", SenderRole: "engineer", AnchorRef: "issue_ref kuhlman-labs/fishhawk#3859",
+		MessageText:  "Does the block cap count rendered bytes?\n",
+		EvidenceRefs: []string{"docs/spec/crew-message-v1.schema.json", "backend/internal/prompt/prompt.go"},
+	}})
+	if block == "" {
+		t.Fatal("no crew block rendered")
+	}
+	if strings.Contains(block, "...[truncated]") {
+		t.Errorf("an under-cap fixture rendered a truncation marker\n---\n%s", block)
+	}
+	if strings.Contains(block, "evidence ref(s) omitted at the Fishhawk cap") {
+		t.Errorf("an under-cap fixture rendered the evidence overflow marker\n---\n%s", block)
+	}
+	if !strings.Contains(block, "Crew message · type: question · from: engineer · anchored at: issue_ref kuhlman-labs/fishhawk#3859 · evidence: docs/spec/crew-message-v1.schema.json, backend/internal/prompt/prompt.go\n") {
+		t.Errorf("the ordinary attribution line did not render byte-identically\n---\n%s", block)
 	}
 }
 
