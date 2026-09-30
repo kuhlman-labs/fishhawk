@@ -36,7 +36,8 @@ import "strings"
 // token (subject "mcp:run:<uuid>", minted by handleIssueMCPToken in
 // mcptoken.go) carries ONLY mcp:read, plus write:retries when the stage's spec
 // sets executor.agent_self_retry, plus write:scope-amendments on implement
-// stages. An entry demanding an OPERATOR-vocabulary scope for a tool the in-run
+// stages, plus write:messages on plan and review stages (E77.3 / #3737). An
+// entry demanding an OPERATOR-vocabulary scope for a tool the in-run
 // agent calls would break the agent loop with no compile error. Two shapes
 // guard that: any-of rules (retry.go's `write:stages OR write:retries`), and
 // runBoundSubjectOK for the handlers that authorize a run-bound token by its
@@ -70,12 +71,17 @@ var mcpScopeAuthenticatedOnly = mcpToolScopeRule{}
 // named here so the vocabulary pin in mcpscopes_test.go can allow it.
 const scopeRunBoundRead = "mcp:read"
 
-// scopeRunBoundRetry and scopeRunBoundScopeAmendments are the two conditional
-// run-bound scopes (mcptoken.go: write:retries when the stage's spec sets
-// executor.agent_self_retry, write:scope-amendments on implement stages).
+// scopeRunBoundRetry, scopeRunBoundScopeAmendments and scopeRunBoundMessages
+// are the three conditional run-bound scopes (mcptoken.go: write:retries when
+// the stage's spec sets executor.agent_self_retry, write:scope-amendments on
+// implement stages, write:messages on plan and review stages ONLY — never
+// implement, deploy or acceptance, E77.3 / #3737). scopeRunBoundMessages is
+// the SAME constant crewmessage.go's handlers check, so the table and the
+// endpoint share one spelling.
 const (
 	scopeRunBoundRetry           = "write:retries"
 	scopeRunBoundScopeAmendments = "write:scope-amendments"
+	scopeRunBoundMessages        = scopeWriteMessages
 )
 
 // scopeFixupAlternate is the legacy alternate the fixup/waive/defer handlers
@@ -271,6 +277,31 @@ var mcpToolScopes = map[string]mcpToolScopeRule{
 	// so runBoundSubjectOK stays false.
 	"fishhawk_handover_brief": {anyOf: []string{scopeDigestRead}},
 
+	// The three crew-message tools (E77.3 / #3737, ADR-081 D4) front the
+	// /v0/crew-messages surface in crewmessage.go. Each row mirrors its
+	// handler's predicate in BOTH directions; runBoundSubjectOK stays false on
+	// all three, because no crew-message handler admits a run-bound token by
+	// SUBJECT alone — a run-bound token is admitted only while it HOLDS
+	// write:messages (minted for plan and review stages only), and then only
+	// on its own run's anchor, which the handler still enforces.
+	//
+	// fishhawk_send_crew_message POSTs /v0/crew-messages
+	// (handleSendCrewMessage): a run-bound token needs write:messages
+	// (requireCrewMessagesScope), every other identity write:stages.
+	"fishhawk_send_crew_message": {anyOf: []string{"write:stages", scopeRunBoundMessages}},
+	// fishhawk_read_crew_messages GETs /v0/crew-messages/{sequence} and
+	// /v0/crew-messages (handleGetCrewMessage / handleListCrewMessages via
+	// authorizeCrewRead): a run-bound token needs write:messages, every other
+	// identity read:audit. NOT mcpScopeAuthenticatedOnly: the read routes
+	// enforce read:audit, so an authenticated-only row would be LOOSER than
+	// the endpoints and would let an implement-stage token build a registry.
+	"fishhawk_read_crew_messages": {anyOf: []string{scopeGateViewRead, scopeRunBoundMessages}},
+	// fishhawk_decide_crew_escalation POSTs
+	// /v0/crew-messages/{sequence}/escalation-decision
+	// (handleDecideCrewEscalation): a run-bound token is refused
+	// self_decision outright, every other identity needs write:stages — so
+	// write:messages is deliberately ABSENT here.
+	"fishhawk_decide_crew_escalation": {anyOf: []string{"write:stages"}},
 	// fishhawk_delegation_confirm (E76.5 / #3768) dials THREE endpoints:
 	// action=read GETs /v0/repos/{owner}/{name}/delegation/confirmation
 	// (delegation_confirm.go handleGetDelegationConfirmation), which checks NO

@@ -31,6 +31,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/captain"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/crewmessage"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/digest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
@@ -832,6 +833,14 @@ type Config struct {
 	// projected from the newest run's cached spec).
 	CaptainStore *captain.Store
 
+	// CrewMailbox is the crew-message domain layer (E77.3 / #3737, ADR-081
+	// #3727 D4) behind the five /v0/crew-messages routes: sends and
+	// dispositions append to the chain through it, and reads go through
+	// CrewMailbox.Store(). Concrete, mirroring CaptainStore — the layer is
+	// chain-authoritative and Postgres-only. Wired from serve.go's pool block;
+	// nil (the documented partial rollback) answers every crew-message route
+	// 503 crew_message_unconfigured and changes no other surface.
+	CrewMailbox *crewmessage.Mailbox
 	// DelegationConfirmStore is delegation confirmation on handover (E76.5 /
 	// #3768, ADR-083 #3751 rule 7): GET .../delegation/confirmation and the
 	// POST .../delegation/{confirm,lower} verbs, plus the confirmation block

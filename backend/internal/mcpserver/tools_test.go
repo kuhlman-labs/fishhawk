@@ -3344,6 +3344,15 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	// captain record derives (not the caller's digest watermark), and its
 	// brief_hash is the value an offer stamps — taking the total 62 -> 63.
 	//
+	// E77.3 (#3737) adds exactly THREE tools — fishhawk_send_crew_message,
+	// fishhawk_read_crew_messages and fishhawk_decide_crew_escalation, the
+	// captain's thin wrappers over the /v0/crew-messages REST surface
+	// (ADR-081 D4). WHEN: the captain sends a crew message, reads one (only in
+	// its prompt-rendered quarantine envelope) or decides an escalation.
+	// ELIGIBILITY: write:stages to send or decide, read:audit to read; a stage
+	// agent uses REST with its run token, never these tools (ADR-021). Three
+	// tools, not one mode-switched tool: send and decide each append a chain
+	// entry and the read never writes.
 	// E76.5 (#3768) adds exactly ONE tool — fishhawk_delegation_confirm, the
 	// thin wrapper over GET .../delegation/confirmation and POST
 	// .../delegation/{confirm,lower}. WHEN: an incoming human captain confirms
@@ -3351,9 +3360,9 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	// is authenticated and repo-visible only (no scope beyond that, the
 	// fishhawk_delegation precedent); confirm/lower need write:approvals and the
 	// sitting captain, agents refused by the backend. Its action set is CLOSED at
-	// {read, confirm, lower} — there is no raise action — taking the total
-	// 63 -> 64.
-	const wantToolCount = 64
+	// {read, confirm, lower} — there is no raise action. With E77.3's three
+	// crew-message tools the total goes 63 -> 67.
+	const wantToolCount = 67
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",
@@ -3465,6 +3474,20 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	}
 	if !sawHandoverBrief {
 		t.Error("fishhawk_handover_brief is not in the registered tool list — the handover brief is unreachable over MCP")
+	}
+	// The three E77.3 (#3737) crew-message tools must be wire-visible by
+	// NAME, for the same reason as fishhawk_digest above.
+	for _, name := range []string{"fishhawk_send_crew_message", "fishhawk_read_crew_messages", "fishhawk_decide_crew_escalation"} {
+		var saw bool
+		for _, tool := range res.Tools {
+			if tool.Name == name {
+				saw = true
+				break
+			}
+		}
+		if !saw {
+			t.Errorf("%s is not in the registered tool list — the crew-message surface is unreachable over MCP", name)
+		}
 	}
 	// fishhawk_delegation_confirm (#3768) must be wire-visible by NAME, and
 	// its advertised action enum must be EXACTLY the closed set — a raise
