@@ -14,6 +14,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcheckpublisher"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/crewmessage"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/delegation"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
@@ -2886,5 +2887,276 @@ func TestDispatchAcceptanceGatedMerge_NilMerger_NoRepublish(t *testing.T) {
 	}
 	if got := log.snapshot(); len(got) != 0 {
 		t.Fatalf("nil-merger fail-closed recorded %v, want nothing (no publish, no merge)", got)
+	}
+}
+
+// --- E77.6 (#3740): the tier-INDEPENDENT crew-escalation page ---------------
+
+// seedCrewChainEntry appends one crew-message chain entry for the run.
+func seedCrewChainEntry(t *testing.T, au *auditFake, runID uuid.UUID, seq int64, category string, payload map[string]any) {
+	t.Helper()
+	rid := runID
+	body, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal %s payload: %v", category, err)
+	}
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	au.seeded = append(au.seeded, &audit.Entry{
+		RunID: &rid, Sequence: seq, Category: category, Payload: body, Timestamp: time.Now().UTC(),
+	})
+}
+
+// tierPageList parses a SHIPPED preset document and returns its resolved
+// must_page_human list — the very delegation-expansion route the issue names.
+func tierPageList(t *testing.T, preset spec.Preset) []string {
+	t.Helper()
+	raw, err := spec.PresetBytes(preset)
+	if err != nil {
+		t.Fatalf("PresetBytes(%s): %v", preset, err)
+	}
+	parsed, err := spec.ParseBytes(raw)
+	if err != nil {
+		t.Fatalf("ParseBytes(%s preset): %v", preset, err)
+	}
+	for _, wf := range parsed.Workflows {
+		if wf.OperatorAgent != nil {
+			return wf.OperatorAgent.MustPageHuman
+		}
+	}
+	return nil
+}
+
+// TestCrewEscalationPageIsNotSourcedFromTierExpansion is the tier
+// COUNTERFACTUAL for AC1 (#3740). Three arms:
+//
+//	(i)   the shipped `low` preset's resolved page list is EMPTY and names no
+//	      crew-escalation token — so a tier-sourced page would be dropped at
+//	      exactly the tier the issue calls out;
+//	(ii)  neither `medium` nor `high` lists PageEventCrewEscalation either, so
+//	      the token is not reachable through ANY tier's expansion;
+//	(iii) activePageEvent STILL returns PageEventCrewEscalation for a run with
+//	      an open escalation whose resolved MustPageHuman is NIL.
+//
+// Arm (iii) is constructed to isolate the control (the #1797 masking hazard):
+// MustPageHuman is nil, there is no gating reviewer round seeded, and the open
+// concern list is empty — so NO other arm of activePageEvent can return a
+// token, and deleting the crew check returns "" rather than being masked by a
+// downstream page.
+func TestCrewEscalationPageIsNotSourcedFromTierExpansion(t *testing.T) {
+	// (i) + (ii): the tier route cannot carry this token.
+	low := tierPageList(t, spec.PresetLow)
+	if len(low) != 0 {
+		t.Errorf("the low preset's must_page_human = %v, want empty (the issue's premise)", low)
+	}
+	for _, preset := range []spec.Preset{spec.PresetLow, spec.PresetMedium, spec.PresetHigh} {
+		for _, pe := range tierPageList(t, preset) {
+			if pe == PageEventCrewEscalation {
+				t.Errorf("%s preset lists %q — the crew-escalation page must NOT be tier-sourced",
+					preset, PageEventCrewEscalation)
+			}
+		}
+	}
+	// The token is not a spec constant at all, so it cannot appear in a
+	// page_human_on list even by hand.
+	for _, known := range []string{
+		spec.PageEventReviewerReject, spec.PageEventGatingReviewerReject,
+		spec.PageEventAdvisoryReviewerReject, spec.PageEventRequirementArbitration,
+		spec.PageEventClarificationRequest,
+	} {
+		if known == PageEventCrewEscalation {
+			t.Fatalf("PageEventCrewEscalation collides with the spec page-event vocabulary (%q)", known)
+		}
+	}
+	// issuecomment.campaignGatePagedPhrase keys its escalation arm on this
+	// literal; binding approval condition 1 asserts the wording over there.
+	if PageEventCrewEscalation != "crew_escalation" {
+		t.Fatalf("PageEventCrewEscalation = %q; issuecomment's campaignGatePagedPhrase arm keys on \"crew_escalation\"",
+			PageEventCrewEscalation)
+	}
+
+	// (iii) the shipped route pages with an EMPTY resolved matrix.
+	s, repo, au, _ := newAutoDriveServer(t)
+	runID, _ := startAutoDriveRun(t, s, repo)
+	runRow := getRun(t, repo, runID)
+	parsed, err := spec.ParseBytes(runRow.WorkflowSpec)
+	if err != nil {
+		t.Fatalf("ParseBytes: %v", err)
+	}
+	wf := parsed.Workflows[runRow.WorkflowID]
+
+	empty := &delegation.Result{} // MustPageHuman nil — the low-tier shape
+	if got := s.activePageEvent(context.Background(), runRow, &wf, empty, nil); got != "" {
+		t.Fatalf("fixture not isolated: activePageEvent = %q with no escalation seeded", got)
+	}
+	seedCrewChainEntry(t, au, runID, 41, crewmessage.CategoryEscalated, map[string]any{
+		"sent_sequence": 40, "thread_root_sequence": 40, "round_bound": 3, "rejections": 3,
+	})
+	if got := s.activePageEvent(context.Background(), runRow, &wf, empty, nil); got != PageEventCrewEscalation {
+		t.Fatalf("activePageEvent = %q with an open escalation and a NIL must_page_human list, want %q",
+			got, PageEventCrewEscalation)
+	}
+}
+
+// TestAutoDriveRunGate_Page_CrewEscalation drives the whole actor: an open crew
+// escalation pages and takes NO gate action, even though the spec's delegated
+// approve knob would otherwise fire on the clean dual approval seeded here.
+func TestAutoDriveRunGate_Page_CrewEscalation(t *testing.T) {
+	s, repo, au, _ := newAutoDriveServer(t)
+	runID, stages := startAutoDriveRun(t, s, repo)
+	plan := stages[0]
+	seedReviewEntry(t, au, runID, 1, "plan_reviewed", planreview.ImplementReviewedPayload{ReviewerKind: "agent", Verdict: planreview.VerdictApprove})
+	seedReviewEntry(t, au, runID, 2, "plan_reviewed", planreview.ImplementReviewedPayload{ReviewerKind: "agent", Verdict: planreview.VerdictApprove})
+	seedCrewChainEntry(t, au, runID, 40, crewmessage.CategorySent, map[string]any{
+		"message": map[string]any{"type": "escalation"},
+	})
+
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err != nil {
+		t.Fatalf("AutoDriveRunGate: %v", err)
+	}
+	if out.Acted || !out.Paged || out.PageEvent != PageEventCrewEscalation {
+		t.Fatalf("outcome = %+v, want paged %s", out, PageEventCrewEscalation)
+	}
+	if countAudit(au, "approval_submitted") != 0 {
+		t.Error("a gate action was taken through an open crew escalation")
+	}
+	if plan.State == run.StageStateSucceeded {
+		t.Error("the plan stage advanced through an open crew escalation")
+	}
+	auditEntry(t, au, CategoryCampaignGatePaged)
+}
+
+// TestCrewEscalationOpen_Branches covers every branch of the detector, one case
+// per named mode.
+func TestCrewEscalationOpen_Branches(t *testing.T) {
+	type entry struct {
+		seq      int64
+		category string
+		payload  map[string]any
+	}
+	cases := map[string]struct {
+		entries []entry
+		want    bool
+	}{
+		"no crew entries": {nil, false},
+		"open root escalation": {[]entry{
+			{40, crewmessage.CategorySent, map[string]any{"message": map[string]any{"type": "escalation"}}},
+		}, true},
+		"root escalation ruled accepted": {[]entry{
+			{40, crewmessage.CategorySent, map[string]any{"message": map[string]any{"type": "escalation"}}},
+			{41, crewmessage.CategoryDisposed, map[string]any{"sent_sequence": 40, "thread_root_sequence": 40, "disposition": "accepted"}},
+		}, false},
+		"root escalation ruled rejected": {[]entry{
+			{40, crewmessage.CategorySent, map[string]any{"message": map[string]any{"type": "escalation"}}},
+			{41, crewmessage.CategoryDisposed, map[string]any{"sent_sequence": 40, "thread_root_sequence": 40, "disposition": "rejected"}},
+		}, false},
+		"root escalation EXPIRED still pages": {[]entry{
+			{40, crewmessage.CategorySent, map[string]any{"message": map[string]any{"type": "escalation"}}},
+			{41, crewmessage.CategoryDisposed, map[string]any{"sent_sequence": 40, "thread_root_sequence": 40, "disposition": "expired"}},
+		}, true},
+		"a THREADED escalation reply alone does not page": {[]entry{
+			{40, crewmessage.CategorySent, map[string]any{
+				"message": map[string]any{"type": "escalation"}, "thread_root_sequence": 39,
+			}},
+		}, false},
+		"a consult does not page": {[]entry{
+			{40, crewmessage.CategorySent, map[string]any{"message": map[string]any{"type": "consult"}}},
+		}, false},
+		"exhausted thread with no ruling": {[]entry{
+			{41, crewmessage.CategoryEscalated, map[string]any{
+				"sent_sequence": 40, "thread_root_sequence": 40, "round_bound": 3, "rejections": 3,
+			}},
+		}, true},
+		"exhausted thread whose ROOT was later ruled": {[]entry{
+			{41, crewmessage.CategoryEscalated, map[string]any{
+				"sent_sequence": 42, "thread_root_sequence": 40, "round_bound": 3, "rejections": 3,
+			}},
+			{43, crewmessage.CategoryDisposed, map[string]any{"sent_sequence": 40, "thread_root_sequence": 40, "disposition": "accepted"}},
+		}, false},
+		"undecodable escalated payload pages": {[]entry{
+			{41, crewmessage.CategoryEscalated, nil},
+		}, true},
+		// The rejections that EXHAUSTED the bound are rounds of the disagreement,
+		// not rulings on it. Keying the resolved set by thread_root_sequence
+		// instead of by the ruled message's own sent_sequence would let these very
+		// rejections mark the escalation settled, and the page would never fire on
+		// the one shape it exists for.
+		"reply rejections do NOT resolve the exhaustion": {[]entry{
+			{40, crewmessage.CategorySent, map[string]any{"message": map[string]any{"type": "escalation"}}},
+			{41, crewmessage.CategoryDisposed, map[string]any{"sent_sequence": 41, "thread_root_sequence": 40, "disposition": "rejected"}},
+			{42, crewmessage.CategoryDisposed, map[string]any{"sent_sequence": 42, "thread_root_sequence": 40, "disposition": "rejected"}},
+			{43, crewmessage.CategoryDisposed, map[string]any{"sent_sequence": 43, "thread_root_sequence": 40, "disposition": "rejected"}},
+			{44, crewmessage.CategoryEscalated, map[string]any{
+				"sent_sequence": 45, "thread_root_sequence": 40, "round_bound": 3, "rejections": 3,
+			}},
+		}, true},
+		// Ruling a REPLY accepted is not ruling the disagreement either.
+		"accepting a REPLY does not resolve the exhaustion": {[]entry{
+			{40, crewmessage.CategorySent, map[string]any{"message": map[string]any{"type": "escalation"}}},
+			{44, crewmessage.CategoryEscalated, map[string]any{
+				"sent_sequence": 45, "thread_root_sequence": 40, "round_bound": 3, "rejections": 3,
+			}},
+			{46, crewmessage.CategoryDisposed, map[string]any{"sent_sequence": 45, "thread_root_sequence": 40, "disposition": "accepted"}},
+		}, true},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			s, repo, au, _ := newAutoDriveServer(t)
+			runID, _ := startAutoDriveRun(t, s, repo)
+			for _, e := range tc.entries {
+				if e.payload == nil {
+					rid := runID
+					au.seeded = append(au.seeded, &audit.Entry{
+						RunID: &rid, Sequence: e.seq, Category: e.category,
+						Payload: []byte("{not json"), Timestamp: time.Now().UTC(),
+					})
+					continue
+				}
+				seedCrewChainEntry(t, au, runID, e.seq, e.category, e.payload)
+			}
+			if got := s.crewEscalationOpen(context.Background(), getRun(t, repo, runID)); got != tc.want {
+				t.Errorf("crewEscalationOpen = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestCrewEscalationOpen_ReadErrorPages: a failing chain read on ANY of the three
+// categories fails TOWARD paging, matching gatingImplementRejectPresent's
+// documented contract. The fixture holds a genuinely-ruled escalation, so the
+// `true` is the degrade and not the open-escalation branch.
+func TestCrewEscalationOpen_ReadErrorPages(t *testing.T) {
+	for _, category := range []string{
+		crewmessage.CategoryDisposed, crewmessage.CategoryEscalated, crewmessage.CategorySent,
+	} {
+		t.Run(category, func(t *testing.T) {
+			s, repo, au, _ := newAutoDriveServer(t)
+			runID, _ := startAutoDriveRun(t, s, repo)
+			seedCrewChainEntry(t, au, runID, 40, crewmessage.CategorySent, map[string]any{
+				"message": map[string]any{"type": "escalation"},
+			})
+			seedCrewChainEntry(t, au, runID, 41, crewmessage.CategoryDisposed, map[string]any{
+				"sent_sequence": 40, "thread_root_sequence": 40, "disposition": "accepted",
+			})
+			runRow := getRun(t, repo, runID)
+			if s.crewEscalationOpen(context.Background(), runRow) {
+				t.Fatalf("fixture: a ruled escalation must not page")
+			}
+			au.listByCategoryErrCategory = category
+			if !s.crewEscalationOpen(context.Background(), runRow) {
+				t.Errorf("a failing %s read returned false; want true (fail-toward-paging)", category)
+			}
+		})
+	}
+}
+
+// TestCrewEscalationOpen_UnconfiguredAuditRepo: with no audit repository no crew
+// message can exist, so the detector reports structural absence (false) rather
+// than the fail-toward-paging true reserved for a READ that failed.
+func TestCrewEscalationOpen_UnconfiguredAuditRepo(t *testing.T) {
+	s := New(Config{Addr: "127.0.0.1:0"})
+	if s.crewEscalationOpen(context.Background(), &run.Run{ID: uuid.New()}) {
+		t.Error("crewEscalationOpen = true with no audit repository configured; want false")
 	}
 }

@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -15,7 +16,9 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/crewmessage"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -521,5 +524,394 @@ func TestCrewMessageAPI_NonConsultSendUnchangedByConsultBranch(t *testing.T) {
 				t.Fatalf("stage stamped = %v (%v), want unstamped", stamped, err)
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// E77.6 (#3740): the notify wiring, over a real database and a real mailbox.
+// This is the gap that made everything else inert — neither crew-message
+// handler called a notifier at all before this change.
+// ---------------------------------------------------------------------------
+
+// crewFailingNotifier records like pageClassRecorder and then ERRORS on both
+// notify surfaces, so a notifier outage can be asserted not to change the HTTP
+// response.
+type crewFailingNotifier struct {
+	*pageClassRecorder
+}
+
+func (n *crewFailingNotifier) NotifyPageClassForRun(ctx context.Context, runID uuid.UUID) error {
+	_ = n.pageClassRecorder.NotifyPageClassForRun(ctx, runID)
+	return errors.New("notifier outage")
+}
+
+func (n *crewFailingNotifier) NotifyStatusUpdateForRun(ctx context.Context, runID uuid.UUID) error {
+	_ = n.pageClassRecorder.NotifyStatusUpdateForRun(ctx, runID)
+	return errors.New("notifier outage")
+}
+
+// escalationDoc renders a schema-complete escalation document with the
+// sender_role OMITTED, for the HTTP send path (which derives it).
+func escalationDoc(anchor, summary string) string { return escalationDocFrom("", anchor, summary) }
+
+// escalationDocFrom renders the same document with an EXPLICIT sender_role, for
+// a direct mailbox.Send (which does not derive one).
+func escalationDocFrom(senderRole, anchor, summary string) string {
+	return crewDoc("escalation", senderRole, "captain", anchor,
+		`{"summary":"`+summary+`","recommended_default":"hold the line","tradeoffs":"either way costs a round"}`)
+}
+
+// decide POSTs the captain's escalation decision over the real handler.
+func (f *crewPG) decide(t *testing.T, seq int64, decision, reason string) *httptest.ResponseRecorder {
+	t.Helper()
+	s := strconv.FormatInt(seq, 10)
+	return crewCall(t, f.srv.handleDecideCrewEscalation, http.MethodPost,
+		"/v0/crew-messages/"+s+"/escalation-decision", s,
+		`{"decision":"`+decision+`","reason":"`+reason+`"}`, operator("write:stages"))
+}
+
+// exhaustRoundBound drives the thread rooted at rootSeq to its round bound by
+// rejecting REPLIES, leaving the ROOT itself OPEN — which is the real shape: the
+// captain has not ruled on the disagreement, they have refused round after round
+// of it. It returns the sequence of one further live reply whose rejection is the
+// one that will EXHAUST the bound (recorded by the caller's own decide call).
+func (f *crewPG) exhaustRoundBound(t *testing.T, runID uuid.UUID, rootSeq int64) int64 {
+	t.Helper()
+	ctx := context.Background()
+	reply := func(round int) int64 {
+		r, err := f.mailbox.Send(ctx, crewmessage.SendParams{
+			RawMessage:         []byte(escalationDocFrom("planner", runAnchor(runID), "restated round "+strconv.Itoa(round))),
+			Actor:              crewmessage.Actor{Kind: audit.ActorAgent, Subject: "test:planner"},
+			ThreadRootSequence: &rootSeq,
+		})
+		if err != nil {
+			t.Fatalf("reply %d: %v", round, err)
+		}
+		return r.SentSequence
+	}
+	for i := 0; i < crewmessage.DefaultRoundBound; i++ {
+		seq := reply(i + 1)
+		if w := f.decide(t, seq, "rejected", "round "+strconv.Itoa(i+1)); w.Code != http.StatusOK {
+			t.Fatalf("rejection %d status = %d; body = %s", i+1, w.Code, w.Body.String())
+		}
+	}
+	return reply(crewmessage.DefaultRoundBound + 1)
+}
+
+// TestDisposeCrewMessage_RoundBoundExhaustionNotifiesOperator: a real thread
+// driven to its round bound over the HTTP decide handler fires EXACTLY ONE
+// operator-visible notify AND leaves a committed crew_message_escalated entry on
+// the run's chain.
+//
+// The assertion is on the NOTIFIER RECORDER, not on the status code: the HTTP
+// refusal is byte-identical with or without the notify, so error identity cannot
+// serve as this control's counterfactual vehicle. Reading the chain at the same
+// moment proves the risk assumption — Mailbox.escalate appends INSIDE the
+// transaction that then reports exhaustion, so the notify follows durable state
+// and would fail here if the append were rolled back.
+func TestDisposeCrewMessage_RoundBoundExhaustionNotifiesOperator(t *testing.T) {
+	f := newCrewPG(t)
+	rec := &pageClassRecorder{}
+	f.srv.issueNotifier = rec
+	runID := f.seedRun(t, run.StageTypePlan)
+	esc := f.send(t, escalationDoc(runAnchor(runID), "EXHAUST-ESCALATION"),
+		runBound(runID, "mcp:read", scopeWriteMessages))
+	last := f.exhaustRoundBound(t, runID, esc.SentSequence)
+	if n := f.count(t, crewmessage.CategoryEscalated); n != 0 {
+		t.Fatalf("fixture: %d escalated entries before the bound is exhausted, want 0", n)
+	}
+	before := len(rec.status)
+
+	w := f.decide(t, last, "rejected", "one round too many")
+	requireCrewRefusal(t, w, http.StatusUnprocessableEntity, "crew_round_bound_exhausted")
+
+	if got := len(rec.status) - before; got != 1 {
+		t.Fatalf("operator-visible notifies on exhaustion = %d, want exactly 1 (recorded %v)", got, rec.status)
+	}
+	if rec.status[len(rec.status)-1] != runID {
+		t.Errorf("notified run = %s, want %s", rec.status[len(rec.status)-1], runID)
+	}
+	if n := f.count(t, crewmessage.CategoryEscalated); n != 1 {
+		t.Fatalf("crew_message_escalated entries = %d, want 1 committed at the moment of the notify", n)
+	}
+	// The projection this notify feeds yields the page.
+	entries, err := f.audit.ListForRun(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("list chain: %v", err)
+	}
+	kinds := issuecomment.PageClassEventKinds(entries, nil)
+	if !containsString(kinds, "crew_escalation_exhausted") {
+		t.Errorf("the run's real chain yields %v, missing crew_escalation_exhausted", kinds)
+	}
+}
+
+// TestSendCrewMessage_EscalationNotifiesPageClass: a sent ROOT escalation fires
+// exactly one page-class notify; a sent CONSULT fires NONE (the two arms differ
+// only in message.type); and a THREADED escalation reply sent through the real
+// responder path fires NONE either (binding approval condition 2's discrimination
+// row, driven through production code rather than through the helper alone).
+func TestSendCrewMessage_EscalationNotifiesPageClass(t *testing.T) {
+	f := newCrewPG(t)
+	rec := &pageClassRecorder{}
+	f.srv.issueNotifier = rec
+	runID := f.seedRun(t, run.StageTypePlan)
+	tok := runBound(runID, "mcp:read", scopeWriteMessages)
+
+	esc := f.send(t, escalationDoc(runAnchor(runID), "ROOT-ESCALATION"), tok)
+	if len(rec.pageClass) != 1 || rec.pageClass[0] != runID {
+		t.Fatalf("page-class notifies after a root escalation = %v, want exactly [%s]", rec.pageClass, runID)
+	}
+
+	f.send(t, crewDoc("consult", "", "historian", runAnchor(runID), crewConsultPayload), tok)
+	if len(rec.pageClass) != 1 {
+		t.Errorf("a sent consult fired a page-class notify: %v", rec.pageClass)
+	}
+
+	// A THREADED escalation reply: same type, only thread_root_sequence differs.
+	root := esc.SentSequence
+	if _, err := f.mailbox.Send(context.Background(), crewmessage.SendParams{
+		RawMessage:         []byte(escalationDocFrom("planner", runAnchor(runID), "THREADED-ESCALATION-REPLY")),
+		Actor:              crewmessage.Actor{Kind: audit.ActorAgent, Subject: "test:planner"},
+		ThreadRootSequence: &root,
+	}); err != nil {
+		t.Fatalf("threaded reply: %v", err)
+	}
+	// Route the reply through the production notify seam exactly as the send
+	// handler does, with the thread root set.
+	replyMsg, err := crewmessage.Parse([]byte(escalationDocFrom("planner", runAnchor(runID), "THREADED-ESCALATION-REPLY")))
+	if err != nil {
+		t.Fatalf("parse reply: %v", err)
+	}
+	f.srv.notifyRootEscalationPage(context.Background(), replyMsg, &root,
+		&crewmessage.Row{SentSequence: root + 1, RunID: &runID})
+	if len(rec.pageClass) != 1 {
+		t.Errorf("a THREADED escalation reply fired a page-class notify: %v", rec.pageClass)
+	}
+}
+
+// TestCrewMessageNotify_FailureDoesNotChangeResponse: a notifier returning an
+// error leaves the send's 201 and the exhaustion refusal exactly as they are.
+func TestCrewMessageNotify_FailureDoesNotChangeResponse(t *testing.T) {
+	f := newCrewPG(t)
+	rec := &crewFailingNotifier{pageClassRecorder: &pageClassRecorder{}}
+	f.srv.issueNotifier = rec
+	runID := f.seedRun(t, run.StageTypePlan)
+
+	// The send still returns 201 (f.send fatals on anything else).
+	esc := f.send(t, escalationDoc(runAnchor(runID), "OUTAGE-ESCALATION"),
+		runBound(runID, "mcp:read", scopeWriteMessages))
+	if len(rec.pageClass) != 1 {
+		t.Fatalf("the failing notifier was not invoked on the send: %v", rec.pageClass)
+	}
+
+	last := f.exhaustRoundBound(t, runID, esc.SentSequence)
+	w := f.decide(t, last, "rejected", "one round too many")
+	requireCrewRefusal(t, w, http.StatusUnprocessableEntity, "crew_round_bound_exhausted")
+	if len(rec.status) == 0 {
+		t.Error("the failing notifier was not invoked on the exhaustion")
+	}
+	if n := f.count(t, crewmessage.CategoryEscalated); n != 1 {
+		t.Errorf("crew_message_escalated entries = %d after a notifier outage, want 1", n)
+	}
+}
+
+// TestDecideCrewEscalation_RunTokenRefusedAndRecordsNothing is AC4 read as
+// COMMITTED STATE rather than as error identity: a control that fires and rolls
+// back returns a byte-identical error, so the test reads the mailbox row AFTER
+// the refused call and asserts it is still `open`.
+func TestDecideCrewEscalation_RunTokenRefusedAndRecordsNothing(t *testing.T) {
+	f := newCrewPG(t)
+	runID := f.seedRun(t, run.StageTypePlan)
+	tok := runBound(runID, "mcp:read", scopeWriteMessages, "write:stages")
+	esc := f.send(t, escalationDoc(runAnchor(runID), "SELF-DECISION-ESCALATION"), tok)
+	seq := strconv.FormatInt(esc.SentSequence, 10)
+
+	w := crewCall(t, f.srv.handleDecideCrewEscalation, http.MethodPost,
+		"/v0/crew-messages/"+seq+"/escalation-decision", seq, `{"decision":"accepted","reason":"me"}`, tok)
+	requireCrewRefusal(t, w, http.StatusForbidden, "self_decision")
+
+	row, err := f.mailbox.Store().Get(context.Background(), esc.SentSequence)
+	if err != nil {
+		t.Fatalf("read the row after the refusal: %v", err)
+	}
+	if row.State != crewmessage.StateOpen {
+		t.Errorf("row state after a refused self-decision = %q, want open", row.State)
+	}
+	if n := f.count(t, crewmessage.CategoryDisposed); n != 0 {
+		t.Errorf("crew_message_disposed entries = %d after a refused self-decision, want 0", n)
+	}
+}
+
+// TestCrewEscalation_EndToEnd_LowTierRunPagesThenBinds is the ONE test crossing
+// all four layers this change touches (#618): the crewmessage domain, the HTTP
+// handler + notify seam, the issuecomment page projection, and the prompt layer.
+//
+// A `low`-tier NON-CAMPAIGN run: send a root escalation -> reject it to its round
+// bound -> the exhausting rejection is refused AND fires the operator-visible
+// notify AND commits the escalated entry -> the run's REAL chain yields BOTH
+// crew-escalation page kinds through issuecomment's own projection -> the plan
+// prompt at that moment carries NO ruling -> the captain decides over the real
+// handler -> the plan prompt now carries the captain's ruling. No per-layer unit
+// can see that seam.
+func TestCrewEscalation_EndToEnd_LowTierRunPagesThenBinds(t *testing.T) {
+	f := newCrewPG(t)
+	rec := &pageClassRecorder{}
+	f.srv.issueNotifier = rec
+	ps, _ := newConsultFoldServer(t, f, f.audit)
+	ps.issueNotifier = rec
+	runID := f.seedRun(t, run.StageTypePlan)
+	ctx := context.Background()
+
+	// The run is `low` tier: nothing is delegated and the resolved page list is
+	// EMPTY, which is the tier the issue names. The page below therefore cannot
+	// have come from the tier expansion.
+	if _, err := f.pool.Exec(ctx, `UPDATE runs SET workflow_spec = $2 WHERE id = $1`,
+		runID, lowTierSpecYAML); err != nil {
+		t.Fatalf("set the low-tier spec: %v", err)
+	}
+
+	esc := f.send(t, escalationDoc(runAnchor(runID), "E2E-ESCALATION-SUMMARY"),
+		runBound(runID, "mcp:read", scopeWriteMessages))
+	// The SEND already paged (the root-escalation page-class hook).
+	if len(rec.pageClass) != 1 {
+		t.Fatalf("page-class notifies after the root escalation = %v, want 1", rec.pageClass)
+	}
+
+	last := f.exhaustRoundBound(t, runID, esc.SentSequence)
+	statusBefore := len(rec.status)
+	w := f.decide(t, last, "rejected", "the fourth rejection")
+	requireCrewRefusal(t, w, http.StatusUnprocessableEntity, "crew_round_bound_exhausted")
+	if got := len(rec.status) - statusBefore; got != 1 {
+		t.Fatalf("operator-visible notifies on exhaustion = %d, want 1 (recorded %v)", got, rec.status)
+	}
+
+	// The projection over the run's REAL chain yields both page kinds.
+	entries, err := f.audit.ListForRun(ctx, runID)
+	if err != nil {
+		t.Fatalf("list chain: %v", err)
+	}
+	kinds := issuecomment.PageClassEventKinds(entries, nil)
+	for _, want := range []string{"crew_escalation_sent", "crew_escalation_exhausted"} {
+		if !containsString(kinds, want) {
+			t.Errorf("the run's chain yields %v, missing %q", kinds, want)
+		}
+	}
+
+	// Nothing binds yet: the escalation is not answered.
+	before, err := prompt.Build("plan", prompt.Trigger{
+		Source: "issue", IssueNumber: 3740, Repo: "kuhlman-labs/fishhawk",
+		CrewEscalationRulings: ps.resolveDecidedCrewEscalations(ctx, runID),
+	})
+	if err != nil {
+		t.Fatalf("Build(plan, before): %v", err)
+	}
+	if strings.Contains(before, "Captain's ruling") || strings.Contains(before, "E2E-RULING-REASON") {
+		t.Error("an unanswered escalation produced binding plan text")
+	}
+
+	// The captain rules over the real decide handler.
+	if dw := f.decide(t, esc.SentSequence, "accepted", "E2E-RULING-REASON ship the recommended default"); dw.Code != http.StatusOK {
+		t.Fatalf("decide status = %d; body = %s", dw.Code, dw.Body.String())
+	}
+	after, err := prompt.Build("plan", prompt.Trigger{
+		Source: "issue", IssueNumber: 3740, Repo: "kuhlman-labs/fishhawk",
+		CrewEscalationRulings: ps.resolveDecidedCrewEscalations(ctx, runID),
+	})
+	if err != nil {
+		t.Fatalf("Build(plan, after): %v", err)
+	}
+	for _, want := range []string{
+		"### Captain's ruling on an escalated disagreement (binding)",
+		"accepted",
+		"E2E-RULING-REASON ship the recommended default",
+	} {
+		if !strings.Contains(after, want) {
+			t.Errorf("the post-ruling plan prompt is missing %q", want)
+		}
+	}
+	// The captain's ruling closes the page for the auto-driver too.
+	runRow, err := f.srv.cfg.RunRepo.GetRun(ctx, runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if f.srv.crewEscalationOpen(ctx, runRow) {
+		t.Error("the captain's ruling on the ROOT did not close the auto-driver's page")
+	}
+}
+
+// lowTierSpecYAML is `autonomy: low` — nothing delegated, an EMPTY resolved
+// page_human_on list. A crew escalation must page anyway.
+const lowTierSpecYAML = `version: "2"
+workflows:
+  feature_change:
+    autonomy: low
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+`
+
+// TestRespondToCrewMessage_RefusesEscalation pins the E77.6 trust-boundary
+// guard: RespondToCrewMessage disposes its answered message `accepted`, and
+// resolveDecidedCrewEscalations promotes an accepted escalation ROOT into
+// TRUSTED binding prompt text — so an in-process responder must NOT be able to
+// close an escalation and manufacture a ruling the captain never made.
+//
+// The assertion reads COMMITTED STATE, not the error identity alone: a guard
+// that fired and was then rolled back would return an indistinguishable error,
+// so the test requires the row to be STILL OPEN and NO ruling to resolve. The
+// control arm is the same call against a CONSULT, which must still succeed —
+// so a refusal that rejected everything cannot pass this test either.
+func TestRespondToCrewMessage_RefusesEscalation(t *testing.T) {
+	f := newCrewPG(t)
+	ctx := context.Background()
+	runID := f.seedRun(t, run.StageTypePlan)
+
+	esc, err := f.mailbox.Send(ctx, crewmessage.SendParams{
+		RawMessage: []byte(escalationDocFrom("planner", runAnchor(runID), "RESPOND-GUARD-ESCALATION")),
+		Actor:      crewmessage.Actor{Kind: audit.ActorAgent, Subject: "test:planner"},
+	})
+	if err != nil {
+		t.Fatalf("seed escalation: %v", err)
+	}
+	reply := []byte(`{"schema_version":"crew-message-v1","type":"notice","recipient_role":"planner","anchor":` +
+		runAnchor(runID) + `,"payload":{"summary":"an in-process answer"}}`)
+	_, _, err = f.srv.RespondToCrewMessage(ctx, RespondParams{
+		SentSequence: esc.SentSequence, Reply: reply, ResponderRole: crewmessage.RoleHistorian,
+		Actor: crewmessage.Actor{Kind: audit.ActorSystem, Subject: "test:historian"},
+	})
+	if !errors.Is(err, crewmessage.ErrInvalidDisposition) {
+		t.Fatalf("answering an escalation in-process returned err = %v, want ErrInvalidDisposition", err)
+	}
+	row, gerr := f.mailbox.Store().Get(ctx, esc.SentSequence)
+	if gerr != nil {
+		t.Fatalf("re-read the escalation: %v", gerr)
+	}
+	if row.State != crewmessage.StateOpen {
+		t.Errorf("escalation state = %q after the refusal, want still open", row.State)
+	}
+	if got := f.srv.resolveDecidedCrewEscalations(ctx, runID); len(got) != 0 {
+		t.Errorf("the refused in-process answer produced %d binding ruling(s), want 0: %+v", len(got), got)
+	}
+
+	// Control: a CONSULT on the same run is still answerable in-process, so the
+	// guard discriminates on message type rather than refusing everything.
+	con, err := f.mailbox.Send(ctx, crewmessage.SendParams{
+		RawMessage: []byte(`{"schema_version":"crew-message-v1","type":"consult","sender_role":"planner","recipient_role":"historian","anchor":` +
+			runAnchor(runID) + `,"payload":{"question":"RESPOND-GUARD-CONSULT"},"response_required":true}`),
+		Actor: crewmessage.Actor{Kind: audit.ActorAgent, Subject: "test:planner"},
+	})
+	if err != nil {
+		t.Fatalf("seed consult: %v", err)
+	}
+	if _, _, err := f.srv.RespondToCrewMessage(ctx, RespondParams{
+		SentSequence: con.SentSequence, Reply: reply, ResponderRole: crewmessage.RoleHistorian,
+		Actor: crewmessage.Actor{Kind: audit.ActorSystem, Subject: "test:historian"},
+	}); err != nil {
+		t.Fatalf("answering a consult in-process: %v", err)
 	}
 }

@@ -501,6 +501,11 @@ func (s *Server) handleSendCrewMessage(w http.ResponseWriter, r *http.Request) {
 	}
 	resp := crewRowToResponse(*row)
 	resp.ProjectionDegraded = degraded
+	// E77.6 (#3740): a newly sent ROOT escalation pages the captain. Fired after
+	// the response-shaping decision above, so a notifier outage can never turn a
+	// recorded send into an HTTP error and never suppresses the
+	// ProjectionError-degraded 200.
+	s.notifyRootEscalationPage(ctx, msg, params.ThreadRootSequence, row)
 	if consult != nil {
 		// The consult is on the chain (a projection gap does not undo it), so
 		// the responder runs either way; Dispose falls back to upserting the
@@ -512,6 +517,30 @@ func (s *Server) handleSendCrewMessage(w http.ResponseWriter, r *http.Request) {
 		s.dispatchCrewConsult(ctx, responder, *consult)
 	}
 	s.writeJSON(w, r, http.StatusCreated, resp)
+}
+
+// notifyRootEscalationPage fires the pings-only page-class hook for a newly
+// SENT crew escalation (E77.6 / #3740). Before this, neither crew-message
+// handler called a notifier at all, so the escalation chain entries were silent
+// on the issue thread.
+//
+// The send-time condition MATCHES the projection (binding approval condition 2):
+// issuecomment's crew_message_sent case yields a page ONLY for a thread ROOT of
+// type `escalation`, so notifying on a THREADED reply would page for an event
+// the projection never produces — the ping would find nothing new and the log
+// line would be the only trace. threadRoot non-nil therefore notifies NOTHING.
+//
+// A run-less anchor (issue_ref / decision_record_id) has no run chain and no
+// anchor comment, so row.RunID == nil pages nothing; that residual is stated in
+// docs/issue-comment-surfaces.md rather than left implicit.
+func (s *Server) notifyRootEscalationPage(ctx context.Context, msg *crewmessage.Message, threadRoot *int64, row *crewmessage.Row) {
+	if msg == nil || row == nil || row.RunID == nil {
+		return
+	}
+	if msg.Type != crewmessage.TypeEscalation || threadRoot != nil {
+		return
+	}
+	s.notifyPageClass(ctx, *row.RunID, crewmessage.CategorySent)
 }
 
 // handleGetCrewMessage implements GET /v0/crew-messages/{sequence}: the row's
@@ -857,6 +886,10 @@ type RespondParams struct {
 // root, then disposes the answered message as accepted. The two chain
 // entries are sequential, not one transaction: a failure between them leaves
 // a recorded reply on a still-open message, which a retried Dispose closes.
+//
+// An ESCALATION is refused (ErrInvalidDisposition): only the captain's
+// escalation-decision endpoint may terminally dispose one, because that
+// terminal state is what makes a ruling binding prompt text (E77.6 / #3740).
 func (s *Server) RespondToCrewMessage(ctx context.Context, p RespondParams) (reply, answered *crewmessage.Row, err error) {
 	if s.cfg.CrewMailbox == nil {
 		return nil, nil, errors.New("crew mailbox not configured")
@@ -864,6 +897,22 @@ func (s *Server) RespondToCrewMessage(ctx context.Context, p RespondParams) (rep
 	row, err := s.cfg.CrewMailbox.Store().Get(ctx, p.SentSequence)
 	if err != nil {
 		return nil, nil, err
+	}
+	// E77.6 (#3740): an ESCALATION is never answered here. This entry point
+	// disposes the answered message `accepted`, and
+	// resolveDecidedCrewEscalations (prompt.go) promotes an accepted or
+	// rejected escalation ROOT into TRUSTED binding plan text — so admitting an
+	// escalation would let an in-process responder manufacture a binding
+	// "ruling" (with a non-captain reason, or none) the captain never made.
+	// handleDecideCrewEscalation is the ONLY path that may terminally dispose
+	// an escalation. Today the sole caller is the consult dispatcher, which
+	// already gates on type `consult` (crew_consult.go); this refusal keeps
+	// that true for the next caller rather than leaving it a property of one
+	// call site.
+	if row.MessageType == crewmessage.TypeEscalation {
+		return nil, nil, fmt.Errorf(
+			"crew message %d: an escalation is ruled on by the captain's escalation decision, never answered in-process: %w",
+			p.SentSequence, crewmessage.ErrInvalidDisposition)
 	}
 	if row.State != crewmessage.StateOpen {
 		return nil, nil, fmt.Errorf("crew message %d: %w", p.SentSequence, crewmessage.ErrAlreadyDisposed)
@@ -879,6 +928,13 @@ func (s *Server) RespondToCrewMessage(ctx context.Context, p RespondParams) (rep
 	var projErr *crewmessage.ProjectionError
 	if err != nil && !errors.As(err, &projErr) {
 		return nil, nil, err
+	}
+	// E77.6 (#3740): the SAME send-time seam the HTTP handler uses. A responder's
+	// reply is always THREADED (root is non-nil just above), so this notifies
+	// nothing — which is the point: the discrimination lives in one function
+	// rather than in two call sites hoping to agree.
+	if replyMsg, perr := crewmessage.Parse(doc); perr == nil {
+		s.notifyRootEscalationPage(ctx, replyMsg, &root, reply)
 	}
 	answered, err = s.cfg.CrewMailbox.Dispose(ctx, crewmessage.DisposeParams{
 		SentSequence: p.SentSequence, Disposition: crewmessage.DispositionAccepted, Actor: p.Actor,
@@ -966,6 +1022,15 @@ func (s *Server) handleDecideCrewEscalation(w http.ResponseWriter, r *http.Reque
 	}
 	if err != nil {
 		s.writeCrewMessageError(w, r, err)
+		// E77.6 (#3740): the captain's rejection exhausted the thread's
+		// reject-and-reply round bound. Mailbox.escalate appends the
+		// crew_message_escalated entry INSIDE the transaction that then reports
+		// exhaustion, so the notify follows a DURABLE row, and the refusal
+		// written just above is unchanged — best-effort, after the
+		// response-shaping decision, exactly like the other notify sites.
+		if errors.Is(err, crewmessage.ErrRoundBoundExhausted) && row.RunID != nil {
+			s.notifyOperatorVisible(ctx, *row.RunID, crewmessage.CategoryEscalated)
+		}
 		return
 	}
 	s.writeJSON(w, r, http.StatusOK, crewRowToResponse(*disposed))

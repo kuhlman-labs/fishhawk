@@ -16,6 +16,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/crewmessage"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/delegation"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
@@ -488,13 +489,40 @@ func parseCampaignOverride(raw []byte) (*spec.OperatorAgent, bool) {
 	return &oa, true
 }
 
-// activePageEvent returns the configured must_page_human event that is
-// CURRENTLY active at the run's gate (one of res.MustPageHuman), or "".
-// Only events with an observable v0 detector are recognised; an event in
-// MustPageHuman with no active state returns "". Detection is
-// fail-toward-paging: when in doubt the actor pages (refuses to act)
-// rather than auto-acting through a must_page condition.
+// PageEventCrewEscalation is the crew-escalation page token (E77.6 / #3740).
+//
+// It is DELIBERATELY NOT a spec.PageEvent* constant and lives in the SERVER
+// package: a crew disagreement the captain has not ruled on pages at EVERY
+// autonomy tier, `low` included, and routing it through `page_human_on` would
+// make that a CONFIGURATION rather than a structural property — spec's
+// expandTier(TierLow) expands to an EMPTY page list, so a tier-sourced token
+// would be dropped at exactly the tier the issue names. Because the token is
+// not a spec constant it cannot appear in any `page_human_on` /
+// `must_page_human` list at all, so the non-delegable page_human_on contract is
+// unchanged and no schema or v2autonomy edit is needed.
+//
+// issuecomment.campaignGatePagedPhrase keys its crew-escalation arm on this
+// literal value; TestCrewEscalationPageIsNotSourcedFromTierExpansion binds the
+// two sides.
+const PageEventCrewEscalation = "crew_escalation"
+
+// activePageEvent returns the page event that is CURRENTLY active at the run's
+// gate: the unconditional crew-escalation token (E77.6 / #3740), else one of
+// the CONFIGURED res.MustPageHuman events. Only events with an observable v0
+// detector are recognised; an event in MustPageHuman with no active state
+// returns "". Detection is fail-toward-paging: when in doubt the actor pages
+// (refuses to act) rather than auto-acting through a must_page condition.
+//
+// The crew-escalation check is checked FIRST and OUTSIDE the MustPageHuman loop
+// on purpose: it must fire whatever the resolved delegation matrix contains, so
+// an `autonomy: low` run — whose expanded page list is EMPTY — still pages. That
+// widens this function's contract from "returns a configured must_page_human
+// event" to "returns a configured must_page_human event, or the unconditional
+// crew-escalation token"; see docs/METHODOLOGY.md.
 func (s *Server) activePageEvent(ctx context.Context, runRow *run.Run, wf *spec.Workflow, res *delegation.Result, open []*concern.Concern) string {
+	if s.crewEscalationOpen(ctx, runRow) {
+		return PageEventCrewEscalation
+	}
 	for _, pe := range res.MustPageHuman {
 		switch pe {
 		case spec.PageEventReviewerReject, spec.PageEventGatingReviewerReject:
@@ -508,6 +536,103 @@ func (s *Server) activePageEvent(ctx context.Context, runRow *run.Run, wf *spec.
 		}
 	}
 	return ""
+}
+
+// crewEscalationOpen reports whether the run carries a crew disagreement the
+// captain has not ruled on yet (E77.6 / #3740) — either
+//
+//   - a crew_message_escalated entry (a thread's reject-and-reply round bound
+//     was exhausted) whose thread ROOT holds no terminal disposition of its own —
+//     the rejections that exhausted the bound are rounds of the disagreement, not
+//     rulings on it, or
+//   - a SENT root `escalation` message with no terminal disposition of its own.
+//
+// Derived from the run's CHAIN, not the derived crew_messages table, for the
+// same reason countThreadRejections is: truncating the projection must not clear
+// a page. `accepted` and `rejected` are the captain's two rulings and are
+// terminal here; `expired` is NOT — an escalation nobody answered still needs a
+// human, which is the whole point of the page.
+//
+// Posture, matching gatingImplementRejectPresent: an audit read error fails
+// TOWARD paging (returns true) rather than letting the auto-driver act through
+// an unread escalation. An UNCONFIGURED audit repository returns false — with no
+// audit repository no crew message can exist at all, so that is structural
+// absence, not doubt.
+func (s *Server) crewEscalationOpen(ctx context.Context, runRow *run.Run) bool {
+	if s.cfg.AuditRepo == nil {
+		return false
+	}
+	warn := func(category string, err error) {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "auto-drive: list crew-message entries failed; fail-toward-paging",
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("category", category), slog.String("error", err.Error()))
+	}
+	disposed, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runRow.ID, crewmessage.CategoryDisposed)
+	if err != nil {
+		warn(crewmessage.CategoryDisposed, err)
+		return true
+	}
+	// ruled is keyed by the ruled message's OWN sent_sequence, never by its
+	// thread root: a rejection of a REPLY inside the thread is one round of the
+	// disagreement, NOT a ruling on it — keying by thread root would let the very
+	// rejections that exhausted the bound mark the escalation resolved. A thread
+	// is settled when its ROOT holds a terminal disposition, which is also the
+	// message resolveDecidedCrewEscalations folds as the binding ruling, so the
+	// page and the binding text agree by construction.
+	ruled := make(map[int64]bool, len(disposed))
+	for _, e := range disposed {
+		var p struct {
+			SentSequence int64  `json:"sent_sequence"`
+			Disposition  string `json:"disposition"`
+		}
+		if json.Unmarshal(e.Payload, &p) != nil {
+			continue
+		}
+		if p.Disposition != string(crewmessage.DispositionAccepted) &&
+			p.Disposition != string(crewmessage.DispositionRejected) {
+			continue
+		}
+		ruled[p.SentSequence] = true
+	}
+
+	escalated, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runRow.ID, crewmessage.CategoryEscalated)
+	if err != nil {
+		warn(crewmessage.CategoryEscalated, err)
+		return true
+	}
+	for _, e := range escalated {
+		var p struct {
+			ThreadRootSequence int64 `json:"thread_root_sequence"`
+		}
+		if json.Unmarshal(e.Payload, &p) != nil {
+			// An undecodable escalation entry is still an escalation: page.
+			return true
+		}
+		if !ruled[p.ThreadRootSequence] {
+			return true
+		}
+	}
+
+	sent, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runRow.ID, crewmessage.CategorySent)
+	if err != nil {
+		warn(crewmessage.CategorySent, err)
+		return true
+	}
+	for _, e := range sent {
+		var p struct {
+			Message struct {
+				Type crewmessage.MessageType `json:"type"`
+			} `json:"message"`
+			ThreadRootSequence *int64 `json:"thread_root_sequence"`
+		}
+		if json.Unmarshal(e.Payload, &p) != nil {
+			continue
+		}
+		if p.ThreadRootSequence == nil && p.Message.Type == crewmessage.TypeEscalation && !ruled[e.Sequence] {
+			return true
+		}
+	}
+	return false
 }
 
 // gatingImplementRejectPresent reports whether the latest implement

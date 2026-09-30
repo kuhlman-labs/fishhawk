@@ -38,6 +38,11 @@ import (
 //     (spec.PageEventClarificationRequest) that waits on the operator's
 //     answers before planning can resume.
 //   - CI failed (#1045)
+//   - a crew disagreement was escalated to the captain — either a SENT root
+//     `escalation` or a thread whose reject-and-reply round bound is exhausted
+//     (E77.6 / #3740). Both page at EVERY autonomy tier, `low` included,
+//     because the refusal is keyed to server.PageEventCrewEscalation rather
+//     than to a `page_human_on` list.
 //
 // Dedup is per source audit event: each ping records the originating
 // entry's audit Sequence on CategoryAnchorPingPosted, so a re-render of
@@ -151,6 +156,40 @@ func pageClassEvents(entries []*audit.Entry, stages []*run.Stage) []pageEvent {
 				message: fmt.Sprintf("🛑 The campaign auto-driver paused this issue and needs you: %s.",
 					campaignGatePagedPhrase(pagePageEvent(e.Payload))),
 			})
+		case "crew_message_escalated":
+			// E77.6 (#3740, crewmessage.CategoryEscalated): a crew-to-crew
+			// disagreement exhausted its reject-and-reply round bound, so the
+			// captain must rule before anything the thread argued can bind. This
+			// page is TIER-INDEPENDENT: it is derived from the chain here and
+			// refused in server.activePageEvent under the server-package
+			// PageEventCrewEscalation token, NOT through a `page_human_on` list —
+			// so `autonomy: low`, whose expanded page list is EMPTY, still pages.
+			// Deliberately NOT routed through campaignGatePagedPhrase: that
+			// wording is the campaign auto-driver's hand-off, and this event
+			// pages on ANY run, campaign or not.
+			out = append(out, pageEvent{
+				sequence: e.Sequence,
+				kind:     "crew_escalation_exhausted",
+				message:  crewEscalationExhaustedMessage(e.Payload),
+			})
+		case "crew_message_sent":
+			// E77.6 (#3740, crewmessage.CategorySent): a crew role SENT an
+			// escalation. Only a thread ROOT pages — a threaded reply inside an
+			// escalation thread is part of an exchange the captain is already
+			// paged about — and only the `escalation` type, so the other four
+			// crew-message types (consult, finding, work_request, notice) produce
+			// NO event and the one-page-per-crew-message noise class cannot
+			// appear. Unlike the exhaustion above this reaches the operator
+			// through the pings-only notifyPageClass path ONLY: registering
+			// crew_message_sent in activityCategories would put EVERY crew
+			// message on the anchor timeline (docs/issue-comment-surfaces.md).
+			if crewSentEscalation(e.Payload) {
+				out = append(out, pageEvent{
+					sequence: e.Sequence,
+					kind:     "crew_escalation_sent",
+					message:  "🛑 A crew role escalated a disagreement to the captain — your ruling is needed before it binds anything.",
+				})
+			}
 		case "ci_failure_retry_dispatched":
 			out = append(out, pageEvent{
 				sequence: e.Sequence,
@@ -186,6 +225,26 @@ func pageClassEvents(entries []*audit.Entry, stages []*run.Stage) []pageEvent {
 	return out
 }
 
+// PageClassEventKinds returns the KIND tokens pageClassEvents projects out of a
+// run's audit chain, ascending by source sequence. It is the read accessor a
+// consumer in another package uses to assert that a chain it produced actually
+// yields the page it intends — the same role RendersActivity plays for the
+// activity registry. It exposes only the stable kind tokens, never the comment
+// bodies, so a caller cannot come to depend on the wording.
+//
+// Added for E77.6 (#3740): the crew-escalation page is written in
+// backend/internal/server (the notify sites and PageEventCrewEscalation) and
+// projected here, so its end-to-end test needs to cross that package boundary
+// without reimplementing the projection.
+func PageClassEventKinds(entries []*audit.Entry, stages []*run.Stage) []string {
+	events := pageClassEvents(entries, stages)
+	out := make([]string, 0, len(events))
+	for _, ev := range events {
+		out = append(out, ev.kind)
+	}
+	return out
+}
+
 // pageEventResolved reports whether a reviewer-reject page event has
 // already been resolved by a LATER audit entry, in which case firePings
 // records the dedup row but SKIPS the actual comment: the page would arrive
@@ -196,8 +255,8 @@ func pageClassEvents(entries []*audit.Entry, stages []*run.Stage) []pageEvent {
 // the resolving entry lands on a later re-render.
 //
 // Only reviewer-reject kinds are resolvable; every other page class (a
-// must_page_human park, a CI failure, an acceptance triage page) always
-// pages and returns false.
+// must_page_human park, a CI failure, an acceptance triage page, either crew
+// escalation kind) always pages and returns false.
 //
 //   - plan_review_rejected — resolved by a later approval_submitted entry
 //     (the operator arbitrated the plan gate).
@@ -346,9 +405,72 @@ func campaignGatePagedPhrase(pageEvent string) string {
 		return "a reviewer flagged a blocking concern that needs your decision"
 	case "requirement_arbitration":
 		return "a requirement needs your arbitration"
+	case "crew_escalation":
+		// server.PageEventCrewEscalation. The token is a SERVER-package constant
+		// deliberately outside spec.PageEvent* (E77.6 / #3740), so it can never
+		// appear in a page_human_on list; this arm exists so a campaign hand-off
+		// on it names the escalation instead of "a gate decision".
+		return "a crew disagreement was escalated to the captain and needs your ruling"
 	default:
 		return "a gate decision"
 	}
+}
+
+// crewEscalatedCounts reads the thread root, the round bound and the rejection
+// count from a crew_message_escalated payload (crewmessage's escalatedPayload).
+// ok=false for an absent, unparseable, or non-positive-valued payload so a
+// malformed entry degrades to a count-free phrase rather than rendering "0"
+// (the clarificationQuestionCount posture).
+func crewEscalatedCounts(payload []byte) (root int64, bound, rejections int, ok bool) {
+	if len(payload) == 0 {
+		return 0, 0, 0, false
+	}
+	var p struct {
+		ThreadRootSequence int64 `json:"thread_root_sequence"`
+		RoundBound         int   `json:"round_bound"`
+		Rejections         int   `json:"rejections"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return 0, 0, 0, false
+	}
+	if p.ThreadRootSequence <= 0 || p.RoundBound <= 0 {
+		return 0, 0, 0, false
+	}
+	return p.ThreadRootSequence, p.RoundBound, p.Rejections, true
+}
+
+// crewEscalationExhaustedMessage renders the round-bound-exhaustion page body.
+// A payload crewEscalatedCounts cannot read degrades to a count-free phrase:
+// the disagreement is real whether or not its metadata decodes, so the page
+// still fires — it just never names a fabricated "0".
+func crewEscalationExhaustedMessage(payload []byte) string {
+	root, bound, _, ok := crewEscalatedCounts(payload)
+	if !ok {
+		return "🛑 A crew disagreement exhausted its reject-and-reply rounds and needs your ruling."
+	}
+	return fmt.Sprintf("🛑 A crew disagreement on thread %d exhausted its %d reject-and-reply rounds and needs your ruling.", root, bound)
+}
+
+// crewSentEscalation reports whether a crew_message_sent payload
+// (crewmessage's sentPayload) is an escalation THREAD ROOT: type `escalation`
+// AND no thread_root_sequence. A reply inside an escalation thread carries the
+// root and returns false, so a reject-and-reply exchange pages once (at its
+// root) plus once more on exhaustion, never once per reply. Any other type, and
+// any absent/unparseable payload, returns false.
+func crewSentEscalation(payload []byte) bool {
+	if len(payload) == 0 {
+		return false
+	}
+	var p struct {
+		Message struct {
+			Type string `json:"type"`
+		} `json:"message"`
+		ThreadRootSequence *int64 `json:"thread_root_sequence"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return false
+	}
+	return p.Message.Type == "escalation" && p.ThreadRootSequence == nil
 }
 
 // acceptanceTriageNeedsHuman reads {class, disposition} from an

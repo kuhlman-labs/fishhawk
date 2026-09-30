@@ -15312,3 +15312,280 @@ func TestConsultChannelFiguresMatchServerBounds(t *testing.T) {
 			prompt.ConsultChannelWindowMinutes, crewConsultWindowSeconds, sites)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// E77.6 (#3740): binding ONLY once answered (AC3). resolveDecidedCrewEscalations
+// folds a captain's ruling into the plan prompt as TRUSTED binding text, and
+// folds NOTHING while the escalation is open.
+// ---------------------------------------------------------------------------
+
+const crewRulingHeading = "### Captain's ruling on an escalated disagreement (binding)"
+
+// seedRootEscalation records a root escalation on runID BY CONSTRUCTION
+// (straight through the mailbox) whose summary carries sentinel, and returns its
+// sent sequence.
+func seedRootEscalation(t *testing.T, f *crewPG, runID uuid.UUID, sentinel string) int64 {
+	t.Helper()
+	row, err := f.mailbox.Send(context.Background(), crewmessage.SendParams{
+		RawMessage: []byte(escalationDocFrom("planner", runAnchor(runID), sentinel)),
+		Actor:      crewmessage.Actor{Kind: audit.ActorAgent, Subject: "test:planner"},
+	})
+	if err != nil {
+		t.Fatalf("seed escalation: %v", err)
+	}
+	return row.SentSequence
+}
+
+// TestPlanPrompt_OpenEscalationRendersNoBindingText: an OPEN escalation whose
+// payload summary carries a sentinel that appears NOWHERE else in the fixture
+// renders no ruling heading and no sentinel. This is an absence test only the
+// terminal-state filter can satisfy — fold in an open escalation and the
+// sentinel appears.
+func TestPlanPrompt_OpenEscalationRendersNoBindingText(t *testing.T) {
+	f := newCrewPG(t)
+	s, _ := newConsultFoldServer(t, f, f.audit)
+	runID := f.seedRun(t, run.StageTypePlan)
+	seedRootEscalation(t, f, runID, "OPEN-ESCALATION-SENTINEL")
+
+	if got := s.resolveDecidedCrewEscalations(context.Background(), runID); len(got) != 0 {
+		t.Fatalf("an OPEN escalation folded %d rulings, want 0: %+v", len(got), got)
+	}
+	tr := prompt.Trigger{
+		Source: "issue", IssueNumber: 3740, Repo: "kuhlman-labs/fishhawk",
+		CrewEscalationRulings: s.resolveDecidedCrewEscalations(context.Background(), runID),
+	}
+	rendered, err := prompt.Build("plan", tr)
+	if err != nil {
+		t.Fatalf("Build(plan): %v", err)
+	}
+	if strings.Contains(rendered, "OPEN-ESCALATION-SENTINEL") {
+		t.Error("an open escalation's agent-authored summary reached the plan prompt as binding text")
+	}
+	if strings.Contains(rendered, crewRulingHeading) {
+		t.Error("an open escalation rendered the captain's-ruling heading")
+	}
+}
+
+// TestPlanPrompt_DecidedEscalationRendersCaptainRuling: decided `accepted` over
+// the REAL decide handler, the re-resolved ruling carries the decision and the
+// captain's distinctive reason, and the plan render carries the heading.
+func TestPlanPrompt_DecidedEscalationRendersCaptainRuling(t *testing.T) {
+	f := newCrewPG(t)
+	s, _ := newConsultFoldServer(t, f, f.audit)
+	runID := f.seedRun(t, run.StageTypePlan)
+	seq := seedRootEscalation(t, f, runID, "DECIDED-ESCALATION-SUMMARY")
+
+	if w := f.decide(t, seq, "accepted", "ACCEPTED-RULING-REASON take the narrow scope"); w.Code != http.StatusOK {
+		t.Fatalf("decide status = %d; body = %s", w.Code, w.Body.String())
+	}
+	got := s.resolveDecidedCrewEscalations(context.Background(), runID)
+	if len(got) != 1 {
+		t.Fatalf("folded %d rulings after a decision, want 1: %+v", len(got), got)
+	}
+	if got[0].Sequence != seq || got[0].Decision != string(crewmessage.StateAccepted) {
+		t.Errorf("ruling = %+v, want sequence %d decision accepted", got[0], seq)
+	}
+	if got[0].Reason != "ACCEPTED-RULING-REASON take the narrow scope" {
+		t.Errorf("ruling reason = %q, want the captain's reason verbatim", got[0].Reason)
+	}
+	rendered, err := prompt.Build("plan", prompt.Trigger{
+		Source: "issue", IssueNumber: 3740, Repo: "kuhlman-labs/fishhawk", CrewEscalationRulings: got,
+	})
+	if err != nil {
+		t.Fatalf("Build(plan): %v", err)
+	}
+	for _, want := range []string{crewRulingHeading, "accepted", "ACCEPTED-RULING-REASON take the narrow scope"} {
+		if !strings.Contains(rendered, want) {
+			t.Errorf("the plan prompt is missing %q", want)
+		}
+	}
+	// The agent-authored escalation text is NOT promoted to trusted binding text
+	// by this channel.
+	if strings.Contains(rendered, "DECIDED-ESCALATION-SUMMARY") {
+		t.Error("the escalation's agent-authored summary was promoted into the trusted ruling section")
+	}
+}
+
+// TestPlanPrompt_RejectedEscalationRendersRuling covers the other disposition.
+func TestPlanPrompt_RejectedEscalationRendersRuling(t *testing.T) {
+	f := newCrewPG(t)
+	s, _ := newConsultFoldServer(t, f, f.audit)
+	runID := f.seedRun(t, run.StageTypePlan)
+	seq := seedRootEscalation(t, f, runID, "REJECTED-ESCALATION-SUMMARY")
+
+	if w := f.decide(t, seq, "rejected", "REJECTED-RULING-REASON do it the other way"); w.Code != http.StatusOK {
+		t.Fatalf("decide status = %d; body = %s", w.Code, w.Body.String())
+	}
+	got := s.resolveDecidedCrewEscalations(context.Background(), runID)
+	if len(got) != 1 || got[0].Decision != string(crewmessage.StateRejected) {
+		t.Fatalf("rulings = %+v, want one rejected ruling", got)
+	}
+	rendered, err := prompt.Build("plan", prompt.Trigger{
+		Source: "issue", IssueNumber: 3740, Repo: "kuhlman-labs/fishhawk", CrewEscalationRulings: got,
+	})
+	if err != nil {
+		t.Fatalf("Build(plan): %v", err)
+	}
+	if !strings.Contains(rendered, "rejected") || !strings.Contains(rendered, "REJECTED-RULING-REASON do it the other way") {
+		t.Errorf("the rejected ruling did not render:\n%s", rendered)
+	}
+}
+
+// TestPlanPrompt_RouteCarriesCaptainRuling pins the PROMPT-ROUTE WIRING, which
+// the resolver-level AC3 tests do not reach: both handleGetStagePrompt and
+// handleGetStagePromptRender set trigger.CrewEscalationRulings, and deleting
+// either line is invisible to every test that calls the resolver directly and
+// hands the result to prompt.Build. This drives the real
+// GET /v0/stages/{stage_id}/prompt (the AC's own verify_hint) and its
+// prompt-render sibling, so each wiring line has its own assertion — the two
+// handlers carry separate copies, and the compiler cannot see a deleted one.
+func TestPlanPrompt_RouteCarriesCaptainRuling(t *testing.T) {
+	f := newCrewPG(t)
+	s, sf := newConsultFoldServer(t, f, f.audit)
+	runID := f.seedRun(t, run.StageTypePlan)
+	stageID := f.stageOf(t, runID)
+	// seedRun leaves runs.requires_charter NULL, which makes the charter
+	// determination undecidable and refuses BOTH prompt routes before any
+	// trigger field is read (#2806). Record the non-grooming determination so
+	// the routes serve.
+	if _, err := f.pool.Exec(context.Background(),
+		`UPDATE runs SET requires_charter = false WHERE id = $1`, runID); err != nil {
+		t.Fatalf("seed the charter determination: %v", err)
+	}
+	priv, _ := sf.issue(t, runID)
+	seq := seedRootEscalation(t, f, runID, "ROUTE-ESCALATION-SUMMARY")
+	const reason = "ROUTE-RULING-REASON ship the narrow slice"
+	if w := f.decide(t, seq, "accepted", reason); w.Code != http.StatusOK {
+		t.Fatalf("decide status = %d; body = %s", w.Code, w.Body.String())
+	}
+
+	for _, route := range []string{"/prompt", "/prompt-render"} {
+		t.Run(route, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/v0/stages/"+stageID.String()+route, nil)
+			req.Header.Set("X-Fishhawk-Signature",
+				hex.EncodeToString(ed25519.Sign(priv, PromptCanonicalMessage(stageID))))
+			w := httptest.NewRecorder()
+			s.Handler().ServeHTTP(w, req)
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+			}
+			var resp promptResponse
+			if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			for _, want := range []string{crewRulingHeading, "accepted", reason} {
+				if !strings.Contains(resp.Prompt, want) {
+					t.Errorf("the prompt served by %s is missing %q", route, want)
+				}
+			}
+			// The agent-authored escalation text is still not promoted.
+			if strings.Contains(resp.Prompt, "ROUTE-ESCALATION-SUMMARY") {
+				t.Errorf("%s promoted the escalation's agent-authored summary into the trusted ruling section", route)
+			}
+		})
+	}
+}
+
+// TestResolveDecidedCrewEscalations_NonEscalationAndReplyNotFolded: a decided
+// CONSULT and a decided THREADED escalation reply each fold NOTHING — only a
+// root escalation is a ruling. The two rows differ from the folded root only in
+// message type and in carrying a thread root, respectively.
+func TestResolveDecidedCrewEscalations_NonEscalationAndReplyNotFolded(t *testing.T) {
+	f := newCrewPG(t)
+	s, _ := newConsultFoldServer(t, f, f.audit)
+	runID := f.seedRun(t, run.StageTypePlan)
+	ctx := context.Background()
+
+	// A decided root escalation: the control, so an empty result elsewhere is not
+	// an inert fixture.
+	root := seedRootEscalation(t, f, runID, "CONTROL-ESCALATION")
+	if w := f.decide(t, root, "accepted", "control ruling"); w.Code != http.StatusOK {
+		t.Fatalf("decide the control: %d %s", w.Code, w.Body.String())
+	}
+	// A THREADED escalation reply, disposed accepted.
+	reply, err := f.mailbox.Send(ctx, crewmessage.SendParams{
+		RawMessage:         []byte(escalationDocFrom("planner", runAnchor(runID), "REPLY-ESCALATION")),
+		Actor:              crewmessage.Actor{Kind: audit.ActorAgent, Subject: "test:planner"},
+		ThreadRootSequence: &root,
+	})
+	if err != nil {
+		t.Fatalf("threaded reply: %v", err)
+	}
+	if _, err := f.mailbox.Dispose(ctx, crewmessage.DisposeParams{
+		SentSequence: reply.SentSequence, Disposition: crewmessage.DispositionAccepted,
+		Reason: "REPLY-RULING-REASON", Actor: crewmessage.Actor{Kind: audit.ActorUser, Subject: "captain"},
+	}); err != nil {
+		t.Fatalf("dispose the reply: %v", err)
+	}
+	// A decided CONSULT.
+	consult, err := f.mailbox.Send(ctx, crewmessage.SendParams{
+		RawMessage: []byte(crewDoc("consult", "planner", "historian", runAnchor(runID), crewConsultPayload)),
+		Actor:      crewmessage.Actor{Kind: audit.ActorAgent, Subject: "test:planner"},
+	})
+	if err != nil {
+		t.Fatalf("send consult: %v", err)
+	}
+	if _, err := f.mailbox.Dispose(ctx, crewmessage.DisposeParams{
+		SentSequence: consult.SentSequence, Disposition: crewmessage.DispositionAccepted,
+		Reason: "CONSULT-RULING-REASON", Actor: crewmessage.Actor{Kind: audit.ActorSystem, Subject: "historian"},
+	}); err != nil {
+		t.Fatalf("dispose the consult: %v", err)
+	}
+
+	got := s.resolveDecidedCrewEscalations(ctx, runID)
+	if len(got) != 1 || got[0].Sequence != root {
+		t.Fatalf("folded %+v, want exactly the root escalation at sequence %d", got, root)
+	}
+	for _, r := range got {
+		if r.Reason == "REPLY-RULING-REASON" || r.Reason == "CONSULT-RULING-REASON" {
+			t.Errorf("a %s folded in as a ruling", r.Reason)
+		}
+	}
+}
+
+// TestResolveDecidedCrewEscalations_Degrades covers each best-effort branch: an
+// unconfigured server, a failing crew_message_sent listing, and a failing
+// crew_message_disposed listing all fold NOTHING rather than failing the prompt
+// build. Each error fixture holds a genuinely DECIDED escalation, so the nil is
+// the degrade and not an empty chain.
+func TestResolveDecidedCrewEscalations_Degrades(t *testing.T) {
+	t.Run("unconfigured", func(t *testing.T) {
+		s := New(Config{Addr: "127.0.0.1:0"})
+		if got := s.resolveDecidedCrewEscalations(context.Background(), uuid.New()); got != nil {
+			t.Fatalf("unconfigured fold = %+v, want nil", got)
+		}
+	})
+	for _, category := range []string{crewmessage.CategorySent, crewmessage.CategoryDisposed} {
+		t.Run("failing "+category+" listing", func(t *testing.T) {
+			f := newCrewPG(t)
+			ok, _ := newConsultFoldServer(t, f, f.audit)
+			runID := f.seedRun(t, run.StageTypePlan)
+			seq := seedRootEscalation(t, f, runID, "DEGRADE-ESCALATION")
+			if w := f.decide(t, seq, "accepted", "DEGRADE-RULING"); w.Code != http.StatusOK {
+				t.Fatalf("decide: %d %s", w.Code, w.Body.String())
+			}
+			if got := ok.resolveDecidedCrewEscalations(context.Background(), runID); len(got) != 1 {
+				t.Fatalf("fixture: expected one ruling before the injected failure; got %+v", got)
+			}
+			failing, _ := newConsultFoldServer(t, f,
+				&crewEscalationFoldAuditRepo{Repository: f.audit, failCategory: category})
+			if got := failing.resolveDecidedCrewEscalations(context.Background(), runID); got != nil {
+				t.Errorf("a failing %s listing folded %+v, want nil", category, got)
+			}
+		})
+	}
+}
+
+// crewEscalationFoldAuditRepo fails ONE category's listing, leaving every other
+// read working, so each degrade branch is injected in isolation.
+type crewEscalationFoldAuditRepo struct {
+	audit.Repository
+	failCategory string
+}
+
+func (a *crewEscalationFoldAuditRepo) ListForRunByCategory(ctx context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
+	if category == a.failCategory {
+		return nil, errors.New("injected listing failure for " + category)
+	}
+	return a.Repository.ListForRunByCategory(ctx, runID, category)
+}

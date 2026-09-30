@@ -922,6 +922,118 @@ func (s *Server) resolveAnsweredCrewConsults(ctx context.Context, runID, stageID
 	return out
 }
 
+// resolveDecidedCrewEscalations returns the captain's rulings on this run's
+// escalated crew disagreements (E77.6 / #3740) as trusted prompt rulings, so a
+// decided escalation — and ONLY a decided one — produces binding plan text.
+//
+// Selection is the binding rule:
+//
+//   - a `type: escalation` THREAD ROOT on this run (run-scoped, not
+//     stage-scoped: an escalation is the run's business whichever stage raised
+//     it, unlike resolveAnsweredCrewConsults' own-stage fold);
+//   - whose DERIVED ROW state is terminal, `accepted` or `rejected` — i.e. the
+//     captain decided via the E77.3 escalation-decision endpoint;
+//   - with the decision and the reason read from the crew_message_disposed CHAIN
+//     entry, the one place the reason prose lives (the row only points at it).
+//
+// An OPEN escalation yields NOTHING. That is what makes an unanswered
+// disagreement bind nothing and park nothing: the page (activePageEvent's
+// PageEventCrewEscalation + the two issuecomment page kinds) is what stops the
+// auto-driver, and this fold is what makes the answer binding.
+//
+// Best-effort, identical in posture to resolveAnsweredCrewConsults: an
+// unconfigured mailbox/audit repository or a list error logs WARN and returns
+// nil, and a single escalation that cannot be resolved is skipped, rather than
+// failing the prompt build.
+func (s *Server) resolveDecidedCrewEscalations(ctx context.Context, runID uuid.UUID) []prompt.CrewEscalationRuling {
+	if s.cfg.CrewMailbox == nil || s.cfg.AuditRepo == nil {
+		return nil
+	}
+	warn := func(msg string, err error, attrs ...slog.Attr) {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, msg, append([]slog.Attr{
+			slog.String("run_id", runID.String()), slog.String("error", err.Error()),
+		}, attrs...)...)
+	}
+	sent, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, crewmessage.CategorySent)
+	if err != nil {
+		warn("prompt: list crew escalations failed", err)
+		return nil
+	}
+	var roots []int64
+	for _, e := range sent {
+		var p struct {
+			Message struct {
+				Type crewmessage.MessageType `json:"type"`
+			} `json:"message"`
+			ThreadRootSequence *int64 `json:"thread_root_sequence"`
+		}
+		if json.Unmarshal(e.Payload, &p) != nil {
+			continue
+		}
+		if p.ThreadRootSequence == nil && p.Message.Type == crewmessage.TypeEscalation {
+			roots = append(roots, e.Sequence)
+		}
+	}
+	if len(roots) == 0 {
+		return nil
+	}
+	rows, err := s.cfg.CrewMailbox.Store().ListByAnchor(ctx, crewmessage.AnchorFilter{RunID: &runID})
+	if err != nil {
+		warn("prompt: list crew messages failed", err)
+		return nil
+	}
+	terminal := make(map[int64]bool, len(rows))
+	for _, r := range rows {
+		if r.State == crewmessage.StateAccepted || r.State == crewmessage.StateRejected {
+			terminal[r.SentSequence] = true
+		}
+	}
+	disposed, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, crewmessage.CategoryDisposed)
+	if err != nil {
+		warn("prompt: list crew dispositions failed", err)
+		return nil
+	}
+	type ruling struct {
+		decision, reason string
+	}
+	bySent := make(map[int64]ruling, len(disposed))
+	for _, e := range disposed {
+		var p struct {
+			SentSequence int64  `json:"sent_sequence"`
+			Disposition  string `json:"disposition"`
+			Reason       string `json:"reason"`
+		}
+		if json.Unmarshal(e.Payload, &p) != nil {
+			continue
+		}
+		if p.Disposition != string(crewmessage.DispositionAccepted) &&
+			p.Disposition != string(crewmessage.DispositionRejected) {
+			continue
+		}
+		// The FIRST disposition in chain order wins, matching
+		// crewmessage.projectDisposition's own first-wins rule.
+		if _, seen := bySent[p.SentSequence]; !seen {
+			bySent[p.SentSequence] = ruling{decision: p.Disposition, reason: p.Reason}
+		}
+	}
+	var out []prompt.CrewEscalationRuling
+	for _, seq := range roots {
+		if !terminal[seq] {
+			continue
+		}
+		r, ok := bySent[seq]
+		if !ok {
+			// Terminal row with no readable ruling entry: skip rather than render
+			// a binding instruction whose decision we cannot name.
+			warn("prompt: terminal crew escalation has no readable disposition entry",
+				errors.New("no accepted/rejected crew_message_disposed entry"), slog.Int64("sent_sequence", seq))
+			continue
+		}
+		out = append(out, prompt.CrewEscalationRuling{Sequence: seq, Decision: r.decision, Reason: r.reason})
+	}
+	return out
+}
+
 // coupledTestSiblings derives the stem-sibling test file for each owned
 // source file in a scope slice: for every entry whose normalized path ends in
 // `.go` but NOT `_test.go` and whose operation is create or modify (a deleted
@@ -1539,6 +1651,11 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		// BOTH prompt handlers so the signed prompt and the render preview
 		// stay byte-identical.
 		trigger.CrewMessages = s.resolveAnsweredCrewConsults(r.Context(), runRow.ID, stage.ID)
+		// Captain's rulings on escalated disagreements (E77.6 / #3740): a DECIDED
+		// escalation becomes binding plan text; an open one folds in nothing. Set
+		// on BOTH prompt handlers so the signed prompt and the render preview stay
+		// byte-identical.
+		trigger.CrewEscalationRulings = s.resolveDecidedCrewEscalations(r.Context(), runRow.ID)
 		if runRow.TriggerRef != nil {
 			// #2680: thread BOTH the feedback text and the rejecting run's id
 			// so buildPlan's truncation marker can name a concrete retrieval
@@ -2219,6 +2336,11 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		// BOTH prompt handlers so the signed prompt and the render preview
 		// stay byte-identical.
 		trigger.CrewMessages = s.resolveAnsweredCrewConsults(r.Context(), runRow.ID, stage.ID)
+		// Captain's rulings on escalated disagreements (E77.6 / #3740): a DECIDED
+		// escalation becomes binding plan text; an open one folds in nothing. Set
+		// on BOTH prompt handlers so the signed prompt and the render preview stay
+		// byte-identical.
+		trigger.CrewEscalationRulings = s.resolveDecidedCrewEscalations(r.Context(), runRow.ID)
 		if runRow.TriggerRef != nil {
 			// #2680: thread BOTH the feedback text and the rejecting run's id
 			// so buildPlan's truncation marker can name a concrete retrieval
