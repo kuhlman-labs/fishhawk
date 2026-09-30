@@ -209,6 +209,13 @@ import "sort"
 // are not decision-bearing (decisionindex is untouched) and, like
 // digest_marked_read, are deliberately NOT issue-comment activity categories:
 // a handover is repo-scoped and has no run thread to render on.
+// E77.2 / #3736 (ADR-081 #3727 D2/D3) added the three crew-message categories
+// — crew_message_sent, crew_message_disposed and crew_message_escalated —
+// written by backend/internal/crewmessage's Mailbox via AppendChainedTx (run
+// anchor) or AppendGlobalChainedTx (issue / decision-record anchor). The chain
+// is authoritative; the crew_messages table (0090) is rebuilt from them. They
+// are INTERNAL, not issue-comment activity categories: no delivery surface and
+// no server writer exists yet (docs/issue-comment-surfaces.md).
 var KnownCategories = map[string]struct{}{
 	"acceptance_dispatched":                   {},
 	"acceptance_outcome_recorded":             {},
@@ -277,6 +284,9 @@ var KnownCategories = map[string]struct{}{
 	"consolidated_pr_opened":                  {},
 	"consolidated_review_diff_truncated":      {},
 	"cost_recorded":                           {},
+	"crew_message_disposed":                   {},
+	"crew_message_escalated":                  {},
+	"crew_message_sent":                       {},
 	"deploy_preflight_refused":                {},
 	"deploy_run":                              {},
 	"deployment_dispatch_failed":              {},
