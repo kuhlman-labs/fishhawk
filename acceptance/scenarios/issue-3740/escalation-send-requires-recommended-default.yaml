@@ -1,0 +1,14 @@
+id: scenario:issue-3740/escalation-send-requires-recommended-default
+statement: Sending a crew message of type escalation without recommended_default is refused at send, and the refusal names the missing field.
+verify_hint: 'An HTTP route/response/status code: POST /v0/crew-messages with an escalation document missing recommended_default returns a 4xx whose error body names recommended_default; the same document with the field present returns 201. Decided by TestSendCrewMessage_EscalationWithoutRecommendedDefaultRefused.'
+steps: 'POST http://localhost:8090/v0/dev/fixtures {"scenario":"trace-upload-target"} -> run R (low tier). Mint the fhm_ run token (signing-key, /v0/dev/sign over ''{}'', mcp-token) and an operator bearer via psql. POST /v0/crew-messages with {schema_version crew-message-v1, type escalation, recipient_role captain, anchor {run_id R}, payload {summary, tradeoffs}} using the fhm_ bearer and again with the operator bearer; GET /v0/runs/R/audit before and after. Control: the same with tradeoffs removed and recommended_default present. Then the complete document (summary, tradeoffs, recommended_default).'
+assertions:
+    expected: 4xx whose error body names recommended_default; the same document with the field present -> 201.
+    observed_at_record: 'Both missing-recommended_default sends -> 400 validation_failed "at ''/payload'': missing property ''recommended_default''"; run audit row count 6 -> 6 (nothing appended). Missing tradeoffs -> 400 naming tradeoffs. Complete document -> 201 (sent_sequence 18, message_type escalation, sender_role planner, state open).'
+    repro_handle: 'curl -X POST -H ''Authorization: Bearer <fhm_>'' localhost:8090/v0/crew-messages -d ''{"schema_version":"crew-message-v1","type":"escalation","recipient_role":"captain","anchor":{"run_id":"<R>"},"payload":{"summary":"s","tradeoffs":"t"}}'''
+origin:
+    issue: 3740
+    pr: 3880
+    run_id: 53cff05d-4d27-48cf-aa61-aa0a7e410131
+    head_sha: 065439034ca1ab0ae007163d648fd6343cdb6df1
+    recorded_at: 2026-09-30T18:27:35Z
