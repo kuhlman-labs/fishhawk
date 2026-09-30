@@ -111,8 +111,20 @@ func (s *Server) handleIssueMCPToken(w http.ResponseWriter, r *http.Request) {
 	// can file mid-stage scope amendment requests. The scope only
 	// admits requesting: the decision endpoint requires write:stages
 	// and rejects run-bound tokens outright.
-	if s.resolveExecutingStageType(r, runRow) == run.StageTypeImplement {
+	stageType := s.resolveExecutingStageType(r, runRow)
+	if stageType == run.StageTypeImplement {
 		scopes = append(scopes, "write:scope-amendments")
+	}
+	// write:messages (E77.3 / #3737, ADR-081 rule 3) is a POSITIVE allow-list
+	// over the two stage types that consult and flag — plan and review — so a
+	// future stage type is denied by default. Implement is excluded by
+	// ARCHITECTURE.md §6 invariant #8: an implement stage never ingests
+	// untrusted text, so it must never hold a channel that returns some (the
+	// crew-message READ routes require this scope too). Deploy and acceptance
+	// are excluded because neither consults nor flags. Like the amendment
+	// grant, it reads the stage row's type — no spec parse.
+	if stageTypeMayMessage(stageType) {
+		scopes = append(scopes, scopeWriteMessages)
 	}
 
 	tok, err := s.cfg.MCPTokenRepo.Issue(r.Context(), mcptoken.IssueParams{
@@ -218,6 +230,12 @@ func (s *Server) writeMCPTokenIssuedAudit(r *http.Request, runID uuid.UUID, tok 
 			slog.String("token_id", tok.ID.String()),
 			slog.String("error", err.Error()))
 	}
+}
+
+// stageTypeMayMessage is the write:messages mint predicate: plan and review
+// ONLY.
+func stageTypeMayMessage(st run.StageType) bool {
+	return st == run.StageTypePlan || st == run.StageTypeReview
 }
 
 // activeOrNextStage resolves the stage a runner-side request is

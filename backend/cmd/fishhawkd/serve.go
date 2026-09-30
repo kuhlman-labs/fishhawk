@@ -41,6 +41,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/claudecode"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/codex"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/crewmessage"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/decisionindex"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/deployreconciler"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/devfixtures"
@@ -2423,6 +2424,11 @@ func runServe(args []string, logSink io.Writer) int {
 		// verbs): the chain is the sole authority, so the store needs only
 		// the pool — no derived table.
 		cfg.CaptainStore = captain.NewStore(pool)
+		// The E77.3 / #3737 crew-message surface (the five /v0/crew-messages
+		// routes). Dropping this ONE line is the partial rollback ADR-081's
+		// Consequences name: every crew-message endpoint then answers 503
+		// crew_message_unconfigured and no other surface changes.
+		cfg.CrewMailbox = crewmessage.NewMailbox(pool, crewmessage.DefaultRoundBound)
 		cfg.ApprovalRepo = approval.NewPostgresRepository(pool)
 		cfg.ArtifactRepo = artifact.NewPostgresRepository(pool)
 		// GET /v0/precedent's read surface (E75.3 / #3731). The SAME store the

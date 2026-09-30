@@ -31,6 +31,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/captain"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/crewmessage"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/digest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
@@ -831,6 +832,15 @@ type Config struct {
 	// in_flight, and a nil RunRepo degrades delegation_in_force, whose view is
 	// projected from the newest run's cached spec).
 	CaptainStore *captain.Store
+
+	// CrewMailbox is the crew-message domain layer (E77.3 / #3737, ADR-081
+	// #3727 D4) behind the five /v0/crew-messages routes: sends and
+	// dispositions append to the chain through it, and reads go through
+	// CrewMailbox.Store(). Concrete, mirroring CaptainStore — the layer is
+	// chain-authoritative and Postgres-only. Wired from serve.go's pool block;
+	// nil (the documented partial rollback) answers every crew-message route
+	// 503 crew_message_unconfigured and changes no other surface.
+	CrewMailbox *crewmessage.Mailbox
 
 	// ModelOracle is the snapshot seam the model-id validity layer (#1339)
 	// queries to decide whether a model named in a workflow spec is a real,

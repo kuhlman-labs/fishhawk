@@ -7798,6 +7798,78 @@ components:
             - $ref: '#/components/schemas/CaptainOffer'
             - type: "null"
 
+    CrewMessageAnchor:
+      type: object
+      description: Exactly one member is set — the crew message's anchor.
+      properties:
+        run_id: { type: string, format: uuid }
+        issue_ref: { type: string }
+        decision_record_id: { type: string }
+    CrewMessage:
+      type: object
+      description: |
+        One crew message's CONTRACT-CLOSED metadata (the derived
+        `crew_messages` row). It deliberately carries no payload: a crew
+        message's text leaves the server only in the prompt-rendered form
+        (`CrewMessageRendered.rendered`).
+      required: [sent_sequence, thread_root_sequence, message_type, sender_role, recipient_role, anchor, response_required, state, round, sent_at]
+      properties:
+        sent_sequence: { type: integer, format: int64, description: The crew_message_sent chain sequence — the message's identity. }
+        thread_root_sequence: { type: integer, format: int64 }
+        message_type: { type: string, enum: [consult, finding, work_request, notice, escalation] }
+        sender_role: { type: string, description: Server-derived crew role. }
+        recipient_role: { type: string }
+        anchor: { $ref: '#/components/schemas/CrewMessageAnchor' }
+        response_required: { type: boolean }
+        deadline: { type: string, format: date-time }
+        state: { type: string, enum: [open, accepted, rejected, expired] }
+        disposition_sequence: { type: integer, format: int64 }
+        reason_sequence: { type: integer, format: int64 }
+        round: { type: integer }
+        sent_at: { type: string, format: date-time }
+        disposed_at: { type: string, format: date-time }
+        projection_degraded:
+          type: boolean
+          description: |
+            Present and true when the chain entry COMMITTED but the derived row
+            did not project. The operation HAPPENED; do not retry it.
+    CrewMessageAnswer:
+      type: object
+      required: [sent_sequence, sender_role, rendered]
+      properties:
+        sent_sequence: { type: integer, format: int64 }
+        sender_role: { type: string }
+        rendered: { type: string, description: The reply in prompt-rendered (quarantine-envelope) form only. }
+    CrewMessageRendered:
+      description: GET one — the metadata plus ONLY the prompt-rendered form.
+      allOf:
+        - $ref: '#/components/schemas/CrewMessage'
+        - type: object
+          required: [rendered, answered]
+          properties:
+            rendered:
+              type: string
+              description: |
+                `prompt.RenderCrewMessages` over this one message — the SAME bytes
+                the three reviewed prompts embed, inside the
+                `<<<BEGIN UNTRUSTED CREW MESSAGE>>>` envelope.
+            answered: { type: boolean, description: A reply exists in the thread after this message. }
+            answer: { $ref: '#/components/schemas/CrewMessageAnswer' }
+    CrewMessageList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/CrewMessage' }
+    CrewEscalationDecisionRequest:
+      type: object
+      additionalProperties: false
+      required: [decision]
+      properties:
+        decision: { type: string, enum: [accepted, rejected] }
+        reason: { type: string, description: Recorded on the crew_message_disposed chain entry only. }
+
   responses:
     BadRequest:
       description: Request body or query parameters were invalid.
@@ -14080,6 +14152,317 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '501':
           description: '`captain_unconfigured` — no captain store on this instance.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/crew-messages:
+    post:
+      operationId: sendCrewMessage
+      summary: Send a crew message
+      description: |
+        E77.3 / #3737 (ADR-081 #3727 D4, rules 3-4). The body is a
+        `crew-message-v1` document (`docs/spec/crew-message-v1.md`). Its
+        `sender_role` is DERIVED server-side — a run-bound token's executing
+        stage (plan -> `planner`, review -> `reviewer`) or `captain` for an
+        operator identity — and may be omitted or equal to the derived role;
+        any other value is refused `sender_role_not_settable` with no chain
+        entry. Appends one `crew_message_sent` chain entry, then projects the
+        derived row. Long-form contract: `backend/internal/server/README.md`.
+
+        **Auth.** A run-bound token must hold `write:messages` and the
+        document's `anchor.run_id` must be its own run (a run-less anchor is
+        refused). Any other identity needs `write:stages` and sends as
+        `captain`; a run anchor is checked against the caller's account.
+      tags: [runs]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: A crew-message-v1 document (sender_role optional).
+      responses:
+        '201':
+          description: The recorded message's metadata (sender_role is the derived one).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CrewMessage' }
+        '400':
+          description: |
+            `sender_role_not_settable` — the body names a sender role other than the derived one. `validation_failed` — not JSON, a repeated member name, a schema violation (`details.instance_location`), or `response_required` on a type that is not answered.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            `insufficient_scope` (a run-bound token without `write:messages`, or an operator without `write:stages`), `cross_run_crew_message` (another run's anchor or a run-less anchor on a run-bound token), `crew_sender_not_derivable` (the token's run has no executing plan or review stage), or `account_mismatch`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: |
+            `run_not_found` — the token's run or the anchor's run does not exist.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '413':
+          description: |
+            `body_too_large` — body over 64 KiB.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: |
+            `recipient_not_addressable` — the recipient is a role an implement stage executes (invariant #8).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: |
+            `internal_error` — the chain append failed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            `crew_message_unconfigured` — no crew mailbox on this instance (the documented partial rollback).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+    get:
+      operationId: listCrewMessages
+      summary: List crew messages by recipient or by anchor
+      description: |
+        Exactly ONE filter family: recipient (`recipient_role`, `state`,
+        `limit`) or anchor (exactly one of `run_id`, `issue_ref`,
+        `decision_record_id`). Metadata only — no message text.
+
+        **Auth (the read gate, identical on every read route).** A run-bound
+        token must hold `write:messages` (minted for plan and review stages
+        ONLY, so an implement-stage token is refused `insufficient_scope`) AND
+        the message's anchor must be the token's own run — another run's
+        message and every run-less message are refused
+        `cross_run_crew_message`. Any other identity needs `read:audit` and
+        reads within its account (another account's message is
+        `crew_message_not_found`). This preserves ARCHITECTURE.md §6
+        invariant #8: no crew message text reaches an implement agent.
+        A recipient listing spans every anchor, so it is refused to a
+        run-bound token (`cross_run_crew_message`).
+      tags: [runs]
+      parameters:
+        - { name: recipient_role, in: query, schema: { type: string } }
+        - { name: state, in: query, schema: { type: string, enum: [open, accepted, rejected, expired] } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 500 } }
+        - { name: run_id, in: query, schema: { type: string, format: uuid } }
+        - { name: issue_ref, in: query, schema: { type: string } }
+        - { name: decision_record_id, in: query, schema: { type: string } }
+      responses:
+        '200':
+          description: The matching messages, ordered by sent sequence.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CrewMessageList' }
+        '400':
+          description: |
+            `validation_failed` — both filter families named, not exactly one anchor, a malformed `run_id`, or `limit` outside 1..500.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            `insufficient_scope` or `cross_run_crew_message` (see Auth).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: |
+            `internal_error` — the read failed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            `crew_message_unconfigured` — no crew mailbox on this instance (the documented partial rollback).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/crew-messages/{sequence}:
+    get:
+      operationId: getCrewMessage
+      summary: Read one crew message in prompt-rendered form
+      description: |
+        Returns the metadata plus ONLY the prompt-rendered form
+        (`rendered`); the raw message text is never returned. `?wait=<seconds>`
+        (clamped to 30) holds the request until the message leaves `open` or a
+        reply appears in its thread (`answered: true`, the reply in `answer`,
+        rendered); on EXPIRY the unchanged single read is returned — the
+        message stays open, an expiry is never a denial.
+
+        **Auth (the read gate, identical on every read route).** A run-bound
+        token must hold `write:messages` (minted for plan and review stages
+        ONLY, so an implement-stage token is refused `insufficient_scope`) AND
+        the message's anchor must be the token's own run — another run's
+        message and every run-less message are refused
+        `cross_run_crew_message`. Any other identity needs `read:audit` and
+        reads within its account (another account's message is
+        `crew_message_not_found`). This preserves ARCHITECTURE.md §6
+        invariant #8: no crew message text reaches an implement agent.
+      tags: [runs]
+      parameters:
+        - name: sequence
+          in: path
+          required: true
+          description: The message's crew_message_sent chain sequence.
+          schema: { type: integer, format: int64, minimum: 1 }
+        - name: wait
+          in: query
+          required: false
+          description: Opt-in long-poll seconds; absent/non-positive is a single read, above 30 is clamped.
+          schema: { type: integer }
+      responses:
+        '200':
+          description: The message, rendered.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CrewMessageRendered' }
+        '400':
+          description: |
+            `validation_failed` — `sequence` is not a positive integer.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            `insufficient_scope` or `cross_run_crew_message` (see Auth).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: |
+            `crew_message_not_found` — no crew message at that sequence (including a sequence naming an entry of another category), or another account's message.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: |
+            `internal_error` — the row or its chain entry could not be read.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            `crew_message_unconfigured` — no crew mailbox on this instance (the documented partial rollback).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/crew-messages/{sequence}/respond:
+    post:
+      operationId: respondCrewMessage
+      summary: Answer a crew message (refused over HTTP)
+      description: |
+        A REFUSAL LADDER (ADR-081 rule 4): only a fishhawkd-invoked responder
+        answers a consult, in-process (`Server.RespondToCrewMessage`), and no
+        HTTP caller is one. A run-bound token is refused
+        `agent_token_required`; every other identity `responder_required`.
+      tags: [runs]
+      parameters:
+        - name: sequence
+          in: path
+          required: true
+          description: The message's crew_message_sent chain sequence.
+          schema: { type: integer, format: int64, minimum: 1 }
+      responses:
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            `agent_token_required` (a run-bound token) or `responder_required` (any other identity).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/crew-messages/{sequence}/escalation-decision:
+    post:
+      operationId: decideCrewEscalation
+      summary: The captain's decision on a crew escalation
+      description: |
+        Disposes an open escalation `accepted` or `rejected`, appending one
+        `crew_message_disposed` chain entry (the reason lives there only). A
+        refusal appends nothing. A rejection past the thread's round bound
+        records the thread's `crew_message_escalated` entry and is refused.
+
+        **Auth.** A run-bound token is refused `self_decision`; any other
+        identity needs `write:stages`.
+      tags: [runs]
+      parameters:
+        - name: sequence
+          in: path
+          required: true
+          description: The message's crew_message_sent chain sequence.
+          schema: { type: integer, format: int64, minimum: 1 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CrewEscalationDecisionRequest' }
+      responses:
+        '200':
+          description: The disposed message's metadata.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CrewMessage' }
+        '400':
+          description: |
+            `validation_failed` — malformed body, unknown field, or a decision other than accepted/rejected.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            `self_decision` (a run-bound token) or `insufficient_scope` (lacks `write:stages`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: |
+            `crew_message_not_found` — no crew message at that sequence, or another account's.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: |
+            `crew_message_already_disposed` — the message is no longer open.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '413':
+          description: |
+            `body_too_large` — body over 64 KiB.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: |
+            `crew_message_not_escalation` (the message is not an escalation) or `crew_round_bound_exhausted` (the rejection exceeded the thread's round bound; the thread was escalated).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: |
+            `internal_error` — the chain append failed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            `crew_message_unconfigured` — no crew mailbox on this instance (the documented partial rollback).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

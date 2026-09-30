@@ -524,6 +524,66 @@ func TestHandleIssueMCPToken_PlanStageOmitsScopeAmendments(t *testing.T) {
 	}
 }
 
+// --- write:messages grant (E77.3 / #3737, ADR-081 rule 3) ---
+
+// TestHandleIssueMCPToken_WriteMessagesGrantTable pins the stage-typed
+// write:messages grant: plan and review carry it; implement, deploy and
+// acceptance do NOT. Every row runs the SAME spec-less fixture differing only
+// in the executing stage's type, so the stage-type predicate is the only thing
+// withholding the scope.
+func TestHandleIssueMCPToken_WriteMessagesGrantTable(t *testing.T) {
+	cases := []struct {
+		typ  run.StageType
+		want bool
+	}{
+		{run.StageTypePlan, true},
+		{run.StageTypeReview, true},
+		{run.StageTypeImplement, false},
+		{run.StageTypeDeploy, false},
+		{run.StageTypeAcceptance, false},
+	}
+	for _, tc := range cases {
+		t.Run(string(tc.typ), func(t *testing.T) {
+			s, sf, mt, _, runRow, _ := scopeAmendmentTokenServer(t, tc.typ)
+			got := false
+			for _, sc := range issuedScopes(t, s, sf, mt, runRow) {
+				if sc == "write:messages" {
+					got = true
+				}
+			}
+			if got != tc.want {
+				t.Errorf("%s-stage token carries write:messages = %v, want %v", tc.typ, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestHandleIssueMCPToken_ImplementStageDoesNotCarryWriteMessages is the
+// named invariant-#8 pin: the implement token's scope set is EXACTLY
+// {mcp:read, write:scope-amendments} — widening the mint predicate adds
+// write:messages and fails the want-set comparison.
+func TestHandleIssueMCPToken_ImplementStageDoesNotCarryWriteMessages(t *testing.T) {
+	s, sf, mt, _, runRow, _ := scopeAmendmentTokenServer(t, run.StageTypeImplement)
+	scopes := issuedScopes(t, s, sf, mt, runRow)
+	want := []string{"mcp:read", "write:scope-amendments"}
+	if strings.Join(scopes, ",") != strings.Join(want, ",") {
+		t.Errorf("implement-stage scopes = %v, want exactly %v", scopes, want)
+	}
+}
+
+// TestHandleIssueMCPToken_NoResolvableStageOmitsWriteMessages: a run whose
+// every stage is terminal resolves no executing stage, so no stage type is
+// admitted and the scope is withheld.
+func TestHandleIssueMCPToken_NoResolvableStageOmitsWriteMessages(t *testing.T) {
+	s, sf, mt, runRow := scopeAmendmentTokenServerSeeded(t,
+		stageSeed{run.StageTypePlan, run.StageStateSucceeded})
+	for _, sc := range issuedScopes(t, s, sf, mt, runRow) {
+		if sc == "write:messages" {
+			t.Errorf("no-executing-stage token granted write:messages: %v", sc)
+		}
+	}
+}
+
 // --- #1030: local-runner first-stage fallback ---
 
 // stageSeed is one stage to seed for the fallback contract tests;
