@@ -17,7 +17,7 @@ import (
 // FuncDecls, TypeSpecs and ValueSpecs), not transcribed, so a drift between
 // an estimate and reality would surface as a test written from the tree.
 //
-// The bulk of these 314 names are tool I/O request/response structs. The MCP
+// The bulk of these 332 names are tool I/O request/response structs. The MCP
 // SDK's jsonschema reflection requires each tool's input/output type — and
 // its fields — to be EXPORTED to build the tool's schema, so unexporting them
 // would break tool registration. In `package main` their exportedness was
@@ -112,9 +112,18 @@ var exportBaseline = []string{
 	"ConsolidateResult",
 	"ConsolidateSlicesInput",
 	"ConsolidateSlicesOutput",
+	// E77.3 / #3737: the three crew-message tools' I/O and the client mirrors
+	// of /v0/crew-messages, exported for the SDK's jsonschema reflection like
+	// every DTO.
+	"CrewMessageAnchor",
+	"CrewMessageAnswer",
+	"CrewMessageRecord",
+	"CrewMessageRecordOutput",
+	"CrewMessageView",
 	"CriteriaPrecheck",
 	"CrossSliceClaim",
 	"CrossSliceCouplingFinding",
+	"DecideCrewEscalationInput",
 	"DecideScopeAmendmentInput",
 	"DecideScopeAmendmentOutput",
 	"DecideScopeCompletenessInput",
@@ -289,6 +298,8 @@ var exportBaseline = []string{
 	"PreviewCampaignInput",
 	"PreviewCampaignOutput",
 	"ProductReport",
+	"ReadCrewMessagesInput",
+	"ReadCrewMessagesOutput",
 	"ReapFailureResult",
 	"ReapStageInput",
 	"ReapStageOutput",
@@ -404,6 +415,7 @@ var exportBaseline = []string{
 	"ScopePrecheck",
 	"ScopePrecheckViolation",
 	"SecurityFinding",
+	"SendCrewMessageInput",
 	"SessionGuidance",
 	"Stage",
 	"StageExecutor",
