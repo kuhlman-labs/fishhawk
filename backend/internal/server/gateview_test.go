@@ -16,6 +16,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/captain"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/crewmessage"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
@@ -1594,4 +1595,145 @@ func TestGateView_CaptainBlock_NonUUIDRunAccountIsGap(t *testing.T) {
 	if !resp.HistoryIncomplete || !slices.Contains(resp.HistoryGaps, gateViewGapCaptainRecord) {
 		t.Errorf("history gaps = %v (incomplete=%v), want %q", resp.HistoryGaps, resp.HistoryIncomplete, gateViewGapCaptainRecord)
 	}
+}
+
+// --- E77.7 (#3741): the captain's crew_messages block ---
+
+// crewGateServer wires a gate-view server over f's pg run/audit/mailbox (the
+// audit repository optionally wrapped) with an empty concern fake.
+func crewGateServer(f *crewPG, ar audit.Repository) *Server {
+	return New(Config{
+		Addr:        "127.0.0.1:0",
+		RunRepo:     run.NewPostgresRepository(f.pool),
+		AuditRepo:   ar,
+		ConcernRepo: newFakeConcernRepo(),
+		CrewMailbox: f.mailbox,
+	})
+}
+
+// TestGateView_CrewMessagesRendered (done-means): every OPEN finding/notice
+// thread root on the run is listed whatever its recipient, with rendered
+// byte-equal to prompt.RenderCrewMessages over that one message; consults,
+// escalations and disposed findings are not, and none of it is a concern.
+func TestGateView_CrewMessagesRendered(t *testing.T) {
+	f := newCrewPG(t)
+	runID := f.seedRun(t, run.StageTypePlan)
+	ctx := context.Background()
+	finding := f.send(t, crewDoc("finding", "", "architect", runAnchor(runID),
+		`{"summary":"GATE-SENTINEL-finding","severity":"high"}`), operator("write:stages")).SentSequence
+	notice := seedCrewMail(t, f, runID, crewmessage.TypeNotice, crewmessage.RoleReviewer, "GATE-SENTINEL-notice")
+	seedCrewMail(t, f, runID, crewmessage.TypeConsult, crewmessage.RolePlanner, "GATE-EXCLUDED-consult")
+	seedCrewMail(t, f, runID, crewmessage.TypeEscalation, crewmessage.RoleCaptain, "GATE-EXCLUDED-escalation")
+	disposed := seedCrewMail(t, f, runID, crewmessage.TypeFinding, crewmessage.RolePlanner, "GATE-EXCLUDED-disposed")
+	if _, err := f.mailbox.Dispose(ctx, crewmessage.DisposeParams{
+		SentSequence: disposed, Disposition: crewmessage.DispositionAccepted,
+		Actor: crewmessage.Actor{Kind: audit.ActorUser, Subject: "github:op"},
+	}); err != nil {
+		t.Fatalf("dispose: %v", err)
+	}
+
+	s := crewGateServer(f, f.audit)
+	w := getGateView(t, s, runID, "")
+	resp := decodeGateView(t, w)
+	if len(resp.CrewMessages) != 2 {
+		t.Fatalf("crew_messages = %+v, want exactly the open finding and notice", resp.CrewMessages)
+	}
+	for i, want := range []int64{finding, notice} {
+		got := resp.CrewMessages[i]
+		if got.SentSequence != want || got.State != string(crewmessage.StateOpen) {
+			t.Fatalf("crew_messages[%d] = %+v, want open sequence %d", i, got, want)
+		}
+		row, err := f.mailbox.Store().Get(ctx, want)
+		if err != nil {
+			t.Fatalf("get row: %v", err)
+		}
+		expect, err := s.renderCrewRow(ctx, row)
+		if err != nil {
+			t.Fatalf("render: %v", err)
+		}
+		if got.Rendered != expect {
+			t.Errorf("crew_messages[%d].rendered is not prompt.RenderCrewMessages' output:\n got %q\nwant %q", i, got.Rendered, expect)
+		}
+	}
+	if f0 := resp.CrewMessages[0]; f0.MessageType != "finding" || f0.RecipientRole != "architect" || f0.SenderRole != "captain" || f0.Severity != "high" {
+		t.Errorf("finding metadata = %+v", f0)
+	}
+	requireInsideCrewEnvelopes(t, resp.CrewMessages[0].Rendered, "GATE-SENTINEL-finding")
+	body := w.Body.String()
+	if strings.Contains(body, "GATE-EXCLUDED") {
+		t.Errorf("an excluded message reached the gate view:\n%s", body)
+	}
+	if len(resp.Open) != 0 || resp.HistoryIncomplete {
+		t.Errorf("open = %d, history_incomplete = %v; an open finding must not be a concern or a gap", len(resp.Open), resp.HistoryIncomplete)
+	}
+}
+
+// TestGateView_RunBoundTokenSeesNoCrewMessages (C8): the identity is
+// mcp:run:<the run's OWN id>, so the cross-run guard PASSES and the omission
+// is the only thing between the token and the crew text. The operator control
+// proves the fixture carries a block to omit.
+func TestGateView_RunBoundTokenSeesNoCrewMessages(t *testing.T) {
+	f := newCrewPG(t)
+	runID := f.seedRun(t, run.StageTypeImplement)
+	seedCrewMail(t, f, runID, crewmessage.TypeFinding, crewmessage.RolePlanner, "RUNBOUND-GATE-SENTINEL")
+	s := crewGateServer(f, f.audit)
+
+	if got := decodeGateView(t, getGateView(t, s, runID, "")); len(got.CrewMessages) != 1 {
+		t.Fatalf("control: operator crew_messages = %d, want 1", len(got.CrewMessages))
+	}
+	w := callGateView(s, runID, "", Identity{Subject: "mcp:run:" + runID.String(), TokenID: "tok-run",
+		Scopes: []string{"mcp:read", "write:scope-amendments"}})
+	resp := decodeGateView(t, w)
+	if resp.CrewMessages != nil {
+		t.Fatalf("a run-bound token read crew_messages: %+v", resp.CrewMessages)
+	}
+	if strings.Contains(w.Body.String(), "RUNBOUND-GATE-SENTINEL") || strings.Contains(w.Body.String(), "crew_messages") {
+		t.Fatalf("crew text reached a run-bound gate-view read:\n%s", w.Body.String())
+	}
+}
+
+// TestGateView_CrewMessagesUnconfigured: no mailbox is the pre-E77.7
+// response — no block and no gap.
+func TestGateView_CrewMessagesUnconfigured(t *testing.T) {
+	f := newCrewPG(t)
+	runID := f.seedRun(t, run.StageTypePlan)
+	seedCrewMail(t, f, runID, crewmessage.TypeFinding, crewmessage.RolePlanner, "UNWIRED")
+	s := crewGateServer(f, f.audit)
+	s.cfg.CrewMailbox = nil
+	resp := decodeGateView(t, getGateView(t, s, runID, ""))
+	if resp.CrewMessages != nil || slices.Contains(resp.HistoryGaps, gateViewGapCrewMessages) {
+		t.Fatalf("unwired mailbox: crew_messages = %+v, gaps = %v; want neither", resp.CrewMessages, resp.HistoryGaps)
+	}
+}
+
+// TestGateView_CrewReadFailureRecordsGap: a failed row list AND a failed
+// per-message document read each omit the block with a crew_messages gap and
+// history_incomplete — a partial read is never rendered as absence.
+func TestGateView_CrewReadFailureRecordsGap(t *testing.T) {
+	requireGap := func(t *testing.T, resp gateViewResponse) {
+		t.Helper()
+		if resp.CrewMessages != nil {
+			t.Fatalf("crew_messages = %+v, want nil on a failed read", resp.CrewMessages)
+		}
+		if !resp.HistoryIncomplete || !slices.Contains(resp.HistoryGaps, gateViewGapCrewMessages) {
+			t.Fatalf("history_incomplete = %v, gaps = %v; want a crew_messages gap", resp.HistoryIncomplete, resp.HistoryGaps)
+		}
+	}
+	t.Run("document", func(t *testing.T) {
+		f := newCrewPG(t)
+		runID := f.seedRun(t, run.StageTypePlan)
+		seedCrewMail(t, f, runID, crewmessage.TypeFinding, crewmessage.RolePlanner, "DOCGAP-good")
+		bad := seedCrewMail(t, f, runID, crewmessage.TypeNotice, crewmessage.RolePlanner, "DOCGAP-bad")
+		s := crewGateServer(f, &deliveryAuditRepo{Repository: f.audit, tamper: map[int64]bool{bad: true}})
+		requireGap(t, decodeGateView(t, getGateView(t, s, runID, "")))
+	})
+	t.Run("rows", func(t *testing.T) {
+		f := newCrewPG(t)
+		runID := f.seedRun(t, run.StageTypePlan)
+		seedCrewMail(t, f, runID, crewmessage.TypeFinding, crewmessage.RolePlanner, "ROWGAP")
+		if _, err := f.pool.Exec(context.Background(), `ALTER TABLE crew_messages RENAME TO crew_messages_gone`); err != nil {
+			t.Fatalf("rename: %v", err)
+		}
+		requireGap(t, decodeGateView(t, getGateView(t, crewGateServer(f, f.audit), runID, "")))
+	})
 }

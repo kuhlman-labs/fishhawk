@@ -7,12 +7,15 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/crewmessage"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -88,7 +91,42 @@ type gateViewResponse struct {
 	// no human gate is open, or when the computation degrades — see
 	// gatePrecedentFor, leaving the response byte-identical.
 	Precedent *gatePrecedentBlock `json:"precedent,omitempty"`
+	// CrewMessages lists every OPEN crew `finding` / `notice` thread root
+	// anchored on this run, whatever its recipient role (E77.7 / #3741, ADR-081
+	// D1 option 3) — a finding addressed to the architect, security or
+	// historian has no stage to read it, so the gate is its only surface. It is
+	// ADVISORY: a finding is a crew_messages row, never a concern, so it is
+	// absent from Open and from every merge-gate read. Each entry's text leaves
+	// only as Rendered, the prompt.RenderCrewMessages quarantine envelope.
+	// Omitted (nil) for EVERY run-bound mcp:run: caller: this surface
+	// authorizes one by the cross-run subject guard alone, and an
+	// implement-stage token is such a token, so without the omission the gate
+	// view would be an un-gated read path into crew text (ARCHITECTURE.md §6
+	// invariant #8). Omitted with no gap when the mailbox is not wired, and
+	// with a crew_messages history_gaps entry when the read fails, so a partial
+	// read is never rendered as absence.
+	CrewMessages []gateViewCrewMessage `json:"crew_messages,omitempty"`
 }
+
+// gateViewCrewMessage is one gate-view crew entry: contract-closed metadata
+// plus the quarantined rendering. There is deliberately no payload field.
+type gateViewCrewMessage struct {
+	SentSequence  int64  `json:"sent_sequence"`
+	MessageType   string `json:"message_type"`
+	SenderRole    string `json:"sender_role"`
+	RecipientRole string `json:"recipient_role"`
+	// Severity is a finding's schema-enumerated severity (low|medium|high),
+	// empty when the sender set none.
+	Severity string    `json:"severity,omitempty"`
+	State    string    `json:"state"`
+	SentAt   time.Time `json:"sent_at"`
+	// Rendered is prompt.RenderCrewMessages over this one message — the same
+	// rule renderCrewRow follows for GET /v0/crew-messages/{sequence}.
+	Rendered string `json:"rendered"`
+}
+
+// gateViewGapCrewMessages is the history_gaps entry the crew block records.
+const gateViewGapCrewMessages = "crew_messages"
 
 // gateViewCaptain is the gate-view captain block (E76.3 / #3766).
 type gateViewCaptain struct {
@@ -426,7 +464,60 @@ func (s *Server) handleGetRunGateView(w http.ResponseWriter, r *http.Request) {
 	resp.Captain = s.gateViewCaptainFor(r.Context(), runRow, &resp)
 	// After the concern read, so the concern-gate arm has its signals.
 	resp.Precedent = s.gatePrecedentFor(r.Context(), runRow, rows, true)
+	resp.CrewMessages = s.gateViewCrewMessagesFor(r.Context(), runID, &resp)
 	s.writeJSON(w, r, http.StatusOK, resp)
+}
+
+// gateViewCrewMessagesFor builds the crew block (E77.7 / #3741) with the
+// captain block's posture:
+//
+//   - a run-bound mcp:run: caller -> nil, no gap, no read: the block is
+//     captain-facing, and a run-bound token (an implement-stage one included)
+//     reaches this surface by the cross-run guard alone;
+//   - mailbox or audit repository not wired -> nil, no gap (the pre-E77.7
+//     response, byte-for-byte);
+//   - the row list or any one message's chain document fails to read -> nil
+//     plus a crew_messages gap: the block is never built from a partial read.
+func (s *Server) gateViewCrewMessagesFor(ctx context.Context, runID uuid.UUID, resp *gateViewResponse) []gateViewCrewMessage {
+	if strings.HasPrefix(IdentityFrom(ctx).Subject, "mcp:run:") {
+		return nil
+	}
+	if s.cfg.CrewMailbox == nil || s.cfg.AuditRepo == nil {
+		return nil
+	}
+	gap := func(err error) []gateViewCrewMessage {
+		s.cfg.Logger.Warn("gate-view: crew message read failed; omitting crew block",
+			"run_id", runID.String(), "error", err.Error())
+		resp.HistoryIncomplete = true
+		resp.HistoryGaps = append(resp.HistoryGaps, gateViewGapCrewMessages)
+		return nil
+	}
+	rows, err := s.cfg.CrewMailbox.Store().ListByAnchor(ctx, crewmessage.AnchorFilter{RunID: &runID})
+	if err != nil {
+		return gap(err)
+	}
+	var out []gateViewCrewMessage
+	for _, row := range rows {
+		if !crewDeliveryTypes[row.MessageType] || row.State != crewmessage.StateOpen ||
+			row.ThreadRootSequence != row.SentSequence {
+			continue
+		}
+		msg, err := s.crewSentDocument(ctx, row)
+		if err != nil {
+			return gap(err)
+		}
+		out = append(out, gateViewCrewMessage{
+			SentSequence:  row.SentSequence,
+			MessageType:   string(row.MessageType),
+			SenderRole:    string(row.SenderRole),
+			RecipientRole: string(row.RecipientRole),
+			Severity:      msg.Payload.Severity,
+			State:         string(row.State),
+			SentAt:        row.SentAt,
+			Rendered:      prompt.RenderCrewMessages([]prompt.CrewMessage{crewMessageForPrompt(msg)}),
+		})
+	}
+	return out
 }
 
 // gateViewCaptainFor builds the captain block (E76.3 / #3766, ADR-083 rule
