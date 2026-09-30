@@ -377,3 +377,80 @@ func TestRank_MatchedKeysAreCapped(t *testing.T) {
 		t.Errorf("reported total = %d, want > %d", mk.TouchedPathPrefixesTotal, MaxMatchedKeys)
 	}
 }
+
+// fingerprintFixture ranks three rows and returns the items + summary a gate
+// block would be fingerprinted over.
+func fingerprintFixture(t *testing.T) ([]Item, Summary) {
+	t.Helper()
+	rows := []decisionindex.Row{
+		row(10, func(r *decisionindex.Row) { r.TouchedPaths = []string{"a/b.go"} }),
+		row(11, func(r *decisionindex.Row) { r.Outcome = "reject" }),
+		row(12, nil),
+	}
+	items, s := Rank(Context{Repo: testRepo, DecisionClass: testClass, TouchedPaths: []string{"a/c.go"}}, rows, 0)
+	if len(items) != 3 {
+		t.Fatalf("fixture ranked %d items, want 3", len(items))
+	}
+	return items, s
+}
+
+func TestFingerprint_StableAcrossRecomputation(t *testing.T) {
+	items1, s1 := fingerprintFixture(t)
+	items2, s2 := fingerprintFixture(t)
+	a := Fingerprint("plan_approval", "stage-1", items1, s1)
+	b := Fingerprint("plan_approval", "stage-1", items2, s2)
+	if a != b || a == "" {
+		t.Fatalf("fingerprint not stable across recomputation: %q vs %q", a, b)
+	}
+}
+
+func TestFingerprint_ChangesOnCitedSet(t *testing.T) {
+	items, s := fingerprintFixture(t)
+	base := Fingerprint("plan_approval", "stage-1", items, s)
+	fewer := items[:2]
+	if Fingerprint("plan_approval", "stage-1", fewer, Summarize(fewer)) == base {
+		t.Error("removing a cited row did not change the fingerprint")
+	}
+	more := append(append([]Item(nil), items...), Item{SourceSequence: 99, SourceEntryHash: "h99"})
+	if Fingerprint("plan_approval", "stage-1", more, Summarize(more)) == base {
+		t.Error("adding a cited row did not change the fingerprint")
+	}
+	// A cited row swapped for a DIFFERENT row with the same outcome leaves the
+	// summary identical, so only the per-item citation can move the key.
+	swapped := append([]Item(nil), items...)
+	swapped[0].SourceSequence, swapped[0].SourceEntryHash = 999, "other-hash"
+	if Summarize(swapped).AgreementRatio != s.AgreementRatio || Summarize(swapped).ModalOutcome != s.ModalOutcome {
+		t.Fatal("fixture: the swap must leave the summary unchanged")
+	}
+	if Fingerprint("plan_approval", "stage-1", swapped, s) == base {
+		t.Error("swapping one cited row (summary unchanged) did not change the fingerprint")
+	}
+	if Fingerprint("plan_approval", "stage-2", items, s) == base {
+		t.Error("a different stage id did not change the fingerprint")
+	}
+	if Fingerprint("merge_verdict", "stage-1", items, s) == base {
+		t.Error("a different decision class did not change the fingerprint")
+	}
+}
+
+func TestFingerprint_ChangesOnIndexVersion(t *testing.T) {
+	items, s := fingerprintFixture(t)
+	if fingerprintAt(IndexVersion, "plan_approval", "stage-1", items, s) != Fingerprint("plan_approval", "stage-1", items, s) {
+		t.Fatal("Fingerprint does not key on IndexVersion")
+	}
+	if fingerprintAt(IndexVersion+"-next", "plan_approval", "stage-1", items, s) == Fingerprint("plan_approval", "stage-1", items, s) {
+		t.Error("a different ranking-contract version produced the same fingerprint")
+	}
+}
+
+func TestFingerprint_IgnoresReasonExcerpt(t *testing.T) {
+	items, s := fingerprintFixture(t)
+	base := Fingerprint("plan_approval", "stage-1", items, s)
+	withProse := append([]Item(nil), items...)
+	for i := range withProse {
+		withProse[i].ReasonExcerpt = "a reason read from the chain"
+	}
+	if Fingerprint("plan_approval", "stage-1", withProse, s) != base {
+		t.Error("the fingerprint changed on ReasonExcerpt alone — a degraded chain read would re-record")
+	}
+}

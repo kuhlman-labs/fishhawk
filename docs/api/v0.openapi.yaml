@@ -572,6 +572,101 @@ components:
         run_id: { type: string, format: uuid }
         detail: { type: string }
 
+    GatePrecedent:
+      type: object
+      description: |
+        The BOUNDED precedent block for a run's open human gate (E75.4 / #3732,
+        ADR-082 decision (c)): how this class of gate was decided before in this
+        repository, computed through the same query as `GET /v0/precedent` and
+        recorded ONCE on the audit chain as a `precedent_surfaced` entry
+        (fingerprint-deduped — an unchanged recomputation is not re-recorded).
+
+        DISPLAY-ONLY. Precedent is NEVER authority, NEVER a gate input (no gate
+        state, allowed action or transition reads it) and NEVER an agent input
+        (no prompt renders it). The decision is still the captain's.
+
+        The gate class is a deterministic ladder: a stage in
+        `awaiting_scope_decision` → `scope_amendment`; the plan stage in
+        `awaiting_approval` → `plan_approval`; a review stage in
+        `awaiting_approval` with an open concern → `concern_waive` (ranked on the
+        newest open concern's category and severity); a review stage in
+        `awaiting_approval` with none → `merge_verdict`. Absent when no human
+        gate is open, or when the computation degrades (decision index
+        unconfigured, a stage/index/gate-context read failure, or no indexed
+        decision of the class in the repository) — the response is then
+        byte-identical to one without the feature.
+      required: [decision_class, stage_id, index_version, fingerprint, items, summary, truncated, degraded, full_query]
+      properties:
+        decision_class:
+          type: string
+          enum: [scope_amendment, plan_approval, concern_waive, merge_verdict]
+        stage_id:
+          type: string
+          format: uuid
+          description: The stage whose human gate is open.
+        stage_kind:
+          type: string
+          description: >-
+            The hard stage-kind filter the candidate window used. Absent for
+            `merge_verdict`, whose decisions carry no stage.
+        index_version:
+          type: string
+          description: >-
+            The ranking-contract version (weights + ordering rule) the scores
+            were computed under.
+        fingerprint:
+          type: string
+          description: >-
+            sha256 over the index version, class, stage and the ordered cited
+            (sequence, entry hash, score) triples — the precedent_surfaced
+            de-duplication key. Excludes the reason excerpts.
+        items:
+          type: array
+          maxItems: 3
+          description: >-
+            At most 3 ranked prior decisions, each with its reason excerpt read
+            at query time (280-byte cap).
+          items:
+            $ref: '#/components/schemas/PrecedentItem'
+        summary:
+          $ref: '#/components/schemas/PrecedentSummary'
+        truncated:
+          type: boolean
+          description: The candidate window was full; an older relevant decision may exist.
+        degraded:
+          type: array
+          items:
+            $ref: '#/components/schemas/PrecedentDegraded'
+        full_query:
+          $ref: '#/components/schemas/GatePrecedentQuery'
+
+    GatePrecedentQuery:
+      type: object
+      description: Where to read the full, unbounded precedent for this gate.
+      required: [endpoint, tool, decision_class, repo, run_id, stage_id]
+      properties:
+        endpoint:
+          type: string
+          description: A ready-to-issue `GET /v0/precedent` path for this gate.
+        tool:
+          type: string
+          description: The MCP tool that runs the same query (`fishhawk_precedent`).
+        decision_class: { type: string }
+        repo: { type: string }
+        run_id: { type: string, format: uuid }
+        stage_id:
+          type: string
+          format: uuid
+          description: >-
+            The stage the ranking context was derived from — for
+            `concern_waive`, the newest open concern's own stage.
+        alternate_decision_class:
+          type: string
+          description: >-
+            A sibling class the captain can also decide at this gate
+            (`concern_defer` beside `concern_waive`); re-run the query with it to
+            see that class's precedent. One gate block covers ONE class.
+
     ProtectedResourceMetadata:
       type: object
       description: |
@@ -1680,6 +1775,16 @@ components:
             response. The `summary` renders through the same helper as the
             `escalation_fired` audit entry, so the run read and the governance
             chain cannot describe one firing differently.
+        precedent:
+          allOf:
+            - $ref: '#/components/schemas/GatePrecedent'
+          description: |
+            The bounded precedent block for the run's open human gate (E75.4 /
+            #3732) — the SAME block the gate view carries, from the same helper.
+            Display-only: never authority, never a gate input, never an agent
+            input. Surfaced on `GET /v0/runs/{run_id}` ONLY (same single-read
+            posture as `escalations`); omitted when no human gate is open or the
+            computation degrades.
         permissions:
           type: array
           description: |
@@ -2271,6 +2376,8 @@ components:
           $ref: '#/components/schemas/GateViewReviewHeadMismatch'
         captain:
           $ref: '#/components/schemas/GateViewCaptain'
+        precedent:
+          $ref: '#/components/schemas/GatePrecedent'
 
     GateViewCaptain:
       type: object

@@ -8,8 +8,10 @@
 // database handle, no clock, no HTTP — so a ranking is byte-reproducible and
 // every component is testable in isolation. There is no model call, no
 // embedding, and no write: a precedent query mints no audit entry and grants no
-// authority. It reports what was decided before; the decision is still the
-// caller's.
+// authority. (The server's gate-open surfacing, E75.4 / #3732, records what it
+// SHOWED as a precedent_surfaced entry keyed by Fingerprint; this package
+// itself still writes nothing.) It reports what was decided before; the
+// decision is still the caller's.
 //
 // Long-form contract (the weights and why each is where it is, the determinism
 // argument, and the agreement summary E75.5's divergence threshold consumes):
@@ -17,6 +19,10 @@
 package precedent
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"time"
@@ -61,6 +67,20 @@ const (
 	WeightConcernCategory = 0.25
 	WeightSeverity        = 0.10
 )
+
+// IndexVersion identifies the RANKING CONTRACT — the weight set above plus
+// Rank's total-ordering rule (score DESC, decided_at DESC, source_sequence
+// DESC). It is recorded on every `precedent_surfaced` audit entry (E75.4 /
+// #3732) and folded into Fingerprint, so a surfaced block is always
+// attributable to the scoring that produced it.
+//
+// BUMP IT whenever a weight changes or the ordering rule changes. That is what
+// makes a recomputation under different scoring record as NEW rather than
+// de-duplicate against an entry whose scores were computed under the old
+// weights. It does NOT need a bump for a change that leaves every Item's
+// score and position unchanged (an explanation-only change such as
+// MaxMatchedKeys).
+const IndexVersion = "precedent-rank-v1"
 
 // MaxMatchedKeys bounds each reported matched-key list. A matched-path-prefix
 // intersection is O(paths x depth) and a caller can supply thousands of paths,
@@ -261,6 +281,44 @@ func scoreRow(c Context, row decisionindex.Row, ctxPaths, ctxKeys map[string]str
 	}
 	return it
 }
+
+// Fingerprint is the de-duplication key of one surfaced precedent block (E75.4
+// / #3732): a sha256 over IndexVersion, the decision class, the gate's stage
+// id, the ORDERED (source_sequence, source_entry_hash, rounded score total)
+// triple of every cited item, the modal outcome and the rounded agreement
+// ratio.
+//
+// DETERMINISTIC: items arrive totally ordered by Rank, and floats are rounded
+// to six decimal places before hashing so a float-formatting difference can
+// never mint a new key for the same answer.
+//
+// ReasonExcerpt is DELIBERATELY EXCLUDED. The excerpt is read from the chain at
+// query time and can DEGRADE (an unreadable run, a missing entry) while the
+// ranked answer is unchanged — a fingerprint over it would re-record an
+// unchanged precedent every time a chain read hiccupped. Every other excluded
+// Item field (outcome, matched keys, delegated, …) is a pure function of the
+// cited row, which source_entry_hash already pins.
+func Fingerprint(class, stageID string, items []Item, s Summary) string {
+	return fingerprintAt(IndexVersion, class, stageID, items, s)
+}
+
+// fingerprintAt is Fingerprint with the ranking-contract version as a
+// parameter, so the version's participation in the key is testable without
+// editing the exported constant.
+func fingerprintAt(version, class, stageID string, items []Item, s Summary) string {
+	// A strings.Builder never returns a write error, so the canonical form is
+	// built there and hashed once.
+	var b strings.Builder
+	fmt.Fprintf(&b, "v=%s\nclass=%s\nstage=%s\n", version, class, stageID)
+	for _, it := range items {
+		fmt.Fprintf(&b, "item=%d|%s|%.6f\n", it.SourceSequence, it.SourceEntryHash, round6(it.Score.Total))
+	}
+	fmt.Fprintf(&b, "modal=%s\nagreement=%.6f\n", s.ModalOutcome, round6(s.AgreementRatio))
+	sum := sha256.Sum256([]byte(b.String()))
+	return hex.EncodeToString(sum[:])
+}
+
+func round6(f float64) float64 { return math.Round(f*1e6) / 1e6 }
 
 // Summarize builds the agreement summary of an already-ranked item set. Split
 // out from Rank so E75.5 can summarise a set it filtered further.

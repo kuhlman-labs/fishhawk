@@ -257,6 +257,58 @@ func (s *Server) handleGetPrecedent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	res, err := s.runPrecedentQuery(ctx, pctx, acct, limit)
+	if err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"list decision index failed", map[string]any{"error": err.Error()})
+		return
+	}
+	resp := precedentResponse{
+		Summary:   res.Summary,
+		Results:   res.Items,
+		Truncated: res.Truncated,
+		Degraded:  res.Degraded,
+	}
+
+	resolved.Repo = pctx.Repo
+	resolved.StageKind = pctx.StageKind
+	resolved.ConcernCategory = pctx.ConcernCategory
+	resolved.Severity = pctx.Severity
+	resolved.TouchedPaths, resolved.TouchedPathsTotal, resolved.TouchedPathsTruncated =
+		capResolvedList(pctx.TouchedPaths)
+	resolved.EscalationKeys, resolved.EscalationKeysTotal, resolved.EscalationKeysTruncated =
+		capResolvedList(pctx.EscalationKeys)
+	resp.ResolvedContext = resolved
+
+	s.writeJSON(w, r, http.StatusOK, resp)
+}
+
+// precedentQueryResult is one ranked precedent answer: the items (with their
+// query-time reason excerpts attached), the agreement summary, whether the
+// candidate window was full, and every named degradation.
+type precedentQueryResult struct {
+	Items []precedent.Item
+	// Summary describes Items as RANKED — it is computed before excerpt
+	// attachment, which never changes the set.
+	Summary   precedent.Summary
+	Truncated bool
+	Degraded  []precedentDegraded
+	// Candidates is how many index rows the window returned — zero means the
+	// repository has no indexed decision of this class yet.
+	Candidates int
+}
+
+// runPrecedentQuery is THE precedent query body, shared by GET /v0/precedent
+// and the gate-open precedent block (E75.4 / #3732): build the account-scoped
+// ListFilter from pctx, read the newest candidate window, Rank, name the
+// window-truncated / no-indexed-decisions degradations, and attach the
+// query-time reason excerpts.
+//
+// ONE derivation on purpose: a second copy of the candidate window or of the
+// account-scoped filter would let the gate block and the full query disagree
+// about what precedent exists. The only error is the index List failure;
+// every other shortfall is a named degradation.
+func (s *Server) runPrecedentQuery(ctx context.Context, pctx precedent.Context, acct *uuid.UUID, limit int) (precedentQueryResult, error) {
 	rows, err := s.cfg.PrecedentIndex.List(ctx, decisionindex.ListFilter{
 		Repo:          pctx.Repo,
 		DecisionClass: pctx.DecisionClass,
@@ -271,45 +323,31 @@ func (s *Server) handleGetPrecedent(w http.ResponseWriter, r *http.Request) {
 		Limit:         precedentCandidateWindow,
 	})
 	if err != nil {
-		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-			"list decision index failed", map[string]any{"error": err.Error()})
-		return
+		return precedentQueryResult{}, err
 	}
 
 	items, summary := precedent.Rank(pctx, rows, limit)
-	resp := precedentResponse{
-		Summary:  summary,
-		Results:  items,
-		Degraded: []precedentDegraded{},
+	res := precedentQueryResult{
+		Summary:    summary,
+		Degraded:   []precedentDegraded{},
+		Candidates: len(rows),
 	}
 	if len(rows) >= precedentCandidateWindow {
-		resp.Truncated = true
-		resp.Degraded = append(resp.Degraded, precedentDegraded{
+		res.Truncated = true
+		res.Degraded = append(res.Degraded, precedentDegraded{
 			Reason: precedentDegradedWindowTruncated,
 			Detail: fmt.Sprintf("the newest %d matching rows were scored; an older relevant decision may exist outside the window",
 				precedentCandidateWindow),
 		})
 	}
 	if len(rows) == 0 {
-		resp.Degraded = append(resp.Degraded, precedentDegraded{
+		res.Degraded = append(res.Degraded, precedentDegraded{
 			Reason: precedentDegradedNoIndexedDecisions,
 			Detail: "no indexed decision of this class exists for this repository yet",
 		})
 	}
-
-	resp.Results, resp.Degraded = s.attachReasonExcerpts(ctx, resp.Results, resp.Degraded)
-
-	resolved.Repo = pctx.Repo
-	resolved.StageKind = pctx.StageKind
-	resolved.ConcernCategory = pctx.ConcernCategory
-	resolved.Severity = pctx.Severity
-	resolved.TouchedPaths, resolved.TouchedPathsTotal, resolved.TouchedPathsTruncated =
-		capResolvedList(pctx.TouchedPaths)
-	resolved.EscalationKeys, resolved.EscalationKeysTotal, resolved.EscalationKeysTruncated =
-		capResolvedList(pctx.EscalationKeys)
-	resp.ResolvedContext = resolved
-
-	s.writeJSON(w, r, http.StatusOK, resp)
+	res.Items, res.Degraded = s.attachReasonExcerpts(ctx, items, res.Degraded)
+	return res, nil
 }
 
 // callerAccountUUID resolves the caller's workspace account to a uuid. An

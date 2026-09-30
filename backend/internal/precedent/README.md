@@ -120,8 +120,29 @@ dominating the response. It never affects the score.
 - `count` is the number of items DESCRIBED, which is the number RETURNED — so a
   summary never describes rows the caller cannot see.
 
+## `IndexVersion` and `Fingerprint` (E75.4 / #3732)
+
+`IndexVersion` names the RANKING CONTRACT: the weight set plus `Rank`'s total
+ordering (score DESC, decided_at DESC, source_sequence DESC). **Bump it whenever
+a weight or the ordering rule changes.** It is recorded on every
+`precedent_surfaced` entry and folded into `Fingerprint`, so a gate re-surfaced
+under recalibrated weights records as NEW rather than de-duplicating against an
+entry whose scores came from the old ones. An explanation-only change (e.g.
+`MaxMatchedKeys`) leaves every score and position unchanged and needs no bump.
+
+`Fingerprint(class, stageID, items, summary)` is the de-duplication key of one
+surfaced gate block: sha256 over `IndexVersion`, the class, the stage id, the
+ORDERED `(source_sequence, source_entry_hash, score total)` triples, the modal
+outcome and the agreement ratio, floats rounded to 6 places so formatting cannot
+mint a new key. It **excludes `ReasonExcerpt`**: excerpts are read from the chain
+at query time and can degrade while the ranked answer is unchanged, and a key
+over them would re-record an unchanged precedent on every chain-read hiccup. The
+other excluded `Item` fields are pure functions of the cited row, which the entry
+hash already pins. Pinned by the four `TestFingerprint_*` tests.
+
 ## Issue history
 
+- #3732 (E75.4) — `IndexVersion` + `Fingerprint` for the gate-open precedent block.
 - #3731 (E75.3) — this package, the REST route and the MCP tool.
 - #3730 (E75.2) — `decision_index`, the rows this ranks.
 - #3728 (ADR-082) — decision (b), the precedent query's charter.

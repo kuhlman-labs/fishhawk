@@ -76,6 +76,15 @@ type gateViewResponse struct {
 	// history_gaps entry when the captain read or the approval read fails,
 	// so the block is never built from a partial read.
 	Captain *gateViewCaptain `json:"captain,omitempty"`
+	// Precedent is the bounded precedent block for the run's open human gate
+	// (E75.4 / #3732, ADR-082 decision (c)): how this class of gate was decided
+	// before in this repository, computed through the same query as GET
+	// /v0/precedent and recorded once on the chain as precedent_surfaced.
+	// DISPLAY-ONLY — never authority, never a gate input, never an agent input;
+	// Open / Settled and every gate outcome are identical with or without it.
+	// Omitted (nil) when no human gate is open or the computation degrades
+	// (see gatePrecedentFor), leaving the response byte-identical.
+	Precedent *gatePrecedentBlock `json:"precedent,omitempty"`
 }
 
 // gateViewCaptain is the gate-view captain block (E76.3 / #3766).
@@ -412,6 +421,8 @@ func (s *Server) handleGetRunGateView(w http.ResponseWriter, r *http.Request) {
 
 	resp := s.buildGateView(r.Context(), runID, stageKind, rows)
 	resp.Captain = s.gateViewCaptainFor(r.Context(), runRow, &resp)
+	// After the concern read, so the concern-gate arm has its signals.
+	resp.Precedent = s.gatePrecedentFor(r.Context(), runRow, rows, true)
 	s.writeJSON(w, r, http.StatusOK, resp)
 }
 
