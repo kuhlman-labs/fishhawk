@@ -841,6 +841,14 @@ type Config struct {
 	// nil (the documented partial rollback) answers every crew-message route
 	// 503 crew_message_unconfigured and changes no other surface.
 	CrewMailbox *crewmessage.Mailbox
+	// CrewResponders is the CLOSED role -> responder registry the synchronous
+	// consult round trip resolves a response_required consult's recipient
+	// through (E77.5 / #3739, crew_consult.go). Built by
+	// NewCrewResponderRegistry, which refuses an implementer or unknown role.
+	// The zero value is the empty registry — the E77.5 production value — under
+	// which every consult fails the send 422 crew_responder_unavailable before
+	// anything is appended; E77.8 (#3742) registers the first responder.
+	CrewResponders CrewResponderRegistry
 	// DelegationConfirmStore is delegation confirmation on handover (E76.5 /
 	// #3768, ADR-083 #3751 rule 7): GET .../delegation/confirmation and the
 	// POST .../delegation/{confirm,lower} verbs, plus the confirmation block

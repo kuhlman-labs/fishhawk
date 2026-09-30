@@ -165,6 +165,13 @@ type SendParams struct {
 	// ThreadRootSequence makes this message a reply in the thread rooted at
 	// that crew_message_sent entry; nil makes it a thread root.
 	ThreadRootSequence *int64
+	// StageID stamps the crew_message_sent chain entry's stage_id with the
+	// stage that sent it (E77.5 / #3739), so a per-stage consult budget is
+	// countable FROM THE CHAIN. Honoured for a RUN anchor only: a run-less
+	// anchor chains on the account's global partition, which has no stage
+	// column. nil leaves the entry's nullable stage_id NULL. The derived row
+	// gains no column, so Rebuild is unaffected.
+	StageID *uuid.UUID
 }
 
 // Send validates, records one crew_message_sent chain entry, and projects it.
@@ -193,7 +200,7 @@ func (m *Mailbox) Send(ctx context.Context, p SendParams) (*Row, error) {
 	var entry *audit.Entry
 	err = pgx.BeginFunc(ctx, m.db, func(tx pgx.Tx) error {
 		var aerr error
-		entry, aerr = m.appendEntry(ctx, tx, msg.Anchor, p.AccountID, CategorySent, p.Actor, payload)
+		entry, aerr = m.appendEntry(ctx, tx, msg.Anchor, p.AccountID, p.StageID, CategorySent, p.Actor, payload)
 		return aerr
 	})
 	if err != nil {
@@ -213,8 +220,9 @@ func (m *Mailbox) Send(ctx context.Context, p SendParams) (*Row, error) {
 }
 
 // appendEntry routes one chain append by anchor: a run anchor chains on the
-// run, a run-less anchor on the account's global partition.
-func (m *Mailbox) appendEntry(ctx context.Context, tx pgx.Tx, anchor Anchor, account *uuid.UUID, category string, actor Actor, payload json.RawMessage) (*audit.Entry, error) {
+// run (stamped with stage when non-nil), a run-less anchor on the account's
+// global partition (which carries no stage).
+func (m *Mailbox) appendEntry(ctx context.Context, tx pgx.Tx, anchor Anchor, account, stage *uuid.UUID, category string, actor Actor, payload json.RawMessage) (*audit.Entry, error) {
 	ts := m.now()
 	if anchor.RunID != "" {
 		runID, err := uuid.Parse(anchor.RunID)
@@ -222,7 +230,7 @@ func (m *Mailbox) appendEntry(ctx context.Context, tx pgx.Tx, anchor Anchor, acc
 			return nil, fmt.Errorf("crewmessage: anchor run_id: %w", err)
 		}
 		return m.appendRun(ctx, tx, audit.ChainAppendParams{
-			RunID: runID, Timestamp: ts, Category: category,
+			RunID: runID, StageID: stage, Timestamp: ts, Category: category,
 			ActorKind: actor.kindPtr(), ActorSubject: actor.subjectPtr(), Payload: payload,
 		})
 	}
@@ -356,7 +364,7 @@ func (m *Mailbox) Dispose(ctx context.Context, p DisposeParams) (*Row, error) {
 		if err != nil {
 			return fmt.Errorf("crewmessage: marshal disposed payload: %w", err)
 		}
-		dispEntry, err = m.appendEntry(ctx, tx, msg.Anchor, sent.AccountID, CategoryDisposed, p.Actor, payload)
+		dispEntry, err = m.appendEntry(ctx, tx, msg.Anchor, sent.AccountID, nil, CategoryDisposed, p.Actor, payload)
 		return err
 	})
 	if err != nil {
@@ -393,7 +401,7 @@ func (m *Mailbox) escalate(ctx context.Context, tx pgx.Tx, sent Row, anchor Anch
 	if err != nil {
 		return fmt.Errorf("crewmessage: marshal escalated payload: %w", err)
 	}
-	_, err = m.appendEntry(ctx, tx, anchor, sent.AccountID, CategoryEscalated, actor, payload)
+	_, err = m.appendEntry(ctx, tx, anchor, sent.AccountID, nil, CategoryEscalated, actor, payload)
 	return err
 }
 

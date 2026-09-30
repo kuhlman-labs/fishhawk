@@ -2430,6 +2430,16 @@ func runServe(args []string, logSink io.Writer) int {
 		// Consequences name: every crew-message endpoint then answers 503
 		// crew_message_unconfigured and no other surface changes.
 		cfg.CrewMailbox = crewmessage.NewMailbox(pool, crewmessage.DefaultRoundBound)
+		// The E77.5 / #3739 consult responder registry: deliberately EMPTY, so
+		// every response_required consult fails the send 422
+		// crew_responder_unavailable. E77.8 (#3742) registers the first
+		// responder (the deterministic historian); ADR-081 rule 8 sequences it.
+		crewResponders, err := server.NewCrewResponderRegistry(nil)
+		if err != nil {
+			logger.Error("crew responder registry refused startup", slog.String("error", err.Error()))
+			return exitFailure
+		}
+		cfg.CrewResponders = crewResponders
 		// E76.5 / #3768 delegation confirmation on handover: chain-only like
 		// the captain record, and its Append takes the captain record's lock.
 		cfg.DelegationConfirmStore = delegationconfirm.NewStore(pool)
