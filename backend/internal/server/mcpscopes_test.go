@@ -49,6 +49,7 @@ func TestMCPToolScopeTable_VocabularyIsNotParallel(t *testing.T) {
 	allowed[scopeRunBoundRead] = "run-bound fhm_ scope (mcptoken.go)"
 	allowed[scopeRunBoundRetry] = "run-bound fhm_ scope (mcptoken.go)"
 	allowed[scopeRunBoundScopeAmendments] = "run-bound fhm_ scope (mcptoken.go)"
+	allowed[scopeRunBoundMessages] = "run-bound fhm_ scope (mcptoken.go)"
 	allowed[scopeGateViewRead] = "named constant (gateview.go)"
 	allowed[scopeAuditExport] = "named constant (audit_export.go)"
 	allowed[scopeRefinementGate] = "named constant (refinement.go)"
@@ -116,7 +117,7 @@ func TestMCPToolScopeRule_SatisfiedBy(t *testing.T) {
 // TestMCPToolScopeTable_RunBoundAgentLoopIntact is the fhm_ NON-REGRESSION
 // assertion. A run-bound token carries ONLY mcp:read (+write:retries when the
 // stage sets executor.agent_self_retry, +write:scope-amendments on implement
-// stages). Every tool the in-run agent actually calls must remain reachable
+// stages, +write:messages on plan and review stages). Every tool the in-run agent actually calls must remain reachable
 // with exactly that scope set, or this gate breaks the agent loop with no
 // compile error and no failing REST test.
 func TestMCPToolScopeTable_RunBoundAgentLoopIntact(t *testing.T) {
@@ -124,6 +125,13 @@ func TestMCPToolScopeTable_RunBoundAgentLoopIntact(t *testing.T) {
 		Subject: "mcp:run:22222222-2222-2222-2222-222222222222",
 		TokenID: "tok",
 		Scopes:  []string{scopeRunBoundRead, scopeRunBoundRetry, scopeRunBoundScopeAmendments},
+	}
+	// The plan/review arm of the issued vocabulary: write:messages replaces
+	// write:scope-amendments (mcptoken.go mints each for disjoint stage types).
+	selfRetryPlanReview := Identity{
+		Subject: "mcp:run:22222222-2222-2222-2222-222222222222",
+		TokenID: "tok",
+		Scopes:  []string{scopeRunBoundRead, scopeRunBoundRetry, scopeRunBoundMessages},
 	}
 	for _, tool := range []string{
 		"fishhawk_get_run_status",
@@ -140,10 +148,12 @@ func TestMCPToolScopeTable_RunBoundAgentLoopIntact(t *testing.T) {
 			t.Errorf("%s: no table entry", tool)
 			continue
 		}
-		if !rule.satisfiedBy(selfRetryImplement) {
-			t.Errorf("%s: a run-bound self-retrying implement token (%s) is refused by the gate, "+
-				"but the REST endpoint admits it — this breaks the in-run agent loop",
-				tool, strings.Join(selfRetryImplement.Scopes, " "))
+		for _, id := range []Identity{selfRetryImplement, selfRetryPlanReview} {
+			if !rule.satisfiedBy(id) {
+				t.Errorf("%s: a run-bound self-retrying token (%s) is refused by the gate, "+
+					"but the REST endpoint admits it — this breaks the in-run agent loop",
+					tool, strings.Join(id.Scopes, " "))
+			}
 		}
 	}
 }
@@ -179,7 +189,7 @@ func TestMCPToolScopeTable_MergeRecoveryPairRequiresWriteRuns(t *testing.T) {
 	runBound := Identity{
 		Subject: "mcp:run:33333333-3333-3333-3333-333333333333",
 		TokenID: "tok",
-		Scopes:  []string{scopeRunBoundRead, scopeRunBoundRetry, scopeRunBoundScopeAmendments},
+		Scopes:  []string{scopeRunBoundRead, scopeRunBoundRetry, scopeRunBoundScopeAmendments, scopeRunBoundMessages},
 	}
 	// The operator identity the endpoints admit.
 	writeRunsOperator := Identity{Subject: "svc:operator", TokenID: "tok", Scopes: []string{"write:runs"}}
@@ -244,12 +254,71 @@ func TestMCPToolScopeTable_HandoverBriefMirrorsReadAudit(t *testing.T) {
 		{"write:approvals-only operator refused", Identity{Subject: "svc:operator", TokenID: "tok", Scopes: []string{"write:approvals"}}, false},
 		{"run-bound token refused", Identity{
 			Subject: "mcp:run:33333333-3333-3333-3333-333333333333", TokenID: "tok",
-			Scopes: []string{scopeRunBoundRead, scopeRunBoundRetry, scopeRunBoundScopeAmendments},
+			Scopes: []string{scopeRunBoundRead, scopeRunBoundRetry, scopeRunBoundScopeAmendments, scopeRunBoundMessages},
 		}, false},
 	}
 	for _, c := range cases {
 		if got := rule.satisfiedBy(c.id); got != c.want {
 			t.Errorf("%s: satisfiedBy = %v, want %v", c.name, got, c.want)
 		}
+	}
+}
+
+// TestMCPToolScopeTable_CrewMessageRowsMirrorHandlers pins the three E77.3
+// (#3737) crew-message rows to the handlers in crewmessage.go, in BOTH
+// directions: each identity below is admitted by the row exactly when the
+// mirrored handler's scope predicate admits it. The implement-stage run-bound
+// token (never minted write:messages) is refused by EVERY row — the gate-level
+// face of ARCHITECTURE.md §6 invariant #8.
+func TestMCPToolScopeTable_CrewMessageRowsMirrorHandlers(t *testing.T) {
+	const runSubject = "mcp:run:44444444-4444-4444-4444-444444444444"
+	implementToken := Identity{Subject: runSubject, TokenID: "tok",
+		Scopes: []string{scopeRunBoundRead, scopeRunBoundRetry, scopeRunBoundScopeAmendments}}
+	planToken := Identity{Subject: runSubject, TokenID: "tok",
+		Scopes: []string{scopeRunBoundRead, scopeRunBoundRetry, scopeRunBoundMessages}}
+	writeStagesOp := Identity{Subject: "svc:operator", TokenID: "tok", Scopes: []string{"write:stages"}}
+	readAuditOp := Identity{Subject: "svc:operator", TokenID: "tok", Scopes: []string{"read:audit"}}
+	neitherOp := Identity{Subject: "svc:operator", TokenID: "tok", Scopes: []string{"write:runs", "write:approvals"}}
+
+	cases := []struct {
+		tool string
+		id   Identity
+		name string
+		want bool
+	}{
+		// handleSendCrewMessage: run-bound needs write:messages; else write:stages.
+		{"fishhawk_send_crew_message", implementToken, "implement token", false},
+		{"fishhawk_send_crew_message", planToken, "plan token", true},
+		{"fishhawk_send_crew_message", writeStagesOp, "write:stages operator", true},
+		{"fishhawk_send_crew_message", readAuditOp, "read:audit-only operator", false},
+		{"fishhawk_send_crew_message", neitherOp, "write:runs+approvals operator", false},
+		// authorizeCrewRead: run-bound needs write:messages; else read:audit.
+		{"fishhawk_read_crew_messages", implementToken, "implement token", false},
+		{"fishhawk_read_crew_messages", planToken, "plan token", true},
+		{"fishhawk_read_crew_messages", readAuditOp, "read:audit operator", true},
+		{"fishhawk_read_crew_messages", writeStagesOp, "write:stages-only operator", false},
+		{"fishhawk_read_crew_messages", neitherOp, "write:runs+approvals operator", false},
+		// handleDecideCrewEscalation: run-bound refused self_decision; else write:stages.
+		{"fishhawk_decide_crew_escalation", implementToken, "implement token", false},
+		{"fishhawk_decide_crew_escalation", planToken, "plan token", false},
+		{"fishhawk_decide_crew_escalation", writeStagesOp, "write:stages operator", true},
+		{"fishhawk_decide_crew_escalation", readAuditOp, "read:audit-only operator", false},
+	}
+	for _, c := range cases {
+		rule, ok := mcpToolScopeFor(c.tool)
+		if !ok {
+			t.Errorf("%s: no mcpToolScopes entry; it would be refused mcp_tool_not_authorized at runtime", c.tool)
+			continue
+		}
+		if rule.runBoundSubjectOK {
+			t.Errorf("%s: runBoundSubjectOK is set, but no crew-message handler admits a run-bound token by subject alone", c.tool)
+		}
+		if got := rule.satisfiedBy(c.id); got != c.want {
+			t.Errorf("%s / %s (%s): satisfiedBy = %v, want %v — the row must mirror its handler in both directions",
+				c.tool, c.name, strings.Join(c.id.Scopes, " "), got, c.want)
+		}
+	}
+	if got := []string{scopeRunBoundMessages, scopeWriteMessages}; got[0] != "write:messages" || got[1] != got[0] {
+		t.Errorf("scopeRunBoundMessages / scopeWriteMessages = %q, want both the write:messages spelling", got)
 	}
 }

@@ -344,6 +344,7 @@ func registerTools(srv *mcp.Server, resolver *runResolver) {
 	registerValidateSpec(srv, resolver)
 	registerDigest(srv, resolver)
 	registerCaptain(srv, resolver)
+	registerCrewMessages(srv, resolver)
 	registerHandoverBrief(srv, resolver)
 }
 
