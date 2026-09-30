@@ -1,6 +1,7 @@
 import { Link, useParams, useSearchParams } from 'react-router';
 import { api } from '@/api/client';
 import { useAsync } from '@/api/use-async';
+import { BridgeTab } from '@/bridge/bridge-tab';
 import { EconomicsPanel } from '@/repo/economics-panel';
 import { HealthPanel } from '@/repo/health-panel';
 import { RepoInFlight } from '@/repo/in-flight-panel';
@@ -19,12 +20,17 @@ import { ThroughputPanel } from '@/repo/throughput-panel';
  * the bare route and every existing deep link still land on Overview.
  * Each branch renders only its own panels, so the Record tab never fires
  * the four rollup fetches and vice versa.
+ *
+ * The Bridge tab (E76.6 / #3769) rides `?tab=bridge` the same way: it
+ * fires only the captain, handover-brief and delegation reads, never the
+ * Overview rollups or the Record tab's export, and vice versa.
  */
 export function RepoDashboard() {
   const { owner = '', name = '' } = useParams<{ owner: string; name: string }>();
   const repo = `${owner}/${name}`;
   const [searchParams] = useSearchParams();
-  const tab = searchParams.get('tab') === 'record' ? 'record' : 'overview';
+  const param = searchParams.get('tab');
+  const tab = param === 'record' || param === 'bridge' ? param : 'overview';
 
   return (
     <section className="space-y-4">
@@ -41,9 +47,12 @@ export function RepoDashboard() {
       >
         <TabLink to="?tab=" label="Overview" selected={tab === 'overview'} />
         <TabLink to="?tab=record" label="Record" selected={tab === 'record'} />
+        <TabLink to="?tab=bridge" label="Bridge" selected={tab === 'bridge'} />
       </nav>
       {tab === 'record' ? (
         <RecordTab repo={repo} owner={owner} name={name} />
+      ) : tab === 'bridge' ? (
+        <BridgeTab repo={repo} owner={owner} name={name} />
       ) : (
         <OverviewTab repo={repo} owner={owner} name={name} />
       )}

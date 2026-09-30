@@ -22,6 +22,10 @@ changes don't pay the install/test cost.
 - `src/repo/` — the repo dashboard's Overview panels (in-flight,
   throughput, economics, health, posture) plus the Record tab
   (`record-tab.tsx`) and its pure export fold (`chain-verification.ts`).
+- `src/bridge/` — the repo dashboard's Bridge tab (`bridge-tab.tsx`):
+  captain, handover, handover brief and delegation-confirmation panels,
+  plus the pure `viewer.ts` helpers (see "Change of command on the
+  bridge" below).
 - `src/auth/` — auth context, provider, `RequireAuth` gate, hook.
   The provider fetches `/v0/auth/me`; routes inside `<Root />` are
   gated behind it.
@@ -209,9 +213,10 @@ for stage state stays consistent.
 ## Repo dashboard (E40.3 / #1714)
 
 `/repos/:owner/:name` renders `src/routes/repo-dashboard.tsx`, reached from
-the repo cell of the `/runs` list (the workflow cell links to the run). Two
-tabs, selected by the `?tab=` search param: **Overview** (the default) and
-**Record** (`?tab=record`, below). Overview renders five panels, in order,
+the repo cell of the `/runs` list (the workflow cell links to the run). Three
+tabs, selected by the `?tab=` search param: **Overview** (the default),
+**Record** (`?tab=record`, below) and **Bridge** (`?tab=bridge`, see
+"Change of command on the bridge" below). Overview renders five panels, in order,
 each with its OWN fetch and its own loading/error surface — one failing read
 renders one panel-scoped alert, never a blank page:
 
@@ -241,10 +246,11 @@ renders one panel-scoped alert, never a blank page:
 
 ### Record tab (E40.6 / #1718)
 
-`?tab=record` selects it; anything else — including the absent param —
-selects Overview, so every existing deep link is unchanged. Each branch
-renders only its own panels, so the Record tab never fires the four
-rollup fetches and Overview never fetches the export. Three sections:
+`?tab=record` selects it (`?tab=bridge` selects the Bridge tab); anything
+else — including the absent param — selects Overview, so every existing
+deep link is unchanged. Each branch renders only its own panels, so the
+Record tab never fires the four rollup fetches and Overview never fetches
+the export. Three sections:
 
 - **Chain verification** — one page of `GET /v0/audit/export?repo=…&limit=25`
   folded through `src/repo/chain-verification.ts`, a PURE, fetch-free,
@@ -297,6 +303,69 @@ rollup fetches and Overview never fetches the export. Three sections:
   the branch matters for bearer-token contexts.
 - **Release evidence** — a visibly disabled placeholder, always rendered,
   wired when E33 (#1583) ships.
+
+## Change of command on the bridge (E76.6 / #3769)
+
+`?tab=bridge` on the repo dashboard renders `src/bridge/bridge-tab.tsx`.
+Every action calls an EXISTING REST verb (`backend/internal/server/captain.go`,
+`delegation_confirm.go`); the tab adds no endpoint and no authority. Types are
+hand-mirrored in `src/api/captain.ts` (drift is silent — change both sides
+together). Three surfaces, each panel owning its own loading/error surface so
+one failing read never blanks the tab:
+
+- **Captain + handover** (`captain-panel.tsx`, `handover-panel.tsx`,
+  `handover-brief.tsx`) — ONE `GET /v0/captain` read shared by both panels and
+  the unconfirmed-delegation badge. Verbs (offer / withdraw / accept /
+  relinquish / claim) are offered by the RECORD'S STATE, and the brief
+  (`GET /v0/handover-brief`) is in view next to Accept.
+- **Unconfirmed-delegation badge** (in `bridge-tab.tsx`) — counts
+  `CaptainResponse.delegation_unconfirmed.workflows`.
+- **Delegation** (`delegation-panel.tsx`, `delegation-lower-form.tsx`) — the
+  resolved view (`GET /v0/repos/{owner}/{name}/delegation`) and the verdicts
+  (`GET …/delegation/confirmation`) read INDEPENDENTLY (default `source=ref`,
+  never a silent `run_cache` fallback) and joined by workflow id, with
+  "Confirm as shown" (`POST …/confirm`) and "Propose lower" (`POST …/lower`).
+
+**No client-side authority.** `GET /v0/auth/me` carries no identity provider
+(the `User` schema is `id` + `github_login` + `name`), while a captain subject
+is provider-qualified (`github:octo`, `gitlab:octo`). The SPA therefore cannot
+compute the viewer's real subject, so NO verb is gated on an identity match:
+`viewer.ts`'s `viewerMatchesSubject` adds a cosmetic "(you)" marker only, and
+the server's refusal — rendered through `captainRefusalMessage` as a named
+sentence alongside the raw `{status} · {error}`, with a raw-only fallback for
+an unmapped code — is the only gate.
+
+**Fail-closed "unavailable" readings.** An empty list is never read as "all
+confirmed" when the wire says the read failed:
+
+- the badge renders the named unavailability when `delegation_unconfirmed` is
+  absent (store not wired) or carries `unavailable` / `inventory_unavailable`
+  (whose `workflows` is then EMPTY); even its all-clear states that hash
+  staleness is not checked there (`source: run_cache`);
+- the delegation panel renders "confirmation state could not be read" and NO
+  status badge when the view-level `confirmation` block is absent or carries
+  `unavailable`; a 501 `delegation_confirm_unconfigured` disables both verbs
+  with the reason named;
+- a brief part's `unavailable` renders its `unavailable_reason`, and an offer's
+  `brief_unavailable` states that the offer committed without a recorded hash.
+
+**Per-workflow hash binding.** "Confirm as shown" POSTs THAT workflow's OWN
+`content_hash`, never the view-level one — per-workflow hashes are stamped
+before any `workflow` filter while the view-level hash is recomputed over the
+retained set, so binding the view-level hash 409s every confirm. A 409
+`delegation_hash_stale` renders `details.current_content_hash` and re-reads the
+view so the next confirm binds the current hash.
+
+**Lower only.** The proposal form offers tiers STRICTLY below the current one
+(`medium` ⇒ `{low}`, `high` ⇒ `{medium, low}`), an escalation ceiling at or
+below the effective proposed tier, and nothing at all for an undeclared tier.
+A resolved lower files ONE `autonomy:low` work item and changes nothing in
+force until a human lands the edit.
+
+**Seat changes refresh delegation.** A resolved accept, claim or relinquish
+bumps the delegation panel's `generation`, re-reading the verdicts: the server
+voids every earlier confirmation at a seat change, so a stale "confirmed"
+badge never survives one.
 
 ## Campaign detail + `operator_agent` override display (E25.12 / #1451; web UI #1467)
 
