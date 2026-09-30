@@ -568,3 +568,14 @@ func TestKnownCategories_CrewMessage(t *testing.T) {
 		}
 	}
 }
+
+// TestKnownCategories_PrecedentSurfaced pins the E75.4 / #3732 category:
+// server/gate_precedent.go appends one precedent_surfaced entry per distinct
+// precedent block shown at an open human gate (fingerprint-deduped).
+// Unregistered, categories_completeness_test.go's AST sweep fails the build on
+// the emit site and an operator could not arm fishhawk_await_audit on it.
+func TestKnownCategories_PrecedentSurfaced(t *testing.T) {
+	if !IsKnownCategory("precedent_surfaced") {
+		t.Fatal("precedent_surfaced is not in KnownCategories; register it in categories.go")
+	}
+}

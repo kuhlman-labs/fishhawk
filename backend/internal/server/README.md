@@ -230,6 +230,10 @@ interface `*decisionindex.Store` satisfies. Nil answers 503
 `handleGetCalibration` uses), which makes dropping the `serve.go` wiring a
 partial rollback that needs no revert.
 
+The query body is `runPrecedentQuery`, shared with the gate-open precedent block
+(§ "Precedent at the gate") — ONE derivation of the candidate window and the
+account-scoped filter, so the two cannot disagree.
+
 ### Two input modes
 
 - **Explicit context** — `repo` + `decision_class` required, plus `stage_kind`,
@@ -308,6 +312,71 @@ request (binding condition 2's server half). Note the PLATFORM ceiling behind
 that: `net/url`'s own query-parameter limit is 10,000 and `r.URL.Query()`
 swallows the resulting error, so a request carrying more parses to an EMPTY query
 and the handler fails CLOSED on the now-missing `decision_class` (400).
+
+## Precedent at the gate (`gate_precedent.go`, E75.4 / #3732, ADR-082 #3728 decision (c))
+
+When a HUMAN gate is open, the gate view (`handleGetRunGateView`) and the
+single-run read (`handleGetRun`) carry a bounded `precedent` block, both from the
+ONE helper `gatePrecedentFor`, so the two surfaces cannot disagree. Wire
+contract: `docs/api/v0.md` § "Precedent at the gate".
+
+**Gate-open is read-time.** `awaiting_approval` / `awaiting_scope_decision` are
+entered from a dozen sites, so there is no single transition seam to compute at;
+the block is computed when a captain-facing surface READS a run whose gate is
+open, and the fingerprint de-duplication makes "record once" hold across reads.
+
+**The ladder** (`gatePrecedentClass`, pure, table-tested by
+`TestGatePrecedentClass_Ladder`), first match wins:
+
+1. any stage in `awaiting_scope_decision` → `scope_amendment` (hard stage-kind
+   filter = that stage's type);
+2. the plan stage in `awaiting_approval` → `plan_approval` (filter `plan`);
+3. a review stage in `awaiting_approval` with ≥1 OPEN concern → `concern_waive`,
+   ranked on the newest open concern's normalized category + severity, context
+   derived from THAT CONCERN's stage (a waiver is recorded on the concern's
+   stage, not the review stage), filter = the concern's stage kind;
+4. a review stage in `awaiting_approval` with none → `merge_verdict`, with NO
+   stage-kind filter (`merge_verdict_recorded` carries no stage, so its index
+   rows have an empty stage kind);
+5. otherwise no gate → no block.
+
+When the concern read failed (run detail only), arms 3 and 4 are undecidable and
+a review gate yields no block rather than a guessed class. `concern_defer` is the
+acknowledged residual: one gate yields ONE class (Summarize's modal-outcome share
+is defined over one class's outcome vocabulary), and `full_query` names
+`alternate_decision_class: concern_defer` for the captain to re-run.
+
+**Reuse, not duplication.** `runPrecedentQuery` (`precedent.go`) is THE query
+body — account-scoped `ListFilter`, the newest-500 candidate window, `Rank`, the
+window/no-rows degradations, and query-time reason excerpts — shared with
+`GET /v0/precedent`. The gate context comes from `PrecedentIndex.GateContext`,
+the same derivation the indexer used. The window is read in the RUN's own
+account (`ListFilter.AccountScoped`), so an untenanted run reads only untenanted
+rows (`TestGatePrecedent_AccountIsolated` seeds a tenanted and an untenanted
+decision in the SAME repository and class).
+
+**Seven degrade modes, each nil + no audit entry** (each has its own test in
+`gate_precedent_test.go`): `PrecedentIndex` unwired, the stage read fails, no
+open gate, the run's account id is not a UUID, `GateContext` fails, the index
+`List` fails, zero indexed rows. The response is then byte-identical to the
+pre-E75.4 one (`TestPrecedentChangesNoGateOutcome` compares a wired and an
+unwired server over the same gate).
+
+**The chain write** (`recordPrecedentSurfaced`): ONE `precedent_surfaced` entry
+(system actor, the gate's stage) carrying decision_class, stage_id, stage_kind,
+`precedent.IndexVersion`, the fingerprint, `cited[]` (sequence, entry hash,
+outcome, score components, matched keys), the summary and the degradation
+reasons — NO reason prose (ADR-082 rule 1). De-duplicated by
+`precedentAlreadySurfaced` on (fingerprint, stage), mirroring
+`escalationAlreadyAudited` including its posture: the read-then-append is NOT
+atomic (two concurrent first reads can both append — "exactly one" is a
+SEQUENTIAL-read guarantee), and a de-dup READ failure emits anyway. An APPEND
+failure is warn-logged; the block is still returned with a 200.
+
+**Isolation.** Precedent is never a gate input: nothing in the approve/advance
+path reads `gatePrecedentBlock` or `precedent_surfaced`. It is never an agent
+input: no prompt renders it (the prompt-render absence pin is E75.4's MCP/anchor
+slice). `precedent_surfaced` is INTERNAL — not an issue-thread activity line.
 
 ## Account-ownership authorization (ADR-057 / E44.5, #1829)
 
@@ -2095,6 +2164,8 @@ Until this change the ONLY writer of `concern.StateAddressed` was `applyConcernR
 - **Disputes (E48.103 / #2551).** Each open concern carries `disputed` plus `disputes[]`. `disputed` is DERIVED FROM DURABLE EVIDENCE — this row's own open state plus a `confirmed` entry in the authoritative `implement_reviewed`/`plan_reviewed` `concern_resolutions` join — so a confirmation that did not settle the concern is always visible, INDEPENDENT of the best-effort `concern_resolution_vetoed` append. `disputes[]` is enrichment decoded from that category (added to `gateViewHistoryCategories`, so an unreadable read degrades via `history_incomplete` + a named gap) carrying `{sequence, round, veto_reason, resolution, confirming_reviewer_model, raising_reviewer_model, note}`; it can be EMPTY on a disputed concern when the veto append failed. A concern confirmed and later reopened also reads as disputed — the same operator-visible fact (a confirmation is on record that did not settle it). The settled ledger is untouched: a vetoed concern is by construction still open. **`disputed` is SCOPED to refused CONFIRMS (#3319):** a refused `reopened` appends its `disputes[]` row (so the refusal is visible as detail) but does NOT set `disputed` — the concern is still `addressed_pending`, so reporting it as disputed would tell the operator a confirmation failed to settle it when the opposite happened. A legacy veto payload carries no `resolution` string and is treated as a confirm, so no pre-#3319 gate view changes shape (`TestGateView_LegacyVetoPayload_EmptyResolution_StillDisputed`).
 - **Degradation is visible, never silent.** `AuditRepo` nil, or any per-category `ListForRunByCategory` error, returns 200 with the concerns intact, `history_incomplete=true`, and `history_gaps` naming each failed category; a single malformed payload entry is skipped warn-only while its siblings still join. `ConcernRepo` unconfigured → 503 `gate_view_unconfigured` (mirrors `fixup_unconfigured`); `RunRepo` unconfigured → 503 `run_repo_unconfigured`; unknown run → 404; bad `stage_kind` → 400; a `ConcernRepo.ListByRun` error → 500 `internal_error`. **Auth mirrors `handleListRunAudit`'s read posture** (full reviewer prose must not be anonymously readable, #1960 authz): a run-bound `mcp:run:<uuid>` token is authorized by the cross-run subject guard alone — it may read only its own run (403 `cross_run_gate_view`, mirroring the fix-up handler; a malformed `mcp:run:` subject → 401 `authentication_required`) — while every other caller must clear the `read:audit` scope (anonymous → 401 `authentication_required`, a token missing the scope → 403 `insufficient_scope`, cookie-session operators bypass per `requireWriteScope`).
 - **Captain block (E76.3 / #3766, ADR-083 rule 4).** `gateViewCaptainFor` runs in the HANDLER only (after `buildGateView`, so `attention.go`'s builds are untouched) and adds an `omitempty` `captain` block: the repository's current captain resolved through `currentCaptain` in the RUN's account (`runs.account_id`, never the request identity), `vacant`, `non_captain_approvers` (each HUMAN subject with an `approve` on the run's `approval_submitted` rows that is not the captain — agent-kind subjects and rejects excluded, de-duplicated in chain order) and `note` (`approved by X; captain is Y`, only when that list is non-empty). It is INFORMATIONAL: eligibility, counting and the advance decision never read it (ADR-083 rule 1). Degrades per the trichotomy: `CaptainStore` unwired → no block and NO gap (byte-identical to pre-E76.3); vacant → `{vacant: true}` with no approval read; captain read failed or the run account is not a UUID → no block + `history_gaps` `captain_record`; approval read or decode failed → no block + `approval_submitted`. Tests: `gateview_captain_pg_test.go` (real handler over pgtest, one per basis and gap) and `gateview_test.go` (unwired and non-UUID-account).
+
+- **Precedent block (E75.4 / #3732).** At an open human gate the view also carries `precedent` (§ "Precedent at the gate"). It makes this READ handler append one best-effort, fingerprint-deduped `precedent_surfaced` entry the first time a given block is shown — the only write the gate view (and `handleGetRun`) performs; a failed append never changes the 200.
 
 ## Attention queue (`attention.go`, E40.1 / #1713)
 
