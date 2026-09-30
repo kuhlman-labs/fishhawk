@@ -5,7 +5,9 @@ package server
 //
 //   - GET  /v0/captain?repo=          the derived record: current captain,
 //     pending handover offer, last captain and the chain history. Never writes.
-//   - POST /v0/captain/offer          the sitting captain offers the seat.
+//   - POST /v0/captain/offer          the sitting captain offers the seat;
+//     the handover brief is composed first and its brief_hash + window (or a
+//     brief_unavailable marker) recorded on the offer (handover_brief.go).
 //   - POST /v0/captain/withdraw       the offering captain withdraws the offer.
 //   - POST /v0/captain/accept         the named successor accepts.
 //   - POST /v0/captain/relinquish     the sitting captain vacates the seat.
@@ -137,14 +139,22 @@ type captainRecordResponse struct {
 }
 
 // captainOfferResponse is the pending handover offer on the wire.
-// IdentityVerified is the SUCCESSOR's provider qualification.
+// IdentityVerified is the SUCCESSOR's provider qualification. The brief_*
+// fields are the handover brief the offer recorded (E76.4 / #3767): a hash
+// plus window, or brief_unavailable with a reason; all empty for an offer
+// written before E76.4.
 type captainOfferResponse struct {
-	Successor        string    `json:"successor"`
-	IdentityVerified bool      `json:"identity_verified"`
-	OfferedBy        string    `json:"offered_by"`
-	OfferEntryHash   string    `json:"offer_entry_hash"`
-	OfferedSequence  int64     `json:"offered_sequence"`
-	OfferedAt        time.Time `json:"offered_at"`
+	Successor              string    `json:"successor"`
+	IdentityVerified       bool      `json:"identity_verified"`
+	OfferedBy              string    `json:"offered_by"`
+	OfferEntryHash         string    `json:"offer_entry_hash"`
+	OfferedSequence        int64     `json:"offered_sequence"`
+	OfferedAt              time.Time `json:"offered_at"`
+	BriefHash              string    `json:"brief_hash,omitempty"`
+	BriefFromSequence      int64     `json:"brief_from_sequence,omitempty"`
+	BriefToSequence        int64     `json:"brief_to_sequence,omitempty"`
+	BriefUnavailable       bool      `json:"brief_unavailable,omitempty"`
+	BriefUnavailableReason string    `json:"brief_unavailable_reason,omitempty"`
 }
 
 // captainHistoryItem is one captain chain entry on the wire.
@@ -198,12 +208,17 @@ func renderCaptainOffer(o *captain.HandoverOffer) *captainOfferResponse {
 		return nil
 	}
 	return &captainOfferResponse{
-		Successor:        o.Successor,
-		IdentityVerified: o.SuccessorIdentityVerified,
-		OfferedBy:        o.OfferedBy,
-		OfferEntryHash:   o.EntryHash,
-		OfferedSequence:  o.Sequence,
-		OfferedAt:        o.OfferedAt,
+		Successor:              o.Successor,
+		IdentityVerified:       o.SuccessorIdentityVerified,
+		OfferedBy:              o.OfferedBy,
+		OfferEntryHash:         o.EntryHash,
+		OfferedSequence:        o.Sequence,
+		OfferedAt:              o.OfferedAt,
+		BriefHash:              o.Brief.Hash,
+		BriefFromSequence:      o.Brief.FromSequence,
+		BriefToSequence:        o.Brief.ToSequence,
+		BriefUnavailable:       o.Brief.Unavailable,
+		BriefUnavailableReason: o.Brief.UnavailableReason,
 	}
 }
 
@@ -346,6 +361,13 @@ func (s *Server) handleCaptainVerb(w http.ResponseWriter, r *http.Request, verb 
 	}
 	if verb.name == captainVerbClaim.name {
 		params.Predicate, params.PredicateBasis = s.classifyRepoPredicate(ctx, req.Repo, subject)
+	}
+	if verb.name == captainVerbOffer.name {
+		// The handover brief (E76.4 / #3767) is composed HERE, before Apply:
+		// composition does I/O and Apply's decide callback runs inside the
+		// advisory-locked transaction. An unestablishable brief is recorded
+		// as brief_unavailable with a reason, never a refusal.
+		params.Brief = s.composeOfferBrief(ctx, req.Repo, subject, req.Successor)
 	}
 	applied, err := s.cfg.CaptainStore.Apply(ctx, captain.ApplyParams{
 		AccountID: identityAccountID(ctx),

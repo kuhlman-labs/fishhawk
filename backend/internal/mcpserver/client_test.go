@@ -738,6 +738,65 @@ func TestDigestClient_SurfacesAPIError(t *testing.T) {
 	}
 }
 
+// TestGetHandoverBrief_SendsSelectorAndDecodes proves GetHandoverBrief GETs
+// /v0/handover-brief with the selector as query params — zero sequences and an
+// empty section OMITTED so the backend derives its window from the captain
+// record — and decodes the shared handoverbrief.Brief wire model, including
+// the canonical brief_hash and a uuid-bearing cited item (E76.4 / #3767).
+func TestGetHandoverBrief_SendsSelectorAndDecodes(t *testing.T) {
+	runID := uuid.New()
+	var gotMethod, gotPath string
+	var gotQuery []string
+	c := releaseTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		gotMethod, gotPath = r.Method, r.URL.Path
+		gotQuery = append(gotQuery, r.URL.RawQuery)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"repo":"x/y","captain_subject":"github:alice","window":{"from_sequence":3,"to_sequence":9,"chain_head":9,"basis":"since_last_handover"},"sections":[{"kind":"what_changed","parts":[{"kind":"merges","items":[{"category":"merge_verdict_recorded","source_sequence":9,"source_entry_hash":"h9","run_id":"`+runID.String()+`","at":"2026-09-01T00:00:00Z"}],"complete":true,"truncated":false,"omitted_count":0}]}],"absent":[{"section":"adr_index","reason":"r","anchor":"E78"}],"gaps":[],"degradations":[],"brief_hash":"cafe","truncated":false}`)
+	})
+
+	b, err := c.GetHandoverBrief(context.Background(), "x/y", "", 0, 0)
+	if err != nil {
+		t.Fatalf("GetHandoverBrief: %v", err)
+	}
+	if _, err := c.GetHandoverBrief(context.Background(), "x/y", "in_flight", 4, 9); err != nil {
+		t.Fatalf("GetHandoverBrief (selector): %v", err)
+	}
+	if gotMethod != http.MethodGet || gotPath != "/v0/handover-brief" {
+		t.Errorf("request = %s %s, want GET /v0/handover-brief", gotMethod, gotPath)
+	}
+	if gotQuery[0] != "repo=x%2Fy" {
+		t.Errorf("default query = %q, want repo only", gotQuery[0])
+	}
+	if gotQuery[1] != "from_sequence=4&repo=x%2Fy&section=in_flight&to_sequence=9" {
+		t.Errorf("selector query = %q", gotQuery[1])
+	}
+	if b.BriefHash != "cafe" || b.Window.FromSequence != 3 || b.Window.Basis != "since_last_handover" || b.CaptainSubject != "github:alice" {
+		t.Errorf("decoded brief header = %+v", b)
+	}
+	if len(b.Sections) != 1 || len(b.Sections[0].Parts) != 1 || len(b.Sections[0].Parts[0].Items) != 1 ||
+		b.Sections[0].Parts[0].Items[0].RunID != runID || b.Sections[0].Parts[0].Items[0].SourceEntryHash != "h9" {
+		t.Errorf("decoded sections = %+v", b.Sections)
+	}
+	if len(b.Absent) != 1 || b.Absent[0].Section != "adr_index" {
+		t.Errorf("decoded absent = %+v", b.Absent)
+	}
+}
+
+// TestGetHandoverBrief_SurfacesAPIError proves a non-2xx surfaces as the typed
+// *apiError with its code (503 handover_brief_unavailable here).
+func TestGetHandoverBrief_SurfacesAPIError(t *testing.T) {
+	c := releaseTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = io.WriteString(w, `{"error":{"code":"handover_brief_unavailable","message":"the handover brief could not be established (window_read_failed)"}}`)
+	})
+	_, err := c.GetHandoverBrief(context.Background(), "x/y", "", 0, 0)
+	var ae *apiError
+	if !errors.As(err, &ae) || ae.StatusCode != http.StatusServiceUnavailable || ae.Code != "handover_brief_unavailable" {
+		t.Errorf("err = %v, want *apiError 503 handover_brief_unavailable", err)
+	}
+}
+
 // TestPersistReleaseNotes_SurfacesAPIError proves a 404 stage_not_found from the
 // persist endpoint surfaces as *apiError (the do error passthrough).
 func TestPersistReleaseNotes_SurfacesAPIError(t *testing.T) {

@@ -1,0 +1,14 @@
+id: scenario:issue-3767/brief-body-carries-every-section-and-its-hash
+statement: For a repository the caller can see, GET /v0/handover-brief returns HTTP 200 whose body carries the window (from_sequence, to_sequence, chain_head and its basis), a sections array containing what_changed, needs_decision, in_flight, delegation_in_force and standing_orders, an absent array naming charter_revision and adr_index with their reasons, and a non-empty brief_hash.
+verify_hint: 'HTTP route: GET /v0/handover-brief?repo=<repo> returns 200 and the JSON body carries window.basis, the five named section kinds, the two named absent sections, and a non-empty brief_hash. Discover a repo the preview serves the same way GET /v0/digest?repo= is driven there.'
+steps: Seeded kuhlman-labs/fishhawk with POST /v0/dev/fixtures plan-gate-parked (and later other scenarios). GET http://localhost:8090/v0/handover-brief?repo=kuhlman-labs/fishhawk with the read:audit bearer, before and after live captain handovers.
+assertions:
+    expected: 200 with window incl. basis, the five sections, absent naming charter_revision and adr_index with reasons, and a non-empty brief_hash.
+    observed_at_record: 200 with window {from_sequence, to_sequence, chain_head, basis} (first_captain before any captain_assigned; since_last_handover plus assigned_sequence/entry_hash after). sections = [what_changed, needs_decision, in_flight, delegation_in_force, standing_orders]. absent = charter_revision (#3242), adr_index (E78), doctrine_changes (#3733), each with a reason. brief_hash is a 64-hex value.
+    repro_handle: 'curl -s -H ''Authorization: Bearer <fhk_>'' ''http://localhost:8090/v0/handover-brief?repo=kuhlman-labs/fishhawk'''
+origin:
+    issue: 3767
+    pr: 0
+    run_id: 98a28bc0-5829-4401-a005-8cbb4abcd9b4
+    head_sha: 1aa55a2de890ea6378ed521ea129fbb45bb66cc6
+    recorded_at: 2026-09-30T00:10:08Z

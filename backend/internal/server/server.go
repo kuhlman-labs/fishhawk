@@ -822,6 +822,14 @@ type Config struct {
 	// /v0/captain/{offer,withdraw,accept,relinquish,claim} verbs. Wired from
 	// serve.go next to digest.NewStore(pool); nil degrades all six routes to
 	// 501 captain_unconfigured rather than panicking.
+	//
+	// The handover brief (E76.4 / #3767, GET /v0/handover-brief and the
+	// offer-time brief_hash) takes NO field of its own: it composes over
+	// DigestStore + DigestIndex + CaptainStore (required — any nil answers 501
+	// handover_brief_unconfigured, and at offer time records
+	// brief_unavailable) and CampaignRepo + RunRepo (optional — nil degrades
+	// in_flight, and a nil RunRepo degrades delegation_in_force, whose view is
+	// projected from the newest run's cached spec).
 	CaptainStore *captain.Store
 
 	// ModelOracle is the snapshot seam the model-id validity layer (#1339)

@@ -17,6 +17,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/delegationview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/digest"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/handoverbrief"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/precedent"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 )
@@ -4908,6 +4909,40 @@ func (c *apiClient) MarkDigestRead(ctx context.Context, repo string, toSequence 
 		return nil, err
 	}
 	return &res, nil
+}
+
+// GetHandoverBrief reads the handover brief for repo via
+// GET /v0/handover-brief?repo=&section=&from_sequence=&to_sequence=
+// (E76.4 / #3767). section and the two sequences are optional and sent only
+// when set (the backend derives the window from the captain record's last
+// captain_assigned entry up to the chain head). The body is the shared
+// handoverbrief.Brief wire model, already bounded server-side at
+// handoverbrief.DefaultByteBudget; its brief_hash is the hash of the
+// canonical, unbounded composition. It never writes. 4xx/5xx surfaces as
+// *apiError:
+//   - 400 validation_failed (repo missing, unknown section, to_sequence
+//     beyond the chain head)
+//   - 401 authentication_required / 403 insufficient_scope (needs
+//     read:audit) / 403 repo_forbidden
+//   - 501 handover_brief_unconfigured
+//   - 503 handover_brief_unavailable (the brief could not be established)
+func (c *apiClient) GetHandoverBrief(ctx context.Context, repo, section string, fromSequence, toSequence int64) (*handoverbrief.Brief, error) {
+	q := url.Values{}
+	q.Set("repo", repo)
+	if section != "" {
+		q.Set("section", section)
+	}
+	if fromSequence > 0 {
+		q.Set("from_sequence", strconv.FormatInt(fromSequence, 10))
+	}
+	if toSequence > 0 {
+		q.Set("to_sequence", strconv.FormatInt(toSequence, 10))
+	}
+	var b handoverbrief.Brief
+	if err := c.do(ctx, http.MethodGet, "/v0/handover-brief?"+q.Encode(), nil, &b); err != nil {
+		return nil, err
+	}
+	return &b, nil
 }
 
 // GetCaptain reads the captain record for repo via GET /v0/captain?repo=

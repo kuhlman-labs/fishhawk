@@ -119,6 +119,10 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v0/captain/accept", s.handleCaptainAccept)
 	mux.HandleFunc("POST /v0/captain/relinquish", s.handleCaptainRelinquish)
 	mux.HandleFunc("POST /v0/captain/claim", s.handleCaptainClaim)
+	// Handover brief (E76.4 / #3767): composed on demand from the digest,
+	// captain record, campaign/run reads and the cached-spec delegation view;
+	// never writes.
+	mux.HandleFunc("GET /v0/handover-brief", s.handleGetHandoverBrief)
 	mux.HandleFunc("GET /v0/audit/export", s.handleAuditExport)
 	mux.HandleFunc("GET /v0/audit/export.csv", s.handleAuditExportCSV)
 	mux.HandleFunc("GET /v0/reports/agent-changes", s.handleAgentChangesReport)

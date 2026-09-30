@@ -21,7 +21,7 @@ the acting account's partition, keyed by `payload.repo`:
 
 | Category | Written by | Payload keys beyond `repo`, `subject`, `identity_verified` |
 |---|---|---|
-| `captain_handover_offered` | `Offer` (sitting captain) | `successor`, `successor_identity_verified` |
+| `captain_handover_offered` | `Offer` (sitting captain) | `successor`, `successor_identity_verified`; the handover brief: `brief_hash` + `brief_from_sequence` + `brief_to_sequence`, or `brief_unavailable` + `brief_unavailable_reason` |
 | `captain_handover_withdrawn` | `Withdraw` (the offering captain) | `successor`, `offer_entry_hash` |
 | `captain_assigned` | `Accept` (the named successor) | `offer_entry_hash`, `previous_captain` |
 | `captain_relinquished` | `Relinquish` (sitting captain) | — |
@@ -30,6 +30,22 @@ the acting account's partition, keyed by `payload.repo`:
 `offer_entry_hash` is the `entry_hash` of the `captain_handover_offered` entry a
 withdraw or accept resolves — the offer's identity. `subject` is always the
 acting identity; the entry's `actor_subject` carries the same value.
+
+**The handover brief on an offer (E76.4 / #3767).** `Params.Brief` /
+`Event.Brief` (an `OfferBrief`) carry the brief the caller composed; `Offer`
+copies it verbatim (a transition is pure — composition is the server's job,
+done BEFORE `Store.Apply` because the decide callback runs under the advisory
+lock). `Payload` emits the five `brief_*` keys ONLY on
+`captain_handover_offered` (`TestEventPayload_BriefKeysOnlyOnOffer`), and
+`Derive` surfaces them on `HandoverOffer.Brief`. `brief_hash` is the hash of
+the canonical, unbounded brief (`handoverbrief.Hash`) with its window;
+`brief_unavailable` + reason (and NO hash) records a brief that could not be
+established at all — a section degradation still hashes. The brief is a
+point-in-time composition: the hash commits to what was composed at offer
+time; live sections may differ on a later read. The keys are additive: a
+pre-E76.4 offer derives the zero `OfferBrief`
+(`TestDerive_PreBriefOfferHasZeroBrief`), and pre-change code ignores them
+(`encoding/json` drops unknown keys).
 
 None is an issue-comment surface or a decision-bearing category (see
 `docs/issue-comment-surfaces.md`). `page_pending` RECORDS the obligation to

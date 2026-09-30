@@ -201,6 +201,11 @@ var exportBaseline = []string{
 	// (process_start + the sibling identity fields). Exported alongside the
 	// other apiClient result types.
 	"GroomingDispositionEntry",
+	// E76.4 / #3767: fishhawk_handover_brief's input and output, exported for
+	// the SDK's jsonschema reflection like every DTO; HandoverBriefOutput wraps
+	// the shared handoverbrief.Brief wire model.
+	"HandoverBriefInput",
+	"HandoverBriefOutput",
 	"HealthInfo",
 	"HostDispatchResult",
 	"InitInput",
