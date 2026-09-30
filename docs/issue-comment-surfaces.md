@@ -175,10 +175,31 @@ Notes:
   `githubclient.EditPullRequest`), spliced between `<!-- fishhawk:economics -->`
   markers so a re-observed merge replaces rather than duplicates the section;
   the stamp is best-effort and never blocks the merge-gate resolution.
+- **Gate precedent section (E75.4 / #3732, ADR-082 decision (c)).** While a
+  human gate is open, the anchor renders a `#### Precedent at this gate`
+  section just above the economics block: the gate's decision class, the modal
+  outcome and its share, one citation line per cited prior decision (its
+  chain sequence, outcome and score total; at most 3), and a
+  `fishhawk_precedent` pointer. It is distilled (`notifier.go::distilAnchorPrecedent`) from the
+  NEWEST decodable `precedent_surfaced` entry on the run's chain, and renders
+  ONLY while that entry's stage is still `awaiting_approval` /
+  `awaiting_scope_decision` — once the captain decides, the section disappears
+  instead of lingering as stale context. The entry carries citations only (no
+  reason prose, ADR-082 rule 1), so neither does the section. It is
+  DISPLAY-ONLY (never authority, never a gate input) and never an agent input:
+  the anchor is Fishhawk-authored, so `writeIssueComments`' `[bot]` filter keeps
+  it out of every later prompt, pinned by
+  `prompt_test.go::TestPrecedentNeverRendersIntoAnAgentPrompt`. Because the
+  entry is recorded at READ time (a captain-facing surface reads the open
+  gate), the section appears on the anchor's NEXT rebuild, not at the instant
+  the gate opens.
 - **Body cap.** The anchor body is capped at `MaxIssueCommentBodyBytes`
-  (65,536) by a degradation ladder that drops the **economics block first**
-  (display-only, derived), then the timeline, then superseded plans, always
-  preserving the header, the current plan summary, and the dashboard deep-link.
+  (65,536) by a degradation ladder that drops the **gate precedent section
+  first** (display-only; the full ranked set is one `fishhawk_precedent` call
+  away), then the **economics block** (display-only, derived), then the
+  timeline, then superseded plans, always preserving the header, the current
+  plan summary, and the dashboard deep-link. Pinned by
+  `TestAssembleAnchor_LadderOrder` and `TestAnchorLadder_DropsPrecedentFirst`.
 - **Sticky PR status comment (E42.1 / #1784).** The PR-locus sibling of the
   living anchor: ONE system-owned comment per PR, edited in place, projecting
   the subset a human deciding the merge needs on the PR page itself — a
@@ -574,6 +595,15 @@ Notes:
   `NotifyRunRejected` (below); the finer per-reviewer capability gap does not
   reject and posts no comment. Listed here so a reader grepping for reviewer
   audit kinds sees the full non-comment set.
+- The gate precedent audit kind — `precedent_surfaced` (E75.4 / #3732,
+  ADR-082 decision (c)), written by `server/gate_precedent.go` when a
+  captain-facing read surface (the gate view or the single-run read) first
+  shows a precedent block for an open human gate, de-duplicated by fingerprint
+  + stage — is an **internal audit kind, not an issue-comment surface**. It is
+  deliberately NOT in `activityCategories`: it fires at every gate open, and an
+  activity line per gate would be thread noise. It surfaces on the thread ONLY
+  inside the living anchor's droppable gate precedent section (see "Gate
+  precedent section" above). Nothing in `issuecomment` posts a comment for it.
 - The local auto-driver attribution audit kind — `run_auto_driven` (#1700),
   written by the auto-drive endpoints (`server/autodrive_http.go`) when the
   local `fishhawk_drive_run` verb walks a run one mechanical step under ADR-040

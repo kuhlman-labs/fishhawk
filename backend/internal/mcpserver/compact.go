@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"reflect"
 	"unicode/utf8"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/precedent"
 )
 
 // This file holds the pure projection helpers shared by
@@ -41,6 +43,38 @@ const concernNoteCapBytes = 240
 // elidedReviewProseMarker. A note WITHIN the cap is returned byte-identical and
 // carries NO marker, so a capped note and an uncapped one are distinguishable.
 const cappedNoteMarker = "…(capped; full note via fishhawk_get_gate_view, or include_review_prose=true)"
+
+// elidedPrecedentExcerptMarker is the visible stand-in elidePrecedentExcerpts
+// writes in place of a NON-EMPTY precedent reason excerpt on the compact-default
+// get_run_status path (E75.4 / #3732). Like elidedReviewProseMarker it is
+// written only over non-empty text, so an elided excerpt and a decision that
+// genuinely recorded no reason stay distinguishable, and it names the surfaces
+// that restore the full excerpt.
+const elidedPrecedentExcerptMarker = "…(elided; full excerpt via fishhawk_precedent or fishhawk_get_gate_view, or include_review_prose=true)"
+
+// elidePrecedentExcerpts returns a COPY of block whose cited items' reason
+// excerpts are replaced by elidedPrecedentExcerptMarker — the compaction lever
+// for the gate precedent block, mirroring the concern-note lever: the reason
+// excerpt is prose, while the scores, matched keys, outcomes, citations and the
+// summary are the decidable part and survive untouched. It copies rather than
+// mutating in place because the block's Items slice may be shared with the
+// decoded run mirror. nil in, nil out.
+func elidePrecedentExcerpts(block *gatePrecedent) *gatePrecedent {
+	if block == nil {
+		return nil
+	}
+	out := *block
+	if len(block.Items) > 0 {
+		out.Items = make([]precedent.Item, len(block.Items))
+		copy(out.Items, block.Items)
+		for i := range out.Items {
+			if out.Items[i].ReasonExcerpt != "" {
+				out.Items[i].ReasonExcerpt = elidedPrecedentExcerptMarker
+			}
+		}
+	}
+	return &out
+}
 
 // implementReviewsElidedNote is the fixed wire note dedupImplementReviews sets on
 // GetRunStatusOutput.ImplementReviewsElided when it drops the redundant flat

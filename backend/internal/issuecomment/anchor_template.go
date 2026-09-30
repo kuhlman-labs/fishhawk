@@ -73,8 +73,15 @@ type AnchorInput struct {
 	// wait-on-human breakdown, and cache net savings. The Notifier folds the
 	// run's cost/latency rollups and populates this; nil (or an all-zero
 	// rollup) omits the block. It is a DROPPABLE section — the degradation
-	// ladder sheds it FIRST when the body exceeds the comment cap.
+	// ladder sheds it SECOND (right after Precedent) when the body exceeds the
+	// comment cap.
 	Economics *EconomicsInput
+	// Precedent, when non-nil, renders the gate precedent section (E75.4 /
+	// #3732, ADR-082 decision (c)): the newest precedent_surfaced entry for a
+	// gate that is still open, distilled by the Notifier
+	// (distilAnchorPrecedent). It is DISPLAY-ONLY and the FIRST section the
+	// degradation ladder sheds. Nil renders exactly as before.
+	Precedent *AnchorPrecedent
 	// PlanEchoSuppressed is true when a plan artifact exists but the
 	// workflow's plan stage declares no originating_issue/rendered_comment
 	// persistence entry (E45.41 / #3346, spec.IssueEchoPolicyFor
@@ -97,7 +104,8 @@ type AnchorInput struct {
 // anchorSections is the assembled, still-mutable form of the anchor body
 // before the degradation ladder collapses it to fit GitHub's comment
 // cap. Each field renders independently so the ladder can drop the
-// optional ones (economics, then timeline, then superseded plans) while
+// optional ones (precedent, then economics, then timeline, then superseded
+// plans) while
 // always keeping the header, the current plan summary, and the dashboard
 // deep-link.
 type anchorSections struct {
@@ -116,6 +124,7 @@ type anchorSections struct {
 	modelResolved   string
 	supersededPlans string
 	economics       string
+	precedent       string
 	footer          string
 }
 
@@ -123,8 +132,8 @@ type anchorSections struct {
 // chain projection. Pure — no IO, no time.Now — so callers (the Notifier
 // and the CLI status-comment endpoint) control exactly what is surfaced.
 // The body is capped at MaxIssueCommentBodyBytes via a degradation ladder
-// that drops the economics block first, then the timeline, then superseded
-// plans, always preserving the header, current plan summary, and dashboard
+// that drops the precedent section first, then the economics block, then the
+// timeline, then superseded plans, always preserving the header, current plan summary, and dashboard
 // deep-link.
 func RenderAnchorBody(in AnchorInput) string {
 	if in.Run == nil {
@@ -149,38 +158,54 @@ func RenderAnchorBody(in AnchorInput) string {
 		modelResolved:   renderResolvedModel(in.Audit),
 		supersededPlans: renderSupersededPlans(in.SupersededPlans),
 		economics:       renderEconomicsSection(in.Economics),
+		precedent:       RenderPrecedentSection(in.Precedent),
 		footer:          renderAnchorFooter(in.Run, externalURL),
 	}
 
 	// Degradation ladder: assemble at progressively reduced fidelity
 	// until the body fits. Level 0 is everything; level 1 drops the
-	// economics block first (display-only, least load-bearing); level 2
-	// also drops the timeline; level 3 also drops superseded plans. A
+	// precedent section first (display-only, one call away via
+	// fishhawk_precedent); level 2 also drops the economics block; level 3
+	// also drops the timeline; level 4 also drops superseded plans. A
 	// still-oversized body at the floor falls through to
 	// truncateForGitHubComment.
-	for level := 0; level <= 3; level++ {
+	for level := 0; level <= anchorLadderFloor; level++ {
 		body := assembleAnchor(s, level)
 		if len(body) <= MaxIssueCommentBodyBytes {
 			return body
 		}
 	}
-	floor := assembleAnchor(s, 3)
+	floor := assembleAnchor(s, anchorLadderFloor)
 	return truncateForGitHubComment(floor, runURL, "", externalURL, in.Run.ID.String())
 }
+
+// The anchor degradation ladder's positions. Each named level is the FIRST
+// level at which that section is gone; anchorLadderFloor is the deepest.
+const (
+	anchorLadderDropPrecedent  = 1
+	anchorLadderDropEconomics  = 2
+	anchorLadderDropTimeline   = 3
+	anchorLadderDropSuperseded = 4
+	anchorLadderFloor          = anchorLadderDropSuperseded
+)
 
 // assembleAnchor joins the sections at the given degradation level.
 //
 //	level 0 — full
-//	level 1 — drop the economics block first (display-only, derived)
-//	level 2 — also drop the timeline (oldest, least load-bearing context)
-//	level 3 — also drop superseded plans
+//	level 1 — drop the precedent section first (E75.4: display-only, and
+//	          the full set is one fishhawk_precedent call away)
+//	level 2 — also drop the economics block (display-only, derived, #1702)
+//	level 3 — also drop the timeline (oldest, least load-bearing context)
+//	level 4 — also drop superseded plans
 //
 // The header, what-now line, current plan, and footer (dashboard link)
-// are never dropped. The economics block sits just above the footer and is
-// the FIRST section shed under the cap (#1702).
+// are never dropped. The precedent section and the economics block sit just
+// above the footer; precedent is the FIRST section shed under the cap, and
+// the pre-E75.4 relative order (economics -> timeline -> superseded) is kept
+// below it.
 func assembleAnchor(s anchorSections, level int) string {
 	parts := []string{s.marker, s.header, s.captain, s.whatNow, s.stages}
-	if level < 2 && s.timeline != "" {
+	if level < anchorLadderDropTimeline && s.timeline != "" {
 		parts = append(parts, s.timeline)
 	}
 	if s.reviews != "" {
@@ -192,10 +217,13 @@ func assembleAnchor(s anchorSections, level int) string {
 	if s.modelResolved != "" {
 		parts = append(parts, s.modelResolved)
 	}
-	if level < 3 && s.supersededPlans != "" {
+	if level < anchorLadderDropSuperseded && s.supersededPlans != "" {
 		parts = append(parts, s.supersededPlans)
 	}
-	if level < 1 && s.economics != "" {
+	if level < anchorLadderDropPrecedent && s.precedent != "" {
+		parts = append(parts, s.precedent)
+	}
+	if level < anchorLadderDropEconomics && s.economics != "" {
 		parts = append(parts, s.economics)
 	}
 	parts = append(parts, s.footer)
@@ -719,10 +747,68 @@ func renderPlanScopeApproach(p *AnchorPlanView) string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
+// AnchorPrecedentHeading is the heading line of the anchor's gate precedent
+// section (E75.4 / #3732). Exported so the never-an-agent-input pin
+// (backend/internal/prompt's TestPrecedentNeverRendersIntoAnAgentPrompt) can
+// assert it appears in NO agent prompt.
+const AnchorPrecedentHeading = "#### Precedent at this gate"
+
+// AnchorPrecedentCitationMarker prefixes each cited decision's line in the
+// precedent section; exported for the same absence pin.
+const AnchorPrecedentCitationMarker = "- precedent `#"
+
+// AnchorPrecedent is the distilled newest precedent_surfaced entry the anchor
+// renders (E75.4 / #3732). It carries only what the chain recorded — by
+// CITATION, never reason prose (the entry carries none, ADR-082 rule 1).
+type AnchorPrecedent struct {
+	DecisionClass  string
+	IndexVersion   string
+	Count          int
+	ModalOutcome   string
+	AgreementRatio float64
+	Cited          []AnchorPrecedentCitation
+}
+
+// AnchorPrecedentCitation is one cited prior decision: its chain coordinate,
+// its outcome, and its explained score total.
+type AnchorPrecedentCitation struct {
+	SourceSequence int64
+	Outcome        string
+	ScoreTotal     float64
+}
+
+// RenderPrecedentSection renders the anchor's gate precedent section, or ""
+// for nil / a block citing nothing. DISPLAY-ONLY: it states how this kind of
+// gate was decided before and that the decision is still the captain's; it is
+// never authority. Shed FIRST by the degradation ladder (anchorLadderDropPrecedent).
+func RenderPrecedentSection(p *AnchorPrecedent) string {
+	if p == nil || len(p.Cited) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(AnchorPrecedentHeading + "\n\n")
+	fmt.Fprintf(&b, "How `%s` was decided before (display-only — never authority; the decision is still the captain's).", oneLine(p.DecisionClass))
+	if p.ModalOutcome != "" {
+		fmt.Fprintf(&b, " Most common outcome: `%s` (%.0f%% of %d).", oneLine(p.ModalOutcome), p.AgreementRatio*100, p.Count)
+	}
+	b.WriteString("\n\n")
+	for _, c := range p.Cited {
+		outcome := c.Outcome
+		if outcome == "" {
+			outcome = "unrecorded"
+		}
+		fmt.Fprintf(&b, "%s%d` — `%s`, score %.2f\n", AnchorPrecedentCitationMarker, c.SourceSequence, oneLine(outcome), c.ScoreTotal)
+	}
+	if p.IndexVersion != "" {
+		fmt.Fprintf(&b, "\n<sub>index `%s` · full ranked set: `fishhawk_precedent`</sub>\n", oneLine(p.IndexVersion))
+	}
+	return b.String()
+}
+
 // renderEconomicsSection renders the per-change economics block (#1702) for
 // the living anchor, or "" when no economics rollup is wired (nil) or the
 // rollup is all-zero (RenderEconomicsBlock returns ""). Placed just above the
-// footer and shed FIRST by the degradation ladder.
+// footer and shed SECOND by the degradation ladder, right after precedent.
 func renderEconomicsSection(in *EconomicsInput) string {
 	if in == nil {
 		return ""

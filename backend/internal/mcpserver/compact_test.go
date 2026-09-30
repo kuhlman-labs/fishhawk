@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"unicode/utf8"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/precedent"
 )
 
 // TestStripReviewProse asserts the typed strip replaces a NON-EMPTY free_form
@@ -596,4 +598,37 @@ func TestCollapseCacheEfficiencyStages(t *testing.T) {
 	}
 	// nil-safe.
 	collapseCacheEfficiencyStages(nil)
+}
+
+// TestElidePrecedentExcerpts (E75.4 / #3732): the compaction lever for the gate
+// precedent block replaces each NON-EMPTY reason excerpt with the marker, leaves
+// an empty one empty (an elided excerpt and a decision with no recorded reason
+// stay distinguishable), keeps every decidable field, returns nil for nil, and
+// does NOT mutate its input (the Items slice may be shared).
+func TestElidePrecedentExcerpts(t *testing.T) {
+	if got := elidePrecedentExcerpts(nil); got != nil {
+		t.Errorf("nil in: got %+v, want nil", got)
+	}
+	in := &gatePrecedent{
+		DecisionClass: "concern_waive",
+		Items: []precedent.Item{
+			{SourceSequence: 1, Outcome: "waived", ReasonExcerpt: "prose one", Score: precedent.ScoreComponents{Total: 0.9}},
+			{SourceSequence: 2, Outcome: "waived"},
+		},
+		Summary: precedent.Summary{Count: 2, ModalOutcome: "waived", AgreementRatio: 1},
+	}
+	out := elidePrecedentExcerpts(in)
+	if out.Items[0].ReasonExcerpt != elidedPrecedentExcerptMarker {
+		t.Errorf("non-empty excerpt = %q, want the marker", out.Items[0].ReasonExcerpt)
+	}
+	if out.Items[1].ReasonExcerpt != "" {
+		t.Errorf("empty excerpt = %q, want it left empty", out.Items[1].ReasonExcerpt)
+	}
+	if out.Items[0].Score.Total != 0.9 || out.Items[0].Outcome != "waived" || out.Summary.ModalOutcome != "waived" ||
+		out.DecisionClass != "concern_waive" {
+		t.Errorf("a decidable field was dropped: %+v", out)
+	}
+	if in.Items[0].ReasonExcerpt != "prose one" {
+		t.Errorf("input mutated: excerpt now %q", in.Items[0].ReasonExcerpt)
+	}
 }

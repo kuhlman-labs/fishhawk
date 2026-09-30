@@ -19,7 +19,9 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/decisionindex"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
@@ -3925,4 +3927,157 @@ func TestGateViewCaptain_WireShape(t *testing.T) {
 			t.Errorf("GateView.Captain = %+v, want nil", gv.Captain)
 		}
 	})
+}
+
+// fakeGatePrecedentIndex is a server.PrecedentIndex serving fixed rows, so the
+// wire-boundary test below drives the REAL gate-view and run handlers without
+// seeding decision_index.
+type fakeGatePrecedentIndex struct {
+	rows []decisionindex.Row
+}
+
+func (f fakeGatePrecedentIndex) List(context.Context, decisionindex.ListFilter) ([]decisionindex.Row, error) {
+	return f.rows, nil
+}
+
+func (f fakeGatePrecedentIndex) GateContext(context.Context, decisionindex.GateRef) (decisionindex.GateContext, error) {
+	return decisionindex.GateContext{Repo: "x/y", StageKind: "plan"}, nil
+}
+
+// jsonFieldNames returns the wire names reflect sees on t (the mirror side of
+// the #371 hand-maintained-wire-mirror seam).
+func jsonFieldNames(t reflect.Type) map[string]bool {
+	out := map[string]bool{}
+	for i := 0; i < t.NumField(); i++ {
+		name := strings.Split(t.Field(i).Tag.Get("json"), ",")[0]
+		if name != "" && name != "-" {
+			out[name] = true
+		}
+	}
+	return out
+}
+
+// TestGatePrecedentMirror_WireBoundary (E75.4 / #3732) pins the hand-maintained
+// gatePrecedent mirror against the REAL backend: a run parked at its plan gate
+// is served by the real server (gate view + single-run read) with a
+// PrecedentIndex wired, and (a) every key the SERVER emits inside the
+// precedent block and its full_query pointer is a field the mirror declares —
+// a renamed backend tag, or a renamed mirror tag, reddens here — and (b) the
+// block decodes through the MCP client's GetGateView and GetRun with its
+// content intact, so the mirror cannot silently decode to nil.
+func TestGatePrecedentMirror_WireBoundary(t *testing.T) {
+	ctx := context.Background()
+	pool := pgtest.NewPool(t)
+	runRepo := runpkg.NewPostgresRepository(pool)
+	concernRepo := concern.NewPostgresRepository(pool)
+
+	row, err := runRepo.CreateRun(ctx, runpkg.CreateRunParams{
+		Repo: "x/y", WorkflowID: "feature_change", WorkflowSHA: "abc",
+		TriggerSource: runpkg.TriggerCLI,
+	})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	if _, err := runRepo.TransitionRun(ctx, row.ID, runpkg.StateRunning); err != nil {
+		t.Fatalf("transition run: %v", err)
+	}
+	stage, err := runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID: row.ID, Sequence: 0, Type: runpkg.StageTypePlan,
+		ExecutorKind: runpkg.ExecutorAgent, ExecutorRef: "claude-code",
+	})
+	if err != nil {
+		t.Fatalf("create stage: %v", err)
+	}
+	for _, to := range []runpkg.StageState{runpkg.StageStateDispatched, runpkg.StageStateRunning, runpkg.StageStateAwaitingApproval} {
+		if _, err := runRepo.TransitionStage(ctx, stage.ID, to, nil); err != nil {
+			t.Fatalf("transition stage %s: %v", to, err)
+		}
+	}
+
+	decided := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	priorRun := uuid.New()
+	idx := fakeGatePrecedentIndex{rows: []decisionindex.Row{
+		{SourceSequence: 41, SourceEntryHash: "h41", RunID: priorRun, Repo: "x/y",
+			DecisionClass: decisionindex.ClassPlanApproval, StageKind: "plan", Outcome: "approved",
+			TouchedPaths: []string{}, EscalationKeys: []string{}, DecidedAt: decided},
+		{SourceSequence: 42, SourceEntryHash: "h42", RunID: priorRun, Repo: "x/y",
+			DecisionClass: decisionindex.ClassPlanApproval, StageKind: "plan", Outcome: "approved",
+			TouchedPaths: []string{}, EscalationKeys: []string{}, DecidedAt: decided.Add(time.Hour)},
+	}}
+	const bearer = "fhk_precedent_e2e"
+	tokRepo := &stubMCPAPITokens{tok: &apitoken.Token{
+		ID: uuid.New(), Subject: "github:op", Scopes: []string{"read:runs", "read:audit"}, PlainText: bearer,
+	}}
+	s := server.New(server.Config{RunRepo: runRepo, ConcernRepo: concernRepo, PrecedentIndex: idx, APITokenRepo: tokRepo})
+	ts := httptest.NewServer(s.Handler())
+	t.Cleanup(ts.Close)
+
+	// (a) SERVER-emitted keys, read out of the server's own gate-view output.
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/v0/runs/"+row.ID.String()+"/gate-view", nil)
+	req.Header.Set("Authorization", "Bearer "+bearer)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET gate view: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET gate view status = %d: %s", resp.StatusCode, body)
+	}
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(body, &top); err != nil {
+		t.Fatalf("unmarshal gate view: %v", err)
+	}
+	rawBlock, ok := top["precedent"]
+	if !ok {
+		t.Fatalf("server emitted no precedent block for a run parked at its plan gate:\n%s", body)
+	}
+	var block map[string]json.RawMessage
+	if err := json.Unmarshal(rawBlock, &block); err != nil {
+		t.Fatalf("unmarshal precedent block: %v", err)
+	}
+	mirrorFields := jsonFieldNames(reflect.TypeOf(gatePrecedent{}))
+	for k := range block {
+		if !mirrorFields[k] {
+			t.Errorf("server precedent key %q has no field on the gatePrecedent mirror (tag drift — the #371 trap)", k)
+		}
+	}
+	var fq map[string]json.RawMessage
+	if err := json.Unmarshal(block["full_query"], &fq); err != nil {
+		t.Fatalf("unmarshal full_query: %v", err)
+	}
+	queryFields := jsonFieldNames(reflect.TypeOf(gatePrecedentQuery{}))
+	for k := range fq {
+		if !queryFields[k] {
+			t.Errorf("server full_query key %q has no field on the gatePrecedentQuery mirror", k)
+		}
+	}
+
+	// (b) The block decodes through the MCP client on BOTH surfaces.
+	client := newAPIClient(config{backendURL: ts.URL, apiToken: bearer})
+	gv, err := client.GetGateView(ctx, row.ID, "")
+	if err != nil {
+		t.Fatalf("client GetGateView: %v", err)
+	}
+	runMirror, err := client.GetRun(ctx, row.ID)
+	if err != nil {
+		t.Fatalf("client GetRun: %v", err)
+	}
+	for name, p := range map[string]*gatePrecedent{"gate_view": gv.Precedent, "run": runMirror.Precedent} {
+		if p == nil {
+			t.Fatalf("%s: precedent decoded to nil through the client mirror", name)
+		}
+		if p.DecisionClass != string(decisionindex.ClassPlanApproval) || p.StageID != stage.ID.String() ||
+			p.IndexVersion == "" || p.Fingerprint == "" || len(p.Items) != 2 ||
+			p.Summary.Count != 2 || p.Summary.ModalOutcome != "approved" ||
+			p.FullQuery.Tool != "fishhawk_precedent" || p.FullQuery.RunID != row.ID.String() {
+			t.Errorf("%s: decoded precedent = %+v, want the plan-gate block citing both rows", name, p)
+		}
+		if p.Items[0].SourceEntryHash == "" || p.Items[0].SourceSequence == 0 {
+			t.Errorf("%s: cited item lost its chain coordinate: %+v", name, p.Items[0])
+		}
+	}
+	if gv.Precedent.Fingerprint != runMirror.Precedent.Fingerprint {
+		t.Errorf("gate view and run read disagree: fingerprint %q vs %q", gv.Precedent.Fingerprint, runMirror.Precedent.Fingerprint)
+	}
 }

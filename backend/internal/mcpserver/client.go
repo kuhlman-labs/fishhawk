@@ -276,7 +276,15 @@ type Run struct {
 	// renders nothing — the mixed-version degrade. The json tag MUST byte-match
 	// the backend's runResponse field or it silently decodes to nil.
 	ReviewHeadMismatch *gateViewReviewHeadMismatch `json:"review_head_mismatch,omitempty" jsonschema:"present when the open implement-review round judged a tree the PR does not carry (reviewed_tree_sha != pushed_tree_sha): the review verdicts describe a stale tree, so force a fresh round (fishhawk_fixup_stage) before merging. Omitted when no such mismatch is recorded"`
-	ReviewAuthority    []RunReviewAuthority        `json:"review_authority,omitempty" jsonschema:"per-stage resolved review authority: each entry carries the stage id, its type, the resolved mode (advisory | gating | gateless) and its provenance (declared | derived). Omitted when the run's spec declares no reviewers block"`
+	// Precedent mirrors the backend runResponse.precedent (E75.4 / #3732): the
+	// bounded precedent block for the run's open human gate. The backend emits
+	// it on the SINGLE-run read only (handleGetRun); nil when no human gate is
+	// open, no precedent is indexed, or against an older backend. The run-status
+	// tool HOISTS it to GetRunStatusOutput.Precedent (next to next_actions) and
+	// clears it here, so the block appears once. The json tag MUST byte-match
+	// the backend's runResponse field or it silently decodes to nil.
+	Precedent       *gatePrecedent       `json:"precedent,omitempty" jsonschema:"the bounded precedent block for the run's open human gate (single-run read only). Display-only: never a gate input, never an agent input"`
+	ReviewAuthority []RunReviewAuthority `json:"review_authority,omitempty" jsonschema:"per-stage resolved review authority: each entry carries the stage id, its type, the resolved mode (advisory | gating | gateless) and its provenance (declared | derived). Omitted when the run's spec declares no reviewers block"`
 	// WorkingDir mirrors the backend runResponse.working_dir (E66.42 /
 	// #2482): the run's bound local checkout, recorded once at start_run and
 	// inherited by every later runner-spawning verb. The
@@ -633,6 +641,53 @@ type GateView struct {
 	// or against an older backend. The json tag MUST byte-match the backend's
 	// gateViewResponse or the block silently decodes to nil.
 	Captain *gateViewCaptain `json:"captain,omitempty"`
+	// Precedent mirrors the backend's gate-view precedent block (E75.4 /
+	// #3732, ADR-082 decision (c)): how this kind of gate was decided before,
+	// bounded to a few cited decisions. DISPLAY-ONLY — never a gate input,
+	// never an agent input. Omitted (nil) when no human gate is open, the
+	// repository has no indexed precedent of the gate's class, the backend's
+	// precedent index is unwired, or against an older backend. The json tag
+	// MUST byte-match the backend's gateViewResponse or the block silently
+	// decodes to nil.
+	Precedent *gatePrecedent `json:"precedent,omitempty"`
+}
+
+// gatePrecedent mirrors the backend's gatePrecedentBlock
+// (backend/internal/server/gate_precedent.go, E75.4 / #3732) carried on BOTH
+// the gate view and the single-run read. The json tags MUST byte-match the
+// backend or each field silently decodes to its zero value (the #371-class
+// hand-maintained-wire-mirror trap); TestGatePrecedentMirrorDecodesBackendShape
+// decodes a fixture marshalled from the real backend shape to pin it. Items and
+// Summary reuse backend/internal/precedent's OWN types (the PrecedentResult
+// rationale: one definition of the ranked-item shape in the tree). Deliberately
+// UNEXPORTED — same rationale as gateViewCaptain.
+//
+// DISPLAY-ONLY: precedent reports how this kind of gate was decided before; it
+// is never authority, never a gate input and never an agent input (ADR-082
+// rules 2 and 6).
+type gatePrecedent struct {
+	DecisionClass string              `json:"decision_class" jsonschema:"the pending decision's class (plan_approval | concern_waive | merge_verdict | scope_amendment)"`
+	StageID       string              `json:"stage_id" jsonschema:"the stage whose gate is open"`
+	StageKind     string              `json:"stage_kind,omitempty" jsonschema:"the hard stage-kind filter the candidate window used; empty means any"`
+	IndexVersion  string              `json:"index_version" jsonschema:"the ranking contract version the scores were computed under"`
+	Fingerprint   string              `json:"fingerprint" jsonschema:"the key the precedent_surfaced audit entry is de-duplicated by"`
+	Items         []precedent.Item    `json:"items" jsonschema:"the cited prior decisions, best first, each with its explained score and matched keys"`
+	Summary       precedent.Summary   `json:"summary" jsonschema:"aggregate over the candidate window: counts, modal outcome and agreement ratio"`
+	Truncated     bool                `json:"truncated" jsonschema:"true when the candidate window was full"`
+	Degraded      []PrecedentDegraded `json:"degraded" jsonschema:"what the block could not include (a reason excerpt the chain read failed on, a truncated window)"`
+	FullQuery     gatePrecedentQuery  `json:"full_query" jsonschema:"where the full, unbounded ranked set for this gate is one call away"`
+}
+
+// gatePrecedentQuery mirrors the backend's gatePrecedentQuery: the pointer at
+// the full precedent query for the open gate. Tags MUST byte-match.
+type gatePrecedentQuery struct {
+	Endpoint               string `json:"endpoint" jsonschema:"the ready-to-issue REST path"`
+	Tool                   string `json:"tool" jsonschema:"the MCP tool that runs the full query (fishhawk_precedent)"`
+	DecisionClass          string `json:"decision_class"`
+	Repo                   string `json:"repo"`
+	RunID                  string `json:"run_id"`
+	StageID                string `json:"stage_id"`
+	AlternateDecisionClass string `json:"alternate_decision_class,omitempty" jsonschema:"a sibling class decidable at this gate (concern_defer beside concern_waive); re-run the full query with it"`
 }
 
 // gateViewCaptain mirrors the backend's gateViewCaptain (E76.3 / #3766). The
