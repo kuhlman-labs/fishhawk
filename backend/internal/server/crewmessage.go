@@ -22,7 +22,7 @@ import (
 // The crew-message REST surface (E77.3 / #3737, ADR-081 #3727 D4 and rules
 // 3-4). Five handlers over the E77.2 chain-authoritative mailbox:
 //
-//	POST /v0/crew-messages                                  send
+//	POST /v0/crew-messages                                  send (+ work_request filing)
 //	GET  /v0/crew-messages                                  list (recipient OR anchor)
 //	GET  /v0/crew-messages/{sequence}                       get one (+ opt-in ?wait=)
 //	POST /v0/crew-messages/{sequence}/respond               refusal ladder
@@ -98,6 +98,14 @@ type crewMessageResponse struct {
 	// byte-identical to E77.3's.
 	ConsultDeadline        *time.Time `json:"consult_deadline,omitempty"`
 	ConsultBudgetRemaining *int       `json:"consult_budget_remaining,omitempty"`
+	// WorkItem and WorkItemFilingError are set ONLY on the send response of a
+	// `work_request` (E77.7 / #3741, ADR-081 rule 2): the one work item the
+	// request filed, or the named filing branch that failed. A filing failure
+	// never un-sends the message — its chain entry is the record — so the
+	// response stays 201 and carries the error here. Both omitempty, so every
+	// other response is byte-identical to E77.5's.
+	WorkItem            *deferFiledIssue         `json:"work_item,omitempty"`
+	WorkItemFilingError *crewWorkItemFilingError `json:"work_item_filing_error,omitempty"`
 }
 
 // crewMessageAnswer is the first reply in a consulted message's thread, in
@@ -515,6 +523,12 @@ func (s *Server) handleSendCrewMessage(w http.ResponseWriter, r *http.Request) {
 		resp.ConsultDeadline = &deadline
 		resp.ConsultBudgetRemaining = &budgetRemains
 		s.dispatchCrewConsult(ctx, responder, *consult)
+	}
+	// E77.7 (#3741): a work_request files exactly one work item AFTER the send
+	// recorded it, and never creates a run. The message is on the chain either
+	// way, so a filing failure degrades the response rather than failing it.
+	if msg.Type == crewmessage.TypeWorkRequest {
+		resp.WorkItem, resp.WorkItemFilingError = s.fileCrewWorkRequest(ctx, id, msg, row)
 	}
 	s.writeJSON(w, r, http.StatusCreated, resp)
 }

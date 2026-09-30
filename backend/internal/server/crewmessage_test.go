@@ -624,3 +624,27 @@ func TestNotifyRootEscalationPage_OnlyRootEscalationNotifies(t *testing.T) {
 		})
 	}
 }
+
+// TestCrewMessageResponse_WorkItemMembersOmitted (E77.7 / #3741): the two
+// work-request members are omitempty, so every non-work_request send response
+// stays byte-identical to E77.5's, and each surfaces when set.
+func TestCrewMessageResponse_WorkItemMembersOmitted(t *testing.T) {
+	plain, err := json.Marshal(crewMessageResponse{SentSequence: 1})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	for _, k := range []string{`"work_item"`, `"work_item_filing_error"`} {
+		if strings.Contains(string(plain), k) {
+			t.Errorf("an unset %s member serialised: %s", k, plain)
+		}
+	}
+	set, _ := json.Marshal(crewMessageResponse{
+		WorkItem:            &deferFiledIssue{Number: 7},
+		WorkItemFilingError: &crewWorkItemFilingError{Code: "work_item_filing_failed", Message: "m"},
+	})
+	for _, k := range []string{`"work_item":{`, `"work_item_filing_error":{"code":"work_item_filing_failed"`} {
+		if !strings.Contains(string(set), k) {
+			t.Errorf("response %s lacks %s", set, k)
+		}
+	}
+}
