@@ -4626,6 +4626,17 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 		}
 	}
 
+	// Deferred crew delivery (E77.7 / #3741): the OPEN findings/notices
+	// addressed to the reviewer, resolved ONCE per round under the implement
+	// stage's id. This is the ONE implement_review render that carries crew
+	// text: both the trace-time round and the PR-report re-review backstop
+	// reach it through runImplementReviews, while runSupplementalReinvokeReview
+	// renders no crew surface (buildImplementReview returns before
+	// writeUntrustedCrewMessages), so it resolves and records nothing.
+	// Recorded only after the build succeeds.
+	crewDeliveries := s.resolveDeliverableCrewMessages(ctx, runID, stageID, run.StageTypeReview)
+	trig.CrewMessages = crewDeliveries.Messages
+
 	promptText, err := prompt.Build("implement_review", trig)
 	if err != nil {
 		treeCleanup()
@@ -4635,6 +4646,7 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 		)
 		return false
 	}
+	s.recordCrewMessagesDelivered(ctx, runID, stageID, run.StageTypeReview, "implement_review", crewDeliveries.Sequences)
 
 	// Idempotency guard (#797): the outer raw-variant gate (#793) already
 	// dedups the raw+redacted pair of one pack, but a retried raw upload (a

@@ -1619,6 +1619,14 @@ func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, p
 		}
 	}
 
+	// Deferred crew delivery (E77.7 / #3741): the OPEN findings/notices
+	// addressed to the reviewer, resolved ONCE per round (every reviewer reads
+	// the same prompt) under the plan stage's id, so each reviewer and each
+	// later round of this stage re-renders them while a later distinct stage
+	// does not. Recorded only after the build succeeds.
+	crewDeliveries := s.resolveDeliverableCrewMessages(ctx, runID, stageID, run.StageTypeReview)
+	trig.CrewMessages = crewDeliveries.Messages
+
 	promptText, err := prompt.Build("plan_review", trig)
 	if err != nil {
 		treeCleanup()
@@ -1628,6 +1636,7 @@ func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, p
 		)
 		return false
 	}
+	s.recordCrewMessagesDelivered(ctx, runID, stageID, run.StageTypeReview, "plan_review", crewDeliveries.Sequences)
 
 	// Pending-signal (#600): now that a reviewer will actually run
 	// (agent>0 AND PlanReviewer wired), emit a plan_review_started audit
