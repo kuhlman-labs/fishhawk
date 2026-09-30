@@ -259,6 +259,7 @@ func connectMCPClient(t *testing.T, ctx context.Context, binary, token, backendU
 // + the backend URL produces a working tool surface; calling
 // fishhawk_get_run_status returns the seeded run's data.
 func TestE2E_MCPLoop_HappyPath_IssuedTokenAuthenticates(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -304,6 +305,7 @@ func TestE2E_MCPLoop_HappyPath_IssuedTokenAuthenticates(t *testing.T) {
 // the HTTP-issued token authenticates through the mcptoken repo
 // before revocation and fails ErrNotFound after.
 func TestE2E_MCPLoop_RevokedToken_AuthLayerRejects(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -345,6 +347,7 @@ func TestE2E_MCPLoop_RevokedToken_AuthLayerRejects(t *testing.T) {
 // handler. The HappyPath test already proves real tokens flow
 // through the tool surface end-to-end.
 func TestE2E_MCPLoop_MalformedToken_AuthRejects(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -394,6 +397,7 @@ func toolContentString(t *testing.T, r *mcp.CallToolResult) string {
 // the first time we exercise a write tool through the real MCP
 // binary + real backend + real DB stack.
 func TestE2E_MCPLoop_OperatorWritePath_StartRun(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -474,6 +478,7 @@ func TestE2E_MCPLoop_OperatorWritePath_StartRun(t *testing.T) {
 // subsequent implement prompt-response. This writer→audit→read-back→response
 // seam is the one per-side unit tests cannot cover (#618).
 func TestE2E_BindingAssertions_PersistedAndEchoedOnPrompt(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -713,6 +718,7 @@ func getNextActions(t *testing.T, ctx context.Context, session *mcp.ClientSessio
 // Per-layer units cover the classifier table; this drives the audit/API
 // → classifier seam against the real backend reads (#618 rule).
 func TestE2E_NextActions_PlanGateParkedAndMergeRitual(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -885,6 +891,7 @@ func mergeVerdictRowCount(t *testing.T, ctx context.Context, pool *pgxpool.Pool,
 // bound — the merge-queued contract is what this case asserts, not the
 // webhook-settled tail (covered by the per-side units).
 func TestE2E_MergeRun_EndpointToolWireAndIdempotence(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()

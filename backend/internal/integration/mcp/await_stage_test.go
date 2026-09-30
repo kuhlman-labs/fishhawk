@@ -100,6 +100,7 @@ func newStageReadProxy(t *testing.T, backendURL, stagePath string) (*httptest.Se
 // or a state/terminal envelope shadow-collision; only this test catches one
 // (the #618 / #962 seam class).
 func TestE2E_AwaitStage_ResolvesOnSettle(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
@@ -207,6 +208,7 @@ func TestE2E_AwaitStage_ResolvesOnSettle(t *testing.T) {
 // terminal-only client-side check would silently get wrong. The fast-path read
 // resolves it, so no flip is needed.
 func TestE2E_AwaitStage_ParkedStageIsSettled(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()

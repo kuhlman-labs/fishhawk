@@ -6,6 +6,7 @@ import "testing"
 // rewrite. Pure unit test — runs in milliseconds, doesn't need
 // Docker.
 func TestNormalizeDatabaseURL(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name string
 		in   string

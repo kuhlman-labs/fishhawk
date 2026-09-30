@@ -8,6 +8,9 @@ import (
 	"go/parser"
 	"go/token"
 	"go/types"
+	"io"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -120,7 +123,7 @@ func typeCheckServerPackageDir(dir string) (*typeCheckedPackage, error) {
 	}
 	var typeErrs []string
 	conf := types.Config{
-		Importer: importer.ForCompiler(fset, "source", nil),
+		Importer: importer.ForCompiler(fset, "gc", exportLookup(dir)),
 		Error:    func(e error) { typeErrs = append(typeErrs, e.Error()) },
 	}
 	info := &types.Info{Uses: map[*ast.Ident]types.Object{}}
@@ -479,4 +482,36 @@ func formatRows(rows []notifyCall) string {
 		fmt.Fprintf(&b, "  %d: %s %s(%q) resolved=%v %s\n", i, r.pos, r.fn, r.category, r.resolved, r.reason)
 	}
 	return b.String()
+}
+
+// SPIKE: resolve gc export data via one `go list -export -deps` call instead
+// of re-type-checking every dependency from source.
+func exportLookup(dir string) importer.Lookup {
+	var once sync.Once
+	m := map[string]string{}
+	var lerr error
+	return func(path string) (io.ReadCloser, error) {
+		once.Do(func() {
+			cmd := exec.Command("go", "list", "-export", "-deps", "-f", "{{.ImportPath}}={{.Export}}", ".")
+			cmd.Dir = dir
+			out, err := cmd.Output()
+			if err != nil {
+				lerr = err
+				return
+			}
+			for _, l := range strings.Split(string(out), "\n") {
+				if k, v, ok := strings.Cut(l, "="); ok && v != "" {
+					m[k] = v
+				}
+			}
+		})
+		if lerr != nil {
+			return nil, lerr
+		}
+		f, ok := m[path]
+		if !ok {
+			return nil, fmt.Errorf("no export data for %s", path)
+		}
+		return os.Open(f)
+	}
 }

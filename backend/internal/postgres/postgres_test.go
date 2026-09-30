@@ -307,6 +307,7 @@ func duplicateMigrationPrefixes(entries []string) []string {
 // the failure mode where someone moves the migrations directory and
 // the embed silently empties.
 func TestMigrations_EmbeddedFiles(t *testing.T) {
+	t.Parallel()
 	mfs := postgres.Migrations()
 	var entries []string
 	if err := fs.WalkDir(mfs, ".", func(path string, d fs.DirEntry, err error) error {
@@ -418,6 +419,7 @@ func TestMigrations_EmbeddedFiles(t *testing.T) {
 // duplicateMigrationPrefixes leaves that case with zero duplicates and reddens
 // this test on "want at least one".
 func TestMigrations_DuplicatePrefixDetected(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name    string
 		entries []string
@@ -475,6 +477,7 @@ func TestMigrations_DuplicatePrefixDetected(t *testing.T) {
 }
 
 func TestConnect_HappyPath(t *testing.T) {
+	t.Parallel()
 	url := startContainer(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -491,6 +494,7 @@ func TestConnect_HappyPath(t *testing.T) {
 }
 
 func TestConnect_MalformedURL(t *testing.T) {
+	t.Parallel()
 	_, err := postgres.Connect(context.Background(), "not-a-url-at-all")
 	if err == nil {
 		t.Fatal("expected error on malformed URL")
@@ -498,6 +502,7 @@ func TestConnect_MalformedURL(t *testing.T) {
 }
 
 func TestConnect_UnreachableHost(t *testing.T) {
+	t.Parallel()
 	// 127.0.0.1:1 is a privileged port no daemon listens on by default.
 	// Use a tight context deadline so the test completes quickly even
 	// if the OS would otherwise wait for the connect syscall to time
@@ -511,6 +516,7 @@ func TestConnect_UnreachableHost(t *testing.T) {
 }
 
 func TestMigrateUp_AppliesAndIsIdempotent(t *testing.T) {
+	t.Parallel()
 	url := startContainer(t)
 
 	// First application creates the schema.
@@ -1514,12 +1520,14 @@ func TestMigrateUp_AppliesAndIsIdempotent(t *testing.T) {
 }
 
 func TestMigrateUp_MalformedURL(t *testing.T) {
+	t.Parallel()
 	if err := postgres.MigrateUp("not-a-url"); err == nil {
 		t.Fatal("expected error on malformed URL")
 	}
 }
 
 func TestMigrateDown_RemovesTables(t *testing.T) {
+	t.Parallel()
 	url := startContainer(t)
 
 	if err := postgres.MigrateUp(url); err != nil {
@@ -2330,6 +2338,7 @@ func TestMigrateDown_RemovesTables(t *testing.T) {
 // id=900 that COLLIDES with the github row, then asserts the one-step down
 // SUCCEEDS, drops both gitlab rows, and keeps the github row.
 func TestMigrateDown_UsersProviderReversal(t *testing.T) {
+	t.Parallel()
 	url := startContainer(t)
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
@@ -2416,6 +2425,7 @@ func TestMigrateDown_UsersProviderReversal(t *testing.T) {
 // PRESENT after MigrateUp and ABSENT after one MigrateDown (index-only, clean
 // DROP INDEX). Mirrors TestMigrateDown_UsersProviderReversal in shape.
 func TestMigrateDown_MergeVerdictUniqueReversal(t *testing.T) {
+	t.Parallel()
 	url := startContainer(t)
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
@@ -2476,6 +2486,7 @@ func TestMigrateDown_MergeVerdictUniqueReversal(t *testing.T) {
 // above 0067, so one preparatory step-down (roll back 0068) is taken first.
 // Mirrors TestMigrateDown_MergeVerdictUniqueReversal.
 func TestMigrateDown_ParentAwaitingChildScopeDecisionUniqueReversal(t *testing.T) {
+	t.Parallel()
 	url := startContainer(t)
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
@@ -2549,6 +2560,7 @@ func TestMigrateDown_ParentAwaitingChildScopeDecisionUniqueReversal(t *testing.T
 // either assumption were wrong, MigrateUp would error before this test reached
 // its first Scan.
 func TestMigrateDown_ClarificationAnswersTruncatedOnce(t *testing.T) {
+	t.Parallel()
 	url := startContainer(t)
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
@@ -2617,6 +2629,7 @@ func TestMigrateDown_ClarificationAnswersTruncatedOnce(t *testing.T) {
 // A fixture WITHOUT such a row would let the narrower CHECK apply cleanly and the
 // arm would prove nothing.
 func TestMigrateDown_CampaignsAwaitingHumanReversal(t *testing.T) {
+	t.Parallel()
 	url := startContainer(t)
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
@@ -2672,6 +2685,7 @@ func TestMigrateDown_CampaignsAwaitingHumanReversal(t *testing.T) {
 // (campaigns, state 'awaiting_human') survives — the down migration touches
 // only its own derived table.
 func TestMigrateDown_DecisionIndexReversal(t *testing.T) {
+	t.Parallel()
 	url := startContainer(t)
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
@@ -2772,6 +2786,7 @@ func TestMigrateDown_DecisionIndexReversal(t *testing.T) {
 // table, policy and index are gone, the schema lands on 0088, and a
 // decision_index row (the table 0088 created) survives.
 func TestMigrateDown_CaptainReadWatermarksReversal(t *testing.T) {
+	t.Parallel()
 	url := startContainer(t)
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
@@ -2890,6 +2905,7 @@ func TestMigrateDown_CaptainReadWatermarksReversal(t *testing.T) {
 // the table 0089 created (captain_read_watermarks) survives — the down
 // migration touches only its own derived table.
 func TestMigrateDown_CrewMessagesReversal(t *testing.T) {
+	t.Parallel()
 	url := startContainer(t)
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
@@ -3016,6 +3032,7 @@ func TestMigrateDown_CrewMessagesReversal(t *testing.T) {
 // fixture, TestMigrateUp_ApprovalConditionsTruncatedUnique_ToleratesPreExistingKeylessDuplicates
 // (kept distinct per binding condition 2).
 func TestMigrateDown_ApprovalConditionsTruncatedUniqueReversal(t *testing.T) {
+	t.Parallel()
 	url := startContainer(t)
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
@@ -3091,6 +3108,7 @@ func TestMigrateDown_ApprovalConditionsTruncatedUniqueReversal(t *testing.T) {
 // audit_entries append-only triggers block UPDATE/DELETE only — a plain INSERT of
 // the seed rows is permitted — so the two-phase seeding works against them.
 func TestMigrateUp_ApprovalConditionsTruncatedUnique_ToleratesPreExistingKeylessDuplicates(t *testing.T) {
+	t.Parallel()
 	url := startContainer(t)
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
@@ -3201,6 +3219,7 @@ func TestMigrateUp_ApprovalConditionsTruncatedUnique_ToleratesPreExistingKeyless
 //     construction); this makes that decision machine-enforced rather than only
 //     commented, so a later accidental policy addition is caught here.
 func TestMigrateDown_OAuthASStorageReversal(t *testing.T) {
+	t.Parallel()
 	url := startContainer(t)
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
@@ -3320,6 +3339,7 @@ func TestMigrateDown_OAuthASStorageReversal(t *testing.T) {
 //     SOFTWARE is asking) loses the discriminator. A sweep that over-reached
 //     into the credential tables fails here.
 func TestMigrateDown_OAuthClientsProviderReversal(t *testing.T) {
+	t.Parallel()
 	url := startContainer(t)
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
@@ -3413,6 +3433,7 @@ func TestMigrateDown_OAuthClientsProviderReversal(t *testing.T) {
 // MigrateUp and is GONE after exactly one MigrateDown. Mirrors the 0065
 // reversal shape.
 func TestMigrateDown_RunsPredictedRuntimeMinutesReversal(t *testing.T) {
+	t.Parallel()
 	url := startContainer(t)
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
@@ -3459,6 +3480,7 @@ func TestMigrateDown_RunsPredictedRuntimeMinutesReversal(t *testing.T) {
 // directions: runs.working_dir EXISTS after MigrateUp and is GONE after exactly
 // one MigrateDown. Mirrors the 0064 reversal shape.
 func TestMigrateDown_RunsWorkingDirReversal(t *testing.T) {
+	t.Parallel()
 	url := startContainer(t)
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
@@ -3522,6 +3544,7 @@ const stagesProgressColumnSQL = `SELECT count(*) FROM information_schema.columns
 // are taken first — without them the single MigrateDown below would target 0071
 // and leave stages.progress in place.
 func TestMigrateDown_StagesProgressReversal(t *testing.T) {
+	t.Parallel()
 	url := startContainer(t)
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
@@ -3574,6 +3597,7 @@ const runsTriggerSourceCheckDefSQL = `SELECT pg_get_constraintdef(oid) FROM pg_c
 // (0076 is an ALTER + a CREATE INDEX, never a DROP TABLE). Mirrors the 0065 /
 // 0066 column-reversal shape, extended to cover the index.
 func TestMigrateDown_RunsInstallationRefReversal(t *testing.T) {
+	t.Parallel()
 	url := startContainer(t)
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
@@ -3674,6 +3698,7 @@ func TestMigrateDown_RunsInstallationRefReversal(t *testing.T) {
 // control open. Both are asserted from information_schema so that regression
 // fails HERE rather than surfacing as a served-without-charter prompt.
 func TestMigrateDown_RunsRequiresCharterReversal(t *testing.T) {
+	t.Parallel()
 	url := startContainer(t)
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
@@ -3762,6 +3787,7 @@ func TestMigrateDown_RunsRequiresCharterReversal(t *testing.T) {
 // project path is an operator authorization decision, not something derivable
 // from the payload being authorized.
 func TestMigrateDown_InstallationsProjectPathReversal(t *testing.T) {
+	t.Parallel()
 	url := startContainer(t)
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
@@ -3856,6 +3882,7 @@ const accountsGranularityCheckDefSQL = `SELECT pg_get_constraintdef(oid) FROM pg
 // assertion that distinguishes RELAXED from DROPPED, and the counterfactual
 // target for the up migration's re-ADD.
 func TestMigrateDown_AccountsGranularityUserReversal(t *testing.T) {
+	t.Parallel()
 	url := startContainer(t)
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
@@ -3976,6 +4003,7 @@ func TestMigrateDown_AccountsGranularityUserReversal(t *testing.T) {
 //     no-credentials run into one claiming installation 0.
 //   - installation_id NULL -> installation_ref STAYS NULL.
 func TestMigration0076_BackfillsInstallationRef(t *testing.T) {
+	t.Parallel()
 	url := startContainer(t)
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
@@ -4054,6 +4082,7 @@ func TestMigration0076_BackfillsInstallationRef(t *testing.T) {
 // blanket uniqueness on parent_run_id: an index that only refused duplicates
 // would pass a test that checked nothing else.
 func TestMigration0076_RetryChildOnceIndexDedups(t *testing.T) {
+	t.Parallel()
 	url := startContainer(t)
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
@@ -4143,6 +4172,7 @@ func TestMigration0076_RetryChildOnceIndexDedups(t *testing.T) {
 //
 // 0075 is the latest migration, so no preparatory step-downs.
 func TestMigrateDown_RunsTriggerSourceOnDemandReversal(t *testing.T) {
+	t.Parallel()
 	url := startContainer(t)
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
@@ -4351,6 +4381,7 @@ const artifactsKindCheckDefSQL = `SELECT pg_get_constraintdef(oid) FROM pg_const
 // 0074 (#2238) and 0075 (#2826) now sit above 0073, so two preparatory
 // step-downs are taken before the step under test.
 func TestMigrateDown_ArtifactGroomingReportReversal(t *testing.T) {
+	t.Parallel()
 	url := startContainer(t)
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
@@ -4455,6 +4486,7 @@ func TestMigrateDown_ArtifactGroomingReportReversal(t *testing.T) {
 // included — still inserts. A comment-only touch of the migration fails
 // here: the assertion is on the INSERT, not on the rendered constraint text.
 func TestMigrateDown_ArtifactAcceptanceTranscriptReversal(t *testing.T) {
+	t.Parallel()
 	url := startContainer(t)
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
@@ -4531,6 +4563,7 @@ func TestMigrateDown_ArtifactAcceptanceTranscriptReversal(t *testing.T) {
 // nothing and behind every GitLab row uniformly — harmless today, but a NOT
 // NULL or a default would make "NULL = not a GitLab pipeline row" undecidable.
 func TestMigrateDown_StageChecksGitLabPipelineIDReversal(t *testing.T) {
+	t.Parallel()
 	url := startContainer(t)
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
@@ -4618,6 +4651,7 @@ const stagesDispatchedAtColumnSQL = `SELECT count(*) FROM information_schema.col
 // updated_at trigger. 0073 (#2235) now sits above 0072, so one preparatory
 // step-down rolls it back before the step under test.
 func TestMigrateDown_StagesDispatchedAtReversal(t *testing.T) {
+	t.Parallel()
 	url := startContainer(t)
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
@@ -4684,6 +4718,7 @@ func TestMigrateDown_StagesDispatchedAtReversal(t *testing.T) {
 // watchdog's clock — does NOT move the backfilled dispatch clock. Uses the
 // postgres_test raw-un-migrated-database exemption; no hand-rolled container.
 func TestMigrateUp_StagesDispatchedAtBackfill(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	url := startContainer(t)
 	if err := postgres.MigrateUp(url); err != nil {
@@ -4765,6 +4800,7 @@ func TestMigrateUp_StagesDispatchedAtBackfill(t *testing.T) {
 // trigger), so a NULL or stale stamp fails without depending on the test host's
 // clock. Uses the postgres_test raw-un-migrated-database exemption.
 func TestStagesDispatchedAt_InsertDirectlyDispatched(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	url := startContainer(t)
 	if err := postgres.MigrateUp(url); err != nil {
@@ -4817,6 +4853,7 @@ func TestStagesDispatchedAt_InsertDirectlyDispatched(t *testing.T) {
 // 0069, so three preparatory step-downs (roll back 0072 then 0071 then 0070)
 // are taken first.
 func TestMigrateDown_ConcernNewEvidenceReversal(t *testing.T) {
+	t.Parallel()
 	url := startContainer(t)
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
@@ -4865,6 +4902,7 @@ func TestMigrateDown_ConcernNewEvidenceReversal(t *testing.T) {
 // column this one is modelled on. 0072 (#2744, stages.dispatched_at) now sits
 // above it, so one preparatory step-down (roll back 0072) is taken first.
 func TestMigrateDown_CampaignsWorkingDirReversal(t *testing.T) {
+	t.Parallel()
 	url := startContainer(t)
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
@@ -4920,6 +4958,7 @@ func TestMigrateDown_CampaignsWorkingDirReversal(t *testing.T) {
 // as a pgx scan error on every concern read against a live database that
 // already had rows.
 func TestMigrateUp_ConcernNewEvidenceDefaultsExistingRows(t *testing.T) {
+	t.Parallel()
 	url := startContainer(t)
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
@@ -5009,6 +5048,7 @@ func TestMigrateUp_ConcernNewEvidenceDefaultsExistingRows(t *testing.T) {
 // only roll back the inert CHECK/column/table changes and never reach 0040's normalization
 // (the campaign tables survive all — 0039 is the table create).
 func TestMigrateDown_NormalizesPausedRows(t *testing.T) {
+	t.Parallel()
 	url := startContainer(t)
 
 	if err := postgres.MigrateUp(url); err != nil {
@@ -5075,6 +5115,7 @@ func TestMigrateDown_NormalizesPausedRows(t *testing.T) {
 // flip, restoring the exact pre-split row shape. This is a behavioral done-means
 // assertion: a comment-only touch of the migration cannot pass it.
 func TestMigration0053_BackfillsParkedLocalStages(t *testing.T) {
+	t.Parallel()
 	url := startContainer(t)
 
 	if err := postgres.MigrateUp(url); err != nil {
@@ -5206,6 +5247,7 @@ func TestMigration0053_BackfillsParkedLocalStages(t *testing.T) {
 // of TestMigration0053_BackfillsParkedLocalStages, seeding via raw SQL against
 // the migrated-to-0054 DB (not the sqlc package).
 func TestMigration0055_BackfillsRunsAccountID(t *testing.T) {
+	t.Parallel()
 	url := startContainer(t)
 
 	if err := postgres.MigrateUp(url); err != nil {
@@ -5296,12 +5338,14 @@ func TestMigration0055_BackfillsRunsAccountID(t *testing.T) {
 }
 
 func TestMigrateDown_MalformedURL(t *testing.T) {
+	t.Parallel()
 	if err := postgres.MigrateDown("not-a-url"); err == nil {
 		t.Fatal("expected error on malformed URL")
 	}
 }
 
 func TestMigrateVersion_MalformedURL(t *testing.T) {
+	t.Parallel()
 	version, _, err := postgres.MigrateVersion("not-a-url")
 	if err == nil {
 		t.Fatal("expected error on malformed URL")
@@ -5318,6 +5362,7 @@ func TestMigrateVersion_MalformedURL(t *testing.T) {
 // fresh database report an error and would break the version-0 reservation the
 // contiguity assertion protects.
 func TestMigrateVersion_FreshDatabase(t *testing.T) {
+	t.Parallel()
 	url := startContainer(t) // deliberately NOT migrated
 	version, dirty, err := postgres.MigrateVersion(url)
 	if err != nil {
@@ -5338,6 +5383,7 @@ func TestMigrateVersion_FreshDatabase(t *testing.T) {
 // SELECT fails with a column-not-found error — rather than through the control's
 // own path, so the RED lands on the behavioral assertion.
 func TestMigrateVersion_VersionQueryError(t *testing.T) {
+	t.Parallel()
 	url := startContainer(t)
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
@@ -5411,6 +5457,7 @@ func highestEmbeddedMigration(t *testing.T) uint {
 // discriminating rather than a "we rolled back a lot" test, and it is the RED
 // site for both counterfactual mutations in the plan.
 func TestDownThrough_ReachesNamedTarget(t *testing.T) {
+	t.Parallel()
 	url := startContainer(t)
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
@@ -5508,6 +5555,7 @@ func TestDownThrough_ReachesNamedTarget(t *testing.T) {
 // order through the retained tiebreak) and grooming_source is NULLABLE (so a
 // campaign not built from a grooming order carries no provenance at all).
 func TestMigrateDown_CampaignQueuePositionAndGroomingSourceReversal(t *testing.T) {
+	t.Parallel()
 	url := startContainer(t)
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
@@ -5596,6 +5644,7 @@ func TestMigrateDown_CampaignQueuePositionAndGroomingSourceReversal(t *testing.T
 //
 // Modelled on TestMigrateDown_CampaignQueuePositionAndGroomingSourceReversal.
 func TestMigrateDown_CampaignItemsResolvedByReversal(t *testing.T) {
+	t.Parallel()
 	url := startContainer(t)
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
@@ -5760,6 +5809,7 @@ func tableExists(t *testing.T, url, table string) bool {
 // fires and is then rolled back returns a byte-identical error, so error
 // identity could not discriminate here.
 func TestMigrateUp_PartialMigrationLeavesNoSchemaBehind(t *testing.T) {
+	t.Parallel()
 	url := startContainer(t)
 	mfs := partialMigrationFS()
 
@@ -5792,6 +5842,7 @@ func TestMigrateUp_PartialMigrationLeavesNoSchemaBehind(t *testing.T) {
 // package's, so this test is a CHARACTERISATION test and is NOT claimed as a
 // counterfactual vehicle for code in this repo.
 func TestMigrateUp_FailingMigrationMarksDirtyAndRefusesSecondRun(t *testing.T) {
+	t.Parallel()
 	url := startContainer(t)
 	mfs := partialMigrationFS()
 
@@ -5837,6 +5888,7 @@ func TestMigrateUp_FailingMigrationMarksDirtyAndRefusesSecondRun(t *testing.T) {
 // recovery step. This is the counterfactual vehicle for enrichDirtyError —
 // deleting that enrichment leaves the bare text and this test goes red.
 func TestMigrateUp_DirtyErrorNamesRecovery(t *testing.T) {
+	t.Parallel()
 	url := startContainer(t)
 	mfs := partialMigrationFS()
 
@@ -5878,6 +5930,7 @@ func TestMigrateUp_DirtyErrorNamesRecovery(t *testing.T) {
 // rollback SUCCEEDS and that the row normalized to 'cancelled' (the closest
 // pre-0079 legal value) rather than being deleted or left behind.
 func TestMigrateDown_StagesSupersededReversal(t *testing.T) {
+	t.Parallel()
 	url := startContainer(t)
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
@@ -5969,6 +6022,7 @@ func TestMigrateDown_StagesSupersededReversal(t *testing.T) {
 // The key must NOT be run_id alone: one run legitimately carries one arbitration
 // per DISTINCT discharged outcome as acceptance re-runs supersede each other.
 func TestMigrateDown_AcceptanceArbitrationUniqueReversal(t *testing.T) {
+	t.Parallel()
 	url := startContainer(t)
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
@@ -6050,6 +6104,7 @@ func TestMigrateDown_AcceptanceArbitrationUniqueReversal(t *testing.T) {
 // absent, seed the two colliding rows (the append-only triggers block UPDATE and
 // DELETE only, so a plain INSERT is permitted), then step UP again.
 func TestMigrateUp_AcceptanceArbitrationUnique_FailsLoudOnPreExistingDuplicates(t *testing.T) {
+	t.Parallel()
 	url := startContainer(t)
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
@@ -6141,6 +6196,7 @@ func TestMigrateUp_AcceptanceArbitrationUnique_FailsLoudOnPreExistingDuplicates(
 // enforce: a comment-only or no-op touch of the migration would satisfy the
 // scope-completeness presence gate but fails here.
 func TestMigrations_StageSupersededByMergeUnique(t *testing.T) {
+	t.Parallel()
 	url := startContainer(t)
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
@@ -6221,6 +6277,7 @@ func TestMigrations_StageSupersededByMergeUnique(t *testing.T) {
 // absent, seed the two colliding rows (the append-only triggers block UPDATE and
 // DELETE only, so a plain INSERT is permitted), then step UP again.
 func TestMigrateUp_StageSupersededByMergeUnique_FailsLoudOnPreExistingDuplicates(t *testing.T) {
+	t.Parallel()
 	url := startContainer(t)
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
