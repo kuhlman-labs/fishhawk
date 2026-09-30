@@ -1,0 +1,14 @@
+id: scenario:issue-3768/confirm-records-content-hash
+statement: Confirming a workflow's delegation records the resolved-matrix content hash the operator was shown, and the confirmation read echoes that exact hash back.
+verify_hint: POST /v0/repos/{owner}/{name}/delegation/confirm returns 200; GET /v0/repos/{owner}/{name}/delegation/confirmation then returns 200 with that workflow confirmed:true and content_hash equal to the value GET /v0/repos/{owner}/{name}/delegation reported for it.
+steps: 'Mint operator bearers opA-v3768 and opB-v3768 (scopes incl. read:audit, write:approvals) as sha256-hashed api_tokens rows via docker exec fishhawk-postgres psql. Seed plan-gate-parked via POST http://localhost:8090/v0/dev/fixtures and set that newest run''s workflow_spec to spec S1: feature_change autonomy medium with escalation paths [backend/internal/audit/**] max_autonomy low. Handover: A POST /v0/captain/claim {repo:kuhlman-labs/fishhawk}; A POST /v0/captain/offer {repo, successor opB-v3768}; B POST /v0/captain/accept {repo} (captain_assigned seq 68). GET /v0/repos/kuhlman-labs/fishhawk/delegation?source=run_cache -> feature_change content_hash 1ec38f17.... Controls: A POST /v0/repos/kuhlman-labs/fishhawk/delegation/confirm {workflow feature_change, content_hash <that>, source run_cache}; B the same with content_hash ''0''*64. Then B POST .../delegation/confirm with the view hash, then GET .../delegation/confirmation?source=run_cache and GET /v0/captain?repo=kuhlman-labs/fishhawk.'
+assertions:
+    expected: Confirm returns 200; the confirmation read shows the workflow confirmed with content_hash equal to the value GET .../delegation reported.
+    observed_at_record: A -> 403 delegation_not_captain; B with a wrong hash -> 409 delegation_hash_stale; B -> 200 with a delegation_confirmed event (seq 69) carrying content_hash 1ec38f17..., workflow_sha b51168cd..., subject opB-v3768. The confirmation read returns 200 with feature_change status 'confirmed' and confirmation.content_hash == current_content_hash == the view's content_hash; unconfirmed_workflows []. The captain read's delegation_unconfirmed.workflows becomes [].
+    repro_handle: POST /v0/repos/kuhlman-labs/fishhawk/delegation/confirm then GET /v0/repos/kuhlman-labs/fishhawk/delegation/confirmation?source=run_cache
+origin:
+    issue: 3768
+    pr: 0
+    run_id: 05928405-4bda-4b07-a6c9-a47fea607033
+    head_sha: 37b1d4f876db2e57d7f8f2724c3fbc35c9137aee
+    recorded_at: 2026-09-30T03:39:26Z

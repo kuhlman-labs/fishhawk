@@ -832,6 +832,16 @@ type Config struct {
 	// projected from the newest run's cached spec).
 	CaptainStore *captain.Store
 
+	// DelegationConfirmStore is delegation confirmation on handover (E76.5 /
+	// #3768, ADR-083 #3751 rule 7): GET .../delegation/confirmation and the
+	// POST .../delegation/{confirm,lower} verbs, plus the confirmation block
+	// on GET .../delegation. Wired from serve.go next to CaptainStore
+	// (delegationconfirm.NewStore(pool)); nil degrades the three routes to 501
+	// delegation_confirm_unconfigured and OMITS the delegation read's block
+	// rather than reporting a false confirmed. An interface so handler tests
+	// can supply an in-memory fold; production is *delegationconfirm.Store.
+	DelegationConfirmStore DelegationConfirmStore
+
 	// ModelOracle is the snapshot seam the model-id validity layer (#1339)
 	// queries to decide whether a model named in a workflow spec is a real,
 	// currently-served model. Nil is treated as fail-open by every consumer

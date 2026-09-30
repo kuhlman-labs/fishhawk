@@ -1,0 +1,14 @@
+id: scenario:issue-3768/run-and-agent-tokens-refused
+statement: A run-bound token and an agent token are both refused when they try to confirm or propose a lowering, and nothing is recorded for either attempt.
+verify_hint: POST /v0/repos/{owner}/{name}/delegation/confirm and POST .../delegation/lower with a run-bound or agent token return 403 with error code delegation_agent_identity_refused, and GET /v0/repos/{owner}/{name}/delegation/confirmation is unchanged afterwards.
+steps: 'Mint operator bearers A and B plus an agent bearer (subject operator-agent/v3768, write:approvals) as api_tokens rows via docker exec psql. Get a run-bound fhm_ bearer: POST http://localhost:8090/v0/dev/fixtures plan-gate-parked, POST /v0/runs/{run}/signing-key, /v0/dev/sign over ''{}'', POST /v0/runs/{run}/mcp-token. Install S1 (medium tier) on the newest run; handover A claim -> A offer opB-v3768 -> B accept. Snapshot GET .../delegation/confirmation?source=run_cache, GET /v0/audit?limit=500 and GET /v0/dev/forge. For each of the fhm_ and agent tokens: POST /v0/repos/kuhlman-labs/fishhawk/delegation/confirm {workflow, content_hash, source run_cache} and POST .../delegation/lower {workflow, proposed_tier low, reason, source run_cache}, plus the same through MCP tools/call fishhawk_delegation_confirm. Supplementary: an api_tokens row with run-bound subject mcp:run:<run_id> holding write:approvals, and captain B with delegated:true, on both verbs. Re-read the snapshots.'
+assertions:
+    expected: 403 refusal for run-bound and agent tokens on confirm and lower, nothing recorded (hint code delegation_agent_identity_refused).
+    observed_at_record: 'Agent token: REST confirm and lower -> 403 delegation_agent_identity_refused; MCP isError naming the same code. Run-bound fhm_: REST and MCP -> 403 insufficient_scope (write:approvals), because fhm_ tokens can never hold that scope and the scope gate refuses first. Run-bound subject with write:approvals -> 403 delegation_agent_identity_refused; delegated:true -> 403 delegation_agent_identity_refused. The confirmation read is byte-identical afterwards, the audit count is unchanged (68 -> 68) and the forge has 0 issues.'
+    repro_handle: POST /v0/repos/kuhlman-labs/fishhawk/delegation/confirm (Bearer agent / fhm_)
+origin:
+    issue: 3768
+    pr: 0
+    run_id: 05928405-4bda-4b07-a6c9-a47fea607033
+    head_sha: 37b1d4f876db2e57d7f8f2724c3fbc35c9137aee
+    recorded_at: 2026-09-30T03:39:26Z

@@ -153,6 +153,13 @@ spec at a ref, WITHOUT a run. Read-only: it writes nothing, mints NO audit
 entry, and grants no authority. The projection is pure
 (`backend/internal/delegationview`, whose README holds the long-form contract);
 this file only resolves the source, parses, and maps.
+Since E76.5 / #3768 the body also carries, when `DelegationConfirmStore` is
+wired, a per-workflow `confirmation` verdict and a view-level `confirmation`
+summary (`captain`, `seat_sequence`, `unconfirmed_workflows`) — computed after
+the `?workflow` filter and after every hash is stamped. A nil store OMITS both
+(never a false confirmed); a chain-read failure reports
+`confirmation.unavailable`. The read still writes nothing. See § "Delegation
+confirmation".
 
 **The gate is the shared one.** `repoDashPrelude(w, r, false, false)` — so the
 run-repo 503 and the `requestRepoFilter` + `repoVisibleOr403` point-read DENY are
@@ -5832,6 +5839,50 @@ The REST surface over `backend/internal/digest` (ADR-082 #3728 rule 7). The comp
 ### Tests
 
 `digest_test.go` (no DB): route registration, both 501s, anonymous GET, every request-shape guard, and `TestOpenAPI_DigestRoutesDocumented`. `digest_pg_test.go` (pgtest, the production audit wiring — the Postgres repository wrapped by `decisionindex.NewIndexingRepository`): `TestDigestEndToEnd_WatermarkRoundTrip` (a merged run + a waived concern surface citing real chain entries; mark-read lands `digest_marked_read` on the global chain; the re-read drops the read items), plus one test per handler-visible failure mode (beyond-head on both routes, at-or-below no-op by ENTRY COUNT, append failure by stored state, 401/403, captain independence, section selector + bound).
+
+## Delegation confirmation (`delegation_confirm.go`, E76.5 / [#3768](https://github.com/kuhlman-labs/fishhawk/issues/3768))
+
+ADR-083 #3751 rule 7: the incoming captain confirms or lowers each workflow's
+delegation; nothing raises it. Three routes under the delegation read, all
+behind `repoDashPrelude` and the same `source=ref|run_cache` contract
+(`loadDelegationWorkflows` reuses `delegationSpecFromRef` /
+`delegationSpecFromRunCache` and refuses an invalid spec 422):
+
+| Route | Scope | Effect |
+|---|---|---|
+| `GET …/delegation/confirmation` | read (prelude only) | every workflow of the VIEW with its verdict; `unconfirmed_workflows` includes never-confirmed ones |
+| `POST …/delegation/confirm` `{workflow, content_hash, source?, ref?}` | `write:approvals` | appends ONE `delegation_confirmed` binding the exact hash shown |
+| `POST …/delegation/lower` `{workflow, proposed_tier?, proposed_escalation?{paths,max_autonomy}, reason, source?, ref?, parent_epic?, title_vars?, labels?}` | `write:approvals` | files ONE `autonomy:low` chore carrying the proposed `.fishhawk/workflows.yaml` edit, then appends ONE `delegation_lower_proposed` naming it |
+
+**Verdict.** `delegationconfirm.Statuses` is CHAIN-ONLY (`confirmed`,
+`unconfirmed`/`handover`, or `no_captain` when no seat was ever taken);
+`ApplyCurrentHashes` adds `unconfirmed`/`hash_stale` when the recorded hash
+differs from the current `delegationview` hash. Staleness appears only on these
+delegation reads; `GET /v0/captain` stays chain-only. A lower proposal does not
+confirm — the workflow stays unconfirmed until the human-authored edit lands and
+is confirmed.
+
+**Refusals, each its own code** (`delegationConfirmRefusals`, pinned distinct):
+agent / `mcp:run:` / `delegated:true` → 403 `delegation_agent_identity_refused`
+(`delegationconfirm.GuardActor`, the single site, before any spec read); not the
+captain → 403 `delegation_not_captain`; vacant seat → 409
+`delegation_no_captain`; unknown workflow → 404 `workflow_not_found`; hash no
+longer current → 409 `delegation_hash_stale` (nothing appended); lower not
+strictly lower → 400 `delegation_raise_refused`; lowers nothing → 400
+`delegation_nothing_proposed`; empty reason / missing fields → 400
+`validation_failed`; nil store → 501 `delegation_confirm_unconfigured`.
+
+**Serialization.** `delegationconfirm.Store.Append` takes the CAPTAIN RECORD's
+advisory lock (same key as `captain.Store.Apply`) and runs the captain check on
+state read inside that transaction, so an outgoing captain's confirm cannot
+commit after a handover. The fold additionally ignores any entry whose actor was
+not the captain in force at its chain position. The lower path pre-checks the
+captain BEFORE filing (a refused proposal files nothing), files through the
+run-absent operator path (`conventionsLoader` → `resolveRepoScope` →
+`applyAndFileWorkItem`), dials no repository write seam, strips caller
+`autonomy:*` labels in favour of `autonomy:low`, and appends nothing when the
+filing fails. A handover landing between the filing and the append refuses the
+append and names the orphaned `filed_ref` in the error details.
 
 ## Captain record (`captain.go`, E76.2 / [#3765](https://github.com/kuhlman-labs/fishhawk/issues/3765))
 

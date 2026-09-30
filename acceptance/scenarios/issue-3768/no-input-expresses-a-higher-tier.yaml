@@ -1,0 +1,14 @@
+id: scenario:issue-3768/no-input-expresses-a-higher-tier
+statement: 'No API or MCP input can express a higher tier: the action set carries no raise, and a lowering request naming a tier that is not strictly below the workflow''s current tier is refused and files nothing.'
+verify_hint: POST /v0/repos/{owner}/{name}/delegation/lower with proposed_tier above the workflow's current tier returns 400 with error code delegation_raise_refused; the fishhawk_delegation_confirm MCP tool result for an unknown action names only read, confirm and lower as accepted.
+steps: Mint operator bearers A and B (api_tokens via docker exec psql); install S1 (feature_change tier medium) on the newest seeded run; handover A claim -> A offer opB-v3768 -> B accept. Snapshot GET http://localhost:8090/v0/dev/forge and GET /v0/audit. B POST /v0/repos/kuhlman-labs/fishhawk/delegation/lower with proposed_tier high; medium (equal); critical; proposed_escalation {paths [x/**], max_autonomy high}; proposed_tier low plus an escalation max_autonomy medium; an extra field raise:true. POST .../delegation/raise, /escalate, /upgrade. MCP tools/list for the fishhawk_delegation_confirm inputSchema; tools/call with action raise, lower+proposed_tier high, and lower+proposed_tier medium (headers Mcp-Protocol-Version 2026-07-28, Mcp-Method, Mcp-Name; params._meta protocolVersion/clientCapabilities/clientInfo). Re-read the snapshots.
+assertions:
+    expected: A lowering naming a tier not strictly below current -> 400 delegation_raise_refused and nothing filed; the MCP unknown-action result names only read, confirm and lower.
+    observed_at_record: 'REST: high/medium/critical, the escalation max_autonomy high, and the escalation above the proposed tier -> 400 delegation_raise_refused (current_tier medium). raise:true -> 400 validation_failed unknown field "raise". /raise, /escalate, /upgrade -> 404. MCP schema: action enum [read, confirm, lower]; proposed_tier and max_autonomy enums [low, medium]. action raise -> ''enum: raise does not equal any of: [read confirm lower]''; proposed_tier high -> enum error; medium -> HTTP 400 delegation_raise_refused. Forge issues 0 -> 0 and audit 68 -> 68: nothing filed.'
+    repro_handle: POST /v0/repos/kuhlman-labs/fishhawk/delegation/lower {proposed_tier:high} (Bearer sitting captain)
+origin:
+    issue: 3768
+    pr: 0
+    run_id: 05928405-4bda-4b07-a6c9-a47fea607033
+    head_sha: 37b1d4f876db2e57d7f8f2724c3fbc35c9137aee
+    recorded_at: 2026-09-30T03:39:26Z
