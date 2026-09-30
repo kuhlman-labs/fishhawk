@@ -7955,6 +7955,7 @@ components:
       required: [seat_sequence, source, workflows, hash_staleness_reported]
       properties:
         seat_sequence: { type: integer, description: Sequence of the latest seat change; 0 when no captain has ever sat (then nothing is listed). }
+        unconfirmed_since: { type: string, format: date-time, description: "Timestamp of the seat-change entry at `seat_sequence` — when the handover the incoming captain answers occurred. Absent when no captain has ever sat." }
         source: { type: string, enum: [run_cache] }
         workflow_sha: { type: string, description: The cached run's `workflow_sha`. }
         workflows:

@@ -99,12 +99,18 @@ var redactableDetailKeys = map[string]struct{}{
 	"verdict_sequence": {},
 	"installation_id":  {},
 	"filed_issue":      {},
-	"field":            {},
-	"concern_id":       {},
-	"epic_number":      {},
-	"failed_ordinal":   {},
-	"filed":            {},
-	"stage":            {},
+	// filed_ref: the URL of the autonomy:low work item a delegation-lower
+	// filing created (delegation_confirm.go). On the SAME footing as
+	// filed_issue — the identical created.URL work-item identifier our own
+	// filing returned — so a post-filing append-failure 500 carries the item's
+	// reference and a retry does not file a duplicate proposal (E76.5 / #3768).
+	"filed_ref":      {},
+	"field":          {},
+	"concern_id":     {},
+	"epic_number":    {},
+	"failed_ordinal": {},
+	"filed":          {},
+	"stage":          {},
 	// recorded / requested: the durable-row count and batch size a partially
 	// applied batch reports (grooming_dispositions.go's mid-batch
 	// AppendChained failure, #2843). Product-owned integers the handler

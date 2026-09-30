@@ -545,6 +545,11 @@ func TestCaptainDelegationUnconfirmed_FirstHandoverListsEveryWorkflow(t *testing
 		got.InventoryUnavailable != "" || got.Unavailable != "" {
 		t.Errorf("block = %+v, want source run_cache, hash_staleness_reported false, a seat sequence, no unavailability", got)
 	}
+	// The normal (GET /v0/captain) hand-off path delivers unconfirmed_since —
+	// the seat-change timestamp — alongside seat_sequence (fix-up 3).
+	if got.UnconfirmedSince == nil || got.UnconfirmedSince.IsZero() {
+		t.Errorf("unconfirmed_since = %v, want the seat-change timestamp", got.UnconfirmedSince)
+	}
 }
 
 // TestCaptainDelegationUnconfirmed_NoCaptainListsNothing: before any captain
@@ -553,8 +558,8 @@ func TestCaptainDelegationUnconfirmed_NoCaptainListsNothing(t *testing.T) {
 	f := newDelegationConfirmPG(t)
 	f.seedSpecAt(t, confirmSpecA, time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC))
 	got := captainUnconfirmed(t, f)
-	if len(got.Workflows) != 0 || got.SeatSequence != 0 {
-		t.Errorf("block = %+v, want no workflows and seat_sequence 0", got)
+	if len(got.Workflows) != 0 || got.SeatSequence != 0 || got.UnconfirmedSince != nil {
+		t.Errorf("block = %+v, want no workflows, seat_sequence 0 and no unconfirmed_since", got)
 	}
 }
 
@@ -609,6 +614,13 @@ func TestCaptainDelegationUnconfirmed_AcceptResponseListsEveryWorkflow(t *testin
 	}
 	if resp.DelegationUnconfirmed != nil && resp.DelegationUnconfirmed.SeatSequence != resp.Event.Sequence {
 		t.Errorf("seat_sequence = %d, want the accept's own sequence %d", resp.DelegationUnconfirmed.SeatSequence, resp.Event.Sequence)
+	}
+	// unconfirmed_since is the timestamp of the handover that opened this seat —
+	// the accept's OWN entry (fix-up 3). Counterfactual: dropping the builder's
+	// UnconfirmedSince assignment leaves it nil and this fails.
+	if resp.DelegationUnconfirmed == nil || resp.DelegationUnconfirmed.UnconfirmedSince == nil ||
+		!resp.DelegationUnconfirmed.UnconfirmedSince.Equal(resp.Event.At) {
+		t.Errorf("unconfirmed_since = %v, want the accept event's timestamp %v", resp.DelegationUnconfirmed.UnconfirmedSince, resp.Event.At)
 	}
 }
 

@@ -144,9 +144,11 @@ WHEN: you are the incoming (or sitting) HUMAN captain of a repository and must
 confirm or lower each workflow's delegation after a handover (ADR-083 rule 7),
 or anyone wants to know which workflows are still unconfirmed.
 
-ELIGIBILITY: action=read needs read:audit and writes nothing. confirm and lower
-need write:approvals, must be made by the SITTING captain, and are REFUSED for
-agent, run-bound and delegated identities (delegation_agent_identity_refused).
+ELIGIBILITY: action=read is authenticated and repo-visible only — no scope
+beyond that (the fishhawk_delegation precedent) — and writes nothing. confirm
+and lower need write:approvals, must be made by the SITTING captain, and are
+REFUSED for agent, run-bound and delegated identities
+(delegation_agent_identity_refused).
 
 Actions (the set is closed; there is NO raise action):
   - read (default): every workflow of the delegation view at source/ref with

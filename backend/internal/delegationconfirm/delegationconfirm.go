@@ -193,6 +193,10 @@ type State struct {
 	// SeatSequence is the sequence of the latest seat change
 	// (captain_assigned or captain_claimed); 0 means no captain has ever sat.
 	SeatSequence int64
+	// SeatAt is the timestamp of the entry at SeatSequence — when the current
+	// seat opened (the handover the incoming captain answers). Zero when no
+	// captain has ever sat.
+	SeatAt time.Time
 	// Confirmations and Lowers hold, per workflow, the latest COUNTED entry
 	// since SeatSequence.
 	Confirmations map[string]Confirmation
@@ -234,6 +238,7 @@ func Derive(repo string, captainEntries, confirmEntries []ChainEntry) State {
 				if cs.Current.AssignedSequence == e.Sequence {
 					// A seat change: every earlier confirmation is void.
 					st.SeatSequence = e.Sequence
+					st.SeatAt = e.Timestamp
 					st.Confirmations = map[string]Confirmation{}
 					st.Lowers = map[string]LowerProposal{}
 				}

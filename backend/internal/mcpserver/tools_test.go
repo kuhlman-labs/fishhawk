@@ -3348,8 +3348,9 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	// thin wrapper over GET .../delegation/confirmation and POST
 	// .../delegation/{confirm,lower}. WHEN: an incoming human captain confirms
 	// or lowers each workflow's delegation after a handover. ELIGIBILITY: read
-	// needs read:audit; confirm/lower need write:approvals and the sitting
-	// captain, agents refused by the backend. Its action set is CLOSED at
+	// is authenticated and repo-visible only (no scope beyond that, the
+	// fishhawk_delegation precedent); confirm/lower need write:approvals and the
+	// sitting captain, agents refused by the backend. Its action set is CLOSED at
 	// {read, confirm, lower} — there is no raise action — taking the total
 	// 63 -> 64.
 	const wantToolCount = 64

@@ -191,7 +191,11 @@ func (s *Server) withDelegationConfirmation(r *http.Request, repo string, v dele
 	}
 	snap, err := s.cfg.DelegationConfirmStore.Read(r.Context(), identityAccountID(r.Context()), repo)
 	if err != nil {
-		resp.Confirmation = &delegationConfirmationSummary{UnconfirmedWorkflows: []string{}, Unavailable: err.Error()}
+		// A fixed reason, not err.Error(): the block rides a 200 body, so a raw
+		// chain-read error (which can carry connection/host/DSN detail) must not
+		// reach a repo-visible caller — the captain surface's posture (captain.go
+		// captainDelegationUnconfirmed).
+		resp.Confirmation = &delegationConfirmationSummary{UnconfirmedWorkflows: []string{}, Unavailable: captainDelegationChainReadFailed}
 		return resp
 	}
 	statuses := delegationStatuses(snap.State, ws)

@@ -90,6 +90,13 @@ type memConfirmStore struct {
 	captain []delegationconfirm.ChainEntry
 	confirm []delegationconfirm.ChainEntry
 	readErr error
+	// appendErr, when set, makes Append fail with this error AFTER the caller
+	// has filed (the generic storage-failure-after-filing path).
+	appendErr error
+	// onAppend, when set, runs at the TOP of Append (before its lock) — a seam
+	// to seat a new captain between the caller's filing and the append, driving
+	// the handover-race refusal.
+	onAppend func()
 }
 
 func (m *memConfirmStore) seat(t *testing.T, repo, subject string) {
@@ -123,6 +130,12 @@ func (m *memConfirmStore) Read(_ context.Context, _ *uuid.UUID, repo string) (*d
 }
 
 func (m *memConfirmStore) Append(_ context.Context, p delegationconfirm.AppendParams, decide func(delegationconfirm.State) (delegationconfirm.Event, error)) (*delegationconfirm.Applied, error) {
+	if m.onAppend != nil {
+		m.onAppend()
+	}
+	if m.appendErr != nil {
+		return nil, m.appendErr
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	ev, err := decide(delegationconfirm.Derive(p.Repo, m.captain, m.confirm))
@@ -445,10 +458,23 @@ func TestDelegationConfirm_UnconfiguredIs501(t *testing.T) {
 // TestDelegationRead_StoreReadFailureReportsUnavailable: a failed chain read
 // reports confirmation.unavailable and NO per-workflow verdict.
 func TestDelegationRead_StoreReadFailureReportsUnavailable(t *testing.T) {
-	s := confirmServer(confirmSpecA, &memConfirmStore{readErr: errors.New("db down")})
-	dr := readDelegationBody(t, s)
-	if dr.Confirmation == nil || dr.Confirmation.Unavailable == "" {
-		t.Fatalf("summary = %+v, want unavailable", dr.Confirmation)
+	// The chain read fails with an error carrying DSN-shaped detail; the 200
+	// body's fixed reason must NOT leak it (fix-up 2). Counterfactual: reverting
+	// delegation_view.go to err.Error() puts "secret-dsn" in the body.
+	s := confirmServer(confirmSpecA, &memConfirmStore{readErr: errors.New("dial tcp secret-dsn:5432: connection refused")})
+	w := serveDelegationConfirm(t, s, "", "", "github:reader")
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET delegation = %d: %s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "secret-dsn") {
+		t.Fatalf("200 body leaked the raw chain-read error; body %s", w.Body.String())
+	}
+	var dr delegationResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &dr); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if dr.Confirmation == nil || dr.Confirmation.Unavailable != captainDelegationChainReadFailed {
+		t.Fatalf("summary = %+v, want unavailable=%q", dr.Confirmation, captainDelegationChainReadFailed)
 	}
 	for _, wf := range dr.Workflows {
 		if wf.Confirmation != nil {
@@ -596,6 +622,67 @@ func TestLower_FilingFailureAppendsNothing(t *testing.T) {
 	}
 	if n := store.count(delegationconfirm.CategoryDelegationLowerProposed); n != 0 {
 		t.Fatalf("entries = %d, want 0 after a failed filing", n)
+	}
+}
+
+// filedRefFromError returns details.filed_ref from an error envelope body.
+func filedRefFromError(t *testing.T, w *httptest.ResponseRecorder) string {
+	t.Helper()
+	var env errorEnvelope
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode error envelope: %v; body %s", err, w.Body.String())
+	}
+	ref, _ := env.Error.Details["filed_ref"].(string)
+	return ref
+}
+
+// TestLower_HandoverRaceRefusesWithFiledRef (fix-up 1a): the work item is
+// filed, a NEW captain is seated before the delegation_lower_proposed append,
+// so ProposeLower's under-lock captain re-check refuses (ErrNotCaptain). The
+// 403 must name the orphaned filed_ref so a retry does not file a duplicate,
+// and nothing is appended.
+func TestLower_HandoverRaceRefusesWithFiledRef(t *testing.T) {
+	fp := &fakeWorkProvider{}
+	registerFakeProvider(t, fp)
+	store := &memConfirmStore{}
+	store.seat(t, "acme/app", confirmCaptain)
+	store.onAppend = func() { store.seat(t, "acme/app", "github:"+uuid.NewString()) }
+	s := confirmServer(confirmSpecA, store)
+	w := serveDelegationConfirm(t, s, "lower", lowerBody(t, map[string]any{"workflow": "ship", "proposed_tier": "low", "reason": "r"}), confirmCaptain)
+	wantCode(t, w, http.StatusForbidden, "delegation_not_captain")
+	if !fp.called {
+		t.Fatal("the work item was not filed before the append race")
+	}
+	if ref := filedRefFromError(t, w); ref == "" {
+		t.Fatalf("403 body carries no filed_ref for the orphaned item; body %s", w.Body.String())
+	}
+	if n := store.count(delegationconfirm.CategoryDelegationLowerProposed); n != 0 {
+		t.Fatalf("entries = %d, want 0 after the refused append", n)
+	}
+}
+
+// TestLower_AppendStorageFailureCarriesFiledRef (fix-up 1b): the work item is
+// filed, then the append fails with a GENERIC storage error. The 500 body must
+// still carry filed_ref — writeDelegationConfirmError's generic branch must
+// preserve the details, and errors.go must allow-list filed_ref past the 5xx
+// redactor — so a retry does not file a duplicate. Counterfactual: dropping the
+// details in the generic branch (or filed_ref from the allow-list) reddens this.
+func TestLower_AppendStorageFailureCarriesFiledRef(t *testing.T) {
+	fp := &fakeWorkProvider{}
+	registerFakeProvider(t, fp)
+	store := &memConfirmStore{appendErr: errors.New("tx rolled back: connect secret-dsn refused")}
+	store.seat(t, "acme/app", confirmCaptain)
+	s := confirmServer(confirmSpecA, store)
+	w := serveDelegationConfirm(t, s, "lower", lowerBody(t, map[string]any{"workflow": "ship", "proposed_tier": "low", "reason": "r"}), confirmCaptain)
+	wantCode(t, w, http.StatusInternalServerError, "internal_error")
+	if !fp.called {
+		t.Fatal("the work item was not filed before the append failure")
+	}
+	if ref := filedRefFromError(t, w); ref == "" {
+		t.Fatalf("500 body carries no filed_ref for the orphaned item; body %s", w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "secret-dsn") {
+		t.Errorf("500 body leaked the raw storage error; body %s", w.Body.String())
 	}
 }
 

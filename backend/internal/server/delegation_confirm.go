@@ -105,8 +105,18 @@ func (s *Server) writeDelegationConfirmError(w http.ResponseWriter, r *http.Requ
 				return
 			}
 		}
+		// Preserve the caller's details (a post-filing append failure carries
+		// filed_ref, so a retry does not file a duplicate proposal) and route the
+		// raw cause through internalCauseKey — the sanctioned non-client channel,
+		// so writeError still joins it to the error_ref log record without leaking
+		// it in the 5xx body.
+		merged := make(map[string]any, len(details)+1)
+		for k, v := range details {
+			merged[k] = v
+		}
+		merged[internalCauseKey] = err.Error()
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-			"delegation confirmation failed", map[string]any{"error": err.Error()})
+			"delegation confirmation failed", merged)
 		return
 	}
 	s.writeError(w, r, ref.status, ref.code, err.Error(), details)

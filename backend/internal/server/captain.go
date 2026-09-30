@@ -229,13 +229,17 @@ const (
 // could not be read (the list is then empty and must not be read as
 // confirmed); Unavailable names a chain read failure.
 type captainDelegationUnconfirmed struct {
-	SeatSequence          int64    `json:"seat_sequence"`
-	Source                string   `json:"source"`
-	WorkflowSHA           string   `json:"workflow_sha,omitempty"`
-	Workflows             []string `json:"workflows"`
-	HashStalenessReported bool     `json:"hash_staleness_reported"`
-	InventoryUnavailable  string   `json:"inventory_unavailable,omitempty"`
-	Unavailable           string   `json:"unavailable,omitempty"`
+	SeatSequence int64 `json:"seat_sequence"`
+	// UnconfirmedSince is the timestamp of the seat-change entry at
+	// SeatSequence — when the handover the incoming captain answers occurred.
+	// Absent (null) when no captain has ever sat.
+	UnconfirmedSince      *time.Time `json:"unconfirmed_since,omitempty"`
+	Source                string     `json:"source"`
+	WorkflowSHA           string     `json:"workflow_sha,omitempty"`
+	Workflows             []string   `json:"workflows"`
+	HashStalenessReported bool       `json:"hash_staleness_reported"`
+	InventoryUnavailable  string     `json:"inventory_unavailable,omitempty"`
+	Unavailable           string     `json:"unavailable,omitempty"`
 }
 
 // captainDelegationUnconfirmed builds the block for repo, or nil when the
@@ -253,6 +257,10 @@ func (s *Server) captainDelegationUnconfirmed(ctx context.Context, repo string) 
 		return out
 	}
 	out.SeatSequence = snap.State.SeatSequence
+	if !snap.State.SeatAt.IsZero() {
+		at := snap.State.SeatAt
+		out.UnconfirmedSince = &at
+	}
 	ids, sha, reason := s.captainDelegationInventory(ctx, repo)
 	if reason != "" {
 		out.InventoryUnavailable = reason
