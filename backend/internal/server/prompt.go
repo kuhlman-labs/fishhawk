@@ -21,6 +21,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/bundle"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/crewmessage"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/fixupobligation"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
@@ -824,6 +825,103 @@ func (s *Server) resolveApprovedScopeAmendments(ctx context.Context, runID, stag
 	return out
 }
 
+// resolveAnsweredCrewConsults returns the plan stage's OWN answered consults
+// (E77.5 / #3739) as prompt crew messages — each consult followed by its
+// threaded answer — so a resumed or retried attempt of the stage sees its
+// prior answers inside writeUntrustedCrewMessages' existing quarantine
+// envelope instead of re-asking, exactly as mergeApprovedScopeAmendments folds
+// decided amendments back in. A retry re-opens the SAME stage row
+// (run.RetryStage bumps self_retry_count in place), so the stage id filter
+// spans every attempt.
+//
+// Selection: a consult is a response_required `consult` THREAD ROOT whose
+// crew_message_sent chain entry is stamped with stageID (the stamping the
+// per-stage budget counts, crewConsultBudgetUsed); it folds in only when its
+// derived row is `accepted` AND a threaded reply exists. An open, expired or
+// rejected consult is not an answer and renders nothing — the plan prompt's
+// consult section already tells the agent an expiry is not a refusal.
+//
+// Best-effort, matching resolveApprovedScopeAmendments' posture: an
+// unconfigured mailbox/audit repo or a list error logs and returns nil, and a
+// single consult whose documents cannot be resolved is skipped with a WARN,
+// rather than failing the prompt build.
+func (s *Server) resolveAnsweredCrewConsults(ctx context.Context, runID, stageID uuid.UUID) []prompt.CrewMessage {
+	if s.cfg.CrewMailbox == nil || s.cfg.AuditRepo == nil {
+		return nil
+	}
+	warn := func(msg string, err error, attrs ...slog.Attr) {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, msg, append([]slog.Attr{
+			slog.String("run_id", runID.String()), slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()),
+		}, attrs...)...)
+	}
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, crewmessage.CategorySent)
+	if err != nil {
+		warn("prompt: list crew consults failed", err)
+		return nil
+	}
+	var roots []int64
+	for _, e := range entries {
+		if e.StageID == nil || *e.StageID != stageID {
+			continue
+		}
+		var p struct {
+			Message struct {
+				Type             crewmessage.MessageType `json:"type"`
+				ResponseRequired bool                    `json:"response_required"`
+			} `json:"message"`
+			ThreadRootSequence *int64 `json:"thread_root_sequence"`
+		}
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			continue
+		}
+		if p.ThreadRootSequence == nil && p.Message.Type == crewmessage.TypeConsult && p.Message.ResponseRequired {
+			roots = append(roots, e.Sequence)
+		}
+	}
+	if len(roots) == 0 {
+		return nil
+	}
+	rows, err := s.cfg.CrewMailbox.Store().ListByAnchor(ctx, crewmessage.AnchorFilter{RunID: &runID})
+	if err != nil {
+		warn("prompt: list crew messages failed", err)
+		return nil
+	}
+	bySeq := make(map[int64]crewmessage.Row, len(rows))
+	for _, r := range rows {
+		bySeq[r.SentSequence] = r
+	}
+	var out []prompt.CrewMessage
+	for _, seq := range roots {
+		row, ok := bySeq[seq]
+		if !ok || row.State != crewmessage.StateAccepted {
+			continue
+		}
+		var reply *crewmessage.Row
+		for i := range rows {
+			if rows[i].ThreadRootSequence == row.ThreadRootSequence && rows[i].SentSequence > row.SentSequence {
+				reply = &rows[i]
+				break
+			}
+		}
+		if reply == nil {
+			continue
+		}
+		question, err := s.crewSentDocument(ctx, row)
+		if err != nil {
+			warn("prompt: resolve crew consult failed", err, slog.Int64("sent_sequence", seq))
+			continue
+		}
+		answer, err := s.crewSentDocument(ctx, *reply)
+		if err != nil {
+			warn("prompt: resolve crew consult answer failed", err, slog.Int64("sent_sequence", seq))
+			continue
+		}
+		out = append(out, crewMessageForPrompt(question), crewMessageForPrompt(answer))
+	}
+	return out
+}
+
 // coupledTestSiblings derives the stem-sibling test file for each owned
 // source file in a scope slice: for every entry whose normalized path ends in
 // `.go` but NOT `_test.go` and whose operation is create or modify (a deleted
@@ -1435,6 +1533,12 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		// handlers so the signed prompt and the render preview stay byte-identical.
 		trigger.GeneratedSurfaceRelations = generatedSurfaceRelationsForPrompt()
 		trigger.GeneratedSurfaceRestoration = s.loadGeneratedSurfaceRestoration(r.Context(), runRow.ID, stage.ID)
+		// Crew consult fold-in (E77.5 / #3739): the stage's OWN answered
+		// consults, so a resumed or retried attempt sees its prior answers
+		// (inside the crew quarantine envelope) instead of re-asking. Set on
+		// BOTH prompt handlers so the signed prompt and the render preview
+		// stay byte-identical.
+		trigger.CrewMessages = s.resolveAnsweredCrewConsults(r.Context(), runRow.ID, stage.ID)
 		if runRow.TriggerRef != nil {
 			// #2680: thread BOTH the feedback text and the rejecting run's id
 			// so buildPlan's truncation marker can name a concrete retrieval
@@ -2109,6 +2213,12 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		// handlers so the signed prompt and the render preview stay byte-identical.
 		trigger.GeneratedSurfaceRelations = generatedSurfaceRelationsForPrompt()
 		trigger.GeneratedSurfaceRestoration = s.loadGeneratedSurfaceRestoration(r.Context(), runRow.ID, stage.ID)
+		// Crew consult fold-in (E77.5 / #3739): the stage's OWN answered
+		// consults, so a resumed or retried attempt sees its prior answers
+		// (inside the crew quarantine envelope) instead of re-asking. Set on
+		// BOTH prompt handlers so the signed prompt and the render preview
+		// stay byte-identical.
+		trigger.CrewMessages = s.resolveAnsweredCrewConsults(r.Context(), runRow.ID, stage.ID)
 		if runRow.TriggerRef != nil {
 			// #2680: thread BOTH the feedback text and the rejecting run's id
 			// so buildPlan's truncation marker can name a concrete retrieval
