@@ -8,6 +8,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/delegationconfirm"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/delegationview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
@@ -47,10 +48,37 @@ const (
 	delegationSourceRunCache = "run_cache"
 )
 
-// delegationResponse is the GET body: the pure view plus nothing else. The
-// projection types are the wire types (delegationview), so a json-tag change
-// there is a deliberate API change rather than an accident of two mirrors.
-type delegationResponse = delegationview.View
+// delegationResponse is the GET body: the pure view, plus — when the
+// delegation-confirmation store is wired (E76.5 / #3768) — a per-workflow
+// `confirmation` block and a view-level `confirmation` summary. The
+// projection types are the wire types (delegationview), embedded so a
+// json-tag change there is a deliberate API change rather than an accident
+// of two mirrors. The outer Workflows field shadows View.Workflows by
+// encoding/json's shallowest-field rule; View.Workflows is left empty.
+type delegationResponse struct {
+	delegationview.View
+	Workflows    []delegationWorkflowResponse   `json:"workflows"`
+	Confirmation *delegationConfirmationSummary `json:"confirmation,omitempty"`
+}
+
+// delegationWorkflowResponse is one workflow entry with its confirmation
+// verdict. Confirmation is ABSENT (never a false confirmed) when the store is
+// not wired or could not be read.
+type delegationWorkflowResponse struct {
+	delegationview.WorkflowDelegation
+	Confirmation *delegationconfirm.WorkflowStatus `json:"confirmation,omitempty"`
+}
+
+// delegationConfirmationSummary is the view-level confirmation block:
+// the captain in force and the retained workflows still awaiting
+// confirmation (never-confirmed ones included). Unavailable carries the
+// read failure instead when the chain could not be read.
+type delegationConfirmationSummary struct {
+	Captain              *string  `json:"captain"`
+	SeatSequence         int64    `json:"seat_sequence"`
+	UnconfirmedWorkflows []string `json:"unconfirmed_workflows"`
+	Unavailable          string   `json:"unavailable,omitempty"`
+}
 
 // handleGetRepoDelegation implements GET /v0/repos/{owner}/{name}/delegation.
 //
@@ -95,7 +123,7 @@ func (s *Server) handleGetRepoDelegation(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	out := delegationResponse{
+	out := delegationview.View{
 		Repo: repo, Source: source, Ref: ref, WorkflowSHA: workflowSHA,
 		Workflows: []delegationview.WorkflowDelegation{},
 	}
@@ -142,7 +170,44 @@ func (s *Server) handleGetRepoDelegation(w http.ResponseWriter, r *http.Request)
 		out.Workflows = kept
 	}
 	out.ContentHash = delegationview.HashWorkflows(out.Workflows)
-	s.writeJSON(w, r, http.StatusOK, out)
+	s.writeJSON(w, r, http.StatusOK, s.withDelegationConfirmation(r, repo, out))
+}
+
+// withDelegationConfirmation wraps the view with the confirmation blocks,
+// computed AFTER the ?workflow filter and after every hash is stamped, so the
+// verdict's hash half compares against the hashes this very response reports.
+// A nil store leaves every block absent; a read failure reports
+// confirmation.unavailable and leaves the per-workflow blocks absent.
+func (s *Server) withDelegationConfirmation(r *http.Request, repo string, v delegationview.View) delegationResponse {
+	resp := delegationResponse{Workflows: make([]delegationWorkflowResponse, 0, len(v.Workflows))}
+	for _, wf := range v.Workflows {
+		resp.Workflows = append(resp.Workflows, delegationWorkflowResponse{WorkflowDelegation: wf})
+	}
+	ws := v.Workflows
+	v.Workflows = nil
+	resp.View = v
+	if s.cfg.DelegationConfirmStore == nil {
+		return resp
+	}
+	snap, err := s.cfg.DelegationConfirmStore.Read(r.Context(), identityAccountID(r.Context()), repo)
+	if err != nil {
+		// A fixed reason, not err.Error(): the block rides a 200 body, so a raw
+		// chain-read error (which can carry connection/host/DSN detail) must not
+		// reach a repo-visible caller — the captain surface's posture (captain.go
+		// captainDelegationUnconfirmed).
+		resp.Confirmation = &delegationConfirmationSummary{UnconfirmedWorkflows: []string{}, Unavailable: captainDelegationChainReadFailed}
+		return resp
+	}
+	statuses := delegationStatuses(snap.State, ws)
+	for i := range resp.Workflows {
+		st := statuses[i]
+		resp.Workflows[i].Confirmation = &st
+	}
+	resp.Confirmation = &delegationConfirmationSummary{
+		Captain: captainPtr(snap.State), SeatSequence: snap.State.SeatSequence,
+		UnconfirmedWorkflows: delegationconfirm.Unconfirmed(statuses),
+	}
+	return resp
 }
 
 // delegationSpecFromRef fetches the spec through the forge Contents API.

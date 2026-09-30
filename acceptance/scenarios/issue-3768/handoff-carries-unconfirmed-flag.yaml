@@ -1,0 +1,14 @@
+id: scenario:issue-3768/handoff-carries-unconfirmed-flag
+statement: After a handover, the captain hand-off surface reports each workflow whose delegation the incoming captain has not yet confirmed, together with when the handover happened.
+verify_hint: GET /v0/captain?repo={owner}/{name} returns 200 and its body carries a delegation_unconfirmed block naming the workflow and an unconfirmed_since timestamp; POST /v0/captain/accept's 200 body carries the same block.
+steps: Mint operator bearers opA-v3768 and opB-v3768 (api_tokens rows via docker exec psql). Seed plan-gate-parked via POST http://localhost:8090/v0/dev/fixtures and set its workflow_spec to S1 (feature_change autonomy medium). GET /v0/repos/kuhlman-labs/fishhawk/delegation/confirmation?source=run_cache. A POST /v0/captain/claim {repo}; A POST /v0/captain/offer {repo, successor opB-v3768}; B POST /v0/captain/accept {repo}; GET /v0/captain?repo=kuhlman-labs/fishhawk (bearer A); GET .../delegation/confirmation?source=run_cache.
+assertions:
+    expected: GET /v0/captain and POST /v0/captain/accept bodies carry delegation_unconfirmed naming the workflow and an unconfirmed_since timestamp.
+    observed_at_record: 'Before any captain: status no_captain. The accept 200 body carries delegation_unconfirmed {seat_sequence 68, unconfirmed_since 2026-09-29T23:31:18.570016-04:00 (= captain_assigned at), workflows [feature_change], hash_staleness_reported false}. GET /v0/captain 200 carries the same block. The confirmation read shows feature_change unconfirmed with reason handover. With no confirmation entries, every spec workflow is listed unconfirmed (approval condition 1). After B''s confirm, the block''s workflows become [].'
+    repro_handle: POST /v0/captain/accept {repo} then GET /v0/captain?repo=kuhlman-labs/fishhawk
+origin:
+    issue: 3768
+    pr: 0
+    run_id: 05928405-4bda-4b07-a6c9-a47fea607033
+    head_sha: 37b1d4f876db2e57d7f8f2724c3fbc35c9137aee
+    recorded_at: 2026-09-30T03:39:26Z

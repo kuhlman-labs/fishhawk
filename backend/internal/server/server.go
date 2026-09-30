@@ -841,6 +841,15 @@ type Config struct {
 	// nil (the documented partial rollback) answers every crew-message route
 	// 503 crew_message_unconfigured and changes no other surface.
 	CrewMailbox *crewmessage.Mailbox
+	// DelegationConfirmStore is delegation confirmation on handover (E76.5 /
+	// #3768, ADR-083 #3751 rule 7): GET .../delegation/confirmation and the
+	// POST .../delegation/{confirm,lower} verbs, plus the confirmation block
+	// on GET .../delegation. Wired from serve.go next to CaptainStore
+	// (delegationconfirm.NewStore(pool)); nil degrades the three routes to 501
+	// delegation_confirm_unconfigured and OMITS the delegation read's block
+	// rather than reporting a false confirmed. An interface so handler tests
+	// can supply an in-memory fold; production is *delegationconfirm.Store.
+	DelegationConfirmStore DelegationConfirmStore
 
 	// ModelOracle is the snapshot seam the model-id validity layer (#1339)
 	// queries to decide whether a model named in a workflow spec is a real,

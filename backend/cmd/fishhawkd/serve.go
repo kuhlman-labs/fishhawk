@@ -43,6 +43,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/crewmessage"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/decisionindex"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/delegationconfirm"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/deployreconciler"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/devfixtures"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/digest"
@@ -2429,6 +2430,9 @@ func runServe(args []string, logSink io.Writer) int {
 		// Consequences name: every crew-message endpoint then answers 503
 		// crew_message_unconfigured and no other surface changes.
 		cfg.CrewMailbox = crewmessage.NewMailbox(pool, crewmessage.DefaultRoundBound)
+		// E76.5 / #3768 delegation confirmation on handover: chain-only like
+		// the captain record, and its Append takes the captain record's lock.
+		cfg.DelegationConfirmStore = delegationconfirm.NewStore(pool)
 		cfg.ApprovalRepo = approval.NewPostgresRepository(pool)
 		cfg.ArtifactRepo = artifact.NewPostgresRepository(pool)
 		// GET /v0/precedent's read surface (E75.3 / #3731). The SAME store the

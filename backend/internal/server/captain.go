@@ -24,6 +24,12 @@ package server
 // scope, so no token loses access). A nil CaptainStore degrades all six to
 // 501 captain_unconfigured. Nothing here is read by approval quorum or
 // eligibility (ADR-083 rule 1).
+//
+// The GET body and every verb's 200 body carry a delegation_unconfirmed
+// block (E76.5 / #3768, ADR-083 rule 7) when the delegation-confirmation
+// store is wired: the workflows with no counted confirmation since the latest
+// seat change. It is CHAIN-ONLY — it never reports hash staleness, which only
+// the delegation-confirmation reads do (captainDelegationUnconfirmed).
 
 import (
 	"bytes"
@@ -37,6 +43,8 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/captain"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/delegationconfirm"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/delegationview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
@@ -175,6 +183,9 @@ type captainResponse struct {
 	History        []captainHistoryItem   `json:"history"`
 	HistoryTotal   int                    `json:"history_total"`
 	SkippedEntries int                    `json:"skipped_entries"`
+	// DelegationUnconfirmed is absent when the delegation-confirmation store
+	// is not wired (never an empty list that would read as "all confirmed").
+	DelegationUnconfirmed *captainDelegationUnconfirmed `json:"delegation_unconfirmed,omitempty"`
 }
 
 // captainVerbResponse is every POST verb's 200 body: the recorded event and
@@ -184,6 +195,108 @@ type captainVerbResponse struct {
 	Event        captainHistoryItem     `json:"event"`
 	Captain      *captainRecordResponse `json:"captain"`
 	PendingOffer *captainOfferResponse  `json:"pending_offer"`
+	// DelegationUnconfirmed is re-derived AFTER the verb's entry commits, so
+	// an accept's response already lists every workflow the new captain has
+	// yet to confirm.
+	DelegationUnconfirmed *captainDelegationUnconfirmed `json:"delegation_unconfirmed,omitempty"`
+}
+
+// The inventory_unavailable reasons of captainDelegationUnconfirmed. Each
+// names why the workflow SET could not be read, so an empty workflows list is
+// never mistaken for "every workflow is confirmed".
+const (
+	captainDelegationNoRunRepository = "no_run_repository"
+	captainDelegationListRunsFailed  = "list_runs_failed"
+	captainDelegationNoCachedSpec    = "no_cached_spec"
+	captainDelegationSpecUnparseable = "spec_unparseable"
+	captainDelegationChainReadFailed = "chain_read_failed"
+)
+
+// captainDelegationUnconfirmed is the hand-off surface's delegation block
+// (E76.5 / #3768, ADR-083 rule 7).
+//
+// Workflows lists every workflow with NO counted delegation_confirmed since
+// the latest seat change (captain_assigned or captain_claimed), never-
+// confirmed ones included. The verdict is CHAIN-ONLY (delegationconfirm.
+// Derive + Statuses): HashStalenessReported is always false, and a workflow's
+// ABSENCE here is not proof its confirmation is still hash-current — only
+// GET .../delegation/confirmation and GET .../delegation report hash_stale.
+//
+// The workflow SET is the delegation view's, projected from the spec cached
+// on the repository's NEWEST run (Source is always run_cache): the hand-off
+// surface never fetches the spec live from the forge, the
+// classifyRepoPredicate precedent. InventoryUnavailable names why the set
+// could not be read (the list is then empty and must not be read as
+// confirmed); Unavailable names a chain read failure.
+type captainDelegationUnconfirmed struct {
+	SeatSequence int64 `json:"seat_sequence"`
+	// UnconfirmedSince is the timestamp of the seat-change entry at
+	// SeatSequence — when the handover the incoming captain answers occurred.
+	// Absent (null) when no captain has ever sat.
+	UnconfirmedSince      *time.Time `json:"unconfirmed_since,omitempty"`
+	Source                string     `json:"source"`
+	WorkflowSHA           string     `json:"workflow_sha,omitempty"`
+	Workflows             []string   `json:"workflows"`
+	HashStalenessReported bool       `json:"hash_staleness_reported"`
+	InventoryUnavailable  string     `json:"inventory_unavailable,omitempty"`
+	Unavailable           string     `json:"unavailable,omitempty"`
+}
+
+// captainDelegationUnconfirmed builds the block for repo, or nil when the
+// delegation-confirmation store is not wired. It never fails the caller: a
+// chain or inventory read failure is reported IN the block.
+func (s *Server) captainDelegationUnconfirmed(ctx context.Context, repo string) *captainDelegationUnconfirmed {
+	if s.cfg.DelegationConfirmStore == nil {
+		return nil
+	}
+	out := &captainDelegationUnconfirmed{Source: delegationSourceRunCache, Workflows: []string{}}
+	snap, err := s.cfg.DelegationConfirmStore.Read(ctx, identityAccountID(ctx), repo)
+	if err != nil {
+		// A fixed reason, not err.Error(): the block rides a 200 body.
+		out.Unavailable = captainDelegationChainReadFailed
+		return out
+	}
+	out.SeatSequence = snap.State.SeatSequence
+	if !snap.State.SeatAt.IsZero() {
+		at := snap.State.SeatAt
+		out.UnconfirmedSince = &at
+	}
+	ids, sha, reason := s.captainDelegationInventory(ctx, repo)
+	if reason != "" {
+		out.InventoryUnavailable = reason
+		return out
+	}
+	out.WorkflowSHA = sha
+	out.Workflows = delegationconfirm.Unconfirmed(delegationconfirm.Statuses(snap.State, ids))
+	return out
+}
+
+// captainDelegationInventory returns the delegation view's workflow ids from
+// the spec cached on repo's newest run, or a non-empty reason when that set
+// cannot be read. It reads no forge.
+func (s *Server) captainDelegationInventory(ctx context.Context, repo string) ([]string, string, string) {
+	if s.cfg.RunRepo == nil {
+		return nil, "", captainDelegationNoRunRepository
+	}
+	rows, err := s.cfg.RunRepo.ListRuns(ctx, run.ListRunsFilter{
+		Repo: repo, AccountID: IdentityFrom(ctx).AccountID, Limit: 1,
+	})
+	if err != nil {
+		return nil, "", captainDelegationListRunsFailed
+	}
+	if len(rows) == 0 || len(bytes.TrimSpace(rows[0].WorkflowSpec)) == 0 {
+		return nil, "", captainDelegationNoCachedSpec
+	}
+	parsed, err := spec.ParseBytes(rows[0].WorkflowSpec)
+	if err != nil {
+		return nil, "", captainDelegationSpecUnparseable
+	}
+	projected := delegationview.Project(parsed)
+	ids := make([]string, 0, len(projected))
+	for _, wf := range projected {
+		ids = append(ids, wf.ID)
+	}
+	return ids, rows[0].WorkflowSHA, ""
 }
 
 // renderCaptainRecord projects a derived Record. claim_verified is the
@@ -267,7 +380,9 @@ func (s *Server) handleGetCaptain(w http.ResponseWriter, r *http.Request) {
 		s.writeCaptainError(w, r, err, nil)
 		return
 	}
-	s.writeJSON(w, r, http.StatusOK, renderCaptainSnapshot(repo, snap))
+	out := renderCaptainSnapshot(repo, snap)
+	out.DelegationUnconfirmed = s.captainDelegationUnconfirmed(r.Context(), repo)
+	s.writeJSON(w, r, http.StatusOK, out)
 }
 
 // captainVerbRequest is every POST verb's body. Successor is accepted only
@@ -392,8 +507,9 @@ func (s *Server) handleCaptainVerb(w http.ResponseWriter, r *http.Request, verb 
 			Sequence: applied.Entry.Sequence, EntryHash: applied.Entry.EntryHash,
 			Category: applied.Entry.Category, At: applied.Entry.Timestamp, Payload: applied.Entry.Payload,
 		},
-		Captain:      renderCaptainRecord(applied.State.Current),
-		PendingOffer: renderCaptainOffer(applied.State.PendingOffer),
+		Captain:               renderCaptainRecord(applied.State.Current),
+		PendingOffer:          renderCaptainOffer(applied.State.PendingOffer),
+		DelegationUnconfirmed: s.captainDelegationUnconfirmed(ctx, req.Repo),
 	})
 }
 

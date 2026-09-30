@@ -3352,8 +3352,17 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	// ELIGIBILITY: write:stages to send or decide, read:audit to read; a stage
 	// agent uses REST with its run token, never these tools (ADR-021). Three
 	// tools, not one mode-switched tool: send and decide each append a chain
-	// entry and the read never writes — taking the total 63 -> 66.
-	const wantToolCount = 66
+	// entry and the read never writes.
+	// E76.5 (#3768) adds exactly ONE tool — fishhawk_delegation_confirm, the
+	// thin wrapper over GET .../delegation/confirmation and POST
+	// .../delegation/{confirm,lower}. WHEN: an incoming human captain confirms
+	// or lowers each workflow's delegation after a handover. ELIGIBILITY: read
+	// is authenticated and repo-visible only (no scope beyond that, the
+	// fishhawk_delegation precedent); confirm/lower need write:approvals and the
+	// sitting captain, agents refused by the backend. Its action set is CLOSED at
+	// {read, confirm, lower} — there is no raise action. With E77.3's three
+	// crew-message tools the total goes 63 -> 67.
+	const wantToolCount = 67
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",
@@ -3479,6 +3488,34 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 		if !saw {
 			t.Errorf("%s is not in the registered tool list — the crew-message surface is unreachable over MCP", name)
 		}
+	}
+	// fishhawk_delegation_confirm (#3768) must be wire-visible by NAME, and
+	// its advertised action enum must be EXACTLY the closed set — a raise
+	// action added to the schema would otherwise pass the count.
+	var sawDelegationConfirm bool
+	for _, tool := range res.Tools {
+		if tool.Name != "fishhawk_delegation_confirm" {
+			continue
+		}
+		sawDelegationConfirm = true
+		raw, err := json.Marshal(tool.InputSchema)
+		if err != nil {
+			t.Fatalf("marshal fishhawk_delegation_confirm input schema: %v", err)
+		}
+		var schema struct {
+			Properties map[string]struct {
+				Enum []string `json:"enum"`
+			} `json:"properties"`
+		}
+		if err := json.Unmarshal(raw, &schema); err != nil {
+			t.Fatalf("decode fishhawk_delegation_confirm input schema: %v", err)
+		}
+		if got := schema.Properties["action"].Enum; strings.Join(got, ",") != "read,confirm,lower" {
+			t.Errorf("fishhawk_delegation_confirm action enum = %v, want exactly [read confirm lower]", got)
+		}
+	}
+	if !sawDelegationConfirm {
+		t.Error("fishhawk_delegation_confirm is not in the registered tool list — delegation confirmation is unreachable over MCP")
 	}
 	if !sawConsolidate {
 		t.Error("fishhawk_consolidate_slices is not registered/visible over ListTools")

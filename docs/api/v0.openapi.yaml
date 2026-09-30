@@ -6176,6 +6176,14 @@ components:
             `source`, and it is stamped BEFORE the `workflow` filter — so a
             filtered read reports the same value an unfiltered one does. Bind a
             single-workflow confirmation to this hash.
+        confirmation:
+          $ref: '#/components/schemas/DelegationWorkflowStatus'
+          description: |
+            E76.5 / #3768: this workflow's confirmation verdict, computed AFTER
+            the `workflow` filter against the `content_hash` this very response
+            reports (so `hash_stale` is reported here). ABSENT — never a false
+            `confirmed` — when the delegation-confirmation store is not wired or
+            its chain read failed (see the view-level `confirmation.unavailable`).
     RepoDelegation:
       type: object
       description: |
@@ -6201,6 +6209,164 @@ components:
           type: array
           description: One entry per declared workflow, in ascending workflow-id order.
           items: { $ref: '#/components/schemas/RepoDelegationWorkflow' }
+        confirmation:
+          $ref: '#/components/schemas/DelegationConfirmationSummary'
+    DelegationConfirmationSummary:
+      type: object
+      description: |
+        E76.5 / #3768: the view-level confirmation block on
+        `GET /v0/repos/{owner}/{name}/delegation`. Absent when the
+        delegation-confirmation store is not wired.
+      required: [captain, seat_sequence, unconfirmed_workflows]
+      properties:
+        captain:
+          type: [string, "null"]
+          description: The captain in force; null when the seat is vacant.
+        seat_sequence:
+          type: integer
+          description: Global-chain sequence of the latest seat change (`captain_assigned` / `captain_claimed`); 0 when no captain has ever sat.
+        unconfirmed_workflows:
+          type: array
+          description: The RETAINED workflows still awaiting confirmation (reason `handover` or `hash_stale`), never-confirmed ones included.
+          items: { type: string }
+        unavailable:
+          type: string
+          description: Set (with `unconfirmed_workflows` empty and every per-workflow `confirmation` absent) when the confirmation chain could not be read — an empty list is then NOT "all confirmed".
+    DelegationConfirmationRecord:
+      type: object
+      description: One COUNTED `delegation_confirmed` entry — written by the captain in force at its point in chain order.
+      required: [subject, content_hash, sequence, entry_hash, at]
+      properties:
+        subject: { type: string }
+        content_hash: { type: string, description: The per-workflow delegation `content_hash` the captain confirmed. }
+        workflow_sha: { type: string }
+        sequence: { type: integer }
+        entry_hash: { type: string }
+        at: { type: string, format: date-time }
+    DelegationEscalationProposal:
+      type: object
+      additionalProperties: false
+      description: A proposed escalation to APPEND to a workflow's `escalations`. It carries no `approvals` field, so nothing about it can raise.
+      required: [paths, max_autonomy]
+      properties:
+        paths: { type: array, minItems: 1, items: { type: string } }
+        max_autonomy: { type: string, enum: [low, medium, high], description: "Must be at or below the effective proposed tier (`proposed_tier` when set, else the current tier), and STRICTLY below the current tier when no `proposed_tier` is named." }
+    DelegationLowerProposal:
+      type: object
+      description: One COUNTED `delegation_lower_proposed` entry. A proposal does NOT confirm and changes nothing in force until the filed human-authored edit lands.
+      required: [subject, reason, filed_ref, sequence, entry_hash, at]
+      properties:
+        subject: { type: string }
+        proposed_tier: { type: string }
+        proposed_escalation: { $ref: '#/components/schemas/DelegationEscalationProposal' }
+        reason: { type: string }
+        filed_ref: { type: string, description: URL of the filed `autonomy:low` work item. }
+        sequence: { type: integer }
+        entry_hash: { type: string }
+        at: { type: string, format: date-time }
+    DelegationWorkflowStatus:
+      type: object
+      description: |
+        One workflow's confirmation verdict (E76.5 / #3768). The handover half
+        is CHAIN-ONLY: confirmation state RESETS at every seat change, and an
+        entry counts only if its author was the captain in force at that point
+        in chain order. The `hash_stale` half compares the confirmed
+        `content_hash` with the workflow's CURRENT delegation hash.
+      required: [workflow, status]
+      properties:
+        workflow: { type: string }
+        status:
+          type: string
+          enum: [confirmed, unconfirmed, no_captain]
+          description: "`no_captain` — no captain has ever sat, so no handover awaits confirmation (not listed as unconfirmed)."
+        reason:
+          type: string
+          enum: [handover, hash_stale]
+          description: "`unconfirmed` only. `handover` — no counted confirmation since the latest seat change; `hash_stale` — the delegation changed after it was confirmed."
+        current_content_hash: { type: string, description: The workflow's current delegation `content_hash` — the value a confirm must bind to. }
+        confirmation: { $ref: '#/components/schemas/DelegationConfirmationRecord' }
+        lower_proposal: { $ref: '#/components/schemas/DelegationLowerProposal' }
+    DelegationConfirmationResponse:
+      type: object
+      description: GET /v0/repos/{owner}/{name}/delegation/confirmation body (E76.5 / #3768).
+      required: [repo, source, captain, seat_sequence, workflows, unconfirmed_workflows, skipped_entries, ignored_entries]
+      properties:
+        repo: { type: string }
+        source: { type: string, enum: [ref, run_cache], description: The spec source actually read — the workflow INVENTORY's source. }
+        ref: { type: string }
+        workflow_sha: { type: string }
+        captain:
+          type: [string, "null"]
+          description: The captain in force; null when the seat is vacant.
+        seat_sequence: { type: integer, description: Sequence of the latest seat change; 0 when no captain has ever sat. }
+        workflows:
+          type: array
+          description: EVERY workflow of the delegation view at this source, in the view's order — never-confirmed ones included.
+          items: { $ref: '#/components/schemas/DelegationWorkflowStatus' }
+        unconfirmed_workflows:
+          type: array
+          items: { type: string }
+        skipped_entries: { type: integer, description: "Confirmation entries the fold could not use (undecodable, another repo, no workflow or subject)." }
+        ignored_entries: { type: integer, description: Well-formed entries whose author was NOT the captain in force when they landed — never folded. }
+    DelegationConfirmRequest:
+      type: object
+      additionalProperties: false
+      required: [workflow, content_hash]
+      properties:
+        workflow: { type: string }
+        content_hash: { type: string, description: The workflow's OWN `content_hash` exactly as shown. A hash no longer current is 409 `delegation_hash_stale`. }
+        source: { type: string, enum: [ref, run_cache], default: ref }
+        ref: { type: string }
+        delegated: { type: boolean, description: "Opts into the ADR-040 delegated path — which confirmation REFUSES (403 `delegation_agent_identity_refused`)." }
+    DelegationLowerRequest:
+      type: object
+      additionalProperties: false
+      description: |
+        A proposed LOWERING. There is no raise route and no field here can
+        raise: `proposed_tier` must rank STRICTLY below the workflow's current
+        tier, and an escalation's `max_autonomy` must be at or below the
+        effective proposed tier. At least one of `proposed_tier` /
+        `proposed_escalation` is required.
+      required: [workflow, reason]
+      properties:
+        workflow: { type: string }
+        proposed_tier: { type: string, enum: [low, medium, high] }
+        proposed_escalation: { $ref: '#/components/schemas/DelegationEscalationProposal' }
+        reason: { type: string, minLength: 1 }
+        source: { type: string, enum: [ref, run_cache], default: ref }
+        ref: { type: string }
+        parent_epic: { type: string, description: Parent epic the filed work item links to. }
+        title_vars: { type: object, additionalProperties: { type: string }, description: Title placeholders the repository's work-item conventions require. }
+        labels: { type: array, items: { type: string }, description: "Extra labels; any `autonomy:*` label is replaced by `autonomy:low`." }
+        delegated: { type: boolean, description: "Refused (403 `delegation_agent_identity_refused`)." }
+    DelegationEventItem:
+      type: object
+      required: [sequence, entry_hash, category, at, payload]
+      properties:
+        sequence: { type: integer }
+        entry_hash: { type: string }
+        category: { type: string, enum: [delegation_confirmed, delegation_lower_proposed] }
+        at: { type: string, format: date-time }
+        payload:
+          type: object
+          description: "`repo`, `workflow`, `subject`, `identity_verified`; a confirm adds `content_hash` + `workflow_sha`; a lower adds `proposed_tier` / `proposed_escalation`, `reason`, `filed_ref`."
+    DelegationVerbResponse:
+      type: object
+      description: The 200 body of both delegation-confirmation write routes.
+      required: [repo, workflow, event]
+      properties:
+        repo: { type: string }
+        workflow: { $ref: '#/components/schemas/DelegationWorkflowStatus' }
+        event: { $ref: '#/components/schemas/DelegationEventItem' }
+        filed:
+          type: object
+          description: "`lower` only: the ONE `autonomy:low` work item proposing the `.fishhawk/workflows.yaml` edit."
+          required: [number, url, title]
+          properties:
+            number: { type: integer }
+            url: { type: string }
+            title: { type: string }
+            applied_labels: { type: array, items: { type: string } }
     RepoPosture:
       type: object
       description: |
@@ -7595,8 +7761,10 @@ components:
         One underlying read inside a section. `merges` / `waivers_and_deferrals`
         / `unanswered_pages` / `open_decisions` carry digest `items` (each citing
         its chain entry); `campaigns` / `runs` carry `in_flight`; `workflows`
-        carries delegation entries whose `confirmation` is `unavailable` until
-        E76.5 (#3768).
+        carries delegation entries whose `confirmation` is the constant
+        `unavailable`: E76.5 (#3768) records confirmations, but the brief does
+        not yet read them — `GET /v0/repos/{owner}/{name}/delegation/confirmation`
+        is the confirmation read.
       required: [kind, complete, truncated, omitted_count]
       properties:
         kind:
@@ -7766,6 +7934,43 @@ components:
         skipped_entries:
           type: integer
           description: Entries the fold could not use (undecodable, another repo) — skipped, never guessed at.
+        delegation_unconfirmed: { $ref: '#/components/schemas/CaptainDelegationUnconfirmed' }
+
+    CaptainDelegationUnconfirmed:
+      type: object
+      description: |
+        E76.5 / #3768 (ADR-083 rule 7): the workflows with NO counted
+        `delegation_confirmed` since the latest seat change, never-confirmed
+        ones included. Present only when the delegation-confirmation store is
+        wired.
+
+        CHAIN-ONLY: `hash_staleness_reported` is always false. A workflow's
+        ABSENCE from `workflows` is NOT proof its confirmation is still
+        hash-current — only `GET /v0/repos/{owner}/{name}/delegation/confirmation`
+        and `GET /v0/repos/{owner}/{name}/delegation` report `hash_stale`.
+
+        The workflow SET is the delegation view projected from the spec cached
+        on the repository's NEWEST run (`source` is always `run_cache`): this
+        surface never fetches the spec from the forge.
+      required: [seat_sequence, source, workflows, hash_staleness_reported]
+      properties:
+        seat_sequence: { type: integer, description: Sequence of the latest seat change; 0 when no captain has ever sat (then nothing is listed). }
+        unconfirmed_since: { type: string, format: date-time, description: "Timestamp of the seat-change entry at `seat_sequence` — when the handover the incoming captain answers occurred. Absent when no captain has ever sat." }
+        source: { type: string, enum: [run_cache] }
+        workflow_sha: { type: string, description: The cached run's `workflow_sha`. }
+        workflows:
+          type: array
+          description: Unconfirmed workflow ids. EMPTY when `inventory_unavailable` or `unavailable` is set — then it is not "all confirmed".
+          items: { type: string }
+        hash_staleness_reported: { type: boolean, enum: [false] }
+        inventory_unavailable:
+          type: string
+          enum: [no_run_repository, list_runs_failed, no_cached_spec, spec_unparseable]
+          description: Why the workflow SET could not be read.
+        unavailable:
+          type: string
+          enum: [chain_read_failed]
+          description: The confirmation chain could not be read.
 
     CaptainVerbRequest:
       type: object
@@ -7797,6 +8002,9 @@ components:
           oneOf:
             - $ref: '#/components/schemas/CaptainOffer'
             - type: "null"
+        delegation_unconfirmed:
+          $ref: '#/components/schemas/CaptainDelegationUnconfirmed'
+          description: Re-derived AFTER the verb's entry commits, so an `accept` response already lists every workflow the new captain has yet to confirm.
 
     CrewMessageAnchor:
       type: object
@@ -13809,6 +14017,12 @@ paths:
         from `identity_verified`. Nothing here is read by approval quorum or
         eligibility. Long-form contract: `backend/internal/captain/README.md`.
 
+        **Unconfirmed delegation (E76.5 / #3768).** When the
+        delegation-confirmation store is wired the body (and every verb's 200
+        body) carries `delegation_unconfirmed`: the workflows with no counted
+        confirmation since the latest seat change. It is CHAIN-ONLY and never
+        reports hash staleness — see `CaptainDelegationUnconfirmed`.
+
         **Auth.** A token must hold `read:audit`; cookie-session operators are
         not scope-checked; a non-admin cookie-session caller must be able to
         read the repository at the forge.
@@ -16836,6 +17050,262 @@ paths:
           description: "`internal_error` — a run read failed."
         '503':
           description: "`github_unconfigured` — `source=ref` was requested but no GitHub App is configured (the message names the `run_cache` alternative); or `run_repo_unconfigured` — the run repository is not configured; or `service_unavailable` — repository visibility could not be resolved."
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/repos/{owner}/{name}/delegation/confirmation:
+    get:
+      operationId: getRepoDelegationConfirmation
+      summary: Which workflows' delegation the captain has confirmed since the latest handover
+      description: |
+        E76.5 / #3768 (ADR-083 #3751 rule 7). Every workflow of the delegation
+        view (`GET /v0/repos/{owner}/{name}/delegation`) at `source`/`ref`, with
+        its confirmation verdict. The workflow INVENTORY is the view's, so a
+        never-confirmed workflow is listed `unconfirmed`, never silently absent.
+
+        The verdict is folded from the global chain (`delegation_confirmed`,
+        `delegation_lower_proposed` and the captain entries): confirmation
+        state RESETS at every seat change, and an entry counts only if its
+        author was the captain in force at that point in chain order (an
+        outgoing captain's late confirmation is counted in `ignored_entries`,
+        never folded). A confirmed workflow whose recorded `content_hash`
+        differs from its current one is `unconfirmed` with reason `hash_stale`.
+
+        Read-only; the same source contract as the delegation read
+        (`source=ref|run_cache`, echoed, never switched silently). Repo
+        visibility is enforced (403 `repo_forbidden`). Also the `read` action of
+        the `fishhawk_delegation_confirm` MCP tool. Long-form contract:
+        `backend/internal/delegationconfirm/README.md`.
+      tags: [repos]
+      parameters:
+        - { name: owner, in: path, required: true, schema: { type: string }, description: Repository owner (first `owner/name` segment). }
+        - { name: name, in: path, required: true, schema: { type: string }, description: Repository name (second `owner/name` segment). }
+        - name: source
+          in: query
+          schema: { type: string, enum: [ref, run_cache], default: ref }
+        - name: ref
+          in: query
+          description: The git ref under `source=ref`; omit for the default branch head.
+          schema: { type: string }
+      responses:
+        '200':
+          description: Every workflow's confirmation verdict.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DelegationConfirmationResponse' }
+        '400':
+          description: "`validation_failed` — `source` is neither `ref` nor `run_cache`."
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/RepoForbidden' }
+        '404':
+          description: "`workflow_spec_not_found` — no spec at the ref, or no run carries a cached spec."
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: "`internal_error` — a run or chain read failed."
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: "`workflow_spec_invalid` — the spec at this source does not validate; nothing can be confirmed or lowered against it."
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '501':
+          description: "`delegation_confirm_unconfigured` — no delegation-confirmation store on this instance."
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '502':
+          description: "`forge_unavailable` — resolving the installation or fetching the spec through the forge failed."
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: "`github_unconfigured` — `source=ref` with no GitHub App configured (the message names `run_cache`); `run_repo_unconfigured`; or `service_unavailable` — repository visibility could not be resolved."
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/repos/{owner}/{name}/delegation/confirm:
+    post:
+      operationId: confirmRepoDelegation
+      summary: The sitting captain confirms one workflow's delegation exactly as shown
+      description: |
+        E76.5 / #3768. Records ONE run-less `delegation_confirmed` entry binding
+        the workflow's per-workflow `content_hash` the captain was shown. The
+        hash must be the CURRENT one at `source`/`ref`, else 409
+        `delegation_hash_stale` and nothing is recorded — so a later spec edit
+        that changes the hash flips the workflow back to `unconfirmed`.
+
+        Refusal order: scope, store, repo prelude, body shape, then the ONE
+        agent / run-bound (`mcp:run:*`) / delegated identity refusal (before any
+        spec read), the spec read, the workflow lookup, the hash binding, and
+        finally the captain check — which runs on state read UNDER the captain
+        record's advisory lock in the same transaction as the append, so an
+        outgoing captain's confirm cannot commit after a handover.
+
+        **Auth.** The existing `write:approvals` scope (no token loses access).
+        Writes are not repo-visibility filtered beyond the shared prelude.
+      tags: [repos]
+      parameters:
+        - { name: owner, in: path, required: true, schema: { type: string }, description: Repository owner (first `owner/name` segment). }
+        - { name: name, in: path, required: true, schema: { type: string }, description: Repository name (second `owner/name` segment). }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DelegationConfirmRequest' }
+      responses:
+        '200':
+          description: The recorded entry and the workflow's verdict after it.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DelegationVerbResponse' }
+        '400':
+          description: "`validation_failed` — malformed body, unknown field, `workflow` or `content_hash` missing, or an unknown `source`."
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: "`authentication_required` — no acting subject (or the auth boundary's `unauthenticated`)."
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: "`insufficient_scope` (lacks `write:approvals`), `repo_forbidden`, `delegation_agent_identity_refused` (an agent-family, `mcp:run:*` run-bound or `delegated: true` caller), or `delegation_not_captain` (the caller is not the captain in force)."
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: "`workflow_not_found` — the spec declares no such workflow; or `workflow_spec_not_found`."
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: "`delegation_hash_stale` — `content_hash` is not the workflow's current hash (`details.current_content_hash` names it); or `delegation_no_captain` — the seat is vacant."
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: "`internal_error` — a run or chain read, or the append, failed."
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: "`workflow_spec_invalid` — the spec at this source does not validate; nothing can be confirmed or lowered against it."
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '501':
+          description: "`delegation_confirm_unconfigured` — no delegation-confirmation store on this instance."
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '502':
+          description: "`forge_unavailable` — resolving the installation or fetching the spec through the forge failed."
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: "`github_unconfigured` — `source=ref` with no GitHub App configured (the message names `run_cache`); `run_repo_unconfigured`; or `service_unavailable` — repository visibility could not be resolved."
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/repos/{owner}/{name}/delegation/lower:
+    post:
+      operationId: lowerRepoDelegation
+      summary: The sitting captain proposes a strictly lower delegation for one workflow
+      description: |
+        E76.5 / #3768. Files exactly ONE `autonomy:low` work item (type
+        `chore`) through the run-absent operator filing path, its body carrying
+        the handover it answers, the reason and the EXACT proposed
+        `.fishhawk/workflows.yaml` edit; then records ONE run-less
+        `delegation_lower_proposed` entry naming the filed item. It touches NO
+        repository file and does NOT confirm: the delegation in force is
+        unchanged until a human lands the edit.
+
+        There is no raise route. `proposed_tier` must rank STRICTLY below the
+        workflow's currently resolved tier, and a `proposed_escalation`'s
+        `max_autonomy` must be at or below the effective proposed tier; an
+        undeclared current tier admits nothing (fail closed).
+
+        Refusal order is load-bearing: the identity refusal, the workflow
+        lookup, the lower validation and a captain pre-check all run BEFORE the
+        filing, so a refused proposal files nothing. The captain is re-checked
+        under the captain record's lock at the append; a filing failure
+        appends nothing, and an append failure after filing names the filed
+        item in `details.filed_ref`.
+
+        **Auth.** The existing `write:approvals` scope.
+      tags: [repos]
+      parameters:
+        - { name: owner, in: path, required: true, schema: { type: string }, description: Repository owner (first `owner/name` segment). }
+        - { name: name, in: path, required: true, schema: { type: string }, description: Repository name (second `owner/name` segment). }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DelegationLowerRequest' }
+      responses:
+        '200':
+          description: The recorded proposal, the workflow's (unchanged) verdict and the filed work item.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DelegationVerbResponse' }
+        '400':
+          description: "`delegation_raise_refused` — a tier or ceiling not strictly lower; `delegation_nothing_proposed` — neither field lowers anything; `validation_failed` — malformed body, unknown field, `workflow` or `reason` missing, an escalation with no paths, or an unknown `source`."
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: "`authentication_required` — no acting subject (or the auth boundary's `unauthenticated`)."
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: "`insufficient_scope`, `repo_forbidden`, `delegation_agent_identity_refused` or `delegation_not_captain` — each files nothing."
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: "`workflow_not_found` or `workflow_spec_not_found`."
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: "`delegation_no_captain` — the seat is vacant."
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: "`internal_error` — conventions, a run or chain read, or the append failed (an append failure after filing carries `details.filed_ref`)."
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: "`workflow_spec_invalid` (nothing can be lowered against an invalid spec), or `work_item_invalid` — the rendered work item violates the repository's conventions."
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '501':
+          description: "`delegation_confirm_unconfigured` — no delegation-confirmation store on this instance."
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '502':
+          description: "`forge_unavailable` — resolving the installation or fetching the spec through the forge failed. Also `work_item_filing_failed` — the work item could not be filed (nothing appended)."
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: "`github_unconfigured` — `source=ref` with no GitHub App configured (the message names `run_cache`); `run_repo_unconfigured`; or `service_unavailable` — repository visibility could not be resolved."
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

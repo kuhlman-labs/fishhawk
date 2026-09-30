@@ -178,6 +178,13 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	// without a run. Same posture as the rollups above — repoDashPrelude owns
 	// the visibility DENY (delegation_view.go).
 	mux.HandleFunc("GET /v0/repos/{owner}/{name}/delegation", s.handleGetRepoDelegation)
+	// Delegation confirmation on handover (E76.5 / #3768, ADR-083 rule 7):
+	// the GET never writes; confirm/lower append one global-chain entry under
+	// the captain record's lock, and lower files one autonomy:low work item
+	// (delegation_confirm.go).
+	mux.HandleFunc("GET /v0/repos/{owner}/{name}/delegation/confirmation", s.handleGetDelegationConfirmation)
+	mux.HandleFunc("POST /v0/repos/{owner}/{name}/delegation/confirm", s.handleDelegationConfirm)
+	mux.HandleFunc("POST /v0/repos/{owner}/{name}/delegation/lower", s.handleDelegationLower)
 	mux.HandleFunc("GET /v0/acceptance-triage/stats", s.handleGetAcceptanceTriageStats)
 	// Dev-only seeded-fixture surface (E72.2 / #3326): registered ONLY
 	// when a DevFixtures applier is configured, so a production server
