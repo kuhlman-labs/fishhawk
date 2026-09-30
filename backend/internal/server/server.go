@@ -1039,6 +1039,17 @@ type Server struct {
 	// releaseNotesResolverOverride exactly.
 	releasePublisherOverride releasePublisher
 
+	// crewConsultSinkOverride lets the crew-consult tests substitute a
+	// fault-injecting crewConsultSink so the dispatcher's two
+	// mailbox-dependent branches run offline (E77.14 / #3876): the
+	// answered-but-not-disposed pairing (a RECORDED reply with a FAILING
+	// disposition, which no real mailbox yields on demand) and
+	// expireCrewConsult's tolerance ladder (a chosen Dispose error class).
+	// Test-only: production is ALWAYS nil, so (*Server).crewConsultSink
+	// returns serverCrewConsultSink, a pass-through. Mirrors
+	// releasePublisherOverride exactly.
+	crewConsultSinkOverride crewConsultSink
+
 	// auditCheckPublisher posts the derived fishhawk_audit_complete
 	// state to GitHub as a Check Run on every compute (#231). nil
 	// when ExternalURL or GitHub aren't wired — the in-Fishhawk
