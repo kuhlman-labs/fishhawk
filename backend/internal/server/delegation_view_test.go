@@ -693,3 +693,35 @@ func TestRepoDelegation_EmptySpecAtRefIs404(t *testing.T) {
 		}
 	}
 }
+
+// TestRepoDelegation_WireShapeUnchangedByConfirmationWrapper pins that the
+// E76.5 wrapper (delegationResponse embedding the view) keeps every view key
+// at the TOP level and every workflow key on each entry, and that a
+// deployment without a DelegationConfirmStore carries no confirmation key at
+// either level — the pre-#3768 payload verbatim.
+func TestRepoDelegation_WireShapeUnchangedByConfirmationWrapper(t *testing.T) {
+	f := newDelegationFixture(string(committedWorkflowSpec(t)))
+	body := dashDecode(t, delegationGET(t, f.server(), "?source=run_cache"))
+	for _, k := range []string{"repo", "source", "workflow_sha", "spec_version", "schema_major", "content_hash", "workflows"} {
+		if _, ok := body[k]; !ok {
+			t.Errorf("top-level key %q missing from the wrapped response", k)
+		}
+	}
+	if _, ok := body["confirmation"]; ok {
+		t.Error("a nil-store read carries a view-level confirmation block")
+	}
+	var workflows []map[string]json.RawMessage
+	if err := json.Unmarshal(body["workflows"], &workflows); err != nil || len(workflows) == 0 {
+		t.Fatalf("workflows = %s (%v)", body["workflows"], err)
+	}
+	for _, wf := range workflows {
+		for _, k := range []string{"id", "matrix", "content_hash"} {
+			if _, ok := wf[k]; !ok {
+				t.Errorf("workflow key %q missing: %v", k, wf)
+			}
+		}
+		if _, ok := wf["confirmation"]; ok {
+			t.Errorf("a nil-store read carries a per-workflow confirmation block")
+		}
+	}
+}
