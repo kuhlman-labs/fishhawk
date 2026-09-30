@@ -205,6 +205,18 @@ var activityCategories = map[string]struct{}{
 	// so selectAnchorTimeline RETAINS it under the row cap like the other
 	// decision-class kinds.
 	"acceptance_scenario_retirement_dropped": {},
+	// Crew disagreement escalated to the captain (E77.6 / #3740). The
+	// round-bound exhaustion is the durable governance fact of a crew thread —
+	// the captain's ruling is what makes anything the thread argued binding — so
+	// it belongs on the anchor timeline alongside the decision-class kinds above,
+	// and server.handleDecideCrewEscalation marks it with notifyOperatorVisible.
+	//
+	// crew_message_sent is DELIBERATELY NOT registered: it would put EVERY crew
+	// message (consults, findings, notices, work requests) on the timeline. The
+	// sent-escalation signal reaches the operator through the pings-only
+	// notifyPageClass path instead — see ping.go's crew_message_sent case and
+	// docs/issue-comment-surfaces.md.
+	"crew_message_escalated": {},
 }
 
 // RendersActivity reports whether category is a member of the
@@ -240,6 +252,13 @@ var statusActorRenderers = actorRenderers{actor: actorMention, approver: approve
 // the category has no template — keeps the output stable if the
 // audit vocabulary grows. The actor-identity rendering is supplied by `r` so
 // the anchor can render the same timeline without @-mentions.
+// crewEscalatedActivityLine is the shipped anchor-timeline phrase for a
+// crew_message_escalated row (E77.6 / #3740). A constant, not a payload-derived
+// render: the timeline states the governance FACT (the captain must rule) and
+// the round-bound numbers belong on the page-class ping, which names them.
+// Pinned byte-for-byte by status_template_test.go.
+const crewEscalatedActivityLine = "Crew disagreement escalated to the captain"
+
 func renderActivityLine(e *audit.Entry, r actorRenderers) string {
 	actor := r.actor(e.ActorSubject)
 	switch e.Category {
@@ -298,6 +317,8 @@ func renderActivityLine(e *audit.Entry, r actorRenderers) string {
 		return renderScopeAmendmentDecidedLine(e.Payload)
 	case "acceptance_scenario_retirement_dropped":
 		return renderAcceptanceRetirementDroppedLine(e.Payload)
+	case "crew_message_escalated":
+		return crewEscalatedActivityLine
 	default:
 		if actor == "" {
 			return e.Category

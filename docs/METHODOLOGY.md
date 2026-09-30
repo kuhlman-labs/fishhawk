@@ -101,7 +101,7 @@ backend-evaluable condition that does not exist.
 
 | Tier | Preset | Expands to |
 |---|---|---|
-| Low | `low` | Every class `gated`. Nothing is delegated; every judgment — approval, fix-up routing, waiver, retry, merge — pages the human. This is also what a spec declaring no autonomy block resolves to. |
+| Low | `low` | Every class `gated`. Nothing is delegated; every judgment — approval, fix-up routing, waiver, retry, merge — pages the human. This is also what a spec declaring no autonomy block resolves to. Its `page_human_on` list is EMPTY (nothing is delegated, so there is nothing to carve out of a delegation) — which is why the crew-escalation page below is deliberately NOT sourced from this expansion. |
 | Medium | `medium` | `approve: auto (clean_dual_approval)`, `fixup: auto (convergent_concerns)`, `retry: auto (infra_flake)`; `waive` and `merge` stay `gated`. Carries the full `page_human_on` event list (`gating_reviewer_reject`, `plan_rejection`, `scope_amendment`, `budget_override`, `policy_override`, `exception_request`, `requirement_arbitration`). The operator agent advances mechanical judgments whose evidence is unambiguous; waivers and merges stay human. |
 | High | `high` | Medium plus `waive: auto (solo_low)` and `merge: auto (gates_resolved_ci_green)`. `page_human_on` still carries the full event list — high autonomy delegates clean-path verbs, never disagreement arbitration. |
 
@@ -119,7 +119,8 @@ preset names align with the operator-role overlay's reserved
 `knob_presets` key (#1025 / #1042 — soft dependency; the overlay may
 reference these presets once it ships).
 
-Two invariants hold at every tier (ADR-027 authority unchanged):
+Two invariants hold at every tier (ADR-027 authority unchanged), plus one
+page that is not a `page_human_on` event at all:
 
 - A delegated action is **condition-gated, not trust-gated**: the
   backend re-evaluates the named condition against current run state at
@@ -131,6 +132,22 @@ Two invariants hold at every tier (ADR-027 authority unchanged):
   arbitration always reaches the human, regardless of tier — and wins
   over a `report` proposal too: an event that must page is not a
   suggestion.
+
+A **crew escalation pages at EVERY tier, `low` included, from OUTSIDE
+`page_human_on` entirely** (E77.6 / #3740). When a crew disagreement is sent
+as an `escalation`, or a thread's reject-and-reply round bound is exhausted,
+the captain is paged and the auto-driver refuses the gate — and it does so
+whatever the resolved matrix contains, because the refusal is keyed to the
+server-package `PageEventCrewEscalation` token rather than to a configured
+event list. The distinction is structural, not stylistic: the `low` tier
+expands to an EMPTY page list (the low preset declares no `operator_agent`
+block, so it implies no page list either), so a crew-escalation page routed
+through the tier expansion would be silently dropped at exactly the tier that
+needs it most. Because the token is not a `spec.PageEvent*` constant it cannot
+appear in a `page_human_on` / `must_page_human` list at all, so the
+non-delegable contract above is unchanged and no autonomy declaration can
+switch this page off. The captain's answer is the ONLY thing an escalation ever
+turns into binding prompt text; an unanswered escalation binds nothing.
 
 ---
 
