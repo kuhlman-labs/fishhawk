@@ -2489,6 +2489,21 @@ func (s *Server) writeApprovalAudit(ctx context.Context, stage *run.Stage, app *
 	if onBehalfOf != "" {
 		auditPayload["on_behalf_of"] = onBehalfOf
 	}
+	// ADR-083 rule 6's delegation leg (E76.3 / #3766): a DELEGATED approve
+	// additionally names the repository's seated captain. Resolved HERE rather
+	// than threaded in from approveStageAs so this function's signature — and
+	// every existing positional call site — is preserved (approval condition
+	// 6). A non-delegated approve never reads the record.
+	if delegatedRule != "" {
+		principal := s.delegatedCaptainPrincipal(ctx, stage, onBehalfOf)
+		if principal.OnBehalfOf != "" {
+			auditPayload["on_behalf_of"] = principal.OnBehalfOf
+			auditPayload["on_behalf_of_basis"] = principal.OnBehalfOfBasis
+		}
+		if principal.CaptainSubject != "" {
+			auditPayload["captain_subject"] = principal.CaptainSubject
+		}
+	}
 	payload, _ := json.Marshal(auditPayload)
 
 	approver := app.ApproverSubject
@@ -2507,6 +2522,60 @@ func (s *Server) writeApprovalAudit(ctx context.Context, stage *run.Stage, app *
 			"error", err.Error(),
 		)
 	}
+}
+
+// onBehalfOfBasisCaptain is the on_behalf_of_basis value recorded when a
+// delegated approval's on_behalf_of names the seated captain because no human
+// principal drove it (E76.3 / #3766, ADR-083 rule 6).
+const onBehalfOfBasisCaptain = "captain"
+
+// captainPrincipal is the captain enrichment a DELEGATED approval_submitted
+// row carries (E76.3 / #3766). Every field empty = no key is written.
+type captainPrincipal struct {
+	// OnBehalfOf / OnBehalfOfBasis are set ONLY when the remap named no human
+	// principal (the acting identity was already agent-kind): the seated
+	// captain becomes the principal, with basis "captain".
+	OnBehalfOf      string
+	OnBehalfOfBasis string
+	// CaptainSubject is set when a human principal DID drive the approve
+	// (onBehalfOf non-empty) and is not the captain, so both are recorded.
+	CaptainSubject string
+}
+
+// delegatedCaptainPrincipal resolves the captain enrichment for a delegated
+// approval whose (pre-existing) on_behalf_of is onBehalfOf. The captain is
+// read in the RUN's account partition. A vacant seat, an unwired store, a
+// failed read, an unreadable run row or a non-UUID account all return the
+// zero value — no key invented, the row byte-identical to before E76.3.
+// Nothing here reaches quorum or eligibility (ADR-083 rule 1): it runs after
+// the vote is recorded and only decorates the audit payload.
+func (s *Server) delegatedCaptainPrincipal(ctx context.Context, stage *run.Stage, onBehalfOf string) captainPrincipal {
+	if s.cfg.CaptainStore == nil || s.cfg.RunRepo == nil {
+		return captainPrincipal{}
+	}
+	ru, err := s.cfg.RunRepo.GetRun(ctx, stage.RunID)
+	if err != nil || ru == nil {
+		return captainPrincipal{}
+	}
+	var acct *uuid.UUID
+	if ru.AccountID != "" {
+		u, perr := uuid.Parse(ru.AccountID)
+		if perr != nil {
+			return captainPrincipal{}
+		}
+		acct = &u
+	}
+	captainSubject, _, basis := s.currentCaptain(ctx, acct, ru.Repo)
+	if basis != captainBasisCaptain || captainSubject == "" {
+		return captainPrincipal{}
+	}
+	if onBehalfOf == "" {
+		return captainPrincipal{OnBehalfOf: captainSubject, OnBehalfOfBasis: onBehalfOfBasisCaptain}
+	}
+	if onBehalfOf != captainSubject {
+		return captainPrincipal{CaptainSubject: captainSubject}
+	}
+	return captainPrincipal{}
 }
 
 // checkPlanModelAllowed is the plan-stage model gate (#1013). It resolves the

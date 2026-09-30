@@ -118,6 +118,14 @@ type driveFakeBackend struct {
 
 	gateCalls    int
 	recordedActs []RecordAutoDriveAct
+
+	// E76.3 / #3766 hand-off fixtures. gateViewCaptain is the raw JSON of the
+	// gate view's captain block ("" = key absent, the unwired/older-backend
+	// shape); gateViewErr makes GET /gate-view return 500; gateViewCalls
+	// counts gate-view reads.
+	gateViewCaptain string
+	gateViewErr     bool
+	gateViewCalls   int
 }
 
 func newDriveFake(runState string, stages []Stage) *driveFakeBackend {
@@ -330,6 +338,21 @@ func (f *driveFakeBackend) handler() http.HandlerFunc {
 				f.appendAuto(fields)
 			}
 			_ = json.NewEncoder(w).Encode(out)
+
+		case strings.HasSuffix(path, "/gate-view"):
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			f.gateViewCalls++
+			if f.gateViewErr {
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte(`{"error":{"code":"internal_error","message":"gate-view boom"}}`))
+				return
+			}
+			body := `{"run_id":"` + f.runID.String() + `","open":[],"settled":[],"suppressed_relitigations":[],"history_incomplete":false`
+			if f.gateViewCaptain != "" {
+				body += `,"captain":` + f.gateViewCaptain
+			}
+			_, _ = w.Write([]byte(body + `}`))
 
 		case strings.HasSuffix(path, "/stages"):
 			f.mu.Lock()
@@ -4715,5 +4738,139 @@ func TestDriveRun_RunReadFails_StopsWithoutSpawn(t *testing.T) {
 	}
 	if got := rec.list(); len(got) != 0 {
 		t.Fatalf("spawned %v on an unreadable run", got)
+	}
+}
+
+// --- E76.3 / #3766: the hand-off names the captain --------------------------
+
+// driveHandoffFixture is a run parked at a paged implement gate
+// (paged=true) or an observe-only plan gate (decision_required).
+func driveHandoffFixture(paged bool) *driveFakeBackend {
+	if paged {
+		f := newDriveFake("running", []Stage{
+			stg(drivePlanID, "plan", "succeeded", 0),
+			stg(driveImplID, "implement", "awaiting_approval", 1),
+		})
+		f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome {
+			return AutoDriveOutcome{Paged: true, PageEvent: "reviewer_reject", Note: "must_page_human"}
+		})
+		return f
+	}
+	f := newDriveFake("running", []Stage{
+		stg(drivePlanID, "plan", "awaiting_approval", 0),
+		stg(driveImplID, "implement", "blocked", 1),
+	})
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "no delegated knob"} })
+	return f
+}
+
+func driveHandoff(t *testing.T, f *driveFakeBackend) DriveRunOutput {
+	t.Helper()
+	r, srv := newDriveResolver(t, f, &spawnRecorder{})
+	defer srv.Close()
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	return out
+}
+
+const driveCaptainBlock = `{"subject":"github:alice","identity_verified":true,"vacant":false,` +
+	`"non_captain_approvers":["github:bob"],"note":"approved by github:bob; captain is github:alice"}`
+
+// TestDriveRun_HandoffCarriesCaptain: both hand-off stop kinds copy the gate
+// view's captain block — the backend-composed note verbatim — onto the output,
+// in ONE gate-view read, with no warning.
+func TestDriveRun_HandoffCarriesCaptain(t *testing.T) {
+	for _, paged := range []bool{true, false} {
+		f := driveHandoffFixture(paged)
+		f.gateViewCaptain = driveCaptainBlock
+		out := driveHandoff(t, f)
+		want := "decision_required:plan_gate_parked"
+		if paged {
+			want = "paged:reviewer_reject"
+		}
+		if out.StoppedReason != want {
+			t.Fatalf("paged=%v: stopped_reason = %q, want %q", paged, out.StoppedReason, want)
+		}
+		if out.Captain == nil || out.Captain.Subject != "github:alice" ||
+			out.Captain.Note != "approved by github:bob; captain is github:alice" {
+			t.Errorf("paged=%v: captain = %+v, want the gate view's block verbatim", paged, out.Captain)
+		}
+		if f.gateViewCalls != 1 {
+			t.Errorf("paged=%v: gate-view reads = %d, want exactly 1", paged, f.gateViewCalls)
+		}
+		for _, w := range out.Warnings {
+			if strings.Contains(w, "gate-view") {
+				t.Errorf("paged=%v: unexpected gate-view warning %q", paged, w)
+			}
+		}
+	}
+}
+
+// TestDriveRun_HandoffVacantAndAbsent: a vacant block is carried as stated;
+// a gate view with no block (unwired / older backend) leaves Captain nil with
+// no warning.
+func TestDriveRun_HandoffVacantAndAbsent(t *testing.T) {
+	f := driveHandoffFixture(true)
+	f.gateViewCaptain = `{"identity_verified":false,"vacant":true,"non_captain_approvers":[]}`
+	if out := driveHandoff(t, f); out.Captain == nil || !out.Captain.Vacant || out.Captain.Note != "" {
+		t.Errorf("vacant: captain = %+v, want a vacant block", out.Captain)
+	}
+	f = driveHandoffFixture(true)
+	out := driveHandoff(t, f)
+	if out.Captain != nil || len(out.Warnings) != 0 {
+		t.Errorf("absent: captain = %+v warnings = %v, want nil and none", out.Captain, out.Warnings)
+	}
+}
+
+// TestDriveRun_HandoffGateViewErrorDegrades (C10): a failed gate-view read on
+// a hand-off stop leaves stopped_reason, page_event and next_actions EXACTLY
+// as the same fixture produces with a healthy read, adds exactly one warning
+// naming the failed read, and omits Captain.
+func TestDriveRun_HandoffGateViewErrorDegrades(t *testing.T) {
+	for _, paged := range []bool{true, false} {
+		hf := driveHandoffFixture(paged)
+		healthy := driveHandoff(t, hf)
+		f := driveHandoffFixture(paged)
+		f.runID = hf.runID // identical fixture: next_actions embed the run id
+		f.gateViewErr = true
+		out := driveHandoff(t, f)
+		if out.StoppedReason == "" || out.StoppedReason != healthy.StoppedReason || out.PageEvent != healthy.PageEvent {
+			t.Errorf("paged=%v: stop = %q/%q, want the healthy %q/%q", paged, out.StoppedReason, out.PageEvent, healthy.StoppedReason, healthy.PageEvent)
+		}
+		gotNA, _ := json.Marshal(out.NextActions)
+		wantNA, _ := json.Marshal(healthy.NextActions)
+		if out.NextActions == nil || string(gotNA) != string(wantNA) {
+			t.Errorf("paged=%v: next_actions changed by a failed enrichment read:\n got  %s\n want %s", paged, gotNA, wantNA)
+		}
+		if out.Captain != nil {
+			t.Errorf("paged=%v: captain = %+v, want nil on a failed read", paged, out.Captain)
+		}
+		var named int
+		for _, w := range out.Warnings {
+			if strings.Contains(w, "gate-view read for the captain hand-off failed") {
+				named++
+			}
+		}
+		if named != 1 || len(out.Warnings) != len(healthy.Warnings)+1 {
+			t.Errorf("paged=%v: warnings = %v, want exactly one added naming the failed gate-view read", paged, out.Warnings)
+		}
+	}
+}
+
+// TestDriveRun_NonHandoffStopMakesNoGateViewRead: a stop that hands nothing
+// to a human (here the stall guard) makes no gate-view read and carries no
+// captain, even when the backend would serve one.
+func TestDriveRun_NonHandoffStopMakesNoGateViewRead(t *testing.T) {
+	f := newDriveFake("running", []Stage{stg(drivePlanID, "plan", "weird_wedged", 0)})
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
+	f.gateViewCaptain = driveCaptainBlock
+	out := driveHandoff(t, f)
+	if out.StoppedReason != stoppedStalled {
+		t.Fatalf("fixture: stopped_reason = %q, want stalled (a non-hand-off stop)", out.StoppedReason)
+	}
+	if f.gateViewCalls != 0 || out.Captain != nil {
+		t.Errorf("stop %q: gate-view reads = %d captain = %+v, want 0 and nil", out.StoppedReason, f.gateViewCalls, out.Captain)
 	}
 }
