@@ -216,6 +216,13 @@ import "sort"
 // is authoritative; the crew_messages table (0090) is rebuilt from them. They
 // are INTERNAL, not issue-comment activity categories: no delivery surface and
 // no server writer exists yet (docs/issue-comment-surfaces.md).
+// E76.5 / #3768 (ADR-083 #3751 rule 7) added delegation_confirmed and
+// delegation_lower_proposed, written by backend/internal/delegationconfirm's
+// Store.Append via AppendGlobalChainedTx under the captain record's lock. Like
+// the captain_* categories they are repo-keyed GLOBAL-chain entries
+// (payload.repo + payload.workflow) belonging to no run, are not
+// decision-bearing, and are deliberately NOT issue-comment activity
+// categories.
 var KnownCategories = map[string]struct{}{
 	"acceptance_dispatched":                   {},
 	"acceptance_outcome_recorded":             {},
@@ -287,6 +294,8 @@ var KnownCategories = map[string]struct{}{
 	"crew_message_disposed":                   {},
 	"crew_message_escalated":                  {},
 	"crew_message_sent":                       {},
+	"delegation_confirmed":                    {},
+	"delegation_lower_proposed":               {},
 	"deploy_preflight_refused":                {},
 	"deploy_run":                              {},
 	"deployment_dispatch_failed":              {},
