@@ -15,7 +15,7 @@ it.
 | Living anchor | `status_comment_posted` | `status_update` | `Dispatcher.Handle` (run create); `Server.notifyStatusUpdate` (every stage transition); `Server.notifyPlanReady` (plan-stage terminal) | run dispatch | Yes — one comment per run, every transition rebuilds + edits the same comment id |
 | PR status comment | `pr_status_comment_posted` | `pr_status_update` | `Server.notifyStatusUpdate` via `issuecomment.Notifier.NotifyStatusUpdateForRun` (folded in after the anchor edit) | PR first observed / `pull_request_url` stamped | Yes — one comment per PR, rebuilt on every transition + edited in place (identical body skips the edit) |
 | Agent-review PR review | `pr_review_posted` | _(source `implement_reviewed`)_ | `Notifier.maybePostAgentReviewPRReviews` via `NotifyStatusUpdateForRun` (folded in after the anchor edit) | each terminal agent `implement_reviewed` verdict on a PR-owning run EXCEPT one whose review round a later stage retry superseded (#3593) | No — a NEW advisory COMMENT-type PR review per verdict round (deduped on the source `implement_reviewed` audit `Sequence`); a post-fixup re-review round posts a new review; a retry-superseded verdict is skipped and writes no row |
-| Page-class ping | `anchor_ping_posted` | _(payload `event`)_ | `Notifier.firePings` from `NotifyStatusUpdateForRun` AND the pings-only immediate `NotifyPageClassForRun` invoked at each batched append site (#1786) | first crossing of a page-class event (plan gate awaiting human approval, advisory reviewer reject, must_page_human, clarification request / awaiting_input park, CI failure, acceptance triage paged, campaign gate hand-off) | No — a one-line NEW comment per source event (deduped on the source audit `Sequence`) linking back to the anchor; an already-resolved reviewer-reject page is recorded-and-skipped |
+| Page-class ping | `anchor_ping_posted` | _(payload `event`)_ | `Notifier.firePings` from `NotifyStatusUpdateForRun` AND the pings-only immediate `NotifyPageClassForRun` invoked at each batched append site (#1786) | first crossing of a page-class event (plan gate awaiting human approval, advisory reviewer reject, must_page_human, clarification request / awaiting_input park, CI failure, acceptance triage paged, campaign gate hand-off) | No — a one-line NEW comment per source event (deduped on the source audit `Sequence`) linking back to the anchor, addressed to the repo's captain when `Deps.Captain` is wired (#3766); an already-resolved reviewer-reject page is recorded-and-skipped |
 | CI-failure retry | `issue_commented` | `ci_retry` | `Dispatcher.handleCIFailureRetry` (#279) | retry dispatch | No (per-attempt dedup; new attempts post new comments) |
 | Budget alert (advisory) | `issue_commented` | `budget_alert` | `Server.checkBudgetAlerts` → `NotifyBudgetAlert` (#688, #1371) | crossing of an advisory periodic-budget ladder rung — `warn` / `over` / `ack_required` (≥2x) / `page` (≥3x) | No (per-`(period_start, tier)` dedup; each tier posts once per calendar period) |
 | Slash-command reply | _(none — no dedup row)_ | _(none)_ | `Server.HandleApprovalCommand` via `replyApproval` | each `/fishhawk approve` or `/fishhawk reject` command | No (every command gets its own reply) |
@@ -450,6 +450,27 @@ Notes:
   Each ping records its source audit `Sequence` so a re-render never
   double-pings.
 
+  **Captain addressing (E76.3 / #3766, ADR-083 rule 6).** When
+  `issuecomment.Deps.Captain` is wired (`server.New` wires it whenever
+  `Config.CaptainStore` is), `firePings` resolves the repository's current
+  captain ONCE per invocation — lazily, at the first comment it actually posts,
+  with the RUN's account id (never request identity on ctx) — and composes the
+  address at body-assembly time (`addressPing`), so the dedup key, the
+  source-`Sequence` gate, the resolved-reject skip and the
+  `anchor_ping_posted` payload are unchanged. Three bases:
+  - **`captain`** — the body is prefixed `Captain <address>: `. The address is an
+    ACTIVE forge mention (`@<login>`) only when the captain's subject is
+    identity-verified, its provider prefix IS the run's comment family
+    (`github:` on a GitHub run, `gitlab:` on a GitLab run), and the remainder
+    passes `validApproverLogin` (the #751 stop-the-ping filter); every other
+    subject (a static `brett@local-mcp`, a cross-family identity) renders in a
+    sanitized code span and never pings (`renderCaptainAddress`).
+  - **`vacant`** — today's body plus "_This repository has no captain, so this
+    page is unaddressed._" The vacancy is stated, never implied.
+  - **`unavailable`** (store not wired, or the read failed) — exactly today's
+    unaddressed body. An unreadable record is never asserted as a vacancy.
+  A nil resolver posts today's body byte-for-byte.
+
   **Immediate dispatch (#1786).** Historically page-class pings only fired
   from `NotifyStatusUpdateForRun`, so they were batched to the NEXT stage
   transition — a reviewer-reject page could arrive minutes late (riding the
@@ -479,6 +500,17 @@ Notes:
   (`<subject>`, delegated: `<rule>`)"; any other non-login subject → verbatim
   in a sanitized code span; "an approver" only for empty/"anonymous") is
   unchanged.
+- **Captain on the living anchor (E76.3 / #3766, ADR-083 rules 4-5).** With
+  `issuecomment.Deps.Captain` wired, `NotifyStatusUpdateForRun` resolves the
+  captain once (shared with the pings that follow) into
+  `AnchorInput.Captain`. A seated captain adds "; captain is `<subject>`" to
+  every timeline approve line whose approver is a human other than the captain
+  (agent/delegated approvals and the captain's own approval carry no note;
+  the approval stays valid and counted). A vacant seat adds "_This repository
+  has no captain._" under the header. An unavailable read (or no resolver)
+  renders the anchor exactly as before. The captain is ALWAYS a code span on
+  the anchor, never a mention — the anchor is re-edited on every transition
+  and must never re-ping.
 - The living anchor is the *only* surface that follows a run end-to-end;
   everything else is event-scoped. A plan rejection that spawns a new run
   gets its own anchor on the new run.

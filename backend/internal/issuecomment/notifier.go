@@ -242,6 +242,10 @@ type Notifier struct {
 	artifacts     PlanArtifactLister
 	externalURL   string
 	now           func() time.Time
+	// captain resolves the repository's current captain for the page
+	// addressing and the anchor's non-captain approval note (E76.3 / #3766,
+	// ADR-083 rule 6). Nil keeps every surface byte-for-byte as before.
+	captain CaptainResolver
 }
 
 // Deps groups the dependencies New needs.
@@ -266,6 +270,70 @@ type Deps struct {
 	// Now is the clock used for audit timestamps; defaults to
 	// time.Now. Overridable for deterministic tests.
 	Now func() time.Time
+	// Captain optionally resolves the repository's current captain (E76.3 /
+	// #3766). server.New wires a closure over server.currentCaptain when the
+	// captain store is configured; nil (the default, and every existing call
+	// site) keeps pages and the anchor exactly as they were: no address, no
+	// vacancy sentence, no approval note.
+	Captain CaptainResolver
+}
+
+// Captain resolution bases (E76.3 / #3766). Every consumer branches on the
+// same trichotomy: a seat is held, the record read fine and the seat is
+// vacant, or the record could not be read (no store wired, or the read
+// failed). An unavailable read is NEVER rendered as a vacancy.
+const (
+	CaptainBasisCaptain     = "captain"
+	CaptainBasisVacant      = "vacant"
+	CaptainBasisUnavailable = "unavailable"
+)
+
+// CaptainResolution is one resolved captain read. Subject and
+// IdentityVerified are meaningful only when Basis is CaptainBasisCaptain.
+type CaptainResolution struct {
+	Subject          string
+	IdentityVerified bool
+	Basis            string
+}
+
+// CaptainResolver reads the current captain for repo within accountID's
+// partition. accountID is the RUN's account (run.Run.AccountID, "" for the
+// untenanted partition), passed explicitly: the notifier fires from
+// background transition hooks whose ctx carries no request identity, so the
+// resolver must never derive the partition from ctx. It never errors — a
+// failure is reported as CaptainBasisUnavailable.
+type CaptainResolver func(ctx context.Context, accountID, repo string) CaptainResolution
+
+// captainMemo resolves the captain at most once per notifier invocation, and
+// only when a surface actually needs it (N page-class events cost one read,
+// zero when nothing posts).
+type captainMemo struct {
+	resolve CaptainResolver
+	run     *run.Run
+	done    bool
+	res     CaptainResolution
+}
+
+// newCaptainMemo returns nil when no resolver is wired, so every caller's
+// nil-memo branch is today's behaviour.
+func (n *Notifier) newCaptainMemo(r *run.Run) *captainMemo {
+	if n == nil || n.captain == nil || r == nil {
+		return nil
+	}
+	return &captainMemo{resolve: n.captain, run: r}
+}
+
+// get returns the memoized resolution, or nil for a nil memo.
+func (m *captainMemo) get(ctx context.Context) *CaptainResolution {
+	if m == nil {
+		return nil
+	}
+	if !m.done {
+		m.res = m.resolve(ctx, m.run.AccountID, m.run.Repo)
+		m.done = true
+	}
+	res := m.res
+	return &res
 }
 
 // New returns a Notifier. Returns nil when the deps don't add up to
@@ -302,6 +370,7 @@ func New(d Deps) *Notifier {
 		artifacts:     d.Artifacts,
 		externalURL:   strings.TrimRight(d.ExternalURL, "/"),
 		now:           now,
+		captain:       d.Captain,
 	}
 }
 
@@ -943,7 +1012,11 @@ func (n *Notifier) NotifyStatusUpdateForRun(ctx context.Context, runID uuid.UUID
 			slog.String("error", cErr.Error()))
 		children = nil
 	}
+	// One captain read serves both the anchor's approval note and the pings
+	// fired below (nil memo = no resolver wired = today's render).
+	captainRes := n.newCaptainMemo(runRow)
 	body := RenderAnchorBody(AnchorInput{
+		Captain:            captainRes.get(ctx),
 		Run:                runRow,
 		Stages:             stages,
 		Audit:              entries,
@@ -975,7 +1048,7 @@ func (n *Notifier) NotifyStatusUpdateForRun(ctx context.Context, runID uuid.UUID
 	if err != nil || !ok {
 		return err
 	}
-	return n.firePings(ctx, ctxv, entries, stages, ctxv.runURL)
+	return n.firePings(ctx, ctxv, entries, stages, ctxv.runURL, captainRes)
 }
 
 // NotifyPageClassForRun is the pings-only sibling of
@@ -1016,7 +1089,7 @@ func (n *Notifier) NotifyPageClassForRun(ctx context.Context, runID uuid.UUID) e
 	if err != nil || !ok {
 		return err
 	}
-	return n.firePings(ctx, ctxv, entries, stages, ctxv.runURL)
+	return n.firePings(ctx, ctxv, entries, stages, ctxv.runURL, n.newCaptainMemo(runRow))
 }
 
 // resolvePlanEchoPolicy resolves the issue-echo policy for the plan

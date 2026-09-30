@@ -387,7 +387,14 @@ func acceptanceTriageNeedsHuman(payload []byte) (class, disposition string, ok b
 // CategoryAnchorPingPosted. Best-effort: a post failure for one event
 // returns a wrapped error but the dedup row for any earlier successful
 // ping is already written, so a retry only re-attempts the unpinged tail.
-func (n *Notifier) firePings(ctx context.Context, ctxv commentContext, entries []*audit.Entry, stages []*run.Stage, runURL string) error {
+//
+// Captain addressing (E76.3 / #3766, ADR-083 rule 6): the captain is resolved
+// through captainRes at most ONCE per invocation, lazily at the first comment
+// actually posted, and composed at body-assembly time (addressPing) — so the
+// dedup key, the source-Sequence gate, the pageEventResolved skip and the
+// CategoryAnchorPingPosted payload are all unchanged. A nil captainRes (no
+// resolver wired) posts exactly today's body.
+func (n *Notifier) firePings(ctx context.Context, ctxv commentContext, entries []*audit.Entry, stages []*run.Stage, runURL string, captainRes *captainMemo) error {
 	events := pageClassEvents(entries, stages)
 	if len(events) == 0 {
 		return nil
@@ -410,7 +417,7 @@ func (n *Notifier) firePings(ctx context.Context, ctxv commentContext, entries [
 			}
 			continue
 		}
-		body := pingCommentBody(ev.message, runURL)
+		body := addressPing(pingCommentBody(ev.message, runURL), captainRes.get(ctx), ctxv.family)
 		// createComment routes by the context's family (E45.52 / #3481): the
 		// github family keeps the GitHub client call; a non-GitHub family posts
 		// through forge.IssueOperations. Pings are one-shot, so no id is kept.
@@ -433,6 +440,63 @@ func pingCommentBody(message, runURL string) string {
 		return message
 	}
 	return fmt.Sprintf("%s [View the run →](%s)", message, runURL)
+}
+
+// captainVacantSentence is appended to a page when the captain record read
+// fine and the seat is vacant (ADR-083 rule 5): the vacancy is STATED, never
+// implied by the absence of an address.
+const captainVacantSentence = "_This repository has no captain, so this page is unaddressed._"
+
+// addressPing composes the captain address onto an assembled ping body:
+//
+//   - nil resolution (no resolver wired) or CaptainBasisUnavailable → body
+//     unchanged. An unreadable record must not be asserted as a vacancy.
+//   - CaptainBasisVacant → body + " " + captainVacantSentence.
+//   - CaptainBasisCaptain → "Captain <address>: " + body, where the address
+//     is renderCaptainAddress's mention or code span. A subject that
+//     sanitizes to nothing leaves the body unaddressed.
+func addressPing(body string, res *CaptainResolution, family string) string {
+	if res == nil {
+		return body
+	}
+	switch res.Basis {
+	case CaptainBasisVacant:
+		return body + " " + captainVacantSentence
+	case CaptainBasisCaptain:
+		if addr := renderCaptainAddress(res.Subject, res.IdentityVerified, family); addr != "" {
+			return "Captain " + addr + ": " + body
+		}
+	}
+	return body
+}
+
+// renderCaptainAddress renders a seated captain's subject for a page on a
+// run of the given comment family. It emits an ACTIVE forge mention
+// ("@<login>") ONLY when all three hold:
+//
+//  1. identityVerified — the subject is provider-qualified (captain.
+//     IdentityVerified); a static token subject such as brett@local-mcp is
+//     never mentioned;
+//  2. the subject's provider prefix IS the run's comment family ("github:"
+//     on the github family, "gitlab:" on the gitlab family) — a gitlab
+//     identity is never mentioned on a GitHub thread, where the same login
+//     may belong to someone else;
+//  3. the remainder passes validApproverLogin (the #751 stop-the-ping
+//     filter: no '@', no '.', at most 39 chars).
+//
+// Every other subject renders inside a backtick code span via
+// sanitizeSubjectForCodeSpan, so it can never close the span and never
+// becomes a mention. Returns "" for a subject that sanitizes to nothing.
+func renderCaptainAddress(subject string, identityVerified bool, family string) string {
+	if identityVerified && family != "" {
+		if login, ok := strings.CutPrefix(subject, family+":"); ok && validApproverLogin(login) {
+			return "@" + login
+		}
+	}
+	if s := sanitizeSubjectForCodeSpan(subject); s != "" {
+		return "`" + s + "`"
+	}
+	return ""
 }
 
 // pingedSequences returns the set of source audit sequences already

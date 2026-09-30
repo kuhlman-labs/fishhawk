@@ -3588,3 +3588,178 @@ func TestPRReview_RetryListError_FailsOpen(t *testing.T) {
 		t.Fatalf("a retry-list read error must fail OPEN (post); got %d", got)
 	}
 }
+
+// captainResolverCall records one CaptainResolver invocation.
+type captainResolverCall struct {
+	accountID, repo string
+}
+
+// fakeCaptainResolver returns a fixed resolution and records every call.
+type fakeCaptainResolver struct {
+	mu    sync.Mutex
+	res   issuecomment.CaptainResolution
+	calls []captainResolverCall
+}
+
+func (f *fakeCaptainResolver) resolve(_ context.Context, accountID, repo string) issuecomment.CaptainResolution {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, captainResolverCall{accountID: accountID, repo: repo})
+	return f.res
+}
+
+const captainRunAccountID = "0b6f7f3e-1d2c-4b5a-9e8f-7a6b5c4d3e2f"
+
+// captainHarness builds a github-family, issue-anchored run owned by
+// captainRunAccountID with one page-class reject (and a scope-amendment
+// request when twoPages), and a notifier whose Captain seam is resolver
+// (nil = unwired).
+func captainHarness(t *testing.T, resolver issuecomment.CaptainResolver, twoPages bool) (uuid.UUID, *fakeGitHub, *issuecomment.Notifier) {
+	t.Helper()
+	runID, gh, au, runs, _ := happyDepsWithStages(t)
+	runs.runs[runID].AccountID = captainRunAccountID
+	au.preSeed(runID, "implement_reviewed", map[string]any{"verdict": "reject", "reviewer_model": "gpt-5.5"})
+	if twoPages {
+		au.preSeed(runID, "scope_amendment_requested", map[string]any{})
+	}
+	n := issuecomment.New(issuecomment.Deps{
+		GitHub: gh, Runs: runs, Audit: au,
+		ExternalURL: "https://app.fishhawk.example.com",
+		Now:         func() time.Time { return time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC) },
+		Captain:     resolver,
+	})
+	return runID, gh, n
+}
+
+// unaddressedPingBodies returns the pings a notifier with NO captain seam
+// posts for the captainHarness fixture — today's exact bodies — with the
+// baseline run's id rewritten to forRunID so they compare byte-for-byte.
+func unaddressedPingBodies(t *testing.T, twoPages bool, forRunID uuid.UUID) []string {
+	t.Helper()
+	runID, gh, n := captainHarness(t, nil, twoPages)
+	if err := n.NotifyPageClassForRun(context.Background(), runID); err != nil {
+		t.Fatalf("baseline NotifyPageClassForRun: %v", err)
+	}
+	out := make([]string, 0, len(gh.calls))
+	for _, c := range gh.calls {
+		out = append(out, strings.ReplaceAll(c.body, runID.String(), forRunID.String()))
+	}
+	return out
+}
+
+// TestNotifyPageClassForRun_CaptainAddressed_RunAccountOnce is the E76.3
+// (#3766) end-to-end page leg: a seated, verified github captain turns every
+// ping into an addressed one, the captain is resolved ONCE for N pages, and
+// it is resolved with the RUN's account id and repo from a context carrying
+// no request identity (approval condition 4).
+func TestNotifyPageClassForRun_CaptainAddressed_RunAccountOnce(t *testing.T) {
+	fake := &fakeCaptainResolver{res: issuecomment.CaptainResolution{
+		Subject: "github:alice", IdentityVerified: true, Basis: issuecomment.CaptainBasisCaptain,
+	}}
+	runID, gh, n := captainHarness(t, fake.resolve, true)
+	baseline := unaddressedPingBodies(t, true, runID)
+	if err := n.NotifyPageClassForRun(context.Background(), runID); err != nil {
+		t.Fatalf("NotifyPageClassForRun: %v", err)
+	}
+	if len(gh.calls) != 2 || len(baseline) != 2 {
+		t.Fatalf("expected 2 pings (and 2 baseline); got %d / %d", len(gh.calls), len(baseline))
+	}
+	for i, c := range gh.calls {
+		if want := "Captain @alice: " + baseline[i]; c.body != want {
+			t.Errorf("ping %d = %q, want %q", i, c.body, want)
+		}
+	}
+	if len(fake.calls) != 1 {
+		t.Fatalf("captain must be resolved once per invocation; got %d calls", len(fake.calls))
+	}
+	call := fake.calls[0]
+	if call.accountID != captainRunAccountID || call.repo != "x/y" {
+		t.Errorf("resolver called with (%q, %q), want the run's (%q, %q)", call.accountID, call.repo, captainRunAccountID, "x/y")
+	}
+}
+
+// TestNotifyPageClassForRun_CaptainVacant_StatesVacancy: a vacant seat posts
+// today's exact body plus the explicit vacancy sentence.
+func TestNotifyPageClassForRun_CaptainVacant_StatesVacancy(t *testing.T) {
+	fake := &fakeCaptainResolver{res: issuecomment.CaptainResolution{Basis: issuecomment.CaptainBasisVacant}}
+	runID, gh, n := captainHarness(t, fake.resolve, false)
+	baseline := unaddressedPingBodies(t, false, runID)
+	if err := n.NotifyPageClassForRun(context.Background(), runID); err != nil {
+		t.Fatalf("NotifyPageClassForRun: %v", err)
+	}
+	if len(gh.calls) != 1 {
+		t.Fatalf("expected 1 ping; got %d", len(gh.calls))
+	}
+	want := baseline[0] + " _This repository has no captain, so this page is unaddressed._"
+	if gh.calls[0].body != want {
+		t.Errorf("vacant ping = %q, want %q", gh.calls[0].body, want)
+	}
+}
+
+// TestNotifyPageClassForRun_CaptainUnavailable_TodaysBody: an unreadable
+// captain record posts EXACTLY today's unaddressed body — one comment,
+// byte-identical to the no-resolver notifier, never a vacancy claim.
+func TestNotifyPageClassForRun_CaptainUnavailable_TodaysBody(t *testing.T) {
+	fake := &fakeCaptainResolver{res: issuecomment.CaptainResolution{Basis: issuecomment.CaptainBasisUnavailable}}
+	runID, gh, n := captainHarness(t, fake.resolve, false)
+	baseline := unaddressedPingBodies(t, false, runID)
+	if err := n.NotifyPageClassForRun(context.Background(), runID); err != nil {
+		t.Fatalf("NotifyPageClassForRun: %v", err)
+	}
+	if len(gh.calls) != 1 {
+		t.Fatalf("expected exactly 1 ping; got %d", len(gh.calls))
+	}
+	if gh.calls[0].body != baseline[0] {
+		t.Errorf("unavailable ping = %q, want today's %q", gh.calls[0].body, baseline[0])
+	}
+}
+
+// TestNotifyPageClassForRun_CaptainNotResolvedWhenNothingPosts: the read is
+// lazy — a run whose only page is already resolved posts nothing and never
+// consults the captain record.
+func TestNotifyPageClassForRun_CaptainNotResolvedWhenNothingPosts(t *testing.T) {
+	runID, gh, au, runs, _ := happyDepsWithStages(t)
+	au.preSeed(runID, "implement_reviewed", map[string]any{"verdict": "reject"})
+	au.preSeed(runID, "stage_fixup_triggered", map[string]any{})
+	fake := &fakeCaptainResolver{res: issuecomment.CaptainResolution{Basis: issuecomment.CaptainBasisVacant}}
+	n := issuecomment.New(issuecomment.Deps{GitHub: gh, Runs: runs, Audit: au, Captain: fake.resolve})
+	if err := n.NotifyPageClassForRun(context.Background(), runID); err != nil {
+		t.Fatalf("NotifyPageClassForRun: %v", err)
+	}
+	if len(gh.calls) != 0 || len(fake.calls) != 0 {
+		t.Errorf("nothing posted must mean no captain read; got %d posts, %d reads", len(gh.calls), len(fake.calls))
+	}
+}
+
+// TestNotifyStatusUpdateForRun_AnchorNotesNonCaptainApproval pins the
+// anchor leg end to end (ADR-083 rule 4): an approval by github:bob on a
+// repository captained by github:alice renders the note on the anchor's
+// approval line as a code span (no mention), with ONE captain read shared
+// by the anchor and the pings.
+func TestNotifyStatusUpdateForRun_AnchorNotesNonCaptainApproval(t *testing.T) {
+	runID, gh, au, runs, _ := happyDepsWithStages(t)
+	runs.runs[runID].AccountID = captainRunAccountID
+	au.preSeed(runID, "approval_submitted", map[string]any{"decision": "approve", "approver": "github:bob"})
+	fake := &fakeCaptainResolver{res: issuecomment.CaptainResolution{
+		Subject: "github:alice", IdentityVerified: true, Basis: issuecomment.CaptainBasisCaptain,
+	}}
+	n := issuecomment.New(issuecomment.Deps{
+		GitHub: gh, Runs: runs, Audit: au, ExternalURL: "https://app.fishhawk.example.com", Captain: fake.resolve,
+	})
+	if err := n.NotifyStatusUpdateForRun(context.Background(), runID); err != nil {
+		t.Fatalf("NotifyStatusUpdateForRun: %v", err)
+	}
+	if len(gh.calls) != 1 {
+		t.Fatalf("expected the anchor create; got %d calls", len(gh.calls))
+	}
+	body := gh.calls[0].body
+	if !strings.Contains(body, "`github:bob` approved the plan; captain is `github:alice`") {
+		t.Errorf("anchor missing the non-captain approval note:\n%s", body)
+	}
+	if strings.Contains(body, "@alice") {
+		t.Errorf("the anchor must never @-mention the captain:\n%s", body)
+	}
+	if len(fake.calls) != 1 || fake.calls[0].accountID != captainRunAccountID {
+		t.Errorf("expected one captain read with the run's account; got %+v", fake.calls)
+	}
+}

@@ -1320,6 +1320,11 @@ func New(cfg Config) *Server {
 			// green e2e — the sibling auditcheckpublisher.New above already
 			// passes the same cfg.ArtifactRepo.
 			Artifacts: cfg.ArtifactRepo,
+			// Captain addresses page-class pings and notes a non-captain
+			// approval on the anchor (E76.3 / #3766). Nil when
+			// cfg.CaptainStore is unwired, so the notifier is built exactly
+			// as before.
+			Captain: s.issueCommentCaptainResolver(),
 		}); ghChannel != nil {
 			channels = append(channels, ghChannel)
 		}

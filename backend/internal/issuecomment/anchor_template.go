@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
@@ -83,6 +84,14 @@ type AnchorInput struct {
 	PlanEchoSuppressed bool
 	ExternalURL        string
 	Now                time.Time
+	// Captain, when non-nil, is the repository's resolved captain (E76.3 /
+	// #3766, ADR-083 rules 4-5). A seated captain adds "; captain is `Y`" to
+	// every timeline approval line whose approver is someone else; a vacant
+	// seat adds captainVacantAnchorLine under the header. Nil or
+	// CaptainBasisUnavailable renders exactly as before. The captain is ALWAYS
+	// a code span here, never a mention: the anchor is edited in place on
+	// every transition, and an edit must never be able to re-ping.
+	Captain *CaptainResolution
 }
 
 // anchorSections is the assembled, still-mutable form of the anchor body
@@ -98,6 +107,7 @@ type anchorSections struct {
 	// head). Never dropped by the ladder.
 	marker          string
 	header          string
+	captain         string
 	whatNow         string
 	stages          string
 	timeline        string
@@ -130,9 +140,10 @@ func RenderAnchorBody(in AnchorInput) string {
 	s := anchorSections{
 		marker:          stickyMarker(stickyLocusAnchor, in.Run.ID),
 		header:          renderAnchorHeader(in.Run, externalURL),
+		captain:         renderAnchorCaptain(in.Captain),
 		whatNow:         renderWhatNow(in.Run, in.Stages),
 		stages:          renderAnchorStages(in.Stages),
-		timeline:        renderAnchorTimeline(in.Audit),
+		timeline:        renderAnchorTimeline(in.Audit, in.Captain),
 		reviews:         renderAnchorReviews(in.Stages, in.Audit),
 		currentPlan:     renderCurrentPlan(in.CurrentPlan, in.PlanEchoSuppressed),
 		modelResolved:   renderResolvedModel(in.Audit),
@@ -168,7 +179,7 @@ func RenderAnchorBody(in AnchorInput) string {
 // are never dropped. The economics block sits just above the footer and is
 // the FIRST section shed under the cap (#1702).
 func assembleAnchor(s anchorSections, level int) string {
-	parts := []string{s.marker, s.header, s.whatNow, s.stages}
+	parts := []string{s.marker, s.header, s.captain, s.whatNow, s.stages}
 	if level < 2 && s.timeline != "" {
 		parts = append(parts, s.timeline)
 	}
@@ -208,6 +219,57 @@ func assembleAnchor(s anchorSections, level int) string {
 func renderAnchorHeader(r *run.Run, externalURL string) string {
 	return fmt.Sprintf("**Fishhawk run %s** — `%s` · %s %s",
 		runShortLink(externalURL, r.ID), r.WorkflowID, runStateIcon(r.State), string(r.State))
+}
+
+// captainVacantAnchorLine is the anchor's statement of a vacant seat
+// (ADR-083 rule 5) — stated, never implied by an absent captain.
+const captainVacantAnchorLine = "_This repository has no captain._"
+
+// renderAnchorCaptain renders the never-dropped captain line under the
+// header: the vacancy sentence for a vacant seat, "" otherwise (a seated
+// captain surfaces only on the approval lines it differs from; nil or an
+// unavailable read renders nothing, exactly as before E76.3).
+func renderAnchorCaptain(res *CaptainResolution) string {
+	if res != nil && res.Basis == CaptainBasisVacant {
+		return captainVacantAnchorLine
+	}
+	return ""
+}
+
+// anchorNonCaptainSuffix returns "; captain is `Y`" for an approve-decision
+// approval_submitted row whose approver is a human other than the seated
+// captain (ADR-083 rule 4: the approval stays valid and counted; the anchor
+// only NOTES it), and "" otherwise — no seated captain, a non-approve
+// decision, an unknown approver, an agent/delegated approval (recorded on
+// behalf of a principal, not a second human), or an approver who IS the
+// captain (by subject, or by the resolved GitHub login matching a
+// "github:<login>" captain).
+func anchorNonCaptainSuffix(e *audit.Entry, res *CaptainResolution) string {
+	if res == nil || res.Basis != CaptainBasisCaptain || res.Subject == "" {
+		return ""
+	}
+	if approvalDecisionOf(e.Payload) != "approve" {
+		return ""
+	}
+	id := decodeApproverIdentity(e.Payload)
+	subject := id.approver
+	if subject == "" && e.ActorSubject != nil {
+		subject = *e.ActorSubject
+	}
+	if subject == "" || subject == "anonymous" || id.delegated != "" || operatorrole.IsTokenSubject(subject) {
+		return ""
+	}
+	if subject == res.Subject {
+		return ""
+	}
+	if login, ok := strings.CutPrefix(res.Subject, commentFamilyGitHub+":"); ok && id.githubLogin != "" && id.githubLogin == login {
+		return ""
+	}
+	captain := sanitizeSubjectForCodeSpan(res.Subject)
+	if captain == "" {
+		return ""
+	}
+	return "; captain is `" + captain + "`"
 }
 
 // renderWhatNow is the next_actions-style "what now" line: a single
@@ -256,7 +318,7 @@ func renderAnchorStages(stages []*run.Stage) string {
 // correctly once the run settles, unlike a relative "5m ago"). Needs no
 // reference clock — the stamp is derived from each row's own timestamp.
 // Empty when no interesting rows exist.
-func renderAnchorTimeline(entries []*audit.Entry) string {
+func renderAnchorTimeline(entries []*audit.Entry, captainRes *CaptainResolution) string {
 	activity := selectAnchorTimeline(entries, anchorTimelineLimit)
 	if len(activity) == 0 {
 		return ""
@@ -265,7 +327,7 @@ func renderAnchorTimeline(entries []*audit.Entry) string {
 	b.WriteString("<details><summary>Timeline</summary>\n\n")
 	for _, e := range activity {
 		if e.Category == "approval_submitted" {
-			b.WriteString(renderGateDecisionTimelineEntry(e, entries))
+			b.WriteString(renderGateDecisionTimelineEntry(e, entries, captainRes))
 			continue
 		}
 		fmt.Fprintf(&b, "- %s · %s\n", renderActivityLine(e, anchorActorRenderers), anchorTimestamp(e.Timestamp))
@@ -329,7 +391,7 @@ func anchorApproverMention(e *audit.Entry) string {
 // <details>. The relative-age suffix stays on the parent bullet so the
 // timeline reads uniformly. `entries` is the full chain (needed to bound
 // the advisory-reject count to the arbitrated round).
-func renderGateDecisionTimelineEntry(e *audit.Entry, entries []*audit.Entry) string {
+func renderGateDecisionTimelineEntry(e *audit.Entry, entries []*audit.Entry, captainRes *CaptainResolution) string {
 	decision := approvalDecisionOf(e.Payload)
 	comment := decodeApprovalComment(e.Payload)
 
@@ -357,6 +419,7 @@ func renderGateDecisionTimelineEntry(e *audit.Entry, entries []*audit.Entry) str
 			line += fmt.Sprintf(" (over %d advisory %s)", n, advisoryRejectNoun(n))
 		}
 	}
+	line += anchorNonCaptainSuffix(e, captainRes)
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "- %s · %s\n", line, anchorTimestamp(e.Timestamp))
