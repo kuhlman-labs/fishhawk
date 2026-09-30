@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -66,7 +67,39 @@ type gateViewResponse struct {
 	// round has since superseded it, or the read fails. Same best-effort read as
 	// ReviewDiffTruncated.
 	ReviewHeadMismatch *gateViewReviewHeadMismatch `json:"review_head_mismatch,omitempty"`
+	// Captain is ADR-083 rule 4's non-captain approval note (E76.3 / #3766):
+	// the repository's current captain and every human approver on this run
+	// who is not that captain. It is INFORMATIONAL — an approval by someone
+	// other than the captain stays valid and counted; nothing here reaches
+	// eligibility, quorum or the advance decision (ADR-083 rule 1). Omitted
+	// (nil) when the captain record is not wired; omitted with a
+	// history_gaps entry when the captain read or the approval read fails,
+	// so the block is never built from a partial read.
+	Captain *gateViewCaptain `json:"captain,omitempty"`
 }
+
+// gateViewCaptain is the gate-view captain block (E76.3 / #3766).
+type gateViewCaptain struct {
+	// Subject is the seated captain's subject; empty when Vacant.
+	Subject          string `json:"subject,omitempty"`
+	IdentityVerified bool   `json:"identity_verified"`
+	// Vacant is true when the repository has no captain (stated, never
+	// implied by an absent block).
+	Vacant bool `json:"vacant"`
+	// NonCaptainApprovers lists, in chain order and de-duplicated, each human
+	// subject that recorded an approve on this run and is not the captain.
+	// Agent-kind subjects are excluded. Always empty when Vacant.
+	NonCaptainApprovers []string `json:"non_captain_approvers"`
+	// Note is "approved by X; captain is Y", composed only when a captain is
+	// seated AND NonCaptainApprovers is non-empty.
+	Note string `json:"note,omitempty"`
+}
+
+// The history_gaps entries the captain block can record.
+const (
+	gateViewGapCaptainRecord     = "captain_record"
+	gateViewGapApprovalSubmitted = "approval_submitted"
+)
 
 // gateViewReviewHeadMismatch is the gate-view / run-status distillation of the
 // newest review_head_mismatch audit entry (#3655). It mirrors the audit
@@ -358,7 +391,8 @@ func (s *Server) handleGetRunGateView(w http.ResponseWriter, r *http.Request) {
 			"gate-view endpoint requires a configured run repository", nil)
 		return
 	}
-	if _, err := s.cfg.RunRepo.GetRun(r.Context(), runID); err != nil {
+	runRow, err := s.cfg.RunRepo.GetRun(r.Context(), runID)
+	if err != nil {
 		if errors.Is(err, run.ErrNotFound) {
 			s.writeError(w, r, http.StatusNotFound, "run_not_found",
 				"no run with that id", map[string]any{"run_id": runID.String()})
@@ -377,7 +411,86 @@ func (s *Server) handleGetRunGateView(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := s.buildGateView(r.Context(), runID, stageKind, rows)
+	resp.Captain = s.gateViewCaptainFor(r.Context(), runRow, &resp)
 	s.writeJSON(w, r, http.StatusOK, resp)
+}
+
+// gateViewCaptainFor builds the captain block (E76.3 / #3766, ADR-083 rule
+// 4) for ru, resolved in the RUN's account partition. The resolution
+// trichotomy maps as:
+//
+//   - CaptainStore not wired -> nil, no gap (the pre-E76.3 response,
+//     byte-for-byte).
+//   - unavailable (the read failed, or the run's account id is not a UUID)
+//     -> nil plus a captain_record gap: an unreadable record is never
+//     reported as a vacancy.
+//   - vacant -> {vacant: true}, no approval read, no note.
+//   - captain -> the run's approval_submitted rows are read; a read failure
+//     omits the block with an approval_submitted gap. The note is composed
+//     only when a human approver differs from the captain.
+//
+// It never fails the gate view and never touches eligibility or counting.
+func (s *Server) gateViewCaptainFor(ctx context.Context, ru *run.Run, resp *gateViewResponse) *gateViewCaptain {
+	if ru == nil || s.cfg.CaptainStore == nil {
+		return nil
+	}
+	gap := func(name string) *gateViewCaptain {
+		resp.HistoryIncomplete = true
+		resp.HistoryGaps = append(resp.HistoryGaps, name)
+		return nil
+	}
+	var acct *uuid.UUID
+	if ru.AccountID != "" {
+		u, err := uuid.Parse(ru.AccountID)
+		if err != nil {
+			s.cfg.Logger.Warn("gate-view: run account id is not a UUID; omitting captain block",
+				"run_id", ru.ID.String(), "error", err.Error())
+			return gap(gateViewGapCaptainRecord)
+		}
+		acct = &u
+	}
+	subject, verified, basis := s.currentCaptain(ctx, acct, ru.Repo)
+	switch basis {
+	case captainBasisVacant:
+		return &gateViewCaptain{Vacant: true, NonCaptainApprovers: []string{}}
+	case captainBasisCaptain:
+	default:
+		return gap(gateViewGapCaptainRecord)
+	}
+	if s.cfg.AuditRepo == nil {
+		return gap(gateViewGapApprovalSubmitted)
+	}
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, ru.ID, "approval_submitted")
+	if err != nil {
+		s.cfg.Logger.Warn("gate-view: list approval_submitted failed; omitting captain block",
+			"run_id", ru.ID.String(), "error", err.Error())
+		return gap(gateViewGapApprovalSubmitted)
+	}
+	block := &gateViewCaptain{Subject: subject, IdentityVerified: verified, NonCaptainApprovers: []string{}}
+	seen := map[string]bool{}
+	for _, e := range entries {
+		var p struct {
+			Decision string `json:"decision"`
+			Approver string `json:"approver"`
+		}
+		if uerr := json.Unmarshal(e.Payload, &p); uerr != nil {
+			s.cfg.Logger.Warn("gate-view: decode approval_submitted payload failed; omitting captain block",
+				"run_id", ru.ID.String(), "error", uerr.Error())
+			return gap(gateViewGapApprovalSubmitted)
+		}
+		if p.Decision != string(approval.DecisionApprove) || p.Approver == "" || seen[p.Approver] {
+			continue
+		}
+		seen[p.Approver] = true
+		if p.Approver == subject || actorKindForSubject(p.Approver) == audit.ActorAgent {
+			continue
+		}
+		block.NonCaptainApprovers = append(block.NonCaptainApprovers, p.Approver)
+	}
+	if len(block.NonCaptainApprovers) > 0 {
+		block.Note = "approved by " + strings.Join(block.NonCaptainApprovers, ", ") + "; captain is " + subject
+	}
+	return block
 }
 
 // buildGateView assembles the gate-view response from the run's concern rows

@@ -2,6 +2,7 @@ package digest
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"sync"
@@ -304,5 +305,55 @@ func TestWatermark_UntenantedUpsertIsSingleRow(t *testing.T) {
 	}
 	if got, _ := f.watermark(t, nil, "cap"); got != head {
 		t.Errorf("untenanted watermark = %d, want %d (independent of the tenanted row)", got, head)
+	}
+}
+
+// TestMarkedReadEvent_PayloadRecordsMarkedBy (E76.3 / #3766): the chain entry
+// names WHO marked alongside WHICH key moved, and carries the key's basis.
+// A caller that leaves MarkedBy empty still gets the key (falling back to the
+// watermark subject) rather than a silent omission; an empty basis is omitted.
+func TestMarkedReadEvent_PayloadRecordsMarkedBy(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		ev        MarkedReadEvent
+		wantBy    string
+		wantBasis any
+	}{
+		{"explicit", MarkedReadEvent{CaptainSubject: "github:bob", MarkedBy: "github:bob", CaptainSubjectBasis: "caller", Repo: testRepo, ToSequence: 3}, "github:bob", "caller"},
+		{"fallback", MarkedReadEvent{CaptainSubject: "cap", Repo: testRepo, ToSequence: 3}, "cap", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, err := tc.ev.Payload()
+			if err != nil {
+				t.Fatal(err)
+			}
+			var m map[string]any
+			if err := json.Unmarshal(raw, &m); err != nil {
+				t.Fatal(err)
+			}
+			if m["marked_by"] != tc.wantBy {
+				t.Errorf("marked_by = %v, want %q (payload %s)", m["marked_by"], tc.wantBy, raw)
+			}
+			if m["captain_subject_basis"] != tc.wantBasis {
+				t.Errorf("captain_subject_basis = %v, want %v (payload %s)", m["captain_subject_basis"], tc.wantBasis, raw)
+			}
+		})
+	}
+}
+
+// TestMarkRead_ThreadsMarkedByAndBasis: MarkRead carries MarkedBy and the
+// basis from its params onto the appended event (the handler's only path to
+// the chain entry).
+func TestMarkRead_ThreadsMarkedByAndBasis(t *testing.T) {
+	f := newFixture(t)
+	head := f.seedHead(t, 1)
+	app := &recordingAppender{}
+	if _, err := f.st.MarkRead(context.Background(), app, MarkReadParams{
+		CaptainSubject: "github:bob", MarkedBy: "github:bob", CaptainSubjectBasis: "caller", Repo: testRepo, ToSequence: head,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if app.count() != 1 || app.events[0].MarkedBy != "github:bob" || app.events[0].CaptainSubjectBasis != "caller" {
+		t.Errorf("events = %+v, want one carrying marked_by github:bob basis caller", app.events)
 	}
 }

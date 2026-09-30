@@ -17,6 +17,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/account"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/captain"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/decisionindex"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/digest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
@@ -433,5 +434,235 @@ func TestGetDigest_RepoForbidden403(t *testing.T) {
 	}
 	if e := digestErrorBody(t, w); e.Code != "repo_forbidden" {
 		t.Errorf("code = %q, want repo_forbidden", e.Code)
+	}
+}
+
+// ---- ADR-083 rule 6: the digest watermark is keyed on the seat (E76.3 / #3766) ----
+
+var (
+	digestAlice = digestTokenIdentity("github:alice", scopeDigestRead, scopeDigestMarkRead)
+	digestBob   = digestTokenIdentity("github:bob", scopeDigestRead, scopeDigestMarkRead)
+)
+
+// withCaptainStore wires the REAL captain.Store onto the fixture's server.
+func (f *digestPG) withCaptainStore(t *testing.T) *digestPG {
+	t.Helper()
+	f.srv.cfg.CaptainStore = captain.NewStore(f.pool)
+	return f
+}
+
+// seedCaptainEntry appends a captain chain entry for digestPGRepo BY
+// CONSTRUCTION (straight onto the global chain, bypassing the verbs).
+func (f *digestPG) seedCaptainEntry(t *testing.T, category, subject string) {
+	t.Helper()
+	raw, _ := json.Marshal(map[string]any{"repo": digestPGRepo, "subject": subject, "identity_verified": captain.IdentityVerified(subject)})
+	kind := audit.ActorUser
+	if _, err := f.audit.AppendGlobalChained(context.Background(), audit.GlobalChainAppendParams{
+		Timestamp: time.Now().UTC(), Category: category, ActorKind: &kind, ActorSubject: &subject, Payload: raw,
+	}); err != nil {
+		t.Fatalf("seed %s: %v", category, err)
+	}
+}
+
+func (f *digestPG) getBasis(t *testing.T, id *Identity, query string) digestResponse {
+	t.Helper()
+	w := serveDigest(t, f.srv, http.MethodGet, "/v0/digest?repo="+digestPGRepo+query, "", id)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /v0/digest%s = %d, want 200:\n%s", query, w.Code, w.Body.String())
+	}
+	var d digestResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &d); err != nil {
+		t.Fatalf("decode digest: %v", err)
+	}
+	return d
+}
+
+func (f *digestPG) markReadResp(t *testing.T, id *Identity, to int64) digestMarkReadResponse {
+	t.Helper()
+	code, body := f.markRead(t, id, to)
+	if code != http.StatusOK {
+		t.Fatalf("mark-read = %d, want 200:\n%s", code, body)
+	}
+	var res digestMarkReadResponse
+	if err := json.Unmarshal([]byte(body), &res); err != nil {
+		t.Fatalf("decode mark-read: %v", err)
+	}
+	return res
+}
+
+// lastMarkedReadPayload reads the newest digest_marked_read entry back from
+// the chain (committed state, not the handler's answer).
+func (f *digestPG) lastMarkedReadPayload(t *testing.T) (actor string, payload map[string]any) {
+	t.Helper()
+	var raw []byte
+	if err := f.pool.QueryRow(context.Background(), `SELECT actor_subject, payload FROM audit_entries
+		WHERE category = 'digest_marked_read' AND run_id IS NULL ORDER BY sequence DESC LIMIT 1`).Scan(&actor, &raw); err != nil {
+		t.Fatalf("read digest_marked_read: %v", err)
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("decode digest_marked_read payload: %v", err)
+	}
+	return actor, payload
+}
+
+// TestDigestCaptain_GetDefaultsToSeatedCaptain (C4): the caller (bob) and the
+// seated captain (alice) are DIFFERENT subjects by construction, and alice
+// holds a watermark bob does not. bob's GET names alice, reports basis
+// "captain" and reads ALICE's watermark — with the resolution deleted it
+// would name bob and report no watermark.
+func TestDigestCaptain_GetDefaultsToSeatedCaptain(t *testing.T) {
+	f := newDigestPG(t).withCaptainStore(t)
+	e := f.append(t, f.seedRun(t, "succeeded"), nil, "merge_verdict_recorded", map[string]any{"verdict": "merged"})
+	f.seedCaptainEntry(t, captain.CategoryAssigned, "github:alice")
+	if res := f.markReadResp(t, digestAlice, e.Sequence); res.CaptainSubjectBasis != digestBasisCaptain || res.CaptainSubject != "github:alice" {
+		t.Fatalf("captain's own mark-read = %+v, want basis captain keyed github:alice", res)
+	}
+	d := f.getBasis(t, digestBob, "")
+	if d.CaptainSubject != "github:alice" || d.CaptainSubjectBasis != digestBasisCaptain {
+		t.Errorf("bob's GET = captain_subject %q basis %q, want github:alice / captain", d.CaptainSubject, d.CaptainSubjectBasis)
+	}
+	if !d.HasWatermark || d.Watermark != e.Sequence {
+		t.Errorf("bob's GET watermark = %d (has %v), want alice's %d", d.Watermark, d.HasWatermark, e.Sequence)
+	}
+}
+
+// TestDigestCaptain_NonCaptainMarkReadAdvancesOwnKey (approval condition 1):
+// a mark-read by bob on a repository captained by alice advances BOB's
+// watermark and leaves ALICE's untouched, recording marked_by github:bob with
+// basis "caller". Keying the write on the seat reddens the watermark reads.
+func TestDigestCaptain_NonCaptainMarkReadAdvancesOwnKey(t *testing.T) {
+	f := newDigestPG(t).withCaptainStore(t)
+	e := f.append(t, f.seedRun(t, "succeeded"), nil, "merge_verdict_recorded", map[string]any{"verdict": "merged"})
+	f.seedCaptainEntry(t, captain.CategoryAssigned, "github:alice")
+	res := f.markReadResp(t, digestBob, e.Sequence)
+	if res.CaptainSubject != "github:bob" || res.CaptainSubjectBasis != digestBasisCaller || !res.Advanced {
+		t.Errorf("bob's mark-read = %+v, want advanced, keyed github:bob, basis caller", res)
+	}
+	if got := f.watermark(t, "github:alice"); got != -1 {
+		t.Errorf("captain alice's watermark = %d after bob's mark, want untouched (no row)", got)
+	}
+	if got := f.watermark(t, "github:bob"); got != e.Sequence {
+		t.Errorf("bob's own watermark = %d, want %d", got, e.Sequence)
+	}
+	actor, p := f.lastMarkedReadPayload(t)
+	if actor != "github:bob" || p["marked_by"] != "github:bob" || p["captain_subject"] != "github:bob" || p["captain_subject_basis"] != digestBasisCaller {
+		t.Errorf("digest_marked_read actor=%q payload=%v, want marked_by/captain_subject github:bob basis caller", actor, p)
+	}
+	// Re-read: bob's default GET still reads the SEAT's (unmarked) window.
+	if d := f.getBasis(t, digestBob, ""); d.CaptainSubject != "github:alice" || d.HasWatermark {
+		t.Errorf("bob's re-read = captain_subject %q has_watermark %v, want alice's unmarked window", d.CaptainSubject, d.HasWatermark)
+	}
+}
+
+// TestDigestCaptain_VacantSeatFallsBackToCaller: a relinquished seat is
+// VACANT, so both routes key on the caller and say so ("caller_vacant").
+func TestDigestCaptain_VacantSeatFallsBackToCaller(t *testing.T) {
+	f := newDigestPG(t).withCaptainStore(t)
+	e := f.append(t, f.seedRun(t, "succeeded"), nil, "merge_verdict_recorded", map[string]any{"verdict": "merged"})
+	f.seedCaptainEntry(t, captain.CategoryAssigned, "github:alice")
+	f.seedCaptainEntry(t, captain.CategoryRelinquished, "github:alice")
+	if d := f.getBasis(t, digestBob, ""); d.CaptainSubject != "github:bob" || d.CaptainSubjectBasis != digestBasisCallerVacant {
+		t.Errorf("GET on a vacant seat = %q / %q, want github:bob / caller_vacant", d.CaptainSubject, d.CaptainSubjectBasis)
+	}
+	if res := f.markReadResp(t, digestBob, e.Sequence); res.CaptainSubject != "github:bob" || res.CaptainSubjectBasis != digestBasisCallerVacant {
+		t.Errorf("mark-read on a vacant seat = %+v, want github:bob / caller_vacant", res)
+	}
+}
+
+// TestDigestCaptain_UnavailableFallsBackToCaller: an UNWIRED CaptainStore and
+// a FAILING captain read are asserted separately; both key on the caller and
+// report "caller_unavailable", never a vacancy.
+func TestDigestCaptain_UnavailableFallsBackToCaller(t *testing.T) {
+	t.Run("store_nil", func(t *testing.T) {
+		f := newDigestPG(t)
+		e := f.append(t, f.seedRun(t, "succeeded"), nil, "merge_verdict_recorded", map[string]any{"verdict": "merged"})
+		if d := f.getBasis(t, digestBob, ""); d.CaptainSubject != "github:bob" || d.CaptainSubjectBasis != digestBasisCallerUnavailable {
+			t.Errorf("GET = %q / %q, want github:bob / caller_unavailable", d.CaptainSubject, d.CaptainSubjectBasis)
+		}
+		if res := f.markReadResp(t, digestBob, e.Sequence); res.CaptainSubjectBasis != digestBasisCallerUnavailable {
+			t.Errorf("mark-read basis = %q, want caller_unavailable", res.CaptainSubjectBasis)
+		}
+	})
+	t.Run("read_error", func(t *testing.T) {
+		f := newDigestPG(t)
+		e := f.append(t, f.seedRun(t, "succeeded"), nil, "merge_verdict_recorded", map[string]any{"verdict": "merged"})
+		f.seedCaptainEntry(t, captain.CategoryAssigned, "github:alice")
+		closed, err := pgxpool.New(context.Background(), f.pool.Config().ConnString())
+		if err != nil {
+			t.Fatalf("second pool: %v", err)
+		}
+		closed.Close()
+		f.srv.cfg.CaptainStore = captain.NewStore(closed)
+		if d := f.getBasis(t, digestBob, ""); d.CaptainSubject != "github:bob" || d.CaptainSubjectBasis != digestBasisCallerUnavailable {
+			t.Errorf("GET with a failing captain read = %q / %q, want github:bob / caller_unavailable", d.CaptainSubject, d.CaptainSubjectBasis)
+		}
+		if res := f.markReadResp(t, digestBob, e.Sequence); res.CaptainSubjectBasis != digestBasisCallerUnavailable {
+			t.Errorf("mark-read basis = %q, want caller_unavailable", res.CaptainSubjectBasis)
+		}
+	})
+}
+
+// TestDigestCaptain_GetOverride (approval condition 2): the read-only
+// captain_subject override is taken verbatim and its basis resolved against
+// BOTH the caller and the seat — "explicit" when it names neither.
+func TestDigestCaptain_GetOverride(t *testing.T) {
+	f := newDigestPG(t).withCaptainStore(t)
+	e := f.append(t, f.seedRun(t, "succeeded"), nil, "merge_verdict_recorded", map[string]any{"verdict": "merged"})
+	f.seedCaptainEntry(t, captain.CategoryAssigned, "github:alice")
+	carol := digestTokenIdentity("github:carol", scopeDigestRead, scopeDigestMarkRead)
+	f.markReadResp(t, carol, e.Sequence)
+	for _, tc := range []struct{ override, wantBasis string }{
+		{"github:carol", digestBasisExplicit},
+		{"github:bob", digestBasisCaller},
+		{"github:alice", digestBasisCaptain},
+	} {
+		d := f.getBasis(t, digestBob, "&captain_subject="+tc.override)
+		if d.CaptainSubject != tc.override || d.CaptainSubjectBasis != tc.wantBasis {
+			t.Errorf("override %q = %q / %q, want %q / %q", tc.override, d.CaptainSubject, d.CaptainSubjectBasis, tc.override, tc.wantBasis)
+		}
+	}
+	// The explicit override reads carol's watermark, not the seat's.
+	if d := f.getBasis(t, digestBob, "&captain_subject=github:carol"); !d.HasWatermark || d.Watermark != e.Sequence {
+		t.Errorf("explicit override watermark = %d (has %v), want carol's %d", d.Watermark, d.HasWatermark, e.Sequence)
+	}
+}
+
+// TestDigestCaptain_GetOverrideRejected: an empty or over-length override is
+// 400 validation_failed naming the field.
+func TestDigestCaptain_GetOverrideRejected(t *testing.T) {
+	f := newDigestPG(t).withCaptainStore(t)
+	for name, q := range map[string]string{
+		"empty":       "&captain_subject=",
+		"over_length": "&captain_subject=" + strings.Repeat("x", digestCaptainSubjectMaxBytes+1),
+	} {
+		w := serveDigest(t, f.srv, http.MethodGet, "/v0/digest?repo="+digestPGRepo+q, "", digestBob)
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("%s override = %d, want 400:\n%s", name, w.Code, w.Body.String())
+			continue
+		}
+		if env := digestErrorBody(t, w); env.Code != "validation_failed" || env.Details["field"] != "captain_subject" {
+			t.Errorf("%s override error = %+v, want validation_failed on captain_subject", name, env)
+		}
+	}
+	// A subject exactly at the cap is accepted.
+	f.getBasis(t, digestBob, "&captain_subject="+strings.Repeat("x", digestCaptainSubjectMaxBytes))
+}
+
+// TestDigestCaptain_MarkReadRefusesCaptainSubject (C5): mark-read accepts no
+// captain_subject — the body is refused with 400 and NO key moves.
+func TestDigestCaptain_MarkReadRefusesCaptainSubject(t *testing.T) {
+	f := newDigestPG(t).withCaptainStore(t)
+	e := f.append(t, f.seedRun(t, "succeeded"), nil, "merge_verdict_recorded", map[string]any{"verdict": "merged"})
+	f.seedCaptainEntry(t, captain.CategoryAssigned, "github:alice")
+	w := serveDigest(t, f.srv, http.MethodPost, "/v0/digest/mark-read",
+		fmt.Sprintf(`{"repo":%q,"to_sequence":%d,"captain_subject":"github:alice"}`, digestPGRepo, e.Sequence), digestBob)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("mark-read with captain_subject = %d, want 400:\n%s", w.Code, w.Body.String())
+	}
+	if env := digestErrorBody(t, w); env.Code != "validation_failed" {
+		t.Errorf("code = %q, want validation_failed", env.Code)
+	}
+	if f.watermark(t, "github:alice") != -1 || f.watermark(t, "github:bob") != -1 || f.markedReadCount(t) != 0 {
+		t.Error("a refused mark-read moved a watermark or appended a chain entry")
 	}
 }
