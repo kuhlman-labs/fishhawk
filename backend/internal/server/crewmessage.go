@@ -91,6 +91,13 @@ type crewMessageResponse struct {
 	// COMMITTED but whose derived row did not project: the operation
 	// HAPPENED and must not be retried (crewmessage.ProjectionError).
 	ProjectionDegraded bool `json:"projection_degraded,omitempty"`
+	// ConsultDeadline and ConsultBudgetRemaining are set ONLY on the send
+	// response of a run-bound response_required consult (E77.5 / #3739): the
+	// effective deadline the responder is held to, and how many more consults
+	// the stage may send. Both omitempty, so every other response is
+	// byte-identical to E77.3's.
+	ConsultDeadline        *time.Time `json:"consult_deadline,omitempty"`
+	ConsultBudgetRemaining *int       `json:"consult_budget_remaining,omitempty"`
 }
 
 // crewMessageAnswer is the first reply in a consulted message's thread, in
@@ -358,8 +365,9 @@ func (s *Server) handleSendCrewMessage(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
 	var (
-		role  crewmessage.Role
-		actor crewmessage.Actor
+		role      crewmessage.Role
+		actor     crewmessage.Actor
+		execStage *run.Stage
 	)
 	tokenRunID, runBound := runBoundTokenRunID(id)
 	if runBound {
@@ -376,7 +384,10 @@ func (s *Server) handleSendCrewMessage(w http.ResponseWriter, r *http.Request) {
 				"get run failed", map[string]any{"error": err.Error()})
 			return
 		}
-		st := s.resolveExecutingStageType(r, runRow)
+		var st run.StageType
+		if execStage = s.resolveExecutingStage(r, runRow); execStage != nil {
+			st = execStage.Type
+		}
 		derived, ok := crewSenderRoleForStage(st)
 		if !ok {
 			s.writeError(w, r, http.StatusForbidden, "crew_sender_not_derivable",
@@ -441,23 +452,66 @@ func (s *Server) handleSendCrewMessage(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	row, err := s.cfg.CrewMailbox.Send(ctx, crewmessage.SendParams{
-		RawMessage: doc,
-		Actor:      actor,
-		AccountID:  identityAccountID(ctx),
-	})
-	var projErr *crewmessage.ProjectionError
-	if errors.As(err, &projErr) && row != nil {
-		resp := crewRowToResponse(*row)
-		resp.ProjectionDegraded = true
-		s.writeJSON(w, r, http.StatusCreated, resp)
-		return
+	// The consult branch (E77.5 / #3739): a run-bound response_required
+	// consult is bounded and routed BEFORE Send, so both refusals append
+	// NOTHING. It reads the SAME parsed msg the chain will record.
+	params := crewmessage.SendParams{RawMessage: doc, Actor: actor, AccountID: identityAccountID(ctx)}
+	var (
+		consult       *CrewConsultRequest
+		responder     CrewResponder
+		budgetRemains int
+	)
+	if runBound && msg.Type == crewmessage.TypeConsult && msg.ResponseRequired {
+		used, err := s.crewConsultBudgetUsed(ctx, tokenRunID, execStage.ID)
+		if err != nil {
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				"count crew consults failed", map[string]any{"error": err.Error()})
+			return
+		}
+		if used >= maxCrewConsultsPerStage {
+			s.writeError(w, r, http.StatusUnprocessableEntity, "crew_consult_budget_exhausted",
+				"this stage has exhausted its consult budget; proceed on what you can infer",
+				map[string]any{"max": maxCrewConsultsPerStage, "used": used})
+			return
+		}
+		var found bool
+		if responder, found = s.cfg.CrewResponders.Lookup(msg.RecipientRole); !found {
+			s.writeError(w, r, http.StatusUnprocessableEntity, "crew_responder_unavailable",
+				"no responder is registered for the consulted role; proceed on what you can infer",
+				map[string]any{"recipient_role": string(msg.RecipientRole)})
+			return
+		}
+		stageID := execStage.ID
+		params.StageID = &stageID
+		budgetRemains = maxCrewConsultsPerStage - used - 1
+		consult = &CrewConsultRequest{
+			RunID: tokenRunID, StageID: stageID,
+			SenderRole: msg.SenderRole, RecipientRole: msg.RecipientRole, Anchor: msg.Anchor,
+			Question: msg.Payload.Question, WhatICanInfer: msg.Payload.WhatICanInfer, Context: msg.Payload.Context,
+			Evidence: msg.Evidence, Deadline: crewConsultDeadline(msg, time.Now().UTC()),
+		}
 	}
-	if err != nil {
+
+	row, err := s.cfg.CrewMailbox.Send(ctx, params)
+	var projErr *crewmessage.ProjectionError
+	degraded := errors.As(err, &projErr) && row != nil
+	if err != nil && !degraded {
 		s.writeCrewMessageError(w, r, err)
 		return
 	}
-	s.writeJSON(w, r, http.StatusCreated, crewRowToResponse(*row))
+	resp := crewRowToResponse(*row)
+	resp.ProjectionDegraded = degraded
+	if consult != nil {
+		// The consult is on the chain (a projection gap does not undo it), so
+		// the responder runs either way; Dispose falls back to upserting the
+		// terminal row when the send projection never landed.
+		consult.SentSequence = row.SentSequence
+		deadline := consult.Deadline
+		resp.ConsultDeadline = &deadline
+		resp.ConsultBudgetRemaining = &budgetRemains
+		s.dispatchCrewConsult(ctx, responder, *consult)
+	}
+	s.writeJSON(w, r, http.StatusCreated, resp)
 }
 
 // handleGetCrewMessage implements GET /v0/crew-messages/{sequence}: the row's
@@ -770,7 +824,7 @@ func (s *Server) parseCrewAnchorFilter(w http.ResponseWriter, r *http.Request) (
 // answers a consult, and no HTTP caller is one. A run-bound token is refused
 // first (agent_token_required), then every other identity
 // (responder_required). The behaviour lives in RespondToCrewMessage, the
-// in-process entry point E77.5's responder calls; if a later change admits an
+// in-process entry point E77.5's consult dispatcher (crew_consult.go) calls; if a later change admits an
 // HTTP responder identity, the responder_required rung is the single place to
 // widen.
 func (s *Server) handleRespondCrewMessage(w http.ResponseWriter, r *http.Request) {
@@ -798,8 +852,8 @@ type RespondParams struct {
 	Actor         crewmessage.Actor
 }
 
-// RespondToCrewMessage is the in-process responder entry point (E77.5 #3739
-// calls it): it sends the reply threaded under the answered message's thread
+// RespondToCrewMessage is the in-process responder entry point
+// (runCrewConsult in crew_consult.go calls it, E77.5 #3739): it sends the reply threaded under the answered message's thread
 // root, then disposes the answered message as accepted. The two chain
 // entries are sequential, not one transaction: a failure between them leaves
 // a recorded reply on a still-open message, which a retried Dispose closes.

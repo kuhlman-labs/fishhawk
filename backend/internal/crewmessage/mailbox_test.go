@@ -816,3 +816,62 @@ func TestProjectSentRow_Defensive(t *testing.T) {
 		t.Error("empty actor must record NULL kind and subject")
 	}
 }
+
+// TestMailbox_Send_StampsStageID pins E77.5's SendParams.StageID threading: a
+// run-anchored send carrying a StageID stamps the crew_message_sent entry's
+// stage_id (what makes the per-stage consult budget countable from the
+// chain), one without leaves it NULL, and the stamped entry's hash still
+// re-verifies from its stored columns — stage_id is a hash input the chain
+// already carries, so stamping it is additive.
+func TestMailbox_Send_StampsStageID(t *testing.T) {
+	f := newMailboxFixture(t, 0)
+	ctx := context.Background()
+	stageID := uuid.New()
+	if _, err := f.pool.Exec(ctx, `INSERT INTO stages (id, run_id, sequence, stage_type, executor_kind, executor_ref, state)
+		VALUES ($1, $2, 1, 'plan', 'agent', 'claude-code', 'running')`, stageID, f.runID); err != nil {
+		t.Fatalf("seed stage: %v", err)
+	}
+	stamped, err := f.mb.Send(ctx, SendParams{RawMessage: f.runNotice(), Actor: mbActor, StageID: &stageID})
+	if err != nil {
+		t.Fatalf("send with stage: %v", err)
+	}
+	bare := f.send(f.runNotice(), nil, nil)
+
+	type stored struct {
+		runID, stageID *uuid.UUID
+		ts             time.Time
+		category       string
+		actorKind      *audit.ActorKind
+		actorSubject   *string
+		payload        []byte
+		prevHash       *string
+		entryHash      string
+	}
+	read := func(seq int64) stored {
+		t.Helper()
+		var s stored
+		if err := f.pool.QueryRow(ctx, `SELECT run_id, stage_id, ts, category, actor_kind, actor_subject, payload, prev_hash, entry_hash
+			FROM audit_entries WHERE sequence = $1`, seq).Scan(&s.runID, &s.stageID, &s.ts, &s.category,
+			&s.actorKind, &s.actorSubject, &s.payload, &s.prevHash, &s.entryHash); err != nil {
+			t.Fatalf("read entry %d: %v", seq, err)
+		}
+		return s
+	}
+	got := read(stamped.SentSequence)
+	if got.stageID == nil || *got.stageID != stageID {
+		t.Fatalf("stamped entry stage_id = %v, want %s", got.stageID, stageID)
+	}
+	if b := read(bare.SentSequence); b.stageID != nil {
+		t.Fatalf("send without StageID stamped stage_id = %s, want NULL", *b.stageID)
+	}
+	h, err := audit.ComputeEntryHash(audit.HashInputs{
+		RunID: got.runID, StageID: got.stageID, Timestamp: got.ts, Category: got.category,
+		ActorKind: got.actorKind, ActorSubject: got.actorSubject, Payload: got.payload, PrevHash: got.prevHash,
+	})
+	if err != nil {
+		t.Fatalf("recompute hash: %v", err)
+	}
+	if h != got.entryHash {
+		t.Fatalf("stamped entry hash does not re-verify: recomputed %s, stored %s", h, got.entryHash)
+	}
+}
