@@ -271,6 +271,17 @@ var mcpToolScopes = map[string]mcpToolScopeRule{
 	// so runBoundSubjectOK stays false.
 	"fishhawk_handover_brief": {anyOf: []string{scopeDigestRead}},
 
+	// fishhawk_delegation_confirm (E76.5 / #3768) dials THREE endpoints:
+	// action=read GETs /v0/repos/{owner}/{name}/delegation/confirmation
+	// (delegation_confirm.go handleGetDelegationConfirmation), which checks NO
+	// scope — its narrowing is the shared repoDashPrelude, the
+	// fishhawk_delegation precedent — and confirm/lower POST routes that
+	// enforce requireWriteScope(scopeDelegationConfirmWrite) = write:approvals
+	// themselves; the inner REST call stays authoritative for the action
+	// invoked. Both writes refuse a run-bound subject
+	// (delegation_agent_identity_refused), so runBoundSubjectOK stays false.
+	"fishhawk_delegation_confirm": mcpScopeAuthenticatedOnly,
+
 	// --- refinement gate. draft_epic dials /v0/refinement/sessions and its
 	// siblings, every one behind requireWriteScope(scopeRefinementGate)
 	// (refinement.go, refinement_file.go).

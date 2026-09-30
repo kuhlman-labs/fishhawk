@@ -345,6 +345,7 @@ func registerTools(srv *mcp.Server, resolver *runResolver) {
 	registerDigest(srv, resolver)
 	registerCaptain(srv, resolver)
 	registerHandoverBrief(srv, resolver)
+	registerDelegationConfirm(srv, resolver)
 }
 
 // GetActiveRunInput is the tool's input schema (E19.3 / #343). All

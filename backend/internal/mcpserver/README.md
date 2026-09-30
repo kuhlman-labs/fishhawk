@@ -44,10 +44,12 @@ The package presents **314** exported top-level identifiers, but only the three
 above are intended entry points. The other 301 are the tool I/O
 request/response structs. The MCP SDK's jsonschema reflection requires each
 tool's input/output type — and its exported fields — to build the tool's
-schema, so **unexporting them would break tool registration**. In `package
-main` their exportedness was cosmetic; the move to a library package makes it
-real. They are deliberately NOT unexported (that refusal is correct — see
-#2408); instead `export_surface_test.go` pins the full sorted surface against a
+schema. Strictly it is the FIELDS that must be exported, not the type name:
+reflection reads a struct's exported fields whatever the type is called, and
+`fishhawk_delegation_confirm` (E76.5 / #3768) registers with UNEXPORTED I/O
+types for exactly that reason, so it adds nothing to the pinned surface. The
+301 grandfathered names are still deliberately NOT unexported (that refusal is
+correct — see #2408; renaming them is churn with no behavioural gain); instead `export_surface_test.go` pins the full sorted surface against a
 baseline generated from the tree, so a NEW export is caught in either direction
 while the pre-existing ones are grandfathered. (The figure above is a snapshot; `TestExportedSurfaceMatchesBaseline`'s count-mismatch message names this heading as a site to update when it moves.)
 
@@ -2580,3 +2582,13 @@ detail is absent.
 - **Explicit output schema.** The brief carries `uuid.UUID` fields (digest items' run ids, in-flight campaign / run ids); `handoverBriefOutputSchema` maps them to a string schema (the `fishhawk_digest` precedent) so the SHARED `handoverbrief.Brief` wire model passes the SDK's own output validation. `TestHandoverBriefTool_WireRoundTrip` drives the registered tool over a real client session and reddens without it.
 - **Bounded.** A floor that cannot fit the session budget is a tool error wrapping `handoverbrief.ErrBudgetTooSmall`, never an over-budget result. Each cut part's cursor `call` names the exact underlying REST query (`GET /v0/digest?...`, `GET /v0/campaigns?...`, `GET /v0/runs?...`, the delegation read).
 - **Authorization.** The `/mcp` gate row (`backend/internal/server/mcpscopes.go`) is `anyOf: [read:audit]` — exactly the scope `handleGetHandoverBrief` enforces (`scopeHandoverBriefRead = scopeDigestRead`), no run-bound subject (`TestMCPToolScopeTable_HandoverBriefMirrorsReadAudit`).
+
+## Delegation confirmation (`fishhawk_delegation_confirm`, [E76.5 / #3768](https://github.com/kuhlman-labs/fishhawk/issues/3768))
+
+`delegation_confirm.go` registers `fishhawk_delegation_confirm`, a thin wrapper over `GET /v0/repos/{owner}/{name}/delegation/confirmation` (`action=read`, the default) and `POST .../delegation/confirm` / `POST .../delegation/lower` (`backend/internal/server/delegation_confirm.go`; the fold — confirmation state resetting at every seat change, the captain-in-force rule, `hash_stale` — and `ValidateLower` live in `backend/internal/delegationconfirm/README.md`, not here). The three `apiClient` methods carrying the wire (`GetDelegationConfirmation`, `PostDelegationConfirm`, `PostDelegationLower`) are declared in `delegation_confirm.go`, not `client.go`.
+
+- **Closed action set, no raise.** The action set is exactly `delegationconfirm.Actions()` = `{read, confirm, lower}`. The input schema is SUPPLIED (`delegationConfirmInputSchema`: the reflected schema plus enums) so it ADVERTISES that set as an enum and restricts both tier-bearing fields — `proposed_tier` and `proposed_escalation.max_autonomy` — to `{low, medium}`: `high` can never be strictly lower than any tier, so the schema cannot name it, and the SDK refuses such a call before the handler runs. The backend's `ValidateLower` remains the authority for "strictly lower than THIS workflow's current tier". `TestDelegationConfirmTool_ActionSetIsClosed` pins the enums; `TestDelegationConfirmTool_RegisteredSchemaRefusesRaise` drives the registered tool over a real session and asserts `action=raise`, `proposed_tier=high` and an escalation ceiling of `high` never reach the backend; `TestToolDescriptions_ConformToHouseStyle` asserts the registered wire enum by name.
+- **Local refusals, before any request.** A missing repo (after the `GITHUB_REPOSITORY` fallback), an unknown action, a field on an action that does not take it (`content_hash` is confirm-only; `proposed_tier` / `proposed_escalation` / `reason` / `parent_epic` / `title_vars` / `labels` are lower-only; `workflow` is refused on read, which returns every workflow) and a write naming no workflow. A lower-only field on confirm is REFUSED rather than ignored, so a caller never believes a proposal was recorded when only a confirmation was. `TestDelegationConfirmTool_LocalRefusals` asserts one case per branch and zero backend requests.
+- **Every other refusal is the backend's.** The tool never re-derives confirmation state or re-checks the captain; an agent calling `confirm`/`lower` is refused by the backend's single guard (`delegation_agent_identity_refused`) and the `*apiError` is passed through with its code (`TestDelegationConfirmTool_BackendRefusalIsToolError`). The tool never sends `delegated`.
+- **Bounded (ADR-077).** `boundDelegationConfirmOutput`: B1 drops each workflow's `confirmation` / `lower_proposal` detail and a verb event's `payload`, keeping every `status` / `reason` / `current_content_hash`; B2 (read only) halves `workflows` from the tail while keeping `unconfirmed_workflows` WHOLE; the FLOOR drops every workflow entry and halves the unconfirmed id list until the MEASURED floor fits. Every elision names `GET /v0/repos/{owner}/{name}/delegation/confirmation`. `TestDelegationConfirmTool_BoundsEveryTier` drives each tier.
+- **Authorization.** The `/mcp` gate row (`backend/internal/server/mcpscopes.go`) is authenticated-only: `read` dials a route that checks no scope (the `fishhawk_delegation` precedent) and `confirm`/`lower` dial routes that enforce `write:approvals` themselves; no run-bound subject.
