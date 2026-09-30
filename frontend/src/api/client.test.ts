@@ -621,3 +621,164 @@ describe('api.getAuditExportDownload', () => {
     expect(err.message).toBe('audit store down');
   });
 });
+
+describe('change of command on the bridge (E76.6 / #3769)', () => {
+  beforeEach(() => vi.unstubAllGlobals());
+  afterEach(() => vi.unstubAllGlobals());
+
+  function lastURL(fetchMock: ReturnType<typeof vi.fn>): string {
+    return fetchMock.mock.calls.at(-1)?.[0] as string;
+  }
+
+  function lastBody(fetchMock: ReturnType<typeof vi.fn>): Record<string, unknown> {
+    return JSON.parse(String(lastInit(fetchMock).body)) as Record<string, unknown>;
+  }
+
+  it('getCaptain GETs /v0/captain with repo encoded once as a query param', async () => {
+    const fetchMock = mockFetch();
+    await api.getCaptain('acme/app');
+    expect(lastURL(fetchMock)).toBe('/v0/captain?repo=acme%2Fapp');
+    expect(lastInit(fetchMock).method ?? 'GET').toBe('GET');
+    expect(lastInit(fetchMock).body).toBeUndefined();
+  });
+
+  it('captainOffer POSTs repo + successor as JSON', async () => {
+    const fetchMock = mockFetch();
+    await api.captainOffer({ repo: 'acme/app', successor: 'github:bob' });
+    const init = lastInit(fetchMock);
+    expect(lastURL(fetchMock)).toBe('/v0/captain/offer');
+    expect(init.method).toBe('POST');
+    expect(headerOf(init, 'Content-Type')).toBe('application/json');
+    expect(lastBody(fetchMock)).toEqual({ repo: 'acme/app', successor: 'github:bob' });
+  });
+
+  it.each([
+    ['withdraw', (r: string) => api.captainWithdraw(r)],
+    ['accept', (r: string) => api.captainAccept(r)],
+    ['relinquish', (r: string) => api.captainRelinquish(r)],
+    ['claim', (r: string) => api.captainClaim(r)],
+  ] as const)(
+    'captain %s POSTs EXACTLY {repo} — never successor, never delegated',
+    async (verb, call) => {
+      const fetchMock = mockFetch();
+      await call('acme/app');
+      const init = lastInit(fetchMock);
+      expect(lastURL(fetchMock)).toBe(`/v0/captain/${verb}`);
+      expect(init.method).toBe('POST');
+      expect(headerOf(init, 'Content-Type')).toBe('application/json');
+      const body = lastBody(fetchMock);
+      expect(body).toEqual({ repo: 'acme/app' });
+      expect(body).not.toHaveProperty('successor');
+      expect(body).not.toHaveProperty('delegated');
+    },
+  );
+
+  it('captainOffer never sends delegated', async () => {
+    const fetchMock = mockFetch();
+    await api.captainOffer({ repo: 'acme/app', successor: 'github:bob' });
+    expect(lastBody(fetchMock)).not.toHaveProperty('delegated');
+  });
+
+  it('getHandoverBrief carries repo and omits every unset selector', async () => {
+    const fetchMock = mockFetch();
+    await api.getHandoverBrief({ repo: 'acme/app' });
+    expect(lastURL(fetchMock)).toBe('/v0/handover-brief?repo=acme%2Fapp');
+  });
+
+  it('getHandoverBrief serialises section + both sequences, keeping an explicit 0', async () => {
+    const fetchMock = mockFetch();
+    await api.getHandoverBrief({
+      repo: 'acme/app',
+      section: 'in_flight',
+      fromSequence: 0,
+      toSequence: 42,
+    });
+    const url = new URL(lastURL(fetchMock), 'http://localhost');
+    expect(url.pathname).toBe('/v0/handover-brief');
+    expect(url.searchParams.get('repo')).toBe('acme/app');
+    expect(url.searchParams.get('section')).toBe('in_flight');
+    expect(url.searchParams.get('from_sequence')).toBe('0');
+    expect(url.searchParams.get('to_sequence')).toBe('42');
+  });
+
+  it('getRepoDelegation encodes owner and name separately and omits unset params', async () => {
+    const fetchMock = mockFetch();
+    await api.getRepoDelegation('ac/me', 'ap/p');
+    expect(lastURL(fetchMock)).toBe('/v0/repos/ac%2Fme/ap%2Fp/delegation');
+    expect(lastInit(fetchMock).method ?? 'GET').toBe('GET');
+  });
+
+  it('getRepoDelegation serialises source, ref and workflow when set', async () => {
+    const fetchMock = mockFetch();
+    await api.getRepoDelegation('acme', 'app', {
+      source: 'run_cache',
+      ref: 'feat/x',
+      workflow: 'feature_change',
+    });
+    const url = new URL(lastURL(fetchMock), 'http://localhost');
+    expect(url.pathname).toBe('/v0/repos/acme/app/delegation');
+    expect(url.searchParams.get('source')).toBe('run_cache');
+    expect(url.searchParams.get('ref')).toBe('feat/x');
+    expect(url.searchParams.get('workflow')).toBe('feature_change');
+  });
+
+  it('getRepoDelegationConfirmation hits /delegation/confirmation with separate encoding', async () => {
+    const fetchMock = mockFetch();
+    await api.getRepoDelegationConfirmation('ac/me', 'ap/p');
+    expect(lastURL(fetchMock)).toBe('/v0/repos/ac%2Fme/ap%2Fp/delegation/confirmation');
+    await api.getRepoDelegationConfirmation('acme', 'app', { source: 'ref', ref: 'main' });
+    expect(lastURL(fetchMock)).toBe(
+      '/v0/repos/acme/app/delegation/confirmation?source=ref&ref=main',
+    );
+  });
+
+  it('confirmRepoDelegation POSTs the exact confirm body and never delegated', async () => {
+    const fetchMock = mockFetch();
+    await api.confirmRepoDelegation('ac/me', 'ap/p', {
+      workflow: 'feature_change',
+      content_hash: 'c'.repeat(64),
+      source: 'ref',
+    });
+    const init = lastInit(fetchMock);
+    expect(lastURL(fetchMock)).toBe('/v0/repos/ac%2Fme/ap%2Fp/delegation/confirm');
+    expect(init.method).toBe('POST');
+    expect(headerOf(init, 'Content-Type')).toBe('application/json');
+    expect(lastBody(fetchMock)).toEqual({
+      workflow: 'feature_change',
+      content_hash: 'c'.repeat(64),
+      source: 'ref',
+    });
+    expect(lastBody(fetchMock)).not.toHaveProperty('delegated');
+  });
+
+  it('lowerRepoDelegation POSTs the exact lower body and never delegated', async () => {
+    const fetchMock = mockFetch();
+    await api.lowerRepoDelegation('acme', 'app', {
+      workflow: 'feature_change',
+      proposed_tier: 'low',
+      proposed_escalation: { paths: ['backend/**'], max_autonomy: 'low' },
+      reason: 'new captain',
+      labels: ['area:backend'],
+    });
+    const init = lastInit(fetchMock);
+    expect(lastURL(fetchMock)).toBe('/v0/repos/acme/app/delegation/lower');
+    expect(init.method).toBe('POST');
+    expect(headerOf(init, 'Content-Type')).toBe('application/json');
+    expect(lastBody(fetchMock)).toEqual({
+      workflow: 'feature_change',
+      proposed_tier: 'low',
+      proposed_escalation: { paths: ['backend/**'], max_autonomy: 'low' },
+      reason: 'new captain',
+      labels: ['area:backend'],
+    });
+    expect(lastBody(fetchMock)).not.toHaveProperty('delegated');
+  });
+
+  it('attaches the CSRF header to a captain verb', async () => {
+    setCookie(CSRF_COOKIE_NAME, 'tok-captain');
+    const fetchMock = mockFetch();
+    await api.captainClaim('acme/app');
+    expect(headerOf(lastInit(fetchMock), CSRF_HEADER_NAME)).toBe('tok-captain');
+    clearCookie(CSRF_COOKIE_NAME);
+  });
+});
