@@ -51,6 +51,32 @@ None is an issue-comment surface or a decision-bearing category (see
 `docs/issue-comment-surfaces.md`). `page_pending` RECORDS the obligation to
 page the previous captain; delivery is E77.6 #3740 / E60.3 #2292.
 
+## Consumers: the current-captain read contract (E76.3 / #3766)
+
+Every surface that is ENRICHED by the captain (ADR-083 rule 6) reads it through
+ONE server helper, `(*server.Server).currentCaptain(ctx, accountID, repo)
+(subject, identityVerified, basis)` in `backend/internal/server/captain.go`,
+which wraps `Store.Read` and folds the outcome into a trichotomy every consumer
+branches on identically:
+
+| `basis` | Meaning | Consumer obligation |
+|---|---|---|
+| `captain` | a seat is held; `subject` / `identityVerified` are the derived `Record`'s | use it |
+| `vacant` | the read succeeded and `State.Current` is nil | STATE the vacancy; do not imply it |
+| `unavailable` | `CaptainStore` not wired, or the read failed (logged at WARN) | degrade to the pre-E76.3 behaviour; never report it as a vacancy |
+
+It never returns an error: every consumer is a best-effort enrichment that must
+not fail its request. `accountID` is EXPLICIT: a request handler passes
+`identityAccountID(ctx)`; the issue-comment notifier passes the RUN's account
+(`run.Run.AccountID`, through `issueCommentCaptainResolver`, which maps an
+unparseable non-empty id to `unavailable` rather than the untenanted partition)
+because it fires from transition hooks whose ctx carries no request identity.
+The result is never an input to approval quorum or eligibility (ADR-083 rule 1).
+The notifier consumes it through the narrow `issuecomment.CaptainResolver` seam
+(nil = today's surfaces byte-for-byte); see `docs/issue-comment-surfaces.md`.
+Later consumers — the push channel's page delivery (E60.3 #2292) and crew-message
+paging (E77.6 #3740) — call the same helper rather than reading the store.
+
 ## Derive
 
 `Derive(repo, entries)` is a pure fold in ascending `sequence` order:

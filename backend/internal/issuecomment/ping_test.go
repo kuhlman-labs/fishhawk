@@ -2,6 +2,7 @@ package issuecomment
 
 import (
 	"encoding/json"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -532,5 +533,124 @@ func TestAcceptanceTriageNeedsHuman_Class5(t *testing.T) {
 	}
 	if class != "5" || got != disposition {
 		t.Errorf("class/disposition = %q/%q, want 5/%q", class, got, disposition)
+	}
+}
+
+// activeMentions returns every forge mention token ("@<login>") in body that
+// sits OUTSIDE a backtick code span — what GitHub/GitLab would actually turn
+// into a notification. A mention needs a start-of-text or non-word character
+// before the '@'.
+func activeMentions(body string) []string {
+	var outside strings.Builder
+	inSpan := false
+	for _, r := range body {
+		if r == '`' {
+			inSpan = !inSpan
+			outside.WriteRune(' ')
+			continue
+		}
+		if inSpan {
+			outside.WriteRune(' ')
+			continue
+		}
+		outside.WriteRune(r)
+	}
+	return activeMentionPattern.FindAllString(outside.String(), -1)
+}
+
+var activeMentionPattern = regexp.MustCompile(`(?:^|[^A-Za-z0-9_@.])@[A-Za-z0-9][A-Za-z0-9-]*`)
+
+// TestRenderCaptainAddress pins the three mention conditions (E76.3 /
+// #3766): identity verified, provider prefix == the run's comment family,
+// and the remainder passing validApproverLogin. Each code-span arm fails
+// exactly one condition while satisfying the others.
+func TestRenderCaptainAddress(t *testing.T) {
+	cases := []struct {
+		name     string
+		subject  string
+		verified bool
+		family   string
+		want     string
+	}{
+		{"verified github on github", "github:alice", true, "github", "@alice"},
+		{"verified gitlab on gitlab", "gitlab:someone", true, "gitlab", "@someone"},
+		{"static subject", "brett@local-mcp", false, "github", "`brett@local-mcp`"},
+		{"gitlab subject on github family", "gitlab:someone", true, "github", "`gitlab:someone`"},
+		{"unverified github subject", "github:alice", false, "github", "`github:alice`"},
+		{"verified but invalid login", "github:a.b", true, "github", "`github:a.b`"},
+		{"backtick cannot close the span", "x`@y", false, "github", "`x'@y`"},
+		{"sanitizes to nothing", "\x00", false, "github", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := renderCaptainAddress(tc.subject, tc.verified, tc.family); got != tc.want {
+				t.Errorf("renderCaptainAddress(%q, %v, %q) = %q, want %q", tc.subject, tc.verified, tc.family, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestAddressPing pins the resolution trichotomy on the posted body, one
+// arm per basis plus the nil (no resolver) arm.
+func TestAddressPing(t *testing.T) {
+	base := pingCommentBody("📋 A plan is ready and awaiting your review.", "https://app.example/runs/abc")
+
+	t.Run("nil resolution is today's body", func(t *testing.T) {
+		if got := addressPing(base, nil, "github"); got != base {
+			t.Errorf("got %q, want %q", got, base)
+		}
+	})
+	t.Run("unavailable is today's body, never a vacancy", func(t *testing.T) {
+		got := addressPing(base, &CaptainResolution{Basis: CaptainBasisUnavailable}, "github")
+		if got != base {
+			t.Errorf("got %q, want %q", got, base)
+		}
+	})
+	t.Run("vacant appends the vacancy sentence", func(t *testing.T) {
+		got := addressPing(base, &CaptainResolution{Basis: CaptainBasisVacant}, "github")
+		if want := base + " " + captainVacantSentence; got != want {
+			t.Errorf("got %q, want %q", got, want)
+		}
+	})
+	t.Run("verified forge captain is an active mention", func(t *testing.T) {
+		got := addressPing(base, &CaptainResolution{Subject: "github:alice", IdentityVerified: true, Basis: CaptainBasisCaptain}, "github")
+		if want := "Captain @alice: " + base; got != want {
+			t.Errorf("got %q, want %q", got, want)
+		}
+		if m := activeMentions(got); len(m) != 1 || !strings.HasSuffix(m[0], "@alice") {
+			t.Errorf("active mentions = %q, want exactly @alice", m)
+		}
+	})
+	t.Run("static subject is a code span with no active mention", func(t *testing.T) {
+		got := addressPing(base, &CaptainResolution{Subject: "brett@local-mcp", Basis: CaptainBasisCaptain}, "github")
+		if want := "Captain `brett@local-mcp`: " + base; got != want {
+			t.Errorf("got %q, want %q", got, want)
+		}
+		if m := activeMentions(got); len(m) != 0 {
+			t.Errorf("a static subject must produce no active mention; got %q in %q", m, got)
+		}
+	})
+	t.Run("gitlab captain on a github run is a code span", func(t *testing.T) {
+		got := addressPing(base, &CaptainResolution{Subject: "gitlab:someone", IdentityVerified: true, Basis: CaptainBasisCaptain}, "github")
+		if m := activeMentions(got); len(m) != 0 {
+			t.Errorf("a cross-family captain must produce no active mention; got %q in %q", m, got)
+		}
+		if !strings.HasPrefix(got, "Captain `gitlab:someone`: ") {
+			t.Errorf("got %q", got)
+		}
+	})
+	t.Run("captain subject sanitizing to nothing stays unaddressed", func(t *testing.T) {
+		got := addressPing(base, &CaptainResolution{Subject: "\x00", Basis: CaptainBasisCaptain}, "github")
+		if got != base {
+			t.Errorf("got %q, want %q", got, base)
+		}
+	})
+}
+
+// TestActiveMentions sanity-checks the test helper itself so a broken helper
+// cannot green the no-mention assertions above.
+func TestActiveMentions(t *testing.T) {
+	if m := activeMentions("hi @alice and `@bob` and brett@local-mcp"); len(m) != 1 || !strings.HasSuffix(m[0], "@alice") {
+		t.Errorf("activeMentions = %q, want only @alice", m)
 	}
 }
