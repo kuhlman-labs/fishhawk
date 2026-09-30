@@ -551,3 +551,20 @@ func TestKnownCategories_CaptainRecord(t *testing.T) {
 		}
 	}
 }
+
+// TestKnownCategories_CrewMessage pins the E77.2 / #3736 crew-message
+// categories: backend/internal/crewmessage's Mailbox appends exactly one of
+// these per send, disposition or round-bound escalation, and Rebuild replays
+// them into crew_messages. Unregistered, categories_completeness_test.go's AST
+// sweep fails the build on the emit site.
+func TestKnownCategories_CrewMessage(t *testing.T) {
+	for _, c := range []string{
+		"crew_message_sent",
+		"crew_message_disposed",
+		"crew_message_escalated",
+	} {
+		if !IsKnownCategory(c) {
+			t.Errorf("%s is not in KnownCategories; register it in categories.go", c)
+		}
+	}
+}
