@@ -886,6 +886,10 @@ type RespondParams struct {
 // root, then disposes the answered message as accepted. The two chain
 // entries are sequential, not one transaction: a failure between them leaves
 // a recorded reply on a still-open message, which a retried Dispose closes.
+//
+// An ESCALATION is refused (ErrInvalidDisposition): only the captain's
+// escalation-decision endpoint may terminally dispose one, because that
+// terminal state is what makes a ruling binding prompt text (E77.6 / #3740).
 func (s *Server) RespondToCrewMessage(ctx context.Context, p RespondParams) (reply, answered *crewmessage.Row, err error) {
 	if s.cfg.CrewMailbox == nil {
 		return nil, nil, errors.New("crew mailbox not configured")
@@ -893,6 +897,22 @@ func (s *Server) RespondToCrewMessage(ctx context.Context, p RespondParams) (rep
 	row, err := s.cfg.CrewMailbox.Store().Get(ctx, p.SentSequence)
 	if err != nil {
 		return nil, nil, err
+	}
+	// E77.6 (#3740): an ESCALATION is never answered here. This entry point
+	// disposes the answered message `accepted`, and
+	// resolveDecidedCrewEscalations (prompt.go) promotes an accepted or
+	// rejected escalation ROOT into TRUSTED binding plan text — so admitting an
+	// escalation would let an in-process responder manufacture a binding
+	// "ruling" (with a non-captain reason, or none) the captain never made.
+	// handleDecideCrewEscalation is the ONLY path that may terminally dispose
+	// an escalation. Today the sole caller is the consult dispatcher, which
+	// already gates on type `consult` (crew_consult.go); this refusal keeps
+	// that true for the next caller rather than leaving it a property of one
+	// call site.
+	if row.MessageType == crewmessage.TypeEscalation {
+		return nil, nil, fmt.Errorf(
+			"crew message %d: an escalation is ruled on by the captain's escalation decision, never answered in-process: %w",
+			p.SentSequence, crewmessage.ErrInvalidDisposition)
 	}
 	if row.State != crewmessage.StateOpen {
 		return nil, nil, fmt.Errorf("crew message %d: %w", p.SentSequence, crewmessage.ErrAlreadyDisposed)

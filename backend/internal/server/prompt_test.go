@@ -15431,6 +15431,61 @@ func TestPlanPrompt_RejectedEscalationRendersRuling(t *testing.T) {
 	}
 }
 
+// TestPlanPrompt_RouteCarriesCaptainRuling pins the PROMPT-ROUTE WIRING, which
+// the resolver-level AC3 tests do not reach: both handleGetStagePrompt and
+// handleGetStagePromptRender set trigger.CrewEscalationRulings, and deleting
+// either line is invisible to every test that calls the resolver directly and
+// hands the result to prompt.Build. This drives the real
+// GET /v0/stages/{stage_id}/prompt (the AC's own verify_hint) and its
+// prompt-render sibling, so each wiring line has its own assertion — the two
+// handlers carry separate copies, and the compiler cannot see a deleted one.
+func TestPlanPrompt_RouteCarriesCaptainRuling(t *testing.T) {
+	f := newCrewPG(t)
+	s, sf := newConsultFoldServer(t, f, f.audit)
+	runID := f.seedRun(t, run.StageTypePlan)
+	stageID := f.stageOf(t, runID)
+	// seedRun leaves runs.requires_charter NULL, which makes the charter
+	// determination undecidable and refuses BOTH prompt routes before any
+	// trigger field is read (#2806). Record the non-grooming determination so
+	// the routes serve.
+	if _, err := f.pool.Exec(context.Background(),
+		`UPDATE runs SET requires_charter = false WHERE id = $1`, runID); err != nil {
+		t.Fatalf("seed the charter determination: %v", err)
+	}
+	priv, _ := sf.issue(t, runID)
+	seq := seedRootEscalation(t, f, runID, "ROUTE-ESCALATION-SUMMARY")
+	const reason = "ROUTE-RULING-REASON ship the narrow slice"
+	if w := f.decide(t, seq, "accepted", reason); w.Code != http.StatusOK {
+		t.Fatalf("decide status = %d; body = %s", w.Code, w.Body.String())
+	}
+
+	for _, route := range []string{"/prompt", "/prompt-render"} {
+		t.Run(route, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/v0/stages/"+stageID.String()+route, nil)
+			req.Header.Set("X-Fishhawk-Signature",
+				hex.EncodeToString(ed25519.Sign(priv, PromptCanonicalMessage(stageID))))
+			w := httptest.NewRecorder()
+			s.Handler().ServeHTTP(w, req)
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+			}
+			var resp promptResponse
+			if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			for _, want := range []string{crewRulingHeading, "accepted", reason} {
+				if !strings.Contains(resp.Prompt, want) {
+					t.Errorf("the prompt served by %s is missing %q", route, want)
+				}
+			}
+			// The agent-authored escalation text is still not promoted.
+			if strings.Contains(resp.Prompt, "ROUTE-ESCALATION-SUMMARY") {
+				t.Errorf("%s promoted the escalation's agent-authored summary into the trusted ruling section", route)
+			}
+		})
+	}
+}
+
 // TestResolveDecidedCrewEscalations_NonEscalationAndReplyNotFolded: a decided
 // CONSULT and a decided THREADED escalation reply each fold NOTHING — only a
 // root escalation is a ruling. The two rows differ from the folded root only in

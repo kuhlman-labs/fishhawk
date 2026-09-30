@@ -854,3 +854,64 @@ workflows:
           - artifact: plan
             schema: standard_v1
 `
+
+// TestRespondToCrewMessage_RefusesEscalation pins the E77.6 trust-boundary
+// guard: RespondToCrewMessage disposes its answered message `accepted`, and
+// resolveDecidedCrewEscalations promotes an accepted escalation ROOT into
+// TRUSTED binding prompt text — so an in-process responder must NOT be able to
+// close an escalation and manufacture a ruling the captain never made.
+//
+// The assertion reads COMMITTED STATE, not the error identity alone: a guard
+// that fired and was then rolled back would return an indistinguishable error,
+// so the test requires the row to be STILL OPEN and NO ruling to resolve. The
+// control arm is the same call against a CONSULT, which must still succeed —
+// so a refusal that rejected everything cannot pass this test either.
+func TestRespondToCrewMessage_RefusesEscalation(t *testing.T) {
+	f := newCrewPG(t)
+	ctx := context.Background()
+	runID := f.seedRun(t, run.StageTypePlan)
+
+	esc, err := f.mailbox.Send(ctx, crewmessage.SendParams{
+		RawMessage: []byte(escalationDocFrom("planner", runAnchor(runID), "RESPOND-GUARD-ESCALATION")),
+		Actor:      crewmessage.Actor{Kind: audit.ActorAgent, Subject: "test:planner"},
+	})
+	if err != nil {
+		t.Fatalf("seed escalation: %v", err)
+	}
+	reply := []byte(`{"schema_version":"crew-message-v1","type":"notice","recipient_role":"planner","anchor":` +
+		runAnchor(runID) + `,"payload":{"summary":"an in-process answer"}}`)
+	_, _, err = f.srv.RespondToCrewMessage(ctx, RespondParams{
+		SentSequence: esc.SentSequence, Reply: reply, ResponderRole: crewmessage.RoleHistorian,
+		Actor: crewmessage.Actor{Kind: audit.ActorSystem, Subject: "test:historian"},
+	})
+	if !errors.Is(err, crewmessage.ErrInvalidDisposition) {
+		t.Fatalf("answering an escalation in-process returned err = %v, want ErrInvalidDisposition", err)
+	}
+	row, gerr := f.mailbox.Store().Get(ctx, esc.SentSequence)
+	if gerr != nil {
+		t.Fatalf("re-read the escalation: %v", gerr)
+	}
+	if row.State != crewmessage.StateOpen {
+		t.Errorf("escalation state = %q after the refusal, want still open", row.State)
+	}
+	if got := f.srv.resolveDecidedCrewEscalations(ctx, runID); len(got) != 0 {
+		t.Errorf("the refused in-process answer produced %d binding ruling(s), want 0: %+v", len(got), got)
+	}
+
+	// Control: a CONSULT on the same run is still answerable in-process, so the
+	// guard discriminates on message type rather than refusing everything.
+	con, err := f.mailbox.Send(ctx, crewmessage.SendParams{
+		RawMessage: []byte(`{"schema_version":"crew-message-v1","type":"consult","sender_role":"planner","recipient_role":"historian","anchor":` +
+			runAnchor(runID) + `,"payload":{"question":"RESPOND-GUARD-CONSULT"},"response_required":true}`),
+		Actor: crewmessage.Actor{Kind: audit.ActorAgent, Subject: "test:planner"},
+	})
+	if err != nil {
+		t.Fatalf("seed consult: %v", err)
+	}
+	if _, _, err := f.srv.RespondToCrewMessage(ctx, RespondParams{
+		SentSequence: con.SentSequence, Reply: reply, ResponderRole: crewmessage.RoleHistorian,
+		Actor: crewmessage.Actor{Kind: audit.ActorSystem, Subject: "test:historian"},
+	}); err != nil {
+		t.Fatalf("answering a consult in-process: %v", err)
+	}
+}
