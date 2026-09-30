@@ -126,6 +126,9 @@ type driveFakeBackend struct {
 	gateViewCaptain string
 	gateViewErr     bool
 	gateViewCalls   int
+	// gateViewPrecedent is the raw JSON of the gate view's precedent block
+	// (E75.4 / #3732; "" = key absent).
+	gateViewPrecedent string
 }
 
 func newDriveFake(runState string, stages []Stage) *driveFakeBackend {
@@ -351,6 +354,9 @@ func (f *driveFakeBackend) handler() http.HandlerFunc {
 			body := `{"run_id":"` + f.runID.String() + `","open":[],"settled":[],"suppressed_relitigations":[],"history_incomplete":false`
 			if f.gateViewCaptain != "" {
 				body += `,"captain":` + f.gateViewCaptain
+			}
+			if f.gateViewPrecedent != "" {
+				body += `,"precedent":` + f.gateViewPrecedent
 			}
 			_, _ = w.Write([]byte(body + `}`))
 
@@ -4872,5 +4878,77 @@ func TestDriveRun_NonHandoffStopMakesNoGateViewRead(t *testing.T) {
 	}
 	if f.gateViewCalls != 0 || out.Captain != nil {
 		t.Errorf("stop %q: gate-view reads = %d captain = %+v, want 0 and nil", out.StoppedReason, f.gateViewCalls, out.Captain)
+	}
+}
+
+// --- E75.4 / #3732: the hand-off carries the gate precedent -----------------
+
+const drivePrecedentBlock = `{"decision_class":"plan_approval","stage_id":"s1","index_version":"precedent-rank-v1",` +
+	`"fingerprint":"fp1","items":[{"source_sequence":41,"source_entry_hash":"h41","run_id":"r","repo":"x/y",` +
+	`"decision_class":"plan_approval","outcome":"approved","delegated":false,"decided_at":"2026-09-01T00:00:00Z",` +
+	`"reason_sequence":41,"reason_excerpt":"looks right","matched_keys":{"touched_path_prefixes":[],` +
+	`"touched_path_prefixes_total":0,"escalation_keys":[],"escalation_keys_total":0},` +
+	`"score":{"touched_paths":0,"escalation_keys":0,"concern_category":0,"severity":0,"total":0.5}}],` +
+	`"summary":{"count":1,"human":1,"delegated":0,"modal_outcome":"approved","agreement_ratio":1,` +
+	`"doctrine_versions":[],"hard_filter_only":0},"truncated":false,"degraded":[],` +
+	`"full_query":{"endpoint":"GET /v0/precedent?decision_class=plan_approval","tool":"fishhawk_precedent",` +
+	`"decision_class":"plan_approval","repo":"x/y","run_id":"r","stage_id":"s1"}}`
+
+// TestDriveRun_HandoffCarriesPrecedent: both hand-off stop kinds copy the gate
+// view's precedent block onto the output from the SAME single gate-view read
+// that supplies the captain — no second HTTP call — with the reason excerpt
+// intact (drive_run is not a compaction surface).
+func TestDriveRun_HandoffCarriesPrecedent(t *testing.T) {
+	for _, paged := range []bool{true, false} {
+		f := driveHandoffFixture(paged)
+		f.gateViewCaptain = driveCaptainBlock
+		f.gateViewPrecedent = drivePrecedentBlock
+		out := driveHandoff(t, f)
+		if out.Precedent == nil || out.Precedent.DecisionClass != "plan_approval" ||
+			len(out.Precedent.Items) != 1 || out.Precedent.Items[0].SourceSequence != 41 ||
+			out.Precedent.Items[0].ReasonExcerpt != "looks right" ||
+			out.Precedent.Summary.AgreementRatio != 1 || out.Precedent.FullQuery.Tool != "fishhawk_precedent" {
+			t.Errorf("paged=%v: precedent = %+v, want the gate view's block verbatim", paged, out.Precedent)
+		}
+		if out.Captain == nil {
+			t.Errorf("paged=%v: captain lost when precedent was added", paged)
+		}
+		if f.gateViewCalls != 1 {
+			t.Errorf("paged=%v: gate-view reads = %d, want exactly 1 (captain + precedent share one read)", paged, f.gateViewCalls)
+		}
+	}
+}
+
+// TestDriveRun_HandoffPrecedentDegrades: a failed gate-view read leaves
+// Precedent nil (with the one named warning); an absent block leaves it nil
+// with no warning; a non-hand-off stop makes no read and carries none.
+func TestDriveRun_HandoffPrecedentDegrades(t *testing.T) {
+	f := driveHandoffFixture(true)
+	f.gateViewPrecedent = drivePrecedentBlock
+	f.gateViewErr = true
+	out := driveHandoff(t, f)
+	if out.Precedent != nil {
+		t.Errorf("read failure: precedent = %+v, want nil", out.Precedent)
+	}
+	var named int
+	for _, w := range out.Warnings {
+		if strings.Contains(w, "captain and precedent omitted") {
+			named++
+		}
+	}
+	if named != 1 {
+		t.Errorf("read failure: warnings = %v, want exactly one naming the omitted precedent", out.Warnings)
+	}
+
+	f = driveHandoffFixture(true)
+	if out := driveHandoff(t, f); out.Precedent != nil || len(out.Warnings) != 0 {
+		t.Errorf("absent: precedent = %+v warnings = %v, want nil and none", out.Precedent, out.Warnings)
+	}
+
+	f = newDriveFake("running", []Stage{stg(drivePlanID, "plan", "weird_wedged", 0)})
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
+	f.gateViewPrecedent = drivePrecedentBlock
+	if out := driveHandoff(t, f); out.StoppedReason != stoppedStalled || out.Precedent != nil || f.gateViewCalls != 0 {
+		t.Errorf("non-hand-off stop %q: precedent = %+v reads = %d, want nil and 0", out.StoppedReason, out.Precedent, f.gateViewCalls)
 	}
 }

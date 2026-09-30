@@ -3763,3 +3763,118 @@ func TestNotifyStatusUpdateForRun_AnchorNotesNonCaptainApproval(t *testing.T) {
 		t.Errorf("expected one captain read with the run's account; got %+v", fake.calls)
 	}
 }
+
+// --- E75.4 / #3732: the anchor's gate precedent section ---------------------
+
+// precedentSurfacedPayload builds a precedent_surfaced payload citing seqs for
+// the given gate stage, in the backend's wire shape.
+func precedentSurfacedPayload(stageID uuid.UUID, seqs ...int64) map[string]any {
+	cited := make([]any, 0, len(seqs))
+	for _, s := range seqs {
+		cited = append(cited, map[string]any{
+			"source_sequence": s, "source_entry_hash": fmt.Sprintf("h%d", s), "outcome": "approved",
+			"score": map[string]any{"total": 0.5}, "matched_keys": map[string]any{},
+		})
+	}
+	return map[string]any{
+		"decision_class": "plan_approval", "stage_id": stageID.String(), "stage_kind": "plan",
+		"index_version": "precedent-rank-v1", "fingerprint": "fp", "cited": cited,
+		"summary":  map[string]any{"count": len(seqs), "modal_outcome": "approved", "agreement_ratio": 1},
+		"degraded": []any{},
+	}
+}
+
+// parkPlanGate moves the fixture's plan stage to awaiting_approval (an open
+// human gate) and returns its id.
+func parkPlanGate(repoRuns *fakeRuns, runID uuid.UUID, state run.StageState) uuid.UUID {
+	st := repoRuns.stages[runID][0]
+	st.State = state
+	return st.ID
+}
+
+func renderedAnchor(t *testing.T, gh *fakeGitHub, n *issuecomment.Notifier, runID uuid.UUID) string {
+	t.Helper()
+	if err := n.NotifyStatusUpdateForRun(context.Background(), runID); err != nil {
+		t.Fatalf("NotifyStatusUpdateForRun: %v", err)
+	}
+	if len(gh.calls) != 1 {
+		t.Fatalf("expected 1 create call; got %d", len(gh.calls))
+	}
+	return gh.calls[0].body
+}
+
+// TestNotifyStatusUpdateForRun_PrecedentNewestAtOpenGate: the anchor renders the
+// NEWEST precedent_surfaced entry while its gate is still open.
+func TestNotifyStatusUpdateForRun_PrecedentNewestAtOpenGate(t *testing.T) {
+	runID, gh, au, repoRuns, n := happyDepsWithStages(t)
+	gate := parkPlanGate(repoRuns, runID, run.StageStateAwaitingApproval)
+	au.preSeed(runID, "precedent_surfaced", precedentSurfacedPayload(gate, 7))
+	au.preSeed(runID, "precedent_surfaced", precedentSurfacedPayload(gate, 41, 42))
+	body := renderedAnchor(t, gh, n, runID)
+	if !strings.Contains(body, issuecomment.AnchorPrecedentHeading) {
+		t.Fatalf("anchor missing the precedent section at an open gate:\n%s", body)
+	}
+	for _, want := range []string{issuecomment.AnchorPrecedentCitationMarker + "41`", issuecomment.AnchorPrecedentCitationMarker + "42`"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("anchor missing %q from the NEWEST entry", want)
+		}
+	}
+	if strings.Contains(body, issuecomment.AnchorPrecedentCitationMarker+"7`") {
+		t.Errorf("anchor rendered the OLDER precedent entry")
+	}
+}
+
+// TestNotifyStatusUpdateForRun_PrecedentGateClosedOmitted: once the recorded
+// gate is no longer open (the captain decided), the section disappears rather
+// than lingering as stale context.
+func TestNotifyStatusUpdateForRun_PrecedentGateClosedOmitted(t *testing.T) {
+	runID, gh, au, repoRuns, n := happyDepsWithStages(t)
+	gate := parkPlanGate(repoRuns, runID, run.StageStateSucceeded)
+	au.preSeed(runID, "precedent_surfaced", precedentSurfacedPayload(gate, 41))
+	if body := renderedAnchor(t, gh, n, runID); strings.Contains(body, issuecomment.AnchorPrecedentHeading) {
+		t.Errorf("a closed gate's precedent must not render:\n%s", body)
+	}
+}
+
+// TestNotifyStatusUpdateForRun_PrecedentUnknownStageOmitted: an entry naming a
+// stage the run does not have renders nothing.
+func TestNotifyStatusUpdateForRun_PrecedentUnknownStageOmitted(t *testing.T) {
+	runID, gh, au, repoRuns, n := happyDepsWithStages(t)
+	parkPlanGate(repoRuns, runID, run.StageStateAwaitingApproval)
+	au.preSeed(runID, "precedent_surfaced", precedentSurfacedPayload(uuid.New(), 41))
+	if body := renderedAnchor(t, gh, n, runID); strings.Contains(body, issuecomment.AnchorPrecedentHeading) {
+		t.Errorf("an entry for an unknown stage must not render:\n%s", body)
+	}
+}
+
+// TestNotifyStatusUpdateForRun_PrecedentUndecodableSkipped: an undecodable
+// newest payload is skipped (never fatal) and the next-newest renders.
+func TestNotifyStatusUpdateForRun_PrecedentUndecodableSkipped(t *testing.T) {
+	runID, gh, au, repoRuns, n := happyDepsWithStages(t)
+	gate := parkPlanGate(repoRuns, runID, run.StageStateAwaitingApproval)
+	au.preSeed(runID, "precedent_surfaced", precedentSurfacedPayload(gate, 41))
+	au.preSeed(runID, "precedent_surfaced", map[string]any{"cited": "not-a-list", "stage_id": gate.String()})
+	body := renderedAnchor(t, gh, n, runID)
+	if !strings.Contains(body, issuecomment.AnchorPrecedentCitationMarker+"41`") {
+		t.Errorf("undecodable newest entry must be skipped for the next-newest:\n%s", body)
+	}
+}
+
+// TestNotifyStatusUpdateForRun_PrecedentEmptyAndCapped: an entry citing nothing
+// renders no section, and an oversized cited list is capped at 3 lines.
+func TestNotifyStatusUpdateForRun_PrecedentEmptyAndCapped(t *testing.T) {
+	runID, gh, au, repoRuns, n := happyDepsWithStages(t)
+	gate := parkPlanGate(repoRuns, runID, run.StageStateAwaitingApproval)
+	au.preSeed(runID, "precedent_surfaced", precedentSurfacedPayload(gate))
+	if body := renderedAnchor(t, gh, n, runID); strings.Contains(body, issuecomment.AnchorPrecedentHeading) {
+		t.Errorf("an entry citing nothing must render no section:\n%s", body)
+	}
+
+	runID, gh, au, repoRuns, n = happyDepsWithStages(t)
+	gate = parkPlanGate(repoRuns, runID, run.StageStateAwaitingApproval)
+	au.preSeed(runID, "precedent_surfaced", precedentSurfacedPayload(gate, 1, 2, 3, 4, 5))
+	body := renderedAnchor(t, gh, n, runID)
+	if got := strings.Count(body, issuecomment.AnchorPrecedentCitationMarker); got != 3 {
+		t.Errorf("cited lines = %d, want 3 (capped)", got)
+	}
+}

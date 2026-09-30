@@ -286,6 +286,17 @@ type runResponse struct {
 	// fired, or when the evaluation could not run — so a run on a workflow
 	// declaring none keeps a byte-identical response.
 	Escalations *runEscalationsPayload `json:"escalations,omitempty"`
+	// Precedent is the bounded precedent block for the run's open human gate
+	// (E75.4 / #3732) — the SAME block the gate view carries, from the same
+	// helper (gatePrecedentFor), so the two surfaces cannot disagree.
+	// DISPLAY-ONLY: never authority, never a gate input, never an agent input —
+	// gatePrecedentFor omits it for a run-bound mcp:run: caller, so the rule-6
+	// guarantee holds at this API read and not only at prompt render.
+	// Populated by handleGetRun ONLY (same single-read posture as
+	// LiveValidation / Escalations — the list endpoint gains no read). Omitted
+	// (nil) for a run-bound identity, when no human gate is open, or when the
+	// computation degrades.
+	Precedent *gatePrecedentBlock `json:"precedent,omitempty"`
 	// Permissions is the run's declared per-stage permissions/egress surface
 	// (E53.5 / #2228): one entry per stage of the run's workflow that declares a
 	// `permissions` or `egress` block. DECLARATION-ONLY — validated, audited and
@@ -2010,6 +2021,11 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 	// ONLY — the list endpoint deliberately omits it (no N+1 concern
 	// query per row). Best-effort: a concern-store failure warn-logs
 	// and the field is omitted rather than failing the run read.
+	// runConcerns / concernsRead feed the gate-precedent ladder below: a failed
+	// (or unwired) concern read leaves a review gate's class undecidable, so
+	// the ladder yields no block rather than a guessed class.
+	var runConcerns []*concern.Concern
+	concernsRead := false
 	if s.cfg.ConcernRepo != nil {
 		// ListByRun, not ListOpenByRun (E45.83 / #3618): the payload now reports
 		// the retry-DISCARDED implement count alongside the open set, and both
@@ -2059,6 +2075,7 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			resp.Concerns = buildRunConcernsPayload(all, claimed)
+			runConcerns, concernsRead = all, true
 		}
 	}
 	// Drive read surfaces (#1023): auto_advanced + next_action +
@@ -2112,6 +2129,9 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 	// surface withholds information while failing the read would withhold the
 	// whole run.
 	resp.Escalations = s.buildEscalationsPayload(r.Context(), got)
+	// Gate precedent (E75.4 / #3732): single-run read ONLY, best-effort —
+	// nil (omitted) when no human gate is open or the computation degrades.
+	resp.Precedent = s.gatePrecedentFor(r.Context(), got, runConcerns, concernsRead)
 	// Lineage-completion signal (E22.X / #1137): single-run read ONLY,
 	// same posture as Concerns. Omitted (nil) when no run repo is wired
 	// or the child-graph read fails (best-effort).

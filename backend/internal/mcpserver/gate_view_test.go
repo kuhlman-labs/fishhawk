@@ -548,3 +548,56 @@ func TestGetGateView_ReviewDiffTruncated_OmittedLeavesMirrorNil(t *testing.T) {
 		t.Errorf("review_diff_truncated = %+v, want nil when the backend omits it", decoded.GateView.ReviewDiffTruncated)
 	}
 }
+
+// TestGetGateView_PrecedentPassesThrough (E75.4 / #3732): the gate view's
+// precedent block decodes through the MCP seam with every field intact —
+// including the reason excerpt, since this surface applies none of the
+// compaction levers — and names the full query.
+func TestGetGateView_PrecedentPassesThrough(t *testing.T) {
+	runID := uuid.New()
+	raw := json.RawMessage(`{"run_id":"` + runID.String() + `","open":[],"settled":[],` +
+		`"suppressed_relitigations":[],"history_incomplete":false,"precedent":` + drivePrecedentBlock + `}`)
+	srv, _ := newGateViewBackend(t, http.StatusOK, raw)
+
+	res := callGateView(t, srv, map[string]any{"run_id": runID.String()})
+	if res.IsError {
+		t.Fatalf("CallTool returned IsError; content: %+v", res.Content)
+	}
+	out, _ := json.Marshal(res.StructuredContent)
+	var decoded GetGateViewOutput
+	if uerr := json.Unmarshal(out, &decoded); uerr != nil {
+		t.Fatalf("decode GetGateViewOutput: %v", uerr)
+	}
+	p := decoded.GateView.Precedent
+	if p == nil {
+		t.Fatal("precedent did not decode through the seam (json tag mismatch?)")
+	}
+	if p.DecisionClass != "plan_approval" || p.IndexVersion != "precedent-rank-v1" || p.Fingerprint != "fp1" {
+		t.Errorf("precedent scalars = %+v, want class/index_version/fingerprint intact", p)
+	}
+	if len(p.Items) != 1 || p.Items[0].SourceEntryHash != "h41" || p.Items[0].ReasonExcerpt != "looks right" ||
+		p.Items[0].Score.Total != 0.5 {
+		t.Errorf("precedent items = %+v, want the cited item with its excerpt and score", p.Items)
+	}
+	if p.Summary.ModalOutcome != "approved" || p.FullQuery.Tool != "fishhawk_precedent" || p.FullQuery.Repo != "x/y" {
+		t.Errorf("precedent summary/full_query = %+v / %+v", p.Summary, p.FullQuery)
+	}
+}
+
+// TestGetGateView_PrecedentOmittedLeavesMirrorNil: no block on the wire (no
+// open gate, nothing indexed, an older backend) leaves the mirror nil.
+func TestGetGateView_PrecedentOmittedLeavesMirrorNil(t *testing.T) {
+	runID := uuid.New()
+	raw := json.RawMessage(`{"run_id":"` + runID.String() + `","open":[],"settled":[],` +
+		`"suppressed_relitigations":[],"history_incomplete":false}`)
+	srv, _ := newGateViewBackend(t, http.StatusOK, raw)
+	res := callGateView(t, srv, map[string]any{"run_id": runID.String()})
+	out, _ := json.Marshal(res.StructuredContent)
+	var decoded GetGateViewOutput
+	if uerr := json.Unmarshal(out, &decoded); uerr != nil {
+		t.Fatalf("decode GetGateViewOutput: %v", uerr)
+	}
+	if decoded.GateView.Precedent != nil {
+		t.Errorf("precedent = %+v, want nil when the backend omits it", decoded.GateView.Precedent)
+	}
+}

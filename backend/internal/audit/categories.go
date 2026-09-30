@@ -31,7 +31,11 @@ import "sort"
 // issue-restarted / paused) written via audit.AppendGlobalChained. #1941
 // added the failed-run revive audit kind (run_revived, #1915). E53.4 / #2227
 // added escalation_fired, written at the ONE server-side escalation resolver
-// both enforcement seams reach. E53.5 / #2228 added stage_permissions_declared,
+// both enforcement seams reach. E75.4 / #3732 added precedent_surfaced, the
+// record of exactly what precedent a captain-facing surface showed at an open
+// human gate (server/gate_precedent.go) — fingerprint-deduped like
+// escalation_fired, INTERNAL (never its own issue-thread activity line), and
+// never a gate input. E53.5 / #2228 added stage_permissions_declared,
 // written ONCE per run at run creation when the workflow declares any stage
 // `permissions` or `egress` block (declaration-only, enforced: false). E66.37 /
 // #2474 added acceptance_triage_arbitrated, the operator-only discharge of a
@@ -385,6 +389,7 @@ var KnownCategories = map[string]struct{}{
 	"pr_review_posted":                        {},
 	"pr_review_submitted":                     {},
 	"pr_status_comment_posted":                {},
+	"precedent_surfaced":                      {}, // E75.4 / #3732: precedent shown at an open human gate (server/gate_precedent.go)
 	"product_report_filed":                    {},
 	"pull_request_closed_after_review_reject": {},
 	"pull_request_failed":                     {},

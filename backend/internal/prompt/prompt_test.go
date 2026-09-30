@@ -9,6 +9,7 @@ import (
 	"go/token"
 	"net/url"
 	"os"
+	"path/filepath"
 	"reflect"
 	"regexp"
 	"strconv"
@@ -18,6 +19,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/securityscan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
@@ -18085,6 +18087,103 @@ func TestBuild_Reviews_OmitConsultChannel(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestPrecedentNeverRendersIntoAnAgentPrompt pins ADR-082 rule 6 (E75.4 /
+// #3732): precedent is NEVER an agent input. The fixture run carries a recorded
+// precedent block in the one place it reaches the issue thread — the living
+// anchor comment's precedent section, rendered by the REAL anchor renderer and
+// posted by Fishhawk's app identity — and the plan, implement, plan_review and
+// implement_review prompts are rendered from it. The anchor heading, every
+// citation marker and the audit category name must appear in NONE of them.
+//
+// The anchor reaches no prompt today because writeIssueComments drops
+// `[bot]`-authored comments; this test is the pin that turns that incidental
+// property into a stated one for precedent. Counterfactual: appending
+// issuecomment.RenderPrecedentSection(...) into any one render — or lifting the
+// `[bot]` filter — reddens the assertion for that render.
+//
+// The structural half asserts the prompt package's non-test source imports
+// neither backend/internal/precedent nor backend/internal/decisionindex and
+// never names the precedent_surfaced category, so a future delivery path would
+// have to add one of those first — and redden here.
+func TestPrecedentNeverRendersIntoAnAgentPrompt(t *testing.T) {
+	section := issuecomment.RenderPrecedentSection(&issuecomment.AnchorPrecedent{
+		DecisionClass: "plan_approval", IndexVersion: "precedent-rank-v1",
+		Count: 2, ModalOutcome: "approved", AgreementRatio: 1,
+		Cited: []issuecomment.AnchorPrecedentCitation{
+			{SourceSequence: 4101, Outcome: "approved", ScoreTotal: 0.8},
+			{SourceSequence: 4102, Outcome: "approved", ScoreTotal: 0.6},
+		},
+	})
+	if !strings.Contains(section, issuecomment.AnchorPrecedentHeading) {
+		t.Fatalf("fixture: the anchor renderer produced no precedent section:\n%s", section)
+	}
+	anchorComment := IssueComment{
+		Author:    "fishhawk-dev[bot]",
+		Body:      "<!-- fishhawk-sticky locus=anchor run=r -->\n### Fishhawk run\n\n" + section,
+		CreatedAt: "2026-09-30T00:00:00Z",
+	}
+	humanComment := IssueComment{Author: "octocat", Body: "please keep the change small", CreatedAt: "2026-09-29T00:00:00Z"}
+	trig := Trigger{
+		Repo: "x/y", IssueNumber: 3732, IssueTitle: "Precedent at the gate",
+		IssueBody:     "Show a bounded precedent block to the captain.",
+		IssueComments: []IssueComment{humanComment, anchorComment},
+		ApprovedPlan:  fixturePlan(),
+	}
+	markers := []string{
+		issuecomment.AnchorPrecedentHeading,
+		issuecomment.AnchorPrecedentCitationMarker + "4101`",
+		issuecomment.AnchorPrecedentCitationMarker + "4102`",
+		"precedent_surfaced",
+	}
+	for _, stage := range []string{"plan", "implement", "plan_review", "implement_review"} {
+		got, err := Build(stage, trig)
+		if err != nil {
+			t.Fatalf("Build(%s): %v", stage, err)
+		}
+		for _, m := range markers {
+			if strings.Contains(got, m) {
+				t.Errorf("%s prompt renders precedent marker %q — precedent must never be an agent input (ADR-082 rule 6)", stage, m)
+			}
+		}
+	}
+	// Control: the fixture's comment channel is LIVE — the human comment does
+	// reach the plan prompt — so the absence above is the filter, not an empty
+	// channel.
+	if got, _ := Build("plan", trig); !strings.Contains(got, "please keep the change small") {
+		t.Fatalf("fixture: the issue-comment channel rendered nothing, so the absence assertion is vacuous")
+	}
+
+	fset := token.NewFileSet()
+	names, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatalf("glob prompt package: %v", err)
+	}
+	for _, name := range names {
+		if strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(fset, name, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		{
+			for _, imp := range f.Imports {
+				path, _ := strconv.Unquote(imp.Path.Value)
+				if path == "github.com/kuhlman-labs/fishhawk/backend/internal/precedent" ||
+					path == "github.com/kuhlman-labs/fishhawk/backend/internal/decisionindex" {
+					t.Errorf("%s imports %s — precedent must never be an agent input (ADR-082 rule 6)", name, path)
+				}
+			}
+			ast.Inspect(f, func(n ast.Node) bool {
+				if lit, ok := n.(*ast.BasicLit); ok && lit.Kind == token.STRING && strings.Contains(lit.Value, "precedent_surfaced") {
+					t.Errorf("%s names the precedent_surfaced category at %s", name, fset.Position(lit.Pos()))
+				}
+				return true
+			})
+		}
 	}
 }
 
