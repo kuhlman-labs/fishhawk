@@ -9,7 +9,7 @@ import { RepoDashboard } from './repo-dashboard';
 import { Runs } from './runs';
 
 /*
- * Mounts the REAL route with the REAL panels of both tabs. The four rollup
+ * Mounts the REAL route with the REAL panels of every tab. The four rollup
  * endpoints serve the SHARED wire goldens the backend seam test pins
  * (testdata/wire/repodash_*.json, approval condition 3) through a stubbed
  * fetch and the real api client; the in-flight surfaces serve a minimal
@@ -69,6 +69,77 @@ const EXPORT_BODY = JSON.stringify({
   },
 });
 
+/*
+ * Bridge tab wire bodies (E76.6 / #3769), transcribed from the CaptainResponse,
+ * HandoverBrief, RepoDelegation and DelegationConfirmationResponse schemas.
+ */
+const CAPTAIN_BODY = JSON.stringify({
+  repo: 'acme/app',
+  captain: {
+    subject: 'github:octo',
+    identity_verified: true,
+    claim_verified: null,
+    basis: 'assigned',
+    assigned_sequence: 5,
+    assigned_entry_hash: 'a'.repeat(64),
+    assigned_at: '2026-09-20T12:00:00Z',
+  },
+  pending_offer: null,
+  last_captain: null,
+  history: [],
+  history_total: 1,
+  skipped_entries: 0,
+  delegation_unconfirmed: {
+    seat_sequence: 5,
+    source: 'run_cache',
+    workflows: ['feature_change'],
+    hash_staleness_reported: false,
+  },
+});
+const BRIEF_BODY = JSON.stringify({
+  repo: 'acme/app',
+  captain_subject: 'github:octo',
+  window: { from_sequence: 6, to_sequence: 9, chain_head: 9, basis: 'since_last_handover' },
+  sections: [],
+  absent: [],
+  gaps: [],
+  degradations: [],
+  gaps_truncated: false,
+  gaps_omitted_count: 0,
+  brief_hash: 'b'.repeat(64),
+  truncated: false,
+});
+const DELEGATION_BODY = JSON.stringify({
+  repo: 'acme/app',
+  source: 'ref',
+  ref: 'main',
+  schema_major: 2,
+  content_hash: 'v'.repeat(64),
+  workflows: [
+    {
+      id: 'feature_change',
+      autonomy: 'medium',
+      matrix: [{ action: 'merge', mode: 'gated', source: 'tier' }],
+      content_hash: 'c'.repeat(64),
+    },
+  ],
+  confirmation: {
+    captain: 'github:octo',
+    seat_sequence: 5,
+    unconfirmed_workflows: ['feature_change'],
+  },
+});
+const CONFIRMATION_BODY = JSON.stringify({
+  repo: 'acme/app',
+  source: 'ref',
+  captain: 'github:octo',
+  seat_sequence: 5,
+  workflows: [{ workflow: 'feature_change', status: 'unconfirmed', reason: 'hash_stale' }],
+  unconfirmed_workflows: ['feature_change'],
+  skipped_entries: 0,
+  ignored_entries: 0,
+});
+
 function stubBackend({ failing }: { failing?: string } = {}) {
   const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
     const p = new URL(String(input), 'http://localhost').pathname;
@@ -89,6 +160,10 @@ function stubBackend({ failing }: { failing?: string } = {}) {
         headers: { 'Content-Type': 'application/json', 'X-Fishhawk-Export-Complete': 'true' },
       });
     }
+    if (p === '/v0/captain') return respond(CAPTAIN_BODY);
+    if (p === '/v0/handover-brief') return respond(BRIEF_BODY);
+    if (p === '/v0/repos/acme/app/delegation') return respond(DELEGATION_BODY);
+    if (p === '/v0/repos/acme/app/delegation/confirmation') return respond(CONFIRMATION_BODY);
     if (p === '/v0/runs') return respond(JSON.stringify({ items: [RUN], next_cursor: null }));
     if (p === '/v0/runs/run-1/stages') return respond('{"items":[]}');
     if (p === '/v0/campaigns') return respond('{"items":[],"next_cursor":null}');
@@ -115,6 +190,8 @@ function panel(title: string): HTMLElement {
 
 const PANELS = ['In flight', 'Throughput', 'Economics', 'Health', 'Posture'];
 const RECORD_SECTIONS = ['Chain verification', 'Export', 'Release evidence'];
+const BRIDGE_PANELS = ['Captain', 'Handover', 'Handover brief', 'Delegation'];
+const ROLLUP_URL = /^\/v0\/repos\/acme\/app\/(throughput|health|economics|posture)/;
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -181,6 +258,69 @@ describe('<RepoDashboard>', () => {
     expect(urls).toContain('/v0/audit/export?repo=acme%2Fapp&limit=25');
   });
 
+  it('renders the Bridge tab at ?tab=bridge from wire bodies, firing no Overview or Record fetch', async () => {
+    const fetchMock = stubBackend();
+    renderAt('/repos/acme/app?tab=bridge');
+    await screen.findByTestId('delegation-status-feature_change');
+    await waitFor(() => expect(screen.queryByText(/^Loading /)).toBeNull());
+
+    expect(screen.getAllByRole('heading', { level: 2 }).map((h) => h.textContent)).toEqual(
+      BRIDGE_PANELS,
+    );
+    for (const title of [...PANELS, ...RECORD_SECTIONS]) {
+      expect(screen.queryByRole('heading', { name: title })).toBeNull();
+    }
+    // captain record → captain panel, via api.getCaptain
+    expect(within(panel('Captain')).getByText('github:octo')).toBeInTheDocument();
+    expect(within(panel('Captain')).getByText('Handed over')).toBeInTheDocument();
+    // brief → brief panel, via api.getHandoverBrief
+    expect(panel('Handover brief')).toHaveTextContent('#6');
+    // delegation_unconfirmed → the badge
+    expect(screen.getByTestId('unconfirmed-delegation')).toHaveTextContent(
+      '1 workflow unconfirmed for the seat in force (#5): feature_change.',
+    );
+    // delegation view + verdicts → the joined card, via getRepoDelegation(+Confirmation)
+    const card = screen.getByTestId('delegation-workflow-feature_change');
+    expect(within(card).getByText('merge')).toBeInTheDocument();
+    expect(screen.getByTestId('delegation-status-feature_change')).toHaveTextContent(
+      'unconfirmed — the delegation changed since it was confirmed',
+    );
+    expect(screen.queryByRole('alert')).toBeNull();
+
+    const paths = fetchMock.mock.calls.map((c) => new URL(String(c[0]), 'http://x').pathname);
+    expect(paths).toContain('/v0/captain');
+    expect(paths).toContain('/v0/handover-brief');
+    expect(paths).toContain('/v0/repos/acme/app/delegation');
+    expect(paths).toContain('/v0/repos/acme/app/delegation/confirmation');
+    expect(paths.some((u) => ROLLUP_URL.test(u))).toBe(false);
+    expect(paths).not.toContain('/v0/audit/export');
+    expect(paths).not.toContain('/v0/runs');
+    expect(
+      within(screen.getByRole('navigation', { name: 'Repository views' })).getByRole('link', {
+        name: 'Bridge',
+      }),
+    ).toHaveAttribute('aria-current', 'page');
+  });
+
+  it('never fires the Bridge reads from Overview (?tab=) or Record (?tab=record)', async () => {
+    for (const path of ['/repos/acme/app?tab=', '/repos/acme/app?tab=record']) {
+      const fetchMock = stubBackend();
+      const { unmount } = renderAt(path);
+      await waitFor(() =>
+        expect(
+          screen.queryByText('Merged changes') ?? screen.queryByText('Pass'),
+        ).toBeInTheDocument(),
+      );
+      const paths = fetchMock.mock.calls.map((c) => new URL(String(c[0]), 'http://x').pathname);
+      expect(paths.some((p) => p.startsWith('/v0/captain'))).toBe(false);
+      expect(paths).not.toContain('/v0/handover-brief');
+      expect(paths.some((p) => p.includes('/delegation'))).toBe(false);
+      expect(screen.queryByRole('heading', { name: 'Delegation' })).toBeNull();
+      unmount();
+      vi.unstubAllGlobals();
+    }
+  });
+
   it('switches between the tabs by link, both ways, marking the selected one', async () => {
     stubBackend();
     renderAt('/repos/acme/app');
@@ -199,9 +339,18 @@ describe('<RepoDashboard>', () => {
       'page',
     );
 
+    fireEvent.click(within(nav).getByRole('link', { name: 'Bridge' }));
+    expect(await screen.findByRole('heading', { name: 'Delegation' })).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'Chain verification' })).toBeNull();
+    expect(within(nav).getByRole('link', { name: 'Bridge' })).toHaveAttribute(
+      'aria-current',
+      'page',
+    );
+
     fireEvent.click(within(nav).getByRole('link', { name: 'Overview' }));
     expect(await screen.findByRole('heading', { name: 'Throughput' })).toBeInTheDocument();
     expect(screen.queryByRole('heading', { name: 'Chain verification' })).toBeNull();
+    expect(screen.queryByRole('heading', { name: 'Delegation' })).toBeNull();
   });
 });
 
