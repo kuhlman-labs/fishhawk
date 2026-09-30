@@ -13,9 +13,10 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// The three OPERATOR crew-message tools (E77.3 / #3737, ADR-081 #3727 D4):
+// The four OPERATOR crew-message tools (E77.3 / #3737, ADR-081 #3727 D4):
 // fishhawk_send_crew_message, fishhawk_read_crew_messages and
-// fishhawk_decide_crew_escalation. Each is a thin wrapper over the
+// fishhawk_decide_crew_escalation, plus fishhawk_convert_crew_finding
+// (E77.7 / #3741). Each is a thin wrapper over the
 // /v0/crew-messages REST surface (backend/internal/server/crewmessage.go);
 // every refusal is the backend's, so this file neither derives a sender role
 // nor re-checks a scope.
@@ -99,6 +100,38 @@ type DecideCrewEscalationInput struct {
 	Sequence int64  `json:"sequence" jsonschema:"the escalation's sent_sequence"`
 	Decision string `json:"decision" jsonschema:"accepted or rejected"`
 	Reason   string `json:"reason,omitempty" jsonschema:"why; recorded on the chain"`
+}
+
+// convertCrewFindingInput is fishhawk_convert_crew_finding's input schema.
+type convertCrewFindingInput struct {
+	Sequence int64  `json:"sequence" jsonschema:"the finding's sent_sequence"`
+	Reason   string `json:"reason,omitempty" jsonschema:"why; recorded on the finding's disposition chain entry"`
+}
+
+// convertedCrewConcern mirrors the concern a conversion minted.
+type convertedCrewConcern struct {
+	ID                   string `json:"id" jsonschema:"the new concern's id — route it to a fix-up with concern_ids"`
+	RunID                string `json:"run_id"`
+	StageID              string `json:"stage_id"`
+	StageKind            string `json:"stage_kind"`
+	OriginReviewSequence int64  `json:"origin_review_sequence" jsonschema:"the finding's sent_sequence"`
+	Severity             string `json:"severity"`
+	Category             string `json:"category"`
+	State                string `json:"state"`
+}
+
+// convertCrewFindingOutput mirrors POST .../convert-to-concern: the disposed
+// finding's metadata and the concern it became.
+type convertCrewFindingOutput struct {
+	Message  CrewMessageRecord    `json:"message"`
+	Concern  convertedCrewConcern `json:"concern"`
+	Elisions *Elisions            `json:"elisions,omitempty"`
+}
+
+// convertCrewFindingWire is the REST response shape.
+type convertCrewFindingWire struct {
+	CrewMessage CrewMessageRecord    `json:"crew_message"`
+	Concern     convertedCrewConcern `json:"concern"`
 }
 
 // CrewMessageRecordOutput is the send and decide tools' result.
@@ -203,7 +236,31 @@ func (c *apiClient) DecideCrewEscalation(ctx context.Context, seq int64, decisio
 	return &rec, nil
 }
 
-// registerCrewMessages wires the three operator crew-message tools.
+// crewConvertBody is the convert-to-concern body.
+type crewConvertBody struct {
+	Reason string `json:"reason,omitempty"`
+}
+
+// ConvertCrewFinding POSTs /v0/crew-messages/{sequence}/convert-to-concern.
+// 4xx/5xx surfaces as *apiError: 400 validation_failed; 403 self_decision /
+// insufficient_scope (write:stages); 404 crew_message_not_found; 409
+// crew_message_already_disposed; 422 crew_message_not_finding /
+// crew_finding_no_concern_stage; 500 crew_finding_convert_failed; 503
+// crew_message_unconfigured.
+func (c *apiClient) ConvertCrewFinding(ctx context.Context, seq int64, reason string) (*convertCrewFindingOutput, error) {
+	body, err := json.Marshal(crewConvertBody{Reason: reason})
+	if err != nil {
+		return nil, fmt.Errorf("marshal crew finding conversion: %w", err)
+	}
+	var wire convertCrewFindingWire
+	path := "/v0/crew-messages/" + strconv.FormatInt(seq, 10) + "/convert-to-concern"
+	if err := c.do(ctx, http.MethodPost, path, body, &wire); err != nil {
+		return nil, err
+	}
+	return &convertCrewFindingOutput{Message: wire.CrewMessage, Concern: wire.Concern}, nil
+}
+
+// registerCrewMessages wires the four operator crew-message tools.
 func registerCrewMessages(srv *mcp.Server, resolver *runResolver) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name: "fishhawk_send_crew_message",
@@ -269,6 +326,28 @@ crew_message_not_escalation / crew_round_bound_exhausted (422);
 crew_message_unconfigured (503).
 `),
 	}, resolver.decideCrewEscalation)
+
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "fishhawk_convert_crew_finding",
+		Description: strings.TrimSpace(`
+Use this when you, the CAPTAIN, decide a crew FINDING should bind: it converts
+an open run-anchored finding into a review concern. A finding is advisory — it
+never blocks the merge gate — until you convert it; the new concern is then
+routed to a fix-up like any other (fishhawk_fixup_stage with concern_ids).
+
+ELIGIBILITY: needs write:stages; a run-bound agent token is refused
+self_decision — a crew role never promotes its own advice into a blocker.
+Exactly once: the finding is disposed accepted FIRST, so a second conversion
+is refused crew_message_already_disposed.
+
+Tool errors: sequence missing; validation_failed (400); self_decision /
+insufficient_scope (403); crew_message_not_found (404);
+crew_message_already_disposed (409); crew_message_not_finding /
+crew_finding_no_concern_stage (422); crew_finding_convert_failed (500 — the
+finding was disposed but no concern was recorded; see the audit entry);
+crew_message_unconfigured (503).
+`),
+	}, resolver.convertCrewFinding)
 }
 
 // sendCrewMessage is fishhawk_send_crew_message's handler.
@@ -307,6 +386,23 @@ func (r *runResolver) decideCrewEscalation(ctx context.Context, req *mcp.CallToo
 		return nil, CrewMessageRecordOutput{}, err
 	}
 	return nil, out, nil
+}
+
+// convertCrewFinding is fishhawk_convert_crew_finding's handler.
+func (r *runResolver) convertCrewFinding(ctx context.Context, req *mcp.CallToolRequest, in convertCrewFindingInput) (*mcp.CallToolResult, convertCrewFindingOutput, error) {
+	if in.Sequence <= 0 {
+		return nil, convertCrewFindingOutput{}, fmt.Errorf("sequence is required: the finding's sent_sequence")
+	}
+	budget := r.responseBudget(req)
+	out, err := r.api.ConvertCrewFinding(ctx, in.Sequence, in.Reason)
+	if err != nil {
+		return nil, convertCrewFindingOutput{}, fmt.Errorf("convert crew finding: %w", err)
+	}
+	bounded, err := boundConvertCrewFindingOutput(*out, budget)
+	if err != nil {
+		return nil, convertCrewFindingOutput{}, err
+	}
+	return nil, bounded, nil
 }
 
 // readCrewMessages is fishhawk_read_crew_messages' handler.
@@ -480,6 +576,35 @@ func boundCrewRecordOutput(out CrewMessageRecordOutput, budget responseBudget) (
 		note: "reduced to the constant-size floor: the recorded message's metadata with every string capped. The entry below is an AGGREGATE — the floor tier's explicit exception to per-field itemisation"}
 	led.add(aggregateStoredElision("*", fmt.Sprintf(
 		"every retained string was capped to %d bytes; the surface below returns the full record", floorFieldCap),
+		[]string{pointer.String()}))
+	w, err := led.wire()
+	if err != nil {
+		return out, err
+	}
+	floor.Elisions = w
+	return floor, nil
+}
+
+// boundConvertCrewFindingOutput bounds the conversion result: metadata only
+// (no crew text), so the one tier IS the constant-size floor.
+func boundConvertCrewFindingOutput(out convertCrewFindingOutput, budget responseBudget) (convertCrewFindingOutput, error) {
+	n, err := marshalledLen(out)
+	if err != nil {
+		return out, err
+	}
+	if n <= budget.bytes {
+		return out, nil
+	}
+	pointer := pointerREST("/v0/crew-messages/" + strconv.FormatInt(out.Message.SentSequence, 10))
+	c := out.Concern
+	for _, f := range []*string{&c.ID, &c.RunID, &c.StageID, &c.StageKind, &c.Severity, &c.Category, &c.State} {
+		*f = capJSONString(*f, floorFieldCap)
+	}
+	floor := convertCrewFindingOutput{Message: capCrewRecord(out.Message), Concern: c}
+	led := &elisionLedger{budget: budget.bytes, source: budget.source, tier: floorTierName,
+		note: "reduced to the constant-size floor: the disposed finding's and the new concern's metadata with every string capped. The entry below is an AGGREGATE — the floor tier's explicit exception to per-field itemisation"}
+	led.add(aggregateStoredElision("*", fmt.Sprintf(
+		"every retained string was capped to %d bytes; the surface below returns the full finding record", floorFieldCap),
 		[]string{pointer.String()}))
 	w, err := led.wire()
 	if err != nil {

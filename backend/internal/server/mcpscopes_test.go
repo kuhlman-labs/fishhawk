@@ -303,6 +303,12 @@ func TestMCPToolScopeTable_CrewMessageRowsMirrorHandlers(t *testing.T) {
 		{"fishhawk_decide_crew_escalation", planToken, "plan token", false},
 		{"fishhawk_decide_crew_escalation", writeStagesOp, "write:stages operator", true},
 		{"fishhawk_decide_crew_escalation", readAuditOp, "read:audit-only operator", false},
+		// handleConvertCrewFindingToConcern: run-bound refused self_decision; else write:stages.
+		{"fishhawk_convert_crew_finding", implementToken, "implement token", false},
+		{"fishhawk_convert_crew_finding", planToken, "plan token", false},
+		{"fishhawk_convert_crew_finding", writeStagesOp, "write:stages operator", true},
+		{"fishhawk_convert_crew_finding", readAuditOp, "read:audit-only operator", false},
+		{"fishhawk_convert_crew_finding", neitherOp, "write:runs+approvals operator", false},
 	}
 	for _, c := range cases {
 		rule, ok := mcpToolScopeFor(c.tool)

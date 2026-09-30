@@ -122,12 +122,14 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	// Crew messages (E77.3 / #3737, ADR-081 D4): send with a server-derived
 	// sender role; reads return ONLY the prompt-rendered form and apply the
 	// send's run-bound gate; respond is a refusal ladder (in-process
-	// responder only); the escalation decision is captain-only.
+	// responder only); the escalation decision is captain-only, and so is
+	// converting a finding into a concern (E77.7 / #3741).
 	mux.HandleFunc("POST /v0/crew-messages", s.handleSendCrewMessage)
 	mux.HandleFunc("GET /v0/crew-messages", s.handleListCrewMessages)
 	mux.HandleFunc("GET /v0/crew-messages/{sequence}", s.handleGetCrewMessage)
 	mux.HandleFunc("POST /v0/crew-messages/{sequence}/respond", s.handleRespondCrewMessage)
 	mux.HandleFunc("POST /v0/crew-messages/{sequence}/escalation-decision", s.handleDecideCrewEscalation)
+	mux.HandleFunc("POST /v0/crew-messages/{sequence}/convert-to-concern", s.handleConvertCrewFindingToConcern)
 	// Handover brief (E76.4 / #3767): composed on demand from the digest,
 	// captain record, campaign/run reads and the cached-spec delegation view;
 	// never writes.

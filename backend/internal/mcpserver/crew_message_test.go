@@ -140,6 +140,11 @@ func TestCrewMessageTools_LocalRefusals(t *testing.T) {
 			t.Errorf("%s: read = nil error, want a refusal", name)
 		}
 	}
+	for _, in := range []convertCrewFindingInput{{}, {Sequence: -3, Reason: "x"}} {
+		if _, _, err := r.convertCrewFinding(ctx, nil, in); err == nil || !strings.Contains(err.Error(), "sequence is required") {
+			t.Errorf("convert(%+v): err = %v, want sequence is required", in, err)
+		}
+	}
 	if len(b.requests) != 0 {
 		t.Errorf("requests = %v, want none (refused locally)", b.requests)
 	}
@@ -239,6 +244,10 @@ func TestCrewMessageTools_RefusalPassthrough(t *testing.T) {
 			"list": func() error { _, _, err := r.readCrewMessages(ctx, nil, ReadCrewMessagesInput{}); return err },
 			"decide": func() error {
 				_, _, err := r.decideCrewEscalation(ctx, nil, DecideCrewEscalationInput{Sequence: 7, Decision: "rejected"})
+				return err
+			},
+			"convert": func() error {
+				_, _, err := r.convertCrewFinding(ctx, nil, convertCrewFindingInput{Sequence: 7})
 				return err
 			},
 		}
@@ -378,6 +387,52 @@ func TestCrewRecordOutput_FloorOverBudget(t *testing.T) {
 	}
 	raw, _ := json.Marshal(out)
 	if len(raw) > budget || out.Elisions == nil || out.Elisions.Tier != floorTierName || out.Message.SentSequence != 7 {
+		t.Errorf("out (%d bytes) = %+v, want the floor within %d bytes", len(raw), out.Elisions, budget)
+	}
+}
+
+// crewConvertRespBody is a POST .../convert-to-concern 201 body over record.
+func crewConvertRespBody(record string) string {
+	return `{"crew_message":` + record + `,"concern":{"id":"22222222-2222-2222-2222-222222222222","run_id":"11111111-1111-1111-1111-111111111111","stage_id":"33333333-3333-3333-3333-333333333333","stage_kind":"plan","origin_review_sequence":7,"severity":"high","category":"crew_finding","state":"raised"}}`
+}
+
+// TestConvertCrewFinding_PostsAndDecodes: the tool POSTs the reason to the
+// finding's convert-to-concern route and returns the disposed finding plus the
+// minted concern, unchanged under budget.
+func TestConvertCrewFinding_PostsAndDecodes(t *testing.T) {
+	record := strings.Replace(strings.Replace(crewRecordBody, `"escalation"`, `"finding"`, 1), `"state":"open"`, `"state":"accepted"`, 1)
+	b := &crewStub{status: http.StatusCreated, body: crewConvertRespBody(record)}
+	r := digestResolver(b.serve(t).URL, nil)
+	_, out, err := r.convertCrewFinding(context.Background(), nil, convertCrewFindingInput{Sequence: 7, Reason: "captain adopts it"})
+	if err != nil {
+		t.Fatalf("convert: %v", err)
+	}
+	if len(b.requests) != 1 || b.requests[0] != "POST /v0/crew-messages/7/convert-to-concern" {
+		t.Fatalf("requests = %v", b.requests)
+	}
+	if b.bodies[0] != `{"reason":"captain adopts it"}` {
+		t.Errorf("body = %s", b.bodies[0])
+	}
+	if out.Message.MessageType != "finding" || out.Message.State != "accepted" || out.Concern.ID != "22222222-2222-2222-2222-222222222222" ||
+		out.Concern.OriginReviewSequence != 7 || out.Concern.Category != "crew_finding" || out.Elisions != nil {
+		t.Errorf("out = %+v", out)
+	}
+}
+
+// TestConvertCrewFinding_FloorOverBudget: an oversized record reduces to the
+// capped-metadata floor within budget, keeping the concern id.
+func TestConvertCrewFinding_FloorOverBudget(t *testing.T) {
+	const budget = mcpConvergenceFloorBytes
+	record := strings.Replace(crewRecordBody, `"run_id":"11111111-1111-1111-1111-111111111111"`, `"decision_record_id":"`+strings.Repeat("d", 9000)+`"`, 1)
+	b := &crewStub{status: http.StatusCreated, body: crewConvertRespBody(record)}
+	r := digestResolver(b.serve(t).URL, map[string]string{mcpResponseBudgetEnvVar: strconv.Itoa(budget)})
+	_, out, err := r.convertCrewFinding(context.Background(), nil, convertCrewFindingInput{Sequence: 7})
+	if err != nil {
+		t.Fatalf("convert: %v", err)
+	}
+	raw, _ := json.Marshal(out)
+	if len(raw) > budget || out.Elisions == nil || out.Elisions.Tier != floorTierName ||
+		out.Message.SentSequence != 7 || out.Concern.ID != "22222222-2222-2222-2222-222222222222" {
 		t.Errorf("out (%d bytes) = %+v, want the floor within %d bytes", len(raw), out.Elisions, budget)
 	}
 }
