@@ -355,6 +355,10 @@ account (`ListFilter.AccountScoped`), so an untenanted run reads only untenanted
 rows (`TestGatePrecedent_AccountIsolated` seeds a tenanted and an untenanted
 decision in the SAME repository and class).
 
+Separately from the degrades below, the block is withheld by POLICY for a
+run-bound `mcp:run:` caller (§ Isolation) — same nil, same no-audit-entry
+outcome, before any read.
+
 **Seven degrade modes, each nil + no audit entry** (each has its own test in
 `gate_precedent_test.go`): `PrecedentIndex` unwired, the stage read fails, no
 open gate, the run's account id is not a UUID, `GateContext` fails, the index
@@ -374,9 +378,26 @@ SEQUENTIAL-read guarantee), and a de-dup READ failure emits anyway. An APPEND
 failure is warn-logged; the block is still returned with a 200.
 
 **Isolation.** Precedent is never a gate input: nothing in the approve/advance
-path reads `gatePrecedentBlock` or `precedent_surfaced`. It is never an agent
-input: no prompt renders it (the prompt-render absence pin is E75.4's MCP/anchor
-slice). `precedent_surfaced` is INTERNAL — not an issue-thread activity line.
+path reads `gatePrecedentBlock` or `precedent_surfaced`.
+
+It is never an agent input, and that guarantee is enforced at BOTH reachable
+paths — not only at prompt render. (1) No prompt renders it
+(`TestPrecedentNeverRendersIntoAnAgentPrompt`, the prompt-render absence pin).
+(2) `gatePrecedentFor` returns nil for a run-bound `mcp:run:<uuid>` identity, so
+NEITHER carrying surface hands an agent the block. That second half is the
+point: the gate view authorizes a run-bound token by the cross-run subject guard
+ALONE (see the gate-view auth bullet below — it may read its OWN run), and the
+live block carries reason EXCERPTS from OTHER runs' human decisions, which is
+exactly the cross-run prose keeping prose off the `precedent_surfaced` entry
+(ADR-082 rule 1) already denies it. Under Fishhawk's code-execution threat model
+an agent holding its run token could otherwise fetch its own gate view while its
+gate is open and self-serve precedent. A run-bound read also records NO
+`precedent_surfaced` entry — nothing was surfaced to a captain, so the read stays
+pure — and it does not even reach the decision index. Pinned by
+`TestGatePrecedent_RunBoundIdentityGetsNoBlock`, whose operator / cookie-session
+/ anonymous arms are the discriminator: a blanket nil fails it.
+
+`precedent_surfaced` is INTERNAL — not an issue-thread activity line.
 
 ## Account-ownership authorization (ADR-057 / E44.5, #1829)
 
@@ -2165,7 +2186,7 @@ Until this change the ONLY writer of `concern.StateAddressed` was `applyConcernR
 - **Degradation is visible, never silent.** `AuditRepo` nil, or any per-category `ListForRunByCategory` error, returns 200 with the concerns intact, `history_incomplete=true`, and `history_gaps` naming each failed category; a single malformed payload entry is skipped warn-only while its siblings still join. `ConcernRepo` unconfigured → 503 `gate_view_unconfigured` (mirrors `fixup_unconfigured`); `RunRepo` unconfigured → 503 `run_repo_unconfigured`; unknown run → 404; bad `stage_kind` → 400; a `ConcernRepo.ListByRun` error → 500 `internal_error`. **Auth mirrors `handleListRunAudit`'s read posture** (full reviewer prose must not be anonymously readable, #1960 authz): a run-bound `mcp:run:<uuid>` token is authorized by the cross-run subject guard alone — it may read only its own run (403 `cross_run_gate_view`, mirroring the fix-up handler; a malformed `mcp:run:` subject → 401 `authentication_required`) — while every other caller must clear the `read:audit` scope (anonymous → 401 `authentication_required`, a token missing the scope → 403 `insufficient_scope`, cookie-session operators bypass per `requireWriteScope`).
 - **Captain block (E76.3 / #3766, ADR-083 rule 4).** `gateViewCaptainFor` runs in the HANDLER only (after `buildGateView`, so `attention.go`'s builds are untouched) and adds an `omitempty` `captain` block: the repository's current captain resolved through `currentCaptain` in the RUN's account (`runs.account_id`, never the request identity), `vacant`, `non_captain_approvers` (each HUMAN subject with an `approve` on the run's `approval_submitted` rows that is not the captain — agent-kind subjects and rejects excluded, de-duplicated in chain order) and `note` (`approved by X; captain is Y`, only when that list is non-empty). It is INFORMATIONAL: eligibility, counting and the advance decision never read it (ADR-083 rule 1). Degrades per the trichotomy: `CaptainStore` unwired → no block and NO gap (byte-identical to pre-E76.3); vacant → `{vacant: true}` with no approval read; captain read failed or the run account is not a UUID → no block + `history_gaps` `captain_record`; approval read or decode failed → no block + `approval_submitted`. Tests: `gateview_captain_pg_test.go` (real handler over pgtest, one per basis and gap) and `gateview_test.go` (unwired and non-UUID-account).
 
-- **Precedent block (E75.4 / #3732).** At an open human gate the view also carries `precedent` (§ "Precedent at the gate"). It makes this READ handler append one best-effort, fingerprint-deduped `precedent_surfaced` entry the first time a given block is shown — the only write the gate view (and `handleGetRun`) performs; a failed append never changes the 200.
+- **Precedent block (E75.4 / #3732).** At an open human gate the view also carries `precedent` (§ "Precedent at the gate"). It makes this READ handler append one best-effort, fingerprint-deduped `precedent_surfaced` entry the first time a given block is shown — the only write the gate view (and `handleGetRun`) performs; a failed append never changes the 200. **It is omitted for the run-bound `mcp:run:<uuid>` identity the auth bullet above admits.** That token clears this surface on the cross-run subject guard alone, and the block carries reason EXCERPTS from OTHER runs' decisions, so handing it over would breach ADR-082 rule 6 ("never an agent input") at the API even though no prompt renders it. A run-bound read therefore gets the pre-E75.4 response byte-for-byte and appends nothing (§ "Precedent at the gate" → Isolation).
 
 ## Attention queue (`attention.go`, E40.1 / #1713)
 

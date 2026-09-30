@@ -304,9 +304,24 @@ func TestPrecedentChangesNoGateOutcome(t *testing.T) {
 	if string(a) != string(c) {
 		t.Errorf("gate view differs beyond the precedent field:\nwith: %s\nbare: %s", a, c)
 	}
-	var withMap map[string]json.RawMessage
-	_ = json.Unmarshal(withRaw, &withMap)
+	// RAW wire comparison, not just the typed one: gateViewResponse cannot
+	// detect a difference in a field the struct does not declare, so the
+	// byte-identical claim is only half-proved by the typed compare above.
+	// map[string]json.RawMessage marshals with sorted keys, so both sides are
+	// canonical and directly comparable.
+	var withMap, bareMap map[string]json.RawMessage
+	if err := json.Unmarshal(withRaw, &withMap); err != nil {
+		t.Fatalf("unmarshal wired gate view: %v", err)
+	}
+	if err := json.Unmarshal(bareRaw, &bareMap); err != nil {
+		t.Fatalf("unmarshal index-less gate view: %v", err)
+	}
 	delete(withMap, "precedent")
+	wm, _ := json.Marshal(withMap)
+	bm, _ := json.Marshal(bareMap)
+	if string(wm) != string(bm) {
+		t.Errorf("gate view WIRE differs beyond the precedent field:\nwith: %s\nbare: %s", wm, bm)
+	}
 	delete(withRun, "precedent")
 	ra, _ := json.Marshal(withRun)
 	rb, _ := json.Marshal(bareRun)

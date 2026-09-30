@@ -390,3 +390,43 @@ func TestGatePrecedent_PayloadCarriesNoReasonProse(t *testing.T) {
 		t.Errorf("payload = %+v", p)
 	}
 }
+
+// TestGatePrecedent_RunBoundIdentityGetsNoBlock pins ADR-082 rule 6 AT THE API
+// SURFACE. Both carrying surfaces are readable by the run's OWN run-bound
+// mcp:run:<uuid> token, and the block carries reason EXCERPTS from OTHER runs'
+// human decisions — cross-run prose an agent must never receive. A run-bound
+// identity therefore gets no block, and no precedent_surfaced entry: nothing
+// was surfaced to a captain, so an agent read stays a pure read. The operator
+// arm is the discriminator — same harness, same gate, block present — so a
+// blanket nil cannot pass this test.
+func TestGatePrecedent_RunBoundIdentityGetsNoBlock(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		subject string
+		want    bool
+	}{
+		{"run_bound_own_run", "mcp:run:" + uuid.NewString(), false},
+		{"operator_token", "operator:captain", true},
+		{"cookie_session", "github:kuhlman-labs", true},
+		{"anonymous", "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newGPHarness(3)
+			ctx := context.WithValue(context.Background(), ctxKeyIdentity, Identity{Subject: tc.subject})
+			b := h.s.gatePrecedentFor(ctx, h.ru, nil, true)
+			if got := b != nil; got != tc.want {
+				t.Fatalf("block present = %v, want %v (subject %q)", got, tc.want, tc.subject)
+			}
+			wantAppends := 0
+			if tc.want {
+				wantAppends = 1
+			}
+			if h.audit.appends != wantAppends {
+				t.Errorf("precedent_surfaced appends = %d, want %d", h.audit.appends, wantAppends)
+			}
+			if !tc.want && h.idx.filterCalls != 0 {
+				t.Errorf("index reads = %d, want 0 — a run-bound read must not even query", h.idx.filterCalls)
+			}
+		})
+	}
+}

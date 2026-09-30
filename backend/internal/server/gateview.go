@@ -82,8 +82,11 @@ type gateViewResponse struct {
 	// /v0/precedent and recorded once on the chain as precedent_surfaced.
 	// DISPLAY-ONLY — never authority, never a gate input, never an agent input;
 	// Open / Settled and every gate outcome are identical with or without it.
-	// Omitted (nil) when no human gate is open or the computation degrades
-	// (see gatePrecedentFor), leaving the response byte-identical.
+	// Omitted (nil) for a run-bound mcp:run: caller (the agent-input half of
+	// ADR-082 rule 6, enforced HERE and not only at prompt render: this surface
+	// authorizes a run-bound token by the cross-run subject guard alone), when
+	// no human gate is open, or when the computation degrades — see
+	// gatePrecedentFor, leaving the response byte-identical.
 	Precedent *gatePrecedentBlock `json:"precedent,omitempty"`
 }
 

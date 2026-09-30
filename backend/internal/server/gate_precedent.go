@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -251,6 +252,24 @@ type precedentSurfacedDegraded struct {
 // run reads only untenanted rows (ListFilter.AccountScoped).
 func (s *Server) gatePrecedentFor(ctx context.Context, ru *run.Run, concerns []*concern.Concern, concernsKnown bool) *gatePrecedentBlock {
 	if ru == nil || s.cfg.PrecedentIndex == nil || s.cfg.RunRepo == nil {
+		return nil
+	}
+	// ADR-082 rule 6 ("never an agent input") AT THE API SURFACE, not only at
+	// prompt render. Both carrying surfaces are readable by a run-bound
+	// mcp:run:<uuid> token — the gate view authorizes one by the cross-run
+	// subject guard ALONE (it may read its own run), and handleGetRun likewise
+	// — while the block carries reason EXCERPTS from OTHER runs' human
+	// decisions. Under Fishhawk's code-execution threat model an agent holding
+	// its run token can fetch its own gate view while its gate is open and
+	// self-serve that cross-run prose, which is exactly what rule 6 forbids and
+	// what keeping prose off the precedent_surfaced entry (rule 1) already
+	// denies it. So a run-bound identity gets NO block — and, because nothing
+	// was surfaced to a captain, no precedent_surfaced entry either: an agent
+	// read of the gate view stays a pure read.
+	//
+	// Every other caller (operator token with read:audit, cookie-session
+	// operator) is captain-facing and gets the block unchanged.
+	if strings.HasPrefix(IdentityFrom(ctx).Subject, "mcp:run:") {
 		return nil
 	}
 	warn := func(msg string, err error) {

@@ -289,10 +289,13 @@ type runResponse struct {
 	// Precedent is the bounded precedent block for the run's open human gate
 	// (E75.4 / #3732) — the SAME block the gate view carries, from the same
 	// helper (gatePrecedentFor), so the two surfaces cannot disagree.
-	// DISPLAY-ONLY: never authority, never a gate input, never an agent input.
+	// DISPLAY-ONLY: never authority, never a gate input, never an agent input —
+	// gatePrecedentFor omits it for a run-bound mcp:run: caller, so the rule-6
+	// guarantee holds at this API read and not only at prompt render.
 	// Populated by handleGetRun ONLY (same single-read posture as
 	// LiveValidation / Escalations — the list endpoint gains no read). Omitted
-	// (nil) when no human gate is open or the computation degrades.
+	// (nil) for a run-bound identity, when no human gate is open, or when the
+	// computation degrades.
 	Precedent *gatePrecedentBlock `json:"precedent,omitempty"`
 	// Permissions is the run's declared per-stage permissions/egress surface
 	// (E53.5 / #2228): one entry per stage of the run's workflow that declares a

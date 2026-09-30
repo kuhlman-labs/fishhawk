@@ -582,19 +582,25 @@ components:
         (fingerprint-deduped — an unchanged recomputation is not re-recorded).
 
         DISPLAY-ONLY. Precedent is NEVER authority, NEVER a gate input (no gate
-        state, allowed action or transition reads it) and NEVER an agent input
-        (no prompt renders it). The decision is still the captain's.
+        state, allowed action or transition reads it) and NEVER an agent input.
+        "Never an agent input" is enforced at BOTH reachable paths: no prompt
+        renders it, AND both carrying surfaces OMIT the block for a run-bound
+        `mcp:run:<uuid>` identity, which may read its own run's gate view and
+        run detail. The block carries reason excerpts from OTHER runs' human
+        decisions, so an agent must not be able to fetch it mid-gate. The
+        decision is still the captain's.
 
         The gate class is a deterministic ladder: a stage in
         `awaiting_scope_decision` → `scope_amendment`; the plan stage in
         `awaiting_approval` → `plan_approval`; a review stage in
         `awaiting_approval` with an open concern → `concern_waive` (ranked on the
         newest open concern's category and severity); a review stage in
-        `awaiting_approval` with none → `merge_verdict`. Absent when no human
-        gate is open, or when the computation degrades (decision index
-        unconfigured, a stage/index/gate-context read failure, or no indexed
-        decision of the class in the repository) — the response is then
-        byte-identical to one without the feature.
+        `awaiting_approval` with none → `merge_verdict`. Absent when the caller
+        is a run-bound `mcp:run:` identity, when no human gate is open, or when
+        the computation degrades (decision index unconfigured, a
+        stage/index/gate-context read failure, or no indexed decision of the
+        class in the repository) — the response is then byte-identical to one
+        without the feature.
       required: [decision_class, stage_id, index_version, fingerprint, items, summary, truncated, degraded, full_query]
       properties:
         decision_class:
@@ -1782,9 +1788,10 @@ components:
             The bounded precedent block for the run's open human gate (E75.4 /
             #3732) — the SAME block the gate view carries, from the same helper.
             Display-only: never authority, never a gate input, never an agent
-            input. Surfaced on `GET /v0/runs/{run_id}` ONLY (same single-read
-            posture as `escalations`); omitted when no human gate is open or the
-            computation degrades.
+            input — a run-bound `mcp:run:` caller never receives it. Surfaced on
+            `GET /v0/runs/{run_id}` ONLY (same single-read posture as
+            `escalations`); omitted for a run-bound identity, when no human gate
+            is open, or when the computation degrades.
         permissions:
           type: array
           description: |
