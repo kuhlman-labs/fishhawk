@@ -2,13 +2,14 @@ id: scenario:issue-3740/run-token-cannot-decide-escalation
 statement: A run-bound agent token cannot decide a crew escalation, and a refused attempt leaves the escalation still open.
 verify_hint: 'An HTTP route/response/status code: POST /v0/crew-messages/{sequence}/escalation-decision with a run-bound token returns 403 self_decision, and a subsequent GET /v0/crew-messages/{sequence} still reports state open. Decided by TestDecideCrewEscalation_RunTokenRefusedAndRecordsNothing (the state read after the refusal is the part error identity alone cannot prove).'
 steps: POST http://localhost:8090/v0/dev/fixtures {"scenario":"trace-upload-target"} -> run R. Mint the fhm_ run token (signing-key, /v0/dev/sign over '{}', mcp-token) and an operator bearer via psql. fhm_ POST /v0/crew-messages root escalation (seq 18). GET /v0/crew-messages/18 (operator); fhm_ POST /v0/crew-messages/18/escalation-decision {decision accepted, reason} and {decision rejected, reason}; GET /v0/crew-messages/18; GET /v0/runs/R/audit.
+steps_carried_from: head 065439034ca1ab0ae007163d648fd6343cdb6df1 recorded_at 2026-09-30T18:27:35Z
 assertions:
-    expected: 403 self_decision, and a subsequent GET still reports state open.
-    observed_at_record: 'Both run-token attempts -> 403 self_decision (''a run-bound agent token cannot decide a crew escalation; the captain decides''). GET afterwards: state open, round 0. No crew_message_disposed or crew_message_escalated rows on the run.'
-    repro_handle: 'curl -X POST -H ''Authorization: Bearer <fhm_>'' localhost:8090/v0/crew-messages/<seq>/escalation-decision -d ''{"decision":"accepted","reason":"x"}'''
+    expected: 403 self_decision and the escalation still open.
+    observed_at_record: 403 self_decision for both; state open, round 0 afterwards; no disposition appended.
+    repro_handle: POST /v0/crew-messages/{seq}/escalation-decision with a fhm_ bearer
 origin:
     issue: 3740
     pr: 3880
     run_id: 53cff05d-4d27-48cf-aa61-aa0a7e410131
-    head_sha: 065439034ca1ab0ae007163d648fd6343cdb6df1
-    recorded_at: 2026-09-30T18:27:35Z
+    head_sha: 53fe86a285320c93851c7ab261f5eda596fdb6a7
+    recorded_at: 2026-09-30T19:58:29Z

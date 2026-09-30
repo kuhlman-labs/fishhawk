@@ -2,13 +2,14 @@ id: scenario:issue-3740/sent-escalation-pages
 statement: Sending a crew message of type escalation as a thread root on a run-anchored message produces an operator-visible page for that run, while sending a consult on the same run produces none.
 verify_hint: 'A persisted audit row: GET /v0/runs/{run_id}/audit carries an anchor_ping_posted entry whose payload `event` is crew_escalation_sent after POST /v0/crew-messages with a root escalation, and carries no such entry after the same POST with a consult document. Decided by TestSendCrewMessage_EscalationNotifiesPageClass and TestPageClassEvents_CrewEscalationSentRoot.'
 steps: POST http://localhost:8090/v0/dev/fixtures {"scenario":"trace-upload-target"} -> run R (low tier, trigger_ref issue:3). Mint the fhm_ run token (signing-key, /v0/dev/sign over '{}', mcp-token) and an operator bearer via psql. DELETE /v0/dev/forge; POST /v0/dev/forge/issues {forge github, repo kuhlman-labs/fishhawk, number 3}. fhm_ POST /v0/crew-messages consult (seq 17) and root escalation (seq 18); GET /v0/runs/R/audit and GET /v0/dev/forge. No ping or forge request appeared, and the run carried no forge credential, so R was bound to an installation via psql (UPDATE runs SET installation_id=4242). Then another root escalation (seq 19), another consult (seq 22), GET /v0/runs/R/audit, and GET /v0/dev/forge.
+steps_carried_from: head 065439034ca1ab0ae007163d648fd6343cdb6df1 recorded_at 2026-09-30T18:27:35Z
 assertions:
-    expected: An anchor_ping_posted entry with payload event crew_escalation_sent after a root escalation, and no such entry after a consult.
-    observed_at_record: "After the binding: anchor_ping_posted seq 20 {event crew_escalation_sent, source_sequence 18} and seq 21 {event crew_escalation_sent, source_sequence 19}. There is no ping for consult 17 or consult 22. The stub forge received exactly two github.post_comment calls on kuhlman-labs/fishhawk#3, each reading 'Captain `opB-v3768`: \U0001F6D1 A crew role escalated a disagreement to the captain — your ruling is needed before it binds anything.' (escalation-specific wording, approval condition 1). Condition 3 is confirmed: the ping path writes anchor_ping_posted with the event kind in its payload."
-    repro_handle: 'curl -H ''Authorization: Bearer <fhk>'' ''localhost:8090/v0/runs/<R>/audit?category=anchor_ping_posted'''
+    expected: anchor_ping_posted with event crew_escalation_sent after a root escalation; none after a consult.
+    observed_at_record: 'Consult: no anchor_ping_posted and no forge request. Root escalation: anchor_ping_posted {event crew_escalation_sent, source_sequence 8}, plus one for the earlier seq-6 escalation, with 2 github.post_comment escalation pages on #3. Second consult: nothing new.'
+    repro_handle: POST /v0/crew-messages root escalation; GET /v0/runs/{run}/audit?limit=500; GET /v0/dev/forge
 origin:
     issue: 3740
     pr: 3880
     run_id: 53cff05d-4d27-48cf-aa61-aa0a7e410131
-    head_sha: 065439034ca1ab0ae007163d648fd6343cdb6df1
-    recorded_at: 2026-09-30T18:27:35Z
+    head_sha: 53fe86a285320c93851c7ab261f5eda596fdb6a7
+    recorded_at: 2026-09-30T19:58:29Z
