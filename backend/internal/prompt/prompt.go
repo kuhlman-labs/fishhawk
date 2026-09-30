@@ -8410,6 +8410,25 @@ const crewMessageAttributionPrefix = "Crew message · "
 // the recovery path names it rather than an issue thread.
 const crewMessageRetrievalPointer = "To recover the dropped remainder: read the full crew message on the run's crew-message record, or ask the sender to re-send the omitted portion."
 
+// RenderCrewMessages is the ONE exported form in which a crew message's text
+// may leave this package (ADR-081 #3727 rule 5; E77.3 / #3737). It is a thin
+// wrapper over writeUntrustedCrewMessages — the heading,
+// crewMessageEnvelopeFraming, the attribution line, the per-message cap and the
+// block cap are the SAME code the three reviewed prompts render, so there is no
+// second envelope. An empty or nil slice renders the empty string.
+//
+// A consumer outside this package (the crew-message REST read path) MUST return
+// this string rather than assembling its own envelope or passing MessageText
+// through; TestRenderCrewMessages_MatchesBuildPlanBlock pins it byte-equal to
+// the block inside a plan render. It reads msgs as a PARAMETER and hands it
+// straight to the enveloping writer, so it adds no watched selector read to
+// TestPrompt_UntrustedIssueFieldsReadOnlyByEnvelopingWriters' allow-list.
+func RenderCrewMessages(msgs []CrewMessage) string {
+	var b strings.Builder
+	writeUntrustedCrewMessages(&b, msgs)
+	return b.String()
+}
+
 // writeUntrustedCrewMessages renders the run's crew-to-crew messages as the ONE
 // form in which a crew message's text may reach an agent (ADR-081 #3727 rule 5,
 // contract docs/spec/crew-message-v1.schema.json). A crew message is prose
