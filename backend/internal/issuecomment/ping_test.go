@@ -654,3 +654,183 @@ func TestActiveMentions(t *testing.T) {
 		t.Errorf("activeMentions = %q, want only @alice", m)
 	}
 }
+
+// --- E77.6 (#3740): crew-escalation page-class events ----------------------
+
+// crewEscalatedEntry builds a crew_message_escalated chain entry with the
+// escalatedPayload crewmessage.escalate writes.
+func crewEscalatedEntry(seq, root int64, bound, rejections int) *audit.Entry {
+	payload, _ := json.Marshal(map[string]any{
+		"sent_sequence":        root,
+		"thread_root_sequence": root,
+		"round_bound":          bound,
+		"rejections":           rejections,
+	})
+	return &audit.Entry{Sequence: seq, Category: "crew_message_escalated", Payload: payload}
+}
+
+// crewSentEntry builds a crew_message_sent chain entry with the sentPayload
+// crewmessage.Send writes. root <= 0 makes it a THREAD ROOT (the member is
+// omitted, exactly as `omitempty` does); root > 0 makes it a threaded reply.
+func crewSentEntry(seq int64, msgType string, root int64) *audit.Entry {
+	p := map[string]any{"message": map[string]any{"type": msgType}}
+	if root > 0 {
+		p["thread_root_sequence"] = root
+	}
+	payload, _ := json.Marshal(p)
+	return &audit.Entry{Sequence: seq, Category: "crew_message_sent", Payload: payload}
+}
+
+// TestPageClassEvents_CrewEscalationExhausted: a crew_message_escalated entry
+// yields exactly ONE page naming the thread root and the exhausted round bound.
+// The fixture chain carries no other page-class category and no awaiting-approval
+// plan stage, so the expected count is 1 with the arm present and 0 without it.
+func TestPageClassEvents_CrewEscalationExhausted(t *testing.T) {
+	got := pageClassEvents([]*audit.Entry{crewEscalatedEntry(9, 4, 3, 3)}, nil)
+	if len(got) != 1 {
+		t.Fatalf("expected one crew-escalation page event; got %d: %+v", len(got), got)
+	}
+	if got[0].kind != "crew_escalation_exhausted" {
+		t.Errorf("kind = %q, want crew_escalation_exhausted", got[0].kind)
+	}
+	if got[0].sequence != 9 {
+		t.Errorf("sequence = %d, want 9 (the escalated entry's own sequence)", got[0].sequence)
+	}
+	for _, want := range []string{"thread 4", "3 reject-and-reply rounds", "your ruling"} {
+		if !strings.Contains(got[0].message, want) {
+			t.Errorf("message %q missing %q", got[0].message, want)
+		}
+	}
+	// The exhaustion is NOT the campaign auto-driver's hand-off wording.
+	if strings.Contains(got[0].message, "campaign auto-driver") {
+		t.Errorf("crew-escalation page must not use the campaign hand-off phrasing: %q", got[0].message)
+	}
+	if pageEventResolved(got[0], []*audit.Entry{
+		{Sequence: 20, Category: "approval_submitted"},
+		{Sequence: 21, Category: "stage_fixup_triggered"},
+	}) {
+		t.Error("a crew escalation must never be treated as resolved by a later approval/fixup")
+	}
+}
+
+// TestPageClassEvents_CrewEscalationSentRoot: a SENT root escalation pages, and
+// the companion table asserts ZERO events for every other crew-message type and
+// for a THREADED escalation reply. The reply row differs from the root row ONLY
+// in carrying thread_root_sequence, so the root condition is the sole
+// discriminator.
+func TestPageClassEvents_CrewEscalationSentRoot(t *testing.T) {
+	got := pageClassEvents([]*audit.Entry{crewSentEntry(7, "escalation", 0)}, nil)
+	if len(got) != 1 {
+		t.Fatalf("expected one sent-escalation page event; got %d: %+v", len(got), got)
+	}
+	if got[0].kind != "crew_escalation_sent" || got[0].sequence != 7 {
+		t.Fatalf("event = %+v, want kind crew_escalation_sent at sequence 7", got[0])
+	}
+	if !strings.Contains(got[0].message, "escalated a disagreement to the captain") {
+		t.Errorf("message %q does not name the escalation", got[0].message)
+	}
+
+	for name, e := range map[string]*audit.Entry{
+		"consult":                   crewSentEntry(7, "consult", 0),
+		"finding":                   crewSentEntry(7, "finding", 0),
+		"notice":                    crewSentEntry(7, "notice", 0),
+		"work_request":              crewSentEntry(7, "work_request", 0),
+		"threaded escalation reply": crewSentEntry(8, "escalation", 7),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if ev := pageClassEvents([]*audit.Entry{e}, nil); len(ev) != 0 {
+				t.Errorf("%s produced %d page events, want 0: %+v", name, len(ev), ev)
+			}
+		})
+	}
+}
+
+// TestPageClassEvents_CrewEscalationMalformedPayload: an absent / unparseable /
+// zero-valued escalated payload still PAGES (the disagreement is real) with the
+// count-free phrase, and never renders a fabricated "0".
+func TestPageClassEvents_CrewEscalationMalformedPayload(t *testing.T) {
+	for name, payload := range map[string][]byte{
+		"empty":       nil,
+		"unparseable": []byte("{not json"),
+		"zero values": []byte(`{"thread_root_sequence":0,"round_bound":0}`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := pageClassEvents([]*audit.Entry{
+				{Sequence: 3, Category: "crew_message_escalated", Payload: payload},
+			}, nil)
+			if len(got) != 1 || got[0].kind != "crew_escalation_exhausted" {
+				t.Fatalf("a malformed escalated payload must still page; got %+v", got)
+			}
+			if got[0].message != "🛑 A crew disagreement exhausted its reject-and-reply rounds and needs your ruling." {
+				t.Errorf("message = %q, want the count-free generic phrase", got[0].message)
+			}
+			if strings.Contains(got[0].message, "0") {
+				t.Errorf("a malformed payload must never render a count: %q", got[0].message)
+			}
+		})
+	}
+	// A malformed SENT payload pages nothing (an unreadable type is not an
+	// escalation), unlike the escalated case above.
+	if got := pageClassEvents([]*audit.Entry{
+		{Sequence: 3, Category: "crew_message_sent", Payload: []byte("{not json")},
+	}, nil); len(got) != 0 {
+		t.Errorf("a malformed sent payload must page nothing; got %+v", got)
+	}
+}
+
+// TestCrewEscalatedCounts pins the decoder's ok=false degrades directly.
+func TestCrewEscalatedCounts(t *testing.T) {
+	root, bound, rej, ok := crewEscalatedCounts(crewEscalatedEntry(1, 12, 3, 5).Payload)
+	if !ok || root != 12 || bound != 3 || rej != 5 {
+		t.Fatalf("crewEscalatedCounts = (%d, %d, %d, %v), want (12, 3, 5, true)", root, bound, rej, ok)
+	}
+	for name, payload := range map[string][]byte{
+		"nil":              nil,
+		"garbled":          []byte("{not json"),
+		"zero root":        []byte(`{"thread_root_sequence":0,"round_bound":3}`),
+		"zero round bound": []byte(`{"thread_root_sequence":4,"round_bound":0}`),
+	} {
+		if _, _, _, ok := crewEscalatedCounts(payload); ok {
+			t.Errorf("crewEscalatedCounts(%s) ok = true, want false", name)
+		}
+	}
+}
+
+// TestCrewSentEscalation pins the root-only predicate.
+func TestCrewSentEscalation(t *testing.T) {
+	cases := map[string]struct {
+		payload []byte
+		want    bool
+	}{
+		"root escalation":    {crewSentEntry(1, "escalation", 0).Payload, true},
+		"threaded reply":     {crewSentEntry(2, "escalation", 1).Payload, false},
+		"root consult":       {crewSentEntry(1, "consult", 0).Payload, false},
+		"explicit null root": {[]byte(`{"message":{"type":"escalation"},"thread_root_sequence":null}`), true},
+		"nil payload":        {nil, false},
+		"garbled":            {[]byte("{not json"), false},
+	}
+	for name, tc := range cases {
+		if got := crewSentEscalation(tc.payload); got != tc.want {
+			t.Errorf("crewSentEscalation(%s) = %v, want %v", name, got, tc.want)
+		}
+	}
+}
+
+// TestCampaignGatePagedPhrase_CrewEscalation is binding approval condition 1:
+// the crew_escalation arm has ESCALATION-SPECIFIC wording, so a dropped arm that
+// falls through to the generic "a gate decision" goes RED here. The token is
+// server.PageEventCrewEscalation's value; autodrive_test.go binds the two sides.
+func TestCampaignGatePagedPhrase_CrewEscalation(t *testing.T) {
+	got := campaignGatePagedPhrase("crew_escalation")
+	if got == campaignGatePagedPhrase("an_unknown_token") {
+		t.Fatalf("crew_escalation fell through to the generic phrase %q", got)
+	}
+	if got != "a crew disagreement was escalated to the captain and needs your ruling" {
+		t.Fatalf("campaignGatePagedPhrase(crew_escalation) = %q", got)
+	}
+	for _, want := range []string{"crew", "escalated", "captain", "ruling"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("phrase %q missing %q", got, want)
+		}
+	}
+}

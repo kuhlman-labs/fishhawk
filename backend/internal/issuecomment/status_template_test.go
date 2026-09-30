@@ -1342,3 +1342,43 @@ func TestRenderStatusBody_SupersededGlyphIsDistinct(t *testing.T) {
 		t.Errorf("superseded rendered cancelled's 🚫; the two states record different facts:\n---\n%s", body)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// crew_message_escalated (E77.6 / #3740).
+// ---------------------------------------------------------------------------
+
+// TestRenderStatusBody_CrewEscalatedActivity pins the shipped verb phrase
+// BYTE-FOR-BYTE and proves the row is not filtered as noise. Both halves matter:
+// the activityCategories entry and the renderActivityLine case are config-shaped,
+// so a comment-only touch of either file would satisfy the scope-completeness
+// gate while the timeline rendered the bare category name (or dropped the row).
+// The fixture pairs the escalated entry with a genuine noise category, so a
+// rendering that leaked EVERY entry could not pass.
+func TestRenderStatusBody_CrewEscalatedActivity(t *testing.T) {
+	runID := uuid.New()
+	r, stages := statusRun(t, runID)
+	now := time.Now()
+	entries := []*audit.Entry{
+		auditEntry(runID, 5, "crew_message_escalated", "system", now.Add(-2*time.Minute),
+			map[string]any{"sent_sequence": 4, "thread_root_sequence": 4, "round_bound": 3, "rejections": 3}),
+		auditEntry(runID, 6, "trace_uploaded", "system", now, nil),
+	}
+	body := issuecomment.RenderStatusBody(r, stages, entries, "https://x", now)
+	if !strings.Contains(body, "Crew disagreement escalated to the captain") {
+		t.Errorf("crew_message_escalated is not rendered on the timeline\n---\n%s", body)
+	}
+	if strings.Contains(body, "crew_message_escalated") {
+		t.Errorf("the bare category name leaked — the renderActivityLine case is missing\n---\n%s", body)
+	}
+	if strings.Contains(body, "trace_uploaded") {
+		t.Errorf("noise category leaked into the activity section\n---\n%s", body)
+	}
+	if !issuecomment.RendersActivity("crew_message_escalated") {
+		t.Error("RendersActivity(crew_message_escalated) = false; notifyOperatorVisible would ERROR-log it")
+	}
+	// crew_message_sent is DELIBERATELY not registered: registering it would put
+	// EVERY crew message on the timeline (docs/issue-comment-surfaces.md).
+	if issuecomment.RendersActivity("crew_message_sent") {
+		t.Error("crew_message_sent must NOT render on the timeline; it pages via notifyPageClass only")
+	}
+}

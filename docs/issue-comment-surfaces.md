@@ -15,7 +15,7 @@ it.
 | Living anchor | `status_comment_posted` | `status_update` | `Dispatcher.Handle` (run create); `Server.notifyStatusUpdate` (every stage transition); `Server.notifyPlanReady` (plan-stage terminal) | run dispatch | Yes — one comment per run, every transition rebuilds + edits the same comment id |
 | PR status comment | `pr_status_comment_posted` | `pr_status_update` | `Server.notifyStatusUpdate` via `issuecomment.Notifier.NotifyStatusUpdateForRun` (folded in after the anchor edit) | PR first observed / `pull_request_url` stamped | Yes — one comment per PR, rebuilt on every transition + edited in place (identical body skips the edit) |
 | Agent-review PR review | `pr_review_posted` | _(source `implement_reviewed`)_ | `Notifier.maybePostAgentReviewPRReviews` via `NotifyStatusUpdateForRun` (folded in after the anchor edit) | each terminal agent `implement_reviewed` verdict on a PR-owning run EXCEPT one whose review round a later stage retry superseded (#3593) | No — a NEW advisory COMMENT-type PR review per verdict round (deduped on the source `implement_reviewed` audit `Sequence`); a post-fixup re-review round posts a new review; a retry-superseded verdict is skipped and writes no row |
-| Page-class ping | `anchor_ping_posted` | _(payload `event`)_ | `Notifier.firePings` from `NotifyStatusUpdateForRun` AND the pings-only immediate `NotifyPageClassForRun` invoked at each batched append site (#1786) | first crossing of a page-class event (plan gate awaiting human approval, advisory reviewer reject, must_page_human, clarification request / awaiting_input park, CI failure, acceptance triage paged, campaign gate hand-off) | No — a one-line NEW comment per source event (deduped on the source audit `Sequence`) linking back to the anchor, addressed to the repo's captain when `Deps.Captain` is wired (#3766); an already-resolved reviewer-reject page is recorded-and-skipped |
+| Page-class ping | `anchor_ping_posted` | _(payload `event`)_ | `Notifier.firePings` from `NotifyStatusUpdateForRun` AND the pings-only immediate `NotifyPageClassForRun` invoked at each batched append site (#1786) | first crossing of a page-class event (plan gate awaiting human approval, advisory reviewer reject, must_page_human, clarification request / awaiting_input park, CI failure, acceptance triage paged, campaign gate hand-off, crew escalation sent, crew escalation round-bound exhausted) | No — a one-line NEW comment per source event (deduped on the source audit `Sequence`) linking back to the anchor, addressed to the repo's captain when `Deps.Captain` is wired (#3766); an already-resolved reviewer-reject page is recorded-and-skipped |
 | CI-failure retry | `issue_commented` | `ci_retry` | `Dispatcher.handleCIFailureRetry` (#279) | retry dispatch | No (per-attempt dedup; new attempts post new comments) |
 | Budget alert (advisory) | `issue_commented` | `budget_alert` | `Server.checkBudgetAlerts` → `NotifyBudgetAlert` (#688, #1371) | crossing of an advisory periodic-budget ladder rung — `warn` / `over` / `ack_required` (≥2x) / `page` (≥3x) | No (per-`(period_start, tier)` dedup; each tier posts once per calendar period) |
 | Slash-command reply | _(none — no dedup row)_ | _(none)_ | `Server.HandleApprovalCommand` via `replyApproval` | each `/fishhawk approve` or `/fishhawk reject` command | No (every command gets its own reply) |
@@ -370,6 +370,52 @@ Notes:
     payload; a malformed payload degrades to a count-free phrase). Deduped on
     the `clarification_requested` `Sequence`.
   - **CI failure** — `ci_failure_retry_dispatched` / `ci_retry_exhausted`.
+  - **Crew escalation sent (E77.6 / #3740)** — a `crew_message_sent` entry whose
+    `message.type` is `escalation` AND which carries NO `thread_root_sequence`
+    (a thread ROOT). Kind token `crew_escalation_sent`. A crew role surfaced a
+    disagreement to the captain, and nothing that disagreement argues becomes
+    binding prompt text until the captain answers, so the page is the thing that
+    makes the answer happen. ONLY a root escalation pages: a threaded reply
+    inside an escalation thread is part of an exchange the captain is already
+    paged about, and the other four crew-message types (`consult`, `finding`,
+    `work_request`, `notice`) produce NO event — otherwise every crew message on
+    the run would post a comment. **This kind is the one page-class event that
+    is NOT on the anchor activity timeline**, and the asymmetry is deliberate:
+    `crew_message_sent` is the category EVERY crew message writes, so
+    registering it in `activityCategories` would render consults, findings and
+    notices on the timeline too. It therefore reaches the operator through the
+    pings-only `notifyPageClass` path (`server/crewmessage.go`'s
+    `notifyRootEscalationPage`, called from the send handler and from
+    `RespondToCrewMessage`) and nowhere else. Do NOT read its absence from
+    `activityCategories` as a missing registration.
+  - **Crew escalation round-bound exhausted (E77.6 / #3740)** —
+    `crew_message_escalated`, written by `crewmessage.Mailbox.escalate` when a
+    thread's reject-and-reply round bound is exhausted. Kind token
+    `crew_escalation_exhausted`. The ping names the thread root and the exhausted
+    bound, read from the entry's `{sent_sequence, thread_root_sequence,
+    round_bound, rejections}` payload; a malformed or zero-valued payload
+    degrades to a count-free phrase rather than rendering "0" (the disagreement
+    is real whether or not its metadata decodes, so the page still fires). Unlike
+    the sent kind above, this one IS registered in `activityCategories` and
+    renders on the anchor timeline as "Crew disagreement escalated to the
+    captain" — the exhaustion is the durable governance fact of the thread —
+    marked by `notifyOperatorVisible` at
+    `server/crewmessage.go`'s `handleDecideCrewEscalation` (the #3406 intent
+    marker).
+    - **Both crew kinds page at EVERY autonomy tier, `low` included**, and the
+      refusal that stops the campaign auto-driver is keyed to the
+      server-package `PageEventCrewEscalation` token rather than to a
+      `page_human_on` list — the `low` tier's page list is EMPTY, so a
+      tier-sourced page would be dropped at exactly the tier that needs it. See
+      `docs/METHODOLOGY.md`.
+    - **RESIDUAL: a crew message anchored to an `issue_ref` or a
+      `decision_record_id` pages NOTHING.** Both the ping and push projections
+      are run-scoped (they take a run id and read that run's chain), and a
+      run-less anchor has no run chain and no anchor comment. Stated here rather
+      than left implicit; a run-less-anchor page surface is not in E77.6.
+    - Neither kind is RESOLVABLE: `pageEventResolved` returns false for both, so
+      a later approval or fix-up never records-and-skips a crew-escalation page.
+      Only a reviewer-reject page is resolvable.
   - **Acceptance scenario-corpus reports (E72.4, #3328)** — two kinds written
     by `server/pullrequest.go` on the acceptance runner's post-verdict report,
     each followed by an anchor rebuild (no new comment surface, no page-class

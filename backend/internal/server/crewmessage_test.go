@@ -526,3 +526,101 @@ func TestCrewMessageAPI_ConsultRefusedBeforeMailboxWithoutResponder(t *testing.T
 		runBound(planRun.ID, "mcp:read", scopeWriteMessages))
 	requireCrewRefusal(t, w, http.StatusUnprocessableEntity, "crew_responder_unavailable")
 }
+
+// --- E77.6 (#3740): the send-time escalation notify condition ---------------
+
+// crewEscalationPayload is a schema-complete escalation payload. Each named
+// member can be deleted to isolate ONE missing required field.
+func crewEscalationPayload(omit string) string {
+	fields := map[string]string{
+		"summary":             `"summary":"the planner and the reviewer disagree on the scope"`,
+		"recommended_default": `"recommended_default":"scope it to the three named files"`,
+		"tradeoffs":           `"tradeoffs":"a wider scope risks the file cap; a narrower one defers the coupling"`,
+	}
+	delete(fields, omit)
+	var parts []string
+	for _, k := range []string{"summary", "recommended_default", "tradeoffs"} {
+		if v, ok := fields[k]; ok {
+			parts = append(parts, v)
+		}
+	}
+	return "{" + strings.Join(parts, ",") + "}"
+}
+
+// TestSendCrewMessage_EscalationWithoutRecommendedDefaultRefused is AC2's
+// send-time contract: an escalation missing recommended_default (or tradeoffs)
+// is refused with a 4xx whose error NAMES the missing field. Each case deletes
+// exactly ONE member and leaves the other PRESENT, so the refusal is
+// attributable to the deleted field and not to a second missing one — and the
+// complete document is the PASS control, proving the fixture is not refused for
+// an unrelated reason.
+func TestSendCrewMessage_EscalationWithoutRecommendedDefaultRefused(t *testing.T) {
+	s, planRun, _ := crewNoDBServer(t)
+	send := func(payload string) *httptest.ResponseRecorder {
+		return crewCall(t, s.handleSendCrewMessage, http.MethodPost, "/v0/crew-messages", "",
+			crewDoc("escalation", "", "captain", runAnchor(planRun.ID), payload),
+			runBound(planRun.ID, "mcp:read", scopeWriteMessages))
+	}
+	for _, field := range []string{"recommended_default", "tradeoffs"} {
+		t.Run("missing "+field, func(t *testing.T) {
+			w := send(crewEscalationPayload(field))
+			requireCrewRefusal(t, w, http.StatusBadRequest, "validation_failed")
+			if !strings.Contains(w.Body.String(), field) {
+				t.Errorf("the refusal does not name %q: %s", field, w.Body.String())
+			}
+		})
+	}
+	// The complete document reaches the mailbox — which has a NIL pool here, so a
+	// panic-free 4xx/5xx from BEYOND the validator is the proof it passed
+	// validation. Assert only that it is NOT the named validation refusal.
+	t.Run("complete document passes validation", func(t *testing.T) {
+		defer func() {
+			// A nil-pool mailbox panics on the real send; recovering here keeps the
+			// assertion about validation rather than about the pool.
+			_ = recover()
+		}()
+		w := send(crewEscalationPayload(""))
+		if w.Code == http.StatusBadRequest && strings.Contains(w.Body.String(), "recommended_default") {
+			t.Errorf("a complete escalation was refused for recommended_default: %s", w.Body.String())
+		}
+	})
+}
+
+// TestNotifyRootEscalationPage_OnlyRootEscalationNotifies is binding approval
+// condition 2 as a unit: the send-time notify condition MATCHES the projection.
+// The threaded-reply row differs from the root row ONLY in the threadRoot
+// argument, so the root condition is the sole discriminator; every other row is
+// a named guard of the helper.
+func TestNotifyRootEscalationPage_OnlyRootEscalationNotifies(t *testing.T) {
+	runID := uuid.New()
+	root := int64(40)
+	escalation := &crewmessage.Message{Type: crewmessage.TypeEscalation}
+	consult := &crewmessage.Message{Type: crewmessage.TypeConsult}
+	runRow := &crewmessage.Row{SentSequence: 41, RunID: &runID}
+	anchorless := &crewmessage.Row{SentSequence: 41}
+
+	cases := map[string]struct {
+		msg        *crewmessage.Message
+		threadRoot *int64
+		row        *crewmessage.Row
+		want       bool
+	}{
+		"root escalation on a run":        {escalation, nil, runRow, true},
+		"THREADED escalation reply":       {escalation, &root, runRow, false},
+		"root consult":                    {consult, nil, runRow, false},
+		"escalation on a run-less anchor": {escalation, nil, anchorless, false},
+		"nil message":                     {nil, nil, runRow, false},
+		"nil row (send failed)":           {escalation, nil, nil, false},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			s := New(Config{Addr: "127.0.0.1:0"})
+			rec := &pageClassRecorder{}
+			s.issueNotifier = rec
+			s.notifyRootEscalationPage(context.Background(), tc.msg, tc.threadRoot, tc.row)
+			if got := len(rec.pageClass) > 0; got != tc.want {
+				t.Errorf("notified = %v, want %v (recorded %v)", got, tc.want, rec.pageClass)
+			}
+		})
+	}
+}

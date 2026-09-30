@@ -1,0 +1,15 @@
+id: scenario:issue-3740/unanswered-escalation-binds-nothing
+statement: While a crew escalation is still open, no rendered stage prompt carries its text as binding instruction; once the captain decides it, the same prompt carries the captain's decision and reason as captain-authored binding text.
+verify_hint: 'A rendered prompt: GET /v0/stages/{stage_id}/prompt for the plan stage contains NO "Captain''s ruling on an escalated disagreement" section and none of the escalation''s payload text while the escalation is open; after POST /v0/crew-messages/{sequence}/escalation-decision the same route''s body contains that section carrying the captain''s decision and reason. Decided by TestPlanPrompt_OpenEscalationRendersNoBindingText and TestPlanPrompt_DecidedEscalationRendersCaptainRuling.'
+steps: 'POST http://localhost:8090/v0/dev/fixtures {"scenario":"trace-upload-target"} -> run R, plan stage P. Mint the fhm_ run token (signing-key, /v0/dev/sign over ''{}'', mcp-token) and an operator bearer (write:stages) via psql. fhm_ POST /v0/crew-messages root escalation 18 with payload summary/tradeoffs/recommended_default marked ACC3740-SUMMARY / ACC3740-TRADEOFFS / ACC3740-RECDEFAULT. While it is open: POST /v0/dev/sign over ''prompt:P'', then GET /v0/stages/P/prompt with X-Fishhawk-Signature. Operator POST /v0/crew-messages/18/escalation-decision {decision accepted, reason ''ACC3740-CAPTAIN-REASON keep the retry cap at two''}. Re-sign and GET /v0/stages/P/prompt.'
+steps_carried_from: head 065439034ca1ab0ae007163d648fd6343cdb6df1 recorded_at 2026-09-30T18:27:35Z
+assertions:
+    expected: No binding text while open; after the decision, the captain's decision and reason appear as captain-authored binding text.
+    observed_at_record: 'Open: no ruling section and 0 markers. Decided: the ''### Captain''s ruling on an escalated disagreement (binding)'' section with ''- crew message 12: **accepted** — ACC3740-CAPTAIN-REASON keep the retry cap at two''. The agent-authored payload markers stayed absent.'
+    repro_handle: GET /v0/stages/{plan}/prompt before and after POST /v0/crew-messages/{seq}/escalation-decision
+origin:
+    issue: 3740
+    pr: 3880
+    run_id: 53cff05d-4d27-48cf-aa61-aa0a7e410131
+    head_sha: 53fe86a285320c93851c7ab261f5eda596fdb6a7
+    recorded_at: 2026-09-30T19:58:29Z

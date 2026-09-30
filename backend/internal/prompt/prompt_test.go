@@ -18186,3 +18186,150 @@ func TestPrecedentNeverRendersIntoAnAgentPrompt(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// E77.6 (#3740): the captain's-ruling channel — the TRUSTED half of the crew
+// channel, plan-only, and byte-identical when empty.
+// ---------------------------------------------------------------------------
+
+const crewRulingHeading = "### Captain's ruling on an escalated disagreement (binding)"
+
+// TestWriteCrewEscalationRulings_EmptyIsByteIdentical: a nil slice and an
+// explicitly-empty slice each leave buildPlan's output BYTE-EQUAL to the render
+// with the field unset, so every prompt without a decided escalation is
+// unchanged by this channel existing.
+func TestWriteCrewEscalationRulings_EmptyIsByteIdentical(t *testing.T) {
+	base, err := Build("plan", crewTrigger())
+	if err != nil {
+		t.Fatalf("Build(plan): %v", err)
+	}
+	for name, rulings := range map[string][]CrewEscalationRuling{
+		"nil":   nil,
+		"empty": {},
+	} {
+		t.Run(name, func(t *testing.T) {
+			tr := crewTrigger()
+			tr.CrewEscalationRulings = rulings
+			got, err := Build("plan", tr)
+			if err != nil {
+				t.Fatalf("Build(plan, %s): %v", name, err)
+			}
+			if got != base {
+				t.Errorf("a %s ruling slice changed the plan render (%d vs %d bytes)", name, len(got), len(base))
+			}
+			if strings.Contains(got, crewRulingHeading) {
+				t.Error("an empty ruling slice rendered the heading")
+			}
+		})
+	}
+}
+
+// TestWriteCrewEscalationRulings_RendersBindingFraming: a decided ruling renders
+// the heading, the sequence, the decision and the captain's reason, framed as
+// binding and winning on conflict, and states that the escalation's own
+// agent-authored text does NOT bind.
+func TestWriteCrewEscalationRulings_RendersBindingFraming(t *testing.T) {
+	tr := crewTrigger()
+	tr.CrewEscalationRulings = []CrewEscalationRuling{
+		{Sequence: 4242, Decision: "accepted", Reason: "RULING-REASON-SENTINEL take the recommended default"},
+	}
+	got, err := Build("plan", tr)
+	if err != nil {
+		t.Fatalf("Build(plan): %v", err)
+	}
+	for _, want := range []string{
+		crewRulingHeading,
+		"crew message 4242",
+		"accepted",
+		"RULING-REASON-SENTINEL take the recommended default",
+		"MANDATORY",
+		"wins on conflict",
+		"agent-authored summary, recommended default and tradeoffs do NOT",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("plan render missing %q", want)
+		}
+	}
+	// A rejection renders the same shape with the other decision.
+	tr.CrewEscalationRulings = []CrewEscalationRuling{{Sequence: 7, Decision: "rejected", Reason: "REJECT-REASON"}}
+	got, err = Build("plan", tr)
+	if err != nil {
+		t.Fatalf("Build(plan, rejected): %v", err)
+	}
+	if !strings.Contains(got, "crew message 7") || !strings.Contains(got, "rejected") ||
+		!strings.Contains(got, "REJECT-REASON") {
+		t.Errorf("the rejected ruling did not render:\n%s", got)
+	}
+	// An empty reason renders the decision alone, with no dangling separator.
+	tr.CrewEscalationRulings = []CrewEscalationRuling{{Sequence: 9, Decision: "accepted"}}
+	got, err = Build("plan", tr)
+	if err != nil {
+		t.Fatalf("Build(plan, no reason): %v", err)
+	}
+	if !strings.Contains(got, "- crew message 9: **accepted**\n") {
+		t.Errorf("an empty reason must render the decision alone without a separator:\n%s", got)
+	}
+}
+
+// TestWriteCrewEscalationRulings_CapsOversizeReason pins the SINGLE cap on this
+// channel: an over-cap reason is elided at MaxCrewEscalationRulingBytes and the
+// tail does not reach the prompt.
+func TestWriteCrewEscalationRulings_CapsOversizeReason(t *testing.T) {
+	tail := "RULING-TAIL-SENTINEL"
+	reason := strings.Repeat("r", MaxCrewEscalationRulingBytes) + tail
+	tr := crewTrigger()
+	tr.CrewEscalationRulings = []CrewEscalationRuling{{Sequence: 1, Decision: "accepted", Reason: reason}}
+	got, err := Build("plan", tr)
+	if err != nil {
+		t.Fatalf("Build(plan): %v", err)
+	}
+	if strings.Contains(got, tail) {
+		t.Errorf("the over-cap tail reached the prompt; MaxCrewEscalationRulingBytes = %d", MaxCrewEscalationRulingBytes)
+	}
+	if !strings.Contains(got, crewRulingHeading) {
+		t.Error("an over-cap reason must still render the ruling")
+	}
+	// The cap matches the three sibling binding channels; a divergence here is
+	// the #2871 two-caps shape.
+	if MaxCrewEscalationRulingBytes != MaxApprovalConditionBytes {
+		t.Errorf("MaxCrewEscalationRulingBytes = %d, want parity with MaxApprovalConditionBytes = %d",
+			MaxCrewEscalationRulingBytes, MaxApprovalConditionBytes)
+	}
+}
+
+// TestBuildImplement_NeverRendersCrewEscalationRuling: the channel is PLAN-ONLY
+// in this change (general delivery is E77.7), so the implement, implement-fix-up,
+// plan-review and implement-review renders carry no ruling section even with a
+// ruling set on the trigger.
+func TestBuildImplement_NeverRendersCrewEscalationRuling(t *testing.T) {
+	tr := crewTrigger()
+	tr.CrewEscalationRulings = []CrewEscalationRuling{
+		{Sequence: 11, Decision: "accepted", Reason: "IMPL-RULING-SENTINEL"},
+	}
+	tr.ImplementRunID = "11111111-1111-4111-8111-111111111111"
+	tr.ImplementStageID = "22222222-2222-4222-8222-222222222222"
+	// The plan render is the control: with the SAME trigger it DOES carry it, so
+	// an absence below cannot be an inert fixture.
+	planned, err := Build("plan", tr)
+	if err != nil {
+		t.Fatalf("Build(plan): %v", err)
+	}
+	if !strings.Contains(planned, "IMPL-RULING-SENTINEL") {
+		t.Fatalf("fixture inert: the plan render does not carry the ruling")
+	}
+	for _, stage := range []string{"implement", "plan_review", "implement_review"} {
+		t.Run(stage, func(t *testing.T) {
+			got, err := Build(stage, tr)
+			if err != nil {
+				t.Fatalf("Build(%s): %v", stage, err)
+			}
+			if strings.Contains(got, crewRulingHeading) || strings.Contains(got, "IMPL-RULING-SENTINEL") {
+				t.Errorf("%s render carries the plan-only captain's-ruling section", stage)
+			}
+		})
+	}
+	fixup := buildImplementFixup(tr)
+	if strings.Contains(fixup, crewRulingHeading) || strings.Contains(fixup, "IMPL-RULING-SENTINEL") {
+		t.Error("the implement fix-up render carries the plan-only captain's-ruling section")
+	}
+}

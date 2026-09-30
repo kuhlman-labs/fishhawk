@@ -6,7 +6,7 @@ Code: `backend/internal/pushnotify` (payload, sinks, dispatcher — long-form co
 
 ## Trigger
 
-- The trigger is the SAME audit-chain page-class projection as the issue-comment pings (`issuecomment.pageClassEvents`): `plan_awaiting_approval`, `plan_review_rejected`, `implement_review_rejected`, `scope_amendment`, `clarification_request`, `campaign_gate_paged`, `acceptance_triage`, `ci_failure`, `ci_retry_exhausted`.
+- The trigger is the SAME audit-chain page-class projection as the issue-comment pings (`issuecomment.pageClassEvents`): `plan_awaiting_approval`, `plan_review_rejected`, `implement_review_rejected`, `scope_amendment`, `clarification_request`, `campaign_gate_paged`, `acceptance_triage`, `ci_failure`, `ci_retry_exhausted`, `crew_escalation_sent`, `crew_escalation_exhausted`.
 - Fires on the Router's `NotifyStatusUpdateForRun` and `NotifyPageClassForRun` (the #1786 immediate hook), for EVERY run — CLI- and PR-triggered runs too, not only issue-anchored ones. The `issue` block is omitted for a non-issue-anchored run.
 - A reviewer reject the operator has already arbitrated is claimed but not sent (same `pageEventResolved` rule as pings).
 - Gate latency is context, not the trigger: folded from `issuecomment.BuildRunEconomics` (`latency.AggregateGateLatency`). No latency-threshold escalation in v0 (#2293).
