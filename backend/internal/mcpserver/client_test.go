@@ -3881,3 +3881,48 @@ func TestGetRepoDelegation_MalformedRepoIsRefusedBeforeTheCall(t *testing.T) {
 		t.Errorf("the malformed repos produced %d backend calls, want 0", calls)
 	}
 }
+
+// TestGateViewCaptain_WireShape (E76.3 / #3766) pins the hand-maintained
+// mirror of the backend's gate-view captain block from raw server-shaped
+// bytes, so a mistyped json tag fails loudly instead of silently decoding a
+// zero value (the #371-class trap). A body omitting the key — an unwired or
+// unreadable captain record, or an older backend — decodes nil.
+func TestGateViewCaptain_WireShape(t *testing.T) {
+	runID := uuid.New()
+	serve := func(t *testing.T, extra string) *GateView {
+		t.Helper()
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"run_id":"` + runID.String() + `","open":[],"settled":[],"suppressed_relitigations":[]` + extra + `}`))
+		}))
+		t.Cleanup(ts.Close)
+		gv, err := newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"}).GetGateView(context.Background(), runID, "")
+		if err != nil {
+			t.Fatalf("GetGateView: %v", err)
+		}
+		return gv
+	}
+
+	t.Run("seated captain with a non-captain approver", func(t *testing.T) {
+		gv := serve(t, `,"captain":{"subject":"github:alice","identity_verified":true,"vacant":false,`+
+			`"non_captain_approvers":["github:bob"],"note":"approved by github:bob; captain is github:alice"}`)
+		want := gateViewCaptain{
+			Subject: "github:alice", IdentityVerified: true, NonCaptainApprovers: []string{"github:bob"},
+			Note: "approved by github:bob; captain is github:alice",
+		}
+		if gv.Captain == nil || !reflect.DeepEqual(*gv.Captain, want) {
+			t.Fatalf("GateView.Captain = %+v, want %+v (a tag does not byte-match the backend)", gv.Captain, want)
+		}
+	})
+	t.Run("vacant seat", func(t *testing.T) {
+		gv := serve(t, `,"captain":{"identity_verified":false,"vacant":true,"non_captain_approvers":[]}`)
+		if gv.Captain == nil || !gv.Captain.Vacant || gv.Captain.Subject != "" || gv.Captain.Note != "" {
+			t.Fatalf("GateView.Captain = %+v, want a vacant block with no subject or note", gv.Captain)
+		}
+	})
+	t.Run("absent block -> nil", func(t *testing.T) {
+		if gv := serve(t, ""); gv.Captain != nil {
+			t.Errorf("GateView.Captain = %+v, want nil", gv.Captain)
+		}
+	})
+}

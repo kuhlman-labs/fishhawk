@@ -36,15 +36,19 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/captain"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/delegationconfirm"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/delegationview"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
@@ -81,6 +85,75 @@ func (s *Server) captainConfigured(w http.ResponseWriter, r *http.Request) bool 
 	s.writeError(w, r, http.StatusNotImplemented, "captain_unconfigured",
 		"the captain record surface is not wired on this deployment; missing: captain_store", nil)
 	return false
+}
+
+// The captain-resolution bases every consumer of currentCaptain branches on
+// (E76.3 / #3766, ADR-083 rule 6). They are the issuecomment package's
+// values, so the notifier seam and the server helper cannot drift apart.
+const (
+	captainBasisCaptain     = issuecomment.CaptainBasisCaptain
+	captainBasisVacant      = issuecomment.CaptainBasisVacant
+	captainBasisUnavailable = issuecomment.CaptainBasisUnavailable
+)
+
+// currentCaptain is the ONE shared read of a repository's current captain
+// for every consumer that enriches a surface with it (the issue-comment page
+// and anchor here; the digest watermark key, the delegated-approval default
+// principal and the gate-view note in the sibling E76.3 slices; E60.3 #2292
+// and E77.6 #3740 after them). It folds the outcome into an explicit
+// trichotomy:
+//
+//   - captainBasisCaptain — a seat is held; subject and identityVerified are
+//     the derived record's.
+//   - captainBasisVacant — the record read fine and State.Current is nil.
+//   - captainBasisUnavailable — CaptainStore is not wired, or the read
+//     failed (logged at WARN, never returned). An unavailable read is never
+//     reported as a vacancy.
+//
+// accountID is EXPLICIT (nil = the untenanted partition): a caller serving
+// a request passes identityAccountID(ctx), while the notifier passes the
+// RUN's account, because it fires from transition hooks whose ctx carries no
+// request identity. It never errors — every consumer is a best-effort
+// enrichment that must degrade to its pre-E76.3 behaviour, never fail. The
+// result is NEVER an input to approval quorum or eligibility (ADR-083 rule 1).
+func (s *Server) currentCaptain(ctx context.Context, accountID *uuid.UUID, repo string) (subject string, identityVerified bool, basis string) {
+	if s.cfg.CaptainStore == nil {
+		return "", false, captainBasisUnavailable
+	}
+	snap, err := s.cfg.CaptainStore.Read(ctx, accountID, repo)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "captain: current-captain read failed; consumer degrades to unaddressed",
+			slog.String("repo", repo), slog.String("error", err.Error()))
+		return "", false, captainBasisUnavailable
+	}
+	if snap == nil || snap.State.Current == nil {
+		return "", false, captainBasisVacant
+	}
+	return snap.State.Current.Subject, snap.State.Current.IdentityVerified, captainBasisCaptain
+}
+
+// issueCommentCaptainResolver adapts currentCaptain to the issuecomment
+// notifier's CaptainResolver seam, or returns nil when CaptainStore is not
+// wired so the notifier is constructed exactly as before E76.3. The run's
+// account id arrives as a string: "" is the untenanted partition, and a
+// non-empty value that is not a UUID resolves UNAVAILABLE rather than
+// silently reading the untenanted partition.
+func (s *Server) issueCommentCaptainResolver() issuecomment.CaptainResolver {
+	if s.cfg.CaptainStore == nil {
+		return nil
+	}
+	return func(ctx context.Context, accountID, repo string) issuecomment.CaptainResolution {
+		var acct *uuid.UUID
+		if accountID != "" {
+			u, err := uuid.Parse(accountID)
+			if err != nil {
+				return issuecomment.CaptainResolution{Basis: captainBasisUnavailable}
+			}
+			acct = &u
+		}
+		subject, verified, basis := s.currentCaptain(ctx, acct, repo)
+		return issuecomment.CaptainResolution{Subject: subject, IdentityVerified: verified, Basis: basis}
+	}
 }
 
 // captainRefusal is one typed captain error's wire mapping.

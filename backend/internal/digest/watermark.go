@@ -36,9 +36,23 @@ import (
 // digest_marked_read entry partitioned by AccountID: the mark is repo- and
 // captain-scoped and belongs to no run.
 type MarkedReadEvent struct {
-	AccountID      *uuid.UUID
+	AccountID *uuid.UUID
+	// CaptainSubject is the watermark KEY that advanced.
 	CaptainSubject string
-	Repo           string
+	// MarkedBy is the authenticated subject that performed the mark (E76.3 /
+	// #3766, ADR-083 rule 6). The surface keys a mark on the caller's own
+	// subject, so today it equals CaptainSubject; it is recorded separately
+	// so the chain names WHO marked independently of WHICH key moved. Empty
+	// means the caller did not say, and the payload falls back to
+	// CaptainSubject rather than omitting the key.
+	MarkedBy string
+	// CaptainSubjectBasis names how the surface chose the key: "captain" when
+	// the marker is the repository's seated captain, "caller" when a captain
+	// is seated but the marker is someone else (their OWN watermark moved,
+	// never the seat's), "caller_vacant" / "caller_unavailable" when no seat
+	// could be named. Omitted from the payload when empty.
+	CaptainSubjectBasis string
+	Repo                string
 	// PreviousSequence is the watermark being replaced (0 with HadPrevious
 	// false for a first mark).
 	PreviousSequence int64
@@ -48,13 +62,22 @@ type MarkedReadEvent struct {
 
 // Payload renders the event's chain-entry payload.
 func (e MarkedReadEvent) Payload() (json.RawMessage, error) {
-	b, err := json.Marshal(map[string]any{
+	markedBy := e.MarkedBy
+	if markedBy == "" {
+		markedBy = e.CaptainSubject
+	}
+	m := map[string]any{
 		"repo":              e.Repo,
 		"captain_subject":   e.CaptainSubject,
+		"marked_by":         markedBy,
 		"previous_sequence": e.PreviousSequence,
 		"had_previous":      e.HadPrevious,
 		"to_sequence":       e.ToSequence,
-	})
+	}
+	if e.CaptainSubjectBasis != "" {
+		m["captain_subject_basis"] = e.CaptainSubjectBasis
+	}
+	b, err := json.Marshal(m)
 	if err != nil {
 		return nil, fmt.Errorf("digest: marked-read payload: %w", err)
 	}
@@ -78,8 +101,12 @@ func (f AppenderFunc) AppendMarkedRead(ctx context.Context, e MarkedReadEvent) e
 type MarkReadParams struct {
 	AccountID      *uuid.UUID
 	CaptainSubject string
-	Repo           string
-	ToSequence     int64
+	// MarkedBy and CaptainSubjectBasis ride onto the MarkedReadEvent verbatim
+	// (see its field docs); neither selects the row.
+	MarkedBy            string
+	CaptainSubjectBasis string
+	Repo                string
+	ToSequence          int64
 }
 
 // MarkReadResult reports what MarkRead did.
@@ -120,7 +147,8 @@ func (s *Store) MarkRead(ctx context.Context, appender Appender, p MarkReadParam
 		return MarkReadResult{}, &BeyondChainHeadError{Requested: p.ToSequence, Head: head}
 	}
 	if err := appender.AppendMarkedRead(ctx, MarkedReadEvent{
-		AccountID: p.AccountID, CaptainSubject: p.CaptainSubject, Repo: p.Repo,
+		AccountID: p.AccountID, CaptainSubject: p.CaptainSubject, MarkedBy: p.MarkedBy,
+		CaptainSubjectBasis: p.CaptainSubjectBasis, Repo: p.Repo,
 		PreviousSequence: cur, HadPrevious: has, ToSequence: p.ToSequence,
 	}); err != nil {
 		return MarkReadResult{}, fmt.Errorf("digest: mark read: append digest_marked_read (watermark unmoved): %w", err)

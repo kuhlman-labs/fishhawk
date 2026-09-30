@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
@@ -1203,5 +1204,110 @@ func TestRenderAnchorBody_ConcernEvidenceCollapsesNewlines(t *testing.T) {
 	})
 	if !strings.Contains(body, "  - evidence: line one line two line three\n") {
 		t.Errorf("multi-line evidence not collapsed onto one list line:\n%s", body)
+	}
+}
+
+// captainApproval builds an approval_submitted entry carrying an explicit
+// approver subject (and optional resolved login / delegated rule), the shape
+// approvals.go writes.
+func captainApproval(t *testing.T, seq int64, approver, login, delegated, decision string) *audit.Entry {
+	t.Helper()
+	payload := map[string]any{"decision": decision, "approver": approver}
+	if login != "" {
+		payload["approver_github_login"] = login
+	}
+	if delegated != "" {
+		payload["delegated"] = delegated
+	}
+	raw, _ := json.Marshal(payload)
+	return &audit.Entry{Sequence: seq, Category: "approval_submitted", Payload: raw, Timestamp: time.Unix(seq, 0).UTC()}
+}
+
+func seated(subject string) *CaptainResolution {
+	return &CaptainResolution{Subject: subject, IdentityVerified: true, Basis: CaptainBasisCaptain}
+}
+
+// TestRenderAnchorBody_CaptainNilAndUnavailableAreByteIdentical pins the
+// degrade contract (E76.3 / #3766): an unreadable captain record renders the
+// anchor EXACTLY as the no-resolver (pre-E76.3) anchor — no vacancy line, no
+// approval note — so an unreadable record is never asserted as a vacancy.
+func TestRenderAnchorBody_CaptainNilAndUnavailableAreByteIdentical(t *testing.T) {
+	entries := []*audit.Entry{captainApproval(t, 5, "github:bob", "bob", "", "approve")}
+	base := AnchorInput{Run: anchorRun(), Audit: entries, Now: time.Unix(100, 0)}
+	want := RenderAnchorBody(base)
+	withUnavailable := base
+	withUnavailable.Captain = &CaptainResolution{Basis: CaptainBasisUnavailable}
+	if got := RenderAnchorBody(withUnavailable); got != want {
+		t.Errorf("unavailable captain changed the anchor:\n--- got\n%s\n--- want\n%s", got, want)
+	}
+	if strings.Contains(want, "captain") {
+		t.Errorf("nil-captain anchor must carry no captain text:\n%s", want)
+	}
+}
+
+// TestRenderAnchorBody_VacantSeatStatesVacancy: a vacant seat is STATED
+// under the header (ADR-083 rule 5), never implied.
+func TestRenderAnchorBody_VacantSeatStatesVacancy(t *testing.T) {
+	body := RenderAnchorBody(AnchorInput{
+		Run: anchorRun(), Now: time.Unix(100, 0),
+		Captain: &CaptainResolution{Basis: CaptainBasisVacant},
+	})
+	header := renderAnchorHeader(anchorRun(), "")
+	if !strings.Contains(body, header+"\n\n"+captainVacantAnchorLine+"\n") {
+		t.Errorf("vacancy line must follow the header:\n%s", body)
+	}
+}
+
+// TestRenderAnchorBody_NonCaptainApprovalNote pins ADR-083 rule 4 on the
+// anchor: an approval by a human other than the seated captain gains
+// "; captain is `Y`", rendered as a code span (never a mention — the anchor
+// is re-edited and must never re-ping). Each no-note arm isolates one guard:
+// the approver IS the captain (by subject, and by resolved login), the
+// approval is delegated/agent, the decision is a reject, or no captain sits.
+func TestRenderAnchorBody_NonCaptainApprovalNote(t *testing.T) {
+	const note = "; captain is `github:alice`"
+	cases := []struct {
+		name     string
+		entry    *audit.Entry
+		captain  *CaptainResolution
+		wantNote bool
+	}{
+		{"different human approver", captainApproval(t, 5, "github:bob", "bob", "", "approve"), seated("github:alice"), true},
+		{"static-subject approver", captainApproval(t, 5, "brett@local-mcp", "", "", "approve"), seated("github:alice"), true},
+		{"approver is the captain by subject", captainApproval(t, 5, "github:alice", "", "", "approve"), seated("github:alice"), false},
+		{"approver is the captain by resolved login", captainApproval(t, 5, "brett@local-mcp", "alice", "", "approve"), seated("github:alice"), false},
+		{"delegated approval", captainApproval(t, 5, "github:bob", "", "gate_x", "approve"), seated("github:alice"), false},
+		{"operator-agent token approval without a rule", captainApproval(t, 5, operatorrole.TokenSubjectPrefix+"v1", "", "", "approve"), seated("github:alice"), false},
+		{"reject decision", captainApproval(t, 5, "github:bob", "bob", "", "reject"), seated("github:alice"), false},
+		{"vacant seat", captainApproval(t, 5, "github:bob", "bob", "", "approve"), &CaptainResolution{Basis: CaptainBasisVacant}, false},
+		// A non-captain basis carrying a stray subject isolates the basis
+		// check from the empty-subject check.
+		{"unavailable basis with a stray subject", captainApproval(t, 5, "github:bob", "bob", "", "approve"), &CaptainResolution{Subject: "github:alice", Basis: CaptainBasisUnavailable}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := RenderAnchorBody(AnchorInput{
+				Run: anchorRun(), Audit: []*audit.Entry{tc.entry}, Now: time.Unix(100, 0), Captain: tc.captain,
+			})
+			if got := strings.Contains(body, note); got != tc.wantNote {
+				t.Errorf("note present = %v, want %v\n%s", got, tc.wantNote, body)
+			}
+			if strings.Contains(body, "@alice") {
+				t.Errorf("the anchor must never @-mention the captain:\n%s", body)
+			}
+		})
+	}
+}
+
+// TestRenderAnchorBody_NonCaptainNoteSanitizesCaptain: a captain subject
+// carrying a backtick cannot close the code span.
+func TestRenderAnchorBody_NonCaptainNoteSanitizesCaptain(t *testing.T) {
+	body := RenderAnchorBody(AnchorInput{
+		Run: anchorRun(), Now: time.Unix(100, 0),
+		Audit:   []*audit.Entry{captainApproval(t, 5, "github:bob", "bob", "", "approve")},
+		Captain: &CaptainResolution{Subject: "evil`@x", Basis: CaptainBasisCaptain},
+	})
+	if !strings.Contains(body, "; captain is `evil'@x`") {
+		t.Errorf("captain must render sanitized inside one code span:\n%s", body)
 	}
 }

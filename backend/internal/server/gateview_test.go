@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/captain"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -1553,5 +1555,43 @@ func TestGateView_LegacyVetoPayload_EmptyResolution_StillDisputed(t *testing.T) 
 	}
 	if len(got.Disputes) != 1 || got.Disputes[0].Resolution != "" {
 		t.Errorf("disputes = %+v, want one row with an empty resolution", got.Disputes)
+	}
+}
+
+// --- captain block (E76.3 / #3766, ADR-083 rule 4) -------------------------
+
+// TestGateView_CaptainBlockOmittedWhenUnwired: with no CaptainStore the
+// response carries no captain key and records no captain gap — the pre-E76.3
+// gate view, byte-for-byte.
+func TestGateView_CaptainBlockOmittedWhenUnwired(t *testing.T) {
+	s, repo, _, _ := gateViewServer(t)
+	runID := seedGateRun(t, repo)
+	w := getGateView(t, s, runID, "")
+	resp := decodeGateView(t, w)
+	if strings.Contains(w.Body.String(), `"captain"`) || resp.Captain != nil {
+		t.Errorf("unwired captain store rendered a captain block:\n%s", w.Body.String())
+	}
+	if resp.HistoryIncomplete || len(resp.HistoryGaps) != 0 {
+		t.Errorf("unwired captain store recorded gaps %v (incomplete=%v), want none", resp.HistoryGaps, resp.HistoryIncomplete)
+	}
+}
+
+// TestGateView_CaptainBlock_NonUUIDRunAccountIsGap: a run whose account id is
+// not a UUID resolves UNAVAILABLE (never the untenanted partition): the block
+// is omitted and the gap is named. The store is never read on this path, so
+// a pool-less store is enough to wire it.
+func TestGateView_CaptainBlock_NonUUIDRunAccountIsGap(t *testing.T) {
+	s, repo, _, _ := gateViewServer(t)
+	s.cfg.CaptainStore = captain.NewStore(nil)
+	runID := seedGateRun(t, repo)
+	repo.mu.Lock()
+	repo.runs[runID].AccountID = "not-a-uuid"
+	repo.mu.Unlock()
+	resp := decodeGateView(t, getGateView(t, s, runID, ""))
+	if resp.Captain != nil {
+		t.Errorf("captain = %+v, want omitted on an unparseable run account", resp.Captain)
+	}
+	if !resp.HistoryIncomplete || !slices.Contains(resp.HistoryGaps, gateViewGapCaptainRecord) {
+		t.Errorf("history gaps = %v (incomplete=%v), want %q", resp.HistoryGaps, resp.HistoryIncomplete, gateViewGapCaptainRecord)
 	}
 }

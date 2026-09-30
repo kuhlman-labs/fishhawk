@@ -554,3 +554,102 @@ func TestCaptain_SeatedCaptainDoesNotAffectApproval(t *testing.T) {
 			c1, s1, k1, c0, s0, k0)
 	}
 }
+
+// seedAccountCaptain seats subject on repo inside acct's partition, by
+// construction on the global chain.
+func (f *captainPG) seedAccountCaptain(t *testing.T, acct uuid.UUID, repo, subject string) {
+	t.Helper()
+	if _, err := f.pool.Exec(context.Background(), `INSERT INTO accounts (id, account_key) VALUES ($1, $2)`, acct, "acct-"+acct.String()[:8]); err != nil {
+		t.Fatalf("seed account: %v", err)
+	}
+	raw, _ := json.Marshal(map[string]any{"repo": repo, "subject": subject, "identity_verified": captain.IdentityVerified(subject)})
+	kind := audit.ActorUser
+	if _, err := f.audit.AppendGlobalChained(context.Background(), audit.GlobalChainAppendParams{
+		Timestamp: time.Now().UTC(), Category: captain.CategoryAssigned, ActorKind: &kind, ActorSubject: &subject,
+		Payload: raw, AccountID: &acct,
+	}); err != nil {
+		t.Fatalf("seed account captain: %v", err)
+	}
+}
+
+// TestCurrentCaptain_Trichotomy pins the shared read (E76.3 / #3766): each
+// basis on its own fixture, against the REAL captain.Store.
+func TestCurrentCaptain_Trichotomy(t *testing.T) {
+	f := newCaptainPG(t, nil)
+	f.seedCaptain(t, "acme/seated", "github:alice")
+	f.seedCaptain(t, "acme/vacated", "github:bob")
+	f.seedEntry(t, captain.CategoryRelinquished, map[string]any{"repo": "acme/vacated", "subject": "github:bob", "identity_verified": true})
+	ctx := context.Background()
+
+	t.Run("captain", func(t *testing.T) {
+		subject, verified, basis := f.srv.currentCaptain(ctx, nil, "acme/seated")
+		if subject != "github:alice" || !verified || basis != captainBasisCaptain {
+			t.Errorf("got (%q, %v, %q), want (github:alice, true, captain)", subject, verified, basis)
+		}
+	})
+	t.Run("static subject is seated but unverified", func(t *testing.T) {
+		f.seedCaptain(t, "acme/static", "brett@local-mcp")
+		subject, verified, basis := f.srv.currentCaptain(ctx, nil, "acme/static")
+		if subject != "brett@local-mcp" || verified || basis != captainBasisCaptain {
+			t.Errorf("got (%q, %v, %q), want (brett@local-mcp, false, captain)", subject, verified, basis)
+		}
+	})
+	t.Run("vacant after relinquish", func(t *testing.T) {
+		subject, _, basis := f.srv.currentCaptain(ctx, nil, "acme/vacated")
+		if subject != "" || basis != captainBasisVacant {
+			t.Errorf("got (%q, %q), want vacant", subject, basis)
+		}
+	})
+	t.Run("vacant with no history", func(t *testing.T) {
+		if _, _, basis := f.srv.currentCaptain(ctx, nil, "acme/never"); basis != captainBasisVacant {
+			t.Errorf("basis = %q, want vacant", basis)
+		}
+	})
+	t.Run("unavailable on a read error", func(t *testing.T) {
+		cancelled, cancel := context.WithCancel(ctx)
+		cancel()
+		subject, _, basis := f.srv.currentCaptain(cancelled, nil, "acme/seated")
+		if subject != "" || basis != captainBasisUnavailable {
+			t.Errorf("a failed read must be unavailable (never vacant); got (%q, %q)", subject, basis)
+		}
+	})
+	t.Run("unavailable when the store is not wired", func(t *testing.T) {
+		bare := New(Config{Addr: "127.0.0.1:0"})
+		if _, _, basis := bare.currentCaptain(ctx, nil, "acme/seated"); basis != captainBasisUnavailable {
+			t.Errorf("basis = %q, want unavailable", basis)
+		}
+		if bare.issueCommentCaptainResolver() != nil {
+			t.Errorf("an unwired store must leave the notifier's resolver nil (today's notifier)")
+		}
+	})
+}
+
+// TestIssueCommentCaptainResolver_UsesRunAccountNotCtx pins approval
+// condition 4: the notifier's resolver reads the partition named by the
+// account id it is GIVEN (the run's), from a context carrying NO request
+// identity. The seat exists only in acct's partition, so resolving from ctx
+// (which names no account → the untenanted partition) would report vacant.
+func TestIssueCommentCaptainResolver_UsesRunAccountNotCtx(t *testing.T) {
+	f := newCaptainPG(t, nil)
+	acct := uuid.New()
+	f.seedAccountCaptain(t, acct, "acme/tenant", "github:alice")
+	resolve := f.srv.issueCommentCaptainResolver()
+	if resolve == nil {
+		t.Fatal("a wired CaptainStore must yield a resolver")
+	}
+	ctx := context.Background() // no request identity
+	if IdentityFrom(ctx).AccountID != "" {
+		t.Fatal("fixture: ctx must carry no identity")
+	}
+
+	got := resolve(ctx, acct.String(), "acme/tenant")
+	if got.Basis != captainBasisCaptain || got.Subject != "github:alice" || !got.IdentityVerified {
+		t.Errorf("run-account read = %+v, want the seated github:alice", got)
+	}
+	if other := resolve(ctx, "", "acme/tenant"); other.Basis != captainBasisVacant {
+		t.Errorf("the untenanted partition holds no seat; got %+v", other)
+	}
+	if bad := resolve(ctx, "not-a-uuid", "acme/tenant"); bad.Basis != captainBasisUnavailable {
+		t.Errorf("an unparseable run account must be unavailable, never the untenanted read; got %+v", bad)
+	}
+}

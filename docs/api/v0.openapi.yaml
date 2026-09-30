@@ -2258,13 +2258,56 @@ components:
         history_gaps:
           type: array
           items: { type: string }
-          description: The audit categories that failed to read, when `history_incomplete` is true.
+          description: |
+            The audit categories that failed to read, when `history_incomplete`
+            is true. The captain block adds `captain_record` (the captain read
+            failed) or `approval_submitted` (the run's approvals could not be
+            read) when it is omitted for that reason.
         live_validation:
           $ref: '#/components/schemas/LiveValidation'
         review_diff_truncated:
           $ref: '#/components/schemas/GateViewReviewDiffTruncated'
         review_head_mismatch:
           $ref: '#/components/schemas/GateViewReviewHeadMismatch'
+        captain:
+          $ref: '#/components/schemas/GateViewCaptain'
+
+    GateViewCaptain:
+      type: object
+      description: |
+        ADR-083 rule 4's non-captain approval note (E76.3 / #3766): the
+        repository's current captain, resolved in the RUN's workspace
+        account, and every human approver on this run who is not that
+        captain. INFORMATIONAL only — an approval by someone other than the
+        captain stays valid and counted; nothing here reaches eligibility,
+        quorum or the advance decision (ADR-083 rule 1). Absent when the
+        captain record is not wired on this instance; absent with a
+        `history_gaps` entry (`captain_record` / `approval_submitted`) when
+        the captain read or the approval read fails, so the block is never
+        built from a partial read.
+      required: [identity_verified, vacant, non_captain_approvers]
+      properties:
+        subject:
+          type: string
+          description: The seated captain's subject; absent when `vacant`.
+        identity_verified:
+          type: boolean
+          description: Whether the captain's subject is a verified forge identity.
+        vacant:
+          type: boolean
+          description: True when the repository has no captain (stated, never implied by an absent block).
+        non_captain_approvers:
+          type: array
+          items: { type: string }
+          description: |
+            Each human subject that recorded an `approve` on this run and is
+            not the captain, in chain order and de-duplicated. Agent-kind
+            subjects and rejects are excluded. Always empty when `vacant`.
+        note:
+          type: string
+          description: |
+            `approved by X; captain is Y` — present only when a captain is
+            seated AND `non_captain_approvers` is non-empty.
 
     GateViewReviewDiffTruncated:
       type: object
@@ -7477,19 +7520,24 @@ components:
     Digest:
       type: object
       description: GET /v0/digest body (E75.6 / #3734). Bounded by `digest.Bound`.
-      required: [repo, captain_subject, watermark, has_watermark, from_sequence, to_sequence, chain_head, sections, gaps, degradations, gaps_truncated, gaps_omitted_count, truncated]
+      required: [repo, captain_subject, captain_subject_basis, watermark, has_watermark, from_sequence, to_sequence, chain_head, sections, gaps, degradations, gaps_truncated, gaps_omitted_count, truncated]
       properties:
         repo: { type: string }
         captain_subject:
           type: string
-          description: The caller's auth subject the watermark is keyed by.
+          description: |
+            The subject whose read watermark this digest is computed against —
+            by default the repository's seated captain, else the caller (see
+            `captain_subject_basis`).
+        captain_subject_basis:
+          $ref: '#/components/schemas/DigestCaptainSubjectBasis'
         watermark:
           type: integer
           format: int64
           description: The last-read chain position (0 when `has_watermark` is false).
         has_watermark:
           type: boolean
-          description: False when the caller never marked this repository read.
+          description: False when `captain_subject` never marked this repository read.
         from_sequence: { type: integer, format: int64, description: Inclusive window start. }
         to_sequence: { type: integer, format: int64, description: Inclusive window end. }
         chain_head:
@@ -7620,9 +7668,25 @@ components:
         call:
           type: string
           description: The next request line, e.g. `GET /v0/digest?from_sequence=…&repo=…&section=…&to_sequence=…`.
+    DigestCaptainSubjectBasis:
+      type: string
+      enum: [captain, caller, caller_vacant, caller_unavailable, explicit]
+      description: |
+        Which subject a digest's watermark key is (E76.3 / #3766, ADR-083
+        rule 6). `captain` — the repository's seated captain. `caller` — a
+        captain is seated but the key is the caller's own subject (a
+        non-captain's mark-read, or a `captain_subject` override naming the
+        caller). `caller_vacant` — the seat is vacant, so the key is the
+        caller's. `caller_unavailable` — the captain record is not wired or
+        could not be read, so the key is the caller's (never reported as a
+        vacancy). `explicit` — a `captain_subject` override naming neither the
+        caller nor the seated captain (GET only).
     DigestMarkReadRequest:
       type: object
       additionalProperties: false
+      description: |
+        Carries NO `captain_subject`: an unknown field is refused with 400, so
+        a mark-read can never be aimed at another subject's watermark.
       required: [repo, to_sequence]
       properties:
         repo: { type: string, description: Repository as `owner/name`. }
@@ -7633,10 +7697,14 @@ components:
           description: The chain position to mark read through (at most the repository's chain head).
     DigestMarkReadResponse:
       type: object
-      required: [repo, captain_subject, previous_sequence, had_previous, sequence, advanced]
+      required: [repo, captain_subject, captain_subject_basis, previous_sequence, had_previous, sequence, advanced]
       properties:
         repo: { type: string }
-        captain_subject: { type: string }
+        captain_subject:
+          type: string
+          description: The watermark key that was advanced — always the caller's own subject.
+        captain_subject_basis:
+          $ref: '#/components/schemas/DigestCaptainSubjectBasis'
         previous_sequence: { type: integer, format: int64 }
         had_previous: { type: boolean }
         sequence:
@@ -13716,11 +13784,20 @@ paths:
       operationId: getDigest
       summary: '"Since you last looked" digest for one repository'
       description: |
-        E75.6 / #3734 (ADR-082 #3728 rule 7). The caller's digest of what the
-        audit chain recorded in one repository since their READ WATERMARK,
-        computed on demand from the decision index and the chain. The
-        watermark is keyed by the caller's auth subject + repository +
-        workspace account, so two captains' digests are independent.
+        E75.6 / #3734 (ADR-082 #3728 rule 7). The digest of what the audit
+        chain recorded in one repository since a READ WATERMARK, computed on
+        demand from the decision index and the chain. A watermark is keyed by
+        a subject + repository + workspace account, so two subjects' digests
+        are independent.
+
+        **Whose watermark** (E76.3 / #3766, ADR-083 rule 6). By default the
+        repository's SEATED captain's (`captain_subject_basis: captain`), so
+        the digest belongs to the seat rather than to whoever asks. A vacant
+        seat or an unreadable captain record falls back to the caller's own
+        subject (`caller_vacant` / `caller_unavailable`) — the fallback is
+        named, never silent. The optional read-only `captain_subject`
+        parameter overrides the key (`captain`, `caller` or `explicit`
+        basis); it is a projection of a chain the caller can already read.
 
         **Retrieval never writes.** This read does not advance the watermark
         and appends no audit entry; only `POST /v0/digest/mark-read` does.
@@ -13787,6 +13864,14 @@ paths:
           in: query
           description: Inclusive upper chain position. 0 or absent = the repository's chain head.
           schema: { type: integer, format: int64, minimum: 0 }
+        - name: captain_subject
+          in: query
+          description: |
+            Read-only override of the watermark key (E76.3 / #3766). Absent =
+            the seated captain, else the caller. When present it must be a
+            non-empty subject of at most 256 bytes. Not accepted by
+            `POST /v0/digest/mark-read`.
+          schema: { type: string, minLength: 1, maxLength: 256 }
       responses:
         '200':
           description: The bounded digest.
@@ -13795,9 +13880,9 @@ paths:
               schema: { $ref: '#/components/schemas/Digest' }
         '400':
           description: |
-            `validation_failed` — `repo` missing, an unknown `section`, or a
-            sequence that is not a non-negative integer (`details.field` names
-            it); or `to_sequence_beyond_chain_head` — `to_sequence` is above
+            `validation_failed` — `repo` missing, an unknown `section`, a
+            sequence that is not a non-negative integer, or an empty or
+            over-length `captain_subject` (`details.field` names it); or `to_sequence_beyond_chain_head` — `to_sequence` is above
             the repository's chain head (`details.chain_head` names it).
           content:
             application/json:
@@ -13833,12 +13918,18 @@ paths:
       operationId: markDigestRead
       summary: Advance the caller's digest read watermark
       description: |
-        E75.6 / #3734. Advances the caller's read watermark for one repository
-        to `to_sequence`. **Never silent:** a `digest_marked_read` entry is
+        E75.6 / #3734. Advances the CALLER's own read watermark for one
+        repository to `to_sequence`. Only the seated captain advances the
+        captain's watermark (for them the two keys are the same row); a
+        non-captain's mark moves their own key, never the seat's
+        (`captain_subject_basis: caller`, E76.3 / #3766). The request accepts
+        no `captain_subject`. **Never silent:** a `digest_marked_read` entry is
         appended to the GLOBAL audit chain (partitioned by the caller's
         workspace account; it belongs to no run) FIRST, and the watermark
         moves only after that append succeeds — an append failure answers 500
-        with the watermark unmoved.
+        with the watermark unmoved. The entry records `captain_subject` (the
+        key), `marked_by` (the subject that performed the mark) and
+        `captain_subject_basis`.
 
         A `to_sequence` at or below the current watermark is a no-op
         (`advanced: false`) that appends NOTHING. The stored watermark is

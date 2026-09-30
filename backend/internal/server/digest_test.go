@@ -186,3 +186,17 @@ func TestOpenAPI_DigestRoutesDocumented(t *testing.T) {
 		}
 	}
 }
+
+// TestDigestBasisOverhead_MatchesWireSize: the budget the GET handler hands
+// digest.Bound is reduced by EXACTLY what captain_subject_basis adds, so the
+// whole response stays inside digest.DefaultByteBudget.
+func TestDigestBasisOverhead_MatchesWireSize(t *testing.T) {
+	d := digest.Digest{Repo: "o/r", CaptainSubject: "github:alice"}
+	bare, _ := json.Marshal(d)
+	for _, basis := range []string{digestBasisCaptain, digestBasisCaller, digestBasisCallerVacant, digestBasisCallerUnavailable, digestBasisExplicit} {
+		wrapped, _ := json.Marshal(digestResponse{Digest: d, CaptainSubjectBasis: basis})
+		if got, want := len(wrapped)-len(bare), digestBasisOverhead(basis); got != want {
+			t.Errorf("basis %q adds %d bytes on the wire, overhead reports %d", basis, got, want)
+		}
+	}
+}
