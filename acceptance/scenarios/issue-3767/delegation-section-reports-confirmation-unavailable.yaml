@@ -1,0 +1,14 @@
+id: scenario:issue-3767/delegation-section-reports-confirmation-unavailable
+statement: 'Each workflow entry in the brief''s delegation_in_force section carries a confirmation field whose value is exactly "unavailable", since delegation confirmation recording (E76.5 #3768) is not implemented by this change.'
+verify_hint: 'HTTP route: the GET /v0/handover-brief 200 body''s delegation_in_force section has every workflow entry''s confirmation == "unavailable".'
+steps: GET http://localhost:8090/v0/handover-brief?repo=kuhlman-labs/fishhawk (and with &section=delegation_in_force) with the read:audit bearer.
+assertions:
+    expected: Every workflow entry has confirmation == "unavailable".
+    observed_at_record: workflows = [{workflow_id feature_change, autonomy low, content_hash 329fabc2…, confirmation 'unavailable'}]. That is the only workflow in the cached spec (matches /v0/repos/kuhlman-labs/fishhawk/delegation?source=run_cache).
+    repro_handle: 'curl -s -H ''Authorization: Bearer <fhk_>'' ''http://localhost:8090/v0/handover-brief?repo=kuhlman-labs/fishhawk&section=delegation_in_force'''
+origin:
+    issue: 3767
+    pr: 0
+    run_id: 98a28bc0-5829-4401-a005-8cbb4abcd9b4
+    head_sha: 1aa55a2de890ea6378ed521ea129fbb45bb66cc6
+    recorded_at: 2026-09-30T00:10:08Z

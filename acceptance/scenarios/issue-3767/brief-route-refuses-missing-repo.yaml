@@ -1,0 +1,14 @@
+id: scenario:issue-3767/brief-route-refuses-missing-repo
+statement: GET /v0/handover-brief with no repo query parameter returns HTTP 400 with the error code validation_failed and details naming the repo field.
+verify_hint: 'HTTP route: GET /v0/handover-brief on the localhost preview returns 400 and the body''s error code is validation_failed with details.field == "repo".'
+steps: Minted an operator fhk_ token (read:audit and others) by inserting a sha256-hashed row into fishhawk_preview.api_tokens. GET http://localhost:8090/v0/handover-brief with that bearer and no repo (also with only section=in_flight). No-bearer requests get 401 first.
+assertions:
+    expected: HTTP 400 validation_failed with details naming the repo field.
+    observed_at_record: 400 {code validation_failed, message 'repo is required (owner/name)', details {field repo}}.
+    repro_handle: 'curl -s -H ''Authorization: Bearer <fhk_ read:audit>'' http://localhost:8090/v0/handover-brief'
+origin:
+    issue: 3767
+    pr: 0
+    run_id: 98a28bc0-5829-4401-a005-8cbb4abcd9b4
+    head_sha: 1aa55a2de890ea6378ed521ea129fbb45bb66cc6
+    recorded_at: 2026-09-30T00:10:08Z
