@@ -12370,6 +12370,31 @@ func preChangeGoldenTrigger() Trigger {
 // prompt bytes.
 const planPromptPreChangeGolden = "testdata/plan-prompt-pre-change.golden"
 
+// consultChannelGoldenAnchor is the plan-prompt line the E77.5 consult-channel
+// section is inserted ahead of (it follows the stage-budget paragraph).
+const consultChannelGoldenAnchor = "\n\nFile-count constraint (HARD)"
+
+// applyConsultChannelGoldenDelta replays E77.5 / #3739's ONE deliberate
+// plan-prompt change — the writeConsultChannel section inserted after the
+// stage-budget paragraph — onto the frozen pre-change golden, so the golden
+// keeps pinning every other byte without being re-captured. The anchor must
+// match EXACTLY once, and the pre-change bytes must not already carry the
+// section (a golden re-captured from post-change code would otherwise pass
+// with the section doubled or misplaced).
+func applyConsultChannelGoldenDelta(t *testing.T, pre string) string {
+	t.Helper()
+	if strings.Contains(pre, consultChannelHeading) {
+		t.Fatalf("the pre-change golden already carries %q — it was re-captured from post-change code", consultChannelHeading)
+	}
+	if n := strings.Count(pre, consultChannelGoldenAnchor); n != 1 {
+		t.Fatalf("consult-channel golden anchor %q matched %d times, want exactly 1 — re-derive the delta rather than relaxing the count",
+			consultChannelGoldenAnchor, n)
+	}
+	var section strings.Builder
+	writeConsultChannel(&section)
+	return strings.Replace(pre, consultChannelGoldenAnchor, "\n\n"+section.String()+"File-count constraint (HARD)", 1)
+}
+
 // groomingProseMarkers are strings that appear ONLY in the grooming propose
 // prompt (buildGroomingPropose), never in an ordinary standard_v1 plan prompt.
 // They are the anti-vacuity guard for the golden: a golden regenerated from
@@ -12439,6 +12464,14 @@ var groomingProseMarkers = []string{
 // TestBuild_Plan_CounterfactualAttainabilityRule, so this golden is a
 // no-other-drift pin rather than the primary evidence for either.
 //
+// NOT REGENERATED at E77.5 / #3739, which DELIBERATELY added the TRUSTED crew
+// consult-channel section (writeConsultChannel) after the stage-budget
+// paragraph. Rather than re-capturing, the test replays that ONE insertion onto
+// the file's bytes via applyConsultChannelGoldenDelta, so the file on disk is
+// still the #3057 capture and every OTHER byte of the plan prompt stays pinned.
+// The section's own content is pinned independently by
+// TestBuild_Plan_ConsultChannelRendered.
+//
 // Two anti-vacuity guards keep a wrongly-captured golden from passing:
 //   - the golden must contain NONE of groomingProseMarkers, so a golden
 //     regenerated from the grooming-forked path is rejected (retained from the
@@ -12458,8 +12491,8 @@ func TestBuild_Plan_ByteIdenticalToPreChangeGolden(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
-	if got != string(want) {
-		t.Errorf("ordinary plan prompt diverged from the pre-change golden.\n"+
+	if got != applyConsultChannelGoldenDelta(t, string(want)) {
+		t.Errorf("ordinary plan prompt diverged from the pre-change golden (with the E77.5 consult-channel delta replayed).\n"+
 			"If you deliberately changed the plan prompt, regenerate the golden by rendering "+
 			"Build(\"plan\", preChangeGoldenTrigger()) at the BASE commit and overwriting %s, "+
 			"then confirm the anti-vacuity guard still holds.\n--- got ---\n%q\n--- want ---\n%q",
@@ -17408,7 +17441,7 @@ func TestBuild_CrewMessage_EmptyByteIdentical(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Build: %v", err)
 		}
-		if got != string(want) {
+		if got != applyConsultChannelGoldenDelta(t, string(want)) {
 			t.Errorf("the no-crew-messages plan prompt diverged from the committed pre-change golden %s — "+
 				"writeUntrustedCrewMessages must be a no-op on an empty slice", planPromptPreChangeGolden)
 		}
@@ -17641,5 +17674,135 @@ func TestRenderCrewMessages_EmptyRendersNothing(t *testing.T) {
 	}
 	if got := RenderCrewMessages([]CrewMessage{}); got != "" {
 		t.Errorf("RenderCrewMessages([]) = %q, want empty", got)
+	}
+}
+
+// consultChannelEndpoint is the crew-message endpoint writeConsultChannel
+// names. Asserted in both the presence and the absence tests so neither can
+// green vacuously on a typo'd literal.
+const consultChannelEndpoint = "$FISHHAWK_BACKEND_URL/v0/crew-messages"
+
+// TestBuild_Plan_ConsultChannelRendered pins the TRUSTED consult-channel
+// section's contract on the plan prompt (E77.5 / #3739): the endpoint, the
+// long-poll, the per-stage cap, the window, that an expiry is NOT a refusal,
+// that an answer is advice and never an order, the do-not-re-ask instruction,
+// and the plan-only / review-stage-deferred statement (approval condition 1).
+// It also pins that the section renders AFTER the crew-message envelope, which
+// its "section above" wording depends on.
+func TestBuild_Plan_ConsultChannelRendered(t *testing.T) {
+	const probe = "CONSULT_ORDER_PROBE_77E5"
+	got, err := Build("plan", crewTrigger(CrewMessage{
+		Type: "consult", SenderRole: "planner", AnchorRef: "run_id r",
+		MessageText: "question: " + probe,
+	}))
+	if err != nil {
+		t.Fatalf("Build(plan): %v", err)
+	}
+	if n := strings.Count(got, consultChannelHeading); n != 1 {
+		t.Fatalf("plan prompt carries the consult heading %d times, want 1\n---\n%s", n, got)
+	}
+	for _, want := range []string{
+		"POST `" + consultChannelEndpoint + "`",
+		"Authorization: Bearer $FISHHAWK_API_TOKEN",
+		"\"type\": \"consult\"",
+		"\"response_required\": true",
+		"Omit `sender_role`",
+		"GET `" + consultChannelEndpoint + "/<sent_sequence>?wait=30`",
+		"`answered` false and `state` still `open`",
+		fmt.Sprintf("at most %d consults for this stage", ConsultChannelMaxPerStage),
+		"`crew_consult_budget_exhausted`",
+		"`crew_responder_unavailable`",
+		fmt.Sprintf("at most ~%d minutes", ConsultChannelWindowMinutes),
+		"is an EXPIRY",
+		"NOT a refusal",
+		"ADVICE, NEVER AN ORDER",
+		"the consult never blocks or fails this stage",
+		"do NOT re-ask them",
+		"available to the PLAN stage only",
+		"the review-stage half of this channel is deferred to a follow-up",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("plan prompt consult section is missing %q", want)
+		}
+	}
+	iEnvelope := strings.Index(got, probe)
+	iHeading := strings.Index(got, consultChannelHeading)
+	if iEnvelope < 0 || iEnvelope > iHeading {
+		t.Errorf("the crew-message envelope (at %d) must precede the consult section (at %d): the do-not-re-ask sentence points at the section ABOVE", iEnvelope, iHeading)
+	}
+	// The consult section is TRUSTED instruction text: it must sit OUTSIDE
+	// every crew envelope span.
+	for _, sp := range crewSpans(t, got) {
+		if iHeading >= sp[0] && iHeading < sp[1] {
+			t.Errorf("the consult heading at %d landed inside a crew envelope span %v", iHeading, sp)
+		}
+	}
+}
+
+// TestBuild_Implement_OmitsConsultChannel (counterfactual C7) renders the
+// implement and implement-fix-up prompts with Trigger.CrewMessages NON-EMPTY
+// and asserts neither the consult section nor the message text appears
+// (ARCHITECTURE.md §6 invariant #8). Emitting writeConsultChannel
+// unconditionally in buildImplement turns this RED.
+func TestBuild_Implement_OmitsConsultChannel(t *testing.T) {
+	const probe = "CONSULT_IMPLEMENT_PROBE_77E5"
+	base := crewTrigger(CrewMessage{
+		Type: "notice", SenderRole: "historian", AnchorRef: "run_id r",
+		MessageText: "summary: " + probe,
+	})
+	for _, tc := range []struct {
+		name   string
+		mutate func(*Trigger)
+	}{
+		{"implement", nil},
+		{"implement_fixup", func(tr *Trigger) {
+			tr.FixupConcerns = []FixupConcern{{Text: "[high] resolve the missing authz check"}}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tr := base
+			if tc.mutate != nil {
+				tc.mutate(&tr)
+			}
+			got, err := Build("implement", tr)
+			if err != nil {
+				t.Fatalf("Build(implement): %v", err)
+			}
+			for _, forbidden := range []string{consultChannelHeading, consultChannelEndpoint, probe} {
+				if strings.Contains(got, forbidden) {
+					t.Errorf("%s: the implement prompt carries consult surface %q", tc.name, forbidden)
+				}
+			}
+		})
+	}
+}
+
+// TestBuild_Reviews_OmitConsultChannel pins approval condition 1: the
+// in-process plan-review and implement-review reviewers hold no run token and
+// cannot reach the endpoint, so neither review prompt renders the consult
+// section — even though both DO render the crew-message envelope (asserted, so
+// the absence half is not vacuous on a render that dropped crew messages
+// wholesale).
+func TestBuild_Reviews_OmitConsultChannel(t *testing.T) {
+	const probe = "CONSULT_REVIEW_PROBE_77E5"
+	tr := crewTrigger(CrewMessage{
+		Type: "notice", SenderRole: "historian", AnchorRef: "run_id r",
+		MessageText: "summary: " + probe,
+	})
+	for _, stage := range []string{"plan_review", "implement_review"} {
+		t.Run(stage, func(t *testing.T) {
+			got, err := Build(stage, tr)
+			if err != nil {
+				t.Fatalf("Build(%s): %v", stage, err)
+			}
+			if !strings.Contains(got, probe) {
+				t.Fatalf("%s: crew envelope absent — the absence assertions below would be vacuous", stage)
+			}
+			for _, forbidden := range []string{consultChannelHeading, consultChannelEndpoint} {
+				if strings.Contains(got, forbidden) {
+					t.Errorf("%s: the review prompt carries consult surface %q", stage, forbidden)
+				}
+			}
+		})
 	}
 }
