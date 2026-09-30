@@ -1,5 +1,17 @@
 import { getCookie } from '@/lib/cookie';
 import type {
+  CaptainResponse,
+  CaptainVerbResponse,
+  DelegationConfirmationResponse,
+  DelegationConfirmRequest,
+  DelegationLowerRequest,
+  DelegationSource,
+  DelegationVerbResponse,
+  HandoverBrief,
+  HandoverBriefSectionKind,
+  RepoDelegation,
+} from './captain';
+import type {
   AcceptanceArbitrationRequest,
   AcceptanceArbitrationResult,
   ApiError,
@@ -73,6 +85,43 @@ function repoDashPath(
 ): string {
   const base = `/v0/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/${rollup}`;
   return weeks !== undefined ? `${base}?weeks=${encodeURIComponent(String(weeks))}` : base;
+}
+
+/*
+ * Delegation path builder (E76.6 / #3769): the same separately-encoded
+ * owner/name discipline as repoDashPath, plus an optional sub-path and a
+ * query string whose unset params are omitted rather than sent empty.
+ */
+function repoDelegationPath(
+  owner: string,
+  name: string,
+  sub: '' | '/confirmation' | '/confirm' | '/lower',
+  query?: Record<string, string | undefined>,
+): string {
+  const base = `/v0/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/delegation${sub}`;
+  const q = new URLSearchParams();
+  for (const [k, v] of Object.entries(query ?? {})) {
+    if (v !== undefined && v !== '') q.set(k, v);
+  }
+  const qs = q.toString();
+  return qs ? `${base}?${qs}` : base;
+}
+
+/*
+ * One captain verb POST. The body carries `repo` and — for `offer` ONLY —
+ * `successor`: the route answers 400 `validation_failed` to a `successor` on
+ * any other verb. `delegated` is never sent; every captain verb refuses the
+ * delegated path, and the SPA acts only as the signed-in human.
+ */
+function captainVerb(
+  verb: 'offer' | 'withdraw' | 'accept' | 'relinquish' | 'claim',
+  body: { repo: string; successor?: string },
+): Promise<CaptainVerbResponse> {
+  return request(`/v0/captain/${verb}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -514,6 +563,114 @@ export const api = {
     body: AcceptanceArbitrationRequest,
   ): Promise<AcceptanceArbitrationResult> {
     return request(`/v0/runs/${encodeURIComponent(runId)}/acceptance-arbitration`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+  },
+
+  /*
+   * Change of command on the bridge (E76.6 / #3769). Ten thin wrappers over
+   * EXISTING routes (backend/internal/server/captain.go and
+   * delegation_confirm.go); no endpoint is added server-side. The UI adds no
+   * authority: the server's refusal is the only identity gate.
+   */
+
+  /** GET /v0/captain — the derived captain record for `owner/name`. */
+  getCaptain(repo: string): Promise<CaptainResponse> {
+    const q = new URLSearchParams();
+    q.set('repo', repo);
+    return request(`/v0/captain?${q.toString()}`);
+  },
+
+  /** POST /v0/captain/offer — the only captain verb that sends `successor`. */
+  captainOffer(body: { repo: string; successor: string }): Promise<CaptainVerbResponse> {
+    return captainVerb('offer', { repo: body.repo, successor: body.successor });
+  },
+
+  captainWithdraw(repo: string): Promise<CaptainVerbResponse> {
+    return captainVerb('withdraw', { repo });
+  },
+
+  captainAccept(repo: string): Promise<CaptainVerbResponse> {
+    return captainVerb('accept', { repo });
+  },
+
+  captainRelinquish(repo: string): Promise<CaptainVerbResponse> {
+    return captainVerb('relinquish', { repo });
+  },
+
+  captainClaim(repo: string): Promise<CaptainVerbResponse> {
+    return captainVerb('claim', { repo });
+  },
+
+  /**
+   * GET /v0/handover-brief. `fromSequence` / `toSequence` are tested with
+   * `!== undefined` so an explicit 0 ("derive it") still rides the query.
+   */
+  getHandoverBrief(params: {
+    repo: string;
+    section?: HandoverBriefSectionKind;
+    fromSequence?: number;
+    toSequence?: number;
+  }): Promise<HandoverBrief> {
+    const q = new URLSearchParams();
+    q.set('repo', params.repo);
+    if (params.section) q.set('section', params.section);
+    if (params.fromSequence !== undefined) q.set('from_sequence', String(params.fromSequence));
+    if (params.toSequence !== undefined) q.set('to_sequence', String(params.toSequence));
+    return request(`/v0/handover-brief?${q.toString()}`);
+  },
+
+  /** GET /v0/repos/{owner}/{name}/delegation — the resolved per-workflow view. */
+  getRepoDelegation(
+    owner: string,
+    name: string,
+    params?: { source?: DelegationSource; ref?: string; workflow?: string },
+  ): Promise<RepoDelegation> {
+    return request(
+      repoDelegationPath(owner, name, '', {
+        source: params?.source,
+        ref: params?.ref,
+        workflow: params?.workflow,
+      }),
+    );
+  },
+
+  /** GET /v0/repos/{owner}/{name}/delegation/confirmation — every workflow's verdict. */
+  getRepoDelegationConfirmation(
+    owner: string,
+    name: string,
+    params?: { source?: DelegationSource; ref?: string },
+  ): Promise<DelegationConfirmationResponse> {
+    return request(
+      repoDelegationPath(owner, name, '/confirmation', {
+        source: params?.source,
+        ref: params?.ref,
+      }),
+    );
+  },
+
+  /** POST .../delegation/confirm — binds the workflow's OWN content_hash. */
+  confirmRepoDelegation(
+    owner: string,
+    name: string,
+    body: DelegationConfirmRequest,
+  ): Promise<DelegationVerbResponse> {
+    return request(repoDelegationPath(owner, name, '/confirm'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+  },
+
+  /** POST .../delegation/lower — files ONE autonomy:low work item; changes nothing in force. */
+  lowerRepoDelegation(
+    owner: string,
+    name: string,
+    body: DelegationLowerRequest,
+  ): Promise<DelegationVerbResponse> {
+    return request(repoDelegationPath(owner, name, '/lower'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
