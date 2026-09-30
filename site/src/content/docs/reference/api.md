@@ -41,7 +41,7 @@ _Generated from the canonical sources by `scripts/gen-site-reference`; do not ed
 
 ## Operations
 
-The v0 REST API exposes **145 operations** across the paths below, generated from [`docs/api/v0.openapi.yaml`](https://github.com/kuhlman-labs/fishhawk/blob/main/docs/api/v0.openapi.yaml). That document is the source of truth; this table is its published rendering.
+The v0 REST API exposes **148 operations** across the paths below, generated from [`docs/api/v0.openapi.yaml`](https://github.com/kuhlman-labs/fishhawk/blob/main/docs/api/v0.openapi.yaml). That document is the source of truth; this table is its published rendering.
 
 | Method | Path | Summary |
 |---|---|---|
@@ -146,6 +146,9 @@ The v0 REST API exposes **145 operations** across the paths below, generated fro
 | `GET` | `/v0/repos/{owner}/{name}/economics` | Get a repository's economics rollup |
 | `GET` | `/v0/repos/{owner}/{name}/posture` | Get a repository's workflow posture |
 | `GET` | `/v0/repos/{owner}/{name}/delegation` | Get a repository's per-workflow delegation posture |
+| `GET` | `/v0/repos/{owner}/{name}/delegation/confirmation` | Which workflows' delegation the captain has confirmed since the latest handover |
+| `POST` | `/v0/repos/{owner}/{name}/delegation/confirm` | The sitting captain confirms one workflow's delegation exactly as shown |
+| `POST` | `/v0/repos/{owner}/{name}/delegation/lower` | The sitting captain proposes a strictly lower delegation for one workflow |
 | `GET` | `/v0/acceptance-triage/stats` | Get acceptance-triage statistics |
 | `GET` | `/v0/stages/{stage_id}` | Get a stage |
 | `GET` | `/v0/stages/{stage_id}/artifacts` | List artifacts for a stage |

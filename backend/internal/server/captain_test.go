@@ -7,10 +7,13 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/captain"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/delegationconfirm"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/digest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/handoverbrief"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/identity"
@@ -494,5 +497,194 @@ func TestCaptainVerbs_OnlyOfferRecordsABrief(t *testing.T) {
 	}
 	if strings.Contains(string(raw), "brief_") {
 		t.Errorf("captain_assigned payload carries brief keys: %s", raw)
+	}
+}
+
+// --- delegation_unconfirmed on the hand-off surface (E76.5 / #3768) ---
+
+// captainUnconfirmed GETs /v0/captain for acme/app and returns the block,
+// failing when it is absent.
+func captainUnconfirmed(t *testing.T, f *delegationConfirmPG) *captainDelegationUnconfirmed {
+	t.Helper()
+	body, raw := f.get(t, "acme/app")
+	if body.DelegationUnconfirmed == nil {
+		t.Fatalf("GET /v0/captain carries no delegation_unconfirmed block:\n%s", raw)
+	}
+	return body.DelegationUnconfirmed
+}
+
+func sameIDs(got []string, want ...string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	g := append([]string(nil), got...)
+	w := append([]string(nil), want...)
+	sort.Strings(g)
+	sort.Strings(w)
+	for i := range g {
+		if g[i] != w[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// TestCaptainDelegationUnconfirmed_FirstHandoverListsEveryWorkflow (approval
+// condition 1): with a captain seated and NO confirmation entries, the
+// hand-off surface lists every workflow of the view — never-confirmed ones
+// included — and says it reports no hash staleness.
+func TestCaptainDelegationUnconfirmed_FirstHandoverListsEveryWorkflow(t *testing.T) {
+	f := newDelegationConfirmPG(t)
+	f.seedSpecAt(t, confirmSpecA, time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC))
+	f.seedCaptain(t, "acme/app", confirmCaptain)
+	got := captainUnconfirmed(t, f)
+	if !sameIDs(got.Workflows, "ship", "guarded") {
+		t.Errorf("workflows = %v, want every workflow of the spec (ship, guarded)", got.Workflows)
+	}
+	if got.Source != delegationSourceRunCache || got.HashStalenessReported || got.SeatSequence == 0 ||
+		got.InventoryUnavailable != "" || got.Unavailable != "" {
+		t.Errorf("block = %+v, want source run_cache, hash_staleness_reported false, a seat sequence, no unavailability", got)
+	}
+}
+
+// TestCaptainDelegationUnconfirmed_NoCaptainListsNothing: before any captain
+// has sat there is no handover to confirm.
+func TestCaptainDelegationUnconfirmed_NoCaptainListsNothing(t *testing.T) {
+	f := newDelegationConfirmPG(t)
+	f.seedSpecAt(t, confirmSpecA, time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC))
+	got := captainUnconfirmed(t, f)
+	if len(got.Workflows) != 0 || got.SeatSequence != 0 {
+		t.Errorf("block = %+v, want no workflows and seat_sequence 0", got)
+	}
+}
+
+// TestCaptainDelegationUnconfirmed_ChainOnlyNoStaleness (approval condition
+// 2): a confirmed workflow leaves the list, and a later TIGHTENED spec — whose
+// hash differs by construction — does NOT put it back on the hand-off surface,
+// while the delegation-confirmation read DOES report hash_stale (which proves
+// the fixture really is stale).
+func TestCaptainDelegationUnconfirmed_ChainOnlyNoStaleness(t *testing.T) {
+	f := newDelegationConfirmPG(t)
+	base := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	f.seedSpecAt(t, confirmSpecA, base)
+	f.seedCaptain(t, "acme/app", confirmCaptain)
+	if w := serveDelegationConfirm(t, f.srv, "confirm", confirmBody("ship", hashOfWorkflow(t, confirmSpecA, "ship")), confirmCaptain); w.Code != http.StatusOK {
+		t.Fatalf("confirm = %d: %s", w.Code, w.Body.String())
+	}
+	if got := captainUnconfirmed(t, f); !sameIDs(got.Workflows, "guarded") {
+		t.Fatalf("after confirm, workflows = %v, want [guarded]", got.Workflows)
+	}
+
+	f.seedSpecAt(t, confirmSpecTightened, base.Add(time.Hour))
+	if st := statusFor(t, readConfirmation(t, f.srv).Workflows, "ship"); st.Reason != delegationconfirm.ReasonHashStale {
+		t.Fatalf("confirmation read = %+v, want hash_stale (the fixture is not stale)", st)
+	}
+	got := captainUnconfirmed(t, f)
+	if !sameIDs(got.Workflows, "guarded") || got.HashStalenessReported {
+		t.Errorf("after tightening, captain block = %+v, want [guarded] with no staleness reported", got)
+	}
+}
+
+// TestCaptainDelegationUnconfirmed_AcceptResponseListsEveryWorkflow: the
+// outgoing captain confirmed `ship`; the successor's ACCEPT response already
+// lists it again, because confirmation state resets at every seat change.
+func TestCaptainDelegationUnconfirmed_AcceptResponseListsEveryWorkflow(t *testing.T) {
+	f := newDelegationConfirmPG(t)
+	f.seedSpecAt(t, confirmSpecA, time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC))
+	f.seedCaptain(t, "acme/app", confirmCaptain)
+	if w := serveDelegationConfirm(t, f.srv, "confirm", confirmBody("ship", hashOfWorkflow(t, confirmSpecA, "ship")), confirmCaptain); w.Code != http.StatusOK {
+		t.Fatalf("confirm = %d: %s", w.Code, w.Body.String())
+	}
+	f.seedOffer(t, "acme/app", confirmCaptain, "github:successor")
+	code, body := f.verb(t, "accept", "github:successor", captainBody("acme/app"))
+	if code != http.StatusOK {
+		t.Fatalf("accept = %d: %s", code, body)
+	}
+	var resp captainVerbResponse
+	if err := json.Unmarshal([]byte(body), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.DelegationUnconfirmed == nil || !sameIDs(resp.DelegationUnconfirmed.Workflows, "ship", "guarded") {
+		t.Errorf("accept delegation_unconfirmed = %+v, want both workflows", resp.DelegationUnconfirmed)
+	}
+	if resp.DelegationUnconfirmed != nil && resp.DelegationUnconfirmed.SeatSequence != resp.Event.Sequence {
+		t.Errorf("seat_sequence = %d, want the accept's own sequence %d", resp.DelegationUnconfirmed.SeatSequence, resp.Event.Sequence)
+	}
+}
+
+// TestCaptainDelegationUnconfirmed_OutgoingCaptainConfirmIgnored (approval
+// condition 3): an outgoing captain's confirmation that lands AFTER a newer
+// captain_assigned — seeded by construction, bypassing the handler's lock —
+// leaves the workflow on the hand-off surface's unconfirmed list.
+func TestCaptainDelegationUnconfirmed_OutgoingCaptainConfirmIgnored(t *testing.T) {
+	f := newDelegationConfirmPG(t)
+	f.seedSpecAt(t, confirmSpecA, time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC))
+	f.seedCaptain(t, "acme/app", confirmCaptain)
+	f.seedCaptain(t, "acme/app", "github:successor")
+	for _, wf := range []string{"ship", "guarded"} {
+		f.seedEntry(t, delegationconfirm.CategoryDelegationConfirmed, map[string]any{
+			"repo": "acme/app", "workflow": wf, "subject": confirmCaptain, "content_hash": hashOfWorkflow(t, confirmSpecA, wf)})
+	}
+	if got := captainUnconfirmed(t, f); !sameIDs(got.Workflows, "ship", "guarded") {
+		t.Errorf("workflows = %v, want both still unconfirmed (the outgoing captain's confirmations must not count)", got.Workflows)
+	}
+}
+
+// TestCaptainDelegationUnconfirmed_InventoryUnavailable: every branch that
+// cannot read the workflow SET names its reason and lists nothing, so an
+// empty list is never read as "all confirmed".
+func TestCaptainDelegationUnconfirmed_InventoryUnavailable(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		repo run.Repository
+		want string
+	}{
+		{"no run repository", nil, captainDelegationNoRunRepository},
+		{"list runs failed", &captainRunRepo{err: errors.New("db down")}, captainDelegationListRunsFailed},
+		{"no run", &captainRunRepo{}, captainDelegationNoCachedSpec},
+		{"no cached spec", &captainRunRepo{rows: []*run.Run{{Repo: "acme/app"}}}, captainDelegationNoCachedSpec},
+		{"spec unparseable", &captainRunRepo{rows: []*run.Run{{Repo: "acme/app", WorkflowSpec: []byte("version: [")}}}, captainDelegationSpecUnparseable},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newDelegationConfirmPG(t)
+			f.seedCaptain(t, "acme/app", confirmCaptain)
+			f.srv.cfg.RunRepo = tc.repo
+			got := captainUnconfirmed(t, f)
+			if got.InventoryUnavailable != tc.want || len(got.Workflows) != 0 || got.Workflows == nil {
+				t.Errorf("block = %+v, want inventory_unavailable %q and an empty (non-null) list", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestCaptainDelegationUnconfirmed_ChainReadFailure: a failed confirmation
+// read degrades to a fixed reason in the block, never a failed GET and never
+// the raw error text.
+func TestCaptainDelegationUnconfirmed_ChainReadFailure(t *testing.T) {
+	f := newDelegationConfirmPG(t)
+	f.seedSpecAt(t, confirmSpecA, time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC))
+	f.seedCaptain(t, "acme/app", confirmCaptain)
+	f.srv.cfg.DelegationConfirmStore = &memConfirmStore{readErr: errors.New("secret-dsn unreachable")}
+	got := captainUnconfirmed(t, f)
+	if got.Unavailable != captainDelegationChainReadFailed || len(got.Workflows) != 0 {
+		t.Errorf("block = %+v, want unavailable %q and no workflows", got, captainDelegationChainReadFailed)
+	}
+	_, raw := f.get(t, "acme/app")
+	if strings.Contains(raw, "secret-dsn") {
+		t.Errorf("the raw chain error leaked into the 200 body:\n%s", raw)
+	}
+}
+
+// TestCaptainDelegationUnconfirmed_NilStoreOmitsBlock: without the store the
+// key is ABSENT on GET and on a verb — never an empty list.
+func TestCaptainDelegationUnconfirmed_NilStoreOmitsBlock(t *testing.T) {
+	f := newCaptainPG(t, nil)
+	f.seedCaptain(t, "acme/app", "github:alice")
+	if _, raw := f.get(t, "acme/app"); strings.Contains(raw, "delegation_unconfirmed") {
+		t.Errorf("GET carries delegation_unconfirmed with no store wired:\n%s", raw)
+	}
+	code, body := f.verb(t, "relinquish", "github:alice", captainBody("acme/app"))
+	if code != http.StatusOK || strings.Contains(body, "delegation_unconfirmed") {
+		t.Errorf("relinquish = %d %s, want 200 without delegation_unconfirmed", code, body)
 	}
 }
