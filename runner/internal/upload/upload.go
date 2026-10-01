@@ -737,6 +737,23 @@ type FetchedPrompt struct {
 	// independent-struct-by-tag convention as ImplementModel. A tag drift silently
 	// drops the model and the runner falls back to today's spawn.
 	PlanModel string `json:"plan_model,omitempty"`
+	// ReasoningEffort is the dispatched stage executor's backend-resolved
+	// reasoning effort (#3896), echoed on ANY agent-stage prompt (plan,
+	// implement incl. fix-up, acceptance) whose spec declares
+	// executor.reasoning_effort. The runner pins it onto
+	// agent.Invocation.ReasoningEffort (claudecode `--effort <e>`, codex
+	// `-c model_reasoning_effort=<e>`). ReasoningEffortSource names the
+	// winning ladder rung (`spec` today) and is informational. EMPTY/omitted
+	// leaves the spawn byte-identical to today.
+	//
+	// CROSS-MODULE WIRE CONTRACT: the json tags (reasoning_effort,
+	// reasoning_effort_source) MUST stay byte-identical to the backend's
+	// promptResponse.ReasoningEffort / ReasoningEffortSource
+	// (backend/internal/server/prompt.go); the shared golden
+	// testdata/wire/reasoning_effort_prompt.json pins both sides. A tag drift
+	// silently drops the effort and the runner spawns at today's default.
+	ReasoningEffort       string `json:"reasoning_effort,omitempty"`
+	ReasoningEffortSource string `json:"reasoning_effort_source,omitempty"`
 	// Fixup is true when this implement stage is an operator-triggered
 	// implement-review fix-up pass (sub-plan A / #762). A fix-up re-runs
 	// the implement agent against the selected concerns and commits the

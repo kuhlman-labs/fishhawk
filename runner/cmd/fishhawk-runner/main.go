@@ -479,6 +479,15 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// Function-scoped like implementModel: produced and consumed within run().
 	var planModel string
 
+	// stage reasoning-effort routing (#3896): the backend resolves the
+	// dispatched stage executor's reasoning_effort and carries it on the prompt
+	// response for ANY agent stage (plan, implement incl. fix-up, acceptance);
+	// the decoder threads it onto FetchedPrompt.ReasoningEffort and the runner
+	// pins it onto agent.Invocation.ReasoningEffort below (claudecode
+	// `--effort <e>`, codex `-c model_reasoning_effort=<e>`). EMPTY leaves the
+	// spawn byte-identical to today.
+	var stageEffort reasoningEffort
+
 	// exemptOpenPR / exemptHeldSHA / exemptHeldBranch / exemptHeldBaseSHA carry
 	// the operator EXEMPT resolution of a scope-completeness park (#1231) from
 	// the fetched prompt to the early zero-re-run branch below. When exemptOpenPR
@@ -643,7 +652,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			return exitFailure
 		}
 		issuedKey = key
-		path, sType, agentTimeoutSecs, specVerifyCmd, specVerifyTimeoutSecs, specVerifyMaxIterations, decomposedFromRunID, minRunnerVersion, agentVersionRange, agentSelfRetry, maxRetriesSnapshot, retryAttempt, scopeFiles, commitAuthorName, commitAuthorEmail, fixup, fixupBranch, expectedHeadSHA, promptBindingAssertions, applyPatches, sliceIndex, promptScopeExemptions, openPRFromHeldCommit, heldCommitSHA, heldCommitBranch, heldCommitBaseSHA, heldCommitResumeKind, heldCommitVerifiedTreeSHA, promptSupportsPushResume, heldCommitPRTitle, heldCommitPRBody, promptImplementModel, promptPlanModel, promptEgressTargetHosts, promptAcceptanceCriteriaIDs, promptAcceptanceExpectedHeadSHA, promptDiffCoverage, promptConflictResolution, promptAcceptanceReplay, promptForgeWrites, promptStageAttempt, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
+		path, sType, agentTimeoutSecs, specVerifyCmd, specVerifyTimeoutSecs, specVerifyMaxIterations, decomposedFromRunID, minRunnerVersion, agentVersionRange, agentSelfRetry, maxRetriesSnapshot, retryAttempt, scopeFiles, commitAuthorName, commitAuthorEmail, fixup, fixupBranch, expectedHeadSHA, promptBindingAssertions, applyPatches, sliceIndex, promptScopeExemptions, openPRFromHeldCommit, heldCommitSHA, heldCommitBranch, heldCommitBaseSHA, heldCommitResumeKind, heldCommitVerifiedTreeSHA, promptSupportsPushResume, heldCommitPRTitle, heldCommitPRBody, promptImplementModel, promptPlanModel, promptEgressTargetHosts, promptAcceptanceCriteriaIDs, promptAcceptanceExpectedHeadSHA, promptDiffCoverage, promptConflictResolution, promptAcceptanceReplay, promptForgeWrites, promptStageAttempt, promptReasoningEffort, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
 		stageAttempt = promptStageAttempt
 		// Arm the retirement-drop reporter IMMEDIATELY (E72.4 / #3328, binding
 		// condition 1) — and BEFORE the fetchErr check (#3396): the guarantee
@@ -757,6 +766,15 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// stage. Empty (no ladder rung supplied a model) leaves the spawn
 		// unchanged.
 		planModel = promptPlanModel
+		// Backend-resolved stage reasoning effort (#3896): held for the inv
+		// construction below. Logged here (non-empty only) so the trace shows
+		// which level the spawn was pinned to and from which rung.
+		stageEffort = promptReasoningEffort
+		if stageEffort.value != "" {
+			_, _ = fmt.Fprintf(logSink,
+				`{"event":"reasoning_effort_resolved","run_id":%q,"stage_type":%q,"reasoning_effort":%q,"reasoning_effort_source":%q}`+"\n",
+				cfg.runID, sType, stageEffort.value, stageEffort.source)
+		}
 		// Acceptance-stage inputs (E31.7 / #1535): held for the acceptance
 		// containment branch (proxy allow-list) and the post-agent verdict
 		// validation (criteria join-key membership) below. Both empty on
@@ -1107,6 +1125,14 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	if stageType == "plan" {
 		inv.Model = planModel
 	}
+
+	// Pin the backend-resolved stage reasoning effort onto the spawn (#3896).
+	// Unlike the model this is NOT stage-gated: the backend resolves the
+	// DISPATCHED stage's executor effort, so the value already belongs to this
+	// stage, whatever its type. Every derived invocation (fix-up, verify-fix
+	// and base-rebase re-invokes) copies inv by value and inherits it. Empty
+	// (no effort declared) adds no flag — byte-identical to today's spawn.
+	inv.ReasoningEffort = stageEffort.value
 
 	// Constrain the plan-stage agent's standard_v1 artifact to the canonical
 	// schema's SHAPE via the claude CLI --json-schema structured-output flag
@@ -3578,6 +3604,15 @@ func reissueSigningKeyForTerminalUpload(ctx context.Context, client uploadClient
 	return issued
 }
 
+// reasoningEffort is the prompt-served stage reasoning effort (#3896) —
+// FetchedPrompt.ReasoningEffort plus its source rung — threaded out of
+// fetchPromptToFile as ONE tuple element. The zero value means no effort was
+// declared and the spawn carries no effort flag.
+type reasoningEffort struct {
+	value  string
+	source string
+}
+
 // fetchPromptToFile pulls the constructed prompt from the backend,
 // writes it to a temp file, and returns the path, stage type,
 // agent_timeout_seconds, verify_command, verify_timeout_seconds,
@@ -3608,16 +3643,18 @@ func reissueSigningKeyForTerminalUpload(ctx context.Context, client uploadClient
 // acceptanceReplay (E72.4 / #3328) bundles the replayable-scenario inputs
 // (run branch, PR + issue numbers, effective criteria, served retirements)
 // served only on acceptance stages; zero-valued everywhere else.
+// effort (#3896) is the dispatched stage executor's resolved reasoning effort
+// and its source rung; zero-valued when the spec declares none.
 // The temp file is 0o600 — bundle-style defense in depth, since prompts
 // may include issue bodies that the customer would prefer not to leave on
 // the runner's filesystem world-readable.
-func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, verifyCmd string, verifyTimeoutSecs int, verifyMaxIterations int, decomposedFromRunID string, minRunnerVersion string, agentVersionRange string, agentSelfRetry bool, maxRetriesSnapshot int, retryAttempt int, scopeFiles []upload.ScopeFile, commitAuthorName string, commitAuthorEmail string, fixup bool, fixupBranch string, fixupExpectedHeadSHA string, bindingAssertions []upload.BindingAssertion, fixupApplyPatches []upload.FixupApplyPatch, sliceIndex int, scopeExemptions []upload.ScopeExemption, openPRFromHeldCommit bool, heldCommitSHA string, heldCommitBranch string, heldCommitBaseSHA string, heldCommitResumeKind string, heldCommitVerifiedTreeSHA string, supportsPushResume bool, heldCommitPRTitle string, heldCommitPRBody string, implementModel string, planModel string, egressTargetHosts []string, acceptanceCriteriaIDs []string, acceptanceExpectedHeadSHA string, diffCoverage *upload.DiffCoverageConfig, conflictResolution *conflictResolutionRequest, acceptanceReplay acceptanceReplayInputs, forgeWrites string, stageAttempt string, err error) {
+func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, verifyCmd string, verifyTimeoutSecs int, verifyMaxIterations int, decomposedFromRunID string, minRunnerVersion string, agentVersionRange string, agentSelfRetry bool, maxRetriesSnapshot int, retryAttempt int, scopeFiles []upload.ScopeFile, commitAuthorName string, commitAuthorEmail string, fixup bool, fixupBranch string, fixupExpectedHeadSHA string, bindingAssertions []upload.BindingAssertion, fixupApplyPatches []upload.FixupApplyPatch, sliceIndex int, scopeExemptions []upload.ScopeExemption, openPRFromHeldCommit bool, heldCommitSHA string, heldCommitBranch string, heldCommitBaseSHA string, heldCommitResumeKind string, heldCommitVerifiedTreeSHA string, supportsPushResume bool, heldCommitPRTitle string, heldCommitPRBody string, implementModel string, planModel string, egressTargetHosts []string, acceptanceCriteriaIDs []string, acceptanceExpectedHeadSHA string, diffCoverage *upload.DiffCoverageConfig, conflictResolution *conflictResolutionRequest, acceptanceReplay acceptanceReplayInputs, forgeWrites string, stageAttempt string, effort reasoningEffort, err error) {
 	got, fetchErr := client.FetchPrompt(ctx, upload.FetchPromptArgs{
 		StageID:    cfg.stageID,
 		PrivateKey: key.PrivateKey,
 	})
 	if fetchErr != nil {
-		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplayInputs{}, "", "", fetchErr
+		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplayInputs{}, "", "", reasoningEffort{}, fetchErr
 	}
 	_, _ = fmt.Fprintf(logSink,
 		`{"event":"prompt_fetched","stage_id":%q,"stage_type":%q,"prompt_hash":%q,"prompt_bytes":%d}`+"\n",
@@ -3632,20 +3669,20 @@ func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key
 	acceptanceReplay = acceptanceReplayInputsFromPrompt(got)
 	tmp, tmpErr := os.CreateTemp("", "fishhawk-prompt-*.txt")
 	if tmpErr != nil {
-		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", fmt.Errorf("create prompt temp file: %w", tmpErr)
+		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", reasoningEffort{}, fmt.Errorf("create prompt temp file: %w", tmpErr)
 	}
 	if err := os.Chmod(tmp.Name(), 0o600); err != nil {
 		_ = tmp.Close()
-		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", fmt.Errorf("chmod prompt temp file: %w", err)
+		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", reasoningEffort{}, fmt.Errorf("chmod prompt temp file: %w", err)
 	}
 	if _, err := tmp.WriteString(got.Prompt); err != nil {
 		_ = tmp.Close()
-		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", fmt.Errorf("write prompt temp file: %w", err)
+		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", reasoningEffort{}, fmt.Errorf("write prompt temp file: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", fmt.Errorf("close prompt temp file: %w", err)
+		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", reasoningEffort{}, fmt.Errorf("close prompt temp file: %w", err)
 	}
-	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, got.VerifyCommand, got.VerifyTimeoutSeconds, got.VerifyMaxIterations, got.DecomposedFromRunID, got.MinRunnerVersion, got.AgentVersionRange, got.AgentSelfRetry, got.MaxRetriesSnapshot, got.RetryAttempt, got.ScopeFiles, got.CommitAuthorName, got.CommitAuthorEmail, got.Fixup, got.FixupBranch, got.FixupExpectedHeadSHA, got.BindingAssertions, got.FixupApplyPatches, got.SliceIndex, got.ScopeExemptions, got.OpenPRFromHeldCommit, got.HeldCommitSHA, got.HeldCommitBranch, got.HeldCommitBaseSHA, got.HeldCommitResumeKind, got.HeldCommitVerifiedTreeSHA, got.SupportsPushResume, got.HeldCommitPRTitle, got.HeldCommitPRBody, got.ImplementModel, got.PlanModel, got.EgressTargetHosts, got.AcceptanceCriteriaIDs, got.AcceptanceExpectedHeadSHA, got.DiffCoverage, conflictResolutionFromPrompt(got), acceptanceReplayInputsFromPrompt(got), got.ForgeWrites, got.StageAttempt, nil
+	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, got.VerifyCommand, got.VerifyTimeoutSeconds, got.VerifyMaxIterations, got.DecomposedFromRunID, got.MinRunnerVersion, got.AgentVersionRange, got.AgentSelfRetry, got.MaxRetriesSnapshot, got.RetryAttempt, got.ScopeFiles, got.CommitAuthorName, got.CommitAuthorEmail, got.Fixup, got.FixupBranch, got.FixupExpectedHeadSHA, got.BindingAssertions, got.FixupApplyPatches, got.SliceIndex, got.ScopeExemptions, got.OpenPRFromHeldCommit, got.HeldCommitSHA, got.HeldCommitBranch, got.HeldCommitBaseSHA, got.HeldCommitResumeKind, got.HeldCommitVerifiedTreeSHA, got.SupportsPushResume, got.HeldCommitPRTitle, got.HeldCommitPRBody, got.ImplementModel, got.PlanModel, got.EgressTargetHosts, got.AcceptanceCriteriaIDs, got.AcceptanceExpectedHeadSHA, got.DiffCoverage, conflictResolutionFromPrompt(got), acceptanceReplayInputsFromPrompt(got), got.ForgeWrites, got.StageAttempt, reasoningEffort{value: got.ReasoningEffort, source: got.ReasoningEffortSource}, nil
 }
 
 func logStartup(w io.Writer, cfg config) {

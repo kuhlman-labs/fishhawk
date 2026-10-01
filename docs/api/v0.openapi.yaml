@@ -18192,6 +18192,28 @@ paths:
                       supplied a model — the runner leaves the model unset and
                       the agent spawns on the adapter's built-in default,
                       byte-identical to today.
+                  reasoning_effort:
+                    type: string
+                    enum: [low, medium, high, xhigh, max]
+                    description: |
+                      The dispatched stage executor's resolved reasoning effort
+                      (#3896), echoed on ANY agent stage (plan, implement incl.
+                      fix-up, acceptance) whose spec declares
+                      `executor.reasoning_effort`. The runner pins it onto the
+                      agent spawn (claudecode `--effort <e>`, codex
+                      `-c model_reasoning_effort=<e>`). Only the spec rung
+                      exists today. Absent when no effort is declared — the
+                      spawn carries no effort flag, byte-identical to today.
+                      This and `reasoning_effort_source` are the observable
+                      surface for the PLAN stage's effort; the implement
+                      stage's effort is also stamped on its `model_resolved`
+                      audit entry.
+                  reasoning_effort_source:
+                    type: string
+                    enum: [spec]
+                    description: |
+                      The ladder rung that supplied `reasoning_effort`
+                      (#3896); present exactly when `reasoning_effort` is.
                   commit_author_name:
                     type: string
                     description: |
@@ -18705,6 +18727,14 @@ paths:
                   implement_model:
                     type: string
                     description: Backend-resolved implement model id (#1013), echoed on implement stages so the runner pins the agent spawn to it (`--model <implement_model>`). Resolved through the implement-model ladder (operator gate decision < plan `model_recommendation.implement_model` < spec `executor.model` < deployment default). Absent when no rung supplied a model — the runner leaves the model unset and the agent spawns on the adapter's built-in default, byte-identical to today.
+                  reasoning_effort:
+                    type: string
+                    enum: [low, medium, high, xhigh, max]
+                    description: The dispatched stage executor's resolved reasoning effort (#3896), same derivation as the signed `/prompt` response — present on any agent stage whose spec declares `executor.reasoning_effort`, absent otherwise (no effort flag on the spawn).
+                  reasoning_effort_source:
+                    type: string
+                    enum: [spec]
+                    description: The ladder rung that supplied `reasoning_effort` (#3896); present exactly when `reasoning_effort` is.
                   commit_author_name:
                     type: string
                     description: GitHub App bot account's git author name (`<app-slug>[bot]`), resolved backend-side (#722). Absent when unresolvable; the runner falls back to its default.
@@ -19568,7 +19598,12 @@ paths:
                     today). Honored only on `approve`; ignored on `reject`.
                     Omitting the field leaves the model to the lower rungs; an
                     empty resolution still records `model_resolved` and spawns
-                    with no `--model`, exactly as today.
+                    with no `--model`, exactly as today. When the implement
+                    stage's spec executor declares `reasoning_effort` (#3896),
+                    that entry additionally carries `reasoning_effort` +
+                    `reasoning_effort_source` (both omitted otherwise); a
+                    plan/review effort rides only on a plan/review entry the
+                    gate already writes and never mints one.
                 plan_model:
                   type: string
                   description: |

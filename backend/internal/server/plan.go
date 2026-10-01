@@ -40,10 +40,11 @@ type PlanReviewer interface {
 // For returns the adapter for one spec-declared heterogeneous reviewer
 // (reviewers.agents[i]), constructed with the given model override (empty
 // model falls back to the provider's deployment-configured default) and the
-// spec-declared reasoningEffort (#1493, codex-only — empty falls back to the
-// deployment default FISHHAWKD_CODEX_REASONING_EFFORT; ignored by the
-// anthropic/claudecode adapters, which take no reasoning-effort parameter); it
-// errors when the provider is not configured in this deployment.
+// spec-declared reasoningEffort (#1493 / #3896 — for codex, empty falls back
+// to the deployment default FISHHAWKD_CODEX_REASONING_EFFORT; the claudecode
+// reviewer takes the spec value only, as `--effort <e>`, with no env
+// fall-through; ignored by the anthropic API adapter); it errors when the
+// provider is not configured in this deployment.
 type ReviewerSet interface {
 	Default() PlanReviewer
 	For(provider, model string, reasoningEffort ...string) (PlanReviewer, error)

@@ -15589,3 +15589,150 @@ func (a *crewEscalationFoldAuditRepo) ListForRunByCategory(ctx context.Context, 
 	}
 	return a.Repository.ListForRunByCategory(ctx, runID, category)
 }
+
+// goldenReasoningEffortPromptJSON reads the CROSS-MODULE GOLDEN FIXTURE for
+// the stage reasoning-effort prompt-response fields (#3896) from the SINGLE
+// shared file testdata/wire/reasoning_effort_prompt.json. The runner's
+// cross-boundary test (runner/cmd/fishhawk-runner/main_test.go) decodes the
+// SAME bytes into upload.FetchedPrompt and drives them to the agent
+// Invocation, so a tag drift on either side reddens one of the two — the
+// exempt_prompt_fields.json precedent (#2558). Fails closed on a read error.
+func goldenReasoningEffortPromptJSON(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(repoRoot(t), "testdata", "wire", "reasoning_effort_prompt.json")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read shared reasoning-effort prompt fixture %s: %v", path, err)
+	}
+	return strings.TrimSuffix(string(b), "\n")
+}
+
+// reasoningEffortSpecYAML is a workflow-v2 spec whose implement AND plan
+// stage executors declare reasoning_effort; withEffort=false drops both so
+// the absent path is exercised against an otherwise identical spec.
+func reasoningEffortSpecYAML(withEffort bool) []byte {
+	implEffort, planEffort := "", ""
+	if withEffort {
+		implEffort = "          reasoning_effort: high\n"
+		planEffort = "          reasoning_effort: medium\n"
+	}
+	return []byte("version: \"2\"\n" +
+		"workflows:\n" +
+		"  feature_change:\n" +
+		"    stages:\n" +
+		"      - id: plan\n" +
+		"        type: plan\n" +
+		"        executor:\n" +
+		"          agent: claude-code\n" +
+		planEffort +
+		"      - id: implement\n" +
+		"        type: implement\n" +
+		"        executor:\n" +
+		"          agent: claude-code\n" +
+		"          model: claude-opus-5-5\n" +
+		implEffort)
+}
+
+// fetchBothPromptBodies serves the stage's signed /prompt AND the SPA
+// /prompt-render endpoint against one run row and returns both raw bodies.
+func fetchBothPromptBodies(t *testing.T, specYAML []byte, stageType run.StageType) (string, string) {
+	t.Helper()
+	s, rr, sf, gh := newPromptServer(t)
+	runID := uuid.New()
+	stageID := uuid.New()
+	priv, _ := sf.issue(t, runID)
+	installation := int64(99)
+	triggerRef := "issue:42"
+	rr.runRow = &run.Run{
+		ID:             runID,
+		Repo:           "kuhlman-labs/example",
+		WorkflowID:     "feature_change",
+		TriggerSource:  run.TriggerGitHubIssue,
+		TriggerRef:     &triggerRef,
+		InstallationID: &installation,
+		WorkflowSpec:   specYAML,
+	}
+	rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: stageType}
+	gh.issue = &githubclient.Issue{Number: 42, Title: "Add foo", Body: "b", State: "open"}
+
+	w := promptRequest(t, s, runID, stageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("/prompt status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	rreq := httptest.NewRequest(http.MethodGet, "/v0/stages/"+stageID.String()+"/prompt-render", nil)
+	rw := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rw, rreq)
+	if rw.Code != http.StatusOK {
+		t.Fatalf("/prompt-render status = %d, want 200:\n%s", rw.Code, rw.Body.String())
+	}
+	return w.Body.String(), rw.Body.String()
+}
+
+// projectPromptKeys re-marshals ONLY the named keys of a prompt-response
+// body (present ones), sorted by encoding/json's map-key order, so the
+// projection is byte-comparable to the shared golden fixture.
+func projectPromptKeys(t *testing.T, body string, keys ...string) string {
+	t.Helper()
+	var all map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(body), &all); err != nil {
+		t.Fatalf("decode prompt body: %v", err)
+	}
+	proj := map[string]json.RawMessage{}
+	for _, k := range keys {
+		if v, ok := all[k]; ok {
+			proj[k] = v
+		}
+	}
+	out, err := json.Marshal(proj)
+	if err != nil {
+		t.Fatalf("marshal projection: %v", err)
+	}
+	return string(out)
+}
+
+// TestGetStagePrompt_ReasoningEffort_MatchesSharedGolden is the EMIT half of
+// the #3896 spec -> prompt -> Invocation -> argv chain: a run whose spec
+// declares executor {agent: claude-code, model: claude-opus-5-5,
+// reasoning_effort: high} on implement serves /prompt AND /prompt-render
+// whose {stage_type, implement_model, reasoning_effort,
+// reasoning_effort_source} projection EQUALS the shared golden the runner
+// decodes.
+func TestGetStagePrompt_ReasoningEffort_MatchesSharedGolden(t *testing.T) {
+	signed, rendered := fetchBothPromptBodies(t, reasoningEffortSpecYAML(true), run.StageTypeImplement)
+	want := goldenReasoningEffortPromptJSON(t)
+	keys := []string{"stage_type", "implement_model", "reasoning_effort", "reasoning_effort_source"}
+	if got := projectPromptKeys(t, signed, keys...); got != want {
+		t.Errorf("/prompt projection = %s\nwant shared golden      %s", got, want)
+	}
+	if got := projectPromptKeys(t, rendered, keys...); got != want {
+		t.Errorf("/prompt-render projection = %s\nwant shared golden             %s", got, want)
+	}
+}
+
+// TestGetStagePrompt_ReasoningEffort_PlanStage asserts the plan-stage effort
+// is observable on BOTH prompt responses (approval condition 1: the plan
+// stage's resolved effort is surfaced here, not on a minted model_resolved
+// entry nor on the run/stage status payload).
+func TestGetStagePrompt_ReasoningEffort_PlanStage(t *testing.T) {
+	signed, rendered := fetchBothPromptBodies(t, reasoningEffortSpecYAML(true), run.StageTypePlan)
+	want := `{"reasoning_effort":"medium","reasoning_effort_source":"spec"}`
+	for name, body := range map[string]string{"/prompt": signed, "/prompt-render": rendered} {
+		if got := projectPromptKeys(t, body, "reasoning_effort", "reasoning_effort_source"); got != want {
+			t.Errorf("%s plan effort projection = %s, want %s", name, got, want)
+		}
+	}
+}
+
+// TestGetStagePrompt_ReasoningEffort_OmittedWhenAbsent asserts the
+// byte-identical back-compat path: a spec declaring no executor effort omits
+// BOTH keys on both endpoints, for the implement and the plan stage.
+func TestGetStagePrompt_ReasoningEffort_OmittedWhenAbsent(t *testing.T) {
+	for _, st := range []run.StageType{run.StageTypeImplement, run.StageTypePlan} {
+		signed, rendered := fetchBothPromptBodies(t, reasoningEffortSpecYAML(false), st)
+		for name, body := range map[string]string{"/prompt": signed, "/prompt-render": rendered} {
+			if contains(body, "reasoning_effort") {
+				t.Errorf("%s %s: reasoning_effort keys must be omitted when no effort is declared:\n%s", st, name, body)
+			}
+		}
+	}
+}
