@@ -194,6 +194,7 @@ func callAnswerClarification(t *testing.T, ctx context.Context, session *mcp.Cli
 //   - the resumed plan prompt carries the LAST answer AND the trailing comment
 //     with NO truncation or elision marker — the exact bytes #3063 lost.
 func TestE2E_Clarification_AnswersInjectedWhole(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -293,6 +294,7 @@ func TestE2E_Clarification_AnswersInjectedWhole(t *testing.T) {
 // entries, the stage still plan/awaiting_input, and a following UNDER-cap
 // answer through the same tool succeeding.
 func TestE2E_Clarification_OverCapRefusedStageStillParked(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()

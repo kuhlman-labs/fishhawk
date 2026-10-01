@@ -54,6 +54,7 @@ import (
 //   - the gate round-trips: re-parked at awaiting_approval, an approve
 //     through the MCP binary succeeds.
 func TestE2E_Revise_ConstraintInjectedAndPlanRebound(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -397,6 +398,7 @@ func removalPlanJSON(summary string, scopeFiles []string, removals map[string]st
 // the plan stage re-opened rather than parked at the gate, with ZERO reviewer
 // passes spent.
 func TestE2E_Revise_UndeclaredNarrowingRefused(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -481,6 +483,7 @@ func TestE2E_Revise_UndeclaredNarrowingRefused(t *testing.T) {
 // does NOT fire for a deliberate drop), declared_removals names the path, and
 // the stage parks at awaiting_approval as it does today.
 func TestE2E_Revise_DeclaredNarrowingAdmitted(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -552,6 +555,7 @@ func TestE2E_Revise_DeclaredNarrowingAdmitted(t *testing.T) {
 // 409 revise_budget_exhausted. Exhaustion must never become a new way to lose
 // a plan.
 func TestE2E_Revise_ScopeRetryExhausted_ParksWithBudgetRefund(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -709,6 +713,7 @@ func (r *advanceCountingRunRepo) advances() int {
 // reason: the loser's fall-through and the winner's re-open race on the stage
 // CAS.
 func TestE2E_Revise_ConcurrentScopeRetryShips_GrantsExactlyOneRefusal(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -925,6 +930,7 @@ func largeMultiItemConstraint(t *testing.T) (constraint, lastItem string) {
 // plan prompt carries the constraint's LAST item verbatim, followed by the
 // end-of-constraint marker.
 func TestE2E_Revise_LargeConstraintDeliveredWhole(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -988,6 +994,7 @@ func TestE2E_Revise_LargeConstraintDeliveredWhole(t *testing.T) {
 // identity cannot make — the revise budget is genuinely unspent, proved by a
 // subsequent normal revise that succeeds.
 func TestE2E_Revise_OverCapConstraintRefusedNoPassSpent(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()

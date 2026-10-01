@@ -15,10 +15,12 @@ Usage:
         --exclude '/db/' --repo-root . \\
         backend/patchcov.out [more.out ...]
 
-Reads each profile, sums statement counts (excluding any line whose
-file path contains an --exclude substring), and computes
-covered/total. Prints a per-package breakdown for visibility.
-Profiles must be in Go's standard `go test -coverprofile=` format.
+Reads every profile, MERGES blocks that recur across profiles keyed on
+their full span (so two shard profiles of one package count each block's
+statements into the denominator once, not once per profile), filters
+--exclude paths, and computes covered/total. Prints a per-package
+breakdown for visibility. Profiles must be in Go's standard
+`go test -coverprofile=` format and all declare the same `mode:`.
 
 With --diff-base the tool ALSO runs a patch-scoped (diff) gate: the
 profiles' per-statement line ranges are intersected with the lines this
@@ -81,20 +83,15 @@ def skip(reason):
     print(f"SKIP: {reason} — patch-coverage gate skipped", file=sys.stderr)
 
 
-def parse_profile(path, excludes):
-    """Yield (pkg, file_path, num_stmts, count) for non-excluded lines."""
-    for file_path, _, _, num_stmts, run_count in _parse_blocks(path, excludes):
-        yield file_path.rsplit("/", 1)[0], file_path, num_stmts, run_count
-
-
-def parse_blocks(path, excludes):
-    """Yield (file_path, start_line, end_line, count) for non-excluded blocks."""
-    for file_path, start, end, _, run_count in _parse_blocks(path, excludes):
-        yield file_path, start, end, run_count
-
-
 def _parse_blocks(path, excludes):
-    """Yield (file_path, start_line, end_line, num_stmts, count) per profile block."""
+    """Yield (file_path, start_line, start_col, end_line, end_col, num_stmts, count, mode) per block.
+
+    The EXACT span (both line AND column at each end) is carried so a consumer can
+    key on the full position: two distinct blocks can share start/end LINES and
+    differ only in columns (a one-line `if x { y() }`), so a line-only key would
+    silently fuse them. The profile's `mode:` value is yielded on every block so a
+    merge can enforce one mode across profiles and pick MAX (set) vs SUM (count).
+    """
     # surrogateescape: a profile's file field is a Go import path plus the real
     # file name, which need not be valid UTF-8. Decoding strictly would raise
     # rather than gate the file.
@@ -102,6 +99,7 @@ def _parse_blocks(path, excludes):
         first = next(f, None)
         if first is None or not first.startswith("mode:"):
             raise SystemExit(f"{path}: missing mode line; not a coverage profile")
+        mode = first.rstrip("\n").split(":", 1)[1].strip()
         for line in f:
             line = line.rstrip("\n")
             if not line:
@@ -111,15 +109,77 @@ def _parse_blocks(path, excludes):
                 loc, numstmts, count = line.rsplit(" ", 2)
                 file_path, span = loc.split(":", 1)
                 start_str, end_str = span.split(",", 1)
-                start_line = int(start_str.split(".", 1)[0])
-                end_line = int(end_str.split(".", 1)[0])
+                sl_str, sc_str = start_str.split(".", 1)
+                el_str, ec_str = end_str.split(".", 1)
+                start_line = int(sl_str)
+                start_col = int(sc_str)
+                end_line = int(el_str)
+                end_col = int(ec_str)
                 num_stmts = int(numstmts)
                 run_count = int(count)
             except (ValueError, IndexError) as e:
                 raise SystemExit(f"{path}: bad line: {line!r}: {e}")
             if any(ex in file_path for ex in excludes):
                 continue
-            yield file_path, start_line, end_line, num_stmts, run_count
+            yield (
+                file_path,
+                start_line,
+                start_col,
+                end_line,
+                end_col,
+                num_stmts,
+                run_count,
+                mode,
+            )
+
+
+def merge_profiles(paths, excludes):
+    """Merge coverage blocks that recur across profiles, keyed on the FULL span.
+
+    Returns {(file_path, start_line, start_col, end_line, end_col): (num_stmts, count)}.
+
+    Counts combine by MAX for `mode: set` (a 0/1 covered flag) and by SUM for
+    `mode: count` / `mode: atomic` (an execution count) — mirroring
+    `go tool covdata merge`. This is the fix for the AGGREGATE double-count: two
+    shard profiles of one package previously summed each block's num_stmts into
+    the denominator twice (80.2% reported where the truth is 91.7%); keying on the
+    span collapses the recurring block to one denominator entry.
+
+    Fails closed (SystemExit, exit 1) on two conditions:
+      (a) the profiles do not all declare the same mode — a `set` 0/1 flag and an
+          `atomic` execution count are not summable, and guessing would corrupt
+          the denominator silently;
+      (b) one span key appears with two different num_stmts values — the profiles
+          came from different source trees, so the merge is meaningless.
+    """
+    merged = {}
+    seen_mode = None
+    for path in paths:
+        for fp, sl, sc, el, ec, n, c, mode in _parse_blocks(path, excludes):
+            if seen_mode is None:
+                seen_mode = mode
+            elif mode != seen_mode:
+                raise SystemExit(
+                    "cannot merge coverage profiles with differing modes "
+                    f"({seen_mode!r} and {mode!r} in {path!r}); a set flag and an "
+                    "execution count are not combinable"
+                )
+            key = (fp, sl, sc, el, ec)
+            if key not in merged:
+                merged[key] = (n, c)
+                continue
+            prev_n, prev_c = merged[key]
+            if prev_n != n:
+                raise SystemExit(
+                    f"coverage block {fp}:{sl}.{sc},{el}.{ec} has conflicting "
+                    f"numstmts {prev_n} and {n} across profiles; the profiles came "
+                    "from different source trees and cannot be merged"
+                )
+            if seen_mode == "set":
+                merged[key] = (n, max(prev_c, c))
+            else:
+                merged[key] = (n, prev_c + c)
+    return merged
 
 
 # --------------------------------------------------------------------------
@@ -563,30 +623,36 @@ def map_profile_path(file_path, module_prefix, changed):
     return None
 
 
-def diff_coverage(profiles, excludes, changed, module_prefix):
-    """Intersect profile blocks with added lines.
+def diff_coverage(merged, changed, module_prefix):
+    """Intersect MERGED profile blocks with added lines.
 
-    Returns (per_file_covered, per_file_total) keyed by repo-relative path.
-    A line is counted only when it falls inside at least one profile block, so
-    added comments/blanks/imports/bare braces carry no statement and are ignored
-    rather than counted uncovered. Blocks overlap at nested-statement
+    `merged` is merge_profiles' output: {(file_path, sl, sc, el, ec): (num_stmts,
+    count)}. Returns (per_file_covered, per_file_total) keyed by repo-relative
+    path. A line is counted only when it falls inside at least one profile block,
+    so added comments/blanks/imports/bare braces carry no statement and are
+    ignored rather than counted uncovered. Blocks overlap at nested-statement
     boundaries, so a covered block wins over an uncovered block spanning the
     same line — the optimistic union can slightly over-report but can never
     manufacture a false failure, the conservative choice for an in-loop gate.
+
+    HONEST NOTE: routing through merge_profiles is a consistency / no-regression
+    change here, NOT a bug fix. Diff mode already unions per-file line SETS, so it
+    was duplicate-tolerant — two shard profiles of one file could not double-count
+    a line. The double-count defect #3881 reports is in the AGGREGATE path, which
+    summed each recurring block's num_stmts into the denominator twice.
     """
     covered = defaultdict(set)
     total = defaultdict(set)
-    for path in profiles:
-        for file_path, start, end, count in parse_blocks(path, excludes):
-            rel = map_profile_path(file_path, module_prefix, changed)
-            if rel is None:
-                continue
-            hit = {ln for ln in changed[rel] if start <= ln <= end}
-            if not hit:
-                continue
-            total[rel] |= hit
-            if count > 0:
-                covered[rel] |= hit
+    for (file_path, start, _, end, _), (_, count) in merged.items():
+        rel = map_profile_path(file_path, module_prefix, changed)
+        if rel is None:
+            continue
+        hit = {ln for ln in changed[rel] if start <= ln <= end}
+        if not hit:
+            continue
+        total[rel] |= hit
+        if count > 0:
+            covered[rel] |= hit
     return covered, total
 
 
@@ -676,9 +742,8 @@ def run_diff_gate(args):
         )
         return 1
 
-    covered, total = diff_coverage(
-        args.profile, args.exclude, changed, args.module_prefix
-    )
+    merged = merge_profiles(args.profile, args.exclude)
+    covered, total = diff_coverage(merged, changed, args.module_prefix)
 
     total_new = sum(len(v) for v in total.values())
     total_cov = sum(len(v) for v in covered.values())
@@ -736,11 +801,16 @@ def run_aggregate_gate(args):
     pkg_stmts = defaultdict(int)
     pkg_covered = defaultdict(int)
 
-    for path in args.profile:
-        for pkg, _, n, c in parse_profile(path, args.exclude):
-            pkg_stmts[pkg] += n
-            if c > 0:
-                pkg_covered[pkg] += n
+    # Merge blocks recurring across profiles FIRST, so a block two shard profiles
+    # of one package both report counts its statements into the denominator ONCE,
+    # not once per profile (#3881). Without the merge, sharding a package across CI
+    # jobs under-reports: the denominator doubles while the numerator does not.
+    merged = merge_profiles(args.profile, args.exclude)
+    for (file_path, _, _, _, _), (n, c) in merged.items():
+        pkg = file_path.rsplit("/", 1)[0]
+        pkg_stmts[pkg] += n
+        if c > 0:
+            pkg_covered[pkg] += n
 
     total_stmts = sum(pkg_stmts.values())
     total_covered = sum(pkg_covered.values())

@@ -13545,6 +13545,13 @@ type worstCase struct {
 	concerns          int
 	securityFindings  int
 	freeTextPoison    bool
+	// wantElidedFields names the elision Field paths this row's knobs must each
+	// drive (read from bound.go's runStatusPathTable, never guessed). The
+	// UnderBudget test asserts every name appears in out.Elisions.Fields, so a
+	// shrink that stops exercising a surface fails instead of passing quietly
+	// while still over budget (#3881). Left empty for rows whose behaviour is
+	// unchanged.
+	wantElidedFields []string
 }
 
 // newWorstCaseFailedRun seeds the observed failure shape on the shared
@@ -13696,8 +13703,17 @@ var worstCases = []worstCase{
 	{name: "150 security findings", stages: 4, securityFindings: 150, auditEntries: 10},
 	{name: "free text with invalid UTF-8, U+2028/9 and HTML bytes", stages: 6, failureReasonLen: 4096, auditEntries: 20, freeTextPoison: true},
 	{name: "payload deliberately past the budget", stages: 30, failureReasonLen: 20 * 1024, auditEntries: 40, auditArrayLen: 200},
-	{name: "everything maximal at once", stages: 40, failureReasonLen: 20 * 1024, auditEntries: 50, auditArrayLen: 400,
-		autoAdvanced: 300, concerns: 200, securityFindings: 150, freeTextPoison: true},
+	{name: "every knob on at once, a few multiples of the budget", stages: 12, failureReasonLen: 512, auditEntries: 20, auditArrayLen: 120,
+		autoAdvanced: 150, concerns: 150, securityFindings: 3, freeTextPoison: true,
+		// Every knob drives its own surface; the ladder reaches T9, so each entry
+		// below is recorded. Paths are the runStatusPathTable rows the knobs hit.
+		wantElidedFields: []string{
+			"security_findings",          // securityFindings (T3)
+			"recent_audit",               // auditEntries/auditArrayLen (T5/T6)
+			"stages[].failure_reason",    // stages + failureReasonLen (T7)
+			"drive_status.auto_advanced", // autoAdvanced (T9)
+			"run.concerns.items",         // concerns (T9)
+		}},
 }
 
 // getRunStatusPreBound returns what the REAL handler assembles before any
@@ -13753,9 +13769,15 @@ func TestGetRunStatus_WorstCaseFailedRun_UnderBudget(t *testing.T) {
 			// the ladder's `n <= budget` early return makes that the unreduced
 			// response — and assert the row's claimed shape is really there.
 			preBound := getRunStatusPreBound(t, srv, runID, 200)
-			preRaw := mustMarshal(t, preBound)
-			if len(preRaw) <= budget {
-				t.Fatalf("the unreduced response is %d bytes, already within the %d-byte budget — this row exercises no tier", len(preRaw), budget)
+			// marshalledLen, not mustMarshal+len: it is one json.Marshal traversal
+			// of the large unreduced payload and discards the bytes rather than
+			// handing the whole slice back to the test to measure (#3881).
+			preLen, err := marshalledLen(preBound)
+			if err != nil {
+				t.Fatalf("marshal unreduced: %v", err)
+			}
+			if preLen <= budget {
+				t.Fatalf("the unreduced response is %d bytes, already within the %d-byte budget — this row exercises no tier", preLen, budget)
 			}
 			if out.Elisions == nil {
 				t.Fatalf("an over-budget row produced no elisions block")
@@ -13797,6 +13819,29 @@ func TestGetRunStatus_WorstCaseFailedRun_UnderBudget(t *testing.T) {
 				}
 				if out.Elisions.Budget != budget {
 					t.Errorf("elisions.budget = %d, want the effective %d", out.Elisions.Budget, budget)
+				}
+			}
+
+			// PER-KNOB SURFACE COVERAGE (#3881). A row that names wantElidedFields
+			// asserts every one appears in the final elisions block, so a retune
+			// that shrank the fixture below the point where a knob drives its own
+			// tier fails HERE rather than passing on the budget bound alone. This
+			// turns the non-vacuity guard above from "still over budget" into
+			// "still reaches the same surfaces".
+			if len(c.wantElidedFields) > 0 {
+				if out.Elisions == nil {
+					t.Fatalf("row names wantElidedFields but produced no elisions block")
+				}
+				emitted := map[string]bool{}
+				var emittedList []string
+				for _, f := range out.Elisions.Fields {
+					emitted[f.Field] = true
+					emittedList = append(emittedList, f.Field)
+				}
+				for _, want := range c.wantElidedFields {
+					if !emitted[want] {
+						t.Errorf("elisions do not cover %q; this knob's surface stopped being exercised. Emitted fields: %v (tier %q)", want, emittedList, out.Elisions.Tier)
+					}
 				}
 			}
 		})

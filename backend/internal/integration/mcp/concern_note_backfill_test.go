@@ -57,6 +57,7 @@ func concernNoteBackfillPlanJSON() []byte {
 // verdict decode, the repository round-trip, and each renderer are all green
 // today against a blank note that the write side never backfilled.
 func TestConcernNoteBackfill_EndToEnd(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()

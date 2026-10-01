@@ -242,6 +242,7 @@ func bcsRunConcerns(t *testing.T, ctx context.Context, srvURL, token string, run
 }
 
 func TestE2E_BulkConcernSettlement_ShorthandMarkerAndBulkWaive(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()

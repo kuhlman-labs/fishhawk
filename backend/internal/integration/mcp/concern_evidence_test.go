@@ -90,6 +90,7 @@ func concernEvidencePlanJSON() []byte {
 // verdict decode, the concern repository round-trip and the gate-view renderer
 // are all green today with trace.go's literal dropping both fields.
 func TestE2E_ConcernEvidence_ReachesGateView(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()

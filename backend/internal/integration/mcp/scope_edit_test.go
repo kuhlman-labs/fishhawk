@@ -52,6 +52,7 @@ workflows:
 // AND that the approval_submitted audit payload carries remove_scope_files +
 // scope_files_before + scope_files_after.
 func TestE2E_ScopeEdit_RemoveAndReplaceAtPlanGate(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
@@ -317,6 +318,7 @@ func decomposedPlanJSON(summary string, titles []string, sliceFiles [][]string) 
 // scope contains the added path, and the SIBLING child's does not — the
 // single-owner-file guarantee, pinned across the real wire.
 func TestE2E_SliceScopeAdd_AtPlanGate(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
@@ -509,6 +511,7 @@ func getPromptRenderScope(t *testing.T, ctx context.Context, baseURL string, sta
 // sides of the move, across the real wire. A second approve exercises the
 // composition decision: add + move over disjoint paths in ONE audited call.
 func TestE2E_SliceScopeMove_AtPlanGate(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
@@ -686,6 +689,7 @@ func TestE2E_SliceScopeMove_AtPlanGate(t *testing.T) {
 // move_scope_files_to_slice over DISJOINT paths lands both edits in one audited
 // call, and both fold into the destination children's scopes.
 func TestE2E_SliceScopeMoveAndAdd_ComposeInOneApprove(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
@@ -902,6 +906,7 @@ func opScopedPlanJSON(summary string, creates, deletes, modifies []string) []byt
 // minimum-physical-count travels the server pre-check payload → audit
 // persistence → get_plan → MCP response through the real ship path.
 func TestE2E_ScopeCapOverride_RefusedAcknowledgedAndFieldReachesGetPlan(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()

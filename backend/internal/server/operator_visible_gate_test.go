@@ -8,6 +8,9 @@ import (
 	"go/parser"
 	"go/token"
 	"go/types"
+	"io"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -74,9 +77,10 @@ type typeCheckedPackage struct {
 }
 
 // serverPackageCheck caches the one type-check of the server package the
-// gate tests share: the "source" importer type-checks every transitive
-// dependency from source, which is the dominant cost, so it is paid once per
-// test binary.
+// gate tests share: resolving every transitive dependency is the dominant
+// cost, so it is paid once per test binary. Dependencies are resolved from gc
+// EXPORT DATA (via exportLookup) rather than re-type-checked from source — the
+// #3881 win that cut this gate from ~39s to ~2s warm under -race.
 var serverPackageCheck struct {
 	once sync.Once
 	pkg  *typeCheckedPackage
@@ -84,8 +88,8 @@ var serverPackageCheck struct {
 }
 
 // loadTypeCheckedServerPackage parses every non-test .go file in this test's
-// own directory and type-checks them with the source importer. Any parse or
-// type error is fatal (never a skip).
+// own directory and type-checks them, resolving imports from gc export data
+// (exportLookup). Any parse or type error is fatal (never a skip).
 func loadTypeCheckedServerPackage(t *testing.T) *typeCheckedPackage {
 	t.Helper()
 	serverPackageCheck.once.Do(func() {
@@ -120,7 +124,7 @@ func typeCheckServerPackageDir(dir string) (*typeCheckedPackage, error) {
 	}
 	var typeErrs []string
 	conf := types.Config{
-		Importer: importer.ForCompiler(fset, "source", nil),
+		Importer: importer.ForCompiler(fset, "gc", exportLookup(dir)),
 		Error:    func(e error) { typeErrs = append(typeErrs, e.Error()) },
 	}
 	info := &types.Info{Uses: map[*ast.Ident]types.Object{}}
@@ -473,10 +477,108 @@ func TestCollectNotifyCalls_ShapeCoverage(t *testing.T) {
 	}
 }
 
+// TestTypeCheckServerPackageDir_FailsClosed drives the fail-closed branches of
+// typeCheckServerPackageDir that nothing else reaches — every real call passes
+// ".". Each row asserts a non-nil error AND a distinguishing substring, so a
+// failure for an unrelated reason cannot green it.
+func TestTypeCheckServerPackageDir_FailsClosed(t *testing.T) {
+	// Row 1: an empty dir has no non-test .go file — the len(files) == 0 branch.
+	t.Run("no non-test go files", func(t *testing.T) {
+		_, err := typeCheckServerPackageDir(t.TempDir())
+		if err == nil {
+			t.Fatal("expected a non-nil error for an empty dir, got nil")
+		}
+		if !strings.Contains(err.Error(), "no non-test .go files") {
+			t.Errorf("error %q does not name the no-files branch", err)
+		}
+	})
+
+	// Row 2: a syntactically valid file referencing an undefined identifier makes
+	// conf.Check report a type error — the len(typeErrs) > 0 refusal. This is the
+	// branch that must SURVIVE the gc-importer swap: a gc importer that resolved
+	// nothing would otherwise hand back a silently empty, nil-error package. The
+	// file imports nothing, so exportLookup is never consulted and the type error
+	// is isolated to the undefined reference.
+	t.Run("type error refused", func(t *testing.T) {
+		dir := t.TempDir()
+		src := "package server\n\nvar _ = thisIdentifierDoesNotExist\n"
+		if err := os.WriteFile(filepath.Join(dir, "x.go"), []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		_, err := typeCheckServerPackageDir(dir)
+		if err == nil {
+			t.Fatal("expected a non-nil error for a type-incorrect package, got nil")
+		}
+		if !strings.Contains(err.Error(), "thisIdentifierDoesNotExist") {
+			t.Errorf("error %q does not name the undefined identifier (the type-check refusal)", err)
+		}
+	})
+
+	// Row 3: a file importing a real package placed OUTSIDE any Go module makes
+	// `go list -export -deps` fail, so exportLookup's cached error propagates into
+	// every import. The error is asserted on the EXPORT-LOOKUP text, not merely on
+	// non-nil-ness, because the downstream conf.Check guard would also fail on the
+	// unresolved import — this row proves the exportLookup fail-closed arm is real.
+	// t.TempDir() lives under the OS temp root, outside the fishhawk module.
+	t.Run("export lookup failure propagates", func(t *testing.T) {
+		dir := t.TempDir()
+		src := "package server\n\nimport \"strings\"\n\nvar _ = strings.TrimSpace\n"
+		if err := os.WriteFile(filepath.Join(dir, "x.go"), []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		_, err := typeCheckServerPackageDir(dir)
+		if err == nil {
+			t.Fatal("expected a non-nil error when go list cannot run, got nil")
+		}
+		if !strings.Contains(err.Error(), "go list -export -deps") {
+			t.Errorf("error %q does not name the export lookup; the fail-closed arm may be masked", err)
+		}
+	})
+}
+
 func formatRows(rows []notifyCall) string {
 	var b strings.Builder
 	for i, r := range rows {
 		fmt.Fprintf(&b, "  %d: %s %s(%q) resolved=%v %s\n", i, r.pos, r.fn, r.category, r.resolved, r.reason)
 	}
 	return b.String()
+}
+
+// exportLookup resolves gc export data for every import of the package in dir
+// via ONE `go list -export -deps` call (behind a sync.Once), instead of letting
+// the "source" importer re-type-check every transitive dependency from source —
+// the dominant cost this gate used to pay (~39s under -race, #3881). It FAILS
+// CLOSED: a failed `go list` or a requested path with no export entry returns an
+// error (never a nil reader, never a silent skip), so an environment that cannot
+// produce export data reddens the gate rather than yielding a silently importless
+// — and therefore vacuous — package. That fail-closed contract is pinned by
+// TestTypeCheckServerPackageDir_FailsClosed row 3.
+func exportLookup(dir string) importer.Lookup {
+	var once sync.Once
+	m := map[string]string{}
+	var lerr error
+	return func(path string) (io.ReadCloser, error) {
+		once.Do(func() {
+			cmd := exec.Command("go", "list", "-export", "-deps", "-f", "{{.ImportPath}}={{.Export}}", ".")
+			cmd.Dir = dir
+			out, err := cmd.Output()
+			if err != nil {
+				lerr = fmt.Errorf("go list -export -deps in %s: %w", dir, err)
+				return
+			}
+			for _, l := range strings.Split(string(out), "\n") {
+				if k, v, ok := strings.Cut(l, "="); ok && v != "" {
+					m[k] = v
+				}
+			}
+		})
+		if lerr != nil {
+			return nil, lerr
+		}
+		f, ok := m[path]
+		if !ok {
+			return nil, fmt.Errorf("no export data for %s", path)
+		}
+		return os.Open(f)
+	}
 }

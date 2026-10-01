@@ -36,6 +36,7 @@ import (
 // seam (a derived_status literal not matching the classifier switch)
 // breaks.
 func TestE2E_CIFailed_ObserverToDerivedStatusToNextActions(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -202,6 +203,7 @@ func TestE2E_CIFailed_ObserverToDerivedStatusToNextActions(t *testing.T) {
 // is file_product_issue_manually — never fishhawk_report_product_issue, which
 // would collect the bundle and then refuse with 501 provider_unimplemented.
 func TestE2E_CIFailed_NoFeedbackProvider_SubstitutesManualFiling(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -429,6 +431,7 @@ func observeTick(t *testing.T, ctx context.Context, srv *server.Server, repo run
 // do. Reverting the guard to plain Recorded leaves derived_status stuck at
 // ci_failed here, so this is an attainable counterfactual for control (d).
 func TestE2E_CIFailed_RecoversWhenNewerHeadGreen(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -485,6 +488,7 @@ func TestE2E_CIFailed_RecoversWhenNewerHeadGreen(t *testing.T) {
 // parks ci_failed — derived_status stays empty and next_actions is not a
 // ci_failed_* arm.
 func TestE2E_CancelledRequiredCheck_NeverParksCIFailed(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -523,6 +527,7 @@ func TestE2E_CancelledRequiredCheck_NeverParksCIFailed(t *testing.T) {
 // the real postgres repositories, must PERSIST a ci_recovered entry, drop
 // derived_status off ci_failed, and leave the ci_failed_unroutable arm.
 func TestE2E_CIRecovered_PersistsAcrossRealRepositories(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()

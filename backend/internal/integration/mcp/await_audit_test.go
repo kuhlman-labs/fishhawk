@@ -25,6 +25,7 @@ import (
 // return the fresh entry — never the stale one — with its sequence
 // strictly greater than the anchor.
 func TestE2E_AwaitAudit_SequenceAnchoredWait(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()

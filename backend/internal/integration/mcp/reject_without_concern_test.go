@@ -421,6 +421,7 @@ func rwcGateViewConcern(t *testing.T, ctx context.Context, fx *e2eFixture, j rwc
 // DIFFERENCE between the per-resolution veto and the verdict-level advisory is
 // observed end to end.
 func TestE2E_RejectWithoutConcern_PredicateSplit(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
@@ -610,6 +611,7 @@ func rcApprovalSubmittedPayloads(t *testing.T, ctx context.Context, baseURL, tok
 // TestE2E_RejectClass_RecordedVerbatim_AndClosedSetEnforced is the
 // cross-boundary done-means for the reject-class half of #3729.
 func TestE2E_RejectClass_RecordedVerbatim_AndClosedSetEnforced(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()

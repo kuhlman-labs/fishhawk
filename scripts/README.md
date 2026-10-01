@@ -20,7 +20,9 @@ moves it — so `scripts/test verify` gates the DIFF instead, in-loop
   `{repo_relative_path: set(added_lines)}`. An omitted `d` means one
   line; `d == 0` is a pure-deletion hunk and contributes nothing;
   `+++ /dev/null` (deleted file) is skipped.
-- `diff_coverage(...)` intersects those lines with each profile block
+- `merge_profiles(paths, excludes)` collapses blocks that recur across
+  profiles BEFORE counting (see "Merging overlapping profiles" below).
+- `diff_coverage(...)` intersects those lines with each MERGED profile block
   `<file>:<start>.<c>,<end>.<c> <n> <count>`. A line counts only when it
   falls inside at least one block, so added comments, blanks, imports and
   bare braces carry no statement and are IGNORED rather than counted
@@ -35,6 +37,30 @@ moves it — so `scripts/test verify` gates the DIFF instead, in-loop
   suffix match against the changed-file keys.
 - On failure it prints `path:line` for the first 25 uncovered new lines
   (then `… and K more`) and exits 1.
+
+### Merging overlapping profiles ([#3881](https://github.com/kuhlman-labs/fishhawk/issues/3881))
+
+Both gates run every profile through `merge_profiles(paths, excludes)`
+first. It keys each block on the FULL span — `(file_path, start_line,
+start_col, end_line, end_col)`, NOT `file:startline,endline` — because Go
+emits distinct blocks that share start/end LINES and differ only in
+columns (a one-line `if x { y() }`), so a line-only key would silently
+fuse two genuinely different blocks and under-count the denominator.
+Counts combine by **MAX** for `mode: set` (a 0/1 covered flag) and by
+**SUM** for `mode: count` / `mode: atomic` (an execution count), mirroring
+`go tool covdata merge`. It fails closed (exit 1) on two conditions: the
+profiles do not all declare the same `mode:` (a set flag and an execution
+count are not combinable — the message names both modes), or one span key
+carries two different `num_stmts` values (the profiles came from different
+source trees — the message names the file and span).
+
+This is what unblocks **sharding a package across CI jobs**: without the
+merge, two shard profiles of one package summed each recurring block's
+`num_stmts` into the denominator twice (80.2% reported where the truth is
+91.7%). The defect is in the AGGREGATE path. Diff mode was ALREADY
+duplicate-tolerant — it unions per-file line SETS, so a recurring line
+could not double-count — so routing `diff_coverage` through the merge is a
+consistency / no-regression change there, not a bug fix.
 
 ### Committed-tree assumption — resolved by diffing the WORK TREE
 
@@ -372,6 +398,19 @@ running. It self-skips with a printed reason when no
 `go` toolchain is present. CI's
 aggregate invocation is unchanged — diff mode is inert without
 `--diff-base` — and `.github/workflows/**` is untouched (human-led).
+
+`test-check-coverage` cases **m1–m6** pin the profile merge (#3881),
+placed after the (e) aggregate-regression pin: (m1) the acceptance case —
+two overlapping shard profiles aggregate to the same 100% as one full
+profile, and is the merge's counterfactual vehicle (deleting the merge
+reports 50%, a 50-point gap); (m2) two disjoint profiles aggregate to the
+unchanged figure (the merge is an identity map); (m3) imports
+`merge_profiles` directly to pin MAX-for-`set` / SUM-for-`atomic`, which no
+gate's printed verdict observes; (m4) a mixed set/atomic pair fails closed
+naming both modes; (m5) a same-span num_stmts mismatch fails closed naming
+the file and span; (m6) the diff gate over the same overlapping shard pair
+as m1 reports the same patch percentage as one full profile, guarding the
+`diff_coverage` rewire on a real git temp repo.
 
 The pre-test snapshot (#2124) is pinned on both sides. `test-check-coverage`
 (s1–s11): emit serializes the change set with a non-ASCII path key that

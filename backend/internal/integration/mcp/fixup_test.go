@@ -63,6 +63,7 @@ import (
 // upload, covered in backend/internal/server) — require a spawned
 // runner + a real workflow dispatch that this fixture has no agent for.
 func TestE2E_Fixup_ConcernRoutedBackAndBounded(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -297,6 +298,7 @@ func TestE2E_Fixup_ConcernRoutedBackAndBounded(t *testing.T) {
 // instruction reaches the agent as a binding instruction with no pre-existing
 // review concern.
 func TestE2E_Fixup_OperatorConcernRoutedToPrompt(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -420,6 +422,7 @@ func TestE2E_Fixup_OperatorConcernRoutedToPrompt(t *testing.T) {
 // even under a `met` report — is covered through the real review path by
 // TestImplementReview_PRBodyObligation_UnsatisfiableEvenWhenMet.
 func TestE2E_Fixup_PRBodyInstruction(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -541,6 +544,7 @@ func TestE2E_Fixup_PRBodyInstruction(t *testing.T) {
 // TestE2E_Fixup_OperatorConcernRoutedToPrompt, which wires NO ConcernRepo and so
 // pins the untracked-delivery degrade.
 func TestE2E_Fixup_OperatorConcernMintedToDurableStore(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -670,6 +674,7 @@ func TestE2E_Fixup_OperatorConcernMintedToDurableStore(t *testing.T) {
 // open_implement:0, AND fishhawk_get_gate_view returns open:[] — the two
 // surfaces agreeing at one instant, the defect's done-means.
 func TestE2E_Fixup_WaivedConcernsSuppressHintAndAgreeWithGateView(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -853,6 +858,7 @@ func getGateViewJSON(t *testing.T, ctx context.Context, baseURL, token string, r
 //     scope.files, so the #818 silent-strip hole stays closed: an undeclared
 //     created file is still category-B.
 func TestE2E_Fixup_AllowCreateFoldsIntoEffectiveScope(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -1004,6 +1010,7 @@ func TestE2E_Fixup_AllowCreateFoldsIntoEffectiveScope(t *testing.T) {
 // through real MCP binary → backend HTTP → Postgres. This is the leg the
 // per-layer unit tests can't cover on their own (cf. #618).
 func TestE2E_Fixup_PushOpenPRReopensImplementAndReparksReview(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -1137,6 +1144,7 @@ func TestE2E_Fixup_PushOpenPRReopensImplementAndReparksReview(t *testing.T) {
 // running, a stage_fixup_recovered audit entry present) so the original
 // PR stays mergeable.
 func TestE2E_Fixup_FailedRedispatchRestoresReviewGate(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -1316,6 +1324,7 @@ func TestE2E_Fixup_FailedRedispatchRestoresReviewGate(t *testing.T) {
 // serving server and the failure-reporting server carry the concern store,
 // following bulk_concern_settlement_test.go.
 func TestE2E_Fixup_DeliveredNothingRecoveryReopensConcern(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -1520,6 +1529,7 @@ func failPushPRViaBackendWithConcerns(t *testing.T, ctx context.Context, fx *e2e
 // per-layer units cannot (cf. #618): without the gate the trace upload would
 // terminalize the stage at upload time, swallowing a later push failure.
 func TestE2E_Fixup_PushFixupForwardGateDrivesTerminal(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -1786,6 +1796,7 @@ func succeedFixupPushViaBackend(t *testing.T, ctx context.Context, fx *e2eFixtur
 //     absolute cap here is 3 + 1 = 4 raw passes — the pass beyond THAT is
 //     rejected fixup_ceiling_reached.
 func TestE2E_Fixup_ExpectedHeadAdvertisedAndNoChangeRefund(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -2057,6 +2068,7 @@ func reportFixupNoChangesViaBackend(t *testing.T, ctx context.Context, fx *e2eFi
 // distinct fixup_ceiling_reached error. The ceiling assertion is the guard
 // against a silently-drifted fixupCeiling mirror.
 func TestE2E_Fixup_ReviewActionHintSurfacesAndOverride(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -2261,6 +2273,7 @@ func TestE2E_Fixup_ReviewActionHintSurfacesAndOverride(t *testing.T) {
 // agrees with the backend's admit-a-normal-pass decision rather than reporting a
 // spent budget + forced override.
 func TestE2E_Fixup_NoChangeRefundRestoresHintBudget(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -2374,6 +2387,7 @@ func TestE2E_Fixup_NoChangeRefundRestoresHintBudget(t *testing.T) {
 // instant stale 'complete') → land a round-2 implement_reviewed(approve) →
 // assert it resolves 'complete' carrying ONLY the round-2 verdict.
 func TestE2E_Fixup_AwaitReviewWaitsForReReviewOfFixupHead(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -2775,6 +2789,7 @@ func decodeStructured(t *testing.T, r *mcp.CallToolResult, dst any) {
 //     than hard-stopping — the run-26663b11 recovery the change unblocks; the
 //     absolute cap (raw=6) is pinned separately by the cap tests.
 func TestE2E_Fixup_DuplicateFailureReportThenRefundedPass(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -3057,6 +3072,7 @@ func TestE2E_Fixup_DuplicateFailureReportThenRefundedPass(t *testing.T) {
 // credited counts. Before the change the fourth pass hit the raw ceiling and the
 // run stranded with verified defects and no pass left.
 func TestE2E_Fixup_TwoNoPushCategoryADeathsLeaveAThirdPassAvailable(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
@@ -3426,6 +3442,7 @@ func restoreReviewGate(t *testing.T, ctx context.Context, fx *e2eFixture, implID
 // Before this change the refund keyed only on category "C", so the crash matched
 // no signal, the hint read 0/true, and the operator burned the override.
 func TestE2E_Fixup_CategoryACrashRefundAgreesAcrossHintAndBackend(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -3498,6 +3515,7 @@ func TestE2E_Fixup_CategoryACrashRefundAgreesAcrossHintAndBackend(t *testing.T) 
 // returns fixup_budget_exhausted, and the error details name
 // crashed_without_push so an operator can see what they would be overriding.
 func TestE2E_Fixup_PushedThenCrashedConsumesBudgetAndReportsCrashCount(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -3545,6 +3563,7 @@ func TestE2E_Fixup_PushedThenCrashedConsumesBudgetAndReportsCrashCount(t *testin
 
 // are indistinguishable from a fix-up that landed a commit — the exact defect.
 func TestE2E_Fixup_RecoveredPassIsReportedOnTheWaitSurfaces(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
@@ -3621,6 +3640,7 @@ func TestE2E_Fixup_RecoveredPassIsReportedOnTheWaitSurfaces(t *testing.T) {
 // surfaces byte-identical to today. Without it, a marker that fired
 // unconditionally would pass the test above.
 func TestE2E_Fixup_SucceededPassCarriesNoRecoveryMarker(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
@@ -3677,6 +3697,7 @@ func TestE2E_Fixup_SucceededPassCarriesNoRecoveryMarker(t *testing.T) {
 // classifier's mirror and the endpoint's predicate are in different packages,
 // and the disagreement between them IS the bug.
 func TestE2E_Fixup_AcceptancePendingRefusesAndSurfacesRemedy(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
