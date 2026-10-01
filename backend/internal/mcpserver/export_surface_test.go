@@ -43,6 +43,13 @@ var exportBaseline = []string{
 	"AcceptanceTranscriptStatus",
 	"AnswerClarificationInput",
 	"AnswerClarificationOutput",
+	// E75.5 / #3733: fishhawk_answer_divergence's I/O and the client mirror of
+	// POST /v0/runs/{run_id}/divergence/{sequence}/answer, exported for the
+	// SDK's jsonschema reflection like every DTO.
+	"AnswerDivergenceInput",
+	"AnswerDivergenceOutput",
+	"AnswerDivergenceParams",
+	"AnswerDivergenceResult",
 	"ApproveDeployInput",
 	"ApproveDeployOutput",
 	"ApprovePlanInput",

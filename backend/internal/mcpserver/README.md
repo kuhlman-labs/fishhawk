@@ -38,10 +38,10 @@ consumes only the first two):
   `initialize` handshake, the public alias of the package-private
   `onboardingInstructions`.
 
-## Exported surface: why 332 identifiers, not 3
+## Exported surface: why 336 identifiers, not 3
 
-The package presents **332** exported top-level identifiers, but only the three
-above are intended entry points. The other 329 are the tool I/O
+The package presents **336** exported top-level identifiers, but only the three
+above are intended entry points. The other 333 are the tool I/O
 request/response structs. The MCP SDK's jsonschema reflection requires each
 tool's input/output type — and its exported fields — to build the tool's
 schema. Strictly it is the FIELDS that must be exported, not the type name:
@@ -1129,6 +1129,12 @@ What a defer does:
 Returns the filed follow-up issue (`{type, title, number, url, provider, applied_labels}`) and the updated concern row (state `deferred`, `state_reason` naming the issue).
 
 Error surfaces propagated as tool errors: `validation_failed` (400 / bad UUID, caught locally before the HTTP hop), `cross_run_defer` (403), `concern_not_found` (404), `concern_defer_conflict` (422 — non-open concern or a post-filing race), `work_item_invalid` (422), `provider_unimplemented` (501), `work_item_filing_failed` (502 — the concern stays open), `concern_store_unconfigured` (503).
+
+## Divergence answer (`fishhawk_answer_divergence`)
+
+`fishhawk_answer_divergence` (E75.5 / [#3733](https://github.com/kuhlman-labs/fishhawk/issues/3733), ADR-082 decision (d)) answers the optional **divergence question** a run carries when a captain decision at an allow-listed gate (concern waive, concern defer, plan reject) went against clear human precedent. It wraps `POST /v0/runs/{run_id}/divergence/{sequence}/answer`. Inputs: `{run_id, sequence, answer: one_off|doctrine_change, note?, parent_epic?, n?, labels?}`; `run_id` and a positive `sequence` are validated BEFORE the HTTP hop. `one_off` records `precedent_divergence_answered`; `doctrine_change` files ONE `autonomy:low` work item through the backend's shared filing pipeline (writing NO repository file) and then records the answer naming it. Every other guard — `divergence_not_found`, `divergence_already_answered`, `cross_run_divergence_answer`, answer-value validation, file-first ordering — lives server-side in `backend/internal/server/divergence_answer.go`. Scope: `write:stages` OR `write:fixups` (the waive/defer posture, `server/mcpscopes.go`).
+
+The question itself is mirrored by ONE hand-maintained struct, `client.go::gateDivergence` (+ `gateDivergenceAnswer`), on `GateView.divergence` (passed through whole by `fishhawk_get_gate_view`) and `Run.divergence`, which `fishhawk_get_run_status` HOISTS to a top-level `divergence` field beside `next_actions` (appearing once). Under the compact default `compact.go::elideDivergenceProse` clears the fixed `question` prose on a copy (`include_review_prose=true` restores it); every decidable field survives. The response-budget ladder sheds it at **T1** with a gate-view pointer (`bound.go` rows `divergence` / `run.divergence`). It is optional and display-only: `next_actions` never reads it (`TestGetRunStatus_DivergenceHoistedAndCompacted`). The mirror's tags are pinned against a REAL server response by `client_test.go::TestGateDivergenceMirror_WireBoundary`, which also drives `AnswerDivergence` end to end. The backend omits the block under its shipped default (divergence disabled), for a run-bound caller, and when none is open.
 
 ## Per-entry grooming dispositions (`fishhawk_record_grooming_dispositions`, [E54.30 / #2843](https://github.com/kuhlman-labs/fishhawk/issues/2843))
 

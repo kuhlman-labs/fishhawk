@@ -646,6 +646,10 @@ var runStatusPathTable = []pathClassification{
 	// hoisted off run.precedent. It sheds at T1 — first, matching the issue
 	// anchor's ladder — and the gate view returns it whole.
 	{Path: "precedent", Tier: "T1", Class: classStored, Surfaces: gateView},
+	// divergence (E75.5 / #3733) is the optional divergence question, hoisted
+	// off run.divergence. It sheds at T1 beside precedent; the gate view
+	// returns it whole and the chain records it as precedent_divergence.
+	{Path: "divergence", Tier: "T1", Class: classStored, Surfaces: gateView},
 
 	// --- run.* -----------------------------------------------------------
 	{Path: "run.id", Tier: tierNever},
@@ -675,6 +679,8 @@ var runStatusPathTable = []pathClassification{
 	// run.precedent is always nil here: getRunStatus hoists it to the top-level
 	// precedent path above, so no tier ever has anything to reduce.
 	{Path: "run.precedent", Tier: tierNever},
+	// run.divergence is likewise always nil here: hoisted to divergence above.
+	{Path: "run.divergence", Tier: tierNever},
 	{Path: "run.concerns.open", Tier: "skeleton", Class: classStored, Surfaces: gateView},
 	{Path: "run.concerns.by_state", Tier: "skeleton", Class: classStored, Surfaces: gateView},
 	{Path: "run.concerns.open_implement", Tier: "skeleton", Class: classStored, Surfaces: gateView},
@@ -866,6 +872,11 @@ func tierDerivedEconomics(out *GetRunStatusOutput, runID string, led *elisionLed
 		out.Precedent = nil
 		led.add(classified("precedent", runID,
 			"the display-only gate precedent block is recorded on the audit chain (precedent_surfaced) and returned whole by the gate view", 0))
+	}
+	if out.Divergence != nil {
+		out.Divergence = nil
+		led.add(classified("divergence", runID,
+			"the optional divergence question is recorded on the audit chain (precedent_divergence) and returned whole by the gate view", 0))
 	}
 	const why = "recomputed at read time from the cost ledger or the audit-chain timestamps; never stored, so no pointer can retrieve it"
 	if out.Cost != nil {

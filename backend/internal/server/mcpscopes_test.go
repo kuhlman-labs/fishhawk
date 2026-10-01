@@ -328,3 +328,22 @@ func TestMCPToolScopeTable_CrewMessageRowsMirrorHandlers(t *testing.T) {
 		t.Errorf("scopeRunBoundMessages / scopeWriteMessages = %q, want both the write:messages spelling", got)
 	}
 }
+
+// TestMCPToolScopeTable_AnswerDivergenceMirrorsHandler (E75.5 / #3733):
+// fishhawk_answer_divergence carries EXACTLY handleAnswerDivergence's
+// predicate — write:stages OR write:fixups, the waive/defer posture — so a
+// fixups-only token the handler admits is not refused at the MCP gate, and a
+// read-only token the handler refuses is not admitted.
+func TestMCPToolScopeTable_AnswerDivergenceMirrorsHandler(t *testing.T) {
+	rule, ok := mcpToolScopeFor("fishhawk_answer_divergence")
+	if !ok {
+		t.Fatal("fishhawk_answer_divergence has no scope rule")
+	}
+	defer_, _ := mcpToolScopeFor("fishhawk_defer_concern")
+	if strings.Join(rule.anyOf, ",") != strings.Join(defer_.anyOf, ",") {
+		t.Errorf("answer_divergence anyOf = %v, want the defer posture %v", rule.anyOf, defer_.anyOf)
+	}
+	if strings.Join(rule.anyOf, ",") != "write:stages,"+scopeFixupAlternate {
+		t.Errorf("answer_divergence anyOf = %v, want [write:stages %s]", rule.anyOf, scopeFixupAlternate)
+	}
+}

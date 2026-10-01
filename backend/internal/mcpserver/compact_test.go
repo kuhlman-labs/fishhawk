@@ -632,3 +632,24 @@ func TestElidePrecedentExcerpts(t *testing.T) {
 		t.Errorf("input mutated: excerpt now %q", in.Items[0].ReasonExcerpt)
 	}
 }
+
+// TestElideDivergenceProse (E75.5 / #3733): the compaction lever clears ONLY
+// the fixed question prose, on a copy; nil in, nil out.
+func TestElideDivergenceProse(t *testing.T) {
+	if elideDivergenceProse(nil) != nil {
+		t.Fatal("nil in, want nil out")
+	}
+	in := &gateDivergence{Sequence: 5, Question: "prose", Options: []string{"one_off", "doctrine_change"},
+		ModalOutcome: "approve", CitedSequences: []int64{1}, Answer: gateDivergenceAnswer{Tool: "fishhawk_answer_divergence"}}
+	out := elideDivergenceProse(in)
+	if out.Question != "" {
+		t.Errorf("question = %q, want elided", out.Question)
+	}
+	if in.Question != "prose" {
+		t.Error("elideDivergenceProse mutated its input")
+	}
+	if out.Sequence != 5 || len(out.Options) != 2 || out.ModalOutcome != "approve" || len(out.CitedSequences) != 1 ||
+		out.Answer.Tool != "fishhawk_answer_divergence" {
+		t.Errorf("a decidable field was dropped: %+v", out)
+	}
+}

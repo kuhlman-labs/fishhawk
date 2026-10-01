@@ -3371,7 +3371,16 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	// ELIGIBILITY: write:stages; a run-bound agent token is refused
 	// self_decision. Its own tool, not a decide-escalation mode: it closes a
 	// finding AND mints a concern, a different write. 67 -> 68.
-	const wantToolCount = 68
+	//
+	// E75.5 (#3733) adds exactly ONE tool — fishhawk_answer_divergence, the
+	// thin wrapper over POST /v0/runs/{run_id}/divergence/{sequence}/answer.
+	// WHEN: a captain decision went against clear precedent and the run
+	// carries the optional divergence question; the captain answers one_off
+	// or doctrine_change. ELIGIBILITY: write:stages or write:fixups (the
+	// waive/defer posture); a run-bound token may answer only its own run.
+	// Its own tool, not a defer mode: it answers a question and may file a
+	// work item, but resolves no concern. 68 -> 69.
+	const wantToolCount = 69
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",
@@ -3400,6 +3409,18 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	}
 	if !sawWaiveConcerns {
 		t.Error("fishhawk_waive_concerns is not in the registered tool list — the bulk waive verb is unreachable")
+	}
+	// fishhawk_answer_divergence (E75.5 / #3733) must be wire-visible for the
+	// same reason.
+	var sawAnswerDivergence bool
+	for _, tool := range res.Tools {
+		if tool.Name == "fishhawk_answer_divergence" {
+			sawAnswerDivergence = true
+			break
+		}
+	}
+	if !sawAnswerDivergence {
+		t.Error("fishhawk_answer_divergence is not in the registered tool list — the divergence answer verb is unreachable")
 	}
 	// fishhawk_validate (#3579) must likewise be wire-visible, for the same
 	// reason: the count bump alone would stay green if the registration were
@@ -16782,5 +16803,147 @@ func TestRunStatusBound_T1ShedsPrecedent(t *testing.T) {
 		if e.field == "precedent" {
 			t.Errorf("an absent block must record no elision: %+v", e)
 		}
+	}
+}
+
+// seededRunStatusDivergence is a divergence question as the backend renders it.
+func seededRunStatusDivergence() *gateDivergence {
+	return &gateDivergence{
+		Sequence: 77, DecisionClass: "concern_waive", StageID: "st-1", StageKind: "implement",
+		Outcome: "waived", ModalOutcome: "deferred", AgreementRatio: 0.9, HumanCount: 9,
+		CitedSequences: []int64{11, 12}, CitedTotal: 9, Question: "divergence-question-sentinel",
+		Options:   []string{"one_off", "doctrine_change"},
+		Answer:    gateDivergenceAnswer{Endpoint: "POST /v0/runs/r/divergence/77/answer", Tool: "fishhawk_answer_divergence"},
+		OpenTotal: 1,
+	}
+}
+
+// TestGetRunStatus_DivergenceHoistedAndCompacted (E75.5 / #3733): the
+// divergence question is hoisted off run.divergence (appearing once), its
+// fixed prose is elided under the compact default while every decidable field
+// survives, include_review_prose restores the prose, and next_actions is
+// byte-identical with and without it (never a gate input).
+func TestGetRunStatus_DivergenceHoistedAndCompacted(t *testing.T) {
+	fb, srv, runID := seedCompactFixture(t)
+	r := newResolver(srv, nil)
+	statusFor := func(with bool, in GetRunStatusInput) GetRunStatusOutput {
+		row := fb.getRunByID[runID]
+		row.Divergence = nil
+		if with {
+			row.Divergence = seededRunStatusDivergence()
+		}
+		fb.getRunByID[runID] = row
+		in.RunID = runID.String()
+		_, out, err := r.getRunStatus(context.Background(), nil, in)
+		if err != nil {
+			t.Fatalf("getRunStatus: %v", err)
+		}
+		return out
+	}
+	out := statusFor(true, GetRunStatusInput{})
+	if out.Run.Divergence != nil {
+		t.Errorf("run.divergence = %+v, want nil (hoisted)", out.Run.Divergence)
+	}
+	d := out.Divergence
+	if d == nil || d.Sequence != 77 || d.Answer.Tool != "fishhawk_answer_divergence" || len(d.Options) != 2 ||
+		d.ModalOutcome != "deferred" || len(d.CitedSequences) != 2 {
+		t.Fatalf("divergence = %+v, want the hoisted block with every decidable field", d)
+	}
+	if d.Question != "" {
+		t.Errorf("compact default: question = %q, want elided", d.Question)
+	}
+	raw, _ := json.Marshal(out)
+	if strings.Contains(string(raw), "divergence-question-sentinel") {
+		t.Error("compact default leaked the question prose onto the wire")
+	}
+	if n := strings.Count(string(raw), `"open_total":1`); n != 1 {
+		t.Errorf("divergence serialized %d times, want 1", n)
+	}
+	full := statusFor(true, GetRunStatusInput{IncludeReviewProse: true})
+	if full.Divergence == nil || full.Divergence.Question != "divergence-question-sentinel" {
+		t.Errorf("include_review_prose: divergence = %+v, want the prose restored", full.Divergence)
+	}
+	without := statusFor(false, GetRunStatusInput{})
+	a, _ := json.Marshal(out.NextActions)
+	b, _ := json.Marshal(without.NextActions)
+	if without.Divergence != nil || string(a) != string(b) {
+		t.Errorf("next_actions changed by the divergence block:\n with    %s\n without %s", a, b)
+	}
+}
+
+// TestRunStatusBound_T1ShedsDivergence: T1 sheds the divergence block with a
+// stored elision pointing at the gate view, and records nothing when absent.
+func TestRunStatusBound_T1ShedsDivergence(t *testing.T) {
+	runID := uuid.NewString()
+	out := GetRunStatusOutput{Divergence: seededRunStatusDivergence()}
+	led := &elisionLedger{}
+	tierDerivedEconomics(&out, runID, led)
+	if out.Divergence != nil {
+		t.Errorf("T1 left the divergence block in place")
+	}
+	var got *elidedField
+	for i := range led.entries {
+		if led.entries[i].field == "divergence" {
+			got = &led.entries[i]
+		}
+	}
+	if got == nil || got.class != classStored || !strings.Contains(got.pointer, "fishhawk_get_gate_view") {
+		t.Fatalf("divergence elision = %+v, want a stored elision pointing at the gate view", got)
+	}
+	empty := GetRunStatusOutput{}
+	led = &elisionLedger{}
+	tierDerivedEconomics(&empty, runID, led)
+	for _, e := range led.entries {
+		if e.field == "divergence" {
+			t.Errorf("an absent block must record no elision: %+v", e)
+		}
+	}
+}
+
+// TestAnswerDivergenceTool pins the tool handler: it refuses a malformed
+// run_id and a non-positive sequence BEFORE any HTTP hop, and otherwise POSTs
+// the exact route + body and surfaces the backend's result.
+func TestAnswerDivergenceTool(t *testing.T) {
+	runID := uuid.New()
+	var hits int
+	var gotPath string
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		hits++
+		gotPath = req.Method + " " + req.URL.Path
+		_ = json.NewDecoder(req.Body).Decode(&gotBody)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"run_id":"` + runID.String() + `","sequence":77,"answer":"doctrine_change","issue":{"type":"chore","title":"t","number":4242,"url":"u","provider":"github"}}`))
+	}))
+	t.Cleanup(srv.Close)
+	r := newResolver(srv, nil)
+
+	for _, bad := range []AnswerDivergenceInput{
+		{RunID: "not-a-uuid", Sequence: 77, Answer: "one_off"},
+		{RunID: runID.String(), Sequence: 0, Answer: "one_off"},
+		{RunID: runID.String(), Sequence: -3, Answer: "one_off"},
+	} {
+		if _, _, err := r.answerDivergence(context.Background(), nil, bad); err == nil {
+			t.Errorf("input %+v: err = nil, want a pre-hop refusal", bad)
+		}
+	}
+	if hits != 0 {
+		t.Fatalf("a refused input reached the backend (%d hits)", hits)
+	}
+
+	_, out, err := r.answerDivergence(context.Background(), nil, AnswerDivergenceInput{
+		RunID: runID.String(), Sequence: 77, Answer: "doctrine_change", ParentEpic: "#3728", Labels: []string{"area:server"},
+	})
+	if err != nil {
+		t.Fatalf("answerDivergence: %v", err)
+	}
+	if want := "POST /v0/runs/" + runID.String() + "/divergence/77/answer"; gotPath != want {
+		t.Errorf("request = %q, want %q", gotPath, want)
+	}
+	if gotBody["answer"] != "doctrine_change" || gotBody["parent_epic"] != "#3728" {
+		t.Errorf("body = %v", gotBody)
+	}
+	if out.Result.Issue == nil || out.Result.Issue.Number != 4242 || out.Result.Sequence != 77 {
+		t.Errorf("result = %+v", out.Result)
 	}
 }
