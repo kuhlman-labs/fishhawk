@@ -8,6 +8,8 @@
 
 It reads one JSON event per stdout line and emits the same canonical envelope (`invocation_start` … per-line events … `invocation_end`) + `stage_progress` heartbeats + category-A `failureResult` shape as claudecode.
 
+A non-empty `agent.Invocation.Model` appends `--model <m>`, and a non-empty `agent.Invocation.ReasoningEffort` (the stage's spec-declared `executor.reasoning_effort`, #3896) appends `-c model_reasoning_effort=<e>` — the same config override `backend/internal/codex` passes for reviewers — both before the trailing positional prompt; values pass through verbatim and the CLI rejects an unsupported level. Empty appends nothing, so the spawn is byte-identical to the pre-#3896 argv (`TestInvoke_ReasoningEffortFlag`). Risk: an older codex CLI that predates the config key would reject or ignore it; pin `executor.agent_version` (the existing pre-spawn guard) on a stage that declares an effort.
+
 ## Usage accounting
 
 Codex reports usage PER TURN on each `turn.completed` line (`{input_tokens,cached_input_tokens,output_tokens,reasoning_output_tokens}`), so the adapter SUMS across turns (not last-wins like claudecode); `cached_input_tokens` is a subset of `input_tokens` (not re-added), `reasoning_output_tokens` is added to the output side.
