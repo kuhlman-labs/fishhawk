@@ -299,6 +299,41 @@ func TestInvoke_ModelFlag(t *testing.T) {
 	})
 }
 
+// TestInvoke_ReasoningEffortFlag asserts the per-stage effort pin (#3896): a
+// non-empty Invocation.ReasoningEffort appends `-c model_reasoning_effort=<e>`
+// before the trailing positional prompt; an empty ReasoningEffort leaves the
+// argv byte-identical to the argv produced with only Model set.
+func TestInvoke_ReasoningEffortFlag(t *testing.T) {
+	capture := func(t *testing.T, in agent.Invocation) []string {
+		t.Helper()
+		var captured []string
+		inv := &Invoker{Cmd: capturingHelperCommand(&captured), Now: frozenNow()}
+		if _, err := inv.Invoke(context.Background(), in); err != nil {
+			t.Fatalf("Invoke: %v", err)
+		}
+		return captured
+	}
+	t.Run("non-empty effort appends -c model_reasoning_effort before the prompt", func(t *testing.T) {
+		got := capture(t, agent.Invocation{Prompt: "p", Model: "gpt-5.5", ReasoningEffort: "high"})
+		if !argsHaveFlagValue(got, "-c", "model_reasoning_effort=high") {
+			t.Fatalf("expected -c model_reasoning_effort=high in args, got %v", got)
+		}
+		if len(got) == 0 || got[len(got)-1] != "p" {
+			t.Fatalf("prompt must stay the trailing positional argument, got %v", got)
+		}
+	})
+	t.Run("empty effort is byte-identical to the model-only spawn", func(t *testing.T) {
+		modelOnly := capture(t, agent.Invocation{Prompt: "p", Model: "gpt-5.5"})
+		got := capture(t, agent.Invocation{Prompt: "p", Model: "gpt-5.5", ReasoningEffort: ""})
+		if !reflect.DeepEqual(got, modelOnly) {
+			t.Fatalf("empty effort changed the spawn:\n got  %q\n want %q", got, modelOnly)
+		}
+		if argsHaveFlag(got, "-c") {
+			t.Fatalf("expected NO -c override for empty effort, got %v", got)
+		}
+	})
+}
+
 // frozenNow returns a Now() that ticks deterministically so tests can
 // assert event ordering without fighting wall-clock jitter.
 func frozenNow() func() time.Time {

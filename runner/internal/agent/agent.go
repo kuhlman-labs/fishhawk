@@ -97,6 +97,17 @@ type Invocation struct {
 	// byte-for-byte. Adapters MUST treat empty as "omit the flag".
 	Model string
 
+	// ReasoningEffort is the resolved reasoning-effort level (low|medium|high|
+	// xhigh|max) for this stage, declared by the workflow spec's
+	// executor.reasoning_effort and carried on the prompt response (#3896). A
+	// non-empty value is passed through verbatim to the agent CLI's effort
+	// override — claudecode `--effort <e>`, codex `-c model_reasoning_effort=<e>`
+	// — and the CLI rejects a level the model does not support. An EMPTY value
+	// (the common case) appends NO flag, so the adapter spawns the agent on its
+	// built-in default effort, byte-for-byte as today. Adapters MUST treat empty
+	// as "omit the flag".
+	ReasoningEffort string
+
 	// JSONSchema is an optional structured-output schema (#1325): the verbatim
 	// JSON Schema text the agent's terminal output must conform to. When
 	// non-empty the claudecode adapter passes it to the CLI's --json-schema

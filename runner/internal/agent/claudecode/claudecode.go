@@ -340,6 +340,17 @@ func (i *Invoker) invokeOnce(ctx context.Context, inv agent.Invocation) (agent.R
 	if inv.Model != "" {
 		args = append(args, "--model", inv.Model)
 	}
+	// --effort: pin the session's reasoning effort to the stage's spec-declared
+	// executor.reasoning_effort (#3896), passed through verbatim (the CLI
+	// rejects a level the model does not support). An empty
+	// inv.ReasoningEffort appends NO flag, so the spawn is byte-identical to
+	// today and Claude Code uses its default effort. `--effort` needs a claude
+	// CLI that ships the flag (verified on 2.1.286); an older CLI fails at
+	// startup with a usage error, and executor.agent_version is the pre-spawn
+	// guard for that.
+	if inv.ReasoningEffort != "" {
+		args = append(args, "--effort", inv.ReasoningEffort)
+	}
 	// --json-schema: constrain the agent's structured_output to the given
 	// schema (#1325). The CLI takes the schema as an INLINE JSON string
 	// argument (NOT a file path — verified against claude 2.1.186). When set,

@@ -499,6 +499,49 @@ func TestInvoke_ModelFlag(t *testing.T) {
 	})
 }
 
+// TestInvoke_ReasoningEffortFlag asserts the per-stage effort pin (#3896): a
+// non-empty Invocation.ReasoningEffort appends `--effort <e>` right after the
+// `--model` pair; an empty ReasoningEffort leaves the argv byte-identical to
+// the argv produced with only Model set (no `--effort` token at all).
+func TestInvoke_ReasoningEffortFlag(t *testing.T) {
+	capture := func(t *testing.T, in agent.Invocation) []string {
+		t.Helper()
+		var captured []string
+		inv := &Invoker{Cmd: capturingHelperCommand(&captured), Now: frozenNow()}
+		if _, err := inv.Invoke(context.Background(), in); err != nil {
+			t.Fatalf("Invoke: %v", err)
+		}
+		return captured
+	}
+	t.Run("non-empty effort appends --effort after --model", func(t *testing.T) {
+		got := capture(t, agent.Invocation{Prompt: "p", Model: "claude-opus-5-5", ReasoningEffort: "high"})
+		want := []string{"--model", "claude-opus-5-5", "--effort", "high"}
+		if !argsContainSeq(got, want) {
+			t.Fatalf("expected contiguous %v in args, got %v", want, got)
+		}
+	})
+	t.Run("empty effort is byte-identical to the model-only spawn", func(t *testing.T) {
+		modelOnly := capture(t, agent.Invocation{Prompt: "p", Model: "claude-opus-5-5"})
+		got := capture(t, agent.Invocation{Prompt: "p", Model: "claude-opus-5-5", ReasoningEffort: ""})
+		if !reflect.DeepEqual(got, modelOnly) {
+			t.Fatalf("empty effort changed the spawn:\n got  %q\n want %q", got, modelOnly)
+		}
+		if argsHaveFlag(got, "--effort") {
+			t.Fatalf("expected NO --effort flag for empty effort, got %v", got)
+		}
+	})
+}
+
+// argsContainSeq reports whether seq appears as a contiguous run in args.
+func argsContainSeq(args, seq []string) bool {
+	for i := 0; i+len(seq) <= len(args); i++ {
+		if reflect.DeepEqual(args[i:i+len(seq)], seq) {
+			return true
+		}
+	}
+	return false
+}
+
 // TestInvoke_JSONSchemaFlag asserts the structured-output gate (#1325): a
 // non-empty Invocation.JSONSchema appends `--json-schema <schema>`; an empty
 // JSONSchema appends NO such flag (byte-identical to today's spawn).

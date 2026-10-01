@@ -2,6 +2,10 @@
 
 `agent.Invoker` adapter for Anthropic's Claude Code CLI. Operator-facing behavior (provider selection, binary pinning, out-of-tree-write semantics) is in `runner/README.md`; this file covers adapter internals.
 
+## Reasoning effort: `--effort` (#3896)
+
+A non-empty `agent.Invocation.ReasoningEffort` (the stage's spec-declared `executor.reasoning_effort`, threaded from the prompt response by the runner) appends `--effort <e>` immediately after the `--model` pair; the value passes through verbatim and the CLI rejects a level the model does not support (e.g. Haiku 4.5 takes no effort). Empty appends NO flag, so the spawn is byte-identical to the pre-#3896 argv — `TestInvoke_ReasoningEffortFlag` pins both the contiguous `--model <m> --effort <e>` pair and the byte-identical absent case. Risk: `--effort` was verified on claude 2.1.286; an older CLI without the flag fails at startup with a usage error. No version probe is added — pin `executor.agent_version` (the existing loud pre-spawn guard) on any stage that declares an effort.
+
 ## Bounded in-driver agent retry (#579)
 
 `claudecode.go` wraps a bounded retry around a single-attempt `invokeOnce` for the transient interleaved-thinking API 400 (`thinking/redacted_thinking blocks in the latest assistant message cannot be modified`) that kills long agent runs at high turn counts.
