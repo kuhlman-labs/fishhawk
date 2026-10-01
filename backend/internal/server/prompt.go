@@ -258,6 +258,25 @@ type promptResponse struct {
 	// convention as ImplementModel. A tag drift here silently drops the model and
 	// the runner falls back to today's spawn.
 	PlanModel string `json:"plan_model,omitempty"`
+	// ReasoningEffort is the dispatched stage executor's resolved reasoning
+	// effort (#3896), carried on EVERY agent-stage prompt (plan, implement
+	// incl. fix-up, acceptance) whose spec declares executor.reasoning_effort.
+	// The runner pins it onto the agent spawn (claudecode `--effort <e>`,
+	// codex `-c model_reasoning_effort=<e>`). Resolved through
+	// resolveStageReasoningEffort (spec rung only today). EMPTY/omitted means
+	// no effort was declared and the spawn is byte-identical to today.
+	// ReasoningEffortSource names the winning rung (`spec`) and is set exactly
+	// when ReasoningEffort is.
+	//
+	// CROSS-MODULE WIRE CONTRACT: the json tags (`reasoning_effort`,
+	// `reasoning_effort_source`) MUST stay byte-identical to the runner's
+	// upload.FetchedPrompt.ReasoningEffort / ReasoningEffortSource decoders
+	// (runner/internal/upload/upload.go) — the same independent-struct-by-tag
+	// convention as ImplementModel/PlanModel, and the shared golden
+	// testdata/wire/reasoning_effort_prompt.json pins both sides. A tag drift
+	// here silently drops the effort and the runner spawns at today's default.
+	ReasoningEffort       string `json:"reasoning_effort,omitempty"`
+	ReasoningEffortSource string `json:"reasoning_effort_source,omitempty"`
 	// EgressTargetHosts is the acceptance stage's FULL spec-declared egress
 	// target-host list (the E31.4/#1532 grammar), served ONLY on acceptance
 	// stages (E31.7 / #1535). The runner feeds it into the ADR-050 egress
@@ -1872,6 +1891,14 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		resp.PlanModel = rm.Value
 		s.logModelResolution(r.Context(), runRow.ID, rm)
 	}
+	// Stage-executor reasoning effort (#3896): carried for any agent stage
+	// whose spec executor declares one (plan, implement incl. fix-up,
+	// acceptance). An undeclared effort resolves to {"", ModelSourceNone==""},
+	// which omitempty drops, so the spawn is byte-identical to today.
+	re := s.resolveStageReasoningEffort(r.Context(), runRow, stage.Type)
+	resp.ReasoningEffort = re.Value
+	resp.ReasoningEffortSource = string(re.Source)
+	s.logEffortResolution(r.Context(), runRow.ID, stage.Type, re)
 	// Acceptance-stage containment inputs (E31.7 / #1535): the FULL egress
 	// target-host list (the runner's ADR-050 proxy allow-list) and the approved
 	// plan's criterion ids (the runner's verdict join-key validation set).
@@ -2540,6 +2567,11 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		rm := s.resolvePlanModelForRun(r.Context(), runRow)
 		resp.PlanModel = rm.Value
 	}
+	// Stage-executor reasoning effort (#3896), same derivation as the dispatch
+	// path so the rendered response stays byte-consistent with it.
+	re := s.resolveStageReasoningEffort(r.Context(), runRow, stage.Type)
+	resp.ReasoningEffort = re.Value
+	resp.ReasoningEffortSource = string(re.Source)
 	// Acceptance-stage containment inputs (E31.7 / #1535) and the E31.18
 	// merge-candidate identity, same derivation as the dispatch path so the
 	// rendered response stays byte-consistent.

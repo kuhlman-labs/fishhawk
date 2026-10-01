@@ -156,8 +156,10 @@ type ResolvedEffort struct {
 // highest non-empty rung wins and its name is the source; an all-empty ladder
 // returns {Value: "", Source: ModelSourceNone}, so the reviewer carries no
 // effort override and the codex adapter inherits its host config byte-for-byte
-// as today. Pure — no IO. Codex-only at the seam: the anthropic/claudecode
-// adapters ignore the resolved value. Exported so the deployment's codex
+// as today. Pure — no IO. The deployment-default rung is CODEX-scoped: the
+// claudecode reviewer takes the spec value verbatim (`--effort <e>`, #3896)
+// and never falls through to FISHHAWKD_CODEX_REASONING_EFFORT; the anthropic
+// (API) adapter ignores the value. Exported so the deployment's codex
 // reviewer construction (serve.go) resolves the env-default rung through the
 // same chokepoint.
 func ResolveReviewerReasoningEffort(deflt, spec string) ResolvedEffort {
@@ -169,6 +171,60 @@ func ResolveReviewerReasoningEffort(deflt, spec string) ResolvedEffort {
 	default:
 		return ResolvedEffort{Value: "", Source: ModelSourceNone}
 	}
+}
+
+// resolveExecutorReasoningEffort applies the stage-executor reasoning-effort
+// ladder (#3896). It ships with the SPEC rung only — stage
+// executor.reasoning_effort — so a non-empty (whitespace-trimmed) spec value
+// wins with Source=spec and an empty one resolves to {Value: "", Source:
+// none}, which the prompt responses omit so the runner spawn stays
+// byte-identical to today. The deployment-default and operator-gate rungs the
+// issue names are deferred; adding one is a new case here. Pure — no IO.
+func resolveExecutorReasoningEffort(specValue string) ResolvedEffort {
+	if v := strings.TrimSpace(specValue); v != "" {
+		return ResolvedEffort{Value: v, Source: ModelSourceSpec}
+	}
+	return ResolvedEffort{Value: "", Source: ModelSourceNone}
+}
+
+// resolveStageReasoningEffort resolves the reasoning effort for the run's
+// stage of the given type: it parses the run's cached WorkflowSpec (reuse
+// resolved — file/workflow `defaults` and `extends` are already applied by
+// spec.ParseBytes) and looks the stage up by id-then-type, the same lookup
+// resolveSpecStageForRun / resolveExecutorAgentVersionRange use. Any parse or
+// lookup failure degrades to the empty resolution (byte-identical spawn)
+// rather than failing the prompt fetch or the gate.
+func (s *Server) resolveStageReasoningEffort(ctx context.Context, runRow *run.Run, stageType run.StageType) ResolvedEffort {
+	if runRow == nil {
+		return resolveExecutorReasoningEffort("")
+	}
+	_, specStage, _, err := resolveSpecStageForRun(runRow, stageType)
+	if err != nil {
+		if s.cfg.Logger != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "reasoning effort: resolve spec stage failed; carrying no effort",
+				slog.String("run_id", runRow.ID.String()),
+				slog.String("stage_type", string(stageType)),
+				slog.String("error", err.Error()),
+			)
+		}
+		return resolveExecutorReasoningEffort("")
+	}
+	return resolveExecutorReasoningEffort(specStage.Executor.ReasoningEffort)
+}
+
+// logEffortResolution debug-logs a non-empty stage reasoning-effort
+// resolution alongside logModelResolution, so an operator can see which
+// level a stage spawn was pinned to and from which rung.
+func (s *Server) logEffortResolution(ctx context.Context, runID uuid.UUID, stageType run.StageType, re ResolvedEffort) {
+	if s.cfg.Logger == nil || re.Value == "" {
+		return
+	}
+	s.cfg.Logger.LogAttrs(ctx, slog.LevelDebug, "server: resolved stage reasoning effort",
+		slog.String("run_id", runID.String()),
+		slog.String("stage_type", string(stageType)),
+		slog.String("reasoning_effort", re.Value),
+		slog.String("reasoning_effort_source", string(re.Source)),
+	)
 }
 
 // modelResolvedPayload is the model_resolved audit payload (#1416): the
@@ -185,9 +241,17 @@ func ResolveReviewerReasoningEffort(deflt, spec string) ResolvedEffort {
 // slice decodes to StageType=="" and is treated as the implement resolution (the
 // only stage that stamped the category before #1416). gateResolvedModelForStage
 // owns that compatibility via modelResolvedStageMatches.
+//
+// ReasoningEffort / ReasoningEffortSource (#3896) are equally ADDITIVE and
+// omitempty: the gate stamps the target stage's resolved executor effort onto
+// the entries it ALREADY writes (it never mints an entry just to carry an
+// effort), and an absent effort leaves both keys off so the payload is
+// byte-identical to the pre-#3896 shape.
 type modelResolvedPayload struct {
 	ResolvedModel
-	StageType string `json:"stage_type,omitempty"`
+	StageType             string `json:"stage_type,omitempty"`
+	ReasoningEffort       string `json:"reasoning_effort,omitempty"`
+	ReasoningEffortSource string `json:"reasoning_effort_source,omitempty"`
 }
 
 // AllowedModels is the per-adapter allowed-model policy sourced from deployment

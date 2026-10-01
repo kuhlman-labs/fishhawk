@@ -1039,3 +1039,107 @@ workflows:
 		})
 	}
 }
+
+// TestResolveExecutorReasoningEffort pins the stage-executor effort ladder's
+// spec rung (#3896): a declared value wins with Source=spec (whitespace
+// trimmed), and an empty or blank value resolves to {"", none} so the prompt
+// responses omit both keys and the spawn stays byte-identical.
+func TestResolveExecutorReasoningEffort(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want ResolvedEffort
+	}{
+		{"set", "high", ResolvedEffort{Value: "high", Source: ModelSourceSpec}},
+		{"whitespace trimmed", "  xhigh \n", ResolvedEffort{Value: "xhigh", Source: ModelSourceSpec}},
+		{"empty", "", ResolvedEffort{Value: "", Source: ModelSourceNone}},
+		{"blank", "   ", ResolvedEffort{Value: "", Source: ModelSourceNone}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := resolveExecutorReasoningEffort(tc.in); got != tc.want {
+				t.Fatalf("resolveExecutorReasoningEffort(%q) = %+v, want %+v", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestResolveStageReasoningEffort pins the per-stage lookup (#3896): the
+// dispatched stage's executor effort is found by stage id, then by stage
+// type; a file-level defaults.executor effort is inherited by an
+// executor-less stage; and every degrade (no spec, malformed spec, unknown
+// workflow, stage without an effort) resolves to the empty resolution.
+func TestResolveStageReasoningEffort(t *testing.T) {
+	const byID = "version: \"2\"\n" +
+		"workflows:\n" +
+		"  feature_change:\n" +
+		"    stages:\n" +
+		"      - id: plan\n" +
+		"        type: plan\n" +
+		"        executor:\n" +
+		"          agent: claude-code\n" +
+		"          reasoning_effort: medium\n" +
+		"      - id: implement\n" +
+		"        type: implement\n" +
+		"        executor:\n" +
+		"          agent: claude-code\n" +
+		"          model: claude-opus-5-5\n" +
+		"          reasoning_effort: high\n"
+	const byType = "version: \"2\"\n" +
+		"workflows:\n" +
+		"  feature_change:\n" +
+		"    stages:\n" +
+		"      - id: build\n" +
+		"        type: implement\n" +
+		"        executor:\n" +
+		"          agent: codex\n" +
+		"          reasoning_effort: max\n"
+	const inherited = "version: \"2\"\n" +
+		"defaults:\n" +
+		"  executor:\n" +
+		"    agent: claude-code\n" +
+		"    reasoning_effort: xhigh\n" +
+		"workflows:\n" +
+		"  feature_change:\n" +
+		"    stages:\n" +
+		"      - id: implement\n" +
+		"        type: implement\n"
+	const absent = "version: \"2\"\n" +
+		"workflows:\n" +
+		"  feature_change:\n" +
+		"    stages:\n" +
+		"      - id: implement\n" +
+		"        type: implement\n" +
+		"        executor:\n" +
+		"          agent: claude-code\n"
+	none := ResolvedEffort{Value: "", Source: ModelSourceNone}
+	cases := []struct {
+		name       string
+		spec       []byte
+		workflowID string
+		stageType  run.StageType
+		want       ResolvedEffort
+	}{
+		{"implement by id", []byte(byID), "feature_change", run.StageTypeImplement, ResolvedEffort{Value: "high", Source: ModelSourceSpec}},
+		{"plan by id", []byte(byID), "feature_change", run.StageTypePlan, ResolvedEffort{Value: "medium", Source: ModelSourceSpec}},
+		{"implement by type", []byte(byType), "feature_change", run.StageTypeImplement, ResolvedEffort{Value: "max", Source: ModelSourceSpec}},
+		{"inherited from defaults", []byte(inherited), "feature_change", run.StageTypeImplement, ResolvedEffort{Value: "xhigh", Source: ModelSourceSpec}},
+		{"stage without effort", []byte(absent), "feature_change", run.StageTypeImplement, none},
+		{"stage not in spec", []byte(absent), "feature_change", run.StageTypeAcceptance, none},
+		{"no spec", nil, "feature_change", run.StageTypeImplement, none},
+		{"malformed spec", []byte("version: \"2\"\nworkflows: [::"), "feature_change", run.StageTypeImplement, none},
+		{"unknown workflow", []byte(byID), "other", run.StageTypeImplement, none},
+	}
+	s := &Server{}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rr := &run.Run{ID: uuid.New(), WorkflowID: tc.workflowID, WorkflowSpec: tc.spec}
+			if got := s.resolveStageReasoningEffort(context.Background(), rr, tc.stageType); got != tc.want {
+				t.Fatalf("resolveStageReasoningEffort = %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+	if got := s.resolveStageReasoningEffort(context.Background(), nil, run.StageTypeImplement); got != none {
+		t.Fatalf("nil run: resolveStageReasoningEffort = %+v, want %+v", got, none)
+	}
+}
