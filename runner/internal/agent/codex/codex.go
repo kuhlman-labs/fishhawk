@@ -187,6 +187,16 @@ func (i *Invoker) Invoke(ctx context.Context, inv agent.Invocation) (agent.Resul
 	if inv.Model != "" {
 		args = append(args, "--model", inv.Model)
 	}
+	// -c model_reasoning_effort=<e>: pin Codex's reasoning effort to the
+	// stage's spec-declared executor.reasoning_effort (#3896) — the same config
+	// override backend/internal/codex passes for reviewers — passed through
+	// verbatim (the CLI rejects a level the model does not support). An empty
+	// inv.ReasoningEffort appends NO override, so the spawn is byte-identical
+	// to today and Codex inherits its host ~/.codex default. Placed with the
+	// other options, before the trailing positional prompt.
+	if inv.ReasoningEffort != "" {
+		args = append(args, "-c", "model_reasoning_effort="+inv.ReasoningEffort)
+	}
 	args = append(args, inv.Prompt)
 	// An ExecWrapper (the acceptance net sandbox, #3393) becomes the
 	// process name with the binary + args appended positionally; an empty

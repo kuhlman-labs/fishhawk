@@ -442,6 +442,51 @@ func TestValidateBytes_V2RejectsMinorForm(t *testing.T) {
 	}
 }
 
+// v2SpecWithExecutorEffort renders a version: "2" spec whose implement
+// executor carries the given executor lines (E28.5 / #3896).
+func v2SpecWithExecutorEffort(executor string) string {
+	return "version: \"2\"\n" + `
+workflows:
+  trivial:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+` + executor
+}
+
+// TestValidateBytes_V2ExecutorReasoningEffort_Accepted asserts the CLI
+// validator (what `fishhawk validate` runs) accepts executor.reasoning_effort
+// on an agent executor in the mirrored v2 schema (E28.5 / #3896).
+func TestValidateBytes_V2ExecutorReasoningEffort_Accepted(t *testing.T) {
+	yml := v2SpecWithExecutorEffort("          agent: claude-code\n          model: claude-opus-5-5\n          reasoning_effort: high\n")
+	if err := spec.ValidateBytes([]byte(yml)); err != nil {
+		t.Errorf("expected executor.reasoning_effort: high to validate, got: %v", err)
+	}
+}
+
+// TestValidateBytes_V2ExecutorReasoningEffort_Rejected asserts the CLI
+// validator rejects an unknown effort level and the key on a human executor,
+// each with an error naming reasoning_effort (E28.5 / #3896).
+func TestValidateBytes_V2ExecutorReasoningEffort_Rejected(t *testing.T) {
+	cases := map[string]string{
+		"unknown_level":  "          agent: claude-code\n          reasoning_effort: extreme\n",
+		"human_executor": "          human: true\n          reasoning_effort: high\n",
+	}
+	for name, executor := range cases {
+		t.Run(name, func(t *testing.T) {
+			err := spec.ValidateBytes([]byte(v2SpecWithExecutorEffort(executor)))
+			var ve *spec.ValidationError
+			if !errors.As(err, &ve) {
+				t.Fatalf("err = %v, want *ValidationError", err)
+			}
+			if !strings.Contains(err.Error(), "reasoning_effort") {
+				t.Errorf("error = %q, want it to name reasoning_effort", err.Error())
+			}
+		})
+	}
+}
+
 // TestValidateBytes_AgentVersion_Valid asserts a workflow-v1.4 spec declaring
 // agent_version ranges on both the executor and a reviewer passes CLI
 // validation (schema + the #1743 semantic range sweep).

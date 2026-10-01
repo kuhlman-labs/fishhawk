@@ -346,6 +346,17 @@
               "minLength": 1,
               "description": "Optional semver comparator RANGE (a space-separated AND list of comparators, e.g. \">=2.1 <2.2\") of coding-agent CLI versions this stage was validated against (E32.13 / #1743). Before spawning the agent the runner compares its resolved CLI version \u2014 the #1769-probed `<binary> --version` \u2014 against this range; a version OUTSIDE the range fails the stage LOUDLY pre-spawn (category C), turning an opaque mid-run CLI-drift break (the 2026-07-08 claude CLI auto-update, #1741) into a one-line diagnosis. It is a RANGE, not an exact pin: CLIs release near-daily, so the actual binary pin stays a host concern via the FISHHAWK_AGENT_BIN / FISHHAWK_CODEX_BIN overrides (#1741 / #1769) \u2014 this field owns only the spec-level contract. Permanently optional (deliberately NOT annotated x-intended-required); absent = no constraint (full back-compat, mirroring min_runner_version). An unprobeable / `unknown` version degrades to a warn and proceeds (never blocks). Declared by workflow-v2; accepted whenever present (v2 has no minor chain — a field is accepted because the schema declares it, not because the document declared a high enough minor)."
             },
+            "reasoning_effort": {
+              "type": "string",
+              "enum": [
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max"
+              ],
+              "description": "Optional reasoning-effort pin for this stage's agent invocation (E28.5 / #3896). The spec rung of the per-stage effort resolution (the only rung today). The resolved value is passed to the coding agent verbatim: claude-code as `--effort <effort>`, codex as `-c model_reasoning_effort=<effort>`. Empty/absent = today's spawn, byte-identical (no effort flag; the agent's own default). Pass-through: not every model accepts every level, and the agent CLI/API rejects one it does not support \u2014 there is no per-model matrix here. An agent CLI too old to know the flag fails at startup; executor.agent_version is the loud pre-spawn guard. Valid only on an agent executor (unevaluatedProperties rejects it on a human or delegate executor). Declared by workflow-v2; accepted whenever present (v2 has no minor chain — a field is accepted because the schema declares it, not because the document declared a high enough minor)."
+            },
             "timeout": {
               "type": "string",
               "pattern": "^([0-9]+(ns|us|ms|s|m|h))+$",
@@ -1017,7 +1028,7 @@
                   "xhigh",
                   "max"
                 ],
-                "description": "Codex-only reviewer reasoning-effort override (#1493). One rung of the per-reviewer reasoning-effort ladder: deployment default (FISHHAWKD_CODEX_REASONING_EFFORT) < this reasoning_effort. Empty/absent falls back to the deployment default exactly as today; the resolved value is passed to the codex adapter as a `-c model_reasoning_effort=<effort>` CLI override. Ignored by the anthropic and claudecode adapters, which take no reasoning-effort parameter. Declared by workflow-v2; accepted whenever present (v2 has no minor chain — a field is accepted because the schema declares it, not because the document declared a high enough minor)."
+                "description": "Reviewer reasoning-effort override (#1493; claudecode E28.5 / #3896). For a codex reviewer it is one rung of the per-reviewer ladder: deployment default (FISHHAWKD_CODEX_REASONING_EFFORT, a codex-only default) < this reasoning_effort; the resolved value is passed as a `-c model_reasoning_effort=<effort>` CLI override. For a claudecode reviewer this value alone is passed as `--effort <effort>` (no deployment-default rung; absent = today's spawn, no `--effort`). Ignored by the anthropic (API) adapter, which takes no reasoning-effort parameter. Declared by workflow-v2; accepted whenever present (v2 has no minor chain — a field is accepted because the schema declares it, not because the document declared a high enough minor)."
               },
               "agent_version": {
                 "type": "string",

@@ -12257,3 +12257,98 @@ func TestValidateRejectClass_PureTable(t *testing.T) {
 		})
 	}
 }
+
+// specEffortPlanImplement is a workflow-v2 spec (workflow id "w", matching
+// seedRun) whose plan and implement executors carry the given model and
+// reasoning_effort; an empty value omits the line.
+func specEffortPlanImplement(planModel, planEffort, implEffort string) []byte {
+	line := func(k, v string) string {
+		if v == "" {
+			return ""
+		}
+		return "          " + k + ": " + v + "\n"
+	}
+	return []byte("version: \"2\"\n" +
+		"workflows:\n" +
+		"  w:\n" +
+		"    stages:\n" +
+		"      - id: plan\n" +
+		"        type: plan\n" +
+		"        executor:\n" +
+		"          agent: claude-code\n" +
+		line("model", planModel) +
+		line("reasoning_effort", planEffort) +
+		"      - id: implement\n" +
+		"        type: implement\n" +
+		"        executor:\n" +
+		"          agent: claude-code\n" +
+		"          model: claude-opus-5-5\n" +
+		line("reasoning_effort", implEffort))
+}
+
+// TestSubmitApproval_ModelResolvedCarriesReasoningEffort pins the #3896
+// audit half (approval condition 1): the implement model_resolved entry the
+// gate ALWAYS writes carries reasoning_effort/reasoning_effort_source when
+// the implement executor declares one and omits BOTH keys otherwise; a plan
+// effort rides on the plan entry only when that entry is already written (a
+// non-empty plan model), and a plan effort with NO plan model mints no plan
+// entry.
+func TestSubmitApproval_ModelResolvedCarriesReasoningEffort(t *testing.T) {
+	approve := func(t *testing.T, specYAML []byte) []audit.ChainAppendParams {
+		t.Helper()
+		art := newFakeArtifactRepo()
+		s, rr, au, _ := newModelGateServer(t, art, nil, "")
+		r, planStage := seedBudgetRun(t, rr, art, planWithRecommendation(""))
+		implStage := rr.seedStage(r.ID, 1, run.StageStatePending)
+		implStage.Type = run.StageTypeImplement
+		r.WorkflowSpec = specYAML
+		w := submitApproval(t, s, planStage.ID, `{"decision":"approve"}`)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		return au.appended
+	}
+
+	t.Run("implement effort declared is stamped with source spec", func(t *testing.T) {
+		appended := approve(t, specEffortPlanImplement("", "", "high"))
+		_, p := findModelResolvedEntryForStage(t, appended, "implement")
+		if p.Value != "claude-opus-5-5" || p.ReasoningEffort != "high" || p.ReasoningEffortSource != string(ModelSourceSpec) {
+			t.Errorf("implement model_resolved = %+v, want model claude-opus-5-5, reasoning_effort high, source spec", p)
+		}
+	})
+
+	t.Run("implement effort absent omits both keys", func(t *testing.T) {
+		appended := approve(t, specEffortPlanImplement("", "", ""))
+		e, p := findModelResolvedEntryForStage(t, appended, "implement")
+		if p.ReasoningEffort != "" || p.ReasoningEffortSource != "" {
+			t.Errorf("implement model_resolved = %+v, want no effort", p)
+		}
+		if strings.Contains(string(e.Payload), "reasoning_effort") {
+			t.Errorf("payload %s must omit reasoning_effort keys (byte-identical pre-#3896 shape)", e.Payload)
+		}
+	})
+
+	t.Run("plan effort rides on the plan entry the gate already writes", func(t *testing.T) {
+		appended := approve(t, specEffortPlanImplement("claude-opus-5-5", "medium", ""))
+		_, p := findModelResolvedEntryForStage(t, appended, "plan")
+		if p.ReasoningEffort != "medium" || p.ReasoningEffortSource != string(ModelSourceSpec) {
+			t.Errorf("plan model_resolved = %+v, want reasoning_effort medium, source spec", p)
+		}
+	})
+
+	t.Run("plan effort with no plan model mints no plan entry", func(t *testing.T) {
+		appended := approve(t, specEffortPlanImplement("", "medium", ""))
+		for _, e := range appended {
+			if e.Category != CategoryModelResolved {
+				continue
+			}
+			var p modelResolvedPayload
+			if err := json.Unmarshal(e.Payload, &p); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if p.StageType == "plan" {
+				t.Errorf("unexpected plan model_resolved entry minted for an effort-only plan executor: %s", e.Payload)
+			}
+		}
+	})
+}

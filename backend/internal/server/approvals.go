@@ -2831,9 +2831,18 @@ func (s *Server) writeStageModelResolutions(ctx context.Context, planStage *run.
 		)
 	}
 
-	s.writeModelResolvedAudit(ctx, planStage.RunID, implStageID, app, implementRM, string(run.StageTypeImplement))
-
+	// The run row is read BEFORE the implement entry so the implement stage's
+	// executor reasoning effort (#3896) rides on the entry the gate already
+	// writes. A GetRun failure leaves the effort empty (both keys omitted) and
+	// the implement entry is still emitted below — the runner-spawn route is
+	// never starved by the effort lookup.
 	runRow, err := s.cfg.RunRepo.GetRun(ctx, planStage.RunID)
+	implementEffort := resolveExecutorReasoningEffort("")
+	if err == nil {
+		implementEffort = s.resolveStageReasoningEffort(ctx, runRow, run.StageTypeImplement)
+	}
+	s.writeModelResolvedAudit(ctx, planStage.RunID, implStageID, app, implementRM, implementEffort, string(run.StageTypeImplement))
+
 	if err != nil {
 		// Implement entry already landed; without the run row the plan/review
 		// ladders cannot be resolved, so degrade to implement-only (the #1013
@@ -2855,7 +2864,7 @@ func (s *Server) writeStageModelResolutions(ctx context.Context, planStage *run.
 	// carrying exactly the single implement entry (#1013's surface), rather than
 	// shadow plan/review rows the readers would resolve identically.
 	if planRM := s.gateResolvePlanModel(runRow, planOverride); planRM.Value != "" {
-		s.writeModelResolvedAudit(ctx, planStage.RunID, planStage.ID, app, planRM, string(run.StageTypePlan))
+		s.writeModelResolvedAudit(ctx, planStage.RunID, planStage.ID, app, planRM, s.resolveStageReasoningEffort(ctx, runRow, run.StageTypePlan), string(run.StageTypePlan))
 	}
 
 	// Gate the review entry on the SAME condition checkStageModelsAllowed
@@ -2871,7 +2880,7 @@ func (s *Server) writeStageModelResolutions(ctx context.Context, planStage *run.
 	if reviewStageID, ok := findStageIDByType(stages, run.StageTypeReview); ok {
 		if reviewRM := s.gateResolveReviewModel(runRow, reviewOverride); reviewRM.Value != "" {
 			if len(s.reviewProvidersForRun(ctx, runRow)) > 0 {
-				s.writeModelResolvedAudit(ctx, planStage.RunID, reviewStageID, app, reviewRM, string(run.StageTypeReview))
+				s.writeModelResolvedAudit(ctx, planStage.RunID, reviewStageID, app, reviewRM, s.resolveStageReasoningEffort(ctx, runRow, run.StageTypeReview), string(run.StageTypeReview))
 			}
 		}
 	}
@@ -2899,10 +2908,22 @@ func findStageIDByType(stages []*run.Stage, t run.StageType) (uuid.UUID, bool) {
 // reads a stage's model by the entry's StageID. Actor attribution mirrors
 // writeApprovalAudit (the acting subject selects agent vs user). Best-effort: a
 // logged append failure never unwinds the approval the gate already recorded.
-func (s *Server) writeModelResolvedAudit(ctx context.Context, runID, targetStageID uuid.UUID, app *approval.Approval, rm ResolvedModel, stageType string) {
+//
+// re is the target stage's resolved executor reasoning effort (#3896), stamped
+// additively as reasoning_effort / reasoning_effort_source. Both tags are
+// omitempty and an empty resolution is {"", ModelSourceNone==""}, so an
+// effort-less entry is byte-identical to the pre-#3896 payload. This function
+// never decides WHETHER an entry is written — the caller's existing
+// conditions do, so an effort alone never mints a plan/review entry.
+func (s *Server) writeModelResolvedAudit(ctx context.Context, runID, targetStageID uuid.UUID, app *approval.Approval, rm ResolvedModel, re ResolvedEffort, stageType string) {
 	actorKind := actorKindForSubject(app.ApproverSubject)
 	approver := app.ApproverSubject
-	payload, _ := json.Marshal(modelResolvedPayload{ResolvedModel: rm, StageType: stageType})
+	payload, _ := json.Marshal(modelResolvedPayload{
+		ResolvedModel:         rm,
+		StageType:             stageType,
+		ReasoningEffort:       re.Value,
+		ReasoningEffortSource: string(re.Source),
+	})
 	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
 		RunID:        runID,
 		StageID:      &targetStageID,

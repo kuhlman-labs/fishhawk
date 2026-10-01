@@ -233,6 +233,54 @@ func TestInvokeUngrounded_ClaudeNoDenyRules(t *testing.T) {
 	}
 }
 
+// TestInvoke_ClaudeEffortFlag pins the reviewer effort pin (E28.5 / #3896): a
+// declared Config.ReasoningEffort lands as the `--effort <e>` pair right after
+// `--model`, and an ABSENT effort leaves the argv byte-identical to the
+// pre-#3896 spawn — no `--effort` token at all, not `--effort ""`.
+func TestInvoke_ClaudeEffortFlag(t *testing.T) {
+	// The exact pre-#3896 ungrounded argv; the absent case must equal it.
+	preChange := []string{
+		"claude",
+		"--print",
+		"--output-format", "json",
+		"--model", "claude-sonnet-4-6",
+		"--strict-mcp-config",
+		"--mcp-config", `{"mcpServers":{}}`,
+		"-p", "review",
+	}
+	run := func(effort string) []string {
+		t.Helper()
+		var argv []string
+		cfg := testConfig()
+		cfg.ReasoningEffort = effort
+		c := NewClient(cfg)
+		c.Cmd = capturingHelper("happy", true, &argv, nil)
+		c.HostPaths = testHostPaths(t)
+		c.GOOS = "linux"
+		if _, _, _, err := c.InferenceInTree(context.Background(), "review", ""); err != nil {
+			t.Fatalf("InferenceInTree(effort=%q): %v", effort, err)
+		}
+		return argv
+	}
+
+	t.Run("set", func(t *testing.T) {
+		argv := run("xhigh")
+		want := slices.Concat(preChange[:6], []string{"--effort", "xhigh"}, preChange[6:])
+		if !slices.Equal(argv, want) {
+			t.Errorf("argv = %q\nwant   %q", argv, want)
+		}
+	})
+	t.Run("absent", func(t *testing.T) {
+		argv := run("")
+		if slices.Contains(argv, "--effort") {
+			t.Errorf("argv %q carries --effort with no declared effort", argv)
+		}
+		if !slices.Equal(argv, preChange) {
+			t.Errorf("argv = %q\nwant byte-identical pre-#3896 argv %q", argv, preChange)
+		}
+	})
+}
+
 // TestInvokeGrounded_ClaudeDenyRuleFailureFailsClosed: a deny-rule build error
 // FAILS the invocation. Spawning a grounded reviewer with NO deny rules would be
 // the unbounded posture this change exists to close — a degraded advisory review

@@ -4820,3 +4820,43 @@ func TestReportRunnerFailure_409_SingleAttempt(t *testing.T) {
 		t.Errorf("hits = %d, want exactly 1 (a 4xx stays terminal under the terminal budget)", hits)
 	}
 }
+
+// TestFetchPrompt_DecodesReasoningEffort confirms the client decodes the
+// backend's reasoning_effort / reasoning_effort_source response fields (#3896)
+// by their literal backend json names into FetchedPrompt, and that both stay
+// empty when the backend omits them (no effort declared — byte-identical
+// spawn).
+func TestFetchPrompt_DecodesReasoningEffort(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		body       string
+		wantEffort string
+		wantSource string
+	}{
+		{
+			name: "present",
+			body: `{"stage_id":"stage-abc","stage_type":"implement","prompt":"p","prompt_hash":"h",` +
+				`"reasoning_effort":"high","reasoning_effort_source":"spec"}`,
+			wantEffort: "high",
+			wantSource: "spec",
+		},
+		{
+			name: "absent",
+			body: `{"stage_id":"stage-abc","stage_type":"implement","prompt":"p","prompt_hash":"h"}`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fb, srv := newFakeBackend(t)
+			priv, _ := makeKey(t, fb)
+			fb.promptBody = tc.body
+			c := quickClient(srv)
+			got, err := c.FetchPrompt(context.Background(), FetchPromptArgs{StageID: "stage-abc", PrivateKey: priv})
+			if err != nil {
+				t.Fatalf("FetchPrompt: %v", err)
+			}
+			if got.ReasoningEffort != tc.wantEffort || got.ReasoningEffortSource != tc.wantSource {
+				t.Errorf("ReasoningEffort/Source = %q/%q, want %q/%q", got.ReasoningEffort, got.ReasoningEffortSource, tc.wantEffort, tc.wantSource)
+			}
+		})
+	}
+}

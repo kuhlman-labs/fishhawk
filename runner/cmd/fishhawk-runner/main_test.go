@@ -31415,3 +31415,134 @@ func TestRun_StandaloneImplement_BaseAdvanceInertOnFakeGitOpsDefaults(t *testing
 		t.Errorf("the suite default advanced a base:\n%s", stderr.String())
 	}
 }
+
+// goldenReasoningEffortPromptJSON reads the CROSS-MODULE GOLDEN FIXTURE for
+// the stage reasoning-effort prompt-response fields (#3896) from the SINGLE
+// shared file testdata/wire/reasoning_effort_prompt.json. The backend's
+// TestGetStagePrompt_ReasoningEffort_MatchesSharedGolden asserts its /prompt
+// and /prompt-render projections EQUAL these bytes; this side decodes the
+// same bytes through upload.FetchedPrompt's json tags and drives them to the
+// agent Invocation — the exempt_prompt_fields.json precedent (#2558). Anchored
+// on runtime.Caller (TestMain chdirs into a temp dir); fails closed on a read
+// error.
+func goldenReasoningEffortPromptJSON(t *testing.T) []byte {
+	t.Helper()
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed; cannot resolve the shared reasoning-effort prompt fixture path")
+	}
+	path := filepath.Join(filepath.Dir(thisFile), "..", "..", "..", "testdata", "wire", "reasoning_effort_prompt.json")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read shared reasoning-effort prompt fixture %s: %v", path, err)
+	}
+	return b
+}
+
+// TestRun_ReasoningEffortPinnedToSpawn is the CONSUME half of the #3896
+// spec -> prompt -> Invocation -> argv chain. It decodes the shared golden
+// (the bytes the backend emits) through upload.FetchedPrompt's json tags,
+// serves it from the fake uploader, drives run() end-to-end through
+// fetchPromptToFile, and captures the agent.Invocation via the EXISTING
+// injectable invoker constructors (newInvoker for claude-code,
+// newCodexInvoker for codex — approval condition 3: no new Cmd seam). It
+// asserts the Invocation carries model claude-opus-5-5 + ReasoningEffort
+// high for BOTH agents (approval condition 2), and an EMPTY ReasoningEffort
+// when the fixture's effort keys are stripped. The adapter unit tests own
+// the argv half (`--effort high` / `-c model_reasoning_effort=high`, and the
+// byte-identical absent argv).
+func TestRun_ReasoningEffortPinnedToSpawn(t *testing.T) {
+	cases := []struct {
+		name        string
+		agent       string
+		stripEffort bool
+		wantEffort  string
+	}{
+		{name: "claude-code present", agent: "claude-code", wantEffort: "high"},
+		{name: "claude-code absent", agent: "claude-code", stripEffort: true, wantEffort: ""},
+		{name: "codex present", agent: "codex", wantEffort: "high"},
+		{name: "codex absent", agent: "codex", stripEffort: true, wantEffort: ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			implementEnv(t, "kuhlman-labs/fishhawk", "main")
+
+			var fp upload.FetchedPrompt
+			raw := goldenReasoningEffortPromptJSON(t)
+			if tc.stripEffort {
+				var m map[string]json.RawMessage
+				if err := json.Unmarshal(raw, &m); err != nil {
+					t.Fatalf("decode golden: %v", err)
+				}
+				delete(m, "reasoning_effort")
+				delete(m, "reasoning_effort_source")
+				var err error
+				if raw, err = json.Marshal(m); err != nil {
+					t.Fatalf("re-marshal golden: %v", err)
+				}
+			}
+			if err := json.Unmarshal(raw, &fp); err != nil {
+				t.Fatalf("decode golden into FetchedPrompt: %v", err)
+			}
+			if fp.StageType != "implement" || fp.ImplementModel != "claude-opus-5-5" {
+				t.Fatalf("golden decoded to stage_type=%q implement_model=%q, want implement/claude-opus-5-5", fp.StageType, fp.ImplementModel)
+			}
+
+			var got agent.Invocation
+			var captured bool
+			capture := &fakeInvoker{
+				canned: agent.Result{OK: true},
+				onInvoke: func(_ int, inv agent.Invocation) {
+					got = inv
+					captured = true
+				},
+			}
+			wrong := &fakeInvoker{
+				canned: agent.Result{OK: true},
+				onInvoke: func(_ int, _ agent.Invocation) {
+					t.Errorf("the %s run reached the wrong agent seam", tc.agent)
+				},
+			}
+			origCodex := newCodexInvoker
+			t.Cleanup(func() { newCodexInvoker = origCodex })
+			if tc.agent == "codex" {
+				withFakeInvoker(t, wrong)
+				newCodexInvoker = func(_, _ string) agent.Invoker { return capture }
+			} else {
+				withFakeInvoker(t, capture)
+				newCodexInvoker = func(_, _ string) agent.Invoker { return wrong }
+			}
+
+			fu := newFakeUploader(t)
+			stageID := "22222222-3333-4444-5555-666666666666"
+			fp.StageID = stageID
+			fp.Prompt = "implement"
+			fp.PromptHash = "h"
+			fu.promptResp = &fp
+			withFakeUploader(t, fu)
+			withFakeGitOps(t, &fakePusher{}, &fakePROpener{})
+
+			var stderr strings.Builder
+			if code := run([]string{
+				"--run-id", "11111111-2222-3333-4444-555555555555",
+				"--backend-url", "https://api.fishhawk.test",
+				"--workflow", "feature_change", "--stage", "implement",
+				"--stage-id", stageID,
+				"--agent", tc.agent,
+				"--fetch-prompt",
+				"--upload-trace",
+			}, &stderr); code != exitOK {
+				t.Fatalf("run = %d, want exitOK:\n%s", code, stderr.String())
+			}
+			if !captured {
+				t.Fatalf("the %s invoker was never called", tc.agent)
+			}
+			if got.Model != "claude-opus-5-5" {
+				t.Errorf("inv.Model = %q, want claude-opus-5-5", got.Model)
+			}
+			if got.ReasoningEffort != tc.wantEffort {
+				t.Errorf("inv.ReasoningEffort = %q, want %q", got.ReasoningEffort, tc.wantEffort)
+			}
+		})
+	}
+}
