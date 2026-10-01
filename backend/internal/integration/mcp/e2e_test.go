@@ -13,8 +13,12 @@
 // dependency direction).
 //
 // Every top-level test in this package calls t.Parallel(): each owns its own
-// throwaway backend/Postgres/MCP-binary, so there is no shared state to race on
-// (#3881). A new test that needs t.Setenv / t.Chdir CANNOT call t.Parallel —
+// throwaway backend/Postgres, so there is no mutable shared state to race on
+// (#3881). The fishhawk-mcp binary is the one shared artifact — built ONCE per
+// test process (buildMCPBinary) and read-only once built, so sharing it is safe;
+// a per-fixture build under t.Parallel() overran its 60s deadline on CI's 4-vCPU
+// runner with a cold cache ("build fishhawk-mcp: signal: killed", #3881).
+// A new test that needs t.Setenv / t.Chdir CANNOT call t.Parallel —
 // Go panics ("test using t.Setenv or t.Chdir can not use t.Parallel") — so put
 // such a test in its own file WITHOUT t.Parallel rather than adding it here.
 package mcpe2e_test
@@ -27,6 +31,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -54,6 +59,7 @@ import (
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 )
 
 // e2eFixture wires every piece the cross-component loop needs.
@@ -145,23 +151,11 @@ func newFixture(t *testing.T) *e2eFixture {
 		t.Fatalf("Issue operator apitoken: %v", err)
 	}
 
-	// 5. Build the fishhawk-mcp binary into a temp dir. We use a
-	// real binary rather than `go run` so the MCP server's
-	// JSON-RPC stdout isn't contaminated by Go's build-progress
-	// chatter. Cold build is a few seconds; subsequent builds in
-	// the same test process hit the build cache.
-	binary := filepath.Join(t.TempDir(), mcpBinaryName())
-	buildCtx, buildCancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer buildCancel()
-	build := exec.CommandContext(buildCtx, "go", "build",
-		"-o", binary,
-		"github.com/kuhlman-labs/fishhawk/backend/cmd/fishhawk-mcp",
-	)
-	var buildErr bytes.Buffer
-	build.Stderr = &buildErr
-	if err := build.Run(); err != nil {
-		t.Fatalf("build fishhawk-mcp: %v\nstderr: %s", err, buildErr.String())
-	}
+	// 5. Build the fishhawk-mcp binary ONCE per test process (shared across
+	// every fixture) and hand this fixture that path. We use a real binary
+	// rather than `go run` so the MCP server's JSON-RPC stdout isn't
+	// contaminated by Go's build-progress chatter.
+	binary := buildMCPBinary(t)
 
 	return &e2eFixture{
 		url:          httpSrv.URL,
@@ -181,6 +175,68 @@ func mcpBinaryName() string {
 		return "fishhawk-mcp.exe"
 	}
 	return "fishhawk-mcp"
+}
+
+// The fishhawk-mcp binary is built ONCE per test process, not once per fixture.
+// Every top-level test runs t.Parallel() and each builds a fixture; a per-fixture
+// `go build` under a 60s deadline raced its parallel siblings and overran on CI's
+// 4-vCPU runner with a cold cache (`build fishhawk-mcp: signal: killed`, #3881).
+// The single build is guarded by sync.Once into a dir created once; the error is
+// cached too, so every caller after a failed build t.Fatalf's with the original
+// stderr rather than silently retrying. TestMain removes the dir after the suite.
+var (
+	mcpBuildOnce sync.Once
+	mcpBinaryDir string // os.MkdirTemp dir holding the built binary; "" if never built
+	mcpBinaryVal string // path to the built binary, set only on build success
+	mcpBuildErr  error  // cached build failure (wraps the go build stderr)
+)
+
+// buildMCPBinary builds the fishhawk-mcp binary once per process and returns the
+// shared path. Concurrent callers block on the single build via sync.Once; on
+// failure every caller t.Fatalf's with the cached original stderr.
+func buildMCPBinary(t *testing.T) string {
+	t.Helper()
+	mcpBuildOnce.Do(func() {
+		dir, err := os.MkdirTemp("", "fishhawk-mcp-e2e")
+		if err != nil {
+			mcpBuildErr = fmt.Errorf("mkdtemp for fishhawk-mcp binary: %w", err)
+			return
+		}
+		mcpBinaryDir = dir
+		binary := filepath.Join(dir, mcpBinaryName())
+		// A base of a few minutes, scaled by the repo's wall-clock rule
+		// (timescale.D, #1984), so the one cold build is never a race against
+		// parallel-sibling deadlines the way the old 60s per-fixture timeout was.
+		buildCtx, cancel := context.WithTimeout(context.Background(), timescale.D(3*time.Minute))
+		defer cancel()
+		build := exec.CommandContext(buildCtx, "go", "build",
+			"-o", binary,
+			"github.com/kuhlman-labs/fishhawk/backend/cmd/fishhawk-mcp",
+		)
+		var buildErr bytes.Buffer
+		build.Stderr = &buildErr
+		if err := build.Run(); err != nil {
+			mcpBuildErr = fmt.Errorf("build fishhawk-mcp: %w\nstderr: %s", err, buildErr.String())
+			return
+		}
+		mcpBinaryVal = binary
+	})
+	if mcpBuildErr != nil {
+		t.Fatalf("%v", mcpBuildErr)
+	}
+	return mcpBinaryVal
+}
+
+// TestMain removes the shared binary dir after the package's tests finish. The
+// dir is created lazily inside buildMCPBinary, so a run where no fixture built
+// (e.g. Docker unavailable and every test skipped) leaves mcpBinaryDir "" and
+// RemoveAll("") is a no-op.
+func TestMain(m *testing.M) {
+	code := m.Run()
+	if mcpBinaryDir != "" {
+		_ = os.RemoveAll(mcpBinaryDir)
+	}
+	os.Exit(code)
 }
 
 // fetchMCPToken reproduces runner/internal/upload.FetchMCPToken's
