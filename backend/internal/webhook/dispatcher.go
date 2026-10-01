@@ -1250,6 +1250,19 @@ type Dispatcher struct {
 	// resolver / approval repo aren't wired yet.
 	ApprovalHandler ApprovalCommandHandler
 
+	// DocumentBaseCommit captures the run-admission document base commit
+	// (E55.7 / #3746) stamped onto every ROOT run the dispatcher mints (the
+	// GitHub and GitLab CreateRun sites): the repository's default-branch head
+	// pinned to a lowercase 40-hex commit, which the run's run-admission
+	// document declarations are later resolved at. Children inherit it through
+	// run.ChildParamsFrom, so only the root seams call it. fishhawkd wires it
+	// to Server.CaptureDocumentBaseCommit after server.New, for the same reason
+	// as ApprovalHandler — the dispatcher is built before the Server exists.
+	// The hook never errors and returns nil on every capture degrade. Nil (no
+	// hook) records no commit: the row stays NULL and those documents are
+	// withheld with a named degradation rather than read at a mutable ref.
+	DocumentBaseCommit func(ctx context.Context, repo string) *string
+
 	// Scaffolder opens the App-PR onboarding scaffold when the App is
 	// installed on a repo or repos are added (ADR-048 / E29.7). Nil leaves
 	// the installation-scaffold path off — the event is acknowledged and
@@ -1610,6 +1623,10 @@ func (d *Dispatcher) Handle(ctx context.Context, ev Event) error {
 	// today, and leaving them NULL would keep a live trigger class on the
 	// spec-derived legacy path.
 	requiresCharter := spec.WorkflowRequiresCharter(workflow)
+	// The run-admission document base commit (E55.7 / #3746) — after the
+	// admission gates so a refused trigger costs no forge read. Nil on every
+	// degrade, never a refusal.
+	documentBaseCommit := d.captureDocumentBaseCommit(ctx, ev.Repo)
 	created, err := d.Runs.CreateRun(ctx, run.CreateRunParams{
 		Repo:                   ev.Repo,
 		WorkflowID:             m.WorkflowID,
@@ -1632,8 +1649,9 @@ func (d *Dispatcher) Handle(ctx context.Context, ev Event) error {
 		// mode (Phase C of E22 / #389) takes a different code
 		// path through handleCreateRun and stamps `local`
 		// itself.
-		RunnerKind:      run.RunnerKindGitHubActions,
-		RequiresCharter: &requiresCharter,
+		RunnerKind:         run.RunnerKindGitHubActions,
+		RequiresCharter:    &requiresCharter,
+		DocumentBaseCommit: documentBaseCommit,
 	})
 	if err != nil {
 		return fmt.Errorf("dispatcher: create run: %w", err)
@@ -1748,6 +1766,18 @@ func (d *Dispatcher) Handle(ctx context.Context, ev Event) error {
 		slog.String("stage_id", firstStage.ID.String()),
 	)
 	return nil
+}
+
+// captureDocumentBaseCommit returns the run-admission document base commit
+// for a root run the dispatcher is about to mint (E55.7 / #3746), or nil when
+// no hook is wired. The hook owns every degrade (it never errors and returns
+// nil on failure), so this adds no fallback of its own: a nil result records
+// NULL, never a guessed ref.
+func (d *Dispatcher) captureDocumentBaseCommit(ctx context.Context, repo string) *string {
+	if d.DocumentBaseCommit == nil {
+		return nil
+	}
+	return d.DocumentBaseCommit(ctx, repo)
 }
 
 // findParentRunID returns the most-recent non-terminal run for

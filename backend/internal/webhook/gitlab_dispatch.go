@@ -429,6 +429,9 @@ func (d *Dispatcher) handleGitLabCreateRun(ctx context.Context, ev Event, m Matc
 	// Persisted grooming determination (E54.13 / #2806) — a stamp, not a
 	// gate; see the GitHub dispatcher's twin for the rationale.
 	requiresCharter := spec.WorkflowRequiresCharter(workflow)
+	// Run-admission document base commit (E55.7 / #3746) — see the GitHub
+	// dispatcher's twin.
+	documentBaseCommit := d.captureDocumentBaseCommit(ctx, ev.Repo)
 	created, err := d.Runs.CreateRun(ctx, run.CreateRunParams{
 		Repo:               ev.Repo,
 		WorkflowID:         m.WorkflowID,
@@ -446,6 +449,7 @@ func (d *Dispatcher) handleGitLabCreateRun(ctx context.Context, ev Event, m Matc
 		RunnerKind:             run.RunnerKindGitLabCI,
 		RequiresCharter:        &requiresCharter,
 		RequiredChecksSnapshot: snapshot,
+		DocumentBaseCommit:     documentBaseCommit,
 	})
 	if err != nil {
 		return fmt.Errorf("dispatcher: create gitlab run: %w", err)
