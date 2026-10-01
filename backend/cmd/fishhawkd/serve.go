@@ -2430,11 +2430,16 @@ func runServe(args []string, logSink io.Writer) int {
 		// Consequences name: every crew-message endpoint then answers 503
 		// crew_message_unconfigured and no other surface changes.
 		cfg.CrewMailbox = crewmessage.NewMailbox(pool, crewmessage.DefaultRoundBound)
-		// The E77.5 / #3739 consult responder registry: deliberately EMPTY, so
-		// every response_required consult fails the send 422
-		// crew_responder_unavailable. E77.8 (#3742) registers the first
-		// responder (the deterministic historian); ADR-081 rule 8 sequences it.
-		crewResponders, err := server.NewCrewResponderRegistry(nil)
+		// The E77.5 / #3739 consult responder registry, carrying the E77.8
+		// (#3742) historian — the FIRST and ONLY registered responder
+		// (ADR-081 rule 8). It reads the SAME decision index the indexing
+		// audit decorator writes through, so a consult sees the rows the live
+		// writer just wrote. Dropping this ONE call (restoring
+		// NewCrewResponderRegistry(nil)) is the partial rollback: every
+		// response_required consult then fails the send 422
+		// crew_responder_unavailable, the exact pre-#3742 behaviour, with no
+		// other surface affected.
+		crewResponders, err := crewResponderRegistry(decisionindex.NewStore(pool))
 		if err != nil {
 			logger.Error("crew responder registry refused startup", slog.String("error", err.Error()))
 			return exitFailure
@@ -4519,4 +4524,27 @@ func closePushDispatcher(d *pushnotify.Dispatcher, timeout time.Duration, logger
 		logger.Warn("push notification drain did not finish before the shutdown deadline",
 			slog.String("error", err.Error()), slog.Int64("abandoned_deliveries", d.Abandoned()))
 	}
+}
+
+// crewResponderRegistry builds the production crew-consult responder registry
+// (E77.8 / #3742): the deterministic historian under crewmessage.RoleHistorian
+// and NOTHING else. Extracted as a package helper so the SHIPPED wiring is
+// pinned behaviourally by TestCrewResponderRegistry_RegistersHistorian — a
+// config-shaped change the scope-completeness gate cannot decide, and one a
+// comment-only touch of this file would otherwise satisfy.
+//
+// A nil index is REFUSED rather than silently registering nothing: the caller
+// would then start with an empty registry that looks wired, and every consult
+// would answer 422 with no operator signal that the index was missing.
+func crewResponderRegistry(index *decisionindex.Store) (server.CrewResponderRegistry, error) {
+	if index == nil {
+		return server.CrewResponderRegistry{}, errors.New("crew responder registry: the decision index is required to register the historian responder")
+	}
+	historian, err := server.NewHistorianResponder(index)
+	if err != nil {
+		return server.CrewResponderRegistry{}, err
+	}
+	return server.NewCrewResponderRegistry(map[crewmessage.Role]server.CrewResponder{
+		crewmessage.RoleHistorian: historian,
+	})
 }

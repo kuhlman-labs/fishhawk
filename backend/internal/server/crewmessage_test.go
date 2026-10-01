@@ -648,3 +648,43 @@ func TestCrewMessageResponse_WorkItemMembersOmitted(t *testing.T) {
 		}
 	}
 }
+
+// --- E77.8 (#3742): the consult's account scope is part of the request -----
+
+// withCorruptAccount injects a run-bound identity whose workspace account id
+// is NOT a UUID — the corrupted-sessions-invariant state.
+func withCorruptAccount(runID uuid.UUID, account string) func(*http.Request) *http.Request {
+	return func(r *http.Request) *http.Request {
+		r = withRunBoundIdentity(r, runID, "mcp:read", scopeWriteMessages)
+		id := IdentityFrom(r.Context())
+		id.AccountID = account
+		return injectIdentity(r, id)
+	}
+}
+
+// TestCrewMessageAPI_ConsultRefusesCorruptedAccountID is the counterfactual
+// vehicle for the send path's fail-closed account resolve (E77.8 / #3742): a
+// responder reads the decision index under CrewConsultRequest.AccountID, so
+// silently degrading an undecodable account id to nil would WIDEN the read to
+// every untenanted row.
+//
+// The two arms differ ONLY in the account value (same run, same body, same
+// empty registry), so the 500 is attributable to the guard and not to a
+// second difference: deleting the guard makes the corrupted arm fall through
+// to the same 422 the valid arm answers.
+func TestCrewMessageAPI_ConsultRefusesCorruptedAccountID(t *testing.T) {
+	s, planRun, _ := crewNoDBServer(t)
+	body := `{"schema_version":"crew-message-v1","type":"consult","recipient_role":"historian","anchor":` +
+		runAnchor(planRun.ID) + `,"payload":` + crewConsultPayload + `,"response_required":true}`
+	send := func(account string) *httptest.ResponseRecorder {
+		return crewCall(t, s.handleSendCrewMessage, http.MethodPost, "/v0/crew-messages", "", body,
+			withCorruptAccount(planRun.ID, account))
+	}
+	requireCrewRefusal(t, send("not-a-uuid"), http.StatusInternalServerError, "internal_error")
+	// The control: a WELL-FORMED account on the same fixture is not refused by
+	// this guard — it reaches the (empty) responder registry instead.
+	requireCrewRefusal(t, send(uuid.NewString()), http.StatusUnprocessableEntity, "crew_responder_unavailable")
+	// And an ABSENT account is legal (the untenanted posture), also reaching
+	// the registry.
+	requireCrewRefusal(t, send(""), http.StatusUnprocessableEntity, "crew_responder_unavailable")
+}

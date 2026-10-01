@@ -601,3 +601,40 @@ func TestGetGateView_PrecedentOmittedLeavesMirrorNil(t *testing.T) {
 		t.Errorf("precedent = %+v, want nil when the backend omits it", decoded.GateView.Precedent)
 	}
 }
+
+// TestGetGateView_ConsultsPassThrough (E77.8 / #3742): the consults block
+// survives the MCP seam intact — the tool applies no compaction lever to it,
+// so the captain reads the same cited entry ids the backend reported.
+func TestGetGateView_ConsultsPassThrough(t *testing.T) {
+	runID := uuid.New()
+	raw := json.RawMessage(`{"run_id":"` + runID.String() + `","open":[],"settled":[],` +
+		`"suppressed_relitigations":[],"history_incomplete":false,"consults":[` +
+		`{"sent_sequence":77,"stage_kind":"plan","sender_role":"planner","recipient_role":"historian",` +
+		`"state":"accepted","answered":true,"question":"has this been decided?",` +
+		`"answer_summary":"Prior decisions in x/y: plan_approval 1","cited_entry_refs":["audit_entry:9"],` +
+		`"asked_at":"2026-09-30T12:00:00Z"}]}`)
+	srv, _ := newGateViewBackend(t, http.StatusOK, raw)
+
+	res := callGateView(t, srv, map[string]any{"run_id": runID.String()})
+	if res.IsError {
+		t.Fatalf("CallTool returned IsError; content: %+v", res.Content)
+	}
+	out, _ := json.Marshal(res.StructuredContent)
+	var decoded GetGateViewOutput
+	if uerr := json.Unmarshal(out, &decoded); uerr != nil {
+		t.Fatalf("decode GetGateViewOutput: %v", uerr)
+	}
+	cs := decoded.GateView.Consults
+	if len(cs) != 1 {
+		t.Fatalf("consults = %+v, want one through the seam (json tag mismatch?)", cs)
+	}
+	if cs[0].SentSequence != 77 || cs[0].RecipientRole != "historian" || !cs[0].Answered {
+		t.Errorf("consult = %+v, want the historian consult intact", cs[0])
+	}
+	if len(cs[0].CitedEntryRefs) != 1 || cs[0].CitedEntryRefs[0] != "audit_entry:9" {
+		t.Errorf("cited_entry_refs = %v, want the backend's list verbatim", cs[0].CitedEntryRefs)
+	}
+	if cs[0].Question != "has this been decided?" {
+		t.Errorf("question = %q, want it uncompacted", cs[0].Question)
+	}
+}

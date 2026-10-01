@@ -1737,3 +1737,49 @@ func TestGateView_CrewReadFailureRecordsGap(t *testing.T) {
 		requireGap(t, decodeGateView(t, getGateView(t, crewGateServer(f, f.audit), runID, "")))
 	})
 }
+
+// --- E77.8 (#3742): the crew-consult block ---------------------------------
+
+// TestGateView_ConsultsDegradeVisibly is the counterfactual vehicle for the
+// consults block's fail-visible branch: the crew_message_sent read fails, and
+// the response must carry history_incomplete + the NAMED gap with the block
+// EMPTY rather than partially built. Deleting the gap record leaves
+// history_incomplete false and the operator reads "this run asked nothing".
+//
+// Only the crew_message_sent category is failed, so every other history join
+// still builds and the degradation is attributable to this read.
+func TestGateView_ConsultsDegradeVisibly(t *testing.T) {
+	s, repo, au, _ := gateViewServer(t)
+	runID := seedGateRun(t, repo)
+	au.listByCategoryErr = errors.New("injected crew read failure")
+	au.listByCategoryErrCategory = "crew_message_sent"
+
+	resp := decodeGateView(t, getGateView(t, s, runID, ""))
+	if !resp.HistoryIncomplete {
+		t.Fatal("history_incomplete = false after the crew-consult read failed")
+	}
+	if !slices.Contains(resp.HistoryGaps, "crew_consults") {
+		t.Fatalf("history_gaps = %v, want it to name crew_consults", resp.HistoryGaps)
+	}
+	if resp.Consults == nil || len(resp.Consults) != 0 {
+		t.Fatalf("consults = %+v, want an EMPTY array (never nil, never partial)", resp.Consults)
+	}
+}
+
+// The healthy control: no consults on the run yields an EMPTY array, NO gap
+// and history_incomplete false — so the degradation above is not what a quiet
+// run looks like.
+func TestGateView_ConsultsEmptyWithoutGap(t *testing.T) {
+	s, repo, _, _ := gateViewServer(t)
+	runID := seedGateRun(t, repo)
+	resp := decodeGateView(t, getGateView(t, s, runID, ""))
+	if resp.Consults == nil {
+		t.Fatal("consults is nil; the block is always present (the SuppressedRelitigations posture)")
+	}
+	if len(resp.Consults) != 0 {
+		t.Fatalf("consults = %+v, want empty", resp.Consults)
+	}
+	if slices.Contains(resp.HistoryGaps, "crew_consults") {
+		t.Fatalf("a quiet run recorded a crew_consults gap: %v", resp.HistoryGaps)
+	}
+}

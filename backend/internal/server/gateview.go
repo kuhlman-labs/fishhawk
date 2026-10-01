@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"sort"
 	"strings"
@@ -106,6 +107,14 @@ type gateViewResponse struct {
 	// with a crew_messages history_gaps entry when the read fails, so a partial
 	// read is never rendered as absence.
 	CrewMessages []gateViewCrewMessage `json:"crew_messages,omitempty"`
+	// Consults is the run's crew consults (E77.8 / #3742, ADR-081 #3727):
+	// what a plan or review stage ASKED another crew role and what came back.
+	// ALWAYS PRESENT — an empty array when the run sent none, the
+	// SuppressedRelitigations posture, so an absent block is never confused
+	// with "asked nothing". A read failure yields an EMPTY array plus a
+	// history_gaps entry and history_incomplete, never a partially-built
+	// block and never a failed request.
+	Consults []gateViewConsult `json:"consults"`
 }
 
 // gateViewCrewMessage is one gate-view crew entry: contract-closed metadata
@@ -127,6 +136,39 @@ type gateViewCrewMessage struct {
 
 // gateViewGapCrewMessages is the history_gaps entry the crew block records.
 const gateViewGapCrewMessages = "crew_messages"
+
+// gateViewConsult is one crew consult this run sent, joined to its answer.
+// The question and answer are agent-authored prose and are EXCERPTED
+// (gateViewConsultTextCap); the full text stays on the chain and in the
+// crew-message read.
+type gateViewConsult struct {
+	SentSequence  int64  `json:"sent_sequence"`
+	StageID       string `json:"stage_id,omitempty"`
+	StageKind     string `json:"stage_kind,omitempty"`
+	SenderRole    string `json:"sender_role"`
+	RecipientRole string `json:"recipient_role"`
+	// State is the derived crew_messages row state (open | accepted |
+	// rejected | expired).
+	State string `json:"state"`
+	// Answered is true when a threaded reply exists for the consult.
+	Answered bool `json:"answered"`
+	// Question is the consult's `payload.question`, excerpted.
+	Question string `json:"question,omitempty"`
+	// AnswerSummary is the answer document's `payload.summary`, excerpted.
+	AnswerSummary string `json:"answer_summary,omitempty"`
+	// CitedEntryRefs are the answer's evidence references, rendered
+	// "<kind>:<ref>" — for the historian, the audit sequences of the prior
+	// decisions it cited.
+	CitedEntryRefs []string `json:"cited_entry_refs,omitempty"`
+	AskedAt        string   `json:"asked_at,omitempty"`
+}
+
+// gateViewConsultTextCap bounds ONE excerpted consult prose field.
+const gateViewConsultTextCap = 400
+
+// gateViewGapCrewConsults is the history_gaps entry the consults block records
+// when any of its reads fails.
+const gateViewGapCrewConsults = "crew_consults"
 
 // gateViewCaptain is the gate-view captain block (E76.3 / #3766).
 type gateViewCaptain struct {
@@ -609,6 +651,7 @@ func (s *Server) buildGateView(ctx context.Context, runID uuid.UUID, stageKind s
 		Open:                    []gateViewConcern{},
 		Settled:                 []gateViewSettledConcern{},
 		SuppressedRelitigations: []gateViewSuppressedRelitig{},
+		Consults:                []gateViewConsult{},
 	}
 
 	// Fetch the audit history, category by category, so a single-category read
@@ -652,7 +695,152 @@ func (s *Server) buildGateView(ctx context.Context, runID uuid.UUID, stageKind s
 	// gate view answers "did the open review judge the tree the PR carries" in
 	// the one call. Omitted (nil) when no un-superseded mismatch was recorded.
 	resp.ReviewHeadMismatch = s.reviewHeadMismatchForRun(ctx, runID)
+	// Crew-consult surface (E77.8 / #3742): what this run ASKED and what came
+	// back, so the captain reads the consult beside the gate it shaped. Reads
+	// only existing chain and derived rows; degrades to an empty array plus a
+	// history_gaps entry.
+	resp.Consults = s.gateViewConsultsForRun(ctx, runID, stageKind, &resp)
 	return resp
+}
+
+// gateViewConsultsForRun builds the consults block (E77.8 / #3742).
+//
+// SELECTION mirrors crewConsultBudgetUsed and resolveAnsweredCrewConsults
+// exactly — a crew_message_sent chain entry stamped with a stage id, with
+// thread_root_sequence nil, type `consult` and response_required true — so the
+// three surfaces can never disagree about what a consult is. Unlike the prompt
+// fold, an OPEN or EXPIRED consult is included: the captain's question is "what
+// did this run ask", and an expiry is part of that answer.
+//
+// DEGRADATION IS VISIBLE AND WHOLESALE. Any read failure records the
+// gateViewGapCrewConsults gap, sets history_incomplete and returns an EMPTY
+// array — never a partially-built block, whose silence would read as "asked
+// nothing". An UNCONFIGURED AUDIT REPOSITORY is not a failure: there is no
+// chain to read consults from, so the surface simply does not exist and the
+// pre-E77.8 response is returned byte-for-byte. An unconfigured MAILBOX is
+// different, and only reachable once the chain already records consults: the
+// questions exist and their state cannot be read, which IS a gap.
+func (s *Server) gateViewConsultsForRun(ctx context.Context, runID uuid.UUID, stageKind string, resp *gateViewResponse) []gateViewConsult {
+	empty := []gateViewConsult{}
+	if s.cfg.AuditRepo == nil {
+		return empty
+	}
+	gap := func(what string, err error) []gateViewConsult {
+		s.cfg.Logger.Warn("gate-view: "+what+"; omitting consults block",
+			"run_id", runID.String(), "error", err.Error())
+		resp.HistoryIncomplete = true
+		resp.HistoryGaps = append(resp.HistoryGaps, gateViewGapCrewConsults)
+		return empty
+	}
+	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, crewmessage.CategorySent)
+	if err != nil {
+		return gap("list crew_message_sent failed", err)
+	}
+	type root struct {
+		seq     int64
+		stageID *uuid.UUID
+		askedAt time.Time
+	}
+	var roots []root
+	for _, e := range entries {
+		if e.StageID == nil {
+			continue
+		}
+		var p struct {
+			Message struct {
+				Type             crewmessage.MessageType `json:"type"`
+				ResponseRequired bool                    `json:"response_required"`
+			} `json:"message"`
+			ThreadRootSequence *int64 `json:"thread_root_sequence"`
+		}
+		if uerr := json.Unmarshal(e.Payload, &p); uerr != nil {
+			continue
+		}
+		if p.ThreadRootSequence == nil && p.Message.Type == crewmessage.TypeConsult && p.Message.ResponseRequired {
+			roots = append(roots, root{seq: e.Sequence, stageID: e.StageID, askedAt: e.Timestamp})
+		}
+	}
+	if len(roots) == 0 {
+		return empty
+	}
+	if s.cfg.CrewMailbox == nil {
+		return gap("crew mailbox is unconfigured while the chain records consults",
+			errors.New("crew_message_unconfigured"))
+	}
+	rows, err := s.cfg.CrewMailbox.Store().ListByAnchor(ctx, crewmessage.AnchorFilter{RunID: &runID})
+	if err != nil {
+		return gap("list crew messages failed", err)
+	}
+	bySeq := make(map[int64]crewmessage.Row, len(rows))
+	for _, r := range rows {
+		bySeq[r.SentSequence] = r
+	}
+	// Stage kinds come from the run's own stage rows, so the stage_kind filter
+	// keys on the CONSULT's stage rather than on the gate being read.
+	kinds := map[uuid.UUID]string{}
+	if s.cfg.RunRepo != nil {
+		stages, serr := s.cfg.RunRepo.ListStagesForRun(ctx, runID)
+		if serr != nil {
+			return gap("list stages failed", serr)
+		}
+		for _, st := range stages {
+			kinds[st.ID] = string(st.Type)
+		}
+	}
+	out := make([]gateViewConsult, 0, len(roots))
+	for _, rt := range roots {
+		row, ok := bySeq[rt.seq]
+		if !ok {
+			return gap("crew consult has no derived row",
+				fmt.Errorf("sent_sequence %d", rt.seq))
+		}
+		kind := ""
+		if rt.stageID != nil {
+			kind = kinds[*rt.stageID]
+		}
+		if stageKind != "" && kind != stageKind {
+			continue
+		}
+		question, qerr := s.crewSentDocument(ctx, row)
+		if qerr != nil {
+			return gap("resolve crew consult document failed", qerr)
+		}
+		c := gateViewConsult{
+			SentSequence:   rt.seq,
+			StageKind:      kind,
+			SenderRole:     string(question.SenderRole),
+			RecipientRole:  string(question.RecipientRole),
+			State:          string(row.State),
+			Question:       gateViewExcerpt(question.Payload.Question),
+			CitedEntryRefs: []string{},
+			AskedAt:        rt.askedAt.UTC().Format(time.RFC3339),
+		}
+		if rt.stageID != nil {
+			c.StageID = rt.stageID.String()
+		}
+		for i := range rows {
+			if rows[i].ThreadRootSequence == row.ThreadRootSequence && rows[i].SentSequence > row.SentSequence {
+				answer, aerr := s.crewSentDocument(ctx, rows[i])
+				if aerr != nil {
+					return gap("resolve crew consult answer failed", aerr)
+				}
+				c.Answered = true
+				c.AnswerSummary = gateViewExcerpt(answer.Payload.Summary)
+				for _, ev := range answer.Evidence {
+					c.CitedEntryRefs = append(c.CitedEntryRefs, string(ev.Kind)+":"+ev.Ref)
+				}
+				break
+			}
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
+// gateViewExcerpt caps one agent-authored prose field for the consults block.
+func gateViewExcerpt(s string) string {
+	out, _ := prompt.CapText(s, gateViewConsultTextCap)
+	return out
 }
 
 // reviewHeadMismatchForRun distills the newest review_head_mismatch audit entry

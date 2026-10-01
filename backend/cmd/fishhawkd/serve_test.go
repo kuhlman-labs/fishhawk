@@ -38,6 +38,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/claudecode"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/codex"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/crewmessage"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/decisionindex"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	forgegitlab "github.com/kuhlman-labs/fishhawk/backend/internal/forge/gitlab"
@@ -6014,4 +6015,33 @@ func (ignoringSink) Name() string { return "webhook" }
 func (s ignoringSink) Deliver(context.Context, pushnotify.Event) error {
 	<-s.release
 	return nil
+}
+
+// TestCrewResponderRegistry_RegistersHistorian is the DONE-MEANS test for the
+// E77.8 (#3742) wiring: a config-shaped change the scope-completeness gate
+// cannot decide, and one a comment-only touch of serve.go would otherwise
+// satisfy. It asserts the SHIPPED registry resolves `historian` and NOTHING
+// else — returning the pre-change empty registry fails it.
+func TestCrewResponderRegistry_RegistersHistorian(t *testing.T) {
+	reg, err := crewResponderRegistry(decisionindex.NewStore(nil))
+	if err != nil {
+		t.Fatalf("crewResponderRegistry: %v", err)
+	}
+	got, ok := reg.Lookup(crewmessage.RoleHistorian)
+	if !ok || got == nil {
+		t.Fatal("the shipped registry does not resolve the historian responder")
+	}
+	for _, role := range []crewmessage.Role{
+		crewmessage.RolePlanner, crewmessage.RoleArchitect,
+		crewmessage.RoleSecurity, crewmessage.RoleReviewer,
+	} {
+		if _, found := reg.Lookup(role); found {
+			t.Fatalf("the shipped registry resolves %q; the historian is the ONLY registered responder (ADR-081 rule 8)", role)
+		}
+	}
+	// A nil index is refused rather than silently yielding a registry that
+	// looks wired and answers 422 for every consult.
+	if _, err := crewResponderRegistry(nil); err == nil {
+		t.Fatal("crewResponderRegistry(nil) returned no error")
+	}
 }

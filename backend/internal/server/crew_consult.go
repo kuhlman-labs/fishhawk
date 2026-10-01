@@ -68,9 +68,28 @@ func crewConsultActor(role crewmessage.Role) crewmessage.Actor {
 // field is untrusted agent-authored prose; a model-backed responder must
 // quarantine it exactly as the prompt package does.
 type CrewConsultRequest struct {
-	SentSequence  int64
-	RunID         uuid.UUID
-	StageID       uuid.UUID
+	SentSequence int64
+	RunID        uuid.UUID
+	StageID      uuid.UUID
+	// AccountID is the workspace account the consult was sent under, and it is
+	// part of the REFERENCE a responder reads with — not a later check.
+	// decisionindex.GateRef documents the same rule for a run read: carrying
+	// the account INTO the read narrows it by construction, so a responder
+	// that queries the decision index cannot resolve a run or a row set
+	// belonging to another tenant even if it forgets to check.
+	//
+	// NIL means the sender's identity carries no workspace account. Paired
+	// with decisionindex.ListFilter.AccountScoped that matches ONLY untenanted
+	// rows — deliberately the stricter reading, the one GateRef already
+	// applies, never nil-matches-all.
+	//
+	// Populated by the send path from the caller's identity with the SAME
+	// fail-closed rule callerAccountUUID applies: a non-empty account id that
+	// is not a UUID is a corrupted sessions invariant and refuses the send
+	// rather than widening the read. A responder must NOT reach into ctx for
+	// identity — the explicit field is what makes it unit-testable and its
+	// scope auditable.
+	AccountID     *uuid.UUID
 	SenderRole    crewmessage.Role
 	RecipientRole crewmessage.Role
 	Anchor        crewmessage.Anchor
@@ -100,15 +119,18 @@ type CrewConsultAnswer struct {
 // Respond that blocks past ctx.Done() keeps one goroutine alive until it
 // returns — tracked by s.bgReviews so Shutdown's bounded drain accounts for
 // it (E77.14 / #3876), but nothing in this package can make a wedged
-// responder return. E77.8's (#3742) model-backed responder is the first
-// implementation obliged to bound its upstream call by the passed ctx.
+// responder return. The E77.8 (#3742) historian is the first implementation
+// bound by it: it is DETERMINISTIC (no model call), so what it must honour is
+// its decision-index reads, and it passes ctx to every one of them.
 type CrewResponder interface {
 	Respond(ctx context.Context, req CrewConsultRequest) (CrewConsultAnswer, error)
 }
 
 // CrewResponderRegistry is the CLOSED role -> responder map. The zero value is
-// the empty registry (every Lookup misses), which is the E77.5 production
-// value: no responder is registered until E77.8 wires the historian.
+// the empty registry (every Lookup misses) — the pre-E77.8 production value,
+// and still the value under which every consult answers 422
+// crew_responder_unavailable. Production now wires the historian and nothing
+// else (E77.8 / #3742, serve.go's crewResponderRegistry).
 type CrewResponderRegistry struct {
 	responders map[crewmessage.Role]CrewResponder
 }

@@ -140,8 +140,37 @@ over them would re-record an unchanged precedent on every chain-read hiccup. The
 other excluded `Item` fields are pure functions of the cited row, which the entry
 hash already pins. Pinned by the four `TestFingerprint_*` tests.
 
+## The one sanctioned agent-facing consumer
+
+ADR-082 ([#3728](https://github.com/kuhlman-labs/fishhawk/issues/3728)) rule 6
+makes precedent **captain-facing in alpha**: it does not go to reviewer or
+planner prompts. Decision (e) option 3 carves out exactly ONE exception —
+agents, later, **only through ADR-081 consults, structured fields only** — and
+ADR-081 ([#3727](https://github.com/kuhlman-labs/fishhawk/issues/3727)) rule 8
+sequences it.
+
+That exception is `backend/internal/server/crew_historian.go` (E77.8 /
+[#3742](https://github.com/kuhlman-labs/fishhawk/issues/3742)), and it is the
+only one. It ranks with this package and renders through an explicit allow-list
+projection (`projectHistorianItem` → `historianItem`) that carries class,
+outcome, reject class, decided date, delegated, actor kind, doctrine version,
+concern category, severity, capped matched keys, the score total and the
+`(source_sequence, source_entry_hash)` citation — **and no free-text prose from
+another run**. `Item.ReasonExcerpt` and `Item.ReasonKey` are deliberately NOT
+projected, and the responder holds no audit repository, so it cannot read the
+chain the excerpt comes from in the first place.
+
+**What that means when this package changes.** A new `Item` field is NOT
+automatically agent-visible: it reaches a planner only by being named in that
+projection, and `TestProjectHistorianItem_FieldSetIsClosed` fails when the
+projected set drifts. If you add a PROSE field here, leave it out of the
+projection — adding it would carry another run's reasoning into a planner's
+prompt, which is exactly what rule 6 protects against and what decision (e)
+narrowed the exception to avoid.
+
 ## Issue history
 
+- #3742 (E77.8) — the historian consult responder, the one sanctioned agent-facing consumer.
 - #3732 (E75.4) — `IndexVersion` + `Fingerprint` for the gate-open precedent block.
 - #3731 (E75.3) — this package, the REST route and the MCP tool.
 - #3730 (E75.2) — `decision_index`, the rows this ranks.

@@ -18333,3 +18333,84 @@ func TestBuildImplement_NeverRendersCrewEscalationRuling(t *testing.T) {
 		t.Error("the implement fix-up render carries the plan-only captain's-ruling section")
 	}
 }
+
+// consultChannelHistorianPhrases are the E77.8 (#3742) sentences the consult
+// section gains: WHEN to ask the historian, HOW to name paths (and that they
+// carry no authority), what the answer does and does NOT contain, and the
+// obligation to record the consult in risks_and_assumptions.
+var consultChannelHistorianPhrases = []string{
+	"The `historian` role is available and answers DETERMINISTICALLY",
+	"has a decision already been made about this?",
+	"NAME the repo-relative paths your approach touches in `payload.context`",
+	"a path written in prose carries NO AUTHORITY",
+	"ONLY to RANK prior decisions",
+	"STRUCTURED FIELDS ONLY",
+	"NO reason prose from another run",
+	"do NOT infer a rationale you were not given",
+	"silence about anything else is a narrowing",
+	"record it in `risks_and_assumptions`",
+}
+
+// TestBuild_Plan_ConsultChannelNamesHistorian pins the E77.8 (#3742) guidance
+// on the PLAN prompt, anchored on the same consultChannelHeading the E77.5
+// presence test uses so the two cannot drift.
+func TestBuild_Plan_ConsultChannelNamesHistorian(t *testing.T) {
+	got, err := Build("plan", crewTrigger(CrewMessage{
+		Type: "consult", SenderRole: "planner", AnchorRef: "run_id r",
+		MessageText: "question: whatever",
+	}))
+	if err != nil {
+		t.Fatalf("Build(plan): %v", err)
+	}
+	if !strings.Contains(got, consultChannelHeading) {
+		t.Fatal("the plan prompt carries no consult section; the assertions below would be vacuous")
+	}
+	for _, want := range consultChannelHistorianPhrases {
+		if !strings.Contains(got, want) {
+			t.Errorf("plan prompt consult section is missing the historian guidance %q", want)
+		}
+	}
+	// TRUSTED text: it must sit OUTSIDE every crew envelope span.
+	iHistorian := strings.Index(got, consultChannelHistorianPhrases[0])
+	for _, sp := range crewSpans(t, got) {
+		if iHistorian >= sp[0] && iHistorian < sp[1] {
+			t.Errorf("the historian guidance at %d landed inside a crew envelope span %v", iHistorian, sp)
+		}
+	}
+}
+
+// TestBuild_NonPlanStages_OmitHistorianGuidance re-asserts the absence half
+// for every render that must NOT carry the consult section: the historian
+// guidance is part of that section, so it follows it exactly.
+func TestBuild_NonPlanStages_OmitHistorianGuidance(t *testing.T) {
+	const probe = "CONSULT_HISTORIAN_PROBE_77E8"
+	tr := crewTrigger(CrewMessage{
+		Type: "notice", SenderRole: "historian", AnchorRef: "run_id r",
+		MessageText: "summary: " + probe,
+	})
+	for _, stage := range []string{"implement", "plan_review", "implement_review"} {
+		t.Run(stage, func(t *testing.T) {
+			got, err := Build(stage, tr)
+			if err != nil {
+				t.Fatalf("Build(%s): %v", stage, err)
+			}
+			for _, forbidden := range consultChannelHistorianPhrases {
+				if strings.Contains(got, forbidden) {
+					t.Errorf("%s: carries the historian consult guidance %q", stage, forbidden)
+				}
+			}
+		})
+	}
+	// And the fix-up render, which takes the implement path with concerns.
+	fixup := tr
+	fixup.FixupConcerns = []FixupConcern{{Text: "[high] resolve the missing authz check"}}
+	got, err := Build("implement", fixup)
+	if err != nil {
+		t.Fatalf("Build(implement fixup): %v", err)
+	}
+	for _, forbidden := range consultChannelHistorianPhrases {
+		if strings.Contains(got, forbidden) {
+			t.Errorf("implement fixup: carries the historian consult guidance %q", forbidden)
+		}
+	}
+}

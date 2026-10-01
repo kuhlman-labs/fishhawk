@@ -2375,7 +2375,8 @@ components:
             is true. The captain block adds `captain_record` (the captain read
             failed) or `approval_submitted` (the run's approvals could not be
             read) when it is omitted for that reason; the crew block adds
-            `crew_messages` when the crew-message read failed.
+            `crew_messages` when the crew-message read failed, and the consults
+            block adds `crew_consults` when any of its reads failed.
         live_validation:
           $ref: '#/components/schemas/LiveValidation'
         review_diff_truncated:
@@ -2402,6 +2403,16 @@ components:
             un-gated read path into crew text (ARCHITECTURE.md §6 invariant
             #8). Absent when no crew mailbox is wired; absent with a
             `crew_messages` `history_gaps` entry when the read fails.
+        consults:
+          type: array
+          items: { $ref: '#/components/schemas/GateViewConsult' }
+          description: |
+            The crew consults this run's plan or review stages SENT (E77.8 /
+            #3742, ADR-081). ALWAYS PRESENT — an empty array when the run sent
+            none, so an absent block is never confused with "asked nothing". A
+            read failure yields an EMPTY array plus a `crew_consults`
+            `history_gaps` entry and `history_incomplete=true`, never a
+            partially-built block.
 
     GateViewCrewMessage:
       type: object
@@ -2426,6 +2437,52 @@ components:
             `prompt.RenderCrewMessages` over this one message — the same bytes
             `GET /v0/crew-messages/{sequence}` returns, inside the
             `<<<BEGIN UNTRUSTED CREW MESSAGE>>>` envelope.
+
+    GateViewConsult:
+      type: object
+      description: |
+        One crew consult joined to its answer (E77.8 / #3742). `question` and
+        `answer_summary` are EXCERPTS of agent-authored prose; the full text
+        stays on the audit chain and in `GET /v0/crew-messages/{sequence}`. An
+        `expired` state means no answer arrived in time — never that the
+        consulted role refused. A `historian` answer carries STRUCTURED FIELDS
+        ONLY and no reason prose from another run (ADR-082 decision (e)).
+      required: [sent_sequence, sender_role, recipient_role, state, answered]
+      properties:
+        sent_sequence:
+          type: integer
+          format: int64
+          description: Audit sequence of the `crew_message_sent` entry that asked.
+        stage_id:
+          $ref: '#/components/schemas/UUID'
+        stage_kind:
+          type: string
+          description: The consulting stage's kind; the `stage_kind` filter matches on this.
+        sender_role:
+          type: string
+        recipient_role:
+          type: string
+        state:
+          type: string
+          enum: [open, accepted, rejected, expired]
+        answered:
+          type: boolean
+          description: True when a threaded answer exists for the consult.
+        question:
+          type: string
+          description: Excerpt of the consult's question prose.
+        answer_summary:
+          type: string
+          description: Excerpt of the answer's summary.
+        cited_entry_refs:
+          type: array
+          items: { type: string }
+          description: |
+            The answer's evidence references rendered `<kind>:<ref>` — for the
+            historian, the audit sequences of the prior decisions it cited.
+        asked_at:
+          type: string
+          format: date-time
 
     GateViewCaptain:
       type: object

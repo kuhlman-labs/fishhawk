@@ -1,0 +1,14 @@
+id: scenario:issue-3742/plan-prompt-names-historian-consult
+statement: A plan stage's rendered prompt tells the planner that the historian is consultable, when to ask (before committing to an approach touching paths with prior rejections or waivers), that repo-relative paths go in the consult's context field and carry no authority, that the answer is structured fields only with no reason prose from another run, and that the consult and its cited entry ids must be recorded in risks_and_assumptions.
+verify_hint: 'GET /v0/stages/{stage_id}/prompt for a plan stage: the response body''s ''### Crew consults'' section contains the historian guidance sentences and the risks_and_assumptions recording instruction.'
+steps: POST http://localhost:8090/v0/dev/fixtures {"scenario":"trace-upload-target"} -> run R, plan stage P (dispatched). POST /v0/runs/R/signing-key -> private_key; POST /v0/dev/sign over 'prompt:P' with X-Fishhawk-Dev-Private-Key; GET /v0/stages/P/prompt with X-Fishhawk-Signature; extract the '### Crew consults' section.
+assertions:
+    expected: Crew consults section with historian guidance and the risks_and_assumptions recording instruction.
+    observed_at_record: 'stage_type plan; item 7: ''The `historian` role is available and answers DETERMINISTICALLY ... Ask it BEFORE committing to an approach that touches paths with prior plan rejections, waivers or deferrals''. Item 8: ''NAME the repo-relative paths your approach touches in `payload.context` ... a path written in prose carries NO AUTHORITY''. Item 9: ''A historian answer is STRUCTURED FIELDS ONLY ... carries NO reason prose from another run''. Item 10: ''record it in `risks_and_assumptions`: the role you asked, the question in one line, and either the cited entry ids you weighed or that it went unanswered''. Supplementary: TestBuild_Plan_ConsultChannelNamesHistorian and TestBuild_NonPlanStages_OmitHistorianGuidance pass in the sanctioned checkout.'
+    repro_handle: GET /v0/stages/{plan_stage_id}/prompt (signed 'prompt:<id>')
+origin:
+    issue: 3742
+    pr: 3887
+    run_id: c3cc3d02-a105-4572-8c1e-cf87165f1c5e
+    head_sha: f5aa3542234d35944fb23921d4e70ea0fa586db6
+    recorded_at: 2026-10-01T00:57:34Z
