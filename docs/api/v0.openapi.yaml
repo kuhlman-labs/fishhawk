@@ -673,6 +673,74 @@ components:
             (`concern_defer` beside `concern_waive`); re-run the query with it to
             see that class's precedent. One gate block covers ONE class.
 
+    DivergenceQuestion:
+      type: object
+      description: |
+        The newest UNANSWERED divergence question on a run (E75.5 / #3733,
+        ADR-082 decision (d) and rule 5): a captain decision at an allow-listed
+        gate (`concern_waive`, `concern_defer`, or a `plan_approval` reject)
+        went against CLEAR human precedent and was recorded as a
+        `precedent_divergence` audit entry. The captain may answer `one_off` or
+        `doctrine_change` via `POST /v0/runs/{run_id}/divergence/{sequence}/answer`.
+        OPTIONAL and DISPLAY-ONLY — nothing gates on it. Carries the divergence
+        BY CITATION ONLY (chain sequences, never reason prose — ADR-082 rule 1).
+        Omitted under the shipped default (divergence disabled — no read at
+        all), for a run-bound `mcp:run:` caller (ADR-082 rule 6), when no
+        question is open, or when an audit read fails (a question is never
+        built from a partial read).
+      required: [sequence, decision_class, stage_id, outcome, modal_outcome, agreement_ratio, human_count, cited_sequences, cited_total, question, options, answer, open_total]
+      properties:
+        sequence:
+          type: integer
+          format: int64
+          description: Chain sequence of the `precedent_divergence` entry — the key the answer endpoint takes.
+        decision_class:
+          type: string
+          enum: [concern_waive, concern_defer, plan_approval]
+        stage_id: { type: string, format: uuid }
+        stage_kind: { type: string }
+        outcome:
+          type: string
+          description: The captain's outcome (`waived`, `deferred`, `reject`).
+        reject_class:
+          type: string
+          description: The validated `reject_class` on a plan reject; omitted otherwise.
+        modal_outcome:
+          type: string
+          description: The outcome clear precedent agreed on.
+        agreement_ratio:
+          type: number
+          description: The modal outcome's share of the human precedent.
+        human_count:
+          type: integer
+          description: How many prior HUMAN (non-delegated) decisions the precedent counted.
+        cited_sequences:
+          type: array
+          items: { type: integer, format: int64 }
+          description: Chain sequences of the cited prior decisions, best first.
+        cited_total:
+          type: integer
+          description: The untruncated citation count.
+        question:
+          type: string
+          description: The fixed question prose.
+        options:
+          type: array
+          items: { type: string, enum: [one_off, doctrine_change] }
+        answer:
+          type: object
+          required: [endpoint, tool]
+          properties:
+            endpoint:
+              type: string
+              description: The ready-to-issue answer route.
+            tool:
+              type: string
+              description: The MCP tool (`fishhawk_answer_divergence`).
+        open_total:
+          type: integer
+          description: How many divergence questions on the run are unanswered; only the newest is rendered.
+
     ProtectedResourceMetadata:
       type: object
       description: |
@@ -1792,6 +1860,15 @@ components:
             `GET /v0/runs/{run_id}` ONLY (same single-read posture as
             `escalations`); omitted for a run-bound identity, when no human gate
             is open, or when the computation degrades.
+        divergence:
+          allOf:
+            - $ref: '#/components/schemas/DivergenceQuestion'
+          description: |
+            The newest unanswered divergence question (E75.5 / #3733) — the
+            SAME block the gate view carries, from the same helper. Surfaced on
+            `GET /v0/runs/{run_id}` ONLY; omitted under the shipped default
+            (divergence disabled), for a run-bound identity, when none is open,
+            or when a read fails.
         permissions:
           type: array
           description: |
@@ -2387,6 +2464,8 @@ components:
           $ref: '#/components/schemas/GateViewCaptain'
         precedent:
           $ref: '#/components/schemas/GatePrecedent'
+        divergence:
+          $ref: '#/components/schemas/DivergenceQuestion'
         crew_messages:
           type: array
           items: { $ref: '#/components/schemas/GateViewCrewMessage' }
@@ -21325,6 +21404,156 @@ paths:
           description: |
             Concern or audit store not configured on this deployment. Body's
             `error` is `concern_store_unconfigured`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/runs/{run_id}/divergence/{sequence}/answer:
+    post:
+      operationId: answerDivergence
+      summary: Answer a divergence question — one-off, or a change of doctrine
+      description: |
+        The captain's answer to one divergence question (E75.5 / #3733,
+        ADR-082 decision (d)). `{sequence}` is the chain sequence of a
+        `precedent_divergence` entry on THIS run (the `divergence.sequence` on
+        `GET /v0/runs/{run_id}` and the gate view); the handler re-reads the
+        run's `precedent_divergence` entries, so a stale or fabricated
+        sequence is a named `404`.
+
+        - `one_off` appends `precedent_divergence_answered` and nothing else;
+          the question stops surfacing.
+        - `doctrine_change` files ONE work item through the shared work-item
+          filing pipeline (labels, board placement and parent-epic linking
+          inherited, exactly as `POST /v0/concerns/{concern_id}/defer`), typed
+          `chore`, labelled `autonomy:low` (any caller-supplied `autonomy:*`
+          label is replaced), with the run as evidence and a body proposing
+          the charter or workflow-spec change that cites the divergence entry
+          and its precedent by sequence and entry hash — then appends
+          `precedent_divergence_answered` naming the issue. FILE FIRST, THEN
+          RECORD: a filing failure records nothing, so the captain can retry.
+          It writes NO repository file (`.fishhawk/**` stays human-authored).
+
+        Both answer categories are INTERNAL chain-only kinds (no issue-thread
+        activity line). Answering is OPTIONAL — nothing gates on it.
+
+        Auth mirrors the bulk waive: `write:stages` OR `write:fixups`; an mcp
+        run-bound token may answer only on its own run (403
+        `cross_run_divergence_answer`).
+      tags: [runs]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+        - name: sequence
+          in: path
+          required: true
+          description: The `precedent_divergence` entry's chain sequence (a positive integer).
+          schema: { type: integer, format: int64, minimum: 1 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [answer]
+              properties:
+                answer:
+                  type: string
+                  enum: [one_off, doctrine_change]
+                note:
+                  type: string
+                  description: Optional addendum recorded on the answer and folded into a doctrine_change item's body.
+                parent_epic:
+                  type: string
+                  description: doctrine_change only — the epic the work item rolls up to (e.g. `#3728`).
+                n:
+                  type: string
+                  description: doctrine_change only — OPTIONAL child-number override; discovered server-side when omitted.
+                labels:
+                  type: array
+                  items: { type: string }
+                  description: doctrine_change only — merged on top of the type defaults; `autonomy:*` is forced to `autonomy:low`.
+      responses:
+        '200':
+          description: The answer was recorded; `issue` is present only for `doctrine_change`.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [run_id, sequence, answer]
+                properties:
+                  run_id: { $ref: '#/components/schemas/UUID' }
+                  sequence: { type: integer, format: int64 }
+                  answer: { type: string, enum: [one_off, doctrine_change] }
+                  issue:
+                    type: object
+                    description: The filed doctrine-change work item (the defer verb's issue shape).
+                    required: [type, title, number, url, provider]
+                    properties:
+                      type: { type: string }
+                      title: { type: string }
+                      number: { type: integer }
+                      url: { type: string }
+                      provider: { type: string }
+                      applied_labels: { type: array, items: { type: string } }
+                      defaulted_labels: { type: array, items: { type: string } }
+                      missing_label_namespaces: { type: array, items: { type: string } }
+        '400':
+          description: |
+            Body's `error` is `validation_failed`: a non-UUID `run_id`, a
+            non-positive or non-numeric `sequence`, a malformed body, or an
+            `answer` outside `one_off` | `doctrine_change`. Nothing recorded.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            `insufficient_scope` (the token lacks both `write:stages` and
+            `write:fixups`) or `cross_run_divergence_answer` (an mcp run-bound
+            token whose run does not match the PATH run id).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: |
+            `run_not_found`, or `divergence_not_found` — the sequence is not a
+            `precedent_divergence` entry on this run.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: |
+            `divergence_already_answered` — the question already carries an
+            answer; nothing recorded and nothing filed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: |
+            doctrine_change only: `work_item_invalid` (the item violates the
+            type's conventions, e.g. a missing `parent_epic`). Nothing recorded.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: |
+            `internal_error`: an audit read failed, or recording the answer
+            failed — after a successful doctrine_change filing, `details.filed_issue`
+            names the durable issue so the captain does not re-file.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '501':
+          description: doctrine_change only — `provider_unimplemented`. Nothing recorded.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '502':
+          description: doctrine_change only — `work_item_filing_failed`. Nothing recorded; retry.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: Audit or run store not configured. Body's `error` is `divergence_store_unconfigured`.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

@@ -92,6 +92,14 @@ type gateViewResponse struct {
 	// no human gate is open, or when the computation degrades — see
 	// gatePrecedentFor, leaving the response byte-identical.
 	Precedent *gatePrecedentBlock `json:"precedent,omitempty"`
+	// Divergence is the newest unanswered divergence question on the run
+	// (E75.5 / #3733, ADR-082 decision (d)) — the same block, from the same
+	// helper (openDivergenceFor), as GET /v0/runs/{id}. OPTIONAL and
+	// DISPLAY-ONLY: Open / Settled and every gate outcome are identical with
+	// or without it. Omitted (nil) under the shipped default (divergence
+	// disabled), for a run-bound mcp:run: caller (ADR-082 rule 6), when no
+	// question is open, or when a read fails.
+	Divergence *divergenceQuestion `json:"divergence,omitempty"`
 	// CrewMessages lists every OPEN crew `finding` / `notice` thread root
 	// anchored on this run, whatever its recipient role (E77.7 / #3741, ADR-081
 	// D1 option 3) — a finding addressed to the architect, security or
@@ -506,6 +514,7 @@ func (s *Server) handleGetRunGateView(w http.ResponseWriter, r *http.Request) {
 	resp.Captain = s.gateViewCaptainFor(r.Context(), runRow, &resp)
 	// After the concern read, so the concern-gate arm has its signals.
 	resp.Precedent = s.gatePrecedentFor(r.Context(), runRow, rows, true)
+	resp.Divergence = s.openDivergenceFor(r.Context(), runRow)
 	resp.CrewMessages = s.gateViewCrewMessagesFor(r.Context(), runID, &resp)
 	s.writeJSON(w, r, http.StatusOK, resp)
 }

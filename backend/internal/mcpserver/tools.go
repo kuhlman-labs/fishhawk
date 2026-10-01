@@ -316,6 +316,7 @@ func registerTools(srv *mcp.Server, resolver *runResolver) {
 	registerWaiveConcern(srv, resolver)
 	registerWaiveConcerns(srv, resolver)
 	registerDeferConcern(srv, resolver)
+	registerAnswerDivergence(srv, resolver)
 	registerRecordGroomingDispositions(srv, resolver)
 	registerListScopeAmendments(srv, resolver)
 	registerDecideScopeAmendment(srv, resolver)
@@ -1708,7 +1709,14 @@ type GetRunStatusOutput struct {
 	// TestPrecedentNeverRendersIntoAnAgentPrompt). Under the compact default
 	// each cited item's reason excerpt is elided (include_review_prose=true
 	// restores it); scores, matched keys, outcomes and the summary survive.
-	Precedent *gatePrecedent `json:"precedent,omitempty" jsonschema:"how this kind of gate was decided before (E75.4): the open gate's decision class, up to 3 cited prior decisions with explained scores + matched keys, the aggregate summary (modal outcome, agreement ratio) and a full_query pointer (fishhawk_precedent) to the unbounded set. DISPLAY-ONLY — never authority, never a gate input, never an agent input; the decision is still the captain's. Reason excerpts are elided unless include_review_prose=true. Omitted when no human gate is open or no precedent is indexed"`
+	// Divergence is the newest unanswered divergence question (E75.5 /
+	// #3733, ADR-082 decision (d)), hoisted off run.divergence so it appears
+	// once beside next_actions. OPTIONAL and DISPLAY-ONLY: next_actions is
+	// computed before it is attached and never reads it. Under the compact
+	// default its fixed question prose is elided (include_review_prose=true
+	// restores it).
+	Divergence *gateDivergence `json:"divergence,omitempty" jsonschema:"the newest unanswered divergence question (E75.5): a captain decision at an allow-listed gate (concern waive, concern defer, plan reject) went against clear human precedent. Carries the sequence, the decision vs the modal outcome, the agreement ratio, cited sequences, the options one_off | doctrine_change and the answer pointer (fishhawk_answer_divergence). Optional — leaving it unanswered blocks nothing. Omitted when the backend's divergence feature is disabled (the shipped default) or none is open"`
+	Precedent  *gatePrecedent  `json:"precedent,omitempty" jsonschema:"how this kind of gate was decided before (E75.4): the open gate's decision class, up to 3 cited prior decisions with explained scores + matched keys, the aggregate summary (modal outcome, agreement ratio) and a full_query pointer (fishhawk_precedent) to the unbounded set. DISPLAY-ONLY — never authority, never a gate input, never an agent input; the decision is still the captain's. Reason excerpts are elided unless include_review_prose=true. Omitted when no human gate is open or no precedent is indexed"`
 	// ChildrenStatus is the decomposed-parent per-child + integration-phase
 	// view (#1147): each child's live lifecycle state in slice-index order
 	// plus the fan-in phase classified from the slices_integrated /
@@ -2254,6 +2262,9 @@ func (r *runResolver) getRunStatus(ctx context.Context, req *mcp.CallToolRequest
 	// ONCE, beside next_actions. nextActions was computed above without it.
 	gatePrecedentBlock := runRow.Precedent
 	runRow.Precedent = nil
+	// Hoist the divergence question (E75.5) the same way, for the same reason.
+	divergenceBlock := runRow.Divergence
+	runRow.Divergence = nil
 
 	assembled := GetRunStatusOutput{
 		Run:                       *runRow,
@@ -2278,6 +2289,7 @@ func (r *runResolver) getRunStatus(ctx context.Context, req *mcp.CallToolRequest
 		AcceptanceTranscript:      acceptanceTranscript,
 		GroomingApplyStatus:       groomingApplyStatus,
 		Precedent:                 gatePrecedentBlock,
+		Divergence:                divergenceBlock,
 	}
 
 	// (b) reviewer prose (E45.92 / #3627). The same per-reviewer implement
@@ -2305,6 +2317,7 @@ func (r *runResolver) getRunStatus(ctx context.Context, req *mcp.CallToolRequest
 			stripReviewProse(assembled.ImplementReviewStatus.Reviews, capImplementNotes)
 		}
 		assembled.Precedent = elidePrecedentExcerpts(assembled.Precedent)
+		assembled.Divergence = elideDivergenceProse(assembled.Divergence)
 	}
 	for i := range recent {
 		recent[i].Payload = compactAuditPayload(recent[i].Payload, !in.IncludeIssueContext, !in.IncludeReviewProse)
@@ -5183,4 +5196,74 @@ func (r *runResolver) runtimeCalibration(ctx context.Context, _ *mcp.CallToolReq
 		CalibrationRatio:       res.CalibrationRatio,
 		ConfidenceBandAccuracy: res.ConfidenceBandAccuracy,
 	}, nil
+}
+
+// AnswerDivergenceInput is the fishhawk_answer_divergence tool's input schema
+// (E75.5 / #3733). Mirrors POST /v0/runs/{run_id}/divergence/{sequence}/answer.
+type AnswerDivergenceInput struct {
+	RunID      string   `json:"run_id" jsonschema:"the run whose divergence question you are answering"`
+	Sequence   int64    `json:"sequence" jsonschema:"the question's sequence (divergence.sequence on fishhawk_get_run_status or fishhawk_get_gate_view)"`
+	Answer     string   `json:"answer" jsonschema:"one_off (records the answer, files nothing) or doctrine_change (files ONE autonomy:low work item proposing the standing-order change)"`
+	Note       string   `json:"note,omitempty" jsonschema:"optional addendum recorded on the answer and folded into a doctrine_change item's body"`
+	ParentEpic string   `json:"parent_epic,omitempty" jsonschema:"doctrine_change only: the epic the work item rolls up to (e.g. '#3728'), exactly as fishhawk_defer_concern takes it"`
+	N          string   `json:"n,omitempty" jsonschema:"doctrine_change only, OPTIONAL: child-number override; discovered server-side when omitted"`
+	Labels     []string `json:"labels,omitempty" jsonschema:"doctrine_change only: labels merged on top of the type defaults; any autonomy:* label is replaced by autonomy:low"`
+}
+
+// AnswerDivergenceOutput surfaces the recorded answer and, for
+// doctrine_change, the filed work item.
+type AnswerDivergenceOutput struct {
+	Result AnswerDivergenceResult `json:"result"`
+}
+
+// registerAnswerDivergence wires fishhawk_answer_divergence (E75.5 / #3733,
+// ADR-082 decision (d)).
+func registerAnswerDivergence(srv *mcp.Server, resolver *runResolver) {
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "fishhawk_answer_divergence",
+		Description: strings.TrimSpace(`
+Answer a divergence question: when a captain decision at an allow-listed gate
+(a concern waive, a concern defer, or a plan reject) went against CLEAR human
+precedent, the run carries one optional question — divergence on
+fishhawk_get_run_status and fishhawk_get_gate_view — asking whether the
+decision was a one-off or a change of doctrine. Answering is optional;
+leaving it unanswered blocks nothing.
+
+  - one_off         — records the answer; the question stops surfacing.
+  - doctrine_change — files ONE autonomy:low work item proposing the charter or
+    workflow-spec change, citing the divergence and its precedent by chain
+    sequence and entry hash, then records the answer naming the issue. It
+    writes NO repository file (.fishhawk/** stays human-authored). Supply
+    parent_epic as for fishhawk_defer_concern.
+
+Eligibility: a write tool (write:stages or write:fixups, the waive/defer
+posture); a run-bound token may answer only on its own run.
+
+Returns a tool error on validation_failed (an answer outside the two values),
+divergence_not_found (the sequence is not a precedent_divergence entry on
+this run), divergence_already_answered, cross_run_divergence_answer, and the
+work-item filing errors (doctrine_change records nothing on a filing failure,
+so you can retry).
+`),
+	}, resolver.answerDivergence)
+}
+
+// answerDivergence is the tool handler. It validates the run id and sequence
+// before the HTTP hop; every other guard lives server-side in
+// server/divergence_answer.go.
+func (r *runResolver) answerDivergence(ctx context.Context, _ *mcp.CallToolRequest, in AnswerDivergenceInput) (*mcp.CallToolResult, AnswerDivergenceOutput, error) {
+	runID, err := uuid.Parse(in.RunID)
+	if err != nil {
+		return nil, AnswerDivergenceOutput{}, fmt.Errorf("run_id %q is not a valid UUID: %w", in.RunID, err)
+	}
+	if in.Sequence <= 0 {
+		return nil, AnswerDivergenceOutput{}, fmt.Errorf("sequence must be a positive chain sequence, got %d", in.Sequence)
+	}
+	res, err := r.api.AnswerDivergence(ctx, runID, in.Sequence, AnswerDivergenceParams{
+		Answer: in.Answer, Note: in.Note, ParentEpic: in.ParentEpic, N: in.N, Labels: in.Labels,
+	})
+	if err != nil {
+		return nil, AnswerDivergenceOutput{}, fmt.Errorf("answer divergence: %w", err)
+	}
+	return nil, AnswerDivergenceOutput{Result: *res}, nil
 }
