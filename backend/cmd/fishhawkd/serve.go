@@ -419,13 +419,17 @@ func (p *planReviewerSet) newAnthropic(model string) server.PlanReviewer {
 	return reviewer
 }
 
-func (p *planReviewerSet) newClaudeCode(model string) server.PlanReviewer {
+func (p *planReviewerSet) newClaudeCode(model, reasoningEffort string) server.PlanReviewer {
 	reviewer := claudecode.NewReviewer(claudecode.Config{
-		Binary:         p.opts.localClaudeBinary,
-		Model:          model,
-		MaxTokens:      p.opts.planReviewMaxTokens,
-		Timeout:        p.opts.planReviewTimeout,
-		EnvPassthrough: p.opts.reviewerEnvPassthrough,
+		Binary: p.opts.localClaudeBinary,
+		Model:  model,
+		// The spec's reviewers.agents[i].reasoning_effort, verbatim (#3896).
+		// There is NO deployment-default rung: FISHHAWKD_CODEX_REASONING_EFFORT
+		// is codex-scoped, so an empty spec value spawns with no --effort.
+		ReasoningEffort: reasoningEffort,
+		MaxTokens:       p.opts.planReviewMaxTokens,
+		Timeout:         p.opts.planReviewTimeout,
+		EnvPassthrough:  p.opts.reviewerEnvPassthrough,
 	})
 	// Apply the env-resolved retry budget past NewClient's zero->1
 	// normalisation: an explicit 0 means retry disabled (single attempt),
@@ -470,7 +474,9 @@ func (p *planReviewerSet) Default() server.PlanReviewer {
 	case p.opts.anthropicConfigured():
 		return p.newAnthropic(p.opts.planReviewModel)
 	case p.opts.enableLocalClaudeReviewer:
-		return p.newClaudeCode(p.opts.localClaudeModel)
+		// Bare count form carries no spec reasoning_effort, and claudecode has
+		// no deployment default (#3896): no --effort, byte-identical to today.
+		return p.newClaudeCode(p.opts.localClaudeModel, "")
 	case p.opts.enableCodexReviewer:
 		// Bare count form carries no spec reasoning_effort — resolve to the
 		// deployment default (#1493), byte-identical to today.
@@ -494,13 +500,16 @@ func (p *planReviewerSet) resolveCodexEffort(specEffort string) string {
 // For resolves one spec-declared reviewer (reviewers.agents[i]) to its
 // adapter, constructed with the requested model. An empty model falls back
 // to that provider's deployment-configured default model. The optional
-// reasoningEffort (first variadic value, empty when omitted) is codex-only
-// (#1493): the codex branch resolves it through the per-reviewer
-// ladder (deployment default FISHHAWKD_CODEX_REASONING_EFFORT < spec value), so
-// an empty spec value falls back to the env default exactly as today; the
-// anthropic/claudecode branches accept and ignore it (their adapters take no
-// reasoning-effort parameter). Errors when the provider is not configured in
-// this deployment, naming the env knob that enables it.
+// reasoningEffort (first variadic value, empty when omitted) is the spec's
+// reviewers.agents[i].reasoning_effort. The codex branch resolves it through
+// the per-reviewer ladder (#1493: deployment default
+// FISHHAWKD_CODEX_REASONING_EFFORT < spec value), so an empty spec value falls
+// back to the env default exactly as today. The claudecode branch passes the
+// spec value VERBATIM as `--effort` (#3896) with no env fall-through — the
+// codex env default stays codex-scoped, and an empty value spawns with no
+// --effort. The anthropic (API) branch accepts and ignores it (its adapter
+// takes no reasoning-effort parameter). Errors when the provider is not
+// configured in this deployment, naming the env knob that enables it.
 func (p *planReviewerSet) For(provider, model string, reasoningEffort ...string) (server.PlanReviewer, error) {
 	effort := ""
 	if len(reasoningEffort) > 0 {
@@ -541,7 +550,7 @@ func (p *planReviewerSet) For(provider, model string, reasoningEffort ...string)
 		if err := p.verifyModel(provider, model); err != nil {
 			return nil, err
 		}
-		return p.newClaudeCode(model), nil
+		return p.newClaudeCode(model, effort), nil
 	case "codex":
 		if !p.opts.enableCodexReviewer {
 			return nil, fmt.Errorf("reviewer provider %q is not configured: set FISHHAWKD_ENABLE_CODEX_REVIEWER", provider)

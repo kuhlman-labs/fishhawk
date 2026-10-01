@@ -3615,6 +3615,124 @@ workflows:
 	}
 }
 
+// TestParseV2_ExecutorReasoningEffort_RoundTrip asserts a workflow-v2 stage
+// executor declaring reasoning_effort parses into Executor.ReasoningEffort
+// and re-marshals it, while an executor without it stays empty and omits the
+// key (E28.5 / #3896).
+func TestParseV2_ExecutorReasoningEffort_RoundTrip(t *testing.T) {
+	s, err := spec.ParseBytes([]byte(`
+version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+          model: claude-opus-5-5
+          reasoning_effort: high
+      - id: implement_b
+        type: implement
+        executor:
+          agent: codex
+`))
+	if err != nil {
+		t.Fatalf("ParseBytes: %v", err)
+	}
+	stages := s.Workflows["feature_change"].Stages
+	if got := stages[0].Executor.ReasoningEffort; got != "high" {
+		t.Errorf("Executor.ReasoningEffort = %q, want %q", got, "high")
+	}
+	if got := stages[1].Executor.ReasoningEffort; got != "" {
+		t.Errorf("absent Executor.ReasoningEffort = %q, want empty", got)
+	}
+	out, err := yaml.Marshal(stages[0].Executor)
+	if err != nil {
+		t.Fatalf("re-marshal executor: %v", err)
+	}
+	if !strings.Contains(string(out), "reasoning_effort: high") {
+		t.Errorf("re-marshalled executor = %q, want it to preserve reasoning_effort", out)
+	}
+	absent, err := yaml.Marshal(stages[1].Executor)
+	if err != nil {
+		t.Fatalf("re-marshal absent executor: %v", err)
+	}
+	if strings.Contains(string(absent), "reasoning_effort") {
+		t.Errorf("re-marshalled executor with no reasoning_effort = %q, want it omitted", absent)
+	}
+}
+
+// TestParseV2_ExecutorReasoningEffort_InheritedFromDefaults asserts a
+// file-level defaults.executor.reasoning_effort lands on a stage that declares
+// no executor of its own — the reuse resolution carries the key, so the
+// backend's per-stage resolver sees the inherited pin (E28.5 / #3896).
+func TestParseV2_ExecutorReasoningEffort_InheritedFromDefaults(t *testing.T) {
+	s, err := spec.ParseBytes([]byte(`
+version: "2"
+defaults:
+  executor:
+    agent: claude-code
+    reasoning_effort: xhigh
+workflows:
+  wf:
+    stages:
+      - id: implement
+        type: implement
+`))
+	if err != nil {
+		t.Fatalf("ParseBytes: %v", err)
+	}
+	if got := s.Workflows["wf"].Stages[0].Executor.ReasoningEffort; got != "xhigh" {
+		t.Errorf("inherited Executor.ReasoningEffort = %q, want %q (from defaults.executor)", got, "xhigh")
+	}
+}
+
+// TestParseV2_ExecutorReasoningEffort_Rejected asserts the schema confines
+// executor.reasoning_effort to its enum and to the agent branch: an unknown
+// level and the key on a human executor are both refused, each with an
+// error naming reasoning_effort (E28.5 / #3896).
+func TestParseV2_ExecutorReasoningEffort_Rejected(t *testing.T) {
+	cases := map[string]string{
+		"unknown_level": `
+version: "2"
+workflows:
+  wf:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+          reasoning_effort: extreme
+`,
+		"human_executor": `
+version: "2"
+workflows:
+  wf:
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          human: true
+          reasoning_effort: high
+`,
+	}
+	for name, doc := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := spec.ParseBytes([]byte(doc))
+			if err == nil {
+				t.Fatal("ParseBytes accepted the document, want a schema rejection")
+			}
+			var se *spec.SchemaError
+			if !errors.As(err, &se) {
+				t.Fatalf("err = %v (%T), want *SchemaError", err, err)
+			}
+			if !strings.Contains(err.Error(), "reasoning_effort") {
+				t.Errorf("err = %v, want it to name reasoning_effort", err)
+			}
+		})
+	}
+}
+
 // TestParse_RequiredOutcomes_VerificationReported pins the workflow-v1
 // enum member added in v1.5 (#1886 / ADR-059) against the BACKEND's
 // embedded mirror. workflow-v0 stays frozen: the same declaration under
