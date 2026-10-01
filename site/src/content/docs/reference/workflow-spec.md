@@ -137,8 +137,20 @@ The live major — write new specs here.
 | `workflows` | object | required |  | Named workflows. Keys are snake_case identifiers (e.g. feature_change). At least one workflow must be defined. |
 | `defaults` | object | optional |  | FILE-LEVEL reuse defaults (E52.4 / #2216): the lowest rung of the same-document resolution ladder — file defaults -> extends base -> workflow defaults -> the stage's own declaration, later winning. Applied to every stage of every workflow in this document before schema validation, so an inherited executor satisfies $defs/stage's required list with no schema relaxation. MERGE SEMANTICS: `executor` and `budget` merge KEY-WISE (the receiving side wins per key) because they carry only execution parameters; `reviewers` is taken WHOLE from exactly one rung and is NEVER blended, because it determines review AUTHORITY (ADR-027) and a supplemented `human` key would silently convert a gating stage into an advisory one. Arrays REPLACE wholesale everywhere — a governance file never accumulates an approver or reviewer its author did not write. Cross-FILE inclusion (`include:`) is deliberately out of scope (ADR-067). This block is INLINED here and on $defs/workflow rather than factored into a shared $defs entry. That was originally FORCED: the interim v1->v2 copy-fidelity allow-list capped licensed divergent paths at ~15, and a shared $def would have spent a fourth. That check and its cap are RETIRED (#2320), so the duplication is now a free CHOICE rather than a constraint — it is kept because changing it would be churn, not a fix. Either way, the two inline bodies MUST be kept in sync: an edit to one is an edit to both. |
 | `test_conventions` | array of `test_convention` | optional |  | Optional per-repo test-location conventions that generalize the plan-gate test sweep (#1004) beyond the built-in Go (name.go -> name_test.go) and colocated-TypeScript defaults. Each entry maps production files matching a glob to candidate test-file path templates. Declared entries are ADDITIVE to the built-in defaults (Go + colocated TS stay covered regardless), so a repo typically declares only its Python / Ruby / parallel-tree conventions. Advisory-only and fail-open: the sweep never blocks a plan. Declared by workflow-v2; accepted whenever present (v2 has no minor chain — a field is accepted because the schema declares it, not because the document declared a high enough minor). |
+| `review_conventions` | object | optional |  | Named repo-declared review conventions (ADR-068 / E55.2 / #2243): a map from a snake_case convention name (^[a-z][a-z0-9_]*$, the v2 identifier rule — a non-matching key is refused as an additional property, the same idiom `workflows` uses) to one entry naming a repo-relative document that a review stage SELECTS by name through its `reviewers.conventions` list. A convention is DECLARED here and never auto-discovered — no file is read because it exists at a conventional path. Every declared entry must be selected by at least one stage of the RESOLVED document (one declared and selected nowhere is refused as a control that does nothing), and every selected name must resolve to an entry here; both rules, plus the canonical repo-relative path rule, are enforced at semantic validation by the backend and `fishhawk validate`. GRAMMAR ONLY in this change: nothing renders a convention into a reviewer prompt yet — rendering and severity_cap enforcement are #2244 (E55.3) and the review-prompt wiring is #2797. Declared by workflow-v2; accepted whenever present (v2 has no minor chain — a field is accepted because the schema declares it, not because the document declared a high enough minor). |
 
 #### workflow-v2 — definitions
+
+##### `review_convention`
+
+One named review convention (ADR-068 / #2243). The document is named by `path` — there is NO inline `text:` alternative (additionalProperties false), so the convention text lives in the repository under review and changes through the same review as any other file. `applies_to` narrows WHICH changes the convention attaches to; `severity_cap` bounds how strongly a reviewer may weigh a finding citing it; `required` decides whether a missing document fails the review stage.
+
+| Field | Type | Required | Constraints | Description |
+|---|---|---|---|---|
+| `path` | string | required | minLength: `1` | Repo-relative, slash-separated path of the convention document, e.g. `docs/conventions/backend.md`. Semantic validation refuses an absolute path, a backslash, an empty / `.` / `..` segment, a non-canonical spelling (one path.Clean would rewrite) and a control or line-separator character — the same rule set the repo-document resolver applies when it fetches the file, which stays the authoritative check at resolution time. |
+| `applies_to` | `predicate` | optional |  | Optional shared path predicate (E53.1 / #2224) deciding which changes this convention attaches to — the same object `applies_to` routing and `escalations.match` consume, NOT a bare glob list. ABSENT means the convention attaches to every review of every stage that selects it. `change_kind` is refused here (nothing produces a change kind today, so the convention could never attach). |
+| `severity_cap` | string | optional | enum: `low`, `medium` | Optional ceiling on the severity a reviewer may assign to a concern that rests on this convention. ABSENT means UNCAPPED (the convention's findings carry whatever severity the reviewer assigns). `high` is deliberately not declarable: it is the top of the reviewer concern-severity ladder (high > medium > low), so a `high` cap would clamp nothing and is refused as a control that does nothing. Enforced by the review-prompt rendering in #2244 (E55.3); grammar only here. |
+| `required` | boolean | optional | default: `true` | Whether the review stage FAILS when the declared document is missing at the reviewed base. Defaults to `true` (fail loudly, never review silently without the convention); `false` degrades to reviewing without it. Grammar only here: the runtime fail-loudly half is an explicit obligation on #2244 (E55.3 rendering), wired into the review prompts by #2797. |
 
 ##### `test_convention`
 
@@ -342,6 +354,7 @@ Plan-review reviewers for plan stages (ADR-027). The `authority` property DECLAR
 | `agents` | array of object | optional | minItems: `1` | Heterogeneous agent reviewers (#955): one entry per reviewer invocation, each naming its provider and optionally its model. The effective agent count for the ADR-027 authority table is len(agents). Authority semantics are unchanged: heterogeneity changes WHO reviews, not gating semantics. |
 | `human` | integer | optional | min: `0` | Number of human approvers required. 0 means no human approval gate for this plan stage. |
 | `review_timeout` | string | optional | pattern: `^([0-9]+(ns\|us\|ms\|s\|m\|h))+$` | Per-stage review-budget floor (#1494). The stage's review_timeout OVERRIDES the FISHHAWKD_PLAN_REVIEW_TIMEOUT deployment default — it sets the Floor rung of the size-aware review-wait budget (Floor + PerKB*ceil(promptKB), clamped to [Floor,Cap]) for this stage's agent reviews; the deployment-level PerKB and Cap are unchanged. Parsed by time.ParseDuration; an unparseable or absent value falls back to the FISHHAWKD_PLAN_REVIEW_TIMEOUT deployment default. Resolved by spec.ResolveReviewTimeout on the backend. Declared by workflow-v2; accepted whenever present (v2 has no minor chain — a field is accepted because the schema declares it, not because the document declared a high enough minor). |
+| `conventions` | array of string | optional | minItems: `1` | Review conventions this stage's agent reviewers are handed (ADR-068 / E55.2 / #2243): each item names an entry of the top-level `review_conventions` map, in the order the reviewer receives them. Semantic validation (backend and `fishhawk validate`) refuses a name that resolves to no declared entry, a selection on any stage type other than `plan` or `implement` (the only stages with a reviewer loop), and a selection on a stage configuring no agent reviewers. Travels with a `defaults.reviewers` block as part of the WHOLE reviewers value, so a file-level reviewers default carrying conventions is subject to the stage-type rule on every stage that inherits it. Grammar only in this change: rendering is #2244 (E55.3) and wiring is #2797. |
 
 ##### `escalation`
 
@@ -807,8 +820,14 @@ Shape deltas only — a field whose description changed but whose type, required
 | `/$defs/predicate/properties/paths` | added | new at the newer major |
 | `/$defs/predicate/properties/trigger` | added | new at the newer major |
 | `/$defs/produces/properties/artifact` | changed | enum members differ |
+| `/$defs/review_convention` | added | new at the newer major |
+| `/$defs/review_convention/properties/applies_to` | added | new at the newer major |
+| `/$defs/review_convention/properties/path` | added | new at the newer major |
+| `/$defs/review_convention/properties/required` | added | new at the newer major |
+| `/$defs/review_convention/properties/severity_cap` | added | new at the newer major |
 | `/$defs/reviewers_config/properties/agent` | removed | present in the older major, absent at the newer |
 | `/$defs/reviewers_config/properties/authority` | added | new at the newer major |
+| `/$defs/reviewers_config/properties/conventions` | added | new at the newer major |
 | `/$defs/role` | removed | present in the older major, absent at the newer |
 | `/$defs/role/properties/members` | removed | present in the older major, absent at the newer |
 | `/$defs/stage/properties/constraints` | changed | type "array of `constraint`"→"`constraint`" |
@@ -828,6 +847,7 @@ Shape deltas only — a field whose description changed but whose type, required
 | `/$defs/workflow/properties/extends` | added | new at the newer major |
 | `/$defs/workflow/properties/operator_agent` | removed | present in the older major, absent at the newer |
 | `/properties/defaults` | added | new at the newer major |
+| `/properties/review_conventions` | added | new at the newer major |
 | `/properties/roles` | removed | present in the older major, absent at the newer |
 | `/properties/version` | changed | enum members differ |
 
@@ -881,8 +901,14 @@ Shape deltas only — a field whose description changed but whose type, required
 | `/$defs/predicate/properties/paths` | added | new at the newer major |
 | `/$defs/predicate/properties/trigger` | added | new at the newer major |
 | `/$defs/produces/properties/artifact` | changed | enum members differ |
+| `/$defs/review_convention` | added | new at the newer major |
+| `/$defs/review_convention/properties/applies_to` | added | new at the newer major |
+| `/$defs/review_convention/properties/path` | added | new at the newer major |
+| `/$defs/review_convention/properties/required` | added | new at the newer major |
+| `/$defs/review_convention/properties/severity_cap` | added | new at the newer major |
 | `/$defs/reviewers_config/properties/agent` | removed | present in the older major, absent at the newer |
 | `/$defs/reviewers_config/properties/authority` | added | new at the newer major |
+| `/$defs/reviewers_config/properties/conventions` | added | new at the newer major |
 | `/$defs/reviewers_config/properties/review_timeout` | added | new at the newer major |
 | `/$defs/role` | removed | present in the older major, absent at the newer |
 | `/$defs/role/properties/members` | removed | present in the older major, absent at the newer |
@@ -907,6 +933,7 @@ Shape deltas only — a field whose description changed but whose type, required
 | `/$defs/workflow/properties/extends` | added | new at the newer major |
 | `/$defs/workflow/properties/operator_agent` | removed | present in the older major, absent at the newer |
 | `/properties/defaults` | added | new at the newer major |
+| `/properties/review_conventions` | added | new at the newer major |
 | `/properties/roles` | removed | present in the older major, absent at the newer |
 | `/properties/version` | changed | enum members differ |
 

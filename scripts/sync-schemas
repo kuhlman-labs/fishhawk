@@ -118,4 +118,18 @@ cp "$REPO_ROOT/docs/spec/tier-expansion-fixtures.json" \
 cp "$REPO_ROOT/docs/spec/tier-expansion-fixtures.json" \
   "$REPO_ROOT/cli/internal/spec/testdata/tier-expansion-fixtures.json"
 
+# The shared review_conventions parity corpus (ADR-068 / E55.2 / #2243) is the
+# proof surface for the two hand-maintained review_conventions validators that
+# CANNOT import each other across the backend/cli module wall: the typed rules
+# in backend/internal/spec/review_conventions.go and the raw-map port in
+# cli/internal/spec/review_conventions.go. Mirroring it into both testdata dirs
+# makes the two suites run the SAME rows through their REAL parse paths, so a
+# divergence in either validator fails whichever side drifted; CI's schema-sync
+# gate red-lines a mirror that itself drifts. Same *-fixtures.json naming idiom:
+# NOT *.schema.json, so the loop above never globs it.
+cp "$REPO_ROOT/docs/spec/review-conventions-fixtures.json" \
+  "$REPO_ROOT/backend/internal/spec/testdata/review-conventions-fixtures.json"
+cp "$REPO_ROOT/docs/spec/review-conventions-fixtures.json" \
+  "$REPO_ROOT/cli/internal/spec/testdata/review-conventions-fixtures.json"
+
 echo "schemas synced from docs/spec/"

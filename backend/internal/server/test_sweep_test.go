@@ -408,6 +408,25 @@ func TestEvaluateTestSweep(t *testing.T) {
 			},
 		},
 		{
+			// E55.2 / #2243: the review_conventions parity corpus is mirrored
+			// by two explicit cp lines; scoping the canonical without either
+			// mirror names both and the generator.
+			name:     "review-conventions corpus without its mirrors names both and the generator",
+			scope:    []plan.ScopeFile{{Path: "docs/spec/review-conventions-fixtures.json", Operation: plan.FileOpCreate}},
+			listings: map[string][]string{},
+			want: []TestSweepFinding{
+				{
+					Rule:        testSweepRuleGeneratedSurface,
+					TriggerPath: "docs/spec/review-conventions-fixtures.json",
+					MissingTests: []string{
+						"backend/internal/spec/testdata/review-conventions-fixtures.json",
+						"cli/internal/spec/testdata/review-conventions-fixtures.json",
+					},
+					Generator: testSweepGeneratorSyncSchemas,
+				},
+			},
+		},
+		{
 			// AC3a: no false positive — a plan already scoping the derived
 			// site region draws nothing.
 			name: "openapi with the api.md region in scope draws no finding",
