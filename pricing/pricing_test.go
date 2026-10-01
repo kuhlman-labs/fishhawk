@@ -70,21 +70,42 @@ func TestCost_KnownTiers(t *testing.T) {
 			model:  "gpt-5.6-sol",
 			input:  1_000_000,
 			output: 1_000_000,
-			want:   5 + 30, // $5 input + $30 output per 1M
+			want:   4 + 20, // $4 input + $20 output per 1M
 		},
 		{
 			name:   "gpt-5.6-terra mid tier",
 			model:  "gpt-5.6-terra",
 			input:  1_000_000,
 			output: 1_000_000,
-			want:   2.5 + 15, // $2.50 input + $15 output per 1M
+			want:   2 + 12, // $2 input + $12 output per 1M
 		},
 		{
 			name:   "gpt-5.6-luna cost-optimized tier",
 			model:  "gpt-5.6-luna",
 			input:  1_000_000,
 			output: 1_000_000,
-			want:   1 + 6, // $1 input + $6 output per 1M
+			want:   0.2 + 1.2, // $0.20 input + $1.20 output per 1M
+		},
+		{
+			name:   "gpt-6.1-sol near-flagship tier",
+			model:  "gpt-6.1-sol",
+			input:  1_000_000,
+			output: 1_000_000,
+			want:   2 + 10,
+		},
+		{
+			name:   "gpt-6-sol tier",
+			model:  "gpt-6-sol",
+			input:  1_000_000,
+			output: 1_000_000,
+			want:   2 + 10,
+		},
+		{
+			name:   "gpt-6-luna cost-optimized tier",
+			model:  "gpt-6-luna",
+			input:  1_000_000,
+			output: 1_000_000,
+			want:   0.1 + 0.5,
 		},
 		{
 			name:   "gpt-6-astra exact family id",
@@ -99,6 +120,48 @@ func TestCost_KnownTiers(t *testing.T) {
 			input:  2_000_000,
 			output: 1_000_000,
 			want:   2*10 + 1*50,
+		},
+		{
+			name:   "opus 5.5 reprices below the opus stem",
+			model:  "claude-opus-5-5",
+			input:  1_000_000,
+			output: 1_000_000,
+			want:   4 + 20, // $4 input + $20 output per 1M
+		},
+		{
+			name:   "opus 5 keeps the opus stem price",
+			model:  "claude-opus-5",
+			input:  1_000_000,
+			output: 1_000_000,
+			want:   5 + 25,
+		},
+		{
+			name:   "fable 5.1 premium tier",
+			model:  "claude-fable-5-1",
+			input:  1_000_000,
+			output: 1_000_000,
+			want:   10 + 50,
+		},
+		{
+			name:   "mythos 5.1 premium tier",
+			model:  "claude-mythos-5-1",
+			input:  1_000_000,
+			output: 1_000_000,
+			want:   10 + 50,
+		},
+		{
+			name:   "sonnet 5 reprices below the sonnet stem",
+			model:  "claude-sonnet-5",
+			input:  1_000_000,
+			output: 1_000_000,
+			want:   2 + 10, // $2 input + $10 output per 1M
+		},
+		{
+			name:   "sonnet 5.5 inherits the sonnet 5 price",
+			model:  "claude-sonnet-5-5",
+			input:  1_000_000,
+			output: 1_000_000,
+			want:   2 + 10,
 		},
 		{
 			name:   "zero usage is zero cost",
@@ -126,8 +189,11 @@ func TestCost_KnownTiers(t *testing.T) {
 // backend/cmd/fishhawkd/serve.go and backend/internal/server/modelpolicy.go
 // (claudecode=claude-opus-4-8,claude-sonnet-4-6; codex=gpt-5.5), AND the
 // models pinned in .fishhawk/workflows.yaml, which overrides the defaults
-// with claude-opus-5 (plan executor), claude-fable-5 (both claudecode
+// with claude-opus-5-5 (plan executor), claude-fable-5-1 (both claudecode
 // reviewers) and gpt-6-astra (both codex reviewers, since #3234).
+// claude-opus-5 and claude-fable-5 are the previous pins and
+// claude-sonnet-5-5 is the current Sonnet, so a swap to any of them
+// prices.
 // gpt-5.6-terra is retained as future-swap insurance — it was the codex
 // reviewer before #3234 and stays priced so a swap back can't silently
 // record $0. claude-sonnet-5 is included so a future family-prefix change
@@ -140,12 +206,18 @@ func TestCost_KnownTiers(t *testing.T) {
 func TestCost_PricesLiveModelIDs(t *testing.T) {
 	live := []string{
 		"claude-opus-4-8",
+		"claude-opus-5",
+		"claude-opus-5-5",
 		"claude-fable-5",
+		"claude-fable-5-1",
 		"claude-sonnet-4-6",
 		"claude-sonnet-5",
+		"claude-sonnet-5-5",
+		"claude-haiku-4-5",
 		"gpt-5.5",
 		"gpt-5.6-terra",
 		"gpt-6-astra",
+		"gpt-6.1-sol",
 	}
 	for _, model := range live {
 		if _, ok := Cost(model, 1, 1); !ok {
@@ -198,12 +270,23 @@ func TestCacheRates_Multipliers(t *testing.T) {
 		{family: "claude-fable", wantReadMultiplier: 0.1, wantReadPerToken: 1.0 / 1_000_000, wantWritePerToken: 12.5 / 1_000_000},
 		{family: "claude-sonnet", wantReadMultiplier: 0.1, wantReadPerToken: 0.3 / 1_000_000, wantWritePerToken: 3.75 / 1_000_000},
 		{family: "claude-haiku", wantReadMultiplier: 0.1, wantReadPerToken: 0.1 / 1_000_000, wantWritePerToken: 1.25 / 1_000_000},
+		{family: "claude-sonnet-5", wantReadMultiplier: 0.1, wantReadPerToken: 0.2 / 1_000_000, wantWritePerToken: 2.5 / 1_000_000},
+		{family: "claude-mythos-5", wantReadMultiplier: 0.1, wantReadPerToken: 1.0 / 1_000_000, wantWritePerToken: 12.5 / 1_000_000},
+		// The read-discount exceptions: Opus 5.5 reads at 0.05x, Fable 5.1 /
+		// Mythos 5.1 at 0.025x; write stays 1.25x input.
+		{family: "claude-opus-5-5", wantReadMultiplier: 0.05, wantReadPerToken: 0.2 / 1_000_000, wantWritePerToken: 5.0 / 1_000_000},
+		{family: "claude-fable-5-1", wantReadMultiplier: 0.025, wantReadPerToken: 0.25 / 1_000_000, wantWritePerToken: 12.5 / 1_000_000},
+		{family: "claude-mythos-5-1", wantReadMultiplier: 0.025, wantReadPerToken: 0.25 / 1_000_000, wantWritePerToken: 12.5 / 1_000_000},
 		// gpt-5.5: read = $0.50/1M (0.1x input), write = input rate ($5/1M).
 		{family: "gpt-5.5", wantReadMultiplier: 0.1, wantReadPerToken: 0.5 / 1_000_000, wantWritePerToken: 5.0 / 1_000_000},
 		// gpt-5.6 tiers: read = 0.1x input, write = 1.25x input (the 5.6 premium).
-		{family: "gpt-5.6-sol", wantReadMultiplier: 0.1, wantReadPerToken: 0.5 / 1_000_000, wantWritePerToken: 6.25 / 1_000_000},
-		{family: "gpt-5.6-terra", wantReadMultiplier: 0.1, wantReadPerToken: 0.25 / 1_000_000, wantWritePerToken: 3.125 / 1_000_000},
-		{family: "gpt-5.6-luna", wantReadMultiplier: 0.1, wantReadPerToken: 0.1 / 1_000_000, wantWritePerToken: 1.25 / 1_000_000},
+		{family: "gpt-5.6-sol", wantReadMultiplier: 0.1, wantReadPerToken: 0.4 / 1_000_000, wantWritePerToken: 5.0 / 1_000_000},
+		{family: "gpt-5.6-terra", wantReadMultiplier: 0.1, wantReadPerToken: 0.2 / 1_000_000, wantWritePerToken: 2.5 / 1_000_000},
+		{family: "gpt-5.6-luna", wantReadMultiplier: 0.1, wantReadPerToken: 0.02 / 1_000_000, wantWritePerToken: 0.25 / 1_000_000},
+		// gpt-6 tiers: read = 0.1x input except gpt-6.1-sol (0.05x); write = 1.25x.
+		{family: "gpt-6-sol", wantReadMultiplier: 0.1, wantReadPerToken: 0.2 / 1_000_000, wantWritePerToken: 2.5 / 1_000_000},
+		{family: "gpt-6.1-sol", wantReadMultiplier: 0.05, wantReadPerToken: 0.1 / 1_000_000, wantWritePerToken: 2.5 / 1_000_000},
+		{family: "gpt-6-luna", wantReadMultiplier: 0.1, wantReadPerToken: 0.01 / 1_000_000, wantWritePerToken: 0.125 / 1_000_000},
 		// gpt-6-astra: read = $1/1M (0.1x its $10/1M input), write = $12.50/1M (1.25x).
 		{family: "gpt-6-astra", wantReadMultiplier: 0.1, wantReadPerToken: 1.0 / 1_000_000, wantWritePerToken: 12.5 / 1_000_000},
 	}
@@ -223,7 +306,7 @@ func TestCacheRates_Multipliers(t *testing.T) {
 	// Anthropic write is 1.25x input; pin the multiplier directly too.
 	// The whole gpt-5.6 family and gpt-6-astra carry the same 1.25x write
 	// premium (unlike gpt-5.5).
-	for _, family := range []string{"claude-opus", "claude-fable", "claude-sonnet", "claude-haiku", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-6-astra"} {
+	for _, family := range []string{"claude-opus", "claude-opus-5-5", "claude-fable", "claude-fable-5-1", "claude-mythos-5", "claude-mythos-5-1", "claude-sonnet", "claude-sonnet-5", "claude-haiku", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna"} {
 		r := familyRates[family]
 		approx(t, r.cacheWritePerToken, 1.25*r.inputPerToken)
 	}
@@ -234,7 +317,7 @@ func TestCacheRates_Multipliers(t *testing.T) {
 // for every live model id, so a non-cache-aware caller routed through the new
 // entry point is unaffected.
 func TestCostWithCache_ReducesToCost(t *testing.T) {
-	for _, model := range []string{"claude-opus-4-8", "claude-fable-5", "claude-sonnet-4-6", "claude-haiku-4-5", "gpt-5.5", "gpt-5.6-terra", "gpt-6-astra"} {
+	for _, model := range []string{"claude-opus-4-8", "claude-opus-5-5", "claude-fable-5", "claude-fable-5-1", "claude-sonnet-4-6", "claude-sonnet-5-5", "claude-haiku-4-5", "gpt-5.5", "gpt-5.6-terra", "gpt-6-astra"} {
 		t.Run(model, func(t *testing.T) {
 			wantUSD, wantOK := Cost(model, 1_234_567, 89_012)
 			gotUSD, gotOK := CostWithCache(model, 1_234_567, 0, 0, 89_012)

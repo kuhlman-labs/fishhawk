@@ -39,7 +39,7 @@ never reads the clock or the network.
 ### The family→reference map
 
 `familyToLiteLLM` is the **operator-maintained** family → reference-id
-map (e.g. `claude-opus` → `claude-opus-4-7`).
+map (e.g. `claude-opus` → `claude-opus-5`).
 `TestDriftReferenceMapMatchesFamilies` pins it to `familyRates` so a
 family add/rename can't silently drop coverage. A missing reference
 reports `no_reference` — a provenance gap, not a false drift. The alarm
