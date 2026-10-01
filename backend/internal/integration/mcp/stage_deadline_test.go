@@ -59,6 +59,7 @@ workflows:
 // identity, not silent skew) and that all three fields drop once the stage goes
 // terminal.
 func TestE2E_StageDeadline_RemainingBudgetOnWaitStatus(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
@@ -172,6 +173,7 @@ func TestE2E_StageDeadline_RemainingBudgetOnWaitStatus(t *testing.T) {
 // Per-layer units each pass while the seam breaks; only the end-to-end read
 // pins it.
 func TestE2E_StageDeadline_RedispatchReportsPerAttemptBudget(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()

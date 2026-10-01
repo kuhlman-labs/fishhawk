@@ -58,6 +58,7 @@ workflows:
 // this integration package is the proven home for the real span (as #2515's
 // scope-edit E2E is for its seam).
 func TestE2E_PlanWarnings_NearCapAdvisory_ShipToGetPlan(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()

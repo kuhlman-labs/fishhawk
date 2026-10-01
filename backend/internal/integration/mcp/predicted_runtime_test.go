@@ -60,6 +60,7 @@ workflows:
 // mismatch at either seam, a stamp that never fires, a derivation wired to the
 // wrong stage — passes every unit test and fails here.
 func TestE2E_PredictedRuntime_DrivesAdvertisedPollInterval(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
@@ -286,6 +287,7 @@ workflows:
 // No fakeBackend anywhere: the router, the repos, the database and the MCP
 // server process are all real.
 func TestE2E_RawPredictedRuntime_GatesOnMaxNotCalibrated(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()

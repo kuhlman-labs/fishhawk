@@ -33,6 +33,7 @@ import (
 // exactly-at-cap reason whose final line is a distinctive marker reaches the
 // implement prompt with that marker intact and no "...[truncated]" suffix.
 func TestE2E_ApprovalConditions_OverCapRefused_AtCapReachesPrompt(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -226,6 +227,7 @@ func getPromptRenderText(t *testing.T, ctx context.Context, baseURL string, stag
 // criterion is recorded FAILED and routed to triage, so this can never become a
 // way to silence a live criterion.
 func TestE2E_AmendAcceptanceCriteria_RetiredAtApproval_ReachesAcceptancePromptAndNeutralizesVerdict(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
@@ -478,6 +480,7 @@ func TestE2E_AmendAcceptanceCriteria_RetiredAtApproval_ReachesAcceptancePromptAn
 // asserts the PROMPT TEXT names the added criterion as operator-authored and
 // that acceptance_criteria_ids serves the added id.
 func TestE2E_AmendAcceptanceCriteria_AddedAtApproval_ReachesAcceptancePrompt(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()

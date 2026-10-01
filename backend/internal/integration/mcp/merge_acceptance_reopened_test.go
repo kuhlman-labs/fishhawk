@@ -45,6 +45,7 @@ import (
 // before any advisory could render; the merge surface's own branches are pinned
 // by mcpserver/merge_run_test.go against its httptest backend.
 func TestE2E_NextActions_AcceptanceReopenedBlocksMerge(t *testing.T) {
+	t.Parallel()
 	fx := newFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()

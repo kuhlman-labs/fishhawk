@@ -28,6 +28,7 @@ func (r *recordingExecer) Exec(_ context.Context, sql string, _ ...any) (pgconn.
 }
 
 func TestSetTenant_EmitsSetLocal(t *testing.T) {
+	t.Parallel()
 	rec := &recordingExecer{}
 	accountID := uuid.New()
 	if err := postgres.SetTenant(context.Background(), rec, accountID.String()); err != nil {
@@ -45,6 +46,7 @@ func TestSetTenant_EmitsSetLocal(t *testing.T) {
 // An empty account id is the fail-closed no-op: nothing is emitted, leaving
 // the GUC unset so the 0057 policies admit only NULL-account rows.
 func TestSetTenant_EmptyAccountIsNoOp(t *testing.T) {
+	t.Parallel()
 	rec := &recordingExecer{}
 	if err := postgres.SetTenant(context.Background(), rec, ""); err != nil {
 		t.Fatalf("SetTenant with empty account: %v", err)
@@ -58,6 +60,7 @@ func TestSetTenant_EmptyAccountIsNoOp(t *testing.T) {
 // that makes inlining the value into SET LOCAL (which cannot take bind
 // parameters) injection-safe.
 func TestSetTenant_RejectsNonUUID(t *testing.T) {
+	t.Parallel()
 	rec := &recordingExecer{}
 	err := postgres.SetTenant(context.Background(), rec, "'; DROP TABLE runs; --")
 	if err == nil {
@@ -69,6 +72,7 @@ func TestSetTenant_RejectsNonUUID(t *testing.T) {
 }
 
 func TestSetTenant_PropagatesExecError(t *testing.T) {
+	t.Parallel()
 	sentinel := errors.New("exec failed")
 	rec := &recordingExecer{err: sentinel}
 	err := postgres.SetTenant(context.Background(), rec, uuid.NewString())
@@ -82,6 +86,7 @@ func TestSetTenant_PropagatesExecError(t *testing.T) {
 // fn's writes commit, and the SET LOCAL reverts with the transaction so the
 // pooled connection does not leak the tenant into later queries.
 func TestWithTenant_ScopesTransactionAndCommits(t *testing.T) {
+	t.Parallel()
 	pool := pgtest.NewPool(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -125,6 +130,7 @@ func TestWithTenant_ScopesTransactionAndCommits(t *testing.T) {
 
 // A failing fn rolls the transaction back: no partial write survives.
 func TestWithTenant_RollsBackOnFnError(t *testing.T) {
+	t.Parallel()
 	pool := pgtest.NewPool(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -154,6 +160,7 @@ func TestWithTenant_RollsBackOnFnError(t *testing.T) {
 // An invalid account id fails before fn runs — the transaction never
 // executes tenant-scoped work under a garbage tenant.
 func TestWithTenant_InvalidAccountSkipsFn(t *testing.T) {
+	t.Parallel()
 	pool := pgtest.NewPool(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()

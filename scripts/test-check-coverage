@@ -199,6 +199,170 @@ else
   fail "(e) aggregate regression (rc_pass=$rc_pass rc_fail=$rc_fail out='$out' out2='$out2')"
 fi
 
+# ===========================================================================
+# MERGE CASES m1..m6 (#3881): check-coverage.py merges blocks that recur
+# across profiles, keyed on the FULL span, before counting. Placed after the
+# (e) aggregate-regression pin so the unchanged aggregate shape is asserted
+# first. Each asserts an exit code AND a distinguishing substring.
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# (m1) ACCEPTANCE CASE + merge counterfactual vehicle. One file with block X
+#      (4 stmts) and block Y (1 stmt), both covered, aggregates to 100%. SPLIT
+#      into two overlapping shard profiles — shard A carries X covered / Y not,
+#      shard B carries X not / Y covered — the two-profile aggregate is the SAME
+#      100%. Unmerged, shard summation doubles the denominator (4+1+5=... total
+#      5+5=10) over numerator 5 = 50%, a 50-point gap, so a deleted merge reddens
+#      on the aggregate percentage, not on a setup error.
+# ---------------------------------------------------------------------------
+cat > "$tmproot/m1-full.out" <<EOF
+mode: atomic
+${PFX}backend/internal/foo/foo.go:3.1,7.2 4 1
+${PFX}backend/internal/foo/foo.go:9.1,9.10 1 1
+EOF
+out_full="$(python3 "$CC" --threshold 90 "$tmproot/m1-full.out" 2>&1)"; rc_full=$?
+cat > "$tmproot/m1-a.out" <<EOF
+mode: atomic
+${PFX}backend/internal/foo/foo.go:3.1,7.2 4 1
+${PFX}backend/internal/foo/foo.go:9.1,9.10 1 0
+EOF
+cat > "$tmproot/m1-b.out" <<EOF
+mode: atomic
+${PFX}backend/internal/foo/foo.go:3.1,7.2 4 0
+${PFX}backend/internal/foo/foo.go:9.1,9.10 1 1
+EOF
+out_split="$(python3 "$CC" --threshold 90 "$tmproot/m1-a.out" "$tmproot/m1-b.out" 2>&1)"; rc_split=$?
+if [ "$rc_full" -eq 0 ] && printf '%s' "$out_full" | grep -q '5/5 = 100.0%' \
+   && [ "$rc_split" -eq 0 ] && printf '%s' "$out_split" | grep -q '5/5 = 100.0%'; then
+  pass "(m1) two overlapping shard profiles aggregate to the same 100% as one full profile"
+else
+  fail "(m1) expected both 100.0% (rc_full=$rc_full out_full='$out_full' rc_split=$rc_split out_split='$out_split')"
+fi
+
+# ---------------------------------------------------------------------------
+# (m2) NO-REGRESSION CONTROL: two DISJOINT profiles (different files, no shared
+#      span) aggregate to exactly the pre-change figure. The merge is an identity
+#      map here, so any perturbation of the normal CI shape shows up.
+# ---------------------------------------------------------------------------
+cat > "$tmproot/m2-a.out" <<EOF
+mode: atomic
+${PFX}backend/internal/foo/a.go:3.1,7.2 4 1
+EOF
+cat > "$tmproot/m2-b.out" <<EOF
+mode: atomic
+${PFX}backend/internal/bar/b.go:3.1,3.10 1 0
+EOF
+out="$(python3 "$CC" --threshold 70 "$tmproot/m2-a.out" "$tmproot/m2-b.out" 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q '4/5 = 80.0%'; then
+  pass "(m2) two disjoint profiles aggregate to the unchanged 80.0% (merge is an identity map)"
+else
+  fail "(m2) expected 4/5 = 80.0% (rc=$rc, out='$out')"
+fi
+
+# ---------------------------------------------------------------------------
+# (m3) PER-MODE COMBINATION, asserted by importing merge_profiles directly:
+#      neither gate's printed verdict depends on max-vs-sum (both only test
+#      count > 0), so the CLI cannot observe it. A `mode: set` pair of 1 and 1
+#      merges to 1 (MAX, not 2); a `mode: atomic` pair of 2 and 3 merges to 5
+#      (SUM). Swapping MAX for SUM yields 2 for the set case, which this asserts
+#      against.
+# ---------------------------------------------------------------------------
+cat > "$tmproot/m3-set-a.out" <<EOF
+mode: set
+${PFX}backend/internal/foo/x.go:1.1,1.5 2 1
+EOF
+cat > "$tmproot/m3-set-b.out" <<EOF
+mode: set
+${PFX}backend/internal/foo/x.go:1.1,1.5 2 1
+EOF
+cat > "$tmproot/m3-atomic-a.out" <<EOF
+mode: atomic
+${PFX}backend/internal/foo/x.go:1.1,1.5 2 2
+EOF
+cat > "$tmproot/m3-atomic-b.out" <<EOF
+mode: atomic
+${PFX}backend/internal/foo/x.go:1.1,1.5 2 3
+EOF
+out="$(python3 - "$CC" "$tmproot/m3-set-a.out" "$tmproot/m3-set-b.out" \
+        "$tmproot/m3-atomic-a.out" "$tmproot/m3-atomic-b.out" <<'PY' 2>&1
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("cc", sys.argv[1])
+cc = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(cc)
+set_merged = cc.merge_profiles([sys.argv[2], sys.argv[3]], [])
+(_, set_count), = set_merged.values()
+assert set_count == 1, f"set MAX expected 1, got {set_count}"
+atomic_merged = cc.merge_profiles([sys.argv[4], sys.argv[5]], [])
+(_, atomic_count), = atomic_merged.values()
+assert atomic_count == 5, f"atomic SUM expected 5, got {atomic_count}"
+print("MERGE OK")
+PY
+)"
+rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'MERGE OK'; then
+  pass "(m3) merge_profiles combines set by MAX (1) and count/atomic by SUM (5)"
+else
+  fail "(m3) per-mode combination (rc=$rc, out='$out')"
+fi
+
+# ---------------------------------------------------------------------------
+# (m4) MIXED-MODE REFUSAL counterfactual: a `mode: set` profile plus a
+#      `mode: atomic` profile must exit 1 naming both modes. With the mode guard
+#      deleted the run proceeds and exits 0 with a printed percentage.
+# ---------------------------------------------------------------------------
+out="$(python3 "$CC" --threshold 50 "$tmproot/m3-set-a.out" "$tmproot/m3-atomic-a.out" 2>&1)"; rc=$?
+if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'differing modes' \
+   && printf '%s' "$out" | grep -q "'set'" && printf '%s' "$out" | grep -q "'atomic'"; then
+  pass "(m4) mixed set/atomic profiles fail closed (exit 1) naming both modes"
+else
+  fail "(m4) expected exit 1 naming both modes (rc=$rc, out='$out')"
+fi
+
+# ---------------------------------------------------------------------------
+# (m5) NUMSTMTS-MISMATCH REFUSAL counterfactual: two profiles carrying the same
+#      span with numstmts 4 and 3 must exit 1 naming the file and the span. With
+#      the guard deleted the merge silently keeps one value and exits 0.
+# ---------------------------------------------------------------------------
+cat > "$tmproot/m5-a.out" <<EOF
+mode: atomic
+${PFX}backend/internal/foo/foo.go:3.1,7.2 4 1
+EOF
+cat > "$tmproot/m5-b.out" <<EOF
+mode: atomic
+${PFX}backend/internal/foo/foo.go:3.1,7.2 3 1
+EOF
+out="$(python3 "$CC" --threshold 50 "$tmproot/m5-a.out" "$tmproot/m5-b.out" 2>&1)"; rc=$?
+if [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'conflicting numstmts' \
+   && printf '%s' "$out" | grep -q 'foo/foo.go:3.1,7.2'; then
+  pass "(m5) same span with conflicting numstmts fails closed (exit 1) naming the file and span"
+else
+  fail "(m5) expected exit 1 naming the file and span (rc=$rc, out='$out')"
+fi
+
+# ---------------------------------------------------------------------------
+# (m6) BINDING CONDITION 2 — the DIFF gate over the same overlapping shard pair
+#      as m1 reports the same patch percentage as one full profile, guarding the
+#      diff_coverage rewire. Built on a real git temp repo, reusing the (a)
+#      pattern. Diff mode was already duplicate-tolerant (it unions per-file line
+#      sets), so this is a no-regression pin, not a bug fix.
+# ---------------------------------------------------------------------------
+repo="$tmproot/m6"
+new_repo "$repo"
+git -C "$repo" checkout -q -b feature
+apply_patch_commit "$repo"
+foo_profile "$tmproot/m6-full.out" 1 1 1
+out_full="$(run_diff "$repo" "$tmproot/m6-full.out")"; rc_full=$?
+foo_profile "$tmproot/m6-a.out" 1 1 0
+foo_profile "$tmproot/m6-b.out" 0 0 1
+out_split="$(python3 "$CC" --diff-base main --repo-root "$repo" \
+              "$tmproot/m6-a.out" "$tmproot/m6-b.out" 2>&1)"; rc_split=$?
+if [ "$rc_full" -eq 0 ] && printf '%s' "$out_full" | grep -q 'Patch coverage: 5/5' \
+   && [ "$rc_split" -eq 0 ] && printf '%s' "$out_split" | grep -q 'Patch coverage: 5/5'; then
+  pass "(m6) the diff gate over two overlapping shards reports the same 5/5 as one full profile"
+else
+  fail "(m6) expected both 5/5 (rc_full=$rc_full out_full='$out_full' rc_split=$rc_split out_split='$out_split')"
+fi
+
 # ---------------------------------------------------------------------------
 # (f) no changed Go files -> SKIP, exit 0, with a printed reason.
 # ---------------------------------------------------------------------------

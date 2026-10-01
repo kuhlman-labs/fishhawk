@@ -193,6 +193,7 @@ func visibleKeys(t *testing.T, pool *pgxpool.Pool, account, table, keyCol string
 // the superuser admin role demonstrably bypasses all of it (the documented
 // reason this slice is inert in production until the runtime-role follow-up).
 func TestRLS_CrossAccountIsolation(t *testing.T) {
+	t.Parallel()
 	f := newRLSFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
@@ -343,6 +344,7 @@ func TestRLS_CrossAccountIsolation(t *testing.T) {
 // role: the cross-account row must be hidden while the own + NULL rows remain
 // visible.
 func TestRLS_CrossAccountReadIsolation_AllAccountTables(t *testing.T) {
+	t.Parallel()
 	f := newRLSFixture(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()

@@ -239,6 +239,7 @@ Error messages: precise about what failed and how to fix. No generic apologies.
 
 ## Traps
 
+- **`t.Parallel()` and `t.Setenv`/`t.Chdir` are mutually exclusive — a test calling both PANICS** (`testing: test using t.Setenv or t.Chdir can not use t.Parallel`). `backend/internal/postgres` (except `startcontainer_test.go`) and `backend/internal/integration/mcp` run every top-level test with `t.Parallel()` (#3881), so a new test needing `t.Setenv`/`t.Chdir` must go in a non-parallel file instead.
 - **macOS bash is 3.2** — no associative arrays. Use zsh, gawk, or awk lookups for scripts that need them.
 - **A container image build must derive `GOARCH` from BuildKit's `TARGETARCH` automatic platform ARG (declared inside the stage that uses it), never a literal** — a hardcoded `GOARCH=amd64` is invisible on an amd64 CI runner and only surfaces as emulated execution on an arm64 host/node (#2912); `scripts/test-dev` pins the shipped directive.
 - **A host behind a TLS-inspecting corporate egress proxy fails `docker build -f backend/Dockerfile` with `x509: certificate signed by unknown authority`** during `go mod download` — the tell: the same command run directly on the host (outside the container) succeeds, because the container's trust store doesn't carry the interception CA that the host's does; registry/base-image pulls are unaffected (#2918). Fix + full diagnostic: `docs/deploy/kubernetes.md` § "When the build fails with `x509: certificate signed by unknown authority`".
