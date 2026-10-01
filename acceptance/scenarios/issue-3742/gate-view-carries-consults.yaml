@@ -1,0 +1,14 @@
+id: scenario:issue-3742/gate-view-carries-consults
+statement: The gate-view read carries a consults array — present and empty for a run that sent none — so the captain can see at the plan gate what was asked and what was answered, with each consult's cited chain entry ids.
+verify_hint: GET /v0/runs/{run_id}/gate-view?stage_kind=plan returns 200 and the body carries the consults field as an array; the fishhawk_get_gate_view MCP tool result carries the same consults field.
+steps: Mint operator bearers via psql. (a) POST http://localhost:8090/v0/dev/fixtures plan-gate-parked -> run R0; GET /v0/runs/R0/gate-view?stage_kind=plan; MCP POST /mcp tools/call fishhawk_get_gate_view {run_id R0, stage_kind plan} with the operator bearer. (b) Seed prior plan rejections (plan-gate-parked + POST /v0/stages/<plan>/approvals {decision reject}), seed trace-upload-target run R, mint its fhm_ token, send two historian consults from R (POST /v0/crew-messages, wait-poll GET /v0/crew-messages/<seq>?wait=30), then GET /v0/runs/R/gate-view?stage_kind=plan and MCP fishhawk_get_gate_view for R.
+assertions:
+    expected: consults array present (empty when none) with each consult's question, answer and cited chain entry ids; MCP carries the same.
+    observed_at_record: '(a) 200, consults: [] (key present, history_incomplete false); MCP structuredContent.gate_view.consults: []. (b) 200, consults has two entries {sent_sequence 97/100, stage_kind plan, sender_role planner, recipient_role historian, state accepted, answered true, question, answer_summary, cited_entry_refs [audit_entry:91, audit_entry:90, audit_entry:81]}; MCP returns the same consults. No sentinel text in the gate view.'
+    repro_handle: GET /v0/runs/{run_id}/gate-view?stage_kind=plan
+origin:
+    issue: 3742
+    pr: 3887
+    run_id: c3cc3d02-a105-4572-8c1e-cf87165f1c5e
+    head_sha: f5aa3542234d35944fb23921d4e70ea0fa586db6
+    recorded_at: 2026-10-01T00:57:34Z
