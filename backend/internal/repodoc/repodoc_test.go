@@ -203,6 +203,189 @@ func TestResolve_EmptyBaseRef_Refused(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// E55.7 / #3746: a BaseSourceRunAdmission declaration reads ONLY at the run's
+// recorded admission commit.
+// ---------------------------------------------------------------------------
+
+// otherCommit is a DIFFERENT valid commit than pinnedCommit: what a moved
+// default-branch head (or the run's own branch tip) would resolve to.
+const otherCommit = "fedcba9876543210fedcba9876543210fedcba98"
+
+func runAdmissionDecl() Declaration {
+	d := testDecl()
+	d.Base = BaseSourceRunAdmission
+	return d
+}
+
+// The guard under test is the ONLY thing between a branch ref and a successful
+// read: the commit resolver maps every ref to a VALID 40-hex commit and the
+// fetcher serves content there (and at every mutable ref), by construction.
+// With the guard deleted, Resolve pins the branch and succeeds.
+func TestResolve_RunAdmission_RefusesBranchRef(t *testing.T) {
+	for _, ref := range []string{
+		baseBranch,
+		"refs/heads/" + baseBranch,
+		otherRefValue,
+		"fishhawk/run-26ede2f1",
+		pinnedCommit[:7],
+		pinnedCommit + "^{commit}",
+	} {
+		t.Run(ref, func(t *testing.T) {
+			ff := &fakeFetcher{blobSHA: fakeBlobSHA, byRef: map[string]string{
+				pinnedCommit: baseContent,
+				otherCommit:  softContent,
+				ref:          softContent,
+				"":           softContent,
+			}}
+			fc := &fakeCommits{sha: otherCommit, found: true}
+			r := &Resolver{Fetcher: ff, Commits: fc}
+			doc, err := r.Resolve(context.Background(), Request{
+				Repo: testRepo(), BaseRef: ref, Declaration: runAdmissionDecl(),
+			})
+			if !errors.Is(err, ErrUnpinnedBaseRef) {
+				t.Fatalf("BaseRef %q: err = %v, want ErrUnpinnedBaseRef (a run-admission declaration accepts only a commit)", ref, err)
+			}
+			if doc != nil {
+				t.Errorf("doc = %+v, want nil", doc)
+			}
+			if fc.calls != 0 {
+				t.Errorf("GetBranchSHA calls = %d, want 0: a run-admission declaration must never resolve a branch", fc.calls)
+			}
+			if n, refs := ff.calls(); n != 0 {
+				t.Errorf("FetchFile calls = %d (refs %v), want 0", n, refs)
+			}
+			assertNamesPathAndSite(t, err)
+		})
+	}
+}
+
+func TestResolve_RunAdmission_ReadsAtRecordedCommit(t *testing.T) {
+	for _, ref := range []string{pinnedCommit, strings.ToUpper(pinnedCommit), " " + pinnedCommit + "\n"} {
+		ff := &fakeFetcher{blobSHA: fakeBlobSHA, byRef: map[string]string{
+			pinnedCommit: baseContent,
+			otherCommit:  softContent,
+			baseBranch:   softContent,
+			"":           softContent,
+		}}
+		// The resolver would move the read to otherCommit if it were ever asked.
+		fc := &fakeCommits{sha: otherCommit, found: true}
+		r := &Resolver{Fetcher: ff, Commits: fc}
+		doc, err := r.Resolve(context.Background(), Request{
+			Repo: testRepo(), BaseRef: ref, Declaration: runAdmissionDecl(),
+		})
+		if err != nil {
+			t.Fatalf("BaseRef %q: Resolve: %v", ref, err)
+		}
+		if doc.Content != baseContent || doc.Commit != pinnedCommit {
+			t.Errorf("BaseRef %q: content %q at %q, want %q at the recorded commit %q", ref, doc.Content, doc.Commit, baseContent, pinnedCommit)
+		}
+		if doc.BaseSource != BaseSourceRunAdmission {
+			t.Errorf("BaseSource = %q, want %q echoed from the declaration", doc.BaseSource, BaseSourceRunAdmission)
+		}
+		if fc.calls != 0 {
+			t.Errorf("GetBranchSHA calls = %d, want 0", fc.calls)
+		}
+		if _, refs := ff.calls(); len(refs) != 1 || refs[0] != pinnedCommit {
+			t.Errorf("fetched at %v, want exactly once at %q", refs, pinnedCommit)
+		}
+	}
+}
+
+// A declaration-seam declaration (the zero BaseSource) is unchanged: a branch
+// ref is still pinned through the commit resolver, and the zero source is
+// echoed.
+func TestResolve_DeclarationSeam_UnchangedAndEchoed(t *testing.T) {
+	r, _, fc := seededResolver(t)
+	doc, err := r.Resolve(context.Background(), Request{
+		Repo: testRepo(), BaseRef: baseBranch, Declaration: testDecl(),
+	})
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if doc.BaseSource != BaseSourceDeclarationSeam || fc.calls != 1 {
+		t.Errorf("BaseSource = %q, GetBranchSHA calls = %d; want the zero source and one branch pin", doc.BaseSource, fc.calls)
+	}
+}
+
+// An unknown BaseSource is refused rather than read as the zero value: the
+// fixture would otherwise resolve "main" through a valid commit resolver and
+// succeed.
+func TestResolve_UnknownBaseSource_Refused(t *testing.T) {
+	r, ff, fc := seededResolver(t)
+	decl := testDecl()
+	decl.Base = BaseSource("run-admission")
+	doc, err := r.Resolve(context.Background(), Request{
+		Repo: testRepo(), BaseRef: baseBranch, Declaration: decl,
+	})
+	if !errors.Is(err, ErrUnknownBaseSource) {
+		t.Fatalf("err = %v, want ErrUnknownBaseSource", err)
+	}
+	if doc != nil {
+		t.Errorf("doc = %+v, want nil", doc)
+	}
+	if n, _ := ff.calls(); n != 0 || fc.calls != 0 {
+		t.Errorf("FetchFile calls = %d, GetBranchSHA calls = %d, want 0 and 0", n, fc.calls)
+	}
+	assertNamesPathAndSite(t, err)
+}
+
+// ---------------------------------------------------------------------------
+// PinCommit: the exported admission-time pin (E55.7 / #3746).
+// ---------------------------------------------------------------------------
+
+func TestPinCommit(t *testing.T) {
+	boom := errors.New("transport: connection reset")
+	cases := []struct {
+		name      string
+		ref       string
+		commits   *fakeCommits // nil = no commit resolver configured
+		want      string
+		wantErr   error
+		wantCalls int
+	}{
+		{"branch resolves to lowercased 40-hex", baseBranch,
+			&fakeCommits{sha: " " + strings.ToUpper(pinnedCommit) + "\n", found: true}, pinnedCommit, nil, 1},
+		{"40-hex ref used verbatim, lowercased", strings.ToUpper(pinnedCommit),
+			&fakeCommits{sha: otherCommit, found: true}, pinnedCommit, nil, 0},
+		// The resolver would return a VALID commit for "", so only the empty-ref
+		// guard stands between an empty ref and a default-branch pin.
+		{"empty ref", "", &fakeCommits{sha: pinnedCommit, found: true}, "", ErrUnpinnedBaseRef, 0},
+		{"whitespace ref", "   ", &fakeCommits{sha: pinnedCommit, found: true}, "", ErrUnpinnedBaseRef, 0},
+		{"branch not found", baseBranch, &fakeCommits{sha: "", found: false}, "", ErrUnpinnedBaseRef, 1},
+		{"non-commit resolver output", baseBranch, &fakeCommits{sha: otherRefValue, found: true}, "", ErrUnpinnedBaseRef, 1},
+		{"nil commit resolver with a branch ref", baseBranch, nil, "", ErrUnpinnedBaseRef, 0},
+		{"transport error", baseBranch, &fakeCommits{err: boom}, "", boom, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &Resolver{Fetcher: &neverFetcher{t: t}}
+			if tc.commits != nil {
+				r.Commits = tc.commits
+			}
+			got, err := r.PinCommit(context.Background(), testRepo(), forge.CredentialScope{}, tc.ref)
+			if tc.wantErr != nil {
+				if !errors.Is(err, tc.wantErr) {
+					t.Fatalf("err = %v, want %v", err, tc.wantErr)
+				}
+				if got != "" {
+					t.Errorf("commit = %q, want empty on refusal", got)
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("PinCommit: %v", err)
+				}
+				if got != tc.want {
+					t.Errorf("commit = %q, want %q", got, tc.want)
+				}
+			}
+			if tc.commits != nil && tc.commits.calls != tc.wantCalls {
+				t.Errorf("GetBranchSHA calls = %d, want %d", tc.commits.calls, tc.wantCalls)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
 // M2: GetBranchSHA's ("", false, nil) missing-branch shape fails closed.
 // ---------------------------------------------------------------------------
 

@@ -45,6 +45,7 @@ Every step fails closed.
 |---|---|---|
 | a | Validate the declared path: non-empty, repo-relative, no leading `/`, no `\`, no `.` / `..` / empty segment, canonical under `path.Clean`, valid UTF-8, **no control characters** | `ErrInvalidPath` |
 | b | Refuse an **empty** base ref | `ErrUnpinnedBaseRef` |
+| b2 | Refuse an unknown `Declaration.Base`; for a `BaseSourceRunAdmission` declaration, refuse any ref that is not already a 40-hex commit — **before** step c, so `GetBranchSHA` is never consulted for it | `ErrUnknownBaseSource` / `ErrUnpinnedBaseRef` |
 | c | Pin the ref: a 40-hex ref is used verbatim; anything else resolves via `GetBranchSHA` **and its OUTPUT must itself be a 40-hex commit SHA** | `ErrUnpinnedBaseRef` (missing branch, or a non-commit resolution) or the wrapped transport error |
 | d | `FetchFile` **at the pinned commit SHA** | wrapped transport error |
 | e | `forge.ErrNotFound` → declared-but-absent | `ErrMissingDocument` |
@@ -98,28 +99,92 @@ framed safely too and **neither layer alone is load-bearing**
 `blob_id`), not a commit SHA. The attributed commit therefore comes from the
 pinned commit resolution, never from `FileContent.SHA`.
 
-## Where the base ref comes from (the #2234 hand-off)
+## Where the base ref comes from
 
-**There is no per-run base-ref source reachable at prompt-serve time today.**
-This was verified for this slice, and it is recorded here so #2234 does not
-discover it late:
+Two sources, selected PER DECLARATION by `Declaration.Base` (a `BaseSource`):
 
-- `run.Run` carries no base-branch or base-commit field, and no migration adds
-  one.
-- The base branch exists only as **runner argv**: it is an MCP tool input
-  (`base_branch` on `fishhawk_run_stage` / `dispatch_stage` / `drive_run` /
-  `run_children`, defaulting to `"main"`), composed into `--base-branch` /
-  `--check-base-ref` by `backend/internal/mcpserver/dispatch_stage.go`. For a
-  dependent fan-out child the server is the authority
-  (`Server.resolveDependentChildBase`, `backend/internal/server/host_dispatch.go`),
-  but that value is returned in the host-dispatch marker response — it is not
-  persisted on the run.
-- `GET /v0/stages/{id}/prompt` therefore cannot recover the run's base ref from
-  storage.
+| `Declaration.Base` | Resolved against | `base_source` on `document_injected` | Consumer today |
+|---|---|---|---|
+| `BaseSourceDeclarationSeam` (zero value) | the ref `Config.DocumentDeclarations` returns as its second value (a branch pinned at serve time, or a commit) | `declaration_seam` | the #2234 charter (default-branch head at serve time, below) |
+| `BaseSourceRunAdmission` | `runs.document_base_commit` — the commit recorded on the run at admission, and nothing else | `run_admission` | none yet; E55.2 / #2797 attach here |
 
-So `Config.DocumentDeclarations` returns the base ref **as its second return
-value**: the mechanism takes it as a caller-supplied parameter rather than
-guessing.
+Before E55.7 there was no per-run base source reachable at prompt-serve time:
+`run.Run` carried no base field, and the base branch existed only as runner
+argv (the `base_branch` MCP dispatch input, composed into `--base-branch` by
+`backend/internal/mcpserver/dispatch_stage.go`). That is why
+`Config.DocumentDeclarations` returns a base ref at all, and it still does for
+seam-sourced declarations.
+
+### Run-admission base source (E55.7 / #3746)
+
+- **Recording.** At every ROOT run-mint seam — `POST /v0/runs` and campaign item
+  start (both via `CreateRunForTrigger`), and the GitHub and GitLab webhook
+  dispatchers — the server pins the repository's default-branch head through the
+  existing document seam (`DocumentScope` → `DocumentBaseRef` →
+  `Resolver.PinCommit`) and stamps it on `runs.document_base_commit` (nullable;
+  a DB CHECK admits only NULL or a lowercase 40-hex commit). Capture is bounded
+  and **never blocks admission**: every capture failure records NULL.
+- **Inheritance.** Children (operator recovery, CI retry, decomposition) inherit
+  the column verbatim through `run.ChildParamsFrom`, and a fix-up re-serves from
+  the same row, so retries and fix-ups resolve against the admission commit —
+  never a newer head and never the run's own (agent-writable) branch.
+- **Resolution.** The server hands a run-admission declaration
+  `Request.BaseRef = *runRow.DocumentBaseCommit`. `Resolve` refuses any ref for
+  it that is not already a 40-hex commit **before** `pinCommit`, so
+  `GetBranchSHA` is never consulted and a branch name can never become the read
+  point, whatever a future caller passes
+  (`TestResolve_RunAdmission_RefusesBranchRef`, whose fake commit resolver maps
+  every ref to a valid commit so the guard is the only thing in the path;
+  `TestResolve_RunAdmission_ReadsAtRecordedCommit`). An unknown `Base` is
+  refused rather than read as the zero value, which would silently resolve at
+  the seam's ref (`TestResolve_UnknownBaseSource_Refused`).
+- **Withholding, not fallback.** A run with NULL `document_base_commit` (a legacy
+  row, a deployment with no document seam, or a degraded capture) has its
+  run-admission declarations **WITHHELD**: none is resolved or fetched. Falling
+  back to the default branch would be exactly the mutable read this source
+  rules out. The prompt carries `WithheldNotice` — heading `Declared repository
+  documents withheld`, reason `run_base_commit_unrecorded`
+  (`WithheldReasonRunBaseUnrecorded`), and each withheld path and declaration
+  site — on BOTH the served and preview paths, so the two stay byte-identical.
+  The notice is system-authored; every interpolated value passes
+  `sanitizeMetadata`, so a repo-chosen file name carrying a newline cannot start
+  a forged heading (`TestWithheldNotice_AdversarialMetadata_CannotStartALine`).
+  Its `Path` / `Commit` / `ContentHash` are empty, so it can never satisfy a
+  consumer's injected-document identity check.
+- **Attribution of a withholding.** The served path (only) calls
+  `RecordWithheld`, which writes ONE `document_injection_degraded` entry and
+  **fails closed** exactly like `Attribute` — an append error, a nil appender,
+  or an empty reason is returned and the caller must not serve the prompt
+  (`TestRecordWithheld_FailsClosed`). The preview writes nothing, matching the
+  attribution domain below.
+
+`Resolver.PinCommit(ctx, repo, scope, ref)` is the exported admission-time pin:
+the same rules as `Resolve`'s step c (a 40-hex ref verbatim and lowercased;
+anything else through `GetBranchSHA`, whose OUTPUT must itself be a full commit
+SHA), plus an explicit refusal of an empty ref (`TestPinCommit`).
+
+**Residuals, stated plainly.**
+
+1. **The admission commit is the DEFAULT-BRANCH head at run creation**, not the
+   run's own base branch: at admission the server cannot know the
+   `--base-branch` a later `dispatch_stage` passes. This repo bases every run on
+   the default branch, so the two coincide here; a run dispatched against a
+   non-default base reads documents from the default-branch head captured at
+   admission. That is a fidelity residual, not a security one — documents never
+   follow the run's own branch. Capturing the run's own non-default base branch
+   is tracked as **#3902**.
+2. **The webhook dispatcher's capture hook is wired in `cmd/fishhawkd/serve.go`
+   after `server.New` with no direct automated test** (the dispatcher's own stamp
+   is unit-tested with a fake hook). Deleting that wiring leaves webhook-minted
+   runs NULL, which degrades safely — withheld with the notice, never a mutable
+   read. Tracked as **#3902**.
+3. **The charter keeps its serve-time default-branch semantics** (below) until
+   E71.2 / #3242, which should switch its declaration to
+   `BaseSourceRunAdmission` and reuse `runs.document_base_commit` rather than add
+   a second column.
+4. A deployment with no attributable forge credential for a repo fails
+   `DocumentScope` at admission, records NULL, and withholds; the notice names
+   the cause.
 
 ### What #2234 actually did (the charter consumer)
 
@@ -148,21 +213,15 @@ wanted (the groomer should rank against the current charter), and the recorded
 commit + content hash make which revision applied decidable after the fact.
 
 **This shortcut is NOT reusable by E55's review-conventions consumer.** That
-consumer attaches to CODE-CHANGE runs whose base may differ from the default
-branch, so it still needs a per-run base-ref source. Both options below stay
-open for it, in preference order:
+consumer attaches to CODE-CHANGE runs, where a serve-time head would let a
+document amendment landing mid-run change which revision constrains a retry or
+fix-up. It declares `BaseSourceRunAdmission` instead (above). Of the two options
+this section used to list — persist the base on the run row, or record it as a
+dispatch audit entry — E55.7 took the first, as a **commit** rather than a
+branch name: a persisted branch name would still be a mutable read point.
 
-1. **Persist the base ref on the run row** at run-create / dispatch time (a
-   `base_branch` column plus a migration), which makes it available to every
-   later read including this one. This is the option that also fixes the
-   adjacent gap that the base ref is not auditable today.
-2. **Record it as a run-scoped audit entry** at dispatch and read it back with
-   `ListForRunByCategory` — cheaper (no migration), but a run whose dispatch
-   predates the entry has no base ref, so the seam must fail closed rather than
-   default.
-
-Whichever is chosen, the value handed to the seam MUST be the run's **base**
-branch or a commit SHA — never the run's own branch, which the agent can write.
+Whatever the source, the value handed to `Resolve` MUST be the run's **base**
+or a commit SHA — never the run's own branch, which the agent can write.
 A pinned-SHA preference is verified here by fake seam
 (`TestResolve_ReadsFromPinnedBaseRef`, `TestGetStagePrompt_InjectedDocument_EndToEnd`,
 and the charter consumer's `TestGroomingPrompt_PinnedCommitBeatsBranchTip`).
@@ -191,8 +250,9 @@ fail-closed refusal runs there too. A preview and a served prompt for the same
 stage therefore carry identical bytes and refuse identically.
 
 The one divergence is ATTRIBUTION, and it is deliberate: the preview wrapper
-passes `attribute=false`, so `Attribute` is never called and no
-`document_injected` / `document_truncated` entry is written. See the
+passes `attribute=false`, so neither `Attribute` nor `RecordWithheld` is called
+and no `document_injected` / `document_truncated` / `document_injection_degraded`
+entry is written. See the
 attribution-domain note below.
 
 ## Content-hash byte domain
@@ -297,10 +357,13 @@ NEL included — plus U+2028/U+2029).
 
 | Category | When | Payload keys |
 |---|---|---|
-| `document_injected` | every injection | `declaration_site`, `path`, `commit`, `content_hash`, `original_bytes`, `rendered_bytes`, `truncated`, `injection_set_id`, `document_index`, `document_count` |
+| `document_injected` | every injection | `declaration_site`, `path`, `commit`, `content_hash`, `original_bytes`, `rendered_bytes`, `truncated`, `base_source`, `injection_set_id`, `document_index`, `document_count` |
 | `document_truncated` | in **addition**, when the document was cut | `path`, `commit`, `content_hash`, `cap_bytes`, `dropped_bytes`, `injection_set_id` |
+| `document_injection_degraded` | once per SERVED prompt that withheld run-admission declarations (E55.7 / #3746) | `reason` (`run_base_commit_unrecorded`), `paths`, `declaration_sites`, `document_count` |
 
-Both are registered in `audit.KnownCategories`, so `fishhawk_await_audit` and
+`base_source` on `document_injected` is `run_admission` or `declaration_seam`
+(the zero `BaseSource`, named explicitly so an entry never reads as
+unrecorded). All three are registered in `audit.KnownCategories`, so `fishhawk_await_audit` and
 `GET /v0/runs/{id}/audit` accept them without `allow_unknown`. `cap_bytes` is
 the **configured** cap carried on the Document — it cannot be reconstructed
 from `OriginalBytes` and `RenderedBytes` once a rune-safe cut and a marker have
@@ -391,11 +454,11 @@ exactly the ones covering re-dispatches — the case where knowing what the agen
 was shown matters most. A reader wanting the distinct set groups by
 `content_hash`; do **not** dedupe at write time.
 
-Note that only the **signed** `/prompt` endpoint injects and attributes.
-`/prompt-render` (the unsigned preview) does not, so a preview never writes to
-the audit trail. Once a declaration site ships, a preview and a dispatched
-prompt will differ by the injected block; that is the trade for not letting a
-read-only preview mutate the run record.
+Note that only the **signed** `/prompt` endpoint attributes. `/prompt-render`
+(the unsigned preview) injects the identical bytes since E54.12 / #2804 —
+including any `WithheldNotice` — but writes NO `document_injected`,
+`document_truncated` or `document_injection_degraded` entry, so a preview never
+writes to the audit trail.
 
 ## Fail-closed matrix
 
@@ -420,11 +483,20 @@ read-only preview mutate the run record.
 | malformed run repo | refuse before any fetch | `TestResolveInjectedDocuments_MalformedRepo_FailsClosed` |
 | credential-scope resolution failure | refuse before any fetch | `TestResolveInjectedDocuments_ScopeResolutionError_FailsClosed` |
 | declaration seam error | prompt request fails 500 | `TestGetStagePrompt_DeclarationSeamError_FailsClosed` |
+| M13 run-admission declaration handed a non-commit ref (a branch, `HEAD`, a short SHA) | refuse before any branch resolution or fetch | `TestResolve_RunAdmission_RefusesBranchRef` |
+| M14 unknown `Declaration.Base` | refuse before any fetch, never read as the zero value | `TestResolve_UnknownBaseSource_Refused` |
+| M15 `PinCommit` empty ref / missing branch / non-commit output / no resolver / transport error | refuse (or wrap), never a default-branch pin | `TestPinCommit` |
+| M16 run recorded no admission commit | run-admission declarations withheld, never fetched; notice rendered; one `document_injection_degraded` on the served path | `TestRecordWithheld_WritesOneDegradedEntry`, `TestWithheldNotice_NamesReasonPathsAndSites`, and the serve cases in `backend/internal/server/document_injection_test.go` |
+| M17 `document_injection_degraded` append fails / nil appender / empty reason | error; caller must not serve | `TestRecordWithheld_FailsClosed` |
+| M18 withheld path or site forges a heading through a line separator | sanitized to U+FFFD, cannot start a line | `TestWithheldNotice_AdversarialMetadata_CannotStartALine` |
 
 ## Consumer contract
 
 A consumer supplies exactly two things: a `Declaration` (path + declaration
-site, plus the `Framing` it wants) and the base ref to pin against. Everything
+site, plus the `Framing` it wants, plus its `Base` source) and — for a
+seam-sourced declaration — the base ref to pin against; a
+`BaseSourceRunAdmission` declaration is pinned to the run's recorded commit
+instead. Everything
 else is shared. `Declaration.Framing` rides on the declaration purely so one
 seam value carries both halves of a consumer's contribution; `Resolve` ignores
 it entirely — only `Render` reads it.
