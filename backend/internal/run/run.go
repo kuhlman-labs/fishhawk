@@ -605,9 +605,33 @@ type Run struct {
 	// max_retries / runner_kind default substitution next to it) and NULL
 	// scans back as nil.
 	RequiresCharter *bool
-	State           State
-	CreatedAt       time.Time
-	UpdatedAt       time.Time
+	// DocumentBaseCommit is the run-admission document base commit
+	// (migration 0091, E55.7 / #3746): the commit, recorded ONCE when the
+	// root run was minted, that every repo-declared document marked
+	// run-admission (repodoc BaseSourceRunAdmission) is resolved from for
+	// the life of the run. Children inherit it verbatim via ChildParamsFrom,
+	// so a retry, recovery or decomposition child — and a fix-up re-serve of
+	// the same row — reads documents at the admission commit, never at a
+	// newer default-branch head or at the run's own branch.
+	//
+	// TWO STATES:
+	//   pointer to a lowercase 40-hex commit  the admission commit.
+	//   nil                                   NO commit recorded at admission:
+	//                                         a row minted before 0091, a
+	//                                         deployment with no document
+	//                                         seam, or a degraded capture. A
+	//                                         consumer WITHHOLDS run-admission
+	//                                         documents for such a run; it
+	//                                         never falls back to a mutable
+	//                                         ref.
+	//
+	// The DB CHECK (runs_document_base_commit_check) makes any other value
+	// unrepresentable. The repo layer passes it through verbatim in BOTH
+	// directions: nil persists as SQL NULL and NULL scans back as nil.
+	DocumentBaseCommit *string
+	State              State
+	CreatedAt          time.Time
+	UpdatedAt          time.Time
 }
 
 // IssueContext is the cached payload from `gh issue view --json

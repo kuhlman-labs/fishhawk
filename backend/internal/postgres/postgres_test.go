@@ -6365,3 +6365,133 @@ func TestMigrateUp_StageSupersededByMergeUnique_FailsLoudOnPreExistingDuplicates
 		t.Errorf("MigrateUp error does not carry the pre-flight's remedy HINT (append-only / hash-chained / recreate the database): %v", upErr)
 	}
 }
+
+// TestMigrateDown_RunsDocumentBaseCommitReversal pins 0091 (E55.7 / #3746) in
+// BOTH directions. After MigrateUp runs.document_base_commit EXISTS as a
+// NULLABLE TEXT column with NO default (NULL = "no commit recorded at
+// admission" is load-bearing — a default would assert a pin nothing recorded)
+// and runs_document_base_commit_check is present and ENFORCING: a lowercase
+// 40-hex commit and NULL insert, while a branch name, an uppercase SHA and a
+// short SHA are rejected with SQLSTATE 23514. After rolling back through 0091
+// the constraint and the column are gone while the runs table survives (0091
+// is an ALTER, never a DROP TABLE), and a re-apply restores the same shape.
+func TestMigrateDown_RunsDocumentBaseCommitReversal(t *testing.T) {
+	t.Parallel()
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+
+	ctx := context.Background()
+
+	columnCount := func() int {
+		t.Helper()
+		var n int
+		if err := pool.QueryRow(ctx,
+			`SELECT count(*) FROM information_schema.columns
+			  WHERE table_name = 'runs' AND column_name = 'document_base_commit'`).Scan(&n); err != nil {
+			t.Fatalf("query runs.document_base_commit: %v", err)
+		}
+		return n
+	}
+	constraintCount := func() int {
+		t.Helper()
+		var n int
+		if err := pool.QueryRow(ctx,
+			`SELECT count(*) FROM pg_constraint WHERE conname = 'runs_document_base_commit_check'`).Scan(&n); err != nil {
+			t.Fatalf("query runs_document_base_commit_check: %v", err)
+		}
+		return n
+	}
+	insertRun := func(commit *string) error {
+		_, err := pool.Exec(ctx,
+			`INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, state, runner_kind, document_base_commit)
+			 VALUES ($1, 'r', 'feature_change', 'sha', 'cli', 'pending', 'local', $2)`,
+			uuid.New(), commit)
+		return err
+	}
+	assertShape := func(phase string) {
+		t.Helper()
+		var nullable, dataType string
+		var columnDefault *string
+		if err := pool.QueryRow(ctx,
+			`SELECT is_nullable, data_type, column_default FROM information_schema.columns
+			  WHERE table_name = 'runs' AND column_name = 'document_base_commit'`).Scan(&nullable, &dataType, &columnDefault); err != nil {
+			t.Fatalf("%s: query runs.document_base_commit shape: %v", phase, err)
+		}
+		if nullable != "YES" {
+			t.Errorf("%s: runs.document_base_commit is_nullable = %q, want YES (NULL = no commit recorded at admission is load-bearing)", phase, nullable)
+		}
+		if columnDefault != nil {
+			t.Errorf("%s: runs.document_base_commit column_default = %q, want none (a DEFAULT would assert a pin nothing recorded)", phase, *columnDefault)
+		}
+		if dataType != "text" {
+			t.Errorf("%s: runs.document_base_commit data_type = %q, want text", phase, dataType)
+		}
+		if n := constraintCount(); n != 1 {
+			t.Fatalf("%s: runs_document_base_commit_check count = %d, want 1", phase, n)
+		}
+		var def string
+		if err := pool.QueryRow(ctx,
+			`SELECT pg_get_constraintdef(oid) FROM pg_constraint
+			  WHERE conname = 'runs_document_base_commit_check'`).Scan(&def); err != nil {
+			t.Fatalf("%s: query runs_document_base_commit_check def: %v", phase, err)
+		}
+		if !strings.Contains(def, "^[0-9a-f]{40}$") {
+			t.Errorf("%s: runs_document_base_commit_check def = %q, want the lowercase 40-hex pattern", phase, def)
+		}
+		// The CHECK is asserted BEHAVIOURALLY, not only by its text: the
+		// accepted states insert, every mutable or ambiguous ref is refused.
+		commit := strings.Repeat("ab", 20)
+		if err := insertRun(&commit); err != nil {
+			t.Errorf("%s: insert lowercase 40-hex document_base_commit failed, want success: %v", phase, err)
+		}
+		if err := insertRun(nil); err != nil {
+			t.Errorf("%s: insert NULL document_base_commit failed, want success: %v", phase, err)
+		}
+		for _, bad := range []string{"main", strings.ToUpper(commit), commit[:12], commit + "0"} {
+			err := insertRun(&bad)
+			var pgErr *pgconn.PgError
+			if !errors.As(err, &pgErr) || pgErr.Code != "23514" || pgErr.ConstraintName != "runs_document_base_commit_check" {
+				t.Errorf("%s: insert document_base_commit=%q returned %v, want SQLSTATE 23514 from runs_document_base_commit_check", phase, bad, err)
+			}
+		}
+	}
+
+	if n := columnCount(); n != 1 {
+		t.Fatalf("runs.document_base_commit count after MigrateUp = %d, want 1 (0091 added it)", n)
+	}
+	assertShape("after MigrateUp")
+
+	// Roll back through 0091, the reversal under test. downThrough names 0091
+	// so this stays a one-line target when a migration lands above it.
+	downThrough(t, url, "0091")
+	if n := columnCount(); n != 0 {
+		t.Errorf("runs.document_base_commit count after MigrateDown = %d, want 0 (0091 reverted)", n)
+	}
+	if n := constraintCount(); n != 0 {
+		t.Errorf("runs_document_base_commit_check count after MigrateDown = %d, want 0 (0091 reverted)", n)
+	}
+	var runsTable int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'runs'`).Scan(&runsTable); err != nil {
+		t.Fatalf("query runs table: %v", err)
+	}
+	if runsTable != 1 {
+		t.Errorf("'runs' table count after MigrateDown = %d, want 1 (0091 is an ALTER, never a DROP TABLE)", runsTable)
+	}
+
+	// Re-apply: the column and its CHECK return with the same shape.
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp (re-apply after rollback): %v", err)
+	}
+	if n := columnCount(); n != 1 {
+		t.Fatalf("runs.document_base_commit count after re-apply = %d, want 1 (0091 re-added it)", n)
+	}
+	assertShape("after re-apply")
+}

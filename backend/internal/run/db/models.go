@@ -311,6 +311,7 @@ type Run struct {
 	PredictedRuntimeMinutes int32              `json:"predicted_runtime_minutes"`
 	InstallationRef         *string            `json:"installation_ref"`
 	RequiresCharter         *bool              `json:"requires_charter"`
+	DocumentBaseCommit      *string            `json:"document_base_commit"`
 }
 
 type ScopeAmendment struct {

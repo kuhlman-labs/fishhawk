@@ -11,8 +11,12 @@
 -- E54.13 / #2806). Tri-state: TRUE / FALSE are a recorded determination, NULL
 -- is "no persisted determination" and is passed through verbatim — the repo
 -- layer never promotes it to FALSE.
-INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, installation_id, installation_ref, idempotency_key, parent_run_id, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, drive, slice_index, upstream_run_id, working_dir, requires_charter)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
+-- document_base_commit is the run-admission document base commit (migration
+-- 0091, E55.7 / #3746). NULL is "no commit recorded at admission" and is
+-- passed through verbatim; any non-NULL value must be a lowercase 40-hex
+-- commit (runs_document_base_commit_check).
+INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, trigger_ref, state, installation_id, installation_ref, idempotency_key, parent_run_id, required_checks_snapshot, workflow_spec, retry_attempt, max_retries_snapshot, runner_kind, issue_context, decomposed_from, drive, slice_index, upstream_run_id, working_dir, requires_charter, document_base_commit)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
 RETURNING *;
 
 -- name: GetRun :one
