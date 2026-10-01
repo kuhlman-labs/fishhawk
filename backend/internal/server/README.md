@@ -399,6 +399,67 @@ pure — and it does not even reach the decision index. Pinned by
 
 `precedent_surfaced` is INTERNAL — not an issue-thread activity line.
 
+## Divergence at the gate (`gate_divergence.go`, E75.5 / #3733, ADR-082 #3728 decision (d), rule 5)
+
+After a captain's decision at an allow-listed gate is DURABLY recorded,
+`noteGateDivergence` asks whether it went against clear precedent and, only if
+so, appends ONE `precedent_divergence` entry — the record a captain-facing
+surface turns into the optional "one-off, or a change of doctrine?" question.
+
+**Shipped disabled.** `Config.DivergenceConfig` nil (the default) or
+`Enabled: false` returns before anything is read: no index query, no entry, every
+response byte-identical to before E75.5. fishhawkd builds it from
+`FISHHAWKD_PRECEDENT_DIVERGENCE_{ENABLED,MIN_DECISIONS,MIN_AGREEMENT,WINDOW,CLASSES}`
+(`divergenceConfigFromEnv`); every knob is parsed strictly and a malformed value
+refuses startup rather than falling back.
+
+**Call sites — each after the decision's own entry is on the chain:**
+
+- `applyConcernWaive` (waive.go), after `ApplyResolution` — so the bulk waive
+  inherits it through the shared body;
+- `handleDeferConcern` (defer_concern.go), after the `concern_deferred` entry
+  appends (a failed append skips the hook);
+- `writeApprovalAudit` (approvals.go), after a successful `approval_submitted`
+  append, for a REJECT on a PLAN stage only — the tail every reject path
+  (legacy first-vote, quorum, escalation-unreadable) shares, so it can never ask
+  about a decision that was not recorded.
+
+**The evaluation.** Resolve the run's account and `GateContext` (repo, touched
+paths, escalation keys, doctrine version = `runs.workflow_sha`), run the SAME
+`runPrecedentQuery` the gate block and `GET /v0/precedent` use once per
+`precedent.ComparisonClasses` member (waive and defer are compared against the
+union of both), drop the decision's OWN index row (same run + source sequence),
+and evaluate `precedent.Decide`. The pure rule is documented in
+`backend/internal/precedent/README.md` § "Divergence threshold".
+
+**The entry.** `precedent_divergence`, actor `system`, on the decision's stage:
+decision class, stage, the decision's sequence, the captain's outcome, the modal
+outcome, agreement ratio, human count, the plan reject's `reject_class` (recorded,
+not ranked — `precedent.Context` carries no reject-class signal), the effective
+threshold (N, X, window seconds, doctrine version), `precedent.IndexVersion`, and
+up to 10 citations (`cited_total` reports the rest) by `source_sequence` +
+`source_entry_hash` + score + matched keys ONLY — no reason prose (ADR-082 rule 1).
+
+**Ask once per gate.** De-duplicated on (run, stage, decision class) by a
+read-then-append over `ListForRunByCategory`. NOT atomic — two concurrent first
+decisions can both append (the `recordPrecedentSurfaced` posture); "once per
+gate" is a SEQUENTIAL guarantee. Unlike `recordPrecedentSurfaced`, a
+de-duplication READ failure records nothing (fail toward quiet): a missed
+question is benign, re-asking is the nagging the rule's brakes exist to prevent.
+
+**Best-effort and total.** Every miss returns with no entry and leaves the
+decision and its response untouched: disabled config, an allow-list miss, nil
+`PrecedentIndex` / `AuditRepo` / `RunRepo`, a run read failure, a non-UUID
+account id, a `GateContext` failure, an index `List` failure, zero candidates, a
+below-threshold or agreed verdict, a de-duplication hit or read failure, and an
+append failure. Pinned one test per mode in `gate_divergence_test.go`; the
+cross-boundary proof (a real plan reject through `POST
+/v0/stages/{id}/approvals` on Postgres, matched vs mismatched doctrine version,
+and the default recording nothing) is `gate_divergence_pg_test.go`.
+
+`precedent_divergence` and `precedent_divergence_answered` are INTERNAL —
+chain-only, not issue-thread activity lines.
+
 ## Account-ownership authorization (ADR-057 / E44.5, #1829)
 
 Handler authorization is tenant-scoped through ONE centralized middleware layer

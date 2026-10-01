@@ -47,6 +47,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/oauthstore"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/precedent"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pushnotify"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/refinement"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/releaseevidence"
@@ -170,6 +171,17 @@ type Config struct {
 	// partial rollback that needs no revert. The read is account-narrowed and
 	// repo-visibility-gated inside the handler (precedent.go).
 	PrecedentIndex PrecedentIndex
+
+	// DivergenceConfig is the E75.5 / #3733 divergence threshold (ADR-082
+	// #3728 decision (d), rule 5): when a captain's decision at an
+	// allow-listed gate (concern waive, concern defer, plan reject) goes
+	// against clear precedent, the server records one precedent_divergence
+	// entry (gate_divergence.go). NIL — the default — and a non-nil value
+	// with Enabled=false are both DISABLED: nothing is evaluated, nothing is
+	// recorded, and every response is byte-identical to before E75.5.
+	// fishhawkd builds it from FISHHAWKD_PRECEDENT_DIVERGENCE_* and leaves it
+	// disabled unless _ENABLED is set.
+	DivergenceConfig *precedent.DivergenceConfig
 
 	// DocumentDeclarations / DocumentResolver / DocumentScope are the
 	// document-injection seam (E55.1 / #2242): the ONE attachment point for

@@ -650,6 +650,18 @@ Notes:
   activity line per gate would be thread noise. It surfaces on the thread ONLY
   inside the living anchor's droppable gate precedent section (see "Gate
   precedent section" above). Nothing in `issuecomment` posts a comment for it.
+- The divergence audit kinds — `precedent_divergence` and
+  `precedent_divergence_answered` (E75.5 / #3733, ADR-082 decision (d) and rule
+  5). `precedent_divergence` is written by `server/gate_divergence.go` when a
+  captain's concern waive, concern defer or plan reject went against clear
+  precedent (shipped disabled; nothing is written unless
+  `FISHHAWKD_PRECEDENT_DIVERGENCE_ENABLED` is set); `precedent_divergence_answered`
+  records the captain's `one_off` / `doctrine_change` answer to it. Both are
+  **internal audit kinds, not issue-comment surfaces**, following
+  `precedent_surfaced`: the question is captain-facing at the gate, and posting
+  it would put one captain's decision-quality prompt on the public thread. Neither
+  is in `activityCategories`, there is no Notifier method, and nothing in
+  `issuecomment` posts a comment for either.
 - The local auto-driver attribution audit kind — `run_auto_driven` (#1700),
   written by the auto-drive endpoints (`server/autodrive_http.go`) when the
   local `fishhawk_drive_run` verb walks a run one mechanical step under ADR-040
