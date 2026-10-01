@@ -15543,6 +15543,154 @@ func TestResolveDecidedCrewEscalations_NonEscalationAndReplyNotFolded(t *testing
 	}
 }
 
+// TestResolveDecidedCrewEscalations_OnlyUserActorDispositionBinds pins the
+// read-side trust boundary of E77.6 (#3884): a root escalation's terminal
+// disposition becomes TRUSTED binding plan text only when the chain entry was
+// recorded by the user actor (the captain's decide endpoint). Every arm
+// disposes a root escalation STRAIGHT THROUGH Mailbox.Dispose — never via
+// RespondToCrewMessage, whose escalation refusal would mask the read-side
+// guard, and never via the decide handler, which always stamps a user actor —
+// so the derived row IS terminal and the chain HOLDS an accepted/rejected entry
+// (both asserted as a precondition): the terminal filter and the bySent lookup
+// are satisfied by construction and the arms differ from the control ONLY in
+// ActorKind. The absent-actor arm disposes with crewmessage.Actor{Kind: ""},
+// which Actor.kindPtr stores as a NULL actor_kind (no direct chain append
+// needed), exercising the nil-pointer branch of the guard.
+func TestResolveDecidedCrewEscalations_OnlyUserActorDispositionBinds(t *testing.T) {
+	const guardMsg = "prompt: crew escalation disposition was not recorded by a user actor; not a binding ruling"
+	f := newCrewPG(t)
+	s, _ := newConsultFoldServer(t, f, f.audit)
+	var logs bytes.Buffer
+	s.cfg.Logger = slog.New(slog.NewJSONHandler(&logs, nil))
+	ctx := context.Background()
+
+	// guardLines decodes the guard's WARN lines naming (runID, sentSeq) written
+	// to logs at or after offset from.
+	guardLines := func(t *testing.T, from int, runID uuid.UUID, sentSeq int64) []map[string]any {
+		t.Helper()
+		var out []map[string]any
+		for _, line := range strings.Split(logs.String()[from:], "\n") {
+			if strings.TrimSpace(line) == "" {
+				continue
+			}
+			var rec map[string]any
+			if err := json.Unmarshal([]byte(line), &rec); err != nil {
+				t.Fatalf("undecodable log line %q: %v", line, err)
+			}
+			if rec["msg"] != guardMsg || rec["level"] != "WARN" || rec["run_id"] != runID.String() {
+				continue
+			}
+			if seq, ok := rec["sent_sequence"].(float64); !ok || int64(seq) != sentSeq {
+				continue
+			}
+			out = append(out, rec)
+		}
+		return out
+	}
+
+	// arm seeds a FRESH run with a root escalation disposed straight through the
+	// mailbox by actor, asserts the terminal precondition, resolves the rulings
+	// and renders the plan prompt from them.
+	type armResult struct {
+		runID    uuid.UUID
+		seq      int64
+		rulings  []prompt.CrewEscalationRuling
+		rendered string
+		logFrom  int
+	}
+	arm := func(t *testing.T, sentinel string, disposition crewmessage.Disposition, actor crewmessage.Actor) armResult {
+		t.Helper()
+		runID := f.seedRun(t, run.StageTypePlan)
+		seq := seedRootEscalation(t, f, runID, sentinel+"-SUMMARY")
+		if _, err := f.mailbox.Dispose(ctx, crewmessage.DisposeParams{
+			SentSequence: seq, Disposition: disposition, Reason: sentinel + "-REASON", Actor: actor,
+		}); err != nil {
+			t.Fatalf("dispose the root escalation: %v", err)
+		}
+		// PRECONDITION: the row is terminal, so the terminal filter is satisfied
+		// and the actor check is the only thing between the chain entry and a ruling.
+		row, err := f.mailbox.Store().Get(ctx, seq)
+		if err != nil {
+			t.Fatalf("read the derived row: %v", err)
+		}
+		if want := crewmessage.State(disposition); row.State != want {
+			t.Fatalf("precondition: derived row state = %q, want terminal %q", row.State, want)
+		}
+		res := armResult{runID: runID, seq: seq, logFrom: logs.Len()}
+		res.rulings = s.resolveDecidedCrewEscalations(ctx, runID)
+		rendered, err := prompt.Build("plan", prompt.Trigger{
+			Source: "issue", IssueNumber: 3884, Repo: "kuhlman-labs/fishhawk", CrewEscalationRulings: res.rulings,
+		})
+		if err != nil {
+			t.Fatalf("Build(plan): %v", err)
+		}
+		res.rendered = rendered
+		return res
+	}
+
+	nonUser := []struct {
+		name        string
+		sentinel    string
+		disposition crewmessage.Disposition
+		actor       crewmessage.Actor
+		wantKind    string
+	}{
+		{"system accepted", "SYSTEM-ACCEPTED", crewmessage.DispositionAccepted, crewmessage.Actor{Kind: audit.ActorSystem, Subject: "system:test"}, "system"},
+		{"system rejected", "SYSTEM-REJECTED", crewmessage.DispositionRejected, crewmessage.Actor{Kind: audit.ActorSystem, Subject: "system:test"}, "system"},
+		{"agent accepted", "AGENT-ACCEPTED", crewmessage.DispositionAccepted, crewmessage.Actor{Kind: audit.ActorAgent, Subject: "test:agent"}, "agent"},
+		{"absent actor accepted", "ABSENT-ACCEPTED", crewmessage.DispositionAccepted, crewmessage.Actor{}, ""},
+	}
+	for _, tc := range nonUser {
+		t.Run(tc.name, func(t *testing.T) {
+			res := arm(t, tc.sentinel, tc.disposition, tc.actor)
+			if len(res.rulings) != 0 {
+				t.Fatalf("a %s disposition folded %d rulings, want 0: %+v", tc.name, len(res.rulings), res.rulings)
+			}
+			if strings.Contains(res.rendered, crewRulingHeading) {
+				t.Error("a non-user disposition rendered the captain's-ruling heading")
+			}
+			if strings.Contains(res.rendered, tc.sentinel) {
+				t.Errorf("a non-user disposition's text %q reached the plan prompt", tc.sentinel)
+			}
+			lines := guardLines(t, res.logFrom, res.runID, res.seq)
+			if len(lines) != 1 {
+				t.Fatalf("guard WARN lines for sent_sequence %d = %d, want 1:\n%s", res.seq, len(lines), logs.String()[res.logFrom:])
+			}
+			if got := lines[0]["actor_kind"]; got != tc.wantKind {
+				t.Errorf("guard WARN actor_kind = %v, want %q", got, tc.wantKind)
+			}
+		})
+	}
+
+	// CONTROL: the identical path with the USER actor binds. It runs AFTER the
+	// non-user arms and its negative log assertion is only meaningful if the
+	// logger is demonstrably connected, so first require that the shared buffer
+	// already holds the guard's WARN lines from those arms.
+	t.Run("user accepted (control)", func(t *testing.T) {
+		if n := strings.Count(logs.String(), guardMsg); n != len(nonUser) {
+			t.Fatalf("logger not connected: shared buffer holds %d guard WARN lines from the non-user arms, want %d", n, len(nonUser))
+		}
+		res := arm(t, "USER-ACCEPTED", crewmessage.DispositionAccepted, crewmessage.Actor{Kind: audit.ActorUser, Subject: "captain"})
+		if len(res.rulings) != 1 {
+			t.Fatalf("the user-actor disposition folded %d rulings, want 1: %+v", len(res.rulings), res.rulings)
+		}
+		if got := res.rulings[0]; got.Sequence != res.seq || got.Decision != string(crewmessage.StateAccepted) || got.Reason != "USER-ACCEPTED-REASON" {
+			t.Errorf("ruling = %+v, want sequence %d accepted with reason USER-ACCEPTED-REASON", got, res.seq)
+		}
+		for _, want := range []string{crewRulingHeading, "USER-ACCEPTED-REASON"} {
+			if !strings.Contains(res.rendered, want) {
+				t.Errorf("the plan prompt is missing %q", want)
+			}
+		}
+		if strings.Contains(res.rendered, "USER-ACCEPTED-SUMMARY") {
+			t.Error("the escalation's agent-authored summary was promoted into the trusted ruling section")
+		}
+		if lines := guardLines(t, res.logFrom, res.runID, res.seq); len(lines) != 0 {
+			t.Errorf("the user-actor disposition drew %d guard WARN lines, want 0: %v", len(lines), lines)
+		}
+	})
+}
+
 // TestResolveDecidedCrewEscalations_Degrades covers each best-effort branch: an
 // unconfigured server, a failing crew_message_sent listing, and a failing
 // crew_message_disposed listing all fold NOTHING rather than failing the prompt

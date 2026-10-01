@@ -953,7 +953,14 @@ func (s *Server) resolveAnsweredCrewConsults(ctx context.Context, runID, stageID
 //   - whose DERIVED ROW state is terminal, `accepted` or `rejected` — i.e. the
 //     captain decided via the E77.3 escalation-decision endpoint;
 //   - with the decision and the reason read from the crew_message_disposed CHAIN
-//     entry, the one place the reason prose lives (the row only points at it).
+//     entry, the one place the reason prose lives (the row only points at it);
+//   - whose disposition entry was recorded by the USER actor
+//     handleDecideCrewEscalation stamps (audit.ActorUser). Any other actor —
+//     system, agent, or absent — is skipped and logged, so a future
+//     Mailbox.Dispose caller that disposes an escalation cannot mint a binding
+//     ruling (#3884). This is the read-side complement to the write-side guards
+//     (handleDecideCrewEscalation is captain-only; RespondToCrewMessage refuses
+//     escalations).
 //
 // An OPEN escalation yields NOTHING. That is what makes an unanswered
 // disagreement bind nothing and park nothing: the page (activePageEvent's
@@ -1014,6 +1021,7 @@ func (s *Server) resolveDecidedCrewEscalations(ctx context.Context, runID uuid.U
 	}
 	type ruling struct {
 		decision, reason string
+		actorKind        *audit.ActorKind
 	}
 	bySent := make(map[int64]ruling, len(disposed))
 	for _, e := range disposed {
@@ -1032,7 +1040,7 @@ func (s *Server) resolveDecidedCrewEscalations(ctx context.Context, runID uuid.U
 		// The FIRST disposition in chain order wins, matching
 		// crewmessage.projectDisposition's own first-wins rule.
 		if _, seen := bySent[p.SentSequence]; !seen {
-			bySent[p.SentSequence] = ruling{decision: p.Disposition, reason: p.Reason}
+			bySent[p.SentSequence] = ruling{decision: p.Disposition, reason: p.Reason, actorKind: e.ActorKind}
 		}
 	}
 	var out []prompt.CrewEscalationRuling
@@ -1046,6 +1054,17 @@ func (s *Server) resolveDecidedCrewEscalations(ctx context.Context, runID uuid.U
 			// a binding instruction whose decision we cannot name.
 			warn("prompt: terminal crew escalation has no readable disposition entry",
 				errors.New("no accepted/rejected crew_message_disposed entry"), slog.Int64("sent_sequence", seq))
+			continue
+		}
+		if r.actorKind == nil || *r.actorKind != audit.ActorUser {
+			// Only the captain's decision endpoint (user actor) may mint binding
+			// text; a disposition by any other actor is not a ruling (#3884).
+			actor := ""
+			if r.actorKind != nil {
+				actor = string(*r.actorKind)
+			}
+			warn("prompt: crew escalation disposition was not recorded by a user actor; not a binding ruling",
+				errors.New("disposition actor is not the user"), slog.Int64("sent_sequence", seq), slog.String("actor_kind", actor))
 			continue
 		}
 		out = append(out, prompt.CrewEscalationRuling{Sequence: seq, Decision: r.decision, Reason: r.reason})

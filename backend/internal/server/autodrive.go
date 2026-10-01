@@ -578,7 +578,15 @@ func (s *Server) crewEscalationOpen(ctx context.Context, runRow *run.Run) bool {
 	// rejections that exhausted the bound mark the escalation resolved. A thread
 	// is settled when its ROOT holds a terminal disposition, which is also the
 	// message resolveDecidedCrewEscalations folds as the binding ruling, so the
-	// page and the binding text agree by construction.
+	// page and the binding text agree for every reachable writer: the only
+	// terminal-disposition writer of an escalation is the user-actor captain
+	// endpoint. A hypothetical NON-user terminal disposition would close the page
+	// while binding NOTHING (resolveDecidedCrewEscalations folds only a user-actor
+	// disposition) — the run continues UNRULED, with that resolver's WARN log as
+	// its only signal. That is deliberate: keeping the page open on an
+	// already-terminal row would wedge the auto-driver permanently, since the
+	// mailbox refuses a second disposition (ErrAlreadyDisposed) and the captain
+	// could never rule.
 	ruled := make(map[int64]bool, len(disposed))
 	for _, e := range disposed {
 		var p struct {
