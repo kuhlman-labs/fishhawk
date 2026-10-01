@@ -11,11 +11,11 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 )
 
-// Audit categories written by this package. Both are registered in
+// Audit categories written by this package. All three are registered in
 // audit.KnownCategories (backend/internal/audit/categories.go) so
 // fishhawk_await_audit and GET /v0/runs/{id}/audit accept them without
 // allow_unknown; the audit AST completeness sweep collects them from these
-// category-named consts and fails the build if either is unregistered.
+// category-named consts and fails the build if any is unregistered.
 const (
 	// categoryDocumentInjected records one repo-authored document injected
 	// into an agent prompt: which path, at which commit, with which content
@@ -26,7 +26,33 @@ const (
 	// document_injected, never instead of it, so a truncation is visible in
 	// the audit trail as its own event rather than only as a flag.
 	categoryDocumentTruncated = "document_truncated"
+	// categoryDocumentInjectionDegraded records that declared documents were
+	// WITHHELD from a served prompt rather than resolved (E55.7 / #3746):
+	// which paths, which declaration sites, and why. A withheld document is
+	// never fetched, so this entry — not a document_injected entry — is the
+	// audit trace of the declaration.
+	categoryDocumentInjectionDegraded = "document_injection_degraded"
 )
+
+// WithheldReasonRunBaseUnrecorded is the Withheld.Reason for run-admission
+// declarations on a run whose admission commit was never recorded (a legacy
+// row, a run created with no document seam wired, or a degraded capture).
+// Resolving them at any other ref would be the mutable read BaseSourceRunAdmission
+// exists to rule out, so they are withheld instead.
+const WithheldReasonRunBaseUnrecorded = "run_base_commit_unrecorded"
+
+// Withheld is a set of declarations a prompt assembly deliberately did NOT
+// resolve, and the reason. RecordWithheld attributes it; WithheldNotice
+// renders it into the prompt so the agent is told the documents exist and
+// were withheld, rather than being left to read their absence as "none
+// declared".
+type Withheld struct {
+	// Reason is a fixed machine-readable reason, e.g.
+	// WithheldReasonRunBaseUnrecorded. Required.
+	Reason string
+	// Declarations are the withheld declarations, in declaration order.
+	Declarations []Declaration
+}
 
 // appender is the narrow view of audit.Repository this package needs.
 // audit.Repository satisfies it.
@@ -136,11 +162,62 @@ func Attribute(ctx context.Context, a appender, runID, stageID uuid.UUID, docs .
 			"original_bytes":   doc.OriginalBytes,
 			"rendered_bytes":   doc.RenderedBytes,
 			"truncated":        doc.Truncated,
+			"base_source":      doc.BaseSource.AuditValue(),
 			"document_index":   i,
 			"document_count":   len(docs),
 		}); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// RecordWithheld writes ONE document_injection_degraded entry naming every
+// withheld declaration's path and declaration site, the reason, and the
+// count. An empty set is a no-op.
+//
+// FAILS CLOSED, exactly like Attribute: an append error (or a nil appender, or
+// an empty Reason) is returned and the caller MUST NOT serve the prompt. A
+// served prompt silently missing a declared document with no audit trace is
+// the un-attributed omission this entry exists to prevent; the preview path,
+// which writes nothing, does not call it.
+func RecordWithheld(ctx context.Context, a appender, runID, stageID uuid.UUID, w Withheld) error {
+	if len(w.Declarations) == 0 {
+		return nil
+	}
+	if a == nil {
+		return fmt.Errorf("repodoc: record withheld %q: no audit appender configured", w.Declarations[0].Path)
+	}
+	if w.Reason == "" {
+		return fmt.Errorf("repodoc: record withheld %q: no reason given", w.Declarations[0].Path)
+	}
+	paths := make([]string, 0, len(w.Declarations))
+	sites := make([]string, 0, len(w.Declarations))
+	for _, d := range w.Declarations {
+		paths = append(paths, d.Path)
+		sites = append(sites, d.DeclarationSite)
+	}
+	raw, err := json.Marshal(map[string]any{
+		"reason":            w.Reason,
+		"paths":             paths,
+		"declaration_sites": sites,
+		"document_count":    len(w.Declarations),
+	})
+	if err != nil {
+		return fmt.Errorf("repodoc: marshal %s payload: %w", categoryDocumentInjectionDegraded, err)
+	}
+	actor := audit.ActorSystem
+	sid := stageID
+	if _, err := a.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   &sid,
+		Timestamp: time.Now().UTC(),
+		Category:  categoryDocumentInjectionDegraded,
+		ActorKind: &actor,
+		Payload:   raw,
+	}); err != nil {
+		return fmt.Errorf("repodoc: attribute %s (%s) of %d document(s): %w",
+			categoryDocumentInjectionDegraded, w.Reason, len(w.Declarations), err)
 	}
 	return nil
 }

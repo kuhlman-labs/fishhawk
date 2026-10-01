@@ -179,9 +179,20 @@ type runResponse struct {
 	// prompt-serve path derives it from the cached spec and refuses
 	// (grooming_workflow_spec_unreadable) when that spec is undecidable.
 	// Surfaced so an operator can see which fact decided a refusal.
-	RequiresCharter *bool     `json:"requires_charter,omitempty"`
-	CreatedAt       time.Time `json:"created_at"`
-	UpdatedAt       time.Time `json:"updated_at"`
+	RequiresCharter *bool `json:"requires_charter,omitempty"`
+	// DocumentBaseCommit is the run-admission document base commit (E55.7 /
+	// #3746, migration 0091), read-only: the lowercase 40-hex commit captured
+	// at run admission that this run's run-admission document declarations
+	// (repodoc.BaseSourceRunAdmission) are resolved at, inherited verbatim by
+	// retry / recovery / decomposition children. Omitted (omitempty on the
+	// pointer) when no commit was recorded — a legacy row, a deployment with
+	// no document seam, or a degraded capture — in which case those
+	// declarations are WITHHELD at prompt serve with a named degradation
+	// rather than read at a mutable ref. Surfaced so an operator can see which
+	// commit a run's declared documents come from.
+	DocumentBaseCommit *string   `json:"document_base_commit,omitempty"`
+	CreatedAt          time.Time `json:"created_at"`
+	UpdatedAt          time.Time `json:"updated_at"`
 	// Concerns is the run's OPEN review-concern summary (#964): count,
 	// per-state breakdown, and the stable IDs fishhawk_fixup_stage's
 	// concern_ids addressing needs. Populated by handleGetRun ONLY —
@@ -756,6 +767,7 @@ func toRunResponse(r *run.Run) runResponse {
 		WorkingDir:              r.WorkingDir,
 		PredictedRuntimeMinutes: r.PredictedRuntimeMinutes,
 		RequiresCharter:         r.RequiresCharter,
+		DocumentBaseCommit:      r.DocumentBaseCommit,
 		CreatedAt:               r.CreatedAt,
 		UpdatedAt:               r.UpdatedAt,
 	}
@@ -1862,6 +1874,15 @@ func (s *Server) CreateRunForTrigger(ctx context.Context, p CreateRunForTriggerP
 	// migration 0082, or a child inheriting nil from such a parent.
 	requiresCharter := WorkflowRequiresCharter(p.WorkflowDef)
 	createParams.RequiresCharter = &requiresCharter
+	// Record the run-admission document base commit (E55.7 / #3746): the
+	// default-branch head pinned to a 40-hex commit through the document seam,
+	// which every run-admission document declaration for this run (and every
+	// child inheriting it through run.ChildParamsFrom) is resolved at. Stamped
+	// UNCONDITIONALLY, like RequiresCharter above. Best-effort and bounded by
+	// documentBaseCaptureTimeout: every capture failure records NIL — never an
+	// error, never a blocked create — and nil withholds those documents with a
+	// named degradation at prompt serve instead of reading a mutable ref.
+	createParams.DocumentBaseCommit = s.captureDocumentBaseCommit(ctx, p.Repo)
 	if p.HaveStageDefs {
 		// Cache the validated spec bytes on the row so the trace handler's
 		// policy re-evaluation reads constraints from storage instead of

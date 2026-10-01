@@ -30,6 +30,7 @@ func childParamsParentFixture(t *testing.T) *Run {
 	decomposedFrom := uuid.New()
 	sliceIdx := 3
 	requiresCharter := true
+	documentBaseCommit := "0123456789abcdef0123456789abcdef01234567"
 	return &Run{
 		ID:              uuid.New(),
 		Repo:            "kuhlman-labs/fishhawk",
@@ -63,7 +64,8 @@ func childParamsParentFixture(t *testing.T) *Run {
 		// pointer-to-true, not pointer-to-false: a false pointer is
 		// non-zero to reflect but would let a helper that MANUFACTURED
 		// &false pass the inherited-equality check for the wrong reason.
-		RequiresCharter: &requiresCharter,
+		RequiresCharter:    &requiresCharter,
+		DocumentBaseCommit: &documentBaseCommit,
 	}
 }
 
@@ -272,6 +274,45 @@ func TestChildParamsFrom_InheritsRequiresCharter(t *testing.T) {
 				t.Fatalf("child dropped the parent's RequiresCharter (%v); the child would fall back to the spec-derived legacy branch", *tc.parent)
 			case tc.parent != nil && *child.RequiresCharter != *tc.parent:
 				t.Errorf("child RequiresCharter = %v, want %v", *child.RequiresCharter, *tc.parent)
+			}
+		})
+	}
+}
+
+// TestChildParamsFrom_InheritsDocumentBaseCommit pins that a child minted
+// from a parent (operator recovery, CI retry, decomposition) carries the
+// parent's run-admission document base commit VERBATIM, in both states
+// (migration 0091, E55.7 / #3746). A child that dropped a recorded commit
+// would have its run-admission documents withheld for no reason; a child that
+// was re-pinned (or minted a value from nil) would read documents at a commit
+// the run was never admitted against — exactly the drift the column exists
+// to prevent. The shared fixture (non-nil, so the reflection pins cover the
+// value state) cannot exercise nil; this test covers both.
+func TestChildParamsFrom_InheritsDocumentBaseCommit(t *testing.T) {
+	commit := "fedcba9876543210fedcba9876543210fedcba98"
+	cases := []struct {
+		name   string
+		parent *string
+	}{
+		{"a recorded admission commit is inherited verbatim", &commit},
+		{"no recorded commit (nil) is inherited as nil, never re-pinned", nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			parent := &Run{
+				ID:                 uuid.New(),
+				Repo:               "kuhlman-labs/fishhawk",
+				WorkflowID:         "feature_change",
+				DocumentBaseCommit: tc.parent,
+			}
+			child := ChildParamsFrom(parent)
+			switch {
+			case tc.parent == nil && child.DocumentBaseCommit != nil:
+				t.Fatalf("child DocumentBaseCommit = %q, want nil when the parent recorded no admission commit", *child.DocumentBaseCommit)
+			case tc.parent != nil && child.DocumentBaseCommit == nil:
+				t.Fatalf("child dropped the parent's DocumentBaseCommit (%q); its run-admission documents would be withheld", *tc.parent)
+			case tc.parent != nil && *child.DocumentBaseCommit != *tc.parent:
+				t.Errorf("child DocumentBaseCommit = %q, want the parent's admission commit %q", *child.DocumentBaseCommit, *tc.parent)
 			}
 		})
 	}

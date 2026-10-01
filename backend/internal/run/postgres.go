@@ -142,6 +142,13 @@ func (r *postgresRepo) CreateRun(ctx context.Context, p CreateRunParams) (*Run, 
 		// persisted determination"); promoting it to false would assert
 		// non-grooming for a row nothing decided (migration 0082, #2806).
 		RequiresCharter: p.RequiresCharter,
+		// Passed VERBATIM: nil persists as SQL NULL ("no commit recorded at
+		// admission", migration 0091 / #3746) and is never substituted with a
+		// ref. A malformed value is NOT normalized here — the
+		// runs_document_base_commit_check constraint refuses it, so a branch
+		// name or an uppercase SHA fails the insert instead of persisting a
+		// mutable read point.
+		DocumentBaseCommit: p.DocumentBaseCommit,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create run: %w", err)
@@ -998,6 +1005,7 @@ func rowToRun(r rundb.Run) *Run {
 		InstallationID:     r.InstallationID,
 		InstallationRef:    r.InstallationRef,
 		RequiresCharter:    r.RequiresCharter,
+		DocumentBaseCommit: r.DocumentBaseCommit,
 		IdempotencyKey:     r.IdempotencyKey,
 		ParentRunID:        r.ParentRunID,
 		PullRequestURL:     r.PullRequestUrl,
@@ -1077,6 +1085,12 @@ func rowToRun(r rundb.Run) *Run {
 	// The tri-state is preserved verbatim — SQL NULL scans back as nil and is
 	// never coerced to false, which is what keeps a "no persisted
 	// determination" row distinguishable from a persisted non-grooming one.
+	//
+	// DocumentBaseCommit (migration 0091, #3746) rides the same mapper on the
+	// same terms: every Run-returning query selects document_base_commit and
+	// scans it, and SQL NULL scans back as nil ("no commit recorded at
+	// admission"), never as "" — so a consumer cannot mistake an unrecorded
+	// row for an empty ref.
 	return out
 }
 

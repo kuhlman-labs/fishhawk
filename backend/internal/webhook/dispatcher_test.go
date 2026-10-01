@@ -1040,9 +1040,13 @@ func (s *stubRuns) CreateRun(_ context.Context, p run.CreateRunParams) (*run.Run
 		// STORED row rather than passing vacuously against a fake that
 		// dropped the field.
 		RequiresCharter: p.RequiresCharter,
-		State:           run.StatePending,
-		CreatedAt:       time.Now().UTC(),
-		UpdatedAt:       time.Now().UTC(),
+		// Carry the run-admission document base commit (E55.7 / #3746)
+		// verbatim — nil stays nil — so the stamp assertions read the
+		// STORED row, not a fake that dropped the field.
+		DocumentBaseCommit: p.DocumentBaseCommit,
+		State:              run.StatePending,
+		CreatedAt:          time.Now().UTC(),
+		UpdatedAt:          time.Now().UTC(),
 	}
 	s.created = append(s.created, r)
 	return r, nil
@@ -4770,6 +4774,80 @@ workflows:
         executor:
           agent: claude-code
 `
+
+// dbcHookHead is the 40-hex default-branch head the fake document-base hook
+// returns in the stamp tests below.
+const dbcHookHead = "0123456789abcdef0123456789abcdef01234567"
+
+// recordingDocumentBaseHook returns a DocumentBaseCommit hook that records the
+// repo it was asked about and returns value.
+func recordingDocumentBaseHook(value *string, repos *[]string) func(context.Context, string) *string {
+	return func(_ context.Context, repo string) *string {
+		*repos = append(*repos, repo)
+		return value
+	}
+}
+
+// TestDispatcher_StampsDocumentBaseCommit pins the run-admission document base
+// commit STAMP on the GitHub webhook root mint seam (E55.7 / #3746, approval
+// condition 4): the run row the dispatcher mints carries EXACTLY the value the
+// DocumentBaseCommit hook returned, for the event's repo. Asserted on the run
+// the fake STORED (runs.created), not on the hook having been called.
+//
+// COUNTERFACTUAL: delete the `DocumentBaseCommit: documentBaseCommit` field in
+// dispatcher.go's root CreateRun call and the value cell goes RED (stored nil).
+func TestDispatcher_StampsDocumentBaseCommit(t *testing.T) {
+	head := dbcHookHead
+	d, _, runs, _ := newDispatcherWithStubs(t)
+	var repos []string
+	d.DocumentBaseCommit = recordingDocumentBaseHook(&head, &repos)
+	ev := issueLabeledEvent(t)
+	if err := d.Handle(context.Background(), ev); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if len(runs.created) != 1 {
+		t.Fatalf("runs.created = %d, want 1", len(runs.created))
+	}
+	got := runs.created[0].DocumentBaseCommit
+	if got == nil {
+		t.Fatalf("stored document_base_commit = nil, want %q — the root mint must stamp the hook's value", head)
+	}
+	if *got != head {
+		t.Errorf("stored document_base_commit = %q, want %q", *got, head)
+	}
+	if len(repos) != 1 || repos[0] != ev.Repo {
+		t.Errorf("hook called for repos %v, want exactly [%q]", repos, ev.Repo)
+	}
+}
+
+// TestDispatcher_DocumentBaseCommitNilWhenUnrecorded pins the two NIL arms on
+// the GitHub root mint seam: no hook wired, and a hook that degraded to nil.
+// Both must leave the stored row NULL (no commit recorded) and still mint the
+// run — the capture is best-effort, never a refusal.
+func TestDispatcher_DocumentBaseCommitNilWhenUnrecorded(t *testing.T) {
+	cases := []struct {
+		name string
+		hook func(context.Context, string) *string
+	}{
+		{name: "no hook wired", hook: nil},
+		{name: "hook degraded to nil", hook: func(context.Context, string) *string { return nil }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d, _, runs, _ := newDispatcherWithStubs(t)
+			d.DocumentBaseCommit = tc.hook
+			if err := d.Handle(context.Background(), issueLabeledEvent(t)); err != nil {
+				t.Fatalf("Handle: %v", err)
+			}
+			if len(runs.created) != 1 {
+				t.Fatalf("runs.created = %d, want 1 — a nil capture must not refuse the run", len(runs.created))
+			}
+			if got := runs.created[0].DocumentBaseCommit; got != nil {
+				t.Errorf("stored document_base_commit = %q, want nil", *got)
+			}
+		})
+	}
+}
 
 // TestDispatcher_PersistsGroomingDetermination pins the requires_charter STAMP
 // on the GitHub webhook root mint seam (E54.13 / #2806): the run row the

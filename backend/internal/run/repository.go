@@ -116,6 +116,16 @@ type CreateRunParams struct {
 	// because NULL and FALSE are different states to the consumer (see
 	// Run.RequiresCharter for the full tri-state contract).
 	RequiresCharter *bool
+	// DocumentBaseCommit is the run-admission document base commit to
+	// persist on the run row (migration 0091, E55.7 / #3746). A root mint
+	// site stamps the lowercase 40-hex default-branch head captured at
+	// admission (nil when the capture degraded); a child mint inherits the
+	// parent's value verbatim via ChildParamsFrom. nil persists as SQL NULL
+	// ("no commit recorded"); a value outside the lowercase 40-hex form is
+	// refused by the runs_document_base_commit_check constraint, so
+	// CreateRun returns an error rather than persisting a mutable ref (see
+	// Run.DocumentBaseCommit for the full contract).
+	DocumentBaseCommit *string
 }
 
 // CreateStageParams are the inputs needed to insert a new stage.

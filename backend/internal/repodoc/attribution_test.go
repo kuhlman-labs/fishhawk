@@ -347,3 +347,129 @@ func TestAttribute_SuccessfulSet_IsCompleteAndSharesOneSetID(t *testing.T) {
 		t.Errorf("a second Attribute call reused injection_set_id %q", id)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// E55.7 / #3746: base_source on document_injected, and the withheld record.
+// ---------------------------------------------------------------------------
+
+func TestAttribute_RecordsBaseSource(t *testing.T) {
+	seam, admission := attributedDoc(), attributedDoc()
+	admission.Path = "second.md"
+	admission.BaseSource = BaseSourceRunAdmission
+
+	a := &recordingAppender{}
+	if err := Attribute(context.Background(), a, uuid.New(), uuid.New(), seam, admission); err != nil {
+		t.Fatalf("Attribute: %v", err)
+	}
+	if got := a.payload(t, 0)["base_source"]; got != "declaration_seam" {
+		t.Errorf("seam document base_source = %v, want declaration_seam (the zero value is named, not empty)", got)
+	}
+	if got := a.payload(t, 1)["base_source"]; got != "run_admission" {
+		t.Errorf("run-admission document base_source = %v, want run_admission", got)
+	}
+}
+
+func TestBaseSource_AuditValue(t *testing.T) {
+	for in, want := range map[BaseSource]string{
+		BaseSourceDeclarationSeam: "declaration_seam",
+		BaseSourceRunAdmission:    "run_admission",
+	} {
+		if got := in.AuditValue(); got != want {
+			t.Errorf("BaseSource(%q).AuditValue() = %q, want %q", string(in), got, want)
+		}
+	}
+}
+
+func withheldFixture() Withheld {
+	return Withheld{
+		Reason: WithheldReasonRunBaseUnrecorded,
+		Declarations: []Declaration{
+			{Path: declaredPath, DeclarationSite: declSite, Base: BaseSourceRunAdmission},
+			{Path: "docs/second.md", DeclarationSite: "second site", Base: BaseSourceRunAdmission},
+		},
+	}
+}
+
+func TestRecordWithheld_WritesOneDegradedEntry(t *testing.T) {
+	a := &recordingAppender{}
+	runID, stageID := uuid.New(), uuid.New()
+	if err := RecordWithheld(context.Background(), a, runID, stageID, withheldFixture()); err != nil {
+		t.Fatalf("RecordWithheld: %v", err)
+	}
+	if len(a.entries) != 1 {
+		t.Fatalf("appended %d entries, want exactly 1 for the whole withheld set (%v)", len(a.entries), a.categories())
+	}
+	e := a.entries[0]
+	if e.Category != "document_injection_degraded" {
+		t.Errorf("Category = %q, want document_injection_degraded", e.Category)
+	}
+	if e.RunID != runID || e.StageID == nil || *e.StageID != stageID {
+		t.Errorf("RunID/StageID = %s/%v, want %s/%s", e.RunID, e.StageID, runID, stageID)
+	}
+	if e.ActorKind == nil || *e.ActorKind != audit.ActorSystem {
+		t.Errorf("ActorKind = %v, want system", e.ActorKind)
+	}
+	var p struct {
+		Reason           string   `json:"reason"`
+		Paths            []string `json:"paths"`
+		DeclarationSites []string `json:"declaration_sites"`
+		DocumentCount    int      `json:"document_count"`
+	}
+	if err := json.Unmarshal(e.Payload, &p); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	if p.Reason != "run_base_commit_unrecorded" {
+		t.Errorf("reason = %q, want run_base_commit_unrecorded", p.Reason)
+	}
+	if len(p.Paths) != 2 || p.Paths[0] != declaredPath || p.Paths[1] != "docs/second.md" {
+		t.Errorf("paths = %v, want [%s docs/second.md] in declaration order", p.Paths, declaredPath)
+	}
+	if len(p.DeclarationSites) != 2 || p.DeclarationSites[0] != declSite || p.DeclarationSites[1] != "second site" {
+		t.Errorf("declaration_sites = %v, want [%s, second site]", p.DeclarationSites, declSite)
+	}
+	if p.DocumentCount != 2 {
+		t.Errorf("document_count = %d, want 2", p.DocumentCount)
+	}
+}
+
+func TestRecordWithheld_FailsClosed(t *testing.T) {
+	boom := errors.New("audit: chain append failed")
+
+	t.Run("append failure returns the error", func(t *testing.T) {
+		a := &recordingAppender{failOn: 1, err: boom}
+		if err := RecordWithheld(context.Background(), a, uuid.New(), uuid.New(), withheldFixture()); !errors.Is(err, boom) {
+			t.Fatalf("err = %v, want the append error wrapped", err)
+		}
+		if len(a.entries) != 0 {
+			t.Errorf("persisted %v after a failed append, want nothing", a.categories())
+		}
+	})
+
+	t.Run("nil appender", func(t *testing.T) {
+		if err := RecordWithheld(context.Background(), nil, uuid.New(), uuid.New(), withheldFixture()); err == nil {
+			t.Fatal("err = nil, want a fail-closed error with no audit appender")
+		}
+	})
+
+	t.Run("empty reason", func(t *testing.T) {
+		w := withheldFixture()
+		w.Reason = ""
+		a := &recordingAppender{}
+		if err := RecordWithheld(context.Background(), a, uuid.New(), uuid.New(), w); err == nil {
+			t.Fatal("err = nil, want a refusal: a degraded entry must name why")
+		}
+		if a.calls != 0 {
+			t.Errorf("AppendChained calls = %d, want 0", a.calls)
+		}
+	})
+
+	t.Run("empty set is a no-op", func(t *testing.T) {
+		a := &recordingAppender{}
+		if err := RecordWithheld(context.Background(), a, uuid.New(), uuid.New(), Withheld{Reason: WithheldReasonRunBaseUnrecorded}); err != nil {
+			t.Fatalf("RecordWithheld with no declarations: %v", err)
+		}
+		if a.calls != 0 {
+			t.Errorf("AppendChained calls = %d for an empty set, want 0", a.calls)
+		}
+	})
+}

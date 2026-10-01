@@ -204,3 +204,40 @@ func lineSeparatorWidth(s string, i int) int {
 	}
 	return 0
 }
+
+// WithheldNoticeHeading is the fixed heading of the block WithheldNotice
+// renders.
+const WithheldNoticeHeading = "Declared repository documents withheld"
+
+// WithheldNotice renders a SYSTEM-AUTHORED block telling the agent that
+// declared documents were deliberately withheld from this prompt (E55.7 /
+// #3746): the reason, and each withheld path with its declaration site.
+// Without it, a withheld document is indistinguishable from one that was never
+// declared, and the agent would judge the change as if no such constraint
+// existed.
+//
+// Every interpolated value — the reason, each path, each declaration site — is
+// passed through sanitizeMetadata, so a repository-chosen file name carrying a
+// newline cannot end its list line and start a forged heading or instruction
+// at column 0. No document body is rendered, so there are no delimiters to
+// forge.
+//
+// Path, Commit and ContentHash are left EMPTY on purpose: the notice names no
+// resolved revision, and an empty Path can never satisfy a consumer's
+// "was my declared document injected?" identity check. The output is
+// deterministic, so the served and preview renders stay byte-identical.
+func WithheldNotice(w Withheld) prompt.InjectedDocument {
+	var b strings.Builder
+	fmt.Fprintf(&b, "The documents listed below are declared for this repository but were WITHHELD from this prompt "+
+		"(reason: %s). They are not absent and were not empty: each one resolves only at a pinned commit this run "+
+		"could not supply, so none of them was read at all rather than read at a mutable ref. "+
+		"Do not conclude from their absence that no such document was declared.\n\n", sanitizeMetadata(w.Reason))
+	b.WriteString("Withheld documents:\n")
+	for _, d := range w.Declarations {
+		fmt.Fprintf(&b, "- %s (declared at %s)\n", sanitizeMetadata(d.Path), sanitizeMetadata(d.DeclarationSite))
+	}
+	return prompt.InjectedDocument{
+		Heading: WithheldNoticeHeading,
+		Body:    b.String(),
+	}
+}

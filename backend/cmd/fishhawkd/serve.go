@@ -1195,9 +1195,12 @@ func documentForgeOwnershipGuard(
 //
 // Why the default branch and not a per-run base: a backlog-grooming run
 // produces no diff and owns no branch, so there is no per-run base to resolve
-// and the trunk IS the base. E55's review-conventions consumer attaches to
-// code-change runs and still needs the per-run source
-// backend/internal/repodoc/README.md names.
+// and the trunk IS the base. Code-change runs get their per-run source from
+// this same adapter, called ONCE at run admission instead of at serve time:
+// Server.captureDocumentBaseCommit pins the head it returns and stamps it on
+// runs.document_base_commit (E55.7 / #3746), and a declaration marked
+// repodoc.BaseSourceRunAdmission is resolved only at that recorded commit —
+// see backend/internal/repodoc/README.md.
 func documentBaseRefResolver(repos repositoryGetter,
 	scope func(ctx context.Context, repo forge.RepoRef) (forge.CredentialScope, error),
 ) func(ctx context.Context, repo forge.RepoRef) (string, error) {
@@ -3459,6 +3462,15 @@ func runServe(args []string, logSink io.Writer) int {
 		// reason as ApprovalHandler — the dispatcher was built before the
 		// Server existed.
 		cfg.WebhookDispatcher.BoardSyncer = srv
+		// Run-admission document base commit (E55.7 / #3746): webhook-minted
+		// root runs record the same pinned default-branch head the
+		// CreateRunForTrigger path stamps. Plugged in here because the capture
+		// reads the document seam installed on the constructed Server (whose
+		// Config server.New copied by value). Without this every webhook-minted
+		// run records NULL, which withholds its run-admission documents with a
+		// named degradation — safe, but a fidelity loss (#3902 tracks the
+		// missing direct test of this wiring).
+		cfg.WebhookDispatcher.DocumentBaseCommit = srv.CaptureDocumentBaseCommit
 		logger.Info("slash-command approval handler wired")
 	}
 

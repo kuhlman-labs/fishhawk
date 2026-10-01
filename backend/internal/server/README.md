@@ -665,8 +665,12 @@ SERVE TIME, which for a non-diff workflow is the defined base (a grooming run pr
 diff and owns no branch). Consequence, stated rather than hidden: a charter amendment
 landing between run creation and prompt serve changes which revision constrains that run
 — acceptable for grooming, decidable after the fact from the audit hash, and **not
-reusable** by E55's review-conventions consumer, which still needs the per-run source
-`backend/internal/repodoc/README.md` names.
+reusable** by E55's review-conventions consumer. That consumer declares
+`repodoc.BaseSourceRunAdmission` and `resolveDeclaredDocuments` resolves it ONLY at
+`runs.document_base_commit`, the commit recorded once at run admission and inherited by
+every child run; a run with no recorded commit has those declarations WITHHELD (E55.7 /
+#3746, `backend/internal/repodoc/README.md`). The charter keeps its serve-time semantics
+until E71.2 #3242, which should reuse that column.
 
 **Non-grooming prompts are byte-identical.** The declarations func returns zero
 declarations for every other stage (and never touches the conventions loader), and
@@ -718,7 +722,9 @@ that both stopped refusing agree with each other, and would also agree on the th
 charter block.
 
 The ONE ratified divergence is ATTRIBUTION: the preview writes NO `document_injected` /
-`document_truncated` entries. A `document_injected` entry claims a revision CONSTRAINED AN
+`document_truncated` / `document_injection_degraded` entries, while rendering the same
+`WithheldNotice` the served prompt carries for withheld run-admission declarations (E55.7 /
+#3746). A `document_injected` entry claims a revision CONSTRAINED AN
 AGENT; a preview constrains none, and `/prompt-render` is an unsigned read-access GET the
 SPA re-fetches on every session view, so attributing it would both falsify the claim and
 let a pure read surface append unbounded chained rows to an append-only log. **Residual:**
