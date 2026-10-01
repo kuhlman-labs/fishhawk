@@ -737,3 +737,68 @@ alarm. An unbound gitlab row is REFUSED by the authorization gate (audit reason
 `gitlab_project_path_unbound`), so this column is how an operator enumerates
 what needs re-registering after upgrading past migration `0078`. Full operator
 procedure: `docs/deploy/gitlab.md`.
+
+## Divergence question: env knobs and `precedent-tuning` (E75.5 / #3733, ADR-082)
+
+When enabled, the server records a `precedent_divergence` entry when a captain's decision at an
+allow-listed gate (a concern waive, a concern defer, or a plan **reject**) goes against clear
+precedent. The pure rule is `precedent.Decide` (`backend/internal/precedent/divergence.go`); the
+gate hook is `backend/internal/server/gate_divergence.go`.
+
+**Shipped DISABLED.** With no override, `server.Config.DivergenceConfig` is nil: nothing is
+detected, nothing is recorded, no response changes. The knobs (`divergenceConfigFromEnv` in
+`serve.go`):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `FISHHAWKD_PRECEDENT_DIVERGENCE_ENABLED` | `false` | Master switch (`strconv.ParseBool`). |
+| `FISHHAWKD_PRECEDENT_DIVERGENCE_MIN_DECISIONS` | `5` | N: fewest prior HUMAN decisions that can be clear precedent (>= 1). Delegated decisions never count. |
+| `FISHHAWKD_PRECEDENT_DIVERGENCE_MIN_AGREEMENT` | `0.8` | X in (0, 1]: the modal outcome's least share of that set. |
+| `FISHHAWKD_PRECEDENT_DIVERGENCE_WINDOW` | `180d` | Recency window: whole days (`180d`) or a Go duration (`4320h`). |
+| `FISHHAWKD_PRECEDENT_DIVERGENCE_CLASSES` | (all) | Comma-separated narrowing of the CLOSED allow-list `concern_defer,concern_waive,plan_approval`; it can never widen it. |
+
+Every knob is parsed strictly **whether or not the feature is enabled**: an unparseable or
+out-of-range value, or a class outside the allow-list, refuses daemon startup naming the
+variable — a typo never silently becomes a default nobody chose. The numeric defaults are
+placeholders; pick real values with the report below before enabling.
+
+### `fishhawkd precedent-tuning`
+
+```sh
+fishhawkd precedent-tuning --repo owner/name [--db <url>] \
+  [--min-decisions 3,5,8] [--min-agreement 0.7,0.8,0.9] [--window 90d,180d,365d] \
+  [--classes concern_waive,concern_defer,plan_approval] [--limit 10000]
+```
+
+Replays the rule (`precedent.Replay`, `backend/internal/precedent/tuning.go`) over the
+repository's recorded decision history for every cell of the cartesian (N, X, window) grid. For
+each historical decision of an examined class, the precedent set is reconstructed AS OF that
+decision — strictly earlier rows (by `decided_at`, then source sequence), same repository, newest
+500 per comparison class, ranked top 20 through the same `precedent.Rank` the live hook uses — and
+the decision's own `decided_at` and doctrine version are the `now` and version `Decide` runs
+under. A concern waive and a concern defer are compared against prior decisions of BOTH classes;
+plan approvals are examined only on a reject. Each candidate is evaluated as though enabled.
+
+Rows are read through `decisionindex.Store.List` un-scoped by account (the deployment posture of
+`decision-index backfill|check`), `--limit` rows per class newest first (`0` = unbounded); run
+`fishhawkd decision-index backfill` first if the index is empty. Output is stdout, one line per
+candidate sorted by fire rate ascending (quietest first, ties in grid order):
+
+```
+precedent-tuning repo=acme/widgets rows_read=7 candidates=4
+...
+min_decisions=5 min_agreement=0.80 window=30d examined=7 fired=1 fire_rate=0.1429 below_min_decisions=5 outside_window=0 doctrine_version_mismatch=0 below_min_agreement=0 agreed_with_precedent=1
+```
+
+`examined` counts the decisions the candidate could have fired on; the five trailing counts are
+the per-reason breakdown of the ones it did not (the first unmet condition, in `Decide`'s order:
+N, window, doctrine version, agreement — or it agreed with precedent).
+
+**Fails closed** (non-zero exit, named message on stderr, no report): a missing or blank `--repo`;
+an unparseable, empty-element or out-of-range threshold; an empty list (`empty grid`); a class
+outside the allow-list; a negative `--limit`; no `--db`/`FISHHAWKD_DATABASE_URL`; a read failure;
+and **zero rows read** — a typo'd repository or an un-backfilled index would otherwise print an
+all-zero report that reads as "never fires".
+
+Until E71.2 / #3242 lands, an index row's doctrine version is `runs.workflow_sha`, so any workflow
+spec edit resets precedent; the `doctrine_version_mismatch` column shows what that costs.
