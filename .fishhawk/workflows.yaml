@@ -242,9 +242,9 @@ workflows:
         executor:
           agent: claude-code
           # The plan stage is the cheapest agent stage and plan quality is
-          # the strongest lever on downstream rework, so it pins the most
-          # capable model rather than taking the deployment default.
-          model: claude-opus-5
+          # the strongest lever on downstream rework, so it pins the current
+          # Opus rather than taking the deployment default.
+          model: claude-opus-5-5
         # Advisory plan review: agent reviewers surface verdicts before the
         # human gate below, which stays authoritative (agent reviewers plus
         # a human reviewer resolves to advisory authority). Two providers

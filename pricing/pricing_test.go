@@ -189,11 +189,11 @@ func TestCost_KnownTiers(t *testing.T) {
 // backend/cmd/fishhawkd/serve.go and backend/internal/server/modelpolicy.go
 // (claudecode=claude-opus-4-8,claude-sonnet-4-6; codex=gpt-5.5), AND the
 // models pinned in .fishhawk/workflows.yaml, which overrides the defaults
-// with claude-opus-5 (plan executor), claude-fable-5-1 (both claudecode
+// with claude-opus-5-5 (plan executor), claude-fable-5-1 (both claudecode
 // reviewers) and gpt-6-astra (both codex reviewers, since #3234).
-// claude-fable-5 is the previous reviewer pin, and claude-opus-5-5 /
-// claude-sonnet-5-5 are the current Opus / Sonnet, so a swap to any of
-// them prices.
+// claude-opus-5 and claude-fable-5 are the previous pins and
+// claude-sonnet-5-5 is the current Sonnet, so a swap to any of them
+// prices.
 // gpt-5.6-terra is retained as future-swap insurance — it was the codex
 // reviewer before #3234 and stays priced so a swap back can't silently
 // record $0. claude-sonnet-5 is included so a future family-prefix change
