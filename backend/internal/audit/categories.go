@@ -35,7 +35,11 @@ import "sort"
 // record of exactly what precedent a captain-facing surface showed at an open
 // human gate (server/gate_precedent.go) — fingerprint-deduped like
 // escalation_fired, INTERNAL (never its own issue-thread activity line), and
-// never a gate input. E53.5 / #2228 added stage_permissions_declared,
+// never a gate input. E75.5 / #3733 added precedent_divergence (a captain's
+// waive / defer / plan reject went against clear precedent —
+// server/gate_divergence.go, shipped disabled) and
+// precedent_divergence_answered (the captain's one_off / doctrine_change
+// answer to it); both INTERNAL like precedent_surfaced. E53.5 / #2228 added stage_permissions_declared,
 // written ONCE per run at run creation when the workflow declares any stage
 // `permissions` or `egress` block (declaration-only, enforced: false). E66.37 /
 // #2474 added acceptance_triage_arbitrated, the operator-only discharge of a
@@ -393,6 +397,8 @@ var KnownCategories = map[string]struct{}{
 	"pr_review_posted":                        {},
 	"pr_review_submitted":                     {},
 	"pr_status_comment_posted":                {},
+	"precedent_divergence":                    {}, // E75.5 / #3733: decision went against clear precedent (server/gate_divergence.go)
+	"precedent_divergence_answered":           {}, // E75.5 / #3733: the captain's one_off / doctrine_change answer
 	"precedent_surfaced":                      {}, // E75.4 / #3732: precedent shown at an open human gate (server/gate_precedent.go)
 	"product_report_filed":                    {},
 	"pull_request_closed_after_review_reject": {},

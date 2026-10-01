@@ -13,6 +13,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/decisionindex"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
@@ -350,7 +351,7 @@ func (s *Server) handleDeferConcern(w http.ResponseWriter, r *http.Request) {
 		"issue_title":    item.Title,
 		"issue_provider": created.Provider,
 	})
-	if _, aerr := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
+	deferredEntry, aerr := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
 		RunID:        row.RunID,
 		StageID:      &row.StageID,
 		Timestamp:    time.Now().UTC(),
@@ -358,7 +359,8 @@ func (s *Server) handleDeferConcern(w http.ResponseWriter, r *http.Request) {
 		ActorKind:    &actorKind,
 		ActorSubject: &subject,
 		Payload:      payload,
-	}); aerr != nil {
+	})
+	if aerr != nil {
 		// The mutation + the durable issue already landed; the audit FACT
 		// is best-effort here (warn-only) so a transient append failure does
 		// not fail a defer the operator already committed. Unlike waive
@@ -370,6 +372,14 @@ func (s *Server) handleDeferConcern(w http.ResponseWriter, r *http.Request) {
 			slog.String("run_id", row.RunID.String()),
 			slog.String("concern_id", row.ID.String()),
 			slog.String("error", aerr.Error()))
+	} else {
+		// Divergence (E75.5 / #3733): only once the concern_deferred FACT is
+		// on the chain. Best-effort; the response below is unchanged by it.
+		s.noteGateDivergence(r.Context(), gateDivergenceDecision{
+			RunID: row.RunID, StageID: row.StageID, Class: decisionindex.ClassConcernDefer,
+			Outcome: "deferred", StageKind: row.StageKind, ConcernCategory: row.Category,
+			Severity: row.Severity, DecisionSequence: entrySequence(deferredEntry),
+		})
 	}
 
 	s.writeJSON(w, r, http.StatusOK, deferConcernResponse{

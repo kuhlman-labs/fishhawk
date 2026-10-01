@@ -168,9 +168,56 @@ projection — adding it would carry another run's reasoning into a planner's
 prompt, which is exactly what rule 6 protects against and what decision (e)
 narrowed the exception to avoid.
 
+## Divergence threshold (`divergence.go`, E75.5 / #3733)
+
+ADR-082 decision (d) and rule 5: when a captain's decision at an allow-listed
+gate goes AGAINST clear precedent, the server records a `precedent_divergence`
+entry (backend/internal/server § "Divergence at the gate"). This file is the
+pure rule; it holds no clock (`now` is a parameter), no DB and no HTTP.
+
+**Shipped disabled.** The zero `DivergenceConfig` and `DefaultDivergenceConfig()`
+both have `Enabled: false`; the default's numbers (N=5, X=0.8, 180-day window)
+are placeholders a tuning report replaces with evidence.
+
+**Closed allow-list.** `concern_waive`, `concern_defer`, and `plan_approval`
+ONLY on a `reject` outcome (`ClassAllowed`). The reject restriction keeps the
+rule off the approve-dominated plan-gate base rate. Config may NARROW the set
+(`AllowedClasses`) but never widen it: `NewDivergenceConfig` refuses an
+unrecognised class with `ErrUnknownDivergenceClass` and an out-of-range threshold
+with `ErrInvalidDivergenceConfig`. The keys are `decisionindex` constants, so a
+renamed class is a compile break, not a silent no-fire.
+
+**Precedent classes.** Each concern class's own outcome is constant
+(`waived` / `deferred`), so a waive compared only against prior waives could
+never diverge. `ComparisonClasses` therefore compares the two concern classes
+against the UNION of both (two answers to one question: what to do with an open
+concern); `plan_approval` is compared against itself.
+
+**`Decide` — four conditions, first unmet one is the reason:**
+
+1. at least N **human** items (`!Item.Delegated`; a delegated decision counts
+   toward neither N nor the agreement denominator) → else `below_min_decisions`;
+2. at least N of those with `DecidedAt >= now - Window` (inclusive edge) → else
+   `outside_window`;
+3. at least N of those under the deciding run's doctrine version → else
+   `doctrine_version_mismatch`;
+4. `Summarize` of exactly that set has `agreement_ratio >= X` (the modal-share
+   definition above) → else `below_min_agreement`.
+
+With clear precedent the verdict is `diverged` when the captain's outcome
+differs from the modal outcome and `agreed_with_precedent` otherwise. The doctrine
+version is `runs.workflow_sha` today (`decisionindex.Row.DoctrineVersion`), which
+is NARROWER than a charter revision — any workflow-spec edit resets the window.
+That makes the rule quieter, never louder.
+
+`ParseWindow` accepts a Go duration or a whole number of days (`180d`) and
+refuses zero, negative and malformed values. Pinned by `divergence_test.go`, one
+isolating fixture per condition.
+
 ## Issue history
 
 - #3742 (E77.8) — the historian consult responder, the one sanctioned agent-facing consumer.
+- #3733 (E75.5) — the divergence threshold rule and closed allow-list.
 - #3732 (E75.4) — `IndexVersion` + `Fingerprint` for the gate-open precedent block.
 - #3731 (E75.3) — this package, the REST route and the MCP tool.
 - #3730 (E75.2) — `decision_index`, the rows this ranks.

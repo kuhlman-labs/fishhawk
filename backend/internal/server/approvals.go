@@ -18,6 +18,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/budget"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/decisionindex"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/delegation"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
@@ -2507,7 +2508,7 @@ func (s *Server) writeApprovalAudit(ctx context.Context, stage *run.Stage, app *
 	payload, _ := json.Marshal(auditPayload)
 
 	approver := app.ApproverSubject
-	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+	entry, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
 		RunID:        stage.RunID,
 		StageID:      &stage.ID,
 		Timestamp:    time.Now().UTC(),
@@ -2515,12 +2516,26 @@ func (s *Server) writeApprovalAudit(ctx context.Context, stage *run.Stage, app *
 		ActorKind:    &actorKind,
 		ActorSubject: &approver,
 		Payload:      payload,
-	}); err != nil {
+	})
+	if err != nil {
 		s.cfg.Logger.Error("audit append failed for approval",
 			"run_id", stage.RunID,
 			"stage_id", stage.ID,
 			"error", err.Error(),
 		)
+		return
+	}
+	// Divergence (E75.5 / #3733): a PLAN REJECT is the one approval outcome
+	// on the allow-list. It runs here — after the approval_submitted entry is
+	// on the chain, the tail every reject path (legacy first-vote, quorum,
+	// escalation-unreadable) shares — so it can never ask about a decision
+	// that was not recorded. Best-effort; it cannot fail or alter the vote.
+	if app.Decision == approval.DecisionReject && stage.Type == run.StageTypePlan {
+		s.noteGateDivergence(ctx, gateDivergenceDecision{
+			RunID: stage.RunID, StageID: stage.ID, Class: decisionindex.ClassPlanApproval,
+			Outcome: string(app.Decision), StageKind: string(run.StageTypePlan),
+			RejectClass: rejectClass, DecisionSequence: entrySequence(entry),
+		})
 	}
 }
 

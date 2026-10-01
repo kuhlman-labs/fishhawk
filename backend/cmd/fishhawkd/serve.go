@@ -72,6 +72,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/precedent"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pushnotify"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/reactionpoller"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/refinement"
@@ -1373,6 +1374,71 @@ func gitlabIdentityWarnings(baseURL, deviceClientID, deploymentToken string) []s
 	return warnings
 }
 
+// Environment knobs of the E75.5 / #3733 divergence threshold.
+const (
+	envDivergenceEnabled      = "FISHHAWKD_PRECEDENT_DIVERGENCE_ENABLED"
+	envDivergenceMinDecisions = "FISHHAWKD_PRECEDENT_DIVERGENCE_MIN_DECISIONS"
+	envDivergenceMinAgreement = "FISHHAWKD_PRECEDENT_DIVERGENCE_MIN_AGREEMENT"
+	envDivergenceWindow       = "FISHHAWKD_PRECEDENT_DIVERGENCE_WINDOW"
+	envDivergenceClasses      = "FISHHAWKD_PRECEDENT_DIVERGENCE_CLASSES"
+)
+
+// divergenceConfigFromEnv builds server.Config.DivergenceConfig from the
+// FISHHAWKD_PRECEDENT_DIVERGENCE_* knobs. It returns NIL — the disabled,
+// byte-identical-to-today posture — unless _ENABLED parses true. Every knob is
+// parsed STRICTLY whether or not the feature is enabled, and any malformed
+// value (an unparseable bool/int/float/window, an out-of-range threshold, a
+// class outside the closed allow-list) is an error naming the variable, so a
+// typo never silently becomes a default nobody chose. Unset numeric knobs take
+// precedent.DefaultDivergenceConfig()'s placeholders.
+func divergenceConfigFromEnv(getenv func(string) string) (*precedent.DivergenceConfig, error) {
+	def := precedent.DefaultDivergenceConfig()
+	enabled := false
+	if v := strings.TrimSpace(getenv(envDivergenceEnabled)); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return nil, fmt.Errorf("%s=%q is not a boolean", envDivergenceEnabled, v)
+		}
+		enabled = b
+	}
+	minDecisions := def.MinDecisions
+	if v := strings.TrimSpace(getenv(envDivergenceMinDecisions)); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return nil, fmt.Errorf("%s=%q is not an integer", envDivergenceMinDecisions, v)
+		}
+		minDecisions = n
+	}
+	minAgreement := def.MinAgreement
+	if v := strings.TrimSpace(getenv(envDivergenceMinAgreement)); v != "" {
+		x, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return nil, fmt.Errorf("%s=%q is not a number", envDivergenceMinAgreement, v)
+		}
+		minAgreement = x
+	}
+	window := def.Window
+	if v := strings.TrimSpace(getenv(envDivergenceWindow)); v != "" {
+		w, err := precedent.ParseWindow(v)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", envDivergenceWindow, err)
+		}
+		window = w
+	}
+	var classes []string
+	if v := strings.TrimSpace(getenv(envDivergenceClasses)); v != "" {
+		classes = strings.Split(v, ",")
+	}
+	cfg, err := precedent.NewDivergenceConfig(enabled, minDecisions, minAgreement, window, classes)
+	if err != nil {
+		return nil, fmt.Errorf("FISHHAWKD_PRECEDENT_DIVERGENCE_*: %w", err)
+	}
+	if !cfg.Enabled {
+		return nil, nil
+	}
+	return &cfg, nil
+}
+
 // validateIssueSetResolutionBudget is the startup gate on
 // --issue-set-resolution-budget / FISHHAWKD_ISSUE_SET_RESOLUTION_BUDGET
 // (E54.59 / #3113), extracted for the same reason resolveMCPRouteMode is: the
@@ -2214,6 +2280,16 @@ func runServe(args []string, logSink io.Writer) int {
 		return exitFailure
 	}
 
+	// E75.5 / #3733 divergence threshold. DISABLED unless
+	// FISHHAWKD_PRECEDENT_DIVERGENCE_ENABLED is set; a malformed knob REFUSES
+	// startup rather than silently falling back (envOr*'s posture), because a
+	// silently-defaulted threshold is a permissive one nobody chose.
+	divergenceConfig, err := divergenceConfigFromEnv(os.Getenv)
+	if err != nil {
+		logger.Error("invalid FISHHAWKD_PRECEDENT_DIVERGENCE_* configuration", slog.String("error", err.Error()))
+		return exitFailure
+	}
+
 	// Warn when an operator .env / flag override drops the plan-review
 	// timeout below the #606 code default (300s) — a value that risks
 	// timing out review of large standard_v1 plans, silently defeating the
@@ -2256,6 +2332,7 @@ func runServe(args []string, logSink io.Writer) int {
 	modelOracle := newModelOracle(modelProviders, *modelBaseURL, *modelAPIKey, *modelsStalenessThreshold, logger)
 
 	cfg := server.Config{Addr: *addr, StartNonce: *startNonce, Logger: logger, ExternalURL: *externalURL, SpendAlertMultiple: *spendAlertMultiple, BudgetLocation: budgetLocation, BudgetLimitOverrideUSD: *budgetLimitOverrideUSD, BudgetAckMultiple: *budgetAckMultiple, BudgetPageMultiple: *budgetPageMultiple, ReviewBudget: reviewBudget, MaxParallelChildren: *maxParallelChildren, ImplementModelDefault: *implementModelDefault, ImplementAllowedModels: server.ParseAllowedModels(*implementAllowedModels), PlanAllowedModels: server.ParseAllowedModels(*planAllowedModels), ReviewAllowedModels: server.ParseAllowedModels(*reviewAllowedModels), ReviewResolution: *reviewResolution, ModelOracle: modelOracle, MCPRoute: mcpRouteMode, IssueSetResolutionBudget: *issueSetResolutionBudget}
+	cfg.DivergenceConfig = divergenceConfig
 
 	// Wire the MCP tool registry into the /mcp route (ADR-076 / #2390). The
 	// route takes a FACTORY rather than importing mcpserver itself: an import

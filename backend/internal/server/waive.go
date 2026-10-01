@@ -13,6 +13,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/decisionindex"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/delegation"
 )
 
@@ -304,7 +305,7 @@ func (s *Server) applyConcernWaive(ctx context.Context, row *concern.Concern, re
 		waivedFields["bulk_waive"] = true
 	}
 	payload, _ := json.Marshal(waivedFields)
-	if _, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+	waived, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
 		RunID:        row.RunID,
 		StageID:      &row.StageID,
 		Timestamp:    time.Now().UTC(),
@@ -312,7 +313,8 @@ func (s *Server) applyConcernWaive(ctx context.Context, row *concern.Concern, re
 		ActorKind:    &actorKind,
 		ActorSubject: &subject,
 		Payload:      payload,
-	}); aerr != nil {
+	})
+	if aerr != nil {
 		return nil, concernWaiveAuditAppendError{err: aerr}
 	}
 
@@ -323,5 +325,14 @@ func (s *Server) applyConcernWaive(ctx context.Context, row *concern.Concern, re
 		s.writeConcernWaiveFailedAudit(ctx, row, err)
 		return nil, err
 	}
+	// Divergence (E75.5 / #3733): the waiver is durable; the hook is
+	// best-effort and can neither fail nor alter it. Here in the shared body,
+	// so the bulk verb inherits it — and its per-gate de-duplication asks at
+	// most once however many concerns a bulk waive resolves.
+	s.noteGateDivergence(ctx, gateDivergenceDecision{
+		RunID: row.RunID, StageID: row.StageID, Class: decisionindex.ClassConcernWaive,
+		Outcome: "waived", StageKind: row.StageKind, ConcernCategory: row.Category,
+		Severity: row.Severity, DecisionSequence: entrySequence(waived),
+	})
 	return updated, nil
 }
