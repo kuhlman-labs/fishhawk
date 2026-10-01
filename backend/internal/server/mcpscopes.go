@@ -215,6 +215,8 @@ var mcpToolScopes = map[string]mcpToolScopeRule{
 	"fishhawk_waive_concern":  {anyOf: []string{"write:stages", scopeFixupAlternate}},
 	"fishhawk_waive_concerns": {anyOf: []string{"write:stages", scopeFixupAlternate}}, // bulk_waive.go handleBulkWaiveConcerns (E64.77 / #3318) — same predicate as the singular verb
 	"fishhawk_defer_concern":  {anyOf: []string{"write:stages", scopeFixupAlternate}},
+	// divergence_answer.go handleAnswerDivergence (E75.5 / #3733) — the waive/defer posture.
+	"fishhawk_answer_divergence": {anyOf: []string{"write:stages", scopeFixupAlternate}},
 
 	// --- write:approvals.
 	"fishhawk_approve_plan":                 {anyOf: []string{"write:approvals"}}, // approvals.go handleSubmitApproval

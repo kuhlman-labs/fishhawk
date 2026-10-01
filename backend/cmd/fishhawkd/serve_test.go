@@ -51,6 +51,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/modeloracle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/precedent"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pushnotify"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/repoacl"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/repodoc"
@@ -6043,5 +6044,82 @@ func TestCrewResponderRegistry_RegistersHistorian(t *testing.T) {
 	// looks wired and answers 422 for every consult.
 	if _, err := crewResponderRegistry(nil); err == nil {
 		t.Fatal("crewResponderRegistry(nil) returned no error")
+	}
+}
+
+// divergenceEnv is a getenv over a fixed map, for divergenceConfigFromEnv.
+func divergenceEnv(m map[string]string) func(string) string {
+	return func(k string) string { return m[k] }
+}
+
+// TestDivergenceConfigFromEnv_DefaultIsDisabled pins the shipped default
+// (E75.5 / #3733): with no FISHHAWKD_PRECEDENT_DIVERGENCE_* override, and with
+// _ENABLED=false, server.Config.DivergenceConfig is NIL — nothing evaluated,
+// nothing recorded.
+func TestDivergenceConfigFromEnv_DefaultIsDisabled(t *testing.T) {
+	for name, env := range map[string]map[string]string{
+		"unset":                 {},
+		"explicit false":        {envDivergenceEnabled: "false"},
+		"tuned but not enabled": {envDivergenceMinDecisions: "8", envDivergenceWindow: "90d"},
+	} {
+		cfg, err := divergenceConfigFromEnv(divergenceEnv(env))
+		if err != nil || cfg != nil {
+			t.Errorf("%s: cfg = %+v, err = %v; want nil, nil (disabled)", name, cfg, err)
+		}
+	}
+}
+
+func TestDivergenceConfigFromEnv_EnabledParsesEveryKnob(t *testing.T) {
+	cfg, err := divergenceConfigFromEnv(divergenceEnv(map[string]string{
+		envDivergenceEnabled:      "true",
+		envDivergenceMinDecisions: "8",
+		envDivergenceMinAgreement: "0.9",
+		envDivergenceWindow:       "90d",
+		envDivergenceClasses:      "concern_waive, plan_approval",
+	}))
+	if err != nil || cfg == nil {
+		t.Fatalf("cfg = %v, err = %v", cfg, err)
+	}
+	if !cfg.Enabled || cfg.MinDecisions != 8 || cfg.MinAgreement != 0.9 || cfg.Window != 90*24*time.Hour ||
+		!reflect.DeepEqual(cfg.AllowedClasses, []string{"concern_waive", "plan_approval"}) {
+		t.Fatalf("cfg = %+v", cfg)
+	}
+	def, err := divergenceConfigFromEnv(divergenceEnv(map[string]string{envDivergenceEnabled: "1"}))
+	if err != nil || def == nil || def.MinDecisions != precedent.DefaultDivergenceConfig().MinDecisions ||
+		def.Window != precedent.DefaultDivergenceConfig().Window || len(def.AllowedClasses) != 0 {
+		t.Fatalf("enabled-with-defaults cfg = %+v, err = %v", def, err)
+	}
+}
+
+// TestDivergenceConfigFromEnv_MalformedFailsClosed: one case per malformed
+// knob. Each REFUSES (a non-nil error naming the variable) rather than falling
+// back to a default, and does so even when the feature is not enabled.
+func TestDivergenceConfigFromEnv_MalformedFailsClosed(t *testing.T) {
+	for name, tc := range map[string]struct {
+		env  map[string]string
+		want string
+	}{
+		"enabled not a bool":       {map[string]string{envDivergenceEnabled: "yes please"}, envDivergenceEnabled},
+		"min decisions not an int": {map[string]string{envDivergenceEnabled: "true", envDivergenceMinDecisions: "five"}, envDivergenceMinDecisions},
+		"min agreement not a num":  {map[string]string{envDivergenceEnabled: "true", envDivergenceMinAgreement: "most"}, envDivergenceMinAgreement},
+		"window malformed":         {map[string]string{envDivergenceEnabled: "true", envDivergenceWindow: "half a year"}, envDivergenceWindow},
+		"min decisions zero":       {map[string]string{envDivergenceEnabled: "true", envDivergenceMinDecisions: "0"}, "min decisions"},
+		"agreement above one":      {map[string]string{envDivergenceEnabled: "true", envDivergenceMinAgreement: "1.5"}, "min agreement"},
+		"malformed while disabled": {map[string]string{envDivergenceMinAgreement: "most"}, envDivergenceMinAgreement},
+	} {
+		cfg, err := divergenceConfigFromEnv(divergenceEnv(tc.env))
+		if err == nil || cfg != nil {
+			t.Errorf("%s: cfg = %+v, err = nil; want a refusal", name, cfg)
+			continue
+		}
+		if !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: err = %q, want it to name %q", name, err, tc.want)
+		}
+	}
+	_, err := divergenceConfigFromEnv(divergenceEnv(map[string]string{
+		envDivergenceEnabled: "true", envDivergenceClasses: "concern_waive,merge_verdict",
+	}))
+	if !errors.Is(err, precedent.ErrUnknownDivergenceClass) {
+		t.Fatalf("unknown class: err = %v, want ErrUnknownDivergenceClass", err)
 	}
 }

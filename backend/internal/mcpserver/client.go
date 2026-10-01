@@ -283,7 +283,14 @@ type Run struct {
 	// tool HOISTS it to GetRunStatusOutput.Precedent (next to next_actions) and
 	// clears it here, so the block appears once. The json tag MUST byte-match
 	// the backend's runResponse field or it silently decodes to nil.
-	Precedent       *gatePrecedent       `json:"precedent,omitempty" jsonschema:"the bounded precedent block for the run's open human gate (single-run read only). Display-only: never a gate input, never an agent input"`
+	Precedent *gatePrecedent `json:"precedent,omitempty" jsonschema:"the bounded precedent block for the run's open human gate (single-run read only). Display-only: never a gate input, never an agent input"`
+	// Divergence mirrors the backend runResponse.divergence (E75.5 / #3733):
+	// the newest unanswered divergence question. Single-run read only; nil
+	// under the backend's shipped default (divergence disabled), for a
+	// run-bound caller, when none is open, or against an older backend. The
+	// run-status tool HOISTS it to GetRunStatusOutput.Divergence and clears it
+	// here, so it appears once. The json tag MUST byte-match the backend.
+	Divergence      *gateDivergence      `json:"divergence,omitempty" jsonschema:"the newest unanswered divergence question (single-run read only): a captain decision went against clear precedent; answer one_off or doctrine_change via fishhawk_answer_divergence. Optional — nothing gates on it"`
 	ReviewAuthority []RunReviewAuthority `json:"review_authority,omitempty" jsonschema:"per-stage resolved review authority: each entry carries the stage id, its type, the resolved mode (advisory | gating | gateless) and its provenance (declared | derived). Omitted when the run's spec declares no reviewers block"`
 	// WorkingDir mirrors the backend runResponse.working_dir (E66.42 /
 	// #2482): the run's bound local checkout, recorded once at start_run and
@@ -658,6 +665,45 @@ type GateView struct {
 	// the backend's gateViewResponse or the block silently decodes to nil (the
 	// #371-class hand-maintained-wire-mirror trap).
 	Consults []gateViewConsult `json:"consults"`
+	// Divergence mirrors the backend's gate-view divergence question (E75.5
+	// / #3733, ADR-082 decision (d)) — the same block GET /v0/runs/{id}
+	// carries. OPTIONAL and display-only. Omitted (nil) under the backend's
+	// shipped default, for a run-bound caller, when none is open, or against
+	// an older backend. The json tag MUST byte-match the backend.
+	Divergence *gateDivergence `json:"divergence,omitempty"`
+}
+
+// gateDivergence mirrors the backend's divergenceQuestion
+// (backend/internal/server/divergence_question.go, E75.5 / #3733) carried on
+// BOTH the gate view and the single-run read. The json tags MUST byte-match
+// the backend or a field silently decodes to its zero value (the #371 trap);
+// TestGateDivergenceMirror_WireBoundary pins them against a REAL server
+// response. Deliberately UNEXPORTED — same rationale as gateViewCaptain.
+// Question is omitempty HERE (not on the backend) because the run-status
+// compact default elides that fixed prose (compact.go::elideDivergenceProse).
+type gateDivergence struct {
+	Sequence       int64                `json:"sequence" jsonschema:"chain sequence of the precedent_divergence entry — the key fishhawk_answer_divergence takes"`
+	DecisionClass  string               `json:"decision_class" jsonschema:"the decision's class (concern_waive | concern_defer | plan_approval)"`
+	StageID        string               `json:"stage_id" jsonschema:"the stage the decision was recorded on"`
+	StageKind      string               `json:"stage_kind,omitempty"`
+	Outcome        string               `json:"outcome" jsonschema:"the captain's outcome (waived | deferred | reject)"`
+	RejectClass    string               `json:"reject_class,omitempty"`
+	ModalOutcome   string               `json:"modal_outcome" jsonschema:"the outcome clear precedent agreed on"`
+	AgreementRatio float64              `json:"agreement_ratio" jsonschema:"the modal outcome's share of the human precedent"`
+	HumanCount     int                  `json:"human_count" jsonschema:"how many prior HUMAN decisions the precedent counted"`
+	CitedSequences []int64              `json:"cited_sequences" jsonschema:"chain sequences of the cited prior decisions (citation only, no prose)"`
+	CitedTotal     int                  `json:"cited_total"`
+	Question       string               `json:"question,omitempty" jsonschema:"the fixed question prose; elided on the run-status compact default (include_review_prose=true restores it)"`
+	Options        []string             `json:"options" jsonschema:"the closed answer set: one_off, doctrine_change"`
+	Answer         gateDivergenceAnswer `json:"answer" jsonschema:"where to answer: the REST endpoint and the MCP tool"`
+	OpenTotal      int                  `json:"open_total" jsonschema:"how many divergence questions on the run are unanswered; only the newest is rendered"`
+}
+
+// gateDivergenceAnswer mirrors the backend's divergenceAnswerPointer. Tags
+// MUST byte-match.
+type gateDivergenceAnswer struct {
+	Endpoint string `json:"endpoint" jsonschema:"the ready-to-issue REST route"`
+	Tool     string `json:"tool" jsonschema:"the MCP tool (fishhawk_answer_divergence)"`
 }
 
 // gateViewConsult mirrors the backend's gateViewConsult (E77.8 / #3742): one
@@ -2528,6 +2574,58 @@ func (c *apiClient) DeferConcern(ctx context.Context, id uuid.UUID, p DeferConce
 	}
 	var out DeferredConcernResult
 	if err := c.do(ctx, http.MethodPost, "/v0/concerns/"+id.String()+"/defer", body, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// answerDivergenceRequest mirrors the backend's
+// `backend/internal/server/divergence_answer.go::divergenceAnswerRequest`.
+type answerDivergenceRequest struct {
+	Answer     string   `json:"answer"`
+	Note       string   `json:"note,omitempty"`
+	ParentEpic string   `json:"parent_epic,omitempty"`
+	N          string   `json:"n,omitempty"`
+	Labels     []string `json:"labels,omitempty"`
+}
+
+// AnswerDivergenceParams bundles the caller-supplied answer inputs.
+type AnswerDivergenceParams struct {
+	Answer     string
+	Note       string
+	ParentEpic string
+	N          string
+	Labels     []string
+}
+
+// AnswerDivergenceResult mirrors the backend's divergenceAnswerResponse. Issue
+// reuses DeferFiledIssue: the backend renders the doctrine_change item with
+// the SAME deferFiledIssue shape the defer verb returns.
+type AnswerDivergenceResult struct {
+	RunID    string           `json:"run_id"`
+	Sequence int64            `json:"sequence"`
+	Answer   string           `json:"answer"`
+	Issue    *DeferFiledIssue `json:"issue,omitempty"`
+}
+
+// AnswerDivergence records the captain's answer to one divergence question via
+// `POST /v0/runs/{run_id}/divergence/{sequence}/answer` (E75.5 / #3733).
+// 4xx/5xx surfaces:
+//   - 400 validation_failed (an answer outside one_off | doctrine_change)
+//   - 403 cross_run_divergence_answer / insufficient_scope
+//   - 404 run_not_found / divergence_not_found
+//   - 409 divergence_already_answered
+//   - 422 work_item_invalid / 501 provider_unimplemented / 502
+//     work_item_filing_failed (doctrine_change only — nothing recorded)
+//   - 503 divergence_store_unconfigured
+func (c *apiClient) AnswerDivergence(ctx context.Context, runID uuid.UUID, sequence int64, p AnswerDivergenceParams) (*AnswerDivergenceResult, error) {
+	body, err := json.Marshal(answerDivergenceRequest(p))
+	if err != nil {
+		return nil, fmt.Errorf("marshal divergence answer: %w", err)
+	}
+	var out AnswerDivergenceResult
+	path := "/v0/runs/" + runID.String() + "/divergence/" + strconv.FormatInt(sequence, 10) + "/answer"
+	if err := c.do(ctx, http.MethodPost, path, body, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil

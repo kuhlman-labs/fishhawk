@@ -76,6 +76,22 @@ func elidePrecedentExcerpts(block *gatePrecedent) *gatePrecedent {
 	return &out
 }
 
+// elideDivergenceProse returns a COPY of q with its fixed question prose
+// cleared — the compact-default lever for the divergence question block (E75.5
+// / #3733) on get_run_status. The sequence, the decision vs modal outcome, the
+// agreement ratio, the cited sequences, the closed option set and the answer
+// pointer are the decidable part and survive untouched;
+// include_review_prose=true restores the prose, and the gate view returns the
+// block whole. nil in, nil out.
+func elideDivergenceProse(q *gateDivergence) *gateDivergence {
+	if q == nil {
+		return nil
+	}
+	out := *q
+	out.Question = ""
+	return &out
+}
+
 // implementReviewsElidedNote is the fixed wire note dedupImplementReviews sets on
 // GetRunStatusOutput.ImplementReviewsElided when it drops the redundant flat
 // implement_reviews listing (E45.92 / #3627). It explains the omission so it is

@@ -580,6 +580,19 @@ func TestKnownCategories_PrecedentSurfaced(t *testing.T) {
 	}
 }
 
+// TestKnownCategories_PrecedentDivergence pins the two E75.5 / #3733
+// categories: server/gate_divergence.go appends precedent_divergence when a
+// captain's allow-listed decision goes against clear precedent, and the
+// answer verb appends precedent_divergence_answered. Both are INTERNAL
+// (chain-only; docs/issue-comment-surfaces.md).
+func TestKnownCategories_PrecedentDivergence(t *testing.T) {
+	for _, c := range []string{"precedent_divergence", "precedent_divergence_answered"} {
+		if !IsKnownCategory(c) {
+			t.Fatalf("%s is not in KnownCategories; register it in categories.go", c)
+		}
+	}
+}
+
 // TestKnownCategories_CrewMessageDelivered pins the E77.7 / #3741 deferred
 // delivery record: backend/internal/server's recordCrewMessagesDelivered
 // appends one per signed plan prompt or review round that handed open

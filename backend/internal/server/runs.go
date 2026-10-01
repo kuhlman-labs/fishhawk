@@ -297,6 +297,16 @@ type runResponse struct {
 	// (nil) for a run-bound identity, when no human gate is open, or when the
 	// computation degrades.
 	Precedent *gatePrecedentBlock `json:"precedent,omitempty"`
+	// Divergence is the newest unanswered divergence question on the run
+	// (E75.5 / #3733, ADR-082 decision (d)): a captain decision went against
+	// clear precedent, and the captain may answer one_off or doctrine_change
+	// via POST /v0/runs/{id}/divergence/{sequence}/answer. The SAME block the
+	// gate view carries, from the same helper (openDivergenceFor). OPTIONAL
+	// and DISPLAY-ONLY: nothing gates on it. Populated by handleGetRun ONLY.
+	// Omitted (nil) under the shipped default (divergence disabled — no read),
+	// for a run-bound mcp:run: caller (ADR-082 rule 6), when no question is
+	// open, or when a read fails.
+	Divergence *divergenceQuestion `json:"divergence,omitempty"`
 	// Permissions is the run's declared per-stage permissions/egress surface
 	// (E53.5 / #2228): one entry per stage of the run's workflow that declares a
 	// `permissions` or `egress` block. DECLARATION-ONLY — validated, audited and
@@ -2132,6 +2142,8 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 	// Gate precedent (E75.4 / #3732): single-run read ONLY, best-effort —
 	// nil (omitted) when no human gate is open or the computation degrades.
 	resp.Precedent = s.gatePrecedentFor(r.Context(), got, runConcerns, concernsRead)
+	// Divergence question (E75.5 / #3733): single-run read ONLY, best-effort.
+	resp.Divergence = s.openDivergenceFor(r.Context(), got)
 	// Lineage-completion signal (E22.X / #1137): single-run read ONLY,
 	// same posture as Concerns. Omitted (nil) when no run repo is wired
 	// or the child-graph read fails (best-effort).

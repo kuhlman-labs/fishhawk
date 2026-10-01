@@ -255,6 +255,8 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v0/stages/{stage_id}/acceptance-admission", s.requireStageAccount(memberWrite, s.handleAcceptanceAdmission))
 	mux.HandleFunc("POST /v0/stages/{stage_id}/fixup", s.requireStageAccount(memberWrite, s.handleFixupStage))
 	mux.HandleFunc("POST /v0/runs/{run_id}/concerns/waive", s.requireRunAccount(memberWrite, s.handleBulkWaiveConcerns))
+	// E75.5 / #3733: the captain's answer to a divergence question.
+	mux.HandleFunc("POST /v0/runs/{run_id}/divergence/{sequence}/answer", s.requireRunAccount(memberWrite, s.handleAnswerDivergence))
 	mux.HandleFunc("POST /v0/concerns/{concern_id}/waive", s.requireConcernAccount(memberWrite, s.handleWaiveConcern))
 	mux.HandleFunc("POST /v0/concerns/{concern_id}/defer", s.requireConcernAccount(memberWrite, s.handleDeferConcern))
 	mux.HandleFunc("GET /v0/artifacts/{artifact_id}", s.handleGetArtifact)

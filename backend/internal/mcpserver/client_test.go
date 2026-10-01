@@ -20,9 +20,11 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/decisionindex"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/precedent"
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
@@ -4148,5 +4150,115 @@ func TestGateViewConsults_WireShape(t *testing.T) {
 	}
 	if old.Consults != nil {
 		t.Errorf("Consults = %+v, want nil against a backend that omits the key", old.Consults)
+	}
+}
+
+// TestGateDivergenceMirror_WireBoundary (E75.5 / #3733) pins the
+// hand-maintained gateDivergence mirror and the AnswerDivergence dial against
+// the REAL backend: a precedent_divergence entry on the REAL chain, served with
+// the feature enabled. (a) Every key the SERVER emits in the divergence block
+// and its answer pointer is a mirror field (tag drift — the #371 trap); (b) the
+// block decodes through GetGateView and GetRun with its sequence; (c)
+// AnswerDivergence posts the real route and, read back, the question is gone.
+func TestGateDivergenceMirror_WireBoundary(t *testing.T) {
+	ctx := context.Background()
+	pool := pgtest.NewPool(t)
+	runRepo := runpkg.NewPostgresRepository(pool)
+	auditRepo := audit.NewPostgresRepository(pool)
+
+	row, err := runRepo.CreateRun(ctx, runpkg.CreateRunParams{
+		Repo: "x/y", WorkflowID: "feature_change", WorkflowSHA: "abc", TriggerSource: runpkg.TriggerCLI,
+	})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	stageID := uuid.New()
+	payload := `{"decision_class":"plan_approval","stage_id":"` + stageID.String() + `","stage_kind":"plan",` +
+		`"decision_sequence":3,"outcome":"reject","reject_class":"wrong_fork","modal_outcome":"approve",` +
+		`"agreement_ratio":1,"human_count":4,"threshold":{"min_decisions":3,"min_agreement":0.8,"window_seconds":60,"doctrine_version":"abc"},` +
+		`"index_version":"v1","cited":[{"source_sequence":41,"source_entry_hash":"h41","decision_class":"plan_approval","outcome":"approve",` +
+		`"score":{},"matched_keys":{}}],"cited_total":4}`
+	entry, err := auditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID: row.ID, Timestamp: time.Now().UTC(), Category: "precedent_divergence", Payload: json.RawMessage(payload),
+	})
+	if err != nil {
+		t.Fatalf("seed precedent_divergence: %v", err)
+	}
+
+	const bearer = "fhk_divergence_e2e"
+	tokRepo := &stubMCPAPITokens{tok: &apitoken.Token{
+		ID: uuid.New(), Subject: "github:op", Scopes: []string{"read:runs", "read:audit", "write:stages"}, PlainText: bearer,
+	}}
+	s := server.New(server.Config{RunRepo: runRepo, ConcernRepo: concern.NewPostgresRepository(pool), AuditRepo: auditRepo,
+		APITokenRepo: tokRepo, DivergenceConfig: &precedent.DivergenceConfig{Enabled: true, MinDecisions: 3, MinAgreement: 0.8, Window: time.Hour}})
+	ts := httptest.NewServer(s.Handler())
+	t.Cleanup(ts.Close)
+
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/v0/runs/"+row.ID.String(), nil)
+	req.Header.Set("Authorization", "Bearer "+bearer)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET run: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(body, &top); err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET run = %d: %s", resp.StatusCode, body)
+	}
+	var block map[string]json.RawMessage
+	if err := json.Unmarshal(top["divergence"], &block); err != nil {
+		t.Fatalf("server emitted no divergence block:\n%s", body)
+	}
+	fields := jsonFieldNames(reflect.TypeOf(gateDivergence{}))
+	for k := range block {
+		if !fields[k] {
+			t.Errorf("server divergence key %q has no field on the gateDivergence mirror (tag drift)", k)
+		}
+	}
+	var ans map[string]json.RawMessage
+	_ = json.Unmarshal(block["answer"], &ans)
+	ansFields := jsonFieldNames(reflect.TypeOf(gateDivergenceAnswer{}))
+	for k := range ans {
+		if !ansFields[k] {
+			t.Errorf("server answer key %q has no field on the gateDivergenceAnswer mirror", k)
+		}
+	}
+
+	client := newAPIClient(config{backendURL: ts.URL, apiToken: bearer})
+	gv, err := client.GetGateView(ctx, row.ID, "")
+	if err != nil {
+		t.Fatalf("GetGateView: %v", err)
+	}
+	runMirror, err := client.GetRun(ctx, row.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	for name, d := range map[string]*gateDivergence{"gate_view": gv.Divergence, "run": runMirror.Divergence} {
+		if d == nil || d.Sequence != entry.Sequence || d.DecisionClass != "plan_approval" || d.RejectClass != "wrong_fork" ||
+			d.ModalOutcome != "approve" || d.HumanCount != 4 || d.CitedTotal != 4 || len(d.CitedSequences) != 1 ||
+			d.CitedSequences[0] != 41 || d.Question == "" || len(d.Options) != 2 || d.OpenTotal != 1 ||
+			d.Answer.Tool != "fishhawk_answer_divergence" || !strings.Contains(d.Answer.Endpoint, "/divergence/") {
+			t.Fatalf("%s: decoded divergence = %+v, want the seeded question (seq %d)", name, d, entry.Sequence)
+		}
+	}
+
+	res, err := client.AnswerDivergence(ctx, row.ID, entry.Sequence, AnswerDivergenceParams{Answer: "one_off", Note: "n"})
+	if err != nil {
+		t.Fatalf("AnswerDivergence: %v", err)
+	}
+	if res.Answer != "one_off" || res.Sequence != entry.Sequence || res.RunID != row.ID.String() || res.Issue != nil {
+		t.Fatalf("result = %+v", res)
+	}
+	after, err := client.GetRun(ctx, row.ID)
+	if err != nil {
+		t.Fatalf("GetRun after: %v", err)
+	}
+	if after.Divergence != nil {
+		t.Fatalf("the answered question still surfaces: %+v", after.Divergence)
+	}
+	if _, err := client.AnswerDivergence(ctx, row.ID, entry.Sequence, AnswerDivergenceParams{Answer: "one_off"}); err == nil ||
+		!strings.Contains(err.Error(), "divergence_already_answered") {
+		t.Fatalf("second answer err = %v, want divergence_already_answered", err)
 	}
 }
