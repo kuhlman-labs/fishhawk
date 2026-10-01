@@ -59,6 +59,22 @@ import (
 // as an inexplicably unconstrained agent rather than as a fault. So it is an
 // error, raised BEFORE the seam is consulted: the mismatch is a wiring defect
 // whatever the seam would have returned.
+//
+// TWO BASE SOURCES, PARTITIONED PER DECLARATION (E55.7 / #3746). A
+// declaration on the zero repodoc.BaseSourceDeclarationSeam resolves against
+// the ref the declaration seam returned, exactly as before (the charter's
+// serve-time default-branch posture). A repodoc.BaseSourceRunAdmission
+// declaration resolves ONLY at runRow.DocumentBaseCommit — the commit recorded
+// once at run admission and inherited by every child run — so a retry, a
+// recovery child or a fix-up re-serve reads the SAME revision, never a newer
+// head and never the run's own branch. When the run recorded no commit (a
+// legacy row, an ad-hoc run, a degraded capture) every run-admission
+// declaration is WITHHELD: none is resolved or fetched, the served path
+// records ONE document_injection_degraded entry (fail-closed, written before
+// any document_injected claim), and BOTH endpoints render a
+// repodoc.WithheldNotice after the resolved documents so the agent is told
+// the documents exist and were withheld. Withholding happens before the
+// resolve phase, so it changes nothing about the ordering invariant above.
 func (s *Server) resolveDeclaredDocuments(ctx context.Context, runRow *run.Run, stage *run.Stage, attribute bool) ([]prompt.InjectedDocument, error) {
 	if runRow == nil || stage == nil {
 		return nil, nil
@@ -90,6 +106,24 @@ func (s *Server) resolveDeclaredDocuments(ctx context.Context, runRow *run.Run, 
 		}
 	}
 
+	// PARTITION BY BASE SOURCE. A run-admission declaration on a run that
+	// recorded no admission commit is WITHHELD here, before the resolve phase:
+	// there is no ref it may honestly be read at (the seam's ref and the run's
+	// branch are both mutable), so it is never handed to Resolve at all.
+	// Declaration order is preserved within each partition.
+	resolvable := make([]repodoc.Declaration, 0, len(decls))
+	var withheld repodoc.Withheld
+	for _, decl := range decls {
+		if decl.Base == repodoc.BaseSourceRunAdmission && runRow.DocumentBaseCommit == nil {
+			withheld.Declarations = append(withheld.Declarations, decl)
+			continue
+		}
+		resolvable = append(resolvable, decl)
+	}
+	if len(withheld.Declarations) > 0 {
+		withheld.Reason = repodoc.WithheldReasonRunBaseUnrecorded
+	}
+
 	// RESOLVE EVERY DECLARATION BEFORE ANY AUDIT ENTRY IS WRITTEN. Attribution
 	// used to run per document, interleaved with resolution, so a LATER
 	// declaration that failed to resolve left the EARLIER documents'
@@ -97,12 +131,20 @@ func (s *Server) resolveDeclaredDocuments(ctx context.Context, runRow *run.Run, 
 	// injected into a prompt this request then refused to serve. The audit log
 	// is append-only, so the fix is ordering: nothing is claimed until the
 	// whole set is known to be resolvable.
-	docs := make([]repodoc.Document, 0, len(decls))
-	for _, decl := range decls {
+	docs := make([]repodoc.Document, 0, len(resolvable))
+	for _, decl := range resolvable {
+		ref := baseRef
+		if decl.Base == repodoc.BaseSourceRunAdmission {
+			// Never the seam's ref: the admission commit, verbatim. A
+			// malformed persisted value cannot pass the runs CHECK, and if
+			// one ever arrived Resolve's run-admission guard refuses any
+			// non-commit ref before a branch lookup or fetch.
+			ref = *runRow.DocumentBaseCommit
+		}
 		doc, err := s.cfg.DocumentResolver.Resolve(ctx, repodoc.Request{
 			Repo:        repo,
 			Scope:       scope,
-			BaseRef:     baseRef,
+			BaseRef:     ref,
 			Declaration: decl,
 		})
 		if err != nil {
@@ -115,21 +157,31 @@ func (s *Server) resolveDeclaredDocuments(ctx context.Context, runRow *run.Run, 
 	// and its audit entries ship together or not at all. repodoc.Attribute
 	// orders its own appends so a failure cannot leave a successful-injection
 	// claim behind (truncations first, injection claims last, all tagged with
-	// one injection_set_id).
+	// one injection_set_id). The withheld set is recorded FIRST and fails
+	// closed the same way: a served prompt missing a declared document with no
+	// audit trace of why is the un-attributed omission that entry prevents,
+	// and writing it before any document_injected claim means its failure
+	// leaves no injection claim behind.
 	//
 	// THE ONE PHASE THE PREVIEW SKIPS. Everything above this point is shared
 	// verbatim between the served and preview wrappers, so the rendered bytes
 	// and every refusal are computed by identical code; `attribute` gates this
-	// call alone. See previewInjectedDocuments for why.
+	// block alone. See previewInjectedDocuments for why.
 	if attribute {
+		if err := repodoc.RecordWithheld(ctx, s.cfg.AuditRepo, runRow.ID, stage.ID, withheld); err != nil {
+			return nil, err
+		}
 		if err := repodoc.Attribute(ctx, s.cfg.AuditRepo, runRow.ID, stage.ID, docs...); err != nil {
 			return nil, err
 		}
 	}
 
-	out := make([]prompt.InjectedDocument, 0, len(docs))
+	out := make([]prompt.InjectedDocument, 0, len(docs)+1)
 	for i, doc := range docs {
-		out = append(out, repodoc.ToPromptDocument(doc, decls[i].Framing))
+		out = append(out, repodoc.ToPromptDocument(doc, resolvable[i].Framing))
+	}
+	if len(withheld.Declarations) > 0 {
+		out = append(out, repodoc.WithheldNotice(withheld))
 	}
 	return out, nil
 }
@@ -137,7 +189,8 @@ func (s *Server) resolveDeclaredDocuments(ctx context.Context, runRow *run.Run, 
 // resolveInjectedDocuments is the SERVED path's wrapper (GET
 // /v0/stages/{id}/prompt): it resolves, ATTRIBUTES and renders. Behaviour is
 // byte-identical to the pre-split single function — this is the only caller
-// that writes document_injected / document_truncated entries.
+// that writes document_injected / document_truncated /
+// document_injection_degraded entries.
 func (s *Server) resolveInjectedDocuments(ctx context.Context, runRow *run.Run, stage *run.Stage) ([]prompt.InjectedDocument, error) {
 	return s.resolveDeclaredDocuments(ctx, runRow, stage, true)
 }

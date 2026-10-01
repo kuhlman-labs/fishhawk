@@ -194,7 +194,12 @@ type Config struct {
 	// DocumentDeclarations returns the documents declared for a run/stage plus
 	// the BASE REF they must be pinned against. That base ref is the security
 	// input: it must name the run's base branch or a commit SHA, never the
-	// run's own branch (which the agent can write). See
+	// run's own branch (which the agent can write). It applies to the
+	// declarations on the zero repodoc.BaseSourceDeclarationSeam; a
+	// declaration marked Base = repodoc.BaseSourceRunAdmission ignores it and
+	// resolves only at the run's recorded runs.document_base_commit, and is
+	// WITHHELD (with a named notice and a document_injection_degraded entry)
+	// when the run recorded none (E55.7 / #3746). See
 	// backend/internal/repodoc/README.md for where a consumer gets it.
 	DocumentDeclarations func(ctx context.Context, runRow *run.Run, stage *run.Stage) ([]repodoc.Declaration, string, error)
 	// DocumentResolver reads declared documents from the forge at a pinned
@@ -217,9 +222,13 @@ type Config struct {
 	// The charter consumer (#2234) resolves the repository's DEFAULT BRANCH
 	// through forge.Forge.GetRepository here and lets repodoc pin it to a
 	// 40-hex commit before any fetch. A grooming run produces no diff and
-	// owns no branch, so its trunk IS its base; a consumer attaching to
-	// code-change runs (E55's review conventions) needs the per-run source
-	// backend/internal/repodoc/README.md names, not this adapter.
+	// owns no branch, so its trunk IS its base. A consumer attaching to
+	// code-change runs (E55's review conventions) does not read this ref at
+	// prompt serve: it declares Base = repodoc.BaseSourceRunAdmission and
+	// resolves at runs.document_base_commit, which run admission records by
+	// pinning THIS seam's ref once (captureDocumentBaseCommit, E55.7 /
+	// #3746). The charter keeps its serve-time semantics until E71.2 #3242,
+	// which should reuse that column rather than add a second one.
 	//
 	// NIL IS A REFUSAL, NOT A DEFAULT. A charter-requiring stage whose base
 	// ref cannot be resolved fails the prompt request: an empty ref is read
