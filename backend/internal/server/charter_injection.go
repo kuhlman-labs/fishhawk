@@ -51,10 +51,15 @@ import (
 // after the fact.
 //
 // THIS SHORTCUT IS NOT REUSABLE BY E55's review-conventions consumer. That
-// consumer attaches to CODE-CHANGE runs whose base may differ from the default
-// branch, so it still needs the per-run base-ref source
-// backend/internal/repodoc/README.md names (a persisted base_branch column, or
-// a dispatch audit entry). Do not copy this adapter there.
+// consumer attaches to CODE-CHANGE runs, whose documents must not move under a
+// retry or fix-up, so it declares repodoc.Declaration.Base =
+// repodoc.BaseSourceRunAdmission instead and resolves at
+// runs.document_base_commit — the commit recorded once at run admission
+// (E55.7 / #3746, backend/internal/repodoc/README.md). Do not copy this
+// adapter there. The charter itself stays on the serve-time default-branch
+// semantics above until E71.2 #3242 (charter admission snapshot) lands; #3242
+// should switch this declaration to BaseSourceRunAdmission and REUSE
+// runs.document_base_commit rather than add a second admission-commit column.
 //
 // # Two fail-closed layers
 //
