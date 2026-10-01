@@ -85,7 +85,57 @@ var (
 	// fallbacks: reading at an unpinned ref is exactly the mutable read the
 	// base-ref-pinning property forbids.
 	ErrUnpinnedBaseRef = errors.New("repodoc: base ref is not pinned to a commit")
+	// ErrUnknownBaseSource means a Declaration names a BaseSource this
+	// package does not define. Refused rather than read as the zero value: a
+	// misspelled run-admission source would otherwise silently resolve at the
+	// declaration seam's ref — the exact ref the declaration opted out of.
+	ErrUnknownBaseSource = errors.New("repodoc: unknown declaration base source")
 )
+
+// BaseSource names WHERE the ref a declaration is resolved against comes from
+// (E55.7 / #3746). It changes which refs Resolve will accept for the
+// declaration, never how a commit is fetched once accepted.
+type BaseSource string
+
+const (
+	// BaseSourceDeclarationSeam (the zero value) resolves against whatever ref
+	// the declaration seam returned alongside the declaration — a branch name
+	// pinned at serve time, or a commit SHA. This is the pre-E55.7 behaviour,
+	// unchanged.
+	BaseSourceDeclarationSeam BaseSource = ""
+	// BaseSourceRunAdmission resolves ONLY at the commit recorded on the run
+	// at admission (runs.document_base_commit). Resolve refuses any ref for
+	// such a declaration that is not already a full 40-hex commit SHA, BEFORE
+	// any branch resolution, so a branch name — the default branch, or the
+	// run's own agent-writable branch — can never become its read point. A
+	// run with no recorded commit has these declarations WITHHELD by the
+	// caller (see Withheld), never resolved at a fallback ref.
+	BaseSourceRunAdmission BaseSource = "run_admission"
+)
+
+// auditDeclarationSeam is how the zero BaseSource is spelled in audit
+// payloads: an empty string there would read as "unrecorded" rather than as
+// the default source.
+const auditDeclarationSeam = "declaration_seam"
+
+// AuditValue is the base_source value recorded on document_injected. The zero
+// value renders as "declaration_seam" so every entry names its source
+// explicitly.
+func (b BaseSource) AuditValue() string {
+	if b == BaseSourceDeclarationSeam {
+		return auditDeclarationSeam
+	}
+	return string(b)
+}
+
+// known reports whether b is a BaseSource this package defines.
+func (b BaseSource) known() bool {
+	switch b {
+	case BaseSourceDeclarationSeam, BaseSourceRunAdmission:
+		return true
+	}
+	return false
+}
 
 // ResolveError wraps every Resolve failure with the two identifiers an
 // operator needs to act: the declared path and the DeclarationSite that
@@ -121,6 +171,11 @@ type Declaration struct {
 	// introduced) through one value. Resolve ignores it entirely; only
 	// Render reads it.
 	Framing Framing
+	// Base selects where the ref this declaration resolves against comes
+	// from. The zero value (BaseSourceDeclarationSeam) is the pre-E55.7
+	// behaviour; BaseSourceRunAdmission accepts only a 40-hex commit. See
+	// BaseSource.
+	Base BaseSource
 }
 
 // Document is one resolved document, ready to render and attribute.
@@ -162,6 +217,9 @@ type Document struct {
 	CapBytes int
 	// DeclarationSite is echoed from the Declaration.
 	DeclarationSite string
+	// BaseSource is echoed from Declaration.Base, so attribution can record
+	// which ref source the pinned commit came from.
+	BaseSource BaseSource
 }
 
 // fileFetcher is the narrow consumer-side view of forge.FileFetcher.
@@ -202,6 +260,9 @@ type Request struct {
 //	(a) the declared path is validated as repo-relative and traversal-free;
 //	(b) an EMPTY base ref is refused (forge.FileFetcher reads an empty ref
 //	    as the repo's default branch — a mutable read);
+//	(b2) an unknown Declaration.Base is refused, and a BaseSourceRunAdmission
+//	    declaration whose ref is not already a 40-hex commit is refused BEFORE
+//	    step (c), so GetBranchSHA is never consulted for it;
 //	(c) the base ref is pinned: a 40-hex ref is used verbatim, anything else
 //	    is resolved via GetBranchSHA, whose ("", false, nil) missing-branch
 //	    shape becomes an error rather than falling through to an empty ref;
@@ -226,8 +287,20 @@ func (r *Resolver) Resolve(ctx context.Context, req Request) (*Document, error) 
 	if strings.TrimSpace(req.BaseRef) == "" {
 		return fail(fmt.Errorf("%w: base ref is empty, which a forge reads as the repo's default branch", ErrUnpinnedBaseRef))
 	}
+	if !decl.Base.known() {
+		return fail(fmt.Errorf("%w %q", ErrUnknownBaseSource, string(decl.Base)))
+	}
+	// A run-admission declaration reads ONLY at the commit recorded on the
+	// run. Refusing a non-commit ref HERE, before pinCommit, is what keeps a
+	// branch name from ever being resolved for it: pinCommit would happily
+	// turn "main" (or the run's own branch) into that branch's CURRENT tip,
+	// which is the mutable read point this source exists to rule out.
+	if decl.Base == BaseSourceRunAdmission && !isCommitSHA(strings.TrimSpace(req.BaseRef)) {
+		return fail(fmt.Errorf("%w: a %s declaration resolves only at the run's recorded admission commit, and %q is not a 40-hex commit SHA",
+			ErrUnpinnedBaseRef, BaseSourceRunAdmission, req.BaseRef))
+	}
 
-	commit, err := r.pinCommit(ctx, req)
+	commit, err := r.pinCommit(ctx, req.Repo, req.Scope, req.BaseRef)
 	if err != nil {
 		return fail(err)
 	}
@@ -263,7 +336,21 @@ func (r *Resolver) Resolve(ctx context.Context, req Request) (*Document, error) 
 		DroppedBytes:    dropped,
 		CapBytes:        effectiveCap,
 		DeclarationSite: decl.DeclarationSite,
+		BaseSource:      decl.Base,
 	}, nil
+}
+
+// PinCommit resolves ref to a lowercase 40-hex commit SHA through the same
+// pinning rules Resolve applies (E55.7 / #3746): a 40-hex ref is used verbatim,
+// anything else resolves via the Resolver's commit resolver and its OUTPUT must
+// itself be a full commit SHA. An empty ref is refused rather than resolved,
+// for the same reason Resolve refuses it. Run admission calls this to record
+// the commit a run's run-admission declarations are later resolved at.
+func (r *Resolver) PinCommit(ctx context.Context, repo forge.RepoRef, scope forge.CredentialScope, ref string) (string, error) {
+	if strings.TrimSpace(ref) == "" {
+		return "", fmt.Errorf("%w: base ref is empty, which a forge reads as the repo's default branch", ErrUnpinnedBaseRef)
+	}
+	return r.pinCommit(ctx, repo, scope, ref)
 }
 
 // capBytes returns the effective cap: Resolver.MaxBytes, or DefaultMaxBytes
@@ -275,19 +362,19 @@ func (r *Resolver) capBytes() int {
 	return DefaultMaxBytes
 }
 
-// pinCommit turns req.BaseRef into a commit SHA. A 40-hex ref is already
+// pinCommit turns baseRef into a commit SHA. A 40-hex ref is already
 // pinned. Anything else is a branch name resolved through GetBranchSHA —
 // whose found=false shape is turned into ErrUnpinnedBaseRef rather than
 // being allowed to fall through as an empty ref.
-func (r *Resolver) pinCommit(ctx context.Context, req Request) (string, error) {
-	ref := strings.TrimSpace(req.BaseRef)
+func (r *Resolver) pinCommit(ctx context.Context, repo forge.RepoRef, scope forge.CredentialScope, baseRef string) (string, error) {
+	ref := strings.TrimSpace(baseRef)
 	if isCommitSHA(ref) {
 		return strings.ToLower(ref), nil
 	}
 	if r.Commits == nil {
 		return "", fmt.Errorf("%w: base ref %q is not a commit SHA and no commit resolver is configured", ErrUnpinnedBaseRef, ref)
 	}
-	sha, found, err := r.Commits.GetBranchSHA(ctx, req.Scope, req.Repo, ref)
+	sha, found, err := r.Commits.GetBranchSHA(ctx, scope, repo, ref)
 	if err != nil {
 		return "", fmt.Errorf("resolve base ref %q to a commit: %w", ref, err)
 	}

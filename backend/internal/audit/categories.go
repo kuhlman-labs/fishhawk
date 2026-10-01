@@ -113,7 +113,10 @@ import "sort"
 // and document_truncated (written IN ADDITION when the document exceeded the
 // effective cap, naming the cap and the dropped-byte count). Both are written
 // per prompt SERVE, so a retry or re-dispatch attributes again — the guarantee
-// is that every injection is attributed.
+// is that every injection is attributed. E55.7 / #3746 added the third,
+// document_injection_degraded: written per served prompt that WITHHELD
+// run-admission declarations because the run recorded no admission commit,
+// naming the reason, the paths and the declaration sites.
 // E54.3 / #2235 added grooming_report_recorded, written once per ingested
 // grooming_report artifact on POST /v0/runs/{run_id}/plan (the plan-stage
 // discriminator's second additive sibling) carrying the artifact's content hash
@@ -318,6 +321,7 @@ var KnownCategories = map[string]struct{}{
 	"digest_marked_read":                      {},
 	"dispatch_reaper_failed":                  {},
 	"document_injected":                       {},
+	"document_injection_degraded":             {}, // E55.7 / #3746: run-admission declarations withheld from a served prompt (repodoc.RecordWithheld)
 	"document_truncated":                      {},
 	"dispatch_watchdog_elapsed":               {},
 	"escalation_fired":                        {},
