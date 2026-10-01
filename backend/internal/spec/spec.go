@@ -598,12 +598,15 @@ type AgentReviewer struct {
 	Provider string `json:"provider" yaml:"provider"`
 	Model    string `json:"model,omitempty" yaml:"model,omitempty"`
 	// ReasoningEffort is the optional per-reviewer reasoning-effort override
-	// (#1493). It is CODEX-ONLY: one rung of the per-reviewer ladder
-	// (deployment default FISHHAWKD_CODEX_REASONING_EFFORT < this value).
-	// Empty falls back to the deployment default. The anthropic and claudecode
-	// adapters take no reasoning-effort parameter and ignore it. The schema
-	// enum (low|medium|high|xhigh|max) is the sole guard before the value
-	// reaches the codex CLI as -c model_reasoning_effort=<effort>.
+	// (#1493). For codex it is one rung of the per-reviewer ladder
+	// (deployment default FISHHAWKD_CODEX_REASONING_EFFORT < this value);
+	// empty falls back to the deployment default, and the resolved value
+	// reaches the codex CLI as -c model_reasoning_effort=<effort>. For
+	// claudecode (#3896) this value alone is passed as --effort <effort> (no
+	// env fall-through; empty = no --effort). The anthropic (API) adapter
+	// takes no reasoning-effort parameter and ignores it. The schema enum
+	// (low|medium|high|xhigh|max) is the sole guard before the value
+	// reaches either CLI.
 	ReasoningEffort string `json:"reasoning_effort,omitempty" yaml:"reasoning_effort,omitempty"`
 	// AgentVersion is the optional per-reviewer agent-version compatibility
 	// RANGE (E32.13 / #1743): a semver comparator range (e.g. ">=0.30
@@ -797,11 +800,21 @@ type Executor struct {
 	// human executor, so this field MUST stay in lockstep with the schema's
 	// executor agent-branch agent_version property. Validated syntactically
 	// by ValidAgentVersionRange in the semantic layer.
-	AgentVersion   string        `json:"agent_version,omitempty" yaml:"agent_version,omitempty"`
-	Human          bool          `json:"human,omitempty" yaml:"human,omitempty"`
-	Timeout        Duration      `json:"timeout,omitempty" yaml:"timeout,omitempty"`
-	Verify         *VerifyConfig `json:"verify,omitempty" yaml:"verify,omitempty"`
-	AgentSelfRetry bool          `json:"agent_self_retry,omitempty" yaml:"agent_self_retry,omitempty"`
+	AgentVersion string `json:"agent_version,omitempty" yaml:"agent_version,omitempty"`
+	// ReasoningEffort is the optional per-stage reasoning-effort pin
+	// (E28.5 / #3896): one of low|medium|high|xhigh|max, passed to the
+	// coding agent verbatim (claude-code `--effort <e>`, codex
+	// `-c model_reasoning_effort=<e>`). Empty/absent = today's spawn,
+	// byte-identical. The value set is enforced by the schema enum, and
+	// the field is declared in the agent branch of the executor oneOf only
+	// (unevaluatedProperties rejects it on a human/delegate executor), so
+	// this field MUST stay in lockstep with the schema's executor
+	// agent-branch reasoning_effort property.
+	ReasoningEffort string        `json:"reasoning_effort,omitempty" yaml:"reasoning_effort,omitempty"`
+	Human           bool          `json:"human,omitempty" yaml:"human,omitempty"`
+	Timeout         Duration      `json:"timeout,omitempty" yaml:"timeout,omitempty"`
+	Verify          *VerifyConfig `json:"verify,omitempty" yaml:"verify,omitempty"`
+	AgentSelfRetry  bool          `json:"agent_self_retry,omitempty" yaml:"agent_self_retry,omitempty"`
 	// Delegate is the v1 delegating-executor declaration for a deploy
 	// stage (ADR-038 / #925). Nil on non-deploy stages. Names the
 	// external pipeline a deploy stage delegates to — Fishhawk holds no

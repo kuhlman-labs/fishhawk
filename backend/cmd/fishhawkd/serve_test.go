@@ -466,6 +466,54 @@ func TestPlanReviewerSet_CodexReasoningEffort(t *testing.T) {
 	})
 }
 
+// TestPlanReviewerSet_ClaudeCodeReasoningEffort pins the claudecode reviewer
+// effort routing (E28.5 / #3896): For("claudecode", m, e) constructs a reviewer
+// carrying the spec effort verbatim, and an absent spec effort carries EMPTY
+// even when the codex deployment default (FISHHAWKD_CODEX_REASONING_EFFORT) is
+// set — that default is codex-scoped and must not fall through to claude.
+// Default() (the bare count form) carries empty too.
+func TestPlanReviewerSet_ClaudeCodeReasoningEffort(t *testing.T) {
+	newSet := func() *planReviewerSet {
+		return &planReviewerSet{opts: planReviewerOptions{
+			enableLocalClaudeReviewer: true,
+			localClaudeModel:          "claude-sonnet-4-6",
+			codexEffort:               "low",
+		}, lookPath: resolvingLookPath}
+	}
+	effortOf := func(t *testing.T, rv server.PlanReviewer) string {
+		t.Helper()
+		cc, ok := rv.(*claudecode.Reviewer)
+		if !ok {
+			t.Fatalf("reviewer = %T, want *claudecode.Reviewer", rv)
+		}
+		return cc.ReasoningEffort()
+	}
+
+	t.Run("spec effort reaches the reviewer verbatim", func(t *testing.T) {
+		rv, err := newSet().For("claudecode", "claude-sonnet-4-6", "xhigh")
+		if err != nil {
+			t.Fatalf("For(claudecode): %v", err)
+		}
+		if got := effortOf(t, rv); got != "xhigh" {
+			t.Errorf("claudecode reviewer effort = %q, want xhigh (spec value)", got)
+		}
+	})
+	t.Run("absent spec effort does not fall through to the codex env default", func(t *testing.T) {
+		rv, err := newSet().For("claudecode", "claude-sonnet-4-6")
+		if err != nil {
+			t.Fatalf("For(claudecode): %v", err)
+		}
+		if got := effortOf(t, rv); got != "" {
+			t.Errorf("claudecode reviewer effort = %q, want empty (codexEffort=low must stay codex-scoped)", got)
+		}
+	})
+	t.Run("Default carries no effort", func(t *testing.T) {
+		if got := effortOf(t, newSet().Default()); got != "" {
+			t.Errorf("Default() claudecode reviewer effort = %q, want empty", got)
+		}
+	})
+}
+
 // TestResolveMaxParallelChildren covers the FISHHAWKD_MAX_PARALLEL_CHILDREN
 // resolution branches: the default applies when unset, the env value wins
 // over the default, an explicit env 0 is honored as the unlimited semantic

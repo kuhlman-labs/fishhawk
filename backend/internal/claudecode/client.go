@@ -7,7 +7,7 @@
 // inherits via os.Environ().
 //
 // The adapter shells out to `claude --print --output-format json --model
-// <model> -p <prompt>` and decodes the single JSON envelope the CLI emits.
+// <model> [--effort <effort>] -p <prompt>` and decodes the single JSON envelope the CLI emits.
 // cmd.Output() captures the whole response in one buffer, sidestepping the
 // StdoutPipe read race the streaming adapter must handle.
 //
@@ -82,6 +82,13 @@ type Config struct {
 	// CLI's JSON envelope does not reliably echo the model, and a
 	// deterministic model string keeps the server's self-review guard honest.
 	Model string
+	// ReasoningEffort is the optional reviewer reasoning-effort pin
+	// (reviewers.agents[].reasoning_effort, E28.5 / #3896), passed verbatim
+	// as `claude --effort <effort>`. Empty omits the flag entirely so the
+	// spawn is byte-identical to the pre-#3896 argv (the CLI's own default).
+	// There is no deployment-default rung: FISHHAWKD_CODEX_REASONING_EFFORT
+	// is codex-scoped and never reaches this adapter.
+	ReasoningEffort string
 	// MaxTokens caps the response length. Reserved for parity with the SDK
 	// adapter; the `claude` CLI has no stable per-call max-tokens flag, so it
 	// is currently advisory only.
@@ -161,6 +168,14 @@ type cliUsage struct {
 	OutputTokens             int `json:"output_tokens"`
 	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
 	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+}
+
+// ReasoningEffort reports the effort pin the Reviewer's client was constructed
+// with (empty = no `--effort` on the spawn). It lets the deployment wiring's
+// tests observe that a spec reviewers.agents[i].reasoning_effort reached the
+// constructed claudecode reviewer verbatim (#3896) without spawning the CLI.
+func (r *Reviewer) ReasoningEffort() string {
+	return r.client.cfg.ReasoningEffort
 }
 
 // Inference runs `claude --print --output-format json --model <model> -p
@@ -249,6 +264,11 @@ func (c *Client) invokeOnce(ctx context.Context, prompt, treeDir string) (respon
 		"--print",
 		"--output-format", "json",
 		"--model", c.cfg.Model,
+	}
+	// Effort pin (#3896): appended only when declared, so an absent effort
+	// keeps the argv byte-identical to the pre-#3896 spawn.
+	if c.cfg.ReasoningEffort != "" {
+		args = append(args, "--effort", c.cfg.ReasoningEffort)
 	}
 	// Empty-MCP pin, applied in BOTH postures (#2524, refining #2486). --tools
 	// (below) bounds only the BUILT-IN toolset; MCP tools are not built-ins, so

@@ -528,6 +528,7 @@ executor:
   agent: claude-code        # provider id; claude-code (default) or codex
   model: claude-opus-4-8    # optional; per-stage model override
   agent_version: ">=2.1 <2.2" # optional; semver comparator RANGE
+  reasoning_effort: high    # optional; low | medium | high | xhigh | max
   timeout: 20m              # optional; per-stage wall-clock cap
   agent_self_retry: false   # optional; default false (ADR-023)
   verify:                   # optional; in-band test gate
@@ -541,6 +542,7 @@ executor:
 - **`timeout`** — a Go duration string; the highest rung of the [stage-timeout precedence](#policymax_stage_runtime).
 - **`agent_self_retry`** — opt-in (default `false`, per ADR-023): the agent may perform one self-initiated retry when it detects a recoverable failure, before the workflow's `on_ci_failure` policy applies.
 - **`agent_version`** — see [Agent version compatibility](#agent-version-compatibility) below.
+- **`reasoning_effort`** — `low | medium | high | xhigh | max`; a per-stage reasoning-effort pin (E28.5 / #3896) for any agent stage (plan, implement including fix-up passes, acceptance). Today it has a single rung — this spec value; there is no deployment default and no gate override. The backend resolves it for the dispatched stage and returns it on the stage's `/prompt` and `/prompt-render` responses as `reasoning_effort` + `reasoning_effort_source`; for the implement stage it is also stamped on the `model_resolved` audit entry the approval gate already writes (a plan stage's effort is observable on its prompt response only — the gate mints no new plan `model_resolved` entry for it). The runner passes it verbatim: `claude-code` as `--effort <effort>`, `codex` as `-c model_reasoning_effort=<effort>`. Absent = today's spawn, byte-identical (no effort flag; the agent's own default). It is a pass-through: not every model accepts every level, and the agent CLI/API rejects a level its model does not support. A CLI too old to know the flag fails at startup — declare `agent_version` as the loud pre-spawn guard. Inheritable from `defaults.executor` like any other agent-branch key.
 
 ### The `verify` gate
 
@@ -563,7 +565,7 @@ executor:
   human: true
 ```
 
-The stage blocks on a person. The branch declares `human` and nothing else — `unevaluatedProperties: false`, so `model`, `timeout`, `verify`, `agent_self_retry` and `agent_version` are all schema errors here, and a `defaults.executor` fragment of any shape is dropped rather than grafted on (see [the executor branch rule](#the-executor-branch-rule)).
+The stage blocks on a person. The branch declares `human` and nothing else — `unevaluatedProperties: false`, so `model`, `timeout`, `verify`, `agent_self_retry`, `agent_version` and `reasoning_effort` are all schema errors here, and a `defaults.executor` fragment of any shape is dropped rather than grafted on (see [the executor branch rule](#the-executor-branch-rule)).
 
 ### The `delegate` branch
 
@@ -626,7 +628,7 @@ reviewers:
   agents:
     - provider: anthropic         # anthropic | claudecode | codex
       model: claude-opus-4-8      # optional; empty -> the provider's deployment default
-      reasoning_effort: high      # optional; codex-only
+      reasoning_effort: high      # optional; codex and claudecode
       agent_version: ">=0.30 <0.31" # optional; codex-only
       optional: false             # optional; default false
     - provider: codex
@@ -638,7 +640,7 @@ reviewers:
 - **`agents`** — one entry per agent reviewer, minimum one entry when the key is present. The effective agent count is `len(agents)`; there is no bare integer count at major 2.
 - **`provider`** — required per entry, and must be configured in the deployment (`FISHHAWKD_ANTHROPIC_API_KEY` / `FISHHAWKD_ENABLE_LOCAL_CLAUDE_REVIEWER` / `FISHHAWKD_ENABLE_CODEX_REVIEWER`). Those env flags are **capability gates** — "is this provider available here" — not policy switches that override the spec.
 - **`model`** — the reviewer's model; empty means the provider's deployment-configured default. The self-review guard runs per invocation against each reviewer's returned model: if it matches the plan's own generating model the server logs a warning and does not block.
-- **`reasoning_effort`** — `low | medium | high | xhigh | max`, **codex-only** (the anthropic and claudecode adapters take no reasoning-effort parameter and ignore it). Resolved through a two-rung ladder: the deployment default (`FISHHAWKD_CODEX_REASONING_EFFORT`) < this value. A non-empty spec value is passed to the codex adapter as a CLI override; the schema enum is the sole guard before it reaches the CLI.
+- **`reasoning_effort`** — `low | medium | high | xhigh | max`, honoured by the **codex** and **claudecode** adapters; the anthropic (API) adapter takes no reasoning-effort parameter and ignores it. For **codex** it resolves through a two-rung ladder: the deployment default (`FISHHAWKD_CODEX_REASONING_EFFORT`) < this value, and a non-empty result is passed as `-c model_reasoning_effort=<effort>`. For **claudecode** (E28.5 / #3896) this spec value alone is passed as `--effort <effort>` — `FISHHAWKD_CODEX_REASONING_EFFORT` is codex-scoped and never falls through to it, so an absent value spawns with no `--effort`, byte-identical to before. The schema enum is the sole guard before the value reaches either CLI.
 - **`optional`** — the per-reviewer degradation policy when the provider is **unavailable on this deployment**. `false` (default) surfaces the gap loudly (an `ERROR` log naming the env knob plus a capability audit) but does not block; `true` is a quiet advisory skip. Either way the gap is recorded as a `reviewer_capability_unavailable` audit at run-create time and as a capability-framed `*_review_skipped` audit when the loop runs — deliberately distinct from a genuine reviewer error, because the reviewer never ran. A deployment with **no** reviewer backend wired at all is still a hard run-create failure: that is a deployment-wide misconfiguration, and `optional` does not apply to it.
 - **`authority`** — `advisory | gating`; optional. Declares **explicitly** whether this stage's agent reviewers can block, instead of leaving it inferred from the counts. See **[Authority](#authority)** below.
 - **`human`** — how many human approvals the stage's review requires.
@@ -1160,12 +1162,13 @@ test_conventions:
 | Executor branch | `agent: <string>` xor `human: true` xor `delegate: {...}` | mutually exclusive; `delegate` is deploy-only |
 | `executor.model` | non-empty string | agent branch only |
 | `executor.agent_version` | space-separated comparator range | agent branch only; malformed ranges rejected by the validator |
+| `executor.reasoning_effort` | `low` \| `medium` \| `high` \| `xhigh` \| `max` | agent branch only; claude-code `--effort`, codex `-c model_reasoning_effort=` |
 | `executor.agent_self_retry` | `true` \| `false` (default `false`) | agent branch only |
 | `executor.timeout`, `executor.verify.timeout`, `policy.max_stage_runtime`, `budget.max_runtime` | `^([0-9]+(ns\|us\|ms\|s\|m\|h))+$` | one duration grammar throughout v2 |
 | `executor.verify.max_iterations` | integer `>= 0` (default `0`) | `0` = single-shot gate |
 | `executor.delegate.target` | `github_actions` \| `webhook` | `workflow_ref` (+ optional `git_ref`), or `url` (+ optional `secret_env`, `secret_header` \| `secret_field`) |
 | `reviewers.agents[].provider` | `anthropic` \| `claudecode` \| `codex` | must be a configured capability on the deployment |
-| `reviewers.agents[].reasoning_effort` | `low` \| `medium` \| `high` \| `xhigh` \| `max` | codex-only |
+| `reviewers.agents[].reasoning_effort` | `low` \| `medium` \| `high` \| `xhigh` \| `max` | codex (env-default ladder) and claudecode (spec value only); ignored by anthropic |
 | `reviewers.agents[].optional` | `true` \| `false` (default `false`) | per-reviewer degradation policy |
 | `reviewers.human` | integer `>= 0` (default `0`) | absent block → no reviewers configured; `Reviewers` nil; agent count `0`; resolves `gateless` (no `{human: 1}` default) |
 | `reviewers.review_timeout` | duration string | this stage's review-budget floor |
