@@ -1690,6 +1690,32 @@ components:
             distinguishable. Surfaced so an operator can see which fact
             decided a charter refusal.
           example: true
+        document_base_commit:
+          type: string
+          pattern: '^[0-9a-f]{40}$'
+          description: |
+            The run-admission document base commit (E55.7 / #3746),
+            read-only: the lowercase 40-hex commit recorded once at run
+            admission that this run's run-admission repository-document
+            declarations are resolved at. It is the repository's
+            default-branch head at creation, pinned to a commit through the
+            document-injection seam. Every root mint seam stamps it — `POST
+            /v0/runs`, the campaign item-run start, and the GitHub / GitLab
+            webhook dispatchers — and a child run (CI retry, operator
+            recovery, decomposition) inherits its parent's value verbatim,
+            so retries and fix-ups read the same commit, never a newer head
+            and never the run's own branch.
+
+            OMITTED when no commit was recorded: a row minted before the
+            column existed, a deployment with no document seam, or a capture
+            that degraded (forge unreachable, no attributable credential,
+            the bounded capture deadline). Capture never fails run creation.
+            For such a run, run-admission declarations are WITHHELD at
+            prompt serve with a named `run_base_commit_unrecorded`
+            degradation rather than read at a mutable ref. A pure row
+            projection, so it appears on both `GET /v0/runs/{run_id}` and
+            the list endpoint.
+          example: abcdef0123456789abcdef0123456789abcdef01
         concerns:
           $ref: '#/components/schemas/RunConcerns'
           description: |

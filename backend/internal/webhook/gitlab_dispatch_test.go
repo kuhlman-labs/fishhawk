@@ -759,6 +759,59 @@ func TestGitLabDispatch_PersistsGroomingDetermination(t *testing.T) {
 	}
 }
 
+// TestGitLabDispatch_StampsDocumentBaseCommit is the GitLab twin of
+// TestDispatcher_StampsDocumentBaseCommit (E55.7 / #3746, approval condition
+// 4): the root mint seam in handleGitLabCreateRun stamps EXACTLY the hook's
+// value onto the STORED run row, and a nil hook (or a hook degraded to nil)
+// leaves it NULL while the run is still minted.
+//
+// COUNTERFACTUAL: delete the `DocumentBaseCommit: documentBaseCommit` field in
+// gitlab_dispatch.go's CreateRun call and the value cell goes RED (stored nil).
+func TestGitLabDispatch_StampsDocumentBaseCommit(t *testing.T) {
+	head := dbcHookHead
+	cases := []struct {
+		name string
+		hook func(context.Context, string) *string
+		want *string
+	}{
+		{name: "hook value stamped", hook: func(context.Context, string) *string { return &head }, want: &head},
+		{name: "no hook wired", hook: nil, want: nil},
+		{name: "hook degraded to nil", hook: func(context.Context, string) *string { return nil }, want: nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d, _, _, runs, _ := newGitLabDispatcher(t, validSpec)
+			var repos []string
+			if tc.hook != nil {
+				inner := tc.hook
+				d.DocumentBaseCommit = func(ctx context.Context, repo string) *string {
+					repos = append(repos, repo)
+					return inner(ctx, repo)
+				}
+			}
+			ev := gitlabIssueTriggerEvent()
+			if err := d.Handle(context.Background(), ev); err != nil {
+				t.Fatalf("Handle: %v", err)
+			}
+			if len(runs.created) != 1 {
+				t.Fatalf("runs.created = %d, want 1 — the capture must never refuse the run", len(runs.created))
+			}
+			got := runs.created[0].DocumentBaseCommit
+			switch {
+			case tc.want == nil && got != nil:
+				t.Errorf("stored document_base_commit = %q, want nil", *got)
+			case tc.want != nil && got == nil:
+				t.Fatalf("stored document_base_commit = nil, want %q — the GitLab root mint must stamp the hook's value", *tc.want)
+			case tc.want != nil && *got != *tc.want:
+				t.Errorf("stored document_base_commit = %q, want %q", *got, *tc.want)
+			}
+			if tc.hook != nil && (len(repos) != 1 || repos[0] != ev.Repo) {
+				t.Errorf("hook called for repos %v, want exactly [%q]", repos, ev.Repo)
+			}
+		})
+	}
+}
+
 // TestHandle_GitLabTrigger_CapturesCIRequirementSnapshot is the done-means
 // anchor for the GitLab RequiredChecksSnapshot capture (E45.55 / #3490). The
 // context and source strings are config-shaped values the ci_green readers
