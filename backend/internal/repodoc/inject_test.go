@@ -329,12 +329,20 @@ func TestWithheldNotice_NamesReasonPathsAndSites(t *testing.T) {
 	}
 	for _, want := range []string{
 		"run_base_commit_unrecorded",
-		"WITHHELD", "not absent", "mutable ref",
+		"WITHHELD", "declared for this repository", "none of them was fetched or read", "mutable ref",
 		"- " + declaredPath + " (declared at " + declSite + ")",
 		"- docs/second.md (declared at second site)",
 	} {
 		if !strings.Contains(n.Body, want) {
 			t.Errorf("notice body missing %q:\n%s", want, n.Body)
+		}
+	}
+	// The server never fetched a withheld document, so the notice must not
+	// claim anything about its content or existence (#2797, carried from
+	// #3746): "not absent" and "not empty" were both unknowable claims.
+	for _, banned := range []string{"not absent", "not empty"} {
+		if strings.Contains(n.Body, banned) {
+			t.Errorf("notice body claims %q about a document the server never read:\n%s", banned, n.Body)
 		}
 	}
 	// The notice names no resolved revision, so it can never satisfy a

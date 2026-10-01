@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/google/uuid"
+
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/repodoc"
@@ -21,12 +23,14 @@ import (
 // (previewInjectedDocuments) cannot diverge on rendered bytes or on any refusal
 // (E54.12 / #2804).
 //
-// INERT BY DEFAULT. Config.DocumentDeclarations and Config.DocumentResolver are
-// both nil in production today — no consumer declares a document yet (E55's
-// review_conventions[] and #2234's charter.path are the two that will) — so
-// this returns (nil, nil) and every served prompt is byte-identical to the
-// pre-#2242 render. The seam exists so both consumers attach at ONE point
-// rather than each growing its own resolution path.
+// INERT WITHOUT A DECLARATION SEAM. With Config.DocumentDeclarations nil this
+// returns (nil, nil) and every prompt is byte-identical to the pre-#2242
+// render; that nil check is the SOLE inert signal, shared by the prompt
+// endpoints and the in-process review build sites
+// (resolveReviewInjectedDocuments, #2797). A configured seam that declares
+// zero documents for a stage is equally byte-identical. The seam exists so
+// every consumer (#2234's charter.path, E55's review_conventions[]) attaches
+// at ONE point rather than each growing its own resolution path.
 //
 // FAILS CLOSED. A declaration that cannot be resolved, or an injection that
 // cannot be attributed, fails the prompt request rather than serving a prompt
@@ -187,12 +191,75 @@ func (s *Server) resolveDeclaredDocuments(ctx context.Context, runRow *run.Run, 
 }
 
 // resolveInjectedDocuments is the SERVED path's wrapper (GET
-// /v0/stages/{id}/prompt): it resolves, ATTRIBUTES and renders. Behaviour is
-// byte-identical to the pre-split single function — this is the only caller
-// that writes document_injected / document_truncated /
+// /v0/stages/{id}/prompt, and the in-process review builds through
+// resolveReviewInjectedDocuments, #2797): it resolves, ATTRIBUTES and renders.
+// Behaviour is byte-identical to the pre-split single function — this is the
+// only wrapper that writes document_injected / document_truncated /
 // document_injection_degraded entries.
 func (s *Server) resolveInjectedDocuments(ctx context.Context, runRow *run.Run, stage *run.Stage) ([]prompt.InjectedDocument, error) {
 	return s.resolveDeclaredDocuments(ctx, runRow, stage, true)
+}
+
+// reviewDocumentInjectionFailedPrefix leads the reason of the
+// plan_review_failed / implement_review_failed audit entry a review build site
+// records when the documents declared for the reviewed stage cannot be resolved
+// or attributed (#2797). It is the operator's one signal that a review produced
+// no verdict because of document injection rather than a reviewer failure.
+const reviewDocumentInjectionFailedPrefix = "document_injection_failed"
+
+// reviewDocumentInjectionFailedReason renders the *_review_failed reason for a
+// review-side document-injection failure. A *repodoc.ResolveError's Error()
+// already names the path and declaration site, so the reason carries them.
+func reviewDocumentInjectionFailedReason(err error) string {
+	return reviewDocumentInjectionFailedPrefix + ": " + err.Error()
+}
+
+// resolveReviewInjectedDocuments is the REVIEW build sites' wrapper (#2797):
+// runPlanReviews (plan_review), runImplementReviewsForTree (implement_review —
+// the trace-time review, the fix-up re-review backstop and the decomposed
+// parent's consolidated review) and runSupplementalReinvokeReview. Those
+// prompts are built in-process and never pass through the signed /prompt
+// endpoint, so without this they carried no declared document at all.
+//
+// A REVIEW PROMPT CARRIES THE DOCUMENTS DECLARED FOR THE STAGE IT REVIEWS. The
+// reviewer is constrained by what constrained the author, so the declaration
+// seam is consulted with the REVIEWED stage (the plan stage for plan_review,
+// the implement stage for implement_review), loaded here by stageID.
+//
+// ONE SEAM, NO SECOND INERT SIGNAL. This wrapper adds no short-circuit of its
+// own: it delegates straight to resolveInjectedDocuments, so
+// Config.DocumentDeclarations == nil (checked inside resolveDeclaredDocuments,
+// BEFORE the nil-resolver refusal) is the SOLE inert signal for both the
+// endpoint and the review paths, and the partial-configuration refusal, the
+// base-source partition and withholding, the resolve-whole-set-before-attribute
+// ordering, RecordWithheld and Attribute all run unchanged. The two paths
+// cannot diverge on what counts as inert. The cost is one reviewed-stage read
+// per review build even when inert.
+//
+// ATTRIBUTION RUNS PER REVIEW BUILD. One document_injected set is written per
+// review round — shared by every reviewer of that round, which all read the
+// same prompt — with stage_id = the reviewed stage.
+//
+// FAILS CLOSED, AND CALLERS MUST HONOUR IT. Every error — a nil run row, a
+// reviewed stage that cannot be loaded, a partial seam configuration, a
+// declaration that cannot be resolved, an audit append that fails — means the
+// declared set could not be resolved or attributed. The caller must then run
+// NO reviewer (a document-less review prompt is exactly the unconstrained
+// verdict injection exists to prevent), record a *_review_failed entry whose
+// reason is reviewDocumentInjectionFailedReason(err), and, under gating
+// authority, fail the stage category-B.
+func (s *Server) resolveReviewInjectedDocuments(ctx context.Context, runRow *run.Run, stageID uuid.UUID) ([]prompt.InjectedDocument, error) {
+	if runRow == nil {
+		return nil, errors.New("reviewed run row is unavailable")
+	}
+	stage, err := s.cfg.RunRepo.GetStage(ctx, stageID)
+	if err != nil {
+		return nil, fmt.Errorf("load reviewed stage %s: %w", stageID, err)
+	}
+	if stage == nil {
+		return nil, fmt.Errorf("load reviewed stage %s: stage not found", stageID)
+	}
+	return s.resolveInjectedDocuments(ctx, runRow, stage)
 }
 
 // previewInjectedDocuments is the PREVIEW path's wrapper (GET

@@ -44,6 +44,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/policy"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/repodoc"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/scopeamendment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
@@ -13971,5 +13972,234 @@ func TestRunSupplementalReinvokeReview_CarriesAndRecordsNoCrewDelivery(t *testin
 	}
 	if got := deliveredEntries(t, f, runRow.ID); len(got) != 0 {
 		t.Errorf("the supplemental re-invoke recorded %d deliveries, want 0", len(got))
+	}
+}
+
+// reviewInjectionDiff is the diff the direct implement-review calls below
+// hand runImplementReviews.
+func reviewInjectionDiff() policy.Diff {
+	return policy.Diff{ChangedFiles: []policy.ChangedFile{{Path: "backend/internal/foo/foo.go", Status: policy.StatusModified}}}
+}
+
+// (P2, #2797) TestShipTrace_ImplementReview_CarriesInjectedDocument drives the
+// REAL implement-review build site end to end — POST /v0/runs/{id}/trace (raw
+// variant) → runImplementReviewsForTree → resolveReviewInjectedDocuments →
+// repodoc resolve against a fake forge → audit → prompt render → the reviewer
+// adapter — and asserts on the prompt the reviewer RECEIVED.
+//
+// Counterfactual: delete `trig.InjectedDocuments = injected` in
+// runImplementReviewsForTree — the reviewer prompt loses injBaseContent and
+// this goes RED.
+func TestShipTrace_ImplementReview_CarriesInjectedDocument(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-sonnet-4-6",
+	}
+	s, sf, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementAdvisoryReviewers)
+	ri := wireReviewInjection(s, seamDecl())
+	priv, _ := sf.issue(t, runRow.ID)
+	bundleBytes := implementBundleWithVerifyTrees(t, [][2]string{{"head-a", "tree-a"}})
+	if w := shipRequest(t, s, runRow.ID, implStage.ID, "raw", priv, bundleBytes, ""); w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+	s.waitBackgroundReviews()
+
+	calls := reviewerCalls(reviewer)
+	if len(calls) != 1 {
+		t.Fatalf("reviewer calls = %d, want 1", len(calls))
+	}
+	assertReviewPromptCarriesInjectedDocument(t, calls[0], prompt.ImplementReviewSplitMarker, "ImplementReviewSplitMarker")
+	assertInjectionAttributedTo(t, au, implStage.ID)
+	assertSeamSawReviewedStage(t, ri.seam, implStage.ID, run.StageTypeImplement)
+	for _, ref := range ri.fetcher.refs {
+		if ref != injPinnedCommit {
+			t.Errorf("fetched at ref %q, want the pinned commit %q", ref, injPinnedCommit)
+		}
+	}
+}
+
+// (P3, #2797) TestRunSupplementalReinvokeReview_CarriesInjectedDocument: the
+// base-rebase supplemental re-invoke builds its own implement_review prompt,
+// so it resolves and attributes the implement stage's documents itself.
+//
+// Counterfactual: delete `trig.InjectedDocuments = injected` at the
+// supplemental site — the reviewer prompt loses injBaseContent and this goes
+// RED.
+func TestRunSupplementalReinvokeReview_CarriesInjectedDocument(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-sonnet-4-6",
+	}
+	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+	ri := wireReviewInjection(s, seamDecl())
+
+	if s.runSupplementalReinvokeReview(t.Context(), runRow.ID, implStage.ID, "feed00dfeed00dfeed00dfeed00dfeed00dfeed0", supplementalExemptions()) {
+		t.Fatal("approve verdict must not gate")
+	}
+	calls := reviewerCalls(reviewer)
+	if len(calls) != 1 {
+		t.Fatalf("reviewer calls = %d, want 1", len(calls))
+	}
+	if !strings.Contains(calls[0], injBaseContent) || strings.Contains(calls[0], injSoftContent) {
+		t.Errorf("supplemental reviewer prompt does not carry the pinned document (and only it)")
+	}
+	assertInjectionAttributedTo(t, au, implStage.ID)
+	assertSeamSawReviewedStage(t, ri.seam, implStage.ID, run.StageTypeImplement)
+}
+
+// (P4, #2797) TestRunImplementReviews_RunAdmissionNilCommit_CarriesWithheldNotice:
+// a run-admission declaration on a run that recorded no admission commit is
+// WITHHELD on a review prompt exactly as on the stage prompt — the reviewer
+// is told the document exists and was not read, nothing is fetched, and one
+// document_injection_degraded entry (no document_injected) is stamped with
+// the implement stage. The fetcher WOULD serve content if consulted, so a
+// fetch or a missing notice is observable.
+func TestRunImplementReviews_RunAdmissionNilCommit_CarriesWithheldNotice(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-sonnet-4-6",
+	}
+	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+	runRow.DocumentBaseCommit = nil
+	ff, cr := wireAdmissionReviewInjection(s)
+
+	if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, reviewInjectionDiff(), nil, "head-p4", nil) {
+		t.Fatal("approve verdict must not gate")
+	}
+	calls := reviewerCalls(reviewer)
+	if len(calls) != 1 {
+		t.Fatalf("reviewer calls = %d, want 1", len(calls))
+	}
+	if !strings.Contains(calls[0], "### "+repodoc.WithheldNoticeHeading) || !strings.Contains(calls[0], admPath) {
+		t.Errorf("reviewer prompt does not carry the withheld notice naming %s", admPath)
+	}
+	if len(ff.refs) != 0 || len(cr.calls) != 0 {
+		t.Errorf("withheld document was consulted: fetches=%v branch lookups=%v", ff.refs, cr.calls)
+	}
+	degraded := auditFakeEntries(au, "document_injection_degraded")
+	if len(degraded) != 1 || degraded[0].StageID == nil || *degraded[0].StageID != implStage.ID {
+		t.Errorf("document_injection_degraded entries = %+v, want one for the implement stage", degraded)
+	}
+	if n := countAuditCategory(au, "document_injected"); n != 0 {
+		t.Errorf("document_injected entries = %d, want 0", n)
+	}
+}
+
+// (F3, #2797) TestRunImplementReviews_DocumentResolutionFailure_FailsClosed:
+// no reviewer runs on a document-less implement_review prompt under either
+// authority. Gating returns true (the caller fails the stage category-B);
+// advisory returns false (the human gate stays authoritative with the failed
+// review visible).
+//
+// Counterfactuals: (a) ignore the error in runImplementReviewsForTree — the
+// reviewer runs and both rows go RED; (b) return false on the error — the
+// gating row goes RED on its return value.
+func TestRunImplementReviews_DocumentResolutionFailure_FailsClosed(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		spec []byte
+		want bool
+	}{
+		{"gating", specImplementGatingReviewers, true},
+		{"advisory", specImplementAdvisoryReviewers, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reviewer := &fakePlanReviewer{
+				verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+				model:   "claude-sonnet-4-6",
+			}
+			s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, tc.spec)
+			wireReviewInjection(s, missingDecl())
+
+			if got := s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, reviewInjectionDiff(), nil, "head-f3", nil); got != tc.want {
+				t.Errorf("runImplementReviews = %v, want %v", got, tc.want)
+			}
+			s.waitBackgroundReviews()
+			assertReviewFailedClosed(t, reviewer, au, implStage.ID, "implement_review_failed", "implement_review_started", reviewMissingPath, injDeclSite)
+		})
+	}
+}
+
+// (F4, #2797) TestRunSupplementalReinvokeReview_DocumentResolutionFailure_FailsClosed
+// is F3 for the supplemental re-invoke site.
+//
+// Counterfactuals: (a) ignore the error at the supplemental site — the
+// reviewer runs and both rows go RED; (b) return false on the error — the
+// gating row goes RED on its return value.
+func TestRunSupplementalReinvokeReview_DocumentResolutionFailure_FailsClosed(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		spec []byte
+		want bool
+	}{
+		{"gating", specImplementGatingReviewers, true},
+		{"advisory", specImplementAdvisoryReviewers, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reviewer := &fakePlanReviewer{
+				verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+				model:   "claude-sonnet-4-6",
+			}
+			s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, tc.spec)
+			wireReviewInjection(s, missingDecl())
+
+			if got := s.runSupplementalReinvokeReview(t.Context(), runRow.ID, implStage.ID, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", supplementalExemptions()); got != tc.want {
+				t.Errorf("runSupplementalReinvokeReview = %v, want %v", got, tc.want)
+			}
+			s.waitBackgroundReviews()
+			assertReviewFailedClosed(t, reviewer, au, implStage.ID, "implement_review_failed", "implement_review_started", reviewMissingPath, injDeclSite)
+		})
+	}
+}
+
+// TestRunImplementReviews_DuplicateDispatch_NoDocumentResolution pins approval
+// condition 1 of #2797: document resolution runs AFTER the #797 idempotency
+// guard, so a duplicate dispatch for an already-reviewed (stage, head_sha) is
+// a silent no-op — no forge read, no document_injected append, and no new
+// failure path even when the declared document has since become unresolvable.
+//
+// Counterfactual: move the resolveReviewInjectedDocuments call (and the
+// prompt build) back above the guard — the duplicate appends a second
+// document_injected entry and this goes RED.
+func TestRunImplementReviews_DuplicateDispatch_NoDocumentResolution(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-sonnet-4-6",
+	}
+	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+	ri := wireReviewInjection(s, seamDecl())
+	const head = "head-dup"
+
+	if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, reviewInjectionDiff(), nil, head, nil) {
+		t.Fatal("approve verdict must not gate")
+	}
+	if n := countAuditCategory(au, "document_injected"); n != 1 {
+		t.Fatalf("first dispatch: document_injected = %d, want 1", n)
+	}
+	fetches, seamCalls := len(ri.fetcher.refs), len(ri.seam.recorded())
+
+	// Duplicate dispatch with the declaration still applied.
+	if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, reviewInjectionDiff(), nil, head, nil) {
+		t.Error("duplicate dispatch returned true")
+	}
+	if n := countAuditCategory(au, "document_injected"); n != 1 {
+		t.Errorf("duplicate dispatch: document_injected = %d, want 1 (no attribution for a skipped dispatch)", n)
+	}
+	if len(ri.fetcher.refs) != fetches || len(ri.seam.recorded()) != seamCalls {
+		t.Errorf("duplicate dispatch consulted the document seam: fetches %d→%d, seam calls %d→%d",
+			fetches, len(ri.fetcher.refs), seamCalls, len(ri.seam.recorded()))
+	}
+
+	// Duplicate dispatch after the declared document became unresolvable:
+	// still a silent no-op, never a new failure on an already-reviewed stage.
+	ri.seam.setDecls(missingDecl())
+	if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, reviewInjectionDiff(), nil, head, nil) {
+		t.Error("duplicate dispatch with an unresolvable document returned true — a new failure path for an already-reviewed stage")
+	}
+	if n := countAuditCategory(au, "implement_review_failed"); n != 0 {
+		t.Errorf("implement_review_failed = %d, want 0", n)
+	}
+	if n := len(reviewerCalls(reviewer)); n != 1 {
+		t.Errorf("reviewer calls = %d, want 1 (only the first dispatch reviews)", n)
 	}
 }

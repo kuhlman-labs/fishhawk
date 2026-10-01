@@ -1421,9 +1421,10 @@ func deref(s *string) string {
 }
 
 // runPlanReviews resolves the plan stage's review config and dispatches
-// the review agents. It does the cheap request-scoped reads (GetRun,
-// resolveStageReviewers, plan.Parse, prompt.Build) on the caller's
-// context, then branches on authority:
+// the review agents. It does the request-scoped reads (GetRun,
+// resolveStageReviewers, plan.Parse, the declared-document resolution of
+// resolveReviewInjectedDocuments, prompt.Build) on the caller's context, then
+// branches on authority:
 //
 //   - gating (reviewers.agent>0 && human==0): runs the review loop
 //     SYNCHRONOUSLY. When any verdict is reject it transitions the stage
@@ -1439,6 +1440,12 @@ func deref(s *string) string {
 //     The detachment is the #584 fix: the review runs to its own
 //     FISHHAWKD_PLAN_REVIEW_TIMEOUT budget instead of dying when the
 //     runner's upload client disconnects and cancels r.Context().
+//
+// Returns true WITHOUT running a reviewer when the documents declared for the
+// plan stage cannot be resolved or attributed under gating authority (#2797):
+// the stage is failed category-B with a plan_review_document_injection_failed
+// reason and a plan_review_failed entry names the cause. Under advisory
+// authority the same failure records plan_review_failed and returns false.
 //
 // Returns false (no gating rejection) when:
 //   - no reviewer backend is configured (nil ReviewerSet or Default() nil)
@@ -1627,6 +1634,45 @@ func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, p
 	// does not. Recorded only after the build succeeds.
 	crewDeliveries := s.resolveDeliverableCrewMessages(ctx, runID, stageID, run.StageTypeReview)
 	trig.CrewMessages = crewDeliveries.Messages
+
+	// Repository documents declared for the PLAN stage under review (#2797):
+	// resolved, attributed and rendered through the same seam the /prompt
+	// endpoint uses. FAILS CLOSED — when the declared set cannot be resolved or
+	// attributed no reviewer runs on a document-less prompt: the failure is
+	// recorded as plan_review_failed (reason document_injection_failed: …) and,
+	// under gating authority, the stage fails category-B because no human gate
+	// stands behind the agent verdict. No plan_review_started is emitted.
+	injected, err := s.resolveReviewInjectedDocuments(ctx, runRow, stageID)
+	if err != nil {
+		treeCleanup()
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "plan review: document injection failed — no reviewer dispatched",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()),
+		)
+		s.emitReviewFailed(ctx, runID, stageID, "plan_review_failed", authority, "", reviewDocumentInjectionFailedReason(err), false)
+		if authority != planreview.AuthorityGating {
+			return false
+		}
+		cat := run.FailureB
+		reason := "plan_review_document_injection_failed: the declared repository documents could not be resolved or attributed for the gating plan review (see the plan_review_failed audit entry)"
+		// Detached like the gating-reject transition below: the failed-B edge
+		// must land even if the upload client has gone away.
+		if _, terr := s.cfg.RunRepo.TransitionStage(context.WithoutCancel(ctx), stageID,
+			run.StageStateFailed, &run.StageCompletion{
+				FailureCategory: &cat,
+				FailureReason:   &reason,
+			}); terr != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+				"plan review: transition to failed-B after document injection failure failed",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+				slog.String("error", terr.Error()),
+			)
+		}
+		return true
+	}
+	trig.InjectedDocuments = injected
 
 	promptText, err := prompt.Build("plan_review", trig)
 	if err != nil {

@@ -5498,3 +5498,171 @@ func TestRunPlanReviews_DeliversCrewFindingOncePerRound(t *testing.T) {
 		t.Errorf("delivery = %+v, want [%d] plan_review/review/reviewer", got[0], seq)
 	}
 }
+
+// (P1, #2797) TestShipPlan_PlanReview_CarriesInjectedDocument drives the REAL
+// plan-review build site end to end — POST /v0/runs/{id}/plan →
+// runPlanReviews → resolveReviewInjectedDocuments → repodoc resolve against a
+// fake forge → audit persistence → prompt render → the reviewer adapter — and
+// asserts on the prompt the reviewer actually RECEIVED. The fetcher serves the
+// pinned commit's sentinel and a different sentinel at every mutable ref, so
+// the only way injBaseContent reaches the reviewer is the injection path.
+//
+// Counterfactual: delete `trig.InjectedDocuments = injected` at the plan.go
+// site — the reviewer prompt loses injBaseContent and this goes RED.
+func TestShipPlan_PlanReview_CarriesInjectedDocument(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-sonnet-4-6",
+	}
+	s, sf, _, au, rr := newPlanServerWithReviewer(t, runID, stageID, reviewer, specGatingReviewers)
+	rr.getStages[stageID].Type = run.StageTypePlan
+	ri := wireReviewInjection(s, seamDecl())
+	priv, _ := sf.issue(t, runID)
+
+	if w := shipPlanRequest(t, s, runID, stageID, priv, validPlanBytes(t), ""); w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	calls := reviewerCalls(reviewer)
+	if len(calls) != 1 {
+		t.Fatalf("reviewer calls = %d, want 1", len(calls))
+	}
+	assertReviewPromptCarriesInjectedDocument(t, calls[0], prompt.PlanReviewSplitMarker, "PlanReviewSplitMarker")
+	assertInjectionAttributedTo(t, au, stageID)
+	assertSeamSawReviewedStage(t, ri.seam, stageID, run.StageTypePlan)
+	if len(ri.fetcher.refs) == 0 {
+		t.Fatal("no document was fetched")
+	}
+	for _, ref := range ri.fetcher.refs {
+		if ref != injPinnedCommit {
+			t.Errorf("fetched at ref %q, want the pinned commit %q", ref, injPinnedCommit)
+		}
+	}
+}
+
+// (F1, #2797) TestShipPlan_PlanReview_DocumentResolutionFailure_AdvisorySkipsReviewers:
+// a declared document the forge answers not-found for fails CLOSED on the
+// advisory plan review — the upload still succeeds (201: the plan artifact is
+// stored), but NO reviewer runs on a document-less prompt, no
+// plan_review_started is emitted, and plan_review_failed names the path and
+// the declaration site. Advisory authority leaves the human gate authoritative,
+// so the stage is not failed.
+//
+// Counterfactual: make the plan.go error branch fall through to the build
+// with nil documents — the reviewer is invoked once and this goes RED.
+func TestShipPlan_PlanReview_DocumentResolutionFailure_AdvisorySkipsReviewers(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-sonnet-4-6",
+	}
+	s, sf, _, au, rr := newPlanServerWithReviewer(t, runID, stageID, reviewer, specAdvisoryReviewers)
+	rr.getStages[stageID].Type = run.StageTypePlan
+	wireReviewInjection(s, missingDecl())
+	priv, _ := sf.issue(t, runID)
+
+	if w := shipPlanRequest(t, s, runID, stageID, priv, validPlanBytes(t), ""); w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	s.waitBackgroundReviews()
+	assertReviewFailedClosed(t, reviewer, au, stageID, "plan_review_failed", "plan_review_started", reviewMissingPath, injDeclSite)
+	for _, call := range rr.transitionStageCalls {
+		if call.StageID == stageID && call.To == run.StageStateFailed {
+			t.Errorf("advisory document-injection failure failed the stage — the human gate must stay authoritative")
+		}
+	}
+}
+
+// (F2, #2797) TestRunPlanReviews_DocumentResolutionFailure_GatingFailsStage:
+// under GATING authority no human gate stands behind the agent verdict, so a
+// review that cannot carry its declared document fails the plan stage
+// category-B with the truthful plan_review_document_injection_failed reason.
+// The assertion reads the COMMITTED stage state back from the run repo after
+// the call returns, not the return value alone.
+//
+// Counterfactual: replace the gating branch's transition + `return true` with
+// `return false` — the stage is not failed and this goes RED.
+func TestRunPlanReviews_DocumentResolutionFailure_GatingFailsStage(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-sonnet-4-6",
+	}
+	s, _, _, au, rr := newPlanServerWithReviewer(t, runID, stageID, reviewer, specGatingReviewers)
+	rr.getStages[stageID].Type = run.StageTypePlan
+	rr.getStages[stageID].State = run.StageStateDispatched
+	wireReviewInjection(s, missingDecl())
+
+	if !s.runPlanReviews(t.Context(), runID, stageID, validPlanBytes(t), nil, nil, nil, nil, nil) {
+		t.Error("gating document-injection failure must return true")
+	}
+	if got := rr.getStages[stageID].State; got != run.StageStateFailed {
+		t.Fatalf("plan stage state = %q, want failed", got)
+	}
+	var found bool
+	for _, call := range rr.transitionStageCalls {
+		if call.StageID != stageID || call.To != run.StageStateFailed {
+			continue
+		}
+		found = true
+		if call.Completion == nil || call.Completion.FailureCategory == nil || *call.Completion.FailureCategory != run.FailureB {
+			t.Errorf("failure category = %v, want B", call.Completion)
+		}
+		if call.Completion == nil || call.Completion.FailureReason == nil ||
+			!strings.HasPrefix(*call.Completion.FailureReason, "plan_review_document_injection_failed:") {
+			t.Errorf("failure reason = %v, want the plan_review_document_injection_failed prefix", call.Completion)
+		}
+	}
+	if !found {
+		t.Error("no failed transition recorded for the plan stage")
+	}
+	assertReviewFailedClosed(t, reviewer, au, stageID, "plan_review_failed", "plan_review_started", reviewMissingPath)
+}
+
+// (F2b, #2797) TestRunPlanReviews_DocumentResolutionFailure_GatingTransitionFailureLogged:
+// when the gating fail-closed path's failed-B transition itself errors, the
+// failure is still reported as a gating block (true) and the transition error
+// is WARN-logged naming the run and stage — never swallowed silently — while no
+// reviewer runs and plan_review_failed still records the injection cause.
+//
+// Counterfactual: drop the `terr != nil` WARN — the log line is absent and this
+// goes RED.
+func TestRunPlanReviews_DocumentResolutionFailure_GatingTransitionFailureLogged(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-sonnet-4-6",
+	}
+	s, _, _, au, rr := newPlanServerWithReviewer(t, runID, stageID, reviewer, specGatingReviewers)
+	var logBuf bytes.Buffer
+	s.cfg.Logger = slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	rr.getStages[stageID].Type = run.StageTypePlan
+	rr.getStages[stageID].State = run.StageStateDispatched
+	rr.transitionStageErr = fmt.Errorf("stage store down")
+	wireReviewInjection(s, missingDecl())
+
+	if !s.runPlanReviews(t.Context(), runID, stageID, validPlanBytes(t), nil, nil, nil, nil, nil) {
+		t.Error("gating document-injection failure must return true even when the failed-B transition errors")
+	}
+	var attempted bool
+	for _, call := range rr.transitionStageCalls {
+		if call.StageID == stageID && call.To == run.StageStateFailed {
+			attempted = true
+		}
+	}
+	if !attempted {
+		t.Error("no failed-B transition was attempted for the plan stage")
+	}
+	logs := logBuf.String()
+	for _, want := range []string{
+		"plan review: transition to failed-B after document injection failure failed",
+		"stage store down",
+		runID.String(),
+		stageID.String(),
+	} {
+		if !strings.Contains(logs, want) {
+			t.Errorf("WARN log missing %q:\n%s", want, logs)
+		}
+	}
+	assertReviewFailedClosed(t, reviewer, au, stageID, "plan_review_failed", "plan_review_started", reviewMissingPath)
+}

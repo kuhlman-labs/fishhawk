@@ -3883,8 +3883,13 @@ func (s *Server) emitConsolidatedReviewTruncated(ctx context.Context, runID, sta
 //
 // Process-global: one backend serves both the trace upload and the pull-request
 // report for a run, so a single mutex closes the race for every (stage, head).
-// The critical section is one list + one append, so the coarse scope does not
-// harm throughput at v0 review volumes (mirrors the p95CacheMu rationale). A
+// The critical section is one list + one append, plus — since #2797 — the
+// declared-document resolution and the prompt build, which sit between the
+// guard and the emit so a duplicate dispatch can never resolve, attribute or
+// fail on documents. When no document is declared that adds one stage read and
+// one seam call; a declared document adds its forge reads, the same cost the
+// /prompt endpoint pays. The coarse scope does not harm throughput at v0 review
+// volumes (mirrors the p95CacheMu rationale). A
 // multi-replica deployment where the two reports land on different replicas
 // would need a DB-level uniqueness guard for the durable dedup; the in-process
 // lock is the proportionate v0 fix and does not regress that future work.
@@ -3914,6 +3919,12 @@ var reviewDispatchMu sync.Mutex
 //     decoupled from the runner's upload client timeout — the human gate
 //     stays authoritative, so the advisory verdict landing after
 //     advancement is fine.
+//
+// Also returns true WITHOUT running a reviewer when, under gating authority,
+// the documents declared for the implement stage cannot be resolved or
+// attributed (#2797); an implement_review_failed entry (reason
+// document_injection_failed: …) names the cause. Under advisory authority the
+// same failure records that entry and returns false.
 //
 // Returns false (no gating block) when:
 //   - RunRepo is nil
@@ -4637,17 +4648,6 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 	crewDeliveries := s.resolveDeliverableCrewMessages(ctx, runID, stageID, run.StageTypeReview)
 	trig.CrewMessages = crewDeliveries.Messages
 
-	promptText, err := prompt.Build("implement_review", trig)
-	if err != nil {
-		treeCleanup()
-		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "implement review: build prompt failed",
-			slog.String("run_id", runID.String()),
-			slog.String("error", err.Error()),
-		)
-		return false
-	}
-	s.recordCrewMessagesDelivered(ctx, runID, stageID, run.StageTypeReview, "implement_review", crewDeliveries.Sequences)
-
 	// Idempotency guard (#797): the outer raw-variant gate (#793) already
 	// dedups the raw+redacted pair of one pack, but a retried raw upload (a
 	// transient 5xx after the review already dispatched → runner re-POSTs
@@ -4666,6 +4666,11 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 	// observe the started entry absent and double-dispatch. See reviewDispatchMu.
 	// Unlocked on every exit from the section (early-return AND after the emit),
 	// never held across the reviewer dispatch below.
+	//
+	// The guard runs BEFORE the declared-document resolution and the prompt
+	// build (#2797): a duplicate dispatch is a silent no-op — no forge read, no
+	// document_injected append, no crew-delivery record and no new failure path
+	// for an already-reviewed stage.
 	reviewDispatchMu.Lock()
 	if headSHA != "" && s.cfg.AuditRepo != nil {
 		started, lerr := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, "implement_review_started")
@@ -4683,6 +4688,44 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 			return false
 		}
 	}
+
+	// Repository documents declared for the IMPLEMENT stage under review
+	// (#2797): resolved, attributed and rendered through the same seam the
+	// /prompt endpoint uses. This one site covers the trace-time review, the
+	// fix-up re-review backstop and the decomposed parent's consolidated
+	// review. FAILS CLOSED — when the declared set cannot be resolved or
+	// attributed no reviewer runs on a document-less prompt and no
+	// implement_review_started is emitted: implement_review_failed (reason
+	// document_injection_failed: …) records the cause, and under gating
+	// authority this returns true so the caller fails the stage category-B
+	// through its existing reject branch (its failure_reason then reads
+	// implement_review_rejected although no reviewer ran — the audit entry is
+	// the discriminator, backend/internal/server/README.md).
+	injected, err := s.resolveReviewInjectedDocuments(ctx, runRow, stageID)
+	if err != nil {
+		reviewDispatchMu.Unlock()
+		treeCleanup()
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "implement review: document injection failed — no reviewer dispatched",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()),
+		)
+		s.emitReviewFailed(ctx, runID, stageID, "implement_review_failed", authority, "", reviewDocumentInjectionFailedReason(err), false)
+		return authority == planreview.AuthorityGating
+	}
+	trig.InjectedDocuments = injected
+
+	promptText, err := prompt.Build("implement_review", trig)
+	if err != nil {
+		reviewDispatchMu.Unlock()
+		treeCleanup()
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "implement review: build prompt failed",
+			slog.String("run_id", runID.String()),
+			slog.String("error", err.Error()),
+		)
+		return false
+	}
+	s.recordCrewMessagesDelivered(ctx, runID, stageID, run.StageTypeReview, "implement_review", crewDeliveries.Sequences)
 
 	// Pending-signal (#600): emit an implement_review_started audit entry
 	// now that a reviewer will actually run. Emitted synchronously before
@@ -5520,7 +5563,9 @@ func (s *Server) supersedeOpenImplementConcerns(ctx context.Context, runID, stag
 // it.
 //
 // Returns true ONLY on a gating-authority reject (the caller fails the stage
-// category-B). Advisory dispatch is detached and returns false. A skipped
+// category-B), or — with no reviewer run — on a gating-authority failure to
+// resolve or attribute the implement stage's declared documents (#2797).
+// Advisory dispatch is detached and returns false. A skipped
 // dispatch (no reviewers, no backend, no plan, or an idempotent duplicate)
 // returns false.
 func (s *Server) runSupplementalReinvokeReview(ctx context.Context, runID, stageID uuid.UUID, headSHA string, exemptions []prompt.GateScopeExemption) bool {
@@ -5616,6 +5661,23 @@ func (s *Server) runSupplementalReinvokeReview(ctx context.Context, runID, stage
 			trig.IssueNumber = n
 		}
 	}
+	// Repository documents declared for the implement stage under review
+	// (#2797), through the same seam and with the same fail-closed contract as
+	// runImplementReviewsForTree: no reviewer runs on a document-less prompt,
+	// implement_review_failed (reason document_injection_failed: …) records the
+	// cause, and under gating authority this returns true so the caller fails
+	// the stage category-B and closes the PR.
+	injected, err := s.resolveReviewInjectedDocuments(ctx, runRow, stageID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "supplemental reinvoke review: document injection failed — no reviewer dispatched",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()),
+		)
+		s.emitReviewFailed(ctx, runID, stageID, "implement_review_failed", authority, "", reviewDocumentInjectionFailedReason(err), false)
+		return authority == planreview.AuthorityGating
+	}
+	trig.InjectedDocuments = injected
 	promptText, err := prompt.Build("implement_review", trig)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "supplemental reinvoke review: build prompt failed",
