@@ -650,6 +650,39 @@ type GateView struct {
 	// MUST byte-match the backend's gateViewResponse or the block silently
 	// decodes to nil.
 	Precedent *gatePrecedent `json:"precedent,omitempty"`
+	// Consults mirrors the backend's gate-view consults block (E77.8 / #3742,
+	// ADR-081 #3727): what this run's plan or review stages ASKED another crew
+	// role and what came back, including the historian's cited chain entry
+	// ids. Always present on a current backend (an empty array when the run
+	// sent none); nil against an older backend. The json tag MUST byte-match
+	// the backend's gateViewResponse or the block silently decodes to nil (the
+	// #371-class hand-maintained-wire-mirror trap).
+	Consults []gateViewConsult `json:"consults"`
+}
+
+// gateViewConsult mirrors the backend's gateViewConsult (E77.8 / #3742): one
+// crew consult joined to its answer. Question and AnswerSummary are EXCERPTS
+// of agent-authored prose — the full text stays on the chain. The json tags
+// MUST byte-match the backend or each field silently decodes to its zero
+// value; TestGateViewConsults_WireShape pins them against a backend-shaped
+// body.
+//
+// Deliberately UNEXPORTED — same rationale as gateViewCaptain: the MCP
+// jsonschema reflection walks it through the exported Consults field either
+// way, and this package's exported surface (exportBaseline,
+// export_surface_test.go) is not widened for a nested payload shape.
+type gateViewConsult struct {
+	SentSequence   int64    `json:"sent_sequence" jsonschema:"audit sequence of the crew_message_sent entry that asked"`
+	StageID        string   `json:"stage_id,omitempty" jsonschema:"the stage that sent the consult"`
+	StageKind      string   `json:"stage_kind,omitempty" jsonschema:"that stage's kind (plan | plan_review | implement_review)"`
+	SenderRole     string   `json:"sender_role" jsonschema:"the crew role that asked"`
+	RecipientRole  string   `json:"recipient_role" jsonschema:"the crew role consulted (today: historian)"`
+	State          string   `json:"state" jsonschema:"the consult's derived state: open | accepted | rejected | expired"`
+	Answered       bool     `json:"answered" jsonschema:"true when a threaded answer exists; an expiry is no answer, never a refusal"`
+	Question       string   `json:"question,omitempty" jsonschema:"excerpt of the consult's question prose"`
+	AnswerSummary  string   `json:"answer_summary,omitempty" jsonschema:"excerpt of the answer's summary"`
+	CitedEntryRefs []string `json:"cited_entry_refs,omitempty" jsonschema:"the answer's evidence references, '<kind>:<ref>' — for the historian, the audit sequences of the prior decisions cited"`
+	AskedAt        string   `json:"asked_at,omitempty" jsonschema:"RFC 3339 timestamp of the send"`
 }
 
 // gatePrecedent mirrors the backend's gatePrecedentBlock

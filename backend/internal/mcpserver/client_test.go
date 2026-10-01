@@ -4081,3 +4081,72 @@ func TestGatePrecedentMirror_WireBoundary(t *testing.T) {
 		t.Errorf("gate view and run read disagree: fingerprint %q vs %q", gv.Precedent.Fingerprint, runMirror.Precedent.Fingerprint)
 	}
 }
+
+// TestGateViewConsults_WireShape (E77.8 / #3742) pins the hand-maintained MCP
+// wire mirror for the gate view's consults[] block, driven from RAW
+// backend-shaped bytes rather than the Go struct: a mistyped json tag would
+// otherwise decode to a silently zeroed field (the #371-class trap). Every
+// field is asserted NON-ZERO, so no single tag can rot unnoticed.
+func TestGateViewConsults_WireShape(t *testing.T) {
+	runID := uuid.New()
+	const block = `[{"sent_sequence":4210,"stage_id":"11111111-1111-1111-1111-111111111111",` +
+		`"stage_kind":"plan","sender_role":"planner","recipient_role":"historian",` +
+		`"state":"accepted","answered":true,"question":"has this been decided?",` +
+		`"answer_summary":"Prior decisions in x/y: plan_approval 2",` +
+		`"cited_entry_refs":["audit_entry:101","audit_entry:102"],"asked_at":"2026-09-30T12:00:00Z"}]`
+	serve := func(t *testing.T, body string) *apiClient {
+		t.Helper()
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(body))
+		}))
+		t.Cleanup(ts.Close)
+		return newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})
+	}
+	gvBody := func(extra string) string {
+		return `{"run_id":"` + runID.String() + `","open":[],"settled":[],"suppressed_relitigations":[]` + extra + `}`
+	}
+
+	gv, err := serve(t, gvBody(`,"consults":`+block)).GetGateView(context.Background(), runID, "")
+	if err != nil {
+		t.Fatalf("GetGateView: %v", err)
+	}
+	if len(gv.Consults) != 1 {
+		t.Fatalf("Consults = %+v, want one decoded consult (a `consults` tag typo yields a nil block)", gv.Consults)
+	}
+	c := gv.Consults[0]
+	switch {
+	case c.SentSequence != 4210:
+		t.Errorf("sent_sequence = %d", c.SentSequence)
+	case c.StageID != "11111111-1111-1111-1111-111111111111":
+		t.Errorf("stage_id = %q", c.StageID)
+	case c.StageKind != "plan":
+		t.Errorf("stage_kind = %q", c.StageKind)
+	case c.SenderRole != "planner":
+		t.Errorf("sender_role = %q", c.SenderRole)
+	case c.RecipientRole != "historian":
+		t.Errorf("recipient_role = %q", c.RecipientRole)
+	case c.State != "accepted":
+		t.Errorf("state = %q", c.State)
+	case !c.Answered:
+		t.Error("answered = false")
+	case c.Question == "":
+		t.Error("question is empty")
+	case c.AnswerSummary == "":
+		t.Error("answer_summary is empty")
+	case len(c.CitedEntryRefs) != 2 || c.CitedEntryRefs[0] != "audit_entry:101":
+		t.Errorf("cited_entry_refs = %v", c.CitedEntryRefs)
+	case c.AskedAt != "2026-09-30T12:00:00Z":
+		t.Errorf("asked_at = %q", c.AskedAt)
+	}
+
+	// An older backend omits the key entirely: the block decodes nil, never an
+	// error (the mixed-version degrade).
+	old, err := serve(t, gvBody("")).GetGateView(context.Background(), runID, "")
+	if err != nil {
+		t.Fatalf("GetGateView (old backend): %v", err)
+	}
+	if old.Consults != nil {
+		t.Errorf("Consults = %+v, want nil against a backend that omits the key", old.Consults)
+	}
+}

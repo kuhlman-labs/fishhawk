@@ -371,3 +371,35 @@ func TestCrewConsult_ExpiryTolerance(t *testing.T) {
 		})
 	}
 }
+
+// --- E77.8 (#3742): the account scope travels ON the request ---------------
+
+// TestCrewConsult_AccountScopeReachesResponder pins that the dispatcher hands
+// the responder the request's OWN account rather than leaving it to reach into
+// ctx values for identity. The explicit field is what makes a responder
+// unit-testable and its read scope auditable, so the plumbing is asserted, not
+// assumed.
+func TestCrewConsult_AccountScopeReachesResponder(t *testing.T) {
+	seen := make(chan CrewConsultRequest, 1)
+	sink := &faultSink{respondReply: &crewmessage.Row{SentSequence: 7}, respondAnswered: &crewmessage.Row{SentSequence: 7}}
+	s, _ := newConsultServer(t, sink)
+	acct := uuid.New()
+	req := consultReq()
+	req.AccountID = &acct
+	s.runCrewConsult(context.Background(), &fakeResponder{
+		answer: CrewConsultAnswer{Summary: "ok"}, seen: seen,
+	}, req)
+	got := <-seen
+	if got.AccountID == nil || *got.AccountID != acct {
+		t.Fatalf("responder saw AccountID = %v, want %v", got.AccountID, acct)
+	}
+	// A nil account (the untenanted posture) travels as nil, never as a zero
+	// UUID — a zero UUID would match no account and silently answer nothing.
+	req.AccountID = nil
+	s.runCrewConsult(context.Background(), &fakeResponder{
+		answer: CrewConsultAnswer{Summary: "ok"}, seen: seen,
+	}, req)
+	if got := <-seen; got.AccountID != nil {
+		t.Fatalf("responder saw AccountID = %v, want nil", got.AccountID)
+	}
+}

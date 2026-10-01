@@ -87,6 +87,15 @@ Response (gate_view):
     agent input — the decision is still yours. What was surfaced is recorded
     once on the chain as precedent_surfaced. Omitted when no human gate is
     open, no precedent is indexed, or the backend's index is unwired.
+  - consults[] — the crew consults this run's plan or review stages SENT
+    (E77.8), each with sent_sequence, stage_id, stage_kind, sender_role,
+    recipient_role, state (open | accepted | rejected | expired), answered, an
+    excerpted question and answer_summary, cited_entry_refs[] (for the
+    historian, the audit sequences of the prior decisions it cited) and
+    asked_at. ALWAYS PRESENT — an empty array when the run asked nothing, so
+    absence is never ambiguous. An EXPIRED consult is "no answer arrived in
+    time", NEVER the role having refused. A historian answer is structured
+    fields only and carries no reason prose from another run.
 `),
 	}, resolver.getGateView)
 }

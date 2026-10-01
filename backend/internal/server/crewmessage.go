@@ -470,6 +470,18 @@ func (s *Server) handleSendCrewMessage(w http.ResponseWriter, r *http.Request) {
 		budgetRemains int
 	)
 	if runBound && msg.Type == crewmessage.TypeConsult && msg.ResponseRequired {
+		// The consult's ACCOUNT SCOPE is part of the request a responder reads
+		// with (CrewConsultRequest.AccountID), resolved FIRST and with the same
+		// fail-closed rule the precedent handler applies: a non-empty account
+		// id that is not a UUID is a corrupted sessions invariant and refuses
+		// the send with 500 rather than handing a responder a nil — i.e.
+		// WIDENING — account. Refused before the budget read, the responder
+		// lookup and the chain append, so nothing is counted and nothing is
+		// recorded.
+		acct, acctOK := s.callerAccountUUID(w, r)
+		if !acctOK {
+			return
+		}
 		used, err := s.crewConsultBudgetUsed(ctx, tokenRunID, execStage.ID)
 		if err != nil {
 			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
@@ -493,7 +505,7 @@ func (s *Server) handleSendCrewMessage(w http.ResponseWriter, r *http.Request) {
 		params.StageID = &stageID
 		budgetRemains = maxCrewConsultsPerStage - used - 1
 		consult = &CrewConsultRequest{
-			RunID: tokenRunID, StageID: stageID,
+			RunID: tokenRunID, StageID: stageID, AccountID: acct,
 			SenderRole: msg.SenderRole, RecipientRole: msg.RecipientRole, Anchor: msg.Anchor,
 			Question: msg.Payload.Question, WhatICanInfer: msg.Payload.WhatICanInfer, Context: msg.Payload.Context,
 			Evidence: msg.Evidence, Deadline: crewConsultDeadline(msg, time.Now().UTC()),
