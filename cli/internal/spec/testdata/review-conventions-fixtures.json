@@ -1,0 +1,226 @@
+{
+  "$comment": "Canonical review_conventions parity corpus (ADR-068 / E55.2 / #2243). The review_conventions grammar is validated by TWO implementations that cannot import each other across the backend/cli module wall: the typed backend layer (backend/internal/spec: ParseBytes -> version-routed schema -> typed decode under DisallowUnknownFields -> v2 reuse resolution -> Validate, rules in review_conventions.go) and the CLI's raw-map port (cli/internal/spec: ValidateBytes -> schema -> reuse -> semantic sweep, rules in review_conventions.go). This file is the shared proof surface: each module runs EVERY row through its REAL parse path and asserts the SAME verdict — TestReviewConventionsCorpus_BackendMatches and TestReviewConventionsCorpus_CLIMatches. Row shape: name; optional note; doc (a complete workflow-v2 YAML document); valid; and, for a rejection, layer (schema | semantic) plus path (a JSON pointer). A semantic row also carries message, the EXACT rejection text: the backend's single ValidationError and the CLI's single ValidationErrorEntry must both equal path + message byte for byte. A schema row asserts only that the rejection lands at or under path (the backend reports one leaf, the CLI every leaf). Every rejection row triggers EXACTLY ONE rule, so the backend's first-error and the CLI's full list are comparable; a multi-error document is outside the parity claim. Mirrored verbatim into both modules' testdata/ by scripts/sync-schemas; CI's schema-sync gate red-lines any divergence between the three copies. Named *-fixtures.json (NOT *.schema.json) so the docs/spec/*.schema.json sync loop never globs it.",
+  "rows": [
+    {
+      "name": "issue-example",
+      "note": "#2243's own proposal made concrete; applies_to is the shared predicate OBJECT, not the issue sketch's bare glob list (see the applies-to-bare-glob-list row)",
+      "doc": "version: \"2\"\nreview_conventions:\n  backend:\n    path: .fishhawk/review/backend.md\n  security:\n    path: .fishhawk/review/security.md\n    applies_to:\n      paths: [\"backend/internal/crypto/**\", \"**/policy/**\"]\n    severity_cap: medium\nworkflows:\n  feature_change:\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n          conventions: [backend]\n      - id: implement\n        type: implement\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: pull_request\n        reviewers:\n          agents:\n            - provider: anthropic\n          conventions: [backend, security]\n",
+      "valid": true
+    },
+    {
+      "name": "applies-to-severity-cap-required-false",
+      "doc": "version: \"2\"\nreview_conventions:\n  crypto:\n    path: docs/conventions/crypto.md\n    applies_to:\n      paths: [\"backend/internal/crypto/**\"]\n      labels: [security]\n      trigger: [diff]\n    severity_cap: low\n    required: false\n  backend:\n    path: docs/conventions/backend.md\nworkflows:\n  feature_change:\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n          conventions: [crypto, backend]\n      - id: implement\n        type: implement\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: pull_request\n        reviewers:\n          agents:\n            - provider: anthropic\n          conventions: [backend]\n",
+      "valid": true
+    },
+    {
+      "name": "defaults-inherited",
+      "note": "a selection inherited from file-level defaults.reviewers counts as a selection on the inheriting plan stage",
+      "doc": "version: \"2\"\ndefaults:\n  reviewers:\n    agents:\n      - provider: anthropic\n    conventions: [backend]\nreview_conventions:\n  backend:\n    path: docs/conventions/backend.md\nworkflows:\n  feature_change:\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n",
+      "valid": true
+    },
+    {
+      "name": "unknown-name",
+      "note": "backend is selected on implement so the unreferenced rule cannot mask the undeclared `security`",
+      "doc": "version: \"2\"\nreview_conventions:\n  backend:\n    path: docs/conventions/backend.md\nworkflows:\n  feature_change:\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n          conventions: [security]\n      - id: implement\n        type: implement\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: pull_request\n        reviewers:\n          agents:\n            - provider: anthropic\n          conventions: [backend]\n",
+      "valid": false,
+      "layer": "semantic",
+      "path": "/workflows/feature_change/stages/0/reviewers/conventions/0",
+      "message": "stage \"plan\": reviewers.conventions names \"security\", which matches no entry in the top-level review_conventions map; declare it there (review_conventions.security: {path: ...}) or remove it from the selection — a convention is declared, never auto-discovered"
+    },
+    {
+      "name": "review-stage",
+      "doc": "version: \"2\"\nreview_conventions:\n  backend:\n    path: docs/conventions/backend.md\nworkflows:\n  feature_change:\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n          conventions: [backend]\n      - id: review\n        type: review\n        executor:\n          human: true\n        reviewers:\n          agents:\n            - provider: anthropic\n          conventions: [backend]\n",
+      "valid": false,
+      "layer": "semantic",
+      "path": "/workflows/feature_change/stages/1/reviewers/conventions",
+      "message": "stage \"review\": reviewers.conventions is valid only on a plan or implement stage, not a \"review\" stage: only those two stages run the agent-review loop a convention is handed to, so this selection would reach no reviewer; move it onto a plan or implement stage (a file-level defaults.reviewers block carrying conventions lands on every stage that inherits it — give this stage its own reviewers block)"
+    },
+    {
+      "name": "acceptance-stage",
+      "doc": "version: \"2\"\nreview_conventions:\n  backend:\n    path: docs/conventions/backend.md\nworkflows:\n  feature_change:\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n          conventions: [backend]\n      - id: accept\n        type: acceptance\n        executor:\n          agent: claude-code\n        reviewers:\n          agents:\n            - provider: anthropic\n          conventions: [backend]\n",
+      "valid": false,
+      "layer": "semantic",
+      "path": "/workflows/feature_change/stages/1/reviewers/conventions",
+      "message": "stage \"accept\": reviewers.conventions is valid only on a plan or implement stage, not a \"acceptance\" stage: only those two stages run the agent-review loop a convention is handed to, so this selection would reach no reviewer; move it onto a plan or implement stage (a file-level defaults.reviewers block carrying conventions lands on every stage that inherits it — give this stage its own reviewers block)"
+    },
+    {
+      "name": "no-agent-reviewers",
+      "doc": "version: \"2\"\nreview_conventions:\n  backend:\n    path: docs/conventions/backend.md\nworkflows:\n  feature_change:\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          human: 1\n          conventions: [backend]\n",
+      "valid": false,
+      "layer": "semantic",
+      "path": "/workflows/feature_change/stages/0/reviewers/conventions",
+      "message": "stage \"plan\": reviewers.conventions selects review conventions but the stage configures no agent reviewers, so no reviewer would be handed them; declare at least one entry under reviewers.agents, or remove reviewers.conventions"
+    },
+    {
+      "name": "path-absolute",
+      "doc": "version: \"2\"\nreview_conventions:\n  backend:\n    path: /docs/conventions/backend.md\nworkflows:\n  feature_change:\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n          conventions: [backend]\n",
+      "valid": false,
+      "layer": "semantic",
+      "path": "/review_conventions/backend/path",
+      "message": "review_conventions.backend: path \"/docs/conventions/backend.md\" is not a canonical repo-relative path: it is absolute; name the document relative to the repository root, slash-separated, with no empty, \".\" or \"..\" segment (e.g. docs/conventions/backend.md)"
+    },
+    {
+      "name": "path-backslash",
+      "doc": "version: \"2\"\nreview_conventions:\n  backend:\n    path: 'docs\\conventions\\backend.md'\nworkflows:\n  feature_change:\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n          conventions: [backend]\n",
+      "valid": false,
+      "layer": "semantic",
+      "path": "/review_conventions/backend/path",
+      "message": "review_conventions.backend: path \"docs\\\\conventions\\\\backend.md\" is not a canonical repo-relative path: it contains a backslash; name the document relative to the repository root, slash-separated, with no empty, \".\" or \"..\" segment (e.g. docs/conventions/backend.md)"
+    },
+    {
+      "name": "path-dot-dot-segment",
+      "doc": "version: \"2\"\nreview_conventions:\n  backend:\n    path: ../outside/backend.md\nworkflows:\n  feature_change:\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n          conventions: [backend]\n",
+      "valid": false,
+      "layer": "semantic",
+      "path": "/review_conventions/backend/path",
+      "message": "review_conventions.backend: path \"../outside/backend.md\" is not a canonical repo-relative path: it contains a \"..\" segment; name the document relative to the repository root, slash-separated, with no empty, \".\" or \"..\" segment (e.g. docs/conventions/backend.md)"
+    },
+    {
+      "name": "path-dot-segment",
+      "doc": "version: \"2\"\nreview_conventions:\n  backend:\n    path: docs/./backend.md\nworkflows:\n  feature_change:\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n          conventions: [backend]\n",
+      "valid": false,
+      "layer": "semantic",
+      "path": "/review_conventions/backend/path",
+      "message": "review_conventions.backend: path \"docs/./backend.md\" is not a canonical repo-relative path: it contains a \".\" segment; name the document relative to the repository root, slash-separated, with no empty, \".\" or \"..\" segment (e.g. docs/conventions/backend.md)"
+    },
+    {
+      "name": "path-empty-segment",
+      "doc": "version: \"2\"\nreview_conventions:\n  backend:\n    path: docs//backend.md\nworkflows:\n  feature_change:\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n          conventions: [backend]\n",
+      "valid": false,
+      "layer": "semantic",
+      "path": "/review_conventions/backend/path",
+      "message": "review_conventions.backend: path \"docs//backend.md\" is not a canonical repo-relative path: it contains an empty segment; name the document relative to the repository root, slash-separated, with no empty, \".\" or \"..\" segment (e.g. docs/conventions/backend.md)"
+    },
+    {
+      "name": "path-non-canonical-trailing-slash",
+      "note": "a spelling path.Clean would rewrite; reported as its empty last segment",
+      "doc": "version: \"2\"\nreview_conventions:\n  backend:\n    path: docs/conventions/\nworkflows:\n  feature_change:\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n          conventions: [backend]\n",
+      "valid": false,
+      "layer": "semantic",
+      "path": "/review_conventions/backend/path",
+      "message": "review_conventions.backend: path \"docs/conventions/\" is not a canonical repo-relative path: it contains an empty segment; name the document relative to the repository root, slash-separated, with no empty, \".\" or \"..\" segment (e.g. docs/conventions/backend.md)"
+    },
+    {
+      "name": "path-control-char",
+      "doc": "version: \"2\"\nreview_conventions:\n  backend:\n    path: \"docs/back\\tend.md\"\nworkflows:\n  feature_change:\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n          conventions: [backend]\n",
+      "valid": false,
+      "layer": "semantic",
+      "path": "/review_conventions/backend/path",
+      "message": "review_conventions.backend: path \"docs/back\\tend.md\" is not a canonical repo-relative path: it contains the control character '\\t'; name the document relative to the repository root, slash-separated, with no empty, \".\" or \"..\" segment (e.g. docs/conventions/backend.md)"
+    },
+    {
+      "name": "path-line-separator",
+      "doc": "version: \"2\"\nreview_conventions:\n  backend:\n    path: \"docs/back\\u2028end.md\"\nworkflows:\n  feature_change:\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n          conventions: [backend]\n",
+      "valid": false,
+      "layer": "semantic",
+      "path": "/review_conventions/backend/path",
+      "message": "review_conventions.backend: path \"docs/back\\u2028end.md\" is not a canonical repo-relative path: it contains the control character '\\u2028'; name the document relative to the repository root, slash-separated, with no empty, \".\" or \"..\" segment (e.g. docs/conventions/backend.md)"
+    },
+    {
+      "name": "applies-to-change-kind",
+      "doc": "version: \"2\"\nreview_conventions:\n  backend:\n    path: docs/conventions/backend.md\n    applies_to:\n      change_kind: [refactor]\nworkflows:\n  feature_change:\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n          conventions: [backend]\n",
+      "valid": false,
+      "layer": "semantic",
+      "path": "/review_conventions/backend/applies_to/change_kind",
+      "message": "review_conventions does not accept the change_kind criterion in applies_to: nothing produces a change kind today, so the criterion can never be satisfied and this convention would attach to no review; narrow on paths, labels or trigger instead (the shared predicate keeps change_kind for its other consumers)"
+    },
+    {
+      "name": "applies-to-malformed-glob",
+      "note": "a string the schema accepts; only the shared Predicate.Validate at the declaration site refuses it",
+      "doc": "version: \"2\"\nreview_conventions:\n  backend:\n    path: docs/conventions/backend.md\n    applies_to:\n      paths: [\"a/[b\"]\nworkflows:\n  feature_change:\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n          conventions: [backend]\n",
+      "valid": false,
+      "layer": "semantic",
+      "path": "/review_conventions/backend/applies_to",
+      "message": "/review_conventions/backend/applies_to/paths/0: malformed path glob \"a/[b\""
+    },
+    {
+      "name": "unreferenced-entry",
+      "doc": "version: \"2\"\nreview_conventions:\n  backend:\n    path: docs/conventions/backend.md\n  security:\n    path: docs/conventions/security.md\nworkflows:\n  feature_change:\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n          conventions: [backend]\n",
+      "valid": false,
+      "layer": "semantic",
+      "path": "/review_conventions/security",
+      "message": "review_conventions.security is declared but no stage selects it through reviewers.conventions, so it would reach no reviewer — it is refused rather than silently accepted as a control that does something; select it on a plan or implement stage, or remove the declaration"
+    },
+    {
+      "name": "selected-only-in-unused-defaults",
+      "note": "the reuse asymmetry: the backend resolver deletes `defaults` after folding while the CLI keeps it, so the CLI must count selections on stages only; every stage here declares its own reviewers, so nothing inherits the default",
+      "doc": "version: \"2\"\ndefaults:\n  reviewers:\n    agents:\n      - provider: anthropic\n    conventions: [backend]\nreview_conventions:\n  backend:\n    path: docs/conventions/backend.md\nworkflows:\n  feature_change:\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n",
+      "valid": false,
+      "layer": "semantic",
+      "path": "/review_conventions/backend",
+      "message": "review_conventions.backend is declared but no stage selects it through reviewers.conventions, so it would reach no reviewer — it is refused rather than silently accepted as a control that does something; select it on a plan or implement stage, or remove the declaration"
+    },
+    {
+      "name": "inline-text",
+      "note": "ADR-068: no inline text alternative to path",
+      "doc": "version: \"2\"\nreview_conventions:\n  backend:\n    path: docs/conventions/backend.md\n    text: Prefer small functions.\nworkflows:\n  feature_change:\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n          conventions: [backend]\n",
+      "valid": false,
+      "layer": "schema",
+      "path": "/review_conventions/backend"
+    },
+    {
+      "name": "severity-cap-high",
+      "doc": "version: \"2\"\nreview_conventions:\n  backend:\n    path: docs/conventions/backend.md\n    severity_cap: high\nworkflows:\n  feature_change:\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n          conventions: [backend]\n",
+      "valid": false,
+      "layer": "schema",
+      "path": "/review_conventions/backend/severity_cap"
+    },
+    {
+      "name": "missing-path",
+      "doc": "version: \"2\"\nreview_conventions:\n  backend:\n    severity_cap: low\nworkflows:\n  feature_change:\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n          conventions: [backend]\n",
+      "valid": false,
+      "layer": "schema",
+      "path": "/review_conventions/backend"
+    },
+    {
+      "name": "path-empty",
+      "doc": "version: \"2\"\nreview_conventions:\n  backend:\n    path: \"\"\nworkflows:\n  feature_change:\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n          conventions: [backend]\n",
+      "valid": false,
+      "layer": "schema",
+      "path": "/review_conventions/backend/path"
+    },
+    {
+      "name": "applies-to-bare-glob-list",
+      "note": "the issue sketch's bare-list form: applies_to is the shared predicate object",
+      "doc": "version: \"2\"\nreview_conventions:\n  backend:\n    path: docs/conventions/backend.md\n    applies_to: [\"backend/internal/crypto/**\"]\nworkflows:\n  feature_change:\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n          conventions: [backend]\n",
+      "valid": false,
+      "layer": "schema",
+      "path": "/review_conventions/backend/applies_to"
+    },
+    {
+      "name": "duplicate-selector-entry",
+      "doc": "version: \"2\"\nreview_conventions:\n  backend:\n    path: docs/conventions/backend.md\nworkflows:\n  feature_change:\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n          conventions: [backend, backend]\n",
+      "valid": false,
+      "layer": "schema",
+      "path": "/workflows/feature_change/stages/0/reviewers/conventions"
+    },
+    {
+      "name": "empty-selector-list",
+      "doc": "version: \"2\"\nreview_conventions:\n  backend:\n    path: docs/conventions/backend.md\nworkflows:\n  feature_change:\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n          conventions: []\n      - id: implement\n        type: implement\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: pull_request\n        reviewers:\n          agents:\n            - provider: anthropic\n          conventions: [backend]\n",
+      "valid": false,
+      "layer": "schema",
+      "path": "/workflows/feature_change/stages/0/reviewers/conventions"
+    },
+    {
+      "name": "empty-map",
+      "doc": "version: \"2\"\nreview_conventions: {}\nworkflows:\n  feature_change:\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n",
+      "valid": false,
+      "layer": "schema",
+      "path": "/review_conventions"
+    },
+    {
+      "name": "bad-name-pattern",
+      "doc": "version: \"2\"\nreview_conventions:\n  Backend:\n    path: docs/conventions/backend.md\nworkflows:\n  feature_change:\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n",
+      "valid": false,
+      "layer": "schema",
+      "path": "/review_conventions"
+    },
+    {
+      "name": "bad-selector-pattern",
+      "doc": "version: \"2\"\nreview_conventions:\n  backend:\n    path: docs/conventions/backend.md\nworkflows:\n  feature_change:\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n          conventions: [Backend]\n      - id: implement\n        type: implement\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: pull_request\n        reviewers:\n          agents:\n            - provider: anthropic\n          conventions: [backend]\n",
+      "valid": false,
+      "layer": "schema",
+      "path": "/workflows/feature_change/stages/0/reviewers/conventions/0"
+    }
+  ]
+}

@@ -330,6 +330,17 @@ var testSweepPathTriggerRules = []testSweepPathTriggerRule{
 		},
 		Generator: testSweepGeneratorSyncSchemas,
 	},
+	{
+		// Explicit cp: the shared review_conventions parity corpus
+		// (ADR-068 / E55.2 / #2243).
+		Rule:        testSweepRuleGeneratedSurface,
+		TriggerGlob: "docs/spec/review-conventions-fixtures.json",
+		RequiredPaths: []string{
+			"backend/internal/spec/testdata/review-conventions-fixtures.json",
+			"cli/internal/spec/testdata/review-conventions-fixtures.json",
+		},
+		Generator: testSweepGeneratorSyncSchemas,
+	},
 }
 
 // testSweepMaxMissingTests caps the existing-test names a single rule-2

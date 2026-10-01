@@ -23,7 +23,14 @@ import (
 //   - a workflow's applies_to routing predicate (E53.3 / #2226), including
 //     the plan-stage rule on its `paths` criterion (E53.15 / #2377);
 //   - a workflow's escalations block (E53.4 / #2227), minus the one check
-//     that needs the v2 autonomy resolver — see checkEscalations.
+//     that needs the v2 autonomy resolver — see checkEscalations;
+//   - the review_conventions family (ADR-068 / E55.2 / #2243,
+//     review_conventions.go): each declared entry's canonical repo-relative
+//     path and well-formed applies_to (no change_kind), a stage's
+//     reviewers.conventions (plan / implement only, declared names only, an
+//     agent reviewer required), and every declared entry selected by some
+//     stage — run at the backend's three positions (declarations before the
+//     workflow loop, stage checks inside it, the reference check after it).
 //
 // It operates on the yaml.v3-decoded map[string]any / []any tree (never
 // structs — this package carries no typed decode; the stage-reference
@@ -42,10 +49,14 @@ func validateAgentVersions(raw any) error {
 	if !ok {
 		return nil
 	}
-	workflows, ok := root["workflows"].(map[string]any)
-	if !ok {
-		return nil
-	}
+	// review_conventions DECLARATION checks run before the workflow loop and
+	// the REFERENCE check after it, mirroring the backend's Validate, so the
+	// list leads with the entry the backend returns first. A document with no
+	// readable workflows map ranges over nothing rather than returning early,
+	// so the reference rung still runs, as the backend's does.
+	checkReviewConventionDeclarations(root, &errs)
+	declaredConventions, _ := root["review_conventions"].(map[string]any)
+	workflows, _ := root["workflows"].(map[string]any)
 	for _, wfName := range sortedKeys(workflows) {
 		wfRaw := workflows[wfName]
 		wf, ok := wfRaw.(map[string]any)
@@ -73,9 +84,11 @@ func validateAgentVersions(raw any) error {
 			checkExecutorAgentVersion(st, base, &errs)
 			checkReviewerAgentVersions(st, base, &errs)
 			checkReviewerAuthority(st, base, &errs)
+			checkStageReviewConventions(st, wfName, i, declaredConventions, &errs)
 			checkStagePermissions(st, base, wfName, &errs)
 		}
 	}
+	checkReviewConventionsReferenced(root, &errs)
 	if len(errs) > 0 {
 		return &ValidationError{Errors: errs}
 	}
