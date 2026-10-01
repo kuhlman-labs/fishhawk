@@ -23,13 +23,15 @@ defaults:               # optional; file-level executor / reviewers / budget def
   reviewers: {...}
   budget: {...}
 test_conventions: [...] # optional; per-repo test-location rules for the plan-gate test sweep
+review_conventions:     # optional; named review-convention documents, selected per stage
+  <convention_name>: {path: ...}
 workflows:              # required; at least one workflow
   <workflow_id>:
     description: "..."
     stages: [...]
 ```
 
-The document root is closed (`additionalProperties: false`) over exactly these four keys: `version`, `defaults`, `test_conventions`, and `workflows`. There is **no top-level `roles` map** at major 2 — approval membership lives on the gate's own `approvals` block.
+The document root is closed (`additionalProperties: false`) over exactly these five keys: `version`, `defaults`, `test_conventions`, `review_conventions`, and `workflows`. There is **no top-level `roles` map** at major 2 — approval membership lives on the gate's own `approvals` block.
 
 `<workflow_id>` and every stage `id` are `snake_case` — `^[a-z][a-z0-9_]*$`.
 
@@ -284,7 +286,7 @@ applies_to: # optional; a $defs/predicate — see "Path predicate" below
   trigger: [diff]
 ```
 
-`applies_to` declares **which changes this workflow may be used for**. It is a [path predicate](#path-predicate) — the same match rule `escalations` and the review-conventions consume, used verbatim rather than reimplemented — so the criteria and their combination rules are the predicate's: AND across declared criteria types, OR within a list, and an undeclared type does not constrain. The one documented divergence is the **quantifier applied to `paths`**, described under "Enforcement" below: the predicate's `paths` rule is existential (*any* change path matching *any* glob), and a confinement control needs the universal reading (*every* path accepted). The quantifier is applied around the ratified matcher, not inside a second one.
+`applies_to` declares **which changes this workflow may be used for**. It is a [path predicate](#path-predicate) — the same match rule `escalations` and [`review_conventions`](#review-conventions) consume, used verbatim rather than reimplemented — so the criteria and their combination rules are the predicate's: AND across declared criteria types, OR within a list, and an undeclared type does not constrain. The one documented divergence is the **quantifier applied to `paths`**, described under "Enforcement" below: the predicate's `paths` rule is existential (*any* change path matching *any* glob), and a confinement control needs the universal reading (*every* path accepted). The quantifier is applied around the ratified matcher, not inside a second one.
 
 A workflow declaring **no** `applies_to` accepts any change. That is what leaves every document written before this property existed unaffected, and it is why the absent case is *not* an empty predicate (an empty predicate is an authoring error, never match-all).
 
@@ -635,6 +637,7 @@ reviewers:
       optional: true
   human: 1                        # integer >= 0; default 0
   review_timeout: 10m             # optional; this stage's review-budget floor
+  conventions: [backend]          # optional; plan / implement only; names review_conventions entries
 ```
 
 - **`agents`** — one entry per agent reviewer, minimum one entry when the key is present. The effective agent count is `len(agents)`; there is no bare integer count at major 2.
@@ -644,6 +647,7 @@ reviewers:
 - **`optional`** — the per-reviewer degradation policy when the provider is **unavailable on this deployment**. `false` (default) surfaces the gap loudly (an `ERROR` log naming the env knob plus a capability audit) but does not block; `true` is a quiet advisory skip. Either way the gap is recorded as a `reviewer_capability_unavailable` audit at run-create time and as a capability-framed `*_review_skipped` audit when the loop runs — deliberately distinct from a genuine reviewer error, because the reviewer never ran. A deployment with **no** reviewer backend wired at all is still a hard run-create failure: that is a deployment-wide misconfiguration, and `optional` does not apply to it.
 - **`authority`** — `advisory | gating`; optional. Declares **explicitly** whether this stage's agent reviewers can block, instead of leaving it inferred from the counts. See **[Authority](#authority)** below.
 - **`human`** — how many human approvals the stage's review requires.
+- **`conventions`** — the [review conventions](#review-conventions) this stage's agent reviewers are handed, by name, in list order. Valid only on a `plan` or `implement` stage, only on a stage with at least one agent reviewer, and every name must resolve to a declared `review_conventions` entry; a non-empty list of unique snake_case names.
 - **`review_timeout`** — a Go duration string setting the **floor** rung of the size-aware review-wait budget (`Floor + PerKB × ceil(promptKB)`, clamped to `[Floor, Cap]`) for **this stage's** agent reviews, so plan and implement stages can carry different review timeouts. Two-rung ladder: the deployment default (`FISHHAWKD_PLAN_REVIEW_TIMEOUT`) < this value. Only the floor is per-stage; the `PerKB` and `Cap` rungs stay deployment-level.
 
 ### Authority
@@ -1145,6 +1149,48 @@ test_conventions:
 - **`candidates`** — one or more test-file path templates (minimum one) for a matched production file. Template variables: `{dir}` (the production file's directory), `{name}` (basename without its final extension), `{ext}` (final extension without the dot), `{relpath}` (the repo-relative path without its final extension).
 - **Built-in defaults are always on.** The sweep ships defaults reproducing the Go rule (`**/*.go` → `{dir}/{name}_test.go`) and colocated TypeScript. Declared conventions **append** to these — they never replace them — so a repo declaring only Python and Ruby keeps Go and TypeScript covered.
 
+## Review conventions
+
+An optional **top-level** `review_conventions` map declaring repo-specific documents an agent reviewer is handed alongside the plan or diff it reviews (ADR-068 / E55.2 / #2243). Each entry is **named**; a `plan` or `implement` stage **selects** entries by name through [`reviewers.conventions`](#reviewers).
+
+```yaml
+review_conventions:
+  backend:
+    path: docs/conventions/backend.md
+  crypto:
+    path: docs/conventions/crypto.md
+    applies_to:                 # optional; a $defs/predicate object
+      paths: ["backend/internal/crypto/**", "**/*_crypto.go"]
+    severity_cap: medium        # optional; low | medium; absent = uncapped
+    required: false             # optional; default true
+
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        # ...
+        reviewers:
+          agents: [{provider: anthropic}]
+          conventions: [backend, crypto]
+```
+
+- **`review_conventions`** — a map from a `snake_case` convention name (`^[a-z][a-z0-9_]*$`) to one entry; at least one entry when the key is present.
+- **`path`** — required. The repo-relative, slash-separated path of the convention document. It must be **canonical**: an absolute path, a backslash, an empty segment (a doubled or trailing slash), a `.` or `..` segment, and a control or line-separator character are each refused at validation, naming the reason. The repo-document resolver that fetches the file applies the same rule set at resolution time and stays the authoritative check.
+- **`applies_to`** — optional. A [path predicate](#path-predicate) narrowing which changes the convention attaches to — the **same object** `applies_to` routing and `escalations.match` consume, not a bare glob list (`applies_to: ["backend/**"]` is a schema error; write `applies_to: {paths: ["backend/**"]}`). **Absent**, the convention attaches to every review of every stage that selects it. `change_kind` is refused here exactly as on the other two consumers: nothing produces a change kind today, so the convention could never attach. The predicate's own rules (no empty predicate, no malformed glob, a known `trigger` form) are checked at this declaration site by the shared validator.
+- **`severity_cap`** — optional; `low` or `medium`. A ceiling on the severity a reviewer may assign to a concern that rests on this convention. **Absent means uncapped.** `high` is not declarable: it is the top of the reviewer concern-severity ladder (`high` > `medium` > `low`), so a `high` cap would clamp nothing, and a control that does nothing is refused rather than accepted.
+- **`required`** — optional; **defaults to `true`**. Whether the review stage **fails** when the declared document is missing at the reviewed base. `true` fails loudly rather than letting a review run silently without the convention; `false` degrades to reviewing without it.
+
+**Named and referenced, not inline.** A convention names a file in the repository under review, so its text changes through the same review as any other file. There is no inline `text:` alternative — the entry is `additionalProperties: false`, so `text:` is a schema error.
+
+**Declared, never auto-discovered.** No document is read because it exists at a conventional path. A convention reaches a reviewer only when it is declared here **and** selected by a stage.
+
+**Every declared entry must be selected, and every selection must resolve.** A stage's `reviewers.conventions` naming an undeclared entry is refused at the selector's index (`/workflows/<wf>/stages/<i>/reviewers/conventions/<j>`, mirroring `inputs[].from_stage`), and an entry no stage selects is refused at `/review_conventions/<name>` — a declaration that reaches no reviewer is a control that does nothing. Selection is valid only on a `plan` or `implement` stage (the only stages with an agent-review loop) and only on a stage configuring at least one agent reviewer.
+
+**Interaction with `defaults.reviewers`.** `conventions` lives inside the `reviewers` block, and a `defaults.reviewers` block is taken **whole** onto every stage that does not declare its own `reviewers` (see [Reuse](#reuse-defaults-and-extends)). A file-level reviewers default carrying `conventions` therefore lands on every inheriting stage — including a `review`, `acceptance` or `deploy` stage, where it is refused at that stage's resolved path. Give such a stage its own `reviewers` block. Conversely, a selection made only inside a `defaults.reviewers` block that no stage inherits selects nothing, and the entry it names is refused as unselected.
+
+**Grammar only, today.** The schema accepts these keys, the parser round-trips them, and the backend and `fishhawk validate` enforce every rule above; nothing yet hands a convention to a reviewer. Rendering a selected convention into the review prompt and enforcing `severity_cap` are #2244 (E55.3), and the runtime half of `required` — a missing required document failing the review stage — is an explicit obligation on #2244, wired into the review-prompt sites by #2797. Until both land, a declared and selected convention is validated and inert.
+
 ## Identifier namespaces
 
 | Field | Pattern / values | Notes |
@@ -1198,6 +1244,11 @@ test_conventions:
 | `gates[].sla` | string | D-category gate timeout |
 | `test_conventions[].match` | non-empty doublestar glob | `**` crosses `/` |
 | `test_conventions[].candidates` | array of non-empty templates, min 1 | `{dir}` / `{name}` / `{ext}` / `{relpath}` |
+| `review_conventions` keys | `^[a-z][a-z0-9_]*$` | snake_case convention names; at least one entry when present |
+| `review_conventions.<name>.path` | canonical repo-relative path | no absolute / backslash / empty / `.` / `..` segment / control character |
+| `review_conventions.<name>.severity_cap` | `low` \| `medium` | absent = uncapped; `high` is not declarable |
+| `review_conventions.<name>.required` | `true` \| `false` (default `true`) | `true` fails the review stage on a missing document (#2244) |
+| `reviewers.conventions` items | `^[a-z][a-z0-9_]*$`, unique, min 1 | each names a declared `review_conventions` entry; `plan` / `implement` stages only |
 
 ## Validation rules beyond the schema
 
@@ -1213,8 +1264,9 @@ The schema enforces structure. Layers above it enforce what JSON Schema cannot e
 - An `agent_version` range parses as a comparator list.
 - `extends` names a defined workflow and forms no cycle.
 - Every `escalations` entry actually **raises** something (see [Escalations](#escalations)): `count` and `min_permission` must exceed the workflow's least-restrictive baseline, `member_of` may not name a group every approval gate already requires, `require.approvals` needs an approval gate to raise, and `max_autonomy` may not leave the resolved matrix identical. A `match.paths` criterion is additionally refused on a workflow that declares no plan stage (E53.16 / #2382), for the same reason `applies_to.paths` is — there is no `scope.files` producer for it to match against, so the escalation could never fire. `fishhawk validate` mirrors all of these except the `max_autonomy` no-op check, which needs the autonomy resolver the CLI deliberately does not carry.
+- Every `review_conventions` entry's `path` is a canonical repo-relative path, and its `applies_to` is a well-formed predicate declaring no `change_kind`. A stage's `reviewers.conventions` is valid only on a `plan` or `implement` stage, names only declared entries, and requires at least one agent reviewer; every declared entry is selected by at least one stage of the resolved document (see [Review conventions](#review-conventions)).
 
-`fishhawk validate` (the CLI) validates in two tiers. It reports schema errors, the removed-form messages, the reuse-resolution rejections, the workflow/stage semantic sweeps (agent_version, reviewers.authority, applies_to, escalations), and — since E52.13 / #2323 — **stage-reference resolution**: duplicate stage ids, the `needs:` shorthand, and `inputs[].from_stage` referent/ordering, reported at the identical paths the backend uses. What remains backend-only is the stage-BINDING class: the ADR-038 type/executor/constraint bindings, the plan `schema: standard_v1` rule, the produces-artifact bindings (deployment / acceptance / grooming_report and the E52.7 post-hoc-constraint↔pull_request rule), and the `max_autonomy` no-op check that needs the autonomy resolver the CLI deliberately does not carry — these surface server-side at run creation.
+`fishhawk validate` (the CLI) validates in two tiers. It reports schema errors, the removed-form messages, the reuse-resolution rejections, the workflow/stage semantic sweeps (agent_version, reviewers.authority, applies_to, escalations, review_conventions), and — since E52.13 / #2323 — **stage-reference resolution**: duplicate stage ids, the `needs:` shorthand, and `inputs[].from_stage` referent/ordering, reported at the identical paths the backend uses. What remains backend-only is the stage-BINDING class: the ADR-038 type/executor/constraint bindings, the plan `schema: standard_v1` rule, the produces-artifact bindings (deployment / acceptance / grooming_report and the E52.7 post-hoc-constraint↔pull_request rule), and the `max_autonomy` no-op check that needs the autonomy resolver the CLI deliberately does not carry — these surface server-side at run creation.
 
 ## Version routing
 
@@ -1240,7 +1292,7 @@ The backend (`backend/internal/spec`) and the CLI (`cli/internal/spec`) compile 
 
 ## Path predicate
 
-`$defs/predicate` is one declarative match rule over a change — the SINGLE matcher that a workflow's [`applies_to`](#workflow-routing-applies_to) routing (E53.3 / #2226), `escalations` (E53.4 / #2227) and the review-conventions of ADR-068 (#2211) each `$ref` rather than each growing a subtly different matcher. `applies_to` is its **first consumer**; the other two children wire the rest. The definition is deliberately left **unchanged by its consumers**: a consumer needing a narrower grammar refuses the criterion at its own declaration site — as `applies_to` does for `change_kind` — rather than editing the shared shape out from under the others.
+`$defs/predicate` is one declarative match rule over a change — the SINGLE matcher that a workflow's [`applies_to`](#workflow-routing-applies_to) routing (E53.3 / #2226), `escalations` (E53.4 / #2227) and the review-conventions of ADR-068 (#2211) each `$ref` rather than each growing a subtly different matcher. All three consumers are now wired: `applies_to` was the first, then `escalations.match`, then a [`review_conventions`](#review-conventions) entry's `applies_to` (E55.2 / #2243). The definition is deliberately left **unchanged by its consumers**: a consumer needing a narrower grammar refuses the criterion at its own declaration site — as `applies_to` does for `change_kind` — rather than editing the shared shape out from under the others.
 
 A predicate carries four optional criteria, each a non-empty list:
 
@@ -1263,7 +1315,7 @@ A predicate carries four optional criteria, each a non-empty list:
 
 ## Control surface: what is enforced, and where
 
-The control-surface fields (`reviewers.authority`, `applies_to`, `escalations`, `permissions`) do **not** share one enforcement status, and reading them as if they did — "declared, therefore guaranteed", or the tidier and equally false "everything here is unenforced" — misstates what the product actually holds. This table is the consolidated per-control account. It states nothing the sections above do not; it keeps the honest split in one place so no reader has to reassemble it. A "declared" control is validated, audited and surfaced, but it is not a guarantee until a seam reads it. The same split, in the same words, governs this repository's own governance in [`docs/METHODOLOGY.md`](../METHODOLOGY.md); the two are written to be read against each other.
+The control-surface fields (`reviewers.authority`, `applies_to`, `escalations`, `permissions`, `review_conventions`) do **not** share one enforcement status, and reading them as if they did — "declared, therefore guaranteed", or the tidier and equally false "everything here is unenforced" — misstates what the product actually holds. This table is the consolidated per-control account. It states nothing the sections above do not; it keeps the honest split in one place so no reader has to reassemble it. A "declared" control is validated, audited and surfaced, but it is not a guarantee until a seam reads it. The same split, in the same words, governs this repository's own governance in [`docs/METHODOLOGY.md`](../METHODOLOGY.md); the two are written to be read against each other.
 
 | Control | What it constrains | Enforcement status |
 |---|---|---|
@@ -1271,6 +1323,7 @@ The control-surface fields (`reviewers.authority`, `applies_to`, `escalations`, 
 | `applies_to.labels`, `applies_to.trigger` | Which changes a workflow may be used for, by issue label and run shape. | **Enforced at run admission** — `POST /v0/runs` **and** the webhook dispatch path — through one shared evaluation core, fail-closed. See [Workflow routing](#workflow-routing-applies_to). |
 | `applies_to.paths` | Confines a workflow's change set to declared globs. | **Enforced at the plan gate** against the `scope.files` union, universally quantified. **Refused at validation on a workflow that declares no plan stage** — there is no `scope.files` producer for it to check, so it could never be evaluated (E53.15 / #2377). |
 | `escalations` | Raises the approval count, membership conjunction, minimum permission, or autonomy ceiling for a change matching a predicate. | **Enforced where declared**, at the approval gate and in delegation resolution; a workflow declaring none short-circuits before any extra read. A `match.paths` criterion is **refused at validation on a workflow that declares no plan stage** — no `scope.files` producer, so it could never fire (E53.16 / #2382). The *mechanism* is shipped and tested; whether it holds on any given path depends on a declaration existing there. See [Escalations](#escalations). |
+| `review_conventions` / `reviewers.conventions` | Which repo-declared convention documents a plan or implement stage's agent reviewers are handed, how severely a finding resting on one may be weighed (`severity_cap`), and whether a missing document fails the review (`required`). | **Validated only.** Both validators enforce the grammar (canonical path, resolvable and selected names, plan/implement-only selection with an agent reviewer), but **no seam reads it yet**: rendering and `severity_cap` enforcement are #2244, and the fail-loudly half of `required` is an obligation on #2244, wired by #2797. See [Review conventions](#review-conventions). |
 | `permissions.network` | The egress host(s) a stage's agent may reach. | **Enforced on an agent-executor `acceptance` stage**, where it normalizes into `egress` and the runner's default-deny proxy applies it — the pre-existing ADR-050 control. On **every other stage** it is a declaration only, until E51 (#2133). The run-status per-entry `enforced` flag encodes exactly this split. |
 | `permissions.write` | The paths a stage's agent is expected to write. | Declared, audited (`stage_permissions_declared`) and surfaced (`permissions[]`), but **not enforced anywhere**, until E51 (#2133). |
 | `permissions.shell` | The stage's shell posture (`none` / `restricted` / `unrestricted`). | Declared, audited and surfaced, but **not enforced anywhere**, until E51 (#2133). |

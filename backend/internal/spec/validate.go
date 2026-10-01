@@ -62,6 +62,13 @@ import (
 //     executor; the `permissions` block's `write` globs and `shell` posture are
 //     then validated. The block is DECLARATION-ONLY — validated, audited and
 //     surfaced but not enforced until E51 #2133.
+//   - review_conventions (ADR-068 / E55.2 / #2243): each declared entry's path
+//     is a canonical repo-relative path and its applies_to is a well-formed
+//     predicate without change_kind; a stage's reviewers.conventions is valid
+//     only on a plan / implement stage, names declared entries only, and needs
+//     an agent reviewer; and every declared entry is selected by some stage.
+//     Rule order and the selection contract: review_conventions.go. v2-only in
+//     practice — no v0/v1 schema declares either key.
 //
 // Validate is exported so tests and Spec-builder code can exercise
 // the semantic layer without the YAML→schema round trip.
@@ -69,13 +76,21 @@ func Validate(s *Spec) error {
 	if s == nil {
 		return &ValidationError{Path: "/", Message: "nil spec"}
 	}
+	// review_conventions DECLARATION checks (E55.2 / #2243) run before the
+	// workflow loop, so a malformed entry is reported ahead of any stage that
+	// selects it; the per-stage selection checks run inside validateWorkflow
+	// and the unreferenced-entry check after the loop. Rule order:
+	// review_conventions.go.
+	if err := validateReviewConventionDeclarations(s); err != nil {
+		return err
+	}
 	major := specVersionMajor(s.Version)
 	for wfName, wf := range s.Workflows {
 		if err := validateWorkflow(s, wfName, &wf, major); err != nil {
 			return err
 		}
 	}
-	return nil
+	return validateReviewConventionsReferenced(s)
 }
 
 // specVersionMajor parses a spec version string's major component, the way
@@ -335,6 +350,13 @@ func validateWorkflow(s *Spec, name string, wf *Workflow, major int) error {
 						"stage %q: reviewers.authority: %q declares agent-reviewer authority but the stage configures no agent reviewers; declare at least one entry under reviewers.agents, or remove reviewers.authority to fall back to the count-derived ADR-027 default",
 						stage.ID, stage.Reviewers.Authority),
 				}
+			}
+			// reviewers.conventions (E55.2 / #2243): stage type, then each
+			// selected name resolves, then an agent reviewer exists. Reads the
+			// RESOLVED stage, so a selection inherited from defaults.reviewers
+			// is checked on every stage that inherits it.
+			if err := validateStageReviewConventions(s, name, i, &stage); err != nil {
+				return err
 			}
 		}
 

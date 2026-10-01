@@ -113,6 +113,16 @@ type Spec struct {
 	// DisallowUnknownFields decode, so this field MUST stay in lockstep
 	// with the schema's top-level test_conventions property.
 	TestConventions []TestConvention `json:"test_conventions,omitempty" yaml:"test_conventions,omitempty"`
+	// ReviewConventions are the named repo-declared review conventions
+	// (ADR-068 / E55.2 / #2243): a convention name -> the document a review
+	// stage selects by name through ReviewersConfig.Conventions. Declared,
+	// never auto-discovered. Validated by validateReviewConventionDeclarations
+	// and validateReviewConventionsReferenced; selected per stage by
+	// SelectReviewConventions. A v2-only surface (no v0/v1 schema declares
+	// it). Round-trips through ParseBytes' DisallowUnknownFields decode, so
+	// this field MUST stay in lockstep with the schema's top-level
+	// review_conventions property.
+	ReviewConventions map[string]ReviewConvention `json:"review_conventions,omitempty" yaml:"review_conventions,omitempty"`
 }
 
 // TestConvention is one test-location convention (#1004): production
@@ -567,6 +577,18 @@ type ReviewersConfig struct {
 	// schema's reviewers_config is additionalProperties:false, so this field
 	// MUST stay in lockstep with the schema's review_timeout property.
 	ReviewTimeout string `json:"review_timeout,omitempty" yaml:"review_timeout,omitempty"`
+	// Conventions selects, by name, the top-level review_conventions entries
+	// this stage's agent reviewers are handed (ADR-068 / E55.2 / #2243), in
+	// list order. Semantic validation refuses an undeclared name, a selection
+	// on a stage type other than plan/implement, and a selection on a stage
+	// with no agent reviewers (validateStageReviewConventions). Because a
+	// defaults.reviewers block is taken WHOLE, a file-level reviewers default
+	// carrying Conventions lands on every inheriting stage and is checked
+	// there. Grammar only: SelectReviewConventions is the consumer contract
+	// #2244 / #2797 call. The schema's reviewers_config is
+	// additionalProperties:false, so this field MUST stay in lockstep with
+	// the schema's conventions property.
+	Conventions []string `json:"conventions,omitempty" yaml:"conventions,omitempty"`
 }
 
 // ResolveReviewTimeout resolves the review-wait budget floor for a stage,

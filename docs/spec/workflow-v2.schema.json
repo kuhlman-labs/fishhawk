@@ -52,9 +52,52 @@
       "items": {
         "$ref": "#/$defs/test_convention"
       }
+    },
+    "review_conventions": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": false,
+      "patternProperties": {
+        "^[a-z][a-z0-9_]*$": {
+          "$ref": "#/$defs/review_convention"
+        }
+      },
+      "description": "Named repo-declared review conventions (ADR-068 / E55.2 / #2243): a map from a snake_case convention name (^[a-z][a-z0-9_]*$, the v2 identifier rule — a non-matching key is refused as an additional property, the same idiom `workflows` uses) to one entry naming a repo-relative document that a review stage SELECTS by name through its `reviewers.conventions` list. A convention is DECLARED here and never auto-discovered — no file is read because it exists at a conventional path. Every declared entry must be selected by at least one stage of the RESOLVED document (one declared and selected nowhere is refused as a control that does nothing), and every selected name must resolve to an entry here; both rules, plus the canonical repo-relative path rule, are enforced at semantic validation by the backend and `fishhawk validate`. GRAMMAR ONLY in this change: nothing renders a convention into a reviewer prompt yet — rendering and severity_cap enforcement are #2244 (E55.3) and the review-prompt wiring is #2797. Declared by workflow-v2; accepted whenever present (v2 has no minor chain — a field is accepted because the schema declares it, not because the document declared a high enough minor)."
     }
   },
   "$defs": {
+    "review_convention": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path"
+      ],
+      "description": "One named review convention (ADR-068 / #2243). The document is named by `path` — there is NO inline `text:` alternative (additionalProperties false), so the convention text lives in the repository under review and changes through the same review as any other file. `applies_to` narrows WHICH changes the convention attaches to; `severity_cap` bounds how strongly a reviewer may weigh a finding citing it; `required` decides whether a missing document fails the review stage.",
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Repo-relative, slash-separated path of the convention document, e.g. `docs/conventions/backend.md`. Semantic validation refuses an absolute path, a backslash, an empty / `.` / `..` segment, a non-canonical spelling (one path.Clean would rewrite) and a control or line-separator character — the same rule set the repo-document resolver applies when it fetches the file, which stays the authoritative check at resolution time."
+        },
+        "applies_to": {
+          "$ref": "#/$defs/predicate",
+          "description": "Optional shared path predicate (E53.1 / #2224) deciding which changes this convention attaches to — the same object `applies_to` routing and `escalations.match` consume, NOT a bare glob list. ABSENT means the convention attaches to every review of every stage that selects it. `change_kind` is refused here (nothing produces a change kind today, so the convention could never attach)."
+        },
+        "severity_cap": {
+          "type": "string",
+          "enum": [
+            "low",
+            "medium"
+          ],
+          "description": "Optional ceiling on the severity a reviewer may assign to a concern that rests on this convention. ABSENT means UNCAPPED (the convention's findings carry whatever severity the reviewer assigns). `high` is deliberately not declarable: it is the top of the reviewer concern-severity ladder (high > medium > low), so a `high` cap would clamp nothing and is refused as a control that does nothing. Enforced by the review-prompt rendering in #2244 (E55.3); grammar only here."
+        },
+        "required": {
+          "type": "boolean",
+          "default": true,
+          "description": "Whether the review stage FAILS when the declared document is missing at the reviewed base. Defaults to `true` (fail loudly, never review silently without the convention); `false` degrades to reviewing without it. Grammar only here: the runtime fail-loudly half is an explicit obligation on #2244 (E55.3 rendering), wired into the review prompts by #2797."
+        }
+      }
+    },
     "test_convention": {
       "type": "object",
       "additionalProperties": false,
@@ -1052,6 +1095,16 @@
           "type": "string",
           "pattern": "^([0-9]+(ns|us|ms|s|m|h))+$",
           "description": "Per-stage review-budget floor (#1494). The stage's review_timeout OVERRIDES the FISHHAWKD_PLAN_REVIEW_TIMEOUT deployment default — it sets the Floor rung of the size-aware review-wait budget (Floor + PerKB*ceil(promptKB), clamped to [Floor,Cap]) for this stage's agent reviews; the deployment-level PerKB and Cap are unchanged. Parsed by time.ParseDuration; an unparseable or absent value falls back to the FISHHAWKD_PLAN_REVIEW_TIMEOUT deployment default. Resolved by spec.ResolveReviewTimeout on the backend. Declared by workflow-v2; accepted whenever present (v2 has no minor chain — a field is accepted because the schema declares it, not because the document declared a high enough minor)."
+        },
+        "conventions": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]*$"
+          },
+          "description": "Review conventions this stage's agent reviewers are handed (ADR-068 / E55.2 / #2243): each item names an entry of the top-level `review_conventions` map, in the order the reviewer receives them. Semantic validation (backend and `fishhawk validate`) refuses a name that resolves to no declared entry, a selection on any stage type other than `plan` or `implement` (the only stages with a reviewer loop), and a selection on a stage configuring no agent reviewers. Travels with a `defaults.reviewers` block as part of the WHOLE reviewers value, so a file-level reviewers default carrying conventions is subject to the stage-type rule on every stage that inherits it. Grammar only in this change: rendering is #2244 (E55.3) and wiring is #2797."
         }
       }
     },
