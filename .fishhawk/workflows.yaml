@@ -295,6 +295,11 @@ workflows:
         type: implement
         executor:
           agent: claude-code
+          # Pinned so the implement model is reproducible and priced rather
+          # than whatever the host's claude CLI defaults to. A plan
+          # model_recommendation or an operator override at the gate still
+          # takes precedence over this pin.
+          model: claude-opus-5-5
           # Execution-grounded verifier. After the agent exits, run the
           # project's test command against the committed, scope-only tree
           # (not the working tree). On failure, feed the captured output
