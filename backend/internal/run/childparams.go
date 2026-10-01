@@ -77,6 +77,8 @@ var childParamsInheritance = map[string]childFieldDecision{
 		"The child works the same issue as its parent, so it reuses the cached context rather than re-fetching it (#415); a site needing a narrowed context overrides after the call."},
 	"RequiresCharter": {modeInherited,
 		"A child executes the same workflow definition as its parent, so it carries the same grooming determination (migration 0082 / #2806) — verbatim, INCLUDING nil: a child of a parent with no persisted determination has none either, and the consumer's legacy branch derives it from the (shared) cached spec."},
+	"DocumentBaseCommit": {modeInherited,
+		"A retry, recovery or decomposition child resolves repo-declared run-admission documents against the SAME admission commit as its parent (migration 0091 / #3746) — verbatim, INCLUDING nil: a child of a parent with no recorded commit has its run-admission documents withheld too, never re-pinned to a newer head."},
 
 	// --- derived: computed from the parent, never copied.
 	"ParentRunID": {modeDerived,
@@ -132,6 +134,7 @@ func ChildParamsFrom(parent *Run) CreateRunParams {
 		MaxRetriesSnapshot:     parent.MaxRetriesSnapshot,
 		IssueContext:           parent.IssueContext,
 		RequiresCharter:        parent.RequiresCharter,
+		DocumentBaseCommit:     parent.DocumentBaseCommit,
 
 		// derived
 		ParentRunID: &parentID,

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
@@ -3122,6 +3123,135 @@ func assertBoolPtrEqual(t *testing.T, path string, got, want *bool) {
 		t.Errorf("%s RequiresCharter = nil, want %v", path, *want)
 	case *got != *want:
 		t.Errorf("%s RequiresCharter = %v, want %v", path, *got, *want)
+	}
+}
+
+// TestCreateRun_PersistsDocumentBaseCommit pins the run-admission document
+// base commit's round trip (migration 0091, E55.7 / #3746): nil and a
+// lowercase 40-hex value each survive CreateRun -> GetRun -> ListRuns and a
+// state transition (an UPDATE ... RETURNING path) distinctly. nil must scan
+// back as nil, never "", so an unrecorded row cannot pass for an empty ref.
+// The ListRuns and TransitionRun arms exist because a missed hand-edited sqlc
+// site is a runtime pgx column-count error, not a compile error.
+func TestCreateRun_PersistsDocumentBaseCommit(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := run.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	const repoSlug = "kuhlman-labs/fishhawk-document-base-commit"
+	commit := "0123456789abcdef0123456789abcdef01234567"
+	cases := []struct {
+		name string
+		val  *string
+	}{
+		{"a recorded admission commit round-trips verbatim", &commit},
+		{"no recorded commit (nil) round-trips as nil, NOT empty", nil},
+	}
+
+	created := make(map[uuid.UUID]*string, len(cases))
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r, err := repo.CreateRun(ctx, run.CreateRunParams{
+				Repo:               repoSlug,
+				WorkflowID:         "feature_change",
+				WorkflowSHA:        "deadbeef",
+				TriggerSource:      run.TriggerCLI,
+				DocumentBaseCommit: tc.val,
+			})
+			if err != nil {
+				t.Fatalf("create run: %v", err)
+			}
+			assertStringPtrEqual(t, "CreateRun", r.DocumentBaseCommit, tc.val)
+
+			got, err := repo.GetRun(ctx, r.ID)
+			if err != nil {
+				t.Fatalf("get run: %v", err)
+			}
+			assertStringPtrEqual(t, "GetRun", got.DocumentBaseCommit, tc.val)
+
+			moved, err := repo.TransitionRun(ctx, r.ID, run.StateRunning)
+			if err != nil {
+				t.Fatalf("transition run: %v", err)
+			}
+			assertStringPtrEqual(t, "TransitionRun", moved.DocumentBaseCommit, tc.val)
+			created[r.ID] = tc.val
+		})
+	}
+
+	list, err := repo.ListRuns(ctx, run.ListRunsFilter{Repo: repoSlug, Limit: 100})
+	if err != nil {
+		t.Fatalf("list runs: %v", err)
+	}
+	seen := 0
+	for _, r := range list {
+		want, ok := created[r.ID]
+		if !ok {
+			continue
+		}
+		seen++
+		assertStringPtrEqual(t, "ListRuns", r.DocumentBaseCommit, want)
+	}
+	if seen != len(created) {
+		t.Errorf("ListRuns returned %d of the %d created runs", seen, len(created))
+	}
+}
+
+// TestCreateRun_RejectsNonCommitDocumentBaseCommit pins the
+// runs_document_base_commit_check constraint (migration 0091, #3746) through
+// the real repository: a branch name, an uppercase SHA and a short SHA are
+// each refused with SQLSTATE 23514 naming the constraint, AND no row is
+// persisted — the control's effect is committed state, so the test reads the
+// table back rather than trusting the error alone. Without the CHECK a mutable
+// ref could be persisted as the run's document read point.
+func TestCreateRun_RejectsNonCommitDocumentBaseCommit(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := run.NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	const repoSlug = "kuhlman-labs/fishhawk-document-base-commit-check"
+	commit := "0123456789abcdef0123456789abcdef01234567"
+	for _, bad := range []string{"main", "0123456789ABCDEF0123456789ABCDEF01234567", commit[:12]} {
+		t.Run(bad, func(t *testing.T) {
+			val := bad
+			_, err := repo.CreateRun(ctx, run.CreateRunParams{
+				Repo:               repoSlug,
+				WorkflowID:         "feature_change",
+				WorkflowSHA:        "deadbeef",
+				TriggerSource:      run.TriggerCLI,
+				DocumentBaseCommit: &val,
+			})
+			var pgErr *pgconn.PgError
+			if !errors.As(err, &pgErr) || pgErr.Code != "23514" || pgErr.ConstraintName != "runs_document_base_commit_check" {
+				t.Errorf("CreateRun(DocumentBaseCommit=%q) error = %v, want SQLSTATE 23514 from runs_document_base_commit_check", bad, err)
+			}
+		})
+	}
+
+	list, err := repo.ListRuns(ctx, run.ListRunsFilter{Repo: repoSlug, Limit: 100})
+	if err != nil {
+		t.Fatalf("list runs: %v", err)
+	}
+	for _, r := range list {
+		got := "<nil>"
+		if r.DocumentBaseCommit != nil {
+			got = *r.DocumentBaseCommit
+		}
+		t.Errorf("run %s persisted with DocumentBaseCommit=%q, want no row for a non-commit value", r.ID, got)
+	}
+}
+
+// assertStringPtrEqual compares two *string values, distinguishing nil from a
+// pointer to "" — the distinction the document_base_commit contract rests on.
+func assertStringPtrEqual(t *testing.T, path string, got, want *string) {
+	t.Helper()
+	switch {
+	case want == nil && got == nil:
+	case want == nil:
+		t.Errorf("%s DocumentBaseCommit = %q, want nil (NULL must not be coerced to a string)", path, *got)
+	case got == nil:
+		t.Errorf("%s DocumentBaseCommit = nil, want %q", path, *want)
+	case *got != *want:
+		t.Errorf("%s DocumentBaseCommit = %q, want %q", path, *got, *want)
 	}
 }
 
