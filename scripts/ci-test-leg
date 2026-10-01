@@ -1,0 +1,253 @@
+#!/usr/bin/env bash
+# SC2001: the sed calls below prefix EVERY line of a multi-line value, which a
+# ${var//search/replace} expansion cannot anchor per line.
+# shellcheck disable=SC2001
+#
+# scripts/ci-test-leg — the CI Go test partition (#3882).
+#
+# CI's `Go (test + coverage)` job used to run `scripts/test coverage`: every
+# go.work module, one after another, on one 4-vCPU runner (~15-20 min). This
+# script splits that same work into LEGS that CI runs as a parallel matrix, each
+# writing coverage profiles that a final job merges and gates (check-coverage.py
+# merges blocks recurring across profiles since #3881, which is what makes
+# splitting one package across two legs safe).
+#
+# usage:
+#   scripts/ci-test-leg --list               print the leg names (one per line)
+#   scripts/ci-test-leg --plan <leg>         print the leg's go test parts
+#   scripts/ci-test-leg --check-partition    fail unless every package of every
+#                                            go.work module is tested by exactly
+#                                            one leg (see below)
+#   scripts/ci-test-leg <leg> <profile-dir>  run the leg; one profile per part
+#
+# The partition is COMPLETE BY CONSTRUCTION, not by a hand-maintained list:
+#   backend-heavy   a fixed list of the slowest backend packages
+#   backend-rest    every OTHER backend package (computed from `go list`)
+#   runner-main-a   runner/cmd/fishhawk-runner, tests matching ^TestRun
+#   runner-main-b   runner/cmd/fishhawk-runner, tests NOT matching ^TestRun
+#                   (-run X / -skip X of the same regex are exact complements)
+#   rest            every other runner package, plus every go.work module that
+#                   is neither backend nor runner (computed from go.work)
+# so a new package or a new go.work module lands in a leg with no edit here.
+# --check-partition proves it, and CI runs it before the coverage gate.
+#
+# Every leg runs with scripts/test's environment (sourced lib-only): the
+# GIT_CONFIG_* /dev/null pins, TESTCONTAINERS_RYUK_DISABLED, the shared
+# fishhawk-test-postgres lease, `-race`, -p "$TEST_P" and -timeout "$TEST_TIMEOUT".
+# A failing part does not stop the leg: every part runs and the leg exits 1 at
+# the end naming each failed part, mirroring `scripts/test coverage` (#3403).
+set -euo pipefail
+
+FISHHAWK_TEST_LIB_ONLY=1
+# shellcheck source=scripts/test
+. "$(dirname "$0")/test"
+unset FISHHAWK_TEST_LIB_ONLY
+
+# The slowest backend packages (CI seconds at #3881's merge: mcpserver 240,
+# server 199, postgres 84, integration/mcp 59). Module-relative.
+HEAVY_BACKEND="./internal/mcpserver ./internal/server ./internal/postgres ./internal/integration/mcp"
+RUNNER_MAIN="./cmd/fishhawk-runner"
+# ^TestRun splits fishhawk-runner's test time ~52/48.
+RUNNER_SPLIT='^TestRun'
+LEGS="backend-heavy backend-rest runner-main-a runner-main-b rest"
+
+# _module_pkgs <module-dir>: every package of a module, module-relative
+# ("." for the module root, "./x/y" otherwise), one per line. Fails closed on an
+# empty listing: a module that lists nothing would otherwise drop out silently.
+_module_pkgs() {
+  local m="$1" dir rel out
+  out="$(cd "$ROOT/$m" && go list -f '{{.Dir}}' ./...)"
+  if [ -z "$out" ]; then
+    echo "ci-test-leg: go list returned no packages for module $m" >&2
+    return 1
+  fi
+  dir="$(cd "$ROOT/$m" && pwd -P)"
+  while IFS= read -r rel; do
+    rel="$(cd "$rel" && pwd -P)"
+    if [ "$rel" = "$dir" ]; then
+      echo "."
+    else
+      echo "./${rel#"$dir"/}"
+    fi
+  done <<< "$out"
+}
+
+# _except <list-to-drop> : filter stdin, dropping exact matches.
+_except() {
+  local drop=" $1 " p
+  while IFS= read -r p; do
+    case "$drop" in
+      *" $p "*) ;;
+      *) echo "$p" ;;
+    esac
+  done
+}
+
+# _other_modules: go.work modules other than backend and runner, without "./".
+_other_modules() {
+  local mlist m
+  if ! mlist="$(_module_list)"; then
+    echo "$NO_MODULES_MSG" >&2
+    return 1
+  fi
+  while IFS= read -r m; do
+    m="${m#./}"
+    case "$m" in
+      backend|runner) ;;
+      *) echo "$m" ;;
+    esac
+  done <<< "$mlist"
+}
+
+# _leg_parts <leg>: one line per `go test` invocation, "module|args|packages"
+# ('|' not tab: IFS would collapse an empty args field between two tabs).
+#
+# Every command substitution is checked explicitly (`|| return 1`): bash does
+# not carry `set -e` into $(...) subshells, and a swallowed `go list` failure
+# would otherwise emit a part with NO packages — which `go test` reads as "the
+# module root only", silently dropping the rest.
+_leg_parts() {
+  local pkgs m others
+  case "$1" in
+    backend-heavy)
+      echo "backend||$HEAVY_BACKEND"
+      ;;
+    backend-rest)
+      pkgs="$(_module_pkgs backend | _except "$HEAVY_BACKEND" | tr '\n' ' ')" || return 1
+      echo "backend||${pkgs% }"
+      ;;
+    runner-main-a)
+      echo "runner|-run $RUNNER_SPLIT|$RUNNER_MAIN"
+      ;;
+    runner-main-b)
+      echo "runner|-skip $RUNNER_SPLIT|$RUNNER_MAIN"
+      ;;
+    rest)
+      pkgs="$(_module_pkgs runner | _except "$RUNNER_MAIN" | tr '\n' ' ')" || return 1
+      echo "runner||${pkgs% }"
+      others="$(_other_modules)" || return 1
+      for m in $others; do
+        pkgs="$(_module_pkgs "$m" | tr '\n' ' ')" || return 1
+        echo "$m||${pkgs% }"
+      done
+      ;;
+    *)
+      echo "ci-test-leg: unknown leg: $1 (known: $LEGS)" >&2
+      return 1
+      ;;
+  esac
+}
+
+cmd_check_partition() {
+  local all claimed leg m args pkgs p bad=0 mlist
+  # One collation for every sort/comm below (comm requires it).
+  export LC_ALL=C
+  if ! mlist="$(_module_list)"; then
+    echo "$NO_MODULES_MSG" >&2
+    exit 1
+  fi
+  local parts mpkgs
+  all=""
+  while IFS= read -r m; do
+    m="${m#./}"
+    mpkgs="$(_module_pkgs "$m")" || exit 1
+    all="$all$(echo "$mpkgs" | sed "s|^|$m |")"$'\n'
+  done <<< "$mlist"
+  all="$(echo "$all" | sed '/^$/d' | sort)"
+  claimed=""
+  for leg in $LEGS; do
+    parts="$(_leg_parts "$leg")" || exit 1
+    while IFS='|' read -r m args pkgs; do
+      for p in $pkgs; do claimed="$claimed$m $p|$args"$'\n'; done
+    done <<< "$parts"
+  done
+  claimed="$(echo "$claimed" | sed '/^$/d' | sort)"
+
+  # Every package is claimed.
+  local missing
+  missing="$(comm -23 <(echo "$all") <(echo "$claimed" | cut -d'|' -f1 | sort -u))"
+  if [ -n "$missing" ]; then
+    echo "ci-test-leg: packages tested by NO leg:" >&2
+    echo "$missing" | sed 's/^/  /' >&2
+    bad=1
+  fi
+  # Nothing is claimed that does not exist (a renamed heavy package).
+  local ghost
+  ghost="$(comm -13 <(echo "$all") <(echo "$claimed" | cut -d'|' -f1 | sort -u))"
+  if [ -n "$ghost" ]; then
+    echo "ci-test-leg: legs name packages that do not exist:" >&2
+    echo "$ghost" | sed 's/^/  /' >&2
+    bad=1
+  fi
+  # A package claimed twice must be exactly the -run X / -skip X pair.
+  local dup
+  dup="$(echo "$claimed" | cut -d'|' -f1 | sort | uniq -d)"
+  local argsets
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    argsets="$(echo "$claimed" | awk -F'|' -v p="$p" '$1 == p { print $2 }' | sort | tr '\n' ';')"
+    if [ "$argsets" != "-run $RUNNER_SPLIT;-skip $RUNNER_SPLIT;" ]; then
+      echo "ci-test-leg: $p is tested by more than one leg with args [$argsets] — only a -run/-skip complement of one regex may share a package" >&2
+      bad=1
+    fi
+  done <<< "$dup"
+  if [ "$bad" -ne 0 ]; then
+    exit 1
+  fi
+  printf 'ci-test-leg: partition OK — %s packages across %s legs\n' \
+    "$(echo "$all" | wc -l | tr -d ' ')" "$(echo "$LEGS" | wc -w | tr -d ' ')"
+}
+
+cmd_run() {
+  local leg="$1" outdir="$2" m args pkgs idx=0 out
+  local failed=()
+  mkdir -p "$outdir"
+  outdir="$(cd "$outdir" && pwd -P)"
+  local parts
+  parts="$(_leg_parts "$leg")" || exit 1
+  _arm_container_lease
+  while IFS='|' read -r m args pkgs; do
+    (( ++idx ))
+    if [ -z "$pkgs" ]; then
+      echo "ci-test-leg: leg $leg part $idx ($m) has no packages — refusing to run go test on the module root alone" >&2
+      exit 1
+    fi
+    out="$outdir/$leg-$idx.out"
+    rm -f "$out"
+    printf '>>> %s [%s] %s %s\n' "$leg" "$m" "$args" "$pkgs"
+    # $args and $pkgs are deliberately unquoted: each is a space-separated word
+    # list built above with no glob characters.
+    # shellcheck disable=SC2086
+    if ! ( cd "$ROOT/$m" && go test -race -p "$TEST_P" -timeout "$TEST_TIMEOUT" \
+        -covermode=atomic -coverprofile="$out" $args $pkgs ); then
+      failed+=("$m ${args:-(all tests)}")
+    fi
+  done <<< "$parts"
+  if [ "${#failed[@]}" -gt 0 ]; then
+    printf 'ci-test-leg: %s of %s parts of leg %s failed:\n' "${#failed[@]}" "$idx" "$leg" >&2
+    local f
+    for f in "${failed[@]}"; do
+      printf '  - %s\n' "$f" >&2
+    done
+    exit 1
+  fi
+}
+
+case "${1:-}" in
+  --list)
+    for leg in $LEGS; do echo "$leg"; done
+    ;;
+  --plan)
+    _leg_parts "${2:?usage: scripts/ci-test-leg --plan <leg>}"
+    ;;
+  --check-partition)
+    cmd_check_partition
+    ;;
+  ""|-h|--help)
+    # The header comment block, from the title line up to `set -euo pipefail`.
+    awk '/^# scripts\/ci-test-leg/{p=1} /^set -euo pipefail/{exit} p' "$0" | sed 's/^# \{0,1\}//'
+    ;;
+  *)
+    cmd_run "$1" "${2:?usage: scripts/ci-test-leg <leg> <profile-dir>}"
+    ;;
+esac

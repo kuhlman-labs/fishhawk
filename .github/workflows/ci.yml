@@ -40,6 +40,12 @@ jobs:
               # fixture-only change must run the Go job — otherwise it merges
               # unvalidated and can red-line main post-merge (#1298/#1301).
               - '**/testdata/**'
+              # The scripts that define the Go gate itself (#3882): a change
+              # to the leg partition, the shared test env, or the coverage
+              # merge must run the gate it changes.
+              - 'scripts/ci-test-leg'
+              - 'scripts/test'
+              - 'scripts/check-coverage.py'
               - '.github/workflows/ci.yml'
             ts:
               - 'frontend/**'
@@ -70,14 +76,13 @@ jobs:
               - '.dockerignore'
               - '.github/workflows/ci.yml'
 
-  # The Go gate is split into two PARALLEL jobs (go-lint, go-test) rather
-  # than one serial job. Lint (~2 min) and test+coverage (~4 min) previously
-  # ran back-to-back on one runner (~6.5 min); as concurrent jobs the Go
-  # critical path is max(lint, test) instead of their sum. Both share the
-  # setup-go build/module cache via the GHA cache backend, so the second job
-  # to start reads a warm cache. Both gate on `detect` and the same
-  # `go == 'true'` filter, and both are listed in `ci-pass.needs` so the
-  # required rollup inherits both results.
+  # The Go gate runs as PARALLEL jobs: go-lint (~2.5 min), a go-test matrix
+  # of test legs, and go-coverage, which merges the legs' profiles and
+  # applies the 80% aggregate gate. Before #3882 the tests ran as one serial
+  # `scripts/test coverage` loop over every module (~15-20 min); split into
+  # legs the critical path is the slowest leg plus the merge. All gate on
+  # `detect` and the same `go == 'true'` filter, and all are listed in
+  # `ci-pass.needs` so the required rollup inherits every result.
   go-lint:
     name: Go (lint)
     needs: detect
@@ -94,6 +99,11 @@ jobs:
           # ServeMux). Bumping conservatively to the major version line.
           go-version: '1.25'
           cache: true
+          # There is no root go.mod (multi-module go.work), and setup-go's
+          # default dependency file is ./go.mod — so without this every run
+          # logged "Restore cache failed: Dependencies file is not found" and
+          # started cold (#3882).
+          cache-dependency-path: '**/go.sum'
 
       - name: Detect registered modules
         id: have-modules
@@ -164,9 +174,67 @@ jobs:
         # `scripts/test verify` gate already relies on.
         run: scripts/test lint
 
+  # Test legs (#3882). scripts/ci-test-leg owns the partition: every package
+  # of every go.work module lands in exactly one leg by construction (new
+  # packages and modules need no edit), runner/cmd/fishhawk-runner is split
+  # across two legs by `-run ^TestRun` / `-skip ^TestRun`, and every leg runs
+  # in scripts/test's environment (sourced lib-only) — the
+  # TESTCONTAINERS_RYUK_DISABLED / GIT_CONFIG_* pins and the
+  # fishhawk-test-postgres lease + reap that #1413 routed CI through
+  # scripts/test for. The `leg` list below must match
+  # `scripts/ci-test-leg --list`; go-coverage fails if a leg's profiles are
+  # missing, so a leg added to the script but not here cannot drop silently.
   go-test:
-    name: Go (test + coverage)
+    name: Go (test ${{ matrix.leg }})
     needs: detect
+    if: ${{ needs.detect.outputs.go == 'true' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        leg: [backend-heavy, backend-rest, runner-main-a, runner-main-b, rest]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.25'
+          # Cached explicitly below, per leg: each leg compiles a different
+          # package set, so one shared setup-go key would save only whichever
+          # leg finished first.
+          cache: false
+
+      # Module + build cache per leg, keyed on go.sum. The race/cover build of
+      # third-party deps (pgx, the AWS SDK, testcontainers, ...) is the bulk
+      # of a cold compile and only changes with go.sum; our own packages
+      # recompile from source either way. Saved once per (leg, go.sum).
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-test-${{ runner.os }}-${{ matrix.leg }}-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            go-test-${{ runner.os }}-${{ matrix.leg }}-
+
+      - name: Test leg ${{ matrix.leg }}
+        run: scripts/ci-test-leg "${{ matrix.leg }}" coverage-profiles
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: go-coverage-${{ matrix.leg }}
+          path: coverage-profiles/*.out
+          if-no-files-found: error
+          retention-days: 1
+
+  # Merge every leg's profiles and apply the aggregate gate (≥ 80%, excl.
+  # sqlc-generated `/db/` packages — identical to the old
+  # `scripts/test coverage`). check-coverage.py merges blocks that recur
+  # across profiles (#3881), so the two fishhawk-runner halves count each
+  # statement once. Targets: ARCHITECTURE §9.
+  go-coverage:
+    name: Go (coverage gate)
+    needs: [detect, go-test]
     if: ${{ needs.detect.outputs.go == 'true' }}
     runs-on: ubuntu-latest
     steps:
@@ -176,37 +244,33 @@ jobs:
         with:
           go-version: '1.25'
           cache: true
+          cache-dependency-path: '**/go.sum'
 
-      - name: Detect registered modules
-        id: have-modules
+      # The partition proof: every package of every go.work module is tested
+      # by exactly one leg (or by the -run/-skip complement pair). It runs
+      # here, against the same tree, so the gate below is only trusted when
+      # the legs it merges provably covered everything.
+      - name: Check the leg partition
+        run: scripts/ci-test-leg --check-partition
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: go-coverage-*
+          path: coverage-profiles
+
+      - name: Every leg delivered profiles
         run: |
-          if [ -f go.work ] && grep -q '^use ' go.work; then
-            echo "yes=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "yes=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::No Go modules registered in go.work yet. Skipping test."
-          fi
+          missing=0
+          for leg in $(scripts/ci-test-leg --list); do
+            if ! ls coverage-profiles/go-coverage-"$leg"/*.out >/dev/null 2>&1; then
+              echo "::error::No coverage profiles from leg $leg — is it missing from the go-test matrix?"
+              missing=1
+            fi
+          done
+          exit "$missing"
 
-      # Route the Go gate through scripts/test instead of an inline `go test`
-      # loop so CI runs the suite in the SAME tuned environment as the local
-      # and runner gates (#1413, the #1402 testcontainer flake). The inline
-      # loop bypassed scripts/test entirely, so in CI the testcontainers ryuk
-      # reaper stayed ENABLED — a shared single-point-of-failure container that
-      # times out under daemon load and cascades one flake into a whole-suite
-      # red (#972) — and the shared fishhawk-test-postgres container (#1174)
-      # was never reaped, so stale named containers accumulated across runs
-      # (the `No such container` stale-reuse symptom). scripts/test exports
-      # TESTCONTAINERS_RYUK_DISABLED=true and reaps fishhawk-test-postgres in
-      # an EXIT trap, so both causes are removed at the source.
-      - name: Test + coverage threshold (≥ 80% aggregate, excl. sqlc-generated)
-        if: steps.have-modules.outputs.yes == 'true'
-        # `scripts/test coverage` writes the per-module coverage.out profiles
-        # and runs scripts/check-coverage.py --threshold 80 --exclude '/db/'
-        # itself — identical to the gate this replaces (the /db/ exclude drops
-        # sqlc-generated packages; new ones auto-skip). Targets: ARCHITECTURE
-        # §9. Lower test-binary parallelism on a constrained daemon with
-        # FISHHAWK_TEST_P (default 4, #1174).
-        run: scripts/test coverage
+      - name: Coverage threshold (≥ 80% aggregate, excl. sqlc-generated)
+        run: python3 scripts/check-coverage.py --threshold 80 --exclude '/db/' coverage-profiles/*/*.out
 
   ts:
     name: TypeScript (lint + build + test)
@@ -308,7 +372,7 @@ jobs:
   # touching the ruleset.
   ci-pass:
     name: CI Pass
-    needs: [detect, go-lint, go-test, ts, openapi, docker-build]
+    needs: [detect, go-lint, go-test, go-coverage, ts, openapi, docker-build]
     if: always()
     runs-on: ubuntu-latest
     steps:

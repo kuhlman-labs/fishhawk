@@ -457,8 +457,8 @@ skip-snapshot with zero profiles still skips.
 
 ## Per-module coverage aggregation ([#3403](https://github.com/kuhlman-labs/fishhawk/issues/3403))
 
-`cmd_coverage` (the body of `scripts/test coverage`, which is what
-`.github/workflows/ci.yml`'s coverage step runs) runs **every** `go.work`
+`cmd_coverage` (the body of `scripts/test coverage`; CI ran it until #3882
+split the suite into [`scripts/ci-test-leg`](#ci-test-legs-3882) legs) runs **every** `go.work`
 module and reports on all of them. It used to run its per-module
 `(cd "$m" && go test … -coverprofile=coverage.out …)` subshell as an
 UNTESTED command under the script's `set -e`, so the first non-zero module
@@ -538,6 +538,55 @@ stale-profile negative argv assertion, k2 build-vs-test classification, k2d
 the no-tee mktemp degrade, k3 the all-green control, k4 the zero-profile
 guard, k5 both module-list fail-closed inputs, k6/k7 a failing aggregate
 gate with and without a module failure, and k8 the static shape.
+
+## CI test legs ([#3882](https://github.com/kuhlman-labs/fishhawk/issues/3882))
+
+`scripts/ci-test-leg` is the partition behind CI's `go-test` matrix. CI used
+to run `scripts/test coverage` (every module, serially, on one 4-vCPU runner,
+~15-20 min); it now runs five legs in parallel and a `go-coverage` job merges
+their profiles and applies the same `--threshold 80 --exclude '/db/'` gate.
+
+| Leg | Tests |
+|---|---|
+| `backend-heavy` | `backend/internal/{mcpserver,server,postgres,integration/mcp}` |
+| `backend-rest` | every other `backend` package |
+| `runner-main-a` | `runner/cmd/fishhawk-runner`, `-run '^TestRun'` |
+| `runner-main-b` | `runner/cmd/fishhawk-runner`, `-skip '^TestRun'` |
+| `rest` | every other `runner` package + every other `go.work` module |
+
+**Complete by construction.** `backend-rest` and `rest` are COMPUTED from
+`go list` / `go.work` minus the fixed parts, so a new package or a new module
+lands in a leg with no edit. `-run X` / `-skip X` of one regex are exact
+complements, so the two `fishhawk-runner` halves never drop or double-run a
+top-level test; their shared blocks are merged by `check-coverage.py`
+([#3881](#merging-overlapping-profiles-3881)), so the denominator counts each
+statement once. `^TestRun` was picked from measured per-test times (~52/48).
+
+**Proven, not assumed.** `--check-partition` fails closed when a package is
+tested by no leg, a leg names a package that does not exist, or a package is
+claimed twice by anything other than that `-run`/`-skip` pair; `go-coverage`
+runs it before the gate, and also fails when a leg in `--list` delivered no
+profiles (a leg added to the script but not to the YAML matrix). Each failure
+branch was reddened by mutation when the script landed.
+
+**Same environment as `scripts/test`.** The script sources `scripts/test`
+lib-only (`FISHHAWK_TEST_LIB_ONLY=1`), so every leg gets the `GIT_CONFIG_*`
+pins, `TESTCONTAINERS_RYUK_DISABLED`, the `fishhawk-test-postgres` lease and
+reap, `-race`, `-p "$TEST_P"` and `-timeout "$TEST_TIMEOUT"`. Like
+`cmd_coverage` (#3403), a failing part does not stop its leg: every part runs
+and the leg exits 1 naming each failed part. A part whose package list came
+back empty is refused rather than run (`go test` with no packages would test
+only the module root).
+
+```sh
+scripts/ci-test-leg --list                 # the matrix
+scripts/ci-test-leg --plan backend-rest    # the go test parts of one leg
+scripts/ci-test-leg --check-partition      # the proof
+scripts/ci-test-leg rest /tmp/profiles     # run one leg locally
+```
+
+Rebalancing is a one-line change to `HEAVY_BACKEND` or `RUNNER_SPLIT`, plus the
+YAML matrix only when a leg is added or removed.
 
 ## Scoped verify + the per-repository verify lock (E68.39 / [#3315](https://github.com/kuhlman-labs/fishhawk/issues/3315))
 
