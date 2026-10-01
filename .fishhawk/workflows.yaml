@@ -253,7 +253,7 @@ workflows:
         reviewers:
           agents:
             - provider: claudecode
-              model: claude-fable-5
+              model: claude-fable-5-1
             - provider: codex
               model: gpt-6-astra
               reasoning_effort: high
@@ -332,7 +332,7 @@ workflows:
         reviewers:
           agents:
             - provider: claudecode
-              model: claude-fable-5
+              model: claude-fable-5-1
             - provider: codex
               model: gpt-6-astra
               reasoning_effort: high

@@ -21,7 +21,7 @@ import "strings"
 // AsOf is the date the price table was last reconciled against
 // published vendor pricing. Surfaced alongside any rolled cost so
 // consumers can label the figure as an estimate of a known vintage.
-const AsOf = "2026-09-06"
+const AsOf = "2026-10-01"
 
 // rate is the per-token price for a single model family, in US
 // dollars. Vendors publish per-million-token prices; we store the
@@ -76,22 +76,32 @@ func perMillionCache(input, output, cacheRead, cacheWrite float64) rate {
 // Prices are published vendor list prices as of AsOf, in $/1M-tokens
 // (input / output / cache-read / cache-write):
 //
-//	Opus          5   / 25 / 0.5  / 6.25   (Anthropic, non-fast tier)
-//	Fable         10  / 50 / 1.0  / 12.5   (Anthropic, premium tier)
-//	Sonnet        3   / 15 / 0.3  / 3.75   (Anthropic)
+//	Opus          5   / 25 / 0.5  / 6.25   (Anthropic 4.x + Opus 5, non-fast tier)
+//	Opus 5.5      4   / 20 / 0.2  / 5      (Anthropic, non-fast tier)
+//	Fable         10  / 50 / 1.0  / 12.5   (Anthropic Fable 5, premium tier)
+//	Fable 5.1     10  / 50 / 0.25 / 12.5   (Anthropic, premium tier)
+//	Mythos 5      10  / 50 / 1.0  / 12.5   (Anthropic, Project Glasswing)
+//	Mythos 5.1    10  / 50 / 0.25 / 12.5   (Anthropic, Project Glasswing)
+//	Sonnet        3   / 15 / 0.3  / 3.75   (Anthropic Sonnet 4.x)
+//	Sonnet 5      2   / 10 / 0.2  / 2.5    (Anthropic Sonnet 5 + 5.5)
 //	Haiku         1   / 5  / 0.1  / 1.25   (Anthropic)
 //	gpt-5.5       5   / 30 / 0.5  / 5      (OpenAI standard short-context)
-//	gpt-5.6-sol   5   / 30 / 0.5  / 6.25   (OpenAI 5.6 flagship)
-//	gpt-5.6-terra 2.5 / 15 / 0.25 / 3.125  (OpenAI 5.6 balanced)
-//	gpt-5.6-luna  1   / 6  / 0.1  / 1.25   (OpenAI 5.6 cost-optimized)
-//	gpt-6-astra   10  / 50 / 1.0  / 12.5   (OpenAI 6 flagship)
+//	gpt-5.6-sol   4   / 20  / 0.4  / 5      (OpenAI 5.6 flagship; promo price "through at least 2026-11-21")
+//	gpt-5.6-terra 2   / 12  / 0.2  / 2.5    (OpenAI 5.6 balanced)
+//	gpt-5.6-luna  0.2 / 1.2 / 0.02 / 0.25   (OpenAI 5.6 cost-optimized)
+//	gpt-6-astra   10  / 50  / 1.0  / 12.5   (OpenAI 6 flagship)
+//	gpt-6.1-sol   2   / 10  / 0.1  / 2.5    (OpenAI 6.1 near-flagship)
+//	gpt-6-sol     2   / 10  / 0.2  / 2.5    (OpenAI 6, superseded by 6.1-sol)
+//	gpt-6-luna    0.1 / 0.5 / 0.01 / 0.125  (OpenAI 6 cost-optimized)
 //
 // The Anthropic cache rates are the 5-minute-TTL baseline (#1343):
 // cache READ = 0.1x the family input rate, cache WRITE = 1.25x the
 // family input rate — verified against the Anthropic prompt-caching
 // pricing (the 1-hour-TTL 2x write tier is intentionally out of scope
 // this slice). Fable follows the same convention at the premium tier
-// ($10/1M input → 1.0 read / 12.5 write). The OpenAI cache READ is the
+// ($10/1M input → 1.0 read / 12.5 write). Exceptions to the 0.1x READ
+// rule: Fable 5.1 / Mythos 5.1 read at 0.025x ($0.25/1M) and Opus 5.5 at
+// 0.05x ($0.20/1M); their WRITE stays 1.25x input. The OpenAI cache READ is the
 // published 90%-cached-input discount (0.1x input). gpt-5.5's cache
 // WRITE is set to the input rate because that model charges no separate
 // cache-write premium; the entire gpt-5.6 family (Sol / Terra / Luna)
@@ -101,19 +111,28 @@ func perMillionCache(input, output, cacheRead, cacheWrite float64) rate {
 // discount ($1/1M against $10/1M input) and its cache WRITE the 1.25x
 // premium ($12.50/1M). Either way the codex adapter maps cache writes
 // to 0, so every gpt cacheWrite rate is effectively unexercised in the
-// reviewer path. Note gpt-5.6-sol's headline input/output ($5/$30)
-// matches gpt-5.5 but its cache WRITE differs (6.25 vs 5) because 5.6
-// added the write premium.
+// reviewer path. The gpt-6 Sol / Luna tiers follow the same 0.1x read /
+// 1.25x write convention, except gpt-6.1-sol, which reads at 0.05x
+// ($0.10/1M against $2/1M input). The gpt-5.6 tiers were repriced after
+// launch (Terra and Luna on 2026-07-30, Sol on 2026-08-21 — Sol's cut is
+// promotional, so re-check it after 2026-11-21).
 //
 // Family-key convention: Anthropic keys are the tier stem (claude-opus,
-// claude-fable) so every dated point release inherits the tier price.
+// claude-fable) so every dated point release inherits the tier price; a
+// release that REPRICES within its tier gets a longer, version-specific
+// key (claude-opus-5-5, claude-fable-5-1, claude-sonnet-5) that wins the
+// longest-prefix lookup. claude-sonnet-5 deliberately covers both Sonnet 5
+// and Sonnet 5.5 (same price); claude-opus-5 needs no key of its own
+// because it keeps the stem's 5/25 price.
 // OpenAI's gpt-5.6 splits into distinctly-priced tiers, so each is keyed
 // by its full tier id (gpt-5.6-sol / gpt-5.6-terra / gpt-5.6-luna) — a
-// bare gpt-5.6 would mis-price the other two. gpt-6-astra is the OpenAI
+// bare gpt-5.6 would mis-price the other two; the gpt-6 tiers are keyed
+// the same way (gpt-6-sol / gpt-6.1-sol / gpt-6-luna). gpt-6-astra is the OpenAI
 // model dispatched today (.fishhawk/workflows.yaml pins it at both codex
 // reviewer sites since #3234); the whole gpt-5.6 tier set (Sol / Terra /
-// Luna) and gpt-5.5 are retained as future-swap insurance so a model
-// swap back can't silently record $0.
+// Luna), the gpt-6 Sol / Luna tiers and gpt-5.5 (retiring 2026-10-14) are
+// retained as future-swap insurance so a model swap can't silently record
+// $0.
 //
 // LONG-CONTEXT SURCHARGE — stated, NOT implemented. GPT-6 Astra bills
 // any request whose input exceeds 272K tokens at 2x the input and cache
@@ -129,15 +148,23 @@ func perMillionCache(input, output, cacheRead, cacheWrite float64) rate {
 // report — an invocation-wide aggregate spanning several turns cannot
 // decide the per-request threshold.
 var familyRates = map[string]rate{
-	"claude-opus":   perMillionCache(5, 25, 0.5, 6.25),
-	"claude-fable":  perMillionCache(10, 50, 1, 12.5),
-	"claude-sonnet": perMillionCache(3, 15, 0.3, 3.75),
-	"claude-haiku":  perMillionCache(1, 5, 0.1, 1.25),
-	"gpt-5.5":       perMillionCache(5, 30, 0.5, 5),
-	"gpt-5.6-sol":   perMillionCache(5, 30, 0.5, 6.25),
-	"gpt-5.6-terra": perMillionCache(2.5, 15, 0.25, 3.125),
-	"gpt-5.6-luna":  perMillionCache(1, 6, 0.1, 1.25),
-	"gpt-6-astra":   perMillionCache(10, 50, 1, 12.5),
+	"claude-opus":       perMillionCache(5, 25, 0.5, 6.25),
+	"claude-opus-5-5":   perMillionCache(4, 20, 0.2, 5),
+	"claude-fable":      perMillionCache(10, 50, 1, 12.5),
+	"claude-fable-5-1":  perMillionCache(10, 50, 0.25, 12.5),
+	"claude-mythos-5":   perMillionCache(10, 50, 1, 12.5),
+	"claude-mythos-5-1": perMillionCache(10, 50, 0.25, 12.5),
+	"claude-sonnet":     perMillionCache(3, 15, 0.3, 3.75),
+	"claude-sonnet-5":   perMillionCache(2, 10, 0.2, 2.5),
+	"claude-haiku":      perMillionCache(1, 5, 0.1, 1.25),
+	"gpt-5.5":           perMillionCache(5, 30, 0.5, 5),
+	"gpt-5.6-sol":       perMillionCache(4, 20, 0.4, 5),
+	"gpt-5.6-terra":     perMillionCache(2, 12, 0.2, 2.5),
+	"gpt-5.6-luna":      perMillionCache(0.2, 1.2, 0.02, 0.25),
+	"gpt-6-astra":       perMillionCache(10, 50, 1, 12.5),
+	"gpt-6-sol":         perMillionCache(2, 10, 0.2, 2.5),
+	"gpt-6.1-sol":       perMillionCache(2, 10, 0.1, 2.5),
+	"gpt-6-luna":        perMillionCache(0.1, 0.5, 0.01, 0.125),
 }
 
 // Cost returns the estimated US-dollar cost of an invocation that

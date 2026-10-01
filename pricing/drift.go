@@ -69,15 +69,23 @@ const (
 // long-context surcharge tier, so a vendor changing only gpt-6-astra's
 // over-272K multipliers is invisible to this check.
 var familyToLiteLLM = map[string]string{
-	"claude-opus":   "claude-opus-4-7",
-	"claude-fable":  "claude-fable-5",
-	"claude-sonnet": "claude-sonnet-4-6",
-	"claude-haiku":  "claude-haiku-4-5",
-	"gpt-5.5":       "gpt-5.5",
-	"gpt-5.6-sol":   "gpt-5.6-sol",
-	"gpt-5.6-terra": "gpt-5.6-terra",
-	"gpt-5.6-luna":  "gpt-5.6-luna",
-	"gpt-6-astra":   "gpt-6-astra",
+	"claude-opus":       "claude-opus-5",
+	"claude-opus-5-5":   "claude-opus-5-5",
+	"claude-fable":      "claude-fable-5",
+	"claude-fable-5-1":  "claude-fable-5-1",
+	"claude-mythos-5":   "claude-mythos-5",
+	"claude-mythos-5-1": "claude-mythos-5-1",
+	"claude-sonnet":     "claude-sonnet-4-6",
+	"claude-sonnet-5":   "claude-sonnet-5-5",
+	"claude-haiku":      "claude-haiku-4-5",
+	"gpt-5.5":           "gpt-5.5",
+	"gpt-5.6-sol":       "gpt-5.6-sol",
+	"gpt-5.6-terra":     "gpt-5.6-terra",
+	"gpt-5.6-luna":      "gpt-5.6-luna",
+	"gpt-6-astra":       "gpt-6-astra",
+	"gpt-6-sol":         "gpt-6-sol",
+	"gpt-6.1-sol":       "gpt-6.1-sol",
+	"gpt-6-luna":        "gpt-6-luna",
 }
 
 // DriftFinding is one priced-field comparison between our table and LiteLLM.
