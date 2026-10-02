@@ -141,6 +141,23 @@ type Concern struct {
 	// concern — it falls open to the normal insert so a real regression is
 	// never discarded. omitempty keeps pre-#1913 verdicts byte-identical.
 	NewEvidence string `json:"new_evidence,omitempty"`
+
+	// Convention names the repository review convention (E55.3 / #2244) a
+	// RepoConventionConcernCategory concern was derived from. It is
+	// REVIEWER-EMITTABLE (registered in VerdictSchema()) and is the key
+	// ClampConventionSeverities looks the convention's severity_cap up by; an
+	// empty or unknown name fails closed to the most restrictive rendered cap.
+	// omitempty keeps every convention-free verdict byte-identical, and an old
+	// stored concern decodes with an empty value.
+	Convention string `json:"convention,omitempty"`
+
+	// SeverityClampedFrom is a SERVER-INTERNAL marker recording the severity a
+	// reviewer originally assigned before ClampConventionSeverities lowered it
+	// to a convention's severity_cap (E55.3 / #2244). It is stamped ONLY by
+	// the clamp and is deliberately absent from VerdictSchema(), so a
+	// schema-constrained reviewer cannot emit it. omitempty keeps every
+	// unclamped concern byte-identical.
+	SeverityClampedFrom ConcernSeverity `json:"severity_clamped_from,omitempty"`
 }
 
 // ConcernProvenanceAcceptance marks a Concern synthesized from the acceptance
@@ -149,6 +166,280 @@ type Concern struct {
 // rendered by the implement fix-up prompt through the untrusted-comment
 // quarantine envelope rather than as trusted binding fix-up text (#1613).
 const ConcernProvenanceAcceptance = "acceptance"
+
+// Review-convention concern categories (E55.3 / #2244). They are reviewer
+// CONCERN categories carried inside plan_reviewed / implement_reviewed verdict
+// payloads — not audit categories. The *ConcernCategory name suffix is
+// load-bearing: it is what exempts these bindings from the audit-category
+// registry sweep (backend/internal/audit TestKnownCategoriesCoversEmittedCategories).
+const (
+	// RepoConventionConcernCategory marks a concern derived from a repository
+	// review convention rendered into the review prompt. Its severity is
+	// bounded by that convention's severity_cap at ingest
+	// (ClampConventionSeverities), keyed by Concern.Convention.
+	RepoConventionConcernCategory = "repo_convention"
+
+	// ConventionsOverrideAttemptConcernCategory marks a reviewer report that a
+	// conventions file tried to remove, weaken, reorder or override a standard
+	// review criterion. It reports an instruction in a file read at the run's
+	// pinned base — not a defect in the change — so the fix-up surface refuses
+	// to route it (backend/internal/server/fixup.go).
+	ConventionsOverrideAttemptConcernCategory = "conventions_override_attempt"
+
+	// ConventionsFileModifiedConcernCategory marks a change that edits a
+	// declared conventions file. The implement-review site synthesizes exactly
+	// one per round when no reviewer raised it
+	// (AddSynthesizedConventionsFileModifiedConcern).
+	ConventionsFileModifiedConcernCategory = "conventions_file_modified"
+)
+
+// conventionCategory reports which review-convention category a concern's
+// free-text category names, matched on its trimmed, lower-cased form so a
+// cosmetic variant ("Repo_Convention ", "REPO_CONVENTION") cannot slip past the
+// clamp. It returns "" for every other category.
+func conventionCategory(category string) string {
+	switch c := strings.ToLower(strings.TrimSpace(category)); c {
+	case RepoConventionConcernCategory,
+		ConventionsOverrideAttemptConcernCategory,
+		ConventionsFileModifiedConcernCategory:
+		return c
+	}
+	return ""
+}
+
+// IsConventionsOverrideAttempt reports whether a concern category names
+// ConventionsOverrideAttemptConcernCategory, using the same normalized match the
+// clamp applies. The fix-up surface consults it to refuse routing such a
+// concern as a code obligation.
+func IsConventionsOverrideAttempt(category string) bool {
+	return conventionCategory(category) == ConventionsOverrideAttemptConcernCategory
+}
+
+// ConventionCaps is the set of review conventions RENDERED into one review
+// round's prompt, keyed by convention name, each mapped to its declared
+// severity_cap ("" = uncapped; spec.ReviewConventionSeverityCapLow /
+// spec.ReviewConventionSeverityCapMedium otherwise). The key set IS the
+// rendered-name set: a name absent from the map was not rendered. A nil or
+// empty ConventionCaps means ZERO conventions were rendered for the round,
+// which ClampConventionSeverities treats as the most restrictive case of all
+// (every convention-category concern clamps to low).
+type ConventionCaps map[string]ConcernSeverity
+
+// severityRank orders severities for the clamp: low < medium < high. An
+// unknown or empty CONCERN severity ranks as high so it is lowered whenever a
+// cap applies (fail closed); capRank handles the cap side separately.
+func severityRank(s ConcernSeverity) int {
+	switch s {
+	case SeverityLow:
+		return 1
+	case SeverityMedium:
+		return 2
+	default:
+		return 3
+	}
+}
+
+// capRank orders a declared severity_cap: "" (uncapped) ranks as high (no
+// bound); low/medium/high rank as themselves; any other value is not a member
+// of the closed cap set and fails closed to low.
+func capRank(c ConcernSeverity) int {
+	switch c {
+	case "", SeverityHigh:
+		return 3
+	case SeverityMedium:
+		return 2
+	default:
+		return 1
+	}
+}
+
+// rankSeverity maps a rank back to its severity.
+func rankSeverity(r int) ConcernSeverity {
+	switch r {
+	case 1:
+		return SeverityLow
+	case 2:
+		return SeverityMedium
+	default:
+		return SeverityHigh
+	}
+}
+
+// ClampedConcern records one concern ClampConventionSeverities lowered, so the
+// ingest site can WARN-log each clamp with the run id and category.
+type ClampedConcern struct {
+	// Index is the concern's position in ReviewVerdict.Concerns.
+	Index int
+	// Category is the concern's normalized review-convention category.
+	Category string
+	// Convention is the concern's (trimmed) Convention name, possibly empty.
+	Convention string
+	// From / To are the reviewer-assigned and clamped severities.
+	From, To ConcernSeverity
+	// NoConventionsRendered is true when the clamp fired because ZERO
+	// conventions were rendered for the round (approval condition 2 of #2244).
+	NoConventionsRendered bool
+}
+
+// ClampResult is what ClampConventionSeverities changed.
+type ClampResult struct {
+	// Clamped lists every lowered concern, in concern order.
+	Clamped []ClampedConcern
+	// VerdictClampedFrom is VerdictReject when the clamp downgraded a reject
+	// to approve_with_concerns, "" otherwise. It is the value the ingest site
+	// stamps on the payload's verdict_clamped_from.
+	VerdictClampedFrom Verdict
+}
+
+// ClampConventionSeverities enforces review-convention severity caps on a
+// reviewer verdict at INGEST (E55.3 / #2244), mutating v in place (its Concerns
+// slice is copied before the first write, so a caller-shared backing array is
+// never written). It is the server-side half of the convention contract: the
+// prompt tells the reviewer the caps, this makes them hold whatever the model
+// emits.
+//
+// Per concern, matched on the normalized category:
+//
+//   - caps EMPTY (zero conventions rendered for the round): a repo_convention,
+//     conventions_override_attempt or conventions_file_modified concern clamps
+//     to low — no rendered convention can justify any weight, so the most
+//     restrictive cap applies. It is never left unclamped.
+//   - caps non-empty, repo_convention: the cap is caps[Convention] when that
+//     name was rendered, else (empty or unknown name) the MOST restrictive
+//     rendered cap — fail closed rather than letting a mislabelled finding
+//     escape its cap.
+//   - caps non-empty, any other category (including override-attempt and
+//     file-modified): untouched.
+//
+// A concern whose severity exceeds its cap is lowered to the cap and stamped
+// SeverityClampedFrom with the original severity. A REJECT verdict is
+// downgraded to approve_with_concerns only when at least one concern was
+// lowered FROM high and no high concern remains — a reject resting on an
+// unclamped high, or on no high at all, stands. The clamp is idempotent: a
+// second call over its own output lowers nothing.
+//
+// The synthesized conventions_file_modified concern is server-authored, not a
+// reviewer emission: callers MUST clamp BEFORE calling
+// AddSynthesizedConventionsFileModifiedConcern so the empty-caps rule never
+// lowers it.
+func ClampConventionSeverities(v *ReviewVerdict, caps ConventionCaps) ClampResult {
+	var res ClampResult
+	if v == nil || len(v.Concerns) == 0 {
+		return res
+	}
+	noneRendered := len(caps) == 0
+	// The most restrictive rendered cap — the fail-closed bound for a
+	// repo_convention concern naming no (or an unrendered) convention.
+	mostRestrictive := 3
+	for _, c := range caps {
+		if r := capRank(c); r < mostRestrictive {
+			mostRestrictive = r
+		}
+	}
+
+	copied := false
+	loweredFromHigh := false
+	for i, c := range v.Concerns {
+		cat := conventionCategory(c.Category)
+		if cat == "" {
+			continue
+		}
+		name := strings.TrimSpace(c.Convention)
+		var bound int
+		switch {
+		case noneRendered:
+			bound = 1
+		case cat != RepoConventionConcernCategory:
+			continue
+		default:
+			if capSev, ok := caps[name]; ok && name != "" {
+				bound = capRank(capSev)
+			} else {
+				bound = mostRestrictive
+			}
+		}
+		if severityRank(c.Severity) <= bound {
+			continue
+		}
+		if !copied {
+			v.Concerns = append([]Concern(nil), v.Concerns...)
+			copied = true
+		}
+		to := rankSeverity(bound)
+		if c.Severity == SeverityHigh {
+			loweredFromHigh = true
+		}
+		v.Concerns[i].SeverityClampedFrom = c.Severity
+		v.Concerns[i].Severity = to
+		res.Clamped = append(res.Clamped, ClampedConcern{
+			Index:                 i,
+			Category:              cat,
+			Convention:            name,
+			From:                  c.Severity,
+			To:                    to,
+			NoConventionsRendered: noneRendered,
+		})
+	}
+
+	if v.Verdict == VerdictReject && loweredFromHigh {
+		for _, c := range v.Concerns {
+			if c.Severity == SeverityHigh {
+				return res
+			}
+		}
+		v.Verdict = VerdictApproveWithConcerns
+		res.VerdictClampedFrom = VerdictReject
+	}
+	return res
+}
+
+// AddSynthesizedConventionsFileModifiedConcern appends the ONE server-authored
+// conventions_file_modified concern a review round carries when the reviewed
+// diff modifies a declared conventions file and no reviewer of the round raised
+// it (E55.3 / #2244). The concern is medium and names every (deduplicated,
+// non-blank) path in order. When v's verdict is a plain approve it is raised to
+// approve_with_concerns — an approve cannot carry an open concern — and the
+// function returns VerdictApprove as the raisedFrom value the caller stamps on
+// verdict_raised_from; approve_with_concerns and reject keep their verdict and
+// return "". A nil verdict or a path list with no non-blank entry is a no-op
+// returning "" (there is nothing to name). v.Concerns is copied before the
+// append so a caller-shared backing array is never written.
+//
+// Call it AFTER ClampConventionSeverities: the clamp's empty-caps rule targets
+// reviewer emissions and would otherwise lower this server-authored concern.
+func AddSynthesizedConventionsFileModifiedConcern(v *ReviewVerdict, paths []string) (raisedFrom Verdict) {
+	if v == nil {
+		return ""
+	}
+	seen := make(map[string]bool, len(paths))
+	named := make([]string, 0, len(paths))
+	for _, p := range paths {
+		p = strings.TrimSpace(p)
+		if p == "" || seen[p] {
+			continue
+		}
+		seen[p] = true
+		named = append(named, p)
+	}
+	if len(named) == 0 {
+		return ""
+	}
+	concerns := make([]Concern, 0, len(v.Concerns)+1)
+	concerns = append(concerns, v.Concerns...)
+	concerns = append(concerns, Concern{
+		Severity: SeverityMedium,
+		Category: ConventionsFileModifiedConcernCategory,
+		Note: "This change modifies a repository review-conventions file declared in the workflow spec: " +
+			strings.Join(named, ", ") +
+			". A conventions file changes the review criteria applied to later runs, so a human must confirm the edit is intended before merge.",
+	})
+	v.Concerns = concerns
+	if v.Verdict == VerdictApprove {
+		v.Verdict = VerdictApproveWithConcerns
+		return VerdictApprove
+	}
+	return ""
+}
 
 // Usage is the token usage a reviewer backend reports for one review
 // invocation (#681). It is captured at the reviewer CONTRACT boundary so
@@ -624,6 +915,13 @@ type PlanReviewedPayload struct {
 	// produced this verdict. Empty for a standard reviewer; omitempty keeps
 	// every standard-reviewer payload byte-identical to pre-#3753 entries.
 	Persona string `json:"persona,omitempty"`
+
+	// VerdictClampedFrom records that the ingest-time review-convention clamp
+	// (ClampConventionSeverities, E55.3 / #2244) downgraded the reviewer's
+	// verdict: it holds the ORIGINAL verdict (reject) while Verdict holds the
+	// clamped one (approve_with_concerns). omitempty keeps every unclamped
+	// payload byte-identical, and an old stored payload decodes "".
+	VerdictClampedFrom Verdict `json:"verdict_clamped_from,omitempty"`
 }
 
 // ImplementReviewedPayload is the JSON payload stored in an audit entry
@@ -725,6 +1023,26 @@ type ImplementReviewedPayload struct {
 	// produced this verdict. Empty for a standard reviewer; omitempty keeps
 	// every standard-reviewer payload byte-identical to pre-#3753 entries.
 	Persona string `json:"persona,omitempty"`
+
+	// VerdictClampedFrom records that the ingest-time review-convention clamp
+	// (ClampConventionSeverities, E55.3 / #2244) downgraded the reviewer's
+	// verdict: it holds the ORIGINAL verdict (reject) while Verdict holds the
+	// clamped one (approve_with_concerns). omitempty keeps every unclamped
+	// payload byte-identical, and an old stored payload decodes "".
+	VerdictClampedFrom Verdict `json:"verdict_clamped_from,omitempty"`
+
+	// VerdictRaisedFrom records that the once-per-round conventions_file_modified
+	// synthesis (AddSynthesizedConventionsFileModifiedConcern, E55.3 / #2244)
+	// raised a plain approve to approve_with_concerns: it holds the ORIGINAL
+	// verdict (approve). omitempty keeps every other payload byte-identical.
+	VerdictRaisedFrom Verdict `json:"verdict_raised_from,omitempty"`
+
+	// ConventionsFileModifiedSynthesized marks the ONE verdict of a round that
+	// carries the server-synthesized conventions_file_modified concern (E55.3 /
+	// #2244), distinguishing it from a reviewer-raised one. omitempty keeps
+	// every other payload byte-identical, and an old stored payload decodes
+	// false.
+	ConventionsFileModifiedSynthesized bool `json:"conventions_file_modified_synthesized,omitempty"`
 }
 
 // OriginBaseRebaseReinvoke is the ImplementReviewedPayload.Origin marker

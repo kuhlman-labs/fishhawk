@@ -378,3 +378,70 @@ so a reviewer can confirm diff-invisible facts. Long-form contract:
 |---|---|---|
 | `FISHHAWKD_REVIEW_GROUNDING` | `false` | Opt-in. Grounding ships DORMANT (#2522) — the per-adapter read bounds landed but the flip to on-by-default is a SEPARATE operator-filed follow-up gated on a recorded operator run of `live_confinement_test.go` passing on BOTH adapters. `false` reverts both adapters to the diff-only (ungrounded) posture and the prompts to diff-only wording, without a rollback. The environment scrub is independent of this flag and always applied. |
 | `FISHHAWKD_REVIEWER_ENV_PASSTHROUGH` | (empty) | Comma-separated EXACT env var names appended to each adapter's scrub allow-list — the escape hatch for a Bedrock/Vertex/proxy deployment whose auth vars the minimal list omits. Named explicitly, never by prefix. |
+
+### Review-convention verdict contract (E55.3 / #2244)
+
+`review.go` carries the verdict-side half of repository review conventions; the
+prompt rendering lives in `backend/internal/prompt` and the resolution / ingest
+wiring in `backend/internal/server` (`review_conventions.go`, `plan.go`,
+`trace.go`).
+
+- **Concern categories** (reviewer concern categories inside verdict payloads,
+  NOT audit categories): `RepoConventionConcernCategory` (`repo_convention`, a
+  finding derived from a rendered convention), `ConventionsOverrideAttemptConcernCategory`
+  (`conventions_override_attempt`, a conventions file tried to weaken/override a
+  standard criterion) and `ConventionsFileModifiedConcernCategory`
+  (`conventions_file_modified`, the change edits a declared conventions file).
+  Category matching is on the trimmed, lower-cased form, so a cosmetic variant
+  cannot slip past the clamp or the fix-up refusal.
+- **`Concern.Convention`** (`convention`, reviewer-emittable, registered in
+  `VerdictSchema()`, nullable in the strict variant) names the convention a
+  `repo_convention` concern derives from. **`Concern.SeverityClampedFrom`**
+  (`severity_clamped_from`) is SERVER-INTERNAL — stamped only by the clamp and
+  absent from the schema (`schemaExcludedTags`, pinned by
+  `TestVerdictSchema_OmitsSeverityClampedFrom`).
+- **`ClampConventionSeverities(v, caps)`** runs at INGEST, before any payload,
+  gating decision or concern persistence reads the verdict. `ConventionCaps` is
+  the rendered-name → `severity_cap` map (`""` = uncapped). Rules:
+  - caps EMPTY (zero conventions rendered for the round — #2244 approval
+    condition 2): every `repo_convention`, `conventions_override_attempt` and
+    `conventions_file_modified` concern clamps to `low`; never left unclamped.
+    `ClampedConcern.NoConventionsRendered` marks these so the ingest site's WARN
+    log can say so (the clamp itself is pure and does not log — the caller logs
+    every `ClampResult.Clamped` record with the run id and category).
+  - caps non-empty: a `repo_convention` concern is bounded by `caps[Convention]`;
+    an empty or unrendered name fails closed to the MOST restrictive rendered
+    cap; an out-of-set cap value fails closed to `low`. Every other category is
+    untouched.
+  - a lowered concern carries `severity_clamped_from`; a `reject` becomes
+    `approve_with_concerns` ONLY when at least one concern was lowered from
+    `high` and no `high` remains (`ClampResult.VerdictClampedFrom = reject`,
+    stamped as `verdict_clamped_from` on `plan_reviewed` / `implement_reviewed`).
+  - the clamp copies `Concerns` before writing and is idempotent.
+- **`AddSynthesizedConventionsFileModifiedConcern(v, paths)`** appends the ONE
+  server-authored medium `conventions_file_modified` concern a round carries when
+  the diff edits a declared conventions file and no reviewer raised it. A plain
+  `approve` is raised to `approve_with_concerns` and the function returns
+  `approve` for the payload's `verdict_raised_from`; the carrying payload also sets
+  `conventions_file_modified_synthesized: true`. Call it AFTER the clamp, so the
+  empty-caps rule never lowers the server's own concern. No-op on a nil verdict
+  or no non-blank path.
+- **Fix-up refusal**: `backend/internal/server/fixup.go` refuses a
+  `conventions_override_attempt` concern on BOTH addressing paths (`concern_ids`
+  and the deprecated positional `concerns`) with 400 `validation_failed` — it
+  reports an instruction in a conventions file read at the run's pinned base,
+  which this run must not edit, so it is never a code obligation (whether or not
+  any convention was rendered); the operator waives or defers it.
+  `repo_convention` and `conventions_file_modified` route unchanged.
+
+All new verdict / payload fields are `omitempty`: with no convention declared
+every verdict and payload is byte-identical to pre-#2244 output.
+
+**Residuals (stated, not closed here).** (a) A conventions file can steer the
+model to label a convention finding with another category, escaping the clamp;
+(b) a concern naming a different, uncapped rendered convention is uncapped.
+Both are bounded by the protected `.fishhawk/workflows.yaml` declaration. (c) On
+an UNCONSTRAINED decode path (`DecodeVerdict`, e.g. claudecode) a reviewer can
+still emit `severity_clamped_from` text; it is display-only and gates nothing.
+This is a quality aid under a protected declaration, not an adversary-proof
+control.
