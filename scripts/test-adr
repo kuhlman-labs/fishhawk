@@ -28,6 +28,13 @@
 # ADR-002.supersedes (both index entries edited), so C-recip-fwd cannot fire
 # alongside C-superseded. Both assert the output names ONLY the intended class.
 #
+# TIMING GUARDS (E78.3 / #3724). h36 and h36b run check-adr under
+# run_check_bounded, a 5s python3 watchdog that kills the child and exits 124.
+# The bound covers the WHOLE check-adr invocation — every per-line pattern run
+# over the pathological heading, not DECISION_RE alone — so a RED on h36b (or
+# h36) names a super-linear regression in whichever pattern changed; attribute
+# it by reading the diff, not by assuming DECISION_RE.
+#
 # ---------------------------------------------------------------------------
 # COUNTERFACTUALS — run EMPIRICALLY: each mutated scripts/check-adr's BODY (or
 # scripts/test's call site), ran this harness, observed the named case(s) RED,
@@ -103,6 +110,21 @@
 #        'Decisions already made', the two real ADR-034 headings).
 #   CF11 (re-run against the tightened regex) italic-placeholder strip removed
 #        → h12 RED, and h34b RED too (the asterisk placeholder is then kept).
+#   E78.3 / #3724 DECISION_RE rewrite (same restore discipline):
+#   CF36 DECISION_RE reverted to the E78.2 form ^#{1,6}\s+(?:[^/\n]*/\s*)*
+#        Decision\b → h36 RED (exponential backtracking on 10,000 ' /' never
+#        finishes; the watchdog kills check-adr and the case sees exit 124).
+#   CF37 DECISION_RE set to the #3724 issue's suggested ^#{1,6}\s+(?:[^/\n]*/)*
+#        \s*Decision\b → h36b RED (quadratic on a 100,000-space run, ~50s against
+#        the 5s bound) while h36 stays GREEN: the two cases isolate the two
+#        distinct ambiguities (repeated ' /' vs. one long whitespace run).
+#   CF34 (re-run against the rewritten regex) reverted to ^#{1,6}\s+Decision\b
+#        → h35 RED: the slash alternative is still pinned.
+#   LANGUAGE EQUIVALENCE (ad hoc, not a committed case): an exhaustive fuzz of
+#   every string of up to 6 tokens over {'#', ' ', '/', 'x', '\t', 'Decision',
+#   'Decisions', 'decision '} — 299,593 strings — found 0 match differences
+#   between the E78.2 form, the issue's \s+ form and the committed form, so the
+#   rewrite changes cost, not the set of Decision headings.
 #   Not counterfactual-run: the unterminated-front-matter branch (deleting it
 #   crashes on close=None rather than greening — h16a still RED via no tag),
 #   the index not-JSON and entry-shape branches (h30a/h30c assert them), and
@@ -125,6 +147,28 @@ out=""
 status=0
 run_check() {
   out="$("$CHECK" "$@" 2>&1)"
+  status=$?
+}
+
+# run_check_bounded <args> — run_check under a 5s watchdog, for the timing
+# guards (h36/h36b). python3's subprocess.run(timeout=...) KILLS the child and
+# waits for it on expiry; the watchdog then prints a reason and exits 124, so a
+# pathological regex fails the case instead of hanging the harness. The bound
+# is >1000x the passing runtime (loaded-host headroom), so it is not a
+# load-sensitive flake.
+run_check_bounded() {
+  out="$(python3 - "$CHECK" "$@" 2>&1 <<'PY'
+import subprocess, sys
+try:
+    r = subprocess.run(sys.argv[1:], stdout=subprocess.PIPE,
+                       stderr=subprocess.STDOUT, timeout=5)
+except subprocess.TimeoutExpired:
+    print("WATCHDOG: check-adr exceeded the 5s bound and was killed")
+    sys.exit(124)
+sys.stdout.write(r.stdout.decode("utf-8", "replace"))
+sys.exit(r.returncode)
+PY
+)"
   status=$?
 }
 
@@ -576,6 +620,38 @@ run_check "$d"; expect_only "h35b: 'The deferred decision' is not a Decision hea
 d="$(fixture h35c)"
 subst "$d/002-beta.md" $'## Decision\n\n**Accepted 2026-05-01.** Y replaces ADR-001.' $'## Decisions already made\n\nDecided.'
 run_check "$d"; expect_only "h35c: 'Decisions already made' is not a Decision heading" C-accepted "002-beta.md"
+
+# --- h36: DECISION_RE is linear on pathological headings (E78.3 / #3724) ---------
+# Both cases append a level-6 heading AFTER the existing Decision text of the
+# ACCEPTED record 002-beta.md. Accepted is load-bearing: decision_sections — and
+# so DECISION_RE.match on every heading — runs only inside has_acceptance for an
+# accepted record. The heading nests inside '## Decision' (it ends at the next
+# level-2 heading), so the acceptance word stays in that section and every other
+# check still passes: the only possible failure is the time bound.
+# h36: 10,000 repetitions of ' /' and NO 'Decision', so the match must fail
+# exhaustively (the E78.2 form's exponential case — CF36).
+d="$(fixture h36)"
+h36_heading="######$(python3 -c "print(' /' * 10000, end='')") x"
+subst "$d/002-beta.md" '**Accepted 2026-05-01.** Y replaces ADR-001.' \
+  "**Accepted 2026-05-01.** Y replaces ADR-001.
+
+$h36_heading"
+run_check_bounded "$d"
+expect_ok "h36: 10,000-' /' heading is checked inside the 5s watchdog" "2 record(s) consistent"
+# h36b: one 100,000-space run (the #3724 issue's suggested form's quadratic
+# case — CF37). The 5s watchdog bounds the WHOLE check-adr invocation, not
+# DECISION_RE alone: every per-line pattern that sees this line (HEADING_RE,
+# DECISION_RE, PLACEHOLDER_RE, ACCEPT_RE, the C-applies stem scan) runs inside
+# it, so a RED here means SOME pattern went super-linear on a long whitespace
+# run — read which one changed before blaming DECISION_RE.
+d="$(fixture h36b)"
+h36b_heading="######$(python3 -c "print(' ' * 100000, end='')")x"
+subst "$d/002-beta.md" '**Accepted 2026-05-01.** Y replaces ADR-001.' \
+  "**Accepted 2026-05-01.** Y replaces ADR-001.
+
+$h36b_heading"
+run_check_bounded "$d"
+expect_ok "h36b: 100,000-space heading is checked inside the 5s watchdog" "2 record(s) consistent"
 
 echo
 echo "scripts/test-adr: $PASS passed, $FAIL failed"

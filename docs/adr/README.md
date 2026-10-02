@@ -73,8 +73,9 @@ editorial act.
   confirmation; never guess upward.
 
 The gate enforces a NECESSARY condition for `accepted` (C-accepted): SOME
-section whose heading matches `^#{1,6}\s+(?:[^/\n]*/\s*)*Decision\b`
-(case-insensitive: `Decision` starts the heading or starts a slash-separated
+section whose heading matches `^#{1,6}\s(?:[^/\n]*/)*\s*Decision\b`
+(case-insensitive, and written unambiguously so a failing match is linear —
+E78.3 / #3724, pinned by `scripts/test-adr` h36/h36b: `Decision` starts the heading or starts a slash-separated
 part of it, so `## Decision (2026-05-19)`, a nested `### Decision` under an
 Addendum and `## Recommendation / Decision` all count, while `## Decisions
 already made` and `## The deferred decision (this ADR)` do not) must contain one
@@ -151,9 +152,52 @@ which refuses (exit 1, writes nothing) while any record check fails.
   ADR-031 itself is `unknown` (see below). ADR-040 is transcribed from the
   decision record #997, not from the five implementation issues that also
   carry an `[ADR-040]` title.
-- Later batches backfill the remaining ADRs; until an ADR's batch lands, read
-  it from the tracker (`gh issue list --label adr`). A batch that backfills a
-  superseding record also edits the older record's `superseded_by`.
+- **Batch 3 (E78.3 / #3724):** ADR-056 – ADR-080, the last batch. Landed with
+  the two cross-batch supersessions the sources state, each front matter only
+  on the older record (its body is untouched):
+  - ADR-061 supersedes ADR-058's tenant definition ("Supersedes ADR-058's
+    tenant definition."), so ADR-058 carries `superseded_by: ["ADR-061"]`.
+    ADR-058's record is titled for GitLab second-forge support but carries the
+    "tenant = forge account" definition that ADR-061 supersedes. ADR-058 stays
+    `accepted` (only its tenant definition is replaced) and ADR-061 itself is
+    `unknown` (see below).
+  - ADR-076 supersedes ADR-033's loopback gate ("This **supersedes ADR-033's
+    gate**"), so ADR-033 carries `superseded_by: ["ADR-076"]`. ADR-033 stays
+    `accepted`: ADR-076 states "ADR-033's other decisions (stdio default;
+    transport-agnostic tool registration; loopback hard-enforcement for the
+    bare-bearer HTTP mode) stand" — the ADR-018/ADR-031 partial-supersession
+    precedent.
+
+  Deliberately NOT linked, because no source states an ADR supersession:
+  ADR-066's "This **supersedes** the `operator_agent.may_*` shape" names a
+  grammar shape, not ADR-040; ADR-073 retires the ECS path without stating that
+  it supersedes ADR-009, ADR-016 or ADR-034 (it names ADR-034 only as the local
+  Docker-Desktop path); ADR-072 says of ADR-011 "That ADR stays parked for
+  market signal"; ADR-064's and ADR-078's "supersedes" refer to their own
+  Recommendation; ADR-067's "which ADR-055 already superseded as the preset
+  default" names a spec surface, not an ADR. `applies_to` near-misses, also
+  left out: ADR-056 names `.fishhawk/checkpoints` in its Decision only as
+  Option B's as-written assumption; ADR-067 names its schema mirrors only as
+  directories, so only the canonical `docs/spec/workflow-v2.schema.json` is
+  listed; ADR-073 names `deploy/helm/fishhawk/` only in Context. ADR-063 and
+  ADR-078 are `accepted` with no `date`, because their Decision sections state
+  none (the batch-2 ADR-038 / ADR-046 precedent).
+
+## Upkeep rule
+
+The record covers ADR-001 – ADR-080. From ADR-081 on, records are added one by
+one, never in batches:
+
+- A ratified ADR lands its `docs/adr/NNN-slug.md` record in the same change
+  that records the ratification, or in the change immediately after.
+- The adding change regenerates `index.json` (`scripts/check-adr
+  --write-index`), adds the row under "Records" below and, when the new ADR
+  states a supersession, edits the superseded record's `superseded_by` (front
+  matter only) in the same change.
+- A record whose status the inference rule leaves `unknown` adds a bullet to
+  "Status unknown" below, quoting its source verbatim.
+- Until its record lands, an ADR is read from the tracker (`gh issue list
+  --label adr`).
 
 ## Records
 
@@ -214,6 +258,31 @@ which refuses (exit 1, writes nothing) while any record check fails.
 | [ADR-053](053-post-deploy-verification-incident-intake.md) | Post-deploy verification + incident intake (closing the ops-to-dev loop) | `accepted` | [#1581](https://github.com/kuhlman-labs/fishhawk/issues/1581) |
 | [ADR-054](054-compliance-export-surface-posture.md) | Compliance export surface posture (auth scope, redaction, filtering semantics) | `accepted` | [#1582](https://github.com/kuhlman-labs/fishhawk/issues/1582) |
 | [ADR-055](055-approval-identity-quorum-eligibility-forge-verified.md) | Approval identity: quorum + eligibility predicates + forge-verified identity (GitHub/GitLab-agnostic) | `accepted` | [#1698](https://github.com/kuhlman-labs/fishhawk/issues/1698) |
+| [ADR-056](056-external-anchoring-of-the-audit-head.md) | External anchoring of the audit head: tamper-evidence beyond the exported chain | `accepted` | [#1699](https://github.com/kuhlman-labs/fishhawk/issues/1699) |
+| [ADR-057](057-multi-tenancy-model-tenant-isolation.md) | Multi-tenancy model and tenant isolation for hosted deployment | `unknown` | [#1823](https://github.com/kuhlman-labs/fishhawk/issues/1823) |
+| [ADR-058](058-second-forge-support-gitlab.md) | Second-forge support: GitLab repositories, work items, and GitLab CI | `accepted` | [#1851](https://github.com/kuhlman-labs/fishhawk/issues/1851) |
+| [ADR-059](059-evidence-gated-correctness-lens-implement-review.md) | Evidence-gated correctness lens in implement-review | `accepted` | [#1883](https://github.com/kuhlman-labs/fishhawk/issues/1883) |
+| [ADR-060](060-mcp-session-survival-shim.md) | MCP session-survival shim: stdio supervisor as gateway phase 0 | `accepted` | [#1920](https://github.com/kuhlman-labs/fishhawk/issues/1920) |
+| [ADR-061](061-multi-tenancy-foundation-workspace-rls.md) | Multi-tenancy foundation: workspace-scoped tenancy with Postgres RLS isolation | `unknown` | [#2069](https://github.com/kuhlman-labs/fishhawk/issues/2069) |
+| [ADR-062](062-regional-cells-control-plane.md) | Regional-cells control plane: fishhawk-directory service, directory-first region pinning, per-cell inference config | `accepted` | [#2099](https://github.com/kuhlman-labs/fishhawk/issues/2099) |
+| [ADR-063](063-isolate-untrusted-gate-command-execution.md) | Isolate untrusted gate-command execution: container sandbox for .git-metadata, egress, and host-filesystem containment | `accepted` | [#2127](https://github.com/kuhlman-labs/fishhawk/issues/2127) |
+| [ADR-064](064-forge-project-board-work-queue-input.md) | Forge project board as declarative work-queue input and derived status projection | `accepted` | [#2139](https://github.com/kuhlman-labs/fishhawk/issues/2139) |
+| [ADR-065](065-backlog-grooming-prioritization-agent.md) | Backlog grooming / prioritization agent with workflow-declared tunable autonomy | `accepted` | [#2161](https://github.com/kuhlman-labs/fishhawk/issues/2161) |
+| [ADR-066](066-workflow-declared-autonomy-tier.md) | Workflow-declared autonomy tier and path-scoped control surface | `accepted` | [#2209](https://github.com/kuhlman-labs/fishhawk/issues/2209) |
+| [ADR-067](067-workflow-spec-grammar-consolidation.md) | Workflow spec grammar consolidation: break the duplicate surfaces and add reuse before the first external consumer | `accepted` | [#2210](https://github.com/kuhlman-labs/fishhawk/issues/2210) |
+| [ADR-068](068-repo-declared-review-conventions.md) | Repo-declared review conventions: workflow-declared, server-injected supplemental criteria for plan and implement review | `accepted` | [#2211](https://github.com/kuhlman-labs/fishhawk/issues/2211) |
+| [ADR-069](069-separate-execution-eligibility-from-autonomy.md) | Separate execution eligibility from autonomy: an `execution:` namespace, type-derived workflow eligibility, and the emergency bypass as an audited action | `accepted` | [#2268](https://github.com/kuhlman-labs/fishhawk/issues/2268) |
+| [ADR-070](070-cost-forecasting-as-planning-input.md) | Cost forecasting as a planning input: interval forecasts at the plan gate, an in-flight circuit-breaker, and budget-aware grooming | `accepted` | [#2276](https://github.com/kuhlman-labs/fishhawk/issues/2276) |
+| [ADR-071](071-beta-hardening-for-external-operators.md) | Beta hardening for external operators: intake sanitization, gate notification and SLA, and per-tenant limits | `accepted` | [#2288](https://github.com/kuhlman-labs/fishhawk/issues/2288) |
+| [ADR-072](072-customers-bring-own-model-credentials-byok.md) | Customers bring their own model credentials (BYOK): inference cost sits with the customer, Fishhawk charges for the governance layer | `accepted` | [#2296](https://github.com/kuhlman-labs/fishhawk/issues/2296) |
+| [ADR-073](073-kubernetes-helm-single-deployment-substrate.md) | Kubernetes and the Helm chart are the single deployment substrate; retire the unexercised ECS path | `accepted` | [#2298](https://github.com/kuhlman-labs/fishhawk/issues/2298) |
+| [ADR-074](074-reviewer-agents-run-on-customer-infrastructure.md) | Reviewer agents run on customer infrastructure: fishhawkd orchestrates and records but never executes an agent | `accepted` | [#2306](https://github.com/kuhlman-labs/fishhawk/issues/2306) |
+| [ADR-075](075-kubernetes-runner-backend.md) | Kubernetes runner backend: run agent stages in the customer's own cluster instead of their CI platform | `accepted` | [#2310](https://github.com/kuhlman-labs/fishhawk/issues/2310) |
+| [ADR-076](076-mcp-over-http-fishhawkd-oauth-authorization-server.md) | MCP over HTTP served by fishhawkd, with fishhawkd as the OAuth authorization server — supersedes ADR-033's loopback gate | `accepted` | [#2387](https://github.com/kuhlman-labs/fishhawk/issues/2387) |
+| [ADR-077](077-bounding-get-run-status-response.md) | Bounding the get_run_status response: what limit, which boundary, and what an elision pointer honestly promises | `accepted` | [#2507](https://github.com/kuhlman-labs/fishhawk/issues/2507) |
+| [ADR-078](078-ground-review-agents-widen-context-narrow-capability.md) | Ground the review agents by widening context and narrowing capability: export the reviewed tree, scrub the inherited environment, grant read and search only | `accepted` | [#2519](https://github.com/kuhlman-labs/fishhawk/issues/2519) |
+| [ADR-079](079-product-and-program-management-agent.md) | Product and program management agent for human-ratified charters, release strategy, and readiness | `accepted` | [#3238](https://github.com/kuhlman-labs/fishhawk/issues/3238) |
+| [ADR-080](080-solo-captain-alpha.md) | Solo-captain alpha: the repository is the unit, one developer commands the full crew locally from the bridge | `accepted` | [#3693](https://github.com/kuhlman-labs/fishhawk/issues/3693) |
 
 ## Status unknown — needs captain confirmation
 
@@ -227,9 +296,12 @@ which refuses (exit 1, writes nothing) while any record check fails.
   recorded. No date.
 - **ADR-028** (date 2026-06-01, from `## Decision (2026-06-01)`) — the Decision
   states a design (local: detection-only; hosted: container mount-confinement)
-  with no acceptance or ratification statement; the only acceptance wording is
-  "Accepted for v0" in Consequences, covering the local residual risk, not the
-  decision. The gate cannot judge this one.
+  with no acceptance or ratification statement. Its only acceptance wording is
+  "Accepted residual: a local agent can still write outside the tree", which
+  qualifies the local residual risk rather than ratifying the decision;
+  "Accepted for v0" in Consequences is a second, non-ratifying use of the same
+  word. The gate cannot judge this one (that Decision-section "Accepted" would
+  pass C-accepted).
 - **ADR-031** — Opens `**Status: Decided (2026-06-03).**` above Context, but the
   Decision section carries no acceptance statement. Records the supersession of
   ADR-018's resolution mechanism (ADR-018 `superseded_by: ["ADR-031"]`, ADR-018
@@ -250,8 +322,8 @@ which refuses (exit 1, writes nothing) while any record check fails.
 - **ADR-042** — Decision section is the placeholder
   `_TBD — operator. (Agent proposes, human disposes.)_`.
 - **ADR-044** — The Decision states a design with no acceptance or ratification
-  statement; "accepted" appears only about models ("newly-released models are
-  accepted"), not the decision. No date.
+  statement; "accepted" appears only about models ("a newly-released model is
+  accepted automatically"), not the decision. No date.
 - **ADR-045** — The Decision states a design with no acceptance or ratification
   statement; the resolution sits in a separate `## Status — RESOLVED
   (2026-06-24)` section, which is outside the Decision section (and so
@@ -259,3 +331,17 @@ which refuses (exit 1, writes nothing) while any record check fails.
   `**Status: Decided/Accepted (<date>)**` line or a Status/Resolution section —
   would settle ADR-031, -032, -035, -036, -037 and -045 together; it is not part
   of the current rule.
+- **ADR-057** — No Decision-headed section: the decisions sit under
+  `## Decisions (founder-directed)`, which the Decision-heading pattern does not
+  match (`Decisions` is not `Decision` — the h35c precision pin), and the
+  acceptance line `**Accepted (founder-directed).** Decisions above are locked.`
+  is in a separate `## Status` section, outside any Decision section. No date.
+  Another instance of the candidate rule extension under ADR-045.
+- **ADR-061** — Decision section is the single italic placeholder
+  `_(Founder ratifies: the two settled decisions above are accepted; this
+  section confirms the proposed design + P1–P5 phasing, or amends it.` … `)_`.
+  The gate's placeholder strip does NOT remove it — the span holds an inner `_`
+  (`depends_on`), the documented cost — so its "accepted" would satisfy
+  C-accepted; `unknown` rests on the per-record rule alone. Records the
+  supersession of ADR-058's tenant definition (ADR-058
+  `superseded_by: ["ADR-061"]`, ADR-058 stays `accepted`). No date.

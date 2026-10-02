@@ -2144,7 +2144,7 @@ non-zero exit — never first-hit-and-stop. Each class is a separate branch:
   isolated.
 - **C-superseded** — `status: superseded` requires a non-empty `superseded_by`.
 - **C-accepted** — `status: accepted` requires SOME section whose heading
-  matches `^#{1,6}\s+(?:[^/\n]*/\s*)*Decision\b` (case-insensitive: `Decision`
+  matches `^#{1,6}\s(?:[^/\n]*/)*\s*Decision\b` (case-insensitive: `Decision`
   starts the heading OR a slash-separated part of it, so
   `## Recommendation / Decision` counts while `## Decisions already made` and
   `## The deferred decision (this ADR)` do not) to carry an acceptance word
@@ -2157,7 +2157,13 @@ non-zero exit — never first-hit-and-stop. Each class is a separate branch:
   more lines than the earlier greedy form, so it cannot fail a record that
   passed. A section runs to the next heading of the same or higher level; `#`
   lines inside fenced code blocks are not headings. A necessary-condition
-  backstop, not proof.
+  backstop, not proof. The pattern is written UNAMBIGUOUSLY (E78.3 / #3724):
+  each repetition ends at a `/` its body cannot contain and the single leading
+  `\s` leaves no whitespace run two quantifiers could share, so a failing match
+  is linear. The E78.2 form `^#{1,6}\s+(?:[^/\n]*/\s*)*Decision\b` was
+  exponential on repeated ` /`, and `^#{1,6}\s+(?:[^/\n]*/)*\s*Decision\b`
+  quadratic on a long whitespace run; an exhaustive fuzz (recorded in the
+  harness header) found the three match the same headings.
 - **C-applies** — every `applies_to` entry has a non-empty literal stem (text
   before the first of `* ? [ {`, minus one trailing `/`) that occurs in the
   record body as a BOUNDED path token (`stem_bounded`), case-sensitively. The
@@ -2220,10 +2226,17 @@ inside `clients` (trailing boundary), h33b a root-anchored `` `/cli/**` `` →
 h34 `_Note:_ Accepted as drafted _(see addendum)_` is NOT stripped → 0, h34b a
 single-span `*To be recorded.*` IS stripped; h35 `## Recommendation / Decision`
 is a Decision heading → 0, h35b / h35c `## The deferred decision (this ADR)` /
-`## Decisions already made` are not (precision pins). The header records every
+`## Decisions already made` are not (precision pins); h36 (a level-6 heading of
+10,000 ` /` with no `Decision`) and h36b (one of 100,000 spaces), each appended
+to the ACCEPTED fixture record so `DECISION_RE` runs on it, must pass inside a
+5s watchdog (`run_check_bounded`: python3 `subprocess.run(timeout=5)` kills the
+child and the case sees exit 124). The bound covers the WHOLE `check-adr`
+invocation, so a RED names a super-linear regression in whichever per-line
+pattern changed, not necessarily `DECISION_RE`. The header records every
 counterfactual run against the gate (CF28–CF35 cover the E78.2 hardening: each
 bounded-stem condition, the placeholder regex and each of its alternatives, and
-the Decision-heading widening in both directions).
+the Decision-heading widening in both directions; CF36/CF37 the two regex
+ambiguities h36/h36b isolate).
 
 `scripts/test verify` runs BOTH: `test-adr` in `_verify_gate_harnesses`, and
 `check-adr` itself via `_verify_adr_records` (immediately after
