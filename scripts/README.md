@@ -2144,14 +2144,35 @@ non-zero exit — never first-hit-and-stop. Each class is a separate branch:
   isolated.
 - **C-superseded** — `status: superseded` requires a non-empty `superseded_by`.
 - **C-accepted** — `status: accepted` requires SOME section whose heading
-  matches `^#{1,6}\s+Decision\b` (case-insensitive) to carry an acceptance word
+  matches `^#{1,6}\s+(?:[^/\n]*/\s*)*Decision\b` (case-insensitive: `Decision`
+  starts the heading OR a slash-separated part of it, so
+  `## Recommendation / Decision` counts while `## Decisions already made` and
+  `## The deferred decision (this ADR)` do not) to carry an acceptance word
   (`accepted|approved|ratified|recorded|decided|adopt|adopted`, whole word)
-  after lines that are entirely one italic span are removed. A section runs to
-  the next heading of the same or higher level; `#` lines inside fenced code
-  blocks are not headings. A necessary-condition backstop, not proof.
+  after lines that are ENTIRELY ONE italic span with no inner delimiter
+  (`^(_[^_]+_|\*[^*]+\*)$`) are removed — a line holding two spans around text,
+  such as `_Note:_ Accepted as drafted _(see addendum)_`, is kept. The cost of
+  that tightening is stated: an italic placeholder with an inner `_` or `*` is
+  no longer stripped, so it can satisfy the backstop; the strip can only KEEP
+  more lines than the earlier greedy form, so it cannot fail a record that
+  passed. A section runs to the next heading of the same or higher level; `#`
+  lines inside fenced code blocks are not headings. A necessary-condition
+  backstop, not proof.
 - **C-applies** — every `applies_to` entry has a non-empty literal stem (text
-  before the first of `* ? [ {`, minus one trailing `/`) that occurs verbatim
-  in the record body.
+  before the first of `* ? [ {`, minus one trailing `/`) that occurs in the
+  record body as a BOUNDED path token (`stem_bounded`), case-sensitively. The
+  character AFTER the occurrence must not be `[A-Za-z0-9_-]` (so `cli` is not
+  satisfied by `clients`); the character BEFORE it must not be `[A-Za-z0-9_./-]`
+  (so `cli` is not satisfied by `backend/internal/cli/`), unless that character
+  is a `/` which itself starts a root-anchored path — the one before it is
+  absent or not a path character — so `` `/cli/**` `` and
+  `` `/backend/sqlc.yaml` `` (ADR-013, ADR-002) still name their stems; every
+  occurrence is tried, so one bounded mention among unbounded ones passes.
+  **Known limit:** a `.` after the stem is accepted, so `backend/**` is
+  satisfied by a body that only says `backend.go`; the trailing set omits `.`
+  deliberately, because a sentence-final mention (`lives under infra/terraform.`)
+  must keep working. Like the rest of the gate this is a backstop against an invented path, not a
+  tree match.
 - **C-index / C-index-missing / C-index-extra / C-index-stale** — `index.json`
   parses as `{"schema_version": "adr-index-v1", "records": [...]}` with
   well-formed, path-unique entries; then, keyed by PATH (never id): a record
@@ -2193,8 +2214,16 @@ h21 `--write-index` refusal leaves `index.json` byte-identical; h22
 unknown key, duplicate key, scalar-vs-list both ways, invalid date, self
 reference; h28 two Decision sections, placeholder first → 0; h29 missing
 `index.json`; h30a–d malformed index; h31a/b index read / write failure → 2;
-h32 a `#` line in a fenced block is not a heading. The header records every
-counterfactual run against the gate.
+h32 a `#` line in a fenced block is not a heading; h33 the stem `cli` only
+inside `clients` (trailing boundary), h33b a root-anchored `` `/cli/**` `` →
+0, h33c `cli` only as the tail of `backend/internal/cli/` (leading boundary);
+h34 `_Note:_ Accepted as drafted _(see addendum)_` is NOT stripped → 0, h34b a
+single-span `*To be recorded.*` IS stripped; h35 `## Recommendation / Decision`
+is a Decision heading → 0, h35b / h35c `## The deferred decision (this ADR)` /
+`## Decisions already made` are not (precision pins). The header records every
+counterfactual run against the gate (CF28–CF35 cover the E78.2 hardening: each
+bounded-stem condition, the placeholder regex and each of its alternatives, and
+the Decision-heading widening in both directions).
 
 `scripts/test verify` runs BOTH: `test-adr` in `_verify_gate_harnesses`, and
 `check-adr` itself via `_verify_adr_records` (immediately after

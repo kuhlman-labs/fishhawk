@@ -4,7 +4,7 @@ title: "Review-stage approval defers to GitHub PR merge"
 status: accepted
 issue: https://github.com/kuhlman-labs/fishhawk/issues/311
 supersedes: []
-superseded_by: []
+superseded_by: ["ADR-031"]
 applies_to: []
 ---
 
