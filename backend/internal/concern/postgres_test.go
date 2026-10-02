@@ -355,6 +355,100 @@ func TestPostgres_PersonaAttribution_RoundTripAllQueries(t *testing.T) {
 	check("ApplyResolution", waived)
 }
 
+// TestPostgres_ProvenanceAndCheckKey_RoundTripAllQueries pins migration
+// 0094's two columns (E80.3 / #3760) through EVERY query that returns
+// review_concerns rows — InsertReviewConcern's RETURNING,
+// GetReviewConcernsByIDs, ListReviewConcernsByRun,
+// ListOpenReviewConcernsByRun and UpdateReviewConcernState's RETURNING — so a
+// hand-edited sqlc scan list that misses or mis-orders either column fails
+// here against the real migrated schema. A server_check insert reads back its
+// provenance and per-concern check_key (two concerns of ONE entry carry
+// DIFFERENT keys, so a key stamped entry-wide instead of per concern is
+// caught); an insert naming neither reads back empty for both, the legacy
+// default every reviewer-raised row carries.
+func TestPostgres_ProvenanceAndCheckKey_RoundTripAllQueries(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+
+	checkRows, err := h.repo.InsertRaised(ctx, concern.InsertRaisedParams{
+		RunID:                h.runID,
+		StageID:              h.stageID,
+		StageKind:            concern.StageKindImplement,
+		Provenance:           concern.ProvenanceServerCheck,
+		OriginReviewSequence: 31,
+		Concerns: []concern.RaisedConcern{
+			{Severity: "high", Category: "security", Note: "credential-shaped addition at a.go:2", CheckKey: "diff_secrets|github-pat-classic|a.go"},
+			{Severity: "high", Category: "security", Note: "credential-shaped addition at b.go:7", CheckKey: "diff_secrets|aws-access-key-id|b.go"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("InsertRaised(server_check): %v", err)
+	}
+	reviewer := h.insert(t, 32)[0]
+
+	type want struct{ provenance, checkKey string }
+	wants := map[uuid.UUID]want{
+		checkRows[0].ID: {concern.ProvenanceServerCheck, "diff_secrets|github-pat-classic|a.go"},
+		checkRows[1].ID: {concern.ProvenanceServerCheck, "diff_secrets|aws-access-key-id|b.go"},
+		reviewer.ID:     {"", ""},
+	}
+	check := func(query string, c *concern.Concern) {
+		t.Helper()
+		if c == nil {
+			t.Errorf("%s: row missing", query)
+			return
+		}
+		w, ok := wants[c.ID]
+		if !ok {
+			t.Errorf("%s: unexpected row %s", query, c.ID)
+			return
+		}
+		if c.Provenance != w.provenance || c.CheckKey != w.checkKey {
+			t.Errorf("%s row %s = (provenance %q, check_key %q), want (%q, %q)",
+				query, c.ID, c.Provenance, c.CheckKey, w.provenance, w.checkKey)
+		}
+		if got, wantSC := c.IsServerCheck(), w.provenance == concern.ProvenanceServerCheck; got != wantSC {
+			t.Errorf("%s row %s IsServerCheck() = %v, want %v", query, c.ID, got, wantSC)
+		}
+	}
+
+	// 1. InsertReviewConcern's RETURNING.
+	for _, c := range []*concern.Concern{checkRows[0], checkRows[1], reviewer} {
+		check("InsertRaised", c)
+	}
+	// 2. GetReviewConcernsByIDs.
+	got, err := h.repo.GetByIDs(ctx, []uuid.UUID{checkRows[0].ID, checkRows[1].ID, reviewer.ID})
+	if err != nil {
+		t.Fatalf("GetByIDs: %v", err)
+	}
+	for _, c := range got {
+		check("GetByIDs", c)
+	}
+	// 3. ListReviewConcernsByRun and 4. ListOpenReviewConcernsByRun.
+	for name, list := range map[string]func() ([]*concern.Concern, error){
+		"ListByRun":     func() ([]*concern.Concern, error) { return h.repo.ListByRun(ctx, h.runID) },
+		"ListOpenByRun": func() ([]*concern.Concern, error) { return h.repo.ListOpenByRun(ctx, h.runID) },
+	} {
+		all, err := list()
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if len(all) != 3 {
+			t.Fatalf("%s returned %d rows, want 3", name, len(all))
+		}
+		for _, c := range all {
+			check(name, c)
+		}
+	}
+	// 5. UpdateReviewConcernState's RETURNING: a human waive must not blank
+	// the server_check marker (the historian reads it off the waived row).
+	waived, err := h.repo.ApplyResolution(ctx, checkRows[0].ID, concern.StateWaived, "known test fixture")
+	if err != nil {
+		t.Fatalf("ApplyResolution: %v", err)
+	}
+	check("ApplyResolution", waived)
+}
+
 func TestPostgres_GetByIDs_InputOrderAndNotFound(t *testing.T) {
 	h := newHarness(t)
 	a := h.insert(t, 1)[0]

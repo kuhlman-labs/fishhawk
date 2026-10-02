@@ -259,3 +259,29 @@ func TestMissingNotePointer_BlankStageKind(t *testing.T) {
 		t.Errorf("MissingNotePointer(\"\", …) = %q, want it to render an unknown stage kind", got)
 	}
 }
+
+// TestConcern_IsServerCheck pins the provenance predicate the human-only
+// clearing guards key on (E80.3 / #3760): exactly ProvenanceServerCheck is a
+// server check; the legacy empty value and any other value are not. The comparison is
+// exact — a near-miss spelling must NOT read as a server check, and the
+// constant's value is pinned because it is persisted on every such row.
+func TestConcern_IsServerCheck(t *testing.T) {
+	cases := []struct {
+		provenance string
+		want       bool
+	}{
+		{ProvenanceServerCheck, true},
+		{"", false},
+		{"reviewer", false},
+		{"Server_Check", false},
+		{" server_check", false},
+	}
+	for _, tc := range cases {
+		if got := (Concern{Provenance: tc.provenance}).IsServerCheck(); got != tc.want {
+			t.Errorf("Concern{Provenance: %q}.IsServerCheck() = %v, want %v", tc.provenance, got, tc.want)
+		}
+	}
+	if ProvenanceServerCheck != "server_check" {
+		t.Errorf("ProvenanceServerCheck = %q, want %q (persisted on every server-check row)", ProvenanceServerCheck, "server_check")
+	}
+}

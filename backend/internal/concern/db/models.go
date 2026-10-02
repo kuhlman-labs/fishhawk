@@ -84,6 +84,8 @@ type ReviewConcern struct {
 	ReviewerRole         string             `json:"reviewer_role"`
 	QuoteUnverified      bool               `json:"quote_unverified"`
 	SeverityClampedFrom  string             `json:"severity_clamped_from"`
+	Provenance           string             `json:"provenance"`
+	CheckKey             string             `json:"check_key"`
 }
 
 type Run struct {
