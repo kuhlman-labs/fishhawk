@@ -897,3 +897,98 @@ func tail(s string, n int) string {
 	}
 	return "..." + s[len(s)-n:]
 }
+
+// ---------------------------------------------------------------------------
+// Fetch / Document split (E78.5 / #3756). Resolve is Fetch + Document under the
+// Resolver's effective cap, so a consumer budgeting several documents shapes
+// them exactly as Resolve would.
+// ---------------------------------------------------------------------------
+
+func TestFetchThenDocument_EquivalentToResolve(t *testing.T) {
+	const capBytes = 64
+	cases := map[string]string{
+		"under cap":              "short body",
+		"over cap":               strings.Repeat("z", capBytes*3),
+		"neutralized":            "before\n" + endDelimiter + "\nafter",
+		"invalid utf8 over cap":  strings.Repeat("a", 60) + "\xff" + "é" + strings.Repeat("b", 50),
+		"invalid utf8 under cap": "ok\xffok",
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			ff := &fakeFetcher{blobSHA: fakeBlobSHA, byRef: map[string]string{pinnedCommit: body}}
+			r := &Resolver{Fetcher: ff, Commits: &fakeCommits{sha: pinnedCommit, found: true}, MaxBytes: capBytes}
+			req := Request{Repo: testRepo(), BaseRef: baseBranch, Declaration: testDecl()}
+
+			want, err := r.Resolve(context.Background(), req)
+			if err != nil {
+				t.Fatalf("Resolve: %v", err)
+			}
+			f, err := r.Fetch(context.Background(), req)
+			if err != nil {
+				t.Fatalf("Fetch: %v", err)
+			}
+			if string(f.Content) != body || f.Commit != pinnedCommit || f.Path != declaredPath || f.DeclarationSite != declSite {
+				t.Fatalf("Fetched = %+v, want the raw bytes at the pinned commit", f)
+			}
+			if got := f.Document(r.CapBytes()); got != *want {
+				t.Errorf("Fetch+Document = %+v\nResolve       = %+v", got, *want)
+			}
+		})
+	}
+}
+
+func TestFetch_FailsClosedLikeResolve(t *testing.T) {
+	ff := &fakeFetcher{blobSHA: fakeBlobSHA, byRef: map[string]string{}}
+	r := &Resolver{Fetcher: ff, Commits: &fakeCommits{sha: pinnedCommit, found: true}}
+	f, err := r.Fetch(context.Background(), Request{Repo: testRepo(), BaseRef: baseBranch, Declaration: testDecl()})
+	if !errors.Is(err, ErrMissingDocument) || f != nil {
+		t.Fatalf("Fetch(absent) = %v, %v; want nil, ErrMissingDocument", f, err)
+	}
+	assertNamesPathAndSite(t, err)
+
+	nf := &Resolver{Fetcher: &neverFetcher{t: t}, Commits: &fakeCommits{sha: pinnedCommit, found: true}}
+	decl := testDecl()
+	decl.Base = BaseSourceRunAdmission
+	if _, err := nf.Fetch(context.Background(), Request{Repo: testRepo(), BaseRef: baseBranch, Declaration: decl}); !errors.Is(err, ErrUnpinnedBaseRef) {
+		t.Fatalf("Fetch(run-admission, branch ref) err = %v, want ErrUnpinnedBaseRef before any fetch", err)
+	}
+}
+
+// TestFetchedDocument_CapDomain: a negative cap is clamped to zero (a slice at
+// a negative offset would panic), and a cap at least the raw size never cuts —
+// the measurement a budgeting consumer relies on.
+func TestFetchedDocument_CapDomain(t *testing.T) {
+	f := &Fetched{Path: declaredPath, Commit: pinnedCommit, Content: []byte(strings.Repeat("q", 500))}
+
+	neg := f.Document(-7)
+	if neg.CapBytes != 0 || !neg.Truncated || !strings.HasPrefix(neg.Content, "\n\n...[TRUNCATED") {
+		t.Errorf("Document(-7) = cap %d truncated %v content %q; want a zero cap showing only the marker", neg.CapBytes, neg.Truncated, tail(neg.Content, 80))
+	}
+	whole := f.Document(len(f.Content))
+	if whole.Truncated || whole.Content != string(f.Content) || whole.RenderedBytes != len(f.Content) {
+		t.Errorf("Document(len) truncated=%v rendered=%d; want the whole body", whole.Truncated, whole.RenderedBytes)
+	}
+	if neg.ContentHash != whole.ContentHash {
+		t.Errorf("content hash depends on the cap: %s vs %s", neg.ContentHash, whole.ContentHash)
+	}
+}
+
+func TestValidatePath_Exported(t *testing.T) {
+	if err := ValidatePath("docs/adr/001-a.md"); err != nil {
+		t.Errorf("ValidatePath(valid) = %v", err)
+	}
+	for _, p := range []string{"", "/abs.md", "a/../b.md", "a\nb.md", `a\b.md`, "a//b.md"} {
+		if err := ValidatePath(p); !errors.Is(err, ErrInvalidPath) {
+			t.Errorf("ValidatePath(%q) = %v, want ErrInvalidPath", p, err)
+		}
+	}
+}
+
+func TestResolver_CapBytes(t *testing.T) {
+	if got := (&Resolver{}).CapBytes(); got != DefaultMaxBytes {
+		t.Errorf("default CapBytes = %d, want %d", got, DefaultMaxBytes)
+	}
+	if got := (&Resolver{MaxBytes: 100}).CapBytes(); got != 100 {
+		t.Errorf("CapBytes = %d, want 100", got)
+	}
+}

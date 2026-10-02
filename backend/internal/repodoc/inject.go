@@ -143,6 +143,12 @@ func renderBody(doc Document, f Framing) string {
 	return b.String()
 }
 
+// SanitizeMetadata is sanitizeMetadata for a consumer that renders its OWN
+// system-authored text around repo-authored values (a list of document paths,
+// say) outside any BEGIN/END delimiters: every framing-breaking character and
+// invalid byte becomes U+FFFD, so the value stays on its line.
+func SanitizeMetadata(s string) string { return sanitizeMetadata(s) }
+
 // sanitizeMetadata makes a value safe to render OUTSIDE the delimiters by
 // replacing every framing-breaking character (C0/C1 controls, DEL, U+2028,
 // U+2029) with U+FFFD, and every invalid UTF-8 byte likewise. The value stays

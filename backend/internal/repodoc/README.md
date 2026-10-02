@@ -58,6 +58,19 @@ by which a working-tree file can become the injected document.
 
 ## Resolution order (`Resolver.Resolve`)
 
+`Resolve` is `Fetch` followed by `Fetched.Document(r.CapBytes())` (E78.5 /
+#3756), so its behaviour is unchanged by the split. `Fetch` runs steps a–e
+below and returns the raw bytes at the pinned commit (`Fetched`);
+`Document(capBytes)` hashes those bytes, applies the loud cut and neutralizes
+forged delimiters. The split exists for a consumer that budgets SEVERAL
+documents against one cap (`backend/internal/decisionrecord`): it measures a
+document's untruncated rendered size with `Document(cap >= len(raw))` before
+deciding whether to show it, and parses a structured document from the same
+bytes the content hash covers. A negative `capBytes` is clamped to zero (only
+the marker is shown), never read as "no cap" (`TestFetchedDocument_CapDomain`).
+`Resolver.CapBytes()`, `ValidatePath` (step a) and `SanitizeMetadata` are
+exported for that consumer.
+
 Every step fails closed.
 
 | Step | Behavior | Failure |
@@ -382,6 +395,7 @@ NEL included — plus U+2028/U+2029).
 |---|---|---|
 | `document_injected` | every injection | `declaration_site`, `path`, `commit`, `content_hash`, `original_bytes`, `rendered_bytes`, `truncated`, `base_source`, `injection_set_id`, `document_index`, `document_count` |
 | `document_truncated` | in **addition**, when the document was cut | `path`, `commit`, `content_hash`, `cap_bytes`, `dropped_bytes`, `injection_set_id` |
+| `document_truncated` (selection shape, E78.5 / #3756) | once per `SelectionTruncation` in an `AttributeSet` call: whole documents of a ranked selection were left OUT to fit a byte budget | `selection` (the shape discriminator — the per-document shape never carries it), `path` (the document the selection was made from), `commit`, `cap_bytes`, `included_bytes`, `dropped` (`[{id, path, status, rank}]`, rank order), `dropped_count`, `injection_set_id` |
 | `document_injection_degraded` | once per SERVED prompt PER REASON: run-admission declarations withheld for an unrecorded base (E55.7 / #3746), and optional review conventions resolved and found absent (E55.3 / #2244); both precede any `document_injected` claim | `reason` (`run_base_commit_unrecorded` \| `optional_document_missing`), `paths`, `declaration_sites`, `document_count` |
 
 `base_source` on `document_injected` is `run_admission` or `declaration_seam`
@@ -391,6 +405,12 @@ unrecorded). All three are registered in `audit.KnownCategories`, so `fishhawk_a
 the **configured** cap carried on the Document — it cannot be reconstructed
 from `OriginalBytes` and `RenderedBytes` once a rune-safe cut and a marker have
 been applied.
+
+`AttributeSet(ctx, a, runID, stageID, InjectionSet{Documents, Selections})` is
+the general form; `Attribute(…docs)` is `AttributeSet` with no selections. A
+`SelectionTruncation` with an empty `Selection` name or no `Dropped` document is
+refused before the first append (`TestAttributeSet_MalformedSelectionRefusedBeforeAnyAppend`).
+`document_count` counts the set's documents only.
 
 `Attribute` **fails closed**: an append error is returned and the caller must
 not inject. `Server.resolveInjectedDocuments` returns **no documents at all**
@@ -409,7 +429,8 @@ no prompt carried" is therefore held by **ordering**, in two places:
    documents' `document_injected` entries standing
    (`TestGetStagePrompt_MultiDocumentResolutionFailure_LeavesNoInjectionClaim`).
 2. **`Attribute` writes every `document_truncated` entry first, across the whole
-   set, and every `document_injected` entry after.** `document_injected` is the
+   set — per-document cuts, then every selection-level truncation
+   (`AttributeSet`) — and every `document_injected` entry after.** `document_injected` is the
    only entry that *claims* an injection, so making it the last append for a
    document makes it that document's commit point: a failed truncation append
    leaves a truncation event, never a claim
@@ -538,6 +559,9 @@ writes to the audit trail.
 | M28 convention selection error (unparseable spec snapshot) | fails closed, nothing fetched | `TestResolveReviewDocuments_SelectionError_FailsClosed`, `TestSelectReviewConventions_Degrades` |
 | M29 review resolve phase exceeds `reviewDocumentResolveTimeout` | error, no `document_injected` | `TestResolveReviewDocuments_ResolvePhaseBounded`, `TestResolveReviewDocuments_ResolveDeadlineExceeded_FailsClosed` |
 | M30 no seam, no selected convention, reviewed stage unloadable | inert: zero value, no stage read, no forge call, no audit row | `TestResolveReviewDocuments_NilSeamNoSelection_UnloadableStage_Inert` |
+| M31 selection-truncation append fails (E78.5 / #3756) | error; no `document_injected` committed (asserted on the appender's committed entries) | `TestAttributeSet_SelectionAppendFailure_LeavesNoInjectionClaim` |
+| M32 selection truncation with no name / no dropped document | refused before any append | `TestAttributeSet_MalformedSelectionRefusedBeforeAnyAppend` |
+| M33 negative cap handed to `Fetched.Document` | clamped to zero (marker only), never a slice panic or "no cap" | `TestFetchedDocument_CapDomain` |
 
 ## Consumer contract
 
@@ -556,6 +580,15 @@ asserts their outputs differ only in the caller-supplied path, framing and
 body. `TestRepodocCarriesNoConsumerVocabulary` scans the package's non-test
 source (comments stripped) for consumer words, so the mechanism cannot quietly
 learn about conventions or charters.
+
+## Budgeted selections (`backend/internal/decisionrecord`, E78.5 / #3756)
+
+The decision-record consumer injects an index plus a ranked selection of whole
+records under ONE byte budget (the resolver's `CapBytes()`). It is the first
+consumer of `Fetch`/`Document`, `AttributeSet` and the selection shape of
+`document_truncated`; repodoc still carries no consumer vocabulary — the
+selection's name, ids and statuses are opaque strings to it. Contract:
+`backend/internal/decisionrecord/README.md`.
 
 ## Recovering the shown text (`InjectedContent`, E55.10 / #3755)
 
