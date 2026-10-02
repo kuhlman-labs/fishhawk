@@ -4779,7 +4779,20 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 	// implement_review_started (which must count them). A persona whose remit
 	// cannot be resolved or attributed is marked degraded and records
 	// persona_remit_unavailable in the loop instead of running.
-	personaInvs := s.resolvePersonaInvocations(s.resolveStageReviewerPersonas(ctx, runRow, stageID))
+	//
+	// Escalation-attached personas (E55.9 / #3754) join the reviewed stage's
+	// static set, matched against the APPROVED plan's scope union UNION every
+	// path the change touched: the pass diff AND the stage-cumulative evalDiff
+	// (so a fix-up delta cannot hide a sensitive path an earlier pass
+	// committed), rename/copy sources included. The diff half is what attaches
+	// the persona when the implementation drifted into a sensitive path the
+	// plan never named.
+	personaInvs := s.resolveReviewPersonaInvocations(ctx, runRow, stageID, "implement_review", reviewPaths{
+		plan:    planGateScopePaths(approvedPlan),
+		diff:    diffReviewPaths(diff, evalDiff),
+		source:  escalationPathSourceApprovedAndDiff,
+		headSHA: headSHA,
+	})
 	s.buildPersonaPrompts(ctx, runRow, stageID, "implement_review", trig, injected, treeDir, personaInvs)
 	invocations = append(invocations, personaInvs...)
 

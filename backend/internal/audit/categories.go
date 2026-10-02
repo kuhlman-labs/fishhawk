@@ -31,7 +31,9 @@ import "sort"
 // issue-restarted / paused) written via audit.AppendGlobalChained. #1941
 // added the failed-run revive audit kind (run_revived, #1915). E53.4 / #2227
 // added escalation_fired, written at the ONE server-side escalation resolver
-// both enforcement seams reach. E75.4 / #3732 added precedent_surfaced, the
+// both enforcement seams reach; E55.9 / #3754 added escalation_persona_attached,
+// written once per review round whose fired escalations attach reviewer
+// personas (server/escalation_persona.go) — INTERNAL like escalation_fired. E75.4 / #3732 added precedent_surfaced, the
 // record of exactly what precedent a captain-facing surface showed at an open
 // human gate (server/gate_precedent.go) — fingerprint-deduped like
 // escalation_fired, INTERNAL (never its own issue-thread activity line), and
@@ -325,6 +327,7 @@ var KnownCategories = map[string]struct{}{
 	"document_truncated":                      {},
 	"dispatch_watchdog_elapsed":               {},
 	"escalation_fired":                        {},
+	"escalation_persona_attached":             {}, // E55.9 / #3754: fired escalations attached reviewer personas to a review round (server/escalation_persona.go)
 	"fixup_no_changes":                        {},
 	"fixup_pushed":                            {},
 	"grooming_apply_completed":                {},

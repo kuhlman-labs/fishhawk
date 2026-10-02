@@ -1313,6 +1313,19 @@ func TestReasonPersonaRemitUnavailable_WireValue(t *testing.T) {
 	}
 }
 
+// TestReasonPersonaAttachmentUnresolvable_WireValue pins the skip REASON value
+// for an unresolvable persona attachment set (E55.9 / #3754): operators and
+// the MCP review surfaces read it verbatim, and it must stay distinct from the
+// per-persona remit degrade.
+func TestReasonPersonaAttachmentUnresolvable_WireValue(t *testing.T) {
+	if planreview.ReasonPersonaAttachmentUnresolvable != "persona_attachment_unresolvable" {
+		t.Errorf("ReasonPersonaAttachmentUnresolvable = %q", planreview.ReasonPersonaAttachmentUnresolvable)
+	}
+	if planreview.ReasonPersonaAttachmentUnresolvable == planreview.ReasonPersonaRemitUnavailable {
+		t.Error("the attachment-set skip reason must differ from the per-persona remit reason")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // E55.3 / #2244 — review-convention verdict contract.
 
