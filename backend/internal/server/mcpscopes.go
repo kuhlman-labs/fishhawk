@@ -114,6 +114,11 @@ var mcpToolScopes = map[string]mcpToolScopeRule{
 	// narrowing is the caller's own workspace account plus the point-read
 	// repo-visibility DENY, both applied inside the handler.
 	"fishhawk_precedent": mcpScopeAuthenticatedOnly,
+	// fishhawk_list_schedules (E79.1 / #3725) dials GET /v0/schedules
+	// (schedules.go handleGetSchedules), an authenticated read that checks NO
+	// scope: its only narrowing is the point-read repo-visibility DENY. It
+	// writes nothing and mints no audit entry.
+	"fishhawk_list_schedules": mcpScopeAuthenticatedOnly,
 	// fishhawk_delegation dials GET /v0/repos/{owner}/{name}/delegation
 	// (delegation_view.go handleGetRepoDelegation), an authenticated read that
 	// checks NO scope: its narrowing is the shared repoDashPrelude — the

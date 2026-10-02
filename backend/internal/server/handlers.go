@@ -134,6 +134,11 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	// captain record, campaign/run reads and the cached-spec delegation view;
 	// never writes.
 	mux.HandleFunc("GET /v0/handover-brief", s.handleGetHandoverBrief)
+	// Scheduler visibility (E79.1 / #3725): read-only report of each
+	// scheduled workflow's window, next due time and last outcome. Repo
+	// visibility is a point-read DENY inside the handler, applied BEFORE the
+	// nil-source enabled:false answer (schedules.go).
+	mux.HandleFunc("GET /v0/schedules", s.handleGetSchedules)
 	mux.HandleFunc("GET /v0/audit/export", s.handleAuditExport)
 	mux.HandleFunc("GET /v0/audit/export.csv", s.handleAuditExportCSV)
 	mux.HandleFunc("GET /v0/reports/agent-changes", s.handleAgentChangesReport)
