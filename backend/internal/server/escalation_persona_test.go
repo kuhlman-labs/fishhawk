@@ -115,7 +115,7 @@ func TestImplementReview_EscalationPersona_DriftAttachesViaDiff(t *testing.T) {
 		t.Fatalf("attachments = %+v, want 1", e.Attachments)
 	}
 	a := e.Attachments[0]
-	if a.Persona != personaTestName || !slices.Equal(a.Fired, []int{0}) || !slices.Equal(a.FiredKeys, []string{escalatedRuleKey(t)}) || !a.ViaDiffOnly || a.AlsoStatic {
+	if a.Persona != personaTestName || !slices.Equal(a.Fired, []int{0}) || !slices.Equal(a.FiredKeys, []string{escalatedRuleKey(t)}) || !a.ViaDiffOnly || a.AlsoStatic == nil || *a.AlsoStatic {
 		t.Errorf("attachment = %+v, want security fired [0] keys [%s] via_diff_only, not also_static", a, escalatedRuleKey(t))
 	}
 	entries := auditFakeEntries(au, CategoryEscalationPersonaAttached)
@@ -273,8 +273,66 @@ func TestReview_EscalationPersona_StaticAndEscalatedDedup(t *testing.T) {
 		t.Errorf("started = configured %d personas %v, want 2 [%s]", started.ConfiguredAgents, started.Personas, personaTestName)
 	}
 	got := decodePersonaAttached(t, au)
-	if len(got) != 1 || len(got[0].Attachments) != 1 || !got[0].Attachments[0].AlsoStatic {
+	if len(got) != 1 || len(got[0].Attachments) != 1 || got[0].Attachments[0].AlsoStatic == nil || !*got[0].Attachments[0].AlsoStatic {
 		t.Errorf("entries = %+v, want one also_static attachment", got)
+	}
+}
+
+// (C10, E55.10 / #3755, carried from #3754) also_static has three readings.
+// When the reviewed stage's static source DEGRADED (persona_stage_unresolvable
+// — here, the run's stages are unlistable) while an escalation still attaches
+// the persona, whether it is also static is UNKNOWN: the attachment carries NO
+// also_static key, decided on the raw JSON (absent and false are distinct
+// states). With a resolvable static source the key is present (true here).
+//
+// Counterfactual: always set AlsoStatic in writeEscalationPersonaAttachedAudit
+// — the degraded case carries also_static:false: RED.
+func TestEscalationPersonaAttached_AlsoStaticAbsentWhenStaticDegraded(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		degrade bool
+	}{
+		{"static source resolved keeps the key", false},
+		{"static source degraded omits the key", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			persona := approvingFake()
+			p := newPersonaPlanRun(t, escalatedSpec("plan"), approvingFake(), persona)
+			p.planBody = planBodyWithScope(t, escalatedPath)
+			if tc.degrade {
+				p.rr.stagesByRunID = nil // ListStagesForRun errors: the static source degrades
+			}
+			p.review(t)
+			if n := len(reviewerCalls(persona)); n != 1 {
+				t.Fatalf("persona calls = %d, want 1 — the escalation still attaches it", n)
+			}
+			entries := auditFakeEntries(p.au, CategoryEscalationPersonaAttached)
+			if len(entries) != 1 {
+				t.Fatalf("%s entries = %d, want 1", CategoryEscalationPersonaAttached, len(entries))
+			}
+			var raw struct {
+				Attachments []map[string]json.RawMessage `json:"attachments"`
+			}
+			if err := json.Unmarshal(entries[0].Payload, &raw); err != nil {
+				t.Fatal(err)
+			}
+			if len(raw.Attachments) != 1 {
+				t.Fatalf("attachments = %d, want 1", len(raw.Attachments))
+			}
+			v, present := raw.Attachments[0]["also_static"]
+			if tc.degrade {
+				if present {
+					t.Errorf("also_static = %s, want the key ABSENT when the static source degraded", v)
+				}
+				if n := len(decodeSkipped(t, p.au, "plan_review_skipped")); n != 1 {
+					t.Errorf("plan_review_skipped = %d, want the one persona_stage_unresolvable skip", n)
+				}
+				return
+			}
+			if !present || string(v) != "true" {
+				t.Errorf("also_static = %s (present %v), want true", v, present)
+			}
+		})
 	}
 }
 
@@ -361,7 +419,7 @@ func TestEscalationPersonaAttachedAudit_BestEffort(t *testing.T) {
 	logs.Reset()
 	s.cfg.AuditRepo = nil
 	res := escalationPersonaResolution{attachments: []escalation.PersonaAttachment{{Persona: personaTestName}}}
-	s.writeEscalationPersonaAttachedAudit(t.Context(), runRow, implStage.ID, "implement_review", reviewPaths{}, res, nil)
+	s.writeEscalationPersonaAttachedAudit(t.Context(), runRow, implStage.ID, "implement_review", reviewPaths{}, res, nil, false)
 	if !strings.Contains(logs.String(), "no audit repository") || !strings.Contains(logs.String(), personaTestName) {
 		t.Errorf("nil-repository WARN missing:\n%s", logs.String())
 	}

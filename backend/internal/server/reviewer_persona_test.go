@@ -19,6 +19,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/repodoc"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
 
 // Reviewer personas (ADR-084 / E55.8 / #3753) — the runtime half. Every test
@@ -56,6 +57,9 @@ type personaSpecOpts struct {
 	// (ADR-084 D2(c) / E55.9 / #3754) and declares the persona even when
 	// attachOn is "".
 	escalatePaths []string
+	// severityCap, when non-empty, declares the persona remit's severity_cap
+	// (E55.10 / #3755).
+	severityCap string
 }
 
 // personaSpec renders a complete workflow-v2 document: a plan and an
@@ -70,6 +74,9 @@ func personaSpec(o personaSpecOpts) []byte {
 	b.WriteString("version: \"2\"\n")
 	if o.attachOn != "" || len(o.escalatePaths) > 0 {
 		fmt.Fprintf(&b, "reviewer_personas:\n  security:\n    agent:\n      provider: %s\n      model: %s\n    remit:\n      path: %s\n", pp, personaAgentModel, personaRemitPath)
+		if o.severityCap != "" {
+			fmt.Fprintf(&b, "      severity_cap: %s\n", o.severityCap)
+		}
 	}
 	b.WriteString("workflows:\n  feature_change:\n")
 	if len(o.escalatePaths) > 0 {
@@ -367,6 +374,32 @@ func TestPersona_RemitUnattributed_DegradesPersonaOnly(t *testing.T) {
 	assertPersonaDegraded(t, p, personaDetailRemitUnattributed)
 }
 
+// (C8, E55.10 / #3755) With NO audit repository the remit's document_injected
+// attribution can never be written, so buildPersonaPrompt refuses with
+// remit_unattributed BEFORE any forge read. The fetch count is the isolating
+// observable: repodoc.Attribute's own nil check would still yield
+// remit_unattributed downstream (a masking guard), but only after a Resolve.
+//
+// Counterfactual: delete the AuditRepo nil guard — the remit is fetched once
+// before the downstream refusal: RED.
+func TestBuildPersonaPrompt_NilAuditRepoRefusesBeforeResolve(t *testing.T) {
+	p := newPersonaPlanRun(t, personaSpec(personaSpecOpts{attachOn: "plan"}), approvingFake(), approvingFake())
+	p.s.cfg.AuditRepo = nil
+	inv := reviewerInvocation{reviewer: approvingFake(), persona: &personaInvocation{selected: spec.SelectedReviewerPersona{
+		Name: personaTestName, RemitPath: personaRemitPath, DeclarationSite: personaDeclSite,
+	}}}
+	detail := p.s.buildPersonaPrompt(t.Context(), p.rr.getRuns[p.runID], p.stageID, "plan_review", prompt.Trigger{Repo: "kuhlman-labs/example"}, nil, "", inv)
+	if detail != personaDetailRemitUnattributed {
+		t.Errorf("detail = %q, want %q", detail, personaDetailRemitUnattributed)
+	}
+	if n := p.fetcher.fetches(); n != 0 {
+		t.Errorf("remit fetches = %d, want 0 — no forge read for a remit that can never be attributed", n)
+	}
+	if inv.persona.promptText != "" || inv.persona.quoteDocs != nil {
+		t.Error("a refused persona must carry no prompt and no quote documents")
+	}
+}
+
 // A forge failure other than not-found degrades with remit_unresolvable — the
 // detail distinguishes "the file is absent" from "the read failed".
 //
@@ -583,6 +616,30 @@ func TestResolveStageReviewerPersonas_FailurePaths(t *testing.T) {
 				t.Errorf("WARN log missing %q:\n%s", tc.wantWarn, logs)
 			}
 		})
+	}
+}
+
+// The GetStage-ERROR mode of the unresolvable static source, driven by a
+// DIRECT call (a stage-read failure set repo-wide would also fail the round's
+// own reads). The nil-stage branch yields the SAME pseudo invocation, so the
+// outcome alone cannot tell the two apart: the isolating observable is the
+// injected error's text in the WARN log, which the nil-stage branch never
+// logs.
+//
+// Counterfactual: replace the GetStage error branch's err with a fixed
+// "stage not found" — the sentinel is absent from the log: RED.
+func TestResolveStageReviewerPersonas_GetStageErrorReachesWarnLog(t *testing.T) {
+	const sentinel = "injected stage read failure 7f3e"
+	p := newPersonaPlanRun(t, personaSpec(personaSpecOpts{attachOn: "plan"}), approvingFake(), approvingFake())
+	p.rr.stageErr = errors.New(sentinel)
+	invs := p.s.resolveReviewPersonaInvocations(t.Context(), p.rr.getRuns[p.runID], p.stageID, "plan_review", reviewPaths{source: escalationPathSourcePlanScope})
+	if len(invs) != 1 || invs[0].persona == nil || invs[0].persona.degraded != personaDetailStageUnresolvable ||
+		invs[0].persona.reason != planreview.ReasonPersonaAttachmentUnresolvable {
+		t.Fatalf("invocations = %+v, want one persona_stage_unresolvable pseudo invocation", invs)
+	}
+	logs := p.logs.String()
+	if !strings.Contains(logs, "reviewer personas: load reviewed stage") || !strings.Contains(logs, sentinel) {
+		t.Errorf("WARN log does not carry the injected GetStage error:\n%s", logs)
 	}
 }
 
