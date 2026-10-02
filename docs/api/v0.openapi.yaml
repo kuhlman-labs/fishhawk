@@ -2849,7 +2849,7 @@ components:
           description: Derived as for `GateViewResolution.round`.
         veto_reason:
           type: string
-          enum: [raiser_rejected_same_round, operator_evidence_routed, fixup_pass_no_changes, evidence_lookup_failed, reopen_without_named_concern]
+          enum: [raiser_rejected_same_round, operator_evidence_routed, fixup_pass_no_changes, evidence_lookup_failed, reopen_without_named_concern, server_check_requires_human]
           description: |
             `raiser_rejected_same_round` — a DIFFERENT reviewer confirmed a
             concern whose RAISING reviewer returned `reject` in the same round;
@@ -2865,13 +2865,21 @@ components:
             blank, so nothing substantiated reopening the concern it names. It
             is decided PER RESOLUTION — a sibling resolution's note is evidence
             for that sibling, and `free_form` prose is unmatched to any concern
-            id and substantiates nothing.
+            id and substantiates nothing;
+            `server_check_requires_human` (E80.3 / #3760) — evaluated FIRST: the
+            concern was synthesized by a deterministic server check (provenance
+            `server_check`, e.g. the diff secrets check), so no reviewer verdict
+            may retire it — a `confirmed`, a `superseded` and the clean-round
+            auto-close are all refused; only a human waive or defer clears it.
         resolution:
           type: string
           description: |
             The refused resolution: `confirmed` for the four round-level veto
-            reasons, `reopened` for `reopen_without_named_concern`. Empty on an
-            entry recorded before #3319, which was always a `confirmed`.
+            reasons, `reopened` for `reopen_without_named_concern`, `auto_close`
+            for a refused clean-round auto-close of a routed concern (E45.84 /
+            #3619), and — with `server_check_requires_human` only — `confirmed`,
+            `superseded` or `auto_close`. Empty on an entry recorded before
+            #3319, which was always a `confirmed`.
         confirming_reviewer_model:
           type: string
         raising_reviewer_model:

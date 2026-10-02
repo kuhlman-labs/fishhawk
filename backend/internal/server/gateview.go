@@ -308,11 +308,16 @@ type gateViewDispute struct {
 	// VetoReason is one of raiser_rejected_same_round | operator_evidence_routed
 	// | fixup_pass_no_changes | evidence_lookup_failed |
 	// reopen_without_named_concern (#3319, the one reason that refuses a
-	// `reopened` rather than a `confirmed`).
+	// `reopened` rather than a `confirmed`) | server_check_requires_human
+	// (E80.3 / #3760: a server-synthesized concern no reviewer verdict may
+	// retire).
 	VetoReason string `json:"veto_reason"`
 	// Resolution is the refused resolution: "confirmed" for the four
-	// round-level veto reasons, "reopened" for reopen_without_named_concern.
-	// Empty on a legacy pre-#3319 entry, which was always a confirm.
+	// round-level veto reasons, "reopened" for reopen_without_named_concern,
+	// "auto_close" for a refused clean-round auto-close (#3619), and — with
+	// server_check_requires_human only — "confirmed", "superseded" or
+	// "auto_close". Empty on a legacy pre-#3319 entry, which was always a
+	// confirm.
 	Resolution              string `json:"resolution,omitempty"`
 	ConfirmingReviewerModel string `json:"confirming_reviewer_model,omitempty"`
 	RaisingReviewerModel    string `json:"raising_reviewer_model,omitempty"`
