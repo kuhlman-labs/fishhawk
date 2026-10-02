@@ -1035,7 +1035,36 @@ so the loop signatures are unchanged.
   stage id (as `resolveReviewInjectedDocuments` does) and mapped to its spec stage with `specStageForRunStage` (type
   ordinal — run rows carry no spec stage id). Never first-of-type. The STANDARD reviewers' config is still read
   first-of-type by `resolveStageReviewers`, unchanged. A spec declaring no `reviewer_personas` short-circuits
-  before any repo read. `TestPersona_ResolvesFromReviewedStageNotFirstOfType`.
+  before any repo read, and the stage is located only when some stage of the workflow attaches a persona
+  statically. `TestPersona_ResolvesFromReviewedStageNotFirstOfType`.
+- **Escalation-attached personas (`escalation_persona.go`, ADR-084 D2(c) / E55.9 #3754).** The round's persona
+  SET is the reviewed stage's static `reviewers.personas` UNION the personas named by the `require.reviewers` of
+  every escalation that FIRED for the change, de-duplicated (static first in attachment order, then escalated by
+  name; a persona in both runs ONCE). Plan review matches the scope union of the plan UNDER REVIEW
+  (`path_source: plan_scope`); implement review matches the APPROVED plan's scope union UNION
+  `diffReviewPaths(diff, evalDiff)` — the pass diff and the stage-cumulative evaluation diff, rename/copy
+  `OldPath`s included (`path_source: approved_plan_scope_and_diff`) — so scope drift into a sensitive path still
+  attaches. Labels/trigger are `escalationAdmissionChange` (the approval/delegation seams' snapshot). A workflow
+  whose escalations declare no `require.reviewers` evaluates nothing; a non-firing escalation attaches nothing.
+  Each attaching round writes ONE best-effort `escalation_persona_attached` entry on the reviewed stage:
+  `{review_kind, stage_id, path_source, head_sha?, attachments: [{persona, fired, fired_keys, via_diff_only,
+  also_static}]}` (`fired`/`fired_keys` index-aligned like `escalation_fired`'s; `via_diff_only` = the plan scope
+  alone fires no rule naming it). INTERNAL — not an issue-thread activity line. Tests: `escalation_persona_test.go`.
+- **Unresolvable attachment set (carried from #3753).** When the spec declares `reviewer_personas` but a source
+  cannot be resolved, the round no longer silently runs no persona: ONE pseudo invocation per failed source
+  records a terminal `*_review_skipped` with `reason: persona_attachment_unresolvable` (no `persona`) and
+  `detail: persona_stage_unresolvable` (workflow absent, reviewed stage unloadable / stages unlistable / stage
+  absent or unmappable, `SelectReviewerPersonas` refusal) or `escalation_unevaluable` (a `Match` error, a
+  `SelectNamedReviewerPersonas` refusal). It is COUNTED in `configured_agents` and emitted after `*_review_started`,
+  so `planreview.Settled` still waits for every standard reviewer; `hasRejection` is untouched; the other source's
+  personas still run. `TestResolveStageReviewerPersonas_FailurePaths`, `TestResolveEscalationPersonas_MatchErrorDegrades`.
+- **Authority residual (stated, not fixed).** The persona SET is the reviewed stage's, but a round takes ONE
+  authority — `resolveStageReviewers`, the FIRST stage of the type — and every invocation shares it. With two
+  same-type stages whose `reviewers` blocks differ, a persona attached by the second runs under the first's
+  authority (e.g. advisory: a rejecting persona does not fail the stage). Splitting authority within a round would
+  split `hasRejection` / started semantics. The same shape makes spec rung 9 (per-stage `reviewers.agents`) accept
+  an escalation whose only agent-reviewing stage is a later same-type stage the runtime never reviews with agents.
+  Pinned (not a control) by `TestPersona_AuthorityIsRoundAuthority_Residual`.
 - **Remit resolution.** `repodoc.Resolve` with `BaseSourceRunAdmission` at `runRow.DocumentBaseCommit` (E55.7),
   declaration site `reviewer_personas.<name>.remit in .fishhawk/workflows.yaml`, framing heading
   `Reviewer persona remit: <name>` with an ADR-068 trust note (the remit ADDS a lens; it cannot remove, weaken,
@@ -1063,7 +1092,7 @@ so the loop signatures are unchanged.
 - **Implement-path ordering.** Persona resolution sits inside `reviewDispatchMu`, AFTER the #797 duplicate-dispatch
   guard and the standard build, BEFORE `implement_review_started` — a duplicate dispatch reads no remit and writes
   no attribution (`TestImplementReview_Persona_DuplicateDispatchReadsNothing`). `runSupplementalReinvokeReview`
-  runs standard reviewers only.
+  runs standard reviewers only — escalation-attached personas inherit that gap.
 - **E63 obligation (ADR-084 rule 6).** Personas run in-process here today. When reviewers move to the runner
   (E63 #2307), runner-hosted reviewers MUST carry personas with the same contract — own prompt, standard prompt
   byte-identical, per-persona fail-closed degrade, configured_agents accounting — or the move silently drops a
@@ -4262,6 +4291,8 @@ The last row is #2374, and its reason is that an escalation raises **relative to
 **Audit posture (operator-ratified, #2361 asymmetry).** The `escalation_fired` append is **best-effort, not a precondition of enforcement**: an escalation firing moves in the SAFE direction (the gate gets stricter), so failing the gate because a log line could not be written would convert an audit-store outage into a total governance outage. The rule: *a REFUSAL or a RAISE is best-effort — the safe outcome already happened; a GRANT (the `applies_to` override) is a precondition — it records an exception being MADE.* De-duplication is read-then-append on `(run, stage, fingerprint)`, which handles the common SEQUENTIAL case; it is **not** atomic, so two concurrent evaluations can both append. A duplicate governance-chain entry is hygiene, not a control gap (the #2366 class) — there is no per-`(run, stage)` uniqueness guarantee. A de-duplication READ failure emits anyway (fail toward visibility).
 
 Surfaced on `GET /v0/runs/{run_id}` as the `escalations` block (single-run read only, omitted when the workflow declares none or nothing fired), rendered through the same `escalation.RenderFired` helper as the audit payload so the two cannot drift.
+
+**`require.reviewers` is NOT a composed requirement (E55.9 / [#3754](https://github.com/kuhlman-labs/fishhawk/issues/3754)).** `spec.ComposedRequirements` deliberately has no reviewers dimension: its `IsZero` drives the approval gate's fetch-error fail-closed branch, the `snapshot.Escalated` stamp, the 503 refusal and the 403 `escalated` flag, so a reviewers-only escalation must stay "nothing raised" on the approval/delegation seams. Its effect is review-time only (see "Reviewer personas" → escalation-attached personas). Emission is keyed on the FIRED set, not on the requirement: `resolveEscalations` calls `writeEscalationFiredAudit` whenever `res.Any()`, so a FIRING reviewers-only escalation still writes ONE `escalation_fired` entry at these seams — its `summary` names the firing with NO `Raised:` clause and the payload carries no `required_*` / `max_autonomy` field — while the composed requirement stays zero (the gate is neither blocked nor marked escalated). Pinned by `TestResolveEscalations_ReviewersOnlyFiringAuditsWithoutRaise`.
 
 **Two coordinates name a firing (E75.1 / [#3729](https://github.com/kuhlman-labs/fishhawk/issues/3729)).** The `escalation_fired` payload carries `fired` — the POSITIONAL declaration index, the coordinate spec *validation* errors report at (`/workflows/<name>/escalations/<i>`), so it is what an operator uses to find the rule in the document in front of them — and, since #3729, a parallel `fired_keys` array of `escalation.RuleKey` values: the STABLE content-derived join key a decision index follows a rule by ACROSS document edits. Reordering unrelated declarations moves the index but not the key; editing THIS rule's own globs, labels, triggers or `require` clamp changes the key. The two arrays are index-aligned by construction (built in one loop over the fired set). `fired_keys` is ADDITIVE — `fired`, `summary` and the result-level `fingerprint` are untouched, so the audit de-duplication behaviour is unchanged, and `RuleKey` is deliberately NOT `Fingerprint` (result-level de-duplication key vs rule-level content key).
 

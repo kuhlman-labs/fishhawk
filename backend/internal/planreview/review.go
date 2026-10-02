@@ -739,6 +739,19 @@ const ReasonReviewerUnavailable = "reviewer_unavailable"
 // category.
 const ReasonPersonaRemitUnavailable = "persona_remit_unavailable"
 
+// ReasonPersonaAttachmentUnresolvable is the ReviewSkippedPayload.Reason for a
+// reviewer-persona ATTACHMENT SET that could not be resolved (ADR-084 / E55.9 /
+// #3754, carrying #3753): the spec declares reviewer_personas, but the
+// reviewed stage could not be mapped onto its spec stage (Detail
+// persona_stage_unresolvable) or the escalations that attach personas could
+// not be evaluated (Detail escalation_unevaluable). Which personas would have
+// run is unknown, so ONE terminal skip per failed source is recorded instead
+// of silently running none; it is counted in configured_agents so the round
+// still settles exactly. Persona is empty — no persona was identified. A skip
+// REASON value on the existing *_review_skipped categories, not a new audit
+// category.
+const ReasonPersonaAttachmentUnresolvable = "persona_attachment_unresolvable"
+
 // ReviewSkippedPayload is the JSON payload stored in an audit
 // entry with category "plan_review_skipped" / "implement_review_skipped"
 // (#574). It records that an agent review the spec requested did not run.
@@ -750,6 +763,10 @@ const ReasonPersonaRemitUnavailable = "persona_remit_unavailable"
 //   - ReasonPersonaRemitUnavailable: a reviewer persona's remit document could
 //     not be resolved or attributed, so that persona alone did not run
 //     (ADR-084 / #3753); Persona and Detail name it and the failed step.
+//   - ReasonPersonaAttachmentUnresolvable: the round's persona attachment set
+//     could not be resolved at all (ADR-084 / E55.9 / #3754); Persona is empty
+//     and Detail names the failed source (persona_stage_unresolvable /
+//     escalation_unevaluable).
 //
 // Authority captures whether the skip degraded a gating or advisory gate;
 // in advisory mode the human gate remains authoritative.
@@ -780,8 +797,10 @@ type ReviewSkippedPayload struct {
 	// Detail is the machine-readable step a ReasonPersonaRemitUnavailable skip
 	// failed at (e.g. remit_missing, run_base_commit_unrecorded,
 	// document_resolver_unconfigured, remit_unresolvable,
-	// persona_prompt_build_failed, remit_unattributed). Empty on every other
-	// skip; omitempty keeps those payloads byte-identical.
+	// persona_prompt_build_failed, remit_unattributed) or the source a
+	// ReasonPersonaAttachmentUnresolvable skip failed at
+	// (persona_stage_unresolvable, escalation_unevaluable). Empty on every
+	// other skip; omitempty keeps those payloads byte-identical.
 	Detail string `json:"detail,omitempty"`
 }
 
