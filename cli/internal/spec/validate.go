@@ -22,6 +22,9 @@ import (
 //   - reviewers.authority with no agent reviewers (E53.2 / #2225);
 //   - a workflow's applies_to routing predicate (E53.3 / #2226), including
 //     the plan-stage rule on its `paths` criterion (E53.15 / #2377);
+//   - a workflow's schedule (E79.1 / #3725, schedule.go): the cross-field
+//     rule requiring applies_to.trigger to list `scheduled`, the cron
+//     grammar, the timezone, and never-fires;
 //   - a workflow's escalations block (E53.4 / #2227), minus the one check
 //     that needs the v2 autonomy resolver — see checkEscalations — including
 //     the require.reviewers rungs (ADR-084 D2(c) / E55.9 / #3754);
@@ -78,6 +81,10 @@ func validateAgentVersions(raw any) error {
 		// the stage loop — a stages-less workflow must still have its
 		// routing predicate reported.
 		checkAppliesTo(wf, wfName, &errs)
+		// schedule (E79.1 / #3725, schedule.go) is a WORKFLOW member too, and
+		// runs right after applies_to as the backend's validateSchedule does:
+		// its first rule reads applies_to.trigger.
+		checkSchedule(wf, wfName, &errs)
 		// escalations is likewise a WORKFLOW member and must be reported for
 		// a stages-less workflow too.
 		checkEscalations(wf, wfName, declaredPersonas, &errs)

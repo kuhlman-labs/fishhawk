@@ -44,6 +44,15 @@ attribution existed omit all three fields. A concern routed into a fix-up by id
 keeps `reviewer_role` and `quote_unverified` on the `stage_fixup_triggered`
 audit entry, and the fix-up prompt names the persona that raised it.
 
+A run's `trigger_source` can also be `scheduled`, which the table does not
+spell out either. Only the scheduler inside `fishhawkd` (off unless the daemon
+runs with `--enable-scheduler`) creates such a run, for a workflow that
+declares a `schedule`. `POST /v0/runs` refuses `scheduled` with 400
+`trigger_source_reserved`. `GET /v0/schedules?repo=owner/name` reports, for
+each scheduled workflow, its cron, the current due window, the next due time
+and the last outcome. When the scheduler is off it answers `enabled: false`
+rather than an error.
+
 ## Generated operation reference
 
 <!-- BEGIN GENERATED api -->
@@ -54,7 +63,7 @@ _Generated from the canonical sources by `scripts/gen-site-reference`; do not ed
 
 ## Operations
 
-The v0 REST API exposes **155 operations** across the paths below, generated from [`docs/api/v0.openapi.yaml`](https://github.com/kuhlman-labs/fishhawk/blob/main/docs/api/v0.openapi.yaml). That document is the source of truth; this table is its published rendering.
+The v0 REST API exposes **156 operations** across the paths below, generated from [`docs/api/v0.openapi.yaml`](https://github.com/kuhlman-labs/fishhawk/blob/main/docs/api/v0.openapi.yaml). That document is the source of truth; this table is its published rendering.
 
 | Method | Path | Summary |
 |---|---|---|
@@ -123,6 +132,7 @@ The v0 REST API exposes **155 operations** across the paths below, generated fro
 | `GET` | `/v0/digest` | "Since you last looked" digest for one repository |
 | `POST` | `/v0/digest/mark-read` | Advance the caller's digest read watermark |
 | `GET` | `/v0/handover-brief` | Handover brief for one repository |
+| `GET` | `/v0/schedules` | Scheduled workflows and their due windows for one repository |
 | `GET` | `/v0/captain` | The captain record for one repository |
 | `POST` | `/v0/captain/offer` | Offer the captain seat to a named successor |
 | `POST` | `/v0/captain/withdraw` | Withdraw a pending handover offer |

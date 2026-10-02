@@ -318,9 +318,17 @@ type TriggerSource string
 // this value existed. It is deliberately ISSUE-ANCHORED — the groom stage
 // declares `inputs: [{source: github_issue, required: true}]`, so an
 // on-demand grooming run carries an `issue:N` TriggerRef exactly as a
-// github_issue run does (see IsIssueAnchored). `scheduled` is deliberately
-// ABSENT: no scheduler exists to mint it, and an unreachable enum member
-// would re-create the dead-surface defect #2826 exists to close.
+// github_issue run does (see IsIssueAnchored).
+//
+// TriggerScheduled (E79.1 / #3725) is the CADENCE form: the producer for a
+// workflow declaring `applies_to: {trigger: [scheduled, ...]}` plus a
+// workflow-level `schedule`. It is SYSTEM-ONLY — minted exclusively by the
+// in-process scheduler through server.StartScheduledRun, which marks its
+// request with an unexported context key. POST /v0/runs refuses it from any
+// other caller with 400 trigger_source_reserved, so it is deliberately ABSENT
+// from ValidTriggerSources (the operator-submittable set). It is
+// issue-anchored when the schedule names an anchor `issue` (see
+// IsIssueAnchored).
 //
 // NOTE (visible modelling debt, #2826): trigger_source now carries BOTH the
 // run's ORIGIN and its routing FORM. github_issue/cli/ui name where a run
@@ -335,27 +343,36 @@ const (
 	TriggerCLI         TriggerSource = "cli"
 	TriggerUI          TriggerSource = "ui"
 	TriggerOnDemand    TriggerSource = "on_demand"
+	// TriggerScheduled is SYSTEM-ONLY: never in ValidTriggerSources, and
+	// admitted by POST /v0/runs only on the in-process scheduler's request.
+	TriggerScheduled TriggerSource = "scheduled"
 )
 
-// ValidTriggerSources is the closed set of accepted trigger sources, in
-// declaration order. It is the SINGLE source of truth every consumer renders
+// ValidTriggerSources is the closed set of OPERATOR-SUBMITTABLE trigger
+// sources, in declaration order. TriggerScheduled is deliberately excluded:
+// it is reserved to the in-process scheduler, and adding it here would make
+// it submittable over POST /v0/runs and the MCP start_run mirror. It is the SINGLE source of truth every consumer renders
 // from — the server's POST /v0/runs validation and its 400 message, and the
 // MCP start_run mirror — so the accepted set and the message an operator
 // reads cannot drift apart. Mirrors the ValidRunnerKinds idiom in this
 // package (a slice rather than a map because the message rendering needs a
 // stable order).
 //
-// A new member here must also be added to the runs_trigger_source_check
-// CHECK constraint (see backend/internal/postgres/migrations), or the INSERT
-// is rejected at the storage layer.
+// A new member here — and any system-only source such as TriggerScheduled —
+// must also be added to the runs_trigger_source_check CHECK constraint (see
+// backend/internal/postgres/migrations; 0093 added 'scheduled'), or the
+// INSERT is rejected at the storage layer.
 func ValidTriggerSources() []TriggerSource {
 	return []TriggerSource{TriggerGitHubIssue, TriggerCLI, TriggerUI, TriggerOnDemand}
 }
 
 // IsIssueAnchored reports whether this run's trigger source is one that
-// carries an `issue:N` TriggerRef — github_issue (the webhook/CLI issue path)
-// and on_demand (the operator-started grooming run, whose groom stage
-// REQUIRES a github_issue input).
+// carries an `issue:N` TriggerRef — github_issue (the webhook/CLI issue path),
+// on_demand (the operator-started grooming run, whose groom stage REQUIRES a
+// github_issue input) and scheduled (a scheduler-started run whose workflow's
+// `schedule` names an anchor `issue`, E79.1 / #3725). A scheduled run WITHOUT
+// an anchor has a nil TriggerRef, which every caller's TriggerRef check
+// already treats as "nothing to post to".
 //
 // It is deliberately a SOURCE-LEVEL predicate only: it says the source is one
 // that MAY be issue-anchored, never that this particular run has a usable
@@ -366,7 +383,8 @@ func (r *Run) IsIssueAnchored() bool {
 	if r == nil {
 		return false
 	}
-	return r.TriggerSource == TriggerGitHubIssue || r.TriggerSource == TriggerOnDemand
+	return r.TriggerSource == TriggerGitHubIssue || r.TriggerSource == TriggerOnDemand ||
+		r.TriggerSource == TriggerScheduled
 }
 
 // Run is the persisted record of a workflow execution.

@@ -6587,3 +6587,138 @@ func TestMigrateDown_ReviewConcernsPersonaAttributionReversal(t *testing.T) {
 		t.Fatalf("review_concerns persona-attribution column count after re-apply = %d, want 3 (0092 re-added them)", n)
 	}
 }
+
+// TestMigrateDown_RunsTriggerSourceScheduledReversal pins 0093 (E79.1 /
+// #3725) in BOTH directions, mirroring the 0075 ladder above, and is the place
+// the domain constant run.TriggerScheduled and the storage CHECK constraint
+// are proven to agree against a real PostgreSQL:
+//
+//  1. with 0093 applied a scheduled run INSERT SUCCEEDS, 'nonsense' is still
+//     REFUSED (relaxed, not dropped) and the four earlier sources still insert;
+//  2. a rollback attempted WHILE a scheduled row is live is REFUSED with
+//     SQLSTATE 23514 and leaves the widened constraint intact — the down
+//     migration's documented fail-loudly posture (0075 precedent);
+//  3. the operator action the down header names (delete the scheduled rows)
+//     is modelled explicitly;
+//  4. the rollback then succeeds and RESTORES the four-value set: scheduled is
+//     refused, on_demand (0075's member) still inserts, 'nonsense' is refused.
+//
+// Counterfactual target: delete the ADD CONSTRAINT from 0093's up file and the
+// state-1 'nonsense' assertion goes RED (a table with no constraint admits
+// every string); widen 0093's down file to keep 'scheduled' and the state-2
+// scheduled-refused assertion goes RED.
+func TestMigrateDown_RunsTriggerSourceScheduledReversal(t *testing.T) {
+	t.Parallel()
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	// Land 0093 as the APPLIED tip: the documented-refusal probe below calls
+	// MigrateDown expecting 0093's OWN down to refuse. Stepping down from
+	// whatever the tip is means migrations added above 0093 need no edit here.
+	const target = 93
+	for {
+		v, _, err := postgres.MigrateVersion(url)
+		if err != nil {
+			t.Fatalf("MigrateVersion: %v", err)
+		}
+		if v <= target {
+			if v != target {
+				t.Fatalf("schema at version %d after MigrateUp, want >= %d (0093 missing?)", v, target)
+			}
+			break
+		}
+		if err := postgres.MigrateDown(url); err != nil {
+			t.Fatalf("MigrateDown (roll back %04d on the way to 0093): %v", v, err)
+		}
+	}
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+	ctx := context.Background()
+
+	insertRun := func(triggerSource string) error {
+		_, err := pool.Exec(ctx,
+			`INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, state, runner_kind)
+			 VALUES ($1, 'kuhlman-labs/fishhawk', 'backlog_grooming', 'sha', $2, 'pending', 'local')`,
+			uuid.New(), triggerSource)
+		return err
+	}
+	// assertRefused requires a CHECK rejection by runs_trigger_source_check;
+	// a SUCCESSFUL insert is the interesting failure (no constraint refused it).
+	assertRefused := func(state, triggerSource string) {
+		t.Helper()
+		err := insertRun(triggerSource)
+		if err == nil {
+			t.Errorf("%s: insert trigger_source=%q SUCCEEDED, want a 23514 runs_trigger_source_check rejection", state, triggerSource)
+			return
+		}
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != "23514" || pgErr.ConstraintName != "runs_trigger_source_check" {
+			t.Errorf("%s: insert trigger_source=%q failed with %v, want SQLSTATE 23514 on runs_trigger_source_check", state, triggerSource, err)
+		}
+	}
+	assertAccepted := func(state, triggerSource string) {
+		t.Helper()
+		if err := insertRun(triggerSource); err != nil {
+			t.Errorf("%s: insert trigger_source=%q: %v, want accepted", state, triggerSource, err)
+		}
+	}
+
+	// ---- state 1: 0093 applied ----
+	assertAccepted("after MigrateUp", string(run.TriggerScheduled))
+	assertRefused("after MigrateUp", "nonsense")
+	for _, ts := range run.ValidTriggerSources() {
+		assertAccepted("after MigrateUp", string(ts))
+	}
+
+	// ---- the documented refusal: rollback with a live scheduled row ----
+	var cleanVersion int64
+	var cleanDirty bool
+	if err := pool.QueryRow(ctx, `SELECT version, dirty FROM schema_migrations`).Scan(&cleanVersion, &cleanDirty); err != nil {
+		t.Fatalf("read schema_migrations: %v", err)
+	}
+	downErr := postgres.MigrateDown(url)
+	if downErr == nil {
+		t.Fatalf("MigrateDown with a live scheduled run SUCCEEDED, want a refusal — 0093's down re-adds a CHECK that row violates and must fail rather than destroy run history")
+	}
+	var migrateErr database.Error
+	if !errors.As(downErr, &migrateErr) {
+		t.Fatalf("MigrateDown returned %v, want a golang-migrate database.Error carrying the CHECK violation", downErr)
+	}
+	var downCheckErr *pgconn.PgError
+	if !errors.As(migrateErr.OrigErr, &downCheckErr) || downCheckErr.Code != "23514" ||
+		!strings.Contains(downCheckErr.Message, "runs_trigger_source_check") {
+		t.Errorf("MigrateDown with a live scheduled run failed with %v, want SQLSTATE 23514 naming runs_trigger_source_check", migrateErr.OrigErr)
+	}
+	// ATOMIC: read the STATE after the refusal — the widened constraint must
+	// survive (scheduled still accepted, nonsense still refused).
+	assertAccepted("after the REFUSED rollback", string(run.TriggerScheduled))
+	assertRefused("after the REFUSED rollback", "nonsense")
+	// Restore the pre-attempt bookkeeping row (the operator's `migrate force`):
+	// the DDL rolled back, so 0093 genuinely is still the applied version.
+	if _, err := pool.Exec(ctx, `UPDATE schema_migrations SET version = $1, dirty = $2`, cleanVersion, cleanDirty); err != nil {
+		t.Fatalf("force schema_migrations back to version=%d dirty=%v: %v", cleanVersion, cleanDirty, err)
+	}
+
+	// ---- the operator action the down migration requires ----
+	tag, err := pool.Exec(ctx, `DELETE FROM runs WHERE trigger_source = 'scheduled'`)
+	if err != nil {
+		t.Fatalf("clear scheduled runs before rollback: %v", err)
+	}
+	if tag.RowsAffected() != 2 {
+		t.Fatalf("DELETE removed %d scheduled runs, want 2 (the state-1 seed and the atomicity probe's row)", tag.RowsAffected())
+	}
+
+	// ---- state 2: 0093 rolled back ----
+	if err := postgres.MigrateDown(url); err != nil {
+		t.Fatalf("MigrateDown (roll back 0093): %v", err)
+	}
+	assertRefused("after rollback", string(run.TriggerScheduled))
+	assertRefused("after rollback", "nonsense")
+	// RESTORED to 0075's four-value set, not 0001's three: on_demand survives.
+	assertAccepted("after rollback", string(run.TriggerOnDemand))
+	assertAccepted("after rollback", string(run.TriggerCLI))
+}

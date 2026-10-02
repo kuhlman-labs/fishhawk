@@ -172,6 +172,15 @@ type Config struct {
 	// repo-visibility-gated inside the handler (precedent.go).
 	PrecedentIndex PrecedentIndex
 
+	// Schedules is the in-process scheduler's read seam (E79.1 / #3725):
+	// GET /v0/schedules reports each scheduled workflow's cron, window,
+	// next due time and last outcome from it. fishhawkd sets it to an adapter
+	// over scheduler.Ticker.Snapshot ONLY when --enable-scheduler starts the
+	// ticker. Nil — the default — makes the endpoint answer 200
+	// enabled:false naming the switch, never 501, because "nothing is
+	// scheduled here" is the answer an operator needs (schedules.go).
+	Schedules ScheduleSource
+
 	// DivergenceConfig is the E75.5 / #3733 divergence threshold (ADR-082
 	// #3728 decision (d), rule 5): when a captain's decision at an
 	// allow-listed gate (concern waive, concern defer, plan reject) goes

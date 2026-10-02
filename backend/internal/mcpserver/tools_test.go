@@ -3380,7 +3380,14 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	// waive/defer posture); a run-bound token may answer only its own run.
 	// Its own tool, not a defer mode: it answers a question and may file a
 	// work item, but resolves no concern. 68 -> 69.
-	const wantToolCount = 69
+	//
+	// E79.1 (#3725) adds exactly ONE tool — fishhawk_list_schedules, the thin
+	// read-only wrapper over GET /v0/schedules. WHEN: the operator needs to
+	// know whether, when and how a workflow runs on its declared schedule
+	// (current window, next due time, last outcome). ELIGIBILITY: an
+	// authenticated read with no scope; the backend's point-read
+	// repo-visibility DENY is the only narrowing. It writes nothing. 69 -> 70.
+	const wantToolCount = 70
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",
@@ -3504,6 +3511,18 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	}
 	if !sawHandoverBrief {
 		t.Error("fishhawk_handover_brief is not in the registered tool list — the handover brief is unreachable over MCP")
+	}
+	// fishhawk_list_schedules (#3725) must be wire-visible by NAME, for the
+	// same reason as fishhawk_digest above.
+	var sawListSchedules bool
+	for _, tool := range res.Tools {
+		if tool.Name == "fishhawk_list_schedules" {
+			sawListSchedules = true
+			break
+		}
+	}
+	if !sawListSchedules {
+		t.Error("fishhawk_list_schedules is not in the registered tool list — the scheduler's visibility surface is unreachable over MCP")
 	}
 	// The three E77.3 (#3737) crew-message tools must be wire-visible by
 	// NAME, for the same reason as fishhawk_digest above.

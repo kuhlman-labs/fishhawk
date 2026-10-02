@@ -1474,7 +1474,11 @@ components:
           description: Git SHA of `.fishhawk/workflows.yaml` at run time.
         trigger_source:
           type: string
-          enum: [github_issue, cli, ui, on_demand]
+          enum: [github_issue, cli, ui, on_demand, scheduled]
+          description: |
+            `scheduled` (E79.1 / #3725) is minted ONLY by the in-process
+            scheduler (`--enable-scheduler`); `POST /v0/runs` refuses it
+            `400 trigger_source_reserved`.
         trigger_ref:
           type: [string, "null"]
           example: "issue:1247"
@@ -8089,6 +8093,123 @@ components:
             `to_sequence` (an entry was appended, but the watermark did not move
             for this call).
 
+    ScheduleList:
+      type: object
+      description: |
+        E79.1 / #3725. The in-process scheduler's state for one repository:
+        each workflow declaring a `schedule`, its current due window, next
+        due time and the last outcome recorded for it. `enabled` is false —
+        with `reason` naming the switch — when the deployment did not pass
+        `--enable-scheduler`; `repo_scanned` is false when the repository is
+        not in `--scheduler-repos`. Long-form contract:
+        `backend/internal/scheduler/README.md`.
+      required: [repo, enabled, repo_scanned, last_tick_at, schedules]
+      properties:
+        repo:
+          type: string
+          example: kuhlman-labs/fishhawk
+        enabled:
+          type: boolean
+          description: Whether the scheduler runs on this deployment.
+        reason:
+          type: string
+          description: |
+            Present when `enabled` is false (the scheduler is not enabled on
+            this deployment) or `repo_scanned` is false (the repository is not
+            in the scheduler's configured set).
+        repo_scanned:
+          type: boolean
+          description: Whether the scheduler scans this repository.
+        last_tick_at:
+          type: [string, "null"]
+          format: date-time
+          description: When the scheduler last scanned this repository; null before its first tick.
+        spec_error:
+          type: string
+          description: |
+            The most recent spec fetch or parse failure for the repository.
+            While set, no schedule in the repository is evaluated.
+        runner_kind:
+          type: string
+          enum: [github_actions, local, gitlab_ci]
+          description: The runner kind every scheduled run is started with.
+        dispatch_note:
+          type: string
+          description: |
+            Present when `runner_kind` is `local`: a started scheduled run
+            parks at `awaiting_host_dispatch` until a host dispatches it
+            (`fishhawk_dispatch_stage` / `fishhawk_run_stage`); the scheduler
+            does not auto-dispatch.
+        schedules:
+          type: array
+          description: One entry per scheduled workflow, sorted by `workflow_id`. Empty, never null.
+          items: { $ref: '#/components/schemas/ScheduleEntry' }
+    ScheduleEntry:
+      type: object
+      required: [workflow_id, cron, timezone, current_window_start, next_due_at, last_outcome]
+      properties:
+        workflow_id:
+          type: string
+          example: backlog_grooming
+        cron:
+          type: string
+          description: The declared 5-field cron expression.
+          example: "0 9 * * 1"
+        timezone:
+          type: string
+          description: IANA timezone the cron is evaluated in; `UTC` when the schedule names none.
+          example: America/Chicago
+        issue:
+          type: integer
+          description: The schedule's optional anchor issue number; absent when it names none.
+        current_window_start:
+          type: [string, "null"]
+          format: date-time
+          description: |
+            The latest cron fire at or before the last tick, in UTC. A window
+            yields at most one run: the scheduler starts it with
+            `Idempotency-Key: scheduled:<workflow_id>:<window start>`. Null
+            when the cron has not fired yet.
+        next_due_at:
+          type: [string, "null"]
+          format: date-time
+          description: The first cron fire strictly after the last tick, in UTC; null when none falls within the parser's horizon.
+        last_outcome:
+          oneOf:
+            - { $ref: '#/components/schemas/ScheduleOutcome' }
+            - { type: "null" }
+          description: The last attempt recorded for this workflow; null when none has been made by this process.
+    ScheduleOutcome:
+      type: object
+      required: [kind, window_start, at]
+      properties:
+        kind:
+          type: string
+          enum: [started, already_started, refused, transient_error]
+          description: |
+            `started` (audited `scheduled_run_started`), `already_started` —
+            an `Idempotency-Key` replay of a run an earlier tick or process
+            already started (audited `scheduled_run_skipped`), `refused` — an
+            admission control refused the run, e.g. `budget_exhausted` or an
+            `applies_to` / charter refusal (audited `scheduled_run_refused`),
+            or `transient_error` — a 5xx or transport failure that is logged
+            only and retried on the next tick.
+        window_start:
+          type: string
+          format: date-time
+        run_id:
+          type: string
+          format: uuid
+          description: The started or replayed run; absent for a refusal.
+        code:
+          type: string
+          description: The refusal's error code (e.g. `budget_exhausted`); absent for a start.
+        message:
+          type: string
+          description: The refusal's message or the transient error's text.
+        at:
+          type: string
+          format: date-time
     HandoverBrief:
       type: object
       description: >-
@@ -10450,8 +10571,11 @@ paths:
                     submitted with neither is still accepted (201)
                     and simply posts no issue comments, because
                     every consumer independently re-checks
-                    `trigger_ref`. `scheduled` is deliberately NOT
-                    accepted: no scheduler exists to mint it.
+                    `trigger_ref`. `scheduled` (E79.1 / #3725) is
+                    RESERVED to the in-process scheduler: a request
+                    naming it is refused `400 trigger_source_reserved`
+                    before any other check, so only the scheduler can
+                    mint a `scheduled` run.
                 trigger_ref:
                   type: [string, "null"]
                 runner_kind:
@@ -10673,7 +10797,10 @@ paths:
             `runner_kind`, message names the accepted `local` and
             `gitlab_ci`) — refused before any registry lookup so an
             unregistered project still learns the pairing rule. Also
-            `plan_reviewer_unconfigured` (see below).
+            `plan_reviewer_unconfigured` (see below), and
+            `trigger_source_reserved` — `trigger_source` is `scheduled`,
+            which only the in-process scheduler may mint (E79.1 / #3725);
+            no run row is created.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -14538,6 +14665,67 @@ paths:
             (`captain_record_read_failed` or `window_read_failed`, named in the
             message); or `service_unavailable` — repo visibility could not be
             resolved (#2071).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/schedules:
+    get:
+      operationId: listSchedules
+      summary: Scheduled workflows and their due windows for one repository
+      description: |
+        E79.1 / #3725. Read-only report of the in-process scheduler for one
+        repository: each workflow declaring a workflow-level `schedule` (cron,
+        IANA timezone, optional anchor `issue`), its current due window, next
+        due time and the last outcome recorded for it. The scheduler starts
+        the latest due window exactly once per (repo, workflow, window) via
+        `Idempotency-Key: scheduled:<workflow_id>:<window start>` and appends
+        each outcome to the global audit chain (`scheduled_run_started`,
+        `scheduled_run_skipped`, `scheduled_run_refused`); a started run
+        still stops at every gate.
+
+        **Off by default.** With no `--enable-scheduler` the answer is `200`
+        with `enabled: false` and a `reason` naming the switch — never 501,
+        because "nothing is scheduled here" is the answer.
+
+        **Local runner.** When `runner_kind` is `local`, `dispatch_note` says
+        a started run parks at `awaiting_host_dispatch` until a host
+        dispatches it; the scheduler does not auto-dispatch.
+
+        **Never writes.** No audit entry.
+
+        **Auth.** Authenticated; no scope. Order: `repo` is validated, then a
+        non-admin cookie-session caller must be able to read the repository
+        at the forge (ADR-057 Amendment A2 / #2071), and only then is the
+        scheduler consulted — so the `enabled: false` answer is never served
+        for a repository the caller cannot read. Long-form contract:
+        `backend/internal/scheduler/README.md`.
+      tags: [runs]
+      parameters:
+        - name: repo
+          in: query
+          required: true
+          description: Repository as `owner/name`.
+          schema: { type: string }
+      responses:
+        '200':
+          description: The repository's schedules (or `enabled` false).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ScheduleList' }
+        '400':
+          description: '`validation_failed` — `repo` missing or not `owner/name` (`details.field` is `repo`).'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: '`repo_forbidden` — the caller cannot read the repository.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: '`service_unavailable` — repo visibility could not be resolved (#2071).'
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

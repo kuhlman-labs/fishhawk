@@ -242,6 +242,18 @@ type Workflow struct {
 	// resolution — live in backend/internal/server and
 	// backend/internal/delegation.
 	Escalations []Escalation `json:"escalations,omitempty" yaml:"escalations,omitempty"`
+	// Schedule is the workflow's declared cadence (E79.1 / #3725). Nil means
+	// the scheduler never starts this workflow. It is declared BESIDE
+	// AppliesTo rather than inside it — AppliesTo is the shared Predicate
+	// and a cadence is not a match criterion — and validateSchedule holds
+	// the two together (a schedule requires applies_to.trigger to list
+	// `scheduled`). Like AppliesTo, the field is REQUIRED for the
+	// schema-permitted property to survive ParseBytes'
+	// DisallowUnknownFields decode, and it is not inherited through
+	// `extends`. The grammar, evaluator (Next/Prev) and validation live in
+	// schedule.go; the scheduler that consumes it is
+	// backend/internal/scheduler.
+	Schedule *Schedule `json:"schedule,omitempty" yaml:"schedule,omitempty"`
 }
 
 // Decomposition is the per-workflow decomposition control block (E24.6 /
@@ -307,13 +319,13 @@ const (
 	// gap: DerivedOperatorAgent maps only the five run-driving classes
 	// onto may_* knobs, so a `hygiene: {mode: auto}` class derives an
 	// EMPTY OperatorAgent knob block and therefore delegates NOTHING at
-	// any enforcement site. The posture is the one `scheduled` still
-	// ships with — no producer emits that trigger form (see
-	// backend/internal/appliesto.TriggerFormForSource), and it is
-	// accepted as declarable grammar rather than rejected. NOTE
-	// (E54.22 / #2826): the sibling `on_demand` form is no longer in
-	// that class — run.TriggerOnDemand is its producer — so `scheduled`
-	// alone carries the precedent now.
+	// any enforcement site. The posture is the one the non-diff trigger
+	// forms originally shipped with — declarable grammar accepted before
+	// any producer emitted it, rather than rejected. Both have producers
+	// now: run.TriggerOnDemand (E54.22 / #2826) and run.TriggerScheduled,
+	// minted only by fishhawkd's in-process scheduler for a workflow
+	// declaring a `schedule` (E79.1 / #3725) — so this condition alone
+	// carries the precedent.
 	ConditionObjectiveReversible DelegationCondition = "objective_reversible"
 )
 

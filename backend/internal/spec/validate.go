@@ -151,6 +151,14 @@ func validateWorkflow(s *Spec, name string, wf *Workflow, major int) error {
 		return err
 	}
 
+	// workflow `schedule` (E79.1 / #3725): the cross-field trigger rule,
+	// cron grammar, timezone and never-fires checks. Runs right after
+	// applies_to because its first rule reads applies_to.trigger, which is
+	// therefore already a well-formed predicate here.
+	if err := validateSchedule(name, wf); err != nil {
+		return err
+	}
+
 	// workflow `escalations` well-formedness (E53.4 / #2227): the
 	// only-ever-raise family, checked at the declaration site. Runs beside
 	// applies_to and AFTER it, so a workflow wrong in both places reports

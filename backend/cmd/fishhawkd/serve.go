@@ -81,6 +81,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/reviewresolver"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/role"
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/scheduler"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/scopeamendment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
@@ -2000,6 +2001,18 @@ func runServe(args []string, logSink io.Writer) int {
 	campaignDriverWorkflowRef := fs.String("campaign-driver-workflow-ref",
 		envOr("FISHHAWKD_CAMPAIGN_DRIVER_WORKFLOW_REF", ""),
 		"git ref the campaign driver fetches the workflow spec at (empty = the repo's default branch). The fetched blob SHA becomes each started run's workflow_sha.")
+	enableScheduler := fs.Bool("enable-scheduler",
+		envOr("FISHHAWKD_ENABLE_SCHEDULER", "false") == "true",
+		"start the workflow scheduler (E79.1 / #3725); starts each workflow that declares a `schedule` (and lists scheduled in applies_to.trigger) once per due cron window, through the same POST /v0/runs admission controls a hand-started run passes. A scheduled run still stops at every gate. Off by default to match the other tickers' dev-loop posture; needs a database, the GitHub App and --scheduler-repos, and logs why when one is missing.")
+	schedulerInterval := fs.Duration("scheduler-interval",
+		scheduler.DefaultInterval,
+		"scheduler scan interval; the upper bound on how late after a cron fire its run is started (a cron's finest grain is one minute, so a shorter interval buys nothing)")
+	schedulerRepos := fs.String("scheduler-repos",
+		envOr("FISHHAWKD_SCHEDULER_REPOS", ""),
+		"comma-separated owner/name repositories whose .fishhawk/workflows.yaml the scheduler reads at the default branch each tick. Required for --enable-scheduler to start the ticker. A malformed entry fails startup.")
+	schedulerRunnerKind := fs.String("scheduler-runner-kind",
+		envOr("FISHHAWKD_SCHEDULER_RUNNER_KIND", runpkg.RunnerKindGitHubActions),
+		"runner_kind every scheduled run is created with (a POST /v0/runs runner_kind; default github_actions). With local, a started run parks at awaiting_host_dispatch until a host dispatches it — the scheduler does not auto-dispatch. An unknown value fails startup.")
 	enableInvariantMonitor := fs.Bool("enable-invariant-monitor",
 		envOr("FISHHAWKD_ENABLE_INVARIANT_MONITOR", "false") == "true",
 		"start the self-consistency invariant monitor (#764); periodically auto-reconciles the safe {all stages terminal, run non-terminal} class and surfaces (audit + WARN log) the unrecoverable {review awaiting_approval, null pull_request_url on a push-and-open-pr run} class. Off by default to match the other tickers' dev-loop posture.")
@@ -2240,6 +2253,21 @@ func runServe(args []string, logSink io.Writer) int {
 	}
 
 	logger := newLogger(logSink)
+
+	// Scheduler flags (E79.1 / #3725). Validated whether or not
+	// --enable-scheduler is set, and FIRST, before anything dials a database:
+	// a typo in either must fail startup loudly rather than silently start
+	// runs on a runner kind nobody chose, or quietly drop a repository from
+	// the scan.
+	if err := validateSchedulerRunnerKind(*schedulerRunnerKind); err != nil {
+		logger.Error("invalid --scheduler-runner-kind", slog.String("error", err.Error()))
+		return exitFailure
+	}
+	schedRepos, err := parseSchedulerRepos(*schedulerRepos)
+	if err != nil {
+		logger.Error("invalid --scheduler-repos", slog.String("error", err.Error()))
+		return exitFailure
+	}
 
 	// OAuth token-mint authz minimum (E39.3 / #1708). Fail closed on an
 	// unrecognized tier rather than silently defaulting — a typo must not
@@ -3430,6 +3458,23 @@ func runServe(args []string, logSink io.Writer) int {
 	}
 	cfg.PushDispatcher = pushDispatcher
 
+	// Scheduler (E79.1 / #3725). Built HERE, before server.New, because
+	// cfg.Schedules (the GET /v0/schedules read seam) must be assigned before
+	// cfg is copied into the Server. The run-starter rides as a closure over
+	// the `srv` variable assigned on the next line; the ticker only calls it
+	// from Run, which starts after that assignment (beside the campaign
+	// driver below). Off by default: a flag-off boot builds nothing and
+	// leaves cfg.Schedules nil, so the endpoint answers enabled:false.
+	var schedTicker *scheduler.Ticker
+	if start, skipReason := schedulerStartDecision(*enableScheduler, cfg, schedRepos); start {
+		schedTicker = newScheduler(cfg, func(ctx context.Context, p server.ScheduledRunParams) (server.ScheduledStartOutcome, error) {
+			return srv.StartScheduledRun(ctx, p)
+		}, logger, *schedulerInterval, schedRepos, *schedulerRunnerKind)
+		cfg.Schedules = schedulerSnapshotSource{ticker: schedTicker}
+	} else if *enableScheduler {
+		logger.Warn(skipReason)
+	}
+
 	srv = newServer(cfg)
 
 	// Per-repo work-management conventions loader (E45.16 / #2022): fetch
@@ -3809,6 +3854,23 @@ func runServe(args []string, logSink io.Writer) int {
 		logger.Warn(skipReason)
 	}
 
+	// Scheduler ticker (E79.1 / #3725), constructed before server.New above
+	// (schedTicker is non-nil only when schedulerStartDecision allowed it).
+	// Every window is started through srv.StartScheduledRun, which drives the
+	// existing handleCreateRun in-process, so a scheduled run passes the same
+	// admission controls and stops at every gate a hand-started run does.
+	if schedTicker != nil {
+		go func() {
+			if err := schedTicker.Run(ctx); err != nil {
+				logger.Error("scheduler exited with error", slog.String("error", err.Error()))
+			}
+		}()
+		logger.Info("scheduler started",
+			slog.Duration("interval", *schedulerInterval),
+			slog.String("repos", strings.Join(schedRepos, ",")),
+			slog.String("runner_kind", *schedulerRunnerKind))
+	}
+
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.Start() }()
 
@@ -4097,6 +4159,235 @@ func newCampaignDriver(cfg server.Config, srv *server.Server, logger *slog.Logge
 		t.Notifier = notifier
 	}
 	return t
+}
+
+// schedulerStartDecision reports whether the scheduler ticker (E79.1 / #3725)
+// should start, and a human reason when it should not — the
+// campaignDriverStartDecision shape, extracted so the fail-closed gating is
+// unit-testable. The flag-off case is a SILENT skip (no reason) and builds
+// nothing. Enabled, the scheduler needs the run and audit repos (the started
+// runs and its outcome entries), the GitHub client (it reads each repo's spec
+// through the App, like the campaign driver) and at least one repository to
+// scan; a missing one is a logged skip rather than a ticker that no-ops every
+// tick.
+func schedulerStartDecision(enabled bool, cfg server.Config, repos []string) (start bool, skipReason string) {
+	if !enabled {
+		return false, ""
+	}
+	switch {
+	case cfg.RunRepo == nil || cfg.AuditRepo == nil:
+		return false, "--enable-scheduler set but RunRepo or AuditRepo unconfigured (needs a database); scheduler not started"
+	case cfg.GitHub == nil:
+		return false, "--enable-scheduler set but GitHub client unconfigured (the scheduler reads each repository's workflow spec through the GitHub App); scheduler not started"
+	case len(repos) == 0:
+		return false, "--enable-scheduler set but --scheduler-repos / FISHHAWKD_SCHEDULER_REPOS names no repository; scheduler not started"
+	default:
+		return true, ""
+	}
+}
+
+// validateSchedulerRunnerKind refuses a --scheduler-runner-kind that
+// POST /v0/runs would refuse, naming the accepted set (rendered from
+// run.ValidRunnerKinds, sorted, so the message can never name a different set
+// than the one enforced).
+func validateSchedulerRunnerKind(kind string) error {
+	if _, ok := runpkg.ValidRunnerKinds[kind]; ok {
+		return nil
+	}
+	names := make([]string, 0, len(runpkg.ValidRunnerKinds))
+	for k := range runpkg.ValidRunnerKinds {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	return fmt.Errorf("%q is not a runner kind; want one of %s", kind, strings.Join(names, ", "))
+}
+
+// parseSchedulerRepos splits --scheduler-repos on commas, trims each entry,
+// drops empties and duplicates (first occurrence wins, so the scan order is
+// the operator's), and refuses any entry that is not exactly owner/name.
+func parseSchedulerRepos(raw string) ([]string, error) {
+	var out []string
+	seen := map[string]bool{}
+	for _, part := range strings.Split(raw, ",") {
+		repo := strings.TrimSpace(part)
+		if repo == "" {
+			continue
+		}
+		owner, name, ok := strings.Cut(repo, "/")
+		if !ok || owner == "" || name == "" || strings.Contains(name, "/") {
+			return nil, fmt.Errorf("%q is not an owner/name repository", repo)
+		}
+		if seen[repo] {
+			continue
+		}
+		seen[repo] = true
+		out = append(out, repo)
+	}
+	return out, nil
+}
+
+// scheduledRunStartFunc is the server.Server.StartScheduledRun shape. runServe
+// binds it as a closure over the not-yet-assigned srv variable, so the ticker
+// can be built before server.New (cfg.Schedules must be set before cfg is
+// copied); tests bind a recording fake.
+type scheduledRunStartFunc func(ctx context.Context, p server.ScheduledRunParams) (server.ScheduledStartOutcome, error)
+
+// newScheduler builds the scheduler ticker from cfg. Callers must gate on
+// schedulerStartDecision first: it relies on cfg.GitHub and cfg.AuditRepo
+// being non-nil.
+func newScheduler(cfg server.Config, start scheduledRunStartFunc, logger *slog.Logger, interval time.Duration, repos []string, runnerKind string) *scheduler.Ticker {
+	return &scheduler.Ticker{
+		Repos:      repos,
+		Specs:      githubScheduleSpecSource{gh: cfg.GitHub},
+		Starter:    scheduledRunStarter{start: start},
+		Audit:      cfg.AuditRepo,
+		RunnerKind: runnerKind,
+		Interval:   interval,
+		Logger:     logger,
+	}
+}
+
+// scheduleSpecFetcher is the slice of *githubclient.Client the scheduler's
+// spec source uses, narrowed so serve_test.go can substitute a fake.
+type scheduleSpecFetcher interface {
+	GetRepoInstallation(ctx context.Context, repo forge.RepoRef) (int64, error)
+	GetWorkflowSpec(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, ref string) (*githubclient.FileContent, error)
+}
+
+// githubScheduleSpecSource adapts the GitHub App to scheduler.SpecSource: it
+// resolves the repository's installation and fetches .fishhawk/workflows.yaml
+// at the DEFAULT branch (ref ""), the same two calls
+// Server.StartRunForCampaignIssue makes. The returned sha is the blob SHA,
+// which becomes each scheduled run's workflow_sha.
+type githubScheduleSpecSource struct {
+	gh scheduleSpecFetcher
+}
+
+func (g githubScheduleSpecSource) FetchSpec(ctx context.Context, repo string) ([]byte, string, error) {
+	owner, name, ok := strings.Cut(repo, "/")
+	if !ok || owner == "" || name == "" {
+		return nil, "", fmt.Errorf("scheduler repo %q is not in owner/name form", repo)
+	}
+	repoRef := forge.RepoRef{Owner: owner, Name: name}
+	instID, err := g.gh.GetRepoInstallation(ctx, repoRef)
+	if err != nil {
+		return nil, "", fmt.Errorf("resolve installation for %s: %w", repo, err)
+	}
+	fc, err := g.gh.GetWorkflowSpec(ctx, forge.FromGitHubInstallationID(instID), repoRef, "")
+	if err != nil {
+		return nil, "", fmt.Errorf("fetch workflow spec for %s: %w", repo, err)
+	}
+	if fc == nil {
+		return nil, "", fmt.Errorf("fetch workflow spec for %s: no content returned", repo)
+	}
+	return fc.Content, fc.SHA, nil
+}
+
+// scheduledRunStarter adapts Server.StartScheduledRun to scheduler.RunStarter:
+// it translates the scheduler's StartRequest into server.ScheduledRunParams
+// and the server's classified outcome back. The two kind vocabularies are
+// mapped EXPLICITLY; a server kind this adapter does not know is returned as
+// an error, which the scheduler treats as transient (logged, retried next
+// tick) rather than guessing a definitive outcome for the window.
+type scheduledRunStarter struct {
+	start scheduledRunStartFunc
+}
+
+func (a scheduledRunStarter) StartScheduledRun(ctx context.Context, req scheduler.StartRequest) (scheduler.StartOutcome, error) {
+	out, err := a.start(ctx, server.ScheduledRunParams{
+		Repo:           req.Repo,
+		WorkflowID:     req.WorkflowID,
+		WorkflowSHA:    req.WorkflowSHA,
+		WorkflowSpec:   req.WorkflowSpec,
+		IdempotencyKey: req.IdempotencyKey,
+		IssueNumber:    req.IssueNumber,
+		RunnerKind:     req.RunnerKind,
+	})
+	if err != nil {
+		return scheduler.StartOutcome{}, err
+	}
+	var kind scheduler.OutcomeKind
+	switch out.Kind {
+	case server.ScheduledStartStarted:
+		kind = scheduler.OutcomeStarted
+	case server.ScheduledStartAlreadyStarted:
+		kind = scheduler.OutcomeAlreadyStarted
+	case server.ScheduledStartRefused:
+		kind = scheduler.OutcomeRefused
+	default:
+		return scheduler.StartOutcome{}, fmt.Errorf("scheduled run start: unrecognized outcome kind %q (status %d)", out.Kind, out.Status)
+	}
+	so := scheduler.StartOutcome{Kind: kind, Code: out.Code, Message: out.Message, Status: out.Status}
+	if out.RunID != uuid.Nil {
+		so.RunID = out.RunID.String()
+	}
+	return so, nil
+}
+
+// schedulerSnapshotSource adapts scheduler.Ticker's snapshot to
+// server.ScheduleSource (cfg.Schedules), the read seam behind
+// GET /v0/schedules and fishhawk_list_schedules. The deployment-level
+// RunnerKind is reported even for a repository the scheduler does not scan,
+// so the local-runner dispatch note still renders there.
+//
+// Not carried: WorkflowSnapshot.ScheduleError. The wire shape has no slot for
+// it, and it is defence in depth only — spec.ParseBytes validates every
+// schedule (validateSchedule) before the ticker evaluates it, so an
+// unparseable schedule surfaces as the repository's SpecError instead.
+type schedulerSnapshotSource struct {
+	ticker *scheduler.Ticker
+}
+
+func (s schedulerSnapshotSource) ScheduleSnapshot(repo string) (server.ScheduleSnapshot, bool) {
+	out := server.ScheduleSnapshot{RunnerKind: s.ticker.RunnerKind}
+	snap, ok := s.ticker.SnapshotFor(repo)
+	if !ok {
+		return out, false
+	}
+	out.LastTickAt = snap.LastTickAt
+	out.SpecError = snap.SpecError
+	out.Schedules = make([]server.ScheduleEntry, 0, len(snap.Schedules))
+	for _, w := range snap.Schedules {
+		e := server.ScheduleEntry{
+			WorkflowID:         w.WorkflowID,
+			Cron:               w.Cron,
+			Timezone:           w.Timezone,
+			Issue:              w.Issue,
+			CurrentWindowStart: w.CurrentWindowStart,
+			NextDueAt:          w.NextDueAt,
+		}
+		if lo := w.LastOutcome; lo != nil {
+			e.LastOutcome = &server.ScheduleOutcome{
+				Kind:        scheduleOutcomeKindForWire(lo.Kind),
+				WindowStart: lo.WindowStart,
+				RunID:       lo.RunID,
+				Code:        lo.Code,
+				Message:     lo.Message,
+				At:          lo.At,
+			}
+		}
+		out.Schedules = append(out.Schedules, e)
+	}
+	return out, true
+}
+
+// scheduleOutcomeKindForWire maps the scheduler's outcome vocabulary onto the
+// server's ScheduleOutcome.Kind constants explicitly, so a rename on either
+// side is a compile-visible or test-visible break rather than a silent string
+// drift. An unknown kind passes through verbatim (visibility, not a gate).
+func scheduleOutcomeKindForWire(k scheduler.OutcomeKind) string {
+	switch k {
+	case scheduler.OutcomeStarted:
+		return server.ScheduleOutcomeKindStarted
+	case scheduler.OutcomeAlreadyStarted:
+		return server.ScheduleOutcomeKindAlreadyStarted
+	case scheduler.OutcomeRefused:
+		return server.ScheduleOutcomeKindRefused
+	case scheduler.OutcomeTransientError:
+		return server.ScheduleOutcomeKindTransientError
+	default:
+		return string(k)
+	}
 }
 
 // campaignOperatorIdentity builds the in-process Identity the campaign
