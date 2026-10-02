@@ -115,6 +115,10 @@ func (s *Server) resolveEscalations(ctx context.Context, runRow *run.Run, wf *sp
 		// declaration we cannot evaluate. Fail closed — see the file header.
 		return escalation.Result{}, fmt.Errorf("evaluate escalations: %w", err)
 	}
+	// Keyed on the FIRED set, not on Requirements.IsZero: a firing
+	// reviewers-only escalation (E55.9 / #3754) raises nothing here yet still
+	// writes one entry with no "Raised:" clause — pinned by
+	// TestResolveEscalations_ReviewersOnlyFiringAuditsWithoutRaise.
 	if res.Any() {
 		s.writeEscalationFiredAudit(ctx, runRow, stageID, res)
 	}
@@ -142,11 +146,7 @@ func (s *Server) resolveEscalations(ctx context.Context, runRow *run.Run, wf *sp
 // answers about one run. TRIGGER comes from the run's trigger_source through
 // the shared appliesto mapping.
 func (s *Server) escalationChange(ctx context.Context, runRow *run.Run, escalations []spec.Escalation) (spec.Change, error) {
-	var labels []string
-	if runRow.IssueContext != nil {
-		labels = runRow.IssueContext.Labels
-	}
-	change := appliesto.AdmissionChange(string(runRow.TriggerSource), labels)
+	change := escalationAdmissionChange(runRow)
 
 	if !escalationsDeclarePaths(escalations) {
 		return change, nil
@@ -160,6 +160,19 @@ func (s *Server) escalationChange(ctx context.Context, runRow *run.Run, escalati
 	}
 	change.Paths = planGateScopePaths(approvedPlan)
 	return change, nil
+}
+
+// escalationAdmissionChange is the path-less half of escalationChange: the
+// run's trigger source and its IMMUTABLE issue-label snapshot, through the
+// shared appliesto mapping. Factored out so the review-time persona resolver
+// (escalation_persona.go) matches the SAME labels and trigger the approval and
+// delegation seams do, and supplies its own path set (E55.9 / #3754).
+func escalationAdmissionChange(runRow *run.Run) spec.Change {
+	var labels []string
+	if runRow.IssueContext != nil {
+		labels = runRow.IssueContext.Labels
+	}
+	return appliesto.AdmissionChange(string(runRow.TriggerSource), labels)
 }
 
 // escalationsDeclarePaths reports whether any declaration carries a `paths`

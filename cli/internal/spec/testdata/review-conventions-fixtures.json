@@ -1,5 +1,5 @@
 {
-  "$comment": "Canonical review_conventions AND reviewer_personas parity corpus (ADR-068 / E55.2 / #2243; ADR-084 / E55.8 / #3753 — the persona-* rows, rules in each module's reviewer_personas.go). The review_conventions grammar is validated by TWO implementations that cannot import each other across the backend/cli module wall: the typed backend layer (backend/internal/spec: ParseBytes -> version-routed schema -> typed decode under DisallowUnknownFields -> v2 reuse resolution -> Validate, rules in review_conventions.go) and the CLI's raw-map port (cli/internal/spec: ValidateBytes -> schema -> reuse -> semantic sweep, rules in review_conventions.go). This file is the shared proof surface: each module runs EVERY row through its REAL parse path and asserts the SAME verdict — TestReviewConventionsCorpus_BackendMatches and TestReviewConventionsCorpus_CLIMatches. Row shape: name; optional note; doc (a complete workflow-v2 YAML document); valid; and, for a rejection, layer (schema | semantic) plus path (a JSON pointer). A semantic row also carries message, the EXACT rejection text: the backend's single ValidationError and the CLI's single ValidationErrorEntry must both equal path + message byte for byte. A schema row asserts only that the rejection lands at or under path (the backend reports one leaf, the CLI every leaf). Every rejection row triggers EXACTLY ONE rule, so the backend's first-error and the CLI's full list are comparable; a multi-error document is outside the parity claim. Mirrored verbatim into both modules' testdata/ by scripts/sync-schemas; CI's schema-sync gate red-lines any divergence between the three copies. Named *-fixtures.json (NOT *.schema.json) so the docs/spec/*.schema.json sync loop never globs it.",
+  "$comment": "Canonical review_conventions AND reviewer_personas parity corpus (ADR-068 / E55.2 / #2243; ADR-084 / E55.8 / #3753 — the persona-* rows, rules in each module's reviewer_personas.go; ADR-084 D2(c) / E55.9 / #3754 — the persona-escalation-* rows, the escalation require.reviewers rungs in the backend's escalation.go and the CLI's validate.go checkEscalations). The review_conventions grammar is validated by TWO implementations that cannot import each other across the backend/cli module wall: the typed backend layer (backend/internal/spec: ParseBytes -> version-routed schema -> typed decode under DisallowUnknownFields -> v2 reuse resolution -> Validate, rules in review_conventions.go) and the CLI's raw-map port (cli/internal/spec: ValidateBytes -> schema -> reuse -> semantic sweep, rules in review_conventions.go). This file is the shared proof surface: each module runs EVERY row through its REAL parse path and asserts the SAME verdict — TestReviewConventionsCorpus_BackendMatches and TestReviewConventionsCorpus_CLIMatches. Row shape: name; optional note; doc (a complete workflow-v2 YAML document); valid; and, for a rejection, layer (schema | semantic) plus path (a JSON pointer). A semantic row also carries message, the EXACT rejection text: the backend's single ValidationError and the CLI's single ValidationErrorEntry must both equal path + message byte for byte. A schema row asserts only that the rejection lands at or under path (the backend reports one leaf, the CLI every leaf). Every rejection row triggers EXACTLY ONE rule, so the backend's first-error and the CLI's full list are comparable; a multi-error document is outside the parity claim. Mirrored verbatim into both modules' testdata/ by scripts/sync-schemas; CI's schema-sync gate red-lines any divergence between the three copies. Named *-fixtures.json (NOT *.schema.json) so the docs/spec/*.schema.json sync loop never globs it.",
   "rows": [
     {
       "name": "issue-example",
@@ -384,7 +384,7 @@
       "valid": false,
       "layer": "semantic",
       "path": "/reviewer_personas/audit",
-      "message": "reviewer_personas.audit is declared but no stage attaches it through reviewers.personas, so it would run no review — it is refused rather than silently accepted as a control that does something; attach it on a plan or implement stage, or remove the declaration"
+      "message": "reviewer_personas.audit is declared but no stage attaches it through reviewers.personas and no workflow escalation requires it through require.reviewers, so it would run no review — it is refused rather than silently accepted as a control that does something; attach it on a plan or implement stage, require it from an escalation, or remove the declaration"
     },
     {
       "name": "persona-attached-only-in-unused-defaults",
@@ -393,7 +393,76 @@
       "valid": false,
       "layer": "semantic",
       "path": "/reviewer_personas/security",
-      "message": "reviewer_personas.security is declared but no stage attaches it through reviewers.personas, so it would run no review — it is refused rather than silently accepted as a control that does something; attach it on a plan or implement stage, or remove the declaration"
+      "message": "reviewer_personas.security is declared but no stage attaches it through reviewers.personas and no workflow escalation requires it through require.reviewers, so it would run no review — it is refused rather than silently accepted as a control that does something; attach it on a plan or implement stage, require it from an escalation, or remove the declaration"
+    },
+    {
+      "name": "persona-escalation-attached-only",
+      "note": "E55.9 / #3754: a persona attached ONLY by an escalation's require.reviewers (no stage attaches it statically) is referenced — the reference rung counts escalation attachments on both validators",
+      "doc": "version: \"2\"\nreviewer_personas:\n  security:\n    agent:\n      provider: codex\n    remit:\n      path: docs/review/security-remit.md\nworkflows:\n  feature_change:\n    escalations:\n      - match:\n          paths: [\"backend/internal/spec/**\"]\n        require:\n          reviewers: [security]\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n      - id: implement\n        type: implement\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: pull_request\n        reviewers:\n          agents:\n            - provider: anthropic\n",
+      "valid": true
+    },
+    {
+      "name": "persona-escalation-labels-match",
+      "note": "require.reviewers under a labels-only match: the reviewers rungs do not depend on the match criterion",
+      "doc": "version: \"2\"\nreviewer_personas:\n  security:\n    agent:\n      provider: codex\n    remit:\n      path: docs/review/security-remit.md\nworkflows:\n  feature_change:\n    escalations:\n      - match:\n          labels: [security]\n        require:\n          reviewers: [security]\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n      - id: implement\n        type: implement\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: pull_request\n        reviewers:\n          agents:\n            - provider: anthropic\n",
+      "valid": true
+    },
+    {
+      "name": "persona-escalation-static-on-one-stage",
+      "note": "the no-op boundary: the persona is static on the plan stage only, so escalating it raises the implement review and is accepted",
+      "doc": "version: \"2\"\nreviewer_personas:\n  security:\n    agent:\n      provider: codex\n    remit:\n      path: docs/review/security-remit.md\nworkflows:\n  feature_change:\n    escalations:\n      - match:\n          paths: [\"backend/internal/spec/**\"]\n        require:\n          reviewers: [security]\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n          personas: [security]\n      - id: implement\n        type: implement\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: pull_request\n        reviewers:\n          agents:\n            - provider: anthropic\n",
+      "valid": true
+    },
+    {
+      "name": "persona-escalation-unknown-name",
+      "note": "rung 8: the FIRST undeclared require.reviewers name is reported at its item index; security is declared and referenced by this same escalation, so no other rule fires",
+      "doc": "version: \"2\"\nreviewer_personas:\n  security:\n    agent:\n      provider: codex\n    remit:\n      path: docs/review/security-remit.md\nworkflows:\n  feature_change:\n    escalations:\n      - match:\n          paths: [\"backend/internal/spec/**\"]\n        require:\n          reviewers: [security, ghost]\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n      - id: implement\n        type: implement\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: pull_request\n        reviewers:\n          agents:\n            - provider: anthropic\n",
+      "valid": false,
+      "layer": "semantic",
+      "path": "/workflows/feature_change/escalations/0/require/reviewers/1",
+      "message": "workflow \"feature_change\" escalation 0: require.reviewers names \"ghost\", which matches no entry in the top-level reviewer_personas map; declare it there (reviewer_personas.ghost: {agent: {provider: ...}, remit: {path: ...}}) or remove it from require.reviewers — a persona is declared, never auto-discovered"
+    },
+    {
+      "name": "persona-escalation-no-agent-review",
+      "note": "rung 9: no plan or implement stage configures agent reviewers, so an escalated persona has no review loop to join",
+      "doc": "version: \"2\"\nreviewer_personas:\n  security:\n    agent:\n      provider: codex\n    remit:\n      path: docs/review/security-remit.md\nworkflows:\n  feature_change:\n    escalations:\n      - match:\n          paths: [\"backend/internal/spec/**\"]\n        require:\n          reviewers: [security]\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n      - id: implement\n        type: implement\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: pull_request\n",
+      "valid": false,
+      "layer": "semantic",
+      "path": "/workflows/feature_change/escalations/0/require/reviewers",
+      "message": "workflow \"feature_change\" escalation 0: require.reviewers attaches reviewer personas, but workflow \"feature_change\" has no plan or implement stage configuring agent reviewers, so there is no agent-review loop for an escalated persona to join and it would run no review wherever the escalation fires — it is refused rather than silently accepted as a control that does something; declare reviewers.agents on a plan or implement stage of this workflow, or drop require.reviewers"
+    },
+    {
+      "name": "persona-escalation-noop",
+      "note": "rung 10: every agent-reviewing plan / implement stage already attaches the persona statically, so the escalation raises nothing — refused through the shared MsgFmtEscalationNoRaise shape",
+      "doc": "version: \"2\"\nreviewer_personas:\n  security:\n    agent:\n      provider: codex\n    remit:\n      path: docs/review/security-remit.md\nworkflows:\n  feature_change:\n    escalations:\n      - match:\n          paths: [\"backend/internal/spec/**\"]\n        require:\n          reviewers: [security]\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n          personas: [security]\n      - id: implement\n        type: implement\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: pull_request\n        reviewers:\n          agents:\n            - provider: anthropic\n          personas: [security]\n",
+      "valid": false,
+      "layer": "semantic",
+      "path": "/workflows/feature_change/escalations/0/require/reviewers/0",
+      "message": "workflow \"feature_change\" escalation 0: require.reviewers: persona \"security\" does not raise the workflow's baseline: every plan or implement stage that runs agent review already attaches \"security\" through reviewers.personas, and an escalated persona composes with the static attachment as a de-duplicated union, so the reviewed set is identical to the baseline; an escalation may only ever RAISE a requirement, so one that changes nothing is refused rather than silently accepted as a control that does something. Drop \"security\" from the static reviewers.personas of some agent-reviewing stage so the escalation attaches it only where a matching change warrants it, or drop \"security\" from require.reviewers."
+    },
+    {
+      "name": "persona-escalation-reviewers-empty",
+      "note": "schema: require.reviewers is minItems 1",
+      "doc": "version: \"2\"\nreviewer_personas:\n  security:\n    agent:\n      provider: codex\n    remit:\n      path: docs/review/security-remit.md\nworkflows:\n  feature_change:\n    escalations:\n      - match:\n          paths: [\"backend/internal/spec/**\"]\n        require:\n          reviewers: []\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n      - id: implement\n        type: implement\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: pull_request\n        reviewers:\n          agents:\n            - provider: anthropic\n",
+      "valid": false,
+      "layer": "schema",
+      "path": "/workflows/feature_change/escalations/0/require/reviewers"
+    },
+    {
+      "name": "persona-escalation-reviewers-duplicate",
+      "note": "schema: require.reviewers is uniqueItems",
+      "doc": "version: \"2\"\nreviewer_personas:\n  security:\n    agent:\n      provider: codex\n    remit:\n      path: docs/review/security-remit.md\nworkflows:\n  feature_change:\n    escalations:\n      - match:\n          paths: [\"backend/internal/spec/**\"]\n        require:\n          reviewers: [security, security]\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n      - id: implement\n        type: implement\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: pull_request\n        reviewers:\n          agents:\n            - provider: anthropic\n",
+      "valid": false,
+      "layer": "schema",
+      "path": "/workflows/feature_change/escalations/0/require/reviewers"
+    },
+    {
+      "name": "persona-escalation-reviewers-bad-name",
+      "note": "schema: each require.reviewers item matches the v2 identifier pattern",
+      "doc": "version: \"2\"\nreviewer_personas:\n  security:\n    agent:\n      provider: codex\n    remit:\n      path: docs/review/security-remit.md\nworkflows:\n  feature_change:\n    escalations:\n      - match:\n          paths: [\"backend/internal/spec/**\"]\n        require:\n          reviewers: [Security]\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n      - id: implement\n        type: implement\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: pull_request\n        reviewers:\n          agents:\n            - provider: anthropic\n",
+      "valid": false,
+      "layer": "schema",
+      "path": "/workflows/feature_change/escalations/0/require/reviewers"
     }
   ]
 }

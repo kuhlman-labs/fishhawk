@@ -51,6 +51,11 @@ type personaSpecOpts struct {
 	human int
 	// personaProvider is the persona agent's provider ("codex" by default).
 	personaProvider string
+	// escalatePaths, when non-empty, declares one workflow escalation
+	// `{match: {paths: escalatePaths}, require: {reviewers: [security]}}`
+	// (ADR-084 D2(c) / E55.9 / #3754) and declares the persona even when
+	// attachOn is "".
+	escalatePaths []string
 }
 
 // personaSpec renders a complete workflow-v2 document: a plan and an
@@ -63,10 +68,14 @@ func personaSpec(o personaSpecOpts) []byte {
 	}
 	var b strings.Builder
 	b.WriteString("version: \"2\"\n")
-	if o.attachOn != "" {
+	if o.attachOn != "" || len(o.escalatePaths) > 0 {
 		fmt.Fprintf(&b, "reviewer_personas:\n  security:\n    agent:\n      provider: %s\n      model: %s\n    remit:\n      path: %s\n", pp, personaAgentModel, personaRemitPath)
 	}
-	b.WriteString("workflows:\n  feature_change:\n    stages:\n")
+	b.WriteString("workflows:\n  feature_change:\n")
+	if len(o.escalatePaths) > 0 {
+		fmt.Fprintf(&b, "    escalations:\n      - match:\n          paths: [%s]\n        require:\n          reviewers: [security]\n", quotedList(o.escalatePaths))
+	}
+	b.WriteString("    stages:\n")
 	stage := func(id, typ, produces string) {
 		fmt.Fprintf(&b, "      - id: %s\n        type: %s\n        executor:\n          agent: claude-code\n        produces:\n%s", id, typ, produces)
 		fmt.Fprintf(&b, "        reviewers:\n          human: %d\n          agents:\n            - provider: anthropic\n              model: %s\n", o.human, personaStdModel)
@@ -77,6 +86,15 @@ func personaSpec(o personaSpecOpts) []byte {
 	stage("plan", "plan", "          - artifact: plan\n            schema: standard_v1\n")
 	stage("implement", "implement", "          - artifact: pull_request\n")
 	return []byte(b.String())
+}
+
+// quotedList renders vals as a YAML flow-sequence body of quoted strings.
+func quotedList(vals []string) string {
+	q := make([]string, len(vals))
+	for i, v := range vals {
+		q[i] = fmt.Sprintf("%q", v)
+	}
+	return strings.Join(q, ", ")
 }
 
 // personaFetcher serves files keyed by PATH at personaBaseCommit only (every
@@ -475,9 +493,20 @@ workflows:
 	}
 }
 
-// resolveStageReviewerPersonas degrades to NO persona — WARN-logged, never a
-// guess — when the reviewed stage cannot be located; and a persona-less spec
-// never touches the run repo at all.
+// (#3753 carried item 1) An attachment set that cannot be resolved is no
+// longer silently dropped: per named failure mode of locating the reviewed
+// stage, the REAL plan-review loop records exactly ONE terminal
+// plan_review_skipped (reason persona_attachment_unresolvable, detail
+// persona_stage_unresolvable, no persona name) stamped on the reviewed stage,
+// COUNTED in plan_review_started.configured_agents so planreview.Settled
+// waits for the standard reviewer, which still runs. A persona-less spec reads
+// nothing and records nothing.
+//
+// Counterfactual: restore the old `return nil` degrade (drop the
+// personaDetailStageUnresolvable append in resolveReviewPersonaInvocations) —
+// zero skip entries and configured_agents 1: RED. Mechanism: the fixture
+// declares AND statically attaches a persona, so a silent drop and a recorded
+// skip are observably different.
 func TestResolveStageReviewerPersonas_FailurePaths(t *testing.T) {
 	withPersona := personaSpec(personaSpecOpts{attachOn: "plan"})
 	cases := []struct {
@@ -488,10 +517,13 @@ func TestResolveStageReviewerPersonas_FailurePaths(t *testing.T) {
 	}{
 		{"persona-less spec reads nothing", personaSpec(personaSpecOpts{}), func(p *personaPlanRun) {
 			p.rr.stagesByRunID = nil // ListStagesForRun would error if consulted
-			p.rr.stageErr = errors.New("GetStage must not be consulted")
 		}, ""},
-		{"unknown workflow", withPersona, func(p *personaPlanRun) { p.rr.getRuns[p.runID].WorkflowID = "nope" }, "workflow not in spec"},
-		{"reviewed stage unloadable", withPersona, func(p *personaPlanRun) { p.rr.stageErr = errors.New("db down") }, "load reviewed stage"},
+		{"reviewed stage unloadable", withPersona, func(p *personaPlanRun) {
+			// A stage id the repo does not hold: GetStage returns (nil, nil)
+			// for the persona lookup while the round itself still runs.
+			p.rr.getStages[uuid.New()] = p.rr.getStages[p.stageID]
+			delete(p.rr.getStages, p.stageID)
+		}, "load reviewed stage"},
 		{"run stages unlistable", withPersona, func(p *personaPlanRun) { p.rr.stagesByRunID = nil }, "list run stages"},
 		{"stage absent from the run's rows", withPersona, func(p *personaPlanRun) {
 			p.rr.stagesByRunID[p.runID] = []*run.Stage{{ID: uuid.New(), RunID: p.runID, Type: run.StageTypePlan}}
@@ -502,23 +534,141 @@ func TestResolveStageReviewerPersonas_FailurePaths(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			p := newPersonaPlanRun(t, tc.spec, approvingFake(), approvingFake())
+			std, persona := approvingFake(), approvingFake()
+			p := newPersonaPlanRun(t, tc.spec, std, persona)
 			tc.mutate(p)
-			got := p.s.resolveStageReviewerPersonas(t.Context(), p.rr.getRuns[p.runID], p.stageID)
-			if got != nil {
-				t.Errorf("personas = %+v, want nil", got)
+			p.review(t)
+			if n := len(reviewerCalls(std)); n != 1 {
+				t.Fatalf("standard reviewer calls = %d, want 1 — the standard reviewers must still run", n)
 			}
+			if n := len(reviewerCalls(persona)); n != 0 {
+				t.Errorf("persona invoked %d times on an unresolvable attachment set, want 0", n)
+			}
+			skips := auditFakeEntries(p.au, "plan_review_skipped")
+			started := decodeStarted(t, p.au, "plan_review_started")
 			logs := p.logs.String()
 			if tc.wantWarn == "" {
-				if logs != "" {
+				if len(skips) != 0 || started.ConfiguredAgents != 1 {
+					t.Errorf("persona-less spec: skips %d, configured_agents %d, want 0 and 1", len(skips), started.ConfiguredAgents)
+				}
+				if strings.Contains(logs, "reviewer personas") {
 					t.Errorf("persona-less spec logged:\n%s", logs)
 				}
 				return
+			}
+			if len(skips) != 1 {
+				t.Fatalf("plan_review_skipped entries = %d, want exactly 1", len(skips))
+			}
+			if skips[0].StageID == nil || *skips[0].StageID != p.stageID {
+				t.Errorf("skip stamped on stage %v, want the reviewed stage %s", skips[0].StageID, p.stageID)
+			}
+			sk := decodeSkipped(t, p.au, "plan_review_skipped")[0]
+			if sk.Reason != planreview.ReasonPersonaAttachmentUnresolvable || sk.Detail != personaDetailStageUnresolvable || sk.Persona != "" {
+				t.Errorf("skip = {reason %q detail %q persona %q}, want {%q %q \"\"}",
+					sk.Reason, sk.Detail, sk.Persona, planreview.ReasonPersonaAttachmentUnresolvable, personaDetailStageUnresolvable)
+			}
+			if started.ConfiguredAgents != 2 || sk.ConfiguredAgents != 2 {
+				t.Errorf("configured_agents started/skip = %d/%d, want 2/2 — the skip must be counted", started.ConfiguredAgents, sk.ConfiguredAgents)
+			}
+			if len(started.Personas) != 0 {
+				t.Errorf("started.personas = %v, want none — no persona was identified", started.Personas)
+			}
+			if !planreview.Settled(started.ConfiguredAgents, terminalCount(p.au, "plan")) {
+				t.Errorf("round does not settle: configured %d terminal %d", started.ConfiguredAgents, terminalCount(p.au, "plan"))
+			}
+			if planreview.Settled(started.ConfiguredAgents, countAuditCategory(p.au, "plan_review_skipped")) {
+				t.Error("the skip alone settles the round — it would settle before the standard reviewer finished")
 			}
 			if !strings.Contains(logs, "reviewer personas: "+tc.wantWarn) {
 				t.Errorf("WARN log missing %q:\n%s", tc.wantWarn, logs)
 			}
 		})
+	}
+}
+
+// The unknown-workflow mode of the unresolvable-attachment degrade. The review
+// loops never reach it (resolveStageReviewers already finds no reviewers for a
+// workflow absent from the spec), so the orchestrator is driven directly: ONE
+// pseudo invocation carrying persona_attachment_unresolvable /
+// persona_stage_unresolvable and no persona name.
+//
+// Counterfactual: return nil on the unknown-workflow branch — zero
+// invocations: RED.
+func TestResolveReviewPersonaInvocations_UnknownWorkflowDegrades(t *testing.T) {
+	p := newPersonaPlanRun(t, personaSpec(personaSpecOpts{attachOn: "plan"}), approvingFake(), approvingFake())
+	p.rr.getRuns[p.runID].WorkflowID = "nope"
+	invs := p.s.resolveReviewPersonaInvocations(t.Context(), p.rr.getRuns[p.runID], p.stageID, "plan_review", reviewPaths{source: escalationPathSourcePlanScope})
+	if len(invs) != 1 || invs[0].persona == nil || invs[0].persona.degraded != personaDetailStageUnresolvable ||
+		invs[0].persona.reason != planreview.ReasonPersonaAttachmentUnresolvable || invs[0].personaName() != "" {
+		t.Fatalf("invocations = %+v, want one persona_stage_unresolvable pseudo invocation", invs)
+	}
+	if !strings.Contains(p.logs.String(), "reviewer personas: workflow not in spec") {
+		t.Errorf("WARN log missing:\n%s", p.logs.String())
+	}
+}
+
+// (#3753 carried item 2) AUTHORITY RESIDUAL — pinned, not a control. With two
+// plan stages, the FIRST advisory (human: 1) and the SECOND gating (human: 0)
+// attaching the persona, reviewing the second runs the persona (the SET is the
+// reviewed stage's) but under the ROUND's authority, which
+// resolveStageReviewers takes from the first stage of the type: advisory. A
+// REJECTING persona therefore does not fail the stage. A later fix that gives
+// the reviewed stage's authority to the round must update this test
+// deliberately.
+func TestPersona_AuthorityIsRoundAuthority_Residual(t *testing.T) {
+	spec := []byte(`version: "2"
+reviewer_personas:
+  security:
+    agent:
+      provider: codex
+      model: ` + personaAgentModel + `
+    remit:
+      path: ` + personaRemitPath + `
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+        reviewers:
+          human: 1
+          agents:
+            - provider: anthropic
+              model: ` + personaStdModel + `
+      - id: plan_again
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+        reviewers:
+          human: 0
+          agents:
+            - provider: anthropic
+              model: ` + personaStdModel + `
+          personas: [security]
+`)
+	reject := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictReject}, model: "reviewer-model"}
+	p := newPersonaPlanRun(t, spec, approvingFake(), reject)
+	first := p.rr.getStages[p.stageID]
+	first.Sequence = 0
+	second := &run.Stage{ID: uuid.New(), RunID: p.runID, Sequence: 1, Type: run.StageTypePlan}
+	p.rr.getStages[second.ID] = second
+	p.rr.stagesByRunID[p.runID] = []*run.Stage{first, second}
+	p.stageID = second.ID
+	if p.review(t) {
+		t.Error("a rejecting persona failed the stage — the round's (first-of-type, advisory) authority no longer applies; update the documented residual")
+	}
+	if n := len(reviewerCalls(reject)); n != 1 {
+		t.Fatalf("persona calls = %d, want 1 — the persona SET is the reviewed stage's", n)
+	}
+	if got := decodeStarted(t, p.au, "plan_review_started").Authority; got != planreview.AuthorityAdvisory {
+		t.Errorf("plan_review_started.authority = %q, want %q (the round's first-of-type authority)", got, planreview.AuthorityAdvisory)
 	}
 }
 
@@ -584,7 +734,7 @@ func TestPersona_BadRepoRef_DegradesPersonaOnly(t *testing.T) {
 func TestPersona_PromptBuildFailure_DegradesWithoutAttribution(t *testing.T) {
 	p := newPersonaPlanRun(t, personaSpec(personaSpecOpts{attachOn: "plan"}), approvingFake(), approvingFake())
 	runRow := p.rr.getRuns[p.runID]
-	invs := p.s.resolvePersonaInvocations(p.s.resolveStageReviewerPersonas(t.Context(), runRow, p.stageID))
+	invs := p.s.resolveReviewPersonaInvocations(t.Context(), runRow, p.stageID, "plan_review", reviewPaths{source: escalationPathSourcePlanScope})
 	if len(invs) != 1 {
 		t.Fatalf("persona invocations = %d, want 1", len(invs))
 	}

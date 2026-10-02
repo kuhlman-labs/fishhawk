@@ -158,7 +158,7 @@ func validateWorkflow(s *Spec, name string, wf *Workflow, major int) error {
 	// is usable at all; an escalation only decides how strict it gets).
 	// Version-agnostic in code but unreachable below major 2 — no v0/v1
 	// schema declares the property.
-	if err := validateEscalations(name, wf); err != nil {
+	if err := validateEscalations(s, name, wf); err != nil {
 		return err
 	}
 

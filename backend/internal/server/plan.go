@@ -1718,7 +1718,17 @@ func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, p
 	// the standard prompt. A persona whose remit cannot be resolved or
 	// attributed is marked degraded here and records persona_remit_unavailable
 	// in the loop instead of running.
-	personaInvs := s.resolvePersonaInvocations(s.resolveStageReviewerPersonas(ctx, runRow, stageID))
+	//
+	// Escalation-attached personas (E55.9 / #3754) join the reviewed stage's
+	// static set: the workflow's escalations are matched against the scope
+	// union of the plan UNDER REVIEW (no approved plan exists yet), so a plan
+	// naming a sensitive path pulls in that path's persona at plan review. An
+	// attachment set that cannot be resolved records a counted
+	// persona_attachment_unresolvable skip rather than silently running none.
+	personaInvs := s.resolveReviewPersonaInvocations(ctx, runRow, stageID, "plan_review", reviewPaths{
+		plan:   planGateScopePaths(parsedPlan),
+		source: escalationPathSourcePlanScope,
+	})
 	s.buildPersonaPrompts(ctx, runRow, stageID, "plan_review", trig, injected, treeDir, personaInvs)
 	invocations = append(invocations, personaInvs...)
 

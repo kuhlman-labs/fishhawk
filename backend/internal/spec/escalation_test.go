@@ -1314,3 +1314,304 @@ func TestClampResolvedMatrix_PreservesBlockMembers(t *testing.T) {
 		t.Errorf("clamped matrix has %d actions, want the input's %d", len(out.Actions), len(in.Actions))
 	}
 }
+
+// --- require.reviewers: escalation-attached personas (ADR-084 D2(c) / E55.9 / #3754) ---
+//
+// Each rejection fixture is otherwise FULLY valid — the persona is declared,
+// it is referenced (by the escalation itself), and every stage that names it
+// statically configures an agent reviewer — so the rung under test is the only
+// thing that can reject it. The one-rule corpus rows (persona-escalation-*)
+// pin the same messages through both validators.
+
+// agentReviewers is a stage reviewers block with one agent reviewer and the
+// given extra tail lines (indented under `reviewers:`).
+func agentReviewers(tail string) string {
+	return "        reviewers:\n          agents:\n            - provider: anthropic\n" + tail
+}
+
+// escReviewersDoc renders a v2 document declaring the security persona, ONE
+// escalation on backend/internal/spec/** requiring the given reviewers list,
+// and a plan + implement stage each carrying the supplied reviewers block
+// (empty for none).
+func escReviewersDoc(reviewers, planReviewers, implReviewers string) []byte {
+	return []byte(`version: "2"
+reviewer_personas:
+  security:
+    agent:
+      provider: codex
+    remit:
+      path: docs/review/security-remit.md
+workflows:
+  feature_change:
+    escalations:
+      - match:
+          paths: ["backend/internal/spec/**"]
+        require:
+          reviewers: ` + reviewers + `
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+` + planReviewers + `      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+` + implReviewers)
+}
+
+// mustValidationError parses doc and returns the *ValidationError it must
+// produce.
+func mustValidationError(t *testing.T, doc []byte) *spec.ValidationError {
+	t.Helper()
+	_, err := spec.ParseBytes(doc)
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want *ValidationError", err)
+	}
+	return ve
+}
+
+// TestParseBytes_EscalationReviewersRoundTrip is the positive control and the
+// DisallowUnknownFields proof for the new dimension: require.reviewers decodes
+// into EscalationRequirements.Reviewers in declared order, alone satisfies the
+// require block, and a persona attached ONLY by the escalation is referenced.
+func TestParseBytes_EscalationReviewersRoundTrip(t *testing.T) {
+	s, err := spec.ParseBytes(escReviewersDoc("[security]", agentReviewers(""), agentReviewers("")))
+	if err != nil {
+		t.Fatalf("ParseBytes: %v", err)
+	}
+	got := s.Workflows["feature_change"].Escalations[0].Require
+	if !reflect.DeepEqual(got.Reviewers, []string{"security"}) {
+		t.Errorf("Require.Reviewers = %v, want [security]", got.Reviewers)
+	}
+	if got.Approvals != nil || got.MaxAutonomy != "" {
+		t.Errorf("a reviewers-only require decoded other dimensions: %+v", got)
+	}
+}
+
+// TestValidate_Escalation_ReviewersUndeclaredPersona pins rung 8: the FIRST
+// undeclared name is reported at its own item index.
+func TestValidate_Escalation_ReviewersUndeclaredPersona(t *testing.T) {
+	ve := mustValidationError(t, escReviewersDoc("[security, ghost]", agentReviewers(""), agentReviewers("")))
+	if want := "/workflows/feature_change/escalations/0/require/reviewers/1"; ve.Path != want {
+		t.Errorf("Path = %q, want %q", ve.Path, want)
+	}
+	if want := fmt.Sprintf(spec.MsgFmtEscalationReviewerPersonaUnknown, "feature_change", 0, "ghost", "ghost"); ve.Message != want {
+		t.Errorf("Message = %q, want %q", ve.Message, want)
+	}
+}
+
+// TestValidate_Escalation_ReviewersNoAgentReview pins rung 9: with no plan or
+// implement stage configuring agent reviewers there is no review loop for the
+// persona to join. The positive control (one agent-reviewing stage) is the
+// round-trip test above.
+func TestValidate_Escalation_ReviewersNoAgentReview(t *testing.T) {
+	ve := mustValidationError(t, escReviewersDoc("[security]", "", ""))
+	if want := "/workflows/feature_change/escalations/0/require/reviewers"; ve.Path != want {
+		t.Errorf("Path = %q, want %q", ve.Path, want)
+	}
+	if want := fmt.Sprintf(spec.MsgFmtEscalationReviewersNoAgentReview, "feature_change", 0, "feature_change"); ve.Message != want {
+		t.Errorf("Message = %q, want %q", ve.Message, want)
+	}
+
+	// ONE agent-reviewing stage is enough: the implement stage alone.
+	if _, err := spec.ParseBytes(escReviewersDoc("[security]", "", agentReviewers(""))); err != nil {
+		t.Errorf("an implement stage with an agent reviewer should satisfy rung 9: %v", err)
+	}
+}
+
+// TestValidate_Escalation_ReviewersNoOp pins rung 10: a persona EVERY
+// agent-reviewing plan / implement stage already attaches statically raises
+// nothing, and is refused in the shared no-raise shape. Its positive control
+// is the boundary: one agent-reviewing stage omitting the static attachment
+// makes the escalation raise THAT stage's review, so it is accepted.
+func TestValidate_Escalation_ReviewersNoOp(t *testing.T) {
+	static := agentReviewers("          personas: [security]\n")
+	ve := mustValidationError(t, escReviewersDoc("[security]", static, static))
+	if want := "/workflows/feature_change/escalations/0/require/reviewers/0"; ve.Path != want {
+		t.Errorf("Path = %q, want %q", ve.Path, want)
+	}
+	assertNoRaiseShape(t, ve.Message, "feature_change", 0, "reviewers")
+	want := fmt.Sprintf(spec.MsgFmtEscalationNoRaise, "feature_change", 0, "reviewers", `persona "security"`,
+		fmt.Sprintf(spec.MsgFmtEscalationReviewerNoRaiseBaseline, "security"),
+		fmt.Sprintf(spec.MsgFmtEscalationReviewerNoRaiseFix, "security", "security"))
+	if ve.Message != want {
+		t.Errorf("Message = %q, want %q", ve.Message, want)
+	}
+
+	t.Run("static on only one agent-reviewing stage is accepted", func(t *testing.T) {
+		if _, err := spec.ParseBytes(escReviewersDoc("[security]", static, agentReviewers(""))); err != nil {
+			t.Errorf("static on plan, escalated for implement must be accepted: %v", err)
+		}
+	})
+	t.Run("a stage with no agent reviewers does not count against the no-op", func(t *testing.T) {
+		// plan attaches statically and is the ONLY agent-reviewing stage;
+		// the implement stage runs no agent review, so it cannot be the stage
+		// the escalation raises — still a no-op.
+		ve := mustValidationError(t, escReviewersDoc("[security]", static, ""))
+		if want := "/workflows/feature_change/escalations/0/require/reviewers/0"; ve.Path != want {
+			t.Errorf("Path = %q, want the no-op rung at %q", ve.Path, want)
+		}
+	})
+}
+
+// TestValidate_Escalation_ReviewersRuleOrder pins where rungs 8-10 sit in the
+// per-escalation order: AFTER the approvals and max_autonomy rungs, in the
+// order undeclared -> no agent review -> no-op, and BEFORE the
+// match.paths-no-plan-stage structural rung. Each case violates two rules.
+func TestValidate_Escalation_ReviewersRuleOrder(t *testing.T) {
+	personas := `reviewer_personas:
+  security:
+    agent:
+      provider: codex
+    remit:
+      path: docs/review/security-remit.md
+`
+	cases := []struct {
+		name     string
+		doc      string
+		wantPath string
+	}{
+		{
+			name: "approvals count rung beats undeclared persona",
+			doc: `version: "2"
+` + personas + `workflows:
+  feature_change:
+    escalations:
+      - match:
+          paths: ["infra/**"]
+        require:
+          approvals:
+            count: 1
+          reviewers: [security, ghost]
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+` + agentReviewers("") + `        gates:
+          - type: approval
+            approvals:
+              count: 2
+`,
+			wantPath: "/workflows/feature_change/escalations/0/require/approvals/count",
+		},
+		{
+			name: "max_autonomy no-op rung beats undeclared persona",
+			doc: `version: "2"
+` + personas + `workflows:
+  feature_change:
+    autonomy: low
+    escalations:
+      - match:
+          paths: ["infra/**"]
+        require:
+          max_autonomy: high
+          reviewers: [security, ghost]
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+` + agentReviewers(""),
+			wantPath: "/workflows/feature_change/escalations/0/require/max_autonomy",
+		},
+		{
+			name:     "undeclared persona beats no agent review",
+			doc:      string(escReviewersDoc("[security, ghost]", "", "")),
+			wantPath: "/workflows/feature_change/escalations/0/require/reviewers/1",
+		},
+		{
+			name: "undeclared persona (later item) beats no-op (earlier item)",
+			doc: string(escReviewersDoc("[security, ghost]",
+				agentReviewers("          personas: [security]\n"),
+				agentReviewers("          personas: [security]\n"))),
+			wantPath: "/workflows/feature_change/escalations/0/require/reviewers/1",
+		},
+		{
+			name: "undeclared persona beats paths-no-plan-stage",
+			doc: `version: "2"
+` + personas + `workflows:
+  feature_change:
+    escalations:
+      - match:
+          paths: ["infra/**"]
+        require:
+          reviewers: [security, ghost]
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+` + agentReviewers(""),
+			wantPath: "/workflows/feature_change/escalations/0/require/reviewers/1",
+		},
+		{
+			name: "no agent review beats paths-no-plan-stage",
+			doc: `version: "2"
+` + personas + `workflows:
+  feature_change:
+    escalations:
+      - match:
+          paths: ["infra/**"]
+        require:
+          reviewers: [security]
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+`,
+			wantPath: "/workflows/feature_change/escalations/0/require/reviewers",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ve := mustValidationError(t, []byte(tc.doc))
+			if ve.Path != tc.wantPath {
+				t.Errorf("Path = %q (%s), want %q", ve.Path, ve.Message, tc.wantPath)
+			}
+		})
+	}
+}
+
+// TestComposeEscalations_ReviewersOnlyIsZero pins why ComposedRequirements has
+// no Reviewers field: a reviewers-only escalation must compose to "nothing
+// raised" so the approval gate's IsZero branches (fetch-error fail-closed,
+// snapshot.Escalated, the 403 `escalated` flag) and the delegation clamp are
+// untouched by it; and require.reviewers on an escalation that ALSO raises a
+// count composes exactly as the count alone. What the escalation_fired audit
+// entry renders for such a firing is pinned beside the renderer
+// (backend/internal/escalation TestRenderFired_ReviewersOnlyFiring).
+func TestComposeEscalations_ReviewersOnlyIsZero(t *testing.T) {
+	reviewersOnly := spec.Escalation{
+		Match:   spec.Predicate{Paths: []string{"backend/internal/spec/**"}},
+		Require: spec.EscalationRequirements{Reviewers: []string{"security"}},
+	}
+	if got := spec.ComposeEscalations([]spec.Escalation{reviewersOnly}); !got.IsZero() {
+		t.Errorf("a reviewers-only firing composed to %+v, want the zero value", got)
+	}
+	withCount := reviewersOnly
+	withCount.Require.Approvals = &spec.EscalatedApprovals{Count: intPtr(3)}
+	got := spec.ComposeEscalations([]spec.Escalation{reviewersOnly, withCount})
+	want := spec.ComposedRequirements{Count: intPtr(3)}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("ComposeEscalations = %+v, want %+v (reviewers contributes nothing to the composed requirements)", got, want)
+	}
+}

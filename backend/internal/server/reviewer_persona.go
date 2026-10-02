@@ -40,6 +40,14 @@ import (
 //     CLOSED for that persona only: it never runs on a remit-less prompt and
 //     records one terminal *_review_skipped entry (reason
 //     persona_remit_unavailable, a named detail); the standard reviewers run.
+//   - The persona SET is the reviewed stage's static attachments UNION the
+//     personas fired escalations attach (E55.9 / #3754,
+//     escalation_persona.go), de-duplicated. A set that cannot be resolved
+//     records one terminal persona_attachment_unresolvable skip per failed
+//     source instead of silently running none.
+//   - Persona AUTHORITY is the round's (resolveStageReviewers, first stage of
+//     the type) while the SET is the reviewed stage's — a stated residual,
+//     see resolveReviewPersonaInvocations.
 
 // Persona-degrade details: the machine-readable step a
 // persona_remit_unavailable skip failed at (ReviewSkippedPayload.Detail).
@@ -61,6 +69,18 @@ const (
 	// personaDetailRemitUnattributed: the remit's document_injected
 	// attribution could not be written, so the prompt is discarded.
 	personaDetailRemitUnattributed = "remit_unattributed"
+)
+
+// Unresolvable-attachment-set details (E55.9 / #3754, carried from #3753): the
+// source a persona_attachment_unresolvable skip failed at.
+const (
+	// personaDetailStageUnresolvable: the reviewed stage could not be located
+	// in the workflow spec, so its static attachment set is unknown.
+	personaDetailStageUnresolvable = "persona_stage_unresolvable"
+	// personaDetailEscalationUnevaluable: the escalations declaring
+	// require.reviewers could not be evaluated (a Match error) or their
+	// personas could not be selected.
+	personaDetailEscalationUnevaluable = "escalation_unevaluable"
 )
 
 // personaRemitPreamble / personaRemitTrustNote frame the persona's remit
@@ -95,8 +115,15 @@ type personaInvocation struct {
 	// round is ungrounded or the persona reviewer cannot ground.
 	treeDir string
 	// degraded is the persona_remit_unavailable detail when the remit could not
-	// be resolved, rendered or attributed; non-empty means DO NOT RUN.
+	// be resolved, rendered or attributed — or, on a pseudo invocation, the
+	// persona_attachment_unresolvable source detail; non-empty means DO NOT RUN.
 	degraded string
+	// reason is the skip REASON emitPersonaDegraded records; "" means
+	// planreview.ReasonPersonaRemitUnavailable. Set only on a pseudo
+	// invocation standing for an unresolvable attachment set
+	// (planreview.ReasonPersonaAttachmentUnresolvable), which carries no
+	// selected persona.
+	reason string
 }
 
 // personaName returns the persona this invocation belongs to, or "" for a
@@ -138,66 +165,158 @@ func personaNames(invs []reviewerInvocation) []string {
 	return out
 }
 
-// resolveStageReviewerPersonas returns the personas the REVIEWED stage
-// attaches (stage stageID of runRow), in attachment order.
+// resolveReviewPersonaInvocations is the ONE place a review round decides
+// which personas run (ADR-084 / E55.8 / #3753, E55.9 / #3754): the personas
+// the REVIEWED stage attaches statically UNION the personas the escalations
+// that fired for this change attach (escalation_persona.go), de-duplicated —
+// static first in attachment order, then the escalation-attached ones by name
+// — mapped to reviewer invocations. kind is the prompt kind ("plan_review" /
+// "implement_review"); paths is the change the escalations are matched
+// against. When an escalation attached any persona, ONE
+// escalation_persona_attached entry is written for the round.
 //
-// STAGE LOOKUP (approval condition 2). A run.Stage row carries no spec stage
-// id, so the reviewed stage is resolved the way the #3907 document-injection
-// path resolves it — loaded by stageID (resolveReviewInjectedDocuments) — and
-// mapped onto its workflow-spec stage with specStageForRunStage, the type
-// ORDINAL mapping (the k-th runtime row of a type is the k-th spec stage of
-// that type), which is exact under the plan-filtered retry/recovery subsets and
-// with repeated same-type stages. It never takes the first stage of a type.
-// (The STANDARD reviewers' ReviewersConfig is still read first-of-type by
-// resolveStageReviewers; that path is unchanged here so the standard reviewers
-// stay byte-identical.)
+// It returns nil — no persona, and no repository read — when the spec
+// declares no reviewer_personas, so every persona-less run pays nothing. The
+// static source is consulted only when some stage of the workflow attaches a
+// persona statically; the escalation source only when some escalation
+// declares require.reviewers.
 //
-// It returns nil — no persona — without touching the run repo when the spec
-// declares no reviewer_personas, so every persona-less run pays nothing. Every
-// other failure (unparseable spec, unknown workflow, an unloadable or
-// unmappable stage, a SelectReviewerPersonas refusal, which is unreachable for
-// a validated spec) WARN-logs and returns nil: without the reviewed stage there
-// is no attachment set to run.
-func (s *Server) resolveStageReviewerPersonas(ctx context.Context, runRow *run.Run, stageID uuid.UUID) []spec.SelectedReviewerPersona {
+// UNRESOLVABLE ATTACHMENT SET (carried from #3753). When the spec declares
+// reviewer_personas but a source cannot be resolved, which personas should
+// have run is unknown, so the round records it rather than silently running
+// none: ONE pseudo invocation per failed source carrying
+// planreview.ReasonPersonaAttachmentUnresolvable and a detail —
+// persona_stage_unresolvable (workflow not in the spec, the reviewed stage
+// unloadable / the run's stages unlistable / the stage absent or unmappable to
+// a spec stage, a SelectReviewerPersonas refusal) or escalation_unevaluable (a
+// Match error or a SelectNamedReviewerPersonas refusal). A pseudo invocation
+// has no prompt, so it rides the loops' existing degraded branch: it is
+// COUNTED in configured_agents and emits a terminal *_review_skipped stamped
+// on the reviewed stage AFTER *_review_started, so planreview.Settled still
+// waits for every standard reviewer. It never touches hasRejection. The other
+// source's personas still run.
+//
+// AUTHORITY RESIDUAL. The persona SET is the reviewed stage's, but the
+// round's AUTHORITY is resolveStageReviewers' — the FIRST stage of the type —
+// and every invocation of a round shares it. For a workflow with two
+// same-type stages whose reviewers blocks differ, a persona attached by the
+// second runs under the first's authority. Stated, not fixed (splitting
+// authority within one round would split hasRejection / started semantics);
+// pinned by TestPersona_AuthorityIsRoundAuthority_Residual.
+func (s *Server) resolveReviewPersonaInvocations(ctx context.Context, runRow *run.Run, stageID uuid.UUID, kind string, paths reviewPaths) []reviewerInvocation {
 	if runRow == nil || len(runRow.WorkflowSpec) == 0 || s.cfg.RunRepo == nil {
 		return nil
 	}
 	parsed, err := spec.ParseBytes(runRow.WorkflowSpec)
-	if err != nil || len(parsed.ReviewerPersonas) == 0 {
+	if err != nil {
 		return nil // the standard path already WARN-logged a parse failure
 	}
-	warn := func(msg string, err error) []spec.SelectedReviewerPersona {
-		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "reviewer personas: "+msg+" — no persona runs this round",
-			slog.String("run_id", runRow.ID.String()),
-			slog.String("stage_id", stageID.String()),
-			slog.String("error", err.Error()),
-		)
+	return s.resolveParsedReviewPersonaInvocations(ctx, runRow, parsed, stageID, kind, paths)
+}
+
+// resolveParsedReviewPersonaInvocations is resolveReviewPersonaInvocations
+// over an already-parsed spec — the seam a test drives with a hand-built Spec
+// carrying a declaration ParseBytes would refuse (a malformed glob).
+func (s *Server) resolveParsedReviewPersonaInvocations(ctx context.Context, runRow *run.Run, parsed *spec.Spec, stageID uuid.UUID, kind string, paths reviewPaths) []reviewerInvocation {
+	if parsed == nil || len(parsed.ReviewerPersonas) == 0 {
 		return nil
 	}
+	var degraded []string
 	wf, ok := parsed.Workflows[runRow.WorkflowID]
 	if !ok {
-		return warn("workflow not in spec", fmt.Errorf("workflow %q not in spec", runRow.WorkflowID))
+		s.warnPersonaUnresolvable(ctx, runRow, stageID, "workflow not in spec", fmt.Errorf("workflow %q not in spec", runRow.WorkflowID))
+		return s.resolvePersonaInvocations(nil, personaDetailStageUnresolvable)
+	}
+
+	var static []spec.SelectedReviewerPersona
+	if workflowAttachesPersonas(wf) {
+		var sok bool
+		if static, sok = s.staticReviewerPersonas(ctx, runRow, parsed, wf, stageID); !sok {
+			degraded = append(degraded, personaDetailStageUnresolvable)
+		}
+	}
+
+	esc := resolveEscalationPersonas(runRow, parsed, wf, paths)
+	if esc.degraded != "" {
+		s.warnPersonaUnresolvable(ctx, runRow, stageID, "evaluate escalation-attached personas", errors.New(esc.degraded))
+		degraded = append(degraded, esc.degraded)
+	}
+
+	staticNames := make(map[string]bool, len(static))
+	for _, p := range static {
+		staticNames[p.Name] = true
+	}
+	union := append([]spec.SelectedReviewerPersona(nil), static...)
+	for _, p := range esc.selected {
+		if !staticNames[p.Name] {
+			union = append(union, p)
+		}
+	}
+	if len(esc.attachments) > 0 {
+		s.writeEscalationPersonaAttachedAudit(ctx, runRow, stageID, kind, paths, esc, staticNames)
+	}
+	return s.resolvePersonaInvocations(union, degraded...)
+}
+
+// workflowAttachesPersonas reports whether any stage of wf attaches a persona
+// statically — the condition under which the reviewed stage must be located.
+func workflowAttachesPersonas(wf spec.Workflow) bool {
+	for i := range wf.Stages {
+		if r := wf.Stages[i].Reviewers; r != nil && len(r.Personas) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// warnPersonaUnresolvable WARN-logs one unresolvable persona source.
+func (s *Server) warnPersonaUnresolvable(ctx context.Context, runRow *run.Run, stageID uuid.UUID, msg string, err error) {
+	s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "reviewer personas: "+msg+" — recording a persona_attachment_unresolvable skip",
+		slog.String("run_id", runRow.ID.String()),
+		slog.String("stage_id", stageID.String()),
+		slog.String("error", err.Error()),
+	)
+}
+
+// staticReviewerPersonas returns the personas the REVIEWED stage (stage
+// stageID of runRow) attaches, in attachment order; ok is false (WARN-logged)
+// when the reviewed stage cannot be located.
+//
+// STAGE LOOKUP. A run.Stage row carries no spec stage id, so the reviewed
+// stage is resolved the way the #3907 document-injection path resolves it —
+// loaded by stageID (resolveReviewInjectedDocuments) — and mapped onto its
+// workflow-spec stage with specStageForRunStage, the type ORDINAL mapping (the
+// k-th runtime row of a type is the k-th spec stage of that type), which is
+// exact under the plan-filtered retry/recovery subsets and with repeated
+// same-type stages. It never takes the first stage of a type. (The STANDARD
+// reviewers' ReviewersConfig is still read first-of-type by
+// resolveStageReviewers; that path is unchanged here so the standard reviewers
+// stay byte-identical.)
+func (s *Server) staticReviewerPersonas(ctx context.Context, runRow *run.Run, parsed *spec.Spec, wf spec.Workflow, stageID uuid.UUID) ([]spec.SelectedReviewerPersona, bool) {
+	fail := func(msg string, err error) ([]spec.SelectedReviewerPersona, bool) {
+		s.warnPersonaUnresolvable(ctx, runRow, stageID, msg, err)
+		return nil, false
 	}
 	stage, err := s.cfg.RunRepo.GetStage(ctx, stageID)
 	if err != nil {
-		return warn("load reviewed stage", err)
+		return fail("load reviewed stage", err)
 	}
 	if stage == nil {
-		return warn("load reviewed stage", errors.New("stage not found"))
+		return fail("load reviewed stage", errors.New("stage not found"))
 	}
 	rows, err := s.cfg.RunRepo.ListStagesForRun(ctx, runRow.ID)
 	if err != nil {
-		return warn("list run stages", err)
+		return fail("list run stages", err)
 	}
 	specStage, ok := specStageForRunStage(wf, rows, stage)
 	if !ok {
-		return warn("map reviewed stage to its spec stage", fmt.Errorf("stage %s (type %s) has no spec stage at its type ordinal", stage.ID, stage.Type))
+		return fail("map reviewed stage to its spec stage", fmt.Errorf("stage %s (type %s) has no spec stage at its type ordinal", stage.ID, stage.Type))
 	}
 	personas, err := parsed.SelectReviewerPersonas(&specStage)
 	if err != nil {
-		return warn("select reviewer personas", err)
+		return fail("select reviewer personas", err)
 	}
-	return personas
+	return personas, true
 }
 
 // resolvePersonaInvocations maps the selected personas to reviewer
@@ -205,12 +324,14 @@ func (s *Server) resolveStageReviewerPersonas(ctx context.Context, runRow *run.R
 // gate-resolved review_model override is deliberately NOT applied: a persona's
 // model configuration is part of its declaration. A provider this deployment
 // cannot run carries resolveErr and degrades like any reviewer
-// (reviewer_unavailable, stamped with the persona).
-func (s *Server) resolvePersonaInvocations(personas []spec.SelectedReviewerPersona) []reviewerInvocation {
-	if len(personas) == 0 {
+// (reviewer_unavailable, stamped with the persona). Each unresolvable-source
+// detail appends one pseudo invocation AFTER the personas (see
+// resolveReviewPersonaInvocations).
+func (s *Server) resolvePersonaInvocations(personas []spec.SelectedReviewerPersona, unresolvable ...string) []reviewerInvocation {
+	if len(personas) == 0 && len(unresolvable) == 0 {
 		return nil
 	}
-	out := make([]reviewerInvocation, 0, len(personas))
+	out := make([]reviewerInvocation, 0, len(personas)+len(unresolvable))
 	for _, p := range personas {
 		reviewer, err := s.cfg.PlanReviewers.For(p.Agent.Provider, p.Agent.Model, p.Agent.ReasoningEffort)
 		out = append(out, reviewerInvocation{
@@ -223,6 +344,12 @@ func (s *Server) resolvePersonaInvocations(personas []spec.SelectedReviewerPerso
 			optional:        p.Agent.Optional,
 			persona:         &personaInvocation{selected: p},
 		})
+	}
+	for _, detail := range unresolvable {
+		out = append(out, reviewerInvocation{persona: &personaInvocation{
+			degraded: detail,
+			reason:   planreview.ReasonPersonaAttachmentUnresolvable,
+		}})
 	}
 	return out
 }
@@ -247,7 +374,7 @@ func (s *Server) resolvePersonaInvocations(personas []spec.SelectedReviewerPerso
 func (s *Server) buildPersonaPrompts(ctx context.Context, runRow *run.Run, reviewedStageID uuid.UUID, kind string, trig prompt.Trigger, standardInjected []prompt.InjectedDocument, treeDir string, invs []reviewerInvocation) {
 	for i := range invs {
 		p := invs[i].persona
-		if p == nil || invs[i].resolveErr != nil {
+		if p == nil || invs[i].resolveErr != nil || p.degraded != "" {
 			continue
 		}
 		p.degraded = s.buildPersonaPrompt(ctx, runRow, reviewedStageID, kind, trig, standardInjected, treeDir, invs[i])
@@ -326,7 +453,11 @@ func (s *Server) buildPersonaPrompt(ctx context.Context, runRow *run.Run, review
 // still settles at configured_agents; hasRejection is never touched — a
 // degraded persona never blocks a gating stage.
 func (s *Server) emitPersonaDegraded(ctx context.Context, runID, stageID uuid.UUID, category string, authority planreview.AuthorityMode, inv reviewerInvocation, configuredAgents int) {
-	s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "review: reviewer persona remit unavailable — persona skipped, standard reviewers unaffected",
+	reason := inv.persona.reason
+	if reason == "" {
+		reason = planreview.ReasonPersonaRemitUnavailable
+	}
+	s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "review: "+reason+" — persona skipped, standard reviewers unaffected",
 		slog.String("run_id", runID.String()),
 		slog.String("stage_id", stageID.String()),
 		slog.String("category", category),
@@ -338,7 +469,7 @@ func (s *Server) emitPersonaDegraded(ctx context.Context, runID, stageID uuid.UU
 		return
 	}
 	payload, _ := json.Marshal(planreview.ReviewSkippedPayload{
-		Reason:           planreview.ReasonPersonaRemitUnavailable,
+		Reason:           reason,
 		ConfiguredAgents: configuredAgents,
 		Authority:        authority,
 		Provider:         inv.provider,

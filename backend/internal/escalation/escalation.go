@@ -16,6 +16,14 @@
 //     resolved action matrix with the composed `max_autonomy` CEILING, LAST,
 //     after the workflow tier and after every explicit `actions` override.
 //
+// A third consumer reads the FIRED set rather than the composed requirements:
+// the plan- and implement-review loops attach every persona a fired
+// escalation names in `require.reviewers` (ADR-084 D2(c) / E55.9 / #3754)
+// through PersonaAttachments. That dimension is deliberately NOT part of
+// spec.ComposedRequirements — a reviewers-only firing composes to the zero
+// value, so the two seams above see "nothing raised" for it — which is why
+// the attachment is derived here from Result.Fired instead.
+//
 // Both reach this package through the ONE server-side resolver
 // (backend/internal/server/escalation_gate.go), which is also the single
 // `escalation_fired` audit emit point — so a `max_autonomy`-only escalation on
@@ -220,6 +228,11 @@ const RuleKeyBytes = 16
 //   - editing ANOTHER rule leaves this rule's key unchanged;
 //   - editing THIS rule's globs, labels, change kinds, triggers or `require`
 //     clamp CHANGES its key — a rule whose meaning moved is a different rule.
+//     `require.reviewers` (E55.9 / #3754) is part of the clamp: it is rendered
+//     ONLY when non-empty, so the key of every rule that declares no
+//     reviewers is byte-identical to its pre-#3754 key (pinned by
+//     TestRuleKey_ReviewersLessRuleKeyIsStable), and it is rendered as a
+//     sorted list, so permuting it does not move the key.
 //
 // Within one rule each match criterion's list is SORTED before hashing,
 // because spec.Predicate evaluates each list as an unordered OR: permuting
@@ -301,7 +314,63 @@ func renderRuleForKey(e spec.Escalation) string {
 	if e.Require.MaxAutonomy != "" {
 		field("require.max_autonomy", string(e.Require.MaxAutonomy))
 	}
+	// Appended LAST and only when non-empty, so a reviewers-less rule renders
+	// exactly as it did before the dimension existed and keeps its key.
+	if len(e.Require.Reviewers) > 0 {
+		field("require.reviewers", joinSorted(e.Require.Reviewers))
+	}
 	return strings.Join(parts, " ")
+}
+
+// PersonaAttachment is one reviewer persona the fired escalations attach to a
+// review, with the escalations that named it.
+type PersonaAttachment struct {
+	// Persona is the reviewer_personas map key.
+	Persona string
+	// Fired is every FIRED escalation whose require.reviewers names Persona,
+	// in declaration order — the provenance an audit entry records (its
+	// Index for the operator, RuleKey(Fired[i].Escalation) for a decision
+	// index).
+	Fired []Fired
+}
+
+// PersonaAttachments derives the reviewer personas an evaluation attaches
+// (ADR-084 D2(c) / E55.9 / #3754): the de-duplicated UNION of every fired
+// escalation's require.reviewers, sorted by persona name, each carrying the
+// fired escalations naming it in declaration order.
+//
+// Only res.Fired is read. An escalation that did not fire contributes nothing
+// — whatever it declares — because Evaluate never put it in Fired; that is the
+// "cost only where attached" property the review loop relies on. A result
+// with nothing fired, or whose fired escalations declare no reviewers, returns
+// nil. Sorting by name (not by first appearance) makes the output a function
+// of the fired SET, so reordering the declarations cannot reorder the
+// attachments. The result shares no slice with res.
+func PersonaAttachments(res Result) []PersonaAttachment {
+	byName := make(map[string][]Fired)
+	for _, f := range res.Fired {
+		seen := make(map[string]bool, len(f.Escalation.Require.Reviewers))
+		for _, name := range f.Escalation.Require.Reviewers {
+			if seen[name] {
+				continue
+			}
+			seen[name] = true
+			byName[name] = append(byName[name], f)
+		}
+	}
+	if len(byName) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(byName))
+	for name := range byName {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	out := make([]PersonaAttachment, 0, len(names))
+	for _, name := range names {
+		out = append(out, PersonaAttachment{Persona: name, Fired: byName[name]})
+	}
+	return out
 }
 
 // joinSorted renders one unordered-OR criterion list canonically: a SORTED
