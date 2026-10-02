@@ -1,0 +1,14 @@
+id: scenario:issue-3722/verify-wires-adr-gate
+statement: 'scripts/test verify runs both the gate and its harness: scripts/test-verify-scope exits 0 with PASS lines asserting that check-adr and test-adr ran in both scoped and unscoped verify.'
+verify_hint: 'CLI: run scripts/test-verify-scope; observe exit 0 and the ''ADR record gate ran'' / ''ADR harness ran'' PASS lines on stdout.'
+steps: 'Posture B: in the scratch copy, ran scripts/test-verify-scope.'
+assertions:
+    expected: exit 0 with the ADR PASS lines
+    observed_at_record: 'exit 0; 168 passed, 0 failed; ''PASS: a10 scoped/unscoped: ADR record gate ran'' and ''ADR harness ran'''
+    repro_handle: scripts/test-verify-scope
+origin:
+    issue: 3722
+    pr: 3917
+    run_id: 050ddc97-b22f-4ba1-bb3c-41664a4a0ccb
+    head_sha: 8711781fba7c6d878c01e3d1ae93615dcb3acc50
+    recorded_at: 2026-10-02T13:38:00Z

@@ -1,0 +1,14 @@
+id: scenario:issue-3722/check-adr-passes-committed-tree
+statement: Running scripts/check-adr with no arguments on the committed tree exits 0, and its stdout reports 25 records consistent with docs/adr/index.json.
+verify_hint: 'CLI: run scripts/check-adr from the repo root; observe exit code 0 and the record count on stdout.'
+steps: 'Posture B: in the sanctioned checkout (HEAD 8711781f, equal to the target''s git_sha), ran scripts/check-adr with no arguments from the repo root.'
+assertions:
+    expected: exit 0 and 25 records reported
+    observed_at_record: 'exit 0; ''check-adr: 25 record(s) consistent with .../docs/adr/index.json'''
+    repro_handle: scripts/check-adr; echo $?
+origin:
+    issue: 3722
+    pr: 3917
+    run_id: 050ddc97-b22f-4ba1-bb3c-41664a4a0ccb
+    head_sha: 8711781fba7c6d878c01e3d1ae93615dcb3acc50
+    recorded_at: 2026-10-02T13:38:00Z

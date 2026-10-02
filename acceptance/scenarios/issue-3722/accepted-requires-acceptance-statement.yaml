@@ -1,0 +1,14 @@
+id: scenario:issue-3722/accepted-requires-acceptance-statement
+statement: Records whose Decision section is a placeholder or carries no acceptance statement are `unknown`, not `accepted`. docs/adr/index.json lists ADR-010, ADR-011, ADR-012 and ADR-022 with status unknown, and in a scratch copy, flipping ADR-010 to `accepted` makes scripts/check-adr exit 1 naming ADR-010.
+verify_hint: 'CLI: read docs/adr/index.json statuses (e.g. python3 -c json query) on stdout; then in a temp copy set ADR-010''s status to accepted and run scripts/check-adr <tempdir>, observing exit 1 naming 010.'
+steps: 'Posture B: read statuses from index.json with python3; read ADR-010''s Decision section; set 010''s status to accepted in a scratch copy and ran scripts/check-adr <copy>.'
+assertions:
+    expected: unknown statuses; the flip exits 1 naming 010
+    observed_at_record: 010/011/012/022 are unknown. ADR-010's Decision section is '_To be recorded._'. The flipped copy exits 1 with '[C-accepted] status accepted but no Decision section carries an acceptance word' on the 010 file.
+    repro_handle: scripts/check-adr <copy with 010 status accepted>
+origin:
+    issue: 3722
+    pr: 3917
+    run_id: 050ddc97-b22f-4ba1-bb3c-41664a4a0ccb
+    head_sha: 8711781fba7c6d878c01e3d1ae93615dcb3acc50
+    recorded_at: 2026-10-02T13:38:00Z

@@ -1,0 +1,14 @@
+id: scenario:issue-3722/malformed-record-fails-gate
+statement: In a scratch copy of docs/adr, changing one record's status to an out-of-set value, or deleting one record's entry from index.json, makes scripts/check-adr <copy> exit 1 and name the offending file and key on its output.
+verify_hint: 'CLI: cp -R docs/adr to a temp dir, edit one record''s `status:` to `bogus`, run scripts/check-adr <tempdir>; observe exit 1 and the file name in output. Repeat with an index.json entry removed.'
+steps: 'Posture B: copied docs/adr to a temp dir and set 005''s status to bogus, then ran scripts/check-adr <dir>. Separately, removed the ADR-007 entry from a copied index.json and ran the gate.'
+assertions:
+    expected: exit 1 naming the file and key
+    observed_at_record: 'bogus: exit 1, ''005-api-auth-session-model.md: [C-status-set] status ''bogus'' is not one of ...''. Index omission: exit 1, ''index.json: [C-index-missing] no entry for record docs/adr/007-trace-bundle-wire-format.md''.'
+    repro_handle: 'cp -R docs/adr /tmp/x; sed -i '''' ''s/^status: .*/status: bogus/'' /tmp/x/005-*.md; scripts/check-adr /tmp/x'
+origin:
+    issue: 3722
+    pr: 3917
+    run_id: 050ddc97-b22f-4ba1-bb3c-41664a4a0ccb
+    head_sha: 8711781fba7c6d878c01e3d1ae93615dcb3acc50
+    recorded_at: 2026-10-02T13:38:00Z

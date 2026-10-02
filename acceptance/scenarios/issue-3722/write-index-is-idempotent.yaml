@@ -1,0 +1,14 @@
+id: scenario:issue-3722/write-index-is-idempotent
+statement: Running scripts/check-adr --write-index on the committed tree exits 0 and leaves docs/adr/index.json byte-identical (no git diff).
+verify_hint: 'CLI: run scripts/check-adr --write-index, then `git diff --exit-code -- docs/adr/index.json` exits 0.'
+steps: 'Posture B: in a scratch git copy, ran scripts/check-adr --write-index, then git diff --exit-code -- docs/adr/index.json, then cmp against the checkout''s index.json.'
+assertions:
+    expected: exit 0 and no diff
+    observed_at_record: exit 0; no diff; byte-identical
+    repro_handle: scripts/check-adr --write-index && git diff --exit-code -- docs/adr/index.json
+origin:
+    issue: 3722
+    pr: 3917
+    run_id: 050ddc97-b22f-4ba1-bb3c-41664a4a0ccb
+    head_sha: 8711781fba7c6d878c01e3d1ae93615dcb3acc50
+    recorded_at: 2026-10-02T13:38:00Z

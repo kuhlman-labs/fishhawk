@@ -1,0 +1,14 @@
+id: scenario:issue-3722/harness-pins-named-failure-modes
+statement: 'scripts/test-adr exits 0, and its stdout shows a PASS line for each named failure mode: missing status, unknown status, id/filename mismatch, duplicate id, one-way supersedes link, index omitting a record, index listing a missing file, and index disagreeing with a record''s front matter.'
+verify_hint: 'CLI: run scripts/test-adr; observe exit 0 and one PASS line per named mode in stdout (h2, h3, h4, h5, h6/h7, h9, h10, h11).'
+steps: 'Posture B: git archive HEAD of the sanctioned checkout into a scratch dir, then ran scripts/test-adr.'
+assertions:
+    expected: exit 0 and a PASS line per named mode
+    observed_at_record: 'exit 0; 44 passed, 0 failed. PASS lines: h2 missing status, h3 unknown status, h4 id/filename mismatch ONLY C-id, h5 duplicate id, h6/h7 one-way supersedes, h9 index omits a record, h10 index lists a missing file, h11 index stale on status. Also h14, h23-h27 and h28 as the approval conditions require.'
+    repro_handle: scripts/test-adr
+origin:
+    issue: 3722
+    pr: 3917
+    run_id: 050ddc97-b22f-4ba1-bb3c-41664a4a0ccb
+    head_sha: 8711781fba7c6d878c01e3d1ae93615dcb3acc50
+    recorded_at: 2026-10-02T13:38:00Z
