@@ -27,6 +27,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan/planfixture"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/repodoc"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
@@ -5857,5 +5858,493 @@ func TestPlanReview_Persona_InheritsGatingAuthority(t *testing.T) {
 				t.Errorf("stage failed-B = %v, want %v", failed, tc.wantGate)
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Review conventions on the PLAN-review path (E55.3 / #2244): selection from
+// the run's admission change + the plan's scope paths, resolution at the run's
+// admission commit, the supplemental prompt section, and the ingest-time
+// severity clamp. Fetcher/resolver fixtures (rcFetcher, admCommits,
+// admCommitA) live in document_injection_test.go.
+// ---------------------------------------------------------------------------
+
+const (
+	pcName    = "pc"
+	pcPath    = "docs/conventions/pc.md"
+	pcContent = "PC-CONVENTION-SENTINEL: every new exported func carries a doc comment."
+)
+
+// pcConventionSpec renders a v2 workflow spec declaring ONE review convention
+// `pc` at pcPath (capLine is a "    severity_cap: <cap>\n" line or "" for
+// uncapped; appliesTo is an indented applies_to block or "" for
+// unconditional; optional adds required: false), selected on the plan stage,
+// whose reviewers carry `human` human approvers.
+func pcConventionSpec(capLine, appliesTo string, optional bool, human int) []byte {
+	conv := "  " + pcName + ":\n    path: " + pcPath + "\n" + capLine + appliesTo
+	if optional {
+		conv += "    required: false\n"
+	}
+	return []byte("version: \"2\"\nreview_conventions:\n" + conv +
+		"workflows:\n  feature_change:\n    stages:\n" +
+		"      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n" +
+		"        produces:\n          - artifact: plan\n            schema: standard_v1\n" +
+		fmt.Sprintf("        reviewers:\n          human: %d\n          agents:\n            - provider: anthropic\n          conventions: [%s]\n", human, pcName))
+}
+
+// pcPlanRun is a plan-review server whose run row carries a convention spec
+// and a recorded admission commit, with the resolver wired to a fetcher that
+// serves pcPath ONLY at that commit, a concern store, and a WARN log buffer.
+type pcPlanRun struct {
+	s        *Server
+	au       *auditFake
+	rr       *promptRunRepo
+	cr       *fakeConcernRepo
+	ff       *rcFetcher
+	logs     *bytes.Buffer
+	reviewer *fakePlanReviewer
+	runID    uuid.UUID
+	stageID  uuid.UUID
+}
+
+func newPCPlanRun(t *testing.T, specBytes []byte, reviewer *fakePlanReviewer) *pcPlanRun {
+	t.Helper()
+	runID, stageID := uuid.New(), uuid.New()
+	s, _, _, au, rr := newPlanServerWithReviewer(t, runID, stageID, reviewer, specBytes)
+	logs := &bytes.Buffer{}
+	s.cfg.Logger = slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	rr.getStages[stageID].Type = run.StageTypePlan
+	rr.getStages[stageID].State = run.StageStateDispatched
+	rr.getRuns[runID].DocumentBaseCommit = strPtr(admCommitA)
+	ff := &rcFetcher{files: map[string]string{pcPath + "@" + admCommitA: pcContent}}
+	s.cfg.DocumentResolver = &repodoc.Resolver{Fetcher: ff, Commits: &admCommits{}}
+	cr := newFakeConcernRepo()
+	s.cfg.ConcernRepo = cr
+	return &pcPlanRun{s: s, au: au, rr: rr, cr: cr, ff: ff, logs: logs, reviewer: reviewer, runID: runID, stageID: stageID}
+}
+
+// review runs the REAL runPlanReviews and waits for a detached loop.
+func (p *pcPlanRun) review(t *testing.T) bool {
+	t.Helper()
+	got := p.s.runPlanReviews(t.Context(), p.runID, p.stageID, validPlanBytes(t), nil, nil, nil, nil, nil)
+	p.s.waitBackgroundReviews()
+	return got
+}
+
+// stageFailed reports whether a failed transition was recorded for the stage.
+func (p *pcPlanRun) stageFailed() bool {
+	for _, c := range p.rr.transitionStageCalls {
+		if c.StageID == p.stageID && c.To == run.StageStateFailed {
+			return true
+		}
+	}
+	return false
+}
+
+// highRepoConventionReject is a reviewer verdict resting entirely on ONE high
+// repo_convention concern naming pcName.
+func highRepoConventionReject() *planreview.ReviewVerdict {
+	return &planreview.ReviewVerdict{
+		Verdict: planreview.VerdictReject,
+		Concerns: []planreview.Concern{{
+			Severity:   planreview.SeverityHigh,
+			Category:   planreview.RepoConventionConcernCategory,
+			Convention: pcName,
+			Note:       "a.go adds an exported func with no doc comment, against the pc convention",
+		}},
+	}
+}
+
+// pcAppliesToScopedPath matches a.go — a path planfixture.Valid() scopes — and
+// nothing else, so the convention is selected ONLY through the plan's scope
+// paths (planGateScopePaths), never unconditionally.
+const pcAppliesToScopedPath = "    applies_to:\n      paths: [\"a.go\"]\n"
+
+// TestRunPlanReviews_ReviewConventions_EndToEnd drives the cross-boundary path
+// spec -> selection (admission change + plan scope paths) -> resolution at the
+// admission commit -> prompt -> reviewer -> ingest clamp -> plan_reviewed audit
+// payload -> concern store -> gating decision, through the REAL runPlanReviews.
+// A GATING reviewer returns reject resting on one HIGH repo_convention concern.
+//
+// Rows: a low-capped convention (the plan's row) clamps it to low; a
+// medium-capped one clamps it to MEDIUM — which isolates the round wiring,
+// because the zero (no-conventions) round would clamp to low; both downgrade
+// the reject to approve_with_concerns (verdict_clamped_from=reject) so the
+// gating stage is NOT failed.
+//
+// Mechanism: the fetcher serves the convention only at the admission commit,
+// and applies_to matches only the plan's scoped path a.go.
+// Counterfactuals: delete the ClampConventionSeverities call -> the reject
+// stands and the stage fails (RED); pass reviewConventionRound{} instead of
+// round -> the medium row clamps to low (RED); delete trig.ReviewConventions
+// -> the prompt lacks the section (RED); pass nil paths instead of
+// planGateScopePaths -> nothing is selected (RED); delete the
+// VerdictClampedFrom stamp -> RED on the payload.
+func TestRunPlanReviews_ReviewConventions_EndToEnd(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		capLine string
+		wantSev planreview.ConcernSeverity
+		capWord string
+	}{
+		{"low cap", "    severity_cap: low\n", planreview.SeverityLow, "low"},
+		{"medium cap isolates the round wiring", "    severity_cap: medium\n", planreview.SeverityMedium, "medium"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reviewer := &fakePlanReviewer{verdict: highRepoConventionReject(), model: "claude-sonnet-4-6"}
+			p := newPCPlanRun(t, pcConventionSpec(tc.capLine, pcAppliesToScopedPath, false, 0), reviewer)
+
+			if p.review(t) {
+				t.Fatal("a reject resting only on a clamped high must not gate the plan stage")
+			}
+			if p.stageFailed() {
+				t.Fatal("the gating plan stage was failed — the ingest clamp did not run before the gating decision")
+			}
+
+			// The captured prompt carries the section AFTER the criteria,
+			// outside the cached prefix, with its provenance line.
+			calls := reviewerCalls(reviewer)
+			if len(calls) != 1 {
+				t.Fatalf("reviewer calls = %d, want 1", len(calls))
+			}
+			pr := calls[0]
+			heading := "### " + prompt.ReviewConventionsHeading
+			split := strings.Index(pr, prompt.PlanReviewSplitMarker)
+			crit := strings.Index(pr, "### Review criteria")
+			sec := strings.Index(pr, heading)
+			body := strings.Index(pr, pcContent)
+			if split < 0 || crit < 0 || sec < 0 || body < 0 {
+				t.Fatalf("prompt indices: split=%d criteria=%d section=%d body=%d — want all present", split, crit, sec, body)
+			}
+			if split >= crit || crit >= sec || sec >= body {
+				t.Errorf("ordering: split=%d < criteria=%d < section=%d < body=%d violated", split, crit, sec, body)
+			}
+			for _, want := range []string{
+				"#### Convention " + pcName + " (severity cap: " + tc.capWord + ")",
+				"Supplied by the repository at " + pcPath + "@" + admCommitA,
+			} {
+				if !strings.Contains(pr, want) {
+					t.Errorf("prompt missing %q", want)
+				}
+			}
+
+			// plan_reviewed carries the clamped verdict and severity.
+			got := collectPlanReviewed(t, p.au)
+			if len(got) != 1 {
+				t.Fatalf("plan_reviewed entries = %d, want 1", len(got))
+			}
+			pl := got[0]
+			if pl.Verdict != planreview.VerdictApproveWithConcerns || pl.VerdictClampedFrom != planreview.VerdictReject {
+				t.Errorf("payload verdict = %q clamped_from %q, want approve_with_concerns / reject", pl.Verdict, pl.VerdictClampedFrom)
+			}
+			if len(pl.Concerns) != 1 || pl.Concerns[0].Severity != tc.wantSev || pl.Concerns[0].SeverityClampedFrom != planreview.SeverityHigh {
+				t.Errorf("payload concerns = %+v, want one %s concern clamped from high", pl.Concerns, tc.wantSev)
+			}
+			if reviewer.verdict.Verdict != planreview.VerdictReject {
+				t.Errorf("the clamp wrote the reviewer's own verdict value (now %q)", reviewer.verdict.Verdict)
+			}
+
+			// The concern store holds the CLAMPED severity.
+			rows, err := p.cr.ListByRun(t.Context(), p.runID)
+			if err != nil {
+				t.Fatalf("ListByRun: %v", err)
+			}
+			if len(rows) != 1 || rows[0].Severity != string(tc.wantSev) {
+				t.Errorf("persisted concerns = %d (first severity %q), want one %s row", len(rows), firstSeverity(rows), tc.wantSev)
+			}
+
+			// Attributed as review_conventions.pc at the admission commit.
+			inj := auditFakeEntries(p.au, "document_injected")
+			if len(inj) != 1 {
+				t.Fatalf("document_injected entries = %d, want 1", len(inj))
+			}
+			var ip map[string]any
+			if err := json.Unmarshal(inj[0].Payload, &ip); err != nil {
+				t.Fatalf("decode document_injected: %v", err)
+			}
+			if site, _ := ip["declaration_site"].(string); !strings.Contains(site, "review_conventions."+pcName) {
+				t.Errorf("declaration_site = %q, want review_conventions.%s", site, pcName)
+			}
+			if !slices.Equal(p.ff.calls, []string{pcPath + "@" + admCommitA}) {
+				t.Errorf("fetches = %v, want exactly the convention at the admission commit", p.ff.calls)
+			}
+
+			// Each clamp is WARN-logged with the run id and category.
+			logs := p.logs.String()
+			for _, want := range []string{"review-convention concern severity clamped at ingest", p.runID.String(), planreview.RepoConventionConcernCategory} {
+				if !strings.Contains(logs, want) {
+					t.Errorf("WARN log missing %q:\n%s", want, logs)
+				}
+			}
+		})
+	}
+}
+
+func firstSeverity(rows []*concern.Concern) string {
+	if len(rows) == 0 {
+		return ""
+	}
+	return rows[0].Severity
+}
+
+// TestRunPlanReviews_ReviewConventions_AdvisoryCarriesRound: the DETACHED
+// advisory loop receives the same round as the gating one — a medium-capped
+// convention clamps a high to medium (the zero round would give low) and the
+// payload records verdict_clamped_from.
+//
+// Counterfactual: pass reviewConventionRound{} at the advisory call site -> the
+// concern clamps to low and this goes RED.
+func TestRunPlanReviews_ReviewConventions_AdvisoryCarriesRound(t *testing.T) {
+	reviewer := &fakePlanReviewer{verdict: highRepoConventionReject(), model: "claude-sonnet-4-6"}
+	p := newPCPlanRun(t, pcConventionSpec("    severity_cap: medium\n", "", false, 1), reviewer)
+	if p.review(t) {
+		t.Fatal("advisory review must never gate")
+	}
+	got := collectPlanReviewed(t, p.au)
+	if len(got) != 1 {
+		t.Fatalf("plan_reviewed entries = %d, want 1", len(got))
+	}
+	if len(got[0].Concerns) != 1 || got[0].Concerns[0].Severity != planreview.SeverityMedium {
+		t.Errorf("advisory concerns = %+v, want one medium (the rendered cap)", got[0].Concerns)
+	}
+	if got[0].VerdictClampedFrom != planreview.VerdictReject {
+		t.Errorf("verdict_clamped_from = %q, want reject", got[0].VerdictClampedFrom)
+	}
+}
+
+// TestRunPlanReviews_ReviewConventions_UncappedRejectStillGates: an UNCAPPED
+// convention leaves the reviewer's high standing, so the gating reject stands
+// and fails the stage — the clamp lowers only what a cap bounds.
+//
+// Counterfactual: pass reviewConventionRound{} instead of round -> the zero
+// round clamps the high to low, the reject is downgraded and the stage is not
+// failed (RED).
+func TestRunPlanReviews_ReviewConventions_UncappedRejectStillGates(t *testing.T) {
+	reviewer := &fakePlanReviewer{verdict: highRepoConventionReject(), model: "claude-sonnet-4-6"}
+	p := newPCPlanRun(t, pcConventionSpec("", "", false, 0), reviewer)
+	if !p.review(t) {
+		t.Error("an uncapped convention's high reject must still gate")
+	}
+	if !p.stageFailed() {
+		t.Error("the gating plan stage was not failed on an unclamped reject")
+	}
+	got := collectPlanReviewed(t, p.au)
+	if len(got) != 1 || got[0].Verdict != planreview.VerdictReject || got[0].VerdictClampedFrom != "" {
+		t.Errorf("payload = %+v, want an unclamped reject", got)
+	}
+}
+
+// TestRunPlanReviews_ReviewConventions_NoMatchRendersNothing: a convention whose
+// applies_to matches none of the plan's scoped paths renders no section,
+// triggers ZERO fetches and writes no document_injected entry.
+func TestRunPlanReviews_ReviewConventions_NoMatchRendersNothing(t *testing.T) {
+	reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "m"}
+	p := newPCPlanRun(t, pcConventionSpec("    severity_cap: low\n", "    applies_to:\n      paths: [\"nomatch/**\"]\n", false, 0), reviewer)
+	if p.review(t) {
+		t.Fatal("an approving review must not gate")
+	}
+	calls := reviewerCalls(reviewer)
+	if len(calls) != 1 {
+		t.Fatalf("reviewer calls = %d, want 1", len(calls))
+	}
+	if strings.Contains(calls[0], prompt.ReviewConventionsHeading) || strings.Contains(calls[0], pcContent) {
+		t.Error("a convention matching nothing rendered into the plan-review prompt")
+	}
+	if len(p.ff.calls) != 0 {
+		t.Errorf("fetches = %v, want none", p.ff.calls)
+	}
+	if n := len(auditFakeEntries(p.au, "document_injected")); n != 0 {
+		t.Errorf("document_injected entries = %d, want 0", n)
+	}
+}
+
+// TestRunPlanReviews_RequiredConventionMissing_GatingFailsStage: a REQUIRED
+// convention absent at the admission commit fails the gating plan review
+// LOUDLY — zero reviewer invocations, no plan_review_started, a
+// plan_review_failed reason naming review_convention_missing with the path and
+// the declaration site, and the stage failed category-B. An OPTIONAL one
+// absent at the commit is skipped (the reviewer runs on a prompt with no
+// section) with a document_injection_degraded optional_document_missing entry.
+//
+// Mechanism: the fetcher serves nothing at all, so the only difference
+// between the rows is the convention's required flag.
+// Counterfactual: treat a required convention as optional (the shared core's
+// conv.Required branch) -> the reviewer runs once and the stage is not failed
+// (RED on the reviewer count).
+func TestRunPlanReviews_RequiredConventionMissing_GatingFailsStage(t *testing.T) {
+	t.Run("required", func(t *testing.T) {
+		reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "m"}
+		p := newPCPlanRun(t, pcConventionSpec("    severity_cap: low\n", "", false, 0), reviewer)
+		delete(p.ff.files, pcPath+"@"+admCommitA)
+
+		if !p.review(t) {
+			t.Error("a required convention missing at the admission commit must gate")
+		}
+		if n := len(reviewerCalls(reviewer)); n != 0 {
+			t.Fatalf("reviewer invocations = %d, want 0", n)
+		}
+		var failedB bool
+		for _, c := range p.rr.transitionStageCalls {
+			if c.StageID == p.stageID && c.To == run.StageStateFailed && c.Completion != nil &&
+				c.Completion.FailureCategory != nil && *c.Completion.FailureCategory == run.FailureB &&
+				c.Completion.FailureReason != nil && strings.HasPrefix(*c.Completion.FailureReason, "plan_review_document_injection_failed:") {
+				failedB = true
+			}
+		}
+		if !failedB {
+			t.Error("no failed-B transition with the plan_review_document_injection_failed reason")
+		}
+		if n := len(auditFakeEntries(p.au, "plan_review_started")); n != 0 {
+			t.Errorf("plan_review_started entries = %d, want 0", n)
+		}
+		failed := auditFakeEntries(p.au, "plan_review_failed")
+		if len(failed) != 1 {
+			t.Fatalf("plan_review_failed entries = %d, want 1", len(failed))
+		}
+		var fp planreview.ReviewFailedPayload
+		if err := json.Unmarshal(failed[0].Payload, &fp); err != nil {
+			t.Fatalf("decode plan_review_failed: %v", err)
+		}
+		for _, want := range []string{reviewDocumentInjectionFailedPrefix + ": " + reviewConventionMissingPrefix, pcPath, "review_conventions." + pcName, admCommitA} {
+			if !strings.Contains(fp.Reason, want) {
+				t.Errorf("plan_review_failed reason %q missing %q", fp.Reason, want)
+			}
+		}
+		if n := len(auditFakeEntries(p.au, "document_injected")); n != 0 {
+			t.Errorf("document_injected entries = %d, want 0", n)
+		}
+	})
+	t.Run("optional", func(t *testing.T) {
+		reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "m"}
+		p := newPCPlanRun(t, pcConventionSpec("    severity_cap: low\n", "", true, 0), reviewer)
+		delete(p.ff.files, pcPath+"@"+admCommitA)
+
+		if p.review(t) {
+			t.Error("an optional convention missing at the admission commit must not gate")
+		}
+		calls := reviewerCalls(reviewer)
+		if len(calls) != 1 {
+			t.Fatalf("reviewer invocations = %d, want 1", len(calls))
+		}
+		if strings.Contains(calls[0], prompt.ReviewConventionsHeading) {
+			t.Error("a missing optional convention rendered a conventions section")
+		}
+		deg := rcDegradedReasons(t, p.au)
+		if len(deg) != 1 || deg[0]["reason"] != repodoc.WithheldReasonOptionalDocumentMissing {
+			t.Errorf("document_injection_degraded = %v, want one optional_document_missing entry", deg)
+		}
+	})
+}
+
+// TestRunPlanReviews_NoConventions_NoConventionAuditTrace (approval condition 3
+// of #2244): a plan review on a spec declaring NO review_conventions, with a
+// resolver wired, writes no document_injected entry naming review_conventions.*
+// and no optional_document_missing degradation — the audit rows GET
+// /v0/runs/{id}/audit serves for such a run carry no convention trace — and the
+// reviewer's prompt has no conventions section.
+func TestRunPlanReviews_NoConventions_NoConventionAuditTrace(t *testing.T) {
+	reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "m"}
+	p := newPCPlanRun(t, specGatingReviewers, reviewer)
+	if p.review(t) {
+		t.Fatal("an approving review must not gate")
+	}
+	calls := reviewerCalls(reviewer)
+	if len(calls) != 1 || strings.Contains(calls[0], prompt.ReviewConventionsHeading) {
+		t.Fatalf("reviewer calls = %d / conventions heading present — want 1 call with no section", len(calls))
+	}
+	if len(p.ff.calls) != 0 {
+		t.Errorf("fetches = %v, want none", p.ff.calls)
+	}
+	p.au.mu.Lock()
+	defer p.au.mu.Unlock()
+	for _, e := range p.au.appended {
+		if e.Category == "document_injected" && strings.Contains(string(e.Payload), "review_conventions.") {
+			t.Errorf("document_injected names a review convention: %s", e.Payload)
+		}
+		if e.Category == "document_injection_degraded" && strings.Contains(string(e.Payload), repodoc.WithheldReasonOptionalDocumentMissing) {
+			t.Errorf("unexpected optional_document_missing degradation: %s", e.Payload)
+		}
+	}
+}
+
+// TestPlanReviewLoop_NoConventionsRendered_ClampsConventionCategoriesToLow
+// (approval condition 2 of #2244): with ZERO conventions rendered (the
+// no-conventions runPlanReviewLoop round), a reviewer that nonetheless emits a
+// high conventions_override_attempt, repo_convention or conventions_file_modified
+// concern has each clamped to low, never left unclamped, and each clamp is
+// WARN-logged with the run id and category; a standard-category high is
+// untouched, so the reject it rests on stands.
+//
+// Counterfactual: delete the ClampConventionSeverities call -> the three stay
+// high in the payload and the store (RED).
+func TestPlanReviewLoop_NoConventionsRendered_ClampsConventionCategoriesToLow(t *testing.T) {
+	au := newSeqAuditFake()
+	cr := newFakeConcernRepo()
+	logs := &bytes.Buffer{}
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au, ConcernRepo: cr,
+		Logger: slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelWarn}))})
+	runID, stageID := uuid.New(), uuid.New()
+	convCats := []string{
+		planreview.ConventionsOverrideAttemptConcernCategory,
+		planreview.RepoConventionConcernCategory,
+		planreview.ConventionsFileModifiedConcernCategory,
+	}
+	v := &planreview.ReviewVerdict{Verdict: planreview.VerdictReject}
+	for _, c := range convCats {
+		v.Concerns = append(v.Concerns, planreview.Concern{Severity: planreview.SeverityHigh, Category: c, Note: "n " + c})
+	}
+	v.Concerns = append(v.Concerns, planreview.Concern{Severity: planreview.SeverityHigh, Category: "verification", Note: "standard high"})
+	rev := &fakePlanReviewer{verdict: v, model: "gpt-5.5"}
+
+	if !s.runPlanReviewLoop(context.Background(), runID, stageID,
+		[]reviewerInvocation{{reviewer: rev}}, planreview.AuthorityGating, "prompt", "", s.cfg.ReviewBudget, "") {
+		t.Error("the standard-category high must keep the reject standing")
+	}
+
+	var payload planreview.PlanReviewedPayload
+	var found bool
+	for _, e := range au.appended {
+		if e.Category == "plan_reviewed" {
+			if err := json.Unmarshal(e.Payload, &payload); err != nil {
+				t.Fatalf("decode plan_reviewed: %v", err)
+			}
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("no plan_reviewed entry")
+	}
+	if payload.Verdict != planreview.VerdictReject || payload.VerdictClampedFrom != "" {
+		t.Errorf("verdict = %q clamped_from %q, want an unclamped reject", payload.Verdict, payload.VerdictClampedFrom)
+	}
+	want := map[string]planreview.ConcernSeverity{
+		convCats[0]: planreview.SeverityLow, convCats[1]: planreview.SeverityLow, convCats[2]: planreview.SeverityLow,
+		"verification": planreview.SeverityHigh,
+	}
+	for _, c := range payload.Concerns {
+		if c.Severity != want[c.Category] {
+			t.Errorf("payload concern %s severity = %q, want %q", c.Category, c.Severity, want[c.Category])
+		}
+	}
+	rows, err := cr.ListByRun(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("ListByRun: %v", err)
+	}
+	if len(rows) != 4 {
+		t.Fatalf("persisted concerns = %d, want 4", len(rows))
+	}
+	for _, r := range rows {
+		if r.Severity != string(want[r.Category]) {
+			t.Errorf("persisted %s severity = %q, want %q", r.Category, r.Severity, want[r.Category])
+		}
+	}
+	if v.Concerns[0].Severity != planreview.SeverityHigh || v.Verdict != planreview.VerdictReject {
+		t.Error("the clamp wrote the reviewer's own verdict value")
+	}
+	lg := logs.String()
+	for _, w := range append([]string{runID.String(), `"no_conventions_rendered":true`}, convCats...) {
+		if !strings.Contains(lg, w) {
+			t.Errorf("WARN log missing %q:\n%s", w, lg)
+		}
 	}
 }
