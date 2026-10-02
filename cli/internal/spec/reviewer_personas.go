@@ -30,7 +30,14 @@ import "fmt"
 //     then every attached name must resolve to a declared persona, then the
 //     stage must configure an agent reviewer.
 //  3. checkReviewerPersonasReferenced, after checkReviewConventionsReferenced:
-//     a declared persona no stage attaches is refused.
+//     a declared persona no stage attaches AND no workflow escalation requires
+//     (require.reviewers, ADR-084 D2(c) / E55.9 / #3754) is refused.
+//
+// The escalation route's own rungs (an undeclared name, no agent-reviewing
+// plan / implement stage to join, a no-op attachment) run inside
+// checkEscalations (validate.go — checkEscalatedReviewers), but their texts
+// are declared HERE, mirroring the backend, so the one parity test covers
+// every persona constant.
 //
 // Each rung reports at most ONE entry per persona (rung 1), per stage (rung 2)
 // or per unreferenced name (rung 3) — the backend's first-error-per-site
@@ -40,8 +47,10 @@ import "fmt"
 // resolver DELETES the root and workflow `defaults` blocks after folding them
 // into the stages, while this package's resolveV2Reuse KEEPS them. Rung 3
 // therefore counts attachments on workflows/*/stages/*/reviewers/personas
-// ONLY, never inside a `defaults` block: an attachment inherited from
-// defaults.reviewers has already been folded onto the inheriting stage and is
+// (plus workflows/*/escalations/*/require/reviewers, a workflow member with
+// no defaults route) ONLY, never inside a `defaults` block: an attachment
+// inherited from defaults.reviewers has already been folded onto the
+// inheriting stage and is
 // counted THERE, and one made only in a defaults block every stage overrides
 // counts nowhere — on both validators. The corpus rows
 // persona-defaults-inherited and persona-attached-only-in-unused-defaults pin
@@ -76,8 +85,26 @@ const MsgFmtReviewerPersonaUnknown = "stage %q: reviewers.personas names %q, whi
 // MsgFmtReviewerPersonaNoAgents rejects an attachment on a stage that configures no agent reviewers (stage id).
 const MsgFmtReviewerPersonaNoAgents = "stage %q: reviewers.personas attaches reviewer personas but the stage configures no agent reviewers; a persona reviews IN ADDITION to the stage's standard reviewers and inherits their authority, so declare at least one entry under reviewers.agents, or remove reviewers.personas"
 
-// MsgFmtReviewerPersonaUnreferenced rejects a declared persona that no resolved stage attaches (name).
-const MsgFmtReviewerPersonaUnreferenced = "reviewer_personas.%s is declared but no stage attaches it through reviewers.personas, so it would run no review — it is refused rather than silently accepted as a control that does something; attach it on a plan or implement stage, or remove the declaration"
+// MsgFmtReviewerPersonaUnreferenced rejects a declared persona that no resolved stage attaches and no escalation requires (name).
+const MsgFmtReviewerPersonaUnreferenced = "reviewer_personas.%s is declared but no stage attaches it through reviewers.personas and no workflow escalation requires it through require.reviewers, so it would run no review — it is refused rather than silently accepted as a control that does something; attach it on a plan or implement stage, require it from an escalation, or remove the declaration"
+
+// PathFmtEscalationReviewers is the reported path for a require.reviewers no-agent-review rejection (workflow name, escalation index).
+const PathFmtEscalationReviewers = "/workflows/%s/escalations/%d/require/reviewers"
+
+// PathFmtEscalationReviewerItem is the reported path for a require.reviewers undeclared-name or no-op rejection (workflow name, escalation index, item index).
+const PathFmtEscalationReviewerItem = "/workflows/%s/escalations/%d/require/reviewers/%d"
+
+// MsgFmtEscalationReviewerPersonaUnknown rejects a require.reviewers name that resolves to no declared persona (workflow name, escalation index, name, name).
+const MsgFmtEscalationReviewerPersonaUnknown = "workflow %q escalation %d: require.reviewers names %q, which matches no entry in the top-level reviewer_personas map; declare it there (reviewer_personas.%s: {agent: {provider: ...}, remit: {path: ...}}) or remove it from require.reviewers — a persona is declared, never auto-discovered"
+
+// MsgFmtEscalationReviewersNoAgentReview rejects require.reviewers on a workflow with no plan / implement stage configuring agent reviewers (workflow name, escalation index, workflow name).
+const MsgFmtEscalationReviewersNoAgentReview = "workflow %q escalation %d: require.reviewers attaches reviewer personas, but workflow %q has no plan or implement stage configuring agent reviewers, so there is no agent-review loop for an escalated persona to join and it would run no review wherever the escalation fires — it is refused rather than silently accepted as a control that does something; declare reviewers.agents on a plan or implement stage of this workflow, or drop require.reviewers"
+
+// MsgFmtEscalationReviewerNoRaiseBaseline is the baseline clause of the require.reviewers no-op rejection, rendered into MsgFmtEscalationNoRaise (persona name).
+const MsgFmtEscalationReviewerNoRaiseBaseline = "the workflow's baseline: every plan or implement stage that runs agent review already attaches %q through reviewers.personas, and an escalated persona composes with the static attachment as a de-duplicated union, so the reviewed set is identical to the baseline"
+
+// MsgFmtEscalationReviewerNoRaiseFix is the fix clause of the require.reviewers no-op rejection, rendered into MsgFmtEscalationNoRaise (persona name, persona name).
+const MsgFmtEscalationReviewerNoRaiseFix = "Drop %q from the static reviewers.personas of some agent-reviewing stage so the escalation attaches it only where a matching change warrants it, or drop %q from require.reviewers."
 
 // checkReviewerPersonaDeclarations runs rung 1 over every declared persona in
 // sorted name order, reporting at most one entry per persona: the remit path
@@ -153,8 +180,9 @@ func checkStageReviewerPersonas(stage map[string]any, wfName string, i int, decl
 }
 
 // checkReviewerPersonasReferenced runs rung 3: every declared persona must be
-// attached by some stage. Attachments are read from
-// workflows/*/stages/*/reviewers/personas ONLY — never a `defaults` block,
+// attached by some stage or required by some escalation. Attachments are read
+// from workflows/*/stages/*/reviewers/personas and
+// workflows/*/escalations/*/require/reviewers ONLY — never a `defaults` block,
 // which this package's resolver keeps and the backend's deletes (see the
 // REUSE ASYMMETRY note above).
 func checkReviewerPersonasReferenced(root map[string]any, errs *[]ValidationErrorEntry) {
@@ -168,6 +196,18 @@ func checkReviewerPersonasReferenced(root map[string]any, errs *[]ValidationErro
 		wf, ok := wfRaw.(map[string]any)
 		if !ok {
 			continue
+		}
+		escalations, _ := wf["escalations"].([]any)
+		for _, escRaw := range escalations {
+			esc, ok := escRaw.(map[string]any)
+			if !ok {
+				continue
+			}
+			if require, ok := esc["require"].(map[string]any); ok {
+				for _, name := range rawStringList(require["reviewers"]) {
+					attached[name] = true
+				}
+			}
 		}
 		stages, _ := wf["stages"].([]any)
 		for _, stRaw := range stages {

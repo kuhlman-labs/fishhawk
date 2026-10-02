@@ -18,8 +18,9 @@ import (
 // one-rule corpus row cannot.
 
 // rpConstDecl matches a single-line exported reviewer-persona message or path
-// constant declaration.
-var rpConstDecl = regexp.MustCompile(`(?m)^const ((?:Msg|MsgFmt|PathFmt)\w*ReviewerPersona\w*) = (".*")$`)
+// constant declaration — the stage family (*ReviewerPersona*) and the
+// escalation require.reviewers family (*EscalationReviewer*, E55.9 / #3754).
+var rpConstDecl = regexp.MustCompile(`(?m)^const ((?:Msg|MsgFmt|PathFmt)\w*(?:ReviewerPersona|EscalationReviewer)\w*) = (".*")$`)
 
 // TestReviewerPersonasMessageParity holds every reviewer-persona message and
 // path constant BYTE-IDENTICAL across the two modules (the
@@ -52,6 +53,13 @@ func TestReviewerPersonasMessageParity(t *testing.T) {
 		"MsgFmtReviewerPersonaUnknown":          MsgFmtReviewerPersonaUnknown,
 		"MsgFmtReviewerPersonaNoAgents":         MsgFmtReviewerPersonaNoAgents,
 		"MsgFmtReviewerPersonaUnreferenced":     MsgFmtReviewerPersonaUnreferenced,
+		// The escalation require.reviewers family (E55.9 / #3754).
+		"PathFmtEscalationReviewers":              PathFmtEscalationReviewers,
+		"PathFmtEscalationReviewerItem":           PathFmtEscalationReviewerItem,
+		"MsgFmtEscalationReviewerPersonaUnknown":  MsgFmtEscalationReviewerPersonaUnknown,
+		"MsgFmtEscalationReviewersNoAgentReview":  MsgFmtEscalationReviewersNoAgentReview,
+		"MsgFmtEscalationReviewerNoRaiseBaseline": MsgFmtEscalationReviewerNoRaiseBaseline,
+		"MsgFmtEscalationReviewerNoRaiseFix":      MsgFmtEscalationReviewerNoRaiseFix,
 	}
 	if len(backend) != len(values) || len(cli) != len(values) {
 		t.Fatalf("extracted %d backend / %d cli declarations, want %d each — a constant was added, dropped, or made multi-line on one side", len(backend), len(cli), len(values))
@@ -177,5 +185,94 @@ func TestReviewerPersonas_ShapeTolerance(t *testing.T) {
 	}, "wf", 0, nil, &errs)
 	if len(errs) != 1 || errs[0].Path != "/workflows/wf/stages/0/reviewers/personas/0" {
 		t.Fatalf("attachment with no declared map: got %+v, want one entry at /workflows/wf/stages/0/reviewers/personas/0", errs)
+	}
+}
+
+// TestEscalationReviewers_CollectsOneEntryPerEscalation pins the collect-mode
+// shape of the require.reviewers rungs (E55.9 / #3754): each escalation
+// reports at most ONE entry — an approvals rung that reported suppresses the
+// reviewers rungs, a reviewers rung that reported suppresses the paths rung,
+// and two undeclared names on one escalation report only the first — so the
+// list carries the backend's first error per escalation, in escalation order.
+func TestEscalationReviewers_CollectsOneEntryPerEscalation(t *testing.T) {
+	doc := `version: "2"
+reviewer_personas:
+  security:
+    agent:
+      provider: codex
+    remit:
+      path: docs/review/security-remit.md
+workflows:
+  feature_change:
+    escalations:
+      - match:
+          paths: ["infra/**"]
+        require:
+          approvals:
+            count: 1
+          reviewers: [ghost]
+      - match:
+          paths: ["backend/**"]
+        require:
+          reviewers: [ghost, spook]
+      - match:
+          labels: [security]
+        require:
+          reviewers: [security]
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+        reviewers:
+          agents:
+            - provider: anthropic
+          personas: [security]
+        gates:
+          - type: approval
+            approvals:
+              count: 2
+`
+	entries := rcEntries(t, ValidateBytes([]byte(doc)))
+	want := []ValidationErrorEntry{
+		// escalation 0: the count rung wins; the undeclared ghost is NOT also reported.
+		{Path: "/workflows/feature_change/escalations/0/require/approvals/count", Message: escalationNoRaiseMessage("feature_change", 0, "approvals.count",
+			"count 1",
+			"the workflow's baseline of 2 (the highest count any approval gate declares)",
+			"Declare a count above 2, or drop require.approvals.count.")},
+		// escalation 1: two undeclared names, only the first; the planless
+		// match.paths rung is suppressed for this escalation.
+		{Path: "/workflows/feature_change/escalations/1/require/reviewers/0", Message: fmt.Sprintf(MsgFmtEscalationReviewerPersonaUnknown, "feature_change", 1, "ghost", "ghost")},
+		// escalation 2: the one agent-reviewing stage already attaches security.
+		{Path: "/workflows/feature_change/escalations/2/require/reviewers/0", Message: escalationReviewerNoRaiseMessage("feature_change", 2, "security")},
+	}
+	if len(entries) != len(want) {
+		t.Fatalf("got %d entries, want %d:\n%v", len(entries), len(want), entries)
+	}
+	for i := range want {
+		if entries[i] != want[i] {
+			t.Errorf("entry[%d] = %+v\nwant %+v", i, entries[i], want[i])
+		}
+	}
+}
+
+// TestEscalationReviewers_ShapeTolerance drives checkEscalatedReviewers over
+// hand-built raw trees the schema keeps unreachable from ValidateBytes: a
+// non-list / non-string reviewers node and a non-list stages node each yield
+// the backend's reading rather than a panic.
+func TestEscalationReviewers_ShapeTolerance(t *testing.T) {
+	declared := map[string]any{"security": map[string]any{}}
+	var errs []ValidationErrorEntry
+	checkEscalatedReviewers(map[string]any{"reviewers": "not-a-list"}, map[string]any{}, "wf", 0, declared, &errs)
+	checkEscalatedReviewers(map[string]any{"reviewers": []any{7}}, map[string]any{}, "wf", 0, declared, &errs)
+	if len(errs) != 0 {
+		t.Fatalf("shape-mismatched reviewers produced entries: %+v", errs)
+	}
+	// An unreadable stages node has no agent-reviewing stage: rung 9.
+	checkEscalatedReviewers(map[string]any{"reviewers": []any{"security"}}, map[string]any{"stages": "not-a-list"}, "wf", 0, declared, &errs)
+	if len(errs) != 1 || errs[0].Path != "/workflows/wf/escalations/0/require/reviewers" {
+		t.Fatalf("unreadable stages: got %+v, want one no-agent-review entry", errs)
 	}
 }

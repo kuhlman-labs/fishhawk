@@ -23,7 +23,8 @@ import (
 //   - a workflow's applies_to routing predicate (E53.3 / #2226), including
 //     the plan-stage rule on its `paths` criterion (E53.15 / #2377);
 //   - a workflow's escalations block (E53.4 / #2227), minus the one check
-//     that needs the v2 autonomy resolver — see checkEscalations;
+//     that needs the v2 autonomy resolver — see checkEscalations — including
+//     the require.reviewers rungs (ADR-084 D2(c) / E55.9 / #3754);
 //   - the review_conventions family (ADR-068 / E55.2 / #2243,
 //     review_conventions.go): each declared entry's canonical repo-relative
 //     path and well-formed applies_to (no change_kind), a stage's
@@ -35,8 +36,9 @@ import (
 //     reviewer_personas.go): each declared persona's canonical remit.path and
 //     well-formed agent.agent_version, a stage's reviewers.personas (plan /
 //     implement only, declared names only, an agent reviewer required), and
-//     every declared persona attached by some stage — each rung run
-//     immediately after its review_conventions sibling, as the backend does.
+//     every declared persona attached by some stage or required by some
+//     escalation's require.reviewers — each rung run immediately after its
+//     review_conventions sibling, as the backend does.
 //
 // It operates on the yaml.v3-decoded map[string]any / []any tree (never
 // structs — this package carries no typed decode; the stage-reference
@@ -78,7 +80,7 @@ func validateAgentVersions(raw any) error {
 		checkAppliesTo(wf, wfName, &errs)
 		// escalations is likewise a WORKFLOW member and must be reported for
 		// a stages-less workflow too.
-		checkEscalations(wf, wfName, &errs)
+		checkEscalations(wf, wfName, declaredPersonas, &errs)
 		stages, ok := wf["stages"].([]any)
 		if !ok {
 			continue
@@ -372,8 +374,9 @@ const MsgFmtEscalationApprovalsNoApprovalGate = "workflow %q escalation %d: requ
 const MsgFmtEscalationPathsNoPlanStage = "workflow %q escalation %d declares match.paths but the workflow declares no plan stage: an escalation's paths are evaluated at the approval gate against the approved plan's scope.files, so a workflow that produces no plan produces no path set to match against and this escalation could never fire — it is refused rather than silently accepted as a control that does something. Give this workflow a plan stage; or match on labels / trigger, which are evaluated from the run's admission context on every workflow whatever its shape (the require dimensions that do not depend on paths — approvals, min_permission and max_autonomy under a non-paths match — still hold)."
 
 // escalationNoRaiseMessage renders MsgFmtEscalationNoRaise — the shared shape
-// helper, mirroring the backend's, so the four dimensions cannot drift into
-// four differently actionable messages on either side.
+// helper, mirroring the backend's, so the dimensions it renders (count,
+// min_permission, member_of, reviewers) cannot drift into differently
+// actionable messages on either side.
 func escalationNoRaiseMessage(workflow string, idx int, dimension, escalated, baseline, fix string) string {
 	return fmt.Sprintf(MsgFmtEscalationNoRaise, workflow, idx, dimension, escalated, baseline, fix)
 }
@@ -393,9 +396,14 @@ func escalationPathsNoPlanStageMessage(workflow string, idx int) string {
 // backend at dispatch. The rungs and their ORDER match the backend's exactly:
 // the `change_kind` refusal, the shared Predicate.Validate, the
 // approvals-with-no-approval-gate rejection, the count, min_permission and
-// member_of checks, then LAST the `match.paths`-on-a-plan-less-workflow refusal
-// (the structural-impossibility rung, last for the reason the backend's doc
-// comment gives). The plan-stage predicate is the reused hasPlanStageFromRaw.
+// member_of checks, then the three require.reviewers rungs (E55.9 / #3754:
+// an undeclared persona, no agent-reviewing plan / implement stage to join, a
+// no-op attachment — checkEscalatedReviewers), then LAST the
+// `match.paths`-on-a-plan-less-workflow refusal (the structural-impossibility
+// rung, last for the reason the backend's doc comment gives). The plan-stage
+// predicate is the reused hasPlanStageFromRaw. declared is the root
+// reviewer_personas map (nil when absent, so every required name is
+// undeclared).
 //
 // THE ONE CHECK THAT STAYS BACKEND-ONLY is `max_autonomy`'s no-op check: it
 // needs the v2 tier expansion and a resolved-matrix comparison, and this
@@ -408,9 +416,10 @@ func escalationPathsNoPlanStageMessage(workflow string, idx int) string {
 //
 // Unlike the backend this sweep COLLECTS every entry's first error rather than
 // returning on the first, matching the file's existing accumulate-then-report
-// posture. To keep the backend's ONE-ENTRY-PER-ESCALATION contract, the paths
-// rung captures the error count before the require-side rungs and reports only
-// when no earlier rung reported for THIS escalation. It also runs regardless
+// posture. To keep the backend's ONE-ENTRY-PER-ESCALATION contract, the
+// error count is captured before the require-side rungs: the reviewers rungs
+// run only when no approvals rung reported, and the paths rung only when no
+// earlier rung reported, for THIS escalation. It also runs regardless
 // of whether the `require` node was a readable map — `require` is
 // schema-required, so an unreadable one means a document already rejected
 // structurally, but the rung must not be silently dead on that leg.
@@ -424,7 +433,7 @@ func escalationPathsNoPlanStageMessage(workflow string, idx int) string {
 //
 // It runs AFTER schema validation, so a node that is not the shape the schema
 // requires was already rejected upstream and is skipped here.
-func checkEscalations(wf map[string]any, wfName string, errs *[]ValidationErrorEntry) {
+func checkEscalations(wf map[string]any, wfName string, declared map[string]any, errs *[]ValidationErrorEntry) {
 	list, ok := wf["escalations"].([]any)
 	if !ok {
 		return
@@ -459,6 +468,9 @@ func checkEscalations(wf map[string]any, wfName string, errs *[]ValidationErrorE
 		before := len(*errs)
 		if require, ok := esc["require"].(map[string]any); ok {
 			checkEscalatedApprovals(require, wfName, i, ptr, gates, errs)
+			if len(*errs) == before {
+				checkEscalatedReviewers(require, wf, wfName, i, declared, errs)
+			}
 		}
 		if len(*errs) == before && stagesReadable && !planStageFound && len(p.Paths) > 0 {
 			*errs = append(*errs, ValidationErrorEntry{
@@ -519,6 +531,103 @@ func checkEscalatedApprovals(require map[string]any, wfName string, idx int, ptr
 				"Name a group some approval gate does NOT already require, or drop require.approvals.member_of."),
 		})
 	}
+}
+
+// checkEscalatedReviewers mirrors the backend's require.reviewers rungs
+// (validateEscalatedReviewers, E55.9 / #3754) for one escalation, appending
+// the FIRST rejection it finds: an undeclared name (at .../require/reviewers/<j>),
+// then no agent-reviewing plan / implement stage (at .../require/reviewers),
+// then a persona every such stage already attaches statically (the no-op,
+// rendered through the shared MsgFmtEscalationNoRaise shape). The stages are
+// the RESOLVED ones (the sweep runs after reuse resolution); the agent count is
+// len(reviewers.agents) and the static attachment set rawStringList of
+// reviewers.personas — the backend's AgentCount / Reviewers.Personas reading.
+func checkEscalatedReviewers(require, wf map[string]any, wfName string, idx int, declared map[string]any, errs *[]ValidationErrorEntry) {
+	names := rawStringList(require["reviewers"])
+	if len(names) == 0 {
+		return
+	}
+	for j, name := range names {
+		if _, ok := declared[name]; !ok {
+			*errs = append(*errs, ValidationErrorEntry{
+				Path:    fmt.Sprintf(PathFmtEscalationReviewerItem, wfName, idx, j),
+				Message: fmt.Sprintf(MsgFmtEscalationReviewerPersonaUnknown, wfName, idx, name, name),
+			})
+			return
+		}
+	}
+	reviewing := agentReviewingStagesFromRaw(wf)
+	if len(reviewing) == 0 {
+		*errs = append(*errs, ValidationErrorEntry{
+			Path:    fmt.Sprintf(PathFmtEscalationReviewers, wfName, idx),
+			Message: fmt.Sprintf(MsgFmtEscalationReviewersNoAgentReview, wfName, idx, wfName),
+		})
+		return
+	}
+	for j, name := range names {
+		if everyStageAttachesPersonaRaw(reviewing, name) {
+			*errs = append(*errs, ValidationErrorEntry{
+				Path:    fmt.Sprintf(PathFmtEscalationReviewerItem, wfName, idx, j),
+				Message: escalationReviewerNoRaiseMessage(wfName, idx, name),
+			})
+			return
+		}
+	}
+}
+
+// escalationReviewerNoRaiseMessage renders the require.reviewers no-op
+// rejection, mirroring the backend helper of the same name so both validators
+// render byte-identical text (the corpus row persona-escalation-noop pins it).
+func escalationReviewerNoRaiseMessage(workflow string, idx int, persona string) string {
+	return escalationNoRaiseMessage(workflow, idx, "reviewers",
+		fmt.Sprintf("persona %q", persona),
+		fmt.Sprintf(MsgFmtEscalationReviewerNoRaiseBaseline, persona),
+		fmt.Sprintf(MsgFmtEscalationReviewerNoRaiseFix, persona, persona))
+}
+
+// agentReviewingStagesFromRaw returns the reviewers node of every stage of
+// the resolved workflow that runs the agent-review loop a persona joins: a
+// plan or implement stage with a non-empty reviewers.agents list.
+func agentReviewingStagesFromRaw(wf map[string]any) []map[string]any {
+	stages, _ := wf["stages"].([]any)
+	var out []map[string]any
+	for _, stRaw := range stages {
+		st, ok := stRaw.(map[string]any)
+		if !ok {
+			continue
+		}
+		stType, _ := st["type"].(string)
+		if !reviewConventionStageType(stType) {
+			continue
+		}
+		reviewers, ok := st["reviewers"].(map[string]any)
+		if !ok {
+			continue
+		}
+		if agents, ok := reviewers["agents"].([]any); ok && len(agents) > 0 {
+			out = append(out, reviewers)
+		}
+	}
+	return out
+}
+
+// everyStageAttachesPersonaRaw reports whether EVERY reviewers node already
+// attaches persona through reviewers.personas — the backend's
+// everyStageAttachesPersona over the raw tree.
+func everyStageAttachesPersonaRaw(reviewing []map[string]any, persona string) bool {
+	for _, reviewers := range reviewing {
+		found := false
+		for _, name := range rawStringList(reviewers["personas"]) {
+			if name == persona {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return len(reviewing) > 0
 }
 
 // approvalGatesFromRaw collects every approval gate's `approvals` node in the
