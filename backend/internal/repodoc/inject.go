@@ -216,6 +216,11 @@ const WithheldNoticeHeading = "Declared repository documents withheld"
 // declared, and the agent would judge the change as if no such constraint
 // existed.
 //
+// The notice states ONLY what the server knows: the documents are DECLARED and
+// were NOT READ. It makes no claim about their content or existence — a
+// withheld document is never fetched, so the server cannot know whether it is
+// present, empty or absent at any commit (#2797, carried from #3746).
+//
 // Every interpolated value — the reason, each path, each declaration site — is
 // passed through sanitizeMetadata, so a repository-chosen file name carrying a
 // newline cannot end its list line and start a forged heading or instruction
@@ -229,8 +234,9 @@ const WithheldNoticeHeading = "Declared repository documents withheld"
 func WithheldNotice(w Withheld) prompt.InjectedDocument {
 	var b strings.Builder
 	fmt.Fprintf(&b, "The documents listed below are declared for this repository but were WITHHELD from this prompt "+
-		"(reason: %s). They are not absent and were not empty: each one resolves only at a pinned commit this run "+
-		"could not supply, so none of them was read at all rather than read at a mutable ref. "+
+		"(reason: %s). Each one may be read only at a pinned commit this run did not record, so none of them was "+
+		"fetched or read, rather than read at a mutable ref. This prompt therefore says nothing about their content, "+
+		"or about whether they exist at any commit. "+
 		"Do not conclude from their absence that no such document was declared.\n\n", sanitizeMetadata(w.Reason))
 	b.WriteString("Withheld documents:\n")
 	for _, d := range w.Declarations {

@@ -10,13 +10,17 @@ import (
 	"log/slog"
 	"net/http"
 	"reflect"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/policy"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/repodoc"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -217,6 +221,12 @@ func TestGetStagePrompt_InjectedDocument_EndToEnd(t *testing.T) {
 // never pass through this endpoint. So the documents are resolved through the
 // SAME server seam the endpoint calls — s.resolveInjectedDocuments, base-ref
 // pinned, attributed — and rendered into both review prompts here.
+//
+// This is the PLACEMENT contract only. That the review build sites actually
+// carry the documents (#2797) is proven on the production paths, against the
+// prompt each reviewer received: TestShipPlan_PlanReview_CarriesInjectedDocument,
+// TestShipTrace_ImplementReview_CarriesInjectedDocument and
+// TestRunSupplementalReinvokeReview_CarriesInjectedDocument.
 func TestInjectedDocument_ReviewPrompts_PrecedeSplitMarker(t *testing.T) {
 	ff := newInjFetcher()
 	s, runID, stageID, _ := newInjectionServer(t, newStoringAuditRepo(),
@@ -1347,5 +1357,338 @@ func TestGetStagePrompt_MixedBaseSources_EachResolvesAgainstItsOwnBase(t *testin
 	want := map[string]string{"declaration_seam": injPinnedCommit, "run_admission": admCommitA}
 	if !reflect.DeepEqual(bySource, want) {
 		t.Errorf("document_injected base_source → commit = %v, want %v", bySource, want)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// #2797: the IN-PROCESS review build sites — runPlanReviews (plan_review),
+// runImplementReviewsForTree (implement_review) and
+// runSupplementalReinvokeReview — resolve, attribute and render the documents
+// declared for the stage UNDER REVIEW through resolveReviewInjectedDocuments,
+// and FAIL CLOSED: no reviewer runs on a document-less prompt. The
+// production-path tests live beside each build site (plan_test.go,
+// trace_test.go); the shared fixtures and the cross-cutting fail-closed/inert
+// tests live here.
+// ---------------------------------------------------------------------------
+
+// reviewMissingPath is a declared path injFetcher answers forge.ErrNotFound for
+// at every ref, so a declaration naming it fails Resolve and nothing else.
+const reviewMissingPath = ".fishhawk/missing-conventions.md"
+
+func missingDecl() repodoc.Declaration {
+	return repodoc.Declaration{Path: reviewMissingPath, DeclarationSite: injDeclSite, Framing: injFraming()}
+}
+
+// reviewDeclSeam is a RECORDING declaration seam: it records every stage it is
+// handed so a test can assert a review build consulted it with the REVIEWED
+// stage, and it returns its current declarations at injBaseBranch.
+type reviewDeclSeam struct {
+	mu     sync.Mutex
+	decls  []repodoc.Declaration
+	stages []run.Stage
+}
+
+func (d *reviewDeclSeam) declare(_ context.Context, _ *run.Run, st *run.Stage) ([]repodoc.Declaration, string, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.stages = append(d.stages, *st)
+	return d.decls, injBaseBranch, nil
+}
+
+func (d *reviewDeclSeam) setDecls(decls ...repodoc.Declaration) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.decls = decls
+}
+
+func (d *reviewDeclSeam) recorded() []run.Stage {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return slices.Clone(d.stages)
+}
+
+// reviewInjection is the wiring a review-path test holds onto: the recording
+// seam and the ref-keyed fetcher (pinned commit → injBaseContent, every
+// mutable ref → injSoftContent).
+type reviewInjection struct {
+	seam    *reviewDeclSeam
+	fetcher *injFetcher
+}
+
+// wireReviewInjection configures BOTH halves of the document seam on s.
+func wireReviewInjection(s *Server, decls ...repodoc.Declaration) *reviewInjection {
+	ri := &reviewInjection{seam: &reviewDeclSeam{decls: decls}, fetcher: newInjFetcher()}
+	s.cfg.DocumentDeclarations = ri.seam.declare
+	s.cfg.DocumentResolver = &repodoc.Resolver{Fetcher: ri.fetcher, Commits: &injCommits{sha: injPinnedCommit}}
+	return ri
+}
+
+// wireAdmissionReviewInjection configures a run-admission declaration (the
+// E55.7 base source) with the counting admFetcher / admCommits.
+func wireAdmissionReviewInjection(s *Server) (*admFetcher, *admCommits) {
+	ff, cr := newAdmFetcher(), &admCommits{}
+	s.cfg.DocumentDeclarations = admSeam(injBaseBranch, admDecl())
+	s.cfg.DocumentResolver = &repodoc.Resolver{Fetcher: ff, Commits: cr}
+	return ff, cr
+}
+
+func reviewerCalls(r *fakePlanReviewer) []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return slices.Clone(r.calls)
+}
+
+// auditFakeEntries returns the auditFake's appended entries of category.
+func auditFakeEntries(au *auditFake, category string) []audit.ChainAppendParams {
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var out []audit.ChainAppendParams
+	for _, e := range au.appended {
+		if e.Category == category {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// assertReviewPromptCarriesInjectedDocument asserts the prompt a reviewer
+// actually RECEIVED carries the pinned document (and never the mutable-ref
+// one) inside the cache-stable prefix: the split marker is REQUIRED to exist.
+func assertReviewPromptCarriesInjectedDocument(t *testing.T, got, marker, markerName string) {
+	t.Helper()
+	if !strings.Contains(got, injBaseContent) {
+		t.Errorf("reviewer prompt does not carry the pinned document content %q", injBaseContent)
+	}
+	if strings.Contains(got, injSoftContent) {
+		t.Errorf("reviewer prompt carries the MUTABLE-ref content — the read was not pinned")
+	}
+	headingAt := strings.Index(got, "### "+injFraming().Heading)
+	if headingAt < 0 {
+		t.Fatalf("reviewer prompt has no injected block")
+	}
+	markerAt := strings.Index(got, marker)
+	if markerAt < 0 {
+		t.Fatalf("reviewer prompt has no %s — there is no boundary to order against", markerName)
+	}
+	if headingAt > markerAt {
+		t.Errorf("injected block at %d falls AFTER %s at %d", headingAt, markerName, markerAt)
+	}
+}
+
+// assertInjectionAttributedTo asserts exactly one document_injected entry,
+// stamped with the REVIEWED stage and naming the pinned revision.
+func assertInjectionAttributedTo(t *testing.T, au *auditFake, stageID uuid.UUID) {
+	t.Helper()
+	entries := auditFakeEntries(au, "document_injected")
+	if len(entries) != 1 {
+		t.Fatalf("document_injected entries = %d, want 1", len(entries))
+	}
+	if entries[0].StageID == nil || *entries[0].StageID != stageID {
+		t.Errorf("document_injected stage_id = %v, want the reviewed stage %s", entries[0].StageID, stageID)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(entries[0].Payload, &payload); err != nil {
+		t.Fatalf("decode document_injected payload: %v", err)
+	}
+	for k, want := range map[string]any{"path": injPath, "commit": injPinnedCommit, "declaration_site": injDeclSite} {
+		if payload[k] != want {
+			t.Errorf("document_injected payload[%q] = %v, want %v", k, payload[k], want)
+		}
+	}
+}
+
+// assertSeamSawReviewedStage asserts the declaration seam was consulted, and
+// only ever with the reviewed stage.
+func assertSeamSawReviewedStage(t *testing.T, seam *reviewDeclSeam, stageID uuid.UUID, stageType run.StageType) {
+	t.Helper()
+	got := seam.recorded()
+	if len(got) == 0 {
+		t.Fatal("the declaration seam was never consulted")
+	}
+	for _, st := range got {
+		if st.ID != stageID || st.Type != stageType {
+			t.Errorf("seam consulted with stage %s (type %q), want the reviewed stage %s (type %q)", st.ID, st.Type, stageID, stageType)
+		}
+	}
+}
+
+// assertReviewFailedClosed asserts the fail-closed contract: NO reviewer ran,
+// NO *_review_started was emitted, NO document_injected claim landed, and a
+// *_review_failed entry for the stage carries a document_injection_failed
+// reason containing every want substring.
+func assertReviewFailedClosed(t *testing.T, reviewer *fakePlanReviewer, au *auditFake, stageID uuid.UUID, failedCat, startedCat string, want ...string) {
+	t.Helper()
+	if n := len(reviewerCalls(reviewer)); n != 0 {
+		t.Errorf("reviewer invoked %d times, want 0 — a review ran on a document-less prompt", n)
+	}
+	if n := countAuditCategory(au, startedCat); n != 0 {
+		t.Errorf("%s entries = %d, want 0", startedCat, n)
+	}
+	if n := countAuditCategory(au, "document_injected"); n != 0 {
+		t.Errorf("document_injected entries = %d, want 0", n)
+	}
+	failed := auditFakeEntries(au, failedCat)
+	if len(failed) != 1 {
+		t.Fatalf("%s entries = %d, want 1", failedCat, len(failed))
+	}
+	if failed[0].StageID == nil || *failed[0].StageID != stageID {
+		t.Errorf("%s stage_id = %v, want %s", failedCat, failed[0].StageID, stageID)
+	}
+	var p planreview.ReviewFailedPayload
+	if err := json.Unmarshal(failed[0].Payload, &p); err != nil {
+		t.Fatalf("decode %s payload: %v", failedCat, err)
+	}
+	if !strings.HasPrefix(p.Reason, reviewDocumentInjectionFailedPrefix+": ") {
+		t.Errorf("%s reason = %q, want prefix %q", failedCat, p.Reason, reviewDocumentInjectionFailedPrefix+": ")
+	}
+	for _, w := range want {
+		if !strings.Contains(p.Reason, w) {
+			t.Errorf("%s reason = %q, missing %q", failedCat, p.Reason, w)
+		}
+	}
+}
+
+// (F5) TestRunImplementReviews_AttributionFailure_NoReviewerRuns: the document
+// RESOLVES, but its document_injected append fails (every other category
+// appends normally, so the implement_review_failed entry lands). An
+// un-attributed injection is exactly what the attribution property forbids, so
+// no reviewer runs.
+//
+// Counterfactual: make resolveReviewInjectedDocuments call
+// previewInjectedDocuments (attribute=false) — nothing fails, the reviewer
+// runs, and this goes RED. That also proves the review path ATTRIBUTES.
+func TestRunImplementReviews_AttributionFailure_NoReviewerRuns(t *testing.T) {
+	reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-sonnet-4-6"}
+	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+	au.appendErrCategory = "document_injected"
+	wireReviewInjection(s, seamDecl())
+
+	diff := policy.Diff{ChangedFiles: []policy.ChangedFile{{Path: "backend/internal/foo/foo.go", Status: policy.StatusModified}}}
+	if !s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, diff, nil, "head-f5", nil) {
+		t.Error("gating attribution failure must return true (the caller fails the stage category-B)")
+	}
+	assertReviewFailedClosed(t, reviewer, au, implStage.ID, "implement_review_failed", "implement_review_started", "attribute document_injected", injPath)
+}
+
+// (F6) TestRunPlanReviews_PartialSeamConfiguration_FailsClosed: a configured
+// declaration seam with NO resolver is a wiring defect, not an inert state, at
+// a review site exactly as at the /prompt endpoint.
+//
+// Counterfactual: add a (nil, nil) short-circuit on a nil DocumentResolver to
+// resolveReviewInjectedDocuments — the reviewer runs and this goes RED.
+func TestRunPlanReviews_PartialSeamConfiguration_FailsClosed(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-sonnet-4-6"}
+	s, _, _, au, rr := newPlanServerWithReviewer(t, runID, stageID, reviewer, specAdvisoryReviewers)
+	rr.getStages[stageID].Type = run.StageTypePlan
+	seam := &reviewDeclSeam{decls: []repodoc.Declaration{seamDecl()}}
+	s.cfg.DocumentDeclarations = seam.declare
+	s.cfg.DocumentResolver = nil
+
+	if s.runPlanReviews(t.Context(), runID, stageID, validPlanBytes(t), nil, nil, nil, nil, nil) {
+		t.Error("advisory runPlanReviews must return false")
+	}
+	s.waitBackgroundReviews()
+	assertReviewFailedClosed(t, reviewer, au, stageID, "plan_review_failed", "plan_review_started", "misconfigured")
+}
+
+// (F7) TestRunPlanReviews_ReviewedStageUnloadable_FailsClosed: with the seam
+// configured, a reviewed stage that cannot be loaded is UNDECIDABLE (the seam
+// is keyed on the stage), so it fails closed rather than reading as "no
+// documents declared".
+//
+// Counterfactual: make resolveReviewInjectedDocuments return (nil, nil) on a
+// GetStage error — the reviewer runs and this goes RED.
+func TestRunPlanReviews_ReviewedStageUnloadable_FailsClosed(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-sonnet-4-6"}
+	s, _, _, au, rr := newPlanServerWithReviewer(t, runID, stageID, reviewer, specAdvisoryReviewers)
+	delete(rr.getStages, stageID)
+	ri := wireReviewInjection(s, seamDecl())
+
+	if s.runPlanReviews(t.Context(), runID, stageID, validPlanBytes(t), nil, nil, nil, nil, nil) {
+		t.Error("advisory runPlanReviews must return false")
+	}
+	s.waitBackgroundReviews()
+	assertReviewFailedClosed(t, reviewer, au, stageID, "plan_review_failed", "plan_review_started", "load reviewed stage")
+	if n := len(ri.seam.recorded()); n != 0 {
+		t.Errorf("declaration seam consulted %d times with no reviewed stage, want 0", n)
+	}
+}
+
+// TestResolveReviewInjectedDocuments_NilInputsFailClosed pins the helper's two
+// remaining guards directly: a nil run row and a stage lookup that returns no
+// stage without an error are errors, never (nil, nil) — the core
+// resolveDeclaredDocuments treats a nil run/stage as inert, which on a review
+// path would silently drop a declared document.
+//
+// Counterfactual: change either guard to `return nil, nil` — its subtest goes
+// RED.
+func TestResolveReviewInjectedDocuments_NilInputsFailClosed(t *testing.T) {
+	t.Run("nil run row", func(t *testing.T) {
+		s, _, _, _, _, implStage := newImplementReviewServer(t, &fakePlanReviewer{}, specImplementGatingReviewers)
+		wireReviewInjection(s, seamDecl())
+		docs, err := s.resolveReviewInjectedDocuments(t.Context(), nil, implStage.ID)
+		if err == nil || docs != nil {
+			t.Fatalf("resolveReviewInjectedDocuments(nil run) = (%v, %v), want (nil, error)", docs, err)
+		}
+	})
+	t.Run("stage lookup returns no stage", func(t *testing.T) {
+		runID, stageID := uuid.New(), uuid.New()
+		s, _, _, _, rr := newPlanServerWithReviewer(t, runID, stageID, &fakePlanReviewer{}, specGatingReviewers)
+		rr.getStages[stageID] = nil
+		wireReviewInjection(s, seamDecl())
+		docs, err := s.resolveReviewInjectedDocuments(t.Context(), rr.getRuns[runID], stageID)
+		if err == nil || docs != nil {
+			t.Fatalf("resolveReviewInjectedDocuments(nil stage) = (%v, %v), want (nil, error)", docs, err)
+		}
+		if !strings.Contains(err.Error(), "stage not found") {
+			t.Errorf("error = %v, want it to name the missing stage", err)
+		}
+	})
+}
+
+// (F8) TestRunPlanReviews_NilSeam_InertAndByteIdentical: with NO declaration
+// seam the review runs, renders no injected block and writes no document_*
+// entry; and that prompt is byte-identical to the one built when the seam is
+// configured and declares ZERO documents for the stage. Config.
+// DocumentDeclarations == nil is the SOLE inert signal, owned by
+// resolveDeclaredDocuments — the review helper has no short-circuit of its own
+// (approval condition 2).
+//
+// Counterfactual: delete the DocumentDeclarations == nil check in
+// resolveDeclaredDocuments — the nil-resolver refusal then fires, the review
+// fails closed, and part (i) goes RED.
+func TestRunPlanReviews_NilSeam_InertAndByteIdentical(t *testing.T) {
+	build := func(t *testing.T, wire bool) (string, *auditFake) {
+		t.Helper()
+		runID, stageID := uuid.New(), uuid.New()
+		reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-sonnet-4-6"}
+		s, _, _, au, rr := newPlanServerWithReviewer(t, runID, stageID, reviewer, specGatingReviewers)
+		rr.getStages[stageID].Type = run.StageTypePlan
+		if wire {
+			wireReviewInjection(s) // configured, declares nothing
+		}
+		if s.runPlanReviews(t.Context(), runID, stageID, validPlanBytes(t), nil, nil, nil, nil, nil) {
+			t.Fatal("approve verdict must not gate")
+		}
+		calls := reviewerCalls(reviewer)
+		if len(calls) != 1 {
+			t.Fatalf("reviewer calls = %d, want 1 (wire=%v)", len(calls), wire)
+		}
+		return calls[0], au
+	}
+
+	inert, au := build(t, false)
+	if strings.Contains(inert, "### "+injFraming().Heading) || strings.Contains(inert, repodoc.WithheldNoticeHeading) {
+		t.Errorf("inert review prompt carries an injected block")
+	}
+	for _, cat := range []string{"document_injected", "document_truncated", "document_injection_degraded", "plan_review_failed"} {
+		if n := countAuditCategory(au, cat); n != 0 {
+			t.Errorf("inert review wrote %d %s entries, want 0", n, cat)
+		}
+	}
+	if zeroDecls, _ := build(t, true); zeroDecls != inert {
+		t.Errorf("a configured seam declaring zero documents changed the review prompt bytes")
 	}
 }

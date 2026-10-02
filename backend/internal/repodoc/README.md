@@ -106,7 +106,7 @@ Two sources, selected PER DECLARATION by `Declaration.Base` (a `BaseSource`):
 | `Declaration.Base` | Resolved against | `base_source` on `document_injected` | Consumer today |
 |---|---|---|---|
 | `BaseSourceDeclarationSeam` (zero value) | the ref `Config.DocumentDeclarations` returns as its second value (a branch pinned at serve time, or a commit) | `declaration_seam` | the #2234 charter (default-branch head at serve time, below) |
-| `BaseSourceRunAdmission` | `runs.document_base_commit` — the commit recorded on the run at admission, and nothing else | `run_admission` | none yet; E55.2 / #2797 attach here |
+| `BaseSourceRunAdmission` | `runs.document_base_commit` — the commit recorded on the run at admission, and nothing else | `run_admission` | none yet; E55.2 attaches here (the review prompts honour it since #2797) |
 
 Before E55.7 there was no per-run base source reachable at prompt-serve time:
 `run.Run` carried no base field, and the base branch existed only as runner
@@ -145,8 +145,12 @@ seam-sourced declarations.
   rules out. The prompt carries `WithheldNotice` — heading `Declared repository
   documents withheld`, reason `run_base_commit_unrecorded`
   (`WithheldReasonRunBaseUnrecorded`), and each withheld path and declaration
-  site — on BOTH the served and preview paths, so the two stay byte-identical.
-  The notice is system-authored; every interpolated value passes
+  site — on BOTH the served and preview paths, so the two stay byte-identical,
+  and on the in-process review prompts (#2797). The notice states only what the
+  server knows: the documents are DECLARED and were NOT fetched or read, so it
+  says nothing about their content or existence at any commit (the earlier "not
+  absent and were not empty" sentence claimed what the server never checked —
+  #2797, carried from #3746). The notice is system-authored; every interpolated value passes
   `sanitizeMetadata`, so a repo-chosen file name carrying a newline cannot start
   a forged heading (`TestWithheldNotice_AdversarialMetadata_CannotStartALine`).
   Its `Path` / `Commit` / `ContentHash` are empty, so it can never satisfy a
@@ -423,6 +427,18 @@ immediately below the call), any other build failure, or a response that fails
 while being written. Every entry is present and `document_count` is satisfied,
 so the set is byte-indistinguishable from one whose prompt reached a runner.
 
+The in-process review builds (#2797) attribute the same way, immediately before
+their own `prompt.Build`, so the same over-record direction holds there: a
+review-prompt build failure after attribution leaves a complete set for a
+prompt no reviewer read. The #797 duplicate-dispatch skip in
+`runImplementReviewsForTree` does NOT add a case — the guard runs BEFORE the
+resolution, so a skipped duplicate resolves and attributes nothing. Review-build
+entries share `stage_id` with the stage-prompt serves of the same stage and
+carry no prompt-surface key, so the audit log alone cannot say whether a set
+reached the author or a reviewer; the production-path tests in
+`backend/internal/server` are the evidence that reviewers receive the
+document.
+
 Read a `document_injected` entry as **"the server resolved this revision at this
 commit and handed it to the renderer"**, not as "an agent read it". To establish
 that a prompt was actually served and executed, join against the stage's own
@@ -445,7 +461,9 @@ not.
 Attribution runs in the stage-prompt handler, so **every fetch of a stage
 prompt appends fresh entries**. A retry, a re-dispatch, or an operator
 inspecting a prompt each accumulate another `document_injected` entry for the
-same document revision.
+same document revision. The same holds per review BUILD (#2797): each review
+round appends one set — shared by every reviewer of that round, which all read
+one prompt — stamped with the REVIEWED stage's id.
 
 That is deliberate and it is the safer direction. The guarantee is *every
 injection is attributed*; de-duplicating by content hash would trade it for
@@ -489,6 +507,12 @@ writes to the audit trail.
 | M16 run recorded no admission commit | run-admission declarations withheld, never fetched; notice rendered; one `document_injection_degraded` on the served path | `TestRecordWithheld_WritesOneDegradedEntry`, `TestWithheldNotice_NamesReasonPathsAndSites`, and the serve cases in `backend/internal/server/document_injection_test.go` |
 | M17 `document_injection_degraded` append fails / nil appender / empty reason | error; caller must not serve | `TestRecordWithheld_FailsClosed` |
 | M18 withheld path or site forges a heading through a line separator | sanitized to U+FFFD, cannot start a line | `TestWithheldNotice_AdversarialMetadata_CannotStartALine` |
+| M19 review-prompt resolution failure (#2797) | no reviewer runs, no `*_review_started`; `*_review_failed` reason `document_injection_failed: …` names path + site | `TestShipPlan_PlanReview_DocumentResolutionFailure_AdvisorySkipsReviewers`, `TestRunImplementReviews_DocumentResolutionFailure_FailsClosed`, `TestRunSupplementalReinvokeReview_DocumentResolutionFailure_FailsClosed` (in `backend/internal/server`) |
+| M20 review-prompt attribution failure | no reviewer runs; no `document_injected` claim | `TestRunImplementReviews_AttributionFailure_NoReviewerRuns` |
+| M21 review-prompt partial seam (declarations, no resolver) | no reviewer runs; `*_review_failed` names the misconfiguration | `TestRunPlanReviews_PartialSeamConfiguration_FailsClosed` |
+| M22 reviewed stage unloadable / nil run or stage with the seam configured | no reviewer runs (never read as "nothing declared") | `TestRunPlanReviews_ReviewedStageUnloadable_FailsClosed`, `TestResolveReviewInjectedDocuments_NilInputsFailClosed` |
+| M23 review-prompt failure: gating vs advisory | gating fails the stage category-B (plan: `plan_review_document_injection_failed`; implement: the existing `implement_review_rejected` branch, discriminated by the failed entry); advisory leaves the human gate authoritative | `TestRunPlanReviews_DocumentResolutionFailure_GatingFailsStage`, the gating/advisory rows of M19's implement tests |
+| M24 run-admission withholding on a review prompt | notice rendered, nothing fetched, one `document_injection_degraded` for the reviewed stage | `TestRunImplementReviews_RunAdmissionNilCommit_CarriesWithheldNotice` |
 
 ## Consumer contract
 
@@ -516,6 +540,14 @@ prefix** of `buildPlan`, `buildPlanReview`, `buildImplement` and
 `ImplementReviewSplitMarker` — so a per-repo-stable document costs nothing
 incremental across a stage's fix-up re-review rounds. An empty slice renders
 nothing at all. See `backend/internal/prompt/README.md`.
+
+The two REVIEW renders are populated by the three in-process review build
+sites in `backend/internal/server` (#2797): `runPlanReviews` (`plan_review`),
+`runImplementReviewsForTree` (`implement_review` — trace-time review, fix-up
+re-review backstop, decomposed-parent consolidated review) and
+`runSupplementalReinvokeReview`. Each carries the documents declared for the
+stage it REVIEWS — the reviewer is constrained by what constrained the author —
+and fails closed (no reviewer runs) when they cannot be resolved or attributed.
 
 The slim fix-up prompt (`buildImplementFixup`) does **not** render injected
 documents: it forks before the writer, and a fix-up pass is a targeted patch

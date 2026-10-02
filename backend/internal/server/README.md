@@ -672,6 +672,36 @@ every child run; a run with no recorded commit has those declarations WITHHELD (
 #3746, `backend/internal/repodoc/README.md`). The charter keeps its serve-time semantics
 until E71.2 #3242, which should reuse that column.
 
+**Review prompts consult the same seam, with the REVIEWED stage (#2797).** The three
+in-process review builds — `runPlanReviews` (`plan_review`), `runImplementReviewsForTree`
+(`implement_review`: the trace-time review, the fix-up re-review backstop and the decomposed
+parent's consolidated review) and `runSupplementalReinvokeReview` — never pass through the
+signed `/prompt` endpoint, so each resolves, attributes and renders through
+`resolveReviewInjectedDocuments` (`document_injection.go`), which loads the stage under review
+(the plan stage for `plan_review`, the implement stage for `implement_review`) and delegates
+straight to `resolveInjectedDocuments`: `Config.DocumentDeclarations == nil` stays the SOLE
+inert signal for both paths. The charter consumer stays out of review prompts by
+construction: `stageRequiresCharter` is false for every implement stage and for a non-grooming
+plan stage, and a grooming propose stage ships a `grooming_report`, which `handleShipPlan`
+routes away BEFORE `runPlanReviews` runs. In `runImplementReviewsForTree` the resolution sits
+AFTER the #797 idempotency guard (inside `reviewDispatchMu`), so a duplicate dispatch performs
+no forge read, no attribution append and has no new failure path. **Fail-closed, and how to
+read it.** A review whose declared documents cannot be resolved or attributed runs NO reviewer
+and emits no `*_review_started`; it records `plan_review_failed` / `implement_review_failed`
+with a reason prefixed `document_injection_failed`. Under ADVISORY authority the human gate
+stays authoritative with that failed review visible. Under GATING authority the stage fails
+category-B: the plan stage with the truthful reason `plan_review_document_injection_failed: …`,
+but an implement stage through its callers' existing reject branch, so its `failure_reason`
+reads `implement_review_rejected: agent review verdict reject under gating authority` **even
+though no reviewer ran**. Operators must read the stage's `implement_review_failed` audit entry
+— reason prefix `document_injection_failed` — to tell a document-injection failure from a real
+reject verdict (a real reject has `implement_reviewed` entries and no such failed entry).
+Tests: `TestShipPlan_PlanReview_CarriesInjectedDocument`,
+`TestShipTrace_ImplementReview_CarriesInjectedDocument`,
+`TestRunSupplementalReinvokeReview_CarriesInjectedDocument`,
+`TestRunImplementReviews_DuplicateDispatch_NoDocumentResolution`, and the fail-closed set in
+`plan_test.go` / `trace_test.go` / `document_injection_test.go`.
+
 **Non-grooming prompts are byte-identical.** The declarations func returns zero
 declarations for every other stage (and never touches the conventions loader), and
 `resolveInjectedDocuments` short-circuits on an empty set. Because the fact decides, a
