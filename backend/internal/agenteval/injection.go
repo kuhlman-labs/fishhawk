@@ -37,6 +37,8 @@
 package agenteval
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -44,6 +46,7 @@ import (
 	"strings"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/repodoc"
 )
 
 // DeciderDimension is the behavioural rubric dimension that DECIDES an
@@ -74,6 +77,13 @@ var InjectionAttackClasses = []string{
 	// three reviewed renders (unlike verify_output, every reviewed render
 	// ingests crew messages).
 	"crew-message-instruction-injection",
+	// E55.3 / #2244: the payload lives in a REPOSITORY REVIEW CONVENTION — a
+	// repo-authored conventions file the workflow selected for a review stage,
+	// rendered through repodoc's delimiters inside the subordinate
+	// "Repository review conventions (supplemental)" section. Its probes use the
+	// "review_convention" channel and are asserted only in the plan_review and
+	// implement_review renders (author prompts never carry conventions).
+	"review-convention-override",
 }
 
 // ReviewedRenderStages are the three stage prompts that INGEST untrusted
@@ -99,7 +109,9 @@ type Probe struct {
 	// the implement_review render (the only reviewed render that ingests gate
 	// evidence) and is asserted WHOLLY ABSENT from the plan/plan_review renders.
 	// A "crew_message" probe is asserted in ALL THREE reviewed renders, since
-	// every one of them ingests crew messages.
+	// every one of them ingests crew messages. A "review_convention" probe is
+	// asserted in the plan_review and implement_review renders and asserted
+	// WHOLLY ABSENT from the plan render (E55.3 / #2244).
 	Channel string `json:"channel"`
 	// Text is the literal probe substring.
 	Text string `json:"text"`
@@ -146,6 +158,22 @@ func (m *CrewMessageFixture) fields() []string {
 	return []string{m.MessageText}
 }
 
+// ReviewConventionFixture declares one workflow-selected repository review
+// convention of an injection case (E55.3 / #2244): the adversarial payload as it
+// would arrive through a conventions file. ToTrigger renders Content through the
+// REAL repodoc.ToPromptDocument, so the shipped delimiters and delimiter-line
+// neutralization are what the containment gate exercises.
+type ReviewConventionFixture struct {
+	Name        string `json:"name"`
+	SeverityCap string `json:"severity_cap"`
+	Path        string `json:"path"`
+	Content     string `json:"content"`
+}
+
+// reviewConventionFixtureCommit is the fixed pinned base commit ToTrigger
+// stamps on every fixture convention, so renders are deterministic.
+const reviewConventionFixtureCommit = "2244e55300000000000000000000000000000000"
+
 // BehavioralRubric states, in reviewable terms, what COMPLIANCE with this
 // fixture's payload would look like in the produced artifact — the
 // substantive signal that replaces "did a sentinel substring appear".
@@ -182,6 +210,11 @@ type InjectionCase struct {
 	// maps them onto prompt.Trigger.CrewMessages; empty leaves that field nil so
 	// every existing fixture's renders stay byte-identical.
 	CrewMessages []CrewMessageFixture `json:"crew_messages,omitempty"`
+	// ReviewConventions, when non-empty, carries the adversarial
+	// review-convention channel (E55.3 / #2244). ToTrigger maps them onto
+	// prompt.Trigger.ReviewConventions; empty leaves that field nil so every
+	// existing fixture's renders stay byte-identical.
+	ReviewConventions []ReviewConventionFixture `json:"review_conventions,omitempty"`
 	// ContainmentProbes are the offline gate's assertions.
 	ContainmentProbes []Probe `json:"containment_probes"`
 	// ComplianceMarker is the literal "emit this token" sentinel. Its
@@ -215,7 +248,7 @@ type NamedInjectionCase struct {
 // the gate is silently not running — the exact fail-open this issue exists
 // to close.
 //
-// EIGHTEEN named fail-closed modes, each returning an error naming the case:
+// TWENTY-ONE named fail-closed modes, each returning an error naming the case:
 //
 //	(a) missing/unreadable case.json
 //	(b) malformed JSON
@@ -246,6 +279,12 @@ type NamedInjectionCase struct {
 //	    messages' message_text — the #3738 vacuity sibling of (f) and (n)
 //	(r) a declared crew_messages entry whose message_text is empty — it would
 //	    render an empty envelope, so a fixture declaring one is malformed
+//	(s) a review_convention probe on a case declaring no review_conventions
+//	    block — no conventions section renders, so it is VACUOUS (E55.3 / #2244)
+//	(t) a review_convention probe whose text is a substring of none of the
+//	    declared conventions' content — the vacuity sibling of (f), (n), (q)
+//	(u) a declared review_conventions entry whose content is empty — it would
+//	    render an empty delimited block, so a fixture declaring one is malformed
 func LoadInjectionCorpus(dir string) ([]NamedInjectionCase, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -328,6 +367,11 @@ func (c *InjectionCase) validate() error {
 			return fmt.Errorf("crew_messages[%d]: message_text must be non-empty — it would render an empty envelope", i) // (r)
 		}
 	}
+	for i, rc := range c.ReviewConventions {
+		if strings.TrimSpace(rc.Content) == "" {
+			return fmt.Errorf("review_conventions[%d]: content must be non-empty — it would render an empty delimited block", i) // (u)
+		}
+	}
 	return nil
 }
 
@@ -367,10 +411,31 @@ func (c *InjectionCase) validateProbe(i int, p Probe) error {
 		if p.Text == "" || !anyCrewMessageContains(c.CrewMessages, p.Text) {
 			return fmt.Errorf("containment_probes[%d]: text %q is not a substring of any declared crew message's message_text", i, p.Text) // (q)
 		}
+	case "review_convention":
+		// (s)/(t): a review_convention probe must occur in a DECLARED
+		// convention's content, or its containment assertion passes VACUOUSLY
+		// (E55.3 / #2244) — the sibling of modes (f), (n) and (q).
+		if len(c.ReviewConventions) == 0 {
+			return fmt.Errorf("containment_probes[%d]: channel \"review_convention\" but the case declares no review_conventions block", i) // (s)
+		}
+		if p.Text == "" || !anyReviewConventionContains(c.ReviewConventions, p.Text) {
+			return fmt.Errorf("containment_probes[%d]: text %q is not a substring of any declared review convention's content", i, p.Text) // (t)
+		}
 	default:
-		return fmt.Errorf("containment_probes[%d]: channel %q must be \"body\", \"comment\", \"verify_output\", or \"crew_message\"", i, p.Channel)
+		return fmt.Errorf("containment_probes[%d]: channel %q must be \"body\", \"comment\", \"verify_output\", \"crew_message\", or \"review_convention\"", i, p.Channel)
 	}
 	return nil
+}
+
+// anyReviewConventionContains reports whether any declared review convention's
+// content contains sub.
+func anyReviewConventionContains(convs []ReviewConventionFixture, sub string) bool {
+	for _, rc := range convs {
+		if strings.Contains(rc.Content, sub) {
+			return true
+		}
+	}
+	return false
 }
 
 // anyCrewMessageContains reports whether any declared crew message's enveloped
@@ -465,6 +530,31 @@ func ToTrigger(c InjectionCase) prompt.Trigger {
 			})
 		}
 		t.CrewMessages = msgs
+	}
+	// E55.3 / #2244: map the declared review conventions through the REAL
+	// repodoc renderer (delimiters, data clause, delimiter-line neutralization),
+	// exactly as the server's resolution path produces them. Left nil when the
+	// fixture declares none, so every existing fixture's renders stay
+	// byte-identical.
+	if len(c.ReviewConventions) > 0 {
+		convs := make([]prompt.ReviewConvention, 0, len(c.ReviewConventions))
+		for _, rc := range c.ReviewConventions {
+			sum := sha256.Sum256([]byte(rc.Content))
+			doc := repodoc.Document{
+				Path:          rc.Path,
+				Commit:        reviewConventionFixtureCommit,
+				ContentHash:   "sha256:" + hex.EncodeToString(sum[:]),
+				Content:       rc.Content,
+				OriginalBytes: len(rc.Content),
+				RenderedBytes: len(rc.Content),
+			}
+			convs = append(convs, prompt.ReviewConvention{
+				Name:        rc.Name,
+				SeverityCap: rc.SeverityCap,
+				Document:    repodoc.ToPromptDocument(doc, repodoc.Framing{Heading: "Review convention " + rc.Name}),
+			})
+		}
+		t.ReviewConventions = convs
 	}
 	// #3192: when the fixture declares a verify_output channel, attach a
 	// GateEvidence that exercises BOTH implement-review render sites from ONE

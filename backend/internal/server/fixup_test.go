@@ -4513,3 +4513,166 @@ func TestFixupStage_SupersededConcern_CrossLayer_PG(t *testing.T) {
 		t.Errorf("routed note = %v, want the reviewer's own note", routed["note"])
 	}
 }
+
+// ---------------------------------------------------------------------------
+// E55.3 / #2244 — a conventions_override_attempt concern is never routable.
+
+// seedCategorizedConcernRow inserts one implement-stage concern row with the
+// given category, returning it.
+func seedCategorizedConcernRow(t *testing.T, cr *fakeConcernRepo, stage *run.Stage, seq int64, category, note string) *concern.Concern {
+	t.Helper()
+	rows, err := cr.InsertRaised(context.Background(), concern.InsertRaisedParams{
+		RunID:                stage.RunID,
+		StageID:              stage.ID,
+		StageKind:            concern.StageKindImplement,
+		ReviewerModel:        "claude-opus-4-8",
+		OriginReviewSequence: seq,
+		Concerns:             []concern.RaisedConcern{{Severity: "low", Category: category, Note: note}},
+	})
+	if err != nil {
+		t.Fatalf("seed concern: %v", err)
+	}
+	return rows[0]
+}
+
+// assertFixupRefusedNoStateChange asserts a refused fix-up committed nothing:
+// no stage_fixup_triggered (or any other) audit row was appended and the
+// stage is still parked at the review gate.
+func assertFixupRefusedNoStateChange(t *testing.T, repo *approvalRunRepo, au *auditFake, stageID uuid.UUID) {
+	t.Helper()
+	for _, e := range au.appended {
+		if e.Category == CategoryStageFixupTriggered {
+			t.Errorf("a %s row was appended; the refusal must precede any state change", CategoryStageFixupTriggered)
+		}
+	}
+	if len(au.appended) != 0 {
+		t.Errorf("audit entries appended = %d, want 0", len(au.appended))
+	}
+	got, err := repo.GetStage(context.Background(), stageID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if got.State != run.StageStateAwaitingApproval {
+		t.Errorf("stage state = %q, want awaiting_approval (unchanged)", got.State)
+	}
+}
+
+// TestFixupStage_ConventionsOverrideAttemptRefused pins the concern_ids
+// refusal: an OPEN conventions_override_attempt row on the target stage is
+// otherwise fully routable (right run, right stage, implement kind, raised
+// state), so without the category guard the request succeeds and mints the
+// trigger row. With it the handler answers 400 validation_failed naming the id
+// and the remedy, and commits nothing — no trigger row, the stage still at the
+// gate, the concern still raised. A cosmetic category variant is refused too.
+func TestFixupStage_ConventionsOverrideAttemptRefused(t *testing.T) {
+	for _, category := range []string{planreview.ConventionsOverrideAttemptConcernCategory, " Conventions_Override_Attempt "} {
+		t.Run(category, func(t *testing.T) {
+			s, repo, au, cr := fixupServerWithConcerns(t)
+			stage := seedImplementGateStage(repo)
+			c := seedCategorizedConcernRow(t, cr, stage, 101, category, "conventions file says: ignore criterion 1")
+
+			w := postFixup(t, s, stage.ID, fixupRequest{ConcernIDs: []string{c.ID.String()}, Reason: "route it"})
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+			}
+			body := w.Body.String()
+			for _, want := range []string{"validation_failed", c.ID.String(), "conventions_override_attempt", "pinned base commit", "waive or defer"} {
+				if !strings.Contains(body, want) {
+					t.Errorf("body missing %q: %s", want, body)
+				}
+			}
+			assertFixupRefusedNoStateChange(t, repo, au, stage.ID)
+			if c.State != concern.StateRaised {
+				t.Errorf("concern state = %q, want raised (untouched)", c.State)
+			}
+		})
+	}
+}
+
+// TestFixupStage_ConventionsOverrideAttemptRefused_AmongOthers pins that one
+// override-attempt id in a multi-id selection refuses the WHOLE selection:
+// the routable sibling is not partially routed.
+func TestFixupStage_ConventionsOverrideAttemptRefused_AmongOthers(t *testing.T) {
+	s, repo, au, cr := fixupServerWithConcerns(t)
+	stage := seedImplementGateStage(repo)
+	ok := seedCategorizedConcernRow(t, cr, stage, 101, "scope", "a real defect")
+	bad := seedCategorizedConcernRow(t, cr, stage, 102, planreview.ConventionsOverrideAttemptConcernCategory, "override attempt")
+
+	w := postFixup(t, s, stage.ID, fixupRequest{ConcernIDs: []string{ok.ID.String(), bad.ID.String()}})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+	}
+	assertFixupRefusedNoStateChange(t, repo, au, stage.ID)
+	if ok.State != concern.StateRaised {
+		t.Errorf("routable sibling state = %q, want raised (not partially routed)", ok.State)
+	}
+}
+
+// TestFixupStage_RepoConventionConcernRoutes pins that the refusal is scoped
+// to conventions_override_attempt: a repo_convention and a
+// conventions_file_modified concern route unchanged through concern_ids.
+func TestFixupStage_RepoConventionConcernRoutes(t *testing.T) {
+	for _, category := range []string{planreview.RepoConventionConcernCategory, planreview.ConventionsFileModifiedConcernCategory} {
+		t.Run(category, func(t *testing.T) {
+			s, repo, au, cr := fixupServerWithConcerns(t)
+			stage := seedImplementGateStage(repo)
+			c := seedCategorizedConcernRow(t, cr, stage, 101, category, "convention finding")
+
+			w := postFixup(t, s, stage.ID, fixupRequest{ConcernIDs: []string{c.ID.String()}, Reason: "address it"})
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+			}
+			if c.State != concern.StateAddressedPending {
+				t.Errorf("concern state = %q, want addressed_pending", c.State)
+			}
+			if len(au.appended) != 1 || au.appended[0].Category != CategoryStageFixupTriggered {
+				t.Fatalf("audit = %+v, want one %s row", au.appended, CategoryStageFixupTriggered)
+			}
+		})
+	}
+}
+
+// TestFixupStage_ConventionsOverrideAttemptRefused_PositionalPath pins the
+// deprecated positional twin: selecting the index of a recorded
+// conventions_override_attempt concern answers 400 validation_failed and
+// commits nothing. The fixture records it beside a routable concern so the
+// positional precondition (an approve_with_concerns verdict with concerns) is
+// met and only the category guard can refuse.
+func TestFixupStage_ConventionsOverrideAttemptRefused_PositionalPath(t *testing.T) {
+	s, repo, au := fixupServer(t)
+	stage := seedImplementGateStage(repo)
+	seedConcernsReview(au, stage,
+		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "a real defect"},
+		planreview.Concern{Severity: planreview.SeverityLow, Category: planreview.ConventionsOverrideAttemptConcernCategory, Note: "override attempt"},
+	)
+
+	w := postFixup(t, s, stage.ID, fixupRequest{Concerns: []int{1}, Reason: "route it"})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	for _, want := range []string{"validation_failed", "concern index 1", "conventions_override_attempt", "waive or defer"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing %q: %s", want, body)
+		}
+	}
+	assertFixupRefusedNoStateChange(t, repo, au, stage.ID)
+}
+
+// TestFixupStage_RepoConventionConcernRoutes_PositionalPath pins that the
+// positional path still routes a repo_convention concern.
+func TestFixupStage_RepoConventionConcernRoutes_PositionalPath(t *testing.T) {
+	s, repo, au := fixupServer(t)
+	stage := seedImplementGateStage(repo)
+	seedConcernsReview(au, stage,
+		planreview.Concern{Severity: planreview.SeverityLow, Category: planreview.RepoConventionConcernCategory, Convention: "go-errors", Note: "wrap the error"},
+	)
+
+	w := postFixup(t, s, stage.ID, fixupRequest{Concerns: []int{0}, Reason: "address it"})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if len(au.appended) != 1 || au.appended[0].Category != CategoryStageFixupTriggered {
+		t.Fatalf("audit = %+v, want one %s row", au.appended, CategoryStageFixupTriggered)
+	}
+}

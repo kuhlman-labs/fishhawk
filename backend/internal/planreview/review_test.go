@@ -1312,3 +1312,325 @@ func TestReasonPersonaRemitUnavailable_WireValue(t *testing.T) {
 		t.Errorf("ReasonPersonaRemitUnavailable = %q", planreview.ReasonPersonaRemitUnavailable)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// E55.3 / #2244 — review-convention verdict contract.
+
+// TestConventionConcernCategories_WireValues pins the three reviewer concern
+// categories the review prompt names verbatim and the fix-up surface keys on.
+func TestConventionConcernCategories_WireValues(t *testing.T) {
+	for got, want := range map[string]string{
+		planreview.RepoConventionConcernCategory:             "repo_convention",
+		planreview.ConventionsOverrideAttemptConcernCategory: "conventions_override_attempt",
+		planreview.ConventionsFileModifiedConcernCategory:    "conventions_file_modified",
+	} {
+		if got != want {
+			t.Errorf("category constant = %q, want %q", got, want)
+		}
+	}
+}
+
+// TestIsConventionsOverrideAttempt pins the normalized category match the
+// fix-up refusal consults: a cosmetic variant still matches, any other
+// category does not.
+func TestIsConventionsOverrideAttempt(t *testing.T) {
+	for cat, want := range map[string]bool{
+		"conventions_override_attempt":     true,
+		"  Conventions_Override_Attempt  ": true,
+		"CONVENTIONS_OVERRIDE_ATTEMPT":     true,
+		"repo_convention":                  false,
+		"conventions_file_modified":        false,
+		"conventions_override":             false,
+		"":                                 false,
+	} {
+		if got := planreview.IsConventionsOverrideAttempt(cat); got != want {
+			t.Errorf("IsConventionsOverrideAttempt(%q) = %v, want %v", cat, got, want)
+		}
+	}
+}
+
+// TestClampConventionSeverities is the one-row-per-branch table for the
+// ingest-time severity_cap clamp. Each row builds a FRESH verdict (the clamp
+// mutates in place) and asserts the resulting severities, the
+// severity_clamped_from stamps, the verdict, VerdictClampedFrom and the
+// Clamped records.
+func TestClampConventionSeverities(t *testing.T) {
+	type cs struct {
+		sev        planreview.ConcernSeverity
+		cat, conv  string
+		wantSev    planreview.ConcernSeverity
+		wantFrom   planreview.ConcernSeverity
+		wantNoneRd bool
+	}
+	caps := planreview.ConventionCaps{"go-errors": planreview.SeverityLow, "docs": planreview.SeverityMedium, "style": ""}
+	cases := []struct {
+		name        string
+		verdict     planreview.Verdict
+		caps        planreview.ConventionCaps
+		concerns    []cs
+		wantVerdict planreview.Verdict
+		wantFrom    planreview.Verdict
+	}{
+		{
+			name: "capped high lowered to cap and stamped", verdict: planreview.VerdictApproveWithConcerns, caps: caps,
+			concerns:    []cs{{sev: "high", cat: "repo_convention", conv: "go-errors", wantSev: "low", wantFrom: "high"}},
+			wantVerdict: planreview.VerdictApproveWithConcerns,
+		},
+		{
+			name: "medium cap lowers high to medium", verdict: planreview.VerdictApproveWithConcerns, caps: caps,
+			concerns:    []cs{{sev: "high", cat: "repo_convention", conv: "docs", wantSev: "medium", wantFrom: "high"}},
+			wantVerdict: planreview.VerdictApproveWithConcerns,
+		},
+		{
+			name: "unknown convention name fails closed to most restrictive rendered cap", verdict: planreview.VerdictApproveWithConcerns, caps: caps,
+			concerns:    []cs{{sev: "medium", cat: "repo_convention", conv: "not-rendered", wantSev: "low", wantFrom: "medium"}},
+			wantVerdict: planreview.VerdictApproveWithConcerns,
+		},
+		{
+			name: "empty convention name fails closed to most restrictive rendered cap", verdict: planreview.VerdictApproveWithConcerns, caps: caps,
+			concerns:    []cs{{sev: "high", cat: "repo_convention", conv: "", wantSev: "low", wantFrom: "high"}},
+			wantVerdict: planreview.VerdictApproveWithConcerns,
+		},
+		{
+			name: "uncapped convention unchanged", verdict: planreview.VerdictApproveWithConcerns, caps: caps,
+			concerns:    []cs{{sev: "high", cat: "repo_convention", conv: "style", wantSev: "high"}},
+			wantVerdict: planreview.VerdictApproveWithConcerns,
+		},
+		{
+			name: "at-or-below cap unchanged", verdict: planreview.VerdictApproveWithConcerns, caps: caps,
+			concerns: []cs{
+				{sev: "low", cat: "repo_convention", conv: "go-errors", wantSev: "low"},
+				{sev: "medium", cat: "repo_convention", conv: "docs", wantSev: "medium"},
+			},
+			wantVerdict: planreview.VerdictApproveWithConcerns,
+		},
+		{
+			name: "non-repo_convention categories untouched when conventions rendered", verdict: planreview.VerdictApproveWithConcerns, caps: caps,
+			concerns: []cs{
+				{sev: "high", cat: "security", wantSev: "high"},
+				{sev: "high", cat: "conventions_override_attempt", wantSev: "high"},
+				{sev: "high", cat: "conventions_file_modified", wantSev: "high"},
+			},
+			wantVerdict: planreview.VerdictApproveWithConcerns,
+		},
+		{
+			name: "cosmetic category variant still clamped", verdict: planreview.VerdictApproveWithConcerns, caps: caps,
+			concerns:    []cs{{sev: "high", cat: " Repo_Convention ", conv: " go-errors ", wantSev: "low", wantFrom: "high"}},
+			wantVerdict: planreview.VerdictApproveWithConcerns,
+		},
+		{
+			name: "out-of-set cap value fails closed to low", verdict: planreview.VerdictApproveWithConcerns,
+			caps:        planreview.ConventionCaps{"weird": "critical"},
+			concerns:    []cs{{sev: "medium", cat: "repo_convention", conv: "weird", wantSev: "low", wantFrom: "medium"}},
+			wantVerdict: planreview.VerdictApproveWithConcerns,
+		},
+		{
+			name: "empty caps (zero conventions rendered) clamps all three convention categories to low", verdict: planreview.VerdictApproveWithConcerns, caps: nil,
+			concerns: []cs{
+				{sev: "high", cat: "repo_convention", conv: "anything", wantSev: "low", wantFrom: "high", wantNoneRd: true},
+				{sev: "medium", cat: "conventions_override_attempt", wantSev: "low", wantFrom: "medium", wantNoneRd: true},
+				{sev: "high", cat: "conventions_file_modified", wantSev: "low", wantFrom: "high", wantNoneRd: true},
+				{sev: "high", cat: "scope", wantSev: "high"},
+			},
+			wantVerdict: planreview.VerdictApproveWithConcerns,
+		},
+		{
+			name: "empty caps map behaves as nil", verdict: planreview.VerdictApproveWithConcerns, caps: planreview.ConventionCaps{},
+			concerns:    []cs{{sev: "high", cat: "conventions_override_attempt", wantSev: "low", wantFrom: "high", wantNoneRd: true}},
+			wantVerdict: planreview.VerdictApproveWithConcerns,
+		},
+		{
+			name: "reject downgraded when every high was clamped", verdict: planreview.VerdictReject, caps: caps,
+			concerns: []cs{
+				{sev: "high", cat: "repo_convention", conv: "go-errors", wantSev: "low", wantFrom: "high"},
+				{sev: "medium", cat: "security", wantSev: "medium"},
+			},
+			wantVerdict: planreview.VerdictApproveWithConcerns, wantFrom: planreview.VerdictReject,
+		},
+		{
+			name: "empty caps reject downgraded when its only high was clamped", verdict: planreview.VerdictReject, caps: nil,
+			concerns:    []cs{{sev: "high", cat: "conventions_override_attempt", wantSev: "low", wantFrom: "high", wantNoneRd: true}},
+			wantVerdict: planreview.VerdictApproveWithConcerns, wantFrom: planreview.VerdictReject,
+		},
+		{
+			name: "reject stands when an unclamped high remains", verdict: planreview.VerdictReject, caps: caps,
+			concerns: []cs{
+				{sev: "high", cat: "repo_convention", conv: "go-errors", wantSev: "low", wantFrom: "high"},
+				{sev: "high", cat: "security", wantSev: "high"},
+			},
+			wantVerdict: planreview.VerdictReject,
+		},
+		{
+			name: "reject stands when no high existed", verdict: planreview.VerdictReject, caps: caps,
+			concerns:    []cs{{sev: "medium", cat: "repo_convention", conv: "go-errors", wantSev: "low", wantFrom: "medium"}},
+			wantVerdict: planreview.VerdictReject,
+		},
+		{
+			name: "reject with no concerns stands", verdict: planreview.VerdictReject, caps: caps,
+			wantVerdict: planreview.VerdictReject,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			v := planreview.ReviewVerdict{Verdict: tc.verdict}
+			for _, c := range tc.concerns {
+				v.Concerns = append(v.Concerns, planreview.Concern{Severity: c.sev, Category: c.cat, Convention: c.conv, Note: "n"})
+			}
+			res := planreview.ClampConventionSeverities(&v, tc.caps)
+			wantClamped := 0
+			for i, c := range tc.concerns {
+				got := v.Concerns[i]
+				if got.Severity != c.wantSev {
+					t.Errorf("concern %d severity = %q, want %q", i, got.Severity, c.wantSev)
+				}
+				if got.SeverityClampedFrom != c.wantFrom {
+					t.Errorf("concern %d severity_clamped_from = %q, want %q", i, got.SeverityClampedFrom, c.wantFrom)
+				}
+				if c.wantFrom != "" {
+					wantClamped++
+				}
+			}
+			if len(res.Clamped) != wantClamped {
+				t.Fatalf("Clamped = %+v, want %d records", res.Clamped, wantClamped)
+			}
+			for _, cl := range res.Clamped {
+				want := tc.concerns[cl.Index]
+				if cl.From != want.sev || cl.To != want.wantSev || cl.NoConventionsRendered != want.wantNoneRd || cl.Category == "" {
+					t.Errorf("Clamped record %+v does not match concern %+v", cl, want)
+				}
+			}
+			if v.Verdict != tc.wantVerdict {
+				t.Errorf("verdict = %q, want %q", v.Verdict, tc.wantVerdict)
+			}
+			if res.VerdictClampedFrom != tc.wantFrom {
+				t.Errorf("VerdictClampedFrom = %q, want %q", res.VerdictClampedFrom, tc.wantFrom)
+			}
+
+			// Idempotent: a second pass over its own output changes nothing.
+			again := planreview.ClampConventionSeverities(&v, tc.caps)
+			if len(again.Clamped) != 0 || again.VerdictClampedFrom != "" {
+				t.Errorf("second clamp pass changed something: %+v", again)
+			}
+		})
+	}
+}
+
+// TestClampConventionSeverities_DoesNotWriteSharedBackingArray pins the
+// copy-before-write: a caller holding the original Concerns slice keeps its
+// reviewer-assigned severities.
+func TestClampConventionSeverities_DoesNotWriteSharedBackingArray(t *testing.T) {
+	orig := []planreview.Concern{{Severity: planreview.SeverityHigh, Category: planreview.RepoConventionConcernCategory, Convention: "c", Note: "n"}}
+	v := planreview.ReviewVerdict{Verdict: planreview.VerdictApproveWithConcerns, Concerns: orig}
+	planreview.ClampConventionSeverities(&v, planreview.ConventionCaps{"c": planreview.SeverityLow})
+	if orig[0].Severity != planreview.SeverityHigh || orig[0].SeverityClampedFrom != "" {
+		t.Errorf("clamp wrote the caller's backing array: %+v", orig[0])
+	}
+	if v.Concerns[0].Severity != planreview.SeverityLow {
+		t.Errorf("clamped verdict severity = %q, want low", v.Concerns[0].Severity)
+	}
+}
+
+// TestClampConventionSeverities_NilVerdict pins the nil-safe no-op.
+func TestClampConventionSeverities_NilVerdict(t *testing.T) {
+	if res := planreview.ClampConventionSeverities(nil, nil); len(res.Clamped) != 0 || res.VerdictClampedFrom != "" {
+		t.Errorf("nil verdict clamp = %+v, want zero result", res)
+	}
+}
+
+// TestAddSynthesizedConventionsFileModifiedConcern pins the once-per-round
+// synthesis: exactly one medium conventions_file_modified concern naming the
+// (deduped, non-blank) paths; a plain approve is raised to
+// approve_with_concerns with raisedFrom=approve; approve_with_concerns and
+// reject keep their verdict with an empty raisedFrom.
+func TestAddSynthesizedConventionsFileModifiedConcern(t *testing.T) {
+	cases := []struct {
+		name        string
+		verdict     planreview.Verdict
+		wantVerdict planreview.Verdict
+		wantRaised  planreview.Verdict
+	}{
+		{"approve raised", planreview.VerdictApprove, planreview.VerdictApproveWithConcerns, planreview.VerdictApprove},
+		{"approve_with_concerns kept", planreview.VerdictApproveWithConcerns, planreview.VerdictApproveWithConcerns, ""},
+		{"reject kept", planreview.VerdictReject, planreview.VerdictReject, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			prior := planreview.Concern{Severity: planreview.SeverityLow, Category: "scope", Note: "prior"}
+			v := planreview.ReviewVerdict{Verdict: tc.verdict, Concerns: []planreview.Concern{prior}}
+			raised := planreview.AddSynthesizedConventionsFileModifiedConcern(&v, []string{".fishhawk/conv/go.md", " ", ".fishhawk/conv/go.md", "docs/rules.md"})
+			if raised != tc.wantRaised {
+				t.Errorf("raisedFrom = %q, want %q", raised, tc.wantRaised)
+			}
+			if v.Verdict != tc.wantVerdict {
+				t.Errorf("verdict = %q, want %q", v.Verdict, tc.wantVerdict)
+			}
+			if len(v.Concerns) != 2 || v.Concerns[0] != prior {
+				t.Fatalf("Concerns = %+v, want the prior concern followed by one synthesized concern", v.Concerns)
+			}
+			got := v.Concerns[1]
+			if got.Category != planreview.ConventionsFileModifiedConcernCategory || got.Severity != planreview.SeverityMedium {
+				t.Errorf("synthesized concern = %+v, want a medium conventions_file_modified", got)
+			}
+			if !strings.Contains(got.Note, ".fishhawk/conv/go.md, docs/rules.md") || strings.Count(got.Note, ".fishhawk/conv/go.md") != 1 {
+				t.Errorf("synthesized note = %q, want each path named once, in order", got.Note)
+			}
+		})
+	}
+}
+
+// TestAddSynthesizedConventionsFileModifiedConcern_NoOps pins the defensive
+// no-op branches: a nil verdict and a path list with no non-blank entry
+// synthesize nothing and leave the verdict alone.
+func TestAddSynthesizedConventionsFileModifiedConcern_NoOps(t *testing.T) {
+	if got := planreview.AddSynthesizedConventionsFileModifiedConcern(nil, []string{"a.md"}); got != "" {
+		t.Errorf("nil verdict raisedFrom = %q, want empty", got)
+	}
+	for _, paths := range [][]string{nil, {}, {"", "  "}} {
+		v := planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}
+		if got := planreview.AddSynthesizedConventionsFileModifiedConcern(&v, paths); got != "" || v.Verdict != planreview.VerdictApprove || len(v.Concerns) != 0 {
+			t.Errorf("paths %q: raisedFrom=%q verdict=%q concerns=%+v, want an untouched approve", paths, got, v.Verdict, v.Concerns)
+		}
+	}
+}
+
+// TestConventionPayloadFields_OmitEmptyAndWire pins the E55.3 additive payload
+// and concern fields: absent when zero (byte-identical to pre-#2244 payloads)
+// and carried under their wire names when set.
+func TestConventionPayloadFields_OmitEmptyAndWire(t *testing.T) {
+	absent := []string{"verdict_clamped_from", "verdict_raised_from", "conventions_file_modified_synthesized", `"convention"`, "severity_clamped_from"}
+	for name, v := range map[string]any{
+		"plan_reviewed":      planreview.PlanReviewedPayload{ReviewerKind: "agent", Verdict: planreview.VerdictApprove, Concerns: []planreview.Concern{{Severity: "low", Note: "n"}}},
+		"implement_reviewed": planreview.ImplementReviewedPayload{ReviewerKind: "agent", Verdict: planreview.VerdictApprove, Concerns: []planreview.Concern{{Severity: "low", Note: "n"}}},
+	} {
+		got, err := json.Marshal(v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, a := range absent {
+			if strings.Contains(string(got), a) {
+				t.Errorf("%s zero-value payload %s carries %s; it must be omitempty", name, got, a)
+			}
+		}
+	}
+
+	set, err := json.Marshal(planreview.ImplementReviewedPayload{
+		ReviewerKind: "agent", Verdict: planreview.VerdictApproveWithConcerns,
+		VerdictClampedFrom: planreview.VerdictReject, VerdictRaisedFrom: planreview.VerdictApprove, ConventionsFileModifiedSynthesized: true,
+		Concerns: []planreview.Concern{{Severity: "low", Category: "repo_convention", Convention: "go-errors", SeverityClampedFrom: "high", Note: "n"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, w := range []string{`"verdict_clamped_from":"reject"`, `"verdict_raised_from":"approve"`, `"conventions_file_modified_synthesized":true`, `"convention":"go-errors"`, `"severity_clamped_from":"high"`} {
+		if !strings.Contains(string(set), w) {
+			t.Errorf("implement_reviewed payload %s missing %s", set, w)
+		}
+	}
+	plan, err := json.Marshal(planreview.PlanReviewedPayload{ReviewerKind: "agent", Verdict: planreview.VerdictApproveWithConcerns, VerdictClampedFrom: planreview.VerdictReject})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(plan), `"verdict_clamped_from":"reject"`) {
+		t.Errorf("plan_reviewed payload %s missing verdict_clamped_from", plan)
+	}
+}

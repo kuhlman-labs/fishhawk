@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -24,6 +25,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/repodoc"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
 
 // This file is the CROSS-BOUNDARY proof for the E55.1 / #2242 document-injection
@@ -1690,5 +1692,407 @@ func TestRunPlanReviews_NilSeam_InertAndByteIdentical(t *testing.T) {
 	}
 	if zeroDecls, _ := build(t, true); zeroDecls != inert {
 		t.Errorf("a configured seam declaring zero documents changed the review prompt bytes")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// E55.3 / #2244: review conventions through the shared resolution core
+// (resolveReviewDocuments) — selection, the lazy stage load, the bounded
+// resolve phase, required/optional/withheld, review-only routing.
+// ---------------------------------------------------------------------------
+
+const (
+	rcConvPath    = "docs/conventions/backend.md"
+	rcOptPath     = "docs/conventions/optional.md"
+	rcConvContent = "CONVENTION: every exported func carries a doc comment."
+	rcConvSite    = "review_conventions.backend in .fishhawk/workflows.yaml"
+	rcOptSite     = "review_conventions.optional in .fishhawk/workflows.yaml"
+)
+
+// rcConventionsSpec declares a REQUIRED low-capped `backend` convention and an
+// OPTIONAL uncapped `optional` one, both selected on the plan and implement
+// stages with no applies_to (they attach unconditionally).
+func rcConventionsSpec() []byte {
+	return rcServerSpec("  backend:\n    path: "+rcConvPath+"\n    severity_cap: low\n"+
+		"  optional:\n    path: "+rcOptPath+"\n    required: false\n", "[backend, optional]")
+}
+
+// rcFetcher serves files keyed by path@ref, records every call, and records
+// whether each call's ctx carried a deadline. err, when set, is returned for
+// every fetch.
+type rcFetcher struct {
+	mu        sync.Mutex
+	files     map[string]string
+	calls     []string
+	deadlines []time.Time
+	err       error
+}
+
+func newRCFetcher() *rcFetcher {
+	return &rcFetcher{files: map[string]string{
+		rcConvPath + "@" + admCommitA:   rcConvContent,
+		injPath + "@" + injPinnedCommit: injBaseContent,
+	}}
+}
+
+func (f *rcFetcher) FetchFile(ctx context.Context, _ forge.CredentialScope, _ forge.RepoRef, p, ref string) (*forge.FileContent, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, p+"@"+ref)
+	dl, _ := ctx.Deadline()
+	f.deadlines = append(f.deadlines, dl)
+	if f.err != nil {
+		return nil, f.err
+	}
+	c, ok := f.files[p+"@"+ref]
+	if !ok {
+		return nil, forge.ErrNotFound
+	}
+	return &forge.FileContent{Path: p, Content: []byte(c), SHA: "blobblobblobblobblobblobblobblobblobblob"}, nil
+}
+
+// rcReviewServer is a plan-review server whose run row carries the conventions
+// spec and (when commit != nil) a recorded admission commit, with the resolver
+// wired to ff and NO declaration seam.
+func rcReviewServer(t *testing.T, ff *rcFetcher, commit *string) (*Server, *auditFake, *promptRunRepo, *run.Run, uuid.UUID) {
+	t.Helper()
+	runID, stageID := uuid.New(), uuid.New()
+	s, _, _, au, rr := newPlanServerWithReviewer(t, runID, stageID, &fakePlanReviewer{}, rcConventionsSpec())
+	rr.getStages[stageID].Type = run.StageTypePlan
+	runRow := rr.getRuns[runID]
+	runRow.DocumentBaseCommit = commit
+	if ff != nil {
+		s.cfg.DocumentResolver = &repodoc.Resolver{Fetcher: ff, Commits: &admCommits{}}
+	}
+	return s, au, rr, runRow, stageID
+}
+
+func rcDegradedReasons(t *testing.T, au *auditFake) []map[string]any {
+	t.Helper()
+	var out []map[string]any
+	for _, e := range auditFakeEntries(au, "document_injection_degraded") {
+		var p map[string]any
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			t.Fatalf("decode degraded payload: %v", err)
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// TestResolveReviewDocuments_ConventionResolvedReviewOnly: a selected required
+// convention is resolved at the ADMISSION commit, returned in Conventions (not
+// Injected), attributed with its review_conventions.<name> site, and its cap is
+// in Round.Caps; the optional convention, absent at the commit, is withheld
+// with reason optional_document_missing BEFORE the injection claim and renders
+// nothing.
+//
+// Counterfactual: drop the optional-missing RecordWithheld call -> no
+// degraded entry, RED; route conventions into Injected -> RED.
+func TestResolveReviewDocuments_ConventionResolvedReviewOnly(t *testing.T) {
+	ff := newRCFetcher()
+	s, au, _, runRow, stageID := rcReviewServer(t, ff, strPtr(admCommitA))
+
+	got, err := s.resolveReviewDocuments(t.Context(), runRow, stageID, spec.StageTypePlan, []string{"backend/x.go"})
+	if err != nil {
+		t.Fatalf("resolveReviewDocuments: %v", err)
+	}
+	if len(got.Injected) != 0 {
+		t.Errorf("Injected = %+v, want none — a convention must never ride Injected", got.Injected)
+	}
+	if len(got.Conventions) != 1 {
+		t.Fatalf("Conventions = %d, want 1 (the optional one is missing)", len(got.Conventions))
+	}
+	c := got.Conventions[0]
+	if c.Name != "backend" || c.SeverityCap != "low" || c.Document.Path != rcConvPath || c.Document.Commit != admCommitA ||
+		!strings.Contains(c.Document.Body, rcConvContent) || c.Document.ContentHash != admContentHash(rcConvContent) {
+		t.Errorf("convention = %+v", c)
+	}
+	if want := (planreview.ConventionCaps{"backend": planreview.SeverityLow}); !reflect.DeepEqual(got.Round.Caps, want) {
+		t.Errorf("Round.Caps = %v, want %v (rendered conventions only)", got.Round.Caps, want)
+	}
+	if got.Round.ModifiedFiles != nil {
+		t.Errorf("plan review Round.ModifiedFiles = %v, want none", got.Round.ModifiedFiles)
+	}
+	inj := auditFakeEntries(au, "document_injected")
+	if len(inj) != 1 {
+		t.Fatalf("document_injected = %d, want 1", len(inj))
+	}
+	var p map[string]any
+	_ = json.Unmarshal(inj[0].Payload, &p)
+	if p["path"] != rcConvPath || p["declaration_site"] != rcConvSite || p["commit"] != admCommitA {
+		t.Errorf("document_injected payload = %v", p)
+	}
+	if inj[0].StageID == nil || *inj[0].StageID != stageID {
+		t.Errorf("document_injected stage = %v, want %s", inj[0].StageID, stageID)
+	}
+	deg := rcDegradedReasons(t, au)
+	if len(deg) != 1 || deg[0]["reason"] != repodoc.WithheldReasonOptionalDocumentMissing ||
+		!reflect.DeepEqual(deg[0]["paths"], []any{rcOptPath}) || !reflect.DeepEqual(deg[0]["declaration_sites"], []any{rcOptSite}) {
+		t.Errorf("document_injection_degraded = %v, want one optional_document_missing naming %s", deg, rcOptPath)
+	}
+	// The degraded entry is written BEFORE the injection claim.
+	au.mu.Lock()
+	order := make([]string, 0, len(au.appended))
+	for _, e := range au.appended {
+		order = append(order, e.Category)
+	}
+	au.mu.Unlock()
+	if slices.Index(order, "document_injection_degraded") > slices.Index(order, "document_injected") {
+		t.Errorf("audit order %v: the withheld record must precede the injection claim", order)
+	}
+}
+
+// TestResolveReviewDocuments_RequiredConventionMissing_NoClaim: a REQUIRED
+// convention absent at the admission commit fails the whole set with
+// review_convention_missing, and NO document_injected claim lands — not even
+// for a seam document that resolved first (resolve-before-attribute).
+//
+// Counterfactual: treat a required convention as optional -> nil error, RED;
+// attribute before resolving -> a document_injected row, RED.
+func TestResolveReviewDocuments_RequiredConventionMissing_NoClaim(t *testing.T) {
+	ff := newRCFetcher()
+	delete(ff.files, rcConvPath+"@"+admCommitA)
+	s, au, _, runRow, stageID := rcReviewServer(t, ff, strPtr(admCommitA))
+	s.cfg.DocumentDeclarations = admSeam(injBaseBranch, seamDecl())
+	s.cfg.DocumentResolver = &repodoc.Resolver{Fetcher: ff, Commits: &injCommits{sha: injPinnedCommit}}
+
+	got, err := s.resolveReviewDocuments(t.Context(), runRow, stageID, spec.StageTypePlan, nil)
+	if err == nil {
+		t.Fatalf("resolveReviewDocuments = %+v, want a review_convention_missing error", got)
+	}
+	reason := reviewDocumentInjectionFailedReason(err)
+	for _, want := range []string{"document_injection_failed: review_convention_missing: ", rcConvPath, rcConvSite, admCommitA} {
+		if !strings.Contains(reason, want) {
+			t.Errorf("reason %q missing %q", reason, want)
+		}
+	}
+	if got.Conventions != nil || got.Injected != nil {
+		t.Errorf("failed resolution returned documents %+v", got)
+	}
+	if !slices.Contains(ff.calls, injPath+"@"+injPinnedCommit) {
+		t.Fatalf("the seam document was never resolved (calls %v) — the fixture does not exercise the ordering", ff.calls)
+	}
+	for _, cat := range []string{"document_injected", "document_truncated", "document_injection_degraded"} {
+		if n := countAuditCategory(au, cat); n != 0 {
+			t.Errorf("%s entries = %d, want 0", cat, n)
+		}
+	}
+}
+
+// TestResolveReviewDocuments_NoAdmissionCommit_Withheld: on a run with no
+// recorded admission commit every convention is WITHHELD (E55.7): zero
+// fetches, one run_base_commit_unrecorded degraded entry, a WithheldNotice in
+// Injected, no convention rendered and no caps.
+func TestResolveReviewDocuments_NoAdmissionCommit_Withheld(t *testing.T) {
+	ff := newRCFetcher()
+	s, au, _, runRow, stageID := rcReviewServer(t, ff, nil)
+
+	got, err := s.resolveReviewDocuments(t.Context(), runRow, stageID, spec.StageTypePlan, nil)
+	if err != nil {
+		t.Fatalf("resolveReviewDocuments: %v", err)
+	}
+	if len(ff.calls) != 0 {
+		t.Errorf("fetches = %v, want none", ff.calls)
+	}
+	if len(got.Conventions) != 0 || got.Round.Caps != nil {
+		t.Errorf("withheld conventions rendered: %+v / caps %v", got.Conventions, got.Round.Caps)
+	}
+	if len(got.Injected) != 1 || got.Injected[0].Heading != repodoc.WithheldNoticeHeading ||
+		!strings.Contains(got.Injected[0].Body, rcConvPath) || !strings.Contains(got.Injected[0].Body, rcOptPath) {
+		t.Errorf("Injected = %+v, want one WithheldNotice naming both conventions", got.Injected)
+	}
+	deg := rcDegradedReasons(t, au)
+	if len(deg) != 1 || deg[0]["reason"] != repodoc.WithheldReasonRunBaseUnrecorded {
+		t.Errorf("degraded = %v, want one run_base_commit_unrecorded", deg)
+	}
+}
+
+// TestResolveReviewDocuments_SelectionWithNilResolver_FailsClosed: a selected
+// convention with NO resolver fails closed even though there is no declaration
+// seam (the partial-configuration rule).
+//
+// Counterfactual: keep the old seam-nil short-circuit first (return inert when
+// DocumentDeclarations is nil) -> nil error, RED.
+func TestResolveReviewDocuments_SelectionWithNilResolver_FailsClosed(t *testing.T) {
+	s, au, _, runRow, stageID := rcReviewServer(t, nil, strPtr(admCommitA))
+	_, err := s.resolveReviewDocuments(t.Context(), runRow, stageID, spec.StageTypePlan, nil)
+	if err == nil || !strings.Contains(err.Error(), "selects review conventions") || !strings.Contains(err.Error(), "DocumentResolver is nil") {
+		t.Fatalf("err = %v, want the misconfigured-resolver refusal", err)
+	}
+	if len(au.appended) != 0 {
+		t.Errorf("audit entries = %d, want 0", len(au.appended))
+	}
+}
+
+// TestResolveReviewDocuments_SelectionError_FailsClosed: an unparseable spec
+// snapshot is a selection error, never "no convention".
+func TestResolveReviewDocuments_SelectionError_FailsClosed(t *testing.T) {
+	ff := newRCFetcher()
+	s, _, _, runRow, stageID := rcReviewServer(t, ff, strPtr(admCommitA))
+	runRow.WorkflowSpec = []byte("version: [\n")
+	if _, err := s.resolveReviewDocuments(t.Context(), runRow, stageID, spec.StageTypePlan, nil); err == nil {
+		t.Fatal("resolveReviewDocuments with an unparseable spec returned nil error")
+	}
+	if len(ff.calls) != 0 {
+		t.Errorf("fetches = %v, want none", ff.calls)
+	}
+	if _, err := s.resolveReviewDocuments(t.Context(), nil, stageID, spec.StageTypePlan, nil); err == nil {
+		t.Error("nil run row returned nil error")
+	}
+}
+
+// (A3) TestResolveReviewDocuments_NilSeamNoSelection_UnloadableStage_Inert: no
+// seam, no selected convention, and the reviewed stage ABSENT from the run
+// repo -> zero value, nil error, zero forge calls, zero audit rows. The inert
+// check precedes the (lazy) stage load.
+//
+// Mechanism: the stage id is missing, so an eager GetStage fails with "stage
+// not found". Counterfactual: move the GetStage above the inert check -> RED.
+func TestResolveReviewDocuments_NilSeamNoSelection_UnloadableStage_Inert(t *testing.T) {
+	ff := newRCFetcher()
+	s, au, rr, runRow, stageID := rcReviewServer(t, ff, strPtr(admCommitA))
+	runRow.WorkflowSpec = specGatingReviewers // selects no convention
+	delete(rr.getStages, stageID)
+
+	got, err := s.resolveReviewDocuments(t.Context(), runRow, stageID, spec.StageTypePlan, []string{"backend/x.go"})
+	if err != nil {
+		t.Fatalf("inert resolveReviewDocuments: %v", err)
+	}
+	if !reflect.DeepEqual(got, reviewDocuments{}) {
+		t.Errorf("inert result = %+v, want the zero value", got)
+	}
+	if len(ff.calls) != 0 || len(au.appended) != 0 {
+		t.Errorf("inert resolution made %d fetches and %d audit appends, want 0", len(ff.calls), len(au.appended))
+	}
+	docs, err := s.resolveReviewInjectedDocuments(t.Context(), runRow, stageID)
+	if err != nil || docs != nil {
+		t.Errorf("resolveReviewInjectedDocuments inert = (%v, %v), want (nil, nil)", docs, err)
+	}
+}
+
+// (A1) TestResolveReviewDocuments_ResolvePhaseBounded: the seam call and every
+// forge read run under reviewDocumentResolveTimeout, while the audit appends
+// see the caller's (unbounded) context.
+//
+// Precondition: the caller ctx has NO deadline, so an observed deadline can
+// only come from the helper. Counterfactual: drop the WithTimeout -> RED.
+func TestResolveReviewDocuments_ResolvePhaseBounded(t *testing.T) {
+	ff := newRCFetcher()
+	ff.files[rcOptPath+"@"+admCommitA] = "optional"
+	s, _, _, runRow, stageID := rcReviewServer(t, ff, strPtr(admCommitA))
+	var seamDeadline time.Time
+	s.cfg.DocumentDeclarations = func(ctx context.Context, _ *run.Run, _ *run.Stage) ([]repodoc.Declaration, string, error) {
+		seamDeadline, _ = ctx.Deadline()
+		return []repodoc.Declaration{seamDecl()}, injBaseBranch, nil
+	}
+	s.cfg.DocumentResolver = &repodoc.Resolver{Fetcher: ff, Commits: &injCommits{sha: injPinnedCommit}}
+	da := &deadlineAuditRepo{auditFake: newAuditFake()}
+	s.cfg.AuditRepo = da
+
+	ctx := t.Context()
+	if _, has := ctx.Deadline(); has {
+		t.Fatal("precondition: the caller ctx already carries a deadline")
+	}
+	start := time.Now()
+	if _, err := s.resolveReviewDocuments(ctx, runRow, stageID, spec.StageTypePlan, nil); err != nil {
+		t.Fatalf("resolveReviewDocuments: %v", err)
+	}
+	bound := start.Add(reviewDocumentResolveTimeout).Add(time.Second)
+	if seamDeadline.IsZero() || seamDeadline.After(bound) {
+		t.Errorf("seam ctx deadline = %v, want one no later than start+%s", seamDeadline, reviewDocumentResolveTimeout)
+	}
+	if len(ff.deadlines) != 3 {
+		t.Fatalf("fetches = %v, want 3", ff.calls)
+	}
+	for i, dl := range ff.deadlines {
+		if dl.IsZero() || dl.After(bound) {
+			t.Errorf("fetch %s ctx deadline = %v, want one no later than start+%s", ff.calls[i], dl, reviewDocumentResolveTimeout)
+		}
+	}
+	if da.appends == 0 || da.withDeadline != 0 {
+		t.Errorf("audit appends = %d (%d with a deadline), want >0 and none bounded", da.appends, da.withDeadline)
+	}
+}
+
+// deadlineAuditRepo counts appends and how many saw a ctx deadline.
+type deadlineAuditRepo struct {
+	*auditFake
+	appends, withDeadline int
+}
+
+func (d *deadlineAuditRepo) AppendChained(ctx context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
+	d.appends++
+	if _, has := ctx.Deadline(); has {
+		d.withDeadline++
+	}
+	return d.auditFake.AppendChained(ctx, p)
+}
+
+// TestResolveReviewDocuments_ResolveDeadlineExceeded_FailsClosed: a forge read
+// that hits the resolve deadline fails the set, with zero document_injected.
+func TestResolveReviewDocuments_ResolveDeadlineExceeded_FailsClosed(t *testing.T) {
+	ff := newRCFetcher()
+	ff.err = context.DeadlineExceeded
+	s, au, _, runRow, stageID := rcReviewServer(t, ff, strPtr(admCommitA))
+	_, err := s.resolveReviewDocuments(t.Context(), runRow, stageID, spec.StageTypePlan, nil)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want it to wrap context.DeadlineExceeded", err)
+	}
+	if n := countAuditCategory(au, "document_injected"); n != 0 {
+		t.Errorf("document_injected = %d, want 0", n)
+	}
+}
+
+// TestResolveReviewDocuments_ImplementModifiedFiles: at the implement site the
+// round names the declared conventions files among the site paths — from EVERY
+// declared entry — and the plan site never does.
+func TestResolveReviewDocuments_ImplementModifiedFiles(t *testing.T) {
+	ff := newRCFetcher()
+	s, _, _, runRow, stageID := rcReviewServer(t, ff, strPtr(admCommitA))
+	diff := policy.Diff{ChangedFiles: []policy.ChangedFile{
+		{Path: "moved.md", OldPath: rcOptPath, Status: policy.StatusRenamed},
+		{Path: "src/x.go", Status: policy.StatusModified},
+	}}
+	got, err := s.resolveReviewDocuments(t.Context(), runRow, stageID, spec.StageTypeImplement, implementReviewPaths(diff))
+	if err != nil {
+		t.Fatalf("resolveReviewDocuments: %v", err)
+	}
+	if !reflect.DeepEqual(got.Round.ModifiedFiles, []string{rcOptPath}) {
+		t.Errorf("Round.ModifiedFiles = %v, want [%s] (via the rename's OldPath)", got.Round.ModifiedFiles, rcOptPath)
+	}
+}
+
+// TestGetStagePrompt_ConventionSelectingSpec_AuthorPromptCarriesNoConventions:
+// conventions are REVIEW-ONLY. The implement AUTHOR prompt of a run whose spec
+// selects a convention on the implement stage — with the resolver able to
+// serve it and the seam declaring a document — carries the seam document but
+// neither the conventions section nor the convention content, and no
+// document_injected entry names the convention.
+//
+// Counterfactual: make resolveDeclaredDocuments select the stage's
+// conventions and render them into its output -> RED.
+func TestGetStagePrompt_ConventionSelectingSpec_AuthorPromptCarriesNoConventions(t *testing.T) {
+	ff := newRCFetcher()
+	ar := newStoringAuditRepo()
+	s, runID, stageID, priv := newInjectionServer(t, ar, &repodoc.Resolver{Fetcher: ff, Commits: &injCommits{sha: injPinnedCommit}}, injDeclarations)
+	rr := s.cfg.RunRepo.(*promptRunRepo)
+	rr.getRuns[runID].WorkflowSpec = rcConventionsSpec()
+	rr.getRuns[runID].DocumentBaseCommit = strPtr(admCommitA)
+
+	got := admServedPrompt(t, s, runID, stageID, priv())
+	if !strings.Contains(got, injBaseContent) {
+		t.Fatalf("author prompt lost the seam document — the fixture is not serving")
+	}
+	if strings.Contains(got, prompt.ReviewConventionsHeading) || strings.Contains(got, rcConvContent) {
+		t.Errorf("author prompt carries a review convention")
+	}
+	for _, p := range admEntries(t, ar, runID, "document_injected") {
+		if p["path"] == rcConvPath {
+			t.Errorf("document_injected names the convention on an author prompt: %v", p)
+		}
+	}
+	if slices.Contains(ff.calls, rcConvPath+"@"+admCommitA) {
+		t.Errorf("author prompt fetched the convention: %v", ff.calls)
 	}
 }

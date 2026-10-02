@@ -3884,16 +3884,32 @@ func (s *Server) emitConsolidatedReviewTruncated(ctx context.Context, runID, sta
 // Process-global: one backend serves both the trace upload and the pull-request
 // report for a run, so a single mutex closes the race for every (stage, head).
 // The critical section is one list + one append, plus — since #2797 — the
-// declared-document resolution and the prompt build, which sit between the
-// guard and the emit so a duplicate dispatch can never resolve, attribute or
-// fail on documents. When no document is declared that adds one stage read and
-// one seam call; a declared document adds its forge reads, the same cost the
-// /prompt endpoint pays. The coarse scope does not harm throughput at v0 review
-// volumes (mirrors the p95CacheMu rationale). A
-// multi-replica deployment where the two reports land on different replicas
-// would need a DB-level uniqueness guard for the durable dedup; the in-process
-// lock is the proportionate v0 fix and does not regress that future work.
+// declared-document and review-convention resolution (resolveReviewDocuments,
+// E55.3 / #2244) and the prompt build, which sit between the guard and the emit
+// so a duplicate dispatch can never resolve, attribute or fail on documents.
+// With no declaration seam and no selected convention the resolution is inert
+// and reads nothing (not even the reviewed stage). Otherwise its RESOLVE phase
+// — the seam call, the credential scope and every forge read — is bounded by
+// reviewDocumentResolveTimeout, so the WORST-CASE hold is that bound plus the
+// attribution audit appends plus the prompt build; only runs that declare
+// documents or select review conventions pay it. Every exit from the section —
+// the duplicate early return, a resolution failure, a prompt-build failure and
+// the started emit — unlocks it (pinned by
+// TestRunImplementReviews_PromptBuildFailure_ReleasesDispatchLock). The coarse
+// scope does not harm throughput at v0 review volumes (mirrors the p95CacheMu
+// rationale). A multi-replica deployment where the two reports land on
+// different replicas would need a DB-level uniqueness guard for the durable
+// dedup; the in-process lock is the proportionate v0 fix and does not regress
+// that future work.
 var reviewDispatchMu sync.Mutex
+
+// buildImplementReviewPrompt is the prompt builder the implement-review
+// dispatch (runImplementReviewsForTree) calls INSIDE the reviewDispatchMu
+// section. It is a package-level seam (#2797 item 2) only so a test can make
+// the build fail and prove the lock is released on that exit; production never
+// reassigns it. Server tests do not run in parallel, so a test overriding it
+// restores it in t.Cleanup.
+var buildImplementReviewPrompt = prompt.Build
 
 // runImplementReviews resolves the implement stage's review config and
 // dispatches the review agents after the diff has landed in the trace
@@ -3921,10 +3937,16 @@ var reviewDispatchMu sync.Mutex
 //     advancement is fine.
 //
 // Also returns true WITHOUT running a reviewer when, under gating authority,
-// the documents declared for the implement stage cannot be resolved or
-// attributed (#2797); an implement_review_failed entry (reason
-// document_injection_failed: …) names the cause. Under advisory authority the
-// same failure records that entry and returns false.
+// the documents declared for the implement stage — or a REQUIRED review
+// convention the workflow selects for it (E55.3 / #2244) — cannot be resolved
+// or attributed (#2797); an implement_review_failed entry (reason
+// document_injection_failed: …, review_convention_missing: … for a missing
+// required convention) names the cause. Under advisory authority the same
+// failure records that entry and returns false.
+//
+// A verdict whose convention-category concerns exceed their severity_cap is
+// clamped at ingest, so a reject resting only on clamped highs does NOT gate
+// (runImplementReviewInvocationsWithConventions).
 //
 // Returns false (no gating block) when:
 //   - RunRepo is nil
@@ -4701,7 +4723,18 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 	// through its existing reject branch (its failure_reason then reads
 	// implement_review_rejected although no reviewer ran — the audit entry is
 	// the discriminator, backend/internal/server/README.md).
-	injected, err := s.resolveReviewInjectedDocuments(ctx, runRow, stageID)
+	//
+	// Review conventions (E55.3 / #2244) resolve through the SAME call: the
+	// workflow's selection for the implement stage is matched against the run's
+	// admission change plus implementReviewPaths(diff) — every changed path and
+	// every rename/copy OldPath of the FULL diff, not the #1725 fix-up delta,
+	// because the conventions govern the change the PR carries — and resolved at
+	// the run's admission commit. A missing REQUIRED convention fails closed
+	// exactly like an unresolvable document (review_convention_missing). Still
+	// AFTER the #797 guard, so a duplicate dispatch selects, fetches and
+	// attributes nothing; the resolve phase is bounded by
+	// reviewDocumentResolveTimeout (see reviewDispatchMu).
+	reviewDocs, err := s.resolveReviewDocuments(ctx, runRow, stageID, spec.StageTypeImplement, implementReviewPaths(diff))
 	if err != nil {
 		reviewDispatchMu.Unlock()
 		treeCleanup()
@@ -4713,9 +4746,18 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 		s.emitReviewFailed(ctx, runID, stageID, "implement_review_failed", authority, "", reviewDocumentInjectionFailedReason(err), false)
 		return authority == planreview.AuthorityGating
 	}
+	injected := reviewDocs.Injected
 	trig.InjectedDocuments = injected
+	// The resolved conventions render as the subordinate supplemental section
+	// inside the cache-stable prefix; the declared conventions files this diff
+	// modifies render as the per-round notice after ImplementReviewSplitMarker.
+	// Both are nil when nothing is selected / modified, keeping the prompt
+	// byte-identical.
+	trig.ReviewConventions = reviewDocs.Conventions
+	trig.ModifiedConventionFiles = reviewDocs.Round.ModifiedFiles
+	conventionRound := reviewDocs.Round
 
-	promptText, err := prompt.Build("implement_review", trig)
+	promptText, err := buildImplementReviewPrompt("implement_review", trig)
 	if err != nil {
 		reviewDispatchMu.Unlock()
 		treeCleanup()
@@ -4792,7 +4834,7 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 		go func() {
 			defer s.bgReviews.Done()
 			defer treeCleanup()
-			s.runImplementReviewInvocations(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel, "", "", stageBudget, treeDir, roundSeq)
+			s.runImplementReviewInvocationsWithConventions(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel, "", "", stageBudget, treeDir, roundSeq, conventionRound)
 		}()
 		return false
 	}
@@ -4801,7 +4843,7 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 	// category-B before the terminal transition. Cleanup is owned by THIS scope
 	// because the loop runs to completion before runImplementReviews returns.
 	defer treeCleanup()
-	return s.runImplementReviewInvocations(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel, "", "", stageBudget, treeDir, roundSeq)
+	return s.runImplementReviewInvocationsWithConventions(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel, "", "", stageBudget, treeDir, roundSeq, conventionRound)
 }
 
 // amendedScopeFilesForReview computes the approval-time scope folds that the
@@ -5187,255 +5229,76 @@ func (s *Server) scopeProvenanceForReview(ctx context.Context, runID, stageID uu
 // round key and supersedes nothing, and the PR relay uses its legacy
 // below-the-verdict derivation for those rows.
 func (s *Server) runImplementReviewInvocations(ctx context.Context, runID, stageID uuid.UUID, invocations []reviewerInvocation, authority planreview.AuthorityMode, promptText, authorModel, origin, headSHA string, reviewBudget planreview.ReviewBudget, treeDir string, roundSeq int64) bool {
-	systemKind := audit.ActorKind("system")
-	hasRejection := false
-	// pagedRejectAppended tracks whether THIS loop appended a page-class audit
-	// entry — an implement_reviewed reject verdict (#1786). Gating the
-	// immediate hook on this (not on an unconditional call) keeps an
-	// all-approve loop from calling NotifyPageClassForRun, which evaluates the
-	// full audit history and would otherwise flush an OLDER unpinged
-	// page-class event at this unrelated moment.
-	pagedRejectAppended := false
-	// conditionClaimsResolved tracks whether THIS loop has already fired the
-	// condition-claim resolution hook (E48.9 / #1956): ONE confirming (non-reject)
-	// implement review resolves the operator's claimed plan-stage concerns, so the
-	// hook fires at most once per loop even with heterogeneous reviewers.
-	conditionClaimsResolved := false
-	// round buffers this loop's reviewer verdicts so the delta-verification
-	// resolutions are applied ONCE after every reviewer has spoken (E48.103 /
-	// #2551). Applying them inline gave each reviewer no knowledge of what its
-	// peers said in the SAME round, so a diff-only peer's `confirmed` retired a
-	// concern whose RAISING reviewer was still returning `reject`.
-	var round []roundReviewVerdict
-	for i, inv := range invocations {
-		// An unresolvable provider is a deployment CAPABILITY gap, not a
-		// reviewer error (#1495, reframes #955): the spec-declared provider is
-		// unavailable on this deployment. Emit a capability-framed terminal
-		// implement_review_skipped entry honoring the per-reviewer optional
-		// flag (loud for optional:false, quiet for optional:true), continue,
-		// hasRejection untouched. implement_review_skipped counts as terminal
-		// (planreview.Settled), so the review-settled gate still resolves.
-		if inv.resolveErr != nil {
-			s.emitReviewerUnavailable(ctx, runID, stageID, "implement_review_skipped", authority, inv.provider, inv.personaName(), inv.optional, len(invocations), inv.resolveErr)
-			continue
-		}
-		// A reviewer persona whose remit could not be resolved, rendered or
-		// attributed never runs on a remit-less prompt (#3753): a terminal
-		// persona_remit_unavailable skip, hasRejection untouched.
-		if inv.persona != nil && inv.persona.promptText == "" {
-			s.emitPersonaDegraded(ctx, runID, stageID, "implement_review_skipped", authority, inv, len(invocations))
-			continue
-		}
-		// Per-invocation prompt, tree and size-aware budget (#3753): a persona
-		// runs on its own prompt; a standard reviewer's values are the shared
-		// ones, unchanged.
-		invPrompt, invTree := inv.promptFor(promptText, treeDir)
-		budget := reviewBudget.Budget(len(invPrompt))
-		// Resolve the reviewer's CLI version + binary-path provenance once per
-		// invocation (#1768) and stamp both onto the implement_reviewed payload
-		// below. The implement loop has no agent_version guard, so this is a
-		// straight provenance add; empty for the non-codex adapters (omitempty).
-		reviewerVersion, reviewerBinary := s.resolveReviewerProvenance(ctx, inv.reviewer)
-		// Apply the size-aware per-invocation budget (#747) as a context
-		// deadline. Implement-review inputs (the diff) are larger than plan
-		// review, so the size-aware formula naturally grants a larger budget
-		// here with no separate per-stage default. cancel() per turn so
-		// deadlines don't accumulate across reviewers.
-		invocationCtx, cancel := context.WithTimeout(ctx, budget)
-		verdict, model, err := s.invokeReview(invocationCtx, inv, invPrompt, invTree)
-		timedOut := errors.Is(invocationCtx.Err(), context.DeadlineExceeded)
-		cancel()
-		if err != nil {
-			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "implement review: reviewer invocation failed",
-				slog.String("run_id", runID.String()),
-				slog.String("stage_id", stageID.String()),
-				slog.Int("reviewer_index", i),
-				slog.Bool("timed_out", timedOut),
-				slog.Duration("budget", budget),
-				slog.String("error", err.Error()),
-			)
-			// Terminal implement_review_failed audit entry (#664), mirroring
-			// the plan path: surfaces a timed-out / errored reviewer as a
-			// definite 'failed' state, with the #747 timeout discriminator
-			// distinguishing a budget-kill from a transport failure.
-			// hasRejection untouched (#574).
-			s.emitReviewFailed(ctx, runID, stageID, "implement_review_failed", authority, model, inv.personaFailureReason(err.Error()), timedOut)
-			continue
-		}
+	return s.runImplementReviewInvocationsWithConventions(ctx, runID, stageID, invocations, authority, promptText, authorModel, origin, headSHA, reviewBudget, treeDir, roundSeq, reviewConventionRound{})
+}
 
-		// Self-review guard (ADR-027): warn when the reviewer's model
-		// matches the plan author's model. Warn-only; verdict still
-		// recorded. The approved plan's GeneratedBy.Model is an
-		// approximation of the implement-stage author's model — v0 does
-		// not record the implement agent's model separately.
-		if model != "" && model == authorModel {
-			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
-				"implement review: self-review detected — reviewer model matches plan author model",
-				slog.String("model", model),
-				slog.String("run_id", runID.String()),
-				slog.String("stage_id", stageID.String()),
-			)
+// runImplementReviewInvocationsWithConventions is runImplementReviewInvocations
+// plus the round's review-convention state (E55.3 / #2244). The zero
+// reviewConventionRound — what runImplementReviewInvocations passes, and what
+// every round whose workflow selects and modifies no convention carries — is
+// today's loop: ingest streams per invocation, in invocation order, with the
+// same audit rows in the same order.
+//
+// Each invocation is split into an INVOKE half (provenance, the reviewer call,
+// the timeout discriminator — no audit write) and an INGEST half (the failure
+// or skip emit, the self-review warn, the retry-supersession read, the
+// implement_reviewed append, concern persistence, the round buffer and the
+// cost record), so the two can be separated in time without reordering a
+// single audit row.
+//
+// CLAMP AT INGEST. Every successful verdict passes ClampConventionSeverities
+// against conv.Caps BEFORE its payload is built, its gating contribution is
+// read or its concerns are persisted: a repo_convention concern above its
+// convention's severity_cap is lowered (severity_clamped_from), and with ZERO
+// conventions rendered every repo_convention / conventions_override_attempt /
+// conventions_file_modified concern a reviewer emits anyway is lowered to low
+// (approval condition 2 of #2244). A reject resting only on clamped highs
+// becomes approve_with_concerns (verdict_clamped_from: reject) and does not
+// gate. Each clamp is WARN-logged with the run id and category.
+//
+// ONCE-PER-ROUND SYNTHESIS. When conv.ModifiedFiles is non-empty — the
+// reviewed diff modifies a declared conventions file — the round's ingests are
+// HELD until every invocation has returned; synthesis is then decided ONCE:
+// unless some verdict of the round already carries a conventions_file_modified
+// concern, or the stage already holds one in an open, waived or deferred state
+// from an earlier round (conventionsFileModifiedAlreadyRaised), the FIRST
+// successful verdict gets the server-authored concern (a plain approve is
+// raised to approve_with_concerns, verdict_raised_from: approve;
+// conventions_file_modified_synthesized: true); then every held result is
+// ingested in invocation order. Holding moves only WHEN the first verdict
+// becomes visible, never the audit row order. A round in which every reviewer
+// failed synthesizes nothing; the next round re-evaluates.
+func (s *Server) runImplementReviewInvocationsWithConventions(ctx context.Context, runID, stageID uuid.UUID, invocations []reviewerInvocation, authority planreview.AuthorityMode, promptText, authorModel, origin, headSHA string, reviewBudget planreview.ReviewBudget, treeDir string, roundSeq int64, conv reviewConventionRound) bool {
+	st := &implementReviewLoopState{
+		runID: runID, stageID: stageID, authority: authority, authorModel: authorModel,
+		origin: origin, headSHA: headSHA, roundSeq: roundSeq, invocations: len(invocations),
+	}
+	if len(conv.ModifiedFiles) == 0 {
+		// Streaming: each invocation is ingested before the next is invoked,
+		// exactly as before E55.3.
+		for i, inv := range invocations {
+			res := s.invokeImplementReviewer(ctx, i, inv, promptText, treeDir, reviewBudget)
+			s.clampImplementReviewVerdict(ctx, runID, stageID, &res, conv.Caps)
+			s.ingestImplementReview(ctx, st, res)
 		}
-
-		// Retry supersession (#3593): read the latest same-stage retry sequence
-		// AT VERDICT TIME (no loop-entry watermark). The predicate is anchored
-		// on roundSeq — the round-start sequence fixed when the round opened —
-		// so a retry landing anywhere between the started emit and this read is
-		// detected. supersededByRetry gates both the payload flag and whether
-		// this verdict's resolutions are buffered into `round`. ok is false only
-		// on a retry-list read error; a clean "no retry yet" read is (0, true),
-		// which correctly yields supersededByRetry=false.
-		latestRetry, retryReadOK := s.latestStageRetrySequence(ctx, runID, stageID)
-		supersededByRetry := retryReadOK && roundSeq > 0 && latestRetry > roundSeq
-
-		payload := planreview.ImplementReviewedPayload{
-			ReviewerKind:  "agent",
-			ReviewerModel: model,
-			Authority:     authority,
-			Verdict:       verdict.Verdict,
-			Concerns:      verdict.Concerns,
-			FreeForm:      verdict.FreeForm,
-			// Recorded review-round identity + retry supersession (#3593).
-			ReviewRoundSequence: roundSeq,
-			SupersededByRetry:   supersededByRetry,
-			// The reviewer's delta-verification verdicts on prior concerns
-			// (#984) ride on the authoritative audit payload; the concern
-			// store applies them below as a derived index.
-			ConcernResolutions: verdict.ConcernResolutions,
-			// #3319 display-only advisory: did this reject name NOTHING,
-			// ANYWHERE? That is the VERDICT-LEVEL question — deliberately the
-			// OTHER predicate from the per-resolution
-			// planreview.RejectSubstantiatesResolution the reopen veto in
-			// applyConcernResolutions consults. Do not swap them.
-			RejectWithoutConcern: planreview.RejectNamesNoConcern(*verdict),
-			// Per-invocation token usage on the review surface (#995).
-			InputTokens:  verdict.Usage.InputTokens,
-			OutputTokens: verdict.Usage.OutputTokens,
-			// Provenance markers (#1250): empty for the first review and the
-			// parent-decomposition consolidated review (byte-identical via
-			// omitempty); set for the base-rebase re-invoke supplemental pass.
-			Origin:  origin,
-			HeadSHA: headSHA,
-			// Resolved reviewer CLI version + binary-path provenance (#1768),
-			// probed once above. Empty for non-codex reviewers (omitempty).
-			ReviewerVersion: reviewerVersion,
-			ReviewerBinary:  reviewerBinary,
-			// The reviewer persona (#3753) that produced this verdict; empty
-			// for a standard reviewer (omitempty, byte-identical).
-			Persona: inv.personaName(),
+	} else {
+		// Held: invoke every reviewer, clamp, decide synthesis once, then
+		// ingest in invocation order.
+		results := make([]implementReviewInvocationResult, len(invocations))
+		for i, inv := range invocations {
+			results[i] = s.invokeImplementReviewer(ctx, i, inv, promptText, treeDir, reviewBudget)
 		}
-		payloadBytes, _ := json.Marshal(payload)
-		entry, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
-			RunID:     runID,
-			StageID:   &stageID,
-			Timestamp: time.Now().UTC(),
-			Category:  "implement_reviewed",
-			ActorKind: &systemKind,
-			Payload:   payloadBytes,
-		})
-		if aerr != nil {
-			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "implement review: append audit entry failed",
-				slog.String("run_id", runID.String()),
-				slog.String("error", aerr.Error()),
-			)
-		} else if entry != nil {
-			// Persist the verdict's concerns with stable IDs (#964),
-			// stamped with the sequence the append returned — the audit
-			// chain stays the sole sequence authority, so a failed append
-			// (no sequence) skips persistence for this verdict.
-			freshRows := s.persistReviewConcerns(ctx, runID, stageID, concern.StageKindImplement, model, verdict.FreeForm, entry.Sequence, verdict.Concerns)
-
-			// Post-persist retry re-check (#3593). RE-READ the latest same-stage
-			// retry sequence AFTER persistReviewConcerns minted this verdict's
-			// rows, so a retry that landed BETWEEN the payload write and here —
-			// the accepted window where the payload is UNMARKED — still
-			// supersedes the concerns it just minted. Combined with the
-			// retry-time sweep in retryStageAs, a retry at ANY instant is caught
-			// by whichever of {sweep, this re-check} runs second. The match
-			// predicate targets ONLY the rows this verdict just minted
-			// (OriginReviewSequence == entry.Sequence), so a peer reviewer's
-			// concerns in the same round are untouched here.
-			latestRetry2, retryReadOK2 := s.latestStageRetrySequence(ctx, runID, stageID)
-			supersededPostPersist := retryReadOK2 && roundSeq > 0 && latestRetry2 > roundSeq
-			if supersededPostPersist {
-				verdictSeq := entry.Sequence
-				s.supersedeOpenImplementConcerns(ctx, runID, stageID,
-					fmt.Sprintf("superseded by stage retry (retry seq %d): this verdict's review round (opened at seq %d, before the retry) reviewed a discarded tree", latestRetry2, roundSeq),
-					func(c *concern.Concern) bool { return c.OriginReviewSequence == verdictSeq })
-			}
-			// A verdict superseded at EITHER read (verdict-build time or this
-			// post-persist re-check) reviewed a tree the retry has discarded;
-			// its delta-verification resolutions describe that discarded tree, so
-			// do NOT buffer them into `round` and do NOT let it resolve the
-			// operator's condition claims. Log at INFO that they were dropped.
-			superseded := supersededByRetry || supersededPostPersist
-			if superseded {
-				s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
-					"implement review: verdict superseded by stage retry — dropping its concern resolutions",
-					slog.String("run_id", runID.String()),
-					slog.String("stage_id", stageID.String()),
-					slog.Int64("review_round_sequence", roundSeq),
-					slog.Int64("verdict_sequence", entry.Sequence),
-				)
-			}
-			// Buffer the delta-verification resolutions (#984) instead of
-			// applying them here (E48.103 / #2551): they are applied once
-			// after the loop, through the veto pass that can see what the
-			// OTHER reviewers in this same round said. The append-gated
-			// posture is unchanged — a failed append (no sequence) buffers
-			// nothing, exactly as it previously applied nothing. A
-			// retry-superseded verdict (#3593) buffers nothing either.
-			if !superseded {
-				round = append(round, roundReviewVerdict{
-					model:          model,
-					verdict:        verdict.Verdict,
-					resolutions:    verdict.ConcernResolutions,
-					reviewSequence: entry.Sequence,
-					// The authoritative input to the #3319 per-resolution
-					// substantiation predicate.
-					review: *verdict,
-				})
-			}
-			// Condition-claim resolution (E48.9 / #1956): ONE confirming
-			// (non-reject) implement review resolves the operator's claimed
-			// plan-stage concerns to addressed_by_condition — the operator's
-			// binding condition is the authority, the reviewer the witness. The
-			// hook keys on the reviewed run's OWN approval_submitted entries, so
-			// a decomposition parent's consolidated review (parent runID, where
-			// the plan gate lives) resolves correctly while implement-only
-			// children no-op. Fires at most once per loop; idempotent across
-			// later re-review rounds via the already-terminal silent skip. A
-			// retry-superseded verdict (#3593) reviewed a discarded tree, so it
-			// never witnesses a condition claim.
-			if !superseded && !conditionClaimsResolved && verdict.Verdict != planreview.VerdictReject {
-				// Cross-link this confirming review's OWN fresh implement
-				// concerns (#2066): persistReviewConcerns ran earlier in this
-				// same iteration for this same verdict, so freshRows are the
-				// concerns THIS confirming review minted. A non-empty set
-				// qualifies the resolution's state_reason + audit payload so
-				// the settled ledger no longer asserts an unqualified
-				// "confirmed delivered" when the same review re-raised concerns.
-				freshIDs := make([]uuid.UUID, 0, len(freshRows))
-				for _, fr := range freshRows {
-					if fr != nil {
-						freshIDs = append(freshIDs, fr.ID)
-					}
-				}
-				s.resolveConditionClaimedPlanConcerns(ctx, runID, entry.Sequence, model, string(verdict.Verdict), freshIDs)
-				conditionClaimsResolved = true
-			}
+		for i := range results {
+			s.clampImplementReviewVerdict(ctx, runID, stageID, &results[i], conv.Caps)
 		}
-
-		// Capture this reviewer invocation's agent token cost (#681). The
-		// usage rode in on the planreview.ReviewVerdict contract; we price
-		// and record it here, backend-agnostically.
-		s.recordReviewerCost(ctx, runID, stageID, model, verdict.Usage, "implement_review")
-
-		if verdict.Verdict == planreview.VerdictReject {
-			hasRejection = true
-			pagedRejectAppended = true
+		s.synthesizeConventionsFileModified(ctx, runID, stageID, results, conv.ModifiedFiles)
+		for _, res := range results {
+			s.ingestImplementReview(ctx, st, res)
 		}
 	}
+	round := st.round
+	hasRejection := st.hasRejection
+	pagedRejectAppended := st.pagedRejectAppended
 
 	// Apply the round's buffered delta-verification resolutions ONCE, through
 	// the veto pass (E48.103 / #2551). Placed after the invocation loop and
@@ -5475,6 +5338,424 @@ func (s *Server) runImplementReviewInvocations(ctx context.Context, runID, stage
 	}
 
 	return hasRejection
+}
+
+// implementReviewLoopState is the state one implement-review round's ingests
+// share (runImplementReviewInvocationsWithConventions): the round's fixed
+// identity plus the accumulators the post-loop passes read.
+type implementReviewLoopState struct {
+	runID, stageID  uuid.UUID
+	authority       planreview.AuthorityMode
+	authorModel     string
+	origin, headSHA string
+	roundSeq        int64
+	invocations     int
+	// hasRejection is true when at least one ingested verdict (after the
+	// ingest clamp) is reject.
+	hasRejection bool
+	// pagedRejectAppended tracks whether THIS loop appended a page-class audit
+	// entry — an implement_reviewed reject verdict (#1786). Gating the
+	// immediate hook on this (not on an unconditional call) keeps an
+	// all-approve loop from calling NotifyPageClassForRun, which evaluates the
+	// full audit history and would otherwise flush an OLDER unpinged
+	// page-class event at this unrelated moment.
+	pagedRejectAppended bool
+	// conditionClaimsResolved tracks whether THIS loop has already fired the
+	// condition-claim resolution hook (E48.9 / #1956): ONE confirming (non-reject)
+	// implement review resolves the operator's claimed plan-stage concerns, so the
+	// hook fires at most once per loop even with heterogeneous reviewers.
+	conditionClaimsResolved bool
+	// round buffers this loop's reviewer verdicts so the delta-verification
+	// resolutions are applied ONCE after every reviewer has spoken (E48.103 /
+	// #2551). Applying them inline gave each reviewer no knowledge of what its
+	// peers said in the SAME round, so a diff-only peer's `confirmed` retired a
+	// concern whose RAISING reviewer was still returning `reject`.
+	round []roundReviewVerdict
+}
+
+// implementReviewInvocationResult is one reviewer invocation's INVOKE half,
+// captured by invokeImplementReviewer and consumed by ingestImplementReview.
+type implementReviewInvocationResult struct {
+	index int
+	inv   reviewerInvocation
+	// ran is false when the invocation never reached a reviewer: an
+	// unresolvable provider (#1495) or a persona whose remit is unavailable
+	// (#3753). Ingest emits the matching terminal skip.
+	ran                             bool
+	budget                          time.Duration
+	reviewerVersion, reviewerBinary string
+	// verdict is the server's OWN copy of the reviewer's verdict (a shallow
+	// copy, so the ingest clamp and the synthesis never write a value the
+	// reviewer adapter still holds).
+	verdict  *planreview.ReviewVerdict
+	model    string
+	err      error
+	timedOut bool
+	// verdictClampedFrom / verdictRaisedFrom / conventionsFileModifiedSynthesized
+	// record the E55.3 ingest-time changes, stamped on the payload.
+	verdictClampedFrom                 planreview.Verdict
+	verdictRaisedFrom                  planreview.Verdict
+	conventionsFileModifiedSynthesized bool
+}
+
+// succeeded reports whether the invocation produced a verdict to ingest.
+func (r implementReviewInvocationResult) succeeded() bool {
+	return r.ran && r.err == nil && r.verdict != nil
+}
+
+// invokeImplementReviewer is the INVOKE half of one implement-review
+// invocation: it resolves the reviewer's provenance and runs the reviewer
+// under its size-aware budget. It writes NO audit entry.
+func (s *Server) invokeImplementReviewer(ctx context.Context, i int, inv reviewerInvocation, promptText, treeDir string, reviewBudget planreview.ReviewBudget) implementReviewInvocationResult {
+	res := implementReviewInvocationResult{index: i, inv: inv}
+	if inv.resolveErr != nil || (inv.persona != nil && inv.persona.promptText == "") {
+		return res
+	}
+	res.ran = true
+	// Per-invocation prompt, tree and size-aware budget (#3753): a persona
+	// runs on its own prompt; a standard reviewer's values are the shared
+	// ones, unchanged.
+	invPrompt, invTree := inv.promptFor(promptText, treeDir)
+	res.budget = reviewBudget.Budget(len(invPrompt))
+	// Resolve the reviewer's CLI version + binary-path provenance once per
+	// invocation (#1768) and stamp both onto the implement_reviewed payload
+	// at ingest. The implement loop has no agent_version guard, so this is a
+	// straight provenance add; empty for the non-codex adapters (omitempty).
+	res.reviewerVersion, res.reviewerBinary = s.resolveReviewerProvenance(ctx, inv.reviewer)
+	// Apply the size-aware per-invocation budget (#747) as a context
+	// deadline. Implement-review inputs (the diff) are larger than plan
+	// review, so the size-aware formula naturally grants a larger budget
+	// here with no separate per-stage default. cancel() per turn so
+	// deadlines don't accumulate across reviewers.
+	invocationCtx, cancel := context.WithTimeout(ctx, res.budget)
+	verdict, model, err := s.invokeReview(invocationCtx, inv, invPrompt, invTree)
+	res.timedOut = errors.Is(invocationCtx.Err(), context.DeadlineExceeded)
+	cancel()
+	res.model, res.err = model, err
+	if err == nil && verdict != nil {
+		own := *verdict
+		res.verdict = &own
+	}
+	return res
+}
+
+// clampImplementReviewVerdict applies the review-convention severity clamp to
+// one successful verdict at ingest (E55.3 / #2244) and WARN-logs every clamp
+// with the run id and the concern's category. caps nil means zero conventions
+// were rendered: every convention-category concern is then lowered to low.
+func (s *Server) clampImplementReviewVerdict(ctx context.Context, runID, stageID uuid.UUID, res *implementReviewInvocationResult, caps planreview.ConventionCaps) {
+	if !res.succeeded() {
+		return
+	}
+	cr := planreview.ClampConventionSeverities(res.verdict, caps)
+	res.verdictClampedFrom = cr.VerdictClampedFrom
+	for _, c := range cr.Clamped {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "implement review: review-convention concern severity clamped at ingest",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("reviewer_model", res.model),
+			slog.String("category", c.Category),
+			slog.String("convention", c.Convention),
+			slog.String("from", string(c.From)),
+			slog.String("to", string(c.To)),
+			slog.Bool("no_conventions_rendered", c.NoConventionsRendered),
+		)
+	}
+	if cr.VerdictClampedFrom != "" {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "implement review: verdict downgraded by the review-convention clamp",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("reviewer_model", res.model),
+			slog.String("verdict_clamped_from", string(cr.VerdictClampedFrom)),
+			slog.String("verdict", string(res.verdict.Verdict)),
+		)
+	}
+}
+
+// synthesizeConventionsFileModified makes the ONCE-per-round
+// conventions_file_modified decision over a held round (E55.3 / #2244): with
+// every invocation returned and clamped, it picks the carrier via
+// conventionsFileModifiedCarrier and appends the server-authored concern to
+// that verdict. It never runs on a streaming round.
+func (s *Server) synthesizeConventionsFileModified(ctx context.Context, runID, stageID uuid.UUID, results []implementReviewInvocationResult, modified []string) {
+	verdicts := make([]*planreview.ReviewVerdict, len(results))
+	for i, r := range results {
+		if r.succeeded() {
+			verdicts[i] = r.verdict
+		}
+	}
+	// An all-failed round has no carrier (-1): nothing is synthesized and the
+	// next round re-evaluates.
+	carrier := conventionsFileModifiedCarrier(verdicts, s.conventionsFileModifiedAlreadyRaised(ctx, runID, stageID))
+	if carrier < 0 {
+		return
+	}
+	before := len(results[carrier].verdict.Concerns)
+	results[carrier].verdictRaisedFrom = planreview.AddSynthesizedConventionsFileModifiedConcern(results[carrier].verdict, modified)
+	results[carrier].conventionsFileModifiedSynthesized = len(results[carrier].verdict.Concerns) > before
+}
+
+// conventionsFileModifiedAlreadyRaised reports whether the stage already holds
+// a conventions_file_modified implement concern in an open, waived or deferred
+// state — raised (by a reviewer or the server) in an earlier round and not
+// since resolved. An addressed or superseded row does not suppress a re-raise.
+// A nil ConcernRepo or a read error falls OPEN to false: a duplicate concern is
+// noise, a missed flag is silent.
+func (s *Server) conventionsFileModifiedAlreadyRaised(ctx context.Context, runID, stageID uuid.UUID) bool {
+	if s.cfg.ConcernRepo == nil {
+		return false
+	}
+	rows, err := s.cfg.ConcernRepo.ListByRun(ctx, runID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "implement review: list concerns for conventions_file_modified dedupe failed — synthesizing",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()),
+		)
+		return false
+	}
+	for _, c := range rows {
+		if c.StageID != stageID || c.StageKind != concern.StageKindImplement {
+			continue
+		}
+		if !isConventionsFileModifiedConcern(planreview.Concern{Category: c.Category}) {
+			continue
+		}
+		if c.State.IsOpen() || c.State == concern.StateWaived || c.State == concern.StateDeferred {
+			return true
+		}
+	}
+	return false
+}
+
+// ingestImplementReview is the INGEST half of one implement-review invocation:
+// every audit write, concern persist and accumulator update the invocation
+// contributes, in the order the pre-split loop body performed them.
+func (s *Server) ingestImplementReview(ctx context.Context, st *implementReviewLoopState, res implementReviewInvocationResult) {
+	runID, stageID, authority, roundSeq := st.runID, st.stageID, st.authority, st.roundSeq
+	inv := res.inv
+	// An unresolvable provider is a deployment CAPABILITY gap, not a
+	// reviewer error (#1495, reframes #955): the spec-declared provider is
+	// unavailable on this deployment. Emit a capability-framed terminal
+	// implement_review_skipped entry honoring the per-reviewer optional
+	// flag (loud for optional:false, quiet for optional:true), continue,
+	// hasRejection untouched. implement_review_skipped counts as terminal
+	// (planreview.Settled), so the review-settled gate still resolves.
+	if inv.resolveErr != nil {
+		s.emitReviewerUnavailable(ctx, runID, stageID, "implement_review_skipped", authority, inv.provider, inv.personaName(), inv.optional, st.invocations, inv.resolveErr)
+		return
+	}
+	// A reviewer persona whose remit could not be resolved, rendered or
+	// attributed never runs on a remit-less prompt (#3753): a terminal
+	// persona_remit_unavailable skip, hasRejection untouched.
+	if !res.ran {
+		s.emitPersonaDegraded(ctx, runID, stageID, "implement_review_skipped", authority, inv, st.invocations)
+		return
+	}
+	model, err := res.model, res.err
+	if err == nil && res.verdict == nil {
+		err = errors.New("reviewer returned no verdict")
+	}
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "implement review: reviewer invocation failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.Int("reviewer_index", res.index),
+			slog.Bool("timed_out", res.timedOut),
+			slog.Duration("budget", res.budget),
+			slog.String("error", err.Error()),
+		)
+		// Terminal implement_review_failed audit entry (#664), mirroring
+		// the plan path: surfaces a timed-out / errored reviewer as a
+		// definite 'failed' state, with the #747 timeout discriminator
+		// distinguishing a budget-kill from a transport failure.
+		// hasRejection untouched (#574).
+		s.emitReviewFailed(ctx, runID, stageID, "implement_review_failed", authority, model, inv.personaFailureReason(err.Error()), res.timedOut)
+		return
+	}
+	verdict := res.verdict
+
+	// Self-review guard (ADR-027): warn when the reviewer's model
+	// matches the plan author's model. Warn-only; verdict still
+	// recorded. The approved plan's GeneratedBy.Model is an
+	// approximation of the implement-stage author's model — v0 does
+	// not record the implement agent's model separately.
+	if model != "" && model == st.authorModel {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"implement review: self-review detected — reviewer model matches plan author model",
+			slog.String("model", model),
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+		)
+	}
+
+	// Retry supersession (#3593): read the latest same-stage retry sequence
+	// AT VERDICT TIME (no loop-entry watermark). The predicate is anchored
+	// on roundSeq — the round-start sequence fixed when the round opened —
+	// so a retry landing anywhere between the started emit and this read is
+	// detected. supersededByRetry gates both the payload flag and whether
+	// this verdict's resolutions are buffered into `round`. ok is false only
+	// on a retry-list read error; a clean "no retry yet" read is (0, true),
+	// which correctly yields supersededByRetry=false.
+	latestRetry, retryReadOK := s.latestStageRetrySequence(ctx, runID, stageID)
+	supersededByRetry := retryReadOK && roundSeq > 0 && latestRetry > roundSeq
+
+	payload := planreview.ImplementReviewedPayload{
+		ReviewerKind:  "agent",
+		ReviewerModel: model,
+		Authority:     authority,
+		Verdict:       verdict.Verdict,
+		Concerns:      verdict.Concerns,
+		FreeForm:      verdict.FreeForm,
+		// Recorded review-round identity + retry supersession (#3593).
+		ReviewRoundSequence: roundSeq,
+		SupersededByRetry:   supersededByRetry,
+		// The reviewer's delta-verification verdicts on prior concerns
+		// (#984) ride on the authoritative audit payload; the concern
+		// store applies them below as a derived index.
+		ConcernResolutions: verdict.ConcernResolutions,
+		// #3319 display-only advisory: did this reject name NOTHING,
+		// ANYWHERE? That is the VERDICT-LEVEL question — deliberately the
+		// OTHER predicate from the per-resolution
+		// planreview.RejectSubstantiatesResolution the reopen veto in
+		// applyConcernResolutions consults. Do not swap them.
+		RejectWithoutConcern: planreview.RejectNamesNoConcern(*verdict),
+		// Per-invocation token usage on the review surface (#995).
+		InputTokens:  verdict.Usage.InputTokens,
+		OutputTokens: verdict.Usage.OutputTokens,
+		// Provenance markers (#1250): empty for the first review and the
+		// parent-decomposition consolidated review (byte-identical via
+		// omitempty); set for the base-rebase re-invoke supplemental pass.
+		Origin:  st.origin,
+		HeadSHA: st.headSHA,
+		// Resolved reviewer CLI version + binary-path provenance (#1768),
+		// probed once in invokeImplementReviewer. Empty for non-codex
+		// reviewers (omitempty).
+		ReviewerVersion: res.reviewerVersion,
+		ReviewerBinary:  res.reviewerBinary,
+		// The reviewer persona (#3753) that produced this verdict; empty
+		// for a standard reviewer (omitempty, byte-identical).
+		Persona: inv.personaName(),
+		// Ingest-time review-convention enforcement (E55.3 / #2244), each
+		// omitempty so a convention-free verdict is byte-identical: the
+		// clamp's reject downgrade, and the once-per-round
+		// conventions_file_modified synthesis with its approve upgrade.
+		VerdictClampedFrom:                 res.verdictClampedFrom,
+		VerdictRaisedFrom:                  res.verdictRaisedFrom,
+		ConventionsFileModifiedSynthesized: res.conventionsFileModifiedSynthesized,
+	}
+	payloadBytes, _ := json.Marshal(payload)
+	systemKind := audit.ActorKind("system")
+	entry, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   &stageID,
+		Timestamp: time.Now().UTC(),
+		Category:  "implement_reviewed",
+		ActorKind: &systemKind,
+		Payload:   payloadBytes,
+	})
+	if aerr != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "implement review: append audit entry failed",
+			slog.String("run_id", runID.String()),
+			slog.String("error", aerr.Error()),
+		)
+	} else if entry != nil {
+		// Persist the verdict's concerns with stable IDs (#964),
+		// stamped with the sequence the append returned — the audit
+		// chain stays the sole sequence authority, so a failed append
+		// (no sequence) skips persistence for this verdict.
+		freshRows := s.persistReviewConcerns(ctx, runID, stageID, concern.StageKindImplement, model, verdict.FreeForm, entry.Sequence, verdict.Concerns)
+
+		// Post-persist retry re-check (#3593). RE-READ the latest same-stage
+		// retry sequence AFTER persistReviewConcerns minted this verdict's
+		// rows, so a retry that landed BETWEEN the payload write and here —
+		// the accepted window where the payload is UNMARKED — still
+		// supersedes the concerns it just minted. Combined with the
+		// retry-time sweep in retryStageAs, a retry at ANY instant is caught
+		// by whichever of {sweep, this re-check} runs second. The match
+		// predicate targets ONLY the rows this verdict just minted
+		// (OriginReviewSequence == entry.Sequence), so a peer reviewer's
+		// concerns in the same round are untouched here.
+		latestRetry2, retryReadOK2 := s.latestStageRetrySequence(ctx, runID, stageID)
+		supersededPostPersist := retryReadOK2 && roundSeq > 0 && latestRetry2 > roundSeq
+		if supersededPostPersist {
+			verdictSeq := entry.Sequence
+			s.supersedeOpenImplementConcerns(ctx, runID, stageID,
+				fmt.Sprintf("superseded by stage retry (retry seq %d): this verdict's review round (opened at seq %d, before the retry) reviewed a discarded tree", latestRetry2, roundSeq),
+				func(c *concern.Concern) bool { return c.OriginReviewSequence == verdictSeq })
+		}
+		// A verdict superseded at EITHER read (verdict-build time or this
+		// post-persist re-check) reviewed a tree the retry has discarded;
+		// its delta-verification resolutions describe that discarded tree, so
+		// do NOT buffer them into `round` and do NOT let it resolve the
+		// operator's condition claims. Log at INFO that they were dropped.
+		superseded := supersededByRetry || supersededPostPersist
+		if superseded {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+				"implement review: verdict superseded by stage retry — dropping its concern resolutions",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+				slog.Int64("review_round_sequence", roundSeq),
+				slog.Int64("verdict_sequence", entry.Sequence),
+			)
+		}
+		// Buffer the delta-verification resolutions (#984) instead of
+		// applying them here (E48.103 / #2551): they are applied once
+		// after the loop, through the veto pass that can see what the
+		// OTHER reviewers in this same round said. The append-gated
+		// posture is unchanged — a failed append (no sequence) buffers
+		// nothing, exactly as it previously applied nothing. A
+		// retry-superseded verdict (#3593) buffers nothing either.
+		if !superseded {
+			st.round = append(st.round, roundReviewVerdict{
+				model:          model,
+				verdict:        verdict.Verdict,
+				resolutions:    verdict.ConcernResolutions,
+				reviewSequence: entry.Sequence,
+				// The authoritative input to the #3319 per-resolution
+				// substantiation predicate.
+				review: *verdict,
+			})
+		}
+		// Condition-claim resolution (E48.9 / #1956): ONE confirming
+		// (non-reject) implement review resolves the operator's claimed
+		// plan-stage concerns to addressed_by_condition — the operator's
+		// binding condition is the authority, the reviewer the witness. The
+		// hook keys on the reviewed run's OWN approval_submitted entries, so
+		// a decomposition parent's consolidated review (parent runID, where
+		// the plan gate lives) resolves correctly while implement-only
+		// children no-op. Fires at most once per loop; idempotent across
+		// later re-review rounds via the already-terminal silent skip. A
+		// retry-superseded verdict (#3593) reviewed a discarded tree, so it
+		// never witnesses a condition claim.
+		if !superseded && !st.conditionClaimsResolved && verdict.Verdict != planreview.VerdictReject {
+			// Cross-link this confirming review's OWN fresh implement
+			// concerns (#2066): persistReviewConcerns ran earlier in this
+			// same iteration for this same verdict, so freshRows are the
+			// concerns THIS confirming review minted. A non-empty set
+			// qualifies the resolution's state_reason + audit payload so
+			// the settled ledger no longer asserts an unqualified
+			// "confirmed delivered" when the same review re-raised concerns.
+			freshIDs := make([]uuid.UUID, 0, len(freshRows))
+			for _, fr := range freshRows {
+				if fr != nil {
+					freshIDs = append(freshIDs, fr.ID)
+				}
+			}
+			s.resolveConditionClaimedPlanConcerns(ctx, runID, entry.Sequence, model, string(verdict.Verdict), freshIDs)
+			st.conditionClaimsResolved = true
+		}
+	}
+
+	// Capture this reviewer invocation's agent token cost (#681). The
+	// usage rode in on the planreview.ReviewVerdict contract; we price
+	// and record it here, backend-agnostically.
+	s.recordReviewerCost(ctx, runID, stageID, model, verdict.Usage, "implement_review")
+
+	if verdict.Verdict == planreview.VerdictReject {
+		st.hasRejection = true
+		st.pagedRejectAppended = true
+	}
 }
 
 // latestStageRetrySequence returns the highest audit Sequence of a
@@ -5530,7 +5811,7 @@ func (s *Server) latestStageRetrySequence(ctx context.Context, runID, stageID uu
 // (concerns.superseded_implement) and the gate view's settled[] ledger carries
 // their full rows. It is the shared best-effort primitive both retryStageAs (at retry
 // time, matching ALL open implement concerns of the re-opened stage) and the
-// post-persist re-check in runImplementReviewInvocations (matching only the
+// post-persist re-check in ingestImplementReview (matching only the
 // just-minted rows) call.
 //
 // `match` selects rows to SUPERSEDE (a true return supersedes the row) — it is

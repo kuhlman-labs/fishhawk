@@ -53,8 +53,11 @@ func itemsOf(t *testing.T, props map[string]any, key string) map[string]any {
 // appear in VerdictSchema()'s closed concern object, so a review agent cannot
 // populate it. TestVerdictSchema_OmitsProvenance (review_test.go) pins its
 // absence positively; this set keeps the struct-vs-schema drift guard from
-// flagging that intentional omission.
-var schemaExcludedTags = map[string]bool{"provenance": true}
+// flagging that intentional omission. Concern.SeverityClampedFrom (E55.3 /
+// #2244) is the same class: stamped only by the ingest-time severity_cap clamp
+// (ClampConventionSeverities), never reviewer-emittable;
+// TestVerdictSchema_OmitsSeverityClampedFrom pins its absence positively.
+var schemaExcludedTags = map[string]bool{"provenance": true, "severity_clamped_from": true}
 
 // assertTagsPresent asserts every reflected json tag of structType (except the
 // deliberately schema-excluded server-internal ones) appears as a property key
@@ -255,7 +258,7 @@ func TestStrictVerdictSchema_SatisfiesStrictRequired(t *testing.T) {
 	if _, ok := concernProps["severity"].(map[string]any)["enum"]; !ok {
 		t.Error("strict concerns.items: severity lost its enum in the strict transform")
 	}
-	for _, k := range []string{"category", "suggested_patch", "settled_ref", "new_evidence"} {
+	for _, k := range []string{"category", "suggested_patch", "settled_ref", "new_evidence", "convention"} {
 		assertNullable(t, concernProps, k, "strict concerns.items")
 	}
 
@@ -557,5 +560,60 @@ func TestStrictVerdictSchema_NoteNotNullable(t *testing.T) {
 	patch, _ := props["suggested_patch"].(map[string]any)
 	if _, isArray := patch["type"].([]any); !isArray {
 		t.Errorf("strict suggested_patch type = %#v, want the nullable [\"string\",\"null\"] widening", patch["type"])
+	}
+}
+
+// TestVerdictSchema_ConventionField pins the E55.3 (#2244) additive concern
+// property: the closed (additionalProperties:false) concerns.items object
+// registers `convention` as an optional string, so a schema-conforming reviewer
+// CAN name the repository convention a repo_convention concern derives from —
+// the key the server-side severity_cap clamp reads. It is NOT required (lenient
+// variant) and is nullable in the strict variant, and a body carrying it decodes
+// into Concern.Convention.
+func TestVerdictSchema_ConventionField(t *testing.T) {
+	lenient := VerdictSchema()
+	concernItems := itemsOf(t, propsOf(t, lenient, "top-level"), "concerns")
+	p, ok := propsOf(t, concernItems, "concerns.items")["convention"].(map[string]any)
+	if !ok {
+		t.Fatal("concerns.items is missing the \"convention\" property (E55.3 / #2244)")
+	}
+	if p["type"] != "string" {
+		t.Errorf("concerns.items.convention type = %v, want \"string\"", p["type"])
+	}
+	for _, r := range concernItems["required"].([]any) {
+		if r == "convention" {
+			t.Error("concerns.items.convention is required in the lenient schema; it must stay optional")
+		}
+	}
+
+	strictItems := itemsOf(t, propsOf(t, StrictVerdictSchema(), "strict top-level"), "concerns")
+	assertNullable(t, propsOf(t, strictItems, "strict concerns.items"), "convention", "strict concerns.items")
+
+	got, err := DecodeVerdict([]byte(`{"verdict":"approve_with_concerns","concerns":[{"severity":"low","category":"repo_convention","note":"n","convention":"go-errors"}]}`))
+	if err != nil {
+		t.Fatalf("DecodeVerdict: %v", err)
+	}
+	if len(got.Concerns) != 1 || got.Concerns[0].Convention != "go-errors" {
+		t.Errorf("Concerns = %+v, want one concern with Convention \"go-errors\"", got.Concerns)
+	}
+}
+
+// TestVerdictSchema_OmitsSeverityClampedFrom pins that the server-internal
+// severity_clamped_from marker (E55.3 / #2244) is NOT emittable: it is absent
+// from both the lenient and the strict concerns.items properties, so under the
+// closed (additionalProperties:false) object a schema-constrained reviewer
+// cannot forge a clamp record.
+func TestVerdictSchema_OmitsSeverityClampedFrom(t *testing.T) {
+	for name, schema := range map[string]map[string]any{
+		"lenient": VerdictSchema(),
+		"strict":  StrictVerdictSchema(),
+	} {
+		items := itemsOf(t, propsOf(t, schema, name+" top-level"), "concerns")
+		if _, exists := propsOf(t, items, name+" concerns.items")["severity_clamped_from"]; exists {
+			t.Errorf("%s VerdictSchema concern properties include \"severity_clamped_from\"; it MUST stay server-internal", name)
+		}
+		if items["additionalProperties"] != false {
+			t.Errorf("%s concerns.items additionalProperties = %v, want false (closed)", name, items["additionalProperties"])
+		}
 	}
 }
