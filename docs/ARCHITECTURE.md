@@ -500,7 +500,8 @@ Resolution is PER RUN FORGE (#3466): the run row's `InstallationRef` → `observ
 |---|---|
 | What does v0 ship? | `docs/MVP_SPEC.md` §9, §13 |
 | 5xx error-cause redaction (E67.15 / #2587) | `backend/internal/server/errors.go` — `writeError` redacts 5xx `details` to a default-deny allow-list, sets `error_ref` (= `X-Request-ID`), and logs the full cause keyed by that ref; 4xx unchanged. Long form: `backend/internal/server/README.md`. |
-| Why a decision was made | The corresponding closed ADR issue (`gh issue list --label adr --state closed`) |
+| Why a decision was made | `docs/adr/` (`docs/adr/index.json` for machines) for backfilled ADRs; the corresponding closed ADR issue (`gh issue list --label adr --state closed`) for ADRs not yet backfilled |
+| ADR record + gate (E78.1 / #3722) | `docs/adr/` — one `NNN-slug.md` per ADR (front matter + tracker body verbatim) plus `index.json`, checked by `scripts/check-adr` in `scripts/test verify`; contract: `docs/adr/README.md` |
 | Voice / naming for new surfaces | `docs/BRAND_FOUNDATIONS.md` §5–§7 |
 | Public documentation site (E12.1 / #2261) | `site/` — human-facing narrative docs (Astro + Starlight) published to GitHub Pages; `docs/` stays agent-consumed and is never a publish source, and `scripts/check-site-voice` gates §5 vocabulary in `scripts/test verify`. Details: `site/README.md`. |
 | Autonomy tier of a change | `docs/METHODOLOGY.md` |

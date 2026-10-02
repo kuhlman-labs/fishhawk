@@ -1,0 +1,14 @@
+id: scenario:issue-3722/applies-to-empty-without-named-paths
+statement: applies_to is [] for every backfilled record whose source names no paths (at least ADR-017, ADR-018, ADR-019, ADR-023). In a scratch copy, adding an invented glob to ADR-017's applies_to makes scripts/check-adr exit 1.
+verify_hint: 'CLI: print applies_to for those ids from docs/adr/index.json; then add applies_to ["backend/foo/**"] to the ADR-017 copy and run scripts/check-adr <tempdir>, observing exit 1.'
+steps: 'Posture B: printed applies_to from index.json; added applies_to ["backend/foo/**"] to ADR-017 in a scratch copy and ran scripts/check-adr <copy>.'
+assertions:
+    expected: '[] and exit 1 on an invented glob'
+    observed_at_record: 017/018/019/023 have applies_to []. The mutated copy exits 1 with '[C-applies] stem backend/foo ... does not occur in the record body'.
+    repro_handle: scripts/check-adr <copy with 017 applies_to edited>
+origin:
+    issue: 3722
+    pr: 3917
+    run_id: 050ddc97-b22f-4ba1-bb3c-41664a4a0ccb
+    head_sha: 8711781fba7c6d878c01e3d1ae93615dcb3acc50
+    recorded_at: 2026-10-02T13:38:00Z

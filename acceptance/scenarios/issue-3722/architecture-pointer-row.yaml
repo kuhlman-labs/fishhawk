@@ -1,0 +1,14 @@
+id: scenario:issue-3722/architecture-pointer-row
+statement: docs/ARCHITECTURE.md §10 contains a pointer row naming docs/adr/ and scripts/check-adr, and no line of the file exceeds 1000 characters.
+verify_hint: 'CLI: grep -n ''docs/adr/'' docs/ARCHITECTURE.md prints the row; awk ''length > 1000'' docs/ARCHITECTURE.md prints nothing.'
+steps: 'Posture B: grep -n ''docs/adr/'' docs/ARCHITECTURE.md; awk ''length > 1000'' docs/ARCHITECTURE.md'
+assertions:
+    expected: a §10 row; no line over 1000 chars
+    observed_at_record: Line 504 under '## 10. Where to look' names docs/adr/ and scripts/check-adr (231 chars); awk printed nothing
+    repro_handle: grep -n 'docs/adr/' docs/ARCHITECTURE.md
+origin:
+    issue: 3722
+    pr: 3917
+    run_id: 050ddc97-b22f-4ba1-bb3c-41664a4a0ccb
+    head_sha: 8711781fba7c6d878c01e3d1ae93615dcb3acc50
+    recorded_at: 2026-10-02T13:38:00Z

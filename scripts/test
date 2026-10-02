@@ -1323,6 +1323,10 @@ _verify_patch_coverage() {
 # sleep/docker, no network and no real Docker. Wiring it here is what makes the
 # harness enforce anything: a harness that exists but is never invoked satisfies
 # the scope-completeness gate while enforcing nothing.
+# test-adr (E78.1 / #3722) pins scripts/check-adr, the decision-record gate over
+# docs/adr/; same shape as test-site-ia (temp-dir fixtures with a hand-written
+# index.json, no network/Docker, no zsh guard). It is bash but drives a python3
+# gate, so it needs python3 — already a verify dependency via check-coverage.py.
 # A FAILING harness fails verify (set -e), which is the point (#2455).
 #
 # Every harness runs with FISHHAWK_VERIFY_LOCK_PATH and FISHHAWK_VERIFY_LOCK_OWNER
@@ -1341,7 +1345,7 @@ _verify_patch_coverage() {
 # still aborts the loop (a3).
 _verify_gate_harnesses() {
   local h
-  for h in test-check-coverage test-patch-coverage test-container-lease test-dev test-site-voice test-site-ia test-helm-render test-site-reference test-verify-scope; do
+  for h in test-check-coverage test-patch-coverage test-container-lease test-dev test-site-voice test-site-ia test-helm-render test-site-reference test-verify-scope test-adr; do
     if [ ! -x "$ROOT/scripts/$h" ]; then
       echo "scripts/test: scripts/$h missing or not executable — skipping that harness" >&2
       continue
@@ -1393,6 +1397,25 @@ _verify_site_ia() {
   fi
   printf '>>> scripts/check-site-ia\n'
   "$ROOT/scripts/check-site-ia"
+}
+
+# _verify_adr_records: run the decision-record gate over the COMMITTED docs/adr/
+# (E78.1 / #3722). _verify_gate_harnesses above proves the CONTROL still works
+# against fixtures; this proves the shipped records and index.json still pass it,
+# so a malformed record, a missing record file, a stale index entry, or an
+# `accepted` record with no acceptance statement in its Decision section fails
+# verify in-loop. The script fail-OPENs with a printed reason when docs/adr/ does
+# not exist, and this wrapper skips with a reason when the script is missing or
+# not executable, so neither can red-line a checkout that predates the record. A
+# real violation exits 1 (a failed read exits 2) and, under set -e, fails verify.
+# Long form: scripts/README.md, docs/adr/README.md.
+_verify_adr_records() {
+  if [ ! -x "$ROOT/scripts/check-adr" ]; then
+    echo "scripts/test: scripts/check-adr missing or not executable — skipping the ADR record gate" >&2
+    return 0
+  fi
+  printf '>>> scripts/check-adr\n'
+  "$ROOT/scripts/check-adr"
 }
 
 # --------------------------------------------------------------------------
@@ -1924,8 +1947,8 @@ _release_verify_lock() {
 # format/lint failure leads the captured output and aborts (set -e) before the
 # slow test loop. The doc line budget and schema-sync drift are checked NEXT
 # (each <1s) so a docs defect fails in-loop, still ahead of the slow test loop,
-# as are the gate harnesses, the site voice gate (#2261), and the site IA gate
-# (E12.7 / #2318).
+# as are the gate harnesses, the site voice gate (#2261), the site IA gate
+# (E12.7 / #2318), and the ADR record gate (E78.1 / #3722).
 # The AGGREGATE coverage gate is still intentionally omitted to bound in-loop
 # runtime — it stays on `coverage` and in CI. What runs here instead is the
 # PATCH-scoped gate (#1887), folded into the same test loop via -coverpkg so no
@@ -1941,6 +1964,7 @@ cmd_verify() {
   _verify_gate_harnesses
   _verify_site_voice
   _verify_site_ia
+  _verify_adr_records
   # SCOPED form (#3315). Bucketing fails SAFE: any package this layer cannot
   # place prints a reason and falls through to the full unscoped loop below.
   local buckets=""

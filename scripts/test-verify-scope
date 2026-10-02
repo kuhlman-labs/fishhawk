@@ -9,9 +9,10 @@
 #      restricted to the listed packages in the modules that own them, every
 #      other module is SKIPPED, the patch-coverage gate is bypassed with a
 #      printed reason, and every non-test leg (lint, the doc-line budget,
-#      schema-sync, the gate harnesses, both site gates) is UNCHANGED. Both
-#      widening fail-safes — an unknown package, an undecodable one — fall back
-#      to the full unscoped loop rather than testing less than was asked for.
+#      schema-sync, the gate harnesses, both site gates, the ADR record gate) is
+#      UNCHANGED. Both widening fail-safes — an unknown package, an undecodable
+#      one — fall back to the full unscoped loop rather than testing less than
+#      was asked for.
 #
 #   B. The verify lock at <git-common-dir>/fishhawk-verify.lock: a SHELL-kind
 #      invocation meeting any live holder refuses immediately without polling; a
@@ -158,10 +159,10 @@ EOF
 
   # --- sub-gate stubs -----------------------------------------------------
   local g
-  for g in sync-schemas check-site-voice check-site-ia \
+  for g in sync-schemas check-site-voice check-site-ia check-adr \
            test-check-coverage test-patch-coverage test-container-lease \
            test-dev test-site-voice test-site-ia test-helm-render \
-           test-site-reference test-verify-scope; do
+           test-site-reference test-verify-scope test-adr; do
     cat > "$dir/scripts/$g" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' "$g" >> "$dir/logs/gate.log"
@@ -398,12 +399,16 @@ assert_contains "a10 scoped: gate harnesses ran" "$FX/logs/gate.log" "test-check
 assert_contains "a10 scoped: the new harness is wired in" "$FX/logs/gate.log" "test-verify-scope"
 assert_contains "a10 scoped: site voice gate ran" "$FX/logs/gate.log" "check-site-voice"
 assert_contains "a10 scoped: site IA gate ran" "$FX/logs/gate.log" "check-site-ia"
+assert_contains "a10 scoped: ADR record gate ran" "$FX/logs/gate.log" "check-adr"
+assert_contains "a10 scoped: ADR harness ran" "$FX/logs/gate.log" "test-adr"
 run_verify "$FX"
 assert_contains "a10 unscoped: lint ran in backend" "$FX/logs/lint.log" "backend	run ./..."
 assert_contains "a10 unscoped: schema-sync ran" "$FX/logs/gate.log" "sync-schemas"
 assert_contains "a10 unscoped: gate harnesses ran" "$FX/logs/gate.log" "test-check-coverage"
 assert_contains "a10 unscoped: site voice gate ran" "$FX/logs/gate.log" "check-site-voice"
 assert_contains "a10 unscoped: site IA gate ran" "$FX/logs/gate.log" "check-site-ia"
+assert_contains "a10 unscoped: ADR record gate ran" "$FX/logs/gate.log" "check-adr"
+assert_contains "a10 unscoped: ADR harness ran" "$FX/logs/gate.log" "test-adr"
 
 # a11 — the doc-line budget still FAILS verify in both modes (the non-test legs
 # are not merely invoked in scoped mode, they still gate).

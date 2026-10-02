@@ -1,0 +1,259 @@
+{
+  "schema_version": "adr-index-v1",
+  "records": [
+    {
+      "id": "ADR-001",
+      "title": "Cloud target (AWS / GCP / Other)",
+      "path": "docs/adr/001-cloud-target-aws-gcp-other.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-002",
+      "title": "Postgres access layer (sqlc + pgx vs. ORM)",
+      "path": "docs/adr/002-postgres-access-layer-sqlc-pgx-vs-orm.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": [
+        "backend/internal/*/queries.sql",
+        "backend/internal/*/db/**",
+        "backend/sqlc.yaml"
+      ]
+    },
+    {
+      "id": "ADR-003",
+      "title": "Object storage choice + dev-loop strategy",
+      "path": "docs/adr/003-object-storage-choice-dev-loop-strategy.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": [
+        "docker-compose.yml"
+      ]
+    },
+    {
+      "id": "ADR-004",
+      "title": "Frontend styling system",
+      "path": "docs/adr/004-frontend-styling-system.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": [
+        "frontend/src/components/ui/**"
+      ]
+    },
+    {
+      "id": "ADR-005",
+      "title": "API auth/session model",
+      "path": "docs/adr/005-api-auth-session-model.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-006",
+      "title": "DB migration tool",
+      "path": "docs/adr/006-db-migration-tool.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": [
+        "backend/internal/db/migrations/**"
+      ]
+    },
+    {
+      "id": "ADR-007",
+      "title": "Trace bundle wire format",
+      "path": "docs/adr/007-trace-bundle-wire-format.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-008",
+      "title": "Signing scheme (Ed25519, canonicalization, issuance protocol)",
+      "path": "docs/adr/008-signing-scheme-ed25519.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-009",
+      "title": "Hosted deployment target",
+      "path": "docs/adr/009-hosted-deployment-target.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": [
+        "backend/Dockerfile"
+      ]
+    },
+    {
+      "id": "ADR-010",
+      "title": "Marketplace billing path (GitHub vs. direct)",
+      "path": "docs/adr/010-marketplace-billing-path-github-vs-direct.md",
+      "status": "unknown",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-011",
+      "title": "Pricing model (per-engineer vs. per-run)",
+      "path": "docs/adr/011-pricing-model-per-engineer-vs-per-run.md",
+      "status": "unknown",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-012",
+      "title": "Design partner sourcing strategy",
+      "path": "docs/adr/012-design-partner-sourcing-strategy.md",
+      "status": "unknown",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-013",
+      "title": "Apache 2.0 / BSL boundary for enterprise modules",
+      "path": "docs/adr/013-apache-bsl-enterprise-boundary.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": [
+        "LICENSE.md",
+        "cli/**",
+        "runner/**",
+        "verifier/**",
+        "docs/spec/**",
+        "backend/internal/account/**",
+        "backend/internal/identity/**"
+      ]
+    },
+    {
+      "id": "ADR-014",
+      "title": "Linter/formatter/CI config for Go and TS",
+      "path": "docs/adr/014-linter-formatter-ci-config-for-go-and-ts.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": [
+        ".golangci.yml",
+        ".github/workflows/ci.yml",
+        "go.work"
+      ]
+    },
+    {
+      "id": "ADR-015",
+      "title": "Slack notification approach (v0.x scope)",
+      "path": "docs/adr/015-slack-notification-approach.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": [
+        "backend/internal/issuecomment/**",
+        "docs/issue-comment-surfaces.md"
+      ]
+    },
+    {
+      "id": "ADR-016",
+      "title": "IaC tool — Terraform vs AWS CDK",
+      "path": "docs/adr/016-iac-tool-terraform-vs-aws-cdk.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": [
+        "infra/terraform/**"
+      ]
+    },
+    {
+      "id": "ADR-017",
+      "title": "CI gating: defer to GitHub branch protection, decouple approval from merge",
+      "path": "docs/adr/017-ci-gating-defer-to-github-branch-protection.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-018",
+      "title": "Review-stage approval defers to GitHub PR merge",
+      "path": "docs/adr/018-review-stage-approval-defers-to-github-pr-merge.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-019",
+      "title": "Fishhawk as coordination layer, not destination",
+      "path": "docs/adr/019-fishhawk-as-coordination-layer-not-destination.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-020",
+      "title": "Plan review surface: post the plan on the originating issue",
+      "path": "docs/adr/020-plan-review-surface-on-originating-issue.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-021",
+      "title": "Claude Code integration: ship a Fishhawk MCP server",
+      "path": "docs/adr/021-claude-code-integration-mcp-server.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-022",
+      "title": "Pluggable runner backends + runner_kind audit dimension",
+      "path": "docs/adr/022-pluggable-runner-backends-runner-kind-audit.md",
+      "status": "unknown",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-023",
+      "title": "Agent self-retry on transient stage failure",
+      "path": "docs/adr/023-agent-self-retry-on-transient-stage-failure.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-024",
+      "title": "MCP server spawning runner subprocesses",
+      "path": "docs/adr/024-mcp-server-spawning-runner-subprocesses.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-025",
+      "title": "Scope-policy: workflow-spec timeouts, predicted runtime, and plan-driven decomposition",
+      "path": "docs/adr/025-scope-policy-timeouts-runtime-decomposition.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    }
+  ]
+}

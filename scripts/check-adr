@@ -1,0 +1,528 @@
+#!/usr/bin/env python3
+# check-adr: fail the build when the in-repo decision records under docs/adr/
+# (E78.1 / #3722) are malformed, inconsistent with each other, or inconsistent
+# with the machine index docs/adr/index.json that reviewers and the architect
+# responder read through repodoc (which cannot list a directory).
+#
+# Usage: scripts/check-adr [ADR_DIR]                (default <repo>/docs/adr)
+#        scripts/check-adr --write-index [ADR_DIR]  regenerate ADR_DIR/index.json
+#   scripts/test-adr injects fixture dirs so the harness never depends on the
+#   committed records.
+#
+# Records are every non-recursive *.md in ADR_DIR except README.md. The format
+# contract (front-matter grammar, status rule, applies_to rule, index contract)
+# lives in docs/adr/README.md; scripts/README.md carries the gate contract.
+#
+# CHECKS — each a separate branch, every violation printed as
+#   check-adr: <file>: [<class>] <message>
+# before a single non-zero exit (never first-hit-and-stop):
+#   C-frontmatter    line 1 is '---' and a closing '---' line exists
+#   C-grammar        every front-matter line is `key: value`; known key; no
+#                    duplicate; scalar vs list type; date is YYYY-MM-DD
+#   C-required       id, title, status, issue, supersedes, superseded_by and
+#                    applies_to are present (status absence is C-status-present)
+#   C-file           every non-README *.md is named NNN-slug.md (else stray)
+#   C-id             id is ADR-NNN and equals 'ADR-' + the filename prefix
+#   C-status-set     a PRESENT status is in the closed set
+#   C-unique         ids are unique across records
+#   C-ref            every supersedes/superseded_by id names an existing
+#                    record other than the record itself
+#   C-recip-fwd      A.supersedes ∋ B  =>  B.superseded_by ∋ A
+#   C-recip-rev      B.superseded_by ∋ A  =>  A.supersedes ∋ B
+#                    (both reciprocity checks skip targets C-ref rejects, so
+#                    C-ref is isolated)
+#   C-superseded     status superseded => non-empty superseded_by
+#   C-accepted       status accepted => SOME Decision section carries an
+#                    acceptance word after italic-placeholder lines are removed
+#   C-applies        every applies_to entry has a non-empty literal stem (text
+#                    before the first of * ? [ {, minus one trailing '/') that
+#                    occurs verbatim in the record body
+#   C-index          index.json parses and has the adr-index-v1 shape; plus three
+#                    separate branches keyed by PATH: missing (record with no
+#                    entry), extra (entry naming no record file), stale (entry
+#                    field disagrees with the record's front matter)
+#
+# --write-index runs every record check (all but C-index); on any violation it
+# refuses with exit 1 and writes NOTHING. Otherwise it writes index.json
+# (records sorted by id) via a temp file + rename.
+#
+# EXIT CODES (mirroring scripts/check-site-ia): 0 = consistent, or a documented
+# fail-open with a printed reason (ADR_DIR does not exist; ADR_DIR holds no *.md
+# besides README.md and no index.json). 1 = violations. 2 = a FAILED enumeration,
+# read or write (ADR_DIR naming a regular file, an unreadable record) — distinct
+# from 1, so the gate never reports a clean tree it did not read.
+#
+# Stdlib only (no PyYAML), python 3.8-compatible.
+import datetime
+import json
+import os
+import re
+import sys
+
+KNOWN_KEYS = ("id", "title", "status", "date", "issue",
+              "supersedes", "superseded_by", "applies_to")
+LIST_KEYS = ("supersedes", "superseded_by", "applies_to")
+REQUIRED_KEYS = ("id", "title", "status", "issue",
+                 "supersedes", "superseded_by", "applies_to")
+STATUSES = ("proposed", "accepted", "rejected", "superseded", "unknown")
+INDEX_FIELDS = ("id", "title", "path", "status",
+                "supersedes", "superseded_by", "applies_to")
+INDEX_SCHEMA = "adr-index-v1"
+
+FILENAME_RE = re.compile(r"^\d{3}-[a-z0-9]+(-[a-z0-9]+)*\.md$")
+ID_RE = re.compile(r"^ADR-\d{3}$")
+LINE_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*): (.+)$")
+BARE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/#-]*$")
+DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+HEADING_RE = re.compile(r"^(#{1,6})\s+")
+DECISION_RE = re.compile(r"^#{1,6}\s+Decision\b", re.IGNORECASE)
+FENCE_RE = re.compile(r"^\s*(```|~~~)")
+# A line that is ENTIRELY one italic span (_..._ or *...*), never bold (**...**).
+PLACEHOLDER_RE = re.compile(r"^(_(?!_).*(?<!_)_|\*(?!\*).*(?<!\*)\*)$")
+ACCEPT_RE = re.compile(
+    r"\b(accepted|approved|ratified|recorded|decided|adopt|adopted)\b",
+    re.IGNORECASE)
+GLOB_META = "*?[{"
+
+
+class ReadFailure(Exception):
+    pass
+
+
+def parse_value(raw):
+    """Return (value, ok). A JSON string, a JSON array, or a bare token."""
+    if raw.startswith('"') or raw.startswith("["):
+        try:
+            val = json.loads(raw)
+        except ValueError:
+            return None, False
+        if isinstance(val, str):
+            return val, True
+        if isinstance(val, list) and all(isinstance(x, str) for x in val):
+            return val, True
+        return None, False
+    if BARE_RE.match(raw):
+        return raw, True
+    return None, False
+
+
+def parse_record(path, name, text):
+    """Parse one record. Returns a dict; violations go into rec['errors']."""
+    rec = {"name": name, "file": path, "fm": None, "present": set(),
+           "body": "", "errors": []}
+
+    def err(cls, msg):
+        rec["errors"].append((path, cls, msg))
+
+    lines = text.replace("\r\n", "\n").split("\n")
+    if not lines or lines[0] != "---":
+        err("C-frontmatter", "missing front matter (line 1 must be '---')")
+        return rec
+    close = None
+    for i in range(1, len(lines)):
+        if lines[i] == "---":
+            close = i
+            break
+    if close is None:
+        err("C-frontmatter", "unterminated front matter (no closing '---' line)")
+        return rec
+    fm = {}
+    for lineno in range(1, close):
+        line = lines[lineno]
+        if not line.strip():
+            continue
+        m = LINE_RE.match(line)
+        if not m:
+            err("C-grammar", "front-matter line %d is not `key: value`: %r"
+                % (lineno + 1, line))
+            continue
+        key, raw = m.group(1), m.group(2).strip()
+        if key not in KNOWN_KEYS:
+            err("C-grammar", "unknown key '%s'" % key)
+            continue
+        if key in rec["present"]:
+            err("C-grammar", "duplicate key '%s'" % key)
+            continue
+        rec["present"].add(key)
+        val, ok = parse_value(raw)
+        if not ok:
+            err("C-grammar", "key '%s': value %r is not a JSON string, a JSON "
+                "array of strings, or a bare token" % (key, raw))
+            continue
+        if key in LIST_KEYS and not isinstance(val, list):
+            err("C-grammar", "key '%s': expected a list, got a scalar" % key)
+            continue
+        if key not in LIST_KEYS and isinstance(val, list):
+            err("C-grammar", "key '%s': expected a scalar, got a list" % key)
+            continue
+        if key == "date" and not valid_date(val):
+            err("C-grammar", "key 'date': %r is not a valid YYYY-MM-DD date"
+                % val)
+            continue
+        fm[key] = val
+    for key in REQUIRED_KEYS:
+        if key not in rec["present"]:
+            cls = "C-status-present" if key == "status" else "C-required"
+            err(cls, "missing required key '%s'" % key)
+    rec["fm"] = fm
+    rec["body"] = "\n".join(lines[close + 1:])
+    return rec
+
+
+def valid_date(val):
+    if not DATE_RE.match(val):
+        return False
+    try:
+        datetime.date(int(val[0:4]), int(val[5:7]), int(val[8:10]))
+    except ValueError:
+        return False
+    return True
+
+
+def decision_sections(body):
+    """Yield the text of every section whose heading matches the Decision
+    pattern. A section runs to the next heading of the same or higher level;
+    headings inside fenced code blocks are ignored."""
+    lines = body.split("\n")
+    in_fence = False
+    heads = []  # (index, level, is_decision)
+    for i, line in enumerate(lines):
+        if FENCE_RE.match(line):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        m = HEADING_RE.match(line)
+        if m:
+            heads.append((i, len(m.group(1)), bool(DECISION_RE.match(line))))
+    for k, (i, level, is_dec) in enumerate(heads):
+        if not is_dec:
+            continue
+        end = len(lines)
+        for (j, lvl, _) in heads[k + 1:]:
+            if lvl <= level:
+                end = j
+                break
+        yield lines[i + 1:end]
+
+
+def has_acceptance(body):
+    for section in decision_sections(body):
+        kept = [ln for ln in section if not PLACEHOLDER_RE.match(ln.strip())]
+        if ACCEPT_RE.search("\n".join(kept)):
+            return True
+    return False
+
+
+def glob_stem(pattern):
+    """The literal text before the first glob metacharacter, minus one trailing
+    '/', so a directory glob `dir/**` matches a body that names `dir`."""
+    cut = len(pattern)
+    for ch in GLOB_META:
+        pos = pattern.find(ch)
+        if pos != -1 and pos < cut:
+            cut = pos
+    stem = pattern[:cut]
+    if stem.endswith("/"):
+        stem = stem[:-1]
+    return stem
+
+
+def check_records(records):
+    """Every record check except C-index. Returns a list of violations."""
+    out = []
+    for rec in records:
+        out.extend(rec["errors"])
+    parsed = [r for r in records if r["fm"] is not None]
+
+    # C-id
+    for rec in parsed:
+        rid = rec["fm"].get("id")
+        if rid is None:
+            continue
+        if not ID_RE.match(rid):
+            out.append((rec["file"], "C-id",
+                        "id '%s' is not of the form ADR-NNN" % rid))
+            continue
+        expected = "ADR-" + rec["name"][:3]
+        if rid != expected:
+            out.append((rec["file"], "C-id",
+                        "id '%s' does not match the filename (expected '%s')"
+                        % (rid, expected)))
+
+    # C-status-set (only for a PRESENT status; absence is C-status-present)
+    for rec in parsed:
+        st = rec["fm"].get("status")
+        if st is not None and st not in STATUSES:
+            out.append((rec["file"], "C-status-set",
+                        "status '%s' is not one of %s"
+                        % (st, ", ".join(STATUSES))))
+
+    # C-unique
+    by_id = {}
+    for rec in parsed:
+        rid = rec["fm"].get("id")
+        if rid is not None:
+            by_id.setdefault(rid, []).append(rec)
+    for rid, recs in sorted(by_id.items()):
+        if len(recs) > 1:
+            for rec in recs:
+                out.append((rec["file"], "C-unique",
+                            "id '%s' is declared by %d records: %s"
+                            % (rid, len(recs),
+                               ", ".join(r["name"] for r in recs))))
+
+    # C-ref
+    def resolvable(rec, target):
+        return target in by_id and target != rec["fm"].get("id")
+
+    for rec in parsed:
+        for key in ("supersedes", "superseded_by"):
+            for target in rec["fm"].get(key, []):
+                if target == rec["fm"].get("id"):
+                    out.append((rec["file"], "C-ref",
+                                "key '%s' names the record itself ('%s')"
+                                % (key, target)))
+                elif target not in by_id:
+                    out.append((rec["file"], "C-ref",
+                                "key '%s' names '%s', which is no existing record"
+                                % (key, target)))
+
+    # C-recip-fwd
+    for rec in parsed:
+        rid = rec["fm"].get("id")
+        for target in rec["fm"].get("supersedes", []):
+            if not resolvable(rec, target):
+                continue
+            other = by_id[target][0]
+            if "superseded_by" not in other["fm"]:
+                continue
+            if rid not in other["fm"]["superseded_by"]:
+                out.append((rec["file"], "C-recip-fwd",
+                            "key 'supersedes' names '%s', but %s's "
+                            "superseded_by does not name '%s'"
+                            % (target, other["name"], rid)))
+
+    # C-recip-rev
+    for rec in parsed:
+        rid = rec["fm"].get("id")
+        for target in rec["fm"].get("superseded_by", []):
+            if not resolvable(rec, target):
+                continue
+            other = by_id[target][0]
+            if "supersedes" not in other["fm"]:
+                continue
+            if rid not in other["fm"]["supersedes"]:
+                out.append((rec["file"], "C-recip-rev",
+                            "key 'superseded_by' names '%s', but %s's "
+                            "supersedes does not name '%s'"
+                            % (target, other["name"], rid)))
+
+    # C-superseded
+    for rec in parsed:
+        if rec["fm"].get("status") == "superseded" \
+                and "superseded_by" in rec["fm"] \
+                and not rec["fm"]["superseded_by"]:
+            out.append((rec["file"], "C-superseded",
+                        "status 'superseded' requires a non-empty "
+                        "superseded_by"))
+
+    # C-accepted
+    for rec in parsed:
+        if rec["fm"].get("status") == "accepted" \
+                and not has_acceptance(rec["body"]):
+            out.append((rec["file"], "C-accepted",
+                        "status 'accepted' but no Decision section carries an "
+                        "acceptance word (placeholder lines do not count)"))
+
+    # C-applies
+    for rec in parsed:
+        for pattern in rec["fm"].get("applies_to", []):
+            stem = glob_stem(pattern)
+            if not stem:
+                out.append((rec["file"], "C-applies",
+                            "key 'applies_to': '%s' has an empty literal stem"
+                            % pattern))
+            elif stem not in rec["body"]:
+                out.append((rec["file"], "C-applies",
+                            "key 'applies_to': stem '%s' of '%s' does not "
+                            "occur in the record body" % (stem, pattern)))
+    return out
+
+
+def index_entry(rec):
+    fm = rec["fm"]
+    return {"id": fm["id"], "title": fm["title"],
+            "path": "docs/adr/" + rec["name"], "status": fm["status"],
+            "supersedes": fm["supersedes"],
+            "superseded_by": fm["superseded_by"],
+            "applies_to": fm["applies_to"]}
+
+
+def check_index(index_path, records):
+    out = []
+    if not os.path.lexists(index_path):
+        if records:
+            out.append((index_path, "C-index-missing",
+                        "index.json is missing but %d record(s) exist "
+                        "(regenerate with scripts/check-adr --write-index)"
+                        % len(records)))
+        return out
+    try:
+        with open(index_path, encoding="utf-8") as fh:
+            raw = fh.read()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ReadFailure("reading %s FAILED: %s" % (index_path, exc))
+    try:
+        doc = json.loads(raw)
+    except ValueError as exc:
+        return [(index_path, "C-index", "not valid JSON: %s" % exc)]
+    if not isinstance(doc, dict) or doc.get("schema_version") != INDEX_SCHEMA \
+            or not isinstance(doc.get("records"), list):
+        return [(index_path, "C-index",
+                 "expected an object with schema_version '%s' and a records "
+                 "list" % INDEX_SCHEMA)]
+    entries = {}
+    for n, entry in enumerate(doc["records"]):
+        if not isinstance(entry, dict) or sorted(entry) != sorted(INDEX_FIELDS) \
+                or not isinstance(entry.get("path"), str):
+            out.append((index_path, "C-index",
+                        "records[%d] must be an object with exactly the keys %s"
+                        % (n, ", ".join(INDEX_FIELDS))))
+            continue
+        if entry["path"] in entries:
+            out.append((index_path, "C-index",
+                        "records[%d]: duplicate entry for path '%s'"
+                        % (n, entry["path"])))
+            continue
+        entries[entry["path"]] = entry
+    rec_by_path = {"docs/adr/" + r["name"]: r for r in records}
+    # missing
+    for path in sorted(rec_by_path):
+        if path not in entries:
+            out.append((index_path, "C-index-missing",
+                        "no entry for record '%s'" % path))
+    # extra
+    for path in sorted(entries):
+        if path not in rec_by_path:
+            out.append((index_path, "C-index-extra",
+                        "entry path '%s' names no record file" % path))
+    # stale — only fields the record successfully declares; an absent or
+    # ill-typed field is already reported by C-required / C-grammar.
+    for path in sorted(entries):
+        rec = rec_by_path.get(path)
+        if rec is None or rec["fm"] is None:
+            continue
+        for field in INDEX_FIELDS:
+            if field == "path" or field not in rec["fm"]:
+                continue
+            if entries[path][field] != rec["fm"][field]:
+                out.append((index_path, "C-index-stale",
+                            "entry '%s' field '%s' is %s but the record says %s"
+                            % (path, field,
+                               json.dumps(entries[path][field],
+                                          ensure_ascii=False),
+                               json.dumps(rec["fm"][field],
+                                          ensure_ascii=False))))
+    return out
+
+
+def report(violations):
+    for (path, cls, msg) in violations:
+        print("check-adr: %s: [%s] %s" % (path, cls, msg))
+
+
+def main(argv):
+    write = False
+    args = list(argv)
+    if args and args[0] == "--write-index":
+        write = True
+        args = args[1:]
+    if len(args) > 1:
+        print("usage: scripts/check-adr [--write-index] [ADR_DIR]",
+              file=sys.stderr)
+        return 2
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    adr_dir = args[0] if args else os.path.join(repo, "docs", "adr")
+    index_path = os.path.join(adr_dir, "index.json")
+
+    if not os.path.lexists(adr_dir):
+        print("check-adr: ADR dir %s does not exist — nothing to check" % adr_dir)
+        return 0
+    try:
+        names = sorted(os.listdir(adr_dir))
+    except OSError as exc:
+        print("check-adr: enumerating %s FAILED (%s) — refusing to report a "
+              "clean tree" % (adr_dir, exc), file=sys.stderr)
+        return 2
+
+    md = [n for n in names if n.endswith(".md") and n != "README.md"]
+    if not md and not os.path.lexists(index_path):
+        print("check-adr: %s holds no records and no index.json — nothing to "
+              "check" % adr_dir)
+        return 0
+
+    violations = []
+    records = []
+    for name in md:
+        path = os.path.join(adr_dir, name)
+        if not FILENAME_RE.match(name):
+            violations.append((path, "C-file",
+                               "stray file: not a record filename "
+                               "(NNN-slug.md) and not README.md"))
+            continue
+        try:
+            with open(path, encoding="utf-8") as fh:
+                text = fh.read()
+        except (OSError, UnicodeDecodeError) as exc:
+            print("check-adr: reading %s FAILED (%s) — refusing to report a "
+                  "clean tree" % (path, exc), file=sys.stderr)
+            return 2
+        records.append(parse_record(path, name, text))
+
+    violations.extend(check_records(records))
+
+    if write:
+        if violations:
+            report(violations)
+            print("check-adr: %d record violation(s) — refusing to write %s"
+                  % (len(violations), index_path), file=sys.stderr)
+            return 1
+        doc = {"schema_version": INDEX_SCHEMA,
+               "records": [index_entry(r) for r in
+                           sorted(records, key=lambda r: r["fm"]["id"])]}
+        tmp = index_path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(doc, indent=2, ensure_ascii=False) + "\n")
+            os.replace(tmp, index_path)
+        except OSError as exc:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            print("check-adr: writing %s FAILED (%s)" % (index_path, exc),
+                  file=sys.stderr)
+            return 2
+        print("check-adr: wrote %s (%d record(s))" % (index_path, len(records)))
+        return 0
+
+    try:
+        violations.extend(check_index(index_path, records))
+    except ReadFailure as exc:
+        print("check-adr: %s — refusing to report a clean tree" % exc,
+              file=sys.stderr)
+        return 2
+
+    if violations:
+        report(violations)
+        print("check-adr: %d violation(s) in %s" % (len(violations), adr_dir),
+              file=sys.stderr)
+        return 1
+    print("check-adr: %d record(s) consistent with %s"
+          % (len(records), index_path))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
