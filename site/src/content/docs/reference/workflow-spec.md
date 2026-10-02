@@ -138,7 +138,7 @@ The live major — write new specs here.
 | `defaults` | object | optional |  | FILE-LEVEL reuse defaults (E52.4 / #2216): the lowest rung of the same-document resolution ladder — file defaults -> extends base -> workflow defaults -> the stage's own declaration, later winning. Applied to every stage of every workflow in this document before schema validation, so an inherited executor satisfies $defs/stage's required list with no schema relaxation. MERGE SEMANTICS: `executor` and `budget` merge KEY-WISE (the receiving side wins per key) because they carry only execution parameters; `reviewers` is taken WHOLE from exactly one rung and is NEVER blended, because it determines review AUTHORITY (ADR-027) and a supplemented `human` key would silently convert a gating stage into an advisory one. Arrays REPLACE wholesale everywhere — a governance file never accumulates an approver or reviewer its author did not write. Cross-FILE inclusion (`include:`) is deliberately out of scope (ADR-067). This block is INLINED here and on $defs/workflow rather than factored into a shared $defs entry. That was originally FORCED: the interim v1->v2 copy-fidelity allow-list capped licensed divergent paths at ~15, and a shared $def would have spent a fourth. That check and its cap are RETIRED (#2320), so the duplication is now a free CHOICE rather than a constraint — it is kept because changing it would be churn, not a fix. Either way, the two inline bodies MUST be kept in sync: an edit to one is an edit to both. |
 | `test_conventions` | array of `test_convention` | optional |  | Optional per-repo test-location conventions that generalize the plan-gate test sweep (#1004) beyond the built-in Go (name.go -> name_test.go) and colocated-TypeScript defaults. Each entry maps production files matching a glob to candidate test-file path templates. Declared entries are ADDITIVE to the built-in defaults (Go + colocated TS stay covered regardless), so a repo typically declares only its Python / Ruby / parallel-tree conventions. Advisory-only and fail-open: the sweep never blocks a plan. Declared by workflow-v2; accepted whenever present (v2 has no minor chain — a field is accepted because the schema declares it, not because the document declared a high enough minor). |
 | `review_conventions` | object | optional |  | Named repo-declared review conventions (ADR-068 / E55.2 / #2243): a map from a snake_case convention name (^[a-z][a-z0-9_]*$, the v2 identifier rule — a non-matching key is refused as an additional property, the same idiom `workflows` uses) to one entry naming a repo-relative document that a review stage SELECTS by name through its `reviewers.conventions` list. A convention is DECLARED here and never auto-discovered — no file is read because it exists at a conventional path. Every declared entry must be selected by at least one stage of the RESOLVED document (one declared and selected nowhere is refused as a control that does nothing), and every selected name must resolve to an entry here; both rules, plus the canonical repo-relative path rule, are enforced at semantic validation by the backend and `fishhawk validate`. GRAMMAR ONLY in this change: nothing renders a convention into a reviewer prompt yet — rendering and severity_cap enforcement are #2244 (E55.3) and the review-prompt wiring is #2797. Declared by workflow-v2; accepted whenever present (v2 has no minor chain — a field is accepted because the schema declares it, not because the document declared a high enough minor). |
-| `reviewer_personas` | object | optional |  | Named reviewer personas (ADR-084 / E55.8 / #3753): a map from a snake_case persona name (^[a-z][a-z0-9_]*$, the v2 identifier rule — a non-matching key is refused as an additional property) to a persona declaring a model configuration and a remit document. A plan or implement stage ATTACHES personas by name through its `reviewers.personas` list; each attached persona runs as a SEPARATE reviewer invocation with its OWN prompt (the stage's review prompt plus the persona's remit), in addition to the stage's standard `reviewers.agents`, whose prompt is unchanged. A persona inherits the stage's review authority and counts toward the round's configured reviewers. A persona is DECLARED here and never auto-discovered. Every declared persona must be attached by at least one stage of the RESOLVED document OR required by at least one workflow escalation's `require.reviewers` (ADR-084 D2(c) / E55.9 / #3754) — one declared and attached nowhere is refused as a control that does nothing, and every attached name must resolve to an entry here; both rules, plus the remit path rule and the persona agent's agent_version syntax, are enforced at semantic validation by the backend and `fishhawk validate`. Declared by workflow-v2; accepted whenever present (v2 has no minor chain — a field is accepted because the schema declares it, not because the document declared a high enough minor). |
+| `reviewer_personas` | object | optional |  | Named reviewer personas (ADR-084 / E55.8 / #3753): a map from a snake_case persona name (^[a-z][a-z0-9_]*$, the v2 identifier rule — a non-matching key is refused as an additional property) to a persona declaring a model configuration and a remit document. A plan or implement stage ATTACHES personas by name through its `reviewers.personas` list; each attached persona runs as a SEPARATE reviewer invocation with its OWN prompt (the stage's review prompt plus the persona's remit and, for a persona declaring `decision_record`, the decision-record index and the records selected for the change), in addition to the stage's standard `reviewers.agents`, whose prompt is unchanged. A persona inherits the stage's review authority and counts toward the round's configured reviewers. A persona is DECLARED here and never auto-discovered. Every declared persona must be attached by at least one stage of the RESOLVED document OR required by at least one workflow escalation's `require.reviewers` (ADR-084 D2(c) / E55.9 / #3754) — one declared and attached nowhere is refused as a control that does nothing, and every attached name must resolve to an entry here; both rules, plus the remit path rule and the persona agent's agent_version syntax, are enforced at semantic validation by the backend and `fishhawk validate`. Declared by workflow-v2; accepted whenever present (v2 has no minor chain — a field is accepted because the schema declares it, not because the document declared a high enough minor). |
 
 #### workflow-v2 — definitions
 
@@ -375,14 +375,23 @@ A reviewer persona's remit document (ADR-084 / E55.8 / #3753): the repo-relative
 | `path` | string | required | minLength: `1` | Repo-relative, slash-separated path of the remit document, e.g. `docs/review/security-remit.md`. Semantic validation (backend and `fishhawk validate`) applies the review-conventions path rule: an absolute path, a backslash, an empty / `.` / `..` segment, a non-canonical spelling and a control or line-separator character are refused. |
 | `severity_cap` | string | optional | enum: `low`, `medium` | Optional ceiling on the severity this persona may assign to a concern. ABSENT means UNCAPPED. The same closed set as a review convention's severity_cap (`high` would clamp nothing and is refused). GRAMMAR ONLY here: the clamp at verdict ingest is E55.10 (#3755). |
 
+##### `persona_decision_record`
+
+A reviewer persona's decision-record opt-in (ADR-084 D4(b) / binding rule 4 / E78.5 / #3756). When declared, each review round the persona joins resolves the named index (schema_version `adr-index-v1`, e.g. `docs/adr/index.json`) at the run's pinned admission commit — never the change's branch — selects the records whose `applies_to` globs match the round's change paths (the plan scope at plan review; the approved plan scope united with the diff at implement review), and adds the index plus every matching record IN FULL to the persona's OWN prompt, in rank order, while the summed rendered bytes of the index and the selected records stay within the repo-document resolver's cap; a match that does not fit is dropped by rank (it and every lower-ranked match), named in the prompt and recorded in a `document_truncated` audit entry, never shown truncated. Each record is framed with its status, and only an `accepted` record is presented as settled. An index that is missing, malformed, or names a record absent at that commit degrades ONLY the persona (it does not run; reason `persona_remit_unavailable` with a `decision_record_*` detail), never the stage; the standard reviewers' prompts never carry the record. There is no inline alternative (additionalProperties false).
+
+| Field | Type | Required | Constraints | Description |
+|---|---|---|---|---|
+| `index` | string | required | minLength: `1` | Repo-relative, slash-separated path of the decision-record index, e.g. `docs/adr/index.json`. Semantic validation (backend and `fishhawk validate`) applies the review-conventions path rule: an absolute path, a backslash, an empty / `.` / `..` segment, a non-canonical spelling and a control or line-separator character are refused. |
+
 ##### `reviewer_persona`
 
-One named reviewer persona (ADR-084 / E55.8 / #3753). ADR-084 binding rule 1: "A named persona declares a model configuration and a remit document." `agent` is the model configuration — the SAME shape as one `reviewers.agents[]` entry ($defs/agent_reviewer), so provider, model, reasoning_effort, agent_version and optional mean exactly what they mean there; `remit` is the document the persona reviews against.
+One named reviewer persona (ADR-084 / E55.8 / #3753). ADR-084 binding rule 1: "A named persona declares a model configuration and a remit document." `agent` is the model configuration — the SAME shape as one `reviewers.agents[]` entry ($defs/agent_reviewer), so provider, model, reasoning_effort, agent_version and optional mean exactly what they mean there; `remit` is the document the persona reviews against; the optional `decision_record` opts the persona into the decision-record selection (ADR-084 D4(b) / E78.5 / #3756).
 
 | Field | Type | Required | Constraints | Description |
 |---|---|---|---|---|
 | `agent` | `agent_reviewer` | required |  |  |
 | `remit` | `persona_remit` | required |  |  |
+| `decision_record` | `persona_decision_record` | optional |  |  |
 
 ##### `reviewers_config`
 
@@ -863,6 +872,8 @@ Shape deltas only — a field whose description changed but whose type, required
 | `/$defs/operator_agent/properties/model_policy` | removed | present in the older major, absent at the newer |
 | `/$defs/operator_agent/properties/must_page_human` | removed | present in the older major, absent at the newer |
 | `/$defs/operator_agent/properties/route_fixup_min_severity` | removed | present in the older major, absent at the newer |
+| `/$defs/persona_decision_record` | added | new at the newer major |
+| `/$defs/persona_decision_record/properties/index` | added | new at the newer major |
 | `/$defs/persona_remit` | added | new at the newer major |
 | `/$defs/persona_remit/properties/path` | added | new at the newer major |
 | `/$defs/persona_remit/properties/severity_cap` | added | new at the newer major |
@@ -879,6 +890,7 @@ Shape deltas only — a field whose description changed but whose type, required
 | `/$defs/review_convention/properties/severity_cap` | added | new at the newer major |
 | `/$defs/reviewer_persona` | added | new at the newer major |
 | `/$defs/reviewer_persona/properties/agent` | added | new at the newer major |
+| `/$defs/reviewer_persona/properties/decision_record` | added | new at the newer major |
 | `/$defs/reviewer_persona/properties/remit` | added | new at the newer major |
 | `/$defs/reviewers_config/properties/agent` | removed | present in the older major, absent at the newer |
 | `/$defs/reviewers_config/properties/agents` | changed | type "array of object"→"array of `agent_reviewer`" |
@@ -965,6 +977,8 @@ Shape deltas only — a field whose description changed but whose type, required
 | `/$defs/operator_agent/properties/model_policy` | removed | present in the older major, absent at the newer |
 | `/$defs/operator_agent/properties/must_page_human` | removed | present in the older major, absent at the newer |
 | `/$defs/operator_agent/properties/route_fixup_min_severity` | removed | present in the older major, absent at the newer |
+| `/$defs/persona_decision_record` | added | new at the newer major |
+| `/$defs/persona_decision_record/properties/index` | added | new at the newer major |
 | `/$defs/persona_remit` | added | new at the newer major |
 | `/$defs/persona_remit/properties/path` | added | new at the newer major |
 | `/$defs/persona_remit/properties/severity_cap` | added | new at the newer major |
@@ -981,6 +995,7 @@ Shape deltas only — a field whose description changed but whose type, required
 | `/$defs/review_convention/properties/severity_cap` | added | new at the newer major |
 | `/$defs/reviewer_persona` | added | new at the newer major |
 | `/$defs/reviewer_persona/properties/agent` | added | new at the newer major |
+| `/$defs/reviewer_persona/properties/decision_record` | added | new at the newer major |
 | `/$defs/reviewer_persona/properties/remit` | added | new at the newer major |
 | `/$defs/reviewers_config/properties/agent` | removed | present in the older major, absent at the newer |
 | `/$defs/reviewers_config/properties/agents` | changed | type "array of object"→"array of `agent_reviewer`" |

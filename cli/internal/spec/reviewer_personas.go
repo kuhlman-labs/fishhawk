@@ -23,8 +23,9 @@ import "fmt"
 //  1. checkReviewerPersonaDeclarations, after checkReviewConventionDeclarations
 //     and BEFORE the workflow loop, over the persona names in sorted order:
 //     the remit path rule (the review-conventions rule and reason strings,
-//     reviewConventionPathReason), then the persona agent's agent_version
-//     range syntax.
+//     reviewConventionPathReason), then the decision_record.index path rule
+//     when a decision_record is declared (the same rule, E78.5 / #3756), then
+//     the persona agent's agent_version range syntax.
 //  2. checkStageReviewerPersonas, inside the sorted stage loop after
 //     checkStageReviewConventions: the stage type must be plan or implement,
 //     then every attached name must resolve to a declared persona, then the
@@ -61,8 +62,9 @@ import "fmt"
 // was already rejected upstream.
 //
 // What stays backend-only is SelectReviewerPersonas and the
-// DeclarationSiteFmtReviewerPersonaRemit provenance string — the CLI
-// validates the grammar and runs no reviewer.
+// DeclarationSiteFmtReviewerPersonaRemit /
+// DeclarationSiteFmtReviewerPersonaDecisionRecord provenance strings — the
+// CLI validates the grammar and runs no reviewer.
 
 // PathFmtReviewerPersona is the reported path for a declaration or reference rejection (persona name).
 const PathFmtReviewerPersona = "/reviewer_personas/%s"
@@ -75,6 +77,9 @@ const PathFmtStageReviewerPersonaItem = "/workflows/%s/stages/%d/reviewers/perso
 
 // MsgFmtReviewerPersonaRemitPathInvalid rejects a persona remit path that is not a canonical repo-relative path (name, path, reason — one of the review-convention path reasons).
 const MsgFmtReviewerPersonaRemitPathInvalid = "reviewer_personas.%s: remit.path %q is not a canonical repo-relative path: %s; name the remit document relative to the repository root, slash-separated, with no empty, \".\" or \"..\" segment (e.g. docs/review/security-remit.md)"
+
+// MsgFmtReviewerPersonaDecisionRecordIndexPathInvalid rejects a persona decision_record.index path that is not a canonical repo-relative path (name, path, reason — one of the review-convention path reasons).
+const MsgFmtReviewerPersonaDecisionRecordIndexPathInvalid = "reviewer_personas.%s: decision_record.index %q is not a canonical repo-relative path: %s; name the decision-record index relative to the repository root, slash-separated, with no empty, \".\" or \"..\" segment (e.g. docs/adr/index.json)"
 
 // MsgFmtReviewerPersonaStageType rejects reviewers.personas on a stage type other than plan / implement (stage id, stage type).
 const MsgFmtReviewerPersonaStageType = "stage %q: reviewers.personas is valid only on a plan or implement stage, not a %q stage: only those two stages run the agent-review loop a persona joins, so this attachment would run no reviewer; move it onto a plan or implement stage (a file-level defaults.reviewers block carrying personas lands on every stage that inherits it — give this stage its own reviewers block)"
@@ -108,7 +113,8 @@ const MsgFmtEscalationReviewerNoRaiseFix = "Drop %q from the static reviewers.pe
 
 // checkReviewerPersonaDeclarations runs rung 1 over every declared persona in
 // sorted name order, reporting at most one entry per persona: the remit path
-// rule, then the persona agent's agent_version range.
+// rule, then the decision_record.index path rule, then the persona agent's
+// agent_version range.
 func checkReviewerPersonaDeclarations(root map[string]any, errs *[]ValidationErrorEntry) {
 	declared, ok := root["reviewer_personas"].(map[string]any)
 	if !ok {
@@ -126,6 +132,17 @@ func checkReviewerPersonaDeclarations(root map[string]any, errs *[]ValidationErr
 					*errs = append(*errs, ValidationErrorEntry{
 						Path:    ptr + "/remit/path",
 						Message: fmt.Sprintf(MsgFmtReviewerPersonaRemitPathInvalid, name, p, reason),
+					})
+					continue
+				}
+			}
+		}
+		if dr, ok := entry["decision_record"].(map[string]any); ok {
+			if idx, ok := dr["index"].(string); ok {
+				if reason := reviewConventionPathReason(idx); reason != "" {
+					*errs = append(*errs, ValidationErrorEntry{
+						Path:    ptr + "/decision_record/index",
+						Message: fmt.Sprintf(MsgFmtReviewerPersonaDecisionRecordIndexPathInvalid, name, idx, reason),
 					})
 					continue
 				}

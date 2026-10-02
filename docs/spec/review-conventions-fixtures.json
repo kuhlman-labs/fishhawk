@@ -1,5 +1,5 @@
 {
-  "$comment": "Canonical review_conventions AND reviewer_personas parity corpus (ADR-068 / E55.2 / #2243; ADR-084 / E55.8 / #3753 — the persona-* rows, rules in each module's reviewer_personas.go; ADR-084 D2(c) / E55.9 / #3754 — the persona-escalation-* rows, the escalation require.reviewers rungs in the backend's escalation.go and the CLI's validate.go checkEscalations). The review_conventions grammar is validated by TWO implementations that cannot import each other across the backend/cli module wall: the typed backend layer (backend/internal/spec: ParseBytes -> version-routed schema -> typed decode under DisallowUnknownFields -> v2 reuse resolution -> Validate, rules in review_conventions.go) and the CLI's raw-map port (cli/internal/spec: ValidateBytes -> schema -> reuse -> semantic sweep, rules in review_conventions.go). This file is the shared proof surface: each module runs EVERY row through its REAL parse path and asserts the SAME verdict — TestReviewConventionsCorpus_BackendMatches and TestReviewConventionsCorpus_CLIMatches. Row shape: name; optional note; doc (a complete workflow-v2 YAML document); valid; and, for a rejection, layer (schema | semantic) plus path (a JSON pointer). A semantic row also carries message, the EXACT rejection text: the backend's single ValidationError and the CLI's single ValidationErrorEntry must both equal path + message byte for byte. A schema row asserts only that the rejection lands at or under path (the backend reports one leaf, the CLI every leaf). Every rejection row triggers EXACTLY ONE rule, so the backend's first-error and the CLI's full list are comparable; a multi-error document is outside the parity claim. Mirrored verbatim into both modules' testdata/ by scripts/sync-schemas; CI's schema-sync gate red-lines any divergence between the three copies. Named *-fixtures.json (NOT *.schema.json) so the docs/spec/*.schema.json sync loop never globs it.",
+  "$comment": "Canonical review_conventions AND reviewer_personas parity corpus (ADR-068 / E55.2 / #2243; ADR-084 / E55.8 / #3753 — the persona-* rows, rules in each module's reviewer_personas.go; ADR-084 D2(c) / E55.9 / #3754 — the persona-escalation-* rows, the escalation require.reviewers rungs in the backend's escalation.go and the CLI's validate.go checkEscalations; ADR-084 D4(b) / E78.5 / #3756 — the persona-decision-record-* rows, the decision_record.index rung in each module's reviewer_personas.go). The review_conventions grammar is validated by TWO implementations that cannot import each other across the backend/cli module wall: the typed backend layer (backend/internal/spec: ParseBytes -> version-routed schema -> typed decode under DisallowUnknownFields -> v2 reuse resolution -> Validate, rules in review_conventions.go) and the CLI's raw-map port (cli/internal/spec: ValidateBytes -> schema -> reuse -> semantic sweep, rules in review_conventions.go). This file is the shared proof surface: each module runs EVERY row through its REAL parse path and asserts the SAME verdict — TestReviewConventionsCorpus_BackendMatches and TestReviewConventionsCorpus_CLIMatches. Row shape: name; optional note; doc (a complete workflow-v2 YAML document); valid; and, for a rejection, layer (schema | semantic) plus path (a JSON pointer). A semantic row also carries message, the EXACT rejection text: the backend's single ValidationError and the CLI's single ValidationErrorEntry must both equal path + message byte for byte. A schema row asserts only that the rejection lands at or under path (the backend reports one leaf, the CLI every leaf). Every rejection row triggers EXACTLY ONE rule, so the backend's first-error and the CLI's full list are comparable; a multi-error document is outside the parity claim. Mirrored verbatim into both modules' testdata/ by scripts/sync-schemas; CI's schema-sync gate red-lines any divergence between the three copies. Named *-fixtures.json (NOT *.schema.json) so the docs/spec/*.schema.json sync loop never globs it.",
   "rows": [
     {
       "name": "issue-example",
@@ -352,6 +352,37 @@
       "layer": "semantic",
       "path": "/reviewer_personas/security/agent/agent_version",
       "message": "agent_version comparator \"bogus\" must start with one of >=, >, <=, <, =, =="
+    },
+    {
+      "name": "persona-decision-record-index",
+      "note": "ADR-084 D4(b) / E78.5 / #3756: a persona opts into the decision-record selection by naming its index; additive-optional, so every persona-* row above (no decision_record) is unchanged",
+      "doc": "version: \"2\"\nreviewer_personas:\n  architect:\n    agent:\n      provider: anthropic\n    remit:\n      path: docs/review/architect-remit.md\n    decision_record:\n      index: docs/adr/index.json\nworkflows:\n  feature_change:\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n          personas: [architect]\n",
+      "valid": true
+    },
+    {
+      "name": "persona-decision-record-index-absent",
+      "note": "schema: decision_record requires index",
+      "doc": "version: \"2\"\nreviewer_personas:\n  architect:\n    agent:\n      provider: anthropic\n    remit:\n      path: docs/review/architect-remit.md\n    decision_record: {}\nworkflows:\n  feature_change:\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n          personas: [architect]\n",
+      "valid": false,
+      "layer": "schema",
+      "path": "/reviewer_personas/architect/decision_record"
+    },
+    {
+      "name": "persona-decision-record-unknown-field",
+      "note": "schema: decision_record is additionalProperties false (no inline record text, no per-persona cap knob)",
+      "doc": "version: \"2\"\nreviewer_personas:\n  architect:\n    agent:\n      provider: anthropic\n    remit:\n      path: docs/review/architect-remit.md\n    decision_record:\n      index: docs/adr/index.json\n      cap_bytes: 4096\nworkflows:\n  feature_change:\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n          personas: [architect]\n",
+      "valid": false,
+      "layer": "schema",
+      "path": "/reviewer_personas/architect/decision_record"
+    },
+    {
+      "name": "persona-decision-record-index-path-absolute",
+      "note": "schema-valid (index is minLength 1 only); only the review-conventions canonical path rule, applied at the persona declaration site after the remit rule, refuses it",
+      "doc": "version: \"2\"\nreviewer_personas:\n  architect:\n    agent:\n      provider: anthropic\n    remit:\n      path: docs/review/architect-remit.md\n    decision_record:\n      index: /docs/adr/index.json\nworkflows:\n  feature_change:\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n          personas: [architect]\n",
+      "valid": false,
+      "layer": "semantic",
+      "path": "/reviewer_personas/architect/decision_record/index",
+      "message": "reviewer_personas.architect: decision_record.index \"/docs/adr/index.json\" is not a canonical repo-relative path: it is absolute; name the decision-record index relative to the repository root, slash-separated, with no empty, \".\" or \"..\" segment (e.g. docs/adr/index.json)"
     },
     {
       "name": "persona-acceptance-stage",
