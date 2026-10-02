@@ -1429,9 +1429,9 @@ func deref(s *string) string {
 
 // runPlanReviews resolves the plan stage's review config and dispatches
 // the review agents. It does the request-scoped reads (GetRun,
-// resolveStageReviewers, plan.Parse, the declared-document resolution of
-// resolveReviewInjectedDocuments, prompt.Build) on the caller's context, then
-// branches on authority:
+// resolveStageReviewers, plan.Parse, the declared-document and
+// review-convention resolution of resolveReviewDocuments, prompt.Build) on the
+// caller's context, then branches on authority:
 //
 //   - gating (reviewers.agent>0 && human==0): runs the review loop
 //     SYNCHRONOUSLY. When any verdict is reject it transitions the stage
@@ -1452,7 +1452,16 @@ func deref(s *string) string {
 // plan stage cannot be resolved or attributed under gating authority (#2797):
 // the stage is failed category-B with a plan_review_document_injection_failed
 // reason and a plan_review_failed entry names the cause. Under advisory
-// authority the same failure records plan_review_failed and returns false.
+// authority the same failure records plan_review_failed and returns false. A
+// REQUIRED review convention (E55.3 / #2244) missing at the run's admission
+// commit is one such failure: its plan_review_failed reason reads
+// "document_injection_failed: review_convention_missing: ...".
+//
+// Review conventions the plan stage selects for this change (matched against
+// the run's admission change plus planGateScopePaths(plan)) render into the
+// prompt's supplemental conventions section, and every verdict is clamped to
+// their severity caps at ingest (runPlanReviewLoopWithConventions) BEFORE the
+// payload, the gating decision or the concern store read it.
 //
 // Returns false (no gating rejection) when:
 //   - no reviewer backend is configured (nil ReviewerSet or Default() nil)
@@ -1642,14 +1651,19 @@ func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, p
 	crewDeliveries := s.resolveDeliverableCrewMessages(ctx, runID, stageID, run.StageTypeReview)
 	trig.CrewMessages = crewDeliveries.Messages
 
-	// Repository documents declared for the PLAN stage under review (#2797):
+	// Repository documents declared for the PLAN stage under review (#2797),
+	// plus the review conventions it selects for this change (E55.3 / #2244):
 	// resolved, attributed and rendered through the same seam the /prompt
-	// endpoint uses. FAILS CLOSED — when the declared set cannot be resolved or
-	// attributed no reviewer runs on a document-less prompt: the failure is
-	// recorded as plan_review_failed (reason document_injection_failed: …) and,
-	// under gating authority, the stage fails category-B because no human gate
-	// stands behind the agent verdict. No plan_review_started is emitted.
-	injected, err := s.resolveReviewInjectedDocuments(ctx, runRow, stageID)
+	// endpoint uses. Convention selection matches the run's admission change
+	// (trigger + issue labels) with the plan's scope paths — the SAME admission
+	// change the implement-review site uses, so a label- or trigger-only
+	// applies_to selects at both. FAILS CLOSED — when the declared set cannot be
+	// resolved or attributed, or a REQUIRED convention is missing at the
+	// admission commit, no reviewer runs on a document-less prompt: the failure
+	// is recorded as plan_review_failed (reason document_injection_failed: …)
+	// and, under gating authority, the stage fails category-B because no human
+	// gate stands behind the agent verdict. No plan_review_started is emitted.
+	docs, err := s.resolveReviewDocuments(ctx, runRow, stageID, spec.StageTypePlan, planGateScopePaths(parsedPlan))
 	if err != nil {
 		treeCleanup()
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "plan review: document injection failed — no reviewer dispatched",
@@ -1679,7 +1693,10 @@ func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, p
 		}
 		return true
 	}
+	injected := docs.Injected
 	trig.InjectedDocuments = injected
+	trig.ReviewConventions = docs.Conventions
+	round := docs.Round
 
 	promptText, err := prompt.Build("plan_review", trig)
 	if err != nil {
@@ -1755,7 +1772,7 @@ func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, p
 		go func() {
 			defer s.bgReviews.Done()
 			defer treeCleanup()
-			s.runPlanReviewLoop(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel, stageBudget, treeDir)
+			s.runPlanReviewLoopWithConventions(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel, stageBudget, treeDir, round)
 		}()
 		return false
 	}
@@ -1765,7 +1782,7 @@ func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, p
 	// (deferred) because the loop runs to completion before runPlanReviews
 	// returns, so the export is live for every reviewer and removed right after.
 	defer treeCleanup()
-	hasRejection := s.runPlanReviewLoop(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel, stageBudget, treeDir)
+	hasRejection := s.runPlanReviewLoopWithConventions(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel, stageBudget, treeDir, round)
 	if hasRejection {
 		cat := run.FailureB
 		reason := "plan_review_rejected: agent review verdict reject under gating authority"
@@ -2224,7 +2241,27 @@ func reviewerAgentVersionMismatch(inv reviewerInvocation, probedVersion string) 
 // ctx is the detached review context: per-invocation errors (including a
 // reviewer whose provider failed to resolve) are WARN-logged and skipped
 // so a transient reviewer failure doesn't strand the loop.
+//
+// It is the no-conventions round of runPlanReviewLoopWithConventions: the zero
+// reviewConventionRound still clamps a review-convention-category concern a
+// reviewer emits anyway (to low — no convention was rendered to justify it)
+// and leaves every standard category untouched.
 func (s *Server) runPlanReviewLoop(ctx context.Context, runID, stageID uuid.UUID, invocations []reviewerInvocation, authority planreview.AuthorityMode, promptText, authorModel string, reviewBudget planreview.ReviewBudget, treeDir string) bool {
+	return s.runPlanReviewLoopWithConventions(ctx, runID, stageID, invocations, authority, promptText, authorModel, reviewBudget, treeDir, reviewConventionRound{})
+}
+
+// runPlanReviewLoopWithConventions is runPlanReviewLoop with the round's
+// review-convention state (E55.3 / #2244). Each successful verdict is clamped
+// by planreview.ClampConventionSeverities against round.Caps IMMEDIATELY after
+// the reviewer returns — before the plan_reviewed payload, the gating
+// hasRejection decision or persistReviewConcerns read it — so a convention's
+// severity_cap holds whatever the model emitted: a reject resting only on
+// clamped highs is recorded as approve_with_concerns with
+// verdict_clamped_from=reject and does not fail a gating stage. The clamp runs
+// on a shallow copy, never on the reviewer's own verdict value, and every
+// lowered concern is WARN-logged with the run id and its category. Plan review
+// has no diff, so round.ModifiedFiles is unused here (no synthesis).
+func (s *Server) runPlanReviewLoopWithConventions(ctx context.Context, runID, stageID uuid.UUID, invocations []reviewerInvocation, authority planreview.AuthorityMode, promptText, authorModel string, reviewBudget planreview.ReviewBudget, treeDir string, round reviewConventionRound) bool {
 	systemKind := audit.ActorKind("system")
 	hasRejection := false
 	// pagedRejectAppended tracks whether THIS loop appended a page-class
@@ -2333,6 +2370,13 @@ func (s *Server) runPlanReviewLoop(ctx context.Context, runID, stageID uuid.UUID
 			continue
 		}
 
+		// Ingest-time review-convention clamp (E55.3 / #2244). Runs on a
+		// shallow copy so the reviewer's own verdict value is never written.
+		clamped := *verdict
+		verdict = &clamped
+		clamp := planreview.ClampConventionSeverities(verdict, round.Caps)
+		s.logConventionClamps(ctx, "plan review", runID, stageID, i, clamp)
+
 		// Self-review guard (ADR-027): warn when the review agent's
 		// model matches the plan author's model. Warn-only per ADR;
 		// the verdict is still recorded.
@@ -2363,6 +2407,9 @@ func (s *Server) runPlanReviewLoop(ctx context.Context, runID, stageID uuid.UUID
 			// The reviewer persona (#3753) that produced this verdict; empty
 			// for a standard reviewer (omitempty, byte-identical).
 			Persona: inv.personaName(),
+			// The reviewer's original verdict when the convention clamp
+			// downgraded it (E55.3 / #2244); empty otherwise (omitempty).
+			VerdictClampedFrom: clamp.VerdictClampedFrom,
 		}
 		payloadBytes, _ := json.Marshal(payload)
 		entry, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
@@ -2408,6 +2455,34 @@ func (s *Server) runPlanReviewLoop(ctx context.Context, runID, stageID uuid.UUID
 		s.notifyPageClass(ctx, runID, "plan_review")
 	}
 	return hasRejection
+}
+
+// logConventionClamps WARN-logs every concern the ingest-time review-convention
+// clamp lowered (E55.3 / #2244), naming the run, stage, reviewer index,
+// category, convention and the severity change, and whether the clamp fired
+// because ZERO conventions were rendered for the round. site prefixes the
+// message ("plan review" / "implement review").
+func (s *Server) logConventionClamps(ctx context.Context, site string, runID, stageID uuid.UUID, reviewerIndex int, res planreview.ClampResult) {
+	for _, c := range res.Clamped {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, site+": review-convention concern severity clamped at ingest",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.Int("reviewer_index", reviewerIndex),
+			slog.String("category", c.Category),
+			slog.String("convention", c.Convention),
+			slog.String("from", string(c.From)),
+			slog.String("to", string(c.To)),
+			slog.Bool("no_conventions_rendered", c.NoConventionsRendered),
+		)
+	}
+	if res.VerdictClampedFrom != "" {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, site+": review verdict downgraded by the review-convention clamp",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.Int("reviewer_index", reviewerIndex),
+			slog.String("verdict_clamped_from", string(res.VerdictClampedFrom)),
+		)
+	}
 }
 
 // resolveStageReviewers reads the run's workflow spec and returns the
