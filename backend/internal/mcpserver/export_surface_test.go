@@ -17,7 +17,7 @@ import (
 // FuncDecls, TypeSpecs and ValueSpecs), not transcribed, so a drift between
 // an estimate and reality would surface as a test written from the tree.
 //
-// The bulk of these 332 names are tool I/O request/response structs. The MCP
+// The bulk of these 340 names are tool I/O request/response structs. The MCP
 // SDK's jsonschema reflection requires each tool's input/output type — and
 // its fields — to be EXPORTED to build the tool's schema, so unexporting them
 // would break tool registration. In `package main` their exportedness was
@@ -249,6 +249,11 @@ var exportBaseline = []string{
 	"ListRunAuditFilter",
 	"ListRunsInput",
 	"ListRunsOutput",
+	// E79.1 / #3725: fishhawk_list_schedules' input and output (the output IS
+	// the client mirror of GET /v0/schedules) plus the two nested DTOs,
+	// exported for the SDK's jsonschema reflection like every DTO.
+	"ListSchedulesInput",
+	"ListSchedulesOutput",
 	"ListScopeAmendmentsInput",
 	"ListScopeAmendmentsOutput",
 	// E45.88 / #3623: the client wire mirror of the `observation` object on
@@ -406,6 +411,8 @@ var exportBaseline = []string{
 	"RunnerEvent",
 	"RuntimeCalibrationInput",
 	"RuntimeCalibrationOutput",
+	"ScheduleEntry",
+	"ScheduleOutcome",
 	"ScopeAmendmentItem",
 	"ScopeAmendmentPath",
 	// #2591: the {path, operation} entry an `amend` scope-completeness

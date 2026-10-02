@@ -38,10 +38,10 @@ consumes only the first two):
   `initialize` handshake, the public alias of the package-private
   `onboardingInstructions`.
 
-## Exported surface: why 336 identifiers, not 3
+## Exported surface: why 340 identifiers, not 3
 
-The package presents **336** exported top-level identifiers, but only the three
-above are intended entry points. The other 333 are the tool I/O
+The package presents **340** exported top-level identifiers, but only the three
+above are intended entry points. The other 337 are the tool I/O
 request/response structs. The MCP SDK's jsonschema reflection requires each
 tool's input/output type — and its exported fields — to build the tool's
 schema. Strictly it is the FIELDS that must be exported, not the type name:
@@ -2145,8 +2145,11 @@ rendered from the same accessor.
   the run's approval-gate / status comments land on that issue.
 - `issue_context` is valid with an **issue-anchored** source (`github_issue` or `on_demand`). Pairing it with `cli` or
   `ui` is refused locally with a clean tool error rather than round-tripped to a backend 400.
-- `scheduled` is deliberately NOT accepted: no scheduler exists to mint it, and a persistable-but-unmintable value is
-  the dead surface #2826 closes.
+- `scheduled` is deliberately NOT accepted: it is RESERVED to the in-process scheduler (E79.1 /
+  [#3725](https://github.com/kuhlman-labs/fishhawk/issues/3725)). The local mirror is derived from
+  `run.ValidTriggerSources()`, which excludes it, and `POST /v0/runs` refuses it `400 trigger_source_reserved` for any
+  caller but the scheduler, so no operator path can mint a `scheduled` run. What the scheduler started, skipped or was
+  refused is readable via `fishhawk_list_schedules`.
 
 ### `applies_to` routing and its audited override (E53.3 / [#2226](https://github.com/kuhlman-labs/fishhawk/issues/2226))
 
@@ -2615,3 +2618,13 @@ detail is absent.
 - **Every other refusal is the backend's.** The tool never re-derives confirmation state or re-checks the captain; an agent calling `confirm`/`lower` is refused by the backend's single guard (`delegation_agent_identity_refused`) and the `*apiError` is passed through with its code (`TestDelegationConfirmTool_BackendRefusalIsToolError`). The tool never sends `delegated`.
 - **Bounded (ADR-077).** `boundDelegationConfirmOutput`: B1 drops each workflow's `confirmation` / `lower_proposal` detail and a verb event's `payload`, keeping every `status` / `reason` / `current_content_hash`; B2 (read only) halves `workflows` from the tail while keeping `unconfirmed_workflows` WHOLE; the FLOOR drops every workflow entry and halves the unconfirmed id list until the MEASURED floor fits. Every elision names `GET /v0/repos/{owner}/{name}/delegation/confirmation`. `TestDelegationConfirmTool_BoundsEveryTier` drives each tier.
 - **Authorization.** The `/mcp` gate row (`backend/internal/server/mcpscopes.go`) is authenticated-only: `read` dials a route that checks no scope (the `fishhawk_delegation` precedent) and `confirm`/`lower` dial routes that enforce `write:approvals` themselves; no run-bound subject.
+
+## Scheduler visibility (`fishhawk_list_schedules`, [E79.1 / #3725](https://github.com/kuhlman-labs/fishhawk/issues/3725))
+
+`schedules.go` registers `fishhawk_list_schedules`, a read-only thin wrapper over `GET /v0/schedules?repo=` (`backend/internal/server/schedules.go`; the scheduler itself — window math, the `scheduled:<workflow_id>:<window>` Idempotency-Key, the three global-chain outcome categories — lives in `backend/internal/scheduler/README.md`, not here). The one `apiClient` method carrying the wire, `ListSchedules`, is declared in `schedules.go`, not `client.go`. The output (`ListSchedulesOutput`) IS the REST body's mirror plus an optional `elisions` block; it and its nested `ScheduleEntry` / `ScheduleOutcome` are exported for the SDK's jsonschema reflection (`export_surface_test.go`).
+
+- **Nothing re-derived.** Cron, window, next due time and `last_outcome` are the scheduler's; the tool forwards `repo` (falling back to `GITHUB_REPOSITORY`; neither → a local refusal with zero requests, `TestListSchedulesTool_RepoFallsBackToEnv`) and renders the answer. `enabled:false` (the deployment did not pass `--enable-scheduler`) is a normal 200, not an error.
+- **A refusal is a tool error, never an empty list.** An empty `schedules` array reads as "nothing is scheduled", the opposite of "we could not tell you", so 400 / 401 / 403 `repo_forbidden` / 503 surface as the typed `*apiError` (`TestListSchedulesTool_BackendRefusalIsToolError`).
+- **`schedules` is never null.** `ListSchedules` normalizes a null/absent array to `[]` because the reflected output schema types it as an array (`TestListSchedulesTool_NullSchedulesNormalized`); `TestListSchedulesTool_WireRoundTrip_RealSession` drives the registered tool over a real client session so the SDK's output-schema validation runs on both a populated and an `enabled:false` body.
+- **Bounded (ADR-077).** `boundListSchedulesOutput`: B1 caps `spec_error` and each `last_outcome.message` to 256 encoded bytes (an `oversized_capable` elision); B2 halves `schedules` from the TAIL of the `workflow_id`-ascending list (a `stored` elision). Both name `GET /v0/schedules?repo=…`. `TestListSchedulesTool_BoundsEveryTier` drives each tier at the 4 KiB floor, B2 over a real session.
+- **Authorization.** The `/mcp` gate row (`backend/internal/server/mcpscopes.go`) is `mcpScopeAuthenticatedOnly`, mirroring the handler: authenticated, no scope, the point-read repo-visibility DENY applied before the scheduler is consulted; no run-bound subject.
