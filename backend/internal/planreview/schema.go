@@ -72,6 +72,16 @@ func VerdictSchema() map[string]any {
 			// severity_clamped_from is deliberately NOT registered: only the
 			// ingest clamp stamps it, so a reviewer cannot emit it.
 			"convention": map[string]any{"type": "string"},
+			// QuotedPassage / DocumentRef (E55.10 / #3755): the exact passage a
+			// reviewer persona quotes from an injected document and that
+			// document's Source path, verified at ingest against the text the
+			// server injected (VerifyQuotedPassages). Optional, so the strict
+			// variant makes both nullable. Their server-internal companions
+			// quote_unverified, quote_verified_content_hash,
+			// persona_severity_cap and reviewer_role are deliberately NOT
+			// registered: only the ingest stamps them.
+			"quoted_passage": map[string]any{"type": "string"},
+			"document_ref":   map[string]any{"type": "string"},
 		},
 	}
 

@@ -405,7 +405,10 @@ wiring in `backend/internal/server` (`review_conventions.go`, `plan.go`,
   the rendered-name → `severity_cap` map (`""` = uncapped). Rules:
   - caps EMPTY (zero conventions rendered for the round — #2244 approval
     condition 2): every `repo_convention`, `conventions_override_attempt` and
-    `conventions_file_modified` concern clamps to `low`; never left unclamped.
+    `conventions_file_modified` concern clamps to `low`; never left unclamped —
+    except that `ClampConventionSeveritiesForRound(v, caps, true)` (a round whose
+    diff edits a declared conventions file, E55.10 / #3755) exempts
+    `conventions_file_modified` from this rule; see below.
     `ClampedConcern.NoConventionsRendered` marks these so the ingest site's WARN
     log can say so (the clamp itself is pure and does not log — the caller logs
     every `ClampResult.Clamped` record with the run id and category).
@@ -445,3 +448,54 @@ an UNCONSTRAINED decode path (`DecodeVerdict`, e.g. claudecode) a reviewer can
 still emit `severity_clamped_from` text; it is display-only and gates nothing.
 This is a quality aid under a protected declaration, not an adversary-proof
 control.
+
+### Persona concern ingest primitives (E55.10 / #3755, ADR-084 D3 / rule 3)
+
+Pure functions the server's ingest site (`backend/internal/server`) applies to
+a reviewer verdict before any payload, gating decision or concern persistence
+reads it. None logs; each returns a record the caller WARN-logs.
+
+- **Reviewer-emittable fields**: `Concern.QuotedPassage` (`quoted_passage`) and
+  `Concern.DocumentRef` (`document_ref`), registered as optional strings in
+  `VerdictSchema()` (nullable in the strict variant, pinned by
+  `TestVerdictSchema_QuotedPassageFields`). There is no `docs/spec` mirror of the
+  verdict schema, so no schema-sync applies.
+- **Server-internal markers** — `quote_unverified`,
+  `quote_verified_content_hash`, `persona_severity_cap`, `reviewer_role` — are
+  absent from the schema (`schemaExcludedTags`, pinned positively by
+  `TestVerdictSchema_OmitsPersonaIngestMarkers`) and all `omitempty`.
+- **`ClearPersonaIngestMarkers(v)`** zeroes those four markers on every concern
+  (copy-on-write). It runs on EVERY verdict first, because the unconstrained
+  `DecodeVerdict` path does not reject unknown keys and a reviewer could
+  otherwise pre-set them. `severity_clamped_from` is NOT scrubbed (the
+  pre-existing residual (c) above is unchanged).
+- **`VerifyQuotedPassages(v, docs)`** — for each concern with a non-blank
+  quote: verified iff `document_ref` (trimmed, leading `./` stripped) names a
+  `QuotedDocument` with non-blank `Text` and the whitespace-collapsed quote is a
+  **case-sensitive substring** of the whitespace-collapsed text (one altered
+  word fails). Verified stamps `quote_verified_content_hash` with that
+  document's `ContentHash`; unverified sets `quote_unverified`, lowers severity
+  to `low` and stamps `severity_clamped_from` (when it changed and none was
+  recorded). Failure modes, one per demotion record:
+  `document_ref_missing` | `document_unknown` | `document_text_unavailable` |
+  `passage_not_found`. `docs` is the invocation's OWN injected set (remit,
+  stage-injected documents, rendered review conventions), so a ref naming a
+  document injected elsewhere — or withheld — is `document_unknown` by design.
+  `Text` must be what the reviewer SAW (`repodoc.InjectedContent`), never the
+  server's framing. Residual: a very short quote (a single common word) can
+  verify trivially; the control bounds FABRICATED passages, not trivially-true
+  ones, and no minimum length is enforced.
+- **`ClampPersonaSeverities(v, cap)`** — `""`/`high` uncapped (no-op);
+  `medium`/`low` bound as themselves; an out-of-set cap fails closed to `low`.
+  Every concern above the cap (any category) is lowered, stamped
+  `severity_clamped_from` (if unset) and `persona_severity_cap`.
+- Both share the convention clamp's reject-downgrade rule
+  (`downgradeRejectWithoutHigh`): `reject` → `approve_with_concerns` only when a
+  `high` was lowered and none remains, reported as `VerdictClampedFrom`. Both
+  copy before writing and are idempotent.
+- **`ClampConventionSeveritiesForRound(v, caps, conventionsFileModified)`** is
+  the convention clamp for a round that knows whether its diff edits a declared
+  conventions file (the #2244 seam). With `true`, the empty-caps rule exempts
+  `conventions_file_modified` (server-observed evidence the finding is real);
+  every other rule is unchanged. `ClampConventionSeverities` delegates with
+  `false`, so existing callers are byte-identical.

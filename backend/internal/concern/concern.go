@@ -235,8 +235,46 @@ type Concern struct {
 	// that re-raises nothing (the common case), and '' for every row minted
 	// before migration 0069.
 	SettledRef string
-	CreatedAt  time.Time
-	UpdatedAt  time.Time
+	// ReviewerRole names WHICH reviewer raised the concern (E55.10 / #3755):
+	// a reviewer persona's name, ReviewerRoleStandard for the stage's standard
+	// reviewer, or '' — UNATTRIBUTED — for every row minted before migration
+	// 0092 and any concern written by a path that names no role. Stored
+	// verbatim (no backfill: a legacy row's role is unknowable). Compare
+	// identities through NormalizedReviewerRole, never on the raw value.
+	ReviewerRole string
+	// QuoteUnverified is true when the reviewer quoted a document passage the
+	// server could NOT find in the text it injected into that invocation; the
+	// concern was demoted to low at ingest (E55.10 / #3755). false for every
+	// row minted before migration 0092.
+	QuoteUnverified bool
+	// SeverityClampedFrom is the reviewer's original severity when ingest
+	// lowered it (persona severity_cap clamp or an unverified quote), '' when
+	// untouched and for every row minted before migration 0092.
+	SeverityClampedFrom string
+	CreatedAt           time.Time
+	UpdatedAt           time.Time
+}
+
+// ReviewerRoleStandard is the reviewer_role recorded for a concern raised by a
+// stage's standard (non-persona) reviewer (E55.10 / #3755). A persona-raised
+// concern records the persona's name instead.
+const ReviewerRoleStandard = "standard"
+
+// NormalizedReviewerRole maps a stored reviewer_role to the role used for
+// IDENTITY comparisons (E55.10 / #3755): the empty string (an unattributed legacy row, or a
+// concern written by a path naming no role) reads as ReviewerRoleStandard,
+// because every concern minted before reviewer personas existed was raised by
+// the standard reviewer, so a legacy row keeps today's identity behaviour.
+// Every other value — ReviewerRoleStandard or a persona name — is returned
+// verbatim after trimming surrounding whitespace.
+//
+// It is for comparisons ONLY: the stored value stays empty so the three-state
+// reading (empty = unattributed / standard / persona name) survives on the row.
+func NormalizedReviewerRole(role string) string {
+	if r := strings.TrimSpace(role); r != "" {
+		return r
+	}
+	return ReviewerRoleStandard
 }
 
 // MissingNoteMarker leads every synthesized stand-in for a blank reviewer
@@ -310,16 +348,26 @@ type RaisedConcern struct {
 	// common case for both.
 	NewEvidence string
 	SettledRef  string
+	// QuoteUnverified and SeverityClampedFrom carry the server's ingest
+	// markers (E55.10 / #3755) from the decoded-and-ingested verdict concern
+	// onto the persisted row: an unverified document quote, and the original
+	// severity when ingest lowered it. Zero values for an untouched concern.
+	QuoteUnverified     bool
+	SeverityClampedFrom string
 }
 
 // InsertRaisedParams bundles the inputs to InsertRaised: every concern
 // from ONE *_reviewed audit entry, stamped with the sequence
 // AppendChained returned for that entry.
 type InsertRaisedParams struct {
-	RunID                uuid.UUID
-	StageID              uuid.UUID
-	StageKind            string // StageKindPlan or StageKindImplement
-	ReviewerModel        string // empty -> stored NULL
+	RunID         uuid.UUID
+	StageID       uuid.UUID
+	StageKind     string // StageKindPlan or StageKindImplement
+	ReviewerModel string // empty -> stored NULL
+	// ReviewerRole is stamped on every concern of the entry (E55.10 / #3755):
+	// a persona name or ReviewerRoleStandard. Stored VERBATIM — '' is allowed
+	// and stored as '' (unattributed), never defaulted to standard here.
+	ReviewerRole         string
 	OriginReviewSequence int64
 	Concerns             []RaisedConcern
 }

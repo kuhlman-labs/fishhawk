@@ -71,6 +71,43 @@ func ToPromptDocument(doc Document, f Framing) prompt.InjectedDocument {
 	}
 }
 
+// InjectedContent returns the document text an injected block SHOWED the
+// agent — the neutralized body between the BEGIN and END delimiter lines that
+// ToPromptDocument rendered — and true; or "" and false when doc's Body
+// carries no delimiter pair (a WithheldNotice, or a block not rendered by
+// this package). It is the text a reviewer's quoted passage is verified
+// against at ingest (E55.10 / #3755), so a quote is matched against exactly
+// the bytes the reviewer saw and NEVER against the server's own framing
+// (heading, preamble, trust note, data clause, Source line).
+//
+// The bracket is unambiguous because neutralizeBody guarantees no delimiter
+// LINE survives inside the content: the FIRST "\n"+BEGIN+"\n" is the
+// framing's own (nothing above it can carry a newline-bounded delimiter —
+// metadata is sanitized to one line), and the LAST "\n"+END line, followed by
+// nothing but whitespace, is the closing one. A delimiter string appearing
+// mid-line inside the content is content, and is returned as such. The
+// returned text is what the agent saw: a neutralization note replaces a
+// forged-delimiter line, and a truncated document includes its marker.
+func InjectedContent(doc prompt.InjectedDocument) (string, bool) {
+	body := doc.Body
+	open := "\n" + beginDelimiter + "\n"
+	i := strings.Index(body, open)
+	if i < 0 {
+		return "", false
+	}
+	start := i + len(open)
+	closeLine := "\n" + endDelimiter
+	j := strings.LastIndex(body, closeLine)
+	if j < start-1 || strings.TrimSpace(body[j+len(closeLine):]) != "" {
+		return "", false
+	}
+	if j < start {
+		// Empty content: the BEGIN line's newline is the END line's lead.
+		return "", true
+	}
+	return body[start:j], true
+}
+
 // renderBody renders everything below the heading.
 func renderBody(doc Document, f Framing) string {
 	var b strings.Builder
