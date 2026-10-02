@@ -1,0 +1,517 @@
+#!/usr/bin/env bash
+# Hermetic test for scripts/check-adr (E78.1 / #3722). Drives the REAL script
+# against temp-dir fixture ADR dirs, one case per named branch of the control,
+# each asserting the exit code AND that the output names the file plus the
+# offending key or value. Single-violation cases ALSO assert that the output
+# carries ONLY the intended violation class tag (`[C-...]`), so a check failing
+# for an unrelated reason — or a second check firing alongside — cannot green
+# it. House style follows scripts/test-site-ia: PASS/FAIL counters, non-zero
+# exit on any FAIL, no network, no Docker. Needs python3 (check-adr is python).
+# Run by `scripts/test verify` via _verify_gate_harnesses, and standalone.
+#
+# The base fixture is a valid two-record dir plus a README.md (exempt from the
+# stray-file check): ADR-001 (001-alpha.md) is superseded with superseded_by
+# [ADR-002] and a Decision 'Recorded 2026-04-30: X.'; ADR-002 (002-beta.md) is
+# accepted with supersedes [ADR-001], a BOLD Decision line (proving bold is not
+# stripped as an italic placeholder), and applies_to ["infra/terraform/**"]
+# whose stem its body names. index.json is a HAND-WRITTEN literal, never one
+# produced by --write-index, so a broken writer and a broken checker cannot
+# agree. Every mutation goes through `subst`, which FAILS the harness when the
+# text it replaces is absent, so a mutation that did not land is a setup
+# failure and never a silent false PASS.
+#
+# FIXTURE ISOLATION (operator binding condition 1). h4 and h14 co-mutate the
+# PARTNER record's supersede link and its hand-written index entry so exactly
+# one branch disagrees: h4 re-declares 002's id as ADR-003 AND sets
+# ADR-001.superseded_by to [ADR-003] (both index entries edited), so C-ref
+# cannot fire alongside C-id; h14 empties ADR-001.superseded_by AND
+# ADR-002.supersedes (both index entries edited), so C-recip-fwd cannot fire
+# alongside C-superseded. Both assert the output names ONLY the intended class.
+#
+# ---------------------------------------------------------------------------
+# COUNTERFACTUALS — run EMPIRICALLY: each mutated scripts/check-adr's BODY (or
+# scripts/test's call site), ran this harness, observed the named case(s) RED,
+# then restored byte-identically (`cmp` against a pre-mutation copy plus
+# `git diff --stat -- scripts/check-adr scripts/test` clean). Observed REDs:
+#
+#   CF1  closed-set membership (C-status-set) made a no-op → h3 RED (status
+#        present as `bogus`, so the required-key check cannot catch it).
+#   CF2  required-key check skips status → h2 RED (membership runs only on a
+#        present value, so nothing else fires on the absent key).
+#   CF3  id-vs-filename comparison made a no-op → h4 RED (h4's index entries
+#        are edited to the declared id, so C-index stays silent).
+#   CF4  uniqueness check made a no-op → h5 RED (both duplicate files satisfy
+#        C-id and the index is keyed by path, so only C-unique sees it).
+#   CF5  forward reciprocity made a no-op → h6 RED.
+#   CF6  reverse reciprocity made a no-op → h7 RED.
+#   CF7  reference-existence check made a no-op → h8 RED (reciprocity skips
+#        unresolvable targets by construction, so it cannot mask it).
+#   CF8  index `missing` (per-record) branch made a no-op → h9 RED.
+#   CF8b index-file-missing branch made a no-op → h29 RED.
+#   CF9  index `extra` branch made a no-op → h10 RED.
+#   CF10 index `stale` branch made a no-op → h11 RED.
+#   CF11 italic-placeholder strip removed → h12 RED (`_To be recorded._` then
+#        satisfies `recorded`).
+#   CF12 whole C-accepted branch made a no-op → h12 and h13 RED.
+#   CF13 C-superseded made a no-op → h14 RED.
+#   CF14 applies_to stem-in-body check made a no-op → h15 RED; CF14b the
+#        empty-stem check made a no-op → h15b RED.
+#   CF15 stray-file branch made a no-op → h17 RED (notes.md then parses as a
+#        record: [C-frontmatter] + [C-index-missing] instead of ONLY [C-file]).
+#   CF16 enumeration-failure exit 2 replaced by a fall-through → h19 RED
+#        (exit 0 via the empty-dir fail-open).
+#   CF17 --write-index refusal guard removed → h21 RED (exit 0, index
+#        rewritten).
+#   CF18 the `_verify_adr_records` CALL deleted from cmd_verify (not the
+#        function) → scripts/test-verify-scope's 'a10 scoped/unscoped: ADR
+#        record gate ran' RED. Mechanism (operator binding condition 4): test-
+#        verify-scope's stub scripts/check-adr appends 'check-adr' to gate.log
+#        ONLY when invoked; with the call gone the stub never runs, so the a10
+#        grep finds nothing.
+#   CF19 `test-adr` removed from the _verify_gate_harnesses list → test-verify-
+#        scope's 'a10 scoped/unscoped: ADR harness ran' RED (same mechanism).
+#   CF20 grammar branches (condition 2), each made a no-op: unknown key → h23
+#        RED; duplicate key → h24 RED; list-key-given-scalar → h25 RED (C-applies
+#        + C-index-stale fire instead); scalar-key-given-list → h25b RED; date →
+#        h26 and h26b RED; self-reference half of C-ref → h27 RED.
+#   CF21 fenced-code tracking in decision_sections removed → h32 RED.
+#   CF22 C-applies trailing-'/' strip removed → h15c RED (and the committed
+#        tree RED on ADR-013/ADR-015, whose bodies name the dirs slash-less).
+#   CF23 line-1 '---' check made a no-op → h16b RED ([C-required] instead).
+#   CF24 schema_version comparison made a no-op → h30b RED.
+#   CF25 duplicate-path index check made a no-op → h30d RED.
+#   CF26 missing-ADR_DIR fail-open removed (fall-through) → h18 RED (exit 2).
+#   CF27 index read failure swallowed (returns no violations) → h31a RED.
+#   Not counterfactual-run: the unterminated-front-matter branch (deleting it
+#   crashes on close=None rather than greening — h16a still RED via no tag),
+#   the index not-JSON and entry-shape branches (h30a/h30c assert them), and
+#   the write-failure branch (h31b asserts it).
+# ---------------------------------------------------------------------------
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+CHECK="$REPO_ROOT/scripts/check-adr"
+PASS=0
+FAIL=0
+
+pass() { echo "PASS: $1"; PASS=$((PASS + 1)); }
+fail() { echo "FAIL: $1"; FAIL=$((FAIL + 1)); }
+
+tmproot=$(mktemp -d)
+trap 'rm -rf "$tmproot"' EXIT
+
+out=""
+status=0
+run_check() {
+  out="$("$CHECK" "$@" 2>&1)"
+  status=$?
+}
+
+# subst <file> <old> <new> — literal, exactly-once replacement. Aborts the
+# harness (exit 3) when <old> is absent or ambiguous: a mutation that did not
+# land must never surface as a PASS.
+subst() {
+  python3 - "$1" "$2" "$3" <<'PY' || { echo "SETUP FAILURE: subst on $1 did not land: $2" >&2; exit 3; }
+import sys
+path, old, new = sys.argv[1], sys.argv[2], sys.argv[3]
+text = open(path, encoding="utf-8").read()
+if text.count(old) != 1:
+    sys.exit(1)
+open(path, "w", encoding="utf-8").write(text.replace(old, new))
+PY
+}
+
+write_alpha() {
+  cat > "$1/001-alpha.md" <<'EOF'
+---
+id: ADR-001
+title: "Alpha decision"
+status: superseded
+date: 2026-04-30
+issue: https://example.invalid/issues/1
+supersedes: []
+superseded_by: ["ADR-002"]
+applies_to: []
+---
+
+# ADR-001: Alpha decision
+
+## Context
+
+Alpha context.
+
+## Decision
+
+Recorded 2026-04-30: X.
+
+## Consequences
+
+None.
+EOF
+}
+
+write_beta() {
+  cat > "$1/002-beta.md" <<'EOF'
+---
+id: ADR-002
+title: "Beta decision"
+status: accepted
+issue: https://example.invalid/issues/2
+supersedes: ["ADR-001"]
+superseded_by: []
+applies_to: ["infra/terraform/**"]
+---
+
+# ADR-002: Beta decision
+
+## Context
+
+Infrastructure lives under `infra/terraform/`.
+
+## Decision
+
+**Accepted 2026-05-01.** Y replaces ADR-001.
+
+## Consequences
+
+None.
+EOF
+}
+
+# The HAND-WRITTEN index literal. One entry per line so `subst` can target a
+# single record's field unambiguously.
+write_index() {
+  cat > "$1/index.json" <<'EOF'
+{
+  "schema_version": "adr-index-v1",
+  "records": [
+    {"id": "ADR-001", "title": "Alpha decision", "path": "docs/adr/001-alpha.md", "status": "superseded", "supersedes": [], "superseded_by": ["ADR-002"], "applies_to": []},
+    {"id": "ADR-002", "title": "Beta decision", "path": "docs/adr/002-beta.md", "status": "accepted", "supersedes": ["ADR-001"], "superseded_by": [], "applies_to": ["infra/terraform/**"]}
+  ]
+}
+EOF
+}
+
+# fixture <name> — build the valid base fixture into $tmproot/<name>, echo it.
+fixture() {
+  local d="$tmproot/$1"
+  mkdir -p "$d"
+  echo "# Fixture README — exempt from the stray-file check" > "$d/README.md"
+  write_alpha "$d"
+  write_beta "$d"
+  write_index "$d"
+  printf '%s' "$d"
+}
+
+# A standalone third record (no supersede links) plus its index entry, for
+# cases that must not disturb the alpha/beta links. $2 = id to declare.
+add_gamma() {
+  cat > "$1/003-gamma.md" <<EOF
+---
+id: $2
+title: "Gamma decision"
+status: accepted
+issue: https://example.invalid/issues/3
+supersedes: []
+superseded_by: []
+applies_to: []
+---
+
+# Gamma decision
+
+## Decision
+
+Approved.
+EOF
+  subst "$1/index.json" '"applies_to": ["infra/terraform/**"]}' \
+    '"applies_to": ["infra/terraform/**"]},
+    {"id": "'"$2"'", "title": "Gamma decision", "path": "docs/adr/003-gamma.md", "status": "accepted", "supersedes": [], "superseded_by": [], "applies_to": []}'
+}
+
+# expect_only <case> <class> <needle>... — exit 1, ONLY [<class>] tags in the
+# output, and every needle on a line carrying that tag.
+expect_only() {
+  local c="$1" cls="$2"; shift 2
+  if [ "$status" -ne 1 ]; then
+    fail "$c: exited $status (expected 1); output: $out"; return
+  fi
+  local tags
+  tags="$(printf '%s\n' "$out" | grep -oE '\[C-[a-z-]+\]' | sort -u | tr '\n' ' ')"
+  if [ "$tags" != "[$cls] " ]; then
+    fail "$c: expected ONLY [$cls], got: $tags; output: $out"; return
+  fi
+  local n
+  for n in "$@"; do
+    if ! printf '%s\n' "$out" | grep -F -- "[$cls]" | grep -qF -- "$n"; then
+      fail "$c: no [$cls] line names '$n'; output: $out"; return
+    fi
+  done
+  pass "$c"
+}
+
+# expect_has <case> <class> <needle> — exit 1 and a [<class>] line naming the
+# needle, other classes TOLERATED (for a malformed index entry, which is by
+# construction unkeyed and so also leaves its record without an entry).
+expect_has() {
+  if [ "$status" -ne 1 ]; then
+    fail "$1: exited $status (expected 1); output: $out"
+  elif ! printf '%s\n' "$out" | grep -F -- "[$2]" | grep -qF -- "$3"; then
+    fail "$1: no [$2] line names '$3'; output: $out"
+  else
+    pass "$1"
+  fi
+}
+
+# expect_ok <case> <needle> — exit 0 and the needle in the output.
+expect_ok() {
+  if [ "$status" -ne 0 ]; then
+    fail "$1: exited $status (expected 0); output: $out"
+  elif ! printf '%s\n' "$out" | grep -qF -- "$2"; then
+    fail "$1: output lacks '$2'; output: $out"
+  else
+    pass "$1"
+  fi
+}
+
+# --- h1: the valid fixture -----------------------------------------------------
+d="$(fixture h1)"; run_check "$d"
+expect_ok "h1: valid fixture exits 0 and names 2 records" "2 record(s) consistent"
+
+# --- h2: missing status (C-status-present) -------------------------------------
+d="$(fixture h2)"; subst "$d/001-alpha.md" $'status: superseded\n' ''
+run_check "$d"; expect_only "h2: missing status" C-status-present "001-alpha.md" "'status'"
+
+# --- h3: unknown status `bogus` (C-status-set); index edited to match ----------
+d="$(fixture h3)"; subst "$d/002-beta.md" 'status: accepted' 'status: bogus'
+subst "$d/index.json" '"path": "docs/adr/002-beta.md", "status": "accepted"' '"path": "docs/adr/002-beta.md", "status": "bogus"'
+run_check "$d"; expect_only "h3: unknown status" C-status-set "002-beta.md" "bogus"
+
+# --- h4: id/filename mismatch (C-id). Co-mutates ADR-001.superseded_by -> ------
+# [ADR-003] and both index entries so C-ref cannot fire alongside (condition 1).
+d="$(fixture h4)"; subst "$d/002-beta.md" 'id: ADR-002' 'id: ADR-003'
+subst "$d/001-alpha.md" 'superseded_by: ["ADR-002"]' 'superseded_by: ["ADR-003"]'
+subst "$d/index.json" '{"id": "ADR-002"' '{"id": "ADR-003"'
+subst "$d/index.json" '"superseded_by": ["ADR-002"]' '"superseded_by": ["ADR-003"]'
+run_check "$d"; expect_only "h4: id/filename mismatch, ONLY C-id" C-id "002-beta.md" "ADR-003"
+
+# --- h4b: id not of the form ADR-NNN (C-id format half) -------------------------
+d="$(fixture h4b)"; add_gamma "$d" "ADR-3"
+run_check "$d"; expect_only "h4b: malformed id" C-id "003-gamma.md" "not of the form ADR-NNN"
+
+# --- h5: duplicate id across two files (C-unique) -------------------------------
+d="$(fixture h5)"; cp "$d/001-alpha.md" "$d/001-gamma.md"
+subst "$d/index.json" '"applies_to": ["infra/terraform/**"]}' \
+  '"applies_to": ["infra/terraform/**"]},
+    {"id": "ADR-001", "title": "Alpha decision", "path": "docs/adr/001-gamma.md", "status": "superseded", "supersedes": [], "superseded_by": ["ADR-002"], "applies_to": []}'
+run_check "$d"; expect_only "h5: duplicate id" C-unique "001-gamma.md" "ADR-001"
+
+# --- h6: one-way supersedes, forward (C-recip-fwd). ADR-001 is accepted with a --
+# real Decision so C-superseded stays silent.
+d="$(fixture h6)"; subst "$d/001-alpha.md" 'status: superseded' 'status: accepted'
+subst "$d/001-alpha.md" 'superseded_by: ["ADR-002"]' 'superseded_by: []'
+subst "$d/index.json" '"status": "superseded", "supersedes": [], "superseded_by": ["ADR-002"]' '"status": "accepted", "supersedes": [], "superseded_by": []'
+run_check "$d"; expect_only "h6: one-way supersedes (forward)" C-recip-fwd "002-beta.md" "supersedes"
+
+# --- h7: one-way supersedes, reverse (C-recip-rev) ------------------------------
+d="$(fixture h7)"; subst "$d/002-beta.md" 'supersedes: ["ADR-001"]' 'supersedes: []'
+subst "$d/index.json" '"supersedes": ["ADR-001"]' '"supersedes": []'
+run_check "$d"; expect_only "h7: one-way supersedes (reverse)" C-recip-rev "001-alpha.md" "superseded_by"
+
+# --- h8: supersede reference to a nonexistent record (C-ref) --------------------
+d="$(fixture h8)"; subst "$d/002-beta.md" 'supersedes: ["ADR-001"]' 'supersedes: ["ADR-001", "ADR-099"]'
+subst "$d/index.json" '"supersedes": ["ADR-001"]' '"supersedes": ["ADR-001", "ADR-099"]'
+run_check "$d"; expect_only "h8: dangling supersede reference" C-ref "002-beta.md" "ADR-099"
+
+# --- h9: index omits a record (C-index-missing) ---------------------------------
+d="$(fixture h9)"
+subst "$d/index.json" ',
+    {"id": "ADR-002", "title": "Beta decision", "path": "docs/adr/002-beta.md", "status": "accepted", "supersedes": ["ADR-001"], "superseded_by": [], "applies_to": ["infra/terraform/**"]}' ''
+run_check "$d"; expect_only "h9: index omits a record" C-index-missing "index.json" "002-beta.md"
+
+# --- h10: index lists a missing file (C-index-extra) ----------------------------
+d="$(fixture h10)"
+subst "$d/index.json" '"applies_to": ["infra/terraform/**"]}' \
+  '"applies_to": ["infra/terraform/**"]},
+    {"id": "ADR-003", "title": "Ghost", "path": "docs/adr/003-ghost.md", "status": "accepted", "supersedes": [], "superseded_by": [], "applies_to": []}'
+run_check "$d"; expect_only "h10: index lists a missing file" C-index-extra "index.json" "003-ghost.md"
+
+# --- h11: index disagrees on status (C-index-stale) -----------------------------
+d="$(fixture h11)"
+subst "$d/index.json" '"path": "docs/adr/002-beta.md", "status": "accepted"' '"path": "docs/adr/002-beta.md", "status": "proposed"'
+run_check "$d"; expect_only "h11: index stale on status" C-index-stale "002-beta.md" "'status'"
+
+# --- h12: accepted with a placeholder-only Decision (C-accepted) ----------------
+d="$(fixture h12)"; subst "$d/002-beta.md" '**Accepted 2026-05-01.** Y replaces ADR-001.' '_To be recorded._'
+run_check "$d"; expect_only "h12: placeholder-only Decision" C-accepted "002-beta.md"
+
+# --- h13: accepted with no Decision section (C-accepted) ------------------------
+d="$(fixture h13)"; subst "$d/002-beta.md" $'## Decision\n\n**Accepted 2026-05-01.** Y replaces ADR-001.\n\n' ''
+run_check "$d"; expect_only "h13: no Decision section" C-accepted "002-beta.md"
+
+# --- h14: superseded with empty superseded_by (C-superseded). Co-mutates -------
+# ADR-002.supersedes -> [] and both index entries so C-recip-fwd cannot fire
+# alongside (condition 1).
+d="$(fixture h14)"; subst "$d/001-alpha.md" 'superseded_by: ["ADR-002"]' 'superseded_by: []'
+subst "$d/002-beta.md" 'supersedes: ["ADR-001"]' 'supersedes: []'
+subst "$d/index.json" '"superseded_by": ["ADR-002"]' '"superseded_by": []'
+subst "$d/index.json" '"supersedes": ["ADR-001"]' '"supersedes": []'
+run_check "$d"; expect_only "h14: superseded without successor, ONLY C-superseded" C-superseded "001-alpha.md" "superseded_by"
+
+# --- h15: applies_to stem absent from the body (C-applies) ----------------------
+d="$(fixture h15)"; subst "$d/002-beta.md" 'applies_to: ["infra/terraform/**"]' 'applies_to: ["infra/ghost/**"]'
+subst "$d/index.json" '"applies_to": ["infra/terraform/**"]' '"applies_to": ["infra/ghost/**"]'
+run_check "$d"; expect_only "h15: invented applies_to" C-applies "002-beta.md" "infra/ghost"
+
+# --- h15b: applies_to with an empty literal stem (C-applies) --------------------
+d="$(fixture h15b)"; subst "$d/002-beta.md" 'applies_to: ["infra/terraform/**"]' 'applies_to: ["**"]'
+subst "$d/index.json" '"applies_to": ["infra/terraform/**"]' '"applies_to": ["**"]'
+run_check "$d"; expect_only "h15b: empty applies_to stem" C-applies "002-beta.md" "empty literal stem"
+
+# --- h15c: a directory glob matches a body naming the dir WITHOUT a slash -------
+d="$(fixture h15c)"; subst "$d/002-beta.md" 'under `infra/terraform/`.' 'under `infra/terraform`.'
+run_check "$d"; expect_ok "h15c: dir/** stem matches a body naming dir with no trailing slash" "2 record(s) consistent"
+
+# --- h16: malformed front matter (C-frontmatter, C-grammar) ---------------------
+d="$(fixture h16a)"; add_gamma "$d" "ADR-003"; subst "$d/003-gamma.md" $'applies_to: []\n---\n' $'applies_to: []\n'
+run_check "$d"; expect_only "h16a: unterminated front matter" C-frontmatter "003-gamma.md" "unterminated"
+d="$(fixture h16b)"; add_gamma "$d" "ADR-003"; subst "$d/003-gamma.md" $'---\nid: ADR-003' $'id: ADR-003'
+run_check "$d"; expect_only "h16b: missing front matter" C-frontmatter "003-gamma.md" "missing front matter"
+d="$(fixture h16c)"; subst "$d/002-beta.md" $'superseded_by: []\n' $'superseded_by: []\nthis line is not key value\n'
+run_check "$d"; expect_only "h16c: unparseable front-matter line" C-grammar "002-beta.md" "this line is not key value"
+
+# --- h17: stray file (C-file) ---------------------------------------------------
+d="$(fixture h17)"; echo "notes" > "$d/notes.md"
+run_check "$d"; expect_only "h17: stray notes.md" C-file "notes.md"
+
+# --- h18: missing ADR_DIR / empty ADR_DIR fail open with a reason ---------------
+run_check "$tmproot/h18-does-not-exist"
+expect_ok "h18: missing ADR_DIR exits 0 with a reason" "does not exist"
+mkdir -p "$tmproot/h18b"; echo "# readme" > "$tmproot/h18b/README.md"
+run_check "$tmproot/h18b"
+expect_ok "h18b: ADR_DIR with no records and no index exits 0 with a reason" "nothing to check"
+
+# --- h19: ADR_DIR is a regular file -> exit 2, never 0 --------------------------
+echo "not a dir" > "$tmproot/h19-file"
+run_check "$tmproot/h19-file"
+if [ "$status" -ne 2 ]; then
+  fail "h19: ADR_DIR as a regular file exited $status (expected 2); output: $out"
+elif ! printf '%s\n' "$out" | grep -q 'FAILED'; then
+  fail "h19: no FAILED reason printed; output: $out"
+else
+  pass "h19: a failed enumeration exits 2 with a reason"
+fi
+
+# --- h20: --write-index regenerates a stale index -------------------------------
+d="$(fixture h20)"
+subst "$d/index.json" '"path": "docs/adr/002-beta.md", "status": "accepted"' '"path": "docs/adr/002-beta.md", "status": "proposed"'
+run_check --write-index "$d"
+if [ "$status" -ne 0 ]; then
+  fail "h20: --write-index on a stale index exited $status (expected 0); output: $out"
+else
+  run_check "$d"
+  expect_ok "h20: --write-index output passes a follow-up check" "2 record(s) consistent"
+fi
+
+# --- h21: --write-index refuses an invalid record, index untouched ---------------
+d="$(fixture h21)"; subst "$d/002-beta.md" 'status: accepted' 'status: bogus'
+cp "$d/index.json" "$tmproot/h21-index.before"
+run_check --write-index "$d"
+if [ "$status" -ne 1 ]; then
+  fail "h21: --write-index with an invalid record exited $status (expected 1); output: $out"
+elif ! cmp -s "$d/index.json" "$tmproot/h21-index.before"; then
+  fail "h21: --write-index rewrote index.json despite refusing; output: $out"
+elif ! printf '%s\n' "$out" | grep -q 'refusing to write'; then
+  fail "h21: no refusal reason printed; output: $out"
+else
+  pass "h21: --write-index refuses (exit 1) and leaves index.json byte-identical"
+fi
+
+# --- h22: _verify_adr_records skips with a reason when the gate is absent ------
+h22="$tmproot/h22"
+mkdir -p "$h22/scripts"
+h22out="$(
+  FISHHAWK_TEST_LIB_ONLY=1 source "$REPO_ROOT/scripts/test" >/dev/null 2>&1
+  set +e
+  ROOT="$h22"
+  _verify_adr_records 2>&1
+  printf 'STATUS=%s\n' "$?"
+)"
+if ! printf '%s\n' "$h22out" | grep -q 'STATUS=0'; then
+  fail "h22: _verify_adr_records did not return 0 with the gate absent; output: $h22out"
+elif ! printf '%s\n' "$h22out" | grep -q 'missing or not executable'; then
+  fail "h22: _verify_adr_records printed no skip reason; output: $h22out"
+else
+  pass "h22: verify skips the ADR gate with a reason when check-adr is absent"
+fi
+
+# --- h23-h27: grammar branches (operator binding condition 2) -------------------
+d="$(fixture h23)"; subst "$d/002-beta.md" $'superseded_by: []\n' $'superseded_by: []\nowner: someone\n'
+run_check "$d"; expect_only "h23: unknown key" C-grammar "002-beta.md" "unknown key 'owner'"
+
+d="$(fixture h24)"; subst "$d/002-beta.md" $'superseded_by: []\n' $'superseded_by: []\ntitle: "Beta decision"\n'
+run_check "$d"; expect_only "h24: duplicate key" C-grammar "002-beta.md" "duplicate key 'title'"
+
+d="$(fixture h25)"; subst "$d/002-beta.md" 'applies_to: ["infra/terraform/**"]' 'applies_to: "infra/terraform/**"'
+run_check "$d"; expect_only "h25: list key given a scalar" C-grammar "002-beta.md" "'applies_to': expected a list"
+d="$(fixture h25b)"; subst "$d/002-beta.md" 'title: "Beta decision"' 'title: ["Beta decision"]'
+run_check "$d"; expect_only "h25b: scalar key given a list" C-grammar "002-beta.md" "'title': expected a scalar"
+
+d="$(fixture h26)"; subst "$d/001-alpha.md" 'date: 2026-04-30' 'date: 2026-13-45'
+run_check "$d"; expect_only "h26: calendar-invalid date" C-grammar "001-alpha.md" "'date'"
+d="$(fixture h26b)"; subst "$d/001-alpha.md" 'date: 2026-04-30' 'date: April-30'
+run_check "$d"; expect_only "h26b: non-YYYY-MM-DD date" C-grammar "001-alpha.md" "'date'"
+
+d="$(fixture h27)"; subst "$d/002-beta.md" 'supersedes: ["ADR-001"]' 'supersedes: ["ADR-001", "ADR-002"]'
+subst "$d/index.json" '"supersedes": ["ADR-001"]' '"supersedes": ["ADR-001", "ADR-002"]'
+run_check "$d"; expect_only "h27: self-referencing supersedes" C-ref "002-beta.md" "names the record itself"
+
+# --- h28: two Decision sections — placeholder first, acceptance second (cond 3) --
+d="$(fixture h28)"
+subst "$d/002-beta.md" $'**Accepted 2026-05-01.** Y replaces ADR-001.\n\n## Consequences\n\nNone.\n' \
+  $'_To be recorded._\n\n## Consequences\n\nNone.\n\n## Addendum\n\n### Decision\n\nApproved as drafted.\n'
+run_check "$d"; expect_ok "h28: acceptance in a SECOND Decision section passes" "2 record(s) consistent"
+
+# --- h29: index.json missing while records exist (C-index-missing) -------------
+d="$(fixture h29)"; rm "$d/index.json"
+run_check "$d"; expect_only "h29: missing index.json" C-index-missing "index.json is missing"
+
+# --- h30: malformed index.json (C-index) ----------------------------------------
+d="$(fixture h30a)"; printf '{ not json' > "$d/index.json"
+run_check "$d"; expect_only "h30a: index.json not JSON" C-index "not valid JSON"
+d="$(fixture h30b)"; subst "$d/index.json" '"adr-index-v1"' '"adr-index-v0"'
+run_check "$d"; expect_only "h30b: wrong schema_version" C-index "schema_version"
+d="$(fixture h30c)"; subst "$d/index.json" '{"id": "ADR-001", "title": "Alpha decision", ' '{"id": "ADR-001", '
+# A malformed entry is unkeyed, so its record ALSO reports C-index-missing.
+run_check "$d"; expect_has "h30c: entry missing a field" C-index "records[0]"
+d="$(fixture h30d)"
+subst "$d/index.json" '"applies_to": ["infra/terraform/**"]}' \
+  '"applies_to": ["infra/terraform/**"]},
+    {"id": "ADR-002", "title": "Beta decision", "path": "docs/adr/002-beta.md", "status": "accepted", "supersedes": ["ADR-001"], "superseded_by": [], "applies_to": ["infra/terraform/**"]}'
+run_check "$d"; expect_only "h30d: duplicate path entry" C-index "duplicate entry"
+
+# --- h31: unreadable / unwritable index.json -> exit 2 --------------------------
+d="$(fixture h31)"; rm "$d/index.json"; mkdir "$d/index.json"
+run_check "$d"
+if [ "$status" -ne 2 ] || ! printf '%s\n' "$out" | grep -q 'FAILED'; then
+  fail "h31a: index.json unreadable (a directory) exited $status (expected 2 + FAILED); output: $out"
+else
+  pass "h31a: a failed index read exits 2 with a reason"
+fi
+run_check --write-index "$d"
+if [ "$status" -ne 2 ] || ! printf '%s\n' "$out" | grep -q 'FAILED'; then
+  fail "h31b: --write-index onto an unwritable index exited $status (expected 2 + FAILED); output: $out"
+elif [ -e "$d/index.json.tmp" ]; then
+  fail "h31b: --write-index left index.json.tmp behind"
+else
+  pass "h31b: a failed index write exits 2 with a reason and no temp left behind"
+fi
+
+# --- h32: a `#` line inside a fenced code block does not end a Decision section --
+d="$(fixture h32)"
+subst "$d/002-beta.md" '**Accepted 2026-05-01.** Y replaces ADR-001.' \
+  $'```sh\n# a shell comment, not a heading\n```\n\nAccepted 2026-05-01.'
+run_check "$d"; expect_ok "h32: fenced '#' line is not a heading" "2 record(s) consistent"
+
+echo
+echo "scripts/test-adr: $PASS passed, $FAIL failed"
+[ "$FAIL" -eq 0 ]

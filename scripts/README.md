@@ -2099,6 +2099,112 @@ clean report; c10 the commented-out-slug parser-limitation pin; c11
 pages agree). Both are bash and need no zsh guard. Long-form site contract:
 `site/README.md`.
 
+## ADR record gate (E78.1 / [#3722](https://github.com/kuhlman-labs/fishhawk/issues/3722))
+
+`docs/adr/` is the in-repo decision record: one file per ADR
+(`docs/adr/NNN-slug.md`) with a restricted-YAML front matter and the tracker
+body transcribed verbatim, plus `docs/adr/index.json`, the machine index that
+reviewers and the architect responder read through repodoc (which cannot list a
+directory). The format contract lives in `docs/adr/README.md`; this section is
+the gate contract.
+
+Two scripts, same shape as the IA gate:
+
+- **`scripts/check-adr [ADR_DIR]`** — the gate (python3, stdlib only, no
+  PyYAML, 3.8-compatible). `ADR_DIR` defaults to `<repo>/docs/adr`.
+- **`scripts/check-adr --write-index [ADR_DIR]`** — regenerates `index.json`.
+- **`scripts/test-adr`** — the bash harness that pins it, driving the real
+  script against temp-dir fixtures with a HAND-WRITTEN `index.json` (never one
+  produced by `--write-index`, so a broken writer and a broken checker cannot
+  agree).
+
+### Checks
+
+Records are every non-recursive `*.md` in `ADR_DIR` except `README.md`. Every
+violation prints as `check-adr: <file>: [<class>] <message>` before one
+non-zero exit — never first-hit-and-stop. Each class is a separate branch:
+
+- **C-frontmatter** — line 1 is `---` and a closing `---` line exists.
+- **C-grammar** — every front-matter line is `key: value`; the key is known;
+  no duplicate key; list keys take a JSON array, scalar keys do not; `date` is
+  a real `YYYY-MM-DD` date.
+- **C-required / C-status-present** — `id`, `title`, `status`, `issue`,
+  `supersedes`, `superseded_by`, `applies_to` are present (lists even when
+  empty). A missing `status` reports as C-status-present.
+- **C-file** — every non-README `*.md` is named `NNN-slug.md`; anything else
+  is a stray file.
+- **C-id** — `id` is `ADR-NNN` and equals `ADR-` + the filename prefix.
+- **C-status-set** — a PRESENT `status` is in
+  `{proposed, accepted, rejected, superseded, unknown}`.
+- **C-unique** — ids are unique across records.
+- **C-ref** — every `supersedes` / `superseded_by` id names an existing record
+  other than the record itself.
+- **C-recip-fwd / C-recip-rev** — `A.supersedes ∋ B ⇔ B.superseded_by ∋ A`,
+  one branch per direction; both skip targets C-ref rejects, so C-ref is
+  isolated.
+- **C-superseded** — `status: superseded` requires a non-empty `superseded_by`.
+- **C-accepted** — `status: accepted` requires SOME section whose heading
+  matches `^#{1,6}\s+Decision\b` (case-insensitive) to carry an acceptance word
+  (`accepted|approved|ratified|recorded|decided|adopt|adopted`, whole word)
+  after lines that are entirely one italic span are removed. A section runs to
+  the next heading of the same or higher level; `#` lines inside fenced code
+  blocks are not headings. A necessary-condition backstop, not proof.
+- **C-applies** — every `applies_to` entry has a non-empty literal stem (text
+  before the first of `* ? [ {`, minus one trailing `/`) that occurs verbatim
+  in the record body.
+- **C-index / C-index-missing / C-index-extra / C-index-stale** — `index.json`
+  parses as `{"schema_version": "adr-index-v1", "records": [...]}` with
+  well-formed, path-unique entries; then, keyed by PATH (never id): a record
+  with no entry, an entry naming no record file, an entry field disagreeing
+  with the record's front matter (named). A missing `index.json` while records
+  exist is C-index-missing. Comparison is semantic, list order significant;
+  a field the record fails to declare is left to C-required / C-grammar.
+
+### Exit codes, fail-opens, `--write-index`
+
+**0** = consistent, or a documented fail-open with a printed reason (`ADR_DIR`
+does not exist; `ADR_DIR` holds no `*.md` besides `README.md` and no
+`index.json`). **1** = violations. **2** = a FAILED enumeration, read or write
+(`ADR_DIR` naming a regular file, an unreadable record or index) — distinct
+from 1, so the gate never reports a clean tree it did not read.
+
+`--write-index` runs every record check (all but the index checks). On any
+violation it refuses with exit 1 and writes NOTHING; otherwise it writes
+`json.dumps(obj, indent=2, ensure_ascii=False)` + newline, records sorted by id,
+through a temp file + rename (a failed write exits 2 and removes the temp).
+
+### Testing
+
+`scripts/test-adr` runs one case per named branch, each asserting the exit
+code AND that the output names the file plus the offending key or value;
+single-violation cases also assert the output carries ONLY the intended class
+tag. h1 valid → 0; h2 missing status; h3 `bogus` status; h4 id/filename
+mismatch (partner link co-mutated so only C-id fires); h4b malformed id; h5
+duplicate id; h6/h7 one-way supersedes forward/reverse; h8 dangling reference;
+h9 index omits a record; h10 index lists a missing file; h11 index stale on
+status; h12 placeholder-only Decision; h13 no Decision; h14 superseded without
+successor (partner link co-mutated so only C-superseded fires); h15/h15b
+invented / empty `applies_to` stem; h15c `dir/**` matching a body naming `dir`;
+h16a/b/c unterminated / missing front matter, unparseable line; h17 stray
+`notes.md`; h18/h18b missing / empty `ADR_DIR` → 0 with reason; h19 `ADR_DIR`
+a regular file → 2; h20 `--write-index` on a stale index, then a clean check;
+h21 `--write-index` refusal leaves `index.json` byte-identical; h22
+`_verify_adr_records` skips with a reason when the gate is absent; h23–h27
+unknown key, duplicate key, scalar-vs-list both ways, invalid date, self
+reference; h28 two Decision sections, placeholder first → 0; h29 missing
+`index.json`; h30a–d malformed index; h31a/b index read / write failure → 2;
+h32 a `#` line in a fenced block is not a heading. The header records every
+counterfactual run against the gate.
+
+`scripts/test verify` runs BOTH: `test-adr` in `_verify_gate_harnesses`, and
+`check-adr` itself via `_verify_adr_records` (immediately after
+`_verify_site_ia`) against the committed tree. `_verify_adr_records` skips with
+a printed reason when `scripts/check-adr` is missing or not executable. A host
+without python3 fails the gate closed (exit 127) rather than skipping —
+`scripts/test verify` already requires python3 for `check-coverage.py`.
+`scripts/test-verify-scope` a10 asserts both legs run in scoped and unscoped
+mode.
+
 ## Helm chart render gate (`scripts/test-helm-render`, E62.2 / #2301)
 
 The fourth entry in `_verify_gate_harnesses`. `deploy/helm/fishhawk` is
