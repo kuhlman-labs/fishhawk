@@ -14313,13 +14313,43 @@ func TestImplementReview_Persona_GoldenStandardPromptAndOwnPersonaPrompt(t *test
 // and adapter: the round settles at configured_agents == 2 with two verdicts,
 // no dedupe, no double-count, and no supplemental re-invoke verdict (that pass
 // is triggered only by a re-invoke ship's exemption delta, never by a count).
+//
+// (C7, E55.10 / #3755) The shared adapter REJECTS on both prompts, keyed by
+// whether the prompt carries the remit, each with a DISTINCT concern under the
+// SAME model string: both concern sets persist, attributed reviewer_role
+// standard vs the persona name, and neither retires the other.
+//
+// Counterfactual: pass concern.ReviewerRoleStandard at ingestImplementReview's
+// persistReviewConcernsAs call — the persona's row is attributed standard:
+// RED.
 func TestImplementReview_Persona_SharedProviderSettlesAtTwo(t *testing.T) {
-	shared := approvingFake()
+	const stdNote, personaNote = "standard finding", "persona finding"
+	shared := &keyedReviewer{
+		model: "shared-model",
+		std: &planreview.ReviewVerdict{Verdict: planreview.VerdictReject, Concerns: []planreview.Concern{
+			{Severity: planreview.SeverityHigh, Category: "correctness", Note: stdNote},
+		}},
+		persona: &planreview.ReviewVerdict{Verdict: planreview.VerdictReject, Concerns: []planreview.Concern{
+			{Severity: planreview.SeverityHigh, Category: "security", Note: personaNote},
+		}},
+	}
 	s, au, runRow, implStage, _ := personaImplRun(t, personaSpec(personaSpecOpts{attachOn: "implement", personaProvider: "anthropic"}),
 		shared, shared, "anthropic/"+personaAgentModel)
+	cr := newFakeConcernRepo()
+	s.cfg.ConcernRepo = cr
 	s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, reviewInjectionDiff(), nil, "head-shared", nil)
-	if n := len(reviewerCalls(shared)); n != 2 {
+	if n := len(shared.calls); n != 2 {
 		t.Fatalf("shared adapter calls = %d, want 2", n)
+	}
+	rows := rowsByNote(t, cr, runRow.ID)
+	if len(rows) != 2 {
+		t.Fatalf("persisted concerns = %d, want 2 (one per reviewer)", len(rows))
+	}
+	for note, role := range map[string]string{stdNote: concern.ReviewerRoleStandard, personaNote: personaTestName} {
+		r := rows[note]
+		if r == nil || r.ReviewerRole != role || derefStr(r.ReviewerModel) != "shared-model" || r.State != concern.StateRaised {
+			t.Errorf("row %q = %+v, want reviewer_role %q, model shared-model, still raised", note, r, role)
+		}
 	}
 	started := decodeStarted(t, au, "implement_review_started")
 	verdicts := decodeImplementReviewed(t, au)
@@ -15083,5 +15113,73 @@ func TestRunImplementReviews_DuplicateDispatch_NoConventionResolution(t *testing
 	}
 	if n := len(reviewerCalls(reviewer)); n != 1 {
 		t.Errorf("reviewer calls = %d, want 1", n)
+	}
+}
+
+// (C9, E55.10 / #3755, the #2244 seam) With ZERO conventions rendered (nil
+// Caps), a reviewer's conventions_file_modified concern keeps its medium
+// severity on a HELD round whose diff modifies a declared conventions file —
+// the server observed the modification itself — and draws no clamp WARN; the
+// paired streaming round (no modified file) still lowers it to low.
+//
+// Counterfactual: pass false for conventionsFileModified at
+// clampImplementReviewVerdict's ClampConventionSeveritiesForRound call — the
+// held round's row drops to low: RED.
+func TestImplementReview_ConventionsFileModifiedSeam_EmptyCaps(t *testing.T) {
+	const note = "edits the declared conventions file"
+	for _, tc := range []struct {
+		name     string
+		modified []string
+		wantSev  string
+		wantWarn bool
+	}{
+		{"held round modifying a conventions file keeps medium", []string{"docs/conventions/go.md"}, "medium", false},
+		{"streaming round lowers it to low", nil, "low", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, repo, _, cr := gateViewServer(t)
+			logs := &bytes.Buffer{}
+			s.cfg.Logger = slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
+			runID, stageID := seedGateRun(t, repo), uuid.New()
+			rev := verdictFake(planreview.VerdictApproveWithConcerns, "m", planreview.Concern{
+				Severity: planreview.SeverityMedium, Category: planreview.ConventionsFileModifiedConcernCategory, Note: note,
+			})
+			s.runImplementReviewInvocationsWithConventions(context.Background(), runID, stageID,
+				[]reviewerInvocation{{reviewer: rev}}, planreview.AuthorityAdvisory, "prompt", "author-model", "", "",
+				planreview.DefaultReviewBudget, "", 0, reviewConventionRound{ModifiedFiles: tc.modified})
+			r := rowsByNote(t, cr, runID)[note]
+			if r == nil || r.Severity != tc.wantSev || r.ReviewerRole != concern.ReviewerRoleStandard {
+				t.Fatalf("row = %+v, want severity %s, role standard", r, tc.wantSev)
+			}
+			if got := strings.Contains(logs.String(), "review-convention concern severity clamped at ingest"); got != tc.wantWarn {
+				t.Errorf("clamp WARN present = %v, want %v:\n%s", got, tc.wantWarn, logs.String())
+			}
+		})
+	}
+}
+
+// (E55.10 / #3755) The server-SYNTHESIZED conventions_file_modified concern on
+// a held round carries the carrier invocation's reviewer_role on the
+// implement_reviewed payload, agreeing with the row persisted under that role.
+//
+// Counterfactual: delete the stampReviewerRole call in
+// synthesizeConventionsFileModified — the payload concern's reviewer_role is
+// empty while the row says standard: RED.
+func TestImplementReview_SynthesizedConventionsConcernCarriesRole(t *testing.T) {
+	s, repo, au, cr := gateViewServer(t)
+	runID, stageID := seedGateRun(t, repo), uuid.New()
+	s.runImplementReviewInvocationsWithConventions(context.Background(), runID, stageID,
+		[]reviewerInvocation{{reviewer: approvingFake()}}, planreview.AuthorityAdvisory, "prompt", "author-model", "", "",
+		planreview.DefaultReviewBudget, "", 0, reviewConventionRound{ModifiedFiles: []string{"docs/conventions/go.md"}})
+	verdicts := decodeImplementReviewed(t, au)
+	if len(verdicts) != 1 || !verdicts[0].ConventionsFileModifiedSynthesized || len(verdicts[0].Concerns) != 1 {
+		t.Fatalf("implement_reviewed = %+v, want one verdict carrying the synthesized concern", verdicts)
+	}
+	if got := verdicts[0].Concerns[0].ReviewerRole; got != concern.ReviewerRoleStandard {
+		t.Errorf("synthesized payload concern reviewer_role = %q, want %q", got, concern.ReviewerRoleStandard)
+	}
+	rows, _ := cr.ListByRun(context.Background(), runID)
+	if len(rows) != 1 || rows[0].ReviewerRole != concern.ReviewerRoleStandard {
+		t.Errorf("rows = %+v, want one attributed standard", rows)
 	}
 }

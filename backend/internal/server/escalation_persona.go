@@ -223,23 +223,28 @@ type escalationPersonaAttachmentEntry struct {
 	Fired       []int    `json:"fired"`
 	FiredKeys   []string `json:"fired_keys"`
 	ViaDiffOnly bool     `json:"via_diff_only"`
-	// AlsoStatic is true when the reviewed stage ALSO attaches the persona
-	// statically; it still runs exactly once.
-	AlsoStatic bool `json:"also_static"`
+	// AlsoStatic has THREE readings (E55.10 / #3755, carried from #3754):
+	// true — the reviewed stage ALSO attaches the persona statically (it
+	// still runs exactly once); false — the static set was resolved and does
+	// not attach it; key ABSENT (nil) — the static source DEGRADED
+	// (persona_stage_unresolvable), so whether it also attaches the persona is
+	// unknown and the payload says so rather than claiming false.
+	AlsoStatic *bool `json:"also_static,omitempty"`
 }
 
 // writeEscalationPersonaAttachedAudit records ONE escalation_persona_attached
 // entry for a review round whose fired escalations attached personas, stamped
 // on the reviewed stage. kind is the prompt kind ("plan_review" /
 // "implement_review"); static names the personas the reviewed stage attaches
-// statically.
+// statically; staticDegraded is true when that static set could not be
+// resolved, in which case every attachment's also_static is left ABSENT.
 //
 // BEST-EFFORT, like escalation_fired: attaching a persona is a RAISE (one more
 // reviewer), which has already happened by the time this is written, so an
 // audit-store outage must not cancel the review. A missing repository or a
 // failed append is WARN-logged NAMING the personas so the attachment is still
 // recoverable from the application log.
-func (s *Server) writeEscalationPersonaAttachedAudit(ctx context.Context, runRow *run.Run, stageID uuid.UUID, kind string, paths reviewPaths, res escalationPersonaResolution, static map[string]bool) {
+func (s *Server) writeEscalationPersonaAttachedAudit(ctx context.Context, runRow *run.Run, stageID uuid.UUID, kind string, paths reviewPaths, res escalationPersonaResolution, static map[string]bool, staticDegraded bool) {
 	entries := make([]escalationPersonaAttachmentEntry, 0, len(res.attachments))
 	names := make([]string, 0, len(res.attachments))
 	for _, a := range res.attachments {
@@ -248,7 +253,10 @@ func (s *Server) writeEscalationPersonaAttachedAudit(ctx context.Context, runRow
 			Fired:       make([]int, 0, len(a.Fired)),
 			FiredKeys:   make([]string, 0, len(a.Fired)),
 			ViaDiffOnly: res.viaDiffOnly[a.Persona],
-			AlsoStatic:  static[a.Persona],
+		}
+		if !staticDegraded {
+			also := static[a.Persona]
+			e.AlsoStatic = &also
 		}
 		for _, f := range a.Fired {
 			e.Fired = append(e.Fired, f.Index)
