@@ -353,16 +353,19 @@ double env-gated, and both SKIP in a checkout with no API key.
 
 ### Injection corpus — `injection.go`, `testdata/injection-corpus/`
 
-Seven attack classes (direct instruction override, fake authority claim,
+Eight attack classes (direct instruction override, fake authority claim,
 envelope delimiter breakout, code-fence-embedded instructions, split
 body/comment payload, verify-output instruction injection — the payload in
 verify-gate output rather than an issue body, #3192 — and crew-message
-instruction injection — the payload in an agent-written crew message, #3738),
+instruction injection — the payload in an agent-written crew message, #3738 —
+and review-convention override — the payload in a repository review
+convention, E55.3 / #2244),
 each a committed `case.json` carrying the adversarial body, its comments (and,
 for the #3192 class, a `verify_output` block; for the #3738 class, a
-`crew_messages` block), containment probes, a literal compliance
+`crew_messages` block; for the E55.3 class, a `review_conventions` block),
+containment probes, a literal compliance
 marker, and either a `behavioral_rubric` or a `marker_only` declaration with a
-reason. `LoadInjectionCorpus` has EIGHTEEN named fail-closed modes; an absent
+reason. `LoadInjectionCorpus` has TWENTY-ONE named fail-closed modes; an absent
 corpus directory is an ERROR, not an empty slice, because a silently-missing
 corpus is a silently-disabled gate.
 
