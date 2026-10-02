@@ -1,5 +1,5 @@
 {
-  "$comment": "Canonical review_conventions parity corpus (ADR-068 / E55.2 / #2243). The review_conventions grammar is validated by TWO implementations that cannot import each other across the backend/cli module wall: the typed backend layer (backend/internal/spec: ParseBytes -> version-routed schema -> typed decode under DisallowUnknownFields -> v2 reuse resolution -> Validate, rules in review_conventions.go) and the CLI's raw-map port (cli/internal/spec: ValidateBytes -> schema -> reuse -> semantic sweep, rules in review_conventions.go). This file is the shared proof surface: each module runs EVERY row through its REAL parse path and asserts the SAME verdict — TestReviewConventionsCorpus_BackendMatches and TestReviewConventionsCorpus_CLIMatches. Row shape: name; optional note; doc (a complete workflow-v2 YAML document); valid; and, for a rejection, layer (schema | semantic) plus path (a JSON pointer). A semantic row also carries message, the EXACT rejection text: the backend's single ValidationError and the CLI's single ValidationErrorEntry must both equal path + message byte for byte. A schema row asserts only that the rejection lands at or under path (the backend reports one leaf, the CLI every leaf). Every rejection row triggers EXACTLY ONE rule, so the backend's first-error and the CLI's full list are comparable; a multi-error document is outside the parity claim. Mirrored verbatim into both modules' testdata/ by scripts/sync-schemas; CI's schema-sync gate red-lines any divergence between the three copies. Named *-fixtures.json (NOT *.schema.json) so the docs/spec/*.schema.json sync loop never globs it.",
+  "$comment": "Canonical review_conventions AND reviewer_personas parity corpus (ADR-068 / E55.2 / #2243; ADR-084 / E55.8 / #3753 — the persona-* rows, rules in each module's reviewer_personas.go). The review_conventions grammar is validated by TWO implementations that cannot import each other across the backend/cli module wall: the typed backend layer (backend/internal/spec: ParseBytes -> version-routed schema -> typed decode under DisallowUnknownFields -> v2 reuse resolution -> Validate, rules in review_conventions.go) and the CLI's raw-map port (cli/internal/spec: ValidateBytes -> schema -> reuse -> semantic sweep, rules in review_conventions.go). This file is the shared proof surface: each module runs EVERY row through its REAL parse path and asserts the SAME verdict — TestReviewConventionsCorpus_BackendMatches and TestReviewConventionsCorpus_CLIMatches. Row shape: name; optional note; doc (a complete workflow-v2 YAML document); valid; and, for a rejection, layer (schema | semantic) plus path (a JSON pointer). A semantic row also carries message, the EXACT rejection text: the backend's single ValidationError and the CLI's single ValidationErrorEntry must both equal path + message byte for byte. A schema row asserts only that the rejection lands at or under path (the backend reports one leaf, the CLI every leaf). Every rejection row triggers EXACTLY ONE rule, so the backend's first-error and the CLI's full list are comparable; a multi-error document is outside the parity claim. Mirrored verbatim into both modules' testdata/ by scripts/sync-schemas; CI's schema-sync gate red-lines any divergence between the three copies. Named *-fixtures.json (NOT *.schema.json) so the docs/spec/*.schema.json sync loop never globs it.",
   "rows": [
     {
       "name": "issue-example",
@@ -221,6 +221,179 @@
       "valid": false,
       "layer": "schema",
       "path": "/workflows/feature_change/stages/0/reviewers/conventions/0"
+    },
+    {
+      "name": "persona-plan-and-implement",
+      "note": "ADR-084 rule 1: a persona declares a model configuration (the full reviewers.agents[] shape via $defs/agent_reviewer) and a remit document; attached by name on a plan and an implement stage",
+      "doc": "version: \"2\"\nreviewer_personas:\n  security:\n    agent:\n      provider: codex\n      model: gpt-5.2-codex\n      reasoning_effort: high\n      agent_version: \">=0.30 <0.31\"\n      optional: true\n    remit:\n      path: docs/review/security-remit.md\n      severity_cap: medium\n  perf:\n    agent:\n      provider: anthropic\n    remit:\n      path: .fishhawk/review/perf.md\nworkflows:\n  feature_change:\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n          personas: [security]\n      - id: implement\n        type: implement\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: pull_request\n        reviewers:\n          agents:\n            - provider: anthropic\n          personas: [security, perf]\n",
+      "valid": true
+    },
+    {
+      "name": "persona-defaults-inherited",
+      "note": "an attachment inherited through defaults.reviewers is folded onto the stage and counts there on BOTH validators (the backend resolver deletes defaults after folding; the CLI keeps defaults but counts attachments on stages only)",
+      "doc": "version: \"2\"\ndefaults:\n  reviewers:\n    agents:\n      - provider: anthropic\n    personas: [security]\nreviewer_personas:\n  security:\n    agent:\n      provider: anthropic\n    remit:\n      path: docs/review/security-remit.md\nworkflows:\n  feature_change:\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n",
+      "valid": true
+    },
+    {
+      "name": "persona-alongside-review-conventions",
+      "note": "the two families compose: one stage selects a convention for its standard reviewers and attaches a persona",
+      "doc": "version: \"2\"\nreview_conventions:\n  backend:\n    path: docs/conventions/backend.md\nreviewer_personas:\n  security:\n    agent:\n      provider: anthropic\n    remit:\n      path: docs/review/security-remit.md\nworkflows:\n  feature_change:\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n          conventions: [backend]\n          personas: [security]\n",
+      "valid": true
+    },
+    {
+      "name": "persona-unknown-provider",
+      "note": "the persona agent $refs $defs/agent_reviewer, so the reviewers.agents[] provider enum binds it",
+      "doc": "version: \"2\"\nreviewer_personas:\n  security:\n    agent:\n      provider: gemini\n    remit:\n      path: docs/review/security-remit.md\nworkflows:\n  feature_change:\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n          personas: [security]\n",
+      "valid": false,
+      "layer": "schema",
+      "path": "/reviewer_personas/security/agent/provider"
+    },
+    {
+      "name": "persona-agent-missing-provider",
+      "doc": "version: \"2\"\nreviewer_personas:\n  security:\n    agent:\n      model: claude-opus-5-5\n    remit:\n      path: docs/review/security-remit.md\nworkflows:\n  feature_change:\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n          personas: [security]\n",
+      "valid": false,
+      "layer": "schema",
+      "path": "/reviewer_personas/security/agent"
+    },
+    {
+      "name": "persona-agent-unknown-field",
+      "doc": "version: \"2\"\nreviewer_personas:\n  security:\n    agent:\n      provider: anthropic\n      temperature: 0\n    remit:\n      path: docs/review/security-remit.md\nworkflows:\n  feature_change:\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n          personas: [security]\n",
+      "valid": false,
+      "layer": "schema",
+      "path": "/reviewer_personas/security/agent"
+    },
+    {
+      "name": "persona-remit-absent",
+      "doc": "version: \"2\"\nreviewer_personas:\n  security:\n    agent:\n      provider: anthropic\nworkflows:\n  feature_change:\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n          personas: [security]\n",
+      "valid": false,
+      "layer": "schema",
+      "path": "/reviewer_personas/security"
+    },
+    {
+      "name": "persona-agent-absent",
+      "doc": "version: \"2\"\nreviewer_personas:\n  security:\n    remit:\n      path: docs/review/security-remit.md\nworkflows:\n  feature_change:\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n          personas: [security]\n",
+      "valid": false,
+      "layer": "schema",
+      "path": "/reviewer_personas/security"
+    },
+    {
+      "name": "persona-remit-path-absent",
+      "doc": "version: \"2\"\nreviewer_personas:\n  security:\n    agent:\n      provider: anthropic\n    remit:\n      severity_cap: low\nworkflows:\n  feature_change:\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n          personas: [security]\n",
+      "valid": false,
+      "layer": "schema",
+      "path": "/reviewer_personas/security/remit"
+    },
+    {
+      "name": "persona-remit-inline-text",
+      "note": "a remit names a repository file; there is no inline text alternative",
+      "doc": "version: \"2\"\nreviewer_personas:\n  security:\n    agent:\n      provider: anthropic\n    remit:\n      path: docs/review/security-remit.md\n      text: Look for injection.\nworkflows:\n  feature_change:\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n          personas: [security]\n",
+      "valid": false,
+      "layer": "schema",
+      "path": "/reviewer_personas/security/remit"
+    },
+    {
+      "name": "persona-remit-severity-cap-high",
+      "doc": "version: \"2\"\nreviewer_personas:\n  security:\n    agent:\n      provider: anthropic\n    remit:\n      path: docs/review/security-remit.md\n      severity_cap: high\nworkflows:\n  feature_change:\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n          personas: [security]\n",
+      "valid": false,
+      "layer": "schema",
+      "path": "/reviewer_personas/security/remit/severity_cap"
+    },
+    {
+      "name": "persona-bad-name-pattern",
+      "note": "a persona name follows the v2 snake_case identifier rule",
+      "doc": "version: \"2\"\nreviewer_personas:\n  Security:\n    agent:\n      provider: anthropic\n    remit:\n      path: docs/review/security-remit.md\nworkflows:\n  feature_change:\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n",
+      "valid": false,
+      "layer": "schema",
+      "path": "/reviewer_personas"
+    },
+    {
+      "name": "persona-empty-map",
+      "doc": "version: \"2\"\nreviewer_personas: {}\nworkflows:\n  feature_change:\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n",
+      "valid": false,
+      "layer": "schema",
+      "path": "/reviewer_personas"
+    },
+    {
+      "name": "persona-duplicate-attachment",
+      "doc": "version: \"2\"\nreviewer_personas:\n  security:\n    agent:\n      provider: anthropic\n    remit:\n      path: docs/review/security-remit.md\nworkflows:\n  feature_change:\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n          personas: [security, security]\n",
+      "valid": false,
+      "layer": "schema",
+      "path": "/workflows/feature_change/stages/0/reviewers/personas"
+    },
+    {
+      "name": "persona-empty-attachment-list",
+      "doc": "version: \"2\"\nreviewer_personas:\n  security:\n    agent:\n      provider: anthropic\n    remit:\n      path: docs/review/security-remit.md\nworkflows:\n  feature_change:\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n          personas: []\n      - id: implement\n        type: implement\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: pull_request\n        reviewers:\n          agents:\n            - provider: anthropic\n          personas: [security]\n",
+      "valid": false,
+      "layer": "schema",
+      "path": "/workflows/feature_change/stages/0/reviewers/personas"
+    },
+    {
+      "name": "persona-remit-path-absolute",
+      "note": "schema-valid (path is minLength 1 only); only the review-conventions canonical path rule refuses it",
+      "doc": "version: \"2\"\nreviewer_personas:\n  security:\n    agent:\n      provider: anthropic\n    remit:\n      path: /docs/review/security-remit.md\nworkflows:\n  feature_change:\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n          personas: [security]\n",
+      "valid": false,
+      "layer": "semantic",
+      "path": "/reviewer_personas/security/remit/path",
+      "message": "reviewer_personas.security: remit.path \"/docs/review/security-remit.md\" is not a canonical repo-relative path: it is absolute; name the remit document relative to the repository root, slash-separated, with no empty, \".\" or \"..\" segment (e.g. docs/review/security-remit.md)"
+    },
+    {
+      "name": "persona-remit-path-dot-segment",
+      "doc": "version: \"2\"\nreviewer_personas:\n  security:\n    agent:\n      provider: anthropic\n    remit:\n      path: docs/../security-remit.md\nworkflows:\n  feature_change:\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n          personas: [security]\n",
+      "valid": false,
+      "layer": "semantic",
+      "path": "/reviewer_personas/security/remit/path",
+      "message": "reviewer_personas.security: remit.path \"docs/../security-remit.md\" is not a canonical repo-relative path: it contains a \"..\" segment; name the remit document relative to the repository root, slash-separated, with no empty, \".\" or \"..\" segment (e.g. docs/review/security-remit.md)"
+    },
+    {
+      "name": "persona-agent-version-bad",
+      "note": "agent_version is any non-empty string to the schema; the range syntax check runs at the persona declaration site",
+      "doc": "version: \"2\"\nreviewer_personas:\n  security:\n    agent:\n      provider: codex\n      agent_version: bogus\n    remit:\n      path: docs/review/security-remit.md\nworkflows:\n  feature_change:\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n          personas: [security]\n",
+      "valid": false,
+      "layer": "semantic",
+      "path": "/reviewer_personas/security/agent/agent_version",
+      "message": "agent_version comparator \"bogus\" must start with one of >=, >, <=, <, =, =="
+    },
+    {
+      "name": "persona-acceptance-stage",
+      "doc": "version: \"2\"\nreviewer_personas:\n  security:\n    agent:\n      provider: anthropic\n    remit:\n      path: docs/review/security-remit.md\nworkflows:\n  feature_change:\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n          personas: [security]\n      - id: accept\n        type: acceptance\n        executor:\n          agent: claude-code\n        reviewers:\n          agents:\n            - provider: anthropic\n          personas: [security]\n",
+      "valid": false,
+      "layer": "semantic",
+      "path": "/workflows/feature_change/stages/1/reviewers/personas",
+      "message": "stage \"accept\": reviewers.personas is valid only on a plan or implement stage, not a \"acceptance\" stage: only those two stages run the agent-review loop a persona joins, so this attachment would run no reviewer; move it onto a plan or implement stage (a file-level defaults.reviewers block carrying personas lands on every stage that inherits it — give this stage its own reviewers block)"
+    },
+    {
+      "name": "persona-unknown-name",
+      "doc": "version: \"2\"\nreviewer_personas:\n  security:\n    agent:\n      provider: anthropic\n    remit:\n      path: docs/review/security-remit.md\nworkflows:\n  feature_change:\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n          personas: [ghost]\n      - id: implement\n        type: implement\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: pull_request\n        reviewers:\n          agents:\n            - provider: anthropic\n          personas: [security]\n",
+      "valid": false,
+      "layer": "semantic",
+      "path": "/workflows/feature_change/stages/0/reviewers/personas/0",
+      "message": "stage \"plan\": reviewers.personas names \"ghost\", which matches no entry in the top-level reviewer_personas map; declare it there (reviewer_personas.ghost: {agent: {provider: ...}, remit: {path: ...}}) or remove it from the attachment — a persona is declared, never auto-discovered"
+    },
+    {
+      "name": "persona-no-agent-reviewers",
+      "note": "no reviewers.authority and no reviewers.conventions on the stage, so neither sibling no-agents rule masks this one",
+      "doc": "version: \"2\"\nreviewer_personas:\n  security:\n    agent:\n      provider: anthropic\n    remit:\n      path: docs/review/security-remit.md\nworkflows:\n  feature_change:\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          human: 1\n          personas: [security]\n",
+      "valid": false,
+      "layer": "semantic",
+      "path": "/workflows/feature_change/stages/0/reviewers/personas",
+      "message": "stage \"plan\": reviewers.personas attaches reviewer personas but the stage configures no agent reviewers; a persona reviews IN ADDITION to the stage's standard reviewers and inherits their authority, so declare at least one entry under reviewers.agents, or remove reviewers.personas"
+    },
+    {
+      "name": "persona-unreferenced",
+      "doc": "version: \"2\"\nreviewer_personas:\n  security:\n    agent:\n      provider: anthropic\n    remit:\n      path: docs/review/security-remit.md\n  audit:\n    agent:\n      provider: anthropic\n    remit:\n      path: docs/review/audit-remit.md\nworkflows:\n  feature_change:\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n          personas: [security]\n",
+      "valid": false,
+      "layer": "semantic",
+      "path": "/reviewer_personas/audit",
+      "message": "reviewer_personas.audit is declared but no stage attaches it through reviewers.personas, so it would run no review — it is refused rather than silently accepted as a control that does something; attach it on a plan or implement stage, or remove the declaration"
+    },
+    {
+      "name": "persona-attached-only-in-unused-defaults",
+      "note": "the reuse asymmetry: the backend resolver deletes `defaults` after folding while the CLI keeps it, so the CLI counts attachments on stages only; every stage here declares its own reviewers, so nothing inherits the default attachment",
+      "doc": "version: \"2\"\ndefaults:\n  reviewers:\n    agents:\n      - provider: anthropic\n    personas: [security]\nreviewer_personas:\n  security:\n    agent:\n      provider: anthropic\n    remit:\n      path: docs/review/security-remit.md\nworkflows:\n  feature_change:\n    stages:\n      - id: plan\n        type: plan\n        executor:\n          agent: claude-code\n        produces:\n          - artifact: plan\n            schema: standard_v1\n        reviewers:\n          agents:\n            - provider: anthropic\n",
+      "valid": false,
+      "layer": "semantic",
+      "path": "/reviewer_personas/security",
+      "message": "reviewer_personas.security is declared but no stage attaches it through reviewers.personas, so it would run no review — it is refused rather than silently accepted as a control that does something; attach it on a plan or implement stage, or remove the declaration"
     }
   ]
 }

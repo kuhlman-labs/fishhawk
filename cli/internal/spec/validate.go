@@ -30,7 +30,13 @@ import (
 //     reviewers.conventions (plan / implement only, declared names only, an
 //     agent reviewer required), and every declared entry selected by some
 //     stage — run at the backend's three positions (declarations before the
-//     workflow loop, stage checks inside it, the reference check after it).
+//     workflow loop, stage checks inside it, the reference check after it);
+//   - the reviewer_personas family (ADR-084 / E55.8 / #3753,
+//     reviewer_personas.go): each declared persona's canonical remit.path and
+//     well-formed agent.agent_version, a stage's reviewers.personas (plan /
+//     implement only, declared names only, an agent reviewer required), and
+//     every declared persona attached by some stage — each rung run
+//     immediately after its review_conventions sibling, as the backend does.
 //
 // It operates on the yaml.v3-decoded map[string]any / []any tree (never
 // structs — this package carries no typed decode; the stage-reference
@@ -55,7 +61,9 @@ func validateAgentVersions(raw any) error {
 	// readable workflows map ranges over nothing rather than returning early,
 	// so the reference rung still runs, as the backend's does.
 	checkReviewConventionDeclarations(root, &errs)
+	checkReviewerPersonaDeclarations(root, &errs)
 	declaredConventions, _ := root["review_conventions"].(map[string]any)
+	declaredPersonas, _ := root["reviewer_personas"].(map[string]any)
 	workflows, _ := root["workflows"].(map[string]any)
 	for _, wfName := range sortedKeys(workflows) {
 		wfRaw := workflows[wfName]
@@ -85,10 +93,12 @@ func validateAgentVersions(raw any) error {
 			checkReviewerAgentVersions(st, base, &errs)
 			checkReviewerAuthority(st, base, &errs)
 			checkStageReviewConventions(st, wfName, i, declaredConventions, &errs)
+			checkStageReviewerPersonas(st, wfName, i, declaredPersonas, &errs)
 			checkStagePermissions(st, base, wfName, &errs)
 		}
 	}
 	checkReviewConventionsReferenced(root, &errs)
+	checkReviewerPersonasReferenced(root, &errs)
 	if len(errs) > 0 {
 		return &ValidationError{Errors: errs}
 	}
