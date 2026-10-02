@@ -138,6 +138,7 @@ The live major — write new specs here.
 | `defaults` | object | optional |  | FILE-LEVEL reuse defaults (E52.4 / #2216): the lowest rung of the same-document resolution ladder — file defaults -> extends base -> workflow defaults -> the stage's own declaration, later winning. Applied to every stage of every workflow in this document before schema validation, so an inherited executor satisfies $defs/stage's required list with no schema relaxation. MERGE SEMANTICS: `executor` and `budget` merge KEY-WISE (the receiving side wins per key) because they carry only execution parameters; `reviewers` is taken WHOLE from exactly one rung and is NEVER blended, because it determines review AUTHORITY (ADR-027) and a supplemented `human` key would silently convert a gating stage into an advisory one. Arrays REPLACE wholesale everywhere — a governance file never accumulates an approver or reviewer its author did not write. Cross-FILE inclusion (`include:`) is deliberately out of scope (ADR-067). This block is INLINED here and on $defs/workflow rather than factored into a shared $defs entry. That was originally FORCED: the interim v1->v2 copy-fidelity allow-list capped licensed divergent paths at ~15, and a shared $def would have spent a fourth. That check and its cap are RETIRED (#2320), so the duplication is now a free CHOICE rather than a constraint — it is kept because changing it would be churn, not a fix. Either way, the two inline bodies MUST be kept in sync: an edit to one is an edit to both. |
 | `test_conventions` | array of `test_convention` | optional |  | Optional per-repo test-location conventions that generalize the plan-gate test sweep (#1004) beyond the built-in Go (name.go -> name_test.go) and colocated-TypeScript defaults. Each entry maps production files matching a glob to candidate test-file path templates. Declared entries are ADDITIVE to the built-in defaults (Go + colocated TS stay covered regardless), so a repo typically declares only its Python / Ruby / parallel-tree conventions. Advisory-only and fail-open: the sweep never blocks a plan. Declared by workflow-v2; accepted whenever present (v2 has no minor chain — a field is accepted because the schema declares it, not because the document declared a high enough minor). |
 | `review_conventions` | object | optional |  | Named repo-declared review conventions (ADR-068 / E55.2 / #2243): a map from a snake_case convention name (^[a-z][a-z0-9_]*$, the v2 identifier rule — a non-matching key is refused as an additional property, the same idiom `workflows` uses) to one entry naming a repo-relative document that a review stage SELECTS by name through its `reviewers.conventions` list. A convention is DECLARED here and never auto-discovered — no file is read because it exists at a conventional path. Every declared entry must be selected by at least one stage of the RESOLVED document (one declared and selected nowhere is refused as a control that does nothing), and every selected name must resolve to an entry here; both rules, plus the canonical repo-relative path rule, are enforced at semantic validation by the backend and `fishhawk validate`. GRAMMAR ONLY in this change: nothing renders a convention into a reviewer prompt yet — rendering and severity_cap enforcement are #2244 (E55.3) and the review-prompt wiring is #2797. Declared by workflow-v2; accepted whenever present (v2 has no minor chain — a field is accepted because the schema declares it, not because the document declared a high enough minor). |
+| `reviewer_personas` | object | optional |  | Named reviewer personas (ADR-084 / E55.8 / #3753): a map from a snake_case persona name (^[a-z][a-z0-9_]*$, the v2 identifier rule — a non-matching key is refused as an additional property) to a persona declaring a model configuration and a remit document. A plan or implement stage ATTACHES personas by name through its `reviewers.personas` list; each attached persona runs as a SEPARATE reviewer invocation with its OWN prompt (the stage's review prompt plus the persona's remit), in addition to the stage's standard `reviewers.agents`, whose prompt is unchanged. A persona inherits the stage's review authority and counts toward the round's configured reviewers. A persona is DECLARED here and never auto-discovered. Every declared persona must be attached by at least one stage of the RESOLVED document (one declared and attached nowhere is refused as a control that does nothing), and every attached name must resolve to an entry here; both rules, plus the remit path rule and the persona agent's agent_version syntax, are enforced at semantic validation by the backend and `fishhawk validate`. Declared by workflow-v2; accepted whenever present (v2 has no minor chain — a field is accepted because the schema declares it, not because the document declared a high enough minor). |
 
 #### workflow-v2 — definitions
 
@@ -344,6 +345,34 @@ Forge-neutral approval predicate for an approval gate (E39.2 / #1707). At workfl
 | `member_of` | string | optional | minLength: `1` | A forge-neutral group (org or org/team) an approver must belong to. Optional now; annotated x-intended-required for promotion to required in a future major. |
 | `members` | array of string | optional |  | Explicit approver subjects as plain forge-neutral strings (plain identifiers, NOT GitHub-specific @-prefixed handles), keeping the approvals block forge-neutral. |
 
+##### `agent_reviewer`
+
+| Field | Type | Required | Constraints | Description |
+|---|---|---|---|---|
+| `provider` | string | required | enum: `anthropic`, `claudecode`, `codex` | Reviewer adapter to invoke. Must be configured in the deployment (FISHHAWKD_ANTHROPIC_API_KEY / FISHHAWKD_ENABLE_LOCAL_CLAUDE_REVIEWER / FISHHAWKD_ENABLE_CODEX_REVIEWER); a gating stage naming an unconfigured provider fails dispatch up front. |
+| `model` | string | optional |  | Model identifier passed to the adapter. Empty/absent falls back to the provider's deployment-configured default model. |
+| `reasoning_effort` | string | optional | enum: `low`, `medium`, `high`, `xhigh`, `max` | Reviewer reasoning-effort override (#1493; claudecode E28.5 / #3896). For a codex reviewer it is one rung of the per-reviewer ladder: deployment default (FISHHAWKD_CODEX_REASONING_EFFORT, a codex-only default) < this reasoning_effort; the resolved value is passed as a `-c model_reasoning_effort=<effort>` CLI override. For a claudecode reviewer this value alone is passed as `--effort <effort>` (no deployment-default rung; absent = today's spawn, no `--effort`). Ignored by the anthropic (API) adapter, which takes no reasoning-effort parameter. Declared by workflow-v2; accepted whenever present (v2 has no minor chain — a field is accepted because the schema declares it, not because the document declared a high enough minor). |
+| `agent_version` | string | optional | minLength: `1` | Optional semver comparator RANGE (a space-separated AND list, e.g. ">=0.30 <0.31") of this reviewer's agent CLI versions the workflow was validated against (E32.13 / #1743). Enforced ONLY for a codex reviewer, whose CLI version the backend probes before dispatch: a probed version OUTSIDE the range fails the review dispatch LOUDLY; an unprobeable version degrades and proceeds. The anthropic (SDK) and claudecode adapters take no CLI version and ignore it. A RANGE, not an exact pin — the binary pin stays a host concern via FISHHAWK_CODEX_BIN (#1741 / #1769); this field owns only the spec-level contract. Permanently optional; absent = no constraint. Declared by workflow-v2; accepted whenever present (v2 has no minor chain — a field is accepted because the schema declares it, not because the document declared a high enough minor). |
+| `optional` | boolean | optional | default: `false` | Per-reviewer degradation policy (#1495). The spec is authoritative for WHICH reviewers run; the FISHHAWKD_ANTHROPIC_API_KEY / FISHHAWKD_ENABLE_LOCAL_CLAUDE_REVIEWER / FISHHAWKD_ENABLE_CODEX_REVIEWER env flags are deployment CAPABILITY gates (is the provider available on this deployment), not policy switches. When this reviewer's provider is unavailable on this deployment, run creation NO LONGER hard-fails on the gap — the run is created and the reviewer degrades at the runtime review loop with a capability-framed *_review_skipped audit (distinct from a genuine reviewer error). false (default) means the deployment SHOULD run this reviewer: an unavailable provider surfaces LOUDLY (ERROR log + capability audit) but still does not block. true means a graceful, quiet advisory-skip when the provider is unavailable. The coarse case of NO reviewer backend configured at all on the deployment is a separate, deployment-wide misconfiguration and still hard-fails run creation irrespective of this flag. Declared by workflow-v2; accepted whenever present (v2 has no minor chain — a field is accepted because the schema declares it, not because the document declared a high enough minor). |
+
+##### `persona_remit`
+
+A reviewer persona's remit document (ADR-084 / E55.8 / #3753): the repo-relative file the persona reviews against, added to the persona's OWN prompt as an injected document resolved at the run's pinned admission commit. It reuses the E55.2 review-conventions machinery INLINE rather than naming a `review_conventions` entry — the same canonical repo-relative path rule and the same `severity_cap` closed set — and deliberately carries no `required` / `applies_to`: a remit that cannot be resolved at review time degrades ONLY the persona (it does not run and records a terminal `*_review_skipped` entry with reason `persona_remit_unavailable`), never the stage. There is no inline `text:` alternative (additionalProperties false).
+
+| Field | Type | Required | Constraints | Description |
+|---|---|---|---|---|
+| `path` | string | required | minLength: `1` | Repo-relative, slash-separated path of the remit document, e.g. `docs/review/security-remit.md`. Semantic validation (backend and `fishhawk validate`) applies the review-conventions path rule: an absolute path, a backslash, an empty / `.` / `..` segment, a non-canonical spelling and a control or line-separator character are refused. |
+| `severity_cap` | string | optional | enum: `low`, `medium` | Optional ceiling on the severity this persona may assign to a concern. ABSENT means UNCAPPED. The same closed set as a review convention's severity_cap (`high` would clamp nothing and is refused). GRAMMAR ONLY here: the clamp at verdict ingest is E55.10 (#3755). |
+
+##### `reviewer_persona`
+
+One named reviewer persona (ADR-084 / E55.8 / #3753). ADR-084 binding rule 1: "A named persona declares a model configuration and a remit document." `agent` is the model configuration — the SAME shape as one `reviewers.agents[]` entry ($defs/agent_reviewer), so provider, model, reasoning_effort, agent_version and optional mean exactly what they mean there; `remit` is the document the persona reviews against.
+
+| Field | Type | Required | Constraints | Description |
+|---|---|---|---|---|
+| `agent` | `agent_reviewer` | required |  |  |
+| `remit` | `persona_remit` | required |  |  |
+
 ##### `reviewers_config`
 
 Plan-review reviewers for plan stages (ADR-027). The `authority` property DECLARES whether agent reviewers can block; when it is ABSENT the count-derived DEFAULT governs, read on len(agents): len(agents)>0 && human==0 → gating (agent rejections block stage advancement); len(agents)>0 && human>0 → advisory (agent verdicts surfaced, cannot block human approval); len(agents)==0 → gateless. An explicit `authority` WINS over the counts. The bare `agent` integer count that v0/v1 accept is REMOVED in v2 (E52.3 / #2215) — `agents` is the sole agent-reviewer declaration and the effective agent count is len(agents). When the reviewers block is absent entirely NO reviewers are configured: Stage.Reviewers stays nil, the effective agent count is 0, and the stage resolves gateless. There is no {human:1} default — an absent block configures no reviewer authority, and a human approval requirement is declared by a stage gate of type approval, not by reviewers.human (E52.12 / #2322).
@@ -351,10 +380,11 @@ Plan-review reviewers for plan stages (ADR-027). The `authority` property DECLAR
 | Field | Type | Required | Constraints | Description |
 |---|---|---|---|---|
 | `authority` | string | optional | enum: `advisory`, `gating` | Explicit review-authority declaration (E53.2 / #2225): states whether this stage's AGENT reviewers can BLOCK stage advancement, instead of leaving it inferred from the reviewer counts. `gating` — an agent reject blocks advancement (no human approver overrides). `advisory` — agent verdicts are surfaced but cannot block; the human gate is authoritative. ABSENT reproduces the ADR-027 count-derived rule EXACTLY: len(agents)>0 && human==0 → gating; len(agents)>0 && human>0 → advisory; len(agents)==0 → gateless — so every existing spec keeps byte-identical gating behavior. An explicit value WINS over the counts: `gating` alongside `human: 1` gates, and `advisory` alongside `human: 0` stays advisory. `gateless` is NOT declarable — it is the zero-agent OUTCOME, not a policy; a declaration (either value) with no agent reviewers (an absent/empty `agents` list) is REJECTED at semantic validation in both the backend and the CLI with a message naming the stage and the fix. Declaring `gating` engages the run-creation reviewer-availability check, so a stage naming an unconfigured reviewer provider fails run creation up front. Declared by workflow-v2; accepted whenever present (v2 has no minor chain — a field is accepted because the schema declares it, not because the document declared a high enough minor). |
-| `agents` | array of object | optional | minItems: `1` | Heterogeneous agent reviewers (#955): one entry per reviewer invocation, each naming its provider and optionally its model. The effective agent count for the ADR-027 authority table is len(agents). Authority semantics are unchanged: heterogeneity changes WHO reviews, not gating semantics. |
+| `agents` | array of `agent_reviewer` | optional | minItems: `1` | Heterogeneous agent reviewers (#955): one entry per reviewer invocation, each naming its provider and optionally its model. The effective agent count for the ADR-027 authority table is len(agents). Authority semantics are unchanged: heterogeneity changes WHO reviews, not gating semantics. |
 | `human` | integer | optional | min: `0` | Number of human approvers required. 0 means no human approval gate for this plan stage. |
 | `review_timeout` | string | optional | pattern: `^([0-9]+(ns\|us\|ms\|s\|m\|h))+$` | Per-stage review-budget floor (#1494). The stage's review_timeout OVERRIDES the FISHHAWKD_PLAN_REVIEW_TIMEOUT deployment default — it sets the Floor rung of the size-aware review-wait budget (Floor + PerKB*ceil(promptKB), clamped to [Floor,Cap]) for this stage's agent reviews; the deployment-level PerKB and Cap are unchanged. Parsed by time.ParseDuration; an unparseable or absent value falls back to the FISHHAWKD_PLAN_REVIEW_TIMEOUT deployment default. Resolved by spec.ResolveReviewTimeout on the backend. Declared by workflow-v2; accepted whenever present (v2 has no minor chain — a field is accepted because the schema declares it, not because the document declared a high enough minor). |
 | `conventions` | array of string | optional | minItems: `1` | Review conventions this stage's agent reviewers are handed (ADR-068 / E55.2 / #2243): each item names an entry of the top-level `review_conventions` map, in the order the reviewer receives them. Semantic validation (backend and `fishhawk validate`) refuses a name that resolves to no declared entry, a selection on any stage type other than `plan` or `implement` (the only stages with a reviewer loop), and a selection on a stage configuring no agent reviewers. Travels with a `defaults.reviewers` block as part of the WHOLE reviewers value, so a file-level reviewers default carrying conventions is subject to the stage-type rule on every stage that inherits it. Grammar only in this change: rendering is #2244 (E55.3) and wiring is #2797. |
+| `personas` | array of string | optional | minItems: `1` | Reviewer personas attached to this stage (ADR-084 / E55.8 / #3753): each item names an entry of the top-level `reviewer_personas` map, and each attached persona reviews this stage as one extra reviewer invocation, in list order, after the standard `agents`. Semantic validation (backend and `fishhawk validate`) refuses a name that resolves to no declared persona, an attachment on any stage type other than `plan` or `implement` (the only stages with a reviewer loop), and an attachment on a stage configuring no agent reviewers (a persona reviews IN ADDITION to the standard reviewers and inherits their authority). Travels with a `defaults.reviewers` block as part of the WHOLE reviewers value, so a file-level reviewers default carrying personas is subject to the stage-type rule on every stage that inherits it. |
 
 ##### `escalation`
 
@@ -791,6 +821,12 @@ Shape deltas only — a field whose description changed but whose type, required
 | `/$defs/action_matrix` | added | new at the newer major |
 | `/$defs/action_matrix/properties/model_policy` | added | new at the newer major |
 | `/$defs/action_matrix/properties/page_human_on` | added | new at the newer major |
+| `/$defs/agent_reviewer` | added | new at the newer major |
+| `/$defs/agent_reviewer/properties/agent_version` | added | new at the newer major |
+| `/$defs/agent_reviewer/properties/model` | added | new at the newer major |
+| `/$defs/agent_reviewer/properties/optional` | added | new at the newer major |
+| `/$defs/agent_reviewer/properties/provider` | added | new at the newer major |
+| `/$defs/agent_reviewer/properties/reasoning_effort` | added | new at the newer major |
 | `/$defs/approvers` | removed | present in the older major, absent at the newer |
 | `/$defs/approvers/properties/all_of` | removed | present in the older major, absent at the newer |
 | `/$defs/approvers/properties/any_of` | removed | present in the older major, absent at the newer |
@@ -814,6 +850,9 @@ Shape deltas only — a field whose description changed but whose type, required
 | `/$defs/operator_agent/properties/model_policy` | removed | present in the older major, absent at the newer |
 | `/$defs/operator_agent/properties/must_page_human` | removed | present in the older major, absent at the newer |
 | `/$defs/operator_agent/properties/route_fixup_min_severity` | removed | present in the older major, absent at the newer |
+| `/$defs/persona_remit` | added | new at the newer major |
+| `/$defs/persona_remit/properties/path` | added | new at the newer major |
+| `/$defs/persona_remit/properties/severity_cap` | added | new at the newer major |
 | `/$defs/predicate` | added | new at the newer major |
 | `/$defs/predicate/properties/change_kind` | added | new at the newer major |
 | `/$defs/predicate/properties/labels` | added | new at the newer major |
@@ -825,9 +864,14 @@ Shape deltas only — a field whose description changed but whose type, required
 | `/$defs/review_convention/properties/path` | added | new at the newer major |
 | `/$defs/review_convention/properties/required` | added | new at the newer major |
 | `/$defs/review_convention/properties/severity_cap` | added | new at the newer major |
+| `/$defs/reviewer_persona` | added | new at the newer major |
+| `/$defs/reviewer_persona/properties/agent` | added | new at the newer major |
+| `/$defs/reviewer_persona/properties/remit` | added | new at the newer major |
 | `/$defs/reviewers_config/properties/agent` | removed | present in the older major, absent at the newer |
+| `/$defs/reviewers_config/properties/agents` | changed | type "array of object"→"array of `agent_reviewer`" |
 | `/$defs/reviewers_config/properties/authority` | added | new at the newer major |
 | `/$defs/reviewers_config/properties/conventions` | added | new at the newer major |
+| `/$defs/reviewers_config/properties/personas` | added | new at the newer major |
 | `/$defs/role` | removed | present in the older major, absent at the newer |
 | `/$defs/role/properties/members` | removed | present in the older major, absent at the newer |
 | `/$defs/stage/properties/constraints` | changed | type "array of `constraint`"→"`constraint`" |
@@ -848,6 +892,7 @@ Shape deltas only — a field whose description changed but whose type, required
 | `/$defs/workflow/properties/operator_agent` | removed | present in the older major, absent at the newer |
 | `/properties/defaults` | added | new at the newer major |
 | `/properties/review_conventions` | added | new at the newer major |
+| `/properties/reviewer_personas` | added | new at the newer major |
 | `/properties/roles` | removed | present in the older major, absent at the newer |
 | `/properties/version` | changed | enum members differ |
 
@@ -862,6 +907,12 @@ Shape deltas only — a field whose description changed but whose type, required
 | `/$defs/action_matrix` | added | new at the newer major |
 | `/$defs/action_matrix/properties/model_policy` | added | new at the newer major |
 | `/$defs/action_matrix/properties/page_human_on` | added | new at the newer major |
+| `/$defs/agent_reviewer` | added | new at the newer major |
+| `/$defs/agent_reviewer/properties/agent_version` | added | new at the newer major |
+| `/$defs/agent_reviewer/properties/model` | added | new at the newer major |
+| `/$defs/agent_reviewer/properties/optional` | added | new at the newer major |
+| `/$defs/agent_reviewer/properties/provider` | added | new at the newer major |
+| `/$defs/agent_reviewer/properties/reasoning_effort` | added | new at the newer major |
 | `/$defs/approvals` | added | new at the newer major |
 | `/$defs/approvals/properties/count` | added | new at the newer major |
 | `/$defs/approvals/properties/member_of` | added | new at the newer major |
@@ -895,6 +946,9 @@ Shape deltas only — a field whose description changed but whose type, required
 | `/$defs/operator_agent/properties/model_policy` | removed | present in the older major, absent at the newer |
 | `/$defs/operator_agent/properties/must_page_human` | removed | present in the older major, absent at the newer |
 | `/$defs/operator_agent/properties/route_fixup_min_severity` | removed | present in the older major, absent at the newer |
+| `/$defs/persona_remit` | added | new at the newer major |
+| `/$defs/persona_remit/properties/path` | added | new at the newer major |
+| `/$defs/persona_remit/properties/severity_cap` | added | new at the newer major |
 | `/$defs/predicate` | added | new at the newer major |
 | `/$defs/predicate/properties/change_kind` | added | new at the newer major |
 | `/$defs/predicate/properties/labels` | added | new at the newer major |
@@ -906,9 +960,14 @@ Shape deltas only — a field whose description changed but whose type, required
 | `/$defs/review_convention/properties/path` | added | new at the newer major |
 | `/$defs/review_convention/properties/required` | added | new at the newer major |
 | `/$defs/review_convention/properties/severity_cap` | added | new at the newer major |
+| `/$defs/reviewer_persona` | added | new at the newer major |
+| `/$defs/reviewer_persona/properties/agent` | added | new at the newer major |
+| `/$defs/reviewer_persona/properties/remit` | added | new at the newer major |
 | `/$defs/reviewers_config/properties/agent` | removed | present in the older major, absent at the newer |
+| `/$defs/reviewers_config/properties/agents` | changed | type "array of object"→"array of `agent_reviewer`" |
 | `/$defs/reviewers_config/properties/authority` | added | new at the newer major |
 | `/$defs/reviewers_config/properties/conventions` | added | new at the newer major |
+| `/$defs/reviewers_config/properties/personas` | added | new at the newer major |
 | `/$defs/reviewers_config/properties/review_timeout` | added | new at the newer major |
 | `/$defs/role` | removed | present in the older major, absent at the newer |
 | `/$defs/role/properties/members` | removed | present in the older major, absent at the newer |
@@ -934,6 +993,7 @@ Shape deltas only — a field whose description changed but whose type, required
 | `/$defs/workflow/properties/operator_agent` | removed | present in the older major, absent at the newer |
 | `/properties/defaults` | added | new at the newer major |
 | `/properties/review_conventions` | added | new at the newer major |
+| `/properties/reviewer_personas` | added | new at the newer major |
 | `/properties/roles` | removed | present in the older major, absent at the newer |
 | `/properties/version` | changed | enum members differ |
 

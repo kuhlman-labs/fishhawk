@@ -4727,6 +4727,20 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 	}
 	s.recordCrewMessagesDelivered(ctx, runID, stageID, run.StageTypeReview, "implement_review", crewDeliveries.Sequences)
 
+	// Reviewer personas (ADR-084 / E55.8 / #3753), mirroring runPlanReviews:
+	// the personas the reviewed implement stage attaches run as EXTRA
+	// invocations, each on its OWN prompt built from a value copy of trig with
+	// its remit appended to a cloned document slice — AFTER the standard prompt
+	// above, which stays byte-identical. Resolved INSIDE the reviewDispatchMu
+	// section, after the duplicate-dispatch guard (so a duplicate dispatch
+	// never reads the forge or writes an attribution for a persona) and BEFORE
+	// implement_review_started (which must count them). A persona whose remit
+	// cannot be resolved or attributed is marked degraded and records
+	// persona_remit_unavailable in the loop instead of running.
+	personaInvs := s.resolvePersonaInvocations(s.resolveStageReviewerPersonas(ctx, runRow, stageID))
+	s.buildPersonaPrompts(ctx, runRow, stageID, "implement_review", trig, injected, treeDir, personaInvs)
+	invocations = append(invocations, personaInvs...)
+
 	// Pending-signal (#600): emit an implement_review_started audit entry
 	// now that a reviewer will actually run. Emitted synchronously before
 	// the dispatch loop so started precedes every implement_reviewed entry
@@ -4741,7 +4755,10 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 	// discarded. roundSeq is 0 when the emit failed (ok=false); the loop then
 	// records no round key and marks nothing, and the relay falls back to its
 	// legacy below-the-verdict derivation for those rows.
-	roundSeq, _ := s.emitReviewStarted(ctx, runID, stageID, "implement_review_started", authority, reviewersCfg.AgentCount(), headSHA, treeSHA, changeID)
+	//
+	// configured_agents counts every persona invocation too (#3753): each one
+	// produces exactly one terminal entry, so the round settles at this count.
+	roundSeq, _ := s.emitReviewStarted(ctx, runID, stageID, "implement_review_started", authority, reviewersCfg.AgentCount()+len(personaInvs), personaNames(personaInvs), headSHA, treeSHA, changeID)
 	reviewDispatchMu.Unlock()
 
 	// invocations were resolved above (before the prompt build) so the grounding
@@ -5190,7 +5207,6 @@ func (s *Server) runImplementReviewInvocations(ctx context.Context, runID, stage
 	// peers said in the SAME round, so a diff-only peer's `confirmed` retired a
 	// concern whose RAISING reviewer was still returning `reject`.
 	var round []roundReviewVerdict
-	budget := reviewBudget.Budget(len(promptText))
 	for i, inv := range invocations {
 		// An unresolvable provider is a deployment CAPABILITY gap, not a
 		// reviewer error (#1495, reframes #955): the spec-declared provider is
@@ -5200,9 +5216,21 @@ func (s *Server) runImplementReviewInvocations(ctx context.Context, runID, stage
 		// hasRejection untouched. implement_review_skipped counts as terminal
 		// (planreview.Settled), so the review-settled gate still resolves.
 		if inv.resolveErr != nil {
-			s.emitReviewerUnavailable(ctx, runID, stageID, "implement_review_skipped", authority, inv.provider, inv.optional, len(invocations), inv.resolveErr)
+			s.emitReviewerUnavailable(ctx, runID, stageID, "implement_review_skipped", authority, inv.provider, inv.personaName(), inv.optional, len(invocations), inv.resolveErr)
 			continue
 		}
+		// A reviewer persona whose remit could not be resolved, rendered or
+		// attributed never runs on a remit-less prompt (#3753): a terminal
+		// persona_remit_unavailable skip, hasRejection untouched.
+		if inv.persona != nil && inv.persona.promptText == "" {
+			s.emitPersonaDegraded(ctx, runID, stageID, "implement_review_skipped", authority, inv, len(invocations))
+			continue
+		}
+		// Per-invocation prompt, tree and size-aware budget (#3753): a persona
+		// runs on its own prompt; a standard reviewer's values are the shared
+		// ones, unchanged.
+		invPrompt, invTree := inv.promptFor(promptText, treeDir)
+		budget := reviewBudget.Budget(len(invPrompt))
 		// Resolve the reviewer's CLI version + binary-path provenance once per
 		// invocation (#1768) and stamp both onto the implement_reviewed payload
 		// below. The implement loop has no agent_version guard, so this is a
@@ -5214,7 +5242,7 @@ func (s *Server) runImplementReviewInvocations(ctx context.Context, runID, stage
 		// here with no separate per-stage default. cancel() per turn so
 		// deadlines don't accumulate across reviewers.
 		invocationCtx, cancel := context.WithTimeout(ctx, budget)
-		verdict, model, err := s.invokeReview(invocationCtx, inv, promptText, treeDir)
+		verdict, model, err := s.invokeReview(invocationCtx, inv, invPrompt, invTree)
 		timedOut := errors.Is(invocationCtx.Err(), context.DeadlineExceeded)
 		cancel()
 		if err != nil {
@@ -5231,7 +5259,7 @@ func (s *Server) runImplementReviewInvocations(ctx context.Context, runID, stage
 			// definite 'failed' state, with the #747 timeout discriminator
 			// distinguishing a budget-kill from a transport failure.
 			// hasRejection untouched (#574).
-			s.emitReviewFailed(ctx, runID, stageID, "implement_review_failed", authority, model, err.Error(), timedOut)
+			s.emitReviewFailed(ctx, runID, stageID, "implement_review_failed", authority, model, inv.personaFailureReason(err.Error()), timedOut)
 			continue
 		}
 
@@ -5292,6 +5320,9 @@ func (s *Server) runImplementReviewInvocations(ctx context.Context, runID, stage
 			// probed once above. Empty for non-codex reviewers (omitempty).
 			ReviewerVersion: reviewerVersion,
 			ReviewerBinary:  reviewerBinary,
+			// The reviewer persona (#3753) that produced this verdict; empty
+			// for a standard reviewer (omitempty, byte-identical).
+			Persona: inv.personaName(),
 		}
 		payloadBytes, _ := json.Marshal(payload)
 		entry, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{

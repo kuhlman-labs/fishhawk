@@ -1236,3 +1236,79 @@ func TestReviewStartedPayload_TreeSHAWireShape(t *testing.T) {
 		})
 	}
 }
+
+// --- Reviewer personas (ADR-084 / E55.8 / #3753) ---
+
+// TestPersonaPayloadFields_OmittedForStandardReviewer pins the byte-identity
+// half of the persona payload contract: a STANDARD reviewer's payloads carry
+// no persona / personas / detail key at all (omitempty), so every pre-#3753
+// payload shape is unchanged. Each payload is compared against the exact
+// pre-#3753 JSON, not just probed for a missing key.
+func TestPersonaPayloadFields_OmittedForStandardReviewer(t *testing.T) {
+	cases := []struct {
+		name string
+		v    any
+		want string
+	}{
+		{"plan_reviewed", planreview.PlanReviewedPayload{ReviewerKind: "agent", Authority: planreview.AuthorityGating, Verdict: planreview.VerdictApprove},
+			`{"reviewer_kind":"agent","authority":"gating","verdict":"approve"}`},
+		{"implement_reviewed", planreview.ImplementReviewedPayload{ReviewerKind: "agent", Authority: planreview.AuthorityAdvisory, Verdict: planreview.VerdictReject},
+			`{"reviewer_kind":"agent","authority":"advisory","verdict":"reject"}`},
+		{"review_skipped", planreview.ReviewSkippedPayload{Reason: planreview.ReasonReviewerUnavailable, ConfiguredAgents: 2, Authority: planreview.AuthorityGating, Provider: "codex"},
+			`{"reason":"reviewer_unavailable","configured_agents":2,"authority":"gating","provider":"codex"}`},
+		{"review_started", planreview.ReviewStartedPayload{ConfiguredAgents: 1, Authority: planreview.AuthorityGating},
+			`{"configured_agents":1,"authority":"gating"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := json.Marshal(tc.v)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != tc.want {
+				t.Errorf("payload = %s, want %s (byte-identical to pre-#3753)", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestPersonaPayloadFields_CarriedForPersona pins the other half: a persona's
+// payloads carry persona (verdicts and skips), detail (the remit-degrade skip)
+// and the started entry's personas list under their wire names.
+func TestPersonaPayloadFields_CarriedForPersona(t *testing.T) {
+	cases := []struct {
+		name string
+		v    any
+		want []string
+	}{
+		{"plan_reviewed", planreview.PlanReviewedPayload{ReviewerKind: "agent", Verdict: planreview.VerdictApprove, Persona: "security"},
+			[]string{`"persona":"security"`}},
+		{"implement_reviewed", planreview.ImplementReviewedPayload{ReviewerKind: "agent", Verdict: planreview.VerdictApprove, Persona: "security"},
+			[]string{`"persona":"security"`}},
+		{"review_skipped", planreview.ReviewSkippedPayload{Reason: planreview.ReasonPersonaRemitUnavailable, Persona: "security", Detail: "remit_missing"},
+			[]string{`"reason":"persona_remit_unavailable"`, `"persona":"security"`, `"detail":"remit_missing"`}},
+		{"review_started", planreview.ReviewStartedPayload{ConfiguredAgents: 2, Personas: []string{"security"}},
+			[]string{`"configured_agents":2`, `"personas":["security"]`}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := json.Marshal(tc.v)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, w := range tc.want {
+				if !strings.Contains(string(got), w) {
+					t.Errorf("payload = %s, want it to carry %s", got, w)
+				}
+			}
+		})
+	}
+}
+
+// TestReasonPersonaRemitUnavailable_WireValue pins the skip REASON value
+// operators and the MCP review surfaces read verbatim.
+func TestReasonPersonaRemitUnavailable_WireValue(t *testing.T) {
+	if planreview.ReasonPersonaRemitUnavailable != "persona_remit_unavailable" {
+		t.Errorf("ReasonPersonaRemitUnavailable = %q", planreview.ReasonPersonaRemitUnavailable)
+	}
+}

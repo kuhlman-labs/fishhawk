@@ -14203,3 +14203,217 @@ func TestRunImplementReviews_DuplicateDispatch_NoDocumentResolution(t *testing.T
 		t.Errorf("reviewer calls = %d, want 1 (only the first dispatch reviews)", n)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Reviewer personas on the IMPLEMENT-review path (ADR-084 / E55.8 / #3753).
+// Shared fixtures live in reviewer_persona_test.go.
+// ---------------------------------------------------------------------------
+
+// personaImplRun wires an implement-review run over spec: the standard fake at
+// anthropic/std-model, the persona fake under personaKey (skipped when nil),
+// the persona fetcher and the run's recorded admission commit.
+func personaImplRun(t *testing.T, spec []byte, std, persona PlanReviewer, personaKey string) (*Server, *auditFake, *run.Run, *run.Stage, *personaFetcher) {
+	t.Helper()
+	byKey := map[string]PlanReviewer{"anthropic/" + personaStdModel: std}
+	if persona != nil {
+		byKey[personaKey] = persona
+	}
+	s, _, au, _, runRow, implStage := newImplementReviewServerWithSet(t, personaReviewerSet{def: std, byKey: byKey}, spec)
+	commit := personaBaseCommit
+	runRow.DocumentBaseCommit = &commit
+	f := newPersonaFetcher()
+	s.cfg.DocumentResolver = &repodoc.Resolver{Fetcher: f}
+	return s, au, runRow, implStage, f
+}
+
+// decodeImplementReviewed decodes every implement_reviewed entry.
+func decodeImplementReviewed(t *testing.T, au *auditFake) []planreview.ImplementReviewedPayload {
+	t.Helper()
+	var out []planreview.ImplementReviewedPayload
+	for _, e := range auditFakeEntries(au, "implement_reviewed") {
+		var p planreview.ImplementReviewedPayload
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			t.Fatalf("decode implement_reviewed: %v", err)
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// (R2) GOLDEN byte-identity on the implement path: attaching a persona leaves
+// the standard implement_review prompt byte-identical to a persona-less run,
+// while the persona runs on its own prompt carrying the remit block and the
+// diff; the remit is attributed with the implement stage at the admission
+// commit; implement_review_started counts and names the persona; only the
+// persona's verdict carries `persona`.
+//
+// Counterfactuals: (a) promptFor returning the shared prompt for a persona — the
+// persona prompt lacks the remit, RED; (b) appending the remit to
+// trig.InjectedDocuments before the standard build — the standard prompt
+// differs from the golden, RED.
+func TestImplementReview_Persona_GoldenStandardPromptAndOwnPersonaPrompt(t *testing.T) {
+	baseStd := approvingFake()
+	bs, _, br, bst, _ := personaImplRun(t, personaSpec(personaSpecOpts{}), baseStd, nil, "")
+	bs.runImplementReviews(t.Context(), br.ID, bst.ID, reviewInjectionDiff(), nil, "head-golden", nil)
+	golden := reviewerCalls(baseStd)
+	if len(golden) != 1 {
+		t.Fatalf("baseline calls = %d, want 1", len(golden))
+	}
+
+	std, persona := approvingFake(), approvingFake()
+	s, au, runRow, implStage, _ := personaImplRun(t, personaSpec(personaSpecOpts{attachOn: "implement"}), std, persona, "codex/"+personaAgentModel)
+	if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, reviewInjectionDiff(), nil, "head-golden", nil) {
+		t.Fatal("approving reviewers must not gate")
+	}
+	stdCalls, perCalls := reviewerCalls(std), reviewerCalls(persona)
+	if len(stdCalls) != 1 || len(perCalls) != 1 {
+		t.Fatalf("calls: standard %d persona %d, want 1 and 1", len(stdCalls), len(perCalls))
+	}
+	if stdCalls[0] != golden[0] {
+		t.Error("standard implement_review prompt is not byte-identical to the persona-less golden prompt")
+	}
+	// The golden compare alone cannot see a remit block injected on BOTH runs
+	// (a mutation reaching the baseline too), so the leak is asserted directly.
+	if strings.Contains(stdCalls[0], personaRemitHeading) || strings.Contains(stdCalls[0], personaRemitBody) {
+		t.Error("the remit leaked into the standard implement_review prompt")
+	}
+	for _, want := range []string{personaRemitHeading, personaRemitBody, "backend/internal/foo/foo.go"} {
+		if !strings.Contains(perCalls[0], want) {
+			t.Errorf("persona prompt missing %q", want)
+		}
+	}
+	inj := remitInjections(t, au)
+	if len(inj) != 1 || inj[0]["commit"] != personaBaseCommit || inj[0]["declaration_site"] != personaDeclSite {
+		t.Fatalf("remit attribution = %v, want one at %s from %s", inj, personaBaseCommit, personaDeclSite)
+	}
+	for _, e := range auditFakeEntries(au, "document_injected") {
+		if e.StageID == nil || *e.StageID != implStage.ID {
+			t.Errorf("remit attributed to stage %v, want the implement stage %s", e.StageID, implStage.ID)
+		}
+	}
+	started := decodeStarted(t, au, "implement_review_started")
+	if started.ConfiguredAgents != 2 || !slices.Equal(started.Personas, []string{personaTestName}) || started.HeadSHA != "head-golden" {
+		t.Errorf("implement_review_started = %+v, want configured 2, personas [%s], head_sha head-golden", started, personaTestName)
+	}
+	var personaVerdicts int
+	for _, v := range decodeImplementReviewed(t, au) {
+		if v.Persona == personaTestName {
+			personaVerdicts++
+		} else if v.Persona != "" {
+			t.Errorf("unexpected persona %q", v.Persona)
+		}
+	}
+	if personaVerdicts != 1 || len(decodeImplementReviewed(t, au)) != 2 {
+		t.Errorf("verdicts: persona %d of %d, want 1 of 2", personaVerdicts, len(decodeImplementReviewed(t, au)))
+	}
+}
+
+// (Condition 3, implement) the persona shares the standard reviewer's provider
+// and adapter: the round settles at configured_agents == 2 with two verdicts,
+// no dedupe, no double-count, and no supplemental re-invoke verdict (that pass
+// is triggered only by a re-invoke ship's exemption delta, never by a count).
+func TestImplementReview_Persona_SharedProviderSettlesAtTwo(t *testing.T) {
+	shared := approvingFake()
+	s, au, runRow, implStage, _ := personaImplRun(t, personaSpec(personaSpecOpts{attachOn: "implement", personaProvider: "anthropic"}),
+		shared, shared, "anthropic/"+personaAgentModel)
+	s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, reviewInjectionDiff(), nil, "head-shared", nil)
+	if n := len(reviewerCalls(shared)); n != 2 {
+		t.Fatalf("shared adapter calls = %d, want 2", n)
+	}
+	started := decodeStarted(t, au, "implement_review_started")
+	verdicts := decodeImplementReviewed(t, au)
+	if started.ConfiguredAgents != 2 || len(verdicts) != 2 || terminalCount(au, "implement") != 2 {
+		t.Errorf("configured %d verdicts %d terminal %d, want 2/2/2", started.ConfiguredAgents, len(verdicts), terminalCount(au, "implement"))
+	}
+	for _, v := range verdicts {
+		if v.Origin == planreview.OriginBaseRebaseReinvoke {
+			t.Error("a supplemental re-invoke verdict was recorded")
+		}
+	}
+	if !planreview.Settled(started.ConfiguredAgents, terminalCount(au, "implement")) {
+		t.Error("round not settled")
+	}
+}
+
+// (R3, implement) a remit missing at the admission commit degrades only the
+// persona: implement_review_skipped persona_remit_unavailable / remit_missing,
+// the standard reviewer still runs, and the round settles at 2.
+func TestImplementReview_Persona_RemitMissingDegradesPersonaOnly(t *testing.T) {
+	std, persona := approvingFake(), approvingFake()
+	s, au, runRow, implStage, f := personaImplRun(t, personaSpec(personaSpecOpts{attachOn: "implement"}), std, persona, "codex/"+personaAgentModel)
+	delete(f.files, personaRemitPath)
+	if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, reviewInjectionDiff(), nil, "head-missing", nil) {
+		t.Fatal("a degraded persona must not gate")
+	}
+	if n := len(reviewerCalls(persona)); n != 0 {
+		t.Errorf("persona invoked %d times, want 0", n)
+	}
+	if n := len(reviewerCalls(std)); n != 1 {
+		t.Errorf("standard invoked %d times, want 1", n)
+	}
+	skips := decodeSkipped(t, au, "implement_review_skipped")
+	if len(skips) != 1 || skips[0].Reason != planreview.ReasonPersonaRemitUnavailable || skips[0].Detail != personaDetailRemitMissing || skips[0].Persona != personaTestName {
+		t.Errorf("skips = %+v, want one persona_remit_unavailable/remit_missing for %s", skips, personaTestName)
+	}
+	if !planreview.Settled(decodeStarted(t, au, "implement_review_started").ConfiguredAgents, terminalCount(au, "implement")) {
+		t.Error("round not settled")
+	}
+}
+
+// (R11) The implement duplicate-dispatch guard still short-circuits BEFORE any
+// persona forge read or attribution: a stage already started at this head_sha
+// runs no reviewer and the remit is never fetched.
+//
+// Counterfactual: move buildPersonaPrompts above the guard — the fetcher is
+// consulted and this goes RED.
+func TestImplementReview_Persona_DuplicateDispatchReadsNothing(t *testing.T) {
+	std, persona := approvingFake(), approvingFake()
+	s, au, runRow, implStage, f := personaImplRun(t, personaSpec(personaSpecOpts{attachOn: "implement"}), std, persona, "codex/"+personaAgentModel)
+	sid := implStage.ID
+	payload, _ := json.Marshal(map[string]any{"configured_agents": 2, "head_sha": "head-dup"})
+	if _, err := au.AppendChained(t.Context(), audit.ChainAppendParams{RunID: runRow.ID, StageID: &sid, Category: "implement_review_started", Payload: payload}); err != nil {
+		t.Fatal(err)
+	}
+	if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, reviewInjectionDiff(), nil, "head-dup", nil) {
+		t.Fatal("a duplicate dispatch must not gate")
+	}
+	if n := f.fetches(); n != 0 {
+		t.Errorf("remit fetched %d times on a duplicate dispatch, want 0", n)
+	}
+	if n := len(remitInjections(t, au)); n != 0 {
+		t.Errorf("remit attributed %d times on a duplicate dispatch, want 0", n)
+	}
+	if n := len(reviewerCalls(std)) + len(reviewerCalls(persona)); n != 0 {
+		t.Errorf("reviewers invoked %d times on a duplicate dispatch, want 0", n)
+	}
+}
+
+// (R10, implement) a persona REJECT under gating authority gates the
+// implement stage (runImplementReviews returns true; the caller fails it
+// category-B), exactly as a standard reviewer's reject would.
+func TestImplementReview_Persona_RejectGates(t *testing.T) {
+	reject := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictReject}, model: "persona"}
+	s, _, runRow, implStage, _ := personaImplRun(t, personaSpec(personaSpecOpts{attachOn: "implement"}), approvingFake(), reject, "codex/"+personaAgentModel)
+	if !s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, reviewInjectionDiff(), nil, "head-reject", nil) {
+		t.Error("a persona reject under gating authority must gate")
+	}
+}
+
+// A persona reviewer that ERRORS records implement_review_failed with a
+// reason prefixed by the persona name, so the failure is attributable.
+func TestImplementReview_Persona_FailureReasonNamesPersona(t *testing.T) {
+	failing := &fakePlanReviewer{err: errors.New("adapter exploded")}
+	s, au, runRow, implStage, _ := personaImplRun(t, personaSpec(personaSpecOpts{attachOn: "implement"}), approvingFake(), failing, "codex/"+personaAgentModel)
+	s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, reviewInjectionDiff(), nil, "head-fail", nil)
+	entries := auditFakeEntries(au, "implement_review_failed")
+	if len(entries) != 1 {
+		t.Fatalf("implement_review_failed entries = %d, want 1", len(entries))
+	}
+	var p planreview.ReviewFailedPayload
+	if err := json.Unmarshal(entries[0].Payload, &p); err != nil {
+		t.Fatal(err)
+	}
+	if p.Reason != "persona security: adapter exploded" {
+		t.Errorf("reason = %q, want the persona-prefixed reason", p.Reason)
+	}
+}

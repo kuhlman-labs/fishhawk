@@ -123,6 +123,17 @@ type Spec struct {
 	// this field MUST stay in lockstep with the schema's top-level
 	// review_conventions property.
 	ReviewConventions map[string]ReviewConvention `json:"review_conventions,omitempty" yaml:"review_conventions,omitempty"`
+	// ReviewerPersonas are the named reviewer personas (ADR-084 / E55.8 /
+	// #3753): a persona name -> a model configuration plus a remit document,
+	// attached to a plan or implement stage by name through
+	// ReviewersConfig.Personas. Declared, never auto-discovered. Validated by
+	// validateReviewerPersonaDeclarations and
+	// validateReviewerPersonasReferenced; selected per stage by
+	// SelectReviewerPersonas (reviewer_personas.go). A v2-only surface (no
+	// v0/v1 schema declares it). Round-trips through ParseBytes'
+	// DisallowUnknownFields decode, so this field MUST stay in lockstep with
+	// the schema's top-level reviewer_personas property.
+	ReviewerPersonas map[string]ReviewerPersona `json:"reviewer_personas,omitempty" yaml:"reviewer_personas,omitempty"`
 }
 
 // TestConvention is one test-location convention (#1004): production
@@ -589,6 +600,18 @@ type ReviewersConfig struct {
 	// additionalProperties:false, so this field MUST stay in lockstep with
 	// the schema's conventions property.
 	Conventions []string `json:"conventions,omitempty" yaml:"conventions,omitempty"`
+	// Personas attaches, by name, the top-level reviewer_personas entries
+	// that review this stage IN ADDITION to Agents (ADR-084 / E55.8 /
+	// #3753), in list order: each is a separate reviewer invocation with its
+	// own model configuration and its own prompt, and the standard
+	// reviewers' prompt is unchanged. Semantic validation refuses an
+	// undeclared name, an attachment on a stage type other than
+	// plan/implement, and an attachment on a stage with no agent reviewers
+	// (validateStageReviewerPersonas). Like Conventions it travels with a
+	// defaults.reviewers block taken WHOLE. The schema's reviewers_config is
+	// additionalProperties:false, so this field MUST stay in lockstep with
+	// the schema's personas property.
+	Personas []string `json:"personas,omitempty" yaml:"personas,omitempty"`
 }
 
 // ResolveReviewTimeout resolves the review-wait budget floor for a stage,
@@ -638,9 +661,10 @@ type AgentReviewer struct {
 	// an out-of-range version via MatchAgentVersionRange (the reviewer
 	// enforcement is a sibling slice; this slice owns the field + matcher).
 	// The anthropic and claudecode adapters take no CLI version and ignore
-	// it. Empty falls back to no constraint. The schema's agents items are
-	// additionalProperties:false, so this field MUST stay in lockstep with
-	// the schema's agent_version property. Validated syntactically by
+	// it. Empty falls back to no constraint. The schema's $defs/agent_reviewer
+	// (the agents items AND every reviewer_personas.<name>.agent, E55.8 /
+	// #3753) is additionalProperties:false, so this field MUST stay in
+	// lockstep with the schema's agent_version property. Validated syntactically by
 	// ValidAgentVersionRange in the semantic layer.
 	AgentVersion string `json:"agent_version,omitempty" yaml:"agent_version,omitempty"`
 	// Optional is the per-reviewer degradation policy (#1495). It frames the
