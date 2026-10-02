@@ -86,19 +86,26 @@ func TestValidTriggerSources_ClosedSet(t *testing.T) {
 	if ValidTriggerSources()[0] != TriggerGitHubIssue {
 		t.Error("ValidTriggerSources() must return a fresh slice; a caller mutated the set")
 	}
-	// `scheduled` is deliberately NOT a member: no producer could mint it, and
-	// an unmintable enum member is the dead surface #2826 exists to close.
+	// `scheduled` is deliberately NOT a member (E79.1 / #3725): it now HAS a
+	// producer, but that producer is the in-process scheduler alone. This
+	// accessor is the OPERATOR-SUBMITTABLE set the POST /v0/runs membership
+	// check and the MCP start_run mirror are derived from, so membership here
+	// would make the reserved source submittable by any write:runs token.
+	if string(TriggerScheduled) != "scheduled" {
+		t.Errorf("TriggerScheduled = %q, want scheduled (the wire value the 0093 CHECK constraint enumerates)", TriggerScheduled)
+	}
 	for _, ts := range ValidTriggerSources() {
-		if ts == "scheduled" {
-			t.Error("ValidTriggerSources() must not admit 'scheduled' — no producer can mint it")
+		if ts == TriggerScheduled {
+			t.Error("ValidTriggerSources() must not admit 'scheduled' — it is reserved to the in-process scheduler (POST /v0/runs refuses it as trigger_source_reserved)")
 		}
 	}
 }
 
 // TestRunIsIssueAnchored pins the source-level predicate the issue_context
 // coupling (server + MCP) and the six issuecomment suppression sites are
-// written against (E54.22 / #2826). github_issue and on_demand are anchored;
-// cli, ui, an unknown value and the empty value are not.
+// written against (E54.22 / #2826). github_issue, on_demand and scheduled
+// (E79.1 / #3725: a schedule may name an anchor issue) are anchored; cli, ui,
+// an unknown value and the empty value are not.
 func TestRunIsIssueAnchored(t *testing.T) {
 	cases := []struct {
 		source TriggerSource
@@ -108,7 +115,7 @@ func TestRunIsIssueAnchored(t *testing.T) {
 		{TriggerOnDemand, true},
 		{TriggerCLI, false},
 		{TriggerUI, false},
-		{TriggerSource("scheduled"), false},
+		{TriggerScheduled, true},
 		{TriggerSource("nonsense"), false},
 		{TriggerSource(""), false},
 	}
