@@ -405,3 +405,83 @@ func TestReviewerPersonaRemitPathReasons(t *testing.T) {
 		}
 	}
 }
+
+// TestValidate_ReviewerPersonaReferencedByEscalationOnly pins the widened
+// REFERENCE rung (E55.9 / #3754): a persona no stage attaches statically but a
+// workflow escalation requires through require.reviewers is referenced, and
+// is NOT refused as unreferenced. The fixture is otherwise valid (one
+// agent-reviewing plan stage for the escalated persona to join), so the
+// escalation loop in validateReviewerPersonasReferenced is the only thing
+// that can accept it; the second case is the negative control — the same
+// persona with no escalation naming it IS refused, in the reworded message.
+func TestValidate_ReviewerPersonaReferencedByEscalationOnly(t *testing.T) {
+	escalation := `    escalations:
+      - match:
+          paths: ["backend/internal/spec/**"]
+        require:
+          reviewers: [security]
+`
+	doc := "version: \"2\"\n" + rpPersonaSecurity + "workflows:\n  feature_change:\n" + escalation + "    stages:\n" + rpPlanStage("")
+	if _, err := spec.ParseBytes([]byte(doc)); err != nil {
+		t.Fatalf("a persona referenced only by an escalation must be accepted: %v", err)
+	}
+
+	unreferenced := rpDoc(rpPersonaSecurity, rpPlanStage(""))
+	_, err := spec.ParseBytes([]byte(unreferenced))
+	var ve *spec.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("err = %v, want the unreferenced-persona *ValidationError", err)
+	}
+	if ve.Path != "/reviewer_personas/security" || ve.Message != fmt.Sprintf(spec.MsgFmtReviewerPersonaUnreferenced, "security") {
+		t.Errorf("got %s: %s, want the unreferenced rung at /reviewer_personas/security", ve.Path, ve.Message)
+	}
+}
+
+// TestSelectNamedReviewerPersonas_OrderDedupAndFailsClosed pins the
+// escalation-attachment selector: input order (NOT sorted), duplicates
+// dropped first-wins, the SAME SelectedReviewerPersona value a static
+// attachment of that persona resolves to, an empty / nil input selecting
+// nothing, and the fail-closed branch for a hand-built spec — error identity
+// via errors.Is and NO partial result.
+func TestSelectNamedReviewerPersonas_OrderDedupAndFailsClosed(t *testing.T) {
+	s := rpSelectSpec(map[string]spec.ReviewerPersona{
+		"alpha": {Agent: spec.AgentReviewer{Provider: "anthropic"}, Remit: spec.PersonaRemit{Path: "a.md"}},
+		"zeta": {
+			Agent: spec.AgentReviewer{Provider: "codex", Model: "m"},
+			Remit: spec.PersonaRemit{Path: "docs/z.md", SeverityCap: spec.ReviewConventionSeverityCapMedium},
+		},
+	})
+	got, err := s.SelectNamedReviewerPersonas([]string{"zeta", "alpha", "zeta"})
+	if err != nil {
+		t.Fatalf("SelectNamedReviewerPersonas: %v", err)
+	}
+	static, err := s.SelectReviewerPersonas(rpStage(spec.StageTypeImplement, "zeta", "alpha"))
+	if err != nil {
+		t.Fatalf("SelectReviewerPersonas: %v", err)
+	}
+	if !reflect.DeepEqual(got, static) {
+		t.Errorf("named selection =\n%+v\nwant the static selection of the same personas (input order, de-duplicated)\n%+v", got, static)
+	}
+
+	for name, in := range map[string][]string{"nil": nil, "empty": {}} {
+		if got, err := s.SelectNamedReviewerPersonas(in); err != nil || got != nil {
+			t.Errorf("%s input: got (%v, %v), want (nil, nil)", name, got, err)
+		}
+	}
+
+	for name, tc := range map[string]struct {
+		s     *spec.Spec
+		names []string
+	}{
+		"undeclared after a declared one": {s, []string{"alpha", "ghost"}},
+		"nil spec":                        {nil, []string{"alpha"}},
+	} {
+		got, err := tc.s.SelectNamedReviewerPersonas(tc.names)
+		if !errors.Is(err, spec.ErrReviewerPersonaUndeclared) {
+			t.Errorf("%s: err = %v, want errors.Is ErrReviewerPersonaUndeclared", name, err)
+		}
+		if got != nil {
+			t.Errorf("%s: returned %+v alongside the error; a fail-closed selection returns no persona", name, got)
+		}
+	}
+}

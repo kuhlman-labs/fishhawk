@@ -311,6 +311,174 @@ func TestRuleKey_ChangesWithRuleContent(t *testing.T) {
 	if got := RuleKey(editedAutonomy); got == base {
 		t.Errorf("RuleKey unchanged after adding a max_autonomy ceiling (%q)", got)
 	}
+
+	// require.reviewers (E55.9 / #3754) is part of the clamp: adding it, and
+	// changing which persona it names, must each move the key.
+	editedReviewers := ruleKeyRuleA()
+	editedReviewers.Require.Reviewers = []string{"security"}
+	withSecurity := RuleKey(editedReviewers)
+	if withSecurity == base {
+		t.Errorf("RuleKey unchanged after adding require.reviewers (%q); a rule that now attaches a persona is a different rule", withSecurity)
+	}
+	otherPersona := ruleKeyRuleA()
+	otherPersona.Require.Reviewers = []string{"privacy"}
+	if got := RuleKey(otherPersona); got == withSecurity {
+		t.Errorf("RuleKey identical for require.reviewers [security] and [privacy] (%q)", got)
+	}
+}
+
+// TestRuleKey_ReviewersLessRuleKeyIsStable pins the compatibility half of the
+// require.reviewers fold-in (E55.9 / #3754): a rule that declares NO reviewers
+// must key exactly as it did before the dimension existed, so every decision
+// index joined on an existing rule's key keeps following it. The two literals
+// were computed by running RuleKey from the PRE-#3754 escalation.go (main at
+// d9d175bb) over these fixtures; a rendering change that moves them is a
+// silent re-keying of every existing rule.
+func TestRuleKey_ReviewersLessRuleKeyIsStable(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		rule spec.Escalation
+		want string
+	}{
+		{"approvals rule (ruleKeyRuleA)", ruleKeyRuleA(), "fef33f4dfb7f5b65"},
+		{"max_autonomy rule (ruleKeyRuleB)", ruleKeyRuleB(), "fd35639f5946e999"},
+	} {
+		if got := RuleKey(tc.rule); got != tc.want {
+			t.Errorf("%s: RuleKey = %q, want the pre-#3754 key %q — a reviewers-less rule must not be re-keyed", tc.name, got, tc.want)
+		}
+		empty := tc.rule
+		empty.Require.Reviewers = []string{}
+		if got := RuleKey(empty); got != tc.want {
+			t.Errorf("%s: an EMPTY (non-nil) require.reviewers re-keyed the rule to %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestRuleKey_ReviewersPermutationInvariant pins that require.reviewers is
+// canonicalized like a criterion list: the attachment is a SET, so permuting
+// it is not a change to the rule. It also pins the sorted COPY — the caller's
+// slice keeps its declared order.
+func TestRuleKey_ReviewersPermutationInvariant(t *testing.T) {
+	a := ruleKeyRuleA()
+	a.Require.Reviewers = []string{"security", "privacy", "data"}
+	b := ruleKeyRuleA()
+	b.Require.Reviewers = []string{"data", "security", "privacy"}
+	if RuleKey(a) != RuleKey(b) {
+		t.Errorf("RuleKey moved under a require.reviewers permutation: %q vs %q", RuleKey(a), RuleKey(b))
+	}
+	if !reflect.DeepEqual(a.Require.Reviewers, []string{"security", "privacy", "data"}) {
+		t.Errorf("RuleKey mutated require.reviewers to %v", a.Require.Reviewers)
+	}
+}
+
+// personaFixture is three escalations: 0 fires on backend/** and attaches
+// security; 1 fires on **/*.go and attaches privacy AND security (a repeat
+// across escalations); 2 never fires for a backend change and attaches data.
+func personaFixture() []spec.Escalation {
+	return []spec.Escalation{
+		esc(spec.Predicate{Paths: []string{"backend/**"}}, spec.EscalationRequirements{Reviewers: []string{"security"}}),
+		esc(spec.Predicate{Paths: []string{"**/*.go"}}, spec.EscalationRequirements{Reviewers: []string{"security", "privacy", "privacy"}}),
+		esc(spec.Predicate{Paths: []string{"frontend/**"}}, spec.EscalationRequirements{Reviewers: []string{"data"}}),
+	}
+}
+
+// TestPersonaAttachments_UnionSortedAttributed pins the derivation: the union
+// of every FIRED escalation's require.reviewers, de-duplicated (a persona two
+// escalations name appears once, carrying both; a persona one escalation
+// repeats is attributed to it once), sorted by persona name, each carrying its
+// fired escalations in declaration order.
+func TestPersonaAttachments_UnionSortedAttributed(t *testing.T) {
+	fx := personaFixture()
+	res, err := Evaluate(fx, spec.Change{Paths: []string{"backend/internal/spec/x.go"}})
+	if err != nil {
+		t.Fatalf("Evaluate: %v", err)
+	}
+	got := PersonaAttachments(res)
+	want := []PersonaAttachment{
+		{Persona: "privacy", Fired: []Fired{{Index: 1, Escalation: fx[1]}}},
+		{Persona: "security", Fired: []Fired{{Index: 0, Escalation: fx[0]}, {Index: 1, Escalation: fx[1]}}},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("PersonaAttachments =\n%+v\nwant\n%+v", got, want)
+	}
+
+	// Reordering the declarations moves the fired indices but not the
+	// attachment ORDER, which is a function of the fired set.
+	shuffled, err := Evaluate([]spec.Escalation{fx[1], fx[2], fx[0]}, spec.Change{Paths: []string{"backend/internal/spec/x.go"}})
+	if err != nil {
+		t.Fatalf("Evaluate(shuffled): %v", err)
+	}
+	sg := PersonaAttachments(shuffled)
+	if len(sg) != 2 || sg[0].Persona != "privacy" || sg[1].Persona != "security" {
+		t.Fatalf("shuffled declarations reordered the attachments: %+v", sg)
+	}
+}
+
+// TestPersonaAttachments_NonFiringContributesNothing pins "cost only where
+// attached": an escalation that did not fire contributes no persona whatever
+// it declares, a result with nothing fired attaches nothing, and a fired
+// escalation declaring no reviewers attaches nothing.
+func TestPersonaAttachments_NonFiringContributesNothing(t *testing.T) {
+	fx := personaFixture()
+	res, err := Evaluate(fx, spec.Change{Paths: []string{"docs/readme.md"}})
+	if err != nil {
+		t.Fatalf("Evaluate: %v", err)
+	}
+	if res.Any() {
+		t.Fatalf("fixture is not discriminating: %d escalations fired for a docs-only change", len(res.Fired))
+	}
+	if got := PersonaAttachments(res); got != nil {
+		t.Errorf("nothing fired, yet PersonaAttachments = %+v", got)
+	}
+
+	// Only escalation 2 (frontend/**) fires: data attaches, and nothing from
+	// the non-firing 0 and 1 leaks in.
+	res, err = Evaluate(fx, spec.Change{Paths: []string{"frontend/app.ts"}})
+	if err != nil {
+		t.Fatalf("Evaluate: %v", err)
+	}
+	got := PersonaAttachments(res)
+	if len(got) != 1 || got[0].Persona != "data" {
+		t.Errorf("PersonaAttachments = %+v, want only data (from the one fired escalation)", got)
+	}
+
+	approvalsOnly, err := Evaluate([]spec.Escalation{ruleKeyRuleA()}, spec.Change{Paths: []string{"backend/internal/server/runs.go"}})
+	if err != nil {
+		t.Fatalf("Evaluate: %v", err)
+	}
+	if !approvalsOnly.Any() {
+		t.Fatal("fixture is not discriminating: ruleKeyRuleA did not fire")
+	}
+	if got := PersonaAttachments(approvalsOnly); got != nil {
+		t.Errorf("a fired escalation declaring no reviewers attached %+v", got)
+	}
+}
+
+// TestRenderFired_ReviewersOnlyFiring pins what the escalation_fired audit
+// entry carries for a reviewers-only firing (approval condition 2, E55.9 /
+// #3754). The server's resolveEscalations writes that entry whenever
+// res.Any() — NOT on Requirements.IsZero — so a reviewers-only escalation that
+// fires at the approval / delegation seams DOES produce an entry; this pins
+// both halves of what it renders: Any() is true (so the entry is written), the
+// composed requirements are the zero value (so the approval gate and the
+// delegation clamp raise nothing), and the rendering names the fired rule with
+// NO "Raised:" clause — accurate, since nothing is raised at those seams.
+func TestRenderFired_ReviewersOnlyFiring(t *testing.T) {
+	rule := esc(spec.Predicate{Paths: []string{"backend/internal/spec/**"}}, spec.EscalationRequirements{Reviewers: []string{"security"}})
+	res, err := Evaluate([]spec.Escalation{rule}, spec.Change{Paths: []string{"backend/internal/spec/x.go"}})
+	if err != nil {
+		t.Fatalf("Evaluate: %v", err)
+	}
+	if !res.Any() {
+		t.Fatal("a reviewers-only escalation matching the change did not fire")
+	}
+	if !res.Requirements.IsZero() {
+		t.Errorf("a reviewers-only firing composed to %+v, want the zero value (nothing raised at the approval / delegation seams)", res.Requirements)
+	}
+	got := RenderFired(res)
+	if want := "1 escalation fired: escalation 0 (paths=backend/internal/spec/**)"; got != want {
+		t.Errorf("RenderFired = %q, want %q (no Raised: clause)", got, want)
+	}
 }
 
 // TestRuleKey_InvariantToWithinRulePermutation pins the canonicalization: each

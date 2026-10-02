@@ -24,7 +24,7 @@ import (
 // the second-matcher drift E53.1 exists to prevent on a predicate that now
 // backs applies_to across three seams (#2361).
 //
-// ONLY-EVER-RAISE is enforced at DECLARATION time, in four checks that are not
+// ONLY-EVER-RAISE is enforced at DECLARATION time, in five checks that are not
 // all the same shape:
 //
 //	count           RAISE-check   must exceed the max count over every approval gate
@@ -32,14 +32,20 @@ import (
 //	member_of       NO-OP check   refused only when EVERY applicable gate already
 //	                              names it (the conjunction de-duplicates it)
 //	max_autonomy    NO-OP check   refused when the clamp leaves the matrix identical
+//	reviewers       NO-OP check   refused only when EVERY agent-reviewing plan /
+//	                              implement stage already attaches the persona
+//	                              statically (the union de-duplicates it)
 //
-// The two no-op checks are NOT lowering checks, and the distinction matters in
-// review. Membership composes as a CONJUNCTION over a de-duplicated set, so
+// The three no-op checks are NOT lowering checks, and the distinction matters
+// in review. Membership composes as a CONJUNCTION over a de-duplicated set, so
 // adding a group can only ever narrow the eligible approver set — no lowering
 // is expressible. The clamp only ever downgrades auto->gated, so a ceiling is
-// monotone-decreasing by construction — again no lowering is expressible. What
-// IS expressible on both dimensions is an escalation that raises NOTHING, and
-// that is the defect these two checks refuse.
+// monotone-decreasing by construction — again no lowering is expressible. A
+// persona attachment composes as a de-duplicated UNION with the reviewed
+// stage's static reviewers.personas, so it can only ever add a reviewer
+// invocation — no lowering is expressible there either. What IS expressible on
+// all three dimensions is an escalation that raises NOTHING, and that is the
+// defect these checks refuse.
 
 // Escalation is one declared escalation rule: the change it applies to, and
 // the requirements it raises for such a change.
@@ -63,6 +69,20 @@ type EscalationRequirements struct {
 	// MaxAutonomy is a CEILING on agent autonomy, applied LAST over the fully
 	// resolved action matrix. Empty means no ceiling.
 	MaxAutonomy AutonomyTier `json:"max_autonomy,omitempty" yaml:"max_autonomy,omitempty"`
+	// Reviewers names reviewer_personas entries this escalation ATTACHES to
+	// a matching change's agent review (ADR-084 D2(c) / E55.9 / #3754). Nil
+	// means this escalation attaches no persona. The schema's
+	// $defs/escalation_requirements is additionalProperties:false and this
+	// struct round-trips through ParseBytes' DisallowUnknownFields decode,
+	// so the field MUST stay in lockstep with the schema.
+	//
+	// It is deliberately NOT folded into ComposedRequirements: that type's
+	// IsZero drives the approval gate's fetch-error fail-closed branch, the
+	// snapshot.Escalated stamp and the 403 `escalated` flag, so a
+	// reviewers-only escalation must stay "nothing raised" on the approval
+	// and delegation seams. The review loop derives persona attachment from
+	// the FIRED set instead (backend/internal/escalation.PersonaAttachments).
+	Reviewers []string `json:"reviewers,omitempty" yaml:"reviewers,omitempty"`
 }
 
 // EscalatedApprovals is the raised approval-gate requirement. It is a strict
@@ -88,6 +108,13 @@ type EscalatedApprovals struct {
 // The zero value is "nothing raised", which is what a workflow declaring no
 // escalations — and a change matching none of the ones it declares — resolves
 // to, so the no-escalation case is a value rather than a special case.
+//
+// require.reviewers (E55.9 / #3754) has NO field here, on purpose: a persona
+// attachment raises the REVIEW, not the approval gate or the autonomy clamp,
+// and IsZero is what those two seams read to decide whether anything was
+// raised (approvals.go's fetch-error fail-closed branch, snapshot.Escalated,
+// the 403 `escalated` flag). A reviewers-only escalation therefore composes to
+// the zero value — pinned by TestComposeEscalations_ReviewersOnlyIsZero.
 type ComposedRequirements struct {
 	// Count is the raised approval count, nil when no fired escalation
 	// declared one.
@@ -268,8 +295,8 @@ func ClampResolvedMatrix(rm *ResolvedMatrix, ceiling AutonomyTier) *ResolvedMatr
 const MsgEscalationChangeKindUnsupported = "escalations does not accept the change_kind criterion in `match`: nothing produces a change kind today, so the criterion can never be satisfied and this escalation could never fire; match on paths, labels or trigger instead (the shared predicate keeps change_kind for its other consumers)"
 
 // MsgFmtEscalationNoRaise is the ONE message shape every only-ever-raise
-// rejection uses, so the four dimensions cannot drift into four differently
-// actionable messages. Arguments, in order: workflow name, escalation index,
+// rejection uses, so the five dimensions (count, min_permission, member_of,
+// max_autonomy, reviewers) cannot drift into differently actionable messages. Arguments, in order: workflow name, escalation index,
 // dimension (e.g. "approvals.count"), the escalated value as written, the
 // baseline it fails to raise, and the fix.
 //
@@ -349,7 +376,14 @@ func escalationPathsNoPlanStageMessage(workflow string, idx int) string {
 //  5. approvals.min_permission raise-check;
 //  6. approvals.member_of no-op check;
 //  7. max_autonomy no-op check;
-//  8. match.paths on a workflow declaring no plan stage (E53.16 / #2382) —
+//  8. require.reviewers names an undeclared persona (E55.9 / #3754) —
+//     reported at .../require/reviewers/<j>, the FIRST undeclared name;
+//  9. require.reviewers on a workflow with no plan / implement stage
+//     configuring agent reviewers — the persona has no review loop to join,
+//     so it is inert wherever the escalation fires;
+//  10. require.reviewers no-op check — a persona EVERY agent-reviewing plan /
+//     implement stage already attaches statically raises nothing;
+//  11. match.paths on a workflow declaring no plan stage (E53.16 / #2382) —
 //     the STRUCTURAL-IMPOSSIBILITY rung, the escalation twin of
 //     validateAppliesTo's rung 3.
 //
@@ -361,16 +395,27 @@ func escalationPathsNoPlanStageMessage(workflow string, idx int) string {
 // reading, so the rejection message names the baseline explicitly rather than
 // leaving the author to guess which gate they failed.
 //
+// Steps 8-10 read the RESOLVED stages (reuse folded) and mirror
+// validateStageReviewerPersonas' vocabulary: the agent-review predicate is
+// reviewConventionStageType (plan / implement) AND Reviewers.AgentCount() > 0,
+// and the static attachment set is that stage's reviewers.personas. Step 9's
+// per-stage reading is deliberately a declaration-time check: the runtime
+// decides whether a review loop runs from the FIRST stage of the type, so a
+// workflow whose first implement stage configures no agents while a later one
+// does validates here yet runs no persona on that later stage — the same
+// first-of-type residual the review-loop authority carries (documented in
+// backend/internal/server/README.md).
+//
 // Step 7 is backend-only: it needs the v2 tier expansion and the resolved
 // matrix, which cli/internal/spec deliberately does not carry (mirroring the
 // resolver there would be precisely the duplicate-implementation drift this
 // epic exists to prevent). Every other check is mirrored onto the CLI's
 // raw-tree validator with byte-identical messages.
 //
-// Step 8 is LAST for the reason validateAppliesTo's structural rung is last:
+// Step 11 is LAST for the reason validateAppliesTo's structural rung is last:
 // change_kind (rung 1) and the shared Predicate.Validate (rung 2) keep
 // reporting their sharper SPELLING diagnoses first, and the require-side rungs
-// (3-7) keep reporting first too, because a require diagnosis names a
+// (3-10) keep reporting first too, because a require diagnosis names a
 // dimension the author wrote wrong while this one names the workflow's SHAPE —
 // worth reporting only once the entry is otherwise well-formed. It reads
 // wf.Stages AFTER v2 reuse resolution (parse.go resolves reuse before Validate
@@ -383,7 +428,7 @@ func escalationPathsNoPlanStageMessage(workflow string, idx int) string {
 // future stage type producing an authoritative pre-implementation path set
 // relaxes the refusal by joining the producer set rather than repealing the
 // rule.
-func validateEscalations(name string, wf *Workflow) error {
+func validateEscalations(s *Spec, name string, wf *Workflow) error {
 	if wf == nil || len(wf.Escalations) == 0 {
 		return nil
 	}
@@ -405,6 +450,9 @@ func validateEscalations(name string, wf *Workflow) error {
 			return err
 		}
 		if err := validateEscalatedCeiling(name, i, ptr, e.Require.MaxAutonomy, wf); err != nil {
+			return err
+		}
+		if err := validateEscalatedReviewers(s, name, i, e.Require.Reviewers, wf); err != nil {
 			return err
 		}
 		if planless && len(e.Match.Paths) > 0 {
@@ -490,6 +538,92 @@ func validateEscalatedCeiling(name string, idx int, ptr string, ceiling Autonomy
 			"the workflow's resolved action matrix: clamping it with this ceiling leaves every action class exactly as resolved, at this workflow and at every gate declaring its own autonomy block",
 			fmt.Sprintf("Declare a ceiling stricter than what the workflow already resolves to, or drop require.max_autonomy (a workflow that delegates nothing has nothing for a %q ceiling to restrict).", ceiling)),
 	}
+}
+
+// validateEscalatedReviewers runs steps 8-10 for one escalation's
+// require.reviewers (ADR-084 D2(c) / E55.9 / #3754): every name declared, an
+// agent-reviewing plan / implement stage to join, and not a no-op. The texts
+// live in reviewer_personas.go beside the persona family's other single-line
+// constants (TestReviewerPersonasMessageParity holds them byte-identical to
+// the CLI); the no-op rung reuses the shared MsgFmtEscalationNoRaise shape.
+func validateEscalatedReviewers(s *Spec, name string, idx int, names []string, wf *Workflow) error {
+	if len(names) == 0 {
+		return nil
+	}
+	var declared map[string]ReviewerPersona
+	if s != nil {
+		declared = s.ReviewerPersonas
+	}
+	for j, persona := range names {
+		if _, ok := declared[persona]; !ok {
+			return &ValidationError{
+				Path:    fmt.Sprintf(PathFmtEscalationReviewerItem, name, idx, j),
+				Message: fmt.Sprintf(MsgFmtEscalationReviewerPersonaUnknown, name, idx, persona, persona),
+			}
+		}
+	}
+	reviewing := agentReviewingStages(wf)
+	if len(reviewing) == 0 {
+		return &ValidationError{
+			Path:    fmt.Sprintf(PathFmtEscalationReviewers, name, idx),
+			Message: fmt.Sprintf(MsgFmtEscalationReviewersNoAgentReview, name, idx, name),
+		}
+	}
+	for j, persona := range names {
+		if everyStageAttachesPersona(reviewing, persona) {
+			return &ValidationError{
+				Path:    fmt.Sprintf(PathFmtEscalationReviewerItem, name, idx, j),
+				Message: escalationReviewerNoRaiseMessage(name, idx, persona),
+			}
+		}
+	}
+	return nil
+}
+
+// escalationReviewerNoRaiseMessage renders the require.reviewers no-op
+// rejection through the shared MsgFmtEscalationNoRaise shape — the helper the
+// CLI port duplicates verbatim, so the rendered text is byte-identical on both
+// validators (the corpus row persona-escalation-noop pins it).
+func escalationReviewerNoRaiseMessage(workflow string, idx int, persona string) string {
+	return escalationNoRaiseMessage(workflow, idx, "reviewers",
+		fmt.Sprintf("persona %q", persona),
+		fmt.Sprintf(MsgFmtEscalationReviewerNoRaiseBaseline, persona),
+		fmt.Sprintf(MsgFmtEscalationReviewerNoRaiseFix, persona, persona))
+}
+
+// agentReviewingStages returns every stage of the resolved workflow that runs
+// the agent-review loop a persona joins: a plan or implement stage
+// (reviewConventionStageType) configuring at least one agent reviewer.
+func agentReviewingStages(wf *Workflow) []*Stage {
+	var out []*Stage
+	for i := range wf.Stages {
+		st := &wf.Stages[i]
+		if !reviewConventionStageType(st.Type) || st.Reviewers == nil || st.Reviewers.AgentCount() == 0 {
+			continue
+		}
+		out = append(out, st)
+	}
+	return out
+}
+
+// everyStageAttachesPersona reports whether EVERY stage in stages already
+// attaches persona through its static reviewers.personas — the condition
+// under which an escalated persona de-duplicates away. A persona some stage
+// omits genuinely raises that stage's review and is accepted.
+func everyStageAttachesPersona(stages []*Stage, persona string) bool {
+	for _, st := range stages {
+		found := false
+		for _, name := range st.Reviewers.Personas {
+			if name == persona {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return len(stages) > 0
 }
 
 // resolvedMatricesOf returns every matrix a ceiling could apply to: the
