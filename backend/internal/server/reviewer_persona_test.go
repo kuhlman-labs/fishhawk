@@ -60,6 +60,9 @@ type personaSpecOpts struct {
 	// severityCap, when non-empty, declares the persona remit's severity_cap
 	// (E55.10 / #3755).
 	severityCap string
+	// decisionRecordIndex, when non-empty, declares the persona's
+	// decision_record.index (ADR-084 D4(b) / E78.5 / #3756).
+	decisionRecordIndex string
 }
 
 // personaSpec renders a complete workflow-v2 document: a plan and an
@@ -76,6 +79,9 @@ func personaSpec(o personaSpecOpts) []byte {
 		fmt.Fprintf(&b, "reviewer_personas:\n  security:\n    agent:\n      provider: %s\n      model: %s\n    remit:\n      path: %s\n", pp, personaAgentModel, personaRemitPath)
 		if o.severityCap != "" {
 			fmt.Fprintf(&b, "      severity_cap: %s\n", o.severityCap)
+		}
+		if o.decisionRecordIndex != "" {
+			fmt.Fprintf(&b, "    decision_record:\n      index: %s\n", o.decisionRecordIndex)
 		}
 	}
 	b.WriteString("workflows:\n  feature_change:\n")
@@ -115,6 +121,10 @@ type personaFetcher struct {
 	// err, when set, is returned for every fetch (a forge failure that is
 	// NOT not-found).
 	err error
+	// atRef, when set, additionally serves ref -> path -> content at refs
+	// OTHER than personaBaseCommit (a branch edit), so a read made at the
+	// wrong ref is observable by its content (E78.5 / #3756).
+	atRef map[string]map[string]string
 }
 
 func newPersonaFetcher() *personaFetcher {
@@ -128,6 +138,9 @@ func (f *personaFetcher) FetchFile(_ context.Context, _ forge.CredentialScope, _
 	f.paths = append(f.paths, p)
 	if f.err != nil {
 		return nil, f.err
+	}
+	if c, ok := f.atRef[ref][p]; ok && ref != personaBaseCommit {
+		return &forge.FileContent{Path: p, Content: []byte(c), SHA: "blobblobblobblobblobblobblobblobblobblob"}, nil
 	}
 	c, ok := f.files[p]
 	if !ok || ref != personaBaseCommit {
