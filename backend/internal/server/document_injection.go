@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/repodoc"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
 
 // resolveDeclaredDocuments is the shared resolve/render core behind BOTH
@@ -25,9 +27,11 @@ import (
 //
 // INERT WITHOUT A DECLARATION SEAM. With Config.DocumentDeclarations nil this
 // returns (nil, nil) and every prompt is byte-identical to the pre-#2242
-// render; that nil check is the SOLE inert signal, shared by the prompt
-// endpoints and the in-process review build sites
-// (resolveReviewInjectedDocuments, #2797). A configured seam that declares
+// render. The check lives in the shared core (resolveDocumentSet), so the
+// prompt endpoints and the in-process review build sites (resolveReviewDocuments,
+// #2797) cannot diverge on it; a review site is additionally non-inert when the
+// workflow selects a review convention (E55.3 / #2244), which an author prompt
+// never does. A configured seam that declares
 // zero documents for a stage is equally byte-identical. The seam exists so
 // every consumer (#2234's charter.path, E55's review_conventions[]) attaches
 // at ONE point rather than each growing its own resolution path.
@@ -83,30 +87,159 @@ func (s *Server) resolveDeclaredDocuments(ctx context.Context, runRow *run.Run, 
 	if runRow == nil || stage == nil {
 		return nil, nil
 	}
-	if s.cfg.DocumentDeclarations == nil {
-		return nil, nil // fully inert: no consumer declares a document
+	res, err := s.resolveDocumentSet(ctx, documentResolveInput{
+		runRow:    runRow,
+		stageID:   stage.ID,
+		stage:     stage,
+		attribute: attribute,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return res.injected, nil
+}
+
+// reviewDocumentResolveTimeout bounds the RESOLVE phase of an in-process
+// review build (#2797 item 1): the declaration-seam call, the credential-scope
+// lookup and every forge Resolve run on a context with this deadline. The
+// implement-review site resolves while holding reviewDispatchMu (so a
+// duplicate dispatch stays a silent no-op), and an unbounded forge read there
+// would hold that lock for as long as the forge hangs. The audit appends
+// (RecordWithheld / Attribute) deliberately run on the CALLER's context, so an
+// expiring deadline can never fail a half-written attribution set. The /prompt
+// endpoints get no deadline: their behaviour is unchanged.
+//
+// Residual: a hung forge still holds reviewDispatchMu for up to this bound per
+// dispatch; only runs that declare documents or select review conventions pay
+// it.
+const reviewDocumentResolveTimeout = 30 * time.Second
+
+// documentResolveInput is one call into the shared resolve/attribute/render
+// core (resolveDocumentSet).
+type documentResolveInput struct {
+	runRow *run.Run
+	// stageID is the stage attribution entries are stamped with.
+	stageID uuid.UUID
+	// stage is the stage handed to the declaration seam. When nil and
+	// loadStage is set, it is loaded by stageID — LAZILY, only when the seam
+	// is configured (the seam is its only consumer).
+	stage     *run.Stage
+	loadStage bool
+	// conventions are the review conventions selected for this review round
+	// (E55.3 / #2244). Empty on every author-prompt path, so a convention can
+	// never reach an author prompt.
+	conventions []spec.SelectedReviewConvention
+	// resolveTimeout bounds the seam call, the credential scope and every
+	// Resolve; zero means the caller's context alone.
+	resolveTimeout time.Duration
+	// attribute gates the audit writes and NOTHING else.
+	attribute bool
+}
+
+// resolvedDocumentSet is what resolveDocumentSet produced.
+type resolvedDocumentSet struct {
+	// injected are the seam-declared documents plus, when any run-admission
+	// declaration was withheld, the WithheldNotice.
+	injected []prompt.InjectedDocument
+	// conventions are the RESOLVED review conventions, rendered — review
+	// prompts only.
+	conventions []prompt.ReviewConvention
+	// rendered are the selections behind conventions, in the same order.
+	rendered []spec.SelectedReviewConvention
+}
+
+// resolveDocumentSet is the shared core behind resolveDeclaredDocuments (both
+// prompt endpoints) and resolveReviewDocuments (the in-process review builds).
+// The contract documented on resolveDeclaredDocuments holds for every caller;
+// this adds the review-only inputs.
+//
+// INERT CHECK FIRST. No declaration seam AND no selected convention returns
+// the zero value before ANY read — in particular before the lazy reviewed-stage
+// load (#2797 item 3), so an otherwise-inert review no longer fails on an
+// unloadable stage row.
+//
+// A SELECTED CONVENTION WITH A NIL RESOLVER FAILS CLOSED, even with no
+// declaration seam: the workflow intends to constrain the reviewer and the
+// deployment cannot read the document — the same partial-configuration rule
+// as the seam's.
+//
+// CONVENTIONS SHARE THE WHOLE PIPELINE. Their declarations (always
+// BaseSourceRunAdmission) are appended after the seam's, go through the same
+// base-source partition (no recorded admission commit -> withheld + notice +
+// document_injection_degraded) and the same resolve-everything-before-any-
+// attribution loop. A missing REQUIRED convention fails the whole set with
+// reviewConventionMissingError — before any audit entry is written. A missing
+// OPTIONAL convention is withheld with reason
+// repodoc.WithheldReasonOptionalDocumentMissing, recorded by RecordWithheld
+// BEFORE Attribute, and renders nothing. Resolved conventions are returned in
+// conventions, never in injected.
+func (s *Server) resolveDocumentSet(ctx context.Context, in documentResolveInput) (resolvedDocumentSet, error) {
+	runRow := in.runRow
+	seam := s.cfg.DocumentDeclarations
+	if seam == nil && len(in.conventions) == 0 {
+		return resolvedDocumentSet{}, nil // fully inert: nothing declares a document
 	}
 	if s.cfg.DocumentResolver == nil {
-		return nil, errors.New("document injection is misconfigured: DocumentDeclarations is configured but DocumentResolver is nil; " +
-			"wire a resolver or remove the declaration seam")
+		if seam != nil {
+			return resolvedDocumentSet{}, errors.New("document injection is misconfigured: DocumentDeclarations is configured but DocumentResolver is nil; " +
+				"wire a resolver or remove the declaration seam")
+		}
+		return resolvedDocumentSet{}, errors.New("document injection is misconfigured: the workflow selects review conventions for this review but DocumentResolver is nil; " +
+			"wire a resolver (a file-capable forge) or remove the review_conventions selection")
 	}
-	decls, baseRef, err := s.cfg.DocumentDeclarations(ctx, runRow, stage)
-	if err != nil {
-		return nil, fmt.Errorf("resolve document declarations: %w", err)
+
+	resolveCtx := ctx
+	if in.resolveTimeout > 0 {
+		var cancel context.CancelFunc
+		resolveCtx, cancel = context.WithTimeout(ctx, in.resolveTimeout)
+		defer cancel()
+	}
+
+	var (
+		decls   []repodoc.Declaration
+		baseRef string
+	)
+	if seam != nil {
+		stage := in.stage
+		if stage == nil && in.loadStage {
+			loaded, err := s.cfg.RunRepo.GetStage(ctx, in.stageID)
+			if err != nil {
+				return resolvedDocumentSet{}, fmt.Errorf("load reviewed stage %s: %w", in.stageID, err)
+			}
+			if loaded == nil {
+				return resolvedDocumentSet{}, fmt.Errorf("load reviewed stage %s: stage not found", in.stageID)
+			}
+			stage = loaded
+		}
+		var err error
+		decls, baseRef, err = seam(resolveCtx, runRow, stage)
+		if err != nil {
+			return resolvedDocumentSet{}, fmt.Errorf("resolve document declarations: %w", err)
+		}
+	}
+	// convOf maps a declaration's index to its convention's index (-1 for a
+	// seam declaration).
+	convOf := make([]int, len(decls), len(decls)+len(in.conventions))
+	for i := range convOf {
+		convOf[i] = -1
+	}
+	for ci, c := range in.conventions {
+		decls = append(decls, conventionDeclaration(c))
+		convOf = append(convOf, ci)
 	}
 	if len(decls) == 0 {
-		return nil, nil
+		return resolvedDocumentSet{}, nil
 	}
 
 	repo, err := parseRepoRef(runRow.Repo)
 	if err != nil {
-		return nil, err
+		return resolvedDocumentSet{}, err
 	}
 	var scope forge.CredentialScope
 	if s.cfg.DocumentScope != nil {
-		scope, err = s.cfg.DocumentScope(ctx, repo)
+		scope, err = s.cfg.DocumentScope(resolveCtx, repo)
 		if err != nil {
-			return nil, fmt.Errorf("resolve credential scope for %s: %w", repo, err)
+			return resolvedDocumentSet{}, fmt.Errorf("resolve credential scope for %s: %w", repo, err)
 		}
 	}
 
@@ -115,14 +248,14 @@ func (s *Server) resolveDeclaredDocuments(ctx context.Context, runRow *run.Run, 
 	// there is no ref it may honestly be read at (the seam's ref and the run's
 	// branch are both mutable), so it is never handed to Resolve at all.
 	// Declaration order is preserved within each partition.
-	resolvable := make([]repodoc.Declaration, 0, len(decls))
+	resolvable := make([]int, 0, len(decls))
 	var withheld repodoc.Withheld
-	for _, decl := range decls {
+	for i, decl := range decls {
 		if decl.Base == repodoc.BaseSourceRunAdmission && runRow.DocumentBaseCommit == nil {
 			withheld.Declarations = append(withheld.Declarations, decl)
 			continue
 		}
-		resolvable = append(resolvable, decl)
+		resolvable = append(resolvable, i)
 	}
 	if len(withheld.Declarations) > 0 {
 		withheld.Reason = repodoc.WithheldReasonRunBaseUnrecorded
@@ -136,7 +269,10 @@ func (s *Server) resolveDeclaredDocuments(ctx context.Context, runRow *run.Run, 
 	// is append-only, so the fix is ordering: nothing is claimed until the
 	// whole set is known to be resolvable.
 	docs := make([]repodoc.Document, 0, len(resolvable))
-	for _, decl := range resolvable {
+	docDecl := make([]int, 0, len(resolvable))
+	optionalMissing := repodoc.Withheld{Reason: repodoc.WithheldReasonOptionalDocumentMissing}
+	for _, i := range resolvable {
+		decl := decls[i]
 		ref := baseRef
 		if decl.Base == repodoc.BaseSourceRunAdmission {
 			// Never the seam's ref: the admission commit, verbatim. A
@@ -145,57 +281,81 @@ func (s *Server) resolveDeclaredDocuments(ctx context.Context, runRow *run.Run, 
 			// non-commit ref before a branch lookup or fetch.
 			ref = *runRow.DocumentBaseCommit
 		}
-		doc, err := s.cfg.DocumentResolver.Resolve(ctx, repodoc.Request{
+		doc, err := s.cfg.DocumentResolver.Resolve(resolveCtx, repodoc.Request{
 			Repo:        repo,
 			Scope:       scope,
 			BaseRef:     ref,
 			Declaration: decl,
 		})
 		if err != nil {
-			return nil, err
+			if ci := convOf[i]; ci >= 0 && isMissingDocument(err) {
+				if conv := in.conventions[ci]; conv.Required {
+					return resolvedDocumentSet{}, reviewConventionMissingError(conv, ref, err)
+				}
+				optionalMissing.Declarations = append(optionalMissing.Declarations, decl)
+				continue
+			}
+			return resolvedDocumentSet{}, err
 		}
 		docs = append(docs, *doc)
+		docDecl = append(docDecl, i)
 	}
 
 	// Attribute the whole set, and return NOTHING on failure — the injection
 	// and its audit entries ship together or not at all. repodoc.Attribute
 	// orders its own appends so a failure cannot leave a successful-injection
 	// claim behind (truncations first, injection claims last, all tagged with
-	// one injection_set_id). The withheld set is recorded FIRST and fails
+	// one injection_set_id). Each withheld set is recorded FIRST and fails
 	// closed the same way: a served prompt missing a declared document with no
 	// audit trace of why is the un-attributed omission that entry prevents,
 	// and writing it before any document_injected claim means its failure
-	// leaves no injection claim behind.
+	// leaves no injection claim behind. The appends run on the CALLER's
+	// context, never the bounded resolve context.
 	//
 	// THE ONE PHASE THE PREVIEW SKIPS. Everything above this point is shared
 	// verbatim between the served and preview wrappers, so the rendered bytes
 	// and every refusal are computed by identical code; `attribute` gates this
 	// block alone. See previewInjectedDocuments for why.
-	if attribute {
-		if err := repodoc.RecordWithheld(ctx, s.cfg.AuditRepo, runRow.ID, stage.ID, withheld); err != nil {
-			return nil, err
+	if in.attribute {
+		if err := repodoc.RecordWithheld(ctx, s.cfg.AuditRepo, runRow.ID, in.stageID, withheld); err != nil {
+			return resolvedDocumentSet{}, err
 		}
-		if err := repodoc.Attribute(ctx, s.cfg.AuditRepo, runRow.ID, stage.ID, docs...); err != nil {
-			return nil, err
+		if err := repodoc.RecordWithheld(ctx, s.cfg.AuditRepo, runRow.ID, in.stageID, optionalMissing); err != nil {
+			return resolvedDocumentSet{}, err
+		}
+		if err := repodoc.Attribute(ctx, s.cfg.AuditRepo, runRow.ID, in.stageID, docs...); err != nil {
+			return resolvedDocumentSet{}, err
 		}
 	}
 
-	out := make([]prompt.InjectedDocument, 0, len(docs)+1)
-	for i, doc := range docs {
-		out = append(out, repodoc.ToPromptDocument(doc, resolvable[i].Framing))
+	var out resolvedDocumentSet
+	for j, doc := range docs {
+		i := docDecl[j]
+		rendered := repodoc.ToPromptDocument(doc, decls[i].Framing)
+		if ci := convOf[i]; ci >= 0 {
+			conv := in.conventions[ci]
+			out.conventions = append(out.conventions, prompt.ReviewConvention{
+				Name:        conv.Name,
+				SeverityCap: conv.SeverityCap,
+				Document:    rendered,
+			})
+			out.rendered = append(out.rendered, conv)
+			continue
+		}
+		out.injected = append(out.injected, rendered)
 	}
 	if len(withheld.Declarations) > 0 {
-		out = append(out, repodoc.WithheldNotice(withheld))
+		out.injected = append(out.injected, repodoc.WithheldNotice(withheld))
 	}
 	return out, nil
 }
 
 // resolveInjectedDocuments is the SERVED path's wrapper (GET
-// /v0/stages/{id}/prompt, and the in-process review builds through
-// resolveReviewInjectedDocuments, #2797): it resolves, ATTRIBUTES and renders.
-// Behaviour is byte-identical to the pre-split single function — this is the
-// only wrapper that writes document_injected / document_truncated /
-// document_injection_degraded entries.
+// /v0/stages/{id}/prompt): it resolves, ATTRIBUTES and renders. The
+// in-process review builds attribute through resolveReviewDocuments (#2797).
+// Behaviour is byte-identical to the pre-split single function; it and the
+// review resolvers are the only callers that write document_injected /
+// document_truncated / document_injection_degraded entries.
 func (s *Server) resolveInjectedDocuments(ctx context.Context, runRow *run.Run, stage *run.Stage) ([]prompt.InjectedDocument, error) {
 	return s.resolveDeclaredDocuments(ctx, runRow, stage, true)
 }
@@ -214,52 +374,114 @@ func reviewDocumentInjectionFailedReason(err error) string {
 	return reviewDocumentInjectionFailedPrefix + ": " + err.Error()
 }
 
-// resolveReviewInjectedDocuments is the REVIEW build sites' wrapper (#2797):
-// runPlanReviews (plan_review), runImplementReviewsForTree (implement_review —
-// the trace-time review, the fix-up re-review backstop and the decomposed
-// parent's consolidated review) and runSupplementalReinvokeReview. Those
-// prompts are built in-process and never pass through the signed /prompt
-// endpoint, so without this they carried no declared document at all.
+// reviewDocuments is what a review build site renders into its prompt and
+// hands its verdict ingest (E55.3 / #2244).
+type reviewDocuments struct {
+	// Injected are the declared documents for Trigger.InjectedDocuments.
+	Injected []prompt.InjectedDocument
+	// Conventions are the resolved review conventions for
+	// Trigger.ReviewConventions.
+	Conventions []prompt.ReviewConvention
+	// Round is the round's clamp caps and modified conventions files.
+	Round reviewConventionRound
+}
+
+// resolveReviewDocuments is the REVIEW build sites' resolver (#2797, E55.3 /
+// #2244): runPlanReviews (plan_review) and runImplementReviewsForTree
+// (implement_review — the trace-time review, the fix-up re-review backstop and
+// the decomposed parent's consolidated review). Those prompts are built
+// in-process and never pass through the signed /prompt endpoint, so without
+// this they carried no declared document at all.
 //
 // A REVIEW PROMPT CARRIES THE DOCUMENTS DECLARED FOR THE STAGE IT REVIEWS. The
 // reviewer is constrained by what constrained the author, so the declaration
 // seam is consulted with the REVIEWED stage (the plan stage for plan_review,
-// the implement stage for implement_review), loaded here by stageID.
+// the implement stage for implement_review).
 //
-// ONE SEAM, NO SECOND INERT SIGNAL. This wrapper adds no short-circuit of its
-// own: it delegates straight to resolveInjectedDocuments, so
-// Config.DocumentDeclarations == nil (checked inside resolveDeclaredDocuments,
-// BEFORE the nil-resolver refusal) is the SOLE inert signal for both the
-// endpoint and the review paths, and the partial-configuration refusal, the
-// base-source partition and withholding, the resolve-whole-set-before-attribute
-// ordering, RecordWithheld and Attribute all run unchanged. The two paths
-// cannot diverge on what counts as inert. The cost is one reviewed-stage read
-// per review build even when inert.
+// REVIEW CONVENTIONS ARE SELECTED HERE, PURELY. stageType locates the reviewed
+// stage in the run's workflow-spec snapshot; paths are the site's paths (plan
+// review: planGateScopePaths(plan); implement review: implementReviewPaths(diff)),
+// combined with the run's admission change by reviewConventionChange so a
+// label- or trigger-only applies_to selects identically at both sites. A
+// selection error (unparseable snapshot, undeclared name, applies_to Match
+// error) fails closed. Selected conventions are resolved at the run's
+// admission commit through the shared core and returned in Conventions —
+// never in Injected, and never on an author-prompt path. Round.Caps are the
+// RENDERED conventions' caps; Round.ModifiedFiles (implement review only) are
+// the declared conventions files among paths, decided from EVERY declared
+// entry whether or not this round selected it.
+//
+// LAZY STAGE LOAD, ONE INERT SIGNAL (#2797 item 3). With no declaration seam
+// and no selected convention nothing is read — not even the reviewed stage —
+// and Injected/Conventions are empty (Round.ModifiedFiles, being pure, is still
+// computed). The reviewed stage is loaded only when the seam is configured,
+// because the seam is its only consumer; attribution keys on stageID.
+//
+// BOUNDED RESOLVE PHASE (#2797 item 1). The seam call, the credential scope and
+// every forge read run under reviewDocumentResolveTimeout; the audit appends
+// run on ctx.
 //
 // ATTRIBUTION RUNS PER REVIEW BUILD. One document_injected set is written per
 // review round — shared by every reviewer of that round, which all read the
-// same prompt — with stage_id = the reviewed stage.
+// same prompt — with stage_id = the reviewed stage. A resolved convention's
+// entry names review_conventions.<name> as its declaration site.
 //
 // FAILS CLOSED, AND CALLERS MUST HONOUR IT. Every error — a nil run row, a
-// reviewed stage that cannot be loaded, a partial seam configuration, a
-// declaration that cannot be resolved, an audit append that fails — means the
-// declared set could not be resolved or attributed. The caller must then run
-// NO reviewer (a document-less review prompt is exactly the unconstrained
+// selection error, a reviewed stage that cannot be loaded, a partial
+// configuration, a declaration that cannot be resolved, a missing REQUIRED
+// convention (review_convention_missing), an audit append that fails — means
+// the declared set could not be resolved or attributed. The caller must then
+// run NO reviewer (a document-less review prompt is exactly the unconstrained
 // verdict injection exists to prevent), record a *_review_failed entry whose
 // reason is reviewDocumentInjectionFailedReason(err), and, under gating
 // authority, fail the stage category-B.
+func (s *Server) resolveReviewDocuments(ctx context.Context, runRow *run.Run, stageID uuid.UUID, stageType spec.StageType, paths []string) (reviewDocuments, error) {
+	if runRow == nil {
+		return reviewDocuments{}, errors.New("reviewed run row is unavailable")
+	}
+	sel, err := selectReviewConventions(runRow, stageType, reviewConventionChange(runRow, paths))
+	if err != nil {
+		return reviewDocuments{}, err
+	}
+	var round reviewConventionRound
+	if stageType == spec.StageTypeImplement {
+		round.ModifiedFiles = conventionPathsTouched(paths, sel.DeclaredPaths)
+	}
+	res, err := s.resolveReviewDocumentSet(ctx, runRow, stageID, sel.Selected)
+	if err != nil {
+		return reviewDocuments{}, err
+	}
+	round.Caps = conventionCapsFor(res.rendered)
+	return reviewDocuments{Injected: res.injected, Conventions: res.conventions, Round: round}, nil
+}
+
+// resolveReviewDocumentSet runs the shared core for a review build: lazy
+// reviewed-stage load, bounded resolve phase, attribution on.
+func (s *Server) resolveReviewDocumentSet(ctx context.Context, runRow *run.Run, stageID uuid.UUID, conventions []spec.SelectedReviewConvention) (resolvedDocumentSet, error) {
+	return s.resolveDocumentSet(ctx, documentResolveInput{
+		runRow:         runRow,
+		stageID:        stageID,
+		loadStage:      true,
+		conventions:    conventions,
+		resolveTimeout: reviewDocumentResolveTimeout,
+		attribute:      true,
+	})
+}
+
+// resolveReviewInjectedDocuments is the NO-CONVENTION review resolver: the
+// declared documents of the reviewed stage only, through the same bounded,
+// lazy-loading core as resolveReviewDocuments, with no convention selected.
+// runSupplementalReinvokeReview uses it (a supplemental re-invoke renders no
+// conventions section). Its fail-closed contract is resolveReviewDocuments'.
 func (s *Server) resolveReviewInjectedDocuments(ctx context.Context, runRow *run.Run, stageID uuid.UUID) ([]prompt.InjectedDocument, error) {
 	if runRow == nil {
 		return nil, errors.New("reviewed run row is unavailable")
 	}
-	stage, err := s.cfg.RunRepo.GetStage(ctx, stageID)
+	res, err := s.resolveReviewDocumentSet(ctx, runRow, stageID, nil)
 	if err != nil {
-		return nil, fmt.Errorf("load reviewed stage %s: %w", stageID, err)
+		return nil, err
 	}
-	if stage == nil {
-		return nil, fmt.Errorf("load reviewed stage %s: stage not found", stageID)
-	}
-	return s.resolveInjectedDocuments(ctx, runRow, stage)
+	return res.injected, nil
 }
 
 // previewInjectedDocuments is the PREVIEW path's wrapper (GET
