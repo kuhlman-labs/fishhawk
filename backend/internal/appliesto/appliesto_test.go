@@ -214,6 +214,8 @@ func TestFirstFailingCriterion_NamesTheCriterion(t *testing.T) {
 //   - the three ORIGIN sources and the empty value map to diff;
 //   - on_demand maps to on_demand — the producer that makes ADR-065's
 //     `trigger: [scheduled, on_demand]` grooming declaration selectable;
+//   - scheduled maps to scheduled (E79.1 / #3725) — the in-process
+//     scheduler's runs;
 //   - an UNRECOGNIZED source stays diff-shaped (the conservative default arm:
 //     every existing predicate is written against a diff-form change).
 func TestTriggerFormForSource(t *testing.T) {
@@ -226,9 +228,7 @@ func TestTriggerFormForSource(t *testing.T) {
 		{"ui", spec.TriggerDiff},
 		{"", spec.TriggerDiff},
 		{"nonsense", spec.TriggerDiff},
-		// `scheduled` has NO producer, so no trigger_source maps to it; the
-		// string is not a trigger source at all and takes the default arm.
-		{"scheduled", spec.TriggerDiff},
+		{"scheduled", spec.TriggerScheduled},
 		{"on_demand", spec.TriggerOnDemand},
 	}
 	for _, tc := range cases {
@@ -240,6 +240,46 @@ func TestTriggerFormForSource(t *testing.T) {
 	// literals that could drift from them.
 	if got := TriggerFormForSource(string(run.TriggerOnDemand)); got != spec.TriggerOnDemand {
 		t.Errorf("TriggerFormForSource(run.TriggerOnDemand) = %q, want on_demand", got)
+	}
+	if got := TriggerFormForSource(string(run.TriggerScheduled)); got != spec.TriggerScheduled {
+		t.Errorf("TriggerFormForSource(run.TriggerScheduled) = %q, want scheduled", got)
+	}
+}
+
+// TestAdmissionChange_ScheduledMatchesScheduledPredicate (E79.1 / #3725) is
+// the scheduled producer asserted through the Change BUILDER, in both
+// directions: a predicate declaring only [scheduled] now ADMITS a
+// scheduled-source change (before #3725 nothing mapped to it, so it matched
+// nothing), the grooming [scheduled, on_demand] declaration admits it too, and
+// a diff-only predicate REFUSES it — widening the mapping must not re-route a
+// diff declaration onto the scheduler's runs.
+func TestAdmissionChange_ScheduledMatchesScheduledPredicate(t *testing.T) {
+	scheduled := AdmissionChange(string(run.TriggerScheduled), nil)
+	if scheduled.Trigger != spec.TriggerScheduled {
+		t.Fatalf("AdmissionChange(scheduled).Trigger = %q, want scheduled", scheduled.Trigger)
+	}
+	for _, tc := range []struct {
+		name string
+		p    spec.Predicate
+		want bool
+	}{
+		{"[scheduled] admits", spec.Predicate{Triggers: []spec.TriggerForm{spec.TriggerScheduled}}, true},
+		{"[scheduled, on_demand] admits", spec.Predicate{Triggers: []spec.TriggerForm{spec.TriggerScheduled, spec.TriggerOnDemand}}, true},
+		{"[on_demand] refuses", spec.Predicate{Triggers: []spec.TriggerForm{spec.TriggerOnDemand}}, false},
+		{"[diff] refuses", spec.Predicate{Triggers: []spec.TriggerForm{spec.TriggerDiff}}, false},
+	} {
+		ok, err := tc.p.Match(scheduled)
+		if err != nil || ok != tc.want {
+			t.Errorf("%s: Match(scheduled change) = (%v, %v), want (%v, nil)", tc.name, ok, err, tc.want)
+		}
+	}
+	// The converse: a [scheduled]-only predicate still refuses the operator
+	// sources, so the mapping did not make it match everything.
+	schedOnly := spec.Predicate{Triggers: []spec.TriggerForm{spec.TriggerScheduled}}
+	for _, src := range []run.TriggerSource{run.TriggerGitHubIssue, run.TriggerCLI, run.TriggerUI, run.TriggerOnDemand} {
+		if ok, err := schedOnly.Match(AdmissionChange(string(src), nil)); err != nil || ok {
+			t.Errorf("(%v, %v): trigger:[scheduled] must REFUSE a %s run", ok, err, src)
+		}
 	}
 }
 

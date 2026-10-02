@@ -853,9 +853,10 @@ type createRunRequest struct {
 	// ships title/body/url/number inline so the prompt builder
 	// has the full context — webhook-dispatched runs leave this
 	// nil and fall through to the existing GitHub-fetch path
-	// inside prompt.fillIssueContext. Only honored when
-	// trigger_source=github_issue; ignored otherwise so the
-	// shape can't be abused to attach prose to non-issue runs.
+	// inside prompt.fillIssueContext. Only accepted with an
+	// issue-anchored trigger_source (github_issue, on_demand,
+	// scheduled — see run.IsIssueAnchored); any other source is
+	// refused 400 so the shape can't attach prose to non-issue runs.
 	IssueContext *issueContextPayload `json:"issue_context,omitempty"`
 	// Drive is the per-run drive-mode override (#1023 / #996 theme
 	// 1). A pointer so absence is distinguishable from an explicit
@@ -1076,6 +1077,28 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Reserved trigger source (E79.1 / #3725). `scheduled` is SYSTEM-ONLY:
+	// the in-process scheduler mints it through StartScheduledRun, whose
+	// request carries the unexported scheduledAdmissionKey marker. Any other
+	// caller — however well-scoped its token — is refused here with a
+	// DEDICATED code, FIRST in body validation and before any repo-dependent
+	// gate, so a refused request touches no forge, spec or audit state. The
+	// control is the marker, not the identity subject: an HTTP request cannot
+	// set an unexported context key, while any subject string is forgeable
+	// by whoever can mint a token. A marked request falls through and is
+	// exempted from the ValidTriggerSources membership check below, which
+	// stays the OPERATOR-SUBMITTABLE set.
+	scheduledAdmitted := false
+	if req.TriggerSource == string(run.TriggerScheduled) {
+		if !isScheduledAdmission(r.Context()) {
+			s.writeError(w, r, http.StatusBadRequest, "trigger_source_reserved",
+				"trigger_source scheduled is reserved to the fishhawkd scheduler and cannot be submitted to POST /v0/runs; declare a workflow `schedule` and enable the scheduler (--enable-scheduler) instead",
+				map[string]any{"field": "trigger_source", "got": req.TriggerSource})
+			return
+		}
+		scheduledAdmitted = true
+	}
+
 	if req.Repo == "" {
 		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
 			"repo is required", map[string]any{"field": "repo"})
@@ -1091,7 +1114,7 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 			"workflow_sha is required", map[string]any{"field": "workflow_sha"})
 		return
 	}
-	if _, ok := validTriggerSources[req.TriggerSource]; !ok {
+	if _, ok := validTriggerSources[req.TriggerSource]; !ok && !scheduledAdmitted {
 		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
 			validTriggerSourcesMessage,
 			map[string]any{"field": "trigger_source", "got": req.TriggerSource})
@@ -1128,10 +1151,12 @@ func (s *Server) handleCreateRun(w http.ResponseWriter, r *http.Request) {
 	// DESIGN: ADR-065's groom stage declares
 	// `inputs: [{source: github_issue, required: true}]`, so the run an
 	// operator starts on-demand is exactly a run that must carry an issue
-	// context. cli and ui still 400 — they carry no issue at all.
+	// context. scheduled (E79.1 / #3725) is anchored when its schedule names
+	// an `issue`, and reaches here only from the in-process scheduler. cli
+	// and ui still 400 — they carry no issue at all.
 	if req.IssueContext != nil && !(&run.Run{TriggerSource: run.TriggerSource(req.TriggerSource)}).IsIssueAnchored() {
 		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
-			"issue_context is only valid with an issue-anchored trigger_source (github_issue, on_demand)",
+			"issue_context is only valid with an issue-anchored trigger_source (github_issue, on_demand, scheduled)",
 			map[string]any{"field": "issue_context", "trigger_source": req.TriggerSource})
 		return
 	}

@@ -321,10 +321,11 @@ func normalizeTriggerForm(t spec.TriggerForm) spec.TriggerForm {
 // `applies_to: {trigger: [scheduled, on_demand]}` grooming declaration
 // selectable at all.
 //
-// `scheduled` still has NO producer — no scheduler exists to mint it — so a
-// predicate declaring only `scheduled` matches nothing. That is documented
-// rather than rejected because `trigger: [scheduled, on_demand]` IS usable
-// against real runs today.
+// `scheduled` (E79.1 / #3725) maps to TriggerScheduled. Its producer is the
+// in-process scheduler alone: server.StartScheduledRun mints
+// run.TriggerScheduled, and POST /v0/runs refuses that source from any other
+// caller (400 trigger_source_reserved). So a predicate declaring only
+// `scheduled` admits exactly the scheduler's runs.
 //
 // The DEFAULT arm returns TriggerDiff, so an unrecognized source stays
 // diff-shaped. That is the conservative reading: every existing predicate is
@@ -344,6 +345,8 @@ func TriggerFormForSource(triggerSource string) spec.TriggerForm {
 	switch triggerSource {
 	case string(run.TriggerOnDemand):
 		return spec.TriggerOnDemand
+	case string(run.TriggerScheduled):
+		return spec.TriggerScheduled
 	case string(run.TriggerGitHubIssue), string(run.TriggerCLI), string(run.TriggerUI):
 		return spec.TriggerDiff
 	default:
