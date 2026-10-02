@@ -2,6 +2,7 @@ package planreview_test
 
 import (
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -1645,5 +1646,426 @@ func TestConventionPayloadFields_OmitEmptyAndWire(t *testing.T) {
 	}
 	if !strings.Contains(string(plan), `"verdict_clamped_from":"reject"`) {
 		t.Errorf("plan_reviewed payload %s missing verdict_clamped_from", plan)
+	}
+}
+
+// --- E55.10 / #3755: persona concern ingest primitives ---
+
+// quoteDocs is the injected-document fixture VerifyQuotedPassages checks
+// against: a remit, a declared stage-injected document, a selected
+// review-convention document, and a withheld document with no text.
+func quoteDocs() []planreview.QuotedDocument {
+	return []planreview.QuotedDocument{
+		{Path: ".fishhawk/personas/security.md", Commit: "c1", ContentHash: "sha256:remit",
+			Text: "Security remit.\nNever log a bearer token,\n  even at debug level.\nTreat every webhook body as untrusted."},
+		{Path: "docs/ARCHITECTURE.md", Commit: "c1", ContentHash: "sha256:arch",
+			Text: "The audit log is append-only and hash-chained."},
+		{Path: "docs/conventions/go-errors.md", Commit: "c1", ContentHash: "sha256:conv",
+			Text: "Wrap every returned error with the operation that failed."},
+		{Path: "docs/withheld.md", Commit: "c1", ContentHash: "sha256:withheld", Text: "  \n "},
+	}
+}
+
+// TestVerifyQuotedPassages is the one-row-per-branch table for quote
+// verification, with ONE ROW PER NAMED FAILURE MODE (document_ref_missing,
+// document_unknown, document_text_unavailable, passage_not_found) and, per
+// approval condition 3, a verified + altered-word pair for each document class
+// a persona can quote: its remit, a declared stage-injected document and a
+// selected review-convention document. Each row builds a FRESH verdict.
+func TestVerifyQuotedPassages(t *testing.T) {
+	cases := []struct {
+		name         string
+		verdict      planreview.Verdict
+		concern      planreview.Concern
+		wantSev      planreview.ConcernSeverity
+		wantFrom     planreview.ConcernSeverity
+		wantUnverif  bool
+		wantHash     string
+		wantFailure  string // "" = not demoted
+		wantVerified bool
+		wantVerdict  planreview.Verdict
+		wantVFrom    planreview.Verdict
+	}{
+		{
+			name: "remit exact quote (whitespace-collapsed) verified with remit hash", verdict: planreview.VerdictReject,
+			concern:      planreview.Concern{Severity: "high", Note: "n", QuotedPassage: "Never log a bearer token, even at debug level.", DocumentRef: ".fishhawk/personas/security.md"},
+			wantSev:      "high",
+			wantHash:     "sha256:remit",
+			wantVerified: true,
+			wantVerdict:  planreview.VerdictReject,
+		},
+		{
+			name: "remit one altered word demoted passage_not_found", verdict: planreview.VerdictReject,
+			concern:     planreview.Concern{Severity: "high", Note: "n", QuotedPassage: "Never log a session token, even at debug level.", DocumentRef: ".fishhawk/personas/security.md"},
+			wantSev:     "low",
+			wantFrom:    "high",
+			wantUnverif: true,
+			wantFailure: planreview.QuoteFailurePassageNotFound,
+			wantVerdict: planreview.VerdictApproveWithConcerns,
+			wantVFrom:   planreview.VerdictReject,
+		},
+		{
+			name: "stage-injected document exact quote verified with its hash", verdict: planreview.VerdictApproveWithConcerns,
+			concern:      planreview.Concern{Severity: "medium", Note: "n", QuotedPassage: "append-only and hash-chained", DocumentRef: "docs/ARCHITECTURE.md"},
+			wantSev:      "medium",
+			wantHash:     "sha256:arch",
+			wantVerified: true,
+			wantVerdict:  planreview.VerdictApproveWithConcerns,
+		},
+		{
+			name: "stage-injected document altered word demoted", verdict: planreview.VerdictApproveWithConcerns,
+			concern:     planreview.Concern{Severity: "medium", Note: "n", QuotedPassage: "append-only and signature-chained", DocumentRef: "docs/ARCHITECTURE.md"},
+			wantSev:     "low",
+			wantFrom:    "medium",
+			wantUnverif: true,
+			wantFailure: planreview.QuoteFailurePassageNotFound,
+			wantVerdict: planreview.VerdictApproveWithConcerns,
+		},
+		{
+			name: "review-convention document exact quote verified with its hash (leading ./ stripped)", verdict: planreview.VerdictApproveWithConcerns,
+			concern:      planreview.Concern{Severity: "high", Note: "n", QuotedPassage: "Wrap every returned error", DocumentRef: " ./docs/conventions/go-errors.md "},
+			wantSev:      "high",
+			wantHash:     "sha256:conv",
+			wantVerified: true,
+			wantVerdict:  planreview.VerdictApproveWithConcerns,
+		},
+		{
+			name: "review-convention document altered word demoted", verdict: planreview.VerdictApproveWithConcerns,
+			concern:     planreview.Concern{Severity: "high", Note: "n", QuotedPassage: "Wrap every returned panic", DocumentRef: "docs/conventions/go-errors.md"},
+			wantSev:     "low",
+			wantFrom:    "high",
+			wantUnverif: true,
+			wantFailure: planreview.QuoteFailurePassageNotFound,
+			wantVerdict: planreview.VerdictApproveWithConcerns,
+		},
+		{
+			name: "case differs -> passage_not_found (case-sensitive)", verdict: planreview.VerdictApproveWithConcerns,
+			concern:     planreview.Concern{Severity: "medium", Note: "n", QuotedPassage: "never log a bearer token", DocumentRef: ".fishhawk/personas/security.md"},
+			wantSev:     "low",
+			wantFrom:    "medium",
+			wantUnverif: true,
+			wantFailure: planreview.QuoteFailurePassageNotFound,
+			wantVerdict: planreview.VerdictApproveWithConcerns,
+		},
+		{
+			name: "document_ref_missing", verdict: planreview.VerdictApproveWithConcerns,
+			concern:     planreview.Concern{Severity: "high", Note: "n", QuotedPassage: "Never log a bearer token", DocumentRef: "   "},
+			wantSev:     "low",
+			wantFrom:    "high",
+			wantUnverif: true,
+			wantFailure: planreview.QuoteFailureDocumentRefMissing,
+			wantVerdict: planreview.VerdictApproveWithConcerns,
+		},
+		{
+			name: "document_unknown", verdict: planreview.VerdictApproveWithConcerns,
+			concern:     planreview.Concern{Severity: "high", Note: "n", QuotedPassage: "Never log a bearer token", DocumentRef: "docs/other-invocation.md"},
+			wantSev:     "low",
+			wantFrom:    "high",
+			wantUnverif: true,
+			wantFailure: planreview.QuoteFailureDocumentUnknown,
+			wantVerdict: planreview.VerdictApproveWithConcerns,
+		},
+		{
+			name: "document_text_unavailable", verdict: planreview.VerdictApproveWithConcerns,
+			concern:     planreview.Concern{Severity: "medium", Note: "n", QuotedPassage: "anything", DocumentRef: "docs/withheld.md"},
+			wantSev:     "low",
+			wantFrom:    "medium",
+			wantUnverif: true,
+			wantFailure: planreview.QuoteFailureDocumentTextUnavailable,
+			wantVerdict: planreview.VerdictApproveWithConcerns,
+		},
+		{
+			name: "already-low unverified marked without severity change", verdict: planreview.VerdictApproveWithConcerns,
+			concern:     planreview.Concern{Severity: "low", Note: "n", QuotedPassage: "fabricated", DocumentRef: "docs/ARCHITECTURE.md"},
+			wantSev:     "low",
+			wantUnverif: true,
+			wantFailure: planreview.QuoteFailurePassageNotFound,
+			wantVerdict: planreview.VerdictApproveWithConcerns,
+		},
+		{
+			name: "existing severity_clamped_from preserved on demotion", verdict: planreview.VerdictApproveWithConcerns,
+			concern:     planreview.Concern{Severity: "medium", SeverityClampedFrom: "high", Note: "n", QuotedPassage: "fabricated", DocumentRef: "docs/ARCHITECTURE.md"},
+			wantSev:     "low",
+			wantFrom:    "high",
+			wantUnverif: true,
+			wantFailure: planreview.QuoteFailurePassageNotFound,
+			wantVerdict: planreview.VerdictApproveWithConcerns,
+		},
+		{
+			name: "whitespace-only quote untouched", verdict: planreview.VerdictReject,
+			concern:     planreview.Concern{Severity: "high", Note: "n", QuotedPassage: " \n\t ", DocumentRef: "docs/nowhere.md"},
+			wantSev:     "high",
+			wantVerdict: planreview.VerdictReject,
+		},
+		{
+			name: "no quote untouched even with a document_ref", verdict: planreview.VerdictReject,
+			concern:     planreview.Concern{Severity: "high", Note: "n", DocumentRef: "docs/nowhere.md"},
+			wantSev:     "high",
+			wantVerdict: planreview.VerdictReject,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			v := planreview.ReviewVerdict{Verdict: tc.verdict, Concerns: []planreview.Concern{tc.concern}}
+			res := planreview.VerifyQuotedPassages(&v, quoteDocs())
+			got := v.Concerns[0]
+			if got.Severity != tc.wantSev || got.SeverityClampedFrom != tc.wantFrom {
+				t.Errorf("severity = %q (clamped_from %q), want %q (%q)", got.Severity, got.SeverityClampedFrom, tc.wantSev, tc.wantFrom)
+			}
+			if got.QuoteUnverified != tc.wantUnverif || got.QuoteVerifiedContentHash != tc.wantHash {
+				t.Errorf("quote_unverified = %v, quote_verified_content_hash = %q, want %v, %q", got.QuoteUnverified, got.QuoteVerifiedContentHash, tc.wantUnverif, tc.wantHash)
+			}
+			if tc.wantFailure == "" {
+				if len(res.Demoted) != 0 {
+					t.Errorf("Demoted = %+v, want none", res.Demoted)
+				}
+			} else if len(res.Demoted) != 1 || res.Demoted[0].Failure != tc.wantFailure || res.Demoted[0].Index != 0 ||
+				res.Demoted[0].From != tc.concern.Severity || res.Demoted[0].To != planreview.SeverityLow {
+				t.Errorf("Demoted = %+v, want one record failure %q from %q", res.Demoted, tc.wantFailure, tc.concern.Severity)
+			}
+			if tc.wantVerified {
+				if len(res.Verified) != 1 || res.Verified[0].ContentHash != tc.wantHash || res.Verified[0].Commit != "c1" {
+					t.Errorf("Verified = %+v, want one record with hash %q", res.Verified, tc.wantHash)
+				}
+			} else if len(res.Verified) != 0 {
+				t.Errorf("Verified = %+v, want none", res.Verified)
+			}
+			if v.Verdict != tc.wantVerdict || res.VerdictClampedFrom != tc.wantVFrom {
+				t.Errorf("verdict = %q (clamped_from %q), want %q (%q)", v.Verdict, res.VerdictClampedFrom, tc.wantVerdict, tc.wantVFrom)
+			}
+
+			// Idempotent: a second pass over its own output changes nothing.
+			before := append([]planreview.Concern(nil), v.Concerns...)
+			beforeVerdict := v.Verdict
+			again := planreview.VerifyQuotedPassages(&v, quoteDocs())
+			if again.VerdictClampedFrom != "" || v.Verdict != beforeVerdict || !reflect.DeepEqual(before, v.Concerns) {
+				t.Errorf("second pass changed something: verdict %q -> %q, concerns %+v -> %+v", beforeVerdict, v.Verdict, before, v.Concerns)
+			}
+		})
+	}
+}
+
+// TestVerifyQuotedPassages_RejectStandsOnUnloweredHigh pins the downgrade
+// rule's other side: a reject resting on a high whose quote VERIFIED (or that
+// quotes nothing) stands even when a sibling high was demoted.
+func TestVerifyQuotedPassages_RejectStandsOnUnloweredHigh(t *testing.T) {
+	v := planreview.ReviewVerdict{Verdict: planreview.VerdictReject, Concerns: []planreview.Concern{
+		{Severity: "high", Note: "fabricated", QuotedPassage: "made up", DocumentRef: "docs/ARCHITECTURE.md"},
+		{Severity: "high", Note: "real, unquoted"},
+	}}
+	res := planreview.VerifyQuotedPassages(&v, quoteDocs())
+	if v.Verdict != planreview.VerdictReject || res.VerdictClampedFrom != "" {
+		t.Errorf("verdict = %q (clamped_from %q), want reject to stand on the unlowered high", v.Verdict, res.VerdictClampedFrom)
+	}
+	if v.Concerns[0].Severity != planreview.SeverityLow || v.Concerns[1].Severity != planreview.SeverityHigh {
+		t.Errorf("severities = %q, %q, want low, high", v.Concerns[0].Severity, v.Concerns[1].Severity)
+	}
+}
+
+// TestVerifyQuotedPassages_RejectDowngradeRequiresLoweredHigh pins that a
+// reject resting on no high at all stands: lowering a medium never downgrades.
+func TestVerifyQuotedPassages_RejectDowngradeRequiresLoweredHigh(t *testing.T) {
+	v := planreview.ReviewVerdict{Verdict: planreview.VerdictReject, Concerns: []planreview.Concern{
+		{Severity: "medium", Note: "fabricated", QuotedPassage: "made up", DocumentRef: "docs/ARCHITECTURE.md"},
+	}}
+	res := planreview.VerifyQuotedPassages(&v, quoteDocs())
+	if v.Verdict != planreview.VerdictReject || res.VerdictClampedFrom != "" {
+		t.Errorf("verdict = %q (clamped_from %q), want reject to stand (no high lowered)", v.Verdict, res.VerdictClampedFrom)
+	}
+}
+
+// TestVerifyQuotedPassages_DuplicatePathMatchesAny pins that when two
+// injected documents share a path, a quote found in either verifies with THAT
+// document's hash, and a blank-text duplicate does not mask a matching one.
+func TestVerifyQuotedPassages_DuplicatePathMatchesAny(t *testing.T) {
+	docs := []planreview.QuotedDocument{
+		{Path: "docs/x.md", ContentHash: "sha256:blank", Text: ""},
+		{Path: "docs/x.md", ContentHash: "sha256:first", Text: "alpha beta"},
+		{Path: "docs/x.md", ContentHash: "sha256:second", Text: "gamma delta"},
+	}
+	v := planreview.ReviewVerdict{Verdict: planreview.VerdictApproveWithConcerns, Concerns: []planreview.Concern{
+		{Severity: "high", Note: "n", QuotedPassage: "gamma delta", DocumentRef: "docs/x.md"},
+	}}
+	planreview.VerifyQuotedPassages(&v, docs)
+	if got := v.Concerns[0]; got.QuoteUnverified || got.QuoteVerifiedContentHash != "sha256:second" || got.Severity != planreview.SeverityHigh {
+		t.Errorf("concern = %+v, want verified against sha256:second at high", got)
+	}
+}
+
+// TestVerifyQuotedPassages_ResetsForgedMarkers pins that the verification
+// outcome, not a reviewer-supplied marker, decides the stored markers: a
+// verified quote clears a forged quote_unverified, and an unverified one
+// clears a forged content hash.
+func TestVerifyQuotedPassages_ResetsForgedMarkers(t *testing.T) {
+	v := planreview.ReviewVerdict{Verdict: planreview.VerdictApproveWithConcerns, Concerns: []planreview.Concern{
+		{Severity: "high", Note: "n", QuotedPassage: "append-only", DocumentRef: "docs/ARCHITECTURE.md", QuoteUnverified: true},
+		{Severity: "high", Note: "n", QuotedPassage: "forged", DocumentRef: "docs/ARCHITECTURE.md", QuoteVerifiedContentHash: "sha256:forged"},
+	}}
+	planreview.VerifyQuotedPassages(&v, quoteDocs())
+	if got := v.Concerns[0]; got.QuoteUnverified || got.QuoteVerifiedContentHash != "sha256:arch" {
+		t.Errorf("verified concern = %+v, want quote_unverified false + sha256:arch", got)
+	}
+	if got := v.Concerns[1]; !got.QuoteUnverified || got.QuoteVerifiedContentHash != "" {
+		t.Errorf("unverified concern = %+v, want quote_unverified true + no hash", got)
+	}
+}
+
+// TestVerifyQuotedPassages_DoesNotWriteSharedBackingArray pins copy-on-write
+// and the nil/empty no-ops.
+func TestVerifyQuotedPassages_DoesNotWriteSharedBackingArray(t *testing.T) {
+	orig := []planreview.Concern{{Severity: "high", Note: "n", QuotedPassage: "made up", DocumentRef: "docs/ARCHITECTURE.md"}}
+	v := planreview.ReviewVerdict{Verdict: planreview.VerdictReject, Concerns: orig}
+	planreview.VerifyQuotedPassages(&v, quoteDocs())
+	if orig[0].Severity != planreview.SeverityHigh || orig[0].QuoteUnverified {
+		t.Errorf("verification wrote the caller's backing array: %+v", orig[0])
+	}
+	if res := planreview.VerifyQuotedPassages(nil, quoteDocs()); len(res.Demoted)+len(res.Verified) != 0 || res.VerdictClampedFrom != "" {
+		t.Errorf("nil verdict = %+v, want zero result", res)
+	}
+}
+
+// TestClampPersonaSeverities is the one-row-per-branch table for the persona
+// remit severity_cap clamp.
+func TestClampPersonaSeverities(t *testing.T) {
+	cases := []struct {
+		name        string
+		capSev      planreview.ConcernSeverity
+		verdict     planreview.Verdict
+		concern     planreview.Concern
+		wantSev     planreview.ConcernSeverity
+		wantFrom    planreview.ConcernSeverity
+		wantCap     planreview.ConcernSeverity
+		wantVerdict planreview.Verdict
+		wantVFrom   planreview.Verdict
+	}{
+		{name: "uncapped no-op", capSev: "", verdict: planreview.VerdictReject,
+			concern: planreview.Concern{Severity: "high", Note: "n"}, wantSev: "high", wantVerdict: planreview.VerdictReject},
+		{name: "high cap is uncapped", capSev: "high", verdict: planreview.VerdictReject,
+			concern: planreview.Concern{Severity: "high", Note: "n"}, wantSev: "high", wantVerdict: planreview.VerdictReject},
+		{name: "medium cap lowers high and stamps persona_severity_cap", capSev: "medium", verdict: planreview.VerdictReject,
+			concern: planreview.Concern{Severity: "high", Note: "n"}, wantSev: "medium", wantFrom: "high", wantCap: "medium",
+			wantVerdict: planreview.VerdictApproveWithConcerns, wantVFrom: planreview.VerdictReject},
+		{name: "low cap lowers medium", capSev: "low", verdict: planreview.VerdictApproveWithConcerns,
+			concern: planreview.Concern{Severity: "medium", Note: "n"}, wantSev: "low", wantFrom: "medium", wantCap: "low",
+			wantVerdict: planreview.VerdictApproveWithConcerns},
+		{name: "already under cap untouched", capSev: "medium", verdict: planreview.VerdictApproveWithConcerns,
+			concern: planreview.Concern{Severity: "low", Note: "n"}, wantSev: "low", wantVerdict: planreview.VerdictApproveWithConcerns},
+		{name: "existing severity_clamped_from preserved", capSev: "low", verdict: planreview.VerdictApproveWithConcerns,
+			concern: planreview.Concern{Severity: "medium", SeverityClampedFrom: "high", Note: "n"}, wantSev: "low", wantFrom: "high", wantCap: "low",
+			wantVerdict: planreview.VerdictApproveWithConcerns},
+		{name: "unknown cap fails closed to low", capSev: "bogus", verdict: planreview.VerdictApproveWithConcerns,
+			concern: planreview.Concern{Severity: "medium", Note: "n"}, wantSev: "low", wantFrom: "medium", wantCap: "low",
+			wantVerdict: planreview.VerdictApproveWithConcerns},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			v := planreview.ReviewVerdict{Verdict: tc.verdict, Concerns: []planreview.Concern{tc.concern}}
+			res := planreview.ClampPersonaSeverities(&v, tc.capSev)
+			got := v.Concerns[0]
+			if got.Severity != tc.wantSev || got.SeverityClampedFrom != tc.wantFrom || got.PersonaSeverityCap != tc.wantCap {
+				t.Errorf("concern = (sev %q, from %q, cap %q), want (%q, %q, %q)", got.Severity, got.SeverityClampedFrom, got.PersonaSeverityCap, tc.wantSev, tc.wantFrom, tc.wantCap)
+			}
+			wantClamped := 0
+			if tc.wantCap != "" {
+				wantClamped = 1
+			}
+			if len(res.Clamped) != wantClamped {
+				t.Fatalf("Clamped = %+v, want %d records", res.Clamped, wantClamped)
+			}
+			if wantClamped == 1 && (res.Clamped[0].From != tc.concern.Severity || res.Clamped[0].To != tc.wantSev) {
+				t.Errorf("Clamped[0] = %+v, want from %q to %q", res.Clamped[0], tc.concern.Severity, tc.wantSev)
+			}
+			if v.Verdict != tc.wantVerdict || res.VerdictClampedFrom != tc.wantVFrom {
+				t.Errorf("verdict = %q (clamped_from %q), want %q (%q)", v.Verdict, res.VerdictClampedFrom, tc.wantVerdict, tc.wantVFrom)
+			}
+			again := planreview.ClampPersonaSeverities(&v, tc.capSev)
+			if len(again.Clamped) != 0 || again.VerdictClampedFrom != "" {
+				t.Errorf("second clamp pass changed something: %+v", again)
+			}
+		})
+	}
+	orig := []planreview.Concern{{Severity: "high", Note: "n"}}
+	v := planreview.ReviewVerdict{Verdict: planreview.VerdictApproveWithConcerns, Concerns: orig}
+	planreview.ClampPersonaSeverities(&v, "low")
+	if orig[0].Severity != planreview.SeverityHigh {
+		t.Errorf("clamp wrote the caller's backing array: %+v", orig[0])
+	}
+	if res := planreview.ClampPersonaSeverities(nil, "low"); len(res.Clamped) != 0 {
+		t.Errorf("nil verdict clamp = %+v, want zero result", res)
+	}
+}
+
+// TestClearPersonaIngestMarkers pins that all four server-internal persona
+// markers are zeroed, the reviewer-emittable fields are kept, the count is
+// reported, and the caller's backing array is never written.
+func TestClearPersonaIngestMarkers(t *testing.T) {
+	orig := []planreview.Concern{
+		{Severity: "high", Note: "forged", QuotedPassage: "q", DocumentRef: "d", SeverityClampedFrom: "high",
+			QuoteUnverified: true, QuoteVerifiedContentHash: "sha256:forged", PersonaSeverityCap: "low", ReviewerRole: "security-reviewer"},
+		{Severity: "low", Note: "clean"},
+		{Severity: "medium", Note: "role only", ReviewerRole: "standard"},
+	}
+	v := planreview.ReviewVerdict{Verdict: planreview.VerdictReject, Concerns: orig}
+	if n := planreview.ClearPersonaIngestMarkers(&v); n != 2 {
+		t.Errorf("cleared = %d, want 2", n)
+	}
+	for i, c := range v.Concerns {
+		if c.QuoteUnverified || c.QuoteVerifiedContentHash != "" || c.PersonaSeverityCap != "" || c.ReviewerRole != "" {
+			t.Errorf("concern %d still carries a server-internal marker: %+v", i, c)
+		}
+	}
+	if c := v.Concerns[0]; c.QuotedPassage != "q" || c.DocumentRef != "d" || c.Severity != "high" || c.SeverityClampedFrom != "high" {
+		t.Errorf("scrub touched reviewer-emitted or out-of-scope fields: %+v", c)
+	}
+	if !orig[0].QuoteUnverified || orig[0].ReviewerRole != "security-reviewer" {
+		t.Errorf("scrub wrote the caller's backing array: %+v", orig[0])
+	}
+	if planreview.ClearPersonaIngestMarkers(nil) != 0 {
+		t.Error("nil verdict scrub reported clears")
+	}
+}
+
+// TestClampConventionSeveritiesForRound_ConventionsFileModifiedSeam is the
+// control pair for the #2244 seam: with nil caps (zero conventions rendered) a
+// medium conventions_file_modified concern stays medium when the round KNOWS
+// the change modifies a conventions file, and is lowered to low when it does
+// not. Every other convention category is clamped identically either way, and
+// the delegating ClampConventionSeverities matches the false arm.
+func TestClampConventionSeveritiesForRound_ConventionsFileModifiedSeam(t *testing.T) {
+	build := func() planreview.ReviewVerdict {
+		return planreview.ReviewVerdict{Verdict: planreview.VerdictApproveWithConcerns, Concerns: []planreview.Concern{
+			{Severity: "medium", Category: planreview.ConventionsFileModifiedConcernCategory, Note: "edits a conventions file"},
+			{Severity: "high", Category: planreview.RepoConventionConcernCategory, Note: "repo convention"},
+		}}
+	}
+	modified := build()
+	res := planreview.ClampConventionSeveritiesForRound(&modified, nil, true)
+	if got := modified.Concerns[0]; got.Severity != planreview.SeverityMedium || got.SeverityClampedFrom != "" {
+		t.Errorf("modified round: conventions_file_modified = (%q, from %q), want medium unclamped", got.Severity, got.SeverityClampedFrom)
+	}
+	if got := modified.Concerns[1]; got.Severity != planreview.SeverityLow {
+		t.Errorf("modified round: repo_convention severity = %q, want low (the exemption is category-scoped)", got.Severity)
+	}
+	if len(res.Clamped) != 1 || res.Clamped[0].Index != 1 {
+		t.Errorf("modified round Clamped = %+v, want only the repo_convention concern", res.Clamped)
+	}
+
+	unmodified := build()
+	planreview.ClampConventionSeveritiesForRound(&unmodified, nil, false)
+	if got := unmodified.Concerns[0]; got.Severity != planreview.SeverityLow || got.SeverityClampedFrom != planreview.SeverityMedium {
+		t.Errorf("unmodified round: conventions_file_modified = (%q, from %q), want low from medium", got.Severity, got.SeverityClampedFrom)
+	}
+
+	delegated := build()
+	planreview.ClampConventionSeverities(&delegated, nil)
+	if !reflect.DeepEqual(delegated, unmodified) {
+		t.Errorf("ClampConventionSeverities = %+v, want byte-identical to ForRound(false) = %+v", delegated, unmodified)
+	}
+
+	// With rendered caps the file-modified category is untouched either way.
+	capped := build()
+	planreview.ClampConventionSeveritiesForRound(&capped, planreview.ConventionCaps{"x": planreview.SeverityLow}, false)
+	if capped.Concerns[0].Severity != planreview.SeverityMedium {
+		t.Errorf("capped round: conventions_file_modified = %q, want medium (only the empty-caps rule targets it)", capped.Concerns[0].Severity)
 	}
 }

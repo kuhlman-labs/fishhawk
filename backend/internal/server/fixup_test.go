@@ -2558,6 +2558,9 @@ func (f *fakeConcernRepo) InsertRaised(_ context.Context, p concern.InsertRaised
 			SuggestedPatch:       c.SuggestedPatch,
 			NewEvidence:          c.NewEvidence,
 			SettledRef:           c.SettledRef,
+			ReviewerRole:         p.ReviewerRole,
+			QuoteUnverified:      c.QuoteUnverified,
+			SeverityClampedFrom:  c.SeverityClampedFrom,
 			State:                concern.StateRaised,
 		}
 		f.rows = append(f.rows, row)

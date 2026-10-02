@@ -539,8 +539,13 @@ type RunConcernItem struct {
 	// (#3318). The json tag MUST byte-match the server's field or it decodes to
 	// false silently — the same hand-maintained wire mirror ShortSummary below
 	// warns about, and the one the #3318 integration test decodes through.
-	ClaimedByApproval bool   `json:"claimed_by_approval,omitempty" jsonschema:"true when an approval's claims_concern_ids (named explicitly, or expanded from claims_all_open_plan_concerns) covers this concern: it will self-settle to addressed_by_condition at the first confirming implement review and needs NO hand waive at the merge gate. Absent/false means it still needs an operator decision"`
-	ShortSummary      string `json:"short_summary,omitempty" jsonschema:"bounded (at most 100 bytes, one line) note-derived recognition label for reading concerns at a glance; equal to the whole collapsed note when it fits, marked with a trailing ... when cut, absent when the note is blank. A recognition label, NOT a unique key — id remains the addressing key for fishhawk_fixup_stage concern_ids; two concerns with a long shared note prefix may share a label"`
+	ClaimedByApproval bool `json:"claimed_by_approval,omitempty" jsonschema:"true when an approval's claims_concern_ids (named explicitly, or expanded from claims_all_open_plan_concerns) covers this concern: it will self-settle to addressed_by_condition at the first confirming implement review and needs NO hand waive at the merge gate. Absent/false means it still needs an operator decision"`
+	// ReviewerRole / QuoteUnverified mirror the backend's persona concern
+	// ingest markers (E55.10 / #3755). Same json-tag byte-match rule as
+	// ClaimedByApproval: a drift decodes to the zero value silently.
+	ReviewerRole    string `json:"reviewer_role,omitempty" jsonschema:"which reviewer raised the concern: a reviewer persona name, or standard for the stage's standard reviewer. Absent for an unattributed legacy concern recorded before reviewer attribution existed"`
+	QuoteUnverified bool   `json:"quote_unverified,omitempty" jsonschema:"true when the reviewer quoted a document passage the server could not find in the text it injected into that review, so the concern was demoted to low at ingest. Absent/false otherwise"`
+	ShortSummary    string `json:"short_summary,omitempty" jsonschema:"bounded (at most 100 bytes, one line) note-derived recognition label for reading concerns at a glance; equal to the whole collapsed note when it fits, marked with a trailing ... when cut, absent when the note is blank. A recognition label, NOT a unique key — id remains the addressing key for fishhawk_fixup_stage concern_ids; two concerns with a long shared note prefix may share a label"`
 }
 
 // IssueContext mirrors the OpenAPI shape: the GitHub issue payload
@@ -838,11 +843,17 @@ type GateViewConcern struct {
 	// #2353): the reviewer's supporting evidence and the re-raise lineage tag.
 	// The json tags MUST byte-match the backend — a typo silently yields an
 	// empty field rather than a decode error.
-	NewEvidence       string               `json:"new_evidence,omitempty"`
-	SettledRef        string               `json:"settled_ref,omitempty"`
-	HasSuggestedPatch bool                 `json:"has_suggested_patch"`
-	Fixups            []GateViewFixup      `json:"fixups,omitempty"`
-	Resolutions       []GateViewResolution `json:"resolutions,omitempty"`
+	NewEvidence string `json:"new_evidence,omitempty"`
+	SettledRef  string `json:"settled_ref,omitempty"`
+	// ReviewerRole / QuoteUnverified / SeverityClampedFrom mirror the server's
+	// gateViewConcern persona ingest markers (E55.10 / #3755). Same json-tag
+	// byte-match rule as the fields above.
+	ReviewerRole        string               `json:"reviewer_role,omitempty" jsonschema:"which reviewer raised the concern: a reviewer persona name, or standard for the stage's standard reviewer. Absent for an unattributed legacy concern recorded before reviewer attribution existed"`
+	QuoteUnverified     bool                 `json:"quote_unverified,omitempty" jsonschema:"true when the reviewer quoted a document passage the server could not find in the text it injected into that review, so the concern was demoted to low at ingest. Absent/false otherwise"`
+	SeverityClampedFrom string               `json:"severity_clamped_from,omitempty" jsonschema:"the reviewer's original severity when ingest lowered it (a persona severity_cap clamp or an unverified quote); absent when the severity is the reviewer's own"`
+	HasSuggestedPatch   bool                 `json:"has_suggested_patch"`
+	Fixups              []GateViewFixup      `json:"fixups,omitempty"`
+	Resolutions         []GateViewResolution `json:"resolutions,omitempty"`
 	// Disputed / Disputes mirror the server's gateViewConcern (E48.103 /
 	// #2551): a `confirmed` resolution was recorded on this concern and it is
 	// STILL OPEN. Disputed is derived server-side from the durable concern row
@@ -900,6 +911,11 @@ type GateViewSettledConcern struct {
 	// (E60.8 / #2353). Same byte-match requirement as GateViewConcern.
 	NewEvidence string `json:"new_evidence,omitempty"`
 	SettledRef  string `json:"settled_ref,omitempty"`
+	// ReviewerRole / QuoteUnverified / SeverityClampedFrom mirror the server's
+	// gateViewSettledConcern persona ingest markers (E55.10 / #3755).
+	ReviewerRole        string `json:"reviewer_role,omitempty" jsonschema:"which reviewer raised the concern: a reviewer persona name, or standard for the stage's standard reviewer. Absent for an unattributed legacy concern recorded before reviewer attribution existed"`
+	QuoteUnverified     bool   `json:"quote_unverified,omitempty" jsonschema:"true when the reviewer quoted a document passage the server could not find in the text it injected into that review, so the concern was demoted to low at ingest. Absent/false otherwise"`
+	SeverityClampedFrom string `json:"severity_clamped_from,omitempty" jsonschema:"the reviewer's original severity when ingest lowered it (a persona severity_cap clamp or an unverified quote); absent when the severity is the reviewer's own"`
 }
 
 // GateViewSuppressedRelitig is one suppressed relitigation (#1913).

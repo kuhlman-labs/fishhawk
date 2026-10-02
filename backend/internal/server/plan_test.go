@@ -5764,17 +5764,47 @@ func TestPlanReview_Persona_ConfiguredAgentsCountsPersona(t *testing.T) {
 // (planreview.Settled), not by provider, so the round settles at
 // configured_agents == 2 with exactly two verdicts — no dedupe, no
 // double-count — and the one adapter sees two distinct prompts.
+//
+// (C7, E55.10 / #3755) The shared adapter REJECTS on both prompts, keyed by
+// whether the prompt carries the remit, each with a DISTINCT concern under the
+// SAME model string: both concern sets persist, attributed reviewer_role
+// standard vs the persona name, and neither retires the other.
+//
+// Counterfactual: pass concern.ReviewerRoleStandard at the plan loop's
+// persistReviewConcernsAs call — the persona's row is attributed standard:
+// RED.
 func TestPlanReview_Persona_SharedProviderSettlesAtTwo(t *testing.T) {
-	shared := approvingFake()
+	const stdNote, personaNote = "standard finding", "persona finding"
+	shared := &keyedReviewer{
+		model: "shared-model",
+		std: &planreview.ReviewVerdict{Verdict: planreview.VerdictReject, Concerns: []planreview.Concern{
+			{Severity: planreview.SeverityHigh, Category: "scope", Note: stdNote},
+		}},
+		persona: &planreview.ReviewVerdict{Verdict: planreview.VerdictReject, Concerns: []planreview.Concern{
+			{Severity: planreview.SeverityHigh, Category: "security", Note: personaNote},
+		}},
+	}
 	p := newPersonaPlanRun(t, personaSpec(personaSpecOpts{attachOn: "plan", personaProvider: "anthropic"}), shared, nil)
 	p.s.cfg.PlanReviewers = personaReviewerSet{def: shared, byKey: map[string]PlanReviewer{
 		"anthropic/" + personaStdModel:   shared,
 		"anthropic/" + personaAgentModel: shared,
 	}}
+	cr := newFakeConcernRepo()
+	p.s.cfg.ConcernRepo = cr
 	p.review(t)
-	calls := reviewerCalls(shared)
+	calls := shared.calls
 	if len(calls) != 2 {
 		t.Fatalf("shared adapter calls = %d, want 2 (standard + persona, no dedupe)", len(calls))
+	}
+	rows := rowsByNote(t, cr, p.runID)
+	if len(rows) != 2 {
+		t.Fatalf("persisted concerns = %d, want 2 (one per reviewer)", len(rows))
+	}
+	for note, role := range map[string]string{stdNote: concern.ReviewerRoleStandard, personaNote: personaTestName} {
+		r := rows[note]
+		if r == nil || r.ReviewerRole != role || derefStr(r.ReviewerModel) != "shared-model" || r.State != concern.StateRaised {
+			t.Errorf("row %q = %+v, want reviewer_role %q, model shared-model, still raised", note, r, role)
+		}
 	}
 	if strings.Contains(calls[0], personaRemitBody) == strings.Contains(calls[1], personaRemitBody) {
 		t.Error("want exactly one of the two prompts to carry the remit")

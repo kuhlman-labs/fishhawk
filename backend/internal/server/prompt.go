@@ -21,6 +21,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/bundle"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/crewmessage"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/fixupobligation"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
@@ -3825,8 +3826,10 @@ func (s *Server) loadPriorSchemaValidationError(ctx context.Context, runID uuid.
 // (server/fixup.go), filters to the current stage, and uses the NEWEST entry
 // — a fix-up re-opens the stage to pending and the renderer must reflect the
 // most recent trigger. Each entry's `concerns` field is the resolved
-// []planreview.Concern set the operator selected; they are formatted as
-// "[severity/category] note" so the agent sees the full reviewer context.
+// []planreview.Concern set the operator selected; they are formatted by
+// fixupConcernLine — "[severity/category] note", with the raising persona and
+// an unverified-quote marker inside the bracket for a persona-raised concern
+// (E55.10 / #3755) — so the agent sees the full reviewer context.
 //
 // Each returned prompt.FixupConcern carries AcceptanceDerived = (the persisted
 // concern's Provenance == planreview.ConcernProvenanceAcceptance), so the
@@ -3877,7 +3880,7 @@ func (s *Server) resolveFixupConcerns(ctx context.Context, runID, stageID uuid.U
 		rendered = make([]prompt.FixupConcern, 0, len(payload.Concerns))
 		for _, c := range payload.Concerns {
 			rendered = append(rendered, prompt.FixupConcern{
-				Text:              fmt.Sprintf("[%s/%s] %s", c.Severity, c.Category, c.Note),
+				Text:              fixupConcernLine(c),
 				AcceptanceDerived: c.Provenance == planreview.ConcernProvenanceAcceptance,
 			})
 		}
@@ -3890,6 +3893,27 @@ func (s *Server) resolveFixupConcerns(ctx context.Context, runID, stageID uuid.U
 		return rendered
 	}
 	return nil
+}
+
+// fixupConcernLine renders one routed concern for the fix-up prompt's binding
+// "### Fix-up concerns" section. A standard-reviewer or legacy (unattributed)
+// concern renders as the byte-identical "[severity/category] note" line. A
+// persona-raised concern (E55.10 / #3755) names its persona inside the bracket
+// — "[severity/category · persona <name>] note" — so the fix-up agent knows
+// which reviewer's remit the obligation comes from, and a concern whose quoted
+// document passage failed verification at ingest also carries
+// " · quote unverified" there, telling the agent the reviewer's citation could
+// not be found in the text the server injected (the concern was demoted to
+// low for that reason).
+func fixupConcernLine(c planreview.Concern) string {
+	label := fmt.Sprintf("%s/%s", c.Severity, c.Category)
+	if role := strings.TrimSpace(c.ReviewerRole); role != "" && role != concern.ReviewerRoleStandard {
+		label += " · persona " + role
+	}
+	if c.QuoteUnverified {
+		label += " · quote unverified"
+	}
+	return fmt.Sprintf("[%s] %s", label, c.Note)
 }
 
 // CategoryFixupReportObligationsDeclared is the audit category the fix-up

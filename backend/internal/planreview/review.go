@@ -158,6 +158,37 @@ type Concern struct {
 	// schema-constrained reviewer cannot emit it. omitempty keeps every
 	// unclamped concern byte-identical.
 	SeverityClampedFrom ConcernSeverity `json:"severity_clamped_from,omitempty"`
+
+	// QuotedPassage and DocumentRef (E55.10 / #3755) are REVIEWER-EMITTABLE
+	// (registered in VerdictSchema()): the exact passage a reviewer persona
+	// quotes from a document injected into its prompt, and that document's
+	// Source path. The server verifies the quote at ingest against the text it
+	// actually injected into that invocation (VerifyQuotedPassages); an
+	// unverified quote demotes the concern to low. omitempty keeps every
+	// quote-free verdict byte-identical.
+	QuotedPassage string `json:"quoted_passage,omitempty"`
+	DocumentRef   string `json:"document_ref,omitempty"`
+
+	// QuoteUnverified, QuoteVerifiedContentHash, PersonaSeverityCap and
+	// ReviewerRole are SERVER-INTERNAL ingest markers (E55.10 / #3755),
+	// deliberately absent from VerdictSchema() and zeroed on every verdict by
+	// ClearPersonaIngestMarkers before the server stamps them, so a reviewer on
+	// the unconstrained decode path can never pre-set them:
+	//
+	//   - QuoteUnverified: the quoted passage was NOT found in the named
+	//     injected document (VerifyQuotedPassages demoted the concern).
+	//   - QuoteVerifiedContentHash: the content_hash of the injected document
+	//     the quote WAS found in.
+	//   - PersonaSeverityCap: the persona remit's severity_cap the concern was
+	//     clamped to (ClampPersonaSeverities).
+	//   - ReviewerRole: the persona name, or the standard role, of the reviewer
+	//     that raised the concern.
+	//
+	// omitempty keeps every untouched concern byte-identical.
+	QuoteUnverified          bool            `json:"quote_unverified,omitempty"`
+	QuoteVerifiedContentHash string          `json:"quote_verified_content_hash,omitempty"`
+	PersonaSeverityCap       ConcernSeverity `json:"persona_severity_cap,omitempty"`
+	ReviewerRole             string          `json:"reviewer_role,omitempty"`
 }
 
 // ConcernProvenanceAcceptance marks a Concern synthesized from the acceptance
@@ -322,7 +353,22 @@ type ClampResult struct {
 // reviewer emission: callers MUST clamp BEFORE calling
 // AddSynthesizedConventionsFileModifiedConcern so the empty-caps rule never
 // lowers it.
+//
+// It is ClampConventionSeveritiesForRound with conventionsFileModified false.
 func ClampConventionSeverities(v *ReviewVerdict, caps ConventionCaps) ClampResult {
+	return ClampConventionSeveritiesForRound(v, caps, false)
+}
+
+// ClampConventionSeveritiesForRound is ClampConventionSeverities for a review
+// round that KNOWS whether the reviewed change modifies a declared conventions
+// file (E55.10 / #3755, the #2244 seam). With conventionsFileModified true the
+// empty-caps rule EXEMPTS conventions_file_modified concerns: the round has
+// independent, server-observed evidence the finding is real (the diff edits a
+// declared conventions file), so a reviewer raising it at medium keeps that
+// weight even when zero conventions were rendered. Every other rule, and every
+// other category, is unchanged; with conventionsFileModified false it is
+// byte-identical to the original clamp.
+func ClampConventionSeveritiesForRound(v *ReviewVerdict, caps ConventionCaps, conventionsFileModified bool) ClampResult {
 	var res ClampResult
 	if v == nil || len(v.Concerns) == 0 {
 		return res
@@ -347,6 +393,8 @@ func ClampConventionSeverities(v *ReviewVerdict, caps ConventionCaps) ClampResul
 		name := strings.TrimSpace(c.Convention)
 		var bound int
 		switch {
+		case noneRendered && conventionsFileModified && cat == ConventionsFileModifiedConcernCategory:
+			continue
 		case noneRendered:
 			bound = 1
 		case cat != RepoConventionConcernCategory:
@@ -381,15 +429,308 @@ func ClampConventionSeverities(v *ReviewVerdict, caps ConventionCaps) ClampResul
 		})
 	}
 
-	if v.Verdict == VerdictReject && loweredFromHigh {
-		for _, c := range v.Concerns {
-			if c.Severity == SeverityHigh {
-				return res
+	res.VerdictClampedFrom = downgradeRejectWithoutHigh(v, loweredFromHigh)
+	return res
+}
+
+// downgradeRejectWithoutHigh is the shared reject-downgrade rule every ingest
+// clamp applies: a REJECT verdict becomes approve_with_concerns only when the
+// clamp lowered at least one concern FROM high and no high concern remains. It
+// returns VerdictReject when it downgraded (the value stamped on the payload's
+// verdict_clamped_from), "" otherwise — a reject resting on an unlowered high,
+// or on no high at all, stands.
+func downgradeRejectWithoutHigh(v *ReviewVerdict, loweredFromHigh bool) Verdict {
+	if v.Verdict != VerdictReject || !loweredFromHigh {
+		return ""
+	}
+	for _, c := range v.Concerns {
+		if c.Severity == SeverityHigh {
+			return ""
+		}
+	}
+	v.Verdict = VerdictApproveWithConcerns
+	return VerdictReject
+}
+
+// ClearPersonaIngestMarkers zeroes the four SERVER-INTERNAL persona ingest
+// markers — QuoteUnverified, QuoteVerifiedContentHash, PersonaSeverityCap and
+// ReviewerRole — on every concern of v (E55.10 / #3755), returning how many
+// concerns carried at least one. The ingest site calls it on EVERY verdict
+// before stamping, so a reviewer on the unconstrained decode path (which does
+// not reject unknown keys) cannot pre-set a marker the server alone may write.
+// v.Concerns is copied before the first write, so a caller-shared backing
+// array is never written. A nil verdict is a no-op returning 0.
+func ClearPersonaIngestMarkers(v *ReviewVerdict) (cleared int) {
+	if v == nil {
+		return 0
+	}
+	copied := false
+	for i, c := range v.Concerns {
+		if !c.QuoteUnverified && c.QuoteVerifiedContentHash == "" && c.PersonaSeverityCap == "" && c.ReviewerRole == "" {
+			continue
+		}
+		if !copied {
+			v.Concerns = append([]Concern(nil), v.Concerns...)
+			copied = true
+		}
+		v.Concerns[i].QuoteUnverified = false
+		v.Concerns[i].QuoteVerifiedContentHash = ""
+		v.Concerns[i].PersonaSeverityCap = ""
+		v.Concerns[i].ReviewerRole = ""
+		cleared++
+	}
+	return cleared
+}
+
+// QuotedDocument is one document whose text was injected into a reviewer
+// invocation's prompt, as VerifyQuotedPassages checks a quote against it
+// (E55.10 / #3755). Path is the document's Source path (what a reviewer names
+// in document_ref); Commit and ContentHash are the attribution its
+// document_injected audit entry recorded; Text is the exact document text the
+// reviewer was shown (repodoc.InjectedContent), never the server's framing.
+type QuotedDocument struct {
+	Path        string
+	Commit      string
+	ContentHash string
+	Text        string
+}
+
+// Quote-verification failure modes (E55.10 / #3755): why VerifyQuotedPassages
+// demoted a concern. Each is logged by the ingest site with the run id,
+// persona and document_ref.
+const (
+	// QuoteFailureDocumentRefMissing: the concern quotes a passage but names
+	// no document_ref.
+	QuoteFailureDocumentRefMissing = "document_ref_missing"
+	// QuoteFailureDocumentUnknown: document_ref names no document injected
+	// into this invocation (including one injected into a DIFFERENT
+	// invocation, or withheld).
+	QuoteFailureDocumentUnknown = "document_unknown"
+	// QuoteFailureDocumentTextUnavailable: the named document was injected but
+	// the server holds no text for it (e.g. a withheld notice), so nothing can
+	// be verified.
+	QuoteFailureDocumentTextUnavailable = "document_text_unavailable"
+	// QuoteFailurePassageNotFound: the quote is not a substring of the named
+	// document's injected text (whitespace-collapsed, case-sensitive).
+	QuoteFailurePassageNotFound = "passage_not_found"
+)
+
+// QuoteVerified records one concern whose quote VerifyQuotedPassages found.
+type QuoteVerified struct {
+	// Index is the concern's position in ReviewVerdict.Concerns.
+	Index int
+	// DocumentRef is the normalized document_ref the quote was matched in.
+	DocumentRef string
+	// Commit / ContentHash are the matched document's attribution.
+	Commit, ContentHash string
+}
+
+// QuoteDemotion records one concern VerifyQuotedPassages marked unverified.
+type QuoteDemotion struct {
+	// Index is the concern's position in ReviewVerdict.Concerns.
+	Index int
+	// DocumentRef is the normalized document_ref ("" when missing).
+	DocumentRef string
+	// Failure is one of the QuoteFailure* modes.
+	Failure string
+	// From / To are the severities before and after; equal when the concern
+	// was already low (marked, not lowered).
+	From, To ConcernSeverity
+}
+
+// QuoteVerificationResult is what VerifyQuotedPassages found and changed.
+type QuoteVerificationResult struct {
+	// Verified lists every concern whose quote was found, in concern order.
+	Verified []QuoteVerified
+	// Demoted lists every concern whose quote was NOT found, in concern order.
+	Demoted []QuoteDemotion
+	// VerdictClampedFrom is VerdictReject when a demotion downgraded a reject
+	// to approve_with_concerns, "" otherwise.
+	VerdictClampedFrom Verdict
+}
+
+// normalizeDocumentRef trims surrounding whitespace and any leading "./" so a
+// reviewer naming "./docs/x.md" or " docs/x.md" matches the Source path
+// "docs/x.md".
+func normalizeDocumentRef(ref string) string {
+	ref = strings.TrimSpace(ref)
+	for strings.HasPrefix(ref, "./") {
+		ref = strings.TrimPrefix(ref, "./")
+	}
+	return ref
+}
+
+// collapseWhitespace replaces every run of whitespace with one space and trims
+// the ends, so a quote re-wrapped across lines still matches.
+func collapseWhitespace(s string) string {
+	return strings.Join(strings.Fields(s), " ")
+}
+
+// VerifyQuotedPassages checks every concern's quoted_passage against the text
+// the server actually injected into this reviewer invocation (E55.10 / #3755,
+// ADR-084 D3 / rule 3), mutating v in place (its Concerns slice is copied
+// before the first write). docs is that invocation's injected document set.
+//
+// A concern whose whitespace-trimmed QuotedPassage is empty is untouched. For
+// every other concern the quote is VERIFIED iff its DocumentRef (trimmed,
+// leading "./" stripped) names a document in docs with non-blank Text and the
+// whitespace-collapsed quote is a substring of the whitespace-collapsed Text —
+// case-sensitive, so one altered word fails. When several docs share the
+// path, a match in any of them verifies (with that doc's hash).
+//
+//   - verified: QuoteVerifiedContentHash is stamped with the matched
+//     document's ContentHash and QuoteUnverified cleared; severity untouched.
+//   - unverified: QuoteUnverified is set, QuoteVerifiedContentHash cleared,
+//     and the severity lowered to low, stamping SeverityClampedFrom with the
+//     original severity when it changed and none was already recorded. The
+//     failure mode (document_ref_missing | document_unknown |
+//     document_text_unavailable | passage_not_found) is reported per concern.
+//
+// The shared reject-downgrade rule then applies: a REJECT becomes
+// approve_with_concerns only when a high was lowered and no high remains.
+// The function is idempotent: a second call over its own output changes
+// nothing.
+//
+// It bounds FABRICATED passages, not trivially-true ones: a very short quote
+// (a single common word) can verify; no minimum length is enforced.
+func VerifyQuotedPassages(v *ReviewVerdict, docs []QuotedDocument) QuoteVerificationResult {
+	var res QuoteVerificationResult
+	if v == nil || len(v.Concerns) == 0 {
+		return res
+	}
+	copied := false
+	write := func() {
+		if !copied {
+			v.Concerns = append([]Concern(nil), v.Concerns...)
+			copied = true
+		}
+	}
+	loweredFromHigh := false
+	for i, c := range v.Concerns {
+		quote := collapseWhitespace(c.QuotedPassage)
+		if quote == "" {
+			continue
+		}
+		ref := normalizeDocumentRef(c.DocumentRef)
+		failure := QuoteFailureDocumentRefMissing
+		var matched *QuotedDocument
+		if ref != "" {
+			failure = QuoteFailureDocumentUnknown
+			for j := range docs {
+				if normalizeDocumentRef(docs[j].Path) != ref {
+					continue
+				}
+				text := collapseWhitespace(docs[j].Text)
+				if text == "" {
+					if failure == QuoteFailureDocumentUnknown {
+						failure = QuoteFailureDocumentTextUnavailable
+					}
+					continue
+				}
+				failure = QuoteFailurePassageNotFound
+				if strings.Contains(text, quote) {
+					matched = &docs[j]
+					break
+				}
 			}
 		}
-		v.Verdict = VerdictApproveWithConcerns
-		res.VerdictClampedFrom = VerdictReject
+		if matched != nil {
+			if c.QuoteUnverified || c.QuoteVerifiedContentHash != matched.ContentHash {
+				write()
+				v.Concerns[i].QuoteUnverified = false
+				v.Concerns[i].QuoteVerifiedContentHash = matched.ContentHash
+			}
+			res.Verified = append(res.Verified, QuoteVerified{
+				Index: i, DocumentRef: ref, Commit: matched.Commit, ContentHash: matched.ContentHash,
+			})
+			continue
+		}
+		from := c.Severity
+		if !c.QuoteUnverified || c.QuoteVerifiedContentHash != "" || from != SeverityLow {
+			write()
+			v.Concerns[i].QuoteUnverified = true
+			v.Concerns[i].QuoteVerifiedContentHash = ""
+			if from != SeverityLow {
+				if from == SeverityHigh {
+					loweredFromHigh = true
+				}
+				if c.SeverityClampedFrom == "" {
+					v.Concerns[i].SeverityClampedFrom = from
+				}
+				v.Concerns[i].Severity = SeverityLow
+			}
+		}
+		res.Demoted = append(res.Demoted, QuoteDemotion{
+			Index: i, DocumentRef: ref, Failure: failure, From: from, To: SeverityLow,
+		})
 	}
+	res.VerdictClampedFrom = downgradeRejectWithoutHigh(v, loweredFromHigh)
+	return res
+}
+
+// PersonaClampedConcern records one concern ClampPersonaSeverities lowered.
+type PersonaClampedConcern struct {
+	// Index is the concern's position in ReviewVerdict.Concerns.
+	Index int
+	// Category is the concern's category, verbatim.
+	Category string
+	// From / To are the reviewer-assigned and clamped severities.
+	From, To ConcernSeverity
+}
+
+// PersonaClampResult is what ClampPersonaSeverities changed.
+type PersonaClampResult struct {
+	// Clamped lists every lowered concern, in concern order.
+	Clamped []PersonaClampedConcern
+	// VerdictClampedFrom is VerdictReject when the clamp downgraded a reject
+	// to approve_with_concerns, "" otherwise.
+	VerdictClampedFrom Verdict
+}
+
+// ClampPersonaSeverities enforces a reviewer persona remit's severity_cap on
+// that persona's verdict at INGEST (E55.10 / #3755), mutating v in place (its
+// Concerns slice is copied before the first write). capSev "" (and "high") is
+// UNCAPPED — a no-op; "medium" and "low" bound as themselves; any other value
+// is outside the closed cap set and fails closed to low.
+//
+// Every concern ranked above the cap — whatever its category — is lowered to
+// it, stamped SeverityClampedFrom with the original severity (unless one is
+// already recorded, e.g. by an unverified-quote demotion) and
+// PersonaSeverityCap with the effective cap. The shared reject-downgrade rule
+// then applies. Idempotent: a second call over its own output lowers nothing.
+func ClampPersonaSeverities(v *ReviewVerdict, capSev ConcernSeverity) PersonaClampResult {
+	var res PersonaClampResult
+	if v == nil || len(v.Concerns) == 0 {
+		return res
+	}
+	bound := capRank(capSev)
+	if bound >= 3 {
+		return res
+	}
+	to := rankSeverity(bound)
+	copied := false
+	loweredFromHigh := false
+	for i, c := range v.Concerns {
+		if severityRank(c.Severity) <= bound {
+			continue
+		}
+		if !copied {
+			v.Concerns = append([]Concern(nil), v.Concerns...)
+			copied = true
+		}
+		if c.Severity == SeverityHigh {
+			loweredFromHigh = true
+		}
+		if c.SeverityClampedFrom == "" {
+			v.Concerns[i].SeverityClampedFrom = c.Severity
+		}
+		v.Concerns[i].Severity = to
+		v.Concerns[i].PersonaSeverityCap = to
+		res.Clamped = append(res.Clamped, PersonaClampedConcern{
+			Index: i, Category: c.Category, From: c.Severity, To: to,
+		})
+	}
+	res.VerdictClampedFrom = downgradeRejectWithoutHigh(v, loweredFromHigh)
 	return res
 }
 

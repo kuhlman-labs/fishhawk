@@ -1195,6 +1195,14 @@ func (s *Server) resolveConcernsByID(ctx context.Context, runID, stageID uuid.UU
 			// store's patch would be dropped here and the apply path could never
 			// engage for concern_ids-addressed fix-ups.
 			SuggestedPatch: c.SuggestedPatch,
+			// Carry the persona ingest attribution (E55.10 / #3755) so the
+			// stage_fixup_triggered `concerns` payload — and the fix-up prompt
+			// line rendered from it (resolveFixupConcerns) — name WHICH reviewer
+			// raised the routed concern and whether its quote failed
+			// verification. Both are omitempty on the planreview shape, so a
+			// legacy (unattributed) row's routed concern is byte-identical.
+			ReviewerRole:    c.ReviewerRole,
+			QuoteUnverified: c.QuoteUnverified,
 		})
 	}
 	return out, nil

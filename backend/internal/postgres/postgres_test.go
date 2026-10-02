@@ -6495,3 +6495,95 @@ func TestMigrateDown_RunsDocumentBaseCommitReversal(t *testing.T) {
 	}
 	assertShape("after re-apply")
 }
+
+// TestMigrateDown_ReviewConcernsPersonaAttributionReversal pins 0092 (E55.10 /
+// #3755) in BOTH directions. After MigrateUp review_concerns carries
+// reviewer_role (TEXT NOT NULL, empty-string default), quote_unverified
+// (BOOLEAN NOT NULL DEFAULT false) and severity_clamped_from (TEXT NOT NULL,
+// empty-string default), and a row inserted WITHOUT naming them reads back
+// empty / false / empty — the no-backfill "unattributed" reading a legacy row
+// gets. After rolling back
+// through 0092 all three columns are gone while the table survives (0092 is an
+// ALTER, never a DROP TABLE), and a re-apply restores them.
+func TestMigrateDown_ReviewConcernsPersonaAttributionReversal(t *testing.T) {
+	t.Parallel()
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+
+	ctx := context.Background()
+	columnCount := func() int {
+		t.Helper()
+		var n int
+		if err := pool.QueryRow(ctx,
+			`SELECT count(*) FROM information_schema.columns
+			  WHERE table_name = 'review_concerns'
+			    AND column_name IN ('reviewer_role', 'quote_unverified', 'severity_clamped_from')`).Scan(&n); err != nil {
+			t.Fatalf("query review_concerns persona-attribution columns: %v", err)
+		}
+		return n
+	}
+
+	if n := columnCount(); n != 3 {
+		t.Fatalf("review_concerns persona-attribution column count after MigrateUp = %d, want 3 (0092 adds reviewer_role, quote_unverified, severity_clamped_from)", n)
+	}
+
+	// A row that names none of the new columns reads back the defaults: ''
+	// reviewer_role is the load-bearing "unattributed" state (no backfill).
+	runID, stageID, concernID := uuid.New(), uuid.New(), uuid.New()
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, state, runner_kind)
+		 VALUES ($1, 'r', 'feature_change', 'sha', 'cli', 'pending', 'local')`, runID); err != nil {
+		t.Fatalf("insert run: %v", err)
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO stages (id, run_id, sequence, stage_type, executor_kind, executor_ref, state)
+		 VALUES ($1, $2, 0, 'implement', 'agent', 'claude-code', 'dispatched')`,
+		stageID, runID); err != nil {
+		t.Fatalf("insert stage: %v", err)
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO review_concerns (id, run_id, stage_id, stage_kind, origin_review_sequence, severity, category, note)
+		 VALUES ($1, $2, $3, 'implement', 7, 'high', 'correctness', 'n')`,
+		concernID, runID, stageID); err != nil {
+		t.Fatalf("insert review_concerns row without the 0092 columns: %v", err)
+	}
+	var role, clampedFrom string
+	var quoteUnverified bool
+	if err := pool.QueryRow(ctx,
+		`SELECT reviewer_role, quote_unverified, severity_clamped_from FROM review_concerns WHERE id = $1`,
+		concernID).Scan(&role, &quoteUnverified, &clampedFrom); err != nil {
+		t.Fatalf("read back 0092 columns: %v", err)
+	}
+	if role != "" || quoteUnverified || clampedFrom != "" {
+		t.Errorf("0092 defaults = (reviewer_role %q, quote_unverified %v, severity_clamped_from %q), want ('', false, '') — a legacy row is unattributed, never backfilled", role, quoteUnverified, clampedFrom)
+	}
+
+	// Roll back through 0092, the reversal under test: one step drops all
+	// three columns — a down migration that dropped only some would leave a
+	// non-zero count.
+	downThrough(t, url, "0092")
+	if n := columnCount(); n != 0 {
+		t.Errorf("review_concerns persona-attribution column count after MigrateDown = %d, want 0 (0092 reverted)", n)
+	}
+	var survivors int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM review_concerns WHERE id = $1`, concernID).Scan(&survivors); err != nil {
+		t.Fatalf("query review_concerns after MigrateDown (table dropped?): %v", err)
+	}
+	if survivors != 1 {
+		t.Errorf("review_concerns row count after MigrateDown = %d, want 1 (0092 is an ALTER, never a DROP TABLE)", survivors)
+	}
+
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp (re-apply after rollback): %v", err)
+	}
+	if n := columnCount(); n != 3 {
+		t.Fatalf("review_concerns persona-attribution column count after re-apply = %d, want 3 (0092 re-added them)", n)
+	}
+}

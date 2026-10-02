@@ -12,7 +12,7 @@ import (
 )
 
 const getReviewConcernsByIDs = `-- name: GetReviewConcernsByIDs :many
-SELECT id, run_id, stage_id, stage_kind, origin_review_sequence, reviewer_model, severity, category, note, state, state_reason, created_at, updated_at, suggested_patch, new_evidence, settled_ref FROM review_concerns
+SELECT id, run_id, stage_id, stage_kind, origin_review_sequence, reviewer_model, severity, category, note, state, state_reason, created_at, updated_at, suggested_patch, new_evidence, settled_ref, reviewer_role, quote_unverified, severity_clamped_from FROM review_concerns
  WHERE id = ANY($1::uuid[])
 `
 
@@ -42,6 +42,9 @@ func (q *Queries) GetReviewConcernsByIDs(ctx context.Context, ids []uuid.UUID) (
 			&i.SuggestedPatch,
 			&i.NewEvidence,
 			&i.SettledRef,
+			&i.ReviewerRole,
+			&i.QuoteUnverified,
+			&i.SeverityClampedFrom,
 		); err != nil {
 			return nil, err
 		}
@@ -58,10 +61,11 @@ const insertReviewConcern = `-- name: InsertReviewConcern :one
 INSERT INTO review_concerns (
     id, run_id, stage_id, stage_kind, origin_review_sequence,
     reviewer_model, severity, category, note, suggested_patch,
-    new_evidence, settled_ref
+    new_evidence, settled_ref, reviewer_role, quote_unverified,
+    severity_clamped_from
 )
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-RETURNING id, run_id, stage_id, stage_kind, origin_review_sequence, reviewer_model, severity, category, note, state, state_reason, created_at, updated_at, suggested_patch, new_evidence, settled_ref
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+RETURNING id, run_id, stage_id, stage_kind, origin_review_sequence, reviewer_model, severity, category, note, state, state_reason, created_at, updated_at, suggested_patch, new_evidence, settled_ref, reviewer_role, quote_unverified, severity_clamped_from
 `
 
 type InsertReviewConcernParams struct {
@@ -77,6 +81,9 @@ type InsertReviewConcernParams struct {
 	SuggestedPatch       string    `json:"suggested_patch"`
 	NewEvidence          string    `json:"new_evidence"`
 	SettledRef           string    `json:"settled_ref"`
+	ReviewerRole         string    `json:"reviewer_role"`
+	QuoteUnverified      bool      `json:"quote_unverified"`
+	SeverityClampedFrom  string    `json:"severity_clamped_from"`
 }
 
 // Review-concern queries (E22.X / #964). sqlc generates typed Go
@@ -95,6 +102,9 @@ func (q *Queries) InsertReviewConcern(ctx context.Context, arg InsertReviewConce
 		arg.SuggestedPatch,
 		arg.NewEvidence,
 		arg.SettledRef,
+		arg.ReviewerRole,
+		arg.QuoteUnverified,
+		arg.SeverityClampedFrom,
 	)
 	var i ReviewConcern
 	err := row.Scan(
@@ -114,12 +124,15 @@ func (q *Queries) InsertReviewConcern(ctx context.Context, arg InsertReviewConce
 		&i.SuggestedPatch,
 		&i.NewEvidence,
 		&i.SettledRef,
+		&i.ReviewerRole,
+		&i.QuoteUnverified,
+		&i.SeverityClampedFrom,
 	)
 	return i, err
 }
 
 const listOpenReviewConcernsByRun = `-- name: ListOpenReviewConcernsByRun :many
-SELECT id, run_id, stage_id, stage_kind, origin_review_sequence, reviewer_model, severity, category, note, state, state_reason, created_at, updated_at, suggested_patch, new_evidence, settled_ref FROM review_concerns
+SELECT id, run_id, stage_id, stage_kind, origin_review_sequence, reviewer_model, severity, category, note, state, state_reason, created_at, updated_at, suggested_patch, new_evidence, settled_ref, reviewer_role, quote_unverified, severity_clamped_from FROM review_concerns
  WHERE run_id = $1
    AND state IN ('raised', 'addressed_pending', 'reopened')
  ORDER BY origin_review_sequence ASC, created_at ASC, id ASC
@@ -153,6 +166,9 @@ func (q *Queries) ListOpenReviewConcernsByRun(ctx context.Context, runID uuid.UU
 			&i.SuggestedPatch,
 			&i.NewEvidence,
 			&i.SettledRef,
+			&i.ReviewerRole,
+			&i.QuoteUnverified,
+			&i.SeverityClampedFrom,
 		); err != nil {
 			return nil, err
 		}
@@ -165,7 +181,7 @@ func (q *Queries) ListOpenReviewConcernsByRun(ctx context.Context, runID uuid.UU
 }
 
 const listReviewConcernsByRun = `-- name: ListReviewConcernsByRun :many
-SELECT id, run_id, stage_id, stage_kind, origin_review_sequence, reviewer_model, severity, category, note, state, state_reason, created_at, updated_at, suggested_patch, new_evidence, settled_ref FROM review_concerns
+SELECT id, run_id, stage_id, stage_kind, origin_review_sequence, reviewer_model, severity, category, note, state, state_reason, created_at, updated_at, suggested_patch, new_evidence, settled_ref, reviewer_role, quote_unverified, severity_clamped_from FROM review_concerns
  WHERE run_id = $1
  ORDER BY origin_review_sequence ASC, created_at ASC, id ASC
 `
@@ -197,6 +213,9 @@ func (q *Queries) ListReviewConcernsByRun(ctx context.Context, runID uuid.UUID) 
 			&i.SuggestedPatch,
 			&i.NewEvidence,
 			&i.SettledRef,
+			&i.ReviewerRole,
+			&i.QuoteUnverified,
+			&i.SeverityClampedFrom,
 		); err != nil {
 			return nil, err
 		}
@@ -215,7 +234,7 @@ UPDATE review_concerns
        updated_at = now()
  WHERE id = $1
    AND state = $4
-RETURNING id, run_id, stage_id, stage_kind, origin_review_sequence, reviewer_model, severity, category, note, state, state_reason, created_at, updated_at, suggested_patch, new_evidence, settled_ref
+RETURNING id, run_id, stage_id, stage_kind, origin_review_sequence, reviewer_model, severity, category, note, state, state_reason, created_at, updated_at, suggested_patch, new_evidence, settled_ref, reviewer_role, quote_unverified, severity_clamped_from
 `
 
 type UpdateReviewConcernStateParams struct {
@@ -253,6 +272,9 @@ func (q *Queries) UpdateReviewConcernState(ctx context.Context, arg UpdateReview
 		&i.SuggestedPatch,
 		&i.NewEvidence,
 		&i.SettledRef,
+		&i.ReviewerRole,
+		&i.QuoteUnverified,
+		&i.SeverityClampedFrom,
 	)
 	return i, err
 }

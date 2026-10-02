@@ -2263,8 +2263,10 @@ func (s *Server) runPlanReviewLoop(ctx context.Context, runID, stageID uuid.UUID
 // runPlanReviewLoopWithConventions is runPlanReviewLoop with the round's
 // review-convention state (E55.3 / #2244). Each successful verdict is clamped
 // by planreview.ClampConventionSeverities against round.Caps IMMEDIATELY after
-// the reviewer returns — before the plan_reviewed payload, the gating
-// hasRejection decision or persistReviewConcerns read it — so a convention's
+// the reviewer returns, then passes applyPersonaConcernControls (E55.10 /
+// #3755: marker scrub, a persona's quote verification and severity_cap clamp,
+// the reviewer_role stamp) — before the plan_reviewed payload, the gating
+// hasRejection decision or persistReviewConcernsAs read it — so a convention's
 // severity_cap holds whatever the model emitted: a reject resting only on
 // clamped highs is recorded as approve_with_concerns with
 // verdict_clamped_from=reject and does not fail a gating stage. The clamp runs
@@ -2386,6 +2388,12 @@ func (s *Server) runPlanReviewLoopWithConventions(ctx context.Context, runID, st
 		verdict = &clamped
 		clamp := planreview.ClampConventionSeverities(verdict, round.Caps)
 		s.logConventionClamps(ctx, "plan review", runID, stageID, i, clamp)
+		// Persona concern ingest (E55.10 / #3755): scrub server-internal
+		// markers, verify a persona's quoted passages and clamp to its remit's
+		// severity_cap, then stamp every concern's reviewer_role — before the
+		// payload, hasRejection and the concern rows read the verdict.
+		verdictClampedFrom := mergeVerdictClampedFrom(clamp.VerdictClampedFrom,
+			s.applyPersonaConcernControls(ctx, "plan review", runID, stageID, inv, model, verdict))
 
 		// Self-review guard (ADR-027): warn when the review agent's
 		// model matches the plan author's model. Warn-only per ADR;
@@ -2418,8 +2426,9 @@ func (s *Server) runPlanReviewLoopWithConventions(ctx context.Context, runID, st
 			// for a standard reviewer (omitempty, byte-identical).
 			Persona: inv.personaName(),
 			// The reviewer's original verdict when the convention clamp
-			// downgraded it (E55.3 / #2244); empty otherwise (omitempty).
-			VerdictClampedFrom: clamp.VerdictClampedFrom,
+			// (E55.3 / #2244) or a persona ingest control (E55.10 / #3755)
+			// downgraded it; empty otherwise (omitempty).
+			VerdictClampedFrom: verdictClampedFrom,
 		}
 		payloadBytes, _ := json.Marshal(payload)
 		entry, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
@@ -2439,7 +2448,7 @@ func (s *Server) runPlanReviewLoopWithConventions(ctx context.Context, runID, st
 			// Persist the verdict's concerns with stable IDs (#964) using
 			// the sequence the append returned; a failed append (no
 			// sequence) skips persistence for this verdict.
-			s.persistReviewConcerns(ctx, runID, stageID, concern.StageKindPlan, model, verdict.FreeForm, entry.Sequence, verdict.Concerns)
+			s.persistReviewConcernsAs(ctx, runID, stageID, concern.StageKindPlan, model, inv.reviewerRole(), verdict.FreeForm, entry.Sequence, verdict.Concerns)
 		}
 
 		// Capture this reviewer invocation's agent token cost (#681). The

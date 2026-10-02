@@ -56,8 +56,19 @@ func itemsOf(t *testing.T, props map[string]any, key string) map[string]any {
 // flagging that intentional omission. Concern.SeverityClampedFrom (E55.3 /
 // #2244) is the same class: stamped only by the ingest-time severity_cap clamp
 // (ClampConventionSeverities), never reviewer-emittable;
-// TestVerdictSchema_OmitsSeverityClampedFrom pins its absence positively.
-var schemaExcludedTags = map[string]bool{"provenance": true, "severity_clamped_from": true}
+// TestVerdictSchema_OmitsSeverityClampedFrom pins its absence positively. The
+// four persona ingest markers (E55.10 / #3755) — quote_unverified,
+// quote_verified_content_hash, persona_severity_cap and reviewer_role — are the
+// same class, stamped only at ingest; TestVerdictSchema_OmitsPersonaIngestMarkers
+// pins their absence positively.
+var schemaExcludedTags = map[string]bool{
+	"provenance":                  true,
+	"severity_clamped_from":       true,
+	"quote_unverified":            true,
+	"quote_verified_content_hash": true,
+	"persona_severity_cap":        true,
+	"reviewer_role":               true,
+}
 
 // assertTagsPresent asserts every reflected json tag of structType (except the
 // deliberately schema-excluded server-internal ones) appears as a property key
@@ -258,7 +269,7 @@ func TestStrictVerdictSchema_SatisfiesStrictRequired(t *testing.T) {
 	if _, ok := concernProps["severity"].(map[string]any)["enum"]; !ok {
 		t.Error("strict concerns.items: severity lost its enum in the strict transform")
 	}
-	for _, k := range []string{"category", "suggested_patch", "settled_ref", "new_evidence", "convention"} {
+	for _, k := range []string{"category", "suggested_patch", "settled_ref", "new_evidence", "convention", "quoted_passage", "document_ref"} {
 		assertNullable(t, concernProps, k, "strict concerns.items")
 	}
 
@@ -614,6 +625,63 @@ func TestVerdictSchema_OmitsSeverityClampedFrom(t *testing.T) {
 		}
 		if items["additionalProperties"] != false {
 			t.Errorf("%s concerns.items additionalProperties = %v, want false (closed)", name, items["additionalProperties"])
+		}
+	}
+}
+
+// TestVerdictSchema_QuotedPassageFields pins the E55.10 (#3755) additive
+// concern properties: the closed concerns.items object registers
+// quoted_passage and document_ref as optional strings (nullable in the strict
+// variant), so a schema-constrained persona CAN cite the passage it rests a
+// concern on, and a body carrying them decodes into the Concern fields.
+func TestVerdictSchema_QuotedPassageFields(t *testing.T) {
+	lenient := VerdictSchema()
+	concernItems := itemsOf(t, propsOf(t, lenient, "top-level"), "concerns")
+	props := propsOf(t, concernItems, "concerns.items")
+	for _, name := range []string{"quoted_passage", "document_ref"} {
+		p, ok := props[name].(map[string]any)
+		if !ok {
+			t.Fatalf("concerns.items is missing the %q property (E55.10 / #3755)", name)
+		}
+		if p["type"] != "string" {
+			t.Errorf("concerns.items.%s type = %v, want \"string\"", name, p["type"])
+		}
+		for _, r := range concernItems["required"].([]any) {
+			if r == name {
+				t.Errorf("concerns.items.%s is required in the lenient schema; it must stay optional", name)
+			}
+		}
+	}
+	strictItems := itemsOf(t, propsOf(t, StrictVerdictSchema(), "strict top-level"), "concerns")
+	strictProps := propsOf(t, strictItems, "strict concerns.items")
+	assertNullable(t, strictProps, "quoted_passage", "strict concerns.items")
+	assertNullable(t, strictProps, "document_ref", "strict concerns.items")
+
+	got, err := DecodeVerdict([]byte(`{"verdict":"reject","concerns":[{"severity":"high","category":"security","note":"n","quoted_passage":"never log tokens","document_ref":"docs/remit.md"}]}`))
+	if err != nil {
+		t.Fatalf("DecodeVerdict: %v", err)
+	}
+	if len(got.Concerns) != 1 || got.Concerns[0].QuotedPassage != "never log tokens" || got.Concerns[0].DocumentRef != "docs/remit.md" {
+		t.Errorf("Concerns = %+v, want one concern with QuotedPassage + DocumentRef decoded", got.Concerns)
+	}
+}
+
+// TestVerdictSchema_OmitsPersonaIngestMarkers pins that the four
+// server-internal persona ingest markers (E55.10 / #3755) are NOT emittable:
+// absent from both the lenient and the strict concerns.items properties, so
+// under the closed object a schema-constrained reviewer cannot forge a
+// verified quote, a cap record or its own role.
+func TestVerdictSchema_OmitsPersonaIngestMarkers(t *testing.T) {
+	for name, schema := range map[string]map[string]any{
+		"lenient": VerdictSchema(),
+		"strict":  StrictVerdictSchema(),
+	} {
+		items := itemsOf(t, propsOf(t, schema, name+" top-level"), "concerns")
+		props := propsOf(t, items, name+" concerns.items")
+		for _, marker := range []string{"quote_unverified", "quote_verified_content_hash", "persona_severity_cap", "reviewer_role"} {
+			if _, exists := props[marker]; exists {
+				t.Errorf("%s VerdictSchema concern properties include %q; it MUST stay server-internal", name, marker)
+			}
 		}
 	}
 }

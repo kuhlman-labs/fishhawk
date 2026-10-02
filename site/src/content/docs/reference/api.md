@@ -31,6 +31,19 @@ the acceptance runner's scenario-corpus reports (`acceptance_scenarios_pushed`,
 alongside the agent's rows. The shape of each is in the companion
 [`docs/api/v0.md`](https://github.com/kuhlman-labs/fishhawk/blob/main/docs/api/v0.md).
 
+Review concerns record which reviewer raised them, which the table also does
+not spell out. The concern items on `GET /v0/runs/{run_id}` and the open and
+settled rows of `GET /v0/runs/{run_id}/gate-view` carry `reviewer_role` — a
+reviewer persona's name, or `standard` for the stage's standard reviewer — and
+`quote_unverified` when the reviewer quoted a document passage the server could
+not find in the text it gave that reviewer, in which case the concern was
+lowered to `low`. The gate view also reports the reviewer's original severity
+as `severity_clamped_from` whenever the server lowered it, whether for an
+unverified quote or a persona's severity cap. Concerns recorded before reviewer
+attribution existed omit all three fields. A concern routed into a fix-up by id
+keeps `reviewer_role` and `quote_unverified` on the `stage_fixup_triggered`
+audit entry, and the fix-up prompt names the persona that raised it.
+
 ## Generated operation reference
 
 <!-- BEGIN GENERATED api -->

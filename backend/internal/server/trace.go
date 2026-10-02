@@ -5259,13 +5259,17 @@ func (s *Server) runImplementReviewInvocations(ctx context.Context, runID, stage
 // cost record), so the two can be separated in time without reordering a
 // single audit row.
 //
-// CLAMP AT INGEST. Every successful verdict passes ClampConventionSeverities
-// against conv.Caps BEFORE its payload is built, its gating contribution is
-// read or its concerns are persisted: a repo_convention concern above its
-// convention's severity_cap is lowered (severity_clamped_from), and with ZERO
-// conventions rendered every repo_convention / conventions_override_attempt /
-// conventions_file_modified concern a reviewer emits anyway is lowered to low
-// (approval condition 2 of #2244). A reject resting only on clamped highs
+// CLAMP AT INGEST. Every successful verdict passes
+// ClampConventionSeveritiesForRound against conv.Caps (and then the E55.10 /
+// #3755 persona concern controls, applyPersonaConcernControls) BEFORE its
+// payload is built, its gating contribution is read or its concerns are
+// persisted: a repo_convention concern above its convention's severity_cap is
+// lowered (severity_clamped_from), and with ZERO conventions rendered every
+// repo_convention / conventions_override_attempt / conventions_file_modified
+// concern a reviewer emits anyway is lowered to low (approval condition 2 of
+// #2244) — except a conventions_file_modified concern on a round whose diff
+// modifies a declared conventions file, which the server observed itself
+// (E55.10 / #3755). A reject resting only on clamped highs
 // becomes approve_with_concerns (verdict_clamped_from: reject) and does not
 // gate. Each clamp is WARN-logged with the run id and category.
 //
@@ -5291,7 +5295,7 @@ func (s *Server) runImplementReviewInvocationsWithConventions(ctx context.Contex
 		// exactly as before E55.3.
 		for i, inv := range invocations {
 			res := s.invokeImplementReviewer(ctx, i, inv, promptText, treeDir, reviewBudget)
-			s.clampImplementReviewVerdict(ctx, runID, stageID, &res, conv.Caps)
+			s.clampImplementReviewVerdict(ctx, runID, stageID, &res, conv)
 			s.ingestImplementReview(ctx, st, res)
 		}
 	} else {
@@ -5302,7 +5306,7 @@ func (s *Server) runImplementReviewInvocationsWithConventions(ctx context.Contex
 			results[i] = s.invokeImplementReviewer(ctx, i, inv, promptText, treeDir, reviewBudget)
 		}
 		for i := range results {
-			s.clampImplementReviewVerdict(ctx, runID, stageID, &results[i], conv.Caps)
+			s.clampImplementReviewVerdict(ctx, runID, stageID, &results[i], conv)
 		}
 		s.synthesizeConventionsFileModified(ctx, runID, stageID, results, conv.ModifiedFiles)
 		for _, res := range results {
@@ -5454,14 +5458,23 @@ func (s *Server) invokeImplementReviewer(ctx context.Context, i int, inv reviewe
 
 // clampImplementReviewVerdict applies the review-convention severity clamp to
 // one successful verdict at ingest (E55.3 / #2244) and WARN-logs every clamp
-// with the run id and the concern's category. caps nil means zero conventions
-// were rendered: every convention-category concern is then lowered to low.
-func (s *Server) clampImplementReviewVerdict(ctx context.Context, runID, stageID uuid.UUID, res *implementReviewInvocationResult, caps planreview.ConventionCaps) {
+// with the run id and the concern's category. conv.Caps nil means zero
+// conventions were rendered: every convention-category concern is then lowered
+// to low — EXCEPT a conventions_file_modified concern on a round whose diff
+// modifies a declared conventions file (conv.ModifiedFiles non-empty), which
+// keeps its weight because the server observed the modification itself
+// (E55.10 / #3755, the #2244 seam).
+//
+// It then runs applyPersonaConcernControls (E55.10 / #3755): the marker scrub,
+// a persona's quote verification and severity_cap clamp, and the reviewer_role
+// stamp. The verdict_clamped_from recorded is the first non-empty of the two.
+func (s *Server) clampImplementReviewVerdict(ctx context.Context, runID, stageID uuid.UUID, res *implementReviewInvocationResult, conv reviewConventionRound) {
 	if !res.succeeded() {
 		return
 	}
-	cr := planreview.ClampConventionSeverities(res.verdict, caps)
-	res.verdictClampedFrom = cr.VerdictClampedFrom
+	cr := planreview.ClampConventionSeveritiesForRound(res.verdict, conv.Caps, len(conv.ModifiedFiles) > 0)
+	res.verdictClampedFrom = mergeVerdictClampedFrom(cr.VerdictClampedFrom,
+		s.applyPersonaConcernControls(ctx, "implement review", runID, stageID, res.inv, res.model, res.verdict))
 	for _, c := range cr.Clamped {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "implement review: review-convention concern severity clamped at ingest",
 			slog.String("run_id", runID.String()),
@@ -5506,6 +5519,10 @@ func (s *Server) synthesizeConventionsFileModified(ctx context.Context, runID, s
 	before := len(results[carrier].verdict.Concerns)
 	results[carrier].verdictRaisedFrom = planreview.AddSynthesizedConventionsFileModifiedConcern(results[carrier].verdict, modified)
 	results[carrier].conventionsFileModifiedSynthesized = len(results[carrier].verdict.Concerns) > before
+	// The synthesized concern is persisted under the carrier invocation's
+	// reviewer_role (E55.10 / #3755); stamp it on the payload concern too so
+	// the implement_reviewed payload and the row agree.
+	stampReviewerRole(results[carrier].verdict, results[carrier].inv.reviewerRole())
 }
 
 // conventionsFileModifiedAlreadyRaised reports whether the stage already holds
@@ -5677,7 +5694,7 @@ func (s *Server) ingestImplementReview(ctx context.Context, st *implementReviewL
 		// stamped with the sequence the append returned — the audit
 		// chain stays the sole sequence authority, so a failed append
 		// (no sequence) skips persistence for this verdict.
-		freshRows := s.persistReviewConcerns(ctx, runID, stageID, concern.StageKindImplement, model, verdict.FreeForm, entry.Sequence, verdict.Concerns)
+		freshRows := s.persistReviewConcernsAs(ctx, runID, stageID, concern.StageKindImplement, model, inv.reviewerRole(), verdict.FreeForm, entry.Sequence, verdict.Concerns)
 
 		// Post-persist retry re-check (#3593). RE-READ the latest same-stage
 		// retry sequence AFTER persistReviewConcerns minted this verdict's
@@ -5722,6 +5739,7 @@ func (s *Server) ingestImplementReview(ctx context.Context, st *implementReviewL
 		if !superseded {
 			st.round = append(st.round, roundReviewVerdict{
 				model:          model,
+				role:           inv.reviewerRole(),
 				verdict:        verdict.Verdict,
 				resolutions:    verdict.ConcernResolutions,
 				reviewSequence: entry.Sequence,
@@ -6656,7 +6674,13 @@ const vetoReopenWithoutNamedConcern = "reopen_without_named_concern"
 // the inline application had: it is buffered only when the implement_reviewed
 // append returned a sequence.
 type roundReviewVerdict struct {
-	model          string
+	model string
+	// role is the reviewer_role the verdict's concerns were persisted under (a
+	// persona name or concern.ReviewerRoleStandard; E55.10 / #3755). With
+	// model it forms the reviewer's veto identity (reviewerIdentity), so a
+	// persona sharing the standard reviewer's model is a DIFFERENT reviewer.
+	// A legacy literal leaving it "" normalizes to standard.
+	role           string
 	verdict        planreview.Verdict
 	resolutions    []planreview.ConcernResolution
 	reviewSequence int64
@@ -6675,10 +6699,12 @@ type roundReviewVerdict struct {
 // resolutionVetoContext is the round-level evidence a `confirmed` resolution is
 // checked against. Built ONCE per round, before any resolution is applied.
 type resolutionVetoContext struct {
-	// rejectedBy is the set of reviewer models that returned `reject` in this
-	// round, keyed by the same model string persistReviewConcerns stamps on a
-	// concern row's ReviewerModel.
-	rejectedBy map[string]bool
+	// rejectedBy is the set of reviewer identities that returned `reject` in
+	// this round, keyed by the model string persistReviewConcernsAs stamps on a
+	// concern row's ReviewerModel AND the normalized reviewer_role it stamps on
+	// ReviewerRole (E55.10 / #3755) — model alone conflated a persona with the
+	// standard reviewer sharing its model.
+	rejectedBy map[reviewerIdentity]bool
 	// operatorEvidenced is the set of concern ids (string form) routed by ANY
 	// same-stage stage_fixup_triggered entry carrying operator_evidence.
 	operatorEvidenced map[string]bool
@@ -6700,11 +6726,16 @@ type concernResolutionVetoedPayload struct {
 	VetoReason              string `json:"veto_reason"`
 	ConfirmingReviewerModel string `json:"confirming_reviewer_model,omitempty"`
 	RaisingReviewerModel    string `json:"raising_reviewer_model,omitempty"`
-	ConcernSeverity         string `json:"concern_severity,omitempty"`
-	ConcernCategory         string `json:"concern_category,omitempty"`
-	Note                    string `json:"note,omitempty"`
-	ReviewSequence          int64  `json:"review_sequence"`
-	OriginReviewSequence    int64  `json:"origin_review_sequence"`
+	// ConfirmingReviewerRole / RaisingReviewerRole name the reviewer_role
+	// half of each identity (E55.10 / #3755): a persona name or standard.
+	// omitempty: absent on the auto-close path (no confirming reviewer).
+	ConfirmingReviewerRole string `json:"confirming_reviewer_role,omitempty"`
+	RaisingReviewerRole    string `json:"raising_reviewer_role,omitempty"`
+	ConcernSeverity        string `json:"concern_severity,omitempty"`
+	ConcernCategory        string `json:"concern_category,omitempty"`
+	Note                   string `json:"note,omitempty"`
+	ReviewSequence         int64  `json:"review_sequence"`
+	OriginReviewSequence   int64  `json:"origin_review_sequence"`
 }
 
 // concernAutoClosedCategory is the audit-log category for a routed concern
@@ -6862,15 +6893,15 @@ func (s *Server) autoCloseUnjudgedRoutedConcerns(ctx context.Context, runID, sta
 	}
 
 	// Build the round's veto evidence ONCE, reusing the existing derivation
-	// rather than forking it. The confirming-model argument is deliberately ""
-	// — there is no confirming reviewer on this path, and the V1
+	// rather than forking it. The confirming identity is deliberately the zero
+	// reviewerIdentity — there is no confirming reviewer on this path, and the V1
 	// raiser-rejected-same-round arm is already subsumed by the reject guard
 	// above (a clean round populates no rejectedBy entries). The three arms
 	// that DO bite here are the ones the issue's item 3 demands.
 	vc := s.buildResolutionVetoContext(ctx, runID, stageID, round)
 	reason := autoCloseReason(closingSequences, closingModels, reviewedHeadSHA)
 	for _, row := range candidates {
-		if veto := vc.vetoReason(row, ""); veto != "" {
+		if veto := vc.vetoReason(row, reviewerIdentity{}); veto != "" {
 			warn("auto-close refused: "+veto,
 				slog.String("concern_id", row.ID.String()),
 			)
@@ -6993,13 +7024,13 @@ func (s *Server) applyRoundConcernResolutions(ctx context.Context, runID, stageI
 // `confirmed` in the round rather than applying it on unknown evidence.
 func (s *Server) buildResolutionVetoContext(ctx context.Context, runID, stageID uuid.UUID, round []roundReviewVerdict) resolutionVetoContext {
 	vc := resolutionVetoContext{
-		rejectedBy:        make(map[string]bool, len(round)),
+		rejectedBy:        make(map[reviewerIdentity]bool, len(round)),
 		operatorEvidenced: map[string]bool{},
 		noChangePass:      map[string]bool{},
 	}
 	for _, rv := range round {
 		if rv.model != "" && rv.verdict == planreview.VerdictReject {
-			vc.rejectedBy[rv.model] = true
+			vc.rejectedBy[newReviewerIdentity(rv.model, rv.role)] = true
 		}
 	}
 	if s.cfg.AuditRepo == nil {
@@ -7102,10 +7133,13 @@ func (s *Server) buildResolutionVetoContext(ctx context.Context, runID, stageID 
 //
 // V1 never fires when the CONFIRMING reviewer is the one that RAISED the
 // concern: that reviewer IS the authority the veto exists to respect, so it may
-// confirm its own finding even while rejecting the pass overall.
-func (vc resolutionVetoContext) vetoReason(row *concern.Concern, confirmingModel string) string {
-	raiser := derefStr(row.ReviewerModel)
-	if raiser != "" && raiser != confirmingModel && vc.rejectedBy[raiser] {
+// confirm its own finding even while rejecting the pass overall. Identity is
+// model + normalized reviewer_role (E55.10 / #3755): a persona on the raising
+// standard reviewer's model is NOT the raiser. The auto-close path passes the
+// zero identity (no confirming reviewer).
+func (vc resolutionVetoContext) vetoReason(row *concern.Concern, confirming reviewerIdentity) string {
+	raiser := rowReviewerIdentity(row)
+	if raiser.model != "" && raiser != confirming && vc.rejectedBy[raiser] {
 		return vetoRaiserRejectedSameRound
 	}
 	id := row.ID.String()
@@ -7225,7 +7259,7 @@ func (s *Server) applyConcernResolutions(ctx context.Context, runID, stageID uui
 		// the round's evidence contradicts is REFUSED — the concern keeps its
 		// current open state and state_reason, and the refusal is recorded.
 		if to == concern.StateAddressed {
-			if reason := vc.vetoReason(row, rv.model); reason != "" {
+			if reason := vc.vetoReason(row, newReviewerIdentity(rv.model, rv.role)); reason != "" {
 				warn(res, "confirmed resolution vetoed: "+reason)
 				s.appendConcernResolutionVetoed(ctx, runID, stageID, concernResolutionVetoedPayload{
 					ConcernID:               cid.String(),
@@ -7233,6 +7267,8 @@ func (s *Server) applyConcernResolutions(ctx context.Context, runID, stageID uui
 					VetoReason:              reason,
 					ConfirmingReviewerModel: rv.model,
 					RaisingReviewerModel:    derefStr(row.ReviewerModel),
+					ConfirmingReviewerRole:  concern.NormalizedReviewerRole(rv.role),
+					RaisingReviewerRole:     concern.NormalizedReviewerRole(row.ReviewerRole),
 					ConcernSeverity:         row.Severity,
 					ConcernCategory:         row.Category,
 					Note:                    res.Note,
@@ -7311,6 +7347,15 @@ func (s *Server) applyConcernResolutions(ctx context.Context, runID, stageID uui
 // The freeForm argument is the emitting verdict's free_form commentary, the
 // recovery source for the blank-note backfill below (#2555).
 func (s *Server) persistReviewConcerns(ctx context.Context, runID, stageID uuid.UUID, stageKind, reviewerModel, freeForm string, originSequence int64, concerns []planreview.Concern) []*concern.Concern {
+	return s.persistReviewConcernsAs(ctx, runID, stageID, stageKind, reviewerModel, concern.ReviewerRoleStandard, freeForm, originSequence, concerns)
+}
+
+// persistReviewConcernsAs is persistReviewConcerns attributing every concern to
+// reviewerRole (E55.10 / #3755): the raising invocation's persona name or
+// concern.ReviewerRoleStandard, stored verbatim on the row. It also carries
+// each concern's ingest markers — quote_unverified and severity_clamped_from —
+// onto the row, so the gate view reads what the payload records.
+func (s *Server) persistReviewConcernsAs(ctx context.Context, runID, stageID uuid.UUID, stageKind, reviewerModel, reviewerRole, freeForm string, originSequence int64, concerns []planreview.Concern) []*concern.Concern {
 	if s.cfg.ConcernRepo == nil || len(concerns) == 0 {
 		return nil
 	}
@@ -7373,6 +7418,9 @@ func (s *Server) persistReviewConcerns(ctx context.Context, runID, stageID uuid.
 			// rendered as a bare assertion.
 			NewEvidence: c.NewEvidence,
 			SettledRef:  c.SettledRef,
+			// Persona ingest markers (E55.10 / #3755).
+			QuoteUnverified:     c.QuoteUnverified,
+			SeverityClampedFrom: string(c.SeverityClampedFrom),
 		})
 	}
 	if len(raised) == 0 {
@@ -7383,6 +7431,7 @@ func (s *Server) persistReviewConcerns(ctx context.Context, runID, stageID uuid.
 		StageID:              stageID,
 		StageKind:            stageKind,
 		ReviewerModel:        reviewerModel,
+		ReviewerRole:         reviewerRole,
 		OriginReviewSequence: originSequence,
 		Concerns:             raised,
 	})

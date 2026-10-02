@@ -557,6 +557,22 @@ body. `TestRepodocCarriesNoConsumerVocabulary` scans the package's non-test
 source (comments stripped) for consumer words, so the mechanism cannot quietly
 learn about conventions or charters.
 
+## Recovering the shown text (`InjectedContent`, E55.10 / #3755)
+
+`InjectedContent(prompt.InjectedDocument) (string, bool)` returns the
+neutralized document text between the BEGIN/END delimiter lines a
+`ToPromptDocument` block rendered — exactly the bytes the agent was shown — and
+`("", false)` when the body carries no delimiter pair (a `WithheldNotice`, a
+hand-built body, a body with text after its END line). The server verifies a
+reviewer persona's `quoted_passage` against this text, never against the
+framing (heading, preamble, trust note, data clause, Source line). The bracket
+is unambiguous because `neutralizeBody` guarantees no delimiter LINE survives
+inside the content: the first newline-bounded BEGIN is the framing's own and the
+last END line is the closing one. The result is the SHOWN text, not the fetched
+bytes the content hash covers: a forged-delimiter line reads as the
+neutralization note and a truncated document includes its marker (pinned by
+`TestInjectedContent_*`).
+
 ## Prompt placement
 
 `prompt.Trigger.InjectedDocuments` renders at the **head of the cache-stable
