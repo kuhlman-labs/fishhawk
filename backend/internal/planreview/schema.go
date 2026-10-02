@@ -65,6 +65,13 @@ func VerdictSchema() map[string]any {
 			// unable to emit the field the ledger asks it to tag a re-raise with.
 			"settled_ref":  map[string]any{"type": "string"},
 			"new_evidence": map[string]any{"type": "string"},
+			// Convention (E55.3 / #2244): the name of the repository review
+			// convention a repo_convention concern derives from — the key the
+			// server-side severity_cap clamp looks the cap up by. Optional, so the
+			// strict variant makes it nullable. Its server-internal companion
+			// severity_clamped_from is deliberately NOT registered: only the
+			// ingest clamp stamps it, so a reviewer cannot emit it.
+			"convention": map[string]any{"type": "string"},
 		},
 	}
 

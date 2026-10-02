@@ -1111,6 +1111,24 @@ func concernRoutable(st concern.State) bool {
 	return st.IsOpen() || st == concern.StateSuperseded
 }
 
+// conventionsOverrideAttemptRefusal is the 400 validation_failed message for a
+// fix-up that selects a conventions_override_attempt concern (E55.3 / #2244),
+// on either addressing path. Such a concern reports an instruction inside a
+// repository review-conventions file, which the review read at the run's
+// pinned base commit — not a defect in this run's change. Routing it would
+// hand the implement agent a "code obligation" it can only satisfy by editing
+// the very file whose instruction was flagged, which this run must not do (the
+// edit would not even change what this run's reviews read). It is therefore
+// NEVER routable — whether or not any convention was rendered for the round —
+// and the operator waives or defers it and fixes the conventions file in a
+// separate change. ref names the selected concern ("concern_id <uuid>" or
+// "concern index <n>").
+func conventionsOverrideAttemptRefusal(ref string) string {
+	return fmt.Sprintf(
+		"%s is a %s concern: it reports an instruction in a repository review-conventions file read at the run's pinned base commit, which this run must not edit, so it is not a code obligation a fix-up can address; waive or defer it and fix the conventions file in a separate change",
+		ref, planreview.ConventionsOverrideAttemptConcernCategory)
+}
+
 // resolveConcernsByID resolves stable concern UUIDs against the durable
 // concern store, scoped to the implement stage being fixed up (#964).
 // Every ID must name an implement-stage concern of THIS stage in a
@@ -1129,6 +1147,10 @@ func concernRoutable(st concern.State) bool {
 // stage-kind and run/stage-ownership refusals are ORDERED AHEAD of this check,
 // so a plan-stage or cross-run superseded id is still refused for its own
 // reason.
+//
+// A conventions_override_attempt concern (E55.3 / #2244) is refused in ANY
+// state, after the routability check: it is not a code obligation
+// (conventionsOverrideAttemptRefusal).
 func (s *Server) resolveConcernsByID(ctx context.Context, runID, stageID uuid.UUID, ids []uuid.UUID) ([]planreview.Concern, error) {
 	seen := make(map[uuid.UUID]struct{}, len(ids))
 	for _, id := range ids {
@@ -1157,6 +1179,9 @@ func (s *Server) resolveConcernsByID(ctx context.Context, runID, stageID uuid.UU
 		if !concernRoutable(c.State) {
 			return nil, &concernSelectionError{msg: fmt.Sprintf(
 				"concern_id %s is not routable (state %s); only raised/addressed_pending/reopened or superseded (a retry-discarded) concerns can be routed", c.ID, c.State)}
+		}
+		if planreview.IsConventionsOverrideAttempt(c.Category) {
+			return nil, &concernSelectionError{msg: conventionsOverrideAttemptRefusal(fmt.Sprintf("concern_id %s", c.ID))}
 		}
 		out = append(out, planreview.Concern{
 			Severity: planreview.ConcernSeverity(c.Severity),
@@ -1433,7 +1458,10 @@ func (s *Server) fixupRefundedPasses(ctx context.Context, runID, stageID uuid.UU
 // selectConcerns validates the operator-selected indices against the
 // resolved concern set and returns the selected concern objects in
 // selection order, de-duplicated. An out-of-range or duplicate index
-// is rejected so the prompt renderer never sees a phantom concern.
+// is rejected so the prompt renderer never sees a phantom concern. A
+// selected conventions_override_attempt concern is rejected too (E55.3 /
+// #2244) — the positional twin of resolveConcernsByID's refusal, so neither
+// addressing path routes one (conventionsOverrideAttemptRefusal).
 func selectConcerns(all []planreview.Concern, indices []int) ([]planreview.Concern, error) {
 	seen := map[int]struct{}{}
 	out := make([]planreview.Concern, 0, len(indices))
@@ -1445,6 +1473,9 @@ func selectConcerns(all []planreview.Concern, indices []int) ([]planreview.Conce
 			return nil, fmt.Errorf("concern index %d selected more than once", i)
 		}
 		seen[i] = struct{}{}
+		if planreview.IsConventionsOverrideAttempt(all[i].Category) {
+			return nil, errors.New(conventionsOverrideAttemptRefusal(fmt.Sprintf("concern index %d", i)))
+		}
 		out = append(out, all[i])
 	}
 	return out, nil
