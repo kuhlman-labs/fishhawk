@@ -165,6 +165,13 @@ func (s *Server) handleWaiveConcern(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Human-only clearing (E80.3 / #3760): a server_check concern refuses an
+	// agent token or a delegated request with 403 concern_requires_human,
+	// BEFORE delegation is evaluated or the intent entry is appended.
+	if s.refuseNonHumanServerCheckClear(w, r, row, id.Subject, reqBody.Delegated, clearVerbWaive) {
+		return
+	}
+
 	// Delegated-action enforcement (ADR-040 / #1026): a delegated:true
 	// waive must hold the may_waive condition (solo_low) against CURRENT
 	// run state, re-evaluated server-side before the intent entry is
@@ -288,7 +295,9 @@ func (e concernWaiveAuditAppendError) Unwrap() error { return e.err }
 //
 // bulk stamps an ADDITIVE bulk_waive:true marker on the payload so an operator
 // reading the chain can tell a batched waive from a single one. The single path
-// passes bulk=false and its payload stays byte-identical to pre-#3318.
+// passes bulk=false and its payload stays byte-identical to pre-#3318. A
+// non-empty row.Provenance is likewise stamped as an additive provenance key
+// (E80.3 / #3760); a reviewer concern's provenance is empty and adds nothing.
 func (s *Server) applyConcernWaive(ctx context.Context, row *concern.Concern, reason, subject string, actorKind audit.ActorKind, delegatedRule string, bulk bool) (*concern.Concern, error) {
 	waivedFields := map[string]any{
 		"concern_id":  row.ID.String(),
@@ -303,6 +312,12 @@ func (s *Server) applyConcernWaive(ctx context.Context, row *concern.Concern, re
 	}
 	if bulk {
 		waivedFields["bulk_waive"] = true
+	}
+	// provenance (E80.3 / #3760) only when non-empty: a reviewer concern's
+	// payload stays byte-identical, while a HUMAN waive of a server_check
+	// concern is recognisable on the chain (the historian, E75, reads it).
+	if row.Provenance != "" {
+		waivedFields["provenance"] = row.Provenance
 	}
 	payload, _ := json.Marshal(waivedFields)
 	waived, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{

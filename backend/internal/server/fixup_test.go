@@ -2561,6 +2561,8 @@ func (f *fakeConcernRepo) InsertRaised(_ context.Context, p concern.InsertRaised
 			ReviewerRole:         p.ReviewerRole,
 			QuoteUnverified:      c.QuoteUnverified,
 			SeverityClampedFrom:  c.SeverityClampedFrom,
+			Provenance:           p.Provenance,
+			CheckKey:             c.CheckKey,
 			State:                concern.StateRaised,
 		}
 		f.rows = append(f.rows, row)

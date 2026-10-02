@@ -251,8 +251,34 @@ type Concern struct {
 	// lowered it (persona severity_cap clamp or an unverified quote), '' when
 	// untouched and for every row minted before migration 0092.
 	SeverityClampedFrom string
-	CreatedAt           time.Time
-	UpdatedAt           time.Time
+	// Provenance records who minted the concern when it was NOT a model
+	// reviewer's verdict (E80.3 / #3760): ProvenanceServerCheck for a concern
+	// the server synthesized from a deterministic check, '' for a row written
+	// by a reviewer verdict, an operator fix-up or a crew conversion — and for
+	// every row minted before migration 0094. Read it through IsServerCheck.
+	Provenance string
+	// CheckKey is the server check's de-duplication key (E80.3 / #3760), so a
+	// re-run of the same check across review rounds does not mint a duplicate
+	// row. '' for every non-server_check row.
+	CheckKey  string
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
+// ProvenanceServerCheck is the provenance of a concern the server synthesized
+// itself from a deterministic check, with no model call (E80.3 / #3760, the
+// diff secrets check). Such a concern can be cleared only by a HUMAN: the
+// waive, bulk-waive and defer handlers refuse an agent token or a delegated
+// request with 403 concern_requires_human.
+const ProvenanceServerCheck = "server_check"
+
+// IsServerCheck reports whether the concern was synthesized by a server check
+// (Provenance == ProvenanceServerCheck) rather than raised by a reviewer. The
+// comparison is exact: provenance is written only by server code, never
+// decoded from a reviewer verdict, so there is no tolerant-decode variant to
+// normalize.
+func (c Concern) IsServerCheck() bool {
+	return c.Provenance == ProvenanceServerCheck
 }
 
 // ReviewerRoleStandard is the reviewer_role recorded for a concern raised by a
@@ -354,6 +380,9 @@ type RaisedConcern struct {
 	// severity when ingest lowered it. Zero values for an untouched concern.
 	QuoteUnverified     bool
 	SeverityClampedFrom string
+	// CheckKey is the server check's de-duplication key (E80.3 / #3760),
+	// persisted verbatim; '' for a reviewer-raised concern.
+	CheckKey string
 }
 
 // InsertRaisedParams bundles the inputs to InsertRaised: every concern
@@ -367,7 +396,11 @@ type InsertRaisedParams struct {
 	// ReviewerRole is stamped on every concern of the entry (E55.10 / #3755):
 	// a persona name or ReviewerRoleStandard. Stored VERBATIM — '' is allowed
 	// and stored as '' (unattributed), never defaulted to standard here.
-	ReviewerRole         string
+	ReviewerRole string
+	// Provenance is stamped on every concern of the entry (E80.3 / #3760):
+	// ProvenanceServerCheck for a server-synthesized entry, '' for a reviewer
+	// verdict, an operator fix-up or a crew conversion. Stored VERBATIM.
+	Provenance           string
 	OriginReviewSequence int64
 	Concerns             []RaisedConcern
 }

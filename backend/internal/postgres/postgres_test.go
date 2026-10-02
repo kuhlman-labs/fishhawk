@@ -6722,3 +6722,91 @@ func TestMigrateDown_RunsTriggerSourceScheduledReversal(t *testing.T) {
 	assertAccepted("after rollback", string(run.TriggerOnDemand))
 	assertAccepted("after rollback", string(run.TriggerCLI))
 }
+
+// TestMigrateDown_ReviewConcernsProvenanceReversal pins 0094 (E80.3 / #3760)
+// in BOTH directions. After MigrateUp review_concerns carries provenance and
+// check_key (both TEXT NOT NULL, empty-string default), and a row inserted
+// WITHOUT naming them reads back empty strings for both — the reading every
+// reviewer-raised and legacy row gets (an empty provenance is NOT a server
+// check, so the human-only clearing guards never fire on it). After rolling back through 0094 both
+// columns are gone while the row survives (0094 is an ALTER, never a DROP
+// TABLE), and a re-apply restores them.
+func TestMigrateDown_ReviewConcernsProvenanceReversal(t *testing.T) {
+	t.Parallel()
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+
+	ctx := context.Background()
+	columnCount := func() int {
+		t.Helper()
+		var n int
+		if err := pool.QueryRow(ctx,
+			`SELECT count(*) FROM information_schema.columns
+			  WHERE table_name = 'review_concerns'
+			    AND column_name IN ('provenance', 'check_key')`).Scan(&n); err != nil {
+			t.Fatalf("query review_concerns provenance columns: %v", err)
+		}
+		return n
+	}
+
+	if n := columnCount(); n != 2 {
+		t.Fatalf("review_concerns provenance column count after MigrateUp = %d, want 2 (0094 adds provenance, check_key)", n)
+	}
+
+	runID, stageID, concernID := uuid.New(), uuid.New(), uuid.New()
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, state, runner_kind)
+		 VALUES ($1, 'r', 'feature_change', 'sha', 'cli', 'pending', 'local')`, runID); err != nil {
+		t.Fatalf("insert run: %v", err)
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO stages (id, run_id, sequence, stage_type, executor_kind, executor_ref, state)
+		 VALUES ($1, $2, 0, 'implement', 'agent', 'claude-code', 'dispatched')`,
+		stageID, runID); err != nil {
+		t.Fatalf("insert stage: %v", err)
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO review_concerns (id, run_id, stage_id, stage_kind, origin_review_sequence, severity, category, note)
+		 VALUES ($1, $2, $3, 'implement', 7, 'high', 'security', 'n')`,
+		concernID, runID, stageID); err != nil {
+		t.Fatalf("insert review_concerns row without the 0094 columns: %v", err)
+	}
+	var provenance, checkKey string
+	if err := pool.QueryRow(ctx,
+		`SELECT provenance, check_key FROM review_concerns WHERE id = $1`,
+		concernID).Scan(&provenance, &checkKey); err != nil {
+		t.Fatalf("read back 0094 columns: %v", err)
+	}
+	if provenance != "" || checkKey != "" {
+		t.Errorf("0094 defaults = (provenance %q, check_key %q), want ('', '') — a row naming neither is not a server check", provenance, checkKey)
+	}
+
+	// Roll back through 0094, the reversal under test: one step drops both
+	// columns — a down migration that dropped only one would leave a count
+	// of 1.
+	downThrough(t, url, "0094")
+	if n := columnCount(); n != 0 {
+		t.Errorf("review_concerns provenance column count after MigrateDown = %d, want 0 (0094 reverted)", n)
+	}
+	var survivors int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM review_concerns WHERE id = $1`, concernID).Scan(&survivors); err != nil {
+		t.Fatalf("query review_concerns after MigrateDown (table dropped?): %v", err)
+	}
+	if survivors != 1 {
+		t.Errorf("review_concerns row count after MigrateDown = %d, want 1 (0094 is an ALTER, never a DROP TABLE)", survivors)
+	}
+
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp (re-apply after rollback): %v", err)
+	}
+	if n := columnCount(); n != 2 {
+		t.Fatalf("review_concerns provenance column count after re-apply = %d, want 2 (0094 re-added them)", n)
+	}
+}

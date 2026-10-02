@@ -1,6 +1,8 @@
 package server
 
 import (
+	"strings"
+
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
 )
@@ -19,4 +21,20 @@ func actorKindForSubject(subject string) audit.ActorKind {
 		return audit.ActorAgent
 	}
 	return audit.ActorUser
+}
+
+// isAgentSubject reports whether subject is an AGENT identity (E80.3 /
+// #3760): the operator-agent token family (operatorrole.IsTokenSubject, the
+// same prefix actorKindForSubject keys on) or a run-bound mcp:run:<uuid>
+// subject, minted for the agent executing inside a run. Every other subject —
+// a human token, a GitHub login, a cookie session — is a human.
+//
+// It is the ONE classification shared by the captain verbs
+// (captainActorIsAgent) and the human-only server-check clearing guard
+// (refuseNonHumanServerCheckClear), so the two cannot drift. It only
+// CLASSIFIES; each caller owns its refusal. The residual is the ADR-040 trust
+// model's: an agent session presenting a human operator's token is
+// indistinguishable from that human and is treated as one.
+func isAgentSubject(subject string) bool {
+	return operatorrole.IsTokenSubject(subject) || strings.HasPrefix(subject, "mcp:run:")
 }

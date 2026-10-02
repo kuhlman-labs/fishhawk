@@ -44,7 +44,6 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/captain"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/delegationconfirm"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/delegationview"
@@ -587,11 +586,12 @@ func (s *Server) handleCaptainVerb(w http.ResponseWriter, r *http.Request, verb 
 }
 
 // captainActorIsAgent reports whether subject is an agent identity: the
-// operator-agent token family (actorKindForSubject) or a run-bound MCP token
-// subject, which belongs to an agent run. It only CLASSIFIES; the refusal is
-// the captain package's guardActor.
+// operator-agent token family or a run-bound MCP token subject, which belongs
+// to an agent run. It delegates to isAgentSubject, the classification the
+// human-only server-check clearing guard shares, so the two cannot drift. It
+// only CLASSIFIES; the refusal is the captain package's guardActor.
 func captainActorIsAgent(subject string) bool {
-	return actorKindForSubject(subject) == audit.ActorAgent || strings.HasPrefix(subject, "mcp:run:")
+	return isAgentSubject(subject)
 }
 
 // classifyRepoPredicate resolves a claim's predicate as an explicit
