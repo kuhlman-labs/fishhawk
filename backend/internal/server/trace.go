@@ -3992,6 +3992,17 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 		return false
 	}
 
+	// Diff secrets check (E80.3 / #3760): deterministic, no model call, run
+	// over the ADDED lines of THIS round's diff — the bundle diff on a first
+	// review, ComparePatch(fixupBase, head) (the pass delta) on the fix-up
+	// re-review backstop, and the consolidated compare on a decomposed
+	// parent's review, all of which reach this function. Placed BEFORE the
+	// reviewer-configuration early return below so it runs even when no model
+	// reviewer is configured, and before persona resolution (the seam E80.5 /
+	// #3762 will consume). Nothing here auto-clears a raised concern, so a
+	// later pass delta that omits an earlier hit can never falsely clear it.
+	_ = s.raiseDiffSecretConcerns(ctx, runID, stageID, diff, headSHA)
+
 	reviewersCfg := s.resolveStageReviewers(ctx, runRow, spec.StageTypeImplement)
 	if reviewersCfg == nil || reviewersCfg.AgentCount() == 0 {
 		return false
@@ -4757,6 +4768,12 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 	trig.ModifiedConventionFiles = reviewDocs.Round.ModifiedFiles
 	conventionRound := reviewDocs.Round
 
+	// Prompt redaction (E80.3 / #3760): the diff the reviewer reads passes
+	// through redaction.RedactDefault, AFTER the #1725 delta substitution, so
+	// the full-diff round, the delta re-review and every persona prompt built
+	// from a copy of trig below never carry a credential-shaped string
+	// verbatim. A diff with no such string stays byte-identical.
+	trig.DiffPatch = s.redactReviewPatch(ctx, runID, stageID, trig.DiffPatch)
 	promptText, err := buildImplementReviewPrompt("implement_review", trig)
 	if err != nil {
 		reviewDispatchMu.Unlock()
@@ -6135,6 +6152,12 @@ func (s *Server) priorConcernsForReview(ctx context.Context, runID, stageID uuid
 		if !c.State.IsOpen() {
 			continue
 		}
+		// A server_check concern (E80.3 / #3760) is cleared only by a human
+		// waive or defer; a reviewer cannot resolve it (vetoServerCheckRequiresHuman),
+		// so the delta-verification section must not ask it to.
+		if c.IsServerCheck() {
+			continue
+		}
 		out = append(out, prompt.PriorConcern{
 			ID:    c.ID.String(),
 			State: string(c.State),
@@ -6636,8 +6659,10 @@ func (s *Server) resolveSecondNewestReportedHeadSHA(ctx context.Context, runID, 
 // DETAIL, never its visibility.
 const concernResolutionVetoedCategory = "concern_resolution_vetoed"
 
-// The four deterministic veto reasons, evaluated in this fixed order against a
-// `confirmed` resolution only (E48.103 / #2551).
+// The deterministic veto reasons, evaluated in this fixed order against a
+// `confirmed` resolution only (E48.103 / #2551) — plus, ahead of the four,
+// the server_check arm (E80.3 / #3760), which also refuses a reviewer
+// `superseded` and the clean-round auto-close of a server-synthesized concern.
 const (
 	// vetoRaiserRejectedSameRound: a DIFFERENT reviewer confirmed a concern
 	// whose RAISING reviewer returned `reject` in this same round. The raiser
@@ -6656,6 +6681,12 @@ const (
 	// a wrongly-vetoed concern stays open and costs one operator waive, while a
 	// wrongly-applied confirm is the silent false-GREEN this issue reports.
 	vetoEvidenceLookupFailed = "evidence_lookup_failed"
+	// vetoServerCheckRequiresHuman (E80.3 / #3760), evaluated FIRST: the
+	// concern was synthesized by a server check (provenance server_check), not
+	// raised by a reviewer, so no reviewer verdict — confirm, supersede or the
+	// clean-round auto-close — may retire it. Only a human waive or defer
+	// clears it (refuseNonHumanServerCheckClear).
+	vetoServerCheckRequiresHuman = "server_check_requires_human"
 )
 
 // vetoReopenWithoutNamedConcern refuses a `reopened` resolution the verdict
@@ -7138,6 +7169,9 @@ func (s *Server) buildResolutionVetoContext(ctx context.Context, runID, stageID 
 // standard reviewer's model is NOT the raiser. The auto-close path passes the
 // zero identity (no confirming reviewer).
 func (vc resolutionVetoContext) vetoReason(row *concern.Concern, confirming reviewerIdentity) string {
+	if row.IsServerCheck() {
+		return vetoServerCheckRequiresHuman
+	}
 	raiser := rowReviewerIdentity(row)
 	if raiser.model != "" && raiser != confirming && vc.rejectedBy[raiser] {
 		return vetoRaiserRejectedSameRound
@@ -7258,9 +7292,12 @@ func (s *Server) applyConcernResolutions(ctx context.Context, runID, stageID uui
 		// Round-level veto (E48.103 / #2551), for `confirmed` ONLY: a confirm
 		// the round's evidence contradicts is REFUSED — the concern keeps its
 		// current open state and state_reason, and the refusal is recorded.
-		if to == concern.StateAddressed {
+		// A server_check row (E80.3 / #3760) additionally refuses a reviewer
+		// `superseded`, which would otherwise close it with no human decision;
+		// vetoReason's first arm names it for that row whatever the resolution.
+		if to == concern.StateAddressed || (to == concern.StateSuperseded && row.IsServerCheck()) {
 			if reason := vc.vetoReason(row, newReviewerIdentity(rv.model, rv.role)); reason != "" {
-				warn(res, "confirmed resolution vetoed: "+reason)
+				warn(res, res.Resolution+" resolution vetoed: "+reason)
 				s.appendConcernResolutionVetoed(ctx, runID, stageID, concernResolutionVetoedPayload{
 					ConcernID:               cid.String(),
 					Resolution:              res.Resolution,

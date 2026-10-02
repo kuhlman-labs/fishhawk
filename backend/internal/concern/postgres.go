@@ -58,6 +58,8 @@ func (r *postgresRepo) InsertRaised(ctx context.Context, p InsertRaisedParams) (
 			ReviewerRole:         p.ReviewerRole,
 			QuoteUnverified:      c.QuoteUnverified,
 			SeverityClampedFrom:  c.SeverityClampedFrom,
+			Provenance:           p.Provenance,
+			CheckKey:             c.CheckKey,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("concern: insert: %w", err)
@@ -187,6 +189,8 @@ func rowToConcern(r concerndb.ReviewConcern) *Concern {
 		ReviewerRole:         r.ReviewerRole,
 		QuoteUnverified:      r.QuoteUnverified,
 		SeverityClampedFrom:  r.SeverityClampedFrom,
+		Provenance:           r.Provenance,
+		CheckKey:             r.CheckKey,
 	}
 	if r.CreatedAt.Valid {
 		out.CreatedAt = r.CreatedAt.Time

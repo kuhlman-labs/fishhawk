@@ -2849,7 +2849,7 @@ components:
           description: Derived as for `GateViewResolution.round`.
         veto_reason:
           type: string
-          enum: [raiser_rejected_same_round, operator_evidence_routed, fixup_pass_no_changes, evidence_lookup_failed, reopen_without_named_concern]
+          enum: [raiser_rejected_same_round, operator_evidence_routed, fixup_pass_no_changes, evidence_lookup_failed, reopen_without_named_concern, server_check_requires_human]
           description: |
             `raiser_rejected_same_round` — a DIFFERENT reviewer confirmed a
             concern whose RAISING reviewer returned `reject` in the same round;
@@ -2865,13 +2865,21 @@ components:
             blank, so nothing substantiated reopening the concern it names. It
             is decided PER RESOLUTION — a sibling resolution's note is evidence
             for that sibling, and `free_form` prose is unmatched to any concern
-            id and substantiates nothing.
+            id and substantiates nothing;
+            `server_check_requires_human` (E80.3 / #3760) — evaluated FIRST: the
+            concern was synthesized by a deterministic server check (provenance
+            `server_check`, e.g. the diff secrets check), so no reviewer verdict
+            may retire it — a `confirmed`, a `superseded` and the clean-round
+            auto-close are all refused; only a human waive or defer clears it.
         resolution:
           type: string
           description: |
             The refused resolution: `confirmed` for the four round-level veto
-            reasons, `reopened` for `reopen_without_named_concern`. Empty on an
-            entry recorded before #3319, which was always a `confirmed`.
+            reasons, `reopened` for `reopen_without_named_concern`, `auto_close`
+            for a refused clean-round auto-close of a routed concern (E45.84 /
+            #3619), and — with `server_check_requires_human` only — `confirmed`,
+            `superseded` or `auto_close`. Empty on an entry recorded before
+            #3319, which was always a `confirmed`.
         confirming_reviewer_model:
           type: string
         raising_reviewer_model:
@@ -21523,7 +21531,19 @@ paths:
             `operator_agent` block delegates the waive action
             (fail-closed), `delegation_condition_unmet` when the
             `solo_low` condition is not satisfied — `details` names the
-            exact failed predicate in `unmet_reason`.
+            exact failed predicate in `unmet_reason`. (4)
+            `concern_requires_human` (E80.3 / #3760): the concern was
+            raised by a server check (`provenance: server_check`, e.g.
+            the diff secrets check) and the caller is an agent token
+            (subject `operator-agent/…` or a run-bound `mcp:run:<uuid>`,
+            even on its own run) or sent `delegated: true`. Checked
+            before delegation and before the `concern_waived` intent
+            entry, so nothing is appended or mutated. The clearing path
+            is a HUMAN, non-delegated waive with a reason (e.g. a known
+            test fixture); its `concern_waived` payload then carries
+            `provenance: server_check`. `details` carries `concern_id`,
+            `provenance`, `verb` (`waive`) and `refused_actor`
+            (`agent_token` or `delegated`).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -21676,8 +21696,17 @@ paths:
           description: |
             `insufficient_scope` (the token lacks both `write:stages` and
             `write:fixups`), `cross_run_waive` (an mcp run-bound token whose run
-            does not match the PATH run id), or the `delegated: true` refusals
-            `delegation_not_configured` / `delegation_condition_unmet`.
+            does not match the PATH run id), the `delegated: true` refusals
+            `delegation_not_configured` / `delegation_condition_unmet`, or
+            `concern_requires_human` (E80.3 / #3760): ANY named concern was
+            raised by a server check (`provenance: server_check`) and the caller
+            is an agent token (`operator-agent/…` or a run-bound
+            `mcp:run:<uuid>`) or sent `delegated: true`. It is a
+            pre-validation refusal, so the WHOLE batch is refused with nothing
+            waived and no audit entry appended; a human, non-delegated batch
+            waive is the clearing path. `details` carries the offending
+            `concern_id`, `provenance`, `verb` (`bulk_waive`) and
+            `refused_actor` (`agent_token` or `delegated`).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -21975,7 +22004,16 @@ paths:
             `write:stages` and `write:fixups` scope — body `error` is
             `insufficient_scope`; (2) caller is an mcp token (subject
             `mcp:run:<uuid>`) whose run scope does not match the
-            concern's `run_id` — body `error` is `cross_run_defer`.
+            concern's `run_id` — body `error` is `cross_run_defer`;
+            (3) `concern_requires_human` (E80.3 / #3760): the concern was
+            raised by a server check (`provenance: server_check`, e.g.
+            the diff secrets check) and the caller is an agent token
+            (subject `operator-agent/…` or a run-bound `mcp:run:<uuid>`,
+            even on its own run). Checked before the open-state
+            pre-check and before any work item is filed, so nothing is
+            filed, appended or mutated; a human defer is the clearing
+            path. `details` carries `concern_id`, `provenance`, `verb`
+            (`defer`) and `refused_actor` (`agent_token`).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

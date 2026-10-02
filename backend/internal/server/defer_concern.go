@@ -198,6 +198,14 @@ func (s *Server) handleDeferConcern(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Human-only clearing (E80.3 / #3760): a server_check concern refuses an
+	// agent token with 403 concern_requires_human BEFORE the open-state
+	// pre-check and, crucially, before any work item is filed. Defer carries
+	// no delegated flag, so only the agent-token arm applies.
+	if s.refuseNonHumanServerCheckClear(w, r, row, id.Subject, false, clearVerbDefer) {
+		return
+	}
+
 	// Orphan-issue-safe PRE-CHECK: a closed concern (already waived,
 	// superseded, deferred, or addressed) must NOT file an issue. Reject
 	// before any provider call so no durable external side effect is

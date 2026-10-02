@@ -3,7 +3,7 @@
 // E22.X / #1106).
 //
 // This is the single shared definition consumed by BOTH the runner and
-// the backend. Two consumers, one boundary:
+// the backend. Three consumers:
 //
 //   - Runner trace bytes: the runner runs RedactDefault over each
 //     captured event payload (and the manifest's agent_failure_reason)
@@ -18,6 +18,14 @@
 //     POST /v0/runs/{run_id}/product-reports after being run through
 //     RedactDefault, the same scrubbing the runner applies to trace
 //     bytes (#1006, slice 3).
+//   - Backend diff secrets check (E80.3 / #3760):
+//     backend/internal/diffsecrets matches DefaultPatterns against the
+//     ADDED lines of each implement-review round's diff and reports only
+//     path, line and pattern Name, and the server passes the review
+//     prompt's diff through RedactDefault so a matched value never
+//     reaches a model reviewer. That check also persists Name in its
+//     de-duplication key, so a rename re-raises concerns a human already
+//     waived.
 //
 // Collapsing the two former hand-copies (backend/internal/redaction and
 // runner/internal/redaction) into this one module is the durable fix
@@ -181,7 +189,10 @@ func Redact(input []byte, patterns []Pattern) ([]byte, []Hit) {
 // runner uses it on the gzip-decompressed trace bytes before
 // re-compressing the redacted variant for upload to S3; the backend's
 // product-report endpoint uses it on operator free text before it
-// crosses the consent boundary into an upstream report.
+// crosses the consent boundary into an upstream report; and the
+// backend's implement-review path uses it on the review prompt's diff
+// (E80.3 / #3760) so a credential the diff secrets check found never
+// reaches a model reviewer verbatim.
 func RedactDefault(input []byte) ([]byte, []Hit) {
 	return Redact(input, DefaultPatterns)
 }
