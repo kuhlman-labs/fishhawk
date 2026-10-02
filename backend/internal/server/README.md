@@ -944,7 +944,7 @@ bound covers the declared-document and convention resolve only.
 
 **Ingest clamp.** Both review loops — `runPlanReviewLoopWithConventions` and
 `runImplementReviewInvocationsWithConventions` — pass every successful verdict through
-`planreview.ClampConventionSeverities` against the round's caps (`conventionCapsFor`: the RENDERED
+`planreview.ClampConventionSeverities` (the implement loop: `ClampConventionSeveritiesForRound`) against the round's caps (`conventionCapsFor`: the RENDERED
 conventions only — a withheld or optional-missing convention was never shown to a reviewer)
 IMMEDIATELY after the reviewer returns and BEFORE the payload, the gating decision or
 `persistReviewConcerns` reads it. A `repo_convention` concern above its convention's cap is lowered
@@ -954,7 +954,10 @@ most restrictive rendered cap; a `reject` resting only on clamped highs is recor
 conventions rendered** (nil caps — the zero `reviewConventionRound` every no-conventions round and
 both legacy loop entry points pass), every `repo_convention`, `conventions_override_attempt` and
 `conventions_file_modified` concern a reviewer emits anyway is clamped to `low`, never left
-unclamped. Every lowered concern is WARN-logged by `logConventionClamps` with `run_id`, `stage_id`,
+unclamped — EXCEPT a `conventions_file_modified` concern on an implement round whose diff modifies a
+declared conventions file (`Round.ModifiedFiles` non-empty): the server observed that modification
+itself, so the reviewer's concern keeps its weight (E55.10 / #3755, the #2244 seam;
+`clampImplementReviewVerdict` passes `len(conv.ModifiedFiles) > 0`). Every lowered concern is WARN-logged by `logConventionClamps` with `run_id`, `stage_id`,
 `reviewer_index`, `category`, `convention`, `from`, `to` and `no_conventions_rendered`. Standard
 categories are untouched, so a reject resting on a standard high still gates. Tests:
 `TestRunPlanReviews_ReviewConventions_EndToEnd`, `TestRunPlanReviews_ReviewConventions_UncappedRejectStillGates`,
@@ -987,6 +990,24 @@ E55.3; plan review has no diff and never synthesizes. Tests:
 suppresses synthesis onto the earlier one — the property a per-verdict decision would break),
 `_WaivedInPriorRound_NotReminted`, `_DedupeReadError_FallsOpen`,
 `TestRunImplementReviews_ConventionsIngestOrdering`, `TestConventionsFileModifiedCarrier`.
+
+**Held-ingest durability.** A held verdict lives only in memory until the round's last invocation
+returns, so two things must not lose it. (1) A LATER reviewer failing: every held result — failed
+ones included — is ingested in invocation order, so the earlier reviewer's `implement_reviewed`, its
+concerns and the synthesized `conventions_file_modified` land, the failed reviewer records
+`implement_review_failed`, and the round settles at `configured_agents`. (2) The CALLER's context
+being cancelled mid-round: the loop runs on `context.WithoutCancel(ctx)` (`reviewCtx`), so the held
+ingest's audit appends and concern inserts are never issued on a cancelled context.
+`TestPersonaHardening_HeldIngestDurability` pins both (the cancelled variant over audit and concern
+fakes that REFUSE a write on a cancelled context — the stores a real driver behaves like).
+
+**Residual — concurrent synthesis (stated, not fixed).** `conventionsFileModifiedAlreadyRaised`
+reads the concern store AFTER the round's reviewers return, OUTSIDE `reviewDispatchMu` (which covers
+only the duplicate-dispatch check, document resolution and the started emit). Two rounds of one stage
+in flight at once — different heads, e.g. a trace-time review and a fix-up re-review of a newer
+push — can therefore BOTH read "none raised" and EACH synthesize a `conventions_file_modified` row.
+The cost is a duplicate open concern (noise the operator waives), never a missed flag; closing it
+needs the read and the insert under one lock or a uniqueness guard on the concern store.
 
 **Fix-up refusal.** `fixup.go` refuses a `conventions_override_attempt` concern on BOTH addressing
 paths — `resolveConcernsByID` (after the routability check) and the positional `selectConcerns` —
@@ -1030,7 +1051,10 @@ so the loop signatures are unchanged.
   the remit appended to a CLONED `InjectedDocuments` slice, so nothing it writes can reach the standard prompt.
   `promptFor` hands each invocation its own prompt and review tree; the size-aware budget is computed per
   invocation (identical for a standard reviewer). Golden tests: `TestPlanReview_Persona_GoldenStandardPromptAndOwnPersonaPrompt`,
-  `TestImplementReview_Persona_GoldenStandardPromptAndOwnPersonaPrompt`.
+  `TestImplementReview_Persona_GoldenStandardPromptAndOwnPersonaPrompt`. Because the copy KEEPS the round's
+  `InjectedDocuments` (the standard set, then the remit) and `ReviewConventions`, a persona prompt carries every
+  document the standard reviewers see — the declared stage-injected documents and the selected review conventions
+  — before its remit: `TestPersonaHardening_{Plan,Implement}_PersonaPromptKeepsStandardDocuments`.
 - **Stage lookup.** Personas resolve from the stage ACTUALLY under review: the reviewed `run.Stage` is loaded by
   stage id (as `resolveReviewInjectedDocuments` does) and mapped to its spec stage with `specStageForRunStage` (type
   ordinal — run rows carry no spec stage id). Never first-of-type. The STANDARD reviewers' config is still read
@@ -1048,8 +1072,12 @@ so the loop signatures are unchanged.
   whose escalations declare no `require.reviewers` evaluates nothing; a non-firing escalation attaches nothing.
   Each attaching round writes ONE best-effort `escalation_persona_attached` entry on the reviewed stage:
   `{review_kind, stage_id, path_source, head_sha?, attachments: [{persona, fired, fired_keys, via_diff_only,
-  also_static}]}` (`fired`/`fired_keys` index-aligned like `escalation_fired`'s; `via_diff_only` = the plan scope
-  alone fires no rule naming it). INTERNAL — not an issue-thread activity line. Tests: `escalation_persona_test.go`.
+  also_static?}]}` (`fired`/`fired_keys` index-aligned like `escalation_fired`'s; `via_diff_only` = the plan scope
+  alone fires no rule naming it). `also_static` has THREE readings (E55.10 / #3755): `true` — the reviewed stage
+  also attaches the persona statically (it still runs once); `false` — the static set resolved and does not
+  attach it; key ABSENT — the static source degraded (`persona_stage_unresolvable`), so it is unknown and the
+  payload does not claim `false`. Decide on the raw JSON: absent and `false` are distinct states
+  (`TestEscalationPersonaAttached_AlsoStaticAbsentWhenStaticDegraded`). INTERNAL — not an issue-thread activity line. Tests: `escalation_persona_test.go`.
 - **Unresolvable attachment set (carried from #3753).** When the spec declares `reviewer_personas` but a source
   cannot be resolved, the round no longer silently runs no persona: ONE pseudo invocation per failed source
   records a terminal `*_review_skipped` with `reason: persona_attachment_unresolvable` (no `persona`) and
@@ -1057,7 +1085,13 @@ so the loop signatures are unchanged.
   absent or unmappable, `SelectReviewerPersonas` refusal) or `escalation_unevaluable` (a `Match` error, a
   `SelectNamedReviewerPersonas` refusal). It is COUNTED in `configured_agents` and emitted after `*_review_started`,
   so `planreview.Settled` still waits for every standard reviewer; `hasRejection` is untouched; the other source's
-  personas still run. `TestResolveStageReviewerPersonas_FailurePaths`, `TestResolveEscalationPersonas_MatchErrorDegrades`.
+  personas still run. `TestResolveStageReviewerPersonas_FailurePaths`, `TestResolveEscalationPersonas_MatchErrorDegrades`;
+  through the implement invocation loop, including the two mixed degrades (static degraded while the escalated
+  persona runs, and the reverse): `TestPersonaHardening_EscalationUnevaluable_ThroughImplementLoop`,
+  `TestPersonaHardening_Mixed_*`. `escalation_unevaluable` is unreachable from a stored spec — `ParseBytes` rejects
+  both of its producers (a malformed glob, an undeclared `require.reviewers` name) — so those cases build the
+  degraded spec by construction and hand it to the same `resolveParsedReviewPersonaInvocations` the dispatch site
+  calls; it remains a defence for a spec that skipped validation.
 - **Authority residual (stated, not fixed).** The persona SET is the reviewed stage's, but a round takes ONE
   authority — `resolveStageReviewers`, the FIRST stage of the type — and every invocation shares it. With two
   same-type stages whose `reviewers` blocks differ, a persona attached by the second runs under the first's
@@ -1093,6 +1127,40 @@ so the loop signatures are unchanged.
   guard and the standard build, BEFORE `implement_review_started` — a duplicate dispatch reads no remit and writes
   no attribution (`TestImplementReview_Persona_DuplicateDispatchReadsNothing`). `runSupplementalReinvokeReview`
   runs standard reviewers only — escalation-attached personas inherit that gap.
+- **Persona concern ingest (`persona_concern_ingest.go`, ADR-084 D3 / rule 3, E55.10 #3755).** After the convention
+  clamp, `applyPersonaConcernControls` runs on EVERY successful verdict of both loops, before its payload, the gating
+  decision or concern persistence reads it, in a load-bearing order:
+  1. **Scrub.** `planreview.ClearPersonaIngestMarkers` zeroes the four server-internal concern fields
+     (`quote_unverified`, `quote_verified_content_hash`, `persona_severity_cap`, `reviewer_role`) on every verdict,
+     standard included — a reviewer on the unconstrained decode path cannot pre-set them.
+  2. **Quote verification (persona only).** A concern with a non-blank `quoted_passage` is checked against the
+     EXACT text injected into THAT persona's prompt (`personaInvocation.quoteDocs`: the standard injected documents,
+     the remit, then each rendered review convention; text via `repodoc.InjectedContent`, i.e. the
+     delimiter-bracketed neutralized body the reviewer saw, never the server's framing). Match = whitespace-collapsed,
+     case-sensitive substring of the document `document_ref` names (leading `./` stripped). Verified → stamps the
+     document's `content_hash` as `quote_verified_content_hash` (the same hash its `document_injected` row
+     recorded). Unverified → `quote_unverified`, severity lowered to `low` with `severity_clamped_from`; the failure
+     mode is WARN-logged: `document_ref_missing`, `document_unknown` (a document injected into a DIFFERENT invocation,
+     or withheld, is unknown by design), `document_text_unavailable`, `passage_not_found`.
+  3. **Cap (persona only).** `planreview.ClampPersonaSeverities` lowers a concern above the remit's `severity_cap`
+     to the cap (`severity_clamped_from`, `persona_severity_cap`); `""` = uncapped.
+  4. **Reject downgrade.** A persona `reject` resting only on lowered highs becomes `approve_with_concerns`
+     (`verdict_clamped_from: reject`; first non-empty of the convention and persona clamps wins) and does not gate.
+  5. **Attribution.** Every concern is stamped with the invocation's `reviewer_role` — the persona name or
+     `standard` — AFTER the scrub, so the `*_reviewed` payload and the persisted row (`persistReviewConcernsAs`)
+     agree; a synthesized `conventions_file_modified` concern takes its carrier's role. A row's `reviewer_role` is
+     `''` for an unattributed legacy or operator-authored row.
+
+  A standard verdict gets only the scrub and the `standard` stamp, so a compliant standard verdict is unchanged.
+  No new authority mode (ADR-084 rule 4): persona concerns enter the existing concern state machine. **Veto
+  identity** for implement-round delta verification is `reviewerIdentity{model, role}` with the role normalized
+  (`''` reads as `standard`): a persona on the standard reviewer's model can no longer confirm-retire the standard
+  reviewer's concern while that reviewer rejects the round; `concern_resolution_vetoed` carries
+  `raising_reviewer_role` / `confirming_reviewer_role`. Operator surfaces (gate view, run status, MCP mirrors, the
+  `stage_fixup_triggered` concern set and the fix-up prompt line `[severity/category · persona <name>] note`, plus
+  `· quote unverified`) show the attribution. **Residual:** a very short quote (one common word) verifies
+  trivially — the control bounds FABRICATED passages, not trivially-true ones. Tests: `persona_concern_ingest_test.go`,
+  `persona_concern_surfaces_test.go`.
 - **E63 obligation (ADR-084 rule 6).** Personas run in-process here today. When reviewers move to the runner
   (E63 #2307), runner-hosted reviewers MUST carry personas with the same contract — own prompt, standard prompt
   byte-identical, per-persona fail-closed degrade, configured_agents accounting — or the move silently drops a
