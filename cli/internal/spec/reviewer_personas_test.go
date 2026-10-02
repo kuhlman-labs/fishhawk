@@ -28,7 +28,8 @@ var rpConstDecl = regexp.MustCompile(`(?m)^const ((?:Msg|MsgFmt|PathFmt)\w*(?:Re
 // from BOTH reviewer_personas.go files, must be the same set, each declaration
 // must be the same line, and each CLI constant's VALUE must be what that line
 // declares. DeclarationSiteFmtReviewerPersonaRemit is backend-only (the CLI
-// resolves no remit) and deliberately outside the regex.
+// resolves no remit) and deliberately outside the regex, as is
+// DeclarationSiteFmtReviewerPersonaDecisionRecord.
 func TestReviewerPersonasMessageParity(t *testing.T) {
 	read := func(path string) map[string]string {
 		src, err := os.ReadFile(path)
@@ -49,10 +50,12 @@ func TestReviewerPersonasMessageParity(t *testing.T) {
 		"PathFmtStageReviewerPersonas":          PathFmtStageReviewerPersonas,
 		"PathFmtStageReviewerPersonaItem":       PathFmtStageReviewerPersonaItem,
 		"MsgFmtReviewerPersonaRemitPathInvalid": MsgFmtReviewerPersonaRemitPathInvalid,
-		"MsgFmtReviewerPersonaStageType":        MsgFmtReviewerPersonaStageType,
-		"MsgFmtReviewerPersonaUnknown":          MsgFmtReviewerPersonaUnknown,
-		"MsgFmtReviewerPersonaNoAgents":         MsgFmtReviewerPersonaNoAgents,
-		"MsgFmtReviewerPersonaUnreferenced":     MsgFmtReviewerPersonaUnreferenced,
+		// The decision_record.index rung (E78.5 / #3756).
+		"MsgFmtReviewerPersonaDecisionRecordIndexPathInvalid": MsgFmtReviewerPersonaDecisionRecordIndexPathInvalid,
+		"MsgFmtReviewerPersonaStageType":                      MsgFmtReviewerPersonaStageType,
+		"MsgFmtReviewerPersonaUnknown":                        MsgFmtReviewerPersonaUnknown,
+		"MsgFmtReviewerPersonaNoAgents":                       MsgFmtReviewerPersonaNoAgents,
+		"MsgFmtReviewerPersonaUnreferenced":                   MsgFmtReviewerPersonaUnreferenced,
 		// The escalation require.reviewers family (E55.9 / #3754).
 		"PathFmtEscalationReviewers":              PathFmtEscalationReviewers,
 		"PathFmtEscalationReviewerItem":           PathFmtEscalationReviewerItem,
@@ -288,5 +291,78 @@ func TestEscalationReviewers_ShapeTolerance(t *testing.T) {
 		map[string]any{"stages": []any{map[string]any{"type": "plan"}}}, "wf", 0, declared, &errs)
 	if len(errs) != 1 || errs[0].Path != "/workflows/wf/escalations/0/require/reviewers" {
 		t.Fatalf("readable stages without an agent review: got %+v, want one no-agent-review entry", errs)
+	}
+}
+
+// TestReviewerPersonas_DecisionRecordRungCollectsOnePerPersona pins the CLI
+// half of the decision_record.index rung (E78.5 / #3756) in collect mode: the
+// rung sits between the remit path rule and the agent_version rule, and a
+// persona reports at most ONE entry — so a persona violating the remit rule
+// AND the index rule reports only the remit entry, and one violating the
+// index rule AND the agent_version rule reports only the index entry, exactly
+// the backend's first error per persona.
+func TestReviewerPersonas_DecisionRecordRungCollectsOnePerPersona(t *testing.T) {
+	doc := `version: "2"
+reviewer_personas:
+  alpha:
+    agent:
+      provider: anthropic
+    remit:
+      path: /a.md
+    decision_record:
+      index: /a-index.json
+  beta:
+    agent:
+      provider: codex
+      agent_version: bogus
+    remit:
+      path: docs/b.md
+    decision_record:
+      index: docs/../index.json
+  gamma:
+    agent:
+      provider: anthropic
+    remit:
+      path: docs/g.md
+    decision_record:
+      index: docs/adr/index.json
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+        reviewers:
+          agents:
+            - provider: anthropic
+          personas: [alpha, beta, gamma]
+`
+	entries := rcEntries(t, ValidateBytes([]byte(doc)))
+	want := []ValidationErrorEntry{
+		{Path: "/reviewer_personas/alpha/remit/path", Message: fmt.Sprintf(MsgFmtReviewerPersonaRemitPathInvalid, "alpha", "/a.md", MsgReviewConventionPathAbsolute)},
+		{Path: "/reviewer_personas/beta/decision_record/index", Message: fmt.Sprintf(MsgFmtReviewerPersonaDecisionRecordIndexPathInvalid, "beta", "docs/../index.json", fmt.Sprintf(MsgFmtReviewConventionPathDotSegment, ".."))},
+	}
+	if len(entries) != len(want) {
+		t.Fatalf("got %d entries, want %d:\n%v", len(entries), len(want), entries)
+	}
+	for i := range want {
+		if entries[i] != want[i] {
+			t.Errorf("entry[%d] = %+v\nwant %+v", i, entries[i], want[i])
+		}
+	}
+
+	// Shape tolerance: a non-map decision_record or a non-string index was
+	// already rejected by the schema, so the rung yields no entry.
+	var errs []ValidationErrorEntry
+	checkReviewerPersonaDeclarations(map[string]any{"reviewer_personas": map[string]any{
+		"a": map[string]any{"remit": map[string]any{"path": "docs/a.md"}, "decision_record": "not-a-map"},
+		"b": map[string]any{"remit": map[string]any{"path": "docs/b.md"}, "decision_record": map[string]any{"index": 7}},
+	}}, &errs)
+	if len(errs) != 0 {
+		t.Fatalf("shape-mismatched decision_record produced entries: %+v", errs)
 	}
 }

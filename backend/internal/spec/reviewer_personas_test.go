@@ -485,3 +485,192 @@ func TestSelectNamedReviewerPersonas_OrderDedupAndFailsClosed(t *testing.T) {
 		}
 	}
 }
+
+// Decision record (ADR-084 D4(b) / binding rule 4 / E78.5 / #3756). The
+// corpus carries the persona-decision-record-* rows (valid; index-absent and
+// unknown-field schema rejections; the absolute-index semantic rejection with
+// its exact text in BOTH modules). This block pins what a single-rule row
+// cannot: the typed round-trip, the selected value on BOTH attachment routes,
+// every path reason through the new rung, the rung's position between the
+// remit rule and the agent_version rule, and the schema facts.
+
+const rpPersonaArchitect = `reviewer_personas:
+  architect:
+    agent:
+      provider: anthropic
+    remit:
+      path: docs/review/architect-remit.md
+    decision_record:
+      index: docs/adr/index.json
+`
+
+func TestParseBytes_ReviewerPersonaDecisionRecordRoundTrip(t *testing.T) {
+	doc := rpDoc(rpPersonaArchitect, rpPlanStage("          personas: [architect]\n"))
+	s, err := spec.ParseBytes([]byte(doc))
+	if err != nil {
+		t.Fatalf("ParseBytes: %v", err)
+	}
+	want := spec.ReviewerPersona{
+		Agent:          spec.AgentReviewer{Provider: "anthropic"},
+		Remit:          spec.PersonaRemit{Path: "docs/review/architect-remit.md"},
+		DecisionRecord: &spec.PersonaDecisionRecord{Index: "docs/adr/index.json"},
+	}
+	if got := s.ReviewerPersonas["architect"]; !reflect.DeepEqual(got, want) {
+		t.Errorf("ReviewerPersonas[architect] = %+v (decision_record %+v), want %+v", got, got.DecisionRecord, want)
+	}
+
+	// A persona WITHOUT decision_record decodes to a nil pointer — the
+	// additive-optional field changes nothing for an existing declaration.
+	s, err = spec.ParseBytes([]byte(rpDoc(rpPersonaSecurity, rpPlanStage("          personas: [security]\n"))))
+	if err != nil {
+		t.Fatalf("ParseBytes(no decision_record): %v", err)
+	}
+	if dr := s.ReviewerPersonas["security"].DecisionRecord; dr != nil {
+		t.Errorf("security.DecisionRecord = %+v, want nil when undeclared", dr)
+	}
+}
+
+// TestSelectReviewerPersonas_DecisionRecordFieldsOnBothRoutes asserts the
+// static attachment (SelectReviewerPersonas) and the escalation attachment
+// (SelectNamedReviewerPersonas) carry the SAME DecisionRecordIndex and
+// DecisionRecordDeclarationSite, and that a persona declaring no
+// decision_record carries neither on either route (the review loop keys its
+// extra read on DecisionRecordIndex != "").
+func TestSelectReviewerPersonas_DecisionRecordFieldsOnBothRoutes(t *testing.T) {
+	s := rpSelectSpec(map[string]spec.ReviewerPersona{
+		"architect": {
+			Agent:          spec.AgentReviewer{Provider: "anthropic"},
+			Remit:          spec.PersonaRemit{Path: "docs/review/architect-remit.md"},
+			DecisionRecord: &spec.PersonaDecisionRecord{Index: "docs/adr/index.json"},
+		},
+		"security": {Agent: spec.AgentReviewer{Provider: "codex"}, Remit: spec.PersonaRemit{Path: "s.md"}},
+	})
+	static, err := s.SelectReviewerPersonas(rpStage(spec.StageTypePlan, "architect", "security"))
+	if err != nil {
+		t.Fatalf("SelectReviewerPersonas: %v", err)
+	}
+	named, err := s.SelectNamedReviewerPersonas([]string{"architect", "security"})
+	if err != nil {
+		t.Fatalf("SelectNamedReviewerPersonas: %v", err)
+	}
+	for route, got := range map[string][]spec.SelectedReviewerPersona{"static": static, "escalation": named} {
+		if len(got) != 2 {
+			t.Fatalf("%s: selected %d personas, want 2", route, len(got))
+		}
+		arch, sec := got[0], got[1]
+		if arch.DecisionRecordIndex != "docs/adr/index.json" {
+			t.Errorf("%s: architect.DecisionRecordIndex = %q, want docs/adr/index.json", route, arch.DecisionRecordIndex)
+		}
+		if want := "reviewer_personas.architect.decision_record.index in .fishhawk/workflows.yaml"; arch.DecisionRecordDeclarationSite != want {
+			t.Errorf("%s: architect.DecisionRecordDeclarationSite = %q, want %q", route, arch.DecisionRecordDeclarationSite, want)
+		}
+		if want := fmt.Sprintf(spec.DeclarationSiteFmtReviewerPersonaDecisionRecord, "architect"); arch.DecisionRecordDeclarationSite != want {
+			t.Errorf("%s: DecisionRecordDeclarationSite %q is not formatted by DeclarationSiteFmtReviewerPersonaDecisionRecord (%q)", route, arch.DecisionRecordDeclarationSite, want)
+		}
+		if sec.DecisionRecordIndex != "" || sec.DecisionRecordDeclarationSite != "" {
+			t.Errorf("%s: security (no decision_record) carries index %q / site %q, want both empty", route, sec.DecisionRecordIndex, sec.DecisionRecordDeclarationSite)
+		}
+	}
+	if !reflect.DeepEqual(static, named) {
+		t.Errorf("static selection\n%+v\n!= escalation selection\n%+v", static, named)
+	}
+}
+
+// TestReviewerPersonaDecisionRecordIndexPathReasons drives every
+// review-convention path reason through the decision_record.index rung, so
+// the index is held to the SAME rule set as a remit with the same reason
+// text. The remit path is valid in every case, so ONLY the new rung can
+// refuse the document.
+func TestReviewerPersonaDecisionRecordIndexPathReasons(t *testing.T) {
+	cases := map[string]string{
+		"/abs.json":  spec.MsgReviewConventionPathAbsolute,
+		`a\b.json`:   spec.MsgReviewConventionPathBackslash,
+		"a//b.json":  spec.MsgReviewConventionPathEmptySegment,
+		"a/./b.json": fmt.Sprintf(spec.MsgFmtReviewConventionPathDotSegment, "."),
+		"../b.json":  fmt.Sprintf(spec.MsgFmtReviewConventionPathDotSegment, ".."),
+		"a\tb.json":  fmt.Sprintf(spec.MsgFmtReviewConventionPathControlChar, '\t'),
+	}
+	for p, reason := range cases {
+		s := &spec.Spec{Version: "2", ReviewerPersonas: map[string]spec.ReviewerPersona{
+			"architect": {
+				Agent:          spec.AgentReviewer{Provider: "anthropic"},
+				Remit:          spec.PersonaRemit{Path: "docs/review/architect-remit.md"},
+				DecisionRecord: &spec.PersonaDecisionRecord{Index: p},
+			},
+		}}
+		var ve *spec.ValidationError
+		err := spec.Validate(s)
+		if !errors.As(err, &ve) || ve.Path != "/reviewer_personas/architect/decision_record/index" {
+			t.Errorf("index %q: err = %v, want a ValidationError at /reviewer_personas/architect/decision_record/index", p, err)
+			continue
+		}
+		if want := fmt.Sprintf(spec.MsgFmtReviewerPersonaDecisionRecordIndexPathInvalid, "architect", p, reason); ve.Message != want {
+			t.Errorf("index %q: message\n got: %s\nwant: %s", p, ve.Message, want)
+		}
+	}
+}
+
+// TestReviewerPersonaDecisionRecordRungOrder pins the new rung's position in
+// rule-order rung 1: AFTER the remit path rule and BEFORE the agent_version
+// range rule. Each case violates exactly two rules on one persona.
+func TestReviewerPersonaDecisionRecordRungOrder(t *testing.T) {
+	cases := []struct {
+		name     string
+		persona  spec.ReviewerPersona
+		wantPath string
+	}{
+		{
+			name: "remit path before decision_record.index",
+			persona: spec.ReviewerPersona{
+				Agent:          spec.AgentReviewer{Provider: "anthropic"},
+				Remit:          spec.PersonaRemit{Path: "/abs-remit.md"},
+				DecisionRecord: &spec.PersonaDecisionRecord{Index: "/abs-index.json"},
+			},
+			wantPath: "/reviewer_personas/architect/remit/path",
+		},
+		{
+			name: "decision_record.index before agent_version",
+			persona: spec.ReviewerPersona{
+				Agent:          spec.AgentReviewer{Provider: "codex", AgentVersion: "bogus"},
+				Remit:          spec.PersonaRemit{Path: "docs/review/architect-remit.md"},
+				DecisionRecord: &spec.PersonaDecisionRecord{Index: "/abs-index.json"},
+			},
+			wantPath: "/reviewer_personas/architect/decision_record/index",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &spec.Spec{Version: "2", ReviewerPersonas: map[string]spec.ReviewerPersona{"architect": tc.persona}}
+			var ve *spec.ValidationError
+			if err := spec.Validate(s); !errors.As(err, &ve) || ve.Path != tc.wantPath {
+				t.Fatalf("Validate = %v, want the first error at %s", err, tc.wantPath)
+			}
+		})
+	}
+}
+
+// TestPersonaDecisionRecordSchemaShape pins the schema facts the typed decode
+// rests on: reviewer_persona.decision_record $refs $defs/persona_decision_record,
+// which is additionalProperties:false, requires index, and is NOT required on
+// the persona (additive-optional — no major bump).
+func TestPersonaDecisionRecordSchemaShape(t *testing.T) {
+	defs := v2Defs(t)
+	if got := rpObj(t, defs, "reviewer_persona", "properties", "decision_record")["$ref"]; got != "#/$defs/persona_decision_record" {
+		t.Errorf("reviewer_persona.decision_record.$ref = %v, want #/$defs/persona_decision_record", got)
+	}
+	persona := rpObj(t, defs, "reviewer_persona")
+	if got, want := persona["required"], []any{"agent", "remit"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("reviewer_persona.required = %v, want %v (decision_record must stay optional)", got, want)
+	}
+	dr := rpObj(t, defs, "persona_decision_record")
+	if dr["additionalProperties"] != false {
+		t.Errorf("persona_decision_record.additionalProperties = %v, want false", dr["additionalProperties"])
+	}
+	if got, want := dr["required"], []any{"index"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("persona_decision_record.required = %v, want %v", got, want)
+	}
+	props := rpObj(t, dr, "properties")
+	if len(props) != 1 {
+		t.Errorf("persona_decision_record declares %d properties, want exactly index (PersonaDecisionRecord is in lockstep)", len(props))
+	}
+}
