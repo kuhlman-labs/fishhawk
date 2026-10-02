@@ -676,12 +676,20 @@ until E71.2 #3242, which should reuse that column.
 in-process review builds — `runPlanReviews` (`plan_review`), `runImplementReviewsForTree`
 (`implement_review`: the trace-time review, the fix-up re-review backstop and the decomposed
 parent's consolidated review) and `runSupplementalReinvokeReview` — never pass through the
-signed `/prompt` endpoint, so each resolves, attributes and renders through
-`resolveReviewInjectedDocuments` (`document_injection.go`), which loads the stage under review
-(the plan stage for `plan_review`, the implement stage for `implement_review`) and delegates
-straight to `resolveInjectedDocuments`: `Config.DocumentDeclarations == nil` stays the SOLE
-inert signal for both paths. The charter consumer stays out of review prompts by
-construction: `stageRequiresCharter` is false for every implement stage and for a non-grooming
+signed `/prompt` endpoint, so each resolves, attributes and renders through the shared core
+`resolveDocumentSet` (`document_injection.go`) — the plan and implement sites via
+`resolveReviewDocuments`, which also selects review conventions (see "Review-convention
+consumer" below), the supplemental re-invoke via its no-convention wrapper
+`resolveReviewInjectedDocuments`. The declaration seam is consulted with the stage under review
+(the plan stage for `plan_review`, the implement stage for `implement_review`), loaded LAZILY —
+only when the seam is configured, since the seam is its only consumer (#2797 item 3). The inert
+signal is now TWO-PART on the review paths: `Config.DocumentDeclarations == nil` AND no selected
+review convention returns before any read, the reviewed-stage load included; on the `/prompt`
+endpoints, which never select a convention, it is still `DocumentDeclarations == nil` alone.
+The review resolve phase — the seam call, the credential scope and every forge `Resolve` — is
+bounded by `reviewDocumentResolveTimeout` (30s, #2797 item 1); the audit appends run on the
+caller's context, and the `/prompt` endpoints get no deadline. The charter consumer stays out
+of review prompts by construction: `stageRequiresCharter` is false for every implement stage and for a non-grooming
 plan stage, and a grooming propose stage ships a `grooming_report`, which `handleShipPlan`
 routes away BEFORE `runPlanReviews` runs. In `runImplementReviewsForTree` the resolution sits
 AFTER the #797 idempotency guard (inside `reviewDispatchMu`), so a duplicate dispatch performs
@@ -840,6 +848,173 @@ all-four-or-none invariant, the base-ref adapter, and the cross-forge collision:
 owner/name registered on both forges, refused through the non-owning one with zero forge
 calls). The counterfactual RED observations for each control are recorded at the top of
 `charter_injection_test.go`.
+
+## Review-convention consumer (`review_conventions.go`, E55.3 / #2244)
+
+The THIRD consumer of `backend/internal/repodoc`, after the charter (above) and the persona remit
+(below). It renders the workflow-selected `review_conventions` (ADR-068; grammar in
+`docs/spec/workflow-v2.md` § Review conventions) into the plan-review and implement-review prompts
+as a fenced, explicitly SUBORDINATE supplemental section, and enforces the declaration
+SERVER-SIDE — a severity clamp at ingest, a once-per-round synthesized concern, a fix-up refusal —
+rather than by model compliance. Split by file: `review_conventions.go` (selection and every pure
+helper — no I/O, no audit write), `document_injection.go` (resolution through the shared core),
+`plan.go` / `trace.go` (ingest), `fixup.go` (refusal). The prompt half is
+`backend/internal/prompt/README.md` § "Repository review conventions"; the verdict half (concern
+categories, `ClampConventionSeverities`, `AddSynthesizedConventionsFileModifiedConcern`, payload
+fields) is `backend/internal/planreview/README.md` § "Review-convention verdict contract".
+
+**Selection — ONE admission change at BOTH sites.** `reviewConventionChange(runRow, paths)` is
+`runAdmissionChange(runRow)` — the SAME trigger-form + issue-label change the plan gate's
+`applies_to` evaluation uses (`applies_to_plan_gate.go`, read-only reuse; labels come from the
+run's `IssueContext` snapshot, a nil context is an empty label set) — with only `Paths` set per
+site:
+
+| Site | Paths | Selected from |
+|---|---|---|
+| plan review (`runPlanReviews`) | `planGateScopePaths(plan)` — the `scope.files` union incl. decomposition phase scopes | the run's FIRST `plan` stage |
+| implement review (`runImplementReviewsForTree`) | `implementReviewPaths(diff)` — every changed `Path` plus each rename/copy `OldPath`, slash-normalized, deduped, sorted; the FULL diff, not the #1725 fix-up delta | the run's FIRST `implement` stage |
+
+So a convention whose `applies_to` names only a label or only a trigger form selects at both sites
+or at neither; a path-only `applies_to` selects at whichever site's paths match. A file's PRE-move
+name still matches, so a rename does not evade a convention. `selectReviewConventions` reads the
+run's workflow-spec SNAPSHOT (the bytes admission parsed). "Nothing declared" (no snapshot, the
+workflow absent from it, no stage of the type) is `(zero, nil)`; an unparseable snapshot, a
+selection naming an undeclared entry, a stage type that may not select, or an `applies_to` Match
+error FAILS CLOSED — a governance input is never read as "no convention". **Residual, stated:** the
+stage is located FIRST-OF-TYPE, as `resolveStageReviewers` locates the standard reviewers' config —
+not by the reviewed stage's type ordinal as personas are (`specStageForRunStage`) — so a workflow
+with two same-type stages selecting different conventions applies the first stage's selection to
+both. Tests: `TestReviewConventionSelection_LabelOrTriggerOnlySelectsAtBothSites`,
+`TestReviewConventionSelection_PathOnly`, `TestImplementReviewPaths_IncludesOldPathDeduped`,
+`TestSelectReviewConventions_Degrades`.
+
+**Review-only routing.** Conventions are selected ONLY by `resolveReviewDocuments` (plan and
+implement review) and come back in `reviewDocuments.Conventions` → `Trigger.ReviewConventions`,
+NEVER in `Injected`. The `/prompt` and `/prompt-render` endpoints select none, so no author prompt
+(plan, implement, fix-up, acceptance) can carry one — `TestGetStagePrompt_ConventionSelectingSpec_AuthorPromptCarriesNoConventions`;
+the supplemental re-invoke resolves through the no-convention `resolveReviewInjectedDocuments` and
+renders none. An attached reviewer persona's prompt is a VALUE COPY of the round's trigger, so it
+carries the same conventions section and its verdict passes through the same ingest clamp and is an
+eligible synthesis carrier.
+
+**Resolution — required, optional, withheld.** Each selected convention becomes a
+`repodoc.Declaration` (`conventionDeclaration`) with `Base: BaseSourceRunAdmission` and declaration
+site `review_conventions.<name> in .fishhawk/workflows.yaml`, appended AFTER the seam's
+declarations, so it rides the same base-source partition and the same
+resolve-everything-before-any-attribution loop (`resolveDocumentSet`):
+
+| Case | Outcome | Audit | Test |
+|---|---|---|---|
+| resolved at the admission commit | rendered in the supplemental section; its cap enters the round's clamp caps | `document_injected` naming `review_conventions.<name>`, `base_source: run_admission` | `TestResolveReviewDocuments_ConventionResolvedReviewOnly` |
+| run recorded NO admission commit | WITHHELD, nothing fetched, `WithheldNotice` in `Injected`; the review proceeds — "required fails" applies only when a base exists (E55.7) | one `document_injection_degraded`, `run_base_commit_unrecorded` | `TestResolveReviewDocuments_NoAdmissionCommit_Withheld` |
+| REQUIRED (`required` absent or `true`) and absent | the whole set fails: `review_convention_missing` naming name, path, site and commit; no reviewer runs | zero `document_injected`, even for an already-resolved seam document; `*_review_failed` reason `document_injection_failed: review_convention_missing: …` | `TestResolveReviewDocuments_RequiredConventionMissing_NoClaim`, `TestRunPlanReviews_RequiredConventionMissing_GatingFailsStage`, `TestRunImplementReviews_RequiredConventionMissing_FailsLoudly` |
+| OPTIONAL (`required: false`) and absent | skipped, renders nothing, excluded from the caps | `document_injection_degraded`, reason `optional_document_missing`, written BEFORE any `document_injected` | `TestResolveReviewDocuments_ConventionResolvedReviewOnly` |
+| selected with a nil `DocumentResolver` — even with no declaration seam | fails closed as a misconfiguration | none | `TestResolveReviewDocuments_SelectionWithNilResolver_FailsClosed` |
+| any other resolve error, incl. the resolve deadline | fails closed | none | `TestResolveReviewDocuments_ResolveDeadlineExceeded_FailsClosed` |
+
+A failure takes the existing review-side fail-closed branch above: gating plan review fails the
+stage category-B (`plan_review_document_injection_failed`); gating implement review fails it through
+the reject branch (read the `implement_review_failed` entry to tell it from a real reject); advisory
+leaves the human gate authoritative. **Production wiring consequence, intended:**
+`cmd/fishhawkd/serve.go` wires `DocumentResolver` only when a file-capable forge exists, so on a
+deployment without one a repository that SELECTS conventions has its reviews fail closed instead of
+running without them — partial configuration is a failure (the #2242 rule).
+
+**Lazy stage load, bounded resolve phase, and the dispatch-lock hold bound (#2797 items 1–3).**
+`resolveDocumentSet`'s inert check — no declaration seam AND no selected convention — runs FIRST and
+reads nothing, the reviewed stage included; the stage is loaded only when the seam is configured
+(the seam is its only consumer; attribution keys on `stageID`), and still fails closed when it
+cannot be loaded (`TestResolveReviewDocuments_NilSeamNoSelection_UnloadableStage_Inert`,
+`TestRunPlanReviews_ReviewedStageUnloadable_FailsClosed`). The seam call, `DocumentScope` and every
+`Resolve` run under `const reviewDocumentResolveTimeout = 30 * time.Second`; `RecordWithheld` /
+`Attribute` run on the CALLER's context, so an expiring deadline cannot fail a half-written
+attribution set (`TestResolveReviewDocuments_ResolvePhaseBounded`, which first asserts its caller
+context carries no deadline, and `TestRunImplementReviews_DocumentResolutionBounded` at the trace
+site). At the implement site the resolution sits INSIDE `reviewDispatchMu`, AFTER the #797
+`(stage_id, head_sha)` guard, so a duplicate dispatch selects, fetches and attributes nothing
+(`TestRunImplementReviews_DuplicateDispatch_NoConventionResolution`). The section's worst-case hold
+for this work is the resolve bound plus the attribution appends plus the prompt build; every exit —
+duplicate return, resolution failure, prompt-build failure (through the `buildImplementReviewPrompt`
+test seam), started emit — unlocks (`TestRunImplementReviews_PromptBuildFailure_ReleasesDispatchLock`).
+Only runs that declare documents or select conventions pay the bound. **Residuals, stated:** (a) a
+hung forge still holds `reviewDispatchMu` for up to the bound per dispatch; (b) an attached
+persona's remit `Resolve` (`buildPersonaPrompts`) ALSO runs inside the section and is NOT under
+`reviewDocumentResolveTimeout`, so a run attaching a persona can hold the lock past that bound — the
+bound covers the declared-document and convention resolve only.
+
+**Ingest clamp.** Both review loops — `runPlanReviewLoopWithConventions` and
+`runImplementReviewInvocationsWithConventions` — pass every successful verdict through
+`planreview.ClampConventionSeverities` against the round's caps (`conventionCapsFor`: the RENDERED
+conventions only — a withheld or optional-missing convention was never shown to a reviewer)
+IMMEDIATELY after the reviewer returns and BEFORE the payload, the gating decision or
+`persistReviewConcerns` reads it. A `repo_convention` concern above its convention's cap is lowered
+and carries `severity_clamped_from`; an empty or unrendered `convention` name fails closed to the
+most restrictive rendered cap; a `reject` resting only on clamped highs is recorded as
+`approve_with_concerns` with `verdict_clamped_from: reject` and does not gate. **With ZERO
+conventions rendered** (nil caps — the zero `reviewConventionRound` every no-conventions round and
+both legacy loop entry points pass), every `repo_convention`, `conventions_override_attempt` and
+`conventions_file_modified` concern a reviewer emits anyway is clamped to `low`, never left
+unclamped. Every lowered concern is WARN-logged by `logConventionClamps` with `run_id`, `stage_id`,
+`reviewer_index`, `category`, `convention`, `from`, `to` and `no_conventions_rendered`. Standard
+categories are untouched, so a reject resting on a standard high still gates. Tests:
+`TestRunPlanReviews_ReviewConventions_EndToEnd`, `TestRunPlanReviews_ReviewConventions_UncappedRejectStillGates`,
+`TestPlanReviewLoop_NoConventionsRendered_ClampsConventionCategoriesToLow`,
+`TestRunImplementReviews_ReviewConventions_EndToEnd`,
+`TestRunImplementReviews_NoConventionsRendered_ConventionConcernClampedToLow`.
+
+**Once-per-round `conventions_file_modified` synthesis and the approve upgrade (implement review
+only).** `Round.ModifiedFiles` is the path of EVERY declared `review_conventions` entry — selected
+this round or not — that `implementReviewPaths(diff)` touches (an `OldPath` counts, so moving the
+file away is detected). Non-empty, it renders a machine-verified notice after
+`ImplementReviewSplitMarker` and switches the ingest from streaming to HELD: every invocation is
+invoked, then every verdict clamped, then synthesis is decided ONCE —
+`conventionsFileModifiedCarrier` picks the FIRST successful verdict when no verdict of the round
+already carries a `conventions_file_modified` concern AND the stage holds none in an open, waived or
+deferred state from an earlier round (`conventionsFileModifiedAlreadyRaised` over
+`ConcernRepo.ListByRun`; an addressed or superseded row does not suppress a re-raise; a nil repo or
+a read error falls OPEN to synthesizing — a duplicate is noise, a missed flag is silent).
+`AddSynthesizedConventionsFileModifiedConcern` appends ONE medium concern naming the paths to that
+verdict alone; a plain `approve` is raised to `approve_with_concerns` (`verdict_raised_from:
+approve`) and the carrying payload sets `conventions_file_modified_synthesized: true`. Synthesis runs
+AFTER the clamp, so the zero-caps rule never lowers the server's own concern. Then every held result
+is ingested in invocation order: audit row ORDER is unchanged, only the moment the first verdict
+becomes visible moves. An all-failed round has no carrier and synthesizes nothing; the next round
+re-evaluates. An `approve_with_concerns` does not gate, so the stage is not failed — the concern is
+an open obligation on the human gate. With `ModifiedFiles` empty the loop streams exactly as before
+E55.3; plan review has no diff and never synthesizes. Tests:
+`TestRunImplementReviews_ConventionsFileModified_ApproveUpgraded`,
+`TestRunImplementReviews_ConventionsFileModified_TwoReviewerRound` (the later reviewer raising it
+suppresses synthesis onto the earlier one — the property a per-verdict decision would break),
+`_WaivedInPriorRound_NotReminted`, `_DedupeReadError_FallsOpen`,
+`TestRunImplementReviews_ConventionsIngestOrdering`, `TestConventionsFileModifiedCarrier`.
+
+**Fix-up refusal.** `fixup.go` refuses a `conventions_override_attempt` concern on BOTH addressing
+paths — `resolveConcernsByID` (after the routability check) and the positional `selectConcerns` —
+with 400 `validation_failed` (`conventionsOverrideAttemptRefusal`), in ANY state and whether or not
+a convention was rendered: it reports an instruction inside a conventions file read at the run's
+pinned base, which this run must not edit, so it is never a code obligation; the operator waives or
+defers it and fixes the file in a separate change. `repo_convention` and `conventions_file_modified`
+route unchanged. Tests: `TestFixupStage_ConventionsOverrideAttemptRefused` (reads committed state:
+no `stage_fixup_triggered` row), `_AmongOthers`, `_PositionalPath`, and the
+`TestFixupStage_RepoConventionConcernRoutes{,_PositionalPath}` pair.
+
+**No conventions selected is byte-identical.** No fetch, no `document_injected` naming
+`review_conventions.*`, no `optional_document_missing` degradation, both review prompts
+byte-identical to base (the prompt package's goldens), streaming ingest, and every new verdict /
+payload field `omitempty` — `TestRunPlanReviews_NoConventions_NoConventionAuditTrace`.
+
+**What this is, honestly.** A quality aid under a PROTECTED declaration, not an adversary-proof
+control. The declaration (which conventions, which caps, required or not) lives in
+`.fishhawk/workflows.yaml`; the convention TEXT is repository content read at the admission commit,
+which is why a change editing a declared file is flagged rather than trusted. The subordinate
+framing is a model instruction: whether a reviewer REPORTS an override instead of following it is
+behavioural and unmeasured offline (#3187) — the `review-convention-override` agenteval class proves
+STRUCTURAL containment only. What holds whatever the model does is server-side: the clamp, the
+synthesis, the fix-up refusal. Clamp residuals: a file can steer the model to file a convention
+finding under another category, escaping the clamp; a concern naming a different, uncapped rendered
+convention is uncapped. Plan-review placement sits OUTSIDE the plan-review cached prefix (after
+`PlanReviewSplitMarker`, because every plan-review criterion follows it) — the stated AC5 deviation
+in `backend/internal/prompt/README.md`.
 
 ## Reviewer personas (`reviewer_persona.go`, ADR-084 #3752 / E55.8 #3753)
 
