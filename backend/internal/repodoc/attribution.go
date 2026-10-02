@@ -24,7 +24,10 @@ const (
 	// categoryDocumentTruncated records that the injected document exceeded
 	// the effective cap and was cut. Written IN ADDITION to
 	// document_injected, never instead of it, so a truncation is visible in
-	// the audit trail as its own event rather than only as a flag.
+	// the audit trail as its own event rather than only as a flag. It has a
+	// SECOND payload shape, discriminated by the "selection" key: a
+	// SelectionTruncation, recording that whole documents of a ranked
+	// selection were left out to fit a byte budget (see AttributeSet).
 	categoryDocumentTruncated = "document_truncated"
 	// categoryDocumentInjectionDegraded records that declared documents were
 	// WITHHELD from a served prompt rather than resolved (E55.7 / #3746):
@@ -70,10 +73,56 @@ type appender interface {
 	AppendChained(ctx context.Context, p audit.ChainAppendParams) (*audit.Entry, error)
 }
 
+// DroppedDocument is one document a selection left OUT of a prompt because
+// it did not fit the selection's byte budget.
+type DroppedDocument struct {
+	// ID is the consumer's identifier for the document (e.g. a record id).
+	ID string
+	// Path is the document's repo-relative path.
+	Path string
+	// Status is the consumer's status label for the document, recorded so a
+	// reader can tell what kind of document was dropped without re-reading it.
+	Status string
+	// Rank is the document's 1-based position in the selection's ranking.
+	Rank int
+}
+
+// SelectionTruncation records that a ranked SELECTION of documents was cut to
+// fit a byte budget: some whole documents were left out of the prompt. It is
+// written as a document_truncated entry whose payload carries a "selection"
+// key — the discriminator from the per-document shape, which never carries
+// one.
+type SelectionTruncation struct {
+	// Selection is a fixed machine-readable name for the selection, chosen by
+	// the consumer. Required: it is the payload's shape discriminator.
+	Selection string
+	// Path is the path of the document the selection was made FROM (e.g. the
+	// index that named the candidates), at Commit.
+	Path string
+	// Commit is the commit the selection was resolved at.
+	Commit string
+	// CapBytes is the byte budget the selection was fitted to.
+	CapBytes int
+	// IncludedBytes is the rendered bytes the selection DID inject, counted in
+	// the same domain as CapBytes.
+	IncludedBytes int
+	// Dropped are the documents left out, in rank order. Required: a
+	// truncation that dropped nothing is a contradiction.
+	Dropped []DroppedDocument
+}
+
+// InjectionSet is the COMPLETE set of documents ONE prompt assembly will
+// inject, plus any selection truncations that shaped it. AttributeSet records
+// it under one injection_set_id.
+type InjectionSet struct {
+	Documents  []Document
+	Selections []SelectionTruncation
+}
+
 // Attribute records the injection of docs — the COMPLETE set of documents ONE
 // prompt assembly will inject — in the audit trail: one document_truncated
 // entry for every document that was cut, then one document_injected entry per
-// document.
+// document. It is AttributeSet with no selection truncations.
 //
 // FAILS CLOSED. An append error is returned and the caller MUST NOT inject any
 // of the documents — an UN-ATTRIBUTED injection is precisely what the
@@ -116,21 +165,43 @@ type appender interface {
 // trade it for "some injections are attributed". The injection_set_id is also
 // what keeps set-completeness readable across those repeats. See the README.
 func Attribute(ctx context.Context, a appender, runID, stageID uuid.UUID, docs ...Document) error {
-	if len(docs) == 0 {
+	return AttributeSet(ctx, a, runID, stageID, InjectionSet{Documents: docs})
+}
+
+// AttributeSet is Attribute for a set that may also carry selection
+// truncations. Phase (1) writes every per-document document_truncated entry
+// AND every selection-level document_truncated entry before phase (2) writes
+// any document_injected, so a failure while recording what was LEFT OUT can
+// never leave an injection claim behind. Every entry shares one
+// injection_set_id; document_count counts set.Documents only.
+//
+// A selection truncation with an empty Selection name or no Dropped document
+// is refused BEFORE any append, so a malformed set leaves no entry at all.
+func AttributeSet(ctx context.Context, a appender, runID, stageID uuid.UUID, set InjectionSet) error {
+	docs := set.Documents
+	if len(docs) == 0 && len(set.Selections) == 0 {
 		return nil
 	}
 	if a == nil {
-		return fmt.Errorf("repodoc: attribute %q: no audit appender configured", docs[0].Path)
+		return fmt.Errorf("repodoc: attribute %q: no audit appender configured", set.firstPath())
+	}
+	for i, sel := range set.Selections {
+		if sel.Selection == "" {
+			return fmt.Errorf("repodoc: attribute selection truncation %d of %q: no selection name given", i, sel.Path)
+		}
+		if len(sel.Dropped) == 0 {
+			return fmt.Errorf("repodoc: attribute selection truncation %q of %q: no dropped document listed", sel.Selection, sel.Path)
+		}
 	}
 	actor := audit.ActorSystem
 	sid := stageID
 	setID := uuid.New().String()
 
-	appendEntry := func(category string, doc Document, payload map[string]any) error {
+	appendEntry := func(category, subject, site string, payload map[string]any) error {
 		payload["injection_set_id"] = setID
 		raw, err := json.Marshal(payload)
 		if err != nil {
-			return fmt.Errorf("repodoc: marshal %s payload for %q: %w", category, doc.Path, err)
+			return fmt.Errorf("repodoc: marshal %s payload for %q: %w", category, subject, err)
 		}
 		if _, err := a.AppendChained(ctx, audit.ChainAppendParams{
 			RunID:     runID,
@@ -140,18 +211,18 @@ func Attribute(ctx context.Context, a appender, runID, stageID uuid.UUID, docs .
 			ActorKind: &actor,
 			Payload:   raw,
 		}); err != nil {
-			return fmt.Errorf("repodoc: attribute %s of %q (declared at %s): %w", category, doc.Path, doc.DeclarationSite, err)
+			return fmt.Errorf("repodoc: attribute %s of %q (declared at %s): %w", category, subject, site, err)
 		}
 		return nil
 	}
 
-	// Phase 1 — truncations. Written before ANY injection claim so a failure
-	// here cannot leave one behind.
+	// Phase 1 — truncations, per document and per selection. Written before
+	// ANY injection claim so a failure here cannot leave one behind.
 	for _, doc := range docs {
 		if !doc.Truncated {
 			continue
 		}
-		if err := appendEntry(categoryDocumentTruncated, doc, map[string]any{
+		if err := appendEntry(categoryDocumentTruncated, doc.Path, doc.DeclarationSite, map[string]any{
 			"path":          doc.Path,
 			"commit":        doc.Commit,
 			"content_hash":  doc.ContentHash,
@@ -161,10 +232,32 @@ func Attribute(ctx context.Context, a appender, runID, stageID uuid.UUID, docs .
 			return err
 		}
 	}
+	for _, sel := range set.Selections {
+		dropped := make([]map[string]any, 0, len(sel.Dropped))
+		for _, d := range sel.Dropped {
+			dropped = append(dropped, map[string]any{
+				"id":     d.ID,
+				"path":   d.Path,
+				"status": d.Status,
+				"rank":   d.Rank,
+			})
+		}
+		if err := appendEntry(categoryDocumentTruncated, sel.Path, "selection "+sel.Selection, map[string]any{
+			"selection":      sel.Selection,
+			"path":           sel.Path,
+			"commit":         sel.Commit,
+			"cap_bytes":      sel.CapBytes,
+			"included_bytes": sel.IncludedBytes,
+			"dropped":        dropped,
+			"dropped_count":  len(sel.Dropped),
+		}); err != nil {
+			return err
+		}
+	}
 
 	// Phase 2 — the injection claims, each the commit point for its document.
 	for i, doc := range docs {
-		if err := appendEntry(categoryDocumentInjected, doc, map[string]any{
+		if err := appendEntry(categoryDocumentInjected, doc.Path, doc.DeclarationSite, map[string]any{
 			"declaration_site": doc.DeclarationSite,
 			"path":             doc.Path,
 			"commit":           doc.Commit,
@@ -180,6 +273,14 @@ func Attribute(ctx context.Context, a appender, runID, stageID uuid.UUID, docs .
 		}
 	}
 	return nil
+}
+
+// firstPath names the set's first subject for an error message.
+func (s InjectionSet) firstPath() string {
+	if len(s.Documents) > 0 {
+		return s.Documents[0].Path
+	}
+	return s.Selections[0].Path
 }
 
 // RecordWithheld writes ONE document_injection_degraded entry naming every
