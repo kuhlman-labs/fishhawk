@@ -236,6 +236,13 @@ import "sort"
 // (payload.repo + payload.workflow) belonging to no run, are not
 // decision-bearing, and are deliberately NOT issue-comment activity
 // categories.
+// E79.1 / #3725 added scheduled_run_started, scheduled_run_skipped and
+// scheduled_run_refused, written by backend/internal/scheduler's Ticker once
+// per due schedule window it decides (a new run, an Idempotency-Key replay of
+// an existing one, or an admission refusal carrying its code). They ride the
+// GLOBAL chain because a refusal has no run; the run linkage travels in
+// payload.run_id. Like the captain_* categories they are not issue-comment
+// activity categories (docs/issue-comment-surfaces.md is untouched).
 var KnownCategories = map[string]struct{}{
 	"acceptance_dispatched":                   {},
 	"acceptance_outcome_recorded":             {},
@@ -438,6 +445,9 @@ var KnownCategories = map[string]struct{}{
 	"runner_kind_mismatch":                    {},
 	"runner_kind_resolved":                    {},
 	"runtime_observed":                        {},
+	"scheduled_run_refused":                   {}, // E79.1 / #3725: a due schedule window refused at admission (scheduler.Ticker, global chain)
+	"scheduled_run_skipped":                   {}, // E79.1 / #3725: a due schedule window replayed an existing run (already_started)
+	"scheduled_run_started":                   {}, // E79.1 / #3725: a due schedule window started a new run
 	"scope_amendment_decided":                 {},
 	"scope_amendment_requested":               {},
 	"scope_completeness_amended":              {},
