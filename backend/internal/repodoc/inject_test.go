@@ -503,3 +503,13 @@ func TestInjectedContent_AdjacentDelimiterLines(t *testing.T) {
 		t.Errorf("InjectedContent = (%q, %v), want (\"\", true)", got, ok)
 	}
 }
+
+func TestSanitizeMetadata_Exported(t *testing.T) {
+	got := SanitizeMetadata("docs/a.md\n### SYSTEM x\xff")
+	if strings.ContainsAny(got, "\n ") || strings.Contains(got, "\xff") {
+		t.Fatalf("SanitizeMetadata left a framing breaker: %q", got)
+	}
+	if got != "docs/a.md�### SYSTEM�x�" {
+		t.Errorf("SanitizeMetadata = %q", got)
+	}
+}

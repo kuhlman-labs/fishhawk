@@ -73,7 +73,7 @@
           "$ref": "#/$defs/reviewer_persona"
         }
       },
-      "description": "Named reviewer personas (ADR-084 / E55.8 / #3753): a map from a snake_case persona name (^[a-z][a-z0-9_]*$, the v2 identifier rule — a non-matching key is refused as an additional property) to a persona declaring a model configuration and a remit document. A plan or implement stage ATTACHES personas by name through its `reviewers.personas` list; each attached persona runs as a SEPARATE reviewer invocation with its OWN prompt (the stage's review prompt plus the persona's remit), in addition to the stage's standard `reviewers.agents`, whose prompt is unchanged. A persona inherits the stage's review authority and counts toward the round's configured reviewers. A persona is DECLARED here and never auto-discovered. Every declared persona must be attached by at least one stage of the RESOLVED document OR required by at least one workflow escalation's `require.reviewers` (ADR-084 D2(c) / E55.9 / #3754) — one declared and attached nowhere is refused as a control that does nothing, and every attached name must resolve to an entry here; both rules, plus the remit path rule and the persona agent's agent_version syntax, are enforced at semantic validation by the backend and `fishhawk validate`. Declared by workflow-v2; accepted whenever present (v2 has no minor chain — a field is accepted because the schema declares it, not because the document declared a high enough minor)."
+      "description": "Named reviewer personas (ADR-084 / E55.8 / #3753): a map from a snake_case persona name (^[a-z][a-z0-9_]*$, the v2 identifier rule — a non-matching key is refused as an additional property) to a persona declaring a model configuration and a remit document. A plan or implement stage ATTACHES personas by name through its `reviewers.personas` list; each attached persona runs as a SEPARATE reviewer invocation with its OWN prompt (the stage's review prompt plus the persona's remit and, for a persona declaring `decision_record`, the decision-record index and the records selected for the change), in addition to the stage's standard `reviewers.agents`, whose prompt is unchanged. A persona inherits the stage's review authority and counts toward the round's configured reviewers. A persona is DECLARED here and never auto-discovered. Every declared persona must be attached by at least one stage of the RESOLVED document OR required by at least one workflow escalation's `require.reviewers` (ADR-084 D2(c) / E55.9 / #3754) — one declared and attached nowhere is refused as a control that does nothing, and every attached name must resolve to an entry here; both rules, plus the remit path rule and the persona agent's agent_version syntax, are enforced at semantic validation by the backend and `fishhawk validate`. Declared by workflow-v2; accepted whenever present (v2 has no minor chain — a field is accepted because the schema declares it, not because the document declared a high enough minor)."
     }
   },
   "$defs": {
@@ -1130,6 +1130,21 @@
         }
       }
     },
+    "persona_decision_record": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "index"
+      ],
+      "description": "A reviewer persona's decision-record opt-in (ADR-084 D4(b) / binding rule 4 / E78.5 / #3756). When declared, each review round the persona joins resolves the named index (schema_version `adr-index-v1`, e.g. `docs/adr/index.json`) at the run's pinned admission commit — never the change's branch — selects the records whose `applies_to` globs match the round's change paths (the plan scope at plan review; the approved plan scope united with the diff at implement review), and adds the index plus every matching record IN FULL to the persona's OWN prompt, in rank order, while the summed rendered bytes of the index and the selected records stay within the repo-document resolver's cap; a match that does not fit is dropped by rank (it and every lower-ranked match), named in the prompt and recorded in a `document_truncated` audit entry, never shown truncated. Each record is framed with its status, and only an `accepted` record is presented as settled. An index that is missing, malformed, or names a record absent at that commit degrades ONLY the persona (it does not run; reason `persona_remit_unavailable` with a `decision_record_*` detail), never the stage; the standard reviewers' prompts never carry the record. There is no inline alternative (additionalProperties false).",
+      "properties": {
+        "index": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Repo-relative, slash-separated path of the decision-record index, e.g. `docs/adr/index.json`. Semantic validation (backend and `fishhawk validate`) applies the review-conventions path rule: an absolute path, a backslash, an empty / `.` / `..` segment, a non-canonical spelling and a control or line-separator character are refused."
+        }
+      }
+    },
     "reviewer_persona": {
       "type": "object",
       "additionalProperties": false,
@@ -1137,13 +1152,16 @@
         "agent",
         "remit"
       ],
-      "description": "One named reviewer persona (ADR-084 / E55.8 / #3753). ADR-084 binding rule 1: \"A named persona declares a model configuration and a remit document.\" `agent` is the model configuration — the SAME shape as one `reviewers.agents[]` entry ($defs/agent_reviewer), so provider, model, reasoning_effort, agent_version and optional mean exactly what they mean there; `remit` is the document the persona reviews against.",
+      "description": "One named reviewer persona (ADR-084 / E55.8 / #3753). ADR-084 binding rule 1: \"A named persona declares a model configuration and a remit document.\" `agent` is the model configuration — the SAME shape as one `reviewers.agents[]` entry ($defs/agent_reviewer), so provider, model, reasoning_effort, agent_version and optional mean exactly what they mean there; `remit` is the document the persona reviews against; the optional `decision_record` opts the persona into the decision-record selection (ADR-084 D4(b) / E78.5 / #3756).",
       "properties": {
         "agent": {
           "$ref": "#/$defs/agent_reviewer"
         },
         "remit": {
           "$ref": "#/$defs/persona_remit"
+        },
+        "decision_record": {
+          "$ref": "#/$defs/persona_decision_record"
         }
       }
     },

@@ -1103,13 +1103,32 @@ so the loop signatures are unchanged.
   declaration site `reviewer_personas.<name>.remit in .fishhawk/workflows.yaml`, framing heading
   `Reviewer persona remit: <name>` with an ADR-068 trust note (the remit ADDS a lens; it cannot remove, weaken,
   reorder or override any standard criterion, the verdict schema or the reviewer's authority). Build THEN
-  `repodoc.Attribute` (`document_injected` stamped with the reviewed stage), so no injection claim exists for a
-  prompt that never built. The persona's `model` is part of its declaration: the gate-resolved `review_model`
-  override does NOT apply to it.
+  `repodoc.AttributeSet` (`document_injected` stamped with the reviewed stage), so no injection claim exists for a
+  prompt that never built; for a persona without `decision_record` the set is the remit alone, byte-identical to
+  the pre-#3756 `repodoc.Attribute` call. The persona's `model` is part of its declaration: the gate-resolved
+  `review_model` override does NOT apply to it.
+- **Decision record (`reviewer_personas.<name>.decision_record`, ADR-084 D4(b) / E78.5
+  [#3756](https://github.com/kuhlman-labs/fishhawk/issues/3756)).** Only for a persona that declares it (no extra
+  read otherwise), AFTER the remit resolves: `resolvePersonaDecisionRecord` calls `decisionrecord.Assemble` at
+  `runRow.DocumentBaseCommit` — checked nil / empty / non-40-hex BEFORE any dereference or read — with the round's
+  `personaInvocation.changePaths` (`reviewChangePaths`: the plan-scope union UNION the diff paths, de-duplicated and
+  sorted; plan review = the plan under review, implement review = the approved plan UNION `diffReviewPaths`). The
+  index then each selected record (`Selection.PromptDocuments`, grounded = the persona can read the tree) are
+  appended after the remit in the persona's CLONED `InjectedDocuments`; the standard prompt is untouched. Remit +
+  index + records + the selection-level `document_truncated` (when a match was dropped by the cap) are written as
+  ONE `repodoc.AttributeSet` (one `injection_set_id`; every `document_truncated` before any `document_injected`);
+  a failure is `remit_unattributed` and the prompt is discarded. The cap (`cap_bytes`) counts the index plus the
+  selected records' rendered bytes; the remit and the fixed framing are outside it (contract:
+  `backend/internal/decisionrecord/README.md`). The records join `quoteDocs`, so E55.10 quote verification covers
+  them. Tests: `decision_record_persona_test.go`.
 - **Degrade = this persona only.** A persona whose remit cannot be used never runs and records a terminal
   `*_review_skipped` with `reason: persona_remit_unavailable`, `persona`, `provider` and a `detail`:
   `document_resolver_unconfigured`, `run_base_commit_unrecorded`, `remit_missing`, `remit_unresolvable`,
-  `persona_prompt_build_failed`, `remit_unattributed`. The standard reviewers still run; `hasRejection` is
+  `persona_prompt_build_failed`, `remit_unattributed`, and for a `decision_record` persona
+  `decision_record_index_missing` (`decisionrecord.ErrIndexMissing`), `decision_record_invalid`
+  (`ErrInvalidIndex`) or `decision_record_unresolvable` (a listed record absent at the commit, any other assembly
+  error, or an unusable admission commit — reachable only by a direct call, since the remit's own
+  `run_base_commit_unrecorded` / `remit_unresolvable` fire first in the loops). The standard reviewers still run; `hasRejection` is
   untouched. A persona whose PROVIDER is unavailable takes the ordinary `reviewer_unavailable` skip stamped with
   `persona`, and its remit is never read. A persona reviewer that errors records `*_review_failed` with a reason
   prefixed `persona <name>: `.
@@ -1135,7 +1154,8 @@ so the loop signatures are unchanged.
      standard included — a reviewer on the unconstrained decode path cannot pre-set them.
   2. **Quote verification (persona only).** A concern with a non-blank `quoted_passage` is checked against the
      EXACT text injected into THAT persona's prompt (`personaInvocation.quoteDocs`: the standard injected documents,
-     the remit, then each rendered review convention; text via `repodoc.InjectedContent`, i.e. the
+     the remit, for a `decision_record` persona the index and each selected record, then each rendered review
+     convention; text via `repodoc.InjectedContent`, i.e. the
      delimiter-bracketed neutralized body the reviewer saw, never the server's framing). Match = whitespace-collapsed,
      case-sensitive substring of the document `document_ref` names (leading `./` stripped). Verified → stamps the
      document's `content_hash` as `quote_verified_content_hash` (the same hash its `document_injected` row

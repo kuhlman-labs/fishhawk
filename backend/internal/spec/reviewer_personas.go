@@ -34,7 +34,8 @@ import (
 //
 //  1. DECLARATION checks (validateReviewerPersonaDeclarations), over the
 //     persona names in sorted order, after validateReviewConventionDeclarations
-//     and BEFORE the workflow loop: the remit path rule, then the persona
+//     and BEFORE the workflow loop: the remit path rule, then the
+//     decision_record.index path rule (when declared), then the persona
 //     agent's agent_version range syntax.
 //  2. STAGE checks (validateStageReviewerPersonas), inside validateWorkflow's
 //     reviewers block after validateStageReviewConventions: the stage type
@@ -71,6 +72,24 @@ type ReviewerPersona struct {
 	Agent AgentReviewer `json:"agent" yaml:"agent"`
 	// Remit names the document the persona reviews against.
 	Remit PersonaRemit `json:"remit" yaml:"remit"`
+	// DecisionRecord optionally opts the persona into the decision-record
+	// selection (ADR-084 D4(b) / E78.5 / #3756); nil means the persona reads
+	// no decision record and its prompt carries the remit only.
+	DecisionRecord *PersonaDecisionRecord `json:"decision_record,omitempty" yaml:"decision_record,omitempty"`
+}
+
+// PersonaDecisionRecord is a persona's decision-record opt-in (ADR-084 D4(b)
+// / binding rule 4 / E78.5 / #3756). The schema's
+// $defs/persona_decision_record is additionalProperties:false, so this struct
+// MUST stay in lockstep with it.
+type PersonaDecisionRecord struct {
+	// Index is the repo-relative, slash-separated path of the decision-record
+	// index (adr-index-v1, e.g. docs/adr/index.json), held to the
+	// review-conventions canonical path rule. The review loop resolves it at
+	// the run's pinned admission commit and selects the records whose
+	// applies_to matches the change; that selection lives in
+	// backend/internal/decisionrecord, not here.
+	Index string `json:"index" yaml:"index"`
 }
 
 // PersonaRemit is a persona's remit document. The schema's
@@ -104,11 +123,25 @@ type SelectedReviewerPersona struct {
 	// (formatted by DeclarationSiteFmtReviewerPersonaRemit), echoed into every
 	// resolution error so an operator knows which knob produced it.
 	DeclarationSite string
+	// DecisionRecordIndex is the declared decision-record index path; ""
+	// means the persona declares no decision_record and the review loop
+	// performs no decision-record read for it (E78.5 / #3756).
+	DecisionRecordIndex string
+	// DecisionRecordDeclarationSite is the provenance string for the index
+	// and every record resolved through it (formatted by
+	// DeclarationSiteFmtReviewerPersonaDecisionRecord); "" exactly when
+	// DecisionRecordIndex is "".
+	DecisionRecordDeclarationSite string
 }
 
 // DeclarationSiteFmtReviewerPersonaRemit formats SelectedReviewerPersona's
 // DeclarationSite from the persona name.
 const DeclarationSiteFmtReviewerPersonaRemit = "reviewer_personas.%s.remit in .fishhawk/workflows.yaml"
+
+// DeclarationSiteFmtReviewerPersonaDecisionRecord formats
+// SelectedReviewerPersona's DecisionRecordDeclarationSite from the persona
+// name.
+const DeclarationSiteFmtReviewerPersonaDecisionRecord = "reviewer_personas.%s.decision_record.index in .fishhawk/workflows.yaml"
 
 // PathFmtReviewerPersona is the reported path for a declaration or reference rejection (persona name).
 const PathFmtReviewerPersona = "/reviewer_personas/%s"
@@ -121,6 +154,9 @@ const PathFmtStageReviewerPersonaItem = "/workflows/%s/stages/%d/reviewers/perso
 
 // MsgFmtReviewerPersonaRemitPathInvalid rejects a persona remit path that is not a canonical repo-relative path (name, path, reason — one of the review-convention path reasons).
 const MsgFmtReviewerPersonaRemitPathInvalid = "reviewer_personas.%s: remit.path %q is not a canonical repo-relative path: %s; name the remit document relative to the repository root, slash-separated, with no empty, \".\" or \"..\" segment (e.g. docs/review/security-remit.md)"
+
+// MsgFmtReviewerPersonaDecisionRecordIndexPathInvalid rejects a persona decision_record.index path that is not a canonical repo-relative path (name, path, reason — one of the review-convention path reasons).
+const MsgFmtReviewerPersonaDecisionRecordIndexPathInvalid = "reviewer_personas.%s: decision_record.index %q is not a canonical repo-relative path: %s; name the decision-record index relative to the repository root, slash-separated, with no empty, \".\" or \"..\" segment (e.g. docs/adr/index.json)"
 
 // MsgFmtReviewerPersonaStageType rejects reviewers.personas on a stage type other than plan / implement (stage id, stage type).
 const MsgFmtReviewerPersonaStageType = "stage %q: reviewers.personas is valid only on a plan or implement stage, not a %q stage: only those two stages run the agent-review loop a persona joins, so this attachment would run no reviewer; move it onto a plan or implement stage (a file-level defaults.reviewers block carrying personas lands on every stage that inherits it — give this stage its own reviewers block)"
@@ -172,7 +208,9 @@ func sortedReviewerPersonaNames(s *Spec) []string {
 }
 
 // validateReviewerPersonaDeclarations runs the per-persona DECLARATION checks
-// (rule-order rung 1): the remit path rule, then the persona agent's
+// (rule-order rung 1): the remit path rule, then the decision_record.index
+// path rule when a decision_record is declared (the same
+// reviewConventionPathReason, E78.5 / #3756), then the persona agent's
 // agent_version range syntax (the same ValidAgentVersionRange check every
 // reviewers.agents[] entry gets, at the persona's own path).
 func validateReviewerPersonaDeclarations(s *Spec) error {
@@ -183,6 +221,14 @@ func validateReviewerPersonaDeclarations(s *Spec) error {
 			return &ValidationError{
 				Path:    ptr + "/remit/path",
 				Message: fmt.Sprintf(MsgFmtReviewerPersonaRemitPathInvalid, name, p.Remit.Path, reason),
+			}
+		}
+		if p.DecisionRecord != nil {
+			if reason := reviewConventionPathReason(p.DecisionRecord.Index); reason != "" {
+				return &ValidationError{
+					Path:    ptr + "/decision_record/index",
+					Message: fmt.Sprintf(MsgFmtReviewerPersonaDecisionRecordIndexPathInvalid, name, p.DecisionRecord.Index, reason),
+				}
 			}
 		}
 		if p.Agent.AgentVersion != "" {
@@ -346,11 +392,16 @@ func (s *Spec) selectReviewerPersona(name string) (SelectedReviewerPersona, bool
 	if !ok {
 		return SelectedReviewerPersona{}, false
 	}
-	return SelectedReviewerPersona{
+	sel := SelectedReviewerPersona{
 		Name:            name,
 		Agent:           p.Agent,
 		RemitPath:       p.Remit.Path,
 		SeverityCap:     p.Remit.SeverityCap,
 		DeclarationSite: fmt.Sprintf(DeclarationSiteFmtReviewerPersonaRemit, name),
-	}, true
+	}
+	if p.DecisionRecord != nil {
+		sel.DecisionRecordIndex = p.DecisionRecord.Index
+		sel.DecisionRecordDeclarationSite = fmt.Sprintf(DeclarationSiteFmtReviewerPersonaDecisionRecord, name)
+	}
+	return sel, true
 }

@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -505,4 +507,142 @@ func TestRecordWithheld_FailsClosed(t *testing.T) {
 			t.Errorf("AppendChained calls = %d for an empty set, want 0", a.calls)
 		}
 	})
+}
+
+// ---------------------------------------------------------------------------
+// AttributeSet: selection-level truncations (E78.5 / #3756).
+// ---------------------------------------------------------------------------
+
+func selectionFixture() SelectionTruncation {
+	return SelectionTruncation{
+		Selection:     "ranked_selection",
+		Path:          "docs/index.json",
+		Commit:        pinnedCommit,
+		CapBytes:      2048,
+		IncludedBytes: 1900,
+		Dropped: []DroppedDocument{
+			{ID: "ADR-001", Path: "docs/001.md", Status: "accepted", Rank: 3},
+			{ID: "ADR-004", Path: "docs/004.md", Status: "unknown", Rank: 4},
+		},
+	}
+}
+
+// TestAttributeSet_TruncationsPrecedeInjections: every document_truncated —
+// per-document AND selection-level — is appended before any
+// document_injected, and the whole set shares one injection_set_id.
+func TestAttributeSet_TruncationsPrecedeInjections(t *testing.T) {
+	a := &recordingAppender{}
+	cut := attributedDoc()
+	cut.Truncated, cut.DroppedBytes = true, 9
+	whole := attributedDoc()
+	whole.Path = "docs/001.md"
+
+	if err := AttributeSet(context.Background(), a, uuid.New(), uuid.New(), InjectionSet{
+		Documents:  []Document{cut, whole},
+		Selections: []SelectionTruncation{selectionFixture()},
+	}); err != nil {
+		t.Fatalf("AttributeSet: %v", err)
+	}
+	want := []string{"document_truncated", "document_truncated", "document_injected", "document_injected"}
+	if got := a.categories(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("append order = %v, want %v", got, want)
+	}
+	setID := a.payload(t, 0)["injection_set_id"]
+	if setID == nil || setID == "" {
+		t.Fatalf("no injection_set_id")
+	}
+	for i := range a.entries {
+		if p := a.payload(t, i); p["injection_set_id"] != setID {
+			t.Errorf("entry %d injection_set_id = %v, want %v", i, p["injection_set_id"], setID)
+		}
+	}
+	if _, ok := a.payload(t, 0)["selection"]; ok {
+		t.Errorf("per-document truncation carries the selection discriminator")
+	}
+	sel := a.payload(t, 1)
+	for k, want := range map[string]any{
+		"selection":      "ranked_selection",
+		"path":           "docs/index.json",
+		"commit":         pinnedCommit,
+		"cap_bytes":      float64(2048),
+		"included_bytes": float64(1900),
+		"dropped_count":  float64(2),
+	} {
+		if sel[k] != want {
+			t.Errorf("selection payload[%q] = %v, want %v", k, sel[k], want)
+		}
+	}
+	wantDropped := []any{
+		map[string]any{"id": "ADR-001", "path": "docs/001.md", "status": "accepted", "rank": float64(3)},
+		map[string]any{"id": "ADR-004", "path": "docs/004.md", "status": "unknown", "rank": float64(4)},
+	}
+	if !reflect.DeepEqual(sel["dropped"], wantDropped) {
+		t.Errorf("selection payload dropped = %v, want %v", sel["dropped"], wantDropped)
+	}
+	for i := 2; i < 4; i++ {
+		if p := a.payload(t, i); p["document_count"] != float64(2) || p["document_index"] != float64(i-2) {
+			t.Errorf("document_injected %d index/count = %v/%v", i, p["document_index"], p["document_count"])
+		}
+	}
+}
+
+// TestAttributeSet_SelectionAppendFailure_LeavesNoInjectionClaim reads the
+// appender's COMMITTED entries after the selection-truncation append fails:
+// no document_injected may have been written (rule 3: committed state, not
+// error identity).
+func TestAttributeSet_SelectionAppendFailure_LeavesNoInjectionClaim(t *testing.T) {
+	boom := errors.New("append failed")
+	a := &recordingAppender{failOn: 1, err: boom}
+	err := AttributeSet(context.Background(), a, uuid.New(), uuid.New(), InjectionSet{
+		Documents:  []Document{attributedDoc()},
+		Selections: []SelectionTruncation{selectionFixture()},
+	})
+	if !errors.Is(err, boom) {
+		t.Fatalf("err = %v, want the append failure", err)
+	}
+	if n := a.countCategory("document_injected"); n != 0 {
+		t.Fatalf("%d document_injected entries committed after the selection truncation failed, want 0", n)
+	}
+	if len(a.entries) != 0 {
+		t.Errorf("entries = %v, want none", a.categories())
+	}
+}
+
+// TestAttributeSet_MalformedSelectionRefusedBeforeAnyAppend: a selection with
+// no name (the payload discriminator) or no dropped document is refused before
+// the first append, so nothing is committed.
+func TestAttributeSet_MalformedSelectionRefusedBeforeAnyAppend(t *testing.T) {
+	cases := map[string]func(s *SelectionTruncation){
+		"no selection name":    func(s *SelectionTruncation) { s.Selection = "" },
+		"no dropped documents": func(s *SelectionTruncation) { s.Dropped = nil },
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			sel := selectionFixture()
+			mutate(&sel)
+			a := &recordingAppender{}
+			cut := attributedDoc()
+			cut.Truncated = true
+			err := AttributeSet(context.Background(), a, uuid.New(), uuid.New(), InjectionSet{
+				Documents:  []Document{cut},
+				Selections: []SelectionTruncation{sel},
+			})
+			if err == nil {
+				t.Fatalf("AttributeSet accepted a malformed selection")
+			}
+			if len(a.entries) != 0 {
+				t.Fatalf("entries committed before the refusal: %v", a.categories())
+			}
+		})
+	}
+}
+
+func TestAttributeSet_EmptyAndNilAppender(t *testing.T) {
+	if err := AttributeSet(context.Background(), nil, uuid.New(), uuid.New(), InjectionSet{}); err != nil {
+		t.Errorf("empty set err = %v, want nil (no-op)", err)
+	}
+	err := AttributeSet(context.Background(), nil, uuid.New(), uuid.New(), InjectionSet{Selections: []SelectionTruncation{selectionFixture()}})
+	if err == nil || !strings.Contains(err.Error(), "docs/index.json") {
+		t.Errorf("nil appender err = %v, want a refusal naming the selection path", err)
+	}
 }

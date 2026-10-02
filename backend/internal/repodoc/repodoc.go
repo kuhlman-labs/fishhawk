@@ -255,6 +255,43 @@ type Request struct {
 }
 
 // Resolve reads req.Declaration's document from req.Repo at req.BaseRef,
+// PINNED to a commit SHA, and shapes it for display under the Resolver's
+// effective cap. It is exactly Fetch followed by Document(r.CapBytes()); see
+// Fetch for the fail-closed resolution steps (a)-(e).
+//
+// The returned Document carries the pinned commit, the content hash over
+// the fetched bytes, and the effective cap.
+func (r *Resolver) Resolve(ctx context.Context, req Request) (*Document, error) {
+	f, err := r.Fetch(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	doc := f.Document(r.CapBytes())
+	return &doc, nil
+}
+
+// Fetched is one declared document read at a pinned commit, BEFORE it is
+// shaped for display: no cap has been applied and nothing has been
+// neutralized. It exists so a consumer that must size several documents
+// against ONE budget can measure a document's untruncated rendered size
+// (Document under a cap at least len(Content)) before deciding whether to
+// show it, and can read the raw bytes a structured document is parsed from —
+// the same bytes Document's ContentHash covers.
+type Fetched struct {
+	// Path is the resolved repo-relative path.
+	Path string
+	// Commit is the COMMIT SHA the bytes were read at.
+	Commit string
+	// Content is the resolved bytes exactly as fetched. Callers must treat it
+	// as read-only: Document hashes these bytes.
+	Content []byte
+	// DeclarationSite is echoed from the Declaration.
+	DeclarationSite string
+	// BaseSource is echoed from Declaration.Base.
+	BaseSource BaseSource
+}
+
+// Fetch reads req.Declaration's document from req.Repo at req.BaseRef,
 // PINNED to a commit SHA. Every step fails closed:
 //
 //	(a) the declared path is validated as repo-relative and traversal-free;
@@ -269,12 +306,9 @@ type Request struct {
 //	(d) the file is fetched AT THE PINNED COMMIT SHA;
 //	(e) forge.ErrNotFound becomes ErrMissingDocument; any other fetch error
 //	    is wrapped, never degraded to an empty document.
-//
-// The returned Document carries the pinned commit, the content hash over
-// the fetched bytes, and the effective cap.
-func (r *Resolver) Resolve(ctx context.Context, req Request) (*Document, error) {
+func (r *Resolver) Fetch(ctx context.Context, req Request) (*Fetched, error) {
 	decl := req.Declaration
-	fail := func(err error) (*Document, error) {
+	fail := func(err error) (*Fetched, error) {
 		return nil, &ResolveError{Path: decl.Path, DeclarationSite: decl.DeclarationSite, Err: err}
 	}
 
@@ -315,29 +349,46 @@ func (r *Resolver) Resolve(ctx context.Context, req Request) (*Document, error) 
 	if fc == nil {
 		return fail(fmt.Errorf("%w at commit %s: forge returned no content", ErrMissingDocument, commit))
 	}
+	return &Fetched{
+		Path:            decl.Path,
+		Commit:          commit,
+		Content:         fc.Content,
+		DeclarationSite: decl.DeclarationSite,
+		BaseSource:      decl.Base,
+	}, nil
+}
 
-	sum := sha256.Sum256(fc.Content)
-	effectiveCap := r.capBytes()
-	content, dropped, truncated := capContent(string(fc.Content), effectiveCap, decl.Path, commit)
+// Document shapes f for display under capBytes: the content hash over the
+// fetched bytes, the rune-safe loud cut when the bytes exceed capBytes, and
+// delimiter neutralization. Resolve calls it with the Resolver's effective
+// cap; a consumer budgeting several documents may pass any other cap. A
+// capBytes below zero is treated as zero (only the truncation marker is
+// shown for a non-empty document), never as "no cap".
+func (f *Fetched) Document(capBytes int) Document {
+	if capBytes < 0 {
+		capBytes = 0
+	}
+	sum := sha256.Sum256(f.Content)
+	content, dropped, truncated := capContent(string(f.Content), capBytes, f.Path, f.Commit)
 	// Neutralize forged delimiter lines HERE, not only at render time, so
 	// Content IS the body that will be shown and RenderedBytes counts those
 	// exact bytes. Render neutralizes again (the operation is idempotent —
 	// the replacement note is not itself a delimiter), so a hand-constructed
 	// Document is still framed safely; neither layer alone is load-bearing.
 	content = neutralizeBody(content)
-	return &Document{
-		Path:            decl.Path,
-		Commit:          commit,
+	return Document{
+		Path:            f.Path,
+		Commit:          f.Commit,
 		ContentHash:     "sha256:" + hex.EncodeToString(sum[:]),
 		Content:         content,
 		Truncated:       truncated,
-		OriginalBytes:   len(fc.Content),
+		OriginalBytes:   len(f.Content),
 		RenderedBytes:   len(content),
 		DroppedBytes:    dropped,
-		CapBytes:        effectiveCap,
-		DeclarationSite: decl.DeclarationSite,
-		BaseSource:      decl.Base,
-	}, nil
+		CapBytes:        capBytes,
+		DeclarationSite: f.DeclarationSite,
+		BaseSource:      f.BaseSource,
+	}
 }
 
 // PinCommit resolves ref to a lowercase 40-hex commit SHA through the same
@@ -353,9 +404,10 @@ func (r *Resolver) PinCommit(ctx context.Context, repo forge.RepoRef, scope forg
 	return r.pinCommit(ctx, repo, scope, ref)
 }
 
-// capBytes returns the effective cap: Resolver.MaxBytes, or DefaultMaxBytes
-// when unset.
-func (r *Resolver) capBytes() int {
+// CapBytes returns the effective cap: Resolver.MaxBytes, or DefaultMaxBytes
+// when unset. It is the cap Resolve shapes a document under, exported so a
+// consumer budgeting several documents against one cap uses the same value.
+func (r *Resolver) CapBytes() int {
 	if r.MaxBytes > 0 {
 		return r.MaxBytes
 	}
@@ -407,6 +459,12 @@ func isCommitSHA(s string) bool {
 	}
 	return true
 }
+
+// ValidatePath reports whether p is a plain, canonical, control-free
+// repo-relative path — the exact check Fetch applies to a declared path
+// (step a) — so a consumer that reads paths out of a fetched document can
+// refuse an unsafe one before declaring it. The error wraps ErrInvalidPath.
+func ValidatePath(p string) error { return validatePath(p) }
 
 // validatePath rejects anything that is not a plain repo-relative path.
 // Both the RAW segments and the path.Clean'd form are checked: the raw scan

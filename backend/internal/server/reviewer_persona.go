@@ -7,11 +7,13 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"sort"
 	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/decisionrecord"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
@@ -67,8 +69,30 @@ const (
 	// personaDetailPromptBuildFailed: the persona's own prompt failed to build.
 	personaDetailPromptBuildFailed = "persona_prompt_build_failed"
 	// personaDetailRemitUnattributed: the remit's document_injected
-	// attribution could not be written, so the prompt is discarded.
+	// attribution — or, for a decision_record persona, the ONE injection set
+	// carrying the remit, the index and the selected records — could not be
+	// written, so the prompt is discarded.
 	personaDetailRemitUnattributed = "remit_unattributed"
+)
+
+// Decision-record degrade details (ADR-084 D4(b) / E78.5 / #3756): the step a
+// persona that declares reviewer_personas.<name>.decision_record failed at.
+// Each degrades THAT persona only (persona_remit_unavailable); the standard
+// reviewers run. A persona without decision_record never produces one.
+const (
+	// personaDetailDecisionRecordIndexMissing: the declared index does not
+	// exist at the run's admission commit (decisionrecord.ErrIndexMissing).
+	personaDetailDecisionRecordIndexMissing = "decision_record_index_missing"
+	// personaDetailDecisionRecordInvalid: the index is not a valid
+	// adr-index-v1 document, or its applies_to cannot be matched
+	// (decisionrecord.ErrInvalidIndex).
+	personaDetailDecisionRecordInvalid = "decision_record_invalid"
+	// personaDetailDecisionRecordUnresolvable: any other assembly failure — a
+	// record the index lists that is absent at the commit, a fetch or pinning
+	// error, a cap too small for the index — AND a run whose recorded
+	// admission commit is nil, empty or not a 40-hex SHA (checked before any
+	// dereference or read).
+	personaDetailDecisionRecordUnresolvable = "decision_record_unresolvable"
 )
 
 // Unresolvable-attachment-set details (E55.9 / #3754, carried from #3753): the
@@ -125,14 +149,21 @@ type personaInvocation struct {
 	// selected persona.
 	reason string
 	// quoteDocs is every document injected into THIS persona's prompt, in
-	// render order — the standard injected set, then the remit, then each
-	// rendered review convention — the set a quoted_passage is verified
-	// against at ingest (E55.10 / #3755, applyPersonaConcernControls). Set
+	// render order — the standard injected set, then the remit, then (for a
+	// decision_record persona) the decision-record index and each selected
+	// record, then each rendered review convention — the set a quoted_passage
+	// is verified against at ingest (E55.10 / #3755,
+	// applyPersonaConcernControls). Set
 	// with promptText; nil while unbuilt.
 	quoteDocs []prompt.InjectedDocument
 	// severityCap is the persona remit's severity_cap ("" = uncapped), enforced
 	// on the persona's concerns at ingest (ClampPersonaSeverities).
 	severityCap string
+	// changePaths is the change the round reviews — the plan-scope union
+	// UNION the diff paths (reviewChangePaths), de-duplicated and sorted — the
+	// paths a decision_record persona's records are selected against
+	// (E78.5 / #3756). Set for every persona of a resolved round.
+	changePaths []string
 }
 
 // personaName returns the persona this invocation belongs to, or "" for a
@@ -266,7 +297,34 @@ func (s *Server) resolveParsedReviewPersonaInvocations(ctx context.Context, runR
 	if len(esc.attachments) > 0 {
 		s.writeEscalationPersonaAttachedAudit(ctx, runRow, stageID, kind, paths, esc, staticNames, staticDegraded)
 	}
-	return s.resolvePersonaInvocations(union, degraded...)
+	invs := s.resolvePersonaInvocations(union, degraded...)
+	changePaths := reviewChangePaths(paths)
+	for i := range invs {
+		invs[i].persona.changePaths = changePaths
+	}
+	return invs
+}
+
+// reviewChangePaths returns the paths a review round's change touches for
+// decision-record selection (E78.5 / #3756): paths.plan UNION paths.diff,
+// de-duplicated and sorted. At plan review that is the scope of the plan under
+// review; at implement review the approved plan's scope union every path the
+// diff touched, so a record governing a path the implementation drifted into
+// is still selected.
+func reviewChangePaths(paths reviewPaths) []string {
+	seen := make(map[string]struct{}, len(paths.plan)+len(paths.diff))
+	var out []string
+	for _, set := range [][]string{paths.plan, paths.diff} {
+		for _, p := range set {
+			if _, dup := seen[p]; dup {
+				continue
+			}
+			seen[p] = struct{}{}
+			out = append(out, p)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // workflowAttachesPersonas reports whether any stage of wf attaches a persona
@@ -382,6 +440,15 @@ func (s *Server) resolvePersonaInvocations(personas []spec.SelectedReviewerPerso
 // injection claim is left for a prompt that was never built; an attribution
 // failure then discards the prompt (an un-attributed injection is exactly what
 // repodoc.Attribute exists to forbid).
+//
+// DECISION RECORD (ADR-084 D4(b) / E78.5 / #3756). A persona that declares
+// decision_record additionally gets, AFTER its remit and in its prompt only,
+// the decision-record index plus the full text of the records whose
+// applies_to matches the round's change paths, within the resolver's cap
+// (decisionrecord.Assemble, at the run's admission commit). The remit, the
+// index and the records are attributed as ONE injection set, so E55.10's
+// quote verification covers the records too. A record that cannot be
+// assembled degrades the persona (decision_record_* detail).
 func (s *Server) buildPersonaPrompts(ctx context.Context, runRow *run.Run, reviewedStageID uuid.UUID, kind string, trig prompt.Trigger, standardInjected []prompt.InjectedDocument, treeDir string, invs []reviewerInvocation) {
 	for i := range invs {
 		p := invs[i].persona
@@ -436,12 +503,20 @@ func (s *Server) buildPersonaPrompt(ctx context.Context, runRow *run.Run, review
 		}
 		return personaDetailRemitUnresolvable
 	}
+	// The decision record is read only for a persona that declares it, so a
+	// persona without decision_record makes no extra read.
+	var record *decisionrecord.Selection
+	if p.selected.DecisionRecordIndex != "" {
+		var detail string
+		if record, detail = s.resolvePersonaDecisionRecord(ctx, runRow, repo, scope, p); detail != "" {
+			return detail
+		}
+	}
 
 	// A VALUE COPY of the round's Trigger with a CLONED document slice: the
 	// standard prompt was already built from trig, and nothing written here
 	// can reach it.
 	ptrig := trig
-	ptrig.InjectedDocuments = append(slices.Clone(standardInjected), repodoc.ToPromptDocument(*doc, framing))
 	ptree := treeDir
 	if _, grounded := inv.reviewer.(groundedReviewer); treeDir == "" || !grounded {
 		// The persona cannot read the round's tree: render the diff-only
@@ -451,11 +526,22 @@ func (s *Server) buildPersonaPrompt(ctx context.Context, runRow *run.Run, review
 		ptrig.ReviewTreeSkippedInstructions = 0
 		ptree = ""
 	}
+	ptrig.InjectedDocuments = append(slices.Clone(standardInjected), repodoc.ToPromptDocument(*doc, framing))
+	set := repodoc.InjectionSet{Documents: []repodoc.Document{*doc}}
+	if record != nil {
+		// After the remit: the index, then each selected record. Whether the
+		// persona can read the tree only changes what the index framing says
+		// about the records NOT shown.
+		ptrig.InjectedDocuments = append(ptrig.InjectedDocuments, record.PromptDocuments(ptree != "")...)
+		rs := record.Attribution()
+		set.Documents = append(set.Documents, rs.Documents...)
+		set.Selections = rs.Selections
+	}
 	promptText, err := prompt.Build(kind, ptrig)
 	if err != nil {
 		return personaDetailPromptBuildFailed
 	}
-	if err := repodoc.Attribute(ctx, s.cfg.AuditRepo, runRow.ID, reviewedStageID, *doc); err != nil {
+	if err := repodoc.AttributeSet(ctx, s.cfg.AuditRepo, runRow.ID, reviewedStageID, set); err != nil {
 		return personaDetailRemitUnattributed
 	}
 	p.promptText = promptText
@@ -465,9 +551,66 @@ func (s *Server) buildPersonaPrompt(ctx context.Context, runRow *run.Run, review
 	return ""
 }
 
+// resolvePersonaDecisionRecord assembles p's decision record (E78.5 / #3756)
+// at the run's recorded admission commit, over the round's change paths, and
+// returns it, or the decision_record_* degrade detail. The commit is checked
+// BEFORE any dereference or read: a nil, empty or non-40-hex admission commit
+// is decision_record_unresolvable. The underlying error is WARN-logged so the
+// operator can see which record or field failed; the skip carries only the
+// detail.
+func (s *Server) resolvePersonaDecisionRecord(ctx context.Context, runRow *run.Run, repo forge.RepoRef, scope forge.CredentialScope, p *personaInvocation) (*decisionrecord.Selection, string) {
+	commit := runRow.DocumentBaseCommit
+	if commit == nil || !isFullCommitSHA(*commit) {
+		return nil, personaDetailDecisionRecordUnresolvable
+	}
+	sel, err := decisionrecord.Assemble(ctx, s.cfg.DocumentResolver, decisionrecord.Request{
+		Repo:            repo,
+		Scope:           scope,
+		Commit:          *commit,
+		IndexPath:       p.selected.DecisionRecordIndex,
+		DeclarationSite: p.selected.DecisionRecordDeclarationSite,
+		ChangePaths:     p.changePaths,
+	})
+	if err == nil {
+		return sel, ""
+	}
+	detail := personaDetailDecisionRecordUnresolvable
+	switch {
+	case errors.Is(err, decisionrecord.ErrIndexMissing):
+		detail = personaDetailDecisionRecordIndexMissing
+	case errors.Is(err, decisionrecord.ErrInvalidIndex):
+		detail = personaDetailDecisionRecordInvalid
+	}
+	s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "reviewer personas: decision record could not be assembled — persona skipped, standard reviewers unaffected",
+		slog.String("run_id", runRow.ID.String()),
+		slog.String("persona", p.selected.Name),
+		slog.String("index", p.selected.DecisionRecordIndex),
+		slog.String("detail", detail),
+		slog.String("error", err.Error()),
+	)
+	return nil, detail
+}
+
+// isFullCommitSHA reports whether s is a full 40-hex git object id — the only
+// shape a run-admission read may be made at.
+func isFullCommitSHA(s string) bool {
+	if len(s) != 40 {
+		return false
+	}
+	for _, c := range s {
+		switch {
+		case c >= '0' && c <= '9', c >= 'a' && c <= 'f', c >= 'A' && c <= 'F':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // personaPromptDocuments returns every document a persona prompt built from
-// trig renders, in render order: the injected documents (the standard set and
-// the remit), then each review convention's document.
+// trig renders, in render order: the injected documents (the standard set, the
+// remit, and for a decision_record persona the index and each selected
+// record), then each review convention's document.
 func personaPromptDocuments(trig prompt.Trigger) []prompt.InjectedDocument {
 	out := make([]prompt.InjectedDocument, 0, len(trig.InjectedDocuments)+len(trig.ReviewConventions))
 	out = append(out, trig.InjectedDocuments...)
