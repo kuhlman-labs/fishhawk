@@ -261,7 +261,7 @@ workflows:
 // TestEscalationReviewers_ShapeTolerance drives checkEscalatedReviewers over
 // hand-built raw trees the schema keeps unreachable from ValidateBytes: a
 // non-list / non-string reviewers node and a non-list stages node each yield
-// the backend's reading rather than a panic.
+// no entry rather than a panic.
 func TestEscalationReviewers_ShapeTolerance(t *testing.T) {
 	declared := map[string]any{"security": map[string]any{}}
 	var errs []ValidationErrorEntry
@@ -270,9 +270,23 @@ func TestEscalationReviewers_ShapeTolerance(t *testing.T) {
 	if len(errs) != 0 {
 		t.Fatalf("shape-mismatched reviewers produced entries: %+v", errs)
 	}
-	// An unreadable stages node has no agent-reviewing stage: rung 9.
+	// An unreadable stages node was already rejected structurally, so the
+	// no-agent-review rung is SKIPPED (the stagesReadable gate the paths rung
+	// shares) rather than stacking a second, misleading diagnosis on it.
 	checkEscalatedReviewers(map[string]any{"reviewers": []any{"security"}}, map[string]any{"stages": "not-a-list"}, "wf", 0, declared, &errs)
+	if len(errs) != 0 {
+		t.Fatalf("unreadable stages: got %+v, want zero entries (rung 9 is gated on stagesReadable)", errs)
+	}
+	// An ABSENT stages node is unreadable too — the same gate.
+	checkEscalatedReviewers(map[string]any{"reviewers": []any{"security"}}, map[string]any{}, "wf", 0, declared, &errs)
+	if len(errs) != 0 {
+		t.Fatalf("absent stages: got %+v, want zero entries", errs)
+	}
+	// Control: a READABLE stages list with no agent-reviewing stage still
+	// reports rung 9, so the gate skips only the unreadable leg.
+	checkEscalatedReviewers(map[string]any{"reviewers": []any{"security"}},
+		map[string]any{"stages": []any{map[string]any{"type": "plan"}}}, "wf", 0, declared, &errs)
 	if len(errs) != 1 || errs[0].Path != "/workflows/wf/escalations/0/require/reviewers" {
-		t.Fatalf("unreadable stages: got %+v, want one no-agent-review entry", errs)
+		t.Fatalf("readable stages without an agent review: got %+v, want one no-agent-review entry", errs)
 	}
 }

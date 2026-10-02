@@ -424,12 +424,14 @@ func escalationPathsNoPlanStageMessage(workflow string, idx int) string {
 // schema-required, so an unreadable one means a document already rejected
 // structurally, but the rung must not be silently dead on that leg.
 //
-// ONE DELIBERATE DIVERGENCE from the typed backend, in the paths rung: when
-// `stages` is not a list (hasPlanStageFromRaw's second return is false) this
-// sweep SKIPS the rung rather than stacking a semantic no-plan-stage diagnosis
-// on the structural one already reported upstream. The typed backend has no
-// equivalent leg — a typed *Spec with zero stages genuinely HAS no plan stage,
-// and the schema's minItems keeps that unreachable from a parsed document.
+// ONE DELIBERATE DIVERGENCE from the typed backend, applied to BOTH
+// stages-reading rungs: when `stages` is not a list (hasPlanStageFromRaw's
+// second return is false) this sweep SKIPS the paths rung AND the reviewers
+// no-agent-review rung rather than stacking a semantic "no such stage"
+// diagnosis on the structural one already reported upstream. The typed
+// backend has no equivalent leg — a typed *Spec with zero stages genuinely HAS
+// no plan stage, and the schema's minItems keeps that unreachable from a
+// parsed document.
 //
 // It runs AFTER schema validation, so a node that is not the shape the schema
 // requires was already rejected upstream and is skipped here.
@@ -542,6 +544,13 @@ func checkEscalatedApprovals(require map[string]any, wfName string, idx int, ptr
 // the RESOLVED ones (the sweep runs after reuse resolution); the agent count is
 // len(reviewers.agents) and the static attachment set rawStringList of
 // reviewers.personas — the backend's AgentCount / Reviewers.Personas reading.
+//
+// The no-agent-review rung is gated on the SAME stagesReadable reading the
+// paths rung uses (hasPlanStageFromRaw's second return): an unreadable
+// `stages` node was already rejected structurally, so the rung is skipped
+// rather than reporting a second, misleading "no agent-reviewing stage"
+// diagnosis — and the no-op rung after it, which reads the same node, is
+// skipped with it (#3755, carried from the #3754 review).
 func checkEscalatedReviewers(require, wf map[string]any, wfName string, idx int, declared map[string]any, errs *[]ValidationErrorEntry) {
 	names := rawStringList(require["reviewers"])
 	if len(names) == 0 {
@@ -555,6 +564,9 @@ func checkEscalatedReviewers(require, wf map[string]any, wfName string, idx int,
 			})
 			return
 		}
+	}
+	if _, stagesReadable := hasPlanStageFromRaw(wf); !stagesReadable {
+		return
 	}
 	reviewing := agentReviewingStagesFromRaw(wf)
 	if len(reviewing) == 0 {
