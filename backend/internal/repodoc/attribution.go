@@ -41,6 +41,15 @@ const (
 // exists to rule out, so they are withheld instead.
 const WithheldReasonRunBaseUnrecorded = "run_base_commit_unrecorded"
 
+// WithheldReasonOptionalDocumentMissing is the Withheld.Reason for OPTIONAL
+// declarations (a review convention declared `required: false`, E55.3 / #2244)
+// whose document was RESOLVED at the pinned commit and found absent
+// (ErrMissingDocument). Unlike WithheldReasonRunBaseUnrecorded the document WAS
+// looked for; it is withheld because there is nothing to inject, and the
+// declaration's author opted into skipping rather than failing. A REQUIRED
+// declaration that is missing is an error, never this reason.
+const WithheldReasonOptionalDocumentMissing = "optional_document_missing"
+
 // Withheld is a set of declarations a prompt assembly deliberately did NOT
 // resolve, and the reason. RecordWithheld attributes it; WithheldNotice
 // renders it into the prompt so the agent is told the documents exist and
@@ -48,7 +57,8 @@ const WithheldReasonRunBaseUnrecorded = "run_base_commit_unrecorded"
 // declared".
 type Withheld struct {
 	// Reason is a fixed machine-readable reason, e.g.
-	// WithheldReasonRunBaseUnrecorded. Required.
+	// WithheldReasonRunBaseUnrecorded or
+	// WithheldReasonOptionalDocumentMissing. Required.
 	Reason string
 	// Declarations are the withheld declarations, in declaration order.
 	Declarations []Declaration

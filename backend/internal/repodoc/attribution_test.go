@@ -390,6 +390,39 @@ func withheldFixture() Withheld {
 	}
 }
 
+// TestRecordWithheld_OptionalDocumentMissingReason pins the E55.3 / #2244
+// reason value: an optional declaration resolved and found absent is recorded
+// on the SAME document_injection_degraded category (no new audit category),
+// naming the path and declaration site.
+func TestRecordWithheld_OptionalDocumentMissingReason(t *testing.T) {
+	if WithheldReasonOptionalDocumentMissing != "optional_document_missing" {
+		t.Fatalf("WithheldReasonOptionalDocumentMissing = %q, want optional_document_missing", WithheldReasonOptionalDocumentMissing)
+	}
+	a := &recordingAppender{}
+	w := Withheld{
+		Reason:       WithheldReasonOptionalDocumentMissing,
+		Declarations: []Declaration{{Path: declaredPath, DeclarationSite: declSite, Base: BaseSourceRunAdmission}},
+	}
+	if err := RecordWithheld(context.Background(), a, uuid.New(), uuid.New(), w); err != nil {
+		t.Fatalf("RecordWithheld: %v", err)
+	}
+	if len(a.entries) != 1 || a.entries[0].Category != "document_injection_degraded" {
+		t.Fatalf("entries = %v, want exactly one document_injection_degraded", a.categories())
+	}
+	var p struct {
+		Reason           string   `json:"reason"`
+		Paths            []string `json:"paths"`
+		DeclarationSites []string `json:"declaration_sites"`
+	}
+	if err := json.Unmarshal(a.entries[0].Payload, &p); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	if p.Reason != "optional_document_missing" || len(p.Paths) != 1 || p.Paths[0] != declaredPath ||
+		len(p.DeclarationSites) != 1 || p.DeclarationSites[0] != declSite {
+		t.Errorf("payload = %+v, want reason optional_document_missing naming %s at %s", p, declaredPath, declSite)
+	}
+}
+
 func TestRecordWithheld_WritesOneDegradedEntry(t *testing.T) {
 	a := &recordingAppender{}
 	runID, stageID := uuid.New(), uuid.New()

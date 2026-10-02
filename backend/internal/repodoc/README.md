@@ -7,7 +7,7 @@ Two consumers will attach to it:
 
 | Consumer | Declared path | Declaration site |
 |---|---|---|
-| E55 review conventions | `.fishhawk/review-conventions.md` (repo's choice) | `review_conventions[]` in `.fishhawk/workflows.yaml` |
+| E55 review conventions (E55.3 / #2244) | each entry's `path` (repo's choice) | `review_conventions.<name> in .fishhawk/workflows.yaml` |
 | #2234 product charter | `.fishhawk/charter.md` | `charter.path` in `.fishhawk/work-management.yaml` |
 
 Neither declaration site ships in this slice. The package has **no production
@@ -15,6 +15,25 @@ caller today**: the server seam (`Config.DocumentDeclarations` /
 `DocumentResolver` / `DocumentScope`) is nil, so
 `Server.resolveInjectedDocuments` returns `(nil, nil)` and every served prompt
 is byte-identical to the pre-#2242 render.
+
+**E55 review conventions attach via `BaseSourceRunAdmission`, not the seam.**
+`Server.resolveReviewDocuments` (`backend/internal/server/document_injection.go`)
+selects the reviewed stage's `reviewers.conventions` from the run's
+workflow-spec snapshot and appends one run-admission `Declaration` per
+selected convention AFTER the seam's, so conventions ride the same base-source
+partition and the same resolve-everything-before-any-attribution ordering. They
+are resolved ONLY on the in-process review paths (plan review, implement
+review) and returned as `prompt.ReviewConvention`s — never as injected
+documents and never on an author prompt. A missing REQUIRED convention fails
+the set (`review_convention_missing`) before any audit entry; a missing
+OPTIONAL one (`required: false`) is withheld with reason
+`optional_document_missing` (`WithheldReasonOptionalDocumentMissing`) on the
+existing `document_injection_degraded` category — no new audit category — and
+renders nothing. A selected convention with a nil `DocumentResolver` fails
+closed even with no declaration seam. The review resolve phase (seam call,
+credential scope, every `Resolve`) is bounded by the server's
+`reviewDocumentResolveTimeout`; the audit appends run on the caller's context.
+Server-side contract: `backend/internal/server/README.md`.
 
 **Inert means NO declaration seam.** `DocumentDeclarations == nil` is the inert
 state: nothing declares a document, so nothing can be missing. A CONFIGURED
@@ -363,7 +382,7 @@ NEL included — plus U+2028/U+2029).
 |---|---|---|
 | `document_injected` | every injection | `declaration_site`, `path`, `commit`, `content_hash`, `original_bytes`, `rendered_bytes`, `truncated`, `base_source`, `injection_set_id`, `document_index`, `document_count` |
 | `document_truncated` | in **addition**, when the document was cut | `path`, `commit`, `content_hash`, `cap_bytes`, `dropped_bytes`, `injection_set_id` |
-| `document_injection_degraded` | once per SERVED prompt that withheld run-admission declarations (E55.7 / #3746) | `reason` (`run_base_commit_unrecorded`), `paths`, `declaration_sites`, `document_count` |
+| `document_injection_degraded` | once per SERVED prompt PER REASON: run-admission declarations withheld for an unrecorded base (E55.7 / #3746), and optional review conventions resolved and found absent (E55.3 / #2244); both precede any `document_injected` claim | `reason` (`run_base_commit_unrecorded` \| `optional_document_missing`), `paths`, `declaration_sites`, `document_count` |
 
 `base_source` on `document_injected` is `run_admission` or `declaration_seam`
 (the zero `BaseSource`, named explicitly so an entry never reads as
@@ -512,7 +531,13 @@ writes to the audit trail.
 | M21 review-prompt partial seam (declarations, no resolver) | no reviewer runs; `*_review_failed` names the misconfiguration | `TestRunPlanReviews_PartialSeamConfiguration_FailsClosed` |
 | M22 reviewed stage unloadable / nil run or stage with the seam configured | no reviewer runs (never read as "nothing declared") | `TestRunPlanReviews_ReviewedStageUnloadable_FailsClosed`, `TestResolveReviewInjectedDocuments_NilInputsFailClosed` |
 | M23 review-prompt failure: gating vs advisory | gating fails the stage category-B (plan: `plan_review_document_injection_failed`; implement: the existing `implement_review_rejected` branch, discriminated by the failed entry); advisory leaves the human gate authoritative | `TestRunPlanReviews_DocumentResolutionFailure_GatingFailsStage`, the gating/advisory rows of M19's implement tests |
-| M24 run-admission withholding on a review prompt | notice rendered, nothing fetched, one `document_injection_degraded` for the reviewed stage | `TestRunImplementReviews_RunAdmissionNilCommit_CarriesWithheldNotice` |
+| M24 run-admission withholding on a review prompt | notice rendered, nothing fetched, one `document_injection_degraded` for the reviewed stage | `TestRunImplementReviews_RunAdmissionNilCommit_CarriesWithheldNotice`, `TestResolveReviewDocuments_NoAdmissionCommit_Withheld` |
+| M25 required review convention absent at the admission commit (E55.3 / #2244) | `review_convention_missing` names name, path, site, commit; no `document_injected` claim even for an already-resolved seam document | `TestResolveReviewDocuments_RequiredConventionMissing_NoClaim` |
+| M26 optional review convention absent | withheld, `document_injection_degraded` reason `optional_document_missing` written before the injection claim; nothing rendered | `TestRecordWithheld_OptionalDocumentMissingReason`, `TestResolveReviewDocuments_ConventionResolvedReviewOnly` |
+| M27 convention selected, no `DocumentResolver` (even with no seam) | fails closed, no audit entry | `TestResolveReviewDocuments_SelectionWithNilResolver_FailsClosed` |
+| M28 convention selection error (unparseable spec snapshot) | fails closed, nothing fetched | `TestResolveReviewDocuments_SelectionError_FailsClosed`, `TestSelectReviewConventions_Degrades` |
+| M29 review resolve phase exceeds `reviewDocumentResolveTimeout` | error, no `document_injected` | `TestResolveReviewDocuments_ResolvePhaseBounded`, `TestResolveReviewDocuments_ResolveDeadlineExceeded_FailsClosed` |
+| M30 no seam, no selected convention, reviewed stage unloadable | inert: zero value, no stage read, no forge call, no audit row | `TestResolveReviewDocuments_NilSeamNoSelection_UnloadableStage_Inert` |
 
 ## Consumer contract
 
