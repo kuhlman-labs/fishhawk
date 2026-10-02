@@ -155,6 +155,9 @@
             "$ref": "#/$defs/stage"
           }
         },
+        "schedule": {
+          "$ref": "#/$defs/schedule"
+        },
         "on_ci_failure": {
           "$ref": "#/$defs/on_ci_failure"
         },
@@ -211,6 +214,31 @@
               "$ref": "#/$defs/budget"
             }
           }
+        }
+      }
+    },
+    "schedule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cron"
+      ],
+      "description": "Optional workflow-level cadence (E79.1 / #3725): when fishhawkd's scheduler is enabled (--enable-scheduler, OFF by default) and lists this repository, it starts exactly one run of this workflow per due WINDOW, with trigger_source `scheduled`. A window is the latest cron fire time at or before the scheduler's tick, evaluated in `timezone`; the run's Idempotency-Key is `scheduled:<workflow_id>:<window start UTC RFC3339>`, so a double tick or a restart inside one window replays the existing run instead of minting a second. Only the LATEST window is ever attempted — no backfill after downtime. A scheduled run passes every admission control a POST /v0/runs does (applies_to, charter, plan-reviewer capability, blocking periodic budgets) and stops at every gate; with runner_kind local it parks at awaiting_host_dispatch until a host dispatches it. Declared BESIDE `applies_to`, not inside it: applies_to is the shared $defs/predicate (also consumed by escalations and review_conventions) and a cadence is not a match criterion. Rejected by the backend and by `fishhawk validate`, beyond this shape, when the workflow's `applies_to.trigger` does not list `scheduled` (the run would be refused at admission every window), when `cron` is malformed, when `timezone` is not a known IANA zone, or when `cron` can never fire (e.g. `0 0 30 2 *`). See docs/spec/workflow-v2.md § 'Workflow schedule'.",
+      "properties": {
+        "cron": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Five whitespace-separated NUMERIC fields: minute (0-59), hour (0-23), day-of-month (1-31), month (1-12), day-of-week (0-7, 0 and 7 both Sunday). Each field accepts `*`, `N`, `A-B`, comma lists, `*/S` and `A-B/S`. Names (MON, JAN) and macros (@daily) are refused. Vixie semantics: when BOTH day-of-month and day-of-week are restricted, a day matches if EITHER matches."
+        },
+        "timezone": {
+          "type": "string",
+          "minLength": 1,
+          "description": "IANA time zone name (e.g. America/Chicago) the cron fields are evaluated in. Absent means UTC. The zone database is embedded in every binary (time/tzdata), so validation and evaluation do not depend on the host's zoneinfo."
+        },
+        "issue": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Optional anchor issue number. When set, each scheduled run is anchored to issue N (trigger_ref `issue:N` plus its issue context), exactly as an on_demand run naming that issue is; absent means the run carries no issue anchor."
         }
       }
     },

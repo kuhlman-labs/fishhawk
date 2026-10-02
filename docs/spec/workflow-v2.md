@@ -190,6 +190,8 @@ workflows:
     description: "..."      # optional; free-form
     applies_to:             # optional; the changes this workflow may be used for
       labels: [dependencies]
+    schedule:               # optional; a cadence (requires applies_to.trigger: [scheduled, ...])
+      cron: "0 9 * * 1-5"
     extends: base_change    # optional; another workflow key in this document
     autonomy: medium        # optional; tier shorthand (low | medium | high)
     actions: {...}          # optional; per-action-class delegation matrix
@@ -209,6 +211,7 @@ workflows:
 |---|---|
 | `description` | Free-form prose. Carried, never interpreted. |
 | `applies_to` | A [path predicate](#path-predicate) declaring which changes may use this workflow — see [Workflow routing](#workflow-routing-applies_to). Absent means *any* change. |
+| `schedule` | A cadence on which fishhawkd's scheduler starts one run of this workflow per due window — see [Workflow schedule](#workflow-schedule-schedule). Absent means the scheduler never starts it. |
 | `extends` | Names another workflow in this document as this one's base — see [Reuse](#reuse-defaults-and-extends). |
 | `autonomy` | Tier shorthand expanding to a full action matrix — see [Autonomy](#autonomy-tier-shorthand-and-action-matrix). |
 | `actions` | The per-action-class delegation matrix, and the home of the two reserved keys `page_human_on` and `model_policy`. |
@@ -322,13 +325,50 @@ The rule reads the **`extends`-resolved** stage list: a plan stage inherited fro
 
 **`change_kind` is rejected inside `applies_to`.** The shared predicate grammar carries the criterion for its other consumers, but nothing populates a change kind today, so a workflow declaring it would be selectable by no run at all — a state indistinguishable, from the operator's side, from the routing control being broken. Both the backend and `fishhawk validate` refuse it at parse time with a message naming the missing producer.
 
-**The non-diff `trigger` forms have no producer either, but are accepted.** Unlike `change_kind` they are *partially* usable: `trigger: [diff, scheduled]` still matches real runs today, and the `scheduled` / `on_demand` arms route correctly the moment a scheduled groomer or an on-demand intake starts producing them. A predicate declaring **only** `scheduled` or **only** `on_demand` therefore matches nothing today — that is expected, not a bug.
+**The non-diff `trigger` forms both have producers.** `on_demand` is minted by an operator- or event-initiated non-diff run (E54.22 / #2826). `scheduled` is minted **only** by fishhawkd's in-process scheduler, for a workflow declaring a [`schedule`](#workflow-schedule-schedule) (E79.1 / #3725); `POST /v0/runs` refuses it as a reserved trigger source, so an operator cannot start a "scheduled" run by hand. A predicate declaring **only** `scheduled` therefore admits scheduler-started runs and nothing else — which is what a workflow meant to run on a cadence wants — and matches nothing on a deployment that has not enabled the scheduler.
 
 **Overlap is benign by construction.** `applies_to` *filters* a workflow the operator named; it never *selects* one. Two workflows whose predicates both match a change is not a coin flip — the requested `workflow_id` is admitted if its own predicate is satisfied, and the other workflow is simply another one that would also have been legal.
 
 `extends` folds **stages** only, so a deriving workflow does not inherit its base's `applies_to`; declare the routing predicate on each workflow that needs one. This matches every other non-stage member (`budgets`, `policy`, `decomposition`, `autonomy` are likewise not inherited).
 
 > `applies_to` is **enforced on every path that can start a run**: the schema accepts it, the parser round-trips it, both validators check it, and every run consults it. A run whose labels or trigger do not satisfy the declaration is refused at admission — on `POST /v0/runs` **and** on the webhook dispatch path (`issues.labeled`, `/fishhawk run`), both through the same shared evaluation core — and a plan whose `scope.files` reaches outside a declared `paths` is refused at the plan gate. Every refusal names the workflows that *would* accept the change, evaluated at **both** phases, so a named alternative cannot turn out to reject the same run at admission. The audited `applies_to_override` (with its required reason) is available on `POST /v0/runs`; a webhook trigger carries no override, so its refusal is unconditional.
+
+### Workflow schedule (`schedule`)
+
+```yaml
+workflows:
+  backlog_grooming:
+    applies_to:
+      trigger: [scheduled, on_demand]   # required: the schedule's runs are `scheduled`
+    schedule:                            # optional
+      cron: "0 9 * * 1"                  # required; five numeric fields
+      timezone: America/Chicago          # optional; IANA name, default UTC
+      issue: 1234                        # optional; anchor issue number
+    stages: [...]
+```
+
+`schedule` declares a **cadence**: when fishhawkd runs with its scheduler enabled (`--enable-scheduler`, **off by default**) and the repository is in the scheduler's configured repo list, it starts **exactly one run of this workflow per due window**, with `trigger_source: scheduled`. It is declared **beside** `applies_to`, not inside it: `applies_to` is the shared [path predicate](#path-predicate) that `escalations` and `review_conventions` also consume, and a cadence is not a match criterion.
+
+| Member | Meaning |
+|---|---|
+| `cron` | Required. Five whitespace-separated **numeric** fields: minute `0-59`, hour `0-23`, day-of-month `1-31`, month `1-12`, day-of-week `0-7` (`0` and `7` are both Sunday). Each field is a comma list of `*`, `N`, `A-B`, `*/S` or `A-B/S`. Names (`MON`, `JAN`), macros (`@daily`) and a bare `N/S` are refused. |
+| `timezone` | Optional IANA zone name the cron fields are evaluated in. Absent means `UTC`. `Local` is refused — it means whatever the host is set to. The zone database is embedded in every binary (`time/tzdata`), so the backend and `fishhawk validate` accept the same names regardless of the host's zoneinfo. |
+| `issue` | Optional anchor issue number. When set, every scheduled run is anchored to that issue (`trigger_ref: issue:N` and its issue context), exactly as an `on_demand` run naming the issue is; absent means the run carries no issue anchor. |
+
+**Day rule.** As in Vixie cron, when **both** day-of-month and day-of-week are restricted (neither field begins with `*`), a day matches if **either** matches — `0 0 13 * 5` fires on the 13th *and* on every Friday. When either field begins with `*` (including a stepped `*/S`), both must match — `0 0 */13 * 5` fires only on a Friday that is the 1st, 14th or 27th.
+
+**Windows.** A window is the **latest cron fire time at or before** the scheduler's tick, evaluated in `timezone`. The run's `Idempotency-Key` is `scheduled:<workflow_id>:<window start, UTC RFC3339>`, which the existing `(idempotency_key, repo)` uniqueness makes exactly-once: a second tick, or a restarted fishhawkd, inside the same window replays the existing run instead of minting another. Daylight-saving transitions follow from evaluating real instants: a local time a spring-forward transition skips never occurs and so never fires that day, and a local time a fall-back transition repeats occurs twice and is **two** distinct windows. Only the **latest** window is ever attempted — a scheduler that was down across several fire times, or a schedule newly declared, starts one run for the most recent window, never a backfill.
+
+**A scheduled run is an ordinary run.** It passes every admission control `POST /v0/runs` applies — `applies_to`, the grooming charter requirement, the plan-reviewer capability gate, blocking periodic `budgets` — and a refusal is recorded for that window rather than retried every tick. It then stops at every gate like any other run; nothing about being scheduled widens its autonomy. With `runner_kind: local` a started run parks at `awaiting_host_dispatch` until a host dispatches it — the scheduler does not auto-dispatch.
+
+**Validation.** Beyond the schema's shape, the backend and `fishhawk validate` reject a `schedule`, at `/workflows/<name>/schedule` with one named message per mode, when:
+
+- the workflow's `applies_to.trigger` does not list `scheduled` — including a workflow with no `applies_to` at all, and one whose `applies_to` declares no `trigger` criterion. Every run the scheduler starts carries the `scheduled` trigger form, so a scheduled workflow must opt in to it explicitly; a trigger list that omitted it would have every scheduled run refused at admission. This rule is reported first;
+- `cron` is malformed — the message names the offending field and value;
+- `timezone` is not a known IANA zone name;
+- `cron` can **never** fire because no declared month has a declared day-of-month (`0 0 30 2 *`, `0 0 31 4,6,9,11 *`). This is decided statically, never by searching forward from the current date; `0 0 29 2 *` (leap days only) is valid.
+
+`extends` folds stages only, so a deriving workflow does not inherit its base's `schedule`, matching `applies_to`.
 
 ### Escalations
 
@@ -720,7 +760,7 @@ inputs:
 
 `source` names the external trigger the run is opened against. `required` marks the trigger as mandatory for the stage. `artifact` + `from_stage` wire an earlier stage's output into this one; the input-artifact enum has exactly two members, `plan` and `pull_request`.
 
-`github_issue` is the `source` enum's ISSUE-ANCHORED member — `Run.IsIssueAnchored` (`backend/internal/run/run.go`) keys on it (alongside `on_demand`) — and it is the correct value on EVERY forge, not a GitHub-only literal. A GitLab issue trigger creates the run with `trigger_source: github_issue` (`matchGitLabIssue` in `backend/internal/webhook/dispatcher.go`). There is deliberately NO `gitlab_issue` member: adding one would need a `runs_trigger_source_check` migration and a widening of `IsIssueAnchored`, and it is not required because the existing member is already forge-neutral. Do not infer a `gitlab_issue` member from the widened `grooming-report-v1.schema.json` enum (`github_issue | gitlab_issue | jira_issue`) — that is a DIFFERENT schema for a different surface. See [`docs/deploy/gitlab.md`](../deploy/gitlab.md) § "What is GitHub-only today" for the GitLab issue-input degradation and the supported escape hatch.
+`github_issue` is the `source` enum's ISSUE-ANCHORED member — `Run.IsIssueAnchored` (`backend/internal/run/run.go`) keys on it (alongside `on_demand` and `scheduled`) — and it is the correct value on EVERY forge, not a GitHub-only literal. A GitLab issue trigger creates the run with `trigger_source: github_issue` (`matchGitLabIssue` in `backend/internal/webhook/dispatcher.go`). There is deliberately NO `gitlab_issue` member: adding one would need a `runs_trigger_source_check` migration and a widening of `IsIssueAnchored`, and it is not required because the existing member is already forge-neutral. Do not infer a `gitlab_issue` member from the widened `grooming-report-v1.schema.json` enum (`github_issue | gitlab_issue | jira_issue`) — that is a DIFFERENT schema for a different surface. See [`docs/deploy/gitlab.md`](../deploy/gitlab.md) § "What is GitHub-only today" for the GitLab issue-input degradation and the supported escape hatch.
 
 ### `needs:` shorthand
 
@@ -1093,7 +1133,7 @@ Two independent controls refuse `<non-delegable>: auto`: the explicit branch abo
 
 **A workflow tier and the grooming classes are disjoint sets.** `autonomy: low` expands to `approve` / `fixup` / `waive` / `retry` / `merge` only — it never names a grooming class — so declaring `autonomy: low` **and** an explicit grooming matrix is not an explicit-overrides-tier contradiction, and `hygiene` legitimately resolves to `auto` under it. An escalation's `max_autonomy: low` **ceiling** is a different operation and *does* clamp `hygiene` to `gated`, via the documented extension-class fail-closed arm.
 
-**No grooming class reaches a `may_*` knob.** The derived-OperatorAgent bridge maps only the five run-driving classes, so a `hygiene: {mode: auto}` class derives an **empty** knob block and widens authority at no enforcement site. That is what makes shipping `objective_reversible` before its evaluator exists fail-closed rather than a gap — the same posture `trigger: [scheduled, on_demand]` already ships with, which likewise has no producer today.
+**No grooming class reaches a `may_*` knob.** The derived-OperatorAgent bridge maps only the five run-driving classes, so a `hygiene: {mode: auto}` class derives an **empty** knob block and widens authority at no enforcement site. That is what makes shipping `objective_reversible` before its evaluator exists fail-closed rather than a gap — the posture the non-diff `trigger` forms originally shipped with, declarable before anything produced them. Both now have producers (`scheduled` since the [workflow schedule](#workflow-schedule-schedule), E79.1 / #3725), so `objective_reversible` alone carries that precedent.
 
 ### The tiers
 
@@ -1351,11 +1391,12 @@ The schema enforces structure. Layers above it enforce what JSON Schema cannot e
 - `mode: auto` requires that class's own `when`; `min_severity` is `fixup`-only; an extension class may not be `auto`; a non-delegable backlog-grooming class (`ordering`, `dedup`, `scoping`, `milestone`) may not be `auto`.
 - An `agent_version` range parses as a comparator list.
 - `extends` names a defined workflow and forms no cycle.
+- A workflow's `schedule` requires `applies_to.trigger` to list `scheduled`, a well-formed numeric five-field `cron` that can fire on some calendar date, and a known IANA `timezone` (see [Workflow schedule](#workflow-schedule-schedule)).
 - Every `escalations` entry actually **raises** something (see [Escalations](#escalations)): `count` and `min_permission` must exceed the workflow's least-restrictive baseline, `member_of` may not name a group every approval gate already requires, `require.approvals` needs an approval gate to raise, `max_autonomy` may not leave the resolved matrix identical, and `require.reviewers` must name declared personas, have an agent-reviewing `plan` / `implement` stage to join, and not name a persona every such stage already attaches. A `match.paths` criterion is additionally refused on a workflow that declares no plan stage (E53.16 / #2382), for the same reason `applies_to.paths` is — there is no `scope.files` producer for it to match against, so the escalation could never fire. `fishhawk validate` mirrors all of these except the `max_autonomy` no-op check, which needs the autonomy resolver the CLI deliberately does not carry.
 - Every `review_conventions` entry's `path` is a canonical repo-relative path, and its `applies_to` is a well-formed predicate declaring no `change_kind`. A stage's `reviewers.conventions` is valid only on a `plan` or `implement` stage, names only declared entries, and requires at least one agent reviewer; every declared entry is selected by at least one stage of the resolved document (see [Review conventions](#review-conventions)).
 - Every `reviewer_personas` entry's `remit.path` is a canonical repo-relative path and its `agent.agent_version` (when present) a well-formed range. A stage's `reviewers.personas` is valid only on a `plan` or `implement` stage, names only declared personas, and requires at least one agent reviewer; every declared persona is attached by at least one stage of the resolved document or required by at least one escalation's `require.reviewers` (see [Reviewer personas](#reviewer-personas)).
 
-`fishhawk validate` (the CLI) validates in two tiers. It reports schema errors, the removed-form messages, the reuse-resolution rejections, the workflow/stage semantic sweeps (agent_version, reviewers.authority, applies_to, escalations, review_conventions, reviewer_personas), and — since E52.13 / #2323 — **stage-reference resolution**: duplicate stage ids, the `needs:` shorthand, and `inputs[].from_stage` referent/ordering, reported at the identical paths the backend uses. What remains backend-only is the stage-BINDING class: the ADR-038 type/executor/constraint bindings, the plan `schema: standard_v1` rule, the produces-artifact bindings (deployment / acceptance / grooming_report and the E52.7 post-hoc-constraint↔pull_request rule), and the `max_autonomy` no-op check that needs the autonomy resolver the CLI deliberately does not carry — these surface server-side at run creation.
+`fishhawk validate` (the CLI) validates in two tiers. It reports schema errors, the removed-form messages, the reuse-resolution rejections, the workflow/stage semantic sweeps (agent_version, reviewers.authority, applies_to, schedule, escalations, review_conventions, reviewer_personas), and — since E52.13 / #2323 — **stage-reference resolution**: duplicate stage ids, the `needs:` shorthand, and `inputs[].from_stage` referent/ordering, reported at the identical paths the backend uses. What remains backend-only is the stage-BINDING class: the ADR-038 type/executor/constraint bindings, the plan `schema: standard_v1` rule, the produces-artifact bindings (deployment / acceptance / grooming_report and the E52.7 post-hoc-constraint↔pull_request rule), and the `max_autonomy` no-op check that needs the autonomy resolver the CLI deliberately does not carry — these surface server-side at run creation.
 
 ## Version routing
 

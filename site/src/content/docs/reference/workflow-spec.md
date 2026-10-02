@@ -169,6 +169,7 @@ One test-location convention: a production file whose repo-relative path matches
 | `stages` | array of `stage` | required | minItems: `1` |  |
 | `description` | string | optional |  |  |
 | `applies_to` | `predicate` | optional |  | Optional routing declaration (E53.3 / #2226): the changes this workflow may be used for. It is a $defs/predicate (E53.1 / #2224) — the SAME match rule `escalations` and the review-conventions consume, deliberately not a second matcher. A workflow declaring no `applies_to` accepts any change, which is what keeps every pre-#2226 document unaffected. Enforcement is fail-closed and runs in TWO PHASES, each at the earliest point its criterion has a PRODUCER: `labels` and `trigger` are evaluated at run admission (POST /v0/runs), `paths` at the PLAN GATE against the approved plan's scope.files. `change_kind` is REJECTED inside `applies_to` by the backend and by `fishhawk validate` — no producer emits a change kind, so a workflow declaring it could never be selected, which is indistinguishable from the feature being broken; $defs/predicate itself keeps the criterion for its other consumers. `applies_to` FILTERS an operator-named workflow_id, it never selects one, so two workflows with overlapping predicates is benign rather than a coin flip. BOTH ENFORCEMENT POINTS ARE LIVE: a run whose issue labels or trigger do not satisfy the declaration is refused at POST /v0/runs, and a plan whose scope.files reaches outside a declared `paths` is refused at the plan gate. The sanctioned exception is the audited `applies_to_override` (a reason is REQUIRED), which carries forward to the plan gate from its run-scoped audit entry. See docs/spec/workflow-v2.md § 'Workflow routing (applies_to)'. |
+| `schedule` | `schedule` | optional |  |  |
 | `on_ci_failure` | `on_ci_failure` | optional |  |  |
 | `policy` | `policy` | optional |  |  |
 | `auto_advance` | boolean | optional |  | Opt-in auto-advance mode (#1023 / #996 theme 1; renamed from v0/v1's `drive` by E52.6 / #2218): when true, fishhawkd auto-advances the run's mechanical transitions (plan-approved dispatch, review-verdict settlement, fixup re-park, checks-green awaiting_merge) and records a run_auto_advanced audit entry per advance. Judgment points (gate approvals, concern routing, merge) always park. Default false preserves operator-driven advancement. Overridable per-run via POST /v0/runs `drive`. This is a SPEC-SURFACE rename only — the semantics are byte-identical to v0/v1's `drive`, which spelling v0 and v1 keep unchanged; the parser rewrites `auto_advance` to the `drive` key before the typed decode, so the Go field, the runs.drive column, the per-run API override and every read site are untouched. A v2 document declaring `drive` is rejected with a message naming `auto_advance`. |
@@ -179,6 +180,16 @@ One test-location convention: a production file whose repo-relative path matches
 | `escalations` | array of `escalation` | optional | minItems: `1` | Per-path escalation rules (E53.4 / #2227): each entry RAISES the requirements that apply to a change matching its predicate. An escalation may only ever raise — a declared value that does not exceed the workflow's baseline, or that composes to the baseline unchanged, is a VALIDATION ERROR rather than a silently accepted no-op, so an operator reading the block can trust that every entry does something. When several entries match one change the composition is the STRICTEST per dimension and therefore ORDER-INDEPENDENT (max count, sorted de-duplicated UNION of member_of as a conjunction, strictest min_permission, lowest max_autonomy) — never last-match-wins. `max_autonomy` is a CEILING on AGENT autonomy (equivalently a floor on human involvement), applied LAST over the fully resolved action matrix, after the workflow tier and after every explicit `actions` override, so an explicit `actions: {merge: {mode: auto}}` cannot re-widen past it. NOT inherited through `extends` (which folds stages only), matching `applies_to`. See docs/spec/workflow-v2.md § 'Escalations'. |
 | `extends` | string | optional | pattern: `^[a-z][a-z0-9_]*$` | SAME-DOCUMENT inheritance (E52.4 / #2216): names another workflow key in this document as this workflow's base. The base's resolved stages are inherited in their declared ORDER; a stage this workflow declares with a matching `id` merges onto the base stage IN THE BASE'S POSITION, and a stage with a new id is appended in declaration order (reordering is deliberately not expressible). Chains resolve transitively. An `extends` naming a workflow this document does not define, and an `extends` cycle (including a self-reference), are both rejected before schema validation with a message naming the offender. Resolution runs BEFORE schema validation, so a deriving workflow may omit `stages` entirely and still satisfy this definition's required list. Cross-FILE inclusion (`include:`) is deliberately out of scope (ADR-067). |
 | `defaults` | object | optional |  | WORKFLOW-LEVEL reuse defaults (E52.4 / #2216): the rung ABOVE the extends base and BELOW this workflow's own stage declarations — file defaults -> extends base -> workflow defaults -> the stage's own declaration. A workflow-level default therefore OVERRIDES a value an inherited base stage declared explicitly, which is what makes "extend the base but swap the agent everywhere" expressible; a stage declared on THIS workflow still wins over it. Same merge semantics as the file-level block: `executor` and `budget` merge KEY-WISE, `reviewers` is taken WHOLE from exactly one rung and never blended (it determines review AUTHORITY), and arrays REPLACE wholesale. |
+
+##### `schedule`
+
+Optional workflow-level cadence (E79.1 / #3725): when fishhawkd's scheduler is enabled (--enable-scheduler, OFF by default) and lists this repository, it starts exactly one run of this workflow per due WINDOW, with trigger_source `scheduled`. A window is the latest cron fire time at or before the scheduler's tick, evaluated in `timezone`; the run's Idempotency-Key is `scheduled:<workflow_id>:<window start UTC RFC3339>`, so a double tick or a restart inside one window replays the existing run instead of minting a second. Only the LATEST window is ever attempted — no backfill after downtime. A scheduled run passes every admission control a POST /v0/runs does (applies_to, charter, plan-reviewer capability, blocking periodic budgets) and stops at every gate; with runner_kind local it parks at awaiting_host_dispatch until a host dispatches it. Declared BESIDE `applies_to`, not inside it: applies_to is the shared $defs/predicate (also consumed by escalations and review_conventions) and a cadence is not a match criterion. Rejected by the backend and by `fishhawk validate`, beyond this shape, when the workflow's `applies_to.trigger` does not list `scheduled` (the run would be refused at admission every window), when `cron` is malformed, when `timezone` is not a known IANA zone, or when `cron` can never fire (e.g. `0 0 30 2 *`). See docs/spec/workflow-v2.md § 'Workflow schedule'.
+
+| Field | Type | Required | Constraints | Description |
+|---|---|---|---|---|
+| `cron` | string | required | minLength: `1` | Five whitespace-separated NUMERIC fields: minute (0-59), hour (0-23), day-of-month (1-31), month (1-12), day-of-week (0-7, 0 and 7 both Sunday). Each field accepts `*`, `N`, `A-B`, comma lists, `*/S` and `A-B/S`. Names (MON, JAN) and macros (@daily) are refused. Vixie semantics: when BOTH day-of-month and day-of-week are restricted, a day matches if EITHER matches. |
+| `timezone` | string | optional | minLength: `1` | IANA time zone name (e.g. America/Chicago) the cron fields are evaluated in. Absent means UTC. The zone database is embedded in every binary (time/tzdata), so validation and evaluation do not depend on the host's zoneinfo. |
+| `issue` | integer | optional | min: `1` | Optional anchor issue number. When set, each scheduled run is anchored to issue N (trigger_ref `issue:N` plus its issue context), exactly as an on_demand run naming that issue is; absent means the run carries no issue anchor. |
 
 ##### `decomposition`
 
@@ -876,6 +887,10 @@ Shape deltas only — a field whose description changed but whose type, required
 | `/$defs/reviewers_config/properties/personas` | added | new at the newer major |
 | `/$defs/role` | removed | present in the older major, absent at the newer |
 | `/$defs/role/properties/members` | removed | present in the older major, absent at the newer |
+| `/$defs/schedule` | added | new at the newer major |
+| `/$defs/schedule/properties/cron` | added | new at the newer major |
+| `/$defs/schedule/properties/issue` | added | new at the newer major |
+| `/$defs/schedule/properties/timezone` | added | new at the newer major |
 | `/$defs/stage/properties/constraints` | changed | type "array of `constraint`"→"`constraint`" |
 | `/$defs/stage/properties/needs` | added | new at the newer major |
 | `/$defs/stage/properties/permissions` | added | new at the newer major |
@@ -892,6 +907,7 @@ Shape deltas only — a field whose description changed but whose type, required
 | `/$defs/workflow/properties/escalations` | added | new at the newer major |
 | `/$defs/workflow/properties/extends` | added | new at the newer major |
 | `/$defs/workflow/properties/operator_agent` | removed | present in the older major, absent at the newer |
+| `/$defs/workflow/properties/schedule` | added | new at the newer major |
 | `/properties/defaults` | added | new at the newer major |
 | `/properties/review_conventions` | added | new at the newer major |
 | `/properties/reviewer_personas` | added | new at the newer major |
@@ -974,6 +990,10 @@ Shape deltas only — a field whose description changed but whose type, required
 | `/$defs/reviewers_config/properties/review_timeout` | added | new at the newer major |
 | `/$defs/role` | removed | present in the older major, absent at the newer |
 | `/$defs/role/properties/members` | removed | present in the older major, absent at the newer |
+| `/$defs/schedule` | added | new at the newer major |
+| `/$defs/schedule/properties/cron` | added | new at the newer major |
+| `/$defs/schedule/properties/issue` | added | new at the newer major |
+| `/$defs/schedule/properties/timezone` | added | new at the newer major |
 | `/$defs/stage/properties/constraints` | changed | type "array of `constraint`"→"`constraint`" |
 | `/$defs/stage/properties/egress` | added | new at the newer major |
 | `/$defs/stage/properties/needs` | added | new at the newer major |
@@ -994,6 +1014,7 @@ Shape deltas only — a field whose description changed but whose type, required
 | `/$defs/workflow/properties/escalations` | added | new at the newer major |
 | `/$defs/workflow/properties/extends` | added | new at the newer major |
 | `/$defs/workflow/properties/operator_agent` | removed | present in the older major, absent at the newer |
+| `/$defs/workflow/properties/schedule` | added | new at the newer major |
 | `/properties/defaults` | added | new at the newer major |
 | `/properties/review_conventions` | added | new at the newer major |
 | `/properties/reviewer_personas` | added | new at the newer major |
