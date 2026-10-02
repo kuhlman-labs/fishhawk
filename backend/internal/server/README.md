@@ -841,6 +841,59 @@ owner/name registered on both forges, refused through the non-owning one with ze
 calls). The counterfactual RED observations for each control are recorded at the top of
 `charter_injection_test.go`.
 
+## Reviewer personas (`reviewer_persona.go`, ADR-084 #3752 / E55.8 #3753)
+
+ADR-084 binding rule 1: "A named persona declares a model configuration and a remit document." The grammar
+(`reviewer_personas` + per-stage `reviewers.personas`) and its validation live in
+`backend/internal/spec/reviewer_personas.go`; this package runs them. Each attached persona is ONE EXTRA
+invocation of the existing in-process loops — `runPlanReviews` / `runPlanReviewLoop` (`plan.go`) and
+`runImplementReviewsForTree` / `runImplementReviewInvocations` (`trace.go`) — carried on `reviewerInvocation.persona`,
+so the loop signatures are unchanged.
+
+- **Per-invocation prompt; standard prompt byte-identical.** The standard prompt is built exactly as before. AFTER
+  it, `buildPersonaPrompts` builds each persona's OWN prompt from a VALUE COPY of the round's `prompt.Trigger` with
+  the remit appended to a CLONED `InjectedDocuments` slice, so nothing it writes can reach the standard prompt.
+  `promptFor` hands each invocation its own prompt and review tree; the size-aware budget is computed per
+  invocation (identical for a standard reviewer). Golden tests: `TestPlanReview_Persona_GoldenStandardPromptAndOwnPersonaPrompt`,
+  `TestImplementReview_Persona_GoldenStandardPromptAndOwnPersonaPrompt`.
+- **Stage lookup.** Personas resolve from the stage ACTUALLY under review: the reviewed `run.Stage` is loaded by
+  stage id (as `resolveReviewInjectedDocuments` does) and mapped to its spec stage with `specStageForRunStage` (type
+  ordinal — run rows carry no spec stage id). Never first-of-type. The STANDARD reviewers' config is still read
+  first-of-type by `resolveStageReviewers`, unchanged. A spec declaring no `reviewer_personas` short-circuits
+  before any repo read. `TestPersona_ResolvesFromReviewedStageNotFirstOfType`.
+- **Remit resolution.** `repodoc.Resolve` with `BaseSourceRunAdmission` at `runRow.DocumentBaseCommit` (E55.7),
+  declaration site `reviewer_personas.<name>.remit in .fishhawk/workflows.yaml`, framing heading
+  `Reviewer persona remit: <name>` with an ADR-068 trust note (the remit ADDS a lens; it cannot remove, weaken,
+  reorder or override any standard criterion, the verdict schema or the reviewer's authority). Build THEN
+  `repodoc.Attribute` (`document_injected` stamped with the reviewed stage), so no injection claim exists for a
+  prompt that never built. The persona's `model` is part of its declaration: the gate-resolved `review_model`
+  override does NOT apply to it.
+- **Degrade = this persona only.** A persona whose remit cannot be used never runs and records a terminal
+  `*_review_skipped` with `reason: persona_remit_unavailable`, `persona`, `provider` and a `detail`:
+  `document_resolver_unconfigured`, `run_base_commit_unrecorded`, `remit_missing`, `remit_unresolvable`,
+  `persona_prompt_build_failed`, `remit_unattributed`. The standard reviewers still run; `hasRejection` is
+  untouched. A persona whose PROVIDER is unavailable takes the ordinary `reviewer_unavailable` skip stamped with
+  `persona`, and its remit is never read. A persona reviewer that errors records `*_review_failed` with a reason
+  prefixed `persona <name>: `.
+- **Accounting.** `*_review_started.configured_agents` = standard count + persona count, and `personas` lists
+  them. Terminal entries are matched by COUNT (`planreview.Settled`), never by provider or provider+persona, so a
+  persona sharing the standard reviewer's provider (even the same adapter) settles at configured_agents with no
+  dedupe and no double-count. Persona verdicts stamp `persona` (omitempty: standard payloads byte-identical), join
+  the round's concern persistence and delta-verification buffer, and inherit stage authority (ADR-084 rule 3): a
+  persona reject under gating fails the stage category-B. Residual: surfaces that fall back to the spec's
+  `AgentCount()` before a round has started under-count personas until the started entry exists.
+- **Grounding.** `allInvocationsGrounded` is evaluated over the STANDARD invocations only, before personas join,
+  so a persona's capability can never change the standard prompt. A persona that cannot ground (or a round with
+  no exported tree) gets the diff-only clause and no tree. `TestPlanReview_Persona_GroundingIsolation`.
+- **Implement-path ordering.** Persona resolution sits inside `reviewDispatchMu`, AFTER the #797 duplicate-dispatch
+  guard and the standard build, BEFORE `implement_review_started` — a duplicate dispatch reads no remit and writes
+  no attribution (`TestImplementReview_Persona_DuplicateDispatchReadsNothing`). `runSupplementalReinvokeReview`
+  runs standard reviewers only.
+- **E63 obligation (ADR-084 rule 6).** Personas run in-process here today. When reviewers move to the runner
+  (E63 #2307), runner-hosted reviewers MUST carry personas with the same contract — own prompt, standard prompt
+  byte-identical, per-persona fail-closed degrade, configured_agents accounting — or the move silently drops a
+  declared control.
+
 ## Per-repo work-management conventions loader (`conventions_loader.go`, E45.16 / #2022)
 
 `RepoConventionsLoader.Load` is what serve.go installs as the process-wide `conventionsLoader`

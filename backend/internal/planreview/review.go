@@ -439,14 +439,26 @@ const ReasonReviewerNotConfigured = "reviewer_not_configured"
 // lacks the capability, not because the invocation failed.
 const ReasonReviewerUnavailable = "reviewer_unavailable"
 
+// ReasonPersonaRemitUnavailable is the ReviewSkippedPayload.Reason for a
+// reviewer PERSONA (ADR-084 / E55.8 / #3753) whose remit document could not be
+// resolved, rendered or attributed: the persona FAILS CLOSED for itself only —
+// it never runs on a remit-less prompt — while the stage's standard reviewers
+// still run. ReviewSkippedPayload.Detail names which step failed. It is a skip
+// REASON value on the existing *_review_skipped categories, not a new audit
+// category.
+const ReasonPersonaRemitUnavailable = "persona_remit_unavailable"
+
 // ReviewSkippedPayload is the JSON payload stored in an audit
 // entry with category "plan_review_skipped" / "implement_review_skipped"
 // (#574). It records that an agent review the spec requested did not run.
-// Two degradation reasons share this payload:
+// Three degradation reasons share this payload:
 //   - ReasonReviewerNotConfigured: no reviewer backend wired at all (#574).
 //   - ReasonReviewerUnavailable: this specific spec-declared reviewer's
 //     provider is unavailable on the deployment — the capability-gate
 //     degradation honoring the per-reviewer optional flag (#1495).
+//   - ReasonPersonaRemitUnavailable: a reviewer persona's remit document could
+//     not be resolved or attributed, so that persona alone did not run
+//     (ADR-084 / #3753); Persona and Detail name it and the failed step.
 //
 // Authority captures whether the skip degraded a gating or advisory gate;
 // in advisory mode the human gate remains authoritative.
@@ -466,6 +478,20 @@ type ReviewSkippedPayload struct {
 	// loud surface (the deployment SHOULD have run it). omitempty keeps
 	// optional:false (the common case) and pre-#1495 payloads byte-identical.
 	Optional bool `json:"optional,omitempty"`
+
+	// Persona names the reviewer persona (ADR-084 / E55.8 / #3753) this skip
+	// belongs to — set on a ReasonPersonaRemitUnavailable skip and on a
+	// ReasonReviewerUnavailable skip of a persona whose provider is
+	// unavailable. Empty for every standard reviewer; omitempty keeps those
+	// payloads byte-identical to pre-#3753 entries.
+	Persona string `json:"persona,omitempty"`
+
+	// Detail is the machine-readable step a ReasonPersonaRemitUnavailable skip
+	// failed at (e.g. remit_missing, run_base_commit_unrecorded,
+	// document_resolver_unconfigured, remit_unresolvable,
+	// persona_prompt_build_failed, remit_unattributed). Empty on every other
+	// skip; omitempty keeps those payloads byte-identical.
+	Detail string `json:"detail,omitempty"`
 }
 
 // ReviewStartedPayload is the JSON payload stored in an audit entry with
@@ -481,6 +507,14 @@ type ReviewSkippedPayload struct {
 type ReviewStartedPayload struct {
 	ConfiguredAgents int           `json:"configured_agents"`
 	Authority        AuthorityMode `json:"authority"`
+
+	// Personas lists, in attachment order, the reviewer personas (ADR-084 /
+	// E55.8 / #3753) counted in ConfiguredAgents: each persona is one extra
+	// reviewer invocation that produces exactly one terminal entry (verdict,
+	// failed or skipped), so the round settles at ConfiguredAgents terminal
+	// entries. Empty when the reviewed stage attaches no persona; omitempty
+	// keeps those payloads byte-identical to pre-#3753 entries.
+	Personas []string `json:"personas,omitempty"`
 
 	// HeadSHA is the implement-review idempotency key (#797): the bundle's
 	// verify_run committed-tree head_sha, recorded on the
@@ -585,6 +619,11 @@ type PlanReviewedPayload struct {
 	// mirroring the InputTokens/OutputTokens additive-field posture above.
 	ReviewerVersion string `json:"reviewer_version,omitempty"`
 	ReviewerBinary  string `json:"reviewer_binary,omitempty"`
+
+	// Persona names the reviewer persona (ADR-084 / E55.8 / #3753) that
+	// produced this verdict. Empty for a standard reviewer; omitempty keeps
+	// every standard-reviewer payload byte-identical to pre-#3753 entries.
+	Persona string `json:"persona,omitempty"`
 }
 
 // ImplementReviewedPayload is the JSON payload stored in an audit entry
@@ -681,6 +720,11 @@ type ImplementReviewedPayload struct {
 	// that dedups a retried PR-upload. Empty on every non-supplemental
 	// review; omitempty keeps those payloads byte-identical.
 	HeadSHA string `json:"head_sha,omitempty"`
+
+	// Persona names the reviewer persona (ADR-084 / E55.8 / #3753) that
+	// produced this verdict. Empty for a standard reviewer; omitempty keeps
+	// every standard-reviewer payload byte-identical to pre-#3753 entries.
+	Persona string `json:"persona,omitempty"`
 }
 
 // OriginBaseRebaseReinvoke is the ImplementReviewedPayload.Origin marker
