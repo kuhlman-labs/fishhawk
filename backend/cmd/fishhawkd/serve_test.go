@@ -57,6 +57,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/repodoc"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/reviewresolver"
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/scheduler"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/tracestore"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
@@ -6170,4 +6171,453 @@ func TestDivergenceConfigFromEnv_MalformedFailsClosed(t *testing.T) {
 	if !errors.Is(err, precedent.ErrUnknownDivergenceClass) {
 		t.Fatalf("unknown class: err = %v, want ErrUnknownDivergenceClass", err)
 	}
+}
+
+// TestSchedulerStartDecision is the scheduler's fail-closed switch (E79.1 /
+// #3725, approval condition 7): flag-off is a SILENT skip that builds nothing,
+// and an enabled scheduler missing any dependency is a logged skip naming it,
+// never a ticker that no-ops every tick. One case per refusal branch.
+func TestSchedulerStartDecision(t *testing.T) {
+	wired := server.Config{
+		RunRepo:   runpkg.BaseFake{},
+		AuditRepo: audit.BaseFake{},
+		GitHub:    &githubclient.Client{},
+	}
+	repos := []string{"kuhlman-labs/fishhawk"}
+
+	if start, reason := schedulerStartDecision(false, wired, repos); start || reason != "" {
+		t.Fatalf("flag-off: start=%v reason=%q; want false + empty (the scheduler is OFF by default)", start, reason)
+	}
+	if start, reason := schedulerStartDecision(true, wired, repos); !start || reason != "" {
+		t.Fatalf("wired: start=%v reason=%q; want true + empty", start, reason)
+	}
+
+	noRunRepo := wired
+	noRunRepo.RunRepo = nil
+	noAuditRepo := wired
+	noAuditRepo.AuditRepo = nil
+	noGitHub := wired
+	noGitHub.GitHub = nil
+	for _, tc := range []struct {
+		name  string
+		cfg   server.Config
+		repos []string
+		want  string
+	}{
+		{"missing run repo", noRunRepo, repos, "RunRepo or AuditRepo"},
+		{"missing audit repo", noAuditRepo, repos, "RunRepo or AuditRepo"},
+		{"missing github", noGitHub, repos, "GitHub client"},
+		{"no repos", wired, nil, "--scheduler-repos"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			start, reason := schedulerStartDecision(true, tc.cfg, tc.repos)
+			if start {
+				t.Fatalf("start = true; want a fail-closed skip")
+			}
+			if !strings.Contains(reason, tc.want) || !strings.Contains(reason, "scheduler not started") {
+				t.Errorf("reason = %q; want it to name %q and say the scheduler was not started", reason, tc.want)
+			}
+		})
+	}
+}
+
+func TestValidateSchedulerRunnerKind(t *testing.T) {
+	for _, ok := range []string{runpkg.RunnerKindGitHubActions, runpkg.RunnerKindLocal} {
+		if err := validateSchedulerRunnerKind(ok); err != nil {
+			t.Errorf("validateSchedulerRunnerKind(%q) = %v, want nil", ok, err)
+		}
+	}
+	for _, bad := range []string{"", "Local", "kubernetes"} {
+		err := validateSchedulerRunnerKind(bad)
+		if err == nil {
+			t.Errorf("validateSchedulerRunnerKind(%q) = nil, want a refusal", bad)
+			continue
+		}
+		if !strings.Contains(err.Error(), "github_actions") || !strings.Contains(err.Error(), "local") {
+			t.Errorf("refusal %q must name the accepted set", err)
+		}
+	}
+}
+
+func TestParseSchedulerRepos(t *testing.T) {
+	got, err := parseSchedulerRepos(" kuhlman-labs/fishhawk, ,acme/widgets,kuhlman-labs/fishhawk ")
+	if err != nil {
+		t.Fatalf("parseSchedulerRepos: %v", err)
+	}
+	if want := []string{"kuhlman-labs/fishhawk", "acme/widgets"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("repos = %v, want %v (trimmed, empties dropped, first occurrence wins)", got, want)
+	}
+	if got, err := parseSchedulerRepos(""); err != nil || len(got) != 0 {
+		t.Errorf("empty input = %v, %v; want no repos and no error", got, err)
+	}
+	for _, bad := range []string{"fishhawk", "/fishhawk", "kuhlman-labs/", "a/b/c", "ok/repo,broken"} {
+		if _, err := parseSchedulerRepos(bad); err == nil {
+			t.Errorf("parseSchedulerRepos(%q) = nil error, want a refusal", bad)
+		}
+	}
+}
+
+// TestRunServe_SchedulerFlagsFailStartup binds the validators above to the
+// REAL runServe flag set: an invalid --scheduler-runner-kind or
+// --scheduler-repos must fail startup with its named log line. The self-pair
+// is a VALID value of each, which must get past the scheduler checks and fail
+// on the deliberately invalid --operator-min-permission validated next — so
+// the refusal is the validator's, not a parse error, and runServe returns
+// before dialing a database.
+func TestRunServe_SchedulerFlagsFailStartup(t *testing.T) {
+	run := func(args ...string) string {
+		var sink bytes.Buffer
+		if code := runServe(args, &sink); code == 0 {
+			t.Fatalf("runServe(%v) = 0, want non-zero; output: %s", args, sink.String())
+		}
+		return sink.String()
+	}
+
+	// Every invocation also carries the invalid --operator-min-permission
+	// backstop, so a deleted scheduler check fails on THAT line (and the
+	// assertion goes RED) instead of runServe booting a real server.
+	if out := run("--scheduler-runner-kind", "kubernetes", "--operator-min-permission", "not-a-permission"); !strings.Contains(out, "invalid --scheduler-runner-kind") {
+		t.Errorf("an unknown runner kind must fail startup naming the flag; output: %s", out)
+	}
+	if out := run("--scheduler-repos", "not-a-repo", "--operator-min-permission", "not-a-permission"); !strings.Contains(out, "invalid --scheduler-repos") {
+		t.Errorf("a malformed repo must fail startup naming the flag; output: %s", out)
+	}
+
+	valid := run("--enable-scheduler", "--scheduler-runner-kind", "local", "--scheduler-repos", "kuhlman-labs/fishhawk",
+		"--scheduler-interval", "30s", "--operator-min-permission", "not-a-permission")
+	if strings.Contains(valid, "invalid --scheduler") || strings.Contains(valid, "not defined") {
+		t.Errorf("valid scheduler flags were refused; output: %s", valid)
+	}
+	if !strings.Contains(valid, "invalid --operator-min-permission") {
+		t.Errorf("expected the post-scheduler-check failure, meaning the scheduler flags parsed and validated; output: %s", valid)
+	}
+}
+
+// fakeScheduleSpecFetcher records the GitHub calls githubScheduleSpecSource
+// makes and serves canned results.
+type fakeScheduleSpecFetcher struct {
+	instID     int64
+	instErr    error
+	fc         *githubclient.FileContent
+	specErr    error
+	gotRepo    forge.RepoRef
+	gotScope   forge.CredentialScope
+	gotRef     string
+	specCalled bool
+}
+
+func (f *fakeScheduleSpecFetcher) GetRepoInstallation(_ context.Context, repo forge.RepoRef) (int64, error) {
+	f.gotRepo = repo
+	return f.instID, f.instErr
+}
+
+func (f *fakeScheduleSpecFetcher) GetWorkflowSpec(_ context.Context, scope forge.CredentialScope, repo forge.RepoRef, ref string) (*githubclient.FileContent, error) {
+	f.specCalled = true
+	f.gotScope, f.gotRef = scope, ref
+	return f.fc, f.specErr
+}
+
+func TestGitHubScheduleSpecSource(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("fetches at the default branch under the repo's installation", func(t *testing.T) {
+		f := &fakeScheduleSpecFetcher{instID: 42, fc: &githubclient.FileContent{Content: []byte("version: \"2\""), SHA: "blob123"}}
+		content, sha, err := githubScheduleSpecSource{gh: f}.FetchSpec(ctx, "kuhlman-labs/fishhawk")
+		if err != nil {
+			t.Fatalf("FetchSpec: %v", err)
+		}
+		if string(content) != "version: \"2\"" || sha != "blob123" {
+			t.Errorf("FetchSpec = %q, %q; want the fetched content and blob SHA", content, sha)
+		}
+		if f.gotRepo != (forge.RepoRef{Owner: "kuhlman-labs", Name: "fishhawk"}) {
+			t.Errorf("installation looked up for %+v", f.gotRepo)
+		}
+		if f.gotRef != "" {
+			t.Errorf("spec ref = %q, want \"\" (the default branch)", f.gotRef)
+		}
+		if f.gotScope != forge.FromGitHubInstallationID(42) {
+			t.Errorf("spec scope = %q, want the installation's scope", f.gotScope.Ref())
+		}
+	})
+
+	t.Run("installation error", func(t *testing.T) {
+		f := &fakeScheduleSpecFetcher{instErr: forge.ErrNotInstalled}
+		_, _, err := githubScheduleSpecSource{gh: f}.FetchSpec(ctx, "kuhlman-labs/fishhawk")
+		if !errors.Is(err, forge.ErrNotInstalled) || !strings.Contains(err.Error(), "resolve installation") {
+			t.Errorf("err = %v; want the wrapped installation error", err)
+		}
+		if f.specCalled {
+			t.Error("spec fetched despite the installation failure")
+		}
+	})
+
+	t.Run("spec fetch error", func(t *testing.T) {
+		f := &fakeScheduleSpecFetcher{instID: 42, specErr: forge.ErrNotFound}
+		_, _, err := githubScheduleSpecSource{gh: f}.FetchSpec(ctx, "kuhlman-labs/fishhawk")
+		if !errors.Is(err, forge.ErrNotFound) || !strings.Contains(err.Error(), "fetch workflow spec") {
+			t.Errorf("err = %v; want the wrapped spec-fetch error", err)
+		}
+	})
+
+	t.Run("nil content is an error, not a panic", func(t *testing.T) {
+		f := &fakeScheduleSpecFetcher{instID: 42}
+		if _, _, err := (githubScheduleSpecSource{gh: f}).FetchSpec(ctx, "kuhlman-labs/fishhawk"); err == nil || !strings.Contains(err.Error(), "no content") {
+			t.Errorf("err = %v; want a no-content error", err)
+		}
+	})
+
+	t.Run("malformed repo", func(t *testing.T) {
+		f := &fakeScheduleSpecFetcher{instID: 42}
+		if _, _, err := (githubScheduleSpecSource{gh: f}).FetchSpec(ctx, "fishhawk"); err == nil || !strings.Contains(err.Error(), "owner/name") {
+			t.Errorf("err = %v; want an owner/name refusal", err)
+		}
+		if f.gotRepo != (forge.RepoRef{}) {
+			t.Error("a malformed repo reached the GitHub client")
+		}
+	})
+}
+
+// TestScheduledRunStarter_MapsOutcomes pins the adapter between the scheduler
+// and Server.StartScheduledRun: every StartRequest field reaches
+// ScheduledRunParams, each server kind maps to its scheduler kind, an error
+// passes through (the scheduler's transient path), and an unrecognized kind is
+// an ERROR rather than a guessed definitive outcome.
+func TestScheduledRunStarter_MapsOutcomes(t *testing.T) {
+	runID := uuid.New()
+	req := scheduler.StartRequest{
+		Repo: "kuhlman-labs/fishhawk", WorkflowID: "upkeep", WorkflowSHA: "blob",
+		WorkflowSpec: []byte("spec"), IdempotencyKey: "scheduled:upkeep:2026-10-02T09:00:00Z",
+		IssueNumber: 3112, RunnerKind: runpkg.RunnerKindLocal,
+	}
+	starterReturning := func(out server.ScheduledStartOutcome, err error, got *server.ScheduledRunParams) scheduledRunStarter {
+		return scheduledRunStarter{start: func(_ context.Context, p server.ScheduledRunParams) (server.ScheduledStartOutcome, error) {
+			if got != nil {
+				*got = p
+			}
+			return out, err
+		}}
+	}
+
+	var gotParams server.ScheduledRunParams
+	out, err := starterReturning(server.ScheduledStartOutcome{Kind: server.ScheduledStartStarted, RunID: runID, Status: 201}, nil, &gotParams).
+		StartScheduledRun(context.Background(), req)
+	if err != nil || out.Kind != scheduler.OutcomeStarted || out.RunID != runID.String() {
+		t.Fatalf("started: out=%+v err=%v; want started with the run id", out, err)
+	}
+	wantParams := server.ScheduledRunParams{
+		Repo: req.Repo, WorkflowID: req.WorkflowID, WorkflowSHA: req.WorkflowSHA, WorkflowSpec: req.WorkflowSpec,
+		IdempotencyKey: req.IdempotencyKey, IssueNumber: req.IssueNumber, RunnerKind: req.RunnerKind,
+	}
+	if !reflect.DeepEqual(gotParams, wantParams) {
+		t.Errorf("params = %+v, want %+v", gotParams, wantParams)
+	}
+
+	out, err = starterReturning(server.ScheduledStartOutcome{Kind: server.ScheduledStartAlreadyStarted, RunID: runID, Status: 200}, nil, nil).
+		StartScheduledRun(context.Background(), req)
+	if err != nil || out.Kind != scheduler.OutcomeAlreadyStarted || out.RunID != runID.String() {
+		t.Errorf("already_started: out=%+v err=%v", out, err)
+	}
+
+	out, err = starterReturning(server.ScheduledStartOutcome{Kind: server.ScheduledStartRefused, Status: 402, Code: "budget_exhausted", Message: "over"}, nil, nil).
+		StartScheduledRun(context.Background(), req)
+	if err != nil || out.Kind != scheduler.OutcomeRefused || out.Code != "budget_exhausted" || out.Message != "over" || out.Status != 402 || out.RunID != "" {
+		t.Errorf("refused: out=%+v err=%v; want code/message/status carried verbatim and no run id", out, err)
+	}
+
+	transient := errors.New("transient status 503")
+	if _, err := starterReturning(server.ScheduledStartOutcome{}, transient, nil).StartScheduledRun(context.Background(), req); !errors.Is(err, transient) {
+		t.Errorf("error passthrough = %v, want %v", err, transient)
+	}
+
+	if out, err := starterReturning(server.ScheduledStartOutcome{Kind: "mystery", Status: 299}, nil, nil).StartScheduledRun(context.Background(), req); err == nil || !strings.Contains(err.Error(), "mystery") {
+		t.Errorf("unknown kind: out=%+v err=%v; want an error naming the kind", out, err)
+	}
+}
+
+// recordingSchedulerAudit records the scheduler's global-chain appends for
+// the snapshot adapter test (BaseFake supplies the rest of audit.Repository).
+type recordingSchedulerAudit struct {
+	audit.BaseFake
+	mu         sync.Mutex
+	categories []string
+}
+
+func (r *recordingSchedulerAudit) AppendGlobalChained(_ context.Context, p audit.GlobalChainAppendParams) (*audit.Entry, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.categories = append(r.categories, p.Category)
+	return &audit.Entry{}, nil
+}
+
+type staticScheduleSpecs struct{ content string }
+
+func (s staticScheduleSpecs) FetchSpec(context.Context, string) ([]byte, string, error) {
+	return []byte(s.content), "blob", nil
+}
+
+const serveScheduledSpec = `version: "2"
+workflows:
+  upkeep:
+    applies_to:
+      trigger:
+        - scheduled
+    schedule:
+      cron: "0 9 * * *"
+      timezone: America/Chicago
+      issue: 3112
+    stages:
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+`
+
+// TestSchedulerSnapshotSource maps a REAL ticker's snapshot onto the
+// server.ScheduleSource shape behind GET /v0/schedules: a scanned repository
+// carries its tick time and each schedule's window, next due time and last
+// outcome; an unscanned repository is ok=false but still reports the
+// deployment-level runner kind (so the local dispatch note renders).
+func TestSchedulerSnapshotSource(t *testing.T) {
+	runID := uuid.New()
+	now := time.Date(2026, 10, 2, 15, 30, 0, 0, time.UTC) // 10:30 in Chicago
+	tk := newScheduler(server.Config{AuditRepo: &recordingSchedulerAudit{}, GitHub: &githubclient.Client{}},
+		func(context.Context, server.ScheduledRunParams) (server.ScheduledStartOutcome, error) {
+			return server.ScheduledStartOutcome{Kind: server.ScheduledStartStarted, RunID: runID, Status: 201}, nil
+		}, slog.Default(), time.Minute, []string{"kuhlman-labs/fishhawk"}, runpkg.RunnerKindLocal)
+	tk.Specs = staticScheduleSpecs{content: serveScheduledSpec}
+	tk.Now = func() time.Time { return now }
+	tk.Tick(context.Background())
+
+	src := schedulerSnapshotSource{ticker: tk}
+	snap, ok := src.ScheduleSnapshot("kuhlman-labs/fishhawk")
+	if !ok {
+		t.Fatal("configured repo reported ok=false")
+	}
+	if snap.RunnerKind != runpkg.RunnerKindLocal || !snap.LastTickAt.Equal(now) || snap.SpecError != "" {
+		t.Errorf("snapshot header = %+v", snap)
+	}
+	if len(snap.Schedules) != 1 {
+		t.Fatalf("schedules = %+v, want one", snap.Schedules)
+	}
+	e := snap.Schedules[0]
+	wantWindow := time.Date(2026, 10, 2, 14, 0, 0, 0, time.UTC) // 09:00 CDT
+	wantNext := time.Date(2026, 10, 3, 14, 0, 0, 0, time.UTC)
+	if e.WorkflowID != "upkeep" || e.Cron != "0 9 * * *" || e.Timezone != "America/Chicago" || e.Issue != 3112 {
+		t.Errorf("entry = %+v", e)
+	}
+	if !e.CurrentWindowStart.Equal(wantWindow) || !e.NextDueAt.Equal(wantNext) {
+		t.Errorf("window = %v next = %v; want %v / %v", e.CurrentWindowStart, e.NextDueAt, wantWindow, wantNext)
+	}
+	if e.LastOutcome == nil || e.LastOutcome.Kind != server.ScheduleOutcomeKindStarted || e.LastOutcome.RunID != runID.String() ||
+		!e.LastOutcome.WindowStart.Equal(wantWindow) || !e.LastOutcome.At.Equal(now) {
+		t.Errorf("last outcome = %+v", e.LastOutcome)
+	}
+
+	other, ok := src.ScheduleSnapshot("acme/widgets")
+	if ok {
+		t.Error("an unconfigured repo reported ok=true")
+	}
+	if other.RunnerKind != runpkg.RunnerKindLocal || len(other.Schedules) != 0 {
+		t.Errorf("unconfigured snapshot = %+v; want only the deployment runner kind", other)
+	}
+}
+
+// TestScheduleOutcomeKindForWire pins every scheduler outcome kind to its
+// server wire constant, so a rename on either side reddens here.
+func TestScheduleOutcomeKindForWire(t *testing.T) {
+	for k, want := range map[scheduler.OutcomeKind]string{
+		scheduler.OutcomeStarted:        server.ScheduleOutcomeKindStarted,
+		scheduler.OutcomeAlreadyStarted: server.ScheduleOutcomeKindAlreadyStarted,
+		scheduler.OutcomeRefused:        server.ScheduleOutcomeKindRefused,
+		scheduler.OutcomeTransientError: server.ScheduleOutcomeKindTransientError,
+		"future_kind":                   "future_kind",
+	} {
+		if got := scheduleOutcomeKindForWire(k); got != want {
+			t.Errorf("scheduleOutcomeKindForWire(%q) = %q, want %q", k, got, want)
+		}
+	}
+}
+
+// TestNewScheduler_WiresDependencies asserts the constructor binds every field
+// Ticker.Run requires (a nil one makes Run refuse to start).
+func TestNewScheduler_WiresDependencies(t *testing.T) {
+	cfg := server.Config{RunRepo: runpkg.BaseFake{}, AuditRepo: audit.BaseFake{}, GitHub: &githubclient.Client{}}
+	tk := newScheduler(cfg, func(context.Context, server.ScheduledRunParams) (server.ScheduledStartOutcome, error) {
+		return server.ScheduledStartOutcome{}, nil
+	}, slog.Default(), 2*time.Minute, []string{"kuhlman-labs/fishhawk"}, runpkg.RunnerKindGitHubActions)
+	if tk.Specs == nil || tk.Starter == nil || tk.Audit == nil || len(tk.Repos) != 1 {
+		t.Fatalf("ticker has a nil required dependency: %+v", tk)
+	}
+	if tk.Interval != 2*time.Minute || tk.RunnerKind != runpkg.RunnerKindGitHubActions {
+		t.Errorf("interval/runner kind = %v/%q", tk.Interval, tk.RunnerKind)
+	}
+}
+
+// TestServe_SchedulerWiresScheduleSource is the WHOLE-PATH wiring test for the
+// scheduler (E79.1 / #3725): FLAGS → runServe → the server.Config handed to
+// server.New. It captures the constructed Config through the newServer seam
+// (reached because bootstrapAbortFlag aborts AFTER newServer and BEFORE the
+// ticker goroutine starts, so nothing ever ticks or calls GitHub) over a real
+// database and a configured GitHub App, so schedulerStartDecision's
+// dependencies are genuinely wired. With --enable-scheduler, cfg.Schedules
+// must be the ticker's snapshot adapter; without it — the default — it must
+// stay nil so GET /v0/schedules answers enabled:false (approval condition 7);
+// and enabled-but-no-repos must log the skip and leave it nil.
+func TestServe_SchedulerWiresScheduleSource(t *testing.T) {
+	keyFile := writeTempAppKey(t)
+	capture := func(t *testing.T, extra ...string) (server.Config, string) {
+		t.Helper()
+		var captured server.Config
+		orig := newServer
+		newServer = func(cfg server.Config) *server.Server {
+			captured = cfg
+			return orig(cfg)
+		}
+		t.Cleanup(func() { newServer = orig })
+		args := append([]string{"-db", pgtest.NewURL(t),
+			"-github-app-id", "12345",
+			"-github-app-private-key-file", keyFile}, extra...)
+		args = append(args, bootstrapAbortFlag)
+		code, log := serveWithProfile(t, args...)
+		if code != exitFailure {
+			t.Fatalf("runServe exit = %d, want %d (aborts at the invalid review-resolution, AFTER newServer); log:\n%s", code, exitFailure, log)
+		}
+		return captured, log
+	}
+
+	t.Run("enabled wires the snapshot source", func(t *testing.T) {
+		cfg, log := capture(t, "--enable-scheduler", "--scheduler-repos", "kuhlman-labs/fishhawk", "--scheduler-runner-kind", "local")
+		if cfg.Schedules == nil {
+			t.Fatalf("cfg.Schedules is nil with --enable-scheduler and every dependency wired; log:\n%s", log)
+		}
+		snap, ok := cfg.Schedules.ScheduleSnapshot("kuhlman-labs/fishhawk")
+		if !ok || snap.RunnerKind != runpkg.RunnerKindLocal {
+			t.Errorf("configured repo snapshot = %+v, ok=%v; want ok with runner kind local (the flag value)", snap, ok)
+		}
+		if _, ok := cfg.Schedules.ScheduleSnapshot("acme/widgets"); ok {
+			t.Error("a repo outside --scheduler-repos reported ok=true")
+		}
+	})
+
+	t.Run("default off leaves the source nil", func(t *testing.T) {
+		cfg, log := capture(t, "--scheduler-repos", "kuhlman-labs/fishhawk")
+		if cfg.Schedules != nil {
+			t.Errorf("cfg.Schedules = %#v without --enable-scheduler; the scheduler must be OFF by default", cfg.Schedules)
+		}
+		if strings.Contains(log, "scheduler not started") {
+			t.Errorf("a flag-off boot must skip silently; log:\n%s", log)
+		}
+	})
+
+	t.Run("enabled without repos is a logged skip", func(t *testing.T) {
+		cfg, log := capture(t, "--enable-scheduler")
+		if cfg.Schedules != nil {
+			t.Errorf("cfg.Schedules = %#v with no --scheduler-repos; want nil", cfg.Schedules)
+		}
+		if !strings.Contains(log, "--scheduler-repos") || !strings.Contains(log, "scheduler not started") {
+			t.Errorf("missing the no-repos skip reason in the log:\n%s", log)
+		}
+	})
 }
