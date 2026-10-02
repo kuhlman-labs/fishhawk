@@ -22,8 +22,9 @@
 // Scope: two tiers, matching the backend. ValidateBytes runs the JSON
 // Schema, resolves workflow-v2 same-document reuse, then mirrors the
 // backend's semantic sweeps the schema can't express — agent_version
-// ranges, reviewers.authority, applies_to, escalations and the
-// review_conventions family (ADR-068 / E55.2 / #2243) — and, since
+// ranges, reviewers.authority, applies_to, escalations, the
+// review_conventions family (ADR-068 / E55.2 / #2243) and the
+// reviewer_personas family (ADR-084 / E55.8 / #3753) — and, since
 // E52.13 / #2323, RESOLVES STAGE REFERENCES: duplicate stage ids, the
 // `needs:` shorthand, and inputs[].from_stage referent/ordering rules.
 // What stays backend-only is the BINDING class: the ADR-038
@@ -309,8 +310,9 @@ func ValidateBytes(data []byte) error {
 	// Semantic sweeps the schema can't express, run in a FIXED order that
 	// mirrors the backend (schema.Validate → workflow/stage sweeps → needs
 	// expansion → graph-shape). validateAgentVersions covers agent_version
-	// ranges (#1743), reviewers.authority, applies_to, escalations and the
-	// review_conventions family (E55.2 / #2243, review_conventions.go);
+	// ranges (#1743), reviewers.authority, applies_to, escalations, the
+	// review_conventions family (E55.2 / #2243, review_conventions.go) and
+	// the reviewer_personas family (E55.8 / #3753, reviewer_personas.go);
 	// validateGraphShape (E52.13 / #2323) resolves stage references —
 	// duplicate ids, inputs[].from_stage, and the `needs:` shorthand at
 	// major >= 2 — so `fishhawk validate` reports the SAME errors the backend

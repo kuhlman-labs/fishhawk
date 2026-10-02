@@ -25,13 +25,15 @@ defaults:               # optional; file-level executor / reviewers / budget def
 test_conventions: [...] # optional; per-repo test-location rules for the plan-gate test sweep
 review_conventions:     # optional; named review-convention documents, selected per stage
   <convention_name>: {path: ...}
+reviewer_personas:      # optional; named reviewer personas (model config + remit), attached per stage
+  <persona_name>: {agent: {provider: ...}, remit: {path: ...}}
 workflows:              # required; at least one workflow
   <workflow_id>:
     description: "..."
     stages: [...]
 ```
 
-The document root is closed (`additionalProperties: false`) over exactly these five keys: `version`, `defaults`, `test_conventions`, `review_conventions`, and `workflows`. There is **no top-level `roles` map** at major 2 — approval membership lives on the gate's own `approvals` block.
+The document root is closed (`additionalProperties: false`) over exactly these six keys: `version`, `defaults`, `test_conventions`, `review_conventions`, `reviewer_personas`, and `workflows`. There is **no top-level `roles` map** at major 2 — approval membership lives on the gate's own `approvals` block.
 
 `<workflow_id>` and every stage `id` are `snake_case` — `^[a-z][a-z0-9_]*$`.
 
@@ -638,6 +640,7 @@ reviewers:
   human: 1                        # integer >= 0; default 0
   review_timeout: 10m             # optional; this stage's review-budget floor
   conventions: [backend]          # optional; plan / implement only; names review_conventions entries
+  personas: [security]            # optional; plan / implement only; names reviewer_personas entries
 ```
 
 - **`agents`** — one entry per agent reviewer, minimum one entry when the key is present. The effective agent count is `len(agents)`; there is no bare integer count at major 2.
@@ -648,6 +651,7 @@ reviewers:
 - **`authority`** — `advisory | gating`; optional. Declares **explicitly** whether this stage's agent reviewers can block, instead of leaving it inferred from the counts. See **[Authority](#authority)** below.
 - **`human`** — how many human approvals the stage's review requires.
 - **`conventions`** — the [review conventions](#review-conventions) this stage's agent reviewers are handed, by name, in list order. Valid only on a `plan` or `implement` stage, only on a stage with at least one agent reviewer, and every name must resolve to a declared `review_conventions` entry; a non-empty list of unique snake_case names.
+- **`personas`** — the [reviewer personas](#reviewer-personas) attached to this stage, by name: each runs as **one extra reviewer invocation** with its own model configuration and its own prompt, in addition to (and after) the `agents` above. Valid only on a `plan` or `implement` stage, only on a stage with at least one agent reviewer, and every name must resolve to a declared `reviewer_personas` entry; a non-empty list of unique snake_case names.
 - **`review_timeout`** — a Go duration string setting the **floor** rung of the size-aware review-wait budget (`Floor + PerKB × ceil(promptKB)`, clamped to `[Floor, Cap]`) for **this stage's** agent reviews, so plan and implement stages can carry different review timeouts. Two-rung ladder: the deployment default (`FISHHAWKD_PLAN_REVIEW_TIMEOUT`) < this value. Only the floor is per-stage; the `PerKB` and `Cap` rungs stay deployment-level.
 
 ### Authority
@@ -1191,6 +1195,48 @@ workflows:
 
 **Grammar only, today.** The schema accepts these keys, the parser round-trips them, and the backend and `fishhawk validate` enforce every rule above; nothing yet hands a convention to a reviewer. Rendering a selected convention into the review prompt and enforcing `severity_cap` are #2244 (E55.3), and the runtime half of `required` — a missing required document failing the review stage — is an explicit obligation on #2244, wired into the review-prompt sites by #2797. Until both land, a declared and selected convention is validated and inert.
 
+## Reviewer personas
+
+An optional **top-level** `reviewer_personas` map declaring **named reviewer personas** (ADR-084 / E55.8 / #3753). ADR-084 binding rule 1: *"A named persona declares a model configuration and a remit document."* A `plan` or `implement` stage **attaches** personas by name through [`reviewers.personas`](#reviewers); each attached persona reviews that stage as a **separate reviewer invocation with its own prompt**, and the stage's standard `reviewers.agents` — and their prompt — are unchanged.
+
+```yaml
+reviewer_personas:
+  security:
+    agent:                       # the model configuration: one reviewers.agents[] entry's shape
+      provider: codex
+      model: gpt-5.2-codex       # optional
+      reasoning_effort: high     # optional
+    remit:                       # the remit document
+      path: docs/review/security-remit.md
+      severity_cap: medium       # optional; low | medium; absent = uncapped
+
+workflows:
+  feature_change:
+    stages:
+      - id: implement
+        type: implement
+        # ...
+        reviewers:
+          agents: [{provider: anthropic}]
+          personas: [security]
+```
+
+- **`reviewer_personas`** — a map from a `snake_case` persona name (`^[a-z][a-z0-9_]*$`) to one persona; at least one entry when the key is present. A persona entry is closed over exactly `agent` and `remit`, both required.
+- **`agent`** — the persona's model configuration. It is the **same schema** (`$defs/agent_reviewer`) as one [`reviewers.agents[]`](#reviewers) entry, so `provider` (required; `anthropic | claudecode | codex`), `model`, `reasoning_effort`, `agent_version` and `optional` mean exactly what they mean there. A malformed `agent_version` range is refused at the persona's own path (`/reviewer_personas/<name>/agent/agent_version`).
+- **`remit`** — the document the persona reviews against: `path` (required) and `severity_cap` (optional). The remit **reuses the review-conventions machinery inline** rather than naming a `review_conventions` entry: `path` is held to the same canonical repo-relative path rule (refused with the same reasons as a [review convention](#review-conventions) `path`), and `severity_cap` is the same closed set (`low` | `medium`; `high` is not declarable). Like a convention, a remit names a file in the repository under review — there is no inline `text:` alternative. Unlike a convention it carries no `required` and no `applies_to`: an attached persona reviews every change its stage reviews, and a remit that cannot be resolved degrades only the persona (below), never the stage.
+
+**Declared, never auto-discovered; every declared persona must be attached, and every attachment must resolve.** A stage's `reviewers.personas` naming an undeclared persona is refused at the attachment's index (`/workflows/<wf>/stages/<i>/reviewers/personas/<j>`), and a persona no stage of the resolved document attaches is refused at `/reviewer_personas/<name>` — a declaration that runs no review is a control that does nothing. Attachment is valid only on a `plan` or `implement` stage (the only stages with an agent-review loop) and only on a stage configuring at least one agent reviewer: a persona reviews **in addition to** the standard reviewers and inherits their authority. Each persona rule runs immediately after its `review_conventions` sibling, in both the backend and `fishhawk validate`.
+
+**Interaction with `defaults.reviewers`.** `personas` lives inside the `reviewers` block, which a `defaults.reviewers` block supplies **whole** to every stage that does not declare its own. An attachment inherited that way counts as an attachment on each inheriting stage (and is subject to the stage-type rule there); an attachment made only inside a `defaults.reviewers` block that every stage overrides attaches nothing, and the persona it names is refused as unattached — the same rule, with the same verdict on both validators, as `reviewers.conventions`.
+
+**Runtime contract.** At review time each attached persona becomes one extra invocation in the stage's existing plan-review or implement-review loop:
+
+- **Its own prompt.** The persona's prompt is the stage's normal review prompt (the plan or diff, plus every document already injected for the stage) with the persona's remit appended as one more injected document, resolved from the run's pinned admission commit. The standard reviewers' prompt is built exactly as it is without the persona, byte for byte. The persona's own `agent` configuration is used as declared; a gate-resolved review-model override does not apply to it.
+- **Inherits the stage.** A persona inherits the stage's review authority (a persona reject under `gating` authority blocks like any agent reject), counts toward the round's configured reviewers, is named in the `*_review_started` entry's `personas` list, and stamps `persona` on its verdict entry.
+- **Fails closed for the persona only.** A persona whose remit cannot be resolved — the document is missing at the base commit, the run recorded no base commit, no repo-document resolver is configured, or the injection cannot be attributed — does **not** run: it records a terminal `*_review_skipped` entry with reason `persona_remit_unavailable` and a named `detail`, and the standard reviewers still run. A persona whose provider is unavailable on the deployment degrades like any reviewer (`reviewer_unavailable`, per its `optional`).
+
+**Not yet.** `severity_cap` is grammar only until E55.10 (#3755) clamps a persona's concerns at ingest and attributes them by reviewer role; attaching a persona through an escalation's `require` block is E55.9 (#3754); and E78.5 (#3756) selects decision records into the same review-prompt injection path a persona's prompt is built from. Runner-hosted reviewers (E63 / #2307) must carry personas when they land (ADR-084 rule 6).
+
 ## Identifier namespaces
 
 | Field | Pattern / values | Notes |
@@ -1249,6 +1295,11 @@ workflows:
 | `review_conventions.<name>.severity_cap` | `low` \| `medium` | absent = uncapped; `high` is not declarable |
 | `review_conventions.<name>.required` | `true` \| `false` (default `true`) | `true` fails the review stage on a missing document (#2244) |
 | `reviewers.conventions` items | `^[a-z][a-z0-9_]*$`, unique, min 1 | each names a declared `review_conventions` entry; `plan` / `implement` stages only |
+| `reviewer_personas` keys | `^[a-z][a-z0-9_]*$` | snake_case persona names; at least one entry when present |
+| `reviewer_personas.<name>.agent` | a `reviewers.agents[]` entry (`$defs/agent_reviewer`) | the persona's model configuration; `provider` required |
+| `reviewer_personas.<name>.remit.path` | canonical repo-relative path | the review-conventions path rule |
+| `reviewer_personas.<name>.remit.severity_cap` | `low` \| `medium` | absent = uncapped; grammar only until E55.10 (#3755) |
+| `reviewers.personas` items | `^[a-z][a-z0-9_]*$`, unique, min 1 | each names a declared `reviewer_personas` entry; `plan` / `implement` stages with an agent reviewer only |
 
 ## Validation rules beyond the schema
 
@@ -1265,8 +1316,9 @@ The schema enforces structure. Layers above it enforce what JSON Schema cannot e
 - `extends` names a defined workflow and forms no cycle.
 - Every `escalations` entry actually **raises** something (see [Escalations](#escalations)): `count` and `min_permission` must exceed the workflow's least-restrictive baseline, `member_of` may not name a group every approval gate already requires, `require.approvals` needs an approval gate to raise, and `max_autonomy` may not leave the resolved matrix identical. A `match.paths` criterion is additionally refused on a workflow that declares no plan stage (E53.16 / #2382), for the same reason `applies_to.paths` is — there is no `scope.files` producer for it to match against, so the escalation could never fire. `fishhawk validate` mirrors all of these except the `max_autonomy` no-op check, which needs the autonomy resolver the CLI deliberately does not carry.
 - Every `review_conventions` entry's `path` is a canonical repo-relative path, and its `applies_to` is a well-formed predicate declaring no `change_kind`. A stage's `reviewers.conventions` is valid only on a `plan` or `implement` stage, names only declared entries, and requires at least one agent reviewer; every declared entry is selected by at least one stage of the resolved document (see [Review conventions](#review-conventions)).
+- Every `reviewer_personas` entry's `remit.path` is a canonical repo-relative path and its `agent.agent_version` (when present) a well-formed range. A stage's `reviewers.personas` is valid only on a `plan` or `implement` stage, names only declared personas, and requires at least one agent reviewer; every declared persona is attached by at least one stage of the resolved document (see [Reviewer personas](#reviewer-personas)).
 
-`fishhawk validate` (the CLI) validates in two tiers. It reports schema errors, the removed-form messages, the reuse-resolution rejections, the workflow/stage semantic sweeps (agent_version, reviewers.authority, applies_to, escalations, review_conventions), and — since E52.13 / #2323 — **stage-reference resolution**: duplicate stage ids, the `needs:` shorthand, and `inputs[].from_stage` referent/ordering, reported at the identical paths the backend uses. What remains backend-only is the stage-BINDING class: the ADR-038 type/executor/constraint bindings, the plan `schema: standard_v1` rule, the produces-artifact bindings (deployment / acceptance / grooming_report and the E52.7 post-hoc-constraint↔pull_request rule), and the `max_autonomy` no-op check that needs the autonomy resolver the CLI deliberately does not carry — these surface server-side at run creation.
+`fishhawk validate` (the CLI) validates in two tiers. It reports schema errors, the removed-form messages, the reuse-resolution rejections, the workflow/stage semantic sweeps (agent_version, reviewers.authority, applies_to, escalations, review_conventions, reviewer_personas), and — since E52.13 / #2323 — **stage-reference resolution**: duplicate stage ids, the `needs:` shorthand, and `inputs[].from_stage` referent/ordering, reported at the identical paths the backend uses. What remains backend-only is the stage-BINDING class: the ADR-038 type/executor/constraint bindings, the plan `schema: standard_v1` rule, the produces-artifact bindings (deployment / acceptance / grooming_report and the E52.7 post-hoc-constraint↔pull_request rule), and the `max_autonomy` no-op check that needs the autonomy resolver the CLI deliberately does not carry — these surface server-side at run creation.
 
 ## Version routing
 
@@ -1315,7 +1367,7 @@ A predicate carries four optional criteria, each a non-empty list:
 
 ## Control surface: what is enforced, and where
 
-The control-surface fields (`reviewers.authority`, `applies_to`, `escalations`, `permissions`, `review_conventions`) do **not** share one enforcement status, and reading them as if they did — "declared, therefore guaranteed", or the tidier and equally false "everything here is unenforced" — misstates what the product actually holds. This table is the consolidated per-control account. It states nothing the sections above do not; it keeps the honest split in one place so no reader has to reassemble it. A "declared" control is validated, audited and surfaced, but it is not a guarantee until a seam reads it. The same split, in the same words, governs this repository's own governance in [`docs/METHODOLOGY.md`](../METHODOLOGY.md); the two are written to be read against each other.
+The control-surface fields (`reviewers.authority`, `applies_to`, `escalations`, `permissions`, `review_conventions`, `reviewer_personas`) do **not** share one enforcement status, and reading them as if they did — "declared, therefore guaranteed", or the tidier and equally false "everything here is unenforced" — misstates what the product actually holds. This table is the consolidated per-control account. It states nothing the sections above do not; it keeps the honest split in one place so no reader has to reassemble it. A "declared" control is validated, audited and surfaced, but it is not a guarantee until a seam reads it. The same split, in the same words, governs this repository's own governance in [`docs/METHODOLOGY.md`](../METHODOLOGY.md); the two are written to be read against each other.
 
 | Control | What it constrains | Enforcement status |
 |---|---|---|
@@ -1324,6 +1376,7 @@ The control-surface fields (`reviewers.authority`, `applies_to`, `escalations`, 
 | `applies_to.paths` | Confines a workflow's change set to declared globs. | **Enforced at the plan gate** against the `scope.files` union, universally quantified. **Refused at validation on a workflow that declares no plan stage** — there is no `scope.files` producer for it to check, so it could never be evaluated (E53.15 / #2377). |
 | `escalations` | Raises the approval count, membership conjunction, minimum permission, or autonomy ceiling for a change matching a predicate. | **Enforced where declared**, at the approval gate and in delegation resolution; a workflow declaring none short-circuits before any extra read. A `match.paths` criterion is **refused at validation on a workflow that declares no plan stage** — no `scope.files` producer, so it could never fire (E53.16 / #2382). The *mechanism* is shipped and tested; whether it holds on any given path depends on a declaration existing there. See [Escalations](#escalations). |
 | `review_conventions` / `reviewers.conventions` | Which repo-declared convention documents a plan or implement stage's agent reviewers are handed, how severely a finding resting on one may be weighed (`severity_cap`), and whether a missing document fails the review (`required`). | **Validated only.** Both validators enforce the grammar (canonical path, resolvable and selected names, plan/implement-only selection with an agent reviewer), but **no seam reads it yet**: rendering and `severity_cap` enforcement are #2244, and the fail-loudly half of `required` is an obligation on #2244, wired by #2797. See [Review conventions](#review-conventions). |
+| `reviewer_personas` / `reviewers.personas` | Which named personas (a model configuration plus a remit document) review a plan or implement stage as extra reviewer invocations with their own prompts. | **Enforced at the review loop** for attachment and remit injection: each attached persona runs with the stage's authority and counts toward the round, and an unresolvable remit fails closed for that persona only (`persona_remit_unavailable`). `remit.severity_cap` is **validated only** until E55.10 (#3755); escalation-attached personas are E55.9 (#3754). See [Reviewer personas](#reviewer-personas). |
 | `permissions.network` | The egress host(s) a stage's agent may reach. | **Enforced on an agent-executor `acceptance` stage**, where it normalizes into `egress` and the runner's default-deny proxy applies it — the pre-existing ADR-050 control. On **every other stage** it is a declaration only, until E51 (#2133). The run-status per-entry `enforced` flag encodes exactly this split. |
 | `permissions.write` | The paths a stage's agent is expected to write. | Declared, audited (`stage_permissions_declared`) and surfaced (`permissions[]`), but **not enforced anywhere**, until E51 (#2133). |
 | `permissions.shell` | The stage's shell posture (`none` / `restricted` / `unrestricted`). | Declared, audited and surfaced, but **not enforced anywhere**, until E51 (#2133). |

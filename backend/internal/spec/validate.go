@@ -69,6 +69,14 @@ import (
 //     an agent reviewer; and every declared entry is selected by some stage.
 //     Rule order and the selection contract: review_conventions.go. v2-only in
 //     practice — no v0/v1 schema declares either key.
+//   - reviewer_personas (ADR-084 / E55.8 / #3753): each declared persona's
+//     remit.path is a canonical repo-relative path (the review_conventions
+//     rule) and its agent.agent_version a well-formed range; a stage's
+//     reviewers.personas is valid only on a plan / implement stage, names
+//     declared personas only, and needs an agent reviewer; and every declared
+//     persona is attached by some stage. Each rung runs immediately after its
+//     review_conventions sibling. Rule order and the selection contract:
+//     reviewer_personas.go. v2-only in practice.
 //
 // Validate is exported so tests and Spec-builder code can exercise
 // the semantic layer without the YAML→schema round trip.
@@ -84,13 +92,22 @@ func Validate(s *Spec) error {
 	if err := validateReviewConventionDeclarations(s); err != nil {
 		return err
 	}
+	// reviewer_personas (E55.8 / #3753) mirrors that placement rung for rung,
+	// each persona rung immediately after its review_conventions sibling.
+	// Rule order: reviewer_personas.go.
+	if err := validateReviewerPersonaDeclarations(s); err != nil {
+		return err
+	}
 	major := specVersionMajor(s.Version)
 	for wfName, wf := range s.Workflows {
 		if err := validateWorkflow(s, wfName, &wf, major); err != nil {
 			return err
 		}
 	}
-	return validateReviewConventionsReferenced(s)
+	if err := validateReviewConventionsReferenced(s); err != nil {
+		return err
+	}
+	return validateReviewerPersonasReferenced(s)
 }
 
 // specVersionMajor parses a spec version string's major component, the way
@@ -356,6 +373,12 @@ func validateWorkflow(s *Spec, name string, wf *Workflow, major int) error {
 			// RESOLVED stage, so a selection inherited from defaults.reviewers
 			// is checked on every stage that inherits it.
 			if err := validateStageReviewConventions(s, name, i, &stage); err != nil {
+				return err
+			}
+			// reviewers.personas (E55.8 / #3753): stage type, then each
+			// attached name resolves, then an agent reviewer exists — the
+			// conventions rung's shape, run after it.
+			if err := validateStageReviewerPersonas(s, name, i, &stage); err != nil {
 				return err
 			}
 		}
