@@ -624,6 +624,15 @@ type runConcernPayload struct {
 	// leave alone. omitempty: an unclaimed concern marshals byte-identically to
 	// pre-#3318.
 	ClaimedByApproval bool `json:"claimed_by_approval,omitempty"`
+	// ReviewerRole names which reviewer raised the concern (E55.10 / #3755): a
+	// reviewer persona's name, "standard" for the stage's standard reviewer,
+	// OMITTED for an unattributed legacy row (minted before migration 0092).
+	// QuoteUnverified reports that the reviewer quoted a document passage the
+	// server could not find in the text it injected, so the concern was
+	// demoted to low at ingest. Both omitempty: a legacy row marshals
+	// byte-identically.
+	ReviewerRole    string `json:"reviewer_role,omitempty"`
+	QuoteUnverified bool   `json:"quote_unverified,omitempty"`
 }
 
 // runDelegationPayload is the operator_agent delegation surface on the
@@ -3051,6 +3060,9 @@ func buildRunConcernsPayload(all []*concern.Concern, claimed map[uuid.UUID]struc
 			// all. Feeding it the stand-in yields a bounded pointer label
 			// instead; the collapse/bound/marker logic is unchanged.
 			ShortSummary: concernShortSummary(c.DisplayNote()),
+			// Persona ingest markers (E55.10 / #3755).
+			ReviewerRole:    c.ReviewerRole,
+			QuoteUnverified: c.QuoteUnverified,
 		})
 		// Nil-safe: a nil claimed map yields ok==false for every lookup, so a run
 		// whose claims could not be loaded (or that has none) simply carries no

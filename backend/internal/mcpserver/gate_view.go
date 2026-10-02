@@ -49,10 +49,18 @@ Inputs:
 Response (gate_view):
   - open[]                     — open concerns, each with note (full), round,
                                  origin_review_sequence, reviewer_model,
-                                 severity, category, state, state_reason,
-                                 has_suggested_patch, fixups[], resolutions[].
+                                 reviewer_role, severity, category, state,
+                                 state_reason, has_suggested_patch, fixups[],
+                                 resolutions[]. reviewer_role names the persona
+                                 (or 'standard') that raised it, absent for a
+                                 legacy unattributed row; quote_unverified marks
+                                 a quoted document passage the server could not
+                                 find in the injected text (demoted to low);
+                                 severity_clamped_from is the reviewer's
+                                 original severity when ingest lowered it.
   - settled[]                  — waived/deferred/addressed/superseded rows with
-                                 state_reason.
+                                 state_reason (same reviewer_role /
+                                 quote_unverified / severity_clamped_from).
   - suppressed_relitigations[] — settled concerns a reviewer tried to re-raise.
   - history_incomplete + history_gaps[] — set when an audit-derived join could
     not be built (the concerns stay intact; only cross-references may be

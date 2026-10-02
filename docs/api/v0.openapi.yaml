@@ -2417,6 +2417,21 @@ components:
             the approval-audit read fails the markers are omitted while the
             `concerns` block itself stays present (presence remains the
             authoritative store-read signal, #3043).
+        reviewer_role:
+          type: string
+          description: |
+            Which reviewer raised this concern (E55.10 / #3755): a reviewer
+            persona's name, or `standard` for the stage's standard reviewer.
+            OMITTED for an unattributed concern — every row minted before
+            migration 0092 — whose reviewer is recoverable only from the
+            originating `plan_reviewed` / `implement_reviewed` audit payload.
+        quote_unverified:
+          type: boolean
+          description: |
+            True when the reviewer quoted a document passage (`quoted_passage`
+            + `document_ref`) that the server could NOT find in the text it
+            injected into that reviewer's invocation, so the concern was demoted
+            to `low` at ingest (E55.10 / #3755). OMITTED otherwise.
         short_summary:
           type: string
           maxLength: 100
@@ -2769,6 +2784,25 @@ components:
             Stable id of the settled concern this one re-raises — the
             re-litigation lineage tag (#1913). Optional: omitted when the
             concern re-raises nothing.
+        reviewer_role:
+          type: string
+          description: |
+            Which reviewer raised this concern (E55.10 / #3755): a reviewer
+            persona's name, or `standard` for the stage's standard reviewer.
+            OMITTED for an unattributed concern minted before migration 0092.
+        quote_unverified:
+          type: boolean
+          description: |
+            True when the reviewer's quoted document passage was not found in
+            the text the server injected into that invocation, demoting the
+            concern to `low` at ingest (E55.10 / #3755). OMITTED otherwise.
+        severity_clamped_from:
+          type: string
+          description: |
+            The reviewer's ORIGINAL severity when ingest lowered it — a persona
+            `severity_cap` clamp or an unverified quote (E55.10 / #3755). The
+            current `severity` is the clamped value. OMITTED when the severity
+            is the reviewer's own.
         has_suggested_patch: { type: boolean }
         fixups:
           type: array
@@ -2923,6 +2957,21 @@ components:
           description: |
             Stable id of the settled concern this one re-raises (#1913).
             Optional, omitted when empty.
+        reviewer_role:
+          type: string
+          description: |
+            Which reviewer raised this concern (E55.10 / #3755) — same
+            semantics as `GateViewConcern.reviewer_role`. Omitted when empty.
+        quote_unverified:
+          type: boolean
+          description: |
+            Same semantics as `GateViewConcern.quote_unverified`. Omitted when
+            false.
+        severity_clamped_from:
+          type: string
+          description: |
+            Same semantics as `GateViewConcern.severity_clamped_from`. Omitted
+            when empty.
 
     GateViewSuppressedRelitigation:
       type: object
