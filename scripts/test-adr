@@ -82,6 +82,27 @@
 #   CF25 duplicate-path index check made a no-op → h30d RED.
 #   CF26 missing-ADR_DIR fail-open removed (fall-through) → h18 RED (exit 2).
 #   CF27 index read failure swallowed (returns no violations) → h31a RED.
+#   E78.2 / #3723 gate hardening (same restore discipline):
+#   CF28 bounded stem check replaced by a plain `stem in body` → h33 and h33c RED
+#        (h33's body holds 'cli' only inside 'clients'; h33c's only as the tail
+#        of 'backend/internal/cli/').
+#   CF29 trailing-boundary condition dropped → h33 RED ('cli' then passes inside
+#        'clients'; its leading char is a space, so no other check sees it).
+#   CF30 leading-boundary condition dropped → h33c RED (its trailing char is
+#        '/', so the trailing check is satisfied and only the leading one fires).
+#   CF31 root-anchored '/' allowance dropped → h33b RED, AND the committed tree
+#        RED on ADR-002 (`/backend/sqlc.yaml`) and ADR-013 (`/cli/**`).
+#   CF32 greedy PLACEHOLDER_RE restored → h34 RED ('_Note:_ Accepted ... _(...)_'
+#        was stripped whole, leaving no acceptance word).
+#   CF33 the `\*[^*]+\*` alternative dropped → h34b RED ('*To be recorded.*' is
+#        then kept and 'recorded' satisfies C-accepted).
+#   CF34 DECISION_RE reverted to ^#{1,6}\s+Decision\b → h35 RED, AND the
+#        committed tree RED on ADR-030 ('## Recommendation / Decision').
+#   CF35 DECISION_RE widened to 'decision anywhere in the heading' → h35b and
+#        h35c RED (the precision pins for 'The deferred decision (this ADR)' and
+#        'Decisions already made', the two real ADR-034 headings).
+#   CF11 (re-run against the tightened regex) italic-placeholder strip removed
+#        → h12 RED, and h34b RED too (the asterisk placeholder is then kept).
 #   Not counterfactual-run: the unterminated-front-matter branch (deleting it
 #   crashes on close=None rather than greening — h16a still RED via no tag),
 #   the index not-JSON and entry-shape branches (h30a/h30c assert them), and
@@ -511,6 +532,50 @@ d="$(fixture h32)"
 subst "$d/002-beta.md" '**Accepted 2026-05-01.** Y replaces ADR-001.' \
   $'```sh\n# a shell comment, not a heading\n```\n\nAccepted 2026-05-01.'
 run_check "$d"; expect_ok "h32: fenced '#' line is not a heading" "2 record(s) consistent"
+
+# --- h33: C-applies stem is BOUNDED (E78.2 / #3723) ----------------------------
+# h33: the stem 'cli' occurs only inside the longer word 'clients' (leading char
+# is a space, so ONLY the trailing-boundary check rejects it).
+d="$(fixture h33)"
+subst "$d/002-beta.md" 'applies_to: ["infra/terraform/**"]' 'applies_to: ["cli/**"]'
+subst "$d/002-beta.md" 'Infrastructure lives under `infra/terraform/`.' 'The clients and the CLI use it.'
+subst "$d/index.json" '"applies_to": ["infra/terraform/**"]' '"applies_to": ["cli/**"]'
+run_check "$d"; expect_only "h33: stem only inside a longer word ('clients')" C-applies "002-beta.md" "cli"
+# h33b: a root-anchored `/cli/**` names 'cli' (the ADR-002/ADR-013 shape). The
+# '/' before the stem is itself preceded by a backtick, so ONLY the root-anchored
+# allowance accepts it.
+d="$(fixture h33b)"
+subst "$d/002-beta.md" 'applies_to: ["infra/terraform/**"]' 'applies_to: ["cli/**"]'
+subst "$d/002-beta.md" 'Infrastructure lives under `infra/terraform/`.' 'The command line lives under `/cli/**`.'
+subst "$d/index.json" '"applies_to": ["infra/terraform/**"]' '"applies_to": ["cli/**"]'
+run_check "$d"; expect_ok "h33b: root-anchored '/cli/**' names the stem 'cli'" "2 record(s) consistent"
+# h33c: the stem occurs only as the tail of a longer path. The trailing char is
+# '/' (boundary satisfied), so ONLY the leading-boundary check rejects it.
+d="$(fixture h33c)"
+subst "$d/002-beta.md" 'applies_to: ["infra/terraform/**"]' 'applies_to: ["cli/**"]'
+subst "$d/002-beta.md" 'Infrastructure lives under `infra/terraform/`.' 'Code lives under `backend/internal/cli/`.'
+subst "$d/index.json" '"applies_to": ["infra/terraform/**"]' '"applies_to": ["cli/**"]'
+run_check "$d"; expect_only "h33c: stem only as a mid-path segment" C-applies "002-beta.md" "cli"
+
+# --- h34: the italic-placeholder strip matches ONE span only ---------------------
+# h34: two italic spans around the acceptance word are NOT a placeholder.
+d="$(fixture h34)"; subst "$d/002-beta.md" '**Accepted 2026-05-01.** Y replaces ADR-001.' '_Note:_ Accepted as drafted _(see addendum)_'
+run_check "$d"; expect_ok "h34: two italic spans around text are kept, not stripped" "2 record(s) consistent"
+# h34b: an asterisk-delimited single span IS a placeholder.
+d="$(fixture h34b)"; subst "$d/002-beta.md" '**Accepted 2026-05-01.** Y replaces ADR-001.' '*To be recorded.*'
+run_check "$d"; expect_only "h34b: *single-span* asterisk placeholder is stripped" C-accepted "002-beta.md"
+
+# --- h35: a slash-combined Decision heading is a Decision heading ------------------
+d="$(fixture h35)"
+subst "$d/002-beta.md" $'## Decision\n\n**Accepted 2026-05-01.** Y replaces ADR-001.' $'## Recommendation / Decision\n\nDecided (2026-06-02).'
+run_check "$d"; expect_ok "h35: '## Recommendation / Decision' is a Decision heading" "2 record(s) consistent"
+# h35b / h35c are PRECISION pins: 'decision' inside a heading is not enough.
+d="$(fixture h35b)"
+subst "$d/002-beta.md" $'## Decision\n\n**Accepted 2026-05-01.** Y replaces ADR-001.' $'## The deferred decision (this ADR)\n\nDecided.'
+run_check "$d"; expect_only "h35b: 'The deferred decision' is not a Decision heading" C-accepted "002-beta.md"
+d="$(fixture h35c)"
+subst "$d/002-beta.md" $'## Decision\n\n**Accepted 2026-05-01.** Y replaces ADR-001.' $'## Decisions already made\n\nDecided.'
+run_check "$d"; expect_only "h35c: 'Decisions already made' is not a Decision heading" C-accepted "002-beta.md"
 
 echo
 echo "scripts/test-adr: $PASS passed, $FAIL failed"

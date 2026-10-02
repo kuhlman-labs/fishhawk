@@ -32,11 +32,18 @@
 #                    (both reciprocity checks skip targets C-ref rejects, so
 #                    C-ref is isolated)
 #   C-superseded     status superseded => non-empty superseded_by
-#   C-accepted       status accepted => SOME Decision section carries an
-#                    acceptance word after italic-placeholder lines are removed
+#   C-accepted       status accepted => SOME Decision section (a heading where
+#                    'Decision' starts the heading or a slash-separated part of
+#                    it, e.g. '## Recommendation / Decision') carries an
+#                    acceptance word after lines that are ENTIRELY ONE italic
+#                    span (no inner delimiter) are removed
 #   C-applies        every applies_to entry has a non-empty literal stem (text
 #                    before the first of * ? [ {, minus one trailing '/') that
-#                    occurs verbatim in the record body
+#                    occurs in the record body as a BOUNDED path token: not
+#                    inside a longer word (trailing char not [A-Za-z0-9_-]) and
+#                    not the tail of a longer path (leading char not
+#                    [A-Za-z0-9_./-], except a '/' that itself starts a
+#                    root-anchored path, '`/cli/**`')
 #   C-index          index.json parses and has the adr-index-v1 shape; plus three
 #                    separate branches keyed by PATH: missing (record with no
 #                    entry), extra (entry naming no record file), stale (entry
@@ -75,10 +82,17 @@ LINE_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*): (.+)$")
 BARE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/#-]*$")
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 HEADING_RE = re.compile(r"^(#{1,6})\s+")
-DECISION_RE = re.compile(r"^#{1,6}\s+Decision\b", re.IGNORECASE)
+# A Decision heading: 'Decision' starts the heading OR starts a slash-separated
+# part of it ('## Recommendation / Decision'). 'Decisions ...' and 'The deferred
+# decision ...' do not match.
+DECISION_RE = re.compile(r"^#{1,6}\s+(?:[^/\n]*/\s*)*Decision\b", re.IGNORECASE)
 FENCE_RE = re.compile(r"^\s*(```|~~~)")
-# A line that is ENTIRELY one italic span (_..._ or *...*), never bold (**...**).
-PLACEHOLDER_RE = re.compile(r"^(_(?!_).*(?<!_)_|\*(?!\*).*(?<!\*)\*)$")
+# A line that is ENTIRELY ONE italic span with no inner delimiter (_x_ or *x*),
+# never bold (**x**) and never two spans around text ('_a_ Accepted _b_').
+PLACEHOLDER_RE = re.compile(r"^(_[^_]+_|\*[^*]+\*)$")
+# C-applies stem boundaries. A stem occurrence counts only as its own path token.
+PATH_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_./-"
+WORD_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"
 ACCEPT_RE = re.compile(
     r"\b(accepted|approved|ratified|recorded|decided|adopt|adopted)\b",
     re.IGNORECASE)
@@ -228,6 +242,26 @@ def glob_stem(pattern):
     return stem
 
 
+def stem_bounded(stem, body):
+    """True when the stem occurs in the body as a bounded path token. The
+    trailing char must not continue a word ('cli' in 'clients'); a '.' is
+    accepted there (a known limit: 'backend' is satisfied by 'backend.go'). The
+    leading char must not continue a path ('cli' in 'backend/internal/cli/'),
+    except a '/' that itself starts a root-anchored path (the char before THAT
+    '/' is absent or not a path char), so '`/cli/**`' still names 'cli'."""
+    for m in re.finditer(re.escape(stem), body):
+        start, end = m.start(), m.end()
+        if end < len(body) and body[end] in WORD_CHARS:
+            continue
+        if start > 0 and body[start - 1] in PATH_CHARS:
+            rooted = (body[start - 1] == "/"
+                      and (start < 2 or body[start - 2] not in PATH_CHARS))
+            if not rooted:
+                continue
+        return True
+    return False
+
+
 def check_records(records):
     """Every record check except C-index. Returns a list of violations."""
     out = []
@@ -343,10 +377,11 @@ def check_records(records):
                 out.append((rec["file"], "C-applies",
                             "key 'applies_to': '%s' has an empty literal stem"
                             % pattern))
-            elif stem not in rec["body"]:
+            elif not stem_bounded(stem, rec["body"]):
                 out.append((rec["file"], "C-applies",
                             "key 'applies_to': stem '%s' of '%s' does not "
-                            "occur in the record body" % (stem, pattern)))
+                            "occur in the record body as a bounded path token"
+                            % (stem, pattern)))
     return out
 
 

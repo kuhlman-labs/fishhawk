@@ -189,7 +189,9 @@
       "path": "docs/adr/018-review-stage-approval-defers-to-github-pr-merge.md",
       "status": "accepted",
       "supersedes": [],
-      "superseded_by": [],
+      "superseded_by": [
+        "ADR-031"
+      ],
       "applies_to": []
     },
     {
@@ -250,6 +252,286 @@
       "id": "ADR-025",
       "title": "Scope-policy: workflow-spec timeouts, predicted runtime, and plan-driven decomposition",
       "path": "docs/adr/025-scope-policy-timeouts-runtime-decomposition.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-026",
+      "title": "Backward-compatibility discipline for schema-extension PRs",
+      "path": "docs/adr/026-backward-compatibility-for-schema-extension-prs.md",
+      "status": "unknown",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-027",
+      "title": "Review-agent stage primitive: per-stage agent + human reviewer counts",
+      "path": "docs/adr/027-review-agent-stage-primitive.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-028",
+      "title": "Agent filesystem confinement requires an OS-level sandbox",
+      "path": "docs/adr/028-agent-filesystem-confinement-os-level-sandbox.md",
+      "status": "unknown",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-029",
+      "title": "Rule-of-Two / lethal-trifecta audit + network egress allow-listing",
+      "path": "docs/adr/029-rule-of-two-audit-network-egress-allow-listing.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-030",
+      "title": "Periodic cost budgets in the workflow spec (advisory + admission-time blocking)",
+      "path": "docs/adr/030-periodic-cost-budgets-in-workflow-spec.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-031",
+      "title": "Review gate succeeds only on verified landing (platform-neutral, delivery-agnostic)",
+      "path": "docs/adr/031-review-gate-succeeds-only-on-verified-landing.md",
+      "status": "unknown",
+      "supersedes": [
+        "ADR-018"
+      ],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-032",
+      "title": "Decomposition delivery model: one consolidated PR per decomposition",
+      "path": "docs/adr/032-decomposition-one-consolidated-pr.md",
+      "status": "unknown",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-033",
+      "title": "MCP transport: stdio-only vs. add streamable-HTTP (relationship to the #655 gateway)",
+      "path": "docs/adr/033-mcp-transport-stdio-vs-streamable-http.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-034",
+      "title": "Kubernetes deployment model — relationship to ECS, deps, secrets, worker model",
+      "path": "docs/adr/034-kubernetes-deployment-model.md",
+      "status": "unknown",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-035",
+      "title": "Own and enforce the git contract of a run (declared base + sole-writer branch lineage)",
+      "path": "docs/adr/035-run-git-contract-declared-base-sole-writer.md",
+      "status": "unknown",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-036",
+      "title": "Gate plan approval on agent-review completion (block-on-completion, unblock-on-terminal)",
+      "path": "docs/adr/036-gate-plan-approval-on-agent-review-completion.md",
+      "status": "unknown",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-037",
+      "title": "Agent-facing waits follow the MCP Tasks / long-running-operation contract (durable handle + authoritative poll)",
+      "path": "docs/adr/037-agent-facing-waits-follow-mcp-tasks-contract.md",
+      "status": "unknown",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-038",
+      "title": "Add a deploy stage type for post-merge release governance",
+      "path": "docs/adr/038-deploy-stage-type-post-merge-release-governance.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-039",
+      "title": "Agentic deploy execution (skills perform the rollout)",
+      "path": "docs/adr/039-agentic-deploy-execution.md",
+      "status": "unknown",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-040",
+      "title": "Operator agent as a product-defined role contract: versioned playbook, gate-delegation knobs, thin-by-design",
+      "path": "docs/adr/040-operator-agent-role-contract.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": [
+        "docs/spec/operator-role.schema.json",
+        ".fishhawk/operator.yaml"
+      ]
+    },
+    {
+      "id": "ADR-041",
+      "title": "Per-child branch isolation + fan-in integration for parallel decomposition",
+      "path": "docs/adr/041-per-child-branch-isolation-fan-in-integration.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-042",
+      "title": "Fix-up session continuity: resume the prior implement agent session vs. prompt-level continuity",
+      "path": "docs/adr/042-fixup-session-continuity.md",
+      "status": "unknown",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-043",
+      "title": "Stale-base integration policy for concurrent agent branches (runner merges base before PR; clean verdict-transfer vs conflict re-invoke+re-review; merge not rebase)",
+      "path": "docs/adr/043-stale-base-integration-policy.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-044",
+      "title": "model cost observability — warn-not-fail price drift-check, 3-bucket fresh/read/write cache cost model with separate capture, split cost-accuracy from efficiency-metric, daily cadence",
+      "path": "docs/adr/044-model-cost-observability.md",
+      "status": "unknown",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-045",
+      "title": "runner-backend identification — derive runner_kind from the execution channel (host-dispatch ⇒ local, runner self-report, mismatch guardrail), not an operator declaration",
+      "path": "docs/adr/045-runner-backend-identification.md",
+      "status": "unknown",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-046",
+      "title": "Workflow schema major-version coexistence model — how workflow-v1 (deploy stage) coexists with and routes against workflow-v0",
+      "path": "docs/adr/046-workflow-schema-major-version-coexistence.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": [
+        "docs/spec/workflow-v1.schema.json",
+        "backend/internal/spec/schemas/workflow-v1.schema.json",
+        "cli/internal/spec/schemas/workflow-v1.schema.json",
+        "backend/internal/spec/**"
+      ]
+    },
+    {
+      "id": "ADR-047",
+      "title": "Campaign primitive — dependency-ordered multi-run sprint driving, generalizing the decomposition fan-out engine to the epic/issue level",
+      "path": "docs/adr/047-campaign-primitive.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-048",
+      "title": "Repository onboarding — `fishhawk init` + `doctor` (CLI engine), MCP/skill wrapper, and App-PR scaffolding, preset-driven from typed specs",
+      "path": "docs/adr/048-repository-onboarding-init-doctor.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-049",
+      "title": "Acceptance-validation stage: agent-driven behavioral validation against intent before release",
+      "path": "docs/adr/049-acceptance-validation-stage.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-050",
+      "title": "Acceptance-agent egress + credential posture (runner-embedded default-deny proxy)",
+      "path": "docs/adr/050-acceptance-agent-egress-credential-posture.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-051",
+      "title": "Release governance: evidence-derived release notes + delegating publish",
+      "path": "docs/adr/051-release-governance-release-notes-delegating-publish.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-052",
+      "title": "Intake and refinement: natural-language brief to gated epic/children drafts",
+      "path": "docs/adr/052-intake-and-refinement-brief-to-drafts.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-053",
+      "title": "Post-deploy verification + incident intake (closing the ops-to-dev loop)",
+      "path": "docs/adr/053-post-deploy-verification-incident-intake.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-054",
+      "title": "Compliance export surface posture (auth scope, redaction, filtering semantics)",
+      "path": "docs/adr/054-compliance-export-surface-posture.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-055",
+      "title": "Approval identity: quorum + eligibility predicates + forge-verified identity (GitHub/GitLab-agnostic)",
+      "path": "docs/adr/055-approval-identity-quorum-eligibility-forge-verified.md",
       "status": "accepted",
       "supersedes": [],
       "superseded_by": [],
