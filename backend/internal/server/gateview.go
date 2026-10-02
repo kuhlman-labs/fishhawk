@@ -260,10 +260,20 @@ type gateViewConcern struct {
 	// SettledRef is the stable id of the settled concern this one re-raises
 	// (#1913), so the operator can follow the re-raise lineage. Omitted when
 	// the concern re-raises nothing.
-	SettledRef        string               `json:"settled_ref,omitempty"`
-	HasSuggestedPatch bool                 `json:"has_suggested_patch"`
-	Fixups            []gateViewFixup      `json:"fixups,omitempty"`
-	Resolutions       []gateViewResolution `json:"resolutions,omitempty"`
+	SettledRef string `json:"settled_ref,omitempty"`
+	// ReviewerRole / QuoteUnverified / SeverityClampedFrom are the persona
+	// concern ingest markers (E55.10 / #3755), read from the row: which
+	// reviewer raised the concern (a persona name, "standard", or omitted for
+	// an unattributed legacy row), whether its quoted document passage failed
+	// verification against the injected text (demoting it to low), and the
+	// reviewer's original severity when ingest lowered it. All omitempty, so a
+	// legacy row's payload is byte-identical.
+	ReviewerRole        string               `json:"reviewer_role,omitempty"`
+	QuoteUnverified     bool                 `json:"quote_unverified,omitempty"`
+	SeverityClampedFrom string               `json:"severity_clamped_from,omitempty"`
+	HasSuggestedPatch   bool                 `json:"has_suggested_patch"`
+	Fixups              []gateViewFixup      `json:"fixups,omitempty"`
+	Resolutions         []gateViewResolution `json:"resolutions,omitempty"`
 	// Disputed reports that a reviewer recorded a `confirmed` resolution on
 	// this concern and the concern is STILL OPEN (E48.103 / #2551) — the
 	// split resolve/reject the merge gate must not settle silently.
@@ -362,6 +372,12 @@ type gateViewSettledConcern struct {
 	// the original concern must survive into it. Both omitempty.
 	NewEvidence string `json:"new_evidence,omitempty"`
 	SettledRef  string `json:"settled_ref,omitempty"`
+	// ReviewerRole / QuoteUnverified / SeverityClampedFrom mirror
+	// gateViewConcern's persona ingest markers (E55.10 / #3755) so a settled
+	// persona concern keeps its attribution and demotion record. All omitempty.
+	ReviewerRole        string `json:"reviewer_role,omitempty"`
+	QuoteUnverified     bool   `json:"quote_unverified,omitempty"`
+	SeverityClampedFrom string `json:"severity_clamped_from,omitempty"`
 }
 
 // gateViewSuppressedRelitig mirrors concernRelitigationSuppressedPayload on
@@ -686,6 +702,10 @@ func (s *Server) buildGateView(ctx context.Context, runID uuid.UUID, stageKind s
 			StateReason:   c.StateReason,
 			NewEvidence:   c.NewEvidence,
 			SettledRef:    c.SettledRef,
+			// Persona ingest markers (E55.10 / #3755).
+			ReviewerRole:        c.ReviewerRole,
+			QuoteUnverified:     c.QuoteUnverified,
+			SeverityClampedFrom: c.SeverityClampedFrom,
 		})
 	}
 
@@ -1126,6 +1146,10 @@ func gateViewOpenConcern(c *concern.Concern, h gateViewHistory) gateViewConcern 
 		NewEvidence:       c.NewEvidence,
 		SettledRef:        c.SettledRef,
 		HasSuggestedPatch: c.SuggestedPatch != "",
+		// Persona ingest markers (E55.10 / #3755).
+		ReviewerRole:        c.ReviewerRole,
+		QuoteUnverified:     c.QuoteUnverified,
+		SeverityClampedFrom: c.SeverityClampedFrom,
 	}
 	if c.StageKind == concern.StageKindImplement {
 		out.Round = gateViewRound(h.triggers, c.StageID, c.OriginReviewSequence)

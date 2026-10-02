@@ -4262,3 +4262,66 @@ func TestGateDivergenceMirror_WireBoundary(t *testing.T) {
 		t.Fatalf("second answer err = %v, want divergence_already_answered", err)
 	}
 }
+
+// TestPersonaConcernMarkers_DecodeOnEveryMirror pins the hand-maintained wire
+// mirrors for the E55.10 / #3755 persona concern ingest markers on all three
+// concern surfaces the MCP tools decode: the run-status concern item, the gate
+// view's open concern, and its settled-ledger row. Driven from raw
+// server-shaped bytes (not the Go struct) because a json-tag drift decodes to
+// the zero value silently — never an error — so the attribution would vanish
+// from every MCP consumer with nothing red. Each surface is self-paired against
+// the SAME shape with the markers absent, so the populated assertion cannot be
+// satisfied by a field that is always set.
+func TestPersonaConcernMarkers_DecodeOnEveryMirror(t *testing.T) {
+	const marked = `{"id":"x","stage_kind":"implement","state":"raised","severity":"low","category":"correctness",` +
+		`"reviewer_role":"security-reviewer","quote_unverified":true,"severity_clamped_from":"high"}`
+	const unmarked = `{"id":"x","stage_kind":"implement","state":"raised","severity":"low","category":"correctness"}`
+
+	t.Run("run-status concern item", func(t *testing.T) {
+		var got, absent RunConcernItem
+		if err := json.Unmarshal([]byte(marked), &got); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if got.ReviewerRole != "security-reviewer" || !got.QuoteUnverified {
+			t.Errorf("RunConcernItem = %+v, want reviewer_role security-reviewer + quote_unverified true (a json tag does not byte-match the backend)", got)
+		}
+		if err := json.Unmarshal([]byte(unmarked), &absent); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if absent.ReviewerRole != "" || absent.QuoteUnverified {
+			t.Errorf("RunConcernItem from a body omitting the markers = %+v, want zero values", absent)
+		}
+	})
+
+	t.Run("gate-view open concern", func(t *testing.T) {
+		var got, absent GateViewConcern
+		if err := json.Unmarshal([]byte(marked), &got); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if got.ReviewerRole != "security-reviewer" || !got.QuoteUnverified || got.SeverityClampedFrom != "high" {
+			t.Errorf("GateViewConcern = %+v, want every persona marker decoded (a mistyped tag zeroes one silently)", got)
+		}
+		if err := json.Unmarshal([]byte(unmarked), &absent); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if absent.ReviewerRole != "" || absent.QuoteUnverified || absent.SeverityClampedFrom != "" {
+			t.Errorf("GateViewConcern from a body omitting the markers = %+v, want zero values", absent)
+		}
+	})
+
+	t.Run("gate-view settled concern", func(t *testing.T) {
+		var got, absent GateViewSettledConcern
+		if err := json.Unmarshal([]byte(marked), &got); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if got.ReviewerRole != "security-reviewer" || !got.QuoteUnverified || got.SeverityClampedFrom != "high" {
+			t.Errorf("GateViewSettledConcern = %+v, want every persona marker decoded (a mistyped tag zeroes one silently)", got)
+		}
+		if err := json.Unmarshal([]byte(unmarked), &absent); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if absent.ReviewerRole != "" || absent.QuoteUnverified || absent.SeverityClampedFrom != "" {
+			t.Errorf("GateViewSettledConcern from a body omitting the markers = %+v, want zero values", absent)
+		}
+	})
+}
