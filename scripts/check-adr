@@ -84,8 +84,15 @@ DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 HEADING_RE = re.compile(r"^(#{1,6})\s+")
 # A Decision heading: 'Decision' starts the heading OR starts a slash-separated
 # part of it ('## Recommendation / Decision'). 'Decisions ...' and 'The deferred
-# decision ...' do not match.
-DECISION_RE = re.compile(r"^#{1,6}\s+(?:[^/\n]*/\s*)*Decision\b", re.IGNORECASE)
+# decision ...' do not match. Written UNAMBIGUOUSLY so a failing match is linear
+# (E78.3 / #3724): each repetition ends at a '/' its body cannot contain, so the
+# split into repetitions is unique, and the single leading \s leaves no run of
+# whitespace that both a \s+ and [^/\n]* could claim. The E78.2 form
+# ^#{1,6}\s+(?:[^/\n]*/\s*)*Decision\b backtracked exponentially on repeated
+# ' /' and ^#{1,6}\s+(?:[^/\n]*/)*\s*Decision\b quadratically on a long
+# whitespace run. The matched language is unchanged (exhaustive fuzz recorded in
+# the scripts/test-adr header); the cost is pinned by test-adr h36/h36b.
+DECISION_RE = re.compile(r"^#{1,6}\s(?:[^/\n]*/)*\s*Decision\b", re.IGNORECASE)
 FENCE_RE = re.compile(r"^\s*(```|~~~)")
 # A line that is ENTIRELY ONE italic span with no inner delimiter (_x_ or *x*),
 # never bold (**x**) and never two spans around text ('_a_ Accepted _b_').

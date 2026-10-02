@@ -328,7 +328,9 @@
       "path": "docs/adr/033-mcp-transport-stdio-vs-streamable-http.md",
       "status": "accepted",
       "supersedes": [],
-      "superseded_by": [],
+      "superseded_by": [
+        "ADR-076"
+      ],
       "applies_to": []
     },
     {
@@ -532,6 +534,245 @@
       "id": "ADR-055",
       "title": "Approval identity: quorum + eligibility predicates + forge-verified identity (GitHub/GitLab-agnostic)",
       "path": "docs/adr/055-approval-identity-quorum-eligibility-forge-verified.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-056",
+      "title": "External anchoring of the audit head: tamper-evidence beyond the exported chain",
+      "path": "docs/adr/056-external-anchoring-of-the-audit-head.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-057",
+      "title": "Multi-tenancy model and tenant isolation for hosted deployment",
+      "path": "docs/adr/057-multi-tenancy-model-tenant-isolation.md",
+      "status": "unknown",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-058",
+      "title": "Second-forge support: GitLab repositories, work items, and GitLab CI",
+      "path": "docs/adr/058-second-forge-support-gitlab.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [
+        "ADR-061"
+      ],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-059",
+      "title": "Evidence-gated correctness lens in implement-review",
+      "path": "docs/adr/059-evidence-gated-correctness-lens-implement-review.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-060",
+      "title": "MCP session-survival shim: stdio supervisor as gateway phase 0",
+      "path": "docs/adr/060-mcp-session-survival-shim.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": [
+        "cmd/fishhawk-mcp-shim/**"
+      ]
+    },
+    {
+      "id": "ADR-061",
+      "title": "Multi-tenancy foundation: workspace-scoped tenancy with Postgres RLS isolation",
+      "path": "docs/adr/061-multi-tenancy-foundation-workspace-rls.md",
+      "status": "unknown",
+      "supersedes": [
+        "ADR-058"
+      ],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-062",
+      "title": "Regional-cells control plane: fishhawk-directory service, directory-first region pinning, per-cell inference config",
+      "path": "docs/adr/062-regional-cells-control-plane.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": [
+        "directory/**"
+      ]
+    },
+    {
+      "id": "ADR-063",
+      "title": "Isolate untrusted gate-command execution: container sandbox for .git-metadata, egress, and host-filesystem containment",
+      "path": "docs/adr/063-isolate-untrusted-gate-command-execution.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-064",
+      "title": "Forge project board as declarative work-queue input and derived status projection",
+      "path": "docs/adr/064-forge-project-board-work-queue-input.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-065",
+      "title": "Backlog grooming / prioritization agent with workflow-declared tunable autonomy",
+      "path": "docs/adr/065-backlog-grooming-prioritization-agent.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-066",
+      "title": "Workflow-declared autonomy tier and path-scoped control surface",
+      "path": "docs/adr/066-workflow-declared-autonomy-tier.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-067",
+      "title": "Workflow spec grammar consolidation: break the duplicate surfaces and add reuse before the first external consumer",
+      "path": "docs/adr/067-workflow-spec-grammar-consolidation.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": [
+        "docs/spec/workflow-v2.schema.json"
+      ]
+    },
+    {
+      "id": "ADR-068",
+      "title": "Repo-declared review conventions: workflow-declared, server-injected supplemental criteria for plan and implement review",
+      "path": "docs/adr/068-repo-declared-review-conventions.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-069",
+      "title": "Separate execution eligibility from autonomy: an `execution:` namespace, type-derived workflow eligibility, and the emergency bypass as an audited action",
+      "path": "docs/adr/069-separate-execution-eligibility-from-autonomy.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-070",
+      "title": "Cost forecasting as a planning input: interval forecasts at the plan gate, an in-flight circuit-breaker, and budget-aware grooming",
+      "path": "docs/adr/070-cost-forecasting-as-planning-input.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-071",
+      "title": "Beta hardening for external operators: intake sanitization, gate notification and SLA, and per-tenant limits",
+      "path": "docs/adr/071-beta-hardening-for-external-operators.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-072",
+      "title": "Customers bring their own model credentials (BYOK): inference cost sits with the customer, Fishhawk charges for the governance layer",
+      "path": "docs/adr/072-customers-bring-own-model-credentials-byok.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-073",
+      "title": "Kubernetes and the Helm chart are the single deployment substrate; retire the unexercised ECS path",
+      "path": "docs/adr/073-kubernetes-helm-single-deployment-substrate.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": [
+        "infra/terraform/**"
+      ]
+    },
+    {
+      "id": "ADR-074",
+      "title": "Reviewer agents run on customer infrastructure: fishhawkd orchestrates and records but never executes an agent",
+      "path": "docs/adr/074-reviewer-agents-run-on-customer-infrastructure.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-075",
+      "title": "Kubernetes runner backend: run agent stages in the customer's own cluster instead of their CI platform",
+      "path": "docs/adr/075-kubernetes-runner-backend.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-076",
+      "title": "MCP over HTTP served by fishhawkd, with fishhawkd as the OAuth authorization server — supersedes ADR-033's loopback gate",
+      "path": "docs/adr/076-mcp-over-http-fishhawkd-oauth-authorization-server.md",
+      "status": "accepted",
+      "supersedes": [
+        "ADR-033"
+      ],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-077",
+      "title": "Bounding the get_run_status response: what limit, which boundary, and what an elision pointer honestly promises",
+      "path": "docs/adr/077-bounding-get-run-status-response.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-078",
+      "title": "Ground the review agents by widening context and narrowing capability: export the reviewed tree, scrub the inherited environment, grant read and search only",
+      "path": "docs/adr/078-ground-review-agents-widen-context-narrow-capability.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-079",
+      "title": "Product and program management agent for human-ratified charters, release strategy, and readiness",
+      "path": "docs/adr/079-product-and-program-management-agent.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-080",
+      "title": "Solo-captain alpha: the repository is the unit, one developer commands the full crew locally from the bridge",
+      "path": "docs/adr/080-solo-captain-alpha.md",
       "status": "accepted",
       "supersedes": [],
       "superseded_by": [],
