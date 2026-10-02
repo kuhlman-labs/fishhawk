@@ -5666,3 +5666,196 @@ func TestRunPlanReviews_DocumentResolutionFailure_GatingTransitionFailureLogged(
 	}
 	assertReviewFailedClosed(t, reviewer, au, stageID, "plan_review_failed", "plan_review_started", reviewMissingPath)
 }
+
+// ---------------------------------------------------------------------------
+// Reviewer personas on the PLAN-review path (ADR-084 / E55.8 / #3753). Shared
+// fixtures (personaSpec, newPersonaPlanRun, personaLessPlanPrompt, …) live in
+// reviewer_persona_test.go.
+// ---------------------------------------------------------------------------
+
+// (R1) GOLDEN byte-identity on the plan path: attaching a persona leaves the
+// standard reviewer's prompt byte-identical to a persona-less run, while the
+// persona runs on its OWN prompt carrying the remit block (heading + body) and
+// the plan. The remit is attributed at the run's admission commit with the
+// persona declaration site; plan_review_started counts the persona and names
+// it; only the persona's verdict carries `persona`.
+//
+// Counterfactuals: (a) make the loop hand the persona the SHARED prompt
+// (promptFor returning sharedPrompt) — the persona prompt lacks the remit and
+// this goes RED; (b) append the remit to trig.InjectedDocuments before the
+// standard prompt.Build — the standard prompt differs from the golden and this
+// goes RED.
+func TestPlanReview_Persona_GoldenStandardPromptAndOwnPersonaPrompt(t *testing.T) {
+	golden := personaLessPlanPrompt(t)
+	std, persona := approvingFake(), approvingFake()
+	p := newPersonaPlanRun(t, personaSpec(personaSpecOpts{attachOn: "plan"}), std, persona)
+	if p.review(t) {
+		t.Fatal("approving reviewers must not gate")
+	}
+
+	stdCalls, perCalls := reviewerCalls(std), reviewerCalls(persona)
+	if len(stdCalls) != 1 || len(perCalls) != 1 {
+		t.Fatalf("calls: standard %d persona %d, want 1 and 1", len(stdCalls), len(perCalls))
+	}
+	if stdCalls[0] != golden {
+		t.Error("standard reviewer prompt is not byte-identical to the persona-less golden prompt")
+	}
+	pp := perCalls[0]
+	for _, want := range []string{personaRemitHeading, personaRemitBody, planfixture.Valid()["summary"].(string)} {
+		if !strings.Contains(pp, want) {
+			t.Errorf("persona prompt missing %q", want)
+		}
+	}
+	if strings.Contains(stdCalls[0], personaRemitBody) || strings.Contains(stdCalls[0], personaRemitHeading) {
+		t.Error("the remit leaked into the standard reviewer prompt")
+	}
+
+	inj := remitInjections(t, p.au)
+	if len(inj) != 1 {
+		t.Fatalf("remit document_injected entries = %d, want 1", len(inj))
+	}
+	if inj[0]["declaration_site"] != personaDeclSite || inj[0]["commit"] != personaBaseCommit || inj[0]["base_source"] != "run_admission" {
+		t.Errorf("remit attribution = %v, want site %q commit %q base_source run_admission", inj[0], personaDeclSite, personaBaseCommit)
+	}
+	started := decodeStarted(t, p.au, "plan_review_started")
+	if started.ConfiguredAgents != 2 || !slices.Equal(started.Personas, []string{personaTestName}) {
+		t.Errorf("plan_review_started = {configured %d personas %v}, want {2 [%s]}", started.ConfiguredAgents, started.Personas, personaTestName)
+	}
+	var personaVerdicts, standardVerdicts int
+	for _, v := range collectPlanReviewed(t, p.au) {
+		switch v.Persona {
+		case personaTestName:
+			personaVerdicts++
+		case "":
+			standardVerdicts++
+		default:
+			t.Errorf("unexpected persona %q on a verdict", v.Persona)
+		}
+	}
+	if personaVerdicts != 1 || standardVerdicts != 1 {
+		t.Errorf("verdicts: persona %d standard %d, want 1 and 1", personaVerdicts, standardVerdicts)
+	}
+	if !planreview.Settled(started.ConfiguredAgents, terminalCount(p.au, "plan")) {
+		t.Errorf("round not settled: %d terminal entries for configured_agents %d", terminalCount(p.au, "plan"), started.ConfiguredAgents)
+	}
+}
+
+// (R8) configured_agents counts the persona even when it degrades: the
+// started entry says 2 and two terminal entries land.
+//
+// Counterfactual: emit reviewersCfg.AgentCount() alone — the started entry
+// says 1 and this goes RED.
+func TestPlanReview_Persona_ConfiguredAgentsCountsPersona(t *testing.T) {
+	p := newPersonaPlanRun(t, personaSpec(personaSpecOpts{attachOn: "plan", human: 1}), approvingFake(), approvingFake())
+	delete(p.fetcher.files, personaRemitPath)
+	p.review(t)
+	started := decodeStarted(t, p.au, "plan_review_started")
+	if started.ConfiguredAgents != 2 {
+		t.Errorf("configured_agents = %d, want 2 (standard + persona)", started.ConfiguredAgents)
+	}
+	if got := terminalCount(p.au, "plan"); got != 2 {
+		t.Errorf("terminal entries = %d, want 2", got)
+	}
+}
+
+// (Condition 3) the persona's provider EQUALS the standard reviewer's: both
+// resolve to the SAME adapter. Terminal entries are matched by COUNT
+// (planreview.Settled), not by provider, so the round settles at
+// configured_agents == 2 with exactly two verdicts — no dedupe, no
+// double-count — and the one adapter sees two distinct prompts.
+func TestPlanReview_Persona_SharedProviderSettlesAtTwo(t *testing.T) {
+	shared := approvingFake()
+	p := newPersonaPlanRun(t, personaSpec(personaSpecOpts{attachOn: "plan", personaProvider: "anthropic"}), shared, nil)
+	p.s.cfg.PlanReviewers = personaReviewerSet{def: shared, byKey: map[string]PlanReviewer{
+		"anthropic/" + personaStdModel:   shared,
+		"anthropic/" + personaAgentModel: shared,
+	}}
+	p.review(t)
+	calls := reviewerCalls(shared)
+	if len(calls) != 2 {
+		t.Fatalf("shared adapter calls = %d, want 2 (standard + persona, no dedupe)", len(calls))
+	}
+	if strings.Contains(calls[0], personaRemitBody) == strings.Contains(calls[1], personaRemitBody) {
+		t.Error("want exactly one of the two prompts to carry the remit")
+	}
+	started := decodeStarted(t, p.au, "plan_review_started")
+	verdicts := collectPlanReviewed(t, p.au)
+	if started.ConfiguredAgents != 2 || len(verdicts) != 2 || terminalCount(p.au, "plan") != 2 {
+		t.Errorf("configured %d verdicts %d terminal %d, want 2/2/2", started.ConfiguredAgents, len(verdicts), terminalCount(p.au, "plan"))
+	}
+	if !planreview.Settled(started.ConfiguredAgents, terminalCount(p.au, "plan")) {
+		t.Error("round not settled")
+	}
+}
+
+// (R7) Grounding isolation: a grounding-capable standard reviewer and a
+// NON-grounded persona. The standard prompt names the exported tree exactly as
+// in a persona-less grounded run (grounding is decided over the STANDARD
+// invocations only), while the persona's prompt carries the diff-only clause
+// and the persona is invoked with no tree.
+//
+// Counterfactual: drop the ReviewTree* clearing for a non-grounded persona —
+// its prompt then claims a tree it cannot read (no DIFF-ONLY clause) and this
+// goes RED.
+func TestPlanReview_Persona_GroundingIsolation(t *testing.T) {
+	repo, _ := gitFixtureRepo(t)
+	newStd := func() *groundingFakeReviewer {
+		return &groundingFakeReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "m"}
+	}
+	baseStd := newStd()
+	base := newPersonaPlanRun(t, personaSpec(personaSpecOpts{}), baseStd, nil)
+	base.rr.getRuns[base.runID].WorkingDir = repo
+	base.review(t)
+
+	std, persona := newStd(), approvingFake()
+	p := newPersonaPlanRun(t, personaSpec(personaSpecOpts{attachOn: "plan"}), std, persona)
+	p.rr.getRuns[p.runID].WorkingDir = repo
+	p.review(t)
+
+	if !std.reviewGroundedHit || std.treeDir == "" {
+		t.Fatalf("standard reviewer not grounded: hit=%v tree=%q", std.reviewGroundedHit, std.treeDir)
+	}
+	if std.prompt != baseStd.prompt {
+		t.Error("grounded standard prompt differs from the persona-less grounded run")
+	}
+	const diffOnly = "it is DIFF-ONLY"
+	if strings.Contains(std.prompt, diffOnly) {
+		t.Error("grounded standard prompt carries the diff-only clause")
+	}
+	calls := reviewerCalls(persona)
+	if len(calls) != 1 || !strings.Contains(calls[0], diffOnly) {
+		t.Errorf("non-grounded persona prompt must carry the diff-only clause (calls %d)", len(calls))
+	}
+}
+
+// (R10) A persona inherits the stage's authority: a persona REJECT under
+// gating authority fails the plan stage category-B, while under advisory it
+// does not block.
+func TestPlanReview_Persona_InheritsGatingAuthority(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		human    int
+		wantGate bool
+	}{
+		{"gating", 0, true},
+		{"advisory", 1, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			persona := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictReject}, model: "persona"}
+			p := newPersonaPlanRun(t, personaSpec(personaSpecOpts{attachOn: "plan", human: tc.human}), approvingFake(), persona)
+			if got := p.review(t); got != tc.wantGate {
+				t.Errorf("runPlanReviews = %v, want %v", got, tc.wantGate)
+			}
+			failed := false
+			for _, c := range p.rr.transitionStageCalls {
+				if c.StageID == p.stageID && c.To == run.StageStateFailed && c.Completion != nil &&
+					c.Completion.FailureCategory != nil && *c.Completion.FailureCategory == run.FailureB {
+					failed = true
+				}
+			}
+			if failed != tc.wantGate {
+				t.Errorf("stage failed-B = %v, want %v", failed, tc.wantGate)
+			}
+		})
+	}
+}

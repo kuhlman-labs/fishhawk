@@ -99,6 +99,13 @@ type reviewerInvocation struct {
 	// (default, including the bare count form which has no per-reviewer flag)
 	// → loud ERROR log + skipped audit. It never blocks the gate either way.
 	optional bool
+
+	// persona is non-nil when this invocation is a reviewer PERSONA (ADR-084 /
+	// E55.8 / #3753) rather than a standard reviewer: it carries the persona's
+	// OWN prompt and review tree (promptFor) or the remit-degrade detail that
+	// keeps it from running. nil for every standard reviewer, whose behaviour
+	// is unchanged (reviewer_persona.go).
+	persona *personaInvocation
 }
 
 // resolveReviewerInvocations maps a stage's ReviewersConfig to its
@@ -1685,6 +1692,19 @@ func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, p
 	}
 	s.recordCrewMessagesDelivered(ctx, runID, stageID, run.StageTypeReview, "plan_review", crewDeliveries.Sequences)
 
+	// Reviewer personas (ADR-084 / E55.8 / #3753): the personas the reviewed
+	// plan stage attaches run as EXTRA invocations of this loop, each on its OWN
+	// prompt built from a value copy of trig with its remit appended to a cloned
+	// document slice — AFTER the standard prompt above was built, so it is
+	// byte-identical to a persona-less round. Grounding was decided over the
+	// standard invocations alone, so a persona's capability can never change
+	// the standard prompt. A persona whose remit cannot be resolved or
+	// attributed is marked degraded here and records persona_remit_unavailable
+	// in the loop instead of running.
+	personaInvs := s.resolvePersonaInvocations(s.resolveStageReviewerPersonas(ctx, runRow, stageID))
+	s.buildPersonaPrompts(ctx, runRow, stageID, "plan_review", trig, injected, treeDir, personaInvs)
+	invocations = append(invocations, personaInvs...)
+
 	// Pending-signal (#600): now that a reviewer will actually run
 	// (agent>0 AND PlanReviewer wired), emit a plan_review_started audit
 	// entry. This is the only MCP-readable proxy that distinguishes a
@@ -1694,7 +1714,11 @@ func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, p
 	// has a lower audit sequence than reviewed under both gating
 	// (synchronous) and advisory (detached) authority. Best-effort:
 	// WARN-log and continue on append failure so dispatch is never blocked.
-	s.emitReviewStarted(ctx, runID, stageID, "plan_review_started", authority, reviewersCfg.AgentCount(), "", "", "")
+	//
+	// configured_agents counts every persona invocation too (#3753): each one
+	// produces exactly one terminal entry (verdict, failed or skipped), so the
+	// round settles at this count.
+	s.emitReviewStarted(ctx, runID, stageID, "plan_review_started", authority, reviewersCfg.AgentCount()+len(personaInvs), personaNames(personaInvs), "", "", "")
 
 	// invocations were resolved above (before the prompt build) so the grounding
 	// decision could key on the loop's capability set.
@@ -1933,13 +1957,17 @@ func (s *Server) planBudgetEvidence(ctx context.Context, runRow *run.Run, parsed
 // sequence into each verdict's ReviewRoundSequence so the review round is
 // RECORDED rather than inferred; the plan_review_started caller discards the
 // result unchanged.
-func (s *Server) emitReviewStarted(ctx context.Context, runID, stageID uuid.UUID, category string, authority planreview.AuthorityMode, configuredAgents int, headSHA, treeSHA, changeID string) (seq int64, ok bool) {
+//
+// personas lists the reviewer personas (#3753) counted in configuredAgents, in
+// attachment order; nil when the stage attaches none (payload byte-identical).
+func (s *Server) emitReviewStarted(ctx context.Context, runID, stageID uuid.UUID, category string, authority planreview.AuthorityMode, configuredAgents int, personas []string, headSHA, treeSHA, changeID string) (seq int64, ok bool) {
 	if s.cfg.AuditRepo == nil {
 		return 0, false
 	}
 	payload, _ := json.Marshal(planreview.ReviewStartedPayload{
 		ConfiguredAgents: configuredAgents,
 		Authority:        authority,
+		Personas:         personas,
 		// Empty for the plan path (no diff/head_sha; omitempty keeps the
 		// payload byte-identical); the implement path passes the bundle's
 		// verify_run head_sha as the #797 dedup key.
@@ -2030,7 +2058,10 @@ func (s *Server) emitReviewFailed(ctx context.Context, runID, stageID uuid.UUID,
 // counts as a terminal review entry (planreview.Settled), so the N-of-N
 // review-settled gate still resolves. ActorKind=system, best-effort,
 // WARN-log on append failure, mirroring emitReviewFailed.
-func (s *Server) emitReviewerUnavailable(ctx context.Context, runID, stageID uuid.UUID, category string, authority planreview.AuthorityMode, provider string, optional bool, configuredAgents int, resolveErr error) {
+//
+// persona names the reviewer persona (#3753) whose provider is unavailable,
+// stamped on the payload; "" for a standard reviewer (byte-identical).
+func (s *Server) emitReviewerUnavailable(ctx context.Context, runID, stageID uuid.UUID, category string, authority planreview.AuthorityMode, provider, persona string, optional bool, configuredAgents int, resolveErr error) {
 	knob := reviewerProviderEnvKnob(provider)
 	if optional {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
@@ -2062,6 +2093,7 @@ func (s *Server) emitReviewerUnavailable(ctx context.Context, runID, stageID uui
 		Authority:        authority,
 		Provider:         provider,
 		Optional:         optional,
+		Persona:          persona,
 	})
 	systemKind := audit.ActorKind("system")
 	if _, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
@@ -2203,7 +2235,6 @@ func (s *Server) runPlanReviewLoop(ctx context.Context, runID, stageID uuid.UUID
 	// hasRejection or an unconditional call) keeps a non-page invocation from
 	// flushing OLDER unpinged page-class events at an unrelated moment.
 	pagedRejectAppended := false
-	budget := reviewBudget.Budget(len(promptText))
 	for i, inv := range invocations {
 		// An unresolvable provider is a deployment CAPABILITY gap, not a
 		// reviewer error (#1495, reframes #955): the spec-declared provider is
@@ -2213,9 +2244,22 @@ func (s *Server) runPlanReviewLoop(ctx context.Context, runID, stageID uuid.UUID
 		// untouched. *_review_skipped counts as terminal (planreview.Settled),
 		// so the review-settled gate still resolves.
 		if inv.resolveErr != nil {
-			s.emitReviewerUnavailable(ctx, runID, stageID, "plan_review_skipped", authority, inv.provider, inv.optional, len(invocations), inv.resolveErr)
+			s.emitReviewerUnavailable(ctx, runID, stageID, "plan_review_skipped", authority, inv.provider, inv.personaName(), inv.optional, len(invocations), inv.resolveErr)
 			continue
 		}
+		// A reviewer persona whose remit could not be resolved, rendered or
+		// attributed never runs on a remit-less prompt (#3753): it records a
+		// terminal persona_remit_unavailable skip and the loop continues,
+		// hasRejection untouched.
+		if inv.persona != nil && inv.persona.promptText == "" {
+			s.emitPersonaDegraded(ctx, runID, stageID, "plan_review_skipped", authority, inv, len(invocations))
+			continue
+		}
+		// Each invocation runs on its OWN prompt (a persona's carries its
+		// remit), so the size-aware budget is computed per invocation; for a
+		// standard reviewer it is the shared prompt's budget, unchanged.
+		invPrompt, invTree := inv.promptFor(promptText, treeDir)
+		budget := reviewBudget.Budget(len(invPrompt))
 		// Resolve the reviewer's CLI version + binary-path provenance ONCE per
 		// invocation (#1768). The probed version is reused by the agent-version
 		// guard below (so the CLI is probed exactly once, not twice) and both
@@ -2247,7 +2291,7 @@ func (s *Server) runPlanReviewLoop(ctx context.Context, runID, stageID uuid.UUID
 				slog.String("agent_version_range", inv.agentVersion),
 				slog.String("reason", reason),
 			)
-			s.emitReviewFailed(ctx, runID, stageID, "plan_review_failed", authority, inv.specModel, reason, false)
+			s.emitReviewFailed(ctx, runID, stageID, "plan_review_failed", authority, inv.specModel, inv.personaFailureReason(reason), false)
 			hasRejection = true
 			continue
 		} else if degraded {
@@ -2267,7 +2311,7 @@ func (s *Server) runPlanReviewLoop(ctx context.Context, runID, stageID uuid.UUID
 		// at its own cfg.Timeout. cancel() is called directly each turn (not a
 		// deferred stack) so deadlines don't accumulate across reviewers.
 		invocationCtx, cancel := context.WithTimeout(ctx, budget)
-		verdict, model, err := s.invokeReview(invocationCtx, inv, promptText, treeDir)
+		verdict, model, err := s.invokeReview(invocationCtx, inv, invPrompt, invTree)
 		timedOut := errors.Is(invocationCtx.Err(), context.DeadlineExceeded)
 		cancel()
 		if err != nil {
@@ -2285,7 +2329,7 @@ func (s *Server) runPlanReviewLoop(ctx context.Context, runID, stageID uuid.UUID
 			// discriminator (#747) tells a budget-kill apart from a transport
 			// failure. hasRejection is deliberately untouched — gating
 			// advance/degrade semantics are unchanged (#574); observability-only.
-			s.emitReviewFailed(ctx, runID, stageID, "plan_review_failed", authority, model, err.Error(), timedOut)
+			s.emitReviewFailed(ctx, runID, stageID, "plan_review_failed", authority, model, inv.personaFailureReason(err.Error()), timedOut)
 			continue
 		}
 
@@ -2316,6 +2360,9 @@ func (s *Server) runPlanReviewLoop(ctx context.Context, runID, stageID uuid.UUID
 			// probed once above. Empty for non-codex reviewers (omitempty).
 			ReviewerVersion: reviewerVersion,
 			ReviewerBinary:  reviewerBinary,
+			// The reviewer persona (#3753) that produced this verdict; empty
+			// for a standard reviewer (omitempty, byte-identical).
+			Persona: inv.personaName(),
 		}
 		payloadBytes, _ := json.Marshal(payload)
 		entry, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
