@@ -49,6 +49,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/scopeamendment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/stagecheck"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/tracestore"
 	"github.com/kuhlman-labs/fishhawk/pricing"
 )
@@ -13983,7 +13984,7 @@ func reviewInjectionDiff() policy.Diff {
 
 // (P2, #2797) TestShipTrace_ImplementReview_CarriesInjectedDocument drives the
 // REAL implement-review build site end to end — POST /v0/runs/{id}/trace (raw
-// variant) → runImplementReviewsForTree → resolveReviewInjectedDocuments →
+// variant) → runImplementReviewsForTree → resolveReviewDocuments →
 // repodoc resolve against a fake forge → audit → prompt render → the reviewer
 // adapter — and asserts on the prompt the reviewer RECEIVED.
 //
@@ -14158,7 +14159,7 @@ func TestRunSupplementalReinvokeReview_DocumentResolutionFailure_FailsClosed(t *
 // a silent no-op — no forge read, no document_injected append, and no new
 // failure path even when the declared document has since become unresolvable.
 //
-// Counterfactual: move the resolveReviewInjectedDocuments call (and the
+// Counterfactual: move the resolveReviewDocuments call (and the
 // prompt build) back above the guard — the duplicate appends a second
 // document_injected entry and this goes RED.
 func TestRunImplementReviews_DuplicateDispatch_NoDocumentResolution(t *testing.T) {
@@ -14415,5 +14416,672 @@ func TestImplementReview_Persona_FailureReasonNamesPersona(t *testing.T) {
 	}
 	if p.Reason != "persona security: adapter exploded" {
 		t.Errorf("reason = %q, want the persona-prefixed reason", p.Reason)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Review conventions on the IMPLEMENT-review path (E55.3 / #2244): resolution
+// through resolveReviewDocuments at the trace site, the ingest clamp, and the
+// once-per-round conventions_file_modified synthesis.
+// ---------------------------------------------------------------------------
+
+const (
+	// ircBackendConv is a REQUIRED, low-capped convention selected for any
+	// change touching backend/** — reviewInjectionDiff matches it.
+	ircBackendConv = "  backend:\n    path: " + rcConvPath + "\n    severity_cap: low\n    applies_to:\n      paths: [\"backend/**\"]\n"
+	// ircFrontendPath / ircFrontendConv is a convention whose applies_to
+	// matches nothing reviewInjectionDiff touches.
+	ircFrontendPath = "docs/conventions/frontend.md"
+	ircFrontendConv = "  frontend:\n    path: " + ircFrontendPath + "\n    applies_to:\n      paths: [\"frontend/**\"]\n"
+)
+
+// ircSpec is a v2 workflow whose plan and implement stages each run one
+// GATING agent reviewer per provider (in order). conventions is the
+// review_conventions block body ("" declares none); sel is the stages'
+// reviewers.conventions list ("" selects none).
+func ircSpec(conventions, sel string, providers ...string) []byte {
+	var b strings.Builder
+	b.WriteString("version: \"2\"\n")
+	if conventions != "" {
+		b.WriteString("review_conventions:\n" + conventions)
+	}
+	b.WriteString("workflows:\n  feature_change:\n    stages:\n")
+	stage := func(id, typ, produces string) {
+		fmt.Fprintf(&b, "      - id: %s\n        type: %s\n        executor:\n          agent: claude-code\n        produces:\n%s        reviewers:\n          agents:\n", id, typ, produces)
+		for _, p := range providers {
+			fmt.Fprintf(&b, "            - provider: %s\n", p)
+		}
+		if sel != "" {
+			fmt.Fprintf(&b, "          conventions: %s\n", sel)
+		}
+	}
+	stage("plan", "plan", "          - artifact: plan\n            schema: standard_v1\n")
+	stage("implement", "implement", "          - artifact: pull_request\n")
+	return []byte(b.String())
+}
+
+// ircServer wires an implement-review server over specBytes: the run records
+// the admission commit admCommitA, the resolver reads through an rcFetcher
+// (rcConvPath served ONLY at admCommitA), and a fake concern store is attached.
+// No declaration seam.
+func ircServer(t *testing.T, set ReviewerSet, specBytes []byte) (*Server, *auditFake, *run.Run, *run.Stage, *rcFetcher, *fakeConcernRepo) {
+	t.Helper()
+	s, _, au, _, runRow, implStage := newImplementReviewServerWithSet(t, set, specBytes)
+	runRow.DocumentBaseCommit = strPtr(admCommitA)
+	ff := newRCFetcher()
+	s.cfg.DocumentResolver = &repodoc.Resolver{Fetcher: ff, Commits: &admCommits{}}
+	cr := newFakeConcernRepo()
+	s.cfg.ConcernRepo = cr
+	return s, au, runRow, implStage, ff, cr
+}
+
+// ircModifiedNoticeHeading is the heading writeModifiedConventionFilesNotice
+// renders for Trigger.ModifiedConventionFiles.
+const ircModifiedNoticeHeading = "### Review-conventions files modified (machine-verified)"
+
+// ircModifiedDiff modifies the declared conventions file rcConvPath (and
+// nothing under backend/**, so the backend convention is NOT selected).
+func ircModifiedDiff() policy.Diff {
+	return policy.Diff{ChangedFiles: []policy.ChangedFile{{Path: rcConvPath, Status: policy.StatusModified}}}
+}
+
+// concernRowsByCategory returns the fake store's rows of category.
+func concernRowsByCategory(cr *fakeConcernRepo, category string) []*concern.Concern {
+	cr.mu.Lock()
+	defer cr.mu.Unlock()
+	var out []*concern.Concern
+	for _, c := range cr.rows {
+		if c.Category == category {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// countConcernCategory counts the concerns of category in one verdict payload.
+func countConcernCategory(cs []planreview.Concern, category string) int {
+	n := 0
+	for _, c := range cs {
+		if c.Category == category {
+			n++
+		}
+	}
+	return n
+}
+
+// TestRunImplementReviews_ReviewConventions_EndToEnd drives the trace-site
+// path spec -> selection on the diff paths -> resolution at the ADMISSION
+// commit -> prompt -> reviewer -> ingest clamp -> audit -> concern store ->
+// gating. The gating reviewer returns REJECT on one HIGH repo_convention
+// concern against the low-capped `backend` convention.
+//
+// Mechanism: without the ingest clamp the reject stands and the gating round
+// returns true. Counterfactuals: delete the clamp call in the streaming
+// branch -> RED on the return value, the payload and the concern row; drop
+// the server's verdict copy in invokeImplementReviewer -> the reviewer's own
+// verdict value is written, RED.
+func TestRunImplementReviews_ReviewConventions_EndToEnd(t *testing.T) {
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictReject, Concerns: []planreview.Concern{{
+			Severity: planreview.SeverityHigh, Category: planreview.RepoConventionConcernCategory, Convention: "backend",
+			Note: "exported Foo has no doc comment; rule: \"every exported func carries a doc comment\"",
+		}}},
+		model: "claude-sonnet-4-6",
+	}
+	s, au, runRow, implStage, ff, cr := ircServer(t, singleReviewerSet{reviewer},
+		ircSpec(ircBackendConv+ircFrontendConv, "[backend, frontend]", "anthropic"))
+
+	if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, reviewInjectionDiff(), nil, "head-e2e", nil) {
+		t.Error("runImplementReviews = true: a reject resting only on a clamped high must not gate")
+	}
+	calls := reviewerCalls(reviewer)
+	if len(calls) != 1 {
+		t.Fatalf("reviewer calls = %d, want 1", len(calls))
+	}
+	got := calls[0]
+	hi := strings.Index(got, "### "+prompt.ReviewConventionsHeading)
+	bi := strings.Index(got, rcConvContent)
+	mi := strings.Index(got, prompt.ImplementReviewSplitMarker)
+	if hi < 0 || bi < hi || mi < 0 || bi > mi {
+		t.Errorf("conventions section misplaced: heading@%d body@%d split marker@%d — want heading < body < ImplementReviewSplitMarker", hi, bi, mi)
+	}
+	if strings.Contains(got, ircFrontendPath) {
+		t.Error("the unmatched frontend convention was rendered")
+	}
+
+	vs := decodeImplementReviewed(t, au)
+	if len(vs) != 1 {
+		t.Fatalf("implement_reviewed = %d, want 1", len(vs))
+	}
+	v := vs[0]
+	if v.Verdict != planreview.VerdictApproveWithConcerns || v.VerdictClampedFrom != planreview.VerdictReject {
+		t.Errorf("payload verdict = %q (clamped from %q), want approve_with_concerns clamped from reject", v.Verdict, v.VerdictClampedFrom)
+	}
+	if len(v.Concerns) != 1 || v.Concerns[0].Severity != planreview.SeverityLow ||
+		v.Concerns[0].SeverityClampedFrom != planreview.SeverityHigh || v.Concerns[0].Convention != "backend" {
+		t.Errorf("payload concerns = %+v, want one low repo_convention clamped from high", v.Concerns)
+	}
+	rows := concernRowsByCategory(cr, planreview.RepoConventionConcernCategory)
+	if len(rows) != 1 || rows[0].Severity != string(planreview.SeverityLow) {
+		t.Errorf("concern rows = %+v, want one low repo_convention row", rows)
+	}
+	inj := auditFakeEntries(au, "document_injected")
+	if len(inj) != 1 {
+		t.Fatalf("document_injected = %d, want 1 (the backend convention only)", len(inj))
+	}
+	var p map[string]any
+	_ = json.Unmarshal(inj[0].Payload, &p)
+	if p["path"] != rcConvPath || p["declaration_site"] != rcConvSite || p["commit"] != admCommitA {
+		t.Errorf("document_injected payload = %v, want %s from %s at %s", p, rcConvPath, rcConvSite, admCommitA)
+	}
+	ff.mu.Lock()
+	fetched := slices.Clone(ff.calls)
+	ff.mu.Unlock()
+	for _, c := range fetched {
+		if strings.HasPrefix(c, ircFrontendPath) {
+			t.Errorf("the unmatched convention was fetched: %v", fetched)
+		}
+	}
+	// The server clamps its OWN copy: the reviewer adapter's verdict value is
+	// never written.
+	if reviewer.verdict.Verdict != planreview.VerdictReject || reviewer.verdict.Concerns[0].Severity != planreview.SeverityHigh {
+		t.Errorf("the reviewer's own verdict was mutated: %+v", reviewer.verdict)
+	}
+}
+
+// TestRunImplementReviews_RequiredConventionMissing_FailsLoudly: a REQUIRED
+// convention absent at the admission commit fails the gating review closed —
+// no reviewer runs, no implement_review_started, and implement_review_failed
+// names review_convention_missing, the path, the declaration site and the
+// commit.
+//
+// Counterfactual: ignore the resolveReviewDocuments error at the trace site ->
+// the reviewer runs, RED.
+func TestRunImplementReviews_RequiredConventionMissing_FailsLoudly(t *testing.T) {
+	reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-sonnet-4-6"}
+	s, au, runRow, implStage, ff, _ := ircServer(t, singleReviewerSet{reviewer}, ircSpec(ircBackendConv, "[backend]", "anthropic"))
+	delete(ff.files, rcConvPath+"@"+admCommitA)
+
+	if !s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, reviewInjectionDiff(), nil, "head-missing-conv", nil) {
+		t.Error("runImplementReviews = false, want true: a gating review whose required convention is missing must fail the stage")
+	}
+	assertReviewFailedClosed(t, reviewer, au, implStage.ID, "implement_review_failed", "implement_review_started",
+		reviewConventionMissingPrefix+": ", rcConvPath, rcConvSite, admCommitA)
+}
+
+// (C verdict) TestRunImplementReviews_ConventionsFileModified_ApproveUpgraded:
+// the diff modifies (or renames away) a declared conventions file and the ONE
+// gating reviewer returns a plain approve with NO concern. The round carries
+// exactly one server-synthesized conventions_file_modified concern, the
+// approve is upgraded to approve_with_concerns (verdict_raised_from approve),
+// the reviewer prompt names the file after ImplementReviewSplitMarker, and the
+// round does not gate.
+//
+// Mechanism: the reviewer emits no concern, so any row can only be
+// synthesized. Counterfactual: delete the synthesizeConventionsFileModified
+// call -> RED on the payload verdict and the concern rows.
+func TestRunImplementReviews_ConventionsFileModified_ApproveUpgraded(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		diff   policy.Diff
+		noRepo bool
+	}{
+		{"modified", ircModifiedDiff(), false},
+		{"renamed away via OldPath", policy.Diff{ChangedFiles: []policy.ChangedFile{{Path: "docs/moved.md", OldPath: rcConvPath, Status: policy.StatusRenamed}}}, false},
+		// A nil concern store falls open: the concern is still synthesized
+		// on the verdict payload.
+		{"no concern store", ircModifiedDiff(), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-sonnet-4-6"}
+			s, au, runRow, implStage, _, cr := ircServer(t, singleReviewerSet{reviewer}, ircSpec(ircBackendConv, "[backend]", "anthropic"))
+			if tc.noRepo {
+				s.cfg.ConcernRepo = nil
+			}
+			if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, tc.diff, nil, "head-cfm", nil) {
+				t.Error("runImplementReviews = true: an approve upgraded to approve_with_concerns must not gate")
+			}
+			calls := reviewerCalls(reviewer)
+			if len(calls) != 1 {
+				t.Fatalf("reviewer calls = %d, want 1", len(calls))
+			}
+			// The diff listing itself names rcConvPath after the split marker,
+			// so the notice is located by its own heading and must name the
+			// file inside its own list.
+			mi := strings.Index(calls[0], prompt.ImplementReviewSplitMarker)
+			ni := strings.Index(calls[0], ircModifiedNoticeHeading)
+			if mi < 0 || ni < mi || !strings.Contains(calls[0][ni:], "- "+rcConvPath+"\n") {
+				t.Errorf("the modified-conventions notice (@%d) naming %s is not after ImplementReviewSplitMarker (@%d)", ni, rcConvPath, mi)
+			}
+			vs := decodeImplementReviewed(t, au)
+			if len(vs) != 1 {
+				t.Fatalf("implement_reviewed = %d, want 1", len(vs))
+			}
+			v := vs[0]
+			if v.Verdict != planreview.VerdictApproveWithConcerns || v.VerdictRaisedFrom != planreview.VerdictApprove || !v.ConventionsFileModifiedSynthesized {
+				t.Errorf("payload = verdict %q raised_from %q synthesized %v, want approve_with_concerns / approve / true",
+					v.Verdict, v.VerdictRaisedFrom, v.ConventionsFileModifiedSynthesized)
+			}
+			if n := countConcernCategory(v.Concerns, planreview.ConventionsFileModifiedConcernCategory); n != 1 {
+				t.Errorf("payload conventions_file_modified concerns = %d, want 1", n)
+			}
+			for _, c := range v.Concerns {
+				if c.Category == planreview.ConventionsFileModifiedConcernCategory && (c.Severity != planreview.SeverityMedium || !strings.Contains(c.Note, rcConvPath)) {
+					t.Errorf("synthesized concern = %+v, want medium naming %s (never lowered by the clamp)", c, rcConvPath)
+				}
+			}
+			if tc.noRepo {
+				return
+			}
+			rows := concernRowsByCategory(cr, planreview.ConventionsFileModifiedConcernCategory)
+			if len(rows) != 1 || !rows[0].State.IsOpen() || rows[0].Severity != string(planreview.SeverityMedium) {
+				t.Errorf("concern rows = %+v, want exactly one open medium conventions_file_modified row", rows)
+			}
+		})
+	}
+}
+
+// (C once-per-round) TestRunImplementReviews_ConventionsFileModified_TwoReviewerRound:
+// two heterogeneous gating reviewers. Row 1: neither raises it -> exactly ONE
+// synthesized row, carried on reviewer 1's payload only. Row 2: only the LATER
+// reviewer raises it -> ZERO synthesized (the one row is reviewer 2's) and
+// reviewer 1's verdict stays a plain approve.
+//
+// Mechanism: in row 2 the only raiser is the later reviewer, so a per-verdict
+// inline decision would already have synthesized onto reviewer 1.
+// Counterfactual: decide synthesis per invocation (ingest every round in the
+// streaming branch with an inline synthesis) -> row 2 RED (two rows).
+func TestRunImplementReviews_ConventionsFileModified_TwoReviewerRound(t *testing.T) {
+	raised := planreview.Concern{Severity: planreview.SeverityMedium, Category: planreview.ConventionsFileModifiedConcernCategory, Note: "this change edits the conventions file"}
+	for _, tc := range []struct {
+		name      string
+		second    *planreview.ReviewVerdict
+		wantSynth bool
+	}{
+		{"neither reviewer raises it", &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, true},
+		{"only the later reviewer raises it", &planreview.ReviewVerdict{Verdict: planreview.VerdictApproveWithConcerns, Concerns: []planreview.Concern{raised}}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r1 := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "model-a"}
+			r2 := &fakePlanReviewer{verdict: tc.second, model: "model-b"}
+			set := fakeReviewerSet{def: r1, providers: map[string]PlanReviewer{"anthropic": r1, "codex": r2}}
+			s, au, runRow, implStage, _, cr := ircServer(t, set, ircSpec(ircBackendConv, "[backend]", "anthropic", "codex"))
+
+			if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, ircModifiedDiff(), nil, "head-two", nil) {
+				t.Error("runImplementReviews = true, want false")
+			}
+			vs := decodeImplementReviewed(t, au)
+			if len(vs) != 2 || vs[0].ReviewerModel != "model-a" || vs[1].ReviewerModel != "model-b" {
+				t.Fatalf("implement_reviewed = %+v, want model-a then model-b", vs)
+			}
+			rows := concernRowsByCategory(cr, planreview.ConventionsFileModifiedConcernCategory)
+			if len(rows) != 1 {
+				t.Fatalf("conventions_file_modified rows = %d, want exactly 1", len(rows))
+			}
+			if tc.wantSynth {
+				if !vs[0].ConventionsFileModifiedSynthesized || vs[0].VerdictRaisedFrom != planreview.VerdictApprove || vs[0].Verdict != planreview.VerdictApproveWithConcerns {
+					t.Errorf("reviewer 1 payload = %+v, want the synthesized carrier", vs[0])
+				}
+				if vs[1].ConventionsFileModifiedSynthesized || vs[1].Verdict != planreview.VerdictApprove || len(vs[1].Concerns) != 0 {
+					t.Errorf("reviewer 2 payload = %+v, want it untouched", vs[1])
+				}
+				if rows[0].ReviewerModel == nil || *rows[0].ReviewerModel != "model-a" {
+					t.Errorf("synthesized row reviewer = %v, want model-a", rows[0].ReviewerModel)
+				}
+				return
+			}
+			if vs[0].ConventionsFileModifiedSynthesized || vs[0].Verdict != planreview.VerdictApprove || len(vs[0].Concerns) != 0 || vs[0].VerdictRaisedFrom != "" {
+				t.Errorf("reviewer 1 payload = %+v, want a plain approve (the later reviewer raised it)", vs[0])
+			}
+			if vs[1].ConventionsFileModifiedSynthesized {
+				t.Error("reviewer 2's own concern was marked synthesized")
+			}
+			if rows[0].ReviewerModel == nil || *rows[0].ReviewerModel != "model-b" {
+				t.Errorf("the one row's reviewer = %v, want model-b", rows[0].ReviewerModel)
+			}
+		})
+	}
+}
+
+// TestRunImplementReviews_ConventionsFileModified_WaivedInPriorRound_NotReminted:
+// a conventions_file_modified concern the operator WAIVED in an earlier round
+// suppresses re-synthesis on the next round; an ADDRESSED one does not.
+//
+// Counterfactual: make conventionsFileModifiedAlreadyRaised return false ->
+// the second round mints a second row, RED.
+func TestRunImplementReviews_ConventionsFileModified_WaivedInPriorRound_NotReminted(t *testing.T) {
+	reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-sonnet-4-6"}
+	s, au, runRow, implStage, _, cr := ircServer(t, singleReviewerSet{reviewer}, ircSpec(ircBackendConv, "[backend]", "anthropic"))
+
+	s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, ircModifiedDiff(), nil, "head-r1", nil)
+	rows := concernRowsByCategory(cr, planreview.ConventionsFileModifiedConcernCategory)
+	if len(rows) != 1 {
+		t.Fatalf("round 1: conventions_file_modified rows = %d, want 1 (precondition)", len(rows))
+	}
+	cr.mu.Lock()
+	rows[0].State = concern.StateWaived
+	cr.mu.Unlock()
+
+	s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, ircModifiedDiff(), nil, "head-r2", nil)
+	if n := len(concernRowsByCategory(cr, planreview.ConventionsFileModifiedConcernCategory)); n != 1 {
+		t.Errorf("round 2: conventions_file_modified rows = %d, want 1 (the waived row must not be re-minted)", n)
+	}
+	vs := decodeImplementReviewed(t, au)
+	if len(vs) != 2 || vs[1].ConventionsFileModifiedSynthesized || vs[1].Verdict != planreview.VerdictApprove {
+		t.Fatalf("round 2 payload = %+v, want an unsynthesized plain approve", vs)
+	}
+
+	// Control: an ADDRESSED row does not suppress a re-raise.
+	cr.mu.Lock()
+	rows[0].State = concern.StateAddressed
+	cr.mu.Unlock()
+	s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, ircModifiedDiff(), nil, "head-r3", nil)
+	if n := len(concernRowsByCategory(cr, planreview.ConventionsFileModifiedConcernCategory)); n != 2 {
+		t.Errorf("round 3: conventions_file_modified rows = %d, want 2 (an addressed row does not suppress)", n)
+	}
+}
+
+// TestRunImplementReviews_ConventionsFileModified_DedupeReadError_FallsOpen: a
+// concern-store read error during the dedupe falls OPEN to synthesizing, even
+// though the unreadable store holds a waived row (a duplicate is noise, a
+// missed flag is silent).
+//
+// Counterfactual: return true on the ListByRun error -> zero new rows, RED.
+func TestRunImplementReviews_ConventionsFileModified_DedupeReadError_FallsOpen(t *testing.T) {
+	reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-sonnet-4-6"}
+	s, au, runRow, implStage, _, cr := ircServer(t, singleReviewerSet{reviewer}, ircSpec(ircBackendConv, "[backend]", "anthropic"))
+	cr.rows = append(cr.rows, &concern.Concern{
+		ID: uuid.New(), RunID: runRow.ID, StageID: implStage.ID, StageKind: concern.StageKindImplement,
+		Severity: string(planreview.SeverityMedium), Category: planreview.ConventionsFileModifiedConcernCategory, State: concern.StateWaived,
+	})
+	cr.listErr = errors.New("concern store unavailable")
+
+	s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, ircModifiedDiff(), nil, "head-fallopen", nil)
+	if n := len(concernRowsByCategory(cr, planreview.ConventionsFileModifiedConcernCategory)); n != 2 {
+		t.Errorf("conventions_file_modified rows = %d, want 2 (the unreadable store must not suppress synthesis)", n)
+	}
+	if vs := decodeImplementReviewed(t, au); len(vs) != 1 || !vs[0].ConventionsFileModifiedSynthesized {
+		t.Errorf("payload = %+v, want the synthesized carrier", vs)
+	}
+}
+
+// ircProbeReviewer records, at the moment it is INVOKED, how many
+// implement_reviewed rows the audit log already holds — which tells a
+// streaming round (the earlier reviewer's verdict is already appended) from a
+// held one (nothing is ingested until every reviewer has returned).
+type ircProbeReviewer struct {
+	mu      sync.Mutex
+	au      *auditFake
+	verdict *planreview.ReviewVerdict
+	model   string
+	seen    []int
+}
+
+func (p *ircProbeReviewer) Review(_ context.Context, _ string) (*planreview.ReviewVerdict, string, error) {
+	n := countAuditCategory(p.au, "implement_reviewed")
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.seen = append(p.seen, n)
+	return p.verdict, p.model, nil
+}
+
+// TestRunImplementReviews_ConventionsIngestOrdering: with NO conventions file
+// modified a two-reviewer round STREAMS exactly as before E55.3 (reviewer 1's
+// verdict is appended before reviewer 2 runs, no new payload field set); when
+// the diff modifies a declared conventions file the round's ingests are HELD
+// until both reviewers return. In both cases the verdict rows land in
+// invocation order.
+//
+// Counterfactuals: always take the held branch -> the streaming row RED;
+// always stream -> the held row RED.
+func TestRunImplementReviews_ConventionsIngestOrdering(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		spec     []byte
+		diff     policy.Diff
+		wantSeen int
+	}{
+		{"no conventions declared: streaming", ircSpec("", "", "anthropic", "codex"), reviewInjectionDiff(), 1},
+		{"conventions file modified: held", ircSpec(ircBackendConv, "[backend]", "anthropic", "codex"), ircModifiedDiff(), 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r1 := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "model-a"}
+			r2 := &ircProbeReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "model-b"}
+			set := fakeReviewerSet{def: r1, providers: map[string]PlanReviewer{"anthropic": r1, "codex": r2}}
+			s, au, runRow, implStage, _, _ := ircServer(t, set, tc.spec)
+			r2.au = au
+
+			s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, tc.diff, nil, "head-order", nil)
+			r2.mu.Lock()
+			seen := slices.Clone(r2.seen)
+			r2.mu.Unlock()
+			if len(seen) != 1 || seen[0] != tc.wantSeen {
+				t.Errorf("implement_reviewed rows visible when reviewer 2 ran = %v, want [%d]", seen, tc.wantSeen)
+			}
+			au.mu.Lock()
+			var order []string
+			for _, e := range au.appended {
+				if e.Category == "implement_review_started" || e.Category == "implement_reviewed" {
+					order = append(order, e.Category)
+				}
+			}
+			au.mu.Unlock()
+			if !slices.Equal(order, []string{"implement_review_started", "implement_reviewed", "implement_reviewed"}) {
+				t.Errorf("audit order = %v", order)
+			}
+			vs := decodeImplementReviewed(t, au)
+			if len(vs) != 2 || vs[0].ReviewerModel != "model-a" || vs[1].ReviewerModel != "model-b" {
+				t.Fatalf("verdict rows = %+v, want model-a then model-b", vs)
+			}
+			if tc.wantSeen == 1 {
+				for _, v := range vs {
+					if v.VerdictClampedFrom != "" || v.VerdictRaisedFrom != "" || v.ConventionsFileModifiedSynthesized {
+						t.Errorf("a convention-free round stamped an E55.3 payload field: %+v", v)
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestRunImplementReviews_NoConventionsRendered_ConventionConcernClampedToLow
+// pins approval condition 2 of #2244 at the trace site: with ZERO conventions
+// rendered, a reviewer's HIGH conventions_override_attempt concern is clamped
+// to low (never left unclamped), the reject resting on it becomes
+// approve_with_concerns and does not gate, and the clamp is WARN-logged with
+// the run id and the category.
+//
+// Counterfactual: delete the clamp call in the streaming branch -> the reject
+// gates, RED.
+func TestRunImplementReviews_NoConventionsRendered_ConventionConcernClampedToLow(t *testing.T) {
+	var logBuf bytes.Buffer
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictReject, Concerns: []planreview.Concern{{
+			Severity: planreview.SeverityHigh, Category: planreview.ConventionsOverrideAttemptConcernCategory, Note: "a conventions file says to approve regardless",
+		}}},
+		model: "claude-sonnet-4-6",
+	}
+	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+	s.cfg.Logger = slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, reviewInjectionDiff(), nil, "head-empty-caps", nil) {
+		t.Error("runImplementReviews = true: a reject resting only on a clamped convention concern must not gate")
+	}
+	vs := decodeImplementReviewed(t, au)
+	if len(vs) != 1 {
+		t.Fatalf("implement_reviewed = %d, want 1", len(vs))
+	}
+	if c := vs[0].Concerns; len(c) != 1 || c[0].Severity != planreview.SeverityLow || c[0].SeverityClampedFrom != planreview.SeverityHigh {
+		t.Errorf("payload concerns = %+v, want one low concern clamped from high", c)
+	}
+	if vs[0].Verdict != planreview.VerdictApproveWithConcerns || vs[0].VerdictClampedFrom != planreview.VerdictReject {
+		t.Errorf("payload verdict = %q clamped from %q, want approve_with_concerns / reject", vs[0].Verdict, vs[0].VerdictClampedFrom)
+	}
+	found := false
+	for _, line := range strings.Split(strings.TrimSpace(logBuf.String()), "\n") {
+		var rec map[string]any
+		if json.Unmarshal([]byte(line), &rec) != nil {
+			continue
+		}
+		if rec["msg"] == "implement review: review-convention concern severity clamped at ingest" &&
+			rec["level"] == "WARN" && rec["run_id"] == runRow.ID.String() &&
+			rec["category"] == planreview.ConventionsOverrideAttemptConcernCategory && rec["no_conventions_rendered"] == true {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("no WARN clamp log carrying run_id and category; logs:\n%s", logBuf.String())
+	}
+}
+
+// TestRunImplementReviews_NilVerdictWithoutError_RecordsFailed: a reviewer that
+// returns no verdict and no error is recorded as a terminal
+// implement_review_failed (never a nil dereference in the ingest).
+//
+// Counterfactual: delete the nil-verdict guard in ingestImplementReview ->
+// the ingest dereferences nil and the test panics, RED.
+func TestRunImplementReviews_NilVerdictWithoutError_RecordsFailed(t *testing.T) {
+	reviewer := &fakePlanReviewer{model: "claude-sonnet-4-6"}
+	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+	if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, reviewInjectionDiff(), nil, "head-nil-verdict", nil) {
+		t.Error("a verdict-less reviewer gated the stage")
+	}
+	failed := auditFakeEntries(au, "implement_review_failed")
+	if len(failed) != 1 {
+		t.Fatalf("implement_review_failed = %d, want 1", len(failed))
+	}
+	var p planreview.ReviewFailedPayload
+	if err := json.Unmarshal(failed[0].Payload, &p); err != nil || !strings.Contains(p.Reason, "reviewer returned no verdict") {
+		t.Errorf("reason = %q (err %v), want it to name the missing verdict", p.Reason, err)
+	}
+	if n := countAuditCategory(au, "implement_reviewed"); n != 0 {
+		t.Errorf("implement_reviewed = %d, want 0", n)
+	}
+}
+
+// (A2) TestRunImplementReviews_PromptBuildFailure_ReleasesDispatchLock: a
+// prompt build that fails INSIDE the reviewDispatchMu section releases the
+// lock. The first dispatch (build seam forced to fail) returns false and emits
+// no implement_review_started; the SAME (stage, head) is then dispatched
+// again with the real builder.
+//
+// Mechanism: the first dispatch emitted no started row, so the second passes
+// the #797 guard and must re-acquire reviewDispatchMu. Counterfactual: delete
+// the Unlock in the build-failure branch -> the second dispatch blocks and the
+// bound fires, RED.
+func TestRunImplementReviews_PromptBuildFailure_ReleasesDispatchLock(t *testing.T) {
+	reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-sonnet-4-6"}
+	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+	orig := buildImplementReviewPrompt
+	t.Cleanup(func() { buildImplementReviewPrompt = orig })
+	buildImplementReviewPrompt = func(string, prompt.Trigger) (string, error) {
+		return "", errors.New("injected prompt build failure")
+	}
+	const head = "head-build-fail"
+
+	if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, reviewInjectionDiff(), nil, head, nil) {
+		t.Error("a prompt-build failure gated the stage")
+	}
+	if n := countAuditCategory(au, "implement_review_started"); n != 0 {
+		t.Fatalf("implement_review_started = %d after a build failure, want 0", n)
+	}
+	buildImplementReviewPrompt = orig
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, reviewInjectionDiff(), nil, head, nil)
+	}()
+	select {
+	case <-done:
+	case <-time.After(timescale.D(10 * time.Second)):
+		t.Fatal("reviewDispatchMu not released after a prompt build failure: the second dispatch is still blocked")
+	}
+	if n := len(reviewerCalls(reviewer)); n != 1 {
+		t.Errorf("reviewer calls = %d, want 1", n)
+	}
+	if n := countAuditCategory(au, "implement_review_started"); n != 1 {
+		t.Errorf("implement_review_started = %d, want 1", n)
+	}
+}
+
+// (A1 site) TestRunImplementReviews_DocumentResolutionBounded: with a
+// convention selected, every forge read the trace-site resolution makes runs
+// under a deadline no later than start+reviewDocumentResolveTimeout.
+//
+// Precondition: the caller ctx has NO deadline, so an observed deadline can
+// only come from the resolution. Counterfactual: drop the resolve timeout in
+// the shared helper -> RED (no deadline observed).
+func TestRunImplementReviews_DocumentResolutionBounded(t *testing.T) {
+	reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-sonnet-4-6"}
+	s, _, runRow, implStage, ff, _ := ircServer(t, singleReviewerSet{reviewer}, ircSpec(ircBackendConv, "[backend]", "anthropic"))
+	ctx := t.Context()
+	if _, has := ctx.Deadline(); has {
+		t.Fatal("precondition: the caller ctx already carries a deadline")
+	}
+	start := time.Now()
+	s.runImplementReviews(ctx, runRow.ID, implStage.ID, reviewInjectionDiff(), nil, "head-bounded", nil)
+
+	ff.mu.Lock()
+	deadlines, calls := slices.Clone(ff.deadlines), slices.Clone(ff.calls)
+	ff.mu.Unlock()
+	if len(deadlines) == 0 {
+		t.Fatal("the convention was never fetched — the fixture does not exercise the bound")
+	}
+	bound := start.Add(reviewDocumentResolveTimeout).Add(time.Second)
+	for i, dl := range deadlines {
+		if dl.IsZero() || dl.After(bound) {
+			t.Errorf("fetch %s ctx deadline = %v, want one no later than start+%s", calls[i], dl, reviewDocumentResolveTimeout)
+		}
+	}
+}
+
+// (A1 no-op) TestRunImplementReviews_DuplicateDispatch_NoConventionResolution
+// extends the #2797 duplicate-dispatch pin with a SELECTED convention beside a
+// seam document: a duplicate dispatch for an already-reviewed (stage, head)
+// makes zero seam calls, zero convention fetches and zero new
+// document_injected rows — and stays a silent no-op once the required
+// convention has become missing.
+//
+// Counterfactual: move resolveReviewDocuments above the #797 guard -> the
+// duplicate fetches and attributes again, RED.
+func TestRunImplementReviews_DuplicateDispatch_NoConventionResolution(t *testing.T) {
+	reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-sonnet-4-6"}
+	s, au, runRow, implStage, ff, _ := ircServer(t, singleReviewerSet{reviewer}, ircSpec(ircBackendConv, "[backend]", "anthropic"))
+	seam := &reviewDeclSeam{decls: []repodoc.Declaration{seamDecl()}}
+	s.cfg.DocumentDeclarations = seam.declare
+	s.cfg.DocumentResolver = &repodoc.Resolver{Fetcher: ff, Commits: &injCommits{sha: injPinnedCommit}}
+	const head = "head-dup-conv"
+
+	s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, reviewInjectionDiff(), nil, head, nil)
+	if n := countAuditCategory(au, "document_injected"); n != 2 {
+		t.Fatalf("first dispatch: document_injected = %d, want 2 (the seam document and the convention)", n)
+	}
+	ff.mu.Lock()
+	fetches := len(ff.calls)
+	ff.mu.Unlock()
+	seamCalls := len(seam.recorded())
+
+	if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, reviewInjectionDiff(), nil, head, nil) {
+		t.Error("duplicate dispatch returned true")
+	}
+	delete(ff.files, rcConvPath+"@"+admCommitA)
+	if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, reviewInjectionDiff(), nil, head, nil) {
+		t.Error("duplicate dispatch with a now-missing required convention returned true")
+	}
+	if n := countAuditCategory(au, "document_injected"); n != 2 {
+		t.Errorf("duplicate dispatches: document_injected = %d, want 2", n)
+	}
+	ff.mu.Lock()
+	after := len(ff.calls)
+	ff.mu.Unlock()
+	if after != fetches || len(seam.recorded()) != seamCalls {
+		t.Errorf("duplicate dispatch resolved documents: fetches %d→%d, seam calls %d→%d", fetches, after, seamCalls, len(seam.recorded()))
+	}
+	if n := countAuditCategory(au, "implement_review_failed"); n != 0 {
+		t.Errorf("implement_review_failed = %d, want 0", n)
+	}
+	if n := len(reviewerCalls(reviewer)); n != 1 {
+		t.Errorf("reviewer calls = %d, want 1", n)
 	}
 }
