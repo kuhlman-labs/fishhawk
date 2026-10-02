@@ -252,6 +252,109 @@ func TestPostgres_NewEvidenceAndSettledRef_RoundTripAllQueries(t *testing.T) {
 	}
 }
 
+// TestPostgres_PersonaAttribution_RoundTripAllQueries pins migration 0092's
+// three columns (E55.10 / #3755) through EVERY query that returns
+// review_concerns rows — InsertReviewConcern's RETURNING,
+// GetReviewConcernsByIDs, ListReviewConcernsByRun,
+// ListOpenReviewConcernsByRun and UpdateReviewConcernState's RETURNING — so a
+// hand-edited sqlc scan list that misses or mis-orders a column fails here
+// against the real migrated schema. It also pins the VERBATIM role contract:
+// an InsertRaisedParams that omits ReviewerRole stores ” (unattributed),
+// never a defaulted "standard".
+func TestPostgres_PersonaAttribution_RoundTripAllQueries(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+
+	insertAs := func(role string, seq int64, c concern.RaisedConcern) *concern.Concern {
+		t.Helper()
+		rows, err := h.repo.InsertRaised(ctx, concern.InsertRaisedParams{
+			RunID:                h.runID,
+			StageID:              h.stageID,
+			StageKind:            concern.StageKindImplement,
+			ReviewerModel:        "claude-opus-4-8",
+			ReviewerRole:         role,
+			OriginReviewSequence: seq,
+			Concerns:             []concern.RaisedConcern{c},
+		})
+		if err != nil {
+			t.Fatalf("InsertRaised(role %q): %v", role, err)
+		}
+		return rows[0]
+	}
+
+	type want struct {
+		role        string
+		unverified  bool
+		clampedFrom string
+		severity    string
+	}
+	persona := insertAs("security-reviewer", 21, concern.RaisedConcern{
+		Severity: "low", Category: "security", Note: "quoted a passage the remit never said",
+		QuoteUnverified: true, SeverityClampedFrom: "high",
+	})
+	standard := insertAs(concern.ReviewerRoleStandard, 22, concern.RaisedConcern{
+		Severity: "high", Category: "correctness", Note: "standard concern",
+	})
+	unattributed := insertAs("", 23, concern.RaisedConcern{
+		Severity: "medium", Category: "scope", Note: "no role named",
+	})
+	wants := map[uuid.UUID]want{
+		persona.ID:      {role: "security-reviewer", unverified: true, clampedFrom: "high", severity: "low"},
+		standard.ID:     {role: concern.ReviewerRoleStandard, severity: "high"},
+		unattributed.ID: {role: "", severity: "medium"},
+	}
+	check := func(query string, c *concern.Concern) {
+		t.Helper()
+		if c == nil {
+			t.Errorf("%s: row missing", query)
+			return
+		}
+		w := wants[c.ID]
+		if c.ReviewerRole != w.role || c.QuoteUnverified != w.unverified ||
+			c.SeverityClampedFrom != w.clampedFrom || c.Severity != w.severity {
+			t.Errorf("%s row %s = (reviewer_role %q, quote_unverified %v, severity_clamped_from %q, severity %q), want (%q, %v, %q, %q)",
+				query, c.ID, c.ReviewerRole, c.QuoteUnverified, c.SeverityClampedFrom, c.Severity,
+				w.role, w.unverified, w.clampedFrom, w.severity)
+		}
+	}
+
+	// 1. InsertReviewConcern's RETURNING.
+	for _, c := range []*concern.Concern{persona, standard, unattributed} {
+		check("InsertRaised", c)
+	}
+	// 2. GetReviewConcernsByIDs.
+	got, err := h.repo.GetByIDs(ctx, []uuid.UUID{persona.ID, standard.ID, unattributed.ID})
+	if err != nil {
+		t.Fatalf("GetByIDs: %v", err)
+	}
+	for _, c := range got {
+		check("GetByIDs", c)
+	}
+	// 3. ListReviewConcernsByRun and 4. ListOpenReviewConcernsByRun.
+	for name, list := range map[string]func() ([]*concern.Concern, error){
+		"ListByRun":     func() ([]*concern.Concern, error) { return h.repo.ListByRun(ctx, h.runID) },
+		"ListOpenByRun": func() ([]*concern.Concern, error) { return h.repo.ListOpenByRun(ctx, h.runID) },
+	} {
+		all, err := list()
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if len(all) != 3 {
+			t.Fatalf("%s returned %d rows, want 3", name, len(all))
+		}
+		for _, c := range all {
+			check(name, c)
+		}
+	}
+	// 5. UpdateReviewConcernState's RETURNING: a transition must not blank
+	// the attribution or the ingest markers.
+	waived, err := h.repo.ApplyResolution(ctx, persona.ID, concern.StateWaived, "operator judged non-blocking")
+	if err != nil {
+		t.Fatalf("ApplyResolution: %v", err)
+	}
+	check("ApplyResolution", waived)
+}
+
 func TestPostgres_GetByIDs_InputOrderAndNotFound(t *testing.T) {
 	h := newHarness(t)
 	a := h.insert(t, 1)[0]
@@ -470,5 +573,29 @@ func TestPostgres_MarkAddressedPending_RefusesWaived(t *testing.T) {
 	}
 	if got[0].State != concern.StateWaived {
 		t.Errorf("committed State = %q, want waived (untouched)", got[0].State)
+	}
+}
+
+// TestNormalizedReviewerRole pins the identity normalization (E55.10 / #3755):
+// the empty (unattributed) role reads as standard so a legacy row keeps
+// today's veto behaviour, while standard and every persona name pass through
+// verbatim (trimmed) — a persona can never collapse onto standard.
+func TestNormalizedReviewerRole(t *testing.T) {
+	for _, tc := range []struct {
+		in, want string
+	}{
+		{"", concern.ReviewerRoleStandard},
+		{"   ", concern.ReviewerRoleStandard},
+		{concern.ReviewerRoleStandard, concern.ReviewerRoleStandard},
+		{"security-reviewer", "security-reviewer"},
+		{"  security-reviewer\t", "security-reviewer"},
+		{"Standard", "Standard"},
+	} {
+		if got := concern.NormalizedReviewerRole(tc.in); got != tc.want {
+			t.Errorf("NormalizedReviewerRole(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+	if concern.ReviewerRoleStandard != "standard" {
+		t.Errorf("ReviewerRoleStandard = %q, want %q (persisted on every standard-reviewer row)", concern.ReviewerRoleStandard, "standard")
 	}
 }
