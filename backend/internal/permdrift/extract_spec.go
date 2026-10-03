@@ -18,6 +18,14 @@ import (
 // invented for an absent declaration: an undeclared tier, ceiling or posture
 // is simply no entry (absence is what the entry's polarity says it is).
 
+// declaredList is the Value of a stage permission list's presence
+// Restriction (the list as a whole limits the stage).
+const declaredList = "declared (limits the stage)"
+
+// shellUnrestricted is ShellLevels' rank for `unrestricted`: a posture at or
+// above it limits nothing.
+var shellUnrestricted, _ = ShellLevels.Rank(string(spec.ShellPostureUnrestricted))
+
 // parseSpec parses a workflow spec, mapping empty content (an absent file) to
 // a nil spec and nil error.
 func parseSpec(content []byte) (*spec.Spec, error) {
@@ -238,12 +246,43 @@ func autoClasses(m *spec.ResolvedMatrix) map[string]bool {
 
 // ExtractSpecStagePermissions keys each stage's declared permissions from the
 // parsed spec (Stage.Egress already folds the `permissions.network`
-// spelling):
+// spelling), modelling ABSENCE as the product's effective default.
 //
-//   - `workflows.<wf>.stages.<stage>.egress[<host>]`: presence Grant;
-//   - `...permissions.write[<glob>]`: presence Grant;
-//   - `...permissions.shell`: ranked Grant on ShellLevels, present only when
-//     declared.
+// The default, checked in-repo: `permissions` is DECLARATION-ONLY with no
+// default resolver (backend/internal/spec/permissions.go, spec.go — nothing
+// fills an undeclared shell/write/network), so an absent shell posture, write
+// list or non-acceptance egress list is NO LIMIT — a declaration is a
+// restriction and removing it widens. An ACCEPTANCE stage is the one
+// exception: its egress is enforced by the runner's default-deny proxy
+// (runner/internal/egressproxy BuildAllowlist), so an absent allow-list there
+// is built-ins only and removing hosts is a true narrowing.
+//
+// A declared-but-EMPTY list never reaches this function: the workflow-v2
+// schema gives `permissions.write` and `egress`/`permissions.network`
+// `target_hosts` minItems 1 (and forbids an empty `permissions: {}` with
+// minProperties 1), so spec.ParseBytes rejects `write: []` and
+// `target_hosts: []`, the extraction errors, and the check fails CLOSED to an
+// unevaluable parse_error rather than reading an empty list as "no limit".
+//
+// Entries:
+//
+//   - `workflows.<wf>.stages.<stage>.egress[<host>]`: presence Grant per
+//     declared host;
+//   - `...egress`: presence RESTRICTION on a NON-acceptance stage declaring
+//     hosts (removing the list widens); an acceptance stage keeps the
+//     per-host Grants only;
+//   - `...permissions.write[<glob>]`: presence Grant per declared glob;
+//   - `...permissions.write`: presence RESTRICTION whenever a write list is
+//     declared (removing the list widens);
+//   - `...permissions.shell`: ranked RESTRICTION on ShellLevels (rank is the
+//     power ordinal), present only when declared BELOW `unrestricted` — so
+//     removing `shell: none` widens, none -> restricted widens, restricted ->
+//     none narrows, adding a posture narrows, and declaring `unrestricted`
+//     (no limit, the same as absence) emits nothing.
+//
+// Residual noise, never a miss: first declaring a write list or a
+// non-acceptance egress list reads as one narrowing (the new restriction)
+// plus one widening per glob or host.
 func ExtractSpecStagePermissions(content []byte) (Grants, error) {
 	out := Grants{}
 	s, err := parseSpec(content)
@@ -253,13 +292,19 @@ func ExtractSpecStagePermissions(content []byte) (Grants, error) {
 	for _, wf := range sortedWorkflowNames(s) {
 		for _, st := range s.Workflows[wf].Stages {
 			p := stagePrefix(wf, st)
-			if st.Egress != nil {
+			if st.Egress != nil && len(st.Egress.TargetHosts) > 0 {
+				if st.Type != spec.StageTypeAcceptance {
+					out.Put(Entry{Key: p + ".egress", Value: declaredList, Rank: PresenceRank, Polarity: Restriction})
+				}
 				for _, h := range st.Egress.TargetHosts {
 					out.Put(Entry{Key: p + ".egress[" + h + "]", Value: Present, Rank: PresenceRank, Polarity: Grant})
 				}
 			}
 			if st.Permissions == nil {
 				continue
+			}
+			if len(st.Permissions.Write) > 0 {
+				out.Put(Entry{Key: p + ".permissions.write", Value: declaredList, Rank: PresenceRank, Polarity: Restriction})
 			}
 			for _, w := range st.Permissions.Write {
 				out.Put(Entry{Key: p + ".permissions.write[" + w + "]", Value: Present, Rank: PresenceRank, Polarity: Grant})
@@ -269,7 +314,9 @@ func ExtractSpecStagePermissions(content []byte) (Grants, error) {
 				if err != nil {
 					return nil, fmt.Errorf("workflow spec: %w", err)
 				}
-				out.Put(Entry{Key: p + ".permissions.shell", Value: string(sh), Rank: r, Polarity: Grant})
+				if r < shellUnrestricted {
+					out.Put(Entry{Key: p + ".permissions.shell", Value: string(sh), Rank: r, Polarity: Restriction})
+				}
 			}
 		}
 	}

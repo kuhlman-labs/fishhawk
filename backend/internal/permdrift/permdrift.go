@@ -17,6 +17,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 // Polarity says what an entry's PRESENCE means.
@@ -104,11 +106,73 @@ const PresenceRank = 1
 // key "<prefix>.*" covers "<prefix>.<x>" for every x containing no '.'.
 const WildcardSuffix = ".*"
 
+// keySegment escapes one FILE-DERIVED dotted key segment (a job id, a scope,
+// a manifest permission or event name, an /mcp tool or scope name, a
+// run-token scope, an env-allow var or NAME) so the file cannot shape the key
+// structure: '%' becomes "%25" FIRST (so the escaping is injective), then
+// '*', '.' and every control or format rune (unicode Cc/Cf/Zl/Zp, and any
+// invalid UTF-8 byte) is percent-encoded byte by byte. An escaped segment
+// therefore never contains a bare '.', so it cannot forge a segment boundary
+// (job "a.b" with scope "c" vs job "a" with scope "b.c"), and never equals or
+// ends in WildcardSuffix, so a file cannot mint its OWN wildcard (a manifest
+// permission literally named "*" would otherwise subsume every sibling
+// widening). The extractors' own wildcard keys (write-all, the default token,
+// an empty anyOf) append WildcardSuffix after the escaped segment and keep
+// the literal suffix. Bracketed values (globs, hosts, canonical matches) end
+// in ']' and can never form a wildcard, so they are not escaped.
+func keySegment(s string) string {
+	if !needsKeyEscape(s) {
+		return s
+	}
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if keyEscapeRune(r, size) {
+			for j := i; j < i+size; j++ {
+				fmt.Fprintf(&b, "%%%02X", s[j])
+			}
+		} else {
+			b.WriteString(s[i : i+size])
+		}
+		i += size
+	}
+	return b.String()
+}
+
+// needsKeyEscape reports whether keySegment would change s.
+func needsKeyEscape(s string) bool {
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if keyEscapeRune(r, size) {
+			return true
+		}
+		i += size
+	}
+	return false
+}
+
+// keyEscapeRune reports whether keySegment percent-encodes rune r (of
+// encoded width size).
+func keyEscapeRune(r rune, size int) bool {
+	switch {
+	case r == '%', r == '*', r == '.':
+		return true
+	case r == utf8.RuneError && size == 1:
+		return true
+	}
+	return unicode.In(r, unicode.Cc, unicode.Cf, unicode.Zl, unicode.Zp)
+}
+
 // Compare diffs base against head. The result is deterministic: one Change
 // per moved key, sorted by key.
 //
-//   - key in both: rank up is Widened, rank down is Narrowed, equal is no
-//     change (rank is the power ordinal for either polarity);
+//   - key in both with a POLARITY CHANGE: one Change whatever the ranks — a
+//     Restriction becoming a Grant is Widened (the limit vanished and a grant
+//     appeared), a Grant becoming a Restriction is Narrowed. Without this rule
+//     a gate override flipping from "not auto" to "auto" at one key (both
+//     presence entries at PresenceRank) would read as no change;
+//   - key in both, same polarity: rank up is Widened, rank down is Narrowed,
+//     equal is no change (rank is the power ordinal for either polarity);
 //   - key only in head: a Grant is Widened, a Restriction Narrowed;
 //   - key only in base: a Grant is Narrowed, a Restriction Widened.
 //
@@ -137,6 +201,14 @@ func Compare(base, head Grants) []Change {
 		h, inHead := head[k]
 		switch {
 		case inBase && inHead:
+			if b.Polarity != h.Polarity {
+				dir := Widened
+				if h.Polarity == Restriction {
+					dir = Narrowed
+				}
+				out = append(out, Change{Key: k, Before: b.Value, After: h.Value, Direction: dir})
+				continue
+			}
 			switch {
 			case h.Rank > b.Rank:
 				out = append(out, Change{Key: k, Before: b.Value, After: h.Value, Direction: Widened})
