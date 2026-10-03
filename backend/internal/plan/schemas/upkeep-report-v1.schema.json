@@ -1,0 +1,283 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fishhawk.dev/spec/upkeep-report-v1.schema.json",
+  "title": "Fishhawk upkeep report artifact (plan-stage sibling)",
+  "description": "The THIRD additive sibling of the plan artifact (after clarification-request-v1 and grooming-report-v1), produced by a `plan`-typed PROPOSE stage that DECLARES `produces: upkeep_report` (E79 / #3726, #3921). Selected over plan-standard-v1 by the top-level 'kind' discriminator BEFORE validation, so plan-standard-v1.schema.json stays frozen. An upkeep report is a PROPOSAL, never an applied mutation: it lists the maintenance findings a scan found (flaky tests, toolchain drift, deprecations), each with the evidence that supports it and the issue it proposes filing, and a human decides what (if anything) to file. `sources_scanned` records what the scan COVERED, so an empty `findings` array reads 'none found', not 'not scanned'. Every finding carries a stable `id` DERIVED as `<source>:<subject>` (never minted per run), so two reports over the same tree diff mechanically and a filed issue's hidden marker `<!-- fishhawk-upkeep:v1 finding_id=<id> -->` matches exactly. Cross-field rules the schema cannot state (id derivation, uniqueness, run-id syntax, per-source evidence shape, label syntax) are enforced by the backend semantic layer; see upkeep-report-v1.md for the normative contract.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "kind",
+    "report_version",
+    "ticket_reference",
+    "generated_by",
+    "summary",
+    "sources_scanned",
+    "findings"
+  ],
+  "properties": {
+    "kind": {
+      "type": "string",
+      "const": "upkeep_report",
+      "description": "Top-level discriminator. The plan package routes an artifact carrying this value to this schema. This sibling intentionally omits plan_version so the artifacts never collide on a shared required field."
+    },
+    "report_version": {
+      "type": "string",
+      "const": "upkeep_report_v1",
+      "description": "Artifact schema version. Single-value enum: a future breaking change bumps to upkeep_report_v2 with its own schema file rather than editing this one in place."
+    },
+    "ticket_reference": {
+      "$ref": "#/$defs/ticket-reference"
+    },
+    "generated_by": {
+      "$ref": "#/$defs/generated-by"
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Human-readable lead paragraph: what the scan covered and the headline of what it proposes. Rendered first at the operator gate."
+    },
+    "sources_scanned": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/source"
+      },
+      "description": "The detector sources this scan RAN. Every finding's `source` must appear here (a semantic rule). Recording coverage separately from findings is what lets an empty `findings` array mean 'scanned, none found' rather than 'not scanned'."
+    },
+    "findings": {
+      "type": "array",
+      "maxItems": 200,
+      "items": {
+        "$ref": "#/$defs/finding"
+      },
+      "description": "The findings, each proposing one issue. May be empty. Capped at 200 so one report bounds the ingest's dedupe and run-ref lookups."
+    }
+  },
+  "$defs": {
+    "ticket-reference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "url",
+        "id"
+      ],
+      "description": "The ticket the grooming RUN was opened against (the run's originating issue), not an item being groomed. Shape mirrors plan-standard-v1 verbatim.",
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "github_issue"
+          ],
+          "description": "v0 closed set; v0.x adds linear_ticket and jira_ticket. Mirrors plan-standard-v1."
+        },
+        "url": {
+          "type": "string",
+          "format": "uri",
+          "description": "Canonical URL of the originating ticket."
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Stable identifier — e.g. \"kuhlman-labs/fishhawk#2235\"."
+        }
+      }
+    },
+    "generated-by": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "agent",
+        "model",
+        "timestamp"
+      ],
+      "description": "Shape mirrors plan-standard-v1 verbatim.",
+      "properties": {
+        "agent": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Agent identifier matching the workflow spec's executor.agent."
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Specific model used (e.g. claude-opus-5)."
+        },
+        "version": {
+          "type": "string",
+          "description": "Optional. Model version or build SHA when agent reports it."
+        },
+        "timestamp": {
+          "type": "string",
+          "format": "date-time",
+          "description": "RFC 3339 timestamp of generation. The runner wall-clock at agent invocation."
+        }
+      }
+    },
+    "source": {
+      "type": "string",
+      "enum": [
+        "flake",
+        "toolchain_drift",
+        "deprecation"
+      ],
+      "description": "Detector source. flake: a test that failed and then passed on the same tree across runs. toolchain_drift: one tool pinned to different versions in different files. deprecation: use of a deprecated API or construct."
+    },
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "source",
+        "subject",
+        "evidence",
+        "proposed_issue"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^(flake|toolchain_drift|deprecation):[^\\s<>]+$",
+          "description": "Stable finding id, DERIVED as `<source>:<subject>` (the backend checks the derivation and report-wide uniqueness). The pattern forbids whitespace and angle brackets so the hidden marker `<!-- fishhawk-upkeep:v1 finding_id=<id> -->` a filed issue carries matches EXACTLY: `flake:TestA` never matches the marker of `flake:TestAB`."
+        },
+        "source": {
+          "$ref": "#/$defs/source"
+        },
+        "subject": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "pattern": "^[^\\s<>]+$",
+          "description": "What the finding is about, with no whitespace or angle bracket: a test name for flake, a tool name for toolchain_drift, an API or construct for deprecation. It is the id's suffix."
+        },
+        "evidence": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 50,
+          "items": {
+            "$ref": "#/$defs/evidence-ref"
+          },
+          "description": "At least one evidence ref. The per-source shape (a flake cites a run; a toolchain_drift names at least two distinct lined file paths; a deprecation names a file) is a semantic rule."
+        },
+        "proposed_issue": {
+          "$ref": "#/$defs/proposed-issue"
+        }
+      }
+    },
+    "evidence-ref": {
+      "description": "One evidence pointer, discriminated by `kind`: a run ref or a file ref.",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/run-evidence"
+        },
+        {
+          "$ref": "#/$defs/file-evidence"
+        }
+      ]
+    },
+    "run-evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "run_id"
+      ],
+      "description": "A Fishhawk run that exhibits the finding. ONLY `run_id` is verified on ingest (it must name an existing run in the reporting run's repository); `stage_id` and `trace_ref` are AGENT-ASSERTED pointers the server never resolves.",
+      "properties": {
+        "kind": {
+          "const": "run"
+        },
+        "run_id": {
+          "type": "string",
+          "description": "The cited run's UUID. The backend requires a non-nil UUID naming a run in the same repository (and account, when both carry one)."
+        },
+        "stage_id": {
+          "type": "string",
+          "description": "Optional stage UUID within the cited run. Agent-asserted: parsed as a UUID, never checked against the run."
+        },
+        "trace_ref": {
+          "type": "string",
+          "description": "Optional pointer into the cited stage's trace. Agent-asserted and unresolved."
+        },
+        "detail": {
+          "type": "string",
+          "description": "Optional free-text note on what this run shows."
+        }
+      }
+    },
+    "file-evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "path"
+      ],
+      "description": "A repository file that exhibits the finding.",
+      "properties": {
+        "kind": {
+          "const": "file"
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Repository-relative path."
+        },
+        "line": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Optional 1-based line."
+        },
+        "value": {
+          "type": "string",
+          "description": "Optional value found at path:line (e.g. the pinned version string)."
+        },
+        "detail": {
+          "type": "string",
+          "description": "Optional free-text note."
+        }
+      }
+    },
+    "proposed-issue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "title",
+        "body",
+        "type",
+        "labels"
+      ],
+      "description": "The issue the finding proposes filing. Filing is a separate, gated step (#3924); an open issue already carrying this finding's marker, or a similar title, marks the finding a duplicate at ingest instead.",
+      "properties": {
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "body": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Proposed issue body. The apply step appends the hidden finding marker; the agent need not include it."
+        },
+        "type": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Proposed work-item type (bug, chore, ...)."
+        },
+        "labels": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": "Proposed label names; may be empty. Each must pass the label syntax rule (a semantic rule). An `autonomy:*` label is STRIPPED at apply unless the captain authorizes it (#3924): the scan may suggest a tier, never set one."
+        },
+        "parent_epic": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Optional parent epic: a positive issue number, bare or `#`-prefixed (a semantic rule)."
+        }
+      }
+    }
+  }
+}

@@ -328,6 +328,10 @@ const (
 	// ADR-065 §3): the proposal a `plan`-typed PROPOSE stage emits when it
 	// grooms a backlog slice instead of planning a code change.
 	ArtifactKindGroomingReport ArtifactKind = "grooming_report"
+	// ArtifactKindUpkeepReport is the upkeep_report sibling (#3921, E79): the
+	// maintenance findings a `plan`-typed PROPOSE stage declaring
+	// `produces: upkeep_report` emits instead of a plan.
+	ArtifactKindUpkeepReport ArtifactKind = "upkeep_report"
 )
 
 // AllArtifactKinds returns every ArtifactKind the plan stage can produce.
@@ -347,6 +351,7 @@ func AllArtifactKinds() []ArtifactKind {
 		ArtifactKindPlan,
 		ArtifactKindClarificationRequest,
 		ArtifactKindGroomingReport,
+		ArtifactKindUpkeepReport,
 	}
 }
 

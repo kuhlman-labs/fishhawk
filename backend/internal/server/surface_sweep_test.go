@@ -357,6 +357,28 @@ func TestEvaluateSurfaceSweep(t *testing.T) {
 			want: nil,
 		},
 		{
+			// #3921: the upkeep-report-v1 canonical scoped without its
+			// embedded mirror is the same self-referential lockstep miss.
+			name:  "upkeep-report canonical without mirror flags",
+			scope: []string{"docs/spec/upkeep-report-v1.schema.json"},
+			want: []SurfaceSweepFinding{
+				{
+					Pattern:         "upkeep-report schema requires every mirror",
+					TriggerPath:     "docs/spec/upkeep-report-v1.schema.json",
+					MissingSiblings: []string{"backend/internal/plan/schemas/upkeep-report-v1.schema.json"},
+				},
+			},
+		},
+		{
+			// Both members scoped: no finding.
+			name: "upkeep-report both mirrors no finding",
+			scope: []string{
+				"docs/spec/upkeep-report-v1.schema.json",
+				"backend/internal/plan/schemas/upkeep-report-v1.schema.json",
+			},
+			want: nil,
+		},
+		{
 			name:  "unrelated files no finding",
 			scope: []string{"backend/internal/foo/foo.go", "README.md"},
 			want:  nil,

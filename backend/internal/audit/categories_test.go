@@ -629,3 +629,27 @@ func TestKnownCategories_CrewFindingConvertFailed(t *testing.T) {
 		t.Error("crew_finding_convert_failed is not in KnownCategories; register it in categories.go")
 	}
 }
+
+// TestKnownCategories_Upkeep pins #3921's four upkeep categories:
+// upkeep_report_recorded (the upkeep_report ingest row) and the three the
+// later upkeep children emit (upkeep_disposition_recorded from #3923,
+// upkeep_finding_filed and upkeep_finding_skipped from #3924), registered
+// ahead of their writers so fishhawk_await_audit can arm on them. The
+// near-miss upkeep_report (the artifact KIND, not an audit category) must stay
+// unknown, so a wait armed on the kind name is refused with a suggestion
+// rather than silently never firing.
+func TestKnownCategories_Upkeep(t *testing.T) {
+	for _, c := range []string{
+		"upkeep_report_recorded",
+		"upkeep_disposition_recorded",
+		"upkeep_finding_filed",
+		"upkeep_finding_skipped",
+	} {
+		if !IsKnownCategory(c) {
+			t.Errorf("%s is not in KnownCategories; register it in categories.go", c)
+		}
+	}
+	if IsKnownCategory("upkeep_report") {
+		t.Error("upkeep_report (the artifact kind) is registered as an audit category; it must stay unknown")
+	}
+}

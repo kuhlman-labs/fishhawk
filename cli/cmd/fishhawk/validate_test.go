@@ -1035,9 +1035,12 @@ func TestRunValidate_UpkeepScanExample_NoCharter_OK(t *testing.T) {
 	}
 
 	// A frozen major keeps rejecting the artifact: a version "1.6" spec
-	// declaring upkeep_report fails on its own produces enum.
-	t.Run("frozen major 1.6 refuses", func(t *testing.T) {
-		const frozen = `version: "1.6"
+	// declaring upkeep_report fails on its own produces enum. The POSITIVE
+	// CONTROL (#3920 note) is the same document with only the produces entry
+	// swapped to plan/standard_v1: it exits OK, so the refusal is attributable
+	// to the produces enum rather than to anything else in the fixture.
+	frozen := func(artifact, schema string) string {
+		return `version: "1.6"
 workflows:
   upkeep_scan:
     stages:
@@ -1046,13 +1049,22 @@ workflows:
         executor:
           agent: claude-code
         produces:
-          - artifact: upkeep_report
-            schema: upkeep_report_v1
+          - artifact: ` + artifact + `
+            schema: ` + schema + `
 `
-		p := writeSpecAndConventions(t, frozen, validConventions)
+	}
+	t.Run("frozen major 1.6 refuses", func(t *testing.T) {
+		p := writeSpecAndConventions(t, frozen("upkeep_report", "upkeep_report_v1"), validConventions)
 		var so, se strings.Builder
 		if got := runValidate([]string{p}, &so, &se); got != exitFailure {
 			t.Fatalf("exit = %d, want exitFailure (v1.x must not admit upkeep_report):\nstdout: %s\nstderr: %s", got, so.String(), se.String())
+		}
+	})
+	t.Run("frozen major 1.6 positive control", func(t *testing.T) {
+		p := writeSpecAndConventions(t, frozen("plan", "standard_v1"), validConventions)
+		var so, se strings.Builder
+		if got := runValidate([]string{p}, &so, &se); got != exitOK {
+			t.Fatalf("exit = %d, want exitOK (the plan/standard_v1 twin must validate, or the refusal above is not attributable to the produces enum):\nstdout: %s\nstderr: %s", got, so.String(), se.String())
 		}
 	})
 }
