@@ -368,3 +368,34 @@ func TestCheckUpkeepRunRefs(t *testing.T) {
 		}
 	})
 }
+
+// TestUpkeepRunOwnershipRefusal is the extracted predicate's direct table
+// (#3922): the SAME rules checkUpkeepRunRefs applies and the flake gather
+// relies on to show the agent only runs the ingest would accept.
+func TestUpkeepRunOwnershipRefusal(t *testing.T) {
+	reporting := &run.Run{Repo: upkeepTestRepo, AccountID: "acct-1"}
+	cases := []struct {
+		name      string
+		ref       *run.Run
+		reporting *run.Run
+		want      string
+	}{
+		{"same repo, same account", &run.Run{Repo: upkeepTestRepo, AccountID: "acct-1"}, reporting, ""},
+		{"same repo, other case", &run.Run{Repo: strings.ToUpper(upkeepTestRepo), AccountID: "acct-1"}, reporting, ""},
+		// Account-less same-repo run: the account is compared only when BOTH
+		// rows carry one (#3922 approval condition 8).
+		{"account-less same-repo ref", &run.Run{Repo: upkeepTestRepo}, reporting, ""},
+		{"account-less reporting run", &run.Run{Repo: upkeepTestRepo, AccountID: "acct-2"}, &run.Run{Repo: upkeepTestRepo}, ""},
+		{"other repo", &run.Run{Repo: "other/repo", AccountID: "acct-1"}, reporting, upkeepOwnershipForeignRepo},
+		{"empty ref repo", &run.Run{AccountID: "acct-1"}, reporting, upkeepOwnershipForeignRepo},
+		{"both repos empty", &run.Run{}, &run.Run{}, upkeepOwnershipForeignRepo},
+		{"same repo, other account", &run.Run{Repo: upkeepTestRepo, AccountID: "acct-2"}, reporting, upkeepOwnershipForeignAccount},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := upkeepRunOwnershipRefusal(tc.ref, tc.reporting); got != tc.want {
+				t.Errorf("upkeepRunOwnershipRefusal(%+v, %+v) = %q, want %q", tc.ref, tc.reporting, got, tc.want)
+			}
+		})
+	}
+}
