@@ -2106,6 +2106,9 @@ func (c *Client) ComparePatch(ctx context.Context, scope forge.CredentialScope,
 	if n := len(body.Commits); n > 0 {
 		result.HeadSHA = body.Commits[n-1].SHA
 	}
+	// GitHub lists at most 250 commits; past that the last listed commit is
+	// not the head tip (forge.ComparePatchResult.CommitsTruncated).
+	result.CommitsTruncated = body.TotalCommits > len(body.Commits)
 
 	var patch strings.Builder
 	result.Files = make([]ComparePatchFile, 0, len(body.Files))

@@ -29,10 +29,11 @@ GitHub REST operations (read workflow spec, fire workflow_dispatch, PR surfaces)
 
 ## Consolidated-diff surface (#1060)
 
-`ComparePatch(scope, repo, base, head)` GETs `/repos/{o}/{r}/compare/{base}...{head}` and returns a `ComparePatchResult{HeadSHA, Patch, Files[], Truncated, TruncationReason}` — the diff source for a decomposed parent's consolidated implement review (the parent has no runner trace bundle).
+`ComparePatch(scope, repo, base, head)` GETs `/repos/{o}/{r}/compare/{base}...{head}` and returns a `ComparePatchResult{HeadSHA, CommitsTruncated, Patch, Files[], Truncated, TruncationReason}` — the diff source for a decomposed parent's consolidated implement review (the parent has no runner trace bundle).
 
 - It uses the structured JSON response (not the raw-diff media type) so the per-file `status` is available for `policy.ChangedFile` and GitHub's truncation signals are observable: `Truncated` is set when the file list hits the documented 300-file cap (`compareFilesCap`) or a changed file's patch body is omitted (oversized), so the consolidated-review dispatch surfaces the under-review loudly rather than silently.
 - `Patch` reconstructs a unified diff by prefixing each file's hunks with a synthetic `diff --git` header.
+- `HeadSHA` is the LAST listed commit. GitHub lists at most 250 commits, so `CommitsTruncated` is set when `total_commits` exceeds the listed count: `HeadSHA` is then not the head tip, and a consumer keying on the tip (the permission-drift check, #3935) treats it as unresolved. It does not set `Truncated` (the file list is unaffected).
 - Each `Files[]` entry carries `Path`, the forge `Status` word, and `PreviousPath` — a `"renamed"` entry's `previous_filename` (the rename SOURCE), empty otherwise or when GitHub omits it. It exists so the permission-drift check can evaluate a rename's SOURCE against the declared surfaces, not only its destination (#3935); an empty `PreviousPath` on a rename is "source unknown", not "no source". GitLab's forge fills the same field from `old_path` on a `renamed_file` entry.
 
 ## Forge credential-scope surface (#2009 / ADR-058)

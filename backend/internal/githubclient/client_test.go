@@ -3225,12 +3225,39 @@ func TestComparePatch_HappyPath(t *testing.T) {
 	if got.Truncated {
 		t.Errorf("Truncated = true, want false for a small comparison (reason %q)", got.TruncationReason)
 	}
+	if got.CommitsTruncated {
+		t.Errorf("CommitsTruncated = true, want false when every commit is listed")
+	}
 	// Wiring: three-dot compare path + default JSON media type.
 	if !strings.Contains(rec.path, "/compare/main...fishhawk/run-abcd1234") {
 		t.Errorf("compare path = %q", rec.path)
 	}
 	if rec.accept != "application/vnd.github+json" {
 		t.Errorf("Accept = %q", rec.accept)
+	}
+}
+
+// TestComparePatch_CommitListingCapped (#3935): GitHub lists at most 250
+// commits, so past the cap the last listed commit is not the head tip and
+// CommitsTruncated says so; the file list is unaffected (Truncated stays
+// false). COUNTERFACTUAL (the CommitsTruncated assignment in ComparePatch
+// mutated to false): RED on "want true".
+func TestComparePatch_CommitListingCapped(t *testing.T) {
+	var commits []string
+	for i := 0; i < 250; i++ {
+		commits = append(commits, `{"sha":"c`+strconv.Itoa(i)+`"}`)
+	}
+	body := `{"total_commits":300,"commits":[` + strings.Join(commits, ",") + `],"files":[]}`
+	c, _ := comparePatchServer(t, http.StatusOK, body)
+	got, err := c.ComparePatch(context.Background(), forge.FromGitHubInstallationID(7), RepoRef{Owner: "o", Name: "r"}, "main", "branch")
+	if err != nil {
+		t.Fatalf("ComparePatch: %v", err)
+	}
+	if !got.CommitsTruncated {
+		t.Errorf("CommitsTruncated = false, want true for total_commits 300 with 250 listed")
+	}
+	if got.HeadSHA != "c249" || got.Truncated {
+		t.Errorf("HeadSHA/Truncated = %q/%v, want the last LISTED commit c249 and no file truncation", got.HeadSHA, got.Truncated)
 	}
 }
 

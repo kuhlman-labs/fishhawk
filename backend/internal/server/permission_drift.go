@@ -181,7 +181,8 @@ func (s *Server) permissionDriftRunnable(_ context.Context, _ permissionDriftReq
 //  2. A missing base or head commit raises ONE check-wide commit_missing
 //     concern and stops (no forge call is made).
 //  3. ComparePatch(base, head) for the changed files, and resolve the head to
-//     the commit SHA every unevaluable key carries (permissionDriftKeyHead).
+//     the commit SHA every unevaluable key carries (permissionDriftKeyHead);
+//     the consolidated trigger's surface files are then read AT that commit.
 //  4. Read .fishhawk/permission-surfaces.yaml at BASE only (404 = none). An
 //     unreadable file (fetch_failed) or an unparseable one
 //     (extension_parse_error) leaves the product list only, records
@@ -224,18 +225,28 @@ func (s *Server) runPermissionDriftCheck(ctx context.Context, req permissionDrif
 			slog.String("stage_id", req.StageID.String()),
 			slog.String("trigger", req.Trigger))
 		fx.unevaluable = append(fx.unevaluable, newUnevaluable(permissionDriftAllSurfaces,
-			req.Base+".."+req.Head, permdrift.ReasonCommitMissing, s.permissionDriftKeyHead(ctx, req, "")))
+			req.Base+".."+req.Head, permdrift.ReasonCommitMissing, s.permissionDriftKeyHead(ctx, req, "", false)))
 		s.raisePermissionDrift(ctx, req, fx)
 		return
 	}
 	reader := &permissionDriftReader{ctx: ctx, f: fetcher, scope: fscope, repo: frepo, cache: map[[2]string]driftSide{}}
 
 	cmp, cerr := comparer.ComparePatch(ctx, scope, repo, req.Base, req.Head)
+	// cmpHead is the compare's head commit only when the forge listed every
+	// commit: past a capped listing the last listed commit is not the tip.
 	cmpHead := ""
-	if cerr == nil {
+	if cerr == nil && !cmp.CommitsTruncated {
 		cmpHead = cmp.HeadSHA
 	}
-	keyHead := s.permissionDriftKeyHead(ctx, req, cmpHead)
+	keyHead := s.permissionDriftKeyHead(ctx, req, cmpHead, cerr == nil)
+	// evalHead is the ref every surface file is read at. The consolidated
+	// trigger's Head is a branch name, so it is pinned to the compare's head
+	// commit when one resolved: the files read are then exactly the commit
+	// the unevaluable keys carry, even if the branch moves mid-check.
+	evalHead := req.Head
+	if req.Trigger == permissionDriftTriggerConsolidated && cmpHead != "" {
+		evalHead = cmpHead
+	}
 	surfaces := s.permissionDriftSurfaces(ctx, req, reader, &fx, keyHead)
 
 	if cerr != nil {
@@ -302,9 +313,9 @@ func (s *Server) runPermissionDriftCheck(ctx context.Context, req permissionDrif
 	}
 
 	for _, p := range pairs {
-		res := reader.detect(p.s, p.path, req.Base, req.Head)
+		res := reader.detect(p.s, p.path, req.Base, evalHead)
 		if req.IntersectRef != "" && res.Unevaluable == "" {
-			res = intersectDrift(p.s, p.path, res, reader.detect(p.s, p.path, req.IntersectRef, req.Head))
+			res = intersectDrift(p.s, p.path, res, reader.detect(p.s, p.path, req.IntersectRef, evalHead))
 		}
 		if res.Unevaluable != "" {
 			fx.unevaluable = append(fx.unevaluable, newUnevaluable(p.s, p.path, res.Unevaluable, keyHead))
@@ -371,10 +382,15 @@ func (s *Server) permissionDriftSurfaces(ctx context.Context, req permissionDrif
 // push-report trigger's Head is the commit SHA the runner reported. The
 // consolidated trigger's Head is the consolidated BRANCH name, which never
 // changes across checks, so it is never keyed on: it resolves to the forge
-// compare's head commit (cmpHead — the branch tip the compare evaluated, so a
-// fix-up pushed to the parent after the fan-in is distinguished), else the
-// newest integration_commit_recorded merge_sha on the parent, else "".
-func (s *Server) permissionDriftKeyHead(ctx context.Context, req permissionDriftRequest, cmpHead string) string {
+// compare's head commit (cmpHead — the branch tip the compare evaluated, and
+// the commit the check then reads its surface files at, so a fix-up pushed
+// to the parent after the fan-in is distinguished). A compare that answered
+// but named no provable tip (cmpHead "" because its commit listing was capped,
+// or it listed no commit) resolves "": the integration ledger may predate the
+// tip that compare evaluated, so it is not consulted. Only a compare that
+// FAILED (compared false) falls back to the newest integration_commit_recorded
+// merge_sha on the parent, else "".
+func (s *Server) permissionDriftKeyHead(ctx context.Context, req permissionDriftRequest, cmpHead string, compared bool) string {
 	switch {
 	case req.Head == "":
 		return ""
@@ -382,6 +398,8 @@ func (s *Server) permissionDriftKeyHead(ctx context.Context, req permissionDrift
 		return req.Head
 	case cmpHead != "":
 		return cmpHead
+	case compared:
+		return ""
 	}
 	if sha, ok := s.resolveConsolidatedFanInHeadSHA(ctx, req.RunID, 0, false); ok {
 		return sha

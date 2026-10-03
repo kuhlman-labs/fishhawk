@@ -324,6 +324,11 @@ type ComparePatchResult struct {
 	// reports), reused as the implement-review dedup key. Empty when the
 	// comparison reports no commits ahead of base.
 	HeadSHA string
+	// CommitsTruncated is set when the forge capped the comparison's commit
+	// listing (GitHub lists at most 250 commits while total_commits counts
+	// them all). HeadSHA is then the last LISTED commit, NOT head's tip, so
+	// a consumer that needs the tip commit must treat HeadSHA as unresolved.
+	CommitsTruncated bool
 	// Patch is the reconstructed unified diff: each changed file's hunks
 	// prefixed with a synthetic `diff --git` header so a downstream
 	// content reviewer reads it as an ordinary git diff. Empty when no

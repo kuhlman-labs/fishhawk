@@ -89,6 +89,7 @@ type driftGH struct {
 	renamed       bool              // every changed file is "renamed" with no previous_filename
 	renamedFrom   map[string]string // changed path → previous_filename (a "renamed" row)
 	headSHA       string            // the compare's head commit ("" → driftHead)
+	totalCommits  int               // the compare's total_commits (0 → 1, every commit listed)
 	truncated     bool
 	compareStatus int
 	contentStatus map[string]int // "ref|path" → status
@@ -144,8 +145,12 @@ func (g *driftGH) serve(w http.ResponseWriter, r *http.Request) {
 		if head == "" {
 			head = driftHead
 		}
+		total := g.totalCommits
+		if total == 0 {
+			total = 1
+		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"total_commits": 1, "commits": []map[string]string{{"sha": head}}, "files": files,
+			"total_commits": total, "commits": []map[string]string{{"sha": head}}, "files": files,
 		})
 		return
 	}
@@ -1070,12 +1075,14 @@ func TestPermissionDrift_RenameSource(t *testing.T) {
 		f.gh.changed = []string{dst}
 		f.gh.renamedFrom = map[string]string{dst: src}
 		f.run(f.req(permissionDriftTriggerPROpened))
-		var found bool
-		for _, r := range f.rows(t) {
-			found = found || strings.HasPrefix(r.CheckKey, "permission_drift|infra-specs|"+src+"|")
-		}
-		if !found {
-			t.Fatalf("rows = %+v, want the source's forbidden_paths widening on infra-specs", f.rows(t))
+		// The EXACT widening key (the removed forbidden_paths restriction), not
+		// a surface/path prefix an unevaluable row on the same file shares.
+		// COUNTERFACTUAL (the source fetch failing — contentStatus 500 on
+		// driftBase|src): the prefix still matched the fetch_failed row; this
+		// assertion goes RED.
+		want := permdrift.CheckKey("infra-specs", src, "workflows.feature_change.stages.implement.forbidden_paths[.github/workflows/**]", permdrift.Absent)
+		if rows := f.rows(t); rowWithKey(rows, want) == nil {
+			t.Fatalf("rows = %+v, want the source's forbidden_paths widening %q on infra-specs", rows, want)
 		}
 		if got := f.unevaluable(t)["gha-workflow-permissions"]; got != "" {
 			t.Errorf("a named rename source raised %q on a glob surface, want nothing", got)
@@ -1150,13 +1157,20 @@ func TestPermissionDrift_UnevaluablePerHead(t *testing.T) {
 	// Approval condition 1(a). COUNTERFACTUAL (permissionDriftKeyHead mutated
 	// to return req.Head for the consolidated trigger — keying on the BRANCH
 	// name): both checks name the same branch, so commit A's waived row
-	// suppresses commit B's → rows = 1 → RED on "want 2".
+	// suppresses commit B's → rows = 1 → RED on "want 2". The head file fails
+	// to read only AT the commit SHAs (the branch name serves it cleanly), so
+	// this arm also pins that the consolidated check reads its surface files
+	// at the compare's head commit. COUNTERFACTUAL (the evalHead pin in
+	// runPermissionDriftCheck mutated out — reads at the branch name): no
+	// read fails → rows = 0 → RED on "want one row keyed by commit A".
 	t.Run("consolidated trigger: waived at commit A does not suppress commit B", func(t *testing.T) {
 		f := newDriftFixture(t)
 		const branch = "fishhawk/run-x-consolidated"
 		f.gh.changed = []string{driftWFPath}
 		f.gh.put(driftBase, driftWFPath, wfBase)
-		f.gh.contentStatus[branch+"|"+driftWFPath] = http.StatusInternalServerError
+		f.gh.put(branch, driftWFPath, wfBase)
+		f.gh.contentStatus["aaaa1111|"+driftWFPath] = http.StatusInternalServerError
+		f.gh.contentStatus["bbbb2222|"+driftWFPath] = http.StatusInternalServerError
 		req := permissionDriftRequest{RunID: f.runRow.ID, StageID: f.stage.ID, Base: driftBase, Head: branch, Trigger: permissionDriftTriggerConsolidated}
 		f.gh.headSHA = "aaaa1111"
 		f.run(req)
@@ -1173,6 +1187,45 @@ func TestPermissionDrift_UnevaluablePerHead(t *testing.T) {
 		f.run(req)
 		if rows := f.rows(t); len(rows) != 2 || rowWithKey(rows, permdrift.UnevaluableKey("gha-workflow-permissions", driftWFPath, "bbbb2222")) == nil {
 			t.Fatalf("rows after commit B = %+v, want 2 with a commit-B row", rows)
+		}
+	})
+
+	// A consolidated branch more than 250 commits ahead of base: the compare's
+	// commit listing is capped, so its last LISTED commit ("aaaa1111", the same
+	// on both checks although the branch moved) is not the tip and the head is
+	// UNRESOLVED — only an open row suppresses, a waived one never does. The
+	// head file fails to read at both the branch and aaaa1111, so each check
+	// raises fetch_failed whichever ref it reads. COUNTERFACTUAL (the
+	// `!cmp.CommitsTruncated` clause in runPermissionDriftCheck mutated out):
+	// both checks key on aaaa1111 → RED on the first check's key, and the
+	// waived row would suppress the second.
+	t.Run("consolidated trigger: a capped commit listing is an unresolved head", func(t *testing.T) {
+		f := newDriftFixture(t)
+		const branch = "fishhawk/run-x-consolidated"
+		f.gh.changed = []string{driftWFPath}
+		f.gh.put(driftBase, driftWFPath, wfBase)
+		f.gh.contentStatus[branch+"|"+driftWFPath] = http.StatusInternalServerError
+		f.gh.contentStatus["aaaa1111|"+driftWFPath] = http.StatusInternalServerError
+		f.gh.headSHA, f.gh.totalCommits = "aaaa1111", 300
+		// An integration ledger entry exists, but it may predate the tip the
+		// capped compare evaluated, so it is never the key. COUNTERFACTUAL
+		// (the `case compared: return ""` arm of permissionDriftKeyHead
+		// mutated out): the key carries merge1111 → RED on the first key.
+		rid := f.runRow.ID
+		payload, _ := json.Marshal(map[string]string{"merge_sha": "merge1111"})
+		f.au.mu.Lock()
+		f.au.seeded = append(f.au.seeded, &audit.Entry{RunID: &rid, Sequence: 1, Category: lineageIntegrationCommitCategory, Payload: payload})
+		f.au.mu.Unlock()
+		req := permissionDriftRequest{RunID: f.runRow.ID, StageID: f.stage.ID, Base: driftBase, Head: branch, Trigger: permissionDriftTriggerConsolidated}
+		f.run(req)
+		rows := f.rows(t)
+		if len(rows) != 1 || rows[0].CheckKey != permdrift.UnevaluableKey("gha-workflow-permissions", driftWFPath, "") {
+			t.Fatalf("rows after the first check = %+v, want one row keyed by the unresolved head", rows)
+		}
+		waiveAll(f)
+		f.run(req)
+		if n := len(f.rows(t)); n != 2 {
+			t.Fatalf("rows after a waive + recheck with an unchanged capped head = %d, want 2 (a waived row never suppresses an unresolved head)", n)
 		}
 	})
 

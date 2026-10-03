@@ -422,6 +422,33 @@ func TestExtractGoRunTokenScopes(t *testing.T) {
 				{Key: "run_token.write:runs@implement", Before: Absent, After: Present, Direction: Widened},
 				{Key: "run_token.write:runs@plan", Before: Absent, After: Present, Direction: Widened},
 			}},
+		// #3935 review: Go reads the last NON-EMPTY statement, so a trailing
+		// empty statement (`fallthrough;;`) and a labeled `L: fallthrough`
+		// still fall through. COUNTERFACTUALS (body mutations of
+		// endsInFallthrough, one at a time): drop the *ast.EmptyStmt skip —
+		// the `;;` row keys only @implement and goes RED; drop the
+		// *ast.LabeledStmt unwrap — the labeled row goes RED.
+		{"a fallthrough followed by an empty statement still carries", tokenSrc("%EXTRA%", `	switch stageType {
+	case run.StageTypePlan:
+		fallthrough;;
+	case run.StageTypeImplement:
+		scopes = append(scopes, "write:runs")
+	}`),
+			[]Change{
+				{Key: "run_token.write:runs@implement", Before: Absent, After: Present, Direction: Widened},
+				{Key: "run_token.write:runs@plan", Before: Absent, After: Present, Direction: Widened},
+			}},
+		{"a labeled fallthrough still carries", tokenSrc("%EXTRA%", `	switch stageType {
+	case run.StageTypePlan:
+	L:
+		fallthrough
+	case run.StageTypeImplement:
+		scopes = append(scopes, "write:runs")
+	}`),
+			[]Change{
+				{Key: "run_token.write:runs@implement", Before: Absent, After: Present, Direction: Widened},
+				{Key: "run_token.write:runs@plan", Before: Absent, After: Present, Direction: Widened},
+			}},
 		{"a fallthrough from default keys the next body @any_stage", tokenSrc("%EXTRA%", `	switch stageType {
 	default:
 		fallthrough
@@ -479,8 +506,13 @@ func TestExtractGoRunTokenScopes(t *testing.T) {
 	//   - alias rule: make aliasesScopes return false — the two alias rows
 	//     and the copy row resolve cleanly with identical grants and go RED
 	//     (observed: `alias := scopes: want an unresolved construct, got none`);
-	//   - address rule: delete the `*ast.UnaryExpr` arm's body — the two
-	//     `&scopes` rows go RED.
+	//   - address rule: delete the `*ast.UnaryExpr` arm's body — the four
+	//     address-of rows go RED; narrow it back to `isIdentNamed(n.X, ...)`
+	//     (the pre-#3935-review form) — the two element/reslice address rows
+	//     go RED;
+	//   - reslice append rule: narrow the append arm's first-argument test
+	//     back to `isIdentNamed` — the `append(scopes[:0], ...)` row goes RED
+	//     (it writes scopes[0] in place through the spare capacity).
 	t.Run("aliases, address-of and copy are stray uses", func(t *testing.T) {
 		for name, extra := range map[string]string{
 			"alias := scopes":       "\talias := scopes\n\talias[0] = \"admin\"",
@@ -488,6 +520,9 @@ func TestExtractGoRunTokenScopes(t *testing.T) {
 			"alias = (scopes[1:])":  "\tvar alias []string\n\talias = (scopes[1:])\n\talias[0] = \"admin\"",
 			"p := &scopes":          "\tp := &scopes\n\t*p = append(*p, \"admin\")",
 			"mutate(&scopes)":       `	mutate(&scopes)`,
+			"p := &scopes[0]":       "\tp := &scopes[0]\n\t*p = \"admin\"",
+			"p := &scopes[0:1]":     "\tp := &scopes[0:1]\n\t(*p)[0] = \"admin\"",
+			"append(scopes[:0], …)": `	_ = append(scopes[:0], "admin")`,
 			"copy(scopes, ...)":     `	copy(scopes, []string{"admin"})`,
 			"copy(scopes[1:], ...)": `	copy(scopes[1:], []string{"admin"})`,
 		} {

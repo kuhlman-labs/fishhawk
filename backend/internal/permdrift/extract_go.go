@@ -594,8 +594,10 @@ func (g *goFile) mcpRule(prefix string, v ast.Expr, seen map[string]bool) {
 //     false reads as @any_stage) — noise, never a miss.
 //
 // Any other assignment to `scopes` (a helper call, a reassignment), an
-// `append(scopes, ...)` not assigned back to `scopes`, `&scopes` (bare or as a
-// call argument, `mutate(&scopes)`), an indexed write, `copy(scopes, ...)`, an
+// `append(scopes, ...)` not assigned back to `scopes` (or any append to a
+// reslice, `append(scopes[:0], ...)`, which writes the backing array in
+// place), `&scopes` or the address of an element (bare or as a call argument,
+// `mutate(&scopes)`, `p := &scopes[0]`), an indexed write, `copy(scopes, ...)`, an
 // ALIAS of the slice (a name other than `scopes` bound from `scopes` or a
 // slice expression of it — `alias := scopes`, `var alias = scopes[:]` — whose
 // element writes would share the backing array), and an append argument
@@ -817,14 +819,26 @@ func (w *tokenWalker) stmt(s ast.Stmt, guards []guard) {
 	}
 }
 
-// endsInFallthrough reports whether a case body's last statement is
-// `fallthrough`.
+// endsInFallthrough reports whether a case body's last non-empty statement is
+// `fallthrough`, as Go's own analysis reads it: trailing empty statements
+// (`fallthrough;;`) are skipped and a label (`L: fallthrough`) is unwrapped.
 func endsInFallthrough(body []ast.Stmt) bool {
-	if len(body) == 0 {
-		return false
+	for i := len(body) - 1; i >= 0; i-- {
+		st := body[i]
+		if _, empty := st.(*ast.EmptyStmt); empty {
+			continue
+		}
+		for {
+			l, ok := st.(*ast.LabeledStmt)
+			if !ok {
+				break
+			}
+			st = l.Stmt
+		}
+		br, ok := st.(*ast.BranchStmt)
+		return ok && br.Tok == token.FALLTHROUGH
 	}
-	br, ok := body[len(body)-1].(*ast.BranchStmt)
-	return ok && br.Tok == token.FALLTHROUGH
+	return false
 }
 
 // assign handles an assignment statement, recognizing the two shapes that
@@ -890,9 +904,10 @@ func (w *tokenWalker) put(scopes, stages []string) {
 }
 
 // checkStrayUses records every use of the tracked slice that could change
-// its contents outside the recognized shapes: `&scopes` (bare or as a call
-// argument), an `append(scopes, ...)` whose result is not assigned back to
-// `scopes`, `copy(scopes, ...)`, an alias of the slice bound to another name,
+// its contents outside the recognized shapes: `&scopes` or the address of an
+// element of it (bare or as a call argument), an append to `scopes` or a
+// reslice of it whose result is not the recognized `scopes = append(scopes,
+// ...)`, `copy(scopes, ...)`, an alias of the slice bound to another name,
 // and an assignment to or declaration of `scopes` the statement walk never
 // reached.
 func (w *tokenWalker) checkStrayUses(body *ast.BlockStmt) {
@@ -925,13 +940,21 @@ func (w *tokenWalker) checkStrayUses(body *ast.BlockStmt) {
 				}
 			}
 		case *ast.UnaryExpr:
-			if n.Op == token.AND && isIdentNamed(n.X, runTokenScopesVar) {
-				w.g.unresolved(RunTokenPrefix, n, "address of "+runTokenScopesVar+" taken")
+			if n.Op == token.AND && addressesScopes(n.X) {
+				w.g.unresolved(RunTokenPrefix, n, "address of "+runTokenScopesVar+" or an element of it taken")
 			}
 		case *ast.CallExpr:
 			fn, isIdent := n.Fun.(*ast.Ident)
-			if isIdent && fn.Name == "append" && len(n.Args) > 0 && isIdentNamed(n.Args[0], runTokenScopesVar) && !w.assigned[n] {
-				w.g.unresolved(RunTokenPrefix, n, "append to "+runTokenScopesVar+" not assigned back")
+			// A reslice (`append(scopes[:0], x)`) writes the shared backing
+			// array in place whenever it has spare capacity, assigned back or
+			// not; only the walk-recognized `scopes = append(scopes, ...)` is
+			// in w.assigned.
+			if isIdent && fn.Name == "append" && len(n.Args) > 0 && aliasesScopes(n.Args[0]) && !w.assigned[n] {
+				what := "append to a reslice of " + runTokenScopesVar
+				if isIdentNamed(n.Args[0], runTokenScopesVar) {
+					what = "append to " + runTokenScopesVar + " not assigned back"
+				}
+				w.g.unresolved(RunTokenPrefix, n, what)
 			}
 			if isIdent && fn.Name == "copy" && len(n.Args) > 0 && aliasesScopes(n.Args[0]) {
 				w.g.unresolved(RunTokenPrefix, n, "copy into "+runTokenScopesVar)
@@ -953,6 +976,23 @@ func aliasesScopes(e ast.Expr) bool {
 			e = x.X
 		default:
 			return isIdentNamed(e, runTokenScopesVar)
+		}
+	}
+}
+
+// addressesScopes reports whether e, under `&`, points into the tracked
+// slice's backing array: the slice itself, a slice expression of it, or an
+// element of either (`&scopes`, `&scopes[0]`, `&scopes[1:][0]`,
+// `&scopes[i:j]`, parenthesized).
+func addressesScopes(e ast.Expr) bool {
+	for {
+		switch x := e.(type) {
+		case *ast.ParenExpr:
+			e = x.X
+		case *ast.IndexExpr:
+			e = x.X
+		default:
+			return aliasesScopes(e)
 		}
 	}
 }
