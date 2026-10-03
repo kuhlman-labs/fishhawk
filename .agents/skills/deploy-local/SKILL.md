@@ -9,16 +9,13 @@ description: Deploy (bring up, rebuild, or restart) the Fishhawk stack on this m
 
 ## 0. Stop if you are a run agent
 
-`reload` and `down` restart or stop the fishhawkd that a run's own runner talks to. Before anything else:
+`reload` (especially `reload --force`) restarts the fishhawkd that a run's own runner talks to, and `k8s` upgrades and restarts the cluster deployment. Before anything else:
 
 ```sh
-case "$(git rev-parse --show-toplevel 2>/dev/null)" in
-  */fishhawk-worktrees/run-*|*/fishhawk-acceptance-tree-*) echo RUN-AGENT ;;
-esac
-if [ -n "${FISHHAWK_RUN_ID:-}" ]; then echo RUN-AGENT; fi
+"$(git rev-parse --show-toplevel)/scripts/is-run-agent"
 ```
 
-If it prints `RUN-AGENT`, you are an agent inside a Fishhawk run: do nothing, and report that this skill is operator-only. The path match is the primary signal, since local runs run in those trees. `FISHHAWK_RUN_ID` is set only by CI-hosted runners (GitLab CI, deploy triggers), not by the local runner.
+If it exits non-zero (it prints `run-agent: <reason>`), you are an agent inside a Fishhawk run: do nothing, and report that this skill is operator-only. `scripts/is-run-agent` is the one shared definition of a run agent: it matches the runner's lineage, acceptance and conflict-resolution trees, plus `FISHHAWK_RUN_ID` (CI runners).
 
 Pulling `main` after a merge is the `sync-main` skill, not this one.
 
@@ -36,7 +33,7 @@ If the intent is ambiguous between process and k8s, use the process mode (`up`) 
 
 Plain `up` is a **no-op when fishhawkd is already running** — it prints `fishhawkd already running` and does not rebuild. To pick up code changes, use `reload`.
 
-## 2. Preflight (run before `up`/`reload`/`post-merge`/`k8s`)
+## 2. Preflight (run before `up`/`reload`/`k8s`)
 
 ```sh
 docker info >/dev/null 2>&1 && echo docker-ok || echo docker-DOWN
@@ -48,8 +45,8 @@ uptime
 
 - **Docker down** → `open -a Docker`, then poll until `docker info` succeeds (a bounded until-loop, not one long `sleep`).
 - **`.env` missing** → `cp .env.example .env`; `FISHHAWKD_DATABASE_URL` already matches `docker-compose.yml`. Tell the user which optional blocks (GitHub App, OAuth) are unset; fishhawkd starts without them but logs warnings. Never print secret values from `.env`.
-- **Live runner** → `reload`/`post-merge`/`down` restart fishhawkd and can strand that run's stage in `running`. `reload`/`post-merge` refuse on their own; STOP and ask the user before passing `--force`. Same if the user has an in-flight `fishhawk_await_*` on another run.
-- **Dirty tree** → fine for `up`/`reload` (binaries get stamped `-dirty`). `post-merge` does `git pull --ff-only` on main — confirm the user is on a clean `main` first.
+- **Live runner** → `reload` restarts fishhawkd and can strand that run's stage in `running`. `reload` refuses on its own; STOP and ask the user before passing `--force`. Same if the user has an in-flight `fishhawk_await_*` on another run.
+- **Dirty tree** → fine for `up`/`reload` (binaries get stamped `-dirty`). Pulling `main` after a merge is the `sync-main` skill.
 - **Load average far above core count** → warn the user; a starved host makes the readiness gate flaky (orphaned agent busy-loops, see AGENTS.md Traps).
 
 ## 3. Deploy
@@ -95,5 +92,5 @@ One short block: mode, URL, pid, `git_sha`, which binaries rebuilt, and **the MC
 
 - `scripts/dev` (`_usage` for every subcommand), `scripts/README.md`
 - `AGENTS.md` § Rebuild matrix (rebuild + activation tables, the short rules) and § Traps
-- `scripts/README.md` § "`scripts/dev` lifecycle" (readiness nonce gate, MCP banner, schema-major banner, `sweep`, ZERR trap), § "Live-run guard for reload / post-merge", § "Local k8s ergonomics"
+- `scripts/README.md` § "`scripts/dev` lifecycle" (readiness nonce gate, MCP banner, schema-major banner, `sweep`, ZERR trap), § "Live-run guard for reload / post-merge" (the `reload` half), § "Local k8s ergonomics"
 - `docs/deploy/kubernetes.md`, `docs/local-tls.md` (`FISHHAWK_DEV_TLS=1`), `docs/local-webhook-relay.md` (`FISHHAWK_DEV_WEBHOOK_RELAY=1`)

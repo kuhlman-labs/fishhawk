@@ -20,13 +20,10 @@ The command is the easy part. The judgment is in **whether it is safe to pull an
 This skill stops services or deletes state, and its confirmation steps need a human. Before anything else:
 
 ```sh
-case "$(git rev-parse --show-toplevel 2>/dev/null)" in
-  */fishhawk-worktrees/run-*|*/fishhawk-acceptance-tree-*) echo RUN-AGENT ;;
-esac
-if [ -n "${FISHHAWK_RUN_ID:-}" ]; then echo RUN-AGENT; fi
+"$(git rev-parse --show-toplevel)/scripts/is-run-agent"
 ```
 
-If it prints `RUN-AGENT`, you are an agent inside a Fishhawk run: do nothing, and report that this skill is operator-only. The path match is the primary signal, since local runs run in those trees. `FISHHAWK_RUN_ID` is set only by CI-hosted runners (GitLab CI, deploy triggers), not by the local runner.
+If it exits non-zero (it prints `run-agent: <reason>`), you are an agent inside a Fishhawk run: do nothing, and report that this skill is operator-only. `scripts/is-run-agent` is the one shared definition of a run agent: it matches the runner's lineage, acceptance and conflict-resolution trees, plus `FISHHAWK_RUN_ID` (CI runners).
 
 ## 1. Is anything live? (stop and ask if yes)
 

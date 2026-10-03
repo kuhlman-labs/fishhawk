@@ -1,68 +1,60 @@
-package constraint
+package policy
 
 import (
 	"os"
 	"path/filepath"
 	"testing"
 
-	"gopkg.in/yaml.v3"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
 
-// repoSpecPath is this repository's own workflow spec, relative to this
-// package directory.
+// repoSpecPath is this repository's own governing workflow spec, relative to
+// this package directory.
 var repoSpecPath = filepath.Join("..", "..", "..", ".fishhawk", "workflows.yaml")
 
-// stageForbiddenPaths returns the forbidden_paths of stage stageID in
-// workflow wf of the repository's real .fishhawk/workflows.yaml, failing the
-// test if the workflow, stage or list is absent (so a renamed stage cannot
-// turn this test vacuous).
-func stageForbiddenPaths(t *testing.T, wf, stageID string) []string {
+// resolvedForbiddenPaths returns every forbidden_paths glob on stage stageID
+// of workflow wf, as the PRODUCT resolves the spec (spec.ParseBytes, so
+// workflow-v2 defaults/extends reuse applies). It fails the test when the
+// workflow, stage or list is absent, so a renamed stage cannot turn the
+// assertions vacuous.
+func resolvedForbiddenPaths(t *testing.T, wf, stageID string) []string {
 	t.Helper()
 	raw, err := os.ReadFile(repoSpecPath)
 	if err != nil {
 		t.Fatalf("read %s: %v", repoSpecPath, err)
 	}
-	var spec struct {
-		Workflows map[string]struct {
-			Stages []struct {
-				ID          string `yaml:"id"`
-				Constraints struct {
-					ForbiddenPaths []string `yaml:"forbidden_paths"`
-				} `yaml:"constraints"`
-			} `yaml:"stages"`
-		} `yaml:"workflows"`
-	}
-	if err := yaml.Unmarshal(raw, &spec); err != nil {
+	s, err := spec.ParseBytes(raw)
+	if err != nil {
 		t.Fatalf("parse %s: %v", repoSpecPath, err)
 	}
-	w, ok := spec.Workflows[wf]
+	w, ok := s.Workflows[wf]
 	if !ok {
 		t.Fatalf("workflow %q not found in %s", wf, repoSpecPath)
 	}
 	for _, st := range w.Stages {
-		if st.ID == stageID {
-			if len(st.Constraints.ForbiddenPaths) == 0 {
-				t.Fatalf("%s.%s has no forbidden_paths", wf, stageID)
-			}
-			return st.Constraints.ForbiddenPaths
+		if st.ID != stageID {
+			continue
 		}
+		var globs []string
+		for _, c := range st.Constraints {
+			globs = append(globs, c.ForbiddenPaths...)
+		}
+		if len(globs) == 0 {
+			t.Fatalf("%s.%s has no forbidden_paths", wf, stageID)
+		}
+		return globs
 	}
 	t.Fatalf("stage %q not found in workflow %q", stageID, wf)
 	return nil
 }
 
-// TestRepoSpecForbidsAgentInstructionPaths pins that this repository's own
-// implement stages forbid agent-instruction paths at ANY depth and in ANY
-// letter case, through the real forbidden-paths evaluator. Codex discovers
-// .agents/skills at every directory level, Claude Code discovers nested
-// .claude/, and on a case-insensitive filesystem a CLI opening `.agents`
-// resolves to a tracked `.Agents` — so a root-only or exact-case glob is a
-// bypass. Both stages also forbid the auto-loaded instruction files at any
-// depth; feature_change deliberately leaves exactly ONE writable — the ROOT
-// AGENTS.md, which the repo's conventions require updating — while
-// routine_change (no human approval) forbids that too. The backend's own
-// evaluator is pinned against the product-parsed spec by the twin test in
-// backend/internal/policy (repospec_test.go); keep the two path tables equal.
+// TestRepoSpecForbidsAgentInstructionPaths is the server-side twin of
+// runner/internal/constraint's test of the same name: it runs the same path
+// tables through THIS module's evaluator (policy.Evaluate) against the
+// product-parsed spec. Agent-instruction paths are forbidden at ANY depth and
+// in ANY letter case; feature_change leaves exactly one writable (the ROOT
+// AGENTS.md, which the repo's conventions require updating), routine_change
+// (no human approval) none. Keep the path tables equal to the runner's.
 func TestRepoSpecForbidsAgentInstructionPaths(t *testing.T) {
 	configDirPaths := []string{
 		".agents/skills/x/SKILL.md",
@@ -102,7 +94,7 @@ func TestRepoSpecForbidsAgentInstructionPaths(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.wf, func(t *testing.T) {
-			c := Constraints{ForbiddenPaths: stageForbiddenPaths(t, tc.wf, tc.stage)}
+			c := Constraints{ForbiddenPaths: resolvedForbiddenPaths(t, tc.wf, tc.stage)}
 			for _, p := range tc.mustForbid {
 				if !hasForbiddenViolation(Evaluate(diff(p), c)) {
 					t.Errorf("%s.%s: %q is NOT forbidden (agent-instruction path admitted)", tc.wf, tc.stage, p)

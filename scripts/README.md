@@ -2770,3 +2770,29 @@ helm guards accept, so a go-less host is not red-lined with exit 127. The
 independent second path is the Go drift test `cli/internal/docgen/drift_test.go`,
 which gates CI through the module test loop and fails LOUDLY (never skips) when
 it cannot resolve the repo root or `site/` is absent.
+
+## `is-run-agent`: the operator-only skill guard
+
+`scripts/is-run-agent [DIR]` prints `operator` (exit 0) or
+`run-agent: <reason>` (exit 10). The agent skills that stop services or
+delete state (`.agents/skills/{teardown-local,dev-clean,sync-main,deploy-local}`)
+run it first and stop on a non-zero exit, because their confirmation steps
+need a human and an unattended runner agent has none (#3938). It is the one
+shared definition of a run agent, so a new runner agent tree is a one-line
+change here, not four skill edits.
+
+- **Path signal (primary).** The git top level of DIR, and its physical
+  path, are matched against the runner's agent trees:
+  `*/fishhawk-worktrees/run-*` (lineage worktree),
+  `*/fishhawk-acceptance-tree-*` (acceptance merge-candidate tree) and
+  `*/fishhawk-conflict-*` (conflict-resolution tree,
+  `<tmp>/fishhawk-conflict-XXXX/tree`). The local runner sets no marker
+  env var, so the path is what identifies a local run agent.
+- **Env signal.** A non-empty `FISHHAWK_RUN_ID` (set by CI-hosted runners
+  only: GitLab CI, deploy triggers). Empty is not a marker.
+
+`scripts/test-is-run-agent` (in `scripts/test verify`'s gate harnesses)
+pins each tree shape, a subdirectory of a run tree, a non-git run-tree
+path, an operator checkout, an operator `.claude/worktrees/*` checkout,
+and both env cases. Counterfactual: deleting the conflict-tree pattern
+fails r3 and r4.

@@ -162,7 +162,7 @@ EOF
   for g in sync-schemas check-site-voice check-site-ia check-adr \
            test-check-coverage test-patch-coverage test-container-lease \
            test-dev test-site-voice test-site-ia test-helm-render \
-           test-site-reference test-verify-scope test-adr; do
+           test-site-reference test-verify-scope test-adr test-is-run-agent; do
     cat > "$dir/scripts/$g" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' "$g" >> "$dir/logs/gate.log"

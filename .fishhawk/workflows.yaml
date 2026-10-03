@@ -395,6 +395,17 @@ workflows:
             - "**/.[aA][gG][eE][nN][tT][sS]/**"
             - "**/.[cC][lL][aA][uU][dD][eE]/**"
             - "**/.[cC][oO][dD][eE][xX]/**"
+            # The instruction files every CLI auto-loads, except the ROOT
+            # AGENTS.md: the repo's conventions require updating it in the
+            # change that adds a trap or workflow, and this workflow has human
+            # plan approval and review. Nothing requires an agent to write a
+            # nested AGENTS.md (`*/**/` needs at least one directory), the
+            # codex AGENTS.override.md (read BEFORE AGENTS.md), or either
+            # CLAUDE file.
+            - "*/**/[aA][gG][eE][nN][tT][sS].[mM][dD]"
+            - "**/[aA][gG][eE][nN][tT][sS].[oO][vV][eE][rR][rR][iI][dD][eE].[mM][dD]"
+            - "**/[cC][lL][aA][uU][dD][eE].[mM][dD]"
+            - "**/[cC][lL][aA][uU][dD][eE].[lL][oO][cC][aA][lL].[mM][dD]"
             - "LICENSE"
             - "NOTICE"
           required_outcomes:
@@ -535,9 +546,10 @@ workflows:
           # instruction files every CLI auto-loads (AGENTS.md,
           # AGENTS.override.md, CLAUDE.md, CLAUDE.local.md) at any depth. All
           # are loaded as instructions by later agent sessions, so on this
-          # workflow they are not the agent's to write. (feature_change keeps
-          # AGENTS.md writable: the repo's conventions require updating it,
-          # and that workflow has human plan approval and review.)
+          # workflow they are not the agent's to write, the root AGENTS.md
+          # included. (feature_change keeps only the root AGENTS.md
+          # writable: the conventions require updating it, and that workflow
+          # has human plan approval and review.)
           forbidden_paths:
             # Agent-config directories at ANY depth and in ANY letter case:
             # codex finds .agents/skills at every level, and on a

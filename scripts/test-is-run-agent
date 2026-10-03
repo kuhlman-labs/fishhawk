@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# Hermetic test for scripts/is-run-agent. Drives the REAL script against
+# temp-dir fixtures named like each runner agent tree, asserting both the
+# exit status and the printed verdict. House style follows
+# scripts/test-site-voice: PASS/FAIL counters, non-zero exit on any FAIL. Run
+# by `scripts/test verify` via _verify_gate_harnesses, and standalone.
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+CHECK="$REPO_ROOT/scripts/is-run-agent"
+PASS=0
+FAIL=0
+
+pass() { echo "PASS: $1"; PASS=$((PASS + 1)); }
+fail() { echo "FAIL: $1"; FAIL=$((FAIL + 1)); }
+
+tmproot=$(mktemp -d)
+trap 'rm -rf "$tmproot"' EXIT
+
+out=""
+status=0
+run_check() {
+  out="$(env -u FISHHAWK_RUN_ID "$CHECK" "$1" 2>&1)"
+  status=$?
+}
+
+# expect_run_agent <name> <dir> <reason-substring>
+expect_run_agent() {
+  run_check "$2"
+  if [ "$status" -eq 10 ] && [[ "$out" == "run-agent: "*"$3"* ]]; then
+    pass "$1"
+  else
+    fail "$1 (status=$status out=$out)"
+  fi
+}
+
+# expect_operator <name> <dir>
+expect_operator() {
+  run_check "$2"
+  if [ "$status" -eq 0 ] && [ "$out" = "operator" ]; then
+    pass "$1"
+  else
+    fail "$1 (status=$status out=$out)"
+  fi
+}
+
+# mk_git <dir>: a minimal git checkout at dir.
+mk_git() {
+  mkdir -p "$1" && git -C "$1" init -q 2>/dev/null
+}
+
+# r1-r3 — each runner agent tree, as a git checkout.
+mk_git "$tmproot/repo/.git/fishhawk-worktrees/run-abc123"
+expect_run_agent "r1 run worktree" "$tmproot/repo/.git/fishhawk-worktrees/run-abc123" "run worktree"
+mk_git "$tmproot/fishhawk-acceptance-tree-run1-stage1"
+expect_run_agent "r2 acceptance tree" "$tmproot/fishhawk-acceptance-tree-run1-stage1" "acceptance tree"
+mk_git "$tmproot/fishhawk-conflict-XYZ/tree"
+expect_run_agent "r3 conflict-resolution tree" "$tmproot/fishhawk-conflict-XYZ/tree" "conflict-resolution tree"
+
+# r4 — invoked from a SUBDIRECTORY of a run tree: the git top level matches.
+mkdir -p "$tmproot/fishhawk-conflict-XYZ/tree/backend/internal"
+expect_run_agent "r4 subdirectory of a run tree" "$tmproot/fishhawk-conflict-XYZ/tree/backend/internal" "conflict-resolution tree"
+
+# r5 — a run-tree-shaped path that is NOT a git checkout still matches.
+mkdir -p "$tmproot/plain/fishhawk-worktrees/run-zzz"
+expect_run_agent "r5 non-git run-tree path" "$tmproot/plain/fishhawk-worktrees/run-zzz" "run worktree"
+
+# o1 — an ordinary operator checkout.
+mk_git "$tmproot/fishhawk"
+expect_operator "o1 operator checkout" "$tmproot/fishhawk"
+
+# o2 — an operator worktree under .claude/worktrees is NOT a run tree.
+mk_git "$tmproot/fishhawk/.claude/worktrees/feature-x"
+expect_operator "o2 operator .claude worktree" "$tmproot/fishhawk/.claude/worktrees/feature-x"
+
+# e1 — FISHHAWK_RUN_ID alone marks a run agent (CI-hosted runners).
+out="$(FISHHAWK_RUN_ID=11111111-2222-3333-4444-555555555555 "$CHECK" "$tmproot/fishhawk" 2>&1)"
+status=$?
+if [ "$status" -eq 10 ] && [ "$out" = "run-agent: FISHHAWK_RUN_ID is set" ]; then
+  pass "e1 FISHHAWK_RUN_ID set"
+else
+  fail "e1 FISHHAWK_RUN_ID set (status=$status out=$out)"
+fi
+
+# e2 — an EMPTY FISHHAWK_RUN_ID is not a marker.
+out="$(FISHHAWK_RUN_ID= "$CHECK" "$tmproot/fishhawk" 2>&1)"
+status=$?
+if [ "$status" -eq 0 ] && [ "$out" = "operator" ]; then
+  pass "e2 empty FISHHAWK_RUN_ID"
+else
+  fail "e2 empty FISHHAWK_RUN_ID (status=$status out=$out)"
+fi
+
+echo "test-is-run-agent: $PASS passed, $FAIL failed"
+[ "$FAIL" -eq 0 ]

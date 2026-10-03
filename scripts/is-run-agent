@@ -1,0 +1,46 @@
+#!/usr/bin/env sh
+# is-run-agent: tell an agent skill whether it is running inside a Fishhawk
+# run (an unattended runner agent) or in an operator session.
+#
+# Usage: scripts/is-run-agent [DIR]     (DIR defaults to the current directory)
+#
+# Prints `operator` and exits 0, or prints `run-agent: <reason>` and exits 10.
+# Skills that stop services or delete state (.agents/skills/*) call this first
+# and stop on a non-zero exit, so this is the ONE definition of "run agent"
+# they share (#3938 review).
+#
+# Signals, in order:
+#   1. The checkout is a runner-owned agent tree. The path is the primary
+#      signal, because the LOCAL runner sets no marker env var:
+#        */fishhawk-worktrees/run-*     implement/plan lineage worktree
+#        */fishhawk-acceptance-tree-*   acceptance merge-candidate tree
+#        */fishhawk-conflict-*          conflict-resolution tree (<tmp>/fishhawk-conflict-XXXX/tree)
+#      Both the git top level and the physical directory are checked, so a
+#      skill invoked from a subdirectory, or outside a git tree, still matches.
+#   2. FISHHAWK_RUN_ID is set (CI-hosted runners only: GitLab CI, deploy
+#      triggers).
+#
+# A new runner agent tree must be added to the case below. The patterns are
+# pinned by scripts/test-is-run-agent, run inside `scripts/test verify`.
+set -u
+
+dir="${1:-.}"
+phys="$(cd "$dir" 2>/dev/null && pwd -P)" || phys="$dir"
+top="$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null)" || top=""
+
+for p in "$top" "$phys"; do
+  [ -n "$p" ] || continue
+  case "$p" in
+    */fishhawk-worktrees/run-*) echo "run-agent: run worktree ($p)"; exit 10 ;;
+    */fishhawk-acceptance-tree-*) echo "run-agent: acceptance tree ($p)"; exit 10 ;;
+    */fishhawk-conflict-*) echo "run-agent: conflict-resolution tree ($p)"; exit 10 ;;
+  esac
+done
+
+if [ -n "${FISHHAWK_RUN_ID:-}" ]; then
+  echo "run-agent: FISHHAWK_RUN_ID is set"
+  exit 10
+fi
+
+echo operator
+exit 0
