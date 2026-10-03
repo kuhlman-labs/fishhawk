@@ -1,6 +1,6 @@
 ---
 name: deploy-local
-description: Deploy (bring up, rebuild, restart, or tear down) the Fishhawk stack on this machine — Postgres + RustFS containers, the five Go binaries, migrations, and fishhawkd on :8080 — or the Helm chart on Docker Desktop Kubernetes. Use when asked to deploy/run/start/restart the stack locally, "bring fishhawkd up", "reload the backend", "deploy to local k8s", or tear the local stack down.
+description: Deploy (bring up, rebuild, or restart) the Fishhawk stack on this machine — Postgres + RustFS containers, the five Go binaries, migrations, and fishhawkd on :8080 — or the Helm chart on Docker Desktop Kubernetes. Use when asked to deploy/run/start/restart the stack locally, "bring fishhawkd up", "reload the backend", "deploy to local k8s". To stop it, use teardown-local.
 ---
 
 # Deploy Fishhawk locally
@@ -27,7 +27,7 @@ Plain `up` is a **no-op when fishhawkd is already running** — it prints `fishh
 ```sh
 docker info >/dev/null 2>&1 && echo docker-ok || echo docker-DOWN
 test -f .env && echo env-ok || echo env-MISSING
-pgrep -fl 'fishhawk-runner .*--run-id' || echo no-live-runner
+pgrep -fl '[f]ishhawk-runner .*--run-id' || echo no-live-runner
 git status --short | head
 uptime
 ```
@@ -68,7 +68,7 @@ One short block: mode, URL, pid, `git_sha`, which binaries rebuilt, and **the MC
 
 | Symptom | Fix |
 |---|---|
-| `port … in use by pid N` | `scripts/dev down`; if a foreign process holds it, report it — don't kill non-fishhawkd processes without asking |
+| `error: port <p> already has a listener: pid N (…)` | `scripts/dev down`; if a foreign process holds it, report it — don't kill non-fishhawkd processes without asking |
 | `did not become healthy within 10s` | Read the printed log tail / `tail -50 logs/fishhawkd.log`; usually a migration or config error |
 | `postgres did not become ready` | `docker logs fishhawk-postgres` |
 | `Operation not permitted` on repo read | Grant the app hosting the agent (terminal, Claude Code, Codex) Full Disk Access in System Settings → Privacy & Security, then restart it |

@@ -1,17 +1,29 @@
 ---
 name: dev-clean
 description: Reclaim disk and clear accumulated local litter in a Fishhawk checkout without stopping the stack — merged operator worktrees, aged run worktrees and /tmp sidecars, merged branches, leaked testcontainers and dangling volumes, stale MCP shims, Go/lint caches, logs. Use when asked to "clean up", "free disk space", "prune worktrees/branches", or when the machine is accumulating leftovers. To STOP services, use teardown-local instead.
+disable-model-invocation: true
 ---
 
 # Clean up local dev litter
 
 Everything here is **list first, confirm, then remove**. Show the user the candidate list and sizes before deleting anything. Never touch `.env`, `.claude/settings.local.json`, the main checkout, or a dirty worktree.
 
+## Operator-only: stop if you are a run agent
+
+This skill stops services or deletes state, and its confirmation steps need a human. Before anything else:
+
+```sh
+case "$(git rev-parse --show-toplevel 2>/dev/null)" in */fishhawk-worktrees/run-*) echo RUN-WORKTREE ;; esac
+[ -n "${FISHHAWK_RUN_ID:-}" ] && echo RUN-AGENT
+```
+
+If either line prints, you are an agent inside a Fishhawk run. Do nothing, and report that this skill is operator-only.
+
 ## 0. Is anything live?
 
 ```sh
-pgrep -fl 'fishhawk-runner .*--run-id' || echo no-live-runner
-pgrep -fl 'scripts/test' || echo no-scripts-test
+pgrep -fl '[f]ishhawk-runner .*--run-id' || echo no-live-runner
+pgrep -fl '[s]cripts/test' || echo no-scripts-test
 ```
 
 With a live runner, skip run-worktree pruning and container removal. Those belong to the run.
@@ -43,9 +55,11 @@ It then runs `scripts/cleanup-merged` (deletes local branches already merged int
 
 ## 3. Docker litter
 
-- **Leaked testcontainers.** Only when no `scripts/test` is running: `docker rm -f -v <name>` for each `org.testcontainers=true` container. `-v` takes only that container's anonymous volumes.
+- **Leaked testcontainers.** The `org.testcontainers=true` label is shared by every testcontainers user on this Docker daemon (other repositories, IDE test runs), not just Fishhawk.
+  - Remove only `fishhawk-test-postgres`, and only when no `scripts/test` is running: `docker rm -f -v fishhawk-test-postgres`. `-v` takes only that container's anonymous volumes.
+  - For any other labelled container, list it with its image and age, and remove it only after the user confirms that specific container.
 - **Dangling anonymous volumes.** `scripts/test` warns above 100. The cleanup command is `docker volume prune -f`, but it is **daemon-wide**: it deletes every unused anonymous volume on the machine, not just Fishhawk's. Say so explicitly and get a yes before running it.
-- **Compose named volumes** (`fishhawk-postgres-data`, `fishhawk-rustfs-data`) hold the dev database and traces. Leave them alone; destroying them is `teardown-local --destroy-data`.
+- **Compose named volumes** (`fishhawk-postgres-data`, `fishhawk-rustfs-data`) hold the dev database and traces. Leave them alone; destroying them is the `teardown-local` skill's destroy-data step (`make nuke`), and only on explicit request.
 
 ## 4. Caches and logs
 

@@ -28,7 +28,7 @@ State the classification to the user before editing.
      Treat `fishhawk validate` (without the flag) as the authority.
 5. **Version advertising.** For a new version string:
    - add it to the plan validator's recognized set (`backend/internal/plan/`)
-   - add it to the runner `/healthz` schema-versions list
+   - add it to the runner `/healthz` schema-versions list **once #466 lands**. That endpoint does not exist yet: check for it first, and don't create it as part of a schema change.
 
 ### A NEW workflow major (also)
 

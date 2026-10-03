@@ -8,16 +8,18 @@ description: Run Fishhawk's `scripts/test verify` gate (lint, schema-sync, gate 
 `scripts/test verify` is the same gate the runner applies to a committed tree. In order, it runs:
 
 1. `golangci-lint` (including gofmt/goimports)
-2. schema-sync drift
-3. doc-line budget, site gates, ADR gate and the gate harnesses
-4. `go test -race` in every module, plus the patch-scoped coverage gate (≥85% of changed lines)
+2. the `docs/ARCHITECTURE.md` doc-line budget
+3. schema-sync drift
+4. the gate harnesses (`scripts/test-*`)
+5. the site voice and site IA gates, then the ADR record gate
+6. `go test -race` in every module, plus the patch-scoped coverage gate (≥85% of changed lines)
 
 The order matters, because a lint failure aborts before the slow test loop.
 
 ## 1. Preflight — do all of these first
 
 ```sh
-pgrep -fl 'fishhawk-runner .*--run-id' || echo no-live-runner
+pgrep -fl '[f]ishhawk-runner .*--run-id' || echo no-live-runner
 uptime; sysctl -n hw.ncpu
 go env GOVERSION
 golangci-lint version

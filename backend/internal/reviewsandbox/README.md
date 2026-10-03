@@ -73,7 +73,10 @@ diff-only review.
   `.agents/` directory (the cross-tool Agent Skills path codex scans for
   `.agents/skills/*/SKILL.md` at every level up to the repo root; skipped
   wholesale, not just `skills/`, so a later discovery path there is closed by
-  default). This
+  default). Every match is case-insensitive: the tree lands on the host
+  filesystem, and on a case-insensitive one (macOS APFS) a CLI opening
+  `.agents/skills` or `AGENTS.md` resolves to a tracked `.Agents/` or
+  `agents.md`. This
   closes an
   approval-laundering channel: this repo's conventions REQUIRE ordinary PRs to
   edit `AGENTS.md`, so without the skip a PR editing it would boot its own

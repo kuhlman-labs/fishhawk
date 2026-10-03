@@ -374,11 +374,18 @@ workflows:
           # what executes the agent and this spec directory is what governs
           # it, so neither is the agent's to edit — an agent able to change
           # them could widen its own permissions inside the very change it
-          # is proposing. The legal files are neither, but are likewise not
-          # the agent's to edit.
+          # is proposing. The agent-instruction directories are the same
+          # class: a skill or setting committed there is loaded as
+          # instructions by every later agent session, runner agents
+          # included, so an agent editing them could rewrite its successors'
+          # instructions; skill and settings upkeep is operator-authored
+          # (AGENTS.md, Documentation surfaces). The legal files are neither,
+          # but are likewise not the agent's to edit.
           forbidden_paths:
             - ".github/workflows/**"
             - ".fishhawk/**"
+            - ".agents/**"
+            - ".claude/**"
             - "LICENSE"
             - "NOTICE"
           required_outcomes:
@@ -513,6 +520,13 @@ workflows:
             - "go.mod"
             - "go.sum"
             - "**/*_test.go"
+          # `**/*.md` above would otherwise admit agent skills
+          # (.agents/skills/*/SKILL.md) and .claude/ content on a workflow
+          # that merges without human approval; both are loaded as
+          # instructions by later agent sessions, so they stay operator-authored.
+          forbidden_paths:
+            - ".agents/**"
+            - ".claude/**"
           required_outcomes:
             - ci_green
       # 2. Review — the gate, held by CI rather than a person.

@@ -1,6 +1,7 @@
 ---
 name: sync-main
 description: Safely bring the local Fishhawk checkout and stack up to date after a PR merges — pre-pull safety checks for live runs and decompositions, `scripts/dev post-merge`, and confirming the rebuilt binaries are live. Use when the user says a PR merged, asks to "pull main", "sync", "update local", or "run post-merge".
+disable-model-invocation: true
 ---
 
 # Sync main after a merge
@@ -14,10 +15,21 @@ description: Safely bring the local Fishhawk checkout and stack up to date after
 
 The command is the easy part. The judgment is in **whether it is safe to pull and restart right now**.
 
+## Operator-only: stop if you are a run agent
+
+This skill stops services or deletes state, and its confirmation steps need a human. Before anything else:
+
+```sh
+case "$(git rev-parse --show-toplevel 2>/dev/null)" in */fishhawk-worktrees/run-*) echo RUN-WORKTREE ;; esac
+[ -n "${FISHHAWK_RUN_ID:-}" ] && echo RUN-AGENT
+```
+
+If either line prints, you are an agent inside a Fishhawk run. Do nothing, and report that this skill is operator-only.
+
 ## 1. Is anything live? (stop and ask if yes)
 
 ```sh
-pgrep -fl 'fishhawk-runner .*--run-id' || echo no-live-runner
+pgrep -fl '[f]ishhawk-runner .*--run-id' || echo no-live-runner
 git branch --show-current; git status --short
 ```
 
@@ -38,7 +50,7 @@ A pull can refuse when a local, previously-ignored or untracked file sits at a p
 
 ```sh
 git fetch -q origin main
-git diff --no-index --quiet <(git show origin/main:<path>) <path> && echo identical
+git show origin/main:<path> | cmp -s - <path> && echo identical
 ```
 
 If the file differs, show the diff and ask. Never discard local edits silently.

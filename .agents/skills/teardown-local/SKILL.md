@@ -1,17 +1,29 @@
 ---
 name: teardown-local
 description: Tear down the local Fishhawk dev environment — stop fishhawkd (and its TLS proxy / webhook relay), the acceptance preview, the Web UI dev server, the Docker Desktop k8s release, and the compose containers (Postgres, RustFS, Jaeger) — optionally destroying the dev data volumes. Use when asked to stop/shut down/tear down/turn off the local stack or free its ports. For disk cleanup without stopping services, use dev-clean.
+disable-model-invocation: true
 ---
 
 # Tear down the local stack
 
 Teardown is ordered from the top of the stack to the bottom: clients, then the daemon, then the cluster, then the containers. The data volumes survive unless the user explicitly asks to destroy data.
 
+## Operator-only: stop if you are a run agent
+
+This skill stops services or deletes state, and its confirmation steps need a human. Before anything else:
+
+```sh
+case "$(git rev-parse --show-toplevel 2>/dev/null)" in */fishhawk-worktrees/run-*) echo RUN-WORKTREE ;; esac
+[ -n "${FISHHAWK_RUN_ID:-}" ] && echo RUN-AGENT
+```
+
+If either line prints, you are an agent inside a Fishhawk run. Do nothing, and report that this skill is operator-only.
+
 ## 1. Check what's live, and stop if a run is mid-flight
 
 ```sh
-pgrep -fl 'fishhawk-runner .*--run-id' || echo no-live-runner
-pgrep -fl 'scripts/test' || echo no-scripts-test
+pgrep -fl '[f]ishhawk-runner .*--run-id' || echo no-live-runner
+pgrep -fl '[s]cripts/test' || echo no-scripts-test
 lsof -nP -iTCP:8080,8090,8443,5173 -sTCP:LISTEN 2>/dev/null
 docker ps --filter name=fishhawk --format '{{.Names}} {{.Status}}'
 kubectl config current-context 2>/dev/null && helm status fishhawk 2>/dev/null | head -3
@@ -29,7 +41,11 @@ Skip any layer that isn't running.
 3. **fishhawkd + TLS proxy + webhook relay:** `scripts/dev down`.
    - It stops the caddy proxy and the smee relay if enabled, SIGTERMs fishhawkd (SIGKILL after 5s), and cleans pid/nonce files.
    - Then it checks the port. A fishhawkd squatting with a matching nonce is killed. A **foreign** process on the port is reported, never killed, and `down` exits 1. Relay that message; don't kill it yourself.
-4. **Kubernetes** (only if a `fishhawk` helm release exists): `scripts/dev k8s-down`. It kills the port-forwards and runs `helm uninstall fishhawk`.
+4. **Kubernetes** (only if a `fishhawk` helm release exists): `scripts/dev k8s-down`. It kills the port-forwards and runs `helm uninstall fishhawk` against **whatever cluster the current kubectl context points at**, with no check that it is local. So first confirm both of these:
+   - `kubectl config current-context` prints `docker-desktop`.
+   - `kubectl get nodes -o name` lists only `node/docker-desktop`, or only kind-style `node/<name>-control-plane` / `-worker` nodes. This is the same classification `scripts/dev k8s` uses.
+
+   If either check fails, **stop**: report the context and the release, and ask. Never `helm uninstall` on a context that might be shared or remote.
 5. **Compose containers:** `make down` (`docker compose down`). This stops Postgres, RustFS and Jaeger and **keeps** the named volumes `fishhawk-postgres-data` and `fishhawk-rustfs-data`. Jaeger sits behind the `otel` profile; if it's still up, run `docker compose --profile otel down`.
 6. **Shared test Postgres** (`fishhawk-test-postgres`, usually already reaped by `scripts/test`): if it's still present and no `scripts/test` is running, run `docker rm -f -v fishhawk-test-postgres`.
 

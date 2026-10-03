@@ -36,7 +36,7 @@ ps -axo pid=,ppid=,pcpu=,etime=,comm= | sort -k3 -nr | head -15
 ```sh
 docker info >/dev/null && echo ok
 docker ps -a --filter label=org.testcontainers=true --format '{{.ID}} {{.Names}} {{.Status}}'
-pgrep -fl 'scripts/test' || echo no-scripts-test
+pgrep -fl '[s]cripts/test' || echo no-scripts-test
 ```
 
 - **"context deadline exceeded" / "No such container" on Postgres start:**
