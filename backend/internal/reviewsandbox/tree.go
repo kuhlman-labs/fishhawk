@@ -54,7 +54,7 @@ type Stats struct {
 	Symlinks int
 	// Instructions is the number of agent-instruction entries SKIPPED (the C1
 	// guard): AGENTS.md / AGENTS.override.md / CLAUDE.md / CLAUDE.local.md at any
-	// depth, and every entry under a .claude/ or .codex/ directory.
+	// depth, and every entry under a .claude/, .codex/ or .agents/ directory.
 	Instructions int
 }
 
@@ -289,10 +289,16 @@ func safeRel(name string) (string, error) {
 //   - any component named .claude or .codex — the two CLIs' config/state
 //     directories (settings, commands, agents, skills, config.toml), skipped
 //     wholesale so nothing under them is loaded as instructions.
+//   - any component named .agents — the cross-tool Agent Skills directory
+//     (agentskills.io): codex auto-discovers skills from .agents/skills at
+//     every directory level up to the repository root, so a tracked SKILL.md
+//     there loads as an instruction exactly like AGENTS.md. Skipped wholesale
+//     like .claude/.codex rather than narrowed to .agents/skills, so a future
+//     discovery path under the same directory is closed by default.
 func isAgentInstructionPath(rel string) bool {
 	parts := strings.Split(rel, "/")
 	for i, p := range parts {
-		if p == ".claude" || p == ".codex" {
+		if p == ".claude" || p == ".codex" || p == ".agents" {
 			return true
 		}
 		if i == len(parts)-1 {
