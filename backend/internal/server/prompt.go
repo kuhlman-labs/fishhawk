@@ -1801,6 +1801,19 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 	}
 	trigger.InjectedDocuments = injected
 	trigger.Grooming = groomingCtx
+	// Upkeep scan evidence (#3922): a plan stage declaring `produces:
+	// upkeep_report` is forked to the upkeep scan prompt with the
+	// server-gathered pin-drift and flake facts. nil for every other stage, so
+	// every other prompt is unchanged. /prompt-render runs this same call and
+	// RE-GATHERS, so the preview can differ from this serve when a run lands
+	// or the gather budget expires between the two calls.
+	upkeepCtx, err := s.resolveUpkeepScanContext(r.Context(), runRow, stage)
+	if err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"resolve the stage's upkeep_report declaration failed", map[string]any{"error": err.Error()})
+		return
+	}
+	trigger.Upkeep = upkeepCtx
 
 	text, err := prompt.Build(string(stage.Type), trigger)
 	if err != nil {
@@ -2487,6 +2500,18 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 	}
 	trigger.InjectedDocuments = injected
 	trigger.Grooming = groomingCtx
+	// Upkeep scan evidence (#3922), resolved exactly as handleGetStagePrompt
+	// resolves it, so the two endpoints share one sequence. The preview
+	// re-gathers the evidence: it reads the same fixed commit and the same
+	// recorded runs, but a run landing or the gather budget expiring between
+	// the two calls can make the rendered facts differ.
+	upkeepCtx, err := s.resolveUpkeepScanContext(r.Context(), runRow, stage)
+	if err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"resolve the stage's upkeep_report declaration failed", map[string]any{"error": err.Error()})
+		return
+	}
+	trigger.Upkeep = upkeepCtx
 
 	text, err := prompt.Build(string(stage.Type), trigger)
 	if err != nil {

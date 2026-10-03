@@ -13465,8 +13465,9 @@ type envelopeMatrixFixture struct {
 // TestBuild_SwitchCasesCoveredByEnvelopeMatrix, the AST exhaustiveness guard
 // that a NEW stage type added to Build cannot ship a raw untrusted-text path.
 //
-// The `plan` case forks internally on t.Grooming != nil, which a case-literal
-// AST walk cannot see, so the plan-plus-Grooming fixture is carried explicitly.
+// The `plan` case forks internally on t.Grooming != nil and t.Upkeep != nil
+// (#3922), which a case-literal AST walk cannot see, so the plan-plus-Grooming
+// and plan-plus-Upkeep fixtures are carried explicitly.
 func envelopeMatrixFixtures() []envelopeMatrixFixture {
 	return []envelopeMatrixFixture{
 		{Name: "plan", StageType: "plan"},
@@ -13477,6 +13478,13 @@ func envelopeMatrixFixtures() []envelopeMatrixFixture {
 				Path: ".fishhawk/charter.md", Commit: "abcdef0123456789abcdef0123456789abcdef01",
 				ContentHash: "sha256:cafebabe",
 			}}
+		}},
+		{Name: "plan_upkeep", StageType: "plan", Mutate: func(tr *Trigger) {
+			tr.Upkeep = &UpkeepScanContext{
+				BaseCommit: "7ded0368aabbccddeeff00112233445566778899",
+				Flakes: []UpkeepFlakeFact{{Subject: "TestWidgetSync", Occurrences: 1,
+					Refs: []UpkeepRunRef{{RunID: "6f1c2a3e-8b4d-4e5f-9a6b-7c8d9e0f1a2b", StageID: "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d"}}}},
+			}
 		}},
 		{Name: "implement", StageType: "implement", BodyMustBeAbsent: true, Mutate: func(tr *Trigger) {
 			tr.ApprovedPlan = fixturePlan()
@@ -14006,8 +14014,9 @@ var allowedReadersFor = map[string]map[string]bool{
 	// #3738: the crew-message channel. The Trigger FIELD is read only by the
 	// three REVIEWED builders — buildImplement and buildImplementFixup are
 	// deliberately absent (never-re-ingest, ADR-029 / ARCHITECTURE.md §6
-	// invariant #8), as are buildAcceptance and buildGroomingPropose (no
-	// crew-message delivery surface). The message's untrusted blob is read by
+	// invariant #8), as are buildAcceptance, buildGroomingPropose and
+	// buildUpkeepScan (no crew-message delivery surface; #3922 follows the
+	// grooming precedent). The message's untrusted blob is read by
 	// the ONE render function, and only as a direct argument to
 	// sanitizeUntrustedComment.
 	"CrewMessages": {

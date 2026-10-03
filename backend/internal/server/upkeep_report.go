@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -66,7 +67,15 @@ var upkeepStageAllowedKinds = map[plan.ArtifactKind]bool{
 // 400 grooming_report_stage_invalid (fail-B); every other kind — plan
 // included — gets the plan path's plan_invalid tail with a *plan.SemanticError
 // naming the declaration, so it is never stored.
-func (s *Server) guardUpkeepStageProposal(w http.ResponseWriter, r *http.Request, runID, stageID uuid.UUID, stage *run.Stage, kind plan.ArtifactKind) bool {
+//
+// body and derr are the raw upload and plan.DetectArtifactKind's error
+// (#3922, the carried #3921 concern). The caller maps a detection error to
+// kind plan, so without them a truncated upkeep_report was refused as "not a
+// plan" with its parse error dropped. upkeepGuardBodyDetail now says WHY the
+// body read as a plan — the parse error, no top-level kind, or an unknown kind
+// — and the message names upkeep_report_v1, so the bounded schema retry the
+// plan_invalid tail schedules feeds the agent that text, not a plan-schema hint.
+func (s *Server) guardUpkeepStageProposal(w http.ResponseWriter, r *http.Request, runID, stageID uuid.UUID, stage *run.Stage, kind plan.ArtifactKind, body []byte, derr error) bool {
 	if upkeepStageAllowedKinds[kind] {
 		return false
 	}
@@ -83,16 +92,48 @@ func (s *Server) guardUpkeepStageProposal(w http.ResponseWriter, r *http.Request
 	if b.Undecidable != "" {
 		why = "belongs to a workflow declaring produces: upkeep_report and its own declaration is undecidable (" + b.Undecidable + ")"
 	}
-	msg := fmt.Sprintf("stage %s %s; it may ship only an upkeep_report or a clarification_request, not a %s", stageID, why, kind)
 	switch kind {
 	case plan.ArtifactKindGroomingReport:
+		msg := fmt.Sprintf("stage %s %s; it may ship only an upkeep_report or a clarification_request, not a %s", stageID, why, kind)
 		s.failGroomingStage(r, runID, stageID, "grooming_report_stage_invalid: "+msg)
 		s.writeError(w, r, http.StatusBadRequest, "grooming_report_stage_invalid", msg,
 			map[string]any{"stage_type": string(stage.Type), "reason": "stage_declares_upkeep_report"})
 	default:
+		msg := fmt.Sprintf("stage %s %s; %s; it may ship only an upkeep_report (%s, kind %q) or a clarification_request",
+			stageID, why, upkeepGuardBodyDetail(body, derr), plan.UpkeepReportVersion, plan.KindUpkeepReport)
 		s.refusePlanInvalid(w, r, runID, stageID, &plan.SemanticError{Message: msg})
 	}
 	return true
+}
+
+// upkeepGuardMaxKindBytes bounds the agent-supplied top-level kind that
+// upkeepGuardBodyDetail echoes back (#3922 approval condition 6): the text
+// reaches the 400, the stage's failure reason and the schema-retry feedback.
+const upkeepGuardMaxKindBytes = 64
+
+// upkeepGuardBodyDetail says why a body refused on an upkeep-declaring stage
+// was read as a plan: derr non-nil means it did not parse (the parse error is
+// kept verbatim); otherwise it either carries no top-level "kind" or carries
+// one plan.DetectArtifactKind does not recognize, which is echoed truncated to
+// upkeepGuardMaxKindBytes. Pure; derr is plan.DetectArtifactKind's error.
+func upkeepGuardBodyDetail(body []byte, derr error) string {
+	if derr != nil {
+		return "the body is not a parseable upkeep_report (" + derr.Error() + ")"
+	}
+	var disc struct {
+		Kind string `json:"kind"`
+	}
+	// DetectArtifactKind already decoded this body into the same shape, so a
+	// decode error here is unreachable; it reads as kind-less either way.
+	_ = json.Unmarshal(body, &disc)
+	if disc.Kind == "" {
+		return `the body carries no top-level "kind", so it was read as a plan`
+	}
+	k := disc.Kind
+	if len(k) > upkeepGuardMaxKindBytes {
+		k = strings.ToValidUTF8(k[:upkeepGuardMaxKindBytes], "") + "...[truncated]"
+	}
+	return fmt.Sprintf("its top-level kind %q is not a recognized artifact kind", k)
 }
 
 // handleUpkeepReport ingests an upkeep_report artifact — the THIRD additive
