@@ -4707,8 +4707,18 @@ func TestScopeExemption_GateEvidence_EndToEnd(t *testing.T) {
 func cannedComparePatchClient(t *testing.T, body string) *githubclient.Client {
 	t.Helper()
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		// The consolidated review's permission-drift check reads
+		// .fishhawk/permission-surfaces.yaml through the contents API. It must
+		// not see the compare JSON there: GetFile rejects it as a non-404 read
+		// failure, which the check (correctly) fails closed on with a
+		// fetch_failed concern (#3935). A 404 reports "no extension".
+		if strings.Contains(r.URL.Path, "/contents/") {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = io.WriteString(w, `{"message":"Not Found"}`)
+			return
+		}
 		_, _ = io.WriteString(w, body)
 	})
 	srv := httptest.NewServer(mux)
