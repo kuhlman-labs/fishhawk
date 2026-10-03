@@ -32,7 +32,7 @@ git status --short | head
 uptime
 ```
 
-- **Docker down** → `open -a Docker`, then wait for `docker info` to succeed (poll with Monitor/until-loop, not `sleep`).
+- **Docker down** → `open -a Docker`, then poll until `docker info` succeeds (a bounded until-loop, not one long `sleep`).
 - **`.env` missing** → `cp .env.example .env`; `FISHHAWKD_DATABASE_URL` already matches `docker-compose.yml`. Tell the user which optional blocks (GitHub App, OAuth) are unset; fishhawkd starts without them but logs warnings. Never print secret values from `.env`.
 - **Live runner** → `reload`/`post-merge`/`down` restart fishhawkd and can strand that run's stage in `running`. `reload`/`post-merge` refuse on their own; STOP and ask the user before passing `--force`. Same if the user has an in-flight `fishhawk_await_*` on another run.
 - **Dirty tree** → fine for `up`/`reload` (binaries get stamped `-dirty`). `post-merge` does `git pull --ff-only` on main — confirm the user is on a clean `main` first.
@@ -40,7 +40,7 @@ uptime
 
 ## 3. Deploy
 
-Run the chosen command in the foreground with a generous timeout (first build of five binaries can take a few minutes; `k8s` builds an image — use the 600000ms max and `run_in_background` if it may exceed it).
+Run the chosen command with a generous timeout: the first build of five binaries can take a few minutes, and `k8s` builds an image. If your shell tool caps command duration below ~10 minutes, run it in the background and wait for it to exit.
 
 Success markers in the output:
 - `postgres: ready|running` and `rustfs: ready|running`
@@ -60,8 +60,8 @@ curl -fsS "http://${FISHHAWKD_ADDR:-localhost:8080}/healthz" | python3 -m json.t
 ## 4. Report
 
 One short block: mode, URL, pid, `git_sha`, which binaries rebuilt, and **the MCP banner verbatim if one printed** — it is the only thing the user must act on:
-- `ACTION REQUIRED` / shim-rebuilt banner → user must run `/mcp` to reconnect.
-- auto-swap / `schema_major_shim` → expectation only; verify with `fishhawk_doctor` (`spec.valid: true`) or a version-returning tool reflecting the new GitSHA. If stale: `bin/fishhawk-mcp-shim --status`, then `/mcp`.
+- `ACTION REQUIRED` / shim-rebuilt banner → the user must reconnect their MCP client (`/mcp` in Claude Code).
+- auto-swap / `schema_major_shim` → expectation only; verify with `fishhawk_doctor` (`spec.valid: true`) or a version-returning tool reflecting the new GitSHA. If stale: `bin/fishhawk-mcp-shim --status`, then reconnect the MCP client.
 - `fishhawk-runner` needs nothing — it is spawned fresh from `bin/` per stage.
 
 ## Troubleshooting
@@ -71,7 +71,7 @@ One short block: mode, URL, pid, `git_sha`, which binaries rebuilt, and **the MC
 | `port … in use by pid N` | `scripts/dev down`; if a foreign process holds it, report it — don't kill non-fishhawkd processes without asking |
 | `did not become healthy within 10s` | Read the printed log tail / `tail -50 logs/fishhawkd.log`; usually a migration or config error |
 | `postgres did not become ready` | `docker logs fishhawk-postgres` |
-| `Operation not permitted` on repo read | Grant Claude Code Full Disk Access (System Settings → Privacy & Security) and restart it |
+| `Operation not permitted` on repo read | Grant the app hosting the agent (terminal, Claude Code, Codex) Full Disk Access in System Settings → Privacy & Security, then restart it |
 | Build fails only under a newer local Go | `go env -w GOTOOLCHAIN=go1.25.6` (AGENTS.md Traps, #3237) |
 | k8s: `STALE fishhawkd image` / identity mismatch | See `docs/deploy/kubernetes.md` § "Image identity"; `FISHHAWK_K8S_SKIP_IDENTITY=1` only with the user's OK |
 | k8s: `x509: certificate signed by unknown authority` in `docker build` | TLS-inspecting proxy — `docs/deploy/kubernetes.md` |
