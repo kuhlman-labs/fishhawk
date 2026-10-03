@@ -2785,23 +2785,28 @@ change here, not four skill edits.
   against the runner's agent trees, each as an exact path component
   (`grep -E`), not a substring:
   `/fishhawk-worktrees/run-<id>` (lineage worktree),
-  `/fishhawk-acceptance-tree-<uuid>-<uuid>` (acceptance merge-candidate
-  tree), `/fishhawk-acceptance-<digits>` (the acceptance agent's own
-  `os.MkdirTemp` workdir) and `/fishhawk-conflict-<rand>/tree`
-  (conflict-resolution tree), each followed by `/` or end of path. A run tree's path prefixes every directory
+  `/fishhawk-acceptance-tree-<run-uuid>-<stage>` (acceptance merge-candidate
+  tree; the full run UUID is required, so an operator worktree like
+  `fishhawk-acceptance-tree-fix` is not refused, but any stage suffix is
+  accepted, since nothing enforces that the stage id is a UUID),
+  `/fishhawk-acceptance-<digits>` (the acceptance agent's own `os.MkdirTemp`
+  workdir) and `/fishhawk-conflict-<rand>/tree` (conflict-resolution tree),
+  each followed by `/` or end of path. The acceptance workdir is not a git
+  checkout, so a skill (which locates this script via `git rev-parse`)
+  cannot reach that pattern from there; it serves direct callers passing
+  DIR. A run tree's path prefixes every directory
   inside it, so a subdirectory matches too. The local runner sets no marker
   env var, so the path is what identifies a local run agent.
-- **Env signals.** A non-empty `FISHHAWK_RUN_ID` (set by CI-hosted runners
-  only: GitLab CI, deploy triggers; empty is not a marker), and, as an
-  INTERIM signal, `FISHHAWK_FORGE_WRITES=deny`, which `acceptenv` injects into
-  every acceptance agent. It catches an acceptance agent that has cd'd out
-  of its trees, but it means "forge writes disabled", so an operator testing
-  dev mode with it set is refused too (the printed reason says so). A
-  dedicated runner-stamped marker on every agent spawn would replace both
-  this and the path list: #3945.
+- **Env signal.** A non-empty `FISHHAWK_RUN_ID` (set by CI-hosted runners
+  only: GitLab CI, deploy triggers; empty is not a marker).
+  `FISHHAWK_FORGE_WRITES=deny` is deliberately NOT a signal: it means "forge
+  writes disabled", and an operator may set it for dev-mode testing. A
+  dedicated runner-stamped marker on every agent spawn would replace the
+  path list: #3945.
 - **Contract for callers.** Continue only on `operator` with exit 0. Any
-  other result, including exit 127 when a checkout predates the script,
-  means stop and report the output. The skills cite this section rather
+  other result, including exit 127 when a checkout predates the script or
+  the caller is not in a repository checkout, means stop and report the
+  output. The skills cite this section rather
   than restate it.
 
 `scripts/test-is-run-agent` (in `scripts/test verify`'s gate harnesses)
@@ -2809,9 +2814,10 @@ pins each tree shape (including the acceptance workdir), a subdirectory of
 a run tree, a non-git run-tree path, operator checkouts merely NAMED like
 each shape (conflict, acceptance tree, acceptance workdir, a
 `fishhawk-worktrees` child merely containing `run-`, a component merely
-ending in `fishhawk-worktrees`), and the env signals (18 cases).
-Counterfactuals: deleting the conflict-tree pattern fails r3/r4, loosening
-it to a prefix fails o3/o4, and an unanchored acceptance-tree pattern fails
-o7. Both `scripts/is-run-agent` and the harness are in both implement
+ending in `fishhawk-worktrees`), near misses on each acceptance anchor,
+and the env cases, including that `FISHHAWK_FORGE_WRITES=deny` is NOT a
+marker (22 cases). Counterfactuals: deleting the conflict-tree pattern fails
+r3/r4, loosening it to a prefix fails o3/o4, an unanchored acceptance-tree
+pattern fails o7, and dropping the workdir pattern's end anchor fails o9. Both `scripts/is-run-agent` and the harness are in both implement
 stages' `forbidden_paths`, so a run cannot merge a weakened guard. A skill that finds the script missing (a
 checkout that predates it, exit 127) stops instead of proceeding.

@@ -72,6 +72,17 @@ expect_run_agent "r5 non-git run-tree path" "$tmproot/plain/fishhawk-worktrees/r
 mkdir -p "$tmproot/fishhawk-acceptance-2836411907"
 expect_run_agent "r6 acceptance workdir" "$tmproot/fishhawk-acceptance-2836411907" "acceptance workdir"
 
+# r7/r8 — subdirectories of the acceptance shapes still match.
+mkdir -p "$tmproot/fishhawk-acceptance-2836411907/sub"
+expect_run_agent "r7 acceptance workdir subdirectory" "$tmproot/fishhawk-acceptance-2836411907/sub" "acceptance workdir"
+mkdir -p "$tmproot/$ACC_TREE/backend/internal"
+expect_run_agent "r8 acceptance tree subdirectory" "$tmproot/$ACC_TREE/backend/internal" "acceptance tree"
+
+# r9 — an acceptance tree whose stage suffix is not a UUID still matches:
+# only the run UUID is required.
+mk_git "$tmproot/fishhawk-acceptance-tree-3a8cc5f5-85cd-4664-8b7c-6974739db24e-acceptance"
+expect_run_agent "r9 acceptance tree, non-UUID stage" "$tmproot/fishhawk-acceptance-tree-3a8cc5f5-85cd-4664-8b7c-6974739db24e-acceptance" "acceptance tree"
+
 # o1 — an ordinary operator checkout.
 mk_git "$tmproot/fishhawk"
 expect_operator "o1 operator checkout" "$tmproot/fishhawk"
@@ -104,6 +115,13 @@ expect_operator "o7 operator worktree named fishhawk-acceptance-tree-*" "$tmproo
 mk_git "$tmproot/fishhawk/.claude/worktrees/fishhawk-acceptance-gate"
 expect_operator "o8 operator worktree named fishhawk-acceptance-*" "$tmproot/fishhawk/.claude/worktrees/fishhawk-acceptance-gate"
 
+# o9/o10 — near misses on the anchors: a workdir-like name with a non-digit
+# after the digits (the `(/|$)` anchor), and a tree-like name without a run UUID.
+mk_git "$tmproot/fishhawk/.claude/worktrees/fishhawk-acceptance-2024x"
+expect_operator "o9 fishhawk-acceptance-<digits><letter>" "$tmproot/fishhawk/.claude/worktrees/fishhawk-acceptance-2024x"
+mk_git "$tmproot/fishhawk/.claude/worktrees/fishhawk-acceptance-tree-notauuid-123"
+expect_operator "o10 acceptance-tree name without a run UUID" "$tmproot/fishhawk/.claude/worktrees/fishhawk-acceptance-tree-notauuid-123"
+
 # e1 — FISHHAWK_RUN_ID alone marks a run agent (CI-hosted runners).
 out="$(env -u FISHHAWK_FORGE_WRITES FISHHAWK_RUN_ID=11111111-2222-3333-4444-555555555555 "$CHECK" "$tmproot/fishhawk" 2>&1)"
 status=$?
@@ -122,22 +140,14 @@ else
   fail "e2 empty FISHHAWK_RUN_ID (status=$status out=$out)"
 fi
 
-# e3 — the acceptance env marker (interim): FISHHAWK_FORGE_WRITES=deny.
+# e3 — FISHHAWK_FORGE_WRITES=deny is NOT a run-agent marker: an operator may
+# set it for dev-mode testing, and must not be refused for it.
 out="$(env -u FISHHAWK_RUN_ID FISHHAWK_FORGE_WRITES=deny "$CHECK" "$tmproot/fishhawk" 2>&1)"
 status=$?
-if [ "$status" -eq 10 ] && [[ "$out" == "run-agent: FISHHAWK_FORGE_WRITES=deny"* ]]; then
-  pass "e3 FISHHAWK_FORGE_WRITES=deny"
-else
-  fail "e3 FISHHAWK_FORGE_WRITES=deny (status=$status out=$out)"
-fi
-
-# e4 — any other FISHHAWK_FORGE_WRITES value is not a marker.
-out="$(env -u FISHHAWK_RUN_ID FISHHAWK_FORGE_WRITES=allow "$CHECK" "$tmproot/fishhawk" 2>&1)"
-status=$?
 if [ "$status" -eq 0 ] && [ "$out" = "operator" ]; then
-  pass "e4 FISHHAWK_FORGE_WRITES=allow"
+  pass "e3 FISHHAWK_FORGE_WRITES=deny is not a marker"
 else
-  fail "e4 FISHHAWK_FORGE_WRITES=allow (status=$status out=$out)"
+  fail "e3 FISHHAWK_FORGE_WRITES=deny is not a marker (status=$status out=$out)"
 fi
 
 echo "test-is-run-agent: $PASS passed, $FAIL failed"

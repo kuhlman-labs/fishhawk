@@ -1,9 +1,11 @@
 package policy
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
@@ -59,7 +61,7 @@ func resolvedForbiddenPaths(t *testing.T, wf, stageID string) []string {
 // testdata/policy/agent-instruction-paths.json.
 func TestRepoSpecForbidsAgentInstructionPaths(t *testing.T) {
 	for _, tc := range loadAgentPathCases(t) {
-		t.Run(tc.Workflow, func(t *testing.T) {
+		t.Run(tc.Workflow+"."+tc.Stage, func(t *testing.T) {
 			c := Constraints{ForbiddenPaths: resolvedForbiddenPaths(t, tc.Workflow, tc.Stage)}
 			for _, p := range tc.MustForbid {
 				if !hasForbiddenViolation(Evaluate(diff(p), c)) {
@@ -75,6 +77,11 @@ func TestRepoSpecForbidsAgentInstructionPaths(t *testing.T) {
 	}
 }
 
+// BEGIN agent-path fixture loader — byte-identical in
+// runner/internal/constraint/repospec_test.go and
+// backend/internal/policy/repospec_test.go (the modules cannot import each
+// other); backend/internal/policy TestAgentPathLoaderParity fails on drift.
+
 // agentPathCase is one workflow stage's expectation, expanded from the shared
 // fixture testdata/policy/agent-instruction-paths.json.
 type agentPathCase struct {
@@ -83,10 +90,15 @@ type agentPathCase struct {
 	MustStayWritable []string
 }
 
-// loadAgentPathCases reads the shared fixture (ONE path table and case list
-// for this test and its twin in the other module) and expands each case's
-// class names into paths. An unknown or empty class fails the test, so a
-// typo cannot make a case vacuous.
+// requiredAgentPathWorkflows are the workflow stages the fixture MUST cover,
+// so deleting a case cannot silently drop its assertions.
+var requiredAgentPathWorkflows = []string{"feature_change.implement", "routine_change.implement"}
+
+// loadAgentPathCases reads the shared fixture and expands each case's class
+// names into paths. It fails closed on anything that would make the test
+// vacuous: an unknown JSON key (a misspelled must_forbid), an unknown or empty
+// class, a case with an empty must_forbid or must_stay_writable, or a missing
+// required workflow stage.
 func loadAgentPathCases(t *testing.T) []agentPathCase {
 	t.Helper()
 	p := filepath.Join("..", "..", "..", "testdata", "policy", "agent-instruction-paths.json")
@@ -95,6 +107,7 @@ func loadAgentPathCases(t *testing.T) []agentPathCase {
 		t.Fatalf("read %s: %v", p, err)
 	}
 	var f struct {
+		Comment string              `json:"_comment"`
 		Classes map[string][]string `json:"classes"`
 		Cases   []struct {
 			Workflow         string   `json:"workflow"`
@@ -103,31 +116,41 @@ func loadAgentPathCases(t *testing.T) []agentPathCase {
 			MustStayWritable []string `json:"must_stay_writable"`
 		} `json:"cases"`
 	}
-	if err := json.Unmarshal(raw, &f); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&f); err != nil {
 		t.Fatalf("parse %s: %v", p, err)
 	}
-	expand := func(classes []string) []string {
+	expand := func(where string, classes []string) []string {
+		if len(classes) == 0 {
+			t.Fatalf("%s: %s lists no classes", p, where)
+		}
 		var out []string
 		for _, c := range classes {
 			paths := f.Classes[c]
 			if len(paths) == 0 {
-				t.Fatalf("%s: class %q is unknown or empty", p, c)
+				t.Fatalf("%s: %s: class %q is unknown or empty", p, where, c)
 			}
 			out = append(out, paths...)
 		}
 		return out
 	}
-	if len(f.Cases) == 0 {
-		t.Fatalf("%s: no cases", p)
-	}
+	seen := map[string]bool{}
 	cases := make([]agentPathCase, 0, len(f.Cases))
 	for _, c := range f.Cases {
+		id := c.Workflow + "." + c.Stage
+		seen[id] = true
 		cases = append(cases, agentPathCase{
 			Workflow:         c.Workflow,
 			Stage:            c.Stage,
-			MustForbid:       expand(c.MustForbid),
-			MustStayWritable: expand(c.MustStayWritable),
+			MustForbid:       expand(id+" must_forbid", c.MustForbid),
+			MustStayWritable: expand(id+" must_stay_writable", c.MustStayWritable),
 		})
+	}
+	for _, id := range requiredAgentPathWorkflows {
+		if !seen[id] {
+			t.Fatalf("%s: required case %s is missing", p, id)
+		}
 	}
 	return cases
 }
@@ -141,4 +164,33 @@ func hasForbiddenViolation(vs []Violation) bool {
 		}
 	}
 	return false
+}
+
+// END agent-path fixture loader
+
+// agentPathLoaderBlock returns the marked loader block of a repospec test file.
+func agentPathLoaderBlock(t *testing.T, path string) string {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	s := string(raw)
+	const begin, end = "// BEGIN agent-path fixture loader", "// END agent-path fixture loader"
+	i, j := strings.Index(s, begin), strings.Index(s, end)
+	if i < 0 || j < i {
+		t.Fatalf("%s: agent-path loader markers missing or out of order", path)
+	}
+	return s[i : j+len(end)]
+}
+
+// TestAgentPathLoaderParity pins that this module's fixture loader is
+// byte-identical to the runner module's twin, so the two tests cannot disagree
+// about what makes the shared fixture valid.
+func TestAgentPathLoaderParity(t *testing.T) {
+	ours := agentPathLoaderBlock(t, "repospec_test.go")
+	theirs := agentPathLoaderBlock(t, filepath.Join("..", "..", "..", "runner", "internal", "constraint", "repospec_test.go"))
+	if ours != theirs {
+		t.Fatalf("agent-path fixture loader drifted between backend/internal/policy and runner/internal/constraint repospec_test.go; make the BEGIN/END blocks identical")
+	}
 }
