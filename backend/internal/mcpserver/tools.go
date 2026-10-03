@@ -528,6 +528,23 @@ type PlanContent struct {
 	// is derived at decode time (see tryGetPlanForRun) so the operator gate view
 	// can show a per-phase file count without recomputing it.
 	SplitProposal *PlanSplitProposal `json:"split_proposal,omitempty"`
+	// NewArchitecturalDecision surfaces the planner's optional declaration that
+	// the plan sets NEW architectural direction (E78.4 / #3748). Presence is the
+	// declaration. Decoded straight from the artifact by tryGetPlanForRun's
+	// json.Unmarshal (the tags mirror the schema's new-architectural-decision
+	// $def), so no decode step is needed. Nil when the plan declares none.
+	NewArchitecturalDecision *PlanNewArchitecturalDecision `json:"new_architectural_decision,omitempty" jsonschema:"the planner's optional declaration that this plan sets NEW architectural direction (E78.4 / #3748): a new component boundary, persistence shape, protocol or wire contract, trust boundary, or a departure from a cited ADR. Presence is the declaration. It gates nothing: the plan-gate advisory pass also surfaces it as one plan_warnings entry, and the captain decides whether the direction needs an ADR. Absent when the plan declares none"`
+}
+
+// PlanNewArchitecturalDecision mirrors the standard_v1 plan's optional
+// new_architectural_decision object (E78.4 / #3748) for get_plan.
+// DecisionSummary is the one-line direction, Rationale says why the plan sets
+// it, and RelatedADRs names the ADRs it relates to or departs from (empty when
+// no existing ADR covers it).
+type PlanNewArchitecturalDecision struct {
+	Rationale       string   `json:"rationale" jsonschema:"why this plan sets new architectural direction"`
+	RelatedADRs     []string `json:"related_adrs" jsonschema:"ADR ids the decision relates to or departs from; empty when no existing ADR covers it"`
+	DecisionSummary string   `json:"decision_summary" jsonschema:"one line naming the new direction"`
 }
 
 // PlanDecomposition carries the agent's proposal to split the plan
@@ -688,7 +705,7 @@ type GetPlanOutput struct {
 	// multi-slice decomposition with every sub_plan omitting depends_on
 	// (the shape that wedged #1551's first attempt), plus the sub-plan
 	// runtime-sum and expensive-gate-vs-budget advisories.
-	PlanWarnings []string `json:"plan_warnings,omitempty" jsonschema:"plan-gate soft advisories (#1684): notably flags a multi-slice decomposition where every sub_plan omits depends_on — if any slice forms a producer->consumer chain, all slices run in parallel in wave 0 and the consumer can fail typecheck against the not-yet-integrated symbol (the shape that wedged #1551's first attempt). Also flags a sub-plan predicted_runtime_minutes sum less than the parent's (possible scope compression) and an expensive test_strategy gate paired with an under-budgeted predicted_runtime_minutes. Flags an over-cap plan (scope.files exceeds the implement-stage max_files_changed cap) and, one step earlier, a NEAR-cap plan (#2492): scope.files lands within a few files of the cap, so it names the count, cap and remaining headroom and warns that once that headroom is spent the plan-approval scope-cap gate and the mid-stage scope-amendment headroom check refuse any further file (stated more emphatically for a decomposed plan, where all slices draw against the ONE whole-plan budget). On a near-cap advisory: approve knowing there is no amendment headroom for a mid-stage fix, or narrow the scope / re-plan first. Also flags an UNLANDABLE plan (#2415): when the scope's minimum PHYSICAL changed-file count exceeds the cap the plan cannot land in this run even with --override-scope-cap (which is refused at approval), so it names the two levers — remove_scope_files, or a governed cap raise plus a fresh run. Advisory, never blocks approval. Absent when no advisory fired or on older runs predating this pass"`
+	PlanWarnings []string `json:"plan_warnings,omitempty" jsonschema:"plan-gate soft advisories (#1684): notably flags a multi-slice decomposition where every sub_plan omits depends_on — if any slice forms a producer->consumer chain, all slices run in parallel in wave 0 and the consumer can fail typecheck against the not-yet-integrated symbol (the shape that wedged #1551's first attempt). Also flags a sub-plan predicted_runtime_minutes sum less than the parent's (possible scope compression) and an expensive test_strategy gate paired with an under-budgeted predicted_runtime_minutes. Flags an over-cap plan (scope.files exceeds the implement-stage max_files_changed cap) and, one step earlier, a NEAR-cap plan (#2492): scope.files lands within a few files of the cap, so it names the count, cap and remaining headroom and warns that once that headroom is spent the plan-approval scope-cap gate and the mid-stage scope-amendment headroom check refuse any further file (stated more emphatically for a decomposed plan, where all slices draw against the ONE whole-plan budget). On a near-cap advisory: approve knowing there is no amendment headroom for a mid-stage fix, or narrow the scope / re-plan first. Also flags an UNLANDABLE plan (#2415): when the scope's minimum PHYSICAL changed-file count exceeds the cap the plan cannot land in this run even with --override-scope-cap (which is refused at approval), so it names the two levers — remove_scope_files, or a governed cap raise plus a fresh run. Also flags a NEW ARCHITECTURAL DECISION (E78.4 / #3748): when the plan declares new_architectural_decision it names the decision summary, rationale and related ADRs, and the captain decides whether the direction needs an ADR — approve (optionally filing one with fishhawk_file_issue type adr) or reject the plan. Advisory, never blocks approval. Absent when no advisory fired or on older runs predating this pass"`
 	// Reachability surfaces the runner-side symbol-reachability sweep (#2056):
 	// the plan's split_proposal phase partition validated against the compiler's
 	// view of the working tree, with per-phase declared-vs-derived file counts

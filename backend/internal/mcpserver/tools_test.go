@@ -4751,6 +4751,146 @@ func TestGetPlan_WithoutDecomposition_RuntimeFieldsPresent(t *testing.T) {
 	}
 }
 
+// seedPlanArtifactWithNewArchitecturalDecision seeds a plan artifact whose
+// wire content carries new_architectural_decision marshalled from the BACKEND
+// type (plan.NewArchitecturalDecision, E78.4 / #3748) rather than from this
+// package's PlanNewArchitecturalDecision mirror, so a json-tag drift between
+// the two sides fails the get_plan decode here instead of silently dropping
+// the field in production.
+func seedPlanArtifactWithNewArchitecturalDecision(t *testing.T, fb *fakeBackend, stageID uuid.UUID, d *plan.NewArchitecturalDecision) {
+	t.Helper()
+	art := seedPlanArtifact(fb, stageID, samplePlanContent(), time.Hour)
+	raw, err := json.Marshal(d)
+	if err != nil {
+		t.Fatalf("marshal plan.NewArchitecturalDecision: %v", err)
+	}
+	var decoded any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("decode plan.NewArchitecturalDecision: %v", err)
+	}
+	content, ok := art.Content.(map[string]any)
+	if !ok {
+		t.Fatalf("seeded plan content is %T, want map[string]any", art.Content)
+	}
+	content["new_architectural_decision"] = decoded
+}
+
+// TestGetPlan_NewArchitecturalDecision_Surfaced pins the get_plan surface of
+// the E78.4 / #3748 declaration: a plan artifact carrying
+// new_architectural_decision decodes into Plan.NewArchitecturalDecision with
+// all three fields, and the server-side advisory seeded as a plan_warnings
+// entry (byte-for-byte the shape server.newArchitecturalDecisionWarning emits)
+// echoes through PlanWarnings.
+func TestGetPlan_NewArchitecturalDecision_Surfaced(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	planStageID := uuid.New()
+	fb.stagesByRun[runID] = []Stage{
+		{ID: planStageID.String(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+	}
+	seedPlanArtifactWithNewArchitecturalDecision(t, fb, planStageID, &plan.NewArchitecturalDecision{
+		Rationale:       "introduces a per-tenant trust boundary on the audit read path",
+		RelatedADRs:     []string{"ADR-057", "#3728"},
+		DecisionSummary: "audit reads resolve through a tenant-scoped repository",
+	})
+	advisory := "plan declares a NEW ARCHITECTURAL DECISION: audit reads resolve through a tenant-scoped repository. " +
+		"Rationale: introduces a per-tenant trust boundary on the audit read path. Related ADRs: ADR-057, #3728. " +
+		"This is an advisory, not a gate: the captain decides whether the direction needs an ADR — " +
+		"approve (optionally filing one with fishhawk_file_issue type adr) or reject the plan."
+	seedPlanWarningsAudit(fb, runID, server.PlanWarningsPayload{Warnings: []string{advisory}})
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getPlan(context.Background(), nil, GetPlanInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getPlan: %v", err)
+	}
+	if out.Plan == nil {
+		t.Fatal("Plan should be non-nil when Status=available")
+	}
+	got := out.Plan.NewArchitecturalDecision
+	if got == nil {
+		t.Fatal("Plan.NewArchitecturalDecision = nil, want the declared object")
+	}
+	if got.DecisionSummary != "audit reads resolve through a tenant-scoped repository" {
+		t.Errorf("DecisionSummary = %q", got.DecisionSummary)
+	}
+	if got.Rationale != "introduces a per-tenant trust boundary on the audit read path" {
+		t.Errorf("Rationale = %q", got.Rationale)
+	}
+	if want := []string{"ADR-057", "#3728"}; !reflect.DeepEqual(got.RelatedADRs, want) {
+		t.Errorf("RelatedADRs = %v, want %v", got.RelatedADRs, want)
+	}
+	if len(out.PlanWarnings) != 1 || out.PlanWarnings[0] != advisory {
+		t.Errorf("PlanWarnings = %q, want exactly the seeded new-architectural-decision advisory", out.PlanWarnings)
+	}
+}
+
+// TestGetPlan_NewArchitecturalDecision_EmptyRelatedADRsKeepsKey pins that a
+// declaration with related_adrs:[] (no existing ADR covers it) surfaces the
+// key as [] rather than dropping it or emitting null: the DTO tag carries no
+// omitempty, mirroring the schema's required related_adrs.
+func TestGetPlan_NewArchitecturalDecision_EmptyRelatedADRsKeepsKey(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	planStageID := uuid.New()
+	fb.stagesByRun[runID] = []Stage{
+		{ID: planStageID.String(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+	}
+	seedPlanArtifactWithNewArchitecturalDecision(t, fb, planStageID, &plan.NewArchitecturalDecision{
+		Rationale:       "first persistence shape for crew messages",
+		RelatedADRs:     []string{},
+		DecisionSummary: "crew messages persist in their own table",
+	})
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getPlan(context.Background(), nil, GetPlanInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getPlan: %v", err)
+	}
+	if out.Plan == nil || out.Plan.NewArchitecturalDecision == nil {
+		t.Fatalf("Plan.NewArchitecturalDecision missing: %+v", out.Plan)
+	}
+	raw, err := json.Marshal(out.Plan.NewArchitecturalDecision)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(raw), `"related_adrs":[]`) {
+		t.Errorf("new_architectural_decision = %s, want related_adrs rendered as []", raw)
+	}
+}
+
+// TestGetPlan_NewArchitecturalDecision_AbsentWhenNotDeclared pins the additive
+// shape: a plan without the field surfaces a nil NewArchitecturalDecision and
+// the marshalled plan carries no new_architectural_decision key at all.
+func TestGetPlan_NewArchitecturalDecision_AbsentWhenNotDeclared(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	planStageID := uuid.New()
+	fb.stagesByRun[runID] = []Stage{
+		{ID: planStageID.String(), RunID: runID.String(), Type: "plan", State: "succeeded"},
+	}
+	seedPlanArtifact(fb, planStageID, samplePlanContent(), time.Hour)
+
+	r := newResolver(srv, nil)
+	_, out, err := r.getPlan(context.Background(), nil, GetPlanInput{RunID: runID.String()})
+	if err != nil {
+		t.Fatalf("getPlan: %v", err)
+	}
+	if out.Plan == nil {
+		t.Fatal("Plan should be non-nil")
+	}
+	if out.Plan.NewArchitecturalDecision != nil {
+		t.Errorf("Plan.NewArchitecturalDecision = %+v, want nil for a plan without the field", out.Plan.NewArchitecturalDecision)
+	}
+	raw, err := json.Marshal(out.Plan)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(raw), "new_architectural_decision") {
+		t.Errorf("marshalled plan carries new_architectural_decision for a plan without it: %s", raw)
+	}
+}
+
 // --- get_plan reviews field (ADR-027 / #560 sub-plan E) ---
 
 // seedPlanReviewAudit adds a plan_reviewed audit entry to the fake's
