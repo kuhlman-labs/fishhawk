@@ -209,7 +209,7 @@ func TestShipPlan_PlanInvalid_400(t *testing.T) {
 // TestShipPlan_AgentOutputInvalid_400 is the #2833 widening: every backend
 // error code that means "the AGENT's output is bad" maps to ErrPlanInvalid
 // (runner category-B), and every other 400 stays a generic error
-// (category-C). All four codes arrive on this one endpoint because POST
+// (category-C). All six codes arrive on this one endpoint because POST
 // /v0/runs/{run_id}/plan routes by the artifact's "kind" discriminator.
 //
 // The control rows are the point:
@@ -253,6 +253,18 @@ func TestShipPlan_AgentOutputInvalid_400(t *testing.T) {
 		{
 			name:       "grooming_report_stage_invalid",
 			body:       envelope("grooming_report_stage_invalid", "grooming_report may only be shipped from a plan stage"),
+			wantB:      true,
+			wantReason: "the stage type is a property of the run — re-shipping cannot help",
+		},
+		{
+			name:       "upkeep_report_invalid",
+			body:       envelope("upkeep_report_invalid", "upkeep_report does not validate against upkeep_report_v1"),
+			wantB:      true,
+			wantReason: "the upkeep_report ingest handler (#3921) fails the stage category-B before writing the 400",
+		},
+		{
+			name:       "upkeep_report_stage_invalid",
+			body:       envelope("upkeep_report_stage_invalid", "upkeep_report may only be shipped from a plan stage"),
 			wantB:      true,
 			wantReason: "the stage type is a property of the run — re-shipping cannot help",
 		},

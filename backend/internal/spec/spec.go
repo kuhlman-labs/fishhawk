@@ -1024,7 +1024,8 @@ type ArtifactKind string
 // artifact (ADR-049 / #1531) — valid only on an acceptance stage;
 // grooming_report is the v2 propose-stage artifact (ADR-065 §3 / #2235)
 // — valid only on a `plan`-typed stage, which ADR-067 §2 reads as
-// PROPOSE. All three stage-type bindings are enforced by Validate.
+// PROPOSE; upkeep_report is the v2 upkeep-scan proposal (E79.2 / #3726),
+// bound the same way. All four stage-type bindings are enforced by Validate.
 const (
 	ArtifactPlan        ArtifactKind = "plan"
 	ArtifactPullRequest ArtifactKind = "pull_request"
@@ -1037,6 +1038,14 @@ const (
 	// declare schema: grooming_report_v1, and may not ALSO declare the plan
 	// artifact — a propose stage proposes one thing.
 	ArtifactGroomingReport ArtifactKind = "grooming_report"
+	// ArtifactUpkeepReport is the upkeep-scan proposal a `plan`-typed
+	// PROPOSE stage emits instead of a plan (E79.2 / #3726). Declared only
+	// at workflow-v2 (v0 and v1 are frozen majors whose produces enums keep
+	// rejecting it). A stage declaring it MUST also declare schema:
+	// upkeep_report_v1, and may not ALSO declare the plan or grooming_report
+	// artifact — a propose stage proposes one thing. The upkeep_report_v1
+	// contract and its ingest handler land in #3921.
+	ArtifactUpkeepReport ArtifactKind = "upkeep_report"
 )
 
 // WorkflowRequiresCharter is the STRUCTURAL discriminator for a backlog-
@@ -1057,6 +1066,10 @@ const (
 // re-deriving from a cached spec that may since have been corrupted. The CLI
 // reruns an independent structural twin over its raw YAML tree (separate Go
 // module); TestCharterMessageParityAcrossModules holds the two together.
+//
+// An upkeep_report workflow (E79.2) requires NO charter: the discriminator
+// keys on grooming_report only, because an upkeep scan ranks nothing against
+// a vision document.
 func WorkflowRequiresCharter(wf Workflow) bool {
 	for _, st := range wf.Stages {
 		for _, p := range st.Produces {
@@ -1072,6 +1085,23 @@ func WorkflowRequiresCharter(wf Workflow) bool {
 // stage must declare, mirroring the plan artifact's standard_v1 rule
 // (MVP_SPEC §4.3: artifacts are schema-versioned for forward compatibility).
 const GroomingReportSchemaVersion = "grooming_report_v1"
+
+// UpkeepReportSchemaVersion is the `schema:` token an upkeep_report-producing
+// stage must declare (E79.2 / #3726), the upkeep sibling of
+// GroomingReportSchemaVersion.
+const UpkeepReportSchemaVersion = "upkeep_report_v1"
+
+// StageProducesUpkeepReport reports whether st declares the upkeep_report
+// artifact in its produces list. Pure — no I/O — and keyed on what the stage
+// PRODUCES, not on a workflow or stage name, like WorkflowRequiresCharter.
+func StageProducesUpkeepReport(st Stage) bool {
+	for _, p := range st.Produces {
+		if p.Artifact == ArtifactUpkeepReport {
+			return true
+		}
+	}
+	return false
+}
 
 // Persistence says where an artifact is stored.
 type Persistence struct {

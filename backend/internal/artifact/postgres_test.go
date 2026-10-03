@@ -375,6 +375,56 @@ func TestPostgres_CreateAndGet_AcceptanceTranscriptKind(t *testing.T) {
 	}
 }
 
+// TestPostgres_CreateAndGet_UpkeepReportKind pins E79.2 / #3726: the
+// `upkeep_report` artifact kind, carrying schema version upkeep_report_v1,
+// round-trips through Create + Get + ListForStage on the real DB — the proof
+// that migration 0095 widened artifacts_kind_check to admit it (a Create
+// against the un-widened CHECK fails SQLSTATE 23514).
+func TestPostgres_CreateAndGet_UpkeepReportKind(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := artifact.NewPostgresRepository(pool)
+	stageID := makeStage(t, pool)
+
+	body := []byte(`{"kind":"upkeep_report","findings":[]}`)
+	schemaVersion := "upkeep_report_v1"
+	created, err := repo.Create(context.Background(), artifact.CreateParams{
+		StageID:       stageID,
+		Kind:          artifact.KindUpkeepReport,
+		SchemaVersion: &schemaVersion,
+		Content:       body,
+		ContentHash:   sha256Hex(body),
+	})
+	if err != nil {
+		t.Fatalf("Create upkeep_report artifact (migration 0095 must admit the kind): %v", err)
+	}
+	if created.Kind != artifact.KindUpkeepReport {
+		t.Errorf("Kind = %q, want upkeep_report", created.Kind)
+	}
+	got, err := repo.Get(context.Background(), created.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Kind != artifact.KindUpkeepReport {
+		t.Errorf("round-tripped Kind = %q, want upkeep_report", got.Kind)
+	}
+	if got.SchemaVersion == nil || *got.SchemaVersion != schemaVersion {
+		t.Errorf("round-tripped SchemaVersion = %v, want %q", got.SchemaVersion, schemaVersion)
+	}
+	listed, err := repo.ListForStage(context.Background(), stageID)
+	if err != nil {
+		t.Fatalf("ListForStage: %v", err)
+	}
+	var found bool
+	for _, a := range listed {
+		if a.ID == created.ID && a.Kind == artifact.KindUpkeepReport {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("ListForStage did not return the upkeep_report artifact; got %d artifacts", len(listed))
+	}
+}
+
 func TestPostgres_GetArtifact_NotFound(t *testing.T) {
 	pool := pgtest.NewPool(t)
 	repo := artifact.NewPostgresRepository(pool)

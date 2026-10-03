@@ -2174,6 +2174,78 @@ func TestValidatePlan_GroomingReportByteIdentical(t *testing.T) {
 	}
 }
 
+// TestValidatePlan_UpkeepReportByteIdentical is the same gate for the upkeep
+// sibling (E79.2 / #3726). The fixture's generated_by is a BARE STRING — a
+// registered string-elision coercion path — so an ungated validatePlan runs
+// TryCoerce and REWRITES the file in place; the assertion reads the bytes back
+// from disk after the call, so deleting the sibling entry reddens it on the
+// rewritten bytes rather than on an error value.
+func TestValidatePlan_UpkeepReportByteIdentical(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "plan.json")
+	report := `{"kind":"upkeep_report","report_version":"upkeep_report_v1","generated_by":"claude-opus-5","findings":[{"id":"f-1","category":"flake","summary":"s"}]}`
+	if err := os.WriteFile(path, []byte(report), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ev, err := validatePlan(path)
+	// Errorf, NOT Fatalf: the load-bearing assertion is the byte-identity
+	// read from disk BELOW, and a Fatalf here would short-circuit it — the
+	// counterfactual must land on committed state, not on an error value.
+	if err != nil {
+		t.Errorf("validatePlan on an upkeep_report = %v, want nil (validation is the backend's job)", err)
+	}
+	if !strings.Contains(string(ev.Payload), `"outcome":"upkeep_report"`) {
+		t.Errorf("event missing outcome=upkeep_report: %s", ev.Payload)
+	}
+	onDisk, rerr := os.ReadFile(path)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if string(onDisk) != report {
+		t.Errorf("validatePlan rewrote the upkeep_report (TryCoerce ran):\n got %q\nwant %q", onDisk, report)
+	}
+}
+
+// TestRun_PlanStage_UpkeepReportWinsOverStructuredOutput mirrors the grooming
+// case at the run() seam: an upkeep_report written to the plan-out file must
+// survive a plan-stage invocation that ALSO produced a structured_output, and
+// must not be plan-validated or clarification-stripped. The byte-identity read
+// is COMMITTED STATE from disk after run() returns.
+func TestRun_PlanStage_UpkeepReportWinsOverStructuredOutput(t *testing.T) {
+	report := validUpkeepReportJSON()
+	args, planPath, bundlePath := groomingPlanStageFixture(t, report)
+	withFakeInvoker(t, &fakeInvoker{
+		// structured_output ALSO carries a (throwaway) plan — the sibling must win.
+		canned: agent.Result{OK: true, StructuredOutput: []byte(validPlanJSON())},
+	})
+
+	var stderr strings.Builder
+	if got := run(args, &stderr); got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	onDisk, err := os.ReadFile(planPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(onDisk) != report {
+		t.Errorf("plan-out file = %q, want the untouched upkeep_report %q", onDisk, report)
+	}
+	events := bundleEventsForTest(t, bundlePath)
+	if !bundleHasPolicyOutcome(events, "upkeep_report") {
+		t.Errorf("missing upkeep_report policy_event:\n%+v", events)
+	}
+	if bundleHasPolicyOutcome(events, "structured_output_adopted") {
+		t.Errorf("structured_output was adopted but the upkeep_report should have won:\n%+v", events)
+	}
+	if bundleHasPolicyOutcome(events, "invalid") {
+		t.Errorf("upkeep_report was mis-validated against standard_v1:\n%+v", events)
+	}
+	if bundleHasPolicyOutcome(events, "clarification_props_stripped") {
+		t.Errorf("clarification prop-stripping ran on an upkeep_report:\n%+v", events)
+	}
+}
+
 // TestValidatePlan_ClarificationByteIdentical is the same gate for the other
 // recognized kind — the sibling set has two members and both must skip the
 // coerce+validate path.
@@ -2305,6 +2377,75 @@ func TestRun_UploadPlan_GroomingReportInvalid_CategoryB(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), `"category":"B"`) {
 		t.Errorf("expected category-B for a backend grooming_report_invalid reject:\n%s", stderr.String())
+	}
+}
+
+// TestRun_UploadPlan_UpkeepReportInvalid_CategoryB closes the category-B path
+// END TO END for the upkeep sibling (E79.2 / #3726): the REAL upload.Client
+// against a server returning an upkeep_report_invalid envelope (the code the
+// #3921 ingest handler must emit verbatim) classifies it ErrPlanInvalid, and
+// run() reports category-B on the runner_completed it writes. The shipped
+// bytes are asserted byte-identical, so a runner that rewrote or dropped the
+// sibling fails here too.
+func TestRun_UploadPlan_UpkeepReportInvalid_CategoryB(t *testing.T) {
+	report := validUpkeepReportJSON()
+	args, _, _ := groomingPlanStageFixture(t, report)
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+
+	runID := "11111111-2222-3333-4444-555555555555"
+	stageID := "22222222-3333-4444-5555-666666666666"
+
+	var shipped []byte
+	pub, priv, kerr := ed25519.GenerateKey(rand.Reader)
+	if kerr != nil {
+		t.Fatal(kerr)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v0/runs/{run_id}/signing-key", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"run_id":      runID,
+			"private_key": base64.StdEncoding.EncodeToString(priv),
+			"public_key":  base64.StdEncoding.EncodeToString(pub),
+			"issued_at":   time.Now().UTC(),
+			"expires_at":  time.Now().UTC().Add(time.Hour),
+		})
+	})
+	mux.HandleFunc("POST /v0/runs/{run_id}/trace", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": "t", "content_hash": "h"})
+	})
+	mux.HandleFunc("POST /v0/runs/{run_id}/plan", func(w http.ResponseWriter, r *http.Request) {
+		shipped, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]any{"error": map[string]any{
+			"code":    "upkeep_report_invalid",
+			"message": "upkeep_report does not validate against upkeep_report_v1",
+		}})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	origClient := newUploadClient
+	newUploadClient = func(baseURL string) uploadClient { return upload.New(baseURL) }
+	t.Cleanup(func() { newUploadClient = origClient })
+
+	args = append(args, "--stage-id", stageID, "--upload-trace")
+	args[1] = runID // --run-id must be a uuid for the backend path
+	args[3] = srv.URL
+
+	var stderr strings.Builder
+	if got := run(args, &stderr); got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure:\n%s", got, stderr.String())
+	}
+	if string(shipped) != report {
+		t.Errorf("backend received %q, want the upkeep_report byte-identical %q", shipped, report)
+	}
+	if !strings.Contains(stderr.String(), `"category":"B"`) {
+		t.Errorf("expected category-B for a backend upkeep_report_invalid reject:\n%s", stderr.String())
 	}
 }
 
@@ -19206,6 +19347,14 @@ func validGroomingReportJSON() string {
 	return `{"kind":"grooming_report","report_version":"grooming_report_v1","generated_by":{"agent":"claude","model":"opus"},"ordering":[{"id":"ord-1","issue":2833,"rank":1,"rationale":"unblocks the grooming walk"}]}`
 }
 
+// validUpkeepReportJSON is a minimal upkeep_report sibling (E79.2 / #3726). The
+// runner never validates it (the upkeep_report_v1 schema and its ingest handler
+// land in the BACKEND, #3921), so this fixture only needs the top-level "kind"
+// discriminator plus enough body to prove byte-identity.
+func validUpkeepReportJSON() string {
+	return `{"kind":"upkeep_report","report_version":"upkeep_report_v1","generated_by":{"agent":"claude","model":"opus"},"findings":[{"id":"f-1","category":"flake","summary":"recorded-run flake in TestX"}]}`
+}
+
 // TestDetectPlanSibling pins the runner-side top-level "kind" peek (#1057
 // slice 3, generalized to a recognized-sibling SET by #2833): a
 // clarification_request or a grooming_report is detected and yields a
@@ -19234,6 +19383,7 @@ func TestDetectPlanSibling(t *testing.T) {
 	}{
 		{"clarification_request", write("clar.json", validClarificationJSON()), "clarification_request"},
 		{"grooming_report", write("groom.json", validGroomingReportJSON()), "grooming_report"},
+		{"upkeep_report", write("upkeep.json", validUpkeepReportJSON()), "upkeep_report"},
 	}
 	for _, tc := range hits {
 		t.Run(tc.name+" detected", func(t *testing.T) {

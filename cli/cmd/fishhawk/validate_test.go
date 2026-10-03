@@ -998,3 +998,61 @@ func TestValidate_NoFlagOutputUnchanged(t *testing.T) {
 		t.Errorf("the emit-mode loss warning leaked onto the default path: %q", stderr.String())
 	}
 }
+
+// upkeepScanExamplePath is the shipped upkeep-scan declaration (E79.2 / #3726),
+// read from disk so the CLI mirror is exercised against the SHIPPED bytes.
+const upkeepScanExamplePath = "../../../docs/spec/examples/workflow-v2-upkeep-scan.yaml"
+
+// TestRunValidate_UpkeepScanExample_NoCharter_OK pins two things end to end:
+// the CLI's embedded workflow-v2 mirror admits the upkeep_report artifact, and
+// the CLI charter rule stays grooming-only. The conventions file beside the
+// spec is present-without-charter (validConventions), so a charter rule that
+// widened to upkeep_report would refuse here.
+//
+// Counterfactuals: drop "upkeep_report" from the CLI schema mirror's produces
+// enum and this exits 1 on a schema error; add upkeep_report to the CLI
+// charter discriminator and this exits 1 on the charter refusal.
+func TestRunValidate_UpkeepScanExample_NoCharter_OK(t *testing.T) {
+	raw, err := os.ReadFile(upkeepScanExamplePath)
+	if err != nil {
+		t.Fatalf("read %s: %v", upkeepScanExamplePath, err)
+	}
+	path := writeSpecAndConventions(t, string(raw), validConventions) // validConventions declares no charter
+	var stdout, stderr strings.Builder
+
+	got := runValidate([]string{path}, &stdout, &stderr)
+	if got != exitOK {
+		t.Fatalf("exit = %d, want exitOK:\nstdout: %s\nstderr: %s", got, stdout.String(), stderr.String())
+	}
+	if stderr.String() != "" {
+		t.Errorf("stderr = %q, want empty (no validation diagnostic, no charter refusal)", stderr.String())
+	}
+	if strings.Contains(stderr.String(), "no backlog charter is declared") {
+		t.Errorf("stderr carries a charter refusal for an upkeep_report workflow: %q", stderr.String())
+	}
+	if !strings.HasPrefix(stdout.String(), path+": OK\n") {
+		t.Errorf("stdout = %q, want it to open with %q", stdout.String(), path+": OK\n")
+	}
+
+	// A frozen major keeps rejecting the artifact: a version "1.6" spec
+	// declaring upkeep_report fails on its own produces enum.
+	t.Run("frozen major 1.6 refuses", func(t *testing.T) {
+		const frozen = `version: "1.6"
+workflows:
+  upkeep_scan:
+    stages:
+      - id: scan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: upkeep_report
+            schema: upkeep_report_v1
+`
+		p := writeSpecAndConventions(t, frozen, validConventions)
+		var so, se strings.Builder
+		if got := runValidate([]string{p}, &so, &se); got != exitFailure {
+			t.Fatalf("exit = %d, want exitFailure (v1.x must not admit upkeep_report):\nstdout: %s\nstderr: %s", got, so.String(), se.String())
+		}
+	})
+}
