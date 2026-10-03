@@ -32,7 +32,9 @@ out/
 *.swp
 *.swo
 *~
-.claude/
+.claude/*
+!.claude/skills/
+!.claude/settings.json
 
 # OS
 .DS_Store
