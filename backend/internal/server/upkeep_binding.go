@@ -154,10 +154,8 @@ func (s *Server) checkUpkeepRunRefs(ctx context.Context, runRow *run.Run, ids []
 			reason = "unknown_run"
 		case err != nil:
 			return uuid.Nil, false, fmt.Errorf("upkeep run-ref check: read run %s: %w", id, err)
-		case ref.Repo == "" || !strings.EqualFold(ref.Repo, runRow.Repo):
-			reason = "foreign_repo"
-		case ref.AccountID != "" && runRow.AccountID != "" && ref.AccountID != runRow.AccountID:
-			reason = "foreign_account"
+		default:
+			reason = upkeepRunOwnershipRefusal(ref, runRow)
 		}
 		if reason != "" {
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "upkeep report: cited run refused",
@@ -168,4 +166,31 @@ func (s *Server) checkUpkeepRunRefs(ctx context.Context, runRow *run.Run, ids []
 		}
 	}
 	return uuid.Nil, true, nil
+}
+
+// Ownership refusal reasons returned by upkeepRunOwnershipRefusal.
+const (
+	upkeepOwnershipForeignRepo    = "foreign_repo"
+	upkeepOwnershipForeignAccount = "foreign_account"
+)
+
+// upkeepRunOwnershipRefusal is the upkeep_report ownership predicate (#3921,
+// extracted for #3922): "" when ref belongs to the reporting run's tenancy,
+// otherwise the refusal reason. ref's repository must equal the reporting
+// run's case-insensitively, and an empty repository never matches; the
+// account is compared only when BOTH rows carry one, so an account-less row
+// on either side is checked by repository alone.
+//
+// It has two callers that must agree: checkUpkeepRunRefs refuses a report
+// citing a run it rejects, and the upkeep scan's flake gather
+// (upkeep_evidence.go) drops a run it rejects BEFORE reading any trace, so the
+// agent is only ever shown runs the ingest would accept.
+func upkeepRunOwnershipRefusal(ref, reporting *run.Run) string {
+	switch {
+	case ref.Repo == "" || !strings.EqualFold(ref.Repo, reporting.Repo):
+		return upkeepOwnershipForeignRepo
+	case ref.AccountID != "" && reporting.AccountID != "" && ref.AccountID != reporting.AccountID:
+		return upkeepOwnershipForeignAccount
+	}
+	return ""
 }

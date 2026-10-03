@@ -10,13 +10,14 @@
 # NOT RUNNABLE YET. This workflow declares a stage that produces an
 # upkeep_report. The ingest route exists (#3921): it binds an uploaded
 # upkeep_report to this stage's `produces: upkeep_report` declaration, and the
-# plan-path guard refuses a plan or grooming_report from it. One piece is still
-# missing:
+# plan-path guard refuses a plan or grooming_report from it. The scan prompt
+# exists too (#3922): this stage is served the upkeep scan prompt with the
+# server-gathered pin-drift and flake facts. Two pieces are still missing:
 #
-#   #3922  the scan prompt that tells the agent what to scan for and what to
-#          emit. Until it lands the scan stage runs the plain plan prompt.
+#   #3923  recording the captain's per-finding dispositions on the report.
+#   #3924  the `file` stage that applies the approved findings as issues.
 #
-# DO NOT register this workflow in .fishhawk/workflows.yaml until it lands.
+# DO NOT register this workflow in .fishhawk/workflows.yaml until they land.
 # Declaring it here (an example under docs/spec/examples/) starts nothing: the
 # scheduler is opt-in (--enable-scheduler) and reads only the registered spec.
 #
