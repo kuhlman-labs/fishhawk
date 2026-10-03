@@ -264,6 +264,24 @@ func TestExtractGoMCPScopes(t *testing.T) {
 			}
 		}
 	})
+	// Item 10 wildcard half: an anyOf member or a tool name is FILE-DERIVED,
+	// so a member literally "*" keys as `any_of.%2A`, an ordinary key, never
+	// the extractor's own authenticated-only wildcard `any_of.*`.
+	// COUNTERFACTUAL: make keySegment return s unchanged (body mutation) —
+	// the member then keys `any_of.*` and both assertions go RED (observed:
+	// `want mcp_tool.fishhawk_start_run.any_of.%2A`).
+	t.Run("a file-derived member named * is not a wildcard", func(t *testing.T) {
+		x := mustGo(t, ExtractGoMCPScopes, mcpScopes("%START%", `{anyOf: []string{"*"}}`, "%EXTRA%", `	"a.b": {anyOf: []string{"write:runs"}},`))
+		if _, ok := x.Grants["mcp_tool.fishhawk_start_run.any_of.%2A"]; !ok {
+			t.Errorf("want mcp_tool.fishhawk_start_run.any_of.%%2A in %v", keysOf(x.Grants))
+		}
+		if _, ok := x.Grants["mcp_tool.fishhawk_start_run.any_of"+WildcardSuffix]; ok {
+			t.Errorf("a member named * minted the authenticated-only wildcard: %v", keysOf(x.Grants))
+		}
+		if _, ok := x.Grants["mcp_tool.a%2Eb.admitted"]; !ok {
+			t.Errorf("want the dotted tool name escaped to one segment in %v", keysOf(x.Grants))
+		}
+	})
 	t.Run("unrecognized rule shapes are unresolved", func(t *testing.T) {
 		for name, head := range map[string]string{
 			"anyOf built by a call":   mcpScopes("%START%", `{anyOf: scopesFor("start")}`),
@@ -366,6 +384,61 @@ func TestExtractGoRunTokenScopes(t *testing.T) {
 		scopes = append(scopes, scopeWriteMessages)
 	}`),
 			[]Change{{Key: "run_token.scopeWriteMessages@review", Before: Present, After: Absent, Direction: Narrowed}}},
+		// COUNTERFACTUAL (`||` operand rule, item 4a): delete collect's
+		// `case token.LOR:` arm body (body mutation). Each of the next three
+		// fixtures has exactly ONE stage selector, in one operand, so without
+		// the rule the grant keys only that stage and the `@any_stage`
+		// assertion goes RED (observed: `got [{Key:run_token.write:runs@plan
+		// ...}] want [{Key:run_token.write:runs@any_stage ...}]`). The
+		// "predicate gains implement" row above (`|| st ==
+		// run.StageTypeImplement`, both operands staged) is the
+		// no-over-trigger control.
+		{"`|| true` keys @any_stage", tokenSrc("%EXTRA%", `	if stageType == run.StageTypePlan || true {
+		scopes = append(scopes, "write:runs")
+	}`),
+			[]Change{{Key: "run_token.write:runs@any_stage", Before: Absent, After: Present, Direction: Widened}}},
+		{"`|| other.Pred(st)` keys @any_stage", tokenSrc("%EXTRA%", `	if stageType == run.StageTypePlan || other.Pred(stageType) {
+		scopes = append(scopes, "write:runs")
+	}`),
+			[]Change{{Key: "run_token.write:runs@any_stage", Before: Absent, After: Present, Direction: Widened}}},
+		{"a two-level same-file predicate keys @any_stage", tokenSrc("%PRED%", " || mayAlso(st)\n}\n\nfunc mayAlso(st run.StageType) bool {\n\treturn st == run.StageTypeImplement"),
+			[]Change{
+				{Key: "run_token.scopeWriteMessages@any_stage", Before: Absent, After: Present, Direction: Widened},
+				{Key: "run_token.scopeWriteMessages@plan", Before: Present, After: Absent, Direction: Narrowed},
+				{Key: "run_token.scopeWriteMessages@review", Before: Present, After: Absent, Direction: Narrowed},
+			}},
+		// COUNTERFACTUAL (fallthrough guard carry, item 4b): make
+		// endsInFallthrough return false (body mutation) — the plan case's
+		// body is only `fallthrough`, so without the carry the implement body
+		// keys only @implement and the @plan row goes RED (observed: `got
+		// [{Key:run_token.write:runs@implement ...}]`).
+		{"a fallthrough case carries its stages into the next body", tokenSrc("%EXTRA%", `	switch stageType {
+	case run.StageTypePlan:
+		fallthrough
+	case run.StageTypeImplement:
+		scopes = append(scopes, "write:runs")
+	}`),
+			[]Change{
+				{Key: "run_token.write:runs@implement", Before: Absent, After: Present, Direction: Widened},
+				{Key: "run_token.write:runs@plan", Before: Absent, After: Present, Direction: Widened},
+			}},
+		{"a fallthrough from default keys the next body @any_stage", tokenSrc("%EXTRA%", `	switch stageType {
+	default:
+		fallthrough
+	case run.StageTypeImplement:
+		scopes = append(scopes, "write:runs")
+	}`),
+			[]Change{{Key: "run_token.write:runs@any_stage", Before: Absent, After: Present, Direction: Widened}}},
+		{"no fallthrough: the carry does not leak", tokenSrc("%EXTRA%", `	switch stageType {
+	case run.StageTypePlan:
+		scopes = append(scopes, "write:a")
+	case run.StageTypeImplement:
+		scopes = append(scopes, "write:runs")
+	}`),
+			[]Change{
+				{Key: "run_token.write:a@plan", Before: Absent, After: Present, Direction: Widened},
+				{Key: "run_token.write:runs@implement", Before: Absent, After: Present, Direction: Widened},
+			}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -393,6 +466,54 @@ func TestExtractGoRunTokenScopes(t *testing.T) {
 		} {
 			if x := mustGo(t, ExtractGoRunTokenScopes, tokenSrc("%EXTRA%", extra)); len(x.Unresolved) == 0 {
 				t.Errorf("%s: want an unresolved construct, got none", name)
+			}
+		}
+	})
+	// Item 4c + approval condition 5: aliases of the slice, `&scopes` (bare
+	// and as a call argument) and copy() into it write the shared backing
+	// array without touching a recognized grant, so each must be unresolved
+	// (Detect then reports shape_unrecognized). Each fixture is ISOLATED:
+	// exactly one rule in checkStrayUses can fire on it.
+	//
+	// COUNTERFACTUALS (body mutations, one at a time):
+	//   - alias rule: make aliasesScopes return false — the two alias rows
+	//     and the copy row resolve cleanly with identical grants and go RED
+	//     (observed: `alias := scopes: want an unresolved construct, got none`);
+	//   - address rule: delete the `*ast.UnaryExpr` arm's body — the two
+	//     `&scopes` rows go RED.
+	t.Run("aliases, address-of and copy are stray uses", func(t *testing.T) {
+		for name, extra := range map[string]string{
+			"alias := scopes":       "\talias := scopes\n\talias[0] = \"admin\"",
+			"var alias = scopes[:]": "\tvar alias = scopes[:]\n\talias[0] = \"admin\"",
+			"alias = (scopes[1:])":  "\tvar alias []string\n\talias = (scopes[1:])\n\talias[0] = \"admin\"",
+			"p := &scopes":          "\tp := &scopes\n\t*p = append(*p, \"admin\")",
+			"mutate(&scopes)":       `	mutate(&scopes)`,
+			"copy(scopes, ...)":     `	copy(scopes, []string{"admin"})`,
+			"copy(scopes[1:], ...)": `	copy(scopes[1:], []string{"admin"})`,
+		} {
+			x := mustGo(t, ExtractGoRunTokenScopes, tokenSrc("%EXTRA%", extra))
+			if len(x.Unresolved) == 0 {
+				t.Errorf("%s: want an unresolved construct, got none (grants %v)", name, keysOf(x.Grants))
+				continue
+			}
+			base := mustGo(t, ExtractGoRunTokenScopes, tokenSrc())
+			if r := Detect(surfaceByID(t, "run-token-scope-grants"), side(tokenSrc()), side(tokenSrc("%EXTRA%", extra))); r.Unevaluable != ReasonShapeUnrecognized || len(base.Unresolved) != 0 {
+				t.Errorf("%s: Detect = %+v, want shape_unrecognized", name, r)
+			}
+		}
+	})
+	// CONTROL: passing scopes BY VALUE as a call argument or a composite
+	// field (the real handler's shape) stays resolvable, and a self-append
+	// is not an alias. TestExtractGo_RealProductFiles is the end-to-end
+	// control on the real mcptoken.go.
+	t.Run("by-value uses stay resolvable", func(t *testing.T) {
+		for name, extra := range map[string]string{
+			"call argument":   `	s.audit(scopes)`,
+			"composite field": `	_ = token{Scopes: scopes}`,
+			"range read":      "\tfor _, sc := range scopes {\n\t\t_ = sc\n\t}",
+		} {
+			if x := mustGo(t, ExtractGoRunTokenScopes, tokenSrc("%EXTRA%", extra)); len(x.Unresolved) != 0 {
+				t.Errorf("%s: unresolved %v, want none", name, x.Unresolved)
 			}
 		}
 	})

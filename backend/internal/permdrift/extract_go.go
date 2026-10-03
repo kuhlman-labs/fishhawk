@@ -44,6 +44,12 @@ import (
 //   - a qualified `pkg.Name` whose qualifier is not declared in this file is
 //     kept as "pkg.Name" for the same reason;
 //   - every other expression (a call, an index, a conversion) is unresolved.
+//
+// Every resolved name that becomes a dotted key segment (a manifest name, an
+// /mcp tool or scope, a run-token scope, an env-allow var or NAME) is escaped
+// with keySegment, so a resolved value carrying '.', '*' or '%' — including a
+// qualified cross-file name kept as "pkg.Name" — is ONE segment and never a
+// wildcard of the file's own making.
 
 // GoExtraction is a Go-source extractor's result.
 type GoExtraction struct {
@@ -500,7 +506,7 @@ func ExtractGoMCPScopes(content []byte) (GoExtraction, error) {
 			g.unresolved(MCPToolPrefix, kv.Key, "tool name is "+exprKind(kv.Key))
 			continue
 		}
-		g.mcpRule(MCPToolPrefix+tool, kv.Value, map[string]bool{})
+		g.mcpRule(MCPToolPrefix+keySegment(tool), kv.Value, map[string]bool{})
 	}
 	return g.ext, nil
 }
@@ -558,7 +564,7 @@ func (g *goFile) mcpRule(prefix string, v ast.Expr, seen map[string]bool) {
 		return
 	}
 	for _, sc := range anyOf {
-		g.ext.Grants.Put(Entry{Key: prefix + ".any_of." + sc, Value: Present, Rank: PresenceRank, Polarity: Grant})
+		g.ext.Grants.Put(Entry{Key: prefix + ".any_of." + keySegment(sc), Value: Present, Rank: PresenceRank, Polarity: Grant})
 	}
 }
 
@@ -574,13 +580,30 @@ func (g *goFile) mcpRule(prefix string, v ast.Expr, seen map[string]bool) {
 //     switch case) contribute their stage selectors, resolving ONE level into
 //     a same-file predicate function's return expressions
 //     (stageTypeMayMessage);
+//   - a switch case whose body ends in `fallthrough` carries its guard (its
+//     stages, and a negated/default marker) into the NEXT case's guard, since
+//     the next body also runs for the falling case's stages;
 //   - no stage selector, an else branch, a default case, or a NEGATED stage
-//     comparison (`!=`, `!`) keys the grant `@any_stage`.
+//     comparison (`!=`, `!`) keys the grant `@any_stage`;
+//   - an `||` with an operand carrying NO stage selector (`|| true`, a
+//     qualified or cross-file call `|| other.Pred(st)`, a same-file predicate
+//     whose own return calls a second predicate the one-level resolution
+//     cannot see) keys the grant `@any_stage`: that operand can be true for
+//     any stage, so keying only the other operand's stages would hide a grant.
+//     This over-approximates (a stage-independent operand that is in fact
+//     false reads as @any_stage) — noise, never a miss.
 //
 // Any other assignment to `scopes` (a helper call, a reassignment), an
-// `append(scopes, ...)` not assigned back to `scopes`, `&scopes`, an indexed
-// write, and an append argument that is a call or a function-local
-// identifier are unresolved.
+// `append(scopes, ...)` not assigned back to `scopes`, `&scopes` (bare or as a
+// call argument, `mutate(&scopes)`), an indexed write, `copy(scopes, ...)`, an
+// ALIAS of the slice (a name other than `scopes` bound from `scopes` or a
+// slice expression of it — `alias := scopes`, `var alias = scopes[:]` — whose
+// element writes would share the backing array), and an append argument
+// that is a call or a function-local identifier are unresolved. Passing
+// `scopes` BY VALUE as a call argument or a composite-literal field value
+// (the real handler's `s.issue(scopes)` / `Scopes: scopes` shape) stays
+// allowed; a callee or struct field that writes the shared elements is a
+// residual this walker does not follow.
 func ExtractGoRunTokenScopes(content []byte) (GoExtraction, error) {
 	if len(bytes.TrimSpace(content)) == 0 {
 		return emptyGoExtraction(), nil
@@ -734,12 +757,15 @@ func (w *tokenWalker) stmt(s ast.Stmt, guards []guard) {
 		if s.Init != nil {
 			w.stmt(s.Init, guards)
 		}
+		// carry is the guard of a preceding case whose body ends in
+		// `fallthrough`: the next body also runs for that case's stages.
+		var carry guard
 		for _, c := range s.Body.List {
 			cc, ok := c.(*ast.CaseClause)
 			if !ok {
 				continue
 			}
-			var g guard
+			g := guard{stages: append([]string(nil), carry.stages...), negated: carry.negated}
 			if cc.List == nil {
 				g.negated = true
 			}
@@ -749,6 +775,10 @@ func (w *tokenWalker) stmt(s ast.Stmt, guards []guard) {
 				g.negated = g.negated || eg.negated
 			}
 			w.stmts(cc.Body, with(guards, g))
+			carry = guard{}
+			if endsInFallthrough(cc.Body) {
+				carry = g
+			}
 		}
 	case *ast.TypeSwitchStmt:
 		for _, c := range s.Body.List {
@@ -785,6 +815,16 @@ func (w *tokenWalker) stmt(s ast.Stmt, guards []guard) {
 			}
 		}
 	}
+}
+
+// endsInFallthrough reports whether a case body's last statement is
+// `fallthrough`.
+func endsInFallthrough(body []ast.Stmt) bool {
+	if len(body) == 0 {
+		return false
+	}
+	br, ok := body[len(body)-1].(*ast.BranchStmt)
+	return ok && br.Tok == token.FALLTHROUGH
 }
 
 // assign handles an assignment statement, recognizing the two shapes that
@@ -844,15 +884,17 @@ func (w *tokenWalker) scopesValue(v ast.Expr, guards []guard) {
 func (w *tokenWalker) put(scopes, stages []string) {
 	for _, sc := range scopes {
 		for _, st := range stages {
-			w.g.ext.Grants.Put(Entry{Key: RunTokenPrefix + sc + "@" + st, Value: Present, Rank: PresenceRank, Polarity: Grant})
+			w.g.ext.Grants.Put(Entry{Key: RunTokenPrefix + keySegment(sc) + "@" + st, Value: Present, Rank: PresenceRank, Polarity: Grant})
 		}
 	}
 }
 
 // checkStrayUses records every use of the tracked slice that could change
-// its contents outside the recognized shapes: `&scopes`, an
-// `append(scopes, ...)` whose result is not assigned back to `scopes`, and an
-// assignment to or declaration of `scopes` the statement walk never reached.
+// its contents outside the recognized shapes: `&scopes` (bare or as a call
+// argument), an `append(scopes, ...)` whose result is not assigned back to
+// `scopes`, `copy(scopes, ...)`, an alias of the slice bound to another name,
+// and an assignment to or declaration of `scopes` the statement walk never
+// reached.
 func (w *tokenWalker) checkStrayUses(body *ast.BlockStmt) {
 	ast.Inspect(body, func(n ast.Node) bool {
 		switch n := n.(type) {
@@ -860,12 +902,26 @@ func (w *tokenWalker) checkStrayUses(body *ast.BlockStmt) {
 			if !w.visited[n] && assignsScopes(n.Lhs) {
 				w.g.unresolved(RunTokenPrefix, n, "assignment to "+runTokenScopesVar+" outside a recognized statement")
 			}
+			for i, r := range n.Rhs {
+				if !aliasesScopes(r) {
+					continue
+				}
+				if len(n.Lhs) == len(n.Rhs) && isIdentNamed(n.Lhs[i], runTokenScopesVar) {
+					continue // a write back into scopes itself: the walk judges it
+				}
+				w.g.unresolved(RunTokenPrefix, r, "alias of "+runTokenScopesVar)
+			}
 		case *ast.ValueSpec:
 			if !w.visited[n] {
 				for _, nm := range n.Names {
 					if nm.Name == runTokenScopesVar {
 						w.g.unresolved(RunTokenPrefix, n, "declaration of "+runTokenScopesVar+" outside a recognized statement")
 					}
+				}
+			}
+			for i, v := range n.Values {
+				if aliasesScopes(v) && (i >= len(n.Names) || n.Names[i].Name != runTokenScopesVar) {
+					w.g.unresolved(RunTokenPrefix, v, "alias of "+runTokenScopesVar)
 				}
 			}
 		case *ast.UnaryExpr:
@@ -877,9 +933,28 @@ func (w *tokenWalker) checkStrayUses(body *ast.BlockStmt) {
 			if isIdent && fn.Name == "append" && len(n.Args) > 0 && isIdentNamed(n.Args[0], runTokenScopesVar) && !w.assigned[n] {
 				w.g.unresolved(RunTokenPrefix, n, "append to "+runTokenScopesVar+" not assigned back")
 			}
+			if isIdent && fn.Name == "copy" && len(n.Args) > 0 && aliasesScopes(n.Args[0]) {
+				w.g.unresolved(RunTokenPrefix, n, "copy into "+runTokenScopesVar)
+			}
 		}
 		return true
 	})
+}
+
+// aliasesScopes reports whether e is the tracked slice itself or a slice
+// expression of it (`scopes`, `scopes[:]`, `scopes[i:j]`, parenthesized):
+// a value sharing its backing array.
+func aliasesScopes(e ast.Expr) bool {
+	for {
+		switch x := e.(type) {
+		case *ast.ParenExpr:
+			e = x.X
+		case *ast.SliceExpr:
+			e = x.X
+		default:
+			return isIdentNamed(e, runTokenScopesVar)
+		}
+	}
 }
 
 // assignsScopes reports whether an assignment's left side writes the
@@ -925,8 +1000,9 @@ func (w *tokenWalker) guardOf(cond ast.Expr) guard {
 }
 
 // collect walks e for run.StageType* selectors. A `!=` comparison or a `!`
-// over an expression holding a stage selector marks the guard negated.
-// resolve allows ONE level of same-file predicate resolution.
+// over an expression holding a stage selector marks the guard negated, and so
+// does an `||` one of whose operands is stageFree. resolve allows ONE level of
+// same-file predicate resolution.
 func (w *tokenWalker) collect(e ast.Expr, resolve bool) guard {
 	var g guard
 	ast.Inspect(e, func(n ast.Node) bool {
@@ -936,9 +1012,17 @@ func (w *tokenWalker) collect(e ast.Expr, resolve bool) guard {
 				g.stages = append(g.stages, st)
 			}
 		case *ast.BinaryExpr:
-			if n.Op == token.NEQ {
+			switch n.Op {
+			case token.NEQ:
 				l, r := w.collect(n.X, false), w.collect(n.Y, false)
 				if len(l.stages)+len(r.stages) > 0 {
+					g.negated = true
+				}
+			case token.LOR:
+				// An operand naming no stage can hold for ANY stage, so the
+				// whole disjunction does: key the grant @any_stage.
+				l, r := w.collect(n.X, resolve), w.collect(n.Y, resolve)
+				if stageFree(l) || stageFree(r) {
 					g.negated = true
 				}
 			}
@@ -977,6 +1061,10 @@ func (w *tokenWalker) collect(e ast.Expr, resolve bool) guard {
 	})
 	return g
 }
+
+// stageFree reports whether an operand's guard names no stage and is not
+// itself negated: an operand that can be true whatever the stage.
+func stageFree(g guard) bool { return len(g.stages) == 0 && !g.negated }
 
 // stageSelector maps `run.StageTypeFooBar` to "foo_bar".
 func stageSelector(s *ast.SelectorExpr) (string, bool) {
@@ -1019,7 +1107,7 @@ func ExtractGoEnvAllow(content []byte) (GoExtraction, error) {
 		if !g.isStringSliceVar(name, v, hasValue) {
 			continue
 		}
-		prefix := EnvAllowPrefix + name
+		prefix := EnvAllowPrefix + keySegment(name)
 		g.ext.Anchors[prefix] = true
 		if !hasValue {
 			continue // a declared-only []string var holds nothing
@@ -1029,7 +1117,7 @@ func ExtractGoEnvAllow(content []byte) (GoExtraction, error) {
 			continue
 		}
 		for _, n := range names {
-			g.ext.Grants.Put(Entry{Key: prefix + "." + n, Value: Present, Rank: PresenceRank, Polarity: Grant})
+			g.ext.Grants.Put(Entry{Key: prefix + "." + keySegment(n), Value: Present, Rank: PresenceRank, Polarity: Grant})
 		}
 	}
 	return g.ext, nil

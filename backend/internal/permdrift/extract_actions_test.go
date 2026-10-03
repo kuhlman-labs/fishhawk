@@ -114,3 +114,32 @@ func TestExtractActions_Errors(t *testing.T) {
 		})
 	}
 }
+
+// TestExtractActions_FileDerivedWildcard pins item 10's wildcard half on the
+// Actions extractor: a scope literally named "*" (or a job id carrying a '.')
+// is a FILE-DERIVED segment, so it keys as an ordinary escaped segment and
+// never as the extractor's own write-all wildcard.
+//
+// COUNTERFACTUAL: make keySegment return s unchanged (body mutation). The
+// base scope "*" then keys `jobs.x.*` at write rank and coveredBy suppresses
+// the head-only `contents: write` grant — the widening vanishes and the first
+// assertion goes RED (observed: `changes = [] want [{Key:jobs.x.contents
+// Before:(absent) After:write Direction:widened}]`);
+// and job "a.b" with scope "c" collides with job "a" with scope "b.c", so the
+// key-shape assertion goes RED too.
+func TestExtractActions_FileDerivedWildcard(t *testing.T) {
+	got := diffActions(t,
+		"jobs:\n  x:\n    permissions: {\"*\": write}\n",
+		"jobs:\n  x:\n    permissions: {\"*\": write, contents: write}\n")
+	want := []Change{{Key: "jobs.x.contents", Before: Absent, After: "write", Direction: Widened}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("changes =\n  %+v\nwant\n  %+v", got, want)
+	}
+	g, err := ExtractActions([]byte("jobs:\n  a.b:\n    permissions: {c: write}\n  a:\n    permissions: {b.c: read}\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(keysOf(g), []string{"jobs.a%2Eb.c", "jobs.a.b%2Ec"}) {
+		t.Fatalf("keys = %v, want the dotted job id and scope each escaped to one segment", keysOf(g))
+	}
+}
