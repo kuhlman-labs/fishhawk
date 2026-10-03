@@ -1,0 +1,14 @@
+id: scenario:issue-3920/cli-upkeep-needs-no-charter
+statement: A spec containing the upkeep_scan example, placed beside a work-management.yaml that declares no charter, passes `fishhawk validate` (exit 0, no charter refusal), while a spec producing grooming_report beside the same conventions file is still refused naming the missing charter.
+verify_hint: 'CLI exit code + stderr: copy the example into a temp dir as workflows.yaml with a sibling work-management.yaml lacking a charter block, run fishhawk validate on it (exit 0); repeat with a grooming_report-producing spec (exit 1, stderr names the charter).'
+steps: 'Built the CLI from the sanctioned checkout. Wrote a schema-valid work-management.yaml: docs/spec/work-management-default.yaml with its charter: block removed. Placed it beside (c1) the upkeep example copied to /tmp/fh3920/c1/.fishhawk/workflows.yaml and (c2) docs/spec/examples/workflow-v2-backlog-grooming.yaml copied to /tmp/fh3920/c2/.fishhawk/workflows.yaml. Ran fishhawk validate on each.'
+assertions:
+    expected: upkeep exit 0, no charter refusal; grooming refused naming the charter
+    observed_at_record: 'c1: OK, exit 0. c2: exit 1, ''workflow backlog_grooming ... produces a grooming report, but no backlog charter is declared ... Declare a `charter:` block ...''.'
+    repro_handle: fishhawk validate /tmp/fh3920/c1/.fishhawk/workflows.yaml
+origin:
+    issue: 3920
+    pr: 3946
+    run_id: f5097685-f053-4b23-8807-d7a6010a4280
+    head_sha: a2204522ad9cc7b06d768409e7f91f92026d4f7b
+    recorded_at: 2026-10-03T15:44:02Z
