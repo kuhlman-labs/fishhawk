@@ -267,9 +267,10 @@ func (r *runResolver) targetRunningRefusal(ctx context.Context, runUUID uuid.UUI
 // runner/ embeds a README.md.
 //
 // The deny-list is deliberately a DENY-list defaulting to FIRE, not a *.go
-// allow-list — the same asymmetry AGENTS.md records for scripts/dev's
-// _path_affects_build. The fail-safe direction is over-warning: a spurious
-// advisory line is cosmetic, while a suppressed one leaves the operator in the
+// allow-list — the same asymmetry scripts/README.md ("Rebuild detection and
+// the README.md carve-out") records for scripts/dev's _path_affects_build.
+// The fail-safe direction is over-warning: a spurious advisory line is
+// cosmetic, while a suppressed one leaves the operator in the
 // four-identical-failures loop #3086 exists to end. So embedded assets under
 // runner/ (e.g. runner/internal/plan/schemas/*.json, which are //go:embed inputs
 // that genuinely change the binary) keep firing ON PURPOSE.

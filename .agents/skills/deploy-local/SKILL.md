@@ -80,5 +80,6 @@ One short block: mode, URL, pid, `git_sha`, which binaries rebuilt, and **the MC
 ## References
 
 - `scripts/dev` (`_usage` for every subcommand), `scripts/README.md`
-- `AGENTS.md` § Rebuild matrix, readiness gate, Traps
+- `AGENTS.md` § Rebuild matrix (rebuild + activation tables, the short rules) and § Traps
+- `scripts/README.md` § "`scripts/dev` lifecycle" (readiness nonce gate, MCP banner, schema-major banner, `sweep`, ZERR trap), § "Live-run guard for reload / post-merge", § "Local k8s ergonomics"
 - `docs/deploy/kubernetes.md`, `docs/local-tls.md` (`FISHHAWK_DEV_TLS=1`), `docs/local-webhook-relay.md` (`FISHHAWK_DEV_WEBHOOK_RELAY=1`)

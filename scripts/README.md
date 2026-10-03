@@ -1,7 +1,55 @@
 # scripts
 
-Operator/dev tooling. `scripts/dev` and `scripts/test` carry their core
-contracts in `AGENTS.md`; this file holds the relocated detail entries.
+Operator/dev tooling. This file holds the long-form contracts for
+`scripts/test`, `scripts/dev` and the gate harnesses; `AGENTS.md`
+§ "Build, test, lint" carries the rules an agent needs up front and points
+here for the mechanism, residuals and issue history.
+
+## `scripts/test verify`: the lint and schema-sync legs (#1064 / #1772)
+
+`cmd_verify` takes the verify lock (see "Scoped verify + the per-repository
+verify lock" below), then runs, in order: `cmd_lint`, the ARCHITECTURE.md
+doc-line budget, `_verify_schema_sync`, `_verify_gate_harnesses`, the site voice
+gate, the site IA gate, the ADR record gate, and finally the test loop (scoped,
+or full with the patch-scoped coverage gate folded in). It omits the AGGREGATE
+coverage gate to bound runtime (the PATCH-scoped gate rides inside that same
+loop).
+
+### Lint
+
+`scripts/test lint` runs `golangci-lint run ./...` per registered module —
+byte-for-byte CI's lint invocation (`ci.yml`). Because `.golangci.yml` enables
+the `gofmt`/`goimports` formatters, golangci-lint v2's `run` fails on
+unformatted files, so `lint` covers gofmt/goimports drift with no separate gofmt
+invocation. `verify` runs `lint` FIRST so a fast format/lint failure leads the
+captured output and aborts before the slow test loop. Both **fail closed** if
+golangci-lint is absent from PATH — an actionable error naming the v2.x install
+pin, never a silent skip. The runner's committed-tree implement verify gate runs
+`scripts/test verify`, so gofmt/golangci-lint defects fail in-loop rather than
+red-lining the PR in CI after the agent is terminal (#1064).
+
+### Schema-sync drift check (`_verify_schema_sync`)
+
+`scripts/test verify` re-runs `scripts/sync-schemas` between lint and the test
+loop and fails on drift, mirroring CI's 'Schema sync (docs/spec ↔ embedded
+copies)' gate: an implement pass that edits a canonical `docs/spec/` file (or a
+mirrored default/preset) without running `scripts/sync-schemas` now fails
+IN-LOOP with the same actionable message CI prints, instead of passing verify
+and then red-lining the required `CI Pass` check after the agent is terminal
+(#1064/#1772).
+
+It snapshots `git status --porcelain` before and after the sync and fails only
+on drift the sync itself introduces (a deliberate refinement over CI's unscoped
+`git diff --exit-code`, so running verify on a dirty local tree only fails on
+real drift, not unrelated pending edits); on the runner's clean committed tree
+the two are equivalent. It degrades to a no-op when git is absent or `$ROOT` is
+not a git work tree — and the not-a-work-tree guard tests the printed `git
+rev-parse --is-inside-work-tree` VALUE, not just its exit status, because a bare
+repo prints `false` yet exits 0 (an exit-status-only guard would fall through to
+`git status --porcelain`, which errors in a bare repo). The standalone
+`scripts/test-schema-sync-verify` pins this check (its
+drift/clean/non-git-dir/bare-repo/git-absent branches + the `cmd_verify`
+ordering), as `scripts/test-container-lease` pins the lease contract.
 
 ## Patch-scoped coverage gate (ADR-059 / [#1887](https://github.com/kuhlman-labs/fishhawk/issues/1887))
 
@@ -10,6 +58,14 @@ in `scripts/test`. The aggregate ≥ 80% gate runs only in CI, only after
 the implement agent is terminal, and a new 0%-covered function barely
 moves it — so `scripts/test verify` gates the DIFF instead, in-loop
 (#1064).
+
+CLI surface: `--diff-base <ref>` turns diff mode on; `--diff-threshold` sets the
+new-line coverage floor (default **85%**, `FISHHAWK_PATCH_COVERAGE_THRESHOLD` in
+the shell wiring); `--diff-min-statements` (default 5) is the floor below which
+the gate does not judge, so a one-line change is not gated on a two-statement
+ratio. The same `--exclude '/db/'` sqlc carve-out the aggregate gate uses
+applies. Diff mode is inert without `--diff-base`, so CI's aggregate invocation
+is unchanged by it and `.github/workflows/**` was not touched.
 
 ### What the Python side does
 
@@ -539,6 +595,24 @@ the no-tee mktemp degrade, k3 the all-green control, k4 the zero-profile
 guard, k5 both module-list fail-closed inputs, k6/k7 a failing aggregate
 gate with and without a module failure, and k8 the static shape.
 
+The loop's shape (`cmd_coverage`; CI's legs run each part the same way,
+#3882):
+
+```sh
+profiles=(); failed=()
+while IFS= read -r m; do
+  rm -f "$m/coverage.out"
+  if ! (cd "$m" && go test -race -coverprofile=coverage.out -covermode=atomic ./...) 2>&1 | tee "$log"; then
+    if grep -q -e '\[build failed\]' -e '\[setup failed\]' "$log"; then failed+=("$m (build failed)"); else failed+=("$m (tests failed)"); fi
+  fi
+  if [ -f "$m/coverage.out" ]; then profiles+=("$m/coverage.out"); fi
+done <<< "$(go work edit -json | jq -r '.Use[].DiskPath')"
+if [ "${#profiles[@]}" -gt 0 ]; then
+  python3 scripts/check-coverage.py --threshold 80 --exclude '/db/' "${profiles[@]}" || cov_rc=$?
+fi
+# then: print one summary line per entry of "${failed[@]}" and exit 1 if any
+```
+
 ## CI test legs ([#3882](https://github.com/kuhlman-labs/fishhawk/issues/3882))
 
 `scripts/ci-test-leg` is the partition behind CI's `go-test` matrix. CI used
@@ -1043,6 +1117,377 @@ and `label=com.docker.volume.anonymous` are present — dropping either filter f
 the helper reddens the warning cases. That harness is now run in-loop by
 `scripts/test verify` via `_verify_gate_harnesses`, adding well under a second (it
 needs no Docker).
+
+### The shared container (`pgtest`, #1174, was #972)
+
+Backend tests share ONE testcontainers Postgres. The residual #972
+start-contention flake (~GOMAXPROCS Postgres containers started at once →
+"context deadline exceeded after 9 retries") is eliminated at the source by
+`backend/internal/pgtest`: a single reused container named
+`fishhawk-test-postgres` (testcontainers `WithReuse`+`WithName`, attach-retry on
+the first-start name conflict AND on a stale reuse reference — docker `No such
+container` — re-creating a daemon-evicted container, #1402) shared across every
+package process, with each test handed its OWN ephemeral `CREATE DATABASE ...
+TEMPLATE` clone for isolation (cross-process-idempotent template bootstrap,
+advisory-locked, tolerating SQLSTATE 42P04). Consumers call `pgtest.NewPool(t)`
+/ `pgtest.NewURL(t)` — do NOT hand-roll a per-package `tcpostgres.Run`. The
+Go-side hazards and their classifiers are documented in the `pgtest.go` package
+comment.
+
+`backend/internal/postgres/postgres_test.go` is the one exemption: it tests
+MigrateUp/MigrateDown and needs raw, un-migrated throwaway databases — so it
+starts its OWN anonymous containers with a `t.Cleanup` that terminates each on
+the start-error path too, since testcontainers-go hands back a non-nil running
+container ALONGSIDE a start error and with ryuk disabled nothing else reaps it
+(#3122).
+
+With the N-container start storm gone, `scripts/test` (default and `coverage`)
+restored `go test -p "${FISHHAWK_TEST_P:-4}"` (the 2→4 bump was gated on a -p 4
+run proving a single shared container via `docker ps`); lower it on a
+constrained daemon with `FISHHAWK_TEST_P=2`; `scripts/test single` is unbounded.
+Every loop also passes an explicit `-timeout "${FISHHAWK_TEST_TIMEOUT:-20m}"`
+(see "One test loop, not two" above, #3475).
+
+`scripts/test` exports `TESTCONTAINERS_RYUK_DISABLED=true` so the named
+container PERSISTS across the package processes that reuse it (the ryuk reaper
+is itself a shared single-point-of-failure container that times out under daemon
+load, cascading one flake into a whole-suite red). Because nothing else reaps
+it, `scripts/test` removes it via an `EXIT` trap (`docker rm -f -v
+fishhawk-test-postgres`, guarded to no-op when Docker is absent) after the
+module loop; `pgtest` deliberately does NOT Terminate it. The `-v` and volume
+rules are in "Anonymous volumes" above.
+
+### Lease refcount and the atomic lock (#1792)
+
+That EXIT trap is lease-refcounted across CONCURRENT `scripts/test` invocations.
+The reuse design supports concurrent PROCESSES within one invocation but not
+concurrent INVOCATIONS: a first invocation's trap would `docker rm` the shared
+container out from under a second invocation whose `go test` loop still held
+live connections (the #1587/#1589 spurious verify failure). So each
+container-using invocation (`cmd_test`/`cmd_coverage`, and thus `cmd_verify`)
+registers a per-invocation lease file (named by its PID) in a shared lease dir
+(`${FISHHAWK_TEST_LEASE_DIR:-${TMPDIR:-/tmp}/fishhawk-test-postgres.leases}`)
+under an atomic symlink lock, and the trap removes only its OWN lease and
+`docker rm`s the container only when no leases remain (an empty-dir `rmdir`
+succeeds → last holder). Stale leases from a SIGKILL'd invocation are pruned by
+a `kill -0` PID liveness check so a crashed run never permanently pins the
+container. A single-invocation `scripts/test verify` is unaffected — the lease
+logic reduces to prior behavior when only one lease exists.
+
+The lock (`_lease_lock`) is an atomically-created SYMLINK whose target IS the
+holder's owner PID (`ln -s "$$"` is one `symlink(2)` syscall that fails `EEXIST`
+if the path is taken, with a `readlink`-equals-`$$` re-check rejecting a stray
+link landed inside a leftover dir lock), so it carries its owner from the
+instant it exists and gets the SAME stale-owner recovery the leases do: the spin
+loop reads the owner via `readlink` and breaks a lock whose owner PID is dead
+(`kill -0` fails → `rm`, retry) so a killed holder can't wedge later
+invocations. Because acquisition is atomic there is NO window in which the lock
+exists yet is unowned, so a live holder's lock can never be observed as
+ownerless and broken out from under it — this eliminates BY CONSTRUCTION both
+the earlier `mkdir`-then-stamp lock's ownerless-forever wedge (a holder
+SIGKILL'd between `mkdir` and stamping its PID) AND its live-but-delayed
+acquisition race (a live holder paused before stamping whose "ownerless" lock a
+concurrent breaker could remove and then double-enter the critical section,
+#1792 fixup), which a grace-window heuristic could only trade off, never
+resolve.
+
+If the retry cap is exhausted with a LIVE owner still stuck, the reap fails SAFE
+— it skips `docker rm` and leaves the container for the next invocation's
+attach-reuse rather than removing it under an uncertain lease state; and a
+REGISTER that can't acquire the lock records NO lease and returns non-zero so
+`_arm_container_lease` does NOT arm the reap — an invocation holding no lease
+can never `docker rm` the container out from under a peer whose lease it never
+got the lock to see.
+
+`scripts/test` is sourceable lib-only via `FISHHAWK_TEST_LIB_ONLY=1` (dispatch
+suppressed); the standalone `scripts/test-container-lease` sources it that way
+with a fake `docker` stub and injectable lease tokens to lock the refcount
+contract (ref-held → no rm, last-holder → one rm, stale-lease pruned,
+stale-lock-broken dead-owner, live-delayed-acquire → a live holder's atomic lock
+never broken, live-stuck-lock fail-safe, register-timeout → no lease + reap
+unarmed; plus the #3122 generation-sweep cases above).
+
+## `scripts/dev` lifecycle: `up` / `reload` / `post-merge` / `sweep`
+
+Long-form contract for the `scripts/dev` behaviours `AGENTS.md` § "Rebuild
+matrix" states as rules. The rebuild table and the activation table themselves
+stay in `AGENTS.md`. All of this is pinned by `scripts/test-dev`, which
+`scripts/test verify` runs via `_verify_gate_harnesses` since #2455 (skipped
+in-loop when zsh is absent from PATH), so a `scripts/dev` regression fails
+in-loop rather than only when a human runs the harness.
+
+### `post-merge` and `reload`
+
+`scripts/dev post-merge [<issue>] [--start-deps]` is the one-step full per-PR
+post-merge walk: it `git pull --ff-only origin main` (a diverged local main
+fails loud rather than landing a merge commit), prunes the merged local branch
+via `scripts/cleanup-merged` (reused, not reimplemented — it deletes only
+ancestors of `origin/main`, never `main`), optionally confirms a given issue is
+`CLOSED` via `gh issue view` (warn-only, non-fatal), then runs `reload` LAST so
+reload's `/healthz` readiness gate (#628 — non-zero exit + log tail on failure)
+and MCP-reconnect verdict are inherited and the verdict is the command's final
+line. Since E68.7 / #2897 it REFUSES at its very top — before the git walk —
+while any `fishhawk-runner` process is live; `--force` overrides (see "Live-run
+guard for reload / post-merge" below).
+
+`scripts/dev reload` (down-then-up) is the stack-only primitive `post-merge`
+composes: plain `scripts/dev up` no-ops when fishhawkd is already running and so
+never rebuilds. **`reload` always rebuilds all five binaries (it forces
+`--all`)** — after a merge `HEAD == origin/main`, so the `origin/main...HEAD`
+diff is empty and the rebuild matrix would match nothing, silently skipping
+runner/CLI/mcp/shim. Forcing `--all` closes that gap. `reload` also REFUSES
+while a runner is live (E68.7 / #2897), and STRIPS its own `--force` from the
+argv it forwards to `cmd_up`.
+
+### Rebuild detection and the `README.md` carve-out (#2403)
+
+`scripts/dev up` auto-detects which binaries need rebuilding by diffing
+`origin/main...HEAD` (falling back to `main...HEAD` with a warning if origin is
+unreachable) against the rebuild matrix in `AGENTS.md`. `fishhawkd` always
+rebuilds as the baseline; the others rebuild only when their source changed.
+`scripts/dev up --all` forces all five. Each rebuild prints a line naming the
+trigger (`baseline`, `--all`, or the path that matched).
+
+**A path whose basename is `README.md` matches NO matrix row.** One shared pure
+predicate, `_path_affects_build`, is consulted at three sites —
+`_detect_rebuild_set` (so a README-only branch diff routes to no binary on a
+plain `up`; `fishhawkd` still rebuilds as the unconditional baseline) and both
+banner matchers, `_diff_touches_mcp` and `_diff_touches_shim` (so a README-only
+merge diff on `reload`/`post-merge` selects the `none` banner instead of the
+ACTION REQUIRED `/mcp` nag PR #2397 drew). It is applied PER DIFF LINE, so a doc
+line never masks a real source line in the same diff.
+
+**Read the residual honestly: only the `README.md` basename class is carved
+out.** A `CHANGELOG.md`, anything under a `docs/` subdirectory of a trigger
+directory, or any other doc-shaped file still fires the banner and still
+rebuilds. That is deliberate — the predicate is a DENY-list defaulting to
+build-affecting, not a `*.go`/`go.mod`/`go.sum` allow-list, because the
+fail-safe direction is over-notifying: a spurious banner is cosmetic, a
+suppressed one is a silently stale binary. Embedded assets under these very
+globs therefore still fire ON PURPOSE — `backend/internal/mcpserver/runbook.md`
+(`//go:embed`, `onboarding.go:47`),
+`backend/internal/{plan,spec}/schemas/*.json` and
+`backend/internal/spec/presets/*.yaml` (`validate.go:19`, `parse.go:20`,
+`preset.go:18`) — each genuinely changes the built binary, which a `*.md`
+blanket deny would have suppressed. Conversely no package embeds its own
+`README.md` (verified repo-wide across `backend/`, `runner/` and `cli/`: no
+`//go:embed` directive names a README, and every embed under these globs names
+explicit files rather than a directory); if one ever does, this carve-out must
+be revisited.
+
+### GitSHA-stamped dev builds (#1007)
+
+`scripts/dev` stamps the short HEAD SHA (`-dirty` suffix on a dirty tree) into
+all five binaries via `-ldflags -X <module>/internal/version.GitSHA=…`, and
+`scripts/dev k8s` passes the same value as the image's `GIT_SHA` build arg — so
+`/healthz` `git_sha`, the runner's `runner_started`/`version` output, the MCP
+handshake version, and `fishhawk version` report the real build commit instead
+of `unknown`. `Version` intentionally stays `dev` — it carries the
+MinRunnerVersion no-enforcement semantics. A wrong `-X` package path is a
+**silent no-op**, not a build error: `scripts/test-dev` body-greps each
+`_build_ldflags` path against the `var GitSHA` declaration in the matching
+`version.go`, so keep them in sync when moving a version package.
+Release-workflow GitSHA stamping (`.github/workflows/**`, human-led) is a
+separate follow-up.
+
+### Stale operator-worktree warning + `sweep` (#1917)
+
+`up` (inherited by `reload`/`post-merge`) runs a non-fatal pass that scans the
+MAIN checkout's `.claude/worktrees/*` — resolved via `git rev-parse
+--git-common-dir`, so a session launched FROM a linked worktree still scans the
+shared root (mirrors the runner's `worktreesDir` in
+`runner/cmd/fishhawk-runner/worktree.go`) — classifies each checkout (`dirty >
+detached > merged > active`, dirty always wins) and, when any is a
+merged-into-`origin/main` leftover, warns naming each stale path and pointing at
+`scripts/dev sweep`. This makes a session launched from a stale checkout
+conspicuous before it can contaminate a run base (#1866). The pass is strictly
+advisory: git absent, `origin/main` unresolvable, or a missing
+`.claude/worktrees` all degrade to silence, and every command runs in a tested
+context so `up` can never abort under `set -e`.
+
+`scripts/dev sweep [--days N] [--yes] [--dry-run]` is the cleanup. With ONE
+confirmation (`read -q` on a tty; a non-tty stdin without `--yes`, or a `no`
+answer, lists candidates and removes NOTHING — never a hung prompt) it:
+
+- removes the merged-clean operator worktrees (never a dirty one, never the
+  worktree the command runs from, never the main checkout) via `git worktree
+  remove` (no `--force`);
+- prunes aged run litter — `.git/fishhawk-worktrees/run-*` dirs, fail-closed:
+  removed only when `git status` positively verifies clean, via `git worktree
+  remove` with NO `--force` so a run that turns dirty in the check→remove window
+  is refused rather than force-deleted, and a status failure leaves the dir in
+  place instead of rm -rf'ing possibly-uncommitted work — and `run-*.runid`
+  files;
+- prunes keyed `/tmp` sidecars (`fishhawk-scope-*-*.json`,
+  `fishhawk-scope-justifications-*-*.json`, `fishhawk-acceptance-*-*.json`,
+  `fishhawk-pr-*-*.md`, `fishhawk-prompt-*.txt`) older than `--days N` (default
+  7);
+- then composes `scripts/cleanup-merged` to delete the now-un-checked-out merged
+  branches (git refuses to delete a branch checked out in any worktree — why
+  `cleanup-merged` alone never clears these).
+
+Every keyed glob requires a dash after the prefix and the plain-file (`.`) mtime
+qualifier, so the legacy fixed-slot transports (`fishhawk-plan.json` /
+`fishhawk-pr.md` / `fishhawk-acceptance.json`) and the
+`fishhawk-acceptance-evidence` directory are never touched. `--dry-run` lists
+both candidate sets without removing. `scripts/test-dev` pins the pure
+classification precedence, git-tempdir scan/warn fixtures, the
+age-boundary/legacy-protection prune fixtures, and the
+non-tty/self-protection/confirmed-sweep `cmd_sweep` paths.
+
+### MCP banner selection (ADR-060 / #1922)
+
+Because `--all` always rebuilds `fishhawk-mcp`, the closing MCP banner is
+**decoupled from the rebuild action** and selected by `_select_mcp_banner` from
+four inputs — the schema-major signal, the shim-rebuild signal, the mcp-source
+signal, and whether the shim is registered — into exactly one kind, in fixed
+precedence:
+
+1. **schema-major** — unconditional (#1422). Its BODY TEXT is registration-aware
+   since #2349: with the shim NOT registered, or registered but itself rebuilt
+   this run, it keeps the stern `ACTION REQUIRED` reconnect wording; with the
+   shim registered and not itself rebuilt it selects the sibling
+   `schema_major_shim` kind, same precedence slot (see "Schema-major banner"
+   below).
+2. **shim-rebuilt** — a distinct banner: a change to `fishhawk-mcp-shim` itself
+   still needs one manual `/mcp`, since the shim swaps its child not itself.
+3. **reconnect** — the mcp source changed and the shim is NOT registered: the
+   legacy manual-reconnect banner.
+4. **auto-swap** — the mcp source changed and the shim IS registered: a one-line
+   note that the registered `fishhawk-mcp-shim` hot-swaps the rebuilt child
+   automatically, verifiable via a version-returning tool call reflecting the
+   new GitSHA.
+5. **none**.
+
+The mcp-source and shim signals are each keyed to whether the pull's merge-aware
+diff (`HEAD@{1}..HEAD`) touched that binary's matrix globs (mcp:
+`backend/cmd/fishhawk-mcp/` + the shared libs; shim:
+`backend/cmd/fishhawk-mcp-shim/` only) MINUS the doc-only paths
+`_path_affects_build` denies — a `README.md` basename cannot alter a built
+binary, so it selects `none` rather than a spurious ACTION REQUIRED (#2403). So
+`reload` never false-nags when the merge missed both; fresh-clone / no-reflog /
+detached-HEAD (unresolvable `HEAD@{1}`) fires conservatively — never a
+false-negative silent-stale binary. Registration is detected via the
+`FISHHAWK_MCP_SHIM_REGISTERED` `.env` override winning over a best-effort
+`claude mcp get fishhawk` probe, degrading to not-registered (manual banner
+survives) when the `claude` CLI is absent or errors. Plain `up` (branch-diff,
+not `--all`) keys each signal off whether that binary was rebuilt.
+
+This supersedes the older "MCP server stale after rebuild" gotcha: once the shim
+is registered (a one-time re-registration — re-point the harness's `fishhawk`
+entry at `bin/fishhawk-mcp-shim`), a child rebuild swaps with no `/mcp` and the
+reconnect nag is retired to the auto-swap note. **That retirement is not
+unconditional (#2831).** A shim can stop swapping while looking healthy — a swap
+whose gate never opens (the `initialize` response was never matched, or a
+long-lived in-flight request never drains) previously deferred FOREVER in
+silence, stranding the session on a binary that is no longer on disk. Three
+things close that: the swap gate now PRESUMES a handshake it never matched once
+the child has demonstrably served a result (recording `handshake_presumed`) and
+REFUSES loudly when it genuinely cannot replay; every running shim publishes a
+per-pid swap-state snapshot (`${TMPDIR:-/tmp}/fishhawk-mcp-shim/<pid>.json`)
+readable via `bin/fishhawk-mcp-shim --status`, naming the child pid/path, both
+hashes, how long the swap has been pending, the handshake status, in-flight
+pressure with the oldest request's id and age, and `last_swap_outcome`; and
+`scripts/dev up`/`reload` run a NON-FATAL stale-shim advisory built on `--status
+--stale-only` (silent on both streams unless something is actually stale, every
+degrade a silence), mirroring the stale-worktree warning. The `auto_swap` banner
+correspondingly states the EXPECTATION plus the GitSHA check that confirms or
+refutes it, rather than asserting the swap as fact. Residual, deliberate: a
+legitimately long in-flight request (a 7200s heartbeat await) still defers a
+swap indefinitely — force-orphaning it would be the worse defect — but the
+deferral is now visible in the snapshot and on a rate-limited stderr line
+instead of silent; and `FISHHAWK_MCP_SHIM_STATE_DIR` set out of `scripts/dev`'s
+view disables the advisory (the state-dir coupling documented in
+`backend/cmd/fishhawk-mcp-shim/README.md`).
+
+### Schema-major banner (#1422, #2349)
+
+A `.fishhawk/workflows.yaml` `version:` MAJOR bump (e.g. `0.7` → `1.0`) silently
+breaks every `fishhawk_start_run` whose live stdio `fishhawk-mcp` is still the
+stale pre-bump binary, because it validates the spec locally on its now-stale
+embedded schema. **That is the UNREGISTERED-shim case (#2349).** Once the
+ADR-060 `fishhawk-mcp-shim` is registered it hot-swaps the rebuilt child, so the
+new major is expected to be live with no `/mcp` — the banner correspondingly
+switches to the `schema_major_shim` body, which asks you to VERIFY
+(`fishhawk_doctor` reporting `spec.valid: true`, or a version-returning call
+reflecting the new GitSHA) rather than reconnect, states the swap as an
+EXPECTATION not a fact (`scripts/dev` cannot observe the harness-owned shim),
+and names `bin/fishhawk-mcp-shim --status` then `/mcp` when verification refutes
+it. A rebuilt shim BINARY keeps the stern wording: a running shim holds its open
+inode, so that needs a manual `/mcp` regardless.
+
+The merge-aware diff can suppress the banner (the spec edit need not touch
+fishhawk-mcp source). So `up`/`reload` ALSO read the pre-pull and post-pull spec
+text (`git show 'HEAD@{1}:.fishhawk/workflows.yaml'` vs `HEAD:…`, each guarded
+so a missing file / unresolvable reflog is empty-text-not-abort), compute
+`_workflow_major_changed`, and pass it as `_select_mcp_banner`'s first
+(highest-precedence) input — so a schema-major bump fires the distinct, louder
+schema-major banner even on a plain `up` that rebuilt nothing, ahead of every
+other kind. (`_decide_mcp_signal` still accepts the schema-major arg for its own
+tests, but `cmd_up` now passes it `0` and lets `_select_mcp_banner` own the
+schema-major precedence.) Same-major minor edits (`0.3` → `0.7`) and both-empty
+stay quiet; one-side-present (first spec) fires conservatively.
+
+**`scripts/dev` cannot probe the stdio MCP process** (the Claude Code harness
+owns it — there is no HTTP endpoint to query its `git_sha`, so the
+running-vs-on-disk liveness check of #1422's proposal 1 is not implementable
+purely in `scripts/dev`), so the residual safety net is server-side: the MCP
+server's local spec pre-parse annotates an unsupported-`/version`
+`*spec.SchemaError` with a `run /mcp to reconnect` staleness hint
+(`annotateStaleSpecError`), making even a missed banner self-diagnosing. The
+schema-major signal + `annotateStaleSpecError` are locked by
+`scripts/test-dev`'s
+`_workflow_major_changed`/`_extract_workflow_version_major`/`_decide_mcp_signal`/`_select_mcp_banner`
+assertions and the Go `TestAnnotateStaleSpecError` table.
+
+### Readiness gate: listener identity (#965, nonce round-trip #1018)
+
+A healthy `/healthz` plus a live spawned pid is not proof the spawn succeeded —
+a stale daemon squatting on the port answers the gate while the fresh fishhawkd
+dies on `bind: address already in use` (the reload false-success). `up`/`reload`
+(a) preflight the fishhawkd port (from `FISHHAWKD_ADDR`, post-.env) before
+spawning and fail loud naming any squatting pid + command, and (b) after the
+gate prove the listener IS the spawned daemon by nonce round-trip: `up`
+generates a per-spawn nonce (persisted to `.fishhawk/dev.nonce`), hands it to
+the child as `FISHHAWKD_START_NONCE`, and `_verify_healthz_nonce` requires
+`/healthz` to echo it back as `start_nonce` — surviving OS pid reuse, which the
+older #965 pid comparison cannot. A mismatch or unreachable `/healthz` fails per
+the #628 contract (expected-vs-actual nonce, log tail, exit 1); a body with no
+`start_nonce` field (pre-nonce binary) degrades with a warning to the #965 pid
+check (`_verify_listener_identity`).
+
+`down` no longer returns success on a missing/stale pid file alone: every path
+falls through to a port fallback (`_down_port_fallback`) where the nonce only
+UPGRADES confidence, never blocks the #965 path — an exact `/healthz`
+`start_nonce` match against `.fishhawk/dev.nonce` proves the listener is our
+stale fishhawkd (kill TERM→KILL, reported as nonce-verified); ANY other outcome
+(no nonce file, unreachable healthz, missing field, different nonce) degrades to
+the comm-basename heuristic unchanged, which kills fishhawkd-named listeners but
+only reports — never kills — a foreign process, with `down` exiting 1 rather
+than claiming a clean shutdown. Both commands sweep numbered stray pid and nonce
+files (`dev 2.pid`, `dev 2.nonce` …, #1623), `down` sources `.env` for port
+parity with `up`, and every teardown path removes `.fishhawk/dev.nonce`. Hosts
+without `lsof` degrade to the old behavior with a warning. The contract is
+locked by `scripts/test-dev`'s real-listener (nc) squatter tests, one-shot
+fake-`/healthz` responder tests (mismatch, pre-nonce degrade, down-fallback
+ladder), and call-site body-greps.
+
+### ZERR diagnostic trap (#631)
+
+`up`/`reload` print a `up: starting` / `reload: starting` entry line first and
+install a zsh `TRAPZERR` (ZERR) trap that, on any command aborting under `set
+-e` in a non-tested context, prints `scripts/dev: command failed (exit <code>)
+at line <file:line>` to stderr — using `${funcfiletrace[1]}` for the error-site
+line, not the trap's own. So a top-level abort can never again exit 1 with zero
+output. The trap is silent in normal operation (ZERR does not fire for
+if/while/&&/||/! tested contexts). It is the permanent diagnostic for the
+intermittent #631 abort, whose root cause it pinned on the first recurrence:
+**`(( i++ ))` returns exit 1 when `i==0`** (post-increment yields the old value
+`0`, and `(( 0 ))` is false), aborting the wait loop under `set -e` — fixed by
+pre-increment `(( ++i ))`. When writing zsh under `set -e`, prefer `(( ++i ))` /
+`i=$(( i + 1 ))` over `(( i++ ))`, and the `if [[ cond ]]; then x=1; fi` form
+over `[[ cond ]] && x=1` (an assignment-RHS `&&` is a tested-context hazard).
+`scripts/test-dev` guards both regressions.
 
 ## Live-run guard for reload / post-merge (E68.7 / [#2897](https://github.com/kuhlman-labs/fishhawk/issues/2897))
 
