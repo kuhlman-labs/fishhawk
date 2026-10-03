@@ -13,10 +13,10 @@ Teardown is ordered from the top of the stack to the bottom: clients, then the d
 This skill stops services or deletes state, and its confirmation steps need a human. Before anything else:
 
 ```sh
-"$(git rev-parse --show-toplevel)/scripts/is-run-agent"
+top=$(git rev-parse --show-toplevel) && "$top/scripts/is-run-agent"
 ```
 
-Continue **only** if it prints `operator` and exits 0. On any other result, stop, do nothing, and report its output to the user. That includes `run-agent: …`, and a missing script, which means this checkout predates the guard or you are not in a repository checkout. The contract lives in `scripts/README.md` § "`is-run-agent`".
+Continue **only** if it prints `operator` and exits 0. On any other result, stop, do nothing, and report its output to the user. That includes `run-agent: …`, a `git` error (you are not in a repository checkout), and a missing script (this checkout predates the guard). The contract lives in `scripts/README.md` § "`is-run-agent`".
 
 ## 1. Check what's live, and stop if a run is mid-flight
 

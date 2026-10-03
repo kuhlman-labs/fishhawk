@@ -19,22 +19,27 @@
 #      shape is matched as one exact path component (not a substring), so an
 #      operator checkout merely NAMED like one is not misclassified:
 #        .../fishhawk-worktrees/run-<id>[/...]            lineage worktree
-#        .../fishhawk-acceptance-tree-<run-uuid>-<stage>[/...] acceptance merge-candidate tree
+#        .../fishhawk-acceptance-tree-<uuid>-<uuid>[/...] acceptance merge-candidate tree
 #        .../fishhawk-acceptance-<digits>[/...]          acceptance agent workdir (os.MkdirTemp)
 #        .../fishhawk-conflict-<rand>/tree[/...]          conflict-resolution tree
-#      The acceptance-tree shape requires the full run UUID (so an operator
-#      worktree like `fishhawk-acceptance-tree-fix` is not refused) but accepts
-#      any stage suffix, since nothing enforces that the stage id is a UUID.
-#      The acceptance WORKDIR is not a git checkout, so a skill (which locates
+#      The acceptance-tree shape is exactly two UUIDs (run id, stage id; the
+#      runner is invoked with UUID --run-id/--stage-id), so neither an operator
+#      worktree like `fishhawk-acceptance-tree-fix` nor an operator copy like
+#      `<tree>-debug` is refused. runner/cmd/fishhawk-runner
+#      TestIsRunAgentMatchesAcceptanceTreePath renders the runner's real
+#      acceptanceTreePath and runs this script on it, so a rename in the Go
+#      format string fails a test. The acceptance WORKDIR is not a git checkout, so a skill (which locates
 #      this script via `git rev-parse`) cannot reach it from there; that
 #      pattern serves direct callers passing DIR.
 #   2. FISHHAWK_RUN_ID is non-empty (CI-hosted runners only: GitLab CI,
 #      deploy triggers).
-#
-# FISHHAWK_FORGE_WRITES=deny is deliberately NOT a signal: it means "forge
-# writes disabled", and an operator may set it for dev-mode testing. A
-# dedicated runner-stamped marker on every agent spawn would replace the path
-# list: #3945.
+#   3. FISHHAWK_FORGE_WRITES=deny (INTERIM, until #3945 stamps a dedicated
+#      marker on every agent spawn). runner/internal/acceptenv injects it as a
+#      fixed value into every acceptance agent, so it still catches one that
+#      has cd'd into an operator checkout, where no path pattern applies. It
+#      means "forge writes disabled", so an operator who set it for dev-mode
+#      testing is refused too. That is the SAFE direction for a guard: the
+#      printed reason tells the operator to unset it.
 #
 # A new runner agent tree must be added below. The patterns are pinned by
 # scripts/test-is-run-agent, run inside `scripts/test verify`.
@@ -52,7 +57,7 @@ if matches '/fishhawk-worktrees/run-[^/]+(/|$)'; then
   exit 10
 fi
 uuid='[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
-if matches "/fishhawk-acceptance-tree-$uuid-[^/]+(/|\$)"; then
+if matches "/fishhawk-acceptance-tree-$uuid-$uuid(/|\$)"; then
   echo "run-agent: acceptance tree ($phys)"
   exit 10
 fi
@@ -67,6 +72,11 @@ fi
 
 if [ -n "${FISHHAWK_RUN_ID:-}" ]; then
   echo "run-agent: FISHHAWK_RUN_ID is set"
+  exit 10
+fi
+
+if [ "${FISHHAWK_FORGE_WRITES:-}" = "deny" ]; then
+  echo "run-agent: FISHHAWK_FORGE_WRITES=deny (the acceptance-agent marker; if you are an operator who set it for dev-mode testing, unset it and re-run)"
   exit 10
 fi
 
