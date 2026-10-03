@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -89,6 +90,18 @@ func assertRequiresHuman(t *testing.T, w *httptest.ResponseRecorder, row *concer
 	if env.Code != errCodeConcernRequiresHuman {
 		t.Errorf("code = %q, want %q:\n%s", env.Code, errCodeConcernRequiresHuman, w.Body.String())
 		return
+	}
+	// The message is check-neutral (E80.4 / #3761): one guard serves the diff
+	// secrets AND the permission-drift checks, so it names no single check's
+	// remedy (a "known test fixture" hint would misdirect a permission-drift
+	// waive).
+	for _, want := range []string{"remove the flagged change", "rotate any credential it exposed"} {
+		if !strings.Contains(env.Message, want) {
+			t.Errorf("message = %q, want it to contain %q (check-neutral wording)", env.Message, want)
+		}
+	}
+	if strings.Contains(env.Message, "test fixture") {
+		t.Errorf("message = %q names the diff secrets check's remedy; it must be check-neutral", env.Message)
 	}
 	for k, want := range map[string]string{
 		"concern_id":    row.ID.String(),

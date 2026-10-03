@@ -3561,10 +3561,22 @@ func (s *Server) DispatchConsolidatedReview(ctx context.Context, parentRunID uui
 	}
 
 	stageID := implStage.ID
+	// Permission-drift check over the consolidated change (E80.4 / #3761): the
+	// run that merges is the parent, so its base → consolidated head is the
+	// cumulative delta the children's `pushed` reports are not checked for. It
+	// runs first inside this review goroutine (not a goroutine of its own), so
+	// it never contends with the review's compare.
+	driftReq := permissionDriftRequest{
+		RunID: parentRunID, StageID: stageID, Base: base, Head: head,
+		Trigger: permissionDriftTriggerConsolidated,
+	}
 	reviewCtx := context.WithoutCancel(ctx)
 	s.bgReviews.Add(1)
 	go func() {
 		defer s.bgReviews.Done()
+		if s.permissionDriftRunnable(reviewCtx, driftReq) {
+			s.runPermissionDriftCheck(reviewCtx, driftReq)
+		}
 		cmp, cerr := comparer.ComparePatch(reviewCtx, scope, repo, base, head)
 		if cerr != nil {
 			s.cfg.Logger.LogAttrs(reviewCtx, slog.LevelWarn, "consolidated review: compare patch failed — review not dispatched",

@@ -371,6 +371,9 @@ var KnownCategories = map[string]struct{}{
 	"operator_scope_path_undelivered":         {},
 	"parent_awaiting_child_scope_decision":    {},
 	"parent_awaiting_redrive":                 {},
+	"permission_drift_detected":               {}, // E80.4 / #3761: the deterministic permission-drift check raised server_check concerns for widened permission surfaces (server/permission_drift.go) — INTERNAL, surfaces/paths/keys/values only
+	"permission_drift_raise_failed":           {}, // E80.4 / #3761: InsertRaised failed twice after permission_drift_detected landed, so the detected entry is the only record — INTERNAL
+	"permission_narrowing_noticed":            {}, // E80.4 / #3761: the permission-drift check saw narrowings (never a concern) — INTERNAL
 	"plan_acceptance_precheck":                {},
 	"plan_add_scope_files_fans_into_slices":   {},
 	"plan_budget_calibration_crossing":        {},
