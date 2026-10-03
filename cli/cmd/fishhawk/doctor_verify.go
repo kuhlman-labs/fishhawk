@@ -456,6 +456,13 @@ var verifyEnvAllowPrefix = []string{"CGO_", "LC_"}
 // verifyLockOwnerEnvVar / verifyLockPathEnvVar consts; the VALUES must match
 // these literals. TestVerifyEnvDenied_VerifyControlVariables pins each BY NAME
 // on this side, so a dropped entry reddens here without the runner's suite.
+//
+// FISHHAWK_RUN_AGENT is the run-agent marker the runner stamps on every agent
+// spawn (#3945; the runner copy spells it agent.RunAgentEnvVar). Default-deny
+// already drops it; the entry is the same redundant defence, so an ambient
+// marker can never reach a verify child, where scripts/test-is-run-agent would
+// read it once scripts/is-run-agent consults the marker (#3947).
+// TestVerifyEnvDenied_RunAgentMarker pins it BY NAME on this side.
 var verifyEnvDeny = map[string]struct{}{
 	"FISHHAWK_GITHUB_TOKEN":      {},
 	"FISHHAWK_GITLAB_TOKEN":      {},
@@ -467,6 +474,7 @@ var verifyEnvDeny = map[string]struct{}{
 	"FISHHAWK_VERIFY_PACKAGES":   {},
 	"FISHHAWK_VERIFY_LOCK_OWNER": {},
 	"FISHHAWK_VERIFY_LOCK_PATH":  {},
+	"FISHHAWK_RUN_AGENT":         {},
 }
 
 // verifyEnvDenyPrefix lists key prefixes dropped unconditionally — the

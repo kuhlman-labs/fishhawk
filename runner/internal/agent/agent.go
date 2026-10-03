@@ -57,7 +57,9 @@ type Invocation struct {
 	// keeps working. A NIL BaseEnv preserves today's
 	// inherit-parent-env behavior byte-for-byte; a non-nil EMPTY
 	// slice means "start from an empty env" — the default-deny
-	// posture.
+	// posture, in which the child receives the run-agent marker
+	// (RunAgentEnvVar, stamped last by every adapter, #3945) and
+	// nothing else.
 	//
 	// As a SEAM contract the nil case above remains exactly as
 	// specified. What changed is who sets the field: the runner now
@@ -435,4 +437,32 @@ func AppendEnvOverride(env []string, key, value string) []string {
 		out = append(out, kv)
 	}
 	return append(out, prefix+value)
+}
+
+// RunAgentEnvVar is the dedicated run-agent marker (#3945): every runner
+// agent spawn carries it, so a process can tell it is running inside a
+// Fishhawk run agent's tree by its environment alone. It is the primary
+// signal scripts/is-run-agent is to read once the operator-authored script
+// half lands (#3947); until then nothing reads it.
+//
+// Consumers MUST treat ANY non-empty value as "this is a run agent". The
+// value is the run id when the invocation carries one and "1" otherwise,
+// so a consumer that keys on a specific value would miss a run-id-less
+// spawn.
+const RunAgentEnvVar = "FISHHAWK_RUN_AGENT"
+
+// WithRunAgentMarker returns env with exactly one RunAgentEnvVar entry,
+// positioned LAST: "FISHHAWK_RUN_AGENT=<runID>", or "FISHHAWK_RUN_AGENT=1"
+// when runID is empty. Every adapter applies it after every other env
+// overlay (the BaseEnv / os.Environ() seed, the API-key overlay and the
+// Invocation.Env overlay), so neither an ambient value, a BaseEnv entry nor
+// an Invocation.Env key can shadow or re-point it. Built on
+// AppendEnvOverride, so any prior same-named entry is stripped and the
+// caller's slice is never aliased.
+func WithRunAgentMarker(env []string, runID string) []string {
+	v := runID
+	if v == "" {
+		v = "1"
+	}
+	return AppendEnvOverride(env, RunAgentEnvVar, v)
 }

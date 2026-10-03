@@ -4,6 +4,8 @@ import (
 	"net/url"
 	"os"
 	"strings"
+
+	"github.com/kuhlman-labs/fishhawk/runner/internal/agent"
 )
 
 // ADR-029 (#650) item 4 — gate-subprocess credential stripping.
@@ -153,6 +155,14 @@ var gateEnvAllowPrefix = []string{"CGO_", "LC_"}
 // refusal is a CONTENTION guard, not an adversarial control. What an agent
 // cannot do is narrow the AUTHORITATIVE gate: the runner invokes that one
 // itself with the packages variable unset.
+//
+// agent.RunAgentEnvVar (FISHHAWK_RUN_AGENT, #3945) is the run-agent marker the
+// adapters stamp on every agent spawn. Default-deny already drops it (no allow
+// rung admits FISHHAWK_*), so this entry is the same redundant defence: an
+// operator's ambient marker, or one inherited by a runner spawned under an
+// agent, can never reach the verify gate, where scripts/test-is-run-agent and
+// TestIsRunAgentMatchesAcceptanceTreePath run and where a reached marker would
+// flip their "operator" cases once scripts/is-run-agent reads it (#3947).
 var gateEnvDeny = map[string]struct{}{
 	"FISHHAWK_GITHUB_TOKEN": {},
 	"FISHHAWK_GITLAB_TOKEN": {},
@@ -164,6 +174,7 @@ var gateEnvDeny = map[string]struct{}{
 	verifyPackagesEnvVar:    {},
 	verifyLockOwnerEnvVar:   {},
 	verifyLockPathEnvVar:    {},
+	agent.RunAgentEnvVar:    {},
 }
 
 // gateEnvDenyPrefix lists key prefixes dropped unconditionally — the

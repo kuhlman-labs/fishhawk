@@ -94,6 +94,58 @@ func TestAppendEnvOverride(t *testing.T) {
 	})
 }
 
+// TestWithRunAgentMarker pins the run-agent marker helper (#3945): the result
+// holds EXACTLY ONE FISHHAWK_RUN_AGENT entry, positioned LAST, carrying the run
+// id ("1" for an empty run id), and the caller's slice is never aliased.
+func TestWithRunAgentMarker(t *testing.T) {
+	if RunAgentEnvVar != "FISHHAWK_RUN_AGENT" {
+		t.Fatalf("RunAgentEnvVar = %q, want FISHHAWK_RUN_AGENT (scripts/is-run-agent keys on this exact name)", RunAgentEnvVar)
+	}
+	cases := []struct {
+		name  string
+		env   []string
+		runID string
+		want  string
+	}{
+		{"empty_env", nil, "run-1", "FISHHAWK_RUN_AGENT=run-1"},
+		{"no_prior_marker", []string{"PATH=/bin", "HOME=/root"}, "run-2", "FISHHAWK_RUN_AGENT=run-2"},
+		// The stale entry sits FIRST: a plain append would leave two entries,
+		// and a child resolving first-match would read the stale one.
+		{"stale_marker_first", []string{"FISHHAWK_RUN_AGENT=stale", "PATH=/bin"}, "run-3", "FISHHAWK_RUN_AGENT=run-3"},
+		{"empty_run_id_falls_back_to_1", []string{"PATH=/bin"}, "", "FISHHAWK_RUN_AGENT=1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := WithRunAgentMarker(tc.env, tc.runID)
+			var n int
+			for _, kv := range got {
+				if len(kv) >= len(RunAgentEnvVar)+1 && kv[:len(RunAgentEnvVar)+1] == RunAgentEnvVar+"=" {
+					n++
+				}
+			}
+			if n != 1 {
+				t.Errorf("FISHHAWK_RUN_AGENT entries = %d in %q, want exactly 1", n, got)
+			}
+			if len(got) == 0 || got[len(got)-1] != tc.want {
+				t.Errorf("last entry of %q, want %q (the marker must be applied last)", got, tc.want)
+			}
+		})
+	}
+
+	t.Run("does_not_mutate_or_alias_input", func(t *testing.T) {
+		env := []string{"FISHHAWK_RUN_AGENT=stale", "PATH=/bin"}
+		orig := append([]string(nil), env...)
+		got := WithRunAgentMarker(env, "run-4")
+		if !reflect.DeepEqual(env, orig) {
+			t.Errorf("input slice mutated: got %q, want %q", env, orig)
+		}
+		got[0] = "MUTATED=1"
+		if env[0] == "MUTATED=1" || env[1] == "MUTATED=1" {
+			t.Error("result aliases the caller's backing array")
+		}
+	})
+}
+
 // TestStructuredOutput_ZeroValues pins the feature-gate default (#1325): an
 // Invocation with no JSONSchema and a Result with no StructuredOutput are the
 // zero values, so the structured-output path is inert unless explicitly wired —

@@ -4,6 +4,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/kuhlman-labs/fishhawk/runner/internal/agent"
 )
 
 // envMap indexes a composed env slice by key. It deliberately does NOT
@@ -275,4 +277,34 @@ func mustEnv(t *testing.T, base []string) []string {
 		t.Fatalf("unexpected refusals: %v", refused)
 	}
 	return env
+}
+
+// TestEnv_RunAgentMarkerNeverComposed (#3945) is a TEST-ONLY pin of existing
+// behaviour: the run-agent marker is runner-stamped by the agent adapter, so
+// agentenv must never compose one. An ambient FISHHAWK_RUN_AGENT (an
+// operator's value, or one inherited by a runner spawned under an agent) is
+// dropped by the FISHHAWK_ deny prefix, and an operator passthrough
+// FISHHAWK_AGENT_ENV_FISHHAWK_RUN_AGENT is refused because Denied applies to
+// the stripped name.
+func TestEnv_RunAgentMarkerNeverComposed(t *testing.T) {
+	name := agent.RunAgentEnvVar
+	if !Denied(name) {
+		t.Fatalf("Denied(%q) = false, want true (the FISHHAWK_ deny prefix must cover the marker)", name)
+	}
+
+	env, refused := Env([]string{name + "=stale-parent", "PATH=/bin"})
+	if _, ok := envMap(t, env)[name]; ok {
+		t.Errorf("ambient %s survived agentenv composition: %v", name, env)
+	}
+	if len(refused) != 0 {
+		t.Errorf("refused = %v, want none (an ambient value is dropped by omission)", refused)
+	}
+
+	env, refused = Env([]string{PassthroughPrefix + name + "=spoof"})
+	if _, ok := envMap(t, env)[name]; ok {
+		t.Errorf("passthrough %s admitted onto the env: %v", name, env)
+	}
+	if !reflect.DeepEqual(refused, []string{name}) {
+		t.Errorf("refused = %v, want [%s] — the passthrough must be refused, never silent", refused, name)
+	}
 }
