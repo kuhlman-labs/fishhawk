@@ -32,7 +32,8 @@ out/
 *.swp
 *.swo
 *~
-.claude/
+.claude/*
+!.claude/skills/
 
 # OS
 .DS_Store
