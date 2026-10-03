@@ -389,6 +389,22 @@ func TestEvaluateTestSweep(t *testing.T) {
 			},
 		},
 		{
+			// #3921: the upkeep-report schema's sync-schemas case arm routes
+			// exactly ONE mirror, and the finding must name both it and the
+			// generator that writes it.
+			name:     "upkeep-report schema without its mirror names the backend copy and the generator",
+			scope:    []plan.ScopeFile{{Path: "docs/spec/upkeep-report-v1.schema.json", Operation: plan.FileOpModify}},
+			listings: map[string][]string{},
+			want: []TestSweepFinding{
+				{
+					Rule:         testSweepRuleGeneratedSurface,
+					TriggerPath:  "docs/spec/upkeep-report-v1.schema.json",
+					MissingTests: []string{"backend/internal/plan/schemas/upkeep-report-v1.schema.json"},
+					Generator:    testSweepGeneratorSyncSchemas,
+				},
+			},
+		},
+		{
 			// AC2: the work-management schema's sync-schemas case arm routes
 			// TWO mirrors (backend since #1005, cli since E54.11 / #2801);
 			// both must be named in one finding.

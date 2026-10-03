@@ -206,6 +206,13 @@ var testSweepPathTriggerRules = []testSweepPathTriggerRule{
 		Generator:     testSweepGeneratorSyncSchemas,
 	},
 	{
+		// upkeep-report-*.schema.json case arm (#3921): backend only.
+		Rule:          testSweepRuleGeneratedSurface,
+		TriggerGlob:   "docs/spec/upkeep-report-v1.schema.json",
+		RequiredPaths: []string{"backend/internal/plan/schemas/upkeep-report-v1.schema.json"},
+		Generator:     testSweepGeneratorSyncSchemas,
+	},
+	{
 		// workflow-v*.schema.json case arm, one row per shipped major.
 		Rule:        testSweepRuleGeneratedSurface,
 		TriggerGlob: "docs/spec/workflow-v0.schema.json",
