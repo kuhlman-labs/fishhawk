@@ -17,7 +17,7 @@ import (
 	"github.com/santhosh-tekuri/jsonschema/v6"
 )
 
-//go:embed schemas/plan-standard-v1.schema.json schemas/clarification-request-v1.schema.json schemas/grooming-report-v1.schema.json
+//go:embed schemas/plan-standard-v1.schema.json schemas/clarification-request-v1.schema.json schemas/grooming-report-v1.schema.json schemas/upkeep-report-v1.schema.json
 var schemaFS embed.FS
 
 // compiledSchema is the JSON Schema used by Validate / Parse. Compiled
@@ -33,6 +33,10 @@ var compiledClarificationSchema = mustCompileNamedSchema("schemas/clarification-
 // sibling artifact (#2235), compiled once at init for the same fail-loud reason.
 var compiledGroomingReportSchema = mustCompileNamedSchema("schemas/grooming-report-v1.schema.json", "grooming-report-v1.schema.json")
 
+// compiledUpkeepReportSchema is the JSON Schema for the upkeep_report sibling
+// artifact (#3921), compiled once at init for the same fail-loud reason.
+var compiledUpkeepReportSchema = mustCompileNamedSchema("schemas/upkeep-report-v1.schema.json", "upkeep-report-v1.schema.json")
+
 // embeddedSchemaHash is the hex-encoded SHA-256 of the canonical JSON
 // bytes of the embedded plan-standard-v1 schema. Computed once at init
 // so /healthz can serve it cheaply.
@@ -43,6 +47,11 @@ var embeddedSchemaHash = computeSchemaHash()
 // so /healthz can advertise it cheaply alongside the plan schema hash (the
 // AGENTS.md schema-change checklist step 3).
 var embeddedGroomingReportSchemaHash = computeNamedSchemaHash("schemas/grooming-report-v1.schema.json")
+
+// embeddedUpkeepReportSchemaHash is the hex-encoded SHA-256 of the canonical
+// JSON bytes of the embedded upkeep-report-v1 schema (#3921), computed once at
+// init. The /healthz advert is #3923's.
+var embeddedUpkeepReportSchemaHash = computeNamedSchemaHash("schemas/upkeep-report-v1.schema.json")
 
 func computeSchemaHash() string {
 	return computeNamedSchemaHash("schemas/plan-standard-v1.schema.json")
@@ -78,6 +87,10 @@ func EmbeddedSchemaHash() string { return embeddedSchemaHash }
 // Advertised by /healthz so a runner writing grooming reports can detect
 // schema drift against the backend that validates them.
 func EmbeddedGroomingReportSchemaHash() string { return embeddedGroomingReportSchemaHash }
+
+// EmbeddedUpkeepReportSchemaHash returns the hex-encoded SHA-256 of the
+// canonical JSON bytes of the embedded upkeep-report-v1 schema (#3921).
+func EmbeddedUpkeepReportSchemaHash() string { return embeddedUpkeepReportSchemaHash }
 
 // expensiveTestRuntimeThreshold is the minimum predicted_runtime_minutes
 // value that suppresses the expensive-test-strategy advisory warning.
@@ -140,8 +153,9 @@ func Validate(data []byte) error {
 
 // DetectArtifactKind inspects the top-level "kind" discriminator and
 // reports which plan-stage artifact the document is. A document carrying
-// kind == "clarification_request" is ArtifactKindClarificationRequest and one
-// carrying kind == "grooming_report" is ArtifactKindGroomingReport (#2235);
+// kind == "clarification_request" is ArtifactKindClarificationRequest, one
+// carrying kind == "grooming_report" is ArtifactKindGroomingReport (#2235) and
+// one carrying kind == "upkeep_report" is ArtifactKindUpkeepReport (#3921);
 // anything else (including the plan artifact, which has no "kind" field)
 // defaults to ArtifactKindPlan. The bytes are only peeked, not fully
 // validated — callers route to ValidateArtifact / Validate next. Returns
@@ -161,6 +175,8 @@ func DetectArtifactKind(data []byte) (ArtifactKind, error) {
 		return ArtifactKindClarificationRequest, nil
 	case KindGroomingReport:
 		return ArtifactKindGroomingReport, nil
+	case KindUpkeepReport:
+		return ArtifactKindUpkeepReport, nil
 	}
 	return ArtifactKindPlan, nil
 }
@@ -170,7 +186,8 @@ func DetectArtifactKind(data []byte) (ArtifactKind, error) {
 // never consulted for a sibling (and vice versa). A clarification_request is
 // validated by ValidateClarificationRequest (schema + unique-id semantics), a
 // grooming_report by ValidateGroomingReport (schema + the four id/rank
-// semantics); anything else is validated as a plan.
+// semantics), an upkeep_report by ValidateUpkeepReport (schema +
+// CheckUpkeepReportSemantics); anything else is validated as a plan.
 func ValidateArtifact(data []byte) error {
 	kind, err := DetectArtifactKind(data)
 	if err != nil {
@@ -181,6 +198,8 @@ func ValidateArtifact(data []byte) error {
 		return ValidateClarificationRequest(data)
 	case ArtifactKindGroomingReport:
 		return ValidateGroomingReport(data)
+	case ArtifactKindUpkeepReport:
+		return ValidateUpkeepReport(data)
 	default:
 		return Validate(data)
 	}
@@ -246,6 +265,48 @@ func ParseClarificationRequest(data []byte) (*ClarificationRequest, error) {
 		return nil, fmt.Errorf("internal: decode to ClarificationRequest: %w", err)
 	}
 	return &cr, nil
+}
+
+// ValidateUpkeepReport validates bytes against the upkeep-report-v1 schema and
+// then runs CheckUpkeepReportSemantics (rules a-k, upkeepreport.go). The
+// returned error is *ParseError, *SchemaError or *SemanticError.
+//
+// It lives here rather than in upkeepreport.go only so that file stays
+// schema-free (#3921 slice 1); upkeepreport.go owns the types and the rules.
+func ValidateUpkeepReport(data []byte) error {
+	_, err := ParseUpkeepReport(data)
+	return err
+}
+
+// ParseUpkeepReport validates upkeep_report bytes (schema, then semantics) and
+// returns the typed *UpkeepReport.
+func ParseUpkeepReport(data []byte) (*UpkeepReport, error) {
+	if len(bytes.TrimSpace(data)) == 0 {
+		return nil, &ParseError{Msg: "empty document"}
+	}
+	var raw any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, &ParseError{Msg: err.Error(), Cause: err}
+	}
+	if err := compiledUpkeepReportSchema.Validate(raw); err != nil {
+		var verr *jsonschema.ValidationError
+		if errors.As(err, &verr) {
+			return nil, schemaErrorFrom(verr)
+		}
+		return nil, &SchemaError{Path: "/", Message: err.Error()}
+	}
+	var ur UpkeepReport
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&ur); err != nil {
+		// Schema accepted the bytes; this should only fail on an internal
+		// type-mapping bug.
+		return nil, fmt.Errorf("internal: decode to UpkeepReport: %w", err)
+	}
+	if err := CheckUpkeepReportSemantics(&ur); err != nil {
+		return nil, err
+	}
+	return &ur, nil
 }
 
 // Parse validates plan bytes and returns the typed *Plan. Equivalent

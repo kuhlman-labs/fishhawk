@@ -8,19 +8,15 @@
 # file fails those tests rather than only a manual check-jsonschema run.
 #
 # NOT RUNNABLE YET. This workflow declares a stage that produces an
-# upkeep_report, and the pieces that make such a stage work end to end are not
-# in the tree:
+# upkeep_report. The ingest route exists (#3921): it binds an uploaded
+# upkeep_report to this stage's `produces: upkeep_report` declaration, and the
+# plan-path guard refuses a plan or grooming_report from it. One piece is still
+# missing:
 #
-#   #3921  the upkeep_report_v1 schema and the plan-stage INGEST handler. Until
-#          it lands the backend has no upkeep_report route: plan ingest routes
-#          on the uploaded body's top-level `kind` alone and never reads the
-#          stage's declared produces, so an upkeep_report body falls to the plan
-#          path and is refused plan_invalid (category-B), while an ordinary plan
-#          uploaded by this stage would be ingested AS A PLAN.
 #   #3922  the scan prompt that tells the agent what to scan for and what to
 #          emit. Until it lands the scan stage runs the plain plan prompt.
 #
-# DO NOT register this workflow in .fishhawk/workflows.yaml until both land.
+# DO NOT register this workflow in .fishhawk/workflows.yaml until it lands.
 # Declaring it here (an example under docs/spec/examples/) starts nothing: the
 # scheduler is opt-in (--enable-scheduler) and reads only the registered spec.
 #

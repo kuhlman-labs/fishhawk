@@ -1469,9 +1469,8 @@ func TruncateReason(s string, max int) string {
 // Sources (backend): plan_invalid and clarification_request_invalid in
 // backend/internal/server/plan.go; grooming_report_invalid and
 // grooming_report_stage_invalid in backend/internal/server/grooming_report.go;
-// upkeep_report_invalid and upkeep_report_stage_invalid from the upkeep_report
-// ingest handler (E79.2 / #3726 — FORWARD DECLARATIONS here: the handler lands
-// in #3921 and must emit these codes verbatim). All six arrive on the SAME
+// upkeep_report_invalid and upkeep_report_stage_invalid in
+// backend/internal/server/upkeep_report.go (E79 / #3921). All six arrive on the SAME
 // endpoint — POST /v0/runs/{run_id}/plan routes by the artifact's top-level
 // "kind" discriminator (#2833).
 //

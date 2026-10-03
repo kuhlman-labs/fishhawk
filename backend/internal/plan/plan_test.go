@@ -1432,6 +1432,15 @@ func TestDetectArtifactKind(t *testing.T) {
 		t.Errorf("kind = %q, want %q", k, plan.ArtifactKindGroomingReport)
 	}
 
+	// The upkeep_report sibling (#3921) is the THIRD additive kind.
+	k, err = plan.DetectArtifactKind([]byte(`{"kind":"upkeep_report"}`))
+	if err != nil {
+		t.Fatalf("DetectArtifactKind(upkeep_report): %v", err)
+	}
+	if k != plan.ArtifactKindUpkeepReport {
+		t.Errorf("kind = %q, want %q", k, plan.ArtifactKindUpkeepReport)
+	}
+
 	k, err = plan.DetectArtifactKind(readFixture(t, "valid/example.json"))
 	if err != nil {
 		t.Fatalf("DetectArtifactKind(plan): %v", err)
