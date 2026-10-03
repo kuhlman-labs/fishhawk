@@ -319,7 +319,7 @@ func TestClassifyScheduledStart_MalformedAnswersAreErrors(t *testing.T) {
 		{"503", http.StatusServiceUnavailable, `{"error":{"code":"run_repo_unconfigured","message":"m"}}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			out, err := classifyScheduledStart(tc.status, []byte(tc.body))
+			out, err := classifyScheduledStart(tc.status, []byte(tc.body), "upkeep")
 			if err == nil {
 				t.Errorf("classifyScheduledStart(%d, %q) = %+v, nil; want an error", tc.status, tc.body, out)
 			}
@@ -327,6 +327,163 @@ func TestClassifyScheduledStart_MalformedAnswersAreErrors(t *testing.T) {
 				t.Errorf("Kind = %q, want empty on an error", out.Kind)
 			}
 		})
+	}
+}
+
+// replayBody is a 200 replay body: the run handleCreateRun answers when the
+// Idempotency-Key matches an existing (repo, key) run.
+func replayBody(id uuid.UUID, triggerSource, workflowID string) []byte {
+	raw, err := json.Marshal(map[string]any{
+		"id":             id,
+		"trigger_source": triggerSource,
+		"workflow_id":    workflowID,
+	})
+	if err != nil {
+		panic(err)
+	}
+	return raw
+}
+
+// TestClassifyScheduledStart_ReplayOccupancy pins the 200-replay occupancy
+// check, one row per failure mode: only a SCHEDULED run of the SAME workflow is
+// already_started; any other occupant of the window's key is refused 409
+// scheduled_key_occupied carrying the occupant's id. A 201 is unaffected (this
+// request minted the run).
+//
+// Counterfactuals: (i) make the check permissive (condition always false) and
+// every refused row reads already_started — RED; (ii) drop ONLY the
+// `rr.WorkflowID != workflowID` disjunct and the "scheduled run of another
+// workflow" row goes RED while the on_demand rows stay green — that row's
+// trigger_source is scheduled, so only the workflow_id comparison can refuse it.
+func TestClassifyScheduledStart_ReplayOccupancy(t *testing.T) {
+	id := uuid.New()
+	for _, tc := range []struct {
+		name         string
+		status       int
+		triggerSrc   string
+		workflowID   string
+		wantKind     ScheduledStartKind
+		wantStatus   int
+		wantCode     string
+		wantContains []string
+	}{
+		{"on_demand occupant of the same workflow", http.StatusOK, "on_demand", "upkeep",
+			ScheduledStartRefused, http.StatusConflict, ScheduledKeyOccupiedCode,
+			[]string{id.String(), "on_demand", "upkeep"}},
+		{"scheduled occupant of another workflow", http.StatusOK, "scheduled", "groom",
+			ScheduledStartRefused, http.StatusConflict, ScheduledKeyOccupiedCode,
+			[]string{id.String(), "groom", "upkeep"}},
+		{"empty trigger_source fails closed", http.StatusOK, "", "upkeep",
+			ScheduledStartRefused, http.StatusConflict, ScheduledKeyOccupiedCode,
+			[]string{id.String()}},
+		{"empty workflow_id fails closed", http.StatusOK, "scheduled", "",
+			ScheduledStartRefused, http.StatusConflict, ScheduledKeyOccupiedCode,
+			[]string{id.String()}},
+		{"genuine scheduled same-workflow replay", http.StatusOK, "scheduled", "upkeep",
+			ScheduledStartAlreadyStarted, http.StatusOK, "", nil},
+		{"201 minted by this request is not occupancy-checked", http.StatusCreated, "on_demand", "upkeep",
+			ScheduledStartStarted, http.StatusCreated, "", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := classifyScheduledStart(tc.status, replayBody(id, tc.triggerSrc, tc.workflowID), "upkeep")
+			if err != nil {
+				t.Fatalf("classifyScheduledStart: %v", err)
+			}
+			if out.Kind != tc.wantKind || out.Status != tc.wantStatus || out.Code != tc.wantCode {
+				t.Fatalf("outcome = %+v, want kind %s status %d code %q", out, tc.wantKind, tc.wantStatus, tc.wantCode)
+			}
+			if out.RunID != id {
+				t.Errorf("RunID = %s, want the replayed/occupying run %s", out.RunID, id)
+			}
+			for _, want := range tc.wantContains {
+				if !strings.Contains(out.Message, want) {
+					t.Errorf("message %q must contain %q", out.Message, want)
+				}
+			}
+			if tc.wantKind != ScheduledStartRefused && out.Message != "" {
+				t.Errorf("non-refused outcome carries message %q", out.Message)
+			}
+		})
+	}
+}
+
+// seedOccupant creates, by construction, a run holding scheduledTestKey — the
+// squat the occupancy check exists to refuse.
+func seedOccupant(t *testing.T, repo *fakeRepo, source run.TriggerSource, workflowID string) *run.Run {
+	t.Helper()
+	key := scheduledTestKey
+	r, err := repo.CreateRun(context.Background(), run.CreateRunParams{
+		Repo:           "kuhlman-labs/fishhawk",
+		WorkflowID:     workflowID,
+		WorkflowSHA:    "blobsha",
+		TriggerSource:  source,
+		IdempotencyKey: &key,
+	})
+	if err != nil {
+		t.Fatalf("seed occupant: %v", err)
+	}
+	return r
+}
+
+// TestStartScheduledRun_OccupiedKeyRefused drives the REAL handleCreateRun
+// replay path: a run an ordinary create minted (on_demand, same workflow)
+// under the window's key is refused 409 scheduled_key_occupied naming the
+// occupant — never already_started — and nothing is minted.
+//
+// Counterfactual: make the classifier's occupancy check permissive; the replay
+// answers already_started and this goes RED. The fixture isolates the
+// trigger_source half: the occupant is of the SAME workflow, so no workflow_id
+// disagreement can refuse it.
+func TestStartScheduledRun_OccupiedKeyRefused(t *testing.T) {
+	repo := newFakeRepo()
+	s := newServer(t, repo)
+	occupant := seedOccupant(t, repo, run.TriggerOnDemand, "upkeep")
+
+	out, err := s.StartScheduledRun(context.Background(), scheduledParams(scheduledSpec("scheduled")))
+	if err != nil {
+		t.Fatalf("StartScheduledRun: %v", err)
+	}
+	if out.Kind != ScheduledStartRefused || out.Status != http.StatusConflict || out.Code != ScheduledKeyOccupiedCode {
+		t.Fatalf("outcome = %+v, want refused/409 %s", out, ScheduledKeyOccupiedCode)
+	}
+	if out.RunID != occupant.ID {
+		t.Errorf("RunID = %s, want the occupant %s", out.RunID, occupant.ID)
+	}
+	if !strings.Contains(out.Message, occupant.ID.String()) || !strings.Contains(out.Message, "on_demand") {
+		t.Errorf("message %q must name the occupant id and its trigger_source on_demand", out.Message)
+	}
+	if n := runRowCount(repo); n != 1 {
+		t.Errorf("run rows = %d, want 1 (only the occupant; the refused window mints nothing)", n)
+	}
+}
+
+// TestStartScheduledRun_OccupiedKeyOtherWorkflowRefused isolates the
+// workflow_id half: the occupant IS a scheduled run, so trigger_source passes
+// and only the workflow comparison can refuse it.
+//
+// Counterfactual: drop ONLY the `rr.WorkflowID != workflowID` disjunct and the
+// replay reads already_started — RED, while the on_demand test above stays
+// green.
+func TestStartScheduledRun_OccupiedKeyOtherWorkflowRefused(t *testing.T) {
+	repo := newFakeRepo()
+	s := newServer(t, repo)
+	occupant := seedOccupant(t, repo, run.TriggerScheduled, "groom")
+
+	out, err := s.StartScheduledRun(context.Background(), scheduledParams(scheduledSpec("scheduled")))
+	if err != nil {
+		t.Fatalf("StartScheduledRun: %v", err)
+	}
+	if out.Kind != ScheduledStartRefused || out.Status != http.StatusConflict || out.Code != ScheduledKeyOccupiedCode {
+		t.Fatalf("outcome = %+v, want refused/409 %s", out, ScheduledKeyOccupiedCode)
+	}
+	if out.RunID != occupant.ID {
+		t.Errorf("RunID = %s, want the occupant %s", out.RunID, occupant.ID)
+	}
+	if !strings.Contains(out.Message, "groom") {
+		t.Errorf("message %q must name the occupant's workflow groom", out.Message)
+	}
+	if n := runRowCount(repo); n != 1 {
+		t.Errorf("run rows = %d, want 1 (only the occupant)", n)
 	}
 }
 

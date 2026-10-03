@@ -377,6 +377,40 @@ func TestTick_Refused_CarriesCodeAndMessageVerbatim(t *testing.T) {
 	}
 }
 
+// TestTick_RefusedWithOccupant_CarriesRunID pins the refused-arm run_id: a
+// refusal that names a run (scheduled_key_occupied — the run holding the
+// window's Idempotency-Key) carries it in the audit payload and the snapshot,
+// while a refusal that names none (the test above) stays run_id-free.
+//
+// COUNTERFACTUAL: delete the refused arm's `payload["run_id"] = out.RunID`
+// line and the payload has no run_id key — RED on the run_id assertion. The
+// fixture isolates it: the starter is scripted to return a refusal CARRYING
+// RunID, so the payload line is the only thing that can surface it.
+func TestTick_RefusedWithOccupant_CarriesRunID(t *testing.T) {
+	h := newHarness()
+	const msg = "Idempotency-Key is occupied by run run-occupant (trigger_source on_demand, workflow_id upkeep), not a scheduled run of workflow upkeep; the window is not started"
+	h.starter.scripted = append(h.starter.scripted, func(StartRequest) (StartOutcome, error) {
+		return StartOutcome{Kind: OutcomeRefused, Code: "scheduled_key_occupied", Message: msg, Status: 409, RunID: "run-occupant"}, nil
+	})
+	tk := h.ticker(run.RunnerKindGitHubActions)
+	tk.Tick(context.Background())
+
+	if got := h.audit.categories(); !equalStrings(got, []string{CategoryScheduledRunRefused}) {
+		t.Fatalf("audit = %v, want [scheduled_run_refused]", got)
+	}
+	p := h.audit.payload(t, 0)
+	if p["run_id"] != "run-occupant" {
+		t.Errorf("refused payload run_id = %v, want run-occupant: %v", p["run_id"], p)
+	}
+	if p["code"] != "scheduled_key_occupied" || p["message"] != msg || p["status"] != float64(409) {
+		t.Errorf("refused payload = %v, want code/message/status verbatim", p)
+	}
+	snap, _ := tk.SnapshotFor(testRepo)
+	if lo := snap.Schedules[0].LastOutcome; lo == nil || lo.Kind != OutcomeRefused || lo.RunID != "run-occupant" || lo.Code != "scheduled_key_occupied" {
+		t.Errorf("snapshot last outcome = %+v, want a refusal carrying run-occupant", lo)
+	}
+}
+
 // TestTick_TransientError_NoAuditAndRetriedNextTick pins the transient
 // branch: a starter error audits nothing and the SAME window is retried.
 //
@@ -535,10 +569,23 @@ func TestTick_UnscheduledWorkflowNeverStarted(t *testing.T) {
 		h.clock.Set(w1.Add(time.Duration(i) * time.Hour))
 		tk.Tick(ctx)
 	}
+	// A loop over zero calls passes vacuously (a failed spec fetch never
+	// reaches the starter), so require at least one start — for the scheduled
+	// workflow — before asserting nothing else was started.
+	if h.starter.callCount() == 0 {
+		t.Fatal("starter never called; the never-manual assertion below would pass vacuously")
+	}
+	sawUpkeep := false
 	for _, c := range h.starter.calls {
 		if c.WorkflowID != "upkeep" {
 			t.Errorf("scheduler started unscheduled workflow %q", c.WorkflowID)
 		}
+		if c.WorkflowID == "upkeep" {
+			sawUpkeep = true
+		}
+	}
+	if !sawUpkeep {
+		t.Error("no recorded start for the scheduled workflow upkeep")
 	}
 	snap, _ := tk.SnapshotFor(testRepo)
 	if len(snap.Schedules) != 1 || snap.Schedules[0].WorkflowID != "upkeep" {

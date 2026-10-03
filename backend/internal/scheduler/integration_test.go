@@ -380,3 +380,75 @@ func TestScheduler_UnscheduledWorkflowNeverStarted(t *testing.T) {
 		t.Errorf("audit entry workflow_id = %v, want upkeep (groom declares no schedule)", wf)
 	}
 }
+
+// TestScheduler_OccupiedKey_RefusedNotAlreadyStarted closes the window-key
+// squat gap: a run an ordinary create minted under the upcoming window's
+// Idempotency-Key (here trigger_source on_demand, SAME workflow) must not be
+// read as "this window was already started". The tick instead records exactly
+// one scheduled_run_refused (code scheduled_key_occupied, status 409, run_id =
+// the occupant), starts nothing, and a second tick inside the window adds no
+// entry (the refusal is definitive for the window). The restart-inside-W1 →
+// scheduled_run_skipped path stays proven by
+// TestScheduler_TwoWindowsAndRestart_ExactlyTwoRuns.
+//
+// COUNTERFACTUAL: make the classifier's occupancy check permissive (accept
+// every 200 replay as already_started). The fixture seeds an on_demand run of
+// the SAME workflow under the EXACT window key, so handleCreateRun's replay
+// lookup answers it with 200 and the trigger_source comparison is the only
+// thing separating refused from skipped: the test then reads
+// [scheduled_run_skipped] — RED.
+func TestScheduler_OccupiedKey_RefusedNotAlreadyStarted(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	specYAML := integrationSpec("", "")
+	w1 := time.Date(2026, 10, 1, 9, 0, 0, 0, time.UTC)
+
+	// Seed the squatter BY CONSTRUCTION: a non-scheduled run holding W1's key.
+	key := scheduler.IdempotencyKey("upkeep", w1)
+	occupant, err := h.runs.CreateRun(ctx, run.CreateRunParams{
+		Repo:           integrationRepo,
+		WorkflowID:     "upkeep",
+		WorkflowSHA:    "blobsha",
+		TriggerSource:  run.TriggerOnDemand,
+		IdempotencyKey: &key,
+	})
+	if err != nil {
+		t.Fatalf("seed occupant run: %v", err)
+	}
+
+	h.clk.now = w1.Add(time.Hour)
+	tk := h.newTicker(specYAML)
+	tk.Tick(ctx)
+
+	runs := h.committedRuns(t)
+	if len(runs) != 1 || runs[0].triggerSource != string(run.TriggerOnDemand) || runs[0].idempotencyKey != key {
+		t.Fatalf("runs = %+v, want only the on_demand occupant (the refused window mints nothing)", runs)
+	}
+	entries := h.globalEntries(t, schedulerCategories...)
+	if got := categoriesOf(entries); len(got) != 1 || got[0] != scheduler.CategoryScheduledRunRefused {
+		t.Fatalf("scheduler audit = %v, want exactly [scheduled_run_refused] (not skipped, not started)", got)
+	}
+	p := payloadOf(t, entries[0])
+	if p["code"] != server.ScheduledKeyOccupiedCode {
+		t.Errorf("refused code = %v, want %s", p["code"], server.ScheduledKeyOccupiedCode)
+	}
+	if status, _ := p["status"].(float64); status != 409 {
+		t.Errorf("refused status = %v, want 409", p["status"])
+	}
+	if p["run_id"] != occupant.ID.String() {
+		t.Errorf("refused run_id = %v, want the occupant %s", p["run_id"], occupant.ID)
+	}
+	if msg, _ := p["message"].(string); !strings.Contains(msg, occupant.ID.String()) || !strings.Contains(msg, "on_demand") {
+		t.Errorf("refused message = %q, want it to name the occupant id and its trigger_source on_demand", msg)
+	}
+
+	// Definitive for the window: a second tick in W1 adds no entry and no run.
+	h.clk.now = w1.Add(5 * time.Hour)
+	tk.Tick(ctx)
+	if got := h.globalEntries(t, schedulerCategories...); len(got) != 1 {
+		t.Errorf("after a second W1 tick: %d scheduler entries, want still 1: %v", len(got), categoriesOf(got))
+	}
+	if got := h.committedRuns(t); len(got) != 1 {
+		t.Errorf("after a second W1 tick: %d runs, want still 1", len(got))
+	}
+}
