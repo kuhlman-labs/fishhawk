@@ -4746,11 +4746,17 @@ func TestShipPlan_EverySiblingSettlesItsStage(t *testing.T) {
 	type settleRow struct {
 		fixture func(*testing.T) []byte
 		want    run.StageState
+		// server, when set, builds the row's server instead of newPlanServer.
+		// The upkeep row installs the multi-run wrapper as RunRepo so the
+		// stage's produces: upkeep_report declaration and the cited runs
+		// resolve (#3921).
+		server func(t *testing.T, runID, stageID uuid.UUID) (*Server, *signingFake, *promptRunRepo)
 	}
 	rows := map[plan.ArtifactKind]settleRow{
-		plan.ArtifactKindPlan:                 {validPlanBytes, run.StageStateAwaitingApproval},
-		plan.ArtifactKindClarificationRequest: {validClarificationBytes, run.StageStateAwaitingInput},
-		plan.ArtifactKindGroomingReport:       {validGroomingReportBytes, run.StageStateAwaitingApproval},
+		plan.ArtifactKindPlan:                 {validPlanBytes, run.StageStateAwaitingApproval, nil},
+		plan.ArtifactKindClarificationRequest: {validClarificationBytes, run.StageStateAwaitingInput, nil},
+		plan.ArtifactKindGroomingReport:       {validGroomingReportBytes, run.StageStateAwaitingApproval, nil},
+		plan.ArtifactKindUpkeepReport:         {upkeepExampleBody, run.StageStateAwaitingApproval, newUpkeepSettleServer},
 	}
 
 	for _, kind := range plan.AllArtifactKinds() {
@@ -4760,7 +4766,16 @@ func TestShipPlan_EverySiblingSettlesItsStage(t *testing.T) {
 		}
 		t.Run(string(kind), func(t *testing.T) {
 			runID, stageID := uuid.New(), uuid.New()
-			s, sf, _, _, rr := newPlanServer(t, runID, stageID)
+			var (
+				s  *Server
+				sf *signingFake
+				rr *promptRunRepo
+			)
+			if row.server != nil {
+				s, sf, rr = row.server(t, runID, stageID)
+			} else {
+				s, sf, _, _, rr = newPlanServer(t, runID, stageID)
+			}
 			rr.getStages[stageID] = &run.Stage{
 				ID: stageID, RunID: runID, Type: run.StageTypePlan,
 				State: run.StageStateRunning, RequiresApproval: true,
@@ -4801,7 +4816,8 @@ func TestShipPlan_UnknownKindDiscriminator_FallsThroughToPlanPath(t *testing.T) 
 		t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
 	}
 	raw := w.Body.String()
-	if strings.Contains(raw, "grooming_report_invalid") || strings.Contains(raw, "clarification_request_invalid") {
+	if strings.Contains(raw, "grooming_report_invalid") || strings.Contains(raw, "clarification_request_invalid") ||
+		strings.Contains(raw, "upkeep_report_invalid") || strings.Contains(raw, "upkeep_report_stage_invalid") {
 		t.Errorf("an unknown kind must take the PLAN path, not a sibling handler: %s", raw)
 	}
 	if !strings.Contains(raw, "plan_invalid") {

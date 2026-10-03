@@ -145,7 +145,7 @@ A `plan`-typed stage may emit an additive **standard_v1 sibling** at the
 |---|---|---|
 | `clarification_request` | the planner's step-zero plannability check ([#1057](https://github.com/kuhlman-labs/fishhawk/issues/1057)) | stage parks at `awaiting_input` |
 | `grooming_report` | a backlog-grooming **propose** stage ([#2235](https://github.com/kuhlman-labs/fishhawk/issues/2235)) | artifact row persisted, decided at the plan gate |
-| `upkeep_report` | an upkeep-scan **propose** stage ([#3726](https://github.com/kuhlman-labs/fishhawk/issues/3726), runner recognition [#3920](https://github.com/kuhlman-labs/fishhawk/issues/3920)) | **none until [#3921](https://github.com/kuhlman-labs/fishhawk/issues/3921) lands the ingest handler** — today the backend has no `upkeep_report` route, so the body falls to the plan path and is refused `plan_invalid` (category-B) |
+| `upkeep_report` | an upkeep-scan **propose** stage ([#3726](https://github.com/kuhlman-labs/fishhawk/issues/3726), runner recognition [#3920](https://github.com/kuhlman-labs/fishhawk/issues/3920)) | artifact row persisted and an `upkeep_report_recorded` row appended, decided at the plan gate ([#3921](https://github.com/kuhlman-labs/fishhawk/issues/3921)); refused `upkeep_report_stage_invalid` unless the stage declares `produces: upkeep_report`, or `upkeep_report_invalid` on a schema, semantic or cited-run failure (category-B) |
 
 That set is a deliberate duplicate of the backend's
 `plan.ArtifactKindClarificationRequest` / `plan.ArtifactKindGroomingReport`

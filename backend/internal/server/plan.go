@@ -333,13 +333,29 @@ func (s *Server) handleShipPlan(w http.ResponseWriter, r *http.Request) {
 	// backlog-grooming workflow emits proposals over a backlog slice instead of
 	// a plan. It is persisted as an artifact + a grooming_report_recorded audit
 	// entry rather than validated as a plan.
-	if kind, derr := plan.DetectArtifactKind(body); derr == nil {
+	// An upkeep_report (#3921) is the THIRD sibling, bound at ingest to the
+	// stage's `produces: upkeep_report` declaration (handleUpkeepReport).
+	kind, derr := plan.DetectArtifactKind(body)
+	if derr != nil {
+		kind = plan.ArtifactKindPlan // the plan path owns the ParseError
+	}
+	// Plan-path guard (#3921): a stage declaring produces: upkeep_report may
+	// ship only the kinds on upkeepStageAllowedKinds; every other kind is
+	// refused here, before anything is stored. Fails OPEN when the RunRepo,
+	// run row or cached spec cannot resolve a workflow.
+	if s.guardUpkeepStageProposal(w, r, runID, stageID, stage, kind) {
+		return
+	}
+	if derr == nil {
 		switch kind {
 		case plan.ArtifactKindClarificationRequest:
 			s.handleClarificationRequest(w, r, runID, stageID, stage, body)
 			return
 		case plan.ArtifactKindGroomingReport:
 			s.handleGroomingReport(w, r, runID, stageID, stage, body)
+			return
+		case plan.ArtifactKindUpkeepReport:
+			s.handleUpkeepReport(w, r, runID, stageID, stage, body)
 			return
 		}
 	}
