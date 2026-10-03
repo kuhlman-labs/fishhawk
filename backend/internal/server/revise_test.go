@@ -1319,3 +1319,110 @@ func TestRevisePlan_CrossLayer_OverCapBase_PromptAndSurfaceAgree(t *testing.T) {
 		t.Errorf("re-dispatched plan prompt did not take the digest path the response reports (mode=%q)", resp.RevisionBase.Mode)
 	}
 }
+
+// withNADPlanJSON adds a new_architectural_decision declaration to a plan JSON
+// fixture (E78.4 / #3748).
+func withNADPlanJSON(t *testing.T, raw []byte) []byte {
+	t.Helper()
+	var p plan.Plan
+	if err := json.Unmarshal(raw, &p); err != nil {
+		t.Fatalf("unmarshal fixture: %v", err)
+	}
+	p.NewArchitecturalDecision = &plan.NewArchitecturalDecision{
+		Rationale:       "introduces a durable crew message bus",
+		RelatedADRs:     []string{"ADR-082", "#3728"},
+		DecisionSummary: "crew messages move to a durable queue",
+	}
+	out, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal fixture: %v", err)
+	}
+	return out
+}
+
+// TestRevisePlan_CrossLayer_NewArchitecturalDecisionSurvivesRevise is the
+// CROSS-BOUNDARY test for the revise carry-through (E78.4 / #3748): a prior
+// plan artifact carrying new_architectural_decision is seeded, POST
+// /v0/stages/{stage_id}/revise re-opens the stage, and the re-dispatched plan
+// prompt's revision base carries the decision summary, rationale and ADR ids —
+// in whole mode (the typed plan re-marshalled verbatim by loadRevisionBasePlan)
+// and in digest mode (an over-cap base rendered by the step-complete digest).
+func TestRevisePlan_CrossLayer_NewArchitecturalDecisionSurvivesRevise(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		planJSON func(t *testing.T) []byte
+		mode     string
+		want     []string
+	}{
+		{
+			name:     "whole",
+			planJSON: func(t *testing.T) []byte { return revisionBasePlanJSON(t, 3, 100) },
+			mode:     prompt.RevisionBaseModeWhole,
+			want: []string{
+				`"new_architectural_decision"`,
+				`"decision_summary": "crew messages move to a durable queue"`,
+				`"rationale": "introduces a durable crew message bus"`,
+				`"ADR-082"`, `"#3728"`,
+			},
+		},
+		{
+			name:     "digest",
+			planJSON: overCapPlanJSON,
+			mode:     prompt.RevisionBaseModeDigest,
+			want: []string{
+				"new_architectural_decision (declared by the planner):",
+				"- decision_summary: crew messages move to a durable queue",
+				"- rationale: introduces a durable crew message bus",
+				"- related_adrs: ADR-082, #3728",
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runID, stageID := uuid.New(), uuid.New()
+			sf := newSigningFake()
+			priv, _ := sf.issue(t, runID)
+			rr := newPromptRunRepo()
+			au := newAuditFake()
+			art := newFakeArtifactRepo()
+			st := &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypePlan, State: run.StageStateAwaitingApproval}
+			rr.getStages[stageID] = st
+			rr.stagesByRunID = map[uuid.UUID][]*run.Stage{runID: {st}}
+			rr.getRuns[runID] = &run.Run{ID: runID, Repo: "kuhlman-labs/example", WorkflowID: "feature_change", TriggerSource: run.TriggerCLI, RequiresCharter: chFalse()}
+			seedRevisionBaseArtifact(t, art, stageID, withNADPlanJSON(t, tc.planJSON(t)))
+
+			s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au, SigningRepo: sf, ArtifactRepo: art})
+			s.promptIssueGetterOverride = &stubIssueGetter{}
+
+			w := revisePlan(t, s, stageID, `{"constraint":"keep the change additive"}`)
+			if w.Code != http.StatusOK {
+				t.Fatalf("revise status = %d, want 200:\n%s", w.Code, w.Body.String())
+			}
+			var resp reviseBodyWithBase
+			if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+				t.Fatal(err)
+			}
+			if resp.RevisionBase == nil || resp.RevisionBase.Mode != tc.mode {
+				t.Fatalf("revision_base = %+v, want mode %q", resp.RevisionBase, tc.mode)
+			}
+			for _, k := range resp.RevisionBase.UnrenderedKeys {
+				if k == "new_architectural_decision" {
+					t.Errorf("revision_base lists new_architectural_decision as unrendered: %v", resp.RevisionBase.UnrenderedKeys)
+				}
+			}
+
+			pw := promptRequest(t, s, runID, stageID, priv, "")
+			if pw.Code != http.StatusOK {
+				t.Fatalf("prompt status = %d, want 200:\n%s", pw.Code, pw.Body.String())
+			}
+			var pr promptResponse
+			if err := json.NewDecoder(pw.Body).Decode(&pr); err != nil {
+				t.Fatalf("decode prompt: %v", err)
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(pr.Prompt, want) {
+					t.Errorf("re-dispatched plan prompt's revision base missing %q", want)
+				}
+			}
+		})
+	}
+}

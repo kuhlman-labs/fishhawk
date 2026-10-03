@@ -128,6 +128,10 @@
           "description": "Optional. The language/toolchain rule that makes the change atomic — e.g. 'Go requires a method's receiver base type in the method's own package'. Rendered alongside the rationale in the plan-gate advisory when present."
         }
       }
+    },
+    "new_architectural_decision": {
+      "$ref": "#/$defs/new-architectural-decision",
+      "description": "Optional (E78.4 / #3748). The planner's declaration that this plan sets NEW ARCHITECTURAL DIRECTION — PRESENCE of this object is the declaration, the same idiom as irreducible. Declare it when the plan introduces a new component boundary, a new persistence shape, a new protocol or wire contract, a new trust boundary, or departs from a cited ADR. Do NOT declare it for routine work inside existing decisions, which is most plans. It is surfaced to the captain as one plan_warnings advisory naming the decision summary, the rationale and the related ADRs, and the captain decides whether the direction needs an ADR. It gates nothing: unlike irreducible, no enforcement path reads it. Additive-optional within standard_v1 (no major bump)."
     }
   },
 
@@ -483,6 +487,30 @@
           "type": "string",
           "minLength": 1,
           "description": "Why the revision constraint genuinely obsoletes this path. Rendered to plan reviewers as a challengeable justification, so a bogus reason is not silent."
+        }
+      }
+    },
+
+    "new-architectural-decision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rationale", "related_adrs", "decision_summary"],
+      "description": "A planner's new-architectural-decision declaration (E78.4 / #3748). Read only by the plan-gate advisory pass, never by an enforcement site. A whitespace-only rationale, decision_summary or related_adrs entry satisfies minLength:1 but is rejected semantically by plan.Parse.",
+      "properties": {
+        "rationale": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Why this plan sets new architectural direction rather than working inside existing decisions. Surfaced to the captain in the plan-gate advisory."
+        },
+        "related_adrs": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "description": "ADR identifiers this direction relates to or departs from (e.g. 'ADR-082' or '#3728'). An EMPTY array is valid and means no existing ADR covers the direction."
+        },
+        "decision_summary": {
+          "type": "string",
+          "minLength": 1,
+          "description": "ONE line naming the direction the plan sets. Rendered as the lead of the plan-gate advisory."
         }
       }
     }
