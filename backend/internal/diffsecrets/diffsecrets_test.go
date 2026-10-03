@@ -139,6 +139,76 @@ func TestScan_UnresolvedPathStillReported(t *testing.T) {
 	}
 }
 
+// TestScan_MalformedHunkHeaderStillScansAddedLines (carried from #3760 into
+// E80.4 / #3761): a `@@` header whose new-side start cannot be parsed still
+// opens a hunk, so the `+` line under it is scanned and reported against its
+// path with UnknownLine, and Note renders it "(line unknown)".
+// COUNTERFACTUAL: restore the old `if start, ok := hunkNewStart(line); ok {
+// state = stateHunk; … }` branch — this fixture's section has NO well-formed
+// header before the key-bearing `+` line (only `@@ garbage @@`), so the
+// section is still in header state when that line arrives, header state
+// discards it, and zero hits are reported where the test asserts one.
+func TestScan_MalformedHunkHeaderStillScansAddedLines(t *testing.T) {
+	patch := section("conf/app.go",
+		"@@ garbage @@\n"+
+			" context\n"+
+			"+k := \""+classicPAT()+"\"\n")
+	res := Scan(patch, redaction.DefaultPatterns)
+	want := []Hit{{Path: "conf/app.go", Line: UnknownLine, Pattern: "github-pat-classic"}}
+	if !reflect.DeepEqual(res.Hits, want) {
+		t.Fatalf("hits = %+v, want %+v", res.Hits, want)
+	}
+	note := Note(GroupHits(res.Hits)[0])
+	if !strings.Contains(note, "conf/app.go:(line unknown)") {
+		t.Errorf("note does not render the unknown line:\n%s", note)
+	}
+	if strings.Contains(note, "conf/app.go:0") {
+		t.Errorf("note renders the UnknownLine sentinel as a line number:\n%s", note)
+	}
+}
+
+// TestScan_MalformedHunkHeaderMidHunkMarksLineUnknown: a malformed `@@` inside
+// a hunk keeps hunk state with the line unknown, and the NEXT well-formed
+// header restores real numbering. COUNTERFACTUAL: make the assignment
+// `lineKnown = ok || true` (keep hunk state but treat the line as known) — a
+// failed parse seeds the counter at 0, so the FIRST `+` line after the
+// malformed header would still read 0; the fixture therefore carries a SECOND
+// `+` line there, which the mutation numbers 1 instead of UnknownLine, and the
+// hit list goes RED. The third hit must restart at 40, pinning that the next
+// well-formed header restores real numbering.
+func TestScan_MalformedHunkHeaderMidHunkMarksLineUnknown(t *testing.T) {
+	patch := section("a.go",
+		"@@ -1,1 +1,2 @@\n"+
+			"+one := \""+classicPAT()+"\"\n"+ // new 1
+			"@@ -9 +nonsense @@\n"+
+			"+two := \""+classicPAT()+"\"\n"+ // unknown
+			"+two2 := \""+classicPAT()+"\"\n"+ // unknown (1 if the line were "known")
+			"@@ -30 +40 @@\n"+
+			"+three := \""+classicPAT()+"\"\n") // new 40
+	res := Scan(patch, redaction.DefaultPatterns)
+	want := []Hit{
+		{Path: "a.go", Line: 1, Pattern: "github-pat-classic"},
+		{Path: "a.go", Line: UnknownLine, Pattern: "github-pat-classic"},
+		{Path: "a.go", Line: UnknownLine, Pattern: "github-pat-classic"},
+		{Path: "a.go", Line: 40, Pattern: "github-pat-classic"},
+	}
+	if !reflect.DeepEqual(res.Hits, want) {
+		t.Fatalf("hits = %+v, want %+v", res.Hits, want)
+	}
+	// A malformed header in one file never bleeds into the next file's
+	// well-formed hunk: that file's own `@@` re-establishes the line.
+	two := section("x.go", "@@ bad @@\n+a := \""+classicPAT()+"\"\n") +
+		section("y.go", "@@ -0,0 +3 @@\n+b := \""+classicPAT()+"\"\n")
+	got := Scan(two, redaction.DefaultPatterns).Hits
+	wantTwo := []Hit{
+		{Path: "x.go", Line: UnknownLine, Pattern: "github-pat-classic"},
+		{Path: "y.go", Line: 3, Pattern: "github-pat-classic"},
+	}
+	if !reflect.DeepEqual(got, wantTwo) {
+		t.Fatalf("two-section hits = %+v, want %+v", got, wantTwo)
+	}
+}
+
 // TestScan_CredentialShapedFileNameIsRedacted: the path itself passes through
 // the pattern set, so a file NAMED like a credential cannot carry it onto a
 // hit.

@@ -81,3 +81,63 @@ func (s *Server) forgeCompareFor(runRow *run.Run) (c patchComparer, scope forge.
 	}
 	return f, forge.FromRef(ref), r, ""
 }
+
+// githubFileFetcher adapts *githubclient.Client's GetFile to forge.FileFetcher
+// for the permission-drift check (E80.4 / #3761). GetFile already maps a 404 to
+// forge.ErrNotFound (githubclient.ErrNotFound is an alias), so absence passes
+// through unchanged.
+type githubFileFetcher struct{ c *githubclient.Client }
+
+func (g githubFileFetcher) FetchFile(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef, path, ref string) (*forge.FileContent, error) {
+	fc, err := g.c.GetFile(ctx, scope, repo, path, ref)
+	if err != nil {
+		return nil, err
+	}
+	return &forge.FileContent{Path: fc.Path, Content: fc.Content, SHA: fc.SHA}, nil
+}
+
+// fileFetcherFor resolves the single-file read capability for a run's forge
+// FAMILY (E80.4 / #3761), with the same per-family ladder as forgeCompareFor:
+// a github-family run resolves ONLY through cfg.GitHub (nil-pointer check
+// before the interface assignment, for the reason forgeCompareFor documents),
+// any other family through cfg.ForgeResolver plus a forge.FileFetcher type
+// assertion — a resolved forge that cannot read files is unavailable, never a
+// silent pass. reason is non-empty exactly when no fetcher is available.
+func (s *Server) fileFetcherFor(runRow *run.Run) (f forge.FileFetcher, scope forge.CredentialScope, repo forge.RepoRef, reason string) {
+	family := observationForgeID(runRow.InstallationRef)
+	if family == observationForgeGitHub {
+		if s.cfg.GitHub == nil {
+			return nil, forge.CredentialScope{}, forge.RepoRef{}, "github client not wired"
+		}
+		if runRow.InstallationID == nil || *runRow.InstallationID == 0 {
+			return nil, forge.CredentialScope{}, forge.RepoRef{}, "no installation id"
+		}
+		r, err := parseRepoOwnerName(runRow.Repo)
+		if err != nil {
+			return nil, forge.CredentialScope{}, forge.RepoRef{}, "parse repo: " + err.Error()
+		}
+		return githubFileFetcher{c: s.cfg.GitHub}, forge.FromGitHubInstallationID(*runRow.InstallationID), r, ""
+	}
+
+	if runRow.InstallationRef == nil || *runRow.InstallationRef == "" {
+		return nil, forge.CredentialScope{}, forge.RepoRef{}, "no installation_ref"
+	}
+	ref := *runRow.InstallationRef
+	resolver := s.cfg.ForgeResolver
+	if resolver == nil {
+		resolver = forge.Get
+	}
+	resolved, err := resolver(family)
+	if err != nil || isNilForge(resolved) {
+		return nil, forge.CredentialScope{}, forge.RepoRef{}, "forge " + family + " unresolved"
+	}
+	ff, ok := resolved.(forge.FileFetcher)
+	if !ok {
+		return nil, forge.CredentialScope{}, forge.RepoRef{}, "forge " + family + " cannot fetch files"
+	}
+	r, ok := splitParentRepoRef(runRow.Repo)
+	if !ok {
+		return nil, forge.CredentialScope{}, forge.RepoRef{}, "parse repo"
+	}
+	return ff, forge.FromRef(ref), r, ""
+}

@@ -851,6 +851,15 @@ func (s *Server) handleShipPullRequest(w http.ResponseWriter, r *http.Request) {
 	// transition below.
 	if stage.Type == run.StageTypeImplement {
 		s.recordReviewHeadMismatch(r.Context(), runID, stageID, &pr)
+		// Permission-drift check (E80.4 / #3761): the head is on the forge
+		// now, so read each changed permission surface at base and head. A
+		// background goroutine; it never alters this response. The idempotent
+		// GetByHash replay above does not re-run it — the check's own
+		// de-duplication would cover a repeat anyway.
+		s.checkPermissionDrift(r.Context(), permissionDriftRequest{
+			RunID: runID, StageID: stageID, Base: pr.BaseSHA, Head: pr.HeadSHA,
+			Trigger: permissionDriftTriggerPROpened,
+		})
 	}
 
 	// Backfill the run's pull_request_url so the threaded-runs view
@@ -1290,6 +1299,13 @@ func (s *Server) succeedFixupPushStage(w http.ResponseWriter, r *http.Request, r
 	// from running twice on a redelivered report. A no-op on the normal path where
 	// the trace-time hook already dispatched for this head.
 	s.maybeBackstopFixupReReview(r.Context(), runID, stage, pr.HeadSHA, pr.BaseSHA)
+
+	// Permission-drift check over this pass's delta (E80.4 / #3761): base is
+	// the previous branch head, head the pushed fix-up commit.
+	s.checkPermissionDrift(r.Context(), permissionDriftRequest{
+		RunID: runID, StageID: stageID, Base: pr.BaseSHA, Head: pr.HeadSHA,
+		Trigger: permissionDriftTriggerFixupPushed,
+	})
 
 	s.notifyOperatorVisible(r.Context(), runID, CategoryFixupPushed)
 
@@ -2033,6 +2049,12 @@ func (s *Server) succeedConflictResolutionPushStage(w http.ResponseWriter, r *ht
 	}
 
 	s.notifyStatusUpdate(r.Context(), runID, CategoryConflictResolutionPushed)
+
+	// Permission-drift check (E80.4 / #3761): a conflict-resolution merge
+	// commit is agent-authored, so it is checked like any other push. Its
+	// previous-head → pushed-head delta also carries the base branch's own
+	// changes, so the check intersects with base-branch-tip → pushed-head.
+	s.checkPermissionDrift(r.Context(), s.conflictResolutionDriftRequest(r.Context(), runID, stageID, pr))
 
 	s.writeJSON(w, r, http.StatusOK, pullRequestConflictResolutionResponse{
 		StageID: stageID,
