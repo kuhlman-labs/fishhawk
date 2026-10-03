@@ -342,8 +342,9 @@ func (s *Server) handleShipPlan(w http.ResponseWriter, r *http.Request) {
 	// Plan-path guard (#3921): a stage declaring produces: upkeep_report may
 	// ship only the kinds on upkeepStageAllowedKinds; every other kind is
 	// refused here, before anything is stored. Fails OPEN when the RunRepo,
-	// run row or cached spec cannot resolve a workflow.
-	if s.guardUpkeepStageProposal(w, r, runID, stageID, stage, kind) {
+	// run row or cached spec cannot resolve a workflow. body and derr reach
+	// the refusal so it keeps the parse error (#3922).
+	if s.guardUpkeepStageProposal(w, r, runID, stageID, stage, kind, body, derr) {
 		return
 	}
 	if derr == nil {

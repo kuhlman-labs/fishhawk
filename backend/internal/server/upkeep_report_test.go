@@ -16,6 +16,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/intakegroom"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/upkeep"
@@ -704,5 +705,184 @@ func TestUpkeepStageGuard_TransportError500(t *testing.T) {
 	}
 	if got := f.stageState(f.planStage.ID); got != run.StageStateRunning {
 		t.Errorf("stage = %q, want running", got)
+	}
+}
+
+// --- plan-path guard: undetectable bodies (#3922, the carried #3921 concern) --
+
+// upkeepGuardBody returns the shipped example with mutate applied, re-encoded.
+func upkeepGuardBody(t *testing.T, mutate func(m map[string]any)) []byte {
+	t.Helper()
+	var m map[string]any
+	if err := json.Unmarshal(upkeepExampleBody(t), &m); err != nil {
+		t.Fatal(err)
+	}
+	mutate(m)
+	b, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// upkeepGuardLongKind is a 100-byte unknown kind: the echo must be cut to
+// upkeepGuardMaxKindBytes (approval condition 6).
+var upkeepGuardLongKind = "upkeep_reprot_" + strings.Repeat("x", 86)
+
+// upkeepGuardUndetectableRows are the three ways a body on an upkeep-declaring
+// stage reads as kind plan. want is the row's detail; absent must NOT appear.
+func upkeepGuardUndetectableRows(t *testing.T) []struct {
+	name   string
+	body   []byte
+	want   []string
+	absent []string
+} {
+	return []struct {
+		name   string
+		body   []byte
+		want   []string
+		absent []string
+	}{
+		{
+			name: "truncated JSON",
+			body: []byte(`{"kind":"upkeep_report","report_version":`),
+			want: []string{"unexpected end of JSON input", "not a parseable upkeep_report"},
+			// The pre-#3922 message claimed a malformed upkeep_report was a plan.
+			absent: []string{"not a plan"},
+		},
+		{
+			name: "kind-less body",
+			body: upkeepGuardBody(t, func(m map[string]any) { delete(m, "kind") }),
+			want: []string{`carries no top-level "kind"`},
+		},
+		{
+			name: "unknown kind",
+			body: upkeepGuardBody(t, func(m map[string]any) { m["kind"] = upkeepGuardLongKind }),
+			want: []string{
+				`its top-level kind "` + upkeepGuardLongKind[:upkeepGuardMaxKindBytes] + `...[truncated]" is not a recognized artifact kind`,
+			},
+			absent: []string{upkeepGuardLongKind},
+		},
+	}
+}
+
+// TestUpkeepStageGuard_UndetectableBodyKeepsParseError pins the refusal text
+// for a body the discriminator reads as a plan: the parse error, the missing
+// kind or the unknown kind is named, alongside the declaration and
+// upkeep_report_v1. The code stays plan_invalid, nothing is stored and the
+// stage fails category-B (no orchestrator, so no schema retry).
+func TestUpkeepStageGuard_UndetectableBodyKeepsParseError(t *testing.T) {
+	for _, row := range upkeepGuardUndetectableRows(t) {
+		t.Run(row.name, func(t *testing.T) {
+			f := newUpkeepIngestFixture(t, nil)
+			code, resp := f.post(t, f.planStage.ID, row.body)
+			if code != http.StatusBadRequest || upkeepErrorCode(resp) != "plan_invalid" {
+				t.Fatalf("response = %d %v, want 400 plan_invalid", code, resp)
+			}
+			e, _ := upkeepErrorDetails(t, resp)["error"].(string)
+			for _, want := range append([]string{"produces: upkeep_report", plan.UpkeepReportVersion}, row.want...) {
+				if !strings.Contains(e, want) {
+					t.Errorf("details.error = %q, want it to contain %q", e, want)
+				}
+			}
+			for _, absent := range row.absent {
+				if strings.Contains(e, absent) {
+					t.Errorf("details.error = %q, must not contain %q", e, absent)
+				}
+			}
+			if got := f.stageState(f.planStage.ID); got != run.StageStateFailed {
+				t.Errorf("stage = %q, want failed", got)
+			}
+			for _, k := range []artifact.Kind{artifact.KindPlan, artifact.KindUpkeepReport} {
+				if n := f.artifacts(k); n != 0 {
+					t.Errorf("%s artifacts = %d, want 0", k, n)
+				}
+			}
+		})
+	}
+}
+
+// upkeepRetryRunRepo lets the schema retry re-open the stage: the shared
+// promptRunRepo's RetryStage is a stub that errors.
+type upkeepRetryRunRepo struct{ *upkeepRunRepo }
+
+func (r *upkeepRetryRunRepo) RetryStage(_ context.Context, id uuid.UUID, to run.StageState) (*run.Stage, error) {
+	st, ok := r.getStages[id]
+	if !ok {
+		return nil, run.ErrNotFound
+	}
+	st.State = to
+	return st, nil
+}
+
+// TestUpkeepStageGuard_UndetectableBodySchemaRetryCarriesParseError: with an
+// orchestrator and audit repo wired, the guard's plan_invalid refusal of a
+// truncated upkeep_report schedules the bounded schema retry, and the
+// plan_schema_retry row's validation_error — the next prompt's feedback —
+// carries the parse error and names upkeep_report_v1.
+func TestUpkeepStageGuard_UndetectableBodySchemaRetryCarriesParseError(t *testing.T) {
+	f := newUpkeepIngestFixtureWith(t, upkeepScanSpec(t), "upkeep_scan", nil, func(rr *upkeepRunRepo) run.Repository {
+		return &upkeepRetryRunRepo{upkeepRunRepo: rr}
+	})
+	f.s.cfg.Orchestrator = &orchestrator.Orchestrator{Runs: f.s.cfg.RunRepo}
+	code, resp := f.post(t, f.planStage.ID, []byte(`{"kind":"upkeep_report","report_version":`))
+	if code != http.StatusBadRequest || upkeepErrorCode(resp) != "plan_invalid" {
+		t.Fatalf("response = %d %v, want 400 plan_invalid", code, resp)
+	}
+	if got := upkeepErrorDetails(t, resp)["retry_scheduled"]; got != true {
+		t.Fatalf("details.retry_scheduled = %v, want true: %v", got, resp)
+	}
+	var rows []string
+	f.au.mu.Lock()
+	for _, e := range f.au.appended {
+		if e.Category != "plan_schema_retry" {
+			continue
+		}
+		var p struct {
+			ValidationError string `json:"validation_error"`
+		}
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			t.Errorf("decode plan_schema_retry payload: %v", err)
+		}
+		rows = append(rows, p.ValidationError)
+	}
+	f.au.mu.Unlock()
+	if len(rows) != 1 {
+		t.Fatalf("plan_schema_retry rows = %d, want 1", len(rows))
+	}
+	for _, want := range []string{"unexpected end of JSON input", plan.UpkeepReportVersion, "produces: upkeep_report"} {
+		if !strings.Contains(rows[0], want) {
+			t.Errorf("validation_error = %q, want it to contain %q", rows[0], want)
+		}
+	}
+	if n := f.artifacts(artifact.KindUpkeepReport); n != 0 {
+		t.Errorf("upkeep_report artifacts = %d, want 0", n)
+	}
+}
+
+// TestUpkeepGuardBodyDetail covers the pure helper's branches directly,
+// including a multi-byte kind cut mid-rune (the echo stays valid UTF-8) and a
+// kind exactly at the cap (not truncated).
+func TestUpkeepGuardBodyDetail(t *testing.T) {
+	atCap := strings.Repeat("k", upkeepGuardMaxKindBytes)
+	runes := strings.Repeat("é", 40) // after the leading "x", the byte-64 cut splits the 32nd é
+	cases := []struct {
+		name string
+		body string
+		derr error
+		want string
+	}{
+		{"parse error", `{`, &plan.ParseError{Msg: "boom"}, "the body is not a parseable upkeep_report (plan: parse: boom)"},
+		{"no kind", `{"summary":"x"}`, nil, `the body carries no top-level "kind", so it was read as a plan`},
+		{"empty kind", `{"kind":""}`, nil, `the body carries no top-level "kind", so it was read as a plan`},
+		{"kind at cap", `{"kind":"` + atCap + `"}`, nil, `its top-level kind "` + atCap + `" is not a recognized artifact kind`},
+		{"multi-byte kind", `{"kind":"x` + runes + `"}`, nil, `its top-level kind "x` + strings.Repeat("é", 31) + `...[truncated]" is not a recognized artifact kind`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := upkeepGuardBodyDetail([]byte(tc.body), tc.derr); got != tc.want {
+				t.Errorf("upkeepGuardBodyDetail = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
