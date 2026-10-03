@@ -11,6 +11,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode"
 
 	"github.com/google/uuid"
 
@@ -85,7 +86,9 @@ type driftGH struct {
 	mu            sync.Mutex
 	files         map[string]map[string]string
 	changed       []string
-	renamed       bool
+	renamed       bool              // every changed file is "renamed" with no previous_filename
+	renamedFrom   map[string]string // changed path → previous_filename (a "renamed" row)
+	headSHA       string            // the compare's head commit ("" → driftHead)
 	truncated     bool
 	compareStatus int
 	contentStatus map[string]int // "ref|path" → status
@@ -125,17 +128,24 @@ func (g *driftGH) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		files := []map[string]any{}
 		for _, c := range g.changed {
-			status := "modified"
+			row := map[string]any{"filename": c, "status": "modified", "changes": 2, "patch": "@@ -1 +1 @@\n-a\n+b"}
 			if g.renamed {
-				status = "renamed"
+				row["status"] = "renamed"
 			}
-			files = append(files, map[string]any{"filename": c, "status": status, "changes": 2, "patch": "@@ -1 +1 @@\n-a\n+b"})
+			if from, ok := g.renamedFrom[c]; ok {
+				row["status"], row["previous_filename"] = "renamed", from
+			}
+			files = append(files, row)
 		}
 		if g.truncated { // a changed file with an omitted patch body → Truncated
 			files = append(files, map[string]any{"filename": "big.bin", "status": "modified", "changes": 9})
 		}
+		head := g.headSHA
+		if head == "" {
+			head = driftHead
+		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"total_commits": 1, "commits": []map[string]string{{"sha": driftHead}}, "files": files,
+			"total_commits": 1, "commits": []map[string]string{{"sha": head}}, "files": files,
 		})
 		return
 	}
@@ -673,7 +683,11 @@ func TestPermissionDrift_FailureModes(t *testing.T) {
 			t.Errorf("calls = %d rows = %d, want 0/0", f.gh.callCount(), len(f.rows(t)))
 		}
 	})
-	t.Run("missing head is skipped", func(t *testing.T) {
+	// Item 9. COUNTERFACTUAL (the commit_missing raise in
+	// runPermissionDriftCheck mutated back to a bare `return`): the request
+	// carries no head, so nothing else can mint a row → zero rows → RED. The
+	// raise happens before any forge call, so the forge sees zero requests.
+	t.Run("missing head raises commit_missing", func(t *testing.T) {
 		f := newDriftFixture(t)
 		f.workflowChange(wfBase, wfWidened)
 		r := f.req(permissionDriftTriggerPROpened)
@@ -682,6 +696,22 @@ func TestPermissionDrift_FailureModes(t *testing.T) {
 		f.s.waitBackgroundReviews()
 		if f.gh.callCount() != 0 {
 			t.Errorf("calls = %d, want 0", f.gh.callCount())
+		}
+		rows := f.rows(t)
+		if len(rows) != 1 || rows[0].CheckKey != permdrift.UnevaluableKey(permissionDriftAllSurfaces.ID, driftBase+"..", "") {
+			t.Fatalf("rows = %+v, want one commit_missing row", rows)
+		}
+		if got := f.unevaluable(t)[permissionDriftAllSurfaces.ID]; got != permdrift.ReasonCommitMissing {
+			t.Errorf("reason = %q, want commit_missing", got)
+		}
+	})
+	t.Run("missing base raises commit_missing", func(t *testing.T) {
+		f := newDriftFixture(t)
+		r := f.req(permissionDriftTriggerFixupPushed)
+		r.Base = ""
+		f.run(r)
+		if got := f.unevaluable(t)[permissionDriftAllSurfaces.ID]; got != permdrift.ReasonCommitMissing || f.gh.callCount() != 0 {
+			t.Errorf("reason = %q calls = %d, want commit_missing/0", got, f.gh.callCount())
 		}
 	})
 	t.Run("get run failure is skipped", func(t *testing.T) {
@@ -721,7 +751,7 @@ func TestPermissionDrift_FailureModes(t *testing.T) {
 		f.gh.compareStatus = http.StatusInternalServerError
 		f.run(f.req(permissionDriftTriggerPROpened))
 		rows := f.rows(t)
-		if len(rows) != 1 || !strings.HasSuffix(rows[0].CheckKey, "|unevaluable") {
+		if len(rows) != 1 || rows[0].CheckKey != permdrift.UnevaluableKey(permissionDriftAllSurfaces.ID, driftBase+".."+driftHead, driftHead) {
 			t.Fatalf("rows = %+v, want one unevaluable row", rows)
 		}
 		if got := f.unevaluable(t)[permissionDriftAllSurfaces.ID]; got != permdrift.ReasonCompareFailed {
@@ -738,7 +768,7 @@ func TestPermissionDrift_FailureModes(t *testing.T) {
 		if got := f.unevaluable(t)["gha-workflow-permissions"]; got != permdrift.ReasonFetchFailed {
 			t.Errorf("reason = %q, want fetch_failed", got)
 		}
-		if rows := f.rows(t); len(rows) != 1 || rows[0].CheckKey != permdrift.UnevaluableKey("gha-workflow-permissions", driftWFPath) {
+		if rows := f.rows(t); len(rows) != 1 || rows[0].CheckKey != permdrift.UnevaluableKey("gha-workflow-permissions", driftWFPath, driftHead) {
 			t.Errorf("rows = %+v", rows)
 		}
 	})
@@ -863,7 +893,11 @@ func TestPermissionDrift_FailureModes(t *testing.T) {
 			t.Errorf("rows = %d, want 1", n)
 		}
 	})
-	t.Run("unparseable extension keeps product surfaces", func(t *testing.T) {
+	// Approval condition 2. COUNTERFACTUAL (the unevaluable append in
+	// permissionDriftSurfaces mutated out): the change touches only ci.yml, so
+	// the only row left is the product widening → the declarations row is
+	// missing → RED.
+	t.Run("unparseable extension keeps product surfaces and fails closed", func(t *testing.T) {
 		f := newDriftFixture(t)
 		f.workflowChange(wfBase, wfWidened)
 		f.gh.put(driftBase, permdrift.RepoSurfacesPath, "version: [\n")
@@ -872,8 +906,19 @@ func TestPermissionDrift_FailureModes(t *testing.T) {
 		if len(p) != 1 || p[0].ExtensionError != permdrift.ReasonParseError || len(p[0].Widenings) != 1 {
 			t.Errorf("detected = %+v, want the product widening with extension_error parse_error", p)
 		}
+		rows := f.rows(t)
+		if len(rows) != 2 || rowWithKey(rows, wfWideningKey) == nil ||
+			rowWithKey(rows, permdrift.UnevaluableKey(permdrift.SurfaceIDSurfaceDeclarations, permdrift.RepoSurfacesPath, driftHead)) == nil {
+			t.Fatalf("rows = %+v, want the product widening AND the declarations unevaluable row", rows)
+		}
+		if got := f.unevaluable(t)[permdrift.SurfaceIDSurfaceDeclarations]; got != permdrift.ReasonExtensionParseError {
+			t.Errorf("reason = %q, want extension_parse_error", got)
+		}
 	})
-	t.Run("extension fetch failure keeps product surfaces", func(t *testing.T) {
+	// Item 8. COUNTERFACTUAL (the unevaluable append in permissionDriftSurfaces
+	// mutated out): the change touches only ci.yml, so the only row left is the
+	// product widening → the declarations fetch_failed row is missing → RED.
+	t.Run("extension fetch failure keeps product surfaces and fails closed", func(t *testing.T) {
 		f := newDriftFixture(t)
 		f.workflowChange(wfBase, wfWidened)
 		f.gh.contentStatus[driftBase+"|"+permdrift.RepoSurfacesPath] = http.StatusInternalServerError
@@ -881,6 +926,14 @@ func TestPermissionDrift_FailureModes(t *testing.T) {
 		p := f.detected(t)
 		if len(p) != 1 || p[0].ExtensionError != permdrift.ReasonFetchFailed || len(p[0].Widenings) != 1 {
 			t.Errorf("detected = %+v, want the product widening with extension_error fetch_failed", p)
+		}
+		rows := f.rows(t)
+		if len(rows) != 2 || rowWithKey(rows, wfWideningKey) == nil ||
+			rowWithKey(rows, permdrift.UnevaluableKey(permdrift.SurfaceIDSurfaceDeclarations, permdrift.RepoSurfacesPath, driftHead)) == nil {
+			t.Fatalf("rows = %+v, want the product widening AND the declarations fetch_failed row", rows)
+		}
+		if got := f.unevaluable(t)[permdrift.SurfaceIDSurfaceDeclarations]; got != permdrift.ReasonFetchFailed {
+			t.Errorf("reason = %q, want fetch_failed", got)
 		}
 	})
 	t.Run("rejected extension entry is named", func(t *testing.T) {
@@ -966,4 +1019,294 @@ type fetchingForge struct{ fakeCompareForge }
 
 func (f *fetchingForge) FetchFile(context.Context, forge.CredentialScope, forge.RepoRef, string, string) (*forge.FileContent, error) {
 	return nil, forge.ErrNotFound
+}
+
+// TestIntersectDrift (item 2): the conflict-resolution intersection matches
+// widenings against widenings and narrowings against narrowings.
+//
+// COUNTERFACTUAL (intersectDrift's two sets mutated back into one union of
+// second.Widened and second.Narrowed): first widens K (absent)→read while
+// second NARROWS K write→read — both share CheckKey(…, K, "read") — so the
+// union keeps first's widening → RED on "want zero widenings". The second arm
+// (second also widens K to read) is the control that a same-direction change
+// survives.
+func TestIntersectDrift(t *testing.T) {
+	sf := permdrift.DefaultSurfaces()[0]
+	widen := permdrift.Change{Key: "jobs.build.contents", Before: permdrift.Absent, After: "read", Direction: permdrift.Widened}
+	narrow := permdrift.Change{Key: "jobs.build.contents", Before: "write", After: "read", Direction: permdrift.Narrowed}
+	first := permdrift.Result{Widened: []permdrift.Change{widen}}
+
+	if got := intersectDrift(sf, driftWFPath, first, permdrift.Result{Narrowed: []permdrift.Change{narrow}}); len(got.Widened) != 0 {
+		t.Errorf("opposite direction: widenings = %+v, want zero", got.Widened)
+	}
+	if got := intersectDrift(sf, driftWFPath, first, permdrift.Result{Widened: []permdrift.Change{widen}}); len(got.Widened) != 1 {
+		t.Errorf("same direction: widenings = %+v, want one", got.Widened)
+	}
+	firstN := permdrift.Result{Narrowed: []permdrift.Change{narrow}}
+	if got := intersectDrift(sf, driftWFPath, firstN, permdrift.Result{Widened: []permdrift.Change{widen}}); len(got.Narrowed) != 0 {
+		t.Errorf("opposite direction: narrowings = %+v, want zero", got.Narrowed)
+	}
+	if got := intersectDrift(sf, driftWFPath, first, permdrift.Result{Unevaluable: permdrift.ReasonFetchFailed}); got.Unevaluable != permdrift.ReasonFetchFailed {
+		t.Errorf("unevaluable second = %+v, want it to fail the pair closed", got)
+	}
+}
+
+// TestPermissionDrift_RenameSource (item 3, server half) drives the REAL
+// githubclient decode of previous_filename through the pairing into the
+// concern store.
+func TestPermissionDrift_RenameSource(t *testing.T) {
+	const src, dst = "infra/specs/a.yaml", "docs/a.yaml"
+	ext := "version: 1\nsurfaces:\n  - id: infra-specs\n    kind: fishhawk_spec_forbidden_paths\n    paths: [\"infra/specs/*.yaml\"]\n"
+
+	// COUNTERFACTUAL (the PreviousPath pair addition mutated out): the
+	// destination matches no surface and the source surface is glob-only, so
+	// the exact-path probe skips it → no infra-specs row → RED.
+	t.Run("rename out of a glob surface is evaluated at the source", func(t *testing.T) {
+		f := newDriftFixture(t)
+		f.gh.put(driftBase, permdrift.RepoSurfacesPath, ext)
+		f.gh.put(driftHead, permdrift.RepoSurfacesPath, ext)
+		f.gh.put(driftBase, src, driftSpec(`[".github/workflows/**"]`))
+		f.gh.put(driftHead, dst, driftSpec(`[".github/workflows/**"]`))
+		f.gh.changed = []string{dst}
+		f.gh.renamedFrom = map[string]string{dst: src}
+		f.run(f.req(permissionDriftTriggerPROpened))
+		var found bool
+		for _, r := range f.rows(t) {
+			found = found || strings.HasPrefix(r.CheckKey, "permission_drift|infra-specs|"+src+"|")
+		}
+		if !found {
+			t.Fatalf("rows = %+v, want the source's forbidden_paths widening on infra-specs", f.rows(t))
+		}
+		if got := f.unevaluable(t)["gha-workflow-permissions"]; got != "" {
+			t.Errorf("a named rename source raised %q on a glob surface, want nothing", got)
+		}
+	})
+	// COUNTERFACTUAL (the rename_source_unknown raise mutated out): the listed
+	// destination matches no surface and the exact-path probes find nothing,
+	// so zero rows exist → RED.
+	t.Run("rename without a source raises rename_source_unknown per glob surface", func(t *testing.T) {
+		f := newDriftFixture(t)
+		f.gh.put(driftBase, permdrift.RepoSurfacesPath, ext)
+		f.gh.put(driftHead, permdrift.RepoSurfacesPath, ext)
+		f.gh.changed = []string{dst}
+		f.gh.renamed = true
+		f.run(f.req(permissionDriftTriggerPROpened))
+		rows := f.rows(t)
+		for _, id := range []string{"gha-workflow-permissions", "infra-specs"} {
+			if rowWithKey(rows, permdrift.UnevaluableKey(id, dst, driftHead)) == nil {
+				t.Errorf("rows = %+v, want a rename_source_unknown row on %s", rows, id)
+			}
+			if got := f.unevaluable(t)[id]; got != permdrift.ReasonRenameSourceUnknown {
+				t.Errorf("%s reason = %q, want rename_source_unknown", id, got)
+			}
+		}
+		if len(rows) != 2 {
+			t.Errorf("rows = %d, want exactly one per glob surface (exact-path surfaces are probed)", len(rows))
+		}
+	})
+}
+
+// TestPermissionDrift_UnevaluablePerHead (item 5, approval condition 1): an
+// unevaluable key carries the resolved head commit, so a waived row suppresses
+// a repeat at the same commit but never a result at a new one, and an
+// unresolved head is suppressed by an OPEN row only.
+func TestPermissionDrift_UnevaluablePerHead(t *testing.T) {
+	waiveAll := func(f *driftFixture) {
+		f.cr.mu.Lock()
+		defer f.cr.mu.Unlock()
+		for _, r := range f.cr.rows {
+			r.State = concern.StateWaived
+		}
+	}
+
+	// COUNTERFACTUAL (the head dropped from UnevaluableKey's key — the body
+	// mutated to ignore its head argument): head A's waived row then shares
+	// head B's key and suppresses it → rows = 1 → RED on "want 2".
+	t.Run("push trigger: waived at head A does not suppress head B", func(t *testing.T) {
+		f := newDriftFixture(t)
+		f.workflowChange(wfBase, wfWidened)
+		const headB = "head2222"
+		f.gh.put(headB, driftWFPath, wfWidened)
+		f.gh.contentStatus[driftHead+"|"+driftWFPath] = http.StatusInternalServerError
+		f.gh.contentStatus[headB+"|"+driftWFPath] = http.StatusInternalServerError
+		f.run(f.req(permissionDriftTriggerPROpened))
+		if n := len(f.rows(t)); n != 1 {
+			t.Fatalf("rows after head A = %d, want 1", n)
+		}
+		waiveAll(f)
+		f.run(f.req(permissionDriftTriggerFixupPushed))
+		if n := len(f.rows(t)); n != 1 {
+			t.Fatalf("rows after a repeat at head A = %d, want 1 (waived at the same head suppresses)", n)
+		}
+		r := f.req(permissionDriftTriggerFixupPushed)
+		r.Head = headB
+		f.run(r)
+		rows := f.rows(t)
+		if len(rows) != 2 || rowWithKey(rows, permdrift.UnevaluableKey("gha-workflow-permissions", driftWFPath, headB)) == nil {
+			t.Fatalf("rows after head B = %+v, want 2 with a head-B row", rows)
+		}
+	})
+
+	// Approval condition 1(a). COUNTERFACTUAL (permissionDriftKeyHead mutated
+	// to return req.Head for the consolidated trigger — keying on the BRANCH
+	// name): both checks name the same branch, so commit A's waived row
+	// suppresses commit B's → rows = 1 → RED on "want 2".
+	t.Run("consolidated trigger: waived at commit A does not suppress commit B", func(t *testing.T) {
+		f := newDriftFixture(t)
+		const branch = "fishhawk/run-x-consolidated"
+		f.gh.changed = []string{driftWFPath}
+		f.gh.put(driftBase, driftWFPath, wfBase)
+		f.gh.contentStatus[branch+"|"+driftWFPath] = http.StatusInternalServerError
+		req := permissionDriftRequest{RunID: f.runRow.ID, StageID: f.stage.ID, Base: driftBase, Head: branch, Trigger: permissionDriftTriggerConsolidated}
+		f.gh.headSHA = "aaaa1111"
+		f.run(req)
+		rows := f.rows(t)
+		if len(rows) != 1 || rows[0].CheckKey != permdrift.UnevaluableKey("gha-workflow-permissions", driftWFPath, "aaaa1111") {
+			t.Fatalf("rows after commit A = %+v, want one row keyed by commit A", rows)
+		}
+		waiveAll(f)
+		f.run(req)
+		if n := len(f.rows(t)); n != 1 {
+			t.Fatalf("rows after a repeat at commit A = %d, want 1", n)
+		}
+		f.gh.headSHA = "bbbb2222"
+		f.run(req)
+		if rows := f.rows(t); len(rows) != 2 || rowWithKey(rows, permdrift.UnevaluableKey("gha-workflow-permissions", driftWFPath, "bbbb2222")) == nil {
+			t.Fatalf("rows after commit B = %+v, want 2 with a commit-B row", rows)
+		}
+	})
+
+	// The consolidated compare failed, so its head commit is resolved from the
+	// newest integration_commit_recorded merge_sha. COUNTERFACTUAL (the ledger
+	// fallback in permissionDriftKeyHead mutated out): the key carries "" and
+	// the assertion on the merge-sha key goes RED.
+	t.Run("consolidated trigger: compare failure keys by the integration ledger", func(t *testing.T) {
+		f := newDriftFixture(t)
+		const branch = "fishhawk/run-x-consolidated"
+		f.gh.compareStatus = http.StatusInternalServerError
+		seed := func(seq int64, sha string) {
+			rid := f.runRow.ID
+			payload, _ := json.Marshal(map[string]string{"merge_sha": sha})
+			f.au.mu.Lock()
+			f.au.seeded = append(f.au.seeded, &audit.Entry{RunID: &rid, Sequence: seq, Category: lineageIntegrationCommitCategory, Payload: payload})
+			f.au.mu.Unlock()
+		}
+		seed(1, "merge1111")
+		seed(2, "merge2222")
+		req := permissionDriftRequest{RunID: f.runRow.ID, StageID: f.stage.ID, Base: "main", Head: branch, Trigger: permissionDriftTriggerConsolidated}
+		f.run(req)
+		if rows := f.rows(t); len(rows) != 1 || rows[0].CheckKey != permdrift.UnevaluableKey(permissionDriftAllSurfaces.ID, "main.."+branch, "merge2222") {
+			t.Fatalf("rows = %+v, want one compare_failed row keyed by the newest merge sha", rows)
+		}
+	})
+
+	// Approval condition 1(b). COUNTERFACTUAL (raisePermissionDrift's
+	// `if u.head == "" { suppress = open }` mutated out): the waived row then
+	// suppresses the repeat → rows = 1 → RED on "want 2". The open-row arm is
+	// the control that an OPEN row still suppresses an unresolved head.
+	t.Run("empty head: a waived prior row does not suppress", func(t *testing.T) {
+		f := newDriftFixture(t)
+		r := f.req(permissionDriftTriggerPROpened)
+		r.Head = ""
+		f.run(r)
+		f.run(r)
+		if n := len(f.rows(t)); n != 1 {
+			t.Fatalf("rows after two checks with an OPEN row = %d, want 1 (an open row suppresses)", n)
+		}
+		waiveAll(f)
+		f.run(r)
+		if n := len(f.rows(t)); n != 2 {
+			t.Fatalf("rows after a waive + recheck = %d, want 2 (a waived row never suppresses an unresolved head)", n)
+		}
+	})
+	t.Run("unresolvable consolidated head: a waived prior row does not suppress", func(t *testing.T) {
+		f := newDriftFixture(t)
+		f.gh.compareStatus = http.StatusInternalServerError
+		req := permissionDriftRequest{RunID: f.runRow.ID, StageID: f.stage.ID, Base: "main", Head: "fishhawk/run-x-consolidated", Trigger: permissionDriftTriggerConsolidated}
+		f.run(req)
+		rows := f.rows(t)
+		if len(rows) != 1 || rows[0].CheckKey != permdrift.UnevaluableKey(permissionDriftAllSurfaces.ID, "main..fishhawk/run-x-consolidated", "") {
+			t.Fatalf("rows = %+v, want one row keyed by the unresolved head", rows)
+		}
+		waiveAll(f)
+		f.run(req)
+		if n := len(f.rows(t)); n != 2 {
+			t.Fatalf("rows after a waive + recheck = %d, want 2", n)
+		}
+	})
+}
+
+// TestPermissionDrift_PayloadAndNoteAreSanitized (item 10, approval
+// conditions 3 and 4): a forbidden_paths glob is a bracketed key value the
+// extractors do not escape, so a spec can put a newline, a bidi override and
+// 10 KB into a widening key.
+//
+// COUNTERFACTUAL (the permdrift.Display calls on the widening's payload fields
+// mutated out): the payload key carries the newline and is unbounded → RED.
+// COUNTERFACTUAL (escapeKeyField's control-rune clause mutated out): check_key
+// carries the newline → RED.
+func TestPermissionDrift_PayloadAndNoteAreSanitized(t *testing.T) {
+	f := newDriftFixture(t)
+	evil := "\"x\\n## injected\\u202e\"" // YAML double-quoted escapes: a newline and a bidi override
+	long := `"` + strings.Repeat("y", 10*1024) + `"`
+	f.gh.put(driftBase, driftSpecRef, driftSpec(`[`+evil+`, `+long+`]`))
+	f.gh.put(driftHead, driftSpecRef, driftSpec(`["docs/**"]`))
+	f.gh.changed = []string{driftSpecRef}
+	f.run(f.req(permissionDriftTriggerPROpened))
+
+	p := f.detected(t)
+	if len(p) != 1 || len(p[0].Widenings) < 2 {
+		t.Fatalf("detected = %+v, want the two forbidden_paths widenings", p)
+	}
+	var sawNewlineKey bool
+	for _, w := range p[0].Widenings {
+		for _, field := range []string{w.Path, w.Key, w.Before, w.After} {
+			if strings.ContainsFunc(field, unicode.IsControl) || strings.ContainsRune(field, '\u202e') || len(field) > 256 {
+				t.Errorf("payload field %q is not control-free and bounded", field)
+			}
+		}
+		if strings.ContainsFunc(w.CheckKey, unicode.IsControl) || strings.ContainsRune(w.CheckKey, '\u202e') || len(w.CheckKey) > 4*300 {
+			t.Errorf("check_key %q carries a control rune or is unbounded", w.CheckKey)
+		}
+		sawNewlineKey = sawNewlineKey || strings.Contains(w.CheckKey, "%0A")
+	}
+	if !sawNewlineKey {
+		t.Errorf("no check_key carries the escaped newline: %+v", p[0].Widenings)
+	}
+	for _, r := range f.rows(t) {
+		if strings.ContainsFunc(r.Note, unicode.IsControl) || strings.ContainsRune(r.Note, '\u202e') || len(r.Note) > 2000 {
+			t.Errorf("note carries a control rune or is unbounded (%d bytes)", len(r.Note))
+		}
+		if strings.ContainsFunc(r.CheckKey, unicode.IsControl) {
+			t.Errorf("stored check_key %q carries a control rune", r.CheckKey)
+		}
+	}
+}
+
+// TestPermissionDrift_ConsolidatedReviewNoReviewers (item 7): the drift hook
+// in DispatchConsolidatedReview runs for a mergeable parent even when no
+// reviewer is declared or wired (no PlanReviewers/PlanReviewer in the
+// fixture) — no reviewer-dependent guard precedes it.
+//
+// COUNTERFACTUAL (the runPermissionDriftCheck call in
+// DispatchConsolidatedReview temporarily removed, then restored with no diff):
+// no reviewer runs, so the drift hook is the only path that can mint a row →
+// zero rows → RED.
+func TestPermissionDrift_ConsolidatedReviewNoReviewers(t *testing.T) {
+	f := newDriftFixture(t)
+	f.workflowChange(wfBase, wfWidened)
+	// specImplementNoReviewers (diff_secrets_test.go): no implement reviewers.
+	parent, implStage := seedConsolidatedParent(t, f.rr, newFakeArtifactRepo(), specImplementNoReviewers)
+	parent.Repo = "acme/widgets"
+	if f.s.cfg.PlanReviewers != nil || f.s.cfg.PlanReviewer != nil {
+		t.Fatal("fixture wires a reviewer; this arm needs none")
+	}
+
+	f.s.DispatchConsolidatedReview(context.Background(), parent.ID, driftBase, driftHead)
+	f.s.waitBackgroundReviews()
+
+	rows := serverCheckRows(t, f.cr.fakeConcernRepo, parent.ID)
+	if len(rows) != 1 || rows[0].CheckKey != wfWideningKey || rows[0].StageID != implStage.ID {
+		t.Fatalf("rows = %+v, want one %q row on the parent implement stage", rows, wfWideningKey)
+	}
 }

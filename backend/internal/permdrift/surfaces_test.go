@@ -4,6 +4,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/bmatcuk/doublestar/v4"
 )
@@ -460,6 +461,7 @@ func TestMergeSurfaces(t *testing.T) {
 // collide and the test goes RED.
 func TestCheckKey_Injective(t *testing.T) {
 	type in struct{ surface, path, key, after string }
+	long := strings.Repeat("x", 1024)
 	inputs := []in{
 		{"s", "p", "k|x", "a"},
 		{"s", "p", "k", "x|a"},
@@ -468,6 +470,22 @@ func TestCheckKey_Injective(t *testing.T) {
 		{"s", "p", "k%x", "a"},
 		{"s", "p", "k%25x", "a"},
 		{"s|p", "k", "x", "a"},
+		// Control runes (approval condition 3): a raw newline and its
+		// already-escaped spelling must not collide.
+		{"s", "p", "k\nx", "a"},
+		{"s", "p", "k%0Ax", "a"},
+		// A file-derived dotted segment carrying '.' (keySegment-escaped by
+		// the extractors) cannot forge a segment boundary: job "a.b" + scope
+		// "c" vs job "a" + scope "b.c".
+		{"s", "p", "jobs." + keySegment("a.b") + ".c", "a"},
+		{"s", "p", "jobs.a." + keySegment("b.c"), "a"},
+		// Overlong fields are digested: two 1 KB fields differing in the last
+		// byte stay distinct, and a raw field spelled like a digest cannot
+		// collide with one.
+		{"s", "p", long + "a", "a"},
+		{"s", "p", long + "b", "a"},
+		{"s", "p", "%Habc", "a"},
+		{"s", "p", keyFieldDigestPrefix + strings.Repeat("0", 64), "a"},
 	}
 	seen := map[string]in{}
 	for _, i := range inputs {
@@ -480,12 +498,74 @@ func TestCheckKey_Injective(t *testing.T) {
 			t.Errorf("CheckKey %q does not have exactly 5 fields", k)
 		}
 	}
-	u := UnevaluableKey("s", "p")
-	if u != "permission_drift|s|p|unevaluable" || seen[u] != (in{}) {
+	u := UnevaluableKey("s", "p", "abc123")
+	if u != "permission_drift|s|p|unevaluable@abc123" || seen[u] != (in{}) {
 		t.Errorf("UnevaluableKey = %q", u)
 	}
-	if UnevaluableKey("s|p", "x") == UnevaluableKey("s", "p|x") {
+	if UnevaluableKey("s|p", "x", "h") == UnevaluableKey("s", "p|x", "h") {
 		t.Error("UnevaluableKey is not injective")
+	}
+	// COUNTERFACTUAL (drop the head from UnevaluableKey's body): two heads then
+	// share one key, so a waived row at head A would suppress head B → RED.
+	if UnevaluableKey("s", "p", "aaaa") == UnevaluableKey("s", "p", "bbbb") {
+		t.Error("UnevaluableKey does not distinguish heads")
+	}
+	// A four-field unevaluable key never equals a five-field CheckKey, even
+	// when the key field is spelled like the unevaluable marker.
+	if UnevaluableKey("s", "p", "h") == CheckKey("s", "p", "unevaluable@h", "") {
+		t.Error("UnevaluableKey collides with a CheckKey")
+	}
+}
+
+// TestCheckKey_ControlFreeAndBounded (approval condition 3, item 10).
+//
+// COUNTERFACTUAL (escapeKeyField's control-rune clause mutated out): the
+// newline, the bidi override and U+2028 survive into the key → RED.
+// COUNTERFACTUAL (the digest branch mutated out): a 10 KB after value yields
+// a key far over the bound → RED.
+func TestCheckKey_ControlFreeAndBounded(t *testing.T) {
+	for _, field := range []string{"a\nb", "a\u202eb", "a\u2028b", "a\u200bb", "a\x00b", "a\xffb"} {
+		k := CheckKey("s", "p", field, field)
+		for _, r := range k {
+			if isDisplayHostile(r) || r == utf8.RuneError {
+				t.Errorf("CheckKey(%q) = %q carries a control/format rune %U", field, k, r)
+			}
+		}
+		if u := UnevaluableKey("s", field, field); strings.ContainsFunc(u, isDisplayHostile) {
+			t.Errorf("UnevaluableKey(%q) = %q carries a control/format rune", field, u)
+		}
+	}
+	k := CheckKey("s", "p", "k", strings.Repeat("v", 10*1024))
+	if len(k) > len(CheckName)+4*(maxKeyFieldBytes+1) {
+		t.Errorf("CheckKey length = %d, want bounded", len(k))
+	}
+	if last := k[strings.LastIndex(k, "|")+1:]; !strings.HasPrefix(last, keyFieldDigestPrefix) || len(last) != len(keyFieldDigestPrefix)+64 {
+		t.Errorf("CheckKey overlong field not digested: %q", last)
+	}
+}
+
+// TestDisplay (approval condition 4, item 10).
+//
+// COUNTERFACTUAL (Display's hostile-rune replacement mutated out): the
+// newline, bidi override, zero-width space and U+2028/U+2029 survive → RED.
+// COUNTERFACTUAL (the length cap mutated out): a 10 KB value renders whole →
+// RED.
+func TestDisplay(t *testing.T) {
+	for _, in := range []string{"a\nb", "a\rb", "a\u202eb", "a\u200bb", "a\ufeffb", "a\u2028b", "a\u2029b", "a\xffb"} {
+		out := Display(in)
+		if strings.ContainsFunc(out, isDisplayHostile) || !utf8.ValidString(out) {
+			t.Errorf("Display(%q) = %q, want no control/format rune and valid UTF-8", in, out)
+		}
+		if !strings.HasPrefix(out, "a") || !strings.HasSuffix(out, "b") {
+			t.Errorf("Display(%q) = %q, want the printable runes kept", in, out)
+		}
+	}
+	if got := Display("jobs.build.contents"); got != "jobs.build.contents" {
+		t.Errorf("Display(plain) = %q, want unchanged", got)
+	}
+	out := Display(strings.Repeat("é", 10*1024))
+	if len(out) > maxDisplayBytes+len(displayTruncationMarker) || !strings.HasSuffix(out, displayTruncationMarker) || !utf8.ValidString(out) {
+		t.Errorf("Display(10 KB) = %d bytes, want <= %d ending in the marker on a rune boundary", len(out), maxDisplayBytes+len(displayTruncationMarker))
 	}
 }
 
@@ -508,5 +588,20 @@ func TestNote(t *testing.T) {
 	}
 	if u := NoteUnevaluable(s, "", "other_reason"); !strings.Contains(u, "other_reason") || strings.Contains(u, " in ") {
 		t.Errorf("NoteUnevaluable(unknown reason, no path) = %s", u)
+	}
+	// Injection (item 10, approval condition 4). COUNTERFACTUAL (the Display
+	// calls in Note mutated out): the key's newline + markdown heading, the
+	// bidi override and the U+2028 survive into the note, and the 10 KB after
+	// value makes it unbounded → RED.
+	evil := Change{Key: "jobs.build.contents\n## injected\u202e\u200b", Before: "read\u2028x", After: strings.Repeat("w", 10*1024), Direction: Widened}
+	n = Note(s, "ci.yml\u2029", evil)
+	if strings.ContainsFunc(n, isDisplayHostile) {
+		t.Errorf("Note carries a control/format rune: %q", n)
+	}
+	if len(n) > 2000 {
+		t.Errorf("Note length = %d, want bounded", len(n))
+	}
+	if u := NoteUnevaluable(s, "p\n## injected\u202e", ReasonFetchFailed); strings.ContainsFunc(u, isDisplayHostile) {
+		t.Errorf("NoteUnevaluable carries a control/format rune: %q", u)
 	}
 }

@@ -2,11 +2,15 @@ package permdrift
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"regexp"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/bmatcuk/doublestar/v4"
 	"gopkg.in/yaml.v3"
@@ -172,6 +176,17 @@ const (
 	ReasonFetchFailed       = "fetch_failed"
 	ReasonCompareFailed     = "compare_failed"
 	ReasonCompareTruncated  = "compare_truncated"
+	// ReasonCommitMissing: the check was asked to compare without a base or
+	// head commit, so nothing could be compared.
+	ReasonCommitMissing = "commit_missing"
+	// ReasonRenameSourceUnknown: the compare reported a rename without naming
+	// its source path, so a glob surface the source may have matched cannot
+	// be evaluated.
+	ReasonRenameSourceUnknown = "rename_source_unknown"
+	// ReasonExtensionParseError: the repository's surface extension
+	// (RepoSurfacesPath) does not parse at the base commit, so only the
+	// product surfaces were evaluated.
+	ReasonExtensionParseError = "extension_parse_error"
 )
 
 // Result is one surface file's evaluation.
@@ -480,30 +495,105 @@ func MergeSurfaces(product, accepted []Surface) []Surface {
 // CheckName is the check-key namespace of every permission-drift concern.
 const CheckName = "permission_drift"
 
-// escapeKeyField makes a check-key field '|'-free: '%' -> "%25" first, then
-// '|' -> "%7C", so the encoding is injective and the field separator never
-// appears inside a field.
+// maxKeyFieldBytes bounds one escaped check-key field; a longer field is
+// replaced by its digest (escapeKeyField).
+const maxKeyFieldBytes = 256
+
+// keyFieldDigestPrefix marks a digested check-key field. An escaped field
+// never contains a bare '%' followed by 'H' (every escape is '%' plus two
+// UPPERCASE hex digits), so a digest can never equal an escaped field.
+const keyFieldDigestPrefix = "%H"
+
+// escapeKeyField makes a check-key field '|'-free and control-free: '%' ->
+// "%25" FIRST, then '|' and every control or format rune (unicode Cc, Cf, Zl,
+// Zp — newlines, bidi overrides, zero-width characters, U+2028/U+2029) and
+// every invalid UTF-8 byte are percent-encoded byte by byte, so the encoding
+// is injective, the field separator never appears inside a field and a
+// file-derived field can never carry a control rune into the stored key. An
+// escaped field longer than maxKeyFieldBytes is replaced by "%H" + the hex
+// SHA-256 of the RAW field (bounded, and still injective up to SHA-256
+// collisions). A '.' in a FILE-DERIVED dotted key segment is escaped earlier,
+// by the extractors' keySegment, so a file cannot forge a segment boundary or
+// mint its own wildcard; the field-level '.' carries no meaning in a check key
+// (its separator is '|') and is left as written.
 func escapeKeyField(s string) string {
-	return strings.ReplaceAll(strings.ReplaceAll(s, "%", "%25"), "|", "%7C")
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r == '%' || r == '|' || (r == utf8.RuneError && size == 1) || isDisplayHostile(r) {
+			for j := i; j < i+size; j++ {
+				fmt.Fprintf(&b, "%%%02X", s[j])
+			}
+		} else {
+			b.WriteString(s[i : i+size])
+		}
+		i += size
+	}
+	if b.Len() > maxKeyFieldBytes {
+		sum := sha256.Sum256([]byte(s))
+		return keyFieldDigestPrefix + hex.EncodeToString(sum[:])
+	}
+	return b.String()
+}
+
+// isDisplayHostile reports whether r is a control or format rune (unicode
+// Cc, Cf, Zl, Zp): a newline, a bidi override, a zero-width character, a
+// line or paragraph separator.
+func isDisplayHostile(r rune) bool {
+	return unicode.In(r, unicode.Cc, unicode.Cf, unicode.Zl, unicode.Zp)
 }
 
 // CheckKey is the de-duplication key the server stores on a widening's
 // concern row: `permission_drift|<surface>|<path>|<key>|<after>`, every
-// field escaped (escapeKeyField) so the key is injective. The after value is
-// part of the key so a LATER move of the same key to a different value
-// raises again, while a repeat of the same widening does not.
+// field escaped (escapeKeyField) so the key is injective, control-free and
+// bounded. The after value is part of the key so a LATER move of the same key
+// to a different value raises again, while a repeat of the same widening does
+// not.
 func CheckKey(surfaceID, path, key, after string) string {
 	return strings.Join([]string{CheckName, escapeKeyField(surfaceID), escapeKeyField(path),
 		escapeKeyField(key), escapeKeyField(after)}, "|")
 }
 
 // UnevaluableKey is the de-duplication key of an unevaluable concern:
-// `permission_drift|<surface>|<path>|unevaluable` — four fields, so it never
-// equals a five-field CheckKey. The reason is deliberately not part of it:
-// one surface file that cannot be evaluated is one concern, whichever way it
-// failed.
-func UnevaluableKey(surfaceID, path string) string {
-	return strings.Join([]string{CheckName, escapeKeyField(surfaceID), escapeKeyField(path), "unevaluable"}, "|")
+// `permission_drift|<surface>|<path>|unevaluable@<head>` — four fields, so it
+// never equals a five-field CheckKey. The head commit is part of it so a
+// waived or deferred unevaluable row suppresses only a repeat at the SAME
+// head, never a result at a new one; the server passes "" when it cannot
+// resolve the head to a commit SHA, and then only an OPEN row suppresses the
+// key. The reason is deliberately not part of it: one surface file that
+// cannot be evaluated at one head is one concern, whichever way it failed.
+func UnevaluableKey(surfaceID, path, head string) string {
+	return strings.Join([]string{CheckName, escapeKeyField(surfaceID), escapeKeyField(path),
+		"unevaluable@" + escapeKeyField(head)}, "|")
+}
+
+// maxDisplayBytes bounds one file-derived value rendered by Display.
+const maxDisplayBytes = 200
+
+// displayTruncationMarker ends a Display value cut at maxDisplayBytes.
+const displayTruncationMarker = "…[truncated]"
+
+// Display renders a FILE-DERIVED value (a path, a key, a before/after value,
+// an extension id) for a concern note or an audit payload: every control or
+// format rune (unicode Cc, Cf, Zl, Zp) and every invalid UTF-8 byte is
+// replaced by U+FFFD, so a value cannot inject a line break, a markdown
+// heading or a bidi override, and the result is cut at maxDisplayBytes on a
+// rune boundary with displayTruncationMarker.
+func Display(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if (r == utf8.RuneError && size == 1) || isDisplayHostile(r) {
+			r = utf8.RuneError
+		}
+		if b.Len()+utf8.RuneLen(r) > maxDisplayBytes {
+			b.WriteString(displayTruncationMarker)
+			return b.String()
+		}
+		b.WriteRune(r)
+		i += size
+	}
+	return b.String()
 }
 
 // noteHumanOnly closes every permission-drift note.
@@ -511,10 +601,10 @@ const noteHumanOnly = "This concern was raised by the server's deterministic per
 	"Only a human can waive it, with a reason; agents and delegated actions cannot waive or defer it."
 
 // Note renders a widening's concern note: the surface, the path, the key and
-// its before/after values.
+// its before/after values, each through Display (control-free, bounded).
 func Note(s Surface, path string, c Change) string {
 	return fmt.Sprintf("Permission-drift check: this change widens the %s surface (%s) in %s: %s moved from %s to %s. ",
-		s.ID, s.Description, path, c.Key, c.Before, c.After) +
+		Display(s.ID), Display(s.Description), Display(path), Display(c.Key), Display(c.Before), Display(c.After)) +
 		"Revert the widening, or have a human confirm it is intended. " + noteHumanOnly
 }
 
@@ -525,18 +615,24 @@ var unevaluableWhy = map[string]string{
 	ReasonFetchFailed:       "the file could not be read from the forge",
 	ReasonCompareFailed:     "the forge compare listing the changed files failed",
 	ReasonCompareTruncated:  "the forge compare listing the changed files was truncated",
+	ReasonCommitMissing:     "the check was given no base or head commit to compare",
+	ReasonRenameSourceUnknown: "the forge compare reported a rename without naming its source path, " +
+		"so a file this surface governs may have been moved away unseen",
+	ReasonExtensionParseError: "the repository's surface extension does not parse at the base commit, " +
+		"so only the product surfaces were evaluated and any surface it declares went unchecked",
 }
 
 // NoteUnevaluable renders an unevaluable concern's note. It names the reason
-// CLASS only — never file bytes — and says the check failed closed.
+// CLASS only — never file bytes — and says the check failed closed. The
+// surface id and path go through Display.
 func NoteUnevaluable(s Surface, path, reason string) string {
 	why, ok := unevaluableWhy[reason]
 	if !ok {
-		why = "the check could not evaluate it (" + reason + ")"
+		why = "the check could not evaluate it (" + Display(reason) + ")"
 	}
-	where := s.ID
+	where := Display(s.ID)
 	if path != "" {
-		where += " in " + path
+		where += " in " + Display(path)
 	}
 	return "Permission-drift check: the " + where + " surface could not be evaluated: " + why +
 		". The check fails closed, so a human must confirm this change does not widen a permission. " + noteHumanOnly
