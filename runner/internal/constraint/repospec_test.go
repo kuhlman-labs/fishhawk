@@ -66,23 +66,78 @@ func stageForbiddenPaths(t *testing.T, wf, stageID string) []string {
 // backend/internal/policy (repospec_test.go); both read the shared path table in
 // testdata/policy/agent-instruction-paths.json.
 func TestRepoSpecForbidsAgentInstructionPaths(t *testing.T) {
-	f := loadAgentPathFixture(t)
-	cases := agentPathCases(f)
-	for _, tc := range cases {
-		t.Run(tc.wf, func(t *testing.T) {
-			c := Constraints{ForbiddenPaths: stageForbiddenPaths(t, tc.wf, tc.stage)}
-			for _, p := range tc.mustForbid {
+	for _, tc := range loadAgentPathCases(t) {
+		t.Run(tc.Workflow, func(t *testing.T) {
+			c := Constraints{ForbiddenPaths: stageForbiddenPaths(t, tc.Workflow, tc.Stage)}
+			for _, p := range tc.MustForbid {
 				if !hasForbiddenViolation(Evaluate(diff(p), c)) {
-					t.Errorf("%s.%s: %q is NOT forbidden (agent-instruction path admitted)", tc.wf, tc.stage, p)
+					t.Errorf("%s.%s: %q is NOT forbidden (agent-instruction path admitted)", tc.Workflow, tc.Stage, p)
 				}
 			}
-			for _, p := range tc.mustNotMatch {
+			for _, p := range tc.MustStayWritable {
 				if v := Evaluate(diff(p), c); len(v) != 0 {
-					t.Errorf("%s.%s: %q must stay writable but is forbidden: %v", tc.wf, tc.stage, p, v)
+					t.Errorf("%s.%s: %q must stay writable but is forbidden: %v", tc.Workflow, tc.Stage, p, v)
 				}
 			}
 		})
 	}
+}
+
+// agentPathCase is one workflow stage's expectation, expanded from the shared
+// fixture testdata/policy/agent-instruction-paths.json.
+type agentPathCase struct {
+	Workflow, Stage  string
+	MustForbid       []string
+	MustStayWritable []string
+}
+
+// loadAgentPathCases reads the shared fixture (ONE path table and case list
+// for this test and its twin in the other module) and expands each case's
+// class names into paths. An unknown or empty class fails the test, so a
+// typo cannot make a case vacuous.
+func loadAgentPathCases(t *testing.T) []agentPathCase {
+	t.Helper()
+	p := filepath.Join("..", "..", "..", "testdata", "policy", "agent-instruction-paths.json")
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatalf("read %s: %v", p, err)
+	}
+	var f struct {
+		Classes map[string][]string `json:"classes"`
+		Cases   []struct {
+			Workflow         string   `json:"workflow"`
+			Stage            string   `json:"stage"`
+			MustForbid       []string `json:"must_forbid"`
+			MustStayWritable []string `json:"must_stay_writable"`
+		} `json:"cases"`
+	}
+	if err := json.Unmarshal(raw, &f); err != nil {
+		t.Fatalf("parse %s: %v", p, err)
+	}
+	expand := func(classes []string) []string {
+		var out []string
+		for _, c := range classes {
+			paths := f.Classes[c]
+			if len(paths) == 0 {
+				t.Fatalf("%s: class %q is unknown or empty", p, c)
+			}
+			out = append(out, paths...)
+		}
+		return out
+	}
+	if len(f.Cases) == 0 {
+		t.Fatalf("%s: no cases", p)
+	}
+	cases := make([]agentPathCase, 0, len(f.Cases))
+	for _, c := range f.Cases {
+		cases = append(cases, agentPathCase{
+			Workflow:         c.Workflow,
+			Stage:            c.Stage,
+			MustForbid:       expand(c.MustForbid),
+			MustStayWritable: expand(c.MustStayWritable),
+		})
+	}
+	return cases
 }
 
 // hasForbiddenViolation reports whether vs carries a forbidden_paths hit, so
@@ -94,63 +149,4 @@ func hasForbiddenViolation(vs []Violation) bool {
 		}
 	}
 	return false
-}
-
-// agentPathFixture is testdata/policy/agent-instruction-paths.json, the ONE
-// path table shared with this test's twin in the other module.
-type agentPathFixture struct {
-	ConfigDirPaths         []string `json:"config_dir_paths"`
-	InstructionFiles       []string `json:"instruction_files"`
-	RootAgents             string   `json:"root_agents"`
-	RootAgentsCaseVariants []string `json:"root_agents_case_variants"`
-	GuardFiles             []string `json:"guard_files"`
-	Ordinary               []string `json:"ordinary"`
-}
-
-func loadAgentPathFixture(t *testing.T) agentPathFixture {
-	t.Helper()
-	p := filepath.Join("..", "..", "..", "testdata", "policy", "agent-instruction-paths.json")
-	raw, err := os.ReadFile(p)
-	if err != nil {
-		t.Fatalf("read %s: %v", p, err)
-	}
-	var f agentPathFixture
-	if err := json.Unmarshal(raw, &f); err != nil {
-		t.Fatalf("parse %s: %v", p, err)
-	}
-	if len(f.ConfigDirPaths) == 0 || len(f.InstructionFiles) == 0 || f.RootAgents == "" ||
-		len(f.RootAgentsCaseVariants) == 0 || len(f.GuardFiles) == 0 || len(f.Ordinary) == 0 {
-		t.Fatalf("%s: a path class is empty — the assertions would be vacuous", p)
-	}
-	return f
-}
-
-// agentPathCases composes the fixture's classes into each workflow's
-// must-forbid / must-stay-writable sets. routine_change's guard files are
-// excluded from must-forbid because its allowed_paths list (not
-// forbidden_paths) already keeps scripts/ out of reach.
-func agentPathCases(f agentPathFixture) []struct {
-	wf, stage    string
-	mustForbid   []string
-	mustNotMatch []string
-} {
-	cat := func(lists ...[]string) []string {
-		var out []string
-		for _, l := range lists {
-			out = append(out, l...)
-		}
-		return out
-	}
-	return []struct {
-		wf, stage    string
-		mustForbid   []string
-		mustNotMatch []string
-	}{
-		{"feature_change", "implement",
-			cat(f.ConfigDirPaths, f.InstructionFiles, f.RootAgentsCaseVariants, f.GuardFiles),
-			cat(f.Ordinary, []string{f.RootAgents})},
-		{"routine_change", "implement",
-			cat(f.ConfigDirPaths, f.InstructionFiles, f.RootAgentsCaseVariants, []string{f.RootAgents}),
-			f.Ordinary},
-	}
 }

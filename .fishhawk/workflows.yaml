@@ -582,6 +582,11 @@ workflows:
             - "**/[aA][gG][eE][nN][tT][sS].[oO][vV][eE][rR][rR][iI][dD][eE].[mM][dD]"
             - "**/[cC][lL][aA][uU][dD][eE].[mM][dD]"
             - "**/[cC][lL][aA][uU][dD][eE].[lL][oO][cC][aA][lL].[mM][dD]"
+            # The operator-only skill guard and its harness. allowed_paths above
+            # already excludes scripts/, but forbidding them here pins that
+            # independently of how the allow-list may later widen.
+            - "scripts/is-run-agent"
+            - "scripts/test-is-run-agent"
           required_outcomes:
             - ci_green
       # 2. Review — the gate, held by CI rather than a person.

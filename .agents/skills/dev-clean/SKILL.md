@@ -16,9 +16,7 @@ This skill stops services or deletes state, and its confirmation steps need a hu
 "$(git rev-parse --show-toplevel)/scripts/is-run-agent"
 ```
 
-- It prints `operator` and exits 0: continue.
-- It prints `run-agent: <reason>` and exits 10: you are an agent inside a Fishhawk run. Do nothing, and report that this skill is operator-only.
-- Anything else, e.g. exit 127 / `No such file or directory`: this checkout predates the guard, or you are outside the repository. **Stop** and tell the user. Don't treat a missing guard as permission. `scripts/is-run-agent` is the one shared definition of a run agent: it matches the runner's lineage, acceptance and conflict-resolution trees, plus `FISHHAWK_RUN_ID` (CI runners).
+Continue **only** if it prints `operator` and exits 0. On any other result, stop, do nothing, and report its output to the user. That includes `run-agent: …`, and a missing script, which means this checkout predates the guard. The contract lives in `scripts/README.md` § "`is-run-agent`".
 
 ## 0. Is anything live?
 

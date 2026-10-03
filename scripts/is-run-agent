@@ -17,11 +17,18 @@
 #      the physical path also covers a skill invoked from a subdirectory. Each
 #      shape is matched as one exact path component (not a substring), so an
 #      operator checkout merely NAMED like one is not misclassified:
-#        .../fishhawk-worktrees/run-<id>[/...]          lineage worktree
-#        .../fishhawk-acceptance-tree-<run>-<stage>[/...] acceptance tree
-#        .../fishhawk-conflict-<rand>/tree[/...]        conflict-resolution tree
+#        .../fishhawk-worktrees/run-<id>[/...]            lineage worktree
+#        .../fishhawk-acceptance-tree-<uuid>-<uuid>[/...] acceptance merge-candidate tree
+#        .../fishhawk-acceptance-<digits>[/...]          acceptance agent workdir (os.MkdirTemp)
+#        .../fishhawk-conflict-<rand>/tree[/...]          conflict-resolution tree
 #   2. FISHHAWK_RUN_ID is non-empty (CI-hosted runners only: GitLab CI,
 #      deploy triggers).
+#   3. FISHHAWK_FORGE_WRITES=deny (INTERIM). runner/internal/acceptenv injects
+#      it as a fixed value into every acceptance agent, so it still identifies
+#      one that has cd'd out of its trees. It means "forge writes disabled",
+#      not "run agent", so an operator who sets it for dev-mode testing is
+#      also refused (the printed reason says why). A dedicated runner-stamped
+#      marker on every agent spawn would replace the path list; see #3945.
 #
 # A new runner agent tree must be added below. The patterns are pinned by
 # scripts/test-is-run-agent, run inside `scripts/test verify`.
@@ -38,8 +45,13 @@ if matches '/fishhawk-worktrees/run-[^/]+(/|$)'; then
   echo "run-agent: run worktree ($phys)"
   exit 10
 fi
-if matches '/fishhawk-acceptance-tree-[^/]+(/|$)'; then
+uuid='[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
+if matches "/fishhawk-acceptance-tree-$uuid-$uuid(/|\$)"; then
   echo "run-agent: acceptance tree ($phys)"
+  exit 10
+fi
+if matches '/fishhawk-acceptance-[0-9]+(/|$)'; then
+  echo "run-agent: acceptance workdir ($phys)"
   exit 10
 fi
 if matches '/fishhawk-conflict-[^/]+/tree(/|$)'; then
@@ -49,6 +61,11 @@ fi
 
 if [ -n "${FISHHAWK_RUN_ID:-}" ]; then
   echo "run-agent: FISHHAWK_RUN_ID is set"
+  exit 10
+fi
+
+if [ "${FISHHAWK_FORGE_WRITES:-}" = "deny" ]; then
+  echo "run-agent: FISHHAWK_FORGE_WRITES=deny (acceptance agent marker; unset it if you are an operator testing dev mode)"
   exit 10
 fi
 
