@@ -64,3 +64,29 @@ func TestExtractManifest_Errors(t *testing.T) {
 		})
 	}
 }
+
+// TestExtractManifest_FileDerivedWildcard pins item 10's wildcard half on the
+// manifest: a permission literally named "*" is a FILE-DERIVED segment and
+// must not become a Grant wildcard that subsumes a sibling's widening.
+//
+// COUNTERFACTUAL: make keySegment return s unchanged (body mutation). The base
+// `default_permissions.*` key is then a Grant wildcard at admin rank, and
+// coveredBy suppresses the head-only `members: admin` grant, so the widening
+// vanishes and the Detect assertion goes RED (observed: `Detect =
+// {Widened:[] ...}, want widened [{Key:default_permissions.members ...}]`).
+func TestExtractManifest_FileDerivedWildcard(t *testing.T) {
+	base := `{"default_permissions": {"*": "admin"}}`
+	head := `{"default_permissions": {"*": "admin", "members": "admin"}}`
+	r := Detect(surfaceByID(t, "github-app-permissions-template"), side(base), side(head))
+	want := []Change{{Key: "default_permissions.members", Before: Absent, After: "admin", Direction: Widened}}
+	if r.Unevaluable != "" || !reflect.DeepEqual(r.Widened, want) {
+		t.Fatalf("Detect = %+v, want widened %+v", r, want)
+	}
+	g, err := ExtractManifest([]byte(`{"default_permissions": {"*": "write", "a.b": "read"}, "default_events": ["x.*"]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(keysOf(g), []string{"default_events.x%2E%2A", "default_permissions.%2A", "default_permissions.a%2Eb"}) {
+		t.Fatalf("keys = %v, want every file-derived name escaped to one segment", keysOf(g))
+	}
+}

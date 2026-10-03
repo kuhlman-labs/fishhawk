@@ -48,7 +48,10 @@ func ExtractManifest(content []byte) (Grants, error) {
 
 // AddManifestGrants records manifest permissions and events into out. It is
 // the one place the manifest key shape and level ranking live, shared by the
-// JSON extractor and the Go-source one.
+// JSON extractor and the Go-source one. Permission and event names are
+// FILE-DERIVED segments, escaped with keySegment: a permission literally
+// named "*" keys as `default_permissions.%2A`, an ordinary key, never a
+// wildcard that would subsume a sibling permission's widening.
 func AddManifestGrants(out Grants, permissions map[string]string, events []string) error {
 	for name, level := range permissions {
 		r, err := AppLevels.mustRank(ManifestPermissionPrefix+name, level)
@@ -58,10 +61,10 @@ func AddManifestGrants(out Grants, permissions map[string]string, events []strin
 		if r == 0 {
 			continue
 		}
-		out.Put(Entry{Key: ManifestPermissionPrefix + name, Value: level, Rank: r, Polarity: Grant})
+		out.Put(Entry{Key: ManifestPermissionPrefix + keySegment(name), Value: level, Rank: r, Polarity: Grant})
 	}
 	for _, ev := range events {
-		out.Put(Entry{Key: ManifestEventPrefix + ev, Value: Present, Rank: PresenceRank, Polarity: Grant})
+		out.Put(Entry{Key: ManifestEventPrefix + keySegment(ev), Value: Present, Rank: PresenceRank, Polarity: Grant})
 	}
 	return nil
 }

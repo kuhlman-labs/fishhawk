@@ -130,7 +130,9 @@ func TestExtractSpec(t *testing.T) {
 			specDoc("%PERMISSIONS%", "        egress:\n          target_hosts: [\"api.example.com\"]\n        permissions:\n          write: [\"src/**\"]\n          shell: restricted"), nil},
 		{"shell posture raised", ExtractSpecStagePermissions,
 			specDoc("%PERMISSIONS%", "        permissions:\n          network:\n            target_hosts: [\"api.example.com\"]\n          write: [\"src/**\"]\n          shell: unrestricted"),
-			[]Change{{Key: implKey + ".permissions.shell", Before: "restricted", After: "unrestricted", Direction: Widened}}},
+			// `unrestricted` limits nothing, so it emits no entry: the
+			// restriction vanishing is the widening.
+			[]Change{{Key: implKey + ".permissions.shell", Before: "restricted", After: Absent, Direction: Widened}}},
 		{"write glob added", ExtractSpecStagePermissions,
 			specDoc("%PERMISSIONS%", "        permissions:\n          network:\n            target_hosts: [\"api.example.com\"]\n          write: [\"src/**\", \"**\"]\n          shell: restricted"),
 			[]Change{{Key: implKey + ".permissions.write[**]", Before: Absent, After: Present, Direction: Widened}}},
@@ -313,5 +315,180 @@ func TestExtractSpec_Errors(t *testing.T) {
 		if g, err := ex(nil); err != nil || len(g) != 0 {
 			t.Errorf("absent spec = %+v, %v; want empty, nil", g, err)
 		}
+	}
+}
+
+// permsDoc renders the base spec with the implement stage's permissions block
+// replaced by block (one already-indented YAML fragment; "" drops it).
+func permsDoc(block string) string { return specDoc("%PERMISSIONS%", block) }
+
+// acceptanceStage is an acceptance stage appended after the implement stage,
+// declaring egress hosts (the runner's default-deny allow-list).
+func acceptanceStage(hosts string) string {
+	s := `      - id: acceptance
+        type: acceptance
+        executor:
+          agent: claude-code
+        inputs:
+          - artifact: plan
+            from_stage: plan
+          - artifact: pull_request
+            from_stage: implement`
+	if hosts != "" {
+		s += "\n        egress:\n          target_hosts: " + hosts
+	}
+	return s
+}
+
+// TestExtractSpecStagePermissions_AbsenceModel pins item 6: a stage
+// permission declaration is a RESTRICTION whose removal widens (absence is
+// the product's no-limit default), except an acceptance stage's egress,
+// whose absence is the runner's default-deny allow-list.
+//
+// COUNTERFACTUAL (Restriction entries): mutate the `.egress`, `.permissions.write`
+// and `.permissions.shell` entries in ExtractSpecStagePermissions back to
+// Polarity Grant (body mutation). Each "removed" fixture deletes ONLY that
+// declaration, so under the Grant model every change is a narrowing and each
+// row's Widened assertion goes RED (observed: the four "posture removed" /
+// "adding a shell posture" rows each fail `changes = ... want ...` with the
+// direction inverted).
+func TestExtractSpecStagePermissions_AbsenceModel(t *testing.T) {
+	const (
+		egressKey = implKey + ".egress"
+		writeKey  = implKey + ".permissions.write"
+		shellKey  = implKey + ".permissions.shell"
+	)
+	full := "        permissions:\n          network:\n            target_hosts: [\"api.example.com\"]\n          write: [\"src/**\"]\n          shell: %s"
+	withShell := func(sh string) string { return permsDoc(strings.Replace(full, "%s", sh, 1)) }
+	noShell := permsDoc("        permissions:\n          network:\n            target_hosts: [\"api.example.com\"]\n          write: [\"src/**\"]")
+	noWrite := permsDoc("        permissions:\n          network:\n            target_hosts: [\"api.example.com\"]\n          shell: none")
+	noEgress := permsDoc("        permissions:\n          write: [\"src/**\"]\n          shell: none")
+
+	cases := []struct {
+		name       string
+		base, head string
+		want       []Change
+	}{
+		{"posture removed: shell none -> absent widens", withShell("none"), noShell,
+			[]Change{{Key: shellKey, Before: "none", After: Absent, Direction: Widened}}},
+		{"shell none -> restricted widens", withShell("none"), withShell("restricted"),
+			[]Change{{Key: shellKey, Before: "none", After: "restricted", Direction: Widened}}},
+		{"shell restricted -> none narrows", withShell("restricted"), withShell("none"),
+			[]Change{{Key: shellKey, Before: "restricted", After: "none", Direction: Narrowed}}},
+		{"adding a shell posture narrows", noShell, withShell("restricted"),
+			[]Change{{Key: shellKey, Before: Absent, After: "restricted", Direction: Narrowed}}},
+		{"posture removed: write list -> absent widens", withShell("none"), noWrite,
+			[]Change{
+				{Key: writeKey, Before: declaredList, After: Absent, Direction: Widened},
+				{Key: writeKey + "[src/**]", Before: Present, After: Absent, Direction: Narrowed},
+			}},
+		{"posture removed: non-acceptance egress -> absent widens", withShell("none"), noEgress,
+			[]Change{
+				{Key: egressKey, Before: declaredList, After: Absent, Direction: Widened},
+				{Key: egressKey + "[api.example.com]", Before: Present, After: Absent, Direction: Narrowed},
+			}},
+		{"posture removed: the whole permissions block widens every declaration", withShell("none"), permsDoc(""),
+			[]Change{
+				{Key: egressKey, Before: declaredList, After: Absent, Direction: Widened},
+				{Key: egressKey + "[api.example.com]", Before: Present, After: Absent, Direction: Narrowed},
+				{Key: shellKey, Before: "none", After: Absent, Direction: Widened},
+				{Key: writeKey, Before: declaredList, After: Absent, Direction: Widened},
+				{Key: writeKey + "[src/**]", Before: Present, After: Absent, Direction: Narrowed},
+			}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := diffSpec(t, ExtractSpecStagePermissions, c.base, c.head); !reflect.DeepEqual(got, c.want) {
+				t.Fatalf("changes =\n  %+v\nwant\n  %+v", got, c.want)
+			}
+		})
+	}
+
+	// CONTROL (no over-trigger): `shell: unrestricted` is the same as no
+	// posture. COUNTERFACTUAL: drop the `r < shellUnrestricted` guard (body
+	// mutation) — the extraction then holds a shell entry and this goes RED.
+	t.Run("declaring shell unrestricted emits nothing", func(t *testing.T) {
+		g, err := ExtractSpecStagePermissions([]byte(withShell("unrestricted")))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if e, ok := g[shellKey]; ok {
+			t.Fatalf("shell: unrestricted extracted %+v; want no entry", e)
+		}
+		if got := diffSpec(t, ExtractSpecStagePermissions, withShell("unrestricted"), noShell); got != nil {
+			t.Fatalf("unrestricted -> absent: changes = %+v, want none", got)
+		}
+	})
+
+	// CONTROL (acceptance default-deny): removing an acceptance stage's
+	// hosts is a true NARROWING, so it must yield no widening.
+	// COUNTERFACTUAL: drop the `st.Type != spec.StageTypeAcceptance` guard
+	// (body mutation) — the acceptance stage then carries an `.egress`
+	// Restriction whose removal reads Widened and this goes RED.
+	t.Run("acceptance egress removal is a narrowing only", func(t *testing.T) {
+		accBase := permsDoc("        permissions:\n          shell: none\n" + acceptanceStage(`["preview.example.com"]`))
+		accHead := permsDoc("        permissions:\n          shell: none\n" + acceptanceStage(""))
+		got := diffSpec(t, ExtractSpecStagePermissions, accBase, accHead)
+		want := []Change{{Key: "workflows.feature_change.stages.acceptance.egress[preview.example.com]", Before: Present, After: Absent, Direction: Narrowed}}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("changes =\n  %+v\nwant\n  %+v", got, want)
+		}
+	})
+
+	// Approval condition 6: a declared-but-EMPTY write list or egress host
+	// list is rejected by the workflow-v2 schema (minItems 1), so the
+	// extraction ERRORS and the check fails closed to parse_error — an empty
+	// list is never read as "no limit". COUNTERFACTUAL: none in this package
+	// (the rejection is spec.ParseBytes'); the arm pins the product semantics
+	// the absence model relies on, and goes RED if the schema ever admits an
+	// empty list.
+	t.Run("declared-but-empty write or egress list fails the extraction", func(t *testing.T) {
+		for name, block := range map[string]string{
+			"write: []":                     "        permissions:\n          write: []",
+			"permissions.network hosts: []": "        permissions:\n          network:\n            target_hosts: []",
+			"egress hosts: []":              "        egress:\n          target_hosts: []",
+		} {
+			g, err := ExtractSpecStagePermissions([]byte(permsDoc(block)))
+			if err == nil || !strings.Contains(err.Error(), "got 0, want 1") {
+				t.Errorf("%s: extracted %+v, %v; want the schema's minItems rejection (fail closed)", name, g, err)
+			}
+		}
+	})
+}
+
+// TestDetect_SpecAutonomyPolarityFlip pins item 1 end to end on the
+// fishhawk-spec-autonomy surface: the base workflow delegates every class
+// (`autonomy: high`) while the plan approval gate overrides it to `low`; the
+// head inverts BOTH (workflow `low`, gate `high`). The workflow level
+// narrows, but the gate key flips from a "not auto" Restriction to an "auto"
+// Grant at the same PresenceRank — a widening a polarity-blind Compare
+// misses.
+//
+// COUNTERFACTUAL: mutate Compare's polarity branch to fall through to the
+// rank comparison (body mutation). The gate keys are present on both sides at
+// PresenceRank, so they report nothing, the only changes are the
+// workflow-level narrowings, and the gate-key Widened assertion goes RED
+// (observed: `widened = [] want the 5 gate keys`).
+func TestDetect_SpecAutonomyPolarityFlip(t *testing.T) {
+	base := specDoc("%AUTONOMY%", "    autonomy: high", "%ESCALATIONS%", "", "%GATE%", "            autonomy: low")
+	head := specDoc("%AUTONOMY%", "    autonomy: low", "%ESCALATIONS%", "", "%GATE%", "            autonomy: high")
+	r := Detect(surfaceByID(t, "fishhawk-spec-autonomy"), side(base), side(head))
+	if r.Unevaluable != "" {
+		t.Fatalf("unevaluable %s: %s", r.Unevaluable, r.Detail)
+	}
+	gate0 := "workflows.feature_change.stages.plan.gates[0].actions."
+	var widened []string
+	for _, c := range r.Widened {
+		widened = append(widened, c.Key)
+		if c.Before != "not auto (gate override)" || c.After != "auto" {
+			t.Errorf("widening %+v: want not auto -> auto", c)
+		}
+	}
+	want := []string{gate0 + "approve", gate0 + "fixup", gate0 + "merge", gate0 + "retry", gate0 + "waive"}
+	if !reflect.DeepEqual(widened, want) {
+		t.Fatalf("widened = %v, want %v (narrowed %+v)", widened, want, r.Narrowed)
+	}
+	if len(r.Narrowed) == 0 {
+		t.Fatalf("want the workflow-level narrowing alongside the gate widening")
 	}
 }

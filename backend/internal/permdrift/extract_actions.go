@@ -27,7 +27,11 @@ const defaultTokenValue = "write (default token permissions)"
 //   - a map -> `jobs.<id>.<scope>` per scope at its level; `none` is no grant
 //
 // A file declaring no jobs keys the top-level block as `permissions.<scope>`
-// (and `permissions.*` for read-all/write-all). Every entry is a ranked Grant
+// (and `permissions.*` for read-all/write-all). The job id and scope are
+// FILE-DERIVED segments, escaped with keySegment, so a job or scope literally
+// named "*" (or carrying a '.') cannot mint or forge a wildcard key; only the
+// extractor's own write-all/read-all/default entries end in the literal
+// WildcardSuffix. Every entry is a ranked Grant
 // on ActionsLevels. Empty content (an absent file) yields an empty set; YAML
 // that does not parse, a non-mapping document or jobs entry, and an
 // unrecognized level are errors.
@@ -70,7 +74,7 @@ func ExtractActions(content []byte) (Grants, error) {
 		if !ok {
 			return nil, fmt.Errorf("actions workflow: job %q is not a mapping", id)
 		}
-		prefix := "jobs." + id
+		prefix := "jobs." + keySegment(id)
 		block, present := job["permissions"]
 		if block == nil {
 			present = false
@@ -122,7 +126,7 @@ func addActionsBlock(out Grants, prefix string, block any) error {
 				// omitted from a declared block.
 				continue
 			}
-			out.Put(Entry{Key: prefix + "." + scope, Value: level, Rank: r, Polarity: Grant})
+			out.Put(Entry{Key: prefix + "." + keySegment(scope), Value: level, Rank: r, Polarity: Grant})
 		}
 	default:
 		return fmt.Errorf("actions workflow: %s: permissions is neither a shorthand string nor a mapping", prefix)

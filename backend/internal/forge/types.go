@@ -307,6 +307,12 @@ type RulesetRequiredCheck struct {
 type ComparePatchFile struct {
 	Path   string
 	Status string
+	// PreviousPath is the rename SOURCE when Status is "renamed" (GitHub's
+	// `previous_filename`, GitLab's `old_path` on a `renamed_file` entry).
+	// Empty when the forge reports none — a non-rename, or a rename whose
+	// source the forge omitted; a consumer that must evaluate the source
+	// treats an empty PreviousPath on a rename as unknown, never as absent.
+	PreviousPath string
 }
 
 // ComparePatchResult carries the unified-diff text + changed-file list for
@@ -318,6 +324,11 @@ type ComparePatchResult struct {
 	// reports), reused as the implement-review dedup key. Empty when the
 	// comparison reports no commits ahead of base.
 	HeadSHA string
+	// CommitsTruncated is set when the forge capped the comparison's commit
+	// listing (GitHub lists at most 250 commits while total_commits counts
+	// them all). HeadSHA is then the last LISTED commit, NOT head's tip, so
+	// a consumer that needs the tip commit must treat HeadSHA as unresolved.
+	CommitsTruncated bool
 	// Patch is the reconstructed unified diff: each changed file's hunks
 	// prefixed with a synthetic `diff --git` header so a downstream
 	// content reviewer reads it as an ordinary git diff. Empty when no

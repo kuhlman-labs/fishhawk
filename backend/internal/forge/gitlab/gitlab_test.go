@@ -766,7 +766,8 @@ func TestComparePatch(t *testing.T) {
 			"diffs":[
 				{"old_path":"a.go","new_path":"a.go","diff":"@@ -1 +1 @@\n-x\n+y"},
 				{"old_path":"new.go","new_path":"new.go","new_file":true,"diff":"@@ -0,0 +1 @@\n+n\n"},
-				{"old_path":"gone.go","new_path":"gone.go","deleted_file":true}
+				{"old_path":"gone.go","new_path":"gone.go","deleted_file":true},
+				{"old_path":"infra/specs/a.yaml","new_path":"docs/a.yaml","renamed_file":true}
 			]
 		}`)
 	})
@@ -781,11 +782,32 @@ func TestComparePatch(t *testing.T) {
 	if !res.Truncated || res.TruncationReason == "" {
 		t.Errorf("Truncated=%v reason=%q, want a compare_timeout truncation", res.Truncated, res.TruncationReason)
 	}
-	if len(res.Files) != 3 {
-		t.Fatalf("Files = %+v, want 3", res.Files)
+	if len(res.Files) != 4 {
+		t.Fatalf("Files = %+v, want 4", res.Files)
 	}
 	if res.Files[1].Status != "added" || res.Files[2].Status != "removed" || res.Files[0].Status != "modified" {
 		t.Errorf("file statuses = %+v, want modified/added/removed", res.Files)
+	}
+	// Only a renamed_file entry carries a PreviousPath; on the others
+	// old_path is not a rename source.
+	// COUNTERFACTUAL (the `if d.RenamedFile` guard widened to `if true ||
+	// d.RenamedFile`): every entry copies its old_path, so this loop goes
+	// RED — observed `Files[0] = {Path:a.go Status:modified
+	// PreviousPath:a.go}, want no PreviousPath on a non-rename`.
+	for i := 0; i < 3; i++ {
+		if res.Files[i].PreviousPath != "" {
+			t.Errorf("Files[%d] = %+v, want no PreviousPath on a non-rename", i, res.Files[i])
+		}
+	}
+	// The renamed row: old_path is the rename SOURCE (#3935).
+	// COUNTERFACTUAL (the `file.PreviousPath = d.OldPath` assignment in
+	// ComparePatch mutated out): the fixture's old_path infra/specs/a.yaml
+	// differs from new_path docs/a.yaml, so PreviousPath reads "" and this
+	// assertion goes RED — observed `Files[3] = {Path:docs/a.yaml
+	// Status:renamed PreviousPath:}, want docs/a.yaml renamed from
+	// infra/specs/a.yaml`.
+	if r := res.Files[3]; r.Path != "docs/a.yaml" || r.Status != "renamed" || r.PreviousPath != "infra/specs/a.yaml" {
+		t.Errorf("Files[3] = %+v, want docs/a.yaml renamed from infra/specs/a.yaml", r)
 	}
 	if !strings.Contains(res.Patch, "diff --git a/a.go b/a.go\n@@ -1 +1 @@") {
 		t.Errorf("patch missing synthetic git header for a.go:\n%s", res.Patch)

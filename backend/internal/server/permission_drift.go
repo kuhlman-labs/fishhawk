@@ -45,8 +45,9 @@ const (
 )
 
 // permissionDriftAllSurfaces is the pseudo-surface a check-wide failure (the
-// forge compare itself failed) is raised against: no single surface file can
-// be named, so the concern covers every one.
+// forge compare itself failed, or a commit to compare is missing) is raised
+// against: no single surface file can be named, so the concern covers every
+// one.
 var permissionDriftAllSurfaces = permdrift.Surface{
 	ID:          "all-surfaces",
 	Severity:    permdrift.SeverityHigh,
@@ -96,6 +97,10 @@ type permissionDriftDetectedPayload struct {
 	ExtensionError      string                       `json:"extension_error,omitempty"`
 }
 
+// permissionDriftWidening is one widening. The exported (payload) Path, Key,
+// Before and After are permdrift.Display renderings (control-free, bounded);
+// CheckKey is the escaped, digest-bounded permdrift.CheckKey of the RAW
+// values; the unexported fields keep the raw values for the concern note.
 type permissionDriftWidening struct {
 	Surface  string `json:"surface"`
 	Path     string `json:"path"`
@@ -106,9 +111,13 @@ type permissionDriftWidening struct {
 	CheckKey string `json:"check_key"`
 
 	surface permdrift.Surface
+	path    string
 	change  permdrift.Change
 }
 
+// permissionDriftUnevaluable is one unevaluable surface file. head is the
+// commit SHA its CheckKey carries ("" when the check could not resolve one —
+// then only an OPEN row suppresses it, never a waived or deferred one).
 type permissionDriftUnevaluable struct {
 	Surface  string `json:"surface"`
 	Path     string `json:"path"`
@@ -116,6 +125,8 @@ type permissionDriftUnevaluable struct {
 	CheckKey string `json:"check_key"`
 
 	surface permdrift.Surface
+	path    string
+	head    string
 }
 
 type permissionNarrowing struct {
@@ -139,8 +150,8 @@ type permissionDriftFindings struct {
 // checkPermissionDrift runs the deterministic permission-drift check (ADR-084
 // D5 / rule 5, E80.4 / #3761) on a detached, shutdown-tracked goroutine, so the
 // caller's report latency is unchanged. A nil ConcernRepo, AuditRepo or
-// RunRepo, or a request without both commits, is a no-op. See
-// runPermissionDriftCheck for the check itself.
+// RunRepo is a no-op; a request without both commits raises commit_missing
+// (runPermissionDriftCheck). See runPermissionDriftCheck for the check itself.
 func (s *Server) checkPermissionDrift(ctx context.Context, req permissionDriftRequest) {
 	if !s.permissionDriftRunnable(ctx, req) {
 		return
@@ -154,19 +165,11 @@ func (s *Server) checkPermissionDrift(ctx context.Context, req permissionDriftRe
 }
 
 // permissionDriftRunnable reports whether a check can run: false (a no-op) for
-// a nil ConcernRepo, AuditRepo or RunRepo, or a request without both commits.
-func (s *Server) permissionDriftRunnable(ctx context.Context, req permissionDriftRequest) bool {
-	if s.cfg.ConcernRepo == nil || s.cfg.AuditRepo == nil || s.cfg.RunRepo == nil {
-		return false
-	}
-	if req.Base == "" || req.Head == "" {
-		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "permission-drift check: base or head commit missing — skipped",
-			slog.String("run_id", req.RunID.String()),
-			slog.String("stage_id", req.StageID.String()),
-			slog.String("trigger", req.Trigger))
-		return false
-	}
-	return true
+// a nil ConcernRepo, AuditRepo or RunRepo — there is nowhere to record a
+// finding. A missing commit is NOT a no-op: runPermissionDriftCheck raises
+// commit_missing for it once the forge resolves.
+func (s *Server) permissionDriftRunnable(_ context.Context, _ permissionDriftRequest) bool {
+	return s.cfg.ConcernRepo != nil && s.cfg.AuditRepo != nil && s.cfg.RunRepo != nil
 }
 
 // runPermissionDriftCheck is the synchronous body of checkPermissionDrift
@@ -175,17 +178,26 @@ func (s *Server) permissionDriftRunnable(ctx context.Context, req permissionDrif
 //
 //  1. Resolve the forge compare and file fetcher; either unavailable is an
 //     INFO-logged skip (the CLI/dev posture, as the consolidated review).
-//  2. Read .fishhawk/permission-surfaces.yaml at BASE only (404 = none; an
-//     unreadable or unparseable file = the product list only, recorded as
-//     extension_error; rejected entries recorded).
-//  3. ComparePatch(base, head) for the changed files. A compare error raises
-//     ONE check-wide compare_failed concern. When the compare is truncated, or
-//     reports a rename (whose source path it does not list), every exact-path
-//     surface is probed at both refs anyway; on truncation each glob surface
-//     also raises one compare_truncated concern.
-//  4. For each (surface, changed path) fetch base and head (ErrNotFound = side
+//  2. A missing base or head commit raises ONE check-wide commit_missing
+//     concern and stops (no forge call is made).
+//  3. ComparePatch(base, head) for the changed files, and resolve the head to
+//     the commit SHA every unevaluable key carries (permissionDriftKeyHead);
+//     the consolidated trigger's surface files are then read AT that commit.
+//  4. Read .fishhawk/permission-surfaces.yaml at BASE only (404 = none). An
+//     unreadable file (fetch_failed) or an unparseable one
+//     (extension_parse_error) leaves the product list only, records
+//     extension_error AND raises one unevaluable concern on the
+//     permission-surface-declarations surface; rejected entries are recorded.
+//  5. A compare error raises ONE check-wide compare_failed concern. A renamed
+//     file's SOURCE (PreviousPath) is evaluated against every surface it
+//     matches; a rename whose source the compare does not name raises one
+//     rename_source_unknown concern per glob surface. When the compare is
+//     truncated or reports a rename, every exact-path surface is probed at
+//     both refs anyway; on truncation each glob surface also raises one
+//     compare_truncated concern.
+//  6. For each (surface, path) fetch base and head (ErrNotFound = side
 //     absent; any other error = fetch_failed for that pair) and Detect.
-//  5. raisePermissionDrift de-duplicates and raises; narrowings go to one
+//  7. raisePermissionDrift de-duplicates and raises; narrowings go to one
 //     permission_narrowing_noticed entry, never to a concern.
 func (s *Server) runPermissionDriftCheck(ctx context.Context, req permissionDriftRequest) {
 	runRow, err := s.cfg.RunRepo.GetRun(ctx, req.RunID)
@@ -206,17 +218,42 @@ func (s *Server) runPermissionDriftCheck(ctx context.Context, req permissionDrif
 			slog.String("run_id", req.RunID.String()), slog.String("reason", freason))
 		return
 	}
+	var fx permissionDriftFindings
+	if req.Base == "" || req.Head == "" {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "permission-drift check: base or head commit missing — raising unevaluable",
+			slog.String("run_id", req.RunID.String()),
+			slog.String("stage_id", req.StageID.String()),
+			slog.String("trigger", req.Trigger))
+		fx.unevaluable = append(fx.unevaluable, newUnevaluable(permissionDriftAllSurfaces,
+			req.Base+".."+req.Head, permdrift.ReasonCommitMissing, s.permissionDriftKeyHead(ctx, req, "", false)))
+		s.raisePermissionDrift(ctx, req, fx)
+		return
+	}
 	reader := &permissionDriftReader{ctx: ctx, f: fetcher, scope: fscope, repo: frepo, cache: map[[2]string]driftSide{}}
 
-	var fx permissionDriftFindings
-	surfaces := s.permissionDriftSurfaces(ctx, req, reader, &fx)
-
 	cmp, cerr := comparer.ComparePatch(ctx, scope, repo, req.Base, req.Head)
+	// cmpHead is the compare's head commit only when the forge listed every
+	// commit: past a capped listing the last listed commit is not the tip.
+	cmpHead := ""
+	if cerr == nil && !cmp.CommitsTruncated {
+		cmpHead = cmp.HeadSHA
+	}
+	keyHead := s.permissionDriftKeyHead(ctx, req, cmpHead, cerr == nil)
+	// evalHead is the ref every surface file is read at. The consolidated
+	// trigger's Head is a branch name, so it is pinned to the compare's head
+	// commit when one resolved: the files read are then exactly the commit
+	// the unevaluable keys carry, even if the branch moves mid-check.
+	evalHead := req.Head
+	if req.Trigger == permissionDriftTriggerConsolidated && cmpHead != "" {
+		evalHead = cmpHead
+	}
+	surfaces := s.permissionDriftSurfaces(ctx, req, reader, &fx, keyHead)
+
 	if cerr != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "permission-drift check: forge compare failed — raising unevaluable",
 			slog.String("run_id", req.RunID.String()), slog.String("error", cerr.Error()))
 		fx.unevaluable = append(fx.unevaluable, newUnevaluable(permissionDriftAllSurfaces,
-			req.Base+".."+req.Head, permdrift.ReasonCompareFailed))
+			req.Base+".."+req.Head, permdrift.ReasonCompareFailed, keyHead))
 		s.raisePermissionDrift(ctx, req, fx)
 		return
 	}
@@ -237,48 +274,65 @@ func (s *Server) runPermissionDriftCheck(ctx context.Context, req permissionDrif
 	}
 	renamed := false
 	for _, f := range cmp.Files {
-		if f.Status == "renamed" {
-			renamed = true
-		}
 		for _, sf := range permdrift.MatchSurfaces(surfaces, f.Path) {
 			add(sf, f.Path)
+		}
+		if f.Status != "renamed" {
+			continue
+		}
+		renamed = true
+		// The rename SOURCE vanished at head: evaluate it against every
+		// surface it matches (glob or exact), so moving a governed file out of
+		// a surface reads as its removal there.
+		if f.PreviousPath != "" {
+			for _, sf := range permdrift.MatchSurfaces(surfaces, f.PreviousPath) {
+				add(sf, f.PreviousPath)
+			}
+			continue
+		}
+		// The source is unknown: an exact-path surface is still probed below,
+		// but no glob surface can be — fail each one CLOSED, keyed by the
+		// destination path.
+		for _, sf := range surfaces {
+			if hasGlobPath(sf) {
+				fx.unevaluable = append(fx.unevaluable, newUnevaluable(sf, f.Path, permdrift.ReasonRenameSourceUnknown, keyHead))
+			}
 		}
 	}
 	if cmp.Truncated || renamed {
 		for _, sf := range surfaces {
-			glob := false
 			for _, p := range sf.Paths {
-				if isGlobPath(p) {
-					glob = true
-					continue
+				if !isGlobPath(p) {
+					add(sf, p)
 				}
-				add(sf, p)
 			}
-			if glob && cmp.Truncated {
-				fx.unevaluable = append(fx.unevaluable, newUnevaluable(sf, "", permdrift.ReasonCompareTruncated))
+			if cmp.Truncated && hasGlobPath(sf) {
+				fx.unevaluable = append(fx.unevaluable, newUnevaluable(sf, "", permdrift.ReasonCompareTruncated, keyHead))
 			}
 		}
 	}
 
 	for _, p := range pairs {
-		res := reader.detect(p.s, p.path, req.Base, req.Head)
+		res := reader.detect(p.s, p.path, req.Base, evalHead)
 		if req.IntersectRef != "" && res.Unevaluable == "" {
-			res = intersectDrift(p.s, p.path, res, reader.detect(p.s, p.path, req.IntersectRef, req.Head))
+			res = intersectDrift(p.s, p.path, res, reader.detect(p.s, p.path, req.IntersectRef, evalHead))
 		}
 		if res.Unevaluable != "" {
-			fx.unevaluable = append(fx.unevaluable, newUnevaluable(p.s, p.path, res.Unevaluable))
+			fx.unevaluable = append(fx.unevaluable, newUnevaluable(p.s, p.path, res.Unevaluable, keyHead))
 			continue
 		}
 		for _, c := range res.Widened {
 			fx.widenings = append(fx.widenings, permissionDriftWidening{
-				Surface: p.s.ID, Path: p.path, Key: c.Key, Before: c.Before, After: c.After,
+				Surface: p.s.ID, Path: permdrift.Display(p.path), Key: permdrift.Display(c.Key),
+				Before: permdrift.Display(c.Before), After: permdrift.Display(c.After),
 				Severity: string(p.s.Severity), CheckKey: permdrift.CheckKey(p.s.ID, p.path, c.Key, c.After),
-				surface: p.s, change: c,
+				surface: p.s, path: p.path, change: c,
 			})
 		}
 		for _, c := range res.Narrowed {
 			fx.narrowings = append(fx.narrowings, permissionNarrowing{
-				Surface: p.s.ID, Path: p.path, Key: c.Key, Before: c.Before, After: c.After,
+				Surface: p.s.ID, Path: permdrift.Display(p.path), Key: permdrift.Display(c.Key),
+				Before: permdrift.Display(c.Before), After: permdrift.Display(c.After),
 			})
 		}
 	}
@@ -287,54 +341,114 @@ func (s *Server) runPermissionDriftCheck(ctx context.Context, req permissionDrif
 
 // permissionDriftSurfaces returns the product surfaces merged with the
 // repository's extension, read at req.Base ONLY so a change cannot remove its
-// own surface. Absence is no extension; any other read failure or a parse
-// error leaves the product list and records extension_error.
-func (s *Server) permissionDriftSurfaces(ctx context.Context, req permissionDriftRequest, reader *permissionDriftReader, fx *permissionDriftFindings) []permdrift.Surface {
+// own surface. Absence is no extension. Any other read failure (fetch_failed)
+// or a parse error (extension_parse_error) leaves the product list, records
+// extension_error, and FAILS CLOSED: one unevaluable concern on the
+// permission-surface-declarations surface at RepoSurfacesPath, keyed by
+// keyHead — whatever surface the extension declares went unchecked.
+func (s *Server) permissionDriftSurfaces(ctx context.Context, req permissionDriftRequest, reader *permissionDriftReader, fx *permissionDriftFindings, keyHead string) []permdrift.Surface {
 	product := permdrift.DefaultSurfaces()
 	side := reader.read(permdrift.RepoSurfacesPath, req.Base)
+	reason := ""
 	switch {
 	case side.err != nil:
-		fx.extError = permdrift.ReasonFetchFailed
+		fx.extError, reason = permdrift.ReasonFetchFailed, permdrift.ReasonFetchFailed
 	case !side.f.Exists:
 		return product
 	default:
 		accepted, rejected, err := permdrift.ParseRepoSurfaces(side.f.Content)
 		if err != nil {
-			fx.extError = permdrift.ReasonParseError
+			fx.extError, reason = permdrift.ReasonParseError, permdrift.ReasonExtensionParseError
 			break
 		}
 		fx.extRejected = rejected
 		return permdrift.MergeSurfaces(product, accepted)
 	}
-	s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "permission-drift check: repository surface extension unreadable — product surfaces only",
+	s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "permission-drift check: repository surface extension unreadable — product surfaces only, raising unevaluable",
 		slog.String("run_id", req.RunID.String()),
 		slog.String("path", permdrift.RepoSurfacesPath),
-		slog.String("reason", fx.extError))
+		slog.String("reason", reason))
+	for _, sf := range product {
+		if sf.ID == permdrift.SurfaceIDSurfaceDeclarations {
+			fx.unevaluable = append(fx.unevaluable, newUnevaluable(sf, permdrift.RepoSurfacesPath, reason, keyHead))
+		}
+	}
 	return product
+}
+
+// permissionDriftKeyHead resolves the commit SHA a check's unevaluable keys
+// carry, so a waived or deferred unevaluable row suppresses only a repeat at
+// the SAME commit. An empty req.Head resolves "" (commit_missing). A
+// push-report trigger's Head is the commit SHA the runner reported. The
+// consolidated trigger's Head is the consolidated BRANCH name, which never
+// changes across checks, so it is never keyed on: it resolves to the forge
+// compare's head commit (cmpHead — the branch tip the compare evaluated, and
+// the commit the check then reads its surface files at, so a fix-up pushed
+// to the parent after the fan-in is distinguished). A compare that answered
+// but named no provable tip (cmpHead "" because its commit listing was capped,
+// or it listed no commit) resolves "": the integration ledger may predate the
+// tip that compare evaluated, so it is not consulted. Only a compare that
+// FAILED (compared false) falls back to the newest integration_commit_recorded
+// merge_sha on the parent, else "".
+func (s *Server) permissionDriftKeyHead(ctx context.Context, req permissionDriftRequest, cmpHead string, compared bool) string {
+	switch {
+	case req.Head == "":
+		return ""
+	case req.Trigger != permissionDriftTriggerConsolidated:
+		return req.Head
+	case cmpHead != "":
+		return cmpHead
+	case compared:
+		return ""
+	}
+	if sha, ok := s.resolveConsolidatedFanInHeadSHA(ctx, req.RunID, 0, false); ok {
+		return sha
+	}
+	return ""
 }
 
 // isGlobPath reports whether a surface path carries doublestar metacharacters.
 func isGlobPath(p string) bool { return strings.ContainsAny(p, "*?[{\\") }
 
-func newUnevaluable(sf permdrift.Surface, path, reason string) permissionDriftUnevaluable {
+// hasGlobPath reports whether any of sf's paths is a glob.
+func hasGlobPath(sf permdrift.Surface) bool {
+	for _, p := range sf.Paths {
+		if isGlobPath(p) {
+			return true
+		}
+	}
+	return false
+}
+
+// newUnevaluable builds one unevaluable finding keyed by head (the resolved
+// commit SHA, "" when unresolved). The payload path is a permdrift.Display
+// rendering; the key and the note use the raw path.
+func newUnevaluable(sf permdrift.Surface, path, reason, head string) permissionDriftUnevaluable {
 	return permissionDriftUnevaluable{
-		Surface: sf.ID, Path: path, Reason: reason,
-		CheckKey: permdrift.UnevaluableKey(sf.ID, path), surface: sf,
+		Surface: sf.ID, Path: permdrift.Display(path), Reason: reason,
+		CheckKey: permdrift.UnevaluableKey(sf.ID, path, head), surface: sf, path: path, head: head,
 	}
 }
 
 // intersectDrift keeps the changes of first (previous head → pushed head)
-// that second (base-branch tip → pushed head) also reports, keyed by check
-// key. An unevaluable second comparison fails the pair closed.
+// that second (base-branch tip → pushed head) also reports IN THE SAME
+// DIRECTION, keyed by check key: a widening survives only when second also
+// widens that key to that value, a narrowing only when second also narrows
+// it. (One union set would let first's widening to "read" survive on second's
+// NARROWING of the same key to "read" — a different change sharing the check
+// key.) An unevaluable second comparison fails the pair closed.
 func intersectDrift(sf permdrift.Surface, path string, first, second permdrift.Result) permdrift.Result {
 	if second.Unevaluable != "" {
 		return second
 	}
-	keys := map[string]bool{}
-	for _, c := range append(append([]permdrift.Change(nil), second.Widened...), second.Narrowed...) {
-		keys[permdrift.CheckKey(sf.ID, path, c.Key, c.After)] = true
+	set := func(in []permdrift.Change) map[string]bool {
+		out := map[string]bool{}
+		for _, c := range in {
+			out[permdrift.CheckKey(sf.ID, path, c.Key, c.After)] = true
+		}
+		return out
 	}
-	keep := func(in []permdrift.Change) []permdrift.Change {
+	keep := func(in []permdrift.Change, keys map[string]bool) []permdrift.Change {
 		var out []permdrift.Change
 		for _, c := range in {
 			if keys[permdrift.CheckKey(sf.ID, path, c.Key, c.After)] {
@@ -343,7 +457,10 @@ func intersectDrift(sf permdrift.Surface, path string, first, second permdrift.R
 		}
 		return out
 	}
-	return permdrift.Result{Widened: keep(first.Widened), Narrowed: keep(first.Narrowed)}
+	return permdrift.Result{
+		Widened:  keep(first.Widened, set(second.Widened)),
+		Narrowed: keep(first.Narrowed, set(second.Narrowed)),
+	}
 }
 
 // driftSide is one fetched file side; err is set for a read failure other
@@ -396,7 +513,9 @@ func (r *permissionDriftReader) detect(sf permdrift.Surface, path, base, head st
 // permissionDriftRaiseMu — the widenings and unevaluables not already on
 // record for the stage as a server_check row in an open, waived or deferred
 // state (superseded/addressed do not suppress; a ListByRun error fails OPEN to
-// raising). The permission_drift_detected entry is appended FIRST and stamps
+// raising). An unevaluable whose head could not be resolved to a commit SHA
+// (head "") is suppressed by an OPEN row only — a waived or deferred row at
+// an unknown commit never silences a later one. The permission_drift_detected entry is appended FIRST and stamps
 // the concerns' origin sequence; an append failure raises nothing. InsertRaised
 // is retried once; a second failure appends permission_drift_raise_failed and
 // the detected entry stands as the record.
@@ -432,10 +551,13 @@ func (s *Server) raisePermissionDrift(ctx context.Context, req permissionDriftRe
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "permission-drift check: list concerns failed — raising without de-duplication",
 			slog.String("run_id", req.RunID.String()), slog.String("error", err.Error()))
 	} else {
-		recorded := map[string]bool{}
+		recorded, open := map[string]bool{}, map[string]bool{}
 		for _, row := range rows {
 			if row == nil || row.StageID != stageID || !row.IsServerCheck() || row.CheckKey == "" {
 				continue
+			}
+			if row.State.IsOpen() {
+				open[row.CheckKey] = true
 			}
 			if row.State.IsOpen() || row.State == concern.StateWaived || row.State == concern.StateDeferred {
 				recorded[row.CheckKey] = true
@@ -444,13 +566,17 @@ func (s *Server) raisePermissionDrift(ctx context.Context, req permissionDriftRe
 		widenings, unevaluable = nil, nil
 		for _, w := range fx.widenings {
 			if !recorded[w.CheckKey] {
-				recorded[w.CheckKey] = true
+				recorded[w.CheckKey], open[w.CheckKey] = true, true
 				widenings = append(widenings, w)
 			}
 		}
 		for _, u := range fx.unevaluable {
-			if !recorded[u.CheckKey] {
-				recorded[u.CheckKey] = true
+			suppress := recorded
+			if u.head == "" {
+				suppress = open
+			}
+			if !suppress[u.CheckKey] {
+				recorded[u.CheckKey], open[u.CheckKey] = true, true
 				unevaluable = append(unevaluable, u)
 			}
 		}
@@ -472,7 +598,7 @@ func (s *Server) raisePermissionDrift(ctx context.Context, req permissionDriftRe
 		CompareTruncated:    fx.truncated,
 		Widenings:           nonNilSlice(widenings),
 		Unevaluable:         nonNilSlice(unevaluable),
-		ExtensionRejected:   fx.extRejected,
+		ExtensionRejected:   displayRejections(fx.extRejected),
 		ExtensionError:      fx.extError,
 	})
 	entry, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
@@ -492,14 +618,14 @@ func (s *Server) raisePermissionDrift(ctx context.Context, req permissionDriftRe
 	for _, w := range widenings {
 		raised = append(raised, concern.RaisedConcern{
 			Severity: string(w.surface.Severity), Category: "security",
-			Note: permdrift.Note(w.surface, w.Path, w.change), CheckKey: w.CheckKey,
+			Note: permdrift.Note(w.surface, w.path, w.change), CheckKey: w.CheckKey,
 		})
 		keys = append(keys, w.CheckKey)
 	}
 	for _, u := range unevaluable {
 		raised = append(raised, concern.RaisedConcern{
 			Severity: string(u.surface.Severity), Category: "security",
-			Note: permdrift.NoteUnevaluable(u.surface, u.Path, u.Reason), CheckKey: u.CheckKey,
+			Note: permdrift.NoteUnevaluable(u.surface, u.path, u.Reason), CheckKey: u.CheckKey,
 		})
 		keys = append(keys, u.CheckKey)
 	}
@@ -541,6 +667,20 @@ func (s *Server) raisePermissionDrift(ctx context.Context, req permissionDriftRe
 		slog.Int("widenings", len(widenings)),
 		slog.Int("unevaluable", len(unevaluable)),
 		slog.String("check_keys", strings.Join(keys, "; ")))
+}
+
+// displayRejections renders each rejected extension entry's id (as written in
+// the file) through permdrift.Display for the audit payload.
+func displayRejections(in []permdrift.Rejection) []permdrift.Rejection {
+	if in == nil {
+		return nil
+	}
+	out := make([]permdrift.Rejection, len(in))
+	for i, r := range in {
+		r.ID = permdrift.Display(r.ID)
+		out[i] = r
+	}
+	return out
 }
 
 // nonNilSlice renders a nil slice as [] in JSON.

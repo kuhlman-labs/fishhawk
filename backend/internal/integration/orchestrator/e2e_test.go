@@ -1200,8 +1200,18 @@ func TestDecomposition_E2E_ConsolidatedReviewGatesParentMerge(t *testing.T) {
 		"files": [{"filename":"x.go","status":"modified","changes":4,"patch":"@@ -1 +1 @@\n-ok\n+nil deref"}]
 	}`
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		// The permission-drift check reads surface files through the contents
+		// API: answer 404 (file absent) there, so the fake reports a
+		// repository with no surface extension instead of handing the compare
+		// JSON to GetFile — which is a non-404 read failure the check
+		// (correctly) fails closed on with a fetch_failed concern (#3935).
+		if strings.Contains(r.URL.Path, "/contents/") {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = io.WriteString(w, `{"message":"Not Found"}`)
+			return
+		}
 		_, _ = io.WriteString(w, compareBody)
 	})
 	ghSrv := httptest.NewServer(mux)
