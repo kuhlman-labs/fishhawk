@@ -243,6 +243,17 @@ import "sort"
 // GLOBAL chain because a refusal has no run; the run linkage travels in
 // payload.run_id. Like the captain_* categories they are not issue-comment
 // activity categories (docs/issue-comment-surfaces.md is untouched).
+// #3921 (E79 / #3726) added the four upkeep categories. upkeep_report_recorded
+// is written once per ingested upkeep_report artifact on
+// POST /v0/runs/{run_id}/plan (the plan-stage discriminator's third additive
+// sibling), carrying the content hash, per-source entry counts and the dedupe
+// duplicates. upkeep_disposition_recorded, upkeep_finding_filed and
+// upkeep_finding_skipped are emitted by the later upkeep children (#3923 /
+// #3924: the captain's per-finding disposition and the apply step's
+// filed/skipped outcome); registering them now lets fishhawk_await_audit arm
+// on them before their writers land. Like grooming_report_recorded they are
+// INTERNAL, not issue-comment activity categories
+// (docs/issue-comment-surfaces.md is untouched).
 var KnownCategories = map[string]struct{}{
 	"acceptance_dispatched":                   {},
 	"acceptance_outcome_recorded":             {},
@@ -478,6 +489,10 @@ var KnownCategories = map[string]struct{}{
 	"status_comment_posted":                   {},
 	"trace_uploaded":                          {},
 	"unpriced_model_alert":                    {},
+	"upkeep_disposition_recorded":             {}, // #3921: the captain disposed an upkeep finding (writer: #3923)
+	"upkeep_finding_filed":                    {}, // #3921: the upkeep apply filed a finding's issue (writer: #3924)
+	"upkeep_finding_skipped":                  {}, // #3921: the upkeep apply skipped a finding (writer: #3924)
+	"upkeep_report_recorded":                  {}, // #3921: one per ingested upkeep_report artifact
 	"verified_tree_discarded":                 {},
 	"work_item_filed":                         {},
 	"work_item_transitioned":                  {},

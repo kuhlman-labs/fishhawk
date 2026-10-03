@@ -7205,15 +7205,19 @@ func TestValidate_UpkeepReportWithOtherProposal_SameStage_Rejected(t *testing.T)
 		plan     = "          - artifact: plan\n            schema: standard_v1\n"
 		grooming = "          - artifact: grooming_report\n            schema: grooming_report_v1\n"
 	)
+	// wantPath locates the refusal at the UPKEEP entry's own artifact field
+	// (index 0 when it is declared first, 1 when the other proposal is), so
+	// an operator is pointed at the entry the rule is about (#3920 note).
 	cases := []struct {
 		name     string
 		produces string
 		other    string
+		wantPath string
 	}{
-		{name: "upkeep first, plan", produces: upkeep + plan, other: "plan"},
-		{name: "plan first, upkeep", produces: plan + upkeep, other: "plan"},
-		{name: "upkeep first, grooming_report", produces: upkeep + grooming, other: "grooming_report"},
-		{name: "grooming_report first, upkeep", produces: grooming + upkeep, other: "grooming_report"},
+		{name: "upkeep first, plan", produces: upkeep + plan, other: "plan", wantPath: "/workflows/wf/stages/0/produces/0/artifact"},
+		{name: "plan first, upkeep", produces: plan + upkeep, other: "plan", wantPath: "/workflows/wf/stages/0/produces/1/artifact"},
+		{name: "upkeep first, grooming_report", produces: upkeep + grooming, other: "grooming_report", wantPath: "/workflows/wf/stages/0/produces/0/artifact"},
+		{name: "grooming_report first, upkeep", produces: grooming + upkeep, other: "grooming_report", wantPath: "/workflows/wf/stages/0/produces/1/artifact"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -7235,18 +7239,25 @@ workflows:
 			if !strings.Contains(ve.Message, want) {
 				t.Errorf("ValidationError.Message = %q, want it to contain %q", ve.Message, want)
 			}
+			if ve.Path != tc.wantPath {
+				t.Errorf("ValidationError.Path = %q, want %q (the upkeep_report entry)", ve.Path, tc.wantPath)
+			}
 		})
 	}
 }
 
-// TestParseBytes_V0V1_UpkeepReportArtifact_Rejected pins that the FROZEN majors
-// keep rejecting the new artifact: v0 and v1's own produces enums do not admit
-// upkeep_report, so a v0.7 / v1.6 document declaring it fails on its own schema
-// (a *SchemaError), never reaching the version-agnostic binding.
-func TestParseBytes_V0V1_UpkeepReportArtifact_Rejected(t *testing.T) {
-	for _, version := range []string{"0.7", "1.6"} {
-		t.Run("frozen major "+version, func(t *testing.T) {
-			_, err := spec.ParseBytes([]byte(`version: "` + version + `"
+// TestValidate_UpkeepReportDeclaredTwice_Permitted pins a DELIBERATE decision
+// (#3920 note): a plan stage declaring upkeep_report TWICE validates.
+//
+// Rationale: every upkeep_report entry is bound identically (plan stage +
+// schema upkeep_report_v1), StageProducesUpkeepReport is a membership
+// predicate, and the plan-stage ingest accepts exactly one artifact BY KIND —
+// so a repeated declaration cannot give the discriminator two answers the way
+// upkeep_report beside plan or grooming_report would. A doubled
+// grooming_report is equally permitted today. If a repeat ever needs refusing,
+// it is a new rule for both proposal kinds, not a gap in this one.
+func TestValidate_UpkeepReportDeclaredTwice_Permitted(t *testing.T) {
+	s, err := spec.ParseBytes([]byte(`version: "2"
 workflows:
   wf:
     stages:
@@ -7257,10 +7268,53 @@ workflows:
         produces:
           - artifact: upkeep_report
             schema: upkeep_report_v1
+          - artifact: upkeep_report
+            schema: upkeep_report_v1
 `))
+	if err != nil {
+		t.Fatalf("a doubled upkeep_report declaration must validate (deliberately permitted): %v", err)
+	}
+	st := s.Workflows["wf"].Stages[0]
+	if !spec.StageProducesUpkeepReport(st) {
+		t.Error("StageProducesUpkeepReport = false for a stage declaring upkeep_report twice")
+	}
+}
+
+// TestParseBytes_V0V1_UpkeepReportArtifact_Rejected pins that the FROZEN majors
+// keep rejecting the new artifact: v0 and v1's own produces enums do not admit
+// upkeep_report, so a v0.7 / v1.6 document declaring it fails on its own schema
+// (a *SchemaError), never reaching the version-agnostic binding.
+//
+// Each version carries a POSITIVE CONTROL (#3920 note): the same fixture with
+// only the produces entry swapped to `artifact: plan, schema: standard_v1`
+// parses cleanly, so the refusal is attributable to the produces enum and not
+// to anything else in the minimal fixture.
+func TestParseBytes_V0V1_UpkeepReportArtifact_Rejected(t *testing.T) {
+	doc := func(version, artifact, schema string) []byte {
+		return []byte(`version: "` + version + `"
+workflows:
+  wf:
+    stages:
+      - id: scan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: ` + artifact + `
+            schema: ` + schema + `
+`)
+	}
+	for _, version := range []string{"0.7", "1.6"} {
+		t.Run("frozen major "+version, func(t *testing.T) {
+			_, err := spec.ParseBytes(doc(version, "upkeep_report", "upkeep_report_v1"))
 			var se *spec.SchemaError
 			if !errors.As(err, &se) {
 				t.Fatalf("version %s: err = %v, want *SchemaError (the frozen major must reject the artifact)", version, err)
+			}
+		})
+		t.Run("frozen major "+version+" positive control", func(t *testing.T) {
+			if _, err := spec.ParseBytes(doc(version, "plan", "standard_v1")); err != nil {
+				t.Fatalf("version %s: the plan/standard_v1 twin must parse, got %v — the refusal above is not attributable to the produces enum", version, err)
 			}
 		})
 	}
