@@ -48,6 +48,13 @@ type AnchorPlanView struct {
 	// RecommendationRationale is the rationale paired with RecommendedModel
 	// (model_recommendation.rationale). Empty when absent.
 	RecommendationRationale string
+	// ArchitecturalDecision is the plan's optional new_architectural_decision
+	// (E78.4 / #3748): the planner's declaration that the plan sets NEW
+	// architectural direction. Rendered as one italic line under the model
+	// recommendation, and only when Declared() (a nil or malformed declaration
+	// renders nothing). Only renderCurrentPlan reads it; a superseded plan's
+	// render is unchanged.
+	ArchitecturalDecision *plan.NewArchitecturalDecision
 	// UnpublishedRevisions counts later plan artifacts that were never
 	// republished to this anchor because the plan stage's persistence
 	// declaration omits `update_on_change` (E45.41 / #3346, one-shot pin —
@@ -653,6 +660,17 @@ func renderCurrentPlan(p *AnchorPlanView, suppressed bool) string {
 		} else {
 			fmt.Fprintf(&b, "\n_Model recommendation: `%s`_\n", p.RecommendedModel)
 		}
+	}
+	if d := p.ArchitecturalDecision; d.Declared() {
+		// The planner's new-architectural-decision declaration (E78.4 /
+		// #3748). Planner-authored text is flattened to one line and bounded,
+		// matching the RecommendationRationale treatment above.
+		adrs := "none cited"
+		if len(d.RelatedADRs) > 0 {
+			adrs = oneLine(strings.Join(d.RelatedADRs, ", "))
+		}
+		fmt.Fprintf(&b, "\n_New architectural decision: %s — %s (related ADRs: %s). The captain decides whether it needs an ADR._\n",
+			oneLine(d.DecisionSummary), oneLineWords(d.Rationale, 200), adrs)
 	}
 	if detail := renderPlanScopeApproach(p); detail != "" {
 		b.WriteString("\n<details><summary>Plan details</summary>\n\n")

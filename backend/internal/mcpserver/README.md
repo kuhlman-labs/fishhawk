@@ -83,6 +83,32 @@ canonical source can legitimately draw TWO findings with different generators
 The three test-file rules (`stem_sibling`, `new_test_in_tested_package`,
 `migration_walk`) omit `generator` and are unchanged.
 
+## `fishhawk_get_plan` new-architectural-decision surface ([E78.4 / #3748](https://github.com/kuhlman-labs/fishhawk/issues/3748))
+
+`PlanContent.new_architectural_decision` (`PlanNewArchitecturalDecision`:
+`decision_summary`, `rationale`, `related_adrs`) surfaces the planner's optional
+declaration that the plan sets NEW architectural direction. Presence is the
+declaration; it is absent for a plan without the field. `tryGetPlanForRun`
+`json.Unmarshal`s the artifact straight into `PlanContent`, so the DTO's json
+tags must mirror the schema's `new-architectural-decision` `$def` (and
+`plan.NewArchitecturalDecision`): there is no mapping step. `related_adrs`
+carries no `omitempty`, matching the schema's required key, so an empty list
+surfaces as `[]` (no existing ADR covers the direction).
+
+The same declaration reaches `plan_warnings` as ONE advisory written by the
+server's plan-gate pass (`newArchitecturalDecisionWarning`): it names the
+summary, rationale and related ADRs, and says the captain decides whether the
+direction needs an ADR (approve, optionally filing one with `fishhawk_file_issue`
+type `adr`, or reject). It gates nothing; this package only echoes the audit
+entry. No tool was added, so the registered tool count is unchanged.
+`fishhawk_revise_plan` needs no change either: it only POSTs the constraint to
+`/v0/stages/{id}/revise`, and the server builds the revision base that carries
+the field.
+
+Pinned by `TestGetPlan_NewArchitecturalDecision_*` (`tools_test.go`), which seed
+the artifact from the backend `plan.NewArchitecturalDecision` type so a tag
+drift between the two sides fails the decode.
+
 ## In-band onboarding (server `instructions` + `fishhawk://runbook`, [#1356](https://github.com/kuhlman-labs/fishhawk/issues/1356))
 
 A connecting client whose agent holds no operator memory gets enough to drive a run without a CLI alt-tab, delivered over the protocol itself:

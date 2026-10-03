@@ -281,6 +281,8 @@ var exportBaseline = []string{
 	"PlanDecomposed",
 	"PlanDecomposition",
 	"PlanGeneratedBy",
+	// E78.4 / #3748: get_plan's new_architectural_decision DTO.
+	"PlanNewArchitecturalDecision",
 	"PlanReachability",
 	"PlanReachabilityPhase",
 	"PlanReachabilityViolation",

@@ -80,6 +80,18 @@ Notes:
   and the `plan` / `plan_full` / `plan_updated` posting) are gone;
   `KindPlanFull` / `KindPlanUpdated` are retained only as recognized
   historical kinds the reaction poller may still read on legacy runs.
+  The current plan's section also renders, under the model recommendation, one
+  italic line `_New architectural decision: <decision_summary> — <rationale>
+  (related ADRs: <ids | none cited>). The captain decides whether it needs an
+  ADR._` when the plan declares `new_architectural_decision` (E78.4 / #3748,
+  `anchor_template.go::renderCurrentPlan`, copied into `AnchorPlanView` by
+  `notifier.go::loadAnchorPlans`). The line renders only for a well-formed
+  declaration (`plan.NewArchitecturalDecision.Declared()`); planner-authored
+  text is flattened to one line and bounded like the model-recommendation
+  rationale, and like the plan summary it does not neutralize `@`-mentions.
+  Superseded plans and `status_template.go` are unchanged. This is a rendered
+  line inside an existing section, not a new surface: no Notifier method or
+  audit kind is added.
 - **Plan content lives in the artifact store, not the audit chain.** The
   anchor loads the current + superseded plans via the optional
   `Deps.Artifacts` (`PlanArtifactLister`) — the latest plan artifact (by
@@ -842,8 +854,10 @@ Notes:
   expensive-test-strategy-vs-budget signal, the count-derived over-cap
   advisory (#2053), and the NEAR-cap advisory (#2492) — the plan's scope
   lands within a few files of the implement `max_files_changed` cap, naming
-  the remaining headroom (more emphatically for a decomposed plan) — with
-  payload `{warnings}`.
+  the remaining headroom (more emphatically for a decomposed plan) — and,
+  appended last, the new-architectural-decision advisory (E78.4 / #3748)
+  when the plan declares `new_architectural_decision` — with payload
+  `{warnings}`.
   Advisory + fail-open (an unparseable plan or an audit-append failure
   writes no entry and never blocks the upload) and — the one divergence
   from the sibling plan-gate sweeps — written ONLY when `Warnings()`
