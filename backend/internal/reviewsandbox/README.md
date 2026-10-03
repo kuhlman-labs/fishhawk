@@ -69,7 +69,14 @@ diff-only review.
   instruction exactly like `AGENTS.md`; its omission was the reopened C1 bypass
   in the #2486 fix-up), `CLAUDE.md` and `CLAUDE.local.md` (claude-code), at ANY
   depth, plus everything under a `.claude/` or `.codex/` directory (the CLIs'
-  config/state dirs: settings, commands, agents, skills, `config.toml`). This
+  config/state dirs: settings, commands, agents, skills, `config.toml`) or an
+  `.agents/` directory (the cross-tool Agent Skills path codex scans for
+  `.agents/skills/*/SKILL.md` at every level up to the repo root; skipped
+  wholesale, not just `skills/`, so a later discovery path there is closed by
+  default). Every match is case-insensitive: the tree lands on the host
+  filesystem, and on a case-insensitive one (macOS APFS) a CLI opening
+  `.agents/skills` or `AGENTS.md` resolves to a tracked `.Agents/` or
+  `agents.md`. This
   closes an
   approval-laundering channel: this repo's conventions REQUIRE ordinary PRs to
   edit `AGENTS.md`, so without the skip a PR editing it would boot its own

@@ -1,0 +1,174 @@
+#!/usr/bin/env bash
+# Hermetic test for scripts/is-run-agent. Drives the REAL script against
+# temp-dir fixtures named like each runner agent tree, asserting both the
+# exit status and the printed verdict. House style follows
+# scripts/test-site-voice: PASS/FAIL counters, non-zero exit on any FAIL. Run
+# by `scripts/test verify` via _verify_gate_harnesses, and standalone.
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+CHECK="$REPO_ROOT/scripts/is-run-agent"
+PASS=0
+FAIL=0
+
+pass() { echo "PASS: $1"; PASS=$((PASS + 1)); }
+fail() { echo "FAIL: $1"; FAIL=$((FAIL + 1)); }
+
+tmproot=$(mktemp -d)
+trap 'rm -rf "$tmproot"' EXIT
+
+out=""
+status=0
+run_check() {
+  out="$(env -u FISHHAWK_RUN_ID -u FISHHAWK_FORGE_WRITES "$CHECK" "$1" 2>&1)"
+  status=$?
+}
+
+# expect_run_agent <name> <dir> <reason-substring>
+expect_run_agent() {
+  run_check "$2"
+  if [ "$status" -eq 10 ] && [[ "$out" == "run-agent: "*"$3"* ]]; then
+    pass "$1"
+  else
+    fail "$1 (status=$status out=$out)"
+  fi
+}
+
+# expect_operator <name> <dir>
+expect_operator() {
+  run_check "$2"
+  if [ "$status" -eq 0 ] && [ "$out" = "operator" ]; then
+    pass "$1"
+  else
+    fail "$1 (status=$status out=$out)"
+  fi
+}
+
+# mk_git <dir>: a minimal git checkout at dir.
+mk_git() {
+  mkdir -p "$1" && git -C "$1" init -q 2>/dev/null
+}
+
+# r1-r3 — each runner agent tree, as a git checkout.
+mk_git "$tmproot/repo/.git/fishhawk-worktrees/run-abc123"
+expect_run_agent "r1 run worktree" "$tmproot/repo/.git/fishhawk-worktrees/run-abc123" "run worktree"
+ACC_TREE="fishhawk-acceptance-tree-3a8cc5f5-85cd-4664-8b7c-6974739db24e-123bc991-6f01-4850-8d83-8cc8ac19a3e6"
+mk_git "$tmproot/$ACC_TREE"
+expect_run_agent "r2 acceptance tree" "$tmproot/$ACC_TREE" "acceptance tree"
+mk_git "$tmproot/fishhawk-conflict-XYZ/tree"
+expect_run_agent "r3 conflict-resolution tree" "$tmproot/fishhawk-conflict-XYZ/tree" "conflict-resolution tree"
+
+# r4 — invoked from a SUBDIRECTORY of a run tree: the run tree's path is a
+# prefix of the physical path, so it still matches.
+mkdir -p "$tmproot/fishhawk-conflict-XYZ/tree/backend/internal"
+expect_run_agent "r4 subdirectory of a run tree" "$tmproot/fishhawk-conflict-XYZ/tree/backend/internal" "conflict-resolution tree"
+
+# r5 — a run-tree-shaped path that is NOT a git checkout still matches.
+mkdir -p "$tmproot/plain/fishhawk-worktrees/run-zzz"
+expect_run_agent "r5 non-git run-tree path" "$tmproot/plain/fishhawk-worktrees/run-zzz" "run worktree"
+
+# r6 — the acceptance agent's own workdir (os.MkdirTemp "fishhawk-acceptance-*",
+# a numeric suffix), not a git checkout.
+mkdir -p "$tmproot/fishhawk-acceptance-2836411907"
+expect_run_agent "r6 acceptance workdir" "$tmproot/fishhawk-acceptance-2836411907" "acceptance workdir"
+
+# r7/r8 — subdirectories of the acceptance shapes still match.
+mkdir -p "$tmproot/fishhawk-acceptance-2836411907/sub"
+expect_run_agent "r7 acceptance workdir subdirectory" "$tmproot/fishhawk-acceptance-2836411907/sub" "acceptance workdir"
+mkdir -p "$tmproot/$ACC_TREE/backend/internal"
+expect_run_agent "r8 acceptance tree subdirectory" "$tmproot/$ACC_TREE/backend/internal" "acceptance tree"
+
+
+# o1 — an ordinary operator checkout.
+mk_git "$tmproot/fishhawk"
+expect_operator "o1 operator checkout" "$tmproot/fishhawk"
+
+# o2 — an operator worktree under .claude/worktrees is NOT a run tree.
+mk_git "$tmproot/fishhawk/.claude/worktrees/feature-x"
+expect_operator "o2 operator .claude worktree" "$tmproot/fishhawk/.claude/worktrees/feature-x"
+
+# o3/o4 — operator checkouts merely NAMED like a conflict tree are not run
+# agents: the conflict shape is <dir>/fishhawk-conflict-<rand>/tree exactly.
+mk_git "$tmproot/fishhawk/.claude/worktrees/fishhawk-conflict-resolver-fix"
+expect_operator "o3 operator worktree named fishhawk-conflict-*" "$tmproot/fishhawk/.claude/worktrees/fishhawk-conflict-resolver-fix"
+mk_git "$tmproot/src/fishhawk-conflict-test/sub/tree"
+expect_operator "o4 operator path with a deeper /tree" "$tmproot/src/fishhawk-conflict-test/sub/tree"
+
+# o5 — a component that merely ENDS in fishhawk-worktrees is not the lineage
+# directory.
+mk_git "$tmproot/my-fishhawk-worktrees/run-x"
+expect_operator "o5 component merely ending in fishhawk-worktrees" "$tmproot/my-fishhawk-worktrees/run-x"
+
+# o6 — a child of fishhawk-worktrees that only CONTAINS run- is not a run
+# worktree (the component must START with run-).
+mk_git "$tmproot/repo2/.git/fishhawk-worktrees/myrun-x"
+expect_operator "o6 fishhawk-worktrees child merely containing run-" "$tmproot/repo2/.git/fishhawk-worktrees/myrun-x"
+
+# o7/o8 — operator worktrees merely NAMED like the acceptance shapes: the tree
+# needs two UUIDs, the workdir an all-digit suffix.
+mk_git "$tmproot/fishhawk/.claude/worktrees/fishhawk-acceptance-tree-fix"
+expect_operator "o7 operator worktree named fishhawk-acceptance-tree-*" "$tmproot/fishhawk/.claude/worktrees/fishhawk-acceptance-tree-fix"
+mk_git "$tmproot/fishhawk/.claude/worktrees/fishhawk-acceptance-gate"
+expect_operator "o8 operator worktree named fishhawk-acceptance-*" "$tmproot/fishhawk/.claude/worktrees/fishhawk-acceptance-gate"
+
+# o9/o10 — near misses on the anchors: a workdir-like name with a non-digit
+# after the digits (the `(/|$)` anchor), and a tree-like name without a run UUID.
+mk_git "$tmproot/fishhawk/.claude/worktrees/fishhawk-acceptance-2024x"
+expect_operator "o9 fishhawk-acceptance-<digits><letter>" "$tmproot/fishhawk/.claude/worktrees/fishhawk-acceptance-2024x"
+mk_git "$tmproot/fishhawk/.claude/worktrees/fishhawk-acceptance-tree-notauuid-123"
+expect_operator "o10 acceptance-tree name without a run UUID" "$tmproot/fishhawk/.claude/worktrees/fishhawk-acceptance-tree-notauuid-123"
+
+# o11 — an operator COPY of a real acceptance tree with an extra suffix (the
+# `(/|$)` anchor after the second UUID).
+mk_git "$tmproot/$ACC_TREE-debug"
+expect_operator "o11 operator copy <tree>-debug" "$tmproot/$ACC_TREE-debug"
+
+# e1 — FISHHAWK_RUN_ID alone marks a run agent (CI-hosted runners).
+out="$(env -u FISHHAWK_FORGE_WRITES FISHHAWK_RUN_ID=11111111-2222-3333-4444-555555555555 "$CHECK" "$tmproot/fishhawk" 2>&1)"
+status=$?
+if [ "$status" -eq 10 ] && [ "$out" = "run-agent: FISHHAWK_RUN_ID is set" ]; then
+  pass "e1 FISHHAWK_RUN_ID set"
+else
+  fail "e1 FISHHAWK_RUN_ID set (status=$status out=$out)"
+fi
+
+# e2 — an EMPTY FISHHAWK_RUN_ID is not a marker.
+out="$(env -u FISHHAWK_FORGE_WRITES FISHHAWK_RUN_ID= "$CHECK" "$tmproot/fishhawk" 2>&1)"
+status=$?
+if [ "$status" -eq 0 ] && [ "$out" = "operator" ]; then
+  pass "e2 empty FISHHAWK_RUN_ID"
+else
+  fail "e2 empty FISHHAWK_RUN_ID (status=$status out=$out)"
+fi
+
+# e3 — FISHHAWK_FORGE_WRITES=deny (the interim acceptance-agent marker) is a
+# run agent even in an operator checkout: an acceptance agent that cd'd there.
+out="$(env -u FISHHAWK_RUN_ID FISHHAWK_FORGE_WRITES=deny "$CHECK" "$tmproot/fishhawk" 2>&1)"
+status=$?
+if [ "$status" -eq 10 ] && [[ "$out" == "run-agent: FISHHAWK_FORGE_WRITES=deny"* ]]; then
+  pass "e3 FISHHAWK_FORGE_WRITES=deny in an operator checkout"
+else
+  fail "e3 FISHHAWK_FORGE_WRITES=deny in an operator checkout (status=$status out=$out)"
+fi
+
+# e4 — any other FISHHAWK_FORGE_WRITES value is not a marker.
+out="$(env -u FISHHAWK_RUN_ID FISHHAWK_FORGE_WRITES=allow "$CHECK" "$tmproot/fishhawk" 2>&1)"
+status=$?
+if [ "$status" -eq 0 ] && [ "$out" = "operator" ]; then
+  pass "e4 FISHHAWK_FORGE_WRITES=allow"
+else
+  fail "e4 FISHHAWK_FORGE_WRITES=allow (status=$status out=$out)"
+fi
+
+# e5 — a path signal still wins with FISHHAWK_FORGE_WRITES set to another
+# value: the env does not mask the path checks.
+out="$(env -u FISHHAWK_RUN_ID FISHHAWK_FORGE_WRITES=allow "$CHECK" "$tmproot/fishhawk-conflict-XYZ/tree" 2>&1)"
+status=$?
+if [ "$status" -eq 10 ] && [[ "$out" == "run-agent: conflict-resolution tree"* ]]; then
+  pass "e5 path signal with FISHHAWK_FORGE_WRITES=allow"
+else
+  fail "e5 path signal with FISHHAWK_FORGE_WRITES=allow (status=$status out=$out)"
+fi
+
+echo "test-is-run-agent: $PASS passed, $FAIL failed"
+[ "$FAIL" -eq 0 ]

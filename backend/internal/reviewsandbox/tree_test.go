@@ -136,8 +136,12 @@ func TestExtractTar_SkipsSymlinks(t *testing.T) {
 // TestExtractTar_SkipsAgentInstructionFiles is the C1 named guard (exact test
 // name, machine-checked): agent-instruction files and config dirs are SKIPPED
 // and counted, while ordinary files land. Covers AGENTS.md / AGENTS.override.md
-// / CLAUDE.md / CLAUDE.local.md at any depth and everything under .claude/ and
-// .codex/. The AGENTS.override.md entries (root and nested) pin the #2486
+// / CLAUDE.md / CLAUDE.local.md at any depth and everything under .claude/,
+// .codex/ and .agents/, matched case-insensitively (the re-cased entries). The
+// .agents/ entries (root and nested) pin the codex
+// Agent Skills discovery path: codex loads .agents/skills/*/SKILL.md from every
+// directory level, so a tracked skill would otherwise be auto-discovered from
+// the grounded tree. The AGENTS.override.md entries (root and nested) pin the #2486
 // fix-up: codex checks the .override. variant BEFORE AGENTS.md at each level, so
 // a tracked AGENTS.override.md at any depth would otherwise survive extraction
 // and reopen the approval-laundering channel C1 made blocking.
@@ -154,19 +158,30 @@ func TestExtractTar_SkipsAgentInstructionFiles(t *testing.T) {
 		reg(".claude/settings.json", "{}"),
 		reg(".codex/config.toml", "x=1"),
 		reg("backend/.claude/commands/foo.md", "cmd"),
+		reg(".agents/skills/x/SKILL.md", "---\nname: x\ndescription: planted\n---\n"),
+		reg("backend/.agents/skills/y/SKILL.md", "nested planted skill"),
+		// Re-cased variants: on a case-insensitive host filesystem a CLI
+		// opening `.agents/skills` or `AGENTS.md` resolves to these.
+		reg(".Agents/skills/z/SKILL.md", "re-cased planted skill"),
+		reg(".CLAUDE/settings.json", "{}"),
+		reg("docs/agents.md", "re-cased codex instructions"),
+		reg("cli/.Codex/config.toml", "x=1"),
+		reg("backend/agents.OVERRIDE.md", "re-cased codex override"),
+		reg("docs/claude.md", "re-cased claude instructions"),
+		reg("web/claude.LOCAL.md", "re-cased claude local override"),
 		reg("main.go", "package main"), // an ordinary file that MUST land
 	})
 	stats, err := extractTar(bytes.NewReader(data), dest, DefaultLimits())
 	if err != nil {
 		t.Fatalf("extractTar: %v", err)
 	}
-	if stats.Instructions != 10 {
-		t.Errorf("stats.Instructions = %d, want 10 agent-instruction skips", stats.Instructions)
+	if stats.Instructions != 19 {
+		t.Errorf("stats.Instructions = %d, want 19 agent-instruction skips", stats.Instructions)
 	}
 	if stats.Files != 1 {
 		t.Errorf("stats.Files = %d, want 1 (only main.go lands)", stats.Files)
 	}
-	for _, skipped := range []string{"AGENTS.md", "AGENTS.override.md", "CLAUDE.md", "CLAUDE.local.md", "backend/AGENTS.md", "backend/AGENTS.override.md", "docs/CLAUDE.md", ".claude/settings.json", ".codex/config.toml"} {
+	for _, skipped := range []string{"AGENTS.md", "AGENTS.override.md", "CLAUDE.md", "CLAUDE.local.md", "backend/AGENTS.md", "backend/AGENTS.override.md", "docs/CLAUDE.md", ".claude/settings.json", ".codex/config.toml", ".agents/skills/x/SKILL.md", "backend/.agents/skills/y/SKILL.md", ".Agents/skills/z/SKILL.md", ".CLAUDE/settings.json", "docs/agents.md", "cli/.Codex/config.toml", "backend/agents.OVERRIDE.md", "docs/claude.md", "web/claude.LOCAL.md"} {
 		if _, serr := os.Stat(filepath.Join(dest, skipped)); !os.IsNotExist(serr) {
 			t.Errorf("agent-instruction path %q was materialized: %v", skipped, serr)
 		}

@@ -1,0 +1,84 @@
+#!/usr/bin/env sh
+# is-run-agent: tell an agent skill whether it is running inside a Fishhawk
+# run (an unattended runner agent) or in an operator session.
+#
+# Usage: scripts/is-run-agent [DIR]     (DIR defaults to the current directory)
+#
+# Prints `operator` and exits 0, or prints `run-agent: <reason>` and exits 10.
+# Skills that stop services or delete state (.agents/skills/*) call this first
+# and stop on a non-zero exit, so this is the ONE definition of "run agent"
+# they share (#3938 review). This file is in BOTH implement stages'
+# forbidden_paths (feature_change and routine_change), so a run cannot merge a
+# weakened copy.
+#
+# Signals, in order:
+#   1. DIR's physical path (`pwd -P`) lies in a runner-owned agent tree. This
+#      is the primary signal, because the LOCAL runner sets no marker env var.
+#      A run tree's path is a prefix of every directory inside it, so matching
+#      the physical path also covers a skill invoked from a subdirectory. Each
+#      shape is matched as one exact path component (not a substring), so an
+#      operator checkout merely NAMED like one is not misclassified:
+#        .../fishhawk-worktrees/run-<id>[/...]            lineage worktree
+#        .../fishhawk-acceptance-tree-<uuid>-<uuid>[/...] acceptance merge-candidate tree
+#        .../fishhawk-acceptance-<digits>[/...]          acceptance agent workdir (os.MkdirTemp)
+#        .../fishhawk-conflict-<rand>/tree[/...]          conflict-resolution tree
+#      The acceptance-tree shape is exactly two UUIDs (run id, stage id; the
+#      runner is invoked with UUID --run-id/--stage-id), so neither an operator
+#      worktree like `fishhawk-acceptance-tree-fix` nor an operator copy like
+#      `<tree>-debug` is refused. runner/cmd/fishhawk-runner
+#      TestIsRunAgentMatchesAcceptanceTreePath renders the runner's real
+#      acceptanceTreePath and runs this script on it, so a rename in the Go
+#      format string fails a test. The acceptance WORKDIR is not a git checkout, so a skill (which locates
+#      this script via `git rev-parse`) cannot reach it from there; that
+#      pattern serves direct callers passing DIR.
+#   2. FISHHAWK_RUN_ID is non-empty (CI-hosted runners only: GitLab CI,
+#      deploy triggers).
+#   3. FISHHAWK_FORGE_WRITES=deny (INTERIM, until #3945 stamps a dedicated
+#      marker on every agent spawn). runner/internal/acceptenv injects it as a
+#      fixed value into every acceptance agent, so it still catches one that
+#      has cd'd into an operator checkout, where no path pattern applies. It
+#      means "forge writes disabled", so an operator who set it for dev-mode
+#      testing is refused too. That is the SAFE direction for a guard: the
+#      printed reason tells the operator to unset it.
+#
+# A new runner agent tree must be added below. The patterns are pinned by
+# scripts/test-is-run-agent, run inside `scripts/test verify`.
+set -u
+
+dir="${1:-.}"
+phys="$(cd "$dir" 2>/dev/null && pwd -P)" || phys="$dir"
+
+matches() {
+  printf '%s\n' "$phys" | grep -Eq "$1"
+}
+
+if matches '/fishhawk-worktrees/run-[^/]+(/|$)'; then
+  echo "run-agent: run worktree ($phys)"
+  exit 10
+fi
+uuid='[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
+if matches "/fishhawk-acceptance-tree-$uuid-$uuid(/|\$)"; then
+  echo "run-agent: acceptance tree ($phys)"
+  exit 10
+fi
+if matches '/fishhawk-acceptance-[0-9]+(/|$)'; then
+  echo "run-agent: acceptance workdir ($phys)"
+  exit 10
+fi
+if matches '/fishhawk-conflict-[^/]+/tree(/|$)'; then
+  echo "run-agent: conflict-resolution tree ($phys)"
+  exit 10
+fi
+
+if [ -n "${FISHHAWK_RUN_ID:-}" ]; then
+  echo "run-agent: FISHHAWK_RUN_ID is set"
+  exit 10
+fi
+
+if [ "${FISHHAWK_FORGE_WRITES:-}" = "deny" ]; then
+  echo "run-agent: FISHHAWK_FORGE_WRITES=deny (the acceptance-agent marker; if you are an operator who set it for dev-mode testing, unset it and re-run)"
+  exit 10
+fi
+
+echo operator
+exit 0

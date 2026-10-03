@@ -54,7 +54,7 @@ type Stats struct {
 	Symlinks int
 	// Instructions is the number of agent-instruction entries SKIPPED (the C1
 	// guard): AGENTS.md / AGENTS.override.md / CLAUDE.md / CLAUDE.local.md at any
-	// depth, and every entry under a .claude/ or .codex/ directory.
+	// depth, and every entry under a .claude/, .codex/ or .agents/ directory.
 	Instructions int
 }
 
@@ -289,18 +289,41 @@ func safeRel(name string) (string, error) {
 //   - any component named .claude or .codex — the two CLIs' config/state
 //     directories (settings, commands, agents, skills, config.toml), skipped
 //     wholesale so nothing under them is loaded as instructions.
+//   - any component named .agents — the cross-tool Agent Skills directory
+//     (agentskills.io): codex auto-discovers skills from .agents/skills at
+//     every directory level up to the repository root, so a tracked SKILL.md
+//     there loads as an instruction exactly like AGENTS.md. Skipped wholesale
+//     like .claude/.codex rather than narrowed to .agents/skills, so a future
+//     discovery path under the same directory is closed by default.
+//
+// Every comparison is CASE-INSENSITIVE. The tree is extracted onto the host
+// filesystem, and on a case-insensitive one (macOS APFS by default) a CLI
+// opening `.agents/skills` or `AGENTS.md` resolves to a tracked `.Agents/` or
+// `agents.md`, so an exact-case match would let a re-cased path survive
+// extraction and still load as an instruction.
 func isAgentInstructionPath(rel string) bool {
 	parts := strings.Split(rel, "/")
 	for i, p := range parts {
-		if p == ".claude" || p == ".codex" {
-			return true
+		for _, dir := range agentConfigDirs {
+			if strings.EqualFold(p, dir) {
+				return true
+			}
 		}
 		if i == len(parts)-1 {
-			switch p {
-			case "AGENTS.md", "AGENTS.override.md", "CLAUDE.md", "CLAUDE.local.md":
-				return true
+			for _, name := range agentInstructionFiles {
+				if strings.EqualFold(p, name) {
+					return true
+				}
 			}
 		}
 	}
 	return false
 }
+
+// agentConfigDirs are the directory components skipped wholesale, and
+// agentInstructionFiles the file basenames skipped at any depth, by
+// isAgentInstructionPath (compared case-insensitively).
+var (
+	agentConfigDirs       = []string{".claude", ".codex", ".agents"}
+	agentInstructionFiles = []string{"AGENTS.md", "AGENTS.override.md", "CLAUDE.md", "CLAUDE.local.md"}
+)

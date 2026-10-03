@@ -1,0 +1,79 @@
+{
+  "_comment": "Shared fixture for the twin TestRepoSpecForbidsAgentInstructionPaths tests in runner/internal/constraint and backend/internal/policy: ONE source of truth across the two modules (AGENTS.md's cross-module golden rule). `classes` are path lists; `cases` say, per workflow stage, which classes the stage's forbidden_paths must reject and which must stay writable. root_agents_case_variants has exactly one variant per root-level AGENTS.md glob, flipping only that glob's letter, so deleting any one glob fails the tests.",
+  "classes": {
+    "config_dir_paths": [
+      ".agents/skills/x/SKILL.md",
+      "backend/.agents/skills/x/SKILL.md",
+      ".Agents/skills/x/SKILL.md",
+      "docs/.AGENTS/skills/x/SKILL.md",
+      ".claude/settings.json",
+      "backend/.claude/skills/x/SKILL.md",
+      ".CLAUDE/settings.json",
+      ".codex/config.toml",
+      "cli/.Codex/config.toml"
+    ],
+    "instruction_files": [
+      "backend/AGENTS.md",
+      "docs/agents.md",
+      "AGENTS.override.md",
+      "backend/agents.OVERRIDE.md",
+      "CLAUDE.md",
+      "docs/claude.md",
+      "CLAUDE.local.md",
+      "web/claude.LOCAL.md"
+    ],
+    "root_agents": [
+      "AGENTS.md"
+    ],
+    "root_agents_case_variants": [
+      "aGENTS.md",
+      "AgENTS.md",
+      "AGeNTS.md",
+      "AGEnTS.md",
+      "AGENtS.md",
+      "AGENTs.md",
+      "AGENTS.Md",
+      "AGENTS.mD"
+    ],
+    "guard_files": [
+      "scripts/is-run-agent",
+      "scripts/test-is-run-agent"
+    ],
+    "ordinary": [
+      "docs/README.md",
+      "backend/internal/agents/agents.go",
+      "docs/agents-guide.md",
+      "scripts/test"
+    ]
+  },
+  "cases": [
+    {
+      "workflow": "feature_change",
+      "stage": "implement",
+      "must_forbid": [
+        "config_dir_paths",
+        "instruction_files",
+        "root_agents_case_variants",
+        "guard_files"
+      ],
+      "must_stay_writable": [
+        "ordinary",
+        "root_agents"
+      ]
+    },
+    {
+      "workflow": "routine_change",
+      "stage": "implement",
+      "must_forbid": [
+        "config_dir_paths",
+        "instruction_files",
+        "root_agents",
+        "root_agents_case_variants",
+        "guard_files"
+      ],
+      "must_stay_writable": [
+        "ordinary"
+      ]
+    }
+  ]
+}
