@@ -307,6 +307,12 @@ type RulesetRequiredCheck struct {
 type ComparePatchFile struct {
 	Path   string
 	Status string
+	// PreviousPath is the rename SOURCE when Status is "renamed" (GitHub's
+	// `previous_filename`, GitLab's `old_path` on a `renamed_file` entry).
+	// Empty when the forge reports none — a non-rename, or a rename whose
+	// source the forge omitted; a consumer that must evaluate the source
+	// treats an empty PreviousPath on a rename as unknown, never as absent.
+	PreviousPath string
 }
 
 // ComparePatchResult carries the unified-diff text + changed-file list for
