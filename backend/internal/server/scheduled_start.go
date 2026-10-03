@@ -101,10 +101,20 @@ const (
 	ScheduledStartRefused ScheduledStartKind = "refused"
 )
 
+// ScheduledKeyOccupiedCode is the refusal code StartScheduledRun synthesizes
+// when the window's Idempotency-Key replays (200) a run that is NOT a scheduled
+// run of this workflow — a run an ordinary POST /v0/runs minted under the
+// upcoming window's key (`scheduled:<workflow_id>:<window UTC>`) before the
+// scheduler reached it. handleCreateRun itself answers 200 for that replay; the
+// code is a scheduler-domain classification, never an HTTP response.
+const ScheduledKeyOccupiedCode = "scheduled_key_occupied"
+
 // ScheduledStartOutcome is the classified result of one StartScheduledRun.
 type ScheduledStartOutcome struct {
 	Kind ScheduledStartKind
-	// RunID is the minted or replayed run (started / already_started).
+	// RunID is the minted or replayed run (started / already_started). A
+	// refusal for an occupied window key (scheduled_key_occupied) also sets it,
+	// to the OCCUPANT run; every other refusal leaves it nil.
 	RunID uuid.UUID
 	// Status is the HTTP status handleCreateRun answered with.
 	Status int
@@ -122,11 +132,14 @@ type ScheduledStartOutcome struct {
 // Identity and the unexported scheduledAdmissionKey marker, the only thing
 // that admits trigger_source=scheduled.
 //
-// Outcome mapping: 201 → started; 200 → already_started (the replay is a
-// pure (repo, key) lookup that returns the prior run, so no conflict code
-// exists to handle); any other 4xx → refused, carrying the envelope's code,
-// message and status. A 5xx — or any status this mapping does not recognise
-// — is returned as an ERROR: it is transient, and the scheduler retries the
+// Outcome mapping: 201 → started; 200 → already_started ONLY when the
+// replayed run is a scheduled run of THIS workflow (a pure (repo, key) lookup
+// answers any run holding the key, so a run an ordinary POST /v0/runs minted
+// under the window's key would otherwise be recorded as the window started and
+// the window would never run) — a replay of any other run is refused 409
+// scheduled_key_occupied, carrying the occupant's id; any other 4xx → refused,
+// carrying the envelope's code, message and status. A 5xx — or any status
+// this mapping does not recognise — is returned as an ERROR: it is transient, and the scheduler retries the
 // window on its next tick. The honest residual of reading the handler's
 // status: a future handler path answering 4xx for a transient condition would
 // be read as a definitive refusal for that window.
@@ -161,12 +174,14 @@ func (s *Server) StartScheduledRun(ctx context.Context, p ScheduledRunParams) (S
 
 	cw := &capturingResponseWriter{header: http.Header{}}
 	s.handleCreateRun(cw, hr)
-	return classifyScheduledStart(cw.status(), cw.body.Bytes())
+	return classifyScheduledStart(cw.status(), cw.body.Bytes(), p.WorkflowID)
 }
 
 // classifyScheduledStart maps handleCreateRun's answer onto the outcome
-// contract documented on StartScheduledRun.
-func classifyScheduledStart(status int, body []byte) (ScheduledStartOutcome, error) {
+// contract documented on StartScheduledRun. workflowID is the workflow the
+// window belongs to: a 200 replay counts as already_started only when the
+// replayed run is a scheduled run of that workflow.
+func classifyScheduledStart(status int, body []byte, workflowID string) (ScheduledStartOutcome, error) {
 	switch {
 	case status == http.StatusCreated || status == http.StatusOK:
 		var rr runResponse
@@ -175,6 +190,21 @@ func classifyScheduledStart(status int, body []byte) (ScheduledStartOutcome, err
 		}
 		kind := ScheduledStartStarted
 		if status == http.StatusOK {
+			// A replay: an existing run holds the key. Only a scheduled run of
+			// THIS workflow means the window was already started; any other
+			// occupant is refused. An empty trigger_source or workflow_id fails
+			// the comparison, so a short body fails closed to refused, never
+			// already_started.
+			if rr.TriggerSource != string(run.TriggerScheduled) || rr.WorkflowID != workflowID {
+				return ScheduledStartOutcome{
+					Kind:   ScheduledStartRefused,
+					Status: http.StatusConflict,
+					RunID:  rr.ID,
+					Code:   ScheduledKeyOccupiedCode,
+					Message: fmt.Sprintf("Idempotency-Key is occupied by run %s (trigger_source %s, workflow_id %s), not a scheduled run of workflow %s; the window is not started",
+						rr.ID, rr.TriggerSource, rr.WorkflowID, workflowID),
+				}, nil
+			}
 			kind = ScheduledStartAlreadyStarted
 		}
 		return ScheduledStartOutcome{Kind: kind, RunID: rr.ID, Status: status}, nil

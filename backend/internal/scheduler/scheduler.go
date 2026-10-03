@@ -23,7 +23,11 @@
 // in-memory attempted mark: that mark only suppresses a per-tick audit flood.
 // The run row's exactly-once guarantee is the (idempotency_key, repo) unique
 // index behind POST /v0/runs' Idempotency-Key replay, which a restarted
-// process (with an empty mark) reaches and which answers already_started.
+// process (with an empty mark) reaches and which answers already_started — but
+// only when the replayed run is a scheduled run of the same workflow. A run an
+// ordinary POST /v0/runs minted under the window's key is a squat, answered
+// as a refusal (scheduled_key_occupied) carrying the occupant's run_id, never
+// as an already_started skip.
 //
 // The package never imports backend/internal/server: the RunStarter,
 // SpecSource and AuditAppender seams are defined HERE and bound by serve.go
@@ -52,19 +56,24 @@ const DefaultInterval = 60 * time.Second
 
 // Audit categories the scheduler emits. They ride the GLOBAL chain
 // (AppendGlobalChained) because a refusal has no run to chain on; the run
-// linkage of a started/skipped window travels in the payload's run_id field.
+// linkage of a started/skipped window (and of a refusal that names the
+// occupant of the window's key) travels in the payload's run_id field.
 // Registered in backend/internal/audit/categories.go.
 const (
 	// CategoryScheduledRunStarted records a due window whose start created a
 	// new run.
 	CategoryScheduledRunStarted = "scheduled_run_started"
 	// CategoryScheduledRunSkipped records a due window whose start replayed
-	// an existing run (the Idempotency-Key matched: a restart, or a second
-	// instance, already started this window).
+	// an existing SCHEDULED run of the same workflow (the Idempotency-Key
+	// matched: a restart, or a second instance, already started this window).
+	// A key held by any other run is a refusal, not a skip.
 	CategoryScheduledRunSkipped = "scheduled_run_skipped"
 	// CategoryScheduledRunRefused records a due window whose start was
 	// refused by an admission control (e.g. budget_exhausted, the applies_to
-	// or charter gates), carrying the refusal's code, message and status.
+	// or charter gates) or because the window's Idempotency-Key is occupied by
+	// a run that is not a scheduled run of this workflow
+	// (scheduled_key_occupied), carrying the refusal's code, message and
+	// status — and, for the occupied key, the occupant's run_id.
 	CategoryScheduledRunRefused = "scheduled_run_refused"
 )
 
@@ -117,7 +126,9 @@ type StartRequest struct {
 // an outcome: it is the starter's error return.
 type StartOutcome struct {
 	Kind OutcomeKind
-	// RunID is set for OutcomeStarted and OutcomeAlreadyStarted.
+	// RunID is set for OutcomeStarted and OutcomeAlreadyStarted, and for an
+	// OutcomeRefused that names an occupant (scheduled_key_occupied: the run
+	// holding the window's key). Other refusals leave it empty.
 	RunID string
 	// Code, Message and Status are set for OutcomeRefused: the admission
 	// error code (e.g. budget_exhausted), its message and the HTTP status.
@@ -442,6 +453,9 @@ func (t *Ticker) tickWorkflow(ctx context.Context, logger *slog.Logger, repo, wo
 		payload["code"] = out.Code
 		payload["message"] = out.Message
 		payload["status"] = out.Status
+		if out.RunID != "" {
+			payload["run_id"] = out.RunID
+		}
 	}
 	t.emit(ctx, logger, category, payload, now)
 	t.markAttempted(repo, workflowID, window)

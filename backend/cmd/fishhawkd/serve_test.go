@@ -6424,6 +6424,20 @@ func TestScheduledRunStarter_MapsOutcomes(t *testing.T) {
 		t.Errorf("refused: out=%+v err=%v; want code/message/status carried verbatim and no run id", out, err)
 	}
 
+	// A key-occupied refusal NAMES the occupant: the adapter copies a non-nil
+	// RunID for EVERY kind (the copy sits outside the kind switch), so the
+	// scheduler's refused payload can carry run_id.
+	//
+	// Counterfactual: move the RunID copy inside the started/already_started
+	// arms and out.RunID reads "" here — RED.
+	out, err = starterReturning(server.ScheduledStartOutcome{
+		Kind: server.ScheduledStartRefused, RunID: runID, Status: 409,
+		Code: server.ScheduledKeyOccupiedCode, Message: "occupied",
+	}, nil, nil).StartScheduledRun(context.Background(), req)
+	if err != nil || out.Kind != scheduler.OutcomeRefused || out.Code != "scheduled_key_occupied" || out.Message != "occupied" || out.Status != 409 || out.RunID != runID.String() {
+		t.Errorf("key-occupied refusal: out=%+v err=%v; want refused/409 scheduled_key_occupied carrying the occupant run id %s", out, err, runID)
+	}
+
 	transient := errors.New("transient status 503")
 	if _, err := starterReturning(server.ScheduledStartOutcome{}, transient, nil).StartScheduledRun(context.Background(), req); !errors.Is(err, transient) {
 		t.Errorf("error passthrough = %v, want %v", err, transient)
