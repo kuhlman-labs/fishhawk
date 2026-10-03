@@ -9,7 +9,7 @@ The deterministic half of the diff secrets check (ADR-084 D5 / rule 5, E80.3 / [
 | `Scan(patch, patterns) Result` | Walks the patch; one `Hit{Path, Line, Pattern}` per (added line, pattern). `Result.AddedLines` counts the `+` lines scanned. Production passes `redaction.DefaultPatterns` — the same set the runner applies to trace bytes, so a format added there is detected here too. |
 | `GroupHits(hits) []Group` | Folds by (path, pattern); lines sorted and de-duplicated; groups ordered by path then pattern. |
 | `CheckKey(pattern, path)` / `Group.Key()` | `diff_secrets\|<pattern>\|<path>` — the server's de-duplication key. |
-| `Note(group)` | The concern note: pattern class + `path:line` list (capped at 20 locations, remainder counted), the provenance sentence, and the clearing instruction (remove/rotate, or a human waive with a reason). |
+| `Note(group)` | The concern note: pattern class + `path:line` list (capped at 20 locations, remainder counted; an `UnknownLine` renders `path:(line unknown)`), the provenance sentence, and the clearing instruction (remove/rotate, or a human waive with a reason). |
 
 ## Parse rules
 
@@ -18,7 +18,7 @@ A header/hunk state machine, one line at a time:
 - `diff --git` opens a section, resets to HEADER state and seeds the path from the header's b-side. GitHub compare patches are rebuilt as `diff --git a/<p> b/<p>` plus hunks with NO `---`/`+++` lines (`githubclient.ComparePatch`), so for the fix-up re-review delta and the decomposed parent's consolidated review this is the only path source. An unquoted header with a space in the name is resolved by the equal-halves rule (a non-rename header is exactly `a/<p> b/<p>`), then by the last ` b/`.
 - `---` / `+++` are headers ONLY in header state — between `diff --git` and the first `@@`. Inside a hunk, an added line whose content begins `++ ` renders `+++ …` and is CONTENT: it is scanned and does not rename the section.
 - `+++ <path>` overrides the section path (git C-quoting decoded, `b/` stripped, a plain `diff -u` timestamp cut at the tab); `+++ /dev/null` keeps the git-header path.
-- `@@ -a,b +c,d @@` seeds the new-side counter at `c` and enters hunk state. A malformed hunk header is ignored.
+- `@@ -a,b +c,d @@` seeds the new-side counter at `c` and enters hunk state. A MALFORMED `@@` header (its `+c` cannot be parsed) ALSO enters hunk state — or keeps it, mid-hunk — with the new-side line UNKNOWN until the next well-formed header: the `+` lines under it are still scanned and each hit records `UnknownLine` (0), which `Note` renders `<path>:(line unknown)`. Staying in header state instead would discard every added line under the header, and a missed secret is silent (carried from #3760 into E80.4 / [#3761](https://github.com/kuhlman-labs/fishhawk/issues/3761)). Pinned by `TestScan_MalformedHunkHeaderStillScansAddedLines`.
 - In a hunk: `+` is scanned and advances the counter; ` ` (and an empty line — a context line whose trailing space was stripped) advances it; `-` and `\ No newline at end of file` do neither. **Removed and context lines are never scanned**: deleting a credential is the fix, not the defect.
 
 ## What never carries bytes

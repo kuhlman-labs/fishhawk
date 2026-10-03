@@ -26,6 +26,13 @@ import (
 // attributed to a placeholder still reaches a human.
 const UnresolvedPath = "(unresolved path)"
 
+// UnknownLine is the Line recorded for a hit under a malformed `@@` hunk
+// header, whose new-side start cannot be parsed. The added line is still
+// scanned — only its position is lost — and Note renders it as
+// "<path>:(line unknown)". No real new-side line is 0: a hunk with added
+// lines starts at 1 or later.
+const UnknownLine = 0
+
 // CheckName is the check identifier carried in every check key and in the
 // server's diff_secrets_detected audit payload.
 const CheckName = "diff_secrets"
@@ -38,7 +45,8 @@ const noteLineCap = 20
 // Hit is one added line matching one pattern. It deliberately carries no
 // field that can hold the matched bytes: Path is the file (itself passed
 // through the pattern set, so a credential-shaped FILE NAME is recorded
-// redacted), Line is the new-side line number, Pattern is the pattern's Name.
+// redacted), Line is the new-side line number (UnknownLine under a malformed
+// hunk header), Pattern is the pattern's Name.
 type Hit struct {
 	Path    string
 	Line    int
@@ -84,7 +92,9 @@ const (
 //     C-quoted name and stripping the `b/` prefix); `+++ /dev/null` (a
 //     deletion) keeps the git-header path;
 //   - `@@ -a,b +c,d @@` seeds the new-side line counter at c and enters hunk
-//     state;
+//     state; a MALFORMED `@@` header enters (or keeps) hunk state too, with
+//     the new-side line unknown until the next well-formed header, so the
+//     added lines under it are still scanned and record UnknownLine;
 //   - in hunk state a `+` line is scanned and advances the counter, a ` `
 //     context line (or an empty line, a context line whose trailing space was
 //     stripped) advances it, and `-` and `\ No newline at end of file` do not.
@@ -96,6 +106,11 @@ func Scan(patch string, patterns []redaction.Pattern) Result {
 	state := stateHeader
 	path := ""
 	newLine := 0
+	// lineKnown is false under a malformed `@@` header until the next
+	// well-formed one: hits there record UnknownLine instead of a guess. A
+	// `diff --git` needs no reset: header state discards every line until
+	// the next `@@`, which sets the flag afresh.
+	lineKnown := false
 	for _, line := range strings.Split(patch, "\n") {
 		if strings.HasPrefix(line, "diff --git ") {
 			state = stateHeader
@@ -104,10 +119,13 @@ func Scan(patch string, patterns []redaction.Pattern) Result {
 			continue
 		}
 		if strings.HasPrefix(line, "@@") {
-			if start, ok := hunkNewStart(line); ok {
-				state = stateHunk
-				newLine = start
-			}
+			// A malformed header still opens (or keeps) a hunk: staying in
+			// header state would DISCARD every `+` line under it, and a
+			// missed secret is silent. Only the line number is lost.
+			start, ok := hunkNewStart(line)
+			state = stateHunk
+			newLine = start
+			lineKnown = ok
 			continue
 		}
 		if state == stateHeader {
@@ -122,11 +140,15 @@ func Scan(patch string, patterns []redaction.Pattern) Result {
 		case strings.HasPrefix(line, "+"):
 			res.AddedLines++
 			content := line[1:]
+			at := UnknownLine
+			if lineKnown {
+				at = newLine
+			}
 			for _, p := range patterns {
 				if p.Regex != nil && p.Regex.MatchString(content) {
 					res.Hits = append(res.Hits, Hit{
 						Path:    displayPath(path, patterns),
-						Line:    newLine,
+						Line:    at,
 						Pattern: p.Name,
 					})
 				}
@@ -353,7 +375,11 @@ func Note(g Group) string {
 		if i == noteLineCap {
 			break
 		}
-		locs = append(locs, g.Path+":"+strconv.Itoa(l))
+		at := strconv.Itoa(l)
+		if l == UnknownLine {
+			at = "(line unknown)"
+		}
+		locs = append(locs, g.Path+":"+at)
 	}
 	where := strings.Join(locs, ", ")
 	if extra := len(g.Lines) - len(locs); extra > 0 {
