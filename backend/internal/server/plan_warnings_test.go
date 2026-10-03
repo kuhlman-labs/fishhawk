@@ -1711,3 +1711,144 @@ workflows:
         executor:
           agent: claude-code
 `)
+
+// --- new_architectural_decision (E78.4 / #3748) ---
+
+// withNewArchitecturalDecision returns body with a new_architectural_decision
+// object set to decl. It runs plan.Validate (schema only, never semanticCheck),
+// so a whitespace-only value the schema's minLength:1 admits still reaches
+// runPlanWarnings, mirroring its json.Unmarshal decode path.
+func withNewArchitecturalDecision(t *testing.T, body []byte, decl map[string]any) []byte {
+	t.Helper()
+	var m map[string]any
+	if err := json.Unmarshal(body, &m); err != nil {
+		t.Fatalf("decode plan body: %v", err)
+	}
+	m["new_architectural_decision"] = decl
+	out, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal plan: %v", err)
+	}
+	if err := plan.Validate(out); err != nil {
+		t.Fatalf("fixture plan does not validate: %v", err)
+	}
+	return out
+}
+
+func nadDecl(adrs ...any) map[string]any {
+	if adrs == nil {
+		adrs = []any{}
+	}
+	return map[string]any{
+		"rationale":        "introduces a durable crew message bus",
+		"related_adrs":     adrs,
+		"decision_summary": "crew messages move to a durable queue",
+	}
+}
+
+// newNilRunRepoWarningsServer wires a Server with an AuditRepo fake and a NIL
+// RunRepo, so every cap-dependent advisory leg fails open and an under-cap,
+// non-decomposed plan is otherwise warning-free.
+func newNilRunRepoWarningsServer(t *testing.T) (*Server, *auditFake) {
+	t.Helper()
+	au := newAuditFake()
+	return New(Config{Addr: "127.0.0.1:0", AuditRepo: au}), au
+}
+
+// TestRunPlanWarnings_NewArchitecturalDecision_ExactlyOneWarning is the
+// counterfactual vehicle for newArchitecturalDecisionWarning: on an otherwise
+// warning-free plan (nil RunRepo, no decomposition) the declaration alone yields
+// exactly one warning naming the summary, rationale and every ADR id, recorded
+// as exactly one plan_warnings row.
+func TestRunPlanWarnings_NewArchitecturalDecision_ExactlyOneWarning(t *testing.T) {
+	s, au := newNilRunRepoWarningsServer(t)
+	body := withNewArchitecturalDecision(t, warningsPlanBody(t, nil), nadDecl("ADR-082", "#3728"))
+
+	got := s.runPlanWarnings(context.Background(), uuid.New(), uuid.New(), body)
+	if got == nil || len(got.Warnings) != 1 {
+		t.Fatalf("want exactly one warning, got %+v", got)
+	}
+	w := got.Warnings[0]
+	for _, want := range []string{
+		"NEW ARCHITECTURAL DECISION",
+		"crew messages move to a durable queue",
+		"introduces a durable crew message bus",
+		"ADR-082", "#3728",
+		"the captain decides whether the direction needs an ADR",
+		"fishhawk_file_issue type adr",
+	} {
+		if !strings.Contains(w, want) {
+			t.Errorf("warning missing %q: %q", want, w)
+		}
+	}
+	entries := planWarningsEntries(t, au)
+	if len(entries) != 1 || len(entries[0].Warnings) != 1 || entries[0].Warnings[0] != w {
+		t.Fatalf("plan_warnings entries = %+v, want exactly one row carrying the warning", entries)
+	}
+}
+
+// TestRunPlanWarnings_NoNewArchitecturalDecision_NoWarning: the same plan
+// without the field returns nil and appends nothing (byte-identical to today).
+func TestRunPlanWarnings_NoNewArchitecturalDecision_NoWarning(t *testing.T) {
+	s, au := newNilRunRepoWarningsServer(t)
+	got := s.runPlanWarnings(context.Background(), uuid.New(), uuid.New(), warningsPlanBody(t, nil))
+	if got != nil {
+		t.Fatalf("want nil result without the field, got %+v", got)
+	}
+	if entries := planWarningsEntries(t, au); len(entries) != 0 {
+		t.Fatalf("plan_warnings entries = %d, want 0", len(entries))
+	}
+}
+
+// TestRunPlanWarnings_NewArchitecturalDecision_EmptyADRsSaysNoneCited pins the
+// empty related_adrs rendering.
+func TestRunPlanWarnings_NewArchitecturalDecision_EmptyADRsSaysNoneCited(t *testing.T) {
+	s, _ := newNilRunRepoWarningsServer(t)
+	body := withNewArchitecturalDecision(t, warningsPlanBody(t, nil), nadDecl())
+
+	got := s.runPlanWarnings(context.Background(), uuid.New(), uuid.New(), body)
+	if got == nil || len(got.Warnings) != 1 {
+		t.Fatalf("want exactly one warning, got %+v", got)
+	}
+	if !strings.Contains(got.Warnings[0], "Related ADRs: none cited.") {
+		t.Errorf("warning should say none cited, got %q", got.Warnings[0])
+	}
+}
+
+// TestRunPlanWarnings_NewArchitecturalDecision_WhitespaceRationaleNoWarning is
+// the counterfactual vehicle for Declared() at this site: runPlanWarnings
+// decodes with json.Unmarshal and never runs semanticCheck, so Declared() is the
+// only guard keeping a whitespace-only rationale from emitting an advisory.
+func TestRunPlanWarnings_NewArchitecturalDecision_WhitespaceRationaleNoWarning(t *testing.T) {
+	s, au := newNilRunRepoWarningsServer(t)
+	decl := nadDecl("ADR-082")
+	decl["rationale"] = "   "
+	body := withNewArchitecturalDecision(t, warningsPlanBody(t, nil), decl)
+
+	if got := s.runPlanWarnings(context.Background(), uuid.New(), uuid.New(), body); got != nil {
+		t.Fatalf("want nil result for a whitespace-only rationale, got %+v", got)
+	}
+	if entries := planWarningsEntries(t, au); len(entries) != 0 {
+		t.Fatalf("plan_warnings entries = %d, want 0", len(entries))
+	}
+}
+
+// TestRunPlanWarnings_NewArchitecturalDecision_AfterOverCap pins the ordering:
+// on an over-cap plan the count-derived over-cap advisory stays at index 0
+// (#2053) and the architectural advisory is appended LAST.
+func TestRunPlanWarnings_NewArchitecturalDecision_AfterOverCap(t *testing.T) {
+	const capLimit = 2
+	s, _, runRow := newScopePrecheckServer(t, planWarningsCapSpec)
+	body := withNewArchitecturalDecision(t, overCapPlanBody(t, 3, nil), nadDecl("ADR-082"))
+
+	got := s.runPlanWarnings(context.Background(), runRow.ID, uuid.New(), body)
+	if got == nil || len(got.Warnings) < 2 {
+		t.Fatalf("want at least 2 warnings (over-cap + architectural), got %+v", got)
+	}
+	if !hasOverCapWarning(got.Warnings[:1], 3, capLimit) {
+		t.Errorf("count-derived over-cap advisory must be first; warnings = %v", got.Warnings)
+	}
+	if last := got.Warnings[len(got.Warnings)-1]; !strings.Contains(last, "NEW ARCHITECTURAL DECISION") {
+		t.Errorf("architectural advisory must be last; warnings = %v", got.Warnings)
+	}
+}

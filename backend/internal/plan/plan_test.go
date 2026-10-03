@@ -1618,7 +1618,10 @@ func TestValidateClarificationRequest_SchemaViolations(t *testing.T) {
 // sync that did not land in the embedded copy) fails this test deliberately.
 // The hash is re-pinned only for a sanctioned additive-optional change within
 // standard_v1.x, or for an ANNOTATION-only description correction that changes
-// no validation behavior — most recently the E72.1 / #3325
+// no validation behavior — most recently the E78.4 / #3748 top-level
+// new_architectural_decision field (the planner's declaration that a plan sets
+// new architectural direction, read only by the plan-gate advisory pass and
+// never by an enforcement site). Before that: the E72.1 / #3325
 // verification.acceptance_surface enum (`none`: the plan's explicit declaration
 // that no operator-observable surface exists, which the plan gate reads to omit
 // the acceptance stage at approval and semanticCheck rejects alongside any
@@ -1646,7 +1649,7 @@ func TestValidateClarificationRequest_SchemaViolations(t *testing.T) {
 // validate unchanged through the plan-only Validate entry point (asserted
 // below), which is the proof the change did not break the schema in place.
 func TestPlanSchemaFrozen(t *testing.T) {
-	const wantHash = "7eafe7db7db1064efd6937cd722a43011a0ebbfe31bf9422f9bf86a298323713"
+	const wantHash = "d37e4356672223f77b0efddb697cad11fcddecd4641e7b938163d27046735f7c"
 	b, err := os.ReadFile("schemas/plan-standard-v1.schema.json")
 	if err != nil {
 		t.Fatalf("read embedded plan schema: %v", err)
@@ -2668,5 +2671,195 @@ func TestWarnings_CounterfactualMechanismMissing_RuneSafeTruncation(t *testing.T
 	}
 	if !strings.Contains(warns[0], "…") {
 		t.Errorf("warning %q must carry the truncation ellipsis", warns[0])
+	}
+}
+
+// --- new_architectural_decision (E78.4 / #3748) ---
+
+// nadFixture returns a well-formed new_architectural_decision map carrying the
+// given related_adrs.
+func nadFixture(adrs []any) map[string]any {
+	return map[string]any{
+		"rationale":        "introduces a persistent crew message bus",
+		"related_adrs":     adrs,
+		"decision_summary": "crew messages move to a durable queue",
+	}
+}
+
+// TestParse_NewArchitecturalDecision_RoundTrips covers the additive optional
+// declaration: a plan carrying it validates, decodes into the typed field,
+// reports Declared(), and re-marshals with all three keys.
+func TestParse_NewArchitecturalDecision_RoundTrips(t *testing.T) {
+	m := planfixture.Valid(func(m map[string]any) {
+		m["new_architectural_decision"] = nadFixture([]any{"ADR-082"})
+	})
+	p, err := plan.Parse(marshalFixture(t, m))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	d := p.NewArchitecturalDecision
+	if d == nil {
+		t.Fatal("NewArchitecturalDecision should be non-nil")
+	}
+	if d.DecisionSummary != "crew messages move to a durable queue" || d.Rationale == "" || len(d.RelatedADRs) != 1 || d.RelatedADRs[0] != "ADR-082" {
+		t.Errorf("decoded declaration = %+v", d)
+	}
+	if !d.Declared() {
+		t.Error("a well-formed declaration should report Declared() == true")
+	}
+	out, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("re-marshal plan: %v", err)
+	}
+	var back map[string]any
+	if err := json.Unmarshal(out, &back); err != nil {
+		t.Fatalf("decode re-marshalled plan: %v", err)
+	}
+	nad, ok := back["new_architectural_decision"].(map[string]any)
+	if !ok {
+		t.Fatalf("re-marshalled plan lost new_architectural_decision: %s", out)
+	}
+	for _, k := range []string{"rationale", "related_adrs", "decision_summary"} {
+		if _, ok := nad[k]; !ok {
+			t.Errorf("re-marshalled declaration lost key %q: %v", k, nad)
+		}
+	}
+}
+
+// TestParse_NewArchitecturalDecision_EmptyADRsRoundTripsAsArray pins that an
+// EMPTY related_adrs survives re-marshal as `[]` (not null, not dropped), so a
+// revision base built by json.MarshalIndent of the typed Plan still validates
+// against the schema, which REQUIRES the key and types it as an array.
+func TestParse_NewArchitecturalDecision_EmptyADRsRoundTripsAsArray(t *testing.T) {
+	m := planfixture.Valid(func(m map[string]any) {
+		m["new_architectural_decision"] = nadFixture([]any{})
+	})
+	p, err := plan.Parse(marshalFixture(t, m))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if !p.NewArchitecturalDecision.Declared() {
+		t.Error("an empty related_adrs is a valid declaration")
+	}
+	out, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("re-marshal plan: %v", err)
+	}
+	if !strings.Contains(string(out), `"related_adrs":[]`) {
+		t.Errorf("re-marshalled plan should carry related_adrs as [], got %s", out)
+	}
+	if _, err := plan.Parse(out); err != nil {
+		t.Fatalf("re-marshalled plan must re-validate: %v", err)
+	}
+}
+
+// TestParse_NewArchitecturalDecision_Omitted confirms the field is additive: a
+// legacy plan without it validates and decodes to nil.
+func TestParse_NewArchitecturalDecision_Omitted(t *testing.T) {
+	p, err := plan.Parse(marshalFixture(t, planfixture.Valid()))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if p.NewArchitecturalDecision != nil {
+		t.Errorf("NewArchitecturalDecision = %+v, want nil when omitted", p.NewArchitecturalDecision)
+	}
+}
+
+// TestParse_NewArchitecturalDecision_SchemaFailures pins one schema-failure
+// case per named mode: each missing required key, plus an unknown nested
+// property (additionalProperties:false). Each asserts a *SchemaError whose
+// Violations name the /new_architectural_decision path and the offending key.
+func TestParse_NewArchitecturalDecision_SchemaFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		mutate  func(d map[string]any)
+		wantKey string
+	}{
+		{"missing rationale", func(d map[string]any) { delete(d, "rationale") }, "rationale"},
+		{"missing related_adrs", func(d map[string]any) { delete(d, "related_adrs") }, "related_adrs"},
+		{"missing decision_summary", func(d map[string]any) { delete(d, "decision_summary") }, "decision_summary"},
+		{"unknown nested property", func(d map[string]any) { d["severity"] = "high" }, "severity"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := nadFixture([]any{"ADR-082"})
+			tc.mutate(d)
+			m := planfixture.Valid(func(m map[string]any) {
+				m["new_architectural_decision"] = d
+			})
+			_, err := plan.Parse(marshalFixture(t, m))
+			var se *plan.SchemaError
+			if !errors.As(err, &se) {
+				t.Fatalf("err = %v, want *SchemaError", err)
+			}
+			found := false
+			for _, v := range se.Violations {
+				if strings.HasPrefix(v.Path, "/new_architectural_decision") && strings.Contains(v.Message, tc.wantKey) {
+					found = true
+				}
+			}
+			if !found {
+				t.Errorf("Violations should name /new_architectural_decision and %q; got %+v", tc.wantKey, se.Violations)
+			}
+		})
+	}
+}
+
+// TestSemanticCheck_NewArchitecturalDecision_WhitespaceRejected pins one
+// semantic-failure case per named mode. Each fixture value is whitespace-only,
+// which the schema's minLength:1 ADMITS (proved per case before Parse), so the
+// rejection lands on checkNewArchitecturalDecision and not on the schema. Each
+// asserts a *SemanticError naming the exact field path.
+func TestSemanticCheck_NewArchitecturalDecision_WhitespaceRejected(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		mutate   func(d map[string]any)
+		wantPath string
+	}{
+		{"whitespace rationale", func(d map[string]any) { d["rationale"] = "   " }, "new_architectural_decision.rationale"},
+		{"whitespace decision_summary", func(d map[string]any) { d["decision_summary"] = " \t " }, "new_architectural_decision.decision_summary"},
+		{"whitespace related_adrs entry", func(d map[string]any) { d["related_adrs"] = []any{"ADR-082", "  "} }, "new_architectural_decision.related_adrs[1]"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := nadFixture([]any{"ADR-082"})
+			tc.mutate(d)
+			m := planfixture.Valid(func(m map[string]any) {
+				m["new_architectural_decision"] = d
+			})
+			if err := plan.Validate(marshalFixture(t, m)); err != nil {
+				t.Fatalf("schema Validate should admit the whitespace value (minLength:1), got %v", err)
+			}
+			_, err := plan.Parse(marshalFixture(t, m))
+			var sem *plan.SemanticError
+			if !errors.As(err, &sem) {
+				t.Fatalf("err = %v, want *SemanticError", err)
+			}
+			if !strings.Contains(sem.Error(), tc.wantPath) {
+				t.Errorf("SemanticError should name %q, got %q", tc.wantPath, sem.Error())
+			}
+		})
+	}
+}
+
+// TestNewArchitecturalDecision_Declared_TruthTable pins the shared Declared()
+// definition, which matches checkNewArchitecturalDecision field for field
+// (approval condition 4): a whitespace ADR id is NOT a declaration.
+func TestNewArchitecturalDecision_Declared_TruthTable(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		in   *plan.NewArchitecturalDecision
+		want bool
+	}{
+		{"nil", nil, false},
+		{"whitespace rationale", &plan.NewArchitecturalDecision{Rationale: " \t", DecisionSummary: "s"}, false},
+		{"whitespace summary", &plan.NewArchitecturalDecision{Rationale: "r", DecisionSummary: "  "}, false},
+		{"whitespace ADR id", &plan.NewArchitecturalDecision{Rationale: "r", DecisionSummary: "s", RelatedADRs: []string{"ADR-082", " "}}, false},
+		{"well-formed, no ADRs", &plan.NewArchitecturalDecision{Rationale: "r", DecisionSummary: "s", RelatedADRs: []string{}}, true},
+		{"well-formed with ADRs", &plan.NewArchitecturalDecision{Rationale: "r", DecisionSummary: "s", RelatedADRs: []string{"ADR-082", "#3728"}}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.in.Declared(); got != tc.want {
+				t.Errorf("Declared() = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }

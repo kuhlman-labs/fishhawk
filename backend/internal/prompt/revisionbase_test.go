@@ -774,3 +774,189 @@ func headOf(s string, n int) string {
 	}
 	return s[:n]
 }
+
+// --- new_architectural_decision (E78.4 / #3748) ---------------------------
+
+func nadForBase(adrs ...string) *plan.NewArchitecturalDecision {
+	if adrs == nil {
+		adrs = []string{}
+	}
+	return &plan.NewArchitecturalDecision{
+		Rationale:       "introduces a durable crew message bus",
+		RelatedADRs:     adrs,
+		DecisionSummary: "crew messages move to a durable queue",
+	}
+}
+
+// totalsLine extracts the digest's "Revision base totals:" line.
+func totalsLine(t *testing.T, digest string) string {
+	t.Helper()
+	m := regexp.MustCompile(`(?m)^Revision base totals: .*$`).FindString(digest)
+	if m == "" {
+		t.Fatalf("digest carries no totals line:\n%s", headOf(digest, 1500))
+	}
+	return m
+}
+
+// TestRevisionBaseDigest_NewArchitecturalDecision_Rendered is the
+// counterfactual vehicle for the digest render and the rendered-keys entry: an
+// over-cap base carrying the field yields a digest containing the summary, the
+// rationale and every ADR id, and the elision manifest does NOT list the key.
+// The totals line is byte-identical to the same base without the field
+// (approval condition 5: the totals line is unchanged).
+func TestRevisionBaseDigest_NewArchitecturalDecision_Rendered(t *testing.T) {
+	without := basePlanFixture(11, 6000)
+	with := basePlanFixture(11, 6000)
+	with.NewArchitecturalDecision = nadForBase("ADR-082", "#3728")
+
+	got, a := assessRevisionBase(overCapBase(t, with))
+	if a.Mode != RevisionBaseModeDigest {
+		t.Fatalf("mode = %q, want digest", a.Mode)
+	}
+	for _, want := range []string{
+		"new_architectural_decision (declared by the planner):\n",
+		"- decision_summary: crew messages move to a durable queue\n",
+		"- rationale: introduces a durable crew message bus\n",
+		"- related_adrs: ADR-082, #3728\n",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("digest missing %q:\n%s", want, tailOf(got, 1500))
+		}
+	}
+	if strings.Contains(got, "- new_architectural_decision\n") {
+		t.Errorf("elision manifest wrongly names new_architectural_decision as unrendered")
+	}
+	for _, k := range a.UnrenderedKeys {
+		if k == "new_architectural_decision" {
+			t.Errorf("assessment UnrenderedKeys lists new_architectural_decision: %v", a.UnrenderedKeys)
+		}
+	}
+	gotWithout, _ := renderRevisionBase(overCapBase(t, without))
+	if tw, two := totalsLine(t, got), totalsLine(t, gotWithout); tw != two {
+		t.Errorf("totals line changed by the field:\n with: %q\n without: %q", tw, two)
+	}
+}
+
+// TestRevisionBaseDigest_NewArchitecturalDecision_EmptyADRs pins "none cited".
+func TestRevisionBaseDigest_NewArchitecturalDecision_EmptyADRs(t *testing.T) {
+	p := basePlanFixture(11, 6000)
+	p.NewArchitecturalDecision = nadForBase()
+	got, _ := renderRevisionBase(overCapBase(t, p))
+	if !strings.Contains(got, "- related_adrs: none cited\n") {
+		t.Errorf("digest should render none cited:\n%s", tailOf(got, 800))
+	}
+}
+
+// TestRevisionBaseDigest_NewArchitecturalDecision_ADRBudget pins the bounded
+// ADR-id list: past maxRevisionBaseRelatedADRs the rest are named and COUNTED
+// by a remainder line, so listed + counted == total.
+func TestRevisionBaseDigest_NewArchitecturalDecision_ADRBudget(t *testing.T) {
+	const total = maxRevisionBaseRelatedADRs + 5
+	ids := make([]string, 0, total)
+	for i := 1; i <= total; i++ {
+		ids = append(ids, fmt.Sprintf("ADR-%03d", i))
+	}
+	p := basePlanFixture(11, 6000)
+	p.NewArchitecturalDecision = nadForBase(ids...)
+	got, _ := renderRevisionBase(overCapBase(t, p))
+	if !strings.Contains(got, fmt.Sprintf("ADR-%03d", maxRevisionBaseRelatedADRs)) {
+		t.Errorf("the last in-budget ADR id is missing")
+	}
+	if strings.Contains(got, fmt.Sprintf("ADR-%03d", maxRevisionBaseRelatedADRs+1)) {
+		t.Errorf("an ADR id past the budget was rendered")
+	}
+	want := fmt.Sprintf("...[5 further new_architectural_decision.related_adrs entries NOT rendered: positions %d..%d of %d total.",
+		maxRevisionBaseRelatedADRs+1, total, total)
+	if !strings.Contains(got, want) {
+		t.Errorf("digest missing remainder line %q:\n%s", want, tailOf(got, 1200))
+	}
+}
+
+// TestRevisionBaseDigest_NewArchitecturalDecision_ShrinkPass pins the shrink
+// pass: summary and ADR ids (identity) are kept, the rationale (body) is
+// withheld as a NAMED elision, and the digest stays under the cap.
+func TestRevisionBaseDigest_NewArchitecturalDecision_ShrinkPass(t *testing.T) {
+	p := basePlanFixture(maxRevisionBaseStepIdentities+150, 400)
+	p.NewArchitecturalDecision = nadForBase("ADR-082", "#3728")
+	got, a := assessRevisionBase(overCapBase(t, p))
+	if a.Mode != RevisionBaseModeDigestShrunk {
+		t.Fatalf("mode = %q, want digest_shrunk", a.Mode)
+	}
+	if len(got) > MaxRevisionBasePlanBytes {
+		t.Errorf("shrink-pass digest is %d bytes, over the %d-byte cap", len(got), MaxRevisionBasePlanBytes)
+	}
+	for _, want := range []string{
+		"- decision_summary: crew messages move to a durable queue\n",
+		"- related_adrs: ADR-082, #3728\n",
+		fmt.Sprintf("- rationale: [new_architectural_decision.rationale elided — %d bytes withheld]\n", len(p.NewArchitecturalDecision.Rationale)),
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("shrink-pass digest missing %q:\n%s", want, tailOf(got, 1500))
+		}
+	}
+	if strings.Contains(got, "introduces a durable crew message bus") {
+		t.Errorf("the shrink pass must withhold the rationale body")
+	}
+}
+
+// TestRenderRevisionBase_NewArchitecturalDecision_UnderCapWhole pins whole mode:
+// an under-cap base carrying the field rides verbatim, field and all.
+func TestRenderRevisionBase_NewArchitecturalDecision_UnderCapWhole(t *testing.T) {
+	p := basePlanFixture(3, 50)
+	p.NewArchitecturalDecision = nadForBase("ADR-082")
+	base := marshalBase(t, p)
+	got, elided := renderRevisionBase(base)
+	if elided || got != base {
+		t.Fatalf("an under-cap base must render verbatim (elided=%v)", elided)
+	}
+	for _, want := range []string{`"new_architectural_decision"`, `"decision_summary": "crew messages move to a durable queue"`, `"ADR-082"`} {
+		if !strings.Contains(got, want) {
+			t.Errorf("whole base missing %q", want)
+		}
+	}
+}
+
+// TestRevisionBaseDigest_ShrinkPassWorstCase_UnderCap pins the shrink pass's
+// stated worst-case bound (revisionbase.go's maxRevisionBaseStepIdentities
+// comment and the prompt README), INCLUDING the new_architectural_decision
+// block (E78.4 / #3748): every budgeted list is saturated past its budget, the
+// decision summary and every ADR id are over-long (so each is cut with a named
+// elision marker), and the delivered digest must still fit under
+// MaxRevisionBasePlanBytes.
+//
+// Criterion ids are held at exactly revisionBaseShrinkFieldBytes, the stated
+// bound's own assumption (~300 bytes per criterion line). That assumption is a
+// KNOWN pre-existing gap, not pinned here: the withheld-statement label embeds
+// the FULL criterion id (`acceptance criterion %q statement`), so ids far
+// longer than revisionBaseShrinkFieldBytes push the shrink pass over the cap
+// with or without this block.
+func TestRevisionBaseDigest_ShrinkPassWorstCase_UnderCap(t *testing.T) {
+	p := basePlanFixture(maxRevisionBaseStepIdentities+50, 400)
+	long := strings.Repeat("x", 4*revisionBaseShrinkFieldBytes)
+	p.Verification.AcceptanceCriteria = nil
+	for i := 0; i < maxRevisionBaseListItems+10; i++ {
+		id := fmt.Sprintf("ac-%03d-", i)
+		id += strings.Repeat("x", revisionBaseShrinkFieldBytes-len(id))
+		p.Verification.AcceptanceCriteria = append(p.Verification.AcceptanceCriteria, plan.AcceptanceCriterion{
+			ID: id, Statement: long, Source: plan.CriterionSourceExplicit,
+		})
+	}
+	adrs := make([]string, 0, maxRevisionBaseRelatedADRs+10)
+	for i := 0; i < maxRevisionBaseRelatedADRs+10; i++ {
+		adrs = append(adrs, fmt.Sprintf("ADR-%d-%s", i, long))
+	}
+	p.NewArchitecturalDecision = &plan.NewArchitecturalDecision{Rationale: long, RelatedADRs: adrs, DecisionSummary: long}
+
+	got, a := assessRevisionBase(overCapBase(t, p))
+	if a.Mode != RevisionBaseModeDigestShrunk {
+		t.Fatalf("mode = %q, want digest_shrunk (the worst case must exercise the shrink pass)", a.Mode)
+	}
+	if len(got) > MaxRevisionBasePlanBytes {
+		t.Errorf("worst-case shrink-pass digest is %d bytes, over the %d-byte cap", len(got), MaxRevisionBasePlanBytes)
+	}
+	if !strings.Contains(got, fmt.Sprintf("10 further new_architectural_decision.related_adrs entries NOT rendered: positions %d..%d",
+		maxRevisionBaseRelatedADRs+1, maxRevisionBaseRelatedADRs+10)) {
+		t.Errorf("worst case did not saturate the ADR-id budget:\n%s", tailOf(got, 1500))
+	}
+	t.Logf("worst-case shrink-pass digest: %d of %d bytes", len(got), MaxRevisionBasePlanBytes)
+}

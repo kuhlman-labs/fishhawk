@@ -6378,3 +6378,81 @@ func TestPlanReviewLoop_NoConventionsRendered_ClampsConventionCategoriesToLow(t 
 		}
 	}
 }
+
+// TestShipPlan_NewArchitecturalDecision_OnePlanWarning is the CROSS-BOUNDARY
+// test for E78.4 / #3748: POST /v0/runs/{run_id}/plan with a plan carrying
+// new_architectural_decision exercises schema validation in the backend's
+// embedded mirror, the ship path, and runPlanWarnings into the audit chain. It
+// asserts 201 and exactly one plan_warnings row whose single warning names the
+// summary, rationale and ADR ids. A second POST whose declaration omits
+// rationale is refused 400 plan_invalid naming new_architectural_decision and
+// rationale.
+func TestShipPlan_NewArchitecturalDecision_OnePlanWarning(t *testing.T) {
+	decl := func() map[string]any {
+		return map[string]any{
+			"rationale":        "introduces a durable crew message bus",
+			"related_adrs":     []any{"ADR-082", "#3728"},
+			"decision_summary": "crew messages move to a durable queue",
+		}
+	}
+
+	t.Run("accepted with one advisory", func(t *testing.T) {
+		runID, stageID := uuid.New(), uuid.New()
+		s, sf, _, au, _ := newPlanServer(t, runID, stageID)
+		priv, _ := sf.issue(t, runID)
+		m := planfixture.Valid(func(m map[string]any) {
+			m["new_architectural_decision"] = decl()
+		})
+		body, err := json.Marshal(m)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		w := shipPlanRequest(t, s, runID, stageID, priv, body, "")
+		if w.Code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+		}
+		entries := planWarningsEntries(t, au)
+		if len(entries) != 1 || len(entries[0].Warnings) != 1 {
+			t.Fatalf("plan_warnings entries = %+v, want exactly one row with one warning", entries)
+		}
+		for _, want := range []string{"NEW ARCHITECTURAL DECISION", "crew messages move to a durable queue", "introduces a durable crew message bus", "ADR-082", "#3728"} {
+			if !strings.Contains(entries[0].Warnings[0], want) {
+				t.Errorf("warning missing %q: %q", want, entries[0].Warnings[0])
+			}
+		}
+	})
+
+	t.Run("missing rationale refused", func(t *testing.T) {
+		runID, stageID := uuid.New(), uuid.New()
+		s, sf, ar, au, rr := newPlanServer(t, runID, stageID)
+		rr.getStages[stageID] = &run.Stage{ID: stageID, RunID: runID, State: run.StageStateRunning}
+		priv, _ := sf.issue(t, runID)
+		d := decl()
+		delete(d, "rationale")
+		m := planfixture.Valid(func(m map[string]any) {
+			m["new_architectural_decision"] = d
+		})
+		body, err := json.Marshal(m)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		w := shipPlanRequest(t, s, runID, stageID, priv, body, "")
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+		}
+		got := w.Body.String()
+		for _, want := range []string{"plan_invalid", "new_architectural_decision", "rationale"} {
+			if !strings.Contains(got, want) {
+				t.Errorf("400 body missing %q:\n%s", want, got)
+			}
+		}
+		if len(ar.all) != 0 {
+			t.Errorf("artifacts = %d, want 0 on a refused plan", len(ar.all))
+		}
+		if entries := planWarningsEntries(t, au); len(entries) != 0 {
+			t.Errorf("plan_warnings entries = %d, want 0 on a refused plan", len(entries))
+		}
+	})
+}

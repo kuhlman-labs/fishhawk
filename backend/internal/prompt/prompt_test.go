@@ -4398,6 +4398,88 @@ func TestBuild_Plan_UnenforceableCriteriaGuidance(t *testing.T) {
 	}
 }
 
+// TestBuild_Plan_NewArchitecturalDecisionGuidance pins the planner-facing
+// new-architectural-decision section (E78.4 / #3748): it exists, names the
+// when-to and when-not-to cases and the three fields, and says the captain
+// decides.
+func TestBuild_Plan_NewArchitecturalDecisionGuidance(t *testing.T) {
+	got, err := Build("plan", Trigger{Repo: "x/y", IssueNumber: 1, IssueTitle: "t", IssueBody: "b"})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, want := range []string{
+		"### New architectural decision",
+		"`new_architectural_decision`",
+		"a new component boundary, a new persistence shape, a new protocol or wire contract, a new trust boundary, or a departure from a cited ADR",
+		"Do NOT set it for routine work inside existing decisions",
+		"`decision_summary` (ONE line naming the direction)",
+		"`rationale`",
+		"`related_adrs`",
+		"an EMPTY array is valid",
+		"the captain decides whether the direction needs an ADR",
+		"carry a prior declaration forward",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("plan prompt missing new-architectural-decision guidance %q", want)
+		}
+	}
+	// It sits after the Model recommendation block.
+	if mr, nad := strings.Index(got, "### Model recommendation"), strings.Index(got, "### New architectural decision"); mr < 0 || nad < mr {
+		t.Errorf("new-architectural-decision section must follow Model recommendation (model=%d, nad=%d)", mr, nad)
+	}
+}
+
+// TestWritePlanForReview_RendersNewArchitecturalDecision pins the plan-review
+// render (E78.4 / #3748): a declared plan's review prompt carries the summary,
+// rationale and ADR ids; an empty related_adrs renders "none cited"; and a plan
+// without a well-formed declaration renders byte-identically to one with no
+// field at all (the guard is Declared()).
+func TestWritePlanForReview_RendersNewArchitecturalDecision(t *testing.T) {
+	declared := fixturePlan()
+	declared.NewArchitecturalDecision = &plan.NewArchitecturalDecision{
+		Rationale:       "introduces a durable crew message bus",
+		RelatedADRs:     []string{"ADR-082", "#3728"},
+		DecisionSummary: "crew messages move to a durable queue",
+	}
+	got, err := Build("plan_review", Trigger{
+		IssueNumber: 42, IssueTitle: "Add foo", IssueBody: "b", Repo: "kuhlman-labs/example",
+		ApprovedPlan: declared,
+	})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, want := range []string{
+		"New architectural decision (declared by the planner):",
+		"- Decision summary: crew messages move to a durable queue",
+		"- Rationale: introduces a durable crew message bus",
+		"- Related ADRs: ADR-082, #3728",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("plan_review prompt missing %q", want)
+		}
+	}
+
+	noADRs := fixturePlan()
+	noADRs.NewArchitecturalDecision = &plan.NewArchitecturalDecision{Rationale: "r", RelatedADRs: []string{}, DecisionSummary: "s"}
+	var b strings.Builder
+	writePlanForReview(&b, noADRs)
+	if !strings.Contains(b.String(), "- Related ADRs: none cited\n") {
+		t.Errorf("empty related_adrs should render none cited:\n%s", b.String())
+	}
+
+	var absent, malformed strings.Builder
+	writePlanForReview(&absent, fixturePlan())
+	bad := fixturePlan()
+	bad.NewArchitecturalDecision = &plan.NewArchitecturalDecision{Rationale: "   ", DecisionSummary: "s"}
+	writePlanForReview(&malformed, bad)
+	if absent.String() != malformed.String() {
+		t.Errorf("a non-Declared() declaration must render byte-identically to an absent one")
+	}
+	if strings.Contains(absent.String(), "New architectural decision") {
+		t.Errorf("a plan without the field must not render the block:\n%s", absent.String())
+	}
+}
+
 // TestBuild_PlanReview_GateEvidence_ContradictionClauseRenders pins the
 // #1611 escape valve: the always-rendered header must carry the
 // evidence_conflict contradiction clause so a reviewer whose artifact
@@ -12473,6 +12555,17 @@ var groomingProseMarkers = []string{
 // still the #3057 capture and every OTHER byte of the plan prompt stays pinned.
 // The section's own content is pinned independently by
 // TestBuild_Plan_ConsultChannelRendered.
+//
+// REGENERATED at E78.4 / #3748, which DELIBERATELY added the planner-facing
+// '### New architectural decision' section immediately after the Model
+// recommendation block (before the optional Calibration hint). The regeneration
+// rendered Build("plan", preChangeGoldenTrigger()) and INVERTED the E77.5
+// consult-channel replay (so the file on disk still omits that section and
+// applyConsultChannelGoldenDelta keeps working). The diff is a single-section
+// INSERTION after the Model recommendation block (5 insertions / 0 deletions in
+// the golden) and nothing else; both anti-vacuity guards below still hold. The
+// section's own content is pinned independently by
+// TestBuild_Plan_NewArchitecturalDecisionGuidance.
 //
 // Two anti-vacuity guards keep a wrongly-captured golden from passing:
 //   - the golden must contain NONE of groomingProseMarkers, so a golden

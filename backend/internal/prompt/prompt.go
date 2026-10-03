@@ -5222,6 +5222,18 @@ func buildPlan(t Trigger) string {
 		"the operator ratifies or overrides it at the gate, and the resolved value is validated against the per-adapter allow-list before any spawn. " +
 		"The field is optional in the schema, but emit it reliably — it is the `plan` rung of the implement-model resolution ladder (#1013/#1415), " +
 		"and omitting it falls the ladder through to the spec default.\n")
+	// New-architectural-decision declaration (E78.4 / #3748). Unconditional, so
+	// every plan prompt carries it; it sits between the model recommendation and
+	// the optional calibration hint.
+	b.WriteString("\n### New architectural decision\n\n")
+	b.WriteString("Set the optional top-level `new_architectural_decision` object ONLY when this plan sets NEW architectural direction: " +
+		"a new component boundary, a new persistence shape, a new protocol or wire contract, a new trust boundary, or a departure from a cited ADR. " +
+		"Do NOT set it for routine work inside existing decisions — that is most plans, and omitting the object is the normal case. " +
+		"When you set it, emit all three fields: `decision_summary` (ONE line naming the direction), " +
+		"`rationale` (why the plan sets new direction rather than working inside existing decisions), and " +
+		"`related_adrs` (the ADR ids it relates to or departs from; an EMPTY array is valid and means no existing ADR covers it).\n")
+	b.WriteString("The declaration surfaces to the captain as a plan warning; the captain decides whether the direction needs an ADR. " +
+		"It gates nothing. On a revision, carry a prior declaration forward unless the revision removes the new direction.\n")
 	if t.CalibrationHint != nil {
 		b.WriteString("\n### Calibration hint\n\n")
 		fmt.Fprintf(&b, "Your last %d implement-stage predictions on this workflow: actual p50 = %.1f min, p95 = %.1f min, ratio = %.2f.\n",
@@ -7684,10 +7696,30 @@ func writePlanForReview(b *strings.Builder, p *plan.Plan) {
 		b.WriteString("\n")
 	}
 
+	// New architectural decision (E78.4 / #3748). Guarded on Declared() so a
+	// plan without the field (or with a malformed one) renders byte-identically
+	// to the pre-change output.
+	if d := p.NewArchitecturalDecision; d.Declared() {
+		b.WriteString("New architectural decision (declared by the planner):\n")
+		fmt.Fprintf(b, "- Decision summary: %s\n", d.DecisionSummary)
+		fmt.Fprintf(b, "- Rationale: %s\n", d.Rationale)
+		fmt.Fprintf(b, "- Related ADRs: %s\n", relatedADRsText(d.RelatedADRs))
+		b.WriteString("\n")
+	}
+
 	if p.PredictedRuntimeMinutes > 0 {
 		fmt.Fprintf(b, "Runtime prediction: %d minutes (%s confidence)\n\n",
 			p.PredictedRuntimeMinutes, p.PredictedRuntimeConfidence)
 	}
+}
+
+// relatedADRsText renders a new-architectural-decision's related ADR ids as a
+// comma-joined list, or "none cited" for an empty list (E78.4 / #3748).
+func relatedADRsText(ids []string) string {
+	if len(ids) == 0 {
+		return "none cited"
+	}
+	return strings.Join(ids, ", ")
 }
 
 // liveValidationCriterionAnnotation is the criterion-line segment rendered for

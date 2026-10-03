@@ -410,6 +410,34 @@ func TestTryCoerce_NullDecompositionDropped(t *testing.T) {
 	}
 }
 
+// TestTryCoerce_NullNewArchitecturalDecisionDropped pins that the
+// schema-derived optionalTopLevelFields picked up new_architectural_decision
+// (E78.4 / #3748): a JSON null there is dropped as absent and the plan
+// validates, exactly like any other optional top-level field.
+func TestTryCoerce_NullNewArchitecturalDecisionDropped(t *testing.T) {
+	m := planfixture.Valid()
+	m["new_architectural_decision"] = nil
+	data := marshal(t, m)
+
+	coercedBytes, coercions, err := plan.TryCoerce(data, testNow)
+	if err != nil {
+		t.Fatalf("TryCoerce: unexpected error: %v", err)
+	}
+	if len(coercions) != 1 || coercions[0].FieldPath != "/new_architectural_decision" || coercions[0].OriginalType != "null" {
+		t.Fatalf("coercions = %+v, want one null drop at /new_architectural_decision", coercions)
+	}
+	if err := plan.Validate(coercedBytes); err != nil {
+		t.Errorf("coerced plan does not validate: %v", err)
+	}
+	var result map[string]any
+	if err := json.Unmarshal(coercedBytes, &result); err != nil {
+		t.Fatalf("unmarshal coerced: %v", err)
+	}
+	if _, present := result["new_architectural_decision"]; present {
+		t.Error("new_architectural_decision key still present after coercion; want dropped")
+	}
+}
+
 // TestTryCoerce_NullRequiredFieldNotDropped verifies that a JSON null in a
 // REQUIRED field (summary) is NOT dropped — it must still fail Validate with a
 // precise message rather than being silently removed.

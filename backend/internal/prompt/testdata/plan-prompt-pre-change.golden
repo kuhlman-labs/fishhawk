@@ -195,6 +195,11 @@ Incremental verification discipline: run relevant tests once after each batch of
 Populate the optional `model_recommendation` object in your plan artifact with the implement-stage model best suited to the change you assessed. Emit all three fields: `implement_model` (the recommended implement-stage model id, e.g. claude-opus-4-8), `rationale` (a sentence on why that model fits the assessed complexity), and `complexity_assessed` (one of low | medium | high). Match the model to complexity: reserve the most capable model for genuinely hard, multi-file, or subtle-logic changes; a smaller/faster model is appropriate for mechanical or low-risk changes.
 This recommendation is ADVISORY and explicitly subordinate to the operator's plan-approval gate decision: the operator ratifies or overrides it at the gate, and the resolved value is validated against the per-adapter allow-list before any spawn. The field is optional in the schema, but emit it reliably — it is the `plan` rung of the implement-model resolution ladder (#1013/#1415), and omitting it falls the ladder through to the spec default.
 
+### New architectural decision
+
+Set the optional top-level `new_architectural_decision` object ONLY when this plan sets NEW architectural direction: a new component boundary, a new persistence shape, a new protocol or wire contract, a new trust boundary, or a departure from a cited ADR. Do NOT set it for routine work inside existing decisions — that is most plans, and omitting the object is the normal case. When you set it, emit all three fields: `decision_summary` (ONE line naming the direction), `rationale` (why the plan sets new direction rather than working inside existing decisions), and `related_adrs` (the ADR ids it relates to or departs from; an EMPTY array is valid and means no existing ADR covers it).
+The declaration surfaces to the captain as a plan warning; the captain decides whether the direction needs an ADR. It gates nothing. On a revision, carry a prior declaration forward unless the revision removes the new direction.
+
 ### Calibration hint
 
 Your last 8 implement-stage predictions on this workflow: actual p50 = 22.0 min, p95 = 41.0 min, ratio = 0.75.

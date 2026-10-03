@@ -139,6 +139,18 @@ type Plan struct {
 	// strict-decodes with DisallowUnknownFields. JSON tags mirror the irreducible
 	// $def in the schema.
 	Irreducible *Irreducible `json:"irreducible,omitempty"`
+	// NewArchitecturalDecision is the planner's optional declaration that this
+	// plan sets NEW architectural direction (E78.4 / #3748): a new component
+	// boundary, persistence shape, protocol or wire contract, trust boundary, or
+	// a departure from a cited ADR. As with Irreducible, PRESENCE is the
+	// declaration. Unlike Irreducible, NO enforcement site reads it: it is read
+	// only by the plan-gate advisory pass (server.runPlanWarnings), which surfaces
+	// it to the captain as one plan_warnings advisory, and by the review and
+	// revision-base renders. Additive-optional within standard_v1; the field must
+	// exist on the struct because plan.Parse strict-decodes with
+	// DisallowUnknownFields. JSON tags mirror the new-architectural-decision $def
+	// in the schema.
+	NewArchitecturalDecision *NewArchitecturalDecision `json:"new_architectural_decision,omitempty"`
 }
 
 // GateRuntimeMinutes returns the runtime estimate the implement-budget gate must
@@ -213,6 +225,42 @@ type Irreducible struct {
 // paths that consume a plan without re-running semanticCheck.
 func (i *Irreducible) Declared() bool {
 	return i != nil && strings.TrimSpace(i.Rationale) != ""
+}
+
+// NewArchitecturalDecision is the planner's optional new-architectural-decision
+// declaration (E78.4 / #3748). Rationale says why the plan sets new direction,
+// RelatedADRs names the ADRs it relates to or departs from (an EMPTY slice means
+// no existing ADR covers it), and DecisionSummary is ONE line naming the
+// direction. RelatedADRs deliberately carries NO omitempty: the schema REQUIRES
+// the key, so a re-marshalled plan (the revise_plan revision base is
+// json.MarshalIndent of the typed Plan) must keep `[]` rather than drop the key.
+// A decoded `[]` is a non-nil empty slice and re-marshals as `[]`. JSON tags
+// mirror the new-architectural-decision $def in the schema.
+type NewArchitecturalDecision struct {
+	Rationale       string   `json:"rationale"`
+	RelatedADRs     []string `json:"related_adrs"`
+	DecisionSummary string   `json:"decision_summary"`
+}
+
+// Declared reports whether the receiver is a WELL-FORMED new-architectural-
+// decision declaration: non-nil, a non-whitespace Rationale, a non-whitespace
+// DecisionSummary, and every RelatedADRs entry non-whitespace. It is the ONE
+// shared definition of a valid declaration, matching the semantic validator
+// (checkNewArchitecturalDecision) field for field, so every consumer (the
+// plan-gate advisory, the plan-review render, the revision-base digest) agrees.
+// The schema's minLength:1 admits a single space, so this trims before
+// deciding. It stays defensive because server.runPlanWarnings decodes the plan
+// with json.Unmarshal and never re-runs semanticCheck.
+func (d *NewArchitecturalDecision) Declared() bool {
+	if d == nil || strings.TrimSpace(d.Rationale) == "" || strings.TrimSpace(d.DecisionSummary) == "" {
+		return false
+	}
+	for _, id := range d.RelatedADRs {
+		if strings.TrimSpace(id) == "" {
+			return false
+		}
+	}
+	return true
 }
 
 // SurfaceSweepExemption is one entry in Plan.SurfaceSweepExemptions (#1544):
