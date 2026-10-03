@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -144,6 +145,15 @@ func (s *Server) runPlanWarnings(ctx context.Context, runID, stageID uuid.UUID, 
 	// count-derived over-cap advisory. Both legs fail open on an unresolved cap.
 	warnings = append(warnings, s.phaseCapWarnings(ctx, runID, &parsedPlan)...)
 	if w := s.irreducibleWarning(ctx, runID, &parsedPlan); w != "" {
+		warnings = append(warnings, w)
+	}
+
+	// NEW ARCHITECTURAL DECISION advisory (E78.4 / #3748), appended LAST so the
+	// #2053 ordering guarantee (count-derived over-cap advisory first) is
+	// unchanged. It reads only the parsed plan — no RunRepo, no cap — so it
+	// fires even when the cap is unresolvable. It rides this plan_warnings entry;
+	// there is no separate audit category.
+	if w := newArchitecturalDecisionWarning(&parsedPlan); w != "" {
 		warnings = append(warnings, w)
 	}
 
@@ -381,6 +391,31 @@ func (s *Server) irreducibleWarning(ctx context.Context, runID uuid.UUID, parsed
 		"The declaration does NOT make the change landable: the implement stage re-checks max_files_changed against the real diff, " +
 		"so approving this over-cap plan still needs a governed max_files_changed raise."
 	return msg
+}
+
+// newArchitecturalDecisionWarning surfaces a planner's new-architectural-
+// decision declaration (E78.4 / #3748) to the captain as ONE advisory naming the
+// decision summary, the rationale and the related ADRs. It is an advisory, not a
+// gate: the captain decides whether the direction needs an ADR. It returns ""
+// unless the declaration is Declared() — that check stays defensive here because
+// runPlanWarnings decodes with json.Unmarshal and never runs semanticCheck, so a
+// whitespace-only rationale or summary reaches this function unrejected. Pure:
+// no RunRepo or cap dependency.
+func newArchitecturalDecisionWarning(parsedPlan *plan.Plan) string {
+	d := parsedPlan.NewArchitecturalDecision
+	if !d.Declared() {
+		return ""
+	}
+	adrs := "none cited"
+	if len(d.RelatedADRs) > 0 {
+		adrs = strings.Join(d.RelatedADRs, ", ")
+	}
+	return fmt.Sprintf(
+		"plan declares a NEW ARCHITECTURAL DECISION: %s. Rationale: %s. Related ADRs: %s. "+
+			"This is an advisory, not a gate: the captain decides whether the direction needs an ADR — "+
+			"approve (optionally filing one with fishhawk_file_issue type adr) or reject the plan.",
+		strings.TrimSpace(d.DecisionSummary), strings.TrimSpace(d.Rationale), adrs,
+	)
 }
 
 // overCapByCount is the shared #2053 count determination (E50.3 refactor). It

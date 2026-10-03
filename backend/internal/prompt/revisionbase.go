@@ -58,11 +58,23 @@ const revisionBaseShrinkFieldBytes = 120
 // "Step 999999: [approach step body elided — 999999 bytes withheld]" (~60
 // bytes each, ~12000 total), plus maxRevisionBaseListItems criterion-id lines
 // capped at revisionBaseShrinkFieldBytes (~300 bytes each, ~30000 total), plus
-// a handful of counted-remainder lines. That is comfortably under
-// MaxRevisionBasePlanBytes, so the shrink pass terminates under the cap.
+// a handful of counted-remainder lines, plus the new_architectural_decision
+// block (E78.4 / #3748): its summary capped at revisionBaseShrinkFieldBytes and
+// at most maxRevisionBaseRelatedADRs ADR-id identities (~200 bytes each with an
+// elision marker, ~4000 total). That is comfortably under
+// MaxRevisionBasePlanBytes, so the shrink pass terminates under the cap
+// (pinned by TestRevisionBaseDigest_ShrinkPassWorstCase_UnderCap). The bound
+// assumes criterion ids at or under revisionBaseShrinkFieldBytes: the
+// withheld-statement label embeds the FULL id, so much longer ids exceed it.
+//
+// maxRevisionBaseRelatedADRs is deliberately smaller than
+// maxRevisionBaseListItems: ADR ids are always-rendered identities (never
+// counted away in the shrink pass), so their budget is part of the shrink
+// pass's worst case and is kept small enough not to threaten the cap.
 const (
 	maxRevisionBaseStepIdentities = 200
 	maxRevisionBaseListItems      = 100
+	maxRevisionBaseRelatedADRs    = 20
 )
 
 // revisionBaseRetrievalPointer names the concrete recovery path for a revision
@@ -318,6 +330,7 @@ var revisionBaseRenderedKeys = map[string]bool{
 	"predicted_runtime_confidence": true,
 	"decomposition":                true,
 	"split_proposal":               true,
+	"new_architectural_decision":   true,
 }
 
 // revisionBaseRender accumulates the digest body while tracking how many bytes
@@ -480,6 +493,12 @@ func renderRevisionBaseDigest(base string, p *plan.Plan, doc map[string]json.Raw
 	r.writeAux("split_proposal phases", splitPhaseTitles(p), dropBodies)
 	r.writeAux("risks_and_assumptions entries", p.RisksAndAssumptions, dropBodies)
 
+	// (g) the planner's new-architectural-decision declaration (E78.4 /
+	// #3748), so a revise_plan over an over-cap base carries it forward. The
+	// Revision base totals line below is deliberately UNCHANGED; the rendered
+	// block plus the rendered-keys manifest are the record.
+	r.writeNewArchitecturalDecision(p.NewArchitecturalDecision, dropBodies)
+
 	body := r.b.String()
 
 	// (a) The header, written LAST and prepended, because the document-level
@@ -519,6 +538,42 @@ func (r *revisionBaseRender) writeAux(kind string, items []string, dropBodies bo
 		fmt.Fprintf(&r.b, "- %s\n", r.capField(kind+" entry", items[i]))
 	}
 	r.remainderLine(kind, listed, len(items))
+	r.b.WriteString("\n")
+}
+
+// writeNewArchitecturalDecision renders the prior plan's new-architectural-
+// decision declaration (E78.4 / #3748), or nothing when the plan carries none.
+// The decision_summary and each related ADR id are IDENTITY: they are always
+// rendered (through capField, so an oversized one is cut with a named elision),
+// in both passes. The rationale is a BODY: capField in the first pass,
+// droppedBody in the shrink pass, which keeps the shrink pass bounded and the
+// byte accounting conservative. The ADR ids are bounded by
+// maxRevisionBaseRelatedADRs, with a counted remainder line past it.
+func (r *revisionBaseRender) writeNewArchitecturalDecision(d *plan.NewArchitecturalDecision, dropBodies bool) {
+	if d == nil {
+		return
+	}
+	r.b.WriteString("new_architectural_decision (declared by the planner):\n")
+	fmt.Fprintf(&r.b, "- decision_summary: %s\n",
+		r.capField("new_architectural_decision.decision_summary", d.DecisionSummary))
+	var rationale string
+	if dropBodies {
+		rationale = r.droppedBody("new_architectural_decision.rationale", d.Rationale)
+	} else {
+		rationale = r.capField("new_architectural_decision.rationale", d.Rationale)
+	}
+	fmt.Fprintf(&r.b, "- rationale: %s\n", rationale)
+	if len(d.RelatedADRs) == 0 {
+		r.b.WriteString("- related_adrs: none cited\n\n")
+		return
+	}
+	listed := listBudget(len(d.RelatedADRs), maxRevisionBaseRelatedADRs)
+	ids := make([]string, 0, listed)
+	for i := 0; i < listed; i++ {
+		ids = append(ids, r.capField("new_architectural_decision.related_adrs entry", d.RelatedADRs[i]))
+	}
+	fmt.Fprintf(&r.b, "- related_adrs: %s\n", strings.Join(ids, ", "))
+	r.remainderLine("new_architectural_decision.related_adrs entries", listed, len(d.RelatedADRs))
 	r.b.WriteString("\n")
 }
 

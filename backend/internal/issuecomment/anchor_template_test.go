@@ -1446,3 +1446,112 @@ func TestAnchorLadder_HarderCapKeepsOrderBelowPrecedent(t *testing.T) {
 		t.Errorf("superseded plans must survive (dropped after the timeline)")
 	}
 }
+
+// TestRenderCurrentPlan_NewArchitecturalDecision pins the E78.4 / #3748 anchor
+// line: a declared new_architectural_decision renders ONE italic line under the
+// model recommendation (and above Plan details) naming the decision summary, the
+// rationale and the related ADRs, with planner-authored newlines flattened so
+// the line cannot break out of its italic span.
+func TestRenderCurrentPlan_NewArchitecturalDecision(t *testing.T) {
+	view := &AnchorPlanView{
+		Summary:                 "Route audit reads through a tenant-scoped repository.",
+		Files:                   []plan.ScopeFile{{Path: "backend/internal/audit/repo.go", Operation: "modify"}},
+		RecommendedModel:        "claude-sonnet-4-6",
+		RecommendationRationale: "medium complexity",
+		ArchitecturalDecision: &plan.NewArchitecturalDecision{
+			Rationale:       "introduces a per-tenant\ntrust boundary\r\non the audit read path",
+			RelatedADRs:     []string{"ADR-057", "#3728\n"},
+			DecisionSummary: "audit reads resolve\nthrough a tenant-scoped repository",
+		},
+	}
+	got := renderCurrentPlan(view, false)
+	const wantLine = "_New architectural decision: audit reads resolve through a tenant-scoped repository — " +
+		"introduces a per-tenant trust boundary on the audit read path (related ADRs: ADR-057, #3728). " +
+		"The captain decides whether it needs an ADR._"
+	if !strings.Contains(got, "\n"+wantLine+"\n") {
+		t.Fatalf("anchor plan missing the flattened new-architectural-decision line %q:\n%s", wantLine, got)
+	}
+	rec := strings.Index(got, "_Model recommendation:")
+	line := strings.Index(got, "_New architectural decision:")
+	details := strings.Index(got, "<details><summary>Plan details</summary>")
+	if rec < 0 || details < 0 || rec >= line || line >= details {
+		t.Errorf("new-architectural-decision line must sit after the model recommendation and before Plan details (rec=%d line=%d details=%d):\n%s", rec, line, details, got)
+	}
+}
+
+// TestRenderCurrentPlan_NewArchitecturalDecision_NoADRsSaysNoneCited pins the
+// empty related_adrs rendering: no existing ADR covers the direction, so the
+// line says "none cited" rather than an empty list.
+func TestRenderCurrentPlan_NewArchitecturalDecision_NoADRsSaysNoneCited(t *testing.T) {
+	got := renderCurrentPlan(&AnchorPlanView{
+		Summary: "s",
+		ArchitecturalDecision: &plan.NewArchitecturalDecision{
+			Rationale:       "first persistence shape for crew messages",
+			RelatedADRs:     []string{},
+			DecisionSummary: "crew messages persist in their own table",
+		},
+	}, false)
+	if !strings.Contains(got, "(related ADRs: none cited).") {
+		t.Errorf("empty related_adrs should render as none cited:\n%s", got)
+	}
+}
+
+// TestRenderCurrentPlan_NewArchitecturalDecision_BoundsRationale pins that an
+// over-long planner rationale is truncated on a word boundary (the
+// RecommendationRationale treatment), so the anchor line stays bounded.
+func TestRenderCurrentPlan_NewArchitecturalDecision_BoundsRationale(t *testing.T) {
+	got := renderCurrentPlan(&AnchorPlanView{
+		Summary: "s",
+		ArchitecturalDecision: &plan.NewArchitecturalDecision{
+			Rationale:       strings.TrimSpace(strings.Repeat("boundary ", 60)),
+			RelatedADRs:     []string{"ADR-082"},
+			DecisionSummary: "one line",
+		},
+	}, false)
+	start := strings.Index(got, "_New architectural decision:")
+	if start < 0 {
+		t.Fatalf("missing new-architectural-decision line:\n%s", got)
+	}
+	line := got[start:]
+	if end := strings.IndexByte(line, '\n'); end >= 0 {
+		line = line[:end]
+	}
+	if !strings.Contains(line, "boundary…") {
+		t.Errorf("over-long rationale should truncate on a word boundary with a real ellipsis:\n%s", line)
+	}
+	if strings.Count(line, "boundary") > 30 {
+		t.Errorf("rationale not bounded: %d repetitions survived in %q", strings.Count(line, "boundary"), line)
+	}
+}
+
+// TestRenderCurrentPlan_NewArchitecturalDecision_UndeclaredIsByteIdentical pins
+// the additive guarantee and the Declared() guard: a view without the field, or
+// with a MALFORMED one (whitespace-only rationale, summary or ADR id — values
+// the schema's minLength:1 admits), renders byte-identically to the view with no
+// field at all.
+func TestRenderCurrentPlan_NewArchitecturalDecision_UndeclaredIsByteIdentical(t *testing.T) {
+	base := AnchorPlanView{
+		Summary:                 "Resolve the implement model at the gate.",
+		Files:                   []plan.ScopeFile{{Path: "a.go", Operation: "modify"}},
+		RecommendedModel:        "claude-sonnet-4-6",
+		RecommendationRationale: "medium complexity",
+	}
+	want := renderCurrentPlan(&base, false)
+	for _, tc := range []struct {
+		name string
+		d    *plan.NewArchitecturalDecision
+	}{
+		{"nil", nil},
+		{"whitespace rationale", &plan.NewArchitecturalDecision{Rationale: "   ", RelatedADRs: []string{"ADR-082"}, DecisionSummary: "summary"}},
+		{"whitespace summary", &plan.NewArchitecturalDecision{Rationale: "why", RelatedADRs: []string{"ADR-082"}, DecisionSummary: " \n "}},
+		{"whitespace ADR id", &plan.NewArchitecturalDecision{Rationale: "why", RelatedADRs: []string{"ADR-082", "  "}, DecisionSummary: "summary"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v := base
+			v.ArchitecturalDecision = tc.d
+			if got := renderCurrentPlan(&v, false); got != want {
+				t.Errorf("undeclared new_architectural_decision changed the render:\n got: %q\nwant: %q", got, want)
+			}
+		})
+	}
+}

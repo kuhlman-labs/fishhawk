@@ -338,6 +338,12 @@ func semanticCheck(p *Plan) error {
 	if err := checkIrreducible(p); err != nil {
 		return err
 	}
+	// new_architectural_decision well-formedness (E78.4 / #3748). Valid on any
+	// plan, so it precedes the decomposition early return. No cap-aware or
+	// cross-field coupling: the declaration gates nothing.
+	if err := checkNewArchitecturalDecision(p.NewArchitecturalDecision); err != nil {
+		return err
+	}
 	if p.Decomposition == nil {
 		return nil
 	}
@@ -510,6 +516,41 @@ func checkIrreducible(p *Plan) error {
 	if strings.TrimSpace(p.Irreducible.Rationale) == "" {
 		return &SemanticError{
 			Message: "irreducible.rationale: an irreducible declaration must carry a non-blank rationale explaining why the change is compile-atomic — a blank rationale is a bare unjustified flag; state why the change cannot be phased into at-or-under-cap commits",
+		}
+	}
+	return nil
+}
+
+// checkNewArchitecturalDecision validates a plan's optional
+// new_architectural_decision declaration (E78.4 / #3748). The schema's
+// minLength:1 admits whitespace-only values, so three hard-rejection branches
+// close that gap, each naming the exact field path:
+//   - a whitespace-only rationale (new_architectural_decision.rationale);
+//   - a whitespace-only decision_summary (new_architectural_decision.decision_summary);
+//   - a whitespace-only related_adrs entry (new_architectural_decision.related_adrs[i]).
+//
+// A nil declaration is a no-op (the field is additive-optional). An EMPTY
+// related_adrs is valid: it means no existing ADR covers the direction. These
+// branches match NewArchitecturalDecision.Declared field for field.
+func checkNewArchitecturalDecision(d *NewArchitecturalDecision) error {
+	if d == nil {
+		return nil
+	}
+	if strings.TrimSpace(d.Rationale) == "" {
+		return &SemanticError{
+			Message: "new_architectural_decision.rationale: a new architectural decision must carry a non-blank rationale explaining why the plan sets new direction",
+		}
+	}
+	if strings.TrimSpace(d.DecisionSummary) == "" {
+		return &SemanticError{
+			Message: "new_architectural_decision.decision_summary: a new architectural decision must carry a non-blank one-line decision_summary naming the direction",
+		}
+	}
+	for i, id := range d.RelatedADRs {
+		if strings.TrimSpace(id) == "" {
+			return &SemanticError{
+				Message: fmt.Sprintf("new_architectural_decision.related_adrs[%d]: an ADR id must be non-blank; use an empty related_adrs array when no existing ADR covers the direction", i),
+			}
 		}
 	}
 	return nil

@@ -1948,6 +1948,80 @@ func TestNotifyStatusUpdateForRun_ModelRecommendationAndResolved(t *testing.T) {
 	}
 }
 
+// TestNotifyStatusUpdateForRun_NewArchitecturalDecision drives the E78.4 /
+// #3748 anchor seam end to end: a plan artifact carrying
+// new_architectural_decision is decoded by loadAnchorPlans, copied into the
+// current-plan view, and rendered as the one-line declaration in the posted
+// anchor comment. A plan without the field renders no such line.
+func TestNotifyStatusUpdateForRun_NewArchitecturalDecision(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		decision *plan.NewArchitecturalDecision
+		wantLine bool
+	}{
+		{
+			name: "declared",
+			decision: &plan.NewArchitecturalDecision{
+				Rationale:       "introduces a per-tenant trust boundary on the audit read path",
+				RelatedADRs:     []string{"ADR-057"},
+				DecisionSummary: "audit reads resolve through a tenant-scoped repository",
+			},
+			wantLine: true,
+		},
+		{name: "absent", decision: nil, wantLine: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runID := uuid.New()
+			planStageID := uuid.New()
+			triggerRef := "issue:42"
+			repoRuns := &fakeRuns{
+				runs: map[uuid.UUID]*run.Run{runID: {
+					ID: runID, Repo: "x/y", WorkflowID: "feature_change", State: run.StateRunning,
+					TriggerSource: run.TriggerGitHubIssue, TriggerRef: &triggerRef, InstallationID: int64Ptr(99),
+				}},
+				stages: map[uuid.UUID][]*run.Stage{runID: {
+					{ID: planStageID, RunID: runID, Type: run.StageTypePlan, State: run.StageStateSucceeded},
+				}},
+			}
+			gh := &fakeGitHub{}
+			au := &fakeAudit{}
+			au.preSeedWithStage(runID, planStageID, "approval_submitted", map[string]any{"decision": "approve"})
+
+			content, err := json.Marshal(plan.Plan{
+				Summary:                  "Route audit reads through a tenant-scoped repository.",
+				NewArchitecturalDecision: tc.decision,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			arts := &fakeArtifacts{byStage: map[uuid.UUID][]*artifact.Artifact{
+				planStageID: {{ID: uuid.New(), StageID: planStageID, Kind: artifact.KindPlan, Content: content, CreatedAt: time.Unix(100, 0)}},
+			}}
+			n := issuecomment.New(issuecomment.Deps{
+				GitHub: gh, Runs: repoRuns, Audit: au, Artifacts: arts,
+				ExternalURL: "https://app.example",
+				Now:         func() time.Time { return time.Date(2026, 6, 20, 12, 0, 0, 0, time.UTC) },
+			})
+			if err := n.NotifyStatusUpdateForRun(context.Background(), runID); err != nil {
+				t.Fatalf("NotifyStatusUpdateForRun: %v", err)
+			}
+			if len(gh.calls) != 1 {
+				t.Fatalf("expected 1 create call; got %d", len(gh.calls))
+			}
+			body := gh.calls[0].body
+			const line = "_New architectural decision: audit reads resolve through a tenant-scoped repository — " +
+				"introduces a per-tenant trust boundary on the audit read path (related ADRs: ADR-057). " +
+				"The captain decides whether it needs an ADR._"
+			if got := strings.Contains(body, line); got != tc.wantLine {
+				t.Errorf("anchor carries the new-architectural-decision line = %v, want %v:\n%s", got, tc.wantLine, body)
+			}
+			if !tc.wantLine && strings.Contains(body, "New architectural decision") {
+				t.Errorf("a plan without the field must render no new-architectural-decision line:\n%s", body)
+			}
+		})
+	}
+}
+
 // TestNotifyStatusUpdateForRun_AnchorEndToEnd drives a feature_change
 // shape across the full audit-chain → anchor-projection → GitHub-I/O
 // seam (#1054): a first plan version rejected (with a reason) and

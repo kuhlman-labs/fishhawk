@@ -1185,6 +1185,9 @@ func (n *Notifier) loadAnchorPlans(ctx context.Context, runRow *run.Run, stages 
 				av.RecommendedModel = p.ModelRecommendation.ImplementModel
 				av.RecommendationRationale = p.ModelRecommendation.Rationale
 			}
+			// Surface the planner's new-architectural-decision declaration
+			// (E78.4 / #3748); renderCurrentPlan shows it only when Declared().
+			av.ArchitecturalDecision = p.NewArchitecturalDecision
 			views = append(views, dated{view: av, at: a.CreatedAt})
 		}
 	}

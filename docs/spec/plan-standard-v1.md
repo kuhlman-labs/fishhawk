@@ -68,7 +68,8 @@ Any property whose `$ref` (or array `items.$ref`) points to an annotated `$defs`
   "scope_removals": [ { "path": "...", "reason": "..." } ],
   "over_cap": false,
   "split_proposal": { "rationale": "...", "phases": [ { "title": "...", "scope": { "files": [...] }, "depends_on": [] }, ... ] },
-  "irreducible": { "rationale": "...", "atomicity_basis": "..." }
+  "irreducible": { "rationale": "...", "atomicity_basis": "..." },
+  "new_architectural_decision": { "rationale": "...", "related_adrs": ["..."], "decision_summary": "..." }
 }
 ```
 
@@ -489,6 +490,28 @@ The optional structured way for a planner facing a **compile-atomic** change to 
 
 **It does not make the change landable.** Approving an `irreducible` over-cap plan does not bypass the cap: the implement stage re-checks `max_files_changed` against the **real diff**, so landing it still needs a governed `max_files_changed` raise. `irreducible` is **mutually exclusive** with `split_proposal` — a plan both declining and proposing a split is contradictory and is rejected by `plan.Parse`. Additive-optional within `standard_v1.x`; a plan that omits it validates and gates exactly as before.
 
+### `new_architectural_decision`
+
+The optional object a planner sets to declare that the plan sets **new architectural direction** (E78.4 / #3748). As with `irreducible`, the **presence** of the object is the declaration. Declare it for a new component boundary, a new persistence shape, a new protocol or wire contract, a new trust boundary, or a departure from a cited ADR. Do not declare it for routine work inside existing decisions, which is most plans.
+
+```json
+{
+  "new_architectural_decision": {
+    "rationale": "the plan adds a durable queue between the backend and the runner, a boundary no existing ADR covers",
+    "related_adrs": ["ADR-082"],
+    "decision_summary": "crew messages move to a durable queue"
+  }
+}
+```
+
+| Field | Required | Meaning |
+|---|---|---|
+| `rationale` | yes | Why the plan sets new direction rather than working inside existing decisions. |
+| `related_adrs` | yes | ADR ids the direction relates to or departs from (free-form, e.g. `ADR-082` or `#3728`). An **empty** array is valid: no existing ADR covers it. |
+| `decision_summary` | yes | **One** line naming the direction. Not enforced by a pattern; one-line renderers flatten it. |
+
+**Advisory only — the contrast with `irreducible`.** `irreducible` is read by an enforcement site (`server.overCapSplitRejection`). `new_architectural_decision` is read by **no** enforcement site: only the plan-gate advisory pass (`server.runPlanWarnings`) reads it, appending **one** `plan_warnings` advisory, last in order, that names the decision summary, the rationale and the related ADRs (`none cited` when empty). The captain decides whether the direction needs an ADR: approve (optionally filing one with `fishhawk_file_issue` type `adr`) or reject the plan. The plan-review prompt renders the declaration for the reviewers, and the `revise_plan` revision base carries it forward in both whole and digest mode. Additive-optional within `standard_v1.x` (no `x-intended-required`); a plan that omits it validates, warns and renders exactly as before.
+
 ## Validation rules beyond the schema
 
 JSON Schema enforces structure. The validator (E1.5 / #20) layers on:
@@ -503,6 +526,7 @@ JSON Schema enforces structure. The validator (E1.5 / #20) layers on:
 - `over_cap` is hint-only: the plan-package semantic validator enforces **no** `over_cap ⇒ split_proposal` coupling. A plan self-declaring `over_cap: true` without a `split_proposal` parses cleanly — the count-blind coupling that once rejected it also rejected under-cap plans that merely set the hint, so it was removed (#2055 fixup). The authoritative over-cap enforcement is the server-side count-derived reject (`overCapSplitRejection`), which never reads `over_cap`.
 - `split_proposal.phases[*].title` must be unique within the array, every phase must declare a non-empty `scope.files`, and `split_proposal.phases[*].depends_on` must form a valid DAG (every index in `[0, len(phases))`, never self-referential, free of cycles — reusing the same Kahn sort as `plan.Waves`). Each returns `*SemanticError` on violation (semantic check `checkSplitProposal` in the plan package, #2055).
 - `irreducible` is **mutually exclusive** with `split_proposal`: a plan carrying both returns `*SemanticError` (a plan cannot both decline and propose a split). And an `irreducible` whose `rationale` is blank/whitespace-only — which the schema's `minLength: 1` admits (a single space) — returns `*SemanticError`: an unjustified declaration is exactly the bare flag the design refuses (semantic check `checkIrreducible` in the plan package, #2412). `irreducible` adds **no** cap-aware logic to the semantic validator (it still has no view of the resolved cap), so no under-cap plan changes behaviour; the cap-aware relaxation lives at the server gate (`overCapSplitRejection`).
+- `new_architectural_decision` rejects whitespace-only values the schema's `minLength: 1` admits: a blank `rationale`, a blank `decision_summary`, or a blank `related_adrs` entry each returns `*SemanticError` naming the exact field path (`new_architectural_decision.rationale`, `.decision_summary`, `.related_adrs[i]`) (semantic check `checkNewArchitecturalDecision` in the plan package, E78.4 / #3748). `NewArchitecturalDecision.Declared()` applies the same three rules, so the advisory and the renders agree with the validator. No cap-aware or cross-field coupling.
 
 These cross-references aren't expressible in JSON Schema cleanly.
 

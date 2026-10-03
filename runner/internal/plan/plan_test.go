@@ -131,3 +131,38 @@ func TestParseErrorUnwrap(t *testing.T) {
 		t.Errorf("Unwrap returned %v, want %v", errors.Unwrap(pe), cause)
 	}
 }
+
+// TestValidate_NewArchitecturalDecision_MirrorSynced proves the runner's
+// embedded schema mirror carries new_architectural_decision (E78.4 / #3748): a
+// plan with the field is accepted, and one whose declaration omits rationale is
+// rejected with an error naming rationale. An un-synced mirror would reject the
+// whole key via the root additionalProperties:false instead, so the error would
+// name the property, not rationale.
+func TestValidate_NewArchitecturalDecision_MirrorSynced(t *testing.T) {
+	decl := func() map[string]any {
+		return map[string]any{
+			"rationale":        "introduces a durable crew message bus",
+			"related_adrs":     []any{"ADR-082"},
+			"decision_summary": "crew messages move to a durable queue",
+		}
+	}
+	ok := planfixture.Valid(func(m map[string]any) {
+		m["new_architectural_decision"] = decl()
+	})
+	if err := Validate(fixtureJSON(t, ok)); err != nil {
+		t.Fatalf("runner mirror should accept new_architectural_decision, got %v", err)
+	}
+
+	d := decl()
+	delete(d, "rationale")
+	bad := planfixture.Valid(func(m map[string]any) {
+		m["new_architectural_decision"] = d
+	})
+	var serr *SchemaError
+	if err := Validate(fixtureJSON(t, bad)); !errors.As(err, &serr) {
+		t.Fatalf("err = %v, want *SchemaError for a declaration missing rationale", err)
+	}
+	if !strings.Contains(serr.Error(), "rationale") {
+		t.Errorf("SchemaError should name rationale, got %q", serr.Error())
+	}
+}
