@@ -412,6 +412,12 @@ func (i *Invoker) invokeOnce(ctx context.Context, inv agent.Invocation) (agent.R
 		}
 		cmd.Env = agent.AppendEnvOverride(cmd.Env, k, v)
 	}
+	// Stamp the run-agent marker LAST (#3945): FISHHAWK_RUN_AGENT=<run id>
+	// ("1" without one) on every seed shape, after every overlay above, so
+	// neither an ambient value, a BaseEnv entry nor an Invocation.Env key can
+	// shadow or re-point it. An ExecWrapper spawn inherits cmd.Env unchanged,
+	// so the wrapped agent carries it too.
+	cmd.Env = agent.WithRunAgentMarker(cmd.Env, inv.RunID)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {

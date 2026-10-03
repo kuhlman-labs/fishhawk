@@ -495,7 +495,11 @@ sanitization (#1796), so admitting it is behaviour-neutral on the runner.
 Layered on top is a known-secret denylist (`gateEnvDeny`) plus a `GOOGLE_` deny
 **prefix** (`gateEnvDenyPrefix`) — belt-and-suspenders that keeps the Google
 credentials out even if a future allow-rule re-widens. There is no Go toolchain
-variable named `GOOGLE_*`, so the prefix is unambiguous.
+variable named `GOOGLE_*`, so the prefix is unambiguous. `gateEnvDeny` also
+lists the run-agent marker `FISHHAWK_RUN_AGENT` (`agent.RunAgentEnvVar`,
+#3945; redundant with default-deny, pinned by `TestGateEnvStripsRunAgentMarker`)
+so an ambient marker never reaches the verify gate, where
+`scripts/test-is-run-agent` would read it once the script consults it (#3947).
 
 **Global/system git config is neutralized (`gateEnvGitConfigPins`, #912 / #3102).**
 After the allow-list loop, `sanitizeEnv` appends `GIT_CONFIG_GLOBAL=/dev/null`

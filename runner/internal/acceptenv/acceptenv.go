@@ -33,11 +33,18 @@
 //     C) before it can push a branch or open a pull request on the real
 //     forge. A passthrough named FISHHAWK_FORGE_WRITES is REFUSED exactly
 //     like a proxy-var passthrough — the containment is not re-pointable.
+//   - The run-agent marker FISHHAWK_RUN_AGENT (agent.RunAgentEnvVar, #3945)
+//     is RUNNER-STAMPED, never operator input: the agent adapter applies it
+//     last on every spawn, a base-env value is dropped by the allow-list,
+//     and a passthrough named FISHHAWK_RUN_AGENT (any case) is REFUSED like
+//     FISHHAWK_FORGE_WRITES.
 package acceptenv
 
 import (
 	"sort"
 	"strings"
+
+	"github.com/kuhlman-labs/fishhawk/runner/internal/agent"
 )
 
 // PassthroughPrefix is the operator's explicit channel for target-instance
@@ -122,6 +129,12 @@ func Env(base []string, proxyURL string) (env []string, refused []string) {
 				refused = append(refused, name)
 				continue
 			}
+			if isRunAgentVar(name) {
+				// The run-agent marker is runner-stamped (#3945); an
+				// operator passthrough must not supply or re-point it.
+				refused = append(refused, name)
+				continue
+			}
 			out = append(out, name+"="+val)
 			continue
 		}
@@ -170,6 +183,12 @@ func allowed(key string) bool {
 // (any case), which a passthrough must not re-point.
 func isForgeWritesVar(name string) bool {
 	return strings.ToUpper(name) == ForgeWritesVar
+}
+
+// isRunAgentVar reports whether name is the runner-stamped run-agent marker
+// (any case), which a passthrough must not supply (#3945).
+func isRunAgentVar(name string) bool {
+	return strings.ToUpper(name) == agent.RunAgentEnvVar
 }
 
 // isProxyVar reports whether name is one of the proxy-routing variables

@@ -794,6 +794,34 @@ func TestVerifyEnvDenied_VerifyControlVariables(t *testing.T) {
 	}
 }
 
+// TestVerifyEnvDenied_RunAgentMarker pins the run-agent marker (#3945) BY NAME
+// on the CLI side, in the TestVerifyEnvDenied_VerifyControlVariables style: the
+// deny predicate, the allow predicate and the sanitize-drop are asserted
+// separately, so deleting only the deny entry reddens here even though
+// default-deny alone still drops the name.
+func TestVerifyEnvDenied_RunAgentMarker(t *testing.T) {
+	const k = "FISHHAWK_RUN_AGENT"
+	if !verifyEnvDenied(k) {
+		t.Errorf("verifyEnvDenied(%q) = false — the run-agent marker deny entry is missing from the CLI copy", k)
+	}
+	if verifyEnvAllowed(k) {
+		t.Errorf("verifyEnvAllowed(%q) = true — the allow-list was widened to admit the run-agent marker", k)
+	}
+	got := sanitizeVerifyEnv([]string{k + "=stale-operator", "PATH=/usr/bin"})
+	var pathKept bool
+	for _, kv := range got {
+		if strings.HasPrefix(kv, k+"=") {
+			t.Errorf("sanitizeVerifyEnv admitted the ambient run-agent marker: %q", kv)
+		}
+		if kv == "PATH=/usr/bin" {
+			pathKept = true
+		}
+	}
+	if !pathKept {
+		t.Errorf("sanitizeVerifyEnv dropped PATH: %q", got)
+	}
+}
+
 // TestSanitizeVerifyEnv_DropsGoogleCredentials is the end-to-end pin over
 // sanitizeVerifyEnv: both Google credential keys are dropped while PATH and the
 // toolchain vars survive with their values intact.

@@ -2798,17 +2798,25 @@ change here, not four skill edits.
   checkout, so a skill (which locates this script via `git rev-parse`)
   cannot reach that pattern from there; it serves direct callers passing
   DIR. A run tree's path prefixes every directory
-  inside it, so a subdirectory matches too. The local runner sets no marker
-  env var, so the path is what identifies a local run agent.
+  inside it, so a subdirectory matches too. The runner now stamps
+  `FISHHAWK_RUN_AGENT=<run id>` on every agent spawn (#3945,
+  `runner/README.md` § "Run-agent marker"), but the script does not read it
+  yet, so today the path is still what identifies a local run agent.
 - **Env signals.** A non-empty `FISHHAWK_RUN_ID` (set by CI-hosted runners
   only: GitLab CI, deploy triggers; empty is not a marker), and, INTERIM
-  until #3945 stamps a dedicated marker on every agent spawn,
+  until the script reads the runner-stamped `FISHHAWK_RUN_AGENT` marker
+  (#3945 stamps it; the read is #3947),
   `FISHHAWK_FORGE_WRITES=deny`, which `acceptenv` injects into every
   acceptance agent. It catches an acceptance agent that has cd'd into an
   operator checkout, where no path pattern applies. It means "forge writes
   disabled", so an operator who set it for dev-mode testing is refused too.
   That is the safe direction for a guard, and the printed reason says to
   unset it.
+- **Pending: the marker read (#3947).** Reading `FISHHAWK_RUN_AGENT` first
+  (any non-empty value), dropping the `FISHHAWK_FORGE_WRITES=deny` interim
+  signal, and adding an env-marker harness case plus `env -u
+  FISHHAWK_RUN_AGENT` in `run_check` is an operator-authored follow-up:
+  both this script and its harness are forbidden to implement stages.
 - **Contract for callers.** Continue only on `operator` with exit 0. Any
   other result means stop and report the output, including a missing
   script (exit 127, a checkout that predates it). The skills invoke it as

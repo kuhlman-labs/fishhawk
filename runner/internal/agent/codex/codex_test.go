@@ -114,8 +114,9 @@ func TestHelperProcess(t *testing.T) {
 		// secret (must be ABSENT when BaseEnv replaces the os.Environ()
 		// seed, PRESENT when nil BaseEnv inherits it), the API-key
 		// overlay, and an Invocation.Env overlay — proving the overlays
-		// still apply on top of a BaseEnv seed.
-		for _, k := range []string{"FISHHAWK_TEST_HOST_SECRET", "OPENAI_API_KEY", "FISHHAWK_BACKEND_URL"} {
+		// still apply on top of a BaseEnv seed — plus the run-agent marker
+		// the adapter stamps last (#3945).
+		for _, k := range []string{"FISHHAWK_TEST_HOST_SECRET", "OPENAI_API_KEY", "FISHHAWK_BACKEND_URL", "FISHHAWK_RUN_AGENT"} {
 			fmt.Printf(`{"type":"env","key":%q,"value":%q}`+"\n", k, os.Getenv(k))
 		}
 		fmt.Println(`{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0,"output_tokens":1,"reasoning_output_tokens":0}}`)
@@ -744,7 +745,9 @@ func TestInvoke_BaseEnvReplacesEnvironSeed(t *testing.T) {
 
 // TestInvoke_EmptyBaseEnvSeedsEmptyEnv pins the default-deny corner: a
 // non-nil EMPTY BaseEnv (with no overlays) must seed an EMPTY child env,
-// not fall back to inherit-parent-env. os/exec treats a nil cmd.Env as
+// not fall back to inherit-parent-env. The only entry the child then
+// receives is the run-agent marker the adapter stamps last (#3945), which
+// cannot put the child into helper mode. os/exec treats a nil cmd.Env as
 // "inherit", so a copy that yields nil (e.g. append onto a nil slice)
 // would silently leak the whole runner env. The helper selectors are set
 // on the PARENT env only: if the child inherited anything it would enter
@@ -1144,5 +1147,70 @@ func TestInvoke_PromptTooLarge_NamedSentinel(t *testing.T) {
 		if ev.Kind != "invocation_start" {
 			t.Errorf("unexpected event %q after a refused spawn", ev.Kind)
 		}
+	}
+}
+
+// TestInvoke_StampsRunAgentMarker pins the run-agent marker (#3945): every
+// spawn carries FISHHAWK_RUN_AGENT=<RunID> ("1" without a run id), applied
+// AFTER every other env overlay so a BaseEnv entry, an Invocation.Env key or
+// an ambient parent value can neither shadow nor re-point it.
+func TestInvoke_StampsRunAgentMarker(t *testing.T) {
+	helper := []string{"GO_HELPER_PROCESS=1", "HELPER_MODE=echo_env_base"}
+	cases := []struct {
+		name    string
+		ambient string // t.Setenv value for the parent (nil-BaseEnv row only)
+		inv     agent.Invocation
+		want    string
+	}{
+		{
+			name: "base_env_without_marker",
+			inv:  agent.Invocation{RunID: "run-a", BaseEnv: helper},
+			want: "run-a",
+		},
+		{
+			name: "base_env_with_stale_marker",
+			inv:  agent.Invocation{RunID: "run-b", BaseEnv: append([]string{"FISHHAWK_RUN_AGENT=stale"}, helper...)},
+			want: "run-b",
+		},
+		{
+			// Pins ORDER: the stamp must run after the Invocation.Env overlay,
+			// or the overlay's AppendEnvOverride re-points the marker.
+			name: "invocation_env_spoof",
+			inv:  agent.Invocation{RunID: "run-c", BaseEnv: helper, Env: map[string]string{"FISHHAWK_RUN_AGENT": "spoof"}},
+			want: "run-c",
+		},
+		{
+			name:    "nil_base_env_ambient_stale_parent",
+			ambient: "stale-parent",
+			inv:     agent.Invocation{RunID: "run-d"},
+			want:    "run-d",
+		},
+		{
+			name: "empty_run_id_falls_back_to_1",
+			inv:  agent.Invocation{BaseEnv: helper},
+			want: "1",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.inv.BaseEnv == nil {
+				// The nil-BaseEnv seed is os.Environ(): the helper selectors
+				// and the stale marker ride in from the parent.
+				t.Setenv("GO_HELPER_PROCESS", "1")
+				t.Setenv("HELPER_MODE", "echo_env_base")
+				t.Setenv("FISHHAWK_RUN_AGENT", tc.ambient)
+			}
+			inv := &Invoker{Cmd: nilEnvHelperCommand(), Now: frozenNow()}
+			res, err := inv.Invoke(context.Background(), tc.inv)
+			if err != nil {
+				t.Fatalf("Invoke: %v", err)
+			}
+			if !res.OK {
+				t.Fatalf("OK = false: %s", res.FailureReason)
+			}
+			if got := envEvents(t, res.Events)["FISHHAWK_RUN_AGENT"]; got != tc.want {
+				t.Errorf("FISHHAWK_RUN_AGENT = %q, want %q (the adapter must stamp the run-agent marker last)", got, tc.want)
+			}
+		})
 	}
 }

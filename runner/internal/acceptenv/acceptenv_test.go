@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/kuhlman-labs/fishhawk/runner/internal/acceptenv"
+	"github.com/kuhlman-labs/fishhawk/runner/internal/agent"
 )
 
 const proxy = "http://127.0.0.1:39999"
@@ -205,5 +206,39 @@ func TestEnv_DropsBaseForgeWritesValue(t *testing.T) {
 	want := []string{acceptenv.ForgeWritesVar + "=" + acceptenv.ForgeWritesDeny}
 	if !slices.Equal(got, want) {
 		t.Fatalf("forge-writes entries = %v, want exactly %v (base allow must be dropped)", got, want)
+	}
+}
+
+// TestEnv_RefusesRunAgentMarkerPassthrough (#3945) proves the runner-stamped
+// run-agent marker cannot be supplied through the credential channel: a
+// passthrough named FISHHAWK_RUN_AGENT (upper and mixed case) is refused and
+// reported, and neither spelling reaches the composed env.
+func TestEnv_RefusesRunAgentMarkerPassthrough(t *testing.T) {
+	base := []string{
+		"FISHHAWK_ACCEPTANCE_ENV_FISHHAWK_RUN_AGENT=spoof",
+		"FISHHAWK_ACCEPTANCE_ENV_Fishhawk_Run_Agent=spoof",
+	}
+	env, refused := acceptenv.Env(base, proxy)
+	if !slices.Contains(refused, "FISHHAWK_RUN_AGENT") || !slices.Contains(refused, "Fishhawk_Run_Agent") {
+		t.Errorf("refused = %v, want both run-agent passthroughs named", refused)
+	}
+	for _, kv := range env {
+		if k, _, _ := strings.Cut(kv, "="); strings.EqualFold(k, agent.RunAgentEnvVar) {
+			t.Errorf("run-agent passthrough admitted onto the env: %q (the marker is runner-stamped, never operator input)", kv)
+		}
+	}
+}
+
+// TestEnv_DropsBaseRunAgentMarker (#3945) proves an ambient FISHHAWK_RUN_AGENT
+// on the runner's env (an operator's value, or one inherited by a runner
+// spawned under an agent) never survives composition: the allow-list drops it
+// by omission, and the adapter's last-applied stamp supplies the real value.
+func TestEnv_DropsBaseRunAgentMarker(t *testing.T) {
+	env, refused := acceptenv.Env([]string{agent.RunAgentEnvVar + "=stale-parent", "PATH=/usr/bin"}, proxy)
+	if len(refused) != 0 {
+		t.Fatalf("refused = %v, want none (a base value is dropped by omission)", refused)
+	}
+	if _, ok := envMap(t, env)[agent.RunAgentEnvVar]; ok {
+		t.Errorf("ambient %s survived acceptenv composition: %v", agent.RunAgentEnvVar, env)
 	}
 }

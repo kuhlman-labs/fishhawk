@@ -8,6 +8,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/kuhlman-labs/fishhawk/runner/internal/agent"
 )
 
 // TestIsRunAgentMatchesAcceptanceTreePath pins scripts/is-run-agent (the
@@ -35,9 +37,14 @@ func TestIsRunAgentMatchesAcceptanceTreePath(t *testing.T) {
 	}
 
 	cmd := exec.Command(script, dir)
-	// Scrub the env signals so only the path can produce the verdict.
+	// Scrub the env signals so only the path can produce the verdict. That
+	// includes the runner-stamped marker FISHHAWK_RUN_AGENT (#3945): inside a
+	// run agent's own shell it is set, and once scripts/is-run-agent reads it
+	// first (#3947) the script would print a marker reason and fail the
+	// "acceptance tree" prefix check below.
 	for _, kv := range os.Environ() {
-		if strings.HasPrefix(kv, "FISHHAWK_RUN_ID=") || strings.HasPrefix(kv, "FISHHAWK_FORGE_WRITES=") {
+		if strings.HasPrefix(kv, "FISHHAWK_RUN_ID=") || strings.HasPrefix(kv, "FISHHAWK_FORGE_WRITES=") ||
+			strings.HasPrefix(kv, agent.RunAgentEnvVar+"=") {
 			continue
 		}
 		cmd.Env = append(cmd.Env, kv)

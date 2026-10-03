@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/kuhlman-labs/fishhawk/runner/internal/agent"
 )
 
 // TestSanitizeEnv_StripsSecretsKeepsToolchain feeds sanitizeEnv a base slice
@@ -739,6 +741,35 @@ func TestGateEnvVerifyControlsProtectedByBothLayers(t *testing.T) {
 		if gateEnvAllowed(key) {
 			t.Errorf("gateEnvAllowed(%q) = true — the default-deny allow-list was widened to admit a scoped-verify control variable", key)
 		}
+	}
+}
+
+// TestGateEnvStripsRunAgentMarker (#3945) pins that the runner-stamped
+// run-agent marker can never reach a verify-gate child. The deny and allow
+// predicates are asserted SEPARATELY: default-deny alone already drops the
+// name, so the sanitize-drop assertion stays green when only the deny entry is
+// deleted — the gateEnvDenied assertion (and TestGateEnvListsMatchCLICopy) is
+// what reddens on that single-layer mutation.
+func TestGateEnvStripsRunAgentMarker(t *testing.T) {
+	key := agent.RunAgentEnvVar
+	if !gateEnvDenied(key) {
+		t.Errorf("gateEnvDenied(%q) = false — the belt-and-suspenders deny entry is missing", key)
+	}
+	if gateEnvAllowed(key) {
+		t.Errorf("gateEnvAllowed(%q) = true — the default-deny allow-list was widened to admit the run-agent marker", key)
+	}
+	got := sanitizeEnv([]string{key + "=stale-operator", "PATH=/usr/bin"})
+	var pathKept bool
+	for _, kv := range got {
+		if strings.HasPrefix(kv, key+"=") {
+			t.Errorf("sanitizeEnv admitted the ambient run-agent marker: %q", kv)
+		}
+		if kv == "PATH=/usr/bin" {
+			pathKept = true
+		}
+	}
+	if !pathKept {
+		t.Errorf("sanitizeEnv dropped PATH: %q", got)
 	}
 }
 
