@@ -29,8 +29,9 @@ type Artifact struct {
 }
 
 // Kind enumerates the artifact kinds. Closed set per the schema's
-// CHECK constraint (migration 0002, widened by 0037, 0045, 0051, and 0073):
-// plan, pull_request, deployment, acceptance, release_notes, grooming_report.
+// CHECK constraint (migration 0002, widened by 0037, 0045, 0051, 0073, 0083,
+// and 0095): plan, pull_request, deployment, acceptance, release_notes,
+// grooming_report, acceptance_transcript, upkeep_report.
 type Kind string
 
 // Artifact kinds.
@@ -82,4 +83,13 @@ const (
 	// Create with this kind fails SQLSTATE 23514 against the un-widened
 	// CHECK), exactly as 0073 paired with KindGroomingReport.
 	KindAcceptanceTranscript Kind = "acceptance_transcript"
+	// KindUpkeepReport is E79's upkeep-scan proposal record (E79.2 / #3726):
+	// the durable artifact a `plan`-typed PROPOSE stage emits carrying the
+	// recorded-run flake, toolchain-pin drift and deprecation findings to
+	// file, validated against upkeep_report_v1 (contract and ingest handler:
+	// #3921). Admitted by migration 0095, which widens artifacts_kind_check;
+	// the constant and migration ship together (a Create with this kind fails
+	// SQLSTATE 23514 against the un-widened CHECK), exactly as 0073 paired
+	// with KindGroomingReport and 0083 with KindAcceptanceTranscript.
+	KindUpkeepReport Kind = "upkeep_report"
 )

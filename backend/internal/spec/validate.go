@@ -500,6 +500,46 @@ func validateWorkflow(s *Spec, name string, wf *Workflow, major int) error {
 					}
 				}
 			}
+			// The upkeep_report artifact (E79.2 / #3726) is the upkeep-scan
+			// sibling of the grooming_report binding above: emitted only by a
+			// `plan`-typed PROPOSE stage (ADR-067 §2), schema-versioned, and
+			// never beside another proposal artifact. The block runs for
+			// whichever produces entry carries the artifact, so both
+			// declaration orders of a conflicting pair are refused here.
+			if p.Artifact == ArtifactUpkeepReport {
+				if stage.Type != StageTypePlan {
+					return &ValidationError{
+						Path: stagePath(i, fmt.Sprintf("/produces/%d/artifact", j)),
+						Message: fmt.Sprintf(
+							"upkeep_report artifact is valid only on a plan stage — the PROPOSE stage per ADR-067 §2 — not a %q stage (E79.2)",
+							stage.Type,
+						),
+					}
+				}
+				if p.Schema != UpkeepReportSchemaVersion {
+					return &ValidationError{
+						Path: stagePath(i, fmt.Sprintf("/produces/%d/schema", j)),
+						Message: fmt.Sprintf(
+							"upkeep_report-producing stage must declare schema: %s, got %q",
+							UpkeepReportSchemaVersion, p.Schema,
+						),
+					}
+				}
+				for k, other := range stage.Produces {
+					if k == j {
+						continue
+					}
+					if other.Artifact == ArtifactPlan || other.Artifact == ArtifactGroomingReport {
+						return &ValidationError{
+							Path: stagePath(i, fmt.Sprintf("/produces/%d/artifact", j)),
+							Message: fmt.Sprintf(
+								"stage %q declares both the upkeep_report and %s artifacts; a propose stage proposes one thing — drop whichever this stage does not emit (E79.2)",
+								stage.ID, other.Artifact,
+							),
+						}
+					}
+				}
+			}
 		}
 
 		// Egress / permissions declaration binding (ADR-050 / #1532;

@@ -1,0 +1,13 @@
+id: scenario:issue-3920/upkeep-artifact-kind-persists-and-reverses
+statement: An upkeep_report artifact row persists under the widened artifacts_kind_check, and the down migration restores the prior check (a reversal test pins both).
+steps: 'On the preview''s database (fishhawk_preview in container fishhawk-postgres, schema_migrations 95), ran one psql session: BEGIN; INSERT an artifacts row kind upkeep_report on the plan stage of a freshly seeded plan-gate-parked run; DELETE it; apply backend/internal/postgres/migrations/0095_artifacts_kind_upkeep_report.down.sql from the sanctioned checkout; read artifacts_kind_check; INSERT upkeep_report again; ROLLBACK. Afterwards, re-read the constraint and counted upkeep_report rows.'
+assertions:
+    expected: row persists under widened check; down restores prior check
+    observed_at_record: The live check includes upkeep_report, and the first insert succeeded. After the down migration the check is the seven-value set without upkeep_report, and the insert fails 'violates check constraint artifacts_kind_check'. After ROLLBACK there are 0 upkeep_report rows and the widened check is intact.
+    repro_handle: 'psql fishhawk_preview: BEGIN; INSERT ... kind ''upkeep_report''; <0095 down>; INSERT ...; ROLLBACK'
+origin:
+    issue: 3920
+    pr: 3946
+    run_id: f5097685-f053-4b23-8807-d7a6010a4280
+    head_sha: a2204522ad9cc7b06d768409e7f91f92026d4f7b
+    recorded_at: 2026-10-03T15:44:02Z

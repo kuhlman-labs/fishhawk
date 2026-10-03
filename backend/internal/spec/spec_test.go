@@ -7072,6 +7072,358 @@ workflows:
 	}
 }
 
+// --- E79.2 / #3726: the upkeep_report produces artifact ---------------------
+//
+// The upkeep sibling of the E54.3 grooming family above: the same stage-type
+// binding, schema-version rule and one-proposal rule, plus a from-disk family
+// over the shipped docs/spec/examples/workflow-v2-upkeep-scan.yaml.
+
+// upkeepScanExampleRelPath is the shipped upkeep-scan declaration, read from
+// disk so the tests exercise the SHIPPED bytes rather than a copy.
+const upkeepScanExampleRelPath = "../../../docs/spec/examples/workflow-v2-upkeep-scan.yaml"
+
+// TestValidate_UpkeepReportArtifact_NonPlanStage_Rejected pins the stage-type
+// binding: upkeep_report is valid ONLY on a `plan`-typed (PROPOSE) stage. Four
+// negative rows plus a POSITIVE control asserting a plan-typed stage accepts it
+// (which also proves the embedded schema enum admits the new value).
+func TestValidate_UpkeepReportArtifact_NonPlanStage_Rejected(t *testing.T) {
+	cases := []struct {
+		name      string
+		stageType string
+		executor  string
+	}{
+		{name: "implement", stageType: "implement", executor: "          agent: claude-code\n"},
+		{name: "review", stageType: "review", executor: "          human: true\n"},
+		{
+			name:      "deploy",
+			stageType: "deploy",
+			executor: "          delegate:\n" +
+				"            target: webhook\n" +
+				"            url: https://example.com/deploy\n",
+		},
+		{name: "acceptance", stageType: "acceptance", executor: "          agent: claude-code\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			doc := `version: "2"
+workflows:
+  wf:
+    stages:
+      - id: s
+        type: ` + tc.stageType + `
+        executor:
+` + tc.executor + `        produces:
+          - artifact: upkeep_report
+            schema: upkeep_report_v1
+`
+			_, err := spec.ParseBytes([]byte(doc))
+			var ve *spec.ValidationError
+			if !errors.As(err, &ve) {
+				t.Fatalf("err = %v, want *ValidationError", err)
+			}
+			if want := "/workflows/wf/stages/0/produces/0/artifact"; ve.Path != want {
+				t.Errorf("ValidationError.Path = %q, want %q", ve.Path, want)
+			}
+			if !strings.Contains(ve.Message, "upkeep_report artifact is valid only on a plan stage") {
+				t.Errorf("ValidationError.Message = %q, want the upkeep_report stage-type binding", ve.Message)
+			}
+			if !strings.Contains(ve.Message, `"`+tc.stageType+`"`) {
+				t.Errorf("ValidationError.Message = %q, want it to name the offending stage type %q", ve.Message, tc.stageType)
+			}
+		})
+	}
+
+	t.Run("plan stage accepts", func(t *testing.T) {
+		if _, err := spec.ParseBytes([]byte(`version: "2"
+workflows:
+  upkeep_scan:
+    stages:
+      - id: scan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: upkeep_report
+            schema: upkeep_report_v1
+`)); err != nil {
+			t.Fatalf("a plan-typed PROPOSE stage must accept upkeep_report: %v", err)
+		}
+	})
+}
+
+// TestValidate_UpkeepReportArtifact_MissingSchema_Rejected pins the
+// schema-version rule (MVP_SPEC §4.3): an upkeep_report-producing stage MUST
+// declare schema: upkeep_report_v1. Rows: schema absent, and a wrong token
+// (the grooming sibling's, which must not pass for this artifact).
+func TestValidate_UpkeepReportArtifact_MissingSchema_Rejected(t *testing.T) {
+	cases := []struct {
+		name    string
+		schema  string
+		wantGot string
+	}{
+		{name: "absent", schema: "", wantGot: `got ""`},
+		{name: "wrong token", schema: "            schema: grooming_report_v1\n", wantGot: `got "grooming_report_v1"`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := spec.ParseBytes([]byte(`version: "2"
+workflows:
+  wf:
+    stages:
+      - id: scan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: upkeep_report
+` + tc.schema))
+			var ve *spec.ValidationError
+			if !errors.As(err, &ve) {
+				t.Fatalf("err = %v, want *ValidationError", err)
+			}
+			if want := "/workflows/wf/stages/0/produces/0/schema"; ve.Path != want {
+				t.Errorf("ValidationError.Path = %q, want %q", ve.Path, want)
+			}
+			if !strings.Contains(ve.Message, "must declare schema: upkeep_report_v1") {
+				t.Errorf("ValidationError.Message = %q, want the schema-version rule", ve.Message)
+			}
+			if !strings.Contains(ve.Message, tc.wantGot) {
+				t.Errorf("ValidationError.Message = %q, want it to name %s", ve.Message, tc.wantGot)
+			}
+		})
+	}
+}
+
+// TestValidate_UpkeepReportWithOtherProposal_SameStage_Rejected pins the
+// one-proposal-per-propose-stage rule against BOTH sibling proposals (plan and
+// grooming_report), in BOTH declaration orders, and asserts the message names
+// the conflicting artifact. Every entry carries its own correct schema, so only
+// the one-proposal rule can refuse these documents.
+func TestValidate_UpkeepReportWithOtherProposal_SameStage_Rejected(t *testing.T) {
+	const (
+		upkeep   = "          - artifact: upkeep_report\n            schema: upkeep_report_v1\n"
+		plan     = "          - artifact: plan\n            schema: standard_v1\n"
+		grooming = "          - artifact: grooming_report\n            schema: grooming_report_v1\n"
+	)
+	cases := []struct {
+		name     string
+		produces string
+		other    string
+	}{
+		{name: "upkeep first, plan", produces: upkeep + plan, other: "plan"},
+		{name: "plan first, upkeep", produces: plan + upkeep, other: "plan"},
+		{name: "upkeep first, grooming_report", produces: upkeep + grooming, other: "grooming_report"},
+		{name: "grooming_report first, upkeep", produces: grooming + upkeep, other: "grooming_report"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := spec.ParseBytes([]byte(`version: "2"
+workflows:
+  wf:
+    stages:
+      - id: scan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+` + tc.produces))
+			var ve *spec.ValidationError
+			if !errors.As(err, &ve) {
+				t.Fatalf("err = %v, want *ValidationError", err)
+			}
+			want := "declares both the upkeep_report and " + tc.other + " artifacts"
+			if !strings.Contains(ve.Message, want) {
+				t.Errorf("ValidationError.Message = %q, want it to contain %q", ve.Message, want)
+			}
+		})
+	}
+}
+
+// TestParseBytes_V0V1_UpkeepReportArtifact_Rejected pins that the FROZEN majors
+// keep rejecting the new artifact: v0 and v1's own produces enums do not admit
+// upkeep_report, so a v0.7 / v1.6 document declaring it fails on its own schema
+// (a *SchemaError), never reaching the version-agnostic binding.
+func TestParseBytes_V0V1_UpkeepReportArtifact_Rejected(t *testing.T) {
+	for _, version := range []string{"0.7", "1.6"} {
+		t.Run("frozen major "+version, func(t *testing.T) {
+			_, err := spec.ParseBytes([]byte(`version: "` + version + `"
+workflows:
+  wf:
+    stages:
+      - id: scan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: upkeep_report
+            schema: upkeep_report_v1
+`))
+			var se *spec.SchemaError
+			if !errors.As(err, &se) {
+				t.Fatalf("version %s: err = %v, want *SchemaError (the frozen major must reject the artifact)", version, err)
+			}
+		})
+	}
+}
+
+// TestStageProducesUpkeepReport pins the pure per-stage predicate: true only
+// for a stage whose produces list declares upkeep_report, false for a plan
+// stage, a grooming stage and the zero Stage.
+func TestStageProducesUpkeepReport(t *testing.T) {
+	cases := []struct {
+		name string
+		st   spec.Stage
+		want bool
+	}{
+		{
+			name: "scan stage",
+			st: spec.Stage{ID: "scan", Type: spec.StageTypePlan, Produces: []spec.Produces{
+				{Artifact: spec.ArtifactUpkeepReport, Schema: spec.UpkeepReportSchemaVersion},
+			}},
+			want: true,
+		},
+		{
+			name: "plan artifact stage",
+			st: spec.Stage{ID: "plan", Type: spec.StageTypePlan, Produces: []spec.Produces{
+				{Artifact: spec.ArtifactPlan, Schema: "standard_v1"},
+			}},
+			want: false,
+		},
+		{
+			name: "grooming stage",
+			st: spec.Stage{ID: "groom", Type: spec.StageTypePlan, Produces: []spec.Produces{
+				{Artifact: spec.ArtifactGroomingReport, Schema: spec.GroomingReportSchemaVersion},
+			}},
+			want: false,
+		},
+		{name: "zero Stage", st: spec.Stage{}, want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := spec.StageProducesUpkeepReport(tc.st); got != tc.want {
+				t.Errorf("StageProducesUpkeepReport = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// parseShippedUpkeepScanExample reads and parses the shipped declaration.
+func parseShippedUpkeepScanExample(t *testing.T) spec.Workflow {
+	t.Helper()
+	raw, err := os.ReadFile(upkeepScanExampleRelPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", upkeepScanExampleRelPath, err)
+	}
+	s, err := spec.ParseBytes(raw)
+	if err != nil {
+		t.Fatalf("ParseBytes(%s): %v", upkeepScanExampleRelPath, err)
+	}
+	wf, ok := s.Workflows["upkeep_scan"]
+	if !ok {
+		t.Fatalf("workflows = %v, want an upkeep_scan workflow", s.Workflows)
+	}
+	return wf
+}
+
+// TestShippedUpkeepScanExample_ProposeStageShape reads the shipped bytes from
+// disk and asserts exactly one stage produces the upkeep_report, that it is a
+// plan-typed stage declaring upkeep_report_v1, and that no stage produces a
+// pull_request (the workflow is a no-diff one).
+func TestShippedUpkeepScanExample_ProposeStageShape(t *testing.T) {
+	wf := parseShippedUpkeepScanExample(t)
+	var scans []spec.Stage
+	for _, st := range wf.Stages {
+		if spec.StageProducesUpkeepReport(st) {
+			scans = append(scans, st)
+		}
+		for _, p := range st.Produces {
+			if p.Artifact == spec.ArtifactPullRequest {
+				t.Errorf("stage %q declares the pull_request artifact; the upkeep scan must stay a NON-code-change workflow", st.ID)
+			}
+		}
+	}
+	if len(scans) != 1 {
+		t.Fatalf("%d stages produce upkeep_report, want exactly 1", len(scans))
+	}
+	scan := scans[0]
+	if scan.Type != spec.StageTypePlan {
+		t.Errorf("upkeep_report is produced by a %q stage, want a plan (PROPOSE) stage", scan.Type)
+	}
+	for _, p := range scan.Produces {
+		if p.Artifact == spec.ArtifactUpkeepReport && p.Schema != spec.UpkeepReportSchemaVersion {
+			t.Errorf("upkeep_report schema = %q, want %q", p.Schema, spec.UpkeepReportSchemaVersion)
+		}
+	}
+}
+
+// TestShippedUpkeepScanExample_NoCharter pins that an upkeep_report workflow
+// requires no charter: WorkflowRequiresCharter keys on grooming_report only.
+func TestShippedUpkeepScanExample_NoCharter(t *testing.T) {
+	wf := parseShippedUpkeepScanExample(t)
+	if spec.WorkflowRequiresCharter(wf) {
+		t.Error("WorkflowRequiresCharter(upkeep_scan) = true, want false — an upkeep scan needs no charter (E79.2)")
+	}
+}
+
+// TestShippedUpkeepScanExample_TriggerRouting pins the non-diff routing form
+// the weekly schedule requires: applies_to lists scheduled and on_demand and
+// refuses a diff-shaped change, and the declared cadence is present.
+func TestShippedUpkeepScanExample_TriggerRouting(t *testing.T) {
+	wf := parseShippedUpkeepScanExample(t)
+	if wf.AppliesTo == nil {
+		t.Fatal("upkeep_scan declares no applies_to; the non-diff routing form is missing")
+	}
+	for _, tc := range []struct {
+		trigger spec.TriggerForm
+		want    bool
+	}{
+		{spec.TriggerScheduled, true},
+		{spec.TriggerOnDemand, true},
+		{spec.TriggerDiff, false},
+	} {
+		got, err := wf.AppliesTo.Match(spec.Change{Trigger: tc.trigger})
+		if err != nil {
+			t.Fatalf("Match(trigger=%s): %v", tc.trigger, err)
+		}
+		if got != tc.want {
+			t.Errorf("Match(trigger=%s) = %v, want %v", tc.trigger, got, tc.want)
+		}
+	}
+	if wf.Schedule == nil || wf.Schedule.Cron == "" {
+		t.Errorf("schedule = %+v, want a declared weekly cadence", wf.Schedule)
+	}
+}
+
+// TestShippedUpkeepScanExample_ApprovalGateExcludesAgents pins that the scan
+// stage's approval gate carries a forge-neutral predicate excluding agents, so
+// no agent approves its own upkeep proposal.
+func TestShippedUpkeepScanExample_ApprovalGateExcludesAgents(t *testing.T) {
+	wf := parseShippedUpkeepScanExample(t)
+	seen := 0
+	for _, st := range wf.Stages {
+		if !spec.StageProducesUpkeepReport(st) {
+			continue
+		}
+		for gi := range st.Gates {
+			g := st.Gates[gi]
+			if g.Type != spec.GateTypeApproval {
+				continue
+			}
+			seen++
+			if g.Approvals == nil {
+				t.Errorf("stage %q gate %d declares no `approvals` block", st.ID, gi)
+				continue
+			}
+			if !containsRole(g.Approvals.Not, "agent") {
+				t.Errorf("stage %q gate %d approvals.not = %v, want it to exclude \"agent\"", st.ID, gi, g.Approvals.Not)
+			}
+		}
+	}
+	if seen != 1 {
+		t.Errorf("found %d approval gates on the scan stage, want 1", seen)
+	}
+}
+
 // --- E54.4 / #2236: the SHIPPED backlog-grooming declaration -----------------
 //
 // The TestShippedGroomingExample_* family below reads
@@ -7521,6 +7873,18 @@ workflows:
         executor:
           agent: claude-code
 `
+	const upkeep = `version: "2"
+workflows:
+  upkeep_scan:
+    stages:
+      - id: scan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: upkeep_report
+            schema: upkeep_report_v1
+`
 	const ordinaryNamedGrooming = `version: "2"
 workflows:
   backlog_grooming:
@@ -7548,6 +7912,9 @@ workflows:
 		{name: "ordinary workflow named backlog_grooming", wf: parse(t, ordinaryNamedGrooming, "backlog_grooming"), want: false},
 		{name: "zero Workflow", wf: spec.Workflow{}, want: false},
 		{name: "stages without produces", wf: spec.Workflow{Stages: []spec.Stage{{ID: "plan", Type: spec.StageTypePlan}}}, want: false},
+		// E79.2: an upkeep_report workflow needs no charter — the discriminator
+		// keys on grooming_report only.
+		{name: "stage producing upkeep_report", wf: parse(t, upkeep, "upkeep_scan"), want: false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

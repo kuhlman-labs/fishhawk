@@ -2007,8 +2007,10 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			if siblingKind, isSibling, ev := detectPlanSibling(cfg.planOut); isSibling {
 				// (1) The stage emitted a recognized standard_v1 SIBLING at the
 				// plan-out path instead of a plan: a clarification_request (#1057,
-				// the planner parked because the issue is not yet plannable) or a
-				// grooming_report (#2235, a backlog-grooming propose stage). ANY
+				// the planner parked because the issue is not yet plannable), a
+				// grooming_report (#2235, a backlog-grooming propose stage) or an
+				// upkeep_report (E79.2 / #3726, an upkeep-scan propose stage; its
+				// backend ingest is #3921). ANY
 				// recognized sibling ALWAYS wins — ignore any structured_output the
 				// (schema-constrained) invocation may also have produced, since
 				// adopting it would DESTROY the sibling before uploadPlan ever reads
@@ -2017,8 +2019,8 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 				// uploadPlan re-reads the file and ships those exact bytes; the
 				// backend ingests the sibling — parking the stage at awaiting_input
 				// for a clarification_request, persisting an artifact row for a
-				// grooming_report — and owns its own validation and category-B
-				// failure on a bad one.
+				// grooming_report or upkeep_report — and owns its own validation
+				// and category-B failure on a bad one.
 				//
 				// Before shipping, strip undeclared properties from the
 				// clarification artifact (#1837): the backend strict-validates it
@@ -2035,8 +2037,9 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 				//
 				// KIND-GATED (#2833): the stripper's allowlists are
 				// clarification-shaped (questions[] / ticket_reference /
-				// generated_by) and have no grooming equivalent, so running it on a
-				// grooming_report would strip every legitimate grooming property.
+				// generated_by) and have no grooming or upkeep equivalent, so
+				// running it on a grooming_report or upkeep_report would strip
+				// every legitimate property of that artifact.
 				if siblingKind == "clarification_request" {
 					if data, rerr := os.ReadFile(cfg.planOut); rerr == nil {
 						cleaned, warnings, serr := plan.StripUnknownClarificationProps(data)
@@ -4491,18 +4494,21 @@ func parseDiffNumstat(output string) (insertions, deletions int) {
 // planSiblingKinds is the runner-side recognized set of additive standard_v1
 // SIBLING artifact kinds a plan-typed stage may emit instead of a plan. It
 // mirrors the backend's plan.ArtifactKindClarificationRequest (#1057) and
-// plan.ArtifactKindGroomingReport (#2235) — the runner module cannot import
-// backend/internal/plan (runner/go.mod declares no backend dependency), so the
-// set is a deliberate module-wall duplicate. A THIRD sibling is one entry here
-// plus the backend's own routing; TestDetectPlanSibling asserts the shipped
-// per-kind behavior so the list cannot silently drift into a no-op.
+// plan.ArtifactKindGroomingReport (#2235), plus upkeep_report (E79.2 / #3726,
+// whose backend ingest handler and upkeep_report_v1 schema land in #3921) — the
+// runner module cannot import backend/internal/plan (runner/go.mod declares no
+// backend dependency), so the set is a deliberate module-wall duplicate. A
+// FURTHER sibling is one entry here plus the backend's own routing;
+// TestDetectPlanSibling asserts the shipped per-kind behavior so the list
+// cannot silently drift into a no-op.
 //
-// The runner does NOT validate a sibling: neither schema is embedded here
-// (scripts/sync-schemas mirrors both into the backend only), so the backend
+// The runner does NOT validate a sibling: no sibling schema is embedded here
+// (scripts/sync-schemas mirrors them into the backend only), so the backend
 // validates on ingest and fails the stage category-B itself.
 var planSiblingKinds = map[string]struct{}{
 	"clarification_request": {},
 	"grooming_report":       {},
+	"upkeep_report":         {},
 }
 
 // siblingKindOf peeks the top-level "kind" discriminator in data and returns
@@ -4525,8 +4531,8 @@ func siblingKindOf(data []byte) string {
 
 // detectPlanSibling peeks the plan-out file's top-level "kind" discriminator
 // (#1057, generalized by #2833). A recognized sibling — clarification_request
-// (the planner parked) or grooming_report (a backlog-grooming propose stage) —
-// is shipped as-is: the backend ingests it and either parks the stage or
+// (the planner parked), grooming_report (a backlog-grooming propose stage) or
+// upkeep_report (an upkeep-scan propose stage, E79.2 / #3726) — is shipped as-is: the backend ingests it and either parks the stage or
 // persists the artifact, so the runner must NOT validate it as a plan and must
 // NOT let structured-output adoption overwrite it.
 //
@@ -4536,8 +4542,9 @@ func siblingKindOf(data []byte) string {
 // where a genuinely-missing or malformed plan is demoted as before. On a hit
 // it returns the detected kind plus a policy_event recording the detection in
 // the trace bundle, with outcome set to the kind string (so the pre-existing
-// clarification_request outcome assertions keep working unchanged and a
-// grooming_report emits outcome=grooming_report).
+// clarification_request outcome assertions keep working unchanged, a
+// grooming_report emits outcome=grooming_report and an upkeep_report emits
+// outcome=upkeep_report).
 func detectPlanSibling(path string) (string, bool, agent.Event) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -4593,9 +4600,10 @@ func adoptStructuredOutput(path string, out []byte) agent.Event {
 // sibling (see planSiblingKinds), validatePlan returns a policy_event and a nil
 // error WITHOUT running plan.TryCoerce and WITHOUT running plan.Validate. Both
 // are standard_v1-shaped — TryCoerce REWRITES the file in place when it fires,
-// so an ungated run against a grooming_report can corrupt an otherwise-valid
-// report, and Validate would demote it to category-B. Sibling validation is the
-// backend's job on ingest; the runner embeds neither sibling schema. The
+// so an ungated run against a grooming_report or upkeep_report can corrupt an
+// otherwise-valid report, and Validate would demote it to category-B. Sibling
+// validation is the backend's job on ingest; the runner embeds no sibling
+// schema. The
 // precedence block in run() normally never reaches here for a sibling, so this
 // gate covers any other caller (a local replay driven only by --plan-out).
 func validatePlan(path string) (agent.Event, error) {
@@ -4607,8 +4615,8 @@ func validatePlan(path string) (agent.Event, error) {
 		}, fmt.Errorf("plan: read %s: %w", path, err)
 	}
 
-	// Recognized-sibling gate (#2833). A clarification_request or
-	// grooming_report is NOT a plan: skip both TryCoerce (which would rewrite
+	// Recognized-sibling gate (#2833). A clarification_request,
+	// grooming_report or upkeep_report is NOT a plan: skip both TryCoerce (which would rewrite
 	// the file in place with standard_v1-shaped fixes) and plan.Validate
 	// (which would demote a perfectly good sibling to category-B). The bytes
 	// are left byte-identical for uploadPlan to ship; the backend validates

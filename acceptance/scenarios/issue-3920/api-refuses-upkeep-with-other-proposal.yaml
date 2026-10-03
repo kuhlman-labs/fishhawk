@@ -1,0 +1,14 @@
+id: scenario:issue-3920/api-refuses-upkeep-with-other-proposal
+statement: POST /v0/runs with an inline workflow_spec whose plan stage declares upkeep_report alongside plan (or alongside grooming_report) is refused with 400 validation_failed whose details.error names both artifacts ('declares both the upkeep_report and plan artifacts' / '... and grooming_report artifacts'); the same request with only upkeep_report (schema upkeep_report_v1) is NOT refused with a validation_failed on field workflow_spec.
+verify_hint: 'HTTP response: POST /v0/runs on the localhost preview with a write:runs bearer token, the inline workflow_spec and a matching workflow_id; read the status code, error.code and error.details.error.'
+steps: 'POST http://localhost:8090/v0/runs with a write:runs fhk_ bearer and inline workflow_spec was refused by the sandbox egress proxy (403 ''egress ... denied: POST /v0/runs is a run-minting/dispatch verb''), so the handler was unreachable. Confirmed handleCreateRun calls spec.ParseBytes on the inline spec and returns 400 validation_failed with details {field workflow_spec, error}. As approval condition 4 directs, ran the same backend validator through the preview''s MCP fishhawk_validate (POST /mcp tools/call, arguments {workflow_spec}) on a v2 spec whose plan stage ''scan'' produces upkeep_report (schema upkeep_report_v1) plus (a) plan standard_v1, (b) grooming_report grooming_report_v1, (c) nothing else, and (d) the shipped example.'
+assertions:
+    expected: refused naming both artifacts; upkeep-only not refused
+    observed_at_record: '(a) valid false: ''stage "scan" declares both the upkeep_report and plan artifacts; a propose stage proposes one thing''. (b) valid false: ''... declares both the upkeep_report and grooming_report artifacts ...''. (c) and (d) valid true, version 2, no diagnostics, charter_required_by [].'
+    repro_handle: 'MCP tools/call fishhawk_validate {workflow_spec: <upkeep+plan spec>}'
+origin:
+    issue: 3920
+    pr: 3946
+    run_id: f5097685-f053-4b23-8807-d7a6010a4280
+    head_sha: a2204522ad9cc7b06d768409e7f91f92026d4f7b
+    recorded_at: 2026-10-03T15:44:02Z

@@ -1,0 +1,101 @@
+# Workflow-v2 example — the UPKEEP SCAN: a propose-only workflow that finds
+# repository upkeep work and proposes it as issues (E79.2 / #3726, phase 2).
+#
+# Validates against ../workflow-v2.schema.json. THIS FILE IS THE SHIPPED
+# UPKEEP-SCAN DECLARATION: the TestShippedUpkeepScanExample_* family in
+# backend/internal/spec and TestRunValidate_UpkeepScanExample_NoCharter_OK in
+# cli/cmd/fishhawk read THESE bytes from disk, so a schema-invalid or drifted
+# file fails those tests rather than only a manual check-jsonschema run.
+#
+# NOT RUNNABLE YET. This workflow declares a stage that produces an
+# upkeep_report, and the pieces that make such a stage work end to end are not
+# in the tree:
+#
+#   #3921  the upkeep_report_v1 schema and the plan-stage INGEST handler. Until
+#          it lands the backend has no upkeep_report route: plan ingest routes
+#          on the uploaded body's top-level `kind` alone and never reads the
+#          stage's declared produces, so an upkeep_report body falls to the plan
+#          path and is refused plan_invalid (category-B), while an ordinary plan
+#          uploaded by this stage would be ingested AS A PLAN.
+#   #3922  the scan prompt that tells the agent what to scan for and what to
+#          emit. Until it lands the scan stage runs the plain plan prompt.
+#
+# DO NOT register this workflow in .fishhawk/workflows.yaml until both land.
+# Declaring it here (an example under docs/spec/examples/) starts nothing: the
+# scheduler is opt-in (--enable-scheduler) and reads only the registered spec.
+#
+# WHAT IT DOES. The `scan` stage is a `plan`-typed PROPOSE stage (ADR-067 §2:
+# the v0 stage-type names are retained but general). It emits an upkeep_report —
+# recorded-run flake, toolchain-pin drift and deprecation findings to file —
+# instead of a plan, and a captain approves it. The `file` stage then applies
+# the approved findings by filing them as issues. No stage declares the
+# pull_request artifact, so this workflow produces NO diff; at major >= 2 an
+# absent produces list reads as "produces no diff", and a post-hoc diff
+# constraint (max_files_changed, forbidden_paths, ...) on any stage here would
+# be refused at parse time.
+#
+# NO CHARTER. WorkflowRequiresCharter keys on the grooming_report artifact
+# only. An upkeep scan ranks nothing against a vision document, so
+# `fishhawk validate` and run admission require no charter for it.
+#
+# NO `actions` BLOCK. No upkeep action classes exist, and `autonomy: low`
+# delegates none of the run-driving classes, so every gate stops for a human.
+#
+# NO `inputs`. A scan is not issue-anchored: it reads the repository and its
+# recorded runs, not an issue body.
+#
+# THE TRIGGER FORM AND CADENCE. `applies_to: {trigger: [scheduled, on_demand]}`
+# is the non-diff routing declaration (ADR-067) and is REQUIRED by the schedule
+# below, which starts `scheduled` runs. The cadence is weekly, Monday 09:00 UTC.
+
+version: "2"
+
+workflows:
+  upkeep_scan:
+    description: >-
+      Scan for repository upkeep work — recorded-run flakes, toolchain-pin
+      drift and deprecations — propose it as an upkeep report, gate the report
+      on a human approval, then file the approved findings as issues. Produces
+      no code diff at any stage.
+    auto_advance: true
+
+    applies_to:
+      trigger: [scheduled, on_demand]
+
+    schedule:
+      cron: "0 9 * * 1"
+
+    autonomy: low
+
+    stages:
+      # PROPOSE. A `plan`-typed stage need not emit a plan artifact — it emits a
+      # proposal, and here the proposal is an upkeep report. The artifact binds
+      # to the stage TYPE, requires its schema for the same forward-compatibility
+      # reason a plan declares standard_v1, and may not share the stage with a
+      # plan or grooming_report artifact.
+      - id: scan
+        type: plan
+        executor:
+          agent: claude-code
+          timeout: 20m
+        produces:
+          - artifact: upkeep_report
+            schema: upkeep_report_v1
+        gates:
+          - type: approval
+            sla: 24_hours
+            # Forge-neutral approval predicate (E39.2 / #1707): the captain
+            # approves, never the author or the agent.
+            approvals:
+              count: 1
+              not: [author, agent]
+
+      # APPLY. An `implement`-typed stage files the approved findings as issues
+      # — tracker writes, not source edits. It declares no produces, so it
+      # produces no diff and opens no pull request.
+      - id: file
+        type: implement
+        executor:
+          agent: claude-code
+          timeout: 30m
+        needs: [scan]
