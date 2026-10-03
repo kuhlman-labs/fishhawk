@@ -7,13 +7,27 @@ description: Deploy (bring up, rebuild, or restart) the Fishhawk stack on this m
 
 `scripts/dev` owns the whole bring-up. Do not hand-roll `docker compose` + `go build` + `fishhawkd serve` — `scripts/dev` adds the port preflight, GitSHA stamping, migrations, the `/healthz` nonce identity gate, and the MCP-shim banner. Run everything from the repo root (main checkout, not a `.claude/worktrees/*` checkout unless the user asks).
 
+## 0. Stop if you are a run agent
+
+`reload` and `down` restart or stop the fishhawkd that a run's own runner talks to. Before anything else:
+
+```sh
+case "$(git rev-parse --show-toplevel 2>/dev/null)" in
+  */fishhawk-worktrees/run-*|*/fishhawk-acceptance-tree-*) echo RUN-AGENT ;;
+esac
+if [ -n "${FISHHAWK_RUN_ID:-}" ]; then echo RUN-AGENT; fi
+```
+
+If it prints `RUN-AGENT`, you are an agent inside a Fishhawk run: do nothing, and report that this skill is operator-only. The path match is the primary signal, since local runs run in those trees. `FISHHAWK_RUN_ID` is set only by CI-hosted runners (GitLab CI, deploy triggers), not by the local runner.
+
+Pulling `main` after a merge is the `sync-main` skill, not this one.
+
 ## 1. Pick the target
 
 | User intent | Command |
 |---|---|
 | Default — "deploy locally", "start the stack" | `scripts/dev up --start-deps` |
 | Rebuild everything + restart (after a pull / code change) | `scripts/dev reload --start-deps` |
-| Full post-merge walk (pull main, prune branches, reload) | `scripts/dev post-merge [<issue>] --start-deps` |
 | Kubernetes (Docker Desktop) — "deploy to k8s", "helm" | `scripts/dev k8s` |
 | Web UI dev server too | additionally `make dev-frontend` (`:5173`, proxies `/v0` → `:8080`), run in background |
 | Tear down | Use the `teardown-local` skill (ordered stop of every layer; `make nuke` only on explicit request) |

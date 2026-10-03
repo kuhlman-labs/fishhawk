@@ -20,11 +20,13 @@ The command is the easy part. The judgment is in **whether it is safe to pull an
 This skill stops services or deletes state, and its confirmation steps need a human. Before anything else:
 
 ```sh
-case "$(git rev-parse --show-toplevel 2>/dev/null)" in */fishhawk-worktrees/run-*) echo RUN-WORKTREE ;; esac
-[ -n "${FISHHAWK_RUN_ID:-}" ] && echo RUN-AGENT
+case "$(git rev-parse --show-toplevel 2>/dev/null)" in
+  */fishhawk-worktrees/run-*|*/fishhawk-acceptance-tree-*) echo RUN-AGENT ;;
+esac
+if [ -n "${FISHHAWK_RUN_ID:-}" ]; then echo RUN-AGENT; fi
 ```
 
-If either line prints, you are an agent inside a Fishhawk run. Do nothing, and report that this skill is operator-only.
+If it prints `RUN-AGENT`, you are an agent inside a Fishhawk run: do nothing, and report that this skill is operator-only. The path match is the primary signal, since local runs run in those trees. `FISHHAWK_RUN_ID` is set only by CI-hosted runners (GitLab CI, deploy triggers), not by the local runner.
 
 ## 1. Is anything live? (stop and ask if yes)
 

@@ -13,11 +13,13 @@ Teardown is ordered from the top of the stack to the bottom: clients, then the d
 This skill stops services or deletes state, and its confirmation steps need a human. Before anything else:
 
 ```sh
-case "$(git rev-parse --show-toplevel 2>/dev/null)" in */fishhawk-worktrees/run-*) echo RUN-WORKTREE ;; esac
-[ -n "${FISHHAWK_RUN_ID:-}" ] && echo RUN-AGENT
+case "$(git rev-parse --show-toplevel 2>/dev/null)" in
+  */fishhawk-worktrees/run-*|*/fishhawk-acceptance-tree-*) echo RUN-AGENT ;;
+esac
+if [ -n "${FISHHAWK_RUN_ID:-}" ]; then echo RUN-AGENT; fi
 ```
 
-If either line prints, you are an agent inside a Fishhawk run. Do nothing, and report that this skill is operator-only.
+If it prints `RUN-AGENT`, you are an agent inside a Fishhawk run: do nothing, and report that this skill is operator-only. The path match is the primary signal, since local runs run in those trees. `FISHHAWK_RUN_ID` is set only by CI-hosted runners (GitLab CI, deploy triggers), not by the local runner.
 
 ## 1. Check what's live, and stop if a run is mid-flight
 
@@ -46,7 +48,7 @@ Skip any layer that isn't running.
    - `kubectl get nodes -o name` lists only `node/docker-desktop`, or only kind-style `node/<name>-control-plane` / `-worker` nodes. This is the same classification `scripts/dev k8s` uses.
 
    If either check fails, **stop**: report the context and the release, and ask. Never `helm uninstall` on a context that might be shared or remote.
-5. **Compose containers:** `make down` (`docker compose down`). This stops Postgres, RustFS and Jaeger and **keeps** the named volumes `fishhawk-postgres-data` and `fishhawk-rustfs-data`. Jaeger sits behind the `otel` profile; if it's still up, run `docker compose --profile otel down`.
+5. **Compose containers:** `make down` (`docker compose down`). This stops Postgres, RustFS and Jaeger and **keeps** the named data volumes. Compose prefixes them with the project name, which defaults to the checkout directory's name: from the main checkout, `docker volume ls` shows `fishhawk_fishhawk-postgres-data` and `fishhawk_fishhawk-rustfs-data`. **Run every compose command from the main checkout.** From a differently named checkout (e.g. a `.claude/worktrees/<x>` worktree), compose targets a different project's containers and volumes. Jaeger sits behind the `otel` profile; if it's still up, run `docker compose --profile otel down`.
 6. **Shared test Postgres** (`fishhawk-test-postgres`, usually already reaped by `scripts/test`): if it's still present and no `scripts/test` is running, run `docker rm -f -v fishhawk-test-postgres`.
 
 ## 3. Destroy data (only on explicit request)
@@ -54,8 +56,10 @@ Skip any layer that isn't running.
 Run this only if the user asked to wipe/reset/destroy data, and after restating that it permanently deletes the local dev database and stored traces:
 
 ```sh
-make nuke        # docker compose down -v — removes fishhawk-postgres-data and fishhawk-rustfs-data
+make nuke        # docker compose down -v: removes fishhawk_fishhawk-postgres-data and fishhawk_fishhawk-rustfs-data
 ```
+
+Run it from the main checkout only. From any other checkout directory, compose targets a different project's volumes.
 
 The next `scripts/dev up --start-deps` recreates empty volumes and re-runs migrations.
 

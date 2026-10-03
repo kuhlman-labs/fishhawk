@@ -165,19 +165,23 @@ func TestExtractTar_SkipsAgentInstructionFiles(t *testing.T) {
 		reg(".Agents/skills/z/SKILL.md", "re-cased planted skill"),
 		reg(".CLAUDE/settings.json", "{}"),
 		reg("docs/agents.md", "re-cased codex instructions"),
+		reg("cli/.Codex/config.toml", "x=1"),
+		reg("backend/agents.OVERRIDE.md", "re-cased codex override"),
+		reg("docs/claude.md", "re-cased claude instructions"),
+		reg("web/claude.LOCAL.md", "re-cased claude local override"),
 		reg("main.go", "package main"), // an ordinary file that MUST land
 	})
 	stats, err := extractTar(bytes.NewReader(data), dest, DefaultLimits())
 	if err != nil {
 		t.Fatalf("extractTar: %v", err)
 	}
-	if stats.Instructions != 15 {
-		t.Errorf("stats.Instructions = %d, want 15 agent-instruction skips", stats.Instructions)
+	if stats.Instructions != 19 {
+		t.Errorf("stats.Instructions = %d, want 19 agent-instruction skips", stats.Instructions)
 	}
 	if stats.Files != 1 {
 		t.Errorf("stats.Files = %d, want 1 (only main.go lands)", stats.Files)
 	}
-	for _, skipped := range []string{"AGENTS.md", "AGENTS.override.md", "CLAUDE.md", "CLAUDE.local.md", "backend/AGENTS.md", "backend/AGENTS.override.md", "docs/CLAUDE.md", ".claude/settings.json", ".codex/config.toml", ".agents/skills/x/SKILL.md", "backend/.agents/skills/y/SKILL.md", ".Agents/skills/z/SKILL.md", ".CLAUDE/settings.json", "docs/agents.md"} {
+	for _, skipped := range []string{"AGENTS.md", "AGENTS.override.md", "CLAUDE.md", "CLAUDE.local.md", "backend/AGENTS.md", "backend/AGENTS.override.md", "docs/CLAUDE.md", ".claude/settings.json", ".codex/config.toml", ".agents/skills/x/SKILL.md", "backend/.agents/skills/y/SKILL.md", ".Agents/skills/z/SKILL.md", ".CLAUDE/settings.json", "docs/agents.md", "cli/.Codex/config.toml", "backend/agents.OVERRIDE.md", "docs/claude.md", "web/claude.LOCAL.md"} {
 		if _, serr := os.Stat(filepath.Join(dest, skipped)); !os.IsNotExist(serr) {
 			t.Errorf("agent-instruction path %q was materialized: %v", skipped, serr)
 		}

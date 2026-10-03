@@ -13,11 +13,13 @@ Everything here is **list first, confirm, then remove**. Show the user the candi
 This skill stops services or deletes state, and its confirmation steps need a human. Before anything else:
 
 ```sh
-case "$(git rev-parse --show-toplevel 2>/dev/null)" in */fishhawk-worktrees/run-*) echo RUN-WORKTREE ;; esac
-[ -n "${FISHHAWK_RUN_ID:-}" ] && echo RUN-AGENT
+case "$(git rev-parse --show-toplevel 2>/dev/null)" in
+  */fishhawk-worktrees/run-*|*/fishhawk-acceptance-tree-*) echo RUN-AGENT ;;
+esac
+if [ -n "${FISHHAWK_RUN_ID:-}" ]; then echo RUN-AGENT; fi
 ```
 
-If either line prints, you are an agent inside a Fishhawk run. Do nothing, and report that this skill is operator-only.
+If it prints `RUN-AGENT`, you are an agent inside a Fishhawk run: do nothing, and report that this skill is operator-only. The path match is the primary signal, since local runs run in those trees. `FISHHAWK_RUN_ID` is set only by CI-hosted runners (GitLab CI, deploy triggers), not by the local runner.
 
 ## 0. Is anything live?
 
@@ -59,7 +61,7 @@ It then runs `scripts/cleanup-merged` (deletes local branches already merged int
   - Remove only `fishhawk-test-postgres`, and only when no `scripts/test` is running: `docker rm -f -v fishhawk-test-postgres`. `-v` takes only that container's anonymous volumes.
   - For any other labelled container, list it with its image and age, and remove it only after the user confirms that specific container.
 - **Dangling anonymous volumes.** `scripts/test` warns above 100. The cleanup command is `docker volume prune -f`, but it is **daemon-wide**: it deletes every unused anonymous volume on the machine, not just Fishhawk's. Say so explicitly and get a yes before running it.
-- **Compose named volumes** (`fishhawk-postgres-data`, `fishhawk-rustfs-data`) hold the dev database and traces. Leave them alone; destroying them is the `teardown-local` skill's destroy-data step (`make nuke`), and only on explicit request.
+- **Compose named volumes** (`fishhawk_fishhawk-postgres-data`, `fishhawk_fishhawk-rustfs-data` from the main checkout; compose prefixes the project name) hold the dev database and traces. Leave them alone; destroying them is the `teardown-local` skill's destroy-data step (`make nuke`), and only on explicit request.
 
 ## 4. Caches and logs
 

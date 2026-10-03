@@ -379,13 +379,22 @@ workflows:
           # instructions by every later agent session, runner agents
           # included, so an agent editing them could rewrite its successors'
           # instructions; skill and settings upkeep is operator-authored
-          # (AGENTS.md, Documentation surfaces). The legal files are neither,
+          # (AGENTS.md, Documentation surfaces). They are matched at any
+          # depth and in any letter case (see the entries below). The legal files are neither,
           # but are likewise not the agent's to edit.
           forbidden_paths:
             - ".github/workflows/**"
             - ".fishhawk/**"
-            - ".agents/**"
-            - ".claude/**"
+            # Agent-config directories at ANY depth and in ANY letter case:
+            # codex finds .agents/skills at every level, and on a
+            # case-insensitive filesystem (macOS) a CLI opening `.agents`
+            # resolves to a tracked `.Agents`. doublestar has no
+            # case-insensitive mode, so each name is spelled as character
+            # classes. Pinned by runner/internal/constraint's
+            # TestRepoSpecForbidsAgentInstructionPaths.
+            - "**/.[aA][gG][eE][nN][tT][sS]/**"
+            - "**/.[cC][lL][aA][uU][dD][eE]/**"
+            - "**/.[cC][oO][dD][eE][xX]/**"
             - "LICENSE"
             - "NOTICE"
           required_outcomes:
@@ -520,13 +529,30 @@ workflows:
             - "go.mod"
             - "go.sum"
             - "**/*_test.go"
-          # `**/*.md` above would otherwise admit agent skills
-          # (.agents/skills/*/SKILL.md) and .claude/ content on a workflow
-          # that merges without human approval; both are loaded as
-          # instructions by later agent sessions, so they stay operator-authored.
+          # `**/*.md` and `docs/**` above would otherwise admit agent
+          # instructions on a workflow that merges without human approval:
+          # skills and settings under the agent-config directories, and the
+          # instruction files every CLI auto-loads (AGENTS.md,
+          # AGENTS.override.md, CLAUDE.md, CLAUDE.local.md) at any depth. All
+          # are loaded as instructions by later agent sessions, so on this
+          # workflow they are not the agent's to write. (feature_change keeps
+          # AGENTS.md writable: the repo's conventions require updating it,
+          # and that workflow has human plan approval and review.)
           forbidden_paths:
-            - ".agents/**"
-            - ".claude/**"
+            # Agent-config directories at ANY depth and in ANY letter case:
+            # codex finds .agents/skills at every level, and on a
+            # case-insensitive filesystem (macOS) a CLI opening `.agents`
+            # resolves to a tracked `.Agents`. doublestar has no
+            # case-insensitive mode, so each name is spelled as character
+            # classes. Pinned by runner/internal/constraint's
+            # TestRepoSpecForbidsAgentInstructionPaths.
+            - "**/.[aA][gG][eE][nN][tT][sS]/**"
+            - "**/.[cC][lL][aA][uU][dD][eE]/**"
+            - "**/.[cC][oO][dD][eE][xX]/**"
+            - "**/[aA][gG][eE][nN][tT][sS].[mM][dD]"
+            - "**/[aA][gG][eE][nN][tT][sS].[oO][vV][eE][rR][rR][iI][dD][eE].[mM][dD]"
+            - "**/[cC][lL][aA][uU][dD][eE].[mM][dD]"
+            - "**/[cC][lL][aA][uU][dD][eE].[lL][oO][cC][aA][lL].[mM][dD]"
           required_outcomes:
             - ci_green
       # 2. Review — the gate, held by CI rather than a person.
