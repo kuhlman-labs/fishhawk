@@ -1,0 +1,13 @@
+id: scenario:issue-3935/reviewerless-consolidated-parent-checked
+statement: 'A decomposed parent whose implement stage has NO reviewers still gets the permission-drift check at its consolidated review: a widening on the consolidated change raises one server_check concern.'
+steps: 'Posture B: in the sanctioned checkout ran `cd backend && GOROOT=/tmp/acc-goroot GOTOOLCHAIN=local /tmp/acc-goroot/bin/go test ./internal/server/ -count=1 -v -run ''PermissionDrift|ConsolidatedReview''` (loopback-over-Unix-socket toolchain copy).'
+assertions:
+    expected: one server_check concern for a reviewer-less consolidated parent widening
+    observed_at_record: PASS TestPermissionDrift_ConsolidatedReviewNoReviewers; also PASS TestPermissionDrift_ConsolidatedReviewRaises and the TestDispatchConsolidatedReview_* tests.
+    repro_handle: go test ./internal/server/ -run TestPermissionDrift_ConsolidatedReviewNoReviewers -v
+origin:
+    issue: 3935
+    pr: 0
+    run_id: f2213730-3e1b-4ee9-b223-53920548c2a5
+    head_sha: 8cc080e13c4eba3535c8cd629173a66a6558bb31
+    recorded_at: 2026-10-03T16:17:20Z

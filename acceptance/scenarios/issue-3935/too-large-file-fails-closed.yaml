@@ -1,0 +1,13 @@
+id: scenario:issue-3935/too-large-file-fails-closed
+statement: A surface file the forge cannot return inline (too large for the contents API) is unevaluable (fetch_failed), never extracted as empty grants.
+steps: 'Posture B: in the sanctioned checkout ran `cd backend && GOROOT=/tmp/acc-goroot GOTOOLCHAIN=local /tmp/acc-goroot/bin/go test ./internal/githubclient/ -count=1 -run TestGetFile_TooLargeToInline -v` (loopback-over-Unix-socket toolchain copy); read the fetch_failed row of the server README fail-closed table.'
+assertions:
+    expected: fetch_failed, never empty grants
+    observed_at_record: 'PASS TestGetFile_TooLargeToInline: encoding ''none'' with empty content returns a non-ErrNotFound error naming ''none''. The README maps any non-ErrNotFound read error, explicitly including too-large, to fetch_failed, which FailureModes/head_fetch_500_raises_fetch_failed (PASS) pins.'
+    repro_handle: go test ./internal/githubclient/ -run TestGetFile_TooLargeToInline -v
+origin:
+    issue: 3935
+    pr: 0
+    run_id: f2213730-3e1b-4ee9-b223-53920548c2a5
+    head_sha: 8cc080e13c4eba3535c8cd629173a66a6558bb31
+    recorded_at: 2026-10-03T16:17:20Z
