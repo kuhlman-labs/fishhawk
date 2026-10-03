@@ -401,6 +401,7 @@ assert_contains "a10 scoped: site voice gate ran" "$FX/logs/gate.log" "check-sit
 assert_contains "a10 scoped: site IA gate ran" "$FX/logs/gate.log" "check-site-ia"
 assert_contains "a10 scoped: ADR record gate ran" "$FX/logs/gate.log" "check-adr"
 assert_contains "a10 scoped: ADR harness ran" "$FX/logs/gate.log" "test-adr"
+assert_contains "a10 scoped: run-agent guard harness ran" "$FX/logs/gate.log" "test-is-run-agent"
 run_verify "$FX"
 assert_contains "a10 unscoped: lint ran in backend" "$FX/logs/lint.log" "backend	run ./..."
 assert_contains "a10 unscoped: schema-sync ran" "$FX/logs/gate.log" "sync-schemas"
@@ -409,6 +410,7 @@ assert_contains "a10 unscoped: site voice gate ran" "$FX/logs/gate.log" "check-s
 assert_contains "a10 unscoped: site IA gate ran" "$FX/logs/gate.log" "check-site-ia"
 assert_contains "a10 unscoped: ADR record gate ran" "$FX/logs/gate.log" "check-adr"
 assert_contains "a10 unscoped: ADR harness ran" "$FX/logs/gate.log" "test-adr"
+assert_contains "a10 unscoped: run-agent guard harness ran" "$FX/logs/gate.log" "test-is-run-agent"
 
 # a11 — the doc-line budget still FAILS verify in both modes (the non-test legs
 # are not merely invoked in scoped mode, they still gate).

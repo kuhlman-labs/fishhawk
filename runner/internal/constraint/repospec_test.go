@@ -1,6 +1,7 @@
 package constraint
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -62,44 +63,11 @@ func stageForbiddenPaths(t *testing.T, wf, stageID string) []string {
 // AGENTS.md, which the repo's conventions require updating — while
 // routine_change (no human approval) forbids that too. The backend's own
 // evaluator is pinned against the product-parsed spec by the twin test in
-// backend/internal/policy (repospec_test.go); keep the two path tables equal.
+// backend/internal/policy (repospec_test.go); both read the shared path table in
+// testdata/policy/agent-instruction-paths.json.
 func TestRepoSpecForbidsAgentInstructionPaths(t *testing.T) {
-	configDirPaths := []string{
-		".agents/skills/x/SKILL.md",
-		"backend/.agents/skills/x/SKILL.md",
-		".Agents/skills/x/SKILL.md",
-		"docs/.AGENTS/skills/x/SKILL.md",
-		".claude/settings.json",
-		"backend/.claude/skills/x/SKILL.md",
-		".CLAUDE/settings.json",
-		".codex/config.toml",
-		"cli/.Codex/config.toml",
-	}
-	const rootAgents = "AGENTS.md"
-	instructionFiles := []string{
-		"backend/AGENTS.md",
-		"docs/agents.md",
-		"AGENTS.override.md",
-		"backend/agents.OVERRIDE.md",
-		"CLAUDE.md",
-		"docs/claude.md",
-		"CLAUDE.local.md",
-		"web/claude.LOCAL.md",
-	}
-	ordinary := []string{
-		"docs/README.md",
-		"backend/internal/agents/agents.go",
-		"docs/agents-guide.md",
-	}
-
-	cases := []struct {
-		wf, stage    string
-		mustForbid   []string
-		mustNotMatch []string
-	}{
-		{"feature_change", "implement", append(append([]string{}, configDirPaths...), instructionFiles...), append(append([]string{}, ordinary...), rootAgents)},
-		{"routine_change", "implement", append(append(append([]string{}, configDirPaths...), instructionFiles...), rootAgents), ordinary},
-	}
+	f := loadAgentPathFixture(t)
+	cases := agentPathCases(f)
 	for _, tc := range cases {
 		t.Run(tc.wf, func(t *testing.T) {
 			c := Constraints{ForbiddenPaths: stageForbiddenPaths(t, tc.wf, tc.stage)}
@@ -126,4 +94,63 @@ func hasForbiddenViolation(vs []Violation) bool {
 		}
 	}
 	return false
+}
+
+// agentPathFixture is testdata/policy/agent-instruction-paths.json, the ONE
+// path table shared with this test's twin in the other module.
+type agentPathFixture struct {
+	ConfigDirPaths         []string `json:"config_dir_paths"`
+	InstructionFiles       []string `json:"instruction_files"`
+	RootAgents             string   `json:"root_agents"`
+	RootAgentsCaseVariants []string `json:"root_agents_case_variants"`
+	GuardFiles             []string `json:"guard_files"`
+	Ordinary               []string `json:"ordinary"`
+}
+
+func loadAgentPathFixture(t *testing.T) agentPathFixture {
+	t.Helper()
+	p := filepath.Join("..", "..", "..", "testdata", "policy", "agent-instruction-paths.json")
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatalf("read %s: %v", p, err)
+	}
+	var f agentPathFixture
+	if err := json.Unmarshal(raw, &f); err != nil {
+		t.Fatalf("parse %s: %v", p, err)
+	}
+	if len(f.ConfigDirPaths) == 0 || len(f.InstructionFiles) == 0 || f.RootAgents == "" ||
+		len(f.RootAgentsCaseVariants) == 0 || len(f.GuardFiles) == 0 || len(f.Ordinary) == 0 {
+		t.Fatalf("%s: a path class is empty — the assertions would be vacuous", p)
+	}
+	return f
+}
+
+// agentPathCases composes the fixture's classes into each workflow's
+// must-forbid / must-stay-writable sets. routine_change's guard files are
+// excluded from must-forbid because its allowed_paths list (not
+// forbidden_paths) already keeps scripts/ out of reach.
+func agentPathCases(f agentPathFixture) []struct {
+	wf, stage    string
+	mustForbid   []string
+	mustNotMatch []string
+} {
+	cat := func(lists ...[]string) []string {
+		var out []string
+		for _, l := range lists {
+			out = append(out, l...)
+		}
+		return out
+	}
+	return []struct {
+		wf, stage    string
+		mustForbid   []string
+		mustNotMatch []string
+	}{
+		{"feature_change", "implement",
+			cat(f.ConfigDirPaths, f.InstructionFiles, f.RootAgentsCaseVariants, f.GuardFiles),
+			cat(f.Ordinary, []string{f.RootAgents})},
+		{"routine_change", "implement",
+			cat(f.ConfigDirPaths, f.InstructionFiles, f.RootAgentsCaseVariants, []string{f.RootAgents}),
+			f.Ordinary},
+	}
 }

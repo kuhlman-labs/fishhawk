@@ -57,7 +57,8 @@ expect_run_agent "r2 acceptance tree" "$tmproot/fishhawk-acceptance-tree-run1-st
 mk_git "$tmproot/fishhawk-conflict-XYZ/tree"
 expect_run_agent "r3 conflict-resolution tree" "$tmproot/fishhawk-conflict-XYZ/tree" "conflict-resolution tree"
 
-# r4 — invoked from a SUBDIRECTORY of a run tree: the git top level matches.
+# r4 — invoked from a SUBDIRECTORY of a run tree: the run tree's path is a
+# prefix of the physical path, so it still matches.
 mkdir -p "$tmproot/fishhawk-conflict-XYZ/tree/backend/internal"
 expect_run_agent "r4 subdirectory of a run tree" "$tmproot/fishhawk-conflict-XYZ/tree/backend/internal" "conflict-resolution tree"
 
@@ -72,6 +73,17 @@ expect_operator "o1 operator checkout" "$tmproot/fishhawk"
 # o2 — an operator worktree under .claude/worktrees is NOT a run tree.
 mk_git "$tmproot/fishhawk/.claude/worktrees/feature-x"
 expect_operator "o2 operator .claude worktree" "$tmproot/fishhawk/.claude/worktrees/feature-x"
+
+# o3/o4 — operator checkouts merely NAMED like a conflict tree are not run
+# agents: the conflict shape is <dir>/fishhawk-conflict-<rand>/tree exactly.
+mk_git "$tmproot/fishhawk/.claude/worktrees/fishhawk-conflict-resolver-fix"
+expect_operator "o3 operator worktree named fishhawk-conflict-*" "$tmproot/fishhawk/.claude/worktrees/fishhawk-conflict-resolver-fix"
+mk_git "$tmproot/src/fishhawk-conflict-test/sub/tree"
+expect_operator "o4 operator path with a deeper /tree" "$tmproot/src/fishhawk-conflict-test/sub/tree"
+
+# o5 — a path that only CONTAINS run- as a substring of a component.
+mk_git "$tmproot/my-fishhawk-worktrees/run-x"
+expect_operator "o5 component merely ending in fishhawk-worktrees" "$tmproot/my-fishhawk-worktrees/run-x"
 
 # e1 — FISHHAWK_RUN_ID alone marks a run agent (CI-hosted runners).
 out="$(FISHHAWK_RUN_ID=11111111-2222-3333-4444-555555555555 "$CHECK" "$tmproot/fishhawk" 2>&1)"

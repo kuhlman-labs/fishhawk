@@ -1327,6 +1327,12 @@ _verify_patch_coverage() {
 # docs/adr/; same shape as test-site-ia (temp-dir fixtures with a hand-written
 # index.json, no network/Docker, no zsh guard). It is bash but drives a python3
 # gate, so it needs python3 — already a verify dependency via check-coverage.py.
+# test-is-run-agent (#3938) pins scripts/is-run-agent, the one shared
+# definition of a Fishhawk run agent that the operator-only agent skills
+# (.agents/skills/{deploy-local,teardown-local,dev-clean,sync-main}) run before
+# stopping services or deleting state: each runner agent tree shape, a
+# subdirectory of one, operator checkouts merely NAMED like one, and the
+# FISHHAWK_RUN_ID signal. Bash, temp-dir git fixtures, no network/Docker.
 # A FAILING harness fails verify (set -e), which is the point (#2455).
 #
 # Every harness runs with FISHHAWK_VERIFY_LOCK_PATH and FISHHAWK_VERIFY_LOCK_OWNER

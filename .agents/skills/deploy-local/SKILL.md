@@ -15,7 +15,9 @@ description: Deploy (bring up, rebuild, or restart) the Fishhawk stack on this m
 "$(git rev-parse --show-toplevel)/scripts/is-run-agent"
 ```
 
-If it exits non-zero (it prints `run-agent: <reason>`), you are an agent inside a Fishhawk run: do nothing, and report that this skill is operator-only. `scripts/is-run-agent` is the one shared definition of a run agent: it matches the runner's lineage, acceptance and conflict-resolution trees, plus `FISHHAWK_RUN_ID` (CI runners).
+- It prints `operator` and exits 0: continue.
+- It prints `run-agent: <reason>` and exits 10: you are an agent inside a Fishhawk run. Do nothing, and report that this skill is operator-only.
+- Anything else, e.g. exit 127 / `No such file or directory`: this checkout predates the guard, or you are outside the repository. **Stop** and tell the user. Don't treat a missing guard as permission. `scripts/is-run-agent` is the one shared definition of a run agent: it matches the runner's lineage, acceptance and conflict-resolution trees, plus `FISHHAWK_RUN_ID` (CI runners).
 
 Pulling `main` after a merge is the `sync-main` skill, not this one.
 

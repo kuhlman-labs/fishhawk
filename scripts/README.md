@@ -2781,18 +2781,24 @@ need a human and an unattended runner agent has none (#3938). It is the one
 shared definition of a run agent, so a new runner agent tree is a one-line
 change here, not four skill edits.
 
-- **Path signal (primary).** The git top level of DIR, and its physical
-  path, are matched against the runner's agent trees:
-  `*/fishhawk-worktrees/run-*` (lineage worktree),
-  `*/fishhawk-acceptance-tree-*` (acceptance merge-candidate tree) and
-  `*/fishhawk-conflict-*` (conflict-resolution tree,
-  `<tmp>/fishhawk-conflict-XXXX/tree`). The local runner sets no marker
+- **Path signal (primary).** DIR's physical path (`pwd -P`) is matched
+  against the runner's agent trees, each as an exact path component
+  (`grep -E`), not a substring:
+  `/fishhawk-worktrees/run-<id>` (lineage worktree),
+  `/fishhawk-acceptance-tree-<run>-<stage>` (acceptance merge-candidate tree)
+  and `/fishhawk-conflict-<rand>/tree` (conflict-resolution tree), each
+  followed by `/` or end of path. A run tree's path prefixes every directory
+  inside it, so a subdirectory matches too. The local runner sets no marker
   env var, so the path is what identifies a local run agent.
 - **Env signal.** A non-empty `FISHHAWK_RUN_ID` (set by CI-hosted runners
   only: GitLab CI, deploy triggers). Empty is not a marker.
 
 `scripts/test-is-run-agent` (in `scripts/test verify`'s gate harnesses)
 pins each tree shape, a subdirectory of a run tree, a non-git run-tree
-path, an operator checkout, an operator `.claude/worktrees/*` checkout,
-and both env cases. Counterfactual: deleting the conflict-tree pattern
-fails r3 and r4.
+path, operator checkouts (including ones merely NAMED like a conflict tree
+or ending in `fishhawk-worktrees`), and both env cases. Counterfactuals:
+deleting the conflict-tree pattern fails r3/r4, and loosening it to a
+`fishhawk-conflict-` prefix fails o3/o4. Both `scripts/is-run-agent` and
+the harness are in `feature_change` implement's `forbidden_paths`, so a run
+cannot merge a weakened guard. A skill that finds the script missing (a
+checkout that predates it, exit 127) stops instead of proceeding.

@@ -1,0 +1,41 @@
+{
+  "_comment": "Shared fixture for the twin TestRepoSpecForbidsAgentInstructionPaths tests in runner/internal/constraint and backend/internal/policy (one source of truth across the two modules, per AGENTS.md's cross-module golden rule). Each list is a class of paths; the tests compose them into per-workflow must-forbid / must-stay-writable sets.",
+  "config_dir_paths": [
+    ".agents/skills/x/SKILL.md",
+    "backend/.agents/skills/x/SKILL.md",
+    ".Agents/skills/x/SKILL.md",
+    "docs/.AGENTS/skills/x/SKILL.md",
+    ".claude/settings.json",
+    "backend/.claude/skills/x/SKILL.md",
+    ".CLAUDE/settings.json",
+    ".codex/config.toml",
+    "cli/.Codex/config.toml"
+  ],
+  "instruction_files": [
+    "backend/AGENTS.md",
+    "docs/agents.md",
+    "AGENTS.override.md",
+    "backend/agents.OVERRIDE.md",
+    "CLAUDE.md",
+    "docs/claude.md",
+    "CLAUDE.local.md",
+    "web/claude.LOCAL.md"
+  ],
+  "root_agents": "AGENTS.md",
+  "root_agents_case_variants": [
+    "agents.md",
+    "Agents.MD",
+    "AGENTS.mD",
+    "aGENTS.MD"
+  ],
+  "guard_files": [
+    "scripts/is-run-agent",
+    "scripts/test-is-run-agent"
+  ],
+  "ordinary": [
+    "docs/README.md",
+    "backend/internal/agents/agents.go",
+    "docs/agents-guide.md",
+    "scripts/test"
+  ]
+}

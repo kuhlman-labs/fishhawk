@@ -406,6 +406,23 @@ workflows:
             - "**/[aA][gG][eE][nN][tT][sS].[oO][vV][eE][rR][rR][iI][dD][eE].[mM][dD]"
             - "**/[cC][lL][aA][uU][dD][eE].[mM][dD]"
             - "**/[cC][lL][aA][uU][dD][eE].[lL][oO][cC][aA][lL].[mM][dD]"
+            # Root-level letter-case VARIANTS of AGENTS.md (`agents.md`,
+            # `Agents.MD`, ...): each pattern forces ONE letter to differ from
+            # the exact `AGENTS.md` (a lowercase name letter, or an uppercase
+            # extension letter), so the eight together match every spelling but it.
+            # On a case-insensitive checkout such a file collides with AGENTS.md.
+            - "a[gG][eE][nN][tT][sS].[mM][dD]"
+            - "[aA]g[eE][nN][tT][sS].[mM][dD]"
+            - "[aA][gG]e[nN][tT][sS].[mM][dD]"
+            - "[aA][gG][eE]n[tT][sS].[mM][dD]"
+            - "[aA][gG][eE][nN]t[sS].[mM][dD]"
+            - "[aA][gG][eE][nN][tT]s.[mM][dD]"
+            - "[aA][gG][eE][nN][tT][sS].M[dD]"
+            - "[aA][gG][eE][nN][tT][sS].[mM]D"
+            # The operator-only skill guard (.agents/skills/*) and its harness:
+            # a run must not merge a weakened run-agent check.
+            - "scripts/is-run-agent"
+            - "scripts/test-is-run-agent"
             - "LICENSE"
             - "NOTICE"
           required_outcomes:
