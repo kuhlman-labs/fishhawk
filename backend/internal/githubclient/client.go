@@ -2045,7 +2045,8 @@ const compareFilesCap = 300
 // truncation signals GitHub only exposes in the structured form — the
 // 300-file cap and the per-file omitted-patch marker. The Patch is
 // reconstructed by concatenating each file's hunks under a synthetic
-// `diff --git` header.
+// `diff --git` header. A "renamed" entry's `previous_filename` is decoded
+// into ComparePatchFile.PreviousPath (the rename source).
 //
 // Returns a typed error (ErrNotFound / ErrValidation / ErrForbidden) on
 // non-2xx. Truncation is NOT an error — the partial diff is returned with
@@ -2092,6 +2093,9 @@ func (c *Client) ComparePatch(ctx context.Context, scope forge.CredentialScope,
 			Status   string `json:"status"`
 			Changes  int    `json:"changes"`
 			Patch    string `json:"patch"`
+			// PreviousFilename is the rename source GitHub reports on a
+			// "renamed" diff entry; absent otherwise.
+			PreviousFilename string `json:"previous_filename"`
 		} `json:"files"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
@@ -2106,7 +2110,11 @@ func (c *Client) ComparePatch(ctx context.Context, scope forge.CredentialScope,
 	var patch strings.Builder
 	result.Files = make([]ComparePatchFile, 0, len(body.Files))
 	for _, f := range body.Files {
-		result.Files = append(result.Files, ComparePatchFile{Path: f.Filename, Status: f.Status})
+		result.Files = append(result.Files, ComparePatchFile{
+			Path:         f.Filename,
+			Status:       f.Status,
+			PreviousPath: f.PreviousFilename,
+		})
 		switch {
 		case f.Patch != "":
 			fmt.Fprintf(&patch, "diff --git a/%s b/%s\n%s\n", f.Filename, f.Filename, f.Patch)

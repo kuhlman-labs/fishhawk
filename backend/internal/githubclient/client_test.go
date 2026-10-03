@@ -575,6 +575,37 @@ func TestGetFile_BadEncoding(t *testing.T) {
 	}
 }
 
+// TestGetFile_TooLargeToInline pins GetFile's behaviour on GitHub's
+// documented response for a 1-100 MB file: 200 with type "file", encoding
+// "none" and an EMPTY content. GetFile must return an error that is NOT
+// ErrNotFound, so the permission-drift check maps it to a fetch_failed
+// unevaluable concern rather than reading the file as absent (#3935) — an
+// empty decoded body with a nil error would silently evaluate a too-large
+// surface file as having no declarations.
+//
+// COUNTERFACTUAL (the `body.Encoding != "base64"` check in GetFile mutated
+// to `false`): the empty content base64-decodes to zero bytes, so GetFile
+// returns an empty FileContent and a nil error — this test goes RED,
+// observed `err = <nil> (content ""), want a non-ErrNotFound error`.
+func TestGetFile_TooLargeToInline(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	fg.getFileBody = `{"path":"big.yaml","sha":"a","size":52428800,"content":"","encoding":"none","type":"file"}`
+	c, _ := newTestClient(t, srv, nil)
+	got, err := c.GetFile(context.Background(), forge.FromGitHubInstallationID(1), RepoRef{Owner: "x", Name: "y"}, "big.yaml", "main")
+	if err == nil {
+		t.Fatalf("err = <nil> (content %q), want a non-ErrNotFound error", got.Content)
+	}
+	if errors.Is(err, ErrNotFound) {
+		t.Errorf("err = %v, want a non-ErrNotFound error (a too-large file exists; it is not absent)", err)
+	}
+	if !strings.Contains(err.Error(), `"none"`) {
+		t.Errorf("err = %v, want it to name the unexpected encoding \"none\"", err)
+	}
+	if got != nil {
+		t.Errorf("content = %+v, want nil on error", got)
+	}
+}
+
 func TestGetFile_CorruptBase64(t *testing.T) {
 	fg, srv := newFakeGitHub(t)
 	fg.getFileBody = `{"path":"x","sha":"a","content":"!!!!","encoding":"base64","type":"file"}`
@@ -3145,7 +3176,8 @@ func TestComparePatch_HappyPath(t *testing.T) {
 		"commits": [{"sha":"c1"},{"sha":"c2"}],
 		"files": [
 			{"filename":"a.go","status":"modified","changes":3,"patch":"@@ -1 +1 @@\n-a\n+b"},
-			{"filename":"b.go","status":"added","changes":1,"patch":"@@ -0,0 +1 @@\n+new"}
+			{"filename":"b.go","status":"added","changes":1,"patch":"@@ -0,0 +1 @@\n+new"},
+			{"filename":"docs/a.yaml","previous_filename":"infra/specs/a.yaml","status":"renamed","changes":0}
 		]
 	}`
 	c, rec := comparePatchServer(t, http.StatusOK, body)
@@ -3156,14 +3188,32 @@ func TestComparePatch_HappyPath(t *testing.T) {
 	if got.HeadSHA != "c2" {
 		t.Errorf("HeadSHA = %q, want c2 (last commit)", got.HeadSHA)
 	}
-	if len(got.Files) != 2 {
-		t.Fatalf("Files = %d, want 2", len(got.Files))
+	if len(got.Files) != 3 {
+		t.Fatalf("Files = %d, want 3", len(got.Files))
 	}
-	if got.Files[0].Path != "a.go" || got.Files[0].Status != "modified" {
-		t.Errorf("Files[0] = %+v", got.Files[0])
+	if got.Files[0].Path != "a.go" || got.Files[0].Status != "modified" || got.Files[0].PreviousPath != "" {
+		t.Errorf("Files[0] = %+v, want a.go modified with no PreviousPath", got.Files[0])
 	}
-	if got.Files[1].Path != "b.go" || got.Files[1].Status != "added" {
-		t.Errorf("Files[1] = %+v", got.Files[1])
+	if got.Files[1].Path != "b.go" || got.Files[1].Status != "added" || got.Files[1].PreviousPath != "" {
+		t.Errorf("Files[1] = %+v, want b.go added with no PreviousPath", got.Files[1])
+	}
+	// The renamed row: previous_filename is decoded into PreviousPath, the
+	// rename SOURCE the permission-drift check evaluates (#3935).
+	// COUNTERFACTUAL (decode mutated to leave PreviousPath empty in
+	// ComparePatch): the fixture's source infra/specs/a.yaml differs from
+	// the destination docs/a.yaml, so an undecoded source reads "" here and
+	// this assertion goes RED — observed `Files[2] = {Path:docs/a.yaml
+	// Status:renamed PreviousPath:}, want PreviousPath infra/specs/a.yaml`.
+	if got.Files[2].Path != "docs/a.yaml" || got.Files[2].Status != "renamed" {
+		t.Errorf("Files[2] = %+v, want docs/a.yaml renamed", got.Files[2])
+	}
+	if got.Files[2].PreviousPath != "infra/specs/a.yaml" {
+		t.Errorf("Files[2] = %+v, want PreviousPath infra/specs/a.yaml", got.Files[2])
+	}
+	// A rename with no content change carries no patch body and zero
+	// changes, so it is neither hunked nor a truncation.
+	if strings.Contains(got.Patch, "docs/a.yaml") {
+		t.Errorf("Patch should omit a pure rename with no patch body: %q", got.Patch)
 	}
 	if !strings.Contains(got.Patch, "diff --git a/a.go b/a.go") ||
 		!strings.Contains(got.Patch, "diff --git a/b.go b/b.go") {

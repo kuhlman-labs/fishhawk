@@ -713,8 +713,9 @@ func (f *Forge) CompareCommits(ctx context.Context, scope forge.CredentialScope,
 // reconstructing a git-style patch: each changed file's GitLab hunk body is
 // prefixed with a synthetic `diff --git a/<old> b/<new>` header so a
 // downstream content reviewer reads it as an ordinary git diff — mirroring
-// the GitHub ComparePatchResult contract. A GitLab compare_timeout is
-// surfaced as Truncated (not an error).
+// the GitHub ComparePatchResult contract. A `renamed_file` entry's
+// `old_path` becomes ComparePatchFile.PreviousPath (the rename source). A
+// GitLab compare_timeout is surfaced as Truncated (not an error).
 func (f *Forge) ComparePatch(ctx context.Context, scope forge.CredentialScope, _ forge.RepoRef, base, head string) (*forge.ComparePatchResult, error) {
 	c, pid, err := f.resolve(ctx, scope)
 	if err != nil {
@@ -733,10 +734,17 @@ func (f *Forge) ComparePatch(ctx context.Context, scope forge.CredentialScope, _
 	res.Files = make([]forge.ComparePatchFile, 0, len(cmp.Diffs))
 	for i := range cmp.Diffs {
 		d := &cmp.Diffs[i]
-		res.Files = append(res.Files, forge.ComparePatchFile{
+		file := forge.ComparePatchFile{
 			Path:   changedPath(d),
 			Status: diffStatus(d),
-		})
+		}
+		// A renamed_file entry's old_path is the rename SOURCE; on every
+		// other entry old_path equals new_path (or is the deletion's only
+		// path) and is not a previous path.
+		if d.RenamedFile {
+			file.PreviousPath = d.OldPath
+		}
+		res.Files = append(res.Files, file)
 		if d.Diff != "" {
 			fmt.Fprintf(&patch, "diff --git a/%s b/%s\n", d.OldPath, d.NewPath)
 			patch.WriteString(d.Diff)
