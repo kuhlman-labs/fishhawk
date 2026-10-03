@@ -16,7 +16,7 @@ description: Deploy (bring up, rebuild, restart, or tear down) the Fishhawk stac
 | Full post-merge walk (pull main, prune branches, reload) | `scripts/dev post-merge [<issue>] --start-deps` |
 | Kubernetes (Docker Desktop) — "deploy to k8s", "helm" | `scripts/dev k8s` |
 | Web UI dev server too | additionally `make dev-frontend` (`:5173`, proxies `/v0` → `:8080`), run in background |
-| Tear down | `scripts/dev down` (process) / `scripts/dev k8s-down` (k8s); `make down` stops containers, keeps volumes |
+| Tear down | Use the `teardown-local` skill (ordered stop of every layer; `make nuke` only on explicit request) |
 
 If the intent is ambiguous between process and k8s, use the process mode (`up`) — it is the daily dev loop. Never run `make nuke` (drops volumes) unless the user explicitly asks to destroy data.
 
