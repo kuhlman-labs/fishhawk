@@ -30,8 +30,10 @@ const (
 // refuseNonHumanServerCheckClear is the human-only clearing guard for a
 // server-synthesized concern (E80.3 / #3760, ADR-084 D5 / rule 5). A concern
 // whose provenance is server_check was raised by a deterministic server check
-// with no model call — the diff secrets check — and the whole point of that
-// check is that no agent can talk its way past it. So when row.IsServerCheck()
+// with no model call — the diff secrets check (E80.3) or the permission-drift
+// check (E80.4 / #3761) — and the whole point of such a check is that no agent
+// can talk its way past it. The refusal message is check-neutral for that
+// reason: it names no single check's remedy. So when row.IsServerCheck()
 // and EITHER the request is delegated (an ADR-040 delegated action, whatever
 // token carried it) OR the subject is an agent identity (isAgentSubject: an
 // operator-agent/ token or a run-bound mcp:run: token), it writes 403
@@ -42,7 +44,8 @@ const (
 // It is provenance-scoped on purpose: a reviewer-raised concern (provenance
 // empty) is untouched, so every existing agent and delegated waive/defer path
 // behaves byte-identically. The clearing path it leaves open is a HUMAN
-// waive (or defer) with a reason, e.g. "known test fixture".
+// waive (or defer) with a reason (e.g. "known test fixture" for a diff
+// secrets hit, "intended permission grant" for a permission-drift widening).
 //
 // Exactly ONE call site per verb — handleWaiveConcern, handleBulkWaiveConcerns
 // (per row, so any server_check row refuses the whole batch) and
@@ -67,8 +70,8 @@ func (s *Server) refuseNonHumanServerCheckClear(w http.ResponseWriter, r *http.R
 	}
 	s.writeError(w, r, http.StatusForbidden, errCodeConcernRequiresHuman,
 		fmt.Sprintf("concern %s was raised by a server check (provenance %s), not a model reviewer; "+
-			"an agent token or a delegated request cannot %s it. A human operator must %s it with a reason "+
-			"(e.g. a known test fixture), or remove the flagged content and rotate any live credential",
+			"an agent token or a delegated request cannot %s it. A human operator must %s it with a reason, "+
+			"or remove the flagged change, and rotate any credential it exposed",
 			row.ID, row.Provenance, action, action),
 		map[string]any{
 			"concern_id":    row.ID.String(),
