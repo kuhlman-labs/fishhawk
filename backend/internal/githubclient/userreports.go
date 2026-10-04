@@ -5,13 +5,16 @@ package githubclient
 // issue comment updated since a bound. Both walk OLDEST-FIRST under a
 // KEYSET bound (see keysetWalk), never newest-first offset pages, so a
 // deletion or transfer between page requests cannot shift an unread item
-// onto an already-read page offset and skip it.
+// onto an already-read page offset and skip it; the one place offset pages
+// remain, an equal-timestamp run, is re-walked until two consecutive passes
+// agree.
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -52,9 +55,12 @@ type ListingMeta struct {
 	// remaining. The returned items are everything read up to that point.
 	Truncated bool
 	// ResumeAt is set only when Truncated: the updated_at of the last node
-	// the walk read. Every node updated STRICTLY before it was returned, so
-	// a later walk passing it as since re-reads the boundary timestamp and
-	// continues without a gap. It is always strictly after the walk's since.
+	// the walk read, or — when the cap stopped the walk inside an
+	// equal-timestamp run it had not yet proven complete — that run's
+	// updated_at, so the cursor never passes an unconfirmed run. Every node
+	// updated STRICTLY before it was returned, so a later walk passing it as
+	// since re-reads the boundary timestamp and continues without a gap. It
+	// is always strictly after the walk's since.
 	ResumeAt time.Time
 }
 
@@ -205,7 +211,7 @@ func (c *Client) ListIssuesUpdatedSince(ctx context.Context, scope forge.Credent
 			if err != nil {
 				return out, err
 			}
-			out.observe(d.updatedAt)
+			out.observe(int64(n.Number), d.updatedAt)
 			if isPullRequestNode(n.PullRequest) {
 				continue
 			}
@@ -248,7 +254,7 @@ func (c *Client) ListIssueCommentsUpdatedSince(ctx context.Context, scope forge.
 			if err != nil {
 				return out, err
 			}
-			out.observe(d.updatedAt)
+			out.observe(n.ID, d.updatedAt)
 			out.kept = append(out.kept, UpdatedIssueComment{
 				ID: n.ID, IssueNumber: lastPathInt(n.IssueURL), Body: n.Body, HTMLURL: n.HTMLURL,
 				AuthorLogin: n.User.Login, AuthorType: n.User.Type,
@@ -293,13 +299,19 @@ func (c *Client) activityPreflight(scope forge.CredentialScope, repo RepoRef, su
 // client's own base, never a forge-supplied Link target — decodes it into
 // nodes, and reports whether Link advertises a rel="next" page and the
 // parsed Date header.
+//
+// since goes on the wire TRUNCATED DOWN to whole seconds in RFC3339, the
+// `YYYY-MM-DDTHH:MM:SSZ` form GitHub documents. Every bound after the first
+// is a GitHub updated_at (already whole seconds); the first scan's bound is
+// a host-clock Now − lookback that can carry a fraction. Truncating down only
+// widens an inclusive bound, so it re-reads and never skips.
 func (c *Client) getActivityPage(ctx context.Context, op string, base activityBase, bound time.Time, page int, installationID int64, nodes any, more *bool, date *time.Time) error {
 	q := url.Values{}
 	for k, v := range base.query {
 		q[k] = v
 	}
 	if !bound.IsZero() {
-		q.Set("since", bound.UTC().Format(time.RFC3339Nano))
+		q.Set("since", bound.UTC().Truncate(time.Second).Format(time.RFC3339))
 	}
 	if page > 1 {
 		q.Set("page", strconv.Itoa(page))
@@ -326,25 +338,33 @@ func (c *Client) getActivityPage(ctx context.Context, op string, base activityBa
 	return nil
 }
 
-// keysetPage is one page as keysetWalk sees it: the items kept, the
-// updated_at range over EVERY node on the page (kept or skipped), whether
-// the forge advertises more, and the page's Date header.
+// keysetPage is one page as keysetWalk sees it: the items kept, the stamp
+// (identity + updated_at) of EVERY node on the page (kept or skipped), their
+// updated_at range, whether the forge advertises more, and the page's Date
+// header.
 type keysetPage[T any] struct {
 	kept     []T
-	n        int
+	stamps   []nodeStamp
 	min, max time.Time
 	more     bool
 	date     time.Time
 }
 
-func (p *keysetPage[T]) observe(updatedAt time.Time) {
-	if p.n == 0 || updatedAt.Before(p.min) {
+// nodeStamp is one listed node's identity at the updated_at it was read at:
+// an issue (or pull request) by number, a comment by id.
+type nodeStamp struct {
+	id int64
+	at int64 // UnixNano
+}
+
+func (p *keysetPage[T]) observe(id int64, updatedAt time.Time) {
+	if len(p.stamps) == 0 || updatedAt.Before(p.min) {
 		p.min = updatedAt
 	}
-	if p.n == 0 || updatedAt.After(p.max) {
+	if len(p.stamps) == 0 || updatedAt.After(p.max) {
 		p.max = updatedAt
 	}
-	p.n++
+	p.stamps = append(p.stamps, nodeStamp{id: id, at: updatedAt.UnixNano()})
 }
 
 // keysetWalk drives the oldest-first keyset walk both listings share.
@@ -357,14 +377,43 @@ func (p *keysetPage[T]) observe(updatedAt time.Time) {
 // (GitHub's since and GitLab's updated_after both return items updated AT
 // the bound), so boundary nodes come back twice: the caller dedupes.
 //
+// AN OFFSET-PAGED PASS IS CONFIRMED BEFORE THE BOUND MOVES PAST IT. Inside a
+// run, removing an already-read node (a deletion, a transfer, or an update
+// that moves it to the tail) between two offset requests shifts every later
+// node one offset left, so the node at the page boundary is never served.
+// A pass — pages 1..k under one bound, ending at the first page that is not
+// one full equal-timestamp page — is therefore re-walked from page 1 until
+// two CONSECUTIVE passes observe the identical stamp set. That is a proof,
+// not a heuristic: the set under a past bound only shrinks, so a survivor
+// the later pass skipped was also skipped by the earlier one, which needs a
+// removal during the earlier pass of a node the later pass still read
+// unchanged — impossible. A one-page pass is a single request and needs no
+// confirmation. (A node updated DURING the walk lands at or after the forge
+// Date the cursor anchor is taken from, so the next scan's overlap re-reads
+// it.)
+//
 // At maxPages with nodes remaining the walk returns what it read with
-// Truncated and ResumeAt = the last page's latest updated_at, unless that
-// is not after since — the whole capped walk sat in one equal-timestamp run
-// at since — which fails closed with ErrEqualTimestampRunExceedsCap.
+// Truncated and ResumeAt = the last page's latest updated_at — or, when the
+// cap lands inside an unconfirmed run, that run's updated_at, so the cursor
+// cannot pass it. When that resume point is not after since — the capped
+// walk never confirmed a run sitting at since — it fails closed with
+// ErrEqualTimestampRunExceedsCap.
 func keysetWalk[T any](since time.Time, maxPages int, fetch func(bound time.Time, page int) (keysetPage[T], error)) ([]T, ListingMeta, error) {
 	var out []T
 	var meta ListingMeta
 	bound, page := since, 1
+	// pass collects the stamps of the current multi-page pass, prev those of
+	// the previous complete pass under the same bound (nil when none), and
+	// runAt the timestamp of the run that put the pass onto offset pages.
+	var pass, prev map[nodeStamp]bool
+	var runAt time.Time
+	truncate := func(resume time.Time, requests int) ([]T, ListingMeta, error) {
+		if !resume.After(since) {
+			return nil, ListingMeta{}, fmt.Errorf("%w: %d pages of nodes all updated at %s", ErrEqualTimestampRunExceedsCap, requests, since.UTC().Format(time.RFC3339Nano))
+		}
+		meta.Truncated, meta.ResumeAt = true, resume
+		return out, meta, nil
+	}
 	for requests := 1; ; requests++ {
 		p, err := fetch(bound, page)
 		if err != nil {
@@ -374,21 +423,43 @@ func keysetWalk[T any](since time.Time, maxPages int, fetch func(bound time.Time
 			meta.Date = p.date
 		}
 		out = append(out, p.kept...)
-		if !p.more || p.n == 0 {
+		inRun := p.more && len(p.stamps) > 0 && p.min.Equal(p.max)
+		if page == 1 {
+			pass = nil
+			if inRun {
+				runAt = p.min
+			}
+		}
+		if inRun || page > 1 {
+			if pass == nil {
+				pass = make(map[nodeStamp]bool, len(p.stamps))
+			}
+			for _, st := range p.stamps {
+				pass[st] = true
+			}
+		}
+		if inRun {
+			if requests >= maxPages {
+				return truncate(runAt, requests)
+			}
+			page++
+			continue
+		}
+		if page > 1 && !maps.Equal(pass, prev) {
+			if requests >= maxPages {
+				return truncate(runAt, requests)
+			}
+			prev, page = pass, 1
+			continue
+		}
+		prev = nil
+		if !p.more || len(p.stamps) == 0 {
 			return out, meta, nil
 		}
 		if requests >= maxPages {
-			if !p.max.After(since) {
-				return nil, ListingMeta{}, fmt.Errorf("%w: %d pages of nodes all updated at %s", ErrEqualTimestampRunExceedsCap, requests, since.UTC().Format(time.RFC3339Nano))
-			}
-			meta.Truncated, meta.ResumeAt = true, p.max
-			return out, meta, nil
+			return truncate(p.max, requests)
 		}
-		if p.min.Equal(p.max) {
-			page++
-		} else {
-			bound, page = p.max, 1
-		}
+		bound, page = p.max, 1
 	}
 }
 

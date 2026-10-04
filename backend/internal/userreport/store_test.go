@@ -367,3 +367,31 @@ func newProbePool(t *testing.T, ctx context.Context, admin *pgxpool.Pool, dbURL 
 	}
 	return probe
 }
+
+// TestStore_NoteFloorRowIsIndependentOfIssuesRow: the note-floor source
+// (SourceIssueNotes) is a valid key with its OWN row through the same
+// monotonic Advance, so holding the floor while the issues cursor advances
+// leaves each row at its own value. Counterfactual: a store refusing the
+// note-floor source (the pre-#3771-fixup closed set) fails the first Advance.
+func TestStore_NoteFloorRowIsIndependentOfIssuesRow(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	s := NewStore(pool)
+	ctx := context.Background()
+	issues := issuesKey("acme/widgets")
+	floor := Key{Repo: "acme/widgets", Source: SourceIssueNotes}
+	if _, _, err := s.Advance(ctx, floor, t1); err != nil {
+		t.Fatalf("Advance(note floor): %v", err)
+	}
+	if _, _, err := s.Advance(ctx, issues, t2); err != nil {
+		t.Fatalf("Advance(issues): %v", err)
+	}
+	if got, moved, err := s.Advance(ctx, floor, t1); err != nil || moved || !got.Equal(t1) {
+		t.Errorf("holding Advance(note floor, t1) = (%v, %v, %v), want (%v, false, nil)", got, moved, err, t1)
+	}
+	if at, _ := rawCursor(t, pool, floor); !at.Equal(t1) {
+		t.Errorf("note floor row = %v, want %v", at, t1)
+	}
+	if at, _ := rawCursor(t, pool, issues); !at.Equal(t2) {
+		t.Errorf("issues row = %v, want %v", at, t2)
+	}
+}

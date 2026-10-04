@@ -500,3 +500,150 @@ func TestGetProjectMemberAccessLevel_MemberNonMemberAndError(t *testing.T) {
 		t.Error("closed server: err = nil, want a transport error")
 	}
 }
+
+// glRunNodes returns 250 issues: #1-#150 share one updated_at (an
+// equal-timestamp run longer than a page), #151-#250 follow one second apart.
+func glRunNodes() ([]glIssueNode, time.Time) {
+	nodes := glIssues(250)
+	run := glBase.Add(time.Hour)
+	for i := range nodes {
+		if i < 150 {
+			nodes[i].updated = run
+		} else {
+			nodes[i].updated = run.Add(time.Duration(i) * time.Second)
+		}
+	}
+	return nodes, run
+}
+
+// TestListIssuesUpdatedAfter_RemovalInsideEqualTimestampRunSkipsNothing pins
+// the run-confirmation pass (#3771 concern 6d59e801): inside a 150-issue run
+// at T, an already-read issue is removed between the run's page 1 and its
+// OFFSET page 2 — deleted, or updated so it moves to the tail — so that pass
+// never serves #101. The walk must re-walk the pass until two consecutive
+// passes agree and return every survivor. Counterfactual: accepting the first
+// offset-paged pass (dropping the maps.Equal check) returns no #101.
+func TestListIssuesUpdatedAfter_RemovalInsideEqualTimestampRunSkipsNothing(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		remove func(f *fakeIssueListing)
+	}{
+		{name: "deletion", remove: func(f *fakeIssueListing) { f.nodes = f.nodes[1:] }},
+		{name: "update moves the issue to the tail", remove: func(f *fakeIssueListing) {
+			f.nodes[0].updated = glBase.Add(48 * time.Hour)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeIssueListing(t)
+			f.nodes, _ = glRunNodes()
+			f.beforeRequest = func(n int) {
+				if n == 2 {
+					tc.remove(f)
+				}
+			}
+			issues, meta, err := f.client().ListIssuesUpdatedAfter(context.Background(), 42, glBase)
+			if err != nil || meta.Truncated {
+				t.Fatalf("got (meta %+v, %v), want an untruncated walk", meta, err)
+			}
+			got := glDistinct(issues)
+			for i := 2; i <= 250; i++ {
+				if got[i] == 0 {
+					t.Errorf("issue #%d skipped after a removal inside the equal-timestamp run", i)
+				}
+			}
+			reqs := f.requests()
+			if len(reqs) < 3 || reqs[2].Get("page") != "" || reqs[2].Get("updated_after") != reqs[0].Get("updated_after") {
+				t.Errorf("third request = %v, want the run re-walked from page 1 under the unchanged bound", reqs[min(2, len(reqs)-1)])
+			}
+		})
+	}
+}
+
+// glMemListing is an in-memory issue listing with GitLab's semantics
+// (inclusive bound, ascending updated_at then iid, offset pages of per, more
+// while issues remain), for driving keysetWalk directly with a small cap.
+type glMemListing struct {
+	nodes  []glIssueNode
+	per    int
+	calls  int
+	before func(n int)
+}
+
+func (m *glMemListing) fetch(bound time.Time, page int) (keysetPage[int], error) {
+	m.calls++
+	if m.before != nil {
+		m.before(m.calls)
+	}
+	var filtered []glIssueNode
+	for _, nd := range m.nodes {
+		if !nd.updated.Before(bound) {
+			filtered = append(filtered, nd)
+		}
+	}
+	sort.SliceStable(filtered, func(i, j int) bool {
+		if !filtered[i].updated.Equal(filtered[j].updated) {
+			return filtered[i].updated.Before(filtered[j].updated)
+		}
+		return filtered[i].iid < filtered[j].iid
+	})
+	var p keysetPage[int]
+	if off := (page - 1) * m.per; off < len(filtered) {
+		end := min(off+m.per, len(filtered))
+		for _, nd := range filtered[off:end] {
+			p.observe(int64(nd.iid), nd.updated)
+			p.kept = append(p.kept, nd.iid)
+		}
+		p.more = end < len(filtered)
+	}
+	return p, nil
+}
+
+// TestKeysetWalk_CapBeforeRunConfirmedHoldsAtRun pins the hold half: when the
+// cap lands before a run's pass is confirmed — in the confirmation check (cap
+// 2) or on the re-walk (cap 3) — the walk truncates with ResumeAt = the RUN's
+// updated_at, never the tail page's later max; a second walk from ResumeAt
+// returns the issue the shifted pass skipped. Counterfactual: truncating at
+// the tail page's max in the confirmation branch reddens the cap-2 row.
+func TestKeysetWalk_CapBeforeRunConfirmedHoldsAtRun(t *testing.T) {
+	for _, maxPages := range []int{2, 3} {
+		t.Run(fmt.Sprintf("cap %d", maxPages), func(t *testing.T) {
+			run := glBase.Add(time.Hour)
+			m := &glMemListing{per: 10}
+			for i := 1; i <= 25; i++ {
+				at := run
+				if i > 15 {
+					at = run.Add(time.Duration(i) * time.Second)
+				}
+				m.nodes = append(m.nodes, glIssueNode{iid: i, updated: at})
+			}
+			m.before = func(n int) {
+				if n == 2 {
+					m.nodes = m.nodes[1:] // delete #1, already read on page 1
+				}
+			}
+			got, meta, err := keysetWalk(glBase, maxPages, m.fetch)
+			if err != nil || !meta.Truncated || !meta.ResumeAt.Equal(run) {
+				t.Fatalf("got (meta %+v, %v), want truncated with ResumeAt held at the run %v", meta, err, run)
+			}
+			// At cap 2 the walk stops in the confirmation check having never
+			// served #11, so only the hold protects it.
+			for _, id := range got {
+				if maxPages == 2 && id == 11 {
+					t.Fatalf("#11 returned by the capped walk; the fixture no longer isolates the hold")
+				}
+			}
+			m.before = nil
+			again, _, err := keysetWalk(meta.ResumeAt, maxListPages, m.fetch)
+			if err != nil {
+				t.Fatalf("second walk: %v", err)
+			}
+			found := false
+			for _, id := range again {
+				found = found || id == 11
+			}
+			if !found {
+				t.Errorf("second walk from ResumeAt %v did not return the shifted issue #11", meta.ResumeAt)
+			}
+		})
+	}
+}

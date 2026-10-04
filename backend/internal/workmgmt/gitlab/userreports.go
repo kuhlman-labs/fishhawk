@@ -4,8 +4,9 @@ package gitlab
 // (E81.1 / #3771) on the GitLab provider. GitLab has no project-wide notes
 // listing, so notes are found through their issue: every issue updated since
 // the cursor is listed (gitlabclient's keyset walk), then its notes are listed
-// and only those updated since the cursor are kept. Every gap this shape
-// leaves is NAMED on the page as a degradation, never silent.
+// and only those updated at or after the NOTE floor (req.NoteSince) are kept.
+// Every gap this shape leaves is NAMED on the page as a degradation, never
+// silent.
 
 import (
 	"context"
@@ -77,8 +78,21 @@ type memberLookup struct {
 //   - Internal: member access level >= Developer (30). Looked up ONCE per
 //     distinct author id per scan; a 404 is a resolved non-member.
 //
-// Confidential issues (and with them their notes) and internal notes are
-// EXCLUDED and counted under confidential_excluded. Every page ALWAYS names
+// NOTE FLOOR. Notes are kept against the effective NoteSince (req.NoteSince;
+// zero or later than Since means Since), never Since. When the issue listing
+// truncates, the cursor advances to its ResumeAt but the issues updated after
+// it were never read, and their notes older than ResumeAt were never
+// reported, so NextNoteCursor HOLDS at the effective NoteSince; the next scan
+// keeps those notes when it reaches the issue. An untruncated scan reported
+// every note at or after NoteSince, so NextNoteCursor catches up to
+// NextCursor.
+//
+// CONFIDENTIALITY is decided over EVERY occurrence before any note is read:
+// an issue identity seen confidential in any occurrence (a keyset re-read
+// after it turned confidential mid-scan included) is excluded wholesale —
+// every earlier public occurrence dropped and NO notes fetched for it. A note
+// seen internal in any of its issue's note listings is excluded by id. Both
+// are counted under confidential_excluded. Every page ALWAYS names
 // reactions_partial, comment_reactions_unavailable, comments_via_issue_activity
 // and bot_detection_heuristic.
 func (p *Provider) ListUserReports(ctx context.Context, req workmgmt.ListUserReportsRequest) (*workmgmt.UserReportPage, error) {
@@ -132,17 +146,34 @@ func (p *Provider) ListUserReports(ctx context.Context, req workmgmt.ListUserRep
 		return a
 	}
 
-	var items []workmgmt.UserReportItem
-	// excluded is keyed by item identity so a boundary re-read of a
-	// confidential issue counts once; notesListedAt skips re-listing the notes
-	// of an issue re-read at the SAME updated_at (a keyset boundary re-read),
-	// while an issue updated mid-scan, re-read at a NEWER updated_at, has its
-	// notes listed again.
-	excluded := map[string]bool{}
-	notesListedAt := map[int]time.Time{}
+	noteSince := req.NoteSince
+	if noteSince.IsZero() || noteSince.After(req.Since) {
+		noteSince = req.Since
+	}
+
+	// Phase 1: the confidential identity set, final before any note read.
+	confidential := map[int]bool{}
 	for _, is := range issues {
 		if is.Confidential {
-			excluded["issue/"+strconv.Itoa(is.IID)] = true
+			confidential[is.IID] = true
+		}
+	}
+
+	// Phase 2: public issues, and the notes of each. notesListedAt skips
+	// re-listing the notes of an issue re-read at the SAME updated_at (a
+	// keyset boundary re-read), while an issue updated mid-scan, re-read at a
+	// NEWER updated_at, has its notes listed again.
+	type noteRead struct {
+		issue            gitlabclient.UpdatedIssue
+		note             gitlabclient.Note
+		created, updated time.Time
+	}
+	var items []workmgmt.UserReportItem
+	var noteReads []noteRead
+	internalNotes := map[int64]bool{}
+	notesListedAt := map[int]time.Time{}
+	for _, is := range issues {
+		if confidential[is.IID] {
 			continue
 		}
 		items = append(items, workmgmt.UserReportItem{
@@ -164,32 +195,44 @@ func (p *Provider) ListUserReports(ctx context.Context, req workmgmt.ListUserRep
 		}
 		for _, n := range notes {
 			if n.Internal {
-				excluded["note/"+strconv.FormatInt(n.ID, 10)] = true
+				internalNotes[n.ID] = true
 				continue
 			}
 			created, updated, err := noteTimes(n)
 			if err != nil {
 				return nil, fmt.Errorf("workmgmt/gitlab: issue #%d: %w", is.IID, err)
 			}
-			if updated.Before(req.Since) {
+			if updated.Before(noteSince) {
 				continue
 			}
-			a := author(n.AuthorID, n.Author)
-			if n.System {
-				a.Bot = true
-			}
-			items = append(items, workmgmt.UserReportItem{
-				Kind: workmgmt.UserReportKindComment, IssueNumber: is.IID, CommentID: n.ID,
-				Body: n.Body, URL: fmt.Sprintf("%s#note_%d", is.WebURL, n.ID),
-				Author:    a,
-				CreatedAt: created, UpdatedAt: updated,
-			})
+			noteReads = append(noteReads, noteRead{issue: is, note: n, created: created, updated: updated})
 		}
+	}
+
+	// Phase 3: notes, once the internal set is final across every listing.
+	for _, r := range noteReads {
+		if internalNotes[r.note.ID] {
+			continue
+		}
+		a := author(r.note.AuthorID, r.note.Author)
+		if r.note.System {
+			a.Bot = true
+		}
+		items = append(items, workmgmt.UserReportItem{
+			Kind: workmgmt.UserReportKindComment, IssueNumber: r.issue.IID, CommentID: r.note.ID,
+			Body: r.note.Body, URL: fmt.Sprintf("%s#note_%d", r.issue.WebURL, r.note.ID),
+			Author: a, System: r.note.System,
+			CreatedAt: r.created, UpdatedAt: r.updated,
+		})
 	}
 	items = workmgmt.DedupeUserReportItems(items)
 
 	next, degs := workmgmt.NextUserReportCursor(req.Since, meta.Date,
 		workmgmt.UserReportListingEnd{Truncated: meta.Truncated, ResumeAt: meta.ResumeAt})
+	nextNote := next
+	if meta.Truncated {
+		nextNote = noteSince
+	}
 	var unresolved, issueItems, noteItems int
 	for _, it := range items {
 		if !it.Author.AssociationResolved {
@@ -208,11 +251,11 @@ func (p *Provider) ListUserReports(ctx context.Context, req workmgmt.ListUserRep
 			Count:  unresolved,
 		})
 	}
-	if len(excluded) > 0 {
+	if excluded := len(confidential) + len(internalNotes); excluded > 0 {
 		degs = append(degs, workmgmt.UserReportDegradation{
 			Code:   workmgmt.UserReportConfidentialExcluded,
 			Detail: "confidential issues (with their notes) and internal notes were excluded from the page; they are not user reports to act on in the open",
-			Count:  len(excluded),
+			Count:  excluded,
 		})
 	}
 	degs = append(degs,
@@ -236,11 +279,12 @@ func (p *Provider) ListUserReports(ctx context.Context, req workmgmt.ListUserRep
 		},
 	)
 	return &workmgmt.UserReportPage{
-		Forge:        workmgmt.UserReportForgeGitLab,
-		Items:        items,
-		Since:        req.Since,
-		NextCursor:   next,
-		Degradations: degs,
+		Forge:          workmgmt.UserReportForgeGitLab,
+		Items:          items,
+		Since:          req.Since,
+		NextCursor:     next,
+		NextNoteCursor: nextNote,
+		Degradations:   degs,
 	}, nil
 }
 

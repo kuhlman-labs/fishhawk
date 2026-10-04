@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/google/uuid"
@@ -97,16 +98,20 @@ type ReportItem struct {
 
 // Report is what one scan hands its Recorder. Since is the bound the listing
 // read from; NextCursor is the bound the cursor advances to once Record
-// succeeds. Items carry the page's order (deduplicated, deterministic).
+// succeeds. NoteSince and NextNoteCursor are the same pair for the note floor
+// (SourceIssueNotes). Items carry the page's order (deduplicated,
+// deterministic).
 type Report struct {
-	AccountID    *uuid.UUID
-	Repo         string
-	Source       Source
-	Forge        string
-	Since        time.Time
-	NextCursor   time.Time
-	Items        []ReportItem
-	Degradations []Degradation
+	AccountID      *uuid.UUID
+	Repo           string
+	Source         Source
+	Forge          string
+	Since          time.Time
+	NextCursor     time.Time
+	NoteSince      time.Time
+	NextNoteCursor time.Time
+	Items          []ReportItem
+	Degradations   []Degradation
 }
 
 // ScanParams configures one Scan.
@@ -115,6 +120,8 @@ type Report struct {
 // Target is what the Reader lists. Captain is optional: nil names
 // captain_unavailable. InitialLookback is a HOST-CLOCK WINDOW bound only (0 =
 // DefaultInitialLookback, negative refused); Now defaults to time.Now.
+// Logger receives the raw captain read error the report's fixed Detail
+// withholds; nil selects slog.Default().
 type ScanParams struct {
 	AccountID       *uuid.UUID
 	Repo            string
@@ -126,6 +133,7 @@ type ScanParams struct {
 	Record          Recorder
 	InitialLookback time.Duration
 	Now             func() time.Time
+	Logger          *slog.Logger
 }
 
 // ScanResult reports a successful scan: the recorded report and the cursor
@@ -147,12 +155,19 @@ func (p ScanParams) validate() error {
 		return fmt.Errorf("%w: a cursor store is required", ErrInvalidParams)
 	case p.InitialLookback < 0:
 		return fmt.Errorf("%w: initial lookback %s is negative (the first since must be earlier than now)", ErrInvalidParams, p.InitialLookback)
+	case p.Source == SourceIssueNotes:
+		return fmt.Errorf("%w: source %q is a note-floor row, not a scannable source", ErrInvalidParams, p.Source)
 	}
 	return p.key().validate()
 }
 
 func (p ScanParams) key() Key {
 	return Key{AccountID: p.AccountID, Repo: p.Repo, Source: p.Source}
+}
+
+// noteKey selects the scan's note-floor row (SourceIssueNotes).
+func (p ScanParams) noteKey() Key {
+	return Key{AccountID: p.AccountID, Repo: p.Repo, Source: SourceIssueNotes}
 }
 
 // Scan reads every issue and comment updated since the stored cursor,
@@ -162,13 +177,19 @@ func (p ScanParams) key() Key {
 //  1. Validate (a nil Record is refused before any read).
 //  2. Read the cursor. With no row, compute Now − InitialLookback ONCE and
 //     persist it via Init, which returns the STORED value; read with that.
-//  3. List through Reader. Any error returns with the cursor untouched.
+//     Read the note floor (SourceIssueNotes); an absent row, or one later
+//     than the cursor, means the cursor.
+//  3. List through Reader with Since and NoteSince. Any error returns with
+//     both rows untouched.
 //  4. Resolve the captain (degrades, never fails).
-//  5. Classify, build the Report, call Record. An error returns with the
-//     cursor untouched, so the next scan passes the identical since.
-//  6. Advance the cursor to the page's NextCursor (monotonic). A failure here
-//     returns ErrCursorNotAdvanced: the report exists and the next scan
-//     re-reads.
+//  5. Classify, build the Report, call Record. An error returns with both
+//     rows untouched, so the next scan passes the identical bounds.
+//  6. Advance the NOTE FLOOR to the page's NextNoteCursor FIRST, then the
+//     cursor to NextCursor (both monotonic). The order matters: a truncated
+//     scan holds the floor below the cursor, and an absent floor row reads as
+//     the cursor, so the floor must be durable before the cursor moves past
+//     it. A failure in either returns ErrCursorNotAdvanced: the report exists
+//     and the next scan re-reads.
 //
 // Each cursor call is its own short transaction; none is held across the
 // listing.
@@ -194,7 +215,14 @@ func Scan(ctx context.Context, p ScanParams) (*ScanResult, error) {
 			return nil, fmt.Errorf("userreport: scan: initialise cursor: %w", err)
 		}
 	}
-	page, err := p.Reader.ListUserReports(ctx, workmgmt.ListUserReportsRequest{Target: p.Target, Since: since})
+	noteSince, noteFound, err := p.Cursors.Get(ctx, p.noteKey())
+	if err != nil {
+		return nil, fmt.Errorf("userreport: scan: read note floor: %w", err)
+	}
+	if !noteFound || noteSince.After(since) {
+		noteSince = since
+	}
+	page, err := p.Reader.ListUserReports(ctx, workmgmt.ListUserReportsRequest{Target: p.Target, Since: since, NoteSince: noteSince})
 	if err != nil {
 		return nil, fmt.Errorf("userreport: scan: list since %s: %w", since.UTC().Format(time.RFC3339Nano), err)
 	}
@@ -202,9 +230,19 @@ func Scan(ctx context.Context, p ScanParams) (*ScanResult, error) {
 		return nil, errors.New("userreport: scan: reader returned a nil page with no error")
 	}
 
+	// A provider that sets no NextNoteCursor HOLDS the floor (re-reads, never
+	// skips); one beyond NextCursor is capped there.
+	nextNote := page.NextNoteCursor
+	if nextNote.IsZero() {
+		nextNote = noteSince
+	}
+	if nextNote.After(page.NextCursor) {
+		nextNote = page.NextCursor
+	}
 	report := Report{
 		AccountID: p.AccountID, Repo: p.Repo, Source: p.Source, Forge: page.Forge,
 		Since: since, NextCursor: page.NextCursor,
+		NoteSince: noteSince, NextNoteCursor: nextNote,
 	}
 	for _, d := range page.Degradations {
 		report.Degradations = append(report.Degradations, Degradation{
@@ -227,6 +265,9 @@ func Scan(ctx context.Context, p ScanParams) (*ScanResult, error) {
 	if err := p.Record.Record(ctx, report); err != nil {
 		return nil, fmt.Errorf("userreport: scan: record report (cursor unmoved, the next scan re-reads): %w", err)
 	}
+	if _, _, err := p.Cursors.Advance(ctx, p.noteKey(), report.NextNoteCursor); err != nil {
+		return nil, fmt.Errorf("%w: note floor: %w", ErrCursorNotAdvanced, err)
+	}
 	committed, advanced, err := p.Cursors.Advance(ctx, key, report.NextCursor)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrCursorNotAdvanced, err)
@@ -245,7 +286,14 @@ func resolveCaptain(ctx context.Context, p ScanParams, forge string) (string, *D
 	}
 	snap, err := p.Captain.Read(ctx, p.AccountID, p.Repo)
 	if err != nil {
-		return unavailable("the captain record could not be read (" + err.Error() + "); the captain arm of the internal rule is off")
+		// The raw error goes to the log, never into the report: a comms
+		// renderer must not surface database error text.
+		logger := p.Logger
+		if logger == nil {
+			logger = slog.Default()
+		}
+		logger.WarnContext(ctx, "userreport: captain read failed; captain arm off", "repo", p.Repo, "error", err)
+		return unavailable("the captain record could not be read; the captain arm of the internal rule is off")
 	}
 	if snap == nil || snap.State.Current == nil {
 		return "", nil // vacant: a normal state

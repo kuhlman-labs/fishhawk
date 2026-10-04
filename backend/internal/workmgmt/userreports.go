@@ -42,9 +42,19 @@ type UserReportReader interface {
 // (repo + credential scope + optional gitlab connection) and the inclusive
 // lower bound. A zero Since lists the repository's whole history; callers
 // (userreport.Scan) always pass a persisted cursor.
+//
+// NoteSince is the inclusive lower bound for comments a provider finds
+// THROUGH their issue (GitLab notes): such a comment is kept when its
+// updated_at is at or after NoteSince, never Since. Zero, or a value after
+// Since, means Since. It exists because an issue-listing truncation advances
+// Since past issues the scan never read, and their earlier notes must still
+// be reported when a later scan reaches them (see UserReportPage.
+// NextNoteCursor). A provider with an independent comment listing (GitHub,
+// whose cursor is already the minimum across both listings) ignores it.
 type ListUserReportsRequest struct {
-	Target Target
-	Since  time.Time
+	Target    Target
+	Since     time.Time
+	NoteSince time.Time
 }
 
 // UserReportKind is the closed set of item kinds a user-report page carries.
@@ -70,6 +80,11 @@ const (
 // for an issue, its state, labels or a note) changes. The counts reflect the
 // item as of the last update a scan observed, never reactions added since —
 // a consumer ranking by reactions must read them as a lower bound.
+//
+// System is true for a forge-generated system note (GitLab's note `system`
+// flag; GitHub has none in these listings). Its body is forge-rendered but
+// embeds actor-controlled text (a title edit quotes the new title), so a
+// classifier must never let a body marker on it earn trusted provenance.
 type UserReportItem struct {
 	Kind        UserReportKind
 	IssueNumber int
@@ -79,6 +94,7 @@ type UserReportItem struct {
 	URL         string
 	Author      ReportAuthor
 	Reactions   ReactionCounts
+	System      bool
 	CreatedAt   time.Time
 	UpdatedAt   time.Time
 }
@@ -128,12 +144,21 @@ type ReactionCounts struct {
 // persist once it has durably recorded the page (see NextUserReportCursor); it
 // never falls below Since. Items are deduplicated and deterministically sorted
 // (DedupeUserReportItems). Degradations names every gap in the page.
+//
+// NextNoteCursor is the NoteSince the caller should persist alongside
+// NextCursor. A provider that finds comments through their issue HOLDS it at
+// the request's effective NoteSince when its issue listing truncated — the
+// unread issues past the resume point may carry notes older than it — and
+// otherwise sets it to NextCursor (an untruncated scan reported every note at
+// or after NoteSince, so the floor catches up). GitHub always sets it to
+// NextCursor. It never exceeds NextCursor.
 type UserReportPage struct {
-	Forge        string
-	Items        []UserReportItem
-	Since        time.Time
-	NextCursor   time.Time
-	Degradations []UserReportDegradation
+	Forge          string
+	Items          []UserReportItem
+	Since          time.Time
+	NextCursor     time.Time
+	NextNoteCursor time.Time
+	Degradations   []UserReportDegradation
 }
 
 // Forge identifiers UserReportPage.Forge carries.
@@ -174,8 +199,10 @@ const (
 	UserReportCursorAnchorUnavailable UserReportDegradationCode = "cursor_anchor_unavailable"
 	// UserReportScanTruncated means a listing hit its page cap with items
 	// remaining. The page holds what was read, and NextCursor stops at the
-	// last fully-read updated_at so the next scan continues from there.
-	// Count is the number of truncated listings.
+	// last fully-read updated_at (or at an equal-timestamp run the walk had
+	// not yet confirmed) so the next scan continues from there; a provider
+	// that finds comments through their issue holds NextNoteCursor. Count is
+	// the number of truncated listings.
 	UserReportScanTruncated UserReportDegradationCode = "scan_truncated"
 	// UserReportConfidentialExcluded means confidential issues and internal notes
 	// were EXCLUDED from the page (GitLab). Count is the excluded item count.
@@ -288,7 +315,7 @@ func NextUserReportCursor(since, forgeDate time.Time, listings ...UserReportList
 	if truncated > 0 {
 		degs = append(degs, UserReportDegradation{
 			Code:   UserReportScanTruncated,
-			Detail: "a listing hit its page cap with items remaining; the page holds what was read and the cursor stops at the last fully-read updated_at so the next scan continues from there",
+			Detail: "a listing hit its page cap with items remaining; the page holds what was read and the cursor stops at the last fully-read updated_at (or an unconfirmed equal-timestamp run) so the next scan continues from there",
 			Count:  truncated,
 		})
 	}

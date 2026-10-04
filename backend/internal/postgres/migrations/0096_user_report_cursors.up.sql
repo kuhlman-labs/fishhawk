@@ -14,7 +14,9 @@
 --     EXCLUDED.cursor_at guard.
 --   * source keys one row per activity source ("issues" today), so a source
 --     that is unreachable never drags another source's cursor past unread
---     items.
+--     items. "issue_notes" is the "issues" source's NOTE FLOOR row, not a
+--     source of its own: the lower bound for GitLab notes, held when an
+--     issue-listing truncation advances "issues" past unread issues.
 --   * Uniqueness is a UNIQUE expression index over COALESCE(account_id, the nil
 --     UUID), the 0089 captain_read_watermarks shape, so an untenanted
 --     repository cannot accumulate duplicate rows.

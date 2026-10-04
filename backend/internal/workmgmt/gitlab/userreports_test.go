@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/gitlabclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/userreport"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 )
 
@@ -40,6 +41,12 @@ type userReportAPI struct {
 	members     map[int64]memberAnswer
 	memberCalls map[int64]int
 	gotAfter    time.Time
+	// listFn, when set, answers the issue listing per bound (a scan
+	// sequence); notesSeq, when set for an iid, answers its n-th notes
+	// listing with notesSeq[iid][n] (a note changing between listings).
+	listFn     func(after time.Time) ([]gitlabclient.UpdatedIssue, gitlabclient.ListingMeta)
+	notesSeq   map[int][][]gitlabclient.Note
+	notesCalls map[int]int
 }
 
 func (a *userReportAPI) ListIssuesUpdatedAfter(_ context.Context, _ int, after time.Time) ([]gitlabclient.UpdatedIssue, gitlabclient.ListingMeta, error) {
@@ -47,12 +54,21 @@ func (a *userReportAPI) ListIssuesUpdatedAfter(_ context.Context, _ int, after t
 	if a.urIssuesErr != nil {
 		return nil, gitlabclient.ListingMeta{}, a.urIssuesErr
 	}
+	if a.listFn != nil {
+		issues, meta := a.listFn(after)
+		return issues, meta, nil
+	}
 	return a.urIssues, a.urMeta, nil
 }
 
 func (a *userReportAPI) ListIssueNotes(_ context.Context, _ int, iid int) ([]gitlabclient.Note, error) {
+	n := a.notesCalls[iid]
+	a.notesCalls[iid]++
 	if err := a.notesErr[iid]; err != nil {
 		return nil, err
+	}
+	if seq, ok := a.notesSeq[iid]; ok {
+		return seq[min(n, len(seq)-1)], nil
 	}
 	return a.notes[iid], nil
 }
@@ -79,6 +95,8 @@ func newGLUserReportAPI() *userReportAPI {
 		notesErr:    map[int]error{},
 		members:     map[int64]memberAnswer{},
 		memberCalls: map[int64]int{},
+		notesSeq:    map[int][][]gitlabclient.Note{},
+		notesCalls:  map[int]int{},
 	}
 }
 
@@ -309,11 +327,11 @@ func TestListUserReports_GitLabSystemNoteAndAccessTokenBotAreBots(t *testing.T) 
 	if is, _ := itemByIssue(page, 1); !is.Author.Bot {
 		t.Errorf("member access-token bot author = %+v, want Bot", is.Author)
 	}
-	if n, _ := itemByComment(page, 201); !n.Author.Bot {
-		t.Errorf("system note author = %+v, want Bot via the system flag", n.Author)
+	if n, _ := itemByComment(page, 201); !n.Author.Bot || !n.System {
+		t.Errorf("system note = %+v, want Bot via the system flag and System carried on the item", n)
 	}
-	if n, _ := itemByComment(page, 202); n.Author.Bot {
-		t.Errorf("ordinary note by the same user = %+v, want not Bot", n.Author)
+	if n, _ := itemByComment(page, 202); n.Author.Bot || n.System {
+		t.Errorf("ordinary note by the same user = %+v, want neither Bot nor System", n)
 	}
 }
 
@@ -460,8 +478,178 @@ func TestListUserReports_GitLabTruncationAdvancesToResumeAt(t *testing.T) {
 	if !page.NextCursor.Equal(resume) {
 		t.Errorf("NextCursor = %v, want ResumeAt %v", page.NextCursor, resume)
 	}
+	if !page.NextNoteCursor.Equal(glSince) {
+		t.Errorf("NextNoteCursor = %v, want the note floor HELD at the pre-truncation %v", page.NextNoteCursor, glSince)
+	}
 	if d, ok := glDegradation(page, workmgmt.UserReportScanTruncated); !ok || d.Count != 1 {
 		t.Errorf("degradations = %+v, want scan_truncated", page.Degradations)
+	}
+	// Untruncated, the floor catches up to the cursor.
+	api.urMeta = gitlabclient.ListingMeta{Date: glDate}
+	if page := mustGLList(t, api); !page.NextNoteCursor.Equal(page.NextCursor) {
+		t.Errorf("untruncated NextNoteCursor = %v, want NextCursor %v", page.NextNoteCursor, page.NextCursor)
+	}
+}
+
+// TestListUserReports_GitLabNotesFilteredByNoteSinceNotSince: a note older
+// than Since but at or after NoteSince is kept; one older than NoteSince is
+// not; a NoteSince later than Since is clamped to Since. Counterfactual:
+// filtering notes by Since drops note 302.
+func TestListUserReports_GitLabNotesFilteredByNoteSinceNotSince(t *testing.T) {
+	api := newGLUserReportAPI()
+	since := glSince.Add(time.Hour)
+	api.urIssues = []gitlabclient.UpdatedIssue{glIssue(1, 10, "alice", since.Add(time.Hour))}
+	api.notes[1] = []gitlabclient.Note{
+		glNote(301, 10, "alice", glSince.Add(-time.Minute)),
+		glNote(302, 10, "alice", glSince.Add(time.Minute)),
+	}
+	list := func(noteSince time.Time) *workmgmt.UserReportPage {
+		t.Helper()
+		page, err := New(api).ListUserReports(context.Background(), workmgmt.ListUserReportsRequest{Target: urTarget(), Since: since, NoteSince: noteSince})
+		if err != nil {
+			t.Fatalf("ListUserReports: %v", err)
+		}
+		return page
+	}
+	page := list(glSince)
+	if _, ok := itemByComment(page, 302); !ok {
+		t.Errorf("note 302 (before Since, after NoteSince) missing")
+	}
+	if _, ok := itemByComment(page, 301); ok {
+		t.Errorf("note 301 (before NoteSince) returned")
+	}
+	if page := list(since.Add(time.Hour)); len(page.Items) != 1 {
+		t.Errorf("NoteSince after Since: items = %+v, want the issue only (clamped to Since)", page.Items)
+	}
+}
+
+// glMemCursors is an in-memory userreport.CursorStore with the Store's
+// semantics (insert-if-absent Init, monotonic Advance).
+type glMemCursors struct{ rows map[userreport.Key]time.Time }
+
+func (m *glMemCursors) Get(_ context.Context, k userreport.Key) (time.Time, bool, error) {
+	at, ok := m.rows[k]
+	return at, ok, nil
+}
+
+func (m *glMemCursors) Init(_ context.Context, k userreport.Key, initial time.Time) (time.Time, error) {
+	if at, ok := m.rows[k]; ok {
+		return at, nil
+	}
+	m.rows[k] = initial
+	return initial, nil
+}
+
+func (m *glMemCursors) Advance(_ context.Context, k userreport.Key, to time.Time) (time.Time, bool, error) {
+	if cur, ok := m.rows[k]; ok && !cur.Before(to) {
+		return cur, false, nil
+	}
+	m.rows[k] = to
+	return to, true, nil
+}
+
+// TestScan_GitLabTruncatedScanThenNextScanReportsEarlierNoteOnUnreadIssue is
+// the provider-plus-Scan control for the note floor (#3771 concerns d7f76737,
+// 3876c2bd). Scan 1's issue listing truncates at ResumeAt R: issue #2 (updated
+// after R) is never read, though it carries note 501 updated at t with
+// Since <= t < R. The issues cursor advances to R; the note floor must stay
+// at the pre-truncation Since. Scan 2 lists #2 and must report note 501.
+// Counterfactual: filtering notes by Since (or advancing the floor with the
+// cursor) drops note 501 from scan 2, and it is never reported.
+func TestScan_GitLabTruncatedScanThenNextScanReportsEarlierNoteOnUnreadIssue(t *testing.T) {
+	resume := glSince.Add(time.Hour)
+	api := newGLUserReportAPI()
+	read := glIssue(1, 10, "alice", resume)
+	unread := glIssue(2, 10, "alice", glSince.Add(3*time.Hour))
+	api.notes[2] = []gitlabclient.Note{glNote(501, 10, "alice", glSince.Add(30*time.Minute))}
+	api.listFn = func(after time.Time) ([]gitlabclient.UpdatedIssue, gitlabclient.ListingMeta) {
+		if after.Equal(glSince) {
+			return []gitlabclient.UpdatedIssue{read}, gitlabclient.ListingMeta{Date: glDate, Truncated: true, ResumeAt: resume}
+		}
+		return []gitlabclient.UpdatedIssue{read, unread}, gitlabclient.ListingMeta{Date: glDate}
+	}
+	cursors := &glMemCursors{rows: map[userreport.Key]time.Time{
+		{Repo: "acme/widgets", Source: userreport.SourceIssues}: glSince,
+	}}
+	var reports []userreport.Report
+	params := userreport.ScanParams{
+		Repo: "acme/widgets", Source: userreport.SourceIssues, Target: urTarget(),
+		Reader: New(api), Cursors: cursors,
+		Record: userreport.RecorderFunc(func(_ context.Context, r userreport.Report) error {
+			reports = append(reports, r)
+			return nil
+		}),
+	}
+	for scan := 1; scan <= 2; scan++ {
+		if _, err := userreport.Scan(context.Background(), params); err != nil {
+			t.Fatalf("scan %d: %v", scan, err)
+		}
+	}
+	noteFloor := userreport.Key{Repo: "acme/widgets", Source: userreport.SourceIssueNotes}
+	if r := reports[0]; !r.NextCursor.Equal(resume) || !r.NextNoteCursor.Equal(glSince) {
+		t.Fatalf("scan 1 cursor %v note floor %v, want the cursor at ResumeAt %v and the floor held at %v", r.NextCursor, r.NextNoteCursor, resume, glSince)
+	}
+	if r := reports[1]; !r.Since.Equal(resume) || !r.NoteSince.Equal(glSince) {
+		t.Errorf("scan 2 read Since %v NoteSince %v, want %v and %v", r.Since, r.NoteSince, resume, glSince)
+	}
+	found := false
+	for _, it := range reports[1].Items {
+		found = found || (it.Kind == workmgmt.UserReportKindComment && it.CommentID == 501)
+	}
+	if !found {
+		t.Errorf("scan 2 items = %+v, want note 501 (older than ResumeAt, on an issue scan 1 never read)", reports[1].Items)
+	}
+	wantNext := glDate.Add(-workmgmt.UserReportCursorOverlap)
+	if got := cursors.rows[noteFloor]; !got.Equal(wantNext) {
+		t.Errorf("note floor after the untruncated scan 2 = %v, want caught up to %v", got, wantNext)
+	}
+}
+
+// TestListUserReports_GitLabConfidentialTransitionsExcludeWholesale (#3771
+// concern 3101fe39): an issue read public and then, re-read after a mid-scan
+// update, CONFIDENTIAL is excluded wholesale — the earlier public occurrence
+// dropped and NO notes listed for it; a note public in one listing and
+// internal in a later one (its issue re-listed after a mid-scan update) is
+// excluded by id. Counterfactuals: deciding confidentiality per occurrence
+// returns issue #1 and lists its notes; deciding internal per listing
+// returns note 602.
+func TestListUserReports_GitLabConfidentialTransitionsExcludeWholesale(t *testing.T) {
+	api := newGLUserReportAPI()
+	public1 := glIssue(1, 10, "alice", glSince.Add(time.Second))
+	secret1 := glIssue(1, 10, "alice", glSince.Add(time.Hour))
+	secret1.Confidential = true
+	api.urIssues = []gitlabclient.UpdatedIssue{
+		public1,
+		glIssue(2, 10, "alice", glSince.Add(2*time.Second)),
+		secret1,
+		glIssue(2, 10, "alice", glSince.Add(2*time.Hour)),
+	}
+	api.notes[1] = []gitlabclient.Note{glNote(601, 10, "alice", glSince.Add(3*time.Second))}
+	turned := glNote(602, 10, "alice", glSince.Add(4*time.Second))
+	turnedInternal := turned
+	turnedInternal.Internal = true
+	api.notesSeq[2] = [][]gitlabclient.Note{{turned}, {turnedInternal}}
+	page := mustGLList(t, api)
+	if _, ok := itemByIssue(page, 1); ok {
+		t.Errorf("issue #1 returned though one occurrence was confidential")
+	}
+	if api.notesCalls[1] != 0 {
+		t.Errorf("notes of issue #1 listed %d times, want 0 (no note read for an excluded identity)", api.notesCalls[1])
+	}
+	if _, ok := itemByComment(page, 601); ok {
+		t.Errorf("note 601 of the confidential issue returned")
+	}
+	if api.notesCalls[2] != 2 {
+		t.Fatalf("notes of issue #2 listed %d times, want 2 (the fixture re-lists after the mid-scan update)", api.notesCalls[2])
+	}
+	if _, ok := itemByComment(page, 602); ok {
+		t.Errorf("note 602 returned though a later listing marked it internal")
+	}
+	if _, ok := itemByIssue(page, 2); !ok {
+		t.Errorf("public issue #2 missing")
+	}
+	if d, ok := glDegradation(page, workmgmt.UserReportConfidentialExcluded); !ok || d.Count != 2 {
+		t.Errorf("degradations = %+v, want confidential_excluded Count 2 (issue #1, note 602)", page.Degradations)
 	}
 }
 

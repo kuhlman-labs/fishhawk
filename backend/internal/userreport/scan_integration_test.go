@@ -60,6 +60,7 @@ type itGitHub struct {
 	nodes     map[string][]itNode
 	sinces    map[string][]string
 	heldConns int
+	date      time.Time // the Date header; zero means itDate
 }
 
 const itPageSize = 2
@@ -107,7 +108,11 @@ func (g *itGitHub) serve(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Link", fmt.Sprintf(`<https://api.github.invalid%s?page=%d>; rel="next"`, r.URL.Path, page+1))
 		}
 	}
-	w.Header().Set("Date", itDate.Format(http.TimeFormat))
+	date := itDate
+	if !g.date.IsZero() {
+		date = g.date
+	}
+	w.Header().Set("Date", date.Format(http.TimeFormat))
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(body)
 }
@@ -218,11 +223,16 @@ func TestScan_GitHubEndToEnd_ClassifiesPaginatesAndHoldsCursorOnFailure(t *testi
 		t.Fatalf("persisted cursor = %v (advanced %v), want the forge Date minus overlap %v", at, res.Advanced, wantCursor)
 	}
 
-	// Scan 2: the recorder fails, so the persisted cursor must not move.
+	// Scan 2: the recorder fails, so the persisted cursor must not move. The
+	// forge clock has advanced an hour, so scan 2 PROPOSES a cursor strictly
+	// later than the stored one: an Advance-before-Record regression would
+	// persist it, and the assertion below would see it.
 	recordErr = errors.New("recorder unavailable")
+	laterDate := itDate.Add(time.Hour)
 	bump := func() {
 		g.mu.Lock()
 		defer g.mu.Unlock()
+		g.date = laterDate
 		g.nodes[issuesPath] = append(g.nodes[issuesPath], itNode{id: 6, updated: itDate, fields: itIssue(6, 0, "rando", "User", "NONE", "new").fields})
 	}
 	bump()
@@ -231,6 +241,9 @@ func TestScan_GitHubEndToEnd_ClassifiesPaginatesAndHoldsCursorOnFailure(t *testi
 		t.Fatal("scan 2 succeeded with a failing recorder")
 	}
 	scan2Since := g.sinces[issuesPath][before]
+	if len(recorded) != 2 || !recorded[1].NextCursor.After(wantCursor) {
+		t.Fatalf("scan 2 proposed cursor = %v, want one later than the stored %v (else the failure leg cannot discriminate)", recorded[len(recorded)-1].NextCursor, wantCursor)
+	}
 	if at, _ := rawCursor(t, pool, key); !at.Equal(wantCursor) {
 		t.Fatalf("persisted cursor after a failed record = %v, want unchanged %v", at, wantCursor)
 	}
@@ -247,6 +260,9 @@ func TestScan_GitHubEndToEnd_ClassifiesPaginatesAndHoldsCursorOnFailure(t *testi
 	}
 	if len(res.Report.Items) != 1 || res.Report.Items[0].IssueNumber != 6 {
 		t.Errorf("scan 3 items = %+v, want issue #6 only", res.Report.Items)
+	}
+	if want := laterDate.Add(-workmgmt.UserReportCursorOverlap); !res.Cursor.Equal(want) || !res.Advanced {
+		t.Errorf("scan 3 cursor = %v (advanced %v), want %v", res.Cursor, res.Advanced, want)
 	}
 	if g.heldConns != 0 || heldAtRecord != 0 {
 		t.Errorf("acquired pool connections during forge I/O = %d, during Record = %d; want 0 (no transaction held across either)", g.heldConns, heldAtRecord)

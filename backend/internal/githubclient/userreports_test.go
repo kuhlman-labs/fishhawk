@@ -572,3 +572,169 @@ func TestLastPathInt(t *testing.T) {
 		}
 	}
 }
+
+// runNodes returns 250 issue nodes: #1-#150 share one updated_at (an
+// equal-timestamp run longer than a page), #151-#250 follow one second apart.
+func runNodes() ([]activityNode, time.Time) {
+	nodes := issueNodes(250)
+	run := activityBaseTime.Add(time.Hour)
+	for i := range nodes {
+		if i < 150 {
+			nodes[i].updated = run
+		} else {
+			nodes[i].updated = run.Add(time.Duration(i) * time.Second)
+		}
+	}
+	return nodes, run
+}
+
+// TestListIssuesUpdatedSince_RemovalInsideEqualTimestampRunSkipsNothing pins
+// the run-confirmation pass (#3771 concern 6d59e801): inside a 150-node run
+// at T, an already-read node is removed between the run's page 1 and its
+// OFFSET page 2 — deleted, or updated so it moves to the tail. Every later
+// node shifts one offset left, so page 2 starts one node late and #101 is
+// never served by that pass. The walk must re-walk the pass until two
+// consecutive passes agree and return every survivor. Counterfactual:
+// accepting the first offset-paged pass (dropping the maps.Equal check)
+// returns no #101.
+func TestListIssuesUpdatedSince_RemovalInsideEqualTimestampRunSkipsNothing(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		remove func(fa *fakeActivity)
+	}{
+		{name: "deletion", remove: func(fa *fakeActivity) { fa.deleteID(1) }},
+		{name: "update moves the node to the tail", remove: func(fa *fakeActivity) {
+			fa.nodes[0].updated = activityBaseTime.Add(48 * time.Hour)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fa, srv := newFakeActivity(t, "/repos/o/r/issues")
+			fa.nodes, _ = runNodes()
+			fa.beforeRequest = func(n int) {
+				if n == 2 {
+					tc.remove(fa)
+				}
+			}
+			issues, meta, err := activityClient(t, srv).ListIssuesUpdatedSince(context.Background(), activityScope(), activityRepo, activityBaseTime)
+			if err != nil || meta.Truncated {
+				t.Fatalf("got (meta %+v, %v), want an untruncated walk", meta, err)
+			}
+			got := distinctNumbers(issues)
+			for i := 2; i <= 250; i++ {
+				if got[i] == 0 {
+					t.Errorf("issue #%d skipped after a removal inside the equal-timestamp run", i)
+				}
+			}
+			reqs := fa.requests()
+			if len(reqs) < 3 || reqs[2].Get("page") != "" || reqs[2].Get("since") != reqs[0].Get("since") {
+				t.Errorf("third request = %v, want the run re-walked from page 1 under the unchanged since", reqs[min(2, len(reqs)-1)])
+			}
+		})
+	}
+}
+
+// memListing is an in-memory activity listing with GitHub's semantics
+// (inclusive bound, ascending updated_at then id, offset pages of per, more
+// while nodes remain), for driving keysetWalk directly with a small page cap.
+type memListing struct {
+	nodes  []activityNode
+	per    int
+	calls  int
+	before func(n int)
+}
+
+func (m *memListing) fetch(bound time.Time, page int) (keysetPage[int], error) {
+	m.calls++
+	if m.before != nil {
+		m.before(m.calls)
+	}
+	var filtered []activityNode
+	for _, nd := range m.nodes {
+		if !nd.updated.Before(bound) {
+			filtered = append(filtered, nd)
+		}
+	}
+	sort.SliceStable(filtered, func(i, j int) bool {
+		if !filtered[i].updated.Equal(filtered[j].updated) {
+			return filtered[i].updated.Before(filtered[j].updated)
+		}
+		return filtered[i].id < filtered[j].id
+	})
+	var p keysetPage[int]
+	if off := (page - 1) * m.per; off < len(filtered) {
+		end := min(off+m.per, len(filtered))
+		for _, nd := range filtered[off:end] {
+			p.observe(int64(nd.id), nd.updated)
+			p.kept = append(p.kept, nd.id)
+		}
+		p.more = end < len(filtered)
+	}
+	return p, nil
+}
+
+// TestKeysetWalk_CapBeforeRunConfirmedHoldsAtRun pins the hold half: when the
+// page cap lands before a run's pass is confirmed — in the confirmation check
+// (cap 2) or on the re-walk (cap 3) — the walk truncates with ResumeAt = the
+// RUN's updated_at, never the tail page's later max, so the cursor cannot pass
+// the node the shifted pass skipped; a second walk from ResumeAt returns it.
+// Counterfactual: truncating at the tail page's max in the confirmation branch
+// reddens the cap-2 row's ResumeAt.
+func TestKeysetWalk_CapBeforeRunConfirmedHoldsAtRun(t *testing.T) {
+	for _, maxPages := range []int{2, 3} {
+		t.Run(fmt.Sprintf("cap %d", maxPages), func(t *testing.T) {
+			run := activityBaseTime.Add(time.Hour)
+			m := &memListing{per: 10}
+			for i := 1; i <= 25; i++ {
+				at := run
+				if i > 15 {
+					at = run.Add(time.Duration(i) * time.Second)
+				}
+				m.nodes = append(m.nodes, activityNode{id: i, updated: at})
+			}
+			m.before = func(n int) {
+				if n == 2 {
+					m.nodes = m.nodes[1:] // delete #1, already read on page 1
+				}
+			}
+			got, meta, err := keysetWalk(activityBaseTime, maxPages, m.fetch)
+			if err != nil || !meta.Truncated || !meta.ResumeAt.Equal(run) {
+				t.Fatalf("got (meta %+v, %v), want truncated with ResumeAt held at the run %v", meta, err, run)
+			}
+			// At cap 2 the walk stops in the confirmation check having never
+			// served #11, so only the hold protects it.
+			for _, id := range got {
+				if maxPages == 2 && id == 11 {
+					t.Fatalf("#11 returned by the capped walk; the fixture no longer isolates the hold")
+				}
+			}
+			m.before = nil
+			again, _, err := keysetWalk(meta.ResumeAt, userReportMaxPages, m.fetch)
+			if err != nil {
+				t.Fatalf("second walk: %v", err)
+			}
+			found := false
+			for _, id := range again {
+				found = found || id == 11
+			}
+			if !found {
+				t.Errorf("second walk from ResumeAt %v did not return the shifted node #11", meta.ResumeAt)
+			}
+		})
+	}
+}
+
+// TestListIssuesUpdatedSince_FractionalSinceSentAsWholeSeconds (#3771 concern
+// 11a9b0c5): a first-scan bound carrying a fraction goes on the wire
+// truncated DOWN to whole seconds in GitHub's documented RFC3339 form.
+// Counterfactual: formatting with RFC3339Nano sends the fraction.
+func TestListIssuesUpdatedSince_FractionalSinceSentAsWholeSeconds(t *testing.T) {
+	fa, srv := newFakeActivity(t, "/repos/o/r/issues")
+	fa.nodes = issueNodes(2)
+	since := activityBaseTime.Add(987654321 * time.Nanosecond)
+	if _, _, err := activityClient(t, srv).ListIssuesUpdatedSince(context.Background(), activityScope(), activityRepo, since); err != nil {
+		t.Fatalf("ListIssuesUpdatedSince: %v", err)
+	}
+	if g := fa.requests()[0].Get("since"); g != "2026-09-01T00:00:00Z" {
+		t.Errorf("since = %q, want the bound truncated down to 2026-09-01T00:00:00Z", g)
+	}
+}

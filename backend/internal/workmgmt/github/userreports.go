@@ -84,6 +84,11 @@ func userReportUnavailable(reason workmgmt.UnavailableReason, detail string, cau
 // association_unresolved / reactions_partial with counts, and anchors
 // NextCursor on the ISSUES listing's first-page Date — the earliest request of
 // the scan — pulled back to any truncated listing's resume point.
+//
+// req.NoteSince is ignored: the comments listing is independent of the issues
+// listing and walks from Since, and NextCursor is already the minimum across
+// both listings, so no comment can sit behind an unread issue.
+// NextNoteCursor is always NextCursor.
 func (p *Provider) ListUserReports(ctx context.Context, req workmgmt.ListUserReportsRequest) (*workmgmt.UserReportPage, error) {
 	repo, err := p.preflight(req.Target)
 	if err != nil {
@@ -159,11 +164,12 @@ func (p *Provider) ListUserReports(ctx context.Context, req workmgmt.ListUserRep
 		})
 	}
 	return &workmgmt.UserReportPage{
-		Forge:        workmgmt.UserReportForgeGitHub,
-		Items:        items,
-		Since:        req.Since,
-		NextCursor:   next,
-		Degradations: degs,
+		Forge:          workmgmt.UserReportForgeGitHub,
+		Items:          items,
+		Since:          req.Since,
+		NextCursor:     next,
+		NextNoteCursor: next,
+		Degradations:   degs,
 	}, nil
 }
 

@@ -91,6 +91,31 @@ func TestClassify_FishhawkFiledTakesPrecedenceOverBotAndInternal(t *testing.T) {
 	}
 }
 
+// TestClassify_SystemNoteNeverFishhawkFiled (#3771 concern 13c665e0): a
+// system note is forge-rendered around actor-controlled text, so a marker in
+// it never earns fishhawk_filed — it stays bot, with MarkerFromExternal set —
+// even when its author is a bot or internal. Without a marker it is plain
+// bot. Counterfactual: dropping the System arm classifies the marker-bearing
+// rows fishhawk_filed.
+func TestClassify_SystemNoteNeverFishhawkFiled(t *testing.T) {
+	marker := "changed title from **x** to **" + intakegroom.MarkerPrefix + "{} -->**"
+	for name, a := range map[string]workmgmt.ReportAuthor{
+		"bot author":      author("alice", "access_level:30", true, true),
+		"internal author": author("maint", "access_level:40", true, false),
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := Classify(workmgmt.UserReportItem{Kind: workmgmt.UserReportKindComment, System: true, Author: a, Body: marker}, ClassifyContext{})
+			if got != (Result{Class: ClassBot, Basis: BasisSystemNote, MarkerFromExternal: true}) {
+				t.Errorf("Classify = %+v, want bot via system_note with MarkerFromExternal", got)
+			}
+		})
+	}
+	plain := Classify(workmgmt.UserReportItem{System: true, Author: author("maint", "access_level:40", true, false), Body: "closed"}, ClassifyContext{})
+	if plain != (Result{Class: ClassBot, Basis: BasisSystemNote}) {
+		t.Errorf("markerless system note = %+v, want bot via system_note", plain)
+	}
+}
+
 // TestClassify_CaptainLoginIsInternal: an association-NONE author whose login
 // equals the captain's (case-insensitively) is internal. Deleting the captain
 // arm leaves it external.

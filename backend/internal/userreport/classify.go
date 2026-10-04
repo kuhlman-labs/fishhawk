@@ -37,6 +37,7 @@ const (
 // "association:<forge association>"; a marker basis is "marker:<marker name>".
 const (
 	BasisBot                   = "bot"
+	BasisSystemNote            = "system_note"
 	BasisCaptain               = "captain"
 	BasisAssociationUnresolved = "association_unresolved"
 	BasisDefault               = "default"
@@ -107,9 +108,17 @@ type Result struct {
 // Bot flag. internal is the provider's Internal flag (never set for an
 // unresolved association) or a login equal, case-insensitively, to the
 // captain's login on the same forge. Everything else is external.
+//
+// A SYSTEM note (item.System) is always bot and NEVER fishhawk_filed: its
+// body is forge-rendered around actor-controlled text (a title edit quotes
+// the new title), so a marker in it proves nothing about who wrote it. A
+// marker on a system note sets MarkerFromExternal so a consumer can flag it.
 func Classify(it workmgmt.UserReportItem, cc ClassifyContext) Result {
-	base := authorClass(it.Author, cc)
 	name := markerIn(it.Body)
+	if it.System {
+		return Result{Class: ClassBot, Basis: BasisSystemNote, MarkerFromExternal: name != ""}
+	}
+	base := authorClass(it.Author, cc)
 	if name == "" {
 		return base
 	}

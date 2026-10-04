@@ -52,7 +52,7 @@ A second optional read capability, resolved through `workmgmt.UserReportReaderFo
 | Case | `UserReportReader` | Hard failures (nil page) | Named page gaps |
 |---|---|---|---|
 | **GitHub** | Implemented. Uses the repo-wide issues listing (pull requests skipped) and the repo-wide issue-comments listing (PR-conversation comments dropped), both walked oldest-first under a keyset bound. | `no_installation`, `forbidden`, `not_implemented` (an API client without the listings), and `workmgmt.ErrUserReportUnresumable` (the page cap was exhausted inside one equal-timestamp run at the cursor). | `association_unresolved` / `reactions_partial` only when GitHub omitted the field. `scan_truncated` / `cursor_anchor_unavailable` when they occur. |
-| **GitLab** | Implemented. GitLab has no project-wide notes listing, so notes are listed per updated issue and filtered by `updated_at`. Membership comes from `GET /projects/:id/members/all/:user_id`, read once per author. | `forbidden` (401/403 on the project, issues or notes read), `not_implemented`, `workmgmt.ErrUserReportUnresumable`. A missing `gitlab` connection or project path is a plain error. | **Always** `reactions_partial`, `comment_reactions_unavailable`, `comments_via_issue_activity`, `bot_detection_heuristic`. Also `association_unresolved` (a failed member lookup), `confidential_excluded`, `scan_truncated` and `cursor_anchor_unavailable` when they occur. |
+| **GitLab** | Implemented. GitLab has no project-wide notes listing, so notes are listed per updated issue and filtered by `updated_at` against a separate note floor (`NoteSince`) that an issue-listing truncation does not advance. Membership comes from `GET /projects/:id/members/all/:user_id`, read once per author. | `forbidden` (401/403 on the project, issues or notes read), `not_implemented`, `workmgmt.ErrUserReportUnresumable`. A missing `gitlab` connection or project path is a plain error. | **Always** `reactions_partial`, `comment_reactions_unavailable`, `comments_via_issue_activity`, `bot_detection_heuristic`. Also `association_unresolved` (a failed member lookup), `confidential_excluded`, `scan_truncated` and `cursor_anchor_unavailable` when they occur. |
 | **Jira** | Not implemented. | `not_implemented` from the chokepoint. | — |
 
 ### User-report degradation vocabulary
@@ -69,14 +69,14 @@ There are two closed sets. They never share a value.
 | `bot_detection_heuristic` | Bots are detected from system notes and from access-token-bot usernames that a project-member lookup **corroborates**. Other service accounts are classified by membership (GitLab). |
 | `association_unresolved` | The forge did not say how some authors relate to the repo: GitHub omitted `author_association`, or a GitLab member lookup failed. An unresolved author is **never** internal or bot. |
 | `cursor_anchor_unavailable` | No parseable `Date` header came back on the scan's first response, so `NextCursor` holds at `Since`. |
-| `scan_truncated` | A listing hit its page cap with items remaining. `NextCursor` stops at the last fully-read `updated_at` so the next scan continues from there. |
-| `confidential_excluded` | Confidential issues (with their notes) and internal notes were **excluded** from the page (GitLab). |
+| `scan_truncated` | A listing hit its page cap with items remaining. `NextCursor` stops at the last fully-read `updated_at` — or at an equal-timestamp run the walk had not yet confirmed — so the next scan continues from there. On GitLab the note floor (`NextNoteCursor`) holds. |
+| `confidential_excluded` | Confidential issues (with their notes) and internal notes were **excluded** from the page (GitLab). An issue seen confidential in ANY occurrence during the listing is excluded wholesale, with no notes read for it; a note seen internal in any listing is excluded by id. |
 
 **Report-level code** is owned by `backend/internal/userreport` and set by `Scan`, not by a provider:
 
 | Code | Meaning |
 |---|---|
-| `captain_unavailable` | The current captain could not be used as an internal-author signal. The cause is a captain read error, a subject that is not identity-verified, or a subject qualified for a different forge. A **vacant** captain is a normal state: no code and no captain arm. |
+| `captain_unavailable` | The current captain could not be used as an internal-author signal. The cause is no captain reader configured for the scan, a captain read error (fixed `Detail`; the raw error is logged), a subject that is not identity-verified, or a subject qualified for a different forge. A **vacant** captain is a normal state: no code and no captain arm. |
 
 `TestBoardCapabilityMatrixDocumentsEveryUserReportDegradationCode` (`backend/internal/workmgmt/userreports_test.go`) fails when a page-level code is missing from this table.
 

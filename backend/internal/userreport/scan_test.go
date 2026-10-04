@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"testing"
@@ -29,6 +30,8 @@ type memCursors struct {
 	getErr, initErr, advanceErr error
 	gets, inits, advances       int
 	initArgs                    []time.Time
+	// advanceErrFor fails Advance for one Source only.
+	advanceErrFor map[Source]error
 }
 
 func newMemCursors() *memCursors { return &memCursors{rows: map[Key]time.Time{}} }
@@ -62,6 +65,9 @@ func (m *memCursors) Advance(_ context.Context, key Key, to time.Time) (time.Tim
 	if m.advanceErr != nil {
 		return time.Time{}, false, m.advanceErr
 	}
+	if err := m.advanceErrFor[key.Source]; err != nil {
+		return time.Time{}, false, err
+	}
 	cur, ok := m.rows[m.k(key)]
 	if ok && !cur.Before(to) {
 		return cur, false, nil
@@ -73,14 +79,16 @@ func (m *memCursors) Advance(_ context.Context, key Key, to time.Time) (time.Tim
 // fakeReader returns a canned page (NextCursor fixed unless pageFn is set)
 // and records every since it is asked for.
 type fakeReader struct {
-	page   *workmgmt.UserReportPage
-	pageFn func(since time.Time) *workmgmt.UserReportPage
-	err    error
-	sinces []time.Time
+	page       *workmgmt.UserReportPage
+	pageFn     func(since time.Time) *workmgmt.UserReportPage
+	err        error
+	sinces     []time.Time
+	noteSinces []time.Time
 }
 
 func (r *fakeReader) ListUserReports(_ context.Context, req workmgmt.ListUserReportsRequest) (*workmgmt.UserReportPage, error) {
 	r.sinces = append(r.sinces, req.Since)
+	r.noteSinces = append(r.noteSinces, req.NoteSince)
 	if r.err != nil {
 		return nil, r.err
 	}
@@ -330,6 +338,7 @@ func TestScan_InvalidParamsRefusedBeforeAnyIO(t *testing.T) {
 		"negative lookback": func(p *ScanParams) { p.InitialLookback = -time.Hour },
 		"empty repo":        func(p *ScanParams) { p.Repo = "" },
 		"unknown source":    func(p *ScanParams) { p.Source = "discussions" },
+		"note-floor source": func(p *ScanParams) { p.Source = SourceIssueNotes },
 	}
 	for name, mutate := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -469,5 +478,121 @@ func TestReportDegradationCodesDisjointFromPageCodes(t *testing.T) {
 		if page[string(c)] {
 			t.Errorf("report code %q is also a page code", c)
 		}
+	}
+}
+
+// TestScan_NoteFloorHeldOnTruncationAndPassedOnNextScan (#3771 concerns
+// d7f76737, 3876c2bd): with no note-floor row the first scan passes NoteSince
+// = since; a page that HOLDS NextNoteCursor (a truncated GitLab listing)
+// persists the floor at since while the cursor advances, and the next scan
+// passes the advanced Since with the held NoteSince. Counterfactual: passing
+// Since as NoteSince, or persisting the floor at NextCursor, reddens the
+// second scan's NoteSince.
+func TestScan_NoteFloorHeldOnTruncationAndPassedOnNextScan(t *testing.T) {
+	issues := Key{Repo: "acme/widgets", Source: SourceIssues}
+	floor := Key{Repo: "acme/widgets", Source: SourceIssueNotes}
+	cur := newMemCursors()
+	cur.rows[issues] = scanSince
+	rd := &fakeReader{pageFn: func(since time.Time) *workmgmt.UserReportPage {
+		return &workmgmt.UserReportPage{Forge: workmgmt.UserReportForgeGitLab, Since: since, NextCursor: since.Add(time.Hour), NextNoteCursor: scanSince}
+	}}
+	rec := &recorder{}
+	for scan := 1; scan <= 2; scan++ {
+		if _, err := Scan(context.Background(), baseParams(rd, cur, rec)); err != nil {
+			t.Fatalf("scan %d: %v", scan, err)
+		}
+	}
+	if !rd.noteSinces[0].Equal(scanSince) || !rd.sinces[1].Equal(scanSince.Add(time.Hour)) || !rd.noteSinces[1].Equal(scanSince) {
+		t.Errorf("sinces %v noteSinces %v, want scan 1 (%v, %v) and scan 2 (%v, held %v)", rd.sinces, rd.noteSinces, scanSince, scanSince, scanSince.Add(time.Hour), scanSince)
+	}
+	if got := cur.rows[floor]; !got.Equal(scanSince) {
+		t.Errorf("persisted note floor = %v, want held at %v", got, scanSince)
+	}
+	if r := rec.reports[1]; !r.NoteSince.Equal(scanSince) || !r.NextNoteCursor.Equal(scanSince) {
+		t.Errorf("report 2 note pair = (%v, %v), want both %v", r.NoteSince, r.NextNoteCursor, scanSince)
+	}
+}
+
+// TestScan_NoteFloorAdvancesBeforeCursor: the floor is durable before the
+// cursor moves past it — an absent floor row reads as the cursor, so a failed
+// floor write must leave the cursor unmoved. Counterfactual: advancing the
+// cursor first moves it on this failure.
+func TestScan_NoteFloorAdvancesBeforeCursor(t *testing.T) {
+	issues := Key{Repo: "acme/widgets", Source: SourceIssues}
+	cur := newMemCursors()
+	cur.rows[issues] = scanSince
+	floorErr := errors.New("floor write failed")
+	cur.advanceErrFor = map[Source]error{SourceIssueNotes: floorErr}
+	res, err := Scan(context.Background(), baseParams(&fakeReader{page: githubPage()}, cur, &recorder{}))
+	if !errors.Is(err, ErrCursorNotAdvanced) || !errors.Is(err, floorErr) || res != nil {
+		t.Fatalf("= (%+v, %v), want ErrCursorNotAdvanced wrapping the floor error", res, err)
+	}
+	if got := cur.rows[issues]; !got.Equal(scanSince) {
+		t.Errorf("cursor = %v after a failed floor write, want unmoved %v", got, scanSince)
+	}
+}
+
+// TestScan_NoteFloorClampedAndDefaulted: a stored floor LATER than the cursor
+// (a floor written before a failed cursor advance) is clamped to the cursor;
+// a page with no NextNoteCursor holds the floor; one beyond NextCursor is
+// capped at NextCursor.
+func TestScan_NoteFloorClampedAndDefaulted(t *testing.T) {
+	issues := Key{Repo: "acme/widgets", Source: SourceIssues}
+	floor := Key{Repo: "acme/widgets", Source: SourceIssueNotes}
+	t.Run("stored floor later than the cursor reads as the cursor", func(t *testing.T) {
+		cur := newMemCursors()
+		cur.rows[issues], cur.rows[floor] = scanSince, scanNext
+		rd := &fakeReader{page: githubPage()}
+		if _, err := Scan(context.Background(), baseParams(rd, cur, &recorder{})); err != nil {
+			t.Fatal(err)
+		}
+		if !rd.noteSinces[0].Equal(scanSince) {
+			t.Errorf("NoteSince = %v, want clamped to the cursor %v", rd.noteSinces[0], scanSince)
+		}
+	})
+	t.Run("zero NextNoteCursor holds", func(t *testing.T) {
+		cur := newMemCursors()
+		cur.rows[issues] = scanSince
+		rec := &recorder{}
+		if _, err := Scan(context.Background(), baseParams(&fakeReader{page: githubPage()}, cur, rec)); err != nil {
+			t.Fatal(err)
+		}
+		if got := cur.rows[floor]; !got.Equal(scanSince) || !rec.reports[0].NextNoteCursor.Equal(scanSince) {
+			t.Errorf("floor %v report %v, want held at %v", got, rec.reports[0].NextNoteCursor, scanSince)
+		}
+	})
+	t.Run("NextNoteCursor beyond NextCursor is capped", func(t *testing.T) {
+		cur := newMemCursors()
+		cur.rows[issues] = scanSince
+		page := githubPage()
+		page.NextNoteCursor = scanNow
+		if _, err := Scan(context.Background(), baseParams(&fakeReader{page: page}, cur, &recorder{})); err != nil {
+			t.Fatal(err)
+		}
+		if got := cur.rows[floor]; !got.Equal(scanNext) {
+			t.Errorf("floor = %v, want capped at NextCursor %v", got, scanNext)
+		}
+	})
+}
+
+// TestScan_CaptainReadErrorDetailIsFixed (#3771 concern 40f9240d): the raw
+// captain read error goes to the logger, never into the report's Detail a
+// comms renderer may surface. Counterfactual: embedding err.Error() in the
+// Detail reddens the first assertion.
+func TestScan_CaptainReadErrorDetailIsFixed(t *testing.T) {
+	var logs strings.Builder
+	rec := &recorder{}
+	p := baseParams(&fakeReader{page: githubPage()}, newMemCursors(), rec)
+	p.Captain = fakeCaptain{err: errors.New("pq: password authentication failed for user secret_db_user")}
+	p.Logger = slog.New(slog.NewTextHandler(&logs, nil))
+	if _, err := Scan(context.Background(), p); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	d := rec.reports[0].Degradations
+	if len(d) != 1 || d[0].Code != string(CaptainUnavailable) || strings.Contains(d[0].Detail, "secret_db_user") {
+		t.Errorf("degradations = %+v, want one captain_unavailable whose Detail omits the raw error", d)
+	}
+	if !strings.Contains(logs.String(), "secret_db_user") {
+		t.Errorf("log = %q, want the raw captain error logged", logs.String())
 	}
 }

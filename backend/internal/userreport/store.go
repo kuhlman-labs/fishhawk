@@ -21,7 +21,16 @@ type Source string
 // SourceIssues is the issues-and-issue-comments source (#3771).
 const SourceIssues Source = "issues"
 
-func (s Source) valid() bool { return s == SourceIssues }
+// SourceIssueNotes is NOT a scannable source: it is SourceIssues' NOTE FLOOR
+// row, the workmgmt NoteSince a scan of SourceIssues passes and advances
+// through the same monotonic Advance. It exists because an issue-listing
+// truncation advances the issues cursor past issues the scan never read
+// (GitLab finds notes only through their issue), so their earlier notes need
+// a bound that truncation does not move. An absent row means "the issues
+// cursor".
+const SourceIssueNotes Source = "issue_notes"
+
+func (s Source) valid() bool { return s == SourceIssues || s == SourceIssueNotes }
 
 // ErrInvalidKey reports a cursor key or value the store refuses before any
 // database call: an empty repo, a source outside the closed set, or a zero
@@ -41,7 +50,7 @@ func (k Key) validate() error {
 		return fmt.Errorf("%w: repo is required", ErrInvalidKey)
 	}
 	if !k.Source.valid() {
-		return fmt.Errorf("%w: source %q is not one of the closed set (%q)", ErrInvalidKey, k.Source, SourceIssues)
+		return fmt.Errorf("%w: source %q is not one of the closed set (%q, %q)", ErrInvalidKey, k.Source, SourceIssues, SourceIssueNotes)
 	}
 	return nil
 }
