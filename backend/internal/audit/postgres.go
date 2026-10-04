@@ -673,6 +673,47 @@ func (r *postgresRepo) AppendChainedGroomingWindowClose(ctx context.Context, p C
 	return watermark, consumed, nil
 }
 
+// AppendChainedUpkeepDispositionBatch implements UpkeepWindowAppender: the
+// one-transaction upkeep capture (#3923). Thin pgx.BeginFunc wrapper delegating
+// to AppendChainedUpkeepDispositionBatchTx; TxOptions deliberately NOT set. A
+// *UpkeepReportSupersededError or *UpkeepWindowClosedError from the core rolls
+// the tx back (nothing was written) and surfaces to the handler's 409 branch.
+func (r *postgresRepo) AppendChainedUpkeepDispositionBatch(ctx context.Context, artifactID string, ps []ChainAppendParams) ([]*Entry, error) {
+	var out []*Entry
+	err := pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
+		entries, aerr := AppendChainedUpkeepDispositionBatchTx(ctx, tx, artifactID, ps)
+		if aerr != nil {
+			return aerr
+		}
+		out = entries
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// AppendChainedUpkeepWindowClose implements UpkeepWindowAppender: the
+// one-transaction upkeep settlement (#3923; caller: the #3924 apply). Thin
+// pgx.BeginFunc wrapper delegating to AppendChainedUpkeepWindowCloseTx.
+func (r *postgresRepo) AppendChainedUpkeepWindowClose(ctx context.Context, p ChainAppendParams, artifactID string) (*Entry, []*Entry, error) {
+	var watermark *Entry
+	var consumed []*Entry
+	err := pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
+		w, c, cerr := AppendChainedUpkeepWindowCloseTx(ctx, tx, p, artifactID)
+		if cerr != nil {
+			return cerr
+		}
+		watermark, consumed = w, c
+		return nil
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return watermark, consumed, nil
+}
+
 func (r *postgresRepo) Get(ctx context.Context, id uuid.UUID) (*Entry, error) {
 	q := auditdb.New(r.pool)
 	row, err := q.GetAuditEntry(ctx, id)
@@ -853,3 +894,9 @@ var _ DedupedChainAppender = (*postgresRepo)(nil)
 // non-atomic legs, reopening the capture/apply TOCTOU; this turns that
 // regression into a build failure rather than a runtime degrade.
 var _ GroomingWindowAppender = (*postgresRepo)(nil)
+
+// Compile-time check that the production repo carries the upkeep capture/apply
+// window capability (#3923). Losing it would make the upkeep capture handler
+// fall back to its non-atomic leg (no binding re-check, no in-tx watermark
+// scan); this turns that regression into a build failure.
+var _ UpkeepWindowAppender = (*postgresRepo)(nil)

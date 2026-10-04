@@ -3387,7 +3387,16 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	// (current window, next due time, last outcome). ELIGIBILITY: an
 	// authenticated read with no scope; the backend's point-read
 	// repo-visibility DENY is the only narrowing. It writes nothing. 69 -> 70.
-	const wantToolCount = 70
+	//
+	// #3923 adds exactly ONE tool — fishhawk_record_upkeep_dispositions, the
+	// thin wrapper over POST /v0/runs/{run_id}/upkeep-dispositions. WHEN: the
+	// captain has read an upkeep_scan run's upkeep_report and decides, per
+	// finding, approved or rejected (optionally authorizing the finding's own
+	// proposed tier label, or overriding its parent epic). ELIGIBILITY:
+	// write:approvals; the backend refuses a run-bound token and a delegated
+	// operator-agent token (self-approval). Its own tool, not a grooming
+	// mode: a different report, verdict set and window family. 70 -> 71.
+	const wantToolCount = 71
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",
@@ -3652,6 +3661,21 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	}
 	if !sawGroomingDispositions {
 		t.Error("fishhawk_record_grooming_dispositions is not registered/visible over ListTools")
+	}
+
+	// fishhawk_record_upkeep_dispositions (#3923) must be wire-visible for the
+	// same reason: a registration regression would drop the captain-only
+	// upkeep capture verb without tripping the count if another tool were
+	// added in the same change.
+	var sawUpkeepDispositions bool
+	for _, tool := range res.Tools {
+		if tool.Name == "fishhawk_record_upkeep_dispositions" {
+			sawUpkeepDispositions = true
+			break
+		}
+	}
+	if !sawUpkeepDispositions {
+		t.Error("fishhawk_record_upkeep_dispositions is not registered/visible over ListTools")
 	}
 
 	// fishhawk_reconcile_reviews (#2712) must be wire-visible: it is the only

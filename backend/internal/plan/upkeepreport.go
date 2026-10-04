@@ -283,7 +283,7 @@ func checkUpkeepProposedIssue(i int, pi *UpkeepProposedIssue) error {
 				i, k, l, upkeepMaxLabelLen)}
 		}
 	}
-	if pi.ParentEpic != nil && !upkeepValidEpicRef(*pi.ParentEpic) {
+	if pi.ParentEpic != nil && !UpkeepValidEpicRef(*pi.ParentEpic) {
 		return &SemanticError{Message: fmt.Sprintf(
 			"/findings/%d/proposed_issue/parent_epic: %q is not a positive issue number (bare like 389 or #-prefixed like #389)",
 			i, *pi.ParentEpic)}
@@ -315,10 +315,12 @@ func upkeepValidLabel(name string) bool {
 	return true
 }
 
-// upkeepValidEpicRef reports whether s is a positive issue number, bare or
+// UpkeepValidEpicRef reports whether s is a positive issue number, bare or
 // with ONE leading `#`. Stricter than workmgmt.groomingEpicRef (no whitespace
 // trim): the report is machine-written, so a padded value is a defect.
-func upkeepValidEpicRef(s string) bool {
+// Exported (#3923) so the upkeep-dispositions capture validates a captain's
+// parent_epic override with the report's own rule (j) instead of a copy.
+func UpkeepValidEpicRef(s string) bool {
 	digits := strings.TrimPrefix(s, "#")
 	// The digit walk is what rejects a sign ("+12"), which strconv.Atoi
 	// would accept; Atoi then bounds the value and rejects "" and overflow.

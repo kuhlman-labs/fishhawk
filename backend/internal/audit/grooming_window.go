@@ -34,6 +34,31 @@ package audit
 // the whole protocol exists to prevent. Both the first-settlement and the
 // permanence paths apply the artifact + below-watermark filter.
 //
+// THE PROTOCOL IS FAMILY-PARAMETERIZED (#3923). The two Tx cores and the scan
+// helpers take a windowFamily — {disposition category, watermark category,
+// closed-error constructor, optional binding re-check} — so a second
+// disposition family reuses the SAME locking and permanence code instead of a
+// copy. Two families exist:
+//
+//   - grooming (#2991): grooming_disposition_recorded under the
+//     grooming_apply_window_closed watermark. Its exported entry points and
+//     GroomingWindowClosedError are thin wrappers, byte-identical in behavior
+//     and error text to the pre-generalization code.
+//   - upkeep (#3923): upkeep_disposition_recorded under the
+//     upkeep_apply_window_closed watermark (writer: the #3924 apply). The
+//     upkeep batch carries ONE extra in-transaction check the grooming batch
+//     does not: the BINDING RE-CHECK. Dispositions bind to the artifact named
+//     by the HIGHEST-sequence upkeep_report_recorded row; the server resolves
+//     that row before the append, so a report recorded between resolution and
+//     append would otherwise land the capture against a superseded report.
+//     Under the run-row lock the batch re-reads the newest recorded row and
+//     refuses with *UpkeepReportSupersededError (writing NOTHING) when it no
+//     longer names the capture's artifact.
+//
+// Family isolation: every scan filters by the family's OWN categories, so a
+// grooming watermark never closes an upkeep window (or vice versa) even when
+// the two carry the same artifact_id string.
+//
 // The capability is kept OFF the Repository interface (the anchored.go /
 // RetryBudgetAppender precedent): adding a Repository method would break the ~20
 // manually-written full-interface fakes. The server type-asserts it and drives
@@ -73,6 +98,26 @@ const GroomingApplyWindowClosedCategory = "grooming_apply_window_closed"
 // in KnownCategories.
 const GroomingDispositionRecordedCategory = "grooming_disposition_recorded"
 
+// UpkeepApplyWindowClosedCategory is the upkeep family's WATERMARK (#3923): the
+// #3924 apply appends one per upkeep-report artifact it settles — on approve
+// AND reject — through AppendChainedUpkeepWindowClose. After it lands a capture
+// for that artifact is refused, and the apply consumes exactly the
+// dispositions recorded below it against that artifact. Registered in
+// KnownCategories.
+const UpkeepApplyWindowClosedCategory = "upkeep_apply_window_closed"
+
+// UpkeepDispositionRecordedCategory is the audit category one captain
+// disposition against an upkeep-report finding lands under (#3923; registered
+// by #3921). Defined beside the protocol that consumes it, as
+// GroomingDispositionRecordedCategory is.
+const UpkeepDispositionRecordedCategory = "upkeep_disposition_recorded"
+
+// UpkeepReportRecordedCategory is the row the server appends once per ingested
+// upkeep_report artifact (#3921; server.CategoryUpkeepReportRecorded carries the
+// same value). The upkeep batch's binding re-check reads it: the
+// HIGHEST-sequence row names the report a capture must still be bound to.
+const UpkeepReportRecordedCategory = "upkeep_report_recorded"
+
 // GroomingWindowClosedError is returned when a capture arrives for an artifact
 // whose window has already been settled — nothing is written. Settlement is the
 // settlement string of the closing watermark (approved / rejected), Sequence its
@@ -108,8 +153,94 @@ type GroomingWindowAppender interface {
 	AppendChainedGroomingWindowClose(ctx context.Context, p ChainAppendParams, artifactID string) (*Entry, []*Entry, error)
 }
 
+// UpkeepWindowClosedError is returned when an upkeep capture arrives for an
+// artifact whose window the #3924 apply has already settled — nothing is
+// written. Same fields as GroomingWindowClosedError, so the handler's 409
+// names the watermark's facts.
+type UpkeepWindowClosedError struct {
+	ArtifactID string
+	Settlement string
+	Sequence   int64
+	ClosedAt   time.Time
+}
+
+func (e *UpkeepWindowClosedError) Error() string {
+	return fmt.Sprintf("audit: upkeep capture window for artifact %s is closed (settlement=%s, watermark sequence %d)",
+		e.ArtifactID, e.Settlement, e.Sequence)
+}
+
+// UpkeepReportSupersededError is returned by the upkeep batch when, under the
+// run-row lock, the HIGHEST-sequence upkeep_report_recorded row no longer
+// names ArtifactID: a newer report was recorded after the server resolved the
+// capture's binding. Nothing is written. CurrentArtifactID is the artifact the
+// newest row names ("" when that row is absent or undecodable — still a
+// refusal, the fail-closed direction) and CurrentSequence its chain sequence
+// (0 when absent), so the captain can re-capture against the current report.
+type UpkeepReportSupersededError struct {
+	ArtifactID        string
+	CurrentArtifactID string
+	CurrentSequence   int64
+}
+
+func (e *UpkeepReportSupersededError) Error() string {
+	return fmt.Sprintf("audit: upkeep report %s is superseded by %q (upkeep_report_recorded sequence %d); re-capture against the current report",
+		e.ArtifactID, e.CurrentArtifactID, e.CurrentSequence)
+}
+
+// UpkeepWindowAppender is the upkeep family's OPTIONAL capability (#3923), the
+// GroomingWindowAppender shape over the upkeep categories. Kept OFF
+// audit.Repository for the same reason; postgresRepo carries it (compile-time
+// assertion in postgres.go) and decisionindex.IndexingRepository forwards it.
+type UpkeepWindowAppender interface {
+	// AppendChainedUpkeepDispositionBatch appends a whole capture batch under
+	// the run-row lock in ONE transaction. It writes NOTHING and returns
+	// *UpkeepReportSupersededError when the newest upkeep_report_recorded row
+	// no longer names artifactID, or *UpkeepWindowClosedError when artifactID's
+	// window is already closed.
+	AppendChainedUpkeepDispositionBatch(ctx context.Context, artifactID string, ps []ChainAppendParams) ([]*Entry, error)
+	// AppendChainedUpkeepWindowClose settles artifactID's upkeep window in ONE
+	// transaction under the run-row lock, returning the watermark and the
+	// consumed dispositions ({this artifact, below the watermark}). An existing
+	// watermark is returned UNCHANGED (permanence), appending nothing.
+	AppendChainedUpkeepWindowClose(ctx context.Context, p ChainAppendParams, artifactID string) (*Entry, []*Entry, error)
+}
+
+// windowFamily parameterizes the capture/apply protocol over one disposition
+// family. name only shapes wrapped error text ("grooming" keeps the
+// pre-generalization strings byte-identical).
+type windowFamily struct {
+	name                string
+	dispositionCategory string
+	watermarkCategory   string
+	// closed builds the family's typed refusal from the permanent watermark.
+	closed func(artifactID, settlement string, seq int64, closedAt time.Time) error
+	// reportCategory, when non-empty, enables the batch's BINDING RE-CHECK: the
+	// highest-sequence row of this category must name the capture's artifact.
+	reportCategory string
+}
+
+var groomingFamily = windowFamily{
+	name:                "grooming",
+	dispositionCategory: GroomingDispositionRecordedCategory,
+	watermarkCategory:   GroomingApplyWindowClosedCategory,
+	closed: func(artifactID, settlement string, seq int64, closedAt time.Time) error {
+		return &GroomingWindowClosedError{ArtifactID: artifactID, Settlement: settlement, Sequence: seq, ClosedAt: closedAt}
+	},
+}
+
+var upkeepFamily = windowFamily{
+	name:                "upkeep",
+	dispositionCategory: UpkeepDispositionRecordedCategory,
+	watermarkCategory:   UpkeepApplyWindowClosedCategory,
+	closed: func(artifactID, settlement string, seq int64, closedAt time.Time) error {
+		return &UpkeepWindowClosedError{ArtifactID: artifactID, Settlement: settlement, Sequence: seq, ClosedAt: closedAt}
+	},
+	reportCategory: UpkeepReportRecordedCategory,
+}
+
 // AppendChainedGroomingDispositionBatchTx is the transaction-aware core of the
-// batch capture. Ordering is LOAD-BEARING and mirrors AppendChainedAnchoredTx:
+// grooming batch capture: windowDispositionBatchTx over the grooming family.
+// Ordering is LOAD-BEARING and mirrors AppendChainedAnchoredTx:
 //
 //  1. LockRunForUpdate(RunID) FIRST, held for the whole transaction.
 //  2. Scan the run's grooming_apply_window_closed entries for one bound to
@@ -122,6 +253,40 @@ type GroomingWindowAppender interface {
 // The caller owns the transaction lifecycle and MUST run it at READ COMMITTED
 // (do NOT set TxOptions), for the reason the file header states.
 func AppendChainedGroomingDispositionBatchTx(ctx context.Context, tx pgx.Tx, artifactID string, ps []ChainAppendParams) ([]*Entry, error) {
+	return windowDispositionBatchTx(ctx, tx, groomingFamily, artifactID, ps)
+}
+
+// AppendChainedGroomingWindowCloseTx is the transaction-aware core of the
+// grooming settlement: windowCloseTx over the grooming family.
+func AppendChainedGroomingWindowCloseTx(ctx context.Context, tx pgx.Tx, p ChainAppendParams, artifactID string) (*Entry, []*Entry, error) {
+	return windowCloseTx(ctx, tx, groomingFamily, p, artifactID)
+}
+
+// AppendChainedUpkeepDispositionBatchTx is the transaction-aware core of the
+// upkeep batch capture (#3923): the grooming ordering plus the BINDING
+// RE-CHECK between the lock and the watermark scan. Same READ COMMITTED rule.
+func AppendChainedUpkeepDispositionBatchTx(ctx context.Context, tx pgx.Tx, artifactID string, ps []ChainAppendParams) ([]*Entry, error) {
+	return windowDispositionBatchTx(ctx, tx, upkeepFamily, artifactID, ps)
+}
+
+// AppendChainedUpkeepWindowCloseTx is the transaction-aware core of the upkeep
+// settlement (#3923; caller: the #3924 apply).
+func AppendChainedUpkeepWindowCloseTx(ctx context.Context, tx pgx.Tx, p ChainAppendParams, artifactID string) (*Entry, []*Entry, error) {
+	return windowCloseTx(ctx, tx, upkeepFamily, p, artifactID)
+}
+
+// windowDispositionBatchTx is the family-generic batch core:
+//
+//  1. LockRunForUpdate(RunID) FIRST, held for the whole transaction.
+//  2. When the family has a reportCategory, the BINDING RE-CHECK: the
+//     highest-sequence row of that category must name artifactID, else the
+//     family's superseded refusal, writing NOTHING. Read UNDER the lock, so a
+//     report recorded after the server's resolution is visible here.
+//  3. The artifact-bound watermark scan; a hit returns the family's closed
+//     error, writing NOTHING.
+//  4. Each param through AppendChainedTx; a mid-batch failure rolls the whole
+//     batch back via the caller's BeginFunc.
+func windowDispositionBatchTx(ctx context.Context, tx pgx.Tx, f windowFamily, artifactID string, ps []ChainAppendParams) ([]*Entry, error) {
 	if len(ps) == 0 {
 		return nil, nil
 	}
@@ -132,13 +297,19 @@ func AppendChainedGroomingDispositionBatchTx(ctx context.Context, tx pgx.Tx, art
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, fmt.Errorf("audit: run %s not found", runID)
 		}
-		return nil, fmt.Errorf("audit: lock run for grooming disposition batch: %w", err)
+		return nil, fmt.Errorf("audit: lock run for %s disposition batch: %w", f.name, err)
 	}
 
-	if closed, err := existingGroomingWatermark(ctx, tx, runID, artifactID); err != nil {
+	if f.reportCategory != "" {
+		if err := checkReportBinding(ctx, tx, f, runID, artifactID); err != nil {
+			return nil, err
+		}
+	}
+
+	if wm, err := lowestWatermarkEntry(ctx, tx, f, runID, artifactID); err != nil {
 		return nil, err
-	} else if closed != nil {
-		return nil, closed
+	} else if wm != nil {
+		return nil, f.closed(artifactID, watermarkSettlement(wm.Payload), wm.Sequence, wm.Timestamp.UTC())
 	}
 
 	out := make([]*Entry, 0, len(ps))
@@ -152,32 +323,31 @@ func AppendChainedGroomingDispositionBatchTx(ctx context.Context, tx pgx.Tx, art
 	return out, nil
 }
 
-// AppendChainedGroomingWindowCloseTx is the transaction-aware core of the
-// settlement. Ordering mirrors the batch core:
+// windowCloseTx is the family-generic settlement core:
 //
 //  1. LockRunForUpdate(p.RunID) FIRST.
-//  2. Scan for an EXISTING grooming_apply_window_closed entry bound to
-//     artifactID. If one exists, return it UNCHANGED alongside the dispositions
-//     below it — the PERMANENCE property — appending nothing.
+//  2. Scan for an EXISTING watermark bound to artifactID. If one exists, return
+//     it UNCHANGED alongside the dispositions below it — the PERMANENCE
+//     property — appending nothing.
 //  3. Otherwise append the watermark via AppendChainedTx and return it with the
 //     consumed dispositions ({artifactID, below the new watermark's sequence}).
 //     Reading the dispositions and appending the watermark in ONE transaction is
 //     what closes the capture/apply TOCTOU.
-func AppendChainedGroomingWindowCloseTx(ctx context.Context, tx pgx.Tx, p ChainAppendParams, artifactID string) (*Entry, []*Entry, error) {
+func windowCloseTx(ctx context.Context, tx pgx.Tx, f windowFamily, p ChainAppendParams, artifactID string) (*Entry, []*Entry, error) {
 	rq := rundb.New(tx)
 	if _, err := rq.LockRunForUpdate(ctx, p.RunID); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil, fmt.Errorf("audit: run %s not found", p.RunID)
 		}
-		return nil, nil, fmt.Errorf("audit: lock run for grooming window close: %w", err)
+		return nil, nil, fmt.Errorf("audit: lock run for %s window close: %w", f.name, err)
 	}
 
-	existing, err := lowestGroomingWatermarkEntry(ctx, tx, p.RunID, artifactID)
+	existing, err := lowestWatermarkEntry(ctx, tx, f, p.RunID, artifactID)
 	if err != nil {
 		return nil, nil, err
 	}
 	if existing != nil {
-		consumed, cerr := consumedGroomingDispositions(ctx, tx, p.RunID, artifactID, existing.Sequence)
+		consumed, cerr := consumedDispositions(ctx, tx, f, p.RunID, artifactID, existing.Sequence)
 		if cerr != nil {
 			return nil, nil, cerr
 		}
@@ -188,42 +358,58 @@ func AppendChainedGroomingWindowCloseTx(ctx context.Context, tx pgx.Tx, p ChainA
 	if err != nil {
 		return nil, nil, err
 	}
-	consumed, err := consumedGroomingDispositions(ctx, tx, p.RunID, artifactID, watermark.Sequence)
+	consumed, err := consumedDispositions(ctx, tx, f, p.RunID, artifactID, watermark.Sequence)
 	if err != nil {
 		return nil, nil, err
 	}
 	return watermark, consumed, nil
 }
 
-// existingGroomingWatermark returns a *GroomingWindowClosedError describing the
-// LOWEST-sequence watermark bound to artifactID, or nil when none exists.
-func existingGroomingWatermark(ctx context.Context, tx pgx.Tx, runID uuid.UUID, artifactID string) (*GroomingWindowClosedError, error) {
-	entry, err := lowestGroomingWatermarkEntry(ctx, tx, runID, artifactID)
-	if err != nil || entry == nil {
-		return nil, err
-	}
-	return &GroomingWindowClosedError{
-		ArtifactID: artifactID,
-		Settlement: groomingWatermarkSettlement(entry.Payload),
-		Sequence:   entry.Sequence,
-		ClosedAt:   entry.Timestamp.UTC(),
-	}, nil
-}
-
-// lowestGroomingWatermarkEntry returns the watermark entry bound to artifactID
-// with the LOWEST sequence (the first one written — the permanent one), or nil.
-func lowestGroomingWatermarkEntry(ctx context.Context, tx pgx.Tx, runID uuid.UUID, artifactID string) (*Entry, error) {
+// checkReportBinding is the BINDING RE-CHECK (#3923 approval condition 1): it
+// returns *UpkeepReportSupersededError unless the HIGHEST-sequence row of
+// f.reportCategory names artifactID. An absent row or an undecodable newest row
+// refuses too (CurrentArtifactID ""): the capture's binding cannot be
+// confirmed, and an append it cannot confirm is the defect the check exists to
+// prevent.
+func checkReportBinding(ctx context.Context, tx pgx.Tx, f windowFamily, runID uuid.UUID, artifactID string) error {
 	id := runID
 	rows, err := auditdb.New(tx).ListAuditEntriesByCategory(ctx, auditdb.ListAuditEntriesByCategoryParams{
 		RunID:    &id,
-		Category: GroomingApplyWindowClosedCategory,
+		Category: f.reportCategory,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("audit: scan grooming watermarks: %w", err)
+		return fmt.Errorf("audit: scan %s report rows: %w", f.name, err)
+	}
+	var newest *auditdb.AuditEntry
+	for i := range rows {
+		if newest == nil || rows[i].Sequence > newest.Sequence {
+			newest = &rows[i]
+		}
+	}
+	if newest == nil {
+		return &UpkeepReportSupersededError{ArtifactID: artifactID}
+	}
+	current := watermarkArtifactID(newest.Payload)
+	if current != artifactID {
+		return &UpkeepReportSupersededError{ArtifactID: artifactID, CurrentArtifactID: current, CurrentSequence: newest.Sequence}
+	}
+	return nil
+}
+
+// lowestWatermarkEntry returns the family watermark bound to artifactID with
+// the LOWEST sequence (the first one written — the permanent one), or nil.
+func lowestWatermarkEntry(ctx context.Context, tx pgx.Tx, f windowFamily, runID uuid.UUID, artifactID string) (*Entry, error) {
+	id := runID
+	rows, err := auditdb.New(tx).ListAuditEntriesByCategory(ctx, auditdb.ListAuditEntriesByCategoryParams{
+		RunID:    &id,
+		Category: f.watermarkCategory,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("audit: scan %s watermarks: %w", f.name, err)
 	}
 	var best *Entry
 	for i := range rows {
-		if groomingWatermarkArtifactID(rows[i].Payload) != artifactID {
+		if watermarkArtifactID(rows[i].Payload) != artifactID {
 			continue
 		}
 		e := rowToEntry(rows[i])
@@ -234,25 +420,25 @@ func lowestGroomingWatermarkEntry(ctx context.Context, tx pgx.Tx, runID uuid.UUI
 	return best, nil
 }
 
-// consumedGroomingDispositions lists the run's grooming_disposition_recorded
-// entries and returns those recorded against artifactID with sequence STRICTLY
-// BELOW belowSeq — the artifact-scoped consumed set (condition 1). It returns
-// the raw entries; the caller collapses them last-wins per entry id.
-func consumedGroomingDispositions(ctx context.Context, tx pgx.Tx, runID uuid.UUID, artifactID string, belowSeq int64) ([]*Entry, error) {
+// consumedDispositions lists the run's family disposition entries and returns
+// those recorded against artifactID with sequence STRICTLY BELOW belowSeq —
+// the artifact-scoped consumed set (condition 1). It returns the raw entries;
+// the caller collapses them last-wins per id.
+func consumedDispositions(ctx context.Context, tx pgx.Tx, f windowFamily, runID uuid.UUID, artifactID string, belowSeq int64) ([]*Entry, error) {
 	id := runID
 	rows, err := auditdb.New(tx).ListAuditEntriesByCategory(ctx, auditdb.ListAuditEntriesByCategoryParams{
 		RunID:    &id,
-		Category: GroomingDispositionRecordedCategory,
+		Category: f.dispositionCategory,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("audit: list grooming dispositions: %w", err)
+		return nil, fmt.Errorf("audit: list %s dispositions: %w", f.name, err)
 	}
 	out := make([]*Entry, 0, len(rows))
 	for i := range rows {
 		if rows[i].Sequence >= belowSeq {
 			continue
 		}
-		if groomingWatermarkArtifactID(rows[i].Payload) != artifactID {
+		if watermarkArtifactID(rows[i].Payload) != artifactID {
 			continue
 		}
 		out = append(out, rowToEntry(rows[i]))
@@ -260,11 +446,11 @@ func consumedGroomingDispositions(ctx context.Context, tx pgx.Tx, runID uuid.UUI
 	return out, nil
 }
 
-// groomingWatermarkArtifactID decodes the shared "artifact_id" payload field,
-// written by the server for BOTH the disposition rows and the watermark. It
-// returns "" for an absent key or malformed payload, which never matches a real
-// artifact id — the fail-safe direction.
-func groomingWatermarkArtifactID(payload []byte) string {
+// watermarkArtifactID decodes the shared "artifact_id" payload field, written
+// by the server for the disposition rows, the watermark AND the
+// upkeep_report_recorded row. It returns "" for an absent key or malformed
+// payload, which never matches a real artifact id — the fail-safe direction.
+func watermarkArtifactID(payload []byte) string {
 	var p struct {
 		ArtifactID string `json:"artifact_id"`
 	}
@@ -274,8 +460,8 @@ func groomingWatermarkArtifactID(payload []byte) string {
 	return p.ArtifactID
 }
 
-// groomingWatermarkSettlement decodes the watermark's "settlement" field.
-func groomingWatermarkSettlement(payload []byte) string {
+// watermarkSettlement decodes the watermark's "settlement" field.
+func watermarkSettlement(payload []byte) string {
 	var p struct {
 		Settlement string `json:"settlement"`
 	}

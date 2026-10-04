@@ -36,6 +36,7 @@ type FullRepository interface {
 	audit.DedupedChainAppender
 	audit.GroomingWindowAppender
 	audit.RetryBudgetAppender
+	audit.UpkeepWindowAppender
 }
 
 // ErrMissingCapability is returned by NewIndexingRepository when the wrapped
@@ -68,7 +69,7 @@ var _ FullRepository = (*IndexingRepository)(nil)
 func NewIndexingRepository(inner audit.Repository, store *Store, resolver ContextResolver, logger *slog.Logger) (*IndexingRepository, error) {
 	full, ok := inner.(FullRepository)
 	if !ok {
-		return nil, fmt.Errorf("%w: %T must implement audit.AnchoredChainAppender, audit.DedupedChainAppender, audit.GroomingWindowAppender and audit.RetryBudgetAppender", ErrMissingCapability, inner)
+		return nil, fmt.Errorf("%w: %T must implement audit.AnchoredChainAppender, audit.DedupedChainAppender, audit.GroomingWindowAppender, audit.RetryBudgetAppender and audit.UpkeepWindowAppender", ErrMissingCapability, inner)
 	}
 	if logger == nil {
 		logger = slog.Default()
@@ -156,6 +157,31 @@ func (r *IndexingRepository) AppendChainedGroomingDispositionBatch(ctx context.C
 // were indexed when they were appended, so they are not re-indexed.
 func (r *IndexingRepository) AppendChainedGroomingWindowClose(ctx context.Context, p audit.ChainAppendParams, artifactID string) (*audit.Entry, []*audit.Entry, error) {
 	w, consumed, err := r.FullRepository.AppendChainedGroomingWindowClose(ctx, p, artifactID)
+	if err == nil {
+		r.index(ctx, w)
+	}
+	return w, consumed, err
+}
+
+// AppendChainedUpkeepDispositionBatch forwards the UpkeepWindowAppender
+// capability (#3923) — the ONLY atomic path upkeep_disposition_recorded
+// reaches the chain — then indexes every appended entry (a no-op while the
+// category is not decision-bearing; forwarded through index so classifying it
+// later needs no change here).
+func (r *IndexingRepository) AppendChainedUpkeepDispositionBatch(ctx context.Context, artifactID string, ps []audit.ChainAppendParams) ([]*audit.Entry, error) {
+	es, err := r.FullRepository.AppendChainedUpkeepDispositionBatch(ctx, artifactID, ps)
+	if err == nil {
+		for _, e := range es {
+			r.index(ctx, e)
+		}
+	}
+	return es, err
+}
+
+// AppendChainedUpkeepWindowClose forwards the UpkeepWindowAppender settlement.
+// As for grooming, only the watermark is (possibly) new.
+func (r *IndexingRepository) AppendChainedUpkeepWindowClose(ctx context.Context, p audit.ChainAppendParams, artifactID string) (*audit.Entry, []*audit.Entry, error) {
+	w, consumed, err := r.FullRepository.AppendChainedUpkeepWindowClose(ctx, p, artifactID)
 	if err == nil {
 		r.index(ctx, w)
 	}

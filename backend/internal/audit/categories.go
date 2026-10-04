@@ -254,6 +254,10 @@ import "sort"
 // on them before their writers land. Like grooming_report_recorded they are
 // INTERNAL, not issue-comment activity categories
 // (docs/issue-comment-surfaces.md is untouched).
+// #3923 added upkeep_apply_window_closed, the upkeep family's WATERMARK
+// (audit/grooming_window.go): the #3924 apply appends one per upkeep-report
+// artifact it settles, on approve AND reject, after which a capture for that
+// artifact is refused (409 upkeep_window_closed). INTERNAL, audit-only.
 var KnownCategories = map[string]struct{}{
 	"acceptance_dispatched":                   {},
 	"acceptance_outcome_recorded":             {},
@@ -489,6 +493,7 @@ var KnownCategories = map[string]struct{}{
 	"status_comment_posted":                   {},
 	"trace_uploaded":                          {},
 	"unpriced_model_alert":                    {},
+	"upkeep_apply_window_closed":              {}, // #3923: upkeep capture-window watermark (writer: #3924 apply, via audit.UpkeepWindowAppender)
 	"upkeep_disposition_recorded":             {}, // #3921: the captain disposed an upkeep finding (writer: #3923)
 	"upkeep_finding_filed":                    {}, // #3921: the upkeep apply filed a finding's issue (writer: #3924)
 	"upkeep_finding_skipped":                  {}, // #3921: the upkeep apply skipped a finding (writer: #3924)

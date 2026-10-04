@@ -231,6 +231,7 @@ var mcpToolScopes = map[string]mcpToolScopeRule{
 	"fishhawk_merge_run":                    {anyOf: []string{"write:approvals"}}, // merge_run.go handleMergeRun
 	"fishhawk_arbitrate_acceptance":         {anyOf: []string{"write:approvals"}}, // acceptance_arbitration.go handleAcceptanceArbitration
 	"fishhawk_record_grooming_dispositions": {anyOf: []string{"write:approvals"}}, // grooming_dispositions.go handleRecordGroomingDispositions
+	"fishhawk_record_upkeep_dispositions":   {anyOf: []string{"write:approvals"}}, // upkeep_dispositions.go handleRecordUpkeepDispositions
 
 	// --- write:deploy. approvals.go handleSubmitApproval takes the
 	// write:deploy branch for a deploy-gate approval (approvals.go:791).

@@ -87,6 +87,8 @@ func TestIndexingRepository_ForwardsEveryOptionalCapability(t *testing.T) {
 			_, ok = dec.(audit.GroomingWindowAppender)
 		case "RetryBudgetAppender":
 			_, ok = dec.(audit.RetryBudgetAppender)
+		case "UpkeepWindowAppender":
+			_, ok = dec.(audit.UpkeepWindowAppender)
 		default:
 			t.Errorf("audit declares %s, which the decision-index decorator does not forward: add it to decisionindex.FullRepository with an indexing method in writer.go, then list it in this switch", name)
 			continue
@@ -174,6 +176,39 @@ func TestIndexingRepository_CapabilityPathsIndex(t *testing.T) {
 		}
 		if n != 0 {
 			t.Fatalf("non-decision watermark %d was indexed", w.Sequence)
+		}
+	})
+
+	// UpkeepWindowAppender (#3923). The batch's binding re-check requires the
+	// newest upkeep_report_recorded row to name the capture's artifact, so it is
+	// seeded first. upkeep_disposition_recorded is not decision-bearing today:
+	// the assertion is that the forward reaches the inner repo and COMMITS.
+	t.Run("UpkeepWindowAppender/batch+close", func(t *testing.T) {
+		// Reached through the type assertion the server makes, so a decorator
+		// that dropped the forward fails HERE rather than at compile time.
+		win, ok := any(d).(audit.UpkeepWindowAppender)
+		if !ok {
+			t.Fatal("decorator does not forward audit.UpkeepWindowAppender: the server would silently take the non-atomic upkeep fallback")
+		}
+		f.appendEntry(t, f.runA, &f.implStageA, audit.UpkeepReportRecordedCategory, map[string]any{"artifact_id": "upkeep-1"})
+		es, err := win.AppendChainedUpkeepDispositionBatch(ctx, "upkeep-1", []audit.ChainAppendParams{
+			params(audit.UpkeepDispositionRecordedCategory, map[string]any{"artifact_id": "upkeep-1", "finding_id": "flake:x", "verdict": "approved"}),
+		})
+		if err != nil {
+			t.Fatalf("AppendChainedUpkeepDispositionBatch: %v", err)
+		}
+		if len(es) != 1 {
+			t.Fatalf("batch appended %d entries, want 1", len(es))
+		}
+		assertEntryCommitted(t, f, es[0])
+		w, consumed, err := win.AppendChainedUpkeepWindowClose(ctx,
+			params(audit.UpkeepApplyWindowClosedCategory, map[string]any{"artifact_id": "upkeep-1", "settlement": "approved"}), "upkeep-1")
+		if err != nil {
+			t.Fatalf("AppendChainedUpkeepWindowClose: %v", err)
+		}
+		assertEntryCommitted(t, f, w)
+		if len(consumed) != 1 || consumed[0].Sequence != es[0].Sequence {
+			t.Fatalf("consumed = %v, want exactly the batch entry %d", consumed, es[0].Sequence)
 		}
 	})
 
