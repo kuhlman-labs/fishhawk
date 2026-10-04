@@ -8,6 +8,7 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -52,8 +53,29 @@ var (
 	upkeepPinMaxWorkflowFiles = 64
 )
 
-// upkeepFlakeRunPageSize is the ListRuns page size of the flake gather.
-const upkeepFlakeRunPageSize = 100
+// upkeepFlakeRunPageSize is the ListRuns page size of the flake gather. A
+// package var so a NON-PARALLEL test can force a multi-page gather (#3924
+// carried item 8).
+var upkeepFlakeRunPageSize = 100
+
+// Scan cache (#3924 carried item 11). The gather reads up to
+// upkeepFlakeBundleCap bundles of up to upkeepBundleMaxBytes each, and both
+// prompt endpoints call it, so a single-flight + short-TTL cache keyed per
+// (server, run, stage) bounds repeated serves. Package vars so a
+// NON-PARALLEL test can shrink them or drive the clock.
+var (
+	// upkeepScanCacheTTL is how long a completed gather is served from the
+	// cache. A degraded (e.g. budget_exceeded) gather is cached too.
+	upkeepScanCacheTTL = 60 * time.Second
+	// upkeepScanCacheMaxEntries hard-caps the cache map. When it is full after
+	// the expired-entry sweep, a new gather runs uncached.
+	upkeepScanCacheMaxEntries = 256
+	// upkeepScanNow is the cache's clock.
+	upkeepScanNow = time.Now
+	// upkeepScanJoinHook, when non-nil, is called each time a caller JOINS an
+	// in-flight gather instead of starting its own. A test-only barrier.
+	upkeepScanJoinHook func()
+)
 
 // upkeepWorkflowDir is the directory the pin gather lists for workflow files.
 const upkeepWorkflowDir = ".github/workflows"
@@ -238,8 +260,13 @@ func (d *upkeepDegrades) sorted() []prompt.UpkeepEvidenceDegrade {
 // transport error only; the gather itself never errors (each partial read is
 // a degrade).
 //
-// The preview (/prompt-render) calls this too and re-gathers, so the two
-// endpoints can differ when a run lands or the budget expires between calls.
+// The binding is read on every call; the gather is served through
+// upkeepScans, so /prompt and /prompt-render share one gather per stage
+// within upkeepScanCacheTTL and concurrent serves of one stage gather once.
+// An Undecidable binding (workflow_unresolved, stage_unmappable) gets nil —
+// the ordinary plan prompt — which is a documented residual, not a fork: the
+// ingest refuses that stage's upkeep_report fail-closed (upkeepIngestRefusal)
+// and the plan-path guard refuses its plan, so nothing it ships is accepted.
 func (s *Server) resolveUpkeepScanContext(ctx context.Context, runRow *run.Run, stage *run.Stage) (*prompt.UpkeepScanContext, error) {
 	if stage.Type != run.StageTypePlan {
 		return nil, nil
@@ -251,12 +278,19 @@ func (s *Server) resolveUpkeepScanContext(ctx context.Context, runRow *run.Run, 
 	if !b.StageDeclaresUpkeep {
 		return nil, nil
 	}
-	gctx, cancel := context.WithTimeout(ctx, upkeepEvidenceBudget)
-	defer cancel()
+	key := upkeepScanKey{srv: s, runID: runRow.ID, stageID: stage.ID}
+	return upkeepScans.do(ctx, key, func(gctx context.Context) *prompt.UpkeepScanContext {
+		return s.gatherUpkeepScan(gctx, runRow)
+	}), nil
+}
 
+// gatherUpkeepScan runs both gathers under ctx (already bounded by the
+// cache's detached budget) and adapts the detector output to the prompt's
+// scan context.
+func (s *Server) gatherUpkeepScan(ctx context.Context, runRow *run.Run) *prompt.UpkeepScanContext {
 	var deg upkeepDegrades
-	files, scanned := s.gatherUpkeepPins(gctx, runRow, &deg)
-	flakeStages, runsScanned, stagesScanned := s.gatherUpkeepFlakes(gctx, runRow, &deg)
+	files, scanned := s.gatherUpkeepPins(ctx, runRow, &deg)
+	flakeStages, runsScanned, stagesScanned := s.gatherUpkeepFlakes(ctx, runRow, &deg)
 
 	out := &prompt.UpkeepScanContext{
 		PinFilesScanned:    scanned,
@@ -284,7 +318,131 @@ func (s *Server) resolveUpkeepScanContext(ctx context.Context, runRow *run.Run, 
 		}
 		out.Flakes = append(out.Flakes, fact)
 	}
-	return out, nil
+	return out
+}
+
+// upkeepScanKey identifies one cached gather. The server is part of the key
+// so two Servers in one process (tests) never share a gather over different
+// stores.
+type upkeepScanKey struct {
+	srv     *Server
+	runID   uuid.UUID
+	stageID uuid.UUID
+}
+
+// upkeepScanEntry is one gather: in flight until done is closed, then
+// served until expires. ok=false after done means the gather aborted (it
+// panicked); such an entry is never served.
+type upkeepScanEntry struct {
+	done    chan struct{}
+	result  *prompt.UpkeepScanContext
+	ok      bool
+	expires time.Time
+}
+
+// upkeepScanCache is the single-flight + short-TTL gather cache. Hand-rolled
+// (no golang.org/x/sync dependency): one mutex over the map, and an in-flight
+// channel per entry.
+type upkeepScanCache struct {
+	mu      sync.Mutex
+	entries map[upkeepScanKey]*upkeepScanEntry
+}
+
+// upkeepScans is the process's scan cache, shared by /prompt and
+// /prompt-render.
+var upkeepScans = &upkeepScanCache{}
+
+// do returns the cached gather for key, or runs gather. A completed entry
+// younger than upkeepScanCacheTTL is served as is; a caller arriving while a
+// gather for key is in flight waits for it instead of starting its own.
+//
+// The LEADER (the caller that starts the gather) runs it inline under a
+// context DETACHED from its request (context.WithoutCancel, so values such
+// as the logger survive) and bounded by its own upkeepEvidenceBudget: a
+// cancelled leader never hands its waiters a cancelled or truncated result.
+// A waiter therefore blocks at most one budget, whatever its own context
+// does. Nothing failed is cached: a gather that panics is removed from the
+// map, its waiters retry (one becomes the new leader), and the panic
+// continues in the leader. A degraded-but-completed gather IS cached.
+func (c *upkeepScanCache) do(ctx context.Context, key upkeepScanKey, gather func(context.Context) *prompt.UpkeepScanContext) *prompt.UpkeepScanContext {
+	for {
+		c.mu.Lock()
+		if c.entries == nil {
+			c.entries = map[upkeepScanKey]*upkeepScanEntry{}
+		}
+		now := upkeepScanNow()
+		if e, hit := c.entries[key]; hit {
+			select {
+			case <-e.done:
+				if e.ok && now.Before(e.expires) {
+					c.mu.Unlock()
+					return e.result
+				}
+				delete(c.entries, key)
+			default:
+				c.mu.Unlock()
+				if hook := upkeepScanJoinHook; hook != nil {
+					hook()
+				}
+				<-e.done
+				if e.ok {
+					return e.result
+				}
+				continue // the leader aborted: retry, possibly as the leader
+			}
+		}
+		c.sweepLocked(now)
+		e := &upkeepScanEntry{done: make(chan struct{})}
+		if len(c.entries) < upkeepScanCacheMaxEntries {
+			c.entries[key] = e
+		}
+		c.mu.Unlock()
+		return c.lead(ctx, key, e, gather)
+	}
+}
+
+// lead runs gather for e under a detached, budgeted context and publishes
+// the outcome. The deferred publish runs on a panic too, so waiters are
+// never stranded.
+func (c *upkeepScanCache) lead(ctx context.Context, key upkeepScanKey, e *upkeepScanEntry, gather func(context.Context) *prompt.UpkeepScanContext) *prompt.UpkeepScanContext {
+	defer func() {
+		c.mu.Lock()
+		if e.ok {
+			e.expires = upkeepScanNow().Add(upkeepScanCacheTTL)
+		} else if c.entries[key] == e {
+			delete(c.entries, key)
+		}
+		c.mu.Unlock()
+		close(e.done)
+	}()
+	gctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), upkeepEvidenceBudget)
+	defer cancel()
+	out := gather(gctx)
+	c.mu.Lock()
+	e.result, e.ok = out, true
+	c.mu.Unlock()
+	return out
+}
+
+// sweepLocked drops every completed entry that has expired (or aborted).
+// c.mu must be held.
+func (c *upkeepScanCache) sweepLocked(now time.Time) {
+	for k, e := range c.entries {
+		select {
+		case <-e.done:
+			if !e.ok || !now.Before(e.expires) {
+				delete(c.entries, k)
+			}
+		default:
+		}
+	}
+}
+
+// size reports the number of map entries (tests).
+func (c *upkeepScanCache) size() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.entries)
 }
 
 // upkeepDegrade records one degrade and WARN-logs it with the run id. No
@@ -484,7 +642,10 @@ func goWorkUseDirs(work string) []string {
 // gatherUpkeepFlakes reads the verify history of recent same-tenancy runs'
 // implement stages. It pages ListRuns newest-first over the run's repository
 // and account, and per run:
-//   - skips the scanning run itself;
+//   - skips the scanning run itself, and any run an EARLIER page already
+//     served (offset paging over a newest-first list re-serves the boundary
+//     run when a run is created between two pages; the seen set reads it
+//     once and does not count it twice toward the scan cap);
 //   - stops at the first run older than upkeepFlakeWindow (ListRuns orders
 //     created_at DESC, id DESC);
 //   - drops a run upkeepRunOwnershipRefusal rejects, so only runs the
@@ -506,6 +667,7 @@ func (s *Server) gatherUpkeepFlakes(ctx context.Context, runRow *run.Run, deg *u
 	}
 	cutoff := time.Now().Add(-upkeepFlakeWindow)
 	bundlesRead, noTrace := 0, 0
+	seen := map[uuid.UUID]bool{}
 
 	for offset := 0; ; offset += upkeepFlakeRunPageSize {
 		if ctx.Err() != nil {
@@ -530,9 +692,10 @@ func (s *Server) gatherUpkeepFlakes(ctx context.Context, runRow *run.Run, deg *u
 				stop = true
 				break
 			}
-			if rn.ID == runRow.ID {
+			if rn.ID == runRow.ID || seen[rn.ID] {
 				continue
 			}
+			seen[rn.ID] = true
 			if rn.CreatedAt.Before(cutoff) {
 				stop = true
 				break
