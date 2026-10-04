@@ -777,6 +777,15 @@
       "supersedes": [],
       "superseded_by": [],
       "applies_to": []
+    },
+    {
+      "id": "ADR-087",
+      "title": "Local stage concurrency groups: server-coordinated admission of host-dispatched stages",
+      "path": "docs/adr/087-local-stage-concurrency-groups.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
     }
   ]
 }
