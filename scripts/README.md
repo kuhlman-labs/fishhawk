@@ -2781,7 +2781,17 @@ need a human and an unattended runner agent has none (#3938). It is the one
 shared definition of a run agent, so a new runner agent tree is a one-line
 change here, not four skill edits.
 
-- **Path signal (primary).** DIR's physical path (`pwd -P`) is matched
+- **Marker signal (primary).** A non-empty `FISHHAWK_RUN_AGENT`, which the
+  runner stamps on every agent it spawns (#3945, `runner/README.md` §
+  "Run-agent marker"; `1` when the invocation has no run id, so any
+  non-empty value counts). It is checked FIRST, so it also catches an agent
+  that has cd'd out of its tree into an operator checkout. Both agent CLIs
+  forward it from their env to their shell tool, where the skills run this
+  script: verified for claude-code's Bash tool and for codex `exec` with the
+  runner's flags on 2026-10-04 (#3947). Residual: an operator-set codex
+  `shell_environment_policy` could filter it, hence the path fallback. The
+  marker is cooperative, not adversarial: an agent can `env -u` it.
+- **Path signal (fallback).** DIR's physical path (`pwd -P`) is matched
   against the runner's agent trees, each as an exact path component
   (`grep -E`), not a substring:
   `/fishhawk-worktrees/run-<id>` (lineage worktree),
@@ -2794,29 +2804,18 @@ change here, not four skill edits.
   format string fails a test),
   `/fishhawk-acceptance-<digits>` (the acceptance agent's own `os.MkdirTemp`
   workdir) and `/fishhawk-conflict-<rand>/tree` (conflict-resolution tree),
-  each followed by `/` or end of path. The acceptance workdir is not a git
-  checkout, so a skill (which locates this script via `git rev-parse`)
-  cannot reach that pattern from there; it serves direct callers passing
-  DIR. A run tree's path prefixes every directory
-  inside it, so a subdirectory matches too. The runner now stamps
-  `FISHHAWK_RUN_AGENT=<run id>` on every agent spawn (#3945,
-  `runner/README.md` § "Run-agent marker"), but the script does not read it
-  yet, so today the path is still what identifies a local run agent.
-- **Env signals.** A non-empty `FISHHAWK_RUN_ID` (set by CI-hosted runners
-  only: GitLab CI, deploy triggers; empty is not a marker), and, INTERIM
-  until the script reads the runner-stamped `FISHHAWK_RUN_AGENT` marker
-  (#3945 stamps it; the read is #3947),
-  `FISHHAWK_FORGE_WRITES=deny`, which `acceptenv` injects into every
-  acceptance agent. It catches an acceptance agent that has cd'd into an
-  operator checkout, where no path pattern applies. It means "forge writes
-  disabled", so an operator who set it for dev-mode testing is refused too.
-  That is the safe direction for a guard, and the printed reason says to
-  unset it.
-- **Pending: the marker read (#3947).** Reading `FISHHAWK_RUN_AGENT` first
-  (any non-empty value), dropping the `FISHHAWK_FORGE_WRITES=deny` interim
-  signal, and adding an env-marker harness case plus `env -u
-  FISHHAWK_RUN_AGENT` in `run_check` is an operator-authored follow-up:
-  both this script and its harness are forbidden to implement stages.
+  each followed by `/` or end of path. A run tree's path prefixes every
+  directory inside it, so a subdirectory matches too. The acceptance workdir
+  is not a git checkout, so a skill (which locates this script via `git
+  rev-parse`) cannot reach that pattern from there; it serves direct callers
+  passing DIR. The fallback covers a runner binary older than the marker or
+  a filtered env.
+- **Env signal.** A non-empty `FISHHAWK_RUN_ID` (set by CI-hosted runners:
+  GitLab CI, deploy triggers; empty is not a marker).
+  `FISHHAWK_FORGE_WRITES=deny` is NOT a signal (dropped in #3947): it was an
+  interim acceptance-agent marker until the runner stamped
+  `FISHHAWK_RUN_AGENT`, and it means "forge writes disabled", which an
+  operator may set for dev-mode testing.
 - **Contract for callers.** Continue only on `operator` with exit 0. Any
   other result means stop and report the output, including a missing
   script (exit 127, a checkout that predates it). The skills invoke it as
@@ -2831,11 +2830,16 @@ a run tree, a non-git run-tree path, operator checkouts merely NAMED like
 each shape (conflict, acceptance tree, acceptance workdir, a
 `fishhawk-worktrees` child merely containing `run-`, a component merely
 ending in `fishhawk-worktrees`), near misses on each acceptance anchor,
-an operator `<tree>-debug` copy, and the env cases (`FISHHAWK_FORGE_WRITES`
-`deny` vs another value, and that a path signal is not masked by it): 24
-cases. Counterfactuals: deleting the conflict-tree pattern fails r3/r4,
-loosening it to a prefix fails o3/o4, an unanchored acceptance-tree pattern
-fails o7, a loose stage suffix fails o11, dropping the workdir pattern's end
-anchor fails o9, and removing the deny signal fails e3. Both `scripts/is-run-agent` and the harness are in both implement
+an operator `<tree>-debug` copy, the env cases (`FISHHAWK_RUN_ID`; that
+`FISHHAWK_FORGE_WRITES=deny` is NOT a signal; that another value does not
+mask a path signal), and the marker cases (a run-id value and the `1`
+fallback in an operator checkout, an empty value, and the marker winning
+inside a run tree): 28 cases. Every invocation scrubs `FISHHAWK_RUN_AGENT`,
+so the harness is stable when run inside an agent's own shell.
+Counterfactuals: deleting the conflict-tree pattern fails r3/r4, loosening
+it to a prefix fails o3/o4, an unanchored acceptance-tree pattern fails o7,
+a loose stage suffix fails o11, dropping the workdir pattern's end anchor
+fails o9, removing the marker check fails m1/m2/m4, moving it after the path
+checks fails m4, and restoring the deny signal fails e3. Both `scripts/is-run-agent` and the harness are in both implement
 stages' `forbidden_paths`, so a run cannot merge a weakened guard. A skill that finds the script missing (a
 checkout that predates it, exit 127) stops instead of proceeding.
