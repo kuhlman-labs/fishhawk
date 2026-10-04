@@ -2511,6 +2511,59 @@ func (c *apiClient) ListGroomingDispositions(ctx context.Context, runID uuid.UUI
 	return &out, nil
 }
 
+// upkeepDispositionRequestBody mirrors the backend's capture request body
+// (`backend/internal/server/upkeep_dispositions.go::upkeepDispositionRequest`).
+type upkeepDispositionRequestBody struct {
+	Dispositions []UpkeepDispositionEntry `json:"dispositions"`
+}
+
+// RecordUpkeepDispositions records a batch of per-finding upkeep verdicts via
+// `POST /v0/runs/{run_id}/upkeep-dispositions` (#3923). The batch is validated
+// ATOMICALLY server-side: a request naming one unknown finding id records
+// NOTHING. 4xx/5xx surfaces:
+//   - 400 validation_failed (unparseable body, empty batch, > 200 entries,
+//     empty or repeated finding_id, invalid parent_epic, parent_epic or
+//     authorize_delegation_tier on a rejected verdict)
+//   - 400 upkeep_verdict_invalid (a verdict outside approved/rejected)
+//   - 403 run_token_forbidden (a run-bound agent token, even for its own run)
+//   - 403 operator_agent_forbidden (a delegated operator-agent token)
+//   - 403 insufficient_scope (token lacks write:approvals)
+//   - 404 run_not_found
+//   - 409 upkeep_report_absent (the run has no recorded upkeep_report)
+//   - 409 upkeep_window_closed (the report's capture window has been settled; nothing recorded)
+//   - 409 upkeep_report_superseded (a newer report was recorded mid-capture; nothing recorded)
+//   - 422 upkeep_finding_unknown (an id the recorded report does not declare)
+//   - 503 upkeep_dispositions_unconfigured
+func (c *apiClient) RecordUpkeepDispositions(ctx context.Context, runID uuid.UUID,
+	dispositions []UpkeepDispositionEntry) (*RecordUpkeepDispositionsOutput, error) {
+	body, err := json.Marshal(upkeepDispositionRequestBody{Dispositions: dispositions})
+	if err != nil {
+		return nil, fmt.Errorf("marshal upkeep dispositions: %w", err)
+	}
+	var out RecordUpkeepDispositionsOutput
+	if err := c.do(ctx, http.MethodPost,
+		"/v0/runs/"+runID.String()+"/upkeep-dispositions", body, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// ListUpkeepDispositions reads back the recorded dispositions for the run's
+// recorded upkeep_report via `GET /v0/runs/{run_id}/upkeep-dispositions`
+// (#3923). Read access only — the captain-only posture is scoped to CAPTURE.
+// 4xx/5xx surfaces:
+//   - 404 run_not_found
+//   - 409 upkeep_report_absent
+//   - 503 upkeep_dispositions_unconfigured
+func (c *apiClient) ListUpkeepDispositions(ctx context.Context, runID uuid.UUID) (*ListUpkeepDispositionsOutput, error) {
+	var out ListUpkeepDispositionsOutput
+	if err := c.do(ctx, http.MethodGet,
+		"/v0/runs/"+runID.String()+"/upkeep-dispositions", nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 // deferConcernRequest mirrors the backend's defer 200 request body
 // (`backend/internal/server/defer_concern.go::deferConcernRequest`). The
 // follow-up body is auto-drafted server-side; the operator supplies only

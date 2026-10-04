@@ -281,6 +281,138 @@ components:
                 description: |
                   Chain sequence of the winning row, so a reader can order
                   captures without re-listing the chain.
+    UpkeepDispositionsRequest:
+      type: object
+      additionalProperties: false
+      required: [dispositions]
+      description: |
+        Body of `POST /v0/runs/{run_id}/upkeep-dispositions` (#3923). Exactly
+        ONE JSON document: trailing content is `400 validation_failed`.
+      properties:
+        dispositions:
+          type: array
+          minItems: 1
+          maxItems: 200
+          description: |
+            One entry per decided finding, at most 200 (the upkeep report's
+            `findings` maxItems). Validated atomically: one unknown
+            `finding_id` records nothing.
+          items:
+            type: object
+            additionalProperties: false
+            required: [finding_id, verdict]
+            properties:
+              finding_id:
+                type: string
+                minLength: 1
+                description: |
+                  The finding's stable DERIVED id (e.g. `flake:TestWidgetSync`).
+                  It must be an id the bound `upkeep_report` declares, and may
+                  not repeat within one request.
+              verdict:
+                type: string
+                enum: [approved, rejected]
+                description: The captain's verdict for this finding.
+              authorize_delegation_tier:
+                type: boolean
+                default: false
+                description: |
+                  Approved only. The captain's BOOLEAN authorization for the
+                  apply (#3924) to keep the finding's OWN proposed `autonomy:*`
+                  label on the issue it files. Recorded verbatim; inert when the
+                  finding proposes no tier label. `true` on a rejected verdict is
+                  `400 validation_failed`.
+              parent_epic:
+                type: string
+                description: |
+                  Approved only. Overrides the parent epic of the issue the apply
+                  files: a positive issue number, bare (`389`) or `#`-prefixed
+                  (`#389`), validated with the report's own rule (j). A
+                  present-but-invalid value, or any value on a rejected verdict,
+                  is `400 validation_failed`.
+    UpkeepDispositions:
+      type: object
+      description: |
+        The recorded per-finding upkeep dispositions for ONE upkeep_report
+        artifact (#3923). Returned by BOTH the capture POST and the read-back
+        GET — they share one server-side projection, so the echo and the
+        read-back are the same bytes by construction.
+      required: [run_id, artifact_id, stage_id, content_hash, window_closed, dispositions]
+      properties:
+        run_id: { $ref: '#/components/schemas/UUID' }
+        artifact_id:
+          allOf: [{ $ref: '#/components/schemas/UUID' }]
+          description: |
+            The artifact named by the HIGHEST-sequence `upkeep_report_recorded`
+            row on the run's chain, which these dispositions bind to. Recorded on
+            every audit payload.
+        stage_id:
+          allOf: [{ $ref: '#/components/schemas/UUID' }]
+          description: The plan stage that shipped the bound artifact.
+        content_hash:
+          type: string
+          description: The bound artifact's content hash.
+        window_closed:
+          type: boolean
+          description: |
+            True once the #3924 apply has appended this artifact's
+            `upkeep_apply_window_closed` watermark (on approve AND reject).
+            After it, a capture for this artifact is refused with
+            `upkeep_window_closed`.
+        settlement:
+          type: object
+          description: |
+            The closing watermark's facts, present only when window_closed is
+            true. Pre-watermark dispositions are still returned in
+            `dispositions` unchanged.
+          properties:
+            settlement:
+              type: string
+              enum: [approved, rejected]
+              description: How the window was settled.
+            closed_at:
+              type: string
+              format: date-time
+            audit_sequence:
+              type: integer
+              format: int64
+              description: Chain sequence of the watermark row.
+        dispositions:
+          type: array
+          description: |
+            One row per DISPOSITIONED finding of the bound artifact, collapsed
+            last-wins by audit sequence and sorted by finding_id. Rows of another
+            artifact and undecodable rows are excluded.
+          items:
+            type: object
+            required: [finding_id, source, verdict, authorize_delegation_tier, recorded_at, recorded_by, audit_sequence]
+            properties:
+              finding_id:
+                type: string
+              source:
+                type: string
+                enum: [flake, toolchain_drift, deprecation]
+                description: The finding's source, copied from the bound report.
+              verdict:
+                type: string
+                enum: [approved, rejected]
+              authorize_delegation_tier:
+                type: boolean
+                description: Always present; false unless the captain set it.
+              parent_epic:
+                type: string
+                description: Present only when the captain supplied one.
+              recorded_at:
+                type: string
+                format: date-time
+                description: Timestamp of the audit row that won the last-wins collapse.
+              recorded_by:
+                type: string
+                description: The token subject that recorded the verdict.
+              audit_sequence:
+                type: integer
+                format: int64
+                description: Chain sequence of the winning row.
 
     Error:
       type: object
@@ -8201,17 +8333,21 @@ components:
             admission control refused the run, e.g. `budget_exhausted` or an
             `applies_to` / charter refusal (audited `scheduled_run_refused`),
             or `transient_error` — a 5xx or transport failure that is logged
-            only and retried on the next tick.
+            only and retried on the next tick. An OCCUPIED window key is also
+            `refused`, never `already_started`: when the `Idempotency-Key`
+            replay returns a run that is NOT a scheduled run of this workflow,
+            the outcome is `refused` with `code: scheduled_key_occupied` and
+            `run_id` naming the occupant.
         window_start:
           type: string
           format: date-time
         run_id:
           type: string
           format: uuid
-          description: The started or replayed run; absent for a refusal.
+          description: The started or replayed run; absent for a refusal, except `scheduled_key_occupied`, where it names the run occupying the window key.
         code:
           type: string
-          description: The refusal's error code (e.g. `budget_exhausted`); absent for a start.
+          description: The refusal's error code (e.g. `budget_exhausted`, `scheduled_key_occupied`); absent for a start.
         message:
           type: string
           description: The refusal's message or the transient error's text.
@@ -9536,14 +9672,15 @@ paths:
                     description: |
                       Map of schema name to hex-encoded SHA-256 of the backend's
                       embedded canonical schema bytes. Keys: "plan-standard-v1",
-                      "grooming-report-v1", "workflow-v0", "workflow-v1",
-                      "workflow-v2". Callers compare against their own embedded
-                      hashes to detect schema drift.
+                      "grooming-report-v1", "upkeep-report-v1", "workflow-v0",
+                      "workflow-v1", "workflow-v2". Callers compare against their
+                      own embedded hashes to detect schema drift.
                     additionalProperties:
                       type: string
                     example:
                       plan-standard-v1: "abc123..."
                       grooming-report-v1: "89abcd..."
+                      upkeep-report-v1: "fedcba..."
                       workflow-v0: "def456..."
                       workflow-v1: "0123ab..."
                       workflow-v2: "4567cd..."
@@ -10681,9 +10818,11 @@ paths:
                     instead of needing an installation_id to fetch
                     from GitHub. Only valid with an
                     ISSUE-ANCHORED `trigger_source` —
-                    `github_issue` or `on_demand` (E54.22 / #2826)
-                    — a 400 fires when shipped with `cli` or `ui`,
-                    which carry no originating issue. The converse
+                    `github_issue`, `on_demand` (E54.22 / #2826) or
+                    `scheduled` (E79.1 / #3725; only the in-process
+                    scheduler can supply it) — a 400 fires when
+                    shipped with `cli` or `ui`, which carry no
+                    originating issue. The converse
                     does not hold: an ISSUE-ANCHORED source is not
                     itself required to carry `issue_context` (or a
                     `trigger_ref`) at creation (E54.24 / #2830) — an
@@ -12581,6 +12720,197 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '503':
           description: The run / artifact / audit repositories are not wired (`grooming_dispositions_unconfigured`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/runs/{run_id}/upkeep-dispositions:
+    post:
+      operationId: recordUpkeepDispositions
+      summary: Record per-finding upkeep dispositions (captain-only)
+      description: |
+        Capture the captain's verdicts on individual findings of a run's
+        upkeep report (#3923). Each disposition names one finding by its
+        stable DERIVED id, a verdict (`approved` / `rejected`), and on an
+        approved finding optionally `authorize_delegation_tier` (a BOOLEAN
+        authorization for the apply to keep the finding's own proposed
+        `autonomy:*` label) and `parent_epic` (a parent-epic override). Each
+        accepted entry persists as ONE chained `upkeep_disposition_recorded`
+        audit row; the #3924 apply consumes them. Contract:
+        `docs/spec/upkeep-report-v1.md` § "Dispositions".
+
+        **Which report.** The dispositions bind to the artifact named by the
+        HIGHEST-sequence `upkeep_report_recorded` row on the run's chain — not
+        the newest artifact: that row is what settles the stage and carries the
+        dedupe verdict the apply consumes. An artifact whose recorded row never
+        landed is not bindable until an idempotent re-ingest heals the row. GET
+        resolves through the same function.
+
+        **Every refusal runs before any write, in this order:** 503
+        `upkeep_dispositions_unconfigured`; 401; 403 `run_token_forbidden`,
+        `operator_agent_forbidden`, `insufficient_scope`; 400
+        `validation_failed` (bad `run_id`); 404 `run_not_found`; 400
+        `validation_failed` / `upkeep_verdict_invalid` (body); 409
+        `upkeep_report_absent` (or 500 for an unreadable report); 422
+        `upkeep_finding_unknown` (whole batch); 409 `upkeep_report_superseded` /
+        `upkeep_window_closed`.
+
+        **Capture guarantee (one capture is one transaction).** The WHOLE batch
+        is validated before ANY row is appended AND appended in ONE transaction
+        under the run-row lock. Inside it the server re-checks that the bound
+        artifact is STILL named by the highest-sequence `upkeep_report_recorded`
+        row (else `409 upkeep_report_superseded`, naming
+        `details.current_artifact_id`) and that its window is still open (else
+        `409 upkeep_window_closed`). Both refusals append nothing. A 200
+        therefore landed against the current report, below any watermark. A
+        capture that a LATER report supersedes is not consumed: the apply
+        decides the report current when it runs. (An in-memory deployment
+        without the atomic capability falls back to a window check plus a
+        per-row append whose mid-batch `500` reports `details.recorded` /
+        `details.requested`; the production store never does.)
+
+        **Window.** The window closes only when the #3924 apply appends an
+        artifact-bound `upkeep_apply_window_closed` watermark, on approve AND
+        reject; the first watermark is permanent. A run never decided keeps its
+        window open.
+
+        **Supersession.** A `finding_id` may not repeat WITHIN one request
+        (`400 validation_failed`), but a LATER request on the same finding
+        SUPERSEDES the earlier one (last wins by audit sequence); both rows stay
+        in the chain.
+
+        **Authorization.** Captain-only, with TWO refusals. A run-bound MCP
+        token (subject `mcp:run:<uuid>`) is rejected outright
+        (`403 run_token_forbidden`), even for its own run. A DELEGATED
+        operator-agent token (subject prefix `operator-agent/`) is rejected too
+        (`403 operator_agent_forbidden`): the upkeep report is agent-authored,
+        so an agent dispositioning it would be a self-approval.
+        `write:approvals` is required and enforced unconditionally.
+      tags: [runs]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpkeepDispositionsRequest' }
+      responses:
+        '200':
+          description: |
+            The batch was recorded. The body carries the bound report artifact
+            plus the FULL current disposition set for it.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UpkeepDispositions' }
+        '400':
+          description: |
+            One of two cases. (1) `validation_failed` — a bad `run_id`, an
+            unparseable body or trailing content, an empty batch or more than
+            200 entries, an empty or repeated `finding_id`, an invalid
+            `parent_epic`, or `parent_epic` / `authorize_delegation_tier: true`
+            on a rejected verdict. (2) `upkeep_verdict_invalid` — a verdict
+            outside `{approved, rejected}`; `details.allowed` names the set.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            One of three cases. (1) `run_token_forbidden` — a run-bound MCP
+            token, even for its own run. (2) `operator_agent_forbidden` — a
+            delegated operator-agent token. (3) `insufficient_scope` — the
+            identity lacks `write:approvals` (no cookie-session bypass).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: No such run (`run_not_found`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: |
+            One of three cases, each recording NOTHING. (1)
+            `upkeep_report_absent` — the run's chain carries no
+            `upkeep_report_recorded` row (distinct from an unreadable report,
+            which is a 500). (2) `upkeep_report_superseded` — a newer report was
+            recorded after this capture resolved its report; `details` carry
+            `artifact_id`, `current_artifact_id` and `current_sequence`;
+            re-capture against the current report. (3) `upkeep_window_closed` —
+            the apply has settled this artifact's window; `details` carry
+            `artifact_id`, `settlement` and `watermark_sequence`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: |
+            One or more `finding_id` values are not declared by the bound
+            `upkeep_report` (`upkeep_finding_unknown`);
+            `details.unknown_finding_ids` names every one and
+            `details.artifact_id` the report. NO disposition was recorded.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: |
+            The bound report could not be read or parsed (an undecodable newest
+            recorded row, an unreadable artifact, a wrong kind or a parse
+            failure — never a fallback to an older report), or a storage failure
+            (`internal_error`). The atomic batch records nothing.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            The run / artifact / audit repositories are not wired
+            (`upkeep_dispositions_unconfigured`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+    get:
+      operationId: listUpkeepDispositions
+      summary: Read back the recorded upkeep dispositions for a run
+      description: |
+        Returns the current disposition set for the run's bound
+        `upkeep_report` (#3923), resolved through the same binding rule the
+        capture uses (the HIGHEST-sequence `upkeep_report_recorded` row).
+        Repeats on one `finding_id` collapse LAST-WINS by audit sequence; an
+        undecodable row is SKIPPED; output is sorted by `finding_id`.
+
+        **Authorization.** Read access only. The captain-only posture is scoped
+        to CAPTURE: the underlying report is already agent-readable.
+      tags: [runs]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      responses:
+        '200':
+          description: The recorded dispositions for the run's bound upkeep report.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UpkeepDispositions' }
+        '400':
+          description: '`run_id` is not a valid UUID (`validation_failed`).'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: No such run (`run_not_found`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: The run's chain carries no `upkeep_report_recorded` row (`upkeep_report_absent`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: The bound report could not be read or parsed (`internal_error`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: The run / artifact / audit repositories are not wired (`upkeep_dispositions_unconfigured`).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -22318,6 +22648,20 @@ paths:
               from a stage whose type is not `plan`. Fails the stage
               category-B: the stage type is a property of the run, so
               re-shipping the same bytes cannot help.
+            - `upkeep_report_invalid` — an upkeep report (`kind:
+              "upkeep_report"`, #3921) failed `upkeep-report-v1` or one of its
+              semantic rules (no `details.reason`), or cited a run that is
+              unknown, in another repository or in another account
+              (`details.reason: run_ref_invalid` plus `details.run_id`). Fails
+              the stage category-B.
+            - `upkeep_report_stage_invalid` — an upkeep report was shipped from
+              a stage it is not bound to; `details.reason` is
+              `stage_type_not_plan` (the stage is not `plan`-typed),
+              `stage_does_not_declare_upkeep_report` (the run's cached workflow
+              does not declare `produces: upkeep_report` on this stage) or
+              `stage_binding_undecidable` (the workflow or the stage's spec
+              entry cannot be resolved; fails CLOSED). Fails the stage
+              category-B. Contract: `docs/spec/upkeep-report-v1.md` § "Ingest".
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
