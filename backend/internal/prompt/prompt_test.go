@@ -13859,7 +13859,7 @@ func TestBuild_SwitchCasesCoveredByEnvelopeMatrix(t *testing.T) {
 }
 
 // untrustedFieldRead is one selector-expression read of an untrusted Trigger
-// field in prompt.go, classified by its enclosing function AND by its
+// field in any non-test file of this package, classified by its enclosing function AND by its
 // SYNTACTIC USE. The use classification is what makes the allow-list a real
 // control: a function allow-list alone cannot tell a sanctioned enveloping
 // call apart from a raw render performed INSIDE an allowed function, so a
@@ -13895,26 +13895,65 @@ type untrustedFieldRead struct {
 // chokepoint — which is why writeUntrustedCrewMessages sanitizes BEFORE it caps:
 // that is what makes sanitizeUntrustedComment the DIRECT consumer of the read
 // (maintainer condition 1 on #3738).
+//
+// ReportTitle and ReportBody are the E81.3 / #3773 user-report pair. Both are
+// UserReport fields (no Trigger field exists until E81.5 adds a builder), so
+// each maps straight to its sanitizing consumer: the title to sanitizeIssueTitle
+// (single-line, non-delimiting, then enveloped), the body to
+// sanitizeUntrustedComment — which is why writeUntrustedUserReports sanitizes
+// BEFORE it caps.
 var envelopingWriterFor = map[string]string{
 	"IssueBody":     "writeUntrustedIssueBody",
 	"IssueComments": "writeIssueComments",
 	"IssueTitle":    "sanitizeIssueTitle",
 	"CrewMessages":  "writeUntrustedCrewMessages",
 	"MessageText":   "sanitizeUntrustedComment",
+	"ReportTitle":   "sanitizeIssueTitle",
+	"ReportBody":    "sanitizeUntrustedComment",
 }
 
-// untrustedTriggerFieldReads parses prompt.go and returns every selector-expression
-// read of an untrusted Trigger field, classified by use. A read is sanctioned
-// when it is a direct argument to that field's enveloping writer, or when it is
-// an operand of a comparison against "" (a presence test renders nothing).
-// Anything else — an argument to strings.Builder.WriteString, to fmt.Fprintf, to
-// the OTHER field's writer, an assignment, a range clause — is a raw use.
+// untrustedTriggerFieldReads parses EVERY non-test .go file in this package and
+// returns every selector-expression read of a watched untrusted field,
+// classified by use. A read is sanctioned when it is a direct argument to that
+// field's enveloping writer, or when it is an operand of a comparison against ""
+// (a presence test renders nothing). Anything else — an argument to
+// strings.Builder.WriteString, to fmt.Fprintf, to the OTHER field's writer, an
+// assignment, a range clause — is a raw use.
+//
+// WHY every file, not prompt.go alone (E81.3 / #3773): the user-report writer
+// lives in userreport.go, and a raw read in that file, revisionbase.go or any
+// future file would otherwise be invisible to this guard. The widening needed no
+// extra scope: operator-verified on main 7c389edf, the package's only non-test
+// Go files were prompt.go and revisionbase.go, and a grep of revisionbase.go
+// found NO read of the watched selectors (IssueBody, IssueComments, IssueTitle,
+// CrewMessages, MessageText). The glob is relative because `go test` runs each
+// test binary in its package's source directory — the same assumption the
+// precedent-import test's filepath.Glob("*.go") makes. The per-field vacuity
+// check in the test below still holds: a watched field with ZERO reads across
+// all files fails it, so reverting this parse to prompt.go only reddens the
+// ReportTitle/ReportBody arms.
 func untrustedTriggerFieldReads(t *testing.T) []untrustedFieldRead {
 	t.Helper()
 	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, "prompt.go", nil, 0)
+	names, err := filepath.Glob("*.go")
 	if err != nil {
-		t.Fatalf("parse prompt.go: %v", err)
+		t.Fatalf("glob prompt package: %v", err)
+	}
+	var decls []ast.Decl
+	parsed := 0
+	for _, name := range names {
+		if strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(fset, name, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		decls = append(decls, f.Decls...)
+		parsed++
+	}
+	if parsed == 0 {
+		t.Fatal("no non-test .go file found in the prompt package — the guard would be vacuous")
 	}
 	fieldOf := func(n ast.Node) (string, bool) {
 		sel, ok := n.(*ast.SelectorExpr)
@@ -13928,7 +13967,7 @@ func untrustedTriggerFieldReads(t *testing.T) []untrustedFieldRead {
 	}
 
 	var reads []untrustedFieldRead
-	for _, decl := range file.Decls {
+	for _, decl := range decls {
 		fn, ok := decl.(*ast.FuncDecl)
 		if !ok || fn.Body == nil {
 			continue
@@ -14027,11 +14066,22 @@ var allowedReadersFor = map[string]map[string]bool{
 	"MessageText": {
 		"writeUntrustedCrewMessages": true,
 	},
+	// E81.3 / #3773: the user-report channel. Both untrusted UserReport fields
+	// are read ONLY by the one per-report envelope writer. No Build stage reads
+	// them yet; E81.5 / #3775 adds a Trigger field and builder and must add
+	// that pair here (and never to buildImplement / buildImplementFixup).
+	"ReportTitle": {
+		"writeUntrustedUserReports": true,
+	},
+	"ReportBody": {
+		"writeUntrustedUserReports": true,
+	},
 }
 
 // TestPrompt_UntrustedIssueFieldsReadOnlyByEnvelopingWriters is the AST
-// allow-list guard over all THREE untrusted Trigger channels — IssueBody,
-// IssueComments and IssueTitle. Covering only the body would leave the
+// allow-list guard over the untrusted channels — IssueBody, IssueComments and
+// IssueTitle, the #3738 crew-message pair, and the E81.3 / #3773 user-report
+// pair (ReportTitle, ReportBody), across EVERY non-test file in the package. Covering only the body would leave the
 // no-raw-render-path criterion partly enforced: a new RAW COMMENT or RAW TITLE
 // render behind a condition the fixture matrix does not activate would evade
 // both halves.
@@ -14061,7 +14111,7 @@ var allowedReadersFor = map[string]map[string]bool{
 // allow-list would leave green.
 func TestPrompt_UntrustedIssueFieldsReadOnlyByEnvelopingWriters(t *testing.T) {
 	reads := untrustedTriggerFieldReads(t)
-	for _, field := range []string{"IssueBody", "IssueComments", "IssueTitle", "CrewMessages", "MessageText"} {
+	for _, field := range []string{"IssueBody", "IssueComments", "IssueTitle", "CrewMessages", "MessageText", "ReportTitle", "ReportBody"} {
 		allowed := allowedReadersFor[field]
 		if len(allowed) == 0 {
 			t.Fatalf("no allowed-reader set declared for watched field %s — the guard would be vacuous", field)
@@ -14077,8 +14127,9 @@ func TestPrompt_UntrustedIssueFieldsReadOnlyByEnvelopingWriters(t *testing.T) {
 				t.Errorf("%s is read by %s (%s), which is not an allowed reader of that field. "+
 					"Untrusted issue text must reach a prompt only through writeUntrustedIssueBody "+
 					"(body) or writeIssueComments (comments), the title only through "+
-					"sanitizeIssueTitle, and crew-message text only through "+
-					"writeUntrustedCrewMessages -> sanitizeUntrustedComment; route the render "+
+					"sanitizeIssueTitle, crew-message text only through "+
+					"writeUntrustedCrewMessages -> sanitizeUntrustedComment, and user-report "+
+					"text only through writeUntrustedUserReports; route the render "+
 					"through an allowed writer instead of adding a raw read.",
 					field, r.Func, r.Pos)
 				continue
@@ -14095,6 +14146,15 @@ func TestPrompt_UntrustedIssueFieldsReadOnlyByEnvelopingWriters(t *testing.T) {
 						"first, then cap the sanitized text) so exactly one function in this " +
 						"package consumes CrewMessage.MessageText."
 				}
+				if field == "ReportTitle" {
+					remedy = "Pass the report title DIRECTLY to sanitizeIssueTitle (then cap it) " +
+						"so it renders single-line and non-delimiting inside its envelope."
+				}
+				if field == "ReportBody" {
+					remedy = "Pass the report body DIRECTLY to sanitizeUntrustedComment (sanitize " +
+						"first, then cap the sanitized text) so exactly one function in this " +
+						"package consumes UserReport.ReportBody."
+				}
 				t.Errorf("%s: %s reads %s as %s — that is a RAW render inside an allowed writer. %s",
 					r.Pos, r.Func, field, r.Use, remedy)
 				continue
@@ -14104,7 +14164,7 @@ func TestPrompt_UntrustedIssueFieldsReadOnlyByEnvelopingWriters(t *testing.T) {
 			}
 		}
 		if seen == 0 {
-			t.Errorf("no reader of %s found in prompt.go — the allow-list guard is vacuous", field)
+			t.Errorf("no reader of %s found in the prompt package's non-test files — the allow-list guard is vacuous", field)
 			continue
 		}
 		for fn := range allowed {
