@@ -3127,6 +3127,83 @@ C2 is now evaluated BEFORE the decision branch, so a reject on an ordinary plan 
 
 **Known operational residual.** This repository's Project #7 is USER-owned, and a GitHub App installation token cannot reach a user-owned Projects v2 board — board placement routes onto `FISHHAWKD_PROJECTS_TOKEN` instead ([#1114](https://github.com/kuhlman-labs/fishhawk/issues/1114)). With that token unset, the `unboarded` and `missing_estimate` hygiene defects dispatch and are recorded outcome `failed`, not `applied`. That is correct continue-and-report behaviour, not a defect: label-set and epic-link mutations land first. It doubles as a **kill switch without a deploy** — leave the token unset, or reject the groom gate instead of approving it.
 
+## On-approval upkeep apply (`upkeep_apply.go`, [#3924](https://github.com/kuhlman-labs/fishhawk/issues/3924), E79 / #3726)
+
+`applyApprovedUpkeep(ctx, stage, decision)` is the upkeep scan's last phase: a best-effort side effect of `finishApprovalAdvance`'s plan-stage block, called directly after `applyApprovedGrooming`. When the DECIDED plan stage carries the run's recorded `upkeep_report`, it settles the report's disposition-capture window and, on approve only, files every captain-approved finding that is not already covered through `applyAndFileWorkItem` — the same work-item core every other auto-file path uses. Like its siblings it never unwinds the approval: every failure degrades to a named audit row and returns. Normative wire contract: `docs/spec/upkeep-report-v1.md` § "Apply".
+
+**It never creates a run.** An approved finding becomes a tracker issue that a human (or a later campaign) picks up — not a dispatched change. Nothing in `upkeep_apply.go` references `CreateRun` or a run-creation path, and two counters pin it at zero: `ukApplyRunRepo` in `upkeep_apply_test.go` and `ukFlowRunRepo` in `upkeep_flow_test.go`.
+
+**Placement is part of the control, exactly as for grooming.** The call sits in the TYPE-only plan block (which runs on approve AND reject) and is PASSED the decision. "A rejected report files nothing and settles its window `rejected`" therefore lives in the hook as a guard whose deletion is observable on the reject path; nesting the call inside the approve-only block would make it untestable.
+
+### The ladder
+
+| # | Rung | Rule | Test |
+|---|---|---|---|
+| E0 | **Report present** | *An early-out, not a control.* No `upkeep_report` artifact on the stage (`ArtifactRepo.ListForStage`), no `upkeep_report_recorded` row, or the recorded row names an artifact on another stage → write NOTHING. It reads only the artifact LIST and the recorded ROW, and a nil `ArtifactRepo`/`AuditRepo`/stage returns at once, so every ordinary plan approval is untouched. An unreadable artifact list is silent (indistinguishable from "no report"). An undecodable newest recorded row degrades `upkeep_apply_report_unreadable` on either decision. | `TestApplyApprovedUpkeep_OrdinaryPlanStageNoOps` |
+| C1 | **Decision** | A decision other than approve settles the window `rejected` from the recorded row's `artifact_id` and files NOTHING. It runs BEFORE any report-body read, so an unreadable body cannot keep a rejected window open. A reject-path settlement failure is logged at Warn (there is nothing to degrade into). | `TestApplyApprovedUpkeep_RejectSettlesRejectedFilesNothing`, `..._RejectClosesWindowEvenWhenBodyUnreadable`, `..._RejectSettlementFailureLogged`, through the real route `TestSubmitApproval_RejectOnUpkeepStageSettlesWindow` and `TestUpkeepFlow_RejectThroughApprovalRouteSettlesRejected` |
+| C3 | **Re-ratification** | Re-read the stage's approval rows: ≥ 1 grant and 0 rejections (`approvedGroomingReport`'s predicate). Otherwise degrade `upkeep_apply_not_ratified`; the window is NOT closed. | `TestApplyApprovedUpkeep_ContestedGateFilesNothingWindowOpen` |
+
+Between C1 and C3 the hook resolves the report through `latestUpkeepReport` — the function the capture binds through — and requires it to name the artifact the row named; otherwise `upkeep_apply_report_unreadable` (`TestApplyApprovedUpkeep_ReportUnreadableDegrades`).
+
+**Settlement.** After C3 the hook appends the `approved` watermark (`upkeep_apply_window_closed`) BEFORE any provider resolution. Production drives `audit.UpkeepWindowAppender.AppendChainedUpkeepWindowClose`, which appends the watermark and reads the consumed `upkeep_disposition_recorded` rows in one transaction; a repository without the capability (the in-memory fakes) takes a permanence-aware read-then-append fallback mirroring `settleGroomingWindow` (`TestApplyApprovedUpkeep_AtomicSettlementPath` covers both). The consumed rows for the artifact collapse last-wins per `finding_id` into `{verdict, authorize_delegation_tier, parent_epic}`. A failed append degrades `upkeep_apply_window_unsettled` (window open, `TestApplyApprovedUpkeep_WindowUnsettledDegrades`). **Every later degrade is post-ratification and leaves the window CLOSED** — reopening on retry is the failure the window protocol prevents.
+
+### Inputs and degrades
+
+After settlement the hook reads the dedupe verdict from the highest-sequence `upkeep_report_recorded` row naming the bound artifact (an absent, null or non-array `duplicates` is unreadable — fail closed), the run's prior `upkeep_finding_filed` rows for the artifact (an unattributable row is unreadable), and the run, `owner/name`, conventions and run-scoped target — built exactly as `upkeepDuplicates` builds its target (installation from the run, else `resolveRepoScope` for the GitHub provider; a failed scope lookup is NOT fatal, the provider fails closed per finding as `filing_failed`).
+
+| `degrade_reason` | Window | Test |
+|---|---|---|
+| `upkeep_apply_report_unreadable` | open | `TestApplyApprovedUpkeep_ReportUnreadableDegrades` |
+| `upkeep_apply_not_ratified` | open | `TestApplyApprovedUpkeep_ContestedGateFilesNothingWindowOpen` |
+| `upkeep_apply_window_unsettled` | open | `TestApplyApprovedUpkeep_WindowUnsettledDegrades`, `TestApplyApprovedUpkeep_AtomicSettlementPath/close_error_degrades` |
+| `upkeep_apply_duplicates_unreadable` | closed | `TestApplyApprovedUpkeep_PostRatificationDegrades` |
+| `upkeep_apply_prior_filings_unreadable` | closed | `TestApplyApprovedUpkeep_PostRatificationDegrades` |
+| `upkeep_apply_run_unreadable` | closed | `TestApplyApprovedUpkeep_PostRatificationDegrades` |
+| `upkeep_apply_repo_unresolvable` | closed | `TestApplyApprovedUpkeep_PostRatificationDegrades` |
+| `upkeep_apply_conventions_unavailable` | closed | `TestApplyApprovedUpkeep_PostRatificationDegrades` |
+| `upkeep_apply_prelaunch_timeout` | either | `TestApplyApprovedUpkeep_PrelaunchTimeoutDegradesNamed` |
+
+Each writes ONE `upkeep_apply_completed` row `{artifact_id, degraded:true, degrade_reason}` with zero counts, on a fresh bounded context so an expired prelaunch context does not lose it. When the prelaunch context has expired, the step's own failure is a symptom and the reason becomes `upkeep_apply_prelaunch_timeout` with the step named in the logged detail.
+
+### The per-finding loop
+
+Detached on `Server.bgUpkeepApply` (drained by `Shutdown` beside `bgGroomingApply`; `waitUpkeepApply()` is the test barrier) under `upkeepApplyBudgetFor(n) = max(upkeepApplyBudget (3m), n × upkeepApplyPerFindingBudget (3s))`; the synchronous half is bounded by `upkeepApplyPrelaunchBudget` (30s). All three are `var`s only so tests can shrink them. The approve response returns once the goroutine is launched (`TestApplyApprovedUpkeep_DetachedAndShutdownDrains`, `..._DetachedFromRequestCancellation`).
+
+In REPORT ORDER, exactly one row per finding; the rules are checked in this order:
+
+| Outcome | Row | When | Test |
+|---|---|---|---|
+| `not_approved` | `upkeep_finding_skipped` | no consumed disposition, or a `rejected` one | `TestApplyApprovedUpkeep_SkipsNotApproved`, `..._LastWinsDisposition` |
+| `duplicate_of_open_issue` | `upkeep_finding_skipped` + `duplicate_issue_number`/`_url`/`duplicate_basis` | the ingest marked it covered by an OPEN issue (marker or similarity) | `TestApplyApprovedUpkeep_SkipsDuplicateOfOpenIssue` |
+| `already_filed` | `upkeep_finding_skipped` + `prior_issue_number` | an `upkeep_finding_filed` row for this artifact and finding exists (a re-apply) | `TestApplyApprovedUpkeep_SecondApplyAlreadyFiled` |
+| `apply_budget_exhausted` | `upkeep_finding_skipped` | the loop's budget expired before this finding | `TestApplyApprovedUpkeep_BudgetExhaustedRecorded` |
+| `filing_failed` | `upkeep_finding_skipped` + `code`/`message` | `applyAndFileWorkItem` returned a `*workItemError`; the loop continues | `TestApplyApprovedUpkeep_FilingFailedContinues` |
+| filed | `upkeep_finding_filed` | otherwise | `TestApplyApprovedUpkeep_FilesApprovedFindingsWithMarkerAndKey` |
+
+Then ONE `upkeep_apply_completed` row `{artifact_id, findings, filed, skipped, failed, budget_exhausted, degraded:false}` (`skipped` counts the first three reasons, `failed` counts `filing_failed`). Every row is written actor `system` with the decided stage's id and the payload marshalled BARE. Skip and degrade reasons are payload VALUES, not audit categories; `upkeep_apply_completed` is registered in `backend/internal/audit/categories.go` and is INTERNAL — not an issue-comment activity category.
+
+**What a filing carries.** `Type`/`Summary`/`Body` come from the proposal; the body gains `upkeep.FindingMarker(id)` on its own line (the marker the next scan's ingest dedupe matches) and is stamped with `workmgmt.MintIdempotencyKey("upkeep_finding", run_id, artifact_id, finding_id)` through `FilingRequest.IdempotencyKey`. The parent epic is the disposition's `parent_epic` override, else the proposal's, normalized to `#N` (`TestApplyApprovedUpkeep_ParentEpicOverrideElseProposal`). The proposal's `autonomy:*` labels are STRIPPED unless the captain set `authorize_delegation_tier` (`TestApplyApprovedUpkeep_AutonomyStrippedUnlessAuthorized`). "Stripped" means the PROPOSED tier is never applied unaided: `workmgmt.Apply`'s label-completeness pass still adds the conventions' DEFAULT tier (`workmgmt.Default()` sets `autonomy:medium`) when the filed labels carry none — the conventions' choice, not the scan's (`TestApplyApprovedUpkeep_DefaultConventionsAutonomyTier`). `applied_labels` on the filed row are the labels actually filed (the post-Apply item), `stripped_labels` the removed ones.
+
+### Cross-boundary flow
+
+`upkeep_flow_test.go` drives the real seams end to end: a SIGNED `POST /v0/runs/{id}/plan` of a six-finding report through the router, whose dedupe reads a registered fake provider serving one open issue carrying finding B's marker and one titled like finding F → `POST /v0/runs/{id}/upkeep-dispositions` → `POST /v0/stages/{id}/approvals` (`handleSubmitApproval` → `finishApprovalAdvance` → this hook) → the same provider as the filer. `TestUpkeepFlow_IngestDispositionsApproveFilesExactlyApproved` asserts exactly {A, E} are filed (A with the `#77` override, E with the proposal's epic and without its unauthorized `autonomy:high`), B and F are skipped as duplicates with number and basis, C (rejected) and D (undispositioned) are skipped `not_approved`, one `approved` watermark and one `{findings:6, filed:2, skipped:4}` summary land, `CreateRun` is called zero times, and a later capture is refused `409 upkeep_window_closed`. `TestUpkeepFlow_RejectThroughApprovalRouteSettlesRejected` rejects through the same route and asserts the `rejected` watermark, zero filings, no per-finding or summary row, and the same later 409. Deleting the `case isDup:` skip reddens the approve case (B and F filed); deleting the `applyApprovedUpkeep` call in `approvals.go` reddens both. The fixture's audit fake lacks `audit.UpkeepWindowAppender`, so both the hook's settlement and the capture's window check take their in-memory fallback; the atomic transaction is pinned against Postgres by `upkeep_dispositions_pg_test.go`.
+
+### Marker provenance (a decision, #3924 carried item 1)
+
+A marker match suppresses filing WITHOUT a provenance check. The title-similarity channel suppresses equally and CANNOT be provenance-gated — a human-filed similar issue IS the duplicate the dedupe exists to catch — so a provenance check on the marker alone would not reduce what an issue-opener can suppress. The effect is bounded to a SKIP: nothing is closed, edited or escalated. `TestApplyApprovedUpkeep_SkipsDuplicateOfOpenIssue` pins the decision with a marker-basis mark whose issue nothing in the run filed. The rejected alternative is a cross-run `upkeep_finding_filed` provenance scan for marker-basis marks.
+
+### Residuals
+
+- **(i) Marker dedupe has NO provenance check.** An issue planted by anyone who can open or edit an issue — carrying a finding's marker, or a near-identical title — suppresses that finding's filing. The upkeep apply's audit categories (`upkeep_finding_skipped` including `filing_failed` and `apply_budget_exhausted`, and a degraded `upkeep_apply_completed`) are INTERNAL: no UI and no issue comment surfaces them, so the captain sees them only through `GET /v0/runs/{id}/audit`. The operator accepted this at the #3924 plan gate as a suppression-only residual — it can stop a filing, never cause one or escalate one.
+- **(ii) Lost apply — no re-drive.** After the window settles `approved`, a crash, a post-ratification degrade, `filing_failed` or budget exhaustion leaves approved findings unfiled, and nothing re-drives them (the consumed window is closed and permanent). Recovery is the NEXT `upkeep_scan`: it re-proposes the still-present findings, and its marker dedupe (plus `already_filed` on a re-apply of the same artifact) prevents a double filing.
+- **(iii) Rollback.** Removing filing requires reverting the `s.applyApprovedUpkeep(...)` call in `approvals.go` (and `upkeep_apply.go`, #3924 slice 3) — reverting this flow test and these docs (slice 4) changes no behaviour. Issues already filed stay on the tracker and carry the marker, so the next scan still recognizes them while they are open.
+- **(iv) Strict disposition decode.** #3924 made `POST /v0/runs/{id}/upkeep-dispositions` decode strictly: a body with an unknown or misspelled key that was previously accepted with `200` (the key silently dropped) is now `400 validation_failed`. In-repo callers (the `fishhawk_record_upkeep_dispositions` MCP tool) send only declared keys.
+- **Settlement does not re-check the report binding.** The audit window-close transaction has no `checkReportBinding`, so if a newer report is recorded between `latestUpkeepReport` and the settlement, the apply settles and consumes against the report it resolved. Narrow: the approved stage's own ingest settled it.
+- **At-least-once filing.** If `provider.File` succeeds but the `upkeep_finding_filed` append fails, a re-apply would file again. A second apply is unreachable in production — the approve compare-and-swap refuses a raced second approval (see "Approval-hook self-protection" above) — and the stamped key and marker make any duplicate identifiable; the next scan's dedupe marks it.
+- **Count-1 ratification.** C3 shares grooming's grant-and-no-rejection predicate, which coincides with gate satisfaction only under a `count: 1` gate (the shipped `upkeep_scan` declares `count: 1`).
+
+**Frontend handling.** The Web UI does not render any of this: `frontend/src/api/types.ts`'s `ArtifactKind` does not list `upkeep_report` (an unknown kind passes through `evidenceRefFor` as an opaque string, so nothing crashes), and the run narrative reads an allow-listed category set (`NARRATIVE_AUDIT_CATEGORIES` in `frontend/src/run-narrative/use-run-narrative.ts`), so the upkeep rows are never fetched. Rendering them is a follow-up for the operator to file.
+
 ## Human-executor review-gate admission (`review_gate_admission.go`, E54.53 / [#3041](https://github.com/kuhlman-labs/fishhawk/issues/3041))
 
 ADR-018 (#311, #313) moved review-stage approval onto GitHub, and `handleSubmitApproval` implemented that by refusing EVERY `type: review` stage with `409 review_stage_managed_by_github`. That is correct for `feature_change` and `routine_change`, whose review stages ARE the PR merge gate. It is wrong for `backlog_grooming`'s `confirm` stage — `executor: human`, `approvals: {count: 1, not: [agent]}`, no `pull_request` input — which had no approvable surface ANYWHERE, so a grooming run could be started but never finished and parked in `running` indefinitely (run `1499bdb0`).
