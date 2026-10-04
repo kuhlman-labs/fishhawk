@@ -1192,6 +1192,37 @@ The tool pre-validates the run UUID, a non-empty batch, and non-empty `entry_id`
 
 Error surfaces propagated as tool errors: invalid UUID / empty `dispositions` / empty `entry_id` (caught locally), `validation_failed` (400), `grooming_verdict_invalid` (400), `run_token_forbidden` (403), `operator_agent_forbidden` (403), `insufficient_scope` (403), `grooming_report_absent` (409), `grooming_window_closed` (409, #2991: the report's capture window has been settled), `grooming_entry_unknown` (422), `grooming_dispositions_unconfigured` (503).
 
+## Per-finding upkeep dispositions (`fishhawk_record_upkeep_dispositions`, [#3923](https://github.com/kuhlman-labs/fishhawk/issues/3923))
+
+`fishhawk_record_upkeep_dispositions` **captures** the captain's verdicts on individual findings of an upkeep_scan run's `upkeep_report` — one `{finding_id, verdict, authorize_delegation_tier?, parent_epic?}` per decided finding — and persists each as ONE chained `upkeep_disposition_recorded` audit row. It wraps `POST /v0/runs/{run_id}/upkeep-dispositions`; `ListUpkeepDispositions` on the client wraps the `GET` read-back. It mirrors the grooming tool above in shape; the contract is `docs/spec/upkeep-report-v1.md` § "Dispositions".
+
+**Consumed by the apply** ([#3924](https://github.com/kuhlman-labs/fishhawk/issues/3924)). The apply files the approved findings' proposed issues and closes the capture WINDOW by appending an artifact-bound `upkeep_apply_window_closed` watermark on approve AND reject; a capture after that returns `409 upkeep_window_closed` and records nothing. Until #3924 lands nothing in production writes the watermark. The response carries `window_closed` / `settlement` (the same settlement shape as grooming's, so the unexported `groomingWindowSettlement` is reused).
+
+**`authorize_delegation_tier` is a BOOLEAN captain authorization** for the apply to keep the finding's OWN proposed `autonomy:*` label on the issue it files. Grooming never applies tier labels, so this per-finding opt-in is new and deliberate. It is recorded verbatim and inert when the finding proposes no tier label. `parent_epic` overrides the filed issue's parent epic. Both are refused (`400 validation_failed`) on a `rejected` verdict, because a rejected finding files nothing.
+
+**Captain-only, with TWO refusals** — the grooming posture: a run-bound MCP token (`mcp:run:<uuid>`) is refused `run_token_forbidden` **even for its own run**, and a DELEGATED operator-agent token (`operator-agent/`) is refused `operator_agent_forbidden`, because the report is agent-authored and an agent dispositioning it would be a self-approval. `write:approvals` is required unconditionally (`server/mcpscopes.go`). `TestRecordUpkeepDispositions_SurfacesBackendRefusals` asserts the tool names each backend code, and `TestRecordUpkeepDispositionsFullPath_RunBoundTokenRefusedAtBackend` proves the run-bound refusal through the REAL server with zero rows persisted.
+
+Inputs:
+
+| Field | Required | Notes |
+|---|---|---|
+| `run_id` | **yes** | The run whose recorded `upkeep_report` the dispositions bind to. |
+| `dispositions[].finding_id` | **yes** | The finding's stable DERIVED id (e.g. `flake:TestWidgetSync`), as the report declares it. At most 200 entries. |
+| `dispositions[].verdict` | **yes** | `approved` or `rejected` — the closed upkeep verdict set. |
+| `dispositions[].authorize_delegation_tier` | no | Approved only. Authorizes the finding's own proposed `autonomy:*` label. |
+| `dispositions[].parent_epic` | no | Approved only. A positive issue number, bare (`389`) or `#`-prefixed (`#389`). A pointer on the wire, so a present-but-blank value reaches the backend and is refused rather than read as absent. |
+
+Semantics worth knowing before calling:
+
+- **Which report.** The dispositions bind to the artifact named by the HIGHEST-sequence `upkeep_report_recorded` row on the run's chain — NOT the newest artifact (the grooming rule). That row is what settles the stage and carries the dedupe verdict the apply consumes. The resolved `artifact_id` + `content_hash` come back in the response, and the `GET` uses the same resolver.
+- **Batch-atomic, with an in-transaction binding re-check.** One unknown `finding_id` records **NOTHING**. The batch is appended in ONE transaction under the run-row lock that re-checks the binding: a report recorded after resolution refuses `409 upkeep_report_superseded` (naming `current_artifact_id`) and records nothing — re-read the report and re-capture.
+- **Last-wins supersession.** A `finding_id` may not repeat WITHIN one request (`validation_failed`), but a LATER request on the same finding **supersedes** the earlier one; both rows stay on the chain.
+- **The read-back rides along.** The capture's 200 carries the FULL current disposition set for the artifact, sorted by `finding_id`.
+
+The tool pre-validates the run UUID, a non-empty batch, and non-empty `finding_id`s **before** the HTTP hop (`TestRecordUpkeepDispositions_PreHopValidation` asserts zero backend calls); it deliberately does NOT duplicate the verdict, finding-id, 200-entry or override checks — the backend is the single authority. `TestRecordUpkeepDispositionsFullPath` carries every field through the real client, the real `server.Handler()` and the real Postgres `UpkeepWindowAppender`, then back out of the `GET`.
+
+Error surfaces propagated as tool errors: invalid UUID / empty `dispositions` / empty `finding_id` (caught locally), `validation_failed` (400), `upkeep_verdict_invalid` (400), `run_token_forbidden` (403), `operator_agent_forbidden` (403), `insufficient_scope` (403), `run_not_found` (404), `upkeep_report_absent` (409), `upkeep_window_closed` (409), `upkeep_report_superseded` (409), `upkeep_finding_unknown` (422), `upkeep_dispositions_unconfigured` (503).
+
 ## Run-branch reset (`fishhawk_reset_run_branch`)
 
 `fishhawk_reset_run_branch` ([ADR-035](https://github.com/kuhlman-labs/fishhawk/issues/857) / [#867](https://github.com/kuhlman-labs/fishhawk/issues/867)) is the **destructive, operator-gated** remediation for a foreign commit pushed **ON TOP** of a run's own commits on the open PR branch. It force-rewinds the run/PR branch back to its **last run-authored HEAD** (the newest commit attributable to the run's reported-head ledger), dropping the on-top foreign commit, then re-parks the review gate so CI + the merge reconciler re-evaluate the rewound head. It wraps `POST /v0/runs/{run_id}/reset-branch`.

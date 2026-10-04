@@ -63,7 +63,7 @@ _Generated from the canonical sources by `scripts/gen-site-reference`; do not ed
 
 ## Operations
 
-The v0 REST API exposes **156 operations** across the paths below, generated from [`docs/api/v0.openapi.yaml`](https://github.com/kuhlman-labs/fishhawk/blob/main/docs/api/v0.openapi.yaml). That document is the source of truth; this table is its published rendering.
+The v0 REST API exposes **158 operations** across the paths below, generated from [`docs/api/v0.openapi.yaml`](https://github.com/kuhlman-labs/fishhawk/blob/main/docs/api/v0.openapi.yaml). That document is the source of truth; this table is its published rendering.
 
 | Method | Path | Summary |
 |---|---|---|
@@ -108,6 +108,8 @@ The v0 REST API exposes **156 operations** across the paths below, generated fro
 | `POST` | `/v0/runs/{run_id}/merge` | Record an operator merge verdict and queue the squash merge (skipped when already merged) |
 | `POST` | `/v0/runs/{run_id}/grooming-dispositions` | Record per-entry grooming dispositions (operator-only) |
 | `GET` | `/v0/runs/{run_id}/grooming-dispositions` | Read back the recorded grooming dispositions for a run |
+| `POST` | `/v0/runs/{run_id}/upkeep-dispositions` | Record per-finding upkeep dispositions (captain-only) |
+| `GET` | `/v0/runs/{run_id}/upkeep-dispositions` | Read back the recorded upkeep dispositions for a run |
 | `POST` | `/v0/runs/{run_id}/acceptance-arbitration` | Record the operator arbitration that discharges a paged acceptance triage |
 | `POST` | `/v0/runs/{run_id}/auto-drive` | Drive the run's parked gate under ADR-040 delegation |
 | `POST` | `/v0/runs/{run_id}/auto-drive/acts` | Record a driver stage dispatch (record-before-dispatch) |

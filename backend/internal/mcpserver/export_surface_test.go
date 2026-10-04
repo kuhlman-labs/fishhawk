@@ -254,6 +254,7 @@ var exportBaseline = []string{
 	// exported for the SDK's jsonschema reflection like every DTO.
 	"ListSchedulesInput",
 	"ListSchedulesOutput",
+	"ListUpkeepDispositionsOutput",
 	"ListScopeAmendmentsInput",
 	"ListScopeAmendmentsOutput",
 	// E45.88 / #3623: the client wire mirror of the `observation` object on
@@ -346,7 +347,10 @@ var exportBaseline = []string{
 	"RecordMergeObservationObservation",
 	"RecordMergeObservationOutput",
 	"RecordMergeObservationResult",
+	"RecordUpkeepDispositionsInput",
+	"RecordUpkeepDispositionsOutput",
 	"RecordedGroomingDisposition",
+	"RecordedUpkeepDisposition",
 	"RecoverExemptPath",
 	"RecoverRunParams",
 	"RecoverScopePath",
@@ -454,6 +458,11 @@ var exportBaseline = []string{
 	"SurfaceSweepFinding",
 	"TestSweep",
 	"TestSweepFinding",
+	// #3923: fishhawk_record_upkeep_dispositions' I/O structs and the nested
+	// per-finding entry (UpkeepDispositionEntry), plus the ListUpkeep*/
+	// RecordUpkeep*/RecordedUpkeep* names above. Exported for the same
+	// SDK-reflection reason as the grooming-dispositions sibling.
+	"UpkeepDispositionEntry",
 	// E45.65 / #3579: the fishhawk_validate tool's I/O structs. Exported for
 	// the same SDK-reflection reason as every other tool I/O type here.
 	"ValidateSpecDiagnostic",

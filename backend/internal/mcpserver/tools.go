@@ -318,6 +318,7 @@ func registerTools(srv *mcp.Server, resolver *runResolver) {
 	registerDeferConcern(srv, resolver)
 	registerAnswerDivergence(srv, resolver)
 	registerRecordGroomingDispositions(srv, resolver)
+	registerRecordUpkeepDispositions(srv, resolver)
 	registerListScopeAmendments(srv, resolver)
 	registerDecideScopeAmendment(srv, resolver)
 	registerDecideScopeCompleteness(srv, resolver)
