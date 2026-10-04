@@ -3813,3 +3813,79 @@ func TestParentEpicAtChildCap(t *testing.T) {
 		})
 	}
 }
+
+// TestFileWorkItem_MalformedSourceRefsIs400 (#3774): the shared prelude refuses
+// a malformed source ref 400 validation_failed {field: source_refs, got} before
+// the conventions load, so nothing is filed and no forge round-trip happens.
+// With the prelude check removed, the request reaches prepareWorkItem's core
+// check and answers 422 work_item_invalid instead.
+func TestFileWorkItem_MalformedSourceRefsIs400(t *testing.T) {
+	fp := &fakeWorkProvider{}
+	registerFakeProvider(t, fp)
+	calls := installConventions(t, workmgmt.Default(), nil)
+	s := New(Config{})
+
+	rec := fileWorkItem(t, s, workItemRequest{
+		Repo:       "kuhlman-labs/fishhawk",
+		Type:       "chore",
+		Summary:    "Tidy up",
+		TitleVars:  map[string]string{"epic": "22", "n": "7"},
+		SourceRefs: []string{"abc"},
+	}, "github:operator")
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body=%s)", rec.Code, rec.Body.String())
+	}
+	var env errorEnvelope
+	_ = json.Unmarshal(rec.Body.Bytes(), &env)
+	if env.Error.Code != "validation_failed" || env.Error.Details["field"] != "source_refs" || env.Error.Details["got"] != "abc" {
+		t.Errorf("error = %+v, want validation_failed {field: source_refs, got: abc}", env.Error)
+	}
+	if *calls != 0 {
+		t.Errorf("conventions loaded %d times, want 0", *calls)
+	}
+	if fp.called {
+		t.Error("provider dispatched despite a malformed source ref")
+	}
+}
+
+// TestFileWorkItem_SourceRefsExcludedFromIntakeDuplicates (#3774) is the real
+// POST /v0/work-items path with source_refs on the wire: the declared source
+// #1234 is excluded from the 201's duplicates and reported as derives_from,
+// while the unrelated near-duplicate #1240 is still flagged — the wire field
+// reaches the intake hook through the prelude's FilingRequest mapping.
+func TestFileWorkItem_SourceRefsExcludedFromIntakeDuplicates(t *testing.T) {
+	p := igSourceRefProvider(t)
+	igInstallCharterConventions(t)
+	s := New(igCharterConfig(igCharterDoc, false))
+
+	rec := fileWorkItem(t, s, workItemRequest{
+		Repo:       "kuhlman-labs/fishhawk",
+		Type:       "chore",
+		Summary:    "Add the widget endpoint",
+		Body:       "A draft written from #1234.",
+		TitleVars:  map[string]string{"epic": "22", "n": "5"},
+		SourceRefs: []string{"#1234"},
+	}, "github:operator")
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
+	}
+	resp := decodeWorkItem(t, rec)
+	if resp.Intake == nil {
+		t.Fatalf("no intake on the 201 (body=%s)", rec.Body.String())
+	}
+	for _, d := range resp.Intake.Duplicates {
+		if d.Number == 1234 {
+			t.Fatalf("the declared source #1234 was reported as a duplicate: %+v", resp.Intake.Duplicates)
+		}
+	}
+	if len(resp.Intake.Duplicates) == 0 || resp.Intake.Duplicates[0].Number != 1240 {
+		t.Errorf("the unrelated near-duplicate #1240 must still be flagged, got %+v", resp.Intake.Duplicates)
+	}
+	if len(resp.Intake.DerivesFrom) != 1 || resp.Intake.DerivesFrom[0].Number != 1234 || !resp.Intake.DerivesFrom[0].InWindow {
+		t.Errorf("derives_from = %+v, want #1234 in_window", resp.Intake.DerivesFrom)
+	}
+	if !strings.Contains(p.captured.Item.Body, "**Derives from**") {
+		t.Errorf("the filed body does not render the Derives-from block:\n%s", p.captured.Item.Body)
+	}
+}

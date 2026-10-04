@@ -78,6 +78,12 @@ type workItemRequest struct {
 	Relations       *workItemRelations `json:"relations,omitempty"`
 	ExistingNumbers []int              `json:"existing_numbers,omitempty"`
 	RunID           string             `json:"run_id,omitempty"`
+	// SourceRefs are same-repo refs ('#N' or 'N') to the existing items this
+	// draft derives from (#3774). They map onto FilingRequest.SourceRefs: the
+	// intake hook excludes those items from the duplicate candidates and
+	// reports them as derives_from instead. A malformed ref is refused 400 by
+	// the prelude before any forge round-trip.
+	SourceRefs []string `json:"source_refs,omitempty"`
 }
 
 // workItemRelations mirrors workmgmt.Relations over the wire.
@@ -150,23 +156,105 @@ type workItemResponse struct {
 // closed with a typed error naming the missing provider — never a nil
 // dispatch.
 func (s *Server) handleFileWorkItem(w http.ResponseWriter, r *http.Request) {
+	rq, ok := s.resolveWorkItemRequest(w, r, false)
+	if !ok {
+		return
+	}
+
+	item, created, werr, signals := s.applyAndFileWorkItemWithIntake(r.Context(), rq.filing, rq.conv, rq.target, rq.owner, rq.name)
+	if werr != nil {
+		s.writeError(w, r, werr.status, werr.code, werr.msg, werr.details)
+		return
+	}
+
+	audited := s.auditWorkItemFiling(r, rq.activeRun, *item, created, rq.id.Subject, signals)
+
+	s.writeJSON(w, r, http.StatusCreated, workItemResponse{
+		Type:                   item.Type,
+		Title:                  item.Title,
+		Number:                 created.Number,
+		URL:                    created.URL,
+		Provider:               created.Provider,
+		AppliedLabels:          created.AppliedLabels,
+		Complexity:             item.Classification.Complexity,
+		Status:                 created.Status,
+		BoardColumn:            created.BoardColumn,
+		Boarded:                created.Boarded,
+		EpicLinked:             created.EpicLinked,
+		BoardingError:          created.BoardingError,
+		EpicLinkError:          created.EpicLinkError,
+		Audited:                audited,
+		DefaultedLabels:        item.Classification.DefaultedLabels,
+		MissingLabelNamespaces: item.Classification.MissingLabelNamespaces,
+		Intake:                 signals,
+	})
+}
+
+// resolvedWorkItem is what the shared work-item request prelude hands its
+// handler: the authenticated caller, the decoded FilingRequest, the repo's
+// conventions, the resolved provider Target (installation scope included) and
+// the entitlement-checked active run (nil on the run-absent path).
+type resolvedWorkItem struct {
+	id        Identity
+	filing    workmgmt.FilingRequest
+	conv      workmgmt.Conventions
+	target    workmgmt.Target
+	owner     string
+	name      string
+	activeRun *run.Run
+}
+
+// resolveWorkItemRequest is the request prelude POST /v0/work-items and POST
+// /v0/work-items/preview share (#3774): auth, the body cap, the
+// DisallowUnknownFields decode, repo/type/summary/source_refs validation, the
+// conventions load, the run_id entitlement and run-to-repo checks, the
+// run-bound run-absent gate and GitHub installation resolution — so a preview
+// resolves EXACTLY the filing a POST would, with the same status codes in the
+// same order. It writes the error envelope itself and returns ok=false on any
+// refusal.
+//
+// preview=true adds three refusals, in this order: (a) a run-bound
+// (mcp:run:<uuid>) identity is 403 preview_operator_only right after the
+// anonymous check, before the body is read; (b) a non-empty run_id is 400
+// validation_failed {field: run_id}, because a preview writes no audit; (c)
+// the repo is held to the point-read visibility DENY (403 repo_forbidden) as
+// soon as it parses. Everything else is shared verbatim.
+func (s *Server) resolveWorkItemRequest(w http.ResponseWriter, r *http.Request, preview bool) (*resolvedWorkItem, bool) {
 	id := IdentityFrom(r.Context())
 	if id.IsAnonymous() {
+		verb := "filing"
+		if preview {
+			verb = "previewing"
+		}
 		s.writeError(w, r, http.StatusUnauthorized, "authentication_required",
-			"filing a work item requires an authenticated caller", nil)
-		return
+			verb+" a work item requires an authenticated caller", nil)
+		return nil, false
+	}
+	// PREVIEW (a): operator-only, refused BEFORE the body is read, so a
+	// run-bound agent token reaches no tracker read at all. A preview reads the
+	// target repo's titles (the duplicate window) without filing anything, and
+	// ADR-064 decision 3 exposes no board read to agents through the MCP
+	// surface. This is the posture the MCP gate defers to: fishhawk_preview_issue
+	// is mcpScopeAuthenticatedOnly and THIS is where a run-bound bearer stops.
+	if preview {
+		if _, runBound := runBoundTokenRunID(id); runBound {
+			s.writeError(w, r, http.StatusForbidden, "preview_operator_only",
+				"previewing a work item is operator-only; a run-bound agent token files through POST /v0/work-items with its own run_id",
+				nil)
+			return nil, false
+		}
 	}
 
 	raw, err := io.ReadAll(io.LimitReader(r.Body, maxWorkItemRequestBytes+1))
 	if err != nil {
 		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
 			"could not read request body", map[string]any{"error": err.Error()})
-		return
+		return nil, false
 	}
 	if len(raw) > maxWorkItemRequestBytes {
 		s.writeError(w, r, http.StatusRequestEntityTooLarge, "body_too_large",
 			"request body exceeds size cap", map[string]any{"limit_bytes": maxWorkItemRequestBytes})
-		return
+		return nil, false
 	}
 
 	var req workItemRequest
@@ -176,7 +264,16 @@ func (s *Server) handleFileWorkItem(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
 			"request body is not valid JSON for a work-item filing",
 			map[string]any{"error": err.Error()})
-		return
+		return nil, false
+	}
+	// PREVIEW (b): a preview writes no audit and is not run-scoped, so a run_id
+	// has nothing to drive. Refused rather than ignored, so a caller that
+	// expected a run-scoped side effect learns it will not happen.
+	if preview && strings.TrimSpace(req.RunID) != "" {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			"run_id is not accepted by a preview: a preview writes no audit and is not run-scoped",
+			map[string]any{"field": "run_id", "got": req.RunID})
+		return nil, false
 	}
 
 	owner, name, ok := splitRepoFullName(req.Repo)
@@ -184,24 +281,45 @@ func (s *Server) handleFileWorkItem(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
 			"repo must be in owner/name form",
 			map[string]any{"field": "repo", "got": req.Repo})
-		return
+		return nil, false
+	}
+	// PREVIEW (c): the point-read repo-visibility DENY. A preview returns the
+	// repo's item titles inside its duplicate candidates, so it is a READ of the
+	// repo and gets the #1829 point-read posture (403 repo_forbidden) for a
+	// cookie session that cannot see it. Token callers and an unwired mirror
+	// pass through (repoFilterFor's nil filter), exactly as on every other read.
+	if preview && !s.enforceRepoVisibility(w, r, owner+"/"+name) {
+		return nil, false
 	}
 	if strings.TrimSpace(req.Type) == "" {
 		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
 			"type is required", map[string]any{"field": "type"})
-		return
+		return nil, false
 	}
 	if strings.TrimSpace(req.Summary) == "" {
 		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
 			"summary is required", map[string]any{"field": "summary"})
-		return
+		return nil, false
+	}
+	// source_refs are validated HERE, before the conventions load, so a
+	// malformed ref costs no forge round-trip. The filing core re-checks them
+	// (422) for the server-internal callers that never pass this prelude.
+	if _, err := intakegroom.ParseSourceRefs(req.SourceRefs); err != nil {
+		got := ""
+		var refErr *intakegroom.SourceRefError
+		if errors.As(err, &refErr) {
+			got = refErr.Ref
+		}
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			err.Error(), map[string]any{"field": "source_refs", "got": got})
+		return nil, false
 	}
 
 	conv, err := conventionsLoader(r.Context(), req.Repo)
 	if err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 			"could not load work-management conventions", map[string]any{"error": err.Error()})
-		return
+		return nil, false
 	}
 
 	filing := workmgmt.FilingRequest{
@@ -214,6 +332,7 @@ func (s *Server) handleFileWorkItem(w http.ResponseWriter, r *http.Request) {
 		Complexity:      req.Complexity,
 		Status:          req.Status,
 		ExistingNumbers: req.ExistingNumbers,
+		SourceRefs:      req.SourceRefs,
 	}
 	if req.Relations != nil {
 		filing.Relations = workmgmt.Relations{
@@ -239,7 +358,7 @@ func (s *Server) handleFileWorkItem(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
 				"run_id must be a valid UUID",
 				map[string]any{"field": "run_id", "got": req.RunID})
-			return
+			return nil, false
 		}
 		// (1) Caller-to-run entitlement (#1005 fix-up). A work_item_filed
 		// audit entry may only be written onto a run by that run's own
@@ -259,18 +378,18 @@ func (s *Server) handleFileWorkItem(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, r, http.StatusForbidden, "run_not_entitled",
 				"run_id may only be supplied by that run's own run-bound agent token",
 				map[string]any{"run_id": runID.String()})
-			return
+			return nil, false
 		}
 		if s.cfg.RunRepo == nil {
 			s.writeError(w, r, http.StatusServiceUnavailable, "run_lookup_unconfigured",
 				"run_id supplied but no run repository is configured", nil)
-			return
+			return nil, false
 		}
 		rn, gerr := s.cfg.RunRepo.GetRun(r.Context(), runID)
 		if gerr != nil {
 			s.writeError(w, r, http.StatusNotFound, "run_not_found",
 				"run does not exist", map[string]any{"run_id": runID.String()})
-			return
+			return nil, false
 		}
 		// (2) Run-to-repo consistency (#1005 fix-up). Defense in depth: the
 		// run the caller is entitled to must also be the run for the filing
@@ -280,7 +399,7 @@ func (s *Server) handleFileWorkItem(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, r, http.StatusForbidden, "run_repo_mismatch",
 				"run_id belongs to a different repository than the filing target",
 				map[string]any{"run_repo": rn.Repo, "requested_repo": owner + "/" + name})
-			return
+			return nil, false
 		}
 		activeRun = rn
 	}
@@ -324,7 +443,7 @@ func (s *Server) handleFileWorkItem(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, r, http.StatusForbidden, "run_scoped_filing_required",
 				"a run-bound agent token must file through the run-scoped path (supply its own run_id); the run-absent filing path is operator-only",
 				nil)
-			return
+			return nil, false
 		}
 	}
 	// The GitHub installation-resolution branch is forge-optional: it runs ONLY
@@ -348,38 +467,20 @@ func (s *Server) handleFileWorkItem(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, r, http.StatusBadGateway, "work_item_filing_failed",
 				"could not resolve the GitHub App installation for the target repo",
 				map[string]any{"error": rerr.Error()})
-			return
+			return nil, false
 		}
 		target.Scope = scope
 	}
 
-	item, created, werr, signals := s.applyAndFileWorkItemWithIntake(r.Context(), filing, conv, target, owner, name)
-	if werr != nil {
-		s.writeError(w, r, werr.status, werr.code, werr.msg, werr.details)
-		return
-	}
-
-	audited := s.auditWorkItemFiling(r, activeRun, *item, created, id.Subject, signals)
-
-	s.writeJSON(w, r, http.StatusCreated, workItemResponse{
-		Type:                   item.Type,
-		Title:                  item.Title,
-		Number:                 created.Number,
-		URL:                    created.URL,
-		Provider:               created.Provider,
-		AppliedLabels:          created.AppliedLabels,
-		Complexity:             item.Classification.Complexity,
-		Status:                 created.Status,
-		BoardColumn:            created.BoardColumn,
-		Boarded:                created.Boarded,
-		EpicLinked:             created.EpicLinked,
-		BoardingError:          created.BoardingError,
-		EpicLinkError:          created.EpicLinkError,
-		Audited:                audited,
-		DefaultedLabels:        item.Classification.DefaultedLabels,
-		MissingLabelNamespaces: item.Classification.MissingLabelNamespaces,
-		Intake:                 signals,
-	})
+	return &resolvedWorkItem{
+		id:        id,
+		filing:    filing,
+		conv:      conv,
+		target:    target,
+		owner:     owner,
+		name:      name,
+		activeRun: activeRun,
+	}, true
 }
 
 // workItemError carries one failure branch of the work-item filing
@@ -431,7 +532,111 @@ func (s *Server) applyAndFileWorkItem(ctx context.Context, filing workmgmt.Filin
 // the returned Signals back. That is the shared-core claim, and
 // TestDeferConcern_IntakeSignalsRenderedThroughSharedCore pins it behaviourally
 // through one of those secondary paths (binding approval condition L5).
+//
+// Since #3774 it is prepareWorkItem (every pre-File step) followed by the File
+// tail below; previewWorkItem shares the first half and never runs the second.
 func (s *Server) applyAndFileWorkItemWithIntake(ctx context.Context, filing workmgmt.FilingRequest, conv workmgmt.Conventions, target workmgmt.Target, owner, name string) (*workmgmt.WorkItem, *workmgmt.CreatedItem, *workItemError, *intakegroom.Signals) {
+	// prepareWorkItem self-releases on its own error paths; on success the
+	// locks it took are still held, and deferring release here keeps them held
+	// across File exactly as the two inline defers did before the split.
+	prep, release, werr := s.prepareWorkItem(ctx, filing, conv, target, owner, name)
+	if werr != nil {
+		return nil, nil, werr, nil
+	}
+	defer release()
+	item, number, provider, signals := prep.item, prep.number, prep.provider, prep.signals
+
+	created, err := provider.File(ctx, workmgmt.ProviderRequest{
+		Item:   item,
+		Number: number,
+		Target: target,
+	})
+	if err != nil {
+		return nil, nil, &workItemError{
+			status: http.StatusBadGateway, code: "work_item_filing_failed",
+			msg:     "provider could not file the work item",
+			details: map[string]any{"error": err.Error()},
+		}, nil
+	}
+
+	// A best-effort boarding/epic-link failure stays VISIBLE: WARN-log the
+	// cause (repo + issue url/number + the wrapped placeOnBoard/linkEpic
+	// error) so a genuine org-project misconfig (e.g. a typo'd Status
+	// option) is diagnosable rather than silently swallowed (#1107). The
+	// issue itself was created, so this is not a filing failure.
+	if created.BoardingError != "" || created.EpicLinkError != "" {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "work item filed but enrichment incomplete",
+			slog.String("repo", owner+"/"+name),
+			slog.String("issue_url", created.URL),
+			slog.Int("issue_number", created.Number),
+			slog.String("boarding_error", created.BoardingError),
+			slog.String("epic_link_error", created.EpicLinkError),
+		)
+	}
+
+	return &item, created, nil, &signals
+}
+
+// preparedWorkItem is everything prepareWorkItem resolves for one filing: the
+// rendered item exactly as provider.File would receive it (advisory section
+// included), the allocated sequential number (0 when the type is not
+// numbered), the resolved provider and the intake signals.
+type preparedWorkItem struct {
+	item     workmgmt.WorkItem
+	number   int
+	provider workmgmt.Provider
+	signals  intakegroom.Signals
+}
+
+// prepareWorkItem runs every step of the filing core BEFORE provider.File
+// (#3774): the source_refs check, {epic}/{n} derivation, the parent-epic
+// capacity guard, area/phase derivation, sequential-number discovery,
+// workmgmt.Apply, provider resolution, the intake hook and RenderBody. It is
+// the half applyAndFileWorkItemWithIntake (which files) and previewWorkItem
+// (which never does) share, so a preview renders byte-for-byte what a filing
+// would send.
+//
+// LOCK-RELEASE CONTRACT. The child-number and sequential-number locks taken
+// here are the ones that must span File, so on SUCCESS they are still held and
+// handed back as release: non-nil, idempotent (sync.Once), runs the unlocks in
+// reverse acquisition order (sequential, then child) and is safe to call when
+// no lock was taken. On ERROR — and on a panic unwinding this frame — every
+// lock it took is released internally before it returns (a deferred release
+// keyed on a success flag), release is nil and the caller owes nothing.
+//
+// A malformed filing.SourceRefs is refused 422 work_item_invalid with
+// details.source_refs_invalid before any lock or I/O.
+func (s *Server) prepareWorkItem(ctx context.Context, filing workmgmt.FilingRequest, conv workmgmt.Conventions, target workmgmt.Target, owner, name string) (_ *preparedWorkItem, release func(), _ *workItemError) {
+	// source_refs are refused HERE, before any lock or I/O, so EVERY entry
+	// path — the server-internal callers that never pass the HTTP prelude
+	// included — is refused rather than silently losing the duplicate
+	// exclusion (intakeFilingFor drops a malformed list on the floor).
+	if _, err := intakegroom.ParseSourceRefs(filing.SourceRefs); err != nil {
+		return nil, nil, &workItemError{
+			status: http.StatusUnprocessableEntity, code: "work_item_invalid",
+			msg:     err.Error(),
+			details: map[string]any{"type": filing.Type, "source_refs_invalid": err.Error()},
+		}
+	}
+
+	// SELF-RELEASE. Every lock taken below is recorded in unlocks, in
+	// acquisition order. Until prepared flips true — on any error return AND on
+	// a panic unwinding this frame — the deferred func releases them all, in
+	// reverse order, so a caller never owes a release after an error. On
+	// success the same set is handed back as the idempotent release instead.
+	var unlocks []func()
+	releaseAll := func() {
+		for i := len(unlocks) - 1; i >= 0; i-- {
+			unlocks[i]()
+		}
+	}
+	prepared := false
+	defer func() {
+		if !prepared {
+			releaseAll()
+		}
+	}()
+
 	// Auto-derive the {epic} title placeholder from the parent_epic relation
 	// (#1184) before Apply renders the title, so a child type need only supply
 	// {n}. Fails closed (leaves epic unset) on every failure mode, so Apply's
@@ -447,13 +652,13 @@ func (s *Server) applyAndFileWorkItemWithIntake(ctx context.Context, filing work
 	// condition 1), so two concurrent omitted-n filings against the same epic
 	// serialize and allocate DISTINCT consecutive numbers. The lock is taken
 	// ONLY when {n} is discovered — an explicit-n caller returns a nil unlock
-	// and never contends. Deferred here so it releases after File below.
+	// and never contends. Recorded for release so it is held across File.
 	unlockChildNumber, capacityChecked, werr := s.deriveChildNumberTitleVar(ctx, &filing, conv, target)
 	if unlockChildNumber != nil {
-		defer unlockChildNumber()
+		unlocks = append(unlocks, unlockChildNumber)
 	}
 	if werr != nil {
-		return nil, nil, werr, nil
+		return nil, nil, werr
 	}
 
 	// Refuse a filing whose parent epic is already at the provider's hard child
@@ -466,7 +671,7 @@ func (s *Server) applyAndFileWorkItemWithIntake(ctx context.Context, filing work
 	// BEFORE Apply and therefore before File, so nothing is created.
 	if !capacityChecked {
 		if werr := s.guardParentEpicCapacity(ctx, filing, conv, target); werr != nil {
-			return nil, nil, werr, nil
+			return nil, nil, werr
 		}
 	}
 
@@ -502,8 +707,8 @@ func (s *Server) applyAndFileWorkItemWithIntake(ctx context.Context, filing work
 	// lock is taken ONLY when discovery runs — an explicit-existing_numbers
 	// caller, a non-sequential type, an unresolvable provider and a provider
 	// without the capability all return a nil unlock and never contend.
-	// Deferred BEFORE the error check so the discovery-success path holds it
-	// across Apply + File below and releases when this function returns. Both
+	// Recorded BEFORE the error check so the discovery-success path holds it
+	// across Apply + File and releases with the child lock. Both
 	// locks are acquired in one fixed order (child then sequential) at this
 	// single call site, so no lock-ordering cycle is reachable. Every filing
 	// path (HTTP handler, defer-concern, live-validation, refinement, split)
@@ -511,10 +716,10 @@ func (s *Server) applyAndFileWorkItemWithIntake(ctx context.Context, filing work
 	// serialization.
 	unlockSequentialNumber, werr := s.discoverExistingNumbers(ctx, &filing, conv, target)
 	if unlockSequentialNumber != nil {
-		defer unlockSequentialNumber()
+		unlocks = append(unlocks, unlockSequentialNumber)
 	}
 	if werr != nil {
-		return nil, nil, werr, nil
+		return nil, nil, werr
 	}
 
 	item, number, err := workmgmt.Apply(filing, conv)
@@ -532,13 +737,13 @@ func (s *Server) applyAndFileWorkItemWithIntake(ctx context.Context, filing work
 			return nil, nil, &workItemError{
 				status: http.StatusUnprocessableEntity, code: "work_item_invalid",
 				msg: sem.Error(), details: details,
-			}, nil
+			}
 		}
 		return nil, nil, &workItemError{
 			status: http.StatusInternalServerError, code: "internal_error",
 			msg:     "could not apply work-management conventions",
 			details: map[string]any{"error": err.Error()},
-		}, nil
+		}
 	}
 
 	// The handler-derived area labels are system-added (the caller did not
@@ -577,13 +782,13 @@ func (s *Server) applyAndFileWorkItemWithIntake(ctx context.Context, filing work
 				status: http.StatusNotImplemented, code: "provider_unimplemented",
 				msg:     unk.Error(),
 				details: map[string]any{"provider": unk.ID, "registered": unk.Known},
-			}, nil
+			}
 		}
 		return nil, nil, &workItemError{
 			status: http.StatusInternalServerError, code: "internal_error",
 			msg:     "could not resolve work-item provider",
 			details: map[string]any{"error": err.Error()},
-		}, nil
+		}
 	}
 
 	// INTAKE GROOM (#2239 / E54.7). Runs AFTER Apply — so it evaluates the
@@ -600,35 +805,10 @@ func (s *Server) applyAndFileWorkItemWithIntake(ctx context.Context, filing work
 	// #2239.
 	item.Body = intakegroom.RenderBody(item.Body, signals)
 
-	created, err := provider.File(ctx, workmgmt.ProviderRequest{
-		Item:   item,
-		Number: number,
-		Target: target,
-	})
-	if err != nil {
-		return nil, nil, &workItemError{
-			status: http.StatusBadGateway, code: "work_item_filing_failed",
-			msg:     "provider could not file the work item",
-			details: map[string]any{"error": err.Error()},
-		}, nil
-	}
-
-	// A best-effort boarding/epic-link failure stays VISIBLE: WARN-log the
-	// cause (repo + issue url/number + the wrapped placeOnBoard/linkEpic
-	// error) so a genuine org-project misconfig (e.g. a typo'd Status
-	// option) is diagnosable rather than silently swallowed (#1107). The
-	// issue itself was created, so this is not a filing failure.
-	if created.BoardingError != "" || created.EpicLinkError != "" {
-		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "work item filed but enrichment incomplete",
-			slog.String("repo", owner+"/"+name),
-			slog.String("issue_url", created.URL),
-			slog.Int("issue_number", created.Number),
-			slog.String("boarding_error", created.BoardingError),
-			slog.String("epic_link_error", created.EpicLinkError),
-		)
-	}
-
-	return &item, created, nil, &signals
+	prepared = true
+	var once sync.Once
+	return &preparedWorkItem{item: item, number: number, provider: provider, signals: signals},
+		func() { once.Do(releaseAll) }, nil
 }
 
 // discoverExistingNumbers fills filing.ExistingNumbers for a numbered type
@@ -680,7 +860,7 @@ func (*Server) discoverExistingNumbers(ctx context.Context, filing *workmgmt.Fil
 	}
 	provider, err := workmgmt.Get(conv.Provider)
 	if err != nil {
-		// Provider resolution failure is surfaced by applyAndFileWorkItem's own
+		// Provider resolution failure is surfaced by prepareWorkItem's own
 		// workmgmt.Get below (typed 501 / 500); leave it to that single mapping.
 		return nil, nil
 	}
@@ -911,7 +1091,7 @@ func childNumberLockKey(target workmgmt.Target, epicRef string) string {
 // binding concurrency condition, is the case where the per-epic lock is NOT
 // taken); Relations.ParentEpic is blank; TitleVars["epic"] is unresolved (epic
 // derivation already failed closed, so renderTitle's 422 covers both
-// placeholders); workmgmt.Get errors (applyAndFileWorkItem's own Get surfaces
+// placeholders); workmgmt.Get errors (prepareWorkItem's own Get surfaces
 // the typed 501/500); or the provider does not implement EpicChildrenQuerier
 // (fall through to Apply's missing-placeholder 422 unchanged).
 //

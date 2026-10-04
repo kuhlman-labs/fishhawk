@@ -90,6 +90,17 @@ func RenderBody(body string, s Signals) string {
 			d.Number, d.Title, d.Confidence, d.Score, state, basisOrNone(d.Basis))
 	}
 
+	// The Derives-from block renders only when the filer declared source
+	// refs; a filing without them keeps exactly the section it had before.
+	if len(s.DerivesFrom) > 0 {
+		b.WriteString("\n**Derives from**\n")
+		b.WriteString(derivesFromNote)
+		b.WriteString("\n")
+		for _, d := range s.DerivesFrom {
+			b.WriteString(derivesFromLine(d))
+		}
+	}
+
 	b.WriteString("\n**Parent epic suggestion**\n")
 	if s.EpicSuggestion == nil {
 		b.WriteString("- none\n")
@@ -126,6 +137,27 @@ func RenderBody(body string, s Signals) string {
 		return section
 	}
 	return strings.TrimRight(body, "\n") + "\n\n" + section
+}
+
+// derivesFromNote states, in the body itself, why a declared source item is
+// absent from the duplicate list above it.
+const derivesFromNote = "Declared as this item's sources; excluded from the duplicate candidates."
+
+// derivesFromLine renders one declared source item. An item outside the
+// scanned window is rendered number-only and says so, rather than implying
+// the tracker has no such item.
+func derivesFromLine(d SourceItem) string {
+	if !d.InWindow {
+		return fmt.Sprintf("- #%d (outside the scanned window)\n", d.Number)
+	}
+	line := fmt.Sprintf("- #%d", d.Number)
+	if d.Title != "" {
+		line += " " + d.Title
+	}
+	if d.Closed {
+		line += " (closed)"
+	}
+	return line + "\n"
 }
 
 // basisOrNone renders an empty shared-token basis explicitly rather than as
@@ -269,6 +301,18 @@ func validSignals(s Signals) bool {
 		if !validCandidateFields(e.Number, e.Title, e.Score, e.Confidence) {
 			return false
 		}
+	}
+	// DerivesFromWindow emits only positive tracker numbers and each at most
+	// once. A title is NOT required, even in-window: the window echoes the
+	// tracker's title verbatim, and an untitled tracker item is a real (if
+	// odd) source the writer can emit — requiring one here would make
+	// ParseBody reject a marker this package wrote.
+	seen := make(map[int]bool, len(s.DerivesFrom))
+	for _, d := range s.DerivesFrom {
+		if d.Number <= 0 || seen[d.Number] {
+			return false
+		}
+		seen[d.Number] = true
 	}
 	return true
 }

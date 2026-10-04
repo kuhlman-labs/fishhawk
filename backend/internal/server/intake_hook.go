@@ -185,7 +185,14 @@ func (s *Server) runIntakeGroom(ctx context.Context, conv workmgmt.Conventions, 
 		// filed body stays byte-identical. A charter resolved alongside a
 		// failed scan is therefore read but not used: scoring on a partial
 		// window is deliberately out of scope.
-		return intakegroom.Degrade(candidateReason)
+		//
+		// The declared provenance still rides along, number-only (no window to
+		// resolve it against): derives_from echoes what the filer declared
+		// rather than anything the scan found, so a degraded filing or preview
+		// still reports it. It is not a finding, so the body is unaffected.
+		degraded := intakegroom.Degrade(candidateReason)
+		degraded.DerivesFrom = intakegroom.DerivesFromWindow(filing, nil)
+		return degraded
 	}
 
 	sig = intakegroom.Evaluate(filing, candidates, charter)
@@ -423,6 +430,13 @@ func (s *Server) logIntakeDegrade(ctx context.Context, target workmgmt.Target, r
 // intakeFilingFor adapts the applied work item into intakegroom's own input
 // vocabulary. The adaptation lives HERE, at the call site, which is what keeps
 // the derivation package free of any workmgmt import.
+//
+// filing.SourceRefs is parsed into Filing.SourceNumbers, which is what makes
+// the duplicate scan exclude the draft's own source items. A parse error
+// yields NO source numbers here — this adapter is total, like the hook it
+// feeds. That is safe only because malformed refs are refused BEFORE this
+// point on every entry path (the filing core's source_refs validation, #3774
+// slice 1); this branch is not where a malformed ref is meant to be caught.
 func intakeFilingFor(filing workmgmt.FilingRequest, item workmgmt.WorkItem) intakegroom.Filing {
 	f := intakegroom.Filing{
 		Title:                  item.Title,
@@ -434,6 +448,9 @@ func intakeFilingFor(filing workmgmt.FilingRequest, item workmgmt.WorkItem) inta
 	}
 	f.ParentEpicRef = strings.TrimSpace(filing.Relations.ParentEpic)
 	f.DependsOn = filing.Relations.DependsOn
+	if numbers, err := intakegroom.ParseSourceRefs(filing.SourceRefs); err == nil {
+		f.SourceNumbers = numbers
+	}
 	return f
 }
 
@@ -470,6 +487,17 @@ func intakeAuditSummary(s intakegroom.Signals) map[string]any {
 			ids = append(ids, c.RubricID)
 		}
 		out["cited_rubric_ids"] = ids
+	}
+	// The declared source items, numbers only (#3774): a key inside the
+	// existing work_item_filed payload, not a new audit category. Present only
+	// when the filer declared source refs, so an ordinary filing's payload is
+	// unchanged.
+	if len(s.DerivesFrom) > 0 {
+		numbers := make([]int, 0, len(s.DerivesFrom))
+		for _, d := range s.DerivesFrom {
+			numbers = append(numbers, d.Number)
+		}
+		out["derives_from"] = numbers
 	}
 	return out
 }
