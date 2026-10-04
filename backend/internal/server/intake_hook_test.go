@@ -1626,6 +1626,13 @@ func TestIntakeHook_AuditCarriesIntakeSummary(t *testing.T) {
 	if intake["cited_rubric_ids"] == nil {
 		t.Errorf("intake summary missing cited_rubric_ids: %v", intake)
 	}
+	// #3774: derives_from is a key inside this same payload, present only when
+	// the filer declared source refs, so an ordinary filing's summary is
+	// unchanged. (The populated case is pinned on the shared core's returned
+	// signals by TestIntakeHook_SourceRefsExcludedFromDuplicates.)
+	if _, present := intake["derives_from"]; present {
+		t.Errorf("an ordinary filing's intake summary carries derives_from: %v", intake)
+	}
 }
 
 // TestDeferConcern_IntakeSignalsRenderedThroughSharedCore is binding approval
@@ -1684,5 +1691,175 @@ func TestDeferConcern_IntakeSignalsRenderedThroughSharedCore(t *testing.T) {
 	}
 	if parsed.Degraded {
 		t.Errorf("defer-path grooming degraded (%s), want a healthy hook", parsed.DegradeReason)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Source refs (#3774 / E81.4): a draft's own source items are excluded from its
+// duplicate candidates and reported as derives_from instead.
+// ---------------------------------------------------------------------------
+
+// igSourceRefProvider is a reader whose window holds the draft's SOURCE item
+// #1234 (a near-identical title whose body differs from the draft's, so the
+// self-match guard cannot be what keeps it out), an UNRELATED near-duplicate
+// #1240, and an epic candidate.
+func igSourceRefProvider(t *testing.T) *igReadProvider {
+	t.Helper()
+	p := &igReadProvider{
+		items: []workmgmt.WorkItemRecord{
+			{Number: 1234, Title: "[E22.4] Add the widget endpoint", Body: "the source item's own body", URL: "https://example.test/1234", Labels: []string{"type:chore", "area:backend"}},
+			{Number: 1240, Title: "Widget endpoint pagination", URL: "https://example.test/1240", Labels: []string{"type:chore"}},
+			{Number: 22, Title: "[E22] Widget platform", URL: "https://example.test/22", Labels: []string{"epic", "area:backend"}},
+		},
+	}
+	igRegisterReadProvider(t, p)
+	return p
+}
+
+// igApplyWithSourceRefs drives the SHARED filing core directly — the path every
+// filing entry point reaches — with FilingRequest.SourceRefs set, and returns
+// the signals the hook derived. It goes below the HTTP handler deliberately:
+// this slice threads SourceRefs from the FilingRequest into the hook, and the
+// wire field that fills it from a request body is the filing prelude's.
+func igApplyWithSourceRefs(t *testing.T, s *Server, refs []string) *intakegroom.Signals {
+	t.Helper()
+	conv := workmgmt.Default()
+	conv.Charter = &workmgmt.Charter{Path: igCharterPath}
+	target := workmgmt.Target{
+		Repo:    workmgmt.Repo{Owner: "kuhlman-labs", Name: "fishhawk"},
+		Project: conv.Project,
+	}
+	_, created, werr, signals := s.applyAndFileWorkItemWithIntake(context.Background(), workmgmt.FilingRequest{
+		Type:       "chore",
+		Summary:    "Add the widget endpoint",
+		Body:       "A draft written from #1234.",
+		TitleVars:  map[string]string{"epic": "22", "n": "5"},
+		SourceRefs: refs,
+	}, conv, target, "kuhlman-labs", "fishhawk")
+	if werr != nil {
+		t.Fatalf("filing core refused: %d %s %s", werr.status, werr.code, werr.msg)
+	}
+	if created == nil || signals == nil {
+		t.Fatalf("filing core returned created=%v signals=%v, want both", created, signals)
+	}
+	return signals
+}
+
+// TestIntakeHook_SourceRefsExcludedFromDuplicates is the server-side vehicle
+// for the SourceRefs -> Filing.SourceNumbers threading in intakeFilingFor:
+// with it deleted, #1234 is scored like any other candidate and is reported as
+// the draft's top duplicate.
+func TestIntakeHook_SourceRefsExcludedFromDuplicates(t *testing.T) {
+	p := igSourceRefProvider(t)
+	s := New(igCharterConfig(igCharterDoc, false))
+
+	signals := igApplyWithSourceRefs(t, s, []string{"#1234"})
+
+	if signals.Degraded {
+		t.Fatalf("intake degraded (%s), want a healthy hook", signals.DegradeReason)
+	}
+	for _, d := range signals.Duplicates {
+		if d.Number == 1234 {
+			t.Fatalf("the declared source #1234 was reported as a duplicate: %+v", signals.Duplicates)
+		}
+	}
+	if len(signals.Duplicates) == 0 || signals.Duplicates[0].Number != 1240 {
+		t.Errorf("the unrelated near-duplicate #1240 must still be reported, got %+v", signals.Duplicates)
+	}
+	want := intakegroom.SourceItem{Number: 1234, Title: "[E22.4] Add the widget endpoint", URL: "https://example.test/1234", InWindow: true}
+	if len(signals.DerivesFrom) != 1 || signals.DerivesFrom[0] != want {
+		t.Fatalf("derives_from = %+v, want [%+v]", signals.DerivesFrom, want)
+	}
+
+	// The body the PROVIDER received renders the block and a marker that
+	// round-trips with derives_from intact.
+	if !p.called {
+		t.Fatal("provider was not called")
+	}
+	body := p.captured.Item.Body
+	for _, frag := range []string{"**Derives from**", "- #1234 [E22.4] Add the widget endpoint\n"} {
+		if !strings.Contains(body, frag) {
+			t.Errorf("filed body is missing %q:\n%s", frag, body)
+		}
+	}
+	parsed, ok := intakegroom.ParseBody(body)
+	if !ok {
+		t.Fatalf("hidden marker did not round-trip out of the filed body:\n%s", body)
+	}
+	if len(parsed.DerivesFrom) != 1 || parsed.DerivesFrom[0] != want {
+		t.Errorf("marker derives_from = %+v, want [%+v]", parsed.DerivesFrom, want)
+	}
+
+	// The work_item_filed audit summary carries the source numbers.
+	if got, ok := intakeAuditSummary(*signals)["derives_from"].([]int); !ok || len(got) != 1 || got[0] != 1234 {
+		t.Errorf("audit summary derives_from = %v, want [1234]", intakeAuditSummary(*signals)["derives_from"])
+	}
+
+	// Control: the SAME filing without source refs reports #1234 as its top
+	// duplicate — so the exclusion above is the refs' doing, not the fixture's.
+	p2 := igSourceRefProvider(t)
+	without := igApplyWithSourceRefs(t, New(igCharterConfig(igCharterDoc, false)), nil)
+	if len(without.Duplicates) == 0 || without.Duplicates[0].Number != 1234 {
+		t.Fatalf("control: without source refs #1234 must be the top duplicate, got %+v", without.Duplicates)
+	}
+	if without.DerivesFrom != nil || strings.Contains(p2.captured.Item.Body, "**Derives from**") {
+		t.Errorf("control: a filing without source refs reports derives_from %+v", without.DerivesFrom)
+	}
+	if _, present := intakeAuditSummary(*without)["derives_from"]; present {
+		t.Error("control: an ordinary filing's audit summary gained a derives_from key")
+	}
+}
+
+// TestIntakeHook_DegradedScanStillReportsDerivesFrom pins the degraded-scan
+// branch: the scan failed, so nothing can be resolved against a window, but
+// the declared provenance is still reported (number-only, in_window false) and
+// the filed body stays byte-identical (derives_from is not a finding).
+func TestIntakeHook_DegradedScanStillReportsDerivesFrom(t *testing.T) {
+	p := &igReadProvider{listErr: errors.New("forge refused the read")}
+	igRegisterReadProvider(t, p)
+	cfg := igCharterConfig(igCharterDoc, false)
+	sink := igCaptureDegrades(&cfg)
+	s := New(cfg)
+
+	signals := igApplyWithSourceRefs(t, s, []string{"#1234", "77"})
+
+	if !signals.Degraded || signals.DegradeReason != intakegroom.DegradeReasonReaderError {
+		t.Fatalf("intake = degraded %v / %q, want reader_error", signals.Degraded, signals.DegradeReason)
+	}
+	igAssertDegradeLogged(t, sink, intakegroom.DegradeReasonReaderError)
+	want := []intakegroom.SourceItem{{Number: 1234}, {Number: 77}}
+	if len(signals.DerivesFrom) != len(want) || signals.DerivesFrom[0] != want[0] || signals.DerivesFrom[1] != want[1] {
+		t.Fatalf("degraded derives_from = %+v, want number-only %+v", signals.DerivesFrom, want)
+	}
+	if strings.Contains(p.captured.Item.Body, intakegroom.MarkerPrefix) || strings.Contains(p.captured.Item.Body, "**Derives from**") {
+		t.Errorf("a degraded filing's body changed:\n%s", p.captured.Item.Body)
+	}
+	summary := intakeAuditSummary(*signals)
+	if got, ok := summary["derives_from"].([]int); !ok || len(got) != 2 || got[0] != 1234 || got[1] != 77 {
+		t.Errorf("degraded audit summary derives_from = %v, want [1234 77]", summary["derives_from"])
+	}
+	if summary["degrade_reason"] != string(intakegroom.DegradeReasonReaderError) {
+		t.Errorf("degraded audit summary lost its reason: %v", summary)
+	}
+}
+
+// TestIntakeFilingFor_MapsSourceRefs pins the adapter both ways: well-formed
+// refs become SourceNumbers, and a malformed list yields NONE (the adapter is
+// total, like the hook; refusing a malformed ref is the filing core's job).
+func TestIntakeFilingFor_MapsSourceRefs(t *testing.T) {
+	item := workmgmt.WorkItem{Title: "t", Body: "b"}
+
+	ok := intakeFilingFor(workmgmt.FilingRequest{SourceRefs: []string{"#12", " 7 ", "12"}}, item)
+	if len(ok.SourceNumbers) != 2 || ok.SourceNumbers[0] != 12 || ok.SourceNumbers[1] != 7 {
+		t.Errorf("SourceNumbers = %v, want [12 7]", ok.SourceNumbers)
+	}
+
+	bad := intakeFilingFor(workmgmt.FilingRequest{SourceRefs: []string{"#12", "o/r#3"}}, item)
+	if bad.SourceNumbers != nil {
+		t.Errorf("a malformed ref list must yield no source numbers, got %v", bad.SourceNumbers)
+	}
+
+	if none := intakeFilingFor(workmgmt.FilingRequest{}, item); none.SourceNumbers != nil {
+		t.Errorf("no refs must yield no source numbers, got %v", none.SourceNumbers)
 	}
 }

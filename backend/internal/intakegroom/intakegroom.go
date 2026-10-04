@@ -31,6 +31,8 @@
 package intakegroom
 
 import (
+	"fmt"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -207,6 +209,136 @@ type Filing struct {
 	// MissingLabelNamespaces are the conventions-required label namespaces
 	// the filing did not populate. Non-emptiness fires S4.
 	MissingLabelNamespaces []string
+	// SourceNumbers are the same-repo tracker numbers this draft DERIVES
+	// FROM, as the filer declared them (source_refs, parsed by
+	// ParseSourceRefs). Duplicates never reports one of them as a duplicate
+	// — a draft written from #X is not #X's duplicate — and Evaluate reports
+	// them as Signals.DerivesFrom instead. The epic suggestion is NOT
+	// affected: a source item may legitimately be the right parent.
+	SourceNumbers []int
+}
+
+// SourceItem is one item a filing declared it derives from, resolved against
+// the scanned window. It is provenance, not a finding: HasFindings ignores it,
+// so a degraded filing's body stays byte-identical.
+type SourceItem struct {
+	// Number is the source item's tracker number.
+	Number int `json:"number"`
+	// Title is the source item's title, empty when it was outside the
+	// scanned window (or the tracker returned an untitled item).
+	Title string `json:"title,omitempty"`
+	// URL is the source item's URL, empty when it was outside the window.
+	URL string `json:"url,omitempty"`
+	// Closed reports whether the source item is closed. Always false for an
+	// item outside the window — the state is unknown, not open.
+	Closed bool `json:"closed"`
+	// InWindow reports whether the source item was found in the scanned
+	// window, which is the only place Title/URL/Closed are read from.
+	InWindow bool `json:"in_window"`
+}
+
+// SourceRefError names the first malformed source ref ParseSourceRefs saw.
+// It is a typed error so a caller can echo the offending ref back to the
+// filer (the HTTP prelude's `got`) without parsing the message.
+type SourceRefError struct {
+	// Ref is the malformed ref exactly as supplied.
+	Ref string
+}
+
+func (e *SourceRefError) Error() string {
+	return fmt.Sprintf("source ref %q is not a same-repo issue reference: want '#N' or 'N' with N > 0", e.Ref)
+}
+
+// ParseSourceRefs parses a filing's declared source refs into tracker
+// numbers.
+//
+// Each ref is '#N' or 'N' with N a positive decimal integer, after trimming
+// surrounding whitespace. Numbers are deduped in first-seen order. Anything
+// else — empty, '#0', a sign, a non-digit, an 'owner/repo#N' cross-repo ref —
+// is MALFORMED and fails the whole list: the result is nil and a
+// *SourceRefError naming the first malformed ref. A cross-repo ref is refused
+// rather than ignored because the duplicate window only ever scans the target
+// repo, so honouring it would be a silent no-op. An empty list is nil, nil.
+func ParseSourceRefs(refs []string) ([]int, error) {
+	if len(refs) == 0 {
+		return nil, nil
+	}
+	seen := make(map[int]bool, len(refs))
+	out := make([]int, 0, len(refs))
+	for _, raw := range refs {
+		digits := strings.TrimPrefix(strings.TrimSpace(raw), "#")
+		n, ok := parsePositiveDecimal(digits)
+		if !ok {
+			return nil, &SourceRefError{Ref: raw}
+		}
+		if seen[n] {
+			continue
+		}
+		seen[n] = true
+		out = append(out, n)
+	}
+	return out, nil
+}
+
+// parsePositiveDecimal parses s as a positive base-10 integer made ONLY of
+// ASCII digits. strconv.Atoi alone would accept a leading sign ("+3"), which
+// is not a tracker reference.
+func parsePositiveDecimal(s string) (int, bool) {
+	if s == "" {
+		return 0, false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return 0, false
+		}
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil || n <= 0 {
+		return 0, false
+	}
+	return n, true
+}
+
+// DerivesFromWindow resolves f.SourceNumbers against the scanned window: a
+// number found among candidates carries that item's title, URL and closed
+// state with InWindow true; a number outside the window is emitted
+// number-only with InWindow false. A nil window (the degraded-scan path)
+// therefore still reports the provenance, number-only.
+//
+// It establishes the invariants validSignals checks on read-back by
+// construction — every entry's Number is positive and numbers are unique —
+// rather than trusting the Filing it was handed to have come through
+// ParseSourceRefs. It returns nil when there is nothing to report.
+func DerivesFromWindow(f Filing, candidates []Candidate) []SourceItem {
+	if len(f.SourceNumbers) == 0 {
+		return nil
+	}
+	byNumber := make(map[int]Candidate, len(candidates))
+	for _, c := range candidates {
+		if _, dup := byNumber[c.Number]; !dup {
+			byNumber[c.Number] = c
+		}
+	}
+	seen := make(map[int]bool, len(f.SourceNumbers))
+	out := make([]SourceItem, 0, len(f.SourceNumbers))
+	for _, n := range f.SourceNumbers {
+		if n <= 0 || seen[n] {
+			continue
+		}
+		seen[n] = true
+		item := SourceItem{Number: n}
+		if c, ok := byNumber[n]; ok {
+			item.Title = c.Title
+			item.URL = c.URL
+			item.Closed = c.Closed
+			item.InWindow = true
+		}
+		out = append(out, item)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // Charter is the repository's resolved charter, reduced to what scoring
@@ -307,6 +439,12 @@ type Signals struct {
 	// Duplicates are the possible duplicates, best first, at most
 	// MaxDuplicates.
 	Duplicates []DuplicateCandidate `json:"duplicates,omitempty"`
+	// DerivesFrom are the items the filing declared it derives from
+	// (Filing.SourceNumbers), resolved against the window. They are
+	// EXCLUDED from Duplicates and reported here instead. Provenance, not a
+	// finding: HasFindings deliberately ignores it. The field is additive and
+	// omitempty, so a marker without it is the same fishhawk-intake:v1 shape.
+	DerivesFrom []SourceItem `json:"derives_from,omitempty"`
 	// EpicSuggestion is the suggested parent epic, nil when the filing
 	// declared one or nothing scored above threshold.
 	EpicSuggestion *EpicSuggestion `json:"epic_suggestion,omitempty"`
@@ -335,6 +473,11 @@ type Signals struct {
 // because the reader was unavailable" onto every filed body would be noise
 // on a path whose promise is that a degraded hook is invisible. RenderBody
 // uses this to keep a degraded filing's body byte-identical to today's.
+//
+// DerivesFrom deliberately does NOT count either: it echoes what the filer
+// declared rather than anything grooming found, so a degraded filing that
+// declared source refs still files a byte-identical body (the refs reach the
+// caller through the returned Signals and the audit summary instead).
 func (s Signals) HasFindings() bool {
 	return len(s.Duplicates) > 0 || s.EpicSuggestion != nil || len(s.Score.Citations) > 0
 }
@@ -358,6 +501,7 @@ func Degrade(reason DegradeReason) Signals {
 func Evaluate(f Filing, candidates []Candidate, c Charter) Signals {
 	s := Signals{ScannedItems: len(candidates)}
 	s.Duplicates = Duplicates(f, candidates)
+	s.DerivesFrom = DerivesFromWindow(f, candidates)
 	if strings.TrimSpace(f.ParentEpicRef) == "" {
 		s.EpicSuggestion = SuggestEpic(f, candidates)
 	}

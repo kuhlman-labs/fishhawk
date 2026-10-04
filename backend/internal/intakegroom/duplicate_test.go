@@ -209,3 +209,64 @@ func TestJaccard_EmptyUnionIsZeroNotNaN(t *testing.T) {
 		})
 	}
 }
+
+// TestDuplicates_SourceRefsExcluded is the counterfactual vehicle for the
+// source exclusion in Duplicates (#3774, binding approval condition 5).
+//
+// The isolating fixture is source #1234: a NEAR-IDENTICAL title whose BODY
+// DIFFERS from the filing's, so the byte-identical self-match guard cannot be
+// what keeps it out. The test first proves that, with the exclusion bypassed
+// (the same filing without SourceNumbers), #1234 scores ABOVE the duplicate
+// threshold and is reported — so a RED with the exclusion deleted comes from
+// scoring, not from the self-match guard. The unrelated near-duplicate #1240
+// must still be reported with the exclusion in place.
+func TestDuplicates_SourceRefsExcluded(t *testing.T) {
+	filing := Filing{
+		Title:         "[E81.4] Intake preview exclude a draft's own source items",
+		Body:          "This draft was written from #1234's findings.",
+		Type:          "feature",
+		Labels:        []string{"type:feature"},
+		SourceNumbers: []int{1234},
+	}
+	source := Candidate{
+		Number: 1234,
+		Title:  "[E81.3] Intake preview exclude a draft's own source items",
+		Body:   "The source item's own, different body.",
+		Labels: []string{"type:feature"},
+		URL:    "u/1234",
+	}
+	unrelated := Candidate{
+		Number: 1240,
+		Title:  "Intake preview exclude own source items from scans",
+		URL:    "u/1240",
+	}
+
+	// Precondition: the fixture isolates the exclusion. The source's body
+	// differs (so the self-match guard does not apply) and, with the
+	// exclusion bypassed, it scores above the threshold and is reported.
+	if source.Body == filing.Body {
+		t.Fatal("fixture defect: the source body must differ from the filing body, or the self-match guard masks the exclusion")
+	}
+	bypassed := filing
+	bypassed.SourceNumbers = nil
+	var sourceScore float64
+	for _, d := range Duplicates(bypassed, []Candidate{source, unrelated}) {
+		if d.Number == source.Number {
+			sourceScore = d.Score
+		}
+	}
+	if sourceScore < ThresholdLow {
+		t.Fatalf("fixture defect: with the exclusion bypassed #1234 scores %.3f, want >= %.2f — the RED must come from scoring", sourceScore, ThresholdLow)
+	}
+
+	got := Duplicates(filing, []Candidate{source, unrelated})
+
+	for _, d := range got {
+		if d.Number == source.Number {
+			t.Fatalf("declared source #1234 (score %.3f without the exclusion) was reported as the draft's duplicate: %+v", sourceScore, got)
+		}
+	}
+	if len(got) != 1 || got[0].Number != unrelated.Number {
+		t.Fatalf("want only the unrelated near-duplicate #1240 reported, got %+v", got)
+	}
+}

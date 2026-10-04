@@ -296,3 +296,125 @@ func TestRenderBody_StatesTheNothingDestructivePosture(t *testing.T) {
 		t.Fatalf("the body must state the posture where its reader sees it:\n%s", got)
 	}
 }
+
+// derivesFromSignals is fullSignals carrying declared source items, one in the
+// window (closed), one outside it.
+func derivesFromSignals() Signals {
+	s := fullSignals()
+	s.DerivesFrom = []SourceItem{
+		{Number: 1234, Title: "[E22.4] Add the widget endpoint", URL: "https://example.test/1234", Closed: true, InWindow: true},
+		{Number: 77},
+	}
+	return s
+}
+
+func TestRenderBody_RendersTheDerivesFromBlockBetweenDuplicatesAndEpic(t *testing.T) {
+	rendered := RenderBody("Original body.\n", derivesFromSignals())
+
+	for _, want := range []string{
+		"**Derives from**\n" + derivesFromNote + "\n",
+		"- #1234 [E22.4] Add the widget endpoint (closed)\n",
+		"- #77 (outside the scanned window)\n",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Errorf("rendered section is missing %q:\n%s", want, rendered)
+		}
+	}
+	dup := strings.Index(rendered, "**Possible duplicates**")
+	derives := strings.Index(rendered, "**Derives from**")
+	epic := strings.Index(rendered, "**Parent epic suggestion**")
+	if dup < 0 || derives < 0 || epic < 0 || dup >= derives || derives >= epic {
+		t.Fatalf("want the Derives-from block between duplicates (%d) and the epic suggestion (%d), got %d:\n%s", dup, epic, derives, rendered)
+	}
+	if !strings.Contains(derivesFromNote, "excluded from the duplicate candidates") {
+		t.Errorf("the block must state the items were excluded from the duplicate candidates: %q", derivesFromNote)
+	}
+}
+
+func TestRenderBody_NoDerivesFromBlockWithoutSourceRefs(t *testing.T) {
+	if rendered := RenderBody("body", fullSignals()); strings.Contains(rendered, "**Derives from**") {
+		t.Fatalf("a filing without source refs must keep its pre-#3774 section:\n%s", rendered)
+	}
+}
+
+// TestRenderBody_DegradedDerivesFromOnlyIsAByteIdenticalNoOp pins that
+// derives_from is provenance, not a finding: a degraded filing that declared
+// source refs still files a byte-identical body.
+func TestRenderBody_DegradedDerivesFromOnlyIsAByteIdenticalNoOp(t *testing.T) {
+	s := Degrade(DegradeReasonReaderError)
+	s.DerivesFrom = []SourceItem{{Number: 1234}}
+	if got := RenderBody("body\n", s); got != "body\n" {
+		t.Fatalf("a degraded filing with only derives_from changed its body:\n%q", got)
+	}
+}
+
+// TestParseBody_RoundTripsDerivesFrom proves a real marker carrying
+// derives_from parses, with every field intact, while staying a v1 marker.
+func TestParseBody_RoundTripsDerivesFrom(t *testing.T) {
+	rendered := RenderBody("body", derivesFromSignals())
+	if !strings.Contains(rendered, MarkerPrefix) || !strings.Contains(rendered, `"derives_from":[`) {
+		t.Fatalf("the v1 marker does not carry derives_from:\n%s", rendered)
+	}
+
+	got, ok := ParseBody(rendered)
+	if !ok {
+		t.Fatalf("ParseBody rejected a marker this package wrote:\n%s", rendered)
+	}
+	wantJSON, _ := json.Marshal(derivesFromSignals())
+	gotJSON, _ := json.Marshal(got)
+	if string(gotJSON) != string(wantJSON) {
+		t.Fatalf("round trip lost derives_from data:\n got %s\nwant %s", gotJSON, wantJSON)
+	}
+}
+
+// TestParseBody_AcceptsAnInWindowSourceWithAnEmptyTitle is the writer/validator
+// agreement test (#3774, binding approval condition 4): an in-window source
+// candidate whose tracker title is EMPTY produces, through the real Evaluate ->
+// RenderBody path, a marker ParseBody accepts. A validator rule requiring an
+// in-window title would reject a marker this package wrote.
+func TestParseBody_AcceptsAnInWindowSourceWithAnEmptyTitle(t *testing.T) {
+	f := Filing{Title: "intake hook duplicate detection", Body: "draft body", SourceNumbers: []int{7}}
+	sig := Evaluate(f, []Candidate{{Number: 7, Title: "", URL: "u/7"}}, testCharter())
+	if len(sig.DerivesFrom) != 1 || !sig.DerivesFrom[0].InWindow || sig.DerivesFrom[0].Title != "" {
+		t.Fatalf("fixture defect: want one in-window, untitled source, got %+v", sig.DerivesFrom)
+	}
+
+	rendered := RenderBody("body", sig)
+	if !strings.Contains(rendered, "- #7\n") {
+		t.Errorf("an untitled in-window source renders as its bare number, got:\n%s", rendered)
+	}
+	got, ok := ParseBody(rendered)
+	if !ok {
+		t.Fatalf("ParseBody rejected a marker carrying an untitled in-window source:\n%s", rendered)
+	}
+	if len(got.DerivesFrom) != 1 || got.DerivesFrom[0].Number != 7 || !got.DerivesFrom[0].InWindow {
+		t.Fatalf("derives_from did not survive the round trip: %+v", got.DerivesFrom)
+	}
+}
+
+// TestParseBody_RejectsIncoherentDerivesFrom is the counterfactual vehicle for
+// validSignals' derives_from check. Each fixture is validPayload with a
+// derives_from list as its ONLY edit, and the well-formed control proves the
+// base with a coherent list parses — so a rejection is attributable to the
+// incoherence alone.
+func TestParseBody_RejectsIncoherentDerivesFrom(t *testing.T) {
+	withDerives := func(list string) string {
+		return mutate(validPayload, `"degraded":false`, `"derives_from":`+list+`,"degraded":false`)
+	}
+
+	if _, ok := ParseBody(markerBody(withDerives(`[{"number":5,"closed":false,"in_window":false}]`))); !ok {
+		t.Fatal("control: a coherent derives_from must parse")
+	}
+
+	for name, list := range map[string]string{
+		"zero number":       `[{"number":0,"closed":false,"in_window":false}]`,
+		"negative number":   `[{"number":-4,"closed":false,"in_window":false}]`,
+		"duplicated number": `[{"number":5,"closed":false,"in_window":false},{"number":5,"title":"t","closed":false,"in_window":true}]`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got, ok := ParseBody(markerBody(withDerives(list))); ok {
+				t.Fatalf("ParseBody accepted an incoherent derives_from %s as %+v", list, got)
+			}
+		})
+	}
+}
