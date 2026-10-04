@@ -58,3 +58,20 @@ Production construction sites, all converted:
 | `server/autodrive.go::evaluateRunDelegation` | observe-only — the auto-drive gate acts with no operator in the loop, so this is the site an unclamped evaluator would have hurt most |
 
 A resolver ERROR returns an error from `Evaluate`; each caller's existing degradation delegates nothing, so that mode is already fail-closed.
+
+## Shadow evaluation (ADR-085 rule 4 / E82.1 / #3778)
+
+`Evaluator.Shadow(ctx, runRow, wf, action)` answers what delegation WOULD have done for one action class on the run's current state. It is the input the server's blind delegation shadow stamp records at a human's action; this package only answers, the server capture and append live in `backend/internal/server`.
+
+- **Evaluated REGARDLESS of mode.** A `gated` (or `report`) class is evaluated exactly as if it were delegated. That is the counterfactual. `Shadow.Mode` / `Shadow.Source` record the class's actual resolved mode next to the answer.
+- **Same resolution as `checkDelegation`.** The campaign override is nil, as `checkDelegation` passes it. `checkDelegation` takes only `(run, action)` and no request-specific input such as selected concern ids or a target stage, so `Shadow` takes the same inputs and answers what the action-time check would. The escalation ceiling is applied LAST through the same resolver and `spec.ClampResolvedMatrix`, and the knob block is re-derived from the clamped matrix (so the fixup threshold still reads `min_severity`). A resolver error is RETURNED.
+- **One condition evaluator.** `Evaluate` and `Shadow` both answer a class through `evalClassCondition`. On the same state, `Evaluate` with the class `auto` and `Shadow` with the class `gated` agree on condition, met and the verbatim unmet reason (`TestShadow_ParityWithEvaluate`, all five classes, met + unmet each).
+- **`not_delegable` without evaluating:** an action with no delegable class (answered before any repository read), and a run parked at `awaiting_input` (where `Evaluate` delegates nothing). Deferral is one such action, but it is INTENTIONALLY UNSTAMPED in this change. #3778's proposal item 3 stamps non-delegable classes `not_delegable`; the operator accepted narrowing that for deferral, which is not a delegable action class, so the server hooks no deferral path at all. `Shadow("defer")` still answers `not_delegable` should a caller ask.
+- **Provenance with no matrix.** A v0/v1 knob block is projected the way a campaign override is (set knob → `auto`, unset → `gated`, both `explicit`), so a human acting on a class the knob block delegates is not stamped as gated. With no block at all, the class reads `gated` / `default`. `MatrixResolved`, `Tier` and `Matrix` are set only when a workflow-v2 matrix governs the run.
+- **Never folded into `Result`.** `Shadow` writes nothing and returns its own value; `Evaluate` never calls it. An all-gated matrix still yields zero `Actions` and zero `Reports` (`TestShadow_GatedClassNotInResult`).
+
+**Verdict vocabulary.** `ShadowVerdict` is ONE closed set, declared together here: `met`, `unmet`, `not_delegable`, `unevaluable` (`ShadowVerdicts()`, `Valid()`). `Shadow` returns only the first three. `unevaluable` is produced by the server capture when it cannot reach an answer (spec unreadable, repository failure, timeout), because `Shadow` returns an error rather than a verdict in those cases.
+
+**`Shadow` alone does NOT apply the `page_human_on` override.** Whether an active page event (a requirement-category concern, an unruled crew escalation, …) would have paged the human needs server-side state this package does not read. The server capture applies that override over `Shadow.MustPageHuman` and stamps `not_delegable` with the page event. A caller that uses `Shadow` directly and skips that step would record a met verdict for a run delegation would actually have paged on.
+
+The resolved-matrix hash a stamp carries is `delegationview.HashMatrix(Shadow.Matrix)`, the E76.1 wire mirror's digest (see `backend/internal/delegationview/README.md`).
