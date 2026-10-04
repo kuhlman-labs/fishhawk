@@ -121,13 +121,31 @@ func sharesNamespace(a, b []string, namespace string) bool {
 //
 // Ordering is score DESC then number ASC, so equal scores render in a stable
 // order rather than in map or provider order.
+//
+// SOURCE EXCLUSION. A candidate whose number is one of f.SourceNumbers is
+// skipped before it is scored: a draft derived from #X is never reported as
+// #X's duplicate (it shares #X's vocabulary BECAUSE it was written from it),
+// while an unrelated near-duplicate #Y is still reported. This is separate
+// from the self-match guard below, which only recognises the filing echoed
+// back byte-identically; a source item's body differs from the draft's, so
+// that guard alone would report it. Evaluate reports the excluded items as
+// Signals.DerivesFrom, so the exclusion is visible rather than silent.
 func Duplicates(f Filing, candidates []Candidate) []DuplicateCandidate {
 	ftokens := tokenize(f.Title)
 	if len(ftokens) == 0 {
 		return nil
 	}
+	sources := make(map[int]bool, len(f.SourceNumbers))
+	for _, n := range f.SourceNumbers {
+		sources[n] = true
+	}
 	out := make([]DuplicateCandidate, 0, len(candidates))
 	for _, c := range candidates {
+		// Source exclusion (see the doc comment): declared provenance, not a
+		// duplicate.
+		if sources[c.Number] {
+			continue
+		}
 		// Self-match guard: an item byte-identical to the filing in both
 		// title and body is the filing echoed back by the reader, not a
 		// duplicate of it. It requires a NON-EMPTY body deliberately —

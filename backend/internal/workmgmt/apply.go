@@ -65,6 +65,17 @@ type FilingRequest struct {
 	// it is STAMP-ONCE, so a caller Body that already carries the key is not
 	// double-marked.
 	IdempotencyKey string
+	// SourceRefs are caller-supplied refs ('#N' or 'N', same repo) to the
+	// existing items this draft DERIVES FROM (#3774, E81.4).
+	//
+	// Like IdempotencyKey it is ADDITIVE, but unlike it Apply NEVER reads
+	// it: the rendered title, body, labels and number are byte-identical
+	// with or without it. Its only consumer is the server's intake hook,
+	// which parses it (intakegroom.ParseSourceRefs) to exclude those items
+	// from the draft's duplicate candidates and report them as derives_from
+	// instead. It lives here only so it can ride the one FilingRequest every
+	// filing entry point already threads to that hook.
+	SourceRefs []string
 }
 
 // placeholderRE matches a `{name}` title_format placeholder.
