@@ -159,6 +159,73 @@ One chained audit row per persisted report:
 
 On success the stage settles to `awaiting_approval`.
 
+## Dispositions (`POST/GET /v0/runs/{run_id}/upkeep-dispositions`, #3923)
+
+The captain records a per-finding verdict. Body:
+`{dispositions:[{finding_id, verdict, authorize_delegation_tier?, parent_epic?}]}`,
+at most 200 entries (the `findings` maxItems). `verdict` is `approved` or
+`rejected`. `authorize_delegation_tier` is a BOOLEAN captain authorization for
+the finding's OWN proposed `autonomy:*` label; the #3924 apply consumes it. It is
+recorded verbatim and is inert when the finding proposes no tier label.
+`parent_epic` overrides the proposed issue's parent and is validated with rule
+(j). Both are refused on a `rejected` verdict. Each accepted entry is ONE
+`upkeep_disposition_recorded` row: `{run_id, stage_id, artifact_id,
+content_hash, finding_id, source, verdict, authorize_delegation_tier (always
+present), parent_epic (omitempty)}`, actor `user` plus the token subject.
+Repeats on one finding collapse last-wins by audit sequence, and both rows stay
+in the chain.
+
+**Binding rule.** Dispositions bind to the artifact named by the
+HIGHEST-sequence `upkeep_report_recorded` row on the run's chain, never to the
+newest artifact. That row is what settles the stage and carries the dedupe
+verdict the apply consumes. An artifact whose recorded row never landed is not
+bindable until an idempotent retry heals its row. The heal appends a new row, so
+a healed older report becomes current. An undecodable newest row, an unreadable
+artifact, a wrong kind or a parse failure is a 500, never a fallback to an older
+report. The #3924 apply resolves through the same function
+(`server.latestUpkeepReport`).
+
+**Capture guarantee.** A capture appends its whole batch in ONE transaction
+under the run-row lock. Inside that transaction it re-checks that its artifact is
+still named by the highest-sequence `upkeep_report_recorded` row, and that the
+artifact's window is still open. A capture that returns 200 therefore landed
+against the CURRENT report, below any watermark, and the apply will consume it.
+A capture that lost a race to a newer report is refused 409
+`upkeep_report_superseded`, and a capture that lost a race to the apply is
+refused 409 `upkeep_window_closed`. Both refusals append nothing. A capture is
+NOT consumable after the fact if a later report supersedes it: the apply decides
+the report that is current when it runs.
+
+**Window.** The window for one artifact closes only when the #3924 apply appends
+an artifact-bound `upkeep_apply_window_closed` watermark
+(`audit.UpkeepWindowAppender.AppendChainedUpkeepWindowClose`) on approve AND
+reject. Dispositions below the watermark against that artifact are the consumed
+set, and the first watermark is permanent. Residual: a run that is never decided
+keeps its window open. Until #3924 lands, nothing in production writes the
+watermark.
+
+| Code | HTTP | When |
+|---|---|---|
+| `upkeep_dispositions_unconfigured` | 503 | Run, artifact or audit repository not wired. |
+| `authentication_required` | 401 | Anonymous. |
+| `run_token_forbidden` | 403 | A run-bound agent token, even for its own run. |
+| `operator_agent_forbidden` | 403 | A delegated operator-agent token. |
+| `insufficient_scope` | 403 | Missing `write:approvals` (unconditional). |
+| `validation_failed` | 400 | Bad `run_id`; unparseable body or trailing content; empty batch or more than 200 entries; empty or duplicate `finding_id`; invalid `parent_epic`; `parent_epic` or `authorize_delegation_tier: true` on `rejected`. |
+| `run_not_found` | 404 | Unknown run. |
+| `upkeep_verdict_invalid` | 400 | Verdict outside `{approved, rejected}` (`details.allowed`). |
+| `upkeep_report_absent` | 409 | No `upkeep_report_recorded` row on the run. |
+| `upkeep_finding_unknown` | 422 | A `finding_id` the bound report does not declare (`details.unknown_finding_ids`). Checked for the WHOLE batch first, so nothing is recorded. |
+| `upkeep_report_superseded` | 409 | A newer report was recorded after resolution (`details.current_artifact_id`). Re-capture. |
+| `upkeep_window_closed` | 409 | The apply settled this artifact's window (`artifact_id`, `settlement`, `watermark_sequence`). |
+| `internal_error` | 500 | Unreadable report, or a storage failure. The atomic batch records nothing. |
+
+`GET` requires read access only and answers 404, 409 `upkeep_report_absent` and
+503 like `POST`. Both verbs return `200 {run_id, artifact_id, stage_id,
+content_hash, window_closed, settlement?, dispositions:[{finding_id, source,
+verdict, authorize_delegation_tier, parent_epic?, recorded_at, recorded_by,
+audit_sequence}]}`, sorted by `finding_id`.
+
 ## Plan-path guard
 
 A stage that declares `produces: upkeep_report` may ship ONLY an

@@ -267,6 +267,31 @@ a non-capable repo (in-memory fakes only) is a non-atomic read-then-append —
 rollback, permanence and the two-artifact scoping are pinned in
 `grooming_window_test.go` against real Postgres.
 
+### Family-parameterized protocol and the upkeep family (`UpkeepWindowAppender`, #3923)
+
+The two Tx cores (`windowDispositionBatchTx`, `windowCloseTx`) and the scan
+helpers take a `windowFamily` — {disposition category, watermark category,
+closed-error constructor, optional report category} — so a second disposition
+family reuses the same lock-then-scan-then-append code. The grooming entry points
+and `GroomingWindowClosedError` are thin wrappers, byte-identical in behavior and
+error text. Every scan filters by the family's OWN categories, so a grooming
+watermark never closes an upkeep window even when both carry the same
+`artifact_id` (`TestUpkeepWindow_FamilyIsolation`).
+
+The upkeep family is `upkeep_disposition_recorded` under the
+`upkeep_apply_window_closed` watermark, exposed as the `UpkeepWindowAppender`
+capability (`AppendChainedUpkeepDispositionBatch`,
+`AppendChainedUpkeepWindowClose`; compile-time assertion in `postgres.go`,
+forwarded by `decisionindex.IndexingRepository`). The upkeep batch adds a
+**binding re-check** between the lock and the watermark scan: the
+HIGHEST-sequence `upkeep_report_recorded` row on the run's chain must still name
+the capture's artifact, else `*UpkeepReportSupersededError` (naming the current
+artifact) and NOTHING is written. An absent or undecodable newest row refuses too.
+This is what keeps a capture the server resolved against report A from landing
+after report B was recorded. The watermark's production writer is the #3924
+apply, which closes the window on approve AND reject. Until it lands, only tests
+write the watermark.
+
 ## At-most-one merge_verdict_recorded per run (0062 / #1983)
 
 The `merge_verdict_recorded` category (POST `/v0/runs/{run_id}/merge`) is

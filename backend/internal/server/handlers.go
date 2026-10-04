@@ -82,6 +82,9 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	// a delegated operator-agent token); the READ-BACK needs read access only.
 	mux.HandleFunc("POST /v0/runs/{run_id}/grooming-dispositions", s.requireRunAccount(memberWrite, s.handleRecordGroomingDispositions))
 	mux.HandleFunc("GET /v0/runs/{run_id}/grooming-dispositions", s.requireRunAccount(readAccess, s.handleListGroomingDispositions))
+	// Per-finding upkeep dispositions (#3923): captain-only capture, read-access read-back.
+	mux.HandleFunc("POST /v0/runs/{run_id}/upkeep-dispositions", s.requireRunAccount(memberWrite, s.handleRecordUpkeepDispositions))
+	mux.HandleFunc("GET /v0/runs/{run_id}/upkeep-dispositions", s.requireRunAccount(readAccess, s.handleListUpkeepDispositions))
 	mux.HandleFunc("POST /v0/runs/{run_id}/auto-drive", s.requireRunAccount(memberWrite, s.handleAutoDrive))
 	mux.HandleFunc("POST /v0/runs/{run_id}/auto-drive/acts", s.requireRunAccount(memberWrite, s.handleAutoDriveRecordAct))
 	// On-demand orphaned-review recovery (#2712): the same per-run helper the
@@ -348,9 +351,12 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 			// grooming reports can detect drift against the backend that
 			// validates them.
 			"grooming-report-v1": plan.EmbeddedGroomingReportSchemaHash(),
-			"workflow-v0":        spec.EmbeddedSchemaHash(),
-			"workflow-v1":        spec.EmbeddedSchemaHashV1(),
-			"workflow-v2":        spec.EmbeddedSchemaHashV2(),
+			// The upkeep_report sibling (#3921), advertised by #3923 for the
+			// same drift-detection reason.
+			"upkeep-report-v1": plan.EmbeddedUpkeepReportSchemaHash(),
+			"workflow-v0":      spec.EmbeddedSchemaHash(),
+			"workflow-v1":      spec.EmbeddedSchemaHashV1(),
+			"workflow-v2":      spec.EmbeddedSchemaHashV2(),
 		},
 		StartNonce: s.cfg.StartNonce,
 		DevMode:    s.devModeActive(),
