@@ -110,6 +110,65 @@ func TestV0md_UpkeepDispositionsRouteDocumented(t *testing.T) {
 	}
 }
 
+// upkeepDocSection returns doc from the first occurrence of start up to the
+// next occurrence of end after it (or the end of doc), failing when start is
+// absent.
+func upkeepDocSection(t *testing.T, doc, rel, start, end string) string {
+	t.Helper()
+	i := strings.Index(doc, start)
+	if i < 0 {
+		t.Fatalf("%s: cannot locate %q", rel, strings.TrimSpace(start))
+	}
+	sec := doc[i+len(start):]
+	if j := strings.Index(sec, end); j >= 0 {
+		sec = sec[:j]
+	}
+	return sec
+}
+
+// TestUpkeepDispositionsDocs_StrictDecodeAndTwo500s pins the two #3924
+// carried-item facts the handler now enforces (strict decode, item 14; the
+// post-commit read-back 500 distinct from the atomic-failure 500, item 16) in
+// BOTH docs. It pins the load-bearing TOKENS, not sentences. The behaviour
+// itself is pinned by TestUpkeepDispositions_UnknownFieldRefused,
+// _AtomicFailureRecordsNothing and _ReadBackFailureAfterCommit; when either
+// fact changes, update the UpkeepDispositionsRequest description and the
+// recordUpkeepDispositions 400/500 descriptions in docs/api/v0.openapi.yaml,
+// the POST route line and the `internal_error` (upkeep) row in docs/api/v0.md,
+// and docs/spec/upkeep-report-v1.md's internal_error row.
+func TestUpkeepDispositionsDocs_StrictDecodeAndTwo500s(t *testing.T) {
+	oa := readRepoDoc(t, upkeepDocsOpenAPI)
+	req := upkeepDocSection(t, oa, upkeepDocsOpenAPI, "\n    UpkeepDispositionsRequest:\n", "\n    UpkeepDispositions:\n")
+	if !strings.Contains(req, "STRICT") || !strings.Contains(req, "unknown key") {
+		t.Errorf("%s UpkeepDispositionsRequest description does not state the STRICT decode refusing an unknown key", upkeepDocsOpenAPI)
+	}
+	post := upkeepDocSection(t, oa, upkeepDocsOpenAPI, "operationId: recordUpkeepDispositions", "operationId: listUpkeepDispositions")
+	r500 := upkeepDocSection(t, post, upkeepDocsOpenAPI, "\n        '500':\n", "\n        '503':\n")
+	for _, want := range []string{"`details.recorded`", "`details.requested`", "ATOMIC BATCH FAILURE", "AFTER A COMMITTED BATCH", "last-wins"} {
+		if !strings.Contains(r500, want) {
+			t.Errorf("%s recordUpkeepDispositions 500 description is missing %q (the atomic-vs-post-commit distinction)", upkeepDocsOpenAPI, want)
+		}
+	}
+	r400 := upkeepDocSection(t, post, upkeepDocsOpenAPI, "\n        '400':\n", "\n        '401':")
+	if !strings.Contains(r400, "unknown key") {
+		t.Errorf("%s recordUpkeepDispositions 400 description does not name the unknown-key refusal", upkeepDocsOpenAPI)
+	}
+
+	v0 := readRepoDoc(t, upkeepDocsV0)
+	route := upkeepDocSection(t, v0, upkeepDocsV0, "\nPOST   /v0/runs/{run_id}/upkeep-dispositions — ", "\n")
+	for _, want := range []string{"STRICT", "unknown key", "details.recorded=0", "details.recorded=details.requested"} {
+		if !strings.Contains(route, want) {
+			t.Errorf("%s POST upkeep-dispositions route line is missing %q", upkeepDocsV0, want)
+		}
+	}
+	row := upkeepDocSection(t, v0, upkeepDocsV0, "\n| `internal_error` (upkeep) | 500 |", "\n")
+	for _, want := range []string{"`recorded: 0`", "`recorded` = `requested`", "last-wins"} {
+		if !strings.Contains(row, want) {
+			t.Errorf("%s `internal_error` (upkeep) error-table row is missing %q", upkeepDocsV0, want)
+		}
+	}
+}
+
 // TestHealthzSchemaKeysDocumented derives the /healthz schemas key set from the
 // LIVE handler and requires every key in both prose enumerations, so a schema
 // advertised later fails here naming the two sites to update.

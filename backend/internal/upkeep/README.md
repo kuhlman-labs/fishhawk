@@ -137,9 +137,28 @@ subject, so the id is `toolchain_drift:<family>`.
   command people run).
 - Occurrences sort by (path, line, value), families by name; the input map is
   iterated in sorted order, so output is deterministic.
-- **Occurrence cap**: at most `PinMaxOccurrences` (32) per family, the rest
-  counted in `OmittedOccurrences`; every distinct value keeps at least one
-  occurrence, so the cap never hides the disagreement.
+- **Occurrence cap** (`capPinHits`, #3924 carried item 7): at most
+  `PinMaxOccurrences` (32) per family, the rest counted in
+  `OmittedOccurrences`. A finding must show the disagreement AND name at least
+  two distinct paths (`upkeep_report_v1` rule (g)), so the slots fill in tiers,
+  each in hit (sorted) order:
+  1. one occurrence per distinct value;
+  2. when the slots kept so far cover fewer than 2 paths while the input spans
+     2 or more, one occurrence from an uncovered path — added if a slot is
+     free, otherwise REPLACING the latest-added tier-1 slot;
+  3. one occurrence per distinct (value, path) pair;
+  4. the remaining hits.
+
+  The kept occurrences are returned in the original hit order. **Bound**: a
+  distinct value can lose its only occurrence ONLY to keep the two-path
+  minimum — when the distinct values alone fill every slot from a single path
+  — and then exactly one value (the latest in hit order) yields its slot.
+  Otherwise every distinct value keeps at least one occurrence. Pinned by
+  `TestCapPinHits_RetainsEveryPathPerValue` (32 alternating `1.24`/`1.25` in
+  `a.yml` plus one in `b.yml`: both paths kept),
+  `TestCapPinHits_SwapsInSecondPathWhenValuesFillTheCap` (`a.yml` alone
+  carries `PinMaxOccurrences` distinct values), `TestCapPinHits_KeepsOnePerValuePath`
+  and `TestDetectPinDrift_OccurrenceCapKeepsEveryValue`.
 
 ## `AggregateFlakes(stages) []Flake` (`flakes.go`)
 
@@ -167,7 +186,10 @@ subject, so the id is `toolchain_drift:<family>`.
 determination, and sets `prompt.Trigger.Upkeep`. A non-plan stage costs
 nothing; a plan stage costs the binding read #3921's ingest already pays (one
 `GetRun` + spec parse); only a stage whose cached spec declares `produces:
-upkeep_report` gathers. A binding transport error is a 500
+upkeep_report` gathers. That gather is NEW serve-time cost: the sibling
+grooming determination's serve-time read is one document fetch, while this one
+reads pin files and up to 40 redacted bundles, so it is served through the scan
+cache below. A binding transport error is a 500
 (`resolve the stage's upkeep_report declaration failed`); the gather itself
 never errors — every partial read is a named DEGRADE, WARN-logged with the
 run id and rendered in the prompt's facts block, so a partial scan is never
@@ -184,8 +206,12 @@ lists under `.github/workflows` at that commit (GitHub runs only), `AGENTS.md`,
 (`forge.ErrNotFound`) is NOT a degrade.
 
 **Flakes (source `flake`).** `ListRuns{Repo, AccountID}` pages newest-first
-(the query orders `created_at DESC, id DESC`); per run it skips the scanning
-run itself, STOPS at the first run older than the 14-day window, and drops any
+(the query orders `created_at DESC, id DESC`, 100 runs a page); per run it
+skips the scanning run itself and any run an EARLIER page already served —
+offset paging over a newest-first list re-serves the boundary run when a run is
+created between two pages, and the seen-run set reads it once and counts it
+once toward the scan cap (#3924 carried item 8; pinned by
+`TestGatherUpkeepFlakes_TwoPages`) — STOPS at the first run older than the 14-day window, and drops any
 run `upkeepRunOwnershipRefusal` rejects — the same predicate the ingest's
 `checkUpkeepRunRefs` applies — so the gather only ever reads **runs the
 upkeep_report ingest ownership predicate accepts** (same repository
@@ -197,8 +223,9 @@ attempts and `FlakeRetries` to `InfraRetries`. A stage with no redacted trace
 or no gate evidence contributes nothing and is not a degrade.
 
 **Bounds** (package vars): wall budget 20 s for both gathers; flake window
-14 days; run-scan cap 300; bundle cap 40; pin file 1 MiB; bundle 64 MiB; 32
-go.work dirs; 64 workflow files. The prompt renderer adds its own caps (per
+14 days; run page 100; run-scan cap 300; bundle cap 40; pin file 1 MiB; bundle
+64 MiB; 32 go.work dirs; 64 workflow files; scan-cache TTL 60 s and 256
+entries. The prompt renderer adds its own caps (per
 family occurrences, flake subjects, facts bytes), each disclosed by an omitted
 line.
 
@@ -226,8 +253,46 @@ line.
 | | `bundle_cap_reached` | the 40-bundle cap stopped the gather |
 | | `budget_exceeded` | the wall budget ran out |
 
-Test seams: `newUpkeepPinSource` and `upkeepListWorkflowDir` are package vars
-(no Server/Config field), swapped by non-parallel tests.
+**Scan cache** (#3924 carried item 11). The gather is served through a
+process-local, per-(server, run, stage) single-flight + short-TTL cache
+(`upkeepScanCache`, hand-rolled: one mutex plus an in-flight channel per entry,
+no `golang.org/x/sync` dependency). The binding is still read on every call, so
+its transport error is never cached.
+
+- **Shared.** `/prompt` and `/prompt-render` for one stage share one gather
+  within `upkeepScanCacheTTL` (60 s), and concurrent serves of one stage gather
+  once: a caller arriving while a gather is in flight waits for it. Distinct
+  (run, stage) pairs never share an entry.
+- **Detached.** The leader runs the gather under
+  `context.WithoutCancel(request ctx)` bounded by its own 20 s budget, so a
+  cancelled leader never hands its waiters a cancelled or truncated result;
+  a waiter blocks at most that one budget.
+- **Failures are not cached.** A gather that panics leaves no entry; its
+  waiters retry (one becomes the new leader). A DEGRADED gather (e.g.
+  `budget_exceeded`) completed and IS cached for the TTL — the accepted price
+  of bounding repeated 64 MiB bundle reads.
+- **Bounded.** Expired entries are swept on every insert, and a hard cap
+  (`upkeepScanCacheMaxEntries`, 256) runs a gather UNCACHED when the swept map
+  is still full.
+
+Pinned by `TestResolveUpkeepScanContext_CachesPerStage`, `_SingleFlight`,
+`_CancelledLeaderDoesNotPoisonWaiters`, `TestUpkeepScanCache_KeyIncludesStage`,
+`_AbortedGatherIsNotCached` and `_BoundedMap`.
+
+**Undecidable binding** (#3924 carried item 10). A plan stage in a workflow
+declaring `produces: upkeep_report` whose own declaration is undecidable
+(`workflow_unresolved`, `stage_unmappable`) gets a nil scan context, i.e. the
+ORDINARY plan prompt. This is a documented residual, not a prompt fork: the
+plan-path guard refuses that stage's plan, and the ingest refuses its
+upkeep_report fail-closed (`upkeepIngestRefusal` →
+`stage_binding_undecidable`, category B), so an upkeep prompt served there
+could not produce an accepted report either. Pinned by
+`TestResolveUpkeepScanContext_UndecidableIsResidual`.
+
+Test seams: `newUpkeepPinSource`, `upkeepListWorkflowDir`, `upkeepScanNow` and
+`upkeepScanJoinHook` are package vars (no Server/Config field), swapped by
+non-parallel tests, as are the bounds (`upkeepFlakeRunPageSize`,
+`upkeepScanCacheTTL`, …).
 
 ## Plan-path guard: undetectable bodies (`server/upkeep_report.go`)
 
@@ -235,8 +300,10 @@ A body `plan.DetectArtifactKind` cannot classify is mapped to kind `plan`, so
 on a stage declaring `produces: upkeep_report` the guard refuses it. Since
 #3922 the guard receives the raw body and the detection error, and the refusal
 says WHY via `upkeepGuardBodyDetail`: the JSON parse error verbatim, no top-level
-`kind`, or the unrecognized kind (echo truncated to 64 bytes),
-and names `upkeep_report_v1` / kind `upkeep_report`. The code stays
+`kind`, a kind `plan.AllArtifactKinds` recognizes but the upkeep allowlist does
+not admit (an explicit `"kind":"plan"` reads "a recognized artifact kind but is
+not allowed on a stage declaring produces: upkeep_report", #3924 carried item
+9), or the unrecognized kind (echo truncated to 64 bytes), and names `upkeep_report_v1` / kind `upkeep_report`. The code stays
 `plan_invalid`, so the bounded schema retry still runs; its recorded
 `validation_error` reaches the next attempt's prompt, which `buildUpkeepScan`
 renders under "Prior upkeep-scan schema validation failure" naming
@@ -258,13 +325,22 @@ which ingests a report carrying it.
   repo can plant a finding's marker, or a near-identical title, on an OPEN
   issue and so suppress that finding's filing. Bounded: it only SKIPS a filing
   (nothing is closed or edited), and the mark — issue number and basis — is
-  visible in the `upkeep_report_recorded` payload's `duplicates`. Whether a
-  marker match needs a provenance check (e.g. issue author is the App) is
-  #3924's decision.
+  visible in the `upkeep_report_recorded` payload's `duplicates`. #3924
+  decided a marker match suppresses filing WITHOUT a provenance check; the
+  decision, its rationale and the apply-side residuals are recorded in
+  `backend/internal/server/README.md` § "On-approval upkeep apply".
 - **Open-window miss.** `intakeCandidates` enumerates newest-first with closed
   items included, capped at `intakegroom.DefaultMaxScanned`. Closed items
   consume part of the window, so an older OPEN duplicate past the cap is not
   seen. `WindowTruncated` makes this visible.
+- **Cross-forge / cross-installation same-name repo.** `checkUpkeepRunRefs`
+  (and the flake gather through the same `upkeepRunOwnershipRefusal`) compares
+  `Repo` case-insensitively and `AccountID` ONLY when both rows carry one; it
+  does not compare the forge or the installation. A run of a same-named
+  `owner/name` on another forge (a GitLab project spelled like the GitHub
+  repo) or under another installation therefore passes when either row lacks
+  an account id: the report may cite it and the gather may read its redacted
+  verify history.
 - **Unverified evidence pointers.** A flake run ref's `stage_id` and
   `trace_ref` are agent-asserted (see above); only `run_id` existence and
   ownership are checked.
@@ -284,8 +360,17 @@ which ingests a report carrying it.
   `verify-gate:unnamed`.
 - **Latest bundle only.** Only the newest redacted bundle per stage is read,
   so verify runs from earlier fix-up passes of that stage are not seen.
-- **Preview drift.** `/prompt-render` re-gathers; a run landing or the budget
-  expiring between it and the signed serve can make the two differ.
+- **Preview drift (narrowed).** Within the 60 s scan-cache TTL `/prompt-render`
+  and the signed `/prompt` share one gather and agree. Past the TTL the second
+  call re-gathers, so a run landing or the budget expiring between them can
+  still make the two differ.
+- **Stale or degraded scan for one TTL.** A cached gather — including a
+  degraded one — is served for up to 60 s, so a run recorded inside that window
+  is not seen until the entry expires.
+- **Process-local scan cache.** Each fishhawkd replica keeps its own cache, so
+  two replicas serving one stage each gather.
+- **Undecidable binding gets the plain plan prompt** (see "Evidence gather");
+  the stage then fails category B on its first ship.
 - **Test-name charset.** Names are restricted to `[A-Za-z0-9_]` at extraction
   and `[A-Za-z0-9._/@:+-]` at render (non-conforming values withheld).
   Identifier-shaped words can still spell text, but only inside the labelled

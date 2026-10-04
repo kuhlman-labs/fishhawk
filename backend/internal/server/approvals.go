@@ -1510,6 +1510,19 @@ func (s *Server) finishApprovalAdvance(ctx context.Context, p approveActionParam
 		// approve-only block would make that governance property structurally
 		// untestable, and therefore unproven.
 		s.applyApprovedGrooming(ctx, advanced, p.Decision)
+		// On-approval upkeep apply (#3924): when the decided plan stage carries
+		// the run's recorded upkeep_report, settle its capture window and, on
+		// approve only, file the captain-approved non-duplicate findings
+		// through the work-item core. It NEVER creates a run. Best-effort like
+		// the grooming hook above — a failure degrades to a named audit row and
+		// never unwinds the approval.
+		//
+		// THE PLACEMENT IS PART OF THE CONTROL, exactly as for grooming: this is
+		// the TYPE-only block and the decision is PASSED, so "a rejected upkeep
+		// report files nothing and settles its window rejected" lives in
+		// applyApprovedUpkeep as a guard whose deletion is observable on the
+		// reject path.
+		s.applyApprovedUpkeep(ctx, advanced, p.Decision)
 	}
 
 	// Sticky status comment (E20.4 / #330). Every approval changes the run's

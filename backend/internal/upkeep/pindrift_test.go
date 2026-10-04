@@ -407,6 +407,143 @@ func TestDetectPinDrift_OccurrenceCapKeepsEveryValue(t *testing.T) {
 	}
 }
 
+// workflowGoVersions renders one `go-version:` line per value, in order.
+func workflowGoVersions(values ...string) string {
+	out := ""
+	for _, v := range values {
+		out += "      go-version: '" + v + "'\n"
+	}
+	return out
+}
+
+// pinPaths returns the distinct paths occs name, in first-seen order.
+func pinPaths(occs []upkeep.PinOccurrence) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, o := range occs {
+		if !seen[o.Path] {
+			seen[o.Path] = true
+			out = append(out, o.Path)
+		}
+	}
+	return out
+}
+
+// assertPinOrder fails unless occs are in the detector's (Path, Line, Value)
+// order: capPinHits returns its retained hits in their original order.
+func assertPinOrder(t *testing.T, occs []upkeep.PinOccurrence) {
+	t.Helper()
+	for i := 1; i < len(occs); i++ {
+		a, b := occs[i-1], occs[i]
+		if a.Path > b.Path || (a.Path == b.Path && a.Line >= b.Line) {
+			t.Fatalf("occurrences out of hit order at %d: %+v then %+v", i, a, b)
+		}
+	}
+}
+
+// TestCapPinHits_RetainsEveryPathPerValue (#3924 carried item 7, HIGH): 32
+// occurrences alternating 1.24/1.25 in a.yml plus one 1.25 in b.yml are 33
+// hits against the 32 cap, with b.yml sorting last. The finding must still
+// name BOTH paths, or it cannot satisfy rule (g)'s two-distinct-path minimum.
+//
+// Counterfactual: keying the cap on the value only (the pre-#3924 capPinHits,
+// tiers (b) and (c) removed) keeps a.yml's first 1.24 and 1.25 and fills the
+// rest from a.yml, dropping b.yml — RED. The cap test above stays green, so
+// value coverage is not traded away.
+func TestCapPinHits_RetainsEveryPathPerValue(t *testing.T) {
+	var values []string
+	for i := 0; i < 32; i++ {
+		values = append(values, []string{"1.24", "1.25"}[i%2])
+	}
+	files := map[string]string{
+		".github/workflows/a.yml": workflowGoVersions(values...),
+		".github/workflows/b.yml": workflowGoVersions("1.25"),
+	}
+	d := findFamily(t, upkeep.DetectPinDrift(files), upkeep.PinFamilyGo)
+	if len(d.Occurrences) != upkeep.PinMaxOccurrences || d.OmittedOccurrences != 1 {
+		t.Fatalf("len(Occurrences) = %d OmittedOccurrences = %d, want %d and 1",
+			len(d.Occurrences), d.OmittedOccurrences, upkeep.PinMaxOccurrences)
+	}
+	if got, want := pinPaths(d.Occurrences), []string{".github/workflows/a.yml", ".github/workflows/b.yml"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("paths = %v, want %v (rule (g) needs two distinct paths)", got, want)
+	}
+	if last, want := d.Occurrences[len(d.Occurrences)-1], (upkeep.PinOccurrence{Path: ".github/workflows/b.yml", Line: 1, Value: "1.25"}); last != want {
+		t.Errorf("last occurrence = %+v, want %+v", last, want)
+	}
+	if want := []string{"1.24", "1.25"}; !reflect.DeepEqual(d.DistinctValues, want) {
+		t.Errorf("DistinctValues = %v, want %v", d.DistinctValues, want)
+	}
+	assertPinOrder(t, d.Occurrences)
+}
+
+// TestCapPinHits_SwapsInSecondPathWhenValuesFillTheCap (#3924 approval
+// condition C1, tier (b)): a.yml ALONE carries PinMaxOccurrences distinct
+// values, so one-per-value fills every slot from one path, and b.yml carries
+// one value a.yml also has. Tier (b) replaces the latest-added value slot
+// (a.yml's 1.31) with b.yml's occurrence: both paths are retained, and the
+// dropped value is still named in DistinctValues — the one bound the cap
+// trades.
+//
+// Counterfactual: deleting tier (b) leaves 32 value slots on a.yml and tiers
+// (c)/(d) never run (no free slot), so b.yml is dropped — RED.
+func TestCapPinHits_SwapsInSecondPathWhenValuesFillTheCap(t *testing.T) {
+	var values []string
+	for i := 0; i < upkeep.PinMaxOccurrences; i++ {
+		values = append(values, fmt.Sprintf("1.%d", i))
+	}
+	files := map[string]string{
+		".github/workflows/a.yml": workflowGoVersions(values...),
+		".github/workflows/b.yml": workflowGoVersions("1.5"),
+	}
+	d := findFamily(t, upkeep.DetectPinDrift(files), upkeep.PinFamilyGo)
+	if len(d.Occurrences) != upkeep.PinMaxOccurrences || d.OmittedOccurrences != 1 {
+		t.Fatalf("len(Occurrences) = %d OmittedOccurrences = %d, want %d and 1",
+			len(d.Occurrences), d.OmittedOccurrences, upkeep.PinMaxOccurrences)
+	}
+	if got, want := pinPaths(d.Occurrences), []string{".github/workflows/a.yml", ".github/workflows/b.yml"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("paths = %v, want %v (rule (g) needs two distinct paths)", got, want)
+	}
+	dropped := fmt.Sprintf("1.%d", upkeep.PinMaxOccurrences-1)
+	for _, o := range d.Occurrences {
+		if o.Value == dropped {
+			t.Errorf("occurrence %+v kept; the latest-added value slot (%s) must yield to b.yml", o, dropped)
+		}
+	}
+	if len(d.DistinctValues) != upkeep.PinMaxOccurrences {
+		t.Errorf("len(DistinctValues) = %d, want %d (the yielded value is still named)", len(d.DistinctValues), upkeep.PinMaxOccurrences)
+	}
+	assertPinOrder(t, d.Occurrences)
+}
+
+// TestCapPinHits_KeepsOnePerValuePath (#3924 approval condition C1, tier
+// (c)): after one-per-value and the two-path minimum are met, every distinct
+// (value, path) pair keeps an occurrence before the fill — c.yml's 1.25 sorts
+// after 40 surplus a.yml lines and still survives.
+//
+// Counterfactual: deleting tier (c) fills the free slots from a.yml in hit
+// order and drops c.yml — RED. Tier (b) cannot mask it: b.yml already covers
+// the second path.
+func TestCapPinHits_KeepsOnePerValuePath(t *testing.T) {
+	values := []string{"1.24", "1.25"}
+	for i := 0; i < 40; i++ {
+		values = append(values, "1.24")
+	}
+	files := map[string]string{
+		".github/workflows/a.yml": workflowGoVersions(values...),
+		".github/workflows/b.yml": workflowGoVersions("1.24"),
+		".github/workflows/c.yml": workflowGoVersions("1.25"),
+	}
+	d := findFamily(t, upkeep.DetectPinDrift(files), upkeep.PinFamilyGo)
+	if len(d.Occurrences) != upkeep.PinMaxOccurrences {
+		t.Fatalf("len(Occurrences) = %d, want %d", len(d.Occurrences), upkeep.PinMaxOccurrences)
+	}
+	want := []string{".github/workflows/a.yml", ".github/workflows/b.yml", ".github/workflows/c.yml"}
+	if got := pinPaths(d.Occurrences); !reflect.DeepEqual(got, want) {
+		t.Errorf("paths = %v, want %v (one occurrence per (value, path) pair)", got, want)
+	}
+	assertPinOrder(t, d.Occurrences)
+}
+
 // TestDetectPinDrift_NoDriftIsEmptyNonNil: agreeing pins and irrelevant files
 // yield a non-nil empty slice.
 func TestDetectPinDrift_NoDriftIsEmptyNonNil(t *testing.T) {

@@ -1118,6 +1118,14 @@ type Server struct {
 	// wedged forge cannot block a graceful stop past the deadline.
 	bgGroomingApply sync.WaitGroup
 
+	// bgUpkeepApply tracks the DETACHED on-approval upkeep apply (#3924):
+	// applyApprovedUpkeep returns to the approve request once the capture
+	// window is settled and the filing inputs are resolved; the per-finding
+	// filing loop then runs on a goroutine in this group under its own
+	// finding-scaled budget. Shutdown drains it alongside bgGroomingApply,
+	// bounded by the shutdown context.
+	bgUpkeepApply sync.WaitGroup
+
 	// bgBranchSweeps tracks the DETACHED cancel-path run-branch sweep
 	// (E68.67 / #3562): handleCancelRun writes its response first and runs
 	// the forge round-trips on a goroutine in this group under a bounded
@@ -1470,7 +1478,8 @@ func (s *Server) Start() error {
 // Shutdown gracefully drains in-flight requests, capped by
 // ShutdownTimeout from the parent context. After the HTTP server
 // drains, it also waits for any detached advisory review goroutines
-// (#584) and any detached grooming apply (E54.77 / #3232) to finish,
+// (#584), any detached grooming apply (E54.77 / #3232) and any detached
+// upkeep apply (#3924) to finish,
 // bounded by the same shutdown context so a hung reviewer or a wedged
 // forge can't block shutdown past the deadline.
 func (s *Server) Shutdown(ctx context.Context) error {
@@ -1485,6 +1494,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	go func() {
 		s.bgReviews.Wait()
 		s.bgGroomingApply.Wait()
+		s.bgUpkeepApply.Wait()
 		s.bgBranchSweeps.Wait()
 		close(done)
 	}()
@@ -1507,6 +1517,12 @@ func (s *Server) waitBackgroundReviews() { s.bgReviews.Wait() }
 // assert on the audit rows the detached apply writes. Production code never
 // calls it (Shutdown drains the same group, bounded by its context).
 func (s *Server) waitGroomingApply() { s.bgGroomingApply.Wait() }
+
+// waitUpkeepApply blocks until every detached on-approval upkeep apply
+// (#3924) has finished — the deterministic sync point tests use to assert on
+// the audit rows and filings the detached loop produces. Production code never
+// calls it (Shutdown drains the same group, bounded by its context).
+func (s *Server) waitUpkeepApply() { s.bgUpkeepApply.Wait() }
 
 // waitBranchSweeps blocks until every detached cancel-path run-branch sweep
 // (E68.67 / #3562) has finished — the deterministic sync point tests use to

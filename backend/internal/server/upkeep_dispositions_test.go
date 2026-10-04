@@ -573,23 +573,231 @@ func TestUpkeepDispositions_ProjectionSkipsJunk(t *testing.T) {
 	}
 }
 
-// TestUpkeepDispositions_FallbackPartialAppendFailure: a per-row append
-// failure on the non-atomic fallback is a 500 reporting recorded/requested.
+// TestUpkeepDispositions_FallbackPartialAppendFailure: on the NON-atomic
+// fallback, a three-entry batch whose SECOND append fails is a 500 whose
+// details say exactly what survived — recorded=1 of requested=3 — and the
+// chain carries exactly that one durable row (committed state, not just the
+// error envelope).
 func TestUpkeepDispositions_FallbackPartialAppendFailure(t *testing.T) {
 	f := newUKFixture(t)
-	failing := &ukFailingAudit{ukAudit: f.au}
+	failing := &ukFailingAudit{ukAudit: f.au, failOn: 2}
 	f.s = New(Config{RunRepo: f.runs, ArtifactRepo: f.arts, AuditRepo: failing})
-	w := postUK(t, f.s, f.runID.String(), ukBatch(ukEntry(ukFlake, "approved")), ukOperator)
+	w := postUK(t, f.s, f.runID.String(), ukBatch(
+		ukEntry(ukFlake, "approved"), ukEntry(ukDrift, "approved"), ukEntry(ukDeprec, "rejected"),
+	), ukOperator)
 	requireGDError(t, w, http.StatusInternalServerError, "internal_error")
-	if !strings.Contains(w.Body.String(), `"requested":1`) {
-		t.Errorf("500 missing recorded/requested: %s", w.Body.String())
+	d := ukErrorDetails(t, w)
+	if d["recorded"] != float64(1) || d["requested"] != float64(3) {
+		t.Errorf("details recorded/requested = %v/%v, want 1/3; body %s", d["recorded"], d["requested"], w.Body.String())
+	}
+	if n := f.au.count(CategoryUpkeepDispositionRecorded); n != 1 {
+		t.Errorf("durable upkeep_disposition_recorded rows = %d, want exactly 1 (the append before the failure)", n)
+	}
+	if got := failing.calls; got != 2 {
+		t.Errorf("disposition appends attempted = %d, want 2 (the loop stops at the failure)", got)
 	}
 }
 
-type ukFailingAudit struct{ *ukAudit }
+// ukFailingAudit fails the failOn-th disposition append (1-based) and passes
+// every other append through to the sequence-assigning chain.
+type ukFailingAudit struct {
+	*ukAudit
+	failOn int
+	calls  int
+}
 
-func (a *ukFailingAudit) AppendChained(context.Context, audit.ChainAppendParams) (*audit.Entry, error) {
-	return nil, errors.New("append boom")
+func (a *ukFailingAudit) AppendChained(ctx context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
+	if p.Category == CategoryUpkeepDispositionRecorded {
+		a.calls++
+		if a.calls == a.failOn {
+			return nil, errors.New("append boom")
+		}
+	}
+	return a.ukAudit.AppendChained(ctx, p)
+}
+
+// ukErrorDetails decodes the error envelope's details object.
+func ukErrorDetails(t *testing.T, w *httptest.ResponseRecorder) map[string]any {
+	t.Helper()
+	var env struct {
+		Error struct {
+			Details map[string]any `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode error envelope: %v (body %s)", err, w.Body.String())
+	}
+	return env.Error.Details
+}
+
+// --- strict decode, rung ordering, the two 500s (#3924 carried 13-16) --------
+
+// TestUpkeepDispositions_UnknownFieldRefused: a misspelled
+// authorise_delegation_tier on an otherwise-valid APPROVED entry is 400
+// validation_failed naming the key, and records NOTHING.
+//
+// COUNTERFACTUAL (decodeUpkeepDispositionsBody's DisallowUnknownFields): drop
+// it — the misspelled key is silently discarded, and the batch is otherwise
+// valid against the recorded report, so nothing downstream refuses it: a 200
+// lands one row with authorize_delegation_tier false.
+func TestUpkeepDispositions_UnknownFieldRefused(t *testing.T) {
+	f := newUKFixture(t)
+	w := postUK(t, f.s, f.runID.String(),
+		ukBatch(`{"finding_id":"`+ukFlake+`","verdict":"approved","authorise_delegation_tier":true}`), ukOperator)
+	requireUKRefused(t, f, w, http.StatusBadRequest, "validation_failed")
+	if !strings.Contains(w.Body.String(), "authorise_delegation_tier") {
+		t.Errorf("400 does not name the unknown key: %s", w.Body.String())
+	}
+}
+
+// TestUpkeepDispositions_UnknownNestedFieldRefused: the strict decode applies
+// at EVERY depth — an undeclared key inside an entry, inside a LATER entry of
+// an otherwise-valid batch (so the valid first entry does not land either),
+// and at the top level are each 400 validation_failed with zero rows. Each
+// body is otherwise valid.
+func TestUpkeepDispositions_UnknownNestedFieldRefused(t *testing.T) {
+	cases := map[string]string{
+		"entry key":     ukBatch(`{"finding_id":"` + ukFlake + `","verdict":"approved","note":"looks right"}`),
+		"top-level key": `{"dispositions":[` + ukEntry(ukFlake, "approved") + `],"dry_run":true}`,
+		"second entry":  ukBatch(ukEntry(ukDrift, "approved"), `{"finding_id":"`+ukFlake+`","verdict":"approved","parentEpic":"#389"}`),
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := newUKFixture(t)
+			requireUKRefused(t, f, postUK(t, f.s, f.runID.String(), body, ukOperator),
+				http.StatusBadRequest, "validation_failed")
+		})
+	}
+}
+
+// TestUpkeepDispositions_NonBooleanTierRefused: authorize_delegation_tier is a
+// BOOLEAN; a string or number is 400 validation_failed with zero rows, never
+// coerced. (A type mismatch fails the decode with or without the strict
+// option, so this pins the contract rather than DisallowUnknownFields.)
+func TestUpkeepDispositions_NonBooleanTierRefused(t *testing.T) {
+	for name, v := range map[string]string{"string": `"true"`, "number": `1`} {
+		t.Run(name, func(t *testing.T) {
+			f := newUKFixture(t)
+			body := ukBatch(`{"finding_id":"` + ukFlake + `","verdict":"approved","authorize_delegation_tier":` + v + `}`)
+			requireUKRefused(t, f, postUK(t, f.s, f.runID.String(), body, ukOperator),
+				http.StatusBadRequest, "validation_failed")
+		})
+	}
+}
+
+// TestUpkeepDispositions_AmendedVerdictBeforeReportLookup: on an EXISTING run
+// whose chain carries NO upkeep_report_recorded row, an out-of-set verdict is
+// 400 upkeep_verdict_invalid — the U8 body rung runs BEFORE the U9 report
+// lookup, so the caller learns its request is malformed rather than being sent
+// to wait for a report that would still refuse it.
+//
+// COUNTERFACTUAL (rung order): move the latestUpkeepReport resolution above the
+// per-entry loop — the empty chain answers first with 409 upkeep_report_absent.
+func TestUpkeepDispositions_AmendedVerdictBeforeReportLookup(t *testing.T) {
+	f := &ukFixture{runID: uuid.New(), stageID: uuid.New(), au: newUKAudit()}
+	f.arts = &ukArtifactRepo{byID: map[uuid.UUID]*artifact.Artifact{}}
+	f.runs = &ukRunRepo{runID: f.runID}
+	f.s = New(Config{RunRepo: f.runs, ArtifactRepo: f.arts, AuditRepo: f.au})
+	if n := f.au.count(CategoryUpkeepReportRecorded); n != 0 {
+		t.Fatalf("fixture carries %d upkeep_report_recorded rows, want 0", n)
+	}
+	requireUKRefused(t, f, postUK(t, f.s, f.runID.String(), ukBatch(ukEntry(ukFlake, "amended")), ukOperator),
+		http.StatusBadRequest, "upkeep_verdict_invalid")
+	// The same run with a VALID verdict reaches U9 — proving the fixture's
+	// chain really is report-less, so the 400 above is the ordering, not luck.
+	requireUKRefused(t, f, postUK(t, f.s, f.runID.String(), ukBatch(ukEntry(ukFlake, "approved")), ukOperator),
+		http.StatusConflict, "upkeep_report_absent")
+}
+
+// ukAtomicAudit carries audit.UpkeepWindowAppender so the handler takes the
+// ATOMIC path: batchErr fails the whole batch with nothing appended; otherwise
+// every param lands on the chain in one call.
+type ukAtomicAudit struct {
+	*ukAudit
+	batchErr error
+}
+
+func (a *ukAtomicAudit) AppendChainedUpkeepDispositionBatch(ctx context.Context, _ string, ps []audit.ChainAppendParams) ([]*audit.Entry, error) {
+	if a.batchErr != nil {
+		return nil, a.batchErr
+	}
+	out := make([]*audit.Entry, 0, len(ps))
+	for _, p := range ps {
+		e, err := a.AppendChained(ctx, p)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, nil
+}
+
+func (a *ukAtomicAudit) AppendChainedUpkeepWindowClose(context.Context, audit.ChainAppendParams, string) (*audit.Entry, []*audit.Entry, error) {
+	return nil, nil, errors.New("not used by the capture")
+}
+
+var _ audit.UpkeepWindowAppender = (*ukAtomicAudit)(nil)
+
+// TestUpkeepDispositions_AtomicFailureRecordsNothing: an atomic batch failure
+// is a 500 with details.recorded=0 of requested=2, and the chain carries no
+// row.
+func TestUpkeepDispositions_AtomicFailureRecordsNothing(t *testing.T) {
+	f := newUKFixture(t)
+	f.s = New(Config{RunRepo: f.runs, ArtifactRepo: f.arts, AuditRepo: &ukAtomicAudit{ukAudit: f.au, batchErr: errors.New("tx boom")}})
+	w := postUK(t, f.s, f.runID.String(), ukBatch(ukEntry(ukFlake, "approved"), ukEntry(ukDrift, "approved")), ukOperator)
+	requireUKRefused(t, f, w, http.StatusInternalServerError, "internal_error")
+	if d := ukErrorDetails(t, w); d["recorded"] != float64(0) || d["requested"] != float64(2) {
+		t.Errorf("details recorded/requested = %v/%v, want 0/2 on an atomic failure; body %s", d["recorded"], d["requested"], w.Body.String())
+	}
+}
+
+// TestUpkeepDispositions_ReadBackFailureAfterCommit: the atomic batch COMMITS,
+// then the read-back list fails. The 500 must say the batch landed
+// (details.recorded = requested = 2, and the message), because the rows ARE
+// durable —
+// reporting it like the atomic failure would tell the captain nothing was
+// recorded when it was. A repeat POST is then safe (last-wins), and the
+// read-back GET recovers once the list heals.
+//
+// COUNTERFACTUAL (respondUpkeepDispositions' committed branch): pass 0 from
+// the POST — the 500 carries no recorded/requested and reads "listing recorded
+// dispositions failed", though two rows are durable.
+func TestUpkeepDispositions_ReadBackFailureAfterCommit(t *testing.T) {
+	for _, cat := range []string{CategoryUpkeepDispositionRecorded, audit.UpkeepApplyWindowClosedCategory} {
+		t.Run(cat, func(t *testing.T) {
+			f := newUKFixture(t)
+			flaky := &ukListFailAudit{ukAudit: f.au, cat: cat}
+			f.s = New(Config{RunRepo: f.runs, ArtifactRepo: f.arts, AuditRepo: &ukAtomicListFailAudit{ukListFailAudit: flaky}})
+			w := postUK(t, f.s, f.runID.String(), ukBatch(ukEntry(ukFlake, "approved"), ukEntry(ukDrift, "rejected")), ukOperator)
+			requireGDError(t, w, http.StatusInternalServerError, "internal_error")
+			if n := f.au.count(CategoryUpkeepDispositionRecorded); n != 2 {
+				t.Fatalf("durable rows = %d, want 2 (the batch committed before the read-back)", n)
+			}
+			if d := ukErrorDetails(t, w); d["recorded"] != float64(2) || d["requested"] != float64(2) {
+				t.Errorf("details recorded/requested = %v/%v, want 2/2 after a committed batch; body %s", d["recorded"], d["requested"], w.Body.String())
+			}
+			if !strings.Contains(w.Body.String(), "WAS recorded") {
+				t.Errorf("500 message does not say the batch was recorded: %s", w.Body.String())
+			}
+			// The list heals: GET reads back exactly the committed batch.
+			flaky.cat = ""
+			if got := decodeUK(t, getUK(t, f.s, f.runID.String())); len(got.Dispositions) != 2 {
+				t.Errorf("healed read-back = %+v, want the 2 committed dispositions", got.Dispositions)
+			}
+		})
+	}
+}
+
+// ukAtomicListFailAudit is ukListFailAudit plus the atomic capability, so the
+// POST commits through the batch and then fails its read-back list.
+type ukAtomicListFailAudit struct{ *ukListFailAudit }
+
+func (a *ukAtomicListFailAudit) AppendChainedUpkeepDispositionBatch(ctx context.Context, artifactID string, ps []audit.ChainAppendParams) ([]*audit.Entry, error) {
+	return (&ukAtomicAudit{ukAudit: a.ukAudit}).AppendChainedUpkeepDispositionBatch(ctx, artifactID, ps)
+}
+
+func (a *ukAtomicListFailAudit) AppendChainedUpkeepWindowClose(context.Context, audit.ChainAppendParams, string) (*audit.Entry, []*audit.Entry, error) {
+	return nil, nil, errors.New("not used by the capture")
 }
 
 // TestUpkeepDispositions_ListErrors: read failures on the disposition list and
@@ -601,7 +809,9 @@ func TestUpkeepDispositions_ListErrors(t *testing.T) {
 			f.s = New(Config{RunRepo: f.runs, ArtifactRepo: f.arts, AuditRepo: &ukListFailAudit{ukAudit: f.au, cat: cat}})
 			requireGDError(t, getUK(t, f.s, f.runID.String()), http.StatusInternalServerError, "internal_error")
 			if cat == CategoryUpkeepDispositionRecorded {
-				return // the POST appends before its read-back list; covered by GET
+				// The POST appends before its read-back list: a failure there is
+				// the post-commit 500, pinned by ..._ReadBackFailureAfterCommit.
+				return
 			}
 			requireUKRefused(t, f, postUK(t, f.s, f.runID.String(), ukBatch(ukEntry(ukFlake, "approved")), ukOperator),
 				http.StatusInternalServerError, "internal_error")

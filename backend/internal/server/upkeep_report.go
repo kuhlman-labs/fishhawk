@@ -39,6 +39,13 @@ const upkeepRefusalStageTypeNotPlan = "stage_type_not_plan"
 // (upkeepIngestMu → governanceHealMu) and the same RESIDUAL: it is
 // PROCESS-LOCAL, so two fishhawkd replicas ingesting the same report at the
 // same instant can still double-write.
+//
+// The span is deliberate and matches groomingIngestMu's (whose deferred
+// unlock also outlives the settle): handleUpkeepReport holds it from GetByHash
+// through advancePlanStageTerminal to the response, so a racing identical POST
+// sees the artifact, its recorded row and the settled stage together, never a
+// half-written ingest. TestUpkeepReportIngest_ConcurrentSameBody pins it
+// (#3924 carried item 3).
 var upkeepIngestMu sync.Mutex
 
 // upkeepStageAllowedKinds is the plan-path guard's ALLOWLIST: the only
@@ -72,8 +79,9 @@ var upkeepStageAllowedKinds = map[plan.ArtifactKind]bool{
 // (#3922, the carried #3921 concern). The caller maps a detection error to
 // kind plan, so without them a truncated upkeep_report was refused as "not a
 // plan" with its parse error dropped. upkeepGuardBodyDetail now says WHY the
-// body read as a plan — the parse error, no top-level kind, or an unknown kind
-// — and the message names upkeep_report_v1, so the bounded schema retry the
+// body read as a plan — the parse error, no top-level kind, a recognized kind
+// the allowlist does not admit (#3924), or an unknown kind — and the message
+// names upkeep_report_v1, so the bounded schema retry the
 // plan_invalid tail schedules feeds the agent that text, not a plan-schema hint.
 func (s *Server) guardUpkeepStageProposal(w http.ResponseWriter, r *http.Request, runID, stageID uuid.UUID, stage *run.Stage, kind plan.ArtifactKind, body []byte, derr error) bool {
 	if upkeepStageAllowedKinds[kind] {
@@ -113,9 +121,11 @@ const upkeepGuardMaxKindBytes = 64
 
 // upkeepGuardBodyDetail says why a body refused on an upkeep-declaring stage
 // was read as a plan: derr non-nil means it did not parse (the parse error is
-// kept verbatim); otherwise it either carries no top-level "kind" or carries
-// one plan.DetectArtifactKind does not recognize, which is echoed truncated to
-// upkeepGuardMaxKindBytes. Pure; derr is plan.DetectArtifactKind's error.
+// kept verbatim); otherwise it carries no top-level "kind", carries a kind
+// plan.AllArtifactKinds recognizes that upkeepStageAllowedKinds does not admit
+// (an explicit "plan" — #3924 carried item 9), or carries one nothing
+// recognizes, which is echoed truncated to upkeepGuardMaxKindBytes. Pure; derr
+// is plan.DetectArtifactKind's error.
 func upkeepGuardBodyDetail(body []byte, derr error) string {
 	if derr != nil {
 		return "the body is not a parseable upkeep_report (" + derr.Error() + ")"
@@ -129,11 +139,28 @@ func upkeepGuardBodyDetail(body []byte, derr error) string {
 	if disc.Kind == "" {
 		return `the body carries no top-level "kind", so it was read as a plan`
 	}
+	if upkeepGuardRecognizedKind(disc.Kind) && !upkeepStageAllowedKinds[plan.ArtifactKind(disc.Kind)] {
+		// A recognized kind is a constant, never agent-chosen text, so it is
+		// echoed whole.
+		return fmt.Sprintf("its top-level kind %q is a recognized artifact kind but is not allowed on a stage declaring produces: upkeep_report", disc.Kind)
+	}
 	k := disc.Kind
 	if len(k) > upkeepGuardMaxKindBytes {
 		k = strings.ToValidUTF8(k[:upkeepGuardMaxKindBytes], "") + "...[truncated]"
 	}
 	return fmt.Sprintf("its top-level kind %q is not a recognized artifact kind", k)
+}
+
+// upkeepGuardRecognizedKind reports whether kind is one of
+// plan.AllArtifactKinds — the enumeration a new plan-stage sibling must join —
+// so the guard detail tracks the recognized set without a second list.
+func upkeepGuardRecognizedKind(kind string) bool {
+	for _, k := range plan.AllArtifactKinds() {
+		if string(k) == kind {
+			return true
+		}
+	}
+	return false
 }
 
 // handleUpkeepReport ingests an upkeep_report artifact — the THIRD additive

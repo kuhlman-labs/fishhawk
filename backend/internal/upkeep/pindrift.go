@@ -29,9 +29,10 @@ const (
 )
 
 // PinMaxOccurrences caps the occurrences one PinDrift carries. The rest are
-// counted in OmittedOccurrences, so a truncated finding says so. The cap never
-// hides the drift itself: every distinct value keeps at least one occurrence
-// (see capPinHits).
+// counted in OmittedOccurrences, so a truncated finding says so. The cap keeps
+// every distinct value AND at least two distinct paths: every value keeps an
+// occurrence unless the values alone fill the cap from one path, when the
+// latest yields its slot to a second path (see capPinHits).
 const PinMaxOccurrences = 32
 
 // PinOccurrence is one pin read from one line of one file.
@@ -364,35 +365,96 @@ func distinctPinKeys(hits []pinHit) []string {
 }
 
 // capPinHits keeps at most limit of the sorted hits and returns how many it
-// dropped. It first keeps the earliest occurrence of EACH distinct key, so a
-// truncated finding still shows every disagreeing value with a path:line, then
-// fills the remaining slots in sort order. The kept hits stay sorted.
+// dropped. A finding must show the disagreement AND name at least two distinct
+// paths (upkeep_report_v1 semantic rule (g)), so the slots are filled in tiers,
+// each in hit order:
+//
+//	(a) one occurrence per distinct grouping key, so every disagreeing value
+//	    keeps a path:line;
+//	(b) when the slots kept so far cover fewer than two paths while the input
+//	    spans two or more, one occurrence from an uncovered path — added if a
+//	    slot is free, otherwise REPLACING the latest-added tier-(a) slot;
+//	(c) one occurrence per distinct (key, path) pair;
+//	(d) the remaining hits.
+//
+// The bound tier (b) trades away: a value can lose its only occurrence ONLY
+// when the distinct values alone fill every slot from a single path, and then
+// exactly one value (the latest in hit order) yields its slot so the finding
+// keeps its two-path minimum. DistinctValues, computed over every occurrence,
+// still names it. The kept hits are returned in the input's (sorted) order.
 func capPinHits(hits []pinHit, limit int) ([]pinHit, int) {
 	if len(hits) <= limit {
 		return hits, 0
 	}
 	keep := make([]bool, len(hits))
 	n := 0
-	seen := map[string]bool{}
+	covered := map[string]bool{}
+	mark := func(i int) {
+		keep[i] = true
+		n++
+		covered[hits[i].occ.Path] = true
+	}
+
+	// (a) one per distinct key.
+	lastA := -1
+	seenKey := map[string]bool{}
 	for i, h := range hits {
 		if n == limit {
 			break
 		}
-		if !seen[h.key] {
-			seen[h.key] = true
-			keep[i] = true
-			n++
+		if !seenKey[h.key] {
+			seenKey[h.key] = true
+			mark(i)
+			lastA = i
 		}
 	}
+
+	// (b) the two-path minimum. A limit below 2 cannot hold two paths, and a
+	// replaced slot leaves its path covered: tier (a) put every kept slot on
+	// that one path, and limit >= 2 slots are kept.
+	if limit >= 2 && len(covered) < 2 && distinctPinPaths(hits) >= 2 {
+		for i, h := range hits {
+			if covered[h.occ.Path] {
+				continue
+			}
+			if n == limit {
+				keep[lastA] = false
+				n--
+			}
+			mark(i)
+			break
+		}
+	}
+
+	// (c) one per distinct (key, path) pair not already kept.
+	type pinPair struct{ key, path string }
+	seenPair := map[pinPair]bool{}
+	for i, h := range hits {
+		if keep[i] {
+			seenPair[pinPair{h.key, h.occ.Path}] = true
+		}
+	}
+	for i, h := range hits {
+		if n == limit {
+			break
+		}
+		p := pinPair{h.key, h.occ.Path}
+		if !keep[i] && !seenPair[p] {
+			seenPair[p] = true
+			mark(i)
+		}
+	}
+
+	// (d) fill.
 	for i := range hits {
 		if n == limit {
 			break
 		}
 		if !keep[i] {
-			keep[i] = true
-			n++
+			mark(i)
 		}
 	}
+
 	kept := make([]pinHit, 0, n)
 	for i, h := range hits {
 		if keep[i] {
@@ -400,6 +462,15 @@ func capPinHits(hits []pinHit, limit int) ([]pinHit, int) {
 		}
 	}
 	return kept, len(hits) - n
+}
+
+// distinctPinPaths counts the distinct paths hits name.
+func distinctPinPaths(hits []pinHit) int {
+	seen := map[string]bool{}
+	for _, h := range hits {
+		seen[h.occ.Path] = true
+	}
+	return len(seen)
 }
 
 // isGoModFile reports go.work, a root go.mod, or any nested go.mod.

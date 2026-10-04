@@ -57,8 +57,11 @@ scanned".
 `parent_epic` is a non-empty string.
 
 **`autonomy:*` carve-out.** A proposed `autonomy:` label is STRIPPED at apply
-unless the captain authorizes it (#3924). The scan may suggest a tier; it never
-sets one.
+unless the captain authorizes it (`authorize_delegation_tier`, #3924). The scan
+may suggest a tier; it never sets one. The repository's work-management
+conventions may still add their DEFAULT tier (`label_defaults.autonomy`, e.g.
+`autonomy:medium`) when the filed labels carry none — that is the conventions'
+choice, not the scan's. See [Apply](#apply-on-gate-decision-3924).
 
 ## Finding id derivation (normative)
 
@@ -196,13 +199,15 @@ refused 409 `upkeep_window_closed`. Both refusals append nothing. A capture is
 NOT consumable after the fact if a later report supersedes it: the apply decides
 the report that is current when it runs.
 
-**Window.** The window for one artifact closes only when the #3924 apply appends
-an artifact-bound `upkeep_apply_window_closed` watermark
+**Window.** The window for one artifact closes only when the apply appends an
+artifact-bound `upkeep_apply_window_closed` watermark
 (`audit.UpkeepWindowAppender.AppendChainedUpkeepWindowClose`) on approve AND
-reject. Dispositions below the watermark against that artifact are the consumed
-set, and the first watermark is permanent. Residual: a run that is never decided
-keeps its window open. Until #3924 lands, nothing in production writes the
-watermark.
+reject of the plan stage carrying it (see [Apply](#apply-on-gate-decision-3924)).
+Dispositions below the watermark against that artifact are the consumed set, and
+the first watermark is permanent. A reject settles `rejected` before any report
+body is read, so an unreadable body cannot keep a rejected window open. An
+approve on a contested or ungranted gate (C3) degrades WITHOUT settling, so the
+window stays open. Residual: a run that is never decided keeps its window open.
 
 | Code | HTTP | When |
 |---|---|---|
@@ -211,20 +216,81 @@ watermark.
 | `run_token_forbidden` | 403 | A run-bound agent token, even for its own run. |
 | `operator_agent_forbidden` | 403 | A delegated operator-agent token. |
 | `insufficient_scope` | 403 | Missing `write:approvals` (unconditional). |
-| `validation_failed` | 400 | Bad `run_id`; unparseable body or trailing content; empty batch or more than 200 entries; empty or duplicate `finding_id`; invalid `parent_epic`; `parent_epic` or `authorize_delegation_tier: true` on `rejected`. |
+| `validation_failed` | 400 | Bad `run_id`; unparseable body or trailing content; an unknown key at any depth (the decode is STRICT, #3924: a misspelled `authorise_delegation_tier` is refused, not dropped) or a wrongly-typed value; empty batch or more than 200 entries; empty or duplicate `finding_id`; invalid `parent_epic`; `parent_epic` or `authorize_delegation_tier: true` on `rejected`. |
 | `run_not_found` | 404 | Unknown run. |
-| `upkeep_verdict_invalid` | 400 | Verdict outside `{approved, rejected}` (`details.allowed`). |
+| `upkeep_verdict_invalid` | 400 | Verdict outside `{approved, rejected}` (`details.allowed`). The body rungs run BEFORE the report lookup, so a bad verdict on a run with no recorded report is this 400, not 409 `upkeep_report_absent`. |
 | `upkeep_report_absent` | 409 | No `upkeep_report_recorded` row on the run. |
 | `upkeep_finding_unknown` | 422 | A `finding_id` the bound report does not declare (`details.unknown_finding_ids`). Checked for the WHOLE batch first, so nothing is recorded. |
 | `upkeep_report_superseded` | 409 | A newer report was recorded after resolution (`details.current_artifact_id`). Re-capture. |
 | `upkeep_window_closed` | 409 | The apply settled this artifact's window (`artifact_id`, `settlement`, `watermark_sequence`). |
-| `internal_error` | 500 | Unreadable report, or a storage failure. The atomic batch records nothing. |
+| `internal_error` | 500 | Storage failure, told apart by `details.recorded` / `details.requested`. An unreadable or unparseable bound report, or a failed window check, fails BEFORE any append: nothing recorded. An ATOMIC batch failure records NOTHING (`recorded: 0`). A read-back failure AFTER the batch COMMITTED leaves every row DURABLE (`recorded` = `requested`; the message says the batch was recorded). A repeat POST is safe in every case because capture is last-wins; `GET` reads back what landed. |
 
 `GET` requires read access only and answers 404, 409 `upkeep_report_absent` and
 503 like `POST`. Both verbs return `200 {run_id, artifact_id, stage_id,
 content_hash, window_closed, settlement?, dispositions:[{finding_id, source,
 verdict, authorize_delegation_tier, parent_epic?, recorded_at, recorded_by,
 audit_sequence}]}`, sorted by `finding_id`.
+
+## Apply (on gate decision, #3924)
+
+The plan stage's gate DECISION is the apply trigger. `finishApprovalAdvance`
+calls `server.applyApprovedUpkeep` on approve AND reject; no agent stage runs
+between the captain's decision and the tracker write. It NEVER creates a run: an
+approved finding becomes a tracker issue, not a dispatched change. Long-form
+contract: `backend/internal/server/README.md` § "On-approval upkeep apply".
+
+**Ladder** (each rung writes nothing it does not name):
+
+| Rung | Rule |
+|---|---|
+| E0 | No `upkeep_report` artifact on the decided stage, no `upkeep_report_recorded` row, or the recorded row names an artifact on another stage → write NOTHING. An ordinary plan approval or reject is untouched. An undecodable newest recorded row degrades `upkeep_apply_report_unreadable` on either decision (window stays open). |
+| C1 | Reject → settle the window `rejected` from the recorded row's `artifact_id` and file nothing. Runs before any report-body read. |
+| C3 | Approve → re-read the stage's approval rows: ≥ 1 grant and 0 rejections, else degrade `upkeep_apply_not_ratified` (window stays OPEN). |
+| settle | Append the `approved` watermark; the dispositions below it for the artifact are CONSUMED, collapsed last-wins per `finding_id`. A failed append degrades `upkeep_apply_window_unsettled` (window stays open). Every later degrade leaves the window CLOSED. |
+
+**Per finding, in report order**, exactly one row:
+
+| Outcome | Row | When |
+|---|---|---|
+| `not_approved` | `upkeep_finding_skipped` | No consumed disposition, or a `rejected` one. |
+| `duplicate_of_open_issue` | `upkeep_finding_skipped` | The finding is in the recorded row's `duplicates` (marker or similarity). Carries `duplicate_issue_number`, `duplicate_issue_url`, `duplicate_basis`. |
+| `already_filed` | `upkeep_finding_skipped` | An `upkeep_finding_filed` row for this artifact and finding exists (a re-apply). Carries `prior_issue_number`. |
+| `apply_budget_exhausted` | `upkeep_finding_skipped` | The detached loop's budget expired before this finding. |
+| `filing_failed` | `upkeep_finding_skipped` | The work-item core refused the filing (`code`, `message`); the loop continues. |
+| filed | `upkeep_finding_filed` | `{run_id, stage_id, artifact_id, finding_id, source, issue_number, issue_url, provider, title, parent_epic, applied_labels, stripped_labels, idempotency_key}`. |
+
+A filed issue's body is the proposed body plus the [hidden marker](#hidden-marker)
+on its own line, and is stamped with an idempotency key minted from
+`(upkeep_finding, run_id, artifact_id, finding_id)`. Its parent epic is the
+disposition's `parent_epic` override, else the proposal's, normalized to `#N`.
+Its labels are the proposal's minus every `autonomy:*` label unless
+`authorize_delegation_tier` is true; `applied_labels` are the labels actually
+filed (after the conventions' label completeness), `stripped_labels` the removed
+ones.
+
+**Summary.** ONE `upkeep_apply_completed` row per apply: `{artifact_id,
+findings, filed, skipped, failed, budget_exhausted, degraded, degrade_reason?}`.
+`skipped` counts `not_approved` / `duplicate_of_open_issue` / `already_filed`;
+`failed` counts `filing_failed`. A degraded row carries zero counts and one
+`degrade_reason`: `upkeep_apply_report_unreadable`, `upkeep_apply_not_ratified`,
+`upkeep_apply_window_unsettled` (all three leave the window open),
+`upkeep_apply_duplicates_unreadable`, `upkeep_apply_prior_filings_unreadable`,
+`upkeep_apply_run_unreadable`, `upkeep_apply_repo_unresolvable`,
+`upkeep_apply_conventions_unavailable`, `upkeep_apply_prelaunch_timeout`. A
+reject writes the `rejected` watermark only — no per-finding or summary row —
+unless E0's recorded row is undecodable (one degraded row, no watermark).
+
+**Budgets.** The synchronous half (on the approve request) is bounded by 30s;
+the per-finding loop runs detached, drained by server shutdown, under
+`max(3m, 3s × findings)`.
+
+**Residuals.** No re-drive: an approved finding left unfiled by a crash, a
+degrade, `filing_failed` or budget exhaustion is recovered by the NEXT scan
+re-proposing it, whose marker and `already_filed` dedupe prevent a double
+filing. A marker match suppresses filing with NO provenance check (a planted
+marker suppresses; it never files or escalates). These apply rows are internal
+audit categories, visible through `GET /v0/runs/{id}/audit` only. Details in the
+server README.
 
 ## Plan-path guard
 
