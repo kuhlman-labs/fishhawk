@@ -10,8 +10,9 @@ package server
 // entry is ONE upkeep_disposition_recorded row; the #3924 apply consumes them.
 //
 // It reuses the grooming capture's shape (#2843 / #2991): the same
-// operator-only ladder (requireOperatorCapture), the same single-document
-// decode, batch-atomic validation, last-wins read-back, and the audit-layer
+// operator-only ladder (requireOperatorCapture), the single-document decode
+// (made STRICT here: unknown keys are refused, decodeUpkeepDispositionsBody),
+// batch-atomic validation, last-wins read-back, and the audit-layer
 // capture/apply WINDOW, generalized to the upkeep family
 // (audit.UpkeepWindowAppender, watermark upkeep_apply_window_closed).
 //
@@ -29,6 +30,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"sort"
@@ -247,7 +249,8 @@ func (s *Server) upkeepUnconfigured(w http.ResponseWriter, r *http.Request) bool
 //	U4  403 insufficient_scope (write:approvals, unconditional)
 //	U5  400 validation_failed — bad run_id
 //	U6  404 run_not_found
-//	U7  400 validation_failed — unparseable body, trailing content, empty
+//	U7  400 validation_failed — unparseable body, an unknown key at any
+//	        depth, a wrongly-typed value, trailing content, empty
 //	        batch, > 200 entries, empty or duplicate finding_id, invalid
 //	        parent_epic, parent_epic or authorize_delegation_tier:true on a
 //	        rejected verdict
@@ -255,6 +258,13 @@ func (s *Server) upkeepUnconfigured(w http.ResponseWriter, r *http.Request) bool
 //	U9  409 upkeep_report_absent / 500 unreadable report
 //	U10 422 upkeep_finding_unknown — whole-batch check
 //	U11 409 upkeep_window_closed; 409 upkeep_report_superseded (atomic path)
+//
+// The 500s after U10 are DISTINCT and carry details.recorded /
+// details.requested (allow-listed through the 5xx redactor): an atomic batch
+// failure recorded NOTHING (recorded=0); a read-back failure AFTER the batch
+// committed means EVERY row is durable (recorded=requested); the fallback's
+// mid-batch failure reports the partial count. A repeat POST is safe in all
+// three, because capture is last-wins.
 func (s *Server) handleRecordUpkeepDispositions(w http.ResponseWriter, r *http.Request) {
 	if s.upkeepUnconfigured(w, r) { // U0
 		return
@@ -273,8 +283,7 @@ func (s *Server) handleRecordUpkeepDispositions(w http.ResponseWriter, r *http.R
 
 	// U7 / U8: body shape and per-entry validation.
 	var reqBody upkeepDispositionRequest
-	if !s.decodeSingleJSONBody(w, r, &reqBody,
-		"request body must be valid JSON {dispositions:[{finding_id, verdict, authorize_delegation_tier, parent_epic}]}") {
+	if !s.decodeUpkeepDispositionsBody(w, r, &reqBody) {
 		return
 	}
 	if len(reqBody.Dispositions) == 0 {
@@ -423,7 +432,7 @@ func (s *Server) handleRecordUpkeepDispositions(w http.ResponseWriter, r *http.R
 				slog.String("run_id", runID.String()), slog.String("error", aerr.Error()))
 			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 				"recording the disposition batch failed; the capture is atomic, so NOTHING was recorded and a repeat POST is safe",
-				map[string]any{"error": aerr.Error()})
+				map[string]any{"recorded": 0, "requested": len(params), "error": aerr.Error()})
 			return
 		}
 	} else {
@@ -453,7 +462,41 @@ func (s *Server) handleRecordUpkeepDispositions(w http.ResponseWriter, r *http.R
 		}
 	}
 
-	s.respondUpkeepDispositions(w, r, runID, b)
+	s.respondUpkeepDispositions(w, r, runID, b, len(params))
+}
+
+// decodeUpkeepDispositionsBody is the capture's STRICT single-document decode:
+// decodeSingleJSONBody's shape (an empty body decodes to the zero request,
+// which the empty-batch rung then refuses; trailing content is refused) plus
+// DisallowUnknownFields, which applies at EVERY depth. Without it a misspelled
+// key (authorise_delegation_tier) or an undeclared nested field was silently
+// dropped while the rest of the entry recorded — a 200 that discarded the
+// captain's intent. This is what makes the request schema's
+// additionalProperties:false true. Kept local: the shared decodeSingleJSONBody
+// that grooming uses stays lenient.
+func (s *Server) decodeUpkeepDispositionsBody(w http.ResponseWriter, r *http.Request, dst *upkeepDispositionRequest) bool {
+	if r.Body == nil {
+		return true
+	}
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	decErr := dec.Decode(dst)
+	switch {
+	case decErr != nil && !errors.Is(decErr, io.EOF):
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			"request body must be valid JSON {dispositions:[{finding_id, verdict, authorize_delegation_tier, parent_epic}]} with no other keys; an unknown or misspelled key is refused rather than dropped",
+			map[string]any{"error": decErr.Error()})
+		return false
+	case decErr == nil:
+		var trailing json.RawMessage
+		if tErr := dec.Decode(&trailing); !errors.Is(tErr, io.EOF) {
+			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+				"request body must be a single JSON document; trailing content after the dispositions object is refused because a decoder that stopped at the first value would silently discard it and report success",
+				map[string]any{"field": "body"})
+			return false
+		}
+	}
+	return true
 }
 
 // writeUpkeepWindowClosed is the U11 refusal, shared by both append paths.
@@ -482,22 +525,34 @@ func (s *Server) handleListUpkeepDispositions(w http.ResponseWriter, r *http.Req
 		s.writeUpkeepReportResolveError(w, r, runID, rerr)
 		return
 	}
-	s.respondUpkeepDispositions(w, r, runID, b)
+	s.respondUpkeepDispositions(w, r, runID, b, 0)
 }
 
 // respondUpkeepDispositions writes the 200 shared by both verbs, so the POST
-// echo and the GET read-back are the same bytes by construction.
-func (s *Server) respondUpkeepDispositions(w http.ResponseWriter, r *http.Request, runID uuid.UUID, b *upkeepReportBinding) {
+// echo and the GET read-back are the same bytes by construction. committed is
+// the number of rows the POST's batch has ALREADY made durable when this runs
+// (0 on the GET): a read-back failure there must not read as "nothing
+// recorded", so its 500 says the batch landed (details.recorded = requested)
+// and that a repeat POST is safe (last-wins).
+func (s *Server) respondUpkeepDispositions(w http.ResponseWriter, r *http.Request, runID uuid.UUID, b *upkeepReportBinding, committed int) {
+	readBackFailed := func(what string, err error) {
+		if committed == 0 {
+			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+				what+" failed", map[string]any{"error": err.Error()})
+			return
+		}
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"the disposition batch WAS recorded and is durable, but "+what+" for the read-back failed; re-read with GET, or repeat the POST (safe: capture is last-wins)",
+			map[string]any{"recorded": committed, "requested": committed, "error": err.Error()})
+	}
 	entries, err := s.cfg.AuditRepo.ListForRunByCategory(r.Context(), runID, CategoryUpkeepDispositionRecorded)
 	if err != nil {
-		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-			"listing recorded dispositions failed", map[string]any{"error": err.Error()})
+		readBackFailed("listing recorded dispositions", err)
 		return
 	}
 	settlement, serr := s.windowSettlementFor(r.Context(), runID, audit.UpkeepApplyWindowClosedCategory, b.art.ID.String())
 	if serr != nil {
-		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-			"listing the upkeep capture window failed", map[string]any{"error": serr.Error()})
+		readBackFailed("listing the upkeep capture window", serr)
 		return
 	}
 	s.writeJSON(w, r, http.StatusOK, upkeepDispositionsResponse{
