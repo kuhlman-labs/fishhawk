@@ -392,8 +392,8 @@ assert_contains "a9 unscoped mode DOES emit a changed-line snapshot" \
 
 # a10 — every non-test leg runs UNCHANGED in both modes.
 run_verify "$FX" --packages backend/internal/alpha
-assert_contains "a10 scoped: lint ran in backend" "$FX/logs/lint.log" "backend	run ./..."
-assert_contains "a10 scoped: lint ran in cli" "$FX/logs/lint.log" "cli	run ./..."
+assert_contains "a10 scoped: lint ran in backend" "$FX/logs/lint.log" "backend	run --allow-serial-runners ./..."
+assert_contains "a10 scoped: lint ran in cli" "$FX/logs/lint.log" "cli	run --allow-serial-runners ./..."
 assert_contains "a10 scoped: schema-sync ran" "$FX/logs/gate.log" "sync-schemas"
 assert_contains "a10 scoped: gate harnesses ran" "$FX/logs/gate.log" "test-check-coverage"
 assert_contains "a10 scoped: the new harness is wired in" "$FX/logs/gate.log" "test-verify-scope"
@@ -403,7 +403,7 @@ assert_contains "a10 scoped: ADR record gate ran" "$FX/logs/gate.log" "check-adr
 assert_contains "a10 scoped: ADR harness ran" "$FX/logs/gate.log" "test-adr"
 assert_contains "a10 scoped: run-agent guard harness ran" "$FX/logs/gate.log" "test-is-run-agent"
 run_verify "$FX"
-assert_contains "a10 unscoped: lint ran in backend" "$FX/logs/lint.log" "backend	run ./..."
+assert_contains "a10 unscoped: lint ran in backend" "$FX/logs/lint.log" "backend	run --allow-serial-runners ./..."
 assert_contains "a10 unscoped: schema-sync ran" "$FX/logs/gate.log" "sync-schemas"
 assert_contains "a10 unscoped: gate harnesses ran" "$FX/logs/gate.log" "test-check-coverage"
 assert_contains "a10 unscoped: site voice gate ran" "$FX/logs/gate.log" "check-site-voice"

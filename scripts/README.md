@@ -17,8 +17,15 @@ loop).
 
 ### Lint
 
-`scripts/test lint` runs `golangci-lint run ./...` per registered module —
-byte-for-byte CI's lint invocation (`ci.yml`). Because `.golangci.yml` enables
+`scripts/test lint` runs `golangci-lint run --allow-serial-runners ./...` per
+registered module. That is CI's lint invocation (`ci.yml`) plus one flag
+(#3962): golangci-lint holds a global lock, and without the flag a second
+concurrent instance exits at once with `parallel golangci-lint is running`, so
+two local runs' verify gates (or an operator shell beside a runner's verify)
+failed on each other's lint. With the flag the second instance waits for the
+lock and runs serially. `--allow-parallel-runners` is deliberately not used
+(two concurrent analyses on one shared cache are what the lock prevents), and
+CI's invocation stays flagless because one lint per job never contends. Because `.golangci.yml` enables
 the `gofmt`/`goimports` formatters, golangci-lint v2's `run` fails on
 unformatted files, so `lint` covers gofmt/goimports drift with no separate gofmt
 invocation. `verify` runs `lint` FIRST so a fast format/lint failure leads the

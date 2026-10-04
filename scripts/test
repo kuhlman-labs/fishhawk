@@ -13,7 +13,7 @@
 # Usage:
 #   scripts/test              run `go test -race ./...` in every module
 #   scripts/test coverage     the gate above + scripts/check-coverage.py
-#   scripts/test lint         run `golangci-lint run ./...` in every module
+#   scripts/test lint         run `golangci-lint run --allow-serial-runners ./...` in every module
 #   scripts/test verify       lint + schema-sync + tests + patch-coverage — the runner's gate
 #   scripts/test verify --packages backend/internal/run,cli/internal/spec
 #                             the SCOPED verify form (#3315): every non-test leg
@@ -876,11 +876,20 @@ EOF
   fi
 }
 
+# cmd_lint passes --allow-serial-runners (#3962): golangci-lint holds a global
+# lock, and WITHOUT the flag a second concurrent instance exits immediately with
+# "parallel golangci-lint is running". Two local runs' verify gates (or an
+# operator shell beside a runner's verify) then fail on each other's lint, not on
+# their own code (run 8ffaa5d1 vs 1a0212a7, 2026-10-03). With the flag the second
+# instance WAITS for the lock and runs serially. --allow-parallel-runners is
+# deliberately not used: two concurrent analyses against one shared cache are
+# what the lock exists to prevent. CI runs one lint per job and never contends,
+# so its ci.yml invocation stays flagless; that is the only difference.
 cmd_lint() {
   _require_golangci_lint
   while IFS= read -r m; do
     printf '>>> %s\n' "$m"
-    (cd "$m" && golangci-lint run ./...)
+    (cd "$m" && golangci-lint run --allow-serial-runners ./...)
   done < <(modules)
 }
 
@@ -2019,7 +2028,7 @@ usage: scripts/test [SUBCOMMAND] [ARGS]
 
   test                 (default) run `go test -race ./...` in every module
   coverage             run tests + aggregate coverage gate
-  lint                 run `golangci-lint run ./...` in every module
+  lint                 run `golangci-lint run --allow-serial-runners ./...` in every module
   verify               lint + schema-sync + tests + patch-scoped coverage — the runner's verify gate
   verify --packages P  the SCOPED verify form: P is a comma-separated list of
                        repo-relative package DIRECTORIES (e.g.
