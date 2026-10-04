@@ -6881,3 +6881,94 @@ func TestMigrateDown_ReviewConcernsProvenanceReversal(t *testing.T) {
 		t.Fatalf("review_concerns provenance column count after re-apply = %d, want 2 (0094 re-added them)", n)
 	}
 }
+
+// TestMigrateDown_UserReportCursorsReversal pins 0096 (E81.1 / #3771): after
+// MigrateUp user_report_cursors exists under ENABLE + FORCE row-level security
+// with a user_report_cursors_tenant_isolation policy whose predicates equal
+// captain_read_watermarks' 0089 policy, a row is insertable, and the
+// COALESCE-sentinel unique index collapses a second untenanted row for one
+// (repo, source); after rolling back through 0096 the table and policy are
+// gone, the schema lands on 0095, and a captain_read_watermarks row (0089)
+// survives.
+func TestMigrateDown_UserReportCursorsReversal(t *testing.T) {
+	t.Parallel()
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+	ctx := context.Background()
+
+	var rowSec, forceSec bool
+	if err := pool.QueryRow(ctx,
+		`SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE relname = 'user_report_cursors'`,
+	).Scan(&rowSec, &forceSec); err != nil {
+		t.Fatalf("query user_report_cursors pg_class RLS flags (0096 table missing?): %v", err)
+	}
+	if !rowSec || !forceSec {
+		t.Errorf("user_report_cursors relrowsecurity=%v relforcerowsecurity=%v, want true/true (0096 ENABLE + FORCE)", rowSec, forceSec)
+	}
+	policyPredicates := func(table, policy string) (qual, check string) {
+		t.Helper()
+		if err := pool.QueryRow(ctx,
+			`SELECT qual, with_check FROM pg_policies WHERE tablename = $1 AND policyname = $2`,
+			table, policy,
+		).Scan(&qual, &check); err != nil {
+			t.Fatalf("read %s.%s from pg_policies: %v", table, policy, err)
+		}
+		return qual, check
+	}
+	uQual, uCheck := policyPredicates("user_report_cursors", "user_report_cursors_tenant_isolation")
+	wQual, wCheck := policyPredicates("captain_read_watermarks", "captain_read_watermarks_tenant_isolation")
+	if uQual != wQual || uCheck != wCheck {
+		t.Errorf("user_report_cursors policy predicates drifted from captain_read_watermarks':\n USING      %q\n want       %q\n WITH CHECK %q\n want       %q",
+			uQual, wQual, uCheck, wCheck)
+	}
+
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO user_report_cursors (repo, source, cursor_at) VALUES ('r', 'issues', now())`,
+	); err != nil {
+		t.Fatalf("insert user_report_cursors row after MigrateUp: %v — 0096 must make it insertable", err)
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO user_report_cursors (repo, source, cursor_at) VALUES ('r', 'issues', now())`,
+	); err == nil {
+		t.Errorf("second untenanted cursor row for the same (repo, source) was accepted, want a unique violation")
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO captain_read_watermarks (captain_subject, repo, sequence) VALUES ('cap', 'r', 1)`,
+	); err != nil {
+		t.Fatalf("seed 0089 watermark row: %v", err)
+	}
+
+	downThrough(t, url, "0096")
+
+	var tables, policies int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'user_report_cursors'`,
+	).Scan(&tables); err != nil {
+		t.Fatalf("count user_report_cursors tables after rollback: %v", err)
+	}
+	if tables != 0 {
+		t.Errorf("user_report_cursors table count after rollback = %d, want 0", tables)
+	}
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM pg_policies WHERE policyname = 'user_report_cursors_tenant_isolation'`,
+	).Scan(&policies); err != nil {
+		t.Fatalf("count cursor policy after rollback: %v", err)
+	}
+	if policies != 0 {
+		t.Errorf("user_report_cursors_tenant_isolation policy count after rollback = %d, want 0", policies)
+	}
+	var survivors int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM captain_read_watermarks WHERE repo = 'r'`).Scan(&survivors); err != nil {
+		t.Fatalf("re-read 0089 captain_read_watermarks after rolling back 0096: %v", err)
+	}
+	if survivors != 1 {
+		t.Errorf("0089 captain_read_watermarks rows after rolling back 0096 = %d, want 1 (untouched)", survivors)
+	}
+}
