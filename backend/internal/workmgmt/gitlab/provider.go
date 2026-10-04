@@ -12,6 +12,9 @@
 // relates_to links, confirmed by the child's `Parent epic:` body marker) and
 // IssueSetDependencyResolver (#2051, items / grooming-order mode), both in
 // campaign.go with is_blocked_by links as the depends_on source (#3658). The
+// UserReportReader capability (E81.1 / #3771) is implemented in
+// userreports.go: issue and note activity since a cursor, with every gap the
+// GitLab API leaves named on the page as a degradation code. The
 // Transitioner (#1012), NumberDiscoverer (#1269) and WorkItemReader (#2230)
 // capabilities are still deliberately NOT implemented. Because board placement
 // rides the create as a label, no separate transition call exists; the

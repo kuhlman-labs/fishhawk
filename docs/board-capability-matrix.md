@@ -45,6 +45,41 @@ Two pairs are distinct on purpose. `no_project_configured` vs `no_projects_token
 | `backend/internal/workmgmt/gitlab/provider.go` | The label-driven board model and the deliberate non-implementation of `WorkItemReader`, pinned by `TestProvider_DoesNotImplementWorkItemReader` (which would not compile had the methods been folded into `Provider`). |
 | `backend/internal/mcpserver/board_read_guard_test.go` | The ADR-064 invariant that **no board-read path reaches the MCP agent tool surface**. An agent acting on a stale, unaudited, rate-limited, truncation-prone board column would be acting on unreconciled run state. It is a source-level, tamper-evident check over `mcpserver`'s full in-repo dependency closure, not a runtime capability boundary. |
 
+## User-report read (`UserReportReader`, E81.1 / #3771)
+
+A second optional read capability, resolved through `workmgmt.UserReportReaderFor(id)` (`backend/internal/workmgmt/userreports.go`): list every issue and issue comment created or updated since a cursor, with author, forge association and reaction counts. It reads the forge's **issues**, not a board, so none of the board credential cases above apply. It shares the `UnavailableError` contract: a degradation that prevents an honest answer is a typed error with a **nil** page. A gap that still allows an honest answer is **named on the page** as a degradation code, never silent.
+
+| Case | `UserReportReader` | Hard failures (nil page) | Named page gaps |
+|---|---|---|---|
+| **GitHub** | Implemented. Uses the repo-wide issues listing (pull requests skipped) and the repo-wide issue-comments listing (PR-conversation comments dropped), both walked oldest-first under a keyset bound. | `no_installation`, `forbidden`, `not_implemented` (an API client without the listings), and `workmgmt.ErrUserReportUnresumable` (the page cap was exhausted inside one equal-timestamp run at the cursor). | `association_unresolved` / `reactions_partial` only when GitHub omitted the field. `scan_truncated` / `cursor_anchor_unavailable` when they occur. |
+| **GitLab** | Implemented. GitLab has no project-wide notes listing, so notes are listed per updated issue and filtered by `updated_at` against a separate note floor (`NoteSince`) that an issue-listing truncation does not advance. Membership comes from `GET /projects/:id/members/all/:user_id`, read once per author. | `forbidden` (401/403 on the project, issues or notes read), `not_implemented`, `workmgmt.ErrUserReportUnresumable`. A missing `gitlab` connection or project path is a plain error. | **Always** `reactions_partial`, `comment_reactions_unavailable`, `comments_via_issue_activity`, `bot_detection_heuristic`. Also `association_unresolved` (a failed member lookup), `confidential_excluded`, `scan_truncated` and `cursor_anchor_unavailable` when they occur. |
+| **Jira** | Not implemented. | `not_implemented` from the chokepoint. | — |
+
+### User-report degradation vocabulary
+
+There are two closed sets. They never share a value.
+
+**Page-level codes** are `workmgmt.UserReportDegradationCode`, set by a provider on `UserReportPage.Degradations`:
+
+| Code | Meaning |
+|---|---|
+| `reactions_partial` | Some items carry no full reaction rollup: GitHub omitted the `reactions` object, or the item is a GitLab issue, which carries only thumbs up/down. Zero counts under `Reactions.Resolved == false` mean unknown, not none. |
+| `comment_reactions_unavailable` | The forge's comment listing carries no reactions at all (GitLab notes). |
+| `comments_via_issue_activity` | Comments are found through their issue's `updated_at`, which relies on the forge touching the issue when a note is saved (GitLab). |
+| `bot_detection_heuristic` | Bots are detected from system notes and from access-token-bot usernames that a project-member lookup **corroborates**. Other service accounts are classified by membership (GitLab). |
+| `association_unresolved` | The forge did not say how some authors relate to the repo: GitHub omitted `author_association`, or a GitLab member lookup failed. An unresolved author is **never** internal or bot. |
+| `cursor_anchor_unavailable` | No parseable `Date` header came back on the scan's first response, so `NextCursor` holds at `Since`. |
+| `scan_truncated` | A listing hit its page cap with items remaining. `NextCursor` stops at the last fully-read `updated_at` — or at an equal-timestamp run the walk had not yet confirmed — so the next scan continues from there. On GitLab the note floor (`NextNoteCursor`) holds. |
+| `confidential_excluded` | Confidential issues (with their notes) and internal notes were **excluded** from the page (GitLab). An issue seen confidential in ANY occurrence during the listing is excluded wholesale, with no notes read for it; a note seen internal in any listing is excluded by id. |
+
+**Report-level code** is owned by `backend/internal/userreport` and set by `Scan`, not by a provider:
+
+| Code | Meaning |
+|---|---|
+| `captain_unavailable` | The current captain could not be used as an internal-author signal. The cause is no captain reader configured for the scan, a captain read error (fixed `Detail`; the raw error is logged), a subject that is not identity-verified, or a subject qualified for a different forge. A **vacant** captain is a normal state: no code and no captain arm. |
+
+`TestBoardCapabilityMatrixDocumentsEveryUserReportDegradationCode` (`backend/internal/workmgmt/userreports_test.go`) fails when a page-level code is missing from this table.
+
 ## Selection config
 
 A tenant declares **which board view feeds work selection** with the optional `selection` block in `work-management-v0` — see [`docs/spec/work-management-v0.md` § Selection](spec/work-management-v0.md#selection).
