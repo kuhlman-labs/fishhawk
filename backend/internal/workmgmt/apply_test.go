@@ -2,6 +2,7 @@ package workmgmt
 
 import (
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -1099,5 +1100,59 @@ func TestRenderTitle_CountsRunesNotBytes(t *testing.T) {
 	}
 	if se.Details["derived_title_length"] != MaxTitleRunes+1 {
 		t.Errorf("derived_title_length = %v, want %d (runes)", se.Details["derived_title_length"], MaxTitleRunes+1)
+	}
+}
+
+// TestApply_SourceRefsAreInert pins that FilingRequest.SourceRefs never leaks
+// into what Apply renders (#3774): the WorkItem and the allocated number are
+// identical with and without it, for a skeleton body, a caller body and a
+// numbered type. Its only consumer is the server's intake hook.
+func TestApply_SourceRefsAreInert(t *testing.T) {
+	conv := testConventions(t)
+	for name, req := range map[string]FilingRequest{
+		"feature with caller body": {
+			Type:      "feature",
+			Summary:   "do the thing",
+			Body:      "## Summary\n\ndo the thing\n",
+			TitleVars: map[string]string{"epic": "1", "n": "1"},
+			Relations: Relations{ParentEpic: "#1"},
+			Labels:    []string{"area:backend"},
+		},
+		"chore with skeleton body": {
+			Type:      "chore",
+			Summary:   "tidy the thing",
+			Sections:  map[string]string{"Summary": "tidy it"},
+			TitleVars: map[string]string{"epic": "1", "n": "2"},
+		},
+		"numbered adr": {
+			Type:            "adr",
+			Summary:         "use postgres",
+			Body:            "## Context\n\n…\n",
+			ExistingNumbers: []int{34, 12, 35},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			plain, plainNum, err := Apply(req, conv)
+			if err != nil {
+				t.Fatalf("Apply (no refs): %v", err)
+			}
+			withRefs := req
+			withRefs.SourceRefs = []string{"#1234", "77", "not-a-ref"}
+			got, gotNum, err := Apply(withRefs, conv)
+			if err != nil {
+				t.Fatalf("Apply (with refs): %v — Apply must not read SourceRefs, malformed or not", err)
+			}
+			if gotNum != plainNum {
+				t.Errorf("number = %d with refs, %d without", gotNum, plainNum)
+			}
+			if !reflect.DeepEqual(got, plain) {
+				t.Errorf("SourceRefs changed the applied item:\n with: %+v\n w/o:  %+v", got, plain)
+			}
+			for _, leak := range []string{"1234", "#77", "not-a-ref"} {
+				if strings.Contains(got.Title, leak) || strings.Contains(got.Body, leak) {
+					t.Errorf("source ref %q leaked into the rendered title/body: %q / %q", leak, got.Title, got.Body)
+				}
+			}
+		})
 	}
 }

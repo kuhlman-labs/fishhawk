@@ -14,6 +14,16 @@ target repository's existing items:
 - **A provisional charter-anchored score** — citing only the rubric lines
   that are decidable from the filing's own structure.
 
+Plus one piece of provenance that is NOT a signal: **derives-from**. A filing
+may declare the same-repo items it was written from (`Filing.SourceNumbers`,
+parsed from the filer's `source_refs` by `ParseSourceRefs`). `Duplicates`
+excludes those items before scoring — a draft derived from `#X` is never
+reported as `#X`'s duplicate, while an unrelated near-duplicate `#Y` still is —
+and `Evaluate` reports them as `Signals.DerivesFrom` (resolved against the
+window by `DerivesFromWindow`: title/url/closed with `in_window: true`, or
+number-only with `in_window: false`). The epic suggestion is unaffected: a
+source item may legitimately be the right parent (#3774, E81.4).
+
 Plus the body surface: `RenderBody` appends a human-readable advisory
 section and a hidden single-line marker, and `ParseBody` recovers the
 signals from that marker so #2236's periodic sweep can read the intake
@@ -63,6 +73,17 @@ unit-testable against literals.
 - `RenderBody` is a **no-op** when the signals are degraded and carry no
   findings: the filed body is then byte-identical to the one it would have
   had before this feature existed.
+- `HasFindings` deliberately ignores `DerivesFrom`: it echoes what the filer
+  declared, not anything grooming found, so a degraded filing that declared
+  source refs still files a byte-identical body. When the section does render,
+  a non-empty `DerivesFrom` adds a **Derives from** block between the
+  duplicates and the epic suggestion, stating the items were excluded from the
+  duplicate candidates.
+- `ParseSourceRefs` accepts `#N` or `N` (`N > 0`, ASCII digits, trimmed),
+  dedupes in first-seen order, and fails the WHOLE list with a nil result and a
+  `*SourceRefError` naming the first malformed ref. A cross-repo
+  `owner/repo#N` ref is malformed, not ignored: the window only scans the
+  target repo, so honouring it would be a silent no-op.
 
 ## Why degradation, not fail-closed
 
@@ -197,8 +218,13 @@ Moving any of them touches no wiring.
 ## Marker format
 
 ```
-<!-- fishhawk-intake:v1 {"duplicates":[...],"score":{...},...} -->
+<!-- fishhawk-intake:v1 {"duplicates":[...],"derives_from":[...],"score":{...},...} -->
 ```
+
+`derives_from` is additive and `omitempty`, so the marker stays `v1` and a
+marker written without it parses unchanged. A `fishhawkd` built before #3774
+rejects a marker carrying it (unknown field), which fails closed (`ok=false`),
+never a misparse.
 
 One HTML comment, one line, a version token — mirroring the existing
 `fishhawk-fingerprint` marker convention in
@@ -222,7 +248,9 @@ from the closed set, `unscored` exactly when no citation survived (with the
 gap stated), a rubric id and quote on every citation, at most
 `MaxDuplicates` duplicates, and a 1-based tracker number, non-empty title,
 `(0,1]` score and known confidence band on every duplicate and epic
-suggestion. Anything short of that is rejected: a hand-edited `{}`, a
+suggestion, and a 1-based, unique number on every `derives_from` entry (a
+title is NOT required even in-window — the window echoes the tracker's title
+verbatim, and an untitled source is one the writer can emit). Anything short of that is rejected: a hand-edited `{}`, a
 truncated candidate object or a payload with a second JSON value appended
 returns `ok=false` rather than a partially-populated analysis a consumer
 would trust.
