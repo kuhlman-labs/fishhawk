@@ -38,6 +38,7 @@ type FileIssueInput struct {
 	Status          string              `json:"status,omitempty" jsonschema:"overrides the type's default board status/column"`
 	Relations       *FileIssueRelations `json:"relations,omitempty" jsonschema:"provider-neutral relations: parent epic, supersedes, companion, evidence runs"`
 	ExistingNumbers []int               `json:"existing_numbers,omitempty" jsonschema:"OPTIONAL for a numbered type (e.g. adr, epic): the backend now discovers the numbers already in use server-side from the tracker, so you do not need to supply them. Pass existing_numbers only to override/hint discovery, or seed existing_numbers:[0] (which yields 1) if discovery is unavailable for the target provider"`
+	SourceRefs      []string            `json:"source_refs,omitempty" jsonschema:"same-repo refs ('#N' or 'N') to the existing items this draft derives from (e.g. the review concern or user report it was written from); they are EXCLUDED from the intake duplicate candidates and reported as intake.derives_from instead. A malformed ref (including owner/repo#N) is refused 400 validation_failed"`
 	RunID           string              `json:"run_id,omitempty" jsonschema:"optional in-flight run UUID; when set and non-terminal a work_item_filed audit entry is appended to it. Falls back to FISHHAWK_RUN_ID env when omitted"`
 }
 
@@ -131,7 +132,13 @@ act on them as decisions. NOTHING was closed, merged, relabelled or
 transitioned on the strength of a duplicate candidate — the dedup decision
 stays a human/workflow action, and the same signals are also appended to the
 created issue body as an advisory section. Duplicate matching is LEXICAL, not
-semantic, so false positives and false negatives are expected. When intake is
+semantic, so false positives and false negatives are expected. Pass
+source_refs ('#N' or 'N', same repo) naming the items this draft derives from
+(the concern or report it was written from): they are excluded from the
+duplicate candidates, so a draft is never reported as its own source's
+duplicate, and are reported as intake.derives_from instead; an unrelated near
+duplicate is still flagged. To see the rendered draft and its intake signals
+BEFORE filing anything, call fishhawk_preview_issue (operator-only). When intake is
 absent, or present with degraded:true and a degrade_reason (reader_unavailable,
 reader_error, charter_undeclared, charter_unresolved, charter_rubric_unparsed,
 budget_exceeded, hook_panic, seam_unwired), that is NORMAL and not an error:
@@ -186,16 +193,9 @@ func (r *runResolver) fileIssue(ctx context.Context, _ *mcp.CallToolRequest, in 
 		Complexity:      in.Complexity,
 		Status:          in.Status,
 		ExistingNumbers: in.ExistingNumbers,
+		SourceRefs:      in.SourceRefs,
 		RunID:           strings.TrimSpace(runID),
-	}
-	if in.Relations != nil {
-		req.Relations = &WorkItemRelations{
-			ParentEpic:   in.Relations.ParentEpic,
-			Supersedes:   in.Relations.Supersedes,
-			CompanionTo:  in.Relations.CompanionTo,
-			EvidenceRuns: in.Relations.EvidenceRuns,
-			DependsOn:    in.Relations.DependsOn,
-		}
+		Relations:       fileIssueRelations(in.Relations),
 	}
 
 	item, err := r.api.FileWorkItem(ctx, req)
@@ -219,4 +219,21 @@ func (r *runResolver) fileIssue(ctx context.Context, _ *mcp.CallToolRequest, in 
 		return nil, FileIssueOutput{}, fmt.Errorf("file work item: %w", err)
 	}
 	return nil, FileIssueOutput{Item: *item}, nil
+}
+
+// fileIssueRelations maps the tool's relations input onto the wire
+// sub-object; nil stays nil so an absent relations key is not sent as {}.
+// Shared by fishhawk_file_issue and fishhawk_preview_issue so the two cannot
+// drift on which links they forward.
+func fileIssueRelations(in *FileIssueRelations) *WorkItemRelations {
+	if in == nil {
+		return nil
+	}
+	return &WorkItemRelations{
+		ParentEpic:   in.ParentEpic,
+		Supersedes:   in.Supersedes,
+		CompanionTo:  in.CompanionTo,
+		EvidenceRuns: in.EvidenceRuns,
+		DependsOn:    in.DependsOn,
+	}
 }

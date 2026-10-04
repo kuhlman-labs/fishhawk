@@ -3396,7 +3396,16 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	// write:approvals; the backend refuses a run-bound token and a delegated
 	// operator-agent token (self-approval). Its own tool, not a grooming
 	// mode: a different report, verdict set and window family. 70 -> 71.
-	const wantToolCount = 71
+	//
+	// #3774 adds exactly ONE tool — fishhawk_preview_issue, the thin wrapper
+	// over POST /v0/work-items/preview. WHEN: the captain wants to see exactly
+	// what a draft work item would look like when filed, with its intake
+	// signals, before anything is filed. ELIGIBILITY: an operator caller; the
+	// backend refuses a run-bound token 403 preview_operator_only (ADR-064: no
+	// agent-reachable tracker read). It creates nothing and writes no audit.
+	// Its own tool, not a file_issue mode: a dry-run flag on a write verb is
+	// one typo away from a filing. 71 -> 72.
+	const wantToolCount = 72
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",
@@ -3437,6 +3446,19 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	}
 	if !sawAnswerDivergence {
 		t.Error("fishhawk_answer_divergence is not in the registered tool list — the divergence answer verb is unreachable")
+	}
+	// fishhawk_preview_issue (#3774) must likewise be wire-visible: the 71 -> 72
+	// bump alone would stay green if its registration were dropped and a
+	// DIFFERENT tool added in the same change.
+	var sawPreviewIssue bool
+	for _, tool := range res.Tools {
+		if tool.Name == "fishhawk_preview_issue" {
+			sawPreviewIssue = true
+			break
+		}
+	}
+	if !sawPreviewIssue {
+		t.Error("fishhawk_preview_issue is not in the registered tool list — the intake preview is unreachable")
 	}
 	// fishhawk_validate (#3579) must likewise be wire-visible, for the same
 	// reason: the count bump alone would stay green if the registration were

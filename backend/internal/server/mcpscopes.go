@@ -182,6 +182,14 @@ var mcpToolScopes = map[string]mcpToolScopeRule{
 	// repo consistency, not on a scope predicate.
 	"fishhawk_file_issue": mcpScopeAuthenticatedOnly,
 
+	// fishhawk_preview_issue POSTs /v0/work-items/preview
+	// (workitem_preview.go handlePreviewWorkItem), which enforces no scope
+	// predicate either: the handler itself refuses a run-bound token 403
+	// preview_operator_only (ADR-064: no agent-reachable tracker read) and
+	// applies the point-read repo-visibility DENY — the same "gate admits, the
+	// handler refuses" posture as fishhawk_file_issue's row (#3774).
+	"fishhawk_preview_issue": mcpScopeAuthenticatedOnly,
+
 	// gateview.go handleGetRunGateView: a run-bound subject is authorized by
 	// its own run; every other identity needs scopeGateViewRead (read:audit).
 	"fishhawk_get_gate_view": {anyOf: []string{scopeGateViewRead}, runBoundSubjectOK: true},

@@ -4318,7 +4318,12 @@ type FileWorkItemRequest struct {
 	Status          string             `json:"status,omitempty"`
 	Relations       *WorkItemRelations `json:"relations,omitempty"`
 	ExistingNumbers []int              `json:"existing_numbers,omitempty"`
-	RunID           string             `json:"run_id,omitempty"`
+	// SourceRefs are same-repo refs ('#N' or 'N') to the existing items this
+	// draft derives from (#3774). The backend excludes them from the intake
+	// duplicate candidates and reports them as intake.derives_from instead; a
+	// malformed ref is refused 400 validation_failed (field source_refs).
+	SourceRefs []string `json:"source_refs,omitempty"`
+	RunID      string   `json:"run_id,omitempty"`
 }
 
 // WorkItemRelations mirrors the wire `relations` sub-object: the
@@ -4383,7 +4388,11 @@ type FiledWorkItem struct {
 // Everything here is ADVISORY. Nothing was closed, merged, relabelled or
 // transitioned on the strength of it, and Degraded is a normal outcome.
 type IntakeSignals struct {
-	Duplicates      []IntakeDuplicate     `json:"duplicates,omitempty"`
+	Duplicates []IntakeDuplicate `json:"duplicates,omitempty"`
+	// DerivesFrom echoes the filing's declared source_refs (#3774), resolved
+	// against the scanned window. Those items were EXCLUDED from Duplicates;
+	// this is provenance, not a finding.
+	DerivesFrom     []IntakeSourceItem    `json:"derives_from,omitempty"`
 	EpicSuggestion  *IntakeEpicSuggestion `json:"epic_suggestion,omitempty"`
 	Score           IntakeScore           `json:"score"`
 	Degraded        bool                  `json:"degraded"`
@@ -4404,6 +4413,19 @@ type IntakeDuplicate struct {
 	Confidence string  `json:"confidence"`
 	Basis      string  `json:"basis"`
 	Closed     bool    `json:"closed"`
+}
+
+// IntakeSourceItem is one item the filing declared it derives from
+// (source_refs, #3774), resolved against the duplicate window. InWindow false
+// means the item was outside the scanned window: only Number is known, and
+// Closed false is "unknown", not "open". It was excluded from the duplicate
+// candidates.
+type IntakeSourceItem struct {
+	Number   int    `json:"number"`
+	Title    string `json:"title,omitempty"`
+	URL      string `json:"url,omitempty"`
+	Closed   bool   `json:"closed"`
+	InWindow bool   `json:"in_window"`
 }
 
 // IntakeEpicSuggestion is the suggested parent epic for a filing that declared
@@ -4456,6 +4478,58 @@ func (c *apiClient) FileWorkItem(ctx context.Context, req FileWorkItemRequest) (
 	}
 	var out FiledWorkItem
 	if err := c.do(ctx, http.MethodPost, "/v0/work-items", body, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// WorkItemPreview mirrors the backend's POST /v0/work-items/preview 200 body
+// (`backend/internal/server/workitem_preview.go::workItemPreviewResponse`,
+// #3774): exactly what a filing of the same draft WOULD send — the rendered
+// title, the body provider.File would receive (advisory section and hidden
+// marker included), the merged labels and the sequential number a filing
+// would allocate (0 when the type is not numbered) — plus the intake signals.
+// Nothing was created, no audit was written and no number was reserved, so
+// Number and the intake window are a point-in-time view.
+//
+// A LOCAL decode-only mirror for the same ADR-064 reason as IntakeSignals:
+// workmgmt must not be reachable from this package.
+type WorkItemPreview struct {
+	Type                   string             `json:"type"`
+	Title                  string             `json:"title"`
+	Body                   string             `json:"body"`
+	Labels                 []string           `json:"labels"`
+	Number                 int                `json:"number,omitempty"`
+	Provider               string             `json:"provider"`
+	Complexity             string             `json:"complexity,omitempty"`
+	Status                 string             `json:"status,omitempty"`
+	BoardColumn            string             `json:"board_column,omitempty"`
+	Relations              *WorkItemRelations `json:"relations,omitempty"`
+	DefaultedLabels        []string           `json:"defaulted_labels,omitempty"`
+	MissingLabelNamespaces []string           `json:"missing_label_namespaces,omitempty"`
+	Intake                 IntakeSignals      `json:"intake"`
+}
+
+// PreviewWorkItem renders a draft through the repo's conventions and the
+// intake hook WITHOUT filing it, via `POST /v0/work-items/preview` (#3774).
+// It never sends run_id: the preview writes no audit and is not run-scoped,
+// and the backend refuses a run_id 400. 4xx/5xx surface as *apiError:
+//   - 400 validation_failed (repo/type/summary, a malformed source_refs entry,
+//     or a run_id)
+//   - 401 authentication_required (anonymous caller)
+//   - 403 preview_operator_only (a run-bound token: the preview reads tracker
+//     titles without filing, which ADR-064 keeps off the agent surface)
+//   - 403 repo_forbidden (a session that cannot see the repo)
+//   - 422 work_item_invalid (the draft violates the type's conventions)
+//   - 501 provider_unimplemented
+func (c *apiClient) PreviewWorkItem(ctx context.Context, req FileWorkItemRequest) (*WorkItemPreview, error) {
+	req.RunID = ""
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("marshal preview-work-item: %w", err)
+	}
+	var out WorkItemPreview
+	if err := c.do(ctx, http.MethodPost, "/v0/work-items/preview", body, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
