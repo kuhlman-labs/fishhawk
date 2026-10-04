@@ -220,7 +220,14 @@ contract); `cmd/fishhawk-runner/gateisolation.go` is the runner-side glue.
 **Three startup variables.** `FISHHAWK_GATE_ISOLATION` (`auto` default |
 `container` | `clone-sandbox` | `clone`), `FISHHAWK_GATE_IMAGE` (empty default
 — the container path is unavailable without it, so a default runner's
-behaviour is unchanged except for the clone materialization below) and
+behaviour is unchanged except for the clone materialization below; for this
+repository the recommended value, once
+[#2137](https://github.com/kuhlman-labs/fishhawk/issues/2137) lands, is the
+digest-pinned in-repo `fishhawk-gate` image, `deploy/gate-image/README.md`
+(E51.17 / #3966), later declared via #2136's gate field — **do NOT set it for
+this repository before #2137**: `auto` then prefers the container path, whose
+`--network=none` cannot reach the testcontainers Postgres, and every verify
+fails) and
 `FISHHAWK_DEPLOYMENT_PROFILE` (`local` default | `self-hosted` | `hosted`). A
 bad value, or `hosted` with an explicit fallback mode, fails the runner with
 `runner_failed reason=config` before it contacts the backend; a valid config

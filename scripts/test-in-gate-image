@@ -1,0 +1,503 @@
+#!/usr/bin/env bash
+# Hermetic test for scripts/test's `verify --no-tests` and `lint|verify
+# --in-gate-image` (E51.17 / #3966). Two vehicles:
+#
+#   * END-TO-END cases execute a COPY of the real scripts/test (with the real
+#     scripts/check-gate-image and deploy/gate-image/Dockerfile beside it) inside
+#     a temp git fixture, with a fake `docker` on PATH. The fake logs every
+#     invocation, answers `image inspect` / `pull` / the check-gate-image probe
+#     from env knobs, and for the INNER command (`... scripts/test ...`) records
+#     its full argv and whether the harness-owned verify lock was HELD at that
+#     instant, then exits with a scripted status.
+#   * LIB-ONLY cases source the real scripts/test (FISHHAWK_TEST_LIB_ONLY=1) in a
+#     subshell, stub the legs by name and drive cmd_verify / _verify_gate_image_pins
+#     / _verify_gate_harnesses directly.
+#
+# Hazards carried from precedent: every cmd_verify drive stubs
+# _verify_gate_harnesses (the real one would re-run THIS harness without bound,
+# as scripts/test-patch-coverage notes), and the harness exports its OWN
+# FISHHAWK_VERIFY_LOCK_PATH (the parent verify already holds the real lock,
+# #3451).
+#
+# DOCKER-FREE PATH (approval condition 5): every end-to-end case runs under a
+# PATH built from a temp dir of symlinks to ONLY the binaries scripts/test and
+# check-gate-image need — never /usr/bin, which holds docker on a typical Linux
+# host. The fake docker dir is prepended for the docker-present cases; the
+# precondition that docker does not resolve on the bare symlink PATH is asserted
+# before any case.
+#
+# House style follows scripts/test-check-gate-image: PASS/FAIL counters,
+# non-zero exit on any FAIL, no network, no real Docker. Run by `scripts/test
+# verify` via _verify_gate_harnesses, and standalone.
+#
+# ---------------------------------------------------------------------------
+# COUNTERFACTUALS — run EMPIRICALLY against scripts/test, each by mutating the
+# control's BODY or deleting its CALL SITE (never a referenced function), this
+# harness run, the named cases observed RED, the file restored and
+# cmp-verified byte-identical:
+#   --in-gate-image + --packages rejection made a no-op      -> i1 i1b
+#   --no-tests + --packages rejection made a no-op           -> i2
+#   FISHHAWK_VERIFY_PACKAGES ignore under --no-tests removed -> i2b
+#   unknown lint option accepted (`shift` instead of exit)   -> i2c
+#   docker-absent guard made a no-op                         -> i3 i3b
+#   `_acquire_verify_lock` CALL deleted from cmd_in_gate_image -> i4 i5
+#   `-e FISHHAWK_VERIFY_LOCK_PATH=...` argument deleted      -> i6
+#   common-dir mount call deleted                            -> i7
+#   `exit "$rc"` replaced by `exit 0`                        -> i8
+#   --no-tests early return deleted from cmd_verify          -> i9
+#   `_verify_gate_image_pins` CALL deleted from cmd_verify   -> i10c
+#   _verify_gate_image_pins skip guard deleted               -> i10a
+#   pre-run check-gate-image call made permissive (`|| true`) -> i11 i11b
+#   pull-failure guard made a fall-through                   -> i12b
+#   sha256: ID validation made permissive                    -> i17
+#   missing check-gate-image guard deleted                   -> i14
+#   cache mkdir failure guard made a no-op                   -> i15
+#   test-in-gate-image removed from _verify_gate_harnesses   -> i16
+# ---------------------------------------------------------------------------
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+PASS=0
+FAIL=0
+
+pass() { echo "PASS: $1"; PASS=$((PASS + 1)); }
+fail() { echo "FAIL: $1"; FAIL=$((FAIL + 1)); }
+
+assert_contains() { # <desc> <file> <needle>
+  if grep -qF -- "$3" "$2" 2>/dev/null; then pass "$1"; else
+    fail "$1 (expected '$3' in $2)"
+    sed -n '1,30p' "$2" 2>/dev/null | sed 's/^/    | /'
+  fi
+}
+assert_not_contains() { # <desc> <file> <needle>
+  if grep -qF -- "$3" "$2" 2>/dev/null; then
+    fail "$1 (unexpected '$3' in $2)"
+    sed -n '1,30p' "$2" 2>/dev/null | sed 's/^/    | /'
+  else pass "$1"; fi
+}
+assert_eq() { # <desc> <expected> <actual>
+  if [ "$2" = "$3" ]; then pass "$1"; else fail "$1 (expected '$2', got '$3')"; fi
+}
+assert_absent() { # <desc> <path>
+  if [ -e "$2" ] || [ -L "$2" ]; then fail "$1 ($2 exists)"; else pass "$1"; fi
+}
+
+# Signing-agnostic, as scripts/test is: the fixture commits must never inherit
+# an operator's global commit.gpgsign. Ambient knobs that would change what the
+# copied scripts/test does are cleared.
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null
+unset FISHHAWK_TEST_GATE_IMAGE FISHHAWK_VERIFY_PACKAGES FISHHAWK_VERIFY_LOCK_OWNER \
+      FISHHAWK_GATE_CACHE_DIR FISHHAWK_TEST_LIB_ONLY
+
+tmproot="$(mktemp -d)"
+HOLDER=""
+trap '[ -n "$HOLDER" ] && kill "$HOLDER" 2>/dev/null; rm -rf "$tmproot"' EXIT
+
+# --- docker-free PATH from symlinks ------------------------------------------
+SAFEBIN="$tmproot/safebin"
+mkdir -p "$SAFEBIN"
+for b in bash sh env dirname basename cat head tail tr sed awk grep git ln \
+         readlink rm mkdir mktemp id sleep cut sort uname mv cp chmod touch wc; do
+  p="$(command -v "$b" 2>/dev/null || true)"
+  if [ -z "$p" ]; then
+    echo "test-in-gate-image: required binary '$b' not found on PATH" >&2
+    exit 1
+  fi
+  ln -s "$p" "$SAFEBIN/$b"
+done
+if PATH="$SAFEBIN" bash -c 'command -v docker' >/dev/null 2>&1; then
+  echo "test-in-gate-image: precondition failed — docker resolves on the symlinked PATH" >&2
+  exit 1
+fi
+
+# --- pins, read from the REAL Dockerfile so a pin bump never reddens this ----
+dockerfile_arg() {
+  sed -nE "s/^[[:space:]]*ARG[[:space:]]+$1=([^[:space:]]+).*/\\1/p" \
+    "$REPO_ROOT/deploy/gate-image/Dockerfile" | head -n 1
+}
+PIN_GO="$(dockerfile_arg GO_VERSION)"
+PIN_GL="$(dockerfile_arg GOLANGCI_LINT_VERSION)"
+PIN_HELM="$(dockerfile_arg HELM_VERSION)"
+PIN_CJ="$(dockerfile_arg CHECK_JSONSCHEMA_VERSION)"
+if [ -z "$PIN_GO" ] || [ -z "$PIN_GL" ] || [ -z "$PIN_HELM" ] || [ -z "$PIN_CJ" ]; then
+  echo "test-in-gate-image: cannot read the ARG pins from deploy/gate-image/Dockerfile" >&2
+  exit 1
+fi
+
+# --- fake docker -------------------------------------------------------------
+# Knobs (env, inherited through scripts/test and check-gate-image):
+#   FAKE_STATE dir         per-case scratch: log, inner.argv, inner.lock, pulled
+#   FAKE_LOCK path         the harness-owned verify lock, probed by the INNER run
+#   FAKE_GO/GL/HELM/CJ     versions the probe reports (default: the pins)
+#   FAKE_ID                what `image inspect` prints as the ID
+#   FAKE_INSPECT_MISSING=1 inspect fails until a successful pull
+#   FAKE_INSPECT_MISSING=once  only the FIRST inspect fails, whatever pull did
+#                          (isolates the pull-failure guard from the post-pull
+#                          inspect that would otherwise mask it)
+#   FAKE_PULL_RC           pull's exit status (default 0)
+#   FAKE_INNER_RC          the inner command's exit status (default 0)
+FAKEBIN="$tmproot/fakebin"
+mkdir -p "$FAKEBIN"
+cat > "$FAKEBIN/docker" <<'EOF'
+#!/bin/sh
+printf '%s %s\n' "$1" "${2:-}" >> "$FAKE_STATE/log"
+case "$1" in
+  image)
+    if [ "${FAKE_INSPECT_MISSING:-0}" = 1 ] && [ ! -e "$FAKE_STATE/pulled" ]; then
+      echo "Error: No such image: $4" >&2
+      exit 1
+    fi
+    if [ "${FAKE_INSPECT_MISSING:-0}" = once ] && [ ! -e "$FAKE_STATE/inspected" ]; then
+      : > "$FAKE_STATE/inspected"
+      echo "Error: No such image: $4" >&2
+      exit 1
+    fi
+    id="${FAKE_ID:-sha256:1111111111111111111111111111111111111111111111111111111111111111}"
+    printf '%s fishhawk-gate@%s\n' "$id" "$id"
+    exit 0 ;;
+  pull)
+    printf 'pull-ref %s\n' "$2" >> "$FAKE_STATE/log"
+    rc="${FAKE_PULL_RC:-0}"
+    if [ "$rc" = 0 ]; then : > "$FAKE_STATE/pulled"; fi
+    exit "$rc" ;;
+  run)
+    inner=0
+    for a in "$@"; do
+      if [ "$a" = scripts/test ]; then inner=1; fi
+    done
+    if [ "$inner" = 1 ]; then
+      line="|"
+      for a in "$@"; do line="$line$a|"; done
+      printf '%s\n' "$line" > "$FAKE_STATE/inner.argv"
+      if [ -L "$FAKE_LOCK" ]; then
+        printf 'held:%s\n' "$(readlink "$FAKE_LOCK")" > "$FAKE_STATE/inner.lock"
+      else
+        printf 'free\n' > "$FAKE_STATE/inner.lock"
+      fi
+      exit "${FAKE_INNER_RC:-0}"
+    fi
+    printf 'go=go version go%s linux/arm64\n' "$FAKE_GO"
+    printf 'golangci-lint=golangci-lint has version %s built with go1.25.5\n' "${FAKE_GL#v}"
+    printf 'helm=%s+g0000000\n' "$FAKE_HELM"
+    printf 'check-jsonschema=check-jsonschema, version %s\n' "$FAKE_CJ"
+    printf 'docker=absent\n'
+    exit 0 ;;
+esac
+echo "fake docker: unexpected argv: $*" >&2
+exit 99
+EOF
+chmod +x "$FAKEBIN/docker"
+
+# --- fixture -----------------------------------------------------------------
+FX="$tmproot/fx"
+mkdir -p "$FX/scripts" "$FX/deploy/gate-image"
+cp "$REPO_ROOT/scripts/test" "$REPO_ROOT/scripts/check-gate-image" "$FX/scripts/"
+cp "$REPO_ROOT/deploy/gate-image/Dockerfile" "$FX/deploy/gate-image/Dockerfile"
+chmod +x "$FX/scripts/test" "$FX/scripts/check-gate-image"
+(
+  cd "$FX" || exit 1
+  git init -q -b main . && git config user.email h@example.invalid \
+    && git config user.name harness && git config commit.gpgsign false \
+    && git add -A && git commit -q -m fixture
+) >/dev/null 2>&1 || { echo "test-in-gate-image: fixture git init failed" >&2; exit 1; }
+FX="$(cd "$FX" && pwd)"
+LOCK="$tmproot/verify.lock"
+CACHE="$tmproot/cache"
+
+# st CASE ROOT PATHMODE ARGS... — run ROOT/scripts/test with a fresh FAKE_STATE.
+# PATHMODE is `docker` (fake prepended) or `nodocker`. Knobs come from the
+# caller's environment prefix; KEEP_LOCK=1 keeps a seeded lock instead of
+# clearing it. Sets $out (combined output file), $st (state dir), $rc.
+st() {
+  local name="$1" root="$2" mode="$3" p
+  shift 3
+  st="$tmproot/state-$name"
+  out="$tmproot/out-$name"
+  mkdir -p "$st"
+  : > "$st/log"
+  if [ "$mode" = docker ]; then p="$FAKEBIN:$SAFEBIN"; else p="$SAFEBIN"; fi
+  if [ "${KEEP_LOCK:-0}" != 1 ]; then rm -f "$LOCK"; fi
+  ( cd "$root" && env PATH="$p" FAKE_STATE="$st" FAKE_LOCK="$LOCK" \
+      FAKE_GO="${FAKE_GO:-$PIN_GO}" FAKE_GL="${FAKE_GL:-$PIN_GL}" \
+      FAKE_HELM="${FAKE_HELM:-$PIN_HELM}" FAKE_CJ="${FAKE_CJ:-$PIN_CJ}" \
+      FISHHAWK_VERIFY_LOCK_PATH="$LOCK" FISHHAWK_GATE_CACHE_DIR="${CASE_CACHE:-$CACHE}" \
+      "$root/scripts/test" "$@" ) > "$out" 2>&1
+  rc=$?
+}
+
+# --- i1/i1b/i2/i2c: argument validation precedes the docker probe ------------
+st i1 "$FX" docker verify --in-gate-image --packages backend/internal/run
+assert_eq "i1: verify --in-gate-image --packages exits 1" 1 "$rc"
+assert_contains "i1: the rejection names --packages" "$out" "--in-gate-image cannot be combined with --packages"
+assert_eq "i1: docker was never invoked" "" "$(cat "$st/log")"
+
+st i1b "$FX" nodocker verify --in-gate-image --packages backend/internal/run
+assert_eq "i1b: docker absent: still exits 1 on the argument" 1 "$rc"
+assert_contains "i1b: the --packages rejection wins over the docker probe" "$out" "--in-gate-image cannot be combined with --packages"
+assert_not_contains "i1b: the docker probe never ran" "$out" "docker not found"
+
+st i2 "$FX" docker verify --no-tests --packages backend/internal/run
+assert_eq "i2: verify --no-tests --packages exits 1" 1 "$rc"
+assert_contains "i2: the rejection names --no-tests" "$out" "--no-tests cannot be combined with --packages"
+assert_eq "i2: docker was never invoked" "" "$(cat "$st/log")"
+
+i2b_out="$(
+  FISHHAWK_TEST_LIB_ONLY=1 source "$REPO_ROOT/scripts/test" >/dev/null 2>&1
+  set +e
+  FISHHAWK_VERIFY_PACKAGES=backend/internal/run _parse_verify_args --no-tests 2>&1
+  printf 'VP=[%s] NT=%s\n' "$VERIFY_PACKAGES" "$VERIFY_NO_TESTS"
+)"
+if printf '%s' "$i2b_out" | grep -qF 'VP=[] NT=1' \
+   && printf '%s' "$i2b_out" | grep -qF 'ignoring FISHHAWK_VERIFY_PACKAGES'; then
+  pass "i2b: --no-tests ignores the FISHHAWK_VERIFY_PACKAGES fallback with a printed note"
+else
+  fail "i2b: env fallback under --no-tests ('$i2b_out')"
+fi
+
+st i2c "$FX" docker lint --in-gate-imag
+assert_eq "i2c: an unknown lint option exits 1" 1 "$rc"
+assert_contains "i2c: names the option" "$out" "unknown lint option: --in-gate-imag"
+assert_eq "i2c: docker was never invoked" "" "$(cat "$st/log")"
+
+# --- i3/i3b: docker absent fails closed, before the lock ---------------------
+st i3 "$FX" nodocker verify --in-gate-image
+assert_eq "i3: docker absent: verify --in-gate-image exits 1" 1 "$rc"
+assert_contains "i3: the message names docker" "$out" "docker not found on PATH"
+assert_absent "i3: no lock symlink left behind" "$LOCK"
+
+st i3b "$FX" nodocker lint --in-gate-image
+assert_eq "i3b: docker absent: lint --in-gate-image exits 1 (never a skip)" 1 "$rc"
+assert_contains "i3b: the message names docker" "$out" "docker not found on PATH"
+
+# --- i4: a live host holder refuses and docker never runs --------------------
+sleep 300 &
+HOLDER=$!
+ln -s "$HOLDER:shell" "$LOCK"
+KEEP_LOCK=1 st i4 "$FX" docker verify --in-gate-image
+assert_eq "i4: a live holder: verify --in-gate-image exits 1" 1 "$rc"
+assert_contains "i4: the shell-kind refusal is printed" "$out" "another verify already holds the lock"
+assert_eq "i4: docker was NEVER invoked" "" "$(cat "$st/log")"
+assert_eq "i4: the holder's lock is untouched" "$HOLDER:shell" "$(readlink "$LOCK" 2>/dev/null)"
+kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null; HOLDER=""
+rm -f "$LOCK"
+
+# --- i5/i6: happy verify path — lock held during the run, argv contract ------
+IMG_ID="sha256:2222222222222222222222222222222222222222222222222222222222222222"
+FAKE_ID="$IMG_ID" FISHHAWK_TEST_GATE_IMAGE=fishhawk-gate:harness \
+  st i5 "$FX" docker verify --in-gate-image
+argv="$st/inner.argv"
+assert_eq "i5: verify --in-gate-image exits 0" 0 "$rc"
+assert_eq "i5: the HOST lock is held (shell-kind) while the container runs" \
+  "held" "$(sed -nE 's/^(held):[0-9]+:shell$/\1/p' "$st/inner.lock" 2>/dev/null)"
+assert_absent "i5: the lock is released after exit" "$LOCK"
+assert_contains "i5: the resolved image ID is printed" "$out" "resolved to $IMG_ID"
+assert_contains "i5: the pre-run pin check printed its image line" "$out" "ok image $IMG_ID id=$IMG_ID"
+assert_contains "i6: inspect resolved FISHHAWK_TEST_GATE_IMAGE" "$st/log" "image inspect"
+assert_contains "i6: --rm and an empty --entrypoint" "$argv" "|run|--rm|--entrypoint||"
+assert_contains "i6: --user uid:gid" "$argv" "|--user|$(id -u):$(id -g)|"
+assert_contains "i6: checkout mounted at its own path" "$argv" "|-v|$FX:$FX|-w|$FX|"
+assert_contains "i6: gocache mount" "$argv" "|-v|$CACHE/gocache:/gocache|"
+assert_contains "i6: gomodcache mount" "$argv" "|-v|$CACHE/gomodcache:/gomodcache|"
+assert_contains "i6: lintcache mount" "$argv" "|-v|$CACHE/lintcache:/lintcache|"
+assert_contains "i6: HOME=/tmp" "$argv" "|-e|HOME=/tmp|"
+assert_contains "i6: GOPATH" "$argv" "|-e|GOPATH=/tmp/gopath|"
+assert_contains "i6: GOCACHE" "$argv" "|-e|GOCACHE=/gocache|"
+assert_contains "i6: GOMODCACHE" "$argv" "|-e|GOMODCACHE=/gomodcache|"
+assert_contains "i6: GOLANGCI_LINT_CACHE" "$argv" "|-e|GOLANGCI_LINT_CACHE=/lintcache|"
+assert_contains "i6: GOTOOLCHAIN=local" "$argv" "|-e|GOTOOLCHAIN=local|"
+assert_contains "i6: container-PRIVATE verify lock path" "$argv" "|-e|FISHHAWK_VERIFY_LOCK_PATH=/tmp/fishhawk-verify.lock|"
+assert_contains "i6: safe.directory via command-scope env" "$argv" \
+  "|-e|GIT_CONFIG_COUNT=1|-e|GIT_CONFIG_KEY_0=safe.directory|-e|GIT_CONFIG_VALUE_0=*|"
+assert_contains "i6: runs the checked ID, inner verify --no-tests" "$argv" "|$IMG_ID|scripts/test|verify|--no-tests|"
+assert_not_contains "i6: never the tag" "$argv" "fishhawk-gate:harness"
+assert_not_contains "i6: no docker socket" "$argv" "docker.sock"
+assert_eq "i6: the cache dirs were created" "ok" \
+  "$([ -d "$CACHE/gocache" ] && [ -d "$CACHE/gomodcache" ] && [ -d "$CACHE/lintcache" ] && echo ok)"
+
+# --- i6b/i7: lint — no lock, default image, primary vs linked worktree -------
+st i6b "$FX" docker lint --in-gate-image
+argv="$st/inner.argv"
+assert_eq "i6b: lint --in-gate-image exits 0" 0 "$rc"
+assert_contains "i6b: inner command is scripts/test lint" "$argv" "|scripts/test|lint|"
+assert_eq "i6b: lint takes no lock" "free" "$(cat "$st/inner.lock" 2>/dev/null)"
+assert_contains "i6b: the default image is inspected" "$out" "ghcr.io/kuhlman-labs/fishhawk-gate:main resolved to"
+assert_eq "i7: a primary checkout adds no common-dir mount (4 mounts)" 4 \
+  "$(grep -o '|-v|' "$argv" | wc -l | tr -d ' ')"
+
+WT="$tmproot/wt-outside"
+git -C "$FX" worktree add -q --detach "$WT" HEAD >/dev/null 2>&1
+WT="$(cd "$WT" && pwd)"
+COMMON="$(git -C "$WT" rev-parse --path-format=absolute --git-common-dir)"
+st i7 "$WT" docker lint --in-gate-image
+argv="$st/inner.argv"
+assert_eq "i7: lint --in-gate-image from a linked worktree exits 0" 0 "$rc"
+assert_contains "i7: the worktree is mounted at its own path" "$argv" "|-v|$WT:$WT|"
+assert_contains "i7: the git common dir outside ROOT is mounted at its own path" "$argv" "|-v|$COMMON:$COMMON|"
+assert_eq "i7: exactly one extra mount (5 mounts)" 5 "$(grep -o '|-v|' "$argv" | wc -l | tr -d ' ')"
+
+# --- i8: the container's exit status propagates, lock released ---------------
+FAKE_INNER_RC=7 st i8 "$FX" docker verify --in-gate-image
+assert_eq "i8: a failing inner command's status (7) propagates" 7 "$rc"
+assert_absent "i8: the lock is released after a failing run" "$LOCK"
+
+# --- i11/i11b: a stale image (pins mismatch) refuses; inner never runs -------
+FAKE_GO="0.0.1" st i11 "$FX" docker verify --in-gate-image
+assert_eq "i11: an image reporting a mismatching go version exits 1" 1 "$rc"
+assert_contains "i11: names the pin mismatch" "$out" "does not match this checkout's pins"
+assert_contains "i11: check-gate-image named the tool" "$out" "go reports 0.0.1"
+assert_absent "i11: the inner command NEVER ran" "$st/inner.argv"
+assert_absent "i11: the lock is released" "$LOCK"
+
+FAKE_GL="v0.0.1" st i11b "$FX" docker lint --in-gate-image
+assert_eq "i11b: lint with a mismatching golangci-lint exits 1" 1 "$rc"
+assert_absent "i11b: the inner command NEVER ran" "$st/inner.argv"
+
+# --- i12/i13/i17: image resolution -------------------------------------------
+FAKE_INSPECT_MISSING=1 FAKE_PULL_RC=1 st i12 "$FX" docker verify --in-gate-image
+assert_eq "i12: an image neither present nor pullable exits 1" 1 "$rc"
+assert_contains "i12: names the resolution failure" "$out" "cannot resolve gate image"
+assert_contains "i12: a pull was attempted" "$st/log" "pull-ref ghcr.io/kuhlman-labs/fishhawk-gate:main"
+assert_absent "i12: the inner command NEVER ran" "$st/inner.argv"
+assert_absent "i12: the lock is released" "$LOCK"
+
+FAKE_INSPECT_MISSING=once FAKE_PULL_RC=1 st i12b "$FX" docker lint --in-gate-image
+assert_eq "i12b: a FAILED pull refuses even if the image appears afterwards" 1 "$rc"
+assert_contains "i12b: names the resolution failure" "$out" "cannot resolve gate image"
+assert_absent "i12b: the inner command NEVER ran" "$st/inner.argv"
+
+FAKE_INSPECT_MISSING=1 FAKE_PULL_RC=0 st i13 "$FX" docker lint --in-gate-image
+assert_eq "i13: an absent image is pulled once, then run" 0 "$rc"
+assert_contains "i13: the pull happened" "$st/log" "pull-ref ghcr.io/kuhlman-labs/fishhawk-gate:main"
+assert_contains "i13: the inner command ran" "$st/inner.argv" "|scripts/test|lint|"
+
+FAKE_ID="not-an-image-id" st i17 "$FX" docker lint --in-gate-image
+assert_eq "i17: inspect output that is not a sha256: ID fails closed" 1 "$rc"
+assert_contains "i17: names the resolution failure" "$out" "cannot resolve gate image"
+assert_absent "i17: the inner command NEVER ran" "$st/inner.argv"
+
+# --- i14: no check-gate-image to vouch for the image -------------------------
+FX14="$tmproot/fx14"
+mkdir -p "$FX14/scripts"
+cp "$FX/scripts/test" "$FX14/scripts/test"
+st i14 "$FX14" docker lint --in-gate-image
+assert_eq "i14: a missing scripts/check-gate-image refuses" 1 "$rc"
+assert_contains "i14: names the missing check" "$out" "scripts/check-gate-image missing or not executable"
+assert_absent "i14: the inner command NEVER ran" "$st/inner.argv"
+
+# --- i15: an uncreatable cache dir refuses -----------------------------------
+: > "$tmproot/afile"
+CASE_CACHE="$tmproot/afile/sub" st i15 "$FX" docker lint --in-gate-image
+assert_eq "i15: an uncreatable cache dir exits 1" 1 "$rc"
+assert_contains "i15: names FISHHAWK_GATE_CACHE_DIR" "$out" "set FISHHAWK_GATE_CACHE_DIR"
+assert_absent "i15: the inner command NEVER ran" "$st/inner.argv"
+
+# --- i9/i9b: verify --no-tests skips the test loop (lib-only) ----------------
+# drive_verify NAME ROOT VERIFY-ARGS... — every leg stubbed to a LEG: line,
+# every test loop stubbed to a marker, the gate-image pin leg REAL unless
+# STUB_PINS=1, _verify_gate_harnesses ALWAYS stubbed (recursion hazard).
+drive_verify() {
+  local name="$1" root="$2"
+  shift 2
+  out="$tmproot/out-$name"
+  marker="$tmproot/marker-$name"
+  rm -f "$marker" "$LOCK"
+  (
+    FISHHAWK_TEST_LIB_ONLY=1 source "$REPO_ROOT/scripts/test"
+    set +e
+    ROOT="$root"
+    export FISHHAWK_VERIFY_LOCK_PATH="$LOCK" FISHHAWK_SKIP_PATCH_COVERAGE=1
+    cmd_lint() { echo LEG:lint; }
+    _verify_doc_line_budget() { echo LEG:doc; }
+    _verify_schema_sync() { echo LEG:sync; }
+    _verify_gate_harnesses() { echo LEG:harnesses; }
+    _verify_site_voice() { echo LEG:voice; }
+    _verify_site_ia() { echo LEG:ia; }
+    _verify_adr_records() { echo LEG:adr; }
+    if [ "${STUB_PINS:-0}" = 1 ]; then _verify_gate_image_pins() { echo LEG:pins; }; fi
+    cmd_test() { : > "$marker"; echo "TEST_LOCK:$VERIFY_LOCK_HELD"; }
+    cmd_test_scoped() { : > "$marker"; }
+    cmd_test_with_patch_coverage() { : > "$marker"; }
+    _parse_verify_args "$@"
+    ( set -e; cmd_verify )
+  ) > "$out" 2>&1
+  rc=$?
+}
+
+NOGIT="$tmproot/nogit"
+mkdir -p "$NOGIT/scripts"
+STUB_PINS=1 drive_verify i9 "$NOGIT" --no-tests
+assert_eq "i9: verify --no-tests exits 0" 0 "$rc"
+assert_absent "i9: the test loop never ran" "$marker"
+assert_contains "i9: the skip reason names #2137" "$out" "#2137"
+for leg in lint doc sync harnesses voice ia adr pins; do
+  assert_contains "i9: the $leg leg still ran" "$out" "LEG:$leg"
+done
+assert_absent "i9: the verify lock is released" "$LOCK"
+
+STUB_PINS=1 drive_verify i9b "$NOGIT"
+assert_eq "i9b: plain verify (no --no-tests) exits 0" 0 "$rc"
+assert_eq "i9b: control — the stubbed test loop DOES run without --no-tests" ok "$([ -e "$marker" ] && echo ok)"
+assert_contains "i9b: the test loop ran under the harness-owned lock" "$out" "TEST_LOCK:$LOCK"
+
+# --- i10: _verify_gate_image_pins --------------------------------------------
+i10a_out="$(
+  FISHHAWK_TEST_LIB_ONLY=1 source "$REPO_ROOT/scripts/test" >/dev/null 2>&1
+  set +e
+  ROOT="$NOGIT"
+  ( set -e; _verify_gate_image_pins ) 2>&1
+  echo "RC=$?"
+)"
+if printf '%s' "$i10a_out" | grep -qF 'RC=0' \
+   && printf '%s' "$i10a_out" | grep -qF 'check-gate-image missing or not executable — skipping'; then
+  pass "i10a: a ROOT without scripts/check-gate-image skips with a printed reason"
+else
+  fail "i10a: skip branch ('$i10a_out')"
+fi
+
+PINS1="$tmproot/pins1"
+mkdir -p "$PINS1/scripts"
+printf '#!/bin/sh\necho "STUB_PINS_ARGS:$*"\nexit 1\n' > "$PINS1/scripts/check-gate-image"
+chmod +x "$PINS1/scripts/check-gate-image"
+i10b_out="$(
+  FISHHAWK_TEST_LIB_ONLY=1 source "$REPO_ROOT/scripts/test" >/dev/null 2>&1
+  set +e
+  ROOT="$PINS1"
+  ( set -e; _verify_gate_image_pins ) 2>&1
+  echo "RC=$?"
+)"
+if printf '%s' "$i10b_out" | grep -qF 'RC=1' \
+   && printf '%s' "$i10b_out" | grep -qF "STUB_PINS_ARGS:--root $PINS1"; then
+  pass "i10b: a failing check-gate-image fails the leg, run against --root ROOT"
+else
+  fail "i10b: failure propagation ('$i10b_out')"
+fi
+
+drive_verify i10c "$PINS1"
+if [ "$rc" -ne 0 ] && [ ! -e "$marker" ] && grep -qF 'STUB_PINS_ARGS:' "$out"; then
+  pass "i10c: cmd_verify runs the pin leg and a violation stops verify before the test loop"
+else
+  fail "i10c: cmd_verify wiring (rc=$rc marker=$([ -e "$marker" ] && echo present || echo absent))"
+  sed -n '1,20p' "$out" | sed 's/^/    | /'
+fi
+
+# --- i16: both new harnesses are wired into _verify_gate_harnesses ------------
+HARN="$tmproot/harn"
+mkdir -p "$HARN/scripts" "$HARN/markers"
+for h in test-check-gate-image test-in-gate-image; do
+  printf '#!/bin/sh\n: > "%s"\n' "$HARN/markers/$h" > "$HARN/scripts/$h"
+  chmod +x "$HARN/scripts/$h"
+done
+(
+  FISHHAWK_TEST_LIB_ONLY=1 source "$REPO_ROOT/scripts/test" >/dev/null 2>&1
+  set +e
+  ROOT="$HARN"
+  ( set -e; _verify_gate_harnesses )
+) > "$tmproot/out-i16" 2>&1
+rc=$?
+assert_eq "i16: the harness loop exits 0" 0 "$rc"
+assert_eq "i16: test-check-gate-image is run by verify" ok "$([ -e "$HARN/markers/test-check-gate-image" ] && echo ok)"
+assert_eq "i16: test-in-gate-image is run by verify" ok "$([ -e "$HARN/markers/test-in-gate-image" ] && echo ok)"
+
+echo
+echo "scripts/test-in-gate-image: $PASS passed, $FAIL failed"
+[ "$FAIL" -eq 0 ]

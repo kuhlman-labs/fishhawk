@@ -10,10 +10,14 @@ here for the mechanism, residuals and issue history.
 `cmd_verify` takes the verify lock (see "Scoped verify + the per-repository
 verify lock" below), then runs, in order: `cmd_lint`, the ARCHITECTURE.md
 doc-line budget, `_verify_schema_sync`, `_verify_gate_harnesses`, the site voice
-gate, the site IA gate, the ADR record gate, and finally the test loop (scoped,
-or full with the patch-scoped coverage gate folded in). It omits the AGGREGATE
+gate, the site IA gate, the ADR record gate, the gate-image pin check
+(`_verify_gate_image_pins`, E51.17), and finally the test loop (scoped, or full
+with the patch-scoped coverage gate folded in). It omits the AGGREGATE
 coverage gate to bound runtime (the PATCH-scoped gate rides inside that same
-loop).
+loop). `verify --no-tests` stops before the test loop; see "Gate image" below.
+The legs stay inline in `cmd_verify`: `scripts/test-patch-coverage` (a) and
+`scripts/test-schema-sync-verify` (a) assert their order by reading that
+function's body with `declare -f`.
 
 ### Lint
 
@@ -668,6 +672,63 @@ scripts/ci-test-leg rest /tmp/profiles     # run one leg locally
 
 Rebalancing is a one-line change to `HEAVY_BACKEND` or `RUNNER_SPLIT`, plus the
 YAML matrix only when a leg is added or removed.
+
+## Gate image: `verify --no-tests` and `--in-gate-image` (E51.17 / [#3966](https://github.com/kuhlman-labs/fishhawk/issues/3966))
+
+The image, its pins, the drift chain and the operator workflow are documented
+in `deploy/gate-image/README.md`; this section covers the `scripts/test` side.
+
+- **`_verify_gate_image_pins`** runs `scripts/check-gate-image --root $ROOT`
+  (STATIC mode: files only, no Docker, no network) right after
+  `_verify_adr_records`. It skips with a printed reason when the script is
+  missing or not executable, which keeps the fixture ROOTs of
+  `test-patch-coverage` and `test-verify-scope` from running it against a
+  fixture. A violation exits 1 and fails verify, so bumping the CI
+  golangci-lint pin (or the go directives) without the Dockerfile ARG fails
+  in-loop.
+- **`verify --no-tests`** runs the lock and every leg above, then returns
+  before the test loop and the patch-coverage gate, printing a reason naming
+  #2137. With an explicit `--packages` it is REJECTED (it scopes a test loop
+  that does not run); the `FISHHAWK_VERIFY_PACKAGES` env fallback is ignored
+  with a printed note.
+- **`lint --in-gate-image` / `verify --in-gate-image`** (the latter implies
+  `--no-tests`, and is rejected with `--packages`) run the subcommand inside
+  the image. Order, each step failing closed: argument validation; docker
+  absent → exit 1 (never a skip); for verify, the HOST verify lock (a
+  container cannot share it, since `kill -0` liveness does not cross PID
+  namespaces, so the container gets a private
+  `FISHHAWK_VERIFY_LOCK_PATH=/tmp/fishhawk-verify.lock`); resolve
+  `$FISHHAWK_TEST_GATE_IMAGE` (default
+  `ghcr.io/kuhlman-labs/fishhawk-gate:main`) to an image ID, pulling once if
+  absent; `scripts/check-gate-image --image <ID>`, refusing on any pin
+  mismatch so a stale cached image cannot report CI-identical results; then
+  `docker run` on that same ID with the checkout (and an outside git common
+  dir) mounted at its own path, `--user uid:gid`, persistent caches under
+  `${FISHHAWK_GATE_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/fishhawk-gate}`,
+  command-scope `safe.directory=*`, and no docker socket. The exit status is
+  the container's. Network on, mount read-write: CI parity, not isolation.
+- **`lint` now parses its arguments**: `--in-gate-image` is the one option and
+  anything else exits 1 (it used to be ignored silently).
+
+### Testing
+
+`scripts/test-in-gate-image` (in `_verify_gate_harnesses`) executes a copy of
+the real `scripts/test` + `scripts/check-gate-image` + Dockerfile in a temp git
+fixture, with a fake docker on a PATH built from symlinks to only the needed
+binaries (never `/usr/bin`, which holds docker on Linux). The fake answers
+`image inspect` / `pull` / the pin probe from env knobs and records the inner
+command's argv and whether the harness-owned lock was held at that instant.
+Lib-only cases drive `cmd_verify` with every leg stubbed (always including
+`_verify_gate_harnesses`, which would otherwise recurse). Cases: argument
+rejection before the docker probe (with docker absent too), the docker-absent
+refusal, the host lock (held during the run, refused on a live holder with
+docker never invoked, released after a failing run), the full argv contract,
+the primary vs linked-worktree common-dir mount, exit-status propagation, a
+mismatching image never running the inner command, image resolution (pull
+fallback, failed pull, non-ID inspect output), a missing check script, an
+uncreatable cache dir, `--no-tests` skipping the test loop, the pin leg's skip
+/ failure / `cmd_verify` wiring, and both new harnesses' wiring. The header
+lists the counterfactual run against each control.
 
 ## Scoped verify + the per-repository verify lock (E68.39 / [#3315](https://github.com/kuhlman-labs/fishhawk/issues/3315))
 
