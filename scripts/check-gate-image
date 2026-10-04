@@ -1,0 +1,419 @@
+#!/usr/bin/env bash
+# check-gate-image: the drift check for deploy/gate-image/Dockerfile (E51.17 /
+# #3966). It closes the chain repo pins <=> Dockerfile <=> built image, so a pin
+# bumped on one side without the other (or without a rebuild) fails.
+#
+# Usage:
+#   scripts/check-gate-image [--root DIR]                              # static
+#   scripts/check-gate-image [--root DIR] --image REF [--platform P]   # dynamic
+#   --root defaults to this checkout; scripts/test-check-gate-image points it
+#   at temp fixture roots.
+#
+# STATIC mode (a `scripts/test verify` leg) reads only files, never the network:
+#   (a) the Dockerfile's ARG defaults GO_VERSION, GOLANGCI_LINT_VERSION,
+#       HELM_VERSION and CHECK_JSONSCHEMA_VERSION must all be present;
+#   (b) GO_VERSION must be an exact MAJOR.MINOR.PATCH;
+#   (c) its MAJOR.MINOR must equal the column-0 `go` directive of go.work, a root
+#       go.mod and every */go.mod, and every literal `go-version:` value in
+#       .github/workflows/*.yml|*.yaml (grouped on MAJOR.MINOR with the
+#       semantics of backend/internal/upkeep/pindrift.go: YAML comment lines are
+#       skipped, `go-version-file:` is ignored, and a non-MAJOR.MINOR[.PATCH]
+#       workflow value such as `stable` is a floating selector, not a pin);
+#   (c2) no go.work / go.mod `go` or `toolchain` directive may EXCEED GO_VERSION
+#       in full, because the image's GOTOOLCHAIN=local refuses a newer toolchain;
+#       an unparseable directive fails closed, and a root with ZERO go.work /
+#       go.mod `go` directives fails closed (anti-vacuity);
+#   (d) GOLANGCI_LINT_VERSION must EXACTLY equal every `golangci-lint/vX.Y.Z/
+#       install.sh` tag and every golangci-lint `sh -s -- ... vX.Y.Z` argument in
+#       the workflows and in scripts/test's install hint;
+#   (e) zero golangci-lint pin sites fails closed (anti-vacuity);
+#   (f) the Dockerfile must not install a docker engine, CLI or plugin;
+#   (g) the Dockerfile must declare `ARG TARGETARCH` (no default) in its final
+#       stage and carry no architecture literal in a download URL, a GOARCH
+#       assignment or a FROM --platform flag.
+# Comment lines of the Dockerfile are never scanned for (f)/(g), so prose may
+# name what is forbidden.
+#
+# DYNAMIC mode (--image) runs ONE probe inside the image:
+#   docker run --rm --entrypoint '' [--platform P] REF sh -c '<probe>'
+# and compares `go version`, `golangci-lint version`, `helm version --short`
+# and `check-jsonschema --version` to the Dockerfile ARGs, all EXACT, and
+# fails when a docker binary is present inside. A missing or unparseable line,
+# a failed docker exec, or docker absent from the host PATH fails closed —
+# never a pass. On success it prints one `ok <tool> <version>` line per tool
+# and an `ok image <REF> id=<ID> digests=<...>` line naming what was checked;
+# pass an ID or digest as REF to pin exactly that image.
+#
+# EXIT: 0 ok, 1 violation (each line names file:line and both values),
+# 2 usage error or an unreadable Dockerfile.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+IMAGE=""
+PLATFORM=""
+platform_set=0
+
+usage() {
+  echo "usage: scripts/check-gate-image [--root DIR] [--image REF [--platform P]]" >&2
+  exit 2
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --root)
+      [ $# -ge 2 ] || usage
+      ROOT="$2"; shift 2 ;;
+    --image)
+      [ $# -ge 2 ] && [ -n "$2" ] || usage
+      IMAGE="$2"; shift 2 ;;
+    --platform)
+      [ $# -ge 2 ] && [ -n "$2" ] || usage
+      PLATFORM="$2"; platform_set=1; shift 2 ;;
+    -h|--help)
+      usage ;;
+    *)
+      echo "check-gate-image: unknown argument '$1'" >&2
+      usage ;;
+  esac
+done
+if [ "$platform_set" = 1 ] && [ -z "$IMAGE" ]; then
+  echo "check-gate-image: --platform requires --image" >&2
+  usage
+fi
+
+DOCKERFILE_REL="deploy/gate-image/Dockerfile"
+DOCKERFILE="$ROOT/$DOCKERFILE_REL"
+if [ ! -f "$DOCKERFILE" ] || [ ! -r "$DOCKERFILE" ]; then
+  echo "check-gate-image: cannot read $DOCKERFILE" >&2
+  exit 2
+fi
+
+violations=0
+violate() {
+  printf 'check-gate-image: %s\n' "$*" >&2
+  violations=$((violations + 1))
+}
+
+# arg_default NAME -> prints "<line>\t<value>" for the first non-comment
+# `ARG NAME=value` line (quotes stripped), or nothing.
+arg_default() {
+  awk -v name="$1" '
+    /^[ \t]*#/ { next }
+    {
+      line = $0; sub(/\r$/, "", line)
+      if (match(line, "^[ \t]*ARG[ \t]+" name "=")) {
+        v = substr(line, RLENGTH + 1)
+        sub(/[ \t].*$/, "", v)
+        gsub(/^["\047]|["\047]$/, "", v)
+        print NR "\t" v
+        exit
+      }
+    }' "$DOCKERFILE"
+}
+
+GO_VERSION="" GO_VERSION_LINE=""
+GOLANGCI_LINT_VERSION="" GOLANGCI_LINT_VERSION_LINE=""
+HELM_VERSION="" HELM_VERSION_LINE=""
+CHECK_JSONSCHEMA_VERSION="" CHECK_JSONSCHEMA_VERSION_LINE=""
+missing_arg=0
+for name in GO_VERSION GOLANGCI_LINT_VERSION HELM_VERSION CHECK_JSONSCHEMA_VERSION; do
+  rec="$(arg_default "$name")"
+  if [ -z "$rec" ] || [ -z "${rec#*	}" ]; then
+    violate "$DOCKERFILE_REL: no \`ARG $name=<version>\` default (fail closed: the pin cannot be compared)"
+    missing_arg=1
+    continue
+  fi
+  eval "$name=\${rec#*	}"
+  eval "${name}_LINE=\${rec%%	*}"
+done
+if [ "$missing_arg" = 1 ]; then
+  echo "check-gate-image: $violations violation(s)" >&2
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# DYNAMIC mode
+# ---------------------------------------------------------------------------
+if [ -n "$IMAGE" ]; then
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "check-gate-image: docker not found on PATH — --image needs docker to run the probe inside $IMAGE (fail closed, not a skip)" >&2
+    exit 1
+  fi
+  probe='
+printf "go=%s\n" "$(go version 2>/dev/null | head -n 1)"
+printf "golangci-lint=%s\n" "$(golangci-lint version 2>/dev/null | head -n 1)"
+printf "helm=%s\n" "$(helm version --short 2>/dev/null | head -n 1)"
+printf "check-jsonschema=%s\n" "$(check-jsonschema --version 2>/dev/null | head -n 1)"
+found=""
+for p in $(command -v docker 2>/dev/null) $(command -v dockerd 2>/dev/null) /usr/bin/docker /usr/local/bin/docker /bin/docker /usr/bin/dockerd /usr/local/bin/dockerd; do
+  if [ -e "$p" ]; then found="$found $p"; fi
+done
+if [ -n "$found" ]; then printf "docker=present:%s\n" "$found"; else printf "docker=absent\n"; fi
+'
+  run_args=(run --rm --entrypoint '')
+  if [ -n "$PLATFORM" ]; then
+    run_args+=(--platform "$PLATFORM")
+  fi
+  run_args+=("$IMAGE" sh -c "$probe")
+  probe_rc=0
+  probe_out="$(docker "${run_args[@]}" 2>&1)" || probe_rc=$?
+  if [ "$probe_rc" -ne 0 ]; then
+    echo "check-gate-image: probe inside $IMAGE failed (docker exit $probe_rc) — fail closed:" >&2
+    printf '%s\n' "$probe_out" | sed 's/^/  /' >&2
+    exit 1
+  fi
+
+  # probe_value KEY -> the value of the LAST `KEY=` line, or the literal
+  # sentinel <missing>.
+  probe_value() {
+    printf '%s\n' "$probe_out" | awk -v k="$1=" '
+      index($0, k) == 1 { v = substr($0, length(k) + 1); seen = 1 }
+      END { if (seen) print v; else print "<missing>" }'
+  }
+
+  # check_tool TOOL WANT RAW PARSED
+  check_tool() {
+    local tool="$1" want="$2" raw="$3" got="$4"
+    if [ "$raw" = "<missing>" ]; then
+      violate "image $IMAGE: no $tool line in the probe output (fail closed)"
+    elif [ -z "$got" ]; then
+      violate "image $IMAGE: cannot parse a $tool version from '$raw' (fail closed)"
+    elif [ "$got" != "$want" ]; then
+      violate "image $IMAGE: $tool reports $got but $DOCKERFILE_REL pins $want — rebuild the image"
+    else
+      echo "ok $tool $got"
+    fi
+  }
+
+  raw="$(probe_value go)"
+  got="$(printf '%s\n' "$raw" | sed -nE 's/^go version go([0-9]+\.[0-9]+(\.[0-9]+)?([a-z]+[0-9]+)?)([[:space:]].*)?$/\1/p')"
+  check_tool go "$GO_VERSION" "$raw" "$got"
+
+  raw="$(probe_value golangci-lint)"
+  got="$(printf '%s\n' "$raw" | sed -nE 's/^golangci-lint has version v?([0-9]+\.[0-9]+\.[0-9]+)([[:space:]].*)?$/\1/p')"
+  check_tool golangci-lint "${GOLANGCI_LINT_VERSION#v}" "$raw" "$got"
+
+  raw="$(probe_value helm)"
+  got="$(printf '%s\n' "$raw" | sed -nE 's/^(v[0-9]+\.[0-9]+\.[0-9]+)(\+.*)?$/\1/p')"
+  check_tool helm "$HELM_VERSION" "$raw" "$got"
+
+  raw="$(probe_value check-jsonschema)"
+  got="$(printf '%s\n' "$raw" | sed -nE 's/^check-jsonschema, version ([0-9]+\.[0-9]+\.[0-9]+)$/\1/p')"
+  check_tool check-jsonschema "$CHECK_JSONSCHEMA_VERSION" "$raw" "$got"
+
+  raw="$(probe_value docker)"
+  case "$raw" in
+    absent) echo "ok docker absent" ;;
+    present:*) violate "image $IMAGE: a docker binary is present inside the image:${raw#present:} — the gate image must carry no docker CLI" ;;
+    *) violate "image $IMAGE: cannot read the docker-presence probe ('$raw') (fail closed)" ;;
+  esac
+
+  if [ "$violations" -gt 0 ]; then
+    echo "check-gate-image: $violations violation(s) in image $IMAGE" >&2
+    exit 1
+  fi
+
+  inspect_rc=0
+  inspect_out="$(docker image inspect --format '{{.Id}} {{join .RepoDigests ","}}' "$IMAGE" 2>&1)" || inspect_rc=$?
+  image_id="${inspect_out%% *}"
+  case "$image_id" in
+    sha256:*) ;;
+    *) [ "$inspect_rc" -ne 0 ] || inspect_rc=1 ;; # exit 0 but no ID: fail closed
+  esac
+  if [ "$inspect_rc" -ne 0 ]; then
+    echo "check-gate-image: cannot resolve the image ID of $IMAGE after the probe (docker image inspect: $inspect_out) — fail closed" >&2
+    exit 1
+  fi
+  digests="${inspect_out#* }"
+  [ "$digests" != "$inspect_out" ] && [ -n "$digests" ] || digests="none"
+  echo "ok image $IMAGE id=$image_id digests=$digests"
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# STATIC mode
+# ---------------------------------------------------------------------------
+
+# (b) GO_VERSION exact.
+if ! printf '%s\n' "$GO_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+  violate "$DOCKERFILE_REL:$GO_VERSION_LINE: GO_VERSION '$GO_VERSION' is not an exact MAJOR.MINOR.PATCH"
+fi
+GO_MM="$(printf '%s\n' "$GO_VERSION" | sed -nE 's/^([0-9]+)\.([0-9]+).*/\1.\2/p')"
+
+# go_ver_key VERSION -> "MAJ MIN PATCH PRE" (PRE 0 for a release, -1 for an
+# rc/beta, which sorts below the .0 release), or nothing when unparseable.
+# Accepts an optional leading `go` (toolchain form) and a `-suffix`.
+go_ver_key() {
+  printf '%s\n' "$1" | sed -nE '
+    s/^(go)?([0-9]+)\.([0-9]+)\.([0-9]+)(-[A-Za-z0-9._-]+)?$/\2 \3 \4 0/p
+    t
+    s/^(go)?([0-9]+)\.([0-9]+)((rc|beta)[0-9]+)(-[A-Za-z0-9._-]+)?$/\2 \3 0 -1/p
+    t
+    s/^(go)?([0-9]+)\.([0-9]+)(-[A-Za-z0-9._-]+)?$/\2 \3 0 0/p'
+}
+# go_ver_gt A_KEY B_KEY -> success when A > B.
+go_ver_gt() {
+  awk -v a="$1" -v b="$2" 'BEGIN {
+    split(a, x, " "); split(b, y, " ")
+    for (i = 1; i <= 4; i++) { if (x[i] + 0 > y[i] + 0) exit 0; if (x[i] + 0 < y[i] + 0) exit 1 }
+    exit 1 }'
+}
+GO_KEY="$(go_ver_key "$GO_VERSION")"
+
+# (c)/(c2) go.work, root go.mod, */go.mod directives.
+go_directive_sites=0
+go_files=()
+[ -f "$ROOT/go.work" ] && go_files+=("$ROOT/go.work")
+[ -f "$ROOT/go.mod" ] && go_files+=("$ROOT/go.mod")
+for f in "$ROOT"/*/go.mod; do
+  [ -f "$f" ] && go_files+=("$f")
+done
+for f in ${go_files[@]+"${go_files[@]}"}; do
+  rel="${f#$ROOT/}"
+  if [ ! -r "$f" ]; then
+    echo "check-gate-image: cannot read $rel" >&2
+    exit 2
+  fi
+  while IFS='	' read -r ln kind val; do
+    [ -n "$ln" ] || continue
+    if [ "$kind" = go ]; then
+      go_directive_sites=$((go_directive_sites + 1))
+    fi
+    key="$(go_ver_key "$val")"
+    if [ -z "$key" ] || { [ "$kind" = toolchain ] && [ "${val#go}" = "$val" ]; } || { [ "$kind" = go ] && [ "${val#go}" != "$val" ]; }; then
+      violate "$rel:$ln: unparseable \`$kind $val\` directive (fail closed)"
+      continue
+    fi
+    if [ "$kind" = go ]; then
+      set -- $key
+      if [ "$1.$2" != "$GO_MM" ]; then
+        violate "$rel:$ln: \`go $val\` (MAJOR.MINOR $1.$2) disagrees with $DOCKERFILE_REL:$GO_VERSION_LINE GO_VERSION $GO_VERSION (MAJOR.MINOR $GO_MM)"
+      fi
+    fi
+    if [ -n "$GO_KEY" ] && go_ver_gt "$key" "$GO_KEY"; then
+      violate "$rel:$ln: \`$kind $val\` exceeds $DOCKERFILE_REL:$GO_VERSION_LINE GO_VERSION $GO_VERSION — GOTOOLCHAIN=local in the image refuses it"
+    fi
+  done < <(awk '
+    { line = $0; sub(/\r$/, "", line) }
+    match(line, /^(go|toolchain)[ \t]+/) {
+      kind = line; sub(/[ \t].*$/, "", kind)
+      v = substr(line, RLENGTH + 1)
+      sub(/\/\/.*$/, "", v); sub(/[ \t]+$/, "", v)
+      print NR "\t" kind "\t" v
+    }' "$f")
+done
+if [ "$go_directive_sites" -eq 0 ]; then
+  violate "no go.work / go.mod \`go\` directive found under $ROOT (fail closed: zero Go pin sites cannot be compared)"
+fi
+
+# Workflow files (read-only).
+wf_files=()
+for f in "$ROOT"/.github/workflows/*.yml "$ROOT"/.github/workflows/*.yaml; do
+  [ -f "$f" ] && wf_files+=("$f")
+done
+
+# (c) workflow go-version literals, MAJOR.MINOR.
+for f in ${wf_files[@]+"${wf_files[@]}"}; do
+  rel="${f#$ROOT/}"
+  while IFS='	' read -r ln val; do
+    [ -n "$ln" ] || continue
+    mm="$(printf '%s\n' "$val" | sed -nE 's/^([0-9]+)\.([0-9]+)(\.[0-9]+)?$/\1.\2/p')"
+    [ -n "$mm" ] || continue # floating selector, not a pin (pindrift semantics)
+    if [ "$mm" != "$GO_MM" ]; then
+      violate "$rel:$ln: go-version '$val' (MAJOR.MINOR $mm) disagrees with $DOCKERFILE_REL:$GO_VERSION_LINE GO_VERSION $GO_VERSION (MAJOR.MINOR $GO_MM)"
+    fi
+  done < <(awk '
+    { line = $0; sub(/\r$/, "", line) }
+    line ~ /^[ \t]*#/ { next }
+    match(line, /^[ \t]*(-[ \t]+)?go-version:/) {
+      v = substr(line, RLENGTH + 1)
+      sub(/^[ \t]+/, "", v)
+      q = substr(v, 1, 1)
+      if (q == "\"" || q == "\047") {
+        rest = substr(v, 2); e = index(rest, q)
+        if (e > 0) v = substr(rest, 1, e - 1)
+      } else {
+        sub(/[ \t]#.*$/, "", v); sub(/[ \t]+$/, "", v)
+      }
+      print NR "\t" v
+    }' "$f")
+done
+
+# (d)/(e) golangci-lint pins: workflows (YAML comments skipped) + scripts/test.
+golangci_scan() { # FILE YAML(0|1)
+  awk -v yaml="$2" '
+    function lastsemver(s,   last) {
+      last = ""
+      while (match(s, /v[0-9]+\.[0-9]+\.[0-9]+/)) { last = substr(s, RSTART, RLENGTH); s = substr(s, RSTART + RLENGTH) }
+      return last
+    }
+    {
+      line = $0; sub(/\r$/, "", line)
+      if (yaml == 1 && line ~ /^[ \t]*#/) next
+      s = line
+      while (match(s, /golangci-lint\/v[0-9]+\.[0-9]+\.[0-9]+\/install\.sh/)) {
+        print NR "\t" substr(s, RSTART + 14, RLENGTH - 25)
+        s = substr(s, RSTART + RLENGTH)
+      }
+      i = index(line, "sh -s --")
+      if (i > 0 && (line ~ /golangci-lint/ || prev ~ /golangci-lint/)) {
+        t = lastsemver(substr(line, i + 8))
+        if (t != "") print NR "\t" t
+      }
+      if (line ~ /[^ \t]/) prev = line
+    }' "$1"
+}
+golangci_sites=0
+gl_targets=()
+for f in ${wf_files[@]+"${wf_files[@]}"}; do gl_targets+=("1:$f"); done
+[ -f "$ROOT/scripts/test" ] && gl_targets+=("0:$ROOT/scripts/test")
+for t in ${gl_targets[@]+"${gl_targets[@]}"}; do
+  yaml="${t%%:*}"; f="${t#*:}"; rel="${f#$ROOT/}"
+  while IFS='	' read -r ln tag; do
+    [ -n "$ln" ] || continue
+    golangci_sites=$((golangci_sites + 1))
+    if [ "$tag" != "$GOLANGCI_LINT_VERSION" ]; then
+      violate "$rel:$ln: golangci-lint pin $tag disagrees with $DOCKERFILE_REL:$GOLANGCI_LINT_VERSION_LINE GOLANGCI_LINT_VERSION $GOLANGCI_LINT_VERSION"
+    fi
+  done < <(golangci_scan "$f" "$yaml")
+done
+if [ "$golangci_sites" -eq 0 ]; then
+  violate "no golangci-lint pin found in .github/workflows/ or scripts/test under $ROOT (fail closed: zero pin sites cannot be compared)"
+fi
+
+# (f) no docker engine/CLI/plugin, (g) TARGETARCH-explicit. Non-comment lines.
+while IFS='	' read -r ln msg; do
+  [ -n "$ln" ] || continue
+  violate "$DOCKERFILE_REL:$ln: $msg"
+done < <(awk '
+  { line = $0; sub(/\r$/, "", line) }
+  line ~ /^[ \t]*#/ { next }
+  {
+    l = tolower(line)
+    if (l ~ /(^|[^a-z0-9_.\/-])(docker\.io|docker-ce|docker-ce-cli|docker-cli|docker-buildx-plugin|docker-compose-plugin|moby-[a-z0-9-]+|podman-docker)([^a-z0-9_.\/-]|$)/ \
+        || l ~ /(download|get)\.docker\.com/ \
+        || l ~ /--from=docker([:@ \t]|$)/ \
+        || l ~ /\/bin\/docker([^a-z0-9_.-]|$)/)
+      print NR "\tinstalls a docker engine/CLI/plugin — the gate image must carry no docker"
+    if (l ~ /https?:\/\// && l ~ /(amd64|arm64|x86_64|aarch64)/)
+      print NR "\thardcoded architecture in a download URL — key it on ${TARGETARCH}"
+    if (l ~ /goarch=["\047]?[a-z0-9]/)
+      print NR "\thardcoded GOARCH literal — derive it from ${TARGETARCH}"
+    if (l ~ /^[ \t]*from[ \t]/ && l ~ /--platform=["\047]?[a-z]/)
+      print NR "\thardcoded FROM --platform — let BuildKit select the platform"
+    if (l ~ /^[ \t]*from[ \t]/) { lastfrom = NR; targetarch = 0 }
+    if (l ~ /^[ \t]*arg[ \t]+targetarch[ \t]*(=|$)/ && lastfrom > 0)
+      targetarch = 1
+    if (l ~ /^[ \t]*arg[ \t]+targetarch[ \t]*=/)
+      print NR "\tARG TARGETARCH carries a default value — it must come from BuildKit"
+  }
+  END {
+    if (lastfrom == 0) print "1\tno FROM line"
+    else if (!targetarch) print lastfrom "\tno `ARG TARGETARCH` declared after this FROM line (the stage cannot see BuildKit'"'"'s TARGETARCH)"
+  }' "$DOCKERFILE")
+
+if [ "$violations" -gt 0 ]; then
+  echo "check-gate-image: $violations violation(s)" >&2
+  exit 1
+fi
+echo "check-gate-image: ok — GO_VERSION $GO_VERSION agrees with $go_directive_sites go directive(s) on $GO_MM; GOLANGCI_LINT_VERSION $GOLANGCI_LINT_VERSION agrees with $golangci_sites pin site(s); no docker; TARGETARCH-explicit"

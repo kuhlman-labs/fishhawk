@@ -1,0 +1,454 @@
+#!/usr/bin/env bash
+# Hermetic test for scripts/check-gate-image (E51.17 / #3966). Drives the REAL
+# script against temp-dir fixture roots (a Dockerfile, go.work, a go.mod,
+# .github/workflows/ci.yml and a scripts/test install-hint line) and, for the
+# --image mode, a fake `docker` on PATH whose per-case output and exit status
+# are scripted from files and whose argv is logged. One case per failure mode,
+# each asserting the exit status AND a message naming the offending file:line
+# or value. House style follows scripts/test-site-ia: PASS/FAIL counters,
+# non-zero exit on any FAIL, no network, no real Docker. Run by `scripts/test
+# verify` via _verify_gate_harnesses, and standalone.
+#
+# DOCKER-FREE PATH (approval condition 5). Every invocation of the control runs
+# under a PATH built from a temp dir of symlinks to ONLY the binaries the
+# control needs — never from /usr/bin, which holds docker on a typical Linux
+# host — so the real docker is unreachable; the fake is prepended for the
+# --image cases. The harness asserts that precondition before any case.
+#
+# ---------------------------------------------------------------------------
+# COUNTERFACTUALS — run EMPIRICALLY: each control's BODY in check-gate-image
+# replaced with the permissive branch (`if false`, a print turned into an
+# assignment, a violate turned into `echo ok`), this harness run, the named
+# cases observed RED, the file restored and `cmp`-verified byte-identical:
+#   golangci compare -> s1 s1b s2      go-directive MAJOR.MINOR -> s3 s3b
+#   workflow go-version -> s4          exact patch -> s5
+#   missing-ARG guard -> s6a-s6e       zero golangci pins -> s7
+#   zero go pin sites -> s12           exceed check -> s11a s11b
+#   unparseable directive -> s11d s11e docker-package scan -> s8a-s8e
+#   URL arch literal -> s9a            TARGETARCH presence -> s9b s9c
+#   TARGETARCH default -> s9d          GOARCH literal -> s9e
+#   FROM --platform -> s9f             dynamic compare -> d1 d2 d3 d4
+#   docker-inside probe -> d5          parse failure -> d6c
+#   missing line -> d6b                unreadable docker probe -> d6d
+#   docker exec failure -> d6a         inspect failure -> d9a d9b
+#   inspect no-ID -> d9b               unknown arg -> s14a
+#   --platform w/o --image -> s14b     unreadable Dockerfile -> s13
+#   host docker absent -> d7 (RED on the MESSAGE only: with the guard gone,
+#   `docker run` exits 127 and the exec-failure guard still exits 1).
+# ---------------------------------------------------------------------------
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+CHECK="$REPO_ROOT/scripts/check-gate-image"
+PASS=0
+FAIL=0
+
+pass() { echo "PASS: $1"; PASS=$((PASS + 1)); }
+fail() { echo "FAIL: $1"; FAIL=$((FAIL + 1)); }
+
+tmproot="$(mktemp -d)"
+trap 'rm -rf "$tmproot"' EXIT
+
+# --- docker-free PATH from symlinks ------------------------------------------
+SAFEBIN="$tmproot/safebin"
+mkdir -p "$SAFEBIN"
+for b in bash awk sed grep dirname cat head tr; do
+  p="$(command -v "$b" 2>/dev/null || true)"
+  if [ -z "$p" ]; then
+    echo "test-check-gate-image: required binary '$b' not found on PATH" >&2
+    exit 1
+  fi
+  ln -s "$p" "$SAFEBIN/$b"
+done
+if PATH="$SAFEBIN" bash -c 'command -v docker' >/dev/null 2>&1; then
+  echo "test-check-gate-image: precondition failed — docker resolves on the symlinked PATH" >&2
+  exit 1
+fi
+
+# --- fake docker -------------------------------------------------------------
+FAKEBIN="$tmproot/fakebin"
+mkdir -p "$FAKEBIN"
+cat > "$FAKEBIN/docker" <<'EOF'
+#!/bin/sh
+{
+  echo "--- invocation"
+  for a in "$@"; do printf '[%s]\n' "$a"; done
+} >> "$FAKE_LOG"
+case "$1" in
+  run)
+    cat "$FAKE_RUN_OUT"
+    exit "${FAKE_RUN_RC:-0}" ;;
+  image)
+    if [ "$2" = inspect ]; then
+      cat "$FAKE_INSPECT_OUT"
+      exit "${FAKE_INSPECT_RC:-0}"
+    fi ;;
+esac
+echo "fake docker: unexpected argv: $*" >&2
+exit 99
+EOF
+chmod +x "$FAKEBIN/docker"
+
+# --- fixtures ----------------------------------------------------------------
+# mkfix NAME -> a fixture root at $tmproot/NAME whose pins all agree; prints it.
+mkfix() {
+  local r="$tmproot/$1"
+  mkdir -p "$r/deploy/gate-image" "$r/mod" "$r/.github/workflows" "$r/scripts"
+  cat > "$r/deploy/gate-image/Dockerfile" <<'EOF'
+# syntax=docker/dockerfile:1
+# Prose may name what is forbidden: docker.io, docker-ce-cli, linux-amd64,
+# https://example.invalid/tool-linux-arm64.tar.gz, GOARCH=amd64.
+ARG GO_VERSION=1.25.6
+FROM golang:${GO_VERSION}-bookworm
+ARG TARGETARCH
+ARG GOLANGCI_LINT_VERSION=v2.8.0
+ARG HELM_VERSION=v3.16.4
+ARG CHECK_JSONSCHEMA_VERSION=0.38.0
+RUN apt-get install -y --no-install-recommends zsh jq python3
+RUN curl -fsSLO "https://get.helm.sh/helm-${HELM_VERSION}-linux-${TARGETARCH}.tar.gz"
+ENV GOTOOLCHAIN=local
+EOF
+  printf 'go 1.25.0\n\nuse ./mod\n' > "$r/go.work"
+  printf 'module example.invalid/mod\n\ngo 1.25\n' > "$r/mod/go.mod"
+  cat > "$r/.github/workflows/ci.yml" <<'EOF'
+jobs:
+  lint:
+    steps:
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.25'
+      # go-version: '1.20'  (a commented-out pin is not executed)
+      - run: |
+          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/v2.8.0/install.sh \
+            | sh -s -- -b "$(go env GOPATH)/bin" v2.8.0
+EOF
+  cat > "$r/scripts/test" <<'EOF'
+#!/usr/bin/env bash
+cat >&2 <<'HINT'
+  curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/v2.8.0/install.sh \
+    | sh -s -- -b "$(go env GOPATH)/bin" v2.8.0
+HINT
+EOF
+  printf '%s\n' "$r"
+}
+
+# edit FILE SED-EXPR — portable in-place sed (BSD and GNU).
+edit() {
+  sed -E "$2" "$1" > "$1.tmp" && mv "$1.tmp" "$1"
+}
+# lineof FILE FIXED-STRING -> the first line number carrying it.
+lineof() {
+  grep -nF -- "$2" "$1" | head -n 1 | cut -d: -f1
+}
+
+out=""
+status=0
+# run_static ROOT [extra args...]
+run_static() {
+  local r="$1"; shift
+  out="$(PATH="$SAFEBIN" "$CHECK" --root "$r" "$@" 2>&1)"
+  status=$?
+}
+
+# expect CASE WANT_STATUS [SUBSTRING...]
+expect() {
+  local c="$1" want="$2"; shift 2
+  if [ "$status" -ne "$want" ]; then
+    fail "$c: exited $status (expected $want); output: $out"
+    return
+  fi
+  local s
+  for s in "$@"; do
+    case "$out" in
+      *"$s"*) ;;
+      *) fail "$c: output lacks '$s'; output: $out"; return ;;
+    esac
+  done
+  pass "$c"
+}
+
+# --- static cases ------------------------------------------------------------
+
+r="$(mkfix s0)"
+run_static "$r"
+expect "s0: an agreeing fixture passes" 0 "check-gate-image: ok" "agrees with 2 go directive(s)" "agrees with 4 pin site(s)"
+
+r="$(mkfix s1)"
+edit "$r/.github/workflows/ci.yml" 's#golangci-lint/v2\.8\.0/install\.sh#golangci-lint/v2.9.0/install.sh#'
+ln="$(lineof "$r/.github/workflows/ci.yml" 'v2.9.0/install.sh')"
+run_static "$r"
+expect "s1: workflow install.sh tag v2.9.0 vs ARG v2.8.0" 1 ".github/workflows/ci.yml:$ln: golangci-lint pin v2.9.0" "GOLANGCI_LINT_VERSION v2.8.0"
+
+r="$(mkfix s1b)"
+edit "$r/.github/workflows/ci.yml" 's#/bin" v2\.8\.0#/bin" v2.9.0#'
+ln="$(lineof "$r/.github/workflows/ci.yml" '/bin" v2.9.0')"
+run_static "$r"
+expect "s1b: workflow \`sh -s --\` argument v2.9.0 vs ARG v2.8.0" 1 ".github/workflows/ci.yml:$ln: golangci-lint pin v2.9.0"
+
+r="$(mkfix s2)"
+edit "$r/scripts/test" 's#golangci-lint/v2\.8\.0/install\.sh#golangci-lint/v2.7.0/install.sh#'
+ln="$(lineof "$r/scripts/test" 'v2.7.0/install.sh')"
+run_static "$r"
+expect "s2: scripts/test install hint v2.7.0 vs ARG v2.8.0" 1 "scripts/test:$ln: golangci-lint pin v2.7.0"
+
+r="$(mkfix s3)"
+edit "$r/deploy/gate-image/Dockerfile" 's#^ARG GO_VERSION=.*#ARG GO_VERSION=1.26.1#'
+run_static "$r"
+expect "s3: GO_VERSION 1.26.1 vs go.work go 1.25.0" 1 "go.work:1: \`go 1.25.0\` (MAJOR.MINOR 1.25) disagrees" "GO_VERSION 1.26.1 (MAJOR.MINOR 1.26)"
+
+r="$(mkfix s3b)"
+edit "$r/mod/go.mod" 's#^go 1\.25$#go 1.24#'
+run_static "$r"
+expect "s3b: GO_VERSION 1.25.6 vs mod/go.mod go 1.24" 1 "mod/go.mod:3: \`go 1.24\` (MAJOR.MINOR 1.24) disagrees"
+
+r="$(mkfix s4)"
+edit "$r/.github/workflows/ci.yml" "s#go-version: '1\\.25'#go-version: '1.24'#"
+ln="$(lineof "$r/.github/workflows/ci.yml" "go-version: '1.24'")"
+run_static "$r"
+expect "s4: workflow go-version '1.24' vs GO_VERSION 1.25.6" 1 ".github/workflows/ci.yml:$ln: go-version '1.24' (MAJOR.MINOR 1.24) disagrees"
+
+r="$(mkfix s4b)"
+cat >> "$r/.github/workflows/ci.yml" <<'EOF'
+  other:
+    steps:
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: mod/go.mod
+EOF
+run_static "$r"
+expect "s4b: a floating go-version, a go-version-file and a commented pin are not compared" 0 "check-gate-image: ok"
+
+r="$(mkfix s5)"
+edit "$r/deploy/gate-image/Dockerfile" 's#^ARG GO_VERSION=.*#ARG GO_VERSION=1.25#'
+run_static "$r"
+expect "s5: GO_VERSION=1.25 is not exact" 1 "deploy/gate-image/Dockerfile:4: GO_VERSION '1.25' is not an exact MAJOR.MINOR.PATCH"
+
+for pair in "s6a:GO_VERSION" "s6b:GOLANGCI_LINT_VERSION" "s6c:HELM_VERSION" "s6d:CHECK_JSONSCHEMA_VERSION"; do
+  c="${pair%%:*}"; name="${pair#*:}"
+  r="$(mkfix "$c")"
+  edit "$r/deploy/gate-image/Dockerfile" "/^ARG $name=/d"
+  run_static "$r"
+  expect "$c: the Dockerfile lacks ARG $name (fail closed)" 1 "no \`ARG $name=<version>\` default"
+done
+
+r="$(mkfix s6e)"
+edit "$r/deploy/gate-image/Dockerfile" 's#^ARG HELM_VERSION=.*#ARG HELM_VERSION=#'
+run_static "$r"
+expect "s6e: an EMPTY ARG HELM_VERSION= default fails closed" 1 "no \`ARG HELM_VERSION=<version>\` default"
+
+r="$(mkfix s7)"
+rm -rf "$r/.github" "$r/scripts"
+run_static "$r"
+expect "s7: zero golangci-lint pin sites fails closed" 1 "no golangci-lint pin found"
+
+r="$(mkfix s8a)"
+edit "$r/deploy/gate-image/Dockerfile" 's#zsh jq python3#zsh jq python3 docker-ce-cli#'
+run_static "$r"
+expect "s8a: apt docker-ce-cli" 1 "deploy/gate-image/Dockerfile:10: installs a docker engine/CLI/plugin"
+
+r="$(mkfix s8b)"
+edit "$r/deploy/gate-image/Dockerfile" 's#zsh jq python3#docker.io zsh jq python3#'
+run_static "$r"
+expect "s8b: apt docker.io" 1 "deploy/gate-image/Dockerfile:10: installs a docker engine/CLI/plugin"
+
+r="$(mkfix s8c)"
+printf 'RUN curl -fsSLO "https://download.docker.com/linux/static/stable/${TARGETARCH}/docker-27.0.0.tgz"\n' >> "$r/deploy/gate-image/Dockerfile"
+run_static "$r"
+expect "s8c: a docker static tarball" 1 "deploy/gate-image/Dockerfile:13: installs a docker engine/CLI/plugin"
+
+r="$(mkfix s8d)"
+printf 'COPY --from=docker:cli /usr/local/bin/docker /usr/local/bin/docker\n' >> "$r/deploy/gate-image/Dockerfile"
+run_static "$r"
+expect "s8d: COPY --from=docker:cli" 1 "deploy/gate-image/Dockerfile:13: installs a docker engine/CLI/plugin"
+
+r="$(mkfix s8e)"
+printf 'RUN install -m 0755 /tmp/x /usr/local/bin/docker\n' >> "$r/deploy/gate-image/Dockerfile"
+run_static "$r"
+expect "s8e: a binary installed at /usr/local/bin/docker" 1 "deploy/gate-image/Dockerfile:13: installs a docker engine/CLI/plugin"
+
+r="$(mkfix s8n)"
+edit "$r/deploy/gate-image/Dockerfile" 's#^FROM golang:#FROM docker.io/library/golang:#'
+run_static "$r"
+expect "s8n: a docker.io/ REGISTRY reference and comment prose are not a docker install" 0 "check-gate-image: ok"
+
+r="$(mkfix s9a)"
+edit "$r/deploy/gate-image/Dockerfile" 's#linux-\$\{TARGETARCH\}#linux-amd64#'
+run_static "$r"
+expect "s9a: a download URL with a literal linux-amd64" 1 "deploy/gate-image/Dockerfile:11: hardcoded architecture in a download URL"
+
+r="$(mkfix s9b)"
+edit "$r/deploy/gate-image/Dockerfile" '/^ARG TARGETARCH$/d'
+run_static "$r"
+expect "s9b: no ARG TARGETARCH" 1 "deploy/gate-image/Dockerfile:5: no \`ARG TARGETARCH\` declared after this FROM line"
+
+r="$(mkfix s9c)"
+edit "$r/deploy/gate-image/Dockerfile" '/^ARG TARGETARCH$/d'
+edit "$r/deploy/gate-image/Dockerfile" 's#^ARG GO_VERSION=1\.25\.6$#ARG GO_VERSION=1.25.6\
+ARG TARGETARCH#'
+run_static "$r"
+expect "s9c: ARG TARGETARCH only BEFORE the FROM line" 1 "deploy/gate-image/Dockerfile:6: no \`ARG TARGETARCH\` declared after this FROM line"
+
+r="$(mkfix s9d)"
+edit "$r/deploy/gate-image/Dockerfile" 's#^ARG TARGETARCH$#ARG TARGETARCH=amd64#'
+run_static "$r"
+expect "s9d: ARG TARGETARCH=amd64 (a default)" 1 "deploy/gate-image/Dockerfile:6: ARG TARGETARCH carries a default value"
+
+r="$(mkfix s9e)"
+printf 'ENV GOARCH=amd64\n' >> "$r/deploy/gate-image/Dockerfile"
+run_static "$r"
+expect "s9e: a hardcoded GOARCH literal" 1 "deploy/gate-image/Dockerfile:13: hardcoded GOARCH literal"
+
+r="$(mkfix s9f)"
+edit "$r/deploy/gate-image/Dockerfile" 's#^FROM golang:#FROM --platform=linux/amd64 golang:#'
+run_static "$r"
+expect "s9f: FROM --platform=linux/amd64" 1 "deploy/gate-image/Dockerfile:5: hardcoded FROM --platform"
+
+r="$(mkfix s9n)"
+edit "$r/deploy/gate-image/Dockerfile" 's#^FROM golang:#FROM --platform=$BUILDPLATFORM golang:#'
+printf 'ENV GOARCH=${TARGETARCH}\n' >> "$r/deploy/gate-image/Dockerfile"
+run_static "$r"
+expect "s9n: \$BUILDPLATFORM and GOARCH=\${TARGETARCH} are not literals" 0 "check-gate-image: ok"
+
+run_static "$REPO_ROOT"
+expect "s10: the SHIPPED repo (deploy/gate-image/Dockerfile vs the real go.work, go.mods, workflows, scripts/test) passes" 0 "check-gate-image: ok" "GO_VERSION 1.25.6"
+
+r="$(mkfix s11a)"
+edit "$r/mod/go.mod" 's#^go 1\.25$#go 1.25.7#'
+run_static "$r"
+expect "s11a: mod/go.mod go 1.25.7 exceeds GO_VERSION 1.25.6 (condition 3)" 1 "mod/go.mod:3: \`go 1.25.7\` exceeds deploy/gate-image/Dockerfile:4 GO_VERSION 1.25.6"
+
+r="$(mkfix s11b)"
+printf 'toolchain go1.25.9\n' >> "$r/go.work"
+run_static "$r"
+expect "s11b: go.work toolchain go1.25.9 exceeds GO_VERSION 1.25.6 (condition 3)" 1 "go.work:4: \`toolchain go1.25.9\` exceeds"
+
+r="$(mkfix s11c)"
+printf 'toolchain go1.25.6\n' >> "$r/go.work"
+edit "$r/mod/go.mod" 's#^go 1\.25$#go 1.25.6#'
+printf 'toolchain go1.25rc1\n' >> "$r/mod/go.mod"
+run_static "$r"
+expect "s11c: directives EQUAL to or below GO_VERSION pass" 0 "check-gate-image: ok"
+
+r="$(mkfix s11d)"
+printf 'toolchain 1.25.6\n' >> "$r/go.work"
+run_static "$r"
+expect "s11d: a toolchain directive without the go prefix fails closed" 1 "go.work:4: unparseable \`toolchain 1.25.6\` directive"
+
+r="$(mkfix s11e)"
+edit "$r/mod/go.mod" 's#^go 1\.25$#go 1.25.x#'
+run_static "$r"
+expect "s11e: an unparseable go directive fails closed" 1 "mod/go.mod:3: unparseable \`go 1.25.x\` directive"
+
+r="$(mkfix s12)"
+rm -f "$r/go.work" "$r/mod/go.mod"
+run_static "$r"
+expect "s12: zero go.work / go.mod go directives fails closed (condition 3)" 1 "no go.work / go.mod \`go\` directive found"
+
+r="$(mkfix s13)"
+rm -f "$r/deploy/gate-image/Dockerfile"
+run_static "$r"
+expect "s13: an unreadable Dockerfile exits 2" 2 "cannot read $r/deploy/gate-image/Dockerfile"
+
+r="$(mkfix s14)"
+run_static "$r" --bogus
+expect "s14a: an unknown argument exits 2" 2 "unknown argument '--bogus'"
+run_static "$r" --platform linux/arm64
+expect "s14b: --platform without --image exits 2" 2 "--platform requires --image"
+
+# --- dynamic cases -----------------------------------------------------------
+
+GOOD_PROBE='go=go version go1.25.6 linux/arm64
+golangci-lint=golangci-lint has version 2.8.0 built with go1.25.5 from e2e40021 on 2026-01-07T21:29:47Z
+helm=v3.16.4+g7877b45
+check-jsonschema=check-jsonschema, version 0.38.0
+docker=absent'
+GOOD_INSPECT='sha256:0c7eeb187563a2051ec0675d932d06f0999dc6aa04584f77ee80e36c0dfcad97 fishhawk-gate@sha256:0c7eeb187563a2051ec0675d932d06f0999dc6aa04584f77ee80e36c0dfcad97'
+
+# run_dynamic CASE ROOT PROBE_TEXT RUN_RC INSPECT_TEXT INSPECT_RC [extra args...]
+log=""
+run_dynamic() {
+  local c="$1" r="$2" probe="$3" rrc="$4" insp="$5" irc="$6"; shift 6
+  local d="$tmproot/dyn-$c"
+  mkdir -p "$d"
+  printf '%s\n' "$probe" > "$d/run.out"
+  printf '%s\n' "$insp" > "$d/inspect.out"
+  : > "$d/argv.log"
+  log="$d/argv.log"
+  out="$(PATH="$FAKEBIN:$SAFEBIN" FAKE_LOG="$d/argv.log" FAKE_RUN_OUT="$d/run.out" FAKE_RUN_RC="$rrc" \
+    FAKE_INSPECT_OUT="$d/inspect.out" FAKE_INSPECT_RC="$irc" "$CHECK" --root "$r" "$@" 2>&1)"
+  status=$?
+}
+
+r="$(mkfix d0)"
+
+run_dynamic d1 "$r" "${GOOD_PROBE/go1.25.6/go1.25.5}" 0 "$GOOD_INSPECT" 0 --image fishhawk-gate:test
+expect "d1: image go1.25.5 vs ARG 1.25.6" 1 "go reports 1.25.5 but deploy/gate-image/Dockerfile pins 1.25.6"
+
+r2="$(mkfix d2)"
+edit "$r2/deploy/gate-image/Dockerfile" 's#^ARG GOLANGCI_LINT_VERSION=.*#ARG GOLANGCI_LINT_VERSION=v2.9.0#'
+edit "$r2/.github/workflows/ci.yml" 's#v2\.8\.0#v2.9.0#g'
+edit "$r2/scripts/test" 's#v2\.8\.0#v2.9.0#g'
+run_static "$r2"
+expect "d2 (precondition): pins bumped to v2.9.0 on BOTH sides pass static mode" 0 "GOLANGCI_LINT_VERSION v2.9.0 agrees"
+run_dynamic d2 "$r2" "$GOOD_PROBE" 0 "$GOOD_INSPECT" 0 --image fishhawk-gate:test
+expect "d2: bump without rebuild — image still reports golangci-lint 2.8.0" 1 "golangci-lint reports 2.8.0 but deploy/gate-image/Dockerfile pins 2.9.0 — rebuild the image"
+
+run_dynamic d3 "$r" "${GOOD_PROBE/v3.16.4+/v3.16.3+}" 0 "$GOOD_INSPECT" 0 --image fishhawk-gate:test
+expect "d3: helm mismatch" 1 "helm reports v3.16.3 but deploy/gate-image/Dockerfile pins v3.16.4"
+
+run_dynamic d4 "$r" "${GOOD_PROBE/version 0.38.0/version 0.37.1}" 0 "$GOOD_INSPECT" 0 --image fishhawk-gate:test
+expect "d4: check-jsonschema mismatch" 1 "check-jsonschema reports 0.37.1 but deploy/gate-image/Dockerfile pins 0.38.0"
+
+run_dynamic d5 "$r" "${GOOD_PROBE/docker=absent/docker=present: /usr/bin/docker}" 0 "$GOOD_INSPECT" 0 --image fishhawk-gate:test
+expect "d5: a docker CLI inside the image" 1 "a docker binary is present inside the image: /usr/bin/docker"
+
+run_dynamic d6a "$r" "$GOOD_PROBE" 125 "$GOOD_INSPECT" 0 --image fishhawk-gate:test
+expect "d6a: a non-zero docker exec fails closed even with agreeing output" 1 "probe inside fishhawk-gate:test failed (docker exit 125)"
+
+run_dynamic d6b "$r" "$(printf '%s\n' "$GOOD_PROBE" | grep -v '^helm=')" 0 "$GOOD_INSPECT" 0 --image fishhawk-gate:test
+expect "d6b: a missing helm line fails closed" 1 "no helm line in the probe output"
+
+run_dynamic d6c "$r" "${GOOD_PROBE/go version go1.25.6 linux\/arm64/go: command not found}" 0 "$GOOD_INSPECT" 0 --image fishhawk-gate:test
+expect "d6c: an unparseable go line fails closed" 1 "cannot parse a go version from 'go: command not found'"
+
+run_dynamic d6d "$r" "${GOOD_PROBE/docker=absent/docker=}" 0 "$GOOD_INSPECT" 0 --image fishhawk-gate:test
+expect "d6d: an unreadable docker-presence probe fails closed" 1 "cannot read the docker-presence probe"
+
+out="$(PATH="$SAFEBIN" "$CHECK" --root "$r" --image fishhawk-gate:test 2>&1)"
+status=$?
+expect "d7: no docker on the host PATH fails closed naming docker" 1 "docker not found on PATH"
+
+run_dynamic d8 "$r" "$GOOD_PROBE" 0 "$GOOD_INSPECT" 0 --image fishhawk-gate:test --platform linux/arm64
+expect "d8: matching versions pass" 0 "ok go 1.25.6" "ok golangci-lint 2.8.0" "ok helm v3.16.4" "ok check-jsonschema 0.38.0" "ok docker absent" \
+  "ok image fishhawk-gate:test id=sha256:0c7eeb187563a2051ec0675d932d06f0999dc6aa04584f77ee80e36c0dfcad97 digests=fishhawk-gate@sha256:"
+argv="$(cat "$log")"
+first_run="$(awk '/^--- invocation/{n++} n==1' "$log")"
+if printf '%s\n' "$first_run" | grep -qxF '[run]' \
+  && printf '%s\n' "$first_run" | grep -qxF '[--rm]' \
+  && printf '%s\n' "$first_run" | awk 'p=="[--entrypoint]"{ok=($0=="[]")} {p=$0} END{exit !ok}' \
+  && printf '%s\n' "$first_run" | awk 'p=="[--platform]"{ok=($0=="[linux/arm64]")} {p=$0} END{exit !ok}' \
+  && printf '%s\n' "$first_run" | grep -qxF '[fishhawk-gate:test]'; then
+  pass "d8: the probe argv carries run --rm --entrypoint '' --platform linux/arm64 and the image ref"
+else
+  fail "d8: probe argv contract broken; argv: $argv"
+fi
+
+run_dynamic d8b "$r" "$GOOD_PROBE" 0 "$GOOD_INSPECT" 0 --image fishhawk-gate:test
+if [ "$status" -eq 0 ] && ! grep -qxF '[--platform]' "$log"; then
+  pass "d8b: no --platform in the argv when none is given"
+else
+  fail "d8b: status $status, argv: $(cat "$log")"
+fi
+
+run_dynamic d9a "$r" "$GOOD_PROBE" 0 "Error: No such image: fishhawk-gate:test" 1 --image fishhawk-gate:test
+expect "d9a: a failed image inspect fails closed" 1 "cannot resolve the image ID of fishhawk-gate:test"
+
+run_dynamic d9b "$r" "$GOOD_PROBE" 0 "" 0 --image fishhawk-gate:test
+expect "d9b: an inspect that exits 0 without an ID fails closed" 1 "cannot resolve the image ID of fishhawk-gate:test"
+
+echo
+echo "test-check-gate-image: $PASS passed, $FAIL failed"
+[ "$FAIL" -eq 0 ]
