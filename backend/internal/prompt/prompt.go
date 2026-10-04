@@ -8630,6 +8630,17 @@ var trustedMarkers = []string{
 	// sanitizeUntrustedComment — whose line opens with it would otherwise read
 	// as the real Fishhawk crew-message banner.
 	"CREW MESSAGE",
+	// The user-report section's heading token and its writer-owned attribution
+	// prefix (E81.3 / #3773). Neither entry is a no-op: like "CREW MESSAGE", each
+	// changes sanitizeUntrustedComment's output for a PRE-EXISTING untrusted line
+	// in ANY channel sharing that sanitizer (issue comments, acceptance-failure
+	// text, obligation text, commit-body responses, crew messages) that begins
+	// with it — such a line now gains the "(untrusted) " tag. The prefix entry is
+	// what stops a report body forging a trusted-looking "User report · … class:
+	// internal" attribution line; the issue BODY renders verbatim and is
+	// unaffected.
+	"USER REPORT",
+	userReportAttributionPrefix,
 }
 
 // untrustedIssueTextBegin / untrustedIssueTextEnd frame the issue-BODY
@@ -8803,8 +8814,10 @@ func gateEvidenceHasUntrustedVerifyText(ev *GateEvidence) bool {
 // delimiters. It is the breakout control for EVERY untrusted envelope in the
 // package, not just one: the issue-BODY envelope calls it directly
 // (writeUntrustedIssueBody) and, via neutralizeLine, it also covers the
-// issue-COMMENT envelope plus the acceptance-failure and obligation-text
-// envelopes that share sanitizeUntrustedComment.
+// issue-COMMENT envelope plus the acceptance-failure, obligation-text,
+// crew-message and user-report (E81.3 / #3773, userreport.go) envelopes that
+// share sanitizeUntrustedComment; a user-report TITLE reaches it through
+// sanitizeIssueTitle.
 //
 // It works by RUN-SPLITTING: a maximal run of three or more `<` (or `>`) is
 // re-emitted in chunks of two separated by a single space, so the output can
@@ -9226,6 +9239,20 @@ func capCrewMetadata(s string) string {
 // overflow semantics. It differs ONLY in the pathological case, where it returns
 // len(rendered)-1 instead of len(rendered).
 func crewBlockStart(rendered []string, budget int) int {
+	return blockStartNewestFirst(rendered, budget)
+}
+
+// blockStartNewestFirst is the shared newest-always-survives block-budget walk
+// behind crewBlockStart and the user-report writer (E81.3 / #3773). It returns
+// the index of the OLDEST (earliest-listed) rendered chunk that fits budget,
+// walking from the LAST chunk toward the first and dropping everything earlier
+// once over budget. It is pure and total.
+//
+// The last chunk is ALWAYS included, whatever its rendered size: start is
+// SEEDED at the last index and the accumulation loop begins one earlier, so no
+// input can make this return len(rendered). See crewBlockStart for why a block
+// that renders its heading and framing with ZERO envelopes is the worse outcome.
+func blockStartNewestFirst(rendered []string, budget int) int {
 	if len(rendered) == 0 {
 		return 0
 	}
