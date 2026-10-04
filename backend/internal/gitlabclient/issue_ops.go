@@ -56,25 +56,45 @@ type Note struct {
 	System bool
 	// CreatedAt is the RFC 3339 creation timestamp as GitLab returned it.
 	CreatedAt string
+	// UpdatedAt is the RFC 3339 last-update timestamp as GitLab returned
+	// it ("" when absent). Added for the E81 user-report reader (#3771),
+	// which keeps only notes updated since its cursor.
+	UpdatedAt string
 	// Author is the note author's username, lifted out of the nested
 	// `author` object GitLab sends (see noteResponse).
 	Author string
+	// AuthorID is the nested author object's numeric id (0 when absent) —
+	// the key GetProjectMemberAccessLevel takes.
+	AuthorID int64
+	// Internal reports an internal note, readable only by project members
+	// with at least Reporter access. GitLab sends it as `internal` and,
+	// on older instances, as the deprecated `confidential`; either set
+	// reads true. Surfaced, not filtered: excluding internal notes is the
+	// consumer's decision.
+	Internal bool
 }
 
 // noteResponse is the wire shape of one note: Note's flat fields plus the
 // nested author object GitLab sends; note() flattens it.
 type noteResponse struct {
-	ID        int64  `json:"id"`
-	Body      string `json:"body"`
-	System    bool   `json:"system"`
-	CreatedAt string `json:"created_at"`
-	Author    struct {
+	ID           int64  `json:"id"`
+	Body         string `json:"body"`
+	System       bool   `json:"system"`
+	CreatedAt    string `json:"created_at"`
+	UpdatedAt    string `json:"updated_at"`
+	Internal     bool   `json:"internal"`
+	Confidential bool   `json:"confidential"`
+	Author       struct {
+		ID       int64  `json:"id"`
 		Username string `json:"username"`
 	} `json:"author"`
 }
 
 func (n noteResponse) note() Note {
-	return Note{ID: n.ID, Body: n.Body, System: n.System, CreatedAt: n.CreatedAt, Author: n.Author.Username}
+	return Note{
+		ID: n.ID, Body: n.Body, System: n.System, CreatedAt: n.CreatedAt, UpdatedAt: n.UpdatedAt,
+		Author: n.Author.Username, AuthorID: n.Author.ID, Internal: n.Internal || n.Confidential,
+	}
 }
 
 // GetIssue reads a single issue by its project-scoped iid.
@@ -187,6 +207,11 @@ func (c *Client) getNotesPage(ctx context.Context, absURL string) ([]Note, strin
 // STILL present means a forge or an interposed proxy is emitting an unending
 // page chain; the loop then FAILS CLOSED with a naming error rather than
 // spinning forever or returning a silently-partial slice.
+//
+// ListIssuesUpdatedAfter (userreports.go) shares the bound but is the one
+// exception to failing closed: its keyset walk returns a NAMED partial
+// (ListingMeta.Truncated + ResumeAt) so a cursor-driven caller still makes
+// progress, and fails closed only inside an equal-timestamp run at its bound.
 const maxListPages = 100
 
 // nextPageURL extracts the rel="next" target from an RFC 8288 Link header,
