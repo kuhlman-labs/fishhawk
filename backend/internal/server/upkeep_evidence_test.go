@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -31,10 +32,12 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/upkeep"
 )
 
-// Upkeep scan evidence gather tests (#3922, slice 2). NONE of these tests is
-// parallel: they swap the package-var seams (newUpkeepPinSource,
-// upkeepListWorkflowDir) and bounds (upkeepFlakeBundleCap, …), restoring them
-// in t.Cleanup.
+// Upkeep scan evidence gather tests (#3922, slice 2; #3924 carried items 8,
+// 10, 11). NONE of these tests is parallel: they swap the package-var seams
+// (newUpkeepPinSource, upkeepListWorkflowDir, upkeepScanNow,
+// upkeepScanJoinHook) and bounds (upkeepFlakeBundleCap,
+// upkeepFlakeRunPageSize, upkeepScanCacheTTL, …), restoring them in
+// t.Cleanup.
 //
 // The flake fixture's ListRuns DELIBERATELY ignores its Repo / AccountID
 // filter, so the Go-side ownership predicate, window cutoff and self-skip are
@@ -1224,4 +1227,471 @@ func TestUpkeepFacts_RoundTripThroughIngest(t *testing.T) {
 	if len(findings) != 6 {
 		t.Errorf("findings = %d, want 6", len(findings))
 	}
+}
+
+// --- flake paging (#3924 carried item 8) ---------------------------------------
+
+// upkeepShiftingRunRepo simulates ONE run created between the first ListRuns
+// page and every later one: a later page's offset lands one row earlier, so it
+// re-serves the previous page's last run (the boundary run).
+type upkeepShiftingRunRepo struct {
+	*upkeepEvidenceRunRepo
+}
+
+func (r *upkeepShiftingRunRepo) ListRuns(ctx context.Context, f run.ListRunsFilter) ([]*run.Run, error) {
+	if f.Offset > 0 {
+		f.Offset--
+	}
+	return r.upkeepEvidenceRunRepo.ListRuns(ctx, f)
+}
+
+// newUpkeepPagingFixture seeds, newest first after the scanning run itself:
+// R1 (TestBoundary), R2 (TestPage2), R3 (TestPage3) and R4 past the window
+// (TestOld), served two per page by the shifting repo. Pages: [self, R1],
+// [R1, R2] (R1 re-served), [R3, R4] (R4 stops the walk).
+func newUpkeepPagingFixture(t *testing.T) (f *upkeepEvidenceFixture, r1, r2, r3 *run.Run) {
+	t.Helper()
+	setUpkeepBound(t, &upkeepFlakeRunPageSize, 2)
+	f = newUpkeepEvidenceFixture(t, upkeepScanSpec(t), "upkeep_scan")
+	installUpkeepPinSource(t, &fakeUpkeepPinSource{})
+	f.s.cfg.RunRepo = &upkeepShiftingRunRepo{upkeepEvidenceRunRepo: f.rr}
+	r1, _ = f.seedFlakeRun(t, upkeepTestRepo, "", time.Hour, flakeGate(failTail("TestBoundary"), "t1"))
+	r2, _ = f.seedFlakeRun(t, upkeepTestRepo, "", 2*time.Hour, flakeGate(failTail("TestPage2"), "t2"))
+	r3, _ = f.seedFlakeRun(t, upkeepTestRepo, "", 3*time.Hour, flakeGate(failTail("TestPage3"), "t3"))
+	f.seedFlakeRun(t, upkeepTestRepo, "", upkeepFlakeWindow+time.Hour, flakeGate(failTail("TestOld"), "t4"))
+	return f, r1, r2, r3
+}
+
+// A multi-page gather cites flakes from later pages, reads a re-served
+// boundary run ONCE, and keeps the window stop and the run-scan cap across
+// pages. Counterfactual: delete the seen-run skip in gatherUpkeepFlakes — R1
+// is read twice (4 bundle Gets, TestBoundary occurrences 2), and under the
+// cap of 2 the re-served R1 spends R2's slot.
+func TestGatherUpkeepFlakes_TwoPages(t *testing.T) {
+	t.Run("later pages, boundary read once, window stop", func(t *testing.T) {
+		f, r1, r2, r3 := newUpkeepPagingFixture(t)
+		u := f.resolve(t)
+		got := subjects(u)
+		b, ok := got["TestBoundary"]
+		if !ok || !citesRun(b, r1.ID) || b.Occurrences != 1 || len(b.Refs) != 1 {
+			t.Errorf("TestBoundary = %+v (present %v), want ONE occurrence citing the boundary run %s once", b, ok, r1.ID)
+		}
+		if fl, ok := got["TestPage2"]; !ok || !citesRun(fl, r2.ID) {
+			t.Errorf("page-2 flake not cited: %+v", got)
+		}
+		if fl, ok := got["TestPage3"]; !ok || !citesRun(fl, r3.ID) {
+			t.Errorf("page-3 flake not cited: %+v", got)
+		}
+		if _, ok := got["TestOld"]; ok {
+			t.Error("a run past the window was read across pages")
+		}
+		if n := f.ts.getCount(); n != 3 {
+			t.Errorf("bundle Gets = %d, want 3 (the re-served boundary run is read once)", n)
+		}
+		if n := f.rr.runListCalls(); n != 3 {
+			t.Errorf("ListRuns calls = %d, want 3 (the window stop on page 3 ends the walk)", n)
+		}
+		if u.FlakeRunsScanned != 3 || len(u.Degrades) != 0 {
+			t.Errorf("runs scanned = %d degrades = %+v, want 3 and none", u.FlakeRunsScanned, u.Degrades)
+		}
+	})
+	t.Run("the run-scan cap counts a re-served run once", func(t *testing.T) {
+		setUpkeepBound(t, &upkeepFlakeRunScanCap, 2)
+		f, _, r2, _ := newUpkeepPagingFixture(t)
+		u := f.resolve(t)
+		got := subjects(u)
+		if fl, ok := got["TestPage2"]; !ok || !citesRun(fl, r2.ID) {
+			t.Errorf("R2 not scanned under a cap of 2 (the re-served boundary run spent its slot?): %+v", got)
+		}
+		if _, ok := got["TestPage3"]; ok {
+			t.Error("a run past the scan cap was read")
+		}
+		if u.FlakeRunsScanned != 2 || degradeCount(u, plan.UpkeepSourceFlake, upkeepDegradeRunScanCapped) != 1 {
+			t.Errorf("runs scanned = %d degrades = %+v, want 2 and run_scan_capped", u.FlakeRunsScanned, u.Degrades)
+		}
+	})
+}
+
+// --- scan cache (#3924 carried item 11, approval condition C5) -----------------
+
+// upkeepFakeClock is a mutex-guarded clock for upkeepScanNow.
+type upkeepFakeClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (c *upkeepFakeClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *upkeepFakeClock) advance(d time.Duration) {
+	c.mu.Lock()
+	c.now = c.now.Add(d)
+	c.mu.Unlock()
+}
+
+func installUpkeepScanClock(t *testing.T) *upkeepFakeClock {
+	t.Helper()
+	c := &upkeepFakeClock{now: time.Now()}
+	setUpkeepBound(t, &upkeepScanNow, c.Now)
+	return c
+}
+
+// installUpkeepScanJoined sets upkeepScanJoinHook to close the returned
+// channel on the first join.
+func installUpkeepScanJoined(t *testing.T) <-chan struct{} {
+	t.Helper()
+	joined := make(chan struct{})
+	var once sync.Once
+	setUpkeepBound(t, &upkeepScanJoinHook, func() { once.Do(func() { close(joined) }) })
+	return joined
+}
+
+// gatedUpkeepPinSource blocks every FetchFile until release is closed (or the
+// gather's ctx ends), closing started on the first call.
+type gatedUpkeepPinSource struct {
+	*fakeUpkeepPinSource
+	once    sync.Once
+	started chan struct{}
+	release chan struct{}
+}
+
+func newGatedUpkeepPinSource(inner *fakeUpkeepPinSource) *gatedUpkeepPinSource {
+	return &gatedUpkeepPinSource{fakeUpkeepPinSource: inner, started: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (g *gatedUpkeepPinSource) FetchFile(ctx context.Context, p string) ([]byte, error) {
+	g.once.Do(func() { close(g.started) })
+	select {
+	case <-g.release:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return g.fakeUpkeepPinSource.FetchFile(ctx, p)
+}
+
+// installCountingUpkeepPinSource swaps newUpkeepPinSource for src and counts
+// the gathers (one source build per gather) race-safely.
+func installCountingUpkeepPinSource(t *testing.T, src upkeepPinSource) *atomic.Int32 {
+	t.Helper()
+	var n atomic.Int32
+	setUpkeepBound(t, &newUpkeepPinSource, func(context.Context, *Server, *run.Run) (upkeepPinSource, string) {
+		n.Add(1)
+		return src, ""
+	})
+	return &n
+}
+
+// upkeepAwait receives from ch or fails after a scaled bound.
+func upkeepAwait[T any](t *testing.T, ch <-chan T, what string) T {
+	t.Helper()
+	select {
+	case v := <-ch:
+		return v
+	case <-time.After(timescale.D(10 * time.Second)):
+		t.Fatalf("timed out waiting for %s", what)
+	}
+	var zero T
+	return zero
+}
+
+// Within the TTL a stage gathers once — /prompt and /prompt-render included —
+// after the TTL it re-gathers, and another (run, stage) never shares the
+// entry. Counterfactual: make upkeepScanCache.do always lead (skip the
+// lookup) — the second resolve gathers again → RED.
+func TestResolveUpkeepScanContext_CachesPerStage(t *testing.T) {
+	clock := installUpkeepScanClock(t)
+	f := newUpkeepEvidenceFixture(t, upkeepScanSpec(t), "upkeep_scan")
+	calls := installUpkeepPinSource(t, driftingWorkflows())
+
+	u1, u2 := f.resolve(t), f.resolve(t)
+	if *calls != 1 || f.rr.runListCalls() != 1 {
+		t.Fatalf("gathers = %d ListRuns = %d after two resolves within the TTL, want 1 and 1", *calls, f.rr.runListCalls())
+	}
+	if u1 != u2 {
+		t.Error("two resolves within the TTL returned different scan contexts")
+	}
+	signed, preview := f.serve(t, f.planStage.ID)
+	if *calls != 1 || signed != preview {
+		t.Errorf("gathers = %d after serving /prompt and /prompt-render (agree: %v), want 1 and agreement", *calls, signed == preview)
+	}
+
+	clock.advance(upkeepScanCacheTTL + time.Second)
+	if f.resolve(t); *calls != 2 {
+		t.Errorf("gathers = %d after the TTL elapsed, want 2", *calls)
+	}
+
+	run2 := &run.Run{ID: uuid.New(), Repo: upkeepTestRepo, WorkflowID: "upkeep_scan", WorkflowSpec: f.runRow.WorkflowSpec,
+		State: run.StateRunning, CreatedAt: time.Now(), DocumentBaseCommit: f.runRow.DocumentBaseCommit}
+	plan2 := &run.Stage{ID: uuid.New(), RunID: run2.ID, Sequence: 0, Type: run.StageTypePlan, State: run.StageStateRunning}
+	f.rr.seedRun(run2)
+	f.rr.getStages[plan2.ID] = plan2
+	f.rr.stagesByRunID[run2.ID] = []*run.Stage{plan2}
+	if u, err := f.s.resolveUpkeepScanContext(context.Background(), run2, plan2); err != nil || u == nil {
+		t.Fatalf("second stage = (%v, %v), want a scan context", u, err)
+	}
+	if *calls != 3 {
+		t.Errorf("gathers = %d after a DIFFERENT (run, stage), want 3", *calls)
+	}
+	if f.resolve(t); *calls != 3 {
+		t.Errorf("gathers = %d: the first stage's re-gathered entry was not reused", *calls)
+	}
+}
+
+// Two concurrent resolves of one stage gather once: the second JOINS the
+// in-flight gather. Counterfactual: drop the in-flight join (lead whenever no
+// completed entry exists) — the second caller never joins and builds its own
+// source → RED.
+func TestResolveUpkeepScanContext_SingleFlight(t *testing.T) {
+	f := newUpkeepEvidenceFixture(t, upkeepScanSpec(t), "upkeep_scan")
+	src := newGatedUpkeepPinSource(driftingWorkflows())
+	var gathers atomic.Int32
+	builds := make(chan struct{}, 4)
+	setUpkeepBound(t, &newUpkeepPinSource, func(context.Context, *Server, *run.Run) (upkeepPinSource, string) {
+		gathers.Add(1)
+		builds <- struct{}{}
+		return src, ""
+	})
+	joined := installUpkeepScanJoined(t)
+
+	results := make(chan *prompt.UpkeepScanContext, 2)
+	call := func() {
+		u, err := f.s.resolveUpkeepScanContext(context.Background(), f.runRow, f.planStage)
+		if err != nil {
+			t.Errorf("resolve: %v", err)
+		}
+		results <- u
+	}
+	go call()
+	upkeepAwait(t, builds, "the leader's gather to build its source")
+	upkeepAwait(t, src.started, "the leader's gather to start")
+	go call()
+	select {
+	case <-joined:
+	case <-builds:
+		t.Error("the second concurrent caller started its own gather instead of joining the in-flight one")
+	case <-time.After(timescale.D(10 * time.Second)):
+		t.Fatal("timed out waiting for the second caller to join or gather")
+	}
+	close(src.release)
+	a, b := upkeepAwait(t, results, "the first result"), upkeepAwait(t, results, "the second result")
+	if n := gathers.Load(); n != 1 {
+		t.Errorf("gathers = %d for two concurrent resolves, want 1", n)
+	}
+	if a == nil || a != b {
+		t.Errorf("results = %p and %p, want one shared scan context", a, b)
+	}
+}
+
+// Approval condition C5: the leader's request is cancelled mid-gather and a
+// waiter still receives the FULL result. Counterfactual: run the gather under
+// the leader's ctx (drop context.WithoutCancel) — the cancel cuts the pin
+// fetch, the shared result carries budget_exceeded and no pins → RED.
+func TestResolveUpkeepScanContext_CancelledLeaderDoesNotPoisonWaiters(t *testing.T) {
+	f := newUpkeepEvidenceFixture(t, upkeepScanSpec(t), "upkeep_scan")
+	src := newGatedUpkeepPinSource(driftingWorkflows())
+	gathers := installCountingUpkeepPinSource(t, src)
+	joined := installUpkeepScanJoined(t)
+
+	leaderCtx, cancelLeader := context.WithCancel(context.Background())
+	defer cancelLeader()
+	leader := make(chan *prompt.UpkeepScanContext, 1)
+	go func() {
+		u, _ := f.s.resolveUpkeepScanContext(leaderCtx, f.runRow, f.planStage)
+		leader <- u
+	}()
+	upkeepAwait(t, src.started, "the leader's gather to start")
+	cancelLeader()
+
+	waiter := make(chan *prompt.UpkeepScanContext, 1)
+	go func() {
+		u, _ := f.s.resolveUpkeepScanContext(context.Background(), f.runRow, f.planStage)
+		waiter <- u
+	}()
+	// With the gather detached the waiter can only JOIN (the gather is parked
+	// on release). A gather the cancel cut short has already completed, so the
+	// waiter is served its cached result instead — then assess that result.
+	var waited *prompt.UpkeepScanContext
+	select {
+	case <-joined:
+		close(src.release)
+		waited = upkeepAwait(t, waiter, "the waiter's result")
+	case waited = <-waiter:
+		t.Log("the waiter never joined: the shared gather ended before release")
+		close(src.release)
+	case <-time.After(timescale.D(10 * time.Second)):
+		t.Fatal("timed out waiting for the waiter to join or return")
+	}
+
+	for name, u := range map[string]*prompt.UpkeepScanContext{
+		"waiter": waited,
+		"leader": upkeepAwait(t, leader, "the leader's result"),
+	} {
+		if u == nil {
+			t.Fatalf("%s: nil scan context", name)
+		}
+		if len(u.Degrades) != 0 || u.PinFilesScanned != 2 || len(u.PinDrift) != 1 {
+			t.Errorf("%s: degrades = %+v pin files = %d drift = %d, want the full, undegraded gather", name, u.Degrades, u.PinFilesScanned, len(u.PinDrift))
+		}
+	}
+	if n := gathers.Load(); n != 1 {
+		t.Errorf("gathers = %d, want 1", n)
+	}
+}
+
+func upkeepCacheKey() upkeepScanKey {
+	return upkeepScanKey{runID: uuid.New(), stageID: uuid.New()}
+}
+
+// countingGather returns a gather that counts its calls and returns a fresh
+// context each time.
+func countingGather(n *atomic.Int32) func(context.Context) *prompt.UpkeepScanContext {
+	return func(context.Context) *prompt.UpkeepScanContext {
+		n.Add(1)
+		return &prompt.UpkeepScanContext{}
+	}
+}
+
+// Keys differing ONLY in the stage never share an entry.
+func TestUpkeepScanCache_KeyIncludesStage(t *testing.T) {
+	installUpkeepScanClock(t)
+	c := &upkeepScanCache{}
+	var n atomic.Int32
+	k := upkeepCacheKey()
+	k2 := k
+	k2.stageID = uuid.New()
+	c.do(context.Background(), k, countingGather(&n))
+	c.do(context.Background(), k2, countingGather(&n))
+	c.do(context.Background(), k, countingGather(&n))
+	if got := n.Load(); got != 2 {
+		t.Errorf("gathers = %d, want 2 (one per stage)", got)
+	}
+}
+
+// Approval condition C5: nothing failed is cached. A gather that panics leaves
+// no entry, the next call re-gathers, and a waiter joined to the aborted
+// gather retries rather than receiving its empty result. Counterfactuals:
+// drop the delete in lead's deferred publish → the aborted entry stays
+// (size 1) → RED; turn the waiter's retry into `return e.result` → the
+// waiter gets nil → RED.
+func TestUpkeepScanCache_AbortedGatherIsNotCached(t *testing.T) {
+	installUpkeepScanClock(t)
+	joined := installUpkeepScanJoined(t)
+	c := &upkeepScanCache{}
+	k := upkeepCacheKey()
+
+	started, release := make(chan struct{}), make(chan struct{})
+	panicked := make(chan any, 1)
+	go func() {
+		defer func() { panicked <- recover() }()
+		c.do(context.Background(), k, func(context.Context) *prompt.UpkeepScanContext {
+			close(started)
+			<-release
+			panic("gather blew up")
+		})
+	}()
+	upkeepAwait(t, started, "the aborting gather to start")
+
+	var n atomic.Int32
+	waiter := make(chan *prompt.UpkeepScanContext, 1)
+	go func() { waiter <- c.do(context.Background(), k, countingGather(&n)) }()
+	upkeepAwait(t, joined, "the waiter to join")
+	close(release)
+	if r := upkeepAwait(t, panicked, "the leader's panic"); r == nil {
+		t.Fatal("the leader's gather did not panic")
+	}
+	if u := upkeepAwait(t, waiter, "the waiter's result"); u == nil {
+		t.Error("the waiter received the aborted gather's nil result instead of re-gathering")
+	}
+	if got := n.Load(); got != 1 {
+		t.Errorf("waiter gathers = %d, want 1 (it re-gathered as the new leader)", got)
+	}
+
+	// The aborted gather left nothing; a later key-alike call is served the
+	// waiter's completed gather.
+	if c.do(context.Background(), k, countingGather(&n)); n.Load() != 1 {
+		t.Errorf("gathers = %d, want the waiter's completed gather reused", n.Load())
+	}
+	k2 := upkeepCacheKey()
+	func() {
+		defer func() { _ = recover() }()
+		c.do(context.Background(), k2, func(context.Context) *prompt.UpkeepScanContext { panic("again") })
+	}()
+	if got := c.size(); got != 1 {
+		t.Errorf("cache size = %d after a panicking gather, want 1 (only the completed entry)", got)
+	}
+	var n2 atomic.Int32
+	if c.do(context.Background(), k2, countingGather(&n2)); n2.Load() != 1 {
+		t.Errorf("gathers after an aborted one = %d, want 1 (a fresh gather)", n2.Load())
+	}
+}
+
+// Approval condition C5: the map is bounded. Expired entries are swept on
+// insert, and a full map runs the gather uncached. Counterfactuals: drop the
+// size check → 3 entries under a cap of 2 → RED; drop the sweep → the expired
+// entries keep the map full, so the post-TTL key is never cached → RED.
+func TestUpkeepScanCache_BoundedMap(t *testing.T) {
+	clock := installUpkeepScanClock(t)
+	setUpkeepBound(t, &upkeepScanCacheMaxEntries, 2)
+	c := &upkeepScanCache{}
+	var n atomic.Int32
+	k1, k2, k3, k4 := upkeepCacheKey(), upkeepCacheKey(), upkeepCacheKey(), upkeepCacheKey()
+	c.do(context.Background(), k1, countingGather(&n))
+	c.do(context.Background(), k2, countingGather(&n))
+
+	var n3 atomic.Int32
+	c.do(context.Background(), k3, countingGather(&n3))
+	c.do(context.Background(), k3, countingGather(&n3))
+	if got := c.size(); got != 2 {
+		t.Errorf("cache size = %d under a cap of 2, want 2", got)
+	}
+	if got := n3.Load(); got != 2 {
+		t.Errorf("full-map gathers = %d, want 2 (uncached when the map is full)", got)
+	}
+
+	clock.advance(upkeepScanCacheTTL + time.Second)
+	var n4 atomic.Int32
+	c.do(context.Background(), k4, countingGather(&n4))
+	if got := c.size(); got != 1 {
+		t.Errorf("cache size = %d after the TTL, want 1 (expired entries swept on insert)", got)
+	}
+	if c.do(context.Background(), k4, countingGather(&n4)); n4.Load() != 1 {
+		t.Errorf("post-sweep gathers = %d, want 1 (cached after the sweep freed room)", n4.Load())
+	}
+}
+
+// --- undecidable binding: a residual, not a fork (#3924 carried item 10) --------
+
+// An upkeep-workflow plan stage whose binding is Undecidable (unmappable) is
+// served the ORDINARY plan prompt — resolveUpkeepScanContext returns nil and
+// gathers nothing — and nothing it ships is accepted: the guard refuses its
+// plan and the ingest refuses its upkeep_report (stage_binding_undecidable,
+// category B). A documentation pin of the residual, not a control.
+func TestResolveUpkeepScanContext_UndecidableIsResidual(t *testing.T) {
+	f := newUpkeepIngestFixture(t, nil)
+	calls := installUpkeepPinSource(t, &fakeUpkeepPinSource{})
+	stray := func() *run.Stage {
+		st := &run.Stage{ID: uuid.New(), RunID: f.runRow.ID, Type: run.StageTypePlan, State: run.StageStateRunning}
+		f.rr.getStages[st.ID] = st
+		return st
+	}
+	planStray, reportStray := stray(), stray()
+
+	b, err := f.s.resolveUpkeepStageBinding(context.Background(), f.runRow.ID, planStray)
+	if err != nil || b.Undecidable != upkeepBindingStageUnmappable || !b.WorkflowDeclaresUpkeep {
+		t.Fatalf("binding = %+v err = %v, want an unmappable stage in an upkeep workflow", b, err)
+	}
+	u, err := f.s.resolveUpkeepScanContext(context.Background(), f.runRow, planStray)
+	if err != nil || u != nil || *calls != 0 {
+		t.Fatalf("= (%+v, %v) gathers = %d, want (nil, nil): the ordinary plan prompt, no gather", u, err, *calls)
+	}
+
+	code, resp := f.post(t, planStray.ID, validPlanBytes(t))
+	if code != http.StatusBadRequest || upkeepErrorCode(resp) != "plan_invalid" {
+		t.Errorf("plan from the undecidable stage = %d %v, want 400 plan_invalid (the guard refuses it)", code, resp)
+	}
+	code, resp = f.post(t, reportStray.ID, upkeepExampleBody(t))
+	assertUpkeepRefused(t, f, reportStray.ID, code, resp, "upkeep_report_stage_invalid", upkeepRefusalStageBindingUndecidable)
 }
