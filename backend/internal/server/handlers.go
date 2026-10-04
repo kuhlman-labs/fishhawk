@@ -169,6 +169,10 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v0/refinement/sessions/{session_id}/decision", s.handleDecideRefinementSession)
 	mux.HandleFunc("POST /v0/refinement/sessions/{session_id}/file", s.handleFileRefinementSession)
 	mux.HandleFunc("POST /v0/work-items", s.handleFileWorkItem)
+	// The non-mutating intake preview of the filing above (#3774): the same
+	// prelude and conventions/intake core, never provider.File, no audit. A
+	// literal path segment, so it does not collide with POST /v0/work-items.
+	mux.HandleFunc("POST /v0/work-items/preview", s.handlePreviewWorkItem)
 	mux.HandleFunc("GET /v0/calibration", s.handleGetCalibration)
 	// Precedent query (E75.3 / #3731): account-scoped, non-run-scoped read,
 	// same posture as GET /v0/attention and GET /v0/calibration — the account

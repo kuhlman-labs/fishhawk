@@ -1071,6 +1071,56 @@ components:
         run_id:
           allOf: [ { $ref: '#/components/schemas/UUID' } ]
           description: Optional in-flight run; when set and non-terminal, a `work_item_filed` audit entry is appended to it.
+        source_refs:
+          type: array
+          items: { type: string }
+          description: >-
+            Optional same-repo refs (`#N` or `N`, N > 0) to the existing items this draft
+            DERIVES FROM (#3774). The intake hook excludes those items from the duplicate
+            candidates — a draft written from #X is never reported as #X's duplicate, while an
+            unrelated near-duplicate still is — and reports them as `intake.derives_from`.
+            Refs are deduped in first-seen order. A malformed ref (empty, `#0`, a sign, a
+            non-digit, or a cross-repo `owner/repo#N`, refused because the duplicate window only
+            scans the target repo) fails the request `400 validation_failed` with
+            `details.field: source_refs` and `details.got` naming the ref.
+
+    WorkItemPreviewResponse:
+      type: object
+      required: [type, title, body, labels, provider, intake]
+      description: >-
+        What a filing of the same request WOULD produce (#3774), rendered by the same
+        conventions + intake core POST /v0/work-items uses. NOTHING was created: the provider's
+        File call (the only mutating provider call on the filing path) was never made and no
+        audit entry was written. A POINT-IN-TIME view — the preview reserves nothing, so a
+        concurrent filing between preview and file can change an auto-derived `{n}`, a
+        discovered sequential `number`, or the duplicate window.
+      properties:
+        type: { type: string }
+        title: { type: string, description: The rendered title a filing would get. }
+        body:
+          type: string
+          description: >-
+            The body exactly as the provider would receive it, advisory intake section and
+            hidden `fishhawk-intake:v1` marker included. A later filing's body differs only in the
+            marker's measured `duration_ms`.
+        labels: { type: array, items: { type: string }, description: The merged label set a filing would apply. }
+        number: { type: integer, description: The sequential number a filing would allocate; absent when the type is not numbered. }
+        provider: { type: string, description: The provider id the filing would dispatch to. }
+        complexity: { type: string }
+        status: { type: string }
+        board_column: { type: string }
+        relations:
+          type: object
+          properties:
+            parent_epic: { type: string }
+            supersedes: { type: array, items: { type: string } }
+            companion_to: { type: array, items: { type: string } }
+            evidence_runs: { type: array, items: { type: string } }
+            depends_on: { type: array, items: { type: string } }
+        defaulted_labels: { type: array, items: { type: string } }
+        missing_label_namespaces: { type: array, items: { type: string } }
+        intake:
+          $ref: '#/components/schemas/IntakeSignals'
 
     WorkItemResponse:
       type: object
@@ -1157,6 +1207,12 @@ components:
         never slows beyond its budget, because grooming was unavailable. The whole object is
         OPTIONAL: absent when the deployment produced no signals at all.
 
+        SOURCE ITEMS ARE EXCLUDED FROM DUPLICATES (#3774). The items a request names in
+        `source_refs` are never scored as duplicates; they are reported in `derives_from`
+        instead, together with the rendered "Derives from" block. `derives_from` is provenance,
+        not a finding, so it is reported even on a degraded hook (number-only, `in_window:
+        false`) and never by itself adds an advisory section to the body.
+
         The hook spends that one deadline on TWO INDEPENDENT READS RUN CONCURRENTLY — the
         duplicate-candidate scan and the charter read — joined before either result is used,
         so the deadline is a PER-READ cap rather than a pool the first read can drain (#2827).
@@ -1192,6 +1248,21 @@ components:
                 description: The band `score` falls in. Read the band, not the float.
               basis: { type: string, description: "The shared tokens, rendered — what makes a wrong candidate cheap to dismiss." }
               closed: { type: boolean, description: Whether the candidate is already closed. A closed duplicate is often the resolution. }
+        derives_from:
+          type: array
+          description: >-
+            The items the request declared it derives from (`source_refs`), resolved against the
+            scanned window and EXCLUDED from `duplicates` (#3774). Absent when no source refs
+            were supplied.
+          items:
+            type: object
+            required: [number, closed, in_window]
+            properties:
+              number: { type: integer, description: The source item's tracker number. }
+              title: { type: string, description: The source item's title; absent when it was outside the scanned window. }
+              url: { type: string, description: The source item's URL; absent when it was outside the scanned window. }
+              closed: { type: boolean, description: "Whether the source item is closed. Always false outside the window: unknown, not open." }
+              in_window: { type: boolean, description: "Whether the source item was found in the scanned window, the only place title/url/closed are read from." }
         epic_suggestion:
           type: object
           description: >-
@@ -17416,7 +17487,8 @@ paths:
         '400':
           description: |
             `validation_failed` — `repo` not in owner/name form, or `type` /
-            `summary` / `run_id` missing or malformed.
+            `summary` / `run_id` missing or malformed, or a `source_refs` entry
+            is malformed (`details.field: source_refs`, `details.got` names it).
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403':
           description: |
@@ -17443,6 +17515,9 @@ paths:
             placeholders, e.g. `["epic"]` when epic derivation failed closed)
             and `details.unknown_sections` / `details.expected_sections` (the
             off-skeleton key(s) and the type's skeleton section names).
+            `details.source_refs_invalid` names a malformed source ref refused
+            by the filing core itself (the request prelude normally answers
+            that case 400 first).
         '501':
           description: |
             `provider_unimplemented` — the conventions name a provider that
@@ -17452,6 +17527,80 @@ paths:
           description: "`work_item_filing_failed` — the provider rejected the filing."
         '503':
           description: "`run_lookup_unconfigured` — `run_id` supplied but no run repository is wired."
+
+  /v0/work-items/preview:
+    post:
+      operationId: previewWorkItem
+      summary: Preview a work-item filing — conventions plus intake signals, nothing filed
+      description: |
+        Runs EXACTLY the filing pipeline POST /v0/work-items runs — the same
+        request prelude (auth, decode, validation, conventions load,
+        installation resolution) and the same conventions + intake core
+        (`{epic}`/`{n}` derivation, the parent-epic capacity guard, area/phase
+        derivation, sequential-number discovery, the conventions Apply, the
+        intake hook and the rendered advisory section) — and returns what a
+        filing WOULD produce, without filing it (#3774, E81.4).
+
+        **Creates and writes nothing.** The provider's File call, the only
+        mutating provider call on the filing path (board placement, the epic
+        link and label writes all happen inside it), is never made, and no
+        audit entry is written. Number discovery is a READ with no
+        reservation: the preview is a point-in-time view, and a concurrent
+        filing between preview and file can change an auto-derived `{n}`, a
+        discovered sequential `number`, or the duplicate window. The preview
+        does take the same per-epic / per-numbered-type in-process locks a
+        filing takes, for the duration of its own reads, so it briefly
+        serializes with a filing of the same epic or numbered type.
+
+        **Operator-only.** A run-bound agent token (`mcp:run:<uuid>`) is
+        refused `403 preview_operator_only` before the body is read (ADR-064
+        decision 3: no agent-reachable tracker read). `run_id` is refused
+        `400` (a preview writes no audit and is not run-scoped). A cookie
+        session is held to the point-read repo-visibility DENY: `403
+        repo_forbidden` when it cannot read `repo`.
+
+        Duplicate candidates and the epic suggestion are ADVISORY, exactly as
+        on the filing response. `source_refs` excludes the draft's own source
+        items from the duplicate candidates and reports them as
+        `intake.derives_from`.
+      tags: [work-items]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WorkItemRequest' }
+      responses:
+        '200':
+          description: The previewed filing.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkItemPreviewResponse' }
+        '400':
+          description: |
+            `validation_failed` — `repo` not in owner/name form, `type` /
+            `summary` missing, a malformed `source_refs` entry
+            (`details.field: source_refs`), or a `run_id` supplied at all
+            (`details.field: run_id`).
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            `preview_operator_only` — the caller holds a run-bound agent token;
+            previewing is operator-only. `repo_forbidden` — a cookie session
+            that cannot read `repo` on the forge (the point-read DENY).
+        '413':
+          description: "`body_too_large` — request body exceeds the size cap."
+        '422':
+          description: |
+            `work_item_invalid` — the same conventions refusals a filing
+            returns (unknown type, unresolved title placeholder, off-skeleton
+            `sections` key, `epic_link` violation, `parent_epic_full`, a
+            failed number/child-number discovery), with the same `details`.
+        '501':
+          description: "`provider_unimplemented` — the conventions name a provider that is not registered."
+        '502':
+          description: "`work_item_filing_failed` — the GitHub App installation for the target repo could not be resolved."
+        '503':
+          description: "`service_unavailable` — repository visibility could not be resolved; retry."
 
   /v0/refinement/sessions:
     post:
