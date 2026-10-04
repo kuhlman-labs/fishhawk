@@ -1955,3 +1955,105 @@ func TestExtractHeadSHA_FirstNonEmptyUnchangedOnMultiIterationBundle(t *testing.
 		t.Errorf("head_sha = %q, want head-a (first non-empty — the #797 dedup key rule)", got)
 	}
 }
+
+// sharedGateIsolationGolden reads the per-class members of the SHARED golden
+// testdata/wire/gate_isolation_evidence.json the runner marshals byte-equal
+// (#2135).
+func sharedGateIsolationGolden(t *testing.T) map[string]json.RawMessage {
+	t.Helper()
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed; cannot resolve the shared wire fixture path")
+	}
+	b, err := os.ReadFile(filepath.Join(filepath.Dir(thisFile), "..", "..", "..", "testdata", "wire", "gate_isolation_evidence.json"))
+	if err != nil {
+		t.Fatalf("read shared wire fixture: %v", err)
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatalf("decode shared wire fixture: %v", err)
+	}
+	return m
+}
+
+// gateEvidenceBundle packs one gate_evidence event with the given payload.
+func gateEvidenceBundle(t *testing.T, payload string) []byte {
+	t.Helper()
+	return packLines(t, []Line{
+		{Seq: 1, Kind: "manifest", Data: json.RawMessage(`{"bundle_schema":"v1"}`)},
+		{Seq: 2, Kind: EventKindGateEvidence, Data: json.RawMessage(payload)},
+	})
+}
+
+// TestExtractGateEvidence_GateIsolationSharedGolden is the BACKEND half of the
+// #2135 wire seam: every class in the shared golden decodes into
+// GateIsolationEvidence with the class, path and container_unavailable the
+// runner wrote, and re-encodes to the SAME bytes (a dropped or renamed field
+// would lose bytes on the round trip).
+func TestExtractGateEvidence_GateIsolationSharedGolden(t *testing.T) {
+	golden := sharedGateIsolationGolden(t)
+	want := map[string]struct{ path, unavailable string }{
+		"fallback":  {"clone", "no gate image configured (FISHHAWK_GATE_IMAGE is empty)"},
+		"refused":   {"refused", "docker is not a safe runtime"},
+		"container": {"container", ""},
+	}
+	for class, w := range want {
+		t.Run(class, func(t *testing.T) {
+			member, ok := golden[class]
+			if !ok {
+				t.Fatalf("shared golden has no %q variant", class)
+			}
+			ge, err := ExtractGateEvidence(gateEvidenceBundle(t, `{"verify_runs":[{"command":"true","exit_code":0,"outcome":"passed"}],"gate_isolation":`+string(member)+`}`))
+			if err != nil {
+				t.Fatalf("ExtractGateEvidence: %v", err)
+			}
+			gi := ge.GateIsolation
+			if gi == nil {
+				t.Fatal("gate_isolation member not decoded")
+			}
+			if gi.Class != class || gi.Path != w.path {
+				t.Errorf("class/path = %q/%q, want %q/%q", gi.Class, gi.Path, class, w.path)
+			}
+			if w.unavailable == "" && gi.ContainerUnavailable != "" || !strings.Contains(gi.ContainerUnavailable, w.unavailable) {
+				t.Errorf("container_unavailable = %q, want %q", gi.ContainerUnavailable, w.unavailable)
+			}
+			re, err := json.Marshal(gi)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(re, member) {
+				t.Errorf("round trip lost bytes:\n got %s\nwant %s", re, member)
+			}
+		})
+	}
+}
+
+// TestExtractGateEvidence_GateIsolationAbsent: an older bundle (or a stage
+// where no gate reached the runner's seam) decodes to a nil member.
+func TestExtractGateEvidence_GateIsolationAbsent(t *testing.T) {
+	ge, err := ExtractGateEvidence(gateEvidenceBundle(t, `{"verify_runs":[{"command":"true","exit_code":0,"outcome":"passed"}]}`))
+	if err != nil {
+		t.Fatalf("ExtractGateEvidence: %v", err)
+	}
+	if ge.GateIsolation != nil {
+		t.Errorf("gate_isolation = %+v, want nil", ge.GateIsolation)
+	}
+}
+
+// TestExtractGateEvidence_IsolationOnlyCarriesNoVerdict (approval condition 5,
+// bundle half): a refusal where no other gate event exists decodes with the
+// isolation member and NO verify run, summary or violation — the decoded
+// struct offers nothing a consumer could read as "gates ran and passed".
+func TestExtractGateEvidence_IsolationOnlyCarriesNoVerdict(t *testing.T) {
+	member := sharedGateIsolationGolden(t)["refused"]
+	ge, err := ExtractGateEvidence(gateEvidenceBundle(t, `{"scope_facts":{"declared_files":2},"gate_isolation":`+string(member)+`}`))
+	if err != nil {
+		t.Fatalf("ExtractGateEvidence: %v", err)
+	}
+	if ge.GateIsolation == nil || ge.GateIsolation.Class != "refused" {
+		t.Fatalf("gate_isolation = %+v, want class refused", ge.GateIsolation)
+	}
+	if len(ge.VerifyRuns) != 0 || ge.VerifySummary != nil || len(ge.PolicyViolations) != 0 || ge.DiffCoverage != nil {
+		t.Errorf("isolation-only evidence decoded a gate verdict: %+v", ge)
+	}
+}

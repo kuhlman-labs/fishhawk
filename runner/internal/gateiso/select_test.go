@@ -150,3 +150,72 @@ func TestProfileForbidsFallback(t *testing.T) {
 		}
 	}
 }
+
+// TestSelect_ContainerUnavailable pins that every non-container outcome names
+// why the container path was not taken (#2135), and the container path names
+// nothing. The auto/no-runtime/no-image row asserts both missing pieces: the
+// fixture has neither, so Select's own assignment is the only source of the
+// asserted substrings (Reason is not consulted).
+func TestSelect_ContainerUnavailable(t *testing.T) {
+	rows := []struct {
+		name    string
+		in      Inputs
+		path    Path
+		want    []string
+		wantNil bool
+	}{
+		{"auto/none-noimage/local → clone", Inputs{Mode: ModeAuto, Profile: ProfileLocal, Runtime: noRT, Sandbox: sbNo}, PathClone,
+			[]string{"no safe container runtime (no container runtime on PATH", "no gate image configured (FISHHAWK_GATE_IMAGE is empty)"}, false},
+		{"auto/unsafe/sandbox → clone-sandbox", Inputs{Mode: ModeAuto, Profile: ProfileSelfHosted, Image: "img", Runtime: unsafeRT, Sandbox: sbOK}, PathCloneSandbox,
+			[]string{"docker is not a safe runtime"}, false},
+		{"auto/hosted → refused", Inputs{Mode: ModeAuto, Profile: ProfileHosted, Image: "img", Runtime: unsafeRT, Sandbox: sbOK}, PathRefused,
+			[]string{"docker is not a safe runtime"}, false},
+		{"container/unavailable → refused", Inputs{Mode: ModeContainer, Profile: ProfileLocal, Runtime: safeRT, Sandbox: sbOK}, PathRefused,
+			[]string{"no gate image configured"}, false},
+		{"clone → not attempted", Inputs{Mode: ModeClone, Profile: ProfileLocal, Image: "img", Runtime: safeRT}, PathClone,
+			[]string{"not attempted: mode=clone selects a fallback path"}, false},
+		{"clone-sandbox → not attempted", Inputs{Mode: ModeCloneSandbox, Profile: ProfileLocal, Image: "img", Runtime: safeRT, Sandbox: sbOK}, PathCloneSandbox,
+			[]string{"not attempted: mode=clone-sandbox selects a fallback path"}, false},
+		{"clone/hosted refused → not attempted", Inputs{Mode: ModeClone, Profile: ProfileHosted, Image: "img", Runtime: safeRT}, PathRefused,
+			[]string{"not attempted: mode=clone"}, false},
+		{"unknown mode → not attempted", Inputs{Mode: "bogus", Profile: ProfileLocal, Image: "img", Runtime: safeRT}, PathRefused,
+			[]string{`not attempted: unknown isolation mode "bogus"`}, false},
+		{"auto/container → empty", Inputs{Mode: ModeAuto, Profile: ProfileLocal, Image: "img", Runtime: safeRT}, PathContainer, nil, true},
+		{"container/container → empty", Inputs{Mode: ModeContainer, Profile: ProfileHosted, Image: "img", Runtime: safeRT}, PathContainer, nil, true},
+	}
+	for _, r := range rows {
+		t.Run(r.name, func(t *testing.T) {
+			sel := Select(r.in)
+			if sel.Path != r.path {
+				t.Fatalf("path = %q, want %q", sel.Path, r.path)
+			}
+			if r.wantNil && sel.ContainerUnavailable != "" {
+				t.Fatalf("container path carries ContainerUnavailable %q, want empty", sel.ContainerUnavailable)
+			}
+			if !r.wantNil && sel.ContainerUnavailable == "" {
+				t.Fatalf("non-container path %q carries no ContainerUnavailable", sel.Path)
+			}
+			for _, w := range r.want {
+				if !strings.Contains(sel.ContainerUnavailable, w) {
+					t.Errorf("ContainerUnavailable %q lacks %q", sel.ContainerUnavailable, w)
+				}
+			}
+		})
+	}
+}
+
+// TestPathClass pins the container|fallback|refused mapping; an unknown path
+// has no class.
+func TestPathClass(t *testing.T) {
+	for p, want := range map[Path]Class{
+		PathContainer:    ClassContainer,
+		PathCloneSandbox: ClassFallback,
+		PathClone:        ClassFallback,
+		PathRefused:      ClassRefused,
+		Path("bogus"):    "",
+	} {
+		if got := p.Class(); got != want {
+			t.Errorf("Path(%q).Class() = %q, want %q", p, got, want)
+		}
+	}
+}

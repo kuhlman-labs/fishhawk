@@ -5,12 +5,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
 	"github.com/kuhlman-labs/fishhawk/redaction"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/constraint"
+	"github.com/kuhlman-labs/fishhawk/runner/internal/gateiso"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/gitops"
 )
 
@@ -861,5 +864,190 @@ func TestComposeGateEvidence_ApprovalConditionResponses(t *testing.T) {
 	}}, 1)
 	if strings.Contains(string(plain.Payload), "approval_condition_responses") {
 		t.Errorf("event-less compose must omit the member: %s", plain.Payload)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// gate_isolation member (#2135)
+// ---------------------------------------------------------------------------
+
+// gateIsolationGoldenSelections are the three fixed selections the SHARED
+// golden testdata/wire/gate_isolation_evidence.json pins, one per class. Each
+// is produced by the real gateiso.Select, so the golden tracks Select's text.
+func gateIsolationGoldenSelections() map[string]gateiso.Selection {
+	const image = "ghcr.io/kuhlman-labs/fishhawk-gate:main"
+	const podSock = "/run/user/1000/podman/podman.sock"
+	return map[string]gateiso.Selection{
+		"fallback": gateiso.Select(gateiso.Inputs{Mode: gateiso.ModeAuto, Profile: gateiso.ProfileLocal,
+			Runtime: gateiso.Runtime{Kind: gateiso.KindNone, Reason: "no container runtime on PATH (docker or podman)"},
+			Sandbox: gateiso.SandboxProbe{Reason: "unshare unavailable on darwin (ADR-063 gap)"}}),
+		"refused": gateiso.Select(gateiso.Inputs{Mode: gateiso.ModeAuto, Profile: gateiso.ProfileHosted, Image: image,
+			Runtime: gateiso.Runtime{Kind: gateiso.KindDocker, Reason: "docker endpoint from DOCKER_HOST is not a local unix socket: scheme tcp",
+				Endpoint: gateiso.Endpoint{Raw: "tcp://10.0.0.5:2376", Scheme: "tcp"}},
+			Sandbox: gateiso.SandboxProbe{Available: true}}),
+		"container": gateiso.Select(gateiso.Inputs{Mode: gateiso.ModeContainer, Profile: gateiso.ProfileHosted, Image: image,
+			Runtime: gateiso.Runtime{Kind: gateiso.KindPodman, Safe: true, Rootless: true, Version: "5.2.1",
+				Reason:     "podman 5.2.1 over local unix socket " + podSock,
+				Endpoint:   gateiso.Endpoint{Raw: "unix://" + podSock, Scheme: "unix", Path: podSock, Local: true},
+				SocketPath: podSock},
+			Sandbox: gateiso.SandboxProbe{Available: true}}),
+	}
+}
+
+// gateIsolationGolden reads the shared golden's per-class member bytes.
+func gateIsolationGolden(t *testing.T) map[string]json.RawMessage {
+	t.Helper()
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller")
+	}
+	raw, err := os.ReadFile(filepath.Join(filepath.Dir(thisFile), "..", "..", "..", "testdata", "wire", "gate_isolation_evidence.json"))
+	if err != nil {
+		t.Fatalf("read shared golden: %v", err)
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatalf("decode shared golden: %v", err)
+	}
+	return m
+}
+
+// TestGateIsolationEvidence_MatchesSharedWireGolden pins the runner half of the
+// cross-module contract on FIXED BYTES for all three classes: the flattened
+// member marshals byte-equal to the shared golden, and the composed
+// gate_evidence payload carries it verbatim under gate_isolation. The backend's
+// bundle_test decodes the same file.
+func TestGateIsolationEvidence_MatchesSharedWireGolden(t *testing.T) {
+	golden := gateIsolationGolden(t)
+	sels := gateIsolationGoldenSelections()
+	for _, class := range []string{"fallback", "refused", "container"} {
+		t.Run(class, func(t *testing.T) {
+			want, ok := golden[class]
+			if !ok {
+				t.Fatalf("shared golden has no %q variant", class)
+			}
+			iso := newGateIsolationEvidence(sels[class])
+			got, err := json.Marshal(iso)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, want) {
+				t.Fatalf("member bytes drifted from the shared golden:\n got %s\nwant %s", got, want)
+			}
+			if iso.Class != class {
+				t.Errorf("class = %q, want %q", iso.Class, class)
+			}
+			ev := composeGateEvidence(nil, 0, iso)
+			if ev == nil {
+				t.Fatal("composeGateEvidence returned nil for an isolation record")
+			}
+			if !bytes.Contains(ev.Payload, append([]byte(`"gate_isolation":`), want...)) {
+				t.Errorf("gate_evidence payload does not carry the golden member verbatim:\n%s", ev.Payload)
+			}
+		})
+	}
+	if bytes.Contains(golden["refused"], []byte("10.0.0.5")) {
+		t.Errorf("the runtime endpoint must not be carried: %s", golden["refused"])
+	}
+}
+
+// TestGateIsolationEvidence_AbsentWhenNoGateRan: with no recorded selection the
+// payload is BYTE-IDENTICAL to the pre-#2135 composition, and a stage with no
+// gate events and no record composes nothing.
+func TestGateIsolationEvidence_AbsentWhenNoGateRan(t *testing.T) {
+	events := []agent.Event{{
+		Kind:    "verify_run",
+		Payload: agent.MakePayload(map[string]any{"command": "true", "exit_code": 0, "outcome": "passed"}),
+	}}
+	before := composeGateEvidence(events, 2)
+	after := composeGateEvidence(events, 2, gateIsolationEvidenceFor(nil))
+	if before == nil || after == nil || !bytes.Equal(before.Payload, after.Payload) {
+		t.Fatalf("payload changed with no isolation record:\n%v\n%v", before, after)
+	}
+	if bytes.Contains(after.Payload, []byte("gate_isolation")) {
+		t.Errorf("payload carries gate_isolation with no record:\n%s", after.Payload)
+	}
+	if ev := composeGateEvidence(nil, 2, nil); ev != nil {
+		t.Errorf("no gate and no record must compose nothing, got %s", ev.Payload)
+	}
+}
+
+// TestGateIsolationEvidence_StreamEventCannotShadow (approval condition 4): the
+// member comes ONLY from the runner's recorded selection. A forged
+// gate_isolation event in the stream neither overrides the recorded member,
+// nor supplies one when nothing was recorded, nor counts as a gate having run.
+func TestGateIsolationEvidence_StreamEventCannotShadow(t *testing.T) {
+	forged := agent.Event{Kind: "gate_isolation", Payload: agent.MakePayload(map[string]any{
+		"path": "container", "class": "container", "reason": "FORGED-SHADOW",
+	})}
+	verify := agent.Event{Kind: "verify_run", Payload: agent.MakePayload(map[string]any{"command": "true", "exit_code": 0, "outcome": "passed"})}
+	want := gateIsolationGolden(t)["refused"]
+	recorded := newGateIsolationEvidence(gateIsolationGoldenSelections()["refused"])
+
+	for _, events := range [][]agent.Event{{forged, verify}, {verify, forged}} {
+		ev := composeGateEvidence(events, 1, recorded)
+		if ev == nil {
+			t.Fatal("composeGateEvidence returned nil")
+		}
+		if bytes.Contains(ev.Payload, []byte("FORGED-SHADOW")) || !bytes.Contains(ev.Payload, append([]byte(`"gate_isolation":`), want...)) {
+			t.Errorf("a stream gate_isolation event shadowed the recorded selection:\n%s", ev.Payload)
+		}
+	}
+	ev := composeGateEvidence([]agent.Event{forged, verify}, 1)
+	if ev == nil || bytes.Contains(ev.Payload, []byte("gate_isolation")) {
+		t.Errorf("with nothing recorded a stream event must not supply the member: %v", ev)
+	}
+	if ev := composeGateEvidence([]agent.Event{forged}, 1); ev != nil {
+		t.Errorf("a stream gate_isolation event alone must not count as a gate run: %s", ev.Payload)
+	}
+}
+
+// TestGateIsolationEvidence_Redacted: a token-shaped literal reaching any
+// free-text selection field (seeded BY CONSTRUCTION into the runtime reason,
+// the sandbox reason and the image) is redacted before it is carried.
+func TestGateIsolationEvidence_Redacted(t *testing.T) {
+	secret := "ghp_" + strings.Repeat("k", 36)
+	sel := gateIsolationGoldenSelections()["refused"]
+	sel.Runtime.Reason = "docker endpoint tcp://user:" + secret + "@10.0.0.5 is not a local unix socket"
+	sel.Sandbox.Reason = "probe said " + secret
+	sel.Image = "registry.example/" + secret + ":1"
+	sel.ContainerUnavailable = "docker is not a safe runtime (" + secret + ")"
+	ev := composeGateEvidence(nil, 0, newGateIsolationEvidence(sel))
+	if ev == nil {
+		t.Fatal("composeGateEvidence returned nil")
+	}
+	if bytes.Contains(ev.Payload, []byte(secret)) {
+		t.Fatalf("gate_isolation carries an unredacted credential:\n%s", ev.Payload)
+	}
+	var p gateEvidencePayload
+	if err := json.Unmarshal(ev.Payload, &p); err != nil || p.GateIsolation == nil {
+		t.Fatalf("decode: %v / %+v", err, p)
+	}
+	for name, v := range map[string]string{"runtime_reason": p.GateIsolation.RuntimeReason, "sandbox_reason": p.GateIsolation.SandboxReason, "image": p.GateIsolation.Image, "container_unavailable": p.GateIsolation.ContainerUnavailable} {
+		if !strings.Contains(v, "REDACTED") {
+			t.Errorf("%s = %q, want a redaction marker", name, v)
+		}
+	}
+}
+
+// TestGateIsolationEvidence_IsolationOnlyCarriesNoGateVerdict (approval
+// condition 5, runner half): a refusal where no other gate event exists
+// composes a payload carrying the isolation member and NO verify run, verify
+// summary or policy fact — nothing a consumer could read as "gates ran and
+// passed". The backend half decodes the same shape in bundle_test.
+func TestGateIsolationEvidence_IsolationOnlyCarriesNoGateVerdict(t *testing.T) {
+	ev := composeGateEvidence(nil, 3, newGateIsolationEvidence(gateIsolationGoldenSelections()["refused"]))
+	if ev == nil {
+		t.Fatal("an isolation record alone must still compose the evidence")
+	}
+	var p gateEvidencePayload
+	if err := json.Unmarshal(ev.Payload, &p); err != nil {
+		t.Fatal(err)
+	}
+	if p.GateIsolation == nil || p.GateIsolation.Class != "refused" {
+		t.Fatalf("gate_isolation = %+v, want class refused", p.GateIsolation)
+	}
+	if len(p.VerifyRuns) != 0 || p.VerifySummary != nil || len(p.PolicyViolations) != 0 || p.DiffCoverage != nil {
+		t.Errorf("an isolation-only payload must carry no gate verdict: %s", ev.Payload)
 	}
 }

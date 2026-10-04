@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/kuhlman-labs/fishhawk/runner/internal/gateiso"
@@ -141,6 +142,14 @@ type gateIsolationState struct {
 	sel  gateiso.Selection
 	uid  int
 	gid  int
+
+	// seamReached is set by markSeamReached at the gate-exec seam
+	// (runBoundedGateArgvDisposed) — NOT inside selection()'s once.Do,
+	// because selection() has a non-exec caller too (runVerifyCommittedTree
+	// reads the path to decide its lock-path env). It is what makes the
+	// selection RECORDED for the gate evidence (#2135): a gate reached the
+	// seam, refusal included.
+	seamReached atomic.Bool
 }
 
 // gateIsolation is the live state run() installs and clears (cleanup).
@@ -254,6 +263,28 @@ func (s *gateIsolationState) selection(ctx context.Context) gateiso.Selection {
 		}
 	})
 	return s.sel
+}
+
+// markSeamReached records that a gate reached the exec seam with the
+// selection already decided. Called by runBoundedGateArgvDisposed right
+// after selection(), so the Store follows the once.Do write of s.sel and a
+// Load()==true reader observes the final selection. Nil receiver: no-op (the
+// unconfigured host exec records nothing).
+func (s *gateIsolationState) markSeamReached() {
+	if s == nil {
+		return
+	}
+	s.seamReached.Store(true)
+}
+
+// recordedSelection returns the selection a gate actually ran under, and
+// false when no gate reached the seam (a plan stage, the working-tree
+// runVerifyGate, a nil state). It never triggers detection.
+func (s *gateIsolationState) recordedSelection() (gateiso.Selection, bool) {
+	if s == nil || !s.seamReached.Load() {
+		return gateiso.Selection{}, false
+	}
+	return s.sel, true
 }
 
 // cleanup releases the process-wide state. run() defers it so a later run()
