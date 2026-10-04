@@ -12,8 +12,19 @@
 # weakened copy.
 #
 # Signals, in order:
-#   1. DIR's physical path (`pwd -P`) lies in a runner-owned agent tree. This
-#      is the primary signal, because the LOCAL runner sets no marker env var.
+#   1. FISHHAWK_RUN_AGENT is non-empty (PRIMARY). The runner stamps
+#      FISHHAWK_RUN_AGENT=<run id> (or `1` when the invocation has no run id) on
+#      EVERY agent process it spawns, last in the env so nothing re-points it
+#      (#3945; runner/README.md § "Run-agent marker"). Any non-empty value is
+#      the signal. Both agent CLIs forward it from their own env to their shell
+#      tool, where the skills run this script: verified for claude-code (Bash
+#      tool) and codex (`exec` with the runner's flags) on 2026-10-04 (#3947).
+#      Residual: a codex `shell_environment_policy` an operator sets in
+#      ~/.codex/config.toml could filter it, which is why the path signal
+#      below stays as the fallback. The marker is cooperative, not
+#      adversarial: an agent can `env -u` it in its own shell.
+#   2. DIR's physical path (`pwd -P`) lies in a runner-owned agent tree (the
+#      FALLBACK, for a runner binary older than the marker or a filtered env).
 #      A run tree's path is a prefix of every directory inside it, so matching
 #      the physical path also covers a skill invoked from a subdirectory. Each
 #      shape is matched as one exact path component (not a substring), so an
@@ -28,21 +39,20 @@
 #      `<tree>-debug` is refused. runner/cmd/fishhawk-runner
 #      TestIsRunAgentMatchesAcceptanceTreePath renders the runner's real
 #      acceptanceTreePath and runs this script on it, so a rename in the Go
-#      format string fails a test. The acceptance WORKDIR is not a git checkout, so a skill (which locates
-#      this script via `git rev-parse`) cannot reach it from there; that
-#      pattern serves direct callers passing DIR.
-#   2. FISHHAWK_RUN_ID is non-empty (CI-hosted runners only: GitLab CI,
-#      deploy triggers).
-#   3. FISHHAWK_FORGE_WRITES=deny (INTERIM, until #3945 stamps a dedicated
-#      marker on every agent spawn). runner/internal/acceptenv injects it as a
-#      fixed value into every acceptance agent, so it still catches one that
-#      has cd'd into an operator checkout, where no path pattern applies. It
-#      means "forge writes disabled", so an operator who set it for dev-mode
-#      testing is refused too. That is the SAFE direction for a guard: the
-#      printed reason tells the operator to unset it.
+#      format string fails a test. The acceptance WORKDIR is not a git
+#      checkout, so a skill (which locates this script via `git rev-parse`)
+#      cannot reach it from there; that pattern serves direct callers passing
+#      DIR.
+#   3. FISHHAWK_RUN_ID is non-empty (CI-hosted runners: GitLab CI, deploy
+#      triggers).
 #
-# A new runner agent tree must be added below. The patterns are pinned by
-# scripts/test-is-run-agent, run inside `scripts/test verify`.
+# FISHHAWK_FORGE_WRITES=deny is NOT a signal (dropped in #3947). It was an
+# interim acceptance-agent marker until the runner stamped FISHHAWK_RUN_AGENT;
+# it means "forge writes disabled", and an operator may set it for dev-mode
+# testing.
+#
+# A new runner agent tree must be added below (the fallback). The signals are
+# pinned by scripts/test-is-run-agent, run inside `scripts/test verify`.
 set -u
 
 dir="${1:-.}"
@@ -51,6 +61,11 @@ phys="$(cd "$dir" 2>/dev/null && pwd -P)" || phys="$dir"
 matches() {
   printf '%s\n' "$phys" | grep -Eq "$1"
 }
+
+if [ -n "${FISHHAWK_RUN_AGENT:-}" ]; then
+  echo "run-agent: FISHHAWK_RUN_AGENT is set (${FISHHAWK_RUN_AGENT})"
+  exit 10
+fi
 
 if matches '/fishhawk-worktrees/run-[^/]+(/|$)'; then
   echo "run-agent: run worktree ($phys)"
@@ -72,11 +87,6 @@ fi
 
 if [ -n "${FISHHAWK_RUN_ID:-}" ]; then
   echo "run-agent: FISHHAWK_RUN_ID is set"
-  exit 10
-fi
-
-if [ "${FISHHAWK_FORGE_WRITES:-}" = "deny" ]; then
-  echo "run-agent: FISHHAWK_FORGE_WRITES=deny (the acceptance-agent marker; if you are an operator who set it for dev-mode testing, unset it and re-run)"
   exit 10
 fi
 

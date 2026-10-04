@@ -20,7 +20,7 @@ trap 'rm -rf "$tmproot"' EXIT
 out=""
 status=0
 run_check() {
-  out="$(env -u FISHHAWK_RUN_ID -u FISHHAWK_FORGE_WRITES "$CHECK" "$1" 2>&1)"
+  out="$(env -u FISHHAWK_RUN_ID -u FISHHAWK_FORGE_WRITES -u FISHHAWK_RUN_AGENT "$CHECK" "$1" 2>&1)"
   status=$?
 }
 
@@ -124,7 +124,7 @@ mk_git "$tmproot/$ACC_TREE-debug"
 expect_operator "o11 operator copy <tree>-debug" "$tmproot/$ACC_TREE-debug"
 
 # e1 — FISHHAWK_RUN_ID alone marks a run agent (CI-hosted runners).
-out="$(env -u FISHHAWK_FORGE_WRITES FISHHAWK_RUN_ID=11111111-2222-3333-4444-555555555555 "$CHECK" "$tmproot/fishhawk" 2>&1)"
+out="$(env -u FISHHAWK_FORGE_WRITES -u FISHHAWK_RUN_AGENT FISHHAWK_RUN_ID=11111111-2222-3333-4444-555555555555 "$CHECK" "$tmproot/fishhawk" 2>&1)"
 status=$?
 if [ "$status" -eq 10 ] && [ "$out" = "run-agent: FISHHAWK_RUN_ID is set" ]; then
   pass "e1 FISHHAWK_RUN_ID set"
@@ -133,7 +133,7 @@ else
 fi
 
 # e2 — an EMPTY FISHHAWK_RUN_ID is not a marker.
-out="$(env -u FISHHAWK_FORGE_WRITES FISHHAWK_RUN_ID= "$CHECK" "$tmproot/fishhawk" 2>&1)"
+out="$(env -u FISHHAWK_FORGE_WRITES -u FISHHAWK_RUN_AGENT FISHHAWK_RUN_ID= "$CHECK" "$tmproot/fishhawk" 2>&1)"
 status=$?
 if [ "$status" -eq 0 ] && [ "$out" = "operator" ]; then
   pass "e2 empty FISHHAWK_RUN_ID"
@@ -141,18 +141,19 @@ else
   fail "e2 empty FISHHAWK_RUN_ID (status=$status out=$out)"
 fi
 
-# e3 — FISHHAWK_FORGE_WRITES=deny (the interim acceptance-agent marker) is a
-# run agent even in an operator checkout: an acceptance agent that cd'd there.
-out="$(env -u FISHHAWK_RUN_ID FISHHAWK_FORGE_WRITES=deny "$CHECK" "$tmproot/fishhawk" 2>&1)"
+# e3 — FISHHAWK_FORGE_WRITES=deny is NOT a run-agent signal (#3947 dropped the
+# interim): it means "forge writes disabled", and an operator may set it for
+# dev-mode testing.
+out="$(env -u FISHHAWK_RUN_ID -u FISHHAWK_RUN_AGENT FISHHAWK_FORGE_WRITES=deny "$CHECK" "$tmproot/fishhawk" 2>&1)"
 status=$?
-if [ "$status" -eq 10 ] && [[ "$out" == "run-agent: FISHHAWK_FORGE_WRITES=deny"* ]]; then
-  pass "e3 FISHHAWK_FORGE_WRITES=deny in an operator checkout"
+if [ "$status" -eq 0 ] && [ "$out" = "operator" ]; then
+  pass "e3 FISHHAWK_FORGE_WRITES=deny is not a signal"
 else
-  fail "e3 FISHHAWK_FORGE_WRITES=deny in an operator checkout (status=$status out=$out)"
+  fail "e3 FISHHAWK_FORGE_WRITES=deny is not a signal (status=$status out=$out)"
 fi
 
 # e4 — any other FISHHAWK_FORGE_WRITES value is not a marker.
-out="$(env -u FISHHAWK_RUN_ID FISHHAWK_FORGE_WRITES=allow "$CHECK" "$tmproot/fishhawk" 2>&1)"
+out="$(env -u FISHHAWK_RUN_ID -u FISHHAWK_RUN_AGENT FISHHAWK_FORGE_WRITES=allow "$CHECK" "$tmproot/fishhawk" 2>&1)"
 status=$?
 if [ "$status" -eq 0 ] && [ "$out" = "operator" ]; then
   pass "e4 FISHHAWK_FORGE_WRITES=allow"
@@ -162,12 +163,47 @@ fi
 
 # e5 — a path signal still wins with FISHHAWK_FORGE_WRITES set to another
 # value: the env does not mask the path checks.
-out="$(env -u FISHHAWK_RUN_ID FISHHAWK_FORGE_WRITES=allow "$CHECK" "$tmproot/fishhawk-conflict-XYZ/tree" 2>&1)"
+out="$(env -u FISHHAWK_RUN_ID -u FISHHAWK_RUN_AGENT FISHHAWK_FORGE_WRITES=allow "$CHECK" "$tmproot/fishhawk-conflict-XYZ/tree" 2>&1)"
 status=$?
 if [ "$status" -eq 10 ] && [[ "$out" == "run-agent: conflict-resolution tree"* ]]; then
   pass "e5 path signal with FISHHAWK_FORGE_WRITES=allow"
 else
   fail "e5 path signal with FISHHAWK_FORGE_WRITES=allow (status=$status out=$out)"
+fi
+
+# m1–m4 — the runner-stamped marker FISHHAWK_RUN_AGENT (#3945, the PRIMARY
+# signal). m1: a run-id value marks a run agent in an operator checkout, where
+# no path pattern applies (an agent that cd'd out of its tree). m2: the `1`
+# fallback value is a signal too (any non-empty value). m3: an EMPTY value is
+# not. m4: the marker wins first even inside a run tree (its reason, not the
+# path reason, is printed), proving it is checked BEFORE the path fallback.
+out="$(env -u FISHHAWK_RUN_ID -u FISHHAWK_FORGE_WRITES FISHHAWK_RUN_AGENT=3a8cc5f5-85cd-4664-8b7c-6974739db24e "$CHECK" "$tmproot/fishhawk" 2>&1)"
+status=$?
+if [ "$status" -eq 10 ] && [ "$out" = "run-agent: FISHHAWK_RUN_AGENT is set (3a8cc5f5-85cd-4664-8b7c-6974739db24e)" ]; then
+  pass "m1 marker with run id in an operator checkout"
+else
+  fail "m1 marker with run id in an operator checkout (status=$status out=$out)"
+fi
+out="$(env -u FISHHAWK_RUN_ID -u FISHHAWK_FORGE_WRITES FISHHAWK_RUN_AGENT=1 "$CHECK" "$tmproot/fishhawk" 2>&1)"
+status=$?
+if [ "$status" -eq 10 ] && [ "$out" = "run-agent: FISHHAWK_RUN_AGENT is set (1)" ]; then
+  pass "m2 marker fallback value 1"
+else
+  fail "m2 marker fallback value 1 (status=$status out=$out)"
+fi
+out="$(env -u FISHHAWK_RUN_ID -u FISHHAWK_FORGE_WRITES FISHHAWK_RUN_AGENT= "$CHECK" "$tmproot/fishhawk" 2>&1)"
+status=$?
+if [ "$status" -eq 0 ] && [ "$out" = "operator" ]; then
+  pass "m3 empty marker is not a signal"
+else
+  fail "m3 empty marker is not a signal (status=$status out=$out)"
+fi
+out="$(env -u FISHHAWK_RUN_ID -u FISHHAWK_FORGE_WRITES FISHHAWK_RUN_AGENT=1 "$CHECK" "$tmproot/fishhawk-conflict-XYZ/tree" 2>&1)"
+status=$?
+if [ "$status" -eq 10 ] && [ "$out" = "run-agent: FISHHAWK_RUN_AGENT is set (1)" ]; then
+  pass "m4 marker checked before the path fallback"
+else
+  fail "m4 marker checked before the path fallback (status=$status out=$out)"
 fi
 
 echo "test-is-run-agent: $PASS passed, $FAIL failed"
