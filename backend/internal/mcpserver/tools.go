@@ -311,6 +311,8 @@ func registerTools(srv *mcp.Server, resolver *runResolver) {
 	registerReconcileMerge(srv, resolver)
 	registerReviveRun(srv, resolver)
 	registerFileIssue(srv, resolver)
+	// #3774: the non-mutating preview of the same filing, adjacent on purpose.
+	registerPreviewIssue(srv, resolver)
 	registerDraftEpic(srv, resolver)
 	registerFixupStage(srv, resolver)
 	registerWaiveConcern(srv, resolver)

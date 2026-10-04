@@ -111,6 +111,40 @@ func TestFileIssue_HappyPath_ThreadsFieldsAndRelations(t *testing.T) {
 	}
 }
 
+// TestFileIssue_ForwardsSourceRefs (#3774): source_refs reach the wire
+// verbatim, so the backend can exclude the draft's own source items from its
+// duplicate candidates; an absent source_refs sends no key at all.
+func TestFileIssue_ForwardsSourceRefs(t *testing.T) {
+	fb, srv := newFileIssueFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	if _, _, err := r.fileIssue(context.Background(), nil, FileIssueInput{
+		Repo: "o/n", Type: "chore", Summary: "x",
+		SourceRefs: []string{"#1234", "1235"},
+	}); err != nil {
+		t.Fatalf("fileIssue: %v", err)
+	}
+	if got := fb.lastBody.SourceRefs; len(got) != 2 || got[0] != "#1234" || got[1] != "1235" {
+		t.Errorf("body source_refs = %v, want [#1234 1235]", got)
+	}
+
+	if _, _, err := r.fileIssue(context.Background(), nil, FileIssueInput{
+		Repo: "o/n", Type: "chore", Summary: "x",
+	}); err != nil {
+		t.Fatalf("fileIssue: %v", err)
+	}
+	if fb.lastBody.SourceRefs != nil {
+		t.Errorf("body source_refs = %v with none supplied, want absent", fb.lastBody.SourceRefs)
+	}
+	raw, err := json.Marshal(FileWorkItemRequest{Repo: "o/n", Type: "chore", Summary: "x"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(raw), "source_refs") {
+		t.Errorf("an empty request marshals a source_refs key: %s", raw)
+	}
+}
+
 func TestFileIssue_RepoAndRunFromEnv(t *testing.T) {
 	fb, srv := newFileIssueFakeBackend(t)
 	r := newResolver(srv, map[string]string{
@@ -367,6 +401,10 @@ func TestFileIssueToolDescribesIntakeAsAdvisory(t *testing.T) {
 		"degraded:true",
 		"degrade_reason",
 		"LEXICAL",
+		// #3774: the source_refs exclusion and the preview pointer.
+		"source_refs",
+		"intake.derives_from",
+		"fishhawk_preview_issue",
 	} {
 		if !strings.Contains(desc, want) {
 			t.Errorf("fishhawk_file_issue description does not mention %q; the intake posture is not stated to the agent", want)
@@ -447,6 +485,7 @@ func TestFileIssueToolDescribesPhaseDerivation(t *testing.T) {
 func TestFiledWorkItemDecodesIntakeShape(t *testing.T) {
 	const payload = `{"type":"chore","title":"t","number":1,"url":"u","provider":"github_projects",
 "intake":{"duplicates":[{"number":7,"url":"x","title":"dup","score":0.7,"confidence":"high","basis":"a b","closed":true}],
+"derives_from":[{"number":5,"title":"src","url":"y","closed":true,"in_window":true},{"number":6,"closed":false,"in_window":false}],
 "epic_suggestion":{"number":22,"title":"[E22] e","score":0.5,"confidence":"medium","basis":"c"},
 "score":{"value":4.0,"citations":[{"rubric_id":"S2","quote":"q","note":"n"}],"unscored":false},
 "degraded":false,"scanned_items":3,"window_truncated":true,"duration_ms":12}}`
@@ -463,6 +502,11 @@ func TestFiledWorkItemDecodesIntakeShape(t *testing.T) {
 	if len(out.Intake.Duplicates) != 1 || out.Intake.Duplicates[0].Number != 7 ||
 		out.Intake.Duplicates[0].Confidence != "high" || !out.Intake.Duplicates[0].Closed {
 		t.Errorf("duplicates = %+v", out.Intake.Duplicates)
+	}
+	if d := out.Intake.DerivesFrom; len(d) != 2 ||
+		d[0] != (IntakeSourceItem{Number: 5, Title: "src", URL: "y", Closed: true, InWindow: true}) ||
+		d[1] != (IntakeSourceItem{Number: 6}) {
+		t.Errorf("derives_from = %+v", d)
 	}
 	if out.Intake.EpicSuggestion == nil || out.Intake.EpicSuggestion.Number != 22 {
 		t.Errorf("epic_suggestion = %+v", out.Intake.EpicSuggestion)

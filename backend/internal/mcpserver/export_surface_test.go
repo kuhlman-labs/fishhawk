@@ -239,6 +239,9 @@ var exportBaseline = []string{
 	"IntakeEpicSuggestion",
 	"IntakeScore",
 	"IntakeSignals",
+	// #3774: the decode-only mirror of intake.derives_from entries, local for
+	// the same ADR-064 reason as the intake satellites above.
+	"IntakeSourceItem",
 	"IntegrateWaveResult",
 	"IssueComment",
 	"IssueContext",
@@ -312,6 +315,10 @@ var exportBaseline = []string{
 	"PrecedentResult",
 	"PreviewCampaignInput",
 	"PreviewCampaignOutput",
+	// #3774: fishhawk_preview_issue's tool I/O, exported for the SDK's
+	// jsonschema reflection like every other tool DTO.
+	"PreviewIssueInput",
+	"PreviewIssueOutput",
 	"ProductReport",
 	"ReadCrewMessagesInput",
 	"ReadCrewMessagesOutput",
@@ -481,6 +488,9 @@ var exportBaseline = []string{
 	"WaiveConcernsInput",
 	"WaiveConcernsOutput",
 	"WaivedConcern",
+	// #3774: the decode-only mirror of POST /v0/work-items/preview's 200,
+	// embedded in PreviewIssueOutput (local for the ADR-064 reason above).
+	"WorkItemPreview",
 	"WorkItemRelations",
 }
 
