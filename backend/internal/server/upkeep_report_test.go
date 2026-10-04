@@ -10,7 +10,9 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -56,6 +58,64 @@ func (r *upkeepRereadFailRepo) GetRun(ctx context.Context, id uuid.UUID) (*run.R
 		return nil, r.err
 	}
 	return r.upkeepRunRepo.GetRun(ctx, id)
+}
+
+// upkeepNthGetRunFailRepo fails GetRun for id from its from-th call on
+// (1-based) and counts every call for id (#3924 carried item 5). The router's
+// run-ownership middleware (requireRunAccount → resolveRunForAuthz) reads the
+// run FIRST, so from = 2 lets that read SUCCEED and fails only the handler's
+// later read — the realistic transient, with the account check exercised. An
+// id-keyed injection reaches the handler too, but only because that
+// middleware falls through on a load error. Either way the keying is not what
+// proves the branch: the tests assert the 500's message names the step.
+type upkeepNthGetRunFailRepo struct {
+	*upkeepRunRepo
+
+	id   uuid.UUID
+	from int
+	err  error
+
+	callMu sync.Mutex
+	calls  int
+}
+
+func (r *upkeepNthGetRunFailRepo) GetRun(ctx context.Context, id uuid.UUID) (*run.Run, error) {
+	if id == r.id {
+		r.callMu.Lock()
+		r.calls++
+		n := r.calls
+		r.callMu.Unlock()
+		if n >= r.from {
+			return nil, r.err
+		}
+	}
+	return r.upkeepRunRepo.GetRun(ctx, id)
+}
+
+func (r *upkeepNthGetRunFailRepo) getRunCalls() int {
+	r.callMu.Lock()
+	defer r.callMu.Unlock()
+	return r.calls
+}
+
+// newUpkeepLateGetRunFailFixture is the ingest fixture with the reporting
+// run's GetRun failing from its second call on.
+func newUpkeepLateGetRunFailFixture(t *testing.T) (*upkeepIngestFixture, *upkeepNthGetRunFailRepo) {
+	t.Helper()
+	var repo *upkeepNthGetRunFailRepo
+	f := newUpkeepIngestFixtureWith(t, upkeepScanSpec(t), "upkeep_scan", nil, func(rr *upkeepRunRepo) run.Repository {
+		repo = &upkeepNthGetRunFailRepo{upkeepRunRepo: rr, from: 2, err: errors.New("connection reset")}
+		return repo
+	})
+	repo.id = f.runRow.ID
+	return f, repo
+}
+
+// upkeepErrorMessage returns the error envelope's message.
+func upkeepErrorMessage(resp map[string]any) string {
+	errObj, _ := resp["error"].(map[string]any)
+	msg, _ := errObj["message"].(string)
+	return msg
 }
 
 type upkeepIngestFixture struct {
@@ -114,10 +174,13 @@ func newUpkeepIngestRepo(wfSpec []byte, workflowID string, runID, planStageID uu
 // the server's RunRepo, seeded with an upkeep-scan run whose plan stage is
 // stageID, plus a registered empty fake reader so no real forge is reached.
 // It returns the wrapper's embedded promptRunRepo, whose getStages the settle
-// table reads.
+// table reads. It installs the default conventions itself (#3924 carried
+// item 2) rather than relying on the caller's, so the dedupe's conventions
+// load never reaches the real forge whichever test builds it.
 func newUpkeepSettleServer(t *testing.T, runID, stageID uuid.UUID) (*Server, *signingFake, *promptRunRepo) {
 	t.Helper()
 	igRegisterReadProvider(t, &igReadProvider{})
+	installConventions(t, workmgmt.Default(), nil)
 	rr, _, _, _ := newUpkeepIngestRepo(upkeepScanSpec(t), "upkeep_scan", runID, stageID)
 	sf := newSigningFake()
 	s := New(Config{
@@ -446,12 +509,33 @@ func assertUpkeepRefused(t *testing.T, f *upkeepIngestFixture, stageID uuid.UUID
 	if got := f.stageState(stageID); got != run.StageStateFailed {
 		t.Errorf("stage = %q, want failed (category-B)", got)
 	}
+	if got := upkeepPersistedFailureCategory(f, stageID); got != run.FailureB {
+		t.Errorf("persisted failure category = %q, want %q", got, run.FailureB)
+	}
 	if n := f.artifacts(artifact.KindUpkeepReport); n != 0 {
 		t.Errorf("upkeep_report artifacts = %d, want 0", n)
 	}
 	if n := len(f.recorded(t)); n != 0 {
 		t.Errorf("recorded rows = %d, want 0", n)
 	}
+}
+
+// upkeepPersistedFailureCategory returns the failure category the LAST
+// transition of stageID to failed persisted, or "" when there was none. The
+// fake has no compare-and-swap capability, so run.FailStage writes the
+// category through TransitionStage's completion (#3924 carried item 4).
+func upkeepPersistedFailureCategory(f *upkeepIngestFixture, stageID uuid.UUID) run.FailureCategory {
+	var got run.FailureCategory
+	for _, c := range f.rr.transitionStageCalls {
+		if c.StageID != stageID || c.To != run.StageStateFailed {
+			continue
+		}
+		got = ""
+		if c.Completion != nil && c.Completion.FailureCategory != nil {
+			got = *c.Completion.FailureCategory
+		}
+	}
+	return got
 }
 
 // (s7) an implement-typed stage. The REASON isolates the type guard: without
@@ -542,8 +626,12 @@ func sortedStrings(in []string) []string {
 func TestUpkeepReportIngest_RunRefTransportError500(t *testing.T) {
 	f := newUpkeepIngestFixture(t, nil)
 	f.rr.getRunErrs[uuid.MustParse(upkeepCitedRunB)] = errors.New("connection reset")
-	if code, resp := f.post(t, f.planStage.ID, upkeepExampleBody(t)); code != http.StatusInternalServerError {
+	code, resp := f.post(t, f.planStage.ID, upkeepExampleBody(t))
+	if code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want 500: %v", code, resp)
+	}
+	if msg := upkeepErrorMessage(resp); msg != "check cited run refs failed" {
+		t.Errorf("message = %q, want the run-ref step's", msg)
 	}
 	if got := f.stageState(f.planStage.ID); got != run.StageStateRunning {
 		t.Errorf("stage = %q, want running", got)
@@ -553,12 +641,21 @@ func TestUpkeepReportIngest_RunRefTransportError500(t *testing.T) {
 	}
 }
 
-// (s12) a GetRun transport error during the binding: 500, nothing stored.
+// (s12) a GetRun transport error during the binding: 500, nothing stored. The
+// error is injected on the read AFTER the ownership middleware's (#3924
+// carried item 5), and the message names the binding step, so the 500 proves
+// the binding's branch was reached rather than the middleware's.
 func TestUpkeepReportIngest_BindingTransportError500(t *testing.T) {
-	f := newUpkeepIngestFixture(t, nil)
-	f.rr.getRunErrs[f.runRow.ID] = errors.New("connection reset")
-	if code, resp := f.post(t, f.planStage.ID, upkeepExampleBody(t)); code != http.StatusInternalServerError {
+	f, repo := newUpkeepLateGetRunFailFixture(t)
+	code, resp := f.post(t, f.planStage.ID, upkeepExampleBody(t))
+	if code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want 500: %v", code, resp)
+	}
+	if msg := upkeepErrorMessage(resp); msg != "resolve the stage's upkeep_report declaration failed" {
+		t.Errorf("message = %q, want the binding step's", msg)
+	}
+	if n := repo.getRunCalls(); n != 2 {
+		t.Errorf("reporting-run GetRun calls = %d, want 2 (the middleware's, then the failed binding read)", n)
 	}
 	if got := f.stageState(f.planStage.ID); got != run.StageStateRunning {
 		t.Errorf("stage = %q, want running", got)
@@ -693,12 +790,19 @@ func TestUpkeepStageGuard_OrdinaryWorkflowUnaffected(t *testing.T) {
 }
 
 // (g4) the guard's GetRun does not answer: 500, nothing stored, stage running.
+// As in (s12) the error lands on the read after the middleware's, and the
+// message names the guard's binding step.
 func TestUpkeepStageGuard_TransportError500(t *testing.T) {
-	f := newUpkeepIngestFixture(t, nil)
-	f.rr.getRunErrs[f.runRow.ID] = errors.New("connection reset")
+	f, repo := newUpkeepLateGetRunFailFixture(t)
 	code, resp := f.post(t, f.planStage.ID, validPlanBytes(t))
 	if code != http.StatusInternalServerError || upkeepErrorCode(resp) != "internal_error" {
 		t.Fatalf("response = %d %v, want 500 internal_error", code, resp)
+	}
+	if msg := upkeepErrorMessage(resp); msg != "resolve the stage's upkeep_report declaration failed" {
+		t.Errorf("message = %q, want the guard's binding step's", msg)
+	}
+	if n := repo.getRunCalls(); n != 2 {
+		t.Errorf("reporting-run GetRun calls = %d, want 2 (the middleware's, then the failed guard read)", n)
 	}
 	if n := f.artifacts(artifact.KindPlan); n != 0 {
 		t.Errorf("plan artifacts = %d, want 0", n)
@@ -877,6 +981,8 @@ func TestUpkeepGuardBodyDetail(t *testing.T) {
 		{"empty kind", `{"kind":""}`, nil, `the body carries no top-level "kind", so it was read as a plan`},
 		{"kind at cap", `{"kind":"` + atCap + `"}`, nil, `its top-level kind "` + atCap + `" is not a recognized artifact kind`},
 		{"multi-byte kind", `{"kind":"x` + runes + `"}`, nil, `its top-level kind "x` + strings.Repeat("é", 31) + `...[truncated]" is not a recognized artifact kind`},
+		{"recognized plan", `{"kind":"plan"}`, nil, upkeepGuardDisallowedDetail("plan")},
+		{"recognized grooming_report", `{"kind":"grooming_report"}`, nil, upkeepGuardDisallowedDetail("grooming_report")},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -885,4 +991,162 @@ func TestUpkeepGuardBodyDetail(t *testing.T) {
 			}
 		})
 	}
+}
+
+// upkeepGuardDisallowedDetail is the guard detail for a recognized kind the
+// upkeep allowlist does not admit.
+func upkeepGuardDisallowedDetail(kind string) string {
+	return `its top-level kind "` + kind + `" is a recognized artifact kind but is not allowed on a stage declaring produces: upkeep_report`
+}
+
+// TestUpkeepStageGuard_RecognizedButDisallowedKind (#3924 carried item 9): a
+// body whose top-level kind is an explicit "plan" — a kind
+// plan.AllArtifactKinds recognizes — shipped to an upkeep-declaring stage is
+// refused with a detail saying the kind is recognized but not allowed, never
+// that it is not a recognized artifact kind.
+//
+// Counterfactual: dropping the recognized-status branch from
+// upkeepGuardBodyDetail reverts the detail to `... "plan" is not a recognized
+// artifact kind` — RED on both the want and the absent assertion.
+func TestUpkeepStageGuard_RecognizedButDisallowedKind(t *testing.T) {
+	var m map[string]any
+	if err := json.Unmarshal(validPlanBytes(t), &m); err != nil {
+		t.Fatal(err)
+	}
+	m["kind"] = "plan"
+	body, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if k, derr := plan.DetectArtifactKind(body); derr != nil || k != plan.ArtifactKindPlan {
+		t.Fatalf("fixture: DetectArtifactKind = %q, %v; want plan, nil", k, derr)
+	}
+
+	f := newUpkeepIngestFixture(t, nil)
+	code, resp := f.post(t, f.planStage.ID, body)
+	if code != http.StatusBadRequest || upkeepErrorCode(resp) != "plan_invalid" {
+		t.Fatalf("response = %d %v, want 400 plan_invalid", code, resp)
+	}
+	e, _ := upkeepErrorDetails(t, resp)["error"].(string)
+	for _, want := range []string{upkeepGuardDisallowedDetail("plan"), "produces: upkeep_report", plan.UpkeepReportVersion} {
+		if !strings.Contains(e, want) {
+			t.Errorf("details.error = %q, want it to contain %q", e, want)
+		}
+	}
+	if strings.Contains(e, "not a recognized artifact kind") {
+		t.Errorf("details.error = %q, must not call a recognized kind unrecognized", e)
+	}
+	if got := f.stageState(f.planStage.ID); got != run.StageStateFailed {
+		t.Errorf("stage = %q, want failed", got)
+	}
+	if got := upkeepPersistedFailureCategory(f, f.planStage.ID); got != run.FailureB {
+		t.Errorf("persisted failure category = %q, want %q", got, run.FailureB)
+	}
+	if n := f.artifacts(artifact.KindPlan); n != 0 {
+		t.Errorf("plan artifacts = %d, want 0", n)
+	}
+}
+
+// TestUpkeepReportIngest_ConcurrentSameBody (#3924 carried item 3) is the
+// atomicity proof for upkeepIngestMu: eight signed POSTs of identical bytes,
+// released from one barrier, must commit exactly ONE upkeep_report artifact
+// and ONE upkeep_report_recorded row, with one 201 and the rest idempotent
+// 200s. Like the grooming sibling it asserts COMMITTED STATE, because every
+// racing request returns a success status whether or not the writes forked.
+//
+// The conventions loader is replaced by a non-counting one: the shared
+// installConventions counter is unguarded, and the dedupe runs OUTSIDE the
+// mutex, so it would race under -race and make a RED the fake's, not the
+// control's.
+//
+// Counterfactual vehicle: deleting the upkeepIngestMu Lock/Unlock pair opens
+// the GetByHash → Create window, so several requests see no artifact and each
+// creates one. Natural scheduling made that RED intermittent (1 of 3 runs
+// observed), so the artifact repo is wrapped in a rendezvous that holds the
+// first GetByHash miss open until a second miss arrives — deterministic
+// without the mutex, a single bounded wait with it.
+func TestUpkeepReportIngest_ConcurrentSameBody(t *testing.T) {
+	const n = 8
+	f := newUpkeepIngestFixture(t, nil)
+	f.s.cfg.ArtifactRepo = &upkeepRendezvousArtifactRepo{fakeArtifactRepo: f.ar, second: make(chan struct{})}
+	prev := conventionsLoader
+	conventionsLoader = func(context.Context, string) (workmgmt.Conventions, error) {
+		return workmgmt.Default(), nil
+	}
+	t.Cleanup(func() { conventionsLoader = prev })
+
+	body := upkeepExampleBody(t)
+	codes := make([]int, n)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := range codes {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			codes[i] = shipPlanRequest(t, f.s, f.runRow.ID, f.planStage.ID, f.priv, body, "").Code
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	created := 0
+	for i, c := range codes {
+		switch c {
+		case http.StatusCreated:
+			created++
+		case http.StatusOK:
+		default:
+			t.Fatalf("request %d status = %d, want 201 or 200", i, c)
+		}
+	}
+	if created != 1 {
+		t.Errorf("201 responses = %d, want exactly 1 (the rest must dedup to 200)", created)
+	}
+	if got := f.artifacts(artifact.KindUpkeepReport); got != 1 {
+		t.Errorf("upkeep_report artifacts = %d, want 1 — concurrent identical POSTs must not fork the artifact row", got)
+	}
+	if got := len(f.recorded(t)); got != 1 {
+		t.Errorf("upkeep_report_recorded rows = %d, want 1 — the existence check and the append must be atomic", got)
+	}
+}
+
+// upkeepRendezvousWindow bounds how long the first GetByHash miss waits for a
+// second. It is the green path's whole added cost (paid once) and only the
+// counterfactual's odds depend on it, so it is not timescale-scaled.
+const upkeepRendezvousWindow = 500 * time.Millisecond
+
+// upkeepRendezvousArtifactRepo makes the ingest's GetByHash → Create window
+// deterministic: the FIRST GetByHash that misses waits until a SECOND miss
+// arrives or upkeepRendezvousWindow elapses. Under upkeepIngestMu no second
+// request can reach GetByHash while the first holds the lock, so the wait
+// times out once; with the mutex deleted a racing request misses too and
+// releases both, so both Create.
+type upkeepRendezvousArtifactRepo struct {
+	*fakeArtifactRepo
+
+	once   sync.Once
+	second chan struct{}
+	rvMu   sync.Mutex
+	misses int
+}
+
+func (r *upkeepRendezvousArtifactRepo) GetByHash(ctx context.Context, stageID uuid.UUID, contentHash string) (*artifact.Artifact, error) {
+	a, err := r.fakeArtifactRepo.GetByHash(ctx, stageID, contentHash)
+	if !errors.Is(err, artifact.ErrNotFound) {
+		return a, err
+	}
+	r.rvMu.Lock()
+	r.misses++
+	first := r.misses == 1
+	r.rvMu.Unlock()
+	if !first {
+		r.once.Do(func() { close(r.second) })
+		return a, err
+	}
+	select {
+	case <-r.second:
+	case <-time.After(upkeepRendezvousWindow):
+	}
+	return a, err
 }
