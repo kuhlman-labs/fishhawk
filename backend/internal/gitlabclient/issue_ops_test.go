@@ -206,6 +206,37 @@ func TestGitLabClient_ListIssueNotes_PagesToExhaustion(t *testing.T) {
 	}
 }
 
+// TestGitLabClient_ListIssueNotes_DecodesUpdatedAtAuthorIDAndInternal pins
+// the additive E81 (#3771) note fields: updated_at and author.id decode, and
+// Internal reads true from EITHER the current `internal` key or the
+// deprecated `confidential` key, false when neither is set. A note with none
+// of the new keys keeps them zero, so older fixtures are unaffected.
+// Counterfactual: dropping the `confidential` arm reddens the legacy row.
+func TestGitLabClient_ListIssueNotes_DecodesUpdatedAtAuthorIDAndInternal(t *testing.T) {
+	s := newIssueServer(t)
+	s.mux.HandleFunc("GET /api/v4/projects/42/issues/7/notes", func(w http.ResponseWriter, _ *http.Request) {
+		writeIssueJSON(w, http.StatusOK, `[
+			{"id":1,"body":"a","created_at":"2026-09-01T00:00:00Z","updated_at":"2026-09-02T00:00:00.5Z","internal":true,"confidential":false,"author":{"id":71,"username":"alice"}},
+			{"id":2,"body":"b","created_at":"2026-09-01T00:00:00Z","confidential":true,"author":{"id":72,"username":"bob"}},
+			{"id":3,"body":"c","created_at":"2026-09-01T00:00:00Z","internal":false,"confidential":false,"author":{"id":73,"username":"carol"}},
+			{"id":4,"body":"d","created_at":"2026-09-01T00:00:00Z","author":{"username":"dave"}}
+		]`)
+	})
+	notes, err := s.client().ListIssueNotes(context.Background(), 42, 7)
+	if err != nil {
+		t.Fatalf("ListIssueNotes: %v", err)
+	}
+	want := []Note{
+		{ID: 1, Body: "a", CreatedAt: "2026-09-01T00:00:00Z", UpdatedAt: "2026-09-02T00:00:00.5Z", Author: "alice", AuthorID: 71, Internal: true},
+		{ID: 2, Body: "b", CreatedAt: "2026-09-01T00:00:00Z", Author: "bob", AuthorID: 72, Internal: true},
+		{ID: 3, Body: "c", CreatedAt: "2026-09-01T00:00:00Z", Author: "carol", AuthorID: 73},
+		{ID: 4, Body: "d", CreatedAt: "2026-09-01T00:00:00Z", Author: "dave"},
+	}
+	if !reflect.DeepEqual(notes, want) {
+		t.Errorf("notes =\n %+v\nwant\n %+v", notes, want)
+	}
+}
+
 // TestGitLabClient_ListIssueNotes_RefusesOffOriginNextLink pins the
 // same-origin guard on the Link walk: a rel="next" pointing at a DIFFERENT
 // host is refused, and that host is never dialed — the PRIVATE-TOKEN
