@@ -23,8 +23,9 @@ A config error (bad mode/profile, or `hosted` with an explicit `clone` /
 `runner_failed reason=config` BEFORE any backend contact. A valid config logs
 `gate_isolation_configured`; the first gate exec logs `gate_isolation_selected`
 carrying the whole `Selection` JSON (path, mode, profile, image, the classified
-runtime including its endpoint, the sandbox probe, and the reason) — the
-struct #2135's evidence carries.
+runtime including its endpoint, the sandbox probe, and the reason). The same
+selection is recorded on the gate evidence once a gate reaches the exec seam
+(#2135, see § "Evidence" below).
 
 **Documented residual (test-pinned, approval condition 6 of #2134): the profile
 is declared, not detected.** A hosted deployment that forgets
@@ -49,6 +50,34 @@ requires `Runtime.Safe && Image != ""`.
 
 `hosted` never executes an untrusted gate outside a container: the fallback
 paths share the host filesystem and daemon sockets with the runner.
+
+**`ContainerUnavailable` and `Class` (#2135).** Every non-container outcome
+sets `Selection.ContainerUnavailable` (`container_unavailable`, omitempty):
+what the container path lacked (`containerMissing` — the runtime verdict
+and/or the empty image) for `auto` and `container`, or `not attempted:
+mode=<m> selects a fallback path` for an explicit `clone` / `clone-sandbox`
+(and `not attempted: unknown isolation mode "<m>"`). It is empty on the
+container path. `Path.Class()` maps a path to the coarse
+`container | fallback | refused` vocabulary: `container` → container,
+`clone-sandbox` / `clone` → fallback, `refused` → refused, anything else → "".
+Pinned by `TestSelect_ContainerUnavailable` and `TestPathClass`.
+
+## Evidence (#2135)
+
+The runner (`runner/cmd/fishhawk-runner`) records the selection only when a
+gate REACHES the exec seam (`runBoundedGateArgvDisposed`, refusal included) —
+not inside `selection()`, which also has a non-exec caller (the committed-tree
+gate's lock-path decision). At pack time it folds the recorded selection into
+the `gate_evidence` trace event as a flat, pre-redacted `gate_isolation`
+member (path, class, mode, profile, image, runtime kind/safe/reason/version/
+rootless, runner-in-container, sandbox availability/reason, reason,
+container_unavailable; the endpoint's raw value and socket path are NOT
+carried). The member comes only from that record — a `gate_isolation`-kind
+event in the stream is never folded. Absent when no gate reached the seam
+(plan stages, the working-tree verify gate, a nil state), so those payloads
+stay byte-identical. The wire shape is pinned cross-module by
+`testdata/wire/gate_isolation_evidence.json` (one member per class) and the
+`gate_isolation_evidence` `ModeExact` pair in `backend/internal/wirecontract`.
 
 ## Safe-runtime detection over the EFFECTIVE endpoint (`runtime.go`)
 
@@ -455,9 +484,9 @@ category B.
 ## What the sibling issues own
 
 - [#2135](https://github.com/kuhlman-labs/fishhawk/issues/2135) (E51.2) — recording
-  the selection on GATE EVIDENCE: container vs fallback vs refused, the
-  detected runtime and the selection inputs (today the `Selection` JSON only
-  reaches the `gate_isolation_selected` log line).
+  the selection on GATE EVIDENCE: landed — see § "Evidence (#2135)". The backend
+  records it as a `gate_isolation_recorded` audit row and surfaces it on the
+  gate view.
 - [#2136](https://github.com/kuhlman-labs/fishhawk/issues/2136) (E51.3) — the
   additive workflow-v1.x `diff_coverage` container-image field declaring the
   gate image for customer coverage commands (today the image is the runner-wide

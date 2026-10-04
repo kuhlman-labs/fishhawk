@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/gateiso"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/gitops"
+	"github.com/kuhlman-labs/fishhawk/runner/internal/upload"
 )
 
 // ---------------------------------------------------------------------------
@@ -1176,4 +1178,226 @@ func TestGateContainer_EntrypointResetSmoke(t *testing.T) {
 // gateSentinelReport renders the sentinel failure line TestMain prints.
 func gateSentinelReport(ran int) string {
 	return fmt.Sprintf("gate isolation e2e: runtime present but no docker-gated fixture ran (ran=%d)", ran)
+}
+
+// ---------------------------------------------------------------------------
+// Gate isolation evidence (#2135): the selection is RECORDED only when a gate
+// reaches the exec seam (runBoundedGateArgvDisposed), and folded into
+// gate_evidence from that record.
+// ---------------------------------------------------------------------------
+
+// fallbackState is a mode=auto/local state with no runtime and no image and
+// no sandbox: Select falls back to clone.
+func fallbackState() *gateIsolationState {
+	st, err := configureGateIsolation(fakeEnv(nil), gateiso.Probes{}, io.Discard)
+	if err != nil {
+		panic(err)
+	}
+	st.detect = func(context.Context, gateiso.Probes) gateiso.Runtime {
+		return gateiso.Runtime{Kind: gateiso.KindNone, Reason: "no container runtime on PATH (docker or podman)"}
+	}
+	st.probeSandbox = func(context.Context) (bool, string) { return false, "no sandbox" }
+	return st
+}
+
+// TestGateIsolationEvidence_FallbackRecordedAtSeam drives the REAL seam: a gate
+// exec on a fallback selection records it, and the evidence names the path,
+// class and what the container path lacked.
+func TestGateIsolationEvidence_FallbackRecordedAtSeam(t *testing.T) {
+	installGateState(t, fallbackState())
+	calls := captureHostExec(t, false, 0)
+	if gateIsolationEvidenceFor(gateIsolation) != nil {
+		t.Fatal("evidence recorded before any gate ran")
+	}
+	dir := t.TempDir()
+	if _, code, disp := runBoundedGateArgvDisposed(context.Background(), []string{"true"}, dir, filepath.Join(dir, "lc"), time.Minute); code != 0 || disp != gateExecuted {
+		t.Fatalf("exec = %d / %s", code, disp)
+	}
+	if len(*calls) != 1 {
+		t.Fatalf("seam calls = %d, want 1", len(*calls))
+	}
+	iso := gateIsolationEvidenceFor(gateIsolation)
+	if iso == nil {
+		t.Fatal("a gate reached the seam but no selection was recorded")
+	}
+	if iso.Path != "clone" || iso.Class != "fallback" || iso.Mode != "auto" || iso.Profile != "local" || iso.RuntimeKind != "none" {
+		t.Errorf("evidence = %+v", iso)
+	}
+	if !strings.Contains(iso.ContainerUnavailable, "no gate image configured (FISHHAWK_GATE_IMAGE is empty)") {
+		t.Errorf("container_unavailable = %q, want it to name the empty image", iso.ContainerUnavailable)
+	}
+}
+
+// TestGateIsolationEvidence_RefusedRecordedWithoutExec: a refused selection
+// executes nothing yet IS recorded — a refusal is the most important record.
+func TestGateIsolationEvidence_RefusedRecordedWithoutExec(t *testing.T) {
+	installGateState(t, refusedState(io.Discard))
+	captureHostExec(t, true, 0)
+	dir := t.TempDir()
+	if _, _, disp := runBoundedGateArgvDisposed(context.Background(), []string{"true"}, dir, filepath.Join(dir, "lc"), time.Minute); disp != gateRefused {
+		t.Fatalf("disposition = %s, want refused", disp)
+	}
+	iso := gateIsolationEvidenceFor(gateIsolation)
+	if iso == nil || iso.Path != "refused" || iso.Class != "refused" || iso.Profile != "hosted" {
+		t.Fatalf("evidence = %+v, want a recorded refusal", iso)
+	}
+	if !strings.Contains(iso.ContainerUnavailable, "docker is not a safe runtime") {
+		t.Errorf("container_unavailable = %q", iso.ContainerUnavailable)
+	}
+}
+
+// TestGateIsolationEvidence_ContainerSelection: the container path through the
+// seam records class container with no container_unavailable.
+func TestGateIsolationEvidence_ContainerSelection(t *testing.T) {
+	installGateState(t, containerState("img:1", "/nonexistent/daemon.sock", io.Discard))
+	stubSeed(t, func(string) error { return nil })
+	captureHostExec(t, false, 0)
+	dir := t.TempDir()
+	if _, code, disp := runBoundedGateArgvDisposed(context.Background(), []string{"true"}, dir, filepath.Join(t.TempDir(), "lc"), time.Minute); code != 0 || disp != gateExecuted {
+		t.Fatalf("exec = %d / %s", code, disp)
+	}
+	iso := gateIsolationEvidenceFor(gateIsolation)
+	if iso == nil || iso.Path != "container" || iso.Class != "container" || iso.Image != "img:1" || !iso.RuntimeSafe || iso.ContainerUnavailable != "" {
+		t.Fatalf("evidence = %+v, want a recorded container selection", iso)
+	}
+}
+
+// TestGateIsolationEvidence_ConfigurationCallerDoesNotRecord (approval
+// condition 1): selection() has a NON-exec caller — runVerifyCommittedTree
+// reads the path to decide its lock-path env — so deciding the selection must
+// not record it; only the seam does. Setting the flag inside selection()'s
+// once.Do turns this red.
+func TestGateIsolationEvidence_ConfigurationCallerDoesNotRecord(t *testing.T) {
+	installGateState(t, fallbackState())
+	if sel := gateIsolation.selection(context.Background()); sel.Path != gateiso.PathClone {
+		t.Fatalf("selection = %+v", sel)
+	}
+	if iso := gateIsolationEvidenceFor(gateIsolation); iso != nil {
+		t.Fatalf("a configuration read of the selection recorded evidence: %+v", iso)
+	}
+}
+
+// TestGateIsolationEvidence_NilStateAbsent: the unconfigured host exec (nil
+// state) runs the gate but records nothing.
+func TestGateIsolationEvidence_NilStateAbsent(t *testing.T) {
+	installGateState(t, nil)
+	captureHostExec(t, false, 0)
+	dir := t.TempDir()
+	_, _, _ = runBoundedGateArgvDisposed(context.Background(), []string{"true"}, dir, filepath.Join(dir, "lc"), time.Minute)
+	if iso := gateIsolationEvidenceFor(gateIsolation); iso != nil {
+		t.Fatalf("nil state recorded evidence: %+v", iso)
+	}
+}
+
+// gateEvidencePayloadFromBundle returns the decoded gate_evidence payload of a
+// packed bundle, failing when the bundle carries none.
+func gateEvidencePayloadFromBundle(t *testing.T, data []byte) (gateEvidencePayload, string) {
+	t.Helper()
+	_, events, _, err := openBundleForTest(data)
+	if err != nil {
+		t.Fatalf("open bundle: %v", err)
+	}
+	for _, ev := range events {
+		if ev.Kind == "gate_evidence" {
+			var p gateEvidencePayload
+			if err := json.Unmarshal(ev.Data, &p); err != nil {
+				t.Fatalf("decode gate_evidence: %v", err)
+			}
+			return p, string(ev.Data)
+		}
+	}
+	t.Fatalf("bundle carries no gate_evidence event")
+	return gateEvidencePayload{}, ""
+}
+
+// TestGateIsolationEvidence_PlanStageEmitsNoMember (approval condition 1)
+// drives the REAL stage path for a plan stage with a configured isolation
+// state and a working-tree verify gate: the gate runs (so gate_evidence IS
+// packed — the absence below is not vacuous) but never reaches the isolation
+// seam, so the packed payload carries no gate_isolation member.
+func TestGateIsolationEvidence_PlanStageEmitsNoMember(t *testing.T) {
+	t.Setenv(gateIsolationModeEnvVar, "clone")
+	dir := t.TempDir()
+	promptPath := filepath.Join(dir, "prompt.txt")
+	bundlePath := filepath.Join(dir, "trace.jsonl.gz")
+	if err := os.WriteFile(promptPath, []byte("p"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	var stderr strings.Builder
+	if got := run([]string{
+		"--run-id", "rid", "--backend-url", "u",
+		"--workflow", "feature_change", "--stage", "plan",
+		"--prompt-file", promptPath,
+		"--bundle-out", bundlePath,
+		"--verify-cmd", "true",
+	}, &stderr); got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `"event":"gate_isolation_configured","mode":"clone"`) {
+		t.Fatalf("isolation state was not configured:\n%s", stderr.String())
+	}
+	data, err := os.ReadFile(bundlePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, raw := gateEvidencePayloadFromBundle(t, data)
+	if len(p.VerifyRuns) != 1 {
+		t.Fatalf("verify_runs = %d, want the working-tree gate's 1", len(p.VerifyRuns))
+	}
+	if p.GateIsolation != nil || strings.Contains(raw, "gate_isolation") {
+		t.Errorf("a plan stage's gate_evidence carries gate_isolation:\n%s", raw)
+	}
+}
+
+// TestGateIsolationEvidence_RefusedStageRawBundleCarriesMember (approval
+// condition 2) drives run() for an implement stage whose committed-tree gate
+// is REFUSED (mode=container with no image): the stage fails category C, still
+// reaches the pre-pack region, and the RAW bundle shipped to the backend
+// carries the refused gate_isolation member through the real pack path.
+func TestGateIsolationEvidence_RefusedStageRawBundleCarriesMember(t *testing.T) {
+	t.Setenv(gateIsolationModeEnvVar, "container")
+	t.Setenv(gateImageEnvVar, "")
+	repo := verifyFixBaseRepo(t)
+	mustWrite(t, filepath.Join(repo, "mod", "reg.go"), regGetFixed)
+	withFakeInvoker(t, &fakeInvoker{mirrorWorkingTreeFrom: repo, canned: agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}}})
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:             verifyFixStageID,
+		StageType:           "implement",
+		Prompt:              "implement",
+		PromptHash:          "h",
+		VerifyCommand:       "true",
+		VerifyMaxIterations: 0,
+		ScopeFiles:          []upload.ScopeFile{{Path: "mod/reg.go", Operation: "modify"}},
+	}
+	withFakeUploader(t, fu)
+	withFakeGitOps(t, &fakePusher{}, &fakePROpener{})
+
+	bundlePath := filepath.Join(t.TempDir(), "trace.jsonl.gz")
+	var stderr strings.Builder
+	if got := run(verifyFixRunArgs(repo, bundlePath), &stderr); got != exitFailure {
+		t.Fatalf("run = %d, want exitFailure:\n%s", got, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `"category":"C"`) {
+		t.Errorf("a refused gate must fail category C:\n%s", stderr.String())
+	}
+	var rawBundle []byte
+	for _, c := range fu.gotShipCalls {
+		if c.Variant == "raw" {
+			rawBundle = c.Bundle
+		}
+	}
+	if rawBundle == nil {
+		t.Fatalf("no raw bundle shipped (calls=%d):\n%s", len(fu.gotShipCalls), stderr.String())
+	}
+	p, raw := gateEvidencePayloadFromBundle(t, rawBundle)
+	if p.GateIsolation == nil {
+		t.Fatalf("raw bundle gate_evidence carries no gate_isolation member:\n%s", raw)
+	}
+	if p.GateIsolation.Path != "refused" || p.GateIsolation.Class != "refused" || p.GateIsolation.Mode != "container" ||
+		!strings.Contains(p.GateIsolation.ContainerUnavailable, "no gate image configured") {
+		t.Errorf("gate_isolation = %+v, want the recorded mode=container refusal", p.GateIsolation)
+	}
 }

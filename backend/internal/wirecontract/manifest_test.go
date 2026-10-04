@@ -421,3 +421,57 @@ func TestSeedManifest_RegistersReapFailureRequestPair(t *testing.T) {
 		}
 	}
 }
+
+// TestSeedManifest_RegistersGateIsolationEvidencePair pins the #2135
+// registration: both files are swept, and the runner's flat
+// gateIsolationEvidence is paired EXACT with bundle.GateIsolationEvidence,
+// resolving to the class and container_unavailable fields on both sides — so
+// dropping the row, a covered file or a field fails here rather than leaving
+// the contract unguarded.
+func TestSeedManifest_RegistersGateIsolationEvidencePair(t *testing.T) {
+	m := SeedManifest()
+	covered := map[string]bool{}
+	for _, f := range m.CoveredFiles {
+		covered[f] = true
+	}
+	for _, f := range []string{runnerGateEvidenceGo, bundleGo} {
+		if !covered[f] {
+			t.Errorf("CoveredFiles missing %s", f)
+		}
+	}
+	var pair *Pair
+	for i := range m.Pairs {
+		if m.Pairs[i].Name == "gate_isolation_evidence" {
+			pair = &m.Pairs[i]
+		}
+	}
+	if pair == nil {
+		t.Fatal("seed manifest has no gate_isolation_evidence pair")
+	}
+	if pair.Mode != ModeExact {
+		t.Errorf("gate_isolation_evidence mode = %v, want ModeExact", pair.Mode)
+	}
+	if pair.Emitter != (Endpoint{File: runnerGateEvidenceGo, Type: "gateIsolationEvidence"}) ||
+		pair.Consumer != (Endpoint{File: bundleGo, Type: "GateIsolationEvidence"}) {
+		t.Errorf("gate_isolation_evidence endpoints = %+v -> %+v", pair.Emitter, pair.Consumer)
+	}
+	root, err := RepoRoot()
+	if err != nil {
+		t.Fatalf("resolve repo root: %v", err)
+	}
+	for _, ep := range []Endpoint{pair.Emitter, pair.Consumer} {
+		fields, err := ExtractStruct(filepath.Join(root, filepath.FromSlash(ep.File)), ep.Type)
+		if err != nil {
+			t.Fatalf("extract %s.%s: %v", ep.File, ep.Type, err)
+		}
+		names := map[string]bool{}
+		for _, f := range fields {
+			names[f.JSONName] = true
+		}
+		for _, want := range []string{"class", "path", "container_unavailable"} {
+			if !names[want] {
+				t.Errorf("%s.%s carries no %s wire field: %+v", ep.File, ep.Type, want, fields)
+			}
+		}
+	}
+}

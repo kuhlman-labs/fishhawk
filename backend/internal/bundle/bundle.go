@@ -385,6 +385,40 @@ type GateEvidence struct {
 	// silently DISABLES the signal, which is why the pair is pinned from BOTH
 	// modules against one shared literal JSON fixture.
 	ApprovalConditionResponses *ApprovalConditionResponsesEvidence `json:"approval_condition_responses,omitempty"`
+	// GateIsolation records which ADR-063 isolation path the stage's gates
+	// ran under (#2135): the runner's OWN recorded selection, flattened and
+	// pre-redacted. Nil (the byte-identical default) on an older bundle or a
+	// stage where no gate reached the runner's exec seam. It is a record of
+	// HOW gates ran, never a gate verdict: an isolation-only payload carries
+	// no verify run or summary.
+	GateIsolation *GateIsolationEvidence `json:"gate_isolation,omitempty"`
+}
+
+// GateIsolationEvidence is the flat gate-isolation record (#2135): Path is the
+// precise gateiso path (container | clone-sandbox | clone | refused), Class
+// the container | fallback | refused class, ContainerUnavailable why the
+// container path was not taken (empty on the container path).
+//
+// CROSS-MODULE WIRE CONTRACT: mirrors the runner's gateIsolationEvidence
+// (runner/cmd/fishhawk-runner/gateevidence.go), paired ModeExact in
+// backend/internal/wirecontract and pinned from both modules by
+// testdata/wire/gate_isolation_evidence.json.
+type GateIsolationEvidence struct {
+	Path                 string `json:"path"`
+	Class                string `json:"class"`
+	Mode                 string `json:"mode"`
+	Profile              string `json:"profile"`
+	Image                string `json:"image,omitempty"`
+	RuntimeKind          string `json:"runtime_kind"`
+	RuntimeSafe          bool   `json:"runtime_safe"`
+	RuntimeReason        string `json:"runtime_reason,omitempty"`
+	RuntimeVersion       string `json:"runtime_version,omitempty"`
+	RuntimeRootless      bool   `json:"runtime_rootless"`
+	RunnerInContainer    bool   `json:"runner_in_container"`
+	SandboxAvailable     bool   `json:"sandbox_available"`
+	SandboxReason        string `json:"sandbox_reason,omitempty"`
+	Reason               string `json:"reason"`
+	ContainerUnavailable string `json:"container_unavailable,omitempty"`
 }
 
 // ApprovalConditionResponsesEvidence is the peeked commit-body responses

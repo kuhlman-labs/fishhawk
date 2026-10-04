@@ -7,6 +7,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/redaction"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent"
+	"github.com/kuhlman-labs/fishhawk/runner/internal/gateiso"
 )
 
 /*
@@ -123,6 +124,74 @@ type gateEvidencePayload struct {
 	// mirror — a one-sided edit silently DISABLES the signal, which is why the
 	// pair is pinned from BOTH modules against one shared literal JSON fixture.
 	ApprovalConditionResponses *approvalConditionResponsesEvidence `json:"approval_condition_responses,omitempty"`
+	// GateIsolation records which ADR-063 isolation path the stage's gates ran
+	// under (#2135), taken from the runner's OWN recorded selection
+	// (gateIsolationEvidenceFor) — never folded from a stream event. Absent
+	// (the byte-identical default) when no gate reached the exec seam.
+	GateIsolation *gateIsolationEvidence `json:"gate_isolation,omitempty"`
+}
+
+// gateIsolationEvidence is the FLAT, pre-redacted digest of a recorded
+// gateiso.Selection (#2135): Path is the precise path, Class the
+// container|fallback|refused class. The runtime endpoint (raw value, socket
+// path) is deliberately NOT carried.
+//
+// CROSS-MODULE WIRE CONTRACT: mirrored by backend/internal/bundle's
+// GateIsolationEvidence, paired ModeExact in backend/internal/wirecontract
+// and pinned from both modules by testdata/wire/gate_isolation_evidence.json.
+type gateIsolationEvidence struct {
+	Path                 string `json:"path"`
+	Class                string `json:"class"`
+	Mode                 string `json:"mode"`
+	Profile              string `json:"profile"`
+	Image                string `json:"image,omitempty"`
+	RuntimeKind          string `json:"runtime_kind"`
+	RuntimeSafe          bool   `json:"runtime_safe"`
+	RuntimeReason        string `json:"runtime_reason,omitempty"`
+	RuntimeVersion       string `json:"runtime_version,omitempty"`
+	RuntimeRootless      bool   `json:"runtime_rootless"`
+	RunnerInContainer    bool   `json:"runner_in_container"`
+	SandboxAvailable     bool   `json:"sandbox_available"`
+	SandboxReason        string `json:"sandbox_reason,omitempty"`
+	Reason               string `json:"reason"`
+	ContainerUnavailable string `json:"container_unavailable,omitempty"`
+}
+
+// gateIsolationEvidenceFor digests st's RECORDED selection — nil when no gate
+// reached the exec seam (or st is nil). Every free-text field is redacted
+// BEFORE it is bounded, like every sibling evidence tail: the runtime and
+// selection reasons can quote an operator-set endpoint or image reference.
+func gateIsolationEvidenceFor(st *gateIsolationState) *gateIsolationEvidence {
+	sel, ok := st.recordedSelection()
+	if !ok {
+		return nil
+	}
+	return newGateIsolationEvidence(sel)
+}
+
+// newGateIsolationEvidence flattens and redacts one selection.
+func newGateIsolationEvidence(sel gateiso.Selection) *gateIsolationEvidence {
+	text := func(s string) string {
+		out, _ := boundEvidenceTail(redactEvidenceText(s))
+		return out
+	}
+	return &gateIsolationEvidence{
+		Path:                 string(sel.Path),
+		Class:                string(sel.Path.Class()),
+		Mode:                 string(sel.Mode),
+		Profile:              string(sel.Profile),
+		Image:                text(sel.Image),
+		RuntimeKind:          string(sel.Runtime.Kind),
+		RuntimeSafe:          sel.Runtime.Safe,
+		RuntimeReason:        text(sel.Runtime.Reason),
+		RuntimeVersion:       text(sel.Runtime.Version),
+		RuntimeRootless:      sel.Runtime.Rootless,
+		RunnerInContainer:    sel.Runtime.RunnerInContainer,
+		SandboxAvailable:     sel.Sandbox.Available,
+		SandboxReason:        text(sel.Sandbox.Reason),
+		Reason:               text(sel.Reason),
+		ContainerUnavailable: text(sel.ContainerUnavailable),
+	}
 }
 
 // approvalConditionResponsesEvidence is the peeked commit-body responses
@@ -330,12 +399,23 @@ type policyViolationEvidence struct {
 // (post-amendment-fold, the same count every gate enforces).
 //
 // Returns nil when no gate ran — no verify_run, verify_summary, or
-// policy_event in the slice — so stages without gates add no event
-// and the backend's no-evidence prompt path stays byte-identical.
-// Individual payloads that fail to decode are skipped best-effort:
-// the evidence is advisory prompt context, never a gate itself.
-func composeGateEvidence(events []agent.Event, declaredScopeCount int) *agent.Event {
-	gateRan := false
+// policy_event in the slice and no isolation record — so stages without
+// gates add no event and the backend's no-evidence prompt path stays
+// byte-identical. Individual payloads that fail to decode are skipped
+// best-effort: the evidence is advisory prompt context, never a gate
+// itself.
+//
+// isolation is the runner's OWN recorded selection digest
+// (gateIsolationEvidenceFor; at most one, nil when no gate reached the
+// seam). It is the ONLY source of the gate_isolation member: a
+// `gate_isolation`-kind event in the stream is not folded and does not
+// count as a gate having run (#2135).
+func composeGateEvidence(events []agent.Event, declaredScopeCount int, isolation ...*gateIsolationEvidence) *agent.Event {
+	var iso *gateIsolationEvidence
+	if len(isolation) > 0 {
+		iso = isolation[0]
+	}
+	gateRan := iso != nil
 	for _, e := range events {
 		switch e.Kind {
 		case "verify_run", "verify_summary", "policy_event", "binding_assertion", "scope_files_exempted", "fixup_selfreport_divergence", "fixup_reporting_obligations", "fixup_counterfactuals", "diff_coverage", "approval_condition_responses":
@@ -347,7 +427,8 @@ func composeGateEvidence(events []agent.Event, declaredScopeCount int) *agent.Ev
 	}
 
 	payload := gateEvidencePayload{
-		ScopeFacts: &scopeFactsEvidence{DeclaredFiles: declaredScopeCount},
+		ScopeFacts:    &scopeFactsEvidence{DeclaredFiles: declaredScopeCount},
+		GateIsolation: iso,
 	}
 
 	for _, e := range events {
