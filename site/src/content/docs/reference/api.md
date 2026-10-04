@@ -63,7 +63,7 @@ _Generated from the canonical sources by `scripts/gen-site-reference`; do not ed
 
 ## Operations
 
-The v0 REST API exposes **158 operations** across the paths below, generated from [`docs/api/v0.openapi.yaml`](https://github.com/kuhlman-labs/fishhawk/blob/main/docs/api/v0.openapi.yaml). That document is the source of truth; this table is its published rendering.
+The v0 REST API exposes **159 operations** across the paths below, generated from [`docs/api/v0.openapi.yaml`](https://github.com/kuhlman-labs/fishhawk/blob/main/docs/api/v0.openapi.yaml). That document is the source of truth; this table is its published rendering.
 
 | Method | Path | Summary |
 |---|---|---|
@@ -165,6 +165,7 @@ The v0 REST API exposes **158 operations** across the paths below, generated fro
 | `POST` | `/v0/campaigns/{campaign_id}/resume` | Resume a paused campaign |
 | `POST` | `/v0/campaigns/{campaign_id}/cancel` | Cancel a campaign |
 | `POST` | `/v0/work-items` | File a work item via the repo's work-management conventions |
+| `POST` | `/v0/work-items/preview` | Preview a work-item filing — conventions plus intake signals, nothing filed |
 | `POST` | `/v0/refinement/sessions` | Draft an epic/children preview from a natural-language brief |
 | `GET` | `/v0/refinement/sessions/{session_id}` | Get a refinement session's preview + approval state |
 | `PATCH` | `/v0/refinement/sessions/{session_id}/draft` | Edit a refinement draft (agent amendment or direct field edit) |
