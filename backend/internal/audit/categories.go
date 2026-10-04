@@ -258,6 +258,12 @@ import "sort"
 // (audit/grooming_window.go): the #3924 apply appends one per upkeep-report
 // artifact it settles, on approve AND reject, after which a capture for that
 // artifact is refused (409 upkeep_window_closed). INTERNAL, audit-only.
+// #3924 added upkeep_apply_completed: the on-approval upkeep apply's ONE
+// summary row per apply (filed / skipped / failed / budget_exhausted counts,
+// or degraded:true with a named degrade_reason when the apply did not run).
+// INTERNAL, NOT an issue-comment activity category — like the other upkeep
+// rows it is read through GET /v0/runs/{id}/audit only
+// (docs/issue-comment-surfaces.md is untouched).
 var KnownCategories = map[string]struct{}{
 	"acceptance_dispatched":                   {},
 	"acceptance_outcome_recorded":             {},
@@ -493,6 +499,7 @@ var KnownCategories = map[string]struct{}{
 	"status_comment_posted":                   {},
 	"trace_uploaded":                          {},
 	"unpriced_model_alert":                    {},
+	"upkeep_apply_completed":                  {}, // #3924: the upkeep apply's one summary row (filed/skipped/failed counts, or a named degrade)
 	"upkeep_apply_window_closed":              {}, // #3923: upkeep capture-window watermark (writer: #3924 apply, via audit.UpkeepWindowAppender)
 	"upkeep_disposition_recorded":             {}, // #3921: the captain disposed an upkeep finding (writer: #3923)
 	"upkeep_finding_filed":                    {}, // #3921: the upkeep apply filed a finding's issue (writer: #3924)
