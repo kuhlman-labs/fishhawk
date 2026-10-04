@@ -287,7 +287,12 @@ components:
       required: [dispositions]
       description: |
         Body of `POST /v0/runs/{run_id}/upkeep-dispositions` (#3923). Exactly
-        ONE JSON document: trailing content is `400 validation_failed`.
+        ONE JSON document: trailing content is `400 validation_failed`. The
+        decode is STRICT (#3924): an unknown key at ANY depth — a misspelled
+        `authorise_delegation_tier`, an undeclared key inside an entry, an
+        extra top-level key — is `400 validation_failed` recording nothing,
+        never silently dropped, so `additionalProperties: false` here is
+        enforced, not advisory.
       properties:
         dispositions:
           type: array
@@ -12750,7 +12755,9 @@ paths:
         `upkeep_dispositions_unconfigured`; 401; 403 `run_token_forbidden`,
         `operator_agent_forbidden`, `insufficient_scope`; 400
         `validation_failed` (bad `run_id`); 404 `run_not_found`; 400
-        `validation_failed` / `upkeep_verdict_invalid` (body); 409
+        `validation_failed` / `upkeep_verdict_invalid` (body — checked BEFORE
+        the report lookup, so a malformed body on a report-less run is a 400,
+        not `409 upkeep_report_absent`); 409
         `upkeep_report_absent` (or 500 for an unreadable report); 422
         `upkeep_finding_unknown` (whole batch); 409 `upkeep_report_superseded` /
         `upkeep_window_closed`.
@@ -12805,7 +12812,9 @@ paths:
         '400':
           description: |
             One of two cases. (1) `validation_failed` — a bad `run_id`, an
-            unparseable body or trailing content, an empty batch or more than
+            unparseable body or trailing content, an unknown key at any depth
+            (strict decode), a wrongly-typed value (e.g. a non-boolean
+            `authorize_delegation_tier`), an empty batch or more than
             200 entries, an empty or repeated `finding_id`, an invalid
             `parent_epic`, or `parent_epic` / `authorize_delegation_tier: true`
             on a rejected verdict. (2) `upkeep_verdict_invalid` — a verdict
@@ -12853,10 +12862,22 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '500':
           description: |
-            The bound report could not be read or parsed (an undecodable newest
-            recorded row, an unreadable artifact, a wrong kind or a parse
-            failure — never a fallback to an older report), or a storage failure
-            (`internal_error`). The atomic batch records nothing.
+            `internal_error`, in one of three cases that differ in what was
+            recorded — read `details.recorded` / `details.requested` where
+            present. (1) BEFORE any append: the bound report could not be read
+            or parsed (an undecodable newest recorded row, an unreadable
+            artifact, a wrong kind or a parse failure — never a fallback to an
+            older report), or the window check failed; nothing was recorded.
+            (2) ATOMIC BATCH FAILURE: the one-transaction append failed, so
+            NOTHING was recorded (`details.recorded: 0`). (3) READ-BACK FAILURE
+            AFTER A COMMITTED BATCH: the batch IS durable
+            (`details.recorded` equals `details.requested`) but listing it back
+            for the echo failed; the message says the batch was recorded. In
+            every case a repeat POST is safe because capture is last-wins (a
+            repeat after case 3 appends a superseding row per finding, both in
+            the chain), and `GET` reads back what landed. The non-atomic
+            in-memory fallback's mid-batch failure reports the partial
+            `details.recorded` of `details.requested`.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

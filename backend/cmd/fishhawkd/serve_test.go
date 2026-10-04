@@ -300,11 +300,12 @@ func TestRunRepoCASWiringError(t *testing.T) {
 
 // TestNewAuditRepository_WiredRepoKeepsEveryCapability pins the E75.2 / #3730
 // wrap at the single audit-repository construction point: the wired value IS
-// the decision-index decorator, and it still satisfies all four optional audit
-// capabilities server/*.go type-asserts off cfg.AuditRepo
-// (acceptance_arbitration.go, grooming_dispositions.go, grooming_apply.go, the
-// retry-budget and deduped paths). A wrap that dropped one would turn that
-// assertion into ok=false and silently disable the feature. The source-scan
+// the decision-index decorator, and it still satisfies every optional audit
+// capability server/*.go type-asserts off cfg.AuditRepo
+// (acceptance_arbitration.go, grooming_dispositions.go, grooming_apply.go,
+// upkeep_dispositions.go, the retry-budget and deduped paths). A wrap that
+// dropped one would turn that assertion into ok=false and silently disable
+// the feature. The source-scan
 // drift guard for NEW capabilities lives in decisionindex/capabilities_test.go.
 func TestNewAuditRepository_WiredRepoKeepsEveryCapability(t *testing.T) {
 	repo, err := newAuditRepository(nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -322,6 +323,12 @@ func TestNewAuditRepository_WiredRepoKeepsEveryCapability(t *testing.T) {
 	}
 	if _, ok := repo.(audit.GroomingWindowAppender); !ok {
 		t.Error("wired audit repository lost audit.GroomingWindowAppender (grooming dispositions)")
+	}
+	// #3923 / #3924: without it the upkeep capture silently takes the
+	// NON-ATOMIC fallback (no in-transaction binding re-check, partial rows on
+	// a mid-batch failure) and the apply cannot settle its window atomically.
+	if _, ok := repo.(audit.UpkeepWindowAppender); !ok {
+		t.Error("wired audit repository lost audit.UpkeepWindowAppender (upkeep dispositions + apply window)")
 	}
 	if _, ok := repo.(audit.RetryBudgetAppender); !ok {
 		t.Error("wired audit repository lost audit.RetryBudgetAppender")
