@@ -25,6 +25,20 @@
 #                             branch diff, which a scoped run cannot honestly
 #                             gate) — the full form still runs it. Falls back to
 #                             $FISHHAWK_VERIFY_PACKAGES when the flag is absent.
+#   scripts/test verify --no-tests
+#                             every verify leg EXCEPT the `go test -race` loop and
+#                             the patch-coverage gate (E51.17 / #3966): the legs
+#                             that need no Docker daemon. Rejected with --packages.
+#   scripts/test lint --in-gate-image
+#   scripts/test verify --in-gate-image
+#                             run `scripts/test lint` / `scripts/test verify
+#                             --no-tests` INSIDE the pinned gate image
+#                             (deploy/gate-image) for CI parity: the image's pins
+#                             are checked against this checkout first and a
+#                             mismatch refuses; verify holds the HOST lock. Image:
+#                             $FISHHAWK_TEST_GATE_IMAGE, default
+#                             ghcr.io/kuhlman-labs/fishhawk-gate:main. Long form:
+#                             deploy/gate-image/README.md.
 #   scripts/test single ARGS  pass-through to `go test -race ARGS`
 #                             example:
 #                             scripts/test single -run TestX ./backend/internal/version/...
@@ -642,14 +656,39 @@ cmd_test() {
 # full unscoped form, which is byte-for-byte what verify did before #3315.
 VERIFY_PACKAGES=""
 
+# VERIFY_NO_TESTS=1 (`verify --no-tests`, E51.17 / #3966) runs every verify leg
+# except the test loop and the patch-coverage gate. GATE_IMAGE_MODE=1
+# (`lint|verify --in-gate-image`) routes the subcommand through
+# cmd_in_gate_image instead of running it on the host; for verify it implies
+# --no-tests.
+VERIFY_NO_TESTS=""
+GATE_IMAGE_MODE=""
+
 # _parse_verify_args: consume `verify`'s own options. CLI beats the environment
 # when both are present. A `--packages` given with an EMPTY value is a CALLER
 # BUG, not a request to run unscoped: silently widening would hide a runner-side
 # defect that produced an empty list, so it exits 1 with the usage line.
+#
+# --no-tests / --in-gate-image with an explicit --packages is REJECTED, not
+# reconciled: --packages scopes a test loop neither form runs, so accepting it
+# would report a scoped verify that tested nothing. Every rejection happens
+# here, BEFORE cmd_in_gate_image probes for docker, so a bad invocation fails
+# on its arguments whatever the host (approval condition 4). The env fallback
+# FISHHAWK_VERIFY_PACKAGES is ignored with a printed note in those forms rather
+# than rejected, since an exported variable is not a request made on this line.
 _parse_verify_args() {
   local seen_flag=0
   while [ "$#" -gt 0 ]; do
     case "$1" in
+      --no-tests)
+        VERIFY_NO_TESTS=1
+        shift
+        ;;
+      --in-gate-image)
+        GATE_IMAGE_MODE=1
+        VERIFY_NO_TESTS=1
+        shift
+        ;;
       --packages)
         if [ "$#" -lt 2 ]; then
           echo "scripts/test: --packages requires a comma-separated package list" >&2
@@ -678,9 +717,45 @@ _parse_verify_args() {
       usage >&2
       exit 1
     fi
+    if [ "$GATE_IMAGE_MODE" = "1" ]; then
+      echo "scripts/test: --in-gate-image cannot be combined with --packages: the gate image runs verify --no-tests, and the scoped test loop needs the Docker daemon the image does not have (#2137)" >&2
+      usage >&2
+      exit 1
+    fi
+    if [ "$VERIFY_NO_TESTS" = "1" ]; then
+      echo "scripts/test: --no-tests cannot be combined with --packages: --packages scopes a test loop --no-tests does not run" >&2
+      usage >&2
+      exit 1
+    fi
+    return 0
+  fi
+  if [ "$VERIFY_NO_TESTS" = "1" ]; then
+    if [ -n "${FISHHAWK_VERIFY_PACKAGES:-}" ]; then
+      echo "scripts/test: ignoring FISHHAWK_VERIFY_PACKAGES — verify --no-tests runs no test loop to scope" >&2
+    fi
+    VERIFY_PACKAGES=""
     return 0
   fi
   VERIFY_PACKAGES="${FISHHAWK_VERIFY_PACKAGES:-}"
+}
+
+# _parse_lint_args: consume `lint`'s own options. Before E51.17 `lint` took
+# none and silently ignored any argument; an unknown option now exits 1 so a
+# typo such as `--in-gate-imag` cannot quietly run lint on the host.
+_parse_lint_args() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --in-gate-image)
+        GATE_IMAGE_MODE=1
+        shift
+        ;;
+      *)
+        echo "scripts/test: unknown lint option: $1" >&2
+        usage >&2
+        exit 1
+        ;;
+    esac
+  done
 }
 
 # _verify_scope_buckets <comma-separated repo-relative package dirs>: emit one
@@ -1342,6 +1417,12 @@ _verify_patch_coverage() {
 # stopping services or deleting state: each runner agent tree shape, a
 # subdirectory of one, operator checkouts merely NAMED like one, and the
 # FISHHAWK_RUN_ID signal. Bash, temp-dir git fixtures, no network/Docker.
+# test-check-gate-image (E51.17 / #3966) pins scripts/check-gate-image, the
+# gate-image pin drift check, against temp fixture roots and a fake docker;
+# test-in-gate-image pins `verify --no-tests` and `lint|verify --in-gate-image`
+# (argument order, the HOST lock, the pre-run image pin check, the docker argv)
+# with a fake docker on a symlinked docker-free PATH. Both are bash, hermetic,
+# no network and no real Docker.
 # A FAILING harness fails verify (set -e), which is the point (#2455).
 #
 # Every harness runs with FISHHAWK_VERIFY_LOCK_PATH and FISHHAWK_VERIFY_LOCK_OWNER
@@ -1360,7 +1441,7 @@ _verify_patch_coverage() {
 # still aborts the loop (a3).
 _verify_gate_harnesses() {
   local h
-  for h in test-check-coverage test-patch-coverage test-container-lease test-dev test-site-voice test-site-ia test-helm-render test-site-reference test-verify-scope test-adr test-is-run-agent; do
+  for h in test-check-coverage test-patch-coverage test-container-lease test-dev test-site-voice test-site-ia test-helm-render test-site-reference test-verify-scope test-adr test-is-run-agent test-check-gate-image test-in-gate-image; do
     if [ ! -x "$ROOT/scripts/$h" ]; then
       echo "scripts/test: scripts/$h missing or not executable — skipping that harness" >&2
       continue
@@ -1431,6 +1512,26 @@ _verify_adr_records() {
   fi
   printf '>>> scripts/check-adr\n'
   "$ROOT/scripts/check-adr"
+}
+
+# _verify_gate_image_pins: run scripts/check-gate-image in STATIC mode over the
+# COMMITTED tree (E51.17 / #3966). It holds deploy/gate-image/Dockerfile's ARG
+# pins to go.work / */go.mod, the workflow go-version and golangci-lint pins,
+# and this script's install hint, so bumping a pin on one side without the
+# other fails verify in-loop. It reads files only (no Docker, no network).
+# Same shape as _verify_adr_records: a missing or non-executable script skips
+# with a reason, which keeps the fixture ROOTs of scripts/test-patch-coverage
+# and scripts/test-verify-scope (they copy or stub the other legs by name) from
+# running the real check against a fixture. A violation exits 1 (an unreadable
+# Dockerfile exits 2) and, under set -e, fails verify. Long form:
+# deploy/gate-image/README.md.
+_verify_gate_image_pins() {
+  if [ ! -x "$ROOT/scripts/check-gate-image" ]; then
+    echo "scripts/test: scripts/check-gate-image missing or not executable — skipping the gate-image pin check" >&2
+    return 0
+  fi
+  printf '>>> scripts/check-gate-image\n'
+  "$ROOT/scripts/check-gate-image" --root "$ROOT"
 }
 
 # --------------------------------------------------------------------------
@@ -1963,7 +2064,11 @@ _release_verify_lock() {
 # slow test loop. The doc line budget and schema-sync drift are checked NEXT
 # (each <1s) so a docs defect fails in-loop, still ahead of the slow test loop,
 # as are the gate harnesses, the site voice gate (#2261), the site IA gate
-# (E12.7 / #2318), and the ADR record gate (E78.1 / #3722).
+# (E12.7 / #2318), the ADR record gate (E78.1 / #3722), and the gate-image pin
+# check (E51.17 / #3966). `--no-tests` stops right after those legs. The legs
+# stay INLINE here rather than behind a helper: scripts/test-patch-coverage and
+# scripts/test-schema-sync-verify assert their order by reading this function's
+# own body.
 # The AGGREGATE coverage gate is still intentionally omitted to bound in-loop
 # runtime — it stays on `coverage` and in CI. What runs here instead is the
 # PATCH-scoped gate (#1887), folded into the same test loop via -coverpkg so no
@@ -1980,6 +2085,14 @@ cmd_verify() {
   _verify_site_voice
   _verify_site_ia
   _verify_adr_records
+  _verify_gate_image_pins
+  # --no-tests (E51.17 / #3966): the legs above need no Docker daemon, so they
+  # are what the gate image can run. The test loop below needs testcontainers
+  # Postgres, which the image path reaches only with full gate isolation.
+  if [ "$VERIFY_NO_TESTS" = "1" ]; then
+    echo "scripts/test: verify --no-tests — the go test loop and the patch-coverage gate are SKIPPED (the daemon-dependent tests need full gate isolation, #2137); the full verify still runs them" >&2
+    return 0
+  fi
   # SCOPED form (#3315). Bucketing fails SAFE: any package this layer cannot
   # place prints a reason and falls through to the full unscoped loop below.
   local buckets=""
@@ -2011,6 +2124,193 @@ cmd_verify() {
   cmd_test
 }
 
+# --------------------------------------------------------------------------
+# --in-gate-image (E51.17 / #3966)
+#
+# Runs `scripts/test lint` or `scripts/test verify --no-tests` inside the pinned
+# gate image (deploy/gate-image) so a local run uses CI's exact tool versions.
+# It is CI PARITY, NOT ISOLATION: the container has the network, the checkout is
+# mounted read-write at its own absolute path, and it runs as the caller's
+# uid:gid. Daemon-dependent tests stay out of reach until #2137.
+#
+# Host-side order, each step failing closed:
+#   1. docker absent from PATH -> exit 1 naming docker. Never a skip. Argument
+#      validation already ran in _parse_verify_args/_parse_lint_args.
+#   2. verify only: take the HOST per-repository verify lock, refusing exactly
+#      as `verify` does on a live holder. Lock liveness is a `kill -0` PID
+#      check, which cannot cross a PID namespace, so a container sharing the
+#      host lock would judge a live host holder dead and displace it. The host
+#      lock is therefore the real one, and the container gets a private
+#      FISHHAWK_VERIFY_LOCK_PATH. lint stays lock-free, as on the host.
+#   3. resolve $FISHHAWK_TEST_GATE_IMAGE (default GATE_IMAGE_DEFAULT) to an
+#      image ID, pulling it once when it is not present locally.
+#   4. run scripts/check-gate-image --image <ID> (approval condition 1): every
+#      tool version in the image must equal this checkout's Dockerfile pins, so
+#      a stale locally cached :main refuses instead of producing results that
+#      look CI-identical. The inner command then runs on that same ID, never on
+#      the tag, so the image checked is the image run.
+#   5. read the image's /etc/passwd and, when no entry maps the caller's uid,
+#      append one (the host login name, home /tmp) and mount the result
+#      read-only over /etc/passwd. --user uid:gid alone leaves the uid
+#      nameless, so whoami fails and test-helm-render r9h's `$(whoami)` probe
+#      degrades to an empty needle that matches every argv (#3966 acceptance).
+#   6. docker run the inner command and exit with its status.
+#
+# The variable is FISHHAWK_TEST_GATE_IMAGE, deliberately NOT FISHHAWK_GATE_IMAGE:
+# exporting the latter in a shell that spawns the runner switches its gate onto
+# the container path, where this repository's verify fails until #2137.
+# --------------------------------------------------------------------------
+
+GATE_IMAGE_DEFAULT="ghcr.io/kuhlman-labs/fishhawk-gate:main"
+
+# _gate_image_resolve_id <ref>: print the image ID (`sha256:...`) of <ref>,
+# pulling it once when `docker image inspect` cannot see it locally. Returns
+# non-zero when neither yields an ID.
+_gate_image_resolve_id() {
+  local ref="$1" out
+  if ! out="$(docker image inspect --format '{{.Id}}' "$ref" 2>/dev/null)"; then
+    echo "scripts/test: gate image $ref is not present locally — pulling it" >&2
+    if ! docker pull "$ref" >&2; then
+      return 1
+    fi
+    if ! out="$(docker image inspect --format '{{.Id}}' "$ref" 2>/dev/null)"; then
+      return 1
+    fi
+  fi
+  out="${out%%[[:space:]]*}"
+  case "$out" in
+    sha256:?*) printf '%s' "$out" ;;
+    *) return 1 ;;
+  esac
+}
+
+# _gate_image_common_dir: print the git common dir when it lies OUTSIDE $ROOT
+# (a linked worktree), so it can be mounted at its own path; print nothing for a
+# primary checkout, a non-repo, or a host without git. A linked worktree's .git
+# FILE names the common dir by absolute path, so without this mount every git
+# command inside the container fails.
+_gate_image_common_dir() {
+  local common root_p common_p
+  command -v git >/dev/null 2>&1 || return 0
+  common="$(git -C "$ROOT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || return 0
+  if [ -z "$common" ] || [ ! -d "$common" ]; then
+    return 0
+  fi
+  root_p="$(cd "$ROOT" && pwd -P)"
+  common_p="$(cd "$common" && pwd -P)"
+  case "$common_p/" in
+    "$root_p"/*) return 0 ;;
+  esac
+  printf '%s' "$common"
+}
+
+# _gate_image_passwd <id> <file>: write <file> as image <id>'s /etc/passwd plus,
+# when no entry there maps the caller's uid, one that does. The name is the host
+# login name, or fishhawk-gate when that is empty or not a plain
+# [A-Za-z0-9._-] word (a `:` or newline would corrupt the file). Returns
+# non-zero when the image's /etc/passwd cannot be read.
+_gate_image_passwd() {
+  local id="$1" file="$2" uid gid name
+  uid="$(id -u)"
+  gid="$(id -g)"
+  if ! docker run --rm --entrypoint '' "$id" cat /etc/passwd > "$file" 2>/dev/null; then
+    return 1
+  fi
+  if awk -F: -v u="$uid" '$3 == u { found = 1 } END { exit !found }' "$file"; then
+    return 0
+  fi
+  name="$(id -un 2>/dev/null || true)"
+  case "$name" in
+    "" | -* | *[!A-Za-z0-9._-]*) name="fishhawk-gate" ;;
+  esac
+  printf '%s:x:%s:%s:fishhawk gate caller:/tmp:/bin/sh\n' "$name" "$uid" "$gid" >> "$file"
+}
+
+# cmd_in_gate_image <lint|verify>: see the block comment above.
+cmd_in_gate_image() {
+  local mode="$1" image id cache common pwdir rc=0
+  local inner=() args=()
+  if ! command -v docker >/dev/null 2>&1; then
+    cat >&2 <<'EOF'
+scripts/test: docker not found on PATH — --in-gate-image runs the gate inside the pinned gate image and needs docker (fail closed, not a skip).
+Start or install Docker, or run the gate on the host without --in-gate-image.
+EOF
+    exit 1
+  fi
+  if [ "$mode" = "verify" ]; then
+    if ! _acquire_verify_lock; then
+      exit 1
+    fi
+    inner=(scripts/test verify --no-tests)
+  else
+    inner=(scripts/test lint)
+  fi
+  image="${FISHHAWK_TEST_GATE_IMAGE:-$GATE_IMAGE_DEFAULT}"
+  if ! id="$(_gate_image_resolve_id "$image")"; then
+    cat >&2 <<EOF
+scripts/test: cannot resolve gate image $image to an image ID (docker image inspect and docker pull both failed) — fail closed.
+Build one locally and point the helper at it:
+  docker buildx build --load -t fishhawk-gate:local deploy/gate-image
+  FISHHAWK_TEST_GATE_IMAGE=fishhawk-gate:local scripts/test $mode --in-gate-image
+EOF
+    exit 1
+  fi
+  echo "scripts/test: gate image $image resolved to $id" >&2
+  if [ ! -x "$ROOT/scripts/check-gate-image" ]; then
+    echo "scripts/test: scripts/check-gate-image missing or not executable — cannot check the gate image's pins, refusing to run (fail closed)" >&2
+    exit 1
+  fi
+  if ! "$ROOT/scripts/check-gate-image" --root "$ROOT" --image "$id" >&2; then
+    echo "scripts/test: gate image $image ($id) does not match this checkout's pins — refusing to run, because a stale image cannot produce CI-identical results. Pull a fresh one (docker pull $image) or rebuild it (deploy/gate-image/README.md)." >&2
+    exit 1
+  fi
+  cache="${FISHHAWK_GATE_CACHE_DIR:-${XDG_CACHE_HOME:-${HOME:-/tmp}/.cache}/fishhawk-gate}"
+  if ! mkdir -p "$cache/gocache" "$cache/gomodcache" "$cache/lintcache" 2>/dev/null; then
+    echo "scripts/test: cannot create the gate-image cache dirs under $cache — set FISHHAWK_GATE_CACHE_DIR to a writable directory" >&2
+    exit 1
+  fi
+  # Under the cache dir, not $TMPDIR: it must be a path the docker daemon can
+  # bind-mount, which the cache dir already has to be.
+  if ! pwdir="$(mktemp -d "$cache/passwd.XXXXXX")"; then
+    echo "scripts/test: cannot create a passwd scratch dir under $cache — set FISHHAWK_GATE_CACHE_DIR to a writable directory" >&2
+    exit 1
+  fi
+  if ! _gate_image_passwd "$id" "$pwdir/passwd"; then
+    rm -rf "$pwdir"
+    echo "scripts/test: cannot read /etc/passwd from gate image $id to give uid $(id -u) a name inside it — refusing to run (fail closed)" >&2
+    exit 1
+  fi
+  args=(run --rm --entrypoint '' --user "$(id -u):$(id -g)" -v "$pwdir/passwd:/etc/passwd:ro" -v "$ROOT:$ROOT" -w "$ROOT")
+  common="$(_gate_image_common_dir)"
+  if [ -n "$common" ]; then
+    args+=(-v "$common:$common")
+  fi
+  # Never a docker socket: the image carries no docker CLI either.
+  # GIT_CONFIG_COUNT/KEY/VALUE is COMMAND-scope config, so it survives the
+  # GIT_CONFIG_GLOBAL/SYSTEM=/dev/null pins the inner scripts/test exports, for
+  # a bind mount whose ownership the container may see as foreign.
+  args+=(
+    -v "$cache/gocache:/gocache"
+    -v "$cache/gomodcache:/gomodcache"
+    -v "$cache/lintcache:/lintcache"
+    -e HOME=/tmp
+    -e GOPATH=/tmp/gopath
+    -e GOCACHE=/gocache
+    -e GOMODCACHE=/gomodcache
+    -e GOLANGCI_LINT_CACHE=/lintcache
+    -e GOTOOLCHAIN=local
+    -e FISHHAWK_VERIFY_LOCK_PATH=/tmp/fishhawk-verify.lock
+    -e GIT_CONFIG_COUNT=1
+    -e GIT_CONFIG_KEY_0=safe.directory
+    -e GIT_CONFIG_VALUE_0='*'
+    "$id" "${inner[@]}"
+  )
+  echo "scripts/test: running '${inner[*]}' in $id (network on, checkout mounted read-write: CI parity, not isolation)" >&2
+  docker "${args[@]}" || rc=$?
+  rm -rf "$pwdir"
+  exit "$rc"
+}
+
 cmd_single() {
   if [ "$#" -eq 0 ]; then
     cat >&2 <<'EOF'
@@ -2036,6 +2336,15 @@ usage: scripts/test [SUBCOMMAND] [ARGS]
                        leg is unchanged; the `go test -race` loop is restricted
                        to those packages and the patch-coverage gate is skipped.
                        Falls back to $FISHHAWK_VERIFY_PACKAGES when absent.
+  verify --no-tests    every verify leg except the test loop and the
+                       patch-coverage gate (rejected with --packages)
+  lint --in-gate-image
+  verify --in-gate-image
+                       run `lint` / `verify --no-tests` inside the pinned gate
+                       image for CI parity; the image's pins are checked first
+                       and a mismatch refuses. Needs docker. Image:
+                       $FISHHAWK_TEST_GATE_IMAGE, default
+                       ghcr.io/kuhlman-labs/fishhawk-gate:main
   single ARGS          pass-through to `go test -race ARGS`
   -h | --help | help   show this message
 EOF
@@ -2048,8 +2357,14 @@ if [ -z "${FISHHAWK_TEST_LIB_ONLY:-}" ]; then
   case "${1:-test}" in
     test|"")          cmd_test ;;
     coverage|cover)   cmd_coverage ;;
-    lint)             cmd_lint ;;
-    verify)           shift; _parse_verify_args "$@"; cmd_verify ;;
+    lint)
+      shift; _parse_lint_args "$@"
+      if [ "$GATE_IMAGE_MODE" = "1" ]; then cmd_in_gate_image lint; else cmd_lint; fi
+      ;;
+    verify)
+      shift; _parse_verify_args "$@"
+      if [ "$GATE_IMAGE_MODE" = "1" ]; then cmd_in_gate_image verify; else cmd_verify; fi
+      ;;
     single)           shift; cmd_single "$@" ;;
     -h|--help|help)   usage ;;
     *)

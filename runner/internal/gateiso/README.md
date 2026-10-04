@@ -15,7 +15,7 @@ there is still no second exec path.
 | Variable | Values | Default | Meaning |
 |---|---|---|---|
 | `FISHHAWK_GATE_ISOLATION` | `auto` \| `container` \| `clone-sandbox` \| `clone` | `auto` | the isolation mode (`ParseMode`; an unknown value is a startup config error naming the valid values) |
-| `FISHHAWK_GATE_IMAGE` | an image reference | empty | the image the container path runs the gate in; empty means the container path is UNAVAILABLE, so a default runner never pays the per-exec cache cost below |
+| `FISHHAWK_GATE_IMAGE` | an image reference | empty | the image the container path runs the gate in; empty means the container path is UNAVAILABLE, so a default runner never pays the per-exec cache cost below. For THIS repository the recommended image is the in-repo, pin-checked `fishhawk-gate` (`deploy/gate-image/README.md`, E51.17 / #3966), digest-pinned, once #2137 lands. **Do NOT set it for this repository before #2137:** `auto` then prefers the container path, whose `--network=none` cannot reach the testcontainers Postgres, and every verify fails |
 | `FISHHAWK_DEPLOYMENT_PROFILE` | `local` \| `self-hosted` \| `hosted` | `local` | the runner-DECLARED deployment profile (`ParseProfile`); `hosted` forbids every non-container path |
 
 A config error (bad mode/profile, or `hosted` with an explicit `clone` /
@@ -461,13 +461,18 @@ category B.
 - [#2136](https://github.com/kuhlman-labs/fishhawk/issues/2136) (E51.3) — the
   additive workflow-v1.x `diff_coverage` container-image field declaring the
   gate image for customer coverage commands (today the image is the runner-wide
-  `FISHHAWK_GATE_IMAGE`).
+  `FISHHAWK_GATE_IMAGE`). Once it lands, this repository declares the
+  digest-pinned `fishhawk-gate` image (`deploy/gate-image/`) through it.
 - [#2137](https://github.com/kuhlman-labs/fishhawk/issues/2137) (E51.4) —
   daemon-dependent gate commands under the container path: this repo's own
   `scripts/test verify` needs the testcontainers Postgres, which a
   `--network=none` container (and the Linux sandbox's netns, above) cannot
-  reach.
+  reach. Until it lands, do not set `FISHHAWK_GATE_IMAGE` for this repository;
+  the gate image (E51.17 / #3966, `deploy/gate-image/README.md`) is usable
+  today only for CI parity via `scripts/test lint|verify --in-gate-image`,
+  which runs the Docker-free legs (`verify --no-tests`) and is not isolation.
 - [#2138](https://github.com/kuhlman-labs/fishhawk/issues/2138) (E51.5) — the
   operator-facing posture docs: the container-runtime requirement in the
   self-hosted distribution profile, runner setup docs, and the ARCHITECTURE
-  containment rows.
+  containment rows. The image those docs point a self-hosted runner of this
+  repository at is `fishhawk-gate` (`deploy/gate-image/`).
