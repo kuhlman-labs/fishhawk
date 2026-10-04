@@ -254,6 +254,91 @@ func newerGroomingArtifact(candidate, incumbent *artifact.Artifact) bool {
 	return candidate.ID.String() > incumbent.ID.String()
 }
 
+// operatorOnlyMessages carries one capture verb's refusal text for the shared
+// operator-only ladder, so each verb keeps its own wording and codes.
+type operatorOnlyMessages struct {
+	runToken      string
+	operatorAgent string
+}
+
+// groomingOperatorOnly is the grooming capture's ladder text (#2843), verbatim.
+var groomingOperatorOnly = operatorOnlyMessages{
+	runToken:      "a run-bound agent token may not record a grooming disposition; deciding a grooming proposal is an operator action",
+	operatorAgent: "a delegated operator-agent token may not record a grooming disposition; a per-entry grooming verdict is a human judgment, and an agent recording it would convert the operator gate into a self-approval",
+}
+
+// requireOperatorCapture is the OPERATOR-ONLY ladder shared by the grooming
+// (#2843) and upkeep (#3923) disposition captures. It writes the refusal and
+// returns ok=false on the first failing rung:
+//
+//	401 authentication_required — anonymous.
+//	403 run_token_forbidden     — a run-bound agent token, even for its OWN run
+//	                              (the merge_run.go / vouch.go posture).
+//	403 operator_agent_forbidden — a DELEGATED operator-agent token, keyed on
+//	                              operatorrole.IsTokenSubject (actor.go's notion
+//	                              of agent identity): an agent recording a verdict
+//	                              on an agent-authored report is a self-approval.
+//	403 insufficient_scope      — missing write:approvals, enforced
+//	                              UNCONDITIONALLY: no cookie-session bypass, because
+//	                              a disposition is an approval-class judgment.
+func (s *Server) requireOperatorCapture(w http.ResponseWriter, r *http.Request, msgs operatorOnlyMessages) (Identity, bool) {
+	id := IdentityFrom(r.Context())
+	if id.IsAnonymous() {
+		s.writeError(w, r, http.StatusUnauthorized, "authentication_required",
+			"an authenticated token is required", nil)
+		return id, false
+	}
+	if _, runBound := runBoundTokenRunID(id); runBound {
+		s.writeError(w, r, http.StatusForbidden, "run_token_forbidden", msgs.runToken, nil)
+		return id, false
+	}
+	if operatorrole.IsTokenSubject(id.Subject) {
+		s.writeError(w, r, http.StatusForbidden, "operator_agent_forbidden", msgs.operatorAgent,
+			map[string]any{"subject": id.Subject})
+		return id, false
+	}
+	if !hasScope(id, "write:approvals") {
+		s.writeError(w, r, http.StatusForbidden, "insufficient_scope",
+			"token is missing required scope: write:approvals",
+			map[string]any{"required_scope": "write:approvals"})
+		return id, false
+	}
+	return id, true
+}
+
+// decodeSingleJSONBody decodes the request body into dst and refuses (400
+// validation_failed, returning false) unparseable JSON or TRAILING content.
+//
+// json.Decoder stops after the first value, so without the trailing check a
+// body of two concatenated batches decodes the first, DISCARDS the second, and
+// returns 200 — a success response for a capture that recorded half of what the
+// operator sent. Trailing WHITESPACE is accepted (every curl heredoc sends a
+// newline): a second Decode returns io.EOF for whitespace-only remainder, a nil
+// error for a second value, and a syntax error for garbage — so io.EOF is
+// exactly the accept condition. An empty body decodes to dst's zero value.
+func (s *Server) decodeSingleJSONBody(w http.ResponseWriter, r *http.Request, dst any, shapeMsg string) bool {
+	if r.Body == nil {
+		return true
+	}
+	dec := json.NewDecoder(r.Body)
+	decErr := dec.Decode(dst)
+	switch {
+	case decErr != nil && !errors.Is(decErr, io.EOF):
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed", shapeMsg,
+			map[string]any{"error": decErr.Error()})
+		return false
+	case decErr == nil:
+		var trailing json.RawMessage
+		if tErr := dec.Decode(&trailing); !errors.Is(tErr, io.EOF) {
+			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+				"request body must be a single JSON document; trailing content after the dispositions object is refused because a decoder that stopped at the first value would silently discard it and report success",
+				map[string]any{"field": "body"})
+			return false
+		}
+	}
+	return true
+}
+
 // handleRecordGroomingDispositions implements
 // POST /v0/runs/{run_id}/grooming-dispositions.
 //
@@ -289,41 +374,9 @@ func (s *Server) handleRecordGroomingDispositions(w http.ResponseWriter, r *http
 		return
 	}
 
-	id := IdentityFrom(r.Context())
-	// G1.
-	if id.IsAnonymous() {
-		s.writeError(w, r, http.StatusUnauthorized, "authentication_required",
-			"an authenticated token is required", nil)
-		return
-	}
-	// G2: a run-bound agent token may NEVER record a disposition — not even for
-	// its own run. The agent authored the report; dispositioning it would be a
-	// self-approval. Mirrors merge_run.go / vouch.go.
-	if _, runBound := runBoundTokenRunID(id); runBound {
-		s.writeError(w, r, http.StatusForbidden, "run_token_forbidden",
-			"a run-bound agent token may not record a grooming disposition; deciding a grooming proposal is an operator action",
-			nil)
-		return
-	}
-	// G3: a DELEGATED operator-agent token is refused too. Keyed on
-	// operatorrole.IsTokenSubject — the same predicate actor.go already uses to
-	// classify a delegated writer as actor_kind=agent — so this is a reuse of
-	// the existing notion of agent identity, not a new one.
-	if operatorrole.IsTokenSubject(id.Subject) {
-		s.writeError(w, r, http.StatusForbidden, "operator_agent_forbidden",
-			"a delegated operator-agent token may not record a grooming disposition; a per-entry grooming verdict is a human judgment, and an agent recording it would convert the operator gate into a self-approval",
-			map[string]any{"subject": id.Subject})
-		return
-	}
-	// G4: write:approvals, enforced UNCONDITIONALLY. This deliberately does NOT
-	// mirror the sibling `id.TokenID != ""` guard that waves operator
-	// cookie-session identities past the scope gate — a disposition is an
-	// approval-class judgment, the same reasoning merge_run.go states for the
-	// merge verdict.
-	if !hasScope(id, "write:approvals") {
-		s.writeError(w, r, http.StatusForbidden, "insufficient_scope",
-			"token is missing required scope: write:approvals",
-			map[string]any{"required_scope": "write:approvals"})
+	// G1..G4: the operator-only ladder, shared with the upkeep capture.
+	id, ok := s.requireOperatorCapture(w, r, groomingOperatorOnly)
+	if !ok {
 		return
 	}
 
@@ -335,41 +388,11 @@ func (s *Server) handleRecordGroomingDispositions(w http.ResponseWriter, r *http
 		return
 	}
 
-	// G5: body shape.
+	// G5: body shape — ONE JSON document (decodeSingleJSONBody).
 	var reqBody groomingDispositionRequest
-	if r.Body != nil {
-		dec := json.NewDecoder(r.Body)
-		decErr := dec.Decode(&reqBody)
-		switch {
-		case decErr != nil && !errors.Is(decErr, io.EOF):
-			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
-				"request body must be valid JSON {dispositions:[{entry_id, verdict, close_target}]}",
-				map[string]any{"error": decErr.Error()})
-			return
-		case decErr == nil:
-			// G5': the body must be ONE JSON document and nothing else.
-			//
-			// json.Decoder stops after the first value, so without this a body
-			// of two concatenated batches decodes the first, DISCARDS the
-			// second, and returns 200 — a success response for a capture that
-			// recorded half of what the operator sent, which is precisely the
-			// silent-partial-capture failure this endpoint exists to prevent.
-			// The refusal sits inside G5, ahead of every write, so a rejected
-			// body still records nothing.
-			//
-			// Trailing WHITESPACE is accepted: a trailing newline is what every
-			// curl heredoc and most HTTP clients send. A second Decode returns
-			// io.EOF for whitespace-only remainder, a nil error for a second
-			// value, and a syntax error for garbage — so io.EOF is exactly the
-			// accept condition.
-			var trailing json.RawMessage
-			if tErr := dec.Decode(&trailing); !errors.Is(tErr, io.EOF) {
-				s.writeError(w, r, http.StatusBadRequest, "validation_failed",
-					"request body must be a single JSON document; trailing content after the dispositions object is refused because a decoder that stopped at the first value would silently discard it and report success",
-					map[string]any{"field": "body"})
-				return
-			}
-		}
+	if !s.decodeSingleJSONBody(w, r, &reqBody,
+		"request body must be valid JSON {dispositions:[{entry_id, verdict, close_target}]}") {
+		return
 	}
 	if len(reqBody.Dispositions) == 0 {
 		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
@@ -580,7 +603,7 @@ func (s *Server) respondGroomingDispositions(w http.ResponseWriter, r *http.Requ
 	// The capture window (#2991). Pre-watermark dispositions are still projected
 	// UNCHANGED below — nothing is voided or hidden — so an operator who recorded
 	// a rejection reads back their capture plus the settlement, never an empty set.
-	settlement, serr := s.groomingWindowSettlementFor(r.Context(), runID, art.ID.String())
+	settlement, serr := s.windowSettlementFor(r.Context(), runID, audit.GroomingApplyWindowClosedCategory, art.ID.String())
 	if serr != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 			"listing the grooming capture window failed", map[string]any{"error": serr.Error()})
@@ -597,12 +620,14 @@ func (s *Server) respondGroomingDispositions(w http.ResponseWriter, r *http.Requ
 	})
 }
 
-// groomingWindowSettlementFor resolves the LOWEST-sequence grooming_apply_window_closed
-// watermark bound to artifactID (the permanent one), or nil when the window is
-// still open. It reads the same rows the audit-layer settlement writes, so the
-// read-back reflects a settlement whatever recorded it.
-func (s *Server) groomingWindowSettlementFor(ctx context.Context, runID uuid.UUID, artifactID string) (*groomingWindowSettlement, error) {
-	rows, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, audit.GroomingApplyWindowClosedCategory)
+// windowSettlementFor resolves the LOWEST-sequence watermark of category bound
+// to artifactID (the permanent one), or nil when the window is still open. It
+// reads the same rows the audit-layer settlement writes, so the read-back
+// reflects a settlement whatever recorded it. Shared by the grooming
+// (grooming_apply_window_closed) and upkeep (upkeep_apply_window_closed, #3923)
+// read-backs; both watermark payloads carry artifact_id + settlement.
+func (s *Server) windowSettlementFor(ctx context.Context, runID uuid.UUID, category, artifactID string) (*groomingWindowSettlement, error) {
+	rows, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, category)
 	if err != nil {
 		return nil, err
 	}

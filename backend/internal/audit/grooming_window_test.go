@@ -433,3 +433,333 @@ func TestGroomingWindow_SettlementRunNotFound(t *testing.T) {
 		t.Errorf("err = %v, want it to name the missing run", err)
 	}
 }
+
+// --- upkeep family (#3923) ---------------------------------------------------
+//
+// The same protocol, generalized over a second disposition family. Every
+// upkeep test drives the PRODUCTION repo through audit.UpkeepWindowAppender.
+// The upkeep batch additionally re-checks its BINDING under the run-row lock,
+// so each fixture records an upkeep_report_recorded row naming the capture's
+// artifact first (seeded by construction through AppendChained).
+
+func (f *gwFixture) upkeepWin(t *testing.T) audit.UpkeepWindowAppender {
+	t.Helper()
+	win, ok := f.audit.(audit.UpkeepWindowAppender)
+	if !ok {
+		t.Fatal("the production audit repository must implement audit.UpkeepWindowAppender")
+	}
+	return win
+}
+
+func (f *gwFixture) appendRaw(t *testing.T, category string, payload map[string]any) *audit.Entry {
+	t.Helper()
+	raw, _ := json.Marshal(payload)
+	e, err := f.audit.AppendChained(context.Background(), audit.ChainAppendParams{
+		RunID: f.runID, Timestamp: time.Now().UTC(), Category: category, Payload: raw,
+	})
+	if err != nil {
+		t.Fatalf("seed %s: %v", category, err)
+	}
+	return e
+}
+
+// recordUpkeepReport seeds the upkeep_report_recorded row binding artifactID.
+func (f *gwFixture) recordUpkeepReport(t *testing.T, artifactID string) *audit.Entry {
+	t.Helper()
+	return f.appendRaw(t, audit.UpkeepReportRecordedCategory, map[string]any{"run_id": f.runID.String(), "artifact_id": artifactID})
+}
+
+func (f *gwFixture) upkeepDisposition(artifactID, findingID, verdict string) audit.ChainAppendParams {
+	payload, _ := json.Marshal(map[string]any{
+		"run_id": f.runID.String(), "artifact_id": artifactID,
+		"finding_id": findingID, "verdict": verdict,
+	})
+	return audit.ChainAppendParams{
+		RunID: f.runID, Timestamp: time.Now().UTC(),
+		Category: audit.UpkeepDispositionRecordedCategory, Payload: payload,
+	}
+}
+
+func (f *gwFixture) upkeepWatermark(artifactID, settlement string) audit.ChainAppendParams {
+	payload, _ := json.Marshal(map[string]any{
+		"run_id": f.runID.String(), "artifact_id": artifactID, "settlement": settlement,
+	})
+	return audit.ChainAppendParams{
+		RunID: f.runID, Timestamp: time.Now().UTC(),
+		Category: audit.UpkeepApplyWindowClosedCategory, Payload: payload,
+	}
+}
+
+func (f *gwFixture) rowsOf(t *testing.T, category string) []*audit.Entry {
+	t.Helper()
+	rows, err := f.audit.ListForRunByCategory(context.Background(), f.runID, category)
+	if err != nil {
+		t.Fatalf("list %s: %v", category, err)
+	}
+	return rows
+}
+
+// TestUpkeepWindow_BatchRefusedAtClosedWindow: an artifact-bound
+// upkeep_apply_window_closed row (seeded DIRECTLY) refuses the batch with
+// *UpkeepWindowClosedError and ZERO committed rows.
+//
+// COUNTERFACTUAL (watermark scan in windowDispositionBatchTx): make it never
+// find the watermark — the rows land and the error is nil. The watermark
+// exists only in the DB, so only the in-transaction scan sees it.
+func TestUpkeepWindow_BatchRefusedAtClosedWindow(t *testing.T) {
+	f := newGWFixture(t)
+	win := f.upkeepWin(t)
+	f.recordUpkeepReport(t, f.artA)
+	wm := f.appendRaw(t, audit.UpkeepApplyWindowClosedCategory, map[string]any{"artifact_id": f.artA, "settlement": "rejected"})
+
+	_, err := win.AppendChainedUpkeepDispositionBatch(context.Background(), f.artA, []audit.ChainAppendParams{
+		f.upkeepDisposition(f.artA, "flake:a", "approved"),
+		f.upkeepDisposition(f.artA, "flake:b", "rejected"),
+	})
+	var closed *audit.UpkeepWindowClosedError
+	if !errors.As(err, &closed) {
+		t.Fatalf("err = %v (%T), want *audit.UpkeepWindowClosedError", err, err)
+	}
+	if closed.ArtifactID != f.artA || closed.Settlement != "rejected" || closed.Sequence != wm.Sequence {
+		t.Errorf("closed = %+v, want artifact %s settlement rejected sequence %d", closed, f.artA, wm.Sequence)
+	}
+	if rows := f.rowsOf(t, audit.UpkeepDispositionRecordedCategory); len(rows) != 0 {
+		t.Errorf("committed upkeep disposition rows = %d, want 0", len(rows))
+	}
+}
+
+// TestUpkeepWindow_BatchRefusedWhenReportSuperseded is the BINDING RE-CHECK
+// (#3923 approval condition 1) at the audit layer: report A was recorded, then
+// report B — a capture still bound to A is refused with
+// *UpkeepReportSupersededError naming B, and NOTHING is written.
+//
+// COUNTERFACTUAL (checkReportBinding): make it return nil — the rows land
+// against the superseded A and the error is nil.
+func TestUpkeepWindow_BatchRefusedWhenReportSuperseded(t *testing.T) {
+	f := newGWFixture(t)
+	win := f.upkeepWin(t)
+	f.recordUpkeepReport(t, f.artA)
+	b := f.recordUpkeepReport(t, f.artB)
+
+	_, err := win.AppendChainedUpkeepDispositionBatch(context.Background(), f.artA, []audit.ChainAppendParams{
+		f.upkeepDisposition(f.artA, "flake:a", "approved"),
+	})
+	var sup *audit.UpkeepReportSupersededError
+	if !errors.As(err, &sup) {
+		t.Fatalf("err = %v (%T), want *audit.UpkeepReportSupersededError", err, err)
+	}
+	if sup.ArtifactID != f.artA || sup.CurrentArtifactID != f.artB || sup.CurrentSequence != b.Sequence {
+		t.Errorf("superseded = %+v, want artifact %s current %s sequence %d", sup, f.artA, f.artB, b.Sequence)
+	}
+	if rows := f.rowsOf(t, audit.UpkeepDispositionRecordedCategory); len(rows) != 0 {
+		t.Errorf("committed upkeep disposition rows = %d, want 0", len(rows))
+	}
+
+	// The CURRENT report still captures.
+	if _, err := win.AppendChainedUpkeepDispositionBatch(context.Background(), f.artB, []audit.ChainAppendParams{
+		f.upkeepDisposition(f.artB, "flake:a", "approved"),
+	}); err != nil {
+		t.Fatalf("capture against the current report: %v", err)
+	}
+}
+
+// TestUpkeepWindow_BatchRefusedWithNoReportRow: no upkeep_report_recorded row
+// at all — the binding cannot be confirmed, so the batch refuses (fail closed)
+// with an empty CurrentArtifactID, writing nothing.
+func TestUpkeepWindow_BatchRefusedWithNoReportRow(t *testing.T) {
+	f := newGWFixture(t)
+	_, err := f.upkeepWin(t).AppendChainedUpkeepDispositionBatch(context.Background(), f.artA, []audit.ChainAppendParams{
+		f.upkeepDisposition(f.artA, "flake:a", "approved"),
+	})
+	var sup *audit.UpkeepReportSupersededError
+	if !errors.As(err, &sup) || sup.CurrentArtifactID != "" {
+		t.Fatalf("err = %v (%T), want *audit.UpkeepReportSupersededError with no current artifact", err, err)
+	}
+	if rows := f.rowsOf(t, audit.UpkeepDispositionRecordedCategory); len(rows) != 0 {
+		t.Errorf("committed rows = %d, want 0", len(rows))
+	}
+}
+
+// TestUpkeepWindow_RepeatedCloseReturnsFirstWatermark: PERMANENCE — a second
+// close returns the FIRST watermark unchanged, appends nothing, and its
+// consumed set stays bounded by the first watermark.
+func TestUpkeepWindow_RepeatedCloseReturnsFirstWatermark(t *testing.T) {
+	f := newGWFixture(t)
+	win := f.upkeepWin(t)
+	ctx := context.Background()
+	f.recordUpkeepReport(t, f.artA)
+	if _, err := win.AppendChainedUpkeepDispositionBatch(ctx, f.artA, []audit.ChainAppendParams{
+		f.upkeepDisposition(f.artA, "flake:a", "approved"),
+	}); err != nil {
+		t.Fatalf("capture: %v", err)
+	}
+	first, consumed1, err := win.AppendChainedUpkeepWindowClose(ctx, f.upkeepWatermark(f.artA, "approved"), f.artA)
+	if err != nil {
+		t.Fatalf("first close: %v", err)
+	}
+	second, consumed2, err := win.AppendChainedUpkeepWindowClose(ctx, f.upkeepWatermark(f.artA, "rejected"), f.artA)
+	if err != nil {
+		t.Fatalf("second close: %v", err)
+	}
+	if second.Sequence != first.Sequence {
+		t.Errorf("second close returned sequence %d, want the first watermark %d", second.Sequence, first.Sequence)
+	}
+	if n := len(f.rowsOf(t, audit.UpkeepApplyWindowClosedCategory)); n != 1 {
+		t.Errorf("watermark rows = %d, want 1", n)
+	}
+	if len(consumed1) != 1 || len(consumed2) != 1 || consumed1[0].Sequence != consumed2[0].Sequence {
+		t.Errorf("consumed sets differ: %d vs %d", len(consumed1), len(consumed2))
+	}
+}
+
+// TestUpkeepWindow_ConsumedSetArtifactScoped: rows of a SECOND artifact and
+// rows above the watermark are excluded from the consumed set.
+func TestUpkeepWindow_ConsumedSetArtifactScoped(t *testing.T) {
+	f := newGWFixture(t)
+	ctx := context.Background()
+	// Seeded DIRECTLY so both artifacts carry rows below A's watermark.
+	f.appendRaw(t, audit.UpkeepDispositionRecordedCategory, map[string]any{"artifact_id": f.artA, "finding_id": "flake:a", "verdict": "approved"})
+	f.appendRaw(t, audit.UpkeepDispositionRecordedCategory, map[string]any{"artifact_id": f.artB, "finding_id": "flake:b", "verdict": "approved"})
+	w, consumed, err := f.upkeepWin(t).AppendChainedUpkeepWindowClose(ctx, f.upkeepWatermark(f.artA, "approved"), f.artA)
+	if err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	// Above the watermark: seeded after the close.
+	f.appendRaw(t, audit.UpkeepDispositionRecordedCategory, map[string]any{"artifact_id": f.artA, "finding_id": "flake:c", "verdict": "approved"})
+	_, again, err := f.upkeepWin(t).AppendChainedUpkeepWindowClose(ctx, f.upkeepWatermark(f.artA, "approved"), f.artA)
+	if err != nil {
+		t.Fatalf("repeat close: %v", err)
+	}
+	for _, set := range [][]*audit.Entry{consumed, again} {
+		if len(set) != 1 || groomingArtifactOf(t, set[0]) != f.artA || set[0].Sequence >= w.Sequence {
+			t.Fatalf("consumed = %d entries, want exactly A's row below watermark %d", len(set), w.Sequence)
+		}
+	}
+}
+
+// TestUpkeepWindow_FamilyIsolation: a grooming disposition row and a grooming
+// watermark carrying the SAME artifact_id as the upkeep artifact neither close
+// the upkeep window nor enter the upkeep consumed set.
+//
+// COUNTERFACTUAL: point upkeepFamily at the grooming categories — the capture
+// is refused (grooming watermark seen) or the consumed set includes the
+// grooming row.
+func TestUpkeepWindow_FamilyIsolation(t *testing.T) {
+	f := newGWFixture(t)
+	ctx := context.Background()
+	win := f.upkeepWin(t)
+	f.recordUpkeepReport(t, f.artA)
+	if _, err := f.audit.AppendChained(ctx, f.dispositionParams(f.artA, "ordering:a", "approved")); err != nil {
+		t.Fatalf("seed grooming disposition: %v", err)
+	}
+	if _, err := f.audit.AppendChained(ctx, f.watermarkParams(f.artA, "approved")); err != nil {
+		t.Fatalf("seed grooming watermark: %v", err)
+	}
+	es, err := win.AppendChainedUpkeepDispositionBatch(ctx, f.artA, []audit.ChainAppendParams{
+		f.upkeepDisposition(f.artA, "flake:a", "approved"),
+	})
+	if err != nil {
+		t.Fatalf("upkeep capture refused by a GROOMING watermark: %v", err)
+	}
+	_, consumed, err := win.AppendChainedUpkeepWindowClose(ctx, f.upkeepWatermark(f.artA, "approved"), f.artA)
+	if err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if len(consumed) != 1 || consumed[0].Sequence != es[0].Sequence || consumed[0].Category != audit.UpkeepDispositionRecordedCategory {
+		t.Fatalf("consumed = %d entries, want exactly the upkeep row %d", len(consumed), es[0].Sequence)
+	}
+}
+
+// TestUpkeepWindow_ConcurrentCaptureAndSettlementSerialize mirrors the grooming
+// race test: every capture either lands below the watermark (and is consumed)
+// or is refused whole — none lands above it, none is partial.
+func TestUpkeepWindow_ConcurrentCaptureAndSettlementSerialize(t *testing.T) {
+	const rounds = 8
+	stagger := timescale.D(3 * time.Millisecond)
+	for i := 0; i < rounds; i++ {
+		f := newGWFixture(t)
+		win := f.upkeepWin(t)
+		f.recordUpkeepReport(t, f.artA)
+		captureFirst := i%2 == 0
+		var wg sync.WaitGroup
+		var captureErr, settleErr error
+		var consumed []*audit.Entry
+		start := make(chan struct{})
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-start
+			if !captureFirst {
+				time.Sleep(stagger)
+			}
+			_, captureErr = win.AppendChainedUpkeepDispositionBatch(context.Background(), f.artA, []audit.ChainAppendParams{
+				f.upkeepDisposition(f.artA, "flake:a", "approved"),
+				f.upkeepDisposition(f.artA, "flake:b", "rejected"),
+			})
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			if captureFirst {
+				time.Sleep(stagger)
+			}
+			_, consumed, settleErr = win.AppendChainedUpkeepWindowClose(context.Background(), f.upkeepWatermark(f.artA, "approved"), f.artA)
+		}()
+		close(start)
+		wg.Wait()
+		if settleErr != nil {
+			t.Fatalf("round %d: settle: %v", i, settleErr)
+		}
+		rows := f.rowsOf(t, audit.UpkeepDispositionRecordedCategory)
+		var closed *audit.UpkeepWindowClosedError
+		switch {
+		case captureErr == nil:
+			if len(rows) != 2 || len(consumed) != 2 {
+				t.Errorf("round %d: capture landed: rows=%d consumed=%d, want 2/2", i, len(rows), len(consumed))
+			}
+		case errors.As(captureErr, &closed):
+			if len(rows) != 0 || len(consumed) != 0 {
+				t.Errorf("round %d: capture refused: rows=%d consumed=%d, want 0/0", i, len(rows), len(consumed))
+			}
+		default:
+			t.Errorf("round %d: capture err = %v, want nil or UpkeepWindowClosedError", i, captureErr)
+		}
+	}
+}
+
+// TestUpkeepWindow_ErrorStrings pins the two upkeep refusals' text: each names
+// the facts the 409 handler renders.
+func TestUpkeepWindow_ErrorStrings(t *testing.T) {
+	closed := (&audit.UpkeepWindowClosedError{ArtifactID: "art-1", Settlement: "rejected", Sequence: 9}).Error()
+	for _, want := range []string{"upkeep", "art-1", "rejected", "9"} {
+		if !strings.Contains(closed, want) {
+			t.Errorf("UpkeepWindowClosedError = %q, want %q", closed, want)
+		}
+	}
+	sup := (&audit.UpkeepReportSupersededError{ArtifactID: "art-1", CurrentArtifactID: "art-2", CurrentSequence: 11}).Error()
+	for _, want := range []string{"art-1", "art-2", "11", "superseded"} {
+		if !strings.Contains(sup, want) {
+			t.Errorf("UpkeepReportSupersededError = %q, want %q", sup, want)
+		}
+	}
+}
+
+// TestUpkeepWindow_RunNotFound: both upkeep cores fail at the run-row lock for
+// an unknown run, and an empty batch is a no-op.
+func TestUpkeepWindow_RunNotFound(t *testing.T) {
+	f := newGWFixture(t)
+	win := f.upkeepWin(t)
+	p := f.upkeepDisposition(f.artA, "flake:a", "approved")
+	p.RunID = uuid.New()
+	if _, err := win.AppendChainedUpkeepDispositionBatch(context.Background(), f.artA, []audit.ChainAppendParams{p}); err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Errorf("batch err = %v, want run not found", err)
+	}
+	w := f.upkeepWatermark(f.artA, "approved")
+	w.RunID = uuid.New()
+	if _, _, err := win.AppendChainedUpkeepWindowClose(context.Background(), w, f.artA); err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Errorf("close err = %v, want run not found", err)
+	}
+	if es, err := win.AppendChainedUpkeepDispositionBatch(context.Background(), f.artA, nil); err != nil || len(es) != 0 {
+		t.Errorf("empty batch = %v, %v; want no-op", es, err)
+	}
+}
