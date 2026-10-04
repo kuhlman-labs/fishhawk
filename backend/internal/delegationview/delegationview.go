@@ -259,6 +259,18 @@ func hashWorkflow(w WorkflowDelegation) string {
 // yields the SAME hash.
 func HashWorkflows(ws []WorkflowDelegation) string { return hashOf(ws) }
 
+// HashMatrix is the content hash of one RESOLVED action matrix, computed
+// through the SAME wire mirror (Action) and the same sha256 this read uses,
+// so a delegation shadow stamp (E82.1 / #3778) hashing a run's clamped matrix
+// yields the digest a matrix of identical content would carry here. The
+// mirror is a plain struct and the slice is ordered, so the bytes — and the
+// digest — are a function of the content alone.
+//
+// A nil or empty matrix hashes the empty Action slice (a stable, non-empty
+// digest), so "no matrix governs the run" is its own comparable stratum
+// rather than an empty string indistinguishable from a hashing failure.
+func HashMatrix(actions []spec.ResolvedAction) string { return hashOf(actionsFrom(actions)) }
+
 // hashOf marshals v and returns hex(sha256(bytes)). A marshalling failure is
 // impossible for these types (no channel, func or NaN reachable from them),
 // and a hash is not a place to surface one, so it degrades to the empty
