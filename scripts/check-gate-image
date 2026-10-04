@@ -30,7 +30,12 @@
 #   (f) the Dockerfile must not install a docker engine, CLI or plugin;
 #   (g) the Dockerfile must declare `ARG TARGETARCH` (no default) in its final
 #       stage and carry no architecture literal in a download URL, a GOARCH
-#       assignment or a FROM --platform flag.
+#       assignment or a FROM --platform flag;
+#   (h) HELM_VERSION must be an exact vMAJOR.MINOR.PATCH with MAJOR >= 4:
+#       test-helm-render r9 renders NOTES.txt with `helm install --dry-run`,
+#       which Helm v3 refuses without a reachable cluster (--dry-run=client
+#       too), and the image has none, so a v3 pin red-lines every in-image
+#       verify on r9.
 # Comment lines of the Dockerfile are never scanned for (f)/(g), so prose may
 # name what is forbidden.
 #
@@ -240,6 +245,14 @@ if ! printf '%s\n' "$GO_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
 fi
 GO_MM="$(printf '%s\n' "$GO_VERSION" | sed -nE 's/^([0-9]+)\.([0-9]+).*/\1.\2/p')"
 
+# (h) HELM_VERSION exact, MAJOR >= 4 (cluster-free `helm install --dry-run`).
+HELM_MAJOR="$(printf '%s\n' "$HELM_VERSION" | sed -nE 's/^v([0-9]+)\.[0-9]+\.[0-9]+$/\1/p')"
+if [ -z "$HELM_MAJOR" ]; then
+  violate "$DOCKERFILE_REL:$HELM_VERSION_LINE: HELM_VERSION '$HELM_VERSION' is not an exact vMAJOR.MINOR.PATCH"
+elif [ "$HELM_MAJOR" -lt 4 ]; then
+  violate "$DOCKERFILE_REL:$HELM_VERSION_LINE: HELM_VERSION $HELM_VERSION is below v4 — test-helm-render r9's \`helm install --dry-run\` needs a reachable cluster on Helm v3, and the gate image has none"
+fi
+
 # go_ver_key VERSION -> "MAJ MIN PATCH PRE" (PRE 0 for a release, -1 for an
 # rc/beta, which sorts below the .0 release), or nothing when unparseable.
 # Accepts an optional leading `go` (toolchain form) and a `-suffix`.
@@ -416,4 +429,4 @@ if [ "$violations" -gt 0 ]; then
   echo "check-gate-image: $violations violation(s)" >&2
   exit 1
 fi
-echo "check-gate-image: ok — GO_VERSION $GO_VERSION agrees with $go_directive_sites go directive(s) on $GO_MM; GOLANGCI_LINT_VERSION $GOLANGCI_LINT_VERSION agrees with $golangci_sites pin site(s); no docker; TARGETARCH-explicit"
+echo "check-gate-image: ok — GO_VERSION $GO_VERSION agrees with $go_directive_sites go directive(s) on $GO_MM; GOLANGCI_LINT_VERSION $GOLANGCI_LINT_VERSION agrees with $golangci_sites pin site(s); HELM_VERSION $HELM_VERSION (>= v4); no docker; TARGETARCH-explicit"

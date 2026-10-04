@@ -685,7 +685,8 @@ in `deploy/gate-image/README.md`; this section covers the `scripts/test` side.
   `test-patch-coverage` and `test-verify-scope` from running it against a
   fixture. A violation exits 1 and fails verify, so bumping the CI
   golangci-lint pin (or the go directives) without the Dockerfile ARG fails
-  in-loop.
+  in-loop, and so does a `HELM_VERSION` below v4 (test-helm-render r9's
+  `helm install --dry-run` needs a cluster on Helm v3; the image has none).
 - **`verify --no-tests`** runs the lock and every leg above, then returns
   before the test loop and the patch-coverage gate, printing a reason naming
   #2137. With an explicit `--packages` it is REJECTED (it scopes a test loop
@@ -701,8 +702,12 @@ in `deploy/gate-image/README.md`; this section covers the `scripts/test` side.
   `$FISHHAWK_TEST_GATE_IMAGE` (default
   `ghcr.io/kuhlman-labs/fishhawk-gate:main`) to an image ID, pulling once if
   absent; `scripts/check-gate-image --image <ID>`, refusing on any pin
-  mismatch so a stale cached image cannot report CI-identical results; then
-  `docker run` on that same ID with the checkout (and an outside git common
+  mismatch so a stale cached image cannot report CI-identical results; read
+  the image's `/etc/passwd` and append an entry for the caller's uid when none
+  maps it (an unreadable one refuses), because a nameless uid makes `whoami`
+  fail and test-helm-render r9h with it; then
+  `docker run` on that same ID with that passwd file mounted read-only over
+  `/etc/passwd`, the checkout (and an outside git common
   dir) mounted at its own path, `--user uid:gid`, persistent caches under
   `${FISHHAWK_GATE_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/fishhawk-gate}`,
   command-scope `safe.directory=*`, and no docker socket. The exit status is

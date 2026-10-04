@@ -21,7 +21,7 @@ toolchain. It has two consumers:
 | Base | `golang:${GO_VERSION}-bookworm` (official multi-arch image) |
 | Build context | `deploy/gate-image/` alone; the image copies NO repository files |
 | Entrypoint / user | none / none — callers pass `--entrypoint ''` and `--user uid:gid` |
-| Runtime env | works as an arbitrary uid with `HOME=/tmp`; `GOTOOLCHAIN=local` is baked in |
+| Runtime env | works as an arbitrary uid with `HOME=/tmp`, except that such a uid has no `/etc/passwd` entry (`whoami` fails, so test-helm-render r9h fails); `--in-gate-image` mounts one (step 6), the runner's container path does not yet (#2137); `GOTOOLCHAIN=local` is baked in |
 | Docker | none: no engine, CLI, plugin or socket, enforced in both check modes |
 | Architecture | every download keyed on BuildKit `TARGETARCH`, declared in the stage |
 
@@ -41,7 +41,7 @@ externally-managed). Deliberately absent: `docker`, `kubectl`, `kind`, `node`.
 |---|---|
 | `GO_VERSION` (exact `MAJOR.MINOR.PATCH`) | MAJOR.MINOR of every `go.work` / `go.mod` `go` directive and every workflow `go-version:` literal; no `go` / `toolchain` directive may EXCEED it in full (`GOTOOLCHAIN=local` refuses a newer one) |
 | `GOLANGCI_LINT_VERSION` | EXACTLY the golangci-lint `install.sh` tag in every `.github/workflows/*` file and in `scripts/test`'s install hint |
-| `HELM_VERSION` | the helm render gate's documented CI half (`deploy/helm/fishhawk/README.md`) |
+| `HELM_VERSION` (exact `vMAJOR.MINOR.PATCH`, currently `v4.2.4`) | MAJOR ≥ 4, because `scripts/test-helm-render` r9 renders `NOTES.txt` with `helm install --dry-run`, which Helm v3 (`--dry-run=client` too) refuses without a reachable cluster and the image has none. The helm render gate's documented CI half (`deploy/helm/fishhawk/README.md`, `setup-helm` `version:`) carries the same `v4.2.4`; nothing checks that pair, so bump both together |
 | `CHECK_JSONSCHEMA_VERSION` | the `check-jsonschema` validator `AGENTS.md` names for `docs/spec/` |
 
 The chain closes in two halves:
@@ -97,7 +97,15 @@ above `cmd_in_gate_image` in `scripts/test`):
    version that disagrees with this checkout's Dockerfile pins refuses the run,
    so a stale locally cached `:main` can never produce results presented as
    CI-identical. The resolved ID and its repo digests are printed.
-6. `docker run --rm --entrypoint '' --user $(id -u):$(id -g)` on that same ID,
+6. The image's `/etc/passwd` is read (`cat` in a throwaway container on the
+   same ID) and, when no entry maps your uid, one is appended (your login name,
+   or `fishhawk-gate` when it is not a plain `[A-Za-z0-9._-]` word; home
+   `/tmp`). The file lives in a scratch dir under the cache dir, is mounted
+   READ-ONLY over `/etc/passwd`, and is removed after the run. Without it the
+   uid is nameless: `whoami` fails and test-helm-render r9h's `$(whoami)`
+   probe becomes an empty needle that matches every argv. An unreadable
+   `/etc/passwd` refuses the run.
+7. `docker run --rm --entrypoint '' --user $(id -u):$(id -g)` on that same ID,
    with the checkout bind-mounted at its own absolute path (plus the git common
    dir at its own path when it lies outside the checkout, for a linked
    worktree), three persistent per-user caches (`gocache`, `gomodcache`,

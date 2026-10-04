@@ -53,6 +53,11 @@
 #   missing check-gate-image guard deleted                   -> i14
 #   cache mkdir failure guard made a no-op                   -> i15
 #   test-in-gate-image removed from _verify_gate_harnesses   -> i16
+#   `-v $pwdir/passwd:/etc/passwd:ro` argument deleted       -> i18
+#   uid-already-mapped check made always-false (append)      -> i18b
+#   passwd read-failure guard made a fall-through            -> i18c
+#   post-run `rm -rf "$pwdir"` deleted                       -> i18d
+#   login-name sanitization case deleted                     -> i18e
 # ---------------------------------------------------------------------------
 set -uo pipefail
 
@@ -136,6 +141,9 @@ fi
 #                          inspect that would otherwise mask it)
 #   FAKE_PULL_RC           pull's exit status (default 0)
 #   FAKE_INNER_RC          the inner command's exit status (default 0)
+#   FAKE_PASSWD_RC         the `cat /etc/passwd` run's exit status (default 0)
+#   FAKE_PASSWD_EXTRA      one more line the image's /etc/passwd carries
+#   FAKE_UN                what the fake `id -un` prints (unset: the real id)
 FAKEBIN="$tmproot/fakebin"
 mkdir -p "$FAKEBIN"
 cat > "$FAKEBIN/docker" <<'EOF'
@@ -169,12 +177,26 @@ case "$1" in
       line="|"
       for a in "$@"; do line="$line$a|"; done
       printf '%s\n' "$line" > "$FAKE_STATE/inner.argv"
+      for a in "$@"; do
+        case "$a" in
+          *:/etc/passwd:ro) cp "${a%:/etc/passwd:ro}" "$FAKE_STATE/inner.passwd" ;;
+        esac
+      done
       if [ -L "$FAKE_LOCK" ]; then
         printf 'held:%s\n' "$(readlink "$FAKE_LOCK")" > "$FAKE_STATE/inner.lock"
       else
         printf 'free\n' > "$FAKE_STATE/inner.lock"
       fi
       exit "${FAKE_INNER_RC:-0}"
+    fi
+    prev="" last=""
+    for a in "$@"; do prev="$last"; last="$a"; done
+    if [ "$prev" = cat ] && [ "$last" = /etc/passwd ]; then
+      printf 'passwd-read\n' >> "$FAKE_STATE/log"
+      printf 'daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n'
+      printf 'nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n'
+      if [ -n "${FAKE_PASSWD_EXTRA:-}" ]; then printf '%s\n' "$FAKE_PASSWD_EXTRA"; fi
+      exit "${FAKE_PASSWD_RC:-0}"
     fi
     printf 'go=go version go%s linux/arm64\n' "$FAKE_GO"
     printf 'golangci-lint=golangci-lint has version %s built with go1.25.5\n' "${FAKE_GL#v}"
@@ -187,6 +209,14 @@ echo "fake docker: unexpected argv: $*" >&2
 exit 99
 EOF
 chmod +x "$FAKEBIN/docker"
+# A pass-through `id` whose -un answer is scriptable (FAKE_UN), for i18e.
+REAL_ID="$(command -v id)"
+{
+  echo '#!/bin/sh'
+  echo 'if [ "$1" = -un ] && [ -n "${FAKE_UN+x}" ]; then printf "%s\n" "$FAKE_UN"; exit 0; fi'
+  printf 'exec "%s" "$@"\n' "$REAL_ID"
+} > "$FAKEBIN/id"
+chmod +x "$FAKEBIN/id"
 
 # --- fixture -----------------------------------------------------------------
 FX="$tmproot/fx"
@@ -321,7 +351,7 @@ assert_eq "i6b: lint --in-gate-image exits 0" 0 "$rc"
 assert_contains "i6b: inner command is scripts/test lint" "$argv" "|scripts/test|lint|"
 assert_eq "i6b: lint takes no lock" "free" "$(cat "$st/inner.lock" 2>/dev/null)"
 assert_contains "i6b: the default image is inspected" "$out" "ghcr.io/kuhlman-labs/fishhawk-gate:main resolved to"
-assert_eq "i7: a primary checkout adds no common-dir mount (4 mounts)" 4 \
+assert_eq "i7: a primary checkout adds no common-dir mount (5 mounts)" 5 \
   "$(grep -o '|-v|' "$argv" | wc -l | tr -d ' ')"
 
 WT="$tmproot/wt-outside"
@@ -333,7 +363,7 @@ argv="$st/inner.argv"
 assert_eq "i7: lint --in-gate-image from a linked worktree exits 0" 0 "$rc"
 assert_contains "i7: the worktree is mounted at its own path" "$argv" "|-v|$WT:$WT|"
 assert_contains "i7: the git common dir outside ROOT is mounted at its own path" "$argv" "|-v|$COMMON:$COMMON|"
-assert_eq "i7: exactly one extra mount (5 mounts)" 5 "$(grep -o '|-v|' "$argv" | wc -l | tr -d ' ')"
+assert_eq "i7: exactly one extra mount (6 mounts)" 6 "$(grep -o '|-v|' "$argv" | wc -l | tr -d ' ')"
 
 # --- i8: the container's exit status propagates, lock released ---------------
 FAKE_INNER_RC=7 st i8 "$FX" docker verify --in-gate-image
@@ -390,6 +420,46 @@ CASE_CACHE="$tmproot/afile/sub" st i15 "$FX" docker lint --in-gate-image
 assert_eq "i15: an uncreatable cache dir exits 1" 1 "$rc"
 assert_contains "i15: names FISHHAWK_GATE_CACHE_DIR" "$out" "set FISHHAWK_GATE_CACHE_DIR"
 assert_absent "i15: the inner command NEVER ran" "$st/inner.argv"
+
+# --- i18: the caller's uid gets a name inside the container -----------------
+# --user uid:gid alone leaves the uid nameless: whoami fails and test-helm-render
+# r9h's `$(whoami)` needle goes empty (the #3966 acceptance failure).
+ME_UID="$(id -u)"
+ME_GID="$(id -g)"
+ME_UN="$(id -un 2>/dev/null || true)"
+case "$ME_UN" in "" | -* | *[!A-Za-z0-9._-]*) ME_UN="fishhawk-gate" ;; esac
+pwdirs() { # <cache dir> -> the passwd.* scratch dirs left under it, if any
+  ls -d "$1"/passwd.* 2>/dev/null || true
+}
+CASE_CACHE="$tmproot/cache18" st i18 "$FX" docker verify --in-gate-image
+assert_eq "i18: verify --in-gate-image exits 0" 0 "$rc"
+assert_contains "i18: the image's /etc/passwd was read" "$st/log" "passwd-read"
+assert_contains "i18: a passwd file is mounted read-only over /etc/passwd" "$st/inner.argv" ":/etc/passwd:ro|"
+assert_contains "i18: the image's own entries are kept" "$st/inner.passwd" "daemon:x:1:1:"
+assert_contains "i18: the caller's uid:gid is appended under the login name" "$st/inner.passwd" \
+  "$ME_UN:x:$ME_UID:$ME_GID:fishhawk gate caller:/tmp:/bin/sh"
+
+FAKE_PASSWD_EXTRA="someone:x:$ME_UID:$ME_GID:someone:/home/someone:/bin/sh" \
+  CASE_CACHE="$tmproot/cache18b" st i18b "$FX" docker lint --in-gate-image
+assert_eq "i18b: lint --in-gate-image exits 0" 0 "$rc"
+assert_contains "i18b: the image's entry for the uid is kept" "$st/inner.passwd" "someone:x:$ME_UID:"
+assert_not_contains "i18b: no second entry is appended when the image already maps the uid" \
+  "$st/inner.passwd" "fishhawk gate caller"
+
+FAKE_PASSWD_RC=1 CASE_CACHE="$tmproot/cache18c" st i18c "$FX" docker verify --in-gate-image
+assert_eq "i18c: an unreadable image /etc/passwd exits 1" 1 "$rc"
+assert_contains "i18c: names the passwd read failure" "$out" "cannot read /etc/passwd from gate image"
+assert_absent "i18c: the inner command NEVER ran" "$st/inner.argv"
+assert_absent "i18c: the lock is released" "$LOCK"
+assert_eq "i18c: the scratch dir is removed on refusal" "" "$(pwdirs "$tmproot/cache18c")"
+
+assert_eq "i18d: the passwd scratch dir is removed after the run" "" "$(pwdirs "$tmproot/cache18")"
+
+FAKE_UN='ev:il' CASE_CACHE="$tmproot/cache18e" st i18e "$FX" docker lint --in-gate-image
+assert_eq "i18e: lint --in-gate-image exits 0" 0 "$rc"
+assert_contains "i18e: a login name carrying ':' falls back to fishhawk-gate" "$st/inner.passwd" \
+  "fishhawk-gate:x:$ME_UID:$ME_GID:fishhawk gate caller:/tmp:/bin/sh"
+assert_not_contains "i18e: the unsafe name never reaches the file" "$st/inner.passwd" "ev:il"
 
 # --- i9/i9b: verify --no-tests skips the test loop (lib-only) ----------------
 # drive_verify NAME ROOT VERIFY-ARGS... — every leg stubbed to a LEG: line,

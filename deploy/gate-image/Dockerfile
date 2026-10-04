@@ -18,8 +18,11 @@
 #                           (GOTOOLCHAIN=local below refuses a newer one).
 #   GOLANGCI_LINT_VERSION   EXACTLY the golangci-lint install.sh tag in every
 #                           .github/workflows file and scripts/test's hint.
-#   HELM_VERSION            the helm render gate's documented CI half
-#                           (deploy/helm/fishhawk/README.md, setup-helm v3.16.4).
+#   HELM_VERSION            exact vMAJOR.MINOR.PATCH, MAJOR >= 4: test-helm-render
+#                           r9 renders NOTES.txt with `helm install --dry-run`,
+#                           which Helm v3 (both --dry-run and --dry-run=client)
+#                           refuses without a reachable cluster, and this image
+#                           has none; Helm v4 renders it cluster-free.
 #   CHECK_JSONSCHEMA_VERSION the `check-jsonschema` docs/spec validator.
 # Static mode (a `scripts/test verify` leg) compares this file to the repo;
 # `scripts/check-gate-image --image REF` compares a BUILT image to this file.
@@ -58,7 +61,11 @@
 #
 # RUNTIME CONTRACT. No ENTRYPOINT (the runner passes --entrypoint '') and no
 # USER (callers pass --user uid:gid). Everything works as an arbitrary uid with
-# HOME=/tmp, matching runner/internal/gateiso's container env.
+# HOME=/tmp, matching runner/internal/gateiso's container env, EXCEPT name
+# lookup: an arbitrary uid has no /etc/passwd entry here, so `whoami` fails and
+# test-helm-render r9h cannot pass. `scripts/test --in-gate-image` therefore
+# mounts a passwd file mapping the caller's uid; the runner's container path
+# does not yet (#2137).
 
 ARG GO_VERSION=1.25.6
 
@@ -66,7 +73,7 @@ FROM golang:${GO_VERSION}-bookworm
 
 ARG TARGETARCH
 ARG GOLANGCI_LINT_VERSION=v2.8.0
-ARG HELM_VERSION=v3.16.4
+ARG HELM_VERSION=v4.2.4
 ARG CHECK_JSONSCHEMA_VERSION=0.38.0
 
 LABEL org.opencontainers.image.source="https://github.com/kuhlman-labs/fishhawk" \

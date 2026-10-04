@@ -949,11 +949,13 @@ jobs:
 
       # Pinned to an immutable version per AGENTS.md's run-time tooling
       # pinning rule: a floating tag lets a third-party release red-line
-      # main with no change on our side.
+      # main with no change on our side. Helm v4 is REQUIRED: r9's
+      # `helm install --dry-run` needs a reachable cluster on Helm v3, and
+      # this runner has none. Keep equal to deploy/gate-image's HELM_VERSION.
       - name: Install Helm
         uses: azure/setup-helm@v4
         with:
-          version: v3.16.4
+          version: v4.2.4
 
       - name: helm version
         run: helm version

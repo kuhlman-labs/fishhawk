@@ -35,6 +35,7 @@
 #   --platform w/o --image -> s14b     unreadable Dockerfile -> s13
 #   host docker absent -> d7 (RED on the MESSAGE only: with the guard gone,
 #   `docker run` exits 127 and the exec-failure guard still exits 1).
+#   helm v4 floor -> s15a              helm exact-version -> s15b
 # ---------------------------------------------------------------------------
 set -uo pipefail
 
@@ -102,7 +103,7 @@ ARG GO_VERSION=1.25.6
 FROM golang:${GO_VERSION}-bookworm
 ARG TARGETARCH
 ARG GOLANGCI_LINT_VERSION=v2.8.0
-ARG HELM_VERSION=v3.16.4
+ARG HELM_VERSION=v4.2.4
 ARG CHECK_JSONSCHEMA_VERSION=0.38.0
 RUN apt-get install -y --no-install-recommends zsh jq python3
 RUN curl -fsSLO "https://get.helm.sh/helm-${HELM_VERSION}-linux-${TARGETARCH}.tar.gz"
@@ -239,6 +240,22 @@ edit "$r/deploy/gate-image/Dockerfile" 's#^ARG HELM_VERSION=.*#ARG HELM_VERSION=
 run_static "$r"
 expect "s6e: an EMPTY ARG HELM_VERSION= default fails closed" 1 "no \`ARG HELM_VERSION=<version>\` default"
 
+# s15 — the Helm v4 floor (acceptance #3966): test-helm-render r9's
+# `helm install --dry-run` needs a reachable cluster on Helm v3, and the image
+# has none, so a v3 pin would red-line every in-image verify on r9.
+r="$(mkfix s15a)"
+edit "$r/deploy/gate-image/Dockerfile" 's#^ARG HELM_VERSION=.*#ARG HELM_VERSION=v3.16.4#'
+run_static "$r"
+expect "s15a: HELM_VERSION v3.16.4 (below the v4 floor) fails" 1 "deploy/gate-image/Dockerfile:8: HELM_VERSION v3.16.4 is below v4" "needs a reachable cluster on Helm v3"
+r="$(mkfix s15b)"
+edit "$r/deploy/gate-image/Dockerfile" 's#^ARG HELM_VERSION=.*#ARG HELM_VERSION=v4.2#'
+run_static "$r"
+expect "s15b: HELM_VERSION v4.2 is not exact" 1 "deploy/gate-image/Dockerfile:8: HELM_VERSION 'v4.2' is not an exact vMAJOR.MINOR.PATCH"
+r="$(mkfix s15c)"
+edit "$r/deploy/gate-image/Dockerfile" 's#^ARG HELM_VERSION=.*#ARG HELM_VERSION=v10.0.0#'
+run_static "$r"
+expect "s15c: a later major (v10.0.0) passes the floor (numeric, not lexical)" 0 "HELM_VERSION v10.0.0 (>= v4)"
+
 r="$(mkfix s7)"
 rm -rf "$r/.github" "$r/scripts"
 run_static "$r"
@@ -362,7 +379,7 @@ expect "s14b: --platform without --image exits 2" 2 "--platform requires --image
 
 GOOD_PROBE='go=go version go1.25.6 linux/arm64
 golangci-lint=golangci-lint has version 2.8.0 built with go1.25.5 from e2e40021 on 2026-01-07T21:29:47Z
-helm=v3.16.4+g7877b45
+helm=v4.2.4+g3900f43
 check-jsonschema=check-jsonschema, version 0.38.0
 docker=absent'
 GOOD_INSPECT='sha256:0c7eeb187563a2051ec0675d932d06f0999dc6aa04584f77ee80e36c0dfcad97 fishhawk-gate@sha256:0c7eeb187563a2051ec0675d932d06f0999dc6aa04584f77ee80e36c0dfcad97'
@@ -396,8 +413,8 @@ expect "d2 (precondition): pins bumped to v2.9.0 on BOTH sides pass static mode"
 run_dynamic d2 "$r2" "$GOOD_PROBE" 0 "$GOOD_INSPECT" 0 --image fishhawk-gate:test
 expect "d2: bump without rebuild — image still reports golangci-lint 2.8.0" 1 "golangci-lint reports 2.8.0 but deploy/gate-image/Dockerfile pins 2.9.0 — rebuild the image"
 
-run_dynamic d3 "$r" "${GOOD_PROBE/v3.16.4+/v3.16.3+}" 0 "$GOOD_INSPECT" 0 --image fishhawk-gate:test
-expect "d3: helm mismatch" 1 "helm reports v3.16.3 but deploy/gate-image/Dockerfile pins v3.16.4"
+run_dynamic d3 "$r" "${GOOD_PROBE/v4.2.4+/v4.2.3+}" 0 "$GOOD_INSPECT" 0 --image fishhawk-gate:test
+expect "d3: helm mismatch" 1 "helm reports v4.2.3 but deploy/gate-image/Dockerfile pins v4.2.4"
 
 run_dynamic d4 "$r" "${GOOD_PROBE/version 0.38.0/version 0.37.1}" 0 "$GOOD_INSPECT" 0 --image fishhawk-gate:test
 expect "d4: check-jsonschema mismatch" 1 "check-jsonschema reports 0.37.1 but deploy/gate-image/Dockerfile pins 0.38.0"
@@ -422,7 +439,7 @@ status=$?
 expect "d7: no docker on the host PATH fails closed naming docker" 1 "docker not found on PATH"
 
 run_dynamic d8 "$r" "$GOOD_PROBE" 0 "$GOOD_INSPECT" 0 --image fishhawk-gate:test --platform linux/arm64
-expect "d8: matching versions pass" 0 "ok go 1.25.6" "ok golangci-lint 2.8.0" "ok helm v3.16.4" "ok check-jsonschema 0.38.0" "ok docker absent" \
+expect "d8: matching versions pass" 0 "ok go 1.25.6" "ok golangci-lint 2.8.0" "ok helm v4.2.4" "ok check-jsonschema 0.38.0" "ok docker absent" \
   "ok image fishhawk-gate:test id=sha256:0c7eeb187563a2051ec0675d932d06f0999dc6aa04584f77ee80e36c0dfcad97 digests=fishhawk-gate@sha256:"
 argv="$(cat "$log")"
 first_run="$(awk '/^--- invocation/{n++} n==1' "$log")"

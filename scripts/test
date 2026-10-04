@@ -2149,7 +2149,12 @@ cmd_verify() {
 #      a stale locally cached :main refuses instead of producing results that
 #      look CI-identical. The inner command then runs on that same ID, never on
 #      the tag, so the image checked is the image run.
-#   5. docker run the inner command and exit with its status.
+#   5. read the image's /etc/passwd and, when no entry maps the caller's uid,
+#      append one (the host login name, home /tmp) and mount the result
+#      read-only over /etc/passwd. --user uid:gid alone leaves the uid
+#      nameless, so whoami fails and test-helm-render r9h's `$(whoami)` probe
+#      degrades to an empty needle that matches every argv (#3966 acceptance).
+#   6. docker run the inner command and exit with its status.
 #
 # The variable is FISHHAWK_TEST_GATE_IMAGE, deliberately NOT FISHHAWK_GATE_IMAGE:
 # exporting the latter in a shell that spawns the runner switches its gate onto
@@ -2199,9 +2204,31 @@ _gate_image_common_dir() {
   printf '%s' "$common"
 }
 
+# _gate_image_passwd <id> <file>: write <file> as image <id>'s /etc/passwd plus,
+# when no entry there maps the caller's uid, one that does. The name is the host
+# login name, or fishhawk-gate when that is empty or not a plain
+# [A-Za-z0-9._-] word (a `:` or newline would corrupt the file). Returns
+# non-zero when the image's /etc/passwd cannot be read.
+_gate_image_passwd() {
+  local id="$1" file="$2" uid gid name
+  uid="$(id -u)"
+  gid="$(id -g)"
+  if ! docker run --rm --entrypoint '' "$id" cat /etc/passwd > "$file" 2>/dev/null; then
+    return 1
+  fi
+  if awk -F: -v u="$uid" '$3 == u { found = 1 } END { exit !found }' "$file"; then
+    return 0
+  fi
+  name="$(id -un 2>/dev/null || true)"
+  case "$name" in
+    "" | -* | *[!A-Za-z0-9._-]*) name="fishhawk-gate" ;;
+  esac
+  printf '%s:x:%s:%s:fishhawk gate caller:/tmp:/bin/sh\n' "$name" "$uid" "$gid" >> "$file"
+}
+
 # cmd_in_gate_image <lint|verify>: see the block comment above.
 cmd_in_gate_image() {
-  local mode="$1" image id cache common rc=0
+  local mode="$1" image id cache common pwdir rc=0
   local inner=() args=()
   if ! command -v docker >/dev/null 2>&1; then
     cat >&2 <<'EOF'
@@ -2242,7 +2269,18 @@ EOF
     echo "scripts/test: cannot create the gate-image cache dirs under $cache — set FISHHAWK_GATE_CACHE_DIR to a writable directory" >&2
     exit 1
   fi
-  args=(run --rm --entrypoint '' --user "$(id -u):$(id -g)" -v "$ROOT:$ROOT" -w "$ROOT")
+  # Under the cache dir, not $TMPDIR: it must be a path the docker daemon can
+  # bind-mount, which the cache dir already has to be.
+  if ! pwdir="$(mktemp -d "$cache/passwd.XXXXXX")"; then
+    echo "scripts/test: cannot create a passwd scratch dir under $cache — set FISHHAWK_GATE_CACHE_DIR to a writable directory" >&2
+    exit 1
+  fi
+  if ! _gate_image_passwd "$id" "$pwdir/passwd"; then
+    rm -rf "$pwdir"
+    echo "scripts/test: cannot read /etc/passwd from gate image $id to give uid $(id -u) a name inside it — refusing to run (fail closed)" >&2
+    exit 1
+  fi
+  args=(run --rm --entrypoint '' --user "$(id -u):$(id -g)" -v "$pwdir/passwd:/etc/passwd:ro" -v "$ROOT:$ROOT" -w "$ROOT")
   common="$(_gate_image_common_dir)"
   if [ -n "$common" ]; then
     args+=(-v "$common:$common")
@@ -2269,6 +2307,7 @@ EOF
   )
   echo "scripts/test: running '${inner[*]}' in $id (network on, checkout mounted read-write: CI parity, not isolation)" >&2
   docker "${args[@]}" || rc=$?
+  rm -rf "$pwdir"
   exit "$rc"
 }
 
