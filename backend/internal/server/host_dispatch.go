@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/concurrency"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/runnerbackend"
 )
@@ -35,10 +36,15 @@ const hostDispatchAnchorSource = "host_dispatch"
 // own re-dispatch, and a wave-0 child declaring no dependencies — and those
 // callers keep whatever base they had. The server is the authority on the
 // per-wave re-base; the client derives nothing.
+//
+// Concurrency (#3964 / ADR-087) is present only on a GROUPED admission (the
+// stage took a concurrency slot): its group, limit, and whether/how long it
+// queued first. Omitted on the ungrouped, nil-store and idempotent arms.
 type hostDispatchResponse struct {
-	Transitioned bool   `json:"transitioned"`
-	StageState   string `json:"stage_state"`
-	BaseBranch   string `json:"base_branch,omitempty"`
+	Transitioned bool                     `json:"transitioned"`
+	StageState   string                   `json:"stage_state"`
+	BaseBranch   string                   `json:"base_branch,omitempty"`
+	Concurrency  *hostDispatchConcurrency `json:"concurrency,omitempty"`
 }
 
 // handleHostDispatchStage implements
@@ -56,6 +62,12 @@ type hostDispatchResponse struct {
 //   - pending → dispatched: the first plan-stage spawn, which today sits at
 //     'pending' until trace time (the local first-stage semantics, #1030) —
 //     marking it here stamps the spawn signal at spawn time.
+//
+// Concurrency groups (#3964 / ADR-087): with Config.Concurrency wired, a
+// GROUPED stage (every local implement stage by default, or a spec-declared
+// `concurrency` group) takes that CAS only when its group has a free slot;
+// otherwise it is QUEUED — 409 concurrency_slot_queued, the stage left
+// untouched at awaiting_host_dispatch. See stage_concurrency.go.
 //
 // Idempotent: a stage already 'dispatched' returns 200 {transitioned:false} — a
 // spawned runner died and the operator is re-dispatching, which the caller
@@ -124,6 +136,18 @@ func (s *Server) handleHostDispatchStage(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// Optional {"host"} body (#3964): the client's host label keys the default
+	// concurrency group. Parsed only when a slot store is wired (a nil store
+	// keeps today's body-ignoring marker byte-identical), after the auth ladder
+	// and the id parse, and before any stage read — a 400 leaves the stage
+	// untouched.
+	host := concurrency.UnknownHost
+	if s.cfg.Concurrency != nil {
+		if host, ok = s.parseHostDispatchBody(w, r); !ok {
+			return
+		}
+	}
+
 	// Fence against a concurrent acceptance-admission short-circuit walk (#1936).
 	// When an orchestrator is wired, acquire the SAME per-stage admission lock
 	// TryShortCircuitAcceptance holds across its read -> admissibility-check -> walk,
@@ -139,6 +163,15 @@ func (s *Server) handleHostDispatchStage(w http.ResponseWriter, r *http.Request)
 	// Held via defer through the response write — the response touches no stage
 	// state, so the extra hold is harmless, while defer guarantees no early-return
 	// path leaks the lock and wedges the stage forever.
+	//
+	// Pool use (#3964 approval condition 4): this lock is a process-local
+	// sync.Mutex — it holds NO pooled connection and NO transaction. Every read
+	// below borrows and returns its own connection, and a grouped admission
+	// (concurrency.Store.Admit) runs as ONE transaction on ONE connection that
+	// never waits on another admission (a group try-lock miss answers queued).
+	// Full lock order: this admission mutex → the group advisory lock → the
+	// stage row (FOR UPDATE) → the run row (only on paths that already take
+	// stage-then-run; Admit itself never locks a run row).
 	if s.cfg.Orchestrator != nil {
 		unlock := s.cfg.Orchestrator.LockStageAdmission(stageID)
 		defer unlock()
@@ -283,11 +316,30 @@ func (s *Server) handleHostDispatchStage(w http.ResponseWriter, r *http.Request)
 	// and this call refuses atomically with StageStateChangedError rather than
 	// being stomped; we re-classify below. In-memory fakes without the
 	// capability fall back to the plain table-validated TransitionStage.
+	//
+	// Concurrency groups (#3964 / ADR-087): when a slot store is wired and the
+	// stage resolves to a group, the bare CAS is replaced by Store.Admit, which
+	// performs the SAME pinned CAS inside its admission transaction when a slot
+	// is free, or commits a FIFO queue row and leaves the stage untouched when
+	// it is not (409 concurrency_slot_queued). Its drift refusal is the same
+	// StageStateChangedError, reclassified below exactly as the bare CAS's.
 	from := stage.State
 	var updated *run.Stage
-	if cas, ok := s.cfg.RunRepo.(run.StageCASTransitioner); ok {
+	var slot *hostDispatchConcurrency
+	group, limit, grouped := "", 0, false
+	if s.cfg.Concurrency != nil {
+		group, limit, grouped = s.resolveStageConcurrency(r.Context(), runRow, stage, host)
+	}
+	switch cas, isCAS := s.cfg.RunRepo.(run.StageCASTransitioner); {
+	case grouped:
+		var queued bool
+		updated, slot, queued, err = s.admitGroupedStage(w, r, stage, group, limit, host)
+		if queued {
+			return
+		}
+	case isCAS:
 		updated, err = cas.TransitionStageFrom(r.Context(), stageID, from, run.StageStateDispatched, nil)
-	} else {
+	default:
 		updated, err = s.cfg.RunRepo.TransitionStage(r.Context(), stageID, run.StageStateDispatched, nil)
 	}
 	if err != nil {
@@ -349,6 +401,7 @@ func (s *Server) handleHostDispatchStage(w http.ResponseWriter, r *http.Request)
 		Transitioned: true,
 		StageState:   string(updated.State),
 		BaseBranch:   baseBranch,
+		Concurrency:  slot,
 	})
 }
 
