@@ -71,6 +71,16 @@ type gateViewResponse struct {
 	// round has since superseded it, or the read fails. Same best-effort read as
 	// ReviewDiffTruncated.
 	ReviewHeadMismatch *gateViewReviewHeadMismatch `json:"review_head_mismatch,omitempty"`
+	// GateIsolation is which ADR-063 isolation path the run's gates ran under
+	// (E51.2 / #2135), distilled from the gate_isolation_recorded rows: the
+	// newest row, plus worst_class / worst_stage_id naming the most severe
+	// class recorded on ANY stage so an earlier fallback or refusal is not
+	// masked by a later container stage. Run-level — the stage_kind filter does
+	// not apply. Omitted (nil) when no row was recorded (an older runner, or no
+	// gate reached the runner's exec seam); omitted with a
+	// gate_isolation_recorded history_gaps entry when the read or a decode
+	// fails. See gateIsolationForRun.
+	GateIsolation *gateViewGateIsolation `json:"gate_isolation,omitempty"`
 	// Captain is ADR-083 rule 4's non-captain approval note (E76.3 / #3766):
 	// the repository's current captain and every human approver on this run
 	// who is not that captain. It is INFORMATIONAL — an approval by someone
@@ -729,6 +739,10 @@ func (s *Server) buildGateView(ctx context.Context, runID uuid.UUID, stageKind s
 	// gate view answers "did the open review judge the tree the PR carries" in
 	// the one call. Omitted (nil) when no un-superseded mismatch was recorded.
 	resp.ReviewHeadMismatch = s.reviewHeadMismatchForRun(ctx, runID)
+	// Gate-isolation surface (#2135): which isolation path the run's gates ran
+	// under, without reading runner logs. Degrades to nil plus a history_gaps
+	// entry on a read or decode failure.
+	resp.GateIsolation = s.gateIsolationForRun(ctx, runID, &resp)
 	// Crew-consult surface (E77.8 / #3742): what this run ASKED and what came
 	// back, so the captain reads the consult beside the gate it shaped. Reads
 	// only existing chain and derived rows; degrades to an empty array plus a
