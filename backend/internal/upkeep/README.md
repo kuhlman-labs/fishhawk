@@ -4,12 +4,15 @@ Pure primitives of the upkeep scan (E79 / #3726): the hidden finding marker and
 the open-issue dedupe an `upkeep_report_v1` ingest runs over its proposed
 issues (#3921), and the two deterministic evidence detectors the scan prompt is
 built from — `DetectPinDrift` and `AggregateFlakes` (#3922). #3924 (apply)
-consumes the duplicate marks.
+consumes the duplicate marks. #3750 adds the `advisory` source's Dependabot
+coverage matcher (`MarkCovered`) and its server-rendered filing helpers
+(`RenderAdvisoryTitle`, `RenderAdvisoryFacts`) in `advisory.go`.
 
 The package imports no forge client, no `workmgmt`, no server package, no
 `bundle` and not `backend/internal/plan`'s report types. Its inputs are its own
-`Proposal`, a path → content map and `FlakeStage`s; the server adapts a
-validated report, the files it read and the gate evidence it read into them.
+`Proposal`, a path → content map, `FlakeStage`s, and `AdvisoryProposal` /
+`PullRequest` / `AdvisoryFacts`; the server adapts a validated report, the files
+it read, the gate evidence it read and a forge pull-request listing into them.
 Nothing here reads, files, closes, comments on or relabels anything.
 
 ## Finding marker
@@ -318,6 +321,122 @@ instructs the RATIFIED fallback: the repository's issues index URL
 `summary`. It satisfies the schema (`url` is a URI, `id` is non-empty) but is a
 convention, not a ticket. Pinned by `TestUpkeepFacts_RoundTripThroughIngest`,
 which ingests a report carrying it.
+
+## Dependabot coverage and advisory filing (#3750)
+
+`advisory.go`. An advisory finding an open Dependabot pull request already
+fixes is MARKED covered at ingest and skipped at apply; an approved advisory
+finding that is not covered is filed from structured fields only. The server
+adapter (`server/upkeep_coverage.go`) feeds it `githubclient.ListOpenPullRequests`
+and the manifest directories from `plan.UpkeepAdvisoryManifestDirs`.
+
+### `MarkCovered(advisories, prs) []Covered`
+
+A finding is covered iff ALL hold:
+
+1. it has a fixed version (`FixedVersion != ""`; a "no fix" advisory is never
+   covered);
+2. it names at least one manifest directory — with none, the every-directory
+   rule would be vacuously true;
+3. for EVERY directory, some pull request (input order, first wins) has
+   `Author == "dependabot[bot]"` (the REST `user.login`), a head ref whose
+   ecosystem equals the finding's (`DependabotEcosystem`:
+   `dependabot/go_modules/` → `go`, `dependabot/npm_and_yarn/` → `npm`, anything
+   else → unknown, never covers), and a bump of the same package in that exact
+   directory to a version `VersionAtLeast` reports comparable and at least the
+   fixed version.
+
+- Output is in advisory input order and never nil. `Covered` JSON (the
+  `upkeep_report_recorded` payload's `covered` entry shape): `finding_id`,
+  `package`, `pulls: [{number, url (omitempty), directory, bumps_to}]`, one pull
+  per directory in the finding's directory order.
+- Directories use the manifest form: `.` for the repository root, else a slash
+  path (`backend`, `site/docs`). Dependabot's `/backend` normalizes to `backend`
+  and `/` to `.`.
+
+### `DependabotBumps(pr) []Bump`
+
+Grounded in this repository's real pull requests, not a documented contract
+(#3823, #3825, #3820). The title is read after any commit-style prefix
+(`deps(backend)(deps): `) or `[Security] ` tag, case-insensitively.
+
+| Title shape | Bumps | Directory |
+|---|---|---|
+| `bump <pkg> from <a> to <b> in /<dir>` | that one | `<dir>` |
+| `bump <pkg> from <a> to <b>` (no `in`) | that one | unknown |
+| `bump the <g> group in /<dir> with N updates`, `bump <a> and <b> in /<dir>` | one per body line `` Updates `<pkg>` from <a> to <b> `` or `Bumps [<pkg>](<url>) from <a> to <b>.` | `<dir>` |
+| `bump the <g> group across N directories with M updates` (even N = 1) | one per body line | unknown |
+| anything not starting `bump ` | none | — |
+
+An unknown directory never equals a manifest directory, so it never covers.
+
+### `VersionAtLeast(have, want) (atLeast, comparable bool)`
+
+Semver §11 precedence: one leading `v` trimmed, `MAJOR.MINOR.PATCH` numeric
+without leading zeros, prerelease identifiers dot-separated (numeric ones
+compared numerically, numeric below alphanumeric, the shorter set lower, a
+release above its own prereleases), build metadata ignored. **Go
+pseudo-versions are comparable** — all three forms (`vX.0.0-<ts>-<hash>`,
+`vX.Y.Z-pre.0.<ts>-<hash>`, `vX.Y.(Z+1)-0.<ts>-<hash>`) are valid semver
+prereleases, so `v0.23.1-0.<ts>-<hash>` reaches a `v0.23.0` fix and
+`v0.23.0-0.<ts>-<hash>` does not. Anything else — a range (`^1.2.3`,
+`>=1.2.3`), a partial version, an empty string, a leading zero, an empty or
+non-`[0-9A-Za-z-]` identifier — is `comparable=false`, and `MarkCovered` treats
+it as NOT covered.
+
+### Filing helpers
+
+- `RenderAdvisoryTitle(f)` → `<primary id>: <package> <version> (<severity>
+  severity)`, cut at GitHub's 256-character title limit.
+- `RenderAdvisoryFacts(f)` → a `### Advisory facts (server-rendered)` block with
+  one line per field: advisory ids, ecosystem, package, in-use version, fixed
+  version (`Fixed version: no fix published` when `""`), reachability, severity
+  and the cited manifests. It takes no call path and no prose.
+- Both withhold a value that is not a plain token for its field
+  (`(withheld: not a plain token)`), and the body renders each value as an
+  inline code span. The token charsets exclude whitespace and the backtick, so
+  a span cannot be broken out of and markdown, mentions and issue references
+  inside one are inert: no free text reaches the tracker through a structured
+  field (`version` and `fixed_version` carry no schema charset of their own).
+- `CallPathDisclosure(body, frames)` is DEFENSE IN DEPTH only: the apply files
+  server-rendered advisory titles and bodies, so agent prose never reaches the
+  tracker. It reports the first caller-frame token (frames at index >= 1; index
+  0 is the public vulnerable symbol) found in `body`: a non-empty filename,
+  `Package.Function`, or `Receiver.Function` with a leading `*` trimmed. A
+  case-sensitive substring match, so a paraphrase evades it.
+
+### Conservative residuals (fail toward filing)
+
+Each leaves a real fix uncovered, so the finding is proposed and, if approved,
+filed even though a Dependabot pull request would fix it:
+
+- **Multi-directory groups.** An `across N directories` group names no single
+  directory, so none of its bumps covers.
+- **Root without `in /`.** A single-dependency title naming no directory is
+  unknown, not assumed to be the root.
+- **Unparseable versions.** Ranges and malformed versions never compare.
+- **Unknown ecosystems and shapes.** A head ref outside `go_modules` /
+  `npm_and_yarn`, a title or body Dependabot reshapes, or a pull request past
+  the listing cap (`truncated`) is not read as covering.
+
+### False-cover risk (the unsafe direction)
+
+A covered finding is NOT filed. These cases suppress a filing for a dependency
+that stays vulnerable somewhere:
+
+- **Under-cited manifests.** Covered marks are only as complete as the agent's
+  manifest citations. A finding that cites `backend/go.mod` but not
+  `runner/go.mod`, where the module also appears, is covered by a `/backend`
+  pull request alone, and the `runner` copy is never filed. The prompt's merge
+  rule (cite EVERY manifest where the module appears) is the only control; the
+  server cannot see a manifest the agent did not cite.
+- **Agent-asserted fixed version.** A fixed version stated lower than the real
+  fix lets a too-low bump cover.
+- **Proposed, not merged.** Covered means an open pull request proposes the
+  fix, not that it landed. While it stays open, every scan re-proposes and
+  re-skips the finding. Coverage is a snapshot at ingest: a pull request closed
+  between ingest and the gate still suppresses that filing (the next scan
+  re-proposes it).
 
 ## Residuals
 
