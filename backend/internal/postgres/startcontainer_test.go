@@ -4,12 +4,19 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/testcontainers/testcontainers-go"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/postgres"
 )
 
 // These tests pin the #3122 raw-container leak fix WITHOUT Docker. They drive
@@ -205,4 +212,204 @@ func TestStartContainerWith_SwallowsTerminateError(t *testing.T) {
 	if fc.calls() != 1 {
 		t.Errorf("Terminate called %d times, want 1", fc.calls())
 	}
+}
+
+// --- #2137: raw databases on a runner-provided server ---
+
+func envMap(kv map[string]string) func(string) string {
+	return func(k string) string { return kv[k] }
+}
+
+// TestStartContainer_GateContainerWithoutURLFatals: inside the gate container
+// with no provisioned server, rawDBSource Fatalf's naming the runner remedy and
+// never attempts the container start (no daemon is reachable in there).
+func TestStartContainer_GateContainerWithoutURLFatals(t *testing.T) {
+	f := &fakeFataler{}
+	started := false
+	got := rawDBSource(f, noopCleanup, envMap(map[string]string{gateContainerEnv: "1"}),
+		func() string { started = true; return "postgres://container" })
+	if started {
+		t.Error("container start was attempted inside the gate container")
+	}
+	if !f.fatalfCalled || f.skipfCalled {
+		t.Fatalf("fatalf=%v skipf=%v, want a Fatalf", f.fatalfCalled, f.skipfCalled)
+	}
+	if !strings.Contains(f.message(), "FISHHAWK_GATE_SERVICES=postgres") {
+		t.Errorf("fatal message %q should name the runner remedy", f.message())
+	}
+	if got != "" {
+		t.Errorf("rawDBSource = %q, want empty", got)
+	}
+
+	// FISHHAWK_SKIP_INTEGRATION keeps precedence: skip, still no start.
+	sf := &fakeFataler{}
+	rawDBSource(sf, noopCleanup, envMap(map[string]string{gateContainerEnv: "1", "FISHHAWK_SKIP_INTEGRATION": "1"}),
+		func() string { started = true; return "" })
+	if !sf.skipfCalled || sf.fatalfCalled || started {
+		t.Errorf("SKIP_INTEGRATION in the gate container: skipf=%v fatalf=%v started=%v, want a skip and no start", sf.skipfCalled, sf.fatalfCalled, started)
+	}
+}
+
+// TestRawDBSource_NoEnvUsesContainer pins the unchanged default arm.
+func TestRawDBSource_NoEnvUsesContainer(t *testing.T) {
+	f := &fakeFataler{}
+	if got := rawDBSource(f, noopCleanup, envMap(nil), func() string { return "postgres://container" }); got != "postgres://container" {
+		t.Errorf("rawDBSource with no env = %q, want the container URL", got)
+	}
+	if f.fatalfCalled || f.skipfCalled {
+		t.Errorf("unexpected terminal call: %q", f.message())
+	}
+}
+
+// TestRawDBSource_ExternalUnreachableFatalsNeverSkips: a provided server that
+// cannot be reached fails closed (Fatalf), never skips, and never falls back to
+// the container start.
+func TestRawDBSource_ExternalUnreachableFatalsNeverSkips(t *testing.T) {
+	f := &fakeFataler{}
+	dead := "postgres://fishhawk:fishhawk@/fishhawk?host=" + t.TempDir() + "&sslmode=disable&connect_timeout=2"
+	started := false
+	rawDBSource(f, func(func()) { t.Error("no drop may be registered when create never happened") },
+		envMap(map[string]string{externalPGURLEnv: dead}),
+		func() string { started = true; return "postgres://container" })
+	if started {
+		t.Error("fell back to the container start although FISHHAWK_TEST_PG_URL is set")
+	}
+	if f.skipfCalled || !f.fatalfCalled {
+		t.Fatalf("skipf=%v fatalf=%v, want a Fatalf (a promised server must fail closed)", f.skipfCalled, f.fatalfCalled)
+	}
+	if !strings.Contains(f.message(), externalPGURLEnv) {
+		t.Errorf("fatal message %q should name %s", f.message(), externalPGURLEnv)
+	}
+}
+
+// TestRetryObjectInUse: 55006 is retried, the cap gives up, anything else
+// returns immediately.
+func TestRetryObjectInUse(t *testing.T) {
+	inUse := &pgconn.PgError{Code: "55006"}
+	calls := 0
+	if err := retryObjectInUse(5, time.Millisecond, func() error {
+		calls++
+		if calls < 3 {
+			return inUse
+		}
+		return nil
+	}); err != nil || calls != 3 {
+		t.Errorf("transient 55006: err=%v calls=%d, want nil after 3", err, calls)
+	}
+	calls = 0
+	if err := retryObjectInUse(3, time.Millisecond, func() error { calls++; return inUse }); err == nil || calls != 3 {
+		t.Errorf("persistent 55006: err=%v calls=%d, want an error after the 3-attempt cap", err, calls)
+	}
+	calls = 0
+	other := &pgconn.PgError{Code: "42501"}
+	if err := retryObjectInUse(5, time.Millisecond, func() error { calls++; return other }); !errors.Is(err, other) || calls != 1 {
+		t.Errorf("non-55006: err=%v calls=%d, want the error after 1 call", err, calls)
+	}
+}
+
+// TestStartContainer_ExternalURLCreatesFreshRawDB drives the REAL startContainer
+// through FISHHAWK_TEST_PG_URL. Off the gate container it stands the server up
+// itself and connects as a NOSUPERUSER CREATEDB-only login role — the least-
+// privilege role the runner's service hands the gate (#2137 approval condition
+// 1) — so it also proves the raw-DB flow plus golang-migrate over pgx work
+// under that role, and that a superuser-only statement is refused from its
+// DSN. Inside the gate container it uses the provided URL as-is.
+func TestStartContainer_ExternalURLCreatesFreshRawDB(t *testing.T) {
+	server := os.Getenv(externalPGURLEnv)
+	leastPrivilege := false
+	if server == "" {
+		server = createDBOnlyRole(t, startContainer(t))
+		leastPrivilege = true
+	}
+
+	var names []string
+	t.Run("two calls give distinct empty databases", func(t *testing.T) {
+		t.Setenv(externalPGURLEnv, server)
+		a, b := startContainer(t), startContainer(t)
+		if a == b {
+			t.Fatalf("two startContainer calls returned the same URL %q", a)
+		}
+		ctx := context.Background()
+		for _, dsn := range []string{a, b} {
+			cfg, err := pgx.ParseConfig(dsn)
+			if err != nil {
+				t.Fatalf("parse raw db url: %v", err)
+			}
+			names = append(names, cfg.Database)
+			if !strings.HasPrefix(cfg.Database, "fh_raw_") {
+				t.Errorf("raw database %q, want an fh_raw_ name", cfg.Database)
+			}
+			conn, err := pgx.Connect(ctx, dsn)
+			if err != nil {
+				t.Fatalf("connect raw db: %v", err)
+			}
+			var reg *string
+			err = conn.QueryRow(ctx, "SELECT to_regclass('schema_migrations')::text").Scan(&reg)
+			_ = conn.Close(ctx)
+			if err != nil {
+				t.Fatalf("probe schema_migrations: %v", err)
+			}
+			if reg != nil {
+				t.Errorf("raw database %q already has schema_migrations; want an EMPTY database", cfg.Database)
+			}
+		}
+		// pgx + golang-migrate over the provided server as the gate role.
+		if err := postgres.MigrateUp(a); err != nil {
+			t.Fatalf("MigrateUp on the raw database (least privilege=%v): %v", leastPrivilege, err)
+		}
+		if leastPrivilege {
+			conn, err := pgx.Connect(ctx, server)
+			if err != nil {
+				t.Fatalf("connect as the gate role: %v", err)
+			}
+			_, err = conn.Exec(ctx, "CREATE ROLE fh_should_not_exist")
+			_ = conn.Close(ctx)
+			var pg *pgconn.PgError
+			if !errors.As(err, &pg) || pg.Code != "42501" {
+				t.Errorf("CREATE ROLE from the gate role's DSN = %v, want SQLSTATE 42501 (insufficient_privilege)", err)
+			}
+		}
+	})
+
+	// The subtest's cleanups have run: both raw databases are dropped.
+	ctx := context.Background()
+	conn, err := pgx.Connect(ctx, server)
+	if err != nil {
+		t.Fatalf("connect server: %v", err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	for _, n := range names {
+		var exists bool
+		if err := conn.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)", n).Scan(&exists); err != nil {
+			t.Fatalf("probe pg_database: %v", err)
+		}
+		if exists {
+			t.Errorf("raw database %q survived its cleanup", n)
+		}
+	}
+}
+
+// createDBOnlyRole creates a NOSUPERUSER CREATEDB-only login role on the server
+// behind admin and returns admin's URL re-pointed at that role.
+func createDBOnlyRole(t *testing.T, admin string) string {
+	t.Helper()
+	ctx := context.Background()
+	conn, err := pgx.Connect(ctx, admin)
+	if err != nil {
+		t.Fatalf("connect admin: %v", err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	role := "fh_gate_" + strings.ReplaceAll(uuid.NewString(), "-", "")[:12]
+	pass := strings.ReplaceAll(uuid.NewString(), "-", "")
+	if _, err := conn.Exec(ctx, fmt.Sprintf(
+		"CREATE ROLE %s LOGIN PASSWORD '%s' NOSUPERUSER CREATEDB NOCREATEROLE NOBYPASSRLS",
+		pgx.Identifier{role}.Sanitize(), pass)); err != nil {
+		t.Fatalf("create least-privilege role: %v", err)
+	}
+	u, err := url.Parse(admin)
+	if err != nil {
+		t.Fatalf("parse admin url: %v", err)
+	}
+	u.User = url.UserPassword(role, pass)
+	return u.String()
 }
