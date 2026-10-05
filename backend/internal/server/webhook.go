@@ -147,9 +147,11 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	// `pull_request.closed` with merged=true is the review-stage
 	// success signal per ADR-018 (#311 / #312). Branch protection
 	// already gated the merge — Fishhawk just records who merged
-	// and transitions the review stage. Closed-without-merging
-	// leaves the run in awaiting_approval; operator can manually
-	// intervene. Best-effort.
+	// and transitions the review stage. Closed WITHOUT merging
+	// CANCELS the run (#316 / ADR-018: change not accepted is
+	// terminal; see resolveReviewStageOnMerge), and a later reopen
+	// does not undo it, so never close a run's PR to re-trigger CI
+	// (#4008). Best-effort.
 	if ev.Type == "pull_request" && ev.Action == "closed" {
 		s.handlePullRequestClosed(r.Context(), ev.RawBody)
 	}
