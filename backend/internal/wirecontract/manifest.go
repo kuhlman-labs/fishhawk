@@ -71,6 +71,10 @@ const (
 	reapFailureGo          = "backend/internal/server/reap_failure.go"
 	uploadFile             = "runner/internal/upload/upload.go"
 	scenarioFile           = "runner/internal/scenario/scenario.go"
+	// runnerGateEvidenceGo / bundleGo hold the gate_isolation evidence pair
+	// (#2135); only that flat struct carries the marker in either file.
+	runnerGateEvidenceGo = "runner/cmd/fishhawk-runner/gateevidence.go"
+	bundleGo             = "backend/internal/bundle/bundle.go"
 )
 
 // SeedManifest is the repo's cross-module wire contract manifest. Verified
@@ -227,6 +231,18 @@ func SeedManifest() Manifest {
 				Consumer: Endpoint{File: reapFailureGo, Type: "reapFailureRequest"},
 				Mode:     ModeExact,
 			},
+			{
+				// The runner's recorded gate-isolation selection (#2135), folded
+				// into gate_evidence and decoded by the backend for the
+				// gate_isolation_recorded audit row. ModeExact: both sides are
+				// flat leaves. The member bytes are ALSO pinned for all three
+				// classes by the shared golden
+				// testdata/wire/gate_isolation_evidence.json.
+				Name: "gate_isolation_evidence", Anchor: "#2135",
+				Emitter:  Endpoint{File: runnerGateEvidenceGo, Type: "gateIsolationEvidence"},
+				Consumer: Endpoint{File: bundleGo, Type: "GateIsolationEvidence"},
+				Mode:     ModeExact,
+			},
 		},
 		CoveredFiles: []string{
 			promptFile,
@@ -238,6 +254,8 @@ func SeedManifest() Manifest {
 			reapFailureGo,
 			uploadFile,
 			scenarioFile,
+			runnerGateEvidenceGo,
+			bundleGo,
 		},
 		UnpairedExemptions: []Endpoint{
 			// ShipPlanArgs carries the marker on its Reachability field, but the

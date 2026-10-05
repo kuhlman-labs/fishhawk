@@ -46,6 +46,32 @@ const (
 	PathRefused      Path = "refused"
 )
 
+// Class is the coarse isolation class a Path belongs to (#2135): the
+// container|fallback|refused vocabulary the gate evidence and the gate view
+// carry beside the precise Path.
+type Class string
+
+// Isolation classes. ClassFallback covers both host paths (clone-sandbox and
+// clone): the gate ran, but outside a container.
+const (
+	ClassContainer Class = "container"
+	ClassFallback  Class = "fallback"
+	ClassRefused   Class = "refused"
+)
+
+// Class maps the path to its isolation class; an unknown path maps to "".
+func (p Path) Class() Class {
+	switch p {
+	case PathContainer:
+		return ClassContainer
+	case PathCloneSandbox, PathClone:
+		return ClassFallback
+	case PathRefused:
+		return ClassRefused
+	}
+	return ""
+}
+
 // ParseMode parses an isolation mode; empty selects ModeAuto. The error names
 // the valid values.
 func ParseMode(s string) (Mode, error) {
@@ -112,7 +138,8 @@ type Inputs struct {
 	Sandbox SandboxProbe
 }
 
-// Selection is the recorded decision (the struct #2135 evidence carries).
+// Selection is the recorded decision; the runner flattens it into the #2135
+// gate_isolation evidence member.
 type Selection struct {
 	Path    Path         `json:"path"`
 	Mode    Mode         `json:"mode"`
@@ -121,6 +148,11 @@ type Selection struct {
 	Runtime Runtime      `json:"runtime"`
 	Sandbox SandboxProbe `json:"sandbox"`
 	Reason  string       `json:"reason"`
+	// ContainerUnavailable names why the container path was not taken, on
+	// EVERY non-container outcome (#2135): what the container path lacked
+	// (containerMissing) when it was considered, or "not attempted: ..." when
+	// the mode never considers it. Empty on the container path.
+	ContainerUnavailable string `json:"container_unavailable,omitempty"`
 }
 
 // Refused reports whether the selection forbids executing the gate.
@@ -150,6 +182,7 @@ func Select(in Inputs) Selection {
 			sel.Reason = "mode=container: " + in.Runtime.Reason
 			return sel
 		}
+		sel.ContainerUnavailable = missing
 		sel.Reason = "mode=container but the container path is unavailable: " + missing
 		return sel
 	case ModeAuto:
@@ -158,6 +191,7 @@ func Select(in Inputs) Selection {
 			sel.Reason = "mode=auto: container path available (" + in.Runtime.Reason + ")"
 			return sel
 		}
+		sel.ContainerUnavailable = missing
 		if in.Profile == ProfileHosted {
 			sel.Reason = "profile=hosted refuses every non-container path and the container path is unavailable: " + missing
 			return sel
@@ -171,6 +205,7 @@ func Select(in Inputs) Selection {
 		sel.Reason = "mode=auto: container path unavailable (" + missing + "); sandbox unavailable (" + in.Sandbox.Reason + "); falling back to clone"
 		return sel
 	case ModeCloneSandbox:
+		sel.ContainerUnavailable = notAttempted(in.Mode)
 		if in.Profile == ProfileHosted {
 			sel.Reason = "profile=hosted refuses mode=clone-sandbox: only the container path is permitted"
 			return sel
@@ -183,6 +218,7 @@ func Select(in Inputs) Selection {
 		sel.Reason = "mode=clone-sandbox but the sandbox is unavailable: " + in.Sandbox.Reason
 		return sel
 	case ModeClone:
+		sel.ContainerUnavailable = notAttempted(in.Mode)
 		if in.Profile == ProfileHosted {
 			sel.Reason = "profile=hosted refuses mode=clone: only the container path is permitted"
 			return sel
@@ -191,8 +227,15 @@ func Select(in Inputs) Selection {
 		sel.Reason = "mode=clone: host exec in a throwaway clone"
 		return sel
 	}
+	sel.ContainerUnavailable = fmt.Sprintf("not attempted: unknown isolation mode %q", in.Mode)
 	sel.Reason = fmt.Sprintf("unknown isolation mode %q", in.Mode)
 	return sel
+}
+
+// notAttempted is ContainerUnavailable for an explicit fallback mode, which
+// never considers the container path.
+func notAttempted(m Mode) string {
+	return fmt.Sprintf("not attempted: mode=%s selects a fallback path", m)
 }
 
 // containerMissing names what the container path lacks.

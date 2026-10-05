@@ -235,6 +235,17 @@ logs `gate_isolation_configured`, and the first gate exec logs
 `gate_isolation_selected` with the whole selection (path, inputs, the classified
 runtime endpoint, the reason).
 
+**Evidence (#2135).** When a gate reaches the exec seam
+(`runBoundedGateArgvDisposed`, a refusal included) the runner marks the
+selection RECORDED, and the pre-pack `composeGateEvidence` call folds it into
+`gate_evidence` as a flat, pre-redacted `gate_isolation` member carrying the
+precise `path` and its `class` (`container | fallback | refused`), the selection
+inputs, the detected runtime (endpoint raw value and socket path excluded) and
+`container_unavailable`. The member comes only from the runner's own record,
+never from a stream event; it is absent when no gate reached the seam (plan
+stages, the working-tree verify gate), leaving the payload byte-identical.
+Contract: `internal/gateiso/README.md` § "Evidence (#2135)".
+
 **The four paths.** `container` (a safe LOCAL docker/podman daemon + an image:
 `--network=none --cap-drop=ALL --security-opt=no-new-privileges --entrypoint ''`,
 every invocation — run and `rm -f` — bound to the validated socket with

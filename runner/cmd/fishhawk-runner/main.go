@@ -2827,7 +2827,10 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// truth. Appended before EITHER PackBytes so both variants
 		// carry it; pre-redacted because the implement review
 		// dispatches on the raw variant (#793). Nil when no gate ran.
-		if ev := composeGateEvidence(res.Events, len(scopePaths(cfg.scopeFiles))); ev != nil {
+		// The gate_isolation member (#2135) comes from the runner's OWN
+		// recorded selection — never from an event in the stream — and
+		// is absent when no gate reached the exec seam.
+		if ev := composeGateEvidence(res.Events, len(scopePaths(cfg.scopeFiles)), gateIsolationEvidenceFor(gateIsolation)); ev != nil {
 			res.Events = append(res.Events, *ev)
 		}
 
@@ -6677,6 +6680,10 @@ func runBoundedGateArgvDisposed(ctx context.Context, argv []string, dir, lintCac
 	sanitized := withIsolatedLintCache(sanitizedGateEnv(), lintCacheDir)
 	env := appendGateExtraEnv(sanitized, extraEnv)
 	sel := gateIsolation.selection(ctx)
+	// Record at the SEAM, not inside selection(): selection() also has a
+	// non-exec caller (runVerifyCommittedTree's lock-path decision), and only
+	// a gate that reaches here — refusal included — is gate evidence (#2135).
+	gateIsolation.markSeamReached()
 	switch sel.Path {
 	case gateiso.PathRefused:
 		return gateRefusalMessage(sel), -1, gateRefused

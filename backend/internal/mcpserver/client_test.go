@@ -1742,6 +1742,57 @@ func TestRunLiveValidation_WireShape(t *testing.T) {
 	})
 }
 
+// TestGateIsolation_WireShape pins the hand-maintained MCP mirror of the
+// backend's gate_isolation block (#2135): raw server-shaped JSON, written as a
+// literal rather than marshalled from the mirror, is driven through
+// GetGateView, so a tag that drifts from the backend decodes to a zero value
+// and fails here.
+func TestGateIsolation_WireShape(t *testing.T) {
+	runID := uuid.New()
+	serve := func(t *testing.T, extra string) *GateView {
+		t.Helper()
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"run_id":"` + runID.String() + `","open":[],"settled":[],"suppressed_relitigations":[]` + extra + `}`))
+		}))
+		defer ts.Close()
+		c := newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})
+		gv, err := c.GetGateView(context.Background(), runID, "")
+		if err != nil {
+			t.Fatalf("GetGateView: %v", err)
+		}
+		return gv
+	}
+
+	t.Run("block decodes field by field", func(t *testing.T) {
+		gv := serve(t, `,"gate_isolation":{"stage_id":"s-new","sequence":20,"recorded_at":"2026-10-04T12:00:00Z",`+
+			`"path":"container","class":"container","mode":"container","profile":"hosted","image":"img:1",`+
+			`"runtime_kind":"podman","runtime_safe":true,"runtime_reason":"rr","runtime_version":"5.2.1",`+
+			`"sandbox_available":true,"sandbox_reason":"sr","reason":"why","container_unavailable":"cu",`+
+			`"worst_class":"fallback","worst_stage_id":"s-old","worst_sequence":10}`)
+		gi := gv.GateIsolation
+		if gi == nil {
+			t.Fatal("GateView.GateIsolation is nil; the gate_isolation json tag does not byte-match the backend")
+		}
+		want := gateViewGateIsolation{
+			StageID: "s-new", Sequence: 20, RecordedAt: time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC),
+			Path: "container", Class: "container", Mode: "container", Profile: "hosted", Image: "img:1",
+			RuntimeKind: "podman", RuntimeSafe: true, RuntimeReason: "rr", RuntimeVersion: "5.2.1",
+			SandboxAvailable: true, SandboxReason: "sr", Reason: "why", ContainerUnavailable: "cu",
+			WorstClass: "fallback", WorstStageID: "s-old", WorstSequence: 10,
+		}
+		if *gi != want {
+			t.Errorf("GateIsolation =\n%+v\nwant\n%+v", *gi, want)
+		}
+	})
+
+	t.Run("old-backend body omits the block -> nil", func(t *testing.T) {
+		if gv := serve(t, ""); gv.GateIsolation != nil {
+			t.Errorf("GateIsolation = %+v, want nil when the backend omits gate_isolation", gv.GateIsolation)
+		}
+	})
+}
+
 // TestGateViewReviewDiffTruncated_WireShape pins the hand-maintained MCP wire
 // mirror for the gate-view review_diff_truncated block (#2875): the backend tags
 // MUST byte-match GateView.ReviewDiffTruncated / gateViewReviewDiffTruncated or

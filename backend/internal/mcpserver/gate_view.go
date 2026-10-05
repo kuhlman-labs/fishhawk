@@ -82,6 +82,21 @@ Response (gate_view):
     verdicts describe a stale tree: force a fresh round (fishhawk_fixup_stage)
     before merging. Omitted when no mismatch was recorded, or once a newer
     same-stage review round superseded it.
+  - gate_isolation — which isolation path the run's gates ran under, so an
+    isolated run is told apart from a fallback run without reading runner
+    logs. The top-level fields describe the NEWEST recorded stage: stage_id,
+    sequence, recorded_at, path (container | clone-sandbox | clone | refused),
+    class (container | fallback | refused), mode, profile, image, the detected
+    runtime (runtime_kind, runtime_safe, runtime_reason, runtime_version), the
+    sandbox probe (sandbox_available, sandbox_reason), reason and
+    container_unavailable (why the container path was not taken).
+    worst_class + worst_stage_id + worst_sequence name the most severe class
+    recorded on ANY stage (refused > fallback > container), so an earlier
+    fallback or refusal is never hidden behind a later container stage — read
+    worst_class, not class, for the run's verdict. Run-level: stage_kind does
+    not filter it. Omitted when no gate reached the runner's isolated exec
+    path (an older runner, or a stage that ran no gate); omitted with a
+    gate_isolation_recorded history_gaps entry when the read degraded.
   - precedent — present when a HUMAN gate is open on the run and the
     repository has indexed prior decisions of that gate's class (E75.4): how
     this kind of gate was decided before. Carries decision_class

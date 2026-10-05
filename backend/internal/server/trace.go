@@ -265,6 +265,13 @@ func (s *Server) handleShipTrace(w http.ResponseWriter, r *http.Request) {
 	if variant == tracestore.VariantRaw {
 		s.recordCost(r.Context(), runID, stageID, body)
 
+		// Gate isolation record (E51.2 / #2135). INSIDE the raw guard (once per
+		// stage bundle, like cost) and BEFORE the budget short-circuits and the
+		// agent-failed branch below, so a refused or red gate's isolation path
+		// is on the chain before the stage is failed. Best-effort; absent
+		// evidence appends nothing.
+		s.recordGateIsolation(r.Context(), runID, stageID, contentHash, body)
+
 		// Per-run budget tripwire (ADR-030 / #653). After the bundle's cost
 		// is rolled into the run total, check it against the operator's
 		// per-run ceilings. On breach the run is HALTED (cancelled) and we
