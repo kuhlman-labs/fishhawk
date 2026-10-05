@@ -851,6 +851,16 @@ Semantics, by the kind of the invocation MEETING a live holder:
 | RUNNER meets a live SHELL holder, budget EXPIRED | **Displace**, with a loud one-line warning naming the deposed pid and stating that two verifies may now contend. That warning is printed on every COMPLETED displacement — including the one where the freed lock is then won by somebody else and this invocation refuses (the steal's `rc=2`), because the victim is running unprotected either way. The wedged-holder escape hatch, not the normal path. It displaces at most once per invocation, and only against the holder it actually waited on — see "The displacement stays valid through the unlink". |
 | RUNNER meets a live RUNNER holder | Wait on the same budget, then **refuse** naming both pids. Two concurrent runner verifies on one worktree family is a bug to surface, not one to paper over by stealing. |
 
+**What the runner does with a RUNNER-meets-RUNNER refusal (#3948).** The runner's committed-tree
+gates (the verify-fix loop, the single-shot gate and the #960 pre-push strict re-verify) recognise the
+refusal text, re-run the verify in place up to twice per gate site (each re-run is itself one bounded
+600s wait inside the verify command, so the runner adds no sleep of its own), and then fail the stage
+category C with a `verify_lock_contended:` reason, retryable in place. A contended verify never reaches
+the fix agent and never spends the infra-flake absorb. That is a bounded RUNNER behaviour, not a licence
+for a shell caller to retry — the rule below is unchanged. The `scripts/test` behaviour itself is
+unchanged too. Long-form: `runner/cmd/fishhawk-runner/README.md` § "Verify-lock contention is category C
+(#3948)".
+
 **Do not poll a refusal.** It is a fast failure, not a queue — retrying it in a
 loop is what killed run a662ed6f category-A. Narrow to `scripts/test single` on
 your package instead.
