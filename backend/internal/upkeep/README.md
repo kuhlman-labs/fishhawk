@@ -6,13 +6,18 @@ issues (#3921), and the two deterministic evidence detectors the scan prompt is
 built from — `DetectPinDrift` and `AggregateFlakes` (#3922). #3924 (apply)
 consumes the duplicate marks. #3750 adds the `advisory` source's Dependabot
 coverage matcher (`MarkCovered`) and its server-rendered filing helpers
-(`RenderAdvisoryTitle`, `RenderAdvisoryFacts`) in `advisory.go`.
+(`RenderAdvisoryTitle`, `RenderAdvisoryFacts`) in `advisory.go`. #3763 adds
+the in-flight advisory match (`DependencyChanges`, `MatchInFlight`,
+`RenderInFlightFinding`) in `inflight.go`.
 
 The package imports no forge client, no `workmgmt`, no server package, no
 `bundle` and not `backend/internal/plan`'s report types. Its inputs are its own
 `Proposal`, a path → content map, `FlakeStage`s, and `AdvisoryProposal` /
-`PullRequest` / `AdvisoryFacts`; the server adapts a validated report, the files
-it read, the gate evidence it read and a forge pull-request listing into them.
+`PullRequest` / `AdvisoryFacts`, and a compare patch plus manifest content /
+`InFlightAdvisory`; the server adapts a validated report, the files it read, the
+gate evidence it read, a forge pull-request listing and a run's forge compare
+diff into them. `inflight.go` imports `gopkg.in/yaml.v3` (pnpm lockfiles) and
+nothing else outside the standard library.
 Nothing here reads, files, closes, comments on or relabels anything.
 
 ## Finding marker
@@ -481,6 +486,122 @@ that stays vulnerable somewhere:
   re-skips the finding. Coverage is a snapshot at ingest: a pull request closed
   between ingest and the gate still suppresses that filing (the next scan
   re-proposes it).
+
+## In-flight advisory match (#3763)
+
+`inflight.go`. After an advisory-watch pass, fishhawkd tells each open run whose
+OWN diff introduces an affected dependency version (one crew-message `finding`
+per run and advisory). This file is the pure half: it reads one run's forge
+compare patch and the changed manifests at the run's head, decides which
+(package, version) pairs the run introduces, matches them against the recorded
+advisory findings, and renders the finding. The server pass that selects runs,
+fetches the diff and manifests, dedupes and sends is documented in
+`backend/internal/server/README.md`.
+
+### Inputs
+
+- `ManifestEcosystem(path)` → `go.mod` = `go`, `pnpm-lock.yaml` = `npm`, with the
+  directory in the `plan.UpkeepAdvisoryManifestDirs` form (`.` for the root).
+  `package.json` (ranges, never a resolved version), `go.sum`, every other file
+  and a path that is absolute or escapes the root are not read.
+- `SplitComparePatch(patch)` splits `forge.ComparePatchResult.Patch` on its
+  COLUMN-0 synthetic `diff --git a/<p> b/<q>` headers, keyed by the `b/` path (a
+  rename keys by its new name). Hunk lines begin with ` `, `+`, `-`, `\` or
+  `@@`, so a header cannot be forged from inside a hunk. A path containing
+  ` b/` is keyed at its last occurrence.
+- `AddedVersions(ecosystem, filePatch)` is the SHAPE layer only — the pairs on
+  `+` lines inside hunks (never a `+++` header): go — after a trailing `//`
+  comment is stripped and an optional leading `require` dropped, exactly two
+  fields with a `v`-prefixed version, so `a => b v` / `a v => b v` replace
+  lines, `exclude m v` single lines and `go` / `toolchain` directives never
+  qualify; npm — a line with exactly two leading spaces whose trimmed text is a
+  key `name@version:` (optionally quoted), a v6 leading `/` and a `(...)` peer
+  suffix stripped, split at the last `@` past index 0. It applies none of the
+  rules below.
+- `GoModRequires(content)` — block-aware: `require m v` single lines and
+  `require ( ... )` block entries only; `replace`, `exclude`, `retract`, `tool`
+  (any other directive or block) are tracked and ignored. `// indirect`
+  requires count: since Go 1.17 module graph pruning a go.mod lists every module
+  providing a package to the build, so go.sum is not read. A malformed require
+  entry, an unterminated or unmatched block, or a module required TWICE is an
+  error.
+- `PnpmLockPackages(content)` — the `name@version` keys of the top-level
+  `packages:` mapping, YAML-decoded. `lockfileVersion` major below 6 (the v5
+  `/name/version` key form), a missing `lockfileVersion` or a non-mapping
+  `packages` is an error.
+
+### `DependencyChanges(path, filePatch, headContent)`
+
+An added pair counts only when ALL hold (each pinned by an isolating case in
+`TestDependencyChanges` / `TestDependencyChanges_Errors`):
+
+1. **The patch applies to the head.** Every context and added line equals the
+   head line its hunk header places it at; otherwise the compare and the head
+   fetch disagree and it is an ERROR (the pair is never guessed).
+2. **Inside require / packages.** The added line is, in the head's OWN parse, a
+   require entry (single-line or block) of go.mod, or an entry key of the
+   lockfile's top-level `packages:` section. `exclude`, `replace` and `retract`
+   lines never count — even when the head requires the same pair elsewhere —
+   and neither do pnpm `snapshots:` or `importers:` lines.
+3. **Net add.** The pair is in neither the patch's removed lines nor an
+   UNCHANGED head line of the same section: either means the base already had
+   it. So a moved require line (`// indirect` dropped, same version), a `go mod
+   tidy` reshuffle, a pnpm peer-suffix churn and a new peer variant of an
+   already-resolved version are not changes. Removed lines are read by shape in
+   any block, which fails toward NO change.
+4. **pnpm: YAML confirmation.** The YAML-decoded `packages` keys hold the pair,
+   so a line the two-space scan misreads (a key nested one level deeper) never
+   counts.
+
+Output is in head-line order, deduped, never nil. Any error fails toward no
+finding for that manifest.
+
+### `MatchInFlight(advisories, changes)`
+
+A change matches an advisory iff the ecosystem and package are equal (exact),
+the change's directory is one the advisory cites, the change's version is on
+the advisory's in-use version line (`sameVersionLine`), and — with a fixed
+version — it is comparable with and BELOW the fix, or — with no fix published —
+comparable with and AT OR ABOVE the in-use version (only versions at or past the
+known-affected one are presumed affected). Every rule fails toward NO match.
+One `InFlightMatch` per advisory with at least one match, in advisory input
+order, changes deduped and sorted by directory, manifest, version; never nil.
+
+### Rendering, dedupe key and disclosure
+
+- `InFlightFindingSummary(a)` = `Dependency advisory <primary id> (<ecosystem>
+  <package>) matches a version this run's dependency changes introduce`. It is
+  the crew message's `payload.summary` AND the server's dedupe key: it depends
+  only on the primary advisory id, ecosystem and package, each a plain token or
+  the withheld marker. Changing its wording re-sends every finding once.
+- `RenderInFlightFinding(m)` → (summary, detail, severity). The detail lists
+  the advisory ids, ecosystem, package, `Introduced by this run:` one line per
+  (directory, manifest, version), the fixed version or `no fix published`, the
+  in-use version on the default branch, the reachability class and `Vulnerable
+  symbol:`. Each value is a code span when it is a plain token for its field
+  (advisory.go's token regexes), else `(withheld: not a plain token)`. Severity
+  passes through only `high`, `medium` or `low`, else `""`.
+- **Disclosure rule.** The call path contributes ONLY index 0, the vulnerable
+  dependency symbol (`package.function`, or the package alone), plus a count of
+  the caller frames omitted. Caller frames (index >= 1) name this repository's
+  own code and are never rendered (`TestRenderInFlightFinding`, sentinel
+  caller tokens).
+
+### Conservative residuals (fail toward no finding)
+
+- **0.x minor lines.** `sameVersionLine` requires the same minor for `0.x`, so
+  a `0.20` → `0.21` bump is not matched against an advisory seen at `0.20`
+  even if `0.21` is still affected.
+- **package.json-only edits.** A range change without a lockfile change
+  resolves nothing and is not read; npm advisories match only through
+  `pnpm-lock.yaml`.
+- **pnpm lockfile below v6** is refused.
+- **go.sum-only edits** are not read.
+- **replace directives** are ignored: a replaced module's effective version is
+  not the required one.
+- **Removed lines in any block cancel.** A removed `exclude` line of the same
+  pair cancels a genuine require addition.
+- **Quoted go.mod module paths** never equal an advisory package.
 
 ## Residuals
 
