@@ -220,7 +220,7 @@ jobs:
       - name: Test leg ${{ matrix.leg }}
         run: scripts/ci-test-leg "${{ matrix.leg }}" coverage-profiles
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: go-coverage-${{ matrix.leg }}
           path: coverage-profiles/*.out
