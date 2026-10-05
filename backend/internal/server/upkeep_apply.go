@@ -46,6 +46,9 @@ package server
 //	duplicate_of_open_issue the ingest marked the finding as covered by an
 //	                        OPEN issue (marker or similarity) — the row carries
 //	                        the issue number, url and basis
+//	covered_by_dependabot_pr the ingest marked the advisory finding as fixed by
+//	                        open Dependabot pull requests (#3750) — the row
+//	                        carries their numbers and urls
 //	already_filed           an upkeep_finding_filed row for this artifact and
 //	                        finding already exists (a re-apply)
 //	apply_budget_exhausted  the detached budget expired before this finding
@@ -53,7 +56,11 @@ package server
 //
 // A filed finding carries the proposed body PLUS upkeep.FindingMarker(id) — the
 // marker the next scan's ingest dedupe matches — and a stable idempotency key
-// minted from (run, artifact, finding). The proposal's autonomy:* labels are
+// minted from (run, artifact, finding). An ADVISORY finding (#3750) is the
+// exception: its title and body are SERVER-RENDERED from the structured
+// advisory fields (upkeep.RenderAdvisoryTitle / RenderAdvisoryFacts) and the
+// agent-authored proposed title and body are ignored, so no agent prose — and
+// no call-path frame naming the repository's own code — reaches the tracker. The proposal's autonomy:* labels are
 // STRIPPED unless the captain set authorize_delegation_tier; note that the
 // conventions' label_defaults may still add their DEFAULT autonomy tier (the
 // conventions' choice, not the scan's), so "stripped" means "the PROPOSED tier
@@ -66,10 +73,12 @@ package server
 // backend/internal/server/README.md § "On-approval upkeep apply".
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"path"
 	"strings"
 	"time"
 
@@ -102,6 +111,7 @@ const upkeepIdempotencyNamespace = "upkeep_finding"
 const (
 	upkeepSkipNotApproved     = "not_approved"
 	upkeepSkipDuplicate       = "duplicate_of_open_issue"
+	upkeepSkipCovered         = "covered_by_dependabot_pr"
 	upkeepSkipAlreadyFiled    = "already_filed"
 	upkeepSkipBudgetExhausted = "apply_budget_exhausted"
 	upkeepSkipFilingFailed    = "filing_failed"
@@ -120,7 +130,11 @@ const (
 	// nothing was consumed and the window is still open.
 	upkeepApplyWindowUnsettled = "upkeep_apply_window_unsettled"
 	// The remaining reasons are POST-ratification: the window stays CLOSED.
-	upkeepApplyDuplicatesUnreadable   = "upkeep_apply_duplicates_unreadable"
+	upkeepApplyDuplicatesUnreadable = "upkeep_apply_duplicates_unreadable"
+	// upkeepApplyCoverageUnreadable: the recorded row's `covered` key is
+	// present but null or not an array (#3750). An ABSENT key is a pre-#3750
+	// row and reads as no marks.
+	upkeepApplyCoverageUnreadable     = "upkeep_apply_coverage_unreadable"
 	upkeepApplyPriorFilingsUnreadable = "upkeep_apply_prior_filings_unreadable"
 	upkeepApplyRunUnreadable          = "upkeep_apply_run_unreadable"
 	upkeepApplyRepoUnresolvable       = "upkeep_apply_repo_unresolvable"
@@ -168,6 +182,10 @@ type upkeepFindingFiledPayload struct {
 	AppliedLabels  []string `json:"applied_labels"`
 	StrippedLabels []string `json:"stripped_labels"`
 	IdempotencyKey string   `json:"idempotency_key"`
+	// ServerRendered is true when the filed title and body were rendered
+	// from the advisory fields and the agent's proposed prose was ignored
+	// (every advisory finding, #3750).
+	ServerRendered bool `json:"server_rendered,omitempty"`
 }
 
 // upkeepFindingSkippedPayload is the upkeep_finding_skipped row. The optional
@@ -183,14 +201,19 @@ type upkeepFindingSkippedPayload struct {
 	DuplicateIssueURL    string `json:"duplicate_issue_url,omitempty"`
 	DuplicateBasis       string `json:"duplicate_basis,omitempty"`
 	PriorIssueNumber     int    `json:"prior_issue_number,omitempty"`
-	Code                 string `json:"code,omitempty"`
-	Message              string `json:"message,omitempty"`
+	// CoveringPRNumbers / CoveringPRURLs name the Dependabot pull requests a
+	// covered_by_dependabot_pr skip rests on, one per cited manifest
+	// directory (#3750).
+	CoveringPRNumbers []int    `json:"covering_pr_numbers,omitempty"`
+	CoveringPRURLs    []string `json:"covering_pr_urls,omitempty"`
+	Code              string   `json:"code,omitempty"`
+	Message           string   `json:"message,omitempty"`
 }
 
 // upkeepApplyCompletedPayload is the ONE upkeep_apply_completed row per apply.
 // filed + skipped + failed + budget_exhausted == findings on a non-degraded
-// row: skipped counts not_approved / duplicate_of_open_issue / already_filed,
-// failed counts filing_failed. A degraded row carries zero counts.
+// row: skipped counts not_approved / duplicate_of_open_issue /
+// covered_by_dependabot_pr / already_filed, failed counts filing_failed. A degraded row carries zero counts.
 type upkeepApplyCompletedPayload struct {
 	ArtifactID      string `json:"artifact_id,omitempty"`
 	Findings        int    `json:"findings"`
@@ -248,6 +271,7 @@ type upkeepFilingJob struct {
 	report         *plan.UpkeepReport
 	consumed       map[string]upkeepConsumedDisposition
 	duplicates     map[string]upkeep.Duplicate
+	covered        map[string]upkeep.Covered
 	priorFiled     map[string]int
 	conv           workmgmt.Conventions
 	target         workmgmt.Target
@@ -405,9 +429,18 @@ func (s *Server) resolveUpkeepFilingJob(ctx context.Context, stage *run.Stage, b
 	consumed map[string]upkeepConsumedDisposition, sink *upkeepApplySink) (*upkeepFilingJob, string, string) {
 	artifactID := b.art.ID.String()
 
-	duplicates, derr := s.upkeepRecordedDuplicates(ctx, stage.RunID, artifactID)
+	recorded, rerr := s.upkeepRecordedRow(ctx, stage.RunID, artifactID)
+	if rerr != nil {
+		return nil, upkeepApplyDuplicatesUnreadable, rerr.Error()
+	}
+	duplicates, derr := upkeepRecordedDuplicates(recorded)
 	if derr != nil {
 		return nil, upkeepApplyDuplicatesUnreadable, derr.Error()
+	}
+	// The SAME row the duplicates came from.
+	covered, cerr := upkeepRecordedCoverage(recorded)
+	if cerr != nil {
+		return nil, upkeepApplyCoverageUnreadable, cerr.Error()
 	}
 	priorFiled, perr := s.upkeepPriorFilings(ctx, stage.RunID, artifactID)
 	if perr != nil {
@@ -416,9 +449,9 @@ func (s *Server) resolveUpkeepFilingJob(ctx context.Context, stage *run.Stage, b
 	if s.cfg.RunRepo == nil {
 		return nil, upkeepApplyRunUnreadable, "no run repository is configured"
 	}
-	rn, rerr := s.cfg.RunRepo.GetRun(ctx, stage.RunID)
-	if rerr != nil {
-		return nil, upkeepApplyRunUnreadable, rerr.Error()
+	rn, gerr := s.cfg.RunRepo.GetRun(ctx, stage.RunID)
+	if gerr != nil {
+		return nil, upkeepApplyRunUnreadable, gerr.Error()
 	}
 	owner, name, ok := splitRepoFullName(rn.Repo)
 	if !ok {
@@ -451,7 +484,7 @@ func (s *Server) resolveUpkeepFilingJob(ctx context.Context, stage *run.Stage, b
 
 	return &upkeepFilingJob{
 		runID: stage.RunID, stageID: stage.ID, artifactID: artifactID,
-		report: b.report, consumed: consumed, duplicates: duplicates, priorFiled: priorFiled,
+		report: b.report, consumed: consumed, duplicates: duplicates, covered: covered, priorFiled: priorFiled,
 		conv: conv, target: target, owner: owner, name: name, sink: sink,
 	}, "", ""
 }
@@ -468,6 +501,7 @@ func (s *Server) runUpkeepFilingLoop(applyCtx context.Context, job *upkeepFiling
 		}
 		disp, approved := job.consumed[f.ID]
 		dup, isDup := job.duplicates[f.ID]
+		cov, isCovered := job.covered[f.ID]
 		prior, wasFiled := job.priorFiled[f.ID]
 		if n, ok := filedNow[f.ID]; ok {
 			prior, wasFiled = n, true
@@ -481,6 +515,15 @@ func (s *Server) runUpkeepFilingLoop(applyCtx context.Context, job *upkeepFiling
 			skip.DuplicateIssueNumber = dup.IssueNumber
 			skip.DuplicateIssueURL = dup.IssueURL
 			skip.DuplicateBasis = string(dup.Basis)
+			sum.Skipped++
+		case isCovered:
+			skip.SkipReason = upkeepSkipCovered
+			for _, p := range cov.Pulls {
+				skip.CoveringPRNumbers = append(skip.CoveringPRNumbers, p.Number)
+				if p.URL != "" {
+					skip.CoveringPRURLs = append(skip.CoveringPRURLs, p.URL)
+				}
+			}
 			sum.Skipped++
 		case wasFiled:
 			skip.SkipReason = upkeepSkipAlreadyFiled
@@ -540,10 +583,11 @@ func (s *Server) fileUpkeepFinding(ctx context.Context, job *upkeepFilingJob, f 
 	parentEpic = normalizeUpkeepEpicRef(parentEpic)
 	key := workmgmt.MintIdempotencyKey(upkeepIdempotencyNamespace, job.runID.String(), job.artifactID, f.ID)
 
+	summary, body, serverRendered := upkeepFilingProse(f)
 	filing := workmgmt.FilingRequest{
 		Type:           f.ProposedIssue.Type,
-		Summary:        f.ProposedIssue.Title,
-		Body:           upkeepFilingBody(f.ProposedIssue.Body, f.ID),
+		Summary:        summary,
+		Body:           upkeepFilingBody(body, f.ID),
 		Labels:         labels,
 		Relations:      workmgmt.Relations{ParentEpic: parentEpic},
 		IdempotencyKey: key,
@@ -553,7 +597,7 @@ func (s *Server) fileUpkeepFinding(ctx context.Context, job *upkeepFilingJob, f 
 		return nil, werr
 	}
 	applied := []string{}
-	title := f.ProposedIssue.Title
+	title := summary
 	if item != nil {
 		applied = append(applied, item.Classification.Labels...)
 		title = item.Title
@@ -562,11 +606,79 @@ func (s *Server) fileUpkeepFinding(ctx context.Context, job *upkeepFilingJob, f 
 		RunID: job.runID.String(), StageID: job.stageID.String(), ArtifactID: job.artifactID,
 		FindingID: f.ID, Source: f.Source, Title: title, ParentEpic: parentEpic,
 		AppliedLabels: applied, StrippedLabels: stripped, IdempotencyKey: key,
+		ServerRendered: serverRendered,
 	}
 	if created != nil {
 		out.IssueNumber, out.IssueURL, out.Provider = created.Number, created.URL, created.Provider
 	}
 	return out, nil
+}
+
+// upkeepFilingProse returns the title and body to file for f, and whether
+// they were server-rendered. An advisory finding (#3750) files ONLY what the
+// server renders from its structured advisory fields — the primary id,
+// package, in-use version and severity in the title; every advisory id, the
+// ecosystem, package, versions (or "no fix published"), reachability,
+// severity and the cited manifest paths in the body — and the agent's
+// proposed title and body are ignored, so agent prose (which could quote the
+// call path through the repository's own code) never reaches the tracker.
+// It keys on the SOURCE alone: an advisory finding missing its advisory
+// object (refused by rule (l), so unreachable past validation) still files
+// only rendered fields, never the agent prose. Every other finding files its
+// proposed title and body unchanged.
+func upkeepFilingProse(f plan.UpkeepFinding) (title, body string, serverRendered bool) {
+	if f.Source != plan.UpkeepSourceAdvisory {
+		return f.ProposedIssue.Title, f.ProposedIssue.Body, false
+	}
+	facts := upkeepAdvisoryFacts(&f)
+	return upkeep.RenderAdvisoryTitle(facts), upkeep.RenderAdvisoryFacts(facts), true
+}
+
+// upkeepAdvisoryFacts adapts an advisory finding to the renderers' input:
+// structured fields only (no proposed prose, no call path), with the cited
+// manifest paths in evidence order. A missing advisory object renders every
+// field as withheld.
+func upkeepAdvisoryFacts(f *plan.UpkeepFinding) upkeep.AdvisoryFacts {
+	a := f.Advisory
+	if a == nil {
+		return upkeep.AdvisoryFacts{Manifests: upkeepAdvisoryManifestPaths(f)}
+	}
+	facts := upkeep.AdvisoryFacts{
+		IDs:          append([]string(nil), a.AdvisoryIDs...),
+		Ecosystem:    a.Ecosystem,
+		Package:      a.Package,
+		Version:      a.Version,
+		Reachability: a.Reachability,
+		Severity:     a.Severity,
+		Manifests:    upkeepAdvisoryManifestPaths(f),
+	}
+	if a.FixedVersion != nil {
+		facts.FixedVersion = *a.FixedVersion
+	}
+	return facts
+}
+
+// upkeepAdvisoryManifestPaths returns the distinct file-ref paths that name a
+// manifest — basename in plan.UpkeepManifestBasenames, repository-relative,
+// not escaping the root (plan.UpkeepAdvisoryManifestDirs' predicate) — in
+// evidence order. A call-site source file cited as evidence is never listed.
+func upkeepAdvisoryManifestPaths(f *plan.UpkeepFinding) []string {
+	manifests := map[string]bool{}
+	for _, b := range plan.UpkeepManifestBasenames() {
+		manifests[b] = true
+	}
+	out := []string{}
+	seen := map[string]bool{}
+	for _, ev := range f.Evidence {
+		c := path.Clean(ev.Path)
+		if ev.Kind != plan.UpkeepEvidenceKindFile || ev.Path == "" || seen[ev.Path] || !manifests[path.Base(c)] ||
+			path.IsAbs(c) || c == ".." || strings.HasPrefix(c, "../") {
+			continue
+		}
+		seen[ev.Path] = true
+		out = append(out, ev.Path)
+	}
+	return out
 }
 
 // upkeepFilingLabels returns the proposal's labels with every autonomy:* label
@@ -637,21 +749,15 @@ func (s *Server) upkeepRecordedArtifact(ctx context.Context, runID uuid.UUID) (u
 	return id, true, nil
 }
 
-// upkeepRecordedDuplicates reads the ingest's dedupe verdict from the
-// highest-sequence upkeep_report_recorded row naming artifactID. An absent,
-// null or non-array duplicates key is UNREADABLE (fail closed: the apply cannot
-// tell which findings an open issue already covers).
-func (s *Server) upkeepRecordedDuplicates(ctx context.Context, runID uuid.UUID, artifactID string) (map[string]upkeep.Duplicate, error) {
+// upkeepRecordedRow returns the highest-sequence upkeep_report_recorded row
+// naming artifactID: the ONE row both the duplicates and the coverage marks
+// are read from. No such row is an error (fail closed).
+func (s *Server) upkeepRecordedRow(ctx context.Context, runID uuid.UUID, artifactID string) (*audit.Entry, error) {
 	rows, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, audit.UpkeepReportRecordedCategory)
 	if err != nil {
 		return nil, fmt.Errorf("list upkeep_report_recorded rows: %w", err)
 	}
-	type recorded struct {
-		ArtifactID string              `json:"artifact_id"`
-		Duplicates *[]upkeep.Duplicate `json:"duplicates"`
-	}
 	var best *audit.Entry
-	var bestRec recorded
 	for _, e := range rows {
 		if e == nil {
 			continue
@@ -662,28 +768,80 @@ func (s *Server) upkeepRecordedDuplicates(ctx context.Context, runID uuid.UUID, 
 		if json.Unmarshal(e.Payload, &probe) != nil || probe.ArtifactID != artifactID {
 			continue
 		}
-		if best != nil && e.Sequence < best.Sequence {
-			continue
+		if best == nil || e.Sequence >= best.Sequence {
+			best = e
 		}
-		var rec recorded
-		if jerr := json.Unmarshal(e.Payload, &rec); jerr != nil {
-			return nil, fmt.Errorf("decode duplicates on upkeep_report_recorded row %d: %w", e.Sequence, jerr)
-		}
-		best, bestRec = e, rec
 	}
 	if best == nil {
 		return nil, fmt.Errorf("no upkeep_report_recorded row names artifact %s", artifactID)
 	}
-	if bestRec.Duplicates == nil {
-		return nil, fmt.Errorf("upkeep_report_recorded row %d carries no duplicates array", best.Sequence)
+	return best, nil
+}
+
+// upkeepRecordedDuplicates reads the ingest's dedupe verdict from the recorded
+// row. An absent, null or non-array duplicates key is UNREADABLE (fail closed:
+// the apply cannot tell which findings an open issue already covers).
+func upkeepRecordedDuplicates(e *audit.Entry) (map[string]upkeep.Duplicate, error) {
+	var rec struct {
+		Duplicates *[]upkeep.Duplicate `json:"duplicates"`
 	}
-	out := make(map[string]upkeep.Duplicate, len(*bestRec.Duplicates))
-	for _, d := range *bestRec.Duplicates {
+	if jerr := json.Unmarshal(e.Payload, &rec); jerr != nil {
+		return nil, fmt.Errorf("decode duplicates on upkeep_report_recorded row %d: %w", e.Sequence, jerr)
+	}
+	if rec.Duplicates == nil {
+		return nil, fmt.Errorf("upkeep_report_recorded row %d carries no duplicates array", e.Sequence)
+	}
+	out := make(map[string]upkeep.Duplicate, len(*rec.Duplicates))
+	for _, d := range *rec.Duplicates {
 		if d.FindingID != "" {
 			out[d.FindingID] = d
 		}
 	}
 	return out, nil
+}
+
+// upkeepRecordedCoverage reads the ingest's Dependabot coverage marks (#3750)
+// from the recorded row, deciding on the RAW JSON because the three states
+// differ:
+//
+//   - key ABSENT: no marks. A row recorded before #3750 carries no `covered`
+//     key, and such a report cannot carry an advisory finding.
+//   - key present but null, or not an array: UNREADABLE (fail closed: the
+//     ingest always records an array, so anything else is a corrupt row and
+//     the apply cannot tell which findings are covered).
+//   - an array: marks by finding id.
+func upkeepRecordedCoverage(e *audit.Entry) (map[string]upkeep.Covered, error) {
+	var fields map[string]json.RawMessage
+	if jerr := json.Unmarshal(e.Payload, &fields); jerr != nil {
+		return nil, fmt.Errorf("decode upkeep_report_recorded row %d: %w", e.Sequence, jerr)
+	}
+	raw, present := fields["covered"]
+	if !present {
+		return map[string]upkeep.Covered{}, nil
+	}
+	if !bytes.HasPrefix(bytes.TrimSpace(raw), []byte("[")) {
+		return nil, fmt.Errorf("upkeep_report_recorded row %d carries a covered value that is not an array: %s", e.Sequence, upkeepTruncateRaw(raw))
+	}
+	var marks []upkeep.Covered
+	if jerr := json.Unmarshal(raw, &marks); jerr != nil {
+		return nil, fmt.Errorf("decode covered on upkeep_report_recorded row %d: %w", e.Sequence, jerr)
+	}
+	out := make(map[string]upkeep.Covered, len(marks))
+	for _, c := range marks {
+		if c.FindingID != "" {
+			out[c.FindingID] = c
+		}
+	}
+	return out, nil
+}
+
+// upkeepTruncateRaw bounds a raw JSON value echoed into a degrade detail.
+func upkeepTruncateRaw(raw json.RawMessage) string {
+	const max = 64
+	if len(raw) <= max {
+		return string(raw)
+	}
+	return string(raw[:max]) + "...[truncated]"
 }
 
 // upkeepPriorFilings maps finding id → issue number for the run's
