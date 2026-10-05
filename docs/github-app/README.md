@@ -44,7 +44,7 @@ Webhook events:
 | `issues` | Trigger on `labeled` with the `fishhawk` label. |
 | `issue_comment` | Trigger on `created` matching `/fishhawk run`, `/fishhawk approve`, or `/fishhawk reject`. |
 | `pull_request` | Future: trigger flows on PR-side actions. |
-| `push` | Future: branch-policy + spec-change detection. |
+| `push` | Default-branch revert detection (E82.2 / #3779): a pushed commit's revert signal is resolved and forge-confirmed against a run's merge, then recorded as `run_merge_reverted`. Future: branch-policy + spec-change detection. |
 | `workflow_run` | Observe customer-side runner job state. |
 | `check_run`, `check_suite` | Required-status visibility on review-stage gates. |
 | `branch_protection_rule`, `repository_ruleset` | Acknowledged so a future cache layer can invalidate the per-run protection snapshot (ADR-017 / #251). v0 reads protection on every run-create — no cache to bust today. |

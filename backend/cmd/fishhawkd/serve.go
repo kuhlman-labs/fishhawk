@@ -64,6 +64,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/jiraclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mcpserver"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mcptoken"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/mergeoutcome"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mergereconciler"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/modeloracle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/oauthas"
@@ -1981,6 +1982,15 @@ func runServe(args []string, logSink io.Writer) int {
 	deployReconcilerInterval := fs.Duration("deploy-reconciler-interval",
 		deployreconciler.DefaultInterval,
 		"deploy reconciler scan interval. Each tick makes up to one GitHub GetWorkflowRun call per parked deploy stage with no per-stage cooldown; tune this upward at scale to stay within GitHub REST rate limits (5,000/hour per installation).")
+	enableMergeOutcomeObserver := fs.Bool("enable-merge-outcome-observer",
+		envOr("FISHHAWKD_ENABLE_MERGE_OUTCOME_OBSERVER", "false") == "true",
+		"start the merge-outcome CI observer (E82.2 / #3779); records each merged run's merge-commit CI conclusion (run_merge_ci_observed), fixed at merged_at + --merge-outcome-ci-window. Off by default — only useful with a GitHub App wired. See backend/internal/mergeoutcome/README.md.")
+	mergeOutcomeInterval := fs.Duration("merge-outcome-interval",
+		mergeoutcome.DefaultCIInterval,
+		"merge-outcome CI observer scan interval. Each tick makes at most 20 forge evaluations (one GetPullRequest plus 1-5 check-run pages each).")
+	mergeOutcomeCIWindow := fs.Duration("merge-outcome-ci-window",
+		mergeoutcome.DefaultCIWindow,
+		"maturity window for the merge-outcome CI observer: a merge commit's CI conclusion is fixed as of forge merged_at plus this window.")
 	reviewResolution := fs.String("review-resolution",
 		envOr("FISHHAWKD_REVIEW_RESOLUTION", reviewresolver.DefaultResolution),
 		"deployment-level review-gate resolution provider (ADR-031 Phase 2; default github_merge). Selects which reviewresolver.Resolver the merge-status reconciler routes through. An unknown value fails startup (fail closed) rather than silently defaulting — succeeded must always mean a verified GitHub merge.")
@@ -3736,6 +3746,24 @@ func runServe(args []string, logSink io.Writer) int {
 			logger.Info("deploy reconciler started",
 				slog.Duration("interval", *deployReconcilerInterval))
 		}
+	}
+
+	// Merge-outcome CI observer (E82.2 / #3779). Fixes each merged run's
+	// merge-commit CI conclusion once, at maturity. Off by default; the
+	// tested constructor names the missing dependency when it cannot start.
+	if t, reason := mergeoutcome.NewCITicker(mergeoutcome.CITickerConfig{
+		Enabled: *enableMergeOutcomeObserver, Runs: cfg.RunRepo, Audit: cfg.AuditRepo, GitHub: cfg.GitHub,
+		Logger: logger, Interval: *mergeOutcomeInterval, Window: *mergeOutcomeCIWindow,
+	}); t != nil {
+		go func() {
+			if err := t.Run(ctx); err != nil {
+				logger.Error("merge-outcome CI observer exited with error", slog.String("error", err.Error()))
+			}
+		}()
+		logger.Info("merge-outcome CI observer started",
+			slog.Duration("interval", *mergeOutcomeInterval), slog.Duration("window", *mergeOutcomeCIWindow))
+	} else if *enableMergeOutcomeObserver {
+		logger.Warn("--enable-merge-outcome-observer set but " + reason + "; ticker not started")
 	}
 
 	// One-shot startup run-completion recovery (ADR-031 chain, #727).

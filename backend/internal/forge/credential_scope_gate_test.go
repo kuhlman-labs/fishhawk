@@ -74,6 +74,11 @@ var sanctioned = map[string]string{
 	// GitHub-shaped input, converted to a scope at the consumer.
 	"backend/internal/webhook/webhook.go":    "GitHub webhook ingest payload struct",
 	"backend/internal/webhook/dispatcher.go": "GitHub webhook ingest payload struct",
+	// mergeoutcome.PushEvent decodes the GitHub push payload the same way
+	// (E82.2 / #3779); ObservePush converts it once via
+	// forge.FromGitHubInstallationID, so the int64 never travels past the
+	// decode boundary.
+	"backend/internal/mergeoutcome/revert.go": "GitHub push webhook payload struct (PushEvent); ObservePush converts it via forge.FromGitHubInstallationID at the consumer",
 
 	// Run persistence: installation_id is a nullable column on the run
 	// row (*int64). ADR-057's installation_ref migration owns this
