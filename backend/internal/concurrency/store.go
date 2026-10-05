@@ -220,10 +220,11 @@ WHERE st.id = $1 AND st.run_id = $2`, req.StageID, req.RunID).Scan(&acct, &round
 	}
 	var waited int
 	if err := tx.QueryRow(ctx, `UPDATE stage_concurrency_slots s
-SET state = 'held', acquired_at = clock_timestamp(), held_dispatched_at = st.dispatched_at
+SET state = 'held', acquired_at = clock_timestamp(), held_dispatched_at = st.dispatched_at,
+  admission_nonce = NULLIF($2, '')
 FROM stages st
 WHERE st.id = s.stage_id AND s.stage_id = $1
-RETURNING GREATEST(0, floor(extract(epoch FROM s.acquired_at - s.enqueued_at)))::int`, req.StageID).Scan(&waited); err != nil {
+RETURNING GREATEST(0, floor(extract(epoch FROM s.acquired_at - s.enqueued_at)))::int`, req.StageID, req.AdmissionNonce).Scan(&waited); err != nil {
 		return Admission{}, fmt.Errorf("concurrency: mark held: %w", err)
 	}
 	if !queuedBefore {
@@ -267,7 +268,8 @@ ON CONFLICT (stage_id) DO UPDATE SET
   enqueued_at = CASE WHEN $6 THEN clock_timestamp() ELSE s.enqueued_at END,
   last_seen_at = clock_timestamp(),
   acquired_at = NULL,
-  held_dispatched_at = NULL
+  held_dispatched_at = NULL,
+  admission_nonce = NULL
 RETURNING enqueued_at`, req.StageID, req.RunID, req.GroupKey, req.Limit, req.Host, restart).Scan(&enqueuedAt)
 	if err != nil {
 		return time.Time{}, false, false, fmt.Errorf("concurrency: upsert slot row: %w", err)
@@ -306,7 +308,7 @@ func (s *PostgresStore) StatusForStages(ctx context.Context, stageIDs []uuid.UUI
 		return out, nil
 	}
 	rows, err := s.pool.Query(ctx, `SELECT s.stage_id, s.group_key, s.slot_limit, s.host, s.state,
-  s.enqueued_at, s.acquired_at, s.held_dispatched_at,
+  s.enqueued_at, s.acquired_at, s.held_dispatched_at, COALESCE(s.admission_nonce, ''),
   s.last_seen_at > clock_timestamp() - `+queueTTLSQL+` AS waiter_live,
   r.account_id,
   (s.state = 'queued' AND st.state IN ('pending', 'awaiting_host_dispatch')) AS active_queued,
@@ -330,7 +332,7 @@ WHERE s.stage_id = ANY($1)`, stageIDs)
 		var r statusRow
 		var state string
 		if err := rows.Scan(&r.stageID, &r.st.GroupKey, &r.st.Limit, &r.st.Host, &state,
-			&r.st.EnqueuedAt, &r.st.AcquiredAt, &r.st.HeldDispatchedAt, &r.st.WaiterLive,
+			&r.st.EnqueuedAt, &r.st.AcquiredAt, &r.st.HeldDispatchedAt, &r.st.AdmissionNonce, &r.st.WaiterLive,
 			&r.acct, &r.activeQueued, &r.activeHeld); err != nil {
 			rows.Close()
 			return nil, fmt.Errorf("concurrency: scan status: %w", err)
@@ -369,7 +371,7 @@ WHERE s.stage_id = ANY($1)`, stageIDs)
 				return nil, fmt.Errorf("concurrency: status position: %w", err)
 			}
 			st.Position = allAhead + 1
-			st.AcquiredAt, st.HeldDispatchedAt = nil, nil
+			st.AcquiredAt, st.HeldDispatchedAt, st.AdmissionNonce = nil, nil, ""
 		} else {
 			st.WaiterLive = false
 		}

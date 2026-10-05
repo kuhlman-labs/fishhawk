@@ -15,6 +15,12 @@
 -- (it joins runs.account_id), so it holds even under the superuser runtime
 -- role that bypasses RLS.
 --
+-- admission_nonce is the slot waiter's per-waiter random nonce the marker
+-- recorded when it ADMITTED the row (NULL while queued, and for an admission
+-- whose request carried none). A waiter that lost its admission response
+-- claims the admission only when this equals its own nonce, so another
+-- session's admission of the same stage is never mistaken for its own.
+--
 -- ON DELETE CASCADE from stages, so deleting a stage (for example
 -- DeletePendingAcceptanceStage) is never blocked by its slot row.
 CREATE TABLE stage_concurrency_slots (
@@ -27,7 +33,8 @@ CREATE TABLE stage_concurrency_slots (
     enqueued_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_seen_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     acquired_at        TIMESTAMPTZ NULL,
-    held_dispatched_at TIMESTAMPTZ NULL
+    held_dispatched_at TIMESTAMPTZ NULL,
+    admission_nonce    TEXT        NULL
 );
 
 CREATE INDEX stage_concurrency_slots_group_idx

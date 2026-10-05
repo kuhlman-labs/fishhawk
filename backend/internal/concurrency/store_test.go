@@ -550,6 +550,107 @@ func TestAdmit_SameRoundLoserDoesNotPreemptWinner(t *testing.T) {
 	f.mustQueue(l, 1)
 }
 
+// TestAdmit_ContendedHeadAdmittedOnRetry pins the round the same-round rule
+// does NOT cover, and the retry that closes it: the slot is free, older B and
+// newer C are both queued and fresh, and their polls collide. C wins the lock
+// and is parked (afterLock) while B polls: B misses and queues contended, C
+// counts B ahead and stays queued, so nobody is admitted that round. B's
+// immediate retry (the slot waiter's contended retry) then admits B.
+func TestAdmit_ContendedHeadAdmittedOnRetry(t *testing.T) {
+	f := newFixture(t)
+	a, b, c := f.stage(), f.stage(), f.stage()
+	f.mustAdmit(a)
+	f.mustQueue(b, 1)
+	f.mustQueue(c, 2)
+	f.to(a.ID, run.StageStateRunning, run.StageStateSucceeded) // the slot is free
+
+	parked, resume := make(chan struct{}), make(chan struct{})
+	cs := NewPostgresStore(f.pool)
+	cs.afterLock = func(_ context.Context, hit bool) {
+		if hit {
+			close(parked)
+			<-resume
+		}
+	}
+	var ca Admission
+	var cerr error
+	done := make(chan struct{})
+	go func() { defer close(done); ca, cerr = cs.Admit(context.Background(), req(c, 1)) }()
+	<-parked
+	ba, err := f.store.Admit(context.Background(), req(b, 1))
+	if err != nil || ba.Admitted || !ba.Contended {
+		t.Fatalf("B while C holds the lock: %+v err=%v, want contended queue", ba, err)
+	}
+	close(resume)
+	<-done
+	if cerr != nil || ca.Admitted || ca.Position != 2 {
+		t.Fatalf("C: %+v err=%v, want queued at 2 behind the older B", ca, cerr)
+	}
+	if f.stageState(b.ID) != run.StageStateAwaitingHostDispatch || f.stageState(c.ID) != run.StageStateAwaitingHostDispatch {
+		t.Fatal("fixture: someone was admitted in the colliding round — the gap is not constructed")
+	}
+	// B's immediate retry: the lock is free and B is first in line.
+	if retry := f.admit(b, 1); !retry.Admitted {
+		t.Fatalf("B retry queued at position %d, want admitted on the free slot", retry.Position)
+	}
+}
+
+// TestAdmit_RecordsAdmissionNonce: an admission records the request's nonce on
+// the held row and StatusForStages reports it; a queue upsert clears it (a
+// queued row never carries one); an admission without a nonce records NULL.
+func TestAdmit_RecordsAdmissionNonce(t *testing.T) {
+	f := newFixture(t)
+	nonce := func(id uuid.UUID) *string {
+		t.Helper()
+		var n *string
+		if err := f.pool.QueryRow(context.Background(), `SELECT admission_nonce FROM stage_concurrency_slots WHERE stage_id = $1`, id).Scan(&n); err != nil {
+			t.Fatalf("read nonce: %v", err)
+		}
+		return n
+	}
+	a, b := f.stage(), f.stage()
+	ra := req(a, 1)
+	ra.AdmissionNonce = "nonce-a"
+	if adm, err := f.store.Admit(context.Background(), ra); err != nil || !adm.Admitted {
+		t.Fatalf("Admit(a) = %+v, %v; want admitted", adm, err)
+	}
+	if n := nonce(a.ID); n == nil || *n != "nonce-a" {
+		t.Fatalf("a's row nonce = %v, want nonce-a", n)
+	}
+	st, err := f.store.StatusForStages(context.Background(), []uuid.UUID{a.ID})
+	if err != nil || st[a.ID].AdmissionNonce != "nonce-a" {
+		t.Fatalf("a status = %+v, %v; want admission nonce nonce-a", st[a.ID], err)
+	}
+
+	rb := req(b, 1)
+	rb.AdmissionNonce = "nonce-b"
+	if adm, err := f.store.Admit(context.Background(), rb); err != nil || adm.Admitted {
+		t.Fatalf("Admit(b) = %+v, %v; want queued", adm, err)
+	}
+	if n := nonce(b.ID); n != nil {
+		t.Fatalf("queued b's row nonce = %q, want NULL (only an admission records one)", *n)
+	}
+
+	// a's attempt ends and the stage re-opens: its previous-episode held row
+	// restarts as queued and loses the old admission's nonce.
+	f.to(a.ID, run.StageStateRunning, run.StageStateAwaitingApproval, run.StageStatePending, run.StageStateAwaitingHostDispatch)
+	f.mustQueue(a, 2)
+	if n := nonce(a.ID); n != nil {
+		t.Fatalf("re-queued a's row nonce = %q, want NULL", *n)
+	}
+
+	// b is admitted by a request carrying no nonce: NULL, reported as "".
+	if adm := f.admit(b, 1); !adm.Admitted {
+		t.Fatalf("Admit(b, no nonce) queued at %d, want admitted", adm.Position)
+	}
+	if n := nonce(b.ID); n != nil {
+		t.Fatalf("b's row nonce = %q, want NULL for a nonce-less admission", *n)
+	}
+	if st, err := f.store.StatusForStages(context.Background(), []uuid.UUID{b.ID}); err != nil || st[b.ID].State != SlotHeld || st[b.ID].AdmissionNonce != "" {
+		t.Fatalf("b status = %+v, %v; want held with no admission nonce", st[b.ID], err)
+	}
+}
+
 func TestAdmit_LimitTwoAdmitsTwo(t *testing.T) {
 	f := newFixture(t)
 	a, b, c := f.stage(), f.stage(), f.stage()

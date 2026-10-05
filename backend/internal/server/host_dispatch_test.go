@@ -1319,6 +1319,9 @@ func TestHostDispatch_Wave0Child_AdmitsWithoutBaseBranch(t *testing.T) {
 	f := seedWaveDispatchFixture(t)
 	seedSlicesIntegrated(t, f.au, f.parentID, waveConsolidatedBranch, nil)
 	stage := f.rr.seedStage(f.dep.ID, 1, run.StageStateAwaitingHostDispatch)
+	// The fixture's slice-0 run doubles as the wave-0 child here; a child
+	// being dispatched is live, and a terminal run is refused (#3964).
+	f.dep.State = run.StateRunning
 
 	w := postHostDispatch(t, f.s, f.dep.ID, stage.ID, withHostDispatchOperator)
 	if w.Code != http.StatusOK {

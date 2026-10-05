@@ -26,13 +26,15 @@ type markerAnswer struct {
 	err error
 }
 
-// seqMarker is the in-file sequenced fake of slotMarker: HostDispatchStage
-// consumes answers in order (the last one repeats), and every call is
-// recorded under mu (the waiter runs on its own goroutine).
+// seqMarker is the in-file sequenced fake of slotMarker:
+// HostDispatchStageWithNonce consumes answers in order (the last one
+// repeats), and every call is recorded under mu (the waiter runs on its own
+// goroutine).
 type seqMarker struct {
 	mu        sync.Mutex
 	answers   []markerAnswer
 	calls     int
+	nonces    []string // the nonce each marker call carried
 	reports   []string // expected_state|category|reason per ReportStageFailureFrom
 	reportErr error
 	// stageWait / stageWaitErr answer GetRunStageWait (the lost-response read).
@@ -44,7 +46,7 @@ type seqMarker struct {
 	block <-chan struct{}
 }
 
-func (m *seqMarker) HostDispatchStage(ctx context.Context, _, _ uuid.UUID) (*HostDispatchResult, error) {
+func (m *seqMarker) HostDispatchStageWithNonce(ctx context.Context, _, _ uuid.UUID, nonce string) (*HostDispatchResult, error) {
 	if m.block != nil {
 		<-m.block
 		if ctx.Err() != nil {
@@ -55,6 +57,7 @@ func (m *seqMarker) HostDispatchStage(ctx context.Context, _, _ uuid.UUID) (*Hos
 	defer m.mu.Unlock()
 	i := m.calls
 	m.calls++
+	m.nonces = append(m.nonces, nonce)
 	if i >= len(m.answers) {
 		i = len(m.answers) - 1
 	}
@@ -112,11 +115,16 @@ func (s *slotSpawnRecorder) spawned() []string {
 }
 
 func queuedAnswer(enq time.Time) markerAnswer {
+	return queuedAnswerContended(enq, false)
+}
+
+func queuedAnswerContended(enq time.Time, contended bool) markerAnswer {
 	return markerAnswer{err: newConcurrencySlotQueuedError(&apiError{
 		StatusCode: 409, Code: concurrencySlotQueuedCode,
 		Details: map[string]any{
 			"group": "local-implement:h1", "limit": 1, "position": 1,
 			"holders": []any{}, "enqueued_at": enq.Format(time.RFC3339Nano),
+			"contended": contended,
 		},
 	})}
 }
@@ -129,19 +137,21 @@ var (
 	notAdmissibleAns = markerAnswer{err: &apiError{StatusCode: 409, Code: "dispatch_not_admissible"}}
 )
 
+// testSlotNonce is the admission nonce testSlotSpec gives its waiter.
+const testSlotNonce = "nonce-own"
+
 // testSlotSpec builds a fast waiter spec over m and rec.
-func testSlotSpec(m *seqMarker, rec *slotSpawnRecorder, episodeStart time.Time) slotWaiterSpec {
+func testSlotSpec(m *seqMarker, rec *slotSpawnRecorder) slotWaiterSpec {
 	return slotWaiterSpec{
-		runID:        uuid.New(),
-		stageID:      uuid.New(),
-		host:         "h1",
-		episodeStart: &episodeStart,
-		marker:       m,
-		prepare:      func() (slotSpawnInputs, error) { return slotSpawnInputs{binary: "/bin/runner"}, nil },
-		spawn:        rec.spawn,
-		cap:          time.Minute,
-		poll:         time.Millisecond,
-		logf:         func(string, ...any) {},
+		runID:   uuid.New(),
+		stageID: uuid.New(),
+		nonce:   testSlotNonce,
+		marker:  m,
+		prepare: func() (slotSpawnInputs, error) { return slotSpawnInputs{binary: "/bin/runner"}, nil },
+		spawn:   rec.spawn,
+		cap:     time.Minute,
+		poll:    time.Millisecond,
+		logf:    func(string, ...any) {},
 	}
 }
 
@@ -155,17 +165,11 @@ func waitDone(t *testing.T, done <-chan struct{}) {
 	}
 }
 
-func TestSlotWaiter_UnknownHostMirrorsServer(t *testing.T) {
-	if slotHostUnknown != concurrency.UnknownHost {
-		t.Fatalf("slotHostUnknown = %q, server concurrency.UnknownHost = %q — they must agree", slotHostUnknown, concurrency.UnknownHost)
-	}
-}
-
 func TestSlotWaiter_SpawnsOnceOnAdmit(t *testing.T) {
 	enq := time.Now()
 	m := &seqMarker{answers: []markerAnswer{queuedAnswer(enq), queuedAnswer(enq), admittedAnswer}}
 	rec := &slotSpawnRecorder{}
-	status, done := slotWaiters.start(testSlotSpec(m, rec, enq))
+	status, done := slotWaiters.start(testSlotSpec(m, rec))
 	if status != slotWaiterStarted {
 		t.Fatalf("status = %q, want started", status)
 	}
@@ -182,7 +186,7 @@ func TestSlotWaiter_NoSpawnWhenAnotherSessionWins(t *testing.T) {
 	enq := time.Now()
 	m := &seqMarker{answers: []markerAnswer{queuedAnswer(enq), otherWinsAnswer}}
 	rec := &slotSpawnRecorder{}
-	_, done := slotWaiters.start(testSlotSpec(m, rec, enq))
+	_, done := slotWaiters.start(testSlotSpec(m, rec))
 	waitDone(t, done)
 	if got := rec.spawned(); len(got) != 0 {
 		t.Fatalf("spawns = %v, want none: transitioned:false means another session admitted the stage", got)
@@ -195,10 +199,9 @@ func TestSlotWaiter_NoSpawnWhenAnotherSessionWins(t *testing.T) {
 func TestSlotWaiter_RetriesTransient(t *testing.T) {
 	for name, transient := range map[string]markerAnswer{"5xx": unavailableAnswr, "transport": transportAnswer} {
 		t.Run(name, func(t *testing.T) {
-			enq := time.Now()
 			m := &seqMarker{answers: []markerAnswer{transient, transient, admittedAnswer}}
 			rec := &slotSpawnRecorder{}
-			_, done := slotWaiters.start(testSlotSpec(m, rec, enq))
+			_, done := slotWaiters.start(testSlotSpec(m, rec))
 			waitDone(t, done)
 			if got := rec.spawned(); len(got) != 1 {
 				t.Fatalf("spawns = %v, want one after the transient failures", got)
@@ -211,10 +214,9 @@ func TestSlotWaiter_RetriesTransient(t *testing.T) {
 }
 
 func TestSlotWaiter_StopsOnTerminal4xx(t *testing.T) {
-	enq := time.Now()
 	m := &seqMarker{answers: []markerAnswer{notAdmissibleAns, admittedAnswer}}
 	rec := &slotSpawnRecorder{}
-	spec := testSlotSpec(m, rec, enq)
+	spec := testSlotSpec(m, rec)
 	_, done := slotWaiters.start(spec)
 	waitDone(t, done)
 	if calls, _, _ := m.snapshot(); calls != 1 {
@@ -235,31 +237,27 @@ func TestSlotWaiter_StopsOnTerminal4xx(t *testing.T) {
 
 // TestSlotWaiter_LostResponse pins approval condition 3: a transport error
 // followed by 200 transitioned:false is resolved from the stage's holding
-// block (host + held_dispatched_at vs the queue episode).
+// block, by the admission nonce the server recorded — never by the host label,
+// which two sessions on one host share.
 func TestSlotWaiter_LostResponse(t *testing.T) {
 	enq := time.Now().UTC()
-	held := enq.Add(3 * time.Second)
-	before := enq.Add(-time.Minute)
-	holding := func(host string, heldAt *time.Time, state string) *RunStageWait {
+	holding := func(nonce, state string) *RunStageWait {
 		return &RunStageWait{State: state, Concurrency: &StageConcurrency{
-			Status: concurrencyStatusHolding, Host: host, HeldDispatchedAt: heldAt,
+			Status: concurrencyStatusHolding, Host: "h1", HeldDispatchedAt: &enq, AdmissionNonce: nonce,
 		}}
 	}
 	cases := []struct {
 		name      string
-		host      string
 		stageWait *RunStageWait
 		readErr   error
 		wantSpawn int
 	}{
-		{"own admission spawns once", "h1", holding("h1", &held, "dispatched"), nil, 1},
-		{"own admission, empty label is the unknown host", "", holding(slotHostUnknown, &held, "dispatched"), nil, 1},
-		{"another host's admission spawns nothing", "h1", holding("h2", &held, "dispatched"), nil, 0},
-		{"an admission before this episode spawns nothing", "h1", holding("h1", &before, "dispatched"), nil, 0},
-		{"a running stage already has a runner", "h1", holding("h1", &held, "running"), nil, 0},
-		{"no held_dispatched_at spawns nothing", "h1", holding("h1", nil, "dispatched"), nil, 0},
-		{"no holding block spawns nothing", "h1", &RunStageWait{State: "dispatched"}, nil, 0},
-		{"a stage read error spawns nothing", "h1", nil, errors.New("read boom"), 0},
+		{"own admission spawns once", holding(testSlotNonce, "dispatched"), nil, 1},
+		{"another session on the SAME host spawns nothing", holding("nonce-other-session", "dispatched"), nil, 0},
+		{"a direct dispatch_stage admission (no nonce) spawns nothing", holding("", "dispatched"), nil, 0},
+		{"a running stage already has a runner", holding(testSlotNonce, "running"), nil, 0},
+		{"no holding block spawns nothing", &RunStageWait{State: "dispatched"}, nil, 0},
+		{"a stage read error spawns nothing", nil, errors.New("read boom"), 0},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -269,9 +267,7 @@ func TestSlotWaiter_LostResponse(t *testing.T) {
 				stageWaitErr: tc.readErr,
 			}
 			rec := &slotSpawnRecorder{}
-			spec := testSlotSpec(m, rec, enq)
-			spec.host = tc.host
-			_, done := slotWaiters.start(spec)
+			_, done := slotWaiters.start(testSlotSpec(m, rec))
 			waitDone(t, done)
 			if got := rec.spawned(); len(got) != tc.wantSpawn {
 				t.Fatalf("spawns = %v, want %d", got, tc.wantSpawn)
@@ -282,15 +278,32 @@ func TestSlotWaiter_LostResponse(t *testing.T) {
 		})
 	}
 
+	// A waiter with no nonce never claims a lost admission, not even one
+	// whose recorded nonce is also empty (a direct dispatch's).
+	t.Run("an empty nonce never claims", func(t *testing.T) {
+		m := &seqMarker{
+			answers:   []markerAnswer{transportAnswer, otherWinsAnswer},
+			stageWait: holding("", "dispatched"),
+		}
+		rec := &slotSpawnRecorder{}
+		spec := testSlotSpec(m, rec)
+		spec.nonce = ""
+		_, done := slotWaiters.start(spec)
+		waitDone(t, done)
+		if got := rec.spawned(); len(got) != 0 {
+			t.Fatalf("spawns = %v, want none", got)
+		}
+	})
+
 	// A definitive queued answer after the lost request clears it: a later
 	// transitioned:false is another session's, even with an own-looking block.
 	t.Run("queued after the loss clears it", func(t *testing.T) {
 		m := &seqMarker{
 			answers:   []markerAnswer{transportAnswer, queuedAnswer(enq), otherWinsAnswer},
-			stageWait: holding("h1", &held, "dispatched"),
+			stageWait: holding(testSlotNonce, "dispatched"),
 		}
 		rec := &slotSpawnRecorder{}
-		_, done := slotWaiters.start(testSlotSpec(m, rec, enq))
+		_, done := slotWaiters.start(testSlotSpec(m, rec))
 		waitDone(t, done)
 		if got := rec.spawned(); len(got) != 0 {
 			t.Fatalf("spawns = %v, want none", got)
@@ -298,12 +311,113 @@ func TestSlotWaiter_LostResponse(t *testing.T) {
 	})
 }
 
+// TestSlotWaiter_SendsItsNonceOnEveryPoll: the nonce rides every marker POST,
+// so whichever poll is admitted records it.
+func TestSlotWaiter_SendsItsNonceOnEveryPoll(t *testing.T) {
+	enq := time.Now()
+	m := &seqMarker{answers: []markerAnswer{queuedAnswer(enq), transportAnswer, admittedAnswer}}
+	rec := &slotSpawnRecorder{}
+	_, done := slotWaiters.start(testSlotSpec(m, rec))
+	waitDone(t, done)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.nonces) != 3 {
+		t.Fatalf("marker calls = %d, want 3", len(m.nonces))
+	}
+	for i, n := range m.nonces {
+		if n != testSlotNonce {
+			t.Fatalf("poll %d carried nonce %q, want %q", i, n, testSlotNonce)
+		}
+	}
+}
+
+func TestNewAdmissionNonce(t *testing.T) {
+	a, b := newAdmissionNonce(), newAdmissionNonce()
+	if a == b || len(a) != 36 {
+		t.Fatalf("nonces %q, %q; want two distinct UUIDs", a, b)
+	}
+}
+
+// TestJitteredPoll pins the ±20% bounds of one poll wait.
+func TestJitteredPoll(t *testing.T) {
+	base := 5 * time.Second
+	if got := jitteredPoll(base, 0); got != 4*time.Second {
+		t.Fatalf("jitteredPoll(r=0) = %v, want 4s (-20%%)", got)
+	}
+	if got := jitteredPoll(base, 0.5); got != base {
+		t.Fatalf("jitteredPoll(r=0.5) = %v, want 5s", got)
+	}
+	if got := jitteredPoll(base, 0.999999); got < 5999*time.Millisecond || got >= 6*time.Second {
+		t.Fatalf("jitteredPoll(r→1) = %v, want just under 6s (+20%%)", got)
+	}
+	for i := 0; i < 100; i++ {
+		if got := randomJitteredPoll(base); got < 4*time.Second || got >= 6*time.Second {
+			t.Fatalf("randomJitteredPoll = %v, want within [4s, 6s)", got)
+		}
+	}
+}
+
+// seqJitter answers its waits in order, repeating the last.
+func seqJitter(waits ...time.Duration) func(time.Duration) time.Duration {
+	var mu sync.Mutex
+	i := 0
+	return func(time.Duration) time.Duration {
+		mu.Lock()
+		defer mu.Unlock()
+		w := waits[min(i, len(waits)-1)]
+		i++
+		return w
+	}
+}
+
+// TestSlotWaiter_ContendedAnswerRetriesOnceAtOnce: a contended queued answer
+// is retried immediately, once; every other wait is a full jittered poll
+// (here an hour, far past the cap, so only an immediate retry can poll again).
+func TestSlotWaiter_ContendedAnswerRetriesOnceAtOnce(t *testing.T) {
+	enq := time.Now()
+	cases := []struct {
+		name          string
+		contendedSpec bool
+		answers       []markerAnswer
+		jitter        []time.Duration
+		wantCalls     int
+		wantSpawn     int
+	}{
+		{"a contended answer is retried at once", false,
+			[]markerAnswer{queuedAnswerContended(enq, true), admittedAnswer}, []time.Duration{time.Millisecond, time.Hour}, 2, 1},
+		{"the immediate retry is not retried again", false,
+			[]markerAnswer{queuedAnswerContended(enq, true), queuedAnswerContended(enq, true), admittedAnswer}, []time.Duration{time.Millisecond, time.Hour}, 2, 0},
+		{"an uncontended answer waits a full poll", false,
+			[]markerAnswer{queuedAnswer(enq), admittedAnswer}, []time.Duration{time.Millisecond, time.Hour}, 1, 0},
+		{"the dispatch call's contended answer makes the first poll immediate", true,
+			[]markerAnswer{admittedAnswer}, []time.Duration{time.Hour}, 1, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &seqMarker{answers: tc.answers}
+			rec := &slotSpawnRecorder{}
+			spec := testSlotSpec(m, rec)
+			spec.contended = tc.contendedSpec
+			spec.jitter = seqJitter(tc.jitter...)
+			spec.cap = timescale.D(300 * time.Millisecond)
+			_, done := slotWaiters.start(spec)
+			waitDone(t, done)
+			if calls, _, _ := m.snapshot(); calls != tc.wantCalls {
+				t.Fatalf("marker calls = %d, want %d", calls, tc.wantCalls)
+			}
+			if got := rec.spawned(); len(got) != tc.wantSpawn {
+				t.Fatalf("spawns = %v, want %d", got, tc.wantSpawn)
+			}
+		})
+	}
+}
+
 func TestSlotWaiter_RebuildsSpawnInputsAtAdmission(t *testing.T) {
 	enq := time.Now()
 	gate := make(chan struct{})
 	m := &seqMarker{answers: []markerAnswer{queuedAnswer(enq), queuedAnswer(enq), admittedAnswer}}
 	rec := &slotSpawnRecorder{}
-	spec := testSlotSpec(m, rec, enq)
+	spec := testSlotSpec(m, rec)
 	var mu sync.Mutex
 	binary := "/old/fishhawk-runner"
 	prepared := 0
@@ -339,16 +453,16 @@ type gatedMarker struct {
 	gate <-chan struct{}
 }
 
-func (g gatedMarker) HostDispatchStage(ctx context.Context, runID, stageID uuid.UUID) (*HostDispatchResult, error) {
+func (g gatedMarker) HostDispatchStageWithNonce(ctx context.Context, runID, stageID uuid.UUID, nonce string) (*HostDispatchResult, error) {
 	<-g.gate
-	return g.slotMarker.HostDispatchStage(ctx, runID, stageID)
+	return g.slotMarker.HostDispatchStageWithNonce(ctx, runID, stageID, nonce)
 }
 
 func TestSlotWaiter_CapExpiryStops(t *testing.T) {
 	enq := time.Now()
 	m := &seqMarker{answers: []markerAnswer{queuedAnswer(enq)}}
 	rec := &slotSpawnRecorder{}
-	spec := testSlotSpec(m, rec, enq)
+	spec := testSlotSpec(m, rec)
 	spec.cap = 50 * time.Millisecond
 	var logged []string
 	var lmu sync.Mutex
@@ -379,11 +493,10 @@ func TestSlotWaiter_CapExpiryStops(t *testing.T) {
 // never cancels an in-flight marker POST, whose admission would otherwise be
 // lost with no spawn.
 func TestSlotWaiter_CapDoesNotCancelInFlightAdmission(t *testing.T) {
-	enq := time.Now()
 	block := make(chan struct{})
 	m := &seqMarker{answers: []markerAnswer{admittedAnswer}, block: block}
 	rec := &slotSpawnRecorder{}
-	spec := testSlotSpec(m, rec, enq)
+	spec := testSlotSpec(m, rec)
 	spec.cap = 20 * time.Millisecond
 	_, done := slotWaiters.start(spec)
 	time.Sleep(timescale.D(200 * time.Millisecond)) // the cap expires mid-request
@@ -395,11 +508,10 @@ func TestSlotWaiter_CapDoesNotCancelInFlightAdmission(t *testing.T) {
 }
 
 func TestSlotWaiter_DedupesPerStage(t *testing.T) {
-	enq := time.Now()
 	gate := make(chan struct{})
 	m := &seqMarker{answers: []markerAnswer{admittedAnswer}}
 	rec := &slotSpawnRecorder{}
-	spec := testSlotSpec(m, rec, enq)
+	spec := testSlotSpec(m, rec)
 	spec.marker = gatedMarker{slotMarker: m, gate: gate}
 	status1, done1 := slotWaiters.start(spec)
 	status2, done2 := slotWaiters.start(spec)
@@ -427,10 +539,9 @@ func TestSlotWaiter_SpawnFailureReleasesSlot(t *testing.T) {
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			enq := time.Now()
 			m := &seqMarker{answers: []markerAnswer{admittedAnswer}}
 			rec := &slotSpawnRecorder{}
-			spec := testSlotSpec(m, rec, enq)
+			spec := testSlotSpec(m, rec)
 			mutate(&spec, rec)
 			_, done := slotWaiters.start(spec)
 			waitDone(t, done)
@@ -443,7 +554,7 @@ func TestSlotWaiter_SpawnFailureReleasesSlot(t *testing.T) {
 	// A failed release is logged, not retried forever.
 	m := &seqMarker{answers: []markerAnswer{admittedAnswer}, reportErr: errors.New("reap boom")}
 	rec := &slotSpawnRecorder{err: errors.New("boom")}
-	spec := testSlotSpec(m, rec, time.Now())
+	spec := testSlotSpec(m, rec)
 	var logged string
 	spec.logf = func(f string, a ...any) { logged = f }
 	_, done := slotWaiters.start(spec)
@@ -462,6 +573,9 @@ type e2eSlotFixture struct {
 	runRepo runpkg.Repository
 	r       *runResolver
 	rec     *slotSpawnRecorder
+	// baseURL / bearer let a test open a SECOND session's client against the
+	// same server (another MCP process on the same host).
+	baseURL, bearer string
 }
 
 func newE2ESlotFixture(t *testing.T) *e2eSlotFixture {
@@ -512,7 +626,73 @@ func newE2ESlotFixture(t *testing.T) *e2eSlotFixture {
 			time.Sleep(20 * time.Millisecond)
 		}
 	})
-	return &e2eSlotFixture{ctx: ctx, runRepo: runRepo, r: r, rec: rec}
+	return &e2eSlotFixture{ctx: ctx, runRepo: runRepo, r: r, rec: rec, baseURL: ts.URL, bearer: bearer}
+}
+
+// session opens another MCP session's client on the SAME host label.
+func (f *e2eSlotFixture) session() *apiClient {
+	api := newAPIClient(config{backendURL: f.baseURL, apiToken: f.bearer})
+	api.hostLabel = f.r.api.hostLabel
+	return api
+}
+
+// waiterSpec is a waiter for st over marker with nonce, spawning into f.rec.
+func (f *e2eSlotFixture) waiterSpec(st *runpkg.Stage, marker slotMarker, nonce string) slotWaiterSpec {
+	return slotWaiterSpec{
+		runID: st.RunID, stageID: st.ID, nonce: nonce, marker: marker,
+		prepare: func() (slotSpawnInputs, error) { return slotSpawnInputs{binary: "/fake/fishhawk-runner"}, nil },
+		spawn:   f.rec.spawn,
+		cap:     concurrencyWaiterCap,
+		poll:    concurrencySlotPollInterval,
+		logf:    func(string, ...any) {},
+	}
+}
+
+// lossyMarker loses the RESPONSE of its loseAt-th call (1-based): it forwards
+// that request to the real server only when send is true (the server then
+// processes it), runs during() — another session acting inside the loss — and
+// answers a transport error either way. Every other call is forwarded.
+type lossyMarker struct {
+	slotMarker
+	mu     sync.Mutex
+	calls  int
+	loseAt int
+	send   bool
+	during func()
+}
+
+func (l *lossyMarker) HostDispatchStageWithNonce(ctx context.Context, runID, stageID uuid.UUID, nonce string) (*HostDispatchResult, error) {
+	l.mu.Lock()
+	l.calls++
+	n := l.calls
+	l.mu.Unlock()
+	if n != l.loseAt {
+		return l.slotMarker.HostDispatchStageWithNonce(ctx, runID, stageID, nonce)
+	}
+	if l.send {
+		_, _ = l.slotMarker.HostDispatchStageWithNonce(ctx, runID, stageID, nonce)
+	}
+	if l.during != nil {
+		l.during()
+	}
+	return nil, errors.New("read tcp 127.0.0.1:8080: connection reset by peer")
+}
+
+// runWaiter runs spec's poll loop synchronously under its cap.
+func (f *e2eSlotFixture) runWaiter(spec slotWaiterSpec) {
+	ctx, cancel := context.WithTimeout(f.ctx, spec.cap)
+	defer cancel()
+	runSlotWaiter(ctx, spec)
+}
+
+func (f *e2eSlotFixture) spawnCount(st *runpkg.Stage) int {
+	n := 0
+	for _, id := range f.rec.spawned() {
+		if id == st.ID.String() {
+			n++
+		}
+	}
+	return n
 }
 
 // park creates a run with one implement stage at awaiting_host_dispatch.
@@ -669,6 +849,104 @@ func TestConcurrencySlot_E2E_TwoFakeRunners(t *testing.T) {
 		defer slotWaiters.mu.Unlock()
 		return len(slotWaiters.active) == 0
 	})
+}
+
+// TestConcurrencySlot_E2E_LostResponseOwnership pins approval condition 3
+// against the REAL marker and slot store: waiter W's marker POST is lost (a
+// transport error), the stage is admitted during the loss, and W's next POST
+// answers 200 transitioned:false. Every arm spawns the stage EXACTLY once. W
+// spawns only when the server recorded W's own nonce; another session on the
+// SAME host label, or a direct fishhawk_dispatch_stage, is told apart by the
+// recorded nonce although the host label is identical.
+func TestConcurrencySlot_E2E_LostResponseOwnership(t *testing.T) {
+	const wNonce = "nonce-waiter-w"
+	cases := []struct {
+		name string
+		// send forwards W's lost request (the admission was W's own).
+		send bool
+		// during is the other actor inside the loss (nil: none).
+		during      func(t *testing.T, f *e2eSlotFixture, st *runpkg.Stage)
+		wantNonce   string
+		wantSpawner string
+	}{
+		{name: "own lost admission spawns once", send: true, wantNonce: wNonce, wantSpawner: "W"},
+		{name: "another session on the same host admits: W spawns nothing",
+			during: func(t *testing.T, f *e2eSlotFixture, st *runpkg.Stage) {
+				f.runWaiter(f.waiterSpec(st, f.session(), "nonce-session-2"))
+			},
+			wantNonce: "nonce-session-2", wantSpawner: "session 2"},
+		{name: "a manual direct re-dispatch admits: W spawns nothing",
+			during: func(t *testing.T, f *e2eSlotFixture, st *runpkg.Stage) {
+				f.dispatch(t, st)
+			},
+			wantNonce: "", wantSpawner: "the direct dispatch"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newE2ESlotFixture(t)
+			st := f.park(t, nil)
+			lossy := &lossyMarker{slotMarker: f.r.api, loseAt: 1, send: tc.send}
+			if tc.during != nil {
+				lossy.during = func() { tc.during(t, f, st) }
+			}
+			f.runWaiter(f.waiterSpec(st, lossy, wNonce))
+
+			if n := f.spawnCount(st); n != 1 {
+				t.Fatalf("spawns of the stage = %d, want exactly 1 (by %s)", n, tc.wantSpawner)
+			}
+			sw, err := f.r.api.GetRunStageWait(f.ctx, st.RunID, st.ID, 0)
+			if err != nil || sw.State != "dispatched" || sw.Concurrency == nil || sw.Concurrency.Status != concurrencyStatusHolding {
+				t.Fatalf("stage = %+v, %v; want dispatched holding", sw, err)
+			}
+			if c := sw.Concurrency; c.Host != "e2e-host" || c.AdmissionNonce != tc.wantNonce {
+				t.Fatalf("holding block host=%q nonce=%q, want host e2e-host (shared by every session) and nonce %q", c.Host, c.AdmissionNonce, tc.wantNonce)
+			}
+			if lossy.calls != 2 {
+				t.Fatalf("W marker calls = %d, want 2 (the lost POST, then transitioned:false)", lossy.calls)
+			}
+		})
+	}
+}
+
+// TestConcurrencySlot_E2E_TerminalRunStopsWaiter: B is queued behind A with a
+// live waiter, then B's run goes terminal (cancelled, or separately failed).
+// When A settles and the slot frees, the marker refuses B's waiter (409
+// dispatch_not_admissible) instead of admitting a dead run's stage: B never
+// spawns, stays awaiting_host_dispatch, and the waiter registry is cleared.
+func TestConcurrencySlot_E2E_TerminalRunStopsWaiter(t *testing.T) {
+	for _, terminal := range []runpkg.State{runpkg.StateCancelled, runpkg.StateFailed} {
+		t.Run(string(terminal), func(t *testing.T) {
+			f := newE2ESlotFixture(t)
+			a, b := f.park(t, nil), f.park(t, nil)
+			f.dispatch(t, a)
+			if out := f.dispatch(t, b); out.ConcurrencySlot == nil || out.ConcurrencySlot.Waiter != slotWaiterStarted {
+				t.Fatalf("B slot = %+v, want queued with a started waiter", out.ConcurrencySlot)
+			}
+			slotWaiters.mu.Lock()
+			done, ok := slotWaiters.active[b.ID]
+			slotWaiters.mu.Unlock()
+			if !ok {
+				t.Fatal("no live waiter registered for B")
+			}
+			if _, err := f.runRepo.TransitionRun(f.ctx, b.RunID, terminal); err != nil {
+				t.Fatalf("transition B's run to %s: %v", terminal, err)
+			}
+			f.settle(t, a) // the slot frees: only the terminal-run refusal keeps B out
+			waitDone(t, done)
+			if n := f.spawnCount(b); n != 0 {
+				t.Fatalf("B spawned %d time(s) for a %s run, want none", n, terminal)
+			}
+			if got := f.stageState(t, b); got != "awaiting_host_dispatch" {
+				t.Fatalf("B state = %s, want awaiting_host_dispatch (never admitted)", got)
+			}
+			slotWaiters.mu.Lock()
+			_, still := slotWaiters.active[b.ID]
+			slotWaiters.mu.Unlock()
+			if still {
+				t.Fatal("B's waiter is still registered after it stopped")
+			}
+		})
+	}
 }
 
 // TestConcurrencySlot_E2E_SpecLimitTwo: a workflow spec declaring implement

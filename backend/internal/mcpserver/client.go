@@ -2109,12 +2109,15 @@ type StageConcurrency struct {
 	QueuedBefore  bool `json:"queued_before,omitempty" jsonschema:"on an admission: true when the stage queued before it was admitted"`
 	WaitedSeconds int  `json:"waited_seconds,omitempty" jsonschema:"on an admission: seconds the stage spent queued"`
 	Contended     bool `json:"contended,omitempty" jsonschema:"on a queued answer: another admission held the group lock at that instant"`
-	// Host / HeldDispatchedAt identify the admission a holding row records
-	// (the host label and the dispatched_at of the attempt it admitted), so a
-	// waiter that lost an admission response can tell its own admission from
-	// another session's (#3964 approval condition 3).
+	// Host / HeldDispatchedAt describe the admission a holding row records
+	// (the host label and the dispatched_at of the attempt it admitted).
+	// AdmissionNonce is the slot-waiter nonce the admitting request carried:
+	// a waiter that lost an admission response claims the admission only when
+	// it equals its own (#3964 approval condition 3), because two sessions on
+	// one host share a host label.
 	Host             string     `json:"host,omitempty" jsonschema:"while holding: the host label the slot was admitted for"`
 	HeldDispatchedAt *time.Time `json:"held_dispatched_at,omitempty" jsonschema:"while holding: the dispatched_at of the dispatch attempt the slot admitted"`
+	AdmissionNonce   string     `json:"admission_nonce,omitempty" jsonschema:"while holding, and on the host-dispatch admission block: the slot waiter nonce the admitting request carried (absent for a direct fishhawk_dispatch_stage admission). It identifies which waiter's request admitted the stage"`
 }
 
 // waiterLive is the nil-safe read of WaiterLive: absent reads as false, the
@@ -2285,12 +2288,21 @@ func asConcurrencySlotQueued(err error) (*concurrencySlotQueuedError, bool) {
 // keying the default `local-implement:<host>` group; an empty label sends no
 // body (the server's `unknown` host).
 func (c *apiClient) HostDispatchStage(ctx context.Context, runID, stageID uuid.UUID) (*HostDispatchResult, error) {
+	return c.HostDispatchStageWithNonce(ctx, runID, stageID, "")
+}
+
+// HostDispatchStageWithNonce is HostDispatchStage carrying a slot waiter's
+// admission nonce as {"admission_nonce": nonce} (#3964): an admission records
+// it on the held slot row, so the waiter can recognise its own admission
+// after a lost response. An empty nonce sends none.
+func (c *apiClient) HostDispatchStageWithNonce(ctx context.Context, runID, stageID uuid.UUID, nonce string) (*HostDispatchResult, error) {
 	path := "/v0/runs/" + runID.String() + "/stages/" + stageID.String() + "/host-dispatch"
 	var body []byte
-	if c.hostLabel != "" {
+	if c.hostLabel != "" || nonce != "" {
 		b, err := json.Marshal(struct {
-			Host string `json:"host"`
-		}{Host: c.hostLabel})
+			Host           string `json:"host,omitempty"`
+			AdmissionNonce string `json:"admission_nonce,omitempty"`
+		}{Host: c.hostLabel, AdmissionNonce: nonce})
 		if err != nil {
 			return nil, fmt.Errorf("marshal host-dispatch body: %w", err)
 		}

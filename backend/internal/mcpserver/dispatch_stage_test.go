@@ -2947,9 +2947,9 @@ func TestDispatchStage_QueuedReturnsAwaitingConcurrencySlotNoSpawn(t *testing.T)
 		t.Fatalf("waiter starts = %d, want 1", len(started))
 	}
 	spec := started[0]
-	if spec.runID != f.runID || spec.stageID != f.stageID || spec.host != "h1" || spec.episodeStart == nil ||
-		!spec.episodeStart.Equal(time.Date(2026, 10, 5, 0, 1, 0, 0, time.UTC)) || spec.spawn == nil || spec.prepare == nil {
-		t.Fatalf("waiter spec = %+v, want the stage, host label, queued episode and spawn inputs", spec)
+	if spec.runID != f.runID || spec.stageID != f.stageID || len(spec.nonce) != 36 || spec.contended ||
+		spec.jitter == nil || spec.spawn == nil || spec.prepare == nil {
+		t.Fatalf("waiter spec = %+v, want the stage, a fresh admission nonce, the uncontended answer, the poll jitter and spawn inputs", spec)
 	}
 	// prepare REBUILDS the spawn inputs at admission: a runner binary changed
 	// while queued is the one spawned.

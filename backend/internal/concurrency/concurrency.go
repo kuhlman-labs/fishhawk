@@ -71,6 +71,11 @@ type Request struct {
 	Limit int
 	// Host is the client-supplied host label recorded on the row.
 	Host string
+	// AdmissionNonce is the client-supplied slot-waiter nonce ("" for none).
+	// An admission records it on the held row (a queued row never carries
+	// one), so a waiter that lost its admission response can recognise its
+	// own admission (README.md § "Admission nonce").
+	AdmissionNonce string
 }
 
 // Holder is one stage currently holding a slot in a group.
@@ -114,11 +119,14 @@ type Status struct {
 	AcquiredAt *time.Time
 	// WaiterLive reports a queued row was refreshed within QueueTTL.
 	WaiterLive bool
-	// Host and HeldDispatchedAt identify the admission a held row records, so
-	// a client that lost an admission response can tell its own admission
-	// (same host, same attempt) from another session's.
+	// Host and HeldDispatchedAt describe the admission a held row records
+	// (the host label and the admitted attempt). They are informational: two
+	// sessions on one host share a label, so ownership is AdmissionNonce.
 	Host             string
 	HeldDispatchedAt *time.Time
+	// AdmissionNonce is the nonce the admitting request carried ("" when it
+	// carried none); set only on a held status.
+	AdmissionNonce string
 }
 
 // Store is the slot store.

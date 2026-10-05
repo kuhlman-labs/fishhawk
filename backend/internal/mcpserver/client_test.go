@@ -4414,14 +4414,17 @@ func TestHostDispatchLabel_Seam(t *testing.T) {
 	}
 }
 
-// TestHostDispatchStage_SendsHostBody: the marker carries {"host": label} as
-// JSON; an empty label sends no body at all.
+// TestHostDispatchStage_SendsHostBody: the marker carries {"host": label} and
+// a slot waiter's {"admission_nonce": nonce} as JSON; with neither, no body at
+// all.
 func TestHostDispatchStage_SendsHostBody(t *testing.T) {
 	for _, tc := range []struct {
-		name, label, wantBody, wantCT string
+		name, label, nonce, wantBody, wantCT string
 	}{
-		{"label sends the host body", "h1", `{"host":"h1"}`, "application/json"},
-		{"empty label sends no body", "", "", ""},
+		{"label sends the host body", "h1", "", `{"host":"h1"}`, "application/json"},
+		{"empty label sends no body", "", "", "", ""},
+		{"a waiter nonce rides with the label", "h1", "n-1", `{"host":"h1","admission_nonce":"n-1"}`, "application/json"},
+		{"a waiter nonce without a label", "", "n-1", `{"admission_nonce":"n-1"}`, "application/json"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var gotBody, gotCT string
@@ -4433,8 +4436,8 @@ func TestHostDispatchStage_SendsHostBody(t *testing.T) {
 			defer ts.Close()
 			c := newAPIClient(config{backendURL: ts.URL, apiToken: "tok"})
 			c.hostLabel = tc.label
-			if _, err := c.HostDispatchStage(context.Background(), uuid.New(), uuid.New()); err != nil {
-				t.Fatalf("HostDispatchStage: %v", err)
+			if _, err := c.HostDispatchStageWithNonce(context.Background(), uuid.New(), uuid.New(), tc.nonce); err != nil {
+				t.Fatalf("HostDispatchStageWithNonce: %v", err)
 			}
 			if gotBody != tc.wantBody || gotCT != tc.wantCT {
 				t.Errorf("body/content-type = %q/%q, want %q/%q", gotBody, gotCT, tc.wantBody, tc.wantCT)
@@ -4580,12 +4583,12 @@ func TestHostDispatchStage_AdmittedConcurrencyDecoded(t *testing.T) {
 // TestStageMirrors_DecodeConcurrency pins the Stage and RunStageWait
 // `concurrency` json tags (and the block's own tags) against server-shaped
 // literal bodies: an explicit waiter_live:false survives as a non-nil false,
-// and a holding block carries host + held_dispatched_at.
+// and a holding block carries host + held_dispatched_at + admission_nonce.
 func TestStageMirrors_DecodeConcurrency(t *testing.T) {
 	const queued = `{"status":"awaiting_concurrency_slot","group":"local-implement:h1","limit":1,"position":3,` +
 		`"holders":[{"run_id":"r1","stage_id":"s1","since":"2026-10-05T10:00:00Z"}],"enqueued_at":"2026-10-05T10:01:00Z","waiter_live":false}`
 	const holding = `{"status":"holding","group":"local-implement:h1","limit":1,"holders":[],"enqueued_at":"2026-10-05T10:01:00Z",` +
-		`"acquired_at":"2026-10-05T10:02:00Z","waiter_live":false,"host":"h1","held_dispatched_at":"2026-10-05T10:02:00Z"}`
+		`"acquired_at":"2026-10-05T10:02:00Z","waiter_live":false,"host":"h1","held_dispatched_at":"2026-10-05T10:02:00Z","admission_nonce":"n-1"}`
 
 	var st Stage
 	if err := json.Unmarshal([]byte(`{"id":"s","type":"implement","state":"awaiting_host_dispatch","concurrency":`+queued+`}`), &st); err != nil {
@@ -4605,8 +4608,8 @@ func TestStageMirrors_DecodeConcurrency(t *testing.T) {
 		t.Fatalf("decode RunStageWait: %v", err)
 	}
 	h := sw.Concurrency
-	if h == nil || h.Status != concurrencyStatusHolding || h.Host != "h1" || h.HeldDispatchedAt == nil || h.AcquiredAt == nil {
-		t.Fatalf("RunStageWait.Concurrency = %+v, want the holding block with host + held_dispatched_at", h)
+	if h == nil || h.Status != concurrencyStatusHolding || h.Host != "h1" || h.HeldDispatchedAt == nil || h.AcquiredAt == nil || h.AdmissionNonce != "n-1" {
+		t.Fatalf("RunStageWait.Concurrency = %+v, want the holding block with host + held_dispatched_at + admission_nonce", h)
 	}
 
 	var bare Stage

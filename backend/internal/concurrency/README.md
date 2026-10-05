@@ -9,7 +9,7 @@ pgx, with no sqlc (same precedent as `captain/store.go`).
 ## Contract
 
 - `Admit(ctx, Request) (Admission, error)`. `Request{StageID, RunID, From,
-  GroupKey, Limit, Host}`. `From` must be `pending` or
+  GroupKey, Limit, Host, AdmissionNonce}`. `From` must be `pending` or
   `awaiting_host_dispatch`, `Limit` must be `1..MaxLimit`, and `RunID` must be
   the stage's own run. Each violation is refused before any SQL runs:
   `ErrInvalidRequest` for the first two, and `run.ErrNotFound` for a stage/run
@@ -17,7 +17,8 @@ pgx, with no sqlc (same precedent as `captain/store.go`).
   - **Admitted**: the stage was CAS'd `From → dispatched`
     (`run.TransitionStageFromTx`, which runs inside the admission transaction),
     and its row is `held` with `held_dispatched_at` = the `dispatched_at` the
-    CAS stamped. `QueuedBefore` and `WaitedSeconds` are set when the stage
+    CAS stamped and `admission_nonce` = the request's `AdmissionNonce` (NULL
+    when empty). `QueuedBefore` and `WaitedSeconds` are set when the stage
     waited during this episode.
   - **Queued**: the stage state is untouched and its row is `queued`.
     `Position` is 1-based. `Holders` lists the live holders and is never nil,
@@ -37,9 +38,10 @@ pgx, with no sqlc (same precedent as `captain/store.go`).
   - a `held` row that currently counts (same attempt and live).
 
   Settled, parked, bypassed and previous-episode rows are omitted. A held
-  status carries `Host` + `HeldDispatchedAt`. A client that lost an admission
-  response (transport error, then `200 transitioned:false`) uses them to tell
-  its own admission from another session's.
+  status carries `Host` + `HeldDispatchedAt` (informational) and
+  `AdmissionNonce`, which is what a client that lost an admission response
+  uses to tell its own admission from another session's (§ "Admission
+  nonce").
 
 ## Admit, step by step (one transaction, one pooled connection)
 
@@ -56,8 +58,8 @@ pgx, with no sqlc (same precedent as `captain/store.go`).
    episode. The row restarts at the TAIL (`enqueued_at = clock_timestamp()`)
    when it was `held`, was queued in a different group, or was queued but
    stale past `QueueTTL`. Otherwise it keeps its `enqueued_at`. In every case
-   it gets `last_seen_at = now`, and `acquired_at`/`held_dispatched_at` are
-   cleared.
+   it gets `last_seen_at = now`, and `acquired_at`/`held_dispatched_at`/
+   `admission_nonce` are cleared.
 5. Read the holders and the queued-ahead counts.
 6. **Lock miss**: commit the queued row and return `Contended=true`, with a
    position/holders snapshot.
@@ -65,18 +67,48 @@ pgx, with no sqlc (same precedent as `captain/store.go`).
    counts only fresh queued rows enqueued at or before the round start
    (approval condition 2). A contended loser's row is inserted after it
    missed the lock, which is after this call's round start. So a row committed
-   during the winner's own round can never block the winner. A free slot
-   therefore always admits someone in the round. Pinned by
+   during the winner's own round can never block the winner. Pinned by
    `TestAdmit_SameRoundLoserDoesNotPreemptWinner` and
-   `TestAdmit_PoolSmallerThanConcurrentAdmits` (exactly one admitted).
+   `TestAdmit_PoolSmallerThanConcurrentAdmits` (exactly one admitted among
+   stages that never queued before).
+   What this does NOT guarantee is that a free slot admits someone in EVERY
+   round. When an OLDER fresh queued row polls in the same instant a newer
+   row wins the lock, the winner counts the older row ahead and stays
+   queued, and the older row misses the lock and queues `Contended` without
+   deciding: nobody is admitted that round. The store does not close this;
+   the MCP slot waiter bounds it. After a contended answer it retries once at
+   once, by which time the winner's transaction has normally committed, so
+   the older row wins the lock and is admitted. Its poll interval is jittered
+   ±20%, so two waiters' polls do not stay phase-aligned across rounds.
+   `TestAdmit_ContendedHeadAdmittedOnRetry` pins the store half (winner
+   parked on `afterLock` while the older row polls, then the older row's
+   retry admits it); the waiter half is
+   `backend/internal/mcpserver/README.md` § "Local concurrency slot waiter".
    Residual: the round start is read a few microseconds before the try-lock.
    A lock-HIT admitter that commits a queued row inside that gap is also
    excluded, so the winner may go ahead of it once. Someone is still admitted.
 8. Admit: `run.TransitionStageFromTx(... From → dispatched)` (the 0072 trigger
-   stamps `dispatched_at`), then mark the row `held`.
+   stamps `dispatched_at`), then mark the row `held`, recording the request's
+   admission nonce.
 
 Every time comparison uses the database clock. No Go `time.Now()` value is
 passed into SQL.
+
+## Admission nonce
+
+A slot waiter sends a random nonce (one per waiter) on every marker POST;
+the marker passes it as `Request.AdmissionNonce`. Only an ADMISSION writes it
+(the held mark); every queue upsert clears it, so a queued row never carries
+one and a later admission overwrites any previous episode's. A waiter that saw
+a transport error and then `200 transitioned:false` claims the admission only
+when the held row's nonce equals its own. Another session on the same host, or
+a manual `fishhawk_dispatch_stage` (which sends no nonce), records a different
+or empty nonce, so the waiter exits without spawning. Two sessions on one host
+share a host label and can both satisfy "same host, admitted this episode",
+which is why the label is not used for ownership. The nonce is an ownership
+marker, not a credential: it is visible on the stage read to any reader of the
+run, and a caller able to replay it could already spawn a runner with
+`write:runs`.
 
 ## Derived holders (the release rule)
 

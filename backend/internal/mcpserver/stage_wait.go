@@ -405,10 +405,11 @@ func stageWaitStatusFor(stages []Stage, stageType, runState string, predictedMin
 		if s.Type == stageType {
 			st := classifyStageWaitStatus(stageType, s.State, runState, s.StartedAt, predictedMinutes, now)
 			// The concurrency-slot block (#3964) rides every non-terminal stage,
-			// including on a terminal run (the ADR-036 window), so a queue is
-			// visible for as long as the stage can still be admitted. The
-			// backend already omits a settled stage's block; this guard keeps a
-			// terminal stage from ever advertising one.
+			// including on a terminal run (the ADR-036 window): the backend still
+			// reports such a stage's queue row, and the block then shows its
+			// waiter going stale — the marker refuses a terminal run's stage, so
+			// it is never admitted. The backend already omits a settled stage's
+			// block; this guard keeps a terminal stage from ever advertising one.
 			if !stageStateIsTerminal(s.State) {
 				st.Concurrency = s.Concurrency
 			}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"os"
 	"sync"
 	"time"
@@ -15,19 +16,39 @@ import (
 // host-dispatch queue. When the host-dispatch marker answers 409
 // concurrency_slot_queued, fishhawk_dispatch_stage spawns nothing and hands
 // the dispatch to ONE in-process waiter per stage. The waiter re-POSTs the
-// marker every concurrencySlotPollInterval (each POST refreshes the queue
-// row's last_seen_at, which is what keeps the stage's place in the FIFO) and
-// spawns the runner only when the marker admits it. Contract and residuals:
-// README.md § "Local concurrency slot waiter".
+// marker every concurrencySlotPollInterval ±20% (each POST refreshes the queue
+// row's last_seen_at, which is what keeps the stage's place in the FIFO),
+// retries once at once after a contended answer, and spawns the runner only
+// when the marker admits it. Contract and residuals: README.md § "Local
+// concurrency slot waiter".
 
 // concurrencyWaiterCap bounds one waiter's lifetime: three full 60-minute
 // implement budgets queued ahead. Package var so tests shrink it.
 var concurrencyWaiterCap = 3 * time.Hour
 
-// concurrencySlotPollInterval is the marker re-POST cadence; it mirrors the
-// server's concurrency.WaiterPollInterval (the 409's poll_interval_seconds and
-// Retry-After). Package var so tests shrink it.
+// concurrencySlotPollInterval is the marker re-POST cadence before jitter; it
+// mirrors the server's concurrency.WaiterPollInterval (the 409's
+// poll_interval_seconds and Retry-After). Package var so tests shrink it.
 var concurrencySlotPollInterval = 5 * time.Second
+
+// slotPollJitter is the ± fraction applied to every poll wait, so two waiters
+// whose polls collide on the group lock do not stay phase-aligned.
+const slotPollJitter = 0.2
+
+// jitteredPoll scales base by a factor in [1-slotPollJitter, 1+slotPollJitter)
+// picked by r in [0, 1). Pure so a test pins the bounds.
+func jitteredPoll(base time.Duration, r float64) time.Duration {
+	return time.Duration(float64(base) * (1 - slotPollJitter + 2*slotPollJitter*r))
+}
+
+// randomJitteredPoll is the production slotWaiterSpec.jitter.
+func randomJitteredPoll(base time.Duration) time.Duration {
+	return jitteredPoll(base, rand.Float64())
+}
+
+// newAdmissionNonce mints a slot waiter's admission nonce: random, one per
+// waiter, sent on every marker POST it makes.
+func newAdmissionNonce() string { return uuid.NewString() }
 
 // The StageConcurrency.Waiter values a queued dispatch reports.
 const (
@@ -35,15 +56,10 @@ const (
 	slotWaiterAlreadyWaiting = "already_waiting"
 )
 
-// slotHostUnknown is the host the server files a body-less marker under; it
-// mirrors backend/internal/concurrency UnknownHost (pinned by
-// TestSlotWaiter_UnknownHostMirrorsServer).
-const slotHostUnknown = "unknown"
-
 // slotMarker is the narrow backend surface the waiter uses. *apiClient
 // satisfies it; the unit tests use an in-file sequenced fake.
 type slotMarker interface {
-	HostDispatchStage(ctx context.Context, runID, stageID uuid.UUID) (*HostDispatchResult, error)
+	HostDispatchStageWithNonce(ctx context.Context, runID, stageID uuid.UUID, nonce string) (*HostDispatchResult, error)
 	ReportStageFailureFrom(ctx context.Context, runID, stageID uuid.UUID, expectedState, category, reason, detail string, exitCode int) (*ReapFailureResult, error)
 	GetRunStageWait(ctx context.Context, runID, stageID uuid.UUID, waitSeconds int) (*RunStageWait, error)
 }
@@ -63,14 +79,15 @@ type detachedSpawnFunc func(binary string, argv, env []string, runID, stageID st
 // dispatch call so the goroutine never reads a package seam a test may swap.
 type slotWaiterSpec struct {
 	runID, stageID uuid.UUID
-	// host is the label this process's marker sends ("" sends no body, which
-	// the server files under slotHostUnknown).
-	host string
-	// episodeStart is the queued answer's enqueued_at (DB clock): the start
-	// of this stage's queue episode. A holding row admitted for this waiter
-	// has held_dispatched_at at or after it.
-	episodeStart *time.Time
-	marker       slotMarker
+	// nonce is this waiter's admission nonce (newAdmissionNonce), sent on
+	// every marker POST and recorded by the server on the slot it admits. A
+	// waiter claims a lost admission only when the holding row carries it;
+	// an empty nonce never claims one.
+	nonce string
+	// contended reports the dispatch call's own queued answer was contended,
+	// so the waiter's first poll is the one immediate retry.
+	contended bool
+	marker    slotMarker
 	// prepare rebuilds the spawn inputs AT ADMISSION (never at queue time),
 	// so a runner binary or token change while queued is picked up.
 	prepare func() (slotSpawnInputs, error)
@@ -79,6 +96,8 @@ type slotWaiterSpec struct {
 	probe   detachedStageStateProbe
 	cap     time.Duration
 	poll    time.Duration
+	// jitter maps poll onto one wait (randomJitteredPoll when nil).
+	jitter func(time.Duration) time.Duration
 	// logf writes the waiter's one-line diagnostics (stderr in production).
 	logf func(format string, args ...any)
 }
@@ -158,30 +177,50 @@ func classifySlotPoll(res *HostDispatchResult, err error) (out slotPollOutcome, 
 // context.WithoutCancel(ctx), so the cap stops POLLING but never cancels an
 // in-flight marker POST (whose admission would otherwise be lost with no
 // spawn). The apiClient's own timeout bounds each request.
+//
+// Each wait is spec.poll ±20% (spec.jitter). A CONTENDED queued answer — the
+// group lock was held by another admission, so this poll queued without
+// deciding — is retried once at once, unless it answered that immediate
+// retry itself: the colliding winner's transaction has normally committed by
+// then, so a waiter at the head of the queue is admitted instead of losing
+// the round (concurrency README § "Admit, step by step", step 7).
 func runSlotWaiter(ctx context.Context, spec slotWaiterSpec) {
 	reqCtx := context.WithoutCancel(ctx)
-	ticker := time.NewTicker(spec.poll)
-	defer ticker.Stop()
+	jitter := spec.jitter
+	if jitter == nil {
+		jitter = randomJitteredPoll
+	}
+	wait := jitter(spec.poll)
+	// retried reports the next (or last) poll is the one immediate retry.
+	retried := spec.contended
+	if retried {
+		wait = 0
+	}
 	lost := false
 	for {
+		timer := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			spec.logf("fishhawk: concurrency slot waiter for run %s stage %s stopped after its %s cap without admission; the stage stays awaiting_host_dispatch — re-dispatch it with fishhawk_dispatch_stage\n",
 				spec.runID, spec.stageID, spec.cap)
 			return
-		case <-ticker.C:
+		case <-timer.C:
 		}
-		res, err := spec.marker.HostDispatchStage(reqCtx, spec.runID, spec.stageID)
+		res, err := spec.marker.HostDispatchStageWithNonce(reqCtx, spec.runID, spec.stageID, spec.nonce)
 		out, wasLost, queued := classifySlotPoll(res, err)
+		wait = jitter(spec.poll)
+		immediate := queued != nil && queued.Contended && !retried
+		retried = immediate
+		if immediate {
+			wait = 0
+		}
 		switch out {
 		case slotKeepWaiting:
 			if queued != nil {
 				// A definitive queued answer: the stage was not admitted, so
 				// any earlier lost request did not admit it either.
 				lost = false
-				if queued.EnqueuedAt != nil {
-					spec.episodeStart = queued.EnqueuedAt
-				}
 			}
 			if wasLost {
 				lost = true
@@ -212,33 +251,29 @@ func runSlotWaiter(ctx context.Context, spec slotWaiterSpec) {
 //
 //   - state dispatched — a running stage already has a runner, so spawning
 //     would double-spawn;
-//   - a holding concurrency block whose host is this process's host label;
-//   - held_dispatched_at at or after this waiter's queue-episode start (the
-//     queued answer's enqueued_at; both are DB-clock stamps).
+//   - a holding concurrency block whose admission_nonce is this waiter's
+//     nonce. The server records the admitting request's nonce on the held
+//     row, so another session's admission (on this host or any other) and a
+//     direct fishhawk_dispatch_stage admission (which sends no nonce) never
+//     match. The host label is NOT used: two sessions on one host share it.
 //
-// Any read error or missing field answers false: no spawn. That leaves a
-// stage this waiter admitted dispatched with no runner, which a plain
-// re-dispatch recovers (the marker's idempotent arm proceeds to spawn) and the
-// server's 15-minute dispatched backstop releases. RESIDUAL: another session
-// on the SAME host admitting the stage inside the same episode carries the
-// same host label and is indistinguishable without an admission token.
+// Any read error, missing field or empty nonce answers false: no spawn. That
+// leaves a stage this waiter admitted dispatched with no runner, which a
+// plain re-dispatch recovers (the marker's idempotent arm proceeds to spawn)
+// and the server's 15-minute dispatched backstop releases.
 func ownLostAdmission(ctx context.Context, spec slotWaiterSpec) bool {
+	if spec.nonce == "" {
+		return false
+	}
 	sw, err := spec.marker.GetRunStageWait(ctx, spec.runID, spec.stageID, 0)
 	if err != nil || sw == nil {
 		return false
 	}
 	c := sw.Concurrency
-	host := spec.host
-	if host == "" {
-		host = slotHostUnknown
-	}
 	return sw.State == "dispatched" &&
 		c != nil &&
 		c.Status == concurrencyStatusHolding &&
-		c.Host == host &&
-		c.HeldDispatchedAt != nil &&
-		spec.episodeStart != nil &&
-		!c.HeldDispatchedAt.Before(*spec.episodeStart)
+		c.AdmissionNonce == spec.nonce
 }
 
 // spawnOrRelease rebuilds the spawn inputs and spawns the runner for an

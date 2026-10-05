@@ -542,6 +542,9 @@ func TestHostDispatch_InvalidHostRejected(t *testing.T) {
 		"unknown key":    `{"host":"h1","x":1}`,
 		"malformed json": `{"host":`,
 		"oversized":      `{"host":"h1","pad":"` + strings.Repeat("x", 5000) + `"}`,
+		"nonce too long": `{"host":"h1","admission_nonce":"` + strings.Repeat("n", 65) + `"}`,
+		"nonce bad char": `{"host":"h1","admission_nonce":"n/1"}`,
+		"nonce no host":  `{"admission_nonce":"n.1"}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			st := f.impl()
@@ -556,6 +559,81 @@ func TestHostDispatch_InvalidHostRejected(t *testing.T) {
 				t.Fatal("a rejected marker wrote a slot row")
 			}
 		})
+	}
+}
+
+// TestHostDispatch_AdmissionNonceRecordedAndEchoed (approval condition 3): an
+// admission records the request's admission_nonce on the held slot and echoes
+// it in the 200 block; every stage read's holding block carries it; a queued
+// stage's block carries none; an admission without a nonce carries none.
+func TestHostDispatch_AdmissionNonceRecordedAndEchoed(t *testing.T) {
+	f := newSCPG(t, pgStore)
+	a, b := f.impl(), f.impl()
+	resp := f.admitted(a, `{"host":"h1","admission_nonce":"nonce-a-1"}`)
+	if resp.Concurrency == nil || resp.Concurrency.AdmissionNonce != "nonce-a-1" {
+		t.Fatalf("admission block = %+v, want admission_nonce echoed", resp.Concurrency)
+	}
+	f.queued(b, `{"host":"h1","admission_nonce":"nonce-b-1"}`)
+	for name, blk := range f.blocks(a) {
+		if blk == nil || blk.Status != "holding" || blk.AdmissionNonce != "nonce-a-1" {
+			t.Errorf("%s: A block = %+v, want holding with admission_nonce nonce-a-1", name, blk)
+		}
+	}
+	for name, blk := range f.blocks(b) {
+		if blk == nil || blk.AdmissionNonce != "" {
+			t.Errorf("%s: queued B block = %+v, want no admission_nonce", name, blk)
+		}
+	}
+	// B is admitted by a nonce-less marker (a direct dispatch): no nonce.
+	f.to(a.ID, run.StageStateRunning, run.StageStateSucceeded)
+	if resp := f.admitted(b, hostBody("h1")); resp.Concurrency == nil || resp.Concurrency.AdmissionNonce != "" {
+		t.Fatalf("nonce-less admission block = %+v, want no admission_nonce", resp.Concurrency)
+	}
+	if blk := f.blocks(b)["get"]; blk == nil || blk.Status != "holding" || blk.AdmissionNonce != "" {
+		t.Fatalf("B block = %+v, want holding with no admission_nonce", blk)
+	}
+}
+
+// TestHostDispatch_TerminalRunRefused: a stage whose run is succeeded, failed
+// or cancelled is never host-spawned — 409 dispatch_not_admissible naming the
+// run state, the stage READ BACK untouched and no slot row — with or without a
+// slot store, and on the already-dispatched idempotent arm too.
+func TestHostDispatch_TerminalRunRefused(t *testing.T) {
+	paths := map[run.State][]run.State{
+		run.StateSucceeded: {run.StateRunning, run.StateSucceeded},
+		run.StateFailed:    {run.StateFailed},
+		run.StateCancelled: {run.StateCancelled},
+	}
+	for name, store := range map[string]func(*pgxpool.Pool) concurrency.Store{"slot store": pgStore, "no store": nil} {
+		for terminal, path := range paths {
+			for _, dispatched := range []bool{false, true} {
+				t.Run(name+"/"+string(terminal)+map[bool]string{false: "/parked", true: "/dispatched"}[dispatched], func(t *testing.T) {
+					f := newSCPG(t, store)
+					st := f.impl()
+					want := run.StageStateAwaitingHostDispatch
+					if dispatched {
+						f.to(st.ID, run.StageStateDispatched)
+						want = run.StageStateDispatched
+					}
+					for _, to := range path {
+						if _, err := f.repo.TransitionRun(context.Background(), st.RunID, to); err != nil {
+							t.Fatalf("run -> %s: %v", to, err)
+						}
+					}
+					w := f.mark(st, hostBody("h1"))
+					if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "dispatch_not_admissible") ||
+						!strings.Contains(w.Body.String(), `"run_state":"`+string(terminal)+`"`) {
+						t.Fatalf("marker = %d, want 409 dispatch_not_admissible naming run_state %s:\n%s", w.Code, terminal, w.Body.String())
+					}
+					if got := f.state(st.ID); got != want {
+						t.Fatalf("stage reads %s, want %s (untouched)", got, want)
+					}
+					if _, ok := f.slot(st.ID); ok {
+						t.Fatal("a refused marker wrote a slot row")
+					}
+				})
+			}
+		}
 	}
 }
 
@@ -856,7 +934,7 @@ func TestOpenAPIDocumentsConcurrency(t *testing.T) {
 		t.Fatalf("read openapi: %v", err)
 	}
 	doc := string(raw)
-	for _, want := range []string{"concurrency_slot_queued", "StageConcurrency:", "HostDispatchRequest:", "awaiting_concurrency_slot", "held_dispatched_at"} {
+	for _, want := range []string{"concurrency_slot_queued", "StageConcurrency:", "HostDispatchRequest:", "awaiting_concurrency_slot", "held_dispatched_at", "admission_nonce"} {
 		if !strings.Contains(doc, want) {
 			t.Errorf("docs/api/v0.openapi.yaml does not document %q", want)
 		}

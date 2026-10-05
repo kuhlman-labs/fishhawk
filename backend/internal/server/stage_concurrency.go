@@ -43,56 +43,85 @@ const (
 	stageConcurrencyStatusHolding = "holding"
 )
 
-// hostDispatchBodyMax bounds the optional {"host"} marker body; hostLabelMax
-// is a DNS name's length bound.
+// hostDispatchBodyMax bounds the optional {"host", "admission_nonce"} marker
+// body; hostLabelMax is a DNS name's length bound; admissionNonceMax bounds
+// the slot waiter's nonce (a UUID is 36).
 const (
 	hostDispatchBodyMax = 4 << 10
 	hostLabelMax        = 253
+	admissionNonceMax   = 64
 )
 
 // hostDispatchBody is the optional POST .../host-dispatch request body.
 type hostDispatchBody struct {
 	Host string `json:"host"`
+	// AdmissionNonce is the MCP slot waiter's per-waiter nonce. An admission
+	// records it on the held slot row and echoes it, so a waiter that lost
+	// its admission response can tell its own admission from another
+	// session's (concurrency README § "Admission nonce").
+	AdmissionNonce string `json:"admission_nonce"`
 }
 
-// parseHostDispatchBody reads the optional {"host": string} body. An absent or
-// empty body, or an empty host, yields concurrency.UnknownHost (a pre-change
-// client sends no body). A malformed body, an unknown key, a host longer than
-// hostLabelMax or one outside [A-Za-z0-9._-] answers 400 validation_failed
+// parseHostDispatchBody reads the optional {"host": string, "admission_nonce":
+// string} body. An absent or empty body, or an empty host, yields
+// concurrency.UnknownHost (a pre-change client sends no body); an absent
+// nonce yields "". A malformed body, an unknown key, a host longer than
+// hostLabelMax or one outside [A-Za-z0-9._-], or a nonce longer than
+// admissionNonceMax or outside [A-Za-z0-9-] answers 400 validation_failed
 // (ok=false) before any stage read, so the stage is untouched.
-func (s *Server) parseHostDispatchBody(w http.ResponseWriter, r *http.Request) (string, bool) {
+func (s *Server) parseHostDispatchBody(w http.ResponseWriter, r *http.Request) (host, nonce string, ok bool) {
 	if r.Body == nil {
-		return concurrency.UnknownHost, true
+		return concurrency.UnknownHost, "", true
 	}
 	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, hostDispatchBodyMax))
 	if err != nil {
 		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
 			fmt.Sprintf("host-dispatch body must be at most %d bytes", hostDispatchBodyMax),
 			map[string]any{"field": "body"})
-		return "", false
+		return "", "", false
 	}
 	if strings.TrimSpace(string(raw)) == "" {
-		return concurrency.UnknownHost, true
+		return concurrency.UnknownHost, "", true
 	}
 	dec := json.NewDecoder(strings.NewReader(string(raw)))
 	dec.DisallowUnknownFields()
 	var body hostDispatchBody
 	if err := dec.Decode(&body); err != nil {
 		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
-			`host-dispatch body must be a JSON object {"host": string}`,
+			`host-dispatch body must be a JSON object {"host": string, "admission_nonce": string}`,
 			map[string]any{"field": "body", "error": err.Error()})
-		return "", false
+		return "", "", false
+	}
+	if body.AdmissionNonce != "" && !validAdmissionNonce(body.AdmissionNonce) {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			fmt.Sprintf("admission_nonce must be 1..%d characters from [A-Za-z0-9-]", admissionNonceMax),
+			map[string]any{"field": "admission_nonce"})
+		return "", "", false
 	}
 	if body.Host == "" {
-		return concurrency.UnknownHost, true
+		return concurrency.UnknownHost, body.AdmissionNonce, true
 	}
 	if !validHostLabel(body.Host) {
 		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
 			fmt.Sprintf("host must be 1..%d characters from [A-Za-z0-9._-]", hostLabelMax),
 			map[string]any{"field": "host"})
-		return "", false
+		return "", "", false
 	}
-	return body.Host, true
+	return body.Host, body.AdmissionNonce, true
+}
+
+func validAdmissionNonce(n string) bool {
+	if len(n) == 0 || len(n) > admissionNonceMax {
+		return false
+	}
+	for _, c := range n {
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '-':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func validHostLabel(h string) bool {
@@ -179,12 +208,14 @@ func toConcurrencyHolders(hs []concurrency.Holder) []concurrencyHolder {
 }
 
 // hostDispatchConcurrency is the 200 marker body's `concurrency` block for a
-// grouped admission.
+// grouped admission. AdmissionNonce echoes the request's nonce (omitted when
+// it carried none).
 type hostDispatchConcurrency struct {
-	Group         string `json:"group"`
-	Limit         int    `json:"limit"`
-	QueuedBefore  bool   `json:"queued_before"`
-	WaitedSeconds int    `json:"waited_seconds"`
+	Group          string `json:"group"`
+	Limit          int    `json:"limit"`
+	QueuedBefore   bool   `json:"queued_before"`
+	WaitedSeconds  int    `json:"waited_seconds"`
+	AdmissionNonce string `json:"admission_nonce,omitempty"`
 }
 
 // stageConcurrency is the Stage `concurrency` block (docs/api/v0.openapi.yaml
@@ -203,12 +234,16 @@ type stageConcurrency struct {
 	// WaiterLive reports a queued row was refreshed within the queue TTL
 	// (false while holding).
 	WaiterLive bool `json:"waiter_live"`
-	// Host and HeldDispatchedAt identify the admission a holding row records
+	// Host and HeldDispatchedAt describe the admission a holding row records
 	// (the host label it was admitted for, and the dispatched_at of the
-	// attempt it admitted), so a client that lost an admission response can
-	// tell its own admission from another session's (approval condition 3).
+	// attempt it admitted). Informational: two sessions on one host share a
+	// label. AdmissionNonce is the slot-waiter nonce the admitting request
+	// carried (omitted when none), which is how a waiter that lost its
+	// admission response tells its own admission from another session's
+	// (approval condition 3).
 	Host             string     `json:"host,omitempty"`
 	HeldDispatchedAt *time.Time `json:"held_dispatched_at,omitempty"`
+	AdmissionNonce   string     `json:"admission_nonce,omitempty"`
 }
 
 func toStageConcurrency(st concurrency.Status) *stageConcurrency {
@@ -223,6 +258,7 @@ func toStageConcurrency(st concurrency.Status) *stageConcurrency {
 		out.AcquiredAt = st.AcquiredAt
 		out.Host = st.Host
 		out.HeldDispatchedAt = st.HeldDispatchedAt
+		out.AdmissionNonce = st.AdmissionNonce
 		return out
 	}
 	out.Status = stageConcurrencyStatusQueued
@@ -354,14 +390,15 @@ func (s *Server) emitStageConcurrency(ctx context.Context, stage *run.Stage, cat
 // pending|awaiting_host_dispatch arm. done=true means the response was
 // written (queued 409); otherwise updated/block carry an admission, or err
 // carries the store error for the caller's existing drift reclassification.
-func (s *Server) admitGroupedStage(w http.ResponseWriter, r *http.Request, stage *run.Stage, group string, limit int, host string) (updated *run.Stage, block *hostDispatchConcurrency, done bool, err error) {
+func (s *Server) admitGroupedStage(w http.ResponseWriter, r *http.Request, stage *run.Stage, group string, limit int, host, nonce string) (updated *run.Stage, block *hostDispatchConcurrency, done bool, err error) {
 	adm, err := s.cfg.Concurrency.Admit(r.Context(), concurrency.Request{
-		StageID:  stage.ID,
-		RunID:    stage.RunID,
-		From:     stage.State,
-		GroupKey: group,
-		Limit:    limit,
-		Host:     host,
+		StageID:        stage.ID,
+		RunID:          stage.RunID,
+		From:           stage.State,
+		GroupKey:       group,
+		Limit:          limit,
+		Host:           host,
+		AdmissionNonce: nonce,
 	})
 	if err != nil {
 		return nil, nil, false, err
@@ -375,9 +412,10 @@ func (s *Server) admitGroupedStage(w http.ResponseWriter, r *http.Request, stage
 	}
 	s.emitStageConcurrencyAdmitted(r.Context(), stage, group, limit, adm)
 	return adm.Stage, &hostDispatchConcurrency{
-		Group:         group,
-		Limit:         limit,
-		QueuedBefore:  adm.QueuedBefore,
-		WaitedSeconds: adm.WaitedSeconds,
+		Group:          group,
+		Limit:          limit,
+		QueuedBefore:   adm.QueuedBefore,
+		WaitedSeconds:  adm.WaitedSeconds,
+		AdmissionNonce: nonce,
 	}, false, nil
 }

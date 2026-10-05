@@ -4746,7 +4746,12 @@ components:
         (#3964). `host` is the caller's host label (the MCP sends its
         sanitised `os.Hostname()`); it keys the default concurrency group
         `local-implement:<host>`. Absent body or empty `host` → `unknown`. A
-        client-supplied label, not a security boundary.
+        client-supplied label, not a security boundary. `admission_nonce` is
+        the MCP slot waiter's random per-waiter nonce, sent on every marker
+        POST it makes; an ADMISSION records it on the held slot and echoes it,
+        so a waiter that lost its admission response can tell its own
+        admission from another session's (two sessions on one host share
+        `host`). Absent or empty → none recorded.
       type: object
       additionalProperties: false
       properties:
@@ -4754,6 +4759,10 @@ components:
           type: string
           maxLength: 253
           pattern: '^[A-Za-z0-9._-]*$'
+        admission_nonce:
+          type: string
+          maxLength: 64
+          pattern: '^[A-Za-z0-9-]*$'
     HostDispatchConcurrency:
       description: |
         The host-dispatch 200 body's `concurrency` block (#3964): present only
@@ -4765,6 +4774,7 @@ components:
         limit: { type: integer, minimum: 1, maximum: 64 }
         queued_before: { type: boolean, description: True when the stage waited in the queue during this episode. }
         waited_seconds: { type: integer, minimum: 0, description: Seconds from enqueue to admission (0 when it did not queue). }
+        admission_nonce: { type: string, description: 'The request''s `admission_nonce` echoed back; omitted when it carried none.' }
     ConcurrencyHolder:
       type: object
       required: [run_id, stage_id, since]
@@ -4812,8 +4822,16 @@ components:
           format: date-time
           description: |
             Holding only: the `dispatched_at` of the attempt this slot admitted.
-            With `host` it lets a client that lost an admission response tell
-            its own admission (same host, same attempt) from another session's.
+            Informational, like `host`: two sessions on one host share a host
+            label, so ownership is `admission_nonce`.
+        admission_nonce:
+          type: string
+          description: |
+            Holding only: the `admission_nonce` the admitting marker request
+            carried; omitted when it carried none (a direct
+            `fishhawk_dispatch_stage` admission). A slot waiter that lost its
+            admission response claims the admission only when this equals its
+            own nonce.
     StageProgress:
       type: object
       description: |
@@ -14145,7 +14163,12 @@ paths:
 
         **Not admissible.** A `running`, terminal, or any `awaiting_*` gate
         state returns 409 `dispatch_not_admissible` so a live or settled stage
-        can never be re-marked as a fresh spawn.
+        can never be re-marked as a fresh spawn. So does any stage whose RUN
+        is terminal (`succeeded`, `failed`, `cancelled`; `details.run_state`),
+        on every arm including the idempotent no-op, evaluated before any
+        concurrency-slot admission (#3964): cancelling or failing a run
+        transitions only the run row, so a parked or queued stage of a dead
+        run is never spawned.
 
         **Authorization.** Requires an authenticated identity carrying
         `write:runs` (anonymous → 401; a token without the scope → 403). The
@@ -14280,9 +14303,10 @@ paths:
               `queue_ttl_seconds` (60) and `poll_interval_seconds` (5). Holders
               in another account are neither counted nor listed.
             - `dispatch_not_admissible` — the stage is in a `running`,
-              terminal, or `awaiting_*` gate state, a run locked to a
-              non-local `runner_kind`, or a non-host-spawn stage, so a fresh
-              spawn marker cannot be applied.
+              terminal, or `awaiting_*` gate state, its run is terminal
+              (`details.run_state`), a run locked to a non-local
+              `runner_kind`, or a non-host-spawn stage, so a fresh spawn
+              marker cannot be applied.
             - `dependency_not_satisfied` — the decomposition wave-order guard
               (E48.99 / #2546): this run is a fan-out child (`decomposed_from`
               + `slice_index` set) whose declared dependency slice has not

@@ -136,14 +136,15 @@ func (s *Server) handleHostDispatchStage(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Optional {"host"} body (#3964): the client's host label keys the default
-	// concurrency group. Parsed only when a slot store is wired (a nil store
-	// keeps today's body-ignoring marker byte-identical), after the auth ladder
-	// and the id parse, and before any stage read — a 400 leaves the stage
-	// untouched.
-	host := concurrency.UnknownHost
+	// Optional {"host", "admission_nonce"} body (#3964): the client's host
+	// label keys the default concurrency group, and a slot waiter's nonce is
+	// recorded on the slot it is admitted to. Parsed only when a slot store is
+	// wired (a nil store keeps today's body-ignoring marker byte-identical),
+	// after the auth ladder and the id parse, and before any stage read — a
+	// 400 leaves the stage untouched.
+	host, nonce := concurrency.UnknownHost, ""
 	if s.cfg.Concurrency != nil {
-		if host, ok = s.parseHostDispatchBody(w, r); !ok {
+		if host, nonce, ok = s.parseHostDispatchBody(w, r); !ok {
 			return
 		}
 	}
@@ -223,6 +224,20 @@ func (s *Server) handleHostDispatchStage(w http.ResponseWriter, r *http.Request)
 				map[string]any{"run_id": runID.String(), "runner_kind": runRow.RunnerKind})
 			return
 		}
+	}
+	// A TERMINAL run's stage is never host-spawned (#3964 fix-up). Cancel
+	// (handleCancelRun) and a run failure transition only the run row, so a
+	// stage parked at awaiting_host_dispatch — or one a slot waiter keeps
+	// re-POSTing for, up to its 3h cap — would otherwise be admitted and
+	// spawn a runner for a dead run. Refused before every state arm and any
+	// slot admission, so the refusal commits nothing; the waiter stops on this
+	// non-queued 4xx. Residual: a cancel committing between this read and the
+	// admission CAS is not seen (the run row is not locked here).
+	if runRow.State.IsTerminal() {
+		s.writeError(w, r, http.StatusConflict, "dispatch_not_admissible",
+			"run is "+string(runRow.State)+"; a terminal run's stage is never host-spawned",
+			map[string]any{"run_id": runID.String(), "run_state": string(runRow.State)})
+		return
 	}
 	if stage.ExecutorKind != run.ExecutorAgent || isAutoMergeReviewStage(stage) {
 		s.writeError(w, r, http.StatusConflict, "dispatch_not_admissible",
@@ -333,7 +348,7 @@ func (s *Server) handleHostDispatchStage(w http.ResponseWriter, r *http.Request)
 	switch cas, isCAS := s.cfg.RunRepo.(run.StageCASTransitioner); {
 	case grouped:
 		var queued bool
-		updated, slot, queued, err = s.admitGroupedStage(w, r, stage, group, limit, host)
+		updated, slot, queued, err = s.admitGroupedStage(w, r, stage, group, limit, host, nonce)
 		if queued {
 			return
 		}

@@ -899,8 +899,9 @@ func TestFixupRecovery_DetailsAvailableIsNotOmitempty(t *testing.T) {
 // TestStageWaitStatus_ProjectsConcurrency pins the #3964 projection: a
 // non-terminal stage carries its concurrency-slot block onto the wait status
 // (the surface fishhawk_get_run_status renders), including on a terminal run
-// (the ADR-036 window, where the stage can still be admitted); a terminal stage
-// never advertises one, even if a block reached the client.
+// (the ADR-036 window, where the backend still reports the queue row though
+// the marker never admits the stage); a terminal stage never advertises one,
+// even if a block reached the client.
 func TestStageWaitStatus_ProjectsConcurrency(t *testing.T) {
 	live := true
 	block := &StageConcurrency{

@@ -587,11 +587,11 @@ func (r *runResolver) dispatchStage(ctx context.Context, _ *mcp.CallToolRequest,
 	probe := r.stageStateProbe(runUUID, resolvedStageID)
 	if q, queued := asConcurrencySlotQueued(hderr); queued {
 		return r.queueDispatchForSlot(in, runUUID, stageUUID, workingDir, q, warnings, slotWaiterSpec{
-			runID:        runUUID,
-			stageID:      stageUUID,
-			host:         r.api.hostLabel,
-			episodeStart: q.EnqueuedAt,
-			marker:       r.api,
+			runID:     runUUID,
+			stageID:   stageUUID,
+			nonce:     newAdmissionNonce(),
+			contended: q.Contended,
+			marker:    r.api,
 			prepare: func() (slotSpawnInputs, error) {
 				p, perr := prepareSpawn()
 				return p.slotSpawnInputs, perr
@@ -601,6 +601,7 @@ func (r *runResolver) dispatchStage(ctx context.Context, _ *mcp.CallToolRequest,
 			probe:  probe,
 			cap:    concurrencyWaiterCap,
 			poll:   concurrencySlotPollInterval,
+			jitter: randomJitteredPoll,
 			logf:   stderrLogf,
 		})
 	}
