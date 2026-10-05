@@ -92,6 +92,12 @@ filter, so a filtered read returns the same per-workflow hash an unfiltered one
 does; only the view-level hash reflects the retained set. A consumer binding a
 confirmation to one workflow should bind to the per-workflow hash.
 
+### `HashMatrix`: one resolved matrix
+
+`HashMatrix(actions []spec.ResolvedAction)` is `sha256` over `actionsFrom(actions)`. It uses the same `Action` wire mirror and the same hashing as the read above, so a resolved matrix hashes to the digest its projected `matrix` would carry here (`TestHashMatrix_DeterministicAndSensitive` pins that byte for byte). Its consumer is the delegation shadow stamp (E82.1 / #3778), which hashes the run's escalation-CLAMPED matrix as the stamp's matrix stratum.
+
+A nil or empty matrix hashes the empty `Action` slice: a stable, non-empty digest. "No matrix governs the run" is therefore its own comparable stratum rather than an empty string that a hashing failure could also produce. Like the other hashes, it never sees a volatile field.
+
 ## Fail-closed readings
 
 - A workflow declaring NO autonomy block resolves to nil and projects an

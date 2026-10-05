@@ -79,9 +79,7 @@ func TestRetryStage_DTimeoutHappyPath(t *testing.T) {
 
 	// One stage_retried entry on the audit chain with the prior
 	// metadata in the payload.
-	if len(au.appended) != 1 {
-		t.Fatalf("audit entries = %d, want 1", len(au.appended))
-	}
+	assertDecisionThenOneStamp(t, au.appended, CategoryStageRetried)
 	got := au.appended[0]
 	if got.Category != CategoryStageRetried {
 		t.Errorf("audit category = %q, want stage_retried", got.Category)
@@ -147,9 +145,7 @@ func TestRetryStage_AHappyPathWithoutOrchestrator(t *testing.T) {
 	if body.FailureCategory != nil {
 		t.Errorf("body.FailureCategory = %v, want nil after retry", body.FailureCategory)
 	}
-	if len(au.appended) != 1 || au.appended[0].Category != CategoryStageRetried {
-		t.Errorf("audit chain = %+v, want one stage_retried entry", au.appended)
-	}
+	assertDecisionThenOneStamp(t, au.appended, CategoryStageRetried)
 	var payload map[string]any
 	_ = json.Unmarshal(au.appended[0].Payload, &payload)
 	if payload["prior_category"] != "A" {
@@ -264,9 +260,7 @@ func TestRetryStage_AHappyPathWithOrchestrator(t *testing.T) {
 	if body.FailureCategory != nil {
 		t.Errorf("body.FailureCategory = %v, want nil after retry", body.FailureCategory)
 	}
-	if len(au.appended) != 1 || au.appended[0].Category != CategoryStageRetried {
-		t.Errorf("audit chain = %+v, want one stage_retried entry", au.appended)
-	}
+	assertDecisionThenOneStamp(t, au.appended, CategoryStageRetried)
 }
 
 // TestRetryStage_AReopensRunAndAdvancesToReview is the load-bearing
@@ -433,9 +427,7 @@ func TestRetryStage_DecomposedParentRestoresAwaitingChildren(t *testing.T) {
 	}
 
 	// (d) The stage_retried audit row landed.
-	if len(au.appended) != 1 || au.appended[0].Category != CategoryStageRetried {
-		t.Fatalf("audit chain = %+v, want one stage_retried entry", au.appended)
-	}
+	assertDecisionThenOneStamp(t, au.appended, CategoryStageRetried)
 }
 
 // retryRunSpy wraps orchestratorRepo to count RetryRun invocations and
@@ -680,9 +672,7 @@ func TestRetryStage_AuditReceiptShape(t *testing.T) {
 		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
 	}
 
-	if len(au.appended) != 1 {
-		t.Fatalf("audit entries = %d, want 1", len(au.appended))
-	}
+	assertDecisionThenOneStamp(t, au.appended, CategoryStageRetried)
 	var payload map[string]any
 	if err := json.Unmarshal(au.appended[0].Payload, &payload); err != nil {
 		t.Fatalf("unmarshal audit payload: %v", err)
@@ -728,9 +718,7 @@ func TestRetryStage_BOverrideHappyPath(t *testing.T) {
 		t.Errorf("body.State = %q, want pending", body.State)
 	}
 
-	if len(au.appended) != 1 {
-		t.Fatalf("audit entries = %d, want 1", len(au.appended))
-	}
+	assertDecisionThenOneStamp(t, au.appended, CategoryStageOverrideRetried)
 	got := au.appended[0]
 	if got.Category != CategoryStageOverrideRetried {
 		t.Errorf("audit category = %q, want stage_override_retried", got.Category)

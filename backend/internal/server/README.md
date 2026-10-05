@@ -6639,3 +6639,56 @@ ADR-081 #3727 D1 option 3 for `finding`/`notice` and rule 2 for `work_request`. 
 - **Delegation view = the run cache.** `handoverBriefDelegation` projects `delegationview` from the spec cached on the repo's NEWEST run — the `source=run_cache` read of `GET /v0/repos/{owner}/{name}/delegation`, account-narrowed — never a forge fetch, because the brief composes on every offer and a forge round-trip there would couple a handover to forge availability. Each non-projectable case (no run repo, list error, no run / no cached spec, an invalid spec) returns nil with a NAMED reason that the brief records as `delegation_unavailable` (`TestHandoverBriefDelegation_EachUnavailableBranch`). Residual: a spec changed since the last run is shown as the older cached one; `standing_orders.source` says `run_cache`.
 - **Errors.** `writeHandoverBriefError`: `handoverbrief.ErrInvalidRequest` (incl. a `to_sequence` above the chain head) → 400 `validation_failed`; `handoverbrief.ErrUnavailable` → 503 `handover_brief_unavailable`, the reason in the MESSAGE (5xx detail keys are redacted); anything else → 500.
 - **One hash.** The route returns the hash `Compose` stamped on the canonical, unbounded brief; `Select` and `Bound` copy it and never re-hash (`TestHandoverBriefRoute_ComposesAndBounds` asserts the whole and the `?section=` render carry the same hash, equal to `handoverbrief.Hash` of the composition). The brief is a POINT-IN-TIME composition: an offer's recorded hash commits to what was composed at offer time, and live sections (parked gates, campaigns, runs) and the chain head may differ on a later read.
+
+## Delegation shadow stamp (`delegation_shadow.go`, E82.1 / [#3778](https://github.com/kuhlman-labs/fishhawk/issues/3778))
+
+ADR-085 rule 4: at every HUMAN action on a delegable class, record what delegation WOULD have done — record-only, blind, grants nothing, changes no decision. One `delegation_shadow_evaluated` row (actor `system`, registered in `audit.KnownCategories`, NOT an issue-comment surface) per fresh human decision.
+
+**Who is stamped.** `captureDelegationShadow` returns nil (never stamped) when the request is `delegated:true`, the subject is an agent (`isAgentSubject`: the operator-agent token family or `mcp:run:<uuid>`), or no audit store is wired. Per the ADR-040 trust model an agent presenting a human operator's token is indistinguishable from that human and is stamped as one; `actor_subject` is recorded so the projection can stratify.
+
+**When.** Captured IMMEDIATELY before the decision call, after every refusal gate, so it evaluates the PRE-decision state; recorded only after the decision call succeeded and wrote a FRESH decision row — never on a duplicate, a refusal, an error, merge's `alreadyRecorded` / lost-race path, or a bulk batch where nothing landed. Appended AFTER the decision row; the link is `stage_id` + `decision_category` + chain order (no exact sequence pointer — concurrent writers may interleave).
+
+**What.** `delegation.Evaluator.Shadow` (the same `evalClassCondition` checkDelegation's `Evaluate` routes through, nil campaign override, escalation ceiling applied last) evaluates the class's condition REGARDLESS of its mode. The capture then applies the page_human_on override Shadow does not: a met/unmet verdict with an active `activePageEvent` (incl. the unconditional crew escalation) becomes `not_delegable` with `page_event`. Payload (`shadow_version` 1): `action`, `class`, `condition`, `verdict` (the closed `delegation.ShadowVerdicts()` set: met | unmet | not_delegable | unevaluable), `met`, `reason` (the evaluator's unmet reason verbatim — byte-equal to a delegated call's `delegation_condition_unmet.unmet_reason` on the same state), `page_event`, `mode` / `mode_source` (clamped), `anchored` (mode == report: report proposals are SHOWN, so agreement there is anchored), `tier`, `matrix_resolved`, `resolved_matrix_hash` (`delegationview.HashMatrix`, the E76.1 wire mirror), `workflow_sha`, the E75.1 escalation stratum (`escalation_fingerprint`, sorted `escalation_keys` = `escalation.RuleKey` of the fired set, `max_autonomy`), `human_decision`, `decision_category`, `actor_kind`, `actor_subject`, `stage_id`, `concern_ids`. Shadow and checkDelegation both take only (run, action) — no request-specific input exists to thread.
+
+**Non-emitting.** The evaluator gets `shadowEscalationResolver`, which evaluates escalations like `resolveEscalations` but never writes `escalation_fired`; the stamp is the capture's only write. No `notifyStatusUpdate` / `notifyOperatorVisible`.
+
+**Bounded, best-effort.** The capture runs on `context.WithoutCancel(r.Context())` under a 3s bound (`defaultDelegationShadowCaptureTimeout`) and a select that returns at the bound even if a repository ignores its context; a timeout yields `unevaluable` (`capture_timeout: …`) and never delays the human beyond it. Every failure is an `unevaluable` stamp naming its mode (`repositories_unconfigured`, `run_read_failed`, `no_cached_spec`, `spec_unparseable`, `workflow_missing`, `evaluator_unavailable`, `shadow_evaluation_failed`, `open_concern_read_failed`, `capture_timeout`) — never a skipped stamp, never a refused action. The append uses `context.WithoutCancel` so a client disconnect after the decision does not drop it; a marshal/append failure is warn-logged, never propagated. **Accepted residual:** a crash between the decision row and the stamp append leaves a decision with no stamp — a missing-not-at-random bias (crash-correlated) the E82 projection must account for, not treat as "no evidence".
+
+**Write-side inventory (approval condition 2)** — every caller of each decision core, classed:
+
+| Core | Caller | Class | Stamped |
+|---|---|---|---|
+| `approveStageAs` | `handleSubmitApproval` (approvals.go) | human (or `delegated:true` / agent token, filtered) | yes, in the handler — not inside `approveStageAs` |
+| `approveStageAs` | `autodrive.go` (campaign / `fishhawk_drive_run` auto-driver) | non-human (delegated) | no |
+| `ApprovalRepo.Submit` + `approval_submitted` | `HandleApprovalCommand` (issue_approval.go: `/fishhawk approve\|reject`, `+1` reply) | human | yes (scope amendment a3996d2a) |
+| `fixupStageAs` | `handleFixupStage` (fixup.go) | human / delegated / agent | yes for human |
+| `fixupStageAs` | `autodrive.go` auto-driver | non-human (delegated) | no |
+| `fixupStageAs` | `acceptance.go` triage (`acceptanceTriageSystemSubject`) | non-human (system) | no |
+| `run.FixupStage` | `conflictresolution_trigger.go` | non-human (system) | no |
+| `applyConcernWaive` | `handleWaiveConcern` (waive.go), `handleBulkWaiveConcerns` (bulk_waive.go, one stamp per request) | human / delegated / agent | yes for human |
+| `retryStageAs` | `handleRetryStage` (retry.go; `decision_category` = `stage_override_retried` only for an override of a category-B failure, derived pre-decision) | human / delegated / agent | yes for human |
+| `retryStageAs` | `autodrive.go` auto-driver | non-human (delegated) | no |
+| `run.ReopenAcceptanceStage` | `retryAcceptanceOutcomeUnknown` (retry.go acceptance-reopen arm) | human, but NOT the delegable retry class: checkDelegation is never consulted there and `infra_flake` (a failed stage) cannot describe a succeeded acceptance stage | no |
+| `merge_verdict_recorded` append | `handleMergeRun` (merge_run.go; never delegated) | human (agent tokens refused / filtered) | yes, fresh-append path only |
+| delegated merge | `autodrive.go` (`ActionMerge`) | non-human (delegated) | no |
+
+**Deferral is intentionally unstamped (approval condition 3).** `defer_concern.go` is untouched: deferral is not a delegable action class (no operator_agent knob or matrix class governs it; `delegation.Shadow` answers `not_delegable` for it), so the issue's proposal item 3 is narrowed to the five classes and the operator accepted that narrowing.
+
+**Read-side inventory (approval condition 1)** — every server caller of `AuditRepo.ListForRun`, classed for the blindness contract (the withholding filter itself is slice C's):
+
+| Caller | Class | Why |
+|---|---|---|
+| `reads.go` `handleListRunAudit` (non-chain list) | withheld | the general per-run list feeds the frontend run view; the frontend reads this non-chain endpoint, so the reads filter covers it (`fishhawk_get_run_status` `recent_audit` reads `GET /v0/audit`, `ListAll`, withheld by the same slice) |
+| `reads.go` `handleListRunAudit` `chain=true` | integrity-exempt | hash-chain verification needs every row; the positive control pins the stamp is present here |
+| `reads.go` `handleGetStatusComment` | internal-non-rendering | renders through `issuecomment.RenderStatusBody`, whose activity timeline is the `activityCategories` ALLOW-list — the stamp is not on it and must never be added |
+| `product_report.go` diagnostic bundle | withheld | the bundle is PUBLISHED into a forge issue, so it must not carry the category or its payload |
+| `diagnostics.go` `GET /v0/runs/{id}/diagnostics` | integrity-exempt | operator integrity/debug surface; stays complete by design, not a gate surface |
+| `audit_export.go` compliance export | integrity-exempt | the external verifier and `frontend/src/repo/chain-verification.ts` read the export; it must stay complete |
+| `acceptance.go` | internal-non-rendering | scans for acceptance outcome entries; renders nothing |
+| `codescanning.go` | internal-non-rendering | scans for code-scanning alert entries |
+| `latency.go` | internal-non-rendering | computes stage latencies from known categories |
+| `precedent.go` | internal-non-rendering | indexes payloads by sequence for KNOWN decision categories only |
+| `quorum.go` (x2) | internal-non-rendering | counts approvals / resolves the change author |
+| `pullrequest_review_events.go` | internal-non-rendering | economics stamp over cost rows |
+| `release_publish.go` | internal-non-rendering | reads only `release_published` |
+| `repodash.go` | internal-non-rendering (payload) | `dashEvent` copies Category + Timestamp for unknown categories and never reads their payload; RESIDUAL: the category NAME and timestamp of a stamp reach the repo-dashboard event stream (no verdict, reason or mode) — a follow-up should drop it there |

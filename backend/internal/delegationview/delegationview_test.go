@@ -1,6 +1,8 @@
 package delegationview_test
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"testing"
 
@@ -324,5 +326,64 @@ func TestProject_NilSpecIsEmptySlice(t *testing.T) {
 	}
 	if len(got) != 0 {
 		t.Errorf("Project(nil) = %+v, want empty", got)
+	}
+}
+
+// TestHashMatrix_DeterministicAndSensitive pins HashMatrix (E82.1 / #3778):
+// equal content hashes equal, a change to one class's mode or source changes
+// the digest, a nil and an empty matrix share one stable non-empty digest, and
+// the digest IS sha256 over the E76.1 wire mirror — the same bytes the
+// delegation read's projected `matrix` marshals to — so a shadow stamp's hash
+// and this read cannot silently diverge.
+func TestHashMatrix_DeterministicAndSensitive(t *testing.T) {
+	parsed := specWith(t, "    autonomy: medium\n"+minimalStages)
+	wf := parsed.Workflows["wf"]
+	resolved := spec.ResolveAutonomy(&wf, nil)
+	if resolved == nil || len(resolved.Actions) == 0 {
+		t.Fatal("fixture resolved no matrix; every assertion below would be vacuous")
+	}
+
+	base := delegationview.HashMatrix(resolved.Actions)
+	if base == "" {
+		t.Fatal("HashMatrix returned an empty digest")
+	}
+	clone := append([]spec.ResolvedAction(nil), resolved.Actions...)
+	if got := delegationview.HashMatrix(clone); got != base {
+		t.Errorf("equal content hashed %s, want %s", got, base)
+	}
+
+	modeChanged := append([]spec.ResolvedAction(nil), resolved.Actions...)
+	modeChanged[0].Mode = spec.ModeReport
+	if delegationview.HashMatrix(modeChanged) == base {
+		t.Errorf("a changed mode on %q did not change the digest", modeChanged[0].Action)
+	}
+	sourceChanged := append([]spec.ResolvedAction(nil), resolved.Actions...)
+	sourceChanged[0].Source = spec.SourceEscalation
+	if delegationview.HashMatrix(sourceChanged) == base {
+		t.Errorf("a changed source on %q did not change the digest", sourceChanged[0].Action)
+	}
+
+	// The E76.1 mirror pin: the projected workflow's `matrix` is the wire
+	// mirror of the same resolved actions, so sha256 over its JSON must be
+	// the HashMatrix digest byte for byte.
+	projected := only(t, delegationview.Project(parsed))
+	raw, err := json.Marshal(projected.Matrix)
+	if err != nil {
+		t.Fatalf("marshal projected matrix: %v", err)
+	}
+	sum := sha256.Sum256(raw)
+	if want := hex.EncodeToString(sum[:]); base != want {
+		t.Errorf("HashMatrix = %s, want sha256 over the projected wire matrix %s", base, want)
+	}
+
+	empty := delegationview.HashMatrix(nil)
+	if empty == "" {
+		t.Error("HashMatrix(nil) is empty; 'no matrix' must be a stable non-empty digest")
+	}
+	if got := delegationview.HashMatrix([]spec.ResolvedAction{}); got != empty {
+		t.Errorf("HashMatrix(empty) = %s, want the nil-matrix digest %s", got, empty)
+	}
+	if empty == base {
+		t.Error("the no-matrix digest equals a resolved matrix's digest")
 	}
 }

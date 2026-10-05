@@ -1932,3 +1932,353 @@ func (r stageCapturingResolver) ResolveEscalations(_ context.Context, _ *run.Run
 	r.seen <- stageID
 	return spec.ComposedRequirements{}, nil
 }
+
+// --- delegation shadow (ADR-085 rule 4 / E82.1 / #3778) ----------------------
+
+// shadowState is one run state a shadow parity case evaluates over.
+type shadowState struct {
+	stages []*run.Stage
+	open   []*concern.Concern
+	audit  map[string][]*audit.Entry
+	prURL  *string
+}
+
+func (st shadowState) evaluator() *Evaluator {
+	return newTestEvaluator(&fakeStages{stages: st.stages}, &fakeConcerns{open: st.open}, &fakeAudit{entries: st.audit})
+}
+
+func (st shadowState) run() *run.Run {
+	r := newRun()
+	r.PullRequestURL = st.prURL
+	return r
+}
+
+func shadowOf(t *testing.T, ev *Evaluator, wf *spec.Workflow, runRow *run.Run, action string) *Shadow {
+	t.Helper()
+	sh, err := ev.Shadow(context.Background(), runRow, wf, action)
+	if err != nil {
+		t.Fatalf("Shadow(%s): %v", action, err)
+	}
+	if sh == nil {
+		t.Fatalf("Shadow(%s) returned nil with no error", action)
+	}
+	return sh
+}
+
+// shadowParityCases is one met and one unmet run state per delegable class.
+// Each unmet state fails on a predicate the class's OWN evaluator names, so
+// a Shadow that answered any class without the shared evaluator diverges.
+func shadowParityCases() []struct {
+	name, action, class string
+	wantMet             bool
+	state               shadowState
+} {
+	pr := "https://github.com/x/y/pull/7"
+	planGate := func() []*run.Stage {
+		return []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateAwaitingApproval)}
+	}
+	implGate := func() []*run.Stage {
+		return []*run.Stage{
+			mkStage(0, run.StageTypePlan, run.StageStateSucceeded),
+			mkStage(1, run.StageTypeImplement, run.StageStateAwaitingApproval),
+		}
+	}
+	settled := func() []*run.Stage {
+		return []*run.Stage{
+			mkStage(0, run.StageTypePlan, run.StageStateSucceeded),
+			mkStage(1, run.StageTypeImplement, run.StageStateSucceeded),
+		}
+	}
+	planRound := func(verdicts ...planreview.Verdict) map[string][]*audit.Entry {
+		m := map[string][]*audit.Entry{"plan_review_started": {startedEntry(1, 2)}}
+		for i, v := range verdicts {
+			m["plan_reviewed"] = append(m["plan_reviewed"], verdictEntry(int64(2+i), v))
+		}
+		return m
+	}
+	implRound := map[string][]*audit.Entry{
+		"implement_review_started": {startedEntry(1, 2)},
+		"implement_reviewed":       {verdictEntry(2, planreview.VerdictApprove), verdictEntry(3, planreview.VerdictApprove)},
+	}
+	green := map[string][]*audit.Entry{drive.Category: {checksGreenEntry(9)}}
+	return []struct {
+		name, action, class string
+		wantMet             bool
+		state               shadowState
+	}{
+		{"approve met", ActionApprove, spec.ActionApprove, true,
+			shadowState{stages: planGate(), audit: planRound(planreview.VerdictApprove, planreview.VerdictApprove)}},
+		{"approve unmet: 1 of 2 verdicts", ActionApprove, spec.ActionApprove, false,
+			shadowState{stages: planGate(), audit: planRound(planreview.VerdictApprove)}},
+		{"route_fixup met", ActionRouteFixup, spec.ActionFixup, true,
+			shadowState{stages: implGate(), audit: implRound, open: []*concern.Concern{openConcern("medium")}}},
+		{"route_fixup unmet: below threshold", ActionRouteFixup, spec.ActionFixup, false,
+			shadowState{stages: implGate(), audit: implRound, open: []*concern.Concern{openConcern("low")}}},
+		{"waive met", ActionWaive, spec.ActionWaive, true,
+			shadowState{stages: planGate(), open: []*concern.Concern{openConcern("low")}}},
+		{"waive unmet: two open", ActionWaive, spec.ActionWaive, false,
+			shadowState{stages: planGate(), open: []*concern.Concern{openConcern("low"), openConcern("low")}}},
+		{"retry met", ActionRetry, spec.ActionRetry, true,
+			shadowState{stages: []*run.Stage{failedStage(1, "A", realFlakeFailureReason())}}},
+		{"retry unmet: category B", ActionRetry, spec.ActionRetry, false,
+			shadowState{stages: []*run.Stage{failedStage(1, "B", "tests failed")}}},
+		{"merge met", ActionMerge, spec.ActionMerge, true,
+			shadowState{stages: settled(), audit: green, prURL: &pr}},
+		{"merge unmet: open concern", ActionMerge, spec.ActionMerge, false,
+			shadowState{stages: settled(), audit: green, prURL: &pr, open: []*concern.Concern{openConcern("low")}}},
+	}
+}
+
+// TestShadow_ParityWithEvaluate: on the SAME run state, Evaluate over a spec
+// where the class is `auto` and Shadow over a spec where the class is `gated`
+// agree on the condition, met, and the unmet reason verbatim — so the stamp
+// records exactly what the action-time check (checkDelegation reads
+// Evaluate's decision) would have answered had the class been delegated.
+func TestShadow_ParityWithEvaluate(t *testing.T) {
+	for _, tc := range shadowParityCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			cond := actionConditions[tc.action]
+			autoWF := parseV2Workflow(t, fmt.Sprintf("    actions:\n      %s:\n        mode: auto\n        when: %s", tc.class, cond))
+			gatedWF := parseV2Workflow(t, fmt.Sprintf("    actions:\n      %s:\n        mode: gated", tc.class))
+
+			runRow := tc.state.run()
+			d := decisionFor(t, evaluate(t, tc.state.evaluator(), autoWF, runRow), tc.action)
+			if d.Met != tc.wantMet {
+				t.Fatalf("Evaluate %s Met = %v, want %v (reason %q) — the fixture does not isolate the case", tc.action, d.Met, tc.wantMet, d.UnmetReason)
+			}
+			sh := shadowOf(t, tc.state.evaluator(), gatedWF, runRow, tc.action)
+
+			if sh.Condition != d.Condition || sh.Met != d.Met || sh.Reason != d.UnmetReason {
+				t.Errorf("Shadow {cond %q met %v reason %q} != Evaluate {cond %q met %v reason %q}",
+					sh.Condition, sh.Met, sh.Reason, d.Condition, d.Met, d.UnmetReason)
+			}
+			wantVerdict := ShadowUnmet
+			if tc.wantMet {
+				wantVerdict = ShadowMet
+			}
+			if sh.Verdict != wantVerdict {
+				t.Errorf("Verdict = %q, want %q", sh.Verdict, wantVerdict)
+			}
+			if sh.Action != tc.action || sh.Class != tc.class {
+				t.Errorf("Action/Class = %q/%q, want %q/%q", sh.Action, sh.Class, tc.action, tc.class)
+			}
+			if sh.Mode != spec.ModeGated || sh.Source != spec.SourceExplicit || !sh.MatrixResolved {
+				t.Errorf("provenance = mode %q source %q resolved %v, want gated/explicit/true", sh.Mode, sh.Source, sh.MatrixResolved)
+			}
+		})
+	}
+}
+
+// TestShadow_GatedClassNotInResult: on an all-gated (`autonomy: low`) run,
+// Evaluate delegates and reports NOTHING while Shadow still answers each
+// class — the counterfactual lives only on the Shadow value and never leaks
+// into the Result every reader (run read, auto-driver, checkDelegation) sees.
+func TestShadow_GatedClassNotInResult(t *testing.T) {
+	wf := parseV2Workflow(t, "    autonomy: low")
+	ev := newTestEvaluator(&fakeStages{stages: []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateAwaitingApproval)}},
+		&fakeConcerns{open: []*concern.Concern{openConcern("low")}}, &fakeAudit{})
+	runRow := newRun()
+
+	for _, action := range []string{ActionApprove, ActionRouteFixup, ActionWaive, ActionRetry, ActionMerge} {
+		sh := shadowOf(t, ev, wf, runRow, action)
+		if sh.Verdict != ShadowMet && sh.Verdict != ShadowUnmet {
+			t.Errorf("Shadow(%s) verdict = %q, want an evaluated met/unmet", action, sh.Verdict)
+		}
+		if sh.Mode != spec.ModeGated || sh.Source != spec.SourceTier || sh.Tier != spec.TierLow {
+			t.Errorf("Shadow(%s) provenance = %q/%q tier %q, want gated/tier/low", action, sh.Mode, sh.Source, sh.Tier)
+		}
+	}
+	if sh := shadowOf(t, ev, wf, runRow, ActionWaive); !sh.Met {
+		t.Errorf("Shadow(waive) = %+v, want met (exactly one low open concern) — the leak assertion below needs a MET shadow", sh)
+	}
+
+	res := evaluate(t, ev, wf, runRow)
+	if len(res.Actions) != 0 || len(res.Reports) != 0 {
+		t.Errorf("Evaluate on an all-gated matrix = actions %+v reports %+v, want none (the shadow must not leak into Result)", res.Actions, res.Reports)
+	}
+}
+
+// TestShadow_ParkedAwaitingInputNotDelegable: a run parked at awaiting_input
+// is stamped not_delegable without evaluating. The single LOW open concern
+// makes solo_low MET, so a Shadow that skipped the parked check would report
+// met here.
+func TestShadow_ParkedAwaitingInputNotDelegable(t *testing.T) {
+	wf := parseV2Workflow(t, "    autonomy: high")
+	ev := newTestEvaluator(&fakeStages{stages: []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateAwaitingInput)}},
+		&fakeConcerns{open: []*concern.Concern{openConcern("low")}}, &fakeAudit{})
+	sh := shadowOf(t, ev, wf, newRun(), ActionWaive)
+	if sh.Verdict != ShadowNotDelegable || sh.Met {
+		t.Fatalf("Shadow = %+v, want not_delegable / met=false while parked", sh)
+	}
+	if !strings.HasPrefix(sh.Reason, "parked_awaiting_input:") {
+		t.Errorf("Reason = %q, want the parked_awaiting_input prefix", sh.Reason)
+	}
+	if sh.Condition != spec.ConditionSoloLow || sh.Class != spec.ActionWaive {
+		t.Errorf("Condition/Class = %q/%q, want solo_low/waive (the class is still named)", sh.Condition, sh.Class)
+	}
+}
+
+// TestShadow_UnknownClassNotDelegable: an action with no delegable class is
+// not_delegable and is answered BEFORE any repository read — every fake here
+// fails if called.
+func TestShadow_UnknownClassNotDelegable(t *testing.T) {
+	boom := errors.New("must not be called")
+	ev := newTestEvaluatorWith(&fakeStages{err: boom}, &fakeConcerns{err: boom}, &fakeAudit{err: boom}, &fakeEscalations{err: boom})
+	for _, action := range []string{"defer", "ordering", ""} {
+		sh, err := ev.Shadow(context.Background(), newRun(), parseV2Workflow(t, "    autonomy: high"), action)
+		if err != nil {
+			t.Fatalf("Shadow(%q): %v (an unknown class must not reach a repository read)", action, err)
+		}
+		if sh.Verdict != ShadowNotDelegable || sh.Met || sh.Class != "" || sh.Condition != "" {
+			t.Errorf("Shadow(%q) = %+v, want not_delegable with no class and no condition", action, sh)
+		}
+		if !strings.Contains(sh.Reason, "not a delegable action class") {
+			t.Errorf("Shadow(%q).Reason = %q, want it to say the action is not a delegable class", action, sh.Reason)
+		}
+	}
+}
+
+// TestShadow_EscalationCeilingAppliedLast: `autonomy: high` puts waive at
+// auto; a fired `max_autonomy: low` ceiling must surface it as gated with
+// Source=escalation — the clamped mode the stamp's stratum records — while the
+// condition is still evaluated. The control arm proves the unclamped mode is
+// auto, so the clamp assertion is not vacuous.
+func TestShadow_EscalationCeilingAppliedLast(t *testing.T) {
+	wf := parseV2Workflow(t, "    autonomy: high")
+	stages := []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateAwaitingApproval)}
+	open := []*concern.Concern{openConcern("low")}
+
+	control := shadowOf(t, newTestEvaluator(&fakeStages{stages: stages}, &fakeConcerns{open: open}, &fakeAudit{}), wf, newRun(), ActionWaive)
+	if control.Mode != spec.ModeAuto || control.Source != spec.SourceTier {
+		t.Fatalf("control (no escalation) = %q/%q, want auto/tier", control.Mode, control.Source)
+	}
+
+	esc := &fakeEscalations{req: spec.ComposedRequirements{MaxAutonomy: spec.TierLow}}
+	sh := shadowOf(t, newTestEvaluatorWith(&fakeStages{stages: stages}, &fakeConcerns{open: open}, &fakeAudit{}, esc), wf, newRun(), ActionWaive)
+	if esc.calls != 1 {
+		t.Errorf("resolver calls = %d, want 1", esc.calls)
+	}
+	if sh.Mode != spec.ModeGated || sh.Source != spec.SourceEscalation {
+		t.Errorf("clamped = %q/%q, want gated/escalation", sh.Mode, sh.Source)
+	}
+	for _, a := range sh.Matrix {
+		if a.Mode == spec.ModeAuto {
+			t.Errorf("matrix[%s] still auto under a low ceiling: %+v", a.Action, sh.Matrix)
+		}
+	}
+	if sh.Verdict != ShadowMet || !sh.Met {
+		t.Errorf("verdict = %q met %v, want met (the condition is evaluated regardless of the clamped mode)", sh.Verdict, sh.Met)
+	}
+	if len(sh.MustPageHuman) == 0 {
+		t.Error("MustPageHuman is empty; the clamped block's page list feeds the server's page-event override")
+	}
+}
+
+// TestShadow_ResolverErrorReturned: a resolver failure is an error, never a
+// verdict computed over the unclamped matrix.
+func TestShadow_ResolverErrorReturned(t *testing.T) {
+	boom := errors.New("plan unreadable")
+	ev := newTestEvaluatorWith(&fakeStages{stages: []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateAwaitingApproval)}},
+		&fakeConcerns{}, &fakeAudit{}, &fakeEscalations{err: boom})
+	sh, err := ev.Shadow(context.Background(), newRun(), parseV2Workflow(t, "    autonomy: high"), ActionWaive)
+	if !errors.Is(err, boom) || sh != nil {
+		t.Fatalf("Shadow = (%+v, %v), want (nil, the resolver failure)", sh, err)
+	}
+}
+
+// TestShadow_RepoFailuresPropagate: every repository read failure Shadow can
+// reach is returned as an error, never a fabricated verdict.
+func TestShadow_RepoFailuresPropagate(t *testing.T) {
+	boom := errors.New("store down")
+	gate := []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateAwaitingApproval)}
+	wf := parseV2Workflow(t, "    autonomy: high")
+	tests := []struct {
+		name string
+		ev   *Evaluator
+	}{
+		{"stage list failure", newTestEvaluator(&fakeStages{err: boom}, &fakeConcerns{}, &fakeAudit{})},
+		{"concern list failure", newTestEvaluator(&fakeStages{stages: gate}, &fakeConcerns{err: boom}, &fakeAudit{})},
+		{"condition audit read failure", newTestEvaluator(&fakeStages{stages: gate}, &fakeConcerns{}, &fakeAudit{err: boom})},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sh, err := tt.ev.Shadow(context.Background(), newRun(), wf, ActionApprove)
+			if !errors.Is(err, boom) || sh != nil {
+				t.Errorf("Shadow = (%+v, %v), want (nil, the injected store failure)", sh, err)
+			}
+		})
+	}
+}
+
+// TestShadow_NoMatrixStillEvaluates: with no matrix the class's condition is
+// still evaluated. No block at all reads gated/default; a v0/v1 knob block is
+// projected (set knob -> auto, unset -> gated, both explicit), so a human
+// acting on a class the knob block delegates is not mis-stamped as gated.
+func TestShadow_NoMatrixStillEvaluates(t *testing.T) {
+	stages := []*run.Stage{mkStage(0, run.StageTypePlan, run.StageStateAwaitingApproval)}
+	open := []*concern.Concern{openConcern("low")}
+
+	tests := []struct {
+		name       string
+		wf         *spec.Workflow
+		action     string
+		wantMode   spec.ActionMode
+		wantSource spec.ResolutionSource
+		wantPage   bool
+	}{
+		{"no block anywhere", testWorkflow(nil, nil), ActionWaive, spec.ModeGated, spec.SourceDefault, false},
+		{"v0 knob set", testWorkflow(allKnobs(), nil), ActionWaive, spec.ModeAuto, spec.SourceExplicit, true},
+		{"v0 knob unset", testWorkflow(&spec.OperatorAgent{MayApprove: spec.ConditionCleanDualApproval}, nil), ActionWaive, spec.ModeGated, spec.SourceExplicit, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ev := newTestEvaluator(&fakeStages{stages: stages}, &fakeConcerns{open: open}, &fakeAudit{})
+			sh := shadowOf(t, ev, tt.wf, newRun(), tt.action)
+			if sh.MatrixResolved || sh.Matrix != nil || sh.Tier != "" {
+				t.Errorf("matrix fields = resolved %v matrix %+v tier %q, want none (no v2 matrix governs the run)", sh.MatrixResolved, sh.Matrix, sh.Tier)
+			}
+			if sh.Mode != tt.wantMode || sh.Source != tt.wantSource {
+				t.Errorf("provenance = %q/%q, want %q/%q", sh.Mode, sh.Source, tt.wantMode, tt.wantSource)
+			}
+			if sh.Verdict != ShadowMet || sh.Condition != spec.ConditionSoloLow {
+				t.Errorf("verdict/condition = %q/%q, want met/solo_low (the condition is still evaluated)", sh.Verdict, sh.Condition)
+			}
+			if got := len(sh.MustPageHuman) > 0; got != tt.wantPage {
+				t.Errorf("MustPageHuman = %v, want non-empty=%v", sh.MustPageHuman, tt.wantPage)
+			}
+		})
+	}
+}
+
+// TestEvalClassCondition_UnknownActionIsError: the shared evaluator refuses a
+// verb it has no condition for instead of answering "unmet", so a verb added
+// without its evaluator surfaces as an error at both callers.
+func TestEvalClassCondition_UnknownActionIsError(t *testing.T) {
+	ev := newTestEvaluator(&fakeStages{}, &fakeConcerns{}, &fakeAudit{})
+	met, reason, err := ev.evalClassCondition(context.Background(), "defer", newRun(), testWorkflow(nil, nil), nil, nil, nil, nil)
+	if err == nil || met || reason != "" {
+		t.Fatalf("evalClassCondition(defer) = (%v, %q, %v), want (false, \"\", an error)", met, reason, err)
+	}
+	if !strings.Contains(err.Error(), `"defer"`) {
+		t.Errorf("error %q does not name the action", err)
+	}
+}
+
+// TestShadowVerdicts_ClosedSet pins the four-value vocabulary, including the
+// server-produced `unevaluable`, as one closed set.
+func TestShadowVerdicts_ClosedSet(t *testing.T) {
+	want := []ShadowVerdict{"met", "unmet", "not_delegable", "unevaluable"}
+	if got := ShadowVerdicts(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("ShadowVerdicts() = %v, want %v", got, want)
+	}
+	for _, v := range want {
+		if !v.Valid() {
+			t.Errorf("%q.Valid() = false", v)
+		}
+	}
+	for _, v := range []ShadowVerdict{"", "auto", "MET", "would_auto"} {
+		if v.Valid() {
+			t.Errorf("%q.Valid() = true, want false (outside the closed set)", v)
+		}
+	}
+}
