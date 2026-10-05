@@ -56,6 +56,13 @@ type DispatchStageOutput struct {
 	// runner was spawned, so there is nothing to await.
 	NextStep *SuggestedAction `json:"next_step,omitempty" jsonschema:"the single terminal wait to call on the returned (run_id, stage_id) handle: fishhawk_await_stage, params pre-filled. Absent on the needs_target pre-spawn refusal (no runner was spawned)"`
 
+	// ConcurrencySlot is the local concurrency-slot state (#3964 / ADR-087):
+	// on a QUEUED dispatch, status awaiting_concurrency_slot with position,
+	// holders and waiter (started | already_waiting) — no runner was spawned;
+	// on a grouped admission, the group/limit/queued_before block. Absent for
+	// an ungrouped stage.
+	ConcurrencySlot *StageConcurrency `json:"concurrency_slot,omitempty" jsonschema:"local concurrency-slot state. status awaiting_concurrency_slot means the dispatch was QUEUED behind this host's slot holders and NO runner was spawned: this session's slot waiter (waiter started | already_waiting) spawns it on admission, so call next_step fishhawk_await_stage. On an immediate grouped admission it carries group, limit and queued_before. Absent for an ungrouped stage"`
+
 	Warnings []string `json:"warnings,omitempty"`
 
 	// NeedsTarget is the pre-spawn acceptance refusal (E48.6 / #1953): set only
@@ -80,7 +87,9 @@ const dispatchStageSourceTag = "fishhawk_dispatch_stage"
 // threads into the spawn without launching a runner. It is READ synchronously
 // inside dispatchStage before the call returns, so — unlike the reaper's
 // reapProbeBackoff — no goroutine reads it after the verb returns, and a serial
-// test override cannot race a leaked reaper. Kept SEPARATE from the drive loop's
+// test override cannot race a leaked reaper. The concurrency-slot waiter
+// (#3964) receives it as a captured value (slotWaiterSpec.spawn), never by
+// reading this var from its goroutine. Kept SEPARATE from the drive loop's
 // r.driveSpawn field so a manual dispatch stays distinguishable from a drive-loop
 // spawn in the shared-fake recovery tests.
 var dispatchSpawnDetached = spawnRunnerStageDetached
@@ -162,6 +171,20 @@ teardown default is injected only alongside the provision default, and the
 flag is inert on every non-acceptance stage. When
 a dispatch DOES park at needs_target, the refusal now names the exact bring-up
 command to run.
+
+Local concurrency slots (#3964 / ADR-087): by default one local IMPLEMENT
+stage runs per host at a time (group local-implement:<host>, limit 1; a
+workflow-v2 stage "concurrency" block overrides it). When the host's slot is
+held, the dispatch is QUEUED, not refused: NO runner is spawned, the stage
+stays awaiting_host_dispatch, and the result carries concurrency_slot (status
+awaiting_concurrency_slot, position, holders, waiter). This session's slot
+waiter then re-polls every 5s and spawns the runner when a slot frees (for up
+to 3 hours); the queue is FIFO across every session on the host. Call the
+returned next_step fishhawk_await_stage — it holds through the queue while the
+waiter is live. The waiter lives in this MCP process: if the process exits (a
+shim hot-swap or /mcp), the queue row goes stale after 60s and the stage must
+be re-dispatched. Until #3969, fishhawk_run_stage, fishhawk_drive_run and
+fishhawk_run_children fail closed on a queued dispatch instead of waiting.
 
 Requires the fishhawk-runner binary to resolve on the MCP server's host,
 exactly like fishhawk_run_stage (this tool is local-only by design, ADR-024 Q5).
@@ -275,108 +298,126 @@ func (r *runResolver) dispatchStage(ctx context.Context, _ *mcp.CallToolRequest,
 	// dispatch.
 	selfHostWarnings := r.guardRunnerSelfHost(ctx, runUUID, in.Stage)
 
-	// (3) Resolve the runner binary (input > env > sibling > PATH > error).
-	binary, err := resolveRunnerBinary(in.RunnerBinary, r.getenv)
+	// Seeded with any guard fail-open warning from step (1a) and (2a).
+	warnings := append(append(append(guardWarnings, siblingWarnings...), noPRWarnings...), selfHostWarnings...)
+
+	// Steps (3)-(5a') build the spawn inputs in ONE closure (#3964): it runs
+	// once here, before the marker, so bad inputs still fail fast, and the
+	// concurrency-slot waiter runs it AGAIN at admission, so a queued stage
+	// spawns with the runner binary, argv and env (current token) of that
+	// moment rather than of queue time.
+	prepareSpawn := func() (dispatchSpawnPlan, error) {
+		var plan dispatchSpawnPlan
+		// (3) Resolve the runner binary (input > env > sibling > PATH > error).
+		binary, err := resolveRunnerBinary(in.RunnerBinary, r.getenv)
+		if err != nil {
+			return plan, err
+		}
+		plan.binary = binary
+
+		// (4) Resolve the GitHub repo with the same soft-fail rule run_stage uses:
+		// push_and_open_pr=false makes a missing repo a warning, not an error.
+		// A gitlab run defaults an omitted github_repo to the run row's project
+		// path BEFORE the github.com-only origin auto-detect (E45.46 / #3463).
+		repo := in.GitHubRepo
+		if repo == "" && forgeTarget.Forge == startRunForgeGitLab {
+			repo = forgeTarget.Repo
+		}
+		if repo == "" {
+			detected, derr := runStageDetectGitHubRepo(workingDir)
+			switch {
+			case derr == nil:
+				repo = detected
+			case pushAndOpenPR:
+				return plan, fmt.Errorf(
+					"github_repo not set and could not detect from origin (push_and_open_pr requires a repo): %w", derr)
+			default:
+				plan.warnings = append(plan.warnings,
+					fmt.Sprintf("github_repo not set and origin auto-detect failed (%v); proceeding without push.", derr))
+			}
+		}
+
+		// (5) Compose the runner argv via the shared composer so the dispatched
+		// argv is byte-identical to fishhawk_run_stage's for the same input.
+		baseBranch := in.BaseBranch
+		if baseBranch == "" {
+			baseBranch = "main"
+		}
+		runStageIn := RunStageInput{
+			RunID:         in.RunID,
+			StageID:       in.StageID,
+			Workflow:      in.Workflow,
+			Stage:         in.Stage,
+			WorkingDir:    workingDir,
+			GitHubRepo:    in.GitHubRepo,
+			BaseBranch:    in.BaseBranch,
+			PushAndOpenPR: in.PushAndOpenPR,
+			RunnerBinary:  in.RunnerBinary,
+		}
+		plan.argv = r.composeRunnerArgv(runStageIn, resolvedStageID, repo, baseBranch, pushAndOpenPR, forgeTarget)
+		plan.env = append(os.Environ(), "FISHHAWK_API_TOKEN="+r.api.token)
+
+		// (5a') auto_preview (E68.43 / #3321). ONE resolution feeds BOTH the gate's
+		// proceed decision (5b' below) and the spawn-env injection here, so the gate
+		// can never proceed on a command the runner was never handed. The
+		// acceptance-stage conjunct confines the flag: it is inert on every other
+		// stage type. An operator-set FISHHAWK_ACCEPTANCE_PREVIEW_CMD resolves with
+		// source "env" and is ALREADY in os.Environ() above, so nothing is appended
+		// and the operator's value is passed through unchanged.
+		//
+		// The TEARDOWN counterpart rides the same resolution (#3394): the built-in
+		// `scripts/dev preview-down` is injected ONLY when the provision resolved to
+		// the built-in default (provisionSource "auto_preview"), never keyed on the
+		// raw flag — an operator provision hook keeps ownership of its own teardown,
+		// because the default teardown only knows how to take down what the default
+		// provision stood up. An operator-set teardown resolves with source "env",
+		// is already in os.Environ(), and passes through unchanged. Without this
+		// pairing the runner emitted acceptance_preview_teardown_missing and leaked
+		// the preview fishhawkd on the target port (observed on #3328).
+		//
+		// LOCAL-ONLY BY CONSTRUCTION — recorded here so the next reader need not
+		// re-derive it (#3321 operator constraint item 2). This verb's ONLY spawn is
+		// dispatchSpawnDetached (below), whose production value is
+		// spawnRunnerStageDetached, which opens `cmd := runStageCommand(binary,
+		// argv...)` / `cmd.Env = env` (run_stage.go) — an os/exec of the runner
+		// binary on the MCP server's OWN host. There is no remote-dispatch branch
+		// anywhere in this verb; its tool description says so ("this tool is
+		// local-only by design, ADR-024 Q5"), and guardHostDispatch already REFUSED,
+		// before any spawn, a run locked to a KNOWN non-host-dispatched kind
+		// (KindHostDispatched returns (false, true) for github_actions and
+		// gitlab_ci). So a runner_kind conjunct here would be redundant: "local" is a
+		// property of the SPAWN PATH, not of the run's runner_kind field. RESIDUAL,
+		// stated rather than glossed: guardHostDispatch deliberately ALLOWS an
+		// un-resolved run (so #1346's first-dispatch auto-resolve can fire) and an
+		// unknown locked kind — but in BOTH cases the spawn is still the local exec
+		// above, so the injected command still reaches a local runner running from
+		// workingDir. TestDispatchStage_AutoPreviewCannotReachNonLocalRunnerKind is
+		// the regression alarm if a remote-dispatch branch is ever added here.
+		previewCmd, previewSource := resolveAcceptancePreviewCmd(r.getenv, in.AutoPreview && in.Stage == "acceptance")
+		plan.previewCmd, plan.previewSource = previewCmd, previewSource
+		if previewSource == "auto_preview" {
+			plan.env = append(plan.env, acceptancePreviewCmdEnv+"="+previewCmd)
+			teardownCmd, teardownSource := resolveAcceptancePreviewTeardownCmd(r.getenv, previewSource)
+			teardownNote := fmt.Sprintf("%s was not set in this process, so the built-in default applies", acceptancePreviewCmdEnv)
+			switch teardownSource {
+			case "auto_preview":
+				plan.env = append(plan.env, acceptancePreviewTeardownCmdEnv+"="+teardownCmd)
+				teardownNote += fmt.Sprintf("; %s was not set either, so its built-in counterpart is injected alongside", acceptancePreviewTeardownCmdEnv)
+			case "env":
+				teardownNote += fmt.Sprintf("; the operator-set %s is passed through unchanged", acceptancePreviewTeardownCmdEnv)
+			}
+			plan.warnings = append(plan.warnings, fmt.Sprintf(
+				"auto_preview: the spawned runner will run %q in %s to provision the acceptance target before validating, and %q to tear it down afterwards on every exit path (%s).",
+				previewCmd, workingDir, teardownCmd, teardownNote))
+		}
+		return plan, nil
+	}
+	spawnPlan, err := prepareSpawn()
 	if err != nil {
 		return nil, DispatchStageOutput{}, err
 	}
-
-	// (4) Resolve the GitHub repo with the same soft-fail rule run_stage uses:
-	// push_and_open_pr=false makes a missing repo a warning, not an error.
-	// Seeded with any guard fail-open warning from step (1a) and (2a).
-	warnings := append(append(append(guardWarnings, siblingWarnings...), noPRWarnings...), selfHostWarnings...)
-	// A gitlab run defaults an omitted github_repo to the run row's project
-	// path BEFORE the github.com-only origin auto-detect (E45.46 / #3463).
-	repo := in.GitHubRepo
-	if repo == "" && forgeTarget.Forge == startRunForgeGitLab {
-		repo = forgeTarget.Repo
-	}
-	if repo == "" {
-		detected, derr := runStageDetectGitHubRepo(workingDir)
-		switch {
-		case derr == nil:
-			repo = detected
-		case pushAndOpenPR:
-			return nil, DispatchStageOutput{}, fmt.Errorf(
-				"github_repo not set and could not detect from origin (push_and_open_pr requires a repo): %w", derr)
-		default:
-			warnings = append(warnings,
-				fmt.Sprintf("github_repo not set and origin auto-detect failed (%v); proceeding without push.", derr))
-		}
-	}
-
-	// (5) Compose the runner argv via the shared composer so the dispatched
-	// argv is byte-identical to fishhawk_run_stage's for the same input.
-	baseBranch := in.BaseBranch
-	if baseBranch == "" {
-		baseBranch = "main"
-	}
-	runStageIn := RunStageInput{
-		RunID:         in.RunID,
-		StageID:       in.StageID,
-		Workflow:      in.Workflow,
-		Stage:         in.Stage,
-		WorkingDir:    workingDir,
-		GitHubRepo:    in.GitHubRepo,
-		BaseBranch:    in.BaseBranch,
-		PushAndOpenPR: in.PushAndOpenPR,
-		RunnerBinary:  in.RunnerBinary,
-	}
-	argv := r.composeRunnerArgv(runStageIn, resolvedStageID, repo, baseBranch, pushAndOpenPR, forgeTarget)
-	env := append(os.Environ(), "FISHHAWK_API_TOKEN="+r.api.token)
-
-	// (5a') auto_preview (E68.43 / #3321). ONE resolution feeds BOTH the gate's
-	// proceed decision (5b' below) and the spawn-env injection here, so the gate
-	// can never proceed on a command the runner was never handed. The
-	// acceptance-stage conjunct confines the flag: it is inert on every other
-	// stage type. An operator-set FISHHAWK_ACCEPTANCE_PREVIEW_CMD resolves with
-	// source "env" and is ALREADY in os.Environ() above, so nothing is appended
-	// and the operator's value is passed through unchanged.
-	//
-	// The TEARDOWN counterpart rides the same resolution (#3394): the built-in
-	// `scripts/dev preview-down` is injected ONLY when the provision resolved to
-	// the built-in default (provisionSource "auto_preview"), never keyed on the
-	// raw flag — an operator provision hook keeps ownership of its own teardown,
-	// because the default teardown only knows how to take down what the default
-	// provision stood up. An operator-set teardown resolves with source "env",
-	// is already in os.Environ(), and passes through unchanged. Without this
-	// pairing the runner emitted acceptance_preview_teardown_missing and leaked
-	// the preview fishhawkd on the target port (observed on #3328).
-	//
-	// LOCAL-ONLY BY CONSTRUCTION — recorded here so the next reader need not
-	// re-derive it (#3321 operator constraint item 2). This verb's ONLY spawn is
-	// dispatchSpawnDetached (below), whose production value is
-	// spawnRunnerStageDetached, which opens `cmd := runStageCommand(binary,
-	// argv...)` / `cmd.Env = env` (run_stage.go) — an os/exec of the runner
-	// binary on the MCP server's OWN host. There is no remote-dispatch branch
-	// anywhere in this verb; its tool description says so ("this tool is
-	// local-only by design, ADR-024 Q5"), and guardHostDispatch already REFUSED,
-	// before any spawn, a run locked to a KNOWN non-host-dispatched kind
-	// (KindHostDispatched returns (false, true) for github_actions and
-	// gitlab_ci). So a runner_kind conjunct here would be redundant: "local" is a
-	// property of the SPAWN PATH, not of the run's runner_kind field. RESIDUAL,
-	// stated rather than glossed: guardHostDispatch deliberately ALLOWS an
-	// un-resolved run (so #1346's first-dispatch auto-resolve can fire) and an
-	// unknown locked kind — but in BOTH cases the spawn is still the local exec
-	// above, so the injected command still reaches a local runner running from
-	// workingDir. TestDispatchStage_AutoPreviewCannotReachNonLocalRunnerKind is
-	// the regression alarm if a remote-dispatch branch is ever added here.
-	previewCmd, previewSource := resolveAcceptancePreviewCmd(r.getenv, in.AutoPreview && in.Stage == "acceptance")
-	if previewSource == "auto_preview" {
-		env = append(env, acceptancePreviewCmdEnv+"="+previewCmd)
-		teardownCmd, teardownSource := resolveAcceptancePreviewTeardownCmd(r.getenv, previewSource)
-		teardownNote := fmt.Sprintf("%s was not set in this process, so the built-in default applies", acceptancePreviewCmdEnv)
-		switch teardownSource {
-		case "auto_preview":
-			env = append(env, acceptancePreviewTeardownCmdEnv+"="+teardownCmd)
-			teardownNote += fmt.Sprintf("; %s was not set either, so its built-in counterpart is injected alongside", acceptancePreviewTeardownCmdEnv)
-		case "env":
-			teardownNote += fmt.Sprintf("; the operator-set %s is passed through unchanged", acceptancePreviewTeardownCmdEnv)
-		}
-		warnings = append(warnings, fmt.Sprintf(
-			"auto_preview: the spawned runner will run %q in %s to provision the acceptance target before validating, and %q to tear it down afterwards on every exit path (%s).",
-			previewCmd, workingDir, teardownCmd, teardownNote))
-	}
+	warnings = append(warnings, spawnPlan.warnings...)
+	previewCmd, previewSource := spawnPlan.previewCmd, spawnPlan.previewSource
 
 	// (6) Spawn DETACHED — start and return; the runner outlives this call. The
 	// reporter closure binds the backend client + durable handle so the detached
@@ -537,12 +578,43 @@ func (r *runResolver) dispatchStage(ctx context.Context, _ *mcp.CallToolRequest,
 	// or 4xx means NO spawn (an unmarked spawn would recreate the ambiguity #1912
 	// removes). transitioned:false (already 'dispatched') proceeds: the manual
 	// dead-runner re-dispatch.
-	if _, hderr := r.api.HostDispatchStage(ctx, runUUID, stageUUID); hderr != nil {
+	//
+	// A 409 concurrency_slot_queued (#3964 / ADR-087) is NOT a failure here:
+	// the stage was queued for this host's local concurrency slot and left at
+	// awaiting_host_dispatch. Spawn nothing; hand the dispatch to this
+	// process's slot waiter, which spawns on admission.
+	hdRes, hderr := r.api.HostDispatchStage(ctx, runUUID, stageUUID)
+	probe := r.stageStateProbe(runUUID, resolvedStageID)
+	if q, queued := asConcurrencySlotQueued(hderr); queued {
+		return r.queueDispatchForSlot(in, runUUID, stageUUID, workingDir, q, warnings, slotWaiterSpec{
+			runID:     runUUID,
+			stageID:   stageUUID,
+			nonce:     newAdmissionNonce(),
+			contended: q.Contended,
+			marker:    r.api,
+			prepare: func() (slotSpawnInputs, error) {
+				p, perr := prepareSpawn()
+				return p.slotSpawnInputs, perr
+			},
+			spawn:  dispatchSpawnDetached,
+			report: report,
+			probe:  probe,
+			cap:    concurrencyWaiterCap,
+			poll:   concurrencySlotPollInterval,
+			jitter: randomJitteredPoll,
+			logf:   stderrLogf,
+		})
+	}
+	if hderr != nil {
 		return nil, DispatchStageOutput{}, fmt.Errorf(
 			"host-dispatch marker for stage %s failed; NOT spawning (fail-closed): %w", resolvedStageID, hderr)
 	}
-
-	probe := r.stageStateProbe(runUUID, resolvedStageID)
+	// A GROUPED admission carries the concurrency block; the stage now holds
+	// a slot, so a spawn failure below must release it.
+	var admittedSlot *StageConcurrency
+	if hdRes != nil && hdRes.Transitioned {
+		admittedSlot = hdRes.Concurrency
+	}
 
 	// dispatchSpawnDetached is the detached-spawn seam (default: the real
 	// spawnRunnerStageDetached). It exists so a test can observe the
@@ -554,37 +626,32 @@ func (r *runResolver) dispatchStage(ctx context.Context, _ *mcp.CallToolRequest,
 	// It is deliberately NOT the drive loop's r.driveSpawn seam: this verb's manual
 	// dispatch must stay distinct from a drive-loop spawn for the shared-fake
 	// recovery tests (TestDriveRun_StaleRecoveryConvergence_EndToEnd).
-	logPath, err := dispatchSpawnDetached(binary, argv, env, runUUID.String(), resolvedStageID, report, probe)
+	logPath, err := dispatchSpawnDetached(spawnPlan.binary, spawnPlan.argv, spawnPlan.env, runUUID.String(), resolvedStageID, report, probe)
 	if err != nil {
-		return nil, DispatchStageOutput{}, err
+		if admittedSlot == nil {
+			return nil, DispatchStageOutput{}, err
+		}
+		// An immediate GROUPED admission whose spawn failed (#3964): release
+		// the slot through the reap-failure path so the stage leaves
+		// dispatched and the next queued stage is admitted at once. The
+		// ungrouped path keeps today's behaviour above.
+		relCtx := context.WithoutCancel(ctx)
+		if rerr := releaseSlotAfterSpawnFailure(relCtx, r.api, runUUID, stageUUID, "fishhawk_dispatch_stage", err); rerr != nil {
+			return nil, DispatchStageOutput{}, fmt.Errorf(
+				"%w; the stage had been admitted to concurrency group %q and releasing its slot failed (re-dispatch, or reap it with fishhawk_reap_stage): %v",
+				err, admittedSlot.Group, rerr)
+		}
+		return nil, DispatchStageOutput{}, fmt.Errorf(
+			"%w; the stage had been admitted to concurrency group %q, so it was failed category C (retryable) and its slot released",
+			err, admittedSlot.Group)
 	}
 
 	// (7) One best-effort post-dispatch stage fetch to classify the
 	// freshly-dispatched stage into a (normally non-terminal) StageWaitStatus.
 	// A fetch failure is a warning, never a tool error — the handle is already
 	// durable and pollable.
-	var stageWaitStatus *StageWaitStatus
-	if fetchErr := func() error {
-		fetchCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		stages, ferr := r.api.ListRunStages(fetchCtx, runUUID)
-		if ferr != nil {
-			return ferr
-		}
-		// The run row is not in hand at this spawn-path call site, so the
-		// predicted-runtime input is 0 and the derivation takes its
-		// elapsed-based branch (E48.62 / #2489). Deliberate, not an
-		// omission: a freshly dispatched stage has ~0 elapsed, so this
-		// resolves to the floor exactly as it did pre-#2489, and the
-		// operator's NEXT get_run_status poll — which does hold the run
-		// row — carries the derived value. An extra GetRun round-trip
-		// here would buy nothing that poll does not already deliver.
-		stageWaitStatus = stageWaitStatusFor(stages, in.Stage, "", 0, time.Now().UTC())
-		if stageWaitStatus == nil {
-			return fmt.Errorf("stage %s not found in run %s stage list", resolvedStageID, runUUID)
-		}
-		return nil
-	}(); fetchErr != nil {
+	stageWaitStatus, fetchErr := r.postDispatchStageWaitStatus(runUUID, in.Stage, resolvedStageID)
+	if fetchErr != nil {
 		warnings = append(warnings,
 			fmt.Sprintf("post-dispatch stage fetch failed (stage_wait_status omitted): %v", fetchErr))
 	}
@@ -596,9 +663,82 @@ func (r *runResolver) dispatchStage(ctx context.Context, _ *mcp.CallToolRequest,
 		StageWaitStatus:    stageWaitStatus,
 		RunURL:             r.api.baseURL + "/runs/" + runUUID.String(),
 		LogPath:            logPath,
+		ConcurrencySlot:    admittedSlot,
 		NextStep:           awaitStageNextStep(runUUID.String(), resolvedStageID, in.Stage),
 		Warnings:           warnings,
 	}, nil
+}
+
+// dispatchSpawnPlan is prepareSpawn's result: the spawn inputs plus the
+// warnings and acceptance-preview resolution the dispatch call reports.
+type dispatchSpawnPlan struct {
+	slotSpawnInputs
+	warnings                  []string
+	previewCmd, previewSource string
+}
+
+// dispatchStartSlotWaiter is the slot-waiter start seam (#3964). Production
+// points at the process-wide registry; a dispatch test stubs it so no waiter
+// goroutine polls the fake backend. Read synchronously inside dispatchStage.
+var dispatchStartSlotWaiter = slotWaiters.start
+
+// queueDispatchForSlot is the queued arm of fishhawk_dispatch_stage (#3964 /
+// ADR-087): the marker answered 409 concurrency_slot_queued, so NO runner is
+// spawned. It starts this process's slot waiter for the stage (or reports the
+// one already running) and returns the handle with the queue state and a
+// fishhawk_await_stage next step: await holds through the queue while the
+// waiter keeps the queue row live.
+func (r *runResolver) queueDispatchForSlot(in DispatchStageInput, runUUID, stageUUID uuid.UUID, workingDir string, q *concurrencySlotQueuedError, warnings []string, spec slotWaiterSpec) (*mcp.CallToolResult, DispatchStageOutput, error) {
+	waiter, _ := dispatchStartSlotWaiter(spec)
+	slot := q.stageConcurrency()
+	slot.Waiter = waiter
+	warnings = append(warnings, fmt.Sprintf(
+		"stage queued for this host's local concurrency slot (group %q, limit %d, position %d): %s. NO runner was spawned: "+
+			"this session's slot waiter (%s) re-POSTs the host-dispatch marker every %s and spawns the runner when the stage is admitted, "+
+			"for up to %s. The waiter lives in this MCP process — if the process exits (a shim hot-swap or /mcp) the queue row goes stale "+
+			"after 60s and the stage must be re-dispatched with fishhawk_dispatch_stage.",
+		q.Group, q.Limit, q.Position, q.holderSummary(), waiter, spec.poll, spec.cap))
+	stageWaitStatus, fetchErr := r.postDispatchStageWaitStatus(runUUID, in.Stage, stageUUID.String())
+	if fetchErr != nil {
+		warnings = append(warnings,
+			fmt.Sprintf("post-queue stage fetch failed (stage_wait_status omitted): %v", fetchErr))
+	}
+	next := awaitStageNextStep(runUUID.String(), stageUUID.String(), in.Stage)
+	next.Precondition = "the stage is QUEUED for a local concurrency slot (awaiting_concurrency_slot); this session's slot waiter spawns its runner on admission"
+	return nil, DispatchStageOutput{
+		RunID:              runUUID.String(),
+		StageID:            stageUUID.String(),
+		ResolvedWorkingDir: workingDir,
+		StageWaitStatus:    stageWaitStatus,
+		RunURL:             r.api.baseURL + "/runs/" + runUUID.String(),
+		ConcurrencySlot:    slot,
+		NextStep:           next,
+		Warnings:           warnings,
+	}, nil
+}
+
+// postDispatchStageWaitStatus is the one best-effort stage fetch that
+// classifies the dispatched (or queued) stage into a StageWaitStatus.
+func (r *runResolver) postDispatchStageWaitStatus(runUUID uuid.UUID, stage, stageID string) (*StageWaitStatus, error) {
+	fetchCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	stages, err := r.api.ListRunStages(fetchCtx, runUUID)
+	if err != nil {
+		return nil, err
+	}
+	// The run row is not in hand at this spawn-path call site, so the
+	// predicted-runtime input is 0 and the derivation takes its
+	// elapsed-based branch (E48.62 / #2489). Deliberate, not an
+	// omission: a freshly dispatched stage has ~0 elapsed, so this
+	// resolves to the floor exactly as it did pre-#2489, and the
+	// operator's NEXT get_run_status poll — which does hold the run
+	// row — carries the derived value. An extra GetRun round-trip
+	// here would buy nothing that poll does not already deliver.
+	st := stageWaitStatusFor(stages, stage, "", 0, time.Now().UTC())
+	if st == nil {
+		return nil, fmt.Errorf("stage %s not found in run %s stage list", stageID, runUUID)
+	}
+	return st, nil
 }
 
 // awaitStageNextStep builds the fishhawk_await_stage pointer a successful

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -22,6 +23,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/concurrency"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/decisionindex"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/precedent"
@@ -4375,4 +4377,355 @@ func TestPersonaConcernMarkers_DecodeOnEveryMirror(t *testing.T) {
 			t.Errorf("GateViewSettledConcern from a body omitting the markers = %+v, want zero values", absent)
 		}
 	})
+}
+
+// --- local concurrency groups (#3964 / ADR-087) ---
+
+// TestSanitizeHostLabel pins every arm of the host-label mapping onto the
+// server's accepted class [A-Za-z0-9._-] (1..253).
+func TestSanitizeHostLabel(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"Bretts-MacBook-Pro.local", "Bretts-MacBook-Pro.local"},
+		{"host_01", "host_01"},
+		{"  padded  ", "padded"},
+		{"a/b c", "a-b-c"},
+		{"héllo", "h-llo"},
+		{"", ""},
+		{strings.Repeat("x", 300), strings.Repeat("x", hostLabelMax)},
+	}
+	for _, tc := range cases {
+		if got := sanitizeHostLabel(tc.in); got != tc.want {
+			t.Errorf("sanitizeHostLabel(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// TestHostDispatchLabel_Seam: the label is the sanitised hostname; a hostname
+// error yields "" (no body, the server's unknown host).
+func TestHostDispatchLabel_Seam(t *testing.T) {
+	if got := hostDispatchLabel(func() (string, error) { return "dev box", nil }); got != "dev-box" {
+		t.Errorf("label = %q, want dev-box", got)
+	}
+	if got := hostDispatchLabel(func() (string, error) { return "ignored", errors.New("no hostname") }); got != "" {
+		t.Errorf("label on hostname error = %q, want empty", got)
+	}
+	if got := newAPIClient(config{backendURL: "http://x"}).hostLabel; got != hostDispatchLabel(os.Hostname) {
+		t.Errorf("newAPIClient hostLabel = %q, want the os.Hostname label", got)
+	}
+}
+
+// TestHostDispatchStage_SendsHostBody: the marker carries {"host": label} and
+// a slot waiter's {"admission_nonce": nonce} as JSON; with neither, no body at
+// all.
+func TestHostDispatchStage_SendsHostBody(t *testing.T) {
+	for _, tc := range []struct {
+		name, label, nonce, wantBody, wantCT string
+	}{
+		{"label sends the host body", "h1", "", `{"host":"h1"}`, "application/json"},
+		{"empty label sends no body", "", "", "", ""},
+		{"a waiter nonce rides with the label", "h1", "n-1", `{"host":"h1","admission_nonce":"n-1"}`, "application/json"},
+		{"a waiter nonce without a label", "", "n-1", `{"admission_nonce":"n-1"}`, "application/json"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotBody, gotCT string
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				b, _ := io.ReadAll(r.Body)
+				gotBody, gotCT = string(b), r.Header.Get("Content-Type")
+				_, _ = w.Write([]byte(`{"transitioned":true,"stage_state":"dispatched"}`))
+			}))
+			defer ts.Close()
+			c := newAPIClient(config{backendURL: ts.URL, apiToken: "tok"})
+			c.hostLabel = tc.label
+			if _, err := c.HostDispatchStageWithNonce(context.Background(), uuid.New(), uuid.New(), tc.nonce); err != nil {
+				t.Fatalf("HostDispatchStageWithNonce: %v", err)
+			}
+			if gotBody != tc.wantBody || gotCT != tc.wantCT {
+				t.Errorf("body/content-type = %q/%q, want %q/%q", gotBody, gotCT, tc.wantBody, tc.wantCT)
+			}
+		})
+	}
+}
+
+// TestHostDispatchStage_QueuedDecodedAndAnnotated: a 409
+// concurrency_slot_queued decodes into the typed queued error (position,
+// holders, enqueued_at, contended), still errors.As into *apiError so every
+// fail-closed caller spawns nothing, and carries the operator guidance. An
+// EMPTY holders list is named as such (approval condition 2), and undecodable
+// details still yield the typed error.
+func TestHostDispatchStage_QueuedDecodedAndAnnotated(t *testing.T) {
+	holderRun, holderStage := uuid.New(), uuid.New()
+	withHolder := `{"error":{"code":"concurrency_slot_queued","message":"stage queued","details":{` +
+		`"stage_id":"x","group":"local-implement:h1","limit":1,"position":1,` +
+		`"holders":[{"run_id":"` + holderRun.String() + `","stage_id":"` + holderStage.String() + `","since":"2026-10-05T10:00:00Z"}],` +
+		`"enqueued_at":"2026-10-05T10:01:00Z","contended":false,"queue_ttl_seconds":60,"poll_interval_seconds":5}}}`
+	noHolders := `{"error":{"code":"concurrency_slot_queued","message":"stage queued","details":{` +
+		`"group":"local-implement:h1","limit":1,"position":2,"holders":[],"enqueued_at":"2026-10-05T10:01:00Z","contended":%s}}}`
+	undecodable := `{"error":{"code":"concurrency_slot_queued","message":"stage queued","details":{"position":"one"}}}`
+
+	queue := func(t *testing.T, body string) error {
+		t.Helper()
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Retry-After", "5")
+			w.WriteHeader(http.StatusConflict)
+			_, _ = w.Write([]byte(body))
+		}))
+		defer ts.Close()
+		_, err := newAPIClient(config{backendURL: ts.URL, apiToken: "tok"}).HostDispatchStage(context.Background(), uuid.New(), uuid.New())
+		if err == nil {
+			t.Fatal("expected an error on 409 concurrency_slot_queued")
+		}
+		var ae *apiError
+		if !errors.As(err, &ae) || ae.StatusCode != http.StatusConflict {
+			t.Errorf("err = %v, want the 409 *apiError preserved in the chain (fail-closed callers)", err)
+		}
+		return err
+	}
+
+	t.Run("holder named", func(t *testing.T) {
+		err := queue(t, withHolder)
+		var ae *apiError
+		if !errors.As(err, &ae) || ae.Code != concurrencySlotQueuedCode {
+			t.Errorf("err = %v, want the concurrency_slot_queued *apiError in the chain", err)
+		}
+		q, ok := asConcurrencySlotQueued(err)
+		if !ok {
+			t.Fatalf("asConcurrencySlotQueued(%v) = false, want the typed queued error", err)
+		}
+		if q.Group != "local-implement:h1" || q.Limit != 1 || q.Position != 1 || q.Contended ||
+			q.QueueTTLSeconds != 60 || q.PollIntervalSeconds != 5 {
+			t.Errorf("queued = %+v, want group/limit/position/ttl/poll decoded", q)
+		}
+		if len(q.Holders) != 1 || q.Holders[0].RunID != holderRun.String() || q.Holders[0].StageID != holderStage.String() ||
+			!q.Holders[0].Since.Equal(time.Date(2026, 10, 5, 10, 0, 0, 0, time.UTC)) {
+			t.Errorf("holders = %+v, want the one decoded holder", q.Holders)
+		}
+		if q.EnqueuedAt == nil || !q.EnqueuedAt.Equal(time.Date(2026, 10, 5, 10, 1, 0, 0, time.UTC)) {
+			t.Errorf("enqueued_at = %v, want 10:01Z", q.EnqueuedAt)
+		}
+		msg := err.Error()
+		for _, want := range []string{
+			"run " + holderRun.String() + " stage " + holderStage.String(),
+			"fishhawk_dispatch_stage", "fishhawk_run_stage", "fishhawk_drive_run", "fishhawk_run_children", "#3969",
+			"concurrency_slot_queued",
+		} {
+			if !strings.Contains(msg, want) {
+				t.Errorf("message missing %q: %s", want, msg)
+			}
+		}
+		sc := q.stageConcurrency()
+		if sc.Status != concurrencyStatusAwaitingSlot || sc.Position != 1 || len(sc.Holders) != 1 || sc.EnqueuedAt == nil {
+			t.Errorf("stageConcurrency() = %+v, want the queued projection", sc)
+		}
+	})
+
+	for _, arm := range []struct{ contended, want string }{
+		{"false", "queued behind earlier waiters"},
+		{"true", "another admission held the group lock"},
+	} {
+		t.Run("empty holders contended="+arm.contended, func(t *testing.T) {
+			err := queue(t, fmt.Sprintf(noHolders, arm.contended))
+			q, ok := asConcurrencySlotQueued(err)
+			if !ok || q.Position != 2 || len(q.Holders) != 0 {
+				t.Fatalf("queued = %+v ok=%v, want position 2 with no holders", q, ok)
+			}
+			msg := err.Error()
+			if !strings.Contains(msg, "no live holder is recorded") || !strings.Contains(msg, arm.want) {
+				t.Errorf("message = %s, want the empty-holders wording %q", msg, arm.want)
+			}
+			if strings.Contains(msg, "held by") {
+				t.Errorf("message renders an empty \"held by\": %s", msg)
+			}
+		})
+	}
+
+	t.Run("undecodable details stay typed", func(t *testing.T) {
+		q, ok := asConcurrencySlotQueued(queue(t, undecodable))
+		if !ok || q.Position != 0 {
+			t.Fatalf("queued = %+v ok=%v, want the typed error with zero details", q, ok)
+		}
+	})
+
+	t.Run("other 409 is not queued", func(t *testing.T) {
+		err := queue(t, `{"error":{"code":"dispatch_not_admissible","message":"x"}}`)
+		if _, ok := asConcurrencySlotQueued(err); ok {
+			t.Errorf("dispatch_not_admissible decoded as queued: %v", err)
+		}
+	})
+}
+
+// TestHostDispatchStage_AdmittedConcurrencyDecoded: the 200 admission block
+// decodes from a literal server-shaped body; an ungrouped 200 leaves it nil.
+func TestHostDispatchStage_AdmittedConcurrencyDecoded(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		want       *StageConcurrency
+	}{
+		{"grouped admission", `{"transitioned":true,"stage_state":"dispatched","concurrency":{"group":"local-implement:h1","limit":2,"queued_before":true,"waited_seconds":42}}`,
+			&StageConcurrency{Group: "local-implement:h1", Limit: 2, QueuedBefore: true, WaitedSeconds: 42}},
+		{"ungrouped admission", `{"transitioned":true,"stage_state":"dispatched"}`, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer ts.Close()
+			res, err := newAPIClient(config{backendURL: ts.URL}).HostDispatchStage(context.Background(), uuid.New(), uuid.New())
+			if err != nil {
+				t.Fatalf("HostDispatchStage: %v", err)
+			}
+			if !reflect.DeepEqual(res.Concurrency, tc.want) {
+				t.Errorf("Concurrency = %+v, want %+v", res.Concurrency, tc.want)
+			}
+		})
+	}
+}
+
+// TestStageMirrors_DecodeConcurrency pins the Stage and RunStageWait
+// `concurrency` json tags (and the block's own tags) against server-shaped
+// literal bodies: an explicit waiter_live:false survives as a non-nil false,
+// and a holding block carries host + held_dispatched_at + admission_nonce.
+func TestStageMirrors_DecodeConcurrency(t *testing.T) {
+	const queued = `{"status":"awaiting_concurrency_slot","group":"local-implement:h1","limit":1,"position":3,` +
+		`"holders":[{"run_id":"r1","stage_id":"s1","since":"2026-10-05T10:00:00Z"}],"enqueued_at":"2026-10-05T10:01:00Z","waiter_live":false}`
+	const holding = `{"status":"holding","group":"local-implement:h1","limit":1,"holders":[],"enqueued_at":"2026-10-05T10:01:00Z",` +
+		`"acquired_at":"2026-10-05T10:02:00Z","waiter_live":false,"host":"h1","held_dispatched_at":"2026-10-05T10:02:00Z","admission_nonce":"n-1"}`
+
+	var st Stage
+	if err := json.Unmarshal([]byte(`{"id":"s","type":"implement","state":"awaiting_host_dispatch","concurrency":`+queued+`}`), &st); err != nil {
+		t.Fatalf("decode Stage: %v", err)
+	}
+	c := st.Concurrency
+	if c == nil || c.Status != concurrencyStatusAwaitingSlot || c.Position != 3 || len(c.Holders) != 1 ||
+		c.Holders[0].RunID != "r1" || c.EnqueuedAt == nil || c.WaiterLive == nil || *c.WaiterLive {
+		t.Fatalf("Stage.Concurrency = %+v, want the queued block with an explicit waiter_live false", c)
+	}
+	if c.waiterLive() {
+		t.Error("waiterLive() = true on waiter_live:false")
+	}
+
+	var sw RunStageWait
+	if err := json.Unmarshal([]byte(`{"id":"s","state":"dispatched","terminal":false,"concurrency":`+holding+`}`), &sw); err != nil {
+		t.Fatalf("decode RunStageWait: %v", err)
+	}
+	h := sw.Concurrency
+	if h == nil || h.Status != concurrencyStatusHolding || h.Host != "h1" || h.HeldDispatchedAt == nil || h.AcquiredAt == nil || h.AdmissionNonce != "n-1" {
+		t.Fatalf("RunStageWait.Concurrency = %+v, want the holding block with host + held_dispatched_at + admission_nonce", h)
+	}
+
+	var bare Stage
+	if err := json.Unmarshal([]byte(`{"id":"s","type":"implement","state":"running"}`), &bare); err != nil {
+		t.Fatalf("decode bare Stage: %v", err)
+	}
+	if bare.Concurrency != nil || bare.Concurrency.waiterLive() {
+		t.Errorf("absent block = %+v, want nil (and nil-safe waiterLive false)", bare.Concurrency)
+	}
+}
+
+// TestConcurrencySlot_ClientCrossBoundary ties the MCP client's concurrency
+// mirrors to the REAL server bytes: the real host-dispatch handler over a
+// pgtest Postgres run repository and the Postgres concurrency store, reached
+// through the real apiClient. Marker A (host h1) is admitted with a decoded
+// admission block; marker B is queued and comes back as the typed queued error
+// naming A; the stage reads decode B's queued block (waiter_live true) and
+// A's holding block (host + held_dispatched_at); stageWaitHeldForSlot holds B
+// until its queue row goes stale, then releases it.
+func TestConcurrencySlot_ClientCrossBoundary(t *testing.T) {
+	ctx := context.Background()
+	pool := pgtest.NewPool(t)
+	runRepo := runpkg.NewPostgresRepository(pool)
+	park := func() *runpkg.Stage {
+		t.Helper()
+		row, err := runRepo.CreateRun(ctx, runpkg.CreateRunParams{
+			Repo: "x/y", WorkflowID: "feature_change", WorkflowSHA: "abc", TriggerSource: runpkg.TriggerCLI,
+		})
+		if err != nil {
+			t.Fatalf("create run: %v", err)
+		}
+		st, err := runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+			RunID: row.ID, Sequence: 1, Type: runpkg.StageTypeImplement,
+			ExecutorKind: runpkg.ExecutorAgent, ExecutorRef: "claude-code",
+		})
+		if err != nil {
+			t.Fatalf("create stage: %v", err)
+		}
+		if st, err = runRepo.TransitionStage(ctx, st.ID, runpkg.StageStateAwaitingHostDispatch, nil); err != nil {
+			t.Fatalf("park stage: %v", err)
+		}
+		return st
+	}
+	a, b := park(), park()
+
+	const bearer = "fhk_concurrency_e2e"
+	s := server.New(server.Config{
+		RunRepo:     runRepo,
+		Concurrency: concurrency.NewPostgresStore(pool),
+		APITokenRepo: &stubMCPAPITokens{tok: &apitoken.Token{
+			ID: uuid.New(), Subject: "github:op", Scopes: []string{"read:runs", "write:runs"}, PlainText: bearer,
+		}},
+	})
+	ts := httptest.NewServer(s.Handler())
+	t.Cleanup(ts.Close)
+	c := newAPIClient(config{backendURL: ts.URL, apiToken: bearer})
+	c.hostLabel = "h1"
+
+	resA, err := c.HostDispatchStage(ctx, a.RunID, a.ID)
+	if err != nil {
+		t.Fatalf("marker A: %v", err)
+	}
+	if !resA.Transitioned || resA.Concurrency == nil || resA.Concurrency.Group != "local-implement:h1" || resA.Concurrency.Limit != 1 {
+		t.Fatalf("marker A = %+v (concurrency %+v), want an admission in local-implement:h1 (the host body reached the server)", resA, resA.Concurrency)
+	}
+
+	_, err = c.HostDispatchStage(ctx, b.RunID, b.ID)
+	q, ok := asConcurrencySlotQueued(err)
+	if !ok {
+		t.Fatalf("marker B err = %v, want the typed queued error", err)
+	}
+	if q.Group != "local-implement:h1" || q.Position != 1 || len(q.Holders) != 1 || q.Holders[0].StageID != a.ID.String() ||
+		q.EnqueuedAt == nil || q.QueueTTLSeconds != 60 || q.PollIntervalSeconds != 5 {
+		t.Fatalf("queued = %+v, want position 1 behind holder A", q)
+	}
+
+	stagesB, err := c.ListRunStages(ctx, b.RunID)
+	if err != nil || len(stagesB) != 1 {
+		t.Fatalf("ListRunStages(B) = %+v, %v", stagesB, err)
+	}
+	qb := stagesB[0].Concurrency
+	if qb == nil || qb.Status != concurrencyStatusAwaitingSlot || qb.Position != 1 || !qb.waiterLive() ||
+		len(qb.Holders) != 1 || qb.Holders[0].StageID != a.ID.String() {
+		t.Fatalf("B stage block = %+v, want queued at 1 behind A with a live waiter", qb)
+	}
+	if st := stageWaitStatusFor(stagesB, "implement", "running", 0, time.Now().UTC()); st == nil || st.Concurrency != qb {
+		t.Errorf("get_run_status projection = %+v, want B's block", st)
+	}
+
+	stagesA, err := c.ListRunStages(ctx, a.RunID)
+	if err != nil || len(stagesA) != 1 {
+		t.Fatalf("ListRunStages(A) = %+v, %v", stagesA, err)
+	}
+	ha := stagesA[0].Concurrency
+	if ha == nil || ha.Status != concurrencyStatusHolding || ha.Host != "h1" || ha.HeldDispatchedAt == nil ||
+		stagesA[0].DispatchedAt == nil || !ha.HeldDispatchedAt.Equal(*stagesA[0].DispatchedAt) {
+		t.Fatalf("A stage block = %+v, want holding for host h1 on A's dispatched_at", ha)
+	}
+
+	swB, err := c.GetRunStageWait(ctx, b.RunID, b.ID, 0)
+	if err != nil {
+		t.Fatalf("GetRunStageWait(B): %v", err)
+	}
+	if !swB.Terminal || swB.State != "awaiting_host_dispatch" || !stageWaitHeldForSlot(swB) {
+		t.Fatalf("B wait envelope = %+v (concurrency %+v), want a settled read HELD for the slot", swB, swB.Concurrency)
+	}
+
+	// The waiter goes away: B's queue row ages past QueueTTL (DB clock).
+	if _, err := pool.Exec(ctx, `UPDATE stage_concurrency_slots SET last_seen_at = now() - interval '2 minutes' WHERE stage_id = $1`, b.ID); err != nil {
+		t.Fatalf("backdate B: %v", err)
+	}
+	swB, err = c.GetRunStageWait(ctx, b.RunID, b.ID, 0)
+	if err != nil {
+		t.Fatalf("GetRunStageWait(B) after stale: %v", err)
+	}
+	if swB.Concurrency == nil || swB.Concurrency.WaiterLive == nil || *swB.Concurrency.WaiterLive || stageWaitHeldForSlot(swB) || !stageWaitSettled(swB) {
+		t.Fatalf("stale B envelope concurrency = %+v, want an explicit waiter_live false that releases the wait", swB.Concurrency)
+	}
 }

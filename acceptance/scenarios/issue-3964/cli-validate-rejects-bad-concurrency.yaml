@@ -1,0 +1,14 @@
+id: scenario:issue-3964/cli-validate-rejects-bad-concurrency
+statement: '`fishhawk validate` exits non-zero and names the stage''s `concurrency` path on stderr for `limit: 0`, `limit: 65`, an unknown key inside `concurrency`, and an empty `concurrency: {}`.'
+verify_hint: 'CLI exit code and stderr: run `fishhawk validate` on each invalid document; observe a non-zero exit and the concurrency path in the error.'
+steps: 'Same CLI and base doc; implement stage concurrency set to {limit: 0}, {limit: 65}, {limit: 2, bogus: x} and {}; ran fishhawk validate on each and the same bytes via the live MCP fishhawk_validate.'
+assertions:
+    expected: non-zero exit naming the concurrency path
+    observed_at_record: 'all exit 1: ''.../stages/1/concurrency/limit: got 0, want 1''; ''.../concurrency/limit: got 65, want 64''; ''.../stages/1/concurrency: additional properties ''bogus'' not allowed''; ''.../stages/1/concurrency: got 0, want 1''. Live MCP valid:false on the same paths'
+    repro_handle: /tmp/fh3964r/fishhawk validate /tmp/fh3964r/cv/bad-limit0.yaml
+origin:
+    issue: 3964
+    pr: 0
+    run_id: e7f0be5b-291d-4c94-8615-429708063143
+    head_sha: bda662caefb10989f29a0f9a1627bfec9d0d512d
+    recorded_at: 2026-10-05T15:02:23Z

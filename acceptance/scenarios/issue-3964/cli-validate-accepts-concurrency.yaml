@@ -1,0 +1,14 @@
+id: scenario:issue-3964/cli-validate-accepts-concurrency
+statement: '`fishhawk validate` exits 0 on a workflow-v2 document whose implement stage declares `concurrency: {group: deploy-target, limit: 2}`, and on one that declares `concurrency: {limit: 2}`.'
+verify_hint: 'CLI exit code: write the two documents to temp files and run `fishhawk validate <file>`; observe exit 0 for both.'
+steps: 'Built the CLI from the sanctioned checkout (cd cli && go build -o /tmp/fh3964r/fishhawk ./cmd/fishhawk). Wrote a workflow-v2 feature_change plan->implement doc with the implement stage declaring concurrency: {group: deploy-target, limit: 2} (good-group.yaml) and concurrency: {limit: 2} (good-limit.yaml); ran fishhawk validate on each. Also sent the same bytes to the running target''s MCP fishhawk_validate.'
+assertions:
+    expected: exit 0 for both
+    observed_at_record: both exit 0 with empty stderr; live MCP valid:true with no diagnostics
+    repro_handle: /tmp/fh3964r/fishhawk validate /tmp/fh3964r/cv/good-group.yaml
+origin:
+    issue: 3964
+    pr: 0
+    run_id: e7f0be5b-291d-4c94-8615-429708063143
+    head_sha: bda662caefb10989f29a0f9a1627bfec9d0d512d
+    recorded_at: 2026-10-05T15:02:23Z

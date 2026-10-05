@@ -78,6 +78,13 @@ type stageResponse struct {
 	// handleListRunStages); best-effort, left nil on a store-assertion miss or a
 	// read error, matching the resolved_model / agent_timeout reads above.
 	Progress *stageProgress `json:"progress,omitempty"`
+	// Concurrency is the stage's ACTIVE local concurrency-slot state (#3964 /
+	// ADR-087): awaiting_concurrency_slot (queued, with position, holders and
+	// waiter_live) or holding. omitempty (a POINTER): absent for an ungrouped,
+	// settled, parked or bypassed stage, on a nil slot store, and on every
+	// action endpoint. Populated by the observability reads (handleGetStage,
+	// handleListRunStages, handleGetRunStage); best-effort, nil on a read error.
+	Concurrency *stageConcurrency `json:"concurrency,omitempty"`
 }
 
 // stageProgress mirrors run.StageProgress on the wire. The per-attempt-versus-
@@ -224,6 +231,12 @@ func (s *Server) handleListRunStages(w http.ResponseWriter, r *http.Request) {
 			progressByStage = m
 		}
 	}
+	// Concurrency blocks for the whole run in ONE batch (#3964).
+	stageIDs := make([]uuid.UUID, 0, len(stages))
+	for _, st := range stages {
+		stageIDs = append(stageIDs, st.ID)
+	}
+	concurrencyByStage := s.stageConcurrencyBlocks(r.Context(), stageIDs)
 	items := make([]stageResponse, 0, len(stages))
 	for _, st := range stages {
 		resp := toStageResponse(st)
@@ -234,6 +247,7 @@ func (s *Server) handleListRunStages(w http.ResponseWriter, r *http.Request) {
 		if p, ok := progressByStage[st.ID]; ok {
 			resp.Progress = toStageProgress(&p)
 		}
+		resp.Concurrency = concurrencyByStage[st.ID]
 		items = append(items, resp)
 	}
 	s.writeJSON(w, r, http.StatusOK, map[string]any{"items": items})
@@ -279,6 +293,7 @@ func (s *Server) handleGetStage(w http.ResponseWriter, r *http.Request) {
 			resp.Progress = toStageProgress(p)
 		}
 	}
+	resp.Concurrency = s.stageConcurrencyBlocks(r.Context(), []uuid.UUID{got.ID})[got.ID]
 	s.writeJSON(w, r, http.StatusOK, resp)
 }
 

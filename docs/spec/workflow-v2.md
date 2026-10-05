@@ -460,6 +460,7 @@ stages:
     reviewers: {...}          # optional; agent + human review policy
     egress: {...}             # optional; egress allowance (enforced on an acceptance stage)
     permissions: {...}        # optional; declared network/write/shell (declaration-only)
+    concurrency: {...}        # optional; dispatch concurrency group (host-dispatched agent stages)
 ```
 
 Stage `id` is unique within the workflow and is what `inputs[].from_stage` and `needs` reference. `type` is the closed five-token enum below. `executor` names who runs the stage and is required on the **resolved** document — a stage may omit it and inherit one from a `defaults` block or an `extends` base.
@@ -579,6 +580,34 @@ The optional per-stage `permissions` block (E53.5 / #2228) is a **declaration-on
 - An empty `permissions: {}` is an authoring error (the schema requires at least one of `network`, `write`, `shell`).
 
 The declaration is surfaced on the run-status read (`permissions[]`, each entry carrying an honest per-entry `enforced` flag — true only for an acceptance stage's network declaration) and recorded once per run as a `stage_permissions_declared` audit entry with an explicit `enforced: false` at the feature level.
+
+## Concurrency
+
+The optional per-stage `concurrency` block (#3964 / ADR-087) places a stage in a **concurrency group**: at most `limit` stages of one group hold a dispatch slot at once. Admission happens at the host-dispatch spawn marker (`POST /v0/runs/{run_id}/stages/{stage_id}/host-dispatch`). A dispatch that cannot get a slot is **queued FIFO, never refused**: the stage stays `awaiting_host_dispatch`, its stage reads carry a `concurrency` block with `status: awaiting_concurrency_slot`, the queue position and the current holders, and it is admitted when a holder settles, parks, or is released by the liveness backstop.
+
+```yaml
+- id: apply
+  type: implement
+  executor:
+    agent: claude-code
+  concurrency:
+    limit: 2                  # widen the host default group to two implements
+
+- id: smoke
+  type: acceptance
+  executor:
+    agent: claude-code
+  concurrency:
+    group: deploy-target      # repository-scoped named group
+    limit: 1
+```
+
+- **The shipped default needs no declaration.** Every host-dispatched (`runner_kind: local`) `implement` stage is in the host group `local-implement:<host>` with limit 1, so two local implement stages on one host never run at once. Every other stage type is in **no group** unless it declares one. `<host>` is the label the dispatching client sends; a client that sends none lands in `local-implement:unknown`.
+- **One group per stage.** A stage that omits `group` joins the host default group with the declared `limit` — the way to widen or narrow it. A stage that names a `group` is in that group **instead of** the host default group.
+- **`group`** names a **repository-scoped** group: two stages naming the same group in the same repository share its slots across runs, and the same name in another repository is a different group. It matches `^[a-z0-9][a-z0-9._-]{0,62}$` (lowercase alphanumerics plus `.`, `_`, `-`; at most 63 characters).
+- **`limit`** is an integer `1`–`64`; absent means `1`. When stages of one group declare different limits, the **admitting** stage's `limit` governs.
+- An empty `concurrency: {}` is an authoring error (the schema requires at least one of `group`, `limit`).
+- **Scope of effect.** The block is honoured only for host-dispatched agent stages; on a stage dispatched any other way it is inert. It is **stage-level only** — it is not a `defaults` key, so it is never inherited from a file- or workflow-level `defaults` block.
 
 ## Executor
 
@@ -1385,6 +1414,8 @@ reviewer_personas:
 | `diff_coverage.format` | `lcov` | only member |
 | `diff_coverage.min_new_line_coverage` | integer 0–100 | compared with `>=` |
 | `budget.enforcement`, `budgets[].enforcement` | `advisory` \| `blocking` | advisory warns; blocking refuses a new run at admission |
+| `concurrency.group` | `^[a-z0-9][a-z0-9._-]{0,62}$` | repository-scoped; absent = the host default group `local-implement:<host>` |
+| `concurrency.limit` | integer 1–64 (default `1`) | the admitting stage's limit governs |
 | `budgets[].period` | `weekly` \| `monthly` | calendar reset cadence |
 | `budgets[].warn_at` | fraction `[0,1]` | early advisory threshold |
 | `decomposition.max_parallel` | integer `>= 0` | `0` = unlimited |

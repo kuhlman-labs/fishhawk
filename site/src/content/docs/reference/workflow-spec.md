@@ -233,6 +233,16 @@ One workflow stage. The `required: [id, type, executor]` list is enforced on the
 | `reviewers` | `reviewers_config` | optional |  |  |
 | `egress` | `stage_egress` | optional |  |  |
 | `permissions` | `stage_permissions` | optional |  |  |
+| `concurrency` | `stage_concurrency` | optional |  |  |
+
+##### `stage_concurrency`
+
+Per-stage concurrency group (#3964 / ADR-087): how many stages of one group may hold a dispatch slot at once. Admission happens at the host-dispatch spawn marker; a dispatch that cannot get a slot is QUEUED FIFO (the stage stays awaiting_host_dispatch and its stage reads carry a concurrency block), never refused. By default every host-dispatched implement stage is in the host group `local-implement:<host>` with limit 1, and every other stage type is in no group. ONE GROUP PER STAGE: an omitted `group` joins the host default group with the declared `limit` (to widen or narrow it); a named `group` is REPOSITORY-scoped (e.g. a shared deploy target) and REPLACES the host default group for that stage. When stages of one group declare different limits, the ADMITTING stage's limit governs. Honoured only for host-dispatched (runner_kind local) agent stages; inert elsewhere. Stage-level only: deliberately NOT inheritable through `defaults`. minProperties 1: an empty `concurrency: {}` is an authoring error, not a default. Declared by workflow-v2; accepted whenever present (v2 has no minor chain — a field is accepted because the schema declares it, not because the document declared a high enough minor).
+
+| Field | Type | Required | Constraints | Description |
+|---|---|---|---|---|
+| `group` | string | optional | pattern: `^[a-z0-9][a-z0-9._-]{0,62}$` | Name of a repository-scoped concurrency group (lowercase alphanumerics plus `.`, `_`, `-`; at most 63 characters, starting with an alphanumeric). Absent = the host default group `local-implement:<host>`. Two stages naming the same group in the same repository share its slots, across runs. |
+| `limit` | integer | optional | min: `1`; max: `64` | Maximum number of stages of the group holding a slot at once, 1..64. Absent = 1. The admitting stage's limit governs when stages of one group disagree. |
 
 ##### `stage_permissions`
 
@@ -903,9 +913,13 @@ Shape deltas only — a field whose description changed but whose type, required
 | `/$defs/schedule/properties/cron` | added | new at the newer major |
 | `/$defs/schedule/properties/issue` | added | new at the newer major |
 | `/$defs/schedule/properties/timezone` | added | new at the newer major |
+| `/$defs/stage/properties/concurrency` | added | new at the newer major |
 | `/$defs/stage/properties/constraints` | changed | type "array of `constraint`"→"`constraint`" |
 | `/$defs/stage/properties/needs` | added | new at the newer major |
 | `/$defs/stage/properties/permissions` | added | new at the newer major |
+| `/$defs/stage_concurrency` | added | new at the newer major |
+| `/$defs/stage_concurrency/properties/group` | added | new at the newer major |
+| `/$defs/stage_concurrency/properties/limit` | added | new at the newer major |
 | `/$defs/stage_permissions` | added | new at the newer major |
 | `/$defs/stage_permissions/properties/network` | added | new at the newer major |
 | `/$defs/stage_permissions/properties/shell` | added | new at the newer major |
@@ -1009,11 +1023,15 @@ Shape deltas only — a field whose description changed but whose type, required
 | `/$defs/schedule/properties/cron` | added | new at the newer major |
 | `/$defs/schedule/properties/issue` | added | new at the newer major |
 | `/$defs/schedule/properties/timezone` | added | new at the newer major |
+| `/$defs/stage/properties/concurrency` | added | new at the newer major |
 | `/$defs/stage/properties/constraints` | changed | type "array of `constraint`"→"`constraint`" |
 | `/$defs/stage/properties/egress` | added | new at the newer major |
 | `/$defs/stage/properties/needs` | added | new at the newer major |
 | `/$defs/stage/properties/permissions` | added | new at the newer major |
 | `/$defs/stage/properties/type` | changed | enum members differ |
+| `/$defs/stage_concurrency` | added | new at the newer major |
+| `/$defs/stage_concurrency/properties/group` | added | new at the newer major |
+| `/$defs/stage_concurrency/properties/limit` | added | new at the newer major |
 | `/$defs/stage_egress` | added | new at the newer major |
 | `/$defs/stage_egress/properties/target_hosts` | added | new at the newer major |
 | `/$defs/stage_permissions` | added | new at the newer major |

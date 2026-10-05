@@ -8297,3 +8297,163 @@ workflows:
 		t.Fatalf("err = %T %v, want *SchemaError", err, err)
 	}
 }
+
+// stageConcurrencyDoc renders a minimal v2 document whose single implement
+// stage carries the given `concurrency:` YAML body (already indented under
+// the key). An empty body omits the key entirely.
+func stageConcurrencyDoc(body string) string {
+	doc := `version: "2"
+workflows:
+  wf:
+    stages:
+      - id: apply
+        type: implement
+        executor:
+          agent: claude-code
+`
+	if body != "" {
+		doc += "        concurrency:" + body + "\n"
+	}
+	return doc
+}
+
+// TestParse_StageConcurrency_RoundTrip pins that the schema-permitted
+// `concurrency` block survives ParseBytes' strict (DisallowUnknownFields)
+// typed decode into Stage.Concurrency, and that EffectiveLimit defaults an
+// absent limit (and an absent block) to 1 (#3964 / ADR-087).
+func TestParse_StageConcurrency_RoundTrip(t *testing.T) {
+	parsed, err := spec.ParseBytes([]byte(stageConcurrencyDoc("\n          group: deploy-target\n          limit: 2")))
+	if err != nil {
+		t.Fatalf("ParseBytes: %v", err)
+	}
+	c := parsed.Workflows["wf"].Stages[0].Concurrency
+	if c == nil {
+		t.Fatal("Stage.Concurrency is nil; the declared block was dropped by the typed decode")
+	}
+	if c.Group != "deploy-target" || c.Limit != 2 {
+		t.Errorf("Stage.Concurrency = %+v, want {Group: deploy-target, Limit: 2}", *c)
+	}
+	if got := c.EffectiveLimit(); got != 2 {
+		t.Errorf("EffectiveLimit() = %d, want the declared 2", got)
+	}
+
+	// limit omitted: the group alone is a valid block and the limit defaults to 1.
+	parsed, err = spec.ParseBytes([]byte(stageConcurrencyDoc("\n          group: deploy-target")))
+	if err != nil {
+		t.Fatalf("ParseBytes (no limit): %v", err)
+	}
+	c = parsed.Workflows["wf"].Stages[0].Concurrency
+	if c == nil || c.Group != "deploy-target" || c.Limit != 0 {
+		t.Fatalf("Stage.Concurrency = %+v, want {Group: deploy-target, Limit: 0}", c)
+	}
+	if got := c.EffectiveLimit(); got != 1 {
+		t.Errorf("EffectiveLimit() with limit omitted = %d, want 1", got)
+	}
+
+	// group omitted: a bare limit joins the host default group (empty Group).
+	parsed, err = spec.ParseBytes([]byte(stageConcurrencyDoc("\n          limit: 3")))
+	if err != nil {
+		t.Fatalf("ParseBytes (no group): %v", err)
+	}
+	c = parsed.Workflows["wf"].Stages[0].Concurrency
+	if c == nil || c.Group != "" || c.EffectiveLimit() != 3 {
+		t.Fatalf("Stage.Concurrency = %+v, want {Group: \"\", Limit: 3}", c)
+	}
+
+	// no block: Concurrency stays nil and the nil receiver yields the default 1.
+	parsed, err = spec.ParseBytes([]byte(stageConcurrencyDoc("")))
+	if err != nil {
+		t.Fatalf("ParseBytes (no block): %v", err)
+	}
+	c = parsed.Workflows["wf"].Stages[0].Concurrency
+	if c != nil {
+		t.Fatalf("Stage.Concurrency = %+v, want nil when undeclared", c)
+	}
+	if got := c.EffectiveLimit(); got != 1 {
+		t.Errorf("nil EffectiveLimit() = %d, want 1", got)
+	}
+}
+
+// TestParse_StageConcurrency_SchemaRejections is the per-failure-mode table
+// for the $defs/stage_concurrency schema rules: each malformed block is
+// refused with a *ValidationError whose pointer names the concurrency path.
+// The boundary values 1 and 64 are accepted (positive controls), so each
+// rejection is attributable to its own rule.
+func TestParse_StageConcurrency_SchemaRejections(t *testing.T) {
+	const base = "/workflows/wf/stages/0/concurrency"
+	const groupPattern = "does not match pattern '^[a-z0-9][a-z0-9._-]{0,62}$'"
+	cases := []struct {
+		name     string
+		body     string
+		wantPath string
+		wantMsg  string
+	}{
+		{name: "limit_zero", body: "\n          limit: 0", wantPath: base + "/limit", wantMsg: "got 0, want 1"},
+		{name: "limit_65", body: "\n          limit: 65", wantPath: base + "/limit", wantMsg: "got 65, want 64"},
+		{name: "limit_not_integer", body: "\n          limit: 1.5", wantPath: base + "/limit", wantMsg: "want integer"},
+		{name: "unknown_key", body: "\n          limit: 1\n          scope: host", wantPath: base, wantMsg: "additional properties 'scope' not allowed"},
+		{name: "empty_block", body: " {}", wantPath: base, wantMsg: "got 0, want 1"},
+		{name: "group_uppercase", body: "\n          group: Deploy", wantPath: base + "/group", wantMsg: groupPattern},
+		{name: "group_leading_dash", body: "\n          group: -deploy", wantPath: base + "/group", wantMsg: groupPattern},
+		{name: "group_slash", body: "\n          group: a/b", wantPath: base + "/group", wantMsg: groupPattern},
+		{name: "group_too_long", body: "\n          group: " + strings.Repeat("a", 64), wantPath: base + "/group", wantMsg: groupPattern},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := spec.ParseBytes([]byte(stageConcurrencyDoc(tc.body)))
+			var se *spec.SchemaError
+			if !errors.As(err, &se) {
+				t.Fatalf("err = %T %v, want *spec.SchemaError", err, err)
+			}
+			if se.Path != tc.wantPath {
+				t.Errorf("SchemaError.Path = %q, want %q (msg: %s)", se.Path, tc.wantPath, se.Message)
+			}
+			if !strings.Contains(se.Message, tc.wantMsg) {
+				t.Errorf("SchemaError.Message = %q, want it to contain %q", se.Message, tc.wantMsg)
+			}
+		})
+	}
+
+	accepted := []struct {
+		name string
+		body string
+	}{
+		{name: "limit_one", body: "\n          limit: 1"},
+		{name: "limit_sixty_four", body: "\n          limit: 64"},
+		{name: "group_max_length", body: "\n          group: " + strings.Repeat("a", 63)},
+		{name: "group_dotted", body: "\n          group: deploy.staging_1-a"},
+	}
+	for _, tc := range accepted {
+		t.Run("accepts_"+tc.name, func(t *testing.T) {
+			if _, err := spec.ParseBytes([]byte(stageConcurrencyDoc(tc.body))); err != nil {
+				t.Fatalf("ParseBytes: %v, want the boundary value accepted", err)
+			}
+		})
+	}
+}
+
+// TestStageConcurrency_NotInheritableThroughDefaults pins the stage-level-only
+// rule: `concurrency` is deliberately absent from the `defaults` blocks, so a
+// file-level default declaring it is refused rather than silently inherited.
+func TestStageConcurrency_NotInheritableThroughDefaults(t *testing.T) {
+	doc := `version: "2"
+defaults:
+  concurrency:
+    limit: 2
+workflows:
+  wf:
+    stages:
+      - id: apply
+        type: implement
+        executor:
+          agent: claude-code
+`
+	_, err := spec.ParseBytes([]byte(doc))
+	var se *spec.SchemaError
+	if !errors.As(err, &se) {
+		t.Fatalf("err = %T %v, want *spec.SchemaError: `concurrency` must be stage-level only", err, err)
+	}
+	if se.Path != "/defaults" || !strings.Contains(se.Message, "'concurrency' not allowed") {
+		t.Errorf("SchemaError = %q: %q, want /defaults refusing 'concurrency'", se.Path, se.Message)
+	}
+}

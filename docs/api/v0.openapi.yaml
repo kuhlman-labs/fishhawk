@@ -4591,6 +4591,8 @@ components:
             `GET /v0/runs/{run_id}/stages`); omitted on the action-endpoint
             responses that build a Stage. Written by
             `POST /v0/runs/{run_id}/stages/{stage_id}/progress`.
+        concurrency:
+          $ref: '#/components/schemas/StageConcurrency'
         created_at:
           type: string
           format: date-time
@@ -4738,6 +4740,98 @@ components:
             True when the excerpt came from an acceptance-derived (attacker-
             influenceable) concern note rather than operator-authored text.
             Omitted (false) for the common operator-authored case.
+    HostDispatchRequest:
+      description: |
+        Optional body of `POST /v0/runs/{run_id}/stages/{stage_id}/host-dispatch`
+        (#3964). `host` is the caller's host label (the MCP sends its
+        sanitised `os.Hostname()`); it keys the default concurrency group
+        `local-implement:<host>`. Absent body or empty `host` → `unknown`. A
+        client-supplied label, not a security boundary. `admission_nonce` is
+        the MCP slot waiter's random per-waiter nonce, sent on every marker
+        POST it makes; an ADMISSION records it on the held slot and echoes it,
+        so a waiter that lost its admission response can tell its own
+        admission from another session's (two sessions on one host share
+        `host`). Absent or empty → none recorded.
+      type: object
+      additionalProperties: false
+      properties:
+        host:
+          type: string
+          maxLength: 253
+          pattern: '^[A-Za-z0-9._-]*$'
+        admission_nonce:
+          type: string
+          maxLength: 64
+          pattern: '^[A-Za-z0-9-]*$'
+    HostDispatchConcurrency:
+      description: |
+        The host-dispatch 200 body's `concurrency` block (#3964): present only
+        when the stage was ADMITTED into a concurrency group.
+      type: object
+      required: [group, limit, queued_before, waited_seconds]
+      properties:
+        group: { type: string, description: 'The group key (`local-implement:<host>` or `spec:<repo>:<name>`).' }
+        limit: { type: integer, minimum: 1, maximum: 64 }
+        queued_before: { type: boolean, description: True when the stage waited in the queue during this episode. }
+        waited_seconds: { type: integer, minimum: 0, description: Seconds from enqueue to admission (0 when it did not queue). }
+        admission_nonce: { type: string, description: 'The request''s `admission_nonce` echoed back; omitted when it carried none.' }
+    ConcurrencyHolder:
+      type: object
+      required: [run_id, stage_id, since]
+      properties:
+        run_id: { $ref: '#/components/schemas/UUID' }
+        stage_id: { $ref: '#/components/schemas/UUID' }
+        since: { type: string, format: date-time, description: When the holder was admitted. }
+    StageConcurrency:
+      description: |
+        A stage's ACTIVE local concurrency-slot state (#3964 / ADR-087). Absent
+        for an ungrouped, settled, parked or bypassed stage, when the daemon
+        has no slot store, and on the action-endpoint responses that build a
+        Stage. Populated on `GET /v0/stages/{stage_id}`,
+        `GET /v0/runs/{run_id}/stages` and
+        `GET /v0/runs/{run_id}/stages/{stage_id}`; best-effort (omitted on a
+        read error). Holders in another account are neither counted nor
+        listed.
+      type: object
+      required: [status, group, limit, holders, enqueued_at, waiter_live]
+      properties:
+        status:
+          type: string
+          enum: [awaiting_concurrency_slot, holding]
+          description: |
+            `awaiting_concurrency_slot` — queued (the stage reads
+            `awaiting_host_dispatch`); `holding` — admitted and counted.
+        group: { type: string }
+        limit: { type: integer, minimum: 1, maximum: 64 }
+        position: { type: integer, minimum: 1, description: 1-based queue position; omitted while holding. }
+        holders:
+          type: array
+          description: The group's live holders; always a list (`[]` when none).
+          items: { $ref: '#/components/schemas/ConcurrencyHolder' }
+        enqueued_at: { type: string, format: date-time }
+        acquired_at: { type: string, format: date-time, description: When the slot was acquired; holding only. }
+        waiter_live:
+          type: boolean
+          description: |
+            Queued only: the queue row was refreshed within the queue TTL
+            (60s), i.e. some session's slot waiter is still re-POSTing the
+            marker. False while holding.
+        host: { type: string, description: The host label the holding row was admitted for; holding only. }
+        held_dispatched_at:
+          type: string
+          format: date-time
+          description: |
+            Holding only: the `dispatched_at` of the attempt this slot admitted.
+            Informational, like `host`: two sessions on one host share a host
+            label, so ownership is `admission_nonce`.
+        admission_nonce:
+          type: string
+          description: |
+            Holding only: the `admission_nonce` the admitting marker request
+            carried; omitted when it carried none (a direct
+            `fishhawk_dispatch_stage` admission). A slot waiter that lost its
+            admission response claims the admission only when this equals its
+            own nonce.
     StageProgress:
       type: object
       description: |
@@ -14069,7 +14163,12 @@ paths:
 
         **Not admissible.** A `running`, terminal, or any `awaiting_*` gate
         state returns 409 `dispatch_not_admissible` so a live or settled stage
-        can never be re-marked as a fresh spawn.
+        can never be re-marked as a fresh spawn. So does any stage whose RUN
+        is terminal (`succeeded`, `failed`, `cancelled`; `details.run_state`),
+        on every arm including the idempotent no-op, evaluated before any
+        concurrency-slot admission (#3964): cancelling or failing a run
+        transitions only the run row, so a parked or queued stage of a dead
+        run is never spawned.
 
         **Authorization.** Requires an authenticated identity carrying
         `write:runs` (anonymous → 401; a token without the scope → 403). The
@@ -14088,10 +14187,40 @@ paths:
         a preview daemon never spawns a runner that could push or open a pull
         request on the real forge. A production daemon (no dev surface) never
         enters this branch and its 401/403 ladder is unchanged.
+
+        **Concurrency groups (#3964 / ADR-087).** When the daemon has a slot
+        store wired, the marker is also the slot-acquire point for a GROUPED
+        host-dispatched stage. Every local `implement` stage is grouped by
+        default in `local-implement:<host>` at limit 1, where `<host>` is the
+        optional request body's `host` label (`unknown` when absent or empty).
+        A workflow-v2 stage `concurrency: {group, limit}` overrides it: an
+        omitted group joins the host default group with the declared limit; a
+        named group is repository-scoped. Every other undeclared stage type is
+        ungrouped and unchanged. On the `pending|awaiting_host_dispatch` arm a
+        grouped stage is either ADMITTED (the same CAS to `dispatched`, plus a
+        `concurrency` block on the 200) or QUEUED FIFO behind the group's live
+        holders: 409 `concurrency_slot_queued`, `Retry-After: 5`, and the stage
+        is untouched at `awaiting_host_dispatch`. Queued is a 409, not a 2xx, so
+        a pre-change client fails closed. A queued caller re-POSTs every
+        `poll_interval_seconds` to keep its queue row live; a row not refreshed
+        within `queue_ttl_seconds` is skipped by the stages behind it and
+        restarts at the tail when its owner polls again. A holder releases its
+        slot when its stage leaves `dispatched`/`running` for the attempt it was
+        admitted on (settled, parked, reaped), or by the liveness backstop
+        (no heartbeat for 45 minutes while `running`, 15 minutes while
+        `dispatched`). The idempotent already-`dispatched` arm, ungrouped
+        stages and a daemon with no slot store are unchanged. Audit:
+        `stage_concurrency_queued` (once per queue episode) and
+        `stage_concurrency_admitted` (every grouped admission).
       tags: [runs]
       parameters:
         - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
         - { name: stage_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/HostDispatchRequest' }
       responses:
         '200':
           description: |
@@ -14125,10 +14254,15 @@ paths:
                       is the authority on the per-wave re-base; a caller must
                       not derive one of its own. Returned on the idempotent
                       already-`dispatched` arm too, since that caller re-spawns.
+                  concurrency:
+                    $ref: '#/components/schemas/HostDispatchConcurrency'
         '400':
           description: |
-            A malformed `run_id` or `stage_id` path value
-            (`validation_failed`).
+            `validation_failed` — a malformed `run_id` or `stage_id` path
+            value, or (when a slot store is wired) a malformed request body:
+            not a JSON object, an unknown key, a body over 4 KiB, or a `host`
+            longer than 253 characters or outside `[A-Za-z0-9._-]`. A body
+            refusal reads no stage and commits nothing.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -14156,12 +14290,23 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '409':
           description: |
-            One of three refusals:
+            One of three refusals, or the concurrency queue answer:
 
+            - `concurrency_slot_queued` (#3964 / ADR-087) — NOT a refusal: the
+              grouped stage is queued FIFO for a concurrency slot and its state
+              is untouched (`awaiting_host_dispatch`). `Retry-After: 5`.
+              `details` carries `stage_id`, `group`, `limit`, `position`
+              (1-based), `holders` (`[{run_id, stage_id, since}]`, always a
+              list — `[]` when the stage waits behind earlier waiters rather
+              than a holder), `enqueued_at`, `contended` (another admission
+              held the group lock, so this call queued without deciding),
+              `queue_ttl_seconds` (60) and `poll_interval_seconds` (5). Holders
+              in another account are neither counted nor listed.
             - `dispatch_not_admissible` — the stage is in a `running`,
-              terminal, or `awaiting_*` gate state, a run locked to a
-              non-local `runner_kind`, or a non-host-spawn stage, so a fresh
-              spawn marker cannot be applied.
+              terminal, or `awaiting_*` gate state, its run is terminal
+              (`details.run_state`), a run locked to a non-local
+              `runner_kind`, or a non-host-spawn stage, so a fresh spawn
+              marker cannot be applied.
             - `dependency_not_satisfied` — the decomposition wave-order guard
               (E48.99 / #2546): this run is a fan-out child (`decomposed_from`
               + `slice_index` set) whose declared dependency slice has not
@@ -14218,7 +14363,10 @@ paths:
             guard could not read the parent's `slices_integrated` history to
             derive `base_branch` (E50.13 / #2363). Retryable: both fail closed
             on a read error rather than admitting out of order or on an
-            unverified base, and commit no state.
+            unverified base, and commit no state. `internal_error` — the state
+            CAS or (for a grouped stage) the concurrency admission failed; the
+            admission is one transaction, so a failure commits nothing and the
+            stage keeps its state and queue standing.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

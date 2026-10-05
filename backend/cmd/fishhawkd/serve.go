@@ -41,6 +41,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/claudecode"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/codex"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/concurrency"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/crewmessage"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/decisionindex"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/delegationconfirm"
@@ -2535,6 +2536,10 @@ func runServe(args []string, logSink io.Writer) int {
 		}
 		defer pool.Close()
 		cfg.RunRepo = runpkg.NewPostgresRepository(pool)
+		// Local stage concurrency groups (#3964 / ADR-087): the host-dispatch
+		// marker's slot store. Dropping this line reverts the marker to a bare
+		// CAS (no queue) without touching any other surface.
+		cfg.Concurrency = concurrency.NewPostgresStore(pool)
 		cfg.CampaignRepo = campaign.NewPostgresRepository(pool)
 		cfg.SigningRepo = signing.NewPostgresRepository(pool)
 		auditRepo, err := newAuditRepository(pool, logger)
