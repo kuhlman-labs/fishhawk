@@ -2706,13 +2706,17 @@ components:
             failed) or `approval_submitted` (the run's approvals could not be
             read) when it is omitted for that reason; the crew block adds
             `crew_messages` when the crew-message read failed, and the consults
-            block adds `crew_consults` when any of its reads failed.
+            block adds `crew_consults` when any of its reads failed. The gate
+            isolation block adds `gate_isolation_recorded` when its read, or the
+            decode of any of its rows, failed.
         live_validation:
           $ref: '#/components/schemas/LiveValidation'
         review_diff_truncated:
           $ref: '#/components/schemas/GateViewReviewDiffTruncated'
         review_head_mismatch:
           $ref: '#/components/schemas/GateViewReviewHeadMismatch'
+        gate_isolation:
+          $ref: '#/components/schemas/GateViewGateIsolation'
         captain:
           $ref: '#/components/schemas/GateViewCaptain'
         precedent:
@@ -2902,6 +2906,92 @@ components:
             incomplete and a changed file may appear in neither the hunks nor this
             list. False for the runner path, whose name-status inventory is
             complete.
+
+    GateViewGateIsolation:
+      type: object
+      description: |
+        E51.2 / #2135. Which ADR-063 isolation path the run's gates ran under,
+        so an isolated run is told apart from a fallback run without reading
+        runner logs. Distilled from the stage-scoped `gate_isolation_recorded`
+        audit rows the trace handler appends at RAW upload from the bundle's
+        `gate_evidence.gate_isolation` member (the runner's own recorded
+        selection, pre-redacted; a re-POST of the same raw bundle for the same
+        stage is deduplicated on `stage_id` + `content_hash`). The top-level
+        fields describe the NEWEST row. `worst_class` / `worst_stage_id` /
+        `worst_sequence` name the most severe class recorded on ANY stage of the
+        run (`refused` > `fallback` > `container`, the newest such row on a
+        tie), so an earlier fallback or refusal is never masked by a later
+        container stage; on a run whose every row is `container` they equal the
+        newest row's. Run-level: the `stage_kind` filter does not apply.
+        Omitted when no row was recorded (an older runner, or a run where no
+        gate reached the runner's isolated exec path); omitted with a
+        `gate_isolation_recorded` `history_gaps` entry when the read, or the
+        decode of ANY row, fails — never built from a partial read.
+      required: [stage_id, sequence, recorded_at, path, class, mode, profile, runtime_kind, runtime_safe, sandbox_available, reason, worst_class, worst_stage_id, worst_sequence]
+      properties:
+        stage_id:
+          type: string
+          description: The stage whose gates the newest record describes.
+        sequence:
+          type: integer
+          format: int64
+          description: Audit sequence of the newest `gate_isolation_recorded` row.
+        recorded_at:
+          type: string
+          format: date-time
+          description: When the newest row was recorded (raw trace upload).
+        path:
+          type: string
+          enum: [container, clone-sandbox, clone, refused]
+          description: The precise isolation path the gates took.
+        class:
+          type: string
+          enum: [container, fallback, refused]
+          description: The path's class; `fallback` covers `clone-sandbox` and `clone`.
+        mode:
+          type: string
+          description: The configured gate isolation mode (`auto` | `container` | `clone-sandbox` | `clone`).
+        profile:
+          type: string
+          description: The runner profile (`local` | `hosted`); `hosted` refuses every non-container path.
+        image:
+          type: string
+          description: The configured gate image, when one was set.
+        runtime_kind:
+          type: string
+          description: The detected container runtime (`docker` | `podman` | `none`).
+        runtime_safe:
+          type: boolean
+          description: True when the detected runtime is a safe local container runtime.
+        runtime_reason:
+          type: string
+          description: Why the runtime was or was not judged safe (pre-redacted).
+        runtime_version:
+          type: string
+          description: The detected runtime's version.
+        sandbox_available:
+          type: boolean
+          description: True when the clone-sandbox probe succeeded.
+        sandbox_reason:
+          type: string
+          description: Why the sandbox is unavailable (pre-redacted).
+        reason:
+          type: string
+          description: The selection's own explanation of the path it took (pre-redacted).
+        container_unavailable:
+          type: string
+          description: Why the container path was not taken; absent on the container path.
+        worst_class:
+          type: string
+          enum: [container, fallback, refused]
+          description: The most severe class recorded on ANY stage of the run. Read this, not `class`, for the run's isolation verdict.
+        worst_stage_id:
+          type: string
+          description: The stage that recorded `worst_class` (the newest such stage on a tie).
+        worst_sequence:
+          type: integer
+          format: int64
+          description: Audit sequence of the row that recorded `worst_class`.
 
     GateViewReviewHeadMismatch:
       type: object

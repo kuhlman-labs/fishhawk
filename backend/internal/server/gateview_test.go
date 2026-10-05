@@ -1783,3 +1783,142 @@ func TestGateView_ConsultsEmptyWithoutGap(t *testing.T) {
 		t.Fatalf("a quiet run recorded a crew_consults gap: %v", resp.HistoryGaps)
 	}
 }
+
+// --- gate isolation (E51.2 / #2135) ----------------------------------------
+
+// TestGateView_GateIsolation_EndToEnd is the cross-layer pin: a bundle packed
+// around the SHARED runner golden is POSTed through the real trace handler,
+// then GET /v0/runs/{id}/gate-view is read through the real handler — bundle
+// decode → audit persistence → gate-view render on the same fixed bytes the
+// runner's half marshals.
+func TestGateView_GateIsolation_EndToEnd(t *testing.T) {
+	repo := newFakeRepo()
+	runID := seedGateRun(t, repo)
+	s, sf, _, _ := newTraceServer(t)
+	priv, _ := sf.issue(t, runID)
+	stageID := uuid.New()
+	body := gateIsolationBundle(t, nil, isolationOnlyEvidence(t, "fallback"))
+	if w := shipRequest(t, s, runID, stageID, "raw", priv, body, ""); w.Code != http.StatusAccepted {
+		t.Fatalf("trace POST status = %d:\n%s", w.Code, w.Body.String())
+	}
+	s.cfg.RunRepo = repo
+	s.cfg.ConcernRepo = newFakeConcernRepo()
+
+	resp := decodeGateView(t, getGateView(t, s, runID, ""))
+	gi := resp.GateIsolation
+	if gi == nil {
+		t.Fatalf("gate_isolation block absent after an evidence-bearing upload; gaps=%v", resp.HistoryGaps)
+	}
+	if gi.Class != "fallback" || gi.Path != "clone" || gi.StageID != stageID.String() ||
+		!strings.Contains(gi.ContainerUnavailable, "FISHHAWK_GATE_IMAGE is empty") {
+		t.Errorf("block = %+v, want class fallback / path clone / stage %s / container_unavailable naming the empty image", gi, stageID)
+	}
+	if gi.WorstClass != "fallback" || gi.WorstStageID != stageID.String() {
+		t.Errorf("worst = (%q, %q), want the single row's own class + stage", gi.WorstClass, gi.WorstStageID)
+	}
+}
+
+// TestGateView_GateIsolationWorstClassSurvivesNewerContainer pins condition 3:
+// the top-level fields are the NEWEST row, while worst_class / worst_stage_id
+// keep naming an earlier fallback or refusal a later container stage would
+// otherwise mask.
+func TestGateView_GateIsolationWorstClassSurvivesNewerContainer(t *testing.T) {
+	type row struct {
+		seq   int64
+		class string
+	}
+	cases := []struct {
+		name      string
+		rows      []row
+		worst     string
+		worstSeq  int64
+		newestCls string
+	}{
+		{"fallback then container", []row{{10, "fallback"}, {20, "container"}}, "fallback", 10, "container"},
+		{"refused then fallback then container", []row{{10, "refused"}, {20, "fallback"}, {30, "container"}}, "refused", 10, "container"},
+		{"all container", []row{{10, "container"}, {20, "container"}}, "container", 20, "container"},
+		{"two fallbacks: newest wins the tie", []row{{10, "fallback"}, {20, "fallback"}, {30, "container"}}, "fallback", 20, "container"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, repo, au, _ := gateViewServer(t)
+			runID := seedGateRun(t, repo)
+			stages := map[int64]uuid.UUID{}
+			for _, r := range tc.rows {
+				stages[r.seq] = uuid.New()
+				seedGateIsolationRow(t, au, runID, stages[r.seq], r.seq, gateIsolationRowPayload(t, stages[r.seq], r.class))
+			}
+			newest := tc.rows[len(tc.rows)-1]
+			gi := decodeGateView(t, getGateView(t, s, runID, "")).GateIsolation
+			if gi == nil {
+				t.Fatal("gate_isolation block absent")
+			}
+			if gi.Class != tc.newestCls || gi.Sequence != newest.seq || gi.StageID != stages[newest.seq].String() {
+				t.Errorf("newest = (%q, %d, %s), want (%q, %d, %s)", gi.Class, gi.Sequence, gi.StageID, tc.newestCls, newest.seq, stages[newest.seq])
+			}
+			if gi.WorstClass != tc.worst || gi.WorstSequence != tc.worstSeq || gi.WorstStageID != stages[tc.worstSeq].String() {
+				t.Errorf("worst = (%q, %d, %s), want (%q, %d, %s)", gi.WorstClass, gi.WorstSequence, gi.WorstStageID, tc.worst, tc.worstSeq, stages[tc.worstSeq])
+			}
+		})
+	}
+}
+
+func TestGateView_GateIsolationAbsentKeyOmitted(t *testing.T) {
+	s, repo, _, _ := gateViewServer(t)
+	runID := seedGateRun(t, repo)
+	w := getGateView(t, s, runID, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+	if strings.Contains(w.Body.String(), `"gate_isolation"`) {
+		t.Errorf("a run with no gate_isolation_recorded row carried the key:\n%s", w.Body.String())
+	}
+	resp := decodeGateView(t, w)
+	if slices.Contains(resp.HistoryGaps, CategoryGateIsolationRecorded) {
+		t.Errorf("a quiet run recorded a gate_isolation gap: %v", resp.HistoryGaps)
+	}
+}
+
+func TestGateView_GateIsolationListErrorIsGap(t *testing.T) {
+	s, repo, au, _ := gateViewServer(t)
+	runID := seedGateRun(t, repo)
+	au.listByCategoryErrCategory = CategoryGateIsolationRecorded
+	resp := decodeGateView(t, getGateView(t, s, runID, ""))
+	if resp.GateIsolation != nil {
+		t.Errorf("block = %+v, want nil on a read failure", resp.GateIsolation)
+	}
+	if !resp.HistoryIncomplete || !slices.Contains(resp.HistoryGaps, CategoryGateIsolationRecorded) {
+		t.Errorf("history_incomplete=%v gaps=%v, want a gate_isolation_recorded gap", resp.HistoryIncomplete, resp.HistoryGaps)
+	}
+}
+
+// TestGateView_GateIsolationUndecodableIsGap pins the wholesale degrade: an
+// undecodable row — newest OR older — omits the block with a gap, because a
+// worst_class built around a row it could not read could hide a refusal.
+func TestGateView_GateIsolationUndecodableIsGap(t *testing.T) {
+	for _, undecodableNewest := range []bool{true, false} {
+		name := "older row undecodable"
+		if undecodableNewest {
+			name = "newest row undecodable"
+		}
+		t.Run(name, func(t *testing.T) {
+			s, repo, au, _ := gateViewServer(t)
+			runID := seedGateRun(t, repo)
+			bad := json.RawMessage(`{"stage_id":"x","class":7}`)
+			good := gateIsolationRowPayload(t, uuid.New(), "container")
+			first, second := bad, good
+			if undecodableNewest {
+				first, second = good, bad
+			}
+			seedGateIsolationRow(t, au, runID, uuid.New(), 10, first)
+			seedGateIsolationRow(t, au, runID, uuid.New(), 20, second)
+			resp := decodeGateView(t, getGateView(t, s, runID, ""))
+			if resp.GateIsolation != nil {
+				t.Errorf("block = %+v, want nil when a row does not decode", resp.GateIsolation)
+			}
+			if !resp.HistoryIncomplete || !slices.Contains(resp.HistoryGaps, CategoryGateIsolationRecorded) {
+				t.Errorf("history_incomplete=%v gaps=%v, want a gate_isolation_recorded gap", resp.HistoryIncomplete, resp.HistoryGaps)
+			}
+		})
+	}
+}

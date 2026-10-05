@@ -646,6 +646,14 @@ type GateView struct {
 	// MUST byte-match the backend's gateViewResponse or the field silently
 	// decodes to nil — the mixed-version degrade.
 	ReviewHeadMismatch *gateViewReviewHeadMismatch `json:"review_head_mismatch,omitempty"`
+	// GateIsolation mirrors the backend's gate-view gate_isolation block (E51.2
+	// / #2135): which ADR-063 isolation path the run's gates ran under — the
+	// newest gate_isolation_recorded row plus worst_class / worst_stage_id, the
+	// most severe class recorded on ANY stage. Omitted (nil) when no row was
+	// recorded, the read degraded (a gate_isolation_recorded history_gaps
+	// entry), or against an older backend. The json tag MUST byte-match the
+	// backend's gateViewResponse or the block silently decodes to nil.
+	GateIsolation *gateViewGateIsolation `json:"gate_isolation,omitempty"`
 	// Captain mirrors the backend's gate-view captain block (E76.3 / #3766,
 	// ADR-083 rule 4): the repository's current captain and the non-captain
 	// approval note. INFORMATIONAL — never an input to quorum or eligibility.
@@ -801,6 +809,33 @@ type gateViewReviewHeadMismatch struct {
 	ReviewRoundSequence int64  `json:"review_round_sequence" jsonschema:"audit sequence of the implement_review_started round judged stale"`
 	ReviewedHeadSHA     string `json:"reviewed_head_sha,omitempty" jsonschema:"the reviewed round's head SHA (a throwaway WIP commit — never equal to pushed_head_sha on its own; not itself evidence of staleness)"`
 	PushedHeadSHA       string `json:"pushed_head_sha,omitempty" jsonschema:"the PR head SHA the runner pushed"`
+}
+
+// gateViewGateIsolation mirrors the backend's gateViewGateIsolation (#2135):
+// the distilled gate_isolation_recorded rows. The json tags MUST byte-match the
+// backend or each field silently decodes to its zero value (the #371-class
+// hand-maintained-wire-mirror trap). Deliberately UNEXPORTED — same rationale
+// as gateViewReviewDiffTruncated.
+type gateViewGateIsolation struct {
+	StageID              string    `json:"stage_id" jsonschema:"the stage whose gates the NEWEST record describes"`
+	Sequence             int64     `json:"sequence" jsonschema:"audit sequence of the newest gate_isolation_recorded row"`
+	RecordedAt           time.Time `json:"recorded_at" jsonschema:"when the newest row was recorded (raw trace upload)"`
+	Path                 string    `json:"path" jsonschema:"the precise isolation path: container | clone-sandbox | clone | refused"`
+	Class                string    `json:"class" jsonschema:"container | fallback | refused — fallback covers clone-sandbox and clone"`
+	Mode                 string    `json:"mode" jsonschema:"the configured gate isolation mode (auto | container | clone-sandbox | clone)"`
+	Profile              string    `json:"profile" jsonschema:"the runner profile (local | hosted); hosted refuses every non-container path"`
+	Image                string    `json:"image,omitempty" jsonschema:"the configured gate image, when one was set"`
+	RuntimeKind          string    `json:"runtime_kind" jsonschema:"the detected container runtime (docker | podman | none)"`
+	RuntimeSafe          bool      `json:"runtime_safe" jsonschema:"true when the detected runtime is a safe local container runtime"`
+	RuntimeReason        string    `json:"runtime_reason,omitempty" jsonschema:"why the runtime was or was not judged safe (pre-redacted)"`
+	RuntimeVersion       string    `json:"runtime_version,omitempty" jsonschema:"the detected runtime's version"`
+	SandboxAvailable     bool      `json:"sandbox_available" jsonschema:"true when the clone-sandbox probe succeeded"`
+	SandboxReason        string    `json:"sandbox_reason,omitempty" jsonschema:"why the sandbox is unavailable (pre-redacted)"`
+	Reason               string    `json:"reason" jsonschema:"the selection's own explanation of the path it took (pre-redacted)"`
+	ContainerUnavailable string    `json:"container_unavailable,omitempty" jsonschema:"why the container path was not taken; empty on the container path"`
+	WorstClass           string    `json:"worst_class" jsonschema:"the most severe class recorded on ANY stage of the run (refused > fallback > container), so an earlier fallback or refusal is never masked by a later container stage"`
+	WorstStageID         string    `json:"worst_stage_id" jsonschema:"the stage that recorded worst_class (the newest such stage on a tie)"`
+	WorstSequence        int64     `json:"worst_sequence" jsonschema:"audit sequence of the row that recorded worst_class"`
 }
 
 // gateViewReviewDiffTruncated mirrors the backend's gateViewReviewDiffTruncated

@@ -359,6 +359,7 @@ var KnownCategories = map[string]struct{}{
 	"escalation_persona_attached":             {}, // E55.9 / #3754: fired escalations attached reviewer personas to a review round (server/escalation_persona.go)
 	"fixup_no_changes":                        {},
 	"fixup_pushed":                            {},
+	"gate_isolation_recorded":                 {}, // E51.2 / #2135: which ADR-063 gate isolation path a stage's gates ran under, recorded at raw trace upload (server/gate_isolation.go) — INTERNAL, read by the gate view
 	"grooming_apply_completed":                {},
 	"grooming_apply_started":                  {}, // E54.77 / #3232: once-per-apply progress denominator (server/grooming_apply.go)
 	"grooming_apply_window_closed":            {},
