@@ -342,9 +342,16 @@ A finding is covered iff ALL hold:
    `Author == "dependabot[bot]"` (the REST `user.login`), a head ref whose
    ecosystem equals the finding's (`DependabotEcosystem`:
    `dependabot/go_modules/` → `go`, `dependabot/npm_and_yarn/` → `npm`, anything
-   else → unknown, never covers), and a bump of the same package in that exact
-   directory to a version `VersionAtLeast` reports comparable and at least the
-   fixed version.
+   else → unknown, never covers), a known `BaseRef` equal to the known
+   `DefaultBranch` (both from the listing's `base.ref` /
+   `base.repo.default_branch`; a Dependabot `target-branch` pull request fixes
+   another tree, and an unknown base never covers), and a bump of the same
+   package in that exact directory whose `From` is on the finding's in-use
+   version line (`sameVersionLine`: the same major, and for `0.x` the same
+   minor; either side unparseable never covers — a lockfile can hold several
+   versions of one package, and a bump of another line leaves this one
+   vulnerable) to a version `VersionAtLeast` reports comparable and at least
+   the fixed version.
 
 - Output is in advisory input order and never nil. `Covered` JSON (the
   `upkeep_report_recorded` payload's `covered` entry shape): `finding_id`,
@@ -364,11 +371,28 @@ Grounded in this repository's real pull requests, not a documented contract
 |---|---|---|
 | `bump <pkg> from <a> to <b> in /<dir>` | that one | `<dir>` |
 | `bump <pkg> from <a> to <b>` (no `in`) | that one | unknown |
-| `bump the <g> group in /<dir> with N updates`, `bump <a> and <b> in /<dir>` | one per body line `` Updates `<pkg>` from <a> to <b> `` or `Bumps [<pkg>](<url>) from <a> to <b>.` | `<dir>` |
-| `bump the <g> group across N directories with M updates` (even N = 1) | one per body line | unknown |
+| `bump the <g> group in /<dir> with N updates` | one per SUMMARY line `` Updates `<pkg>` from <a> to <b> `` or `Bumps [<pkg>](<url>) from <a> to <b>.` | `<dir>` |
+| `bump <a> and <b> in /<dir>` | one per SUMMARY line, only for a package the title names as a word | `<dir>` |
+| `bump the <g> group across N directories with M updates` (even N = 1) | one per SUMMARY line | unknown |
 | anything not starting `bump ` | none | — |
 
 An unknown directory never equals a manifest directory, so it never covers.
+
+**Only the body's leading summary is read — a trust boundary.** A Dependabot
+body embeds release notes, changelogs and commit lists written by the
+dependency's UPSTREAM maintainers; an `` Updates `victim` from 1.0.0 to 1.2.3 ``
+line inside them would otherwise cover a package the pull request does not
+update (the author, ecosystem and directory checks all pass, because the pull
+request really is Dependabot's). `dependabotSummary` keeps the text before the
+first `<details>` (case-insensitive), the first line starting `Release notes`,
+`Changelog` or `Commits` (case-insensitive), or the first markdown heading,
+whichever comes first. A non-group multi-dependency title additionally counts a
+line only when the title names its package. The cost: in a grouped body each
+package's `Updates` line is followed by its own embedded block, so only the
+lines ahead of the FIRST block are read and later packages in the group never
+cover (a conservative residual, below). Pinned by
+`TestMarkCovered_ReleaseNoteLineNeverCovers` and
+`TestDependabotBumps_SummaryEndsAtUpstreamText`.
 
 ### `VersionAtLeast(have, want) (atLeast, comparable bool)`
 
@@ -398,10 +422,13 @@ it as NOT covered.
   a span cannot be broken out of and markdown, mentions and issue references
   inside one are inert: no free text reaches the tracker through a structured
   field (`version` and `fixed_version` carry no schema charset of their own).
-- `CallPathDisclosure(body, frames)` is DEFENSE IN DEPTH only: the apply files
-  server-rendered advisory titles and bodies, so agent prose never reaches the
-  tracker. It reports the first caller-frame token (frames at index >= 1; index
-  0 is the public vulnerable symbol) found in `body`: a non-empty filename,
+- `CallPathDisclosure(body, frames)` is an UNWIRED helper: no production path
+  calls it. The disclosure control is the server-rendered advisory filing (the
+  apply files no agent title or body, and narrows advisory labels to the
+  `area:`/`type:`/`phase:` namespaces), so there is no agent text for it to
+  scan; it is kept for a future surface that must screen agent prose. It
+  reports the first caller-frame token (frames at index >= 1; index 0 is the
+  public vulnerable symbol) found in `body`: a non-empty filename,
   `Package.Function`, or `Receiver.Function` with a leading `*` trimmed. A
   case-sensitive substring match, so a paraphrase evades it.
 
@@ -412,6 +439,13 @@ filed even though a Dependabot pull request would fix it:
 
 - **Multi-directory groups.** An `across N directories` group names no single
   directory, so none of its bumps covers.
+- **Grouped bodies past the first embedded block.** Only the leading summary
+  is read, so a group's packages whose `Updates` line follows the first
+  `<details>` block never cover, and a multi-dependency title's line covers
+  only for a package the title names.
+- **Other version lines and branches.** A bump whose `From` is on another
+  version line than the finding's in-use version, or a pull request whose
+  base is not the known default branch, never covers.
 - **Root without `in /`.** A single-dependency title naming no directory is
   unknown, not assumed to be the root.
 - **Unparseable versions.** Ranges and malformed versions never compare.
@@ -432,6 +466,16 @@ that stays vulnerable somewhere:
   server cannot see a manifest the agent did not cite.
 - **Agent-asserted fixed version.** A fixed version stated lower than the real
   fix lets a too-low bump cover.
+- **Agent-asserted in-use version.** The version-line check compares the bump's
+  `From` with the finding's `version`, which the agent copies from the scanner.
+  A version stated on the wrong line lets a bump of another instance cover. A
+  bump on the SAME line as another instance of the package (two `1.x` copies
+  in one lockfile) also covers both.
+- **Dependabot-authored summary text.** The leading summary is trusted as
+  Dependabot's own rendering. A package name or link in it is upstream-chosen
+  metadata, and a line-anchored `Updates`/`Bumps` match cannot form inside a
+  link; but should Dependabot ever render upstream text ahead of the first
+  `<details>`, release-notes line or heading, that text would be read.
 - **Proposed, not merged.** Covered means an open pull request proposes the
   fix, not that it landed. While it stays open, every scan re-proposes and
   re-skips the finding. Coverage is a snapshot at ingest: a pull request closed

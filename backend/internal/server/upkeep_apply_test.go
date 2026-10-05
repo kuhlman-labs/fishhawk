@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -1384,15 +1385,22 @@ func TestApplyApprovedUpkeep_CoverageUnreadableDegrades(t *testing.T) {
 // qualified name and filename — files a SERVER-RENDERED title and body that
 // contain none of them, nor any of the agent's prose. Filing the agent title
 // or body instead → red.
+//
+// Its agent LABELS (routed concern 9a5616a3) plant two frame-shaped tokens
+// beside area:/type:/phase: ones; only the three namespaces are filed and the
+// frame-shaped two are recorded stripped. Deleting the advisory namespace
+// narrowing files both → red.
 func TestApplyApprovedUpkeep_AdvisoryFilingIsServerRendered(t *testing.T) {
 	const (
 		agentTitle = "Fix serveH2 in internal/server/serve.go (GO-2024-2687)"
 		agentBody  = "govulncheck traced github.com/kuhlman-labs/fishhawk/backend/internal/server.serveH2 " +
 			"at internal/server/serve.go:88 into Framer.ReadFrame."
 	)
+	frameLabels := []string{"internal/server/serve.go", "server.serveH2"}
 	body := ukAdvisoryBody(t, map[string]func(map[string]any){ukAdvNet: func(issue map[string]any) {
 		issue["title"] = agentTitle
 		issue["body"] = agentBody
+		issue["labels"] = append([]string{"area:backend", "type:bug", "Phase:Alpha"}, frameLabels...)
 	}})
 	f := newUkApplyFixture(t, ukApplyOpts{reportBody: body})
 	f.grant(t)
@@ -1424,6 +1432,44 @@ func TestApplyApprovedUpkeep_AdvisoryFilingIsServerRendered(t *testing.T) {
 	row := f.filed(t)[ukAdvNet]
 	if !row.ServerRendered || row.Title != title || row.Source != plan.UpkeepSourceAdvisory {
 		t.Errorf("filed row = %+v, want server_rendered true and the rendered title", row)
+	}
+	filedLabels := reqs[0].Item.Classification.Labels
+	for _, leak := range frameLabels {
+		if hasLabelFold(filedLabels, leak) {
+			t.Errorf("filed labels = %v, carry the frame-shaped label %q", filedLabels, leak)
+		}
+	}
+	for _, want := range []string{"area:backend", "type:bug", "phase:alpha"} {
+		if !hasLabelFold(filedLabels, want) {
+			t.Errorf("filed labels = %v, want %q", filedLabels, want)
+		}
+	}
+	if !reflect.DeepEqual(row.StrippedLabels, frameLabels) {
+		t.Errorf("stripped_labels = %v, want %v", row.StrippedLabels, frameLabels)
+	}
+}
+
+// TestApplyApprovedUpkeep_DuplicateWinsOverCovered (routed concern eb6584b6
+// arm a): an approved advisory finding the recorded row marks BOTH a
+// duplicate of an open issue AND covered by a Dependabot pull request is
+// skipped duplicate_of_open_issue, carrying the issue and no pull request.
+// Evaluating the covered case first records covered_by_dependabot_pr → red.
+func TestApplyApprovedUpkeep_DuplicateWinsOverCovered(t *testing.T) {
+	f := newUkApplyFixture(t, ukApplyOpts{
+		reportBody: upkeepAdvisoryExampleBody(t),
+		covered:    ukCoveredRaw(t),
+		duplicates: []upkeep.Duplicate{{FindingID: ukAdvNet, IssueNumber: 905, Basis: upkeep.BasisMarker}},
+	})
+	f.grant(t)
+	f.dispose(t, ukAdvNet, upkeepVerdictApproved, false, "")
+	f.apply(t, approval.DecisionApprove)
+
+	if n := len(f.provider.requests()); n != 0 {
+		t.Fatalf("File calls = %d, want 0", n)
+	}
+	s := f.skips(t)[ukAdvNet]
+	if s.SkipReason != upkeepSkipDuplicate || s.DuplicateIssueNumber != 905 || len(s.CoveringPRNumbers) != 0 {
+		t.Errorf("skip = %+v, want duplicate_of_open_issue #905 with no covering pull request", s)
 	}
 }
 

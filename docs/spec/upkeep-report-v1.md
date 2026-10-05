@@ -197,21 +197,35 @@ repository's open pull requests (GitHub only, at most 300, one 10s budget;
 `backend/internal/upkeep.MarkCovered`). A finding is COVERED iff it cites at
 least one manifest and, for EVERY cited manifest directory, some open pull
 request authored by `dependabot[bot]`, on a head ref of the finding's ecosystem
-(`dependabot/go_modules/…` ⇒ `go`, `dependabot/npm_and_yarn/…` ⇒ `npm`), bumps
-the same package in that exact directory to a version at least `fixed_version`.
+(`dependabot/go_modules/…` ⇒ `go`, `dependabot/npm_and_yarn/…` ⇒ `npm`) and
+targeting the repository's default branch (`base.ref` equal to
+`base.repo.default_branch`, both known), bumps the same package in that exact
+directory FROM a version on the finding's `version` line (same major; for `0.x`
+the same minor) to a version at least `fixed_version`. A multi-package pull
+request's updates are read only from the body's leading summary — before the
+first `<details>`, `Release notes` / `Changelog` / `Commits` line or markdown
+heading — because the rest embeds upstream-authored release notes, and a
+non-group multi-dependency title counts only a package it names.
 
 A covered finding is still PROPOSED and visible at the gate; the apply skips its
 filing (`covered_by_dependabot_pr`). Every rule fails toward NOT covered — a
 `null` fix, an unparseable version, a grouped pull request spanning several
-directories, an unknown ecosystem, a truncated listing — so these residuals only
-leave a finding to be filed.
+directories, a group package listed after the first embedded release-notes
+block, a bump of another version line, a pull request on another base branch,
+an unknown ecosystem, a truncated listing — so these residuals only leave a
+finding to be filed.
 
 **FALSE-COVER risk (the unsafe direction).** Coverage reaches only the
 directories of the manifests the finding CITES. A finding that under-cites (the
 module is also pinned in a manifest it does not name) can be marked covered by a
 bump that misses that manifest, and is then not filed. Covered marks are only as
 complete as the agent's manifest citations; the multi-module merge rule above is
-what the scan prompt instructs to prevent it.
+what the scan prompt instructs to prevent it. The version-line check is likewise
+only as sound as the agent-asserted `version`, and a bump on the SAME line as a
+second instance of the package (two `1.x` copies in one lockfile) covers both.
+Text an upstream maintainer authored inside an embedded release-notes block can
+no longer cover; text Dependabot renders ahead of that block is trusted as
+Dependabot's own.
 
 Coverage is a snapshot at INGEST: a Dependabot pull request closed between
 ingest and the gate still suppresses filing (the next scan re-proposes the
@@ -377,8 +391,10 @@ on its own line, and is stamped with an idempotency key minted from
 `(upkeep_finding, run_id, artifact_id, finding_id)`. Its parent epic is the
 disposition's `parent_epic` override, else the proposal's, normalized to `#N`.
 Its labels are the proposal's minus every `autonomy:*` label unless
-`authorize_delegation_tier` is true; `applied_labels` are the labels actually
-filed (after the conventions' label completeness), `stripped_labels` the removed
+`authorize_delegation_tier` is true, and for an `advisory` finding minus every
+label outside the `area:`, `type:` and `phase:` namespaces (an authorized
+`autonomy:*` label included); `applied_labels` are the labels actually filed
+(after the conventions' label completeness), `stripped_labels` the removed
 ones.
 
 **Advisory filings are SERVER-RENDERED (#3750).** For an `advisory` finding the
@@ -387,9 +403,13 @@ title is `<primary id>: <package> <version> (<severity> severity)`; the body is
 a `### Advisory facts (server-rendered)` block listing every advisory id, the
 ecosystem, package, in-use version, fixed version (or `no fix published`),
 reachability, severity and the cited manifest paths — then the hidden marker. No
-call-path frame and no agent prose reaches the tracker, and a structured value
-that is not a plain token is withheld. The filed row carries
-`server_rendered: true`. Type, labels and parent epic follow the ordinary rules.
+call-path frame and no agent prose reaches the tracker through the title or
+body, and a structured value that is not a plain token is withheld. The filed
+row carries `server_rendered: true`. Labels are narrowed to the `area:`,
+`type:` and `phase:` namespaces, so a frame-shaped label (`server.serveH2`)
+is stripped; the suffix inside a kept namespace is still agent-chosen until the
+filing-label allow-list (#3956). Type and parent epic follow the ordinary
+rules.
 
 **Summary.** ONE `upkeep_apply_completed` row per apply: `{artifact_id,
 findings, filed, skipped, failed, budget_exhausted, degraded, degrade_reason?}`.

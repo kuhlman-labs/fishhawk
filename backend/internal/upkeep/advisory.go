@@ -48,6 +48,11 @@ type AdvisoryProposal struct {
 	// Package is the affected dependency: the Go MODULE path, or the npm
 	// package name.
 	Package string
+	// Version is the in-use version the finding names. A bump covers only
+	// when its From is on the SAME version line (sameVersionLine): a
+	// lockfile can hold several versions of one package, and a bump of
+	// another line leaves this one vulnerable. "" never covers.
+	Version string
 	// FixedVersion is the lowest fixed version; "" means no fix is published,
 	// and such a finding is never covered.
 	FixedVersion string
@@ -65,6 +70,13 @@ type PullRequest struct {
 	Body    string
 	Author  string
 	HeadRef string
+	// BaseRef is the branch the pull request targets and DefaultBranch the
+	// repository's default branch, both from the listing. A pull request
+	// covers only when both are known and equal: the scan reads the default
+	// branch, so a Dependabot `target-branch` pull request fixes another
+	// tree.
+	BaseRef       string
+	DefaultBranch string
 }
 
 // Bump is one dependency update a Dependabot pull request makes.
@@ -116,6 +128,13 @@ var (
 	// titleDirRe: the `in /<dir>` of a multi-dependency or group title,
 	// optionally followed by ` with N update(s)`.
 	titleDirRe = regexp.MustCompile(`(?i) in (/\S*)(?: with \d+ updates?)?$`)
+	// groupTitleRe: a group title, `bump the <g> group …`.
+	groupTitleRe = regexp.MustCompile(`(?i)^bump the \S+ group\b`)
+	// detailsRe: the first `<details>` block, where Dependabot embeds
+	// upstream release notes, changelogs and commit lists.
+	detailsRe = regexp.MustCompile(`(?i)<details`)
+	// headingLineRe: a markdown ATX heading line.
+	headingLineRe = regexp.MustCompile(`^#{1,6}(?:\s|$)`)
 	// updatesLineRe: a body line `Updates `<pkg>` from <a> to <b>`.
 	updatesLineRe = regexp.MustCompile("(?m)^\\s*Updates `([^`]+)` from (\\S+) to (\\S+?)\\.?\\s*$")
 	// bumpsLineRe: a body line `Bumps [<pkg>](<url>) from <a> to <b>.`.
@@ -130,12 +149,21 @@ var (
 //     bump. A title with no `in /<dir>` yields an UNKNOWN directory: the
 //     directory is not stated, so it is not guessed.
 //   - Any other `bump …` title (a group or a multi-dependency update) yields
-//     one bump per body line `Updates `<pkg>` from <a> to <b>` or
-//     `Bumps [<pkg>](<url>) from <a> to <b>.`, with the directory taken from
-//     the title's `in /<dir>`. A title naming no `in /<dir>` — the
-//     `across N directories` group form, even N = 1 — yields UNKNOWN
-//     directories.
+//     one bump per line `Updates `<pkg>` from <a> to <b>` or
+//     `Bumps [<pkg>](<url>) from <a> to <b>.` in the body's LEADING SUMMARY
+//     only (dependabotSummary), with the directory taken from the title's
+//     `in /<dir>`. A line counts only when the title is a group form
+//     (`bump the <g> group …`) or the title names its package as a word. A
+//     title naming no `in /<dir>` — the `across N directories` group form,
+//     even N = 1 — yields UNKNOWN directories.
 //   - A title that is not a bump yields nothing.
+//
+// The summary-only read is a TRUST BOUNDARY, not a parse convenience: a
+// Dependabot body embeds release notes, changelogs and commit lists written
+// by the dependency's upstream maintainers, and an `Updates …` line inside
+// them would otherwise cover a package the pull request does not update.
+// The cost is fewer bumps for a grouped body (only the update lines ahead
+// of the first embedded block are read), which fails toward NOT covered.
 //
 // The title and body formats are not a documented contract; every parse
 // failure yields fewer bumps, which fails toward NOT covered.
@@ -155,12 +183,50 @@ func DependabotBumps(pr PullRequest) []Bump {
 	if m := titleDirRe.FindStringSubmatch(title); m != nil {
 		dir = normalizeDependabotDir(m[1])
 	}
+	group := groupTitleRe.MatchString(title)
+	summary := dependabotSummary(pr.Body)
 	for _, re := range []*regexp.Regexp{updatesLineRe, bumpsLineRe} {
-		for _, m := range re.FindAllStringSubmatch(pr.Body, -1) {
+		for _, m := range re.FindAllStringSubmatch(summary, -1) {
+			if !group && !titleNamesPackage(title, m[1]) {
+				continue
+			}
 			out = append(out, Bump{Package: m[1], From: m[2], To: m[3], Directory: dir})
 		}
 	}
 	return out
+}
+
+// dependabotSummary returns the leading summary of a Dependabot pull-request
+// body: the text before the first `<details>`, the first line starting
+// `Release notes`, `Changelog` or `Commits` (case-insensitive), or the
+// first markdown heading, whichever comes first. Everything from there on
+// may carry upstream-authored text and is never read.
+func dependabotSummary(body string) string {
+	if loc := detailsRe.FindStringIndex(body); loc != nil {
+		body = body[:loc[0]]
+	}
+	var b strings.Builder
+	for _, line := range strings.SplitAfter(body, "\n") {
+		t := strings.TrimSpace(line)
+		lt := strings.ToLower(t)
+		if headingLineRe.MatchString(t) || strings.HasPrefix(lt, "release notes") ||
+			strings.HasPrefix(lt, "changelog") || strings.HasPrefix(lt, "commits") {
+			break
+		}
+		b.WriteString(line)
+	}
+	return b.String()
+}
+
+// titleNamesPackage reports whether title carries pkg as one
+// whitespace-separated word (a trailing comma trimmed).
+func titleNamesPackage(title, pkg string) bool {
+	for _, w := range strings.Fields(title) {
+		if strings.TrimRight(w, ",") == pkg {
+			return true
+		}
+	}
+	return false
 }
 
 // normalizeDependabotDir turns a Dependabot `/<dir>` into the manifest
@@ -184,9 +250,11 @@ func normalizeDependabotDir(d string) string {
 // A finding is covered iff it has a fixed version AND at least one manifest
 // directory AND, for EVERY one of its directories, some pull request whose
 // Author is DependabotAuthor, whose head ref names the finding's ecosystem,
-// and that bumps the same package in that exact (known) directory to a
-// version VersionAtLeast reports comparable and at least the fixed version.
-// The first such pull request, in input order, is recorded per directory.
+// whose BaseRef is known and equals the known DefaultBranch, and that bumps
+// the same package in that exact (known) directory FROM a version on the
+// finding's in-use version line (sameVersionLine) TO a version
+// VersionAtLeast reports comparable and at least the fixed version. The
+// first such pull request, in input order, is recorded per directory.
 //
 // Every rule fails toward NOT covered: a covered finding is not filed, so a
 // false cover would silently drop a real advisory.
@@ -203,6 +271,9 @@ func MarkCovered(advisories []AdvisoryProposal, prs []PullRequest) []Covered {
 		}
 		eco := DependabotEcosystem(pr.HeadRef)
 		if eco == "" {
+			continue
+		}
+		if pr.BaseRef == "" || pr.BaseRef != pr.DefaultBranch {
 			continue
 		}
 		pulls = append(pulls, parsedPull{pr: pr, ecosystem: eco, bumps: DependabotBumps(pr)})
@@ -241,11 +312,14 @@ func MarkCovered(advisories []AdvisoryProposal, prs []PullRequest) []Covered {
 	return out
 }
 
-// coveringBump returns the first bump of a's package in dir that reaches a's
-// fixed version.
+// coveringBump returns the first bump of a's package in dir that moves a's
+// in-use version line and reaches a's fixed version.
 func coveringBump(bumps []Bump, a AdvisoryProposal, dir string) (Bump, bool) {
 	for _, b := range bumps {
 		if b.Package != a.Package || b.Directory != dir {
+			continue
+		}
+		if !sameVersionLine(b.From, a.Version) {
 			continue
 		}
 		if atLeast, comparable := VersionAtLeast(b.To, a.FixedVersion); atLeast && comparable {
@@ -253,6 +327,25 @@ func coveringBump(bumps []Bump, a AdvisoryProposal, dir string) (Bump, bool) {
 		}
 	}
 	return Bump{}, false
+}
+
+// sameVersionLine reports whether from and inUse are on the same version
+// line: the same major, and for a 0.x major also the same minor (semver
+// §4: 0.y.z makes no compatibility promise across minors). Either side not
+// parsing is false, so an unknown line never covers.
+func sameVersionLine(from, inUse string) bool {
+	f, ok := parseSemver(from)
+	if !ok {
+		return false
+	}
+	u, ok := parseSemver(inUse)
+	if !ok {
+		return false
+	}
+	if f.core[0] != u.core[0] {
+		return false
+	}
+	return f.core[0] != 0 || f.core[1] == u.core[1]
 }
 
 // semver is a parsed MAJOR.MINOR.PATCH[-PRERELEASE] version. Build metadata
@@ -526,8 +619,13 @@ type DisclosureFrame struct {
 // advisory, and is never a token. Per frame the tokens are a non-empty
 // Filename, `Package.Function`, and `Receiver.Function` (a leading `*`
 // trimmed) when both parts are set. Matching is a case-sensitive substring
-// test, so a paraphrase evades it: this is defense in depth behind the
-// server-rendered advisory filing, which files no agent prose at all.
+// test, so a paraphrase evades it.
+//
+// It is an UNWIRED helper: no production path calls it. The disclosure
+// control is the server-rendered advisory filing, which files no agent
+// prose at all, so there is no agent text for it to scan; it is kept for a
+// future surface that must screen agent prose (approval condition 1 permits
+// keeping or dropping it).
 func CallPathDisclosure(body string, frames []DisclosureFrame) (string, bool) {
 	for i := 1; i < len(frames); i++ {
 		f := frames[i]

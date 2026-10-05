@@ -60,8 +60,13 @@ package server
 // exception: its title and body are SERVER-RENDERED from the structured
 // advisory fields (upkeep.RenderAdvisoryTitle / RenderAdvisoryFacts) and the
 // agent-authored proposed title and body are ignored, so no agent prose — and
-// no call-path frame naming the repository's own code — reaches the tracker. The proposal's autonomy:* labels are
-// STRIPPED unless the captain set authorize_delegation_tier; note that the
+// no call-path frame naming the repository's own code — reaches the tracker
+// through them. Its labels are narrowed to the area:, type: and phase:
+// namespaces (upkeepAdvisoryLabels); the suffix inside a kept namespace is
+// still agent-chosen until the filing-label allow-list (#3956). The
+// proposal's autonomy:* labels are
+// STRIPPED unless the captain set authorize_delegation_tier (an advisory
+// filing strips them regardless, by the namespace narrowing); note that the
 // conventions' label_defaults may still add their DEFAULT autonomy tier (the
 // conventions' choice, not the scan's), so "stripped" means "the PROPOSED tier
 // is never applied unaided". The parent epic is the disposition's override,
@@ -576,6 +581,9 @@ func (s *Server) recordUpkeepApplyRow(ctx context.Context, job *upkeepFilingJob,
 func (s *Server) fileUpkeepFinding(ctx context.Context, job *upkeepFilingJob, f plan.UpkeepFinding,
 	disp upkeepConsumedDisposition) (*upkeepFindingFiledPayload, *workItemError) {
 	labels, stripped := upkeepFilingLabels(f.ProposedIssue.Labels, disp.AuthorizeDelegationTier)
+	if f.Source == plan.UpkeepSourceAdvisory {
+		labels, stripped = upkeepAdvisoryLabels(labels, stripped)
+	}
 	parentEpic := disp.ParentEpic
 	if parentEpic == "" && f.ProposedIssue.ParentEpic != nil {
 		parentEpic = *f.ProposedIssue.ParentEpic
@@ -691,6 +699,36 @@ func upkeepFilingLabels(proposed []string, authorized bool) ([]string, []string)
 			continue
 		}
 		kept = append(kept, l)
+	}
+	return kept, stripped
+}
+
+// upkeepAdvisoryLabelNamespaces are the only label namespaces an ADVISORY
+// filing carries (#3750). An agent-proposed label is a whitespace-free token
+// of up to 50 runes, so one such as `internal/server/serve.go` or
+// `server.serveH2` would carry a call-path frame to the tracker past the
+// server-rendered title and body.
+var upkeepAdvisoryLabelNamespaces = []string{"area:", "type:", "phase:"}
+
+// upkeepAdvisoryLabels narrows an advisory finding's labels to
+// upkeepAdvisoryLabelNamespaces, appending every other label (an authorized
+// autonomy:* label included) to stripped. Both results are non-nil.
+func upkeepAdvisoryLabels(labels, stripped []string) ([]string, []string) {
+	kept := []string{}
+	for _, l := range labels {
+		norm := strings.ToLower(strings.TrimSpace(l))
+		allowed := false
+		for _, ns := range upkeepAdvisoryLabelNamespaces {
+			if strings.HasPrefix(norm, ns) {
+				allowed = true
+				break
+			}
+		}
+		if allowed {
+			kept = append(kept, l)
+		} else {
+			stripped = append(stripped, l)
+		}
 	}
 	return kept, stripped
 }

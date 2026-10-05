@@ -141,6 +141,7 @@ func upkeepAdvisoryProposals(r *plan.UpkeepReport) []upkeep.AdvisoryProposal {
 			FindingID:    f.ID,
 			Ecosystem:    f.Advisory.Ecosystem,
 			Package:      f.Advisory.Package,
+			Version:      f.Advisory.Version,
 			FixedVersion: *f.Advisory.FixedVersion,
 			Directories:  plan.UpkeepAdvisoryManifestDirs(f),
 		})
@@ -155,6 +156,7 @@ func upkeepPullRequests(pulls []githubclient.OpenPullRequest) []upkeep.PullReque
 		out = append(out, upkeep.PullRequest{
 			Number: p.Number, URL: p.HTMLURL, Title: p.Title, Body: p.Body,
 			Author: p.UserLogin, HeadRef: p.HeadRef,
+			BaseRef: p.BaseRef, DefaultBranch: p.DefaultBranch,
 		})
 	}
 	return out

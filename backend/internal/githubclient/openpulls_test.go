@@ -81,10 +81,11 @@ func TestListOpenPullRequests_QueryDecodeAndPaging(t *testing.T) {
 				"title":"deps(backend)(deps): bump github.com/aws/aws-sdk-go-v2 from 1.47.0 to 1.47.1 in /backend",
 				"body":"Bumps [github.com/aws/aws-sdk-go-v2](https://github.com/aws/aws-sdk-go-v2) from 1.47.0 to 1.47.1.",
 				"user":{"login":"dependabot[bot]"},"head":{"ref":"dependabot/go_modules/backend/github.com/aws/aws-sdk-go-v2-1.47.1"},
+				"base":{"ref":"main","repo":{"default_branch":"main"}},
 				"state":"open"}]`))
 		case 2:
 			_, _ = w.Write([]byte(`[{"number":7,"html_url":"https://github.com/x/y/pull/7","title":"human","body":null,
-				"user":{"login":"octocat"},"head":{"ref":"feature"}}]`))
+				"user":{"login":"octocat"},"head":{"ref":"feature"},"base":{"ref":"release-1.x","repo":null}}]`))
 		default:
 			t.Errorf("unexpected page %d", page)
 			_, _ = w.Write([]byte(`[]`))
@@ -111,14 +112,17 @@ func TestListOpenPullRequests_QueryDecodeAndPaging(t *testing.T) {
 	}
 	want := []OpenPullRequest{
 		{
-			Number:    3823,
-			HTMLURL:   "https://github.com/x/y/pull/3823",
-			Title:     "deps(backend)(deps): bump github.com/aws/aws-sdk-go-v2 from 1.47.0 to 1.47.1 in /backend",
-			Body:      "Bumps [github.com/aws/aws-sdk-go-v2](https://github.com/aws/aws-sdk-go-v2) from 1.47.0 to 1.47.1.",
-			UserLogin: "dependabot[bot]",
-			HeadRef:   "dependabot/go_modules/backend/github.com/aws/aws-sdk-go-v2-1.47.1",
+			Number:        3823,
+			HTMLURL:       "https://github.com/x/y/pull/3823",
+			Title:         "deps(backend)(deps): bump github.com/aws/aws-sdk-go-v2 from 1.47.0 to 1.47.1 in /backend",
+			Body:          "Bumps [github.com/aws/aws-sdk-go-v2](https://github.com/aws/aws-sdk-go-v2) from 1.47.0 to 1.47.1.",
+			UserLogin:     "dependabot[bot]",
+			HeadRef:       "dependabot/go_modules/backend/github.com/aws/aws-sdk-go-v2-1.47.1",
+			BaseRef:       "main",
+			DefaultBranch: "main",
 		},
-		{Number: 7, HTMLURL: "https://github.com/x/y/pull/7", Title: "human", UserLogin: "octocat", HeadRef: "feature"},
+		// A null base repo leaves DefaultBranch unknown.
+		{Number: 7, HTMLURL: "https://github.com/x/y/pull/7", Title: "human", UserLogin: "octocat", HeadRef: "feature", BaseRef: "release-1.x"},
 	}
 	if len(pulls) != len(want) {
 		t.Fatalf("pulls = %+v, want %+v", pulls, want)

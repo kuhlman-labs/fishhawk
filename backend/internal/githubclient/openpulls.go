@@ -24,6 +24,11 @@ type OpenPullRequest struct {
 	Body      string // "" when GitHub reports null
 	UserLogin string // "dependabot[bot]" for a Dependabot pull request
 	HeadRef   string
+	// BaseRef is the branch the pull request targets (`base.ref`) and
+	// DefaultBranch the base repository's default branch
+	// (`base.repo.default_branch`); "" when GitHub omits either.
+	BaseRef       string
+	DefaultBranch string
 }
 
 // ListOpenPullRequests lists a repository's open pull requests, at most maxPulls
@@ -113,6 +118,12 @@ func (c *Client) doOpenPullsPage(req *http.Request) ([]OpenPullRequest, bool, er
 		Head struct {
 			Ref string `json:"ref"`
 		} `json:"head"`
+		Base struct {
+			Ref  string `json:"ref"`
+			Repo *struct {
+				DefaultBranch string `json:"default_branch"`
+			} `json:"repo"`
+		} `json:"base"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 		return nil, false, fmt.Errorf("githubclient: decode open pulls: %w", err)
@@ -125,6 +136,10 @@ func (c *Client) doOpenPullsPage(req *http.Request) ([]OpenPullRequest, bool, er
 			Title:     p.Title,
 			UserLogin: p.User.Login,
 			HeadRef:   p.Head.Ref,
+			BaseRef:   p.Base.Ref,
+		}
+		if p.Base.Repo != nil {
+			pr.DefaultBranch = p.Base.Repo.DefaultBranch
 		}
 		if p.Body != nil {
 			pr.Body = *p.Body

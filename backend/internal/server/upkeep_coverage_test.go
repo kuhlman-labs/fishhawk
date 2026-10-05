@@ -74,14 +74,17 @@ func ukPullsSeam(calls *atomic.Int32, pulls ...githubclient.OpenPullRequest) fun
 }
 
 // ukDependabotPull is one dependabot[bot] go_modules pull request bumping pkg
-// from -> to in dir (a Dependabot `/<dir>`), in this repo's real title shape.
+// from -> to in dir (a Dependabot `/<dir>`), in this repo's real title shape,
+// targeting the default branch.
 func ukDependabotPull(n int, pkg, from, to, dir string) githubclient.OpenPullRequest {
 	return githubclient.OpenPullRequest{
-		Number:    n,
-		HTMLURL:   fmt.Sprintf("https://github.com/kuhlman-labs/fishhawk/pull/%d", n),
-		Title:     fmt.Sprintf("deps(backend)(deps): bump %s from %s to %s in %s", pkg, from, to, dir),
-		UserLogin: upkeep.DependabotAuthor,
-		HeadRef:   "dependabot/go_modules/" + strings.TrimPrefix(dir, "/") + "/" + pkg + "-" + to,
+		Number:        n,
+		HTMLURL:       fmt.Sprintf("https://github.com/kuhlman-labs/fishhawk/pull/%d", n),
+		Title:         fmt.Sprintf("deps(backend)(deps): bump %s from %s to %s in %s", pkg, from, to, dir),
+		UserLogin:     upkeep.DependabotAuthor,
+		HeadRef:       "dependabot/go_modules/" + strings.TrimPrefix(dir, "/") + "/" + pkg + "-" + to,
+		BaseRef:       "main",
+		DefaultBranch: "main",
 	}
 }
 
@@ -300,8 +303,8 @@ func TestUpkeepCoverage_RequiresEveryManifest(t *testing.T) {
 
 // TestUpkeepCoverage_ProductionListing drives the PRODUCTION seam against a
 // fake GitHub: with the run's installation id, and with the installation
-// resolved through the App. It pins the field mapping (user.login, head.ref)
-// and the truncation pass-through.
+// resolved through the App. It pins the field mapping (user.login, head.ref,
+// base.ref, base.repo.default_branch) and the truncation pass-through.
 func TestUpkeepCoverage_ProductionListing(t *testing.T) {
 	report := upkeepAdvisoryExampleReport(t)
 	pull := map[string]any{
@@ -309,6 +312,7 @@ func TestUpkeepCoverage_ProductionListing(t *testing.T) {
 		"title": "deps(backend)(deps): bump golang.org/x/net from 0.22.0 to 0.23.0 in /backend",
 		"body":  nil, "user": map[string]any{"login": upkeep.DependabotAuthor},
 		"head": map[string]any{"ref": "dependabot/go_modules/backend/golang.org/x/net-0.23.0"},
+		"base": map[string]any{"ref": "main", "repo": map[string]any{"default_branch": "main"}},
 	}
 	for _, withInstall := range []bool{true, false} {
 		t.Run(fmt.Sprintf("installation_id=%v", withInstall), func(t *testing.T) {

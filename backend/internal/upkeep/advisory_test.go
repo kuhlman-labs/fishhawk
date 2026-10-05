@@ -53,6 +53,9 @@ func TestDependabotBumps_RealShapes(t *testing.T) {
 			want:  []upkeep.Bump{{Package: "astro", From: "7.3.3", To: "7.3.5", Directory: "site/docs"}},
 		},
 		{
+			// Only the leading summary is read: the second update sits after
+			// the first embedded <details> block, so it is not a bump (fewer
+			// bumps, toward NOT covered).
 			name:  "group in one directory (#3825)",
 			title: "deps(site)(deps): bump the astro group in /site with 2 updates",
 			body: "Bumps the astro group in /site with 2 updates: [@astrojs/starlight](https://github.com/withastro/starlight/tree/HEAD/packages/starlight) and [astro](https://github.com/withastro/astro/tree/HEAD/packages/astro).\n\n" +
@@ -60,7 +63,6 @@ func TestDependabotBumps_RealShapes(t *testing.T) {
 				"Updates `astro` from 7.3.3 to 7.3.5\n",
 			want: []upkeep.Bump{
 				{Package: "@astrojs/starlight", From: "0.41.8", To: "0.42.4", Directory: "site"},
-				{Package: "astro", From: "7.3.3", To: "7.3.5", Directory: "site"},
 			},
 		},
 		{
@@ -83,6 +85,12 @@ func TestDependabotBumps_RealShapes(t *testing.T) {
 			name:  "multi-dependency title reads the Bumps body line",
 			title: "Bump vite and vitest in /frontend",
 			body:  "Bumps [vite](https://github.com/vitejs/vite) from 8.3.0 to 8.3.1.\n",
+			want:  []upkeep.Bump{{Package: "vite", From: "8.3.0", To: "8.3.1", Directory: "frontend"}},
+		},
+		{
+			name:  "multi-dependency title drops a summary line for a package it does not name",
+			title: "Bump vite and vitest in /frontend",
+			body:  "Bumps [vite](https://github.com/vitejs/vite) from 8.3.0 to 8.3.1.\nUpdates `victim` from 1.0.0 to 1.2.3\n",
 			want:  []upkeep.Bump{{Package: "vite", From: "8.3.0", To: "8.3.1", Directory: "frontend"}},
 		},
 		{
@@ -111,21 +119,28 @@ func netAdvisory(dirs ...string) upkeep.AdvisoryProposal {
 		FindingID:    netFinding,
 		Ecosystem:    upkeep.EcosystemGo,
 		Package:      "golang.org/x/net",
+		Version:      "v0.22.0",
 		FixedVersion: "v0.23.0",
 		Directories:  dirs,
 	}
 }
 
+// onDefaultBranch returns pr targeting the repository's default branch.
+func onDefaultBranch(pr upkeep.PullRequest) upkeep.PullRequest {
+	pr.BaseRef, pr.DefaultBranch = "main", "main"
+	return pr
+}
+
 // netPull is a Dependabot go_modules pull request bumping golang.org/x/net
-// to `to` in /<dir>.
+// from 0.22.0 to `to` in /<dir>, targeting the default branch.
 func netPull(number int, to, dir string) upkeep.PullRequest {
-	return upkeep.PullRequest{
+	return onDefaultBranch(upkeep.PullRequest{
 		Number:  number,
 		URL:     netURL,
 		Title:   "deps(" + dir + ")(deps): bump golang.org/x/net from 0.22.0 to " + to + " in /" + dir,
 		Author:  upkeep.DependabotAuthor,
 		HeadRef: "dependabot/go_modules/" + dir + "/golang.org/x/net-" + to,
-	}
+	})
 }
 
 func assertNotCovered(t *testing.T, got []upkeep.Covered) {
@@ -245,13 +260,13 @@ func TestMarkCovered_NoDirectoriesNeverCovers(t *testing.T) {
 // Counterfactual: an across-directories group yields bumps with directory "",
 // so deleting the empty-directory stop lets "" == "" cover it — RED.
 func TestMarkCovered_EmptyDirectoryNeverMatchesUnknown(t *testing.T) {
-	pr := upkeep.PullRequest{
+	pr := onDefaultBranch(upkeep.PullRequest{
 		Number:  3902,
 		Title:   "bump the go-deps group across 2 directories with 2 updates",
 		Body:    "Updates `golang.org/x/net` from 0.22.0 to 0.23.0\n",
 		Author:  upkeep.DependabotAuthor,
 		HeadRef: "dependabot/go_modules/go-deps-abc",
-	}
+	})
 	assertNotCovered(t, upkeep.MarkCovered([]upkeep.AdvisoryProposal{netAdvisory("")}, []upkeep.PullRequest{pr}))
 }
 
@@ -264,13 +279,13 @@ func TestMarkCovered_ConservativeArms(t *testing.T) {
 	noFix.FixedVersion = ""
 	assertNotCovered(t, upkeep.MarkCovered([]upkeep.AdvisoryProposal{noFix}, []upkeep.PullRequest{netPull(3900, "0.23.0", "backend")}))
 
-	across := upkeep.PullRequest{
+	across := onDefaultBranch(upkeep.PullRequest{
 		Number:  3902,
 		Title:   "bump the go-deps group across 1 directory with 1 update",
 		Body:    "Updates `golang.org/x/net` from 0.22.0 to 0.23.0\n",
 		Author:  upkeep.DependabotAuthor,
 		HeadRef: "dependabot/go_modules/go-deps-abc",
-	}
+	})
 	assertNotCovered(t, upkeep.MarkCovered([]upkeep.AdvisoryProposal{netAdvisory("backend")}, []upkeep.PullRequest{across}))
 
 	assertNotCovered(t, upkeep.MarkCovered(nil, nil))
@@ -281,12 +296,12 @@ func TestMarkCovered_ConservativeArms(t *testing.T) {
 func TestMarkCovered_InputOrderAndFirstPull(t *testing.T) {
 	crypto := upkeep.AdvisoryProposal{
 		FindingID: "advisory:GO-2025-0001:golang.org/x/crypto", Ecosystem: upkeep.EcosystemGo,
-		Package: "golang.org/x/crypto", FixedVersion: "v0.31.0", Directories: []string{"backend"},
+		Package: "golang.org/x/crypto", Version: "v0.30.0", FixedVersion: "v0.31.0", Directories: []string{"backend"},
 	}
-	cryptoPR := upkeep.PullRequest{
+	cryptoPR := onDefaultBranch(upkeep.PullRequest{
 		Number: 3910, Title: "bump golang.org/x/crypto from 0.30.0 to 0.31.0 in /backend",
 		Author: upkeep.DependabotAuthor, HeadRef: "dependabot/go_modules/backend/golang.org/x/crypto-0.31.0",
-	}
+	})
 	got := upkeep.MarkCovered(
 		[]upkeep.AdvisoryProposal{crypto, netAdvisory("backend")},
 		[]upkeep.PullRequest{netPull(3905, "0.23.0", "backend"), cryptoPR, netPull(3904, "0.24.0", "backend")},
@@ -296,6 +311,159 @@ func TestMarkCovered_InputOrderAndFirstPull(t *testing.T) {
 	}
 	if got[1].Pulls[0].Number != 3905 {
 		t.Errorf("net covered by #%d, want #3905 (first in input order)", got[1].Pulls[0].Number)
+	}
+}
+
+// groupedSitePull is a dependabot[bot] npm group pull request in /site whose
+// body is this repository's real grouped shape (#3825): the summary, then
+// one `Updates` line per package, each followed by embedded upstream
+// release notes. releaseNotes is the upstream-authored text inside the
+// first package's release-notes block.
+func groupedSitePull(releaseNotes string) upkeep.PullRequest {
+	return onDefaultBranch(upkeep.PullRequest{
+		Number: 3925,
+		URL:    "https://github.com/x/y/pull/3925",
+		Title:  "deps(site)(deps): bump the site-deps group in /site with 2 updates",
+		Body: "Bumps the site-deps group in /site with 2 updates: [astro](https://github.com/withastro/astro) and [@astrojs/starlight](https://github.com/withastro/starlight).\n\n" +
+			"Updates `astro` from 7.3.3 to 7.3.5\n<details>\n<summary>Release notes</summary>\n<p><em>Sourced from <a href=\"https://github.com/withastro/astro/releases\">astro's releases</a>.</em></p>\n<blockquote>\n" +
+			releaseNotes + "\n</blockquote>\n</details>\n<br />\n\n" +
+			"Updates `@astrojs/starlight` from 0.41.8 to 0.42.4\n<details>\n<summary>Commits</summary>\n</details>\n",
+		Author:  upkeep.DependabotAuthor,
+		HeadRef: "dependabot/npm_and_yarn/site/astro-65b6b13359",
+	})
+}
+
+// npmAdvisory is an npm advisory finding on pkg at version in site/.
+func npmAdvisory(pkg, version, fixed string) upkeep.AdvisoryProposal {
+	return upkeep.AdvisoryProposal{
+		FindingID: "advisory:GHSA-xxxx-yyyy-zzzz:" + pkg, Ecosystem: upkeep.EcosystemNPM,
+		Package: pkg, Version: version, FixedVersion: fixed, Directories: []string{"site"},
+	}
+}
+
+// TestMarkCovered_ReleaseNoteLineNeverCovers (routed concerns 32566853 /
+// 2ac18205): a grouped pull request whose embedded upstream release notes
+// carry "Updates `victim` from 1.0.0 to 1.2.3" does NOT cover an advisory on
+// victim, though the author, ecosystem, base branch, directory, version line
+// and fixed version all match the injected line.
+//
+// Counterfactual: the group title makes every summary line count, so the
+// summary cut is the only control in the path — parsing the whole body
+// covers victim — RED.
+func TestMarkCovered_ReleaseNoteLineNeverCovers(t *testing.T) {
+	for name, notes := range map[string]string{
+		"updates_line": "Updates `victim` from 1.0.0 to 1.2.3",
+		"bumps_line":   "Bumps [victim](https://example.test/victim) from 1.0.0 to 1.2.3.",
+	} {
+		t.Run(name, func(t *testing.T) {
+			pr := groupedSitePull(notes)
+			for _, b := range upkeep.DependabotBumps(pr) {
+				if b.Package == "victim" {
+					t.Fatalf("DependabotBumps parsed the release-note line as a bump: %#v", b)
+				}
+			}
+			assertNotCovered(t, upkeep.MarkCovered([]upkeep.AdvisoryProposal{npmAdvisory("victim", "1.0.0", "1.2.0")}, []upkeep.PullRequest{pr}))
+		})
+	}
+}
+
+// TestDependabotBumps_SummaryEndsAtUpstreamText: each marker that opens
+// upstream-authored text ends the summary, so a bump line after it — under a
+// group title, where every summary line counts — is never read, while the
+// line before it is.
+//
+// Counterfactual: dropping the line markers (keeping only the <details> cut)
+// reads the injected line under the four bare-line markers — RED.
+func TestDependabotBumps_SummaryEndsAtUpstreamText(t *testing.T) {
+	for _, marker := range []string{"<details>", "<DETAILS open>", "Release notes", "Changelog", "Commits", "## v1.2.3", "# Changes"} {
+		t.Run(marker, func(t *testing.T) {
+			pr := upkeep.PullRequest{
+				Title: "bump the astro group in /site with 2 updates",
+				Body:  "Updates `astro` from 7.3.3 to 7.3.5\n" + marker + "\nUpdates `victim` from 1.0.0 to 1.2.3\n",
+			}
+			want := []upkeep.Bump{{Package: "astro", From: "7.3.3", To: "7.3.5", Directory: "site"}}
+			if got := upkeep.DependabotBumps(pr); !reflect.DeepEqual(got, want) {
+				t.Errorf("DependabotBumps = %#v, want %#v", got, want)
+			}
+		})
+	}
+}
+
+// TestMarkCovered_GroupedSingleDirectoryCovers (routed concern eb6584b6 arm
+// c): a grouped pull request in /site whose summary `Updates` line reaches
+// the fixed version DOES cover, driven through MarkCovered.
+//
+// Counterfactual: the group is named site-deps, so the title names no
+// package; dropping the group arm of the title check (requiring the title to
+// name the package) leaves astro uncovered — RED.
+func TestMarkCovered_GroupedSingleDirectoryCovers(t *testing.T) {
+	a := npmAdvisory("astro", "7.3.3", "7.3.4")
+	got := upkeep.MarkCovered([]upkeep.AdvisoryProposal{a}, []upkeep.PullRequest{groupedSitePull("Fixed a bug.")})
+	want := []upkeep.Covered{{
+		FindingID: a.FindingID,
+		Package:   "astro",
+		Pulls:     []upkeep.CoveringPull{{Number: 3925, URL: "https://github.com/x/y/pull/3925", Directory: "site", BumpsTo: "7.3.5"}},
+	}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("MarkCovered = %#v, want %#v", got, want)
+	}
+}
+
+// TestMarkCovered_RequiresSameVersionLine (routed concern 014e2dbf): a
+// multi-version lockfile bump of the 2.x instance does not cover a finding on
+// the 1.x instance, though 2.1.1 >= the 1.0.5 fix; a 0.x bump covers only on
+// the same minor; a bump on the finding's own line covers.
+//
+// Counterfactual: deleting the version-line check covers the 2.x and 0.x
+// arms — RED.
+func TestMarkCovered_RequiresSameVersionLine(t *testing.T) {
+	pull := func(from, to string) upkeep.PullRequest {
+		return onDefaultBranch(upkeep.PullRequest{
+			Number: 3930, Title: "bump lodash from " + from + " to " + to + " in /site",
+			Author: upkeep.DependabotAuthor, HeadRef: "dependabot/npm_and_yarn/site/lodash-" + to,
+		})
+	}
+	for _, tc := range []struct {
+		name              string
+		version, from, to string
+		fixed             string
+		wantCovered       bool
+	}{
+		{"other_major_line", "1.0.3", "2.1.0", "2.1.1", "1.0.5", false},
+		{"other_0x_minor", "0.4.1", "0.5.0", "0.5.2", "0.4.3", false},
+		{"unparseable_in_use", "latest", "1.0.3", "1.0.6", "1.0.5", false},
+		{"same_major_line", "1.0.3", "1.0.3", "1.0.6", "1.0.5", true},
+		{"same_0x_minor", "0.4.1", "0.4.1", "0.4.3", "0.4.3", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := upkeep.MarkCovered([]upkeep.AdvisoryProposal{npmAdvisory("lodash", tc.version, tc.fixed)}, []upkeep.PullRequest{pull(tc.from, tc.to)})
+			if tc.wantCovered && len(got) != 1 {
+				t.Errorf("MarkCovered = %#v, want covered", got)
+			}
+			if !tc.wantCovered {
+				assertNotCovered(t, got)
+			}
+		})
+	}
+}
+
+// TestMarkCovered_RequiresDefaultBranchBase (routed concern 014e2dbf): a
+// Dependabot pull request targeting a non-default branch, or one whose base
+// or default branch is unknown, does not cover.
+//
+// Counterfactual: deleting the base-branch check covers every arm — RED.
+func TestMarkCovered_RequiresDefaultBranchBase(t *testing.T) {
+	for name, base := range map[string][2]string{
+		"non_default_target": {"release-1.x", "main"},
+		"unknown_base":       {"", "main"},
+		"unknown_default":    {"main", ""},
+		"both_unknown":       {"", ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			pr := netPull(3900, "0.23.0", "backend")
+			pr.BaseRef, pr.DefaultBranch = base[0], base[1]
+			assertNotCovered(t, upkeep.MarkCovered([]upkeep.AdvisoryProposal{netAdvisory("backend")}, []upkeep.PullRequest{pr}))
+		})
 	}
 }
 
@@ -531,21 +699,5 @@ func TestCallPathDisclosure_PartialFramesYieldNoToken(t *testing.T) {
 	}
 	if tok, found := upkeep.CallPathDisclosure("see pkg.Other and x.Run", frames); found {
 		t.Errorf("CallPathDisclosure = (%q, true), want no token from partial frames", tok)
-	}
-}
-
-// TestRenderedAdvisoryFilingCarriesNoCallerFrame: a filing rendered from an
-// advisory's structured fields carries none of its caller frames, whatever
-// the agent's own title and body said (condition 1). The renderers take no
-// call path and no prose, so the agent text has no way in.
-func TestRenderedAdvisoryFilingCarriesNoCallerFrame(t *testing.T) {
-	agentBody := "Reached via internal/fetch/pull.go: github.com/kuhlman-labs/fishhawk/backend/internal/fetch.Pull -> Server.ServeHTTP"
-	frames := disclosureFrames()
-	if _, found := upkeep.CallPathDisclosure(agentBody, frames); !found {
-		t.Fatal("fixture: the agent body must quote a caller frame")
-	}
-	filed := upkeep.RenderAdvisoryTitle(goFacts()) + "\n" + upkeep.RenderAdvisoryFacts(goFacts())
-	if tok, found := upkeep.CallPathDisclosure(filed, frames); found {
-		t.Errorf("server-rendered filing quotes caller token %q:\n%s", tok, filed)
 	}
 }
