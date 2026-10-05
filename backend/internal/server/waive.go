@@ -194,6 +194,9 @@ func (s *Server) handleWaiveConcern(w http.ResponseWriter, r *http.Request) {
 	if subject == "" {
 		subject = "anonymous"
 	}
+	// Delegation shadow stamp (E82.1 / #3778): captured on the PRE-decision
+	// state (the concern still open), recorded only after the waive landed.
+	shadow := s.captureDelegationShadow(r.Context(), row.RunID, delegation.ActionWaive, subject, reqBody.Delegated)
 	updated, err := s.applyConcernWaive(r.Context(), row, reqBody.Reason, subject,
 		actorKindForSubject(subject), delegatedRule, false)
 	if err != nil {
@@ -221,6 +224,8 @@ func (s *Server) handleWaiveConcern(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	stageID := row.StageID
+	s.recordDelegationShadow(r.Context(), shadow, &stageID, "waive", CategoryConcernWaived, []uuid.UUID{updated.ID})
 	s.writeJSON(w, r, http.StatusOK, waiveConcernResponse{
 		ID:          updated.ID,
 		RunID:       updated.RunID,

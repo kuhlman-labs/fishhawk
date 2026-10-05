@@ -138,9 +138,7 @@ func TestFixupStage_HappyPath(t *testing.T) {
 	}
 
 	// One stage_fixup_triggered audit entry with the selected concern.
-	if len(au.appended) != 1 {
-		t.Fatalf("audit entries = %d, want 1", len(au.appended))
-	}
+	assertDecisionThenOneStamp(t, au.appended, CategoryStageFixupTriggered)
 	got := au.appended[0]
 	if got.Category != CategoryStageFixupTriggered {
 		t.Errorf("audit category = %q, want %s", got.Category, CategoryStageFixupTriggered)
@@ -417,9 +415,7 @@ func TestFixupStage_AllowCreatePersisted(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
 	}
-	if len(au.appended) != 1 {
-		t.Fatalf("audit entries = %d, want 1", len(au.appended))
-	}
+	assertDecisionThenOneStamp(t, au.appended, CategoryStageFixupTriggered)
 	var payload struct {
 		AllowCreate []string `json:"allow_create"`
 	}
@@ -513,9 +509,7 @@ func TestFixupStage_PushOpenPRReopensAndReparks(t *testing.T) {
 	}
 
 	// One audit entry carrying the re-parked review stage id.
-	if len(au.appended) != 1 {
-		t.Fatalf("audit entries = %d, want 1", len(au.appended))
-	}
+	assertDecisionThenOneStamp(t, au.appended, CategoryStageFixupTriggered)
 	var payload map[string]any
 	if err := json.Unmarshal(au.appended[0].Payload, &payload); err != nil {
 		t.Fatalf("unmarshal audit payload: %v", err)
@@ -2729,9 +2723,7 @@ func TestFixupStage_ConcernIDs_RoutesExactConcern(t *testing.T) {
 
 	// The audit payload records the routed stable ID alongside the
 	// embedded concern copy the prompt renderer reads back.
-	if len(au.appended) != 1 {
-		t.Fatalf("audit entries = %d, want 1", len(au.appended))
-	}
+	assertDecisionThenOneStamp(t, au.appended, CategoryStageFixupTriggered)
 	var payload map[string]any
 	if err := json.Unmarshal(au.appended[0].Payload, &payload); err != nil {
 		t.Fatalf("unmarshal audit payload: %v", err)
@@ -3124,9 +3116,7 @@ func TestFixupStage_ApplyEligibleRecorded_PositionalPath(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
 	}
-	if len(au.appended) != 1 {
-		t.Fatalf("audit entries = %d, want 1", len(au.appended))
-	}
+	assertDecisionThenOneStamp(t, au.appended, CategoryStageFixupTriggered)
 	var payload struct {
 		ApplyEligible bool                 `json:"apply_eligible"`
 		Concerns      []planreview.Concern `json:"concerns"`
@@ -3284,9 +3274,7 @@ func TestFixupStage_OperatorConcernOnly_NotFixupNotApplicable(t *testing.T) {
 	if strings.Contains(w.Body.String(), "fixup_not_applicable") {
 		t.Errorf("operator-concern-only must NOT surface fixup_not_applicable: %s", w.Body.String())
 	}
-	if len(au.appended) != 1 {
-		t.Fatalf("audit entries = %d, want 1", len(au.appended))
-	}
+	assertDecisionThenOneStamp(t, au.appended, CategoryStageFixupTriggered)
 }
 
 // TestFixupStage_OperatorConcernWithConcernIDs_FoldsBoth: an operator_concern
@@ -4235,9 +4223,7 @@ func TestFixupStage_ConcernIDs_SupersededRouted(t *testing.T) {
 	}
 	// The reviewer provenance the free-text operator_concern fallback destroys
 	// survives onto the trigger payload.
-	if len(au.appended) != 1 {
-		t.Fatalf("audit entries = %d, want 1", len(au.appended))
-	}
+	assertDecisionThenOneStamp(t, au.appended, CategoryStageFixupTriggered)
 	var payload map[string]any
 	if err := json.Unmarshal(au.appended[0].Payload, &payload); err != nil {
 		t.Fatalf("unmarshal audit payload: %v", err)
@@ -4630,9 +4616,7 @@ func TestFixupStage_RepoConventionConcernRoutes(t *testing.T) {
 			if c.State != concern.StateAddressedPending {
 				t.Errorf("concern state = %q, want addressed_pending", c.State)
 			}
-			if len(au.appended) != 1 || au.appended[0].Category != CategoryStageFixupTriggered {
-				t.Fatalf("audit = %+v, want one %s row", au.appended, CategoryStageFixupTriggered)
-			}
+			assertDecisionThenOneStamp(t, au.appended, CategoryStageFixupTriggered)
 		})
 	}
 }
@@ -4677,7 +4661,5 @@ func TestFixupStage_RepoConventionConcernRoutes_PositionalPath(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
 	}
-	if len(au.appended) != 1 || au.appended[0].Category != CategoryStageFixupTriggered {
-		t.Fatalf("audit = %+v, want one %s row", au.appended, CategoryStageFixupTriggered)
-	}
+	assertDecisionThenOneStamp(t, au.appended, CategoryStageFixupTriggered)
 }

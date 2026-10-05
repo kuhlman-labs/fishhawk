@@ -263,6 +263,11 @@ func (s *Server) handleBulkWaiveConcerns(w http.ResponseWriter, r *http.Request)
 	}
 	actorKind := actorKindForSubject(subject)
 
+	// Delegation shadow stamp (E82.1 / #3778): ONE capture per request (one
+	// run), on the PRE-decision state, recorded only when a waive landed.
+	shadow := s.captureDelegationShadow(r.Context(), runID, delegation.ActionWaive, subject, reqBody.Delegated)
+	var waivedIDs []uuid.UUID
+
 	resp := bulkWaiveResponse{
 		RunID:   runID.String(),
 		Reason:  reqBody.Reason,
@@ -288,11 +293,15 @@ func (s *Server) handleBulkWaiveConcerns(w http.ResponseWriter, r *http.Request)
 			continue
 		}
 		item.Applied = true
+		waivedIDs = append(waivedIDs, row.ID)
 		item.State = string(updated.State)
 		item.StateReason = updated.StateReason
 		resp.Waived++
 		resp.Results = append(resp.Results, item)
 	}
 
+	if len(waivedIDs) > 0 {
+		s.recordDelegationShadow(r.Context(), shadow, nil, "waive", CategoryConcernWaived, waivedIDs)
+	}
 	s.writeJSON(w, r, http.StatusOK, resp)
 }

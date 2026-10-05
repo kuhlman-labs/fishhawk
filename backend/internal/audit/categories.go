@@ -264,6 +264,13 @@ import "sort"
 // INTERNAL, NOT an issue-comment activity category — like the other upkeep
 // rows it is read through GET /v0/runs/{id}/audit only
 // (docs/issue-comment-surfaces.md is untouched).
+// E82.1 / #3778 (ADR-085 rule 4) added delegation_shadow_evaluated, the
+// record-only BLIND shadow stamp: server/delegation_shadow.go appends one,
+// actor system, after a HUMAN's decision on a delegable class (approve,
+// route_fixup, waive, retry, merge), recording what delegation would have done
+// on the pre-decision state. It grants nothing, is INTERNAL, and must never be
+// an issue-comment activity category (docs/issue-comment-surfaces.md records
+// it as deliberately not a surface).
 var KnownCategories = map[string]struct{}{
 	"acceptance_dispatched":                   {},
 	"acceptance_outcome_recorded":             {},
@@ -341,6 +348,7 @@ var KnownCategories = map[string]struct{}{
 	"crew_work_request_filed":                 {},
 	"delegation_confirmed":                    {},
 	"delegation_lower_proposed":               {},
+	"delegation_shadow_evaluated":             {},
 	"deploy_preflight_refused":                {},
 	"deploy_run":                              {},
 	"deployment_dispatch_failed":              {},
