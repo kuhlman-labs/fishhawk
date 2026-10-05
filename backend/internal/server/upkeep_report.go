@@ -185,6 +185,11 @@ func upkeepGuardRecognizedKind(kind string) bool {
 // critical section and never fail the ingest: a degraded dedupe or coverage
 // read is recorded (dedupe_degraded / coverage_degraded, a named reason, an
 // empty duplicates / covered array), not hidden.
+//
+// The ingest deliberately starts NO in-flight advisory pass (#3763): the
+// recorded report is unratified scanner output, and only the captain-approved
+// apply (applyApprovedUpkeep -> startUpkeepInflightPass) may carry an advisory
+// to another run.
 func (s *Server) handleUpkeepReport(w http.ResponseWriter, r *http.Request, runID, stageID uuid.UUID, stage *run.Stage, body []byte) {
 	ctx := r.Context()
 	if stage.Type != run.StageTypePlan {

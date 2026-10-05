@@ -2179,6 +2179,17 @@ Notes:
   through the quarantine envelope. Listed here so a future
   reader grepping the audit categories doesn't mistake them for comment
   surfaces.
+- The in-flight advisory pass kind — `upkeep_inflight_pass_completed` (E80.6 /
+  #3763) — is an **internal, audit-only category, not an issue-comment
+  surface**, like the other upkeep rows (`upkeep_report_recorded`,
+  `upkeep_apply_completed`, …). It is the pass's ONE summary row on the scan
+  run, written by `backend/internal/server/upkeep_inflight.go` under the system
+  actor after the captain-approved upkeep apply. Nothing in `issuecomment`
+  posts it, it has no Notifier method, and it is not in `activityCategories`.
+  The findings the pass sends to OTHER runs are ordinary `crew_message_sent`
+  entries (sender `security`), so they reach a reader only through the crew
+  quarantine envelope and the gate view, never an issue comment. Contract:
+  `backend/internal/server/README.md` § "In-flight advisory findings".
 - The board-state-sync kind — `work_item_transitioned` (#1012) — is an
   **internal, audit-only category, not an issue-comment surface**. Nothing in
   `issuecomment` posts it; it has no Notifier method. It is written under its
