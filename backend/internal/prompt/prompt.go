@@ -5580,6 +5580,13 @@ func buildGroomingPropose(t Trigger) (string, error) {
 	return b.String(), nil
 }
 
+// UpkeepGovulncheckModule is the pinned govulncheck the upkeep scan prompt's
+// `### Advisories` section falls back to (`go run <module> -json ./...`) when
+// no govulncheck binary is on PATH (#3750). v1.7.0 is the version the
+// captured backend/internal/plan/testdata fixtures were produced with; v1.8.0
+// requires go >= 1.26, above this repository's go1.25 pin.
+const UpkeepGovulncheckModule = "golang.org/x/vuln/cmd/govulncheck@v1.7.0"
+
 // UpkeepFactWithheld is the fixed marker buildUpkeepScan renders in place of an
 // evidence string that fails upkeepFact's charset gate (#3922).
 const UpkeepFactWithheld = "[withheld: non-conforming value]"
@@ -5627,8 +5634,8 @@ func upkeepFact(v string) string {
 
 // buildUpkeepScan renders the upkeep SCAN prompt (#3922): a plan-typed stage
 // declaring `produces: upkeep_report` emits an upkeep_report_v1 artifact — the
-// flake, toolchain-drift and deprecation findings over the repository, each
-// proposing an issue — NOT a standard_v1 implementation plan. Modelled on
+// flake, toolchain-drift, deprecation and advisory (#3750) findings over the
+// repository, each proposing an issue — NOT a standard_v1 implementation plan. Modelled on
 // buildGroomingPropose: its optional-channel blocks are scan-worded copies of
 // buildPlan's rather than shared helpers, so buildPlan's bytes stay pinned by
 // the pre-change golden.
@@ -5700,13 +5707,14 @@ func buildUpkeepScan(t Trigger) string {
 	planMins := resolveMins(t.PlanStageTimeout)
 	fmt.Fprintf(&b,
 		"Stage budget (ADR-025): upkeep scan stage %d minutes. If a source cannot be scanned within the budget, "+
-			"leave it out of sources_scanned and say so in summary rather than emitting an unsupported finding.\n\n",
+			"leave it out of sources_scanned AND name it in source_degrades (reason `budget_exceeded`) rather than "+
+			"emitting an unsupported finding.\n\n",
 		planMins,
 	)
 
 	kind := string(plan.ArtifactKindUpkeepReport)
 	b.WriteString("### Your task: emit an upkeep report, NOT an implementation plan\n\n")
-	b.WriteString("This stage emits a `" + kind + "` artifact — the flake, toolchain-drift and deprecation findings over " +
+	b.WriteString("This stage emits a `" + kind + "` artifact — the flake, toolchain-drift, deprecation and advisory findings over " +
 		"this repository, each proposing one issue. It does NOT produce an implementation plan and it changes no code. " +
 		"Write the report as a single JSON object to `")
 	b.WriteString(PlanArtifactPath)
@@ -5718,11 +5726,19 @@ func buildUpkeepScan(t Trigger) string {
 		"(`https://github.com/<owner>/<repo>/issues`) with id `<owner>/<repo>`, and says in `summary` that the scan " +
 		"had no triggering issue.\n")
 	b.WriteString("- `sources_scanned` lists ONLY the sources you actually scanned (`flake`, `toolchain_drift`, " +
-		"`deprecation`). An empty `findings` array with a source listed reads \"scanned, none found\" — never list " +
+		"`deprecation`, `advisory`). An empty `findings` array with a source listed reads \"scanned, none found\" — never list " +
 		"a source you did not scan. A source scanned only partly (see the degrades in the facts below) is still " +
 		"listed, and `summary` names what was missed.\n")
+	b.WriteString("- `source_degrades` names each source that did not run or ran only in part, at most one entry per " +
+		"source: `{source, reason, detail}` with `reason` one of `" + plan.UpkeepDegradeNetworkUnavailable + "`, `" +
+		plan.UpkeepDegradeToolUnavailable + "`, `" + plan.UpkeepDegradeToolFailed + "`, `" + plan.UpkeepDegradeBudgetExceeded +
+		"` (the source did NOT run, so it is NOT in sources_scanned) or `" + plan.UpkeepDegradePartial + "` (it ran in part, " +
+		"so it IS in sources_scanned). The `advisory` source MUST be accounted for in exactly ONE place: listed in " +
+		"sources_scanned when it ran, or named in source_degrades with the reason it did not run — never neither, and " +
+		"never an empty, clean-looking advisory scan that did not run.\n")
 	b.WriteString("- Every finding's `id` is DERIVED as `<source>:<subject>` (e.g. `flake:TestWidgetSync`, " +
-		"`toolchain_drift:golangci-lint`) and never minted per run, so the same finding keeps the same id run over run.\n")
+		"`toolchain_drift:golangci-lint`, `advisory:GO-2024-2687:golang.org/x/net`) and never minted per run, so the " +
+		"same finding keeps the same id run over run.\n")
 	b.WriteString("- `flake` findings: cite at least one run evidence ref per flake, copying `run_id` and `stage_id` " +
 		"VERBATIM from the facts below. Never invent a run id.\n")
 	b.WriteString("- `toolchain_drift` findings: cite one file evidence ref per occurrence, copying `path`, `line` and " +
@@ -5733,7 +5749,9 @@ func buildUpkeepScan(t Trigger) string {
 	b.WriteString("- `proposed_issue` carries `title`, `body`, `type` and `labels`. Propose `area:*` and `type:*` " +
 		"labels freely; an `autonomy:*` label is only a suggestion — it is applied ONLY if the captain authorizes it " +
 		"at the gate, and stripped otherwise.\n")
-	b.WriteString("See docs/spec/upkeep-report-v1.md for the normative schema and semantic rules — do NOT restate the " +
+	b.WriteString("- `advisory` findings: see `### Advisories` below.\n")
+	b.WriteString("See docs/spec/upkeep-report-v1.md for the normative schema and semantic rules (and " +
+		"docs/spec/examples/upkeep-report-v1-advisory-example.json for advisory findings) — do NOT restate the " +
 		"whole schema, follow it.\n\n")
 	b.WriteString("Do NOT emit any standard_v1 plan field (scope, approach, verification, decomposition, " +
 		"model_recommendation, predicted_runtime_minutes): " + plan.UpkeepReportVersion + " is " +
@@ -5751,17 +5769,95 @@ func buildUpkeepScan(t Trigger) string {
 		"of `go list -m -json all`).\n" +
 		"These commands are READ-ONLY: never install, upgrade or modify anything, and never write a file other than " +
 		"the report. If a command needs network access that is unavailable, leave `deprecation` out of " +
-		"sources_scanned (or name the gap in `summary` when it was scanned partly).\n\n")
+		"sources_scanned AND name it in source_degrades (reason `" + plan.UpkeepDegradeNetworkUnavailable + "`); when " +
+		"it was scanned partly, list it and add a `" + plan.UpkeepDegradePartial + "` degrade.\n\n")
+
+	writeUpkeepAdvisories(&b)
 
 	b.WriteString("### Excluded: dependency bumps\n\n")
-	b.WriteString("NEVER propose a finding whose remedy is a dependency version bump — Dependabot already covers " +
-		"those. A deprecation finding names OUR deprecated USE (the call site, the import, the config key) and its " +
-		"remedy is changing that use, not upgrading a module.\n\n")
+	b.WriteString("For the `flake`, `toolchain_drift` and `deprecation` sources, NEVER propose a finding whose remedy " +
+		"is a dependency version bump — Dependabot already covers those. A deprecation finding names OUR deprecated " +
+		"USE (the call site, the import, the config key) and its remedy is changing that use, not upgrading a " +
+		"module. This exclusion does NOT apply to the `advisory` source: an advisory finding's remedy may be a bump, " +
+		"and it is reported even when a Dependabot pull request already proposes that bump.\n\n")
 
 	b.WriteString("You yourself perform NO tracker writes and NO code changes — an upkeep scan produces no diff, so no " +
 		"source file is to be modified.\n\n")
 
 	return b.String()
+}
+
+// writeUpkeepAdvisories renders the upkeep scan's `### Advisories` section
+// (#3750): the READ-ONLY scanner commands the agent runs in its worktree, the
+// classification rules that map scanner output onto the advisory object, the
+// named degradation rule, the disclosure rule and the coverage note. The
+// server cannot re-run a scanner, so these rules are what the plan package's
+// semantic rules (l)-(t) bound the agent's claim against. OSV is RESERVED in
+// the schema and deliberately not instructed.
+func writeUpkeepAdvisories(b *strings.Builder) {
+	b.WriteString("### Advisories\n\n")
+	b.WriteString("The `" + plan.UpkeepSourceAdvisory + "` source is yours to scan: dependencies named by a published " +
+		"vulnerability advisory. Run these READ-ONLY commands in your worktree — never install, upgrade, `--fix` or " +
+		"modify anything:\n" +
+		"- Go: in EACH directory holding a `go.mod` (every `use` directory of `go.work`, and the repository root when " +
+		"it has its own `go.mod`), run `govulncheck -json ./...`. When no `govulncheck` binary is on PATH, run the " +
+		"pinned `go run " + UpkeepGovulncheckModule + " -json ./...` instead.\n" +
+		"- npm: in EACH directory holding a `pnpm-lock.yaml`, run `pnpm audit --json`. Never `pnpm install` and " +
+		"never `pnpm audit --fix`. `pnpm audit` exits NON-ZERO when it finds vulnerabilities — that is its findings " +
+		"report, NOT `" + plan.UpkeepDegradeToolFailed + "`: read its JSON output.\n" +
+		"- Do NOT run an OSV scanner. The `" + plan.UpkeepScannerOSV + "` scanner value is RESERVED; never emit it.\n\n")
+
+	b.WriteString("Classify each advisory into ONE finding with `source: " + plan.UpkeepSourceAdvisory + "` and an " +
+		"`advisory` object:\n")
+	b.WriteString("- govulncheck (`ecosystem: " + plan.UpkeepEcosystemGo + "`, `scanner: " + plan.UpkeepScannerGovulncheck +
+		"`): per OSV id take the DEEPEST finding level reported (a trace frame with a function, else a package, else " +
+		"a module only) and copy that finding's `trace` VERBATIM as `call_path` — govulncheck's own frame fields, in " +
+		"its order. Index 0 is the vulnerable end: keep it, and when the trace is longer than " +
+		fmt.Sprint(plan.UpkeepMaxCallPathFrames) + " frames keep frames 0-" + fmt.Sprint(plan.UpkeepMaxCallPathFrames-1) +
+		" and truncate the far end. `reachability` follows call_path[0]: a function is `" + plan.UpkeepReachabilityCalled +
+		"`, a package `" + plan.UpkeepReachabilityImported + "`, a module only `" + plan.UpkeepReachabilityRequired + "`.\n")
+	b.WriteString("- For Go, `package` is the MODULE path (call_path[0]'s `module`, e.g. `golang.org/x/net`), never a " +
+		"package path inside the module. `version` is the in-use module version.\n")
+	b.WriteString("- pnpm audit (`ecosystem: " + plan.UpkeepEcosystemNPM + "`, `scanner: " + plan.UpkeepScannerPnpmAudit +
+		"`): `reachability: " + plan.UpkeepReachabilityUnanalyzed + "` with NO `call_path`; `package` is the npm " +
+		"package name and `version` the in-use version from the lockfile.\n")
+	b.WriteString("- `advisory_ids` lists every id of the advisory, primary first (the OSV/GHSA id, then its CVE and " +
+		"GHSA aliases).\n")
+	b.WriteString("- `fixed_version` is ONE bare version — the lowest patched version on the in-use major line (reduce a " +
+		"`patched_versions` range such as `>=7.3.5` to `7.3.5`) — or JSON `null` when no fix is published (an empty " +
+		"or absent fixed version is `null`; the key itself is required). NEVER a range: no `<`, `>`, `=`, `^`, `~`, " +
+		"`|`, `*`, whitespace or comma.\n")
+	b.WriteString("- MERGE: emit ONE finding per (primary advisory id, package). When the same advisory hits the same " +
+		"package in several modules or lockfiles, the one finding cites EVERY manifest where the package appears, " +
+		"`version` is the LOWEST in-use version among them, and `reachability`/`call_path` come from the module " +
+		"with the strongest reachability.\n")
+	b.WriteString("- `subject` is `<advisory_ids[0]>:<package>`, so the id is `advisory:<advisory_ids[0]>:<package>`.\n")
+	b.WriteString("- Severity: `" + plan.UpkeepReachabilityCalled + "` -> `" + plan.UpkeepSeverityHigh + "` unless the " +
+		"advisory is clearly low impact; `" + plan.UpkeepReachabilityImported + "` and `" + plan.UpkeepReachabilityRequired +
+		"` -> `" + plan.UpkeepSeverityLow + "`; `" + plan.UpkeepReachabilityUnanalyzed + "` (pnpm) -> at most `" +
+		plan.UpkeepSeverityMedium + "`.\n")
+	b.WriteString("- Evidence: cite EVERY manifest as a file ref — a repository-relative path with basename " +
+		"`go.mod`, `pnpm-lock.yaml` or `package.json`. A call-site source file may also be cited, but it never " +
+		"stands in for a manifest. The manifests you cite are the directories a covering Dependabot pull request " +
+		"must reach, so an omitted manifest can let a bump that misses it read as covering the advisory.\n\n")
+
+	b.WriteString("Degradation: when the vulnerability database or the package registry is unreachable (no network), " +
+		"leave `" + plan.UpkeepSourceAdvisory + "` OUT of sources_scanned and emit `source_degrades: [{source: " +
+		plan.UpkeepSourceAdvisory + ", reason: " + plan.UpkeepDegradeNetworkUnavailable + ", detail}]` (`" +
+		plan.UpkeepDegradeToolUnavailable + "` when neither govulncheck nor the pinned fallback can run, `" +
+		plan.UpkeepDegradeToolFailed + "` when every scan errored, `" + plan.UpkeepDegradeBudgetExceeded + "` when the " +
+		"budget ran out before any finished). When some modules or lockfiles were scanned and others were not, list " +
+		"`" + plan.UpkeepSourceAdvisory + "` AND add a `" + plan.UpkeepDegradePartial + "` degrade whose detail names " +
+		"what was missed. NEVER emit an empty, clean-looking advisory scan that did not run.\n\n")
+
+	b.WriteString("Disclosure: NEVER quote call-path frames — caller function or receiver names, file names or " +
+		"positions — in `proposed_issue.title` or `proposed_issue.body`. Those carry only the advisory ids, the " +
+		"package, the in-use and fixed versions (or \"no fix\"), the reachability class and the severity. The " +
+		"`call_path` belongs in the advisory object only: the server renders a filed advisory issue from the " +
+		"structured advisory fields, and agent prose quoting the call path never reaches the tracker.\n\n")
+
+	b.WriteString("Coverage: report an advisory even when an open Dependabot pull request already bumps the package " +
+		"past the fix. Do not drop it yourself — the server marks it covered and skips filing it.\n\n")
 }
 
 // writeUpkeepFacts renders the server-gathered evidence block. It is labelled
