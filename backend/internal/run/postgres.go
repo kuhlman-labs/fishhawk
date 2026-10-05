@@ -693,117 +693,150 @@ func (r *postgresRepo) TransitionStageFromAttempt(ctx context.Context, id uuid.U
 // (same-state short-circuit, completion validation, started_at/ended_at
 // stamping, override-table union) is shared, not duplicated.
 func (r *postgresRepo) transitionStage(ctx context.Context, id uuid.UUID, to StageState, completion *StageCompletion, expectedFrom *StageState, expectedAttempt string) (*Stage, error) {
-	if to == StageStateFailed && (completion == nil || completion.FailureCategory == nil) {
-		return nil, errors.New("transition to failed requires StageCompletion with FailureCategory")
+	if err := validateStageCompletion(to, completion); err != nil {
+		return nil, err
 	}
-	if to != StageStateFailed && completion != nil && completion.FailureCategory != nil {
-		return nil, errors.New("FailureCategory only valid when transitioning to failed")
-	}
-
-	now := time.Now().UTC()
-
 	var result *Stage
 	err := pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
-		q := rundb.New(tx)
-		current, err := q.LockStageForUpdate(ctx, id)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return ErrNotFound
-		}
-		if err != nil {
-			return fmt.Errorf("lock stage: %w", err)
-		}
-		from := StageState(current.State)
-		// Compare-and-swap: when the caller pinned an expected from-state
-		// (TransitionStageFrom), refuse atomically under the row lock if the
-		// current state has drifted since the caller's load. Checked BEFORE
-		// the same-state short-circuit so an already-flipped stage (e.g. a
-		// stage another writer already failed or parked) surfaces as a typed
-		// StageStateChangedError rather than a silent idempotent success.
-		if expectedFrom != nil && from != *expectedFrom {
-			return StageStateChangedError{StageID: id, Expected: *expectedFrom, Actual: from}
-		}
-		// Attempt pin (#3598): evaluated against the SAME row-locked read as
-		// the state comparison above, so state and attempt are decided
-		// atomically — a running(A) → failed → retry → pending → dispatched →
-		// running(B) cycle satisfies a state-only `from == running` predicate,
-		// and only this comparison tells the two attempts apart. Checked
-		// BEFORE the same-state short-circuit so a superseded attempt is
-		// refused even when the stage already sits in the target state.
-		if expectedAttempt != "" {
-			if actual := StageAttemptToken(rowToStage(current).DispatchedAt); actual != expectedAttempt {
-				return StageAttemptChangedError{StageID: id, Expected: expectedAttempt, Actual: actual}
-			}
-		}
-		if from == to {
-			result = rowToStage(current)
-			return nil
-		}
-		// The fix-up re-open (awaiting_approval → pending, #762) is an
-		// explicit override off the normal machine: admit it here in
-		// addition to the ordinary transitions so run.FixupStage can
-		// reuse this method without a dedicated repo verb. The fix-up
-		// RECOVERY edges (failed → succeeded/awaiting_approval, review
-		// pending → awaiting_approval, #788) are admitted the same way so
-		// run.RestoreFixupStage can restore the review gate on a failed
-		// fix-up re-dispatch. The plan-revise re-open (awaiting_approval →
-		// pending for a plan stage, #1099) is admitted the same way via
-		// ValidStageReviseTransition so run.RevisePlanStage can re-open a
-		// parked plan stage in place. The domain gates in run.FixupStage /
-		// run.RestoreFixupStage / run.RevisePlanStage are the real guards;
-		// ordinary callers never compute these edges by accident. Note
-		// `failed → succeeded` is admissible ONLY through the recovery
-		// table — it must never leak into the ordinary path, where it would
-		// fake success.
-		// The merge-supersede edge (→ superseded, #3083) is admitted here
-		// too, and it is the one arm of this union that is TYPE-AWARE: it
-		// is consulted with the ROW-LOCKED stage's own stage_type, so the
-		// default-deny (stage_type, state) pair table is enforced at this
-		// boundary rather than only inside the sweep that calls it. That
-		// matters because `superseded` is terminal — completeRun's #968
-		// guard passes it — so a caller reaching the repository directly
-		// with a state-only premise could otherwise sweep a `pending` plan
-		// stage and fabricate a `succeeded` run around work never done.
-		if !ValidStageTransition(from, to) &&
-			!ValidStageFixupTransition(from, to) &&
-			!ValidStageFixupRecoveryTransition(from, to) &&
-			!ValidStageReviseTransition(from, to) &&
-			!ValidStageMergeSupersedeTransition(StageType(current.StageType), from, to) {
-			return InvalidTransitionError{Kind: "stage", From: string(from), To: string(to)}
-		}
-
-		params := rundb.UpdateStageStateParams{
-			ID:    id,
-			State: string(to),
-		}
-		// Stamp started_at the first time we leave Pending/Dispatched.
-		if to == StageStateRunning && !current.StartedAt.Valid {
-			params.StartedAt = pgtype.Timestamptz{Time: now, Valid: true}
-		}
-		// Stamp ended_at when entering a terminal state.
-		if to.IsTerminal() {
-			params.EndedAt = pgtype.Timestamptz{Time: now, Valid: true}
-		}
-		if completion != nil {
-			if completion.FailureCategory != nil {
-				cat := string(*completion.FailureCategory)
-				params.FailureCategory = &cat
-			}
-			if completion.FailureReason != nil {
-				params.FailureReason = completion.FailureReason
-			}
-		}
-
-		updated, err := q.UpdateStageState(ctx, params)
-		if err != nil {
-			return fmt.Errorf("update stage state: %w", err)
-		}
-		result = rowToStage(updated)
-		return nil
+		var err error
+		result, err = transitionStageTx(ctx, tx, id, to, completion, expectedFrom, expectedAttempt)
+		return err
 	})
 	if err != nil {
 		return nil, err
 	}
 	return result, nil
+}
+
+// TransitionStageFromTx is the TRANSACTION-SCOPED compare-and-swap (#3964 /
+// ADR-087): the same row-locked CAS as TransitionStageFrom
+// (LockStageForUpdate, StageStateChangedError on drift, the
+// ValidStageTransition union, started_at/ended_at stamping) run inside the
+// CALLER's transaction rather than one of its own, so a caller can commit the
+// stage move atomically with its own writes — or roll both back. The
+// precedent is audit.AppendChainedTx. backend/internal/concurrency's Admit is
+// the consumer: its slot-held mark and the dispatched CAS commit together.
+//
+// It carries no StageCompletion, so a move INTO failed (which requires a
+// FailureCategory) is refused before any SQL runs. The row lock it takes is
+// held until the caller's transaction ends.
+func TransitionStageFromTx(ctx context.Context, tx pgx.Tx, id uuid.UUID, from, to StageState) (*Stage, error) {
+	if err := validateStageCompletion(to, nil); err != nil {
+		return nil, err
+	}
+	return transitionStageTx(ctx, tx, id, to, nil, &from, "")
+}
+
+// validateStageCompletion is the completion/FailureCategory pairing rule every
+// stage transition enforces before touching the database.
+func validateStageCompletion(to StageState, completion *StageCompletion) error {
+	if to == StageStateFailed && (completion == nil || completion.FailureCategory == nil) {
+		return errors.New("transition to failed requires StageCompletion with FailureCategory")
+	}
+	if to != StageStateFailed && completion != nil && completion.FailureCategory != nil {
+		return errors.New("FailureCategory only valid when transitioning to failed")
+	}
+	return nil
+}
+
+// transitionStageTx is the row-locked body shared by transitionStage (which
+// opens its own transaction) and TransitionStageFromTx (which runs in the
+// caller's). The caller has already applied validateStageCompletion.
+func transitionStageTx(ctx context.Context, tx pgx.Tx, id uuid.UUID, to StageState, completion *StageCompletion, expectedFrom *StageState, expectedAttempt string) (*Stage, error) {
+	now := time.Now().UTC()
+	q := rundb.New(tx)
+	current, err := q.LockStageForUpdate(ctx, id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("lock stage: %w", err)
+	}
+	from := StageState(current.State)
+	// Compare-and-swap: when the caller pinned an expected from-state
+	// (TransitionStageFrom), refuse atomically under the row lock if the
+	// current state has drifted since the caller's load. Checked BEFORE
+	// the same-state short-circuit so an already-flipped stage (e.g. a
+	// stage another writer already failed or parked) surfaces as a typed
+	// StageStateChangedError rather than a silent idempotent success.
+	if expectedFrom != nil && from != *expectedFrom {
+		return nil, StageStateChangedError{StageID: id, Expected: *expectedFrom, Actual: from}
+	}
+	// Attempt pin (#3598): evaluated against the SAME row-locked read as
+	// the state comparison above, so state and attempt are decided
+	// atomically — a running(A) → failed → retry → pending → dispatched →
+	// running(B) cycle satisfies a state-only `from == running` predicate,
+	// and only this comparison tells the two attempts apart. Checked
+	// BEFORE the same-state short-circuit so a superseded attempt is
+	// refused even when the stage already sits in the target state.
+	if expectedAttempt != "" {
+		if actual := StageAttemptToken(rowToStage(current).DispatchedAt); actual != expectedAttempt {
+			return nil, StageAttemptChangedError{StageID: id, Expected: expectedAttempt, Actual: actual}
+		}
+	}
+	if from == to {
+		return rowToStage(current), nil
+	}
+	// The fix-up re-open (awaiting_approval → pending, #762) is an
+	// explicit override off the normal machine: admit it here in
+	// addition to the ordinary transitions so run.FixupStage can
+	// reuse this method without a dedicated repo verb. The fix-up
+	// RECOVERY edges (failed → succeeded/awaiting_approval, review
+	// pending → awaiting_approval, #788) are admitted the same way so
+	// run.RestoreFixupStage can restore the review gate on a failed
+	// fix-up re-dispatch. The plan-revise re-open (awaiting_approval →
+	// pending for a plan stage, #1099) is admitted the same way via
+	// ValidStageReviseTransition so run.RevisePlanStage can re-open a
+	// parked plan stage in place. The domain gates in run.FixupStage /
+	// run.RestoreFixupStage / run.RevisePlanStage are the real guards;
+	// ordinary callers never compute these edges by accident. Note
+	// `failed → succeeded` is admissible ONLY through the recovery
+	// table — it must never leak into the ordinary path, where it would
+	// fake success.
+	// The merge-supersede edge (→ superseded, #3083) is admitted here
+	// too, and it is the one arm of this union that is TYPE-AWARE: it
+	// is consulted with the ROW-LOCKED stage's own stage_type, so the
+	// default-deny (stage_type, state) pair table is enforced at this
+	// boundary rather than only inside the sweep that calls it. That
+	// matters because `superseded` is terminal — completeRun's #968
+	// guard passes it — so a caller reaching the repository directly
+	// with a state-only premise could otherwise sweep a `pending` plan
+	// stage and fabricate a `succeeded` run around work never done.
+	if !ValidStageTransition(from, to) &&
+		!ValidStageFixupTransition(from, to) &&
+		!ValidStageFixupRecoveryTransition(from, to) &&
+		!ValidStageReviseTransition(from, to) &&
+		!ValidStageMergeSupersedeTransition(StageType(current.StageType), from, to) {
+		return nil, InvalidTransitionError{Kind: "stage", From: string(from), To: string(to)}
+	}
+
+	params := rundb.UpdateStageStateParams{
+		ID:    id,
+		State: string(to),
+	}
+	// Stamp started_at the first time we leave Pending/Dispatched.
+	if to == StageStateRunning && !current.StartedAt.Valid {
+		params.StartedAt = pgtype.Timestamptz{Time: now, Valid: true}
+	}
+	// Stamp ended_at when entering a terminal state.
+	if to.IsTerminal() {
+		params.EndedAt = pgtype.Timestamptz{Time: now, Valid: true}
+	}
+	if completion != nil {
+		if completion.FailureCategory != nil {
+			cat := string(*completion.FailureCategory)
+			params.FailureCategory = &cat
+		}
+		if completion.FailureReason != nil {
+			params.FailureReason = completion.FailureReason
+		}
+	}
+
+	updated, err := q.UpdateStageState(ctx, params)
+	if err != nil {
+		return nil, fmt.Errorf("update stage state: %w", err)
+	}
+	return rowToStage(updated), nil
 }
 
 // ResumeAwaitingInputAndAppend atomically re-opens a parked plan stage
