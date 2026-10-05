@@ -691,6 +691,20 @@ Notes:
   the delegation. Listed here so a reader grepping for auto-driver audit kinds
   sees it is a non-comment, supplementary surface (the campaign sibling
   `campaign_gate_paged` above IS a hand-off surface; this one is not).
+- The delegation shadow stamp audit kind — `delegation_shadow_evaluated`
+  (ADR-085 rule 4 / E82.1 / #3778), written by `server/delegation_shadow.go`
+  (actor `system`) after a HUMAN's fresh decision on a delegable class
+  (approve/reject at a gate — the HTTP handler AND the issue slash-command /
+  `+1` channel — route a fix-up, waive one or several concerns, retry a stage,
+  record a merge verdict) — is an **internal, record-only audit kind, not an
+  issue-comment surface, and must NEVER be added to `activityCategories`**. It
+  records what delegation WOULD have done on the pre-decision state (`verdict`
+  met | unmet | not_delegable | unevaluable, the class's resolved mode, the
+  escalation stratum, the human's actual decision); ADR-085 requires it never
+  be RENDERED to the deciding human, so posting it to the thread would anchor
+  the very decision it measures. Its writer never calls
+  `notifyStatusUpdate` / `notifyOperatorVisible`. Contract:
+  `backend/internal/server/README.md` § "Delegation shadow stamp".
 - The plan-approval completion-gate backstop audit kind —
   `plan_review_backstop_elapsed` (ADR-036 / #875), written by the approval
   handler (`server/approvals.go::checkPlanReviewSettled`) when a plan-stage

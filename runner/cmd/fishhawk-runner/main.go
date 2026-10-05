@@ -5291,6 +5291,8 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 		form            string // the verify form of the deciding (last) verify run: scoped, or full after the (c2) re-verify
 		flakeRetried    bool   // once-per-stage testcontainers infra-flake absorb (#972) already spent
 		autoformatted   bool   // once-per-stage gofmt/goimports auto-format absorb (#3316) already spent
+		lockContended   bool   // the LAST verify was a verify-lock refusal and no re-run remains (#3948) → category C, no fix re-invoke
+		lockState       verifyLockContention
 	)
 
 	for iter := 0; iter <= cfg.verifyMaxIterations; iter++ {
@@ -5469,6 +5471,30 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 			res.Events = append(res.Events, logVerifyGateTimedOut(logSink, *cfg, iter+1, form, timeout))
 		}
 		if refused || unavailable || timedOut {
+			break
+		}
+
+		// Verify-lock contention (#3948): scripts/test refused because another
+		// live RUNNER verify held the per-repository lock past its wait budget.
+		// The tree was never judged, so there is nothing for the fix agent to
+		// fix and nothing for the infra absorb to absorb. Re-run the iteration
+		// in place (re-stage, re-commit, re-verify — the absorb's
+		// budget-preserving `iter--; continue` shape) up to
+		// verifyLockContentionMaxReruns times while the stage budget can cover
+		// a full lock wait plus one verify, WITHOUT touching flakeRetried and
+		// without reaching the fix re-invoke. Once no re-run is admitted the
+		// loop breaks and the stage ends category C verify_lock_contended.
+		// Placed after the disposition break, so only an EXECUTED gate's output
+		// is matched; the iteration has already been reset --soft, so the #816
+		// and #960 invariants are untouched.
+		if disp == gateExecuted && isVerifyLockContended(out) {
+			if lockState.admit(ctx, timeout) {
+				res.Events = append(res.Events, logVerifyLockContendedRerun(logSink, *cfg, iter+1, lockState.reruns))
+				iter--
+				continue
+			}
+			lockContended = true
+			res.Events = append(res.Events, logVerifyLockContended(logSink, *cfg, iter+1, attempts, &lockState))
 			break
 		}
 
@@ -5736,6 +5762,9 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 	case timedOut:
 		summary["outcome"] = "failed"
 		summary["detail"] = verifyTimedOutReason(cfg.verifyCmd, form, timeout, attempts)
+	case lockContended:
+		summary["outcome"] = "failed"
+		summary["detail"] = lockState.reason(cfg.verifyCmd, attempts, timeout)
 	case !passed:
 		summary["outcome"] = "failed"
 	default:
@@ -5792,10 +5821,20 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 		return reinvoked, "", nil
 	}
 
+	if lockContended {
+		// Never judged (#3948): the verify lock stayed contended through every
+		// admitted re-run. Category C, retryable in place, with a lead naming
+		// the cause; the refusal text follows.
+		res.OK = false
+		res.FailureCategory = "C"
+		res.FailureReason = lockState.reason(cfg.verifyCmd, attempts, timeout) + "\n" + lastOutput
+		return reinvoked, "", nil
+	}
+
 	// HOST OVERLOADED (#3663): the deciding verify FAILED and the host was far
 	// above its core count when it ran, so this is infrastructure, not an
 	// artifact defect — category C, retryable in place. Evaluated AFTER
-	// refused / unavailable / timedOut (each names a more specific cause) and
+	// refused / unavailable / timedOut / lockContended (each names a more specific cause) and
 	// BEFORE the category-A arm. The `!passed` conjunct IS the outcome=="failed"
 	// precondition: every non-failure exit path above has already returned, so
 	// reaching here with !passed means the deciding verify was red. A passing
@@ -5855,6 +5894,12 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 //     errVerifyGateTimedOut: category C at the call site, the absorb is
 //     SKIPPED (a re-run would cost another full timeout), and the error
 //     leads with verifyGateTimedOutLead over output ending in the trailer.
+//   - A scripts/test verify-lock refusal (#3948, isVerifyLockContended on an
+//     executed gate) is re-run against the same headSHA up to
+//     verifyLockContentionMaxReruns times while the stage budget covers it,
+//     BEFORE and without spending the infra absorb; a still-contended gate
+//     wraps gitops.ErrVerifyInfraFailure + errVerifyLockContended (category
+//     C) with a verifyLockContendedLead lead.
 //   - A POST-commit gitResetSoftHEAD1 failure is FATAL, not a skip (#802
 //     approval condition). After the throwaway commit is materialized, a failed
 //     undo leaves HEAD on the throwaway commit, so openPRAndShipArtifact's real
@@ -5957,7 +6002,34 @@ func runVerifyGateCommitted(ctx context.Context, cfg config, logSink io.Writer) 
 	if timedOut {
 		events = append(events, logVerifyGateTimedOut(logSink, cfg, verifyAttempts, verifyFormFull, timeout))
 	}
-	if !refused && !unavailable && !timedOut && outcome == "failed" && isVerifyInfraFailure(out) {
+	// Verify-lock contention (#3948): an EXECUTED gate whose output is a
+	// scripts/test lock refusal was never judged. Re-run it against the SAME
+	// throwaway headSHA (still before the reset --soft, so the (e)/(f)
+	// invariants are untouched) while lockState admits a re-run, re-deriving
+	// the dispositions from the LAST run. It runs BEFORE the infra absorb and
+	// never spends it: a still-contended gate classifies at (f) as
+	// ErrVerifyInfraFailure + errVerifyLockContended.
+	var lockState verifyLockContention
+	lockContended := false
+	for outcome == "failed" && disp == gateExecuted && isVerifyLockContended(out) {
+		if !lockState.admit(ctx, timeout) {
+			lockContended = true
+			events = append(events, logVerifyLockContended(logSink, cfg, 1, verifyAttempts, &lockState))
+			break
+		}
+		events = append(events, logVerifyLockContendedRerun(logSink, cfg, 1, lockState.reruns))
+		events = append(events, hostProbe.sample(ctx)...)
+		ev, out, outcome, disp = runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, timeout, nil)
+		events = append(events, stampVerifyRunChangeID(ev, changeID))
+		verifyAttempts++
+		refused = outcome == "failed" && disp == gateRefused
+		unavailable = outcome == "failed" && disp == gateUnavailable
+		timedOut = outcome == "failed" && disp == gateTimedOut
+		if timedOut {
+			events = append(events, logVerifyGateTimedOut(logSink, cfg, verifyAttempts, verifyFormFull, timeout))
+		}
+	}
+	if !lockContended && !refused && !unavailable && !timedOut && outcome == "failed" && isVerifyInfraFailure(out) {
 		const detail = "infrastructure-failure signature in verify output (container-start timeout or lint-lock contention); re-running verify once"
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"verify_infra_flake_retry","run_id":%q,"stage_id":%q,"iteration":%d,"detail":%q}`+"\n",
@@ -5978,7 +6050,7 @@ func runVerifyGateCommitted(ctx context.Context, cfg config, logSink io.Writer) 
 		// gate (#3383 — the LAST execution's disposition governs).
 		refused = outcome == "failed" && disp == gateRefused
 		unavailable = outcome == "failed" && disp == gateUnavailable
-		verifyAttempts = 2
+		verifyAttempts++
 		timedOut = outcome == "failed" && disp == gateTimedOut
 		if timedOut {
 			events = append(events, logVerifyGateTimedOut(logSink, cfg, verifyAttempts, verifyFormFull, timeout))
@@ -6042,6 +6114,14 @@ func runVerifyGateCommitted(ctx context.Context, cfg config, logSink io.Writer) 
 			// already ends with the trailer.
 			return events, "", fmt.Errorf("%w: %w: %s\n%s",
 				gitops.ErrVerifyInfraFailure, errVerifyGateTimedOut, verifyTimedOutReason(cfg.verifyCmd, verifyFormFull, timeout, verifyAttempts), out)
+		}
+		if disp == gateExecuted && isVerifyLockContended(out) {
+			// Category C (retryable in place): the verify lock stayed
+			// contended through every admitted re-run, so the tree was never
+			// judged (#3948). Ahead of the infra signature check because it
+			// names the more specific cause.
+			return events, "", fmt.Errorf("%w: %w: %s\n%s",
+				gitops.ErrVerifyInfraFailure, errVerifyLockContended, lockState.reason(cfg.verifyCmd, verifyAttempts, timeout), out)
 		}
 		if isVerifyInfraFailure(out) {
 			return events, "", fmt.Errorf("%w: committed tree verify command %q failed for an infrastructure reason: %s; %d file(s) outside scope are build/test-required: %s\n%s",
@@ -6495,6 +6575,12 @@ func reinvokeOnBaseRebaseConflict(ctx context.Context, cfg config, invoker agent
 // it) and the verify_run event carries timed_out:true. The tolerant tmp-dir
 // and clone "skipped" branches return gateExecuted: their pre-#2134 outcome
 // mapping is unchanged and must never become category C.
+// materializeGateCheckoutFn is runVerifyCommittedTree's checkout seam (#3948):
+// production is materializeGateCheckout, byte-identically; a test swaps it to
+// force the "skipped" (gate infrastructure never ran the command) outcome at a
+// precise site without breaking the rest of the push path.
+var materializeGateCheckoutFn = materializeGateCheckout
+
 func runVerifyCommittedTree(ctx context.Context, verifyCmd, repoDir, headSHA string, timeout time.Duration, scopePkgs []string) (agent.Event, string, string, gateDisposition) {
 	// Best-effort tree identity for the trace event: the enforcement-grade
 	// capture is the gates' fail-closed gitRevParseTreeOf; an empty tree_sha
@@ -6509,7 +6595,7 @@ func runVerifyCommittedTree(ctx context.Context, verifyCmd, repoDir, headSHA str
 	// that plants a ref or a hook writes into the throwaway tree, never the
 	// primary. A materialization failure keeps the pre-#2134 outcome —
 	// "skipped", with a clone: reason.
-	wt, err := materializeGateCheckout(ctx, repoDir, headSHA, parent)
+	wt, err := materializeGateCheckoutFn(ctx, repoDir, headSHA, parent)
 	if err != nil {
 		return verifyRunEvent(verifyCmd, headSHA, treeSHA, -1,
 			"clone: "+strings.TrimSpace(err.Error()), "skipped"), "", "skipped", gateExecuted
@@ -9604,11 +9690,16 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		// freshly-fetched moved base via FreshFetchBase), so prove the trees
 		// match before anything reaches origin. Equal tree hashes mean a
 		// byte-identical snapshot — the gates' verdict transfers for free. A
-		// mismatch gets exactly ONE strict re-verify against the real
-		// committed HEAD; only an explicit "passed" lets the push proceed
-		// (an infra-skip is NOT a pass — #959-complementary), anything else
-		// returns ErrPushedTreeNotVerified BEFORE the push (origin untouched,
-		// category-B). Empty verifiedTreeSHA = no gate ran = no-op.
+		// mismatch gets a strict re-verify against the real committed HEAD;
+		// only an explicit "passed" lets the push proceed, and anything else
+		// returns BEFORE the push (origin untouched). A genuine red re-verify
+		// returns ErrPushedTreeNotVerified (category-B). An infra-skip is
+		// still NOT a pass (#959-complementary): it re-runs once and then
+		// classifies category C, because the gate never ran the command
+		// (#3948). A verify-lock refusal re-runs in place up to
+		// verifyLockContentionMaxReruns times and then classifies category C
+		// verify_lock_contended (#3948). Empty verifiedTreeSHA = no gate ran =
+		// no-op.
 		//
 		// EXPECTED-with-rationale (#1821, disposition of the #1820-adjacent
 		// recurrence): a mismatch is NOT inherently a defect. It is the
@@ -9667,10 +9758,12 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		}
 		// nil scope set = the FULL verify form (#3315): the #960 strict re-verify
 		// is the pre-push authority and is never narrowed.
-		// The disposition is read for ONE case only (#3383): gateTimedOut, the
-		// runner's own deadline killing the re-verify before a verdict. Every
-		// other failure keeps this site's isReverifyInfraFailure
-		// classification unchanged (out_of_scope for #3448).
+		// The disposition is read for three cases: gateTimedOut (#3383), the
+		// runner's own deadline killing the re-verify before a verdict; and
+		// gateExecuted, which both the verify-lock contention match and the
+		// gate-infrastructure "skipped" arm require (#3948). Every other
+		// failure keeps this site's isReverifyInfraFailure classification
+		// unchanged (out_of_scope for #3448).
 		ev, out, outcome, disp := runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, reverifyTimeout, nil)
 		// Emit the decisive re-verify's verify_run record unconditionally
 		// (pass or fail) before the outcome check (#969). The gate's first
@@ -9713,22 +9806,56 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		// A timed-out re-verify (#3383) SKIPS the absorb: a re-run costs another
 		// full reverifyTimeout, and the fragment carries no verdict to match.
 		signalRuleOK := reverifySignalRuleAdmissible(treeDelta, tdErr == nil, gateScopeFiles)
+		reverifyRuns := 1
 		timedOut := outcome != "passed" && disp == gateTimedOut
 		if timedOut {
-			logVerifyGateTimedOut(logSink, cfg, 1, verifyFormFull, reverifyTimeout)
+			logVerifyGateTimedOut(logSink, cfg, reverifyRuns, verifyFormFull, reverifyTimeout)
 		}
-		if outcome != "passed" && !timedOut && isReverifyInfraFailure(out, signalRuleOK) {
-			const detail = "infrastructure-failure signature in the pre-push strict re-verify output; re-running the re-verify once against the same committed head"
+		// Verify-lock contention (#3948), BEFORE the #2645 absorb so a
+		// contended re-verify never spends the absorb's single re-run: an
+		// executed re-verify whose output is a scripts/test lock refusal is
+		// re-run in place against the SAME real headSHA while lockState admits
+		// it, each execution keeping its own verify_run record.
+		var lockState verifyLockContention
+		lockContended := false
+		for outcome == "failed" && disp == gateExecuted && isVerifyLockContended(out) {
+			if !lockState.admit(ctx, reverifyTimeout) {
+				lockContended = true
+				logVerifyLockContended(logSink, cfg, 1, reverifyRuns, &lockState)
+				break
+			}
+			logVerifyLockContendedRerun(logSink, cfg, 1, lockState.reruns)
+			ev, out, outcome, disp = runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, reverifyTimeout, nil)
+			emitReverifyRun(ev)
+			reverifyRuns++
+			timedOut = outcome != "passed" && disp == gateTimedOut
+			if timedOut {
+				logVerifyGateTimedOut(logSink, cfg, reverifyRuns, verifyFormFull, reverifyTimeout)
+			}
+		}
+		// A "skipped" re-verify never ran the command. The absorb re-runs it
+		// ONCE only for a gate-infrastructure cause (the throwaway checkout
+		// could not be materialized, reverifySkipGateInfraDetail): a refused
+		// or unavailable gate reports "failed", not "skipped", and a cancelled
+		// context keeps its pre-#3948 classification without spending the
+		// absorb.
+		_, skipInfra := reverifySkipGateInfraDetail(ctx, ev, disp)
+		if !lockContended && (skipInfra || (outcome != "passed" && !timedOut && isReverifyInfraFailure(out, signalRuleOK))) {
+			detail := "infrastructure-failure signature in the pre-push strict re-verify output; re-running the re-verify once against the same committed head"
+			if skipInfra {
+				detail = "the pre-push strict re-verify did not run (outcome skipped: the gate could not materialize its throwaway checkout); re-running the re-verify once against the same committed head"
+			}
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"verify_infra_flake_retry","run_id":%q,"stage_id":%q,"iteration":%d,"detail":%q}`+"\n",
 				cfg.runID, cfg.stageID, 1, detail)
 			ev, out, outcome, disp = runVerifyCommittedTree(ctx, cfg.verifyCmd, repoDir, headSHA, reverifyTimeout, nil)
 			emitReverifyRun(ev)
+			reverifyRuns++
 			// The LAST execution's disposition governs (#3383): an absorb
 			// re-run that itself timed out is a timed-out re-verify.
 			timedOut = outcome != "passed" && disp == gateTimedOut
 			if timedOut {
-				logVerifyGateTimedOut(logSink, cfg, 2, verifyFormFull, reverifyTimeout)
+				logVerifyGateTimedOut(logSink, cfg, reverifyRuns, verifyFormFull, reverifyTimeout)
 			}
 		}
 		if outcome != "passed" {
@@ -9748,6 +9875,20 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 			if timedOut {
 				return fmt.Errorf("%w: %s; %s\n%s", gitops.ErrVerifyInfraFailure,
 					verifyTimedOutReason(cfg.verifyCmd, verifyFormFull, reverifyTimeout, 1), accounting, out)
+			}
+			// A re-verify the verify lock kept contended was never judged
+			// (#3948): category C, never ErrPushedTreeNotVerified. Ahead of the
+			// infra arm because it names the more specific cause.
+			if outcome == "failed" && disp == gateExecuted && isVerifyLockContended(out) {
+				return fmt.Errorf("%w: %w: %s; %s\n%s", gitops.ErrVerifyInfraFailure, errVerifyLockContended,
+					lockState.reason(cfg.verifyCmd, reverifyRuns, reverifyTimeout), accounting, out)
+			}
+			// A re-verify the gate infrastructure never ran (#3948): still
+			// not a pass, so the push stays blocked, but category C — the
+			// detail is the runner-authored reason the checkout failed.
+			if skipDetail, ok := reverifySkipGateInfraDetail(ctx, ev, disp); outcome == "skipped" && ok {
+				return fmt.Errorf("%w: strict re-verify of %q did not run (outcome skipped): %s; %s",
+					gitops.ErrVerifyInfraFailure, cfg.verifyCmd, skipDetail, accounting)
 			}
 			// Split by cause: an infra failure that survived the absorb above
 			// is category-C (retryable in place), NOT the category-B park a

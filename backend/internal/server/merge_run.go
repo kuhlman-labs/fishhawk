@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/delegation"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/stagecheck"
@@ -322,6 +323,11 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 		// Reuse the earliest recorded verdict's sequence (chain-stable).
 		verdictSequence = earliestMergeVerdictSequence(existing)
 	} else {
+		// Delegation shadow stamp (E82.1 / #3778): captured on the
+		// PRE-decision state, recorded ONLY on the fresh-append path below —
+		// never on alreadyRecorded or the lost-race duplicate path. This
+		// handler is never delegated (the delegated merge is the auto-driver).
+		shadow := s.captureDelegationShadow(r.Context(), runID, delegation.ActionMerge, subject, false)
 		actorKind := audit.ActorUser
 		payload, _ := json.Marshal(map[string]any{
 			"run_id":    runID.String(),
@@ -340,6 +346,7 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case aerr == nil:
 			verdictSequence = entry.Sequence
+			s.recordDelegationShadow(r.Context(), shadow, nil, "merge", CategoryMergeVerdictRecorded, nil)
 		case audit.IsMergeVerdictDuplicate(aerr):
 			// Lost the concurrent merge-verdict race: another POST's insert
 			// won the partial-unique-index slot. Re-read to recover the

@@ -13,6 +13,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/delegation"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -171,6 +172,11 @@ func (s *Server) HandleApprovalCommand(ctx context.Context, p webhook.ApprovalCo
 		commentPtr = &c
 	}
 
+	// Delegation shadow stamp (E82.1 / #3778): this slash-command / reply
+	// channel is a HUMAN approval path outside approveStageAs, so it is hooked
+	// here — captured on the PRE-decision state just before Submit, recorded
+	// below only on a fresh, advanced decision (never a duplicate).
+	shadow := s.captureDelegationShadow(ctx, stage.RunID, delegation.ActionApprove, subject, false)
 	res, err := s.cfg.ApprovalRepo.Submit(ctx, approval.SubmitParams{
 		StageID:         stage.ID,
 		ApproverSubject: subject,
@@ -240,6 +246,7 @@ func (s *Server) HandleApprovalCommand(ctx context.Context, p webhook.ApprovalCo
 	}
 
 	s.writeSlashApprovalAudit(ctx, advanced, res.Approval, p.Comment)
+	s.recordDelegationShadow(ctx, shadow, &stage.ID, string(decision), "approval_submitted", nil)
 
 	if s.cfg.Orchestrator != nil {
 		if _, err := s.cfg.Orchestrator.Advance(ctx, advanced.RunID); err != nil {

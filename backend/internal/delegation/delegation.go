@@ -426,28 +426,15 @@ func (e *Evaluator) Evaluate(ctx context.Context, runRow *run.Run, wf *spec.Work
 		res.Tier = matrix.Tier
 		res.Matrix = matrix.Actions
 	}
-	type knob struct {
+	knobs := []struct {
 		action    string
 		condition spec.DelegationCondition
-		eval      func() (bool, string, error)
-	}
-	knobs := []knob{
-		{ActionApprove, effective.MayApprove, func() (bool, string, error) {
-			return e.evalCleanDualApproval(ctx, runRow, wf, gated, open)
-		}},
-		{ActionRouteFixup, effective.MayRouteFixup, func() (bool, string, error) {
-			return e.evalConvergentConcerns(ctx, runRow, wf, effective, open)
-		}},
-		{ActionWaive, effective.MayWaive, func() (bool, string, error) {
-			return evalSoloLow(open), soloLowUnmetReason(open), nil
-		}},
-		{ActionRetry, effective.MayRetry, func() (bool, string, error) {
-			met, reason := evalInfraFlake(stages)
-			return met, reason, nil
-		}},
-		{ActionMerge, effective.MayMerge, func() (bool, string, error) {
-			return e.evalGatesResolvedCIGreen(ctx, runRow, stages, open)
-		}},
+	}{
+		{ActionApprove, effective.MayApprove},
+		{ActionRouteFixup, effective.MayRouteFixup},
+		{ActionWaive, effective.MayWaive},
+		{ActionRetry, effective.MayRetry},
+		{ActionMerge, effective.MayMerge},
 	}
 	for _, k := range knobs {
 		entry, hasEntry := res.MatrixEntry(actionClasses[k.action])
@@ -459,7 +446,7 @@ func (e *Evaluator) Evaluate(ctx context.Context, runRow *run.Run, wf *spec.Work
 		if cond == "" {
 			cond = reportCond
 		}
-		met, reason, err := k.eval()
+		met, reason, err := e.evalClassCondition(ctx, k.action, runRow, wf, effective, gated, stages, open)
 		if err != nil {
 			return nil, fmt.Errorf("evaluate %s: %w", cond, err)
 		}
@@ -476,6 +463,216 @@ func (e *Evaluator) Evaluate(ctx context.Context, runRow *run.Run, wf *spec.Work
 		res.Reports = append(res.Reports, d)
 	}
 	return res, nil
+}
+
+// evalClassCondition answers ONE action class's single legal condition
+// against the given run state — the one evaluator both Evaluate (for a class
+// it delegates or reports) and Shadow (for any known class, whatever its
+// mode) route through, so the two cannot answer the same predicate
+// differently. It is lazy by construction: each condition's repository reads
+// happen only when that class is asked about.
+//
+// The unmet reason is returned verbatim; callers keep it only when met is
+// false (every evaluator already returns "" when met). An action with no
+// evaluator is an ERROR rather than an unmet answer: both callers resolve the
+// action from the closed Action* set first, so reaching the default branch
+// means a new verb was added without its condition, and answering "unmet"
+// there would hide that.
+func (e *Evaluator) evalClassCondition(ctx context.Context, action string, runRow *run.Run, wf *spec.Workflow, effective *spec.OperatorAgent, gated *run.Stage, stages []*run.Stage, open []*concern.Concern) (bool, string, error) {
+	switch action {
+	case ActionApprove:
+		return e.evalCleanDualApproval(ctx, runRow, wf, gated, open)
+	case ActionRouteFixup:
+		return e.evalConvergentConcerns(ctx, runRow, wf, effective, open)
+	case ActionWaive:
+		return evalSoloLow(open), soloLowUnmetReason(open), nil
+	case ActionRetry:
+		met, reason := evalInfraFlake(stages)
+		return met, reason, nil
+	case ActionMerge:
+		return e.evalGatesResolvedCIGreen(ctx, runRow, stages, open)
+	}
+	return false, "", fmt.Errorf("delegation: no condition evaluator for action %q", action)
+}
+
+// ShadowVerdict is the closed vocabulary of a delegation SHADOW stamp
+// (ADR-085 rule 4 / E82.1 / #3778): what delegation WOULD have done at a
+// human's action on a delegable class. The four values are one set, declared
+// here together so the producer of each cannot drift into a private spelling:
+//
+//   - ShadowMet / ShadowUnmet — Shadow evaluated the class's condition.
+//   - ShadowNotDelegable — Shadow refused to evaluate: the action is not a
+//     delegable class, or the run is parked at awaiting_input (Evaluate
+//     delegates nothing there). The SERVER capture also lands here when an
+//     active page_human_on event would have paged the human, an override
+//     Shadow itself never applies.
+//   - ShadowUnevaluable — the SERVER capture could not reach an answer
+//     (spec unreadable, repository failure, timeout). Shadow never returns
+//     it — Shadow returns an error instead — but the value belongs to this
+//     set, so it is declared here.
+type ShadowVerdict string
+
+// The closed ShadowVerdict set; see ShadowVerdict for who produces each.
+const (
+	ShadowMet          ShadowVerdict = "met"
+	ShadowUnmet        ShadowVerdict = "unmet"
+	ShadowNotDelegable ShadowVerdict = "not_delegable"
+	ShadowUnevaluable  ShadowVerdict = "unevaluable"
+)
+
+// ShadowVerdicts returns the closed verdict set in a stable order.
+func ShadowVerdicts() []ShadowVerdict {
+	return []ShadowVerdict{ShadowMet, ShadowUnmet, ShadowNotDelegable, ShadowUnevaluable}
+}
+
+// Valid reports whether v is a member of the closed verdict set.
+func (v ShadowVerdict) Valid() bool {
+	for _, known := range ShadowVerdicts() {
+		if v == known {
+			return true
+		}
+	}
+	return false
+}
+
+// Shadow is one class's COUNTERFACTUAL delegation evaluation: the answer the
+// class's condition gives on the current run state as if the class were
+// delegated, plus the provenance strata the E82 record keys on. It is a
+// record-only value; it is never folded into a Result, so nothing that reads
+// a Result (the run read, the auto-driver, checkDelegation) can see it.
+type Shadow struct {
+	// Action is the delegation verb (an Action* constant); Class is the
+	// workflow-v2 action class governing it ("" for a non-delegable action).
+	Action string
+	Class  string
+	// Condition is the class's single legal condition — the predicate
+	// checkDelegation would answer for this action.
+	Condition spec.DelegationCondition
+	Verdict   ShadowVerdict
+	Met       bool
+	// Reason is the evaluator's unmet reason (verbatim, the same string a
+	// delegated call's delegation_condition_unmet carries), or the
+	// not_delegable reason. Empty when met.
+	Reason string
+	// Mode and Source are the class's resolved, escalation-CLAMPED mode and
+	// the input that decided it. With no resolved matrix they are projected
+	// from the effective v0/v1 knob block (set knob -> auto, unset -> gated,
+	// both explicit — the campaign-override projection), and are
+	// gated/default when no block governs the run at all.
+	Mode   spec.ActionMode
+	Source spec.ResolutionSource
+	// MatrixResolved is true when a workflow-v2 matrix governs the run.
+	MatrixResolved bool
+	// Tier and Matrix are the resolved (clamped) matrix's tier and entries;
+	// empty / nil when MatrixResolved is false.
+	Tier   spec.AutonomyTier
+	Matrix []spec.ResolvedAction
+	// MustPageHuman is the effective (clamped) block's page_human_on list —
+	// the input the SERVER capture's page-event override reads.
+	MustPageHuman []string
+}
+
+// Shadow evaluates the named action class's condition against the run's
+// current state REGARDLESS of the class's mode — the counterfactual a
+// delegation shadow stamp records at a human's action (ADR-085 rule 4 /
+// E82.1 / #3778): a gated class is evaluated exactly as if it were delegated.
+//
+// It mirrors checkDelegation's resolution so the stamp answers what the
+// action-time check would have answered:
+//
+//   - the campaign override is nil, as checkDelegation passes it;
+//   - the escalation ceiling is applied LAST through the same resolver and
+//     clamp Evaluate uses, and the knob block is re-derived from the clamped
+//     matrix; a resolver error is RETURNED;
+//   - the condition is answered by evalClassCondition, the evaluator Evaluate
+//     itself routes through.
+//
+// Two branches answer not_delegable without evaluating a condition: an action
+// with no delegable class (checked before any repository read), and a run
+// parked at awaiting_input, where Evaluate delegates nothing.
+//
+// Shadow does NOT apply the page_human_on override — whether an active page
+// event would have paged the human needs server-side state (crew escalations,
+// concern categories) this package does not read; the server capture applies
+// it over MustPageHuman. Shadow never writes and never touches a Result;
+// Evaluate never calls Shadow.
+func (e *Evaluator) Shadow(ctx context.Context, runRow *run.Run, wf *spec.Workflow, action string) (*Shadow, error) {
+	class, known := actionClasses[action]
+	condition, hasCondition := actionConditions[action]
+	if !known || !hasCondition {
+		return &Shadow{
+			Action:  action,
+			Verdict: ShadowNotDelegable,
+			Reason:  action + ": not a delegable action class (no operator_agent knob or matrix class governs it)",
+		}, nil
+	}
+
+	stages, err := e.stages.ListStagesForRun(ctx, runRow.ID)
+	if err != nil {
+		return nil, fmt.Errorf("list stages: %w", err)
+	}
+	gated := currentGatedStage(stages)
+	gate := approvalGateForStage(wf, gated)
+	effective := spec.ResolveOperatorAgent(nil, wf, gate)
+	matrix := resolveMatrix(nil, wf, gate)
+
+	var gatedStageID uuid.UUID
+	if gated != nil {
+		gatedStageID = gated.ID
+	}
+	req, err := e.escalations.ResolveEscalations(ctx, runRow, wf, gatedStageID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve escalations: %w", err)
+	}
+	if req.MaxAutonomy != "" && matrix != nil {
+		matrix = spec.ClampResolvedMatrix(matrix, req.MaxAutonomy)
+		if derived := spec.DerivedOperatorAgent(matrix); derived != nil {
+			effective = derived
+		}
+	}
+
+	out := &Shadow{Action: action, Class: class, Condition: condition, Mode: spec.ModeGated, Source: spec.SourceDefault}
+	provenance := matrix
+	if matrix != nil {
+		out.MatrixResolved = true
+		out.Tier = matrix.Tier
+		out.Matrix = matrix.Actions
+	} else if effective != nil {
+		provenance = matrixFromOperatorAgent(effective)
+	}
+	if provenance != nil {
+		for _, a := range provenance.Actions {
+			if a.Action == class {
+				out.Mode, out.Source = a.Mode, a.Source
+				break
+			}
+		}
+	}
+	if effective != nil {
+		out.MustPageHuman = effective.MustPageHuman
+	}
+
+	if parkedAwaitingInput(stages) {
+		out.Verdict = ShadowNotDelegable
+		out.Reason = "parked_awaiting_input: a stage is parked at awaiting_input for human direction, so delegation would act on nothing"
+		return out, nil
+	}
+
+	open, err := e.concerns.ListOpenByRun(ctx, runRow.ID)
+	if err != nil {
+		return nil, fmt.Errorf("list open concerns: %w", err)
+	}
+	met, reason, err := e.evalClassCondition(ctx, action, runRow, wf, effective, gated, stages, open)
+	if err != nil {
+		return nil, fmt.Errorf("evaluate %s: %w", condition, err)
+	}
+	out.Met = met
+	out.Verdict = ShadowMet
+	if !met {
+		out.Verdict = ShadowUnmet
+		out.Reason = reason
+	}
+	return out, nil
 }
 
 // reportCondition returns the condition a `mode: report` entry declared for

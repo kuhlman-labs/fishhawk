@@ -206,6 +206,77 @@ func TestRetryStage_StandaloneImplementStillPending(t *testing.T) {
 	}
 }
 
+// lineageRepo resolves ListRuns by its DecomposedFrom filter (unlike
+// decomposedRepo, which ignores the filter), so one repository can hold a
+// real decomposition: a parent run with a child, and the child with none.
+type lineageRepo struct {
+	*memRepo
+	childrenOf map[uuid.UUID][]*run.Run
+	queried    []uuid.UUID
+}
+
+func (l *lineageRepo) ListRuns(_ context.Context, f run.ListRunsFilter) ([]*run.Run, error) {
+	if f.DecomposedFrom == nil {
+		return nil, errors.New("lineageRepo: only DecomposedFrom lookups are modelled")
+	}
+	l.queried = append(l.queried, *f.DecomposedFrom)
+	return l.childrenOf[*f.DecomposedFrom], nil
+}
+
+// #3948: a decomposition CHILD whose implement stage the runner failed
+// category C with the verify_lock_contended reason (the strict re-verify lost
+// the per-repository verify lock to another live runner) is admitted for an
+// in-place retry — the stage re-opens to pending with its failure metadata
+// cleared — and the retry leaves the live parent's awaiting_children fan-in
+// park untouched. The reason is byte-identical to the runner's rendered
+// verifyLockContendedReason("scripts/test verify", 3), which
+// runner/cmd/fishhawk-runner's TestVerifyLockContendedReasonRendering pins
+// (the two modules cannot share a fixture). Before #3948 the runner reported
+// this failure as category B, which RetryStage refuses.
+func TestRetryStage_VerifyLockContendedIsRetryableInPlace(t *testing.T) {
+	const reason = `verify_lock_contended: "scripts/test verify" could not acquire the per-repository verify lock after 3 attempt(s): scripts/test refused because another verify held it past its wait budget; the change was NOT judged. Retry the stage in place once the other run's verify has finished.`
+	if !run.RetryableFailure(run.FailureC, reason) {
+		t.Fatal("RetryableFailure(C, verify_lock_contended reason) = false, want true")
+	}
+
+	parentStage := newStage(run.StageStateAwaitingChildren)
+	parentStage.Type = run.StageTypeImplement
+	parentRunID := parentStage.RunID
+	child := failedImplementStage(t, run.FailureC, reason)
+	childRunID := child.RunID
+	repo := &lineageRepo{
+		memRepo: newMemRepo(parentStage, child),
+		childrenOf: map[uuid.UUID][]*run.Run{
+			parentRunID: {{ID: childRunID, DecomposedFrom: &parentRunID}},
+		},
+	}
+
+	dec, err := run.RetryStage(context.Background(), repo, child.ID, run.RetryOptions{})
+	if err != nil {
+		t.Fatalf("RetryStage: %v", err)
+	}
+	if dec.PriorCategory != run.FailureC || dec.PriorReason != reason {
+		t.Errorf("prior = %q / %q, want C with the verify_lock_contended reason", dec.PriorCategory, dec.PriorReason)
+	}
+	if dec.Stage.State != run.StageStatePending {
+		t.Errorf("post-retry state = %q, want pending (a child has no children of its own)", dec.Stage.State)
+	}
+	if dec.Stage.FailureCategory != nil || dec.Stage.FailureReason != nil {
+		t.Errorf("post-retry stage still carries failure metadata: %+v", dec.Stage)
+	}
+	if len(repo.queried) != 1 || repo.queried[0] != childRunID {
+		t.Errorf("decomposed-parent detection queried %v, want exactly the child's run %s", repo.queried, childRunID)
+	}
+	parent, err := repo.GetStage(context.Background(), parentStage.ID)
+	if err != nil {
+		t.Fatalf("GetStage(parent): %v", err)
+	}
+	if parent.State != run.StageStateAwaitingChildren || parent.FailureCategory != nil {
+		t.Errorf("parent stage = %q (category %v), want awaiting_children untouched — retrying a child must not cancel or fail its parent",
+			parent.State, parent.FailureCategory)
+	}
+}
+
 // #1891: a ListRuns read error fails the retry CLOSED — defaulting to
 // pending would recreate the very bug (a doomed re-dispatch + suppressed
 // sweeper) the fix prevents.
