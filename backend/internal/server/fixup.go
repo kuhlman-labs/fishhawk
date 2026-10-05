@@ -603,6 +603,9 @@ func (s *Server) handleFixupStage(w http.ResponseWriter, r *http.Request) {
 		ceilingCredits = maxCeilingRefundCredits
 	}
 
+	// Delegation shadow stamp (E82.1 / #3778): captured on the PRE-decision
+	// state, recorded below only after the fix-up succeeded.
+	shadow := s.captureDelegationShadow(r.Context(), stage.RunID, delegation.ActionRouteFixup, id.Subject, reqBody.Delegated)
 	dec, prBodyObligations, err := s.fixupStageAs(r.Context(), id, fixupActionParams{
 		StageID: stageID,
 		Options: run.FixupOptions{
@@ -695,6 +698,7 @@ func (s *Server) handleFixupStage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.recordDelegationShadow(r.Context(), shadow, &stageID, "route_fixup", CategoryStageFixupTriggered, concernIDs)
 	s.writeJSON(w, r, http.StatusOK, toFixupResponse(dec.Stage, prBodyObligations))
 }
 

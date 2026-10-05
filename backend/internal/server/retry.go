@@ -227,6 +227,12 @@ func (s *Server) handleRetryStage(w http.ResponseWriter, r *http.Request) {
 	// the in-process campaign auto-driver also calls. run.RetryStage's
 	// sentinel errors are returned verbatim and mapped to HTTP here exactly
 	// as before.
+	// Delegation shadow stamp (E82.1 / #3778): captured on the PRE-decision
+	// state (the stage still failed), recorded only after the retry landed.
+	// The decision category is derived from the PRE-decision stage too: the
+	// retry clears the failure fields it keys on.
+	shadow := s.captureDelegationShadow(r.Context(), stage.RunID, delegation.ActionRetry, id.Subject, reqBody.Delegated)
+	shadowDecisionCategory := retryShadowDecisionCategory(stage, reqBody.Override)
 	stageOut, err := s.retryStageAs(r.Context(), id, retryActionParams{
 		StageID:        stageID,
 		Override:       reqBody.Override,
@@ -258,6 +264,7 @@ func (s *Server) handleRetryStage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.recordDelegationShadow(r.Context(), shadow, &stageID, "retry", shadowDecisionCategory, nil)
 	s.writeJSON(w, r, http.StatusOK, toStageResponse(stageOut))
 }
 

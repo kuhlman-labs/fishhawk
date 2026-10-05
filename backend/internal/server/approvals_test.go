@@ -624,9 +624,7 @@ func TestSubmitApproval_Approve_AdvancesStage(t *testing.T) {
 	if len(rr.transitions) != 1 || rr.transitions[0].To != run.StageStateSucceeded {
 		t.Errorf("transitions = %+v", rr.transitions)
 	}
-	if len(au.appended) != 1 || au.appended[0].Category != "approval_submitted" {
-		t.Errorf("audit = %+v", au.appended)
-	}
+	assertDecisionThenOneStamp(t, au.appended, "approval_submitted")
 }
 
 func TestSubmitApproval_Reject_FailsCategoryD(t *testing.T) {
@@ -654,9 +652,7 @@ func TestSubmitApproval_Reject_FailsCategoryD(t *testing.T) {
 		*tr.Completion.FailureCategory != run.FailureD {
 		t.Errorf("transition completion = %+v", tr.Completion)
 	}
-	if len(au.appended) != 1 {
-		t.Errorf("audit entries = %d, want 1", len(au.appended))
-	}
+	assertDecisionThenOneStamp(t, au.appended, "approval_submitted")
 }
 
 func TestSubmitApproval_BadDecision(t *testing.T) {
@@ -719,9 +715,9 @@ func TestSubmitApproval_Idempotent_SameApprover(t *testing.T) {
 	if len(rr.transitions) != 1 {
 		t.Errorf("transitions = %d, want 1 (no second transition on idempotent submit)", len(rr.transitions))
 	}
-	if len(au.appended) != 1 {
-		t.Errorf("audit = %d, want 1 (no second audit on idempotent submit)", len(au.appended))
-	}
+	// The first submit wrote its decision row and one shadow stamp; the
+	// idempotent re-submit adds neither a second audit row nor a second stamp.
+	assertDecisionThenOneStamp(t, au.appended, "approval_submitted")
 }
 
 func TestSubmitApproval_ReviewStage_Refused(t *testing.T) {
@@ -3610,9 +3606,9 @@ func TestSubmitApproval_Duplicate_LabeledResponse(t *testing.T) {
 	if got.State != string(run.StageStateSucceeded) {
 		t.Errorf("State = %q, want succeeded (unchanged by the duplicate)", got.State)
 	}
-	if len(au.appended) != 1 {
-		t.Errorf("audit entries = %d, want 1 (no entry for the duplicate)", len(au.appended))
-	}
+	// The first submit wrote its decision row and one shadow stamp; the
+	// duplicate adds no entry and no second stamp.
+	assertDecisionThenOneStamp(t, au.appended, "approval_submitted")
 }
 
 func TestSubmitApproval_Reject_RejectionCommentInAuditPayload(t *testing.T) {
@@ -5596,8 +5592,13 @@ func TestSubmitApproval_OperatorAgentActorAttribution(t *testing.T) {
 		t.Fatalf("human approve status = %d, want 200:\n%s", w.Code, w.Body.String())
 	}
 
-	if len(au.appended) != 2 {
-		t.Fatalf("audit entries = %d, want 2", len(au.appended))
+	// The agent-token decision is never shadow-stamped (agent subject); the
+	// human decision is followed by exactly one stamp (E82.1 / #3778).
+	if len(au.appended) != 3 {
+		t.Fatalf("audit entries = %d, want 3 (agent decision, human decision, one shadow stamp)", len(au.appended))
+	}
+	if au.appended[2].Category != CategoryDelegationShadowEvaluated {
+		t.Errorf("third entry category = %q, want the human decision's shadow stamp", au.appended[2].Category)
 	}
 	agentEntry, humanEntry := au.appended[0], au.appended[1]
 	if agentEntry.RunID != humanEntry.RunID {

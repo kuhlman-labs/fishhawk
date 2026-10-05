@@ -175,6 +175,17 @@ func TestKnownCategories_EscalationFired(t *testing.T) {
 	}
 }
 
+// TestKnownCategories_DelegationShadowEvaluated pins the E82.1 / #3778
+// category: the shadow stamp's emit site (server/delegation_shadow.go) writes
+// it after every human decision on a delegable class, and an unregistered
+// category would redden TestKnownCategoriesCoversEmittedCategories and leave
+// the E82 record un-awaitable.
+func TestKnownCategories_DelegationShadowEvaluated(t *testing.T) {
+	if !IsKnownCategory("delegation_shadow_evaluated") {
+		t.Fatal("delegation_shadow_evaluated is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
+	}
+}
+
 // TestKnownCategories_StagePermissionsDeclared pins the E53.5 / #2228 category:
 // the run-creation emitter writes it once per run whose workflow declares any
 // stage `permissions`/`egress` block, and an unregistered category is

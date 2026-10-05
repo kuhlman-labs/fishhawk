@@ -930,6 +930,17 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 	// above; the result/error it returns is rendered to HTTP here exactly as
 	// the prior inline core did (duplicate 200, InvalidTransition 409, and
 	// the two distinct submit/advance 500 messages).
+	//
+	// Delegation shadow stamp (ADR-085 rule 4 / E82.1 / #3778): captured
+	// HERE — after every refusal gate, immediately before the decision — so it
+	// evaluates the PRE-decision state, and recorded below only on a fresh
+	// decision. Hooked in the handler, NOT inside approveStageAs, which the
+	// campaign auto-driver also calls. Nil (never stamped) for a delegated
+	// or agent submission.
+	var shadow *pendingDelegationShadow
+	if stage.State == run.StageStateAwaitingApproval {
+		shadow = s.captureDelegationShadow(r.Context(), stage.RunID, delegation.ActionApprove, subject, req.Delegated)
+	}
 	result, err := s.approveStageAs(r.Context(), ident, approveActionParams{
 		Stage:                     stage,
 		Decision:                  decision,
@@ -991,6 +1002,7 @@ func (s *Server) handleSubmitApproval(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.recordDelegationShadow(r.Context(), shadow, &stage.ID, string(decision), "approval_submitted", nil)
 	s.writeJSON(w, r, http.StatusOK, toStageResponse(result.Stage))
 }
 
