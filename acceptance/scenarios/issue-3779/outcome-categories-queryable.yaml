@@ -1,0 +1,14 @@
+id: scenario:issue-3779/outcome-categories-queryable
+statement: The audit read surface accepts both new categories as known. GET /v0/runs/{run_id}/audit?category=run_merge_reverted and ?category=run_merge_ci_observed, without allow_unknown, return 200 rather than the 400 validation_failed unknown-category refusal.
+verify_hint: On the localhost preview, issue GET /v0/runs/{run_id}/audit?category=run_merge_reverted and ?category=run_merge_ci_observed against any existing run. Expect HTTP 200 with an items array (empty is fine), not a 400 that lists suggestions.
+steps: POST http://localhost:8090/v0/dev/fixtures {"scenario":"acceptance-dispatched"} -> run c498f28e-7feb-4091-8f6b-716125c6e483. GET /v0/runs/{run}/audit?category=run_merge_reverted ; ?category=run_merge_ci_observed ; control ?category=run_merge_bogus (no allow_unknown).
+assertions:
+    expected: 200 with an items array for both new categories
+    observed_at_record: run_merge_reverted -> 200 {"items":[],"next_cursor":""}; run_merge_ci_observed -> 200 {"items":[]}; control -> 400 validation_failed unknown category with suggestions [run_merge_reverted, pr_merged, run_revived].
+    repro_handle: curl 'http://localhost:8090/v0/runs/<run>/audit?category=run_merge_ci_observed'
+origin:
+    issue: 3779
+    pr: 0
+    run_id: 75f6716a-8fe3-4fce-a1c0-28e619eb9098
+    head_sha: 6fe7738f60d3ad666120954d34cb4667b1e94b33
+    recorded_at: 2026-10-05T05:40:12Z

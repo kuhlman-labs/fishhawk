@@ -264,6 +264,16 @@ import "sort"
 // INTERNAL, NOT an issue-comment activity category — like the other upkeep
 // rows it is read through GET /v0/runs/{id}/audit only
 // (docs/issue-comment-surfaces.md is untouched).
+// E82.2 / #3779 (ADR-085 rules 3 and 6) added the two post-merge OUTCOME fact
+// records written by backend/internal/mergeoutcome under the system actor
+// "merge-outcome-observer": run_merge_reverted (a default-branch push whose
+// revert signal resolves to a run's forge-confirmed merge, with the
+// forge-diff attestation inverse_diff | partial_inverse | signal_only) and
+// run_merge_ci_observed (the merge commit's CI conclusion fixed at maturity).
+// Both are deduped per (run, reverting commit / merge commit), carry only
+// forge-attested facts (no commit message, PR body or other prose), and are
+// INTERNAL fact records, NOT issue-comment surfaces
+// (docs/issue-comment-surfaces.md is untouched).
 // E82.1 / #3778 (ADR-085 rule 4) added delegation_shadow_evaluated, the
 // record-only BLIND shadow stamp: server/delegation_shadow.go appends one,
 // actor system, after a HUMAN's decision on a delegable class (approve,
@@ -471,6 +481,8 @@ var KnownCategories = map[string]struct{}{
 	"run_budget_exceeded":                     {},
 	"run_completed":                           {},
 	"run_dispatched":                          {},
+	"run_merge_ci_observed":                   {}, // E82.2 / #3779: merge-commit CI conclusion fixed at maturity
+	"run_merge_reverted":                      {}, // E82.2 / #3779: a forge-confirmed revert of the run's merge
 	"run_rejected_applies_to":                 {},
 	"run_rejected_budget":                     {},
 	"run_rejected_misconfigured":              {},

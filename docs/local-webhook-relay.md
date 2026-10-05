@@ -18,9 +18,11 @@ local smee client long-polls that channel and replays each delivery to the local
 endpoint.
 
 The webhook-driven behaviours this reaches include the run-less
-`fishhawk_audit_complete` publish (#3160) and the five `handleWebhook`
-consumers. Without the relay, each of those is exercised locally only by a
-poller (e.g. the merge reconciler) or not at all.
+`fishhawk_audit_complete` publish (#3160), the five `handleWebhook`
+consumers, and push-driven default-branch revert detection (`run_merge_reverted`,
+E82.2 / #3779). Without the relay, each of those is exercised locally only by a
+poller (e.g. the merge reconciler) or not at all — revert detection has no
+poller, so a local install without the relay records no reverts.
 
 ## Enable it
 
@@ -160,6 +162,7 @@ not uniformly idempotent — per handler:
 | `code_scanning_alert` (`recordSecurityScan`) | **Idempotent** — writes one idempotent `securityscan` entry. |
 | `check_run` (`ingestCheckRun` → `StageCheckRepo.Append`) | **Idempotent in effect** — consumers read the latest per `(stage_id, check_name)` — but the rows are append-only, so a replay adds duplicate history. |
 | `pull_request.closed` (`handlePullRequestClosed` → `resolveReviewStageOnMerge`) | Stage transition is idempotent (the state machine rejects a repeat), but `writePRMergedAudit` is an **unguarded** `AppendChained` — a replay writes a **duplicate `pr_merged` audit row**. |
+| `push` to the default branch (`observeDefaultBranchPush` → `mergeoutcome.RevertObserver`) | **Idempotent** — `run_merge_reverted` is appended atomically deduped on `(run, reverting_commit_sha)`, so a replay under a fresh delivery id re-runs the forge lookups but writes no second row. |
 | `pull_request_review.submitted` (`handlePullRequestReviewSubmitted`) | **Not idempotent** — an unconditional `AppendChained` with no dedup writes a **duplicate review audit row**. The clearest case. |
 
 And one consequence the per-handler table omits: `WebhookDispatcher.Handle` runs
