@@ -19,7 +19,13 @@ const (
 	MountGoCache    = "/gocache"
 	MountGoModCache = "/gomodcache"
 	MountLintCache  = "/lintcache"
+	MountPasswd     = "/etc/passwd"
 )
+
+// GateContainerMarker is pinned on EVERY container exec so in-gate code can
+// tell it runs in the network-less gate container (pgtest fails closed there
+// without a provisioned database instead of attempting testcontainers).
+const GateContainerMarker = "FISHHAWK_GATE_CONTAINER=1"
 
 // DefaultMaxMountDepth bounds the socket walk under each bind-mount source.
 // A socket deeper than this is NOT detected — a documented, test-pinned limit
@@ -38,6 +44,15 @@ type ContainerSpec struct {
 	GoCache    string
 	GoModCache string
 	LintCache  string
+	// PasswdFile is an optional HOST file (WritePasswdFile) mounted
+	// read-only at /etc/passwd; guarded by ForbidSocketMounts with the
+	// other sources. Empty → no passwd mount.
+	PasswdFile string
+	// ServiceMounts are runner-provisioned service volumes (#2137), each
+	// mounted read-only. BuildArgv refuses any volume not shaped like a
+	// service volume name, so a host path or the daemon socket can never
+	// ride in as a "volume".
+	ServiceMounts []ServiceMount
 	// UID/GID own the bind-mount writes (--user uid:gid; rootless podman uses
 	// --userns=keep-id instead).
 	UID int
@@ -47,6 +62,29 @@ type ContainerSpec struct {
 	// Argv is the gate command executed after `--entrypoint ''` resets the
 	// image's ENTRYPOINT.
 	Argv []string
+}
+
+// ServiceMount is one read-only service volume in the gate container.
+type ServiceMount struct {
+	// Volume must match fishhawk-gate-svc-<12 hex> (PostgresService.Name).
+	Volume string
+	// Target is the absolute, clean, non-root in-container mount point.
+	Target string
+	// ReadOnly must be true; a writable service mount is refused.
+	ReadOnly bool
+}
+
+// validate refuses every ServiceMount BuildArgv must not render.
+func (m ServiceMount) validate() error {
+	switch {
+	case !serviceNamePattern.MatchString(m.Volume):
+		return fmt.Errorf("service mount volume %q refused: not a gate service volume (%s)", m.Volume, serviceNamePattern)
+	case !filepath.IsAbs(m.Target) || filepath.Clean(m.Target) != m.Target || m.Target == "/":
+		return fmt.Errorf("service mount target %q refused: must be an absolute, clean, non-root path", m.Target)
+	case !m.ReadOnly:
+		return fmt.Errorf("service mount %q refused: service mounts must be read-only", m.Volume)
+	}
+	return nil
 }
 
 // NewContainerName returns a fresh, runtime-legal container name.
@@ -281,14 +319,16 @@ func (r Runtime) BindEndpointEnv(base []string) ([]string, error) {
 }
 
 // BuildArgv renders the runtime command line. It applies ForbidSocketMounts
-// to every bind-mount source BEFORE emitting any -v token and returns the
-// refusal with no argv. The exact shape is:
+// to every bind-mount source (the passwd file included) and validates every
+// ServiceMount BEFORE emitting any -v token, and returns the refusal with no
+// argv. The exact shape is:
 //
-//	<runtime> run --rm --name <name> --network=none --cap-drop=ALL
+//	<runtime> <endpoint…> run --rm --name <name> --network=none --cap-drop=ALL
 //	  --security-opt=no-new-privileges --workdir /work
 //	  (--user uid:gid | --userns=keep-id)
 //	  -v checkout:/work -v gocache:/gocache -v gomodcache:/gomodcache
-//	  -v lintcache:/lintcache -e K=V… --entrypoint '' <image> <argv…>
+//	  -v lintcache:/lintcache [-v passwdfile:/etc/passwd:ro]
+//	  [-v <service-volume>:<target>:ro…] -e K=V… --entrypoint '' <image> <argv…>
 //
 // --entrypoint with an EMPTY value precedes the image so an image whose ENTRYPOINT is git
 // (docker.io/alpine/git) cannot swallow or reinterpret the gate command; the
@@ -311,25 +351,36 @@ func (s ContainerSpec) BuildArgv(policy MountPolicy) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := ForbidSocketMounts(policy, s.Checkout, s.GoCache, s.GoModCache, s.LintCache); err != nil {
+	sources := []string{s.Checkout, s.GoCache, s.GoModCache, s.LintCache}
+	if s.PasswdFile != "" {
+		sources = append(sources, s.PasswdFile)
+	}
+	if err := ForbidSocketMounts(policy, sources...); err != nil {
 		return nil, err
+	}
+	for _, m := range s.ServiceMounts {
+		if err := m.validate(); err != nil {
+			return nil, err
+		}
 	}
 	argv := append([]string{bin}, endpoint...)
 	argv = append(argv, "run", "--rm", "--name", s.Name,
 		"--network=none", "--cap-drop=ALL", "--security-opt=no-new-privileges",
 		"--workdir", MountWork,
 	)
-	if s.Runtime.Kind == KindPodman && s.Runtime.Rootless {
-		argv = append(argv, "--userns=keep-id")
-	} else {
-		argv = append(argv, "--user", fmt.Sprintf("%d:%d", s.UID, s.GID))
-	}
+	argv = append(argv, userArgs(s.Runtime, s.UID, s.GID)...)
 	argv = append(argv,
 		"-v", s.Checkout+":"+MountWork,
 		"-v", s.GoCache+":"+MountGoCache,
 		"-v", s.GoModCache+":"+MountGoModCache,
 		"-v", s.LintCache+":"+MountLintCache,
 	)
+	if s.PasswdFile != "" {
+		argv = append(argv, "-v", s.PasswdFile+":"+MountPasswd+":ro")
+	}
+	for _, m := range s.ServiceMounts {
+		argv = append(argv, "-v", m.Volume+":"+m.Target+":ro")
+	}
 	for _, kv := range s.Env {
 		argv = append(argv, "-e", kv)
 	}
@@ -363,6 +414,7 @@ var containerEnvPins = []string{
 	"GOTOOLCHAIN=local",
 	"GIT_CONFIG_GLOBAL=/dev/null",
 	"GIT_CONFIG_SYSTEM=/dev/null",
+	GateContainerMarker,
 }
 
 // containerEnvAllowed reports whether a sanitized-env key crosses into the
@@ -379,8 +431,9 @@ func containerEnvAllowed(key string) bool {
 // only the TZ/LANG/TERM/LC_*/CGO_*/GO* allow-list survives, then the cache
 // and toolchain pins are appended drop-then-append (HOME, GOPATH, GOCACHE,
 // GOMODCACHE, GOLANGCI_LINT_CACHE, GOPROXY=off, GOTOOLCHAIN=local,
-// GIT_CONFIG_GLOBAL/SYSTEM=/dev/null), then extras drop-then-append so a
-// caller-supplied value wins over both.
+// GIT_CONFIG_GLOBAL/SYSTEM=/dev/null, FISHHAWK_GATE_CONTAINER=1), then extras
+// drop-then-append so a caller-supplied value wins over both. Service env is
+// applied after all of it by WithServiceEnv.
 func ContainerEnv(sanitized []string, extras []string) []string {
 	var out []string
 	for _, kv := range sanitized {
@@ -394,6 +447,20 @@ func ContainerEnv(sanitized []string, extras []string) []string {
 		out = dropThenAppend(out, kv)
 	}
 	for _, kv := range extras {
+		if _, _, ok := strings.Cut(kv, "="); !ok {
+			continue
+		}
+		out = dropThenAppend(out, kv)
+	}
+	return out
+}
+
+// WithServiceEnv applies a provisioned service's env (PostgresService.GateEnv)
+// LAST, drop-then-append over a ContainerEnv result, so neither the sanitized
+// env nor extras can override the DSN the runner provisioned.
+func WithServiceEnv(env, serviceEnv []string) []string {
+	out := append([]string(nil), env...)
+	for _, kv := range serviceEnv {
 		if _, _, ok := strings.Cut(kv, "="); !ok {
 			continue
 		}
