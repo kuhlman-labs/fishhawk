@@ -446,7 +446,9 @@ func confirmMerge(sig revertSignal, pull *forge.PullRequest) bool {
 }
 
 // attest fetches the reverting commit's and the merge commit's file lists
-// (cached per push) and classifies them. Any fetch failure is signal_only.
+// (cached per push) and classifies them. Any fetch failure is signal_only with
+// attestation_reason file_list_unavailable — an UNKNOWN, not evidence the
+// commit is no inverse, and fixed for good by the reverting-commit dedup.
 func (o *RevertObserver) attest(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef,
 	revertSHA, mergeSHA string, cache map[string]*githubclient.CommitFiles) (string, string) {
 	get := func(sha string) *githubclient.CommitFiles {
@@ -476,7 +478,9 @@ func (o *RevertObserver) attest(ctx context.Context, scope forge.CredentialScope
 //   - signal_only: anything else, including an unavailable or truncated file
 //     list on either side and a revert touching no files.
 //
-// A rename is matched in either direction (the revert renames back).
+// A rename is matched in either direction (the revert renames back). The
+// comparison is COUNT-level, not content-level: a commit that swaps the
+// merge's per-file line counts with different content still attests.
 func ClassifyAttestation(revert, merge *githubclient.CommitFiles) (string, string) {
 	if revert == nil || merge == nil {
 		return AttestationSignalOnly, attestReasonFilesUnavailable

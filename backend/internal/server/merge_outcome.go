@@ -15,9 +15,18 @@ import (
 // runs unbounded.
 const pushObserveTimeout = 60 * time.Second
 
+// maxConcurrentPushObservations bounds the detached push observations in
+// flight at once; a delivery arriving while every slot is held is skipped with
+// a WARN rather than queued, so the webhook is never blocked.
+const maxConcurrentPushObservations = 4
+
 // pushObservers tracks every in-flight detached push observation so tests can
 // wait for the background work to settle before reading the audit chain.
 var pushObservers sync.WaitGroup
+
+// pushObserveSlots is the process-wide semaphore for detached push
+// observations.
+var pushObserveSlots = make(chan struct{}, maxConcurrentPushObservations)
 
 // detachedPushContext derives the push observer's context: detached from the
 // webhook request's cancellation (context.WithoutCancel keeps its values) and
@@ -53,11 +62,7 @@ func (s *Server) observeDefaultBranchPush(ctx context.Context, ev webhook.Event)
 		Audit:  s.cfg.AuditRepo,
 		Logger: s.cfg.Logger,
 	}
-	detached, cancel := detachedPushContext(ctx)
-	pushObservers.Add(1)
-	go func() {
-		defer pushObservers.Done()
-		defer cancel()
+	runDetachedPushObservation(ctx, s.cfg.Logger, pushObserveSlots, ev.DeliveryID, func(detached context.Context) {
 		sum := obs.ObservePush(detached, push, ev.DeliveryID)
 		if sum.Signals > 0 {
 			s.cfg.Logger.LogAttrs(detached, slog.LevelInfo, "merge outcome: push observed",
@@ -66,5 +71,36 @@ func (s *Server) observeDefaultBranchPush(ctx context.Context, ev webhook.Event)
 				slog.Bool("truncated", sum.Truncated), slog.Int("recorded", sum.Recorded),
 				slog.Int("errors", sum.Errors))
 		}
+	})
+}
+
+// runDetachedPushObservation runs observe on its own goroutine under
+// detachedPushContext, holding one of slots for its lifetime. It never blocks:
+// with every slot held it logs a WARN, skips the observation and returns
+// false. A panic in observe is recovered, logged and the observation dropped —
+// the goroutine sits outside net/http's per-request recovery, so an unrecovered
+// panic would take fishhawkd down.
+func runDetachedPushObservation(ctx context.Context, logger *slog.Logger, slots chan struct{}, deliveryID string, observe func(context.Context)) bool {
+	select {
+	case slots <- struct{}{}:
+	default:
+		logger.LogAttrs(ctx, slog.LevelWarn, "merge outcome: push observation skipped; concurrent observations saturated",
+			slog.String("delivery_id", deliveryID), slog.Int("max_concurrent", cap(slots)))
+		return false
+	}
+	detached, cancel := detachedPushContext(ctx)
+	pushObservers.Add(1)
+	go func() {
+		defer pushObservers.Done()
+		defer func() { <-slots }()
+		defer cancel()
+		defer func() {
+			if r := recover(); r != nil {
+				logger.LogAttrs(detached, slog.LevelError, "merge outcome: push observation panicked; dropped",
+					slog.String("delivery_id", deliveryID), slog.Any("panic", r))
+			}
+		}()
+		observe(detached)
 	}()
+	return true
 }

@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -300,6 +302,49 @@ func TestDetachedPushContext_BoundedAndUncancelled(t *testing.T) {
 	}
 	if pushObserveTimeout != 60*time.Second {
 		t.Fatalf("pushObserveTimeout = %v, want 60s (operator condition 2)", pushObserveTimeout)
+	}
+}
+
+// TestRunDetachedPushObservation_PanicRecovered: a panicking observer is
+// recovered, logged and dropped, and its slot is released — the test process
+// survives. Counterfactuals: delete the recover → the detached goroutine's
+// panic crashes the test binary; delete the slot release → the slot stays held.
+func TestRunDetachedPushObservation_PanicRecovered(t *testing.T) {
+	buf := &syncBuffer{}
+	slots := make(chan struct{}, 1)
+	started := runDetachedPushObservation(context.Background(), slog.New(slog.NewTextHandler(buf, nil)), slots, "push-panic",
+		func(context.Context) { panic("observer boom") })
+	if !started {
+		t.Fatal("observation skipped with a free slot")
+	}
+	pushObservers.Wait()
+	if out := buf.String(); !strings.Contains(out, "push observation panicked; dropped") || !strings.Contains(out, "observer boom") {
+		t.Fatalf("log = %q, want the recovered panic logged", out)
+	}
+	if len(slots) != 0 {
+		t.Fatalf("slots held = %d after the panic, want 0", len(slots))
+	}
+}
+
+// TestRunDetachedPushObservation_SaturatedSkipsWithWarn: with every slot held a
+// delivery is skipped with a WARN, never queued or run. Counterfactual: drop
+// the slot acquisition → the observation runs past the bound.
+func TestRunDetachedPushObservation_SaturatedSkipsWithWarn(t *testing.T) {
+	buf := &syncBuffer{}
+	slots := make(chan struct{}, 1)
+	slots <- struct{}{}
+	var ran atomic.Bool
+	started := runDetachedPushObservation(context.Background(), slog.New(slog.NewTextHandler(buf, nil)), slots, "push-full",
+		func(context.Context) { ran.Store(true) })
+	pushObservers.Wait()
+	if started || ran.Load() {
+		t.Fatalf("started = %v ran = %v with every slot held, want a skip", started, ran.Load())
+	}
+	if out := buf.String(); !strings.Contains(out, "level=WARN") || !strings.Contains(out, "concurrent observations saturated") {
+		t.Fatalf("log = %q, want the saturation WARN", out)
+	}
+	if cap(pushObserveSlots) != maxConcurrentPushObservations {
+		t.Fatalf("process-wide slots = %d, want %d", cap(pushObserveSlots), maxConcurrentPushObservations)
 	}
 }
 

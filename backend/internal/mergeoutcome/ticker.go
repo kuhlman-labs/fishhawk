@@ -31,7 +31,9 @@ const (
 	// DefaultCILookback bounds the scan by MERGE-EVIDENCE time (operator
 	// condition 4): a run whose earliest merge-evidence row is older is not
 	// evaluated. Never narrower than window + DefaultCITerminalAfter + a day,
-	// so every run reaches its terminal row before it leaves the scan.
+	// so a run reaches its terminal row before it leaves the scan unless its
+	// forge merged_at trails the evidence by more than that slack (README
+	// residual: the deadline keys on the forge maturity, the lookback does not).
 	DefaultCILookback = 14 * 24 * time.Hour
 	// DefaultCIMaxPerTick caps forge evaluations per tick, so a backfill
 	// drains over several ticks.
@@ -130,6 +132,10 @@ type CITicker struct {
 type ciBackoff struct {
 	failures    int
 	nextAttempt time.Time
+	// pull is the last forge PR this process saw carrying the merge facts;
+	// a later pre-PR failure keeps anchoring the terminal deadline on its
+	// merged_at instead of falling back to the evidence time.
+	pull *forge.PullRequest
 }
 
 // CITickerConfig is the flag-to-ticker input NewCITicker validates.
@@ -203,7 +209,8 @@ func (t *CITicker) terminalAfter() time.Duration {
 	return DefaultCITerminalAfter
 }
 
-// lookback never drops a run before its terminal deadline has passed.
+// lookback never drops a run before its EVIDENCE-anchored terminal deadline
+// has passed (a forge-anchored deadline may trail it: README residual).
 func (t *CITicker) lookback() time.Duration {
 	lb := t.Lookback
 	if lb <= 0 {
@@ -419,7 +426,7 @@ func (t *CITicker) evaluate(ctx context.Context, r *run.Run, tgt ciTarget, c ciC
 		return t.Forge.GetPullRequest(ctx, tgt.scope, tgt.repo, tgt.number)
 	})
 	if err != nil {
-		t.fail(ctx, r, tgt, c, nil, now, classifyCIError(ctx, err), err, sum)
+		t.fail(ctx, r, tgt, c, t.knownPull(c.runID), now, classifyCIError(ctx, err), err, sum)
 		return
 	}
 	switch {
@@ -430,6 +437,7 @@ func (t *CITicker) evaluate(ctx context.Context, r *run.Run, tgt ciTarget, c ciC
 		t.fail(ctx, r, tgt, c, pull, now, errClassMergeFacts, errors.New("forge omits merge_commit_sha or merged_at"), sum)
 		return
 	}
+	t.notePull(c.runID, pull)
 	matures := pull.MergedAt.Add(t.window())
 	if matures.After(now) {
 		// The chain's evidence predates the forge's merged_at; wait for the
@@ -471,6 +479,9 @@ func withRetry2[A, B any](ctx context.Context, base time.Duration, fn func(conte
 
 // fail enters (or extends) the run's exponential backoff and, once the run is
 // TerminalAfter past maturity, records the terminal observation_failed row.
+// Maturity is the FORGE merged_at + Window whenever the forge has returned it
+// (pull non-nil, from this evaluation or an earlier one in this process); the
+// evidence-derived c.maturesAt anchors the deadline only when it never has.
 func (t *CITicker) fail(ctx context.Context, r *run.Run, tgt ciTarget, c ciCandidate, pull *forge.PullRequest,
 	now time.Time, class string, cause error, sum *CITickSummary) {
 	if ctx.Err() != nil {
@@ -483,7 +494,11 @@ func (t *CITicker) fail(ctx context.Context, r *run.Run, tgt ciTarget, c ciCandi
 		slog.String("run_id", r.ID.String()), slog.String("pull_request_url", tgt.prURL),
 		slog.String("error_class", class), slog.String("error", cause.Error()),
 		slog.Int("failures", st.failures), slog.Time("next_attempt", st.nextAttempt))
-	if now.Before(c.maturesAt.Add(t.terminalAfter())) {
+	matures := c.maturesAt
+	if pull != nil && pull.MergedAt != nil {
+		matures = pull.MergedAt.Add(t.window())
+	}
+	if now.Before(matures.Add(t.terminalAfter())) {
 		return
 	}
 	v := CIVerdict{
@@ -496,10 +511,6 @@ func (t *CITicker) fail(ctx context.Context, r *run.Run, tgt ciTarget, c ciCandi
 		FailedChecks:         []string{},
 		MissingChecks:        []string{},
 		MissingCheckReasons:  map[string]string{},
-	}
-	matures := c.maturesAt
-	if pull != nil && pull.MergedAt != nil {
-		matures = pull.MergedAt.Add(t.window())
 	}
 	landed, err := t.record(ctx, r, tgt, c, pull, matures, now, v, class)
 	if err != nil {
@@ -642,6 +653,31 @@ func (t *CITicker) noteFailure(id uuid.UUID, now time.Time) ciBackoff {
 	}
 	st.nextAttempt = now.Add(delay)
 	return *st
+}
+
+// notePull remembers the forge PR whose merge facts evaluate confirmed.
+func (t *CITicker) notePull(id uuid.UUID, pull *forge.PullRequest) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.backoff == nil {
+		t.backoff = map[uuid.UUID]*ciBackoff{}
+	}
+	st := t.backoff[id]
+	if st == nil {
+		st = &ciBackoff{}
+		t.backoff[id] = st
+	}
+	st.pull = pull
+}
+
+// knownPull returns the forge PR notePull remembered for id, or nil.
+func (t *CITicker) knownPull(id uuid.UUID) *forge.PullRequest {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if st := t.backoff[id]; st != nil {
+		return st.pull
+	}
+	return nil
 }
 
 // holdUntil holds a run until notBefore without counting a failure.

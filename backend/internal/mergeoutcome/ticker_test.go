@@ -419,18 +419,32 @@ func TestCITicker_LookbackNeverBelowTerminalDeadline(t *testing.T) {
 }
 
 // Operator condition 5: oldest-maturity-first — persistently failing NEWER
-// runs never prevent an older mature run from being recorded.
+// runs never prevent an older mature run from being recorded. Without the sort
+// the candidates arrive in map-iteration order, so a single trial would still
+// pick exactly {oldest, second-oldest} by chance; 16 fresh trials of 8
+// candidates against a cap of 2 make that counterfactual RED on every run.
 func TestTick_OldestMaturityFirst_NewerFailuresDoNotStarve(t *testing.T) {
-	f := newTickFixture(t)
-	f.ticker.MaxPerTick = 2
-	old := f.addMergedRun(1, tickNow.Add(-20*time.Hour))
-	for n := 2; n <= 4; n++ {
-		f.addMergedRun(n, tickNow.Add(-time.Duration(6+n)*time.Hour))
-		f.forge.prErr[n] = fmt.Errorf("%w: get pr", forge.ErrForbidden)
-	}
-	f.tick()
-	if len(f.ciRows(old)) != 1 {
-		t.Fatalf("older run rows = %d after tick 1, want 1 (oldest maturity first)", len(f.ciRows(old)))
+	for trial := 0; trial < 16; trial++ {
+		f := newTickFixture(t)
+		f.ticker.MaxPerTick = 2
+		for n := 2; n <= 8; n++ {
+			f.addMergedRun(n, tickNow.Add(-time.Duration(6+n)*time.Hour))
+			f.forge.prErr[n] = fmt.Errorf("%w: get pr", forge.ErrForbidden)
+		}
+		old := f.addMergedRun(1, tickNow.Add(-20*time.Hour)) // inserted LAST
+		f.tick()
+		if len(f.ciRows(old)) != 1 {
+			t.Fatalf("trial %d: older run rows = %d after tick 1, want 1 (oldest maturity first)", trial, len(f.ciRows(old)))
+		}
+		var evaluated []int
+		for n := 1; n <= 8; n++ {
+			if f.forge.gets(n) > 0 {
+				evaluated = append(evaluated, n)
+			}
+		}
+		if fmt.Sprint(evaluated) != "[1 8]" {
+			t.Fatalf("trial %d: evaluated PRs = %v, want [1 8] (the two oldest maturities)", trial, evaluated)
+		}
 	}
 }
 
@@ -519,6 +533,56 @@ func TestTick_TerminalAfterCheckRunsFailure_CarriesMergeFacts(t *testing.T) {
 	}
 	if f.forge.checkCalls != forgeAttempts {
 		t.Fatalf("check calls = %d, want %d (a 5xx is retried)", f.forge.checkCalls, forgeAttempts)
+	}
+}
+
+// The terminal deadline keys on the FORGE maturity once GetPullRequest has
+// returned merged_at: an 8-day-old forge merge whose merge-evidence row landed
+// only 7 hours ago records its terminal row on the first failing tick.
+// Counterfactual: anchoring on the evidence maturity backs off instead.
+func TestTick_TerminalDeadline_ForgeMergeOlderThanEvidence(t *testing.T) {
+	f := newTickFixture(t)
+	id := f.addMergedRun(42, tickNow.Add(-7*time.Hour))
+	forgeMerged := tickNow.Add(-8 * 24 * time.Hour)
+	f.forge.prs[42].MergedAt = &forgeMerged
+	f.forge.checksErr = errors.New("githubclient: list check runs: 503: unavailable")
+	sum := f.tick()
+	rows := f.ciRows(id)
+	if len(rows) != 1 || sum.Terminal != 1 {
+		t.Fatalf("rows = %v sum = %+v, want one terminal row on the first tick", rows, sum)
+	}
+	r := rows[0]
+	if r["missing_reason"] != "observation_failed" || r["matures_at"] != "2026-09-02T18:00:00Z" ||
+		r["merge_evidence_at"] != "2026-09-10T05:00:00Z" || r["observation_error_class"] != "transient" {
+		t.Fatalf("terminal row = %v, want matures_at from the forge merged_at", r)
+	}
+}
+
+// An evidence row OLDER than the forge merge never terminates observation
+// early: the deadline is the forge maturity + 7 days, also after a later
+// pre-PR failure (the forge PR this process already saw keeps anchoring it).
+// Counterfactuals: anchoring on the evidence maturity records a terminal row
+// on tick 1; dropping knownPull records one on tick 2.
+func TestTick_TerminalDeadline_EvidenceOlderThanForgeMerge(t *testing.T) {
+	f := newTickFixture(t)
+	id := f.addMergedRun(42, tickNow.Add(-8*24*time.Hour))
+	forgeMerged := tickNow.Add(-2 * 24 * time.Hour)
+	f.forge.prs[42].MergedAt = &forgeMerged
+	f.forge.checksErr = errors.New("githubclient: list check runs: 503: unavailable")
+	if sum := f.tick(); sum.Failed != 1 || len(f.ciRows(id)) != 0 {
+		t.Fatalf("tick 1: sum = %+v rows = %d, want a failure but no terminal row before the forge deadline", sum, len(f.ciRows(id)))
+	}
+	f.forge.prErr[42] = fmt.Errorf("%w: get pr", forge.ErrForbidden)
+	f.now = tickNow.Add(11 * time.Minute)
+	if sum := f.tick(); sum.Failed != 1 || len(f.ciRows(id)) != 0 {
+		t.Fatalf("tick 2: sum = %+v rows = %d, want a pre-PR failure still anchored on the forge maturity", sum, len(f.ciRows(id)))
+	}
+	f.now = tickNow.Add(5*24*time.Hour + 12*time.Hour)
+	f.tick()
+	rows := f.ciRows(id)
+	if len(rows) != 1 || rows[0]["observation_error_class"] != "forbidden" || rows[0]["merge_commit_sha"] != shaFor(42) ||
+		rows[0]["matures_at"] != "2026-09-08T18:00:00Z" {
+		t.Fatalf("rows = %v, want one terminal row past the forge deadline carrying the remembered merge facts", rows)
 	}
 }
 
