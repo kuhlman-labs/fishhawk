@@ -58,6 +58,13 @@ type AwaitStageInput struct {
 //     PendingAmendment carries the row to decide and NextStep the pre-filled
 //     fishhawk_decide_scope_amendment call.
 //
+// One settled read does NOT release (#3964 / ADR-087): an awaiting_host_dispatch
+// stage QUEUED for a local concurrency slot whose waiter is live (concurrency
+// status awaiting_concurrency_slot, waiter_live true) is held — the waiter
+// spawns it on admission, so the wait keeps polling on its ticker. With no live
+// waiter it releases as "settled" carrying Concurrency and a re-dispatch
+// Message. See stageWaitHeldForSlot.
+//
 // Settledness WINS over amendment_pending, and the guarantee is enforced rather
 // than asserted: the amendment probe re-reads the stage before resolving and
 // prefers `settled` if the stage settled while the amendment list was in
@@ -112,7 +119,7 @@ type AwaitStageOutput struct {
 	FailureReason       string           `json:"failure_reason,omitempty" jsonschema:"the failed stage's reason, when the settled state is failed"`
 	StageWaitStatus     *StageWaitStatus `json:"stage_wait_status,omitempty" jsonschema:"the classified execution wait status (same shape get_run_status / dispatch_stage carry), for continuity; the raw state + terminal fields are the authority. On a settled implement stage it may carry fixup_recovered (#3081) — the marker that the latest fix-up pass FAILED and was recovered, so no fix-up commit landed. On the 'timeout' status it carries the best-effort health read behind timeout_kind (#3626) — agent_timeout_seconds / deadline_seconds_remaining — and is ABSENT when that read failed, in which case stage health is UNKNOWN"`
 	WaitedSeconds       float64          `json:"waited_seconds" jsonschema:"elapsed wall time spent waiting"`
-	Message             string           `json:"message,omitempty" jsonschema:"actionable explanation on the timeout / run_terminal statuses, AND on a SETTLED status whose stage_wait_status carries fixup_recovered (#3081) — a fix-up pass that failed and was recovered, so the succeeded status is misleading about the fix-up"`
+	Message             string           `json:"message,omitempty" jsonschema:"actionable explanation on the timeout / run_terminal statuses, on a SETTLED status whose stage_wait_status carries fixup_recovered (#3081) — a fix-up pass that failed and was recovered, so the succeeded status is misleading about the fix-up — AND on a SETTLED awaiting_host_dispatch stage queued for a local concurrency slot with NO live waiter (#3964), telling you to re-dispatch it with fishhawk_dispatch_stage"`
 	PollIntervalSeconds int              `json:"poll_interval_seconds,omitempty" jsonschema:"server-suggested cadence (seconds) for switching to fishhawk_get_run_status polling; present only on the timeout status"`
 	// Heartbeat reports whether the CLIENT supplied a progressToken and a
 	// per-tick keep-alive was therefore emitted (#2490). Present on every return
@@ -132,6 +139,11 @@ type AwaitStageOutput struct {
 	// PendingAmendment (#2588), reusing the SuggestedAction shape from
 	// next_actions.go so the operator acts in one hop.
 	NextStep *SuggestedAction `json:"next_step,omitempty" jsonschema:"the single call to make on the amendment_pending status: fishhawk_decide_scope_amendment with run_id + amendment_id pre-filled"`
+	// Concurrency is the settled stage's local concurrency-slot block (#3964 /
+	// ADR-087), carried when the read had one. On a settled
+	// awaiting_host_dispatch stage it is how a queued stage whose waiter is
+	// gone (waiter_live false) is told apart from one simply never dispatched.
+	Concurrency *StageConcurrency `json:"concurrency,omitempty" jsonschema:"the stage's local concurrency-slot block on a settled read (#3964), when it has one: status awaiting_concurrency_slot with waiter_live false means the stage is queued for a slot but NO waiter will spawn it — re-dispatch with fishhawk_dispatch_stage"`
 }
 
 // awaitStageDefaultStageType is the stage type awaited when the caller omits
@@ -188,6 +200,15 @@ is distinguishable from a succeeded stage. (A freshly dispatched local stage
 can legitimately be awaiting_host_dispatch, which IS settled — so a wait
 against a never-dispatched stage returns immediately, and the raw state says
 why.)
+
+Local concurrency queue (#3964): a local implement stage that could not get
+this host's concurrency slot stays awaiting_host_dispatch, QUEUED
+(concurrency.status awaiting_concurrency_slot). While a live waiter refreshes
+its queue row (concurrency.waiter_live true — fishhawk_dispatch_stage started
+one) that is NOT treated as settled: the wait keeps polling until the waiter
+spawns the stage and it settles for real. With no live waiter it releases as
+"settled" with state awaiting_host_dispatch, the concurrency block, and a
+message telling you to re-dispatch with fishhawk_dispatch_stage.
 
 A pending scope amendment does NOT park the stage: it stays 'running' — there
 is no awaiting_scope_decision transition on this path, and that state now
@@ -323,7 +344,7 @@ func (r *runResolver) awaitStage(ctx context.Context, req *mcp.CallToolRequest, 
 	if err != nil {
 		return nil, AwaitStageOutput{}, fmt.Errorf("read stage wait: %w", err)
 	}
-	if sw.Terminal {
+	if stageWaitSettled(sw) {
 		return nil, r.awaitStageSettled(ctx, runID, stageUUID, stageType, sw, start, heartbeat, capSeconds), nil
 	}
 
@@ -391,7 +412,7 @@ func (r *runResolver) awaitStage(ctx context.Context, req *mcp.CallToolRequest, 
 				}
 				return nil, AwaitStageOutput{}, fmt.Errorf("poll stage wait: %w", err)
 			}
-			if sw.Terminal {
+			if stageWaitSettled(sw) {
 				return nil, r.awaitStageSettled(pollCtx, runID, stageUUID, stageType, sw, start, heartbeat, capSeconds), nil
 			}
 			// Second release condition (#2588) on every tick, after the settled
@@ -407,6 +428,29 @@ func (r *runResolver) awaitStage(ctx context.Context, req *mcp.CallToolRequest, 
 			}
 		}
 	}
+}
+
+// stageWaitHeldForSlot reports a read that is settled ONLY because the stage is
+// parked at awaiting_host_dispatch while QUEUED for a local concurrency slot
+// with a live waiter (#3964 / ADR-087): concurrency status
+// awaiting_concurrency_slot and waiter_live true. That stage is not waiting on
+// the operator — the waiter spawns it on admission — so releasing would hand
+// the caller a "settled" stage that is about to run. The backend's ?wait
+// returns at once for a settled state, so a held wait re-reads on the ticker.
+func stageWaitHeldForSlot(sw *RunStageWait) bool {
+	return sw.Terminal &&
+		sw.State == "awaiting_host_dispatch" &&
+		sw.Concurrency != nil &&
+		sw.Concurrency.Status == concurrencyStatusAwaitingSlot &&
+		sw.Concurrency.waiterLive()
+}
+
+// stageWaitSettled is the await's release predicate: the endpoint's
+// settledness flag, minus a stage held for a concurrency slot. Every settled
+// check in this file goes through it, so the fast path, the poll loop, the
+// amendment re-read and the run-terminal final read agree.
+func stageWaitSettled(sw *RunStageWait) bool {
+	return sw.Terminal && !stageWaitHeldForSlot(sw)
 }
 
 // awaitStageRunTerminalBackstop resolves the wait when the run itself has
@@ -428,7 +472,7 @@ func (r *runResolver) awaitStageRunTerminalBackstop(ctx context.Context, runID, 
 	// Final read: a settlement landing at/after the terminal transition still
 	// resolves as settled and beats the backstop.
 	sw, ferr := r.api.GetRunStageWait(ctx, runID, stageID, 0)
-	if ferr == nil && sw != nil && sw.Terminal {
+	if ferr == nil && sw != nil && stageWaitSettled(sw) {
 		return r.awaitStageSettled(ctx, runID, stageID, stageType, sw, start, heartbeat, capSeconds), true
 	}
 	return AwaitStageOutput{
@@ -507,7 +551,7 @@ func (r *runResolver) awaitStageAmendmentRelease(ctx context.Context, runID, sta
 	if item == nil {
 		return AwaitStageOutput{}, false
 	}
-	if sw, err := r.api.GetRunStageWait(ctx, runID, stageUUID, 0); err == nil && sw != nil && sw.Terminal {
+	if sw, err := r.api.GetRunStageWait(ctx, runID, stageUUID, 0); err == nil && sw != nil && stageWaitSettled(sw) {
 		return r.awaitStageSettled(ctx, runID, stageUUID, stageType, sw, start, heartbeat, capSeconds), true
 	}
 	return awaitStageAmendmentPendingOutput(stageType, stageUUID.String(), runID, state, item, start, heartbeat, capSeconds), true
@@ -622,6 +666,19 @@ func awaitStageSettledOutput(stageType string, sw *RunStageWait, start time.Time
 	}
 	if sw.FailureReason != nil {
 		out.FailureReason = *sw.FailureReason
+	}
+	if sw.Concurrency != nil {
+		out.Concurrency = sw.Concurrency
+		// Released while queued: stageWaitSettled only lets a queued
+		// awaiting_host_dispatch read through when no live waiter refreshes
+		// the queue row, so nothing will spawn the stage (#3964).
+		if sw.State == "awaiting_host_dispatch" && sw.Concurrency.Status == concurrencyStatusAwaitingSlot && !sw.Concurrency.waiterLive() {
+			out.Message = fmt.Sprintf("stage %q is queued for local concurrency slot group %q (position %d) at awaiting_host_dispatch, "+
+				"but NO live waiter is refreshing its queue row (waiter_live false) — the dispatch waiter exited (MCP process "+
+				"restart, /mcp, or its cap) — so nothing will spawn it and its stale row no longer holds its place. "+
+				"Re-dispatch it with fishhawk_dispatch_stage, which re-queues it and starts a waiter.",
+				stageType, sw.Concurrency.Group, sw.Concurrency.Position)
+		}
 	}
 	return out
 }

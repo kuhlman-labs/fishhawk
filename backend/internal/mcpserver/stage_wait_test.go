@@ -895,3 +895,59 @@ func TestFixupRecovery_DetailsAvailableIsNotOmitempty(t *testing.T) {
 		t.Errorf("details_available:false was dropped from the wire: %s", raw)
 	}
 }
+
+// TestStageWaitStatus_ProjectsConcurrency pins the #3964 projection: a
+// non-terminal stage carries its concurrency-slot block onto the wait status
+// (the surface fishhawk_get_run_status renders), including on a terminal run
+// (the ADR-036 window, where the stage can still be admitted); a terminal stage
+// never advertises one, even if a block reached the client.
+func TestStageWaitStatus_ProjectsConcurrency(t *testing.T) {
+	live := true
+	block := &StageConcurrency{
+		Status:     concurrencyStatusAwaitingSlot,
+		Group:      "local-implement:h1",
+		Limit:      1,
+		Position:   1,
+		Holders:    []ConcurrencyHolder{{RunID: "r-a", StageID: "s-a", Since: waitBase}},
+		WaiterLive: &live,
+	}
+	cases := []struct {
+		name     string
+		state    string
+		runState string
+		block    *StageConcurrency
+		want     *StageConcurrency
+	}{
+		{"queued non-terminal projects", "awaiting_host_dispatch", "running", block, block},
+		{"non-terminal stage on a terminal run still projects", "awaiting_host_dispatch", "failed", block, block},
+		{"terminal stage omits a stray block", "succeeded", "running", block, nil},
+		{"no block stays nil", "awaiting_host_dispatch", "running", nil, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stages := []Stage{{ID: "s-b", Type: "implement", State: tc.state, Concurrency: tc.block}}
+			st := stageWaitStatusFor(stages, "implement", tc.runState, 0, waitBase)
+			if st == nil {
+				t.Fatal("stage wait status nil")
+			}
+			if st.Concurrency != tc.want {
+				t.Errorf("Concurrency = %+v, want %+v", st.Concurrency, tc.want)
+			}
+			// A queued stage still buckets to pending: the block, not the
+			// status, is where the queue is visible.
+			if tc.state == "awaiting_host_dispatch" && st.Status != "pending" {
+				t.Errorf("Status = %q, want pending", st.Status)
+			}
+		})
+	}
+
+	// The wire key the get_run_status consumer reads.
+	raw, err := json.Marshal(stageWaitStatusFor([]Stage{{Type: "implement", State: "awaiting_host_dispatch", Concurrency: block}}, "implement", "running", 0, waitBase))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(raw), `"concurrency":{"status":"awaiting_concurrency_slot"`) ||
+		!strings.Contains(string(raw), `"waiter_live":true`) {
+		t.Errorf("wire = %s, want the concurrency block with status + waiter_live", raw)
+	}
+}
