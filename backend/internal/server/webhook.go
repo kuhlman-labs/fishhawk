@@ -197,6 +197,16 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		s.handleContractChildClosed(r.Context(), ev)
 	}
 
+	// `push` to the default branch drives revert detection (E82.2 / #3779):
+	// a revert signal in a pushed commit is resolved and forge-confirmed
+	// against a run's merge, then recorded as run_merge_reverted. Routed
+	// LAST and outside the dispatcher's bot-sender skip, so a revert pushed
+	// by the GitHub App is still observed; the observation runs detached,
+	// so it never delays or influences the 202.
+	if ev.Type == "push" {
+		s.observeDefaultBranchPush(r.Context(), ev)
+	}
+
 	w.WriteHeader(http.StatusAccepted)
 }
 
