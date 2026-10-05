@@ -181,9 +181,10 @@ func upkeepGuardRecognizedKind(kind string) bool {
 //   - a store that did not answer, storage → 500, stage untouched (the runner
 //     retries; idempotent via GetByHash, which HEALS a missing audit row).
 //
-// The tracker dedupe runs BEFORE the critical section and never fails the
-// ingest: a degraded dedupe is recorded (dedupe_degraded, a named reason, an
-// empty duplicates array), not hidden.
+// The tracker dedupe and the Dependabot coverage read (#3750) run BEFORE the
+// critical section and never fail the ingest: a degraded dedupe or coverage
+// read is recorded (dedupe_degraded / coverage_degraded, a named reason, an
+// empty duplicates / covered array), not hidden.
 func (s *Server) handleUpkeepReport(w http.ResponseWriter, r *http.Request, runID, stageID uuid.UUID, stage *run.Stage, body []byte) {
 	ctx := r.Context()
 	if stage.Type != run.StageTypePlan {
@@ -237,6 +238,11 @@ func (s *Server) handleUpkeepReport(w http.ResponseWriter, r *http.Request, runI
 
 	// Outside the mutex: no forge read is held under the lock.
 	dedupe := s.upkeepDuplicates(ctx, runRow, upkeepProposals(report))
+	coverage := s.upkeepCoverage(ctx, runRow, report)
+	sourceDegrades := report.SourceDegrades
+	if sourceDegrades == nil {
+		sourceDegrades = []plan.UpkeepSourceDegrade{}
+	}
 
 	contentHash := sha256Hex(body)
 	schemaVersion := plan.UpkeepReportVersion
@@ -255,9 +261,20 @@ func (s *Server) handleUpkeepReport(w http.ResponseWriter, r *http.Request, runI
 			"dedupe_degraded":         dedupe.Degraded,
 			"dedupe_scanned_items":    dedupe.ScannedItems,
 			"dedupe_window_truncated": dedupe.WindowTruncated,
+			// Always a JSON array ([] when none or degraded): the apply reads
+			// this key three-state (absent = a pre-#3750 row, no marks).
+			"covered":                   coverage.Covered,
+			"coverage_degraded":         coverage.Degraded,
+			"coverage_scanned_pulls":    coverage.ScannedPulls,
+			"coverage_window_truncated": coverage.WindowTruncated,
+			// Always a JSON array, copied from the report (#3750).
+			"source_degrades": sourceDegrades,
 		}
 		if dedupe.Degraded {
 			m["dedupe_degrade_reason"] = dedupe.DegradeReason
+		}
+		if coverage.Degraded {
+			m["coverage_degrade_reason"] = coverage.DegradeReason
 		}
 		p, _ := json.Marshal(m)
 		return p
@@ -346,13 +363,12 @@ func (s *Server) refuseUpkeepStage(w http.ResponseWriter, r *http.Request, runID
 }
 
 // upkeepEntryCounts is the per-source census recorded in the audit payload.
-// Every key is always present.
+// Every key is always present: "findings" plus one per plan.UpkeepSources()
+// member, so a new source joins the census with the enum.
 func upkeepEntryCounts(r *plan.UpkeepReport) map[string]int {
-	counts := map[string]int{
-		"findings":                      len(r.Findings),
-		plan.UpkeepSourceFlake:          0,
-		plan.UpkeepSourceToolchainDrift: 0,
-		plan.UpkeepSourceDeprecation:    0,
+	counts := map[string]int{"findings": len(r.Findings)}
+	for _, src := range plan.UpkeepSources() {
+		counts[src] = 0
 	}
 	for _, f := range r.Findings {
 		counts[f.Source]++

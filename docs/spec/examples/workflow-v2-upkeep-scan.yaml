@@ -23,8 +23,8 @@
 #
 # WHAT IT DOES. The `scan` stage is a `plan`-typed PROPOSE stage (ADR-067 §2:
 # the v0 stage-type names are retained but general). It emits an upkeep_report —
-# recorded-run flake, toolchain-pin drift and deprecation findings to file —
-# instead of a plan, and a captain approves it. The `file` stage then applies
+# recorded-run flake, toolchain-pin drift, deprecation and dependency-advisory
+# findings to file — instead of a plan, and a captain approves it. The `file` stage then applies
 # the approved findings by filing them as issues. No stage declares the
 # pull_request artifact, so this workflow produces NO diff; at major >= 2 an
 # absent produces list reads as "produces no diff", and a post-hoc diff
@@ -41,6 +41,16 @@
 # NO `inputs`. A scan is not issue-anchored: it reads the repository and its
 # recorded runs, not an issue body.
 #
+# ADVISORIES (#3750). The scan agent runs `govulncheck -json ./...` per Go
+# module (falling back to a pinned `go run golang.org/x/vuln/cmd/govulncheck@
+# v1.7.0`) and `pnpm audit --json` per pnpm lockfile, read-only, in its own
+# worktree. Both query advisory databases, so the `scan` stage NEEDS NETWORK
+# EGRESS: without it the report names `advisory` in `source_degrades`
+# (`network_unavailable`) instead of listing it in `sources_scanned` — never an
+# empty clean advisory scan. An advisory an open Dependabot pull request already
+# fixes is reported and marked covered by the server, then skipped at filing.
+# GitHub Dependabot ALERTS are not read yet; that source awaits #3749.
+#
 # THE TRIGGER FORM AND CADENCE. `applies_to: {trigger: [scheduled, on_demand]}`
 # is the non-diff routing declaration (ADR-067) and is REQUIRED by the schedule
 # below, which starts `scheduled` runs. The cadence is weekly, Monday 09:00 UTC.
@@ -51,9 +61,10 @@ workflows:
   upkeep_scan:
     description: >-
       Scan for repository upkeep work — recorded-run flakes, toolchain-pin
-      drift and deprecations — propose it as an upkeep report, gate the report
-      on a human approval, then file the approved findings as issues. Produces
-      no code diff at any stage.
+      drift, deprecations and dependency vulnerability advisories (govulncheck
+      reachability, pnpm audit) — propose it as an upkeep report, gate the
+      report on a human approval, then file the approved findings as issues.
+      Produces no code diff at any stage.
     auto_advance: true
 
     applies_to:
@@ -69,7 +80,8 @@ workflows:
       # proposal, and here the proposal is an upkeep report. The artifact binds
       # to the stage TYPE, requires its schema for the same forward-compatibility
       # reason a plan declares standard_v1, and may not share the stage with a
-      # plan or grooming_report artifact.
+      # plan or grooming_report artifact. The advisory scanners need network
+      # access to their advisory databases (see ADVISORIES above).
       - id: scan
         type: plan
         executor:

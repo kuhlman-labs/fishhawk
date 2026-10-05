@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://fishhawk.dev/spec/upkeep-report-v1.schema.json",
   "title": "Fishhawk upkeep report artifact (plan-stage sibling)",
-  "description": "The THIRD additive sibling of the plan artifact (after clarification-request-v1 and grooming-report-v1), produced by a `plan`-typed PROPOSE stage that DECLARES `produces: upkeep_report` (E79 / #3726, #3921). Selected over plan-standard-v1 by the top-level 'kind' discriminator BEFORE validation, so plan-standard-v1.schema.json stays frozen. An upkeep report is a PROPOSAL, never an applied mutation: it lists the maintenance findings a scan found (flaky tests, toolchain drift, deprecations), each with the evidence that supports it and the issue it proposes filing, and a human decides what (if anything) to file. `sources_scanned` records what the scan COVERED, so an empty `findings` array reads 'none found', not 'not scanned'. Every finding carries a stable `id` DERIVED as `<source>:<subject>` (never minted per run), so two reports over the same tree diff mechanically and a filed issue's hidden marker `<!-- fishhawk-upkeep:v1 finding_id=<id> -->` matches exactly. Cross-field rules the schema cannot state (id derivation, uniqueness, run-id syntax, per-source evidence shape, label syntax) are enforced by the backend semantic layer; see upkeep-report-v1.md for the normative contract.",
+  "description": "The THIRD additive sibling of the plan artifact (after clarification-request-v1 and grooming-report-v1), produced by a `plan`-typed PROPOSE stage that DECLARES `produces: upkeep_report` (E79 / #3726, #3921). Selected over plan-standard-v1 by the top-level 'kind' discriminator BEFORE validation, so plan-standard-v1.schema.json stays frozen. An upkeep report is a PROPOSAL, never an applied mutation: it lists the maintenance findings a scan found (flaky tests, toolchain drift, deprecations, vulnerability advisories), each with the evidence that supports it and the issue it proposes filing, and a human decides what (if anything) to file. `sources_scanned` records what the scan COVERED, so an empty `findings` array reads 'none found', not 'not scanned'. Every finding carries a stable `id` DERIVED as `<source>:<subject>` (never minted per run), so two reports over the same tree diff mechanically and a filed issue's hidden marker `<!-- fishhawk-upkeep:v1 finding_id=<id> -->` matches exactly. Cross-field rules the schema cannot state (id derivation, uniqueness, run-id syntax, per-source evidence shape, label syntax, and the advisory rules: reachability derived from the call path, severity capped by reachability, scanner/ecosystem pairing, a cited manifest, a bare fixed version, source_degrades consistency and the advisory source accounted for) are enforced by the backend semantic layer; see upkeep-report-v1.md for the normative contract.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -43,7 +43,7 @@
       "items": {
         "$ref": "#/$defs/source"
       },
-      "description": "The detector sources this scan RAN. Every finding's `source` must appear here (a semantic rule). Recording coverage separately from findings is what lets an empty `findings` array mean 'scanned, none found' rather than 'not scanned'."
+      "description": "The detector sources this scan RAN. Every finding's `source` must appear here (a semantic rule). Recording coverage separately from findings is what lets an empty `findings` array mean 'scanned, none found' rather than 'not scanned'. A source the scan could not run is left OUT of this array and named in `source_degrades` instead."
     },
     "findings": {
       "type": "array",
@@ -52,6 +52,14 @@
         "$ref": "#/$defs/finding"
       },
       "description": "The findings, each proposing one issue. May be empty. Capped at 200 so one report bounds the ingest's dedupe and run-ref lookups."
+    },
+    "source_degrades": {
+      "type": "array",
+      "maxItems": 8,
+      "items": {
+        "$ref": "#/$defs/source-degrade"
+      },
+      "description": "Optional (#3750). The NAMED degradations of this scan: one entry per source that could not run at all (reason other than `partial`; the source is then NOT in sources_scanned) or that ran only in part (reason `partial`; the source IS in sources_scanned). It is what keeps an advisory scan that could not reach its database from reading as a clean 'none found'. At most one entry per source, and the reason/sources_scanned pairing, are semantic rules; so is the advisory accounting: a report carrying any entry here must list `advisory` in sources_scanned (it ran) or name it here with a reason other than `partial` (it did not run). The residual: a report with no entry here and no advisory finding cannot be told apart from a pre-#3750 report, so zero advisory findings from a scan that never ran advisories is not detectable."
     }
   },
   "$defs": {
@@ -120,9 +128,10 @@
       "enum": [
         "flake",
         "toolchain_drift",
-        "deprecation"
+        "deprecation",
+        "advisory"
       ],
-      "description": "Detector source. flake: a test that failed and then passed on the same tree across runs. toolchain_drift: one tool pinned to different versions in different files. deprecation: use of a deprecated API or construct."
+      "description": "Detector source. flake: a test that failed and then passed on the same tree across runs. toolchain_drift: one tool pinned to different versions in different files. deprecation: use of a deprecated API or construct. advisory (#3750): a dependency the repository pins is named by a published vulnerability advisory; the finding carries an `advisory` object."
     },
     "finding": {
       "type": "object",
@@ -137,7 +146,7 @@
       "properties": {
         "id": {
           "type": "string",
-          "pattern": "^(flake|toolchain_drift|deprecation):[^\\s<>]+$",
+          "pattern": "^(flake|toolchain_drift|deprecation|advisory):[^\\s<>]+$",
           "description": "Stable finding id, DERIVED as `<source>:<subject>` (the backend checks the derivation and report-wide uniqueness). The pattern forbids whitespace and angle brackets so the hidden marker `<!-- fishhawk-upkeep:v1 finding_id=<id> -->` a filed issue carries matches EXACTLY: `flake:TestA` never matches the marker of `flake:TestAB`."
         },
         "source": {
@@ -148,7 +157,7 @@
           "minLength": 1,
           "maxLength": 256,
           "pattern": "^[^\\s<>]+$",
-          "description": "What the finding is about, with no whitespace or angle bracket: a test name for flake, a tool name for toolchain_drift, an API or construct for deprecation. It is the id's suffix."
+          "description": "What the finding is about, with no whitespace or angle bracket: a test name for flake, a tool name for toolchain_drift, an API or construct for deprecation, `<primary advisory id>:<package>` for advisory (a semantic rule). It is the id's suffix."
         },
         "evidence": {
           "type": "array",
@@ -157,7 +166,10 @@
           "items": {
             "$ref": "#/$defs/evidence-ref"
           },
-          "description": "At least one evidence ref. The per-source shape (a flake cites a run; a toolchain_drift names at least two distinct lined file paths; a deprecation names a file) is a semantic rule."
+          "description": "At least one evidence ref. The per-source shape (a flake cites a run; a toolchain_drift names at least two distinct lined file paths; a deprecation names a file; an advisory names at least one manifest file — basename go.mod, pnpm-lock.yaml or package.json) is a semantic rule."
+        },
+        "advisory": {
+          "$ref": "#/$defs/advisory"
         },
         "proposed_issue": {
           "$ref": "#/$defs/proposed-issue"
@@ -246,7 +258,7 @@
         "type",
         "labels"
       ],
-      "description": "The issue the finding proposes filing. Filing is a separate, gated step (#3924); an open issue already carrying this finding's marker, or a similar title, marks the finding a duplicate at ingest instead.",
+      "description": "The issue the finding proposes filing. Filing is a separate, gated step (#3924); an open issue already carrying this finding's marker, or a similar title, marks the finding a duplicate at ingest instead. For an `advisory` finding the filed title and body are SERVER-RENDERED from the advisory object, so the agent-authored title and body here are read at the gate but never reach the tracker (#3750).",
       "properties": {
         "title": {
           "type": "string",
@@ -276,6 +288,189 @@
           "type": "string",
           "minLength": 1,
           "description": "Optional parent epic: a positive issue number, bare or `#`-prefixed (a semantic rule)."
+        }
+      }
+    },
+    "advisory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ecosystem",
+        "package",
+        "version",
+        "advisory_ids",
+        "fixed_version",
+        "scanner",
+        "reachability",
+        "severity"
+      ],
+      "description": "The advisory facts of an `advisory` finding (#3750). Present on, and only on, a finding whose source is `advisory` (a semantic rule). The scan agent copies these from the scanner output; the server cannot re-run the scanner, so it BOUNDS the claim instead: `reachability` must equal the level derived from `call_path[0]`, `severity` is capped by `reachability`, `scanner` pairs with `ecosystem`, and the finding must cite a manifest file. Normative contract: upkeep-report-v1.md.",
+      "properties": {
+        "ecosystem": {
+          "type": "string",
+          "enum": [
+            "go",
+            "npm"
+          ],
+          "description": "Package ecosystem of the affected dependency."
+        },
+        "package": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 214,
+          "pattern": "^[^\\s<>]+$",
+          "description": "The affected dependency. For Go this is the MODULE path (golang.org/x/net), never the vulnerable package path inside it (golang.org/x/net/http2); for npm, the package name. It is the subject's suffix after the primary advisory id."
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The in-use version. When one finding cites several manifests, the LOWEST in-use version across them."
+        },
+        "advisory_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 20,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 40,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+          },
+          "description": "Advisory identifiers. Index 0 is the PRIMARY id the subject is derived from: the GO- id for Go, the GHSA id for npm. Aliases (CVE, GHSA) follow."
+        },
+        "fixed_version": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "description": "ONE bare version carrying the fix (the lowest patched version on the in-use major line), or an explicit null when the advisory has no fix. Never a range: a value carrying any of `<>=^~|*`, whitespace or a comma is refused (a semantic rule). REQUIRED: absence is a schema error, so 'no fix' is always stated, never implied."
+        },
+        "scanner": {
+          "type": "string",
+          "enum": [
+            "govulncheck",
+            "pnpm_audit",
+            "osv"
+          ],
+          "description": "The scanner that reported the advisory. govulncheck pairs with go, pnpm_audit with npm, osv with either (a semantic rule). `osv` is RESERVED: no OSV command is instructed yet."
+        },
+        "reachability": {
+          "type": "string",
+          "enum": [
+            "called",
+            "imported",
+            "required",
+            "unanalyzed"
+          ],
+          "description": "How deeply the repository reaches the vulnerable code. For govulncheck it must equal the level derived from call_path[0]: a function -> called, else a package -> imported, else a module -> required. pnpm_audit and osv report no reachability, so they are always unanalyzed."
+        },
+        "call_path": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "$ref": "#/$defs/advisory-frame"
+          },
+          "description": "govulncheck only, required non-empty there and absent or empty otherwise: the finding's `trace` copied VERBATIM from `govulncheck -json`, ordered from the vulnerable end (index 0) toward the entry point. A trace longer than 32 frames keeps index 0 onward and truncates the FAR end, never the vulnerable end."
+        },
+        "severity": {
+          "type": "string",
+          "enum": [
+            "high",
+            "medium",
+            "low"
+          ],
+          "description": "Proposed severity, CAPPED by reachability (a semantic rule): called may be any; imported and required at most low; unanalyzed at most medium."
+        }
+      }
+    },
+    "advisory-frame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "module"
+      ],
+      "description": "One govulncheck `-json` trace frame, with govulncheck's own field names (golang.org/x/vuln internal/govulncheck Frame), so a frame is copied verbatim. additionalProperties is false so a frame carrying an unexpected key is refused, not silently dropped.",
+      "properties": {
+        "module": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Module path of the module containing the symbol; `stdlib` for the standard library."
+        },
+        "version": {
+          "type": "string",
+          "description": "Module version from the build graph."
+        },
+        "package": {
+          "type": "string",
+          "description": "Import path."
+        },
+        "function": {
+          "type": "string",
+          "description": "Function name."
+        },
+        "receiver": {
+          "type": "string",
+          "description": "Receiver type when the symbol is a method."
+        },
+        "position": {
+          "$ref": "#/$defs/advisory-position"
+        }
+      }
+    },
+    "advisory-position": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "A govulncheck source position. The filename is relative to the enclosing module's directory and uses `/`.",
+      "properties": {
+        "filename": {
+          "type": "string"
+        },
+        "offset": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Byte offset, from 0."
+        },
+        "line": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Line, from 1 (0 marks an invalid position)."
+        },
+        "column": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Column in bytes, from 1."
+        }
+      }
+    },
+    "source-degrade": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "reason"
+      ],
+      "description": "One named degradation of a source (#3750).",
+      "properties": {
+        "source": {
+          "$ref": "#/$defs/source"
+        },
+        "reason": {
+          "type": "string",
+          "enum": [
+            "network_unavailable",
+            "tool_unavailable",
+            "tool_failed",
+            "budget_exceeded",
+            "partial"
+          ],
+          "description": "network_unavailable: the source's database or registry was unreachable. tool_unavailable: the scanner is not installed and its fallback could not run. tool_failed: the scanner ran and failed. budget_exceeded: the stage ran out of time before the source finished. partial: the source ran, but not over everything (the detail names what was missed); only partial pairs with the source being in sources_scanned."
+        },
+        "detail": {
+          "type": "string",
+          "maxLength": 500,
+          "description": "Optional free-text: what failed or what was missed."
         }
       }
     }

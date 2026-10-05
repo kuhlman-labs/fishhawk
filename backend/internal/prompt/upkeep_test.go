@@ -414,3 +414,158 @@ func TestBuildUpkeepScan_RejectionAndRevision(t *testing.T) {
 		RevisionConstraintEndMarker,
 	)
 }
+
+// TestBuildUpkeepScan_Advisories pins the `### Advisories` section (#3750),
+// one arm per rule, so deleting or rewording a rule reddens the arm naming it.
+// Expected strings are LITERALS, not the plan constants, so a constant whose
+// wire value drifts reddens here too.
+func TestBuildUpkeepScan_Advisories(t *testing.T) {
+	got := buildUpkeep(t, upkeepScanTrigger())
+	arms := []struct {
+		rule  string
+		wants []string
+	}{
+		{"section heading", []string{"### Advisories"}},
+		{"advisory is a sources_scanned value", []string{"(`flake`, `toolchain_drift`, `deprecation`, `advisory`)"}},
+		{"govulncheck per go.mod directory", []string{
+			"in EACH directory holding a `go.mod`",
+			"`use` directory of `go.work`",
+			"run `govulncheck -json ./...`",
+		}},
+		{"pinned govulncheck fallback", []string{"`go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 -json ./...`"}},
+		{"pnpm audit per lockfile directory, read-only", []string{
+			"in EACH directory holding a `pnpm-lock.yaml`, run `pnpm audit --json`",
+			"Never `pnpm install` and never `pnpm audit --fix`",
+		}},
+		{"pnpm audit non-zero exit is not tool_failed", []string{
+			"`pnpm audit` exits NON-ZERO when it finds vulnerabilities — that is its findings report, NOT `tool_failed`",
+		}},
+		{"OSV reserved, not instructed", []string{"Do NOT run an OSV scanner", "The `osv` scanner value is RESERVED"}},
+		{"deepest level, trace copied verbatim", []string{
+			"per OSV id take the DEEPEST finding level",
+			"copy that finding's `trace` VERBATIM as `call_path`",
+		}},
+		{"32-frame truncation keeps index 0", []string{
+			"Index 0 is the vulnerable end: keep it",
+			"longer than 32 frames keep frames 0-31 and truncate the far end",
+		}},
+		{"reachability from call_path[0]", []string{
+			"a function is `called`, a package `imported`, a module only `required`",
+		}},
+		{"Go package is the MODULE path", []string{
+			"For Go, `package` is the MODULE path",
+			"never a package path inside the module",
+		}},
+		{"pnpm is unanalyzed with no call_path", []string{"`reachability: unanalyzed` with NO `call_path`"}},
+		{"fixed_version is one bare version or null", []string{
+			"`fixed_version` is ONE bare version — the lowest patched version on the in-use major line",
+			"reduce a `patched_versions` range such as `>=7.3.5` to `7.3.5`",
+			"or JSON `null` when no fix is published",
+			"NEVER a range: no `<`, `>`, `=`, `^`, `~`, `|`, `*`, whitespace or comma",
+		}},
+		{"multi-module merge", []string{
+			"emit ONE finding per (primary advisory id, package)",
+			"cites EVERY manifest where the package appears",
+			"`version` is the LOWEST in-use version",
+			"come from the module with the strongest reachability",
+		}},
+		{"subject and id derivation", []string{
+			"`subject` is `<advisory_ids[0]>:<package>`",
+			"`advisory:GO-2024-2687:golang.org/x/net`",
+		}},
+		{"severity by reachability", []string{
+			"`called` -> `high` unless the advisory is clearly low impact",
+			"`imported` and `required` -> `low`",
+			"`unanalyzed` (pnpm) -> at most `medium`",
+		}},
+		{"manifests cited as file refs", []string{
+			"cite EVERY manifest as a file ref",
+			"basename `go.mod`, `pnpm-lock.yaml` or `package.json`",
+			"it never stands in for a manifest",
+		}},
+		{"named degradation", []string{
+			"leave `advisory` OUT of sources_scanned and emit `source_degrades: [{source: advisory, reason: network_unavailable, detail}]`",
+			"list `advisory` AND add a `partial` degrade",
+			"NEVER emit an empty, clean-looking advisory scan that did not run",
+		}},
+		{"advisory accounted for in exactly one place", []string{
+			"The `advisory` source MUST be accounted for in exactly ONE place: listed in sources_scanned when it ran, " +
+				"or named in source_degrades with the reason it did not run — never neither",
+			"`partial` (it ran in part, so it IS in sources_scanned)",
+		}},
+		{"disclosure", []string{
+			"NEVER quote call-path frames",
+			"agent prose quoting the call path never reaches the tracker",
+		}},
+		{"coverage note", []string{
+			"report an advisory even when an open Dependabot pull request already bumps the package past the fix",
+			"the server marks it covered and skips filing it",
+		}},
+		{"source_degrades replaces say-so-in-summary", []string{
+			"leave it out of sources_scanned AND name it in source_degrades (reason `budget_exceeded`)",
+			"leave `deprecation` out of sources_scanned AND name it in source_degrades (reason `network_unavailable`)",
+		}},
+		{"bump exclusion scoped to non-advisory sources", []string{
+			"For the `flake`, `toolchain_drift` and `deprecation` sources, NEVER propose a finding whose remedy is a dependency version bump",
+			"This exclusion does NOT apply to the `advisory` source",
+		}},
+	}
+	for _, arm := range arms {
+		for _, w := range arm.wants {
+			if !strings.Contains(got, w) {
+				t.Errorf("%s: upkeep prompt missing %q", arm.rule, w)
+			}
+		}
+	}
+
+	// The superseded sentences are gone: a degraded source is NAMED in
+	// source_degrades, not only described in summary.
+	for _, gone := range []string{
+		"leave it out of sources_scanned and say so in summary",
+		"(or name the gap in `summary` when it was scanned partly)",
+	} {
+		if strings.Contains(got, gone) {
+			t.Errorf("upkeep prompt still carries the superseded sentence %q", gone)
+		}
+	}
+	// No OSV command is instructed (the scanner value is reserved).
+	for _, cmd := range []string{"osv-scanner", "api.osv.dev"} {
+		if strings.Contains(got, cmd) {
+			t.Errorf("upkeep prompt instructs an OSV command %q; osv is RESERVED (#3750)", cmd)
+		}
+	}
+	// The section sits between Deprecations and the bump exclusion, so the
+	// exclusion that names it reads after it.
+	dep, adv, excl := strings.Index(got, "\n### Deprecations\n"), strings.Index(got, "\n### Advisories\n"),
+		strings.Index(got, "\n### Excluded: dependency bumps\n")
+	if dep < 0 || adv < 0 || excl < 0 || dep >= adv || adv >= excl {
+		t.Errorf("section order: Deprecations@%d Advisories@%d Excluded@%d, want Deprecations < Advisories < Excluded",
+			dep, adv, excl)
+	}
+}
+
+// TestUpkeepGovulncheckModule_Pinned: the fallback is pinned to an exact
+// version, never @latest — a floating ref lets a new govulncheck release
+// change the -json stream the classification rules copy verbatim.
+func TestUpkeepGovulncheckModule_Pinned(t *testing.T) {
+	if UpkeepGovulncheckModule != "golang.org/x/vuln/cmd/govulncheck@v1.7.0" {
+		t.Errorf("UpkeepGovulncheckModule = %q, want the captured-fixture pin golang.org/x/vuln/cmd/govulncheck@v1.7.0",
+			UpkeepGovulncheckModule)
+	}
+}
+
+// TestBuild_Plan_CarriesNoAdvisorySection: the ordinary plan prompt never
+// carries the advisory scan instructions.
+func TestBuild_Plan_CarriesNoAdvisorySection(t *testing.T) {
+	tr := upkeepScanTrigger()
+	tr.Upkeep = nil
+	got, err := Build("plan", tr)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, marker := range []string{"### Advisories", "govulncheck", "pnpm audit"} {
+		if strings.Contains(got, marker) {
+			t.Errorf("plan prompt carries advisory marker %q", marker)
+		}
+	}
+}

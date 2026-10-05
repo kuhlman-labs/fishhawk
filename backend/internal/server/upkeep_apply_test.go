@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -217,6 +218,12 @@ type ukApplyOpts struct {
 	duplicates      []upkeep.Duplicate
 	// rawDuplicates, when non-nil, replaces the recorded row's duplicates value.
 	rawDuplicates json.RawMessage
+	// reportBody, when non-nil, replaces the fixture's report body (#3750:
+	// the advisory example).
+	reportBody []byte
+	// covered, when non-nil, is the recorded row's `covered` value; nil
+	// leaves the key ABSENT (a pre-#3750 row).
+	covered json.RawMessage
 }
 
 type ukApplyFixture struct {
@@ -292,6 +299,9 @@ func newUkApplyFixture(t *testing.T, opts ukApplyOpts) *ukApplyFixture {
 	}
 
 	body := ukApplyReportBody(t, findings)
+	if opts.reportBody != nil {
+		body = opts.reportBody
+	}
 	if opts.badBody {
 		body = []byte(`{"kind":"upkeep_report","not":"parseable"`)
 	}
@@ -318,7 +328,11 @@ func newUkApplyFixture(t *testing.T, opts ukApplyOpts) *ukApplyFixture {
 			}
 			dups, _ = json.Marshal(d)
 		}
-		f.recordRow(t, map[string]any{"run_id": stage.RunID.String(), "artifact_id": art.ID.String(), "duplicates": dups})
+		row := map[string]any{"run_id": stage.RunID.String(), "artifact_id": art.ID.String(), "duplicates": dups}
+		if opts.covered != nil {
+			row["covered"] = opts.covered
+		}
+		f.recordRow(t, row)
 	}
 	return f
 }
@@ -1248,4 +1262,350 @@ func TestApplyApprovedUpkeep_AtomicSettlementPath(t *testing.T) {
 			t.Errorf("File calls = %d, want 0", n)
 		}
 	})
+}
+
+// ---------------------------------------------------------------------------
+// Advisory findings (#3750): Dependabot coverage and server-rendered filings
+// ---------------------------------------------------------------------------
+
+// ukAdvisoryBody is the shipped advisory example with mutate applied to each
+// finding's proposed_issue (keyed by finding id), re-validated.
+func ukAdvisoryBody(t *testing.T, mutate map[string]func(issue map[string]any)) []byte {
+	t.Helper()
+	var doc map[string]any
+	if err := json.Unmarshal(upkeepAdvisoryExampleBody(t), &doc); err != nil {
+		t.Fatal(err)
+	}
+	for _, raw := range doc["findings"].([]any) {
+		fd := raw.(map[string]any)
+		if m := mutate[fd["id"].(string)]; m != nil {
+			m(fd["proposed_issue"].(map[string]any))
+		}
+	}
+	b, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, perr := plan.ParseUpkeepReport(b); perr != nil {
+		t.Fatalf("mutated advisory report is not valid: %v", perr)
+	}
+	return b
+}
+
+// ukCoveredRaw marks ukAdvNet covered by Dependabot pull request #3823.
+func ukCoveredRaw(t *testing.T) json.RawMessage {
+	t.Helper()
+	raw, err := json.Marshal([]upkeep.Covered{{FindingID: ukAdvNet, Package: "golang.org/x/net",
+		Pulls: []upkeep.CoveringPull{{Number: 3823, URL: "https://github.com/kuhlman-labs/fishhawk/pull/3823",
+			Directory: "backend", BumpsTo: "0.23.0"}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
+// TestApplyApprovedUpkeep_SkipsCoveredByDependabotPR: finding X (ukAdvNet) is
+// APPROVED, not a duplicate and never filed, and the recorded row marks it
+// covered. It is skipped covered_by_dependabot_pr carrying the pull request,
+// and nothing is filed. X is approved and non-duplicate, so the covered case
+// is the only thing between it and filing: delete it and X is filed → red.
+func TestApplyApprovedUpkeep_SkipsCoveredByDependabotPR(t *testing.T) {
+	f := newUkApplyFixture(t, ukApplyOpts{reportBody: upkeepAdvisoryExampleBody(t), covered: ukCoveredRaw(t)})
+	f.grant(t)
+	f.dispose(t, ukAdvNet, upkeepVerdictApproved, false, "")
+	f.apply(t, approval.DecisionApprove)
+
+	if n := len(f.provider.requests()); n != 0 {
+		t.Fatalf("File calls = %d, want 0 (the only approved finding is covered)", n)
+	}
+	s := f.skips(t)[ukAdvNet]
+	if s.SkipReason != upkeepSkipCovered || len(s.CoveringPRNumbers) != 1 || s.CoveringPRNumbers[0] != 3823 ||
+		len(s.CoveringPRURLs) != 1 || s.CoveringPRURLs[0] != "https://github.com/kuhlman-labs/fishhawk/pull/3823" {
+		t.Errorf("skip = %+v, want covered_by_dependabot_pr by #3823", s)
+	}
+	if s.Source != plan.UpkeepSourceAdvisory {
+		t.Errorf("skip source = %q, want advisory", s.Source)
+	}
+	if c := f.completed(t); len(c) != 1 || c[0].Degraded || c[0].Filed != 0 || c[0].Skipped != 3 || c[0].Findings != 3 {
+		t.Errorf("completed = %+v, want {findings:3 filed:0 skipped:3}", c)
+	}
+}
+
+// TestApplyApprovedUpkeep_LegacyRowWithoutCoveredFiles: a recorded row with NO
+// `covered` key (recorded before #3750) reads as no marks, so approved X is
+// filed. Treating the absent key as unreadable degrades and files nothing →
+// red.
+func TestApplyApprovedUpkeep_LegacyRowWithoutCoveredFiles(t *testing.T) {
+	f := newUkApplyFixture(t, ukApplyOpts{reportBody: upkeepAdvisoryExampleBody(t)})
+	f.grant(t)
+	f.dispose(t, ukAdvNet, upkeepVerdictApproved, false, "")
+	f.apply(t, approval.DecisionApprove)
+
+	if n := len(f.provider.requests()); n != 1 {
+		t.Fatalf("File calls = %d, want 1", n)
+	}
+	if _, ok := f.filed(t)[ukAdvNet]; !ok {
+		t.Errorf("no upkeep_finding_filed row for %s", ukAdvNet)
+	}
+	if c := f.completed(t); len(c) != 1 || c[0].Degraded || c[0].Filed != 1 {
+		t.Errorf("completed = %+v, want one non-degraded {filed:1}", c)
+	}
+}
+
+// TestApplyApprovedUpkeep_CoverageUnreadableDegrades: a `covered` key that is
+// present but null, not an array, or an undecodable array fails closed —
+// upkeep_apply_coverage_unreadable, nothing filed, the window left settled
+// `approved`. X is approved, so a lenient decode (null as empty) lets it file
+// → red.
+func TestApplyApprovedUpkeep_CoverageUnreadableDegrades(t *testing.T) {
+	for name, raw := range map[string]string{
+		"null": `null`, "string": `"nope"`, "object": `{"finding_id":"x"}`, "array_of_numbers": `[1,2]`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newUkApplyFixture(t, ukApplyOpts{reportBody: upkeepAdvisoryExampleBody(t), covered: json.RawMessage(raw)})
+			f.grant(t)
+			f.dispose(t, ukAdvNet, upkeepVerdictApproved, false, "")
+			f.apply(t, approval.DecisionApprove)
+			if got := f.degradeReason(t); got != upkeepApplyCoverageUnreadable {
+				t.Errorf("degrade_reason = %q, want %q", got, upkeepApplyCoverageUnreadable)
+			}
+			if n := len(f.provider.requests()); n != 0 {
+				t.Errorf("File calls = %d, want 0", n)
+			}
+			if wm := f.watermarks(t); len(wm) != 1 || wm[0].Settlement != "approved" {
+				t.Errorf("watermarks = %+v, want one 'approved' (post-ratification)", wm)
+			}
+		})
+	}
+}
+
+// TestApplyApprovedUpkeep_AdvisoryFilingIsServerRendered (approval condition
+// 1): an approved advisory finding whose AGENT title and body quote the call
+// path through the repository's own code — the caller frame's function,
+// qualified name and filename — files a SERVER-RENDERED title and body that
+// contain none of them, nor any of the agent's prose. Filing the agent title
+// or body instead → red.
+//
+// Its agent LABELS (routed concern 9a5616a3) plant two frame-shaped tokens
+// beside area:/type:/phase: ones; only the three namespaces are filed and the
+// frame-shaped two are recorded stripped. Deleting the advisory namespace
+// narrowing files both → red.
+func TestApplyApprovedUpkeep_AdvisoryFilingIsServerRendered(t *testing.T) {
+	const (
+		agentTitle = "Fix serveH2 in internal/server/serve.go (GO-2024-2687)"
+		agentBody  = "govulncheck traced github.com/kuhlman-labs/fishhawk/backend/internal/server.serveH2 " +
+			"at internal/server/serve.go:88 into Framer.ReadFrame."
+	)
+	frameLabels := []string{"internal/server/serve.go", "server.serveH2"}
+	body := ukAdvisoryBody(t, map[string]func(map[string]any){ukAdvNet: func(issue map[string]any) {
+		issue["title"] = agentTitle
+		issue["body"] = agentBody
+		issue["labels"] = append([]string{"area:backend", "type:bug", "Phase:Alpha"}, frameLabels...)
+	}})
+	f := newUkApplyFixture(t, ukApplyOpts{reportBody: body})
+	f.grant(t)
+	f.dispose(t, ukAdvNet, upkeepVerdictApproved, false, "")
+	f.apply(t, approval.DecisionApprove)
+
+	reqs := f.provider.requests()
+	if len(reqs) != 1 {
+		t.Fatalf("File calls = %d, want 1", len(reqs))
+	}
+	title, filedBody := reqs[0].Item.Title, reqs[0].Item.Body
+	if want := "GO-2024-2687: golang.org/x/net v0.22.0 (high severity)"; title != want {
+		t.Errorf("filed title = %q, want the server-rendered %q", title, want)
+	}
+	for _, leak := range []string{agentTitle, agentBody, "serveH2", "internal/server/serve.go",
+		"github.com/kuhlman-labs/fishhawk/backend/internal/server.serveH2", "govulncheck traced"} {
+		if strings.Contains(title, leak) || strings.Contains(filedBody, leak) {
+			t.Errorf("filing quotes %q:\ntitle: %s\nbody:\n%s", leak, title, filedBody)
+		}
+	}
+	for _, want := range []string{"### Advisory facts (server-rendered)",
+		"- Advisory IDs: `GO-2024-2687`, `CVE-2023-45288`, `GHSA-4v7x-pqxf-cx7m`",
+		"- Fixed version: `v0.23.0`", "- Reachability: `called`", "- Manifests: `backend/go.mod`\n",
+		upkeep.FindingMarker(ukAdvNet)} {
+		if !strings.Contains(filedBody, want) {
+			t.Errorf("filed body lacks %q:\n%s", want, filedBody)
+		}
+	}
+	row := f.filed(t)[ukAdvNet]
+	if !row.ServerRendered || row.Title != title || row.Source != plan.UpkeepSourceAdvisory {
+		t.Errorf("filed row = %+v, want server_rendered true and the rendered title", row)
+	}
+	filedLabels := reqs[0].Item.Classification.Labels
+	for _, leak := range frameLabels {
+		if hasLabelFold(filedLabels, leak) {
+			t.Errorf("filed labels = %v, carry the frame-shaped label %q", filedLabels, leak)
+		}
+	}
+	for _, want := range []string{"area:backend", "type:bug", "phase:alpha"} {
+		if !hasLabelFold(filedLabels, want) {
+			t.Errorf("filed labels = %v, want %q", filedLabels, want)
+		}
+	}
+	if !reflect.DeepEqual(row.StrippedLabels, frameLabels) {
+		t.Errorf("stripped_labels = %v, want %v", row.StrippedLabels, frameLabels)
+	}
+}
+
+// TestApplyApprovedUpkeep_DuplicateWinsOverCovered (routed concern eb6584b6
+// arm a): an approved advisory finding the recorded row marks BOTH a
+// duplicate of an open issue AND covered by a Dependabot pull request is
+// skipped duplicate_of_open_issue, carrying the issue and no pull request.
+// Evaluating the covered case first records covered_by_dependabot_pr → red.
+func TestApplyApprovedUpkeep_DuplicateWinsOverCovered(t *testing.T) {
+	f := newUkApplyFixture(t, ukApplyOpts{
+		reportBody: upkeepAdvisoryExampleBody(t),
+		covered:    ukCoveredRaw(t),
+		duplicates: []upkeep.Duplicate{{FindingID: ukAdvNet, IssueNumber: 905, Basis: upkeep.BasisMarker}},
+	})
+	f.grant(t)
+	f.dispose(t, ukAdvNet, upkeepVerdictApproved, false, "")
+	f.apply(t, approval.DecisionApprove)
+
+	if n := len(f.provider.requests()); n != 0 {
+		t.Fatalf("File calls = %d, want 0", n)
+	}
+	s := f.skips(t)[ukAdvNet]
+	if s.SkipReason != upkeepSkipDuplicate || s.DuplicateIssueNumber != 905 || len(s.CoveringPRNumbers) != 0 {
+		t.Errorf("skip = %+v, want duplicate_of_open_issue #905 with no covering pull request", s)
+	}
+}
+
+// TestApplyApprovedUpkeep_AdvisoryFactsBlock: an approved advisory finding
+// with no published fix, whose agent body carries NONE of the facts, files a
+// body carrying every server-rendered facts line, with `no fix published`.
+// Drop the facts from the filing and the agent body carries none of these
+// lines → red.
+func TestApplyApprovedUpkeep_AdvisoryFactsBlock(t *testing.T) {
+	body := ukAdvisoryBody(t, map[string]func(map[string]any){ukAdvGHSA: func(issue map[string]any) {
+		issue["body"] = "See the weekly scan."
+	}})
+	f := newUkApplyFixture(t, ukApplyOpts{reportBody: body, covered: json.RawMessage(`[]`)})
+	f.grant(t)
+	f.dispose(t, ukAdvGHSA, upkeepVerdictApproved, false, "")
+	f.apply(t, approval.DecisionApprove)
+
+	reqs := f.provider.requests()
+	if len(reqs) != 1 {
+		t.Fatalf("File calls = %d, want 1", len(reqs))
+	}
+	got := reqs[0].Item.Body
+	for _, want := range []string{
+		"### Advisory facts (server-rendered)\n",
+		"- Advisory IDs: `GHSA-q8v2-3m4c-7x9p`\n",
+		"- Ecosystem: `npm`\n",
+		"- Package: `yaml-front-parser`\n",
+		"- In-use version: `2.1.0`\n",
+		"- Fixed version: no fix published\n",
+		"- Reachability: `unanalyzed`\n",
+		"- Severity: `medium`\n",
+		"- Manifests: `site/pnpm-lock.yaml`\n",
+		upkeep.FindingMarker(ukAdvGHSA),
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("filed body lacks %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "See the weekly scan.") {
+		t.Errorf("filed body carries the agent's prose:\n%s", got)
+	}
+	key := workmgmt.MintIdempotencyKey(upkeepIdempotencyNamespace, f.stage.RunID.String(), f.art.ID.String(), ukAdvGHSA)
+	if !workmgmt.BodyHasIdempotencyKey(got, key) {
+		t.Errorf("filed body lacks the idempotency key %s", key)
+	}
+}
+
+// TestUpkeepFilingProse: a non-advisory finding files its proposed title and
+// body byte-identically; an advisory finding never does, even one whose
+// advisory object is missing (unreachable past rule (l), and still rendered
+// from structured fields only).
+func TestUpkeepFilingProse(t *testing.T) {
+	dep := plan.UpkeepFinding{Source: plan.UpkeepSourceDeprecation,
+		ProposedIssue: plan.UpkeepProposedIssue{Title: "Replace pkg/a", Body: "Replace pkg/a.\n"}}
+	if title, body, rendered := upkeepFilingProse(dep); title != "Replace pkg/a" || body != "Replace pkg/a.\n" || rendered {
+		t.Errorf("deprecation prose = (%q, %q, %v), want the proposal unchanged", title, body, rendered)
+	}
+	if got := upkeepFilingBody("Replace pkg/a.\n", "deprecation:pkg/a"); got != "Replace pkg/a.\n\n"+upkeep.FindingMarker("deprecation:pkg/a") {
+		t.Errorf("non-advisory filing body = %q, want body + marker", got)
+	}
+	bare := plan.UpkeepFinding{Source: plan.UpkeepSourceAdvisory,
+		ProposedIssue: plan.UpkeepProposedIssue{Title: "agent title", Body: "agent body"}}
+	title, body, rendered := upkeepFilingProse(bare)
+	if !rendered || strings.Contains(title, "agent") || strings.Contains(body, "agent") {
+		t.Errorf("advisory prose = (%q, %q, %v), want server-rendered with no agent prose", title, body, rendered)
+	}
+}
+
+// TestUpkeepAdvisoryManifestPaths: only manifest file refs are listed — never
+// a call-site source file, a run ref, an absolute or root-escaping path, or a
+// repeat.
+func TestUpkeepAdvisoryManifestPaths(t *testing.T) {
+	f := &plan.UpkeepFinding{Evidence: []plan.UpkeepEvidenceRef{
+		{Kind: plan.UpkeepEvidenceKindFile, Path: "backend/go.mod"},
+		{Kind: plan.UpkeepEvidenceKindFile, Path: "backend/internal/server/serve.go"},
+		{Kind: plan.UpkeepEvidenceKindRun, Path: "runner/go.mod"},
+		{Kind: plan.UpkeepEvidenceKindFile, Path: "../go.mod"},
+		{Kind: plan.UpkeepEvidenceKindFile, Path: "/etc/go.mod"},
+		{Kind: plan.UpkeepEvidenceKindFile, Path: ""},
+		{Kind: plan.UpkeepEvidenceKindFile, Path: "site/pnpm-lock.yaml"},
+		{Kind: plan.UpkeepEvidenceKindFile, Path: "backend/go.mod"},
+		{Kind: plan.UpkeepEvidenceKindFile, Path: "go.mod"},
+	}}
+	got := upkeepAdvisoryManifestPaths(f)
+	want := []string{"backend/go.mod", "site/pnpm-lock.yaml", "go.mod"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("manifest paths = %v, want %v", got, want)
+	}
+}
+
+// TestUpkeepRecordedCoverage_ThreeStates pins the raw-JSON decision directly:
+// absent → no marks, an array → marks by finding id (an id-less mark is
+// dropped), anything else → unreadable.
+func TestUpkeepRecordedCoverage_ThreeStates(t *testing.T) {
+	entry := func(payload string) *audit.Entry { return &audit.Entry{Sequence: 7, Payload: json.RawMessage(payload)} }
+
+	if got, err := upkeepRecordedCoverage(entry(`{"artifact_id":"a","duplicates":[]}`)); err != nil || got == nil || len(got) != 0 {
+		t.Errorf("absent key = (%v, %v), want empty marks and no error", got, err)
+	}
+	got, err := upkeepRecordedCoverage(entry(`{"covered":[{"finding_id":"advisory:X:p","package":"p","pulls":[{"number":4,"directory":"backend","bumps_to":"1.0.0"}]},{"package":"q"}]}`))
+	if err != nil || len(got) != 1 || got["advisory:X:p"].Pulls[0].Number != 4 {
+		t.Errorf("array = (%+v, %v), want one mark for advisory:X:p", got, err)
+	}
+	long := `"` + strings.Repeat("x", 100) + `"`
+	for _, payload := range []string{`{"covered":null}`, `{"covered":"x"}`, `{"covered":` + long + `}`, `{"covered":[1]}`, `[]`} {
+		if got, err := upkeepRecordedCoverage(entry(payload)); err == nil {
+			t.Errorf("payload %s = %v, want an unreadable error", payload, got)
+		}
+	}
+	if s := upkeepTruncateRaw(json.RawMessage(long)); !strings.HasSuffix(s, "...[truncated]") || len(s) > 64+len("...[truncated]") {
+		t.Errorf("truncated = %q, want 64 bytes plus the marker", s)
+	}
+}
+
+// TestUpkeepRecordedRow_SelectsHighestSequenceForArtifact: the ONE row both
+// the duplicates and the coverage marks are read from is the highest-sequence
+// recorded row naming the artifact; rows naming another artifact or not
+// decoding are passed over, and no matching row or a list failure is an error.
+func TestUpkeepRecordedRow_SelectsHighestSequenceForArtifact(t *testing.T) {
+	f := newUkApplyFixture(t, ukApplyOpts{omitRecordedRow: true})
+	ctx := context.Background()
+	art := f.art.ID.String()
+	if _, err := f.s.upkeepRecordedRow(ctx, f.stage.RunID, art); err == nil {
+		t.Error("no recorded row: want an error")
+	}
+	f.recordRow(t, map[string]any{"artifact_id": art, "duplicates": []any{}, "marker": "first"})
+	f.recordRow(t, map[string]any{"artifact_id": uuid.NewString(), "duplicates": []any{}})
+	f.appendRow(t, CategoryUpkeepReportRecorded, "not an object")
+	f.recordRow(t, map[string]any{"artifact_id": art, "duplicates": []any{}, "marker": "newest"})
+	f.recordRow(t, map[string]any{"artifact_id": uuid.NewString(), "duplicates": []any{}})
+	e, err := f.s.upkeepRecordedRow(ctx, f.stage.RunID, art)
+	if err != nil || !strings.Contains(string(e.Payload), `"newest"`) {
+		t.Fatalf("selected row = %v (err %v), want the newest row naming %s", e, err, art)
+	}
+	f.au.listErrCategories = map[string]error{CategoryUpkeepReportRecorded: errors.New("audit down")}
+	if _, err := f.s.upkeepRecordedRow(ctx, f.stage.RunID, art); err == nil {
+		t.Error("list failure: want an error")
+	}
 }

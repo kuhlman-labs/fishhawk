@@ -396,7 +396,7 @@ components:
                 type: string
               source:
                 type: string
-                enum: [flake, toolchain_drift, deprecation]
+                enum: [flake, toolchain_drift, deprecation, advisory]
                 description: The finding's source, copied from the bound report.
               verdict:
                 type: string

@@ -3,12 +3,14 @@
 Normative reference for the plan-stage artifact an upkeep scan ships (E79 /
 #3726, contract #3921). Schema: [`upkeep-report-v1.schema.json`](upkeep-report-v1.schema.json)
 (Draft 2020-12, embedded at `backend/internal/plan/schemas/` by
-`scripts/sync-schemas`). Example: [`examples/upkeep-report-v1-example.json`](examples/upkeep-report-v1-example.json).
-Dedupe contract and residuals: `backend/internal/upkeep/README.md`.
+`scripts/sync-schemas`). Examples: [`examples/upkeep-report-v1-example.json`](examples/upkeep-report-v1-example.json),
+[`examples/upkeep-report-v1-advisory-example.json`](examples/upkeep-report-v1-advisory-example.json) (#3750).
+Dedupe and Dependabot-coverage contracts and residuals: `backend/internal/upkeep/README.md`.
 
 An upkeep report is a PROPOSAL. It lists maintenance findings — flaky tests,
-toolchain drift, deprecations — each with evidence and a proposed issue. Nothing
-is filed on ingest; filing is a later, gated step (#3924).
+toolchain drift, deprecations, vulnerability advisories — each with evidence and
+a proposed issue. Nothing is filed on ingest; filing is a later, gated step
+(#3924).
 
 ## Discrimination
 
@@ -28,21 +30,24 @@ All objects are `additionalProperties: false`.
 | `ticket_reference` | yes | `{type: github_issue, url, id}` — the run's originating ticket; verbatim `grooming-report-v1` shape |
 | `generated_by` | yes | `{agent, model, version?, timestamp}` — verbatim `grooming-report-v1` shape |
 | `summary` | yes | string, minLength 1 |
-| `sources_scanned` | yes | array of `flake` / `toolchain_drift` / `deprecation`, minItems 1, uniqueItems |
+| `sources_scanned` | yes | array of `flake` / `toolchain_drift` / `deprecation` / `advisory`, minItems 1, uniqueItems |
 | `findings` | yes | array of finding, maxItems 200, MAY be empty |
+| `source_degrades` | no (#3750) | array of [source degrade](#source-degrades-3750), maxItems 8 |
 
 `sources_scanned` records what the scan COVERED. An empty `findings` array with
 `sources_scanned: [flake]` reads "scanned for flakes, none found", never "not
-scanned".
+scanned". A source the scan could not run is left OUT of `sources_scanned` and
+NAMED in `source_degrades`.
 
 ### Finding
 
 | Field | Required | Shape |
 |---|---|---|
-| `id` | yes | pattern `^(flake\|toolchain_drift\|deprecation):[^\s<>]+$` |
-| `source` | yes | `flake` / `toolchain_drift` / `deprecation` |
-| `subject` | yes | 1..256 chars, pattern `^[^\s<>]+$` (test name, tool name, API) |
+| `id` | yes | pattern `^(flake\|toolchain_drift\|deprecation\|advisory):[^\s<>]+$` |
+| `source` | yes | `flake` / `toolchain_drift` / `deprecation` / `advisory` |
+| `subject` | yes | 1..256 chars, pattern `^[^\s<>]+$` (test name, tool name, API; for an advisory `<primary id>:<package>`) |
 | `evidence` | yes | 1..50 evidence refs |
+| `advisory` | on, and only on, an `advisory` finding (rule l) | see [Advisory object](#advisory-object-3750) |
 | `proposed_issue` | yes | see below |
 
 ### Evidence ref (`oneOf`, discriminated by `kind`)
@@ -62,6 +67,52 @@ may suggest a tier; it never sets one. The repository's work-management
 conventions may still add their DEFAULT tier (`label_defaults.autonomy`, e.g.
 `autonomy:medium`) when the filed labels carry none — that is the conventions'
 choice, not the scan's. See [Apply](#apply-on-gate-decision-3924).
+
+### Advisory object (#3750)
+
+The facts of one vulnerability advisory. The scan agent copies them from the
+scanner output (`govulncheck -json` per Go module, `pnpm audit --json` per pnpm
+lockfile directory). They are AGENT-ASSERTED: the server cannot re-run the
+scanner, so the semantic rules BOUND the claim instead of re-deriving it.
+
+| Field | Required | Shape |
+|---|---|---|
+| `ecosystem` | yes | `go` / `npm` |
+| `package` | yes | 1..214 chars, no whitespace or `<` `>`. **Go: the MODULE path** (`golang.org/x/net`), never the vulnerable package inside it (`golang.org/x/net/http2`); npm: the package name. |
+| `version` | yes | the in-use version (the LOWEST across merged manifests, below) |
+| `advisory_ids` | yes | 1..20 unique ids; **index 0 is the PRIMARY id** (`GO-` for Go, `GHSA-` for npm), aliases (CVE, GHSA) follow |
+| `fixed_version` | yes, nullable | ONE bare version — the lowest patched version on the in-use major line — or an explicit `null` for "no fix". Never a range (rule s). The key is required, so "no fix" is always stated, never implied. |
+| `scanner` | yes | `govulncheck` (pairs with `go`) / `pnpm_audit` (pairs with `npm`) / `osv` (either; **RESERVED** — no OSV command is instructed yet) |
+| `reachability` | yes | `called` / `imported` / `required` (govulncheck's symbol / package / module levels) / `unanalyzed` (every scanner that reports none) |
+| `call_path` | govulncheck only, non-empty there | ≤ 32 frames copied VERBATIM from govulncheck's `trace`, field names and tags govulncheck's own (`module`, `version?`, `package?`, `function?`, `receiver?`, `position?{filename?, offset, line, column}`). Ordered from the VULNERABLE end (index 0) toward the entry point. **A longer trace keeps index 0 onward and truncates the FAR end**, never the vulnerable end. |
+| `severity` | yes | `high` / `medium` / `low`, capped by reachability (rule p) |
+
+**Multi-module merge (normative).** One finding per `(primary id, package)`. An
+advisory that appears in several manifests (two `go.work` modules pinning the
+same module) is ONE finding that cites EVERY manifest where it appears as a file
+ref; `version` is the LOWEST in-use version across them, and `reachability` /
+`call_path` come from the module with the STRONGEST reachability
+(`called` > `imported` > `required`). A call-site source file MAY also be cited
+as evidence, but only a manifest (basename `go.mod`, `pnpm-lock.yaml`,
+`package.json`) is ever a Dependabot-coverage directory.
+
+**Version comparison.** Coverage compares `fixed_version` against a Dependabot
+bump by semver §11 precedence after trimming a leading `v`. Go pseudo-versions
+are valid semver prereleases and compare by that precedence; anything that does
+not parse (a range, a partial version, empty) is NOT comparable and never covers.
+
+### Source degrades (#3750)
+
+`{source, reason, detail?}` — one entry per source that could not run at all
+(any reason but `partial`; the source is then NOT in `sources_scanned`), or that
+ran only in part (`partial`; the source IS in `sources_scanned`). `reason` is
+`network_unavailable` (the source's database or registry was unreachable),
+`tool_unavailable` (the scanner and its pinned fallback could not run),
+`tool_failed` (the scanner ran and failed — NOT `pnpm audit` exiting non-zero
+because it FOUND vulnerabilities, which is its normal result), `budget_exceeded`,
+or `partial`. `detail` is free text, ≤ 500 chars. A scan whose advisory database
+was unreachable reports `{advisory, network_unavailable}`, never an empty clean
+advisory scan.
 
 ## Finding id derivation (normative)
 
@@ -100,9 +151,29 @@ violation is a `*plan.SemanticError` naming the JSON pointer; ingest maps it to
 | (i) each label is non-empty, ≤ 50 runes, has no whitespace or control rune, and no leading or trailing punctuation or symbol rune (the `workmgmt` grooming label rule) | `/findings/<i>/proposed_issue/labels/<k>` |
 | (j) `parent_epic`, when present, is a positive integer, bare or `#`-prefixed | `/findings/<i>/proposed_issue/parent_epic` |
 | (k) at most 200 distinct `run_id`s across the report | `/findings` |
+| (l) `source: advisory` ⇔ an `advisory` object is present | `/findings/<i>/advisory` |
+| (m) an advisory's `subject == advisory_ids[0] + ":" + package` | `/findings/<i>/subject` |
+| (n) scanner/ecosystem pairing: `govulncheck` ⇒ `go`, `pnpm_audit` ⇒ `npm`, `osv` ⇒ either | `/findings/<i>/advisory/scanner` |
+| (o) reachability consistency: `govulncheck` ⇒ a non-empty `call_path`, `reachability` equals the level derived from `call_path[0]` (a function ⇒ `called`, else a package ⇒ `imported`, else a module ⇒ `required`) and `call_path[0].module == package`; `pnpm_audit` / `osv` ⇒ `unanalyzed` with no `call_path` | `/findings/<i>/advisory/reachability` (`/advisory/package` for the module) |
+| (p) severity cap: `called` ⇒ any; `imported` / `required` ⇒ `low`; `unanalyzed` ⇒ `medium` or `low` | `/findings/<i>/advisory/severity` |
+| (q) an advisory cites at least one MANIFEST file ref (basename `go.mod`, `pnpm-lock.yaml` or `package.json`) | `/findings/<i>/evidence` |
+| (r) `source_degrades`: at most one entry per source; `partial` ⇒ the source IS in `sources_scanned`, any other reason ⇒ it is NOT | `/source_degrades/<k>` |
+| (s) a non-null `fixed_version` is ONE bare version, never a range: none of `<` `>` `=` `^` `~` `\|` `*`, whitespace or a comma | `/findings/<i>/advisory/fixed_version` |
+| (t) a report carrying an advisory finding or ANY `source_degrades` entry accounts for `advisory` in exactly one place: in `sources_scanned` (it ran; a partial run adds a `partial` degrade) or named by a non-`partial` degrade (it did not run) | `/sources_scanned` |
 
 Evidence COUNT (minItems 1) is the schema's job and is deliberately not
 re-checked by the semantic layer.
+
+Rules (l)–(t) fire only on an advisory finding, an advisory object or a
+`source_degrades` entry, so every pre-#3750 stored report (re-parsed by the
+dispositions capture and the apply) still parses.
+
+**Residual of rule (t).** A report with NO advisory finding and NO
+`source_degrades` entry carries no signal that the advisory source exists, so
+zero advisory findings from a scan that never ran the scanners is
+indistinguishable from a pre-#3750 report. The rule closes every other shape of
+"the tool never ran but the report reads clean"; this one remains, and the
+captain reading `sources_scanned` at the gate is its only backstop.
 
 ## Dedupe
 
@@ -118,6 +189,47 @@ window of existing work items (`backend/internal/upkeep.MarkDuplicates`):
 A marked finding is reported, not dropped: the apply step skips its filing. A
 failed or timed-out tracker read DEGRADES to no duplicates with a named reason
 (`reader_error`, `budget_exceeded`, …) and the report is still ingested.
+
+## Dependabot coverage (#3750)
+
+On ingest every advisory finding WITH a `fixed_version` is checked against the
+repository's open pull requests (GitHub only, at most 300, one 10s budget;
+`backend/internal/upkeep.MarkCovered`). A finding is COVERED iff it cites at
+least one manifest and, for EVERY cited manifest directory, some open pull
+request authored by `dependabot[bot]`, on a head ref of the finding's ecosystem
+(`dependabot/go_modules/…` ⇒ `go`, `dependabot/npm_and_yarn/…` ⇒ `npm`) and
+targeting the repository's default branch (`base.ref` equal to
+`base.repo.default_branch`, both known), bumps the same package in that exact
+directory FROM a version on the finding's `version` line (same major; for `0.x`
+the same minor) to a version at least `fixed_version`. A multi-package pull
+request's updates are read only from the body's leading summary — before the
+first `<details>`, `Release notes` / `Changelog` / `Commits` line or markdown
+heading — because the rest embeds upstream-authored release notes, and a
+non-group multi-dependency title counts only a package it names.
+
+A covered finding is still PROPOSED and visible at the gate; the apply skips its
+filing (`covered_by_dependabot_pr`). Every rule fails toward NOT covered — a
+`null` fix, an unparseable version, a grouped pull request spanning several
+directories, a group package listed after the first embedded release-notes
+block, a bump of another version line, a pull request on another base branch,
+an unknown ecosystem, a truncated listing — so these residuals only leave a
+finding to be filed.
+
+**FALSE-COVER risk (the unsafe direction).** Coverage reaches only the
+directories of the manifests the finding CITES. A finding that under-cites (the
+module is also pinned in a manifest it does not name) can be marked covered by a
+bump that misses that manifest, and is then not filed. Covered marks are only as
+complete as the agent's manifest citations; the multi-module merge rule above is
+what the scan prompt instructs to prevent it. The version-line check is likewise
+only as sound as the agent-asserted `version`, and a bump on the SAME line as a
+second instance of the package (two `1.x` copies in one lockfile) covers both.
+Text an upstream maintainer authored inside an embedded release-notes block can
+no longer cover; text Dependabot renders ahead of that block is trusted as
+Dependabot's own.
+
+Coverage is a snapshot at INGEST: a Dependabot pull request closed between
+ingest and the gate still suppresses filing (the next scan re-proposes the
+finding), and one opened after ingest does not cover.
 
 ## Ingest (`POST /v0/runs/{run_id}/plan`)
 
@@ -154,13 +266,21 @@ One chained audit row per persisted report:
 |---|---|
 | `run_id`, `stage_id`, `artifact_id` | UUID strings |
 | `content_hash`, `schema_version`, `size_bytes` | artifact identity |
-| `entry_counts` | `{findings, flake, toolchain_drift, deprecation}` — every key always present |
+| `entry_counts` | `{findings, flake, toolchain_drift, deprecation, advisory}` — every key always present (one per `sources_scanned` enum member) |
 | `duplicates` | ALWAYS a JSON array (`[]` when none or degraded); each `{finding_id, issue_number, issue_url?, basis, score?, confidence?}` |
 | `dedupe_degraded` | bool, always present |
 | `dedupe_degrade_reason` | present only when degraded |
 | `dedupe_scanned_items`, `dedupe_window_truncated` | the window the marks were drawn from |
+| `covered` (#3750) | ALWAYS a JSON array (`[]` when none, nothing coverable, or degraded); each `{finding_id, package, pulls:[{number, url?, directory, bumps_to}]}`, one pull per cited manifest directory |
+| `coverage_degraded` | bool, always present |
+| `coverage_degrade_reason` | present only when degraded: `forge_unsupported`, `github_unwired`, `repo_malformed`, `scope_unavailable`, `pull_list_failed`, `budget_exceeded`, `coverage_panic` |
+| `coverage_scanned_pulls`, `coverage_window_truncated` | the open pull requests the marks were drawn from |
+| `source_degrades` | ALWAYS a JSON array, copied verbatim from the report (`[]` when it carries none) |
 
-On success the stage settles to `awaiting_approval`.
+A report with no advisory finding carrying a `fixed_version` records
+`covered: []` with no forge read. A degraded coverage read records `covered: []`
+and the report is still ingested. On success the stage settles to
+`awaiting_approval`.
 
 ## Dispositions (`POST/GET /v0/runs/{run_id}/upkeep-dispositions`, #3923)
 
@@ -254,27 +374,51 @@ contract: `backend/internal/server/README.md` § "On-approval upkeep apply".
 |---|---|---|
 | `not_approved` | `upkeep_finding_skipped` | No consumed disposition, or a `rejected` one. |
 | `duplicate_of_open_issue` | `upkeep_finding_skipped` | The finding is in the recorded row's `duplicates` (marker or similarity). Carries `duplicate_issue_number`, `duplicate_issue_url`, `duplicate_basis`. |
+| `covered_by_dependabot_pr` | `upkeep_finding_skipped` | The finding is in the recorded row's `covered` (#3750). Carries `covering_pr_numbers`, `covering_pr_urls`. |
 | `already_filed` | `upkeep_finding_skipped` | An `upkeep_finding_filed` row for this artifact and finding exists (a re-apply). Carries `prior_issue_number`. |
 | `apply_budget_exhausted` | `upkeep_finding_skipped` | The detached loop's budget expired before this finding. |
 | `filing_failed` | `upkeep_finding_skipped` | The work-item core refused the filing (`code`, `message`); the loop continues. |
-| filed | `upkeep_finding_filed` | `{run_id, stage_id, artifact_id, finding_id, source, issue_number, issue_url, provider, title, parent_epic, applied_labels, stripped_labels, idempotency_key}`. |
+| filed | `upkeep_finding_filed` | `{run_id, stage_id, artifact_id, finding_id, source, issue_number, issue_url, provider, title, parent_epic, applied_labels, stripped_labels, idempotency_key, server_rendered?}`. |
+
+`covered` is read from the SAME highest-sequence recorded row as `duplicates`,
+on the raw JSON: key ABSENT ⇒ no marks (a row recorded before #3750, whose
+report cannot carry an advisory finding); present but `null` or not an array ⇒
+degrade `upkeep_apply_coverage_unreadable` (window closed, nothing filed); an
+array ⇒ marks by `finding_id`.
 
 A filed issue's body is the proposed body plus the [hidden marker](#hidden-marker)
 on its own line, and is stamped with an idempotency key minted from
 `(upkeep_finding, run_id, artifact_id, finding_id)`. Its parent epic is the
 disposition's `parent_epic` override, else the proposal's, normalized to `#N`.
 Its labels are the proposal's minus every `autonomy:*` label unless
-`authorize_delegation_tier` is true; `applied_labels` are the labels actually
-filed (after the conventions' label completeness), `stripped_labels` the removed
+`authorize_delegation_tier` is true, and for an `advisory` finding minus every
+label outside the `area:`, `type:` and `phase:` namespaces (an authorized
+`autonomy:*` label included); `applied_labels` are the labels actually filed
+(after the conventions' label completeness), `stripped_labels` the removed
 ones.
+
+**Advisory filings are SERVER-RENDERED (#3750).** For an `advisory` finding the
+apply IGNORES the agent's `proposed_issue.title` and `proposed_issue.body`. The
+title is `<primary id>: <package> <version> (<severity> severity)`; the body is
+a `### Advisory facts (server-rendered)` block listing every advisory id, the
+ecosystem, package, in-use version, fixed version (or `no fix published`),
+reachability, severity and the cited manifest paths — then the hidden marker. No
+call-path frame and no agent prose reaches the tracker through the title or
+body, and a structured value that is not a plain token is withheld. The filed
+row carries `server_rendered: true`. Labels are narrowed to the `area:`,
+`type:` and `phase:` namespaces, so a frame-shaped label (`server.serveH2`)
+is stripped; the suffix inside a kept namespace is still agent-chosen until the
+filing-label allow-list (#3956). Type and parent epic follow the ordinary
+rules.
 
 **Summary.** ONE `upkeep_apply_completed` row per apply: `{artifact_id,
 findings, filed, skipped, failed, budget_exhausted, degraded, degrade_reason?}`.
-`skipped` counts `not_approved` / `duplicate_of_open_issue` / `already_filed`;
-`failed` counts `filing_failed`. A degraded row carries zero counts and one
+`skipped` counts `not_approved` / `duplicate_of_open_issue` /
+`covered_by_dependabot_pr` / `already_filed`; `failed` counts `filing_failed`. A degraded row carries zero counts and one
 `degrade_reason`: `upkeep_apply_report_unreadable`, `upkeep_apply_not_ratified`,
 `upkeep_apply_window_unsettled` (all three leave the window open),
-`upkeep_apply_duplicates_unreadable`, `upkeep_apply_prior_filings_unreadable`,
+`upkeep_apply_duplicates_unreadable`, `upkeep_apply_coverage_unreadable`,
+`upkeep_apply_prior_filings_unreadable`,
 `upkeep_apply_run_unreadable`, `upkeep_apply_repo_unresolvable`,
 `upkeep_apply_conventions_unavailable`, `upkeep_apply_prelaunch_timeout`. A
 reject writes the `rejected` watermark only — no per-finding or summary row —
