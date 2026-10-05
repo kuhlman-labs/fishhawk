@@ -268,7 +268,7 @@ func ParseClarificationRequest(data []byte) (*ClarificationRequest, error) {
 }
 
 // ValidateUpkeepReport validates bytes against the upkeep-report-v1 schema and
-// then runs CheckUpkeepReportSemantics (rules a-k, upkeepreport.go). The
+// then runs CheckUpkeepReportSemantics (rules a-t, upkeepreport.go). The
 // returned error is *ParseError, *SchemaError or *SemanticError.
 //
 // It lives here rather than in upkeepreport.go only so that file stays

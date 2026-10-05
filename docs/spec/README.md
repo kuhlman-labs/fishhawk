@@ -13,7 +13,7 @@ Machine-readable schemas and reference docs for the v0 surfaces that span the ru
 | Plan artifact `standard_v1` | [`plan-standard-v1.md`](plan-standard-v1.md) | [`plan-standard-v1.schema.json`](plan-standard-v1.schema.json) | [`examples/plan-standard-v1-example.json`](examples/plan-standard-v1-example.json) |
 | Clarification request artifact (`standard_v1` sibling) | [`clarification-request-v1.md`](clarification-request-v1.md) | [`clarification-request-v1.schema.json`](clarification-request-v1.schema.json) | inline in [`clarification-request-v1.md`](clarification-request-v1.md#example) |
 | Grooming report artifact (plan-stage sibling, ADR-065 §3) | [`grooming-report-v1.md`](grooming-report-v1.md) | [`grooming-report-v1.schema.json`](grooming-report-v1.schema.json) | [`examples/grooming-report-v1-example.json`](examples/grooming-report-v1-example.json), [`examples/grooming-report-v1-milestone-example.json`](examples/grooming-report-v1-milestone-example.json) (the optional `milestone_scope` variant — a scoped, sequenced release milestone with the calls it declined to make, E54.9 / #2309) |
-| Upkeep report artifact (plan-stage sibling, E79 / #3921) | [`upkeep-report-v1.md`](upkeep-report-v1.md) | [`upkeep-report-v1.schema.json`](upkeep-report-v1.schema.json) | [`examples/upkeep-report-v1-example.json`](examples/upkeep-report-v1-example.json) (one finding per source: a flake citing two runs, a toolchain drift across two files, a deprecation) |
+| Upkeep report artifact (plan-stage sibling, E79 / #3921) | [`upkeep-report-v1.md`](upkeep-report-v1.md) | [`upkeep-report-v1.schema.json`](upkeep-report-v1.schema.json) | [`examples/upkeep-report-v1-example.json`](examples/upkeep-report-v1-example.json) (one finding per source: a flake citing two runs, a toolchain drift across two files, a deprecation), [`examples/upkeep-report-v1-advisory-example.json`](examples/upkeep-report-v1-advisory-example.json) (the `advisory` source, #3750: a govulncheck `called` high finding with its call path, a govulncheck `imported` low finding, a pnpm_audit `unanalyzed` medium finding with `fixed_version: null`, and a `source_degrades` entry naming a source that could not run; kept SEPARATE so the three-finding example stays byte-identical) |
 | Crew message (`crew-message-v1`, ADR-081 rule 1) — a standalone contract, NOT a plan `ArtifactKind` | [`crew-message-v1.md`](crew-message-v1.md) | [`crew-message-v1.schema.json`](crew-message-v1.schema.json) | one valid fixture per type in `backend/internal/crewmessage/testdata/valid/`; inline example in [`crew-message-v1.md`](crew-message-v1.md#example) |
 | Operator role spec v0 (shipped default + `.fishhawk/operator.yaml` overlay, ADR-040) | [`operator-role.md`](operator-role.md) | [`operator-role.schema.json`](operator-role.schema.json), [`operator-role-overlay.schema.json`](operator-role-overlay.schema.json) | [`operator-role-default.yaml`](operator-role-default.yaml) (shipped default — a product artifact, synced like the schemas), [`examples/operator-role-overlay-example.yaml`](examples/operator-role-overlay-example.yaml) |
 
@@ -78,7 +78,8 @@ check-jsonschema --schemafile docs/spec/grooming-report-v1.schema.json \
     docs/spec/examples/grooming-report-v1-milestone-example.json
 
 check-jsonschema --schemafile docs/spec/upkeep-report-v1.schema.json \
-    docs/spec/examples/upkeep-report-v1-example.json
+    docs/spec/examples/upkeep-report-v1-example.json \
+    docs/spec/examples/upkeep-report-v1-advisory-example.json
 
 # A crew message carries no docs/spec/examples/ file: its fixture corpus lives
 # beside the Go validator that later E77 children reuse. NOTE this command

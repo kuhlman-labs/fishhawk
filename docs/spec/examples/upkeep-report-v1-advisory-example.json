@@ -1,0 +1,152 @@
+{
+  "kind": "upkeep_report",
+  "report_version": "upkeep_report_v1",
+  "ticket_reference": {
+    "type": "github_issue",
+    "url": "https://github.com/kuhlman-labs/fishhawk/issues/3750",
+    "id": "kuhlman-labs/fishhawk#3750"
+  },
+  "generated_by": {
+    "agent": "claude-code",
+    "model": "claude-opus-5",
+    "timestamp": "2026-10-05T09:00:00Z"
+  },
+  "summary": "Weekly advisory scan over main at 0c1d2e3f: govulncheck ran in every go.work module and pnpm audit in site/. One advisory is reachable through a call path (high), one is in an imported package that is never called (low), and one npm advisory has no fix yet (medium, unanalyzed). The deprecation source could not reach the module proxy and is named in source_degrades. Three issues proposed.",
+  "sources_scanned": ["advisory"],
+  "source_degrades": [
+    {
+      "source": "deprecation",
+      "reason": "network_unavailable",
+      "detail": "go list -m -json all could not reach proxy.golang.org"
+    }
+  ],
+  "findings": [
+    {
+      "id": "advisory:GO-2024-2687:golang.org/x/net",
+      "source": "advisory",
+      "subject": "GO-2024-2687:golang.org/x/net",
+      "evidence": [
+        {
+          "kind": "file",
+          "path": "backend/go.mod",
+          "line": 31,
+          "value": "golang.org/x/net v0.22.0",
+          "detail": "the manifest pinning the affected version"
+        },
+        {
+          "kind": "file",
+          "path": "backend/internal/server/serve.go",
+          "line": 88,
+          "detail": "the call site at the entry end of the call path; a source file is evidence, never a coverage directory"
+        }
+      ],
+      "advisory": {
+        "ecosystem": "go",
+        "package": "golang.org/x/net",
+        "version": "v0.22.0",
+        "advisory_ids": ["GO-2024-2687", "CVE-2023-45288", "GHSA-4v7x-pqxf-cx7m"],
+        "fixed_version": "v0.23.0",
+        "scanner": "govulncheck",
+        "reachability": "called",
+        "call_path": [
+          {
+            "module": "golang.org/x/net",
+            "version": "v0.22.0",
+            "package": "golang.org/x/net/http2",
+            "function": "ReadFrame",
+            "receiver": "*Framer",
+            "position": {
+              "filename": "http2/frame.go",
+              "offset": 15322,
+              "line": 498,
+              "column": 18
+            }
+          },
+          {
+            "module": "github.com/kuhlman-labs/fishhawk/backend",
+            "package": "github.com/kuhlman-labs/fishhawk/backend/internal/server",
+            "function": "serveH2",
+            "position": {
+              "filename": "internal/server/serve.go",
+              "offset": 2210,
+              "line": 88,
+              "column": 24
+            }
+          }
+        ],
+        "severity": "high"
+      },
+      "proposed_issue": {
+        "title": "Bump golang.org/x/net to v0.23.0 (GO-2024-2687, reachable)",
+        "body": "Advisory GO-2024-2687 (CVE-2023-45288, GHSA-4v7x-pqxf-cx7m) affects golang.org/x/net v0.22.0, pinned in backend/go.mod. Fixed in v0.23.0. Reachability: called (govulncheck found a call path to the vulnerable symbol). Proposed severity: high.",
+        "type": "bug",
+        "labels": ["area:backend", "type:bug"]
+      }
+    },
+    {
+      "id": "advisory:GO-2022-1059:golang.org/x/text",
+      "source": "advisory",
+      "subject": "GO-2022-1059:golang.org/x/text",
+      "evidence": [
+        {
+          "kind": "file",
+          "path": "runner/go.mod",
+          "line": 19,
+          "value": "golang.org/x/text v0.3.7"
+        }
+      ],
+      "advisory": {
+        "ecosystem": "go",
+        "package": "golang.org/x/text",
+        "version": "v0.3.7",
+        "advisory_ids": ["GO-2022-1059", "CVE-2022-32149", "GHSA-69ch-w2m2-3vjp"],
+        "fixed_version": "v0.3.8",
+        "scanner": "govulncheck",
+        "reachability": "imported",
+        "call_path": [
+          {
+            "module": "golang.org/x/text",
+            "version": "v0.3.7",
+            "package": "golang.org/x/text/language"
+          }
+        ],
+        "severity": "low"
+      },
+      "proposed_issue": {
+        "title": "Bump golang.org/x/text to v0.3.8 (GO-2022-1059, imported, not called)",
+        "body": "Advisory GO-2022-1059 (CVE-2022-32149, GHSA-69ch-w2m2-3vjp) affects golang.org/x/text v0.3.7, pinned in runner/go.mod. Fixed in v0.3.8. Reachability: imported (the vulnerable package is imported but no vulnerable symbol is called). Proposed severity: low.",
+        "type": "chore",
+        "labels": ["area:runner", "type:chore"]
+      }
+    },
+    {
+      "id": "advisory:GHSA-q8v2-3m4c-7x9p:yaml-front-parser",
+      "source": "advisory",
+      "subject": "GHSA-q8v2-3m4c-7x9p:yaml-front-parser",
+      "evidence": [
+        {
+          "kind": "file",
+          "path": "site/pnpm-lock.yaml",
+          "line": 4120,
+          "value": "yaml-front-parser@2.1.0"
+        }
+      ],
+      "advisory": {
+        "ecosystem": "npm",
+        "package": "yaml-front-parser",
+        "version": "2.1.0",
+        "advisory_ids": ["GHSA-q8v2-3m4c-7x9p"],
+        "fixed_version": null,
+        "scanner": "pnpm_audit",
+        "reachability": "unanalyzed",
+        "severity": "medium"
+      },
+      "proposed_issue": {
+        "title": "Track GHSA-q8v2-3m4c-7x9p in yaml-front-parser (no fix yet)",
+        "body": "Advisory GHSA-q8v2-3m4c-7x9p affects yaml-front-parser 2.1.0, pinned in site/pnpm-lock.yaml. No fixed version is published. Reachability: unanalyzed (pnpm audit reports none). Proposed severity: medium.",
+        "type": "chore",
+        "labels": ["area:docs", "type:chore"]
+      }
+    }
+  ]
+}

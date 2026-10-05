@@ -2,6 +2,8 @@ package plan
 
 import (
 	"fmt"
+	"path"
+	"sort"
 	"strconv"
 	"strings"
 	"unicode"
@@ -33,7 +35,84 @@ const (
 	UpkeepSourceFlake          = "flake"
 	UpkeepSourceToolchainDrift = "toolchain_drift"
 	UpkeepSourceDeprecation    = "deprecation"
+	// UpkeepSourceAdvisory (#3750): a dependency named by a published
+	// vulnerability advisory. Its findings carry an UpkeepAdvisory.
+	UpkeepSourceAdvisory = "advisory"
 )
+
+// UpkeepSources returns the closed detector-source set, in schema enum
+// order: the single Go-side owner of upkeep-report-v1's $defs.source.enum
+// (TestUpkeepSources_MatchSchemaEnum pins the two together). A fresh slice
+// per call, so a caller cannot mutate the set.
+func UpkeepSources() []string {
+	return []string{UpkeepSourceFlake, UpkeepSourceToolchainDrift, UpkeepSourceDeprecation, UpkeepSourceAdvisory}
+}
+
+// Advisory ecosystems (the advisory object's `ecosystem` enum).
+const (
+	UpkeepEcosystemGo  = "go"
+	UpkeepEcosystemNPM = "npm"
+)
+
+// Advisory scanners (the advisory object's `scanner` enum). UpkeepScannerOSV
+// is RESERVED: no OSV command is instructed yet (#3750).
+const (
+	UpkeepScannerGovulncheck = "govulncheck"
+	UpkeepScannerPnpmAudit   = "pnpm_audit"
+	UpkeepScannerOSV         = "osv"
+)
+
+// Advisory reachability classes, strongest first. called/imported/required
+// are govulncheck's symbol/package/module finding levels; unanalyzed is
+// every scanner that reports no reachability.
+const (
+	UpkeepReachabilityCalled     = "called"
+	UpkeepReachabilityImported   = "imported"
+	UpkeepReachabilityRequired   = "required"
+	UpkeepReachabilityUnanalyzed = "unanalyzed"
+)
+
+// Advisory severities (the advisory object's `severity` enum).
+const (
+	UpkeepSeverityHigh   = "high"
+	UpkeepSeverityMedium = "medium"
+	UpkeepSeverityLow    = "low"
+)
+
+// Source-degrade reasons (the source-degrade `reason` enum). Only
+// UpkeepDegradePartial pairs with the source being in sources_scanned.
+const (
+	UpkeepDegradeNetworkUnavailable = "network_unavailable"
+	UpkeepDegradeToolUnavailable    = "tool_unavailable"
+	UpkeepDegradeToolFailed         = "tool_failed"
+	UpkeepDegradeBudgetExceeded     = "budget_exceeded"
+	UpkeepDegradePartial            = "partial"
+)
+
+// UpkeepMaxCallPathFrames mirrors the schema's call_path maxItems. A longer
+// govulncheck trace keeps index 0 (the vulnerable end) onward and truncates
+// the far end.
+const UpkeepMaxCallPathFrames = 32
+
+// upkeepManifestBasenames is the CLOSED set of manifest basenames an
+// advisory finding's file refs are matched against (rule q) and the only
+// file refs that contribute a coverage directory (UpkeepAdvisoryManifestDirs).
+// A call-site source file is allowed as evidence but never names a manifest.
+var upkeepManifestBasenames = map[string]bool{
+	"go.mod":         true,
+	"pnpm-lock.yaml": true,
+	"package.json":   true,
+}
+
+// UpkeepManifestBasenames returns the closed manifest basename set, sorted.
+func UpkeepManifestBasenames() []string {
+	out := make([]string, 0, len(upkeepManifestBasenames))
+	for b := range upkeepManifestBasenames {
+		out = append(out, b)
+	}
+	sort.Strings(out)
+	return out
+}
 
 // Evidence-ref discriminators (the evidence-ref oneOf's `kind` const).
 const (
@@ -62,16 +141,133 @@ type UpkeepReport struct {
 	Summary         string          `json:"summary"`
 	SourcesScanned  []string        `json:"sources_scanned"`
 	Findings        []UpkeepFinding `json:"findings"`
+	// SourceDegrades names each source that could not run, or ran only in
+	// part (#3750). Optional; absent on every pre-#3750 report.
+	SourceDegrades []UpkeepSourceDegrade `json:"source_degrades,omitempty"`
+}
+
+// UpkeepSourceDegrade is one named degradation of a source (rule r).
+type UpkeepSourceDegrade struct {
+	Source string `json:"source"`
+	Reason string `json:"reason"`
+	Detail string `json:"detail,omitempty"`
 }
 
 // UpkeepFinding is one finding: a derived id, its source and subject, the
 // evidence for it and the issue it proposes filing.
 type UpkeepFinding struct {
-	ID            string              `json:"id"`
-	Source        string              `json:"source"`
-	Subject       string              `json:"subject"`
-	Evidence      []UpkeepEvidenceRef `json:"evidence"`
+	ID       string              `json:"id"`
+	Source   string              `json:"source"`
+	Subject  string              `json:"subject"`
+	Evidence []UpkeepEvidenceRef `json:"evidence"`
+	// Advisory is present on, and only on, an advisory finding (rule l).
+	Advisory      *UpkeepAdvisory     `json:"advisory,omitempty"`
 	ProposedIssue UpkeepProposedIssue `json:"proposed_issue"`
+}
+
+// UpkeepAdvisory is an advisory finding's advisory facts (#3750). They are
+// AGENT-ASSERTED, copied from the scanner output: the server cannot re-run
+// the scanner, so rules (m)-(q) bound the claim instead.
+//
+// FixedVersion is a pointer with NO omitempty: the schema requires the key,
+// and an explicit null is the stated "no fix" — never an absent key.
+type UpkeepAdvisory struct {
+	Ecosystem    string                `json:"ecosystem"`
+	Package      string                `json:"package"`
+	Version      string                `json:"version"`
+	AdvisoryIDs  []string              `json:"advisory_ids"`
+	FixedVersion *string               `json:"fixed_version"`
+	Scanner      string                `json:"scanner"`
+	Reachability string                `json:"reachability"`
+	CallPath     []UpkeepAdvisoryFrame `json:"call_path,omitempty"`
+	Severity     string                `json:"severity"`
+}
+
+// UpkeepAdvisoryFrame is one govulncheck `-json` trace frame. The field
+// names and json tags are govulncheck's own (golang.org/x/vuln
+// internal/govulncheck Frame), so a trace is copied VERBATIM; the
+// captured-stream test decodes real frames into this type with
+// DisallowUnknownFields.
+type UpkeepAdvisoryFrame struct {
+	Module   string                  `json:"module"`
+	Version  string                  `json:"version,omitempty"`
+	Package  string                  `json:"package,omitempty"`
+	Function string                  `json:"function,omitempty"`
+	Receiver string                  `json:"receiver,omitempty"`
+	Position *UpkeepAdvisoryPosition `json:"position,omitempty"`
+}
+
+// UpkeepAdvisoryPosition is govulncheck's Position, tags verbatim.
+type UpkeepAdvisoryPosition struct {
+	Filename string `json:"filename,omitempty"`
+	Offset   int    `json:"offset"`
+	Line     int    `json:"line"`
+	Column   int    `json:"column"`
+}
+
+// UpkeepAdvisoryReachability derives the reachability class from a
+// govulncheck call path. callPath[0] is the VULNERABLE end (govulncheck
+// orders a trace from the vulnerable symbol toward the entry point), so its
+// most specific field decides: a function -> called, else a package ->
+// imported, else a module -> required. An empty path (or a frame naming
+// nothing) derives "" — no class, which rule (o) refuses.
+func UpkeepAdvisoryReachability(callPath []UpkeepAdvisoryFrame) string {
+	if len(callPath) == 0 {
+		return ""
+	}
+	switch f := callPath[0]; {
+	case f.Function != "":
+		return UpkeepReachabilityCalled
+	case f.Package != "":
+		return UpkeepReachabilityImported
+	case f.Module != "":
+		return UpkeepReachabilityRequired
+	}
+	return ""
+}
+
+// upkeepManifestDir reports whether a file ref's path names a manifest
+// (basename in the closed set, repository-relative, not escaping the root)
+// and, if so, the manifest's directory: "." for the repository root, else
+// the cleaned slash path ("backend", "site").
+func upkeepManifestDir(p string) (string, bool) {
+	c := path.Clean(p)
+	if p == "" || path.IsAbs(c) || c == ".." || strings.HasPrefix(c, "../") {
+		return "", false
+	}
+	if !upkeepManifestBasenames[path.Base(c)] {
+		return "", false
+	}
+	return path.Dir(c), true
+}
+
+// UpkeepAdvisoryManifestDirs returns the distinct directories of the
+// MANIFEST file refs a finding cites, in first-seen order and never nil.
+// Only a manifest ref (basename go.mod, pnpm-lock.yaml or package.json)
+// contributes; a call-site source file cited as evidence never does. This is
+// the directory set Dependabot coverage must reach in full. It is only as
+// complete as the agent's manifest citations: a manifest the finding fails to
+// cite is never checked, so an under-cited finding can be marked covered by a
+// bump that misses that manifest — a FALSE-COVER risk (the unsafe direction),
+// unlike the conservative residuals that only leave a finding uncovered.
+func UpkeepAdvisoryManifestDirs(f *UpkeepFinding) []string {
+	out := []string{}
+	if f == nil {
+		return out
+	}
+	seen := map[string]bool{}
+	for _, ev := range f.Evidence {
+		if ev.Kind != UpkeepEvidenceKindFile {
+			continue
+		}
+		dir, ok := upkeepManifestDir(ev.Path)
+		if !ok || seen[dir] {
+			continue
+		}
+		seen[dir] = true
+		out = append(out, dir)
+	}
+	return out
 }
 
 // UpkeepEvidenceRef is one evidence pointer, discriminated by Kind: a run ref
@@ -159,6 +355,36 @@ func (r *UpkeepReport) RunRefIDs() []uuid.UUID {
 //	(j) parent_epic, when present, is a positive integer, bare or
 //	    `#`-prefixed                                               /findings/<i>/proposed_issue/parent_epic
 //	(k) at most UpkeepMaxDistinctRunRefs distinct run ids          /findings
+//	(l) source advisory <=> an advisory object is present          /findings/<i>/advisory
+//	(m) an advisory's subject == advisory_ids[0] + ":" + package   /findings/<i>/subject
+//	(n) scanner/ecosystem pairing: govulncheck => go,
+//	    pnpm_audit => npm, osv => either                           /findings/<i>/advisory/scanner
+//	(o) reachability consistency: govulncheck => a non-empty
+//	    call_path, reachability == UpkeepAdvisoryReachability
+//	    (call_path) and call_path[0].module == package; pnpm_audit
+//	    and osv => unanalyzed with no call_path                    /findings/<i>/advisory/reachability
+//	                                                               (/advisory/package for the module)
+//	(p) severity cap: called -> any; imported/required -> low;
+//	    unanalyzed -> medium or low                                /findings/<i>/advisory/severity
+//	(q) an advisory cites at least one MANIFEST file ref
+//	    (basename go.mod, pnpm-lock.yaml or package.json)          /findings/<i>/evidence
+//	(r) source_degrades: at most one entry per source; reason
+//	    partial => the source IS in sources_scanned, any other
+//	    reason => it is NOT                                        /source_degrades/<k>
+//	(s) a non-null fixed_version is ONE bare version, never a
+//	    range: none of < > = ^ ~ | *, whitespace or a comma        /findings/<i>/advisory/fixed_version
+//	(t) a report carrying an advisory finding or any
+//	    source_degrades entry accounts for the advisory source:
+//	    it is in sources_scanned (it ran; a partial run adds a
+//	    partial degrade) or named by a non-partial degrade (it
+//	    did not run) — with (r), exactly one of the two            /sources_scanned
+//
+// Rules (l)-(t) fire only on an advisory finding, an advisory object or a
+// source_degrades entry, so every pre-#3750 stored report (re-parsed by the
+// dispositions capture and the apply) still parses. The residual (t) leaves
+// open: a report with neither carries no signal that the advisory source
+// exists, so zero findings from a scan that never ran advisories is
+// indistinguishable from a pre-#3750 report.
 //
 // Evidence COUNT is the schema's job (minItems 1) and is deliberately not
 // re-checked here, so a schema regression is not masked by this layer.
@@ -204,6 +430,9 @@ func CheckUpkeepReportSemantics(r *UpkeepReport) error {
 		if err := checkUpkeepProposedIssue(i, &f.ProposedIssue); err != nil {
 			return err
 		}
+		if err := checkUpkeepAdvisory(i, f); err != nil {
+			return err
+		}
 	}
 	// Rule (k). After rule (e), so every cited run_id parses and RunRefIDs
 	// skips nothing.
@@ -211,6 +440,149 @@ func CheckUpkeepReportSemantics(r *UpkeepReport) error {
 		return &SemanticError{Message: fmt.Sprintf(
 			"/findings: the report cites %d distinct run ids; at most %d are allowed (each is looked up on ingest)",
 			n, UpkeepMaxDistinctRunRefs)}
+	}
+	if err := checkUpkeepSourceDegrades(r, scanned); err != nil {
+		return err
+	}
+	return checkUpkeepAdvisoryAccounted(r, scanned)
+}
+
+// upkeepVersionRangeChars are the characters rule (s) refuses in a
+// fixed_version: npm/semver range operators, set unions and wildcards.
+// Whitespace and commas are refused separately (hyphen ranges and
+// comparator sets need one of them).
+const upkeepVersionRangeChars = "<>=^~|*,"
+
+// checkUpkeepAdvisoryAccounted enforces rule (t). Two earlier rules carry
+// part of it, so only the remainder is checked here: rule (c) already puts
+// the advisory source in sources_scanned whenever the report carries an
+// advisory finding, and rule (r) already refuses the source being BOTH
+// scanned and degraded as not run. What is left is a source_degrades entry
+// with the advisory source in NEITHER place. Past the scanned early return,
+// rule (r) guarantees an advisory degrade is a not-run reason (a partial one
+// would require the source to be scanned), so any advisory entry accounts.
+func checkUpkeepAdvisoryAccounted(r *UpkeepReport, scanned map[string]bool) error {
+	if len(r.SourceDegrades) == 0 || scanned[UpkeepSourceAdvisory] {
+		return nil
+	}
+	for _, d := range r.SourceDegrades {
+		if d.Source == UpkeepSourceAdvisory {
+			return nil
+		}
+	}
+	return &SemanticError{Message: fmt.Sprintf(
+		"/sources_scanned: the report carries a source_degrades entry, so it must account for the %q source in exactly one place: list it in sources_scanned %v if it ran (a run over only part of the tree adds a %q degrade), or name it in source_degrades with the reason it did not run; an unaccounted advisory source reads as a clean scan that may never have run",
+		UpkeepSourceAdvisory, r.SourcesScanned, UpkeepDegradePartial)}
+}
+
+// checkUpkeepAdvisory enforces rules (l) through (q) and (s) on one finding.
+func checkUpkeepAdvisory(i int, f *UpkeepFinding) error {
+	isAdvisory := f.Source == UpkeepSourceAdvisory
+	// Rule (l).
+	if isAdvisory != (f.Advisory != nil) {
+		if isAdvisory {
+			return &SemanticError{Message: fmt.Sprintf(
+				"/findings/%d/advisory: an advisory finding must carry an advisory object (ids, package, versions, scanner, reachability, severity)", i)}
+		}
+		return &SemanticError{Message: fmt.Sprintf(
+			"/findings/%d/advisory: only an advisory finding may carry an advisory object; this finding's source is %q", i, f.Source)}
+	}
+	if !isAdvisory {
+		return nil
+	}
+	a := f.Advisory
+	// Rule (m). The schema guarantees advisory_ids is non-empty; the length
+	// guard keeps a struct-literal caller from panicking.
+	primary := ""
+	if len(a.AdvisoryIDs) > 0 {
+		primary = a.AdvisoryIDs[0]
+	}
+	if want := primary + ":" + a.Package; f.Subject != want {
+		return &SemanticError{Message: fmt.Sprintf(
+			"/findings/%d/subject: an advisory finding's subject %q is not derived from its primary advisory id and package; expected %q (advisory_ids[0] + \":\" + package)",
+			i, f.Subject, want)}
+	}
+	// Rule (n).
+	switch {
+	case a.Scanner == UpkeepScannerGovulncheck && a.Ecosystem != UpkeepEcosystemGo,
+		a.Scanner == UpkeepScannerPnpmAudit && a.Ecosystem != UpkeepEcosystemNPM:
+		return &SemanticError{Message: fmt.Sprintf(
+			"/findings/%d/advisory/scanner: scanner %q cannot report ecosystem %q (govulncheck scans go, pnpm_audit scans npm, osv either)",
+			i, a.Scanner, a.Ecosystem)}
+	}
+	// Rule (o).
+	if a.Scanner == UpkeepScannerGovulncheck {
+		derived := UpkeepAdvisoryReachability(a.CallPath)
+		if derived == "" {
+			return &SemanticError{Message: fmt.Sprintf(
+				"/findings/%d/advisory/reachability: a govulncheck finding must carry a non-empty call_path (the finding's trace, copied verbatim) naming at least a module in call_path[0]; reachability is derived from it", i)}
+		}
+		if a.Reachability != derived {
+			return &SemanticError{Message: fmt.Sprintf(
+				"/findings/%d/advisory/reachability: reachability %q does not match the level derived from call_path[0] (%q): a function frame is called, a package frame imported, a module frame required",
+				i, a.Reachability, derived)}
+		}
+		if m := a.CallPath[0].Module; m != a.Package {
+			return &SemanticError{Message: fmt.Sprintf(
+				"/findings/%d/advisory/package: package %q is not the vulnerable module %q named by call_path[0]; for Go the package is the MODULE path, never a package path inside it",
+				i, a.Package, m)}
+		}
+	} else if a.Reachability != UpkeepReachabilityUnanalyzed || len(a.CallPath) > 0 {
+		return &SemanticError{Message: fmt.Sprintf(
+			"/findings/%d/advisory/reachability: scanner %q reports no reachability, so its finding must be %q with no call_path (got reachability %q and %d call_path frames)",
+			i, a.Scanner, UpkeepReachabilityUnanalyzed, a.Reachability, len(a.CallPath))}
+	}
+	// Rule (p).
+	capped := false
+	switch a.Reachability {
+	case UpkeepReachabilityImported, UpkeepReachabilityRequired:
+		capped = a.Severity != UpkeepSeverityLow
+	case UpkeepReachabilityUnanalyzed:
+		capped = a.Severity == UpkeepSeverityHigh
+	}
+	if capped {
+		return &SemanticError{Message: fmt.Sprintf(
+			"/findings/%d/advisory/severity: severity %q exceeds the cap for reachability %q (only called may be high; imported and required are at most low; unanalyzed is at most medium)",
+			i, a.Severity, a.Reachability)}
+	}
+	// Rule (q).
+	if len(UpkeepAdvisoryManifestDirs(f)) == 0 {
+		return &SemanticError{Message: fmt.Sprintf(
+			"/findings/%d/evidence: an advisory finding must cite at least one manifest file ref (a repository-relative path with basename %s) pinning the affected version; a call-site source file alone names no manifest",
+			i, strings.Join(UpkeepManifestBasenames(), ", "))}
+	}
+	// Rule (s). A range would make "covered by a bump to at least the fix"
+	// undecidable and reads to the captain as a fix that is not one version.
+	if fv := a.FixedVersion; fv != nil {
+		if strings.ContainsAny(*fv, upkeepVersionRangeChars) || strings.IndexFunc(*fv, unicode.IsSpace) >= 0 {
+			return &SemanticError{Message: fmt.Sprintf(
+				"/findings/%d/advisory/fixed_version: fixed_version %q is a range, not ONE bare version: report the lowest patched version on the in-use major line (no %s, whitespace or comma), or null when no fix is published",
+				i, *fv, strings.TrimSuffix(upkeepVersionRangeChars, ","))}
+		}
+	}
+	return nil
+}
+
+// checkUpkeepSourceDegrades enforces rule (r).
+func checkUpkeepSourceDegrades(r *UpkeepReport, scanned map[string]bool) error {
+	seen := make(map[string]int, len(r.SourceDegrades))
+	for k, d := range r.SourceDegrades {
+		pointer := fmt.Sprintf("/source_degrades/%d", k)
+		if prev, dup := seen[d.Source]; dup {
+			return &SemanticError{Message: fmt.Sprintf(
+				"%s: source %q is already degraded by /source_degrades/%d; at most one entry per source", pointer, d.Source, prev)}
+		}
+		seen[d.Source] = k
+		partial := d.Reason == UpkeepDegradePartial
+		if partial && !scanned[d.Source] {
+			return &SemanticError{Message: fmt.Sprintf(
+				"%s: a %q degrade means source %q ran in part, so it must appear in sources_scanned %v", pointer, d.Reason, d.Source, r.SourcesScanned)}
+		}
+		if !partial && scanned[d.Source] {
+			return &SemanticError{Message: fmt.Sprintf(
+				"%s: source %q is degraded %q (it did not run), so it must NOT appear in sources_scanned %v; a source that ran in part is degraded %q",
+				pointer, d.Source, d.Reason, r.SourcesScanned, UpkeepDegradePartial)}
+		}
 	}
 	return nil
 }
