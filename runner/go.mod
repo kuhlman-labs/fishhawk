@@ -1,6 +1,6 @@
 module github.com/kuhlman-labs/fishhawk/runner
 
-go 1.25.0
+go 1.26.0
 
 require (
 	github.com/bmatcuk/doublestar/v4 v4.10.2
@@ -12,7 +12,7 @@ require (
 	go.opentelemetry.io/otel/sdk v1.46.0
 	go.opentelemetry.io/otel/trace v1.46.0
 	golang.org/x/mod v0.39.0
-	golang.org/x/sys v0.47.0
+	golang.org/x/sys v0.48.0
 	golang.org/x/tools v0.49.0
 	gopkg.in/yaml.v3 v3.0.1
 )
