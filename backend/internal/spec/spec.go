@@ -765,6 +765,36 @@ type Stage struct {
 	// is a SPELLING of Egress and is normalized into it after decode; declaring
 	// both on one stage is a validation error, never a precedence rule.
 	Permissions *StagePermissions `json:"permissions,omitempty" yaml:"permissions,omitempty"`
+	// Concurrency is the workflow-v2 per-stage concurrency group (#3964 /
+	// ADR-087). Nil = the shipped default (host-dispatched implement stages
+	// share `local-implement:<host>` at limit 1; other stage types are
+	// ungrouped). REQUIRED for the schema-permitted key to survive
+	// ParseBytes' DisallowUnknownFields decode. Honoured only for
+	// host-dispatched agent stages; inert elsewhere.
+	Concurrency *StageConcurrency `json:"concurrency,omitempty" yaml:"concurrency,omitempty"`
+}
+
+// StageConcurrency is a stage's declared concurrency group (#3964 /
+// ADR-087). Both fields are optional individually; the schema's
+// minProperties 1 forbids the empty block. One group per stage: an empty
+// Group joins the host default group with the declared limit, a named Group
+// is repository-scoped and replaces the host default for that stage.
+type StageConcurrency struct {
+	// Group names a repository-scoped group (schema pattern
+	// ^[a-z0-9][a-z0-9._-]{0,62}$). Empty = the host default group.
+	Group string `json:"group,omitempty" yaml:"group,omitempty"`
+	// Limit is how many stages of the group may hold a slot at once
+	// (schema range 1..64). Zero = absent; read it through EffectiveLimit.
+	Limit int `json:"limit,omitempty" yaml:"limit,omitempty"`
+}
+
+// EffectiveLimit returns the declared limit, or 1 when the limit is absent
+// (zero). A nil receiver also yields 1, the shipped default.
+func (c *StageConcurrency) EffectiveLimit() int {
+	if c == nil || c.Limit <= 0 {
+		return 1
+	}
+	return c.Limit
 }
 
 // StagePermissions is the declaration-only per-stage permissions block (E53.5 /

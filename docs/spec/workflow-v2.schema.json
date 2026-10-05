@@ -350,6 +350,28 @@
         },
         "permissions": {
           "$ref": "#/$defs/stage_permissions"
+        },
+        "concurrency": {
+          "$ref": "#/$defs/stage_concurrency"
+        }
+      }
+    },
+    "stage_concurrency": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "description": "Per-stage concurrency group (#3964 / ADR-087): how many stages of one group may hold a dispatch slot at once. Admission happens at the host-dispatch spawn marker; a dispatch that cannot get a slot is QUEUED FIFO (the stage stays awaiting_host_dispatch and its stage reads carry a concurrency block), never refused. By default every host-dispatched implement stage is in the host group `local-implement:<host>` with limit 1, and every other stage type is in no group. ONE GROUP PER STAGE: an omitted `group` joins the host default group with the declared `limit` (to widen or narrow it); a named `group` is REPOSITORY-scoped (e.g. a shared deploy target) and REPLACES the host default group for that stage. When stages of one group declare different limits, the ADMITTING stage's limit governs. Honoured only for host-dispatched (runner_kind local) agent stages; inert elsewhere. Stage-level only: deliberately NOT inheritable through `defaults`. minProperties 1: an empty `concurrency: {}` is an authoring error, not a default. Declared by workflow-v2; accepted whenever present (v2 has no minor chain — a field is accepted because the schema declares it, not because the document declared a high enough minor).",
+      "properties": {
+        "group": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9._-]{0,62}$",
+          "description": "Name of a repository-scoped concurrency group (lowercase alphanumerics plus `.`, `_`, `-`; at most 63 characters, starting with an alphanumeric). Absent = the host default group `local-implement:<host>`. Two stages naming the same group in the same repository share its slots, across runs."
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 64,
+          "description": "Maximum number of stages of the group holding a slot at once, 1..64. Absent = 1. The admitting stage's limit governs when stages of one group disagree."
         }
       }
     },
