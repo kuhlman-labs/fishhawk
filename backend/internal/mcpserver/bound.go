@@ -717,6 +717,8 @@ var runStatusPathTable = []pathClassification{
 	// skeleton-ledger entry, so it neither bypasses the budget nor perturbs the
 	// diagnosis-skeleton size the floor assertions pin.
 	{Path: "stages[].dispatched_at", Tier: tierNever},
+	// concurrency (#3964): a redundant decode-mirror like stages[].progress; holders bounded by MaxLimit 64.
+	{Path: "stages[].concurrency", Tier: tierNever},
 	{Path: "stages[].failure_reason", Tier: "T7", Class: classOversizedCapable, Surfaces: restStages, Unbounded: unboundedStages},
 	{Path: "stages[].id", Tier: "skeleton", Class: classStored, Surfaces: restStages},
 	{Path: "stages[].run_id", Tier: "skeleton", Class: classStored, Surfaces: restStages},

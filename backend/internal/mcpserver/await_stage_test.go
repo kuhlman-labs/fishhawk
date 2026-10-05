@@ -1937,3 +1937,299 @@ func TestAwaitStageToolDescription_NamesDiscriminatedTimeout(t *testing.T) {
 		t.Errorf("fishhawk_await_stage description must not deny the stage's own deadline unconditionally: %q", desc)
 	}
 }
+
+// --- local concurrency queue (#3964 / ADR-087) ---
+
+// queuedSlotBlock is a server-shaped queued concurrency block; live sets
+// waiter_live (nil = the key absent).
+func queuedSlotBlock(live *bool) *StageConcurrency {
+	return &StageConcurrency{
+		Status:     concurrencyStatusAwaitingSlot,
+		Group:      "local-implement:h1",
+		Limit:      1,
+		Position:   1,
+		Holders:    []ConcurrencyHolder{{RunID: uuid.NewString(), StageID: uuid.NewString(), Since: time.Now().UTC()}},
+		WaiterLive: live,
+	}
+}
+
+// seedQueuedStageWait seeds an implement stage parked at awaiting_host_dispatch
+// (settled per the endpoint) carrying a queued concurrency block.
+func seedQueuedStageWait(fb *fakeBackend, runID uuid.UUID, live *bool) uuid.UUID {
+	stageID := seedStageWait(fb, runID, "implement", "awaiting_host_dispatch", true)
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	env := fb.stageWaitByStageID[stageID]
+	env.Concurrency = queuedSlotBlock(live)
+	fb.stageWaitByStageID[stageID] = env
+	return stageID
+}
+
+// TestStageWaitHeldForSlot_Table isolates every conjunct of the hold
+// predicate: only a SETTLED awaiting_host_dispatch read whose block is queued
+// with waiter_live true holds.
+func TestStageWaitHeldForSlot_Table(t *testing.T) {
+	holding := queuedSlotBlock(boolPtr(true))
+	holding.Status = concurrencyStatusHolding
+	cases := []struct {
+		name string
+		sw   RunStageWait
+		want bool
+	}{
+		{"queued + live holds", RunStageWait{State: "awaiting_host_dispatch", Terminal: true, Concurrency: queuedSlotBlock(boolPtr(true))}, true},
+		{"waiter_live false releases", RunStageWait{State: "awaiting_host_dispatch", Terminal: true, Concurrency: queuedSlotBlock(boolPtr(false))}, false},
+		{"waiter_live absent releases", RunStageWait{State: "awaiting_host_dispatch", Terminal: true, Concurrency: queuedSlotBlock(nil)}, false},
+		{"no block releases", RunStageWait{State: "awaiting_host_dispatch", Terminal: true}, false},
+		{"holding block releases", RunStageWait{State: "awaiting_host_dispatch", Terminal: true, Concurrency: holding}, false},
+		{"another parked state releases", RunStageWait{State: "awaiting_approval", Terminal: true, Concurrency: queuedSlotBlock(boolPtr(true))}, false},
+		{"unsettled read is not held", RunStageWait{State: "awaiting_host_dispatch", Terminal: false, Concurrency: queuedSlotBlock(boolPtr(true))}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sw := tc.sw
+			if got := stageWaitHeldForSlot(&sw); got != tc.want {
+				t.Errorf("stageWaitHeldForSlot = %v, want %v", got, tc.want)
+			}
+			if got, want := stageWaitSettled(&sw), sw.Terminal && !tc.want; got != want {
+				t.Errorf("stageWaitSettled = %v, want %v", got, want)
+			}
+		})
+	}
+}
+
+// TestAwaitStage_HoldsWhileQueuedWithLiveWaiter is the three-phase read
+// sequence: queued with a live waiter (settled per the endpoint, but HELD),
+// then dispatched once the waiter's admission landed, then succeeded. The wait
+// releases only on succeeded. Deleting the hold releases on the first read with
+// awaiting_host_dispatch.
+func TestAwaitStage_HoldsWhileQueuedWithLiveWaiter(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	stageID := seedQueuedStageWait(fb, runID, boolPtr(true))
+	fb.stageWaitFlip = func(sid uuid.UUID, reads int) {
+		if sid != stageID {
+			return
+		}
+		env := fb.stageWaitByStageID[sid]
+		switch reads {
+		case 3:
+			env.State, env.Terminal = "dispatched", false
+			env.Concurrency = &StageConcurrency{Status: concurrencyStatusHolding, Group: "local-implement:h1", Limit: 1}
+		case 5:
+			env.State, env.Terminal, env.Concurrency = "succeeded", true, nil
+		}
+		fb.stageWaitByStageID[sid] = env
+	}
+	r := newResolver(srv, nil)
+	r.reviewPollInterval = 100 * time.Microsecond
+
+	_, out, err := r.awaitStage(context.Background(), nil, AwaitStageInput{
+		RunID: runID.String(), Stage: "implement", TimeoutSeconds: 5,
+	})
+	if err != nil {
+		t.Fatalf("awaitStage: %v", err)
+	}
+	if out.Status != "settled" || out.State != "succeeded" {
+		t.Fatalf("Status/State = %q/%q, want settled/succeeded (held through the queue)", out.Status, out.State)
+	}
+	if got := stageReads(fb, stageID); got < 5 {
+		t.Errorf("stage reads = %d, want >= 5 (held through the queued phase)", got)
+	}
+	if out.Concurrency != nil || out.Message != "" {
+		t.Errorf("succeeded release carries Concurrency=%+v Message=%q, want neither", out.Concurrency, out.Message)
+	}
+}
+
+// TestAwaitStage_ReleasesWhenWaiterGone: a queued stage with NO live waiter
+// releases on the fast path as settled, with the raw state, the concurrency
+// block and the re-dispatch message; the same goes for a waiter that dies
+// mid-hold (live, then stale). A parked awaiting_host_dispatch stage with no
+// block keeps today's bare settled release.
+func TestAwaitStage_ReleasesWhenWaiterGone(t *testing.T) {
+	cases := []struct {
+		name      string
+		live      *bool
+		staleAt   int // flip waiter_live to false at this read (0 = never)
+		block     bool
+		wantMsg   bool
+		wantReads int
+	}{
+		{"waiter_live false on the fast path", boolPtr(false), 0, true, true, 1},
+		{"waiter_live absent on the fast path", nil, 0, true, true, 1},
+		{"waiter dies mid-hold", boolPtr(true), 3, true, true, 3},
+		{"no block is a bare parked release", nil, 0, false, false, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fb, srv := newFakeBackend(t)
+			runID := uuid.New()
+			var stageID uuid.UUID
+			if tc.block {
+				stageID = seedQueuedStageWait(fb, runID, tc.live)
+			} else {
+				stageID = seedStageWait(fb, runID, "implement", "awaiting_host_dispatch", true)
+			}
+			if tc.staleAt > 0 {
+				fb.stageWaitFlip = func(sid uuid.UUID, reads int) {
+					if sid == stageID && reads == tc.staleAt {
+						env := fb.stageWaitByStageID[sid]
+						env.Concurrency.WaiterLive = boolPtr(false)
+						fb.stageWaitByStageID[sid] = env
+					}
+				}
+			}
+			r := newResolver(srv, nil)
+			r.reviewPollInterval = 100 * time.Microsecond
+
+			_, out, err := r.awaitStage(context.Background(), nil, AwaitStageInput{
+				RunID: runID.String(), Stage: "implement", TimeoutSeconds: 5,
+			})
+			if err != nil {
+				t.Fatalf("awaitStage: %v", err)
+			}
+			if out.Status != "settled" || out.State != "awaiting_host_dispatch" || !out.Terminal {
+				t.Fatalf("Status/State/Terminal = %q/%q/%v, want settled/awaiting_host_dispatch/true", out.Status, out.State, out.Terminal)
+			}
+			if got := stageReads(fb, stageID); got != tc.wantReads {
+				t.Errorf("stage reads = %d, want %d", got, tc.wantReads)
+			}
+			if !tc.block {
+				if out.Concurrency != nil || out.Message != "" {
+					t.Errorf("no-block release carries Concurrency=%+v Message=%q, want neither", out.Concurrency, out.Message)
+				}
+				return
+			}
+			if out.Concurrency == nil || out.Concurrency.Group != "local-implement:h1" || out.Concurrency.Position != 1 {
+				t.Errorf("Concurrency = %+v, want the queued block", out.Concurrency)
+			}
+			for _, want := range []string{"NO live waiter", "fishhawk_dispatch_stage", `"local-implement:h1"`, "position 1"} {
+				if tc.wantMsg && !strings.Contains(out.Message, want) {
+					t.Errorf("Message missing %q: %q", want, out.Message)
+				}
+			}
+		})
+	}
+}
+
+// TestAwaitStage_QueuedWithLiveWaiterOnTerminalRunIsRunTerminal: the
+// run-terminal backstop's final read goes through the same predicate, so a
+// held queued stage on a terminal run resolves run_terminal (it will never be
+// admitted) rather than settled.
+func TestAwaitStage_QueuedWithLiveWaiterOnTerminalRunIsRunTerminal(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	seedQueuedStageWait(fb, runID, boolPtr(true))
+	fb.getRunByID[runID] = Run{ID: runID.String(), State: "cancelled"}
+	r := newResolver(srv, nil)
+	r.reviewPollInterval = 100 * time.Microsecond
+
+	_, out, err := r.awaitStage(context.Background(), nil, AwaitStageInput{
+		RunID: runID.String(), Stage: "implement", TimeoutSeconds: 600,
+	})
+	if err != nil {
+		t.Fatalf("awaitStage: %v", err)
+	}
+	if out.Status != "run_terminal" {
+		t.Fatalf("Status = %q, want run_terminal", out.Status)
+	}
+}
+
+// TestAwaitStage_HeldQueueDoesNotWinTheAmendmentReCheck: the amendment
+// release's settledness re-read goes through the same predicate, so a held
+// queued stage does NOT turn a pending amendment into a "settled" release.
+func TestAwaitStage_HeldQueueDoesNotWinTheAmendmentReCheck(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	stageID := seedQueuedStageWait(fb, runID, boolPtr(true))
+	seedAmendment(fb, runID, stageID, "pending", "backend/internal/mcpserver/onboarding.go")
+	r := newResolver(srv, nil)
+	r.reviewPollInterval = 30 * time.Second
+
+	_, out, err := r.awaitStage(context.Background(), nil, AwaitStageInput{
+		RunID: runID.String(), Stage: "implement", TimeoutSeconds: 600,
+	})
+	if err != nil {
+		t.Fatalf("awaitStage: %v", err)
+	}
+	if out.Status != "amendment_pending" {
+		t.Fatalf("Status = %q, want amendment_pending (a held queue is not settled)", out.Status)
+	}
+}
+
+// TestAwaitStage_HeldQueueTimesOutWithBlockVisible: a queue that never frees
+// inside the caller's cap times out resumably, and the timeout's health read
+// carries the queue block on stage_wait_status.
+func TestAwaitStage_HeldQueueTimesOutWithBlockVisible(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	stageID := seedQueuedStageWait(fb, runID, boolPtr(true))
+	fb.mu.Lock()
+	for i := range fb.stagesByRun[runID] {
+		fb.stagesByRun[runID][i].Concurrency = queuedSlotBlock(boolPtr(true))
+	}
+	fb.mu.Unlock()
+	fb.getRunByID[runID] = Run{ID: runID.String(), State: "running"}
+	r := newResolver(srv, nil)
+	r.reviewPollInterval = 100 * time.Microsecond
+
+	_, out, err := r.awaitStage(context.Background(), nil, AwaitStageInput{
+		RunID: runID.String(), Stage: "implement", TimeoutSeconds: 1,
+	})
+	if err != nil {
+		t.Fatalf("awaitStage: %v", err)
+	}
+	if out.Status != "timeout" {
+		t.Fatalf("Status = %q, want timeout (held through the whole cap)", out.Status)
+	}
+	if got := stageReads(fb, stageID); got < 2 {
+		t.Errorf("stage reads = %d, want > 1 (polled while held)", got)
+	}
+	if out.StageWaitStatus == nil || out.StageWaitStatus.Concurrency == nil ||
+		out.StageWaitStatus.Concurrency.Status != concurrencyStatusAwaitingSlot {
+		t.Errorf("timeout StageWaitStatus = %+v, want the queued concurrency block", out.StageWaitStatus)
+	}
+}
+
+// TestAwaitStageToolDescription_NamesConcurrencyHold pins the #3964 sentence
+// in the tool description.
+func TestAwaitStageToolDescription_NamesConcurrencyHold(t *testing.T) {
+	desc := awaitStageToolDescription(t)
+	for _, want := range []string{"awaiting_concurrency_slot", "waiter_live", "re-dispatch with fishhawk_dispatch_stage"} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("fishhawk_await_stage description missing %q", want)
+		}
+	}
+}
+
+// awaitStageToolDescription lists the registered fishhawk_await_stage tool
+// over an in-memory MCP session and returns its description.
+func awaitStageToolDescription(t *testing.T) string {
+	t.Helper()
+	ctx := context.Background()
+	_, srv := newFakeBackend(t)
+	server := mcp.NewServer(&mcp.Implementation{Name: "test-server", Version: "0"}, nil)
+	registerAwaitStage(server, newResolver(srv, nil))
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := server.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	t.Cleanup(func() { _ = serverSession.Close() })
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	t.Cleanup(func() { _ = clientSession.Close() })
+	res, err := clientSession.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	for _, tool := range res.Tools {
+		if tool.Name == "fishhawk_await_stage" {
+			return tool.Description
+		}
+	}
+	t.Fatal("fishhawk_await_stage not registered")
+	return ""
+}

@@ -162,6 +162,13 @@ type StageWaitStatus struct {
 	// Populated by the MCP layer's best-effort audit probe, never by the pure
 	// classifier: see fixup_recovery_surface.go.
 	FixupRecovered *FixupRecovery `json:"fixup_recovered,omitempty" jsonschema:"present ONLY when the LATEST fix-up pass for this stage FAILED and the backend recovered the stage to its prior state (#3081). Its presence means status 'succeeded' is TRUE of the stage and MISLEADING of the fix-up: no fix-up commit landed, the PR head still carries the pre-fix-up commit, and the routed concerns were NOT addressed. Absent when the fix-up landed, when no fix-up ran, or when a later pass superseded an earlier recovery"`
+	// Concurrency projects the stage's local concurrency-slot block (#3964 /
+	// ADR-087) while the stage is non-terminal: a stage QUEUED for a slot
+	// buckets to status pending (its raw state stays awaiting_host_dispatch),
+	// so this block is where the queue position, the holders and whether a
+	// live waiter will spawn it are visible. Nil when the stage has no active
+	// slot row, is terminal, or the backend predates the block.
+	Concurrency *StageConcurrency `json:"concurrency,omitempty" jsonschema:"the stage's local concurrency-slot state while non-terminal (#3964): status awaiting_concurrency_slot means the stage is QUEUED behind the holders for a slot (status above reads pending; the raw state stays awaiting_host_dispatch) and spawns only once admitted — waiter_live false means no waiter will spawn it, so re-dispatch with fishhawk_dispatch_stage; status holding means it holds a slot. Absent when the stage holds no slot row"`
 }
 
 // FixupRecovery is the additive #3081 marker carried on StageWaitStatus when a
@@ -397,6 +404,14 @@ func stageWaitStatusFor(stages []Stage, stageType, runState string, predictedMin
 	for _, s := range stages {
 		if s.Type == stageType {
 			st := classifyStageWaitStatus(stageType, s.State, runState, s.StartedAt, predictedMinutes, now)
+			// The concurrency-slot block (#3964) rides every non-terminal stage,
+			// including on a terminal run (the ADR-036 window), so a queue is
+			// visible for as long as the stage can still be admitted. The
+			// backend already omits a settled stage's block; this guard keeps a
+			// terminal stage from ever advertising one.
+			if !stageStateIsTerminal(s.State) {
+				st.Concurrency = s.Concurrency
+			}
 			if !stageStateIsTerminal(s.State) && !runStateIsTerminal(runState) {
 				elapsed := stageElapsed(s.StartedAt, now)
 				// Deadline is derived from the PER-ATTEMPT clock (#3335): the

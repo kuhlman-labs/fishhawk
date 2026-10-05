@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -48,6 +49,12 @@ type apiClient struct {
 	// issueSetClientTimeout for why it is its own client rather than the 30s
 	// short one.
 	httpIssueSet *http.Client
+	// hostLabel is this MCP process's host label (#3964 / ADR-087), captured
+	// ONCE by newAPIClient (hostDispatchLabel) and sent as the host-dispatch
+	// marker's {"host"} body. The server keys the default local concurrency
+	// group `local-implement:<host>` on it. Empty sends no body, which the
+	// server reads as the `unknown` host.
+	hostLabel string
 }
 
 // refinementDraftClientTimeout bounds the MCP client's wait on the two
@@ -109,7 +116,50 @@ func newAPIClient(cfg config) *apiClient {
 		// budgets (refinementDraftBudget vs MaxIssueSetResolutionBudget), so
 		// sharing one would silently couple them.
 		httpIssueSet: &http.Client{Timeout: issueSetClientTimeout},
+		hostLabel:    hostDispatchLabel(os.Hostname),
 	}
+}
+
+// hostLabelMax mirrors the server's host-label bound (a DNS name's length;
+// backend/internal/server/stage_concurrency.go hostLabelMax).
+const hostLabelMax = 253
+
+// hostDispatchLabel derives the host label the host-dispatch marker sends
+// (#3964 / ADR-087): os.Hostname sanitised to the server's accepted class
+// [A-Za-z0-9._-] (every other character becomes '-') and truncated to
+// hostLabelMax. A hostname error or an empty name yields "", so the marker
+// sends no body and the server files the stage under the `unknown` host. The
+// label is a coordination key, not a security boundary: a write:runs caller
+// can already spawn runners. hostname is the seam (os.Hostname in
+// production): a parameter rather than a package var, so a test pins the
+// label without racing parallel tests that build clients.
+func hostDispatchLabel(hostname func() (string, error)) string {
+	name, err := hostname()
+	if err != nil {
+		return ""
+	}
+	return sanitizeHostLabel(name)
+}
+
+// sanitizeHostLabel maps raw onto the server's accepted host-label class. Pure
+// so a table test pins every arm. The result is ASCII, so the byte truncation
+// cannot split a rune.
+func sanitizeHostLabel(raw string) string {
+	raw = strings.TrimSpace(raw)
+	var b strings.Builder
+	for _, c := range raw {
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '.', c == '_', c == '-':
+			b.WriteRune(c)
+		default:
+			b.WriteByte('-')
+		}
+	}
+	out := b.String()
+	if len(out) > hostLabelMax {
+		out = out[:hostLabelMax]
+	}
+	return out
 }
 
 // apiError is the typed form of the OpenAPI error envelope. Mirrors
@@ -2011,10 +2061,186 @@ func (c *apiClient) AcceptanceDispatchAdmission(ctx context.Context, stageID uui
 // wave-0 child with no dependencies), and an empty value means "keep the base
 // you already had". The server is the authority on the per-wave re-base; a
 // caller must NOT derive one of its own.
+//
+// Concurrency (#3964 / ADR-087) is present only on a GROUPED admission — the
+// stage took a local concurrency slot: its group, limit, and whether/how long
+// it queued first. Nil on the ungrouped and idempotent arms and on an older
+// backend.
 type HostDispatchResult struct {
-	Transitioned bool   `json:"transitioned"`
-	StageState   string `json:"stage_state"`
-	BaseBranch   string `json:"base_branch,omitempty"`
+	Transitioned bool              `json:"transitioned"`
+	StageState   string            `json:"stage_state"`
+	BaseBranch   string            `json:"base_branch,omitempty"`
+	Concurrency  *StageConcurrency `json:"concurrency,omitempty"`
+}
+
+// The StageConcurrency.Status values the server emits on the stage block
+// (backend/internal/server/stage_concurrency.go).
+const (
+	concurrencyStatusAwaitingSlot = "awaiting_concurrency_slot"
+	concurrencyStatusHolding      = "holding"
+)
+
+// StageConcurrency mirrors a stage's local concurrency-slot state (#3964 /
+// ADR-087). One shape carries three wire sources: the Stage `concurrency`
+// block on the stage reads (status awaiting_concurrency_slot | holding), the
+// host-dispatch 200 admission block (group/limit/queued_before/
+// waited_seconds), and the MCP-side queued dispatch output (waiter). Every
+// field is omitempty so each source renders only what it carries. Each json
+// tag MUST byte-match the backend or the field silently decodes to zero (the
+// #371-class wire-mirror trap); client_test pins them against server-shaped
+// bodies.
+type StageConcurrency struct {
+	Status   string `json:"status,omitempty" jsonschema:"awaiting_concurrency_slot (the stage is QUEUED for a local concurrency slot: it stays at awaiting_host_dispatch until a slot frees) or holding (the stage holds a slot). Absent on the host-dispatch admission block"`
+	Group    string `json:"group,omitempty" jsonschema:"the concurrency group: local-implement:<host> by default for a local implement stage, spec:<repo>:<name> for a spec-declared named group"`
+	Limit    int    `json:"limit,omitempty" jsonschema:"how many stages the group admits at once"`
+	Position int    `json:"position,omitempty" jsonschema:"1-based queue position while awaiting_concurrency_slot"`
+	// Holders is a list of the live slot holders. Absent or empty means no live
+	// holder: the stage is queued behind earlier waiters, or another admission
+	// held the group lock at that instant.
+	Holders    []ConcurrencyHolder `json:"holders,omitempty" jsonschema:"the live holders of the group's slots (run_id, stage_id, since). Absent or empty means NO live holder: the stage is queued behind earlier waiters, or another admission held the group lock at that instant"`
+	EnqueuedAt *time.Time          `json:"enqueued_at,omitempty" jsonschema:"when this queue episode started (a stale row restarts at the tail)"`
+	AcquiredAt *time.Time          `json:"acquired_at,omitempty" jsonschema:"when the slot was acquired, while holding"`
+	// WaiterLive is a pointer so an explicit false — the queue row has NOT
+	// been refreshed within the queue TTL — survives omitempty: that false is
+	// the operator's signal that no waiter will spawn the stage.
+	WaiterLive *bool  `json:"waiter_live,omitempty" jsonschema:"while awaiting_concurrency_slot: true when a dispatch waiter refreshed the queue row within the queue TTL (60s); false means NO live waiter will spawn the stage — re-dispatch it with fishhawk_dispatch_stage"`
+	Waiter     string `json:"waiter,omitempty" jsonschema:"on a queued fishhawk_dispatch_stage: started (this MCP session's slot waiter will spawn the stage on admission) or already_waiting (one already is)"`
+	// QueuedBefore / WaitedSeconds ride the host-dispatch admission block.
+	QueuedBefore  bool `json:"queued_before,omitempty" jsonschema:"on an admission: true when the stage queued before it was admitted"`
+	WaitedSeconds int  `json:"waited_seconds,omitempty" jsonschema:"on an admission: seconds the stage spent queued"`
+	Contended     bool `json:"contended,omitempty" jsonschema:"on a queued answer: another admission held the group lock at that instant"`
+	// Host / HeldDispatchedAt identify the admission a holding row records
+	// (the host label and the dispatched_at of the attempt it admitted), so a
+	// waiter that lost an admission response can tell its own admission from
+	// another session's (#3964 approval condition 3).
+	Host             string     `json:"host,omitempty" jsonschema:"while holding: the host label the slot was admitted for"`
+	HeldDispatchedAt *time.Time `json:"held_dispatched_at,omitempty" jsonschema:"while holding: the dispatched_at of the dispatch attempt the slot admitted"`
+}
+
+// waiterLive is the nil-safe read of WaiterLive: absent reads as false, the
+// direction that releases a wait rather than holding it on a signal nobody
+// sent.
+func (c *StageConcurrency) waiterLive() bool {
+	return c != nil && c.WaiterLive != nil && *c.WaiterLive
+}
+
+// ConcurrencyHolder is one live holder of a concurrency slot (#3964). IDs are
+// strings per the #371 reflection rule.
+type ConcurrencyHolder struct {
+	RunID   string    `json:"run_id" jsonschema:"the holder's run UUID"`
+	StageID string    `json:"stage_id" jsonschema:"the holder's stage UUID"`
+	Since   time.Time `json:"since" jsonschema:"when the holder took the slot"`
+}
+
+// concurrencySlotQueuedCode is the host-dispatch marker's queued answer
+// (#3964 / ADR-087): 409, the stage left at awaiting_host_dispatch.
+const concurrencySlotQueuedCode = "concurrency_slot_queued"
+
+// concurrencySlotQueuedError is the typed form of a 409
+// concurrency_slot_queued marker answer (#3964 / ADR-087): the stage did NOT
+// get a local concurrency slot and was queued, untouched. It carries the
+// parsed details and WRAPS the *apiError, so errors.As(*apiError) still holds
+// and every caller that fails closed on a non-nil marker error (run_stage,
+// drive_run, run_children) spawns nothing. asConcurrencySlotQueued recovers
+// it; fishhawk_dispatch_stage hands the queued dispatch to its slot waiter.
+type concurrencySlotQueuedError struct {
+	Group               string
+	Limit               int
+	Position            int
+	Holders             []ConcurrencyHolder
+	EnqueuedAt          *time.Time
+	Contended           bool
+	QueueTTLSeconds     int
+	PollIntervalSeconds int
+	apiErr              *apiError
+}
+
+// concurrencySlotQueuedDetails is the 409 details object's typed decode.
+type concurrencySlotQueuedDetails struct {
+	Group               string              `json:"group"`
+	Limit               int                 `json:"limit"`
+	Position            int                 `json:"position"`
+	Holders             []ConcurrencyHolder `json:"holders"`
+	EnqueuedAt          *time.Time          `json:"enqueued_at"`
+	Contended           bool                `json:"contended"`
+	QueueTTLSeconds     int                 `json:"queue_ttl_seconds"`
+	PollIntervalSeconds int                 `json:"poll_interval_seconds"`
+}
+
+// newConcurrencySlotQueuedError decodes ae's details. The code alone makes the
+// answer "queued", so an undecodable details object still yields the typed
+// error (with zero-valued details) rather than an untyped one a waiter would
+// treat as terminal.
+func newConcurrencySlotQueuedError(ae *apiError) *concurrencySlotQueuedError {
+	out := &concurrencySlotQueuedError{apiErr: ae}
+	raw, err := json.Marshal(ae.Details)
+	if err != nil {
+		return out
+	}
+	var d concurrencySlotQueuedDetails
+	if json.Unmarshal(raw, &d) != nil {
+		return out
+	}
+	out.Group = d.Group
+	out.Limit = d.Limit
+	out.Position = d.Position
+	out.Holders = d.Holders
+	out.EnqueuedAt = d.EnqueuedAt
+	out.Contended = d.Contended
+	out.QueueTTLSeconds = d.QueueTTLSeconds
+	out.PollIntervalSeconds = d.PollIntervalSeconds
+	return out
+}
+
+// holderSummary names who holds the slot. An empty holders list is named as
+// such rather than rendered as an empty "held by" (#3964 approval
+// condition 2).
+func (e *concurrencySlotQueuedError) holderSummary() string {
+	if len(e.Holders) == 0 {
+		if e.Contended {
+			return "no live holder is recorded — another admission held the group lock at that instant"
+		}
+		return "no live holder is recorded — it is queued behind earlier waiters"
+	}
+	parts := make([]string, 0, len(e.Holders))
+	for _, h := range e.Holders {
+		parts = append(parts, fmt.Sprintf("run %s stage %s", h.RunID, h.StageID))
+	}
+	return "the slot is held by " + strings.Join(parts, ", ")
+}
+
+func (e *concurrencySlotQueuedError) Error() string {
+	return fmt.Sprintf(
+		"dispatch queued for this host's local concurrency slot (group %q, limit %d, position %d): %s. "+
+			"fishhawk_dispatch_stage queues the stage and spawns it automatically once a slot frees; "+
+			"fishhawk_run_stage, fishhawk_drive_run and fishhawk_run_children fail closed on a queued dispatch until #3969 — "+
+			"re-invoke them after the holder settles: %v",
+		e.Group, e.Limit, e.Position, e.holderSummary(), e.apiErr)
+}
+
+func (e *concurrencySlotQueuedError) Unwrap() error { return e.apiErr }
+
+// stageConcurrency projects the queued answer onto the output DTO.
+func (e *concurrencySlotQueuedError) stageConcurrency() *StageConcurrency {
+	return &StageConcurrency{
+		Status:     concurrencyStatusAwaitingSlot,
+		Group:      e.Group,
+		Limit:      e.Limit,
+		Position:   e.Position,
+		Holders:    e.Holders,
+		EnqueuedAt: e.EnqueuedAt,
+		Contended:  e.Contended,
+	}
+}
+
+// asConcurrencySlotQueued recovers the typed queued answer from a
+// HostDispatchStage error chain.
+func asConcurrencySlotQueued(err error) (*concurrencySlotQueuedError, bool) {
+	var q *concurrencySlotQueuedError
+	if errors.As(err, &q) {
+		return q, true
+	}
+	return nil, false
 }
 
 // HostDispatchStage marks a host spawn against a runner_kind-locked-local stage
@@ -2046,12 +2272,32 @@ type HostDispatchResult struct {
 //     because the newest one is STALE. Annotated here ONCE (below) so every
 //     host-spawn verb inherits an actionable message with no per-call-site
 //     edit. It clears on its own: the server integrates between waves.
+//   - 409 concurrency_slot_queued — the local concurrency guard (#3964 /
+//     ADR-087): the stage's group has no free slot, so the stage was QUEUED
+//     and left at awaiting_host_dispatch. Returned as a
+//     *concurrencySlotQueuedError (asConcurrencySlotQueued) carrying the
+//     parsed position/holders and wrapping the *apiError, annotated here ONCE
+//     so every host-spawn verb fails closed with an actionable message.
 //   - 500 dependency_check_failed — the guard's parent-plan / sibling / audit
 //     read errored (retryable), never a silent admit.
+//
+// The request carries this process's host label as {"host": label} (#3964),
+// keying the default `local-implement:<host>` group; an empty label sends no
+// body (the server's `unknown` host).
 func (c *apiClient) HostDispatchStage(ctx context.Context, runID, stageID uuid.UUID) (*HostDispatchResult, error) {
 	path := "/v0/runs/" + runID.String() + "/stages/" + stageID.String() + "/host-dispatch"
+	var body []byte
+	if c.hostLabel != "" {
+		b, err := json.Marshal(struct {
+			Host string `json:"host"`
+		}{Host: c.hostLabel})
+		if err != nil {
+			return nil, fmt.Errorf("marshal host-dispatch body: %w", err)
+		}
+		body = b
+	}
 	var res HostDispatchResult
-	if err := c.do(ctx, http.MethodPost, path, nil, &res); err != nil {
+	if err := c.do(ctx, http.MethodPost, path, body, &res); err != nil {
 		// Annotate the wave-order refusal ONCE, at the client, as a deliberate
 		// ordering refusal rather than an opaque infrastructure failure. The
 		// wrap preserves the *apiError in the chain (%w), so callers that
@@ -2073,6 +2319,12 @@ func (c *apiClient) HostDispatchStage(ctx context.Context, runID, stageID uuid.U
 			return nil, fmt.Errorf(
 				"dispatch refused by the per-wave integration guard: this fan-out child's predecessors have succeeded but are not yet integrated onto the parent's consolidated branch; the server integrates between waves — retry the dispatch shortly (fishhawk_await_children releases when the child becomes dispatchable): %w",
 				err)
+		}
+		// The local concurrency queue (#3964): typed so fishhawk_dispatch_stage
+		// can hand the dispatch to its slot waiter, and annotated for every
+		// other host-spawn verb, which fails closed on it (#3969).
+		if errors.As(err, &ae) && ae.Code == concurrencySlotQueuedCode {
+			return nil, newConcurrencySlotQueuedError(ae)
 		}
 		return nil, err
 	}
@@ -5041,9 +5293,14 @@ type Stage struct {
 	// legacy run, or on an older backend that omits the key. The json tag MUST
 	// byte-match the backend or the field silently decodes to nil — the
 	// #371-class wire-mirror trap.
-	Progress  *StageProgress `json:"progress,omitempty"`
-	CreatedAt time.Time      `json:"created_at"`
-	UpdatedAt time.Time      `json:"updated_at"`
+	Progress *StageProgress `json:"progress,omitempty"`
+	// Concurrency mirrors the backend stageResponse.concurrency (#3964 /
+	// ADR-087): the stage's ACTIVE local concurrency-slot state (queued or
+	// holding). Nil for a stage with no active slot row and on an older
+	// backend. The json tag MUST byte-match the backend.
+	Concurrency *StageConcurrency `json:"concurrency,omitempty"`
+	CreatedAt   time.Time         `json:"created_at"`
+	UpdatedAt   time.Time         `json:"updated_at"`
 }
 
 // StageProgress mirrors the backend stageResponse.progress sub-schema (#2541).
@@ -5114,6 +5371,10 @@ type RunStageWait struct {
 	FailureCategory *string    `json:"failure_category,omitempty"`
 	FailureReason   *string    `json:"failure_reason,omitempty"`
 	StartedAt       *time.Time `json:"started_at,omitempty"`
+	// Concurrency is the embedded stage shape's `concurrency` block (#3964):
+	// fishhawk_await_stage holds through a settled awaiting_host_dispatch read
+	// while the stage is queued for a slot with a live waiter.
+	Concurrency *StageConcurrency `json:"concurrency,omitempty"`
 }
 
 // GetRunStageWait calls GET /v0/runs/{run_id}/stages/{stage_id}, decoding the
