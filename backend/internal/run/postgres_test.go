@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -3783,4 +3784,114 @@ func TestPostgres_DeletePendingAcceptanceStage_RefusedByReferencingAuditRow(t *t
 	if _, err := repo.GetStage(ctx, acc.ID); err != nil {
 		t.Fatalf("GetStage after refused delete: %v (row must be intact)", err)
 	}
+}
+
+// TestTransitionStageFromTx pins the transaction-scoped CAS (#3964): it
+// applies inside the CALLER's transaction (visible, with dispatched_at
+// stamped, only after commit), reverts with the caller's rollback, refuses
+// drift with StageStateChangedError, and refuses a move into failed (it
+// carries no FailureCategory) before any SQL runs.
+func TestTransitionStageFromTx(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := run.NewPostgresRepository(pool)
+	ctx := context.Background()
+	newParked := func() *run.Stage {
+		r := makeRun(t, repo)
+		s := makeStage(t, repo, r.ID, 1)
+		s, err := repo.TransitionStage(ctx, s.ID, run.StageStateAwaitingHostDispatch, nil)
+		if err != nil {
+			t.Fatalf("park: %v", err)
+		}
+		return s
+	}
+
+	t.Run("commits with the caller", func(t *testing.T) {
+		s := newParked()
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin: %v", err)
+		}
+		got, err := run.TransitionStageFromTx(ctx, tx, s.ID, run.StageStateAwaitingHostDispatch, run.StageStateDispatched)
+		if err != nil {
+			_ = tx.Rollback(ctx)
+			t.Fatalf("TransitionStageFromTx: %v", err)
+		}
+		if got.State != run.StageStateDispatched || got.DispatchedAt == nil {
+			_ = tx.Rollback(ctx)
+			t.Fatalf("returned stage = %+v, want dispatched with dispatched_at", got)
+		}
+		if outside, _ := repo.GetStage(ctx, s.ID); outside.State != run.StageStateAwaitingHostDispatch {
+			_ = tx.Rollback(ctx)
+			t.Fatalf("uncommitted move visible outside the transaction: %s", outside.State)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatalf("commit: %v", err)
+		}
+		after, _ := repo.GetStage(ctx, s.ID)
+		if after.State != run.StageStateDispatched || after.DispatchedAt == nil || !after.DispatchedAt.Equal(*got.DispatchedAt) {
+			t.Fatalf("after commit = %+v, want dispatched with the returned dispatched_at", after)
+		}
+	})
+	t.Run("reverts with the caller's rollback", func(t *testing.T) {
+		s := newParked()
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin: %v", err)
+		}
+		if _, err := run.TransitionStageFromTx(ctx, tx, s.ID, run.StageStateAwaitingHostDispatch, run.StageStateDispatched); err != nil {
+			_ = tx.Rollback(ctx)
+			t.Fatalf("TransitionStageFromTx: %v", err)
+		}
+		if err := tx.Rollback(ctx); err != nil {
+			t.Fatalf("rollback: %v", err)
+		}
+		if after, _ := repo.GetStage(ctx, s.ID); after.State != run.StageStateAwaitingHostDispatch || after.DispatchedAt != nil {
+			t.Fatalf("after rollback = %+v, want untouched", after)
+		}
+	})
+	t.Run("refuses drift", func(t *testing.T) {
+		s := newParked()
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin: %v", err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		_, err = run.TransitionStageFromTx(ctx, tx, s.ID, run.StageStatePending, run.StageStateDispatched)
+		var changed run.StageStateChangedError
+		if !errors.As(err, &changed) || changed.Actual != run.StageStateAwaitingHostDispatch {
+			t.Fatalf("err = %v, want StageStateChangedError(actual awaiting_host_dispatch)", err)
+		}
+	})
+	t.Run("refuses a move into failed", func(t *testing.T) {
+		// dispatched → failed is a VALID edge, so only the completion guard
+		// can refuse it (an awaiting_host_dispatch fixture would be masked by
+		// the transition table).
+		s := newParked()
+		if _, err := repo.TransitionStage(ctx, s.ID, run.StageStateDispatched, nil); err != nil {
+			t.Fatalf("dispatch: %v", err)
+		}
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin: %v", err)
+		}
+		_, err = run.TransitionStageFromTx(ctx, tx, s.ID, run.StageStateDispatched, run.StageStateFailed)
+		if err == nil || !strings.Contains(err.Error(), "FailureCategory") {
+			_ = tx.Rollback(ctx)
+			t.Fatalf("err = %v, want the FailureCategory refusal", err)
+		}
+		_ = tx.Commit(ctx)
+		if after, _ := repo.GetStage(ctx, s.ID); after.State != run.StageStateDispatched {
+			t.Fatalf("stage = %s after refused move into failed, want dispatched", after.State)
+		}
+	})
+	t.Run("missing stage is ErrNotFound", func(t *testing.T) {
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin: %v", err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		if _, err := run.TransitionStageFromTx(ctx, tx, uuid.New(), run.StageStatePending, run.StageStateDispatched); !errors.Is(err, run.ErrNotFound) {
+			t.Fatalf("err = %v, want ErrNotFound", err)
+		}
+	})
 }

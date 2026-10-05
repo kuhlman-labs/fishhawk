@@ -6972,3 +6972,92 @@ func TestMigrateDown_UserReportCursorsReversal(t *testing.T) {
 		t.Errorf("0089 captain_read_watermarks rows after rolling back 0096 = %d, want 1 (untouched)", survivors)
 	}
 }
+
+// TestMigrateDown_StageConcurrencySlotsReversal pins 0097 (#3964 / ADR-087):
+// after MigrateUp stage_concurrency_slots accepts a queued row, refuses an
+// out-of-range slot_limit and an unknown state, cascades away with its
+// stage, and fishhawk_stage_heartbeat_at parses a valid heartbeat while
+// mapping a special/out-of-range one to NULL; after rolling back through
+// 0097 the table and function are gone, the schema lands on 0096, and a
+// stages row survives.
+func TestMigrateDown_StageConcurrencySlotsReversal(t *testing.T) {
+	t.Parallel()
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+	ctx := context.Background()
+
+	var runID, stageID, survivorID uuid.UUID
+	if err := pool.QueryRow(ctx, `INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, state)
+VALUES (gen_random_uuid(), 'o/r', 'w', 'sha', 'cli', 'running') RETURNING id`).Scan(&runID); err != nil {
+		t.Fatalf("seed run: %v", err)
+	}
+	seedStage := func(seq int) uuid.UUID {
+		t.Helper()
+		var id uuid.UUID
+		if err := pool.QueryRow(ctx, `INSERT INTO stages (id, run_id, sequence, stage_type, executor_kind, executor_ref, state)
+VALUES (gen_random_uuid(), $1, $2, 'implement', 'agent', 'claude-code', 'awaiting_host_dispatch') RETURNING id`, runID, seq).Scan(&id); err != nil {
+			t.Fatalf("seed stage: %v", err)
+		}
+		return id
+	}
+	stageID, survivorID = seedStage(1), seedStage(2)
+
+	if _, err := pool.Exec(ctx, `INSERT INTO stage_concurrency_slots (stage_id, run_id, group_key, slot_limit, state)
+VALUES ($1, $2, 'local-implement:h1', 1, 'queued')`, stageID, runID); err != nil {
+		t.Fatalf("insert slot row after MigrateUp: %v — 0097 must make it insertable", err)
+	}
+	for name, sql := range map[string]string{
+		"slot_limit 0":  `INSERT INTO stage_concurrency_slots (stage_id, run_id, group_key, slot_limit, state) VALUES ($1, $2, 'g', 0, 'queued')`,
+		"slot_limit 65": `INSERT INTO stage_concurrency_slots (stage_id, run_id, group_key, slot_limit, state) VALUES ($1, $2, 'g', 65, 'queued')`,
+		"state waiting": `INSERT INTO stage_concurrency_slots (stage_id, run_id, group_key, slot_limit, state) VALUES ($1, $2, 'g', 1, 'waiting')`,
+	} {
+		if _, err := pool.Exec(ctx, sql, survivorID, runID); err == nil {
+			t.Errorf("%s accepted, want a CHECK violation", name)
+		}
+	}
+
+	var valid, special, outOfRange *time.Time
+	if err := pool.QueryRow(ctx, `SELECT
+  fishhawk_stage_heartbeat_at(jsonb_build_object('reported_at', to_jsonb(now()))),
+  fishhawk_stage_heartbeat_at('{"reported_at":"infinity"}'::jsonb),
+  fishhawk_stage_heartbeat_at('{"reported_at":"2026-13-45T00:00:00Z"}'::jsonb)`).Scan(&valid, &special, &outOfRange); err != nil {
+		t.Fatalf("fishhawk_stage_heartbeat_at: %v", err)
+	}
+	if valid == nil || special != nil || outOfRange != nil {
+		t.Errorf("heartbeat parse valid=%v special=%v outOfRange=%v, want non-nil/nil/nil", valid, special, outOfRange)
+	}
+
+	if _, err := pool.Exec(ctx, `DELETE FROM stages WHERE id = $1`, stageID); err != nil {
+		t.Fatalf("delete stage with a slot row: %v — ON DELETE CASCADE must not block it", err)
+	}
+	var slots int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM stage_concurrency_slots`).Scan(&slots); err != nil {
+		t.Fatalf("count slots: %v", err)
+	}
+	if slots != 0 {
+		t.Errorf("slot rows after deleting their stage = %d, want 0 (cascade)", slots)
+	}
+
+	downThrough(t, url, "0097")
+
+	var tables, funcs, survivors int
+	if err := pool.QueryRow(ctx, `SELECT
+  (SELECT count(*) FROM information_schema.tables WHERE table_name = 'stage_concurrency_slots'),
+  (SELECT count(*) FROM pg_proc WHERE proname = 'fishhawk_stage_heartbeat_at'),
+  (SELECT count(*) FROM stages WHERE id = $1)`, survivorID).Scan(&tables, &funcs, &survivors); err != nil {
+		t.Fatalf("read back after rollback: %v", err)
+	}
+	if tables != 0 || funcs != 0 {
+		t.Errorf("after rolling back 0097: tables=%d functions=%d, want 0/0", tables, funcs)
+	}
+	if survivors != 1 {
+		t.Errorf("stages row after rolling back 0097 = %d, want 1 (untouched)", survivors)
+	}
+}
