@@ -71,3 +71,59 @@ Adopt Option 5 (container isolation) as the primary mechanism, with Option 3 + a
 - Related: ADR-029 / #650 (env-sanitization half of gate containment); this ADR is the filesystem/metadata/egress half that was never specified. E46 follow-ups #2124, #2125, #2129 depend on this for their full close.
 
 **Implementation** is a follow-up (or set of follow-ups) filed against this ADR: the shared-helper container path + runtime detection + fallback, the gate-evidence path-recording, the `diff_coverage` image field, and the self-hosted-profile doc update. Human-led review per `autonomy:low`.
+
+## Decision addendum (E51.4 / #2137): daemon-dependent gate commands
+
+**Gap.** This repository's `scripts/test verify` runs the pgtest-backed backend suite, which starts a testcontainers Postgres through the host Docker daemon. The `--network=none` gate container has no daemon, no daemon socket (forbidden above) and no network, so the container path could not run this repository's own verify. Three options were weighed: (a) a nesting-safe runtime inside the gate, (b) a runner-provisioned service container whose unix socket alone is shared into the gate, (c) routing daemon-dependent gates to the fallback.
+
+**Decided: option (b), with least privilege** (operator decision on the #2137 plan approval).
+- **Rejected (a):** there is no nesting-safe runtime on Docker Desktop or the macOS dogfood runner; sysbox is a Linux-only runtime installed with root.
+- **Rejected (c):** it would make the flagship verify gate permanently a fallback gate, which is the silent regression this ADR exists to prevent.
+
+**Mechanism.** The runner switch is `FISHHAWK_GATE_SERVICES=postgres` (a comma list; `postgres` is the only member; an unknown member is a startup config error, `runner_failed reason=config`, before any backend contact). `FISHHAWK_GATE_POSTGRES_IMAGE` overrides the service image (default `postgres:16-alpine`; operators should pin it by digest). The switch only acts on the container path; elsewhere the runner logs `gate_services_ignored` and changes nothing. #2136's workflow-v2 `gate_container` block is the future spec mapping (a `gate_container.services` member); until then the runner variable is the switch. Per container exec:
+1. `volume create` makes one fresh named volume, `fishhawk-gate-svc-<12 hex>`, labelled `org.fishhawk.gate-service=postgres`.
+2. `run -d` starts the service as `--network=none --cap-drop=ALL --security-opt=no-new-privileges --user postgres`, with the same label and no published port. Its only mounts are that named volume at `/var/run/postgresql` and a `--tmpfs` at the image's declared PGDATA `VOLUME` (`/var/lib/postgresql/data`), so the daemon creates no anonymous data volume. No host path is mounted. initdb runs with `--auth-local=scram-sha-256 --auth-host=scram-sha-256`, so every connection, the socket included, needs a password. The superuser password is random per service.
+3. **Readiness.** Each iteration reads the service logs FIRST and runs `pg_isready` only once the image's `PostgreSQL init process complete; ready for start up.` line has been seen, because the temporary init server already answers `pg_isready`. The service is ready only when `pg_isready` succeeds after that line.
+4. **Bootstrap.** Inside the service container, as the superuser, the runner creates the gate role `fishhawk` (`LOGIN CREATEDB NOSUPERUSER NOCREATEROLE NOBYPASSRLS NOREPLICATION`) and a database `fishhawk` owned by it.
+5. **Gate exec.** The socket volume is mounted READ-ONLY at `/pgsock` in the gate container. `FISHHAWK_TEST_PG_URL=postgres://fishhawk:fishhawk@/fishhawk?host=/pgsock&sslmode=disable` is applied LAST, so neither the sanitized env nor extras can redirect it. The superuser credential never enters the gate container: not in its env, files, mounts or argv.
+6. **Teardown.** `rm -f -v <service>` then `volume rm -f <volume>` run on EVERY exit: provisioning failure, gate failure and timeout. They run on a detached, bounded context and are registered before `volume create` is attempted. A teardown failure is logged (`gate_service_cleanup_failed`) and never changes the gate's verdict.
+
+Every runtime call (the passwd read, all six service steps, the gate run and its kill) is bound to the endpoint the selection validated.
+
+**Bounds.** Each provisioning step has its own bound, and none of them counts against the gate's own timeout (`executor.verify.timeout`), just like the module-cache seed:
+- `volume create`: 1m.
+- `run -d`: 5m, which covers a cold pull of the service image.
+- Readiness: 90s overall, polled every 250ms, with each `logs` / `pg_isready` probe bounded at 15s.
+- Bootstrap: 1m.
+
+ANY provisioning failure is `gateUnavailable`: category C, the gate argv never executes, and the fix agent is never invoked.
+
+**On EVERY container exec, services or not:**
+- the in-container env pin `FISHHAWK_GATE_CONTAINER=1`;
+- a runner-generated `/etc/passwd`, mounted read-only, that maps the caller uid;
+- the passwd-read helper that builds it.
+
+The file is the gate image's `/etc/passwd` plus one caller entry, written to a fresh per-exec file. The helper is `run --rm --network=none --cap-drop=ALL --security-opt=no-new-privileges --user <uid>:<gid> --entrypoint '' <image> cat /etc/passwd`. Only a successful read is cached, per image per process, so a transient failure is retried on a later exec. A read or write failure degrades to no passwd mount, with a `gate_passwd_unavailable` log line; it never refuses the gate.
+
+**Test side.**
+- `backend/internal/pgtest` uses `FISHHAWK_TEST_PG_URL` as its shared base without testcontainers. Every failure on that branch is fatal, never a skip.
+- With `FISHHAWK_GATE_CONTAINER=1` and no URL, `pgtest` fails, naming `FISHHAWK_GATE_SERVICES`.
+- `backend/internal/postgres`'s raw-database helper creates throwaway `fh_raw_<uuid>` databases on that server.
+- The RustFS-backed `backend/internal/tracestore` S3 suite skips inside the gate container.
+
+**Scoped exceptions to "only the checkout is mounted".** These are deliberate, and they are the only ones:
+- (i) One per-exec NAMED volume holding only the Postgres unix socket, mounted read-only. It is never a host path and never the runtime daemon socket: `BuildArgv` refuses, with no argv, any service mount whose volume is not `^fishhawk-gate-svc-[0-9a-f]{12}$`, whose target is not absolute, clean and non-root, or that is not read-only.
+- (ii) The runner-generated read-only `/etc/passwd`. It is a host file under the per-exec cache root and passes through the same resolved-path socket-mount guard as every other bind source.
+
+The service container itself mounts no host path: one named volume plus a tmpfs, nothing else.
+
+**Residuals, stated:**
+- **A CREATEDB role on a network-less, per-exec Postgres.** The gate connects as a non-superuser that can create databases and own what it creates, and nothing else. It cannot run superuser-only SQL: `COPY … TO PROGRAM` and `CREATE ROLE` are refused, and the superuser cannot be reached over the socket without its password. The service it talks to has no network, no host mount, no published port and no capabilities, and is destroyed after the exec. The superuser password exists only in the service container's env and the host-side runtime CLI argv. Those are visible to same-user processes on the runner HOST, but not inside the gate container.
+- **The containment fixtures skip once verify itself runs on the container path.** The docker-gated fixtures in `runner/cmd/fishhawk-runner/gateisolation_e2e_test.go` (the containment set (a)–(g), (k), (l) and the service fixtures (m), (n)) need a container runtime, and the gate container has none, so inside it they and the `TestMain` sentinel's eligibility skip. They keep running wherever the runner package's `go test` runs on a host with Docker: a host-side `scripts/test verify` / `scripts/test single -run TestGate`, on the operator's docker host and in CI.
+- **The RustFS S3 suite is skipped on the container path.** No RustFS service is provisioned. CI and host-side verify still run it. Patch coverage measured INSIDE the gate container therefore counts `backend/internal/tracestore`'s S3 code as uncovered, so a change there can fail the in-loop 85% patch gate on the container path and pass it on the host. The aggregate CI gate is unaffected.
+- **Postgres is the only provisioned daemon.** Any other daemon dependency is unsupported on the container path. Under the hosted profile (no fallback) it surfaces as a red tree, never as a silent skip. `directory/internal/store` still starts its own testcontainers Postgres outside `pgtest`, so it is a known in-container failure until it learns the external URL.
+- **Crash-orphaned services.** A runner SIGKILLed mid-exec runs no deferred teardown, and the service container and volume outlive it. Both carry the `org.fishhawk.gate-service` label; the label-filtered manual cleanup is in `runner/README.md`.
+- **Cost.** Each container exec gains a Postgres start (seconds) plus one passwd read per image per process.
+- **Not yet proven in-loop.** The full in-container `scripts/test verify` is validated by an operator walk, not by the implement gate. The opt-in fixture (n), `TestGateContainer_SelfHostPgtestSuite`, drives pgx and golang-migrate (the real `pgtest` external branch) over the mounted socket inside the built `fishhawk-gate` image. It must pass, with its result recorded, before an operator sets `FISHHAWK_GATE_IMAGE` with `FISHHAWK_GATE_SERVICES=postgres` for this repository.
+
+**Rollback.** The feature is opt-in. With `FISHHAWK_GATE_SERVICES` unset the runner provisions nothing, and `pgtest` / `postgres` tests behave as before outside the gate container. The `FISHHAWK_GATE_CONTAINER=1` pin, the `/etc/passwd` mount and the passwd-read helper apply to EVERY container exec, so reverting them changes every container gate, not only service-bearing ones. Unsetting `FISHHAWK_GATE_IMAGE` returns a runner to the clone fallback with no code change.

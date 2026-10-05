@@ -8,11 +8,12 @@ toolchain. It has two consumers:
    verify --in-gate-image` run the gate's Docker-free legs inside the image, so
    a local run uses CI's tool versions rather than whatever the host has
    (the local-golangci-newer-than-CI and Go-toolchain-drift reds).
-2. **The runner's container gate path later.** ADR-063's Decision already
+2. **The runner's container gate path.** ADR-063's Decision already
    provides a runner gate image via `FISHHAWK_GATE_IMAGE`; this is that image,
-   defined in-repo and pin-checked. **Do NOT set `FISHHAWK_GATE_IMAGE` for this
-   repository before [#2137](https://github.com/kuhlman-labs/fishhawk/issues/2137)
-   lands** — see "Runner gate image" below.
+   defined in-repo and pin-checked. **For this repository set it only together
+   with `FISHHAWK_GATE_SERVICES=postgres`
+   ([#2137](https://github.com/kuhlman-labs/fishhawk/issues/2137)), and only
+   after the operator walk is green** — see "Runner gate image" below.
 
 ## Image contract
 
@@ -21,7 +22,7 @@ toolchain. It has two consumers:
 | Base | `golang:${GO_VERSION}-bookworm` (official multi-arch image) |
 | Build context | `deploy/gate-image/` alone; the image copies NO repository files |
 | Entrypoint / user | none / none — callers pass `--entrypoint ''` and `--user uid:gid` |
-| Runtime env | works as an arbitrary uid with `HOME=/tmp`, except that such a uid has no `/etc/passwd` entry (`whoami` fails, so test-helm-render r9h fails); `--in-gate-image` mounts one (step 6), the runner's container path does not yet (#2137); `GOTOOLCHAIN=local` is baked in |
+| Runtime env | works as an arbitrary uid with `HOME=/tmp`, except that such a uid has no `/etc/passwd` entry in the image (`whoami` fails, so test-helm-render r9h fails); both callers SUPPLY one: `--in-gate-image` mounts one (step 6), and the runner's container path mounts a runner-generated read-only `/etc/passwd` on every exec (#2137; when that read or write degrades, `gate_passwd_unavailable`, the gap returns for that exec); `GOTOOLCHAIN=local` is baked in |
 | Docker | none: no engine, CLI, plugin or socket, enforced in both check modes |
 | Architecture | every download keyed on BuildKit `TARGETARCH`, declared in the stage |
 
@@ -122,11 +123,12 @@ containing what the gate executes; that is the runner's container path
 (ADR-063), not this helper.
 
 **Limits.** The `go test -race` loop and the patch-coverage gate do not run
-in-image: the backend tests need the testcontainers Postgres, which needs a
-Docker daemon, and that is
-[#2137](https://github.com/kuhlman-labs/fishhawk/issues/2137). `verify
---in-gate-image` therefore runs `verify --no-tests` (every other leg) inside.
-Host-side, `verify --no-tests` runs the same legs without the image.
+in-image here: the backend tests need a Postgres, and this helper provisions
+none (no daemon in the image). The runner's container path does — #2137's
+runner-provisioned Postgres service, reached over a read-only unix-socket
+mount — but `--in-gate-image` is a shell helper with no such service, so
+`verify --in-gate-image` still runs `verify --no-tests` (every other leg)
+inside. Host-side, `verify --no-tests` runs the same legs without the image.
 
 **Variable name.** The helper reads `FISHHAWK_TEST_GATE_IMAGE`, deliberately not
 `FISHHAWK_GATE_IMAGE`: exporting the latter in a shell that spawns the runner
@@ -143,15 +145,20 @@ PATH="$d" scripts/test lint --in-gate-image   # exits 1 naming docker
 
 ## Runner gate image
 
-Once [#2137](https://github.com/kuhlman-labs/fishhawk/issues/2137) makes this
-repository's verify runnable under the container path, this is the recommended
-`FISHHAWK_GATE_IMAGE` for it, pinned by DIGEST
-(`ghcr.io/kuhlman-labs/fishhawk-gate@sha256:…`) and later declared through
-[#2136](https://github.com/kuhlman-labs/fishhawk/issues/2136)'s workflow-v2
-gate field. **Until #2137 lands, do NOT set `FISHHAWK_GATE_IMAGE`** in an
-environment that spawns the runner for this repository: `auto` then prefers
-the container path, whose `--network=none` cannot reach the testcontainers
-Postgres, and every verify fails. Contract: `runner/internal/gateiso/README.md`.
+This is the recommended `FISHHAWK_GATE_IMAGE` for this repository, pinned by
+DIGEST (`ghcr.io/kuhlman-labs/fishhawk-gate@sha256:…`) and later declared
+through [#2136](https://github.com/kuhlman-labs/fishhawk/issues/2136)'s
+workflow-v2 `gate_container` block. The image carries no daemon; the
+daemon-dependent backend tests reach Postgres through the runner's gate
+service ([#2137](https://github.com/kuhlman-labs/fishhawk/issues/2137)), so
+**set it only TOGETHER with `FISHHAWK_GATE_SERVICES=postgres`** (and a
+digest-pinned `FISHHAWK_GATE_POSTGRES_IMAGE`): without the service, `pgtest`
+fails closed inside the container and every verify is red. **Enable it only
+after the operator walk** — fixture (n), `TestGateContainer_SelfHostPgtestSuite`,
+run against this image with its PASS line recorded, then one full
+container-path verify with pgtest-backed PASS lines and no `--- SKIP` — in
+`runner/internal/gateiso/README.md` § "Gate services (#2137)", which is also
+the contract.
 
 ## One-time operator steps
 
