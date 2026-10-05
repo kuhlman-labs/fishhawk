@@ -271,6 +271,12 @@ import "sort"
 // on the pre-decision state. It grants nothing, is INTERNAL, and must never be
 // an issue-comment activity category (docs/issue-comment-surfaces.md records
 // it as deliberately not a surface).
+// #3964 (ADR-087) added stage_concurrency_queued and
+// stage_concurrency_admitted: server/stage_concurrency.go appends one queued
+// row per queue episode when the host-dispatch marker queues a grouped local
+// stage behind its group's holders, and one admitted row on every grouped
+// admission. Best-effort, actor system, INTERNAL — deliberately NOT
+// issue-comment activity categories (read through GET /v0/runs/{id}/audit).
 var KnownCategories = map[string]struct{}{
 	"acceptance_dispatched":                   {},
 	"acceptance_outcome_recorded":             {},
@@ -497,6 +503,8 @@ var KnownCategories = map[string]struct{}{
 	"split_parent_closed":                     {},
 	"spend_alert":                             {},
 	"stage_budget_exceeded":                   {},
+	"stage_concurrency_admitted":              {},
+	"stage_concurrency_queued":                {},
 	"stage_conflict_resolution_failed":        {},
 	"stage_conflict_resolution_triggered":     {},
 	"stage_fixup_recovered":                   {},

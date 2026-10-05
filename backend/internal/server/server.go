@@ -31,6 +31,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/captain"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/concurrency"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/crewmessage"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/digest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
@@ -862,6 +863,15 @@ type Config struct {
 	// in_flight, and a nil RunRepo degrades delegation_in_force, whose view is
 	// projected from the newest run's cached spec).
 	CaptainStore *captain.Store
+
+	// Concurrency is the local stage concurrency slot store (#3964 /
+	// ADR-087): the host-dispatch spawn marker asks it for a slot before it
+	// moves a grouped host-dispatched stage to dispatched, and the stage reads
+	// project its queue/holding state as the `concurrency` block. Wired from
+	// serve.go next to RunRepo; nil keeps today's marker byte-identical (a
+	// bare CAS, no queue, no block). See stage_concurrency.go and
+	// backend/internal/concurrency/README.md.
+	Concurrency concurrency.Store
 
 	// CrewMailbox is the crew-message domain layer (E77.3 / #3737, ADR-081
 	// #3727 D4) behind the five /v0/crew-messages routes: sends and

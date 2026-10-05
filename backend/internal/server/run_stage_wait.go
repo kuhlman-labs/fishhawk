@@ -151,6 +151,10 @@ func (s *Server) handleGetRunStage(w http.ResponseWriter, r *http.Request) {
 		Terminal:      stage.State.IsSettled(),
 		NextAction:    s.stageNextAction(r.Context(), runID),
 	}
+	// The local concurrency-slot block (#3964): fishhawk_await_stage reads this
+	// envelope to tell a QUEUED awaiting_host_dispatch stage (with a live slot
+	// waiter) from a plain parked one. Best-effort, nil on a read error.
+	resp.Concurrency = s.stageConcurrencyBlocks(r.Context(), []uuid.UUID{stage.ID})[stage.ID]
 	s.writeJSON(w, r, http.StatusOK, resp)
 }
 
