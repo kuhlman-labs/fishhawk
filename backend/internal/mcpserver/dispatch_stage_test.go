@@ -2815,3 +2815,205 @@ func TestDispatchStage_GitLabRun_NoBaseURL_RefusesBeforeMarker(t *testing.T) {
 		t.Fatalf("host-dispatch marker POSTed %d times before the refusal", marker)
 	}
 }
+
+// --- local concurrency slots (#3964 / ADR-087) -------------------------------
+
+// slotDispatchFake is a minimal backend for the concurrency-slot dispatch
+// tests: GET run (unlocked), GET stages (one implement stage), the best-effort
+// record-act, a host-dispatch marker answering markerStatus/markerBody, and a
+// reap-failure endpoint recording each body.
+type slotDispatchFake struct {
+	mu           sync.Mutex
+	runID        uuid.UUID
+	stageID      uuid.UUID
+	stageState   string
+	markerStatus int
+	markerBody   string
+	reapStatus   int // 0 -> 200
+	reaps        []reapFailureRequest
+}
+
+func newSlotDispatchFake(t *testing.T, markerStatus int, markerBody string) (*slotDispatchFake, *runResolver) {
+	t.Helper()
+	f := &slotDispatchFake{runID: uuid.New(), stageID: uuid.New(), stageState: "awaiting_host_dispatch", markerStatus: markerStatus, markerBody: markerBody}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		switch {
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/host-dispatch"):
+			if f.markerStatus == http.StatusOK {
+				f.stageState = "dispatched"
+			}
+			w.WriteHeader(f.markerStatus)
+			_, _ = w.Write([]byte(f.markerBody))
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/reap-failure"):
+			var b reapFailureRequest
+			_ = json.NewDecoder(r.Body).Decode(&b)
+			f.reaps = append(f.reaps, b)
+			if f.reapStatus != 0 {
+				w.WriteHeader(f.reapStatus)
+				_, _ = w.Write([]byte(`{"error":{"code":"stage_state_precondition_failed","message":"no"}}`))
+				return
+			}
+			f.stageState = "failed"
+			_, _ = w.Write([]byte(`{"transitioned":true,"stage_state":"failed"}`))
+		case strings.HasSuffix(r.URL.Path, "/stages"):
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"items": []Stage{{ID: f.stageID.String(), RunID: f.runID.String(), Type: "implement", State: f.stageState}},
+			})
+		default:
+			_ = json.NewEncoder(w).Encode(Run{ID: f.runID.String(), Repo: "x/y", State: "running"})
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return f, &runResolver{
+		api:    newAPIClient(config{backendURL: srv.URL, apiToken: "tok-test"}),
+		getenv: func(string) string { return "" },
+	}
+}
+
+func (f *slotDispatchFake) input() DispatchStageInput {
+	return DispatchStageInput{
+		RunID: f.runID.String(), StageID: f.stageID.String(), Workflow: "feature_change", Stage: "implement",
+		WorkingDir: "/tmp/checkout", GitHubRepo: "x/y", PushAndOpenPR: boolPtr(false), RunnerBinary: "/fake/fishhawk-runner",
+	}
+}
+
+// countingSpawn swaps the detached-spawn seam for a counter returning err.
+func countingSpawn(t *testing.T, err error) *int {
+	t.Helper()
+	n := new(int)
+	saved := dispatchSpawnDetached
+	dispatchSpawnDetached = func(string, []string, []string, string, string, detachedFailureReporter, detachedStageStateProbe) (string, error) {
+		*n++
+		if err != nil {
+			return "", err
+		}
+		return "/dev/null", nil
+	}
+	t.Cleanup(func() { dispatchSpawnDetached = saved })
+	return n
+}
+
+const slotQueuedBody = `{"error":{"code":"concurrency_slot_queued","message":"queued","details":{"group":"local-implement:h1","limit":1,"position":2,"holders":[{"run_id":"11111111-1111-1111-1111-111111111111","stage_id":"22222222-2222-2222-2222-222222222222","since":"2026-10-05T00:00:00Z"}],"enqueued_at":"2026-10-05T00:01:00Z","contended":false,"queue_ttl_seconds":60,"poll_interval_seconds":5}}}`
+
+// TestDispatchStage_QueuedReturnsAwaitingConcurrencySlotNoSpawn: a 409
+// concurrency_slot_queued marker answer spawns NOTHING, starts this process's
+// slot waiter with the queued episode, and returns the queue state plus a
+// fishhawk_await_stage next step — not a tool error.
+func TestDispatchStage_QueuedReturnsAwaitingConcurrencySlotNoSpawn(t *testing.T) {
+	f, r := newSlotDispatchFake(t, http.StatusConflict, slotQueuedBody)
+	r.api.hostLabel = "h1"
+	runnerBin := "/old/fishhawk-runner"
+	r.getenv = func(k string) string {
+		if k == "FISHHAWK_RUNNER_BIN" {
+			return runnerBin
+		}
+		return ""
+	}
+	spawns := countingSpawn(t, nil)
+	var started []slotWaiterSpec
+	saved := dispatchStartSlotWaiter
+	dispatchStartSlotWaiter = func(spec slotWaiterSpec) (string, <-chan struct{}) {
+		started = append(started, spec)
+		return slotWaiterAlreadyWaiting, nil
+	}
+	t.Cleanup(func() { dispatchStartSlotWaiter = saved })
+
+	in := f.input()
+	in.RunnerBinary = ""
+	_, out, err := r.dispatchStage(context.Background(), nil, in)
+	if err != nil {
+		t.Fatalf("dispatchStage on a queued marker: %v (a queued dispatch is not a failure)", err)
+	}
+	if *spawns != 0 {
+		t.Fatalf("spawns = %d, want 0 while queued", *spawns)
+	}
+	slot := out.ConcurrencySlot
+	if slot == nil || slot.Status != concurrencyStatusAwaitingSlot || slot.Position != 2 || slot.Group != "local-implement:h1" ||
+		slot.Waiter != slotWaiterAlreadyWaiting || len(slot.Holders) != 1 || slot.EnqueuedAt == nil {
+		t.Fatalf("concurrency_slot = %+v, want the queued block with the waiter status", slot)
+	}
+	if out.LogPath != "" {
+		t.Errorf("log_path = %q, want empty (no runner)", out.LogPath)
+	}
+	if out.NextStep == nil || out.NextStep.Action != "fishhawk_await_stage" || !strings.Contains(out.NextStep.Precondition, "QUEUED") {
+		t.Fatalf("next_step = %+v, want fishhawk_await_stage naming the queue", out.NextStep)
+	}
+	if !strings.Contains(strings.Join(out.Warnings, "\n"), "NO runner was spawned") {
+		t.Errorf("warnings = %q, want the no-spawn queue warning", out.Warnings)
+	}
+	if len(started) != 1 {
+		t.Fatalf("waiter starts = %d, want 1", len(started))
+	}
+	spec := started[0]
+	if spec.runID != f.runID || spec.stageID != f.stageID || spec.host != "h1" || spec.episodeStart == nil ||
+		!spec.episodeStart.Equal(time.Date(2026, 10, 5, 0, 1, 0, 0, time.UTC)) || spec.spawn == nil || spec.prepare == nil {
+		t.Fatalf("waiter spec = %+v, want the stage, host label, queued episode and spawn inputs", spec)
+	}
+	// prepare REBUILDS the spawn inputs at admission: a runner binary changed
+	// while queued is the one spawned.
+	runnerBin = "/new/fishhawk-runner"
+	got, perr := spec.prepare()
+	if perr != nil || got.binary != "/new/fishhawk-runner" || !strings.Contains(strings.Join(got.argv, " "), "--check-base-ref main") {
+		t.Fatalf("prepare = binary %q argv %v, %v; want the binary current at admission and the implement argv", got.binary, got.argv, perr)
+	}
+	if len(f.reaps) != 0 {
+		t.Errorf("reaps = %+v, want none", f.reaps)
+	}
+}
+
+// TestDispatchStage_ImmediateAdmissionSpawnFailureReaps: a GROUPED admission
+// (200 with a concurrency block) whose spawn fails releases the slot through
+// reap-failure pinned to dispatched, category C. The ungrouped admission keeps
+// today's behaviour (the error, no reap).
+func TestDispatchStage_ImmediateAdmissionSpawnFailureReaps(t *testing.T) {
+	cases := []struct {
+		name     string
+		body     string
+		wantReap bool
+	}{
+		{"grouped", `{"transitioned":true,"stage_state":"dispatched","concurrency":{"group":"local-implement:h1","limit":1,"queued_before":false,"waited_seconds":0}}`, true},
+		{"ungrouped", `{"transitioned":true,"stage_state":"dispatched"}`, false},
+		{"idempotent re-dispatch", `{"transitioned":false,"stage_state":"dispatched","concurrency":{"group":"local-implement:h1","limit":1}}`, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f, r := newSlotDispatchFake(t, http.StatusOK, tc.body)
+			countingSpawn(t, errors.New("spawn boom"))
+			_, _, err := r.dispatchStage(context.Background(), nil, f.input())
+			if err == nil || !strings.Contains(err.Error(), "spawn boom") {
+				t.Fatalf("err = %v, want the spawn error surfaced", err)
+			}
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			if !tc.wantReap {
+				if len(f.reaps) != 0 {
+					t.Fatalf("reaps = %+v, want none (today's behaviour)", f.reaps)
+				}
+				return
+			}
+			if len(f.reaps) != 1 || f.reaps[0].Category != "C" || f.reaps[0].ExpectedState == nil ||
+				*f.reaps[0].ExpectedState != "dispatched" || !strings.Contains(f.reaps[0].Reason, "spawn failed after admission") {
+				t.Fatalf("reaps = %+v, want one pinned to dispatched, category C", f.reaps)
+			}
+			if !strings.Contains(err.Error(), "slot released") {
+				t.Errorf("err = %v, want the release named", err)
+			}
+		})
+	}
+}
+
+// TestDispatchStage_ImmediateAdmissionReleaseFailureNamed: when the release
+// itself fails, the tool error names both failures and the recovery verbs.
+func TestDispatchStage_ImmediateAdmissionReleaseFailureNamed(t *testing.T) {
+	f, r := newSlotDispatchFake(t, http.StatusOK,
+		`{"transitioned":true,"stage_state":"dispatched","concurrency":{"group":"local-implement:h1","limit":1}}`)
+	f.reapStatus = http.StatusConflict
+	countingSpawn(t, errors.New("spawn boom"))
+	_, _, err := r.dispatchStage(context.Background(), nil, f.input())
+	if err == nil || !strings.Contains(err.Error(), "spawn boom") || !strings.Contains(err.Error(), "releasing its slot failed") ||
+		!strings.Contains(err.Error(), "fishhawk_reap_stage") {
+		t.Fatalf("err = %v, want the spawn error, the failed release and the recovery verbs", err)
+	}
+}
