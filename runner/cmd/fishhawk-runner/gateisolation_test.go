@@ -1699,6 +1699,8 @@ func TestRunGateInContainer_ServiceProvisionFailures(t *testing.T) {
 		extra        map[string]string
 		respond      func(string, int) (string, int, bool)
 		lead         string
+		contains     []string // further substrings the output must carry
+		noReady      bool     // pg_isready must never be consulted
 		wantTeardown bool
 	}{
 		{name: "service argv refused (flag-shaped image)", extra: map[string]string{gatePostgresImageEnvVar: "--privileged"},
@@ -1708,15 +1710,24 @@ func TestRunGateInContainer_ServiceProvisionFailures(t *testing.T) {
 		{name: "service run fails", respond: failOn("service_run", "pull access denied"),
 			lead: "gate container: provision postgres service: run: exit 1: pull access denied", wantTeardown: true},
 		{name: "readiness times out (pg_isready never answers)", respond: failOn("ready", "no response"),
-			lead: "gate container: provision postgres service: readiness: not ready within", wantTeardown: true},
+			lead:         "gate container: provision postgres service: readiness: not ready within",
+			contains:     []string{"(init-complete line seen: true): last pg_isready: no response; last service logs: server started"},
+			wantTeardown: true},
 		{name: "ready but init-complete line missing", respond: func(l string, n int) (string, int, bool) {
 			if l == "logs" {
 				// The temporary init server is up and answers pg_isready,
 				// but the image never printed the init-complete line.
-				return "waiting for server to start.... done\nserver started\n", 0, false
+				return "waiting for server to start.... done\nserver started\ninitdb: error: invalid locale\n", 0, false
 			}
 			return serviceHappyPath(l, n)
-		}, lead: "gate container: provision postgres service: readiness: not ready within", wantTeardown: true},
+		}, lead: "gate container: provision postgres service: readiness: not ready within",
+			// The service logs explain the failure; the teardown removes them.
+			contains: []string{"(init-complete line seen: false): pg_isready not run; last service logs:", "initdb: error: invalid locale"},
+			noReady:  true, wantTeardown: true},
+		{name: "service logs unreadable (logs exits non-zero)", respond: failOn("logs", "Error response from daemon: No such container: x"),
+			lead:     "gate container: provision postgres service: readiness: not ready within",
+			contains: []string{"last service logs: logs exit 1: Error response from daemon: No such container: x"},
+			noReady:  true, wantTeardown: true},
 		{name: "bootstrap fails", respond: failOn("bootstrap", "permission denied"),
 			lead: "gate container: provision postgres service: bootstrap: exit 1: permission denied", wantTeardown: true},
 	}
@@ -1732,6 +1743,14 @@ func TestRunGateInContainer_ServiceProvisionFailures(t *testing.T) {
 			}
 			if !strings.HasPrefix(out, r.lead) {
 				t.Errorf("output %q does not lead with %q", out, r.lead)
+			}
+			for _, w := range r.contains {
+				if !strings.Contains(out, w) {
+					t.Errorf("output %q lacks %q", out, w)
+				}
+			}
+			if r.noReady && g.counts["ready"] != 0 {
+				t.Errorf("pg_isready consulted %d times without a readable init-complete line: %q", g.counts["ready"], g.order)
 			}
 			if g.counts["gate_run"] != 0 || len(*seen) != 0 {
 				t.Errorf("the gate executed (or the observer fired) despite a provisioning failure: %q", g.order)
@@ -1830,6 +1849,110 @@ func TestRunGateInContainer_ServiceTornDownOnGateFailureAndTimeout(t *testing.T)
 			}
 		})
 	}
+}
+
+// recordSeamCtx wraps BOTH seams installed by scriptGateExec so each call also
+// records ctx.Err() under its label (the scripted fakes ignore ctx).
+func recordSeamCtx(t *testing.T, g *gateExecScript) map[string]error {
+	t.Helper()
+	ctxErr := map[string]error{}
+	prevAux, prevHost := execGateAuxArgvFn, execBoundedHostArgvFn
+	wrap := func(ctx context.Context, argv []string, env []string) (string, int, bool) {
+		ctxErr[classifyGateArgv(argv)] = ctx.Err()
+		return g.record(argv, env)
+	}
+	execGateAuxArgvFn = func(ctx context.Context, argv []string, _ string, env []string, _ time.Duration) (string, int, bool) {
+		return wrap(ctx, argv, env)
+	}
+	execBoundedHostArgvFn = func(ctx context.Context, argv []string, _ string, env []string, _ time.Duration) (string, int, bool) {
+		return wrap(ctx, argv, env)
+	}
+	t.Cleanup(func() { execGateAuxArgvFn, execBoundedHostArgvFn = prevAux, prevHost })
+	return ctxErr
+}
+
+// TestRunGateInContainer_CancelledParentContextStillTearsDown: a parent
+// context cancelled mid-gate (a runner shutdown) or during the readiness poll
+// must not leak the service — the teardown runs both steps on a context the
+// cancellation does not reach (context.WithoutCancel). The readiness row parks
+// the poll on an hour-long interval, so only the select's ctx.Done() arm can
+// end it inside the guard; it must then be gateUnavailable, never the gate.
+func TestRunGateInContainer_CancelledParentContextStillTearsDown(t *testing.T) {
+	assertTornDown := func(t *testing.T, g *gateExecScript, ctxErr map[string]error) {
+		t.Helper()
+		if g.counts["service_rm"] != 1 || g.counts["volume_rm"] != 1 {
+			t.Fatalf("teardown not run after the parent cancellation: %q", g.order)
+		}
+		for _, l := range []string{"service_rm", "volume_rm"} {
+			if err := ctxErr[l]; err != nil {
+				t.Errorf("%s ran on a cancelled context (%v): the service would leak", l, err)
+			}
+		}
+	}
+
+	t.Run("cancelled mid-gate", func(t *testing.T) {
+		serviceContainerState(t, "/nonexistent/daemon.sock", io.Discard, nil)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		g := scriptGateExec(t, func(l string, n int) (string, int, bool) {
+			if l == "gate_run" {
+				cancel() // the runner shuts down while the gate runs
+				return "killed", -1, false
+			}
+			return serviceHappyPath(l, n)
+		})
+		ctxErr := recordSeamCtx(t, g)
+		if _, code, disp := runBoundedGateCommandDisposed(ctx, "true", t.TempDir(), filepath.Join(t.TempDir(), "lc"), time.Minute); code != -1 || disp != gateExecuted {
+			t.Errorf("(code, disp) = (%d, %s), want (-1, executed): a parent cancellation is not a runner timeout", code, disp)
+		}
+		if ctxErr["gate_run"] != nil {
+			t.Fatalf("fixture: the gate ran on an already-cancelled context")
+		}
+		assertTornDown(t, g, ctxErr)
+	})
+
+	t.Run("cancelled during the readiness poll", func(t *testing.T) {
+		shortServiceReady(t, time.Hour)
+		gateServiceReadyInterval = time.Hour
+		serviceContainerState(t, "/nonexistent/daemon.sock", io.Discard, nil)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		g := scriptGateExec(t, func(l string, n int) (string, int, bool) {
+			if l == "logs" && n == 1 {
+				// Cancel once the poll is parked on its interval timer.
+				time.AfterFunc(20*time.Millisecond, cancel)
+				return "server started\n", 0, false
+			}
+			return serviceHappyPath(l, n)
+		})
+		ctxErr := recordSeamCtx(t, g)
+		type result struct {
+			out  string
+			code int
+			disp gateDisposition
+		}
+		done := make(chan result, 1)
+		go func() {
+			out, code, disp := runBoundedGateCommandDisposed(ctx, "true", t.TempDir(), filepath.Join(t.TempDir(), "lc"), time.Minute)
+			done <- result{out, code, disp}
+		}()
+		var r result
+		select {
+		case r = <-done:
+		case <-time.After(30 * time.Second):
+			t.Fatal("the readiness poll did not observe the parent cancellation (ctx.Done) within 30s")
+		}
+		if r.code != -1 || r.disp != gateUnavailable {
+			t.Errorf("(code, disp) = (%d, %s), want (-1, unavailable)", r.code, r.disp)
+		}
+		if !strings.HasPrefix(r.out, "gate container: provision postgres service: readiness:") {
+			t.Errorf("output %q does not lead with the readiness failure", r.out)
+		}
+		if g.counts["gate_run"] != 0 || g.counts["bootstrap"] != 0 {
+			t.Errorf("provisioning continued past the cancellation: %q", g.order)
+		}
+		assertTornDown(t, g, ctxErr)
+	})
 }
 
 // TestRunGateInContainer_TeardownFailureDoesNotChangeVerdict: a failing
@@ -1935,6 +2058,66 @@ func TestRunGateInContainer_PasswdReadFailureDegrades(t *testing.T) {
 			t.Errorf("passwd read argv lacks %q: %q", w, read)
 		}
 	}
+}
+
+// TestRunGateInContainer_PasswdReadDropsPullNoise: the passwd read's seam
+// returns the runtime CLI's combined stdout and stderr, so a cold pull of the
+// gate image puts its progress lines beside the file with exit 0. Only the
+// passwd entries are cached and mounted; an output carrying NO entry is a
+// failed read — degraded and not cached, so the next exec reads again.
+func TestRunGateInContainer_PasswdReadDropsPullNoise(t *testing.T) {
+	const pull = "Unable to find image 'img:1' locally\n1: Pulling from library/img\n" +
+		"Digest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n" +
+		"Status: Downloaded newer image for img:1\n"
+	var log strings.Builder
+	st := containerState("img:1", "/nonexistent/daemon.sock", &log)
+	installGateState(t, st)
+	g := scriptGateExec(t, func(l string, n int) (string, int, bool) {
+		if l == "passwd" {
+			if n == 1 {
+				return pull, 0, false // noise only: no entry at all
+			}
+			return pull + "root:x:0:0:root:/root:/bin/sh\n", 0, false
+		}
+		return serviceHappyPath(l, n)
+	})
+	exec := func() string {
+		t.Helper()
+		if _, code, disp := runBoundedGateCommandDisposed(context.Background(), "true", t.TempDir(), filepath.Join(t.TempDir(), "lc"), time.Minute); code != 0 || disp != gateExecuted {
+			t.Fatalf("(code, disp) = (%d, %s), want the gate executed", code, disp)
+		}
+		return strings.Join(g.argv["gate_run"], " ")
+	}
+	if first := exec(); strings.Contains(first, gateiso.MountPasswd) {
+		t.Errorf("a noise-only read must degrade to no passwd mount: %q", first)
+	}
+	if !strings.Contains(log.String(), `"event":"gate_passwd_unavailable","image":"img:1"`) || !strings.Contains(log.String(), "no well-formed passwd entry") {
+		t.Errorf("log lacks gate_passwd_unavailable naming the empty read:\n%s", log.String())
+	}
+	if second := exec(); !strings.Contains(second, ":"+gateiso.MountPasswd+":ro") {
+		t.Fatalf("the noise-only read was cached: no passwd mount on the retry: %q", second)
+	}
+	want := fmt.Sprintf("root:x:0:0:root:/root:/bin/sh\n%s:x:%d:%d:fishhawk gate caller:/tmp:/bin/sh\n",
+		passwdTestName(), os.Getuid(), os.Getgid())
+	if string(g.passwd) != want {
+		t.Errorf("mounted passwd file:\n%q\nwant only the entries:\n%q", g.passwd, want)
+	}
+	st.passwdMu.Lock()
+	cached := string(st.passwdByImage["img:1"])
+	st.passwdMu.Unlock()
+	if cached != "root:x:0:0:root:/root:/bin/sh\n" {
+		t.Errorf("cached image passwd = %q, want the entry without the pull noise", cached)
+	}
+	if g.counts["passwd"] != 2 {
+		t.Errorf("passwd reads = %d, want 2 (noise-only, then a cached success)", g.counts["passwd"])
+	}
+}
+
+// passwdTestName is the caller-entry name gatePasswdFile writes on this host.
+func passwdTestName() string {
+	got := string(gateiso.BuildPasswd(nil, os.Getuid(), os.Getgid(), gateCallerName()))
+	name, _, _ := strings.Cut(got, ":")
+	return name
 }
 
 // TestRunGateInContainer_PasswdWriteFailureDegrades: a passwd WRITE failure

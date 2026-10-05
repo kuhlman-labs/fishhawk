@@ -79,23 +79,24 @@ const (
 	rawCreateDelay    = 250 * time.Millisecond
 )
 
-// rawDBSource routes startContainer (#2137): FISHHAWK_TEST_PG_URL set -> a
-// fresh raw database on that server (every failure Fatalf's, never a skip: the
-// runner promised a database); FISHHAWK_GATE_CONTAINER=1 without a URL ->
-// Fatalf naming the runner remedy (Skipf under FISHHAWK_SKIP_INTEGRATION),
+// rawDBSource routes startContainer (#2137), in pgtest's resolveBase order:
+// FISHHAWK_SKIP_INTEGRATION set -> Skipf, before any server or container is
+// touched; FISHHAWK_TEST_PG_URL set -> a fresh raw database on that server
+// (every failure Fatalf's, never a skip: the runner promised a database);
+// FISHHAWK_GATE_CONTAINER=1 without a URL -> Fatalf naming the runner remedy,
 // container never attempted; otherwise the testcontainers path, unchanged.
 // Taking getenv instead of reading os.Getenv keeps it drivable from tests
 // without t.Setenv, which this package's parallel tests cannot call.
 func rawDBSource(f fataler, cleanup func(func()), getenv func(string) string, container func() string) string {
 	f.Helper()
+	if getenv("FISHHAWK_SKIP_INTEGRATION") != "" {
+		f.Skipf("FISHHAWK_SKIP_INTEGRATION set; skipping integration test")
+		return ""
+	}
 	if base := getenv(externalPGURLEnv); base != "" {
 		return createExternalRawDB(f, cleanup, base)
 	}
 	if getenv(gateContainerEnv) == "1" {
-		if getenv("FISHHAWK_SKIP_INTEGRATION") != "" {
-			f.Skipf("FISHHAWK_SKIP_INTEGRATION set; skipping integration test")
-			return ""
-		}
 		f.Fatalf("postgres tests: inside the gate container (%s=1) with no provisioned Postgres (%s unset); "+
 			"set FISHHAWK_GATE_SERVICES=postgres on the runner so it provisions one (#2137)", gateContainerEnv, externalPGURLEnv)
 		return ""

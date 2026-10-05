@@ -596,7 +596,10 @@ func (s *gateIsolationState) gatePasswdFile(ctx context.Context, rt gateiso.Runt
 // imagePasswd reads the gate image's /etc/passwd through the hardened,
 // endpoint-bound gateiso.PasswdReadArgv (no network, all capabilities
 // dropped, no-new-privileges, the caller's user pin), serving a cached
-// SUCCESSFUL read when there is one. A failed read is not cached.
+// SUCCESSFUL read when there is one. The seam returns the runtime CLI's
+// COMBINED stdout and stderr, so only gateiso.WellFormedPasswd's entries are
+// kept (a cold pull's progress lines exit 0 alongside the file); an output
+// with no entry at all is a failed read. A failed read is not cached.
 func (s *gateIsolationState) imagePasswd(ctx context.Context, rt gateiso.Runtime, image, root string, cliEnv []string, uid, gid int) ([]byte, error) {
 	if s != nil {
 		s.passwdMu.Lock()
@@ -614,7 +617,10 @@ func (s *gateIsolationState) imagePasswd(ctx context.Context, rt gateiso.Runtime
 	if code != 0 {
 		return nil, fmt.Errorf("read %s /etc/passwd: exit %d: %s", image, code, gateOutputTail(out))
 	}
-	content := []byte(out)
+	content := gateiso.WellFormedPasswd([]byte(out))
+	if len(content) == 0 {
+		return nil, fmt.Errorf("read %s /etc/passwd: no well-formed passwd entry in the output: %s", image, gateOutputTail(out))
+	}
 	if s != nil {
 		s.passwdMu.Lock()
 		if s.passwdByImage == nil {
@@ -663,7 +669,12 @@ func buildGateServiceArgv(svc gateiso.PostgresService, rt gateiso.Runtime) (gate
 // approval condition 3): each iteration reads the service logs FIRST and runs
 // pg_isready only once the image's init-complete line was seen — the
 // temporary init server answers pg_isready before init completes — and the
-// service is ready only when pg_isready succeeds after that.
+// service is ready only when pg_isready succeeds after that. A readiness
+// failure carries the tail of the last service-log read (or its failure) as
+// well as the last pg_isready output, because the deferred teardown removes
+// the container and its logs with it. A parent cancellation ends the poll at
+// once — also while it is parked on the interval timer — as a readiness
+// failure, so provisioning never continues to the bootstrap or the gate.
 func provisionGateService(ctx context.Context, a gateServiceArgv, root string, cliEnv []string) (string, bool) {
 	if out, code, _ := execGateAuxArgvFn(ctx, a.volumeCreate, root, cliEnv, gateServiceVolumeTimeout); code != 0 {
 		return fmt.Sprintf("volume create: exit %d: %s", code, gateOutputTail(out)), false
@@ -672,9 +683,25 @@ func provisionGateService(ctx context.Context, a gateServiceArgv, root string, c
 		return fmt.Sprintf("run: exit %d: %s", code, gateOutputTail(out)), false
 	}
 	deadline := time.Now().Add(gateServiceReadyTimeout)
-	initSeen, last := false, ""
+	initSeen, last, lastLogs := false, "", ""
+	notReady := func() string {
+		why := fmt.Sprintf("not ready within %s", gateServiceReadyTimeout)
+		if err := ctx.Err(); err != nil {
+			why = "cancelled before ready: " + err.Error()
+		}
+		ready := "pg_isready not run"
+		if initSeen {
+			ready = "last pg_isready: " + gateOutputTail(last)
+		}
+		return fmt.Sprintf("readiness: %s (init-complete line seen: %t): %s; last service logs: %s",
+			why, initSeen, ready, gateOutputTail(lastLogs))
+	}
 	for {
 		logs, code, _ := execGateAuxArgvFn(ctx, a.logs, root, cliEnv, gateServiceProbeTimeout)
+		lastLogs = logs
+		if code != 0 {
+			lastLogs = fmt.Sprintf("logs exit %d: %s", code, logs)
+		}
 		if code == 0 && gateiso.PostgresInitComplete(logs) {
 			initSeen = true
 			out, rc, _ := execGateAuxArgvFn(ctx, a.ready, root, cliEnv, gateServiceProbeTimeout)
@@ -684,15 +711,17 @@ func provisionGateService(ctx context.Context, a gateServiceArgv, root string, c
 			last = out
 		}
 		if ctx.Err() != nil || !time.Now().Before(deadline) {
-			return fmt.Sprintf("readiness: not ready within %s (init-complete line seen: %t): %s",
-				gateServiceReadyTimeout, initSeen, gateOutputTail(last)), false
+			return notReady(), false
 		}
 		t := time.NewTimer(gateServiceReadyInterval)
 		select {
 		case <-ctx.Done():
+			// Cancelled while parked: stop here rather than run another
+			// iteration whose probes could still answer.
+			t.Stop()
+			return notReady(), false
 		case <-t.C:
 		}
-		t.Stop()
 	}
 	if out, code, _ := execGateAuxArgvFn(ctx, a.bootstrap, root, cliEnv, gateServiceBootstrapTimeout); code != 0 {
 		return fmt.Sprintf("bootstrap: exit %d: %s", code, gateOutputTail(out)), false

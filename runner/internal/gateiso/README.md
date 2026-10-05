@@ -381,6 +381,14 @@ and is rendered — and validated — before any of them runs; a runtime with no
   stays as belt and braces should an overriding image declare another
   `VOLUME`. Fixture (m) inspects exactly one mount (type volume, the
   `fishhawk-gate-svc-` name) and a tmpfs at the PGDATA path.
+- **RAM-backed PGDATA (residual).** That tmpfs has no size option and the
+  service container no memory limit, so the databases the gate creates (it
+  holds `CREATEDB`) live in host memory, bounded only by the runtime's tmpfs
+  default. A hostile or simply large suite can pressure the runner host's
+  memory. Host availability only — the service has no egress — and the same
+  posture as the gate container, which sets no `--memory` or pids limit
+  either. A size cap waits on the operator walk showing what the full suite
+  needs.
 - **Readiness ordering (approval condition 3).** The image's temporary init
   server answers `pg_isready` before init completes, so the logs are read
   FIRST in every iteration (`PostgresInitComplete`). Pinned by
@@ -388,13 +396,20 @@ and is rendered — and validated — before any of them runs; a runtime with no
   init-complete line missing` row of `TestRunGateInContainer_ServiceProvisionFailures`.
 - **Provisioning never counts against the gate timeout, and never reaches the
   fix agent.** Each step carries its own bound above; ANY failure — a step's
-  non-zero exit, the readiness deadline — returns
+  non-zero exit, the readiness deadline, a parent cancellation (which ends
+  the readiness poll at once, also mid-interval) — returns
   `gate container: provision postgres service: <step>: <output>`, `-1`,
   `gateUnavailable` (category C), and the gate argv never executes
-  (`TestRunGateInContainer_ServiceProvisionFailures`, one row per mode).
+  (`TestRunGateInContainer_ServiceProvisionFailures`, one row per mode). A
+  readiness failure carries the last `pg_isready` output AND the tail of the
+  last service-log read (or that read's own failure), because the teardown
+  removes the container and its logs with it.
 - **Teardown on every exit.** Registered before `volume create` is attempted,
   so a partial provision, a failed gate and a timed-out gate all tear down
-  (`TestRunGateInContainer_ServiceTornDownOnGateFailureAndTimeout`). A
+  (`TestRunGateInContainer_ServiceTornDownOnGateFailureAndTimeout`); so does
+  a parent cancellation mid-gate or mid-readiness, on a context the
+  cancellation does not reach
+  (`TestRunGateInContainer_CancelledParentContextStillTearsDown`). A
   teardown failure logs `gate_service_cleanup_failed` (with the label) and
   never changes the verdict
   (`TestRunGateInContainer_TeardownFailureDoesNotChangeVerdict`). Runner log
@@ -411,7 +426,12 @@ The gate runs as the caller's numeric `uid:gid`, which the gate image's
 The runner reads the IMAGE's `/etc/passwd` through `PasswdReadArgv` — `run --rm
 --network=none --cap-drop=ALL --security-opt=no-new-privileges (--user
 uid:gid | --userns=keep-id) --entrypoint '' <image> cat /etc/passwd`,
-endpoint-bound, bounded at 5m (a cold gate-image pull) — and `BuildPasswd`
+endpoint-bound, bounded at 5m (a cold gate-image pull) — keeps only its
+well-formed entries (`WellFormedPasswd`: seven fields, decimal uid and gid),
+because the read's output is the runtime CLI's COMBINED stdout and stderr and
+a cold pull's progress lines arrive beside the file with exit 0 (an output
+with no entry at all is a failed read;
+`TestRunGateInContainer_PasswdReadDropsPullNoise`) — and `BuildPasswd`
 appends `<name>:x:<uid>:<gid>:fishhawk gate caller:/tmp:/bin/sh` only when no
 entry maps the uid (the name falls back to `fishhawk-gate` unless it matches
 `^[A-Za-z0-9._][A-Za-z0-9._-]*$`, so no `:`/newline can forge an entry).
@@ -427,9 +447,14 @@ as its shared base without testcontainers and Fatalf's — never Skips — on an
 failure there; with `FISHHAWK_GATE_CONTAINER=1` and no URL it Fatalf's naming
 `FISHHAWK_GATE_SERVICES`. `backend/internal/postgres`'s raw-database helper
 creates `fh_raw_<uuid>` databases on that server; the RustFS `tracestore` S3
-suite skips inside the gate container. `directory/internal/store` still starts
-its own testcontainers Postgres outside `pgtest` — a KNOWN in-container
-failure the operator walk below will show.
+suite skips inside the gate container. `pgtest`'s own tests take their server
+from the same routing (`sharedBaseURL`), so the package is clean in there: `go
+test ./internal/pgtest/ ./internal/postgres/` was recorded green inside
+`fishhawk-gate:smoke-92445ead` against a provided server on the #2137 fix-up
+pass (no daemon socket; NOT the runner-provisioned service, so not the walk).
+`directory/internal/store` still starts its own testcontainers Postgres
+outside `pgtest` — a KNOWN in-container failure the operator walk below will
+show.
 
 **Operator walk — required before setting `FISHHAWK_GATE_IMAGE` for this
 repository (approval conditions 5 and 6).** In-loop the implement gate proves

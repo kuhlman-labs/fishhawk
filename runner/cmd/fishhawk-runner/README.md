@@ -455,8 +455,11 @@ others, so an unknown service fails startup like a bad mode —
   when `FISHHAWK_GATE_SERVICES=postgres`, a fresh `gateiso.PostgresService`
   whose whole lifecycle argv is rendered (and validated) up front; the
   per-exec caller passwd file (`gatePasswdFile` — the image's `/etc/passwd`
-  read once per image through the hardened `gateiso.PasswdReadArgv`, only a
-  SUCCESSFUL read cached, written fresh per exec; any read or write failure
+  read once per image through the hardened `gateiso.PasswdReadArgv`, only
+  its well-formed entries kept (`gateiso.WellFormedPasswd` — the seam returns
+  the CLI's combined stdout and stderr, so a cold pull's progress lines would
+  otherwise land in the file), only a SUCCESSFUL read cached, written fresh
+  per exec; any read or write failure
   DEGRADES to no mount with `gate_passwd_unavailable`, never a refusal); the
   runtime argv built under the resolved-path socket-mount guard FIRST
   (`gateiso.ForbidSocketMounts` — a refused source returns `-1` with no exec

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -488,18 +487,15 @@ func TestExternalURL_UnixSocketHostParses(t *testing.T) {
 
 // --- Docker-guarded integration test ---
 
-// TestExternalURL_BootstrapsAgainstProvidedServer feeds the shared container's
-// URL through the EXTERNAL branch with the production bootstrapExternalOnce
-// (the real bootstrapTemplate), then creates a per-test database from it and
-// checks it carries the migrated schema.
+// TestExternalURL_BootstrapsAgainstProvidedServer feeds a server's URL through
+// the EXTERNAL branch with the production bootstrapExternalOnce (the real
+// bootstrapTemplate), then creates a per-test database from it and checks it
+// carries the migrated schema. The server comes from sharedBaseURL: the
+// runner-provided FISHHAWK_TEST_PG_URL when set — inside the gate container
+// there is no daemon to start one with (#2137) — otherwise the shared
+// container, with resolveBase's skip and gate-container precedence.
 func TestExternalURL_BootstrapsAgainstProvidedServer(t *testing.T) {
-	if os.Getenv("FISHHAWK_SKIP_INTEGRATION") != "" {
-		t.Skip("FISHHAWK_SKIP_INTEGRATION set")
-	}
-	base, err := sharedContainerBaseURL()
-	if err != nil {
-		failStart(t, err)
-	}
+	base := sharedBaseURL(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 

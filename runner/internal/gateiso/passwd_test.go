@@ -49,6 +49,34 @@ func TestBuildPasswd_HostileNamesFallBack(t *testing.T) {
 	}
 }
 
+// TestWellFormedPasswd_DropsRuntimeNoise: the read's output is the runtime
+// CLI's combined stdout and stderr, so a cold pull's progress lines and a
+// platform warning arrive interleaved with the file. Only the entries survive,
+// each newline-terminated (CRLF and an unterminated last line included).
+func TestWellFormedPasswd_DropsRuntimeNoise(t *testing.T) {
+	noisy := "Unable to find image 'fishhawk-gate:main' locally\n" +
+		"main: Pulling from kuhlman-labs/fishhawk-gate\n" +
+		"4abcf2066143: Pull complete\n" +
+		"Digest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n" +
+		"Status: Downloaded newer image for fishhawk-gate:main\n" +
+		"WARNING: The requested image's platform (linux/amd64) does not match the detected host platform (linux/arm64/v8)\n" +
+		"root:x:0:0:root:/root:/bin/sh\r\n" +
+		"bad:x:notanumber:0::/:/bin/sh\n" +
+		":x:1:1::/:/bin/sh\n" +
+		"a:b:c:d:e:f:g:h\n" +
+		"\n" +
+		"postgres:x:70:70:Linux User,,,:/var/lib/postgresql:/bin/sh"
+	if got := string(WellFormedPasswd([]byte(noisy))); got != imagePasswd {
+		t.Errorf("got %q\nwant %q", got, imagePasswd)
+	}
+	if got := WellFormedPasswd([]byte("Unable to find image 'x' locally\nStatus: Downloaded newer image for x\n")); len(got) != 0 {
+		t.Errorf("noise-only output kept %q, want nothing", got)
+	}
+	if got := string(WellFormedPasswd([]byte(imagePasswd))); got != imagePasswd {
+		t.Errorf("a clean file was rewritten: %q", got)
+	}
+}
+
 func TestPasswdReadArgv(t *testing.T) {
 	got, err := PasswdReadArgv(dockerRT, "img:1", 501, 20)
 	if err != nil {

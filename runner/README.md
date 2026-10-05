@@ -331,7 +331,8 @@ the container path or sets `FISHHAWK_GATE_ISOLATION=clone`.
 container exec gets its own Postgres service: a fresh labelled named volume
 `fishhawk-gate-svc-<12 hex>`, the service started `--network=none
 --cap-drop=ALL --security-opt=no-new-privileges --user postgres` with no
-published port, no host path and PGDATA on a tmpfs, readiness (logs FIRST for
+published port, no host path and PGDATA on a RAM-backed, uncapped tmpfs (a
+stated residual), readiness (logs FIRST for
 the init-complete line, then `pg_isready`), a bootstrap of the
 least-privilege `CREATEDB`-only role `fishhawk`, the socket volume mounted
 READ-ONLY at `/pgsock` with

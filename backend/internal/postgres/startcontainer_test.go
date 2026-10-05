@@ -250,6 +250,28 @@ func TestStartContainer_GateContainerWithoutURLFatals(t *testing.T) {
 	}
 }
 
+// TestRawDBSource_SkipIntegrationPrecedesExternalURL: FISHHAWK_SKIP_INTEGRATION
+// wins over FISHHAWK_TEST_PG_URL (pgtest's resolveBase order). The URL points
+// at a dead socket, so if the external branch ran first it would Fatalf; the
+// skip must land with no database created, no drop registered and no start.
+func TestRawDBSource_SkipIntegrationPrecedesExternalURL(t *testing.T) {
+	dead := "postgres://fishhawk:fishhawk@/fishhawk?host=" + t.TempDir() + "&sslmode=disable&connect_timeout=2"
+	for _, env := range []map[string]string{
+		{"FISHHAWK_SKIP_INTEGRATION": "1", externalPGURLEnv: dead},
+		{"FISHHAWK_SKIP_INTEGRATION": "1", externalPGURLEnv: dead, gateContainerEnv: "1"},
+		{"FISHHAWK_SKIP_INTEGRATION": "1"},
+	} {
+		f := &fakeFataler{}
+		started := false
+		got := rawDBSource(f, func(func()) { t.Error("no drop may be registered under FISHHAWK_SKIP_INTEGRATION") },
+			envMap(env), func() string { started = true; return "postgres://container" })
+		if !f.skipfCalled || f.fatalfCalled || started || got != "" {
+			t.Errorf("env %v: skipf=%v fatalf=%v started=%v got=%q, want a skip before any server or container (%q)",
+				env, f.skipfCalled, f.fatalfCalled, started, got, f.message())
+		}
+	}
+}
+
 // TestRawDBSource_NoEnvUsesContainer pins the unchanged default arm.
 func TestRawDBSource_NoEnvUsesContainer(t *testing.T) {
 	f := &fakeFataler{}
