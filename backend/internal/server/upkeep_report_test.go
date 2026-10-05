@@ -11,12 +11,15 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/intakegroom"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
@@ -318,11 +321,22 @@ func TestUpkeepReportIngest_HappyPath(t *testing.T) {
 	if err := json.Unmarshal(rows[0]["entry_counts"], &counts); err != nil {
 		t.Fatalf("decode entry_counts: %v", err)
 	}
-	want := map[string]int{"findings": 3, "flake": 1, "toolchain_drift": 1, "deprecation": 1}
+	want := map[string]int{"findings": 3, "flake": 1, "toolchain_drift": 1, "deprecation": 1, "advisory": 0}
 	for k, v := range want {
 		if got, ok := counts[k]; !ok || got != v {
 			t.Errorf("entry_counts[%s] = %d (present=%v), want %d", k, got, ok, v)
 		}
+	}
+	// #3750: a report with no advisory finding records an empty covered
+	// array, no coverage degrade, and an empty source_degrades array.
+	for k, wantRaw := range map[string]string{"covered": "[]", "source_degrades": "[]", "coverage_degraded": "false",
+		"coverage_scanned_pulls": "0", "coverage_window_truncated": "false"} {
+		if got := string(rows[0][k]); got != wantRaw {
+			t.Errorf("%s = %s, want %s", k, got, wantRaw)
+		}
+	}
+	if _, ok := rows[0]["coverage_degrade_reason"]; ok {
+		t.Error("coverage_degrade_reason present on a healthy coverage read")
 	}
 	if d := upkeepDuplicatesOf(t, rows[0]); len(d) != 0 {
 		t.Errorf("duplicates = %+v, want [] over an empty window", d)
@@ -1149,4 +1163,84 @@ func (r *upkeepRendezvousArtifactRepo) GetByHash(ctx context.Context, stageID uu
 	case <-time.After(upkeepRendezvousWindow):
 	}
 	return a, err
+}
+
+// TestUpkeepReportIngest_RecordsAdvisoryCoverage (#3750): the shipped advisory
+// example through the real signed handler, with the listing seam serving one
+// dependabot[bot] pull request bumping golang.org/x/net past the fix in
+// /backend. The PERSISTED upkeep_report_recorded row (read after the call)
+// marks exactly GO-2024-2687 covered by that pull request, counts three
+// advisory findings, and copies the report's source_degrades verbatim. The
+// seam serves a matching pull request, so only the payload wiring decides
+// whether the mark lands: record a constant [] instead and this goes red.
+func TestUpkeepReportIngest_RecordsAdvisoryCoverage(t *testing.T) {
+	var calls atomic.Int32
+	swapUpkeepListOpenPulls(t, ukPullsSeam(&calls, ukDependabotPull(3823, "golang.org/x/net", "0.22.0", "0.23.0", "/backend")))
+	f := newUpkeepIngestFixture(t, nil)
+	if code, resp := f.post(t, f.planStage.ID, upkeepAdvisoryExampleBody(t)); code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201: %v", code, resp)
+	}
+	rows := f.recorded(t)
+	if len(rows) != 1 {
+		t.Fatalf("upkeep_report_recorded rows = %d, want 1", len(rows))
+	}
+	row := rows[0]
+	var covered []upkeep.Covered
+	if err := json.Unmarshal(row["covered"], &covered); err != nil {
+		t.Fatalf("decode covered %s: %v", row["covered"], err)
+	}
+	if len(covered) != 1 || covered[0].FindingID != ukAdvNet || covered[0].Package != "golang.org/x/net" ||
+		len(covered[0].Pulls) != 1 || covered[0].Pulls[0].Number != 3823 || covered[0].Pulls[0].Directory != "backend" {
+		t.Errorf("covered = %+v, want exactly %s by #3823 in backend", covered, ukAdvNet)
+	}
+	var counts map[string]int
+	if err := json.Unmarshal(row["entry_counts"], &counts); err != nil {
+		t.Fatal(err)
+	}
+	if counts["advisory"] != 3 || counts["findings"] != 3 {
+		t.Errorf("entry_counts = %v, want advisory 3, findings 3", counts)
+	}
+	var degrades []plan.UpkeepSourceDegrade
+	if err := json.Unmarshal(row["source_degrades"], &degrades); err != nil {
+		t.Fatal(err)
+	}
+	if len(degrades) != 1 || degrades[0].Source != plan.UpkeepSourceDeprecation ||
+		degrades[0].Reason != plan.UpkeepDegradeNetworkUnavailable || degrades[0].Detail == "" {
+		t.Errorf("source_degrades = %+v, want the report's one {deprecation, network_unavailable} entry", degrades)
+	}
+	if string(row["coverage_degraded"]) != "false" || string(row["coverage_scanned_pulls"]) != "1" {
+		t.Errorf("coverage_degraded = %s, coverage_scanned_pulls = %s, want false, 1",
+			row["coverage_degraded"], row["coverage_scanned_pulls"])
+	}
+	if n := calls.Load(); n != 1 {
+		t.Errorf("listing calls = %d, want 1", n)
+	}
+}
+
+// TestUpkeepReportIngest_CoverageDegradedStillIngests: a failed listing is
+// recorded as a named coverage degrade with an empty covered array, and the
+// report is still ingested and settled.
+func TestUpkeepReportIngest_CoverageDegradedStillIngests(t *testing.T) {
+	swapUpkeepListOpenPulls(t, func(context.Context, *Server, *run.Run, forge.RepoRef, int) ([]githubclient.OpenPullRequest, bool, error) {
+		return nil, false, errors.New("github said no")
+	})
+	f := newUpkeepIngestFixture(t, nil)
+	if code, resp := f.post(t, f.planStage.ID, upkeepAdvisoryExampleBody(t)); code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201: %v", code, resp)
+	}
+	rows := f.recorded(t)
+	if len(rows) != 1 {
+		t.Fatalf("recorded rows = %d, want 1", len(rows))
+	}
+	if string(rows[0]["coverage_degraded"]) != "true" || string(rows[0]["covered"]) != "[]" {
+		t.Errorf("coverage_degraded = %s, covered = %s, want true, []", rows[0]["coverage_degraded"], rows[0]["covered"])
+	}
+	var reason string
+	_ = json.Unmarshal(rows[0]["coverage_degrade_reason"], &reason)
+	if reason != upkeepCoveragePullListFailed {
+		t.Errorf("coverage_degrade_reason = %q, want %q", reason, upkeepCoveragePullListFailed)
+	}
+	if got := f.stageState(f.planStage.ID); got != run.StageStateAwaitingApproval {
+		t.Errorf("stage = %q, want awaiting_approval", got)
+	}
 }
