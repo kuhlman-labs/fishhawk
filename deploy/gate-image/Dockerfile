@@ -30,8 +30,10 @@
 #
 # NO DOCKER. No docker engine, CLI, plugin or socket enters this image. The
 # harnesses that drive docker (test-container-lease, test-verify-scope) stub it
-# with a fake on PATH, and the daemon-dependent Go tests (testcontainers
-# Postgres) are out of reach here until #2137. scripts/check-gate-image fails
+# with a fake on PATH. The daemon-dependent Go tests reach Postgres only on the
+# runner's container path, through its per-exec Postgres service and a
+# read-only unix-socket mount (#2137); `--in-gate-image` provisions no service,
+# so they stay out of reach there. scripts/check-gate-image fails
 # on a docker package in this file and on a docker binary inside a built image.
 #
 # ARCHITECTURE. Every download is keyed on BuildKit's TARGETARCH, declared
@@ -63,9 +65,10 @@
 # USER (callers pass --user uid:gid). Everything works as an arbitrary uid with
 # HOME=/tmp, matching runner/internal/gateiso's container env, EXCEPT name
 # lookup: an arbitrary uid has no /etc/passwd entry here, so `whoami` fails and
-# test-helm-render r9h cannot pass. `scripts/test --in-gate-image` therefore
-# mounts a passwd file mapping the caller's uid; the runner's container path
-# does not yet (#2137).
+# test-helm-render r9h cannot pass. Both callers therefore SUPPLY one, read-only:
+# `scripts/test --in-gate-image` mounts a passwd file mapping the caller's uid,
+# and the runner's container path mounts a runner-generated one on every exec
+# (#2137).
 
 ARG GO_VERSION=1.25.6
 

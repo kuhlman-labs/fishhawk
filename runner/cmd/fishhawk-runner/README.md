@@ -441,12 +441,23 @@ as before (sanitized → isolated lint cache → `extraEnv` drop-then-append) an
 is what the gate sees on EVERY path; then the process-wide selection
 (`gateisolation.go::gateIsolationState.selection`, decided ONCE per process on
 the first gate exec from `FISHHAWK_GATE_ISOLATION` × `FISHHAWK_DEPLOYMENT_PROFILE`
-× `FISHHAWK_GATE_IMAGE` × the detected runtime × the sandbox probe) routes:
+× `FISHHAWK_GATE_IMAGE` × the detected runtime × the sandbox probe; the
+container path additionally reads `FISHHAWK_GATE_SERVICES` /
+`FISHHAWK_GATE_POSTGRES_IMAGE`, parsed by `configureGateIsolation` with the
+others, so an unknown service fails startup like a bad mode —
+`TestRun_GateIsolationConfigErrorsExitUsage`'s `unknown gate service` row) routes:
 
 - **refused** → the refusal text (`gate isolation refused: …`) and `-1`
   WITHOUT executing; the gates classify it **category C** — never an infra
   flake, never a fix-agent re-invoke (`verify_gate_refused`);
 - **container** → `runGateInContainer`: fresh EMPTY per-exec caches; the
+  runtime CLI's env bound to the validated endpoint BEFORE any runtime call;
+  when `FISHHAWK_GATE_SERVICES=postgres`, a fresh `gateiso.PostgresService`
+  whose whole lifecycle argv is rendered (and validated) up front; the
+  per-exec caller passwd file (`gatePasswdFile` — the image's `/etc/passwd`
+  read once per image through the hardened `gateiso.PasswdReadArgv`, only a
+  SUCCESSFUL read cached, written fresh per exec; any read or write failure
+  DEGRADES to no mount with `gate_passwd_unavailable`, never a refusal); the
   runtime argv built under the resolved-path socket-mount guard FIRST
   (`gateiso.ForbidSocketMounts` — a refused source returns `-1` with no exec
   AND no seed, so `go mod download` never runs against a checkout the
@@ -459,10 +470,23 @@ the first gate exec from `FISHHAWK_GATE_ISOLATION` × `FISHHAWK_DEPLOYMENT_PROFI
   (a symlinked `go.mod`/`go.sum`/`go.work`/`go.work.sum` at the root, in a
   `use` directory or in a directory `replace` target; a `go.work` `use` or a
   directory `replace` resolving outside the checkout) would let the seed read
-  or write an unrelated host file (`gateiso.ErrSeedCheckout`); the container
+  or write an unrelated host file (`gateiso.ErrSeedCheckout`); THEN, with a
+  service configured, `provisionGateService` (volume create → `run -d` →
+  readiness reading the logs FIRST for the init-complete line, then
+  `pg_isready` → the least-privilege role bootstrap), each step under its own
+  bound OUTSIDE the gate timeout and ANY failure `gateUnavailable` with the
+  gate argv never executed, its `teardownGateService` (`rm -f -v`, `volume
+  rm -f`) deferred from before `volume create` so it runs on every exit and
+  never changes the verdict — all runtime calls around the gate go through
+  the `execGateAuxArgvFn` seam, so `execBoundedHostArgvFn` still carries
+  exactly the gate's `run` and its kill, and the test-only
+  `gateServiceObserver` (nil in production) sees the ready service before the
+  gate exec; the container
   runs `--network=none --cap-drop=ALL
   --security-opt=no-new-privileges --entrypoint ''` with the sanitized env
-  crossing via `-e` and the RUNNER's own env going to the runtime CLI BOUND
+  crossing via `-e` (`FISHHAWK_GATE_CONTAINER=1` pinned on every exec, the
+  service's `FISHHAWK_TEST_PG_URL` applied LAST, its socket volume at
+  `/pgsock:ro`, the passwd file at `/etc/passwd:ro`) and the RUNNER's own env going to the runtime CLI BOUND
   to the endpoint the selection validated (`gateiso.Runtime.BindEndpointEnv`:
   `DOCKER_HOST`/`DOCKER_CONTEXT`/`CONTAINER_HOST`/`CONTAINER_CONNECTION`
   dropped and the validated socket re-pinned, and the argv opens with
@@ -482,7 +506,9 @@ The process-level contract (bounded child context, group SIGKILL,
 seam. Every gate site — including the `diff_coverage` measurement below —
 inherits the selected path, so `--network=none` applies to a customer coverage
 command exactly as it does to the verify gate. Long-form contract, env vars,
-selection table, mount guard, cache invariant and the e2e fixture table:
+selection table, mount guard, cache invariant, the gate services (#2137, with
+its operator walk and the leaked-service cleanup in `runner/README.md`) and the
+e2e fixture table:
 [`runner/internal/gateiso/README.md`](../../internal/gateiso/README.md).
 
 ### Gate-env allow-list

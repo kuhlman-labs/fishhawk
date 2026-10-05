@@ -3,8 +3,9 @@
 The pure pieces of the runner's gate-isolation layer: safe container-runtime
 detection over the EFFECTIVE endpoint, the mode × profile × runtime selection
 policy, the container argv/env builder with its resolved-path socket-mount
-guard, the throwaway-clone materializer, the Linux no-network sandbox, and the
-per-exec build-cache posture. Nothing here executes a gate. The runner wires
+guard, the throwaway-clone materializer, the Linux no-network sandbox, the
+per-exec build-cache posture, and the per-exec gate services and caller
+passwd entry (#2137). Nothing here executes a gate. The runner wires
 every piece at its ONE gate-exec seam — `runner/cmd/fishhawk-runner/main.go::runBoundedGateArgv`
 (`gateisolation.go` carries the runner-side glue) — so the verify gates,
 `diff_coverage` and the auto-format absorb inherit isolation together and
@@ -15,13 +16,17 @@ there is still no second exec path.
 | Variable | Values | Default | Meaning |
 |---|---|---|---|
 | `FISHHAWK_GATE_ISOLATION` | `auto` \| `container` \| `clone-sandbox` \| `clone` | `auto` | the isolation mode (`ParseMode`; an unknown value is a startup config error naming the valid values) |
-| `FISHHAWK_GATE_IMAGE` | an image reference | empty | the image the container path runs the gate in; empty means the container path is UNAVAILABLE, so a default runner never pays the per-exec cache cost below. For THIS repository the recommended image is the in-repo, pin-checked `fishhawk-gate` (`deploy/gate-image/README.md`, E51.17 / #3966), digest-pinned, once #2137 lands. **Do NOT set it for this repository before #2137:** `auto` then prefers the container path, whose `--network=none` cannot reach the testcontainers Postgres, and every verify fails |
+| `FISHHAWK_GATE_IMAGE` | an image reference | empty | the image the container path runs the gate in; empty means the container path is UNAVAILABLE, so a default runner never pays the per-exec cache cost below. For THIS repository the recommended image is the in-repo, pin-checked `fishhawk-gate` (`deploy/gate-image/README.md`, E51.17 / #3966), digest-pinned. **For this repository, set it ONLY together with `FISHHAWK_GATE_SERVICES=postgres`, and only after the § "Gate services (#2137)" operator walk is green:** without the service, `auto` prefers the container path, where `pgtest` fails closed (`FISHHAWK_GATE_CONTAINER=1`, no database) and every verify is red |
+| `FISHHAWK_GATE_SERVICES` | comma list; only member `postgres` | empty (none) | services the CONTAINER path provisions beside each gate exec (`ParseServices`; an unknown member is a startup config error naming the variable and the valid value; duplicates collapse). Ignored, with one `gate_services_ignored` log line, on every other path. Future spec mapping: #2136's workflow-v2 `gate_container.services` |
+| `FISHHAWK_GATE_POSTGRES_IMAGE` | an image reference | `postgres:16-alpine` (`DefaultPostgresImage`) | the Postgres service image; pin it by DIGEST (`postgres@sha256:…`) — the image runs as a service beside every container gate |
 | `FISHHAWK_DEPLOYMENT_PROFILE` | `local` \| `self-hosted` \| `hosted` | `local` | the runner-DECLARED deployment profile (`ParseProfile`); `hosted` forbids every non-container path |
 
-A config error (bad mode/profile, or `hosted` with an explicit `clone` /
-`clone-sandbox` — `ProfileForbidsFallback`) fails the runner at startup with
+A config error (bad mode/profile, an unknown `FISHHAWK_GATE_SERVICES` member,
+or `hosted` with an explicit `clone` / `clone-sandbox` —
+`ProfileForbidsFallback`) fails the runner at startup with
 `runner_failed reason=config` BEFORE any backend contact. A valid config logs
-`gate_isolation_configured`; the first gate exec logs `gate_isolation_selected`
+`gate_isolation_configured` (mode, profile, image, services,
+postgres_image); the first gate exec logs `gate_isolation_selected`
 carrying the whole `Selection` JSON (path, mode, profile, image, the classified
 runtime including its endpoint, the sandbox probe, and the reason). The same
 selection is recorded on the gate evidence once a gate reaches the exec seam
@@ -129,6 +134,7 @@ a refused connection are all `Local=false` with a named reason.
   run --rm --name fishhawk-gate-<hex> --network=none --cap-drop=ALL
   --security-opt=no-new-privileges --workdir /work (--user <uid>:<gid> | --userns=keep-id)
   -v <checkout>:/work -v <gocache>:/gocache -v <gomodcache>:/gomodcache -v <lintcache>:/lintcache
+  [-v <passwdfile>:/etc/passwd:ro] [-v fishhawk-gate-svc-<hex>:/pgsock:ro]
   -e K=V … --entrypoint '' <image> <argv…>
 ```
 
@@ -151,9 +157,19 @@ a refused connection are all `Local=false` with a named reason.
   THEN `DOCKER_HOST`/`DOCKER_CONTEXT` redirected, run + rm still bound) and
   the live fixture (l) `TestGateContainer_EndpointBoundAcrossContextSwitch`.
 
-- **Four mounts, nothing else.** The checkout at `/work` (the working
-  directory) and the three per-exec throwaway caches. No socket, no `/run`, no
-  host cache is ever a mount source.
+- **The mounts, and nothing else.** The checkout at `/work` (the working
+  directory), the three per-exec throwaway caches, the runner-generated
+  `/etc/passwd` (read-only; `PasswdFile`, omitted when the read degraded) and,
+  only when a gate service is provisioned, its socket volume at `/pgsock`
+  (read-only; `ServiceMounts`). The passwd file is a host bind source and goes
+  through `ForbidSocketMounts` with the other four; a service mount is a NAMED
+  volume, and `BuildArgv` refuses with NO argv any volume not matching
+  `^fishhawk-gate-svc-[0-9a-f]{12}$`, a target that is not absolute, clean and
+  non-root, or a mount that is not read-only — so a host path or the daemon
+  socket can never ride in as a "volume"
+  (`TestBuildArgv_ServiceMountRefusesNonServiceVolume`). No socket, no `/run`,
+  no host cache is ever a bind source. These two additions are the scoped
+  exceptions ADR-063's #2137 addendum records.
 - **`--entrypoint ''` precedes the image and the full argv follows it**
   (approval condition 1 of #2134): an image whose `ENTRYPOINT` is `git`
   (`docker.io/alpine/git`, the pinned e2e image) cannot swallow or reinterpret
@@ -192,8 +208,13 @@ runner's already-sanitized gate env (`sanitizedGateEnv`, ADR-029) into the
 container: only `TZ`/`LANG`/`TERM`, `LC_*`, `CGO_*` and `GO*` survive, then
 `HOME=/tmp`, `GOPATH=/tmp/gopath`, `GOCACHE=/gocache`, `GOMODCACHE=/gomodcache`,
 `GOLANGCI_LINT_CACHE=/lintcache`, `GOPROXY=off`, `GOTOOLCHAIN=local`,
-`GIT_CONFIG_GLOBAL/SYSTEM=/dev/null` are appended drop-then-append, then the
-runner's `extraEnv` entries drop-then-append so a caller-supplied value wins.
+`GIT_CONFIG_GLOBAL/SYSTEM=/dev/null` and `FISHHAWK_GATE_CONTAINER=1`
+(`GateContainerMarker`, on EVERY container exec) are appended drop-then-append,
+then the runner's `extraEnv` entries drop-then-append so a caller-supplied value
+wins. A provisioned service's env (`PostgresService.GateEnv`, the
+`FISHHAWK_TEST_PG_URL` pin) is applied after ALL of that by `WithServiceEnv`,
+so neither the sanitized env nor extras can redirect the DSN
+(`TestContainerEnv_ServiceEnvWinsOverExtras`).
 The RUNNER's own inherited environment goes to the runtime CLI (it needs
 `PATH` and its config dir) with the endpoint BOUND (`BindEndpointEnv`:
 `DOCKER_HOST` / `DOCKER_CONTEXT` / `CONTAINER_HOST` / `CONTAINER_CONNECTION`
@@ -244,9 +265,10 @@ macOS, so a macOS host reports unavailable with the ADR-063 gap reason and
 `auto` selects `clone`; the container path (configure `FISHHAWK_GATE_IMAGE`)
 is the way to get network isolation there. **Linux clone-not-sandbox note:**
 the netns hides the HOST loopback too, so a gate that needs a daemon on the
-host (this repo's testcontainers Postgres) fails under `clone-sandbox` exactly
-as it does under the `--network=none` container; until
-[#2137](https://github.com/kuhlman-labs/fishhawk/issues/2137) such hosts set
+host (this repo's testcontainers Postgres) fails under `clone-sandbox`. The
+#2137 gate service provisions Postgres on the CONTAINER path only — the
+sandbox path has no service — so such a host either runs the container path
+(`FISHHAWK_GATE_IMAGE` + `FISHHAWK_GATE_SERVICES=postgres`) or sets
 `FISHHAWK_GATE_ISOLATION=clone`.
 
 ## Build-cache posture (`cache.go`) — the INVARIANT
@@ -315,7 +337,125 @@ The container path is opt-in via `FISHHAWK_GATE_IMAGE`, so no default runner
 pays it. **Residuals:** the fallback paths keep the host caches (they are host
 exec); there is no persistent shared cache; the per-exec repopulation and the
 cold `GOCACHE` are accepted. The first container exec also pulls the image
-through the daemon inside the gate timeout — pre-pull it.
+through the daemon inside the gate timeout — pre-pull it. With
+`FISHHAWK_GATE_SERVICES=postgres` every container exec also pays a Postgres
+start (seconds; OUTSIDE the gate timeout, § "Gate services (#2137)").
+
+## Gate services (`service.go`, `passwd.go`; ADR-063 #2137 addendum, [E51.4 / #2137](https://github.com/kuhlman-labs/fishhawk/issues/2137))
+
+A daemon-dependent gate command — this repository's pgtest-backed backend
+suite — cannot start its own database inside the `--network=none` gate
+container (no daemon, no daemon socket, no network). With
+`FISHHAWK_GATE_SERVICES=postgres` and the container path selected, the runner
+provisions a per-exec Postgres SERVICE container and shares ONLY its unix
+socket with the gate. Everything in `service.go` is pure argv/env rendering;
+`runner/cmd/fishhawk-runner/gateisolation.go` (`provisionGateService`,
+`teardownGateService`) executes it.
+
+**Lifecycle, per container exec** (every argv opens with the endpoint binding
+and is rendered — and validated — before any of them runs; a runtime with no
+`SocketPath`, a malformed name or a flag-shaped image renders none,
+`ErrContainerSpec`):
+
+| Step | Argv (after `<bin> --host/--url unix://<socket>`) | Bound |
+|---|---|---|
+| volume create | `volume create --label org.fishhawk.gate-service=postgres fishhawk-gate-svc-<12 hex>` | 1m |
+| run | `run -d --name <svc> --network=none --cap-drop=ALL --security-opt=no-new-privileges --user postgres --label … --tmpfs /var/lib/postgresql/data -e PGDATA=…/pgdata -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=<random> -e POSTGRES_INITDB_ARGS=--auth-local=scram-sha-256 --auth-host=scram-sha-256 -v <svc>:/var/run/postgresql <image>` — no `-p`, no host path | 5m (covers a cold pull of the service image) |
+| readiness | each iteration: `logs <svc>` FIRST; only once it carries `PostgreSQL init process complete; ready for start up.`, `exec <svc> pg_isready -h /var/run/postgresql …`; ready = pg_isready exit 0 AFTER the line | 15s per probe, 90s overall, 250ms interval |
+| bootstrap | `exec -e PGPASSWORD=<random> <svc> psql … -c "CREATE ROLE fishhawk LOGIN CREATEDB NOSUPERUSER NOCREATEROLE NOBYPASSRLS NOREPLICATION PASSWORD 'fishhawk'" -c "CREATE DATABASE fishhawk OWNER fishhawk"` | 1m |
+| gate exec | `BuildArgv` with `-v <svc>:/pgsock:ro` and `FISHHAWK_TEST_PG_URL=postgres://fishhawk:fishhawk@/fishhawk?host=/pgsock&sslmode=disable` applied LAST | the gate's own timeout |
+| teardown | `rm -f -v <svc>`, then `volume rm -f <svc>` (one name, two runtime namespaces) | `diffCoverageCleanupTimeout` each, detached context |
+
+- **Least privilege (approval condition 1).** The gate's DSN connects as the
+  `CREATEDB`-only role `fishhawk`, never the superuser. initdb's
+  `scram-sha-256` local auth means the superuser cannot be reached over the
+  socket without its per-service random password, which exists only in the
+  service container's env and the host-side runtime argv — never in the gate
+  container's env, files, mounts or argv. Pinned live by
+  `TestPostgresService_LiveLeastPrivilegeOverReadOnlySocket` (this package) and
+  fixture (m): `CREATE ROLE` and `COPY … TO PROGRAM` from the gate DSN fail
+  with `permission denied`.
+- **No anonymous data volume (approval condition 2).** The image declares a
+  `VOLUME` for PGDATA; a `--tmpfs` there means the daemon creates none. The
+  service's only mount is the named socket volume, plus the tmpfs; `rm -f -v`
+  stays as belt and braces should an overriding image declare another
+  `VOLUME`. Fixture (m) inspects exactly one mount (type volume, the
+  `fishhawk-gate-svc-` name) and a tmpfs at the PGDATA path.
+- **Readiness ordering (approval condition 3).** The image's temporary init
+  server answers `pg_isready` before init completes, so the logs are read
+  FIRST in every iteration (`PostgresInitComplete`). Pinned by
+  `TestRunGateInContainer_ReadinessReadsLogsFirst` and the `ready but
+  init-complete line missing` row of `TestRunGateInContainer_ServiceProvisionFailures`.
+- **Provisioning never counts against the gate timeout, and never reaches the
+  fix agent.** Each step carries its own bound above; ANY failure — a step's
+  non-zero exit, the readiness deadline — returns
+  `gate container: provision postgres service: <step>: <output>`, `-1`,
+  `gateUnavailable` (category C), and the gate argv never executes
+  (`TestRunGateInContainer_ServiceProvisionFailures`, one row per mode).
+- **Teardown on every exit.** Registered before `volume create` is attempted,
+  so a partial provision, a failed gate and a timed-out gate all tear down
+  (`TestRunGateInContainer_ServiceTornDownOnGateFailureAndTimeout`). A
+  teardown failure logs `gate_service_cleanup_failed` (with the label) and
+  never changes the verdict
+  (`TestRunGateInContainer_TeardownFailureDoesNotChangeVerdict`). Runner log
+  lines: `gate_service_provisioned` / `gate_service_removed` (service, volume).
+- **Crash-orphaned services.** A runner SIGKILLed mid-exec runs no deferred
+  teardown. Both objects carry `org.fishhawk.gate-service`; the label-filtered
+  manual cleanup is in `runner/README.md` § "Gate isolation".
+- **Image provenance.** `FISHHAWK_GATE_POSTGRES_IMAGE` defaults to the TAG
+  `postgres:16-alpine`; pin it by digest in any operator environment.
+
+**Caller passwd entry (`passwd.go`, every container exec, services or not).**
+The gate runs as the caller's numeric `uid:gid`, which the gate image's
+`/etc/passwd` does not name, so `id -un`, git and libpq's default user fail.
+The runner reads the IMAGE's `/etc/passwd` through `PasswdReadArgv` — `run --rm
+--network=none --cap-drop=ALL --security-opt=no-new-privileges (--user
+uid:gid | --userns=keep-id) --entrypoint '' <image> cat /etc/passwd`,
+endpoint-bound, bounded at 5m (a cold gate-image pull) — and `BuildPasswd`
+appends `<name>:x:<uid>:<gid>:fishhawk gate caller:/tmp:/bin/sh` only when no
+entry maps the uid (the name falls back to `fishhawk-gate` unless it matches
+`^[A-Za-z0-9._][A-Za-z0-9._-]*$`, so no `:`/newline can forge an entry).
+`WritePasswdFile` writes a FRESH `0444` file per exec under the visible-cache
+root (approval condition 7); only a SUCCESSFUL read is cached (per image, per
+process), so a transient failure is retried on a later exec. A read OR write
+failure DEGRADES to no passwd mount with a `gate_passwd_unavailable` log line —
+never a refusal (`TestRunGateInContainer_PasswdReadFailureDegrades`,
+`TestRunGateInContainer_PasswdWriteFailureDegrades`).
+
+**In-gate test contract (`backend/`).** `pgtest` uses `FISHHAWK_TEST_PG_URL`
+as its shared base without testcontainers and Fatalf's — never Skips — on any
+failure there; with `FISHHAWK_GATE_CONTAINER=1` and no URL it Fatalf's naming
+`FISHHAWK_GATE_SERVICES`. `backend/internal/postgres`'s raw-database helper
+creates `fh_raw_<uuid>` databases on that server; the RustFS `tracestore` S3
+suite skips inside the gate container. `directory/internal/store` still starts
+its own testcontainers Postgres outside `pgtest` — a KNOWN in-container
+failure the operator walk below will show.
+
+**Operator walk — required before setting `FISHHAWK_GATE_IMAGE` for this
+repository (approval conditions 5 and 6).** In-loop the implement gate proves
+the pieces, not the full in-container verify. Before enabling:
+
+1. Build the gate image (`docker buildx build --load -t fishhawk-gate:local
+   deploy/gate-image`) and run fixture (n):
+   `FISHHAWK_GATE_SELFHOST_IMAGE=fishhawk-gate:local scripts/test single -run
+   TestGateContainer_SelfHostPgtestSuite ./runner/cmd/fishhawk-runner/`. It
+   drives pgx + golang-migrate (the real `pgtest` external branch) over the
+   mounted socket; record its `--- PASS: TestSharedContainer_SharesAndIsolates`
+   line. (Recorded once on the #2137 slice-3 run against
+   `fishhawk-gate:smoke-92445ead`: PASS.)
+2. Run a full container-path verify through the runner and collect POSITIVE
+   evidence, not just exit 0: the runner log's `gate_service_provisioned` /
+   `gate_service_removed` pair, and pgtest-backed `--- PASS` lines (or a
+   non-zero test count) for `backend/internal/pgtest` and a pgtest consumer
+   package in the in-container `go test` output, with no
+   `FISHHAWK_SKIP_INTEGRATION` skip line. What `scripts/test verify` does in
+   there, examined for this walk: every docker helper (lease, sweep, reap)
+   opens with `command -v docker || return`, so with no docker CLI they no-op
+   rather than fail or skip the run; `scripts/test` never sets
+   `FISHHAWK_SKIP_INTEGRATION`; and the container env allow-list (`TZ`/`LANG`/
+   `TERM`, `LC_*`, `CGO_*`, `GO*`) cannot carry a host
+   `FISHHAWK_SKIP_INTEGRATION` in. A suite that skipped anyway shows as
+   `--- SKIP`, which the walk must treat as a failure.
 
 ## Never-executed gates → category C
 
@@ -358,7 +498,9 @@ The five dispositions, by classification:
 - **`unavailable`** — the container path failed BEFORE exec for a reason on
   the HOST, not in the tree: visible-cache root creation, the lint-cache dir,
   the resolved-path mount-guard refusal, the host `GOMODCACHE` probe or
-  `go mod download` (an offline host), or endpoint binding. The gate never
+  `go mod download` (an offline host), endpoint binding, the gate-service
+  argv, or ANY gate-service provisioning step (#2137: volume create, run,
+  readiness, bootstrap). The gate never
   executed, so its verdict says nothing about the tree — the same argument
   the refusal rests on — so it is **category C** exactly like a refusal:
   `runVerifyGateCommitted` wraps `gitops.ErrVerifyInfraFailure` +
@@ -463,6 +605,8 @@ every host — no runtime skip, no refused-state theater.
 | (g) `TestGateContainer_LinuxOwnership` | `id -u` is the runner's uid; on Linux a written file is owned by `os.Getuid()` |
 | (k) `TestGateContainer_CacheSymlinkNeverReachesHost` | the cache invariant + symlink-safe cleanup, above |
 | (l) `TestGateContainer_EndpointBoundAcrossContextSwitch` | selection recorded against the real socket, THEN `DOCKER_HOST`/`CONTAINER_HOST` redirected to an unreachable tcp endpoint and `DOCKER_CONTEXT`/`CONTAINER_CONNECTION` to a nonexistent context → the gate still runs on the validated daemon; the argv opens with the binding; the CLI env pins the validated socket with the redirecting variables dropped |
+| (m) `TestGateContainer_PostgresServiceReachableAndContained` | with `FISHHAWK_GATE_SERVICES=postgres` and the Postgres image as the gate image (it carries `psql`): `select 1` over the injected `FISHHAWK_TEST_PG_URL` prints 1; the role is `rolsuper=false, rolcreatedb=true, rolcreaterole=false`, `CREATE DATABASE` works, `CREATE ROLE` and `COPY … TO PROGRAM` are `permission denied`, the superuser cannot connect without its password, and its password appears nowhere in the gate output, env or argv; the containment set (no external or host-loopback egress after a positive control, no `eth*`, no daemon socket, only the Postgres socket under `/pgsock`, `/pgsock` and `/etc/passwd` mounted `ro` per `/proc/mounts`, `id -un` resolves, `FISHHAWK_GATE_CONTAINER=1`); host-side inspect via `gateServiceObserver` (NetworkMode none, one named-volume mount and a PGDATA tmpfs, no bind, no port, CapDrop ALL); `rm -f -v` + `volume rm` recorded and nothing left on the daemon; counterfactual: the same DSN with services UNSET fails to connect |
+| (n) `TestGateContainer_SelfHostPgtestSuite` | OPT-IN (`FISHHAWK_GATE_SELFHOST_IMAGE`, the built `fishhawk-gate` image; counts toward the sentinel only when opted in and run): the REAL `pgtest` suite of the committed HEAD runs in the gate image over the socket DSN — pgx + golang-migrate, template bootstrap, per-test databases — exit 0, the PASS line, no `--- SKIP` |
 | (h) `TestGateClone_PlantedRefNeverReachesPrimary` | clone path: plant never reaches the primary, lock path injected; the `git worktree add` sibling DOES leak the plant |
 | (i) `TestGateCloneSandbox_NoNetwork` | Linux-only: a loopback connect fails under `clone-sandbox` through `runBoundedGateCommand` and succeeds under the host-exec control |
 | (j) `TestGateHosted_RefusesEndToEnd` | hosted + auto with a REALLY detected runtime whose endpoint is pinned remote (`DOCKER_HOST=tcp://…` via the Getenv probe) → single-shot gate category C, fix loop category C, fix agent never invoked, verify command never ran |
@@ -491,15 +635,19 @@ category B.
   additive workflow-v1.x `diff_coverage` container-image field declaring the
   gate image for customer coverage commands (today the image is the runner-wide
   `FISHHAWK_GATE_IMAGE`). Once it lands, this repository declares the
-  digest-pinned `fishhawk-gate` image (`deploy/gate-image/`) through it.
+  digest-pinned `fishhawk-gate` image (`deploy/gate-image/`) through it; its
+  workflow-v2 `gate_container` block is also the future home of the gate
+  services (`gate_container.services`), which today are the operator-side
+  `FISHHAWK_GATE_SERVICES`.
 - [#2137](https://github.com/kuhlman-labs/fishhawk/issues/2137) (E51.4) —
-  daemon-dependent gate commands under the container path: this repo's own
-  `scripts/test verify` needs the testcontainers Postgres, which a
-  `--network=none` container (and the Linux sandbox's netns, above) cannot
-  reach. Until it lands, do not set `FISHHAWK_GATE_IMAGE` for this repository;
-  the gate image (E51.17 / #3966, `deploy/gate-image/README.md`) is usable
-  today only for CI parity via `scripts/test lint|verify --in-gate-image`,
-  which runs the Docker-free legs (`verify --no-tests`) and is not isolation.
+  daemon-dependent gate commands under the container path: landed as the
+  runner-provisioned Postgres service, § "Gate services (#2137)". This
+  repository sets `FISHHAWK_GATE_IMAGE` (the digest-pinned `fishhawk-gate`)
+  TOGETHER with `FISHHAWK_GATE_SERVICES=postgres`, and only after that
+  section's operator walk is green. `scripts/test lint|verify
+  --in-gate-image` (E51.17 / #3966) is unchanged: it provisions no service,
+  so it still runs only the Docker-free legs (`verify --no-tests`) and is CI
+  parity, not isolation.
 - [#2138](https://github.com/kuhlman-labs/fishhawk/issues/2138) (E51.5) — the
   operator-facing posture docs: the container-runtime requirement in the
   self-hosted distribution profile, runner setup docs, and the ARCHITECTURE
