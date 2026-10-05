@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -41,6 +42,13 @@ const (
 	// detected: a hosted deployment that forgets it gets fallback rather
 	// than refusal — a documented residual pinned by the selection tests.
 	deploymentProfileEnvVar = "FISHHAWK_DEPLOYMENT_PROFILE"
+	// gateServicesEnvVar lists the services the container path provisions
+	// beside the gate (#2137; comma list, only member `postgres`, empty =
+	// none). It is ignored off the container path (gate_services_ignored).
+	gateServicesEnvVar = "FISHHAWK_GATE_SERVICES"
+	// gatePostgresImageEnvVar overrides the Postgres service image (default
+	// gateiso.DefaultPostgresImage; operators should pin it by digest).
+	gatePostgresImageEnvVar = "FISHHAWK_GATE_POSTGRES_IMAGE"
 )
 
 // gateIsolationRefusedSignature leads every refusal output. It is
@@ -121,6 +129,34 @@ func (d gateDisposition) String() string {
 // exec (gateiso.SeedModCache); the gate's own timeout does not cover it.
 const gateSeedTimeout = 5 * time.Minute
 
+// Container-path provisioning bounds (#2137 approval condition 9). The passwd
+// read and every gate-service step run BEFORE the gate exec and — like the
+// module-cache seed — do NOT count against the gate's own timeout: each step
+// carries its own bound, and a step that exceeds it is a provisioning failure
+// (gateUnavailable), never a gate verdict.
+const (
+	// gatePasswdReadTimeout bounds the image /etc/passwd read, including a
+	// cold pull of the gate image.
+	gatePasswdReadTimeout = 5 * time.Minute
+	// gateServiceVolumeTimeout bounds `volume create`.
+	gateServiceVolumeTimeout = time.Minute
+	// gateServiceStartTimeout bounds `run -d`, including a cold pull of the
+	// service image.
+	gateServiceStartTimeout = 5 * time.Minute
+	// gateServiceProbeTimeout bounds each readiness probe (`logs`,
+	// pg_isready).
+	gateServiceProbeTimeout = 15 * time.Second
+	// gateServiceBootstrapTimeout bounds the least-privilege role bootstrap.
+	gateServiceBootstrapTimeout = time.Minute
+)
+
+// gateServiceReadyTimeout / gateServiceReadyInterval bound the readiness
+// poll. Package vars SOLELY so a test can shorten them.
+var (
+	gateServiceReadyTimeout  = 90 * time.Second
+	gateServiceReadyInterval = 250 * time.Millisecond
+)
+
 // gateIsolationState is the process-wide isolation configuration plus the
 // lazily computed selection. The package var gateIsolation carries it; its
 // NIL value selects the pre-#2134 host exec (path clone, reason
@@ -132,6 +168,17 @@ type gateIsolationState struct {
 	image   string
 	probes  gateiso.Probes
 	logSink io.Writer
+
+	// services / postgresImage are the gate services the container path
+	// provisions per exec (#2137) and the Postgres service image.
+	services      []gateiso.Service
+	postgresImage string
+
+	// passwdByImage caches each gate image's /etc/passwd after a SUCCESSFUL
+	// read (#2137 approval condition 7: a failed read is never cached, so a
+	// transient failure is retried on a later exec).
+	passwdMu      sync.Mutex
+	passwdByImage map[string][]byte
 
 	// detect / probeSandbox are the two host probes selection runs. Nil
 	// selects gateiso.DetectRuntime / gateiso.ProbeSandbox; tests inject.
@@ -177,6 +224,24 @@ var seedModCacheFn = gateiso.SeedModCache
 // production leaves it the method expression.
 var bindEndpointEnvFn = gateiso.Runtime.BindEndpointEnv
 
+// execGateAuxArgvFn is the host-exec seam for the runtime CLI calls AROUND a
+// container gate exec — the gate image's /etc/passwd read and the gate-service
+// lifecycle (#2137) — kept apart from execBoundedHostArgvFn so that seam still
+// carries exactly the gate's own `run` and its `rm -f` kill. A package var
+// SOLELY so a test can script and record those calls; production leaves it
+// execBoundedHostArgv.
+var execGateAuxArgvFn = execBoundedHostArgv
+
+// writePasswdFileFn writes the per-exec passwd file (gateiso.WritePasswdFile).
+// A package var SOLELY so a test can make the write fail and pin the degrade.
+var writePasswdFileFn = gateiso.WritePasswdFile
+
+// gateServiceObserver, when non-nil, is called once per provisioned gate
+// service after readiness and the role bootstrap and BEFORE the gate exec,
+// with the validated runtime and the bound CLI env — the end-to-end fixtures'
+// host-side inspection point. Test-only: production leaves it nil.
+var gateServiceObserver func(ctx context.Context, rt gateiso.Runtime, cliEnv []string, svc gateiso.PostgresService)
+
 // dockerFixturesEligible / dockerFixturesRan are the end-to-end fixture
 // sentinel (gateisolation_e2e_test.go increments Ran at the END of every
 // docker-gated fixture; main_test.go's TestMain fails the binary when a
@@ -187,7 +252,7 @@ var (
 	dockerFixturesRan      int
 )
 
-// configureGateIsolation parses the three variables through getenv and
+// configureGateIsolation parses the five variables through getenv and
 // applies the startup rule ProfileForbidsFallback. A configuration error names
 // the variable and the valid values; run() logs it as runner_failed
 // reason=config and exits exitUsage BEFORE any backend contact. On success it
@@ -204,21 +269,62 @@ func configureGateIsolation(getenv func(string) string, probes gateiso.Probes, l
 	if err := gateiso.ProfileForbidsFallback(profile, mode); err != nil {
 		return nil, fmt.Errorf("%s=%s with %s=%s: %w", deploymentProfileEnvVar, profile, gateIsolationModeEnvVar, mode, err)
 	}
+	services, err := gateiso.ParseServices(getenv(gateServicesEnvVar))
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", gateServicesEnvVar, err)
+	}
+	pgImage := strings.TrimSpace(getenv(gatePostgresImageEnvVar))
+	if pgImage == "" {
+		pgImage = gateiso.DefaultPostgresImage
+	}
 	st := &gateIsolationState{
-		mode:    mode,
-		profile: profile,
-		image:   strings.TrimSpace(getenv(gateImageEnvVar)),
-		probes:  probes,
-		logSink: logSink,
-		uid:     os.Getuid(),
-		gid:     os.Getgid(),
+		mode:          mode,
+		profile:       profile,
+		image:         strings.TrimSpace(getenv(gateImageEnvVar)),
+		probes:        probes,
+		logSink:       logSink,
+		uid:           os.Getuid(),
+		gid:           os.Getgid(),
+		services:      services,
+		postgresImage: pgImage,
 	}
 	if logSink != nil {
 		_, _ = fmt.Fprintf(logSink,
-			`{"event":"gate_isolation_configured","mode":%q,"profile":%q,"image":%q}`+"\n",
-			mode, profile, st.image)
+			`{"event":"gate_isolation_configured","mode":%q,"profile":%q,"image":%q,"services":%q,"postgres_image":%q}`+"\n",
+			mode, profile, st.image, joinServices(services), pgImage)
 	}
 	return st, nil
+}
+
+// joinServices renders a service list as its comma form for log lines.
+func joinServices(svcs []gateiso.Service) string {
+	parts := make([]string, len(svcs))
+	for i, s := range svcs {
+		parts[i] = string(s)
+	}
+	return strings.Join(parts, ",")
+}
+
+// logEvent writes one runner log line to the state's sink. Nil-safe.
+func (s *gateIsolationState) logEvent(format string, args ...any) {
+	if s == nil || s.logSink == nil {
+		return
+	}
+	_, _ = fmt.Fprintf(s.logSink, format+"\n", args...)
+}
+
+// postgresServiceWanted reports whether the container path provisions the
+// Postgres service for each exec.
+func (s *gateIsolationState) postgresServiceWanted() bool {
+	if s == nil {
+		return false
+	}
+	for _, svc := range s.services {
+		if svc == gateiso.ServicePostgres {
+			return true
+		}
+	}
+	return false
 }
 
 // hostExecSelection is the nil-state selection: the pre-#2134 host exec.
@@ -260,6 +366,11 @@ func (s *gateIsolationState) selection(ctx context.Context) gateiso.Selection {
 		if s.logSink != nil {
 			b, _ := json.Marshal(s.sel)
 			_, _ = fmt.Fprintf(s.logSink, `{"event":"gate_isolation_selected","selection":%s}`+"\n", b)
+		}
+		if len(s.services) > 0 && s.sel.Path != gateiso.PathContainer {
+			// Only the container path provisions services; elsewhere the
+			// gate's own tooling (pgtest's host testcontainers) is unchanged.
+			s.logEvent(`{"event":"gate_services_ignored","services":%q,"path":%q}`, joinServices(s.services), s.sel.Path)
 		}
 	})
 	return s.sel
@@ -321,34 +432,41 @@ func materializeGateCheckout(ctx context.Context, repoDir, headSHA, parent strin
 	return wt, nil
 }
 
-// runGateInContainer is the container branch of runBoundedGateArgv: fresh
-// empty visible caches, argv build under the resolved-path mount guard
-// (FIRST — a checkout the guard refuses is never handed to the host-side
-// seed, so no go process runs against a checkout the container would not
-// have been given), THEN the host-side module-cache seed run under the
-// SANITIZED gate env (never the runner's inherited environment — no runner
-// credential reaches the `go mod download`, and the checkout's module
-// metadata is refused before any go process runs when it would reach outside
-// the checkout), exec through the host seam with the RUNNER's inherited environment BOUND to the
-// validated endpoint (the runtime CLI needs PATH and its config dir from the
-// inherited env; DOCKER_HOST / DOCKER_CONTEXT / CONTAINER_HOST /
-// CONTAINER_CONNECTION are dropped and the selection's socket re-pinned, and
-// the argv carries the same binding as a global flag, so a docker-context
-// switch between gates cannot redirect a bind-mount request to a daemon the
-// selection never validated; the SANITIZED gate env crosses into the
-// container via -e only), and `rm -f` — under the same binding — on a
+// runGateInContainer is the container branch of runBoundedGateArgv. In order:
+// fresh empty visible caches; the lint-cache dir; the runtime CLI's env BOUND
+// to the validated endpoint (the runner's inherited environment — the CLI
+// needs PATH and its config dir — with DOCKER_HOST / DOCKER_CONTEXT /
+// CONTAINER_HOST / CONTAINER_CONNECTION dropped and the selection's socket
+// re-pinned; every argv carries the same binding as a global flag, so a
+// docker-context switch between gates cannot redirect any runtime call to a
+// daemon the selection never validated); when FISHHAWK_GATE_SERVICES names
+// postgres, a fresh per-exec gate service and its argv (#2137); the caller's
+// passwd file (gatePasswdFile — a DEGRADE, never a refusal); the argv build
+// under the resolved-path mount guard (BEFORE the seed — a checkout the guard
+// refuses is never handed to the host-side seed); the host-side module-cache
+// seed under the SANITIZED gate env (no runner credential reaches the
+// `go mod download`, and the checkout's module metadata is refused before any
+// go process runs when it would reach outside the checkout); the gate service
+// provisioning (provisionGateService), whose teardown is DEFERRED from the
+// moment `volume create` is attempted so it runs on EVERY later exit; the
+// exec through the host seam (the sanitized gate env crosses into the
+// container via -e only, with FISHHAWK_GATE_CONTAINER=1 pinned and the
+// service DSN applied LAST); and `rm -f` — under the same binding — on a
 // detached context when the exec returned -1 (killing the CLI does not stop
-// the container). Every failure before the exec returns -1 WITHOUT
-// executing, and the third value names WHY out of band (#3448): a HOST-caused
-// pre-exec failure — visible-cache creation, the lint-cache dir, the
-// mount-guard refusal, a seed failure NOT wrapping gateiso.ErrSeedCheckout
-// (the host GOMODCACHE probe or `go mod download` on an offline host), or
-// endpoint binding — is gateUnavailable (category C at the gates, like a
-// refusal); a seed failure wrapping ErrSeedCheckout is the checkout's OWN
+// the container). Every failure before the exec returns -1 WITHOUT executing
+// the gate, and the third value names WHY out of band (#3448): a HOST-caused
+// pre-exec failure — visible-cache creation, the lint-cache dir, endpoint
+// binding, the gate-service argv, the mount-guard refusal, a seed failure NOT
+// wrapping gateiso.ErrSeedCheckout (the host GOMODCACHE probe or `go mod
+// download` on an offline host), or ANY gate-service provisioning step — is
+// gateUnavailable (category C at the gates, like a refusal; never the fix
+// agent); a seed failure wrapping ErrSeedCheckout is the checkout's OWN
 // metadata being refused, so it is gateCheckoutRefused (tree-attributable,
 // classified as an executed failure); the exec path is gateExecuted whatever
 // the exit code, EXCEPT that a seam result reporting the runner's own
-// deadline expiry is gateTimedOut (#3383, no verdict). Deliberate residual: a legitimate tree whose `replace`
+// deadline expiry is gateTimedOut (#3383, no verdict). A gate-service
+// teardown failure is logged (gate_service_cleanup_failed) and never changes
+// the gate's verdict. Deliberate residual: a legitimate tree whose `replace`
 // target sits outside the checkout draws ErrSeedCheckout too and reaches the
 // fix agent with the refusing message rather than parking category C.
 func runGateInContainer(ctx context.Context, sel gateiso.Selection, argv []string, dir, lintCacheDir string, sanitizedEnv, extraEnv []string, timeout time.Duration) (string, int, gateDisposition) {
@@ -361,6 +479,32 @@ func runGateInContainer(ctx context.Context, sel gateiso.Selection, argv []strin
 	if err := os.MkdirAll(lintCacheDir, 0o700); err != nil {
 		return "gate container: create lint cache dir: " + err.Error(), -1, gateUnavailable
 	}
+	// The runtime CLI's env is the runner's inherited environment with the
+	// endpoint bound to the socket the selection validated (concern: a
+	// context switch after selection must not redirect launch, the passwd
+	// read, the service lifecycle or cleanup). Bound FIRST: no runtime call
+	// below runs under an unbound env.
+	cliEnv, err := bindEndpointEnvFn(sel.Runtime, os.Environ())
+	if err != nil {
+		return "gate container: " + err.Error(), -1, gateUnavailable
+	}
+	uid, gid := os.Getuid(), os.Getgid()
+	if st != nil {
+		uid, gid = st.uid, st.gid
+	}
+	env := gateiso.ContainerEnv(sanitizedEnv, extraEnv)
+	var svc *gateiso.PostgresService
+	var svcArgv gateServiceArgv
+	if st.postgresServiceWanted() {
+		s := gateiso.NewPostgresService(st.postgresImage)
+		if svcArgv, err = buildGateServiceArgv(s, sel.Runtime); err != nil {
+			return "gate container: provision postgres service: argv: " + err.Error(), -1, gateUnavailable
+		}
+		svc = &s
+		// Service env LAST: neither the sanitized env nor extras can
+		// redirect the DSN the runner provisioned.
+		env = gateiso.WithServiceEnv(env, s.GateEnv())
+	}
 	spec := gateiso.ContainerSpec{
 		Runtime:    sel.Runtime,
 		Image:      sel.Image,
@@ -369,13 +513,14 @@ func runGateInContainer(ctx context.Context, sel gateiso.Selection, argv []strin
 		GoCache:    vc.GoCache,
 		GoModCache: vc.GoModCache,
 		LintCache:  lintCacheDir,
-		Env:        gateiso.ContainerEnv(sanitizedEnv, extraEnv),
+		PasswdFile: st.gatePasswdFile(ctx, sel.Runtime, sel.Image, vc.Root, cliEnv, uid, gid),
+		Env:        env,
 		Argv:       argv,
+		UID:        uid,
+		GID:        gid,
 	}
-	if st != nil {
-		spec.UID, spec.GID = st.uid, st.gid
-	} else {
-		spec.UID, spec.GID = os.Getuid(), os.Getgid()
+	if svc != nil {
+		spec.ServiceMounts = []gateiso.ServiceMount{svc.GateMount()}
 	}
 	runArgv, err := spec.BuildArgv(gateiso.MountPolicy{
 		Permitted:    []string{dir, vc.Root, lintCacheDir},
@@ -394,12 +539,17 @@ func runGateInContainer(ctx context.Context, sel gateiso.Selection, argv []strin
 		}
 		return "gate container: seed module cache: " + err.Error(), -1, disp
 	}
-	// The runtime CLI's env is the runner's inherited environment with the
-	// endpoint bound to the socket the selection validated (concern: a
-	// context switch after selection must not redirect launch or cleanup).
-	cliEnv, err := bindEndpointEnvFn(sel.Runtime, os.Environ())
-	if err != nil {
-		return "gate container: " + err.Error(), -1, gateUnavailable
+	if svc != nil {
+		// Registered BEFORE `volume create` is attempted, so a partial
+		// provision, a failed gate and a timed-out gate all tear down.
+		defer teardownGateService(ctx, st, svc.Name, svcArgv, vc.Root, cliEnv)
+		if msg, ok := provisionGateService(ctx, svcArgv, vc.Root, cliEnv); !ok {
+			return "gate container: provision postgres service: " + msg, -1, gateUnavailable
+		}
+		st.logEvent(`{"event":"gate_service_provisioned","service":%q,"volume":%q,"image":%q}`, svc.Name, svc.Name, svc.Image)
+		if gateServiceObserver != nil {
+			gateServiceObserver(ctx, sel.Runtime, cliEnv, *svc)
+		}
 	}
 	out, code, timedOut := execBoundedHostArgvFn(ctx, runArgv, dir, cliEnv, timeout)
 	if code == -1 {
@@ -414,6 +564,174 @@ func runGateInContainer(ctx context.Context, sel gateiso.Selection, argv []strin
 		return out, code, gateTimedOut
 	}
 	return out, code, gateExecuted
+}
+
+// gateCallerName is the host login name the passwd entry carries
+// (gateiso.BuildPasswd falls back to fishhawk-gate when it is unusable).
+func gateCallerName() string {
+	if u, err := user.Current(); err == nil {
+		return u.Username
+	}
+	return ""
+}
+
+// gatePasswdFile returns a FRESH per-exec passwd file under root (#2137
+// approval condition 7) naming the caller uid, mounted read-only at
+// /etc/passwd on EVERY container exec so `id -un`, git and libpq resolve the
+// caller. Any failure — the image read or the write — DEGRADES to "" (no
+// passwd mount) with a gate_passwd_unavailable log line; it never refuses the
+// gate. Only a successful image read is cached (per image, per process).
+func (s *gateIsolationState) gatePasswdFile(ctx context.Context, rt gateiso.Runtime, image, root string, cliEnv []string, uid, gid int) string {
+	content, err := s.imagePasswd(ctx, rt, image, root, cliEnv, uid, gid)
+	if err == nil {
+		var path string
+		if path, err = writePasswdFileFn(root, gateiso.BuildPasswd(content, uid, gid, gateCallerName())); err == nil {
+			return path
+		}
+	}
+	s.logEvent(`{"event":"gate_passwd_unavailable","image":%q,"reason":%q}`, image, err.Error())
+	return ""
+}
+
+// imagePasswd reads the gate image's /etc/passwd through the hardened,
+// endpoint-bound gateiso.PasswdReadArgv (no network, all capabilities
+// dropped, no-new-privileges, the caller's user pin), serving a cached
+// SUCCESSFUL read when there is one. A failed read is not cached.
+func (s *gateIsolationState) imagePasswd(ctx context.Context, rt gateiso.Runtime, image, root string, cliEnv []string, uid, gid int) ([]byte, error) {
+	if s != nil {
+		s.passwdMu.Lock()
+		cached, ok := s.passwdByImage[image]
+		s.passwdMu.Unlock()
+		if ok {
+			return cached, nil
+		}
+	}
+	argv, err := gateiso.PasswdReadArgv(rt, image, uid, gid)
+	if err != nil {
+		return nil, err
+	}
+	out, code, _ := execGateAuxArgvFn(ctx, argv, root, cliEnv, gatePasswdReadTimeout)
+	if code != 0 {
+		return nil, fmt.Errorf("read %s /etc/passwd: exit %d: %s", image, code, gateOutputTail(out))
+	}
+	content := []byte(out)
+	if s != nil {
+		s.passwdMu.Lock()
+		if s.passwdByImage == nil {
+			s.passwdByImage = map[string][]byte{}
+		}
+		s.passwdByImage[image] = content
+		s.passwdMu.Unlock()
+	}
+	return content, nil
+}
+
+// gateServiceArgv is every runtime command line of one gate service's
+// lifecycle, rendered (and validated) before any of them executes.
+type gateServiceArgv struct {
+	volumeCreate, run, logs, ready, bootstrap, remove, volumeRemove []string
+}
+
+// buildGateServiceArgv renders the lifecycle argv; any refusal (an unbound
+// runtime, a malformed name, a flag-shaped image) renders none.
+func buildGateServiceArgv(svc gateiso.PostgresService, rt gateiso.Runtime) (gateServiceArgv, error) {
+	var a gateServiceArgv
+	for _, b := range []struct {
+		dst   *[]string
+		build func(gateiso.Runtime) ([]string, error)
+	}{
+		{&a.volumeCreate, svc.VolumeCreateArgv},
+		{&a.run, svc.RunArgv},
+		{&a.logs, svc.LogsArgv},
+		{&a.ready, svc.ReadyArgv},
+		{&a.bootstrap, svc.BootstrapArgv},
+		{&a.remove, svc.RemoveArgv},
+		{&a.volumeRemove, svc.VolumeRemoveArgv},
+	} {
+		argv, err := b.build(rt)
+		if err != nil {
+			return gateServiceArgv{}, err
+		}
+		*b.dst = argv
+	}
+	return a, nil
+}
+
+// provisionGateService creates the socket volume, starts the service, waits
+// for readiness and bootstraps the least-privilege gate role. It returns
+// ("<step>: <detail>", false) on the first failing step. Readiness (#2137
+// approval condition 3): each iteration reads the service logs FIRST and runs
+// pg_isready only once the image's init-complete line was seen — the
+// temporary init server answers pg_isready before init completes — and the
+// service is ready only when pg_isready succeeds after that.
+func provisionGateService(ctx context.Context, a gateServiceArgv, root string, cliEnv []string) (string, bool) {
+	if out, code, _ := execGateAuxArgvFn(ctx, a.volumeCreate, root, cliEnv, gateServiceVolumeTimeout); code != 0 {
+		return fmt.Sprintf("volume create: exit %d: %s", code, gateOutputTail(out)), false
+	}
+	if out, code, _ := execGateAuxArgvFn(ctx, a.run, root, cliEnv, gateServiceStartTimeout); code != 0 {
+		return fmt.Sprintf("run: exit %d: %s", code, gateOutputTail(out)), false
+	}
+	deadline := time.Now().Add(gateServiceReadyTimeout)
+	initSeen, last := false, ""
+	for {
+		logs, code, _ := execGateAuxArgvFn(ctx, a.logs, root, cliEnv, gateServiceProbeTimeout)
+		if code == 0 && gateiso.PostgresInitComplete(logs) {
+			initSeen = true
+			out, rc, _ := execGateAuxArgvFn(ctx, a.ready, root, cliEnv, gateServiceProbeTimeout)
+			if rc == 0 {
+				break
+			}
+			last = out
+		}
+		if ctx.Err() != nil || !time.Now().Before(deadline) {
+			return fmt.Sprintf("readiness: not ready within %s (init-complete line seen: %t): %s",
+				gateServiceReadyTimeout, initSeen, gateOutputTail(last)), false
+		}
+		t := time.NewTimer(gateServiceReadyInterval)
+		select {
+		case <-ctx.Done():
+		case <-t.C:
+		}
+		t.Stop()
+	}
+	if out, code, _ := execGateAuxArgvFn(ctx, a.bootstrap, root, cliEnv, gateServiceBootstrapTimeout); code != 0 {
+		return fmt.Sprintf("bootstrap: exit %d: %s", code, gateOutputTail(out)), false
+	}
+	return "", true
+}
+
+// teardownGateService removes the service container (with its anonymous
+// volumes) and then the socket volume, on a detached context under the same
+// endpoint binding, each bounded by diffCoverageCleanupTimeout. A failure is
+// logged and never changes the gate's verdict; a leak stays removable by the
+// gateiso.ServiceLabel label.
+func teardownGateService(ctx context.Context, st *gateIsolationState, name string, a gateServiceArgv, root string, cliEnv []string) {
+	cleanupCtx := context.WithoutCancel(ctx)
+	var failed []string
+	for _, step := range []struct {
+		what string
+		argv []string
+	}{{"rm", a.remove}, {"volume rm", a.volumeRemove}} {
+		if out, code, _ := execGateAuxArgvFn(cleanupCtx, step.argv, root, cliEnv, diffCoverageCleanupTimeout); code != 0 {
+			failed = append(failed, fmt.Sprintf("%s: exit %d: %s", step.what, code, gateOutputTail(out)))
+		}
+	}
+	if len(failed) > 0 {
+		st.logEvent(`{"event":"gate_service_cleanup_failed","service":%q,"volume":%q,"detail":%q,"label":%q}`,
+			name, name, strings.Join(failed, "; "), gateiso.ServiceLabel)
+		return
+	}
+	st.logEvent(`{"event":"gate_service_removed","service":%q,"volume":%q}`, name, name)
+}
+
+// gateOutputTail bounds runtime CLI output carried into an error or log line.
+func gateOutputTail(out string) string {
+	const limit = 2048
+	out = strings.TrimSpace(out)
+	if len(out) > limit {
+		out = "…" + out[len(out)-limit:]
+	}
+	return out
 }
 
 // errGateIsolationRefused is joined (alongside gitops.ErrVerifyInfraFailure)
