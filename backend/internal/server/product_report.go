@@ -313,6 +313,11 @@ func (s *Server) handleFileProductReport(w http.ResponseWriter, r *http.Request)
 			"list audit failed", map[string]any{"error": err.Error()})
 		return
 	}
+	// The bundle is PUBLISHED into a forge issue, so the blind delegation
+	// shadow stamp is withheld before collection (E82.1 / #3778): a stamp is
+	// stage-tagged, so it would otherwise surface as the failing stage's
+	// failing_surface. The diagnostics read keeps it (operator debug surface).
+	auditEntries = withholdDelegationShadow(auditEntries, "")
 
 	// CollectWithWedge (not Collect): a product report's whole job is to
 	// describe WHY a run is stuck, so the auto-drafted body carries the

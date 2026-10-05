@@ -554,6 +554,14 @@ func (s *Server) handleListRunAudit(w http.ResponseWriter, r *http.Request) {
 		entries = filtered
 	}
 
+	// Blind delegation shadow stamp (E82.1 / #3778): withheld from every
+	// list read that does not name the category, BEFORE pagination so
+	// limit=N still returns N visible rows. The chain=true read stays
+	// complete for hash-chain verification.
+	if !chain {
+		entries = withholdDelegationShadow(entries, category)
+	}
+
 	page, nextCursor := pageOffset(entries, offset, limit)
 	items := make([]auditEntryResponse, 0, len(page))
 	for _, e := range page {
@@ -626,6 +634,12 @@ func (s *Server) handleListGlobalAudit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Blind delegation shadow stamp (E82.1 / #3778): withheld unless the
+	// request names the category, BEFORE pagination — this is the read
+	// fishhawk_get_run_status's recent_audit makes (run_id + limit), so a
+	// newest stamp must not cost it a visible row.
+	entries = withholdDelegationShadow(entries, q.Get("category"))
+
 	page, nextCursor := pageOffset(entries, offset, limit)
 
 	// Repo-scoped narrowing (ADR-057 Amendment A2 / #2071), applied AFTER the
@@ -656,6 +670,32 @@ func (s *Server) handleListGlobalAudit(w http.ResponseWriter, r *http.Request) {
 		"items":       items,
 		"next_cursor": nextCursor,
 	})
+}
+
+// withholdDelegationShadow drops `delegation_shadow_evaluated` entries
+// (E82.1 / #3778) unless requestedCategory names that category explicitly.
+// ADR-085 rule 4 requires the shadow stamp never be RENDERED to the deciding
+// human, so every general audit read that can reach a gate surface withholds
+// it; the explicit-category read is the E82 record's read path. This is not
+// access control — any read:audit caller may name the category. The
+// compliance export, the chain=true read and the diagnostics read do not
+// call this and stay complete (backend/internal/server/README.md § "Delegation
+// shadow stamp", read-side inventory).
+//
+// It returns a NEW slice and never filters in place: the input may be a
+// repository's shared backing array.
+func withholdDelegationShadow(entries []*audit.Entry, requestedCategory string) []*audit.Entry {
+	if requestedCategory == CategoryDelegationShadowEvaluated {
+		return entries
+	}
+	out := make([]*audit.Entry, 0, len(entries))
+	for _, e := range entries {
+		if e != nil && e.Category == CategoryDelegationShadowEvaluated {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
 }
 
 // auditEntryVisible decides ONE global-feed entry against a resolved repo

@@ -14216,6 +14216,16 @@ paths:
       description: |
         Cursor-paginated, sequence-ascending. Used by the run-detail UI
         and (eventually) the compliance export.
+
+        **Withheld category (E82.1 / #3778, ADR-085 rule 4).** Entries of
+        category `delegation_shadow_evaluated` (the record-only, blind
+        delegation shadow stamp) are OMITTED from every read that does not
+        name that category via `category=delegation_shadow_evaluated`. The
+        withholding is applied BEFORE pagination, so `limit=N` still returns
+        up to N visible entries and `next_cursor` walks the filtered set.
+        The `chain=true` read (hash-chain verification) and the compliance
+        export stay complete. This is not access control: any caller holding
+        `read:audit` may request the category explicitly.
       tags: [audit]
       parameters:
         - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
@@ -14230,6 +14240,8 @@ paths:
             than returning a permissive empty page that would silently arm
             an unsatisfiable `fishhawk_await_audit` wait for the full
             timeout. Pass `allow_unknown=true` to bypass the check.
+            `delegation_shadow_evaluated` entries are returned ONLY when this
+            parameter names that category (E82.1 / #3778).
         - name: allow_unknown
           in: query
           schema: { type: boolean, default: false }
@@ -14669,9 +14681,24 @@ paths:
         after paging, so a short page with a non-empty `next_cursor` is
         expected. Bearer / MCP identities and workspace admins see the feed
         unfiltered.
+
+        **Withheld category (E82.1 / #3778, ADR-085 rule 4).** Entries of
+        category `delegation_shadow_evaluated` (the record-only, blind
+        delegation shadow stamp) are OMITTED unless the request names that
+        category via `category=delegation_shadow_evaluated`. Unlike the repo
+        narrowing above, this withholding is applied BEFORE pagination, so
+        `limit=N` (e.g. `fishhawk_get_run_status`'s `run_id` + `limit`
+        recent-activity read) still returns up to N visible entries. This is
+        not access control.
       tags: [audit]
       parameters:
-        - { name: category, in: query, schema: { type: string } }
+        - name: category
+          in: query
+          schema: { type: string }
+          description: |
+            Optional. Filters the feed to entries of this audit category.
+            `delegation_shadow_evaluated` entries are returned ONLY when this
+            parameter names that category (E82.1 / #3778).
         - { name: run_id, in: query, schema: { $ref: '#/components/schemas/UUID' } }
         - { name: limit, in: query, schema: { type: integer, default: 100, maximum: 500 } }
         - name: cursor
