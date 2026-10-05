@@ -14,7 +14,7 @@ import (
 
 // The pin families. A family string is the finding SUBJECT, so a drift finding's
 // id is `toolchain_drift:<family>`, which the upkeep_report_v1 id pattern
-// (`^(flake|toolchain_drift|deprecation):[^\s<>]+$`) accepts for all three.
+// (`^(flake|toolchain_drift|deprecation|advisory):[^\s<>]+$`) accepts for all three.
 const (
 	// PinFamilyGo is the Go language version: the go.work / go.mod `go`
 	// directive, the root golangci config's run.go, and literal workflow

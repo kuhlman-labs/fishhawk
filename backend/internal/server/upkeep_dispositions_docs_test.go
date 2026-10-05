@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -247,5 +248,41 @@ func TestV0md_IssueContextSentenceNamesIssueAnchoredSources(t *testing.T) {
 	}
 	if anchored == 0 {
 		t.Fatal("run.IsIssueAnchored accepted no trigger source; the derivation is vacuous")
+	}
+}
+
+// TestOpenAPI_UpkeepDispositionsSourceEnumMatchesPlan derives the
+// upkeep-dispositions `source` enum from plan.UpkeepSources() (the Go-side
+// owner of the closed source set, itself pinned to the schema by
+// TestUpkeepSources_MatchSchemaEnum), so a source added to the report schema
+// (#3750 added `advisory`) cannot leave the API document stale. On failure,
+// update the `source` enum under UpkeepDispositions in docs/api/v0.openapi.yaml.
+func TestOpenAPI_UpkeepDispositionsSourceEnumMatchesPlan(t *testing.T) {
+	doc := readRepoDoc(t, upkeepDocsOpenAPI)
+	// No end marker ("\x00" never occurs): the schema is bounded by the line
+	// scan below, at the next 4-space-indented components.schemas key.
+	sec := upkeepDocSection(t, doc, upkeepDocsOpenAPI, "\n    UpkeepDispositions:\n", "\x00")
+	lines := strings.Split(sec, "\n")
+	for k, l := range lines {
+		if strings.HasPrefix(l, "    ") && len(l) > 4 && l[4] != ' ' {
+			lines = lines[:k]
+			break
+		}
+	}
+	sec = "\n" + strings.Join(lines, "\n")
+	const field = "\n              source:\n                type: string\n                enum: ["
+	i := strings.Index(sec, field)
+	if i < 0 {
+		t.Fatalf("%s UpkeepDispositions: cannot locate the dispositions `source` enum", upkeepDocsOpenAPI)
+	}
+	line := sec[i+len(field):]
+	line = line[:strings.Index(line, "]")]
+	var documented []string
+	for _, v := range strings.Split(line, ",") {
+		documented = append(documented, strings.TrimSpace(v))
+	}
+	want := plan.UpkeepSources()
+	if strings.Join(documented, ",") != strings.Join(want, ",") {
+		t.Errorf("%s UpkeepDispositions `source` enum = %v, want plan.UpkeepSources() = %v", upkeepDocsOpenAPI, documented, want)
 	}
 }
