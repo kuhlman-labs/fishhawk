@@ -1018,9 +1018,13 @@ The THIRD `plan` fork. A stage declaring `produces: upkeep_report` is still
 and id `<owner>/<repo>`, `sources_scanned` = what was actually scanned,
 `id = <source>:<subject>`, evidence refs copied VERBATIM from the facts, a
 single-file drift goes in `summary` only, `autonomy:*` labels apply only on
-captain authorization); a `### Deprecations` section (SA1019 / `Deprecated:`
-diagnostics and package-manager notices such as `go list -m -json`, read-only);
-`### Excluded: dependency bumps`; and the scan-worded copies of the optional
+captain authorization, a source that did not run is left out of
+`sources_scanned` AND named in `source_degrades`, the `advisory` source is
+accounted for in exactly one of the two); a `### Deprecations` section (SA1019 /
+`Deprecated:` diagnostics and package-manager notices such as
+`go list -m -json`, read-only); a `### Advisories` section (#3750, below);
+`### Excluded: dependency bumps`, scoped to the `flake`, `toolchain_drift` and
+`deprecation` sources (an advisory's remedy may be a bump); and the scan-worded copies of the optional
 operator channels (rejection feedback, schema failure, revision constraint +
 base, clarification answers), duplicated rather than extracted for the same
 golden reason as the grooming branch. The issue renders only through
@@ -1043,6 +1047,37 @@ the unquoted scalar. Three render caps, each disclosed by an omitted-count line:
 first line over the cap and every later one are dropped). `OmittedOccurrences`
 / `OmittedFlakes` let the gather report what it already dropped; the renderer
 adds its own cuts. Pinned in `upkeep_test.go`.
+
+**The `### Advisories` section (#3750).** `writeUpkeepAdvisories` renders the
+`advisory` source's instructions. The scan agent runs the scanners in its own
+worktree, READ-ONLY: `govulncheck -json ./...` in each directory holding a
+`go.mod` (the `go.work` `use` directories, plus the root when it has one),
+falling back to `go run <UpkeepGovulncheckModule> -json ./...` with the exported
+pin `golang.org/x/vuln/cmd/govulncheck@v1.7.0` (the version the
+`backend/internal/plan/testdata` fixtures were captured with; v1.8.0 needs
+go >= 1.26), and `pnpm audit --json` in each directory holding a
+`pnpm-lock.yaml` (never install or `--fix`; its non-zero exit on findings is
+not `tool_failed`). OSV is RESERVED in the schema and NOT instructed. The
+classification rules mirror the plan package's semantic rules (l)-(t) so a
+compliant report passes them: per OSV id the deepest finding level, its trace
+copied VERBATIM as `call_path` (index 0 kept, truncated past 32 frames);
+reachability from `call_path[0]`; a Go `package` is the MODULE path;
+`fixed_version` is ONE bare version (the lowest patched version on the in-use
+major line) or `null`, never a range; ONE finding per (primary id, package)
+citing EVERY manifest, `version` the lowest in-use, reachability and
+`call_path` from the strongest module; severity capped by reachability
+(`called` high unless clearly low impact, `imported`/`required` low, pnpm's
+`unanalyzed` at most medium); every manifest cited as a file ref. Degradation
+is NAMED: an unreachable advisory database or registry yields
+`source_degrades: [{advisory, network_unavailable}]` with `advisory` NOT in
+`sources_scanned`, a part-run lists it plus a `partial` degrade, and an empty
+clean advisory scan that never ran is forbidden. Disclosure: proposed-issue
+prose carries ids, package, versions, reachability and severity but never
+call-path frames, because the server renders the filed advisory issue from the
+structured advisory fields. Coverage: the agent reports an advisory even when a
+Dependabot PR already fixes it; the server marks it covered. The section
+renders only on the upkeep fork, so `buildPlan`'s golden is unchanged. Pinned
+per rule by `TestBuildUpkeepScan_Advisories`.
 
 ## Live-validation markers in the review prompt (#2978)
 
