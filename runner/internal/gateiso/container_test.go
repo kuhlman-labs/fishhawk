@@ -494,7 +494,7 @@ func TestContainerEnv_AllowListPinsExtras(t *testing.T) {
 	want := []string{
 		"TZ=UTC", "LANG=C.UTF-8", "TERM=xterm", "LC_ALL=C", "CGO_ENABLED=0", "GOFLAGS=-mod=mod",
 		"HOME=/tmp", "GOPATH=/tmp/gopath", "GOCACHE=/gocache", "GOMODCACHE=/gomodcache", "GOLANGCI_LINT_CACHE=/lintcache",
-		"GOTOOLCHAIN=local", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null",
+		"GOTOOLCHAIN=local", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null", "FISHHAWK_GATE_CONTAINER=1",
 		"FISHHAWK_VERIFY_LOCK_OWNER=runner", "GOPROXY=direct",
 	}
 	if !reflect.DeepEqual(got, want) {
@@ -519,5 +519,123 @@ func TestContainerEnv_DefaultsWithoutExtras(t *testing.T) {
 	}
 	if idx(got, "GOPROXY=off") < 0 {
 		t.Fatalf("GOPROXY=off pin missing: %q", got)
+	}
+}
+
+// TestContainerEnv_PinsGateContainerMarker: every container exec carries
+// FISHHAWK_GATE_CONTAINER=1, and a sanitized-env value cannot unset it (the
+// allow-list drops it; the pin re-appends).
+func TestContainerEnv_PinsGateContainerMarker(t *testing.T) {
+	got := ContainerEnv([]string{"FISHHAWK_GATE_CONTAINER=0", "GOFLAGS=x"}, nil)
+	if idx(got, "FISHHAWK_GATE_CONTAINER=1") < 0 || idx(got, "FISHHAWK_GATE_CONTAINER=0") >= 0 {
+		t.Fatalf("marker not pinned: %q", got)
+	}
+}
+
+// TestContainerEnv_ServiceEnvWinsOverExtras: WithServiceEnv applies the
+// provisioned DSN LAST, so an extras (or any earlier) value cannot redirect it.
+func TestContainerEnv_ServiceEnvWinsOverExtras(t *testing.T) {
+	svc := fixedService()
+	base := ContainerEnv(nil, []string{"FISHHAWK_TEST_PG_URL=postgres://attacker@evil/x", "GOFLAGS=y"})
+	got := WithServiceEnv(base, append(svc.GateEnv(), "NOEQUALS"))
+	n := 0
+	for _, kv := range got {
+		if strings.HasPrefix(kv, "FISHHAWK_TEST_PG_URL=") {
+			n++
+		}
+	}
+	if n != 1 || got[len(got)-1] != "FISHHAWK_TEST_PG_URL="+PostgresGateURL {
+		t.Fatalf("service DSN not applied last and alone: %q", got)
+	}
+	if idx(got, "NOEQUALS") >= 0 || idx(got, "GOFLAGS=y") < 0 {
+		t.Errorf("WithServiceEnv mangled the base env: %q", got)
+	}
+	if idx(base, "FISHHAWK_TEST_PG_URL="+PostgresGateURL) >= 0 {
+		t.Error("WithServiceEnv mutated its input")
+	}
+}
+
+// --- passwd + service mounts -------------------------------------------------
+
+func TestBuildArgv_ServiceMountAndPasswdReadOnly(t *testing.T) {
+	m := newMounts(t)
+	pw := filepath.Join(m.root, "passwd-1")
+	if err := os.WriteFile(pw, []byte("root:x:0:0::/:/bin/sh\n"), 0o444); err != nil {
+		t.Fatal(err)
+	}
+	spec := specFor(m, Runtime{Kind: KindDocker, Safe: true})
+	spec.PasswdFile = pw
+	spec.ServiceMounts = []ServiceMount{fixedService().GateMount()}
+	got, err := spec.BuildArgv(MountPolicy{Permitted: []string{m.root}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(got, " ")
+	want := "-v " + m.lint + ":/lintcache -v " + pw + ":/etc/passwd:ro -v fishhawk-gate-svc-0a1b2c3d4e5f:/pgsock:ro -e "
+	if !strings.Contains(joined, want) {
+		t.Fatalf("argv %q lacks %q", joined, want)
+	}
+	// Without the optional pieces the shape is the four-mount golden.
+	spec.PasswdFile, spec.ServiceMounts = "", nil
+	plain, _ := spec.BuildArgv(MountPolicy{Permitted: []string{m.root}})
+	if strings.Contains(strings.Join(plain, " "), ":ro") {
+		t.Errorf("read-only mounts emitted with none configured: %q", plain)
+	}
+}
+
+// TestBuildArgv_ServiceMountRefusesNonServiceVolume: a host path, the daemon
+// socket, a traversal, a near-miss name, a bad target or a writable mount is
+// refused with NO argv — without the check BuildArgv would emit e.g.
+// `-v /var/run:/pgsock:ro`.
+func TestBuildArgv_ServiceMountRefusesNonServiceVolume(t *testing.T) {
+	m := newMounts(t)
+	ok := fixedService().GateMount()
+	for _, sm := range []ServiceMount{
+		{Volume: "/var/run", Target: "/pgsock", ReadOnly: true},
+		{Volume: "/Users/x", Target: "/pgsock", ReadOnly: true},
+		{Volume: "docker.sock", Target: "/pgsock", ReadOnly: true},
+		{Volume: "../x", Target: "/pgsock", ReadOnly: true},
+		{Volume: "fishhawk-gate-svc-0A1B2C3D4E5F", Target: "/pgsock", ReadOnly: true},
+		{Volume: "fishhawk-gate-svc-0a1b2c3d4e5f:/x", Target: "/pgsock", ReadOnly: true},
+		{Volume: ok.Volume, Target: "pgsock", ReadOnly: true},
+		{Volume: ok.Volume, Target: "/pg/../sock", ReadOnly: true},
+		{Volume: ok.Volume, Target: "/", ReadOnly: true},
+		{Volume: ok.Volume, Target: "/pgsock", ReadOnly: false},
+	} {
+		spec := specFor(m, Runtime{Kind: KindDocker, Safe: true})
+		spec.ServiceMounts = []ServiceMount{ok, sm}
+		argv, err := spec.BuildArgv(MountPolicy{Permitted: []string{m.root}})
+		if err == nil || argv != nil {
+			t.Errorf("%+v: argv %q, err %v; want refusal and nil argv", sm, argv, err)
+		}
+		if strings.Contains(strings.Join(argv, " "), sm.Volume+":"+sm.Target) {
+			t.Errorf("%+v rendered", sm)
+		}
+	}
+}
+
+// TestBuildArgv_PasswdFileThroughMountGuard: the passwd file is a bind-mount
+// source like the checkout, so a symlink resolving outside the permitted
+// roots (or onto a socket) is refused.
+func TestBuildArgv_PasswdFileThroughMountGuard(t *testing.T) {
+	m := newMounts(t)
+	outside := shortTempDir(t)
+	target := filepath.Join(outside, "passwd")
+	if err := os.WriteFile(target, []byte("x\n"), 0o444); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(m.root, "passwd-link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	spec := specFor(m, Runtime{Kind: KindDocker, Safe: true})
+	spec.PasswdFile = link
+	argv, err := spec.BuildArgv(MountPolicy{Permitted: []string{m.root}})
+	if err == nil || argv != nil || !strings.Contains(err.Error(), "outside the permitted roots") {
+		t.Fatalf("argv %q, err %v; want the symlinked passwd file refused", argv, err)
+	}
+	spec.PasswdFile = listenUnix(t, m.root, "p.sock")
+	if argv, err := spec.BuildArgv(MountPolicy{Permitted: []string{m.root}}); err == nil || argv != nil {
+		t.Fatalf("socket passwd file accepted: %q", argv)
 	}
 }
