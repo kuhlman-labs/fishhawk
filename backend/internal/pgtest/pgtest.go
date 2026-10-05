@@ -31,6 +31,17 @@
 // When Docker is unreachable (isDockerUnavailable) the helpers Skip so devs
 // without Docker still pass the rest of the suite — preserving the old
 // per-package skip behavior at the shared level.
+//
+// External server (#2137). Inside the runner's --network=none gate container
+// there is no Docker daemon, so the runner provisions a Postgres service and
+// hands its unix-socket DSN in as FISHHAWK_TEST_PG_URL. When that variable is
+// set, resolveBase uses it as the shared base WITHOUT touching testcontainers,
+// still bootstraps the template, and routes EVERY failure to Fatalf — never a
+// Skip, because the runner promised a database and a skip would silently drop
+// the whole suite from the gate. With FISHHAWK_GATE_CONTAINER=1 and no URL the
+// helpers Fatalf with the runner-side remedy instead of attempting a
+// testcontainers start that cannot succeed. FISHHAWK_SKIP_INTEGRATION keeps
+// precedence over both.
 package pgtest
 
 import (
@@ -76,12 +87,21 @@ const (
 	contentionAttempts = 12
 	contentionDelay    = 250 * time.Millisecond
 	startTimeout       = 180 * time.Second
+
+	// externalURLEnv names the runner-provisioned server (#2137); see the
+	// package doc. gateContainerEnv is the marker the runner pins on every
+	// gate-container exec.
+	externalURLEnv   = "FISHHAWK_TEST_PG_URL"
+	gateContainerEnv = "FISHHAWK_GATE_CONTAINER"
 )
 
 var (
 	sharedOnce sync.Once
 	sharedBase string
 	sharedErr  error
+
+	externalOnce sync.Once
+	externalErr  error
 )
 
 // NewURL returns the connection URL of a freshly-migrated, per-test
@@ -89,8 +109,12 @@ var (
 // is dropped via t.Cleanup. Skips the test if Docker is unavailable.
 func NewURL(t *testing.T) string {
 	t.Helper()
-	baseURL := sharedBaseURL(t)
+	return newURLFrom(t, sharedBaseURL(t))
+}
 
+// newURLFrom creates the per-test database on the server behind baseURL.
+func newURLFrom(t *testing.T, baseURL string) string {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
@@ -142,18 +166,61 @@ func NewPool(t *testing.T) *pgxpool.Pool {
 }
 
 // sharedBaseURL returns the base (admin) connection URL of the shared
-// container, starting it on first use. Skips on Docker-unavailable or the
-// FISHHAWK_SKIP_INTEGRATION override; fatals on any other start failure.
+// server: the runner-provided FISHHAWK_TEST_PG_URL when set, otherwise the
+// shared container, started on first use. See resolveBase for the routing.
 func sharedBaseURL(t *testing.T) string {
 	t.Helper()
-	if os.Getenv("FISHHAWK_SKIP_INTEGRATION") != "" {
-		t.Skipf("FISHHAWK_SKIP_INTEGRATION set; skipping integration test")
+	return resolveBase(t, os.Getenv, sharedContainerBaseURL, bootstrapExternalOnce)
+}
+
+// resolveBase is the pure routing seam under sharedBaseURL (#2137). Order:
+//
+//  1. FISHHAWK_SKIP_INTEGRATION set: Skip (unchanged precedence).
+//  2. FISHHAWK_TEST_PG_URL set: bootstrap the template on that server and
+//     return it; start is NEVER called, and any error Fatalf's — never routed
+//     through failStart, whose Docker-unavailable markers would turn a broken
+//     provisioned server into a silent skip.
+//  3. FISHHAWK_GATE_CONTAINER=1 without a URL: Fatalf naming the runner-side
+//     remedy; start is never called (no daemon is reachable in there).
+//  4. Otherwise the shared testcontainers start, through failStart.
+//
+// Fake fatalers return from Skipf/Fatalf, so every terminal call is followed
+// by an explicit return.
+func resolveBase(tb fataler, getenv func(string) string, start func() (string, error), bootstrapExternal func(string) error) string {
+	tb.Helper()
+	if getenv("FISHHAWK_SKIP_INTEGRATION") != "" {
+		tb.Skipf("FISHHAWK_SKIP_INTEGRATION set; skipping integration test")
+		return ""
 	}
-	base, err := sharedContainerBaseURL()
+	if ext := getenv(externalURLEnv); ext != "" {
+		if err := bootstrapExternal(ext); err != nil {
+			tb.Fatalf("%s is set but the provided Postgres server is unusable (no testcontainers fallback, never skipped): %v", externalURLEnv, err)
+			return ""
+		}
+		return ext
+	}
+	if getenv(gateContainerEnv) == "1" {
+		tb.Fatalf("pgtest: inside the gate container (%s=1) with no provisioned Postgres (%s unset); "+
+			"set FISHHAWK_GATE_SERVICES=postgres on the runner so it provisions one (#2137)", gateContainerEnv, externalURLEnv)
+		return ""
+	}
+	base, err := start()
 	if err != nil {
-		failStart(t, err)
+		failStart(tb, err)
+		return ""
 	}
 	return base
+}
+
+// bootstrapExternalOnce bootstraps the template on the runner-provided server
+// once per process (the advisory lock serializes it across processes).
+func bootstrapExternalOnce(baseURL string) error {
+	externalOnce.Do(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), startTimeout)
+		defer cancel()
+		externalErr = bootstrapTemplate(ctx, baseURL)
+	})
+	return externalErr
 }
 
 func sharedContainerBaseURL() (string, error) {
