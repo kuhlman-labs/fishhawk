@@ -3245,6 +3245,47 @@ A marker match suppresses filing WITHOUT a provenance check. The title-similarit
 
 **Frontend handling.** The Web UI does not render any of this: `frontend/src/api/types.ts`'s `ArtifactKind` does not list `upkeep_report` (an unknown kind passes through `evidenceRefFor` as an opaque string, so nothing crashes), and the run narrative reads an allow-listed category set (`NARRATIVE_AUDIT_CATEGORIES` in `frontend/src/run-narrative/use-run-narrative.ts`), so the upkeep rows are never fetched. Rendering them is a follow-up for the operator to file.
 
+## In-flight advisory findings (`upkeep_inflight.go`, [#3763](https://github.com/kuhlman-labs/fishhawk/issues/3763), E80.6)
+
+After the captain approves an upkeep scan, every advisory finding the captain APPROVED is matched against the dependency changes of the repository's other RUNNING runs. A run whose own diff introduces an affected version gets ONE crew-message-v1 `finding` (sender `security`, recipient `reviewer`, anchored on that run, actor system `upkeep:advisory-watch`, no stage). E77.7's deferred delivery renders it in the run's next review round and in the gate view's `crew_messages` block. It is a crew_messages row, never a concern, so the merge gate is untouched (ADR-081 rule 2).
+
+**Trigger: after the captain, not at ingest (a decision; prior-run approval condition 1).** `applyApprovedUpkeep` calls `startUpkeepInflightPass` once the disposition window settles `approved`, after the settlement and before the filing-job resolution. The pass receives only the advisory findings whose consumed disposition is `approved`. A rejected gate, a contested or ungranted gate, an unsettled window and a finding the captain rejected or left undisposed start nothing. The `upkeep_report` ingest starts nothing, so unratified scanner output never reaches another run. The call is detached: the apply's latency and outcome are unchanged. A re-apply of the same settled window runs the pass again, and the chain dedupe below sends nothing new (`TestApplyApprovedUpkeep_StartsInflightPassForApprovedAdvisories`).
+
+**Run selection.** `RunRepo.ListRuns{Repo, AccountID, State: running}`, paged 100, at most `upkeepInflightMaxRuns` (50) runs, with `runs_window_truncated` set at the cap. `run.State` is only pending, running or terminal; gate parking lives on STAGE states, so a run parked at a plan, review or merge gate is `running` and IS examined (the pg test's run A is parked at `awaiting_approval`). The scan run is excluded silently. A decomposition child is skipped (its parent owns the PR and the gate). `upkeepRunOwnershipRefusal` is the account control, because the listing keeps NULL-account rows.
+
+**Diff source.** The base is `cfg.DocumentBaseRef(repo)`. The head is `latestRunHeadSHA`. The diff is the forge compare `base...head`, which is merge-base anchored, so only the run's OWN manifest edits count. For every changed `go.mod` / `pnpm-lock.yaml` (not `removed`) in a directory an approved advisory of that ecosystem cites, the pass reads its patch section (`upkeep.SplitComparePatch`) and its content at the head COMMIT (never the branch name), and calls `upkeep.DependencyChanges`. No other manifest is fetched. The match rules (net-add only, inside a `require` directive, same version line, below the fix) live in `backend/internal/upkeep/README.md` § "In-flight advisory match".
+
+**Dedupe.** A match is skipped as `already_sent` when the TARGET run's CHAIN (`crew_message_sent` entries, never the derived table) holds a `security`-sent `finding` whose summary equals `upkeep.InFlightFindingSummary`, which is keyed on primary advisory id + ecosystem + package. The sender filter is what makes planting impossible. **`crewSenderRoleForStage` (`server/crewmessage.go`) derives a run-bound token's sender role from its stage through an allow-list of `planner` (plan) and `reviewer` (review) only, so no run token can send as `security`; operators send as `captain`.** Only fishhawkd sends as `security`, so an agent cannot suppress a finding by planting its summary (`TestUpkeepInflight_DedupeIgnoresNonSecuritySender`). A `*crewmessage.ProjectionError` counts as SENT, because the entry committed and is never re-sent.
+
+**Bounded wait.** Passes serialize on `upkeepInflightSlot`, a one-slot semaphore acquired via `select` on the pass context. The 60s `upkeepInflightBudget` clock starts at the CALL SITE, so a queued pass spends its own budget waiting and then degrades `pass_busy` instead of blocking. Every summary row, degrades included, is appended on a FRESH `upkeepInflightRowBudget` context derived from `context.WithoutCancel`, never on the possibly-expired pass context. Shutdown drains `bgUpkeepInflight`.
+
+| `degrade_reason` | When | Test |
+|---|---|---|
+| `pass_busy` | another pass held the slot for this pass's whole budget | `TestUpkeepInflight_QueuedPassDegradesBusyWithinItsBudget` |
+| `report_unreadable` | no `upkeep_report_recorded` row names the artifact | `TestUpkeepInflight_Degrades/report_unreadable` |
+| `scan_run_unreadable` | the scan run row cannot be read | `…/scan_run_unreadable` |
+| `base_ref_unavailable` | no resolver, a resolver error, an empty ref, or a malformed repo | `…/base_ref_*` |
+| `run_list_failed` | the run listing errored | `…/run_list_failed` |
+| `budget_exceeded` | the pass budget expired (sent work kept) | `TestUpkeepInflight_BudgetExceededRowSurvivesExpiredContext` |
+| `pass_panic` | a panic was recovered | `…/pass_panic` |
+
+| `skipped_runs` key | When |
+|---|---|
+| `decomposition_child` | `DecomposedFrom != nil` |
+| `ownership_refused` | foreign repo or foreign account |
+| `head_read_failed` / `no_head` | the head read errored / no head recorded |
+| `forge_unavailable` / `compare_failed` | no comparer or file reader / the compare errored |
+| `patch_unavailable` | a cited manifest changed but its patch body is absent (an oversized diff) |
+| `manifest_fetch_failed` / `manifest_too_large` / `manifest_unparseable` | the head read failed / exceeds `upkeepInflightMaxManifestBytes` (4 MiB) / `DependencyChanges` errored |
+| `dedupe_read_failed` | the target chain could not be read or decoded (fail toward NOT sending) |
+| `send_failed` | `Send` errored (counted per failed match) |
+
+Each skip has a `TestUpkeepInflight_SkipReasons/…` case and a WARN log naming both run ids.
+
+**Summary row.** ONE `upkeep_inflight_pass_completed` row per started pass on the scan run (stage = the scan's plan stage, actor system): `{artifact_id, advisory_findings, base_ref, runs_listed, runs_examined, runs_window_truncated, sent:[{run_id, finding_id, advisory_id, sent_sequence}], already_sent:[{run_id, finding_id, advisory_id}], skipped_runs:{reason: n}, degraded, degrade_reason}`. Arrays and the map are never null. A pass is not started, and no row is written, when the mailbox, audit or run repository is unwired or no approved advisory finding exists. INTERNAL and audit-only, not an issue-comment surface.
+
+**Residuals.** Passes serialize per process only, so two replicas approving at the same instant could double-send (the `upkeepIngestMu` residual). A crash mid-pass loses the rest of that pass, and the next scan's approval re-covers it. A run on a non-default base is compared against the default branch (#3902). A run whose last review already settled sees the finding only in the gate view until a fix-up re-review. A later re-bump of the same advisory to another affected version is not re-sent (the dedupe key has no version). Cross-boundary: `upkeep_inflight_pg_test.go` (real audit, run, artifact repositories and a real `crewmessage.Mailbox`, driven through `applyApprovedUpkeep`).
+
 ## Human-executor review-gate admission (`review_gate_admission.go`, E54.53 / [#3041](https://github.com/kuhlman-labs/fishhawk/issues/3041))
 
 ADR-018 (#311, #313) moved review-stage approval onto GitHub, and `handleSubmitApproval` implemented that by refusing EVERY `type: review` stage with `409 review_stage_managed_by_github`. That is correct for `feature_change` and `routine_change`, whose review stages ARE the PR merge gate. It is wrong for `backlog_grooming`'s `confirm` stage — `executor: human`, `approvals: {count: 1, not: [agent]}`, no `pull_request` input — which had no approvable surface ANYWHERE, so a grooming run could be started but never finished and parked in `running` indefinitely (run `1499bdb0`).

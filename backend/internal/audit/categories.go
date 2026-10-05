@@ -264,6 +264,10 @@ import "sort"
 // INTERNAL, NOT an issue-comment activity category — like the other upkeep
 // rows it is read through GET /v0/runs/{id}/audit only
 // (docs/issue-comment-surfaces.md is untouched).
+// #3763 (E80.6) added upkeep_inflight_pass_completed: the in-flight advisory
+// pass's ONE summary row on the scan run (sent / already_sent / per-run skip
+// counts, or degraded:true with a named degrade_reason). INTERNAL, audit-only,
+// NOT an issue-comment activity category, like the other upkeep rows.
 // E82.2 / #3779 (ADR-085 rules 3 and 6) added the two post-merge OUTCOME fact
 // records written by backend/internal/mergeoutcome under the system actor
 // "merge-outcome-observer": run_merge_reverted (a default-branch push whose
@@ -533,6 +537,7 @@ var KnownCategories = map[string]struct{}{
 	"upkeep_disposition_recorded":             {}, // #3921: the captain disposed an upkeep finding (writer: #3923)
 	"upkeep_finding_filed":                    {}, // #3921: the upkeep apply filed a finding's issue (writer: #3924)
 	"upkeep_finding_skipped":                  {}, // #3921: the upkeep apply skipped a finding (writer: #3924)
+	"upkeep_inflight_pass_completed":          {}, // #3763: the in-flight advisory pass's one summary row on the scan run (sent/already_sent/skips, or a named degrade)
 	"upkeep_report_recorded":                  {}, // #3921: one per ingested upkeep_report artifact
 	"verified_tree_discarded":                 {},
 	"work_item_filed":                         {},
