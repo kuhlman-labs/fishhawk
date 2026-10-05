@@ -1136,6 +1136,12 @@ type Server struct {
 	// bounded by the shutdown context.
 	bgUpkeepApply sync.WaitGroup
 
+	// bgUpkeepInflight tracks the DETACHED in-flight advisory pass (#3763):
+	// applyApprovedUpkeep starts it once the capture window settles
+	// `approved`, under its own call-site-clocked budget. Shutdown drains it
+	// alongside bgUpkeepApply, bounded by the shutdown context.
+	bgUpkeepInflight sync.WaitGroup
+
 	// bgBranchSweeps tracks the DETACHED cancel-path run-branch sweep
 	// (E68.67 / #3562): handleCancelRun writes its response first and runs
 	// the forge round-trips on a goroutine in this group under a bounded
@@ -1505,6 +1511,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		s.bgReviews.Wait()
 		s.bgGroomingApply.Wait()
 		s.bgUpkeepApply.Wait()
+		s.bgUpkeepInflight.Wait()
 		s.bgBranchSweeps.Wait()
 		close(done)
 	}()
@@ -1533,6 +1540,11 @@ func (s *Server) waitGroomingApply() { s.bgGroomingApply.Wait() }
 // the audit rows and filings the detached loop produces. Production code never
 // calls it (Shutdown drains the same group, bounded by its context).
 func (s *Server) waitUpkeepApply() { s.bgUpkeepApply.Wait() }
+
+// waitUpkeepInflight blocks until every detached in-flight advisory pass
+// (#3763) has finished — the test sync point. Production code never calls it
+// (Shutdown drains the same group, bounded by its context).
+func (s *Server) waitUpkeepInflight() { s.bgUpkeepInflight.Wait() }
 
 // waitBranchSweeps blocks until every detached cancel-path run-branch sweep
 // (E68.67 / #3562) has finished — the deterministic sync point tests use to

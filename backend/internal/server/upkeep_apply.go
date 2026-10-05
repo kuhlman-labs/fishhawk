@@ -376,6 +376,11 @@ func (s *Server) applyApprovedUpkeep(ctx context.Context, stage *run.Stage, deci
 		return
 	}
 
+	// The in-flight advisory pass (#3763) for the advisory findings the
+	// captain APPROVED in this settled window: started detached, so the
+	// apply's latency and outcome are unchanged.
+	s.startUpkeepInflightPass(base, stage.RunID, stage.ID, artifactID, b.report, consumed)
+
 	job, reason, detail := s.resolveUpkeepFilingJob(ctx, stage, b, consumed, sink)
 	if reason != "" {
 		s.degradeUpkeepApplyPrelaunch(ctx, sink, artifactID, reason, detail)
