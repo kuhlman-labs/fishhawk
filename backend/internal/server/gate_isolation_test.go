@@ -122,6 +122,60 @@ func TestTraceUpload_RecordsGateIsolation(t *testing.T) {
 	}
 }
 
+// TestTraceUpload_GateIsolationDeclaredPayload (E51.3 / #2136, approval
+// condition 5) pins the bundle-to-audit serialization boundary for the
+// gate_container members of the shared golden: the gate_isolation_recorded
+// payload carries image_digest (container_declared), build_context_digest
+// (container_build) and declared_unhonored (fallback_declared_unhonored) as
+// top-level wire keys with the runner's exact values. It reads the RAW payload
+// keys, not the decoded struct, so a field dropped by the embed or renamed on
+// the wire fails here.
+func TestTraceUpload_GateIsolationDeclaredPayload(t *testing.T) {
+	cases := []struct {
+		member string
+		keys   []string
+	}{
+		{"container_declared", []string{"image_source", "image_digest", "image_id", "policy_warning"}},
+		{"container_build", []string{"image_source", "image_id", "build_dockerfile", "build_context", "build_context_digest", "distinct_images_count"}},
+		{"fallback_declared_unhonored", []string{"image_source", "declared_unhonored"}},
+	}
+	for _, c := range cases {
+		t.Run(c.member, func(t *testing.T) {
+			s, sf, _, au := newTraceServer(t)
+			runID, stageID := uuid.New(), uuid.New()
+			priv, _ := sf.issue(t, runID)
+			body := gateIsolationBundle(t, nil, isolationOnlyEvidence(t, c.member))
+			if w := shipRequest(t, s, runID, stageID, "raw", priv, body, ""); w.Code != http.StatusAccepted {
+				t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+			}
+			rows := gateIsolationRows(au)
+			if len(rows) != 1 {
+				t.Fatalf("gate_isolation_recorded rows = %d, want 1", len(rows))
+			}
+			var got, want map[string]json.RawMessage
+			if err := json.Unmarshal(rows[0].Payload, &got); err != nil {
+				t.Fatalf("decode payload: %v", err)
+			}
+			if err := json.Unmarshal(gateIsolationGolden(t, c.member), &want); err != nil {
+				t.Fatalf("decode golden: %v", err)
+			}
+			for _, k := range c.keys {
+				if len(want[k]) == 0 {
+					t.Fatalf("golden member %s lacks %q — the fixture no longer exercises it", c.member, k)
+				}
+				if !bytes.Equal(got[k], want[k]) {
+					t.Errorf("payload %s = %s, want %s", k, got[k], want[k])
+				}
+			}
+			for k, v := range want {
+				if !bytes.Equal(got[k], v) {
+					t.Errorf("payload %s = %s, want the golden's %s", k, got[k], v)
+				}
+			}
+		})
+	}
+}
+
 // TestTraceUpload_GateIsolationRawVariantOnly pins the raw-variant guard: a
 // REDACTED upload of an evidence-bearing bundle records nothing. The redacted
 // POST is the only upload, so the dedup cannot mask a hoisted call.

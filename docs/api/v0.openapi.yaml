@@ -19216,6 +19216,41 @@ paths:
                           the RUNNER resolves at measurement time
                           (`--base-branch` > `GITHUB_REF_NAME` > `main`); an
                           empty ref never reaches git.
+                  gate_container:
+                    type: object
+                    required: [source]
+                    description: |
+                      The stage's effective workflow-v2 `gate_container`
+                      declaration (E51.3 / #2136): the container image every
+                      gate command of the stage (verify, `diff_coverage`, the
+                      auto-format absorb) runs in. Exactly one source — `image`,
+                      OR `dockerfile` + `context` — plus `source`, the level
+                      that declared it. Resolved by stage IDENTITY (the k-th
+                      runtime stage of a type maps to the k-th spec stage of
+                      that type, so repeated same-type stages each get their
+                      own block) after `extends` / `defaults` reuse is
+                      resolved. Precedence: the stage's block, else the
+                      workflow's. The runner applies the image policy, pull
+                      and build, with the operator's `FISHHAWK_GATE_IMAGE` and
+                      the clone-sandbox / clone fallback below both. Absent
+                      when neither level declares one or the cached spec
+                      cannot be read — byte-identical to before #2136. When
+                      the stage cannot be mapped onto its spec stage, the
+                      workflow-level block is served (absent if none).
+                    properties:
+                      image:
+                        type: string
+                        description: Registry image reference, digest-pinned (`name@sha256:<64 hex>`) or tag-only. Present only for an image source.
+                      dockerfile:
+                        type: string
+                        description: Repository-relative path of the Dockerfile for an in-repo build. Present only for a build source, always with `context`.
+                      context:
+                        type: string
+                        description: Repository-relative build context directory for an in-repo build. Present only for a build source, always with `dockerfile`.
+                      source:
+                        type: string
+                        enum: [stage, workflow]
+                        description: Which level declared the block — the stage's own `gate_container` or the workflow-level one.
                   implement_model:
                     type: string
                     description: |
@@ -19760,6 +19795,41 @@ paths:
                           the RUNNER resolves at measurement time
                           (`--base-branch` > `GITHUB_REF_NAME` > `main`); an
                           empty ref never reaches git.
+                  gate_container:
+                    type: object
+                    required: [source]
+                    description: |
+                      The stage's effective workflow-v2 `gate_container`
+                      declaration (E51.3 / #2136): the container image every
+                      gate command of the stage (verify, `diff_coverage`, the
+                      auto-format absorb) runs in. Exactly one source — `image`,
+                      OR `dockerfile` + `context` — plus `source`, the level
+                      that declared it. Resolved by stage IDENTITY (the k-th
+                      runtime stage of a type maps to the k-th spec stage of
+                      that type, so repeated same-type stages each get their
+                      own block) after `extends` / `defaults` reuse is
+                      resolved. Precedence: the stage's block, else the
+                      workflow's. The runner applies the image policy, pull
+                      and build, with the operator's `FISHHAWK_GATE_IMAGE` and
+                      the clone-sandbox / clone fallback below both. Absent
+                      when neither level declares one or the cached spec
+                      cannot be read — byte-identical to before #2136. When
+                      the stage cannot be mapped onto its spec stage, the
+                      workflow-level block is served (absent if none).
+                    properties:
+                      image:
+                        type: string
+                        description: Registry image reference, digest-pinned (`name@sha256:<64 hex>`) or tag-only. Present only for an image source.
+                      dockerfile:
+                        type: string
+                        description: Repository-relative path of the Dockerfile for an in-repo build. Present only for a build source, always with `context`.
+                      context:
+                        type: string
+                        description: Repository-relative build context directory for an in-repo build. Present only for a build source, always with `dockerfile`.
+                      source:
+                        type: string
+                        enum: [stage, workflow]
+                        description: Which level declared the block — the stage's own `gate_container` or the workflow-level one.
                   implement_model:
                     type: string
                     description: Backend-resolved implement model id (#1013), echoed on implement stages so the runner pins the agent spawn to it (`--model <implement_model>`). Resolved through the implement-model ladder (operator gate decision < plan `model_recommendation.implement_model` < spec `executor.model` < deployment default). Absent when no rung supplied a model — the runner leaves the model unset and the agent spawns on the adapter's built-in default, byte-identical to today.

@@ -192,6 +192,10 @@
             "$ref": "#/$defs/escalation"
           }
         },
+        "gate_container": {
+          "$ref": "#/$defs/gate_container",
+          "description": "WORKFLOW-LEVEL gate container (E51.3 / #2136): the container image every gate command of every stage of this workflow runs in, unless a stage declares its own `gate_container` (the stage block wins). Precedence: stage > workflow > the runner's FISHHAWK_GATE_IMAGE > the clone-sandbox / clone fallback. NOT inherited through `extends` (which folds stages only) and NOT a `defaults` key. See docs/spec/workflow-v2.md § 'Gate container (gate_container)'."
+        },
         "extends": {
           "type": "string",
           "pattern": "^[a-z][a-z0-9_]*$",
@@ -353,8 +357,78 @@
         },
         "concurrency": {
           "$ref": "#/$defs/stage_concurrency"
+        },
+        "gate_container": {
+          "$ref": "#/$defs/gate_container",
+          "description": "PER-STAGE gate container override (E51.3 / #2136): replaces the workflow-level `gate_container` for this stage's gate commands. Resolved by stage IDENTITY, so two stages of one type may declare different images. Under `extends`, a deriving stage that names a source (image, or dockerfile + context) REPLACES the base stage's source rather than blending with it. See docs/spec/workflow-v2.md § 'Gate container (gate_container)'."
         }
       }
+    },
+    "gate_container": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "The container a stage's gate commands (verify, diff_coverage, the auto-format absorb) run in (E51.3 / #2136; ADR-063). Exactly ONE source: a registry `image`, OR an in-repo build declared as `dockerfile` + `context` together. Declarable at workflow level and per stage; precedence is stage > workflow > the runner's FISHHAWK_GATE_IMAGE > the clone-sandbox / clone fallback. The runner applies a per-profile image policy (digest pinning, an operator allowlist, in-repo builds closed down) before anything runs; a declaration the runner cannot honour runs the fallback with a warning in local / self-hosted and is refused in hosted. The key `services` is RESERVED for daemon-dependent gates (#2137) and is rejected today by additionalProperties. See docs/spec/workflow-v2.md § 'Gate container (gate_container)'.",
+      "properties": {
+        "image": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._/:-]*(@sha256:[a-f0-9]{64})?$",
+          "description": "A registry image reference, optionally digest-pinned (`ghcr.io/org/gate@sha256:<64 hex>`). The image must be PULLABLE from a registry: a local-only image belongs in `dockerfile` + `context` or the operator's FISHHAWK_GATE_IMAGE. A tag-only reference warns in local / self-hosted and is refused in hosted. Mutually exclusive with `dockerfile` / `context`."
+        },
+        "dockerfile": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "pattern": "^[A-Za-z0-9._][A-Za-z0-9._/-]*$",
+          "not": {
+            "pattern": "(^|/)\\.\\.(/|$)"
+          },
+          "description": "Repository-relative path of the Dockerfile an in-repo gate image is built from: no leading `/`, no `..` segment. Requires `context`; mutually exclusive with `image`."
+        },
+        "context": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "pattern": "^[A-Za-z0-9._][A-Za-z0-9._/-]*$",
+          "not": {
+            "pattern": "(^|/)\\.\\.(/|$)"
+          },
+          "description": "Repository-relative build-context directory for `dockerfile` (`.` is the repository root): no leading `/`, no `..` segment. A narrow context keeps the content-digest build cache warm. Requires `dockerfile`; mutually exclusive with `image`."
+        }
+      },
+      "oneOf": [
+        {
+          "required": [
+            "image"
+          ],
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "dockerfile"
+                ]
+              },
+              {
+                "required": [
+                  "context"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "required": [
+            "dockerfile",
+            "context"
+          ],
+          "not": {
+            "required": [
+              "image"
+            ]
+          }
+        }
+      ]
     },
     "stage_concurrency": {
       "type": "object",

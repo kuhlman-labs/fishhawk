@@ -1,0 +1,14 @@
+id: scenario:issue-2136/runner-refuses-bad-allowlist-entry
+statement: The runner exits with its usage exit code before contacting the backend, naming the entry on stderr, when FISHHAWK_GATE_IMAGE_ALLOWLIST contains a single-component bare name (`alpine`), a tag-bearing entry (`ghcr.io/org/gate:main`) or a wildcard.
+verify_hint: CLI exit code and stderr of `bin/fishhawk-runner` started with the variable set (decided by TestRun_GateIsolationConfigErrorsExitUsage's allowlist row).
+steps: 'Built fishhawk-runner from the sanctioned checkout. Ran FISHHAWK_GATE_IMAGE_ALLOWLIST=<v> fishhawk-runner --run-id 11111111-2222-3333-4444-555555555555 --backend-url http://127.0.0.1:1 --workflow feature_change --stage plan for v=alpine, ghcr.io/org/gate:main and ghcr.io/org/*. Control: v=ghcr.io/org/gate. Also ran TestRun_GateIsolationConfigErrorsExitUsage.'
+assertions:
+    expected: usage exit before backend contact naming the entry
+    observed_at_record: 'The three bad values each exit 2 with runner_failed reason=config naming the entry: ''a bare name is ambiguous'', ''a tag is mutable and cannot be allowlisted'' and ''wildcards are not supported''. None reaches the forge_writes_healthz_probe. The control logs gate_isolation_configured allowlist_entries=1 and proceeds to the probe. The test''s bad_image_allowlist row passes.'
+    repro_handle: FISHHAWK_GATE_IMAGE_ALLOWLIST=alpine fishhawk-runner --run-id 11111111-2222-3333-4444-555555555555 --backend-url http://127.0.0.1:1 --workflow feature_change --stage plan
+origin:
+    issue: 2136
+    pr: 0
+    run_id: 1aa1daac-161b-4163-a94e-fff4a01c897a
+    head_sha: e507d08288bd2ab948c51cdf242b1ca4f1489ba7
+    recorded_at: 2026-10-06T08:21:54Z

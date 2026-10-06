@@ -8457,3 +8457,166 @@ workflows:
 		t.Errorf("SchemaError = %q: %q, want /defaults refusing 'concurrency'", se.Path, se.Message)
 	}
 }
+
+// gateContainerPinned is a digest-pinned image reference used by the
+// gate_container rows (E51.3 / #2136).
+const gateContainerPinned = "ghcr.io/org/gate@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+// gateContainerDoc renders a v2 document whose workflow carries wfBody and
+// whose single implement stage carries stageBody as `gate_container:` YAML
+// (each already indented under its key). An empty body omits that key.
+func gateContainerDoc(version, wfBody, stageBody string) string {
+	doc := "version: \"" + version + "\"\nworkflows:\n  wf:\n"
+	if wfBody != "" {
+		doc += "    gate_container:" + wfBody + "\n"
+	}
+	doc += `    stages:
+      - id: apply
+        type: implement
+        executor:
+          agent: claude-code
+`
+	if stageBody != "" {
+		doc += "        gate_container:" + stageBody + "\n"
+	}
+	return doc
+}
+
+// TestParseV2_GateContainer pins the $defs/gate_container schema (E51.3 /
+// #2136): the two accepted source shapes survive ParseBytes' strict typed
+// decode at both levels, and each malformed block is refused with a
+// *SchemaError at the gate_container path. Every reject row violates ONE
+// rule, so its RED under a deleted schema clause is attributable to it.
+func TestParseV2_GateContainer(t *testing.T) {
+	parsed, err := spec.ParseBytes([]byte(gateContainerDoc("2", "\n      image: "+gateContainerPinned, "")))
+	if err != nil {
+		t.Fatalf("ParseBytes (workflow image): %v", err)
+	}
+	wf := parsed.Workflows["wf"]
+	if wf.GateContainer == nil || *wf.GateContainer != (spec.GateContainer{Image: gateContainerPinned}) {
+		t.Fatalf("Workflow.GateContainer = %+v, want {Image: %s}", wf.GateContainer, gateContainerPinned)
+	}
+	if wf.Stages[0].GateContainer != nil {
+		t.Errorf("Stage.GateContainer = %+v, want nil when only the workflow declares one", wf.Stages[0].GateContainer)
+	}
+
+	parsed, err = spec.ParseBytes([]byte(gateContainerDoc("2", "", "\n          dockerfile: build/gate/Dockerfile\n          context: build/gate")))
+	if err != nil {
+		t.Fatalf("ParseBytes (stage build): %v", err)
+	}
+	got := parsed.Workflows["wf"].Stages[0].GateContainer
+	want := spec.GateContainer{Dockerfile: "build/gate/Dockerfile", Context: "build/gate"}
+	if got == nil || *got != want {
+		t.Fatalf("Stage.GateContainer = %+v, want %+v", got, want)
+	}
+
+	accepted := []struct{ name, body string }{
+		{name: "tag_only_image", body: "\n          image: ghcr.io/org/gate:1.2"},
+		{name: "bare_image", body: "\n          image: alpine"},
+		{name: "context_repo_root", body: "\n          dockerfile: Dockerfile\n          context: ."},
+		{name: "dotted_names_not_parent", body: "\n          dockerfile: .gate/...Dockerfile\n          context: ./.gate"},
+	}
+	for _, tc := range accepted {
+		t.Run("accepts_"+tc.name, func(t *testing.T) {
+			if _, err := spec.ParseBytes([]byte(gateContainerDoc("2", "", tc.body))); err != nil {
+				t.Fatalf("ParseBytes: %v, want the block accepted", err)
+			}
+		})
+	}
+
+	const base = "/workflows/wf/stages/0/gate_container"
+	rejected := []struct{ name, body, wantPath string }{
+		{name: "image_and_build", body: "\n          image: " + gateContainerPinned + "\n          dockerfile: Dockerfile\n          context: .", wantPath: base},
+		{name: "image_and_dockerfile", body: "\n          image: " + gateContainerPinned + "\n          dockerfile: Dockerfile", wantPath: base},
+		{name: "image_and_context", body: "\n          image: " + gateContainerPinned + "\n          context: .", wantPath: base},
+		{name: "dockerfile_without_context", body: "\n          dockerfile: Dockerfile", wantPath: base},
+		{name: "context_without_dockerfile", body: "\n          context: .", wantPath: base},
+		{name: "empty_block", body: " {}", wantPath: base},
+		{name: "dockerfile_parent_prefix", body: "\n          dockerfile: ../x/Dockerfile\n          context: .", wantPath: base + "/dockerfile"},
+		{name: "dockerfile_parent_inner", body: "\n          dockerfile: a/../b\n          context: .", wantPath: base + "/dockerfile"},
+		{name: "dockerfile_parent_bare", body: "\n          dockerfile: ..\n          context: .", wantPath: base + "/dockerfile"},
+		{name: "dockerfile_absolute", body: "\n          dockerfile: /abs/Dockerfile\n          context: .", wantPath: base + "/dockerfile"},
+		{name: "context_parent_suffix", body: "\n          dockerfile: Dockerfile\n          context: a/..", wantPath: base + "/context"},
+		{name: "context_absolute", body: "\n          dockerfile: Dockerfile\n          context: /srv", wantPath: base + "/context"},
+		{name: "image_empty", body: "\n          image: ''", wantPath: base + "/image"},
+		{name: "image_not_string", body: "\n          image: 7", wantPath: base + "/image"},
+		{name: "image_short_digest", body: "\n          image: ghcr.io/org/gate@sha256:abc", wantPath: base + "/image"},
+		{name: "image_too_long", body: "\n          image: " + strings.Repeat("a", 513), wantPath: base + "/image"},
+		{name: "services_reserved", body: "\n          image: " + gateContainerPinned + "\n          services: [postgres]", wantPath: base},
+	}
+	for _, tc := range rejected {
+		t.Run("rejects_"+tc.name, func(t *testing.T) {
+			_, err := spec.ParseBytes([]byte(gateContainerDoc("2", "", tc.body)))
+			var se *spec.SchemaError
+			if !errors.As(err, &se) {
+				t.Fatalf("err = %T %v, want *spec.SchemaError", err, err)
+			}
+			if se.Path != tc.wantPath {
+				t.Errorf("SchemaError.Path = %q, want %q (msg: %s)", se.Path, tc.wantPath, se.Message)
+			}
+		})
+	}
+
+	// The workflow level carries the same $ref: a two-source block there is
+	// refused at its own path.
+	t.Run("rejects_workflow_level_two_sources", func(t *testing.T) {
+		_, err := spec.ParseBytes([]byte(gateContainerDoc("2", "\n      image: alpine\n      dockerfile: Dockerfile\n      context: .", "")))
+		var se *spec.SchemaError
+		if !errors.As(err, &se) || se.Path != "/workflows/wf/gate_container" {
+			t.Fatalf("err = %T %v, want *spec.SchemaError at /workflows/wf/gate_container", err, err)
+		}
+	})
+
+	// v0 and v1 are frozen: their additionalProperties:false keeps refusing
+	// the key at both levels.
+	// The plain document parses at each version (positive control), so each
+	// refusal is attributable to the key alone.
+	for _, version := range []string{"1.0", "0.7"} {
+		t.Run("rejects_below_major_2_"+version, func(t *testing.T) {
+			if _, err := spec.ParseBytes([]byte(gateContainerDoc(version, "", ""))); err != nil {
+				t.Fatalf("ParseBytes (no gate_container): %v, want the plain document accepted", err)
+			}
+			for _, doc := range []string{
+				gateContainerDoc(version, "", "\n          image: alpine"),
+				gateContainerDoc(version, "\n      image: alpine", ""),
+			} {
+				_, err := spec.ParseBytes([]byte(doc))
+				var se *spec.SchemaError
+				if !errors.As(err, &se) || !strings.Contains(se.Message, "'gate_container' not allowed") {
+					t.Errorf("err = %T %v, want a SchemaError refusing 'gate_container' below major 2", err, err)
+				}
+			}
+		})
+	}
+}
+
+// TestEffectiveGateContainer pins the precedence the backend echoes on the
+// prompt wire (E51.3 / #2136): stage beats workflow, workflow when the stage
+// is silent, nil when neither declares one.
+func TestEffectiveGateContainer(t *testing.T) {
+	wfBlock := &spec.GateContainer{Image: "ghcr.io/org/wf@sha256:" + strings.Repeat("a", 64)}
+	stBlock := &spec.GateContainer{Dockerfile: "Dockerfile", Context: "."}
+	cases := []struct {
+		name       string
+		wf         spec.Workflow
+		st         spec.Stage
+		want       *spec.GateContainer
+		wantSource string
+	}{
+		{name: "stage_beats_workflow", wf: spec.Workflow{GateContainer: wfBlock}, st: spec.Stage{GateContainer: stBlock}, want: stBlock, wantSource: spec.GateContainerSourceStage},
+		{name: "stage_only", st: spec.Stage{GateContainer: stBlock}, want: stBlock, wantSource: "stage"},
+		{name: "workflow_when_stage_silent", wf: spec.Workflow{GateContainer: wfBlock}, want: wfBlock, wantSource: spec.GateContainerSourceWorkflow},
+		{name: "neither", want: nil, wantSource: ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, source := spec.EffectiveGateContainer(tc.wf, tc.st)
+			if got != tc.want || source != tc.wantSource {
+				t.Errorf("EffectiveGateContainer = (%+v, %q), want (%+v, %q)", got, source, tc.want, tc.wantSource)
+			}
+		})
+	}
+	if spec.GateContainerSourceWorkflow != "workflow" {
+		t.Errorf("GateContainerSourceWorkflow = %q, want the wire value \"workflow\"", spec.GateContainerSourceWorkflow)
+	}
+}

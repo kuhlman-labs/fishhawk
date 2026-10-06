@@ -82,6 +82,20 @@ type promptResponse struct {
 	// config, runs nothing, emits no evidence — and the gate reports nothing
 	// wrong because it never ran.
 	DiffCoverage *diffCoverageConfig `json:"diff_coverage,omitempty"`
+	// GateContainer is the stage's effective workflow-v2 `gate_container`
+	// declaration (E51.3 / #2136): the stage's own block (source "stage"),
+	// else the workflow's (source "workflow"), resolved by stage IDENTITY
+	// (resolveGateContainerConfig). Nil — the key omitted, byte-identical to
+	// before — when neither declares one or the spec cannot be read; the
+	// runner then applies FISHHAWK_GATE_IMAGE and its fallback as today.
+	//
+	// CROSS-MODULE WIRE CONTRACT: the json tags MUST stay byte-identical to
+	// the runner's upload.FetchedPrompt.GateContainer / GateContainerConfig
+	// (runner/internal/upload/upload.go) — the gate_container_config
+	// ModeExact pair in backend/internal/wirecontract, plus the shared golden
+	// testdata/wire/gate_container_prompt.json. A tag drift silently drops
+	// the declaration: the runner decodes nil and runs the operator's image.
+	GateContainer *gateContainerConfig `json:"gate_container,omitempty"`
 	// MinRunnerVersion is the minimum runner version the backend requires.
 	// Runners that are older than this should exit with a version-skew error
 	// rather than proceeding to invoke the agent.
@@ -1841,6 +1855,7 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		VerifyMaxIterations:  verifyMaxIterations,
 		ForgeWrites:          s.forgeWritesPolicy(),
 		DiffCoverage:         s.resolveDiffCoverageConfig(r.Context(), runRow, stage.Type),
+		GateContainer:        s.resolveGateContainerConfig(r.Context(), runRow, stage),
 		MinRunnerVersion:     version.MinRunnerVersion,
 		AgentVersionRange:    s.resolveExecutorAgentVersionRange(r.Context(), runRow, stage.Type),
 		AgentSelfRetry:       s.resolveAgentSelfRetryForStage(r.Context(), runRow, stage.Type),
@@ -2538,6 +2553,7 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		VerifyMaxIterations:  verifyMaxIterations,
 		ForgeWrites:          s.forgeWritesPolicy(),
 		DiffCoverage:         s.resolveDiffCoverageConfig(r.Context(), runRow, stage.Type),
+		GateContainer:        s.resolveGateContainerConfig(r.Context(), runRow, stage),
 		MinRunnerVersion:     version.MinRunnerVersion,
 		AgentVersionRange:    s.resolveExecutorAgentVersionRange(r.Context(), runRow, stage.Type),
 		AgentSelfRetry:       s.resolveAgentSelfRetryForStage(r.Context(), runRow, stage.Type),
@@ -3626,6 +3642,108 @@ func (s *Server) resolveDiffCoverageConfig(ctx context.Context, runRow *run.Run,
 		break
 	}
 	return out
+}
+
+// gateContainerConfig is the prompt-response shape of a stage's effective
+// workflow-v2 `gate_container` declaration (E51.3 / #2136): exactly one
+// source — Image, OR Dockerfile + Context — plus Source, which names the
+// level that declared it ("stage" or "workflow", spec.GateContainerSource*).
+// The runner owns the image policy, pull and build; this is an echo of the
+// declaration, never a decision.
+//
+// CROSS-MODULE WIRE CONTRACT: the json tags (names AND options) MUST stay
+// byte-identical to the runner's upload.GateContainerConfig
+// (runner/internal/upload/upload.go). Pinned by the gate_container_config
+// ModeExact pair in backend/internal/wirecontract and by the shared golden
+// testdata/wire/gate_container_prompt.json, which this package's emit test
+// and the runner's decode test both read.
+type gateContainerConfig struct {
+	Image      string `json:"image,omitempty"`
+	Dockerfile string `json:"dockerfile,omitempty"`
+	Context    string `json:"context,omitempty"`
+	Source     string `json:"source"`
+}
+
+// resolveGateContainerConfig returns the stage's effective `gate_container`
+// declaration (E51.3 / #2136), threaded to the runner as
+// promptResponse.gate_container.
+//
+// The spec stage is resolved by IDENTITY via specStageForRunStage (the type
+// ordinal: the k-th runtime row of a type is the k-th spec stage of that
+// type), never first-of-type — two stages of one type may declare different
+// images, and the plan-filtered retry/recovery children renumber Sequence.
+// `extends` / v2 reuse is already resolved by spec.ParseBytes, so a deriving
+// workflow's stage carries its merged block here.
+//
+// ListStagesForRun is called ONLY when the workflow or one of its stages
+// declares gate_container, so an ordinary workflow pays one spec parse and
+// never lists stages.
+//
+// Degradations: a nil spec, a parse failure, a missing workflow, or a
+// workflow declaring nothing return nil (the key omitted, byte-identical).
+// A stage-list error or a stage that cannot be mapped onto its spec stage
+// degrades to the WORKFLOW-level block (nil when the workflow declares none)
+// with a warn log: the workflow's declaration still binds every stage that
+// does not override it, and the runner's hosted profile refuses rather than
+// falls back when a declared image cannot be honoured.
+func (s *Server) resolveGateContainerConfig(ctx context.Context, runRow *run.Run, stage *run.Stage) *gateContainerConfig {
+	if runRow == nil || runRow.WorkflowSpec == nil || stage == nil {
+		return nil
+	}
+	parsed, err := spec.ParseBytes(runRow.WorkflowSpec)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: parse workflow spec for gate_container config",
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("error", err.Error()),
+		)
+		return nil
+	}
+	wf, ok := parsed.Workflows[runRow.WorkflowID]
+	if !ok {
+		return nil
+	}
+	declared := wf.GateContainer != nil
+	for _, st := range wf.Stages {
+		if st.GateContainer != nil {
+			declared = true
+			break
+		}
+	}
+	if !declared {
+		return nil
+	}
+	workflowLevel := func(reason string, attrs ...slog.Attr) *gateContainerConfig {
+		attrs = append([]slog.Attr{
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("stage_id", stage.ID.String()),
+			slog.String("stage_type", string(stage.Type)),
+		}, attrs...)
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "prompt: gate_container "+reason+"; degrading to the workflow-level declaration", attrs...)
+		return toGateContainerConfig(spec.EffectiveGateContainer(wf, spec.Stage{}))
+	}
+	rows, err := s.cfg.RunRepo.ListStagesForRun(ctx, runRow.ID)
+	if err != nil {
+		return workflowLevel("list run stages failed", slog.String("error", err.Error()))
+	}
+	specStage, mapped := specStageForRunStage(wf, rows, stage)
+	if !mapped {
+		return workflowLevel("stage has no spec stage at its type ordinal")
+	}
+	return toGateContainerConfig(spec.EffectiveGateContainer(wf, specStage))
+}
+
+// toGateContainerConfig converts spec.EffectiveGateContainer's result into
+// the wire shape; a nil block is nil.
+func toGateContainerConfig(gc *spec.GateContainer, source string) *gateContainerConfig {
+	if gc == nil {
+		return nil
+	}
+	return &gateContainerConfig{
+		Image:      gc.Image,
+		Dockerfile: gc.Dockerfile,
+		Context:    gc.Context,
+		Source:     source,
+	}
 }
 
 // resolveExecutorAgentVersionRange returns the stage executor's spec-declared

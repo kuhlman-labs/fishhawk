@@ -2664,6 +2664,94 @@ func TestFetchPrompt_DiffCoverageOmittedWhenAbsent(t *testing.T) {
 	}
 }
 
+// gateContainerGolden reads the SHARED cross-module golden
+// testdata/wire/gate_container_prompt.json (E51.3 / #2136) — the SAME file the
+// backend's TestGetStagePrompt_GateContainerMatchesSharedGolden asserts the
+// real /prompt handler's gate_container bytes against. Fails closed.
+func gateContainerGolden(t *testing.T) map[string]json.RawMessage {
+	t.Helper()
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	b, err := os.ReadFile(filepath.Join(filepath.Dir(thisFile), "..", "..", "..", "testdata", "wire", "gate_container_prompt.json"))
+	if err != nil {
+		t.Fatalf("read shared gate_container golden: %v", err)
+	}
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(b, &members); err != nil {
+		t.Fatalf("decode shared gate_container golden: %v", err)
+	}
+	return members
+}
+
+// TestFetchPrompt_DecodesGateContainerSharedGolden pins the DECODE side of the
+// gate_container contract (E51.3 / #2136): each shared-golden member, served as
+// the prompt's gate_container, decodes into GateContainerConfig with every
+// field populated as the backend emitted it, and re-marshals BYTE-EQUAL to the
+// member. A tag rename here loses the field on decode (re-marshal differs); a
+// rename on the backend reddens the backend's emit test against the same bytes.
+func TestFetchPrompt_DecodesGateContainerSharedGolden(t *testing.T) {
+	golden := gateContainerGolden(t)
+	want := map[string]GateContainerConfig{
+		"stage_image": {
+			Image:  "ghcr.io/kuhlman-labs/fishhawk-gate@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+			Source: "stage",
+		},
+		"workflow_build": {Dockerfile: "build/gate/Dockerfile", Context: "build/gate", Source: "workflow"},
+	}
+	if len(golden) != len(want) {
+		t.Fatalf("golden members = %d, want %d (a member without a decode case is unpinned)", len(golden), len(want))
+	}
+	for member, wantCfg := range want {
+		t.Run(member, func(t *testing.T) {
+			raw, ok := golden[member]
+			if !ok {
+				t.Fatalf("golden has no member %q", member)
+			}
+			fb, srv := newFakeBackend(t)
+			priv, _ := makeKey(t, fb)
+			fb.promptBody = `{"stage_id":"stage-abc","stage_type":"implement","prompt":"p","prompt_hash":"h","gate_container":` + string(raw) + `}`
+			got, err := quickClient(srv).FetchPrompt(context.Background(), FetchPromptArgs{StageID: "stage-abc", PrivateKey: priv})
+			if err != nil {
+				t.Fatalf("FetchPrompt: %v", err)
+			}
+			if got.GateContainer == nil {
+				t.Fatal("GateContainer = nil — the backend's json field names did not decode; the declared image would be silently ignored")
+			}
+			if *got.GateContainer != wantCfg {
+				t.Fatalf("GateContainer = %+v, want %+v", *got.GateContainer, wantCfg)
+			}
+			reenc, err := json.Marshal(got.GateContainer)
+			if err != nil {
+				t.Fatalf("re-marshal: %v", err)
+			}
+			var compact bytes.Buffer
+			if err := json.Compact(&compact, raw); err != nil {
+				t.Fatalf("compact golden member: %v", err)
+			}
+			if !bytes.Equal(reenc, compact.Bytes()) {
+				t.Fatalf("re-marshalled GateContainer = %s\nwant shared golden %s", reenc, compact.Bytes())
+			}
+		})
+	}
+}
+
+// TestFetchPrompt_GateContainerOmittedWhenAbsent confirms GateContainer
+// decodes to nil when the backend omits the key — every workflow declaring no
+// gate_container — so the runner keeps FISHHAWK_GATE_IMAGE and its fallback.
+func TestFetchPrompt_GateContainerOmittedWhenAbsent(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	priv, _ := makeKey(t, fb)
+	got, err := quickClient(srv).FetchPrompt(context.Background(), FetchPromptArgs{StageID: "stage-abc", PrivateKey: priv})
+	if err != nil {
+		t.Fatalf("FetchPrompt: %v", err)
+	}
+	if got.GateContainer != nil {
+		t.Errorf("GateContainer = %+v, want nil when absent", got.GateContainer)
+	}
+}
+
 // TestShipPullRequest_ScopeParkGoldenBytes pins BOTH park wire shapes as GOLDEN
 // BYTES (#2501). The scope-only case is the regression guard: adding the
 // omitempty tag to MissingPaths plus a new UnsatisfiedAssertions field must

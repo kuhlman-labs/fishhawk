@@ -1430,3 +1430,149 @@ workflows:
 		t.Errorf("reviewers.agents = %+v, want exactly the workflow rung's [codex]", rev.Agents)
 	}
 }
+
+// gateContainerReuseDoc renders a base/derived pair whose base stage
+// declares baseBlock and whose deriving stage (same id) declares ownBlock as
+// `gate_container:` YAML; an empty ownBlock leaves the deriving stage silent.
+// The base WORKFLOW also declares a workflow-level block, which must NOT be
+// inherited (E51.3 / #2136).
+func gateContainerReuseDoc(baseBlock, ownBlock string) string {
+	doc := `
+version: "2"
+workflows:
+  base:
+    gate_container:
+      image: ghcr.io/org/base-workflow:1
+    stages:
+      - id: apply
+        type: implement
+        executor:
+          agent: claude-code
+        gate_container:` + baseBlock + `
+  derived:
+    extends: base
+    stages:
+      - id: apply
+        type: implement
+`
+	if ownBlock != "" {
+		doc += "        gate_container:" + ownBlock + "\n"
+	}
+	return doc
+}
+
+// TestResolveV2Reuse_GateContainerSourceRule pins mergeStage's SOURCE rule
+// for `gate_container` (E51.3 / #2136). The base and deriving blocks name
+// DIFFERENT sources in the first row — the only case the rule changes: a
+// plain key-wise merge would blend {image, dockerfile, context}, which the
+// schema's oneOf rejects, so deleting the rule turns that row's ParseBytes
+// into a SchemaError.
+func TestResolveV2Reuse_GateContainerSourceRule(t *testing.T) {
+	const imageA = "\n          image: ghcr.io/org/a@sha256:" + "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+	t.Run("build source replaces base image", func(t *testing.T) {
+		s := mustParseV2(t, gateContainerReuseDoc(imageA, "\n          dockerfile: gate/Dockerfile\n          context: gate"))
+		got := s.Workflows["derived"].Stages[0].GateContainer
+		want := GateContainer{Dockerfile: "gate/Dockerfile", Context: "gate"}
+		if got == nil || *got != want {
+			t.Fatalf("derived stage gate_container = %+v, want exactly the deriving source %+v", got, want)
+		}
+	})
+
+	t.Run("deriving image replaces base image", func(t *testing.T) {
+		s := mustParseV2(t, gateContainerReuseDoc(imageA, "\n          image: ghcr.io/org/b:2"))
+		got := s.Workflows["derived"].Stages[0].GateContainer
+		if got == nil || *got != (GateContainer{Image: "ghcr.io/org/b:2"}) {
+			t.Fatalf("derived stage gate_container = %+v, want {Image: ghcr.io/org/b:2}", got)
+		}
+	})
+
+	t.Run("deriving image replaces base build", func(t *testing.T) {
+		s := mustParseV2(t, gateContainerReuseDoc("\n          dockerfile: Dockerfile\n          context: .", "\n          image: ghcr.io/org/b:2"))
+		got := s.Workflows["derived"].Stages[0].GateContainer
+		if got == nil || *got != (GateContainer{Image: "ghcr.io/org/b:2"}) {
+			t.Fatalf("derived stage gate_container = %+v, want {Image: ghcr.io/org/b:2} with no base build keys", got)
+		}
+	})
+
+	t.Run("silent deriving stage inherits the base block", func(t *testing.T) {
+		s := mustParseV2(t, gateContainerReuseDoc(imageA, ""))
+		got := s.Workflows["derived"].Stages[0].GateContainer
+		if got == nil || got.Image != "ghcr.io/org/a@sha256:"+strings.Repeat("a", 64) || got.Dockerfile != "" {
+			t.Fatalf("derived stage gate_container = %+v, want the base stage's image block", got)
+		}
+	})
+
+	t.Run("workflow-level block is not inherited through extends", func(t *testing.T) {
+		s := mustParseV2(t, gateContainerReuseDoc(imageA, ""))
+		if gc := s.Workflows["base"].GateContainer; gc == nil || gc.Image != "ghcr.io/org/base-workflow:1" {
+			t.Fatalf("base workflow gate_container = %+v, want its own declaration (positive control)", gc)
+		}
+		if gc := s.Workflows["derived"].GateContainer; gc != nil {
+			t.Errorf("derived workflow gate_container = %+v, want nil: workflow-level keys are not inherited", gc)
+		}
+	})
+
+	t.Run("present-null deriving block is preserved for the schema", func(t *testing.T) {
+		err := parseV2Err(t, gateContainerReuseDoc(imageA, " null"))
+		var se *SchemaError
+		if !errors.As(err, &se) || se.Path != "/workflows/derived/stages/0/gate_container" {
+			t.Fatalf("err = %T %v, want a SchemaError at the deriving stage's gate_container", err, err)
+		}
+	})
+
+	t.Run("not a defaults key", func(t *testing.T) {
+		err := parseV2Err(t, `
+version: "2"
+defaults:
+  gate_container:
+    image: alpine
+workflows:
+  wf:
+    stages:
+      - id: apply
+        type: implement
+        executor:
+          agent: claude-code
+`)
+		var se *SchemaError
+		if !errors.As(err, &se) || se.Path != "/defaults" || !strings.Contains(se.Message, "'gate_container' not allowed") {
+			t.Fatalf("err = %T %v, want /defaults refusing 'gate_container'", err, err)
+		}
+	})
+}
+
+// TestMergeGateContainer_Branches covers the branches the schema keeps a
+// document from reaching: a deriving block naming NO source key merges
+// key-wise (the shape a future `services` key, #2137, takes), and a
+// non-object side falls through to mergeKeyWise for the schema to report.
+func TestMergeGateContainer_Branches(t *testing.T) {
+	base := map[string]any{"image": "a", "services": []any{"x"}}
+
+	got, _ := mergeGateContainer(base, map[string]any{"services": []any{"y"}}).(map[string]any)
+	if got["image"] != "a" {
+		t.Errorf("no-source deriving block: image = %v, want the base source kept", got["image"])
+	}
+	if svc, _ := got["services"].([]any); len(svc) != 1 || svc[0] != "y" {
+		t.Errorf("no-source deriving block: services = %v, want the deriving value", got["services"])
+	}
+
+	got, _ = mergeGateContainer(base, map[string]any{"dockerfile": "D", "context": "."}).(map[string]any)
+	if _, kept := got["image"]; kept {
+		t.Errorf("source-bearing deriving block: %v, want the base image dropped", got)
+	}
+	if svc, _ := got["services"].([]any); len(svc) != 1 || svc[0] != "x" {
+		t.Errorf("source-bearing deriving block: services = %v, want the base non-source key merged", got["services"])
+	}
+	if base["image"] != "a" {
+		t.Errorf("base block mutated: %v", base)
+	}
+
+	if v := mergeGateContainer(base, "oops"); v != "oops" {
+		t.Errorf("non-object deriving side = %v, want it to win for the schema to report", v)
+	}
+	over := map[string]any{"image": "b"}
+	if v, _ := mergeGateContainer("oops", over).(map[string]any); v["image"] != "b" {
+		t.Errorf("non-object base side = %v, want the deriving block", v)
+	}
+}

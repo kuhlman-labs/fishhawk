@@ -85,7 +85,7 @@ const (
 func SeedManifest() Manifest {
 	return Manifest{
 		Pairs: []Pair{
-			// ---- Six ModeExact leaf pairs (round-trip both ways) ----
+			// ---- ModeExact leaf pairs (round-trip both ways) ----
 			{
 				Name: "scope_file", Anchor: "#824",
 				Emitter:  Endpoint{File: promptFile, Type: "scopeFile"},
@@ -108,6 +108,16 @@ func SeedManifest() Manifest {
 				Name: "diff_coverage_config", Anchor: "#1888",
 				Emitter:  Endpoint{File: promptFile, Type: "diffCoverageConfig"},
 				Consumer: Endpoint{File: uploadFile, Type: "DiffCoverageConfig"},
+				Mode:     ModeExact,
+			},
+			{
+				// The stage's effective gate_container declaration (E51.3 /
+				// #2136). ModeExact: a flat leaf, and the member bytes are
+				// ALSO pinned by the shared golden
+				// testdata/wire/gate_container_prompt.json.
+				Name: "gate_container_config", Anchor: "#2136",
+				Emitter:  Endpoint{File: promptFile, Type: "gateContainerConfig"},
+				Consumer: Endpoint{File: uploadFile, Type: "GateContainerConfig"},
 				Mode:     ModeExact,
 			},
 			{

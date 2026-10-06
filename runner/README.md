@@ -217,13 +217,14 @@ where the execution PATH is chosen. The pure pieces live in
 [`runner/internal/gateiso`](internal/gateiso/README.md) (the long-form
 contract); `cmd/fishhawk-runner/gateisolation.go` is the runner-side glue.
 
-**Five startup variables.** `FISHHAWK_GATE_ISOLATION` (`auto` default |
+**Seven startup variables.** `FISHHAWK_GATE_ISOLATION` (`auto` default |
 `container` | `clone-sandbox` | `clone`), `FISHHAWK_GATE_IMAGE` (empty default
 — the container path is unavailable without it, so a default runner's
 behaviour is unchanged except for the clone materialization below; for this
 repository the recommended value is the digest-pinned in-repo `fishhawk-gate`
-image, `deploy/gate-image/README.md` (E51.17 / #3966), later declared via
-#2136's gate field — **set it for this repository ONLY together with
+image, `deploy/gate-image/README.md` (E51.17 / #3966); a project can instead
+declare its gate image in the spec through workflow-v2 `gate_container`
+(E51.3 / #2136, below), which beats this variable — **set it for this repository ONLY together with
 `FISHHAWK_GATE_SERVICES=postgres`, and only after the operator walk below is
 green**: without the service, `auto` prefers the container path, where
 `pgtest` fails closed with no database and every verify is red),
@@ -231,11 +232,15 @@ green**: without the service, `auto` prefers the container path, where
 services the container path provisions beside each gate exec,
 [#2137](https://github.com/kuhlman-labs/fishhawk/issues/2137); ignored with a
 `gate_services_ignored` log line on every other path; the future spec mapping
-is #2136's workflow-v2 `gate_container.services`),
+is the reserved workflow-v2 `gate_container.services` key),
 `FISHHAWK_GATE_POSTGRES_IMAGE` (default `postgres:16-alpine`; pin it by
-DIGEST) and
-`FISHHAWK_DEPLOYMENT_PROFILE` (`local` default | `self-hosted` | `hosted`). A
-bad value (an unknown `FISHHAWK_GATE_SERVICES` member included), or `hosted`
+DIGEST),
+`FISHHAWK_DEPLOYMENT_PROFILE` (`local` default | `self-hosted` | `hosted`),
+`FISHHAWK_GATE_IMAGE_ALLOWLIST` (empty default; the operator image allowlist a
+declared `gate_container` image and every base of a declared build must pass)
+and `FISHHAWK_GATE_BUILD` (`allow` | `deny`; empty = the profile default,
+`hosted` deny). A
+bad value (an unknown `FISHHAWK_GATE_SERVICES` member or allowlist entry included), or `hosted`
 with an explicit fallback mode, fails the runner with
 `runner_failed reason=config` before it contacts the backend; a valid config
 logs `gate_isolation_configured`, and the first gate exec logs
@@ -252,6 +257,28 @@ inputs, the detected runtime (endpoint raw value and socket path excluded) and
 never from a stream event; it is absent when no gate reached the seam (plan
 stages, the working-tree verify gate), leaving the payload byte-identical.
 Contract: `internal/gateiso/README.md` § "Evidence (#2135)".
+
+**Declared gate image (E51.3 / [#2136](https://github.com/kuhlman-labs/fishhawk/issues/2136)).**
+A workflow-v2 `gate_container` (`{image}` or `{dockerfile, context}`, stage
+beats workflow) arrives on the fetched prompt and `run()` declares it before
+any gate. Precedence: stage > workflow > `FISHHAWK_GATE_IMAGE` > the
+clone-sandbox / clone fallback. `EvaluateImagePolicy` applies the per-profile
+rules (a tag-only ref warns in `local` / `self-hosted` and is refused in
+`hosted`; `hosted` refuses every declared image or build while the allowlist
+is empty; builds are denied by default in `hosted`). The container path then
+pulls the image (10-minute bound, the runtime CLI's own credential store) and
+runs it by `name@<registry digest>`, or builds the COMMITTED context at the
+gate's head SHA with `--network=none` after a static, deny-by-default
+Dockerfile guard, cached by a git-derived content digest. A policy, source or
+Dockerfile refusal is `gateRefused`; a pull, inspect, digest or build failure
+is `gateUnavailable` — both category C, neither reaches the fix agent, and
+neither falls back to `FISHHAWK_GATE_IMAGE`. A declaration the selected path
+cannot honour runs the host fallback in `local` / `self-hosted` with a
+`gate_container_unhonored` log line and a `declared_unhonored` evidence marker;
+`hosted` refuses. The `gate_isolation` evidence gains the image source, the
+final deciding gate's digest / image id / build context digest, and
+`distinct_images_count`. Contract: `internal/gateiso/README.md` § "Declared
+gate image".
 
 **The four paths.** `container` (a safe LOCAL docker/podman daemon + an image:
 `--network=none --cap-drop=ALL --security-opt=no-new-privileges --entrypoint ''`,

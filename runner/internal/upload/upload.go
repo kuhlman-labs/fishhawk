@@ -620,6 +620,21 @@ type FetchedPrompt struct {
 	// eliminate, so the decode side is pinned by a test feeding the
 	// BACKEND's literal json field names.
 	DiffCoverage *DiffCoverageConfig `json:"diff_coverage,omitempty"`
+	// GateContainer is the stage's effective workflow-v2 `gate_container`
+	// declaration (E51.3 / #2136) as the backend resolved it by stage
+	// identity: the stage's own block (source "stage") or the workflow's
+	// (source "workflow"). Nil when neither declares one — the runner then
+	// applies FISHHAWK_GATE_IMAGE and its fallback exactly as before. The
+	// runner, not the backend, applies the image policy, pull and build.
+	//
+	// CROSS-MODULE WIRE CONTRACT: the json tags MUST stay byte-identical to
+	// the backend's promptResponse.GateContainer / gateContainerConfig
+	// (backend/internal/server/prompt.go) — the gate_container_config
+	// ModeExact pair in backend/internal/wirecontract, plus the shared golden
+	// testdata/wire/gate_container_prompt.json both modules' tests read. A
+	// drift decodes nil and silently runs the operator's image instead of
+	// the declared one.
+	GateContainer *GateContainerConfig `json:"gate_container,omitempty"`
 	// MinRunnerVersion is the minimum runner version the backend requires.
 	// Non-empty only when the backend is a release build. The runner compares
 	// this against its own version and exits with exitVersionSkew when it is
@@ -1087,6 +1102,25 @@ type DiffCoverageConfig struct {
 	Format             string `json:"format,omitempty"`
 	MinNewLineCoverage int    `json:"min_new_line_coverage"`
 	BaseRef            string `json:"base_ref,omitempty"`
+}
+
+// GateContainerConfig is a stage's effective workflow-v2 `gate_container`
+// declaration (E51.3 / #2136) as the backend echoes it: exactly one source —
+// Image, OR Dockerfile + Context (repository-relative) — plus Source, the
+// level that declared it ("stage" or "workflow"). The backend's schema
+// enforces the exactly-one-source rule and the path shape; the runner's
+// gateiso image policy re-checks the request before any pull or build.
+//
+// CROSS-MODULE WIRE CONTRACT: the json tags (names AND options) MUST stay
+// byte-identical to the backend's gateContainerConfig
+// (backend/internal/server/prompt.go) — the gate_container_config ModeExact
+// pair in backend/internal/wirecontract, plus the shared golden
+// testdata/wire/gate_container_prompt.json.
+type GateContainerConfig struct {
+	Image      string `json:"image,omitempty"`
+	Dockerfile string `json:"dockerfile,omitempty"`
+	Context    string `json:"context,omitempty"`
+	Source     string `json:"source"`
 }
 
 // FetchPrompt calls GET /v0/stages/{stage_id}/prompt with an

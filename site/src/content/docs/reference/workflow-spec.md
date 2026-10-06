@@ -178,6 +178,7 @@ One test-location convention: a production file whose repo-relative path matches
 | `actions` | `action_matrix` | optional |  |  |
 | `decomposition` | `decomposition` | optional |  |  |
 | `escalations` | array of `escalation` | optional | minItems: `1` | Per-path escalation rules (E53.4 / #2227): each entry RAISES the requirements that apply to a change matching its predicate. An escalation may only ever raise — a declared value that does not exceed the workflow's baseline, or that composes to the baseline unchanged, is a VALIDATION ERROR rather than a silently accepted no-op, so an operator reading the block can trust that every entry does something. When several entries match one change the composition is the STRICTEST per dimension and therefore ORDER-INDEPENDENT (max count, sorted de-duplicated UNION of member_of as a conjunction, strictest min_permission, lowest max_autonomy) — never last-match-wins. `max_autonomy` is a CEILING on AGENT autonomy (equivalently a floor on human involvement), applied LAST over the fully resolved action matrix, after the workflow tier and after every explicit `actions` override, so an explicit `actions: {merge: {mode: auto}}` cannot re-widen past it. NOT inherited through `extends` (which folds stages only), matching `applies_to`. See docs/spec/workflow-v2.md § 'Escalations'. |
+| `gate_container` | `gate_container` | optional |  | WORKFLOW-LEVEL gate container (E51.3 / #2136): the container image every gate command of every stage of this workflow runs in, unless a stage declares its own `gate_container` (the stage block wins). Precedence: stage > workflow > the runner's FISHHAWK_GATE_IMAGE > the clone-sandbox / clone fallback. NOT inherited through `extends` (which folds stages only) and NOT a `defaults` key. See docs/spec/workflow-v2.md § 'Gate container (gate_container)'. |
 | `extends` | string | optional | pattern: `^[a-z][a-z0-9_]*$` | SAME-DOCUMENT inheritance (E52.4 / #2216): names another workflow key in this document as this workflow's base. The base's resolved stages are inherited in their declared ORDER; a stage this workflow declares with a matching `id` merges onto the base stage IN THE BASE'S POSITION, and a stage with a new id is appended in declaration order (reordering is deliberately not expressible). Chains resolve transitively. An `extends` naming a workflow this document does not define, and an `extends` cycle (including a self-reference), are both rejected before schema validation with a message naming the offender. Resolution runs BEFORE schema validation, so a deriving workflow may omit `stages` entirely and still satisfy this definition's required list. Cross-FILE inclusion (`include:`) is deliberately out of scope (ADR-067). |
 | `defaults` | object | optional |  | WORKFLOW-LEVEL reuse defaults (E52.4 / #2216): the rung ABOVE the extends base and BELOW this workflow's own stage declarations — file defaults -> extends base -> workflow defaults -> the stage's own declaration. A workflow-level default therefore OVERRIDES a value an inherited base stage declared explicitly, which is what makes "extend the base but swap the agent everywhere" expressible; a stage declared on THIS workflow still wins over it. Same merge semantics as the file-level block: `executor` and `budget` merge KEY-WISE, `reviewers` is taken WHOLE from exactly one rung and never blended (it determines review AUTHORITY), and arrays REPLACE wholesale. |
 
@@ -234,6 +235,17 @@ One workflow stage. The `required: [id, type, executor]` list is enforced on the
 | `egress` | `stage_egress` | optional |  |  |
 | `permissions` | `stage_permissions` | optional |  |  |
 | `concurrency` | `stage_concurrency` | optional |  |  |
+| `gate_container` | `gate_container` | optional |  | PER-STAGE gate container override (E51.3 / #2136): replaces the workflow-level `gate_container` for this stage's gate commands. Resolved by stage IDENTITY, so two stages of one type may declare different images. Under `extends`, a deriving stage that names a source (image, or dockerfile + context) REPLACES the base stage's source rather than blending with it. See docs/spec/workflow-v2.md § 'Gate container (gate_container)'. |
+
+##### `gate_container`
+
+The container a stage's gate commands (verify, diff_coverage, the auto-format absorb) run in (E51.3 / #2136; ADR-063). Exactly ONE source: a registry `image`, OR an in-repo build declared as `dockerfile` + `context` together. Declarable at workflow level and per stage; precedence is stage > workflow > the runner's FISHHAWK_GATE_IMAGE > the clone-sandbox / clone fallback. The runner applies a per-profile image policy (digest pinning, an operator allowlist, in-repo builds closed down) before anything runs; a declaration the runner cannot honour runs the fallback with a warning in local / self-hosted and is refused in hosted. The key `services` is RESERVED for daemon-dependent gates (#2137) and is rejected today by additionalProperties. See docs/spec/workflow-v2.md § 'Gate container (gate_container)'.
+
+| Field | Type | Required | Constraints | Description |
+|---|---|---|---|---|
+| `image` | string | optional | minLength: `1`; maxLength: `512`; pattern: `^[A-Za-z0-9][A-Za-z0-9._/:-]*(@sha256:[a-f0-9]{64})?$` | A registry image reference, optionally digest-pinned (`ghcr.io/org/gate@sha256:<64 hex>`). The image must be PULLABLE from a registry: a local-only image belongs in `dockerfile` + `context` or the operator's FISHHAWK_GATE_IMAGE. A tag-only reference warns in local / self-hosted and is refused in hosted. Mutually exclusive with `dockerfile` / `context`. |
+| `dockerfile` | string | optional | minLength: `1`; maxLength: `1024`; pattern: `^[A-Za-z0-9._][A-Za-z0-9._/-]*$` | Repository-relative path of the Dockerfile an in-repo gate image is built from: no leading `/`, no `..` segment. Requires `context`; mutually exclusive with `image`. |
+| `context` | string | optional | minLength: `1`; maxLength: `1024`; pattern: `^[A-Za-z0-9._][A-Za-z0-9._/-]*$` | Repository-relative build-context directory for `dockerfile` (`.` is the repository root): no leading `/`, no `..` segment. A narrow context keeps the content-digest build cache warm. Requires `dockerfile`; mutually exclusive with `image`. |
 
 ##### `stage_concurrency`
 
@@ -872,6 +884,10 @@ Shape deltas only — a field whose description changed but whose type, required
 | `/$defs/escalation_requirements/properties/approvals` | added | new at the newer major |
 | `/$defs/escalation_requirements/properties/max_autonomy` | added | new at the newer major |
 | `/$defs/escalation_requirements/properties/reviewers` | added | new at the newer major |
+| `/$defs/gate_container` | added | new at the newer major |
+| `/$defs/gate_container/properties/context` | added | new at the newer major |
+| `/$defs/gate_container/properties/dockerfile` | added | new at the newer major |
+| `/$defs/gate_container/properties/image` | added | new at the newer major |
 | `/$defs/member-ref` | removed | present in the older major, absent at the newer |
 | `/$defs/operator_agent` | removed | present in the older major, absent at the newer |
 | `/$defs/operator_agent/properties/may_approve` | removed | present in the older major, absent at the newer |
@@ -915,6 +931,7 @@ Shape deltas only — a field whose description changed but whose type, required
 | `/$defs/schedule/properties/timezone` | added | new at the newer major |
 | `/$defs/stage/properties/concurrency` | added | new at the newer major |
 | `/$defs/stage/properties/constraints` | changed | type "array of `constraint`"→"`constraint`" |
+| `/$defs/stage/properties/gate_container` | added | new at the newer major |
 | `/$defs/stage/properties/needs` | added | new at the newer major |
 | `/$defs/stage/properties/permissions` | added | new at the newer major |
 | `/$defs/stage_concurrency` | added | new at the newer major |
@@ -932,6 +949,7 @@ Shape deltas only — a field whose description changed but whose type, required
 | `/$defs/workflow/properties/drive` | removed | present in the older major, absent at the newer |
 | `/$defs/workflow/properties/escalations` | added | new at the newer major |
 | `/$defs/workflow/properties/extends` | added | new at the newer major |
+| `/$defs/workflow/properties/gate_container` | added | new at the newer major |
 | `/$defs/workflow/properties/operator_agent` | removed | present in the older major, absent at the newer |
 | `/$defs/workflow/properties/schedule` | added | new at the newer major |
 | `/properties/defaults` | added | new at the newer major |
@@ -981,6 +999,10 @@ Shape deltas only — a field whose description changed but whose type, required
 | `/$defs/escalation_requirements/properties/approvals` | added | new at the newer major |
 | `/$defs/escalation_requirements/properties/max_autonomy` | added | new at the newer major |
 | `/$defs/escalation_requirements/properties/reviewers` | added | new at the newer major |
+| `/$defs/gate_container` | added | new at the newer major |
+| `/$defs/gate_container/properties/context` | added | new at the newer major |
+| `/$defs/gate_container/properties/dockerfile` | added | new at the newer major |
+| `/$defs/gate_container/properties/image` | added | new at the newer major |
 | `/$defs/member-ref` | removed | present in the older major, absent at the newer |
 | `/$defs/operator_agent` | removed | present in the older major, absent at the newer |
 | `/$defs/operator_agent/properties/may_approve` | removed | present in the older major, absent at the newer |
@@ -1026,6 +1048,7 @@ Shape deltas only — a field whose description changed but whose type, required
 | `/$defs/stage/properties/concurrency` | added | new at the newer major |
 | `/$defs/stage/properties/constraints` | changed | type "array of `constraint`"→"`constraint`" |
 | `/$defs/stage/properties/egress` | added | new at the newer major |
+| `/$defs/stage/properties/gate_container` | added | new at the newer major |
 | `/$defs/stage/properties/needs` | added | new at the newer major |
 | `/$defs/stage/properties/permissions` | added | new at the newer major |
 | `/$defs/stage/properties/type` | changed | enum members differ |
@@ -1046,6 +1069,7 @@ Shape deltas only — a field whose description changed but whose type, required
 | `/$defs/workflow/properties/drive` | removed | present in the older major, absent at the newer |
 | `/$defs/workflow/properties/escalations` | added | new at the newer major |
 | `/$defs/workflow/properties/extends` | added | new at the newer major |
+| `/$defs/workflow/properties/gate_container` | added | new at the newer major |
 | `/$defs/workflow/properties/operator_agent` | removed | present in the older major, absent at the newer |
 | `/$defs/workflow/properties/schedule` | added | new at the newer major |
 | `/properties/defaults` | added | new at the newer major |
