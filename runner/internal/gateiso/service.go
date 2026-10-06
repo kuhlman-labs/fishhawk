@@ -64,7 +64,9 @@ func ParseServices(raw string) ([]Service, error) {
 
 // DefaultPostgresImage is the service image when FISHHAWK_GATE_POSTGRES_IMAGE
 // is unset — the image pgtest already starts. Operators should pin it by
-// digest.
+// digest. An override MUST be PostgreSQL 16 or newer: the gate role holds
+// CREATEROLE, which only 16 bounds, so BootstrapArgv refuses an older server
+// (postgresMinVersionGuard).
 const DefaultPostgresImage = "postgres:16-alpine"
 
 // Service container layout and the in-gate contract.
@@ -96,10 +98,23 @@ const (
 	// random and appears only in the service container's env and the
 	// bootstrap exec, never in the gate container.
 	postgresSuperuser = "postgres"
-	// postgresGateRoleAttributes is the Captain's least-privilege decision
-	// (#2137 approval condition 1): a login role that can create databases
-	// and nothing else — no superuser, no role management, no RLS bypass.
-	postgresGateRoleAttributes = "LOGIN CREATEDB NOSUPERUSER NOCREATEROLE NOBYPASSRLS NOREPLICATION"
+	// postgresGateRoleAttributes is the gate role's posture (#2137 approval
+	// condition 1, widened by #4050). The backend suite assumes the host
+	// path's superuser: FORCE ROW LEVEL SECURITY tables seeded across accounts
+	// need BYPASSRLS, and RLS tests create NOBYPASSRLS probe roles, which
+	// needs CREATEROLE. NOSUPERUSER still closes the escape route: COPY … TO
+	// PROGRAM and server-file access need superuser or pg_execute_server_program
+	// / pg_read_server_files, and PostgreSQL 16's CREATEROLE cannot grant
+	// SUPERUSER or a role it holds no ADMIN option on — a bound only 16
+	// enforces, hence postgresMinVersionGuard. BYPASSRLS affects row
+	// visibility only, inside a throwaway --network=none database. The
+	// superuser password still never reaches the gate.
+	postgresGateRoleAttributes = "LOGIN CREATEDB CREATEROLE BYPASSRLS NOSUPERUSER NOREPLICATION"
+	// postgresMinVersionGuard is BootstrapArgv's first statement: it fails
+	// the bootstrap (ON_ERROR_STOP) on a server older than PostgreSQL 16,
+	// before the gate role exists. It is one argv token with no shell, so
+	// the $$ quoting is literal.
+	postgresMinVersionGuard = `DO $$BEGIN IF current_setting('server_version_num')::int < 160000 THEN RAISE EXCEPTION 'gate service Postgres must be 16 or newer (server_version_num %): the gate role holds CREATEROLE, which only PostgreSQL 16 bounds', current_setting('server_version_num'); END IF; END$$`
 	// postgresInitdbArgs require a password on EVERY connection, the unix
 	// socket included: the image's default `local all all trust` would let
 	// the gate connect as the superuser without its password.
@@ -202,11 +217,13 @@ func (s PostgresService) ReadyArgv(rt Runtime) ([]string, error) {
 
 // BootstrapArgv creates the least-privilege gate role and its database as the
 // superuser, inside the service container (the superuser password never
-// leaves it). Each -c runs in its own transaction (CREATE DATABASE cannot run
+// leaves it). The PostgreSQL 16 guard runs first, so an older server creates
+// no role. Each -c runs in its own transaction (CREATE DATABASE cannot run
 // inside one); ON_ERROR_STOP makes any failure a non-zero exit.
 func (s PostgresService) BootstrapArgv(rt Runtime) ([]string, error) {
 	return s.argv(rt, "exec", "-e", "PGPASSWORD="+s.superPassword, s.Name,
 		"psql", "-X", "-v", "ON_ERROR_STOP=1", "-h", PostgresSocketDir, "-U", postgresSuperuser, "-d", "postgres",
+		"-c", postgresMinVersionGuard,
 		"-c", "CREATE ROLE "+PostgresGateRole+" "+postgresGateRoleAttributes+" PASSWORD 'fishhawk'",
 		"-c", "CREATE DATABASE "+PostgresGateDB+" OWNER "+PostgresGateRole,
 	)

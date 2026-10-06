@@ -331,16 +331,17 @@ func TestRetryObjectInUse(t *testing.T) {
 
 // TestStartContainer_ExternalURLCreatesFreshRawDB drives the REAL startContainer
 // through FISHHAWK_TEST_PG_URL. Off the gate container it stands the server up
-// itself and connects as a NOSUPERUSER CREATEDB-only login role — the least-
-// privilege role the runner's service hands the gate (#2137 approval condition
-// 1) — so it also proves the raw-DB flow plus golang-migrate over pgx work
-// under that role, and that a superuser-only statement is refused from its
-// DSN. Inside the gate container it uses the provided URL as-is.
+// itself and connects as a mirror of the role the runner's service hands the
+// gate (createGateRole; #2137 approval condition 1, widened by #4050) — so it
+// also proves the raw-DB flow plus golang-migrate over pgx work under that
+// role, that CREATE ROLE succeeds from its DSN, and that superuser-only
+// statements are still refused. Inside the gate container it uses the
+// provided URL as-is.
 func TestStartContainer_ExternalURLCreatesFreshRawDB(t *testing.T) {
 	server := os.Getenv(externalPGURLEnv)
 	leastPrivilege := false
 	if server == "" {
-		server = createDBOnlyRole(t, startContainer(t))
+		server = createGateRole(t, startContainer(t))
 		leastPrivilege = true
 	}
 
@@ -384,11 +385,24 @@ func TestStartContainer_ExternalURLCreatesFreshRawDB(t *testing.T) {
 			if err != nil {
 				t.Fatalf("connect as the gate role: %v", err)
 			}
-			_, err = conn.Exec(ctx, "CREATE ROLE fh_should_not_exist")
-			_ = conn.Close(ctx)
-			var pg *pgconn.PgError
-			if !errors.As(err, &pg) || pg.Code != "42501" {
-				t.Errorf("CREATE ROLE from the gate role's DSN = %v, want SQLSTATE 42501 (insufficient_privilege)", err)
+			defer func() { _ = conn.Close(ctx) }()
+			// CREATEROLE (#4050): the backend's RLS tests create probe roles.
+			probe := pgx.Identifier{"fh_probe_" + strings.ReplaceAll(uuid.NewString(), "-", "")[:12]}.Sanitize()
+			if _, err := conn.Exec(ctx, "CREATE ROLE "+probe); err != nil {
+				t.Errorf("CREATE ROLE from the gate role's DSN: %v, want success (CREATEROLE)", err)
+			} else if _, err := conn.Exec(ctx, "DROP ROLE "+probe); err != nil {
+				t.Errorf("DROP ROLE %s: %v", probe, err)
+			}
+			// NOSUPERUSER: the escape routes stay refused.
+			for _, stmt := range []string{
+				"COPY (SELECT 1) TO PROGRAM 'true'",
+				"GRANT pg_execute_server_program TO CURRENT_USER",
+			} {
+				_, err := conn.Exec(ctx, stmt)
+				var pg *pgconn.PgError
+				if !errors.As(err, &pg) || pg.Code != "42501" {
+					t.Errorf("%s from the gate role's DSN = %v, want SQLSTATE 42501 (insufficient_privilege)", stmt, err)
+				}
 			}
 		}
 	})
@@ -411,9 +425,11 @@ func TestStartContainer_ExternalURLCreatesFreshRawDB(t *testing.T) {
 	}
 }
 
-// createDBOnlyRole creates a NOSUPERUSER CREATEDB-only login role on the server
-// behind admin and returns admin's URL re-pointed at that role.
-func createDBOnlyRole(t *testing.T, admin string) string {
+// createGateRole creates a login role mirroring the gate role's posture on the
+// server behind admin and returns admin's URL re-pointed at that role. The
+// attributes mirror postgresGateRoleAttributes in
+// runner/internal/gateiso/service.go by convention (a separate module).
+func createGateRole(t *testing.T, admin string) string {
 	t.Helper()
 	ctx := context.Background()
 	conn, err := pgx.Connect(ctx, admin)
@@ -424,9 +440,9 @@ func createDBOnlyRole(t *testing.T, admin string) string {
 	role := "fh_gate_" + strings.ReplaceAll(uuid.NewString(), "-", "")[:12]
 	pass := strings.ReplaceAll(uuid.NewString(), "-", "")
 	if _, err := conn.Exec(ctx, fmt.Sprintf(
-		"CREATE ROLE %s LOGIN PASSWORD '%s' NOSUPERUSER CREATEDB NOCREATEROLE NOBYPASSRLS",
+		"CREATE ROLE %s LOGIN PASSWORD '%s' NOSUPERUSER CREATEDB CREATEROLE BYPASSRLS",
 		pgx.Identifier{role}.Sanitize(), pass)); err != nil {
-		t.Fatalf("create least-privilege role: %v", err)
+		t.Fatalf("create gate role: %v", err)
 	}
 	u, err := url.Parse(admin)
 	if err != nil {

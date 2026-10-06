@@ -125,10 +125,12 @@ func (f *chainFixture) appendEntry(t *testing.T, runID uuid.UUID, stageID *uuid.
 }
 
 // insertOrphanEntry writes a decision-bearing entry whose run row does NOT
-// exist, BY CONSTRUCTION: session_replication_role=replica disables the
-// audit_entries run_id FK trigger for this one transaction (the admin test
-// role is a superuser). It is the only way to reach the state, since
-// audit_entries.run_id is ON DELETE RESTRICT.
+// exist, BY CONSTRUCTION: one transaction drops the audit_entries run_id FK,
+// inserts the orphan and re-adds the FK NOT VALID, so the orphan survives and
+// later inserts are checked again. It is the only way to reach the state,
+// since audit_entries.run_id is ON DELETE RESTRICT. It needs table ownership,
+// not superuser (#4050): the host path's superuser has it, and so does the
+// container gate role, which owns the template-cloned tables.
 func (f *chainFixture) insertOrphanEntry(t *testing.T, category string) int64 {
 	t.Helper()
 	ctx := context.Background()
@@ -137,14 +139,18 @@ func (f *chainFixture) insertOrphanEntry(t *testing.T, category string) int64 {
 		t.Fatal(err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	if _, err := tx.Exec(ctx, `SET LOCAL session_replication_role = replica`); err != nil {
-		t.Fatalf("disable FK triggers: %v", err)
+	if _, err := tx.Exec(ctx, `ALTER TABLE audit_entries DROP CONSTRAINT audit_entries_run_id_fkey`); err != nil {
+		t.Fatalf("drop run_id FK: %v", err)
 	}
 	var seq int64
 	if err := tx.QueryRow(ctx, `INSERT INTO audit_entries (id, run_id, category, payload, entry_hash)
 		VALUES ($1, $2, $3, '{"decision":"approve"}', 'orphan-hash') RETURNING sequence`,
 		uuid.New(), uuid.New(), category).Scan(&seq); err != nil {
 		t.Fatalf("insert orphan entry: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `ALTER TABLE audit_entries ADD CONSTRAINT audit_entries_run_id_fkey
+		FOREIGN KEY (run_id) REFERENCES runs (id) ON DELETE RESTRICT NOT VALID`); err != nil {
+		t.Fatalf("restore run_id FK: %v", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		t.Fatal(err)

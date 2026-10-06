@@ -1051,10 +1051,13 @@ func gateServiceProbeCmd(port int) string {
 	superDSN := "postgres://postgres@/postgres?host=" + gateiso.MountPgSock + "&sslmode=disable"
 	return strings.Join([]string{
 		pg("select1", "select 1"),
-		pg("role", "select rolsuper::text || ',' || rolcreatedb::text || ',' || rolcreaterole::text from pg_roles where rolname = current_user"),
+		pg("role", "select rolsuper::text || ',' || rolcreatedb::text || ',' || rolcreaterole::text || ',' || rolbypassrls::text from pg_roles where rolname = current_user"),
 		`printf 'createdb=%s\n' "$(psql -X -w -v ON_ERROR_STOP=1 "$FISHHAWK_TEST_PG_URL" -c 'CREATE DATABASE fh_e2e_probe' -c 'DROP DATABASE fh_e2e_probe' >/dev/null 2>&1 && echo ok || echo failed)"`,
 		pg("createrole", "CREATE ROLE fh_e2e_probe"),
 		pg("copyprogram", "COPY (SELECT 1) TO PROGRAM 'true'"),
+		pg("grantexec", "GRANT pg_execute_server_program TO CURRENT_USER"),
+		pg("createsuper", "CREATE ROLE fh_e2e_super SUPERUSER"),
+		pg("altersuper", "ALTER ROLE postgres PASSWORD 'x'"),
 		`printf 'superuser=%s\n' "$(psql -X -w '` + superDSN + `' -tAc 'select 1' 2>&1 | tr '\n' ' ')"`,
 		`wget -q -T 3 -O /dev/null http://example.com/ && echo external=reached || echo external=failed`,
 		fmt.Sprintf(`wget -q -T 3 -O /dev/null http://127.0.0.1:%d/ && echo loopback=reached || echo loopback=failed`, port),
@@ -1082,10 +1085,12 @@ func envSection(out string) []string {
 // (m) TestGateContainer_PostgresServiceReachableAndContained: with
 // FISHHAWK_GATE_SERVICES=postgres, a daemon-dependent gate command reaches the
 // runner-provisioned Postgres over the injected DSN (the read-only unix-socket
-// mount) through the REAL container seam, as the least-privilege role: CREATE
-// DATABASE works, while CREATE ROLE and COPY … TO PROGRAM are refused and the
-// superuser cannot connect without the password that never enters the gate
-// (#2137 approval condition 1). The containment set still holds (no egress
+// mount) through the REAL container seam, as the gate role (#2137 approval
+// condition 1, widened by #4050): CREATE DATABASE and CREATE ROLE work and the
+// role is NOSUPERUSER with BYPASSRLS, while COPY … TO PROGRAM, granting
+// pg_execute_server_program, creating a superuser and altering the superuser
+// are refused, and the superuser cannot connect without the password that
+// never enters the gate. The containment set still holds (no egress
 // incl. a host loopback proven live first, no eth*, no daemon socket, /pgsock
 // and /etc/passwd mounted read-only (asserted on the /proc/mounts options),
 // the caller uid resolves through the runner's passwd mount,
@@ -1133,13 +1138,17 @@ func TestGateContainer_PostgresServiceReachableAndContained(t *testing.T) {
 	if got := outputField(out, "select1"); got != "1" {
 		t.Errorf("psql over FISHHAWK_TEST_PG_URL printed %q, want 1:\n%s", got, out)
 	}
-	if got := outputField(out, "role"); got != "false,true,false" {
-		t.Errorf("gate role (rolsuper,rolcreatedb,rolcreaterole) = %q, want false,true,false", got)
+	if got := outputField(out, "role"); got != "false,true,true,true" {
+		t.Errorf("gate role (rolsuper,rolcreatedb,rolcreaterole,rolbypassrls) = %q, want false,true,true,true", got)
 	}
 	if got := outputField(out, "createdb"); got != "ok" {
 		t.Errorf("CREATE DATABASE as the gate role = %q, want ok (pgtest needs CREATEDB)", got)
 	}
-	for _, key := range []string{"createrole", "copyprogram"} {
+	// CREATEROLE (#4050): the backend's RLS tests create NOBYPASSRLS probe roles.
+	if got := outputField(out, "createrole"); !strings.Contains(got, "CREATE ROLE") || strings.Contains(got, "ERROR") {
+		t.Errorf("CREATE ROLE as the gate role = %q, want the CREATE ROLE command tag (the backend suite needs CREATEROLE)", got)
+	}
+	for _, key := range []string{"copyprogram", "grantexec", "createsuper", "altersuper"} {
 		if got := outputField(out, key); !strings.Contains(got, "permission denied") {
 			t.Errorf("superuser-only operation %s from the gate DSN = %q, want a permission-denied refusal", key, got)
 		}

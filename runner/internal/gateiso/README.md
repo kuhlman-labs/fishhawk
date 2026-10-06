@@ -20,7 +20,7 @@ there is still no second exec path.
 | `FISHHAWK_GATE_ISOLATION` | `auto` \| `container` \| `clone-sandbox` \| `clone` | `auto` | the isolation mode (`ParseMode`; an unknown value is a startup config error naming the valid values) |
 | `FISHHAWK_GATE_IMAGE` | an image reference | empty | the image the container path runs the gate in when the stage declares no `gate_container` (a declared one beats it, § "Declared gate image"); empty means the container path is UNAVAILABLE, so a default runner never pays the per-exec cache cost below. For THIS repository the recommended image is the in-repo, pin-checked `fishhawk-gate` (`deploy/gate-image/README.md`, E51.17 / #3966), digest-pinned. **For this repository, set it ONLY together with `FISHHAWK_GATE_SERVICES=postgres`, and only after the § "Gate services (#2137)" operator walk is green:** without the service, `auto` prefers the container path, where `pgtest` fails closed (`FISHHAWK_GATE_CONTAINER=1`, no database) and every verify is red |
 | `FISHHAWK_GATE_SERVICES` | comma list; only member `postgres` | empty (none) | services the CONTAINER path provisions beside each gate exec (`ParseServices`; an unknown member is a startup config error naming the variable and the valid value; duplicates collapse). Ignored, with one `gate_services_ignored` log line, on every other path. Future spec mapping: #2136's workflow-v2 `gate_container.services` |
-| `FISHHAWK_GATE_POSTGRES_IMAGE` | an image reference | `postgres:16-alpine` (`DefaultPostgresImage`) | the Postgres service image; pin it by DIGEST (`postgres@sha256:…`) — the image runs as a service beside every container gate |
+| `FISHHAWK_GATE_POSTGRES_IMAGE` | an image reference | `postgres:16-alpine` (`DefaultPostgresImage`) | the Postgres service image; pin it by DIGEST (`postgres@sha256:…`) — the image runs as a service beside every container gate. **Floor: PostgreSQL 16 or newer.** The gate role holds `CREATEROLE`, which only 16 bounds, so the bootstrap's version guard fails an older image (category C, the gate never runs; § "Gate services (#2137)", Least privilege) |
 | `FISHHAWK_DEPLOYMENT_PROFILE` | `local` \| `self-hosted` \| `hosted` | `local` | the runner-DECLARED deployment profile (`ParseProfile`); `hosted` forbids every non-container path |
 | `FISHHAWK_GATE_IMAGE_ALLOWLIST` | comma/whitespace list of registry hosts, namespace prefixes, repositories, exact digests | empty (no allowlist) | the operator image allowlist a DECLARED `gate_container` image, and every base of a declared build, must pass (`ParseAllowlist`; grammar in § "Declared gate image"). An invalid entry is a startup config error naming it. Never applied to `FISHHAWK_GATE_IMAGE` (operator-chosen) |
 | `FISHHAWK_GATE_BUILD` | `allow` \| `deny` | empty = the profile default (`hosted` deny, `local`/`self-hosted` allow) | whether a declared `gate_container` `dockerfile`/`context` build may run (`ParseBuildPolicy`; any other value is a startup config error) |
@@ -824,19 +824,49 @@ and is rendered — and validated — before any of them runs; a runtime with no
 | volume create | `volume create --label org.fishhawk.gate-service=postgres fishhawk-gate-svc-<12 hex>` | 1m |
 | run | `run -d --name <svc> --network=none --cap-drop=ALL --security-opt=no-new-privileges --user postgres --label … --tmpfs /var/lib/postgresql/data -e PGDATA=…/pgdata -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=<random> -e POSTGRES_INITDB_ARGS=--auth-local=scram-sha-256 --auth-host=scram-sha-256 -v <svc>:/var/run/postgresql <image>` — no `-p`, no host path | 5m (covers a cold pull of the service image) |
 | readiness | each iteration: `logs <svc>` FIRST; only once it carries `PostgreSQL init process complete; ready for start up.`, `exec <svc> pg_isready -h /var/run/postgresql …`; ready = pg_isready exit 0 AFTER the line | 15s per probe, 90s overall, 250ms interval |
-| bootstrap | `exec -e PGPASSWORD=<random> <svc> psql … -c "CREATE ROLE fishhawk LOGIN CREATEDB NOSUPERUSER NOCREATEROLE NOBYPASSRLS NOREPLICATION PASSWORD 'fishhawk'" -c "CREATE DATABASE fishhawk OWNER fishhawk"` | 1m |
+| bootstrap | `exec -e PGPASSWORD=<random> <svc> psql … -c "DO $$BEGIN IF current_setting('server_version_num')::int < 160000 THEN RAISE EXCEPTION 'gate service Postgres must be 16 or newer …'; END IF; END$$" -c "CREATE ROLE fishhawk LOGIN CREATEDB CREATEROLE BYPASSRLS NOSUPERUSER NOREPLICATION PASSWORD 'fishhawk'" -c "CREATE DATABASE fishhawk OWNER fishhawk"` (the version guard runs first, so a pre-16 server creates no role) | 1m |
 | gate exec | `BuildArgv` with `-v <svc>:/pgsock:ro` and `FISHHAWK_TEST_PG_URL=postgres://fishhawk:fishhawk@/fishhawk?host=/pgsock&sslmode=disable` applied LAST | the gate's own timeout |
 | teardown | `rm -f -v <svc>`, then `volume rm -f <svc>` (one name, two runtime namespaces) | `diffCoverageCleanupTimeout` each, detached context |
 
-- **Least privilege (approval condition 1).** The gate's DSN connects as the
-  `CREATEDB`-only role `fishhawk`, never the superuser. initdb's
-  `scram-sha-256` local auth means the superuser cannot be reached over the
-  socket without its per-service random password, which exists only in the
-  service container's env and the host-side runtime argv — never in the gate
-  container's env, files, mounts or argv. Pinned live by
-  `TestPostgresService_LiveLeastPrivilegeOverReadOnlySocket` (this package) and
-  fixture (m): `CREATE ROLE` and `COPY … TO PROGRAM` from the gate DSN fail
-  with `permission denied`.
+- **Least privilege (approval condition 1, widened by #4050).** The gate's
+  DSN connects as the role `fishhawk` (`LOGIN CREATEDB CREATEROLE BYPASSRLS
+  NOSUPERUSER NOREPLICATION`), never the superuser. initdb's `scram-sha-256`
+  local auth means the superuser cannot be reached over the socket without
+  its per-service random password, which exists only in the service
+  container's env and the host-side runtime argv — never in the gate
+  container's env, files, mounts or argv. Why `CREATEROLE` and `BYPASSRLS`
+  (#4050): the backend suite assumes the host path's superuser — it seeds
+  `FORCE ROW LEVEL SECURITY` tables across accounts (a `NOBYPASSRLS` role,
+  owner included, gets `42501 new row violates row-level security policy`)
+  and its RLS tests create `NOBYPASSRLS` probe roles. Why that is still
+  contained:
+  - **`NOSUPERUSER` closes the escape route.** `COPY … TO PROGRAM` and
+    server-file access need superuser or membership in
+    `pg_execute_server_program` / `pg_read_server_files` /
+    `pg_write_server_files`, and the role holds neither.
+  - **PostgreSQL 16 bounds `CREATEROLE`, enforced by the version guard.**
+    From 16, `CREATEROLE` cannot create or alter a superuser and cannot grant
+    a role it holds no `ADMIN` option on, so it cannot reach those
+    server-program roles. Before 16 it could, so the bootstrap's first
+    statement refuses a server below `server_version_num` 160000 before the
+    role exists (`ON_ERROR_STOP` makes that a bootstrap failure: category C,
+    the gate never runs).
+  - **`BYPASSRLS` affects row visibility only**, inside a throwaway
+    `--network=none` database destroyed after the exec. It grants no
+    statement the role could not otherwise run.
+
+  Pinned live by `TestPostgresService_LiveLeastPrivilegeOverReadOnlySocket`
+  (this package) and fixture (m): from the gate DSN `CREATE ROLE` succeeds
+  and an insert into a `FORCE ROW LEVEL SECURITY` table with no policy
+  succeeds (the live test), while granting `pg_execute_server_program`
+  (`ADMIN option`), `CREATE ROLE … SUPERUSER`, `ALTER ROLE postgres` and
+  `COPY … TO PROGRAM` fail with `permission denied`.
+  `TestPostgresService_LiveBootstrapRefusesPrePG16` runs the real bootstrap
+  against `postgres:15-alpine` (skipping when that image is unavailable) and
+  asserts a non-zero exit naming `16 or newer` with no `fishhawk` role
+  created. Residual: probe roles the RLS tests create leak on this path,
+  since PostgreSQL 16 refuses their creator `DROP OWNED BY`; the cluster is
+  per-exec and destroyed after it.
 - **No anonymous data volume (approval condition 2).** The image declares a
   `VOLUME` for PGDATA; a `--tmpfs` there means the daemon creates none. The
   service's only mount is the named socket volume, plus the tmpfs; `rm -f -v`
@@ -880,7 +910,8 @@ and is rendered — and validated — before any of them runs; a runtime with no
   teardown. Both objects carry `org.fishhawk.gate-service`; the label-filtered
   manual cleanup is in `runner/README.md` § "Gate isolation".
 - **Image provenance.** `FISHHAWK_GATE_POSTGRES_IMAGE` defaults to the TAG
-  `postgres:16-alpine`; pin it by digest in any operator environment.
+  `postgres:16-alpine`; pin it by digest in any operator environment. An
+  override must be PostgreSQL 16 or newer (the bootstrap's version guard).
 
 **Caller passwd entry (`passwd.go`, every container exec, services or not).**
 The gate runs as the caller's numeric `uid:gid`, which the gate image's
@@ -1097,7 +1128,7 @@ every host — no runtime skip, no refused-state theater.
 | (g) `TestGateContainer_LinuxOwnership` | `id -u` is the runner's uid; on Linux a written file is owned by `os.Getuid()` |
 | (k) `TestGateContainer_CacheSymlinkNeverReachesHost` | the cache invariant + symlink-safe cleanup, above |
 | (l) `TestGateContainer_EndpointBoundAcrossContextSwitch` | selection recorded against the real socket, THEN `DOCKER_HOST`/`CONTAINER_HOST` redirected to an unreachable tcp endpoint and `DOCKER_CONTEXT`/`CONTAINER_CONNECTION` to a nonexistent context → the gate still runs on the validated daemon; the argv opens with the binding; the CLI env pins the validated socket with the redirecting variables dropped |
-| (m) `TestGateContainer_PostgresServiceReachableAndContained` | with `FISHHAWK_GATE_SERVICES=postgres` and the Postgres image as the gate image (it carries `psql`): `select 1` over the injected `FISHHAWK_TEST_PG_URL` prints 1; the role is `rolsuper=false, rolcreatedb=true, rolcreaterole=false`, `CREATE DATABASE` works, `CREATE ROLE` and `COPY … TO PROGRAM` are `permission denied`, the superuser cannot connect without its password, and its password appears nowhere in the gate output, env or argv; the containment set (no external or host-loopback egress after a positive control, no `eth*`, no daemon socket, only the Postgres socket under `/pgsock`, `/pgsock` and `/etc/passwd` mounted `ro` per `/proc/mounts`, `id -un` resolves, `FISHHAWK_GATE_CONTAINER=1`); host-side inspect via `gateServiceObserver` (NetworkMode none, one named-volume mount and a PGDATA tmpfs, no bind, no port, CapDrop ALL); `rm -f -v` + `volume rm` recorded and nothing left on the daemon; counterfactual: the same DSN with services UNSET fails to connect |
+| (m) `TestGateContainer_PostgresServiceReachableAndContained` | with `FISHHAWK_GATE_SERVICES=postgres` and the Postgres image as the gate image (it carries `psql`): `select 1` over the injected `FISHHAWK_TEST_PG_URL` prints 1; the role is `rolsuper=false, rolcreatedb=true, rolcreaterole=true, rolbypassrls=true` (#4050), `CREATE DATABASE` works, `CREATE ROLE` prints its `CREATE ROLE` command tag, `COPY … TO PROGRAM`, `GRANT pg_execute_server_program TO CURRENT_USER`, `CREATE ROLE … SUPERUSER` and `ALTER ROLE postgres` are `permission denied`, the superuser cannot connect without its password, and its password appears nowhere in the gate output, env or argv; the containment set (no external or host-loopback egress after a positive control, no `eth*`, no daemon socket, only the Postgres socket under `/pgsock`, `/pgsock` and `/etc/passwd` mounted `ro` per `/proc/mounts`, `id -un` resolves, `FISHHAWK_GATE_CONTAINER=1`); host-side inspect via `gateServiceObserver` (NetworkMode none, one named-volume mount and a PGDATA tmpfs, no bind, no port, CapDrop ALL); `rm -f -v` + `volume rm` recorded and nothing left on the daemon; counterfactual: the same DSN with services UNSET fails to connect |
 | (o) `TestGateContainer_CacheVolumeWarmWithinProcessFreshAcrossProcesses` | `FISHHAWK_GATE_CACHE=process` (#3967): state A's exec 1 prints the runner uid, `GOCACHE=/gatecache/gocache` and WRITES a marker into it (the prepare helper's ownership, live); A's exec 2 finds the marker (warm within a process); state B — a second runner process, a different run/stage — mounts a different volume and finds nothing (fresh across processes); the positive control C (cache off) does NOT see its own exec-1 marker, so warm discriminates on the volume; A's gate argv mounts `/gatecache` BY NAME (a volume that `BelongsTo` A's run/stage, never an absolute path) beside `--network=none`; a host-side `volume inspect` shows the `org.fishhawk.gate-cache` label before `A.cleanup()` and fails after it |
 | (n) `TestGateContainer_SelfHostPgtestSuite` | OPT-IN (`FISHHAWK_GATE_SELFHOST_IMAGE`, the built `fishhawk-gate` image; counts toward the sentinel only when opted in and run): the REAL `pgtest` suite of the committed HEAD runs in the gate image over the socket DSN — pgx + golang-migrate, template bootstrap, per-test databases — exit 0, the PASS line, no `--- SKIP` |
 | (measure) `TestGateMeasure_ThreeWayFullVerify` (`gatemeasure_test.go`) | OPT-IN (`FISHHAWK_GATE_MEASURE_IMAGE`), NEVER counted toward the sentinel: the three-way full-verify walk of § "Persistent cache volume"; its pure helpers run in-loop via `TestGateMeasureHelpers` |
