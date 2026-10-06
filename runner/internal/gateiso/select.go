@@ -9,7 +9,8 @@ import (
 type Mode string
 
 // Isolation modes. ModeAuto is the default: container when a safe runtime and
-// an image are present, else the strongest available fallback.
+// an image (or a declared build) are present, else the strongest available
+// fallback.
 const (
 	ModeAuto         Mode = "auto"
 	ModeContainer    Mode = "container"
@@ -131,11 +132,58 @@ type SandboxProbe struct {
 type Inputs struct {
 	Mode    Mode
 	Profile Profile
-	// Image is the configured gate image (FISHHAWK_GATE_IMAGE); "" means the
-	// container path is unavailable regardless of the runtime.
+	// Image is the gate image the request resolved to: a declared
+	// gate_container image ref, or FISHHAWK_GATE_IMAGE. "" with Build false
+	// means the container path is unavailable regardless of the runtime.
 	Image   string
 	Runtime Runtime
 	Sandbox SandboxProbe
+	// Build reports a declared in-repo Dockerfile build (E51.3 / #2136): it
+	// satisfies the container path's image requirement, the runner building
+	// the image before the first gate exec.
+	Build bool
+	// ImageSource is where the image request came from (ImageSourceStage,
+	// ImageSourceWorkflow, ImageSourceEnv, or "" for none).
+	ImageSource string
+	// PolicyRefusal is EvaluateImagePolicy's refusal for the request; non-empty
+	// refuses the gate under EVERY mode and never substitutes another image.
+	PolicyRefusal string
+	// PolicyWarning is EvaluateImagePolicy's allowed-but-weak finding, echoed
+	// onto the selection.
+	PolicyWarning string
+}
+
+// ResolvedImage is what a declared gate_container resolved to on the host —
+// filled by the runner after its pull or build, never by Select. It records
+// the image of the FINAL DECIDING gate of the stage.
+type ResolvedImage struct {
+	// Ref is the reference the gate ran by: name@digest for a pulled image,
+	// the content-addressed build tag for a built image.
+	Ref string `json:"ref,omitempty"`
+	// Digest is the registry content digest (sha256:<hex>) of a pulled image.
+	Digest string `json:"digest,omitempty"`
+	// ImageID is the runtime's local image id: opaque, recorded, never
+	// compared across hosts (a containerd image store reports an index
+	// digest there).
+	ImageID string `json:"image_id,omitempty"`
+	// BuildDockerfile / BuildContext are the declared repo-relative build
+	// paths.
+	BuildDockerfile string `json:"build_dockerfile,omitempty"`
+	BuildContext    string `json:"build_context,omitempty"`
+	// ContextDigest is the build's content digest (the build tag's key).
+	ContextDigest string `json:"context_digest,omitempty"`
+}
+
+// Identity is the key a stage counts distinct gate images by: the registry
+// digest when known, else the build content digest, else the local image id,
+// else the ref.
+func (r ResolvedImage) Identity() string {
+	for _, k := range []string{r.Digest, r.ContextDigest, r.ImageID, r.Ref} {
+		if k != "" {
+			return k
+		}
+	}
+	return ""
 }
 
 // Selection is the recorded decision; the runner flattens it into the #2135
@@ -153,15 +201,33 @@ type Selection struct {
 	// (containerMissing) when it was considered, or "not attempted: ..." when
 	// the mode never considers it. Empty on the container path.
 	ContainerUnavailable string `json:"container_unavailable,omitempty"`
+	// ImageSource, Build and PolicyWarning echo the image request (E51.3 /
+	// #2136); all omitempty, so a selection without a request is
+	// byte-identical to its pre-#2136 form.
+	ImageSource   string `json:"image_source,omitempty"`
+	Build         bool   `json:"build,omitempty"`
+	PolicyWarning string `json:"policy_warning,omitempty"`
+	// DeclaredUnhonored is set when a DECLARED gate_container (stage or
+	// workflow) was not honoured because the gate ran on a host fallback path
+	// (clone-sandbox or clone); it names what the container path lacked.
+	DeclaredUnhonored string `json:"declared_unhonored,omitempty"`
+	// ResolvedImage is the image the final deciding gate ran in, filled by the
+	// runner after resolution; nil from Select.
+	ResolvedImage *ResolvedImage `json:"resolved_image,omitempty"`
+	// DistinctImagesCount is the number of distinct resolved images the
+	// stage's gates ran in, set by the runner only when it exceeds one.
+	DistinctImagesCount int `json:"distinct_images_count,omitempty"`
 }
 
 // Refused reports whether the selection forbids executing the gate.
 func (s Selection) Refused() bool { return s.Path == PathRefused }
 
 // Select decides the execution path from mode × profile × image × runtime ×
-// sandbox:
+// sandbox, then marks a declared gate_container the path did not honour:
 //
-//   - container requires Runtime.Safe && Image != "".
+//   - a non-empty PolicyRefusal → refused under every mode, the container
+//     path not attempted.
+//   - container requires Runtime.Safe && (Image != "" || Build).
 //   - mode=container → container, else refused.
 //   - mode=auto → container when possible; otherwise refused under hosted
 //     (naming what is missing), else clone-sandbox when available, else clone.
@@ -170,10 +236,29 @@ func (s Selection) Refused() bool { return s.Path == PathRefused }
 //   - mode=clone → refused under hosted; else clone.
 //
 // Hosted never executes an untrusted gate outside a container: the fallback
-// paths share the host's filesystem and daemon sockets with the runner.
+// paths share the host's filesystem and daemon sockets with the runner, so a
+// declared image there is refused, never run on the host.
+//
+// A declared source (stage or workflow) landing on clone-sandbox or clone
+// carries DeclaredUnhonored; an env-sourced fallback does not.
 func Select(in Inputs) Selection {
+	sel := selectPath(in)
+	sel.ImageSource, sel.Build, sel.PolicyWarning = in.ImageSource, in.Build, in.PolicyWarning
+	if DeclaredSource(in.ImageSource) && sel.Path.Class() == ClassFallback {
+		sel.DeclaredUnhonored = fmt.Sprintf("gate_container declared (%s) but not honoured: %s; the gate ran on the host toolchain", in.ImageSource, sel.ContainerUnavailable)
+	}
+	return sel
+}
+
+// selectPath is Select's mode × profile decision.
+func selectPath(in Inputs) Selection {
 	sel := Selection{Path: PathRefused, Mode: in.Mode, Profile: in.Profile, Image: in.Image, Runtime: in.Runtime, Sandbox: in.Sandbox}
-	containerOK := in.Runtime.Safe && in.Image != ""
+	if in.PolicyRefusal != "" {
+		sel.ContainerUnavailable = "not attempted: gate_container policy refused"
+		sel.Reason = "gate_container policy refused: " + in.PolicyRefusal
+		return sel
+	}
+	containerOK := in.Runtime.Safe && (in.Image != "" || in.Build)
 	missing := containerMissing(in)
 	switch in.Mode {
 	case ModeContainer:
@@ -248,7 +333,7 @@ func containerMissing(in Inputs) string {
 			parts = append(parts, string(in.Runtime.Kind)+" is not a safe runtime ("+in.Runtime.Reason+")")
 		}
 	}
-	if in.Image == "" {
+	if in.Image == "" && !in.Build {
 		parts = append(parts, "no gate image configured (FISHHAWK_GATE_IMAGE is empty)")
 	}
 	if len(parts) == 0 {
