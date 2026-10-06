@@ -196,7 +196,14 @@ func (v CacheVolume) CreateArgv(rt Runtime) ([]string, error) {
 // root-owned, so a gate running --user uid:gid could not create them itself.
 //
 // Docker (and any non-rootless runtime): the helper runs as container root
-// with exactly CAP_CHOWN added back and `install -d -o uid -g gid -m 0700`.
+// with exactly CAP_CHOWN added back and cachePrepareScript — `mkdir -p -m
+// 0700` THEN `chown uid:gid`, the directories and the owner passed as
+// positional arguments, never interpolated into the script. Not `install -d
+// -o -g -m`: busybox install chowns BEFORE it chmods, and root without
+// CAP_FOWNER cannot chmod a directory it no longer owns, so it failed EPERM
+// on a fresh volume and on every re-prepare (caught live by fixture (o)).
+// mkdir -p is a no-op on an existing directory, so a re-prepare only
+// re-chowns.
 // Rootless podman (#3967 approval condition 1): under --userns=keep-id
 // container root maps to a SUBORDINATE uid, not the caller, so the helper
 // runs AS the caller (`--userns=keep-id --user uid:gid`), with no capability
@@ -209,8 +216,14 @@ func (v CacheVolume) PrepareArgv(rt Runtime, image string, uid, gid int) ([]stri
 			"install", "-d", "-m", "0700", GateGoCache, GateLintCache)
 	}
 	return v.helperArgv(rt, image, uid, gid, "CHOWN", []string{"--user", "0:0"},
-		"install", "-d", "-o", strconv.Itoa(uid), "-g", strconv.Itoa(gid), "-m", "0700", GateGoCache, GateLintCache)
+		"sh", "-c", cachePrepareScript, "sh", strconv.Itoa(uid)+":"+strconv.Itoa(gid), GateGoCache, GateLintCache)
 }
+
+// cachePrepareScript creates every directory argument after the first (mode
+// 0700) and then chowns them to the first argument (uid:gid). The only
+// capability it needs is CAP_CHOWN: root owns each directory it creates, so
+// no chmod of a foreign-owned directory ever runs.
+const cachePrepareScript = `o="$1"; shift; mkdir -p -m 0700 "$@" && chown "$o" "$@"`
 
 // cacheWriteProbeScript creates and removes cacheWriteProbe in every
 // directory argument; any failure is a non-zero exit.

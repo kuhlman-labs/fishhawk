@@ -85,10 +85,12 @@ func refusedState(logSink io.Writer) *gateIsolationState {
 }
 
 // containerState is a mode=container state whose probes report a safe docker
-// runtime at sock and the given image: Select picks the container path.
+// runtime at sock and the given image: Select picks the container path. It
+// pins FISHHAWK_GATE_CACHE=off so every pre-#3967 test keeps the per-exec
+// caches and its exact runtime call sequence.
 func containerState(image, sock string, logSink io.Writer) *gateIsolationState {
 	st, err := configureGateIsolation(fakeEnv(map[string]string{
-		gateIsolationModeEnvVar: "container", gateImageEnvVar: image}), gateiso.Probes{}, logSink)
+		gateIsolationModeEnvVar: "container", gateImageEnvVar: image, gateCacheEnvVar: "off"}), gateiso.Probes{}, logSink)
 	if err != nil {
 		panic(err)
 	}
@@ -127,6 +129,10 @@ func TestConfigureGateIsolation_Rows(t *testing.T) {
 			[]string{gateBuildEnvVar, `"maybe"`, "allow, deny"}},
 		{"allowlist and build", map[string]string{gateImageAllowlistEnvVar: "ghcr.io/org/ docker.io/library/alpine", deploymentProfileEnvVar: "hosted", gateBuildEnvVar: "allow"}, nil},
 		{"hosted build default", map[string]string{deploymentProfileEnvVar: "hosted"}, nil},
+		// E51.18 / #3967: the cache posture is startup config.
+		{"invalid cache mode", map[string]string{gateCacheEnvVar: "bogus"},
+			[]string{gateCacheEnvVar, `"bogus"`, "process, off"}},
+		{"cache off", map[string]string{gateCacheEnvVar: " off "}, nil},
 	}
 	for _, r := range rows {
 		t.Run(r.name, func(t *testing.T) {
@@ -181,6 +187,15 @@ func TestConfigureGateIsolation_Rows(t *testing.T) {
 				if st.buildAllowed || !strings.Contains(log.String(), `"build":"deny"`) {
 					t.Errorf("hosted default build = %t, want deny:\n%s", st.buildAllowed, log.String())
 				}
+			case "cache off":
+				if st.cacheMode != gateiso.CacheModeOff || !strings.Contains(log.String(), `"build":"allow","cache":"off"}`) {
+					t.Errorf("cache = %q, want off (the LAST configured field):\n%s", st.cacheMode, log.String())
+				}
+			}
+			// The shipped default (#3967): an UNSET FISHHAWK_GATE_CACHE is
+			// process, logged as the configured line's LAST field.
+			if r.name == "defaults" && (st.cacheMode != gateiso.CacheModeProcess || !strings.Contains(log.String(), `"build":"allow","cache":"process"}`)) {
+				t.Errorf("default cache = %q, want process:\n%s", st.cacheMode, log.String())
 			}
 		})
 	}
@@ -206,11 +221,12 @@ func TestRun_GateIsolationConfigErrorsExitUsage(t *testing.T) {
 		{"unknown gate service", map[string]string{gateServicesEnvVar: "redis"}, exitUsage},
 		{"bad image allowlist", map[string]string{gateImageAllowlistEnvVar: "alpine"}, exitUsage},
 		{"bad build posture", map[string]string{gateBuildEnvVar: "sometimes"}, exitUsage},
+		{"bad cache mode", map[string]string{gateCacheEnvVar: "bogus"}, exitUsage},
 		{"valid", map[string]string{gateIsolationModeEnvVar: "clone"}, exitOK},
 	}
 	for _, r := range rows {
 		t.Run(r.name, func(t *testing.T) {
-			for _, k := range []string{gateIsolationModeEnvVar, deploymentProfileEnvVar, gateImageEnvVar, gateServicesEnvVar, gatePostgresImageEnvVar, gateImageAllowlistEnvVar, gateBuildEnvVar} {
+			for _, k := range []string{gateIsolationModeEnvVar, deploymentProfileEnvVar, gateImageEnvVar, gateServicesEnvVar, gatePostgresImageEnvVar, gateImageAllowlistEnvVar, gateBuildEnvVar, gateCacheEnvVar} {
 				t.Setenv(k, r.env[k])
 			}
 			var out strings.Builder
@@ -224,7 +240,7 @@ func TestRun_GateIsolationConfigErrorsExitUsage(t *testing.T) {
 				if !strings.Contains(out.String(), `"event":"runner_started"`) {
 					t.Errorf("the config check must run AFTER the startup line:\n%s", out.String())
 				}
-				for _, k := range []string{gateServicesEnvVar, gateImageAllowlistEnvVar, gateBuildEnvVar} {
+				for _, k := range []string{gateServicesEnvVar, gateImageAllowlistEnvVar, gateBuildEnvVar, gateCacheEnvVar} {
 					if r.env[k] != "" && !strings.Contains(out.String(), k) {
 						t.Errorf("config error must name %s:\n%s", k, out.String())
 					}
@@ -1227,7 +1243,7 @@ func TestGateContainer_EntrypointResetSmoke(t *testing.T) {
 	if out, err := exec.CommandContext(pull, rt.Kind.Binary(), "pull", "-q", image).CombinedOutput(); err != nil {
 		t.Skipf("image %s unavailable: %v: %s", image, err, out)
 	}
-	st, err := configureGateIsolation(fakeEnv(map[string]string{gateIsolationModeEnvVar: "container", gateImageEnvVar: image}), gateiso.DefaultProbes(), io.Discard)
+	st, err := configureGateIsolation(fakeEnv(map[string]string{gateIsolationModeEnvVar: "container", gateImageEnvVar: image, gateCacheEnvVar: "off"}), gateiso.DefaultProbes(), io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1482,6 +1498,14 @@ func classifyGateArgv(argv []string) string {
 	}
 	sub, joined := argv[3:], strings.Join(argv, " ")
 	switch {
+	case len(sub) > 1 && sub[0] == "volume" && sub[1] == "create" && strings.Contains(joined, gateiso.CacheVolumeLabel):
+		return "cache_create"
+	case len(sub) > 1 && sub[0] == "volume" && sub[1] == "rm" && strings.Contains(joined, "fishhawk-gate-cache-"):
+		return "cache_rm"
+	case len(sub) > 1 && sub[0] == "run" && sub[1] == "--rm" && (strings.Contains(joined, "mkdir -p -m 0700") || strings.Contains(joined, " install -d ")):
+		return "cache_prepare"
+	case len(sub) > 1 && sub[0] == "run" && sub[1] == "--rm" && strings.Contains(joined, ".fishhawk-write-probe"):
+		return "cache_check"
 	case strings.HasSuffix(joined, "cat /etc/passwd"):
 		return "passwd"
 	case len(sub) > 1 && sub[0] == "volume" && sub[1] == "create":
@@ -1584,10 +1608,11 @@ func scriptGateExec(t *testing.T, respond func(label string, n int) (string, int
 	return g
 }
 
-// serviceContainerState is containerState with FISHHAWK_GATE_SERVICES=postgres.
+// serviceContainerState is containerState with FISHHAWK_GATE_SERVICES=postgres
+// (cache off like containerState; an extra may override it).
 func serviceContainerState(t *testing.T, sock string, logSink io.Writer, extra map[string]string) *gateIsolationState {
 	t.Helper()
-	env := map[string]string{gateIsolationModeEnvVar: "container", gateImageEnvVar: "img:1", gateServicesEnvVar: "postgres"}
+	env := map[string]string{gateIsolationModeEnvVar: "container", gateImageEnvVar: "img:1", gateServicesEnvVar: "postgres", gateCacheEnvVar: "off"}
 	for k, v := range extra {
 		env[k] = v
 	}
@@ -2314,8 +2339,10 @@ func runDeclaredGate(t *testing.T, ctx context.Context, dir string) (string, int
 	return runBoundedGateArgvDisposed(ctx, []string{"true"}, dir, filepath.Join(t.TempDir(), "lc"), time.Minute)
 }
 
+// containerEnv is the declared-image tests' container-mode env, cache off
+// (pre-#3967 call sequences) unless an extra overrides it.
 func containerEnv(extra map[string]string) map[string]string {
-	env := map[string]string{gateIsolationModeEnvVar: "container"}
+	env := map[string]string{gateIsolationModeEnvVar: "container", gateCacheEnvVar: "off"}
 	for k, v := range extra {
 		env[k] = v
 	}
@@ -3113,5 +3140,586 @@ func TestRun_FetchedGateContainerIsDeclared(t *testing.T) {
 	want := `"event":"gate_container_declared","source":"stage","image":"ghcr.io/o/g@` + declDigestA + `"`
 	if !strings.Contains(stderr.String(), want) {
 		t.Errorf("log lacks %s:\n%s", want, stderr.String())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Persistent gate cache volume (E51.18 / #3967): under FISHHAWK_GATE_CACHE=
+// process the container path mounts ONE per-runner-process named volume for
+// GOCACHE and the lint cache, created + prepared + write-checked through
+// execGateAuxArgvFn before EVERY exec, degraded to the per-exec binds on any
+// failure, never reused across a (run, stage) pair, and removed at cleanup.
+// ---------------------------------------------------------------------------
+
+const (
+	cacheRunA   = "aaaaaaaa-0000-4000-8000-000000000001"
+	cacheStageA = "aaaaaaaa-0000-4000-8000-0000000000a1"
+	cacheRunB   = "bbbbbbbb-0000-4000-8000-000000000002"
+	cacheStageB = "bbbbbbbb-0000-4000-8000-0000000000b2"
+	cacheSock   = "/nonexistent/cache-daemon.sock"
+)
+
+// cacheState is a mode=container state (img:1, safe docker at cacheSock)
+// with FISHHAWK_GATE_CACHE=process plus extra, bound to (run, stage) when run
+// is non-empty. It is NOT installed: a test swaps gateIsolation itself so it
+// can drive two states in one process.
+func cacheState(t *testing.T, logSink io.Writer, run, stage string, extra map[string]string) *gateIsolationState {
+	t.Helper()
+	env := map[string]string{gateIsolationModeEnvVar: "container", gateImageEnvVar: "img:1", gateCacheEnvVar: "process"}
+	for k, v := range extra {
+		env[k] = v
+	}
+	st, err := configureGateIsolation(fakeEnv(env), gateiso.Probes{}, logSink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.detect = func(context.Context, gateiso.Probes) gateiso.Runtime { return safeDockerRuntime(cacheSock) }
+	st.probeSandbox = func(context.Context) (bool, string) { return false, "no sandbox" }
+	if run != "" {
+		st.bindOwner(run, stage)
+	}
+	return st
+}
+
+// execOn runs one container gate exec with st as the process-wide state.
+func execOn(t *testing.T, st *gateIsolationState, extraEnv ...string) (string, int, gateDisposition) {
+	t.Helper()
+	prev := gateIsolation
+	gateIsolation = st
+	defer func() { gateIsolation = prev }()
+	return runBoundedGateArgvDisposed(context.Background(), []string{"sh", "-c", "true"}, t.TempDir(),
+		filepath.Join(t.TempDir(), "lc"), time.Minute, extraEnv...)
+}
+
+// cacheMountSource returns the source of the gate argv's -v token whose
+// target is exactly target ("" when absent).
+func cacheMountSource(argv []string, target string) string {
+	for i := 0; i+1 < len(argv); i++ {
+		if argv[i] == "-v" {
+			if src, ok := strings.CutSuffix(argv[i+1], ":"+target); ok {
+				return src
+			}
+		}
+	}
+	return ""
+}
+
+// envIndex returns the argv index of the LAST `-e key=…` token (-1 if none).
+func envIndex(argv []string, key string) int {
+	idx := -1
+	for i := 0; i+1 < len(argv); i++ {
+		if argv[i] == "-e" && strings.HasPrefix(argv[i+1], key+"=") {
+			idx = i
+		}
+	}
+	return idx
+}
+
+// endpointBound reports whether a recorded runtime argv opens with the
+// docker endpoint binding to cacheSock.
+func endpointBound(argv []string) bool {
+	return len(argv) > 2 && argv[0] == "docker" && argv[1] == "--host" && argv[2] == "unix://"+cacheSock
+}
+
+// TestRunGateInContainer_CacheVolumeMountedAndEnvPinned is the done-means row
+// for the shipped default: a process-mode state creates, prepares and
+// write-checks the volume (each endpoint-bound, all BEFORE the gate run),
+// mounts it read-write at /gatecache in place of the per-exec /gocache and
+// /lintcache binds, points GOCACHE / GOLANGCI_LINT_CACHE into it, and — with
+// the postgres service — still applies the service DSN LAST.
+func TestRunGateInContainer_CacheVolumeMountedAndEnvPinned(t *testing.T) {
+	rows := []struct {
+		name      string
+		extra     map[string]string
+		wantOrder string
+	}{
+		{"no services", nil, "passwd,cache_create,cache_prepare,cache_check,gate_run"},
+		{"postgres service", map[string]string{gateServicesEnvVar: "postgres"},
+			"passwd,cache_create,cache_prepare,cache_check,volume_create,service_run,logs,ready,bootstrap,gate_run,service_rm,volume_rm"},
+	}
+	for _, r := range rows {
+		t.Run(r.name, func(t *testing.T) {
+			var log strings.Builder
+			st := cacheState(t, &log, cacheRunA, cacheStageA, r.extra)
+			t.Cleanup(st.cleanup)
+			g := scriptGateExec(t, nil)
+			if out, code, disp := execOn(t, st, "GOCACHE=/evil", "FISHHAWK_TEST_PG_URL=postgres://attacker@evil/x"); code != 0 || disp != gateExecuted {
+				t.Fatalf("(out, code, disp) = (%q, %d, %s)", out, code, disp)
+			}
+			if got := strings.Join(g.order, ","); got != r.wantOrder {
+				t.Fatalf("call order:\n got %s\nwant %s", got, r.wantOrder)
+			}
+			name := g.argv["cache_create"][len(g.argv["cache_create"])-1]
+			if !(gateiso.CacheVolume{Name: name}).BelongsTo(cacheRunA, cacheStageA) {
+				t.Fatalf("cache volume %q does not embed the bound run/stage", name)
+			}
+			for _, l := range []string{"cache_create", "cache_prepare", "cache_check"} {
+				if !endpointBound(g.argv[l]) {
+					t.Errorf("%s argv is not endpoint-bound: %q", l, g.argv[l])
+				}
+				if !strings.Contains(strings.Join(g.argv[l], " "), name) {
+					t.Errorf("%s argv does not name %s: %q", l, name, g.argv[l])
+				}
+			}
+			for _, l := range []string{"cache_prepare", "cache_check"} {
+				if got := gateRunImage(g.argv[l]); got != "img:1" {
+					t.Errorf("%s ran image %q, want the gate image img:1", l, got)
+				}
+			}
+			prep := g.argv["cache_prepare"]
+			if owner := fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()); !argvHasPair(prep, "--user", "0:0") || !argvHasPair(prep, "sh", owner) {
+				t.Errorf("prepare does not run as root and chown to the caller %s: %q", owner, prep)
+			}
+			if !argvHasPair(g.argv["cache_check"], "--user", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid())) {
+				t.Errorf("write check does not run under the gate's user pin: %q", g.argv["cache_check"])
+			}
+			gate := g.argv["gate_run"]
+			if src := cacheMountSource(gate, gateiso.MountGateCache); src != name {
+				t.Errorf("gate /gatecache source = %q, want the volume %q (read-write): %q", src, name, gate)
+			}
+			for _, target := range []string{gateiso.MountGoCache, gateiso.MountLintCache} {
+				if src := cacheMountSource(gate, target); src != "" {
+					t.Errorf("volume mode still binds %s from %q", target, src)
+				}
+			}
+			if v, _ := lastEnvValue(gate, "GOCACHE"); v != gateiso.GateGoCache {
+				t.Errorf("gate GOCACHE = %q, want %q (an extra must not win)", v, gateiso.GateGoCache)
+			}
+			if v, _ := lastEnvValue(gate, "GOLANGCI_LINT_CACHE"); v != gateiso.GateLintCache {
+				t.Errorf("gate GOLANGCI_LINT_CACHE = %q, want %q", v, gateiso.GateLintCache)
+			}
+			if r.extra != nil {
+				if v, _ := lastEnvValue(gate, "FISHHAWK_TEST_PG_URL"); v != gateiso.PostgresGateURL {
+					t.Errorf("gate DSN = %q, want %q", v, gateiso.PostgresGateURL)
+				}
+				if envIndex(gate, "FISHHAWK_TEST_PG_URL") < envIndex(gate, "GOCACHE") {
+					t.Errorf("the service env must stay LAST, after the cache env: %q", gate)
+				}
+			}
+			if !strings.Contains(log.String(), `"event":"gate_cache_volume_ready","volume":"`+name+`","reused":false`) {
+				t.Errorf("missing gate_cache_volume_ready:\n%s", log.String())
+			}
+		})
+	}
+}
+
+// TestRunGateInContainer_CacheVolumeReusedWithinProcess: two execs on one
+// state mount the SAME volume; create + prepare + check run once per exec.
+func TestRunGateInContainer_CacheVolumeReusedWithinProcess(t *testing.T) {
+	var log strings.Builder
+	st := cacheState(t, &log, cacheRunA, cacheStageA, nil)
+	t.Cleanup(st.cleanup)
+	g := scriptGateExec(t, nil)
+	var mounted []string
+	for i := 0; i < 2; i++ {
+		if _, code, disp := execOn(t, st); code != 0 || disp != gateExecuted {
+			t.Fatalf("exec %d = %d / %s", i+1, code, disp)
+		}
+		mounted = append(mounted, cacheMountSource(g.argv["gate_run"], gateiso.MountGateCache))
+	}
+	if mounted[0] == "" || mounted[0] != mounted[1] {
+		t.Fatalf("execs mounted %q, want the same volume twice", mounted)
+	}
+	for _, l := range []string{"cache_create", "cache_prepare", "cache_check", "gate_run"} {
+		if g.counts[l] != 2 {
+			t.Errorf("%s ran %d times, want once per exec (2)", l, g.counts[l])
+		}
+	}
+	if !strings.Contains(log.String(), `"volume":"`+mounted[0]+`","reused":true`) {
+		t.Errorf("the second exec must log reused:true:\n%s", log.String())
+	}
+}
+
+// TestGateCacheVolume_DistinctPerProcessNeverShared is the poisoning
+// boundary: two states standing for two runner processes — bound to the SAME
+// (run, stage), the retried-stage shape — mint DIFFERENT volumes; B's gate
+// and aux argvs never name A's; A.cleanup() removes exactly A's; B's next
+// exec still mounts B's.
+func TestGateCacheVolume_DistinctPerProcessNeverShared(t *testing.T) {
+	a := cacheState(t, io.Discard, cacheRunA, cacheStageA, nil)
+	b := cacheState(t, io.Discard, cacheRunA, cacheStageA, nil)
+	t.Cleanup(a.cleanup)
+	t.Cleanup(b.cleanup)
+	ga := scriptGateExec(t, nil)
+	if _, code, _ := execOn(t, a); code != 0 {
+		t.Fatalf("A exec = %d", code)
+	}
+	nameA := cacheMountSource(ga.argv["gate_run"], gateiso.MountGateCache)
+	gb := scriptGateExec(t, nil)
+	if _, code, _ := execOn(t, b); code != 0 {
+		t.Fatalf("B exec = %d", code)
+	}
+	nameB := cacheMountSource(gb.argv["gate_run"], gateiso.MountGateCache)
+	if nameA == "" || nameB == "" || nameA == nameB {
+		t.Fatalf("A mounted %q, B mounted %q: two processes must never share a volume", nameA, nameB)
+	}
+	for l, argv := range gb.argv {
+		if strings.Contains(strings.Join(argv, " "), nameA) {
+			t.Errorf("B's %s argv names A's volume %s: %q", l, nameA, argv)
+		}
+	}
+	gc := scriptAuxExec(t, nil)
+	a.cleanup()
+	if gc.counts["cache_rm"] != 1 || !argvHasPair(gc.argv["cache_rm"], "-f", nameA) || !endpointBound(gc.argv["cache_rm"]) {
+		t.Fatalf("A.cleanup() = %d rm calls, last %q; want exactly one endpoint-bound `volume rm -f %s`", gc.counts["cache_rm"], gc.argv["cache_rm"], nameA)
+	}
+	g2 := scriptGateExec(t, nil)
+	if _, code, _ := execOn(t, b); code != 0 {
+		t.Fatalf("B exec 2 = %d", code)
+	}
+	if got := cacheMountSource(g2.argv["gate_run"], gateiso.MountGateCache); got != nameB {
+		t.Errorf("B's next exec mounted %q, want its own %q", got, nameB)
+	}
+}
+
+// TestGateCacheVolume_DifferentOwnerNeverReuses is #3967 approval condition
+// 2's runtime guard: an exec for a different (run, stage) pair — the run
+// differing, or only the stage — never mounts the volume minted for the first
+// pair; it mints its own, embedding its own ids, and cleanup removes both.
+func TestGateCacheVolume_DifferentOwnerNeverReuses(t *testing.T) {
+	rows := []struct{ name, run, stage string }{
+		{"different run and stage", cacheRunB, cacheStageB},
+		{"same run, different stage", cacheRunA, cacheStageB},
+	}
+	for _, r := range rows {
+		t.Run(r.name, func(t *testing.T) {
+			var log strings.Builder
+			st := cacheState(t, &log, cacheRunA, cacheStageA, nil)
+			g1 := scriptGateExec(t, nil)
+			if _, code, _ := execOn(t, st); code != 0 {
+				t.Fatalf("exec 1 = %d", code)
+			}
+			first := cacheMountSource(g1.argv["gate_run"], gateiso.MountGateCache)
+			st.bindOwner(r.run, r.stage)
+			g2 := scriptGateExec(t, nil)
+			if _, code, _ := execOn(t, st); code != 0 {
+				t.Fatalf("exec 2 = %d", code)
+			}
+			second := cacheMountSource(g2.argv["gate_run"], gateiso.MountGateCache)
+			if first == "" || second == "" || first == second {
+				t.Fatalf("pair 1 mounted %q, pair 2 mounted %q: a second (run, stage) must never reuse the first's volume", first, second)
+			}
+			if !(gateiso.CacheVolume{Name: second}).BelongsTo(r.run, r.stage) {
+				t.Errorf("the second volume %q does not embed its own run/stage", second)
+			}
+			for l, argv := range g2.argv {
+				if strings.Contains(strings.Join(argv, " "), first) {
+					t.Errorf("pair 2's %s argv names pair 1's volume: %q", l, argv)
+				}
+			}
+			if !strings.Contains(log.String(), `"event":"gate_cache_volume_not_reused","volume":"`+first+`","replacement":"`+second+`"`) {
+				t.Errorf("missing gate_cache_volume_not_reused:\n%s", log.String())
+			}
+			gc := scriptAuxExec(t, nil)
+			st.cleanup()
+			if gc.counts["cache_rm"] != 2 {
+				t.Errorf("cleanup removed %d volumes, want both minted (2)", gc.counts["cache_rm"])
+			}
+		})
+	}
+}
+
+// TestGateCacheVolume_UnboundStateNeverMountsAnotherOwnersVolume: a state
+// that never had bindOwner called — even one already HOLDING a volume minted
+// for another (run, stage), seeded by construction — never mounts it: the
+// mint refuses the empty owner and the exec degrades to the per-exec binds
+// with no cache runtime call at all. bindOwner and gateCacheVolume are
+// nil-safe.
+func TestGateCacheVolume_UnboundStateNeverMountsAnotherOwnersVolume(t *testing.T) {
+	other, err := gateiso.NewCacheVolume(cacheRunB, cacheStageB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var log strings.Builder
+	st := cacheState(t, &log, "", "", nil)
+	st.cacheVol = &other
+	g := scriptGateExec(t, nil)
+	if _, code, disp := execOn(t, st); code != 0 || disp != gateExecuted {
+		t.Fatalf("exec = %d / %s", code, disp)
+	}
+	gate := g.argv["gate_run"]
+	if strings.Contains(strings.Join(gate, " "), other.Name) || cacheMountSource(gate, gateiso.MountGateCache) != "" {
+		t.Fatalf("an unbound state mounted a cache volume: %q", gate)
+	}
+	if cacheMountSource(gate, gateiso.MountGoCache) == "" {
+		t.Errorf("the degrade must keep the per-exec /gocache bind: %q", gate)
+	}
+	if got := strings.Join(g.order, ","); got != "passwd,gate_run" {
+		t.Errorf("calls = %s, want no cache runtime call", got)
+	}
+	if !strings.Contains(log.String(), `"event":"gate_cache_volume_unavailable","volume":"","step":"mint"`) {
+		t.Errorf("missing the mint degrade:\n%s", log.String())
+	}
+	var nilState *gateIsolationState
+	nilState.bindOwner(cacheRunA, cacheStageA)
+	if got := nilState.gateCacheVolume(context.Background(), safeDockerRuntime(cacheSock), "img:1", t.TempDir(), nil, 1, 1); got != "" {
+		t.Errorf("nil state gateCacheVolume = %q, want \"\"", got)
+	}
+	nilState.cleanup()
+}
+
+// TestRunGateInContainer_CacheVolumeDegrades: one row per cache-step failure
+// mode. Each still EXECUTES the gate (gateExecuted, its own exit code) on the
+// per-exec /gocache and /lintcache binds with GOCACHE=/gocache, never mounts
+// /gatecache, logs gate_cache_volume_unavailable naming the step, and runs no
+// later cache step; the minted name stays recorded so cleanup removes it.
+func TestRunGateInContainer_CacheVolumeDegrades(t *testing.T) {
+	failOn := func(label string, code int, timedOut bool) func(string, int) (string, int, bool) {
+		return func(l string, n int) (string, int, bool) {
+			if l == label {
+				return "Error: boom", code, timedOut
+			}
+			return serviceHappyPath(l, n)
+		}
+	}
+	rows := []struct {
+		name    string
+		respond func(string, int) (string, int, bool)
+		uid     int
+		step    string
+		reason  string
+		ran     string
+	}{
+		{"create exits 1", failOn("cache_create", 1, false), 0, "create", "exit 1: Error: boom", "cache_create"},
+		{"create timed out", failOn("cache_create", -1, true), 0, "create", "timed out after " + gateCacheVolumeTimeout.String(), "cache_create"},
+		{"prepare exits 1", failOn("cache_prepare", 1, false), 0, "prepare", "exit 1: Error: boom", "cache_create,cache_prepare"},
+		{"prepare timed out", failOn("cache_prepare", -1, true), 0, "prepare", "timed out after " + gateCachePrepareTimeout.String(), "cache_create,cache_prepare"},
+		{"check exits 1 (ownership)", failOn("cache_check", 1, false), 0, "check", "ownership: the gate uid", "cache_create,cache_prepare,cache_check"},
+		{"prepare argv refused", nil, -1, "prepare", "argv: ", "cache_create"},
+	}
+	for _, r := range rows {
+		t.Run(r.name, func(t *testing.T) {
+			var log strings.Builder
+			st := cacheState(t, &log, cacheRunA, cacheStageA, nil)
+			if r.uid != 0 {
+				st.uid, st.gid = r.uid, r.uid
+			}
+			g := scriptGateExec(t, r.respond)
+			out, code, disp := execOn(t, st)
+			if code != 0 || disp != gateExecuted || out != "gate ok" {
+				t.Fatalf("(out, code, disp) = (%q, %d, %s), want the gate's own verdict", out, code, disp)
+			}
+			var cacheCalls []string
+			for _, l := range g.order {
+				if strings.HasPrefix(l, "cache_") {
+					cacheCalls = append(cacheCalls, l)
+				}
+			}
+			if got := strings.Join(cacheCalls, ","); got != r.ran {
+				t.Errorf("cache calls = %s, want %s (no step after the failing one)", got, r.ran)
+			}
+			gate := g.argv["gate_run"]
+			if src := cacheMountSource(gate, gateiso.MountGateCache); src != "" {
+				t.Errorf("a degraded exec mounted the cache volume %q: %q", src, gate)
+			}
+			if cacheMountSource(gate, gateiso.MountGoCache) == "" || cacheMountSource(gate, gateiso.MountLintCache) == "" {
+				t.Errorf("the degrade must keep the per-exec /gocache and /lintcache binds: %q", gate)
+			}
+			if v, _ := lastEnvValue(gate, "GOCACHE"); v != gateiso.MountGoCache {
+				t.Errorf("gate GOCACHE = %q, want the per-exec %q", v, gateiso.MountGoCache)
+			}
+			if !strings.Contains(log.String(), `"event":"gate_cache_volume_unavailable"`) ||
+				!strings.Contains(log.String(), `"step":"`+r.step+`","reason":"`+r.reason) {
+				t.Errorf("log lacks the %s degrade with reason %q:\n%s", r.step, r.reason, log.String())
+			}
+			if !strings.Contains(log.String(), `"event":"gate_container_timing","cache":"degraded","cache_volume":""`) {
+				t.Errorf("timing line must report the degraded posture:\n%s", log.String())
+			}
+			gc := scriptAuxExec(t, nil)
+			st.cleanup()
+			if gc.counts["cache_rm"] != 1 {
+				t.Errorf("cleanup ran %d volume rm, want 1 (a partial create is still removed)", gc.counts["cache_rm"])
+			}
+		})
+	}
+}
+
+// TestRunGateInContainer_CacheOffKeepsPerExecCaches: FISHHAWK_GATE_CACHE=off
+// and the ZERO-VALUE cache mode of a hand-built state both run no cache
+// runtime call and keep the pre-#3967 per-exec binds.
+func TestRunGateInContainer_CacheOffKeepsPerExecCaches(t *testing.T) {
+	for _, name := range []string{"off", "zero value"} {
+		t.Run(name, func(t *testing.T) {
+			var log strings.Builder
+			st := cacheState(t, &log, cacheRunA, cacheStageA, map[string]string{gateCacheEnvVar: "off"})
+			if name == "zero value" {
+				st.cacheMode = ""
+			}
+			g := scriptGateExec(t, nil)
+			if _, code, disp := execOn(t, st); code != 0 || disp != gateExecuted {
+				t.Fatalf("exec = %d / %s", code, disp)
+			}
+			if got := strings.Join(g.order, ","); got != "passwd,gate_run" {
+				t.Errorf("calls = %s, want passwd,gate_run", got)
+			}
+			gate := g.argv["gate_run"]
+			if cacheMountSource(gate, gateiso.MountGateCache) != "" || cacheMountSource(gate, gateiso.MountGoCache) == "" || cacheMountSource(gate, gateiso.MountLintCache) == "" {
+				t.Errorf("off must keep the per-exec binds only: %q", gate)
+			}
+			if !strings.Contains(log.String(), `"event":"gate_container_timing","cache":"off"`) {
+				t.Errorf("timing line must report cache off:\n%s", log.String())
+			}
+			gc := scriptAuxExec(t, nil)
+			st.cleanup()
+			if len(gc.order) != 0 {
+				t.Errorf("cleanup with no minted volume ran %q", gc.order)
+			}
+		})
+	}
+}
+
+// TestGateIsolationState_CleanupRemovesCacheVolume: cleanup removes the
+// minted volume with exactly one endpoint-bound `volume rm -f <name>`; with
+// no minted volume it runs nothing; a failing removal is logged as
+// gate_cache_volume_cleanup_failed (naming the label) and the global is
+// still cleared.
+func TestGateIsolationState_CleanupRemovesCacheVolume(t *testing.T) {
+	t.Run("removes after an exec", func(t *testing.T) {
+		var log strings.Builder
+		st := cacheState(t, &log, cacheRunA, cacheStageA, nil)
+		g := scriptGateExec(t, nil)
+		if _, code, _ := execOn(t, st); code != 0 {
+			t.Fatalf("exec = %d", code)
+		}
+		name := cacheMountSource(g.argv["gate_run"], gateiso.MountGateCache)
+		gc := scriptAuxExec(t, nil)
+		installGateState(t, st)
+		st.cleanup()
+		if got := strings.Join(gc.order, ","); got != "cache_rm" {
+			t.Fatalf("cleanup calls = %s, want exactly one cache_rm", got)
+		}
+		want := []string{"docker", "--host", "unix://" + cacheSock, "volume", "rm", "-f", name}
+		if strings.Join(gc.argv["cache_rm"], "\x00") != strings.Join(want, "\x00") {
+			t.Errorf("rm argv = %q, want %q", gc.argv["cache_rm"], want)
+		}
+		if gateIsolation != nil || !strings.Contains(log.String(), `"event":"gate_cache_volume_removed","volume":"`+name+`"`) {
+			t.Errorf("global = %v; log:\n%s", gateIsolation, log.String())
+		}
+		st.cleanup()
+		if gc.counts["cache_rm"] != 1 {
+			t.Errorf("a second cleanup re-removed (%d rm calls)", gc.counts["cache_rm"])
+		}
+	})
+	t.Run("no exec, no removal", func(t *testing.T) {
+		st := cacheState(t, io.Discard, cacheRunA, cacheStageA, nil)
+		gc := scriptAuxExec(t, nil)
+		st.cleanup()
+		if len(gc.order) != 0 {
+			t.Errorf("cleanup with nothing minted ran %q", gc.order)
+		}
+	})
+	t.Run("unbound runtime: create and removal argv refused, nothing runs", func(t *testing.T) {
+		var log strings.Builder
+		st := cacheState(t, &log, cacheRunA, cacheStageA, nil)
+		g := scriptAuxExec(t, nil)
+		unbound := gateiso.Runtime{Kind: gateiso.KindDocker}
+		if got := st.gateCacheVolume(context.Background(), unbound, "img:1", t.TempDir(), nil, 1, 1); got != "" {
+			t.Fatalf("an unbound runtime mounted %q", got)
+		}
+		st.cleanup()
+		if len(g.order) != 0 {
+			t.Errorf("a refused argv still ran %q", g.order)
+		}
+		for _, w := range []string{`"step":"create","reason":"argv: `, `"event":"gate_cache_volume_cleanup_failed","volume":"fishhawk-gate-cache-`, `"detail":"argv: `} {
+			if !strings.Contains(log.String(), w) {
+				t.Errorf("log lacks %s:\n%s", w, log.String())
+			}
+		}
+	})
+	t.Run("removal failure logged, global cleared", func(t *testing.T) {
+		var log strings.Builder
+		st := cacheState(t, &log, cacheRunA, cacheStageA, nil)
+		g := scriptGateExec(t, nil)
+		if _, code, _ := execOn(t, st); code != 0 {
+			t.Fatalf("exec = %d", code)
+		}
+		name := cacheMountSource(g.argv["gate_run"], gateiso.MountGateCache)
+		scriptAuxExec(t, func(string, int) (string, int, bool) { return "Error: volume is in use", 1, false })
+		installGateState(t, st)
+		st.cleanup()
+		if gateIsolation != nil {
+			t.Errorf("a failed removal must still clear the global")
+		}
+		want := `"event":"gate_cache_volume_cleanup_failed","volume":"` + name + `","detail":"exit 1: Error: volume is in use","label":"` + gateiso.CacheVolumeLabel + `"`
+		if !strings.Contains(log.String(), want) {
+			t.Errorf("log lacks %s:\n%s", want, log.String())
+		}
+	})
+}
+
+// TestRunGateInContainer_TimingLogLine: every container exec logs exactly one
+// gate_container_timing line carrying the cache posture, the volume, the
+// phase split and the gate's exit code.
+func TestRunGateInContainer_TimingLogLine(t *testing.T) {
+	var log strings.Builder
+	st := cacheState(t, &log, cacheRunA, cacheStageA, nil)
+	t.Cleanup(st.cleanup)
+	scriptGateExec(t, func(l string, n int) (string, int, bool) {
+		if l == "gate_run" && n == 2 {
+			return "red", 3, false
+		}
+		return serviceHappyPath(l, n)
+	})
+	for i := 0; i < 2; i++ {
+		execOn(t, st)
+	}
+	type timing struct {
+		Event       string `json:"event"`
+		Cache       string `json:"cache"`
+		CacheVolume string `json:"cache_volume"`
+		CacheMS     *int64 `json:"cache_ms"`
+		SeedMS      *int64 `json:"seed_ms"`
+		ServiceMS   *int64 `json:"service_ms"`
+		ExecMS      *int64 `json:"exec_ms"`
+		ExitCode    int    `json:"exit_code"`
+	}
+	var lines []timing
+	for _, l := range strings.Split(log.String(), "\n") {
+		if strings.Contains(l, `"event":"gate_container_timing"`) {
+			var tl timing
+			if err := json.Unmarshal([]byte(l), &tl); err != nil {
+				t.Fatalf("timing line is not JSON: %v: %s", err, l)
+			}
+			lines = append(lines, tl)
+		}
+	}
+	if len(lines) != 2 {
+		t.Fatalf("got %d timing lines, want one per exec (2):\n%s", len(lines), log.String())
+	}
+	for i, tl := range lines {
+		if tl.Cache != "process" || !strings.HasPrefix(tl.CacheVolume, "fishhawk-gate-cache-") ||
+			tl.CacheMS == nil || tl.SeedMS == nil || tl.ServiceMS == nil || tl.ExecMS == nil {
+			t.Errorf("timing line %d = %+v", i+1, tl)
+		}
+	}
+	if lines[0].ExitCode != 0 || lines[1].ExitCode != 3 {
+		t.Errorf("exit codes = %d, %d; want 0, 3", lines[0].ExitCode, lines[1].ExitCode)
+	}
+}
+
+// TestDeclaredImage_CacheVolumePreparedForResolvedImage (#3967 approval
+// condition 5): for a spec-declared gate_container the cache volume is
+// prepared and checked with the RESOLVED name@digest — the image the gate
+// itself runs — and mounted beside it, exactly as for FISHHAWK_GATE_IMAGE.
+func TestDeclaredImage_CacheVolumePreparedForResolvedImage(t *testing.T) {
+	ref := "ghcr.io/o/g@" + declDigestA
+	st := declaredState(t, containerEnv(map[string]string{gateImageEnvVar: "img:1", gateCacheEnvVar: "process"}),
+		safeDockerRuntime(declSock), stageImage(ref), io.Discard)
+	st.bindOwner(cacheRunA, cacheStageA)
+	t.Cleanup(st.cleanup)
+	g := scriptGateExec(t, pulledImageResponder(0, declImageID+" ghcr.io/o/g@"+declDigestA))
+	if _, code, disp := runDeclaredGate(t, context.Background(), t.TempDir()); code != 0 || disp != gateExecuted {
+		t.Fatalf("exec = %d / %s", code, disp)
+	}
+	if got, want := strings.Join(g.order, ","), "inspect,passwd,cache_create,cache_prepare,cache_check,gate_run"; got != want {
+		t.Fatalf("calls = %s, want %s", got, want)
+	}
+	for _, l := range []string{"cache_prepare", "cache_check", "gate_run"} {
+		if got := gateRunImage(g.argv[l]); got != ref {
+			t.Errorf("%s image = %q, want the resolved %q (never img:1)", l, got, ref)
+		}
+	}
+	if src := cacheMountSource(g.argv["gate_run"], gateiso.MountGateCache); !strings.HasPrefix(src, "fishhawk-gate-cache-") {
+		t.Errorf("declared-image gate does not mount the cache volume: %q", g.argv["gate_run"])
 	}
 }

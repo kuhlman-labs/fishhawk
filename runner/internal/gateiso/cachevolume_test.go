@@ -153,7 +153,10 @@ func TestCacheVolume_BelongsTo(t *testing.T) {
 func TestCacheVolumeArgv_Golden(t *testing.T) {
 	v := CacheVolume{Name: testCacheVolume}
 	mount := []string{"-v", testCacheVolume + ":/gatecache", "--entrypoint", "", testGateImage}
-	install := []string{"install", "-d", "-o", "501", "-g", "20", "-m", "0700", "/gatecache/gocache", "/gatecache/lintcache"}
+	// #3967: mkdir THEN chown, the owner and directories positional — never
+	// busybox `install -o -g -m`, which chowns before it chmods (EPERM under
+	// CAP_CHOWN alone).
+	install := []string{"sh", "-c", cachePrepareScript, "sh", "501:20", "/gatecache/gocache", "/gatecache/lintcache"}
 	probe := []string{"sh", "-c", cacheWriteProbeScript, "sh", "/gatecache/gocache", "/gatecache/lintcache"}
 	cat := func(parts ...[]string) []string {
 		var out []string
@@ -204,6 +207,9 @@ func TestCacheVolumeArgv_Golden(t *testing.T) {
 	}
 	if want := `set -e; for d in "$@"; do p="$d/.fishhawk-write-probe"; : > "$p"; rm -f "$p"; done`; cacheWriteProbeScript != want {
 		t.Errorf("write probe script = %q, want %q", cacheWriteProbeScript, want)
+	}
+	if want := `o="$1"; shift; mkdir -p -m 0700 "$@" && chown "$o" "$@"`; cachePrepareScript != want {
+		t.Errorf("prepare script = %q, want %q", cachePrepareScript, want)
 	}
 }
 
