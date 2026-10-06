@@ -14,24 +14,29 @@ import (
 	"golang.org/x/mod/modfile"
 )
 
-// Build-cache posture for the container path (ADR-063 gap 3), stated as an
-// INVARIANT rather than a preference:
+// Build-cache posture for the container path (ADR-063 gap 3). The MODULE
+// cache is stated as an INVARIANT rather than a preference:
 //
 //   - The host GOMODCACHE is the TRUSTED SEED. It is never bind-mounted into
 //     a container and never opened for writing by the seeding step: it is
 //     only READ, as a GOPROXY file:// source, by a `go mod download` running
 //     host-side against an empty destination.
-//   - Every container-visible cache directory is created EMPTY per exec
-//     (NewVisibleCaches), populated host-side (SeedModCache), mounted for
-//     exactly one container exec, and removed afterwards (Remove). Host
+//   - Every container-visible module cache directory is created EMPTY per
+//     exec (NewVisibleCaches), populated host-side (SeedModCache), mounted
+//     for exactly one container exec, and removed afterwards (Remove). Host
 //     seeding never opens a directory a container has already been given:
 //     SeedModCache REFUSES a non-empty destination, so a symlink a previous
 //     container planted in its visible dir can never redirect a later
 //     host-side write into the host cache or anywhere else on the host.
-//   - GOCACHE has NO seed. Each container exec starts with a cold build
-//     cache. That is a deliberate, documented cost (one cold build per gate
-//     exec, three per stage) rather than a shared cache that a container
-//     could poison for the next exec.
+//   - GOCACHE and the golangci-lint cache have NO host seed and are never
+//     mounted from a host cache. They take one of two postures:
+//     FISHHAWK_GATE_CACHE=off keeps them per-exec throwaway directories, so
+//     each container exec starts cold (the pre-#3967 posture); otherwise
+//     (the default, E51.18 / #3967) they live in ONE named volume per runner
+//     PROCESS (cachevolume.go), created by the runtime — never a host path —
+//     and reused by every container exec of that process. A runner process
+//     serves exactly one stage of one run, so no gate ever reads a build
+//     cache another run's gate wrote; execs inside one run share it.
 //   - The seed runs HOST-SIDE against AGENT-AUTHORED module metadata, so the
 //     checkout is treated as untrusted input on both axes. Environment: the
 //     download never reads os.Environ(); it runs under the caller's
@@ -48,11 +53,13 @@ import (
 //     unrelated host file.
 //
 // Residuals, stated not stronger: the FALLBACK paths (clone, clone-sandbox)
-// still run gates with the host caches, exactly as before ADR-063; there is
-// no persistent shared cache on the container path, so mod-cache
-// repopulation plus a cold GOCACHE is paid on EVERY container exec. The
-// container path is opt-in via FISHHAWK_GATE_IMAGE, so no default runner
-// pays it.
+// still run gates with the host caches, exactly as before ADR-063. Module
+// cache repopulation is paid on EVERY container exec; a cold GOCACHE is paid
+// on every exec under FISHHAWK_GATE_CACHE=off and on the first exec of each
+// runner process otherwise (or every exec whose cache volume degraded). The
+// per-process volume shares the build cache, cached test results included,
+// across the execs of one run. The container path is opt-in (FISHHAWK_GATE_IMAGE
+// or a spec-declared gate image), so no default runner pays any of it.
 
 // ErrDestinationNotEmpty is returned (wrapped) by SeedModCache when the
 // destination module cache already has entries. It is the invariant's
@@ -74,7 +81,7 @@ type VisibleCaches struct {
 
 // seedGoCacheDir is the throwaway GOCACHE the host-side seed itself runs
 // with, under Root so Remove sweeps it. It is NOT the container-visible
-// GoCache: the container's build cache stays cold (no seed) by invariant.
+// GoCache: the container's build cache is never host-seeded, by invariant.
 func (v *VisibleCaches) seedGoCacheDir() string { return filepath.Join(v.Root, "seed-gocache") }
 
 // NewVisibleCaches creates a fresh throwaway cache root
