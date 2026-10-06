@@ -70,6 +70,7 @@ Chains resolve transitively (`c` extends `b` extends `a`), and a deriving workfl
 | `stages` | the ONE keyed array: merged **by stage `id`** |
 | `reviewers` | taken **WHOLE** from exactly one rung — never blended |
 | `executor` | key-wise, **except** the branch rule below |
+| `gate_container` | key-wise, **except** the source rule: a deriving stage naming a source **replaces** the base stage's source — see [Gate container](#gate-container-gate_container) |
 
 **Arrays replace, they never concatenate.** This is a governance rule, not a convenience: a `reviewers.agents` or `approvals` list that accumulated entries by inheritance would give a stage an approver or a reviewer **its author did not write**. Declaring one agent reviewer where the base declared two resolves to exactly one — the deriving one.
 
@@ -203,6 +204,7 @@ workflows:
     budgets: [...]          # optional; periodic USD ceilings across runs
     decomposition:          # optional
       max_parallel: 3
+    gate_container: {...}   # optional; the image every gate runs in (a stage may override)
     defaults: {...}         # optional; workflow-level reuse defaults
     stages: [...]           # required (or inherited whole via extends)
 ```
@@ -220,6 +222,7 @@ workflows:
 | `on_ci_failure` | Auto-retry policy for a failed required check on the implement stage's PR. |
 | `budgets` | Recurring USD ceilings across **all** runs of the workflow. |
 | `decomposition` | Decomposition controls; its one member is `max_parallel`. |
+| `gate_container` | The container every gate command of every stage runs in, unless the stage declares its own — see [Gate container](#gate-container-gate_container). Not inherited through `extends`. |
 | `defaults` | Workflow-level `executor` / `reviewers` / `budget` defaults — rung 3 of the resolution ladder. |
 | `stages` | The ordered stage list. Required, unless inherited whole through `extends`. |
 
@@ -461,6 +464,7 @@ stages:
     egress: {...}             # optional; egress allowance (enforced on an acceptance stage)
     permissions: {...}        # optional; declared network/write/shell (declaration-only)
     concurrency: {...}        # optional; dispatch concurrency group (host-dispatched agent stages)
+    gate_container: {...}     # optional; the image this stage's gates run in (overrides the workflow's)
 ```
 
 Stage `id` is unique within the workflow and is what `inputs[].from_stage` and `needs` reference. `type` is the closed five-token enum below. `executor` names who runs the stage and is required on the **resolved** document — a stage may omit it and inherit one from a `defaults` block or an `extends` base.
@@ -608,6 +612,52 @@ The optional per-stage `concurrency` block (#3964 / ADR-087) places a stage in a
 - **`limit`** is an integer `1`–`64`; absent means `1`. When stages of one group declare different limits, the **admitting** stage's `limit` governs.
 - An empty `concurrency: {}` is an authoring error (the schema requires at least one of `group`, `limit`).
 - **Scope of effect.** The block is honoured only for host-dispatched agent stages; on a stage dispatched any other way it is inert. It is **stage-level only** — it is not a `defaults` key, so it is never inherited from a file- or workflow-level `defaults` block.
+
+## Gate container (`gate_container`)
+
+The optional `gate_container` block (E51.3 / #2136; ADR-063) declares the container a stage's **gate commands** run in — the `verify` command, the `diff_coverage` measurement and the auto-format absorb all reach the same seam, so all of them run in it. It is declarable at **workflow** level and **per stage**.
+
+```yaml
+workflows:
+  feature_change:
+    gate_container:                         # workflow level: every stage's gates
+      image: ghcr.io/org/gate@sha256:4f1c...e9   # digest-pinned registry image
+    stages:
+      - id: apply
+        type: implement
+        executor:
+          agent: claude-code
+        gate_container:                     # stage override: an in-repo build
+          dockerfile: build/gate/Dockerfile
+          context: build/gate
+```
+
+**Shape — exactly one source.** The block carries a registry `image`, **or** an in-repo build declared as `dockerfile` **and** `context` together. `image` beside either build key, a `dockerfile` without its `context` (or the reverse), and an empty `{}` are schema errors at the block's path. `image` is a docker-style reference, optionally digest-pinned (`name@sha256:<64 lowercase hex>`), at most 512 characters. `dockerfile` and `context` are **repository-relative** paths: no leading `/`, no `..` segment (`context: .` is the repository root). The block is closed: the key `services` is **reserved** for daemon-dependent gates (#2137, today the runner's `FISHHAWK_GATE_SERVICES`) and is rejected until that lands. v0 and v1 reject the key outright.
+
+**Precedence, highest first:** the stage's `gate_container` > the workflow's `gate_container` > the runner's `FISHHAWK_GATE_IMAGE` > the `clone-sandbox` / `clone` fallback. The stage is resolved by **identity**, not by type, so two stages of one type may declare different images, and a retry or recovery child resolves to the declaration of the stage it re-runs. The backend echoes the effective block, and whether it came from the `stage` or the `workflow`, on the stage prompt; the runner applies it.
+
+**Reuse.** A workflow-level `gate_container` is **not** inherited through `extends` (no workflow-level key is — the same rule as `applies_to` and `schedule`), and `gate_container` is **not** a `defaults` key. A base **stage's** block is inherited like any other stage key, under the **source rule**: when the deriving stage's block names any source key (`image`, `dockerfile`, `context`), the base block's source keys are dropped first, so a base `{image}` overridden by a deriving `{dockerfile, context}` resolves to exactly the deriving build rather than a blended two-source block. A deriving stage that is silent inherits the base block whole.
+
+**Image policy (applied by the runner, per `FISHHAWK_DEPLOYMENT_PROFILE`).** The operator-chosen `FISHHAWK_GATE_IMAGE` is exempt from this policy; a declared block is not.
+
+| Declared | `local` / `self-hosted` | `hosted` |
+|---|---|---|
+| `image`, digest-pinned | allowed | allowed only when it matches the operator allowlist |
+| `image`, tag-only | allowed with a warning | **refused** |
+| `image` off a configured allowlist | **refused** | **refused** |
+| `dockerfile` + `context` | allowed (`FISHHAWK_GATE_BUILD=deny` disables) | **refused** unless `FISHHAWK_GATE_BUILD=allow` **and** an allowlist is configured |
+
+The allowlist (`FISHHAWK_GATE_IMAGE_ALLOWLIST`) is validated at runner startup; its entry grammar is in `runner/internal/gateiso/README.md`. A refusal is a category-C gate failure naming the rule — never a fallback to `FISHHAWK_GATE_IMAGE`, and never routed to the fix agent.
+
+**Pull semantics.** A declared `image` must be **pullable from a registry**. The runner pulls it explicitly before the gate, under its own timeout and outside the gate's timeout, with the container runtime CLI's **own** credential store on the runner host — Fishhawk passes no credential and the spec cannot carry one. A pinned reference is pulled only when absent and run by that pin; a tag-only reference is always pulled and then run by the resolved `name@<digest>`, so a concurrent retag cannot change what runs. Any pull or inspect failure, timeout, registry outage or missing digest fails the gate category C. **A local-only image cannot be declared as `image`:** a tag-only reference that cannot be pulled fails category C with a named reason telling the operator to declare it as `dockerfile` + `context`, or to set it as the runner's `FISHHAWK_GATE_IMAGE`.
+
+**In-repo builds.** The build context is the **committed** tree at the gate's head SHA, materialized from git — uncommitted and untracked working-tree files never enter a gate image — with `.dockerignore` applied to what is sent. The image is tagged by a content digest derived from the git tree hash of `context`, the `dockerfile` blob hash at that SHA and the `.dockerignore` effect, so every gate kind and every clone of one commit hits one cached image, and a mode-only change rebuilds. `RUN` steps build with `--network=none`; base images are pulled through the daemon. Before any build the runner statically scans the Dockerfile — instructions case-insensitively — and refuses, category C with a named reason: a parser directive that can select a build frontend (`# syntax=`, `// syntax=`, a JSON first line) or any other leading directive it does not recognise as harmless; an `ADD`/`COPY` source that is not a plain, clean, relative in-context path (a `$`, `://`, `@` or `.git`, a host-like first component, or an scp-like `x:y`); `RUN --network=` anything but `none`; `RUN --security=insecure`; and, under `hosted`, `RUN --mount=type=cache`. With an allowlist configured every base — each `FROM`, `COPY --from=<image>` and `RUN --mount=…,from=<image>` — must pass it (and be digest-pinned under `hosted`); a variable-bearing base is refused there because it cannot be checked statically. Build tags accumulate one per distinct content digest and carry the label `fishhawk.gate-build=1`; prune them with `docker image prune -a --filter label=fishhawk.gate-build=1`. Prefer a **narrow** `context`: `context: .` hashes the repository root, so every commit is a new digest and a new build.
+
+**The image contract.** A gate image is run with no Docker socket inside, as a non-root user (`--user`, or `--userns=keep-id` under rootless podman), with its entrypoint reset and the gate argv exec'd as given, `--network=none`, `--cap-drop=ALL`, `no-new-privileges`, the mount guard and per-exec caches, and `GOPROXY=off` — so the toolchain the gate needs must already be in the image.
+
+**Evidence.** The stage's `gate_isolation` evidence records the image source (`stage`, `workflow`, or the operator env), the resolved digest or built image id, and the build-context digest of the **final deciding** gate, plus a count of distinct images when one stage ran more than one. A declaration the runner could not honour (no safe container runtime under `auto`, or an explicit `clone` / `clone-sandbox` mode) runs the fallback with a warning and a `declared_unhonored` marker in `local` / `self-hosted`, and is refused in `hosted`.
+
+**Honest limits.** The static scan is a deny-by-default guard over the Dockerfile text, not a sandbox: `RUN` steps run as root inside the build, a base image's `ONBUILD` triggers are not visible to it, and outside `hosted` BuildKit cache mounts persist on the daemon across builds (an accepted limit there). A Dockerfile in the repository is writable by the agent that authors the change, so a build declaration protects the **host**, not the verdict. Daemon-dependent gates and `services` stay with #2137. Runner contract: `runner/internal/gateiso/README.md`.
 
 ## Executor
 
