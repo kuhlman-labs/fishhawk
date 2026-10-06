@@ -11,9 +11,11 @@ import (
 	"strings"
 )
 
-// In-container mount points. The checkout is the working directory; the three
-// caches are per-exec throwaway directories (cache.go) so nothing the gate
-// writes outlives the exec.
+// In-container mount points. The checkout is the working directory. The module
+// cache is always a per-exec throwaway directory (cache.go); GOCACHE and the
+// lint cache are either per-exec throwaway directories too (the bind form) or
+// live in the runner process's cache volume at MountGateCache (the volume
+// form, ContainerSpec.CacheVolume, cachevolume.go).
 const (
 	MountWork       = "/work"
 	MountGoCache    = "/gocache"
@@ -39,11 +41,19 @@ type ContainerSpec struct {
 	// Name is the container name (NewContainerName); KillArgv removes it.
 	Name string
 	// Checkout, GoCache, GoModCache, LintCache are the four host-side
-	// bind-mount sources, each guarded by ForbidSocketMounts.
+	// bind-mount sources, each guarded by ForbidSocketMounts. With
+	// CacheVolume set only Checkout and GoModCache are required; GoCache and
+	// LintCache are then neither rendered nor guarded.
 	Checkout   string
 	GoCache    string
 	GoModCache string
 	LintCache  string
+	// CacheVolume is the runner process's gate cache volume (#3967), mounted
+	// read-write at /gatecache in place of the GoCache and LintCache binds.
+	// BuildArgv refuses any name not shaped like a cache volume name, so a
+	// host path or the daemon socket can never ride in as the cache. Empty →
+	// the bind form, byte-identical to the pre-#3967 argv.
+	CacheVolume string
 	// PasswdFile is an optional HOST file (WritePasswdFile) mounted
 	// read-only at /etc/passwd; guarded by ForbidSocketMounts with the
 	// other sources. Empty → no passwd mount.
@@ -318,17 +328,22 @@ func (r Runtime) BindEndpointEnv(base []string) ([]string, error) {
 	return append(out, pin), nil
 }
 
-// BuildArgv renders the runtime command line. It applies ForbidSocketMounts
-// to every bind-mount source (the passwd file included) and validates every
-// ServiceMount BEFORE emitting any -v token, and returns the refusal with no
-// argv. The exact shape is:
+// BuildArgv renders the runtime command line. It validates the cache volume,
+// applies ForbidSocketMounts to every bind-mount source (the passwd file
+// included) and validates every ServiceMount BEFORE emitting any -v token, and
+// returns the refusal with no argv. The exact shape is:
 //
 //	<runtime> <endpoint…> run --rm --name <name> --network=none --cap-drop=ALL
 //	  --security-opt=no-new-privileges --workdir /work
 //	  (--user uid:gid | --userns=keep-id)
-//	  -v checkout:/work -v gocache:/gocache -v gomodcache:/gomodcache
-//	  -v lintcache:/lintcache [-v passwdfile:/etc/passwd:ro]
+//	  -v checkout:/work
+//	  ( -v gocache:/gocache -v gomodcache:/gomodcache -v lintcache:/lintcache
+//	  | -v gomodcache:/gomodcache -v <cache-volume>:/gatecache )
+//	  [-v passwdfile:/etc/passwd:ro]
 //	  [-v <service-volume>:<target>:ro…] -e K=V… --entrypoint '' <image> <argv…>
+//
+// The first alternative is the bind form (CacheVolume empty); the second the
+// volume form, whose cache mount is read-write.
 //
 // --entrypoint with an EMPTY value precedes the image so an image whose ENTRYPOINT is git
 // (docker.io/alpine/git) cannot swallow or reinterpret the gate command; the
@@ -344,14 +359,24 @@ func (s ContainerSpec) BuildArgv(policy MountPolicy) ([]string, error) {
 		return nil, fmt.Errorf("%w: container name is empty", ErrContainerSpec)
 	case len(s.Argv) == 0:
 		return nil, fmt.Errorf("%w: argv is empty", ErrContainerSpec)
-	case s.Checkout == "" || s.GoCache == "" || s.GoModCache == "" || s.LintCache == "":
+	case s.CacheVolume != "" && (s.Checkout == "" || s.GoModCache == ""):
+		return nil, fmt.Errorf("%w: every mount source (checkout, gomodcache) must be set", ErrContainerSpec)
+	case s.CacheVolume == "" && (s.Checkout == "" || s.GoCache == "" || s.GoModCache == "" || s.LintCache == ""):
 		return nil, fmt.Errorf("%w: every mount source (checkout, gocache, gomodcache, lintcache) must be set", ErrContainerSpec)
 	}
 	endpoint, err := s.Runtime.EndpointArgs()
 	if err != nil {
 		return nil, err
 	}
+	if s.CacheVolume != "" {
+		if err := (CacheVolume{Name: s.CacheVolume}).validate(); err != nil {
+			return nil, err
+		}
+	}
 	sources := []string{s.Checkout, s.GoCache, s.GoModCache, s.LintCache}
+	if s.CacheVolume != "" {
+		sources = []string{s.Checkout, s.GoModCache}
+	}
 	if s.PasswdFile != "" {
 		sources = append(sources, s.PasswdFile)
 	}
@@ -369,12 +394,20 @@ func (s ContainerSpec) BuildArgv(policy MountPolicy) ([]string, error) {
 		"--workdir", MountWork,
 	)
 	argv = append(argv, userArgs(s.Runtime, s.UID, s.GID)...)
-	argv = append(argv,
-		"-v", s.Checkout+":"+MountWork,
-		"-v", s.GoCache+":"+MountGoCache,
-		"-v", s.GoModCache+":"+MountGoModCache,
-		"-v", s.LintCache+":"+MountLintCache,
-	)
+	if s.CacheVolume != "" {
+		argv = append(argv,
+			"-v", s.Checkout+":"+MountWork,
+			"-v", s.GoModCache+":"+MountGoModCache,
+			"-v", s.CacheVolume+":"+MountGateCache,
+		)
+	} else {
+		argv = append(argv,
+			"-v", s.Checkout+":"+MountWork,
+			"-v", s.GoCache+":"+MountGoCache,
+			"-v", s.GoModCache+":"+MountGoModCache,
+			"-v", s.LintCache+":"+MountLintCache,
+		)
+	}
 	if s.PasswdFile != "" {
 		argv = append(argv, "-v", s.PasswdFile+":"+MountPasswd+":ro")
 	}
@@ -432,8 +465,9 @@ func containerEnvAllowed(key string) bool {
 // and toolchain pins are appended drop-then-append (HOME, GOPATH, GOCACHE,
 // GOMODCACHE, GOLANGCI_LINT_CACHE, GOPROXY=off, GOTOOLCHAIN=local,
 // GIT_CONFIG_GLOBAL/SYSTEM=/dev/null, FISHHAWK_GATE_CONTAINER=1), then extras
-// drop-then-append so a caller-supplied value wins over both. Service env is
-// applied after all of it by WithServiceEnv.
+// drop-then-append so a caller-supplied value wins over both. The volume
+// form's cache env (WithCacheVolumeEnv) and then the service env
+// (WithServiceEnv) are applied after all of it.
 func ContainerEnv(sanitized []string, extras []string) []string {
 	var out []string
 	for _, kv := range sanitized {
