@@ -17,6 +17,11 @@ import (
 // Production wires exec.Command.
 var ghIssueCommand = exec.Command
 
+// ghLookPath is the test seam for resolving the gh binary on PATH
+// (#4053). Tests swap it so gh can be made present or absent without
+// touching the process-wide PATH. Production wires exec.LookPath.
+var ghLookPath = exec.LookPath
+
 // resolveIssueRef parses the operator's --issue argument into an
 // issue number. Accepted forms:
 //
@@ -101,7 +106,7 @@ type ghIssue struct {
 // on PATH so the caller can distinguish "operator hasn't set up
 // gh" from "the issue genuinely isn't reachable."
 func fetchIssueViaGh(repo string, issueNumber int) (*httpclient.IssueContext, error) {
-	if _, err := exec.LookPath("gh"); err != nil {
+	if _, err := ghLookPath("gh"); err != nil {
 		return nil, ErrGhNotInstalled
 	}
 	cmd := ghIssueCommand("gh", "issue", "view", strconv.Itoa(issueNumber),

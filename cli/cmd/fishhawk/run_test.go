@@ -423,20 +423,6 @@ func TestRunStatus_RefreshesAndPersistsOnOrdinaryCLIPath(t *testing.T) {
 // receives (the literal `forge` key, or its absence), plus the
 // ghIssueCommand seam — whether gh was invoked at all.
 
-// withGhOnPath makes exec.LookPath("gh") succeed by dropping an
-// executable stub named `gh` at the front of PATH. fetchIssueViaGh
-// checks LookPath BEFORE consulting the ghIssueCommand seam, so a
-// host without gh would otherwise take the ErrGhNotInstalled branch
-// and never reach the seam whose invocation these tests observe.
-func withGhOnPath(t *testing.T) {
-	t.Helper()
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "gh"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
-}
-
 // withRecordingGh swaps the ghIssueCommand seam for one that counts
 // invocations and returns the fixture issue (or, when fail is set,
 // exits non-zero so the gh-error branch runs).
@@ -449,7 +435,7 @@ func withRecordingGh(t *testing.T, fail bool) *atomic.Int64 {
 		if fail {
 			return exec.Command("/usr/bin/false")
 		}
-		return exec.Command("sh", "-c", `printf '{"title":"Add foo","body":"b","url":"https://github.com/x/y/issues/42","number":42}'`)
+		return exec.Command("/bin/sh", "-c", `printf '{"title":"Add foo","body":"b","url":"https://github.com/x/y/issues/42","number":42}'`)
 	}
 	t.Cleanup(func() { ghIssueCommand = orig })
 	return calls
@@ -520,7 +506,7 @@ func TestRunStart_InvalidForge_Usage(t *testing.T) {
 // degraded prompt, sends forge:gitlab, and ships no issue_context.
 func TestRunStart_GitLabWithIssue_SkipsGh(t *testing.T) {
 	fake := newStartRunCapture(t)
-	withGhOnPath(t)
+	withGhPresent(t)
 	withGhNeverInvoked(t)
 	var stdout, stderr bytes.Buffer
 	code := runStart([]string{
@@ -562,7 +548,7 @@ func TestRunStart_OmittedForgeWithIssue_PinsGitHubAndInvokesGh(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fake := newStartRunCapture(t)
-			withGhOnPath(t)
+			withGhPresent(t)
 			calls := withRecordingGh(t, tc.ghFails)
 			var stdout, stderr bytes.Buffer
 			code := runStart([]string{
@@ -600,7 +586,7 @@ func TestRunStart_OmittedForgeWithIssue_PinsGitHubAndInvokesGh(t *testing.T) {
 // invoked.
 func TestRunStart_OmittedForgeNoIssue_SendsNoForge(t *testing.T) {
 	fake := newStartRunCapture(t)
-	withGhOnPath(t)
+	withGhPresent(t)
 	withGhNeverInvoked(t)
 	var stdout, stderr bytes.Buffer
 	code := runStart([]string{
