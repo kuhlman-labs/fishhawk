@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/kuhlman-labs/fishhawk/runner/internal/gateiso"
+	"github.com/kuhlman-labs/fishhawk/runner/internal/upload"
 )
 
 // Gate isolation wiring (ADR-063 / #2134). This file resolves the operator's
@@ -34,8 +35,10 @@ const (
 	// (auto|container|clone-sandbox|clone; empty = auto).
 	gateIsolationModeEnvVar = "FISHHAWK_GATE_ISOLATION"
 	// gateImageEnvVar names the container image the container path runs the
-	// gate in. Empty means the container path is unavailable, so a default
-	// runner never pays the per-exec cache cost (gateiso/cache.go).
+	// gate in when the stage declares no gate_container (E51.3 / #2136: a
+	// declared image or build takes precedence). Empty with no declaration
+	// means the container path is unavailable, so a default runner never pays
+	// the per-exec cache cost (gateiso/cache.go).
 	gateImageEnvVar = "FISHHAWK_GATE_IMAGE"
 	// deploymentProfileEnvVar is the runner-DECLARED deployment profile
 	// (local|self-hosted|hosted; empty = local). It is declared, not
@@ -49,6 +52,13 @@ const (
 	// gatePostgresImageEnvVar overrides the Postgres service image (default
 	// gateiso.DefaultPostgresImage; operators should pin it by digest).
 	gatePostgresImageEnvVar = "FISHHAWK_GATE_POSTGRES_IMAGE"
+	// gateImageAllowlistEnvVar is the operator image allowlist a declared
+	// gate_container image — and every base of a declared build — must pass
+	// (E51.3 / #2136; gateiso.ParseAllowlist grammar, empty = no allowlist).
+	gateImageAllowlistEnvVar = "FISHHAWK_GATE_IMAGE_ALLOWLIST"
+	// gateBuildEnvVar is the in-repo gate image build posture (allow|deny;
+	// empty = the profile default: hosted deny, local/self-hosted allow).
+	gateBuildEnvVar = "FISHHAWK_GATE_BUILD"
 )
 
 // gateIsolationRefusedSignature leads every refusal output. It is
@@ -150,6 +160,23 @@ const (
 	gateServiceBootstrapTimeout = time.Minute
 )
 
+// Declared gate_container resolution bounds (E51.3 / #2136). Like the
+// provisioning bounds above, each runs BEFORE the gate exec and outside the
+// gate's own timeout; exceeding one is gateUnavailable, never a verdict.
+const (
+	// gateImageInspectTimeout bounds one `image inspect`.
+	gateImageInspectTimeout = 30 * time.Second
+	// gateImagePullTimeout bounds the explicit pull of a declared image.
+	gateImagePullTimeout = 10 * time.Minute
+	// gateImageBuildTimeout bounds an in-repo build, including reading and
+	// materializing its committed source from git.
+	gateImageBuildTimeout = 20 * time.Minute
+)
+
+// gateBuildContextLimits bounds a materialized build context. A package var
+// SOLELY so a test can lower it; production leaves the gateiso default.
+var gateBuildContextLimits = gateiso.DefaultContextLimits
+
 // gateServiceReadyTimeout / gateServiceReadyInterval bound the readiness
 // poll. Package vars SOLELY so a test can shorten them.
 var (
@@ -173,6 +200,33 @@ type gateIsolationState struct {
 	// provisions per exec (#2137) and the Postgres service image.
 	services      []gateiso.Service
 	postgresImage string
+
+	// allowlist / buildAllowed are the operator image allowlist and the
+	// in-repo build posture (E51.3 / #2136), parsed at startup.
+	allowlist    gateiso.Allowlist
+	buildAllowed bool
+
+	// declared is the stage's effective gate_container from the fetched
+	// prompt (declare); selDone marks that selection() has read it, after
+	// which a late declaration is ignored. Both guarded by declMu.
+	declMu   sync.Mutex
+	declared *upload.GateContainerConfig
+	selDone  bool
+
+	// req / decision are the image request selection() built and the policy
+	// verdict on it; written once inside once.Do, read by the container path.
+	req      gateiso.ImageRequest
+	decision gateiso.ImageDecision
+
+	// resolvedMu guards the images declared gates resolved to: deciding is
+	// the image of the LAST verify gate to reach the container path (nil when
+	// that gate's resolution failed), decidingSeen whether any did, last the
+	// most recent of any gate, identities every distinct image.
+	resolvedMu   sync.Mutex
+	deciding     *gateiso.ResolvedImage
+	decidingSeen bool
+	last         *gateiso.ResolvedImage
+	identities   map[string]bool
 
 	// passwdByImage caches each gate image's /etc/passwd after a SUCCESSFUL
 	// read (#2137 approval condition 7: a failed read is never cached, so a
@@ -252,9 +306,10 @@ var (
 	dockerFixturesRan      int
 )
 
-// configureGateIsolation parses the five variables through getenv and
+// configureGateIsolation parses the seven variables through getenv and
 // applies the startup rule ProfileForbidsFallback. A configuration error names
-// the variable and the valid values; run() logs it as runner_failed
+// the variable and the valid values (an allowlist error also names the
+// offending entry); run() logs it as runner_failed
 // reason=config and exits exitUsage BEFORE any backend contact. On success it
 // emits gate_isolation_configured and returns the state for run() to install.
 func configureGateIsolation(getenv func(string) string, probes gateiso.Probes, logSink io.Writer) (*gateIsolationState, error) {
@@ -277,6 +332,14 @@ func configureGateIsolation(getenv func(string) string, probes gateiso.Probes, l
 	if pgImage == "" {
 		pgImage = gateiso.DefaultPostgresImage
 	}
+	allow, err := gateiso.ParseAllowlist(getenv(gateImageAllowlistEnvVar))
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", gateImageAllowlistEnvVar, err)
+	}
+	buildAllowed, err := gateiso.ParseBuildPolicy(getenv(gateBuildEnvVar), profile)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", gateBuildEnvVar, err)
+	}
 	st := &gateIsolationState{
 		mode:          mode,
 		profile:       profile,
@@ -287,13 +350,53 @@ func configureGateIsolation(getenv func(string) string, probes gateiso.Probes, l
 		gid:           os.Getgid(),
 		services:      services,
 		postgresImage: pgImage,
+		allowlist:     allow,
+		buildAllowed:  buildAllowed,
+	}
+	build := gateiso.BuildPolicyDeny
+	if buildAllowed {
+		build = gateiso.BuildPolicyAllow
 	}
 	if logSink != nil {
 		_, _ = fmt.Fprintf(logSink,
-			`{"event":"gate_isolation_configured","mode":%q,"profile":%q,"image":%q,"services":%q,"postgres_image":%q}`+"\n",
-			mode, profile, st.image, joinServices(services), pgImage)
+			`{"event":"gate_isolation_configured","mode":%q,"profile":%q,"image":%q,"services":%q,"postgres_image":%q,"allowlist_entries":%d,"build":%q}`+"\n",
+			mode, profile, st.image, joinServices(services), pgImage, len(allow), build)
 	}
 	return st, nil
+}
+
+// declare records the stage's effective gate_container from the fetched
+// prompt (E51.3 / #2136). run() calls it right after the fetch, before any
+// gate; selection() reads it once. A declaration arriving after the
+// selection was decided cannot change the path the earlier gates ran under,
+// so it is ignored with a logged line. Nil receiver, nil config, or a config
+// carrying neither a source nor a level: no-op (no declaration).
+func (s *gateIsolationState) declare(gc *upload.GateContainerConfig) {
+	if s == nil || gc == nil || (*gc == upload.GateContainerConfig{}) {
+		return
+	}
+	s.declMu.Lock()
+	defer s.declMu.Unlock()
+	if s.selDone {
+		s.logEvent(`{"event":"gate_container_declaration_ignored","source":%q,"reason":"the gate isolation selection was already decided"}`, gc.Source)
+		return
+	}
+	d := *gc
+	s.declared = &d
+	s.logEvent(`{"event":"gate_container_declared","source":%q,"image":%q,"dockerfile":%q,"context":%q}`, d.Source, d.Image, d.Dockerfile, d.Context)
+}
+
+// imageRequest is the gate image request in precedence order: the declared
+// gate_container (stage beats workflow, resolved by the backend), else the
+// operator's FISHHAWK_GATE_IMAGE, else none.
+func (s *gateIsolationState) imageRequest(declared *upload.GateContainerConfig) gateiso.ImageRequest {
+	if declared != nil {
+		return gateiso.ImageRequest{Source: declared.Source, Image: declared.Image, Dockerfile: declared.Dockerfile, Context: declared.Context}
+	}
+	if s.image != "" {
+		return gateiso.ImageRequest{Source: gateiso.ImageSourceEnv, Image: s.image}
+	}
+	return gateiso.ImageRequest{}
 }
 
 // joinServices renders a service list as its comma form for log lines.
@@ -354,18 +457,34 @@ func (s *gateIsolationState) selection(ctx context.Context) gateiso.Selection {
 		if probe == nil {
 			probe = gateiso.ProbeSandbox
 		}
+		s.declMu.Lock()
+		s.selDone = true
+		declared := s.declared
+		s.declMu.Unlock()
+		s.req = s.imageRequest(declared)
+		s.decision = gateiso.EvaluateImagePolicy(s.profile, s.req, s.allowlist, s.buildAllowed)
 		rt := detect(ctx, s.probes)
 		avail, reason := probe(ctx)
 		s.sel = gateiso.Select(gateiso.Inputs{
-			Mode:    s.mode,
-			Profile: s.profile,
-			Image:   s.image,
-			Runtime: rt,
-			Sandbox: gateiso.SandboxProbe{Available: avail, Reason: reason},
+			Mode:          s.mode,
+			Profile:       s.profile,
+			Image:         s.req.Image,
+			Runtime:       rt,
+			Sandbox:       gateiso.SandboxProbe{Available: avail, Reason: reason},
+			Build:         gateiso.DeclaredSource(s.req.Source) && (s.req.Dockerfile != "" || s.req.Context != ""),
+			ImageSource:   s.req.Source,
+			PolicyRefusal: s.decision.Refusal,
+			PolicyWarning: s.decision.Warning,
 		})
 		if s.logSink != nil {
 			b, _ := json.Marshal(s.sel)
 			_, _ = fmt.Fprintf(s.logSink, `{"event":"gate_isolation_selected","selection":%s}`+"\n", b)
+		}
+		if s.sel.PolicyWarning != "" {
+			s.logEvent(`{"event":"gate_container_policy_warning","source":%q,"warning":%q}`, s.sel.ImageSource, s.sel.PolicyWarning)
+		}
+		if s.sel.DeclaredUnhonored != "" {
+			s.logEvent(`{"event":"gate_container_unhonored","source":%q,"path":%q,"detail":%q}`, s.sel.ImageSource, s.sel.Path, s.sel.DeclaredUnhonored)
 		}
 		if len(s.services) > 0 && s.sel.Path != gateiso.PathContainer {
 			// Only the container path provisions services; elsewhere the
@@ -390,12 +509,73 @@ func (s *gateIsolationState) markSeamReached() {
 
 // recordedSelection returns the selection a gate actually ran under, and
 // false when no gate reached the seam (a plan stage, the working-tree
-// runVerifyGate, a nil state). It never triggers detection.
+// runVerifyGate, a nil state). It never triggers detection. For a declared
+// gate_container it also carries the image of the FINAL DECIDING gate — the
+// last verify gate to reach the container path (nil when that gate's
+// resolution failed), else the most recent gate's — and, when the stage's
+// gates ran in more than one distinct image, that count.
 func (s *gateIsolationState) recordedSelection() (gateiso.Selection, bool) {
 	if s == nil || !s.seamReached.Load() {
 		return gateiso.Selection{}, false
 	}
-	return s.sel, true
+	sel := s.sel
+	s.resolvedMu.Lock()
+	defer s.resolvedMu.Unlock()
+	img := s.last
+	if s.decidingSeen {
+		img = s.deciding
+	}
+	if img != nil {
+		c := *img
+		sel.ResolvedImage = &c
+	}
+	if n := len(s.identities); n > 1 {
+		sel.DistinctImagesCount = n
+	}
+	return sel, true
+}
+
+// decidingGateKey marks a gate exec's context as a VERIFY gate — the kind
+// whose outcome decides the push or the failure (runVerifyCommittedTree) —
+// as opposed to the diff-coverage measurement or the auto-format absorb.
+type decidingGateKey struct{}
+
+// withDecidingGate marks ctx as a deciding verify gate.
+func withDecidingGate(ctx context.Context) context.Context {
+	return context.WithValue(ctx, decidingGateKey{}, true)
+}
+
+// isDecidingGate reports whether ctx was marked by withDecidingGate.
+func isDecidingGate(ctx context.Context) bool {
+	v, _ := ctx.Value(decidingGateKey{}).(bool)
+	return v
+}
+
+// noteDeclaredGate records that a declared-image gate started resolution: a
+// deciding gate clears the deciding image, so a deciding gate whose
+// resolution fails never inherits an earlier gate's image.
+func (s *gateIsolationState) noteDeclaredGate(deciding bool) {
+	if !deciding {
+		return
+	}
+	s.resolvedMu.Lock()
+	s.decidingSeen, s.deciding = true, nil
+	s.resolvedMu.Unlock()
+}
+
+// recordResolved records the image one declared gate resolved to.
+func (s *gateIsolationState) recordResolved(res gateiso.ResolvedImage, deciding bool) {
+	s.resolvedMu.Lock()
+	defer s.resolvedMu.Unlock()
+	if s.identities == nil {
+		s.identities = map[string]bool{}
+	}
+	s.identities[res.Identity()] = true
+	c := res
+	s.last = &c
+	if deciding {
+		s.deciding = &c
+	}
 }
 
 // cleanup releases the process-wide state. run() defers it so a later run()
@@ -439,7 +619,11 @@ func materializeGateCheckout(ctx context.Context, repoDir, headSHA, parent strin
 // CONTAINER_HOST / CONTAINER_CONNECTION dropped and the selection's socket
 // re-pinned; every argv carries the same binding as a global flag, so a
 // docker-context switch between gates cannot redirect any runtime call to a
-// daemon the selection never validated); when FISHHAWK_GATE_SERVICES names
+// daemon the selection never validated); for a DECLARED gate_container (E51.3
+// / #2136) the image resolution (resolveDeclaredImage: explicit pull or
+// in-repo build, a refused build source/Dockerfile/base gateRefused and any
+// operational failure gateUnavailable, the resolved image recorded for the
+// evidence) — the FISHHAWK_GATE_IMAGE path skips it; when FISHHAWK_GATE_SERVICES names
 // postgres, a fresh per-exec gate service and its argv (#2137); the caller's
 // passwd file (gatePasswdFile — a DEGRADE, never a refusal); the argv build
 // under the resolved-path mount guard (BEFORE the seed — a checkout the guard
@@ -488,6 +672,24 @@ func runGateInContainer(ctx context.Context, sel gateiso.Selection, argv []strin
 	if err != nil {
 		return "gate container: " + err.Error(), -1, gateUnavailable
 	}
+	// A DECLARED gate_container (E51.3 / #2136) resolves to an image on the
+	// host first — explicit pull or in-repo build, each under its own bound
+	// and the bound CLI env (the runtime CLI's own credential store; Fishhawk
+	// passes no credential). The FISHHAWK_GATE_IMAGE path skips this and runs
+	// sel.Image byte-unchanged (its implicit pull stays inside the gate run).
+	image := sel.Image
+	if st != nil && gateiso.DeclaredSource(sel.ImageSource) {
+		deciding := isDecidingGate(ctx)
+		st.noteDeclaredGate(deciding)
+		res, how, msg, disp := st.resolveDeclaredImage(ctx, sel.Runtime, dir, vc.Root, cliEnv)
+		if msg != "" {
+			return msg, -1, disp
+		}
+		st.recordResolved(res, deciding)
+		image = res.Ref
+		st.logEvent(`{"event":"gate_container_resolved","source":%q,"how":%q,"ref":%q,"digest":%q,"image_id":%q,"context_digest":%q,"deciding":%t}`,
+			sel.ImageSource, how, res.Ref, res.Digest, res.ImageID, res.ContextDigest, deciding)
+	}
 	uid, gid := os.Getuid(), os.Getgid()
 	if st != nil {
 		uid, gid = st.uid, st.gid
@@ -507,13 +709,13 @@ func runGateInContainer(ctx context.Context, sel gateiso.Selection, argv []strin
 	}
 	spec := gateiso.ContainerSpec{
 		Runtime:    sel.Runtime,
-		Image:      sel.Image,
+		Image:      image,
 		Name:       gateiso.NewContainerName(),
 		Checkout:   dir,
 		GoCache:    vc.GoCache,
 		GoModCache: vc.GoModCache,
 		LintCache:  lintCacheDir,
-		PasswdFile: st.gatePasswdFile(ctx, sel.Runtime, sel.Image, vc.Root, cliEnv, uid, gid),
+		PasswdFile: st.gatePasswdFile(ctx, sel.Runtime, image, vc.Root, cliEnv, uid, gid),
 		Env:        env,
 		Argv:       argv,
 		UID:        uid,
@@ -564,6 +766,174 @@ func runGateInContainer(ctx context.Context, sel gateiso.Selection, argv []strin
 		return out, code, gateTimedOut
 	}
 	return out, code, gateExecuted
+}
+
+// gateContainerUnavailable / gateContainerRefused render a declared
+// gate_container resolution failure. A refusal leads with
+// gateIsolationRefusedSignature like every selection refusal (operator TEXT;
+// classification reads the disposition).
+func gateContainerUnavailable(format string, args ...any) (gateiso.ResolvedImage, string, string, gateDisposition) {
+	return gateiso.ResolvedImage{}, "", "gate container: gate_container unavailable: " + fmt.Sprintf(format, args...), gateUnavailable
+}
+
+func gateContainerRefused(format string, args ...any) (gateiso.ResolvedImage, string, string, gateDisposition) {
+	return gateiso.ResolvedImage{}, "", gateIsolationRefusedSignature + " gate_container build refused: " + fmt.Sprintf(format, args...), gateRefused
+}
+
+// resolveDeclaredImage resolves the declared gate_container to the image the
+// gate runs by. It returns the resolution, how it was reached
+// (present|pulled|cache_hit|built), and — on failure — a non-empty message
+// with its disposition: a build source, Dockerfile or base the runner refuses
+// is gateRefused BEFORE any build call; every operational failure (inspect,
+// pull, digest, git read, context size, build) is gateUnavailable. Neither
+// reaches the fix agent, and neither substitutes FISHHAWK_GATE_IMAGE.
+func (s *gateIsolationState) resolveDeclaredImage(ctx context.Context, rt gateiso.Runtime, dir, root string, cliEnv []string) (gateiso.ResolvedImage, string, string, gateDisposition) {
+	if s.decision.Build {
+		return s.resolveBuiltImage(ctx, rt, dir, root, cliEnv)
+	}
+	return s.resolvePulledImage(ctx, rt, root, cliEnv)
+}
+
+// inspectImage runs `image inspect` on ref under gateImageInspectTimeout and
+// parses it; ok is false when the runtime reports no such image (or failed).
+func inspectImage(ctx context.Context, rt gateiso.Runtime, ref, root string, cliEnv []string) (insp gateiso.ImageInspect, ok bool, err error) {
+	argv, err := rt.InspectArgv(ref)
+	if err != nil {
+		return gateiso.ImageInspect{}, false, err
+	}
+	out, code, _ := execGateAuxArgvFn(ctx, argv, root, cliEnv, gateImageInspectTimeout)
+	if code != 0 {
+		return gateiso.ImageInspect{}, false, fmt.Errorf("image inspect %s: exit %d: %s", ref, code, gateOutputTail(out))
+	}
+	insp, err = gateiso.ParseInspect(out)
+	if err != nil {
+		return gateiso.ImageInspect{}, false, err
+	}
+	return insp, true, nil
+}
+
+// resolvePulledImage resolves a declared `image:`. A digest-pinned ref is
+// inspected and pulled only when absent; a tag-only ref is ALWAYS pulled.
+// Either way the gate runs by name@<registry digest> from the inspected
+// RepoDigests, so a concurrent retag cannot change what runs; a pinned ref
+// must find its own digest there. A pull failure carries the named
+// local-only remedy (gateiso.PullFailedReason).
+func (s *gateIsolationState) resolvePulledImage(ctx context.Context, rt gateiso.Runtime, root string, cliEnv []string) (gateiso.ResolvedImage, string, string, gateDisposition) {
+	ref := s.decision.Ref
+	target := ref.String()
+	if ref.Pinned() {
+		target = ref.Name() + "@" + ref.Digest
+	}
+	how := "present"
+	insp, ok, ierr := gateiso.ImageInspect{}, false, error(nil)
+	if ref.Pinned() {
+		insp, ok, _ = inspectImage(ctx, rt, target, root, cliEnv)
+	}
+	if !ok {
+		how = "pulled"
+		argv, err := rt.PullArgv(target)
+		if err != nil {
+			return gateContainerUnavailable("pull argv for %s: %v", ref, err)
+		}
+		out, code, timedOut := execGateAuxArgvFn(ctx, argv, root, cliEnv, gateImagePullTimeout)
+		if code != 0 {
+			cause := fmt.Errorf("exit %d: %s", code, gateOutputTail(out))
+			if timedOut {
+				cause = fmt.Errorf("timed out after %s", gateImagePullTimeout)
+			}
+			return gateContainerUnavailable("%s", gateiso.PullFailedReason(ref, cause))
+		}
+		if insp, ok, ierr = inspectImage(ctx, rt, target, root, cliEnv); !ok {
+			return gateContainerUnavailable("inspect %s after pull: %v", ref, ierr)
+		}
+	}
+	if ref.Pinned() {
+		if !hasRepoDigest(ref, insp.RepoDigests) {
+			return gateContainerUnavailable("image %s is present but its registry digests %q do not include the pinned %s", ref, insp.RepoDigests, ref.Digest)
+		}
+		return gateiso.ResolvedImage{Ref: target, Digest: ref.Digest, ImageID: insp.ID}, how, "", gateExecuted
+	}
+	pinned, found := gateiso.RepoDigestFor(ref, insp.RepoDigests)
+	if !found {
+		return gateContainerUnavailable("image %s has no registry digest after the pull, so the gate cannot run it by digest: a declared `image:` must be pullable from a registry; for a local-only image declare `dockerfile` + `context`, or have the operator set FISHHAWK_GATE_IMAGE", ref)
+	}
+	_, digest, _ := strings.Cut(pinned, "@")
+	return gateiso.ResolvedImage{Ref: pinned, Digest: digest, ImageID: insp.ID}, how, "", gateExecuted
+}
+
+// hasRepoDigest reports whether any inspected RepoDigest names ref's
+// repository at ref's own digest.
+func hasRepoDigest(ref gateiso.ImageRef, digests []string) bool {
+	for _, d := range digests {
+		if r, err := gateiso.ParseImageRef(d); err == nil && r.Name() == ref.Name() && r.Digest == ref.Digest {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveBuiltImage resolves a declared dockerfile/context build from the
+// COMMITTED tree at the gate checkout's HEAD — never the working tree, so an
+// uncommitted or untracked file cannot enter a gate image, and every gate
+// kind on one commit computes the same content digest. In order: pin the
+// source to git objects (gateiso.ResolveBuildSource), screen the committed
+// Dockerfile bytes (parse refusals, the profile's cache-mount rule, the
+// allowlist/pinning rule for every base) — every refusal before ANY build
+// call — then inspect the content-addressed tag (a hit skips the build),
+// else materialize the committed context into a throwaway dir and build it
+// with --network=none.
+func (s *gateIsolationState) resolveBuiltImage(ctx context.Context, rt gateiso.Runtime, dir, root string, cliEnv []string) (gateiso.ResolvedImage, string, string, gateDisposition) {
+	bctx, cancel := context.WithTimeout(ctx, gateImageBuildTimeout)
+	defer cancel()
+	git := gateiso.ExecGit(dir)
+	sourceFailure := func(what string, err error) (gateiso.ResolvedImage, string, string, gateDisposition) {
+		if errors.Is(err, gateiso.ErrBuildSourceRefused) {
+			return gateContainerRefused("%s: %v", what, err)
+		}
+		return gateContainerUnavailable("%s: %v", what, err)
+	}
+	src, err := gateiso.ResolveBuildSource(bctx, git, "HEAD", s.req.Dockerfile, s.req.Context)
+	if err != nil {
+		return sourceFailure("resolve build source", err)
+	}
+	content, err := gateiso.ReadDockerfile(bctx, git, src)
+	if err != nil {
+		return sourceFailure("read "+src.Dockerfile, err)
+	}
+	if err := gateiso.ScreenDockerfile(content, s.profile, s.allowlist, s.decision); err != nil {
+		return gateContainerRefused("%s at %s: %v", src.Dockerfile, src.Commit, err)
+	}
+	res := gateiso.ResolvedImage{Ref: src.Tag(), BuildDockerfile: src.Dockerfile, BuildContext: src.Context, ContextDigest: src.Digest}
+	if insp, ok, _ := inspectImage(ctx, rt, res.Ref, root, cliEnv); ok {
+		res.ImageID = insp.ID
+		return res, "cache_hit", "", gateExecuted
+	}
+	tmp, err := os.MkdirTemp("", "fishhawk-gate-build-*")
+	if err != nil {
+		return gateContainerUnavailable("build dir: %v", err)
+	}
+	defer func() { _ = os.RemoveAll(tmp) }()
+	layout, err := gateiso.MaterializeBuildContext(bctx, git, src, filepath.Join(tmp, "src"), gateBuildContextLimits)
+	if err != nil {
+		return sourceFailure("materialize build context", err)
+	}
+	argv, err := rt.BuildArgv(gateiso.BuildSpec{Dockerfile: layout.Dockerfile, Context: layout.Context, Digest: src.Digest})
+	if err != nil {
+		return gateContainerUnavailable("build argv: %v", err)
+	}
+	out, code, timedOut := execGateAuxArgvFn(ctx, argv, root, cliEnv, gateImageBuildTimeout)
+	if code != 0 {
+		if timedOut {
+			return gateContainerUnavailable("build of %s timed out after %s", src.Dockerfile, gateImageBuildTimeout)
+		}
+		return gateContainerUnavailable("build of %s failed: exit %d: %s", src.Dockerfile, code, gateOutputTail(out))
+	}
+	insp, ok, ierr := inspectImage(ctx, rt, res.Ref, root, cliEnv)
+	if !ok {
+		return gateContainerUnavailable("inspect %s after build: %v", res.Ref, ierr)
+	}
+	res.ImageID = insp.ID
+	return res, "built", "", gateExecuted
 }
 
 // gateCallerName is the host login name the passwd entry carries
