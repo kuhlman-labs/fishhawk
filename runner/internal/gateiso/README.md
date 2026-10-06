@@ -24,14 +24,15 @@ there is still no second exec path.
 | `FISHHAWK_DEPLOYMENT_PROFILE` | `local` \| `self-hosted` \| `hosted` | `local` | the runner-DECLARED deployment profile (`ParseProfile`); `hosted` forbids every non-container path |
 | `FISHHAWK_GATE_IMAGE_ALLOWLIST` | comma/whitespace list of registry hosts, namespace prefixes, repositories, exact digests | empty (no allowlist) | the operator image allowlist a DECLARED `gate_container` image, and every base of a declared build, must pass (`ParseAllowlist`; grammar in § "Declared gate image"). An invalid entry is a startup config error naming it. Never applied to `FISHHAWK_GATE_IMAGE` (operator-chosen) |
 | `FISHHAWK_GATE_BUILD` | `allow` \| `deny` | empty = the profile default (`hosted` deny, `local`/`self-hosted` allow) | whether a declared `gate_container` `dockerfile`/`context` build may run (`ParseBuildPolicy`; any other value is a startup config error) |
+| `FISHHAWK_GATE_CACHE` | `process` \| `off` | `process` | the container path's `GOCACHE` / golangci-lint cache posture (`ParseCacheMode`; any other value is a startup config error naming it and both valid values): `process` keeps them in ONE named volume per runner process, `off` keeps the pre-#3967 per-exec cold caches (also the measurement's cold arm). § "Persistent cache volume" |
 
 A config error (bad mode/profile, an unknown `FISHHAWK_GATE_SERVICES` member,
-an invalid `FISHHAWK_GATE_IMAGE_ALLOWLIST` entry or `FISHHAWK_GATE_BUILD`
-value, or `hosted` with an explicit `clone` / `clone-sandbox` —
+an invalid `FISHHAWK_GATE_IMAGE_ALLOWLIST` entry, `FISHHAWK_GATE_BUILD` or
+`FISHHAWK_GATE_CACHE` value, or `hosted` with an explicit `clone` / `clone-sandbox` —
 `ProfileForbidsFallback`) fails the runner at startup with
 `runner_failed reason=config` BEFORE any backend contact. A valid config logs
 `gate_isolation_configured` (mode, profile, image, services,
-postgres_image, allowlist_entries, build); the first gate exec logs `gate_isolation_selected`
+postgres_image, allowlist_entries, build, cache — `cache` is the LAST field); the first gate exec logs `gate_isolation_selected`
 carrying the whole `Selection` JSON (path, mode, profile, image, the classified
 runtime including its endpoint, the sandbox probe, and the reason). The same
 selection is recorded on the gate evidence once a gate reaches the exec seam
@@ -367,10 +368,18 @@ a refused connection are all `Local=false` with a named reason.
 <docker --host | podman --url> unix://<validated socket>
   run --rm --name fishhawk-gate-<hex> --network=none --cap-drop=ALL
   --security-opt=no-new-privileges --workdir /work (--user <uid>:<gid> | --userns=keep-id)
-  -v <checkout>:/work -v <gocache>:/gocache -v <gomodcache>:/gomodcache -v <lintcache>:/lintcache
+  -v <checkout>:/work
+  ( -v <gocache>:/gocache -v <gomodcache>:/gomodcache -v <lintcache>:/lintcache
+  | -v <gomodcache>:/gomodcache -v fishhawk-gate-cache-<run>-<stage>-<hex>:/gatecache )
   [-v <passwdfile>:/etc/passwd:ro] [-v fishhawk-gate-svc-<hex>:/pgsock:ro]
   -e K=V … --entrypoint '' <image> <argv…>
 ```
+
+The first cache alternative is the BIND form (`ContainerSpec.CacheVolume`
+empty — byte-identical to the pre-#3967 argv, so every existing golden passes
+unedited); the second is the VOLUME form (§ "Persistent cache volume"), whose
+`/gatecache` mount is read-write and replaces the `gocache` / `lintcache`
+binds.
 
 - **The validated endpoint is BOUND to every invocation.** `DetectRuntime`
   validates the endpoint once, at selection, but the CLI re-resolves its
@@ -392,7 +401,9 @@ a refused connection are all `Local=false` with a named reason.
   the live fixture (l) `TestGateContainer_EndpointBoundAcrossContextSwitch`.
 
 - **The mounts, and nothing else.** The checkout at `/work` (the working
-  directory), the three per-exec throwaway caches, the runner-generated
+  directory), the three per-exec throwaway caches — or, in the volume form,
+  the per-exec module cache plus the runner process's cache volume at
+  `/gatecache` — the runner-generated
   `/etc/passwd` (read-only; `PasswdFile`, omitted when the read degraded) and,
   only when a gate service is provisioned, its socket volume at `/pgsock`
   (read-only; `ServiceMounts`). The passwd file is a host bind source and goes
@@ -401,9 +412,18 @@ a refused connection are all `Local=false` with a named reason.
   `^fishhawk-gate-svc-[0-9a-f]{12}$`, a target that is not absolute, clean and
   non-root, or a mount that is not read-only — so a host path or the daemon
   socket can never ride in as a "volume"
-  (`TestBuildArgv_ServiceMountRefusesNonServiceVolume`). No socket, no `/run`,
-  no host cache is ever a bind source. These two additions are the scoped
-  exceptions ADR-063's #2137 addendum records.
+  (`TestBuildArgv_ServiceMountRefusesNonServiceVolume`). The cache volume is
+  likewise a NAMED volume: `BuildArgv` refuses with NO argv any
+  `CacheVolume` not matching
+  `^fishhawk-gate-cache-<uuid>-<uuid>-[0-9a-f]{12}$` (`cacheVolumePattern`;
+  no `/`, `.`, `:` or upper case, so it can never name a host path, the
+  daemon socket or a second mount field), BEFORE any `-v` token, and the
+  checkout, module cache and passwd file still go through
+  `ForbidSocketMounts` in volume mode
+  (`TestBuildArgv_CacheVolumeRefusesNonCacheVolume`,
+  `TestBuildArgv_CacheVolumeStillGuardsCheckout`). No socket, no `/run`,
+  no host cache is ever a bind source. These additions are the scoped
+  exceptions ADR-063's #2137 and #3967 addenda record.
 - **`--entrypoint ''` precedes the image and the full argv follows it**
   (approval condition 1 of #2134): an image whose `ENTRYPOINT` is `git`
   (`docker.io/alpine/git`, the pinned e2e image) cannot swallow or reinterpret
@@ -445,7 +465,10 @@ container: only `TZ`/`LANG`/`TERM`, `LC_*`, `CGO_*` and `GO*` survive, then
 `GIT_CONFIG_GLOBAL/SYSTEM=/dev/null` and `FISHHAWK_GATE_CONTAINER=1`
 (`GateContainerMarker`, on EVERY container exec) are appended drop-then-append,
 then the runner's `extraEnv` entries drop-then-append so a caller-supplied value
-wins. A provisioned service's env (`PostgresService.GateEnv`, the
+wins. In the volume form `WithCacheVolumeEnv` then re-pins
+`GOCACHE=/gatecache/gocache` and `GOLANGCI_LINT_CACHE=/gatecache/lintcache`
+drop-then-append (the bind-form `/gocache` / `/lintcache` are not mounted
+there). A provisioned service's env (`PostgresService.GateEnv`, the
 `FISHHAWK_TEST_PG_URL` pin) is applied after ALL of that by `WithServiceEnv`,
 so neither the sanitized env nor extras can redirect the DSN
 (`TestContainerEnv_ServiceEnvWinsOverExtras`).
@@ -508,7 +531,9 @@ sandbox path has no service — so such a host either runs the container path
 ## Build-cache posture (`cache.go`) — the INVARIANT
 
 **The host `GOMODCACHE` is the trusted seed and is NEVER bind-mounted into a
-container.** Every container exec gets a fresh EMPTY set of visible cache
+container.** The invariant is scoped to the MODULE cache; `GOCACHE` and the
+lint cache are never host-seeded or mounted from a host cache either, and
+take one of the two postures below. Every container exec gets a fresh EMPTY set of visible cache
 directories (`NewVisibleCaches`: `fishhawk-gatecache-*` under the OS temp dir,
 0700, empty `gocache` + `gomodcache`), populated HOST-side, mounted for that
 one exec, and removed afterwards. Host seeding never opens a directory a
@@ -555,7 +580,11 @@ container has been given.
   requires a newer Go than the runner host has fails the seed with a named
   error rather than auto-downloading — accepted over a toolchain
   download-and-exec driven by untrusted metadata.
-- `GOCACHE` has NO seed: a cold build cache per container exec.
+- `GOCACHE` has NO seed. Under `FISHHAWK_GATE_CACHE=off` (or a degraded
+  cache step) it is the per-exec throwaway `gocache` dir: a cold build cache
+  per container exec. Otherwise it lives in the runner process's cache volume
+  (§ "Persistent cache volume"): cold on the first container exec of the
+  process, warm on every later one.
 - `VisibleCaches.Remove` is SYMLINK-SAFE (approval condition 2 of #2134): the
   chmod walk examines every entry with Lstat semantics, SKIPS (unlink-only) any
   entry whose mode is `ModeSymlink` — never chmod/chown/open through a link —
@@ -565,15 +594,197 @@ container has been given.
   target's mode and contents are untouched, the link is gone with the visible
   dir, and the host module cache carries no planted entry.
 
-**Cost, honestly:** module-cache repopulation plus a cold `GOCACHE` on EVERY
-container exec (three per stage: scoped verify, full verify, diff_coverage).
-The container path is opt-in via `FISHHAWK_GATE_IMAGE`, so no default runner
-pays it. **Residuals:** the fallback paths keep the host caches (they are host
-exec); there is no persistent shared cache; the per-exec repopulation and the
-cold `GOCACHE` are accepted. The first container exec also pulls the image
+**Cost, honestly:** module-cache repopulation on EVERY container exec (three
+or more per stage: scoped verify, full verify, diff_coverage, plus fix
+iterations and absorbs). `GOCACHE` and the lint cache are cold on the FIRST
+container exec of each runner process and warm afterwards under
+`FISHHAWK_GATE_CACHE=process`; under `off` (or a degraded step) they are cold
+on every exec, the pre-#3967 cost. Process mode adds a `volume create`, a
+prepare helper and a write check before every exec (about two extra
+container starts, ~1–2s on Docker Desktop, outside the gate timeout; logged
+as `cache_ms`). The container path is opt-in via `FISHHAWK_GATE_IMAGE` (or a
+spec-declared `gate_container`), so no default runner pays any of it.
+**Residuals:** the fallback paths keep the host caches (they are host exec);
+there is no cache shared ACROSS runs or stages (by design, § "Persistent
+cache volume"), so the first container exec of every stage is cold; the
+per-exec module-cache repopulation is accepted. The first container exec also pulls the image
 through the daemon inside the gate timeout — pre-pull it. With
 `FISHHAWK_GATE_SERVICES=postgres` every container exec also pays a Postgres
 start (seconds; OUTSIDE the gate timeout, § "Gate services (#2137)").
+
+## Persistent cache volume (`cachevolume.go`, E51.18 / [#3967](https://github.com/kuhlman-labs/fishhawk/issues/3967))
+
+Under `FISHHAWK_GATE_CACHE=process` (the default) the container path keeps
+`GOCACHE` and the golangci-lint cache in ONE runner-owned NAMED volume per
+runner PROCESS instead of per-exec throwaway host dirs. The module cache keeps
+its per-exec host-seeded posture unchanged (§ "Build-cache posture").
+
+- **Name, label, mount, env.** `fishhawk-gate-cache-<run uuid>-<stage
+  uuid>-<12 hex>` (`NewCacheVolume`: the bound owner ids lower-cased plus 6
+  crypto-random bytes; non-UUID ids are an error, so the exec degrades),
+  labelled `org.fishhawk.gate-cache=process` (`CacheVolumeLabel`), mounted
+  read-write at `/gatecache` (`MountGateCache`), with
+  `GOCACHE=/gatecache/gocache` and `GOLANGCI_LINT_CACHE=/gatecache/lintcache`
+  (`CacheVolumeEnv` / `WithCacheVolumeEnv`, applied before the service env,
+  which stays last). Every builder (`CreateArgv`, `PrepareArgv`, `CheckArgv`,
+  `RemoveArgv`) renders NOTHING (`ErrContainerSpec`) for a runtime with no
+  validated socket, an unsupported kind, a name off `cacheVolumePattern`, an
+  empty or flag-shaped image, or a negative uid/gid
+  (`TestCacheVolumeArgv_Refusals`).
+- **Lifecycle, per container exec** (`gateCacheVolume` in
+  `cmd/fishhawk-runner/gateisolation.go`): mint ONCE per (state, owner) —
+  recorded for cleanup BEFORE the create is attempted, so teardown covers a
+  partial create — then on EVERY exec, each step through `execGateAuxArgvFn`
+  under the bound CLI env and its own bound OUTSIDE the gate timeout:
+  `volume create` (1m; idempotent — docker re-uses an existing name, podman
+  gets `--ignore`; a volume an operator removed mid-stage is re-created and
+  re-owned, never auto-created root-owned by `run -v`), the prepare helper
+  (5m, covers a cold image pull) and the write check (1m). Success logs
+  `gate_cache_volume_ready {volume, reused}`. `gateIsolationState.cleanup()`
+  (deferred by `run()`) removes every minted volume on a fresh bounded
+  context: `gate_cache_volume_removed`, or `gate_cache_volume_cleanup_failed`
+  naming the label (never a panic; the global is still cleared).
+- **Why a prepare helper.** A fresh named volume's root is root-owned, so a
+  gate running `--user uid:gid` cannot create its cache dirs in it.
+  `PrepareArgv` runs a `--rm --network=none --cap-drop=ALL
+  --security-opt=no-new-privileges --entrypoint ''` helper with ONLY the
+  volume mounted. **Docker** (and any non-rootless runtime): `--user 0:0`
+  with exactly `--cap-add=CHOWN` and `sh -c 'o="$1"; shift; mkdir -p -m 0700
+  "$@" && chown "$o" "$@"'`, owner and dirs passed as positional arguments,
+  never interpolated. Not `install -d -o -g -m`: busybox `install` chowns
+  BEFORE it chmods, and root without CAP_FOWNER cannot chmod a directory it no
+  longer owns (EPERM, caught live by fixture (o)). **Rootless podman**
+  (#3967 approval condition 1): `--userns=keep-id --user uid:gid`, no
+  capability, `install -d -m 0700` — the helper runs AS the caller, so the
+  directories are the caller's by construction. **uid-mapping assumption,
+  stated:** under rootless `--userns=keep-id` the caller's host uid maps to
+  the SAME uid in the container and container root maps to a SUBORDINATE uid
+  (never the caller), which is why the podman helper must not run as root;
+  the podman argv is golden-pinned but NOT live-validated (no podman host). A
+  wrong mapping cannot pass silently: `CheckArgv` then runs, under the SAME
+  user pin as the gate exec (`userArgs`), a create-and-remove of a probe file
+  in both subdirs, and a failure DEGRADES the exec with
+  `gate_cache_volume_unavailable` step `check`, reason `ownership: the gate
+  uid U:G cannot write …` — never a misattributed red verify later. Whatever
+  a prior gate left in the volume (a symlink included) can only redirect the
+  CHOWN-only, network-less helper into the volume or its own throwaway rootfs.
+  The prepare and check helpers need `sh`, `mkdir`, `chown` (docker) and
+  `install` (podman) IN the gate image: a missing one degrades every exec, and
+  the e2e image-contents check (`gateImageBinaries`) names it loudly
+  (approval condition 3).
+- **DEGRADE, never refuse.** A mint error (non-UUID owner), a render error, a
+  non-zero exit or a timeout at `create` / `prepare` / `check` logs
+  `gate_cache_volume_unavailable {volume, step, reason}` and that exec runs on
+  the per-exec `/gocache` + `/lintcache` binds exactly as under `off`
+  (`TestRunGateInContainer_CacheVolumeDegrades`, one row per step and
+  failure mode). The gate's disposition is unchanged — a cache step is never
+  `gateUnavailable` and never a verdict.
+- **Timing.** Every container exec logs one `gate_container_timing` line:
+  `cache` (`process` | `degraded` | `off`), `cache_volume`, `cache_ms`,
+  `seed_ms`, `service_ms`, `exec_ms`, `exit_code`
+  (`TestRunGateInContainer_TimingLogLine`). Provisioning sits outside the gate
+  timeout, so `exec_ms` alone is what that timeout bounds.
+
+**The boundary decision: the RUN, via the runner process.** No gate can read a
+build cache another run's gate wrote; execs inside one run share it. The name
+is crypto-random per process, never derived from shared state, never reused,
+and it is removed at process exit. Rejected:
+
+1. *Per-run copy-on-write over a read-mostly shared base.* An overlay mount
+   needs CAP_SYS_ADMIN, which `--cap-drop=ALL` removes, and there is no
+   trusted writer for the base: every gate is untrusted.
+2. *One shared cache relying on content addressing.* Go's build cache maps an
+   action id (a hash of the INPUTS) to an output the reader cannot re-verify
+   without rebuilding (`cmd/go/internal/cache`: `GetFile` checks only the
+   recorded size), and `go test` caches PASS results in `GOCACHE` (`go help
+   test`, "Test caching"; `scripts/test` runs `go test -race ./...` without
+   `-count=1`). A shared writable cache would let one run plant another run's
+   object files AND its test verdict.
+
+**Process-lifetime invariant — an ASSUMPTION the boundary rests on (#3967
+approval condition 2).** "One runner process serves exactly one stage of one
+run." The spawn model guarantees it: `fishhawk-runner` takes ONE `--run-id`
+and ONE `--stage-id` per invocation (`cmd/fishhawk-runner/flags.go`), `run()`
+serves that one stage and returns, the host dispatcher spawns a fresh runner
+from `bin/` per stage dispatch (a retry or fix-up pass is a new process), and
+`run()` installs the gate state, binds its owner once
+(`gateState.bindOwner(cfg.runID, cfg.stageID)`, `cmd/fishhawk-runner/main.go`)
+and defers `cleanup()`. Because the invariant lives outside this package, a
+cheap RUNTIME guard backs it: the name embeds the owning run and stage ids,
+and before reusing a minted volume `gateCacheVolume` checks
+`CacheVolume.BelongsTo(boundRun, boundStage)`; an exec for a different pair
+mints its own (`gate_cache_volume_not_reused`) and never mounts the first's
+(`TestCacheVolume_BelongsTo`, `TestGateCacheVolume_DifferentOwnerNeverReuses`,
+`TestGateCacheVolume_UnboundStateNeverMountsAnotherOwnersVolume`,
+`TestGateCacheVolume_DistinctPerProcessNeverShared`). An unbound or non-UUID
+owner (a runner started without `--stage-id`) degrades every exec to the
+per-exec caches rather than minting an unscoped volume. A future runner that
+serves several stages in one process MUST re-bind the owner per stage.
+
+**Residuals, stated not stronger:**
+
+- **Within-run sharing.** An intermediate fix iteration's test can plant a
+  cached PASS result or a crafted compiled object that the full re-verify of
+  a LATER SHA in the same stage reads. Backstops: CI's required checks run on
+  clean caches before merge, the intermediate commits stay in the PR history,
+  and the clone path today exposes the operator's host-wide `GOCACHE` to every
+  run — a strictly larger channel. Rollback: `FISHHAWK_GATE_CACHE=off`.
+- **The first container exec of every stage is still cold** (there is no
+  cross-run base, by the decision above).
+- **The module cache is still repopulated per exec** (host-seeded, unchanged).
+- **golangci-lint's cache key** hashes package file contents with their paths;
+  if a stale lint result could survive a fix iteration inside one stage, `off`
+  is the mitigation (the measurement compares exec 2's output to exec 1's).
+- **Podman** prepare argv is golden-pinned, not live-validated; a failure
+  degrades with `gate_cache_volume_unavailable`.
+- **Crash-orphaned volumes.** A runner SIGKILLed mid-stage runs no cleanup.
+  With NO runner live: `docker volume rm $(docker volume ls -q --filter
+  label=org.fishhawk.gate-cache)` (`podman` takes the same arguments).
+
+**Measurement procedure** (`cmd/fishhawk-runner/gatemeasure_test.go`,
+OPT-IN, never counted toward the e2e sentinel). On an idle docker host with
+NO live runner (verify lock and the shared test Postgres):
+
+```sh
+(cd runner && FISHHAWK_GATE_MEASURE_IMAGE=<digest-pinned fishhawk-gate> \
+  go test -run TestGateMeasure_ThreeWayFullVerify -timeout 4h -v ./cmd/fishhawk-runner/)
+```
+
+Optional: `FISHHAWK_GATE_MEASURE_COMMAND` (default `scripts/test verify`),
+`FISHHAWK_GATE_MEASURE_SHA` (default HEAD), `FISHHAWK_GATE_MEASURE_OUT` (a
+markdown file the table is also written to). With the image set and no safe
+runtime it FAILS rather than skips. It pre-pulls the gate and Postgres images,
+then runs the same SHA's full verify on a FRESH clone per exec through
+`runBoundedGateCommandDisposed` on three arms: `clone`
+(`FISHHAWK_GATE_ISOLATION=clone`) x2; `container-cold` (container + image +
+`FISHHAWK_GATE_SERVICES=postgres` + `FISHHAWK_GATE_CACHE=off`) x1;
+`container-volume` (the same with `process`) x2 on ONE state (exec 1 = cold
+volume, exec 2 = warm), then cleanup. Wall time per exec; CPU from
+`getrusage(RUSAGE_CHILDREN)` on the host arm and the gate container's own
+cgroup v2 `cpu.stat` `usage_usec` on the container arms (`n/a` when absent;
+neither counts the Postgres container); the cache/seed/service/exec split from
+the `gate_container_timing` lines. Every exec must exit 0 with disposition
+executed, and every container exec must log exactly one timing line with the
+arm's cache posture (a degraded volume arm, or a warm exec on a different
+volume, fails the walk) — a red or mis-postured exec invalidates the
+comparison. The pure helpers are pinned in-loop by `TestGateMeasureHelpers`.
+The walk is ~1.5–2h (five full verifies), beyond an implement budget, so it is
+an operator walk. **Recorded: pending operator walk.**
+
+**Decision rule.** Make the container path with `FISHHAWK_GATE_CACHE=process`
+this repository's local default when the stage-shaped sequence —
+container-volume exec 1 + exec 2 — is within **1.25x** of clone exec 1 +
+exec 2 in wall time; otherwise stay clone and pursue the cross-run
+trusted-base follow-up. The harness prints the ratio and the verdict.
+Interpretation to confirm, not asserted: without `-trimpath` the compile
+action id includes the package directory, so the clone arm's per-exec temp
+checkout path gets no build-cache hits for this repository's own packages
+across execs, while the container always mounts the checkout at `/work`.
+
+**Current decision: the local default is UNCHANGED.** The container path stays
+opt-in via `FISHHAWK_GATE_IMAGE` (or a declared `gate_container`) until the
+walk records numbers against the rule. `FISHHAWK_GATE_CACHE=process` is the
+default only for a runner that has already opted into the container path.
 
 ## Gate services (`service.go`, `passwd.go`; ADR-063 #2137 addendum, [E51.4 / #2137](https://github.com/kuhlman-labs/fishhawk/issues/2137))
 
@@ -865,7 +1076,9 @@ every host — no runtime skip, no refused-state theater.
 | (k) `TestGateContainer_CacheSymlinkNeverReachesHost` | the cache invariant + symlink-safe cleanup, above |
 | (l) `TestGateContainer_EndpointBoundAcrossContextSwitch` | selection recorded against the real socket, THEN `DOCKER_HOST`/`CONTAINER_HOST` redirected to an unreachable tcp endpoint and `DOCKER_CONTEXT`/`CONTAINER_CONNECTION` to a nonexistent context → the gate still runs on the validated daemon; the argv opens with the binding; the CLI env pins the validated socket with the redirecting variables dropped |
 | (m) `TestGateContainer_PostgresServiceReachableAndContained` | with `FISHHAWK_GATE_SERVICES=postgres` and the Postgres image as the gate image (it carries `psql`): `select 1` over the injected `FISHHAWK_TEST_PG_URL` prints 1; the role is `rolsuper=false, rolcreatedb=true, rolcreaterole=false`, `CREATE DATABASE` works, `CREATE ROLE` and `COPY … TO PROGRAM` are `permission denied`, the superuser cannot connect without its password, and its password appears nowhere in the gate output, env or argv; the containment set (no external or host-loopback egress after a positive control, no `eth*`, no daemon socket, only the Postgres socket under `/pgsock`, `/pgsock` and `/etc/passwd` mounted `ro` per `/proc/mounts`, `id -un` resolves, `FISHHAWK_GATE_CONTAINER=1`); host-side inspect via `gateServiceObserver` (NetworkMode none, one named-volume mount and a PGDATA tmpfs, no bind, no port, CapDrop ALL); `rm -f -v` + `volume rm` recorded and nothing left on the daemon; counterfactual: the same DSN with services UNSET fails to connect |
+| (o) `TestGateContainer_CacheVolumeWarmWithinProcessFreshAcrossProcesses` | `FISHHAWK_GATE_CACHE=process` (#3967): state A's exec 1 prints the runner uid, `GOCACHE=/gatecache/gocache` and WRITES a marker into it (the prepare helper's ownership, live); A's exec 2 finds the marker (warm within a process); state B — a second runner process, a different run/stage — mounts a different volume and finds nothing (fresh across processes); the positive control C (cache off) does NOT see its own exec-1 marker, so warm discriminates on the volume; A's gate argv mounts `/gatecache` BY NAME (a volume that `BelongsTo` A's run/stage, never an absolute path) beside `--network=none`; a host-side `volume inspect` shows the `org.fishhawk.gate-cache` label before `A.cleanup()` and fails after it |
 | (n) `TestGateContainer_SelfHostPgtestSuite` | OPT-IN (`FISHHAWK_GATE_SELFHOST_IMAGE`, the built `fishhawk-gate` image; counts toward the sentinel only when opted in and run): the REAL `pgtest` suite of the committed HEAD runs in the gate image over the socket DSN — pgx + golang-migrate, template bootstrap, per-test databases — exit 0, the PASS line, no `--- SKIP` |
+| (measure) `TestGateMeasure_ThreeWayFullVerify` (`gatemeasure_test.go`) | OPT-IN (`FISHHAWK_GATE_MEASURE_IMAGE`), NEVER counted toward the sentinel: the three-way full-verify walk of § "Persistent cache volume"; its pure helpers run in-loop via `TestGateMeasureHelpers` |
 | (h) `TestGateClone_PlantedRefNeverReachesPrimary` | clone path: plant never reaches the primary, lock path injected; the `git worktree add` sibling DOES leak the plant |
 | (i) `TestGateCloneSandbox_NoNetwork` | Linux-only: a loopback connect fails under `clone-sandbox` through `runBoundedGateCommand` and succeeds under the host-exec control |
 | (j) `TestGateHosted_RefusesEndToEnd` | hosted + auto with a REALLY detected runtime whose endpoint is pinned remote (`DOCKER_HOST=tcp://…` via the Getenv probe) → single-shot gate category C, fix loop category C, fix agent never invoked, verify command never ran |
