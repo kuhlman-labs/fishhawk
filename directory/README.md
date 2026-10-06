@@ -106,6 +106,22 @@ would leak. Each test gets its own freshly-migrated throwaway database.
 
 `FISHHAWK_SKIP_INTEGRATION` and an absent Docker daemon both skip.
 
+The same `TestMain` routes Postgres the way `backend/internal/pgtest` does
+(#2137, #4047), through the pure seam `resolveBase` in `testdb_test.go`:
+
+1. `FISHHAWK_SKIP_INTEGRATION` set: skip (it wins over everything below).
+2. `FISHHAWK_TEST_PG_URL` set (the runner's gate container hands in its
+   provisioned server): that server is the base, no container is started, and
+   there is no skip path — a skip would silently drop the suite from the gate.
+3. `FISHHAWK_GATE_CONTAINER=1` without a URL: every integration test fails
+   with `Fatalf` naming `FISHHAWK_GATE_SERVICES=postgres`; it never skips.
+4. Otherwise the testcontainers start above.
+
+Every test database is created by one helper, `newTestDatabase`:
+`fh_dir_<random hex>`, `TEMPLATE template0`, dropped `WITH (FORCE)` in
+`t.Cleanup`. A start that fails after the container exists still hands its
+terminate to `TestMain`, so the container is not leaked.
+
 ## Adding this module to a build
 
 `directory/` is in `/go.work`, so `scripts/test` picks it up automatically.

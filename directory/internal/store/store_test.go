@@ -2,40 +2,30 @@ package store
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
-	"net/url"
 	"os"
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 )
 
-// The directory module cannot import backend/internal/pgtest (Go's
-// internal-package rule stops at the module boundary), so it runs its OWN
-// container. It deliberately does NOT attach to the
-// shared fishhawk-test-postgres by reuse+name: that would require
-// replicating pgtest's whole hardening ladder (first-start name-conflict
-// attach-retry, stale-reuse re-create, cross-process template bootstrap),
-// and a naive WithReuse+WithName bootstrap is exactly the flake source
-// #1174 removed. One package here needs Postgres, so one unshared
-// container per test binary is the cheap, hazard-free option — and because
-// scripts/test disables ryuk and only reaps the shared container by name,
-// this one is terminated explicitly in TestMain rather than leaked. It is
-// unnamed (testcontainers assigns a random name), so it cannot collide
-// with a concurrent invocation either.
+// Postgres for these tests is routed by resolveBase (testdb_test.go), three
+// ways: FISHHAWK_TEST_PG_URL set means that server is the base and no
+// container is started (the runner's gate container, #2137);
+// FISHHAWK_GATE_CONTAINER=1 without a URL is a Fatalf naming the runner-side
+// remedy, never a skip; otherwise this package starts its own unshared
+// testcontainers Postgres, terminated explicitly in TestMain. See
+// testdb_test.go for why it cannot reuse backend/internal/pgtest.
 
 var (
 	baseURL     string
 	skipReason  string
+	fatalReason string
 	terminateFn func()
 )
 
@@ -53,82 +43,22 @@ func TestMain(m *testing.M) {
 }
 
 func setup() {
-	if os.Getenv("FISHHAWK_SKIP_INTEGRATION") != "" {
-		skipReason = "FISHHAWK_SKIP_INTEGRATION set"
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
-	defer cancel()
-
-	container, err := tcpostgres.Run(ctx,
-		"postgres:16-alpine",
-		tcpostgres.WithDatabase("fishhawk_directory"),
-		tcpostgres.WithUsername("fishhawk"),
-		tcpostgres.WithPassword("fishhawk"),
-		tcpostgres.BasicWaitStrategies(),
-	)
+	res, err := resolveBase(os.Getenv, startContainer)
+	// Assigned BEFORE the panic: TestMain's deferred terminate runs while the
+	// panic unwinds, so a container that started and then failed is reaped.
+	terminateFn = res.terminate
 	if err != nil {
-		if isDockerUnavailable(err) {
-			skipReason = fmt.Sprintf("Docker not available: %v", err)
-			return
-		}
 		panic(fmt.Sprintf("start directory test postgres: %v", err))
 	}
-	terminateFn = func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-		defer cancel()
-		_ = container.Terminate(ctx)
-	}
-
-	baseURL, err = container.ConnectionString(ctx, "sslmode=disable")
-	if err != nil {
-		panic(fmt.Sprintf("connection string: %v", err))
-	}
-}
-
-// isDockerUnavailable reports the daemon-absent shape, so a dev without
-// Docker skips rather than fails (mirrors backend/internal/pgtest).
-func isDockerUnavailable(err error) bool {
-	msg := strings.ToLower(err.Error())
-	for _, marker := range []string{
-		"cannot connect to the docker daemon",
-		"docker: not found",
-		"executable file not found",
-		"dial unix /var/run/docker.sock",
-		"is the docker daemon running",
-	} {
-		if strings.Contains(msg, marker) {
-			return true
-		}
-	}
-	return false
+	baseURL, skipReason, fatalReason = res.url, res.skip, res.fatal
 }
 
 // newStore returns a Store over a freshly-migrated throwaway database.
 func newStore(t *testing.T) *Store {
 	t.Helper()
-	if skipReason != "" {
-		t.Skipf("skipping integration test: %s", skipReason)
-	}
+	dbURL := newTestDatabase(t)
 
 	ctx := context.Background()
-	admin, err := pgx.Connect(ctx, baseURL)
-	if err != nil {
-		t.Fatalf("connect base db: %v", err)
-	}
-	defer func() { _ = admin.Close(ctx) }()
-
-	buf := make([]byte, 8)
-	if _, err := rand.Read(buf); err != nil {
-		t.Fatalf("random db name: %v", err)
-	}
-	dbName := "dir_" + hex.EncodeToString(buf)
-	if _, err := admin.Exec(ctx, "CREATE DATABASE "+pgx.Identifier{dbName}.Sanitize()); err != nil {
-		t.Fatalf("create per-test db: %v", err)
-	}
-
-	dbURL := replaceDBName(baseURL, dbName)
 	if err := MigrateUp(dbURL); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
@@ -136,28 +66,11 @@ func newStore(t *testing.T) *Store {
 	if err != nil {
 		t.Fatalf("connect per-test pool: %v", err)
 	}
-	t.Cleanup(func() {
-		pool.Close()
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		c, err := pgx.Connect(ctx, baseURL)
-		if err != nil {
-			return // best-effort drop
-		}
-		defer func() { _ = c.Close(ctx) }()
-		_, _ = c.Exec(ctx, "DROP DATABASE IF EXISTS "+pgx.Identifier{dbName}.Sanitize()+" WITH (FORCE)")
-	})
+	// Registered AFTER newTestDatabase's drop cleanup, so LIFO closes the
+	// pool before the database is dropped.
+	t.Cleanup(pool.Close)
 
 	return New(pool)
-}
-
-func replaceDBName(base, dbName string) string {
-	u, err := url.Parse(base)
-	if err != nil {
-		return base
-	}
-	u.Path = "/" + dbName
-	return u.String()
 }
 
 func TestAssignRegionThenLookup(t *testing.T) {
@@ -382,29 +295,8 @@ func TestMigrationsAreEmbedded(t *testing.T) {
 // The down migration must actually roll the schema back — an untested
 // down leaves local dev with no way out of a bad head.
 func TestMigrateDownDropsTable(t *testing.T) {
-	if skipReason != "" {
-		t.Skipf("skipping integration test: %s", skipReason)
-	}
 	ctx := context.Background()
-
-	admin, err := pgx.Connect(ctx, baseURL)
-	if err != nil {
-		t.Fatalf("connect base db: %v", err)
-	}
-	defer func() { _ = admin.Close(ctx) }()
-
-	buf := make([]byte, 8)
-	if _, err := rand.Read(buf); err != nil {
-		t.Fatalf("random db name: %v", err)
-	}
-	dbName := "dir_" + hex.EncodeToString(buf)
-	if _, err := admin.Exec(ctx, "CREATE DATABASE "+pgx.Identifier{dbName}.Sanitize()); err != nil {
-		t.Fatalf("create db: %v", err)
-	}
-	dbURL := replaceDBName(baseURL, dbName)
-	t.Cleanup(func() {
-		_, _ = admin.Exec(context.Background(), "DROP DATABASE IF EXISTS "+pgx.Identifier{dbName}.Sanitize()+" WITH (FORCE)")
-	})
+	dbURL := newTestDatabase(t)
 
 	if err := MigrateUp(dbURL); err != nil {
 		t.Fatalf("MigrateUp: %v", err)

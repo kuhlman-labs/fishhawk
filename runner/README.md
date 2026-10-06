@@ -491,9 +491,10 @@ this: its docker helpers (lease, sweep, reap) all open with
 `command -v docker || return`, so with no docker CLI in the gate they no-op
 rather than fail or skip the loop; it never sets `FISHHAWK_SKIP_INTEGRATION`;
 and the gate container's env allow-list (`TZ`/`LANG`/`TERM`, `LC_*`, `CGO_*`,
-`GO*`) cannot carry a host `FISHHAWK_SKIP_INTEGRATION` in. Known blocker the
-walk will hit: `directory/internal/store` starts its own testcontainers
-Postgres outside `pgtest`.
+`GO*`) cannot carry a host `FISHHAWK_SKIP_INTEGRATION` in.
+`directory/internal/store` honours the same `FISHHAWK_TEST_PG_URL` /
+`FISHHAWK_GATE_CONTAINER` routing as `pgtest` (#4047), so it is no longer a
+known in-container failure.
 
 **End-to-end fixtures.** `cmd/fishhawk-runner/gateisolation_e2e_test.go`
 drives the real wiring against a real runtime and the pinned
