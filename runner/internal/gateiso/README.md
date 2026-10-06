@@ -42,8 +42,12 @@ selection is recorded on the gate evidence once a gate reaches the exec seam
 is declared, not detected.** A hosted deployment that forgets
 `FISHHAWK_DEPLOYMENT_PROFILE=hosted` gets the `local` default and therefore
 fallback, not refusal. The mitigations are the two log lines above, the #2135
-evidence and the #2138 deployment docs. Do not widen this into detection
-silently.
+evidence and the deployment docs
+([`docs/deploy/self-hosted.md`](../../../docs/deploy/self-hosted.md) §
+"Runner gate isolation (ADR-063)" and
+[`docs/deploy/hosted-regional.md`](../../../docs/deploy/hosted-regional.md) §
+"Runner gate isolation under hosted", which tell every hosted runner host to
+set it). Do not widen this into detection silently.
 
 ## Selection (`select.go`)
 
@@ -359,6 +363,14 @@ a refused connection are all `Local=false` with a named reason.
   path would be interpreted in the host's filesystem namespace. Every remote
   endpoint is unsafe for the same reason — a bind-mount source is resolved on
   the daemon's host, not the runner's.
+
+**A SAFE verdict does not mean pulls work.** Detection probes (`docker context
+show` / `inspect`, `docker version`, `podman info` / `version`) never pull, so
+a runtime classified SAFE can still hang every image pull when its credential
+helper blocks (observed on Docker Desktop for macOS: a
+`docker-credential-desktop get` child). The classification is unchanged; the
+symptom, the per-step bounds and the remedy are in `runner/README.md` §
+"Gate isolation" (Docker Desktop: hung credential helper).
 
 ## The container path (`container.go`)
 
@@ -1121,7 +1133,14 @@ category B.
   so it still runs only the Docker-free legs (`verify --no-tests`) and is CI
   parity, not isolation.
 - [#2138](https://github.com/kuhlman-labs/fishhawk/issues/2138) (E51.5) — the
-  operator-facing posture docs: the container-runtime requirement in the
-  self-hosted distribution profile, runner setup docs, and the ARCHITECTURE
-  containment rows. The image those docs point a self-hosted runner of this
-  repository at is `fishhawk-gate` (`deploy/gate-image/`).
+  operator-facing posture docs: landed in
+  [`docs/deploy/self-hosted.md`](../../../docs/deploy/self-hosted.md) §
+  "Runner gate isolation (ADR-063)" (runtime requirement, never the host
+  Docker socket, the per-path table including the macOS egress gap, the
+  declared profile, the #2136 / #2137 / #3967 limits, the Docker Desktop
+  credential-helper hang) and
+  [`docs/deploy/hosted-regional.md`](../../../docs/deploy/hosted-regional.md) §
+  "Runner gate isolation under hosted", with a runner-host checklist in
+  `runner/README.md` § "Gate isolation" and pointer rows in
+  `docs/ARCHITECTURE.md` §10. The image those docs point a self-hosted runner
+  of this repository at is `fishhawk-gate` (`deploy/gate-image/`).

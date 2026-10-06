@@ -163,6 +163,18 @@ Full env matrix and fail-closed table:
 [regional-cells.md](regional-cells.md). Chart reference:
 [deploy/helm/fishhawk/README.md](../../deploy/helm/fishhawk/README.md).
 
+## Runner gate isolation under hosted
+
+Hosted runners execute tenants' gate commands, so ADR-063's posture is refuse, never fall back. The operator-facing contract (runtime requirement, never the host Docker socket, what each path closes) is in [self-hosted.md](self-hosted.md#runner-gate-isolation-adr-063); the code contract is `runner/internal/gateiso/README.md`. This section is only what changes under `hosted`.
+
+- **Every runner serving a hosted cell MUST set `FISHHAWK_DEPLOYMENT_PROFILE=hosted`.** The profile is declared, not detected: an unset value parses as `local`, so a runner that forgets it silently gets the `local` fallback instead of a refusal. The runner's startup `gate_isolation_configured` line and its first `gate_isolation_selected` line both carry the profile, and the gate evidence records it: confirm `hosted` there on every runner host.
+- **Every non-container path is refused.** Without a SAFE local runtime AND a gate image the gate does not run: category C, never a fallback run, never the fix agent. A runner without both cannot serve hosted at all. This includes a containerized runner (docker-outside-of-docker classifies UNSAFE).
+- **An explicit `FISHHAWK_GATE_ISOLATION=clone` or `clone-sandbox` is a startup config error**, not a per-gate refusal (`runner_failed reason=config`, before any backend contact). Only `auto` and `container` are permitted.
+- **Declared images** (workflow-v2 `gate_container`) are refused while `FISHHAWK_GATE_IMAGE_ALLOWLIST` is empty, and a tag-only reference is refused even when it is allowlisted: `name@sha256:<digest>` is required. `FISHHAWK_GATE_IMAGE` stays operator-chosen and is not checked against the allowlist.
+- **In-repo builds are denied by default.** Allowing one (`FISHHAWK_GATE_BUILD=allow`) additionally needs the allowlist, and every build base must pass it and be digest-pinned.
+- **`RUN --mount=type=cache` is refused in a declared build**: a cache mount persists on the shared daemon across builds and projects.
+- **A declared `gate_container` the selected path cannot honour is refused**, where `local` / `self-hosted` run the host fallback with a `declared_unhonored` marker.
+
 ## Region-scoped inference
 
 Per-cell and process-level: set `FISHHAWKD_MODEL_BASE_URL` and

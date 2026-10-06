@@ -217,6 +217,23 @@ where the execution PATH is chosen. The pure pieces live in
 [`runner/internal/gateiso`](internal/gateiso/README.md) (the long-form
 contract); `cmd/fishhawk-runner/gateisolation.go` is the runner-side glue.
 
+**Runner host requirements (operator checklist).** The `container` path needs
+a SAFE local container runtime (docker over a local unix socket, or rootless
+podman with its socket service) AND a gate image (`FISHHAWK_GATE_IMAGE` or a
+declared `gate_container`). Without both, `auto` takes the fallback at reduced
+isolation, `clone-sandbox` on Linux or `clone`; macOS has no unprivileged
+no-network sandbox, so there `auto` without an image selects `clone` (full host
+network and host-filesystem read). Never hand a gate the host Docker socket:
+do not mount `/var/run/docker.sock` into a runner or gate container
+(docker-outside-of-docker classifies UNSAFE). Declare
+`FISHHAWK_DEPLOYMENT_PROFILE` on every runner host (`self-hosted` | `hosted`;
+unset is `local`); `hosted` refuses every non-container path instead of falling
+back. The per-path table and the per-feature limits are in
+[`docs/deploy/self-hosted.md`](../docs/deploy/self-hosted.md) § "Runner gate
+isolation (ADR-063)"; the hosted half is in
+[`docs/deploy/hosted-regional.md`](../docs/deploy/hosted-regional.md) § "Runner
+gate isolation under hosted".
+
 **Eight startup variables.** `FISHHAWK_GATE_ISOLATION` (`auto` default |
 `container` | `clone-sandbox` | `clone`), `FISHHAWK_GATE_IMAGE` (empty default
 — the container path is unavailable without it, so a default runner's
@@ -424,6 +441,37 @@ The local default is UNCHANGED (the container path stays opt-in via
 (`TestGateMeasure_ThreeWayFullVerify`) records numbers against the decision
 rule. Boundary, residuals, measurement procedure and rule:
 `internal/gateiso/README.md` § "Persistent cache volume".
+
+**Docker Desktop: hung credential helper.** Observed on Docker Desktop for
+macOS (2026-10-06), not a reproduced contract: `docker-credential-desktop get`
+can block indefinitely, presumed to be waiting on keychain access. With
+`credsStore` set in the docker config, EVERY `docker pull` calls it, an
+anonymous pull of a public image included, so the pull makes no progress and
+prints no error; the tell is a `docker-credential-desktop get` child process
+under the pulling `docker`. The runner's exposure is bounded per step, and each
+step runs under the runner's inherited environment with the endpoint re-pinned
+(`DOCKER_CONFIG` is kept): the explicit declared-image pull 10m (a failure is
+`gateUnavailable`, category C), the gate-image `/etc/passwd` read 5m and the
+cache prepare helper 5m (each includes a cold pull and DEGRADES, the former with
+`gate_passwd_unavailable`, the latter with `gate_cache_volume_unavailable`), the
+service `run -d` 5m (`gateUnavailable`); a `FISHHAWK_GATE_IMAGE` pull inside the
+gate run is bounded only by the gate's own `executor.verify.timeout`. Pulls
+outside these runner steps (a hand-run pull, `scripts/test lint|verify
+--in-gate-image`, the docker-gated e2e fixtures) have no such bound and hang
+until something kills them. Remedies: unlock the keychain or allow its
+prompt, if that is the cause; or, for anonymous public pulls only, point
+`DOCKER_CONFIG` at a config with NO `credsStore`, NO `credHelpers` and NO inline
+`auths`. Prefer a fresh empty one (`{"auths":{}}`) over a copy of yours, and
+set `DOCKER_HOST=unix://$HOME/.docker/run/docker.sock` with it: a fresh config
+dir has no `currentContext` or `contexts/`, so the CLI falls back to the
+`default` context (`DOCKER_HOST`, else `/var/run/docker.sock`) and the endpoint
+would otherwise change silently. Operator-verified (2026-10-06, Docker Desktop
+on macOS): with exactly that pair a pull of `docker.io/alpine/git:v2.47.2`
+completed immediately and the live gate fixtures passed, while the default
+config hung. Set both in the RUNNER's environment; the gate container never sees
+them. A config without credentials cannot pull a private image. Operator
+walkthrough: [`docs/deploy/self-hosted.md`](../docs/deploy/self-hosted.md)
+§ "Docker Desktop: a hung credential helper".
 
 **Operator walk before enabling it for this repository (approval conditions 5
 and 6 of #2137).** The implement gate proves the pieces, not the full
