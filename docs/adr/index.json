@@ -786,6 +786,15 @@
       "supersedes": [],
       "superseded_by": [],
       "applies_to": []
+    },
+    {
+      "id": "ADR-088",
+      "title": "Declarative gate services: a closed, Fishhawk-owned `services:` schema under workflow-v2 `gate_container`, joined to the gate by a shared --network=none namespace (not raw compose, not a bridge network)",
+      "path": "docs/adr/088-declarative-gate-services.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
     }
   ]
 }
