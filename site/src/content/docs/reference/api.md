@@ -53,6 +53,17 @@ each scheduled workflow, its cron, the current due window, the next due time
 and the last outcome. When the scheduler is off it answers `enabled: false`
 rather than an error.
 
+The stage prompt responses (`GET /v0/stages/{stage_id}/prompt` and its
+`prompt-render` twin) carry a `gate_container` object when the run's
+workflow-v2 spec declares one, which the table does not spell out either. It
+holds exactly one source, `image` or `dockerfile` plus `context`, and a
+`source` of `stage` or `workflow` naming the level that declared it. The
+server picks the stage's own block over the workflow's and resolves the stage
+by its position among stages of the same type, so two implement stages can
+run their gates in different images. The runner applies its image policy,
+pull and build to that declaration. The object is absent when nothing is
+declared.
+
 ## Generated operation reference
 
 <!-- BEGIN GENERATED api -->
