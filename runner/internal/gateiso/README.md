@@ -914,9 +914,14 @@ from the same routing (`sharedBaseURL`), so the package is clean in there: `go
 test ./internal/pgtest/ ./internal/postgres/` was recorded green inside
 `fishhawk-gate:smoke-92445ead` against a provided server on the #2137 fix-up
 pass (no daemon socket; NOT the runner-provisioned service, so not the walk).
-`directory/internal/store` still starts its own testcontainers Postgres
-outside `pgtest` — a KNOWN in-container failure the operator walk below will
-show.
+`directory/internal/store` (a separate module that cannot import `pgtest`)
+honours the same routing (#4047): `FISHHAWK_TEST_PG_URL` is its base with
+throwaway `fh_dir_<hex>` databases and no testcontainers call, and with
+`FISHHAWK_GATE_CONTAINER=1` and no URL it Fatalf's naming
+`FISHHAWK_GATE_SERVICES` instead of skipping. Its provided-server path was run
+against a hand-started server as the runner's least-privilege role, not
+against the runner-provisioned service, so the operator walk below remains
+the first run on the real socket.
 
 **Operator walk — required before setting `FISHHAWK_GATE_IMAGE` for this
 repository (approval conditions 5 and 6).** In-loop the implement gate proves
