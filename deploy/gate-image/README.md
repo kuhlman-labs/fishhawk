@@ -122,6 +122,19 @@ as your uid. It answers "would CI's toolchain pass this tree", nothing about
 containing what the gate executes; that is the runner's container path
 (ADR-063), not this helper.
 
+**Docker Desktop: a blocked credential helper hangs the pull.** Observed on
+Docker Desktop for macOS (2026-10-06): when `docker-credential-desktop get`
+blocks (presumed to be waiting on keychain access), step 4's pull makes no
+progress and prints no error; the tell is a `docker-credential-desktop get`
+child under the `docker` process. This is the environment, not the image or the
+script. Remedy and the per-step
+bounds the runner applies: `runner/README.md` § "Gate isolation" (Docker
+Desktop: hung credential helper). The anonymous-pull remedy (`DOCKER_CONFIG` at
+a config with no `credsStore`, no `credHelpers` and no inline `auths` entries, plus an explicit
+`DOCKER_HOST`) works for the default `ghcr.io/kuhlman-labs/fishhawk-gate:main`
+only after the one-time public-visibility step below, and never for a private
+image.
+
 **Limits.** The `go test -race` loop and the patch-coverage gate do not run
 in-image here: the backend tests need a Postgres, and this helper provisions
 none (no daemon in the image). The runner's container path does — #2137's
@@ -166,6 +179,13 @@ run against this image with its PASS line recorded, then one full
 container-path verify with pgtest-backed PASS lines and no `--- SKIP` — in
 `runner/internal/gateiso/README.md` § "Gate services (#2137)", which is also
 the contract.
+
+On Docker Desktop for macOS, a blocked `docker-credential-desktop get` makes the
+runner's image pull for this image hang silently (each runner pulling step is
+bounded and fails or degrades at its bound). Symptom and remedy:
+`runner/README.md` § "Gate isolation" (Docker Desktop: hung credential helper).
+The anonymous-pull `DOCKER_CONFIG` remedy covers this image only once its GHCR
+package is public (§ "One-time operator steps"), not a private image.
 
 ## One-time operator steps
 

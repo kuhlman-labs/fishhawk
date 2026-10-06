@@ -289,6 +289,109 @@ browser-facing denial page is unchanged and still names no login.
 If the page shows the generic body instead of a branch, the deployment recorded
 the reason but did not carry it — check the same log line.
 
+## Runner gate isolation (ADR-063)
+
+The runner executes spec-supplied gate commands (the committed-tree verify gates, the `diff_coverage` measurement, the auto-format absorb) on its own host, and the checkout they run over is agent-authored. ADR-063 ([#2127](https://github.com/kuhlman-labs/fishhawk/issues/2127)) contains that execution; this section is the operator posture for a Mode 1 runner host. It states what to install, what never to do, and what each fallback leaves open. The contract lives in [`runner/internal/gateiso/README.md`](../../runner/internal/gateiso/README.md); the runner-side summary and cleanup commands in [`runner/README.md`](../../runner/README.md) § "Gate isolation".
+
+### Runtime requirement
+
+- The `container` path needs BOTH a SAFE local container runtime AND a gate image. Image sources: `FISHHAWK_GATE_IMAGE`, or a workflow-v2 `gate_container` in the spec (a registry `image`, or an in-repo `dockerfile` + `context` build).
+- SAFE means: docker whose `DOCKER_HOST` (when set) AND active-context host are both local, dialable unix sockets; or rootless podman with its socket service running (`systemctl --user enable --now podman.socket`). Docker Desktop on macOS classifies SAFE. Every other runtime is UNSAFE with a named reason on the recorded selection: tcp/ssh/npipe endpoints, a podman machine, rootful podman, a missing socket.
+- Without both, the runner does not fail: under `local` / `self-hosted` it takes the fallback at reduced isolation (table below), and the gate evidence names what the container path lacked (`container_unavailable`).
+
+Owner: `runner/internal/gateiso/README.md` § "Safe-runtime detection over the EFFECTIVE endpoint".
+
+### Safe launch: never the host Docker socket
+
+- Never mount `/var/run/docker.sock` (or any path that reaches the daemon) into a runner container or a gate container to make the container path work. ADR-063's hard requirement: a gate container that can reach the host daemon is a container-escape path and is worse than the unisolated status quo.
+- Docker-outside-of-docker, a runner running inside a container against the host's daemon, classifies UNSAFE by design: the gate container would be a sibling on the host daemon, not isolated from it. So do tcp, ssh and npipe endpoints. A runner that is itself inside a container is classified UNSAFE whatever runtime it reaches, and takes the fallback: run the runner on the host to get the container path.
+- The mount guard is the backstop, not the plan. It refuses any bind-mount source that resolves under `/run` or `/var/run`, is a unix socket, contains the detected daemon socket, or has a socket within eight directory levels. The gate then does not run: it is category C, never handed to the fix agent. The depth bound is a stated, test-pinned limit.
+
+Owner: `runner/internal/gateiso/README.md` § "The container path" (the resolved-path socket-mount guard).
+
+### What each path closes
+
+| Path | Hosts | `.git` metadata | Egress | Host filesystem read |
+|---|---|---|---|---|
+| `container` | any host with a SAFE runtime and an image: Linux docker or rootless podman, macOS Docker Desktop | closed: independent clone mounted at `/work`, primary `.git` unreachable | closed: `--network=none` | closed: only the checkout, caches, a read-only `/etc/passwd` and (with a service) a read-only socket volume are mounted |
+| `clone-sandbox` | Linux only, when the `unshare -rn` probe passes | closed: independent clone | closed at the IP layer only: network namespace (it hides host loopback too), but unix sockets in the filesystem the runner's user can read, the runtime's daemon socket included, stay reachable | OPEN: the gate reads whatever the runner's OS user reads |
+| `clone` | every host; the only host path on macOS | closed: independent clone | OPEN: full host network | OPEN: same OS user as the runner |
+| `refused` | any | the gate never runs: category C, not a fallback run, not the fix agent | | |
+
+- `.git` metadata is closed on every path that executes: the gate's checkout is an independent `--no-hardlinks` clone with `remote.origin.url` unset, never a linked worktree of the primary.
+- **macOS egress gap.** macOS has no unprivileged no-network sandbox, so `clone-sandbox` is unavailable there and `auto` without an image selects `clone`: full host network and host-filesystem read. Network isolation on macOS comes from the container path (Docker Desktop plus an image) or not at all.
+- The coverage gates' waived residuals (profile forgery, same-user snapshot tamper) close once the gate command can no longer reach those paths (ADR-063 § Consequences). Only `container` withholds the host paths.
+- The selection is visible: the first gate exec logs `gate_isolation_selected`, and the gate evidence carries `gate_isolation` with the precise `path` and its class (`container` | `fallback` | `refused`). An isolated run and a fallback run are distinguishable after the fact.
+
+Owner: `runner/internal/gateiso/README.md` § "Selection (`select.go`)", § "The throwaway clone (`clone.go`)", § "The Linux no-network sandbox (`sandbox.go`)", § "Evidence (#2135)".
+
+### The profile is declared, not detected
+
+- Set `FISHHAWK_DEPLOYMENT_PROFILE=self-hosted` in the environment of every `fishhawk-runner` (`local` | `self-hosted` | `hosted`). Unset means `local` (`ParseProfile`); an unknown value is a startup config error.
+- `self-hosted` behaves exactly like `local`: the image policy treats them identically and only `hosted` forbids the fallback paths. Setting it changes no behaviour; it records which posture the deployment claims on the selection and the gate evidence.
+- `FISHHAWKD_SINGLE_TENANT_*` does NOT set it. Those are `fishhawkd` flags; the runner is a separate process that reads its own environment.
+
+Owner: `runner/internal/gateiso/README.md` § "Environment variables (read by the runner at startup)".
+
+### Hosted refuses, never falls back
+
+Under profile `hosted` every non-container path is refused, so a runner without a safe runtime and an image cannot serve a hosted cell at all. A Mode 1 deployment does not run `hosted`; the policy and what it enforces are in [hosted-regional.md](hosted-regional.md#runner-gate-isolation-under-hosted).
+
+### Per-project gate image (#2136)
+
+- A workflow-v2 `gate_container` (`{image}` or `{dockerfile, context}`, workflow level with a per-stage override) names the image every gate kind runs in. Precedence: stage > workflow > `FISHHAWK_GATE_IMAGE` > the fallback. Spec: [`docs/spec/workflow-v2.md`](../spec/workflow-v2.md) § "Gate container".
+- Declared images are pulled by the runner with the runtime CLI's own credential store (Fishhawk passes no credential) and run by `name@<registry digest>`. Under `self-hosted` a tag-only reference is allowed with a recorded warning and re-pulled on every gate; pin `name@sha256:<digest>`.
+- A declared image the selected path cannot honour runs the host fallback under `self-hosted` (log `gate_container_unhonored`, evidence `declared_unhonored`). `hosted` refuses.
+- Builds are allowed by default under `self-hosted`: the context is the COMMITTED tree at the gate's head SHA, behind a deny-by-default static Dockerfile guard, built with `--network=none`. `FISHHAWK_GATE_BUILD=deny` turns them off. Build tags accumulate under label `fishhawk.gate-build=1`; pruning is documented, not automated.
+- **Limit: build bases are pulled with the host's registry credentials.** Without `FISHHAWK_GATE_IMAGE_ALLOWLIST`, a declared build's `FROM`, `COPY --from=` and `RUN --mount from=` references are unconstrained and the daemon pulls them with the runtime CLI's credential store. The agent-writable Dockerfile gains a daemon-mediated egress channel to any registry host and read access to any private image the host is logged in to. On any host whose runtime CLI holds registry credentials, set `FISHHAWK_GATE_IMAGE_ALLOWLIST` or `FISHHAWK_GATE_BUILD=deny`.
+- **Limit: `RUN --mount=type=cache` persists on the daemon** across builds and projects under `self-hosted`, so one build can read a cache another wrote. Accepted for a single-tenant host.
+- **Limit: guard residual [#4034](https://github.com/kuhlman-labs/fishhawk/issues/4034), open.** The guard classes any digits-only `COPY --from=` value as a stage index, but BuildKit treats a value too long for `strconv.Atoi` (20 digits, operator-verified on the issue) as an image, so it escapes the allowlist. Exploitation needs a single-component image under `docker.io/library` plus podman short-name search registries or a registry mirror.
+- Other stated residuals (RUN steps as root in the build sandbox, `ONBUILD` triggers invisible to the scan, the scan being best-effort): ADR-063's #2136 addendum.
+
+Owner: `runner/internal/gateiso/README.md` § "Declared gate image (`gate_container`, …)"; `deploy/gate-image/README.md` for this repository's own image.
+
+### Daemon-dependent gates (#2137)
+
+- The `--network=none` gate container has no daemon, no daemon socket and no network, so a gate that needs Docker (testcontainers) cannot run in it.
+- `FISHHAWK_GATE_SERVICES=postgres` is the only provisioned daemon: the runner starts one network-less Postgres per container exec and shares only its unix socket, read-only, into the gate as `FISHHAWK_TEST_PG_URL`. Container path only; elsewhere the runner logs `gate_services_ignored`. An unknown member is a startup config error.
+- Pin `FISHHAWK_GATE_POSTGRES_IMAGE` by digest (default `postgres:16-alpine`); it runs beside every container gate.
+- Any other daemon dependency is unsupported on the container path. A repository whose gates need Postgres must not get a gate image without `FISHHAWK_GATE_SERVICES=postgres`: the pgtest-backed suite then fails closed with no database.
+- On `clone`, the host's daemon is reachable as before. On `clone-sandbox` only its loopback TCP is hidden (the network namespace hides host loopback); a pathname unix socket such as `docker.sock` or a rootless `podman.socket` is a filesystem object, and the sandbox adds no mount namespace (`sandbox.go` wraps `unshare -rn` only), so a socket the runner's user can read stays reachable and a gate command could use it to start a networked container. Egress there is closed at the IP layer only; where that matters, use the container path.
+- **Residual: RAM-backed PGDATA.** The service's data directory is a `tmpfs` with no size option and the service has no memory limit, so the databases a gate creates live in host memory. A large or hostile suite can pressure the runner host's memory (host availability only; the service has no egress).
+- **Residual: crash-orphaned services.** A runner killed with SIGKILL mid-exec runs no teardown. The service container and volume stay behind, both labelled `org.fishhawk.gate-service`; the label-filtered cleanup is in `runner/README.md`.
+
+Owner: `runner/internal/gateiso/README.md` § "Gate services (`service.go`, `passwd.go`; ADR-063 #2137 addendum, …)".
+
+### Cache volume (#3967)
+
+- `FISHHAWK_GATE_CACHE=process` (default) | `off`. It acts only on the container path: `process` keeps `GOCACHE` and the golangci-lint cache in ONE named volume per runner process, so later gate execs of a stage start warm. `off` restores a cold per-exec cache. The module cache stays per-exec either way.
+- **Poisoning boundary: one runner process serves one stage of one run.** A fresh runner is spawned per stage dispatch, so no gate reads a cache another run's gate wrote. Within one stage the execs share it: an intermediate fix iteration's test can plant a cached result that a later verify of the same stage reads.
+- A failed cache step (volume create, prepare, write check) degrades that exec to the per-exec caches and logs `gate_cache_volume_unavailable`. It never refuses the gate and never changes a verdict.
+- The volume is removed when the runner process exits. A SIGKILLed runner leaves it behind, labelled `org.fishhawk.gate-cache`; remove it by label with no runner live (command in `runner/README.md`).
+- The container path itself stays opt-in: nothing here changes what a runner without an image does.
+
+Owner: `runner/internal/gateiso/README.md` § "Persistent cache volume (`cachevolume.go`, …)".
+
+### Docker Desktop: a hung credential helper
+
+Observed on Docker Desktop for macOS (2026-10-06), not a reproduced contract.
+
+- **Symptom.** A `docker pull` makes no progress and prints no error, and `ps` shows a `docker-credential-desktop get` child process. The helper is presumed to be waiting on keychain access; that cause is not confirmed.
+- **Effect.** With `credsStore` set in the docker config, the CLI asks the helper for credentials even on an anonymous pull of a public image. Hand-run pulls (`scripts/test lint|verify --in-gate-image`, the docker-gated runner fixtures) hang with nothing to read. Inside the runner each pulling step is bounded and fails or degrades at its bound instead of hanging the stage; the exact bounds are in `runner/README.md`.
+- **Remedy 1.** Unlock the keychain or allow its prompt, if that is the cause.
+- **Remedy 2, anonymous public pulls only.** Point `DOCKER_CONFIG` at a config with NO `credsStore`, NO `credHelpers` and NO inline `auths`. Prefer a fresh empty config over copying your own:
+
+  ```sh
+  mkdir -p "$HOME/.docker-anon" && printf '{"auths":{}}\n' > "$HOME/.docker-anon/config.json"
+  export DOCKER_CONFIG="$HOME/.docker-anon"
+  export DOCKER_HOST="unix://$HOME/.docker/run/docker.sock"
+  ```
+
+  Set `DOCKER_HOST` explicitly. A fresh config carries no `currentContext` or `contexts/`, so the CLI falls back to the `default` context, whose endpoint is `DOCKER_HOST` or else `/var/run/docker.sock`; pinning the socket keeps the effective endpoint from changing silently. Operator-verified (2026-10-06, Docker Desktop on macOS): with exactly this pair, a pull of `docker.io/alpine/git:v2.47.2` completed immediately and the live gate fixtures passed, while the default config hung on `docker-credential-desktop get`.
+- **It reaches the runner only if it is in the RUNNER's environment.** The runner hands its own environment to the runtime CLI for pulls, inspects and service steps, with the endpoint variables re-pinned to the validated socket and `DOCKER_CONFIG` kept. The gate container never sees it. A config without credentials cannot pull a private image, so this does not work for a private gate image or private build bases.
+
+Owner: `runner/README.md` § "Gate isolation" (Docker Desktop: hung credential helper); `deploy/gate-image/README.md` for the default gate image.
+
 ## What stays untenanted
 
 CLI / bearer-token runs are not bound to an account: the account-scoped authz
