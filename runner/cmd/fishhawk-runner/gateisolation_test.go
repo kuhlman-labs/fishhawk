@@ -116,6 +116,17 @@ func TestConfigureGateIsolation_Rows(t *testing.T) {
 		{"defaults", nil, nil},
 		{"services postgres", map[string]string{gateServicesEnvVar: " postgres , postgres ", gatePostgresImageEnvVar: " pg@sha256:abc "}, nil},
 		{"hosted+container", map[string]string{deploymentProfileEnvVar: "hosted", gateIsolationModeEnvVar: "container", gateImageEnvVar: " img:1 "}, nil},
+		// E51.3 / #2136: the allowlist and build posture are startup config.
+		{"allowlist bare name", map[string]string{gateImageAllowlistEnvVar: "ghcr.io/org/, alpine"},
+			[]string{gateImageAllowlistEnvVar, `"alpine"`, "ambiguous"}},
+		{"allowlist host with tag-shaped port", map[string]string{gateImageAllowlistEnvVar: "x:tag"},
+			[]string{gateImageAllowlistEnvVar, `"x:tag"`}},
+		{"allowlist tag entry", map[string]string{gateImageAllowlistEnvVar: "ghcr.io/org/gate:main"},
+			[]string{gateImageAllowlistEnvVar, `"ghcr.io/org/gate:main"`, "mutable"}},
+		{"invalid build posture", map[string]string{gateBuildEnvVar: "maybe"},
+			[]string{gateBuildEnvVar, `"maybe"`, "allow, deny"}},
+		{"allowlist and build", map[string]string{gateImageAllowlistEnvVar: "ghcr.io/org/ docker.io/library/alpine", deploymentProfileEnvVar: "hosted", gateBuildEnvVar: "allow"}, nil},
+		{"hosted build default", map[string]string{deploymentProfileEnvVar: "hosted"}, nil},
 	}
 	for _, r := range rows {
 		t.Run(r.name, func(t *testing.T) {
@@ -157,6 +168,20 @@ func TestConfigureGateIsolation_Rows(t *testing.T) {
 			if r.name == "hosted+container" && (st.image != "img:1" || !strings.Contains(log.String(), `"image":"img:1"`)) {
 				t.Errorf("image not trimmed/logged: %q\n%s", st.image, log.String())
 			}
+			switch r.name {
+			case "defaults":
+				if !st.buildAllowed || !st.allowlist.Empty() || !strings.Contains(log.String(), `"allowlist_entries":0,"build":"allow"`) {
+					t.Errorf("local default = build %t allowlist %v, want allow / empty:\n%s", st.buildAllowed, st.allowlist, log.String())
+				}
+			case "allowlist and build":
+				if !st.buildAllowed || len(st.allowlist) != 2 || !strings.Contains(log.String(), `"allowlist_entries":2,"build":"allow"`) {
+					t.Errorf("state = build %t allowlist %v:\n%s", st.buildAllowed, st.allowlist, log.String())
+				}
+			case "hosted build default":
+				if st.buildAllowed || !strings.Contains(log.String(), `"build":"deny"`) {
+					t.Errorf("hosted default build = %t, want deny:\n%s", st.buildAllowed, log.String())
+				}
+			}
 		})
 	}
 }
@@ -179,11 +204,13 @@ func TestRun_GateIsolationConfigErrorsExitUsage(t *testing.T) {
 		{"bogus mode", map[string]string{gateIsolationModeEnvVar: "bogus"}, exitUsage},
 		{"hosted+clone", map[string]string{deploymentProfileEnvVar: "hosted", gateIsolationModeEnvVar: "clone"}, exitUsage},
 		{"unknown gate service", map[string]string{gateServicesEnvVar: "redis"}, exitUsage},
+		{"bad image allowlist", map[string]string{gateImageAllowlistEnvVar: "alpine"}, exitUsage},
+		{"bad build posture", map[string]string{gateBuildEnvVar: "sometimes"}, exitUsage},
 		{"valid", map[string]string{gateIsolationModeEnvVar: "clone"}, exitOK},
 	}
 	for _, r := range rows {
 		t.Run(r.name, func(t *testing.T) {
-			for _, k := range []string{gateIsolationModeEnvVar, deploymentProfileEnvVar, gateImageEnvVar, gateServicesEnvVar, gatePostgresImageEnvVar} {
+			for _, k := range []string{gateIsolationModeEnvVar, deploymentProfileEnvVar, gateImageEnvVar, gateServicesEnvVar, gatePostgresImageEnvVar, gateImageAllowlistEnvVar, gateBuildEnvVar} {
 				t.Setenv(k, r.env[k])
 			}
 			var out strings.Builder
@@ -197,8 +224,13 @@ func TestRun_GateIsolationConfigErrorsExitUsage(t *testing.T) {
 				if !strings.Contains(out.String(), `"event":"runner_started"`) {
 					t.Errorf("the config check must run AFTER the startup line:\n%s", out.String())
 				}
-				if r.env[gateServicesEnvVar] != "" && !strings.Contains(out.String(), gateServicesEnvVar) {
-					t.Errorf("config error must name %s:\n%s", gateServicesEnvVar, out.String())
+				for _, k := range []string{gateServicesEnvVar, gateImageAllowlistEnvVar, gateBuildEnvVar} {
+					if r.env[k] != "" && !strings.Contains(out.String(), k) {
+						t.Errorf("config error must name %s:\n%s", k, out.String())
+					}
+				}
+				if strings.Contains(out.String(), `"event":"gate_isolation_configured"`) {
+					t.Errorf("a config error must not configure:\n%s", out.String())
 				}
 			} else if !strings.Contains(out.String(), `"event":"gate_isolation_configured","mode":"clone"`) {
 				t.Errorf("missing gate_isolation_configured:\n%s", out.String())
@@ -1470,6 +1502,12 @@ func classifyGateArgv(argv []string) string {
 		return "service_rm"
 	case len(sub) > 1 && sub[0] == "rm" && sub[1] == "-f":
 		return "gate_kill"
+	case len(sub) > 1 && sub[0] == "image" && sub[1] == "inspect":
+		return "inspect"
+	case sub[0] == "pull":
+		return "pull"
+	case sub[0] == "build":
+		return "build"
 	}
 	return "?"
 }
@@ -2196,5 +2234,875 @@ func TestGateOutputTail_Bounds(t *testing.T) {
 	got := gateOutputTail(strings.Repeat("a", 3000) + "END")
 	if !strings.HasPrefix(got, "…") || !strings.HasSuffix(got, "END") || len(got) != len("…")+2048 {
 		t.Errorf("long output not bounded to its tail: len %d", len(got))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Declared gate_container (E51.3 / #2136): the prompt's declaration reaches
+// selection() through declare, the image policy runs there, and the container
+// path resolves a declared image (explicit pull, run by digest) or an in-repo
+// build (committed tree, static screen first, content-addressed cache) through
+// the AUXILIARY seam before the gate's own run. The env image path is pinned
+// byte-unchanged by TestRunGateInContainer_ArgvAndTimeoutKill above (exactly
+// the passwd read on the aux seam, exactly run + rm -f on the gate seam).
+// ---------------------------------------------------------------------------
+
+const declSock = "/nonexistent/daemon.sock"
+
+var (
+	declDigestA = "sha256:" + strings.Repeat("a", 64)
+	declDigestB = "sha256:" + strings.Repeat("b", 64)
+	declDigestC = "sha256:" + strings.Repeat("c", 64)
+	declImageID = "sha256:" + strings.Repeat("1", 64)
+)
+
+// declaredState configures a state from env, injects rt (no sandbox),
+// declares gc and installs it.
+func declaredState(t *testing.T, env map[string]string, rt gateiso.Runtime, gc *upload.GateContainerConfig, logSink io.Writer) *gateIsolationState {
+	t.Helper()
+	if logSink == nil {
+		logSink = io.Discard
+	}
+	st, err := configureGateIsolation(fakeEnv(env), gateiso.Probes{}, logSink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.detect = func(context.Context, gateiso.Probes) gateiso.Runtime { return rt }
+	st.probeSandbox = func(context.Context) (bool, string) { return false, "no sandbox" }
+	st.declare(gc)
+	installGateState(t, st)
+	return st
+}
+
+func stageImage(ref string) *upload.GateContainerConfig {
+	return &upload.GateContainerConfig{Image: ref, Source: gateiso.ImageSourceStage}
+}
+
+// gateRunImage is the image operand of a run argv (after `--entrypoint ""`).
+func gateRunImage(argv []string) string {
+	for i := 0; i+2 < len(argv); i++ {
+		if argv[i] == "--entrypoint" {
+			return argv[i+2]
+		}
+	}
+	return ""
+}
+
+// pulledImageResponder answers a declared-image resolution: the n-th inspect
+// returns inspects[n-1] (exit 0) or "no such image" (exit 1) when absent or
+// empty; pull exits pullCode; everything else is the service happy path.
+func pulledImageResponder(pullCode int, inspects ...string) func(string, int) (string, int, bool) {
+	return func(label string, n int) (string, int, bool) {
+		switch label {
+		case "inspect":
+			if n <= len(inspects) && inspects[n-1] != "" {
+				return inspects[n-1], 0, false
+			}
+			return "Error: No such image", 1, false
+		case "pull":
+			if pullCode != 0 {
+				return "Error response from daemon: manifest unknown", pullCode, false
+			}
+			return "pulled", 0, false
+		}
+		return serviceHappyPath(label, n)
+	}
+}
+
+func runDeclaredGate(t *testing.T, ctx context.Context, dir string) (string, int, gateDisposition) {
+	t.Helper()
+	return runBoundedGateArgvDisposed(ctx, []string{"true"}, dir, filepath.Join(t.TempDir(), "lc"), time.Minute)
+}
+
+func containerEnv(extra map[string]string) map[string]string {
+	env := map[string]string{gateIsolationModeEnvVar: "container"}
+	for k, v := range extra {
+		env[k] = v
+	}
+	return env
+}
+
+// TestDeclaredImage_Resolution: a declared image beats FISHHAWK_GATE_IMAGE;
+// a pinned ref present locally skips the pull, a pinned ref absent is pulled,
+// a tag-only ref is ALWAYS pulled; the gate runs by name@digest every time and
+// the resolved image is recorded. Dropping the declared branch from
+// imageRequest turns every row red (the gate runs img:1, nothing resolves).
+func TestDeclaredImage_Resolution(t *testing.T) {
+	rows := []struct {
+		name, ref  string
+		inspects   []string
+		wantOrder  string
+		wantRun    string
+		wantDigest string
+	}{
+		{"pinned present skips pull", "ghcr.io/o/g@" + declDigestA,
+			[]string{declImageID + " ghcr.io/o/g@" + declDigestA},
+			"inspect,passwd,gate_run", "ghcr.io/o/g@" + declDigestA, declDigestA},
+		{"pinned with tag absent pulls", "ghcr.io/o/g:v1@" + declDigestA,
+			[]string{"", declImageID + " ghcr.io/o/g@" + declDigestB + " ghcr.io/o/g@" + declDigestA},
+			"inspect,pull,inspect,passwd,gate_run", "ghcr.io/o/g@" + declDigestA, declDigestA},
+		{"tag-only always pulls and runs by digest", "ghcr.io/o/g:v1",
+			[]string{declImageID + " ghcr.io/o/g@" + declDigestB},
+			"pull,inspect,passwd,gate_run", "ghcr.io/o/g@" + declDigestB, declDigestB},
+		{"docker hub familiar digest", "alpine:3.20",
+			[]string{declImageID + " alpine@" + declDigestC},
+			"pull,inspect,passwd,gate_run", "docker.io/library/alpine@" + declDigestC, declDigestC},
+	}
+	for _, r := range rows {
+		t.Run(r.name, func(t *testing.T) {
+			var log strings.Builder
+			st := declaredState(t, containerEnv(map[string]string{gateImageEnvVar: "img:1"}), safeDockerRuntime(declSock), stageImage(r.ref), &log)
+			g := scriptGateExec(t, pulledImageResponder(0, r.inspects...))
+			if _, code, disp := runDeclaredGate(t, context.Background(), t.TempDir()); code != 0 || disp != gateExecuted {
+				t.Fatalf("exec = %d / %s", code, disp)
+			}
+			if got := strings.Join(g.order, ","); got != r.wantOrder {
+				t.Errorf("runtime calls = %s, want %s", got, r.wantOrder)
+			}
+			if got := gateRunImage(g.argv["gate_run"]); got != r.wantRun {
+				t.Errorf("gate ran image %q, want %q (never the env image img:1)", got, r.wantRun)
+			}
+			if got := gateRunImage(g.argv["passwd"]); got != r.wantRun {
+				t.Errorf("passwd read image %q, want %q", got, r.wantRun)
+			}
+			sel, ok := st.recordedSelection()
+			if !ok || sel.ImageSource != gateiso.ImageSourceStage || sel.ResolvedImage == nil ||
+				sel.ResolvedImage.Ref != r.wantRun || sel.ResolvedImage.Digest != r.wantDigest || sel.ResolvedImage.ImageID != declImageID {
+				t.Errorf("recorded = %+v / %+v", sel, sel.ResolvedImage)
+			}
+			if !strings.Contains(log.String(), `"event":"gate_container_resolved","source":"stage"`) {
+				t.Errorf("missing gate_container_resolved:\n%s", log.String())
+			}
+		})
+	}
+}
+
+// TestDeclaredImage_ResolutionFailuresAreUnavailable: every pull / inspect /
+// digest failure is gateUnavailable (category C), the gate argv and the
+// passwd read never run, and a pull failure names the local-only remedy
+// (approval condition 7).
+func TestDeclaredImage_ResolutionFailuresAreUnavailable(t *testing.T) {
+	timedOutPull := func(label string, n int) (string, int, bool) {
+		if label == "pull" {
+			return "", -1, true
+		}
+		return pulledImageResponder(0)(label, n)
+	}
+	rows := []struct {
+		name, ref string
+		respond   func(string, int) (string, int, bool)
+		want      []string
+	}{
+		{"tag-only local-only image cannot be pulled", "ghcr.io/o/local-only:dev", pulledImageResponder(1),
+			[]string{"could not be pulled from its registry", "manifest unknown", "declare `dockerfile` + `context`", "FISHHAWK_GATE_IMAGE"}},
+		{"pinned absent pull failure", "ghcr.io/o/g@" + declDigestA, pulledImageResponder(1),
+			[]string{"could not be pulled", "exit 1"}},
+		{"pull timeout", "ghcr.io/o/g:v1", timedOutPull,
+			[]string{"could not be pulled", "timed out after 10m0s"}},
+		{"tag-only without registry digest", "ghcr.io/o/g:v1", pulledImageResponder(0, declImageID),
+			[]string{"has no registry digest", "local-only image"}},
+		{"pinned present with unmatched digest", "ghcr.io/o/g@" + declDigestA, pulledImageResponder(0, declImageID+" ghcr.io/o/g@"+declDigestB),
+			[]string{"do not include the pinned " + declDigestA}},
+		{"inspect after pull fails", "ghcr.io/o/g@" + declDigestA, pulledImageResponder(0, "", ""),
+			[]string{"after pull", "exit 1"}},
+		{"inspect after pull unparsable", "ghcr.io/o/g:v1", pulledImageResponder(0, "garbage"),
+			[]string{"after pull", "not a sha256 image id"}},
+	}
+	for _, r := range rows {
+		t.Run(r.name, func(t *testing.T) {
+			declaredState(t, containerEnv(nil), safeDockerRuntime(declSock), stageImage(r.ref), nil)
+			g := scriptGateExec(t, r.respond)
+			out, code, disp := runDeclaredGate(t, context.Background(), t.TempDir())
+			if code != -1 || disp != gateUnavailable {
+				t.Fatalf("exec = %d / %s, want -1 / unavailable: %s", code, disp, out)
+			}
+			if !strings.HasPrefix(out, "gate container: gate_container unavailable: ") {
+				t.Errorf("output %q lacks the unavailable lead", out)
+			}
+			for _, w := range r.want {
+				if !strings.Contains(out, w) {
+					t.Errorf("output %q does not name %q", out, w)
+				}
+			}
+			if g.counts["gate_run"] != 0 || g.counts["passwd"] != 0 {
+				t.Errorf("the gate (or passwd read) ran despite the resolution failure: %q", g.order)
+			}
+		})
+	}
+}
+
+// TestDeclaredImage_PullUsesEndpointBoundInheritedEnv: the pull (and
+// inspect) run under the runner's INHERITED environment bound to the
+// validated socket — DOCKER_HOST re-pinned, DOCKER_CONTEXT dropped, HOME and
+// DOCKER_CONFIG kept so the runtime CLI finds its own credential store — and
+// not under the sanitized gate env.
+func TestDeclaredImage_PullUsesEndpointBoundInheritedEnv(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "tcp://10.0.0.5:2376")
+	t.Setenv("DOCKER_CONTEXT", "remote")
+	t.Setenv("DOCKER_CONFIG", "/runner/docker-config")
+	t.Setenv("FISHHAWK_TEST_INHERITED_ONLY", "1")
+	declaredState(t, containerEnv(nil), safeDockerRuntime(declSock), stageImage("ghcr.io/o/g:v1"), nil)
+	g := scriptGateExec(t, pulledImageResponder(0, declImageID+" ghcr.io/o/g@"+declDigestA))
+	if _, code, _ := runDeclaredGate(t, context.Background(), t.TempDir()); code != 0 {
+		t.Fatalf("exit %d", code)
+	}
+	for _, label := range []string{"pull", "inspect"} {
+		env := map[string]string{}
+		for _, kv := range g.env[label] {
+			k, v, _ := strings.Cut(kv, "=")
+			env[k] = v
+		}
+		if env["DOCKER_HOST"] != "unix://"+declSock {
+			t.Errorf("%s DOCKER_HOST = %q, want the validated socket", label, env["DOCKER_HOST"])
+		}
+		if _, ok := env["DOCKER_CONTEXT"]; ok {
+			t.Errorf("%s env carries DOCKER_CONTEXT", label)
+		}
+		if env["HOME"] == "" || env["DOCKER_CONFIG"] != "/runner/docker-config" {
+			t.Errorf("%s env lost HOME/DOCKER_CONFIG: HOME=%q DOCKER_CONFIG=%q", label, env["HOME"], env["DOCKER_CONFIG"])
+		}
+		if env["FISHHAWK_TEST_INHERITED_ONLY"] != "1" {
+			t.Errorf("%s env is not the inherited environment (the sanitized gate env would drop the marker)", label)
+		}
+		if argv := g.argv[label]; argv[1] != "--host" || argv[2] != "unix://"+declSock {
+			t.Errorf("%s argv not endpoint-bound: %q", label, argv)
+		}
+	}
+	for _, kv := range sanitizedGateEnv() {
+		if strings.HasPrefix(kv, "FISHHAWK_TEST_INHERITED_ONLY=") {
+			t.Fatal("fixture invalid: the sanitized gate env keeps the marker, so the inherited-env assertion discriminates nothing")
+		}
+	}
+}
+
+// TestRunVerifyFixLoop_DeclaredPullFailureIsCategoryC: a declared image that
+// cannot be pulled parks the fix loop category C — verify_gate_unavailable,
+// the verify command never executed, the fix agent never invoked. Mapping
+// the pull failure to gateExecuted turns this red (the agent is invoked).
+func TestRunVerifyFixLoop_DeclaredPullFailureIsCategoryC(t *testing.T) {
+	declaredState(t, containerEnv(nil), safeDockerRuntime(declSock), stageImage("ghcr.io/o/local-only:dev"), nil)
+	g := scriptGateExec(t, pulledImageResponder(1))
+	cfg, logPath := verifyFixLoopScopeFixture(t, verifyScopeGoFiles, 0, 0)
+	cfg.verifyMaxIterations = 2
+	res := agent.Result{OK: true}
+	var log strings.Builder
+	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
+	reinvoked, tree, err := runVerifyFixLoop(context.Background(), &cfg, nil, "", invoker, agent.Invocation{}, &res, &log)
+	if err != nil || reinvoked || tree != "" {
+		t.Fatalf("err=%v reinvoked=%t tree=%q", err, reinvoked, tree)
+	}
+	if res.OK || res.FailureCategory != "C" || !strings.Contains(res.FailureReason, "could not be pulled") {
+		t.Errorf("res = OK:%t cat:%q reason:%q, want category C naming the pull", res.OK, res.FailureCategory, res.FailureReason)
+	}
+	if invoker.callIdx != 0 {
+		t.Errorf("fix agent invoked %d times, want 0", invoker.callIdx)
+	}
+	if lines := readVerifyFormLog(t, logPath); len(lines) != 0 || g.counts["gate_run"] != 0 {
+		t.Errorf("the verify command executed despite the pull failure: %d log lines, %d gate runs", len(lines), g.counts["gate_run"])
+	}
+	if !strings.Contains(log.String(), `"event":"verify_gate_unavailable"`) {
+		t.Errorf("log lacks verify_gate_unavailable:\n%s", log.String())
+	}
+}
+
+// TestRunVerifyGateCommitted_DeclaredPullFailureIsCategoryC: the single-shot
+// gate wraps it in ErrVerifyInfraFailure + errGateContainerUnavailable.
+func TestRunVerifyGateCommitted_DeclaredPullFailureIsCategoryC(t *testing.T) {
+	declaredState(t, containerEnv(nil), safeDockerRuntime(declSock), stageImage("ghcr.io/o/g:v1"), nil)
+	scriptGateExec(t, pulledImageResponder(1))
+	repo, _, _ := verifiedTreeRepo(t)
+	_, tree, err := runVerifyGateCommitted(context.Background(), verifiedTreeCfg(repo, "true"), io.Discard)
+	if !errors.Is(err, gitops.ErrVerifyInfraFailure) || !errors.Is(err, errGateContainerUnavailable) || errors.Is(err, errGateIsolationRefused) {
+		t.Fatalf("err = %v, want ErrVerifyInfraFailure + errGateContainerUnavailable", err)
+	}
+	if got := committedGateFailureCategory(err); got != "C" || tree != "" {
+		t.Errorf("category = %q tree = %q, want C and no verified tree", got, tree)
+	}
+}
+
+// TestHosted_DeclaredTagOnlyRefusedNeverFallsBackToEnv: under hosted a
+// tag-only declared ref is a policy refusal; the gate is refused (nothing
+// reaches the runtime) and the operator's env image is NEVER substituted.
+func TestHosted_DeclaredTagOnlyRefusedNeverFallsBackToEnv(t *testing.T) {
+	declaredState(t, containerEnv(map[string]string{deploymentProfileEnvVar: "hosted", gateImageEnvVar: "img:1", gateImageAllowlistEnvVar: "ghcr.io"}),
+		safeDockerRuntime(declSock), stageImage("ghcr.io/o/g:v1"), nil)
+	g := scriptGateExec(t, pulledImageResponder(0, declImageID+" ghcr.io/o/g@"+declDigestA))
+	out, code, disp := runDeclaredGate(t, context.Background(), t.TempDir())
+	if code != -1 || disp != gateRefused {
+		t.Fatalf("exec = %d / %s, want -1 / refused", code, disp)
+	}
+	if !strings.HasPrefix(out, gateIsolationRefusedSignature) || !strings.Contains(out, "not digest-pinned") || !strings.Contains(out, `image="ghcr.io/o/g:v1"`) {
+		t.Errorf("refusal %q must name the declared tag-only ref", out)
+	}
+	if strings.Contains(out, "img:1") || len(g.order) != 0 {
+		t.Errorf("the env image was substituted or the runtime reached: out=%q calls=%q", out, g.order)
+	}
+}
+
+// TestHosted_DeclaredOffAllowlistRefusedCategoryC: an off-allowlist pinned
+// ref is refused category C at the committed gate.
+func TestHosted_DeclaredOffAllowlistRefusedCategoryC(t *testing.T) {
+	declaredState(t, containerEnv(map[string]string{deploymentProfileEnvVar: "hosted", gateImageAllowlistEnvVar: "ghcr.io/org/"}),
+		safeDockerRuntime(declSock), stageImage("ghcr.io/other/g@"+declDigestA), nil)
+	g := scriptGateExec(t, nil)
+	repo, _, _ := verifiedTreeRepo(t)
+	_, _, err := runVerifyGateCommitted(context.Background(), verifiedTreeCfg(repo, "true"), io.Discard)
+	if !errors.Is(err, errGateIsolationRefused) || committedGateFailureCategory(err) != "C" {
+		t.Fatalf("err = %v, want a category C refusal", err)
+	}
+	if !strings.Contains(err.Error(), "not permitted by the operator image allowlist") || len(g.order) != 0 {
+		t.Errorf("err = %v calls = %q", err, g.order)
+	}
+}
+
+// TestHosted_DeclaredWithoutRuntimeRefused: hosted never runs a declared
+// image on the host when no safe runtime exists.
+func TestHosted_DeclaredWithoutRuntimeRefused(t *testing.T) {
+	declaredState(t, map[string]string{deploymentProfileEnvVar: "hosted", gateImageAllowlistEnvVar: "ghcr.io"},
+		unsafeRuntime(), stageImage("ghcr.io/o/g@"+declDigestA), nil)
+	captureHostExec(t, true, 0)
+	out, _, disp := runDeclaredGate(t, context.Background(), t.TempDir())
+	if disp != gateRefused || !strings.Contains(out, "profile=hosted refuses") {
+		t.Fatalf("disp = %s out = %q, want the hosted refusal", disp, out)
+	}
+	if sel, _ := gateIsolation.recordedSelection(); sel.DeclaredUnhonored != "" {
+		t.Errorf("a refusal ran nothing on the host, yet it carries declared_unhonored %q", sel.DeclaredUnhonored)
+	}
+}
+
+// TestLocal_DeclaredWithoutRuntimeRunsFallbackWithWarningAndMarker: local
+// runs the fallback on the host, logs gate_container_unhonored (plus the
+// tag-only policy warning) and records the declared_unhonored marker; an
+// explicit clone mode marks "not attempted".
+func TestLocal_DeclaredWithoutRuntimeRunsFallbackWithWarningAndMarker(t *testing.T) {
+	rows := []struct {
+		name, mode, want string
+	}{
+		{"auto without a safe runtime", "auto", "docker is not a safe runtime"},
+		{"explicit clone mode", "clone", "not attempted: mode=clone"},
+	}
+	for _, r := range rows {
+		t.Run(r.name, func(t *testing.T) {
+			var log strings.Builder
+			st := declaredState(t, map[string]string{gateIsolationModeEnvVar: r.mode}, unsafeRuntime(),
+				&upload.GateContainerConfig{Image: "ghcr.io/o/g:v1", Source: gateiso.ImageSourceWorkflow}, &log)
+			calls := captureHostExec(t, false, 0)
+			if _, code, disp := runDeclaredGate(t, context.Background(), t.TempDir()); code != 0 || disp != gateExecuted {
+				t.Fatalf("exec = %d / %s", code, disp)
+			}
+			if len(*calls) != 1 || strings.Join((*calls)[0], " ") != "true" {
+				t.Errorf("host calls = %q, want the gate argv on the host", *calls)
+			}
+			sel, _ := st.recordedSelection()
+			if sel.Path != gateiso.PathClone || !strings.Contains(sel.DeclaredUnhonored, "gate_container declared (workflow) but not honoured: ") ||
+				!strings.Contains(sel.DeclaredUnhonored, r.want) {
+				t.Errorf("selection = %s / %q", sel.Path, sel.DeclaredUnhonored)
+			}
+			for _, w := range []string{`"event":"gate_container_unhonored","source":"workflow","path":"clone"`, `"event":"gate_container_policy_warning","source":"workflow"`} {
+				if !strings.Contains(log.String(), w) {
+					t.Errorf("log lacks %s:\n%s", w, log.String())
+				}
+			}
+		})
+	}
+}
+
+// TestDeclare_AfterSelectionIgnored: a declaration after the selection was
+// decided changes nothing and is logged; an empty or nil declaration is a
+// no-op.
+func TestDeclare_AfterSelectionIgnored(t *testing.T) {
+	var log strings.Builder
+	st := declaredState(t, containerEnv(map[string]string{gateImageEnvVar: "img:1"}), safeDockerRuntime(declSock), nil, &log)
+	st.declare(&upload.GateContainerConfig{})
+	if st.declared != nil || strings.Contains(log.String(), "gate_container_declared") {
+		t.Fatalf("an empty declaration was recorded:\n%s", log.String())
+	}
+	sel := st.selection(context.Background())
+	st.declare(stageImage("ghcr.io/o/g@" + declDigestA))
+	if sel2 := st.selection(context.Background()); sel2.Image != "img:1" || sel2.ImageSource != gateiso.ImageSourceEnv || sel2 != sel {
+		t.Errorf("selection after a late declaration = %+v, want the env selection unchanged", sel2)
+	}
+	if st.declared != nil || !strings.Contains(log.String(), `"event":"gate_container_declaration_ignored","source":"stage"`) {
+		t.Errorf("late declaration not ignored with a log line:\n%s", log.String())
+	}
+	var nilState *gateIsolationState
+	nilState.declare(stageImage("x")) // nil receiver: no panic
+}
+
+// TestDeclaredImage_EvidenceRecordsFinalDecidingGate (approval condition 4):
+// two VERIFY gates resolve different digests and a later diff-coverage-style
+// gate a third; the recorded image is the LAST verify gate's, with the
+// distinct count; a later verify gate whose resolution fails records no image
+// rather than inheriting an earlier one. Recording the most recent gate's
+// image instead turns the first assertion red (digest C).
+func TestDeclaredImage_EvidenceRecordsFinalDecidingGate(t *testing.T) {
+	st := declaredState(t, containerEnv(nil), safeDockerRuntime(declSock), stageImage("ghcr.io/o/g:v1"), nil)
+	pullFails := false
+	scriptGateExec(t, func(label string, n int) (string, int, bool) {
+		if label == "pull" && pullFails {
+			return "registry down", 1, false
+		}
+		digests := []string{declDigestA, declDigestB, declDigestC}
+		if label == "inspect" && n <= len(digests) {
+			return declImageID + " ghcr.io/o/g@" + digests[n-1], 0, false
+		}
+		return pulledImageResponder(0)(label, n)
+	})
+	verify := withDecidingGate(context.Background())
+	for i, ctx := range []context.Context{verify, verify, context.Background()} {
+		if _, code, _ := runDeclaredGate(t, ctx, t.TempDir()); code != 0 {
+			t.Fatalf("gate %d exit %d", i, code)
+		}
+	}
+	sel, _ := st.recordedSelection()
+	if sel.ResolvedImage == nil || sel.ResolvedImage.Digest != declDigestB || sel.DistinctImagesCount != 3 {
+		t.Fatalf("recorded = %+v count %d, want the last VERIFY gate's digest %s and 3 distinct", sel.ResolvedImage, sel.DistinctImagesCount, declDigestB)
+	}
+	pullFails = true
+	if _, _, disp := runDeclaredGate(t, verify, t.TempDir()); disp != gateUnavailable {
+		t.Fatalf("disposition = %s, want unavailable", disp)
+	}
+	if sel, _ := st.recordedSelection(); sel.ResolvedImage != nil || sel.DistinctImagesCount != 3 {
+		t.Errorf("a failed deciding gate recorded %+v (count %d), want no image", sel.ResolvedImage, sel.DistinctImagesCount)
+	}
+}
+
+// TestDeclaredImage_SingleImageHasNoDistinctCount: one image, no count.
+func TestDeclaredImage_SingleImageHasNoDistinctCount(t *testing.T) {
+	st := declaredState(t, containerEnv(nil), safeDockerRuntime(declSock), stageImage("ghcr.io/o/g@"+declDigestA), nil)
+	scriptGateExec(t, pulledImageResponder(0, declImageID+" ghcr.io/o/g@"+declDigestA, declImageID+" ghcr.io/o/g@"+declDigestA))
+	for i := 0; i < 2; i++ {
+		if _, code, _ := runDeclaredGate(t, context.Background(), t.TempDir()); code != 0 {
+			t.Fatalf("exit %d", code)
+		}
+	}
+	if sel, _ := st.recordedSelection(); sel.ResolvedImage == nil || sel.ResolvedImage.Digest != declDigestA || sel.DistinctImagesCount != 0 {
+		t.Errorf("recorded = %+v count %d, want digest A and no count", sel.ResolvedImage, sel.DistinctImagesCount)
+	}
+}
+
+// TestDiffCoverage_RunsInDeclaredImage: the diff-coverage measurement reaches
+// the same seam, so it runs in the declared image (no diff_coverage rule).
+func TestDiffCoverage_RunsInDeclaredImage(t *testing.T) {
+	declaredState(t, containerEnv(nil), safeDockerRuntime(declSock), stageImage("ghcr.io/o/g@"+declDigestA), nil)
+	g := scriptGateExec(t, pulledImageResponder(0, declImageID+" ghcr.io/o/g@"+declDigestA))
+	repo, _ := gateRepoWithCommit(t)
+	base := strings.TrimSpace(declGit(t, repo, "rev-parse", "HEAD~1"))
+	ev := measureDiffCoverage(context.Background(), diffCoverageEvidence{BaseRef: "main"}, &upload.DiffCoverageConfig{Command: "make cover", ReportPath: "lcov.info"}, repo, base)
+	if g.counts["gate_run"] != 1 {
+		t.Fatalf("coverage command did not reach the container path (calls %q): %+v", g.order, ev)
+	}
+	if got := gateRunImage(g.argv["gate_run"]); got != "ghcr.io/o/g@"+declDigestA {
+		t.Errorf("coverage ran in %q, want the declared image", got)
+	}
+	if !strings.Contains(strings.Join(g.argv["gate_run"], " "), "sh -c make cover") {
+		t.Errorf("gate argv %q lacks the coverage command", g.argv["gate_run"])
+	}
+}
+
+// TestAutoformat_RunsInDeclaredImage: the auto-format absorb reaches the same
+// seam, so the formatter runs in the declared image.
+func TestAutoformat_RunsInDeclaredImage(t *testing.T) {
+	declaredState(t, containerEnv(nil), safeDockerRuntime(declSock), stageImage("ghcr.io/o/g@"+declDigestA), nil)
+	g := scriptGateExec(t, pulledImageResponder(0, declImageID+" ghcr.io/o/g@"+declDigestA))
+	repo := t.TempDir()
+	mustWrite(t, filepath.Join(repo, "a.go"), "package a\n")
+	if _, err := runAutoformat(context.Background(), repo, []string{"a.go"}, time.Minute); err != nil {
+		t.Fatalf("runAutoformat: %v", err)
+	}
+	argv := g.argv["gate_run"]
+	if got := gateRunImage(argv); got != "ghcr.io/o/g@"+declDigestA {
+		t.Errorf("formatter ran in %q, want the declared image", got)
+	}
+	if !strings.HasSuffix(strings.Join(argv, " "), autoformatBinary+" fmt a.go") {
+		t.Errorf("gate argv %q lacks the formatter argv", argv)
+	}
+}
+
+func declGit(t *testing.T, repo string, args ...string) string {
+	t.Helper()
+	out, err := exec.Command("git", append([]string{"-C", repo}, args...)...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+	return string(out)
+}
+
+// buildRepo is a git repository whose single commit holds files.
+func buildRepo(t *testing.T, files map[string]string) string {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := t.TempDir()
+	declGit(t, repo, "init", "--initial-branch=main")
+	declGit(t, repo, "config", "user.name", "t")
+	declGit(t, repo, "config", "user.email", "t@example.com")
+	declGit(t, repo, "config", "commit.gpgsign", "false")
+	for p, c := range files {
+		full := filepath.Join(repo, filepath.FromSlash(p))
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		mustWrite(t, full, c)
+	}
+	declGit(t, repo, "add", "-A")
+	declGit(t, repo, "commit", "-m", "base")
+	return repo
+}
+
+var declaredBuild = &upload.GateContainerConfig{Dockerfile: "gate/Dockerfile", Context: "gate", Source: gateiso.ImageSourceWorkflow}
+
+// buildResponder scripts the build path: an inspect of a tag the script has
+// built answers an id (else no such image); build records the tag as built
+// and hands its argv to onBuild (nil = nothing) while the materialized
+// context still exists; build exits buildCode.
+func buildResponder(g **gateExecScript, buildCode int, onBuild func(argv []string)) func(string, int) (string, int, bool) {
+	built := map[string]bool{}
+	return func(label string, n int) (string, int, bool) {
+		switch label {
+		case "inspect":
+			argv := (*g).argv["inspect"]
+			if built[argv[len(argv)-1]] {
+				return declImageID, 0, false
+			}
+			return "Error: No such image", 1, false
+		case "build":
+			argv := (*g).argv["build"]
+			if onBuild != nil {
+				onBuild(argv)
+			}
+			if buildCode != 0 {
+				return "step 2/3 failed", buildCode, false
+			}
+			for i := 0; i+1 < len(argv); i++ {
+				if argv[i] == "--tag" {
+					built[argv[i+1]] = true
+				}
+			}
+			return "built", 0, false
+		}
+		return serviceHappyPath(label, n)
+	}
+}
+
+func flagValueOf(argv []string, flag string) string {
+	for i := 0; i+1 < len(argv); i++ {
+		if argv[i] == flag {
+			return argv[i+1]
+		}
+	}
+	return ""
+}
+
+// TestDeclaredBuild_CacheMissBuildsCommittedTreeWithNetworkNone (approval
+// condition 3): a cache miss builds with --network=none from the COMMITTED
+// tree — a modified working-tree file contributes its committed bytes and an
+// untracked file never enters the context — and the gate runs the
+// content-addressed tag.
+func TestDeclaredBuild_CacheMissBuildsCommittedTreeWithNetworkNone(t *testing.T) {
+	repo := buildRepo(t, map[string]string{"gate/Dockerfile": "FROM alpine\nCOPY . /src\n", "gate/a.txt": "committed\n"})
+	mustWrite(t, filepath.Join(repo, "gate", "a.txt"), "uncommitted edit\n")
+	mustWrite(t, filepath.Join(repo, "gate", "untracked.txt"), "untracked\n")
+	mustWrite(t, filepath.Join(repo, "gate", "Dockerfile"), "FROM evil/uncommitted\n")
+	st := declaredState(t, containerEnv(nil), safeDockerRuntime(declSock), declaredBuild, nil)
+	var g *gateExecScript
+	var seen string
+	g = scriptGateExec(t, buildResponder(&g, 0, func(argv []string) {
+		cx := argv[len(argv)-1]
+		a, _ := os.ReadFile(filepath.Join(cx, "a.txt"))
+		_, uerr := os.Stat(filepath.Join(cx, "untracked.txt"))
+		df, _ := os.ReadFile(flagValueOf(argv, "--file"))
+		seen = fmt.Sprintf("a=%q untracked_absent=%t dockerfile=%q", a, os.IsNotExist(uerr), df)
+	}))
+	if out, code, disp := runDeclaredGate(t, context.Background(), repo); code != 0 || disp != gateExecuted {
+		t.Fatalf("exec = %d / %s: %s", code, disp, out)
+	}
+	if got := strings.Join(g.order, ","); got != "inspect,build,inspect,passwd,gate_run" {
+		t.Errorf("runtime calls = %s", got)
+	}
+	if want := `a="committed\n" untracked_absent=true dockerfile="FROM alpine\nCOPY . /src\n"`; seen != want {
+		t.Errorf("build context = %s, want %s", seen, want)
+	}
+	b := strings.Join(g.argv["build"], " ")
+	tag := flagValueOf(g.argv["build"], "--tag")
+	for _, w := range []string{"docker --host unix://" + declSock + " build --network=none --file ", "--label " + gateiso.GateBuildLabel} {
+		if !strings.Contains(b, w) {
+			t.Errorf("build argv %q lacks %q", b, w)
+		}
+	}
+	if !strings.HasPrefix(tag, gateiso.GateBuildRepository+":") || gateRunImage(g.argv["gate_run"]) != tag {
+		t.Errorf("gate ran %q, want the build tag %q", gateRunImage(g.argv["gate_run"]), tag)
+	}
+	sel, _ := st.recordedSelection()
+	if r := sel.ResolvedImage; r == nil || r.Ref != tag || r.ContextDigest == "" || r.BuildDockerfile != "gate/Dockerfile" || r.BuildContext != "gate" || r.ImageID != declImageID || !sel.Build {
+		t.Errorf("recorded = %+v / %+v", sel, sel.ResolvedImage)
+	}
+	if _, err := os.Stat(flagValueOf(g.argv["build"], "--file")); !os.IsNotExist(err) {
+		t.Errorf("the materialized build dir was not removed: %v", err)
+	}
+}
+
+// TestDeclaredBuild_TwoGateKindsShareDigestCacheHit (approval condition 3):
+// the committed-tree verify gate (an independent clone) and the auto-format
+// absorb (the dirty primary working tree) on ONE commit compute the same
+// content digest, so the second is a cache hit and both run the same tag.
+func TestDeclaredBuild_TwoGateKindsShareDigestCacheHit(t *testing.T) {
+	repo := buildRepo(t, map[string]string{"gate/Dockerfile": "FROM alpine\n", "gate/a.txt": "committed\n", "a.go": "package a\n"})
+	head := strings.TrimSpace(declGit(t, repo, "rev-parse", "HEAD"))
+	mustWrite(t, filepath.Join(repo, "gate", "a.txt"), "dirty\n")
+	declaredState(t, containerEnv(nil), safeDockerRuntime(declSock), declaredBuild, nil)
+	var g *gateExecScript
+	g = scriptGateExec(t, buildResponder(&g, 0, nil))
+	if _, _, outcome, disp := runVerifyCommittedTree(context.Background(), "true", repo, head, time.Minute, nil); outcome != "passed" || disp != gateExecuted {
+		t.Fatalf("verify = %s / %s (calls %q)", outcome, disp, g.order)
+	}
+	first := gateRunImage(g.argv["gate_run"])
+	if _, err := runAutoformat(context.Background(), repo, []string{"a.go"}, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if second := gateRunImage(g.argv["gate_run"]); second != first || !strings.HasPrefix(first, gateiso.GateBuildRepository+":") {
+		t.Errorf("gate kinds ran %q then %q, want one content-addressed tag", first, second)
+	}
+	if g.counts["build"] != 1 {
+		t.Errorf("builds = %d, want 1 (the second gate kind is a cache hit): %q", g.counts["build"], g.order)
+	}
+}
+
+// TestDeclaredBuild_ModeOnlyChangeAltersDigest (approval condition 3): a
+// commit that only flips a context file's mode moves the digest, so the tag
+// changes and the image is rebuilt.
+func TestDeclaredBuild_ModeOnlyChangeAltersDigest(t *testing.T) {
+	repo := buildRepo(t, map[string]string{"gate/Dockerfile": "FROM alpine\n", "gate/run.sh": "echo hi\n"})
+	declaredState(t, containerEnv(nil), safeDockerRuntime(declSock), declaredBuild, nil)
+	var g *gateExecScript
+	g = scriptGateExec(t, buildResponder(&g, 0, nil))
+	if _, code, _ := runDeclaredGate(t, context.Background(), repo); code != 0 {
+		t.Fatal("first gate failed")
+	}
+	first := gateRunImage(g.argv["gate_run"])
+	if err := os.Chmod(filepath.Join(repo, "gate", "run.sh"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	declGit(t, repo, "commit", "-am", "mode only")
+	if _, code, _ := runDeclaredGate(t, context.Background(), repo); code != 0 {
+		t.Fatal("second gate failed")
+	}
+	if second := gateRunImage(g.argv["gate_run"]); second == first || g.counts["build"] != 2 {
+		t.Errorf("tags %q -> %q with %d builds, want a new digest and a rebuild", first, second, g.counts["build"])
+	}
+}
+
+// TestDeclaredBuild_StaticRefusalBeforeBuild (approval conditions 1, 2, 6):
+// every static refusal — a frontend-selecting directive in each form, each
+// ADD source shape, the RUN network/security flags, an off-allowlist base in
+// lower case, and a cache mount under hosted — is gateRefused with the
+// refusal named and NOTHING reaches the runtime (no inspect, no build, no
+// gate). Skipping ScreenDockerfile turns every row red (a build call).
+func TestDeclaredBuild_StaticRefusalBeforeBuild(t *testing.T) {
+	pinnedBase := "ghcr.io/org/base@" + declDigestA
+	hosted := map[string]string{deploymentProfileEnvVar: "hosted", gateImageAllowlistEnvVar: "ghcr.io/org/", gateBuildEnvVar: "allow"}
+	allow := map[string]string{gateImageAllowlistEnvVar: "ghcr.io/org/"}
+	rows := []struct {
+		name, dockerfile, want string
+		env                    map[string]string
+	}{
+		{"syntax directive", "# syntax=docker/dockerfile:1\nFROM alpine\n", "syntax", nil},
+		{"c-style syntax directive", "// syntax=evil/frontend\nFROM alpine\n", "syntax", nil},
+		{"json first line", "{\"syntax\": \"evil/frontend\"}\nFROM alpine\n", "first line is neither", nil},
+		{"ADD url", "FROM alpine\nADD https://x/y /z\n", "ADD source", nil},
+		{"lowercase add url", "FROM alpine\nadd http://x/y /z\n", "ADD source", nil},
+		{"ADD variable", "FROM alpine\nARG U=https://x\nADD $U /x\n", "variable expansion", nil},
+		{"ADD at sign", "FROM alpine\nADD a@b /src\n", "'@'", nil},
+		{"ADD .git", "FROM alpine\nADD example/r.git /src\n", ".git", nil},
+		{"ADD host-shaped", "FROM alpine\nADD github.com/o/r /src\n", "host-shaped", nil},
+		{"ADD scp-like", "FROM alpine\nADD host:repo /x\n", "':'", nil},
+		{"ADD not clean", "FROM alpine\nADD ../x /y\n", "'..'", nil},
+		{"mixed-case RUN network host", "FROM alpine\nRun --network=host true\n", "--network=host", nil},
+		{"RUN security insecure", "FROM alpine\nRUN --security=insecure true\n", "--security=insecure", nil},
+		{"lowercase from off-allowlist", "from evil/base\n", "not permitted by the operator image allowlist", allow},
+		{"lowercase copy --from off-allowlist", "FROM ghcr.io/org/base\ncopy --from=evil/img /a /b\n", "not permitted by the operator image allowlist", allow},
+		{"hosted unpinned base", "FROM ghcr.io/org/base:1\n", "not digest-pinned", hosted},
+		{"hosted cache mount", "FROM " + pinnedBase + "\nRUN --mount=type=cache,target=/c true\n", "type=cache is refused under profile hosted", hosted},
+	}
+	for _, r := range rows {
+		t.Run(r.name, func(t *testing.T) {
+			repo := buildRepo(t, map[string]string{"gate/Dockerfile": r.dockerfile, "gate/a.txt": "x\n"})
+			declaredState(t, containerEnv(r.env), safeDockerRuntime(declSock), declaredBuild, nil)
+			var g *gateExecScript
+			g = scriptGateExec(t, buildResponder(&g, 0, nil))
+			out, code, disp := runDeclaredGate(t, context.Background(), repo)
+			if code != -1 || disp != gateRefused {
+				t.Fatalf("exec = %d / %s, want -1 / refused: %s", code, disp, out)
+			}
+			if !strings.HasPrefix(out, gateIsolationRefusedSignature+" gate_container build refused: gate/Dockerfile at ") || !strings.Contains(out, r.want) {
+				t.Errorf("refusal %q does not name %q", out, r.want)
+			}
+			if len(g.order) != 0 {
+				t.Errorf("the runtime was reached before the static refusal: %q", g.order)
+			}
+		})
+	}
+}
+
+// TestDeclaredBuild_LocalCacheMountAccepted (approval condition 6): outside
+// hosted a cache mount is an accepted, documented limit — the build proceeds.
+func TestDeclaredBuild_LocalCacheMountAccepted(t *testing.T) {
+	repo := buildRepo(t, map[string]string{"gate/Dockerfile": "FROM alpine\nRUN --mount=type=cache,target=/c true\n"})
+	declaredState(t, containerEnv(nil), safeDockerRuntime(declSock), declaredBuild, nil)
+	var g *gateExecScript
+	g = scriptGateExec(t, buildResponder(&g, 0, nil))
+	if out, code, disp := runDeclaredGate(t, context.Background(), repo); code != 0 || disp != gateExecuted || g.counts["build"] != 1 {
+		t.Fatalf("exec = %d / %s builds %d: %s", code, disp, g.counts["build"], out)
+	}
+}
+
+// TestDeclaredBuild_DisabledInHostedIsRefused: hosted denies in-repo builds
+// by default (FISHHAWK_GATE_BUILD unset) even with an allowlist.
+func TestDeclaredBuild_DisabledInHostedIsRefused(t *testing.T) {
+	declaredState(t, containerEnv(map[string]string{deploymentProfileEnvVar: "hosted", gateImageAllowlistEnvVar: "ghcr.io/org/"}),
+		safeDockerRuntime(declSock), declaredBuild, nil)
+	g := scriptGateExec(t, nil)
+	out, _, disp := runDeclaredGate(t, context.Background(), t.TempDir())
+	if disp != gateRefused || !strings.Contains(out, "in-repo gate image builds are disabled under profile hosted (FISHHAWK_GATE_BUILD)") || len(g.order) != 0 {
+		t.Fatalf("disp = %s out = %q calls = %q", disp, out, g.order)
+	}
+}
+
+// TestDeclaredBuild_SourceAndBuildFailures: each failure after the policy
+// decision maps to its disposition — an uncommitted Dockerfile is refused
+// (tree-shaped, before any runtime call); a checkout git cannot read, an
+// oversized context, a failed or timed-out build and a failed post-build
+// inspect are gateUnavailable — and the gate never runs.
+func TestDeclaredBuild_SourceAndBuildFailures(t *testing.T) {
+	committed := map[string]string{"gate/Dockerfile": "FROM alpine\n", "gate/a.txt": "x\n", "gate/b.txt": "y\n"}
+	rows := []struct {
+		name      string
+		repo      func(t *testing.T) string
+		buildCode int
+		timeout   bool
+		noInspect bool
+		limits    *gateiso.ContextLimits
+		wantDisp  gateDisposition
+		want      []string
+	}{
+		{name: "dockerfile not committed", repo: func(t *testing.T) string {
+			r := buildRepo(t, map[string]string{"gate/a.txt": "x\n"})
+			mustWrite(t, filepath.Join(r, "gate", "Dockerfile"), "FROM alpine\n")
+			return r
+		}, wantDisp: gateRefused, want: []string{"not present in the committed tree", "uncommitted files never enter a gate image"}},
+		{name: "not a git checkout", repo: func(t *testing.T) string { return t.TempDir() }, wantDisp: gateUnavailable, want: []string{"resolve build source"}},
+		{name: "symlinked context ignore file", repo: func(t *testing.T) string {
+			r := buildRepo(t, committed)
+			if err := os.Symlink("../a.go", filepath.Join(r, "gate", ".dockerignore")); err != nil {
+				t.Fatal(err)
+			}
+			declGit(t, r, "add", "-A")
+			declGit(t, r, "commit", "-m", "symlinked ignore file")
+			return r
+		}, wantDisp: gateRefused, want: []string{"materialize build context", "is a symlink"}},
+		{name: "context too large", limits: &gateiso.ContextLimits{MaxEntries: 1, MaxBytes: 1 << 30}, wantDisp: gateUnavailable, want: []string{"too large", "narrower context"}},
+		{name: "build fails", buildCode: 1, wantDisp: gateUnavailable, want: []string{"build of gate/Dockerfile failed: exit 1", "step 2/3 failed"}},
+		{name: "build times out", timeout: true, wantDisp: gateUnavailable, want: []string{"build of gate/Dockerfile timed out after 20m0s"}},
+		{name: "inspect after build fails", noInspect: true, wantDisp: gateUnavailable, want: []string{"after build"}},
+	}
+	for _, r := range rows {
+		t.Run(r.name, func(t *testing.T) {
+			repo := ""
+			if r.repo != nil {
+				repo = r.repo(t)
+			} else {
+				repo = buildRepo(t, committed)
+			}
+			if r.limits != nil {
+				prev := gateBuildContextLimits
+				gateBuildContextLimits = *r.limits
+				t.Cleanup(func() { gateBuildContextLimits = prev })
+			}
+			declaredState(t, containerEnv(nil), safeDockerRuntime(declSock), declaredBuild, nil)
+			var g *gateExecScript
+			inner := buildResponder(&g, r.buildCode, nil)
+			g = scriptGateExec(t, func(label string, n int) (string, int, bool) {
+				if label == "build" && r.timeout {
+					return "", -1, true
+				}
+				if label == "inspect" && r.noInspect {
+					return "Error: No such image", 1, false
+				}
+				return inner(label, n)
+			})
+			out, code, disp := runDeclaredGate(t, context.Background(), repo)
+			if code != -1 || disp != r.wantDisp {
+				t.Fatalf("exec = %d / %s, want -1 / %s: %s", code, disp, r.wantDisp, out)
+			}
+			for _, w := range r.want {
+				if !strings.Contains(out, w) {
+					t.Errorf("output %q does not name %q", out, w)
+				}
+			}
+			if g.counts["gate_run"] != 0 {
+				t.Errorf("the gate ran despite the failure: %q", g.order)
+			}
+			if r.wantDisp == gateRefused && g.counts["build"] != 0 {
+				t.Errorf("a refused source reached a build: %q", g.order)
+			}
+			if r.name == "dockerfile not committed" && len(g.order) != 0 {
+				t.Errorf("an uncommitted Dockerfile reached the runtime: %q", g.order)
+			}
+		})
+	}
+}
+
+// TestRunVerifyCommittedTree_IsTheDecidingGate: the committed-tree verify
+// marks its gate as deciding, so a later auto-format absorb resolving a
+// different digest does not displace the verify's image in the evidence.
+// Deleting withDecidingGate at runVerifyCommittedTree's seam call turns this
+// red (the absorb's digest B is recorded).
+func TestRunVerifyCommittedTree_IsTheDecidingGate(t *testing.T) {
+	st := declaredState(t, containerEnv(nil), safeDockerRuntime(declSock), stageImage("ghcr.io/o/g:v1"), nil)
+	scriptGateExec(t, pulledImageResponder(0, declImageID+" ghcr.io/o/g@"+declDigestA, declImageID+" ghcr.io/o/g@"+declDigestB))
+	repo, head := gateRepoWithCommit(t)
+	if _, out, outcome, _ := runVerifyCommittedTree(context.Background(), "true", repo, head, time.Minute, nil); outcome != "passed" {
+		t.Fatalf("verify %s: %s", outcome, out)
+	}
+	mustWrite(t, filepath.Join(repo, "a.go"), "package a\n")
+	if _, err := runAutoformat(context.Background(), repo, []string{"a.go"}, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	sel, _ := st.recordedSelection()
+	if sel.ResolvedImage == nil || sel.ResolvedImage.Digest != declDigestA || sel.DistinctImagesCount != 2 {
+		t.Errorf("recorded = %+v count %d, want the verify gate's digest A and 2 distinct", sel.ResolvedImage, sel.DistinctImagesCount)
+	}
+}
+
+// TestRun_FetchedGateContainerIsDeclared: run() threads the prompt's
+// gate_container out of fetchPromptToFile and declares it before any gate.
+// Deleting the declare call in run() turns this red.
+func TestRun_FetchedGateContainerIsDeclared(t *testing.T) {
+	for _, k := range []string{gateImageEnvVar, deploymentProfileEnvVar, gateServicesEnvVar, gatePostgresImageEnvVar, gateImageAllowlistEnvVar, gateBuildEnvVar} {
+		t.Setenv(k, "")
+	}
+	t.Setenv(gateIsolationModeEnvVar, "clone")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID: "22222222-3333-4444-5555-666666666666", StageType: "implement",
+		Prompt: "do the thing", PromptHash: "deadbeef",
+		GateContainer: stageImage("ghcr.io/o/g@" + declDigestA),
+	}
+	withFakeUploader(t, fu)
+	var stderr strings.Builder
+	if got := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt",
+	}, &stderr); got != exitOK {
+		t.Fatalf("run = %d:\n%s", got, stderr.String())
+	}
+	want := `"event":"gate_container_declared","source":"stage","image":"ghcr.io/o/g@` + declDigestA + `"`
+	if !strings.Contains(stderr.String(), want) {
+		t.Errorf("log lacks %s:\n%s", want, stderr.String())
 	}
 }
