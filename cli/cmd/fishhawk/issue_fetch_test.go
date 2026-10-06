@@ -69,34 +69,48 @@ func TestInferIssueNumberFromTriggerRef(t *testing.T) {
 	}
 }
 
+// withGhPresent stubs the ghLookPath seam so fetchIssueViaGh's
+// "is gh on PATH" guard passes on any host, including the gate image
+// where gh is not installed (#4053).
+func withGhPresent(t *testing.T) {
+	t.Helper()
+	orig := ghLookPath
+	ghLookPath = func(string) (string, error) { return "/fake/gh", nil }
+	t.Cleanup(func() { ghLookPath = orig })
+}
+
 // withFakeGh swaps in a fake gh subprocess that returns the
 // supplied JSON body verbatim. The actual command path doesn't
-// matter — we replace ghIssueCommand entirely.
+// matter — we replace ghIssueCommand entirely, and ghLookPath so the
+// PATH guard passes whether or not the host has gh.
 func withFakeGh(t *testing.T, jsonBody string) {
 	t.Helper()
+	withGhPresent(t)
 	orig := ghIssueCommand
 	ghIssueCommand = func(_ string, _ ...string) *exec.Cmd {
-		// echo prints the body to stdout; gh's --json output is
-		// JSON-on-stdout.
-		return exec.Command("sh", "-c", "cat <<'BODY'\n"+jsonBody+"\nBODY")
+		// /bin/sh by absolute path and the builtin printf need no
+		// PATH lookup; gh's --json output is JSON-on-stdout.
+		return exec.Command("/bin/sh", "-c", `printf '%s\n' "$1"`, "fake-gh", jsonBody)
 	}
 	t.Cleanup(func() { ghIssueCommand = orig })
 }
 
-// withFakeGhMissing makes the gh binary appear absent from PATH.
-// The function temporarily swaps PATH so exec.LookPath fails.
+// withFakeGhMissing makes the gh binary appear absent by stubbing the
+// ghLookPath seam to fail, so the result does not depend on the host's
+// PATH or on whether gh is installed.
 func withFakeGhMissing(t *testing.T) {
 	t.Helper()
-	tmp := t.TempDir()
-	orig := os.Getenv("PATH")
-	t.Setenv("PATH", tmp)
-	t.Cleanup(func() { _ = os.Setenv("PATH", orig) })
+	orig := ghLookPath
+	ghLookPath = func(string) (string, error) { return "", exec.ErrNotFound }
+	t.Cleanup(func() { ghLookPath = orig })
 }
 
 // withFakeGhBroken returns a non-zero exit from the stub so the
-// failure branch is exercised.
+// failure branch is exercised. It stubs ghLookPath as well, so the
+// subprocess failure is reached on a gh-less host.
 func withFakeGhBroken(t *testing.T) {
 	t.Helper()
+	withGhPresent(t)
 	orig := ghIssueCommand
 	ghIssueCommand = func(_ string, _ ...string) *exec.Cmd {
 		// /usr/bin/false exits 1 with no output; matches the
@@ -138,18 +152,37 @@ func TestFetchIssueViaGh_DecodesComments(t *testing.T) {
 	}
 }
 
+// TestFetchIssueViaGh_NotInstalled is hermetic by construction: the
+// lookup seam reports gh absent and the subprocess seam would return a
+// valid issue, so the result is the same on a host with or without gh.
+// Only the guard stands between the absent-gh state and a decoded
+// issue, so a missing guard fails here rather than passing silently.
 func TestFetchIssueViaGh_NotInstalled(t *testing.T) {
 	withFakeGhMissing(t)
-	_, err := fetchIssueViaGh("x/y", 42)
+	invocations := 0
+	orig := ghIssueCommand
+	ghIssueCommand = func(_ string, _ ...string) *exec.Cmd {
+		invocations++
+		return exec.Command("/bin/sh", "-c", `printf '%s\n' "$1"`, "fake-gh",
+			`{"title":"t","number":1}`)
+	}
+	t.Cleanup(func() { ghIssueCommand = orig })
+
+	got, err := fetchIssueViaGh("x/y", 42)
 	if !errors.Is(err, ErrGhNotInstalled) {
 		t.Errorf("err = %v, want ErrGhNotInstalled", err)
+	}
+	if got != nil {
+		t.Errorf("result = %+v, want nil when gh is absent", got)
+	}
+	if invocations != 0 {
+		t.Errorf("gh subprocess invoked %d times, want 0 when gh is absent", invocations)
 	}
 }
 
 func TestFetchIssueViaGh_CommandFails(t *testing.T) {
-	// Need gh on PATH so the LookPath check passes; then the
-	// fake command fails the actual call.
-	withFakeGh(t, "ignored")
+	// withFakeGhBroken stubs the PATH lookup so the guard passes;
+	// the fake command then fails the actual call.
 	withFakeGhBroken(t)
 	_, err := fetchIssueViaGh("x/y", 42)
 	if err == nil {
@@ -368,10 +401,11 @@ func TestIssueContext_RoundTrip(t *testing.T) {
 // `labels` in the field list gh omits the key entirely.
 func TestFetchIssueViaGh_RequestsLabelsField(t *testing.T) {
 	var gotArgs []string
+	withGhPresent(t)
 	orig := ghIssueCommand
 	ghIssueCommand = func(name string, args ...string) *exec.Cmd {
 		gotArgs = append([]string{name}, args...)
-		return exec.Command("sh", "-c", `printf '{"title":"t","number":1}'`)
+		return exec.Command("/bin/sh", "-c", `printf '{"title":"t","number":1}'`)
 	}
 	t.Cleanup(func() { ghIssueCommand = orig })
 
