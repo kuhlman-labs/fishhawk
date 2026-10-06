@@ -538,7 +538,12 @@ host (this repo's testcontainers Postgres) fails under `clone-sandbox`. The
 #2137 gate service provisions Postgres on the CONTAINER path only — the
 sandbox path has no service — so such a host either runs the container path
 (`FISHHAWK_GATE_IMAGE` + `FISHHAWK_GATE_SERVICES=postgres`) or sets
-`FISHHAWK_GATE_ISOLATION=clone`.
+`FISHHAWK_GATE_ISOLATION=clone`. **Residual: IP-layer isolation only.**
+`unshare -rn` creates user and network namespaces and no mount namespace, so a
+pathname unix socket the runner's user can read (the runtime's own
+`docker.sock` / `podman.socket`, an ssh-agent socket) stays reachable from the
+sandbox; a gate command that reaches a daemon could start a networked
+container. The container path is the isolation that withholds those paths.
 
 ## Build-cache posture (`cache.go`) — the INVARIANT
 

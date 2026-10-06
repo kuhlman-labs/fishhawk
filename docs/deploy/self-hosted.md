@@ -314,7 +314,7 @@ Owner: `runner/internal/gateiso/README.md` § "The container path" (the resolved
 | Path | Hosts | `.git` metadata | Egress | Host filesystem read |
 |---|---|---|---|---|
 | `container` | any host with a SAFE runtime and an image: Linux docker or rootless podman, macOS Docker Desktop | closed: independent clone mounted at `/work`, primary `.git` unreachable | closed: `--network=none` | closed: only the checkout, caches, a read-only `/etc/passwd` and (with a service) a read-only socket volume are mounted |
-| `clone-sandbox` | Linux only, when the `unshare -rn` probe passes | closed: independent clone | closed: network namespace (it hides host loopback too) | OPEN: the gate reads whatever the runner's OS user reads |
+| `clone-sandbox` | Linux only, when the `unshare -rn` probe passes | closed: independent clone | closed at the IP layer only: network namespace (it hides host loopback too), but unix sockets in the filesystem the runner's user can read, the runtime's daemon socket included, stay reachable | OPEN: the gate reads whatever the runner's OS user reads |
 | `clone` | every host; the only host path on macOS | closed: independent clone | OPEN: full host network | OPEN: same OS user as the runner |
 | `refused` | any | the gate never runs: category C, not a fallback run, not the fix agent | | |
 
@@ -356,7 +356,7 @@ Owner: `runner/internal/gateiso/README.md` § "Declared gate image (`gate_contai
 - `FISHHAWK_GATE_SERVICES=postgres` is the only provisioned daemon: the runner starts one network-less Postgres per container exec and shares only its unix socket, read-only, into the gate as `FISHHAWK_TEST_PG_URL`. Container path only; elsewhere the runner logs `gate_services_ignored`. An unknown member is a startup config error.
 - Pin `FISHHAWK_GATE_POSTGRES_IMAGE` by digest (default `postgres:16-alpine`); it runs beside every container gate.
 - Any other daemon dependency is unsupported on the container path. A repository whose gates need Postgres must not get a gate image without `FISHHAWK_GATE_SERVICES=postgres`: the pgtest-backed suite then fails closed with no database.
-- On `clone`, the host's daemon is reachable as before; on `clone-sandbox` it is not (the network namespace hides host loopback).
+- On `clone`, the host's daemon is reachable as before. On `clone-sandbox` only its loopback TCP is hidden (the network namespace hides host loopback); a pathname unix socket such as `docker.sock` or a rootless `podman.socket` is a filesystem object, and the sandbox adds no mount namespace (`sandbox.go` wraps `unshare -rn` only), so a socket the runner's user can read stays reachable and a gate command could use it to start a networked container. Egress there is closed at the IP layer only; where that matters, use the container path.
 - **Residual: RAM-backed PGDATA.** The service's data directory is a `tmpfs` with no size option and the service has no memory limit, so the databases a gate creates live in host memory. A large or hostile suite can pressure the runner host's memory (host availability only; the service has no egress).
 - **Residual: crash-orphaned services.** A runner killed with SIGKILL mid-exec runs no teardown. The service container and volume stay behind, both labelled `org.fishhawk.gate-service`; the label-filtered cleanup is in `runner/README.md`.
 
@@ -387,7 +387,7 @@ Observed on Docker Desktop for macOS (2026-10-06), not a reproduced contract.
   export DOCKER_HOST="unix://$HOME/.docker/run/docker.sock"
   ```
 
-  Set `DOCKER_HOST` explicitly. A fresh config carries no `currentContext` or `contexts/`, so the CLI falls back to the `default` context, whose endpoint is `DOCKER_HOST` or else `/var/run/docker.sock`; pinning the socket keeps the effective endpoint from changing silently. Operator-verified on this host (2026-10-06, Docker Desktop on macOS): with exactly this pair, a pull of `docker.io/alpine/git:v2.47.2` completed immediately and the live gate fixtures passed, while the default config hung on `docker-credential-desktop get`.
+  Set `DOCKER_HOST` explicitly. A fresh config carries no `currentContext` or `contexts/`, so the CLI falls back to the `default` context, whose endpoint is `DOCKER_HOST` or else `/var/run/docker.sock`; pinning the socket keeps the effective endpoint from changing silently. Operator-verified (2026-10-06, Docker Desktop on macOS): with exactly this pair, a pull of `docker.io/alpine/git:v2.47.2` completed immediately and the live gate fixtures passed, while the default config hung on `docker-credential-desktop get`.
 - **It reaches the runner only if it is in the RUNNER's environment.** The runner hands its own environment to the runtime CLI for pulls, inspects and service steps, with the endpoint variables re-pinned to the validated socket and `DOCKER_CONFIG` kept. The gate container never sees it. A config without credentials cannot pull a private image, so this does not work for a private gate image or private build bases.
 
 Owner: `runner/README.md` § "Gate isolation" (Docker Desktop: hung credential helper); `deploy/gate-image/README.md` for the default gate image.

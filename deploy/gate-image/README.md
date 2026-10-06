@@ -130,7 +130,7 @@ child under the `docker` process. This is the environment, not the image or the
 script. Remedy and the per-step
 bounds the runner applies: `runner/README.md` § "Gate isolation" (Docker
 Desktop: hung credential helper). The anonymous-pull remedy (`DOCKER_CONFIG` at
-a config with no `credsStore`, `credHelpers` or `auths`, plus an explicit
+a config with no `credsStore`, no `credHelpers` and no inline `auths` entries, plus an explicit
 `DOCKER_HOST`) works for the default `ghcr.io/kuhlman-labs/fishhawk-gate:main`
 only after the one-time public-visibility step below, and never for a private
 image.
