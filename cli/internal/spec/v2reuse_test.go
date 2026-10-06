@@ -778,3 +778,120 @@ func resolveStageBlock(t *testing.T, doc, wf string, idx int, key string) map[st
 	}
 	return block
 }
+
+// TestResolveV2Reuse_GateContainerSourceRule is the CLI twin of the
+// backend's source-rule test (E51.3 / #2136): a deriving stage naming a
+// source REPLACES the base stage's source, so a base {image} overridden by a
+// deriving {dockerfile, context} resolves to exactly the deriving source and
+// `fishhawk validate` accepts it; a plain key-wise merge would blend a
+// two-source block the schema's oneOf rejects.
+func TestResolveV2Reuse_GateContainerSourceRule(t *testing.T) {
+	doc := func(baseBlock, ownBlock string) string {
+		d := `
+version: "2"
+workflows:
+  base:
+    gate_container:
+      image: ghcr.io/org/base-workflow:1
+    stages:
+      - id: apply
+        type: implement
+        executor:
+          agent: claude-code
+        gate_container:` + baseBlock + `
+  derived:
+    extends: base
+    stages:
+      - id: apply
+        type: implement
+`
+		if ownBlock != "" {
+			d += "        gate_container:" + ownBlock + "\n"
+		}
+		return d
+	}
+	const imageA = "\n          image: ghcr.io/org/a:1"
+	const build = "\n          dockerfile: gate/Dockerfile\n          context: gate"
+
+	t.Run("build source replaces base image", func(t *testing.T) {
+		d := doc(imageA, build)
+		if err := ValidateBytes([]byte(d)); err != nil {
+			t.Fatalf("ValidateBytes = %v, want the resolved single-source block accepted", err)
+		}
+		gc := resolveStageBlock(t, d, "derived", 0, "gate_container")
+		if len(gc) != 2 || gc["dockerfile"] != "gate/Dockerfile" || gc["context"] != "gate" {
+			t.Errorf("gate_container = %v, want exactly {dockerfile, context}", gc)
+		}
+	})
+
+	t.Run("deriving image replaces base build", func(t *testing.T) {
+		d := doc(build, "\n          image: ghcr.io/org/b:2")
+		if err := ValidateBytes([]byte(d)); err != nil {
+			t.Fatalf("ValidateBytes = %v, want nil", err)
+		}
+		gc := resolveStageBlock(t, d, "derived", 0, "gate_container")
+		if len(gc) != 1 || gc["image"] != "ghcr.io/org/b:2" {
+			t.Errorf("gate_container = %v, want exactly {image: ghcr.io/org/b:2}", gc)
+		}
+	})
+
+	t.Run("silent deriving stage inherits the base block", func(t *testing.T) {
+		gc := resolveStageBlock(t, doc(imageA, ""), "derived", 0, "gate_container")
+		if len(gc) != 1 || gc["image"] != "ghcr.io/org/a:1" {
+			t.Errorf("gate_container = %v, want the base stage's block", gc)
+		}
+	})
+
+	t.Run("workflow-level block is not inherited through extends", func(t *testing.T) {
+		var raw any
+		if err := yaml.Unmarshal([]byte(doc(imageA, "")), &raw); err != nil {
+			t.Fatalf("yaml: %v", err)
+		}
+		if err := resolveV2Reuse(raw); err != nil {
+			t.Fatalf("resolveV2Reuse: %v", err)
+		}
+		wfs := raw.(map[string]any)["workflows"].(map[string]any)
+		if _, ok := wfs["base"].(map[string]any)["gate_container"]; !ok {
+			t.Fatal("base workflow lost its own gate_container (positive control)")
+		}
+		if gc, ok := wfs["derived"].(map[string]any)["gate_container"]; ok {
+			t.Errorf("derived workflow gate_container = %v, want absent", gc)
+		}
+	})
+}
+
+// TestMergeGateContainer_Branches is the CLI twin of the backend's branch
+// test: a deriving block naming NO source key merges key-wise (the shape a
+// future `services` key, #2137, takes), a source-bearing one drops the base
+// sources but keeps non-source keys, and a non-object side falls through to
+// mergeKeyWise for the schema to report.
+func TestMergeGateContainer_Branches(t *testing.T) {
+	base := map[string]any{"image": "a", "services": []any{"x"}}
+
+	got, _ := mergeGateContainer(base, map[string]any{"services": []any{"y"}}).(map[string]any)
+	if got["image"] != "a" {
+		t.Errorf("no-source deriving block: image = %v, want the base source kept", got["image"])
+	}
+	if svc, _ := got["services"].([]any); len(svc) != 1 || svc[0] != "y" {
+		t.Errorf("no-source deriving block: services = %v, want the deriving value", got["services"])
+	}
+
+	got, _ = mergeGateContainer(base, map[string]any{"dockerfile": "D", "context": "."}).(map[string]any)
+	if _, kept := got["image"]; kept {
+		t.Errorf("source-bearing deriving block: %v, want the base image dropped", got)
+	}
+	if svc, _ := got["services"].([]any); len(svc) != 1 || svc[0] != "x" {
+		t.Errorf("source-bearing deriving block: services = %v, want the base non-source key merged", got["services"])
+	}
+	if base["image"] != "a" {
+		t.Errorf("base block mutated: %v", base)
+	}
+
+	if v := mergeGateContainer(base, "oops"); v != "oops" {
+		t.Errorf("non-object deriving side = %v, want it to win for the schema to report", v)
+	}
+	over := map[string]any{"image": "b"}
+	if v, _ := mergeGateContainer("oops", over).(map[string]any); v["image"] != "b" {
+		t.Errorf("non-object base side = %v, want the deriving block", v)
+	}
+}

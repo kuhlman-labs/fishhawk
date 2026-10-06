@@ -39,6 +39,10 @@ import (
 //   - an executor default is DROPPED WHOLESALE for a stage selecting a
 //     different oneOf branch, and for ANY stage on the `human` or `delegate`
 //     branch, which admit no key beyond their own. See mergeExecutor.
+//   - a deriving stage's `gate_container` naming a source REPLACES the base
+//     stage's source rather than blending with it. See mergeGateContainer.
+//     A workflow-level `gate_container` is not inherited through `extends`
+//     (no workflow-level key is) and is not a `defaults` key.
 //   - a key written with NO value (PRESENT-but-null) is PRESERVED, never
 //     overwritten by a `defaults` block or an inherited base value, and never
 //     FABRICATED onto a stage from a null INSIDE a `defaults` block. It is a
@@ -391,7 +395,8 @@ func mergeStagesByID(baseStages []any, ownStages []any, newDefaults map[string]a
 // merges key-wise with the deriving side winning, EXCEPT the three blocks
 // applyDefaults documents: `executor` carries the branch rule, `budget`
 // merges key-wise, and `reviewers` is taken WHOLE from whichever side
-// declared it, deriving first.
+// declared it, deriving first. `gate_container` carries the SOURCE rule
+// (mergeGateContainer).
 func mergeStage(base, own map[string]any) map[string]any {
 	out := make(map[string]any, len(base)+len(own))
 	for k, v := range base {
@@ -418,11 +423,53 @@ func mergeStage(base, own map[string]any) map[string]any {
 			// stage, so a base stage selecting a different branch is
 			// dropped rather than merged into it.
 			out[k] = mergeExecutor(out[k], v, v)
+		case "gate_container":
+			out[k] = mergeGateContainer(out[k], v)
 		default:
 			out[k] = mergeKeyWise(out[k], v)
 		}
 	}
 	return out
+}
+
+// gateContainerSourceKeys are the source keys of $defs/gate_container,
+// whose oneOf admits exactly one source: `image`, or `dockerfile` +
+// `context` together.
+var gateContainerSourceKeys = []string{"image", "dockerfile", "context"}
+
+// mergeGateContainer is the SOURCE rule for a deriving stage's
+// `gate_container` over its base stage's (E51.3 / #2136). When the deriving
+// block names ANY source key, the base block's source keys are dropped
+// before the key-wise merge, so a base {image} overridden by a deriving
+// {dockerfile, context} resolves to exactly the deriving source — a plain
+// key-wise merge would blend a two-source block the schema's oneOf rejects.
+// Non-source keys (none today; `services` is reserved for #2137) still merge
+// key-wise. A non-object on either side falls through to mergeKeyWise
+// unchanged, leaving the shape to the schema.
+func mergeGateContainer(under, over any) any {
+	um, uok := under.(map[string]any)
+	om, ook := over.(map[string]any)
+	if !uok || !ook {
+		return mergeKeyWise(under, over)
+	}
+	declaresSource := false
+	for _, k := range gateContainerSourceKeys {
+		if _, ok := om[k]; ok {
+			declaresSource = true
+			break
+		}
+	}
+	if !declaresSource {
+		return mergeKeyWise(um, om)
+	}
+	trimmed := make(map[string]any, len(um))
+	for k, v := range um {
+		trimmed[k] = v
+	}
+	for _, k := range gateContainerSourceKeys {
+		delete(trimmed, k)
+	}
+	return mergeKeyWise(trimmed, om)
 }
 
 // applyDefaults folds one `defaults` block into ONE stage, in place.

@@ -254,6 +254,49 @@ type Workflow struct {
 	// schedule.go; the scheduler that consumes it is
 	// backend/internal/scheduler.
 	Schedule *Schedule `json:"schedule,omitempty" yaml:"schedule,omitempty"`
+	// GateContainer is the workflow-level gate container declaration
+	// (E51.3 / #2136): the image every gate command of every stage runs
+	// in unless a stage declares its own. Nil means undeclared. v2-only
+	// (v0/v1 schemas reject the key). REQUIRED for the schema-permitted
+	// key to survive ParseBytes' DisallowUnknownFields decode. Not
+	// inherited through `extends` and not a `defaults` key. Read it
+	// through EffectiveGateContainer, never directly.
+	GateContainer *GateContainer `json:"gate_container,omitempty" yaml:"gate_container,omitempty"`
+}
+
+// GateContainer is a declared gate container (E51.3 / #2136): exactly one
+// source — a registry Image, OR an in-repo build from Dockerfile + Context
+// (both repository-relative). The schema's oneOf enforces the
+// exactly-one-source rule and the path shape; this package does not
+// re-check them. The runner owns the image policy, pull and build.
+type GateContainer struct {
+	Image      string `json:"image,omitempty" yaml:"image,omitempty"`
+	Dockerfile string `json:"dockerfile,omitempty" yaml:"dockerfile,omitempty"`
+	Context    string `json:"context,omitempty" yaml:"context,omitempty"`
+}
+
+// Gate container declaration sources, as EffectiveGateContainer reports
+// them and the prompt wire carries them.
+const (
+	GateContainerSourceStage    = "stage"
+	GateContainerSourceWorkflow = "workflow"
+)
+
+// EffectiveGateContainer resolves the gate container a stage's gates run
+// in (E51.3 / #2136): the stage's own block with source "stage", else the
+// workflow's block with source "workflow", else (nil, ""). The caller
+// resolves `st` by stage IDENTITY — two stages of one type may declare
+// different blocks. The runner's FISHHAWK_GATE_IMAGE and the
+// clone-sandbox / clone fallback sit below both and are not this
+// package's concern.
+func EffectiveGateContainer(wf Workflow, st Stage) (*GateContainer, string) {
+	if st.GateContainer != nil {
+		return st.GateContainer, GateContainerSourceStage
+	}
+	if wf.GateContainer != nil {
+		return wf.GateContainer, GateContainerSourceWorkflow
+	}
+	return nil, ""
 }
 
 // Decomposition is the per-workflow decomposition control block (E24.6 /
@@ -772,6 +815,12 @@ type Stage struct {
 	// ParseBytes' DisallowUnknownFields decode. Honoured only for
 	// host-dispatched agent stages; inert elsewhere.
 	Concurrency *StageConcurrency `json:"concurrency,omitempty" yaml:"concurrency,omitempty"`
+	// GateContainer is the per-stage gate container override (E51.3 /
+	// #2136); it wins over Workflow.GateContainer. Nil means the stage
+	// declared none. REQUIRED for the schema-permitted key to survive
+	// ParseBytes' DisallowUnknownFields decode. Read it through
+	// EffectiveGateContainer.
+	GateContainer *GateContainer `json:"gate_container,omitempty" yaml:"gate_container,omitempty"`
 }
 
 // StageConcurrency is a stage's declared concurrency group (#3964 /

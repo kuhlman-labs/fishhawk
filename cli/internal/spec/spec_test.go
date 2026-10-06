@@ -3767,3 +3767,79 @@ func TestEscalationMessageParity(t *testing.T) {
 		}
 	}
 }
+
+// cliGateContainerDoc renders a v2 document whose workflow carries wfBody and
+// whose single implement stage carries stageBody as `gate_container:` YAML;
+// an empty body omits that key (E51.3 / #2136).
+func cliGateContainerDoc(version, wfBody, stageBody string) string {
+	doc := "version: \"" + version + "\"\nworkflows:\n  wf:\n"
+	if wfBody != "" {
+		doc += "    gate_container:" + wfBody + "\n"
+	}
+	doc += `    stages:
+      - id: apply
+        type: implement
+        executor:
+          agent: claude-code
+`
+	if stageBody != "" {
+		doc += "        gate_container:" + stageBody + "\n"
+	}
+	return doc
+}
+
+// TestValidateBytes_V2GateContainer is the `fishhawk validate` parity twin of
+// the backend's TestParseV2_GateContainer (E51.3 / #2136): the CLI never
+// decodes typed structs, so its mirrored $defs/gate_container is the whole
+// contract and must accept and refuse exactly the same blocks.
+func TestValidateBytes_V2GateContainer(t *testing.T) {
+	const pinned = "ghcr.io/org/gate@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	accepted := []struct{ name, wf, stage string }{
+		{name: "workflow_pinned_image", wf: "\n      image: " + pinned},
+		{name: "stage_build", stage: "\n          dockerfile: build/gate/Dockerfile\n          context: build/gate"},
+		{name: "context_repo_root", stage: "\n          dockerfile: Dockerfile\n          context: ."},
+		{name: "tag_only_image", stage: "\n          image: ghcr.io/org/gate:1.2"},
+	}
+	for _, tc := range accepted {
+		t.Run("accepts_"+tc.name, func(t *testing.T) {
+			if err := spec.ValidateBytes([]byte(cliGateContainerDoc("2", tc.wf, tc.stage))); err != nil {
+				t.Fatalf("ValidateBytes: %v, want the block accepted", err)
+			}
+		})
+	}
+
+	const stagePath = "/workflows/wf/stages/0/gate_container"
+	rejected := []struct{ name, version, wf, stage, wantPath string }{
+		{name: "image_and_build", stage: "\n          image: " + pinned + "\n          dockerfile: Dockerfile\n          context: .", wantPath: stagePath},
+		{name: "image_and_dockerfile", stage: "\n          image: " + pinned + "\n          dockerfile: Dockerfile", wantPath: stagePath},
+		{name: "dockerfile_without_context", stage: "\n          dockerfile: Dockerfile", wantPath: stagePath},
+		{name: "empty_block", stage: " {}", wantPath: stagePath},
+		{name: "dockerfile_parent", stage: "\n          dockerfile: ../x/Dockerfile\n          context: .", wantPath: stagePath + "/dockerfile"},
+		{name: "dockerfile_parent_inner", stage: "\n          dockerfile: a/../b\n          context: .", wantPath: stagePath + "/dockerfile"},
+		{name: "dockerfile_absolute", stage: "\n          dockerfile: /abs/Dockerfile\n          context: .", wantPath: stagePath + "/dockerfile"},
+		{name: "image_empty", stage: "\n          image: ''", wantPath: stagePath + "/image"},
+		{name: "image_not_string", stage: "\n          image: 7", wantPath: stagePath + "/image"},
+		{name: "services_reserved", stage: "\n          image: " + pinned + "\n          services: [postgres]", wantPath: stagePath},
+		{name: "workflow_two_sources", wf: "\n      image: alpine\n      dockerfile: Dockerfile\n      context: .", wantPath: "/workflows/wf/gate_container"},
+		{name: "below_major_2", version: "1.0", stage: "\n          image: alpine", wantPath: "/workflows/wf/stages/0"},
+	}
+	for _, tc := range rejected {
+		t.Run("rejects_"+tc.name, func(t *testing.T) {
+			version := tc.version
+			if version == "" {
+				version = "2"
+			}
+			err := spec.ValidateBytes([]byte(cliGateContainerDoc(version, tc.wf, tc.stage)))
+			var ve *spec.ValidationError
+			if !errors.As(err, &ve) {
+				t.Fatalf("err = %T %v, want *spec.ValidationError", err, err)
+			}
+			for _, e := range ve.Errors {
+				if e.Path == tc.wantPath {
+					return
+				}
+			}
+			t.Errorf("errors = %+v, want one at %q", ve.Errors, tc.wantPath)
+		})
+	}
+}
