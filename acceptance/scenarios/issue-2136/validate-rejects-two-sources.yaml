@@ -1,0 +1,14 @@
+id: scenario:issue-2136/validate-rejects-two-sources
+statement: '`fishhawk validate` exits non-zero and names the offending `gate_container` path on its output when one block declares both `image` and `dockerfile`, or declares `dockerfile` without `context`.'
+verify_hint: CLI exit code and output of `fishhawk validate` on two small spec files, one per shape.
+steps: Wrote two v2 specs. In both.yaml the implement stage's gate_container declares image, dockerfile and context. In nocontext.yaml it declares dockerfile only. Ran fishhawk validate on each.
+assertions:
+    expected: non-zero exit naming the gate_container path
+    observed_at_record: 'both.yaml: exit 1, ''both.yaml/workflows/feature_change/stages/1/gate_container: ''not'' failed''. nocontext.yaml: exit 1, ''…/stages/1/gate_container: missing property ''context''''.'
+    repro_handle: fishhawk validate both.yaml; fishhawk validate nocontext.yaml
+origin:
+    issue: 2136
+    pr: 0
+    run_id: 1aa1daac-161b-4163-a94e-fff4a01c897a
+    head_sha: e507d08288bd2ab948c51cdf242b1ca4f1489ba7
+    recorded_at: 2026-10-06T08:21:54Z

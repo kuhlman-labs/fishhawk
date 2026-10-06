@@ -1,0 +1,14 @@
+id: scenario:issue-2136/validate-rejects-escaping-paths
+statement: '`fishhawk validate` exits non-zero when `gate_container.dockerfile` or `gate_container.context` is an absolute path or contains a `..` segment.'
+verify_hint: 'CLI exit code of `fishhawk validate` on specs with `dockerfile: ../outside/Dockerfile` and `context: /etc`.'
+steps: 'Wrote three v2 specs: (1) the implement stage''s gate_container has dockerfile: ../outside/Dockerfile; (2) it has context: /etc; (3) the workflow-level block has dockerfile: a/../../x/Dockerfile. Ran fishhawk validate on each.'
+assertions:
+    expected: non-zero exit
+    observed_at_record: 'Each exits 1. (1) ''…/stages/1/gate_container/dockerfile: ''not'' failed''. (2) ''…/gate_container/context: ''/etc'' does not match pattern''. (3) ''…/feature_change/gate_container/dockerfile: ''not'' failed''.'
+    repro_handle: fishhawk validate dotdot.yaml; fishhawk validate abs.yaml
+origin:
+    issue: 2136
+    pr: 0
+    run_id: 1aa1daac-161b-4163-a94e-fff4a01c897a
+    head_sha: e507d08288bd2ab948c51cdf242b1ca4f1489ba7
+    recorded_at: 2026-10-06T08:21:54Z

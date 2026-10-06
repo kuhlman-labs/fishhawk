@@ -1,0 +1,13 @@
+id: scenario:issue-2136/gate-container-precedence-runner
+statement: With no gate_container declaration the runner's gate execution is byte-unchanged from today (FISHHAWK_GATE_IMAGE or the clone/sandbox fallback), and a workflow-level gate_container image is used in preference to FISHHAWK_GATE_IMAGE.
+steps: 'Posture B on the sanctioned checkout: in runner/, ran go test ./cmd/fishhawk-runner -run ''TestDeclaredImage_Resolution|TestRunGateInContainer|TestRunBoundedGate|TestGateContainer_EntrypointResetSmoke|TestGateIsolationState'' and go test ./internal/gateiso. Searched the tree for the test names cited by the operator.'
+assertions:
+    expected: no declaration = today's behaviour; workflow image preferred over FISHHAWK_GATE_IMAGE
+    observed_at_record: The cited tests TestDeclaredImage_BeatsEnvImage and TestEnvImagePath_ByteUnchanged do not exist in the tree, so the behaviour was judged from equivalent tests. TestDeclaredImage_Resolution PASSES with FISHHAWK_GATE_IMAGE=img:1 set and asserts the gate runs the declared image, 'never the env image img:1'. The runner treats stage and workflow sources identically as declared sources (DeclaredSource accepts both). Workflow-source selection rows pass in gateiso select_test. The pre-existing env-image and fallback tests (TestRunGateInContainer_*, TestRunBoundedGate*) all PASS unchanged.
+    repro_handle: cd runner && go test ./cmd/fishhawk-runner -run TestDeclaredImage_Resolution -v
+origin:
+    issue: 2136
+    pr: 0
+    run_id: 1aa1daac-161b-4163-a94e-fff4a01c897a
+    head_sha: e507d08288bd2ab948c51cdf242b1ca4f1489ba7
+    recorded_at: 2026-10-06T08:21:54Z

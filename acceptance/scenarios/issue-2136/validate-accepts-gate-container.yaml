@@ -1,0 +1,14 @@
+id: scenario:issue-2136/validate-accepts-gate-container
+statement: '`fishhawk validate` exits 0 on a version "2" spec declaring a workflow-level `gate_container: {image: ghcr.io/org/gate@sha256:<64 hex>}` and an implement-stage `gate_container: {dockerfile: deploy/gate-image/Dockerfile, context: deploy/gate-image}` override.'
+verify_hint: CLI exit code and stdout of `fishhawk validate <spec.yaml>` on a hand-written spec file (decided by cli/internal/spec/spec_test.go TestValidateV2_GateContainer rows).
+steps: 'Built the CLI from the sanctioned checkout (cd cli && go build -o /tmp/fh2136/bin/fishhawk ./cmd/fishhawk). Wrote /tmp/fh2136/specs/good.yaml: version "2", workflow feature_change with gate_container: {image: ghcr.io/org/gate@sha256:<64 a>}, a plan stage, and an implement stage with gate_container: {dockerfile: deploy/gate-image/Dockerfile, context: deploy/gate-image}. Ran fishhawk validate good.yaml.'
+assertions:
+    expected: exit 0
+    observed_at_record: '''good.yaml: OK'', exit 0'
+    repro_handle: fishhawk validate /tmp/fh2136/specs/good.yaml
+origin:
+    issue: 2136
+    pr: 0
+    run_id: 1aa1daac-161b-4163-a94e-fff4a01c897a
+    head_sha: e507d08288bd2ab948c51cdf242b1ca4f1489ba7
+    recorded_at: 2026-10-06T08:21:54Z

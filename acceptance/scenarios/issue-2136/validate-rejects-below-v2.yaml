@@ -1,0 +1,14 @@
+id: scenario:issue-2136/validate-rejects-below-v2
+statement: '`fishhawk validate` exits non-zero on a version "1" spec that declares `gate_container`, because the field is workflow-v2 only.'
+verify_hint: CLI exit code of `fishhawk validate` on a v1 spec carrying the block.
+steps: Wrote v1.yaml with version "1.6", the same workflow-level and implement-level gate_container blocks as good.yaml. Ran fishhawk validate on it. As a control, ran it on the same 1.6 spec without the blocks.
+assertions:
+    expected: non-zero exit
+    observed_at_record: 'v1.yaml: exit 1, ''additional properties ''gate_container'' not allowed'' at both the workflow and the stage. Control: exit 0.'
+    repro_handle: fishhawk validate v1.yaml
+origin:
+    issue: 2136
+    pr: 0
+    run_id: 1aa1daac-161b-4163-a94e-fff4a01c897a
+    head_sha: e507d08288bd2ab948c51cdf242b1ca4f1489ba7
+    recorded_at: 2026-10-06T08:21:54Z

@@ -1,0 +1,14 @@
+id: scenario:issue-2136/emit-resolved-extends-source-rule
+statement: '`fishhawk validate --emit-resolved` on a spec whose deriving workflow `extends` a base whose implement stage declares `gate_container: {image: …}`, with the deriving implement stage declaring `{dockerfile, context}`, prints a resolved implement stage whose gate_container carries dockerfile and context and NO image, and `fishhawk validate` exits 0 on that spec.'
+verify_hint: CLI stdout of `fishhawk validate --emit-resolved <spec.yaml>` and the exit code of `fishhawk validate`.
+steps: 'Wrote ext.yaml (version 2). Its base_change workflow has an implement stage with gate_container {image: ghcr.io/org/gate@sha256:…}. feature_change extends base_change and overrides implement with gate_container {dockerfile: deploy/gate-image/Dockerfile, context: deploy/gate-image}. Ran fishhawk validate ext.yaml, then fishhawk validate --emit-resolved ext.yaml.'
+assertions:
+    expected: resolved stage carries dockerfile+context and no image; validate exit 0
+    observed_at_record: 'validate: exit 0. emit-resolved: exit 0; the resolved feature_change implement stage has gate_container {context: deploy/gate-image, dockerfile: deploy/gate-image/Dockerfile} with no image key. base_change keeps {image}.'
+    repro_handle: fishhawk validate --emit-resolved /tmp/fh2136/specs/ext.yaml
+origin:
+    issue: 2136
+    pr: 0
+    run_id: 1aa1daac-161b-4163-a94e-fff4a01c897a
+    head_sha: e507d08288bd2ab948c51cdf242b1ca4f1489ba7
+    recorded_at: 2026-10-06T08:21:54Z
