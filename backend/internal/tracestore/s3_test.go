@@ -163,6 +163,12 @@ func startRustFS(t *testing.T) (*s3.Client, string) {
 	if os.Getenv("FISHHAWK_SKIP_INTEGRATION") != "" {
 		t.Skip(skipMsg("FISHHAWK_SKIP_INTEGRATION is set"))
 	}
+	// Inside the runner's gate container there is no Docker daemon and the
+	// runner provisions only Postgres (#2137), so the start below cannot succeed
+	// and its error matches no skip marker: skip by name, before startup.
+	if reason, ok := gateContainerSkip(os.Getenv); ok {
+		t.Skip(reason)
+	}
 
 	shared := resolveSharedRustFS()
 	if shared.err != nil {
@@ -208,6 +214,19 @@ func startRustFS(t *testing.T) (*s3.Client, string) {
 func skipMsg(reason string) string {
 	return fmt.Sprintf("tracestore S3 integration suite skipped: %s. "+
 		"Check `docker ps` and restart Docker Desktop if the daemon is loaded. See #2948.", reason)
+}
+
+// gateContainerSkip reports the pre-startup skip for a run inside the runner's
+// gate container (FISHHAWK_GATE_CONTAINER=1, pinned on every container exec):
+// no RustFS service is provisioned there (#2137). CI and host-side verify runs
+// still exercise the suite.
+func gateContainerSkip(getenv func(string) string) (string, bool) {
+	if getenv("FISHHAWK_GATE_CONTAINER") != "1" {
+		return "", false
+	}
+	return "tracestore S3 integration suite skipped: running inside the Fishhawk gate container " +
+		"(FISHHAWK_GATE_CONTAINER=1), where the runner provisions Postgres only and no RustFS service (#2137); " +
+		"CI and the host-side verify still run it.", true
 }
 
 // rustfsSkipReason classifies a RustFS container-start / endpoint-resolution
@@ -694,6 +713,28 @@ func TestRustfsRunOptions_IncludeAPortResolvingWait(t *testing.T) {
 			t.Error("expected a port-bearing member (ForListeningPort or ForHTTP.WithPort) to satisfy the port requirement")
 		}
 	})
+}
+
+// TestRustfsPreSkip_GateContainer pins the gate-container pre-startup skip
+// (#2137) and its negative controls.
+func TestRustfsPreSkip_GateContainer(t *testing.T) {
+	reason, ok := gateContainerSkip(func(k string) string {
+		if k == "FISHHAWK_GATE_CONTAINER" {
+			return "1"
+		}
+		return ""
+	})
+	if !ok {
+		t.Fatal("expected a pre-startup skip inside the gate container")
+	}
+	if !strings.Contains(reason, "gate container") || !strings.Contains(reason, "FISHHAWK_GATE_CONTAINER=1") {
+		t.Errorf("reason %q should name the gate container marker", reason)
+	}
+	for _, v := range []string{"", "0", "true"} {
+		if _, ok := gateContainerSkip(func(string) string { return v }); ok {
+			t.Errorf("FISHHAWK_GATE_CONTAINER=%q skipped; only the runner's exact pin 1 may", v)
+		}
+	}
 }
 
 // TestRustfsSkipReason asserts one case per named branch of the fail-soft

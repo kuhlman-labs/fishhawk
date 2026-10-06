@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
@@ -338,7 +340,190 @@ func TestReplaceDBName(t *testing.T) {
 	}
 }
 
+// --- external-server routing (#2137), no container ---
+
+// msgTB is a fake fataler that records the branch AND the message, and returns
+// from Skipf/Fatalf (resolveBase returns explicitly after each).
+type msgTB struct {
+	skipped bool
+	fataled bool
+	msg     string
+}
+
+func (m *msgTB) Helper() {}
+func (m *msgTB) Skipf(f string, a ...any) {
+	m.skipped = true
+	m.msg = fmt.Sprintf(f, a...)
+}
+func (m *msgTB) Fatalf(f string, a ...any) {
+	m.fataled = true
+	m.msg = fmt.Sprintf(f, a...)
+}
+
+func envOf(kv map[string]string) func(string) string {
+	return func(k string) string { return kv[k] }
+}
+
+// runnerDSN is the exact unix-socket DSN shape the runner pins (#2137).
+const runnerDSN = "postgres://fishhawk:fishhawk@/fishhawk?host=/pgsock&sslmode=disable"
+
+// TestResolveBase_ExternalURLSkipsContainerStart: with FISHHAWK_TEST_PG_URL set
+// the testcontainers start is never called, the template is bootstrapped on the
+// provided server, and that URL is the base.
+func TestResolveBase_ExternalURLSkipsContainerStart(t *testing.T) {
+	tb := &msgTB{}
+	started := false
+	var bootstrapped string
+	got := resolveBase(tb, envOf(map[string]string{externalURLEnv: runnerDSN}),
+		func() (string, error) { started = true; return "postgres://container", nil },
+		func(u string) error { bootstrapped = u; return nil })
+	if started {
+		t.Error("testcontainers start was called although FISHHAWK_TEST_PG_URL is set")
+	}
+	if got != runnerDSN {
+		t.Errorf("resolveBase = %q, want the provided URL %q", got, runnerDSN)
+	}
+	if bootstrapped != runnerDSN {
+		t.Errorf("template bootstrapped on %q, want %q", bootstrapped, runnerDSN)
+	}
+	if tb.skipped || tb.fataled {
+		t.Errorf("unexpected terminal call: skipped=%v fataled=%v msg=%q", tb.skipped, tb.fataled, tb.msg)
+	}
+}
+
+// TestResolveBase_ExternalErrorFatalsNeverSkips: an external bootstrap error
+// CRAFTED to carry the Docker-unavailable marker must still Fatalf — the only
+// thing between it and a silent Skipf is the external branch's own routing.
+func TestResolveBase_ExternalErrorFatalsNeverSkips(t *testing.T) {
+	tb := &msgTB{}
+	bootErr := errors.New("Cannot connect to the Docker daemon at unix:///var/run/docker.sock")
+	if !isDockerUnavailable(bootErr) {
+		t.Fatal("fixture: the crafted error must match the docker-unavailable marker")
+	}
+	got := resolveBase(tb, envOf(map[string]string{externalURLEnv: runnerDSN}),
+		func() (string, error) { t.Error("start must not be called"); return "", nil },
+		func(string) error { return bootErr })
+	if tb.skipped {
+		t.Errorf("external error was SKIPPED (%q); a provided server must fail closed", tb.msg)
+	}
+	if !tb.fataled {
+		t.Fatal("external error did not Fatalf")
+	}
+	if !strings.Contains(tb.msg, externalURLEnv) || !strings.Contains(tb.msg, "Cannot connect") {
+		t.Errorf("fatal message %q should name %s and carry the cause", tb.msg, externalURLEnv)
+	}
+	if got != "" {
+		t.Errorf("resolveBase = %q on error, want empty", got)
+	}
+}
+
+// TestResolveBase_GateContainerWithoutURLFatals: inside the gate container with
+// no provisioned server, Fatalf naming the runner remedy, start never called.
+func TestResolveBase_GateContainerWithoutURLFatals(t *testing.T) {
+	tb := &msgTB{}
+	started := false
+	resolveBase(tb, envOf(map[string]string{gateContainerEnv: "1"}),
+		func() (string, error) { started = true; return "", errors.New("no docker host") },
+		func(string) error { t.Error("bootstrap must not be called"); return nil })
+	if started {
+		t.Error("testcontainers start was attempted inside the gate container")
+	}
+	if !tb.fataled || tb.skipped {
+		t.Fatalf("fataled=%v skipped=%v, want a Fatalf", tb.fataled, tb.skipped)
+	}
+	if !strings.Contains(tb.msg, "FISHHAWK_GATE_SERVICES=postgres") {
+		t.Errorf("fatal message %q should name the runner remedy FISHHAWK_GATE_SERVICES=postgres", tb.msg)
+	}
+}
+
+// TestResolveBase_SkipIntegrationAndContainerPath pins the unchanged arms:
+// FISHHAWK_SKIP_INTEGRATION wins over everything, and with no env the
+// container start runs and its error routes through failStart.
+func TestResolveBase_SkipIntegrationAndContainerPath(t *testing.T) {
+	skipTB := &msgTB{}
+	resolveBase(skipTB, envOf(map[string]string{"FISHHAWK_SKIP_INTEGRATION": "1", externalURLEnv: runnerDSN, gateContainerEnv: "1"}),
+		func() (string, error) { t.Error("start must not be called"); return "", nil },
+		func(string) error { t.Error("bootstrap must not be called"); return nil })
+	if !skipTB.skipped || skipTB.fataled {
+		t.Errorf("SKIP_INTEGRATION: skipped=%v fataled=%v, want a skip", skipTB.skipped, skipTB.fataled)
+	}
+
+	okTB := &msgTB{}
+	if got := resolveBase(okTB, envOf(nil), func() (string, error) { return "postgres://container", nil },
+		func(string) error { t.Error("bootstrap must not be called"); return nil }); got != "postgres://container" {
+		t.Errorf("container path = %q, want the started base", got)
+	}
+
+	downTB := &msgTB{}
+	resolveBase(downTB, envOf(nil), func() (string, error) {
+		return "", errors.New("Cannot connect to the Docker daemon at unix:///var/run/docker.sock")
+	}, func(string) error { return nil })
+	if !downTB.skipped {
+		t.Errorf("container path with Docker down should skip via failStart (fataled=%v)", downTB.fataled)
+	}
+}
+
+// TestExternalURL_UnixSocketHostParses: pgx reads the runner DSN's host query
+// parameter as a unix-socket directory, and replaceDBName keeps it.
+func TestExternalURL_UnixSocketHostParses(t *testing.T) {
+	for _, dsn := range []string{runnerDSN, replaceDBName(runnerDSN, "fh_abc")} {
+		cfg, err := pgconn.ParseConfig(dsn)
+		if err != nil {
+			t.Fatalf("ParseConfig(%q): %v", dsn, err)
+		}
+		if cfg.Host != "/pgsock" {
+			t.Errorf("%q: Host = %q, want /pgsock", dsn, cfg.Host)
+		}
+		network, addr := pgconn.NetworkAddress(cfg.Host, cfg.Port)
+		if network != "unix" || addr != "/pgsock/.s.PGSQL.5432" {
+			t.Errorf("%q: NetworkAddress = (%q, %q), want (unix, /pgsock/.s.PGSQL.5432)", dsn, network, addr)
+		}
+	}
+	got := replaceDBName(runnerDSN, "fh_abc")
+	if !strings.Contains(got, "/fh_abc?") || !strings.Contains(got, "host=/pgsock") {
+		t.Errorf("replaceDBName(runnerDSN) = %q, want the new path with host=/pgsock kept", got)
+	}
+}
+
 // --- Docker-guarded integration test ---
+
+// TestExternalURL_BootstrapsAgainstProvidedServer feeds a server's URL through
+// the EXTERNAL branch with the production bootstrapExternalOnce (the real
+// bootstrapTemplate), then creates a per-test database from it and checks it
+// carries the migrated schema. The server comes from sharedBaseURL: the
+// runner-provided FISHHAWK_TEST_PG_URL when set — inside the gate container
+// there is no daemon to start one with (#2137) — otherwise the shared
+// container, with resolveBase's skip and gate-container precedence.
+func TestExternalURL_BootstrapsAgainstProvidedServer(t *testing.T) {
+	base := sharedBaseURL(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	got := resolveBase(t, envOf(map[string]string{externalURLEnv: base}),
+		func() (string, error) { t.Fatal("start must not be called on the external branch"); return "", nil },
+		bootstrapExternalOnce)
+	if got != base {
+		t.Fatalf("resolveBase = %q, want the provided URL", got)
+	}
+	// A second call hits the once-cached result instead of re-bootstrapping.
+	if err := bootstrapExternalOnce(base); err != nil {
+		t.Fatalf("second bootstrapExternalOnce = %v, want the cached nil", err)
+	}
+
+	conn, err := pgx.Connect(ctx, newURLFrom(t, got))
+	if err != nil {
+		t.Fatalf("connect per-test db: %v", err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	var version int64
+	var dirty bool
+	if err := conn.QueryRow(ctx, "SELECT version, dirty FROM schema_migrations").Scan(&version, &dirty); err != nil {
+		t.Fatalf("per-test db is not migrated: %v", err)
+	}
+	if version == 0 || dirty {
+		t.Errorf("per-test db schema_migrations = (%d, dirty=%v), want a clean head", version, dirty)
+	}
+}
 
 // TestSharedContainer_SharesAndIsolates calls NewPool twice in one process
 // and asserts both pools share the container (same host:port) yet are

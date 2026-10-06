@@ -29,11 +29,13 @@ import (
 //
 // These cross gateiso → the runner wiring (runBoundedGateArgv,
 // runVerifyCommittedTree, runVerifyFixLoop) → a REAL container runtime and
-// the pinned image. Every docker-gated fixture (a)–(g), (k) skips with the
-// detected reason when no safe runtime or the image is unavailable, and
+// the pinned image. Every docker-gated fixture (a)–(g), (k)–(m) skips with
+// the detected reason when no safe runtime or the image is unavailable, and
 // increments dockerFixturesRan at its END so main_test.go's TestMain
 // sentinel (approval condition 3) turns an all-skipped run on a docker host
-// into a failure. The fallback fixtures (h)–(j) need no runtime.
+// into a failure. The fallback fixtures (h)–(j) need no runtime. Fixture (n)
+// is OPT-IN (FISHHAWK_GATE_SELFHOST_IMAGE): it counts toward the sentinel
+// only on a run that opted in and executed it.
 // ---------------------------------------------------------------------------
 
 // gateTestImageEnvVar overrides the pinned e2e image.
@@ -831,4 +833,480 @@ func TestGateHosted_RefusesEndToEnd(t *testing.T) {
 	if !strings.Contains(log.String(), `"event":"verify_gate_refused"`) {
 		t.Errorf("log lacks verify_gate_refused:\n%s", log.String())
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Gate services (ADR-063 amendment gap 1, E51.4 / #2137): fixtures (m), (n).
+// ---------------------------------------------------------------------------
+
+// gateSelfHostImageEnvVar opts fixture (n) in: the built fishhawk-gate image
+// (deploy/gate-image), which carries the Go toolchain the pgtest suite needs.
+const gateSelfHostImageEnvVar = "FISHHAWK_GATE_SELFHOST_IMAGE"
+
+var (
+	gatePgImageOnce sync.Once
+	gatePgImageSkip string
+)
+
+// requirePostgresImage makes the Postgres service image available ONCE per
+// process (a pull, falling back to an image already present locally) and
+// proves the in-image binaries fixture (m) relies on — it runs the SAME image
+// as the gate image, for its psql client and busybox. Skips naming the error.
+func requirePostgresImage(t *testing.T, rt gateiso.Runtime) string {
+	t.Helper()
+	image := gateiso.DefaultPostgresImage
+	gatePgImageOnce.Do(func() {
+		bin := rt.Kind.Binary()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+		if out, err := exec.CommandContext(ctx, bin, "pull", "-q", image).CombinedOutput(); err != nil {
+			if exec.CommandContext(ctx, bin, "image", "inspect", image).Run() != nil {
+				gatePgImageSkip = fmt.Sprintf("image %s unavailable: %v: %s", image, err, strings.TrimSpace(string(out)))
+				return
+			}
+		}
+		script := "for b in psql wget id touch ls env tr find; do command -v $b >/dev/null || { echo missing:$b; exit 1; }; done; echo ok"
+		out, err := exec.CommandContext(ctx, bin, "run", "--rm", "--network=none", "--entrypoint", "", image, "/bin/sh", "-c", script).CombinedOutput()
+		if text := strings.TrimSpace(string(out)); err != nil || !strings.HasPrefix(text, "ok") {
+			gatePgImageSkip = fmt.Sprintf("image %s binary check failed: %v: %s", image, err, text)
+		}
+	})
+	if gatePgImageSkip != "" {
+		t.Skip(gatePgImageSkip)
+	}
+	return image
+}
+
+// liveServiceState installs a mode=container state bound to the REAL detected
+// runtime with FISHHAWK_GATE_SERVICES=services and the given gate and
+// Postgres images, logging to logSink.
+func liveServiceState(t *testing.T, rt gateiso.Runtime, image, services string, logSink io.Writer) *gateIsolationState {
+	t.Helper()
+	st, err := configureGateIsolation(fakeEnv(map[string]string{
+		gateIsolationModeEnvVar: "container", gateImageEnvVar: image,
+		gateServicesEnvVar: services, gatePostgresImageEnvVar: gateiso.DefaultPostgresImage}), gateiso.DefaultProbes(), logSink)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.detect = func(context.Context, gateiso.Probes) gateiso.Runtime { return rt }
+	installGateState(t, st)
+	return st
+}
+
+// recordAuxExec wraps the REAL gate-service/passwd seam with a recorder.
+func recordAuxExec(t *testing.T) *[][]string {
+	t.Helper()
+	prev := execGateAuxArgvFn
+	var calls [][]string
+	execGateAuxArgvFn = func(ctx context.Context, argv []string, dir string, env []string, timeout time.Duration) (string, int, bool) {
+		calls = append(calls, append([]string(nil), argv...))
+		return prev(ctx, argv, dir, env, timeout)
+	}
+	t.Cleanup(func() { execGateAuxArgvFn = prev })
+	return &calls
+}
+
+// runtimeHostCmd runs `<bin> <endpoint binding> args…` on the HOST under an
+// env bound to the validated endpoint — the inspection side of the fixtures.
+func runtimeHostCmd(t *testing.T, rt gateiso.Runtime, args ...string) (string, error) {
+	t.Helper()
+	endpoint, err := rt.EndpointArgs()
+	if err != nil {
+		t.Fatalf("endpoint args: %v", err)
+	}
+	env, err := rt.BindEndpointEnv(os.Environ())
+	if err != nil {
+		t.Fatalf("bind endpoint env: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, rt.Kind.Binary(), append(endpoint, args...)...)
+	cmd.Env = env
+	out, err := cmd.CombinedOutput()
+	return strings.TrimSpace(string(out)), err
+}
+
+// serviceInspect is the subset of `<runtime> inspect` fixture (m) asserts.
+type serviceInspect struct {
+	Config struct {
+		User   string
+		Env    []string
+		Labels map[string]string
+	}
+	HostConfig struct {
+		NetworkMode     string
+		CapDrop         []string
+		SecurityOpt     []string
+		Privileged      bool
+		PublishAllPorts bool
+		PortBindings    map[string]any
+		Tmpfs           map[string]string
+	}
+	Mounts []struct {
+		Type        string
+		Name        string
+		Source      string
+		Destination string
+	}
+}
+
+// inspectGateService is fixture (m)'s gateServiceObserver body: it inspects
+// the provisioned service on the host BEFORE the gate exec and returns the
+// superuser password from the service env (so the fixture can prove it never
+// reached the gate). Every containment property is asserted here: no network,
+// all capabilities dropped, no-new-privileges, the non-root user, no published
+// port, PGDATA on tmpfs, and EXACTLY ONE mount — the named socket volume — so
+// no bind mount and no anonymous data volume (#2137 approval condition 2).
+func inspectGateService(t *testing.T, ctx context.Context, rt gateiso.Runtime, cliEnv []string, svc gateiso.PostgresService) string {
+	t.Helper()
+	endpoint, err := rt.EndpointArgs()
+	if err != nil {
+		t.Errorf("observer: endpoint args: %v", err)
+		return ""
+	}
+	cmd := exec.CommandContext(ctx, rt.Kind.Binary(), append(endpoint, "inspect", svc.Name)...)
+	cmd.Env = cliEnv
+	raw, err := cmd.Output()
+	if err != nil {
+		t.Errorf("observer: inspect %s: %v", svc.Name, err)
+		return ""
+	}
+	var got []serviceInspect
+	if err := json.Unmarshal(raw, &got); err != nil || len(got) != 1 {
+		t.Errorf("observer: inspect %s: %v (%d objects)", svc.Name, err, len(got))
+		return ""
+	}
+	in := got[0]
+	if in.HostConfig.NetworkMode != "none" {
+		t.Errorf("service NetworkMode = %q, want none", in.HostConfig.NetworkMode)
+	}
+	capDropAll := false
+	for _, c := range in.HostConfig.CapDrop {
+		if strings.EqualFold(c, "ALL") {
+			capDropAll = true
+		}
+	}
+	if !capDropAll && (rt.Kind != gateiso.KindPodman || len(in.HostConfig.CapDrop) == 0) {
+		t.Errorf("service CapDrop = %q, want ALL", in.HostConfig.CapDrop)
+	}
+	nnp := false
+	for _, o := range in.HostConfig.SecurityOpt {
+		if strings.HasPrefix(o, "no-new-privileges") {
+			nnp = true
+		}
+	}
+	if !nnp {
+		t.Errorf("service SecurityOpt = %q, want no-new-privileges", in.HostConfig.SecurityOpt)
+	}
+	if in.HostConfig.Privileged {
+		t.Errorf("service is privileged")
+	}
+	if len(in.HostConfig.PortBindings) != 0 || in.HostConfig.PublishAllPorts {
+		t.Errorf("service publishes ports: %v (publish-all=%t)", in.HostConfig.PortBindings, in.HostConfig.PublishAllPorts)
+	}
+	if in.Config.User != "postgres" {
+		t.Errorf("service user = %q, want postgres", in.Config.User)
+	}
+	if in.Config.Labels[gateiso.ServiceLabel] != string(gateiso.ServicePostgres) {
+		t.Errorf("service labels = %v, want %s=postgres", in.Config.Labels, gateiso.ServiceLabel)
+	}
+	if _, ok := in.HostConfig.Tmpfs[gateiso.PostgresDataDir]; !ok {
+		t.Errorf("service Tmpfs = %v, want %s (PGDATA must not land on a daemon-managed volume)", in.HostConfig.Tmpfs, gateiso.PostgresDataDir)
+	}
+	if len(in.Mounts) != 1 {
+		t.Errorf("service mounts = %+v, want exactly the one named socket volume (no bind, no anonymous data volume)", in.Mounts)
+	}
+	for _, m := range in.Mounts {
+		if m.Type != "volume" || m.Name != svc.Name || m.Destination != gateiso.PostgresSocketDir {
+			t.Errorf("service mount %+v, want the named volume %s at %s", m, svc.Name, gateiso.PostgresSocketDir)
+		}
+	}
+	vcmd := exec.CommandContext(ctx, rt.Kind.Binary(), append(endpoint, "volume", "inspect", "--format", "{{json .Labels}}", svc.Name)...)
+	vcmd.Env = cliEnv
+	if vout, err := vcmd.Output(); err != nil || !strings.Contains(string(vout), `"`+gateiso.ServiceLabel+`":"postgres"`) {
+		t.Errorf("socket volume %s labels = %s (err %v), want %s=postgres (the manual-cleanup filter)", svc.Name, vout, err, gateiso.ServiceLabel)
+	}
+	for _, kv := range in.Config.Env {
+		if v, ok := strings.CutPrefix(kv, "POSTGRES_PASSWORD="); ok {
+			return v
+		}
+	}
+	t.Errorf("service env carries no POSTGRES_PASSWORD: %q", in.Config.Env)
+	return ""
+}
+
+// gateServiceProbeCmd is fixture (m)'s gate command. It always exits 0 and
+// prints one key=value fact per line for the assertions.
+func gateServiceProbeCmd(port int) string {
+	pg := func(key, sql string) string {
+		return `printf '` + key + `=%s\n' "$(psql -X -w -v ON_ERROR_STOP=1 "$FISHHAWK_TEST_PG_URL" -tAc "` + sql + `" 2>&1 | tr '\n' ' ')"`
+	}
+	superDSN := "postgres://postgres@/postgres?host=" + gateiso.MountPgSock + "&sslmode=disable"
+	return strings.Join([]string{
+		pg("select1", "select 1"),
+		pg("role", "select rolsuper::text || ',' || rolcreatedb::text || ',' || rolcreaterole::text from pg_roles where rolname = current_user"),
+		`printf 'createdb=%s\n' "$(psql -X -w -v ON_ERROR_STOP=1 "$FISHHAWK_TEST_PG_URL" -c 'CREATE DATABASE fh_e2e_probe' -c 'DROP DATABASE fh_e2e_probe' >/dev/null 2>&1 && echo ok || echo failed)"`,
+		pg("createrole", "CREATE ROLE fh_e2e_probe"),
+		pg("copyprogram", "COPY (SELECT 1) TO PROGRAM 'true'"),
+		`printf 'superuser=%s\n' "$(psql -X -w '` + superDSN + `' -tAc 'select 1' 2>&1 | tr '\n' ' ')"`,
+		`wget -q -T 3 -O /dev/null http://example.com/ && echo external=reached || echo external=failed`,
+		fmt.Sprintf(`wget -q -T 3 -O /dev/null http://127.0.0.1:%d/ && echo loopback=reached || echo loopback=failed`, port),
+		`printf 'ifaces=%s\n' "$(ls /sys/class/net | tr '\n' ' ')"`,
+		`for s in /var/run/docker.sock /run/docker.sock /run/podman/podman.sock; do test -e $s && echo socket=$s; done`,
+		`printf 'mountsocket=%s\n' "$(find /work /gocache /gomodcache /lintcache /run /var/run -type s 2>/dev/null | head -1)"`,
+		`printf 'pgsocket=%s\n' "$(find /pgsock -type s 2>/dev/null | tr '\n' ' ')"`,
+		`touch /pgsock/planted 2>/dev/null && echo pgsock=writable || echo pgsock=readonly`,
+		`printf 'pgsockmount=%s\n' "$(awk '$2 == "/pgsock" {print $4}' /proc/mounts)"`,
+		`printf 'passwdmount=%s\n' "$(awk '$2 == "/etc/passwd" {print $4}' /proc/mounts)"`,
+		`id -un >/dev/null 2>&1 && printf 'user=%s\n' "$(id -un)" || echo user=unresolved`,
+		`printf 'marker=%s\n' "$FISHHAWK_GATE_CONTAINER"`,
+		`echo env-begin=1; env; echo env-end=1`,
+		`echo done=ok`,
+	}, "; ")
+}
+
+// envSection returns the `env` dump fixture (m) prints between its markers.
+func envSection(out string) []string {
+	_, rest, _ := strings.Cut(out, "env-begin=1\n")
+	body, _, _ := strings.Cut(rest, "env-end=1")
+	return strings.Split(strings.TrimSpace(body), "\n")
+}
+
+// (m) TestGateContainer_PostgresServiceReachableAndContained: with
+// FISHHAWK_GATE_SERVICES=postgres, a daemon-dependent gate command reaches the
+// runner-provisioned Postgres over the injected DSN (the read-only unix-socket
+// mount) through the REAL container seam, as the least-privilege role: CREATE
+// DATABASE works, while CREATE ROLE and COPY … TO PROGRAM are refused and the
+// superuser cannot connect without the password that never enters the gate
+// (#2137 approval condition 1). The containment set still holds (no egress
+// incl. a host loopback proven live first, no eth*, no daemon socket, /pgsock
+// and /etc/passwd mounted read-only (asserted on the /proc/mounts options),
+// the caller uid resolves through the runner's passwd mount,
+// FISHHAWK_GATE_CONTAINER=1); the service itself is inspected on the host
+// before the gate exec (inspectGateService); and after the exec the service
+// container and its socket volume are gone. The counterfactual — the same
+// psql DSN with services UNSET — must FAIL, proving the success is the
+// provisioned socket and nothing else.
+func TestGateContainer_PostgresServiceReachableAndContained(t *testing.T) {
+	rt, _ := requireGateImage(t)
+	image := requirePostgresImage(t, rt)
+	port := listenLoopback(t)
+	requireLoopbackAnswers(t, port)
+
+	var logBuf strings.Builder
+	liveServiceState(t, rt, image, "postgres", &logBuf)
+	aux := recordAuxExec(t)
+	calls := recordHostExec(t)
+	var svc gateiso.PostgresService
+	var superPassword string
+	observed := 0
+	prevObs := gateServiceObserver
+	gateServiceObserver = func(ctx context.Context, r gateiso.Runtime, cliEnv []string, s gateiso.PostgresService) {
+		observed++
+		svc = s
+		superPassword = inspectGateService(t, ctx, r, cliEnv, s)
+	}
+	t.Cleanup(func() { gateServiceObserver = prevObs })
+	t.Cleanup(func() {
+		if svc.Name != "" { // belt and braces should an assertion below fail first
+			_, _ = runtimeHostCmd(t, rt, "rm", "-f", "-v", svc.Name)
+			_, _ = runtimeHostCmd(t, rt, "volume", "rm", "-f", svc.Name)
+		}
+	})
+
+	out, code := runBoundedGateCommand(context.Background(), gateServiceProbeCmd(port), t.TempDir(), filepath.Join(t.TempDir(), "lc"), 3*time.Minute)
+	if observed != 1 || svc.Name == "" {
+		t.Fatalf("gateServiceObserver called %d times (service %q), want once:\nexit %d\n%s\nlog:\n%s", observed, svc.Name, code, out, logBuf.String())
+	}
+	if code != 0 || outputField(out, "done") != "ok" {
+		t.Fatalf("exit %d:\n%s\nlog:\n%s", code, out, logBuf.String())
+	}
+
+	// The daemon-dependent command, over the injected DSN, as the gate role.
+	if got := outputField(out, "select1"); got != "1" {
+		t.Errorf("psql over FISHHAWK_TEST_PG_URL printed %q, want 1:\n%s", got, out)
+	}
+	if got := outputField(out, "role"); got != "false,true,false" {
+		t.Errorf("gate role (rolsuper,rolcreatedb,rolcreaterole) = %q, want false,true,false", got)
+	}
+	if got := outputField(out, "createdb"); got != "ok" {
+		t.Errorf("CREATE DATABASE as the gate role = %q, want ok (pgtest needs CREATEDB)", got)
+	}
+	for _, key := range []string{"createrole", "copyprogram"} {
+		if got := outputField(out, key); !strings.Contains(got, "permission denied") {
+			t.Errorf("superuser-only operation %s from the gate DSN = %q, want a permission-denied refusal", key, got)
+		}
+	}
+	if got := outputField(out, "superuser"); got == "1" || !strings.Contains(got, "password") {
+		t.Errorf("superuser connect without its password = %q, want a password-required refusal", got)
+	}
+
+	// The superuser credential never reaches the gate container.
+	if superPassword == "" {
+		t.Fatal("observer did not capture the service superuser password")
+	}
+	if strings.Contains(out, superPassword) {
+		t.Errorf("the service superuser password is visible inside the gate container:\n%s", out)
+	}
+	gateRun := containerRunArgv(t, *calls)
+	for _, tok := range gateRun {
+		if strings.Contains(tok, superPassword) {
+			t.Errorf("the gate run argv carries the superuser password: %q", tok)
+		}
+	}
+	env := envSection(out)
+	var pgURL string
+	for _, kv := range env {
+		if v, ok := strings.CutPrefix(kv, "FISHHAWK_TEST_PG_URL="); ok {
+			pgURL = v
+		}
+		if strings.HasPrefix(kv, "POSTGRES_PASSWORD=") || strings.HasPrefix(kv, "PGPASSWORD=") {
+			t.Errorf("superuser credential variable in the gate env: %s", kv)
+		}
+	}
+	if pgURL != gateiso.PostgresGateURL {
+		t.Errorf("gate FISHHAWK_TEST_PG_URL = %q, want %q", pgURL, gateiso.PostgresGateURL)
+	}
+
+	// Containment set.
+	if outputField(out, "external") != "failed" {
+		t.Errorf("external network reachable from the gate container:\n%s", out)
+	}
+	if outputField(out, "loopback") != "failed" {
+		t.Errorf("host loopback listener on 127.0.0.1:%d reachable from the gate container:\n%s", port, out)
+	}
+	for _, i := range strings.Fields(outputField(out, "ifaces")) {
+		if strings.HasPrefix(i, "eth") || strings.HasPrefix(i, "en") {
+			t.Errorf("network interface %q present in the gate container", i)
+		}
+	}
+	if got := outputField(out, "socket"); got != "" {
+		t.Errorf("daemon socket %s present inside the gate container", got)
+	}
+	if got := outputField(out, "mountsocket"); got != "" {
+		t.Errorf("unix socket %s visible outside /pgsock inside the gate container", got)
+	}
+	if got := strings.Fields(outputField(out, "pgsocket")); len(got) != 1 || got[0] != gateiso.MountPgSock+"/.s.PGSQL.5432" {
+		t.Errorf("sockets under %s = %q, want exactly the Postgres socket", gateiso.MountPgSock, got)
+	}
+	// The touch is NOT the discriminating check for `:ro`: the daemon's
+	// volume copy-up leaves the socket dir without other-write, so the gate
+	// uid cannot create a file there even on a rw mount. The mount options
+	// from /proc/mounts are what a dropped `:ro` turns red.
+	if got := outputField(out, "pgsock"); got != "readonly" {
+		t.Errorf("%s is %q from the gate container, want readonly", gateiso.MountPgSock, got)
+	}
+	for key, target := range map[string]string{"pgsockmount": gateiso.MountPgSock, "passwdmount": gateiso.MountPasswd} {
+		if got := outputField(out, key); got != "ro" && !strings.HasPrefix(got, "ro,") {
+			t.Errorf("%s mount options = %q in the gate container, want ro", target, got)
+		}
+	}
+	if got := outputField(out, "user"); got == "" || got == "unresolved" {
+		t.Errorf("caller uid %d does not resolve to a name in the gate container (passwd mount): %q", os.Getuid(), got)
+	}
+	if got := outputField(out, "marker"); got != "1" {
+		t.Errorf("FISHHAWK_GATE_CONTAINER = %q in the gate container, want 1", got)
+	}
+	if !argvHasPair(gateRun, "-v", svc.Name+":"+gateiso.MountPgSock+":ro") {
+		t.Errorf("gate run argv lacks the read-only socket mount -v %s:%s:ro: %q", svc.Name, gateiso.MountPgSock, gateRun)
+	}
+
+	// Teardown: rm -f -v then volume rm, and nothing left on the daemon.
+	var sawRemove, sawVolumeRemove bool
+	for _, c := range *aux {
+		joined := strings.Join(c, " ")
+		sawRemove = sawRemove || strings.HasSuffix(joined, " rm -f -v "+svc.Name)
+		sawVolumeRemove = sawVolumeRemove || strings.HasSuffix(joined, " volume rm -f "+svc.Name)
+	}
+	if !sawRemove || !sawVolumeRemove {
+		t.Errorf("teardown argv missing (rm -f -v: %t, volume rm: %t): %q", sawRemove, sawVolumeRemove, *aux)
+	}
+	if ps, err := runtimeHostCmd(t, rt, "ps", "-a", "--filter", "name="+svc.Name, "--format", "{{.Names}}"); err != nil || ps != "" {
+		t.Errorf("service container %s still present after the exec (err %v): %q", svc.Name, err, ps)
+	}
+	if vols, err := runtimeHostCmd(t, rt, "volume", "ls", "-q", "--filter", "name="+svc.Name); err != nil || vols != "" {
+		t.Errorf("socket volume %s still present after the exec (err %v): %q", svc.Name, err, vols)
+	}
+	log := logBuf.String()
+	for _, want := range []string{`"event":"gate_service_provisioned"`, `"event":"gate_service_removed"`} {
+		if !strings.Contains(log, want) || !strings.Contains(log, svc.Name) {
+			t.Errorf("runner log lacks %s for %s:\n%s", want, svc.Name, log)
+		}
+	}
+	for _, bad := range []string{`"event":"gate_service_cleanup_failed"`, `"event":"gate_passwd_unavailable"`} {
+		if strings.Contains(log, bad) {
+			t.Errorf("runner log carries %s:\n%s", bad, log)
+		}
+	}
+
+	// Counterfactual: the same DSN with services UNSET has no socket to reach.
+	liveServiceState(t, rt, image, "", io.Discard)
+	before := len(*aux)
+	cfCmd := `psql -X -w '` + gateiso.PostgresGateURL + `' -tAc 'select 1'`
+	cfOut, cfCode := runBoundedGateCommand(context.Background(), cfCmd, t.TempDir(), filepath.Join(t.TempDir(), "lc"), 2*time.Minute)
+	if cfCode == 0 || strings.TrimSpace(cfOut) == "1" {
+		t.Errorf("counterfactual: psql with services unset exited %d printing %q, want a connection failure", cfCode, cfOut)
+	}
+	for _, c := range (*aux)[before:] {
+		if strings.Contains(strings.Join(c, " "), gateiso.ServiceLabel) {
+			t.Errorf("counterfactual: a gate service was provisioned with services unset: %q", c)
+		}
+	}
+	dockerFixturesRan++
+}
+
+// (n) TestGateContainer_SelfHostPgtestSuite (OPT-IN on
+// FISHHAWK_GATE_SELFHOST_IMAGE): the REAL pgtest suite of this repository's
+// committed HEAD runs inside the built fishhawk-gate image through the
+// container seam with the provisioned service — pgx and golang-migrate (the
+// pgtest external branch: template bootstrap + MigrateUp + per-test databases)
+// over the unix-socket DSN as the least-privilege role. Asserts exit 0, the
+// PASS line, and no SKIP, so a silently skipped suite cannot pass. Counts
+// toward the sentinel only when opted in and executed.
+func TestGateContainer_SelfHostPgtestSuite(t *testing.T) {
+	image := os.Getenv(gateSelfHostImageEnvVar)
+	if image == "" {
+		t.Skipf("%s unset: opt-in; build the gate image (`docker buildx build --load -t fishhawk-gate:local deploy/gate-image`) and set %s=fishhawk-gate:local",
+			gateSelfHostImageEnvVar, gateSelfHostImageEnvVar)
+	}
+	rt, _ := requireGateImage(t)
+	requirePostgresImage(t, rt)
+	_, self, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller: no source path")
+	}
+	top, err := exec.Command("git", "-C", filepath.Dir(self), "rev-parse", "--show-toplevel").Output()
+	if err != nil {
+		t.Skipf("repository root not resolvable from %s: %v", self, err)
+	}
+	root := strings.TrimSpace(string(top))
+	head, err := exec.Command("git", "-C", root, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatalf("git rev-parse HEAD: %v", err)
+	}
+	checkout, err := materializeGateCheckout(context.Background(), root, strings.TrimSpace(string(head)), t.TempDir())
+	if err != nil {
+		t.Fatalf("materialize %s at HEAD: %v", root, err)
+	}
+	var logBuf strings.Builder
+	liveServiceState(t, rt, image, "postgres", &logBuf)
+	const testName = "TestSharedContainer_SharesAndIsolates"
+	cmd := `cd backend && go test -count=1 -v -run '^` + testName + `$' ./internal/pgtest/`
+	out, code := runBoundedGateCommand(context.Background(), cmd, checkout, filepath.Join(t.TempDir(), "lc"), 15*time.Minute)
+	if code != 0 {
+		t.Fatalf("in-container pgtest suite: exit %d:\n%s\nlog:\n%s", code, out, logBuf.String())
+	}
+	if !strings.Contains(out, "--- PASS: "+testName) {
+		t.Errorf("no PASS line for %s:\n%s", testName, out)
+	}
+	if strings.Contains(out, "--- SKIP") {
+		t.Errorf("the pgtest suite SKIPPED inside the gate container (a silent skip is not a pass):\n%s", out)
+	}
+	if !strings.Contains(logBuf.String(), `"event":"gate_service_removed"`) {
+		t.Errorf("runner log lacks gate_service_removed:\n%s", logBuf.String())
+	}
+	// The positive evidence an operator walk records: the in-container
+	// go test -v output with its PASS line.
+	t.Logf("in-container pgtest output:\n%s", out)
+	dockerFixturesRan++
 }

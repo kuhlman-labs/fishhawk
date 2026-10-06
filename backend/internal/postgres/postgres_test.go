@@ -1,7 +1,8 @@
 // Every top-level test in this package calls t.Parallel(): each provisions its
-// OWN throwaway Postgres container (this is the documented pgtest exemption —
-// it needs raw un-migrated databases), so there is no shared schema to race on
-// (#3881). A new test that needs t.Setenv / t.Chdir CANNOT call t.Parallel — Go
+// OWN throwaway Postgres container — or, inside the runner's gate container, its
+// own fresh raw database on the runner-provided server (#2137) — (this is the
+// documented pgtest exemption — it needs raw un-migrated databases), so there is
+// no shared schema to race on (#3881). A new test that needs t.Setenv / t.Chdir CANNOT call t.Parallel — Go
 // panics ("test using t.Setenv or t.Chdir can not use t.Parallel") — so put it
 // in (or alongside) startcontainer_test.go, which is deliberately NOT parallel.
 package postgres_test
@@ -9,7 +10,9 @@ package postgres_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
+	"net/url"
 	"os"
 	"reflect"
 	"sort"
@@ -51,12 +54,121 @@ type fataler interface {
 // registering the terminate cleanup — preserving the original ordering.
 type connStringFunc func(context.Context) (string, error)
 
-// startContainer spins up a throwaway Postgres 16 container and returns its
-// connection URL. Skips the test if Docker isn't reachable so devs without
-// Docker still pass `go test`. It is a one-line wrapper over startContainerWith,
-// which contains the error-branch leak fix (#3122); the ~30 existing callers see
-// an unchanged `func startContainer(t *testing.T) string`.
+// startContainer returns the URL of a throwaway, EMPTY (un-migrated) Postgres
+// 16 database. Normally it spins up a throwaway container; skips the test if
+// Docker isn't reachable so devs without Docker still pass `go test`. Inside
+// the runner's gate container (#2137) there is no daemon, so when the runner
+// provides FISHHAWK_TEST_PG_URL it instead creates a fresh raw database on that
+// server (see rawDBSource). The ~30 existing callers see an unchanged
+// `func startContainer(t *testing.T) string`.
 func startContainer(t *testing.T) string {
+	t.Helper()
+	return rawDBSource(t, t.Cleanup, os.Getenv, func() string {
+		t.Helper()
+		return startRawContainer(t)
+	})
+}
+
+const (
+	// externalPGURLEnv names the runner-provisioned server; gateContainerEnv
+	// is the marker the runner pins on every gate-container exec (#2137).
+	externalPGURLEnv = "FISHHAWK_TEST_PG_URL"
+	gateContainerEnv = "FISHHAWK_GATE_CONTAINER"
+
+	rawCreateAttempts = 12
+	rawCreateDelay    = 250 * time.Millisecond
+)
+
+// rawDBSource routes startContainer (#2137), in pgtest's resolveBase order:
+// FISHHAWK_SKIP_INTEGRATION set -> Skipf, before any server or container is
+// touched; FISHHAWK_TEST_PG_URL set -> a fresh raw database on that server
+// (every failure Fatalf's, never a skip: the runner promised a database);
+// FISHHAWK_GATE_CONTAINER=1 without a URL -> Fatalf naming the runner remedy,
+// container never attempted; otherwise the testcontainers path, unchanged.
+// Taking getenv instead of reading os.Getenv keeps it drivable from tests
+// without t.Setenv, which this package's parallel tests cannot call.
+func rawDBSource(f fataler, cleanup func(func()), getenv func(string) string, container func() string) string {
+	f.Helper()
+	if getenv("FISHHAWK_SKIP_INTEGRATION") != "" {
+		f.Skipf("FISHHAWK_SKIP_INTEGRATION set; skipping integration test")
+		return ""
+	}
+	if base := getenv(externalPGURLEnv); base != "" {
+		return createExternalRawDB(f, cleanup, base)
+	}
+	if getenv(gateContainerEnv) == "1" {
+		f.Fatalf("postgres tests: inside the gate container (%s=1) with no provisioned Postgres (%s unset); "+
+			"set FISHHAWK_GATE_SERVICES=postgres on the runner so it provisions one (#2137)", gateContainerEnv, externalPGURLEnv)
+		return ""
+	}
+	return container()
+}
+
+// createExternalRawDB creates an empty database fh_raw_<uuid> from template0 on
+// the server behind base, registers a WITH (FORCE) drop, and returns its URL
+// (path replaced, query — including a unix-socket host= — kept).
+func createExternalRawDB(f fataler, cleanup func(func()), base string) string {
+	f.Helper()
+	u, err := url.Parse(base)
+	if err != nil {
+		f.Fatalf("parse %s: %v", externalPGURLEnv, err)
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, base)
+	if err != nil {
+		f.Fatalf("%s is set but the provided Postgres server is unreachable (no testcontainers fallback, never skipped): %v", externalPGURLEnv, err)
+		return ""
+	}
+	defer func() { _ = conn.Close(ctx) }()
+
+	name := "fh_raw_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	create := func() error {
+		_, err := conn.Exec(ctx, "CREATE DATABASE "+pgx.Identifier{name}.Sanitize()+" TEMPLATE template0")
+		return err
+	}
+	if err := retryObjectInUse(rawCreateAttempts, rawCreateDelay, create); err != nil {
+		f.Fatalf("create raw database on %s: %v", externalPGURLEnv, err)
+		return ""
+	}
+	cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		c, err := pgx.Connect(ctx, base)
+		if err != nil {
+			return // best-effort drop; the per-exec server is discarded anyway
+		}
+		defer func() { _ = c.Close(ctx) }()
+		_, _ = c.Exec(ctx, "DROP DATABASE IF EXISTS "+pgx.Identifier{name}.Sanitize()+" WITH (FORCE)")
+	})
+	u.Path = "/" + name
+	return u.String()
+}
+
+// retryObjectInUse runs create, retrying ONLY on SQLSTATE 55006 (object_in_use,
+// a concurrently-accessed template); any other error returns immediately.
+func retryObjectInUse(attempts int, delay time.Duration, create func() error) error {
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		err := create()
+		if err == nil {
+			return nil
+		}
+		var pg *pgconn.PgError
+		if !errors.As(err, &pg) || pg.Code != "55006" {
+			return err
+		}
+		lastErr = err
+		time.Sleep(delay)
+	}
+	return fmt.Errorf("contention (55006) persisted after %d attempts: %w", attempts, lastErr)
+}
+
+// startRawContainer is the testcontainers path: a throwaway Postgres 16
+// container. It is a one-line wrapper over startContainerWith, which contains
+// the error-branch leak fix (#3122).
+func startRawContainer(t *testing.T) string {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
@@ -92,7 +204,7 @@ func startContainer(t *testing.T) string {
 // skipping/fataling — the #3122 leak fix — then, on success, registers the
 // terminate cleanup and resolves the connection URL. Splitting run/cleanup out
 // of *testing.T is what makes the error branch drivable by startcontainer_test.go
-// without Docker; startContainer passes t, t.Cleanup and a real tcpostgres.Run.
+// without Docker; startRawContainer passes t, t.Cleanup and a real tcpostgres.Run.
 func startContainerWith(
 	f fataler,
 	cleanup func(func()),
