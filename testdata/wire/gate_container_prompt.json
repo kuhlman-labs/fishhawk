@@ -1,0 +1,4 @@
+{
+  "stage_image": {"image":"ghcr.io/kuhlman-labs/fishhawk-gate@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","source":"stage"},
+  "workflow_build": {"dockerfile":"build/gate/Dockerfile","context":"build/gate","source":"workflow"}
+}
