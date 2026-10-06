@@ -1,0 +1,14 @@
+id: scenario:issue-2137/adr-063-decision-addendum-recorded
+statement: The ADR-063 record carries a Decision addendum section naming option (b) (runner-provisioned Postgres over a read-only unix-socket volume) as the chosen answer for daemon-dependent gate commands, stating the scoped mount exception and the residuals, and the ADR record gate still accepts the record.
+verify_hint: 'CLI: `scripts/check-adr` exits 0, and the stdout of reading docs/adr/063-isolate-untrusted-gate-command-execution.md contains a ''## Decision addendum (E51.4 / #2137)'' heading naming option (b).'
+steps: 'Posture B (the verify_hint names a repo-local check) on the sanctioned checkout at HEAD 52e28273, which matches the preview''s /healthz git_sha: ran scripts/check-adr and read docs/adr/063-isolate-untrusted-gate-command-execution.md.'
+assertions:
+    expected: Decision addendum naming option (b), scoped mount exception, residuals; check-adr exit 0
+    observed_at_record: 'check-adr exits 0 (''81 record(s) consistent''). Line 75 heading: ''## Decision addendum (E51.4 / #2137): daemon-dependent gate commands''. It states ''Decided: option (b), with least privilege'', rejects (a) and (c) with reasons, and describes the read-only /pgsock named-volume mount. Scoped exceptions are listed: (i) the socket volume, (ii) the read-only /etc/passwd. Residuals: a CREATEDB role on a network-less per-exec Postgres; containment fixtures skip in-container and where they keep running; RustFS S3 skipped with the patch-coverage implication; crash-orphaned services with label cleanup; RAM-backed PGDATA; fixture (n) required before enabling. File sha256 a3ae6239….'
+    repro_handle: scripts/check-adr; sed -n '75,$p' docs/adr/063-isolate-untrusted-gate-command-execution.md
+origin:
+    issue: 2137
+    pr: 0
+    run_id: d793f28e-4d75-4466-bb86-1749e9e0de07
+    head_sha: 52e282734d9ae0454e1407297718c105ef5e1005
+    recorded_at: 2026-10-06T00:07:39Z

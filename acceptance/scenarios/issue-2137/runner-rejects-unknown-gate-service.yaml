@@ -1,0 +1,14 @@
+id: scenario:issue-2137/runner-rejects-unknown-gate-service
+statement: Starting fishhawk-runner with FISHHAWK_GATE_SERVICES set to an unsupported member (e.g. redis) fails at startup before any backend contact with the usage exit code, and its runner_failed reason=config output names FISHHAWK_GATE_SERVICES and the valid value postgres.
+verify_hint: 'CLI exit code + stderr/stdout of the fishhawk-runner binary started with FISHHAWK_GATE_SERVICES=redis (no backend needed: the config error fires before backend contact); decided by that exit code and the runner_failed reason=config log line.'
+steps: 'Built fishhawk-runner from the sanctioned checkout (cd runner && go build -o /tmp/fh2137/fishhawk-runner ./cmd/fishhawk-runner). Ran FISHHAWK_GATE_SERVICES=redis ./fishhawk-runner --run-id 11111111-2222-3333-4444-555555555555 --backend-url http://localhost:8090 --workflow feature_change --stage plan, then the same with ''postgres,redis''. Controls: FISHHAWK_GATE_SERVICES=postgres, and no services with FISHHAWK_GATE_ISOLATION=clone. Compared preview request-log line counts before and after. Also ran the run-level test TestRun_GateIsolationConfigErrorsExitUsage (all rows pass with the ambient FISHHAWK_FORGE_WRITES unset).'
+assertions:
+    expected: usage exit code before any backend contact; runner_failed reason=config naming FISHHAWK_GATE_SERVICES and postgres
+    observed_at_record: 'redis and postgres,redis: exit 2 (exitUsage = 2 in main.go). Output was runner_started, then {"event":"runner_failed","reason":"config","detail":"FISHHAWK_GATE_SERVICES: unknown gate service \"redis\" (valid: postgres)"}, with no forge_writes_healthz_probe and no other backend contact. The postgres control got past config (gate_isolation_configured services=postgres) to the /healthz probe. The preview log grew by exactly the 2 probes from the two control runs.'
+    repro_handle: FISHHAWK_GATE_SERVICES=redis /tmp/fh2137/fishhawk-runner --run-id 11111111-2222-3333-4444-555555555555 --backend-url http://localhost:8090 --workflow feature_change --stage plan; echo $?
+origin:
+    issue: 2137
+    pr: 0
+    run_id: d793f28e-4d75-4466-bb86-1749e9e0de07
+    head_sha: 52e282734d9ae0454e1407297718c105ef5e1005
+    recorded_at: 2026-10-06T00:07:39Z
