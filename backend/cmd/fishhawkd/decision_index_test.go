@@ -183,8 +183,12 @@ func TestDecisionIndexCommand_CheckExitsNonZeroOnGaps(t *testing.T) {
 
 // TestDecisionIndexCommand_CheckOrphansDoNotFail pins #3730 approval condition
 // 6 at the CLI: an entry whose run row is absent is reported as orphaned and
-// check still exits 0. The orphan is seeded by construction (FK triggers
-// disabled for one transaction), since audit_entries.run_id is RESTRICT.
+// check still exits 0. The orphan is seeded by construction, since
+// audit_entries.run_id is RESTRICT: one transaction drops the run_id FK,
+// inserts the orphan and re-adds the FK NOT VALID, so the orphan survives and
+// later inserts are checked again. That needs table ownership, not superuser
+// (#4050): the host path's superuser has it, and so does the container gate
+// role, which owns the template-cloned tables.
 func TestDecisionIndexCommand_CheckOrphansDoNotFail(t *testing.T) {
 	dbURL := pgtest.NewURL(t)
 	ctx := context.Background()
@@ -197,13 +201,20 @@ func TestDecisionIndexCommand_CheckOrphansDoNotFail(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := tx.Exec(ctx, `SET LOCAL session_replication_role = replica`); err != nil {
-		t.Fatal(err)
+	// A failed seed must release the pooled connection, or pool.Close blocks
+	// forever (#4050).
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `ALTER TABLE audit_entries DROP CONSTRAINT audit_entries_run_id_fkey`); err != nil {
+		t.Fatalf("drop run_id FK: %v", err)
 	}
 	var seq int64
 	if err := tx.QueryRow(ctx, `INSERT INTO audit_entries (id, run_id, category, payload, entry_hash)
 		VALUES ($1, $2, 'merge_verdict_recorded', '{}', 'h') RETURNING sequence`, uuid.New(), uuid.New()).Scan(&seq); err != nil {
 		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `ALTER TABLE audit_entries ADD CONSTRAINT audit_entries_run_id_fkey
+		FOREIGN KEY (run_id) REFERENCES runs (id) ON DELETE RESTRICT NOT VALID`); err != nil {
+		t.Fatalf("restore run_id FK: %v", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		t.Fatal(err)

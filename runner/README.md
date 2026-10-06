@@ -383,8 +383,12 @@ container exec gets its own Postgres service: a fresh labelled named volume
 --cap-drop=ALL --security-opt=no-new-privileges --user postgres` with no
 published port, no host path and PGDATA on a RAM-backed, uncapped tmpfs (a
 stated residual), readiness (logs FIRST for
-the init-complete line, then `pg_isready`), a bootstrap of the
-least-privilege `CREATEDB`-only role `fishhawk`, the socket volume mounted
+the init-complete line, then `pg_isready`), a bootstrap of the role
+`fishhawk` (`LOGIN CREATEDB CREATEROLE BYPASSRLS NOSUPERUSER NOREPLICATION`,
+#4050: the backend suite needs RLS bypass and probe-role creation;
+`NOSUPERUSER` closes the escape route, PostgreSQL 16's `CREATEROLE` bound is
+enforced by a bootstrap version guard that refuses a pre-16 image, and
+`BYPASSRLS` affects row visibility only), the socket volume mounted
 READ-ONLY at `/pgsock` with
 `FISHHAWK_TEST_PG_URL=postgres://fishhawk:fishhawk@/fishhawk?host=/pgsock&sslmode=disable`
 pinned last, and `rm -f -v` + `volume rm -f` on every exit. The superuser

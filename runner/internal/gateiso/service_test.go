@@ -68,7 +68,8 @@ func TestPostgresServiceArgv_Golden(t *testing.T) {
 		{"ready", s.ReadyArgv, []string{"exec", s.Name, "pg_isready", "-h", "/var/run/postgresql", "-U", "postgres", "-d", "postgres"}},
 		{"bootstrap", s.BootstrapArgv, []string{"exec", "-e", "PGPASSWORD=s3cret", s.Name,
 			"psql", "-X", "-v", "ON_ERROR_STOP=1", "-h", "/var/run/postgresql", "-U", "postgres", "-d", "postgres",
-			"-c", "CREATE ROLE fishhawk LOGIN CREATEDB NOSUPERUSER NOCREATEROLE NOBYPASSRLS NOREPLICATION PASSWORD 'fishhawk'",
+			"-c", "DO $$BEGIN IF current_setting('server_version_num')::int < 160000 THEN RAISE EXCEPTION 'gate service Postgres must be 16 or newer (server_version_num %): the gate role holds CREATEROLE, which only PostgreSQL 16 bounds', current_setting('server_version_num'); END IF; END$$",
+			"-c", "CREATE ROLE fishhawk LOGIN CREATEDB CREATEROLE BYPASSRLS NOSUPERUSER NOREPLICATION PASSWORD 'fishhawk'",
 			"-c", "CREATE DATABASE fishhawk OWNER fishhawk"}},
 		{"rm", s.RemoveArgv, []string{"rm", "-f", "-v", s.Name}},
 		{"volume rm", s.VolumeRemoveArgv, []string{"volume", "rm", "-f", s.Name}},
@@ -236,23 +237,11 @@ func runArgv(t *testing.T, env []string, d time.Duration, argv []string) (string
 	return string(out), rerr
 }
 
-// TestPostgresService_LiveLeastPrivilegeOverReadOnlySocket drives the real
-// service lifecycle through this file's argv builders and a gate container
-// rendered by BuildArgv (passwd file + read-only socket mount + service env),
-// then asserts from the gate's DSN: SELECT and CREATE DATABASE work, while
-// CREATE ROLE, COPY … TO PROGRAM and a passwordless superuser connection are
-// refused, /pgsock is read-only, the caller uid resolves and the marker is
-// pinned. Host side: the service carries exactly one mount (the named socket
-// volume — no anonymous PGDATA volume, no bind), and teardown leaves neither
-// the container nor the volume.
-func TestPostgresService_LiveLeastPrivilegeOverReadOnlySocket(t *testing.T) {
-	svc := NewPostgresService("")
-	rt, env := liveRuntime(t, svc.Image)
-	ep, _ := rt.EndpointArgs()
-	host := func(args ...string) string {
-		out, _ := runLive(t, rt, env, 30*time.Second, append(append([]string{}, ep...), args...)...)
-		return strings.TrimSpace(out)
-	}
+// startLiveService creates the socket volume, runs the service (removing
+// both on cleanup) and waits for readiness: the init-complete log line, then
+// a successful pg_isready.
+func startLiveService(t *testing.T, svc PostgresService, rt Runtime, env []string, host func(...string) string) {
+	t.Helper()
 	if out, err := runArgv(t, env, time.Minute, must(t)(svc.VolumeCreateArgv(rt))); err != nil {
 		t.Fatalf("volume create: %v: %s", err, out)
 	}
@@ -263,20 +252,53 @@ func TestPostgresService_LiveLeastPrivilegeOverReadOnlySocket(t *testing.T) {
 	if out, err := runArgv(t, env, 3*time.Minute, must(t)(svc.RunArgv(rt))); err != nil {
 		t.Fatalf("service run: %v: %s", err, out)
 	}
-	ready := false
 	for deadline := time.Now().Add(90 * time.Second); time.Now().Before(deadline); time.Sleep(250 * time.Millisecond) {
 		logs, _ := runArgv(t, env, 30*time.Second, must(t)(svc.LogsArgv(rt)))
 		if !PostgresInitComplete(logs) {
 			continue
 		}
 		if _, err := runArgv(t, env, 30*time.Second, must(t)(svc.ReadyArgv(rt))); err == nil {
-			ready = true
-			break
+			return
 		}
 	}
-	if !ready {
-		t.Fatalf("service never ready: %s", host("logs", svc.Name))
+	t.Fatalf("service never ready: %s", host("logs", svc.Name))
+}
+
+// liveHost returns a runner for host-side runtime commands (trimmed output).
+func liveHost(t *testing.T, rt Runtime, env []string) func(...string) string {
+	ep, _ := rt.EndpointArgs()
+	return func(args ...string) string {
+		out, _ := runLive(t, rt, env, 30*time.Second, append(append([]string{}, ep...), args...)...)
+		return strings.TrimSpace(out)
 	}
+}
+
+// probeLine returns the gate output line reporting probe name ("name=…").
+func probeLine(out, name string) string {
+	for _, l := range strings.Split(out, "\n") {
+		if strings.HasPrefix(l, name+"=") {
+			return l
+		}
+	}
+	return ""
+}
+
+// TestPostgresService_LiveLeastPrivilegeOverReadOnlySocket drives the real
+// service lifecycle through this file's argv builders and a gate container
+// rendered by BuildArgv (passwd file + read-only socket mount + service env),
+// then asserts from the gate's DSN: SELECT, CREATE DATABASE, CREATE ROLE and
+// an insert into a FORCE ROW LEVEL SECURITY table with no policy (BYPASSRLS,
+// #4050) work, while granting pg_execute_server_program, creating a
+// superuser, altering the superuser, COPY … TO PROGRAM and a passwordless
+// superuser connection are refused, /pgsock is read-only, the caller uid
+// resolves and the marker is pinned. Host side: the service carries exactly
+// one mount (the named socket volume — no anonymous PGDATA volume, no bind),
+// and teardown leaves neither the container nor the volume.
+func TestPostgresService_LiveLeastPrivilegeOverReadOnlySocket(t *testing.T) {
+	svc := NewPostgresService("")
+	rt, env := liveRuntime(t, svc.Image)
+	host := liveHost(t, rt, env)
+	startLiveService(t, svc, rt, env, host)
 	if out, err := runArgv(t, env, time.Minute, must(t)(svc.BootstrapArgv(rt))); err != nil {
 		t.Fatalf("bootstrap: %v: %s", err, out)
 	}
@@ -298,10 +320,18 @@ func TestPostgresService_LiveLeastPrivilegeOverReadOnlySocket(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	script := `psql "$FISHHAWK_TEST_PG_URL" -tAc 'select 1'; echo "sel=$?"
-psql "$FISHHAWK_TEST_PG_URL" -qtAc 'create database fh_live_probe'; echo "createdb=$?"
-psql "$FISHHAWK_TEST_PG_URL" -tAc 'create role fh_live_x'; echo "createrole=$?"
-psql "$FISHHAWK_TEST_PG_URL" -tAc "copy (select 1) to program 'true'"; echo "copyprogram=$?"
+	// probe prints one line per statement: "<name>=<psql exit> <output>",
+	// with the output's newlines folded so each assertion binds to its probe.
+	script := `set -f
+probe() { r=$(psql "$FISHHAWK_TEST_PG_URL" -tAc "$2" 2>&1); c=$?; echo "$1=$c" $r; }
+probe sel 'select 1'
+probe createdb 'create database fh_live_probe'
+probe createrole 'create role fh_live_x'
+probe bypassrls 'create table fh_rls (x int); alter table fh_rls enable row level security; alter table fh_rls force row level security; insert into fh_rls values (1)'
+probe grantexec 'grant pg_execute_server_program to current_user'
+probe createsuper 'create role fh_live_super superuser'
+probe altersuper "alter role postgres password 'x'"
+probe copyprogram "copy (select 1) to program 'true'"
 psql -w 'postgres://postgres@/postgres?host=/pgsock&sslmode=disable' -tAc 'select 1'; echo "superuser=$?"
 touch /pgsock/planted; echo "touch=$?"
 echo "user=$(id -un)" "marker=$FISHHAWK_GATE_CONTAINER"`
@@ -314,8 +344,26 @@ echo "user=$(id -un)" "marker=$FISHHAWK_GATE_CONTAINER"`
 		Argv: []string{"sh", "-c", script},
 	}
 	out, _ := runArgv(t, env, 2*time.Minute, must(t)(spec.BuildArgv(MountPolicy{Permitted: []string{m.root}, DaemonSocket: rt.SocketPath})))
-	for _, want := range []string{"sel=0", "createdb=0", "createrole=1", "permission denied to create role",
-		"copyprogram=1", "pg_execute_server_program", "superuser=2", "touch=1", "user=gatecaller", "marker=1"} {
+	for _, p := range []struct{ name, exit, want string }{
+		{"sel", "0", "1"},
+		{"createdb", "0", "CREATE DATABASE"},
+		// CREATEROLE (#4050): the backend's RLS tests create NOBYPASSRLS probe roles.
+		{"createrole", "0", "CREATE ROLE"},
+		// BYPASSRLS (#4050): FORCE RLS with no policy rejects every row for a
+		// NOBYPASSRLS role, the owner included.
+		{"bypassrls", "0", "INSERT 0 1"},
+		// NOSUPERUSER + PostgreSQL 16's CREATEROLE bound: no escalation.
+		{"grantexec", "1", "ADMIN option"},
+		{"createsuper", "1", "permission denied to create role"},
+		{"altersuper", "1", "permission denied to alter role"},
+		{"copyprogram", "1", "pg_execute_server_program"},
+	} {
+		line := probeLine(out, p.name)
+		if !strings.HasPrefix(line, p.name+"="+p.exit+" ") || !strings.Contains(line, p.want) {
+			t.Errorf("probe %s = %q, want exit %s with %q; gate output:\n%s", p.name, line, p.exit, p.want, out)
+		}
+	}
+	for _, want := range []string{"superuser=2", "touch=1", "user=gatecaller", "marker=1"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("gate output lacks %q:\n%s", want, out)
 		}
@@ -332,6 +380,28 @@ echo "user=$(id -un)" "marker=$FISHHAWK_GATE_CONTAINER"`
 	}
 	if left := host("volume", "ls", "-q", "--filter", "name="+svc.Name); left != "" {
 		t.Errorf("service volume left after teardown: %q", left)
+	}
+}
+
+// TestPostgresService_LiveBootstrapRefusesPrePG16 runs the real bootstrap
+// against PostgreSQL 15, where every other bootstrap statement is valid: the
+// version guard is the only thing that can fail it. It must exit non-zero
+// naming the floor and leave no gate role, because a pre-16 CREATEROLE can
+// grant pg_execute_server_program (#4050).
+func TestPostgresService_LiveBootstrapRefusesPrePG16(t *testing.T) {
+	svc := NewPostgresService("postgres:15-alpine")
+	rt, env := liveRuntime(t, svc.Image)
+	host := liveHost(t, rt, env)
+	startLiveService(t, svc, rt, env, host)
+	out, err := runArgv(t, env, time.Minute, must(t)(svc.BootstrapArgv(rt)))
+	if err == nil || !strings.Contains(out, "16 or newer") {
+		t.Errorf("bootstrap on PostgreSQL 15: err %v, output %q; want a non-zero exit naming '16 or newer'", err, out)
+	}
+	roles := host("exec", "-e", "PGPASSWORD="+svc.superPassword, svc.Name,
+		"psql", "-X", "-h", PostgresSocketDir, "-U", postgresSuperuser, "-d", "postgres",
+		"-tAc", "select count(*) from pg_roles where rolname = '"+PostgresGateRole+"'")
+	if roles != "0" {
+		t.Errorf("gate roles after a refused bootstrap = %q, want 0", roles)
 	}
 }
 
