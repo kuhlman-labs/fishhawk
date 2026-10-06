@@ -441,11 +441,15 @@ as before (sanitized → isolated lint cache → `extraEnv` drop-then-append) an
 is what the gate sees on EVERY path; then the process-wide selection
 (`gateisolation.go::gateIsolationState.selection`, decided ONCE per process on
 the first gate exec from `FISHHAWK_GATE_ISOLATION` × `FISHHAWK_DEPLOYMENT_PROFILE`
-× `FISHHAWK_GATE_IMAGE` × the detected runtime × the sandbox probe; the
+× the image request (the declared `gate_container` the fetched prompt carried
+— `gateIsolationState.declare`, called by `run()` right after
+`fetchPromptToFile` — else `FISHHAWK_GATE_IMAGE`) × its `EvaluateImagePolicy`
+verdict under `FISHHAWK_GATE_IMAGE_ALLOWLIST` / `FISHHAWK_GATE_BUILD` × the
+detected runtime × the sandbox probe; the
 container path additionally reads `FISHHAWK_GATE_SERVICES` /
 `FISHHAWK_GATE_POSTGRES_IMAGE`, parsed by `configureGateIsolation` with the
-others, so an unknown service fails startup like a bad mode —
-`TestRun_GateIsolationConfigErrorsExitUsage`'s `unknown gate service` row) routes:
+others, so an unknown service or allowlist entry fails startup like a bad mode —
+`TestRun_GateIsolationConfigErrorsExitUsage`'s rows) routes:
 
 - **refused** → the refusal text (`gate isolation refused: …`) and `-1`
   WITHOUT executing; the gates classify it **category C** — never an infra
@@ -497,7 +501,22 @@ others, so an unknown service fails startup like a bad mode —
   gates cannot redirect a bind-mount request to a daemon the selection never
   validated), and `rm -f` under the same binding on a detached bounded
   context whenever the exec returned `-1` (killing the CLI does not stop the
-  container);
+  container). For a DECLARED `gate_container` (E51.3 / #2136; the
+  `FISHHAWK_GATE_IMAGE` path stays byte-identical) `runGateInContainer` first
+  resolves the image (`resolveDeclaredImage`): an inspect / pull of a declared
+  `image:` run by `name@<registry digest>`, or an in-repo build of the
+  COMMITTED context at the checkout's HEAD after the static Dockerfile guard,
+  every runtime call through `execGateAuxArgvFn` under its own bound outside
+  the gate timeout. A refused source, Dockerfile or base is `gateRefused`
+  before any build call; any pull, inspect, digest or build failure is
+  `gateUnavailable`; the gate argv never runs on either. The resolved image is
+  recorded under a mutex (`recordResolved`); `runVerifyCommittedTree` marks its
+  gate `withDecidingGate`, so the `gate_isolation` evidence carries the FINAL
+  DECIDING verify gate's image plus `distinct_images_count` when the stage ran
+  more than one (`TestRunVerifyCommittedTree_IsTheDecidingGate`,
+  `TestGateIsolationEvidence_FinalDecidingGateImage`), and
+  `TestRun_DeclaredGateContainerReachesGateEvidence` pins the prompt golden →
+  `declare` → selection → shipped evidence path end to end;
 - **clone-sandbox** → `gateiso.WrapSandbox(argv)` (Linux `unshare -rn`) on the host;
 - **clone** → the argv on the host — the pre-#2134 behaviour, and what the
   nil (unconfigured) state selects, so every direct `runBoundedGateCommand`

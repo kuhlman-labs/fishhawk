@@ -15,6 +15,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/runner/internal/constraint"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/gateiso"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/gitops"
+	"github.com/kuhlman-labs/fishhawk/runner/internal/upload"
 )
 
 // diffOf builds a constraint.Diff of modified files for makeGitDiffEvent.
@@ -871,13 +872,55 @@ func TestComposeGateEvidence_ApprovalConditionResponses(t *testing.T) {
 // gate_isolation member (#2135)
 // ---------------------------------------------------------------------------
 
-// gateIsolationGoldenSelections are the three fixed selections the SHARED
-// golden testdata/wire/gate_isolation_evidence.json pins, one per class. Each
-// is produced by the real gateiso.Select, so the golden tracks Select's text.
+// Fixed image identities the gate_container golden members (E51.3 / #2136)
+// carry: a registry digest, a runtime-local image id and a build content
+// digest, each a distinct realistic sha256.
+const (
+	goldenImageDigest   = "sha256:9b2e6d1c4a7f30e8b5c2d9f4a1e6b3c8d7f0a2e5b9c4d1f6a3e8b2c7d0f5a9e4"
+	goldenImageID       = "sha256:3c1f8a6e2d9b4f7a0e5c8d3b6f1a9e4c7d2b5f8a1e6c9d4b7f0a3e8c2d5b9f6a"
+	goldenContextDigest = "sha256:e7a4c1f9d6b3e0a8c5f2d9b6e3a0c7f4d1b8e5a2c9f6d3b0e7a4c1f8d5b2e9a6"
+)
+
+// gateIsolationGoldenSelections are the six fixed selections the SHARED golden
+// testdata/wire/gate_isolation_evidence.json pins: one per class (#2135), plus
+// a declared pulled image, a declared in-repo build and a declared image that
+// ran on the host fallback (E51.3 / #2136). Each is produced by the real
+// gateiso.Select (and, for the warning, the real EvaluateImagePolicy), so the
+// golden tracks their text; the runner fills ResolvedImage and
+// DistinctImagesCount after resolution, exactly as recordedSelection does.
 func gateIsolationGoldenSelections() map[string]gateiso.Selection {
 	const image = "ghcr.io/kuhlman-labs/fishhawk-gate:main"
 	const podSock = "/run/user/1000/podman/podman.sock"
+	const dockSock = "/var/run/docker.sock"
+	dockerSafe := gateiso.Runtime{Kind: gateiso.KindDocker, Safe: true, Version: "27.3.1",
+		Reason:     "docker 27.3.1 over local unix socket " + dockSock,
+		Endpoint:   gateiso.Endpoint{Raw: "unix://" + dockSock, Scheme: "unix", Path: dockSock, Local: true},
+		SocketPath: dockSock}
+
+	const tagged = "ghcr.io/acme/gate:1.4"
+	taggedReq := gateiso.ImageRequest{Source: gateiso.ImageSourceStage, Image: tagged}
+	declared := gateiso.Select(gateiso.Inputs{Mode: gateiso.ModeAuto, Profile: gateiso.ProfileSelfHosted, Image: tagged,
+		Runtime: dockerSafe, Sandbox: gateiso.SandboxProbe{Available: true},
+		ImageSource:   gateiso.ImageSourceStage,
+		PolicyWarning: gateiso.EvaluateImagePolicy(gateiso.ProfileSelfHosted, taggedReq, nil, true).Warning})
+	declared.ResolvedImage = &gateiso.ResolvedImage{Ref: "ghcr.io/acme/gate@" + goldenImageDigest, Digest: goldenImageDigest, ImageID: goldenImageID}
+
+	built := gateiso.Select(gateiso.Inputs{Mode: gateiso.ModeAuto, Profile: gateiso.ProfileLocal,
+		Runtime: dockerSafe, Sandbox: gateiso.SandboxProbe{Reason: "unshare unavailable on darwin (ADR-063 gap)"},
+		Build: true, ImageSource: gateiso.ImageSourceWorkflow})
+	built.ResolvedImage = &gateiso.ResolvedImage{Ref: gateiso.BuildTag(goldenContextDigest), ImageID: goldenImageID,
+		BuildDockerfile: "build/gate/Dockerfile", BuildContext: "build/gate", ContextDigest: goldenContextDigest}
+	built.DistinctImagesCount = 2
+
+	unhonored := gateiso.Select(gateiso.Inputs{Mode: gateiso.ModeAuto, Profile: gateiso.ProfileLocal,
+		Image:   "ghcr.io/acme/gate@" + goldenImageDigest,
+		Runtime: gateiso.Runtime{Kind: gateiso.KindNone, Reason: "no container runtime on PATH (docker or podman)"},
+		Sandbox: gateiso.SandboxProbe{Reason: "unshare unavailable on darwin (ADR-063 gap)"}, ImageSource: gateiso.ImageSourceStage})
+
 	return map[string]gateiso.Selection{
+		"container_declared":          declared,
+		"container_build":             built,
+		"fallback_declared_unhonored": unhonored,
 		"fallback": gateiso.Select(gateiso.Inputs{Mode: gateiso.ModeAuto, Profile: gateiso.ProfileLocal,
 			Runtime: gateiso.Runtime{Kind: gateiso.KindNone, Reason: "no container runtime on PATH (docker or podman)"},
 			Sandbox: gateiso.SandboxProbe{Reason: "unshare unavailable on darwin (ADR-063 gap)"}}),
@@ -912,21 +955,34 @@ func gateIsolationGolden(t *testing.T) map[string]json.RawMessage {
 	return m
 }
 
+// gateIsolationGoldenClasses maps every shared-golden member to its class.
+var gateIsolationGoldenClasses = map[string]string{
+	"fallback":                    "fallback",
+	"refused":                     "refused",
+	"container":                   "container",
+	"container_declared":          "container",
+	"container_build":             "container",
+	"fallback_declared_unhonored": "fallback",
+}
+
 // TestGateIsolationEvidence_MatchesSharedWireGolden pins the runner half of the
-// cross-module contract on FIXED BYTES for all three classes: the flattened
+// cross-module contract on FIXED BYTES for all six members: the flattened
 // member marshals byte-equal to the shared golden, and the composed
 // gate_evidence payload carries it verbatim under gate_isolation. The backend's
 // bundle_test decodes the same file.
 func TestGateIsolationEvidence_MatchesSharedWireGolden(t *testing.T) {
 	golden := gateIsolationGolden(t)
 	sels := gateIsolationGoldenSelections()
-	for _, class := range []string{"fallback", "refused", "container"} {
-		t.Run(class, func(t *testing.T) {
-			want, ok := golden[class]
+	if len(golden) != len(gateIsolationGoldenClasses) || len(sels) != len(gateIsolationGoldenClasses) {
+		t.Fatalf("golden has %d members, selections %d, want %d each", len(golden), len(sels), len(gateIsolationGoldenClasses))
+	}
+	for member, class := range gateIsolationGoldenClasses {
+		t.Run(member, func(t *testing.T) {
+			want, ok := golden[member]
 			if !ok {
-				t.Fatalf("shared golden has no %q variant", class)
+				t.Fatalf("shared golden has no %q variant", member)
 			}
-			iso := newGateIsolationEvidence(sels[class])
+			iso := newGateIsolationEvidence(sels[member])
 			got, err := json.Marshal(iso)
 			if err != nil {
 				t.Fatal(err)
@@ -1049,5 +1105,132 @@ func TestGateIsolationEvidence_IsolationOnlyCarriesNoGateVerdict(t *testing.T) {
 	}
 	if len(p.VerifyRuns) != 0 || p.VerifySummary != nil || len(p.PolicyViolations) != 0 || p.DiffCoverage != nil {
 		t.Errorf("an isolation-only payload must carry no gate verdict: %s", ev.Payload)
+	}
+}
+
+// TestGateIsolationEvidence_FinalDecidingGateImage (approval condition 4,
+// evidence half): when a stage's gates resolved two different images, the
+// flattened evidence carries the FINAL DECIDING verify gate's image — not the
+// later non-deciding gate's — plus distinct_images_count. A deciding gate
+// whose resolution FAILED leaves no image fields, never an earlier gate's.
+func TestGateIsolationEvidence_FinalDecidingGateImage(t *testing.T) {
+	const digestB = "sha256:" + "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0"
+	st := &gateIsolationState{sel: gateIsolationGoldenSelections()["container_declared"]}
+	st.sel.ResolvedImage, st.sel.DistinctImagesCount = nil, 0
+	st.seamReached.Store(true)
+
+	st.noteDeclaredGate(true)
+	st.recordResolved(gateiso.ResolvedImage{Ref: "ghcr.io/acme/gate@" + goldenImageDigest, Digest: goldenImageDigest, ImageID: goldenImageID}, true)
+	st.recordResolved(gateiso.ResolvedImage{Ref: "ghcr.io/acme/gate@" + digestB, Digest: digestB, ImageID: "sha256:" + strings.Repeat("2", 64)}, false)
+	ev := gateIsolationEvidenceFor(st)
+	if ev == nil || ev.ImageDigest != goldenImageDigest || ev.ImageID != goldenImageID || ev.DistinctImagesCount != 2 {
+		t.Fatalf("evidence = %+v, want the deciding gate's digest/id and distinct_images_count 2", ev)
+	}
+
+	st.noteDeclaredGate(true) // a later deciding gate whose resolution fails
+	ev = gateIsolationEvidenceFor(st)
+	if ev == nil || ev.ImageDigest != "" || ev.ImageID != "" || ev.BuildContextDigest != "" || ev.DistinctImagesCount != 2 {
+		t.Errorf("evidence = %+v, want no image fields after a failed deciding resolution (count kept)", ev)
+	}
+}
+
+// TestGateIsolationEvidence_DeclaredFieldsRedacted: a token-shaped literal
+// reaching any new free-text field (seeded BY CONSTRUCTION) is redacted before
+// it is carried.
+func TestGateIsolationEvidence_DeclaredFieldsRedacted(t *testing.T) {
+	secret := "ghp_" + strings.Repeat("q", 36)
+	sel := gateIsolationGoldenSelections()["container_build"]
+	sel.PolicyWarning = "warning " + secret
+	sel.DeclaredUnhonored = "unhonored " + secret
+	sel.ResolvedImage.BuildDockerfile = "ci/" + secret + "/Dockerfile"
+	sel.ResolvedImage.BuildContext = "ci/" + secret
+	ev := newGateIsolationEvidence(sel)
+	b, _ := json.Marshal(ev)
+	if bytes.Contains(b, []byte(secret)) {
+		t.Fatalf("gate_isolation carries an unredacted credential:\n%s", b)
+	}
+	for name, v := range map[string]string{"policy_warning": ev.PolicyWarning, "declared_unhonored": ev.DeclaredUnhonored, "build_dockerfile": ev.BuildDockerfile, "build_context": ev.BuildContext} {
+		if !strings.Contains(v, "REDACTED") {
+			t.Errorf("%s = %q, want a redaction marker", name, v)
+		}
+	}
+}
+
+// gateContainerPromptGolden decodes one member of the SHARED prompt-wire golden
+// testdata/wire/gate_container_prompt.json (E51.3 / #2136) — the bytes the
+// backend's prompt handler emits as gate_container.
+func gateContainerPromptGolden(t *testing.T, member string) *upload.GateContainerConfig {
+	t.Helper()
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller")
+	}
+	raw, err := os.ReadFile(filepath.Join(filepath.Dir(thisFile), "..", "..", "..", "testdata", "wire", "gate_container_prompt.json"))
+	if err != nil {
+		t.Fatalf("read shared prompt golden: %v", err)
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatalf("decode shared prompt golden: %v", err)
+	}
+	var gc upload.GateContainerConfig
+	if err := json.Unmarshal(m[member], &gc); err != nil || gc.Source == "" {
+		t.Fatalf("decode member %q: %v / %+v", member, err, gc)
+	}
+	return &gc
+}
+
+// TestRun_DeclaredGateContainerReachesGateEvidence is the cross-boundary
+// end-to-end pin (E51.3 / #2136): the backend's prompt golden (stage_image)
+// is served by the fake prompt fetch, run() declares it, the committed-tree
+// verify gate's selection records it, and the RAW bundle shipped to the
+// backend carries image_source=stage and the declared_unhonored marker
+// (FISHHAWK_GATE_ISOLATION=clone, so the declared image is not honoured).
+// Not t.Parallel: it uses t.Setenv.
+func TestRun_DeclaredGateContainerReachesGateEvidence(t *testing.T) {
+	for _, k := range []string{gateImageEnvVar, deploymentProfileEnvVar, gateServicesEnvVar, gatePostgresImageEnvVar, gateImageAllowlistEnvVar, gateBuildEnvVar} {
+		t.Setenv(k, "")
+	}
+	t.Setenv(gateIsolationModeEnvVar, "clone")
+	repo := verifyFixBaseRepo(t)
+	mustWrite(t, filepath.Join(repo, "mod", "reg.go"), regGetFixed)
+	withFakeInvoker(t, &fakeInvoker{mirrorWorkingTreeFrom: repo, canned: agent.Result{OK: true, Events: []agent.Event{{Kind: "invocation_start"}}}})
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	fu := newFakeUploader(t)
+	fu.promptResp = &upload.FetchedPrompt{
+		StageID:       verifyFixStageID,
+		StageType:     "implement",
+		Prompt:        "implement",
+		PromptHash:    "h",
+		VerifyCommand: "true",
+		ScopeFiles:    []upload.ScopeFile{{Path: "mod/reg.go", Operation: "modify"}},
+		GateContainer: gateContainerPromptGolden(t, "stage_image"),
+	}
+	withFakeUploader(t, fu)
+	withFakeGitOps(t, &fakePusher{}, &fakePROpener{})
+
+	bundlePath := filepath.Join(t.TempDir(), "trace.jsonl.gz")
+	var stderr strings.Builder
+	if got := run(verifyFixRunArgs(repo, bundlePath), &stderr); got != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+	}
+	var rawBundle []byte
+	for _, c := range fu.gotShipCalls {
+		if c.Variant == "raw" {
+			rawBundle = c.Bundle
+		}
+	}
+	if rawBundle == nil {
+		t.Fatalf("no raw bundle shipped (calls=%d):\n%s", len(fu.gotShipCalls), stderr.String())
+	}
+	p, raw := gateEvidencePayloadFromBundle(t, rawBundle)
+	gi := p.GateIsolation
+	if gi == nil {
+		t.Fatalf("raw bundle gate_evidence carries no gate_isolation member:\n%s", raw)
+	}
+	if gi.Path != "clone" || gi.ImageSource != gateiso.ImageSourceStage ||
+		!strings.Contains(gi.Image, "ghcr.io/kuhlman-labs/fishhawk-gate@sha256:") ||
+		!strings.Contains(gi.DeclaredUnhonored, "gate_container declared (stage) but not honoured") {
+		t.Errorf("gate_isolation = %+v, want path clone, image_source stage, the declared image and a declared_unhonored marker", gi)
 	}
 }

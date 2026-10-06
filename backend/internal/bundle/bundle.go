@@ -399,6 +399,15 @@ type GateEvidence struct {
 // the container | fallback | refused class, ContainerUnavailable why the
 // container path was not taken (empty on the container path).
 //
+// The fields after ContainerUnavailable (E51.3 / #2136) record a gate_container
+// declaration and are all omitempty, so an undeclared stage decodes and
+// re-encodes byte-identical to its #2135 form: ImageSource (stage | workflow |
+// env), the image the FINAL DECIDING gate resolved (ImageDigest for a pulled
+// image, ImageID the runtime's opaque local id, the Build* fields for an
+// in-repo build), DistinctImagesCount when the stage's gates ran in more than
+// one image, PolicyWarning, and DeclaredUnhonored when a declared image was
+// not honoured because the gate ran on a host fallback path.
+//
 // CROSS-MODULE WIRE CONTRACT: mirrors the runner's gateIsolationEvidence
 // (runner/cmd/fishhawk-runner/gateevidence.go), paired ModeExact in
 // backend/internal/wirecontract and pinned from both modules by
@@ -419,6 +428,15 @@ type GateIsolationEvidence struct {
 	SandboxReason        string `json:"sandbox_reason,omitempty"`
 	Reason               string `json:"reason"`
 	ContainerUnavailable string `json:"container_unavailable,omitempty"`
+	ImageSource          string `json:"image_source,omitempty"`
+	ImageDigest          string `json:"image_digest,omitempty"`
+	ImageID              string `json:"image_id,omitempty"`
+	BuildDockerfile      string `json:"build_dockerfile,omitempty"`
+	BuildContext         string `json:"build_context,omitempty"`
+	BuildContextDigest   string `json:"build_context_digest,omitempty"`
+	DistinctImagesCount  int    `json:"distinct_images_count,omitempty"`
+	PolicyWarning        string `json:"policy_warning,omitempty"`
+	DeclaredUnhonored    string `json:"declared_unhonored,omitempty"`
 }
 
 // ApprovalConditionResponsesEvidence is the peeked commit-body responses

@@ -4,8 +4,10 @@ The pure pieces of the runner's gate-isolation layer: safe container-runtime
 detection over the EFFECTIVE endpoint, the mode × profile × runtime selection
 policy, the container argv/env builder with its resolved-path socket-mount
 guard, the throwaway-clone materializer, the Linux no-network sandbox, the
-per-exec build-cache posture, and the per-exec gate services and caller
-passwd entry (#2137). Nothing here executes a gate. The runner wires
+per-exec build-cache posture, the per-exec gate services and caller
+passwd entry (#2137), and the declared per-project gate image — its policy,
+the static Dockerfile guard and the pull/build resolution argv (E51.3 / #2136,
+§ "Declared gate image"). Nothing here executes a gate. The runner wires
 every piece at its ONE gate-exec seam — `runner/cmd/fishhawk-runner/main.go::runBoundedGateArgv`
 (`gateisolation.go` carries the runner-side glue) — so the verify gates,
 `diff_coverage` and the auto-format absorb inherit isolation together and
@@ -16,17 +18,20 @@ there is still no second exec path.
 | Variable | Values | Default | Meaning |
 |---|---|---|---|
 | `FISHHAWK_GATE_ISOLATION` | `auto` \| `container` \| `clone-sandbox` \| `clone` | `auto` | the isolation mode (`ParseMode`; an unknown value is a startup config error naming the valid values) |
-| `FISHHAWK_GATE_IMAGE` | an image reference | empty | the image the container path runs the gate in; empty means the container path is UNAVAILABLE, so a default runner never pays the per-exec cache cost below. For THIS repository the recommended image is the in-repo, pin-checked `fishhawk-gate` (`deploy/gate-image/README.md`, E51.17 / #3966), digest-pinned. **For this repository, set it ONLY together with `FISHHAWK_GATE_SERVICES=postgres`, and only after the § "Gate services (#2137)" operator walk is green:** without the service, `auto` prefers the container path, where `pgtest` fails closed (`FISHHAWK_GATE_CONTAINER=1`, no database) and every verify is red |
+| `FISHHAWK_GATE_IMAGE` | an image reference | empty | the image the container path runs the gate in when the stage declares no `gate_container` (a declared one beats it, § "Declared gate image"); empty means the container path is UNAVAILABLE, so a default runner never pays the per-exec cache cost below. For THIS repository the recommended image is the in-repo, pin-checked `fishhawk-gate` (`deploy/gate-image/README.md`, E51.17 / #3966), digest-pinned. **For this repository, set it ONLY together with `FISHHAWK_GATE_SERVICES=postgres`, and only after the § "Gate services (#2137)" operator walk is green:** without the service, `auto` prefers the container path, where `pgtest` fails closed (`FISHHAWK_GATE_CONTAINER=1`, no database) and every verify is red |
 | `FISHHAWK_GATE_SERVICES` | comma list; only member `postgres` | empty (none) | services the CONTAINER path provisions beside each gate exec (`ParseServices`; an unknown member is a startup config error naming the variable and the valid value; duplicates collapse). Ignored, with one `gate_services_ignored` log line, on every other path. Future spec mapping: #2136's workflow-v2 `gate_container.services` |
 | `FISHHAWK_GATE_POSTGRES_IMAGE` | an image reference | `postgres:16-alpine` (`DefaultPostgresImage`) | the Postgres service image; pin it by DIGEST (`postgres@sha256:…`) — the image runs as a service beside every container gate |
 | `FISHHAWK_DEPLOYMENT_PROFILE` | `local` \| `self-hosted` \| `hosted` | `local` | the runner-DECLARED deployment profile (`ParseProfile`); `hosted` forbids every non-container path |
+| `FISHHAWK_GATE_IMAGE_ALLOWLIST` | comma/whitespace list of registry hosts, namespace prefixes, repositories, exact digests | empty (no allowlist) | the operator image allowlist a DECLARED `gate_container` image, and every base of a declared build, must pass (`ParseAllowlist`; grammar in § "Declared gate image"). An invalid entry is a startup config error naming it. Never applied to `FISHHAWK_GATE_IMAGE` (operator-chosen) |
+| `FISHHAWK_GATE_BUILD` | `allow` \| `deny` | empty = the profile default (`hosted` deny, `local`/`self-hosted` allow) | whether a declared `gate_container` `dockerfile`/`context` build may run (`ParseBuildPolicy`; any other value is a startup config error) |
 
 A config error (bad mode/profile, an unknown `FISHHAWK_GATE_SERVICES` member,
-or `hosted` with an explicit `clone` / `clone-sandbox` —
+an invalid `FISHHAWK_GATE_IMAGE_ALLOWLIST` entry or `FISHHAWK_GATE_BUILD`
+value, or `hosted` with an explicit `clone` / `clone-sandbox` —
 `ProfileForbidsFallback`) fails the runner at startup with
 `runner_failed reason=config` BEFORE any backend contact. A valid config logs
 `gate_isolation_configured` (mode, profile, image, services,
-postgres_image); the first gate exec logs `gate_isolation_selected`
+postgres_image, allowlist_entries, build); the first gate exec logs `gate_isolation_selected`
 carrying the whole `Selection` JSON (path, mode, profile, image, the classified
 runtime including its endpoint, the sandbox probe, and the reason). The same
 selection is recorded on the gate evidence once a gate reaches the exec seam
@@ -41,10 +46,15 @@ silently.
 
 ## Selection (`select.go`)
 
-`Select` is PURE over `Inputs{Mode, Profile, Image, Runtime, Sandbox}` — no
-probe, no filesystem, no environment — and returns a `Selection` whose `Path`
-is one of `container`, `clone-sandbox`, `clone`, `refused`. The container path
-requires `Runtime.Safe && Image != ""`.
+`Select` is PURE over `Inputs{Mode, Profile, Image, Runtime, Sandbox, Build,
+ImageSource, PolicyRefusal, PolicyWarning}` — no probe, no filesystem, no
+environment — and returns a `Selection` whose `Path` is one of `container`,
+`clone-sandbox`, `clone`, `refused`. The container path requires
+`Runtime.Safe && (Image != "" || Build)`. A non-empty `PolicyRefusal` (a
+declared `gate_container` the image policy refused, § "Declared gate image")
+refuses under EVERY mode and profile with `container_unavailable: not
+attempted: gate_container policy refused`, and never substitutes the
+`FISHHAWK_GATE_IMAGE` image.
 
 | Mode | container available | container unavailable, profile ≠ hosted | container unavailable, profile = hosted |
 |---|---|---|---|
@@ -67,6 +77,14 @@ container path. `Path.Class()` maps a path to the coarse
 `clone-sandbox` / `clone` → fallback, `refused` → refused, anything else → "".
 Pinned by `TestSelect_ContainerUnavailable` and `TestPathClass`.
 
+**`DeclaredUnhonored` (E51.3 / #2136).** A DECLARED source (`stage` or
+`workflow`) landing on `clone-sandbox` or `clone` sets
+`declared_unhonored: gate_container declared (<source>) but not honoured:
+<container_unavailable>; the gate ran on the host toolchain`, and the runner
+logs `gate_container_unhonored`. An env-sourced fallback carries no marker.
+Under `hosted` a declared image is never run on the host — every non-container
+path is already refused. Pinned by `TestSelect_DeclaredUnhonoredMarker`.
+
 ## Evidence (#2135)
 
 The runner (`runner/cmd/fishhawk-runner`) records the selection only when a
@@ -81,8 +99,178 @@ carried). The member comes only from that record — a `gate_isolation`-kind
 event in the stream is never folded. Absent when no gate reached the seam
 (plan stages, the working-tree verify gate, a nil state), so those payloads
 stay byte-identical. The wire shape is pinned cross-module by
-`testdata/wire/gate_isolation_evidence.json` (one member per class) and the
-`gate_isolation_evidence` `ModeExact` pair in `backend/internal/wirecontract`.
+`testdata/wire/gate_isolation_evidence.json` (one member per class, plus the
+three `gate_container` members below) and the `gate_isolation_evidence`
+`ModeExact` pair in `backend/internal/wirecontract`.
+
+**Declared-image fields (E51.3 / #2136), all omitempty** so an undeclared
+stage's member is byte-identical to its #2135 form: `image_source` (`stage` |
+`workflow` | `env`), `image_digest` (the registry digest a pulled image ran
+by), `image_id` (the runtime's local image id — opaque, recorded, never
+compared: on a containerd image store it is an index digest, AGENTS.md trap
+#3530), `build_dockerfile` / `build_context` / `build_context_digest` (an
+in-repo build), `distinct_images_count`, `policy_warning` and
+`declared_unhonored`. The image fields describe the **final deciding gate**:
+the LAST verify gate (`runVerifyCommittedTree`, the gate whose outcome decides
+the push or the failure) to reach the container path; a non-deciding gate
+(`diff_coverage`, the auto-format absorb) is used only when no verify gate ran
+there, and a deciding gate whose resolution FAILED leaves the image fields
+empty rather than inheriting an earlier gate's image. `distinct_images_count`
+is set only when the stage's gates ran in more than one distinct image
+(`ResolvedImage.Identity`: registry digest, else build content digest, else
+local id). Free text is redacted then bounded like every sibling field. The
+shared golden's `container_declared`, `container_build` and
+`fallback_declared_unhonored` members are produced by the real `Select` and
+`EvaluateImagePolicy`; the backend embeds the struct in the
+`gate_isolation_recorded` audit payload, so the fields reach
+`GET /v0/runs/{id}/audit` unchanged (`TestTraceUpload_GateIsolationDeclaredPayload`).
+The gate view's `gate_isolation` block does not carry them yet.
+
+## Declared gate image (`gate_container`, E51.3 / [#2136](https://github.com/kuhlman-labs/fishhawk/issues/2136))
+
+A workflow-v2 spec may declare the image every gate of a stage runs in —
+`gate_container: {image: <ref>}` or `{dockerfile: <path>, context: <path>}`,
+at workflow level with a per-stage override (shape:
+`docs/spec/workflow-v2.md` § "Gate container"). The backend resolves the
+effective block by stage IDENTITY and serves it on the stage prompt
+(`gate_container`, with its `source`); `run()` declares it right after the
+prompt fetch, before any gate. A declaration arriving after the selection was
+decided is ignored with a `gate_container_declaration_ignored` line.
+
+**Precedence:** stage `gate_container` > workflow `gate_container` >
+`FISHHAWK_GATE_IMAGE` > the clone-sandbox / clone fallback. A declared
+source never falls back to the env image — not on a policy refusal, a pull
+failure or a build failure.
+
+**Image policy (`imagepolicy.go`, `EvaluateImagePolicy`)** — every refusal
+holds under every mode, is category C, and never reaches the fix agent:
+
+| Request | `local` | `self-hosted` | `hosted` |
+|---|---|---|---|
+| `FISHHAWK_GATE_IMAGE` (env) | allowed, unchecked | allowed, unchecked | allowed, unchecked |
+| declared image, digest-pinned, empty allowlist | allowed | allowed | **refused** |
+| declared image, allowlist permits it | allowed | allowed | allowed (must be pinned) |
+| declared image, allowlist configured and does not permit it | **refused** | **refused** | **refused** |
+| declared image, tag-only | allowed + `policy_warning` | allowed + `policy_warning` | **refused** |
+| declared build, builds disabled (`FISHHAWK_GATE_BUILD=deny`; the `hosted` default) | **refused** | **refused** | **refused** |
+| declared build, empty allowlist | allowed, bases unconstrained | allowed, bases unconstrained | **refused** |
+| declared build, allowlist configured | every base must pass it | every base must pass it | every base must pass it AND be digest-pinned |
+| both sources, half a dockerfile/context pair, a `..` or absolute path | **refused** | **refused** | **refused** |
+
+**Allowlist grammar (`ParseAllowlist`).** Entries separated by commas and/or
+whitespace, each exactly one of: a registry host (`ghcr.io`, `registry:5000`,
+`localhost`, `localhost:5000` — host and port compared exactly); a namespace
+prefix with a trailing slash (`ghcr.io/org/`, matched on whole path components,
+so it never permits `ghcr.io/organization/x`); a repository
+(`ghcr.io/org/gate`, `docker.io/library/alpine` — any tag or digest); an exact
+digest (`ghcr.io/org/gate@sha256:<64 hex>` — that digest only, never a
+tag-only ref). Refused at startup, naming the entry: a single-component bare
+name (`alpine` is ambiguous — write `docker.io/library/alpine`), a tag-bearing
+entry (mutable), any wildcard, anything unparsable.
+
+**Pulling a declared `image:`** (`resolvePulledImage`). Every runtime call goes
+through the endpoint-bound runtime CLI with the runner host's inherited
+environment, so it authenticates with that CLI's OWN credential store
+(`docker login` / `containers-auth.json`); Fishhawk passes no credential and
+the spec cannot carry one. A digest-pinned ref is inspected and pulled only
+when absent; a tag-only ref is pulled on EVERY gate. Either way the gate runs
+by `name@<registry digest>` read back from the inspected `RepoDigests`, so a
+concurrent retag cannot change what runs, and a pinned ref must find its own
+digest there. Pull is bounded at 10 minutes, inspect at 30 seconds, both
+outside the gate timeout. Any pull/inspect failure or timeout, a missing
+registry digest, or a pinned digest absent from `RepoDigests` is
+`gateUnavailable` (category C). **A declared `image:` must be pullable from a
+registry:** a local-only image (built on the host, never pushed) fails the
+pull or has no registry digest, and the reason names the remedy — declare
+`dockerfile` + `context` to build it in-repo, or have the operator set
+`FISHHAWK_GATE_IMAGE` (`PullFailedReason`).
+
+**Building a declared `dockerfile`/`context`** (`resolveBuiltImage`,
+`imageresolve.go`, `dockerfile.go`), in order, all under a 20-minute bound:
+
+1. **Source = the COMMITTED tree at the gate checkout's HEAD**, read from git
+   objects (`ResolveBuildSource`), never the working tree — an uncommitted or
+   untracked file cannot enter a gate image, and every gate kind on one
+   commit sees the same bytes. The context must be a tree, the Dockerfile a
+   regular-file blob ≤ 1 MiB; a symlink, a submodule, the wrong type or an
+   absent path is `gateRefused`.
+2. **Content digest** = a domain-separated sha256 over the context path's git
+   TREE id, the Dockerfile's mode + blob id and the optional
+   `<dockerfile>.dockerignore` blob id. A tree id covers every byte, path and
+   file mode beneath it (a mode-only change moves the digest) and the
+   context's own `.dockerignore`, so the digest moves whenever what the
+   builder could see moves, and is identical across gate kinds and clones of
+   one commit.
+3. **Static Dockerfile guard** (`ScreenDockerfile`) on the committed bytes —
+   every refusal `gateRefused` BEFORE any build call. It is DENY BY DEFAULT
+   and case-insensitive (`add`, `Run`, `from`, `copy --from=` are the same
+   instructions), and scans the union of three views (BuildKit-faithful
+   logical instructions, heredoc-unaware logical instructions, every physical
+   line) so a builder that groups lines differently over-refuses. Refused:
+   - any parser directive other than `check` — `# syntax=` (selects a
+     BuildKit frontend image that can ignore `--network=none`) and `# escape=`
+     (changes how the file is tokenized) included;
+   - a first non-blank, non-shebang line that is neither a `#` comment nor a
+     Dockerfile instruction (a `// syntax=` or JSON `{"syntax": …}` first
+     line);
+   - an ADD source that is not a plain relative in-context path: one carrying
+     `$` (expanded before the builder classifies it), `://`, `@`, `.git`, `:`,
+     a host-shaped first component (contains a dot), an absolute path, a
+     backslash, a `..` segment, or shell-significant characters — mirroring
+     BuildKit's remote-source rules (http(s) URLs and scheme-less / scp-like
+     git remotes), and refusing when in doubt; COPY sources get the same
+     clean-relative-path rule;
+   - `RUN --network=` anything but `none`, `RUN --security=insecure`, a
+     malformed `RUN --mount`, a URL-bearing `FROM` / `COPY --from=` /
+     `RUN --mount from=`, a non-standalone heredoc token;
+   - under `hosted`, `RUN --mount=type=cache` (a cache mount persists on the
+     shared daemon across builds and projects);
+   - with an allowlist configured, every base — `FROM`, `COPY --from=<image>`,
+     `RUN --mount=…,from=<image>`; stage names, stage indexes and `scratch`
+     are not bases — must pass it, a variable-bearing base (`$`) is refused
+     (not statically checkable), and under `hosted` every base must be
+     digest-pinned.
+4. **Cache:** the image is tagged `fishhawk-gate-build:<digest hex>` with
+   labels `fishhawk.gate-build=1` and
+   `fishhawk.gate-build.context-digest=sha256:<hex>`; an inspect hit on that
+   tag skips the build (so two gate kinds on one commit build once).
+5. **Build:** the committed context is materialized into a throwaway dir
+   (bounded at 50,000 entries / 1 GiB, checked before anything is written;
+   over it is `gateUnavailable`, narrow the context) and built with
+   `build --network=none`, the builder applying the context's `.dockerignore`
+   (or `<dockerfile>.dockerignore`) to what it sends. A symlinked root ignore
+   file is refused. Any build failure or timeout — including a RUN step the
+   tree broke — is `gateUnavailable` (category C): a red build costs an
+   operator retry, never a verified-tree bypass.
+
+Build tags accumulate one per distinct content digest; prune them with
+`docker image prune -a --filter label=fishhawk.gate-build=1` (pruning is
+documented, not automated). `context: '.'` puts the whole repository in the
+digest, so every commit is a new build — declare the narrowest context that
+holds the Dockerfile's inputs.
+
+**Seam.** `diff_coverage` and the auto-format absorb reach the same exec seam
+as the verify gates, so they run in the declared image too; there is no
+`diff_coverage`-specific image rule. The `FISHHAWK_GATE_IMAGE` path is
+byte-identical to its pre-#2136 form (implicit pull inside the gate timeout,
+no digest on the evidence).
+
+**Honest limits (documented, not closed):**
+- **Cache mounts outside `hosted`.** `RUN --mount=type=cache` is accepted
+  under `local` / `self-hosted`: the cache persists on the daemon across
+  builds and projects, so a build can read a cache another build wrote. That
+  is accepted for a single-tenant host; `hosted` refuses it.
+- RUN steps run as root inside the build sandbox (the GATE runs non-root via
+  `--user`; the build does not).
+- A base image's `ONBUILD` triggers are not visible to the static scan.
+- The scan is a best-effort hedge against builder divergence, not a proof of
+  equivalence with every builder (BuildKit, buildah, a future frontend): it is
+  designed so a divergence over-refuses, but it can under-refuse a shape no
+  view anticipates.
+- The Dockerfile is agent-writable: the guard protects the HOST, not the
+  verdict — an agent that edits the gate image can change what the gate
+  measures, exactly as it can edit the gate command's inputs today.
+- Daemon-dependent gates and `services` stay with #2137 / `FISHHAWK_GATE_SERVICES`.
 
 ## Safe-runtime detection over the EFFECTIVE endpoint (`runtime.go`)
 
@@ -657,13 +845,13 @@ category B.
   records it as a `gate_isolation_recorded` audit row and surfaces it on the
   gate view.
 - [#2136](https://github.com/kuhlman-labs/fishhawk/issues/2136) (E51.3) — the
-  additive workflow-v1.x `diff_coverage` container-image field declaring the
-  gate image for customer coverage commands (today the image is the runner-wide
-  `FISHHAWK_GATE_IMAGE`). Once it lands, this repository declares the
-  digest-pinned `fishhawk-gate` image (`deploy/gate-image/`) through it; its
-  workflow-v2 `gate_container` block is also the future home of the gate
-  services (`gate_container.services`), which today are the operator-side
-  `FISHHAWK_GATE_SERVICES`.
+  per-project gate image: landed as the workflow-v2 `gate_container` block,
+  § "Declared gate image". It replaced the originally proposed
+  `diff_coverage`-only image field: every gate kind, `diff_coverage`
+  included, runs in the declared image. This repository does not declare one
+  yet (`.fishhawk/workflows.yaml` is unchanged); `gate_container` is also the
+  reserved future home of the gate services (`gate_container.services`),
+  which today are the operator-side `FISHHAWK_GATE_SERVICES`.
 - [#2137](https://github.com/kuhlman-labs/fishhawk/issues/2137) (E51.4) —
   daemon-dependent gate commands under the container path: landed as the
   runner-provisioned Postgres service, § "Gate services (#2137)". This
