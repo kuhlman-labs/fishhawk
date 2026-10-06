@@ -136,6 +136,16 @@ type gateEvidencePayload struct {
 // container|fallback|refused class. The runtime endpoint (raw value, socket
 // path) is deliberately NOT carried.
 //
+// The image fields after ContainerUnavailable (E51.3 / #2136) are all
+// omitempty, so a selection without a gate_container declaration marshals
+// byte-identical to its #2135 form. ImageSource is stage | workflow | env;
+// ImageDigest / ImageID / BuildDockerfile / BuildContext / BuildContextDigest
+// flatten the image the FINAL DECIDING gate resolved (the last verify gate to
+// reach the container path — absent when that gate's resolution failed);
+// DistinctImagesCount is set only when the stage's gates ran in more than one
+// distinct image; DeclaredUnhonored marks a declared gate_container that ran
+// on a host fallback path instead.
+//
 // CROSS-MODULE WIRE CONTRACT: mirrored by backend/internal/bundle's
 // GateIsolationEvidence, paired ModeExact in backend/internal/wirecontract
 // and pinned from both modules by testdata/wire/gate_isolation_evidence.json.
@@ -155,6 +165,15 @@ type gateIsolationEvidence struct {
 	SandboxReason        string `json:"sandbox_reason,omitempty"`
 	Reason               string `json:"reason"`
 	ContainerUnavailable string `json:"container_unavailable,omitempty"`
+	ImageSource          string `json:"image_source,omitempty"`
+	ImageDigest          string `json:"image_digest,omitempty"`
+	ImageID              string `json:"image_id,omitempty"`
+	BuildDockerfile      string `json:"build_dockerfile,omitempty"`
+	BuildContext         string `json:"build_context,omitempty"`
+	BuildContextDigest   string `json:"build_context_digest,omitempty"`
+	DistinctImagesCount  int    `json:"distinct_images_count,omitempty"`
+	PolicyWarning        string `json:"policy_warning,omitempty"`
+	DeclaredUnhonored    string `json:"declared_unhonored,omitempty"`
 }
 
 // gateIsolationEvidenceFor digests st's RECORDED selection — nil when no gate
@@ -175,7 +194,7 @@ func newGateIsolationEvidence(sel gateiso.Selection) *gateIsolationEvidence {
 		out, _ := boundEvidenceTail(redactEvidenceText(s))
 		return out
 	}
-	return &gateIsolationEvidence{
+	ev := &gateIsolationEvidence{
 		Path:                 string(sel.Path),
 		Class:                string(sel.Path.Class()),
 		Mode:                 string(sel.Mode),
@@ -191,7 +210,19 @@ func newGateIsolationEvidence(sel gateiso.Selection) *gateIsolationEvidence {
 		SandboxReason:        text(sel.Sandbox.Reason),
 		Reason:               text(sel.Reason),
 		ContainerUnavailable: text(sel.ContainerUnavailable),
+		ImageSource:          text(sel.ImageSource),
+		DistinctImagesCount:  sel.DistinctImagesCount,
+		PolicyWarning:        text(sel.PolicyWarning),
+		DeclaredUnhonored:    text(sel.DeclaredUnhonored),
 	}
+	if img := sel.ResolvedImage; img != nil {
+		ev.ImageDigest = text(img.Digest)
+		ev.ImageID = text(img.ImageID)
+		ev.BuildDockerfile = text(img.BuildDockerfile)
+		ev.BuildContext = text(img.BuildContext)
+		ev.BuildContextDigest = text(img.ContextDigest)
+	}
+	return ev
 }
 
 // approvalConditionResponsesEvidence is the peeked commit-body responses

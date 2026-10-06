@@ -146,9 +146,16 @@ PATH="$d" scripts/test lint --in-gate-image   # exits 1 naming docker
 ## Runner gate image
 
 This is the recommended `FISHHAWK_GATE_IMAGE` for this repository, pinned by
-DIGEST (`ghcr.io/kuhlman-labs/fishhawk-gate@sha256:…`) and later declared
-through [#2136](https://github.com/kuhlman-labs/fishhawk/issues/2136)'s
-workflow-v2 `gate_container` block. The image carries no daemon; the
+DIGEST (`ghcr.io/kuhlman-labs/fishhawk-gate@sha256:…`). It can also be
+declared in the spec through the workflow-v2 `gate_container` block
+([E51.3 / #2136](https://github.com/kuhlman-labs/fishhawk/issues/2136):
+`gate_container: {image: ghcr.io/kuhlman-labs/fishhawk-gate@sha256:…}`, which
+beats `FISHHAWK_GATE_IMAGE`); this repository does not declare it yet, and the
+service it needs still comes from the runner-side `FISHHAWK_GATE_SERVICES`
+(`gate_container.services` is reserved, not implemented), which applies to the
+container path whichever source named the image. A declared `image:` must be
+pullable from a registry — a locally built, never-pushed tag fails category C
+naming the `dockerfile`/`context` or `FISHHAWK_GATE_IMAGE` remedy. The image carries no daemon; the
 daemon-dependent backend tests reach Postgres through the runner's gate
 service ([#2137](https://github.com/kuhlman-labs/fishhawk/issues/2137)), so
 **set it only TOGETHER with `FISHHAWK_GATE_SERVICES=postgres`** (and a

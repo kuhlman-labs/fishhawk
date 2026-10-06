@@ -2028,6 +2028,56 @@ func TestExtractGateEvidence_GateIsolationSharedGolden(t *testing.T) {
 	}
 }
 
+// TestExtractGateEvidence_GateIsolationDeclaredSharedGolden extends the #2135
+// backend half to the E51.3 / #2136 gate_container members: each decodes with
+// the image source, the final deciding gate's image identity and the
+// unhonoured marker the runner wrote, and re-encodes to the SAME bytes — a new
+// field missing from GateIsolationEvidence loses bytes on the round trip.
+func TestExtractGateEvidence_GateIsolationDeclaredSharedGolden(t *testing.T) {
+	golden := sharedGateIsolationGolden(t)
+	type want struct {
+		class, source, digest, imageID, ctxDigest, dockerfile, buildCtx, warning, unhonored string
+		distinct                                                                            int
+	}
+	cases := map[string]want{
+		"container_declared": {class: "container", source: "stage", digest: "sha256:9b2e6d1c", imageID: "sha256:3c1f8a6e", warning: "is not digest-pinned"},
+		"container_build": {class: "container", source: "workflow", imageID: "sha256:3c1f8a6e", ctxDigest: "sha256:e7a4c1f9",
+			dockerfile: "build/gate/Dockerfile", buildCtx: "build/gate", distinct: 2},
+		"fallback_declared_unhonored": {class: "fallback", source: "stage", unhonored: "gate_container declared (stage) but not honoured"},
+	}
+	prefix := func(got, want string) bool { return (want == "") == (got == "") && strings.HasPrefix(got, want) }
+	for member, w := range cases {
+		t.Run(member, func(t *testing.T) {
+			raw, ok := golden[member]
+			if !ok {
+				t.Fatalf("shared golden has no %q variant", member)
+			}
+			ge, err := ExtractGateEvidence(gateEvidenceBundle(t, `{"verify_runs":[{"command":"true","exit_code":0,"outcome":"passed"}],"gate_isolation":`+string(raw)+`}`))
+			if err != nil {
+				t.Fatalf("ExtractGateEvidence: %v", err)
+			}
+			gi := ge.GateIsolation
+			if gi == nil {
+				t.Fatal("gate_isolation member not decoded")
+			}
+			if gi.Class != w.class || gi.ImageSource != w.source || gi.DistinctImagesCount != w.distinct ||
+				!prefix(gi.ImageDigest, w.digest) || !prefix(gi.ImageID, w.imageID) || !prefix(gi.BuildContextDigest, w.ctxDigest) ||
+				gi.BuildDockerfile != w.dockerfile || gi.BuildContext != w.buildCtx ||
+				!strings.Contains(gi.PolicyWarning, w.warning) || (w.warning == "") != (gi.PolicyWarning == "") ||
+				!strings.Contains(gi.DeclaredUnhonored, w.unhonored) || (w.unhonored == "") != (gi.DeclaredUnhonored == "") {
+				t.Errorf("decoded = %+v, want %+v", *gi, w)
+			}
+			re, err := json.Marshal(gi)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(re, raw) {
+				t.Errorf("round trip lost bytes:\n got %s\nwant %s", re, raw)
+			}
+		})
+	}
+}
+
 // TestExtractGateEvidence_GateIsolationAbsent: an older bundle (or a stage
 // where no gate reached the runner's seam) decodes to a nil member.
 func TestExtractGateEvidence_GateIsolationAbsent(t *testing.T) {
