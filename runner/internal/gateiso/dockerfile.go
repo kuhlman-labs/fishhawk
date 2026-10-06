@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -19,15 +20,22 @@ import (
 // which the build could reach the network or escape the build sandbox, and
 // collects every base image for the allowlist check.
 //
-// The scan is DENY BY DEFAULT and errs toward over-refusal: it scans the
-// union of three views of the file — BuildKit-faithful logical instructions
-// (continuations joined, heredoc bodies consumed), heredoc-UNAWARE logical
+// The scan is DENY BY DEFAULT and errs toward over-refusal. It first refuses
+// every byte on which this scan and the builder could TOKENIZE a line
+// differently (checkCharacters: BuildKit splits an instruction keyword on
+// [\t\v\f\r ]+ and trims with unicode.IsSpace), so only space and tab
+// separate tokens. It then scans the union of three views of the file —
+// BuildKit-faithful logical instructions (continuations joined, heredoc
+// bodies consumed; a line whose first token is not an instruction is
+// REFUSED, as the builder rejects it too), heredoc-UNAWARE logical
 // instructions (every line treated as instruction text), and every physical
-// line on its own (split on \n and \r) — so a continuation or heredoc the
-// builder groups differently from this parser surfaces in at least one view.
-// That is a best-effort hedge, NOT a proof of equivalence with every builder
-// (BuildKit, buildah, a future frontend): it is designed so a divergence
-// over-refuses, and the residuals are documented in the gateiso README.
+// line on its own — so a continuation or heredoc the builder groups
+// differently from this parser surfaces in at least one view. Flag tokens
+// carrying a quote or backslash are refused, because the builder's flag
+// lexer rewrites them (and joins a quoted space into one flag). That is a
+// best-effort hedge, NOT a proof of equivalence with every builder (BuildKit,
+// buildah, a future frontend): it is designed so a divergence over-refuses,
+// and the residuals are documented in the gateiso README.
 
 // maxDockerfileBytes bounds a Dockerfile the scan accepts.
 const maxDockerfileBytes = 1 << 20
@@ -132,7 +140,11 @@ type logicalInstr struct {
 // ParseDockerfile runs every profile-independent static refusal over content
 // and collects the build bases. A refusal is returned as *DockerfileRefusal.
 //
-// Refused: content over 1 MiB or not valid UTF-8; any leading parser
+// Refused: content over 1 MiB or not valid UTF-8; a control character other
+// than tab and newline, a CR not followed by LF, or non-ASCII whitespace (see
+// checkCharacters); a logical instruction whose first token is not a
+// Dockerfile instruction; a flag token carrying a quote or backslash; any
+// leading parser
 // directive other than `check` (so `# syntax=`, `# escape=`, an unknown
 // directive) and a `syntax` directive anywhere; a first significant line that
 // is neither a `#` comment nor a Dockerfile instruction (`// syntax=`, a JSON
@@ -148,7 +160,10 @@ func ParseDockerfile(content []byte) (*Dockerfile, error) {
 	if !utf8.Valid(content) {
 		return nil, refuseLine(0, "is not valid UTF-8")
 	}
-	lines := splitPhysical(string(content), false)
+	if err := checkCharacters(string(content)); err != nil {
+		return nil, err
+	}
+	lines := splitPhysical(string(content))
 	if err := checkDirectives(lines); err != nil {
 		return nil, err
 	}
@@ -157,7 +172,7 @@ func ParseDockerfile(content []byte) (*Dockerfile, error) {
 		return nil, err
 	}
 	viewB, _ := logicalInstructions(lines, false)
-	views := [][]logicalInstr{viewA, viewB, physicalInstructions(splitPhysical(string(content), true))}
+	views := [][]logicalInstr{viewA, viewB, physicalInstructions(lines)}
 	df := &Dockerfile{}
 	seenBase := map[string]bool{}
 	seenCache := map[int]bool{}
@@ -188,20 +203,35 @@ func ParseDockerfile(content []byte) (*Dockerfile, error) {
 	return df, nil
 }
 
-// splitPhysical splits on \n (dropping a trailing \r, as bufio.ScanLines
-// does); with alsoCR it also splits on a bare \r, so the per-physical-line
-// view sees a line a CR-splitting builder would see.
-func splitPhysical(s string, alsoCR bool) []physLine {
+// checkCharacters refuses every character on which this scan and the
+// builder could split a line differently. BuildKit separates an instruction
+// keyword from its arguments on [\t\v\f\r ]+ and trims leading whitespace
+// with unicode.IsSpace, while this scan separates on space and tab only: a
+// keyword followed by a vertical tab, form feed or bare CR (`ADD<VT>url`,
+// `FROM<FF>image`) is an instruction to the builder and an unknown word here.
+// So a control character other than tab and newline, a CR not immediately
+// followed by LF, and any non-ASCII whitespace are refused outright, leaving
+// space and tab as the only separators either side can see.
+func checkCharacters(s string) error {
+	line := 1
+	for i, r := range s {
+		switch {
+		case r == '\n':
+			line++
+		case r == '\t', r == '\r' && strings.HasPrefix(s[i+1:], "\n"):
+		case unicode.IsControl(r) || (r > unicode.MaxASCII && unicode.IsSpace(r)):
+			return refuseLine(line, "character %U is refused: only space and tab may separate tokens (the builder also splits on vertical tab, form feed, a bare CR and Unicode whitespace, which this scan does not)", r)
+		}
+	}
+	return nil
+}
+
+// splitPhysical splits on \n, dropping a trailing \r as bufio.ScanLines
+// does (checkCharacters has refused every other CR).
+func splitPhysical(s string) []physLine {
 	var out []physLine
 	for i, l := range strings.Split(s, "\n") {
-		l = strings.TrimSuffix(l, "\r")
-		if !alsoCR {
-			out = append(out, physLine{n: i + 1, text: l})
-			continue
-		}
-		for _, part := range strings.Split(l, "\r") {
-			out = append(out, physLine{n: i + 1, text: part})
-		}
+		out = append(out, physLine{n: i + 1, text: strings.TrimSuffix(l, "\r")})
 	}
 	return out
 }
@@ -260,9 +290,13 @@ func firstWord(s string) string {
 // consumed up to their terminator, as BuildKit does, and any `<<` in such an
 // instruction that is not a plain standalone heredoc token is REFUSED (a
 // heredoc this parser and the builder delimit differently is the one way the
-// faithful view could see an instruction the builder does not); without
-// heredocAware every line is instruction text — the backstop view against a
-// heredoc this parser detects but the builder does not.
+// faithful view could see an instruction the builder does not), and a logical
+// line whose first token is not an instruction is REFUSED rather than skipped
+// (the builder rejects an unknown instruction, so this refuses nothing the
+// builder would build, and a keyword this scan failed to recognise can never
+// pass silently); without heredocAware every line is instruction text and an
+// unknown first token is skipped — the backstop view against a heredoc this
+// parser detects but the builder does not.
 func logicalInstructions(lines []physLine, heredocAware bool) ([]logicalInstr, error) {
 	var out []logicalInstr
 	for i := 0; i < len(lines); i++ {
@@ -285,13 +319,21 @@ func logicalInstructions(lines []physLine, heredocAware bool) ([]logicalInstr, e
 		}
 		kw, rest := splitKeyword(text)
 		if kw == "" {
+			if heredocAware {
+				return nil, refuseLine(start, "%q is not a Dockerfile instruction (an unrecognised first token is refused, never skipped)", firstWord(text))
+			}
 			continue
 		}
 		out = append(out, logicalInstr{line: start, keyword: kw, rest: rest})
-		if !heredocAware || (kw != "ADD" && kw != "COPY" && kw != "RUN") || !strings.Contains(rest, "<<") {
+		// ONBUILD ADD/COPY/RUN opens a heredoc exactly as the bare form does.
+		hkw, hrest := kw, rest
+		if kw == "ONBUILD" {
+			hkw, hrest = splitKeyword(rest)
+		}
+		if !heredocAware || (hkw != "ADD" && hkw != "COPY" && hkw != "RUN") || !strings.Contains(hrest, "<<") {
 			continue
 		}
-		docs, err := heredocTokens(start, rest)
+		docs, err := heredocTokens(start, hrest)
 		if err != nil {
 			return nil, err
 		}
@@ -375,8 +417,12 @@ func splitKeyword(s string) (string, string) {
 	return kw, rest
 }
 
-// splitFlags splits leading `--flag[=value]` tokens from the arguments.
-func splitFlags(rest string) ([]string, string) {
+// splitFlags splits leading `--flag[=value]` tokens from the arguments. A
+// flag token carrying a quote or backslash is refused: the builder's flag
+// lexer strips quotes and escapes and keeps a quoted space inside the flag
+// (`--mount="type=bind, from=evil/x"` is ONE flag to it, two words here), so
+// this scan could not classify the value the builder uses.
+func splitFlags(line int, rest string) ([]string, string, error) {
 	var flags []string
 	s := strings.TrimLeft(rest, " \t")
 	for strings.HasPrefix(s, "--") {
@@ -390,9 +436,12 @@ func splitFlags(rest string) ([]string, string) {
 		if tok == "--" {
 			break
 		}
+		if strings.ContainsAny(tok, `"'\`) {
+			return nil, "", refuseLine(line, "flag %q refused: a quote or backslash in a flag is rewritten by the builder's flag lexer, so the flag cannot be classified statically", tok)
+		}
 		flags = append(flags, tok)
 	}
-	return flags, s
+	return flags, s, nil
 }
 
 func flagValue(flag, name string) (string, bool) {
@@ -456,7 +505,10 @@ func checkInstruction(in logicalInstr, stages map[string]bool, declare bool) ([]
 }
 
 func checkFrom(line int, rest string, stages map[string]bool, declare bool) ([]BuildBase, int, error) {
-	_, args := splitFlags(rest)
+	_, args, err := splitFlags(line, rest)
+	if err != nil {
+		return nil, 0, err
+	}
 	f := strings.Fields(args)
 	if len(f) == 0 {
 		return nil, 0, nil
@@ -496,7 +548,10 @@ func stageRef(v string, stages map[string]bool) bool {
 }
 
 func checkAddCopy(line int, kw, rest string, stages map[string]bool) ([]BuildBase, int, error) {
-	flags, args := splitFlags(rest)
+	flags, args, err := splitFlags(line, rest)
+	if err != nil {
+		return nil, 0, err
+	}
 	var bases []BuildBase
 	from := ""
 	hasFrom := false
@@ -601,7 +656,10 @@ func checkAddSource(src string) string {
 }
 
 func checkRun(line int, rest string, stages map[string]bool) ([]BuildBase, int, error) {
-	flags, _ := splitFlags(rest)
+	flags, _, err := splitFlags(line, rest)
+	if err != nil {
+		return nil, 0, err
+	}
 	var bases []BuildBase
 	cacheLine := 0
 	for _, fl := range flags {

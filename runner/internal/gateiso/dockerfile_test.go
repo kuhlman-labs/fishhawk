@@ -80,7 +80,15 @@ func TestParseDockerfile_Refusals(t *testing.T) {
 		{"RUN network on continuation", "FROM alpine\nRUN \\\n--network=host true\n", "--network=host"},
 		{"RUN comment inside continuation", "FROM alpine\nRUN \\\n# note\n--network=host true\n", "--network=host"},
 		{"RUN mount from url", "FROM alpine\nRUN --mount=type=bind,from=https://x,target=/x true\n", "URL scheme"},
-		{"RUN mount unparsable", "FROM alpine\nRUN --mount=type=bind,\"from=x true\n", "unparsable mount"},
+		{"RUN mount unparsable", "FROM alpine\nRUN --mount= true\n", "unparsable mount"},
+		// Flag tokens the builder's flag lexer rewrites: a quoted space keeps
+		// `from=evil/x` inside the mount to the builder (not a base here), and
+		// an escaped key or quoted value hides the real one.
+		{"RUN mount quoted space", "FROM alpine\nRUN --mount=\"type=bind, from=evil/x,target=/x\" true\n", "quote or backslash"},
+		{"RUN mount escaped key", "FROM alpine\nRUN --mount=type=bind,fr\\om=evil/x,target=/x true\n", "quote or backslash"},
+		{"run network single-quoted lowercase", "FROM alpine\nrun --network='none' true\n", "quote or backslash"},
+		{"copy from quoted lowercase", "FROM alpine\ncopy --from=\"evil/img\" /a /b\n", "quote or backslash"},
+		{"FROM platform quoted", "FROM --platform=\"linux/amd64\" alpine\n", "quote or backslash"},
 		// Heredoc tokens the builder could delimit differently.
 		{"here-string", "FROM alpine\nRUN cat <<<x\n", "standalone heredoc"},
 		{"quoted heredoc marker", "FROM alpine\nRUN echo \"<<EOF\"\n", "standalone heredoc"},
@@ -88,7 +96,29 @@ func TestParseDockerfile_Refusals(t *testing.T) {
 		{"heredoc mismatched quotes", "FROM alpine\nRUN cat <<\"EOF'\nEOF\n", "mismatched quotes"},
 		// The backstop views.
 		{"physical line after backslash-space", "FROM alpine\nRUN echo hi \\ \nADD https://x /y\n", "ADD source"},
-		{"bare CR line split", "FROM alpine\nRUN echo hi\rADD https://x /y\n", "ADD source"},
+		{"bare CR line split", "FROM alpine\nRUN echo hi\rADD https://x /y\n", "U+000D"},
+		// Separators the builder splits a keyword on and this scan does not
+		// ([\t\v\f\r ]+, unicode.IsSpace trimming): refused outright.
+		{"ADD vertical tab url", "FROM alpine\nADD\vhttps://host/x /y\n", "U+000B"},
+		{"add vertical tab url lowercase", "FROM alpine\nadd\vhttps://host/x /y\n", "U+000B"},
+		{"FROM form feed image", "FROM\fevil/base\n", "U+000C"},
+		{"from form feed lowercase", "from\fevil/base\n", "U+000C"},
+		{"FROM bare CR image", "FROM\revil/base\n", "U+000D"},
+		{"Run vertical tab network host", "FROM alpine\nRun\v--network=host true\n", "U+000B"},
+		{"RUN form feed cache mount", "FROM alpine\nRUN\f--mount=type=cache,target=/c true\n", "U+000C"},
+		{"copy vertical tab from", "FROM alpine\ncopy\v--from=evil/img /a /b\n", "U+000B"},
+		{"trailing bare CR", "FROM alpine\r", "U+000D"},
+		{"NUL", "FROM alpine\nRUN true\x00\n", "U+0000"},
+		{"DEL", "FROM alpine\nRUN true\x7f\n", "U+007F"},
+		{"leading NBSP", "FROM alpine\n\u00a0ADD https://x /y\n", "U+00A0"},
+		{"NEL separator", "FROM alpine\nADD\u0085https://x /y\n", "U+0085"},
+		{"line separator", "FROM alpine\nADD\u2028https://x /y\n", "U+2028"},
+		{"ideographic space", "FROM\u3000evil/base\n", "U+3000"},
+		// An unrecognised first token in the faithful view is refused, never
+		// skipped (the builder rejects it too).
+		{"unknown first token", "FROM alpine\nADD\u200bhttps://x /y\n", "is not a Dockerfile instruction"},
+		{"unknown lowercase token", "FROM alpine\nxadd https://x /y\n", "is not a Dockerfile instruction"},
+		{"unknown token after continuation", "FROM alpine\n\\\nfoo bar\n", "is not a Dockerfile instruction"},
 		{"heredoc-unaware continuation", "FROM alpine\nRUN cat <<EOF\nRUN \\\n  --network=host echo\nEOF\n", "--network=host"},
 		// Whole-file.
 		{"invalid utf8", "FROM alpine\nRUN \xff\n", "UTF-8"},
@@ -133,11 +163,14 @@ COPY <<-EOT /b
 	EOT
 COPY ["go.mod", "./"]
 `,
-		"shebang first":                 "#!/usr/bin/env dockerfile\nFROM alpine\n",
-		"blank lines first":             "\n\n\nFROM alpine\n",
-		"bom":                           "\xef\xbb\xbfFROM alpine\n",
-		"crlf":                          "FROM alpine\r\nRUN true\r\n",
-		"heredoc with tab chomp and fd": "FROM alpine\nRUN 3<<-EOF cat\n\tset -e\n\tEOF\n",
+		"shebang first":                    "#!/usr/bin/env dockerfile\nFROM alpine\n",
+		"blank lines first":                "\n\n\nFROM alpine\n",
+		"bom":                              "\xef\xbb\xbfFROM alpine\n",
+		"crlf":                             "FROM alpine\r\nRUN true\r\n",
+		"heredoc with tab chomp and fd":    "FROM alpine\nRUN 3<<-EOF cat\n\tset -e\n\tEOF\n",
+		"tab separators":                   "FROM\talpine\nRUN\t--network=none\ttrue\n",
+		"onbuild heredoc body consumed":    "FROM alpine\nONBUILD RUN <<EOF\necho hi\nEOF\nRUN true\n",
+		"non-ASCII non-space in a comment": "# café — ünïcode\nFROM alpine\n",
 	}
 	for name, c := range rows {
 		t.Run(name, func(t *testing.T) {

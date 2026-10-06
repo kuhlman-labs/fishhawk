@@ -207,6 +207,18 @@ pull or has no registry digest, and the reason names the remedy — declare
    instructions), and scans the union of three views (BuildKit-faithful
    logical instructions, heredoc-unaware logical instructions, every physical
    line) so a builder that groups lines differently over-refuses. Refused:
+   - a control character other than tab and newline, a CR not followed by
+     LF, or any non-ASCII whitespace — BuildKit splits an instruction keyword
+     from its arguments on `[\t\v\f\r ]+` and trims Unicode whitespace, so
+     `ADD<VT>https://…` or `FROM<FF>image` is an instruction to it; refusing
+     these leaves space and tab as the only separators either side sees;
+   - a logical line (outside a consumed heredoc body) whose first token is
+     not a Dockerfile instruction — refused, never skipped (the builder
+     rejects it too, so nothing it would build is refused);
+   - a flag token carrying a quote or backslash: the builder's flag lexer
+     strips them and keeps a quoted space inside one flag
+     (`--mount="type=bind, from=evil/x"`), so the value cannot be classified
+     statically;
    - any parser directive other than `check` — `# syntax=` (selects a
      BuildKit frontend image that can ignore `--network=none`) and `# escape=`
      (changes how the file is tokenized) included;
