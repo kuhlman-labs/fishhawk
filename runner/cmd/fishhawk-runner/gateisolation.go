@@ -59,6 +59,11 @@ const (
 	// gateBuildEnvVar is the in-repo gate image build posture (allow|deny;
 	// empty = the profile default: hosted deny, local/self-hosted allow).
 	gateBuildEnvVar = "FISHHAWK_GATE_BUILD"
+	// gateCacheEnvVar is the container path's build-cache posture
+	// (process|off; empty = process, E51.18 / #3967): `process` mounts ONE
+	// per-runner-process named volume for GOCACHE and the lint cache, `off`
+	// keeps the per-exec cold caches (gateiso/cachevolume.go).
+	gateCacheEnvVar = "FISHHAWK_GATE_CACHE"
 )
 
 // gateIsolationRefusedSignature leads every refusal output. It is
@@ -160,6 +165,19 @@ const (
 	gateServiceBootstrapTimeout = time.Minute
 )
 
+// Gate cache volume bounds (E51.18 / #3967). Like the provisioning bounds
+// above, each step runs BEFORE the gate exec and outside the gate's own
+// timeout; exceeding one DEGRADES to the per-exec caches, never a verdict.
+const (
+	// gateCacheVolumeTimeout bounds `volume create`.
+	gateCacheVolumeTimeout = time.Minute
+	// gateCachePrepareTimeout bounds the prepare helper, including a cold
+	// pull of the gate image.
+	gateCachePrepareTimeout = 5 * time.Minute
+	// gateCacheCheckTimeout bounds the post-prepare write check.
+	gateCacheCheckTimeout = time.Minute
+)
+
 // Declared gate_container resolution bounds (E51.3 / #2136). Like the
 // provisioning bounds above, each runs BEFORE the gate exec and outside the
 // gate's own timeout; exceeding one is gateUnavailable, never a verdict.
@@ -229,6 +247,22 @@ type gateIsolationState struct {
 	last         *gateiso.ResolvedImage
 	identities   map[string]bool
 
+	// cacheMode is the FISHHAWK_GATE_CACHE posture. Its ZERO value means off,
+	// so a hand-built struct-literal state keeps the per-exec caches; only
+	// configureGateIsolation selects process (the default). ownerRun /
+	// ownerStage are the run and stage this process serves (bindOwner), which
+	// every cache volume name embeds. cacheVol is the volume the next exec
+	// reuses when it still BelongsTo the owner, cacheUses how many execs
+	// mounted it, cacheMinted every volume minted (removed at cleanup with the
+	// runtime and bound CLI env it was minted under). All guarded by cacheMu.
+	cacheMode   gateiso.CacheMode
+	cacheMu     sync.Mutex
+	ownerRun    string
+	ownerStage  string
+	cacheVol    *gateiso.CacheVolume
+	cacheUses   int
+	cacheMinted []mintedCacheVolume
+
 	// passwdByImage caches each gate image's /etc/passwd after a SUCCESSFUL
 	// read (#2137 approval condition 7: a failed read is never cached, so a
 	// transient failure is retried on a later exec).
@@ -252,6 +286,14 @@ type gateIsolationState struct {
 	// selection RECORDED for the gate evidence (#2135): a gate reached the
 	// seam, refusal included.
 	seamReached atomic.Bool
+}
+
+// mintedCacheVolume is one cache volume a state minted, with the runtime and
+// bound CLI env its removal runs under.
+type mintedCacheVolume struct {
+	vol    gateiso.CacheVolume
+	rt     gateiso.Runtime
+	cliEnv []string
 }
 
 // gateIsolation is the live state run() installs and clears (cleanup).
@@ -307,7 +349,7 @@ var (
 	dockerFixturesRan      int
 )
 
-// configureGateIsolation parses the seven variables through getenv and
+// configureGateIsolation parses the eight variables through getenv and
 // applies the startup rule ProfileForbidsFallback. A configuration error names
 // the variable and the valid values (an allowlist error also names the
 // offending entry); run() logs it as runner_failed
@@ -341,6 +383,10 @@ func configureGateIsolation(getenv func(string) string, probes gateiso.Probes, l
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", gateBuildEnvVar, err)
 	}
+	cacheMode, err := gateiso.ParseCacheMode(getenv(gateCacheEnvVar))
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", gateCacheEnvVar, err)
+	}
 	st := &gateIsolationState{
 		mode:          mode,
 		profile:       profile,
@@ -353,6 +399,7 @@ func configureGateIsolation(getenv func(string) string, probes gateiso.Probes, l
 		postgresImage: pgImage,
 		allowlist:     allow,
 		buildAllowed:  buildAllowed,
+		cacheMode:     cacheMode,
 	}
 	build := gateiso.BuildPolicyDeny
 	if buildAllowed {
@@ -360,8 +407,8 @@ func configureGateIsolation(getenv func(string) string, probes gateiso.Probes, l
 	}
 	if logSink != nil {
 		_, _ = fmt.Fprintf(logSink,
-			`{"event":"gate_isolation_configured","mode":%q,"profile":%q,"image":%q,"services":%q,"postgres_image":%q,"allowlist_entries":%d,"build":%q}`+"\n",
-			mode, profile, st.image, joinServices(services), pgImage, len(allow), build)
+			`{"event":"gate_isolation_configured","mode":%q,"profile":%q,"image":%q,"services":%q,"postgres_image":%q,"allowlist_entries":%d,"build":%q,"cache":%q}`+"\n",
+			mode, profile, st.image, joinServices(services), pgImage, len(allow), build, cacheMode)
 	}
 	return st, nil
 }
@@ -579,12 +626,143 @@ func (s *gateIsolationState) recordResolved(res gateiso.ResolvedImage, deciding 
 	}
 }
 
-// cleanup releases the process-wide state. run() defers it so a later run()
-// in the same process (the test binary) starts unconfigured.
+// bindOwner records the run and stage this runner process serves (run()
+// calls it once, right after installing the state). Every cache volume name
+// embeds them, and an exec whose owner no longer matches the minted volume
+// mints its own instead of reusing it (#3967 approval condition 2). Ids that
+// are not UUIDs make every exec degrade to the per-exec caches. Nil-safe.
+func (s *gateIsolationState) bindOwner(runID, stageID string) {
+	if s == nil {
+		return
+	}
+	s.cacheMu.Lock()
+	s.ownerRun, s.ownerStage = runID, stageID
+	s.cacheMu.Unlock()
+}
+
+// cacheUnavailable logs one degrade of the cache volume step and returns "".
+func (s *gateIsolationState) cacheUnavailable(vol, step, reason string) string {
+	s.logEvent(`{"event":"gate_cache_volume_unavailable","volume":%q,"step":%q,"reason":%q}`, vol, step, reason)
+	return ""
+}
+
+// gateCacheVolume returns the cache volume the next container exec mounts,
+// or "" for the per-exec caches: always "" for a nil state or mode off. In
+// process mode it mints the volume ONCE per (state, owner) — recorded for
+// cleanup BEFORE the create is attempted, so teardown covers a partial
+// create — and re-mints when the minted volume no longer BelongsTo the bound
+// owner (it is never reused across a (run, stage) pair). On EVERY call it
+// then runs, through execGateAuxArgvFn under the bound CLI env, `volume
+// create` (idempotent), the prepare helper (subdirectories owned by the gate
+// uid) and the write check under the gate's own user pin (#3967 approval
+// condition 1). Any render error, non-zero exit or timeout logs
+// gate_cache_volume_unavailable naming the step and returns "" — a DEGRADE to
+// the per-exec caches, never a refusal and never a gate verdict.
+func (s *gateIsolationState) gateCacheVolume(ctx context.Context, rt gateiso.Runtime, image, root string, cliEnv []string, uid, gid int) string {
+	if s == nil || s.cacheMode != gateiso.CacheModeProcess {
+		return ""
+	}
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+	if s.cacheVol == nil || !s.cacheVol.BelongsTo(s.ownerRun, s.ownerStage) {
+		v, err := gateiso.NewCacheVolume(s.ownerRun, s.ownerStage)
+		if err != nil {
+			return s.cacheUnavailable("", "mint", err.Error())
+		}
+		if s.cacheVol != nil {
+			s.logEvent(`{"event":"gate_cache_volume_not_reused","volume":%q,"replacement":%q,"reason":"the volume belongs to a different run/stage"}`, s.cacheVol.Name, v.Name)
+		}
+		s.cacheVol, s.cacheUses = &v, 0
+		s.cacheMinted = append(s.cacheMinted, mintedCacheVolume{vol: v, rt: rt, cliEnv: append([]string(nil), cliEnv...)})
+	}
+	vol := *s.cacheVol
+	steps := []struct {
+		name    string
+		build   func() ([]string, error)
+		timeout time.Duration
+		failure string
+	}{
+		{"create", func() ([]string, error) { return vol.CreateArgv(rt) }, gateCacheVolumeTimeout, ""},
+		{"prepare", func() ([]string, error) { return vol.PrepareArgv(rt, image, uid, gid) }, gateCachePrepareTimeout, ""},
+		{"check", func() ([]string, error) { return vol.CheckArgv(rt, image, uid, gid) }, gateCacheCheckTimeout,
+			fmt.Sprintf("ownership: the gate uid %d:%d cannot write %s / %s", uid, gid, gateiso.GateGoCache, gateiso.GateLintCache)},
+	}
+	for _, step := range steps {
+		argv, err := step.build()
+		if err != nil {
+			return s.cacheUnavailable(vol.Name, step.name, "argv: "+err.Error())
+		}
+		out, code, timedOut := execGateAuxArgvFn(ctx, argv, root, cliEnv, step.timeout)
+		if timedOut {
+			return s.cacheUnavailable(vol.Name, step.name, fmt.Sprintf("timed out after %s", step.timeout))
+		}
+		if code != 0 {
+			reason := fmt.Sprintf("exit %d: %s", code, gateOutputTail(out))
+			if step.failure != "" {
+				reason = step.failure + ": " + reason
+			}
+			return s.cacheUnavailable(vol.Name, step.name, reason)
+		}
+	}
+	s.logEvent(`{"event":"gate_cache_volume_ready","volume":%q,"reused":%t}`, vol.Name, s.cacheUses > 0)
+	s.cacheUses++
+	return vol.Name
+}
+
+// removeCacheVolumes removes every cache volume the state minted, each on a
+// fresh detached context bounded by diffCoverageCleanupTimeout under the
+// runtime and bound CLI env it was minted with. A failure is logged
+// (gate_cache_volume_cleanup_failed, naming the label a leak stays
+// removable by) and never panics.
+func (s *gateIsolationState) removeCacheVolumes() {
+	s.cacheMu.Lock()
+	minted := s.cacheMinted
+	s.cacheMinted, s.cacheVol = nil, nil
+	s.cacheMu.Unlock()
+	for _, m := range minted {
+		detail := ""
+		if argv, err := m.vol.RemoveArgv(m.rt); err != nil {
+			detail = "argv: " + err.Error()
+		} else {
+			ctx, cancel := context.WithTimeout(context.Background(), diffCoverageCleanupTimeout)
+			out, code, _ := execGateAuxArgvFn(ctx, argv, os.TempDir(), m.cliEnv, diffCoverageCleanupTimeout)
+			cancel()
+			if code != 0 {
+				detail = fmt.Sprintf("exit %d: %s", code, gateOutputTail(out))
+			}
+		}
+		if detail != "" {
+			s.logEvent(`{"event":"gate_cache_volume_cleanup_failed","volume":%q,"detail":%q,"label":%q}`, m.vol.Name, detail, gateiso.CacheVolumeLabel)
+			continue
+		}
+		s.logEvent(`{"event":"gate_cache_volume_removed","volume":%q}`, m.vol.Name)
+	}
+}
+
+// cleanup releases the process-wide state: it first removes every cache
+// volume the state minted (#3967), then clears the global. run() defers it
+// so a later run() in the same process (the test binary) starts
+// unconfigured. Nil-safe.
 func (s *gateIsolationState) cleanup() {
+	if s != nil {
+		s.removeCacheVolumes()
+	}
 	if gateIsolation == s {
 		gateIsolation = nil
 	}
+}
+
+// cachePosture names the cache posture one container exec ran under for the
+// gate_container_timing line: process (the volume mounted), degraded (process
+// mode, but a cache step failed) or off (mode off, or a nil state).
+func (s *gateIsolationState) cachePosture(volume string) string {
+	switch {
+	case volume != "":
+		return string(gateiso.CacheModeProcess)
+	case s != nil && s.cacheMode == gateiso.CacheModeProcess:
+		return "degraded"
+	}
+	return string(gateiso.CacheModeOff)
 }
 
 // gateRefusalMessage renders the operator-facing output a refused gate
@@ -626,7 +804,11 @@ func materializeGateCheckout(ctx context.Context, repoDir, headSHA, parent strin
 // operational failure gateUnavailable, the resolved image recorded for the
 // evidence) — the FISHHAWK_GATE_IMAGE path skips it; when FISHHAWK_GATE_SERVICES names
 // postgres, a fresh per-exec gate service and its argv (#2137); the caller's
-// passwd file (gatePasswdFile — a DEGRADE, never a refusal); the argv build
+// passwd file (gatePasswdFile — a DEGRADE, never a refusal); under
+// FISHHAWK_GATE_CACHE=process the per-process cache volume for the resolved
+// image (gateCacheVolume: create + prepare + write check on every exec, a
+// DEGRADE to the per-exec GOCACHE / lint-cache binds on any failure, #3967)
+// with its env applied before the service env; the argv build
 // under the resolved-path mount guard (BEFORE the seed — a checkout the guard
 // refuses is never handed to the host-side seed); the host-side module-cache
 // seed under the SANITIZED gate env (no runner credential reaches the
@@ -651,7 +833,9 @@ func materializeGateCheckout(ctx context.Context, repoDir, headSHA, parent strin
 // the exit code, EXCEPT that a seam result reporting the runner's own
 // deadline expiry is gateTimedOut (#3383, no verdict). A gate-service
 // teardown failure is logged (gate_service_cleanup_failed) and never changes
-// the gate's verdict. Deliberate residual: a legitimate tree whose `replace`
+// the gate's verdict. Every exec that reaches the seam logs one
+// gate_container_timing line splitting cache / seed / service / exec time.
+// Deliberate residual: a legitimate tree whose `replace`
 // target sits outside the checkout draws ErrSeedCheckout too and reaches the
 // fix agent with the refusing message rather than parking category C.
 func runGateInContainer(ctx context.Context, sel gateiso.Selection, argv []string, dir, lintCacheDir string, sanitizedEnv, extraEnv []string, timeout time.Duration) (string, int, gateDisposition) {
@@ -696,6 +880,17 @@ func runGateInContainer(ctx context.Context, sel gateiso.Selection, argv []strin
 		uid, gid = st.uid, st.gid
 	}
 	env := gateiso.ContainerEnv(sanitizedEnv, extraEnv)
+	passwdFile := st.gatePasswdFile(ctx, sel.Runtime, image, vc.Root, cliEnv, uid, gid)
+	// The per-process cache volume (#3967) for the RESOLVED image — a
+	// declared gate_container's name@digest or FISHHAWK_GATE_IMAGE alike. ""
+	// keeps the per-exec GOCACHE / lint-cache binds exactly as before.
+	cacheStart := time.Now()
+	cacheVolume := st.gateCacheVolume(ctx, sel.Runtime, image, vc.Root, cliEnv, uid, gid)
+	cacheElapsed := time.Since(cacheStart)
+	if cacheVolume != "" {
+		// Cache env before the service env, which stays LAST.
+		env = gateiso.WithCacheVolumeEnv(env)
+	}
 	var svc *gateiso.PostgresService
 	var svcArgv gateServiceArgv
 	if st.postgresServiceWanted() {
@@ -713,14 +908,17 @@ func runGateInContainer(ctx context.Context, sel gateiso.Selection, argv []strin
 		Image:      image,
 		Name:       gateiso.NewContainerName(),
 		Checkout:   dir,
-		GoCache:    vc.GoCache,
 		GoModCache: vc.GoModCache,
-		LintCache:  lintCacheDir,
-		PasswdFile: st.gatePasswdFile(ctx, sel.Runtime, image, vc.Root, cliEnv, uid, gid),
+		PasswdFile: passwdFile,
 		Env:        env,
 		Argv:       argv,
 		UID:        uid,
 		GID:        gid,
+	}
+	if cacheVolume != "" {
+		spec.CacheVolume = cacheVolume
+	} else {
+		spec.GoCache, spec.LintCache = vc.GoCache, lintCacheDir
 	}
 	if svc != nil {
 		spec.ServiceMounts = []gateiso.ServiceMount{svc.GateMount()}
@@ -734,7 +932,10 @@ func runGateInContainer(ctx context.Context, sel gateiso.Selection, argv []strin
 	}
 	// Seed only AFTER the mount guard accepted every source: the seed is the
 	// one host-side process the container path runs against the checkout.
-	if _, err := seedModCacheFn(ctx, nil, dir, "", vc, sanitizedEnv, gateSeedTimeout); err != nil {
+	seedStart := time.Now()
+	_, err = seedModCacheFn(ctx, nil, dir, "", vc, sanitizedEnv, gateSeedTimeout)
+	seedElapsed := time.Since(seedStart)
+	if err != nil {
 		disp := gateUnavailable
 		if errors.Is(err, gateiso.ErrSeedCheckout) {
 			// The checkout's OWN metadata was refused: tree-attributable.
@@ -742,11 +943,15 @@ func runGateInContainer(ctx context.Context, sel gateiso.Selection, argv []strin
 		}
 		return "gate container: seed module cache: " + err.Error(), -1, disp
 	}
+	var serviceElapsed time.Duration
 	if svc != nil {
 		// Registered BEFORE `volume create` is attempted, so a partial
 		// provision, a failed gate and a timed-out gate all tear down.
 		defer teardownGateService(ctx, st, svc.Name, svcArgv, vc.Root, cliEnv)
-		if msg, ok := provisionGateService(ctx, svcArgv, vc.Root, cliEnv); !ok {
+		serviceStart := time.Now()
+		msg, ok := provisionGateService(ctx, svcArgv, vc.Root, cliEnv)
+		serviceElapsed = time.Since(serviceStart)
+		if !ok {
 			return "gate container: provision postgres service: " + msg, -1, gateUnavailable
 		}
 		st.logEvent(`{"event":"gate_service_provisioned","service":%q,"volume":%q,"image":%q}`, svc.Name, svc.Name, svc.Image)
@@ -754,7 +959,13 @@ func runGateInContainer(ctx context.Context, sel gateiso.Selection, argv []strin
 			gateServiceObserver(ctx, sel.Runtime, cliEnv, *svc)
 		}
 	}
+	execStart := time.Now()
 	out, code, timedOut := execBoundedHostArgvFn(ctx, runArgv, dir, cliEnv, timeout)
+	// One phase split per container exec (#3967): provisioning stays outside
+	// the gate timeout, so exec_ms alone is what the gate's timeout bounds.
+	st.logEvent(`{"event":"gate_container_timing","cache":%q,"cache_volume":%q,"cache_ms":%d,"seed_ms":%d,"service_ms":%d,"exec_ms":%d,"exit_code":%d}`,
+		st.cachePosture(cacheVolume), cacheVolume, cacheElapsed.Milliseconds(), seedElapsed.Milliseconds(),
+		serviceElapsed.Milliseconds(), time.Since(execStart).Milliseconds(), code)
 	if code == -1 {
 		killCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), diffCoverageCleanupTimeout)
 		defer cancel()

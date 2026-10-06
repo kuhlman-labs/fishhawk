@@ -392,6 +392,9 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		return exitUsage
 	}
 	gateIsolation = gateState
+	// The run and stage this process serves: every gate cache volume name
+	// embeds them (E51.18 / #3967).
+	gateState.bindOwner(cfg.runID, cfg.stageID)
 	defer gateState.cleanup()
 
 	_, _ = fmt.Fprintf(logSink, `{"event":"coercion_registry","summary":%q}`+"\n", plan.CoercionRegistrySummary())

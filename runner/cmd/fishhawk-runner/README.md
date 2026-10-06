@@ -447,8 +447,9 @@ the first gate exec from `FISHHAWK_GATE_ISOLATION` × `FISHHAWK_DEPLOYMENT_PROFI
 verdict under `FISHHAWK_GATE_IMAGE_ALLOWLIST` / `FISHHAWK_GATE_BUILD` × the
 detected runtime × the sandbox probe; the
 container path additionally reads `FISHHAWK_GATE_SERVICES` /
-`FISHHAWK_GATE_POSTGRES_IMAGE`, parsed by `configureGateIsolation` with the
-others, so an unknown service or allowlist entry fails startup like a bad mode —
+`FISHHAWK_GATE_POSTGRES_IMAGE` / `FISHHAWK_GATE_CACHE`, parsed by
+`configureGateIsolation` with the others, so an unknown service, allowlist
+entry or cache mode fails startup like a bad mode —
 `TestRun_GateIsolationConfigErrorsExitUsage`'s rows) routes:
 
 - **refused** → the refusal text (`gate isolation refused: …`) and `-1`
@@ -464,7 +465,19 @@ others, so an unknown service or allowlist entry fails startup like a bad mode �
   the CLI's combined stdout and stderr, so a cold pull's progress lines would
   otherwise land in the file), only a SUCCESSFUL read cached, written fresh
   per exec; any read or write failure
-  DEGRADES to no mount with `gate_passwd_unavailable`, never a refusal); the
+  DEGRADES to no mount with `gate_passwd_unavailable`, never a refusal);
+  under `FISHHAWK_GATE_CACHE=process` (the default; E51.18 / #3967) the
+  per-runner-process cache volume for the RESOLVED image
+  (`gateCacheVolume`: minted once per process with the run/stage ids
+  `run()` bound via `bindOwner` embedded in its name — an exec for a
+  different run/stage mints its own, `gate_cache_volume_not_reused` — then
+  on EVERY exec `volume create`, the contained prepare helper and a write
+  check under the gate's own user pin, each through `execGateAuxArgvFn`
+  under its own bound OUTSIDE the gate timeout; any failure DEGRADES that
+  exec to the per-exec `GOCACHE` / lint-cache binds with
+  `gate_cache_volume_unavailable` naming the step, never a refusal or a
+  verdict), mounted at `/gatecache` with `GOCACHE` / `GOLANGCI_LINT_CACHE`
+  re-pinned into it before the service env; the
   runtime argv built under the resolved-path socket-mount guard FIRST
   (`gateiso.ForbidSocketMounts` — a refused source returns `-1` with no exec
   AND no seed, so `go mod download` never runs against a checkout the
@@ -501,7 +514,14 @@ others, so an unknown service or allowlist entry fails startup like a bad mode �
   gates cannot redirect a bind-mount request to a daemon the selection never
   validated), and `rm -f` under the same binding on a detached bounded
   context whenever the exec returned `-1` (killing the CLI does not stop the
-  container). For a DECLARED `gate_container` (E51.3 / #2136; the
+  container). Every container exec that reaches the seam logs one
+  `gate_container_timing` line (`cache` = `process` | `degraded` | `off`,
+  `cache_volume`, `cache_ms`, `seed_ms`, `service_ms`, `exec_ms`,
+  `exit_code`) — the per-phase split the opt-in three-way harness
+  `TestGateMeasure_ThreeWayFullVerify` (`gatemeasure_test.go`) reads — and
+  `gateIsolationState.cleanup()`, deferred by `run()`, removes every cache
+  volume the process minted (`gate_cache_volume_removed` /
+  `gate_cache_volume_cleanup_failed`, never a panic). For a DECLARED `gate_container` (E51.3 / #2136; the
   `FISHHAWK_GATE_IMAGE` exec path is unchanged, its evidence gains
   `image_source: "env"`) `runGateInContainer` first
   resolves the image (`resolveDeclaredImage`): an inspect / pull of a declared

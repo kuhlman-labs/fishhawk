@@ -639,3 +639,140 @@ func TestBuildArgv_PasswdFileThroughMountGuard(t *testing.T) {
 		t.Fatalf("socket passwd file accepted: %q", argv)
 	}
 }
+
+// --- cache volume (#3967) ----------------------------------------------------
+
+// volumeSpecFor is specFor in the volume form: the GoCache/LintCache binds
+// are left empty and the spec mounts the fixed cache volume.
+func volumeSpecFor(m mountSet, rt Runtime) ContainerSpec {
+	s := specFor(m, rt)
+	s.GoCache, s.LintCache = "", ""
+	s.CacheVolume = testCacheVolume
+	return s
+}
+
+// TestBuildArgv_CacheVolumeGolden pins the volume form: the gocache and
+// lintcache binds are gone and the cache volume is mounted read-write at
+// /gatecache after the module cache.
+func TestBuildArgv_CacheVolumeGolden(t *testing.T) {
+	m := newMounts(t)
+	policy := MountPolicy{Permitted: []string{m.root}}
+	common := []string{
+		"--network=none", "--cap-drop=ALL", "--security-opt=no-new-privileges", "--workdir", "/work",
+	}
+	mounts := []string{
+		"-v", m.checkout + ":/work", "-v", m.gomod + ":/gomodcache", "-v", testCacheVolume + ":/gatecache",
+		"-e", "GOFLAGS=-mod=mod", "-e", "GOPROXY=off",
+		"--entrypoint", "", "docker.io/alpine/git:v2.47.2", "/bin/sh", "-c", "scripts/test verify",
+	}
+	for _, tc := range []struct {
+		rt   Runtime
+		head []string
+		user []string
+	}{
+		{Runtime{Kind: KindDocker, Safe: true}, []string{"docker", "--host", "unix://" + testSock}, []string{"--user", "501:20"}},
+		{Runtime{Kind: KindPodman, Safe: true, Rootless: true}, []string{"podman", "--url", "unix://" + testSock}, []string{"--userns=keep-id"}},
+	} {
+		got, err := volumeSpecFor(m, tc.rt).BuildArgv(policy)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := append(append([]string{}, tc.head...), "run", "--rm", "--name", "fishhawk-gate-0a1b2c3d4e5f")
+		want = append(want, common...)
+		want = append(want, tc.user...)
+		want = append(want, mounts...)
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("%s argv mismatch\n got %q\nwant %q", tc.rt.Kind, got, want)
+		}
+	}
+	// Bind sources set alongside a cache volume are not rendered.
+	both := specFor(m, Runtime{Kind: KindDocker, Safe: true})
+	both.CacheVolume = testCacheVolume
+	got, err := both.BuildArgv(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(got, " ")
+	if strings.Contains(joined, ":/gocache") || strings.Contains(joined, ":/lintcache") || !strings.Contains(joined, testCacheVolume+":/gatecache ") {
+		t.Fatalf("volume form rendered a cache bind: %q", got)
+	}
+	if strings.Contains(joined, testCacheVolume+":/gatecache:ro") {
+		t.Fatalf("cache volume mounted read-only: %q", got)
+	}
+}
+
+// TestBuildArgv_CacheVolumeRefusesNonCacheVolume: a host path, the daemon
+// socket, a service volume, an unscoped, upper-case or mount-suffixed name is
+// refused with NO argv — without the check BuildArgv would emit e.g.
+// `-v /var/run/docker.sock:/gatecache`. An empty CacheVolume is not a
+// refusal: it selects the bind form.
+func TestBuildArgv_CacheVolumeRefusesNonCacheVolume(t *testing.T) {
+	m := newMounts(t)
+	policy := MountPolicy{Permitted: []string{m.root}}
+	for _, vol := range []string{
+		"/var/run/docker.sock",
+		m.gocache,
+		"docker.sock",
+		"fishhawk-gate-svc-0a1b2c3d4e5f",
+		"fishhawk-gate-cache-0a1b2c3d4e5f",
+		strings.ToUpper(testCacheVolume),
+		testCacheVolume + ":/etc",
+		"../" + testCacheVolume,
+	} {
+		spec := volumeSpecFor(m, Runtime{Kind: KindDocker, Safe: true})
+		spec.CacheVolume = vol
+		argv, err := spec.BuildArgv(policy)
+		if !errors.Is(err, ErrContainerSpec) || argv != nil || !strings.Contains(err.Error(), "not a gate cache volume") {
+			t.Errorf("%q: argv %q, err %v; want the cache volume refused with nil argv", vol, argv, err)
+		}
+	}
+	spec := specFor(m, Runtime{Kind: KindDocker, Safe: true})
+	spec.CacheVolume = ""
+	argv, err := spec.BuildArgv(policy)
+	if err != nil || !strings.Contains(strings.Join(argv, " "), m.gocache+":/gocache") || strings.Contains(strings.Join(argv, " "), "/gatecache") {
+		t.Fatalf("empty CacheVolume must select the bind form: %q, %v", argv, err)
+	}
+}
+
+// TestBuildArgv_CacheVolumeStillGuardsCheckout: the volume form keeps
+// ForbidSocketMounts over the checkout, the module cache and the passwd file.
+func TestBuildArgv_CacheVolumeStillGuardsCheckout(t *testing.T) {
+	for _, plant := range []string{"checkout", "gomod"} {
+		m := newMounts(t)
+		dir := m.checkout
+		if plant == "gomod" {
+			dir = m.gomod
+		}
+		listenUnix(t, dir, "planted.sock")
+		got, err := volumeSpecFor(m, Runtime{Kind: KindDocker, Safe: true}).BuildArgv(MountPolicy{Permitted: []string{m.root}})
+		if err == nil || got != nil || !strings.Contains(err.Error(), "planted.sock") {
+			t.Errorf("%s: socket accepted in volume form: %q, %v", plant, got, err)
+		}
+	}
+	m := newMounts(t)
+	spec := volumeSpecFor(m, Runtime{Kind: KindDocker, Safe: true})
+	spec.PasswdFile = listenUnix(t, m.root, "p.sock")
+	if got, err := spec.BuildArgv(MountPolicy{Permitted: []string{m.root}}); err == nil || got != nil {
+		t.Errorf("socket passwd file accepted in volume form: %q", got)
+	}
+}
+
+// TestBuildArgv_CacheVolumeIncompleteSpec: the volume form still requires the
+// checkout and the module cache, and no longer requires the cache binds.
+func TestBuildArgv_CacheVolumeIncompleteSpec(t *testing.T) {
+	m := newMounts(t)
+	policy := MountPolicy{Permitted: []string{m.root}}
+	for name, mut := range map[string]func(s *ContainerSpec){
+		"no checkout": func(s *ContainerSpec) { s.Checkout = "" },
+		"no gomod":    func(s *ContainerSpec) { s.GoModCache = "" },
+	} {
+		s := volumeSpecFor(m, Runtime{Kind: KindDocker, Safe: true})
+		mut(&s)
+		if got, err := s.BuildArgv(policy); !errors.Is(err, ErrContainerSpec) || got != nil {
+			t.Errorf("%s: got %q, %v; want ErrContainerSpec", name, got, err)
+		}
+	}
+	if got, err := volumeSpecFor(m, Runtime{Kind: KindDocker, Safe: true}).BuildArgv(policy); err != nil || got == nil {
+		t.Errorf("volume form without cache binds refused: %q, %v", got, err)
+	}
+}

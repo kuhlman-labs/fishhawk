@@ -217,7 +217,7 @@ where the execution PATH is chosen. The pure pieces live in
 [`runner/internal/gateiso`](internal/gateiso/README.md) (the long-form
 contract); `cmd/fishhawk-runner/gateisolation.go` is the runner-side glue.
 
-**Seven startup variables.** `FISHHAWK_GATE_ISOLATION` (`auto` default |
+**Eight startup variables.** `FISHHAWK_GATE_ISOLATION` (`auto` default |
 `container` | `clone-sandbox` | `clone`), `FISHHAWK_GATE_IMAGE` (empty default
 — the container path is unavailable without it, so a default runner's
 behaviour is unchanged except for the clone materialization below; for this
@@ -238,9 +238,11 @@ DIGEST),
 `FISHHAWK_DEPLOYMENT_PROFILE` (`local` default | `self-hosted` | `hosted`),
 `FISHHAWK_GATE_IMAGE_ALLOWLIST` (empty default; the operator image allowlist a
 declared `gate_container` image and every base of a declared build must pass)
-and `FISHHAWK_GATE_BUILD` (`allow` | `deny`; empty = the profile default,
-`hosted` deny). A
-bad value (an unknown `FISHHAWK_GATE_SERVICES` member or allowlist entry included), or `hosted`
+`FISHHAWK_GATE_BUILD` (`allow` | `deny`; empty = the profile default,
+`hosted` deny) and `FISHHAWK_GATE_CACHE` (`process` default | `off`; the
+container path's build-cache posture, E51.18 /
+[#3967](https://github.com/kuhlman-labs/fishhawk/issues/3967), below). A
+bad value (an unknown `FISHHAWK_GATE_SERVICES` member, allowlist entry or `FISHHAWK_GATE_CACHE` value included), or `hosted`
 with an explicit fallback mode, fails the runner with
 `runner_failed reason=config` before it contacts the backend; a valid config
 logs `gate_isolation_configured`, and the first gate exec logs
@@ -284,7 +286,9 @@ gate image".
 `--network=none --cap-drop=ALL --security-opt=no-new-privileges --entrypoint ''`,
 every invocation — run and `rm -f` — bound to the validated socket with
 `--host`/`--url unix://<socket>` so a later context switch cannot redirect it,
-four bind mounts only — the checkout and three EMPTY per-exec caches, the
+four bind mounts only — the checkout and three EMPTY per-exec caches (under
+`FISHHAWK_GATE_CACHE=process` the build and lint caches are instead the runner
+process's named cache volume, below), the
 module cache seeded host-side under the sanitized env with `GOTOOLCHAIN=local`
 and refused when the checkout's module metadata reaches outside the checkout —
 the sanitized gate env via `-e` with `FISHHAWK_GATE_CONTAINER=1` pinned, a
@@ -336,8 +340,10 @@ requires `DOCKER_HOST` (if set) AND the active docker context's
 symlink outside the permitted roots, any socket within a depth-8 walk, and the
 detected daemon socket. The host `GOMODCACHE` is never mounted: each container
 exec seeds a fresh empty module cache host-side through a `file://` proxy and
-runs with a cold `GOCACHE` (the documented per-exec cost of the opt-in
-container path).
+runs with `GOCACHE` and the lint cache in the runner process's cache volume
+(`FISHHAWK_GATE_CACHE=process`, below) — or, under `FISHHAWK_GATE_CACHE=off`
+or a degraded cache step, cold per-exec ones (the pre-#3967 cost of the
+opt-in container path).
 
 **Two documented, test-pinned residuals (approval condition 6).** The profile
 is DECLARED, not detected — a hosted deployment that forgets
@@ -387,6 +393,37 @@ docker volume rm $(docker volume ls -q --filter label=org.fishhawk.gate-service)
 ```
 
 (`podman` takes the same arguments.)
+
+**Gate cache volume (E51.18 / [#3967](https://github.com/kuhlman-labs/fishhawk/issues/3967)).**
+Under `FISHHAWK_GATE_CACHE=process` (the default) the container path keeps
+`GOCACHE` and the golangci-lint cache in ONE named volume per runner PROCESS —
+`fishhawk-gate-cache-<run id>-<stage id>-<12 hex>`, labelled
+`org.fishhawk.gate-cache`, mounted read-write at `/gatecache`
+(`GOCACHE=/gatecache/gocache`, `GOLANGCI_LINT_CACHE=/gatecache/lintcache`) —
+minted on the first container exec and reused by every later one of that
+process (scoped verify, full verify, `diff_coverage`, fix iterations,
+absorbs). A runner process serves one stage of one run (`run()` binds the
+run/stage ids once via `bindOwner`), so no gate ever reads a cache another
+run's gate wrote; an exec for a different run/stage mints its own. Before
+EVERY exec the runner runs `volume create` (idempotent), a contained prepare
+helper (subdirectories owned by the gate uid) and a write check under the
+gate's own user pin; any failure DEGRADES that exec to the per-exec caches
+with `gate_cache_volume_unavailable` naming the step — never a refusal, never
+a verdict. The module cache stays per-exec and host-seeded. Each container
+exec logs one `gate_container_timing` line (`cache`, `cache_ms`, `seed_ms`,
+`service_ms`, `exec_ms`). The volume is removed at process exit
+(`gate_cache_volume_removed`, or `gate_cache_volume_cleanup_failed`); a runner
+SIGKILLed mid-stage leaves it behind, so with no runner live:
+
+```sh
+docker volume rm $(docker volume ls -q --filter label=org.fishhawk.gate-cache)
+```
+
+The local default is UNCHANGED (the container path stays opt-in via
+`FISHHAWK_GATE_IMAGE`) until the opt-in three-way measurement
+(`TestGateMeasure_ThreeWayFullVerify`) records numbers against the decision
+rule. Boundary, residuals, measurement procedure and rule:
+`internal/gateiso/README.md` § "Persistent cache volume".
 
 **Operator walk before enabling it for this repository (approval conditions 5
 and 6 of #2137).** The implement gate proves the pieces, not the full

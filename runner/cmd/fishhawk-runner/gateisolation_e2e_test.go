@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,7 +30,7 @@ import (
 //
 // These cross gateiso → the runner wiring (runBoundedGateArgv,
 // runVerifyCommittedTree, runVerifyFixLoop) → a REAL container runtime and
-// the pinned image. Every docker-gated fixture (a)–(g), (k)–(m) skips with
+// the pinned image. Every docker-gated fixture (a)–(g), (k)–(m), (o) skips with
 // the detected reason when no safe runtime or the image is unavailable, and
 // increments dockerFixturesRan at its END so main_test.go's TestMain
 // sentinel (approval condition 3) turns an all-skipped run on a docker host
@@ -49,7 +50,11 @@ const gateTestImageDefault = "docker.io/alpine/git:v2.47.2"
 // gateImageBinaries are the in-image binaries every fixture relies on;
 // requireGateImage checks each one INSIDE the image and skips naming the
 // first missing one rather than letting a fixture fail on a busybox gap.
-var gateImageBinaries = []string{"git", "wget", "env", "sh", "cat", "ls", "sleep", "id", "stat", "test", "touch", "ln"}
+// sh, mkdir and chown are the cache volume's docker prepare helper and
+// install the rootless-podman one (#3967 approval condition 3): a gate image
+// without them degrades every exec to the per-exec caches, so their absence
+// is named here rather than only in a degrade log line.
+var gateImageBinaries = []string{"git", "wget", "env", "sh", "cat", "ls", "sleep", "id", "stat", "test", "touch", "ln", "mkdir", "chown", "install"}
 
 // gateImageCheck is the once-per-process outcome of requireGateImage.
 type gateImageCheck struct {
@@ -120,11 +125,13 @@ func requireGateImage(t *testing.T) (gateiso.Runtime, string) {
 
 // liveContainerState installs a mode=container state bound to the REAL
 // detected runtime and the pinned image (DefaultProbes, so the recorded
-// selection carries the real endpoint) and returns it.
+// selection carries the real endpoint) and returns it. It pins
+// FISHHAWK_GATE_CACHE=off so fixtures (a)–(k) keep the per-exec caches —
+// (k) plants into the per-exec cache dirs; fixture (o) owns process mode.
 func liveContainerState(t *testing.T, rt gateiso.Runtime, image string) *gateIsolationState {
 	t.Helper()
 	st, err := configureGateIsolation(fakeEnv(map[string]string{
-		gateIsolationModeEnvVar: "container", gateImageEnvVar: image}), gateiso.DefaultProbes(), io.Discard)
+		gateIsolationModeEnvVar: "container", gateImageEnvVar: image, gateCacheEnvVar: "off"}), gateiso.DefaultProbes(), io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -879,11 +886,11 @@ func requirePostgresImage(t *testing.T, rt gateiso.Runtime) string {
 
 // liveServiceState installs a mode=container state bound to the REAL detected
 // runtime with FISHHAWK_GATE_SERVICES=services and the given gate and
-// Postgres images, logging to logSink.
+// Postgres images, logging to logSink (cache off, like liveContainerState).
 func liveServiceState(t *testing.T, rt gateiso.Runtime, image, services string, logSink io.Writer) *gateIsolationState {
 	t.Helper()
 	st, err := configureGateIsolation(fakeEnv(map[string]string{
-		gateIsolationModeEnvVar: "container", gateImageEnvVar: image,
+		gateIsolationModeEnvVar: "container", gateImageEnvVar: image, gateCacheEnvVar: "off",
 		gateServicesEnvVar: services, gatePostgresImageEnvVar: gateiso.DefaultPostgresImage}), gateiso.DefaultProbes(), logSink)
 	if err != nil {
 		t.Fatal(err)
@@ -1308,5 +1315,129 @@ func TestGateContainer_SelfHostPgtestSuite(t *testing.T) {
 	// The positive evidence an operator walk records: the in-container
 	// go test -v output with its PASS line.
 	t.Logf("in-container pgtest output:\n%s", out)
+	dockerFixturesRan++
+}
+
+// liveCacheState configures (does NOT install) a mode=container state on the
+// REAL detected runtime with FISHHAWK_GATE_CACHE=cache, bound to (run, stage)
+// — one runner process in fixture (o). Its cleanup is registered so a failing
+// fixture still removes the volume.
+func liveCacheState(t *testing.T, rt gateiso.Runtime, image, cache, run, stage string) *gateIsolationState {
+	t.Helper()
+	st, err := configureGateIsolation(fakeEnv(map[string]string{
+		gateIsolationModeEnvVar: "container", gateImageEnvVar: image, gateCacheEnvVar: cache}), gateiso.DefaultProbes(), testLogWriter{t})
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.detect = func(context.Context, gateiso.Probes) gateiso.Runtime { return rt }
+	st.bindOwner(run, stage)
+	t.Cleanup(st.cleanup)
+	return st
+}
+
+// testLogWriter routes a state's runner log lines to t.Log, so a fixture
+// failure shows why a cache step degraded.
+type testLogWriter struct{ t *testing.T }
+
+func (w testLogWriter) Write(p []byte) (int, error) {
+	w.t.Helper()
+	w.t.Log(strings.TrimSpace(string(p)))
+	return len(p), nil
+}
+
+// liveExecOn runs cmd through the real gate seam with st as the process-wide
+// state, failing the fixture on a non-zero exit.
+func liveExecOn(t *testing.T, st *gateIsolationState, cmd string) string {
+	t.Helper()
+	prev := gateIsolation
+	gateIsolation = st
+	defer func() { gateIsolation = prev }()
+	out, code := runBoundedGateCommand(context.Background(), cmd, t.TempDir(), filepath.Join(t.TempDir(), "lc"), 2*time.Minute)
+	if code != 0 {
+		t.Fatalf("exit %d:\n%s", code, out)
+	}
+	return out
+}
+
+// lastContainerRunArgv returns the LAST gate `run` argv recorded by
+// recordHostExec.
+func lastContainerRunArgv(t *testing.T, calls [][]string) []string {
+	t.Helper()
+	for i := len(calls) - 1; i >= 0; i-- {
+		if c := calls[i]; len(c) > 4 && c[3] == "run" {
+			return c
+		}
+	}
+	t.Fatalf("no `run` argv recorded: %q", calls)
+	return nil
+}
+
+// (o) TestGateContainer_CacheVolumeWarmWithinProcessFreshAcrossProcesses
+// (E51.18 / #3967): state A (cache process) exec 1 runs as the runner uid,
+// sees GOCACHE=/gatecache/gocache and can WRITE it (the prepare helper's
+// ownership); A's exec 2 finds the marker (warm within a process); state B —
+// a second runner process — mounts a different volume and finds nothing
+// (fresh across processes); the positive control C (cache off) does NOT see
+// its own exec-1 marker, so the warm assertion discriminates on the volume.
+// The gate argv mounts the volume BY NAME (never an absolute host path)
+// beside --network=none, and the volume carries the org.fishhawk.gate-cache
+// label until A.cleanup() removes it.
+func TestGateContainer_CacheVolumeWarmWithinProcessFreshAcrossProcesses(t *testing.T) {
+	rt, image := requireGateImage(t)
+	calls := recordHostExec(t)
+	const (
+		runA, stageA = "0000000a-0000-4000-8000-00000000000a", "0000000a-0000-4000-8000-0000000000a0"
+		runB, stageB = "0000000b-0000-4000-8000-00000000000b", "0000000b-0000-4000-8000-0000000000b0"
+	)
+	write := `printf 'uid=%s\n' "$(id -u)"; printf 'gocache=%s\n' "$GOCACHE"; touch "$GOCACHE/marker" && echo marker=wrote`
+	probe := `if test -f "$GOCACHE/marker"; then echo probe=warm; else echo probe=fresh; fi`
+
+	a := liveCacheState(t, rt, image, "process", runA, stageA)
+	out := liveExecOn(t, a, write)
+	if got := outputField(out, "uid"); got != strconv.Itoa(os.Getuid()) {
+		t.Errorf("A exec 1 uid = %q, want the runner's %d", got, os.Getuid())
+	}
+	if got := outputField(out, "gocache"); got != gateiso.GateGoCache {
+		t.Errorf("A exec 1 GOCACHE = %q, want %q", got, gateiso.GateGoCache)
+	}
+	if outputField(out, "marker") != "wrote" {
+		t.Fatalf("A exec 1 could not write its GOCACHE as the runner uid (prepare ownership):\n%s", out)
+	}
+	runA1 := lastContainerRunArgv(t, *calls)
+	volA := argvMountSource(runA1, gateiso.MountGateCache)
+	if !(gateiso.CacheVolume{Name: volA}).BelongsTo(runA, stageA) || filepath.IsAbs(volA) {
+		t.Fatalf("A's /gatecache source %q is not its named cache volume: %q", volA, runA1)
+	}
+	if !slices.Contains(runA1, "--network=none") {
+		t.Errorf("A's gate argv lacks --network=none: %q", runA1)
+	}
+	if got := outputField(liveExecOn(t, a, probe), "probe"); got != "warm" {
+		t.Errorf("A exec 2 probe = %q, want warm (one volume per process, reused)", got)
+	}
+
+	b := liveCacheState(t, rt, image, "process", runB, stageB)
+	if got := outputField(liveExecOn(t, b, probe), "probe"); got != "fresh" {
+		t.Errorf("B probe = %q, want fresh (another process must never see A's cache)", got)
+	}
+	if volB := argvMountSource(lastContainerRunArgv(t, *calls), gateiso.MountGateCache); volB == "" || volB == volA {
+		t.Errorf("B mounted %q, A mounted %q: want a distinct volume", volB, volA)
+	}
+
+	c := liveCacheState(t, rt, image, "off", runA, stageA)
+	if out := liveExecOn(t, c, write); outputField(out, "marker") != "wrote" || outputField(out, "gocache") != gateiso.MountGoCache {
+		t.Fatalf("C exec 1 (cache off) did not write its per-exec GOCACHE:\n%s", out)
+	}
+	if got := outputField(liveExecOn(t, c, probe), "probe"); got != "fresh" {
+		t.Errorf("positive control C (cache off) probe = %q, want fresh: the warm assertion would not discriminate", got)
+	}
+
+	label, err := runtimeHostCmd(t, rt, "volume", "inspect", "--format", `{{ index .Labels "`+gateiso.CacheVolumeLabel+`" }}`, volA)
+	if err != nil || label != string(gateiso.CacheModeProcess) {
+		t.Errorf("volume inspect %s = %q / %v, want label %s=process before cleanup", volA, label, err, gateiso.CacheVolumeLabel)
+	}
+	a.cleanup()
+	if out, err := runtimeHostCmd(t, rt, "volume", "inspect", volA); err == nil {
+		t.Errorf("volume %s survives A.cleanup():\n%s", volA, out)
+	}
 	dockerFixturesRan++
 }
