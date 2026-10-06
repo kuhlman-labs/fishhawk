@@ -89,6 +89,18 @@ func TestParseDockerfile_Refusals(t *testing.T) {
 		{"run network single-quoted lowercase", "FROM alpine\nrun --network='none' true\n", "quote or backslash"},
 		{"copy from quoted lowercase", "FROM alpine\ncopy --from=\"evil/img\" /a /b\n", "quote or backslash"},
 		{"FROM platform quoted", "FROM --platform=\"linux/amd64\" alpine\n", "quote or backslash"},
+		// A byte >= 0x80 on an instruction line: BuildKit's byte-wise flag
+		// lexer ends a word on 0xA0 / 0x85, so `/tà--mount=from=…` is a second
+		// mount to it (operator-verified: busybox's root was listed).
+		{"RUN mount split on byte 0xA0", "FROM busybox\nRUN --mount=type=tmpfs,target=/t\xc3\xa0--mount=from=busybox,type=bind,target=/bb ls /bb\n", "line 2: character U+00E0 on an instruction line is refused"},
+		{"RUN mount split on byte 0x85", "FROM busybox\nRUN --mount=type=tmpfs,target=/t\xc4\x85--mount=from=busybox,type=bind,target=/bb ls /bb\n", "line 2: character U+0105 on an instruction line is refused"},
+		{"run mount split lowercase", "FROM alpine\nrun --mount=type=tmpfs,target=/t\u00e0--mount=type=cache,target=/c true\n", "U+00E0 on an instruction line"},
+		{"Copy from split mixed case", "FROM alpine\nCopy --from=build\u00e0--from=evil/img /a /b\n", "U+00E0 on an instruction line"},
+		{"non-ASCII outside a flag", "FROM alpine\nRUN echo caf\u00e9\n", "line 2: character U+00E9 on an instruction line"},
+		{"non-ASCII on a continuation line", "FROM alpine\nRUN \\\n  --mount=type=tmpfs,target=/t\u00e0--mount=from=evil/img,type=bind,target=/x true\n", "line 3: character U+00E0 on an instruction line"},
+		// The faithful view consumes this body; the backstop views read it as
+		// an instruction, so the flag-token rule refuses it there.
+		{"non-ASCII flag in a heredoc body", "FROM alpine\nRUN cat <<EOF\nRUN --mount=type=tmpfs,target=/t\u00e0--mount=from=evil/img,type=bind,target=/x true\nEOF\n", "U+00E0 carries a byte >= 0x80"},
 		// Heredoc tokens the builder could delimit differently.
 		{"here-string", "FROM alpine\nRUN cat <<<x\n", "standalone heredoc"},
 		{"quoted heredoc marker", "FROM alpine\nRUN echo \"<<EOF\"\n", "standalone heredoc"},
@@ -171,6 +183,7 @@ COPY ["go.mod", "./"]
 		"tab separators":                   "FROM\talpine\nRUN\t--network=none\ttrue\n",
 		"onbuild heredoc body consumed":    "FROM alpine\nONBUILD RUN <<EOF\necho hi\nEOF\nRUN true\n",
 		"non-ASCII non-space in a comment": "# café — ünïcode\nFROM alpine\n",
+		"non-ASCII in a heredoc body":      "FROM alpine\nRUN cat <<EOF\ncafé\nRUN echo café\nEOF\n",
 	}
 	for name, c := range rows {
 		t.Run(name, func(t *testing.T) {
@@ -202,13 +215,16 @@ COPY --from=second /a /b
 RUN --mount=type=bind,from=alpine,target=/x true
 Run --mount=type=cache,target=/c true
 run --mount=type=bind,from=build,target=/y true
+RUN --mount=type=bind,from=0,target=/z true
 FROM scratch
 FROM Scratch
 `))
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"FROM golang:1.25", "FROM evil/base", "COPY --from " + pinned, "RUN --mount from alpine"}
+	// COPY --from=0 is a stage index; RUN --mount from=0 is the IMAGE
+	// docker.io/library/0 (BuildKit resolves a mount source by name only).
+	want := []string{"FROM golang:1.25", "FROM evil/base", "COPY --from " + pinned, "RUN --mount from alpine", "RUN --mount from 0"}
 	if got := baseRefs(df); strings.Join(got, "|") != strings.Join(want, "|") {
 		t.Fatalf("bases = %q, want %q", got, want)
 	}
@@ -244,6 +260,29 @@ func TestParseDockerfile_StageNameOnlyFromFaithfulView(t *testing.T) {
 	}
 }
 
+// TestParseDockerfile_OnbuildHeredocBodyDeclaresNoStage pins that an
+// ONBUILD RUN/COPY/ADD heredoc body is consumed like the bare form's, so a
+// `FROM … AS evil` inside it never makes a later --from=evil a stage. The
+// second fixture isolates the unwrap from the unknown-token refusal: its
+// terminator `FROM` is itself an instruction, so without the unwrap every
+// body line parses and only the stage set is wrong.
+func TestParseDockerfile_OnbuildHeredocBodyDeclaresNoStage(t *testing.T) {
+	for name, c := range map[string]string{
+		"EOF terminator":  "FROM alpine\nONBUILD RUN cat <<EOF\nFROM scratch AS evil\nEOF\nCOPY --from=evil /a /b\n",
+		"FROM terminator": "FROM alpine\nonbuild run cat <<FROM\nFROM scratch AS evil\nFROM\nCOPY --from=evil /a /b\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			df, err := ParseDockerfile([]byte(c))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := strings.Join(baseRefs(df), "|"); got != "FROM alpine|COPY --from evil" {
+				t.Fatalf("bases = %q, want COPY --from=evil collected as an image", got)
+			}
+		})
+	}
+}
+
 func TestCheckBuildBases(t *testing.T) {
 	allow, err := ParseAllowlist("ghcr.io/org/")
 	if err != nil {
@@ -262,6 +301,8 @@ func TestCheckBuildBases(t *testing.T) {
 		{"off-list COPY --from", "FROM " + ok + "\nCOPY --from=evil/x /a /b\n", allow, false, "COPY --from base docker.io/evil/x is not permitted"},
 		{"off-list lowercase copy --from", "FROM " + ok + "\ncopy --from=evil/x /a /b\n", allow, false, "COPY --from base docker.io/evil/x"},
 		{"off-list mount from", "FROM " + ok + "\nRUN --mount=type=bind,from=evil/m,target=/x true\n", allow, false, "RUN --mount from base docker.io/evil/m"},
+		{"numeric mount from is an image", "FROM " + ok + " AS a\nFROM " + ok + "\nRUN --mount=type=bind,from=0,target=/x cat /x/m\n", allow, false, "RUN --mount from base docker.io/library/0 is not permitted"},
+		{"numeric COPY --from is a stage index", "FROM " + ok + " AS a\nFROM " + ok + "\nCOPY --from=0 /a /b\n", allow, true, ""},
 		{"stage names never checked", "FROM " + ok + " AS build\nFROM build\nCOPY --from=build /a /b\nRUN --mount=from=build,target=/x true\n", allow, true, ""},
 		{"variable base with allowlist", "ARG B\nFROM $B\n", allow, false, "variable expansion"},
 		{"variable base without allowlist", "ARG B\nFROM $B\n", nil, false, ""},

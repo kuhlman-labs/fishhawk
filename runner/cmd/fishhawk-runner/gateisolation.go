@@ -168,8 +168,9 @@ const (
 	gateImageInspectTimeout = 30 * time.Second
 	// gateImagePullTimeout bounds the explicit pull of a declared image.
 	gateImagePullTimeout = 10 * time.Minute
-	// gateImageBuildTimeout bounds an in-repo build, including reading and
-	// materializing its committed source from git.
+	// gateImageBuildTimeout bounds an in-repo build TWICE, separately: once
+	// over reading and materializing its committed source from git, and again
+	// over the build call itself (worst case about twice this value).
 	gateImageBuildTimeout = 20 * time.Minute
 )
 

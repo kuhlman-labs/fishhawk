@@ -502,7 +502,8 @@ others, so an unknown service or allowlist entry fails startup like a bad mode â
   validated), and `rm -f` under the same binding on a detached bounded
   context whenever the exec returned `-1` (killing the CLI does not stop the
   container). For a DECLARED `gate_container` (E51.3 / #2136; the
-  `FISHHAWK_GATE_IMAGE` path stays byte-identical) `runGateInContainer` first
+  `FISHHAWK_GATE_IMAGE` exec path is unchanged, its evidence gains
+  `image_source: "env"`) `runGateInContainer` first
   resolves the image (`resolveDeclaredImage`): an inspect / pull of a declared
   `image:` run by `name@<registry digest>`, or an in-repo build of the
   COMMITTED context at the checkout's HEAD after the static Dockerfile guard,

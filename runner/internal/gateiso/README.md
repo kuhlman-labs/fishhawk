@@ -103,8 +103,10 @@ stay byte-identical. The wire shape is pinned cross-module by
 three `gate_container` members below) and the `gate_isolation_evidence`
 `ModeExact` pair in `backend/internal/wirecontract`.
 
-**Declared-image fields (E51.3 / #2136), all omitempty** so an undeclared
-stage's member is byte-identical to its #2135 form: `image_source` (`stage` |
+**Declared-image fields (E51.3 / #2136), all omitempty** so a stage with
+neither a declared block nor `FISHHAWK_GATE_IMAGE` has a member byte-identical
+to its #2135 form (an env-image stage's member gains `image_source: "env"`):
+`image_source` (`stage` |
 `workflow` | `env`), `image_digest` (the registry digest a pulled image ran
 by), `image_id` (the runtime's local image id — opaque, recorded, never
 compared: on a containerd image store it is an index digest, AGENTS.md trap
@@ -186,7 +188,13 @@ pull or has no registry digest, and the reason names the remedy — declare
 `FISHHAWK_GATE_IMAGE` (`PullFailedReason`).
 
 **Building a declared `dockerfile`/`context`** (`resolveBuiltImage`,
-`imageresolve.go`, `dockerfile.go`), in order, all under a 20-minute bound:
+`imageresolve.go`, `dockerfile.go`), in order, under TWO separate bounds:
+reading the committed source from git, the static guard and materializing the
+context share one 20-minute bound (`gateImageBuildTimeout`, armed when
+resolution starts), and the build call then gets its OWN
+`gateImageBuildTimeout` (20 minutes) — so the worst case is about 40 minutes.
+The cache-hit and post-build inspects keep the 30-second inspect bound. All of
+it is outside the gate timeout.
 
 1. **Source = the COMMITTED tree at the gate checkout's HEAD**, read from git
    objects (`ResolveBuildSource`), never the working tree — an uncommitted or
@@ -219,6 +227,12 @@ pull or has no registry digest, and the reason names the remedy — declare
      strips them and keeps a quoted space inside one flag
      (`--mount="type=bind, from=evil/x"`), so the value cannot be classified
      statically;
+   - any byte >= 0x80 on an instruction line (comment lines and consumed
+     heredoc bodies keep non-ASCII text), and in a flag token in every view:
+     BuildKit's flag lexer walks the line BYTE by byte and ends a word on
+     0x85 and 0xA0, the UTF-8 continuation bytes of `ą` and `à`, so
+     `--mount=type=tmpfs,target=/tà--mount=from=<image>,…` is two mounts to
+     it and one flag here (operator-verified against the builder);
    - any parser directive other than `check` — `# syntax=` (selects a
      BuildKit frontend image that can ignore `--network=none`) and `# escape=`
      (changes how the file is tokenized) included;
@@ -238,8 +252,10 @@ pull or has no registry digest, and the reason names the remedy — declare
    - under `hosted`, `RUN --mount=type=cache` (a cache mount persists on the
      shared daemon across builds and projects);
    - with an allowlist configured, every base — `FROM`, `COPY --from=<image>`,
-     `RUN --mount=…,from=<image>`; stage names, stage indexes and `scratch`
-     are not bases — must pass it, a variable-bearing base (`$`) is refused
+     `RUN --mount=…,from=<image>`; stage names, `COPY --from` stage indexes
+     and `scratch` are not bases, while a digits-only `RUN --mount from=` IS
+     an image (BuildKit resolves a mount source by stage name only, so
+     `from=0` pulls `docker.io/library/0`) — must pass it, a variable-bearing base (`$`) is refused
      (not statically checkable), and under `hosted` every base must be
      digest-pinned.
 4. **Cache:** the image is tagged `fishhawk-gate-build:<digest hex>` with
@@ -263,15 +279,33 @@ holds the Dockerfile's inputs.
 
 **Seam.** `diff_coverage` and the auto-format absorb reach the same exec seam
 as the verify gates, so they run in the declared image too; there is no
-`diff_coverage`-specific image rule. The `FISHHAWK_GATE_IMAGE` path is
-byte-identical to its pre-#2136 form (implicit pull inside the gate timeout,
-no digest on the evidence).
+`diff_coverage`-specific image rule. The `FISHHAWK_GATE_IMAGE` EXEC path is
+unchanged from its pre-#2136 form (the same container argv, implicit pull
+inside the gate timeout, no digest on the evidence). Its RECORDS are not
+byte-identical: the `gate_isolation_selected` log line and the
+`gate_isolation` evidence now carry `image_source: "env"`. The shared
+golden's `container` / `refused` members keep the pre-#2136 shape (an
+`image` with no `image_source`), which the runner no longer emits for an
+env image; they pin the wire's field set, not the env-image record.
 
 **Honest limits (documented, not closed):**
 - **Cache mounts outside `hosted`.** `RUN --mount=type=cache` is accepted
   under `local` / `self-hosted`: the cache persists on the daemon across
   builds and projects, so a build can read a cache another build wrote. That
   is accepted for a single-tenant host; `hosted` refuses it.
+- **Build bases are pulled with the runner host's own registry
+  credentials.** Without `FISHHAWK_GATE_IMAGE_ALLOWLIST` (the default in
+  `local` / `self-hosted`), a declared build's `FROM` / `COPY --from=` /
+  `RUN --mount from=` references are unconstrained, and the daemon pulls
+  them through the runtime CLI's inherited environment, i.e. the host's
+  `docker login` / `containers-auth.json` store. The agent-writable
+  Dockerfile therefore gets (1) a daemon-mediated egress channel to any
+  registry host, with data encodable in the host or repository name, and
+  (2) read access to any private image the host is logged in to, whose
+  contents become the gate image's filesystem and can reach gate output.
+  The mitigation is the allowlist: configure `FISHHAWK_GATE_IMAGE_ALLOWLIST`
+  (or `FISHHAWK_GATE_BUILD=deny`) on any host whose runtime CLI holds
+  registry credentials; `hosted` requires an allowlist for builds.
 - RUN steps run as root inside the build sandbox (the GATE runs non-root via
   `--user`; the build does not).
 - A base image's `ONBUILD` triggers are not visible to the static scan.

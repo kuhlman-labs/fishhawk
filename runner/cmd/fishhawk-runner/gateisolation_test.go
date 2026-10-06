@@ -2895,8 +2895,10 @@ func TestDeclaredBuild_ModeOnlyChangeAltersDigest(t *testing.T) {
 
 // TestDeclaredBuild_StaticRefusalBeforeBuild (approval conditions 1, 2, 6):
 // every static refusal — a frontend-selecting directive in each form, each
-// ADD source shape, the RUN network/security flags, an off-allowlist base in
-// lower case, and a cache mount under hosted — is gateRefused with the
+// ADD source shape, the RUN network/security flags, a non-ASCII byte that
+// splits a flag for the builder, an off-allowlist base in lower case (a
+// numeric RUN --mount source included), and a cache mount under hosted — is
+// gateRefused with the
 // refusal named and NOTHING reaches the runtime (no inspect, no build, no
 // gate). Skipping ScreenDockerfile turns every row red (a build call).
 func TestDeclaredBuild_StaticRefusalBeforeBuild(t *testing.T) {
@@ -2923,6 +2925,8 @@ func TestDeclaredBuild_StaticRefusalBeforeBuild(t *testing.T) {
 		{"FROM bare CR off-allowlist image", "FROM\revil/base\n", "U+000D", allow},
 		{"unknown first token", "FROM alpine\nADD\u200bhttps://x /y\n", "is not a Dockerfile instruction", nil},
 		{"RUN mount quoted space", "FROM alpine\nRUN --mount=\"type=bind, from=evil/x,target=/x\" true\n", "quote or backslash", allow},
+		{"RUN mount split on byte 0xA0", "FROM busybox\nRUN --mount=type=tmpfs,target=/t\xc3\xa0--mount=from=busybox,type=bind,target=/bb ls /bb\n", "U+00E0 on an instruction line is refused", nil},
+		{"numeric mount source off-allowlist", "FROM ghcr.io/org/base AS a\nFROM ghcr.io/org/base\nRUN --mount=type=bind,from=0,target=/x cat /x/m\n", "RUN --mount from base docker.io/library/0 is not permitted", allow},
 		{"mixed-case RUN network host", "FROM alpine\nRun --network=host true\n", "--network=host", nil},
 		{"RUN security insecure", "FROM alpine\nRUN --security=insecure true\n", "--security=insecure", nil},
 		{"lowercase from off-allowlist", "from evil/base\n", "not permitted by the operator image allowlist", allow},

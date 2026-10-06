@@ -32,7 +32,10 @@ import (
 // line on its own — so a continuation or heredoc the builder groups
 // differently from this parser surfaces in at least one view. Flag tokens
 // carrying a quote or backslash are refused, because the builder's flag
-// lexer rewrites them (and joins a quoted space into one flag). That is a
+// lexer rewrites them (and joins a quoted space into one flag), and so is
+// any byte >= 0x80 on an instruction line, because that lexer walks the line
+// BYTE by byte and ends a word on 0x85 and 0xA0 — UTF-8 continuation bytes
+// (`à` is C3 A0) — so it could split a flag this scan reads as one. That is a
 // best-effort hedge, NOT a proof of equivalence with every builder (BuildKit,
 // buildah, a future frontend): it is designed so a divergence over-refuses,
 // and the residuals are documented in the gateiso README.
@@ -143,8 +146,9 @@ type logicalInstr struct {
 // Refused: content over 1 MiB or not valid UTF-8; a control character other
 // than tab and newline, a CR not followed by LF, or non-ASCII whitespace (see
 // checkCharacters); a logical instruction whose first token is not a
-// Dockerfile instruction; a flag token carrying a quote or backslash; any
-// leading parser
+// Dockerfile instruction; a byte >= 0x80 on an instruction line (outside
+// comment lines and consumed heredoc bodies) or in any view's flag token; a
+// flag token carrying a quote or backslash; any leading parser
 // directive other than `check` (so `# syntax=`, `# escape=`, an unknown
 // directive) and a `syntax` directive anywhere; a first significant line that
 // is neither a `#` comment nor a Dockerfile instruction (`// syntax=`, a JSON
@@ -282,6 +286,33 @@ func firstWord(s string) string {
 	return ""
 }
 
+// firstNonASCII returns the first character of s whose UTF-8 encoding holds
+// a byte >= 0x80.
+func firstNonASCII(s string) (rune, bool) {
+	for _, r := range s {
+		if r > unicode.MaxASCII {
+			return r, true
+		}
+	}
+	return 0, false
+}
+
+// nonASCIIRefusal refuses a byte >= 0x80 on an instruction line. BuildKit's
+// flag lexer walks the line byte by byte and ends a word on
+// unicode.IsSpace(rune(byte)), which is true for 0x85 and 0xA0 — the
+// continuation bytes of `ą` (C4 85) and `à` (C3 A0) — so
+// `--mount=…,target=/tà--mount=from=<image>,…` is TWO mounts to the builder
+// and one flag token here. Refusing every non-ASCII byte on an instruction
+// line (comment lines and consumed heredoc bodies keep them) leaves no byte
+// the two lexers split differently.
+func nonASCIIRefusal(line int, s string) *DockerfileRefusal {
+	r, ok := firstNonASCII(s)
+	if !ok {
+		return nil
+	}
+	return refuseLine(line, "character %U on an instruction line is refused: the builder's flag lexer reads the line byte by byte and ends a word on the UTF-8 bytes 0x85 and 0xA0, so a non-ASCII character can split a flag this scan reads as one (keep non-ASCII text in comments or a heredoc body)", r)
+}
+
 // logicalInstructions groups physical lines into instructions the way
 // BuildKit's parser does for the default escape character: comment lines
 // are skipped (also inside a continuation), a line ending in `\` plus
@@ -294,9 +325,10 @@ func firstWord(s string) string {
 // line whose first token is not an instruction is REFUSED rather than skipped
 // (the builder rejects an unknown instruction, so this refuses nothing the
 // builder would build, and a keyword this scan failed to recognise can never
-// pass silently); without heredocAware every line is instruction text and an
-// unknown first token is skipped — the backstop view against a heredoc this
-// parser detects but the builder does not.
+// pass silently), as is a byte >= 0x80 on any physical line the instruction
+// spans (see nonASCIIRefusal); without heredocAware every line is
+// instruction text and an unknown first token is skipped — the backstop view
+// against a heredoc this parser detects but the builder does not.
 func logicalInstructions(lines []physLine, heredocAware bool) ([]logicalInstr, error) {
 	var out []logicalInstr
 	for i := 0; i < len(lines); i++ {
@@ -305,6 +337,10 @@ func logicalInstructions(lines []physLine, heredocAware bool) ([]logicalInstr, e
 			continue
 		}
 		start := lines[i].n
+		var wide *DockerfileRefusal
+		if heredocAware {
+			wide = nonASCIIRefusal(start, t)
+		}
 		text, more := trimContinuation(t)
 		for more && i+1 < len(lines) {
 			i++
@@ -312,6 +348,9 @@ func logicalInstructions(lines []physLine, heredocAware bool) ([]logicalInstr, e
 			nt := strings.TrimLeft(next, " \t")
 			if strings.HasPrefix(nt, "#") || strings.TrimSpace(nt) == "" {
 				continue
+			}
+			if heredocAware && wide == nil {
+				wide = nonASCIIRefusal(lines[i].n, next)
 			}
 			var part string
 			part, more = trimContinuation(next)
@@ -323,6 +362,9 @@ func logicalInstructions(lines []physLine, heredocAware bool) ([]logicalInstr, e
 				return nil, refuseLine(start, "%q is not a Dockerfile instruction (an unrecognised first token is refused, never skipped)", firstWord(text))
 			}
 			continue
+		}
+		if wide != nil {
+			return nil, wide
 		}
 		out = append(out, logicalInstr{line: start, keyword: kw, rest: rest})
 		// ONBUILD ADD/COPY/RUN opens a heredoc exactly as the bare form does.
@@ -421,7 +463,11 @@ func splitKeyword(s string) (string, string) {
 // flag token carrying a quote or backslash is refused: the builder's flag
 // lexer strips quotes and escapes and keeps a quoted space inside the flag
 // (`--mount="type=bind, from=evil/x"` is ONE flag to it, two words here), so
-// this scan could not classify the value the builder uses.
+// this scan could not classify the value the builder uses. A flag token
+// carrying a byte >= 0x80 is refused in EVERY view (the faithful view has
+// already refused it line-wide, see nonASCIIRefusal): it covers the backstop
+// views, where a line the faithful view consumes as a heredoc body is an
+// instruction to a builder that delimits the heredoc differently.
 func splitFlags(line int, rest string) ([]string, string, error) {
 	var flags []string
 	s := strings.TrimLeft(rest, " \t")
@@ -438,6 +484,9 @@ func splitFlags(line int, rest string) ([]string, string, error) {
 		}
 		if strings.ContainsAny(tok, `"'\`) {
 			return nil, "", refuseLine(line, "flag %q refused: a quote or backslash in a flag is rewritten by the builder's flag lexer, so the flag cannot be classified statically", tok)
+		}
+		if r, ok := firstNonASCII(tok); ok {
+			return nil, "", refuseLine(line, "flag %q refused: character %U carries a byte >= 0x80, and the builder's flag lexer ends a word on 0x85 and 0xA0, so the flag cannot be classified statically", tok, r)
 		}
 		flags = append(flags, tok)
 	}
@@ -531,9 +580,12 @@ func checkFrom(line int, rest string, stages map[string]bool, declare bool) ([]B
 }
 
 // stageRef reports whether a --from / from= value names a build stage (a
-// stage declared earlier in this view, or a numeric stage index) rather than
-// an image.
-func stageRef(v string, stages map[string]bool) bool {
+// stage declared earlier in this view or, with numericIndex, a numeric stage
+// index) rather than an image. Only COPY --from resolves a numeric index:
+// BuildKit resolves RUN --mount from= by stage NAME alone, so a digits-only
+// mount source is an IMAGE (`from=0` pulls docker.io/library/0) and must
+// reach CheckBuildBases.
+func stageRef(v string, stages map[string]bool, numericIndex bool) bool {
 	if v == "" {
 		return true
 	}
@@ -544,7 +596,7 @@ func stageRef(v string, stages map[string]bool) bool {
 			break
 		}
 	}
-	return allDigits || stages[strings.ToLower(v)]
+	return (numericIndex && allDigits) || stages[strings.ToLower(v)]
 }
 
 func checkAddCopy(line int, kw, rest string, stages map[string]bool) ([]BuildBase, int, error) {
@@ -564,7 +616,7 @@ func checkAddCopy(line int, kw, rest string, stages map[string]bool) ([]BuildBas
 		if strings.Contains(from, "://") {
 			return nil, 0, refuseLine(line, "%s --from=%q carries a URL scheme", kw, from)
 		}
-		if !stageRef(from, stages) {
+		if !stageRef(from, stages, true) {
 			bases = append(bases, BuildBase{Ref: from, Line: line, Kind: BaseCopyFrom})
 		}
 	}
@@ -683,7 +735,7 @@ func checkRun(line int, rest string, stages map[string]bool) ([]BuildBase, int, 
 			if strings.Contains(f, "://") {
 				return nil, 0, refuseLine(line, "RUN --mount from=%q carries a URL scheme", f)
 			}
-			if !stageRef(f, stages) {
+			if !stageRef(f, stages, false) {
 				bases = append(bases, BuildBase{Ref: f, Line: line, Kind: BaseMountFrom})
 			}
 		}
