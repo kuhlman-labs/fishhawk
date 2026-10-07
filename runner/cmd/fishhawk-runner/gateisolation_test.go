@@ -11,7 +11,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -35,7 +38,15 @@ func installGateState(t *testing.T, st *gateIsolationState) {
 	t.Helper()
 	prev := gateIsolation
 	gateIsolation = st
-	t.Cleanup(func() { gateIsolation = prev })
+	t.Cleanup(func() {
+		gateIsolation = prev
+		// The runner-owned docker config a container exec minted (#4046);
+		// NOT st.cleanup(), whose cache-volume removal would reach the real
+		// runtime once the test's seams are restored.
+		if st != nil {
+			st.removeDockerConfig()
+		}
+	})
 }
 
 // captureHostExec swaps the host-exec seam for a recorder. When fail is
@@ -89,9 +100,21 @@ func refusedState(logSink io.Writer) *gateIsolationState {
 // pins FISHHAWK_GATE_CACHE=off so every pre-#3967 test keeps the per-exec
 // caches and its exact runtime call sequence.
 func containerState(image, sock string, logSink io.Writer) *gateIsolationState {
-	st, err := configureGateIsolation(fakeEnv(map[string]string{
-		gateIsolationModeEnvVar: "container", gateImageEnvVar: image, gateCacheEnvVar: "off"}), gateiso.Probes{}, logSink)
+	return containerStateEnv(nil, image, sock, logSink, nil)
+}
+
+// containerStateEnv is containerState with extra env overriding the defaults
+// (t may be nil when extra is nil).
+func containerStateEnv(t *testing.T, image, sock string, logSink io.Writer, extra map[string]string) *gateIsolationState {
+	env := map[string]string{gateIsolationModeEnvVar: "container", gateImageEnvVar: image, gateCacheEnvVar: "off"}
+	for k, v := range extra {
+		env[k] = v
+	}
+	st, err := configureGateIsolation(fakeEnv(env), gateiso.Probes{}, logSink)
 	if err != nil {
+		if t != nil {
+			t.Fatal(err)
+		}
 		panic(err)
 	}
 	st.detect = func(context.Context, gateiso.Probes) gateiso.Runtime { return safeDockerRuntime(sock) }
@@ -100,6 +123,8 @@ func containerState(image, sock string, logSink io.Writer) *gateIsolationState {
 }
 
 func TestConfigureGateIsolation_Rows(t *testing.T) {
+	validDockerCfg, emptyDockerCfg := t.TempDir(), t.TempDir()
+	mustWrite(t, filepath.Join(validDockerCfg, "config.json"), `{"credsStore":"desktop"}`)
 	rows := []struct {
 		name    string
 		env     map[string]string
@@ -133,6 +158,12 @@ func TestConfigureGateIsolation_Rows(t *testing.T) {
 		{"invalid cache mode", map[string]string{gateCacheEnvVar: "bogus"},
 			[]string{gateCacheEnvVar, `"bogus"`, "process, off"}},
 		{"cache off", map[string]string{gateCacheEnvVar: " off "}, nil},
+		// E51.26 / #4046: the opt-in docker config is validated at startup.
+		{"relative docker config", map[string]string{gateDockerConfigEnvVar: "rel/cfg"},
+			[]string{gateDockerConfigEnvVar, `"rel/cfg" is not an absolute path`}},
+		{"docker config without config.json", map[string]string{gateDockerConfigEnvVar: emptyDockerCfg},
+			[]string{gateDockerConfigEnvVar, "no readable config.json"}},
+		{"operator docker config", map[string]string{gateDockerConfigEnvVar: " " + validDockerCfg + " "}, nil},
 	}
 	for _, r := range rows {
 		t.Run(r.name, func(t *testing.T) {
@@ -191,6 +222,17 @@ func TestConfigureGateIsolation_Rows(t *testing.T) {
 				if st.cacheMode != gateiso.CacheModeOff || !strings.Contains(log.String(), `"build":"allow","cache":"off"}`) {
 					t.Errorf("cache = %q, want off (the LAST configured field):\n%s", st.cacheMode, log.String())
 				}
+			case "operator docker config":
+				if st.credentials != gateiso.CredentialsOperatorConfig || st.dockerConfig == nil || st.dockerConfig.Dir != validDockerCfg ||
+					st.dockerConfig.Owned() || !strings.Contains(log.String(), `"credentials":"operator_config"`) {
+					t.Errorf("credentials = %q config = %+v, want operator_config at %s (not owned):\n%s", st.credentials, st.dockerConfig, validDockerCfg, log.String())
+				}
+			}
+			// The shipped default (#4046): an UNSET FISHHAWK_GATE_DOCKER_CONFIG
+			// is the anonymous posture, its config minted lazily (none yet).
+			if r.name == "defaults" && (st.credentials != gateiso.CredentialsAnonymous || st.dockerConfig != nil ||
+				!strings.Contains(log.String(), `"image":"","credentials":"anonymous"`)) {
+				t.Errorf("default credentials = %q config = %+v, want anonymous / not yet minted:\n%s", st.credentials, st.dockerConfig, log.String())
 			}
 			// The shipped default (#3967): an UNSET FISHHAWK_GATE_CACHE is
 			// process, logged as the configured line's LAST field.
@@ -205,6 +247,8 @@ func TestConfigureGateIsolation_Rows(t *testing.T) {
 // isolation env as a config error BEFORE any backend contact, and a valid
 // configuration reaches exit 0 with the configured line in the log.
 func TestRun_GateIsolationConfigErrorsExitUsage(t *testing.T) {
+	validDockerCfg := t.TempDir()
+	mustWrite(t, filepath.Join(validDockerCfg, "config.json"), `{"auths":{}}`)
 	args := []string{
 		"--run-id", "11111111-2222-3333-4444-555555555555",
 		"--backend-url", "https://api.fishhawk.test",
@@ -222,11 +266,14 @@ func TestRun_GateIsolationConfigErrorsExitUsage(t *testing.T) {
 		{"bad image allowlist", map[string]string{gateImageAllowlistEnvVar: "alpine"}, exitUsage},
 		{"bad build posture", map[string]string{gateBuildEnvVar: "sometimes"}, exitUsage},
 		{"bad cache mode", map[string]string{gateCacheEnvVar: "bogus"}, exitUsage},
+		{"relative docker config", map[string]string{gateDockerConfigEnvVar: "rel/cfg"}, exitUsage},
+		{"docker config without config.json", map[string]string{gateDockerConfigEnvVar: t.TempDir()}, exitUsage},
 		{"valid", map[string]string{gateIsolationModeEnvVar: "clone"}, exitOK},
+		{"valid operator docker config", map[string]string{gateIsolationModeEnvVar: "clone", gateDockerConfigEnvVar: validDockerCfg}, exitOK},
 	}
 	for _, r := range rows {
 		t.Run(r.name, func(t *testing.T) {
-			for _, k := range []string{gateIsolationModeEnvVar, deploymentProfileEnvVar, gateImageEnvVar, gateServicesEnvVar, gatePostgresImageEnvVar, gateImageAllowlistEnvVar, gateBuildEnvVar, gateCacheEnvVar} {
+			for _, k := range []string{gateIsolationModeEnvVar, deploymentProfileEnvVar, gateImageEnvVar, gateServicesEnvVar, gatePostgresImageEnvVar, gateImageAllowlistEnvVar, gateBuildEnvVar, gateCacheEnvVar, gateDockerConfigEnvVar} {
 				t.Setenv(k, r.env[k])
 			}
 			var out strings.Builder
@@ -240,7 +287,7 @@ func TestRun_GateIsolationConfigErrorsExitUsage(t *testing.T) {
 				if !strings.Contains(out.String(), `"event":"runner_started"`) {
 					t.Errorf("the config check must run AFTER the startup line:\n%s", out.String())
 				}
-				for _, k := range []string{gateServicesEnvVar, gateImageAllowlistEnvVar, gateBuildEnvVar, gateCacheEnvVar} {
+				for _, k := range []string{gateServicesEnvVar, gateImageAllowlistEnvVar, gateBuildEnvVar, gateCacheEnvVar, gateDockerConfigEnvVar} {
 					if r.env[k] != "" && !strings.Contains(out.String(), k) {
 						t.Errorf("config error must name %s:\n%s", k, out.String())
 					}
@@ -250,6 +297,14 @@ func TestRun_GateIsolationConfigErrorsExitUsage(t *testing.T) {
 				}
 			} else if !strings.Contains(out.String(), `"event":"gate_isolation_configured","mode":"clone"`) {
 				t.Errorf("missing gate_isolation_configured:\n%s", out.String())
+			} else {
+				want := `"credentials":"anonymous"`
+				if r.env[gateDockerConfigEnvVar] != "" {
+					want = `"credentials":"operator_config"`
+				}
+				if !strings.Contains(out.String(), want) {
+					t.Errorf("gate_isolation_configured lacks %s:\n%s", want, out.String())
+				}
 			}
 			if gateIsolation != nil {
 				t.Errorf("run() must clear the process-wide state on exit")
@@ -335,7 +390,7 @@ func stubSeed(t *testing.T, fn func(checkout string) error) {
 func stubBindEndpointEnv(t *testing.T, err error) {
 	t.Helper()
 	prev := bindEndpointEnvFn
-	bindEndpointEnvFn = func(gateiso.Runtime, []string) ([]string, error) { return nil, err }
+	bindEndpointEnvFn = func(gateiso.Runtime, []string, string) ([]string, error) { return nil, err }
 	t.Cleanup(func() { bindEndpointEnvFn = prev })
 }
 
@@ -369,6 +424,9 @@ func TestRunGateInContainer_PreExecFailures(t *testing.T) {
 		setup func(t *testing.T) (dir, lintCacheDir string)
 		seed  func(checkout string) error // nil = the seed must NOT be reached
 		bind  error                       // non-nil = the endpoint binder fails
+		mint  error                       // non-nil = minting the runner docker config fails
+		// state overrides the default container state (nil = containerState).
+		state func(t *testing.T) *gateIsolationState
 		want  gateDisposition
 		leads []string // every substring the output must carry
 	}{
@@ -441,11 +499,41 @@ func TestRunGateInContainer_PreExecFailures(t *testing.T) {
 			want:  gateUnavailable,
 			leads: []string{"gate container:", "no validated socket path to bind"},
 		},
+		{
+			// E51.26 / #4046: the runner-owned docker config precedes the
+			// binding, so a mint failure leaves no runtime call to make.
+			name:  "runner docker config cannot be minted",
+			setup: func(t *testing.T) (string, string) { return t.TempDir(), filepath.Join(t.TempDir(), "lc") },
+			mint:  errors.New("create runner docker config dir: read-only file system"),
+			want:  gateUnavailable,
+			leads: []string{"gate container: docker config:", "read-only file system"},
+		},
+		{
+			// A blocked operator-config helper fails BEFORE any runtime call
+			// that could pull — category C, never a hang.
+			name: "operator credential helper blocked",
+			setup: func(t *testing.T) (string, string) {
+				credentialHelpersOnPath(t, map[string]string{"fhblock": "sleep 600"})
+				shortCredentialProbe(t, 300*time.Millisecond)
+				return t.TempDir(), filepath.Join(t.TempDir(), "lc")
+			},
+			state: func(t *testing.T) *gateIsolationState {
+				return containerStateEnv(t, "img:1", "/nonexistent/daemon.sock", io.Discard,
+					map[string]string{gateDockerConfigEnvVar: operatorDockerConfig(t, `{"credsStore":"fhblock"}`)})
+			},
+			want: gateUnavailable,
+			leads: []string{"gate container: container_credentials_blocked: credential helper docker-credential-fhblock did not answer within 300ms for https://index.docker.io/v1/",
+				"a locked keychain/screen"},
+		},
 	}
 	for _, r := range rows {
 		t.Run(r.name, func(t *testing.T) {
 			dir, lc := r.setup(t)
-			installGateState(t, containerState("img:1", "/nonexistent/daemon.sock", io.Discard))
+			st := containerState("img:1", "/nonexistent/daemon.sock", io.Discard)
+			if r.state != nil {
+				st = r.state(t)
+			}
+			installGateState(t, st)
 			calls := captureHostExec(t, true, 0)
 			aux := scriptAuxExec(t, nil)
 			var seeded []string
@@ -459,6 +547,11 @@ func TestRunGateInContainer_PreExecFailures(t *testing.T) {
 			})
 			if r.bind != nil {
 				stubBindEndpointEnv(t, r.bind)
+			}
+			if r.mint != nil {
+				prev := newAnonymousDockerConfigFn
+				newAnonymousDockerConfigFn = func([]string) (gateiso.DockerConfig, error) { return gateiso.DockerConfig{}, r.mint }
+				t.Cleanup(func() { newAnonymousDockerConfigFn = prev })
 			}
 			out, code, disp := runBoundedGateCommandDisposed(context.Background(), "true", dir, lc, time.Minute)
 			if code != -1 {
@@ -481,8 +574,8 @@ func TestRunGateInContainer_PreExecFailures(t *testing.T) {
 			if len(*calls) != 0 {
 				t.Errorf("runtime CLI reached with %q", *calls)
 			}
-			if r.bind != nil && len(aux.order) != 0 {
-				t.Errorf("auxiliary runtime calls ran under an unbound env: %q", aux.order)
+			if (r.bind != nil || r.mint != nil || r.state != nil) && len(aux.order) != 0 {
+				t.Errorf("auxiliary runtime calls ran despite the pre-exec failure: %q", aux.order)
 			}
 			if isVerifyInfraFailure(out) {
 				t.Errorf("pre-exec output must never match an infra signature (the gates would absorb it): %q", out)
@@ -2458,21 +2551,28 @@ func TestDeclaredImage_ResolutionFailuresAreUnavailable(t *testing.T) {
 	}
 }
 
-// TestDeclaredImage_PullUsesEndpointBoundInheritedEnv: the pull (and
+// TestDeclaredImage_PullUsesRunnerDockerConfigNotInherited (E51.26 / #4046,
+// the inversion of the former inherited-DOCKER_CONFIG pin): the pull (and
 // inspect) run under the runner's INHERITED environment bound to the
-// validated socket — DOCKER_HOST re-pinned, DOCKER_CONTEXT dropped, HOME and
-// DOCKER_CONFIG kept so the runtime CLI finds its own credential store — and
-// not under the sanitized gate env.
-func TestDeclaredImage_PullUsesEndpointBoundInheritedEnv(t *testing.T) {
+// validated socket — DOCKER_HOST re-pinned, DOCKER_CONTEXT dropped, HOME kept
+// — but with the operator's DOCKER_CONFIG / REGISTRY_AUTH_FILE REPLACED by the
+// runner-owned anonymous config (no credsStore, no credHelpers), and not
+// under the sanitized gate env.
+func TestDeclaredImage_PullUsesRunnerDockerConfigNotInherited(t *testing.T) {
 	t.Setenv("DOCKER_HOST", "tcp://10.0.0.5:2376")
 	t.Setenv("DOCKER_CONTEXT", "remote")
 	t.Setenv("DOCKER_CONFIG", "/runner/docker-config")
+	t.Setenv("REGISTRY_AUTH_FILE", "/runner/auth.json")
 	t.Setenv("FISHHAWK_TEST_INHERITED_ONLY", "1")
-	declaredState(t, containerEnv(nil), safeDockerRuntime(declSock), stageImage("ghcr.io/o/g:v1"), nil)
+	st := declaredState(t, containerEnv(nil), safeDockerRuntime(declSock), stageImage("ghcr.io/o/g:v1"), nil)
 	g := scriptGateExec(t, pulledImageResponder(0, declImageID+" ghcr.io/o/g@"+declDigestA))
 	if _, code, _ := runDeclaredGate(t, context.Background(), t.TempDir()); code != 0 {
 		t.Fatalf("exit %d", code)
 	}
+	if st.dockerConfig == nil || !st.dockerConfig.Owned() {
+		t.Fatalf("no runner-owned docker config minted: %+v", st.dockerConfig)
+	}
+	minted := st.dockerConfig.Dir
 	for _, label := range []string{"pull", "inspect"} {
 		env := map[string]string{}
 		for _, kv := range g.env[label] {
@@ -2485,15 +2585,22 @@ func TestDeclaredImage_PullUsesEndpointBoundInheritedEnv(t *testing.T) {
 		if _, ok := env["DOCKER_CONTEXT"]; ok {
 			t.Errorf("%s env carries DOCKER_CONTEXT", label)
 		}
-		if env["HOME"] == "" || env["DOCKER_CONFIG"] != "/runner/docker-config" {
-			t.Errorf("%s env lost HOME/DOCKER_CONFIG: HOME=%q DOCKER_CONFIG=%q", label, env["HOME"], env["DOCKER_CONFIG"])
+		if env["DOCKER_CONFIG"] != minted {
+			t.Errorf("%s DOCKER_CONFIG = %q, want the runner-owned %q (never the inherited /runner/docker-config)", label, env["DOCKER_CONFIG"], minted)
 		}
-		if env["FISHHAWK_TEST_INHERITED_ONLY"] != "1" {
-			t.Errorf("%s env is not the inherited environment (the sanitized gate env would drop the marker)", label)
+		if v, ok := env["REGISTRY_AUTH_FILE"]; ok {
+			t.Errorf("%s env carries REGISTRY_AUTH_FILE=%q on docker", label, v)
+		}
+		if env["HOME"] == "" || env["FISHHAWK_TEST_INHERITED_ONLY"] != "1" {
+			t.Errorf("%s env is not the inherited environment (HOME=%q, marker=%q)", label, env["HOME"], env["FISHHAWK_TEST_INHERITED_ONLY"])
 		}
 		if argv := g.argv[label]; argv[1] != "--host" || argv[2] != "unix://"+declSock {
 			t.Errorf("%s argv not endpoint-bound: %q", label, argv)
 		}
+	}
+	b, err := os.ReadFile(filepath.Join(minted, "config.json"))
+	if err != nil || strings.Contains(string(b), "credsStore") || strings.Contains(string(b), "credHelpers") || !strings.Contains(string(b), `"auths":{}`) {
+		t.Errorf("runner-owned config.json = %s (%v), want an empty auths map and no store", b, err)
 	}
 	for _, kv := range sanitizedGateEnv() {
 		if strings.HasPrefix(kv, "FISHHAWK_TEST_INHERITED_ONLY=") {
@@ -3178,6 +3285,7 @@ func cacheState(t *testing.T, logSink io.Writer, run, stage string, extra map[st
 	if run != "" {
 		st.bindOwner(run, stage)
 	}
+	t.Cleanup(st.removeDockerConfig)
 	return st
 }
 
@@ -3721,5 +3829,493 @@ func TestDeclaredImage_CacheVolumePreparedForResolvedImage(t *testing.T) {
 	}
 	if src := cacheMountSource(g.argv["gate_run"], gateiso.MountGateCache); !strings.HasPrefix(src, "fishhawk-gate-cache-") {
 		t.Errorf("declared-image gate does not mount the cache volume: %q", g.argv["gate_run"])
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Runner docker config (E51.26 / #4046): every post-selection runtime call is
+// pinned to a docker config the runner chose — the runner-owned anonymous
+// config by default, FISHHAWK_GATE_DOCKER_CONFIG by opt-in — and an opt-in
+// config's matching credential helpers are probed under a bound before any
+// pull or build.
+// ---------------------------------------------------------------------------
+
+// credentialHelpersOnPath writes docker-credential-<name> scripts into a
+// fresh dir and prepends it to PATH (the runtime CLI env inherits PATH).
+func credentialHelpersOnPath(t *testing.T, scripts map[string]string) string {
+	t.Helper()
+	dir := t.TempDir()
+	for name, body := range scripts {
+		p := filepath.Join(dir, "docker-credential-"+name)
+		mustWrite(t, p, "#!/bin/sh\n"+body+"\n")
+		if err := os.Chmod(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return dir
+}
+
+// operatorDockerConfig is an operator-prepared docker config dir holding
+// content as its config.json.
+func operatorDockerConfig(t *testing.T, content string) string {
+	t.Helper()
+	dir := t.TempDir()
+	mustWrite(t, filepath.Join(dir, "config.json"), content)
+	return dir
+}
+
+// shortCredentialProbe shrinks the probe bound for the test.
+func shortCredentialProbe(t *testing.T, d time.Duration) {
+	t.Helper()
+	prev := gateCredentialProbeTimeout
+	gateCredentialProbeTimeout = d
+	t.Cleanup(func() { gateCredentialProbeTimeout = prev })
+}
+
+// orderProbes wraps the REAL credential probe so each probe lands in g.order
+// as "probe:<helper>" — the ordering against the runtime calls it guards.
+func orderProbes(t *testing.T, g *gateExecScript) {
+	t.Helper()
+	prev := probeCredentialHelperFn
+	probeCredentialHelperFn = func(ctx context.Context, p gateiso.CredentialProbe, env []string, bound time.Duration) gateiso.ProbeResult {
+		g.order = append(g.order, "probe:"+p.Executable())
+		return prev(ctx, p, env, bound)
+	}
+	t.Cleanup(func() { probeCredentialHelperFn = prev })
+}
+
+// envOf returns the value of key in env and whether it is present.
+func envOf(env []string, key string) (string, bool) {
+	for _, kv := range env {
+		if k, v, _ := strings.Cut(kv, "="); k == key {
+			return v, true
+		}
+	}
+	return "", false
+}
+
+// TestRunGateInContainer_EveryRuntimeCallPinsRunnerDockerConfig: with an
+// inherited DOCKER_CONFIG / REGISTRY_AUTH_FILE pointing at the operator's
+// interactive store, EVERY runtime call of a container exec — the declared
+// pull and inspect, the passwd read, the cache volume steps, the postgres
+// service lifecycle, the gate run, its `rm -f` kill, and the cache volume
+// removal at cleanup — carries DOCKER_CONFIG=<the runner-owned dir> and never
+// the inherited value. A second exec reuses the same minted dir. Passing
+// os.Environ() instead of the bound env in runGateInContainer turns this red.
+func TestRunGateInContainer_EveryRuntimeCallPinsRunnerDockerConfig(t *testing.T) {
+	t.Setenv("DOCKER_CONFIG", "/operator/interactive/.docker")
+	t.Setenv("REGISTRY_AUTH_FILE", "/operator/auth.json")
+	var log strings.Builder
+	st := cacheState(t, &log, cacheRunA, cacheStageA, map[string]string{gateServicesEnvVar: "postgres"})
+	st.declare(stageImage("ghcr.io/o/g:v1"))
+	shortServiceReady(t, time.Second)
+	pulled := pulledImageResponder(0, declImageID+" ghcr.io/o/g@"+declDigestA, declImageID+" ghcr.io/o/g@"+declDigestA)
+	g := scriptGateExec(t, func(label string, n int) (string, int, bool) {
+		if label == "gate_run" {
+			return "", -1, false
+		}
+		return pulled(label, n)
+	})
+	type call struct{ label, cfg string }
+	var calls []call
+	record := func(prev func(context.Context, []string, string, []string, time.Duration) (string, int, bool)) func(context.Context, []string, string, []string, time.Duration) (string, int, bool) {
+		return func(ctx context.Context, argv []string, dir string, env []string, d time.Duration) (string, int, bool) {
+			cfg, _ := envOf(env, "DOCKER_CONFIG")
+			if v, ok := envOf(env, "REGISTRY_AUTH_FILE"); ok {
+				t.Errorf("%s carries REGISTRY_AUTH_FILE=%q on docker", classifyGateArgv(argv), v)
+			}
+			calls = append(calls, call{classifyGateArgv(argv), cfg})
+			return prev(ctx, argv, dir, env, d)
+		}
+	}
+	prevAux, prevHost := execGateAuxArgvFn, execBoundedHostArgvFn
+	execGateAuxArgvFn, execBoundedHostArgvFn = record(prevAux), record(prevHost)
+	t.Cleanup(func() { execGateAuxArgvFn, execBoundedHostArgvFn = prevAux, prevHost })
+	for i := 0; i < 2; i++ {
+		if _, code, _ := execOn(t, st); code != -1 {
+			t.Fatalf("exec %d exit %d, want the scripted -1", i+1, code)
+		}
+	}
+	minted := st.dockerConfig.Dir
+	st.cleanup()
+	want := map[string]bool{"pull": true, "inspect": true, "passwd": true, "cache_create": true, "cache_prepare": true, "cache_check": true,
+		"volume_create": true, "service_run": true, "logs": true, "ready": true, "bootstrap": true, "gate_run": true, "gate_kill": true,
+		"service_rm": true, "volume_rm": true, "cache_rm": true}
+	for _, c := range calls {
+		delete(want, c.label)
+		if c.cfg != minted {
+			t.Errorf("%s ran with DOCKER_CONFIG=%q, want the runner-owned %q", c.label, c.cfg, minted)
+		}
+	}
+	if len(want) != 0 {
+		t.Errorf("fixture covers no %v call (order %q)", want, g.order)
+	}
+	if n := strings.Count(log.String(), `"event":"gate_docker_config_minted"`); n != 1 {
+		t.Errorf("minted %d docker configs for two execs on one state, want 1:\n%s", n, log.String())
+	}
+}
+
+// TestRunGateInContainer_BlockedCredentialHelperFailsFast is probe site (a):
+// an opt-in config whose credsStore matches the gate image's registry and
+// never answers fails the exec within the bound — gateUnavailable naming
+// container_credentials_blocked, the helper and the server — with NO runtime
+// call before or after the probe. The helper's whole process group is gone.
+func TestRunGateInContainer_BlockedCredentialHelperFailsFast(t *testing.T) {
+	helpers := credentialHelpersOnPath(t, map[string]string{"fhblock": `echo $$ > "` + "$FH_HELPER_DIR" + `/helper.pid"; sleep 600`})
+	t.Setenv("FH_HELPER_DIR", helpers)
+	// 2s, not the 300ms other rows use: this row reads the helper's pid, which
+	// a loaded -race package run can delay past a sub-second bound.
+	shortCredentialProbe(t, 2*time.Second)
+	var log strings.Builder
+	st := containerStateEnv(t, "img:1", declSock, &log, map[string]string{gateDockerConfigEnvVar: operatorDockerConfig(t, `{"credsStore":"fhblock"}`)})
+	installGateState(t, st)
+	g := scriptGateExec(t, nil)
+	orderProbes(t, g)
+	start := time.Now()
+	out, code, disp := runDeclaredGate(t, context.Background(), t.TempDir())
+	if elapsed := time.Since(start); elapsed > 30*time.Second {
+		t.Errorf("blocked helper held the exec %s", elapsed)
+	}
+	if code != -1 || disp != gateUnavailable {
+		t.Fatalf("exec = %d / %s, want -1 / unavailable: %s", code, disp, out)
+	}
+	if want := "gate container: container_credentials_blocked: credential helper docker-credential-fhblock did not answer within 2s for https://index.docker.io/v1/"; !strings.HasPrefix(out, want) {
+		t.Errorf("output = %q, want lead %q", out, want)
+	}
+	if got := strings.Join(g.order, ","); got != "probe:docker-credential-fhblock" {
+		t.Errorf("calls = %s, want only the probe (no runtime call may run behind a blocked helper)", got)
+	}
+	if !strings.Contains(log.String(), `"event":"gate_credentials_probe","site":"gate","helper":"docker-credential-fhblock","server":"https://index.docker.io/v1/","outcome":"blocked"`) {
+		t.Errorf("missing blocked gate_credentials_probe line:\n%s", log.String())
+	}
+	b, err := os.ReadFile(filepath.Join(helpers, "helper.pid"))
+	if err != nil {
+		t.Fatalf("fixture: the helper never ran: %v", err)
+	}
+	pid, _ := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
+		_ = syscall.Kill(pid, syscall.SIGKILL)
+		t.Errorf("helper pid %d survived the probe (kill(0) = %v)", pid, err)
+	}
+}
+
+// TestRunVerifyFixLoop_BlockedCredentialHelperIsCategoryC: through the fix
+// loop a blocked helper is category C — verify_gate_unavailable, the verify
+// command never executed, the fix agent never invoked.
+func TestRunVerifyFixLoop_BlockedCredentialHelperIsCategoryC(t *testing.T) {
+	credentialHelpersOnPath(t, map[string]string{"fhblock": "sleep 600"})
+	shortCredentialProbe(t, 300*time.Millisecond)
+	installGateState(t, containerStateEnv(t, "img:1", declSock, io.Discard,
+		map[string]string{gateDockerConfigEnvVar: operatorDockerConfig(t, `{"credsStore":"fhblock"}`)}))
+	g := scriptGateExec(t, nil)
+	cfg, logPath := verifyFixLoopScopeFixture(t, verifyScopeGoFiles, 0, 0)
+	cfg.verifyMaxIterations = 2
+	res := agent.Result{OK: true}
+	var log strings.Builder
+	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
+	if _, _, err := runVerifyFixLoop(context.Background(), &cfg, nil, "", invoker, agent.Invocation{}, &res, &log); err != nil {
+		t.Fatal(err)
+	}
+	if res.OK || res.FailureCategory != "C" || !strings.Contains(res.FailureReason, "container_credentials_blocked") {
+		t.Errorf("res = OK:%t cat:%q reason:%q, want category C naming container_credentials_blocked", res.OK, res.FailureCategory, res.FailureReason)
+	}
+	if invoker.callIdx != 0 || len(g.order) != 0 || len(readVerifyFormLog(t, logPath)) != 0 {
+		t.Errorf("fix agent %d / runtime calls %q / verify runs after a blocked helper", invoker.callIdx, g.order)
+	}
+	if !strings.Contains(log.String(), `"event":"verify_gate_unavailable"`) {
+		t.Errorf("log lacks verify_gate_unavailable:\n%s", log.String())
+	}
+}
+
+// TestResolveBuiltImage_BlockedBaseHelperFailsBeforeBuild is probe site (b)
+// (#4046 approval condition 2): a declared build whose Dockerfile base
+// matches a blocked helper fails gateUnavailable after the content-addressed
+// inspect MISS (allowed — it is what makes a build necessary) and BEFORE the
+// build: no runtime call runs after the probe, and above all no build. The
+// gate image probe site (a) matches nothing here (a build has no gate image).
+func TestResolveBuiltImage_BlockedBaseHelperFailsBeforeBuild(t *testing.T) {
+	repo := buildRepo(t, map[string]string{"gate/Dockerfile": "FROM ghcr.io/o/base:1\nCOPY . /src\n", "gate/a.txt": "x\n"})
+	credentialHelpersOnPath(t, map[string]string{"fhblock": "sleep 600"})
+	shortCredentialProbe(t, 300*time.Millisecond)
+	var log strings.Builder
+	declaredState(t, containerEnv(map[string]string{gateDockerConfigEnvVar: operatorDockerConfig(t, `{"credHelpers":{"ghcr.io":"fhblock"}}`)}),
+		safeDockerRuntime(declSock), declaredBuild, &log)
+	var g *gateExecScript
+	g = scriptGateExec(t, buildResponder(&g, 0, nil))
+	orderProbes(t, g)
+	out, code, disp := runDeclaredGate(t, context.Background(), repo)
+	if code != -1 || disp != gateUnavailable {
+		t.Fatalf("exec = %d / %s, want -1 / unavailable: %s", code, disp, out)
+	}
+	if !strings.Contains(out, "gate_container unavailable: container_credentials_blocked: credential helper docker-credential-fhblock did not answer within 300ms for ghcr.io") {
+		t.Errorf("output = %q", out)
+	}
+	probeAt := slices.Index(g.order, "probe:docker-credential-fhblock")
+	if probeAt < 0 || probeAt != len(g.order)-1 {
+		t.Errorf("calls = %q: the probe must run and be the LAST call (nothing after a blocked probe)", g.order)
+	}
+	if g.counts["build"] != 0 {
+		t.Errorf("the build ran behind a blocked base helper: %q", g.order)
+	}
+	if !strings.Contains(log.String(), `"site":"build","helper":"docker-credential-fhblock","server":"ghcr.io","outcome":"blocked"`) {
+		t.Errorf("missing build-site probe line:\n%s", log.String())
+	}
+}
+
+// TestResolveBuiltImage_CacheHitProbesNothing: a content-addressed cache hit
+// builds nothing, so no base helper is probed (site (b) sits after the miss).
+func TestResolveBuiltImage_CacheHitProbesNothing(t *testing.T) {
+	repo := buildRepo(t, map[string]string{"gate/Dockerfile": "FROM ghcr.io/o/base:1\n"})
+	credentialHelpersOnPath(t, map[string]string{"fhblock": "sleep 600"})
+	shortCredentialProbe(t, 300*time.Millisecond)
+	declaredState(t, containerEnv(map[string]string{gateDockerConfigEnvVar: operatorDockerConfig(t, `{"credHelpers":{"ghcr.io":"fhblock"}}`)}),
+		safeDockerRuntime(declSock), declaredBuild, nil)
+	g := scriptGateExec(t, func(label string, n int) (string, int, bool) {
+		if label == "inspect" {
+			return declImageID, 0, false
+		}
+		return serviceHappyPath(label, n)
+	})
+	orderProbes(t, g)
+	if out, code, _ := runDeclaredGate(t, context.Background(), repo); code != 0 {
+		t.Fatalf("exit %d: %s", code, out)
+	}
+	if got := strings.Join(g.order, ","); got != "inspect,passwd,gate_run" {
+		t.Errorf("calls = %s, want a cache hit with no probe", got)
+	}
+}
+
+// TestRunGateInContainer_UnmatchedHelperNotProbed: an opt-in config whose only
+// helper serves a registry no image of this exec names (an ECR credHelpers
+// entry, the gate image on Docker Hub) never runs that helper — no probe, no
+// probe line — and the exec proceeds under the operator's config, which
+// cleanup never removes.
+func TestRunGateInContainer_UnmatchedHelperNotProbed(t *testing.T) {
+	helpers := credentialHelpersOnPath(t, map[string]string{"fhecr": `touch "$FH_HELPER_DIR/ran"; exit 0`})
+	t.Setenv("FH_HELPER_DIR", helpers)
+	opCfg := operatorDockerConfig(t, `{"credHelpers":{"123456789012.dkr.ecr.us-east-1.amazonaws.com":"fhecr"}}`)
+	var log strings.Builder
+	st := containerStateEnv(t, "img:1", declSock, &log, map[string]string{gateDockerConfigEnvVar: opCfg})
+	installGateState(t, st)
+	g := scriptGateExec(t, nil)
+	orderProbes(t, g)
+	if out, code, disp := runDeclaredGate(t, context.Background(), t.TempDir()); code != 0 || disp != gateExecuted {
+		t.Fatalf("exec = %d / %s: %s", code, disp, out)
+	}
+	if got := strings.Join(g.order, ","); got != "passwd,gate_run" {
+		t.Errorf("calls = %s, want passwd,gate_run with no probe", got)
+	}
+	if _, err := os.Stat(filepath.Join(helpers, "ran")); !os.IsNotExist(err) {
+		t.Errorf("the unmatched helper ran (%v)", err)
+	}
+	if strings.Contains(log.String(), "gate_credentials_probe") {
+		t.Errorf("an unmatched helper was probed:\n%s", log.String())
+	}
+	if v, _ := envOf(g.env["gate_run"], "DOCKER_CONFIG"); v != opCfg {
+		t.Errorf("gate_run DOCKER_CONFIG = %q, want the operator config %q", v, opCfg)
+	}
+	st.cleanup()
+	if _, err := os.Stat(filepath.Join(opCfg, "config.json")); err != nil {
+		t.Errorf("cleanup removed the operator's config: %v", err)
+	}
+	if strings.Contains(log.String(), "gate_docker_config_removed") {
+		t.Errorf("cleanup logged removing an operator config:\n%s", log.String())
+	}
+}
+
+// TestRunGateInContainer_AnsweringHelperProbedBeforeEveryExec: a matching
+// helper that answers lets the exec proceed — the probe precedes the first
+// runtime call and runs again on the next exec (no success caching) — and the
+// gate image and the postgres service image are each probed.
+func TestRunGateInContainer_AnsweringHelperProbedBeforeEveryExec(t *testing.T) {
+	credentialHelpersOnPath(t, map[string]string{"fhok": `echo '{"Username":"u","Secret":"FH-CANARY-SECRET"}'`, "fhpg": "exit 1"})
+	var log strings.Builder
+	serviceContainerState(t, declSock, &log, map[string]string{
+		gateImageEnvVar: "ghcr.io/o/gate:v1", gatePostgresImageEnvVar: "docker.io/library/postgres:16",
+		gateDockerConfigEnvVar: operatorDockerConfig(t, `{"credsStore":"fhpg","credHelpers":{"ghcr.io":"fhok"}}`)})
+	g := scriptGateExec(t, nil)
+	orderProbes(t, g)
+	for i := 0; i < 2; i++ {
+		if out, code, _ := runDeclaredGate(t, context.Background(), t.TempDir()); code != 0 {
+			t.Fatalf("exec %d exit %d: %s", i+1, code, out)
+		}
+	}
+	// Each exec opens with both probes (the second exec's passwd read is a
+	// cache hit, so its first runtime call is the service volume).
+	execs := strings.Split(strings.Join(g.order, ","), "probe:docker-credential-fhok,probe:docker-credential-fhpg,")
+	if len(execs) != 3 || execs[0] != "" || !strings.HasPrefix(execs[1], "passwd,") || !strings.HasPrefix(execs[2], "volume_create,") {
+		t.Errorf("calls = %q, want both probes ahead of each exec's first runtime call", g.order)
+	}
+	for _, w := range []string{
+		`"site":"gate","helper":"docker-credential-fhok","server":"ghcr.io","outcome":"answered"`,
+		`"site":"gate","helper":"docker-credential-fhpg","server":"https://index.docker.io/v1/","outcome":"answered"`} {
+		if n := strings.Count(log.String(), w); n != 2 {
+			t.Errorf("%d lines %s, want 2:\n%s", n, w, log.String())
+		}
+	}
+	if strings.Contains(log.String(), "FH-CANARY-SECRET") {
+		t.Fatalf("a helper's answer reached the runner log:\n%s", log.String())
+	}
+}
+
+// TestGateIsolationState_CleanupRemovesOwnedDockerConfigAfterCacheVolumes:
+// cleanup removes the cache volumes WHILE the runner-owned docker config they
+// were minted under still exists, THEN removes that dir. Swapping the two
+// steps in cleanup turns the at-rm assertion red.
+func TestGateIsolationState_CleanupRemovesOwnedDockerConfigAfterCacheVolumes(t *testing.T) {
+	var log strings.Builder
+	st := cacheState(t, &log, cacheRunA, cacheStageA, nil)
+	g := scriptGateExec(t, nil)
+	if _, code, _ := execOn(t, st); code != 0 {
+		t.Fatalf("exit %d", code)
+	}
+	minted := st.dockerConfig.Dir
+	if !st.dockerConfig.Owned() || g.counts["cache_create"] != 1 {
+		t.Fatalf("fixture: config %+v, cache creates %d", st.dockerConfig, g.counts["cache_create"])
+	}
+	existedAtRm := false
+	prev := execGateAuxArgvFn
+	execGateAuxArgvFn = func(ctx context.Context, argv []string, dir string, env []string, d time.Duration) (string, int, bool) {
+		if classifyGateArgv(argv) == "cache_rm" {
+			cfg, _ := envOf(env, "DOCKER_CONFIG")
+			_, err := os.Stat(filepath.Join(cfg, "config.json"))
+			existedAtRm = cfg == minted && err == nil
+		}
+		return prev(ctx, argv, dir, env, d)
+	}
+	t.Cleanup(func() { execGateAuxArgvFn = prev })
+	st.cleanup()
+	if g.counts["cache_rm"] != 1 || !existedAtRm {
+		t.Errorf("cache_rm = %d, config present at rm = %t; the volumes must go BEFORE the config dir", g.counts["cache_rm"], existedAtRm)
+	}
+	if _, err := os.Stat(minted); !os.IsNotExist(err) {
+		t.Errorf("cleanup left the runner-owned docker config %s: %v", minted, err)
+	}
+	if !strings.Contains(log.String(), `"event":"gate_docker_config_removed","dir":"`+minted+`"`) {
+		t.Errorf("missing gate_docker_config_removed:\n%s", log.String())
+	}
+	st.cleanup()
+	if n := strings.Count(log.String(), "gate_docker_config_removed"); n != 1 {
+		t.Errorf("a second cleanup re-removed (%d lines)", n)
+	}
+}
+
+// TestGateIsolationState_DockerConfigRemovalFailureLogged: a failing removal
+// is logged naming the dir and never panics.
+func TestGateIsolationState_DockerConfigRemovalFailureLogged(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	var log strings.Builder
+	st := containerState("img:1", declSock, &log)
+	cfg, err := st.gateDockerConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent := filepath.Dir(cfg.Dir)
+	locked := filepath.Join(t.TempDir(), "locked")
+	if err := os.Mkdir(locked, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	moved := filepath.Join(locked, filepath.Base(cfg.Dir))
+	if err := os.Rename(cfg.Dir, moved); err != nil {
+		t.Skipf("cannot move the minted dir across %s: %v", parent, err)
+	}
+	st.dockerConfig.Dir = moved
+	if err := os.Chmod(locked, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o700) })
+	st.cleanup()
+	if !strings.Contains(log.String(), `"event":"gate_docker_config_cleanup_failed","dir":"`+moved+`"`) {
+		t.Errorf("missing gate_docker_config_cleanup_failed:\n%s", log.String())
+	}
+}
+
+// TestGateDockerConfig_NilStateRefused: a nil state has no cleanup to own a
+// minted dir, so the container path refuses it gateUnavailable before any
+// runtime call rather than leak a config dir.
+func TestGateDockerConfig_NilStateRefused(t *testing.T) {
+	installGateState(t, nil)
+	g := scriptGateExec(t, nil)
+	sel := containerState("img:1", declSock, io.Discard).selection(context.Background())
+	out, code, disp := runGateInContainer(context.Background(), sel, []string{"true"}, t.TempDir(), filepath.Join(t.TempDir(), "lc"), nil, nil, time.Minute)
+	if code != -1 || disp != gateUnavailable || !strings.HasPrefix(out, "gate container: docker config: no gate isolation state") {
+		t.Fatalf("exec = %q / %d / %s", out, code, disp)
+	}
+	if len(g.order) != 0 {
+		t.Errorf("runtime calls ran: %q", g.order)
+	}
+}
+
+// TestGateIsolationState_SelectionStampsCredentials: the runner stamps the
+// credential posture on a container-path selection only — anonymous by
+// default, operator_config under the opt-in — and the gate_isolation_selected
+// line and the recorded selection carry it; a refused or fallback selection
+// carries none.
+func TestGateIsolationState_SelectionStampsCredentials(t *testing.T) {
+	opCfg := operatorDockerConfig(t, `{"auths":{}}`)
+	rows := []struct {
+		name string
+		st   func(io.Writer) *gateIsolationState
+		want gateiso.Credentials
+	}{
+		{"container anonymous", func(w io.Writer) *gateIsolationState { return containerState("img:1", declSock, w) }, gateiso.CredentialsAnonymous},
+		{"container operator config", func(w io.Writer) *gateIsolationState {
+			return containerStateEnv(t, "img:1", declSock, w, map[string]string{gateDockerConfigEnvVar: opCfg})
+		}, gateiso.CredentialsOperatorConfig},
+		{"refused", refusedState, ""},
+		{"fallback", func(io.Writer) *gateIsolationState { return fallbackState() }, ""},
+	}
+	for _, r := range rows {
+		t.Run(r.name, func(t *testing.T) {
+			var log strings.Builder
+			st := r.st(&log)
+			installGateState(t, st)
+			captureHostExec(t, false, 0)
+			scriptAuxExec(t, nil)
+			stubSeed(t, func(string) error { return nil })
+			_, _, _ = runBoundedGateCommandDisposed(context.Background(), "true", t.TempDir(), filepath.Join(t.TempDir(), "lc"), time.Minute)
+			sel, ok := st.recordedSelection()
+			if !ok || sel.Credentials != r.want {
+				t.Fatalf("recorded credentials = %q (recorded %t), want %q", sel.Credentials, ok, r.want)
+			}
+			hasKey := strings.Contains(log.String(), `"credentials":"`+string(r.want)+`"}`)
+			if r.want != "" && !hasKey {
+				t.Errorf("gate_isolation_selected lacks credentials %q:\n%s", r.want, log.String())
+			}
+		})
+	}
+}
+
+// TestDeclaredImage_PullFailureHintOnlyWhenAnonymous (#4046 approval
+// condition 1): a pull failure under the anonymous posture names the
+// FISHHAWK_GATE_DOCKER_CONFIG remedy after gateiso.PullFailedReason's own
+// text; under an operator config (whose credentials were offered) it does not.
+func TestDeclaredImage_PullFailureHintOnlyWhenAnonymous(t *testing.T) {
+	const hint = "the runner pulls with a credential-free docker config (no credsStore, no credHelpers), so an image on a private registry needs FISHHAWK_GATE_DOCKER_CONFIG set to a docker config dir holding that registry's credentials"
+	for _, r := range []struct {
+		name     string
+		extra    map[string]string
+		wantHint bool
+	}{
+		{"anonymous", nil, true},
+		{"operator config", map[string]string{gateDockerConfigEnvVar: operatorDockerConfig(t, `{"auths":{}}`)}, false},
+	} {
+		t.Run(r.name, func(t *testing.T) {
+			declaredState(t, containerEnv(r.extra), safeDockerRuntime(declSock), stageImage("ghcr.io/o/private:v1"), nil)
+			scriptGateExec(t, pulledImageResponder(1))
+			out, code, disp := runDeclaredGate(t, context.Background(), t.TempDir())
+			if code != -1 || disp != gateUnavailable || !strings.Contains(out, "could not be pulled from its registry") {
+				t.Fatalf("exec = %q / %d / %s", out, code, disp)
+			}
+			if got := strings.Contains(out, hint); got != r.wantHint {
+				t.Errorf("hint present = %t, want %t: %q", got, r.wantHint, out)
+			}
+			if r.wantHint && !strings.HasSuffix(out, "; "+hint) {
+				t.Errorf("hint must follow PullFailedReason's text: %q", out)
+			}
+		})
 	}
 }

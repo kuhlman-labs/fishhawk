@@ -217,6 +217,12 @@ type Selection struct {
 	// DistinctImagesCount is the number of distinct resolved images the
 	// stage's gates ran in, set by the runner only when it exceeds one.
 	DistinctImagesCount int `json:"distinct_images_count,omitempty"`
+	// Credentials is the credential posture of the container path's runtime
+	// CLI calls (E51.26 / #4046): anonymous (the runner-owned config) or
+	// operator_config (FISHHAWK_GATE_DOCKER_CONFIG). Stamped by the runner on
+	// a container-path selection; Select never sets it, so it is empty on
+	// every other path.
+	Credentials Credentials `json:"credentials,omitempty"`
 }
 
 // Refused reports whether the selection forbids executing the gate.

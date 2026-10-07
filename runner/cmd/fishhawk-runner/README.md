@@ -521,12 +521,14 @@ entry or cache mode fails startup like a bad mode —
   crossing via `-e` (`FISHHAWK_GATE_CONTAINER=1` pinned on every exec, the
   service's `FISHHAWK_TEST_PG_URL` applied LAST, its socket volume at
   `/pgsock:ro`, the passwd file at `/etc/passwd:ro`) and the RUNNER's own env going to the runtime CLI BOUND
-  to the endpoint the selection validated (`gateiso.Runtime.BindEndpointEnv`:
-  `DOCKER_HOST`/`DOCKER_CONTEXT`/`CONTAINER_HOST`/`CONTAINER_CONNECTION`
-  dropped and the validated socket re-pinned, and the argv opens with
+  to the endpoint the selection validated AND to a runner-chosen docker config
+  (`gateiso.Runtime.BindEndpointEnv`:
+  `DOCKER_HOST`/`DOCKER_CONTEXT`/`CONTAINER_HOST`/`CONTAINER_CONNECTION`/`DOCKER_CONFIG`/`REGISTRY_AUTH_FILE`
+  dropped, the validated socket and the config re-pinned, and the argv opens with
   `--host`/`--url unix://<socket>` — so a docker-context switch between two
   gates cannot redirect a bind-mount request to a daemon the selection never
-  validated), and `rm -f` under the same binding on a detached bounded
+  validated, and no runtime call reaches the operator's interactive credential
+  store; see "Runtime CLI credentials" below), and `rm -f` under the same binding on a detached bounded
   context whenever the exec returned `-1` (killing the CLI does not stop the
   container). Every container exec that reaches the seam logs one
   `gate_container_timing` line (`cache` = `process` | `degraded` | `off`,
@@ -567,6 +569,50 @@ selection table, mount guard, cache invariant, the gate services (#2137, with
 its operator walk and the leaked-service cleanup in `runner/README.md`) and the
 e2e fixture table:
 [`runner/internal/gateiso/README.md`](../../internal/gateiso/README.md).
+
+**Runtime CLI credentials (E51.26 / [#4046](https://github.com/kuhlman-labs/fishhawk/issues/4046)).**
+`gateisolation.go` owns the runner side of `gateiso`'s § "Runtime CLI
+credentials" (the contract and the residuals live there):
+
+- **Startup.** `FISHHAWK_GATE_DOCKER_CONFIG` (`gateDockerConfigEnvVar`) is
+  parsed by `configureGateIsolation`; a defect (relative path, not a dir, no
+  `config.json`, a non-object top level, a bad helper name) is a config error
+  naming the variable → `runner_failed reason=config`, exit 2, before any
+  backend contact. `gate_isolation_configured` gains `credentials`
+  (`anonymous` | `operator_config`), and `selection()` stamps it on a
+  container-path `Selection.Credentials` only.
+- **The pinned config.** `gateDockerConfig` returns the operator config, or
+  mints the runner-owned anonymous one ONCE per state on the first container
+  exec (`gate_docker_config_minted`; a mint failure is `gateUnavailable`
+  `gate container: docker config: …`; a nil state is refused rather than leak
+  a dir). `runGateInContainer` binds every runtime call's env to it.
+- **Probes (operator config only).** `probeGateCredentials` runs at site (a),
+  in `runGateInContainer` before resolution / passwd / cache / service, over
+  the gate image by reference plus the Postgres service image; and at site
+  (b), in `resolveBuiltImage` after the content-addressed inspect miss and
+  before the build, over the Dockerfile bases. A helper still running at
+  `gateCredentialProbeTimeout` (20s) returns `gate container:
+  container_credentials_blocked: …` as `gateUnavailable` (category C at both
+  gates). Each probe logs `gate_credentials_probe` (site, helper, server,
+  outcome, elapsed — never output); probes run on every exec.
+- **Pull-failure hint.** Under `anonymous`, a declared-image pull failure
+  appends the `FISHHAWK_GATE_DOCKER_CONFIG` remedy to
+  `gateiso.PullFailedReason`'s text (`anonymousPullHint`, at the call site).
+- **Cleanup.** `cleanup()` removes the cache volumes FIRST (their `volume rm`
+  runs under the bound env, which still names the owned dir), THEN the owned
+  dir (`gate_docker_config_removed` / `gate_docker_config_cleanup_failed`);
+  an operator config is never removed.
+- **Tests.** `TestRunGateInContainer_EveryRuntimeCallPinsRunnerDockerConfig`,
+  `TestDeclaredImage_PullUsesRunnerDockerConfigNotInherited`,
+  `TestRunGateInContainer_BlockedCredentialHelperFailsFast`,
+  `TestResolveBuiltImage_BlockedBaseHelperFailsBeforeBuild`,
+  `TestRunVerifyFixLoop_BlockedCredentialHelperIsCategoryC`, the
+  `TestRunGateInContainer_PreExecFailures` rows,
+  `TestRunGateInContainer_UnmatchedHelperNotProbed`,
+  `TestGateIsolationState_CleanupRemovesOwnedDockerConfigAfterCacheVolumes`,
+  `TestGateIsolationState_SelectionStampsCredentials`,
+  `TestDeclaredImage_PullFailureHintOnlyWhenAnonymous`, and the docker-gated
+  live fixture (p) `TestGateContainer_PublicPullIgnoresBlockingCredsStore`.
 
 ### Gate-env allow-list
 

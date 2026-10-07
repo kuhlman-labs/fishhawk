@@ -332,6 +332,8 @@ var agentSpawnSiteAllowlist = map[string]allowedSpawnSite{
 	"internal/gateiso/clone.go:runGit":                  {1, "git (resolved binary path)"},
 	"internal/gateiso/cache.go:seedDefaultExec":         {1, "module-cache seed command"},
 	"internal/hostload/hostload.go:defaultRunCommand":   {1, "ps / sysctl host-load probe"},
+
+	"internal/gateiso/dockerconfig.go:ProbeCredentialHelper": {1, "docker credential helper probe (docker-credential-<name> get; name regex-validated, cannot be the coding agent)"},
 }
 
 // TestNoAgentSpawnOutsideAdapters is the source-scan ratchet behind the
