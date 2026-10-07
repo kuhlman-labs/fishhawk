@@ -43,12 +43,13 @@ func (r *guardCountingRepo) ListRuns(ctx context.Context, f run.ListRunsFilter) 
 		return nil, r.listRunsErr
 	}
 	rows, err := r.orchestratorRepo.ListRuns(ctx, f)
-	// SNAPSHOT FIDELITY (load-bearing for the window tests): orchestratorRepo
-	// returns pointers INTO its own store, but postgresRepo.ListRuns
-	// materializes fresh rows — a true point-in-time value snapshot. Copying
-	// here is what makes the fake model the real window: without it, a mutation
-	// fired by onListRuns would be visible to the guard through the shared
-	// pointer, i.e. the exact OPPOSITE of the production behaviour under test.
+	// SNAPSHOT FIDELITY (load-bearing for the window tests): postgresRepo.ListRuns
+	// materializes fresh rows — a true point-in-time value snapshot, and a
+	// mutation fired by onListRuns must not be visible to the guard through a
+	// shared pointer (the exact OPPOSITE of the production behaviour under
+	// test). orchestratorRepo.ListRuns now returns copies itself (#4033), so
+	// this copy is REDUNDANT but harmless; it is kept so these window tests'
+	// fidelity does not silently depend on the base fake's copy-on-return.
 	out := make([]*run.Run, len(rows))
 	for i, row := range rows {
 		cp := *row

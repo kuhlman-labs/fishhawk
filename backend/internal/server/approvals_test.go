@@ -899,10 +899,26 @@ func (r *orchestratorRepo) stampDispatchedLocked(st *run.Stage) {
 	st.DispatchedAt = &at
 }
 
+// cloneRunLocked returns a shallow copy of a map-held run. Every run-returning
+// method hands out a copy taken under r.mu, mirroring the postgres repo's fresh
+// row per read: map-held state must never leak by pointer, or a caller reading
+// a returned field (e.g. handleHostDispatchStage's #3964 terminal-run guard
+// reading runRow.State) races a concurrent TransitionRun writing the same field
+// under the lock (#4033, the #2586 / #3226 fake-race class). Shallow is enough,
+// as with ListStagesForRun: no fake method mutates a pointee in place
+// (SetRunPullRequestURL reassigns the pointer). Live identity stays available
+// through seedRun / seedDecomposedChild and rr.runs[id]. Caller holds r.mu.
+func cloneRunLocked(rr *run.Run) *run.Run {
+	cp := *rr
+	return &cp
+}
+
 // seedDecomposedChild inserts a fan-out child run of parentID carrying the given
 // 0-based slice_index and run state, so the #2596 dispatched-sibling guard can be
 // exercised BY CONSTRUCTION (a child row built directly in a non-pending state is
-// definitionally past 'pending').
+// definitionally past 'pending'). Like seedRun it returns the LIVE map-held
+// pointer on purpose: a pre-concurrency setup handle, unlike the copies the
+// run-returning methods hand out (cloneRunLocked).
 func (r *orchestratorRepo) seedDecomposedChild(parentID uuid.UUID, sliceIdx int, state run.State) *run.Run {
 	id := uuid.New()
 	parent := parentID
@@ -930,6 +946,9 @@ func newOrchestratorRepo() *orchestratorRepo {
 	}
 }
 
+// seedRun returns the LIVE map-held pointer on purpose: it is a setup handle
+// tests mutate before any concurrency, unlike the copies the run-returning
+// methods hand out (cloneRunLocked).
 func (r *orchestratorRepo) seedRun() *run.Run {
 	id := uuid.New()
 	rr := &run.Run{
@@ -955,7 +974,7 @@ func (r *orchestratorRepo) SetRunPredictedRuntimeMinutes(_ context.Context, id u
 		return nil, run.ErrNotFound
 	}
 	rr.PredictedRuntimeMinutes = minutes
-	return rr, nil
+	return cloneRunLocked(rr), nil
 }
 
 // predictedRuntimeCallsSnapshot returns a copy of the recorded calls under the
@@ -991,7 +1010,7 @@ func (r *orchestratorRepo) GetRun(_ context.Context, id uuid.UUID) (*run.Run, er
 	if !ok {
 		return nil, run.ErrNotFound
 	}
-	return rr, nil
+	return cloneRunLocked(rr), nil
 }
 
 // AddRunCost satisfies the trace handler's runCostRecorder optional
@@ -1012,7 +1031,7 @@ func (r *orchestratorRepo) AddRunCost(_ context.Context, id uuid.UUID, deltaUSD 
 	if resolvedModel != "" {
 		rr.ResolvedModel = resolvedModel
 	}
-	return rr, nil
+	return cloneRunLocked(rr), nil
 }
 
 func (r *orchestratorRepo) GetRunByIdempotencyKey(context.Context, string, string) (*run.Run, error) {
@@ -1099,7 +1118,7 @@ func (r *orchestratorRepo) TransitionRun(_ context.Context, id uuid.UUID, to run
 		return nil, run.InvalidTransitionError{Kind: "run", From: string(rr.State), To: string(to)}
 	}
 	rr.State = to
-	return rr, nil
+	return cloneRunLocked(rr), nil
 }
 
 // RetryRun mirrors postgresRepo's run-level reopen override (#698):
@@ -1117,7 +1136,7 @@ func (r *orchestratorRepo) RetryRun(_ context.Context, id uuid.UUID, to run.Stat
 		return nil, run.InvalidTransitionError{Kind: "run", From: string(rr.State), To: string(to)}
 	}
 	rr.State = to
-	return rr, nil
+	return cloneRunLocked(rr), nil
 }
 
 func (r *orchestratorRepo) SetRunPullRequestURL(_ context.Context, id uuid.UUID, url string) (*run.Run, error) {
@@ -1129,7 +1148,7 @@ func (r *orchestratorRepo) SetRunPullRequestURL(_ context.Context, id uuid.UUID,
 	}
 	u := url
 	rr.PullRequestURL = &u
-	return rr, nil
+	return cloneRunLocked(rr), nil
 }
 
 func (r *orchestratorRepo) TransitionStage(_ context.Context, id uuid.UUID, to run.StageState, c *run.StageCompletion) (*run.Stage, error) {
@@ -1245,7 +1264,7 @@ func (r *orchestratorRepo) ListRuns(_ context.Context, f run.ListRunsFilter) ([]
 		if f.DecomposedFrom != nil && (rr.DecomposedFrom == nil || *rr.DecomposedFrom != *f.DecomposedFrom) {
 			continue
 		}
-		out = append(out, rr)
+		out = append(out, cloneRunLocked(rr))
 	}
 	return out, nil
 }
