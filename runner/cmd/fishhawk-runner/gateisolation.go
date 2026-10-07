@@ -363,6 +363,12 @@ var newAnonymousDockerConfigFn = gateiso.NewAnonymousDockerConfig
 // probes; production leaves it the real probe.
 var probeCredentialHelperFn = gateiso.ProbeCredentialHelper
 
+// parseGateDockerfileFn parses the committed Dockerfile at the build-base
+// credential probe site (gateiso.ParseDockerfile). A package var SOLELY so a
+// test can make that parse fail and pin that it fails closed; production
+// leaves it the real parser.
+var parseGateDockerfileFn = gateiso.ParseDockerfile
+
 // writePasswdFileFn writes the per-exec passwd file (gateiso.WritePasswdFile).
 // A package var SOLELY so a test can make the write fail and pin the degrade.
 var writePasswdFileFn = gateiso.WritePasswdFile
@@ -1213,7 +1219,9 @@ func (s *gateIsolationState) anonymousPullHint() string {
 // helper dockerCfg would invoke for images (E51.26 / #4046: the CLI's own
 // store choice, gateiso.DockerConfig.ProbesFor — an unmatched helper is never
 // run) and returns the blocked reason of the first that does not answer
-// within gateCredentialProbeTimeout ("" when none blocks). The anonymous
+// within gateCredentialProbeTimeout, or a cancellation reason when the
+// stage's own context ended mid-probe — never the blocked text, which would
+// name a locked screen that did not occur ("" when none blocks). The anonymous
 // config matches no helper, so it probes nothing. Each probe logs one
 // gate_credentials_probe line naming the site, helper, server and outcome —
 // never the helper's output. Probes run on EVERY exec, uncached: a screen
@@ -1223,8 +1231,11 @@ func (s *gateIsolationState) probeGateCredentials(ctx context.Context, dockerCfg
 		res := probeCredentialHelperFn(ctx, p, cliEnv, gateCredentialProbeTimeout)
 		s.logEvent(`{"event":"gate_credentials_probe","site":%q,"helper":%q,"server":%q,"outcome":%q,"detail":%q,"elapsed_ms":%d}`,
 			site, p.Executable(), p.Server, res.Outcome, res.Detail, res.Elapsed.Milliseconds())
-		if res.Outcome == gateiso.ProbeBlocked {
+		switch res.Outcome {
+		case gateiso.ProbeBlocked:
 			return res.BlockedReason()
+		case gateiso.ProbeCancelled:
+			return fmt.Sprintf("credential helper %s probe for %s cancelled: %s", p.Executable(), p.Server, res.Detail)
 		}
 	}
 	return ""
@@ -1279,15 +1290,19 @@ func (s *gateIsolationState) resolveBuiltImage(ctx context.Context, rt gateiso.R
 		res.ImageID = insp.ID
 		return res, "cache_hit", "", gateExecuted
 	}
-	// ScreenDockerfile above parsed the same bytes, so this cannot fail.
-	if df, err := gateiso.ParseDockerfile(content); err == nil {
-		bases := make([]string, len(df.Bases))
-		for i, b := range df.Bases {
-			bases[i] = b.Ref
-		}
-		if reason := s.probeGateCredentials(ctx, dockerCfg, bases, cliEnv, "build"); reason != "" {
-			return gateContainerUnavailable("%s", reason)
-		}
+	// ScreenDockerfile above parsed the same bytes, so this should not fail;
+	// if the two ever diverge it fails closed rather than skipping the
+	// base-helper probe straight into the build.
+	df, err := parseGateDockerfileFn(content)
+	if err != nil {
+		return gateContainerUnavailable("parse %s for the credential probe: %v", src.Dockerfile, err)
+	}
+	bases := make([]string, len(df.Bases))
+	for i, b := range df.Bases {
+		bases[i] = b.Ref
+	}
+	if reason := s.probeGateCredentials(ctx, dockerCfg, bases, cliEnv, "build"); reason != "" {
+		return gateContainerUnavailable("%s", reason)
 	}
 	tmp, err := os.MkdirTemp("", "fishhawk-gate-build-*")
 	if err != nil {

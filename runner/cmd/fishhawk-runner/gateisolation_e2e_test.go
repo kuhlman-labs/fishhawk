@@ -1469,7 +1469,15 @@ func TestGateContainer_CacheVolumeWarmWithinProcessFreshAcrossProcesses(t *testi
 // a pull that completes means the fixture discriminates nothing and FAILS.
 // Condition 4(b): DetectRuntime, which runs before the seam under the
 // inherited env, also runs under the blocking config here and invokes no
-// helper.
+// helper. A logging fake of the PLATFORM DEFAULT helper (osxkeychain on
+// darwin; pass and secretservice on linux) sits first on PATH throughout and
+// must record zero calls: with an empty auths map the docker CLI auto-detects
+// that helper and consults it even for an anonymous public pull, which the
+// anonymous config's placeholder auths entry prevents (#4046 review).
+// DOCKER_HOST is pinned to the socket requireGateImage already validated, and
+// DOCKER_CONTEXT cleared, so detection under the blocking config (which holds
+// no context metadata) resolves the default context to that socket on a
+// context-based Docker Desktop install with no /var/run/docker.sock.
 func TestGateContainer_PublicPullIgnoresBlockingCredsStore(t *testing.T) {
 	rt, image := requireGateImage(t)
 	if rt.Kind != gateiso.KindDocker {
@@ -1485,10 +1493,25 @@ func TestGateContainer_PublicPullIgnoresBlockingCredsStore(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(blocking, "config.json"), []byte(`{"auths":{},"credsStore":"fhblock"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	platformLog := filepath.Join(helpers, "platform-calls.log")
+	platformDefaults := map[string][]string{"darwin": {"osxkeychain"}, "linux": {"pass", "secretservice"}}[runtime.GOOS]
+	if len(platformDefaults) == 0 {
+		t.Skipf("no platform-default docker credential helper is known for %s", runtime.GOOS)
+	}
+	for _, name := range platformDefaults {
+		fake := "#!/bin/sh\necho \"" + name + " $*\" >> \"$FH_PLATFORM_HELPER_LOG\"\necho 'credentials not found in native keychain'\nexit 1\n"
+		if err := os.WriteFile(filepath.Join(helpers, "docker-credential-"+name), []byte(fake), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
 	t.Setenv("PATH", helpers+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("DOCKER_CONFIG", blocking)
+	t.Setenv("DOCKER_HOST", "unix://"+rt.SocketPath)
+	t.Setenv("DOCKER_CONTEXT", "")
 	t.Setenv("FH_HELPER_LOG", helperLog)
+	t.Setenv("FH_PLATFORM_HELPER_LOG", platformLog)
 	helperCalls := func() string { b, _ := os.ReadFile(helperLog); return string(b) }
+	platformCalls := func() string { b, _ := os.ReadFile(platformLog); return string(b) }
 
 	// Precondition: the blocking store DOES hang a direct pull on this host.
 	endpoint, err := rt.EndpointArgs()
@@ -1559,6 +1582,9 @@ func TestGateContainer_PublicPullIgnoresBlockingCredsStore(t *testing.T) {
 	}
 	if calls := helperCalls(); calls != "" {
 		t.Errorf("the gate path invoked the blocking helper: %q", calls)
+	}
+	if calls := platformCalls(); calls != "" {
+		t.Errorf("the gate path invoked the platform-default credential helper %v (the anonymous config let the docker CLI auto-detect it): %q", platformDefaults, calls)
 	}
 	st.cleanup()
 	if _, err := os.Stat(minted); !os.IsNotExist(err) {

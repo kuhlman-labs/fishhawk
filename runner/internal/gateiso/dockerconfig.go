@@ -21,8 +21,10 @@ import (
 // Docker Desktop's `desktop` helper blocks every pull while the macOS screen
 // is locked, even an anonymous pull of a public image, because the docker
 // CLI consults the store for every registry it talks to. By default that
-// config is a runner-owned temp dir with NO credsStore and NO credHelpers
-// (NewAnonymousDockerConfig); FISHHAWK_GATE_DOCKER_CONFIG opts into an
+// config is a runner-owned temp dir with NO credsStore, NO credHelpers and a
+// credential-free placeholder auths entry that stops the CLI auto-detecting
+// the platform default helper (NewAnonymousDockerConfig);
+// FISHHAWK_GATE_DOCKER_CONFIG opts into an
 // operator-prepared one (LoadOperatorDockerConfig), whose matching helpers
 // the runner probes under a bound before any pull (ProbeCredentialHelper).
 
@@ -81,25 +83,41 @@ func (c DockerConfig) Remove() error {
 	return os.RemoveAll(c.Dir)
 }
 
-// anonymousConfig is the whole content of the runner-owned config.json: an
-// empty auths map, plus the plugin dirs so `docker buildx` (a CLI plugin the
-// docker CLI looks up under DOCKER_CONFIG/cli-plugins) still resolves.
+// anonymousConfig is the whole content of the runner-owned config.json: the
+// credential-free placeholder auths entry, plus the plugin dirs so `docker
+// buildx` (a CLI plugin the docker CLI looks up under DOCKER_CONFIG/cli-plugins)
+// still resolves.
 type anonymousConfig struct {
-	Auths               map[string]any `json:"auths"`
-	CliPluginsExtraDirs []string       `json:"cliPluginsExtraDirs,omitempty"`
+	Auths               map[string]struct{} `json:"auths"`
+	CliPluginsExtraDirs []string            `json:"cliPluginsExtraDirs,omitempty"`
 }
 
+// anonymousAuthPlaceholder is the one auths key of the runner-owned config,
+// mapped to an EMPTY object (no auth, no identitytoken). It exists because an
+// empty auths map is NOT helper-free: the docker CLI's LoadDefaultConfigFile
+// runs credentials.DetectDefaultStore whenever the config's ContainsAuth() is
+// false (no credsStore, no credHelpers AND no auths entry), adopting the
+// platform default helper — docker-credential-osxkeychain on darwin, -pass or
+// -secretservice on linux — when it is on PATH and consulting it even for an
+// anonymous pull of a public image, which hangs on a locked screen exactly as
+// the credsStore does (#4046 review). One entry makes ContainsAuth() true, so
+// detection is skipped and every registry resolves through the plain file
+// store, which holds nothing for it. The key is an RFC 2606 reserved name no
+// image reference can name.
+const anonymousAuthPlaceholder = "fishhawk.invalid"
+
 // NewAnonymousDockerConfig mints the runner-owned config: a fresh temp dir
-// (mode 0700) holding a config.json (mode 0600) with an empty auths map, NO
-// credsStore and NO credHelpers, and pluginDirs as cliPluginsExtraDirs. The
-// caller removes it with Remove; a failed mint removes what it created.
+// (mode 0700) holding a config.json (mode 0600) whose auths map holds only the
+// credential-free anonymousAuthPlaceholder entry, with NO credsStore and NO
+// credHelpers, and pluginDirs as cliPluginsExtraDirs. The caller removes it
+// with Remove; a failed mint removes what it created.
 func NewAnonymousDockerConfig(pluginDirs []string) (DockerConfig, error) {
 	dir, err := os.MkdirTemp("", "fishhawk-gate-docker-config-*")
 	if err != nil {
 		return DockerConfig{}, fmt.Errorf("create runner docker config dir: %w", err)
 	}
 	cfg := DockerConfig{Dir: dir, Credentials: CredentialsAnonymous, owned: true}
-	b, err := json.Marshal(anonymousConfig{Auths: map[string]any{}, CliPluginsExtraDirs: pluginDirs})
+	b, err := json.Marshal(anonymousConfig{Auths: map[string]struct{}{anonymousAuthPlaceholder: {}}, CliPluginsExtraDirs: pluginDirs})
 	if err == nil {
 		err = os.Chmod(dir, 0o700)
 	}
@@ -260,6 +278,10 @@ const (
 	// ProbeBlocked means the helper did not answer within the bound; its whole
 	// process group was killed.
 	ProbeBlocked ProbeOutcome = "blocked"
+	// ProbeCancelled means the CALLER's context ended (the stage is aborting)
+	// before the helper answered or the bound expired — not a blocked helper.
+	// A running helper's group was killed; Detail names the context error.
+	ProbeCancelled ProbeOutcome = "cancelled"
 )
 
 // ProbeResult is one probe's verdict. It never carries the helper's output:
@@ -267,7 +289,7 @@ const (
 type ProbeResult struct {
 	Probe   CredentialProbe
 	Outcome ProbeOutcome
-	// Detail names why a probe is missing ("" otherwise).
+	// Detail names why a probe is missing or cancelled ("" otherwise).
 	Detail  string
 	Bound   time.Duration
 	Elapsed time.Duration
@@ -309,9 +331,14 @@ func lookPathIn(file string, env []string) (string, error) {
 // group with stdout and stderr on the null device (its answer is a
 // credential and is never read), and on expiry the WHOLE group is SIGKILLed —
 // a helper's descendant cannot outlive the probe. It classifies the helper as
-// answered, missing or blocked.
+// answered, missing or blocked — or cancelled when ctx itself ended first,
+// so an aborting stage is never reported as a blocked helper.
 func ProbeCredentialHelper(ctx context.Context, p CredentialProbe, env []string, bound time.Duration) ProbeResult {
 	res := ProbeResult{Probe: p, Bound: bound}
+	if err := ctx.Err(); err != nil {
+		res.Outcome, res.Detail = ProbeCancelled, err.Error()
+		return res
+	}
 	bin, err := lookPathIn(p.Executable(), env)
 	if err != nil {
 		res.Outcome, res.Detail = ProbeMissing, err.Error()
@@ -332,10 +359,13 @@ func ProbeCredentialHelper(ctx context.Context, p CredentialProbe, env []string,
 	}
 	_ = cmd.Wait()
 	res.Elapsed = time.Since(start)
-	if pctx.Err() != nil {
+	switch {
+	case ctx.Err() != nil:
+		res.Outcome, res.Detail = ProbeCancelled, ctx.Err().Error()
+	case pctx.Err() != nil:
 		res.Outcome = ProbeBlocked
-		return res
+	default:
+		res.Outcome = ProbeAnswered
 	}
-	res.Outcome = ProbeAnswered
 	return res
 }

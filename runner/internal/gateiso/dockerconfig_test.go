@@ -30,8 +30,12 @@ func writeModeFile(t *testing.T, path, content string, mode os.FileMode) {
 }
 
 // TestNewAnonymousDockerConfig_Content: the runner-owned config is a 0700 dir
-// whose 0600 config.json holds ONLY an empty auths map and the plugin dirs —
-// no credsStore, no credHelpers — and Remove deletes it.
+// whose 0600 config.json holds ONLY the plugin dirs and an auths map whose one
+// entry is the credential-free placeholder (an empty object: no auth, no
+// identitytoken) — no credsStore, no credHelpers — and Remove deletes it. The
+// placeholder is load-bearing: with an EMPTY auths map the docker CLI
+// auto-detects the platform default helper (osxkeychain, pass, secretservice)
+// and consults it even for an anonymous pull (#4046 review).
 func TestNewAnonymousDockerConfig_Content(t *testing.T) {
 	cfg, err := NewAnonymousDockerConfig([]string{"/op/.docker/cli-plugins", "/Applications/Docker.app/Contents/Resources/cli-plugins"})
 	if err != nil {
@@ -49,7 +53,7 @@ func TestNewAnonymousDockerConfig_Content(t *testing.T) {
 		t.Fatalf("config.json mode = %v (%v), want 0600", info.Mode().Perm(), err)
 	}
 	b, _ := os.ReadFile(cfg.ConfigFile())
-	if want := `{"auths":{},"cliPluginsExtraDirs":["/op/.docker/cli-plugins","/Applications/Docker.app/Contents/Resources/cli-plugins"]}`; string(b) != want {
+	if want := `{"auths":{"fishhawk.invalid":{}},"cliPluginsExtraDirs":["/op/.docker/cli-plugins","/Applications/Docker.app/Contents/Resources/cli-plugins"]}`; string(b) != want {
 		t.Errorf("config.json = %s, want %s", b, want)
 	}
 	var keys map[string]json.RawMessage
@@ -60,6 +64,13 @@ func TestNewAnonymousDockerConfig_Content(t *testing.T) {
 		if _, ok := keys[k]; ok {
 			t.Errorf("anonymous config carries %s", k)
 		}
+	}
+	var auths map[string]map[string]json.RawMessage
+	if err := json.Unmarshal(keys["auths"], &auths); err != nil {
+		t.Fatal(err)
+	}
+	if len(auths) != 1 || auths[anonymousAuthPlaceholder] == nil || len(auths[anonymousAuthPlaceholder]) != 0 {
+		t.Errorf("auths = %s, want exactly one credential-free %q entry (an empty auths map lets the CLI auto-detect the platform default helper)", keys["auths"], anonymousAuthPlaceholder)
 	}
 	if err := cfg.Remove(); err != nil {
 		t.Fatal(err)
@@ -359,4 +370,56 @@ func TestProbeCredentialHelper_BlockedKillsHelperAndDescendant(t *testing.T) {
 	if got := res.BlockedReason(); got != want {
 		t.Errorf("BlockedReason = %q, want %q", got, want)
 	}
+}
+
+// TestProbeCredentialHelper_CancelledIsNotBlocked (#4046 review): a probe
+// whose CALLER's context ended — before the probe, or while the helper runs —
+// is cancelled with the context error, never blocked: the blocked reason
+// names a locked keychain/screen that did not occur. A pre-cancelled probe
+// never runs the helper; a mid-flight cancellation returns well inside the
+// bound and kills the helper.
+func TestProbeCredentialHelper_CancelledIsNotBlocked(t *testing.T) {
+	dir, env := helperDir(t, map[string]string{
+		"ran":   `touch "$FH_PROBE_DIR/ran"; exit 0`,
+		"block": `echo $$ > "$FH_PROBE_DIR/helper.pid"; sleep 600`,
+	})
+	t.Run("pre-cancelled", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		res := ProbeCredentialHelper(ctx, CredentialProbe{Helper: "ran", Server: "ghcr.io"}, env, 10*time.Second)
+		if res.Outcome != ProbeCancelled || res.Detail != context.Canceled.Error() {
+			t.Fatalf("result = %+v, want cancelled naming %q", res, context.Canceled)
+		}
+		if _, err := os.Stat(filepath.Join(dir, "ran")); !os.IsNotExist(err) {
+			t.Errorf("a pre-cancelled probe ran the helper (%v)", err)
+		}
+	})
+	t.Run("cancelled mid-flight", func(t *testing.T) {
+		const bound = 30 * time.Second
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		pidFile := filepath.Join(dir, "helper.pid")
+		go func() {
+			for deadline := time.Now().Add(bound); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+				if b, err := os.ReadFile(pidFile); err == nil && len(b) > 0 {
+					break
+				}
+			}
+			cancel()
+		}()
+		start := time.Now()
+		res := ProbeCredentialHelper(ctx, CredentialProbe{Helper: "block", Server: "ghcr.io"}, env, bound)
+		elapsed := time.Since(start)
+		helper := readPid(t, pidFile)
+		t.Cleanup(func() { _ = syscall.Kill(helper, syscall.SIGKILL) })
+		if res.Outcome != ProbeCancelled || res.Detail != context.Canceled.Error() {
+			t.Fatalf("result = %+v, want cancelled naming %q (a parent cancellation is not a blocked helper)", res, context.Canceled)
+		}
+		if elapsed >= bound {
+			t.Errorf("probe returned after %s, not on the cancellation", elapsed)
+		}
+		if !pidGone(helper, 5*time.Second) {
+			t.Errorf("helper pid %d survived the cancelled probe", helper)
+		}
+	})
 }

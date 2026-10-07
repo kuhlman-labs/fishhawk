@@ -129,9 +129,10 @@ pulls under YOUR docker config. On Docker Desktop for macOS that config's
 LOCKED (#4046), so step 4's pull makes no progress and prints no error; the
 tell is a `docker-credential-desktop get` child under the `docker` process.
 This is the environment, not the image or the script. Unlock the screen, or
-use the anonymous-pull remedy (`DOCKER_CONFIG` at a fresh config with no
-`credsStore`, no `credHelpers` and no inline `auths` entries, plus an explicit
-`DOCKER_HOST`): `docs/deploy/self-hosted.md` § "Docker Desktop: a locked screen
+use the anonymous-pull remedy (`DOCKER_CONFIG` at a fresh config holding only
+`{"auths":{"fishhawk.invalid":{}}}` — no `credsStore`, no `credHelpers`, no
+credential; a bare `{"auths":{}}` still lets the CLI auto-detect and call
+`docker-credential-osxkeychain` — plus an explicit `DOCKER_HOST`): `docs/deploy/self-hosted.md` § "Docker Desktop: a locked screen
 and the credential helper". It works for the default
 `ghcr.io/kuhlman-labs/fishhawk-gate:main` only after the one-time
 public-visibility step below, and never for a private image. The RUNNER needs

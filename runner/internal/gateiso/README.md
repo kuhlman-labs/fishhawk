@@ -527,8 +527,19 @@ runtime call under the operator's interactive config.
 
 - `anonymous` (default, `FISHHAWK_GATE_DOCKER_CONFIG` unset) — a RUNNER-OWNED
   config (`NewAnonymousDockerConfig`): a temp dir (mode `0700`) whose
-  `config.json` (mode `0600`) holds ONLY `{"auths":{}}` plus
-  `cliPluginsExtraDirs`, with NO `credsStore` and NO `credHelpers`. Minted
+  `config.json` (mode `0600`) holds ONLY `{"auths":{"fishhawk.invalid":{}}}`
+  plus `cliPluginsExtraDirs`, with NO `credsStore` and NO `credHelpers`. The
+  one auths entry is a credential-free PLACEHOLDER (an empty object, no
+  `auth` / `identitytoken`, keyed by an RFC 2606 reserved name no image can
+  name) and is load-bearing: with an EMPTY auths map the docker CLI's
+  `LoadDefaultConfigFile` sees `ContainsAuth()` false, runs
+  `credentials.DetectDefaultStore`, and adopts the platform default helper
+  (`docker-credential-osxkeychain` on darwin, `-pass` or `-secretservice` on
+  linux) whenever it is on `PATH`, consulting it even for an anonymous public
+  pull — the same locked-screen hang (#4046 review; operator-reproduced on
+  Docker 29.5.3). One entry makes `ContainsAuth()` true, so detection is
+  skipped and every registry resolves through the plain file store, which
+  holds nothing for it. Minted
   lazily on the first container exec of a runner process
   (`gateDockerConfig`), reused by every later exec, and removed at
   `cleanup()` AFTER the cache volumes (whose `volume rm` still runs under it).
@@ -576,8 +587,13 @@ helper that has not answered within 20s (`gateCredentialProbeTimeout`) is
 `blocked` and fails the exec `gateUnavailable` (category C) with
 `container_credentials_blocked: credential helper docker-credential-<name> did
 not answer within <bound> for <server> (a locked keychain/screen, or a slow
-network-backed helper)`. A missing helper is logged and left to the pull's own
-error. Every probe logs one `gate_credentials_probe` line (site, helper,
+network-backed helper)`. A probe whose CALLER's context ended first (the
+stage aborting) is `cancelled`, never `blocked` — it also fails the exec
+`gateUnavailable`, naming the cancellation instead of a lock that did not
+occur. A missing helper is logged and left to the pull's own error. Site (b)
+re-parses the committed Dockerfile for its bases; a parse error there (which
+`ScreenDockerfile` on the same bytes makes unreachable today) fails the exec
+`gateUnavailable` rather than skipping the probe into the build. Every probe logs one `gate_credentials_probe` line (site, helper,
 server, outcome — never output). Probes run on EVERY exec, uncached.
 
 **Residuals (named, not closed).**
@@ -593,7 +609,13 @@ server, outcome — never output). Probes run on EVERY exec, uncached.
   with the INHERITED env, before any config is pinned. It invokes no
   credential helper — the live fixture (p) runs it under the blocking config
   and asserts the helper was never called — but it is outside the every-call
-  guarantee, which covers post-selection runtime calls only.
+  guarantee, which covers post-selection runtime calls only. Fixture (p)
+  pins `DOCKER_HOST` to the socket its runtime already validated and clears
+  `DOCKER_CONTEXT`, because the blocking config holds no context metadata:
+  without the pin the default context resolves `/var/run/docker.sock`, absent
+  on a context-based Docker Desktop install. It also puts a logging fake of
+  the platform default helper first on `PATH` and asserts zero calls — the
+  live control on the placeholder auths entry.
 - *Opt-in probe cost.* One outbound credential call per MATCHED pair per
   exec, plus one per build-base pair before a build, with no success caching;
   for a network-backed helper (ecr-login, gcr, acr) that is a live token

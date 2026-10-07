@@ -2599,8 +2599,8 @@ func TestDeclaredImage_PullUsesRunnerDockerConfigNotInherited(t *testing.T) {
 		}
 	}
 	b, err := os.ReadFile(filepath.Join(minted, "config.json"))
-	if err != nil || strings.Contains(string(b), "credsStore") || strings.Contains(string(b), "credHelpers") || !strings.Contains(string(b), `"auths":{}`) {
-		t.Errorf("runner-owned config.json = %s (%v), want an empty auths map and no store", b, err)
+	if err != nil || strings.Contains(string(b), "credsStore") || strings.Contains(string(b), "credHelpers") || !strings.Contains(string(b), `"auths":{"fishhawk.invalid":{}}`) {
+		t.Errorf("runner-owned config.json = %s (%v), want only the credential-free placeholder auths entry and no store", b, err)
 	}
 	for _, kv := range sanitizedGateEnv() {
 		if strings.HasPrefix(kv, "FISHHAWK_TEST_INHERITED_ONLY=") {
@@ -4060,6 +4060,64 @@ func TestResolveBuiltImage_BlockedBaseHelperFailsBeforeBuild(t *testing.T) {
 	}
 	if !strings.Contains(log.String(), `"site":"build","helper":"docker-credential-fhblock","server":"ghcr.io","outcome":"blocked"`) {
 		t.Errorf("missing build-site probe line:\n%s", log.String())
+	}
+}
+
+// TestResolveBuiltImage_ProbeSiteParseErrorFailsClosed (#4046 review): a
+// Dockerfile the build-base probe site cannot parse — unreachable today, since
+// ScreenDockerfile parsed the same bytes, so the divergence is injected — is
+// gateUnavailable naming the parse, never a silent skip of the base-helper
+// probe straight into the build.
+func TestResolveBuiltImage_ProbeSiteParseErrorFailsClosed(t *testing.T) {
+	repo := buildRepo(t, map[string]string{"gate/Dockerfile": "FROM ghcr.io/o/base:1\nCOPY . /src\n", "gate/a.txt": "x\n"})
+	prev := parseGateDockerfileFn
+	parseGateDockerfileFn = func([]byte) (*gateiso.Dockerfile, error) { return nil, errors.New("injected parser divergence") }
+	t.Cleanup(func() { parseGateDockerfileFn = prev })
+	declaredState(t, containerEnv(nil), safeDockerRuntime(declSock), declaredBuild, nil)
+	var g *gateExecScript
+	g = scriptGateExec(t, buildResponder(&g, 0, nil))
+	out, code, disp := runDeclaredGate(t, context.Background(), repo)
+	if code != -1 || disp != gateUnavailable {
+		t.Fatalf("exec = %d / %s, want -1 / unavailable: %s", code, disp, out)
+	}
+	if !strings.Contains(out, "parse gate/Dockerfile for the credential probe: injected parser divergence") {
+		t.Errorf("output = %q, want the probe-site parse failure named", out)
+	}
+	if g.counts["build"] != 0 {
+		t.Errorf("the build ran past an unparsable probe site: %q", g.order)
+	}
+}
+
+// TestRunGateInContainer_CancelledProbeIsNotBlocked (#4046 review): a probe
+// cancelled by the stage's own context fails the exec naming the
+// cancellation, never container_credentials_blocked (which names a locked
+// screen that did not occur), and no runtime call runs after it.
+func TestRunGateInContainer_CancelledProbeIsNotBlocked(t *testing.T) {
+	var log strings.Builder
+	st := containerStateEnv(t, "img:1", declSock, &log, map[string]string{gateDockerConfigEnvVar: operatorDockerConfig(t, `{"credsStore":"fhblock"}`)})
+	installGateState(t, st)
+	g := scriptGateExec(t, nil)
+	prev := probeCredentialHelperFn
+	probeCredentialHelperFn = func(_ context.Context, p gateiso.CredentialProbe, _ []string, bound time.Duration) gateiso.ProbeResult {
+		g.order = append(g.order, "probe:"+p.Executable())
+		return gateiso.ProbeResult{Probe: p, Outcome: gateiso.ProbeCancelled, Detail: context.Canceled.Error(), Bound: bound}
+	}
+	t.Cleanup(func() { probeCredentialHelperFn = prev })
+	out, code, disp := runDeclaredGate(t, context.Background(), t.TempDir())
+	if code != -1 || disp != gateUnavailable {
+		t.Fatalf("exec = %d / %s, want -1 / unavailable: %s", code, disp, out)
+	}
+	if want := "gate container: credential helper docker-credential-fhblock probe for https://index.docker.io/v1/ cancelled: context canceled"; !strings.HasPrefix(out, want) {
+		t.Errorf("output = %q, want lead %q", out, want)
+	}
+	if strings.Contains(out, "container_credentials_blocked") {
+		t.Errorf("a cancelled probe was reported as a blocked helper: %q", out)
+	}
+	if got := strings.Join(g.order, ","); got != "probe:docker-credential-fhblock" {
+		t.Errorf("calls = %s, want only the probe", got)
+	}
+	if !strings.Contains(log.String(), `"helper":"docker-credential-fhblock","server":"https://index.docker.io/v1/","outcome":"cancelled","detail":"context canceled"`) {
+		t.Errorf("missing cancelled gate_credentials_probe line:\n%s", log.String())
 	}
 }
 

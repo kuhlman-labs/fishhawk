@@ -593,8 +593,12 @@ credentials" (the contract and the residuals live there):
   before the build, over the Dockerfile bases. A helper still running at
   `gateCredentialProbeTimeout` (20s) returns `gate container:
   container_credentials_blocked: …` as `gateUnavailable` (category C at both
-  gates). Each probe logs `gate_credentials_probe` (site, helper, server,
-  outcome, elapsed — never output); probes run on every exec.
+  gates); a probe the stage's own context cancelled returns `gate container:
+  credential helper … probe for … cancelled: …`, never the blocked text. Site
+  (b) re-parses the Dockerfile through `parseGateDockerfileFn`, and a parse
+  error there is `gateUnavailable`, never a skip into the build. Each probe
+  logs `gate_credentials_probe` (site, helper, server, outcome, elapsed —
+  never output); probes run on every exec.
 - **Pull-failure hint.** Under `anonymous`, a declared-image pull failure
   appends the `FISHHAWK_GATE_DOCKER_CONFIG` remedy to
   `gateiso.PullFailedReason`'s text (`anonymousPullHint`, at the call site).
@@ -605,14 +609,20 @@ credentials" (the contract and the residuals live there):
 - **Tests.** `TestRunGateInContainer_EveryRuntimeCallPinsRunnerDockerConfig`,
   `TestDeclaredImage_PullUsesRunnerDockerConfigNotInherited`,
   `TestRunGateInContainer_BlockedCredentialHelperFailsFast`,
+  `TestRunGateInContainer_CancelledProbeIsNotBlocked`,
   `TestResolveBuiltImage_BlockedBaseHelperFailsBeforeBuild`,
+  `TestResolveBuiltImage_ProbeSiteParseErrorFailsClosed`,
   `TestRunVerifyFixLoop_BlockedCredentialHelperIsCategoryC`, the
   `TestRunGateInContainer_PreExecFailures` rows,
   `TestRunGateInContainer_UnmatchedHelperNotProbed`,
   `TestGateIsolationState_CleanupRemovesOwnedDockerConfigAfterCacheVolumes`,
   `TestGateIsolationState_SelectionStampsCredentials`,
   `TestDeclaredImage_PullFailureHintOnlyWhenAnonymous`, and the docker-gated
-  live fixture (p) `TestGateContainer_PublicPullIgnoresBlockingCredsStore`.
+  live fixture (p) `TestGateContainer_PublicPullIgnoresBlockingCredsStore`
+  (pins `DOCKER_HOST` to the validated socket so detection under its
+  context-less blocking config works on a context-based Docker Desktop
+  install, and asserts a logging fake of the platform default helper is
+  never called).
 
 ### Gate-env allow-list
 

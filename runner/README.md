@@ -473,8 +473,13 @@ lifecycle, gate `run`, kill, cleanup) runs with `DOCKER_CONFIG` pinned by
 `gateiso.Runtime.BindEndpointEnv` to a config the runner chose:
 
 - **Default `anonymous`:** a runner-owned temp dir whose `config.json` holds
-  only `{"auths":{}}` plus the `cliPluginsExtraDirs` carried forward so
-  `docker buildx` still resolves — no `credsStore`, no `credHelpers`. No
+  only `{"auths":{"fishhawk.invalid":{}}}` plus the `cliPluginsExtraDirs`
+  carried forward so `docker buildx` still resolves — no `credsStore`, no
+  `credHelpers`. The one auths entry is a credential-free placeholder, and it
+  is what keeps the keychain out: with an EMPTY auths map the docker CLI
+  auto-detects the platform default helper (`docker-credential-osxkeychain`
+  on darwin, `-pass` / `-secretservice` on linux) when it is on `PATH` and
+  consults it even for an anonymous public pull. With the placeholder no
   helper and no keychain is touched, so only a public image pulls. The dir is
   removed at runner exit, after the cache volumes. The operator's interactive
   config is never used for credentials (it is read only for its
@@ -487,7 +492,9 @@ lifecycle, gate `run`, kill, cleanup) runs with `DOCKER_CONFIG` pinned by
   fails the exec `gateUnavailable` (category C) with
   `container_credentials_blocked: credential helper docker-credential-<name>
   did not answer within <bound> for <server> (a locked keychain/screen, or a
-  slow network-backed helper)` instead of a silent 10-minute pull timeout.
+  slow network-backed helper)` instead of a silent 10-minute pull timeout. A
+  probe cut short by the stage's own cancellation is reported as cancelled,
+  never as blocked.
 
 Under the anonymous posture a declared-image pull failure appends the
 `FISHHAWK_GATE_DOCKER_CONFIG` remedy to its reason. Runtime DETECTION
@@ -505,8 +512,10 @@ own `executor.verify.timeout`.
 `scripts/test lint|verify --in-gate-image` and the docker-gated e2e fixtures
 run under YOUR docker config and hang on a locked screen with no bound. Their
 remedy, for anonymous public pulls only: unlock the screen, or point
-`DOCKER_CONFIG` at a fresh `{"auths":{}}` config (no `credsStore`, no
-`credHelpers`, no inline `auths`) and set
+`DOCKER_CONFIG` at a fresh `{"auths":{"fishhawk.invalid":{}}}` config (no
+`credsStore`, no `credHelpers`, no credential in `auths` — the one empty
+placeholder entry is required, because an empty `{"auths":{}}` lets the CLI
+auto-detect `docker-credential-osxkeychain` and call it anyway) and set
 `DOCKER_HOST=unix://$HOME/.docker/run/docker.sock` with it — a fresh config
 dir has no `currentContext` or `contexts/`, so the CLI would otherwise fall
 back to the `default` context (`DOCKER_HOST`, else `/var/run/docker.sock`) and
