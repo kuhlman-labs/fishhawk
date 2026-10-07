@@ -520,7 +520,10 @@ func commsCapSuppressions(sups []commsSuppression) []commsSuppression {
 
 // commsPendingCursorFor returns the bounds phase 7 may advance to: the scan's
 // next cursors held back to the earliest omitted report's updated_at, with
-// note <= cursor, never behind the read bounds.
+// note <= cursor, never behind the read bounds. The note bound is derived
+// from the held cursor BEFORE it is clamped to Since (as commsCursorHoldBack
+// does): a GitLab note listed under a NoteSince earlier than Since may be
+// older than Since, and clamping first would lift the note floor past it.
 func commsPendingCursorFor(report *userreport.Report, omitted []commsKept) *commsPendingCursor {
 	pc := &commsPendingCursor{
 		Since: report.Since, NoteSince: report.NoteSince,
@@ -531,11 +534,11 @@ func commsPendingCursorFor(report *userreport.Report, omitted []commsKept) *comm
 			pc.Cursor = k.item.UpdatedAt
 		}
 	}
-	if pc.Cursor.Before(pc.Since) {
-		pc.Cursor = pc.Since
-	}
 	if pc.Cursor.Before(pc.NoteCursor) {
 		pc.NoteCursor = pc.Cursor
+	}
+	if pc.Cursor.Before(pc.Since) {
+		pc.Cursor = pc.Since
 	}
 	if pc.NoteCursor.Before(pc.NoteSince) {
 		pc.NoteCursor = pc.NoteSince

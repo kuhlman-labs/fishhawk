@@ -65,15 +65,23 @@ const csCharterMixed = `# Charter
 
 // csReader is a fake workmgmt.UserReportReader implementing the DOCUMENTED
 // inclusive contract: it returns every item whose updated_at is AT OR AFTER
-// req.Since, and a NextCursor later than every item.
+// req.Since, and a NextCursor later than every item. With noteFloor set it
+// keeps comments against req.NoteSince instead (zero, or later than Since,
+// means Since), as the GitLab reader keeps notes found through their issue,
+// and reports nextNote (zero: next) as the NextNoteCursor.
 type csReader struct {
 	mu        sync.Mutex
 	items     []workmgmt.UserReportItem
 	next      time.Time
+	nextNote  time.Time
+	noteFloor bool
 	degr      []workmgmt.UserReportDegradation
 	err       error
 	block     bool
 	panicking bool
+	// panicGate, when non-nil, makes a panicking call wait for it to close
+	// and panic ONCE: the call clears panicking, so later calls list.
+	panicGate chan struct{}
 	calls     int
 }
 
@@ -81,8 +89,15 @@ func (r *csReader) ListUserReports(ctx context.Context, req workmgmt.ListUserRep
 	r.mu.Lock()
 	r.calls++
 	items, next, degr, err, block, panicking := r.items, r.next, r.degr, r.err, r.block, r.panicking
+	nextNote, noteFloor, gate := r.nextNote, r.noteFloor, r.panicGate
+	if panicking && gate != nil {
+		r.panicking = false
+	}
 	r.mu.Unlock()
 	if panicking {
+		if gate != nil {
+			<-gate
+		}
 		panic("comms reader exploded")
 	}
 	if block {
@@ -92,16 +107,27 @@ func (r *csReader) ListUserReports(ctx context.Context, req workmgmt.ListUserRep
 	if err != nil {
 		return nil, err
 	}
+	noteSince := req.Since
+	if noteFloor && !req.NoteSince.IsZero() && req.NoteSince.Before(req.Since) {
+		noteSince = req.NoteSince
+	}
 	var out []workmgmt.UserReportItem
 	for _, it := range items {
-		if !it.UpdatedAt.Before(req.Since) {
+		bound := req.Since
+		if it.Kind == workmgmt.UserReportKindComment {
+			bound = noteSince
+		}
+		if !it.UpdatedAt.Before(bound) {
 			out = append(out, it)
 		}
 	}
 	if next.Before(req.Since) {
 		next = req.Since
 	}
-	return &workmgmt.UserReportPage{Forge: "github", Items: out, Since: req.Since, NextCursor: next, NextNoteCursor: next, Degradations: degr}, nil
+	if nextNote.IsZero() {
+		nextNote = next
+	}
+	return &workmgmt.UserReportPage{Forge: "github", Items: out, Since: req.Since, NextCursor: next, NextNoteCursor: nextNote, Degradations: degr}, nil
 }
 
 func (r *csReader) callCount() int {
@@ -528,6 +554,51 @@ func TestCommsScan_OmittedReportReappears(t *testing.T) {
 	}
 	if csHas(shown, "UR-issue-1") || csHas(shown, "UR-issue-2") {
 		t.Fatalf("second gather re-showed an accounted report: %v", shown)
+	}
+}
+
+// TestCommsScan_OmittedNoteOlderThanSinceReappears: a note floor (NoteSince
+// 09:00) earlier than the issues cursor (Since 10:00) — the shape a GitLab
+// issue-listing truncation leaves behind — lists comments older than Since.
+// The gather cap omits the 09:30 comment; the pending NOTE cursor must hold
+// to 09:30 (derived before the cursor is clamped to Since), so after phase 7
+// advances the REAL store to the recorded bounds the next real Scan lists it
+// again. Clamping first records note 10:00 and the comment is never reported.
+func TestCommsScan_OmittedNoteOlderThanSinceReappears(t *testing.T) {
+	f := newCSFixture(t, nil)
+	prev := commsScanMaxReports
+	commsScanMaxReports = 2
+	t.Cleanup(func() { commsScanMaxReports = prev })
+	noteSince, since, next := csBase, csBase.Add(time.Hour), csBase.Add(2*time.Hour)
+	f.cursors.vals[csCursorKey(csKey(userreport.SourceIssues))] = since
+	f.cursors.vals[csCursorKey(csKey(userreport.SourceIssueNotes))] = noteSince
+	f.reader.noteFloor, f.reader.next, f.reader.nextNote = true, next, next
+	f.reader.items = []workmgmt.UserReportItem{
+		csComment(5, 51, "Crash on save", csBase.Add(10*time.Minute), commsExternalAuthor),
+		csComment(5, 52, "Sync is slow", csBase.Add(20*time.Minute), commsExternalAuthor),
+		csComment(5, 53, "Login loops forever", csBase.Add(30*time.Minute), commsExternalAuthor),
+	}
+	_, g := f.gather(t)
+	if got := csShownIDs(g); !csEqual(got, []string{"UR-comment-5-52", "UR-comment-5-51"}) {
+		t.Fatalf("first gather shown = %v, want the two oldest comments newest-first", got)
+	}
+	pc := g.Payload.PendingCursor
+	if pc == nil || !pc.Since.Equal(since) || !pc.NoteSince.Equal(noteSince) {
+		t.Fatalf("pending cursor = %+v, want read bounds Since %v NoteSince %v", pc, since, noteSince)
+	}
+	if !pc.Cursor.Equal(since) || !pc.NoteCursor.Equal(csBase.Add(30*time.Minute)) {
+		t.Fatalf("pending cursor %v note %v, want cursor clamped to Since %v and note held to the omitted comment %v",
+			pc.Cursor, pc.NoteCursor, since, csBase.Add(30*time.Minute))
+	}
+	f.applyPhase7(t, pc.Cursor, pc.NoteCursor)
+	f.expire()
+	_, g2 := f.gather(t)
+	shown := csShownIDs(g2)
+	if !csHas(shown, "UR-comment-5-53") {
+		t.Fatalf("second gather shown = %v: the omitted comment older than Since did not reappear", shown)
+	}
+	if csHas(shown, "UR-comment-5-51") || csHas(shown, "UR-comment-5-52") {
+		t.Fatalf("second gather re-showed an accounted comment: %v", shown)
 	}
 }
 
@@ -1024,6 +1095,58 @@ func TestCommsScanCache_PanicIsNotCached(t *testing.T) {
 	}
 }
 
+// TestCommsScanCache_WaiterRetriesAfterLeaderPanic: a caller joined to an
+// in-flight gather whose leader PANICS is neither stranded nor handed the
+// aborted entry: it retries as the new leader and completes its own gather.
+func TestCommsScanCache_WaiterRetriesAfterLeaderPanic(t *testing.T) {
+	f := newCSFixture(t, nil)
+	gate := make(chan struct{})
+	f.reader.panicking, f.reader.panicGate = true, gate
+	f.reader.items = []workmgmt.UserReportItem{csIssue(1, "Crash on save", "a", csBase.Add(time.Minute), commsExternalAuthor)}
+	joined := make(chan struct{}, 1)
+	prev := commsScanJoinHook
+	commsScanJoinHook = func() { joined <- struct{}{} }
+	t.Cleanup(func() { commsScanJoinHook = prev })
+
+	leaderPanicked := make(chan bool, 1)
+	go func() {
+		defer func() { leaderPanicked <- recover() != nil }()
+		_, _, _ = f.s.resolveCommsScanContext(context.Background(), f.runRow, f.plan)
+	}()
+	for f.reader.callCount() == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	type res struct {
+		g   *commsGather
+		err error
+	}
+	out := make(chan res, 1)
+	go func() {
+		_, g, err := f.s.resolveCommsScanContext(context.Background(), f.runRow, f.plan)
+		out <- res{g, err}
+	}()
+	select {
+	case <-joined:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the second serve never joined the in-flight gather")
+	}
+	close(gate)
+	if !<-leaderPanicked {
+		t.Fatal("the leader's gather did not panic")
+	}
+	select {
+	case r := <-out:
+		if r.err != nil || r.g == nil || !csEqual(csShownIDs(r.g), []string{"UR-issue-1"}) {
+			t.Fatalf("joined caller after the leader aborted = (%+v, %v), want its own completed gather", r.g, r.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the joined caller hung after the leader aborted")
+	}
+	if f.reader.callCount() != 2 {
+		t.Fatalf("reader calls = %d, want 2 (the waiter re-gathered as the new leader)", f.reader.callCount())
+	}
+}
+
 // TestCommsScanCache_ConcurrentServesGatherOnce: a caller arriving while a
 // gather is in flight joins it — including its refusal — instead of
 // gathering again.
@@ -1173,6 +1296,7 @@ func TestCommsPendingCursorFor_Clamps(t *testing.T) {
 		{"held to the earliest omitted, note follows", 0, 0, 60, 60, []commsKept{omit(40), omit(20)}, 20, 20},
 		{"never behind the read bound", 10, 10, 60, 60, []commsKept{omit(5)}, 10, 10},
 		{"note never above the cursor", 10, 30, 60, 60, []commsKept{omit(5)}, 10, 10},
+		{"note held below Since before the cursor clamp", 60, 0, 120, 120, []commsKept{omit(30)}, 60, 30},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
