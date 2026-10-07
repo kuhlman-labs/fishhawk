@@ -1117,6 +1117,107 @@ else
   fail "(k8) cmd_coverage static shape ('$k8_body')"
 fi
 
+# ---------------------------------------------------------------------------
+# (m) cmd_test and cmd_test_with_patch_coverage AGGREGATE across modules too
+#     (#4036). Same shape as (k): the REAL loop inside a `set -euo pipefail`
+#     subshell (the pre-#4036 first-failure abort only reproduces under
+#     errexit) against the (k) stub `go`. A failing module must not stop the
+#     later one, the stderr summary must name it, and the loop must exit
+#     non-zero. For the patch-coverage loop the subshell then calls
+#     _verify_patch_coverage exactly as cmd_verify does, stubbed to print a
+#     marker: a failed loop must exit BEFORE the gate is reached.
+# ---------------------------------------------------------------------------
+# m_run <fn> [args...]: reset the go log, then drive the real loop (and, for
+# cmd_test_with_patch_coverage, the stubbed gate after it). Sets $out and $rc.
+# The snapshot emit is stubbed to a skip-snapshot so no real git/python runs.
+m_run() {
+  : > "$KGO_LOG"
+  out="$( cd "$kroot" || exit 99
+          set -euo pipefail
+          ROOT="$kroot"
+          PATH="$kbin:$PATH"
+          TMPDIR="$tmproot"
+          export PATH TMPDIR
+          _patch_cov_emit_snapshot() { printf '{"schema":1,"skip":"harness"}' > "$2"; }
+          _verify_patch_coverage() { echo "PATCH_GATE_REACHED:$1"; }
+          "$@" 2>&1
+          if [ "$1" = "cmd_test_with_patch_coverage" ]; then
+            _verify_patch_coverage main 2>&1
+          fi )"
+  rc=$?
+}
+m_mods="$(printf 'backend\t./internal/foo\n')"
+
+# (m1) DONE-MEANS for the plain loop: module 1 fails, module 2 STILL runs, the
+#      summary names exactly module 1, and the exit is non-zero.
+KGO_FAIL="backend" KGO_BUILDFAIL=""
+m_run cmd_test
+if [ "$rc" -ne 0 ] \
+   && grep -q '^backend|' "$KGO_LOG" \
+   && grep -q '^cli|' "$KGO_LOG" \
+   && printf '%s\n' "$out" | grep -q 'scripts/test: 1 of 2 modules failed:' \
+   && printf '%s\n' "$out" | grep -qxF -- '  - ./backend' \
+   && ! printf '%s\n' "$out" | grep -qF -- '  - ./cli'; then
+  pass "(m1) cmd_test: a failing first module no longer hides the second; summary names it; rc non-zero"
+else
+  fail "(m1) cmd_test aggregation (rc=$rc out='$out' log='$(cat "$KGO_LOG")')"
+fi
+
+# (m2) the all-green control for (m1): rc 0, both modules ran, no summary — so
+#      (m1)'s red cannot be a setup failure of the subshell itself.
+KGO_FAIL="" KGO_BUILDFAIL=""
+m_run cmd_test
+if [ "$rc" -eq 0 ] \
+   && grep -q '^backend|' "$KGO_LOG" \
+   && grep -q '^cli|' "$KGO_LOG" \
+   && ! printf '%s\n' "$out" | grep -q 'modules failed'; then
+  pass "(m2) cmd_test all-green: rc 0, both modules ran, no failure summary"
+else
+  fail "(m2) cmd_test all-green control (rc=$rc out='$out')"
+fi
+
+# (m3) the patch-coverage loop, failing module = the INSTRUMENTED (-coverpkg)
+#      branch: the plain-branch module after it still runs, the summary names
+#      the failure, rc non-zero, and _verify_patch_coverage is NOT reached.
+KGO_FAIL="backend" KGO_BUILDFAIL=""
+m_run cmd_test_with_patch_coverage "$m_mods" main
+if [ "$rc" -ne 0 ] \
+   && grep '^backend|' "$KGO_LOG" | grep -q -- '-coverpkg=./internal/foo' \
+   && grep -q '^cli|' "$KGO_LOG" \
+   && printf '%s\n' "$out" | grep -q 'scripts/test: 1 of 2 modules failed:' \
+   && printf '%s\n' "$out" | grep -qxF -- '  - ./backend' \
+   && ! printf '%s\n' "$out" | grep -q 'PATCH_GATE_REACHED'; then
+  pass "(m3) patch-coverage loop: instrumented module fails, later module still runs, gate not reached"
+else
+  fail "(m3) patch-coverage loop aggregation, instrumented branch (rc=$rc out='$out' log='$(cat "$KGO_LOG")')"
+fi
+
+# (m4) the same loop, failing module = the PLAIN branch (the last module): the
+#      plain branch is aggregated too, and the gate is still not reached.
+KGO_FAIL="cli" KGO_BUILDFAIL=""
+m_run cmd_test_with_patch_coverage "$m_mods" main
+if [ "$rc" -ne 0 ] \
+   && grep -q '^backend|' "$KGO_LOG" \
+   && printf '%s\n' "$out" | grep -q 'scripts/test: 1 of 2 modules failed:' \
+   && printf '%s\n' "$out" | grep -qxF -- '  - ./cli' \
+   && ! printf '%s\n' "$out" | grep -q 'PATCH_GATE_REACHED'; then
+  pass "(m4) patch-coverage loop: a failing plain-branch module is summarised and the gate not reached"
+else
+  fail "(m4) patch-coverage loop aggregation, plain branch (rc=$rc out='$out')"
+fi
+
+# (m5) the all-green control for (m3)/(m4): rc 0 and the gate IS reached, so
+#      their "not reached" is the failure exit and not a broken subshell.
+KGO_FAIL="" KGO_BUILDFAIL=""
+m_run cmd_test_with_patch_coverage "$m_mods" main
+if [ "$rc" -eq 0 ] \
+   && printf '%s\n' "$out" | grep -q 'PATCH_GATE_REACHED:main' \
+   && ! printf '%s\n' "$out" | grep -q 'modules failed'; then
+  pass "(m5) patch-coverage loop all-green: rc 0, no summary, the gate is reached"
+else
+  fail "(m5) patch-coverage loop all-green control (rc=$rc out='$out')"
+fi
+
 unset KGO_FAIL KGO_BUILDFAIL COVGATE_RC
 
 # ---------------------------------------------------------------------------

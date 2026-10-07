@@ -1,0 +1,14 @@
+id: scenario:issue-4036/verify-runs-every-module
+statement: '`scripts/test verify` with a go toolchain that fails the first go.work module still runs the tests of every later module, exits non-zero, and ends its stderr with a summary naming each failed module.'
+verify_hint: 'CLI surface: build the standard fixture with `scripts/test-verify-scope --fixture <dir>`, then from <dir> run `bash <dir>/scripts/test verify` with PATH=<dir>/bin:$PATH, FISHHAWK_TEST_LEASE_DIR=<dir>/leases and FIXTURE_GO_FAIL=backend; observe a non-zero exit, a stderr line `1 of 2 modules failed` followed by `  - ./backend`, and that <dir>/logs/go.log records a `cli` go test line.'
+steps: 'bash <tree>/scripts/test-verify-scope --fixture /tmp/fhacc4036/fx. Then, from /tmp/fhacc4036/fx: env PATH=/tmp/fhacc4036/fx/bin:$PATH FISHHAWK_TEST_LEASE_DIR=/tmp/fhacc4036/fx/leases FIXTURE_GO_FAIL=backend bash /tmp/fhacc4036/fx/scripts/test verify. Then read stderr and logs/go.log.'
+assertions:
+    expected: non-zero exit, '1 of 2 modules failed' then '  - ./backend', and a cli go test line
+    observed_at_record: 'Exit 1. stderr ends with ''scripts/test: 1 of 2 modules failed:'' followed by ''  - ./backend''. logs/go.log records ''backend test -race -p 4 -timeout 20m ...'' and then ''cli test -race -p 4 ./... -timeout 20m'', so the later module ran.'
+    repro_handle: FIXTURE_GO_FAIL=backend bash <fixture>/scripts/test verify
+origin:
+    issue: 4036
+    pr: 0
+    run_id: 3e85e39d-4208-497e-add2-28298e560406
+    head_sha: b61824889657cfaaa72e223d886667ac9230c0ec
+    recorded_at: 2026-10-07T05:00:46Z
