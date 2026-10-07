@@ -2244,6 +2244,12 @@ func acceptanceStageOf(stages []*run.Stage) *run.Stage {
 // A re-opened acceptance stage carries more than one acceptance_dispatched
 // entry; the highest-sequence one is the current validation episode.
 //
+// A POST-DEPLOY acceptance stage (one consuming a deploy stage's deployment
+// artifact, E35.2 / #1599) binds instead to the deployed commit SHA
+// (resolvePostDeployExpectedSHA), checked only AFTER the dispatch-anchor and
+// episode-restart guards below, so the anchor posture is identical for both
+// arms.
+//
 // ANCHOR PROVENANCE (E64.53 / #3174). The anchor has TWO emit sites, split by
 // how the stage was actually spawned: orchestrator.Advance writes it for a
 // BACKEND-TRIGGERED (github_actions) dispatch, and the host-dispatch marker
@@ -2339,6 +2345,20 @@ func (s *Server) acceptanceValidatedHeadSHA(ctx context.Context, runID, stageID 
 			slog.Int64("anchor_seq", dispatchSeq),
 			slog.Int64("restart_seq", restartSeq))
 		return "", false
+	}
+	// RELEASE ARM (E35.2 / #1599). AFTER both guards above — the order is
+	// load-bearing: an anchorless or stale-anchored ship must still resolve
+	// ("", false) and clamp, deployment or not. A post-deploy acceptance stage
+	// validated the DEPLOYED build, so its verdict binds to the deployed SHA
+	// the runner's identity probe checked, never to a reported head (a release
+	// run has none, which without this arm would clamp every passed post-deploy
+	// verdict to undecidable(head_unresolved)). When the arm applies — the stage
+	// consumes a deployment, or that cannot be determined — its answer is final:
+	// "" resolves ("", false) and clamps. A different succeeded deployment
+	// posted after dispatch cannot re-bind the verdict: two distinct deployed
+	// SHAs resolve "" (deployedSHAFromArtifacts' disagreement rule).
+	if sha, applies := s.resolvePostDeployExpectedSHA(ctx, runID, stageID); applies {
+		return sha, sha != ""
 	}
 	var candidates []*audit.Entry
 	for _, cat := range auditcomplete.HeadReportCategoriesByPrecedence {

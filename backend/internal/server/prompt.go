@@ -4743,14 +4743,27 @@ func (s *Server) acceptanceHeadForRun(ctx context.Context, runID, stageID uuid.U
 // warn-and-proceed at the dispatch gates: both the verb gate and the runner
 // gate refuse (acceptance_expected_head_unresolved), because a verdict bound
 // to no tree is unfalsifiable.
+//
+// RELEASE ARM PRECEDENCE (E35.2 / #1599). resolvePostDeployExpectedSHA runs
+// FIRST: when the stage consumes a deployment — or when it cannot be
+// determined whether it does — its answer is returned VERBATIM, "" included,
+// and the reported-head ledger is never consulted. The deployed commit SHA is
+// what a post-deploy acceptance stage validates; a reported head there would
+// name a PR candidate the deployed host may not serve. Only a stage positively
+// known NOT to consume a deployment reaches acceptanceHeadForRun below, whose
+// answer is byte-identical to before #1599.
 func (s *Server) resolveAcceptanceExpectedHeadSHA(ctx context.Context, runID, stageID uuid.UUID) string {
+	if sha, applies := s.resolvePostDeployExpectedSHA(ctx, runID, stageID); applies {
+		return sha
+	}
 	return s.acceptanceHeadForRun(ctx, runID, stageID)
 }
 
 // resolveAcceptanceExpectedHeadSHAWalkingParents resolves the acceptance
-// merge-candidate head SHA with a ParentRunID fallback (#2028): it calls the
-// own-run resolveAcceptanceExpectedHeadSHA FIRST and returns its result verbatim
-// when non-empty (BYTE-IDENTICAL to the top-level path). Only when the own-run
+// merge-candidate head SHA with a ParentRunID fallback (#2028): it runs the
+// own-run resolution FIRST — the same release-arm-then-acceptanceHeadForRun
+// sequence resolveAcceptanceExpectedHeadSHA performs — and returns its result
+// verbatim when non-empty (BYTE-IDENTICAL to the top-level path). Only when the own-run
 // ledger resolves "" AND r.ParentRunID != nil does it walk ParentRunID upward,
 // re-running the same chain-then-consolidated resolution (acceptanceHeadForRun)
 // against each ancestor's runID until a non-empty head resolves, ParentRunID is
@@ -4765,11 +4778,21 @@ func (s *Server) resolveAcceptanceExpectedHeadSHA(ctx context.Context, runID, st
 // (ParentRunID==nil) never enters it, so every own-plan / top-level path is
 // unchanged. Preserves the WARN-and-omit "" posture — an exhausted walk returns
 // "" exactly as the own-run resolver would.
+//
+// The RELEASE ARM short-circuits FIRST (E35.2 / #1599): when
+// resolvePostDeployExpectedSHA applies, its answer is returned verbatim — ""
+// included — with NO ParentRunID walk. An ancestor's reported head names a PR
+// candidate, never the build the consumed deploy stage put on the host, so
+// walking to it on an unresolved deployment would bind the probe to the wrong
+// tree.
 func (s *Server) resolveAcceptanceExpectedHeadSHAWalkingParents(ctx context.Context, r *run.Run, stageID uuid.UUID) string {
 	if r == nil {
 		return ""
 	}
-	if sha := s.resolveAcceptanceExpectedHeadSHA(ctx, r.ID, stageID); sha != "" {
+	if sha, applies := s.resolvePostDeployExpectedSHA(ctx, r.ID, stageID); applies {
+		return sha
+	}
+	if sha := s.acceptanceHeadForRun(ctx, r.ID, stageID); sha != "" {
 		return sha
 	}
 	if r.ParentRunID == nil || s.cfg.RunRepo == nil {
